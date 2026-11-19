@@ -94,8 +94,8 @@ impl Tuning {
 
     /// The tuning from the curves' string table and the constants' table.
     /// A missing curve has no points and weighs everything 0, as the
-    /// original's empty curve does (0x4167de). The curve's text ends at
-    /// its first zero byte (0x4703ad). **Unverified:** the points are read by
+    /// original's empty curve does (0x4167de). The curve's text is its
+    /// bytes up to the first zero byte (0x4703ad), each read as it is. **Unverified:** the points are read by
     /// `sims_sim::motives::Curve::parse`, which the motives' curves share;
     /// where text is not well formed (a point such as `(100;90 coins)`)
     /// it drops a point that the original's scanner (0x4614a2) reads.
@@ -105,13 +105,15 @@ impl Tuning {
     pub fn from_tables(curves: Option<&StringTable>, constants: Option<&Constants>) -> Self {
         // The original copies the string's bytes as a C string
         // (0x4703ad), so a zero byte inside a length-prefixed string ends
-        // it, before any decoding.
+        // it, and its scanner (0x461435) reads those bytes as they are: a
+        // byte order mark is two bytes that are not a point, not a change
+        // of encoding.
         let curve = |n: usize| {
-            let text = curves
+            let text: String = curves
                 .and_then(|t| t.entry(n, US_ENGLISH))
                 .map(|entry| {
                     let bytes = entry.raw_text.split(|&b| b == 0).next().unwrap_or(&[]);
-                    sims_formats::strings::decode(bytes, entry.language)
+                    bytes.iter().copied().map(char::from).collect()
                 })
                 .unwrap_or_default();
             Curve::parse(0, &text, CURVE_POINTS)
@@ -326,16 +328,24 @@ impl House {
     ///   set.
     ///
     /// - Furnishings (0x416851) weighs the lot's values ([`Values`]):
-    ///   see [`furnishings`]. The original reads the two values its lot
-    ///   statistics (0x416085) last stored: at the load (0x41621f), at the
-    ///   day's turn (0x41647e), on leaving build or buy mode (0x4cea9e)
-    ///   and from 0x50206e. This works them out at each read, so where an
-    ///   object breaks, is mended or changes value between those passes,
-    ///   ours follows at once and the original's later: a known
-    ///   difference, not the original's behaviour.
+    ///   see [`furnishings`]. This works them out now; the original reads
+    ///   the two values its lot statistics last stored, which
+    ///   [`House::with_values`] takes ([`Stored`]).
     ///
     /// Not ported: Layout (its routing history, lot +0x3c to +0x64).
     pub fn read(world: &World, tuning: &Tuning, kinds: &Kinds) -> Self {
+        Self::with_values(
+            world,
+            tuning,
+            kinds,
+            Values::read(world, kinds, &tuning.prices),
+        )
+    }
+
+    /// [`House::read`], with the lot's values as stored (`values`, from
+    /// [`Stored::values`]) rather than worked out now, as the original's
+    /// panel reads them (0x416851).
+    pub fn with_values(world: &World, tuning: &Tuning, kinds: &Kinds, values: Values) -> Self {
         let mut house = Self::default();
         for room in world.rooms.rooms.values() {
             if room.outdoors || !room.dirty {
@@ -376,7 +386,7 @@ impl House {
         };
         house.ratings[YARD] = Some(yard.to_i32_truncate());
         house.ratings[UPKEEP] = Some(upkeep(world, tuning, kinds));
-        house.values = Values::read(world, kinds, &tuning.prices);
+        house.values = values;
         house.ratings[FURNISHINGS] = Some(furnishings(house.values, &tuning.furnishings));
         house
     }
@@ -502,6 +512,11 @@ impl Prices {
     /// catalogs. Each entry of a table is three strings, the first its
     /// price, read as C's `atoi` reads its bytes; the strings are looked up with
     /// the 1-based accessor (0x4704fa), so entry `n` is string `3n - 3`.
+    ///
+    /// The strings are US English's (language 1), as everything here
+    /// reads; the original takes the game's language (0x47028b,
+    /// 0x470256), and some tables price a style differently in another
+    /// language, so a game in another language would price by those.
     pub fn from_tables(tables: &BTreeMap<u16, StringTable>, surfaces: &Surfaces) -> Self {
         let price = |table: u16, entry: u16| -> Option<i32> {
             let at = usize::from(entry).checked_sub(1)? * 3;
@@ -545,6 +560,55 @@ impl Prices {
             walls,
         }
     }
+}
+
+/// The lot's two values as the original keeps them for the house panel
+/// (simulator +0xa0 and +0xa4). Its lot statistics (0x416085) store them
+/// at the load (0x41621f), at the day's turn (0x41647e, signal 0xdc), on
+/// leaving build or buy mode (0x4cea9e, through 0x416534) and from
+/// 0x50206e (through 0x416558, when word +0x36 of the record at the lot's
+/// +0x20 is not 0), and the panel reads what was stored last (0x416851):
+/// an object that breaks or is mended shows at the next of those.
+///
+/// The host stores them when the lot is loaded and again whenever the
+/// day has turned ([`Stored::stale`]). It looks once a frame, so a day's
+/// turn is stored after the frame's last update rather than at the
+/// update that turned it: a known difference, not the original's
+/// behaviour. Neither build nor buy mode is ported, and what reaches
+/// 0x50206e was not read, so those passes are not made.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Stored {
+    values: Values,
+    /// The days played (global 28) when they were stored; none before.
+    day: Option<i16>,
+}
+
+/// Global 28, the days played, which the day's turn counts up.
+const DAYS_PLAYED: usize = 28;
+
+impl Stored {
+    /// Whether the values were never stored, or the day has turned since.
+    #[must_use]
+    pub fn stale(&self, world: &World) -> bool {
+        self.day != Some(days_played(world))
+    }
+
+    /// Works the values out from `world` ([`Values::read`]) and keeps
+    /// them, with the day.
+    pub fn store(&mut self, world: &World, kinds: &Kinds, prices: &Prices) {
+        self.values = Values::read(world, kinds, prices);
+        self.day = Some(days_played(world));
+    }
+
+    /// The values last stored.
+    #[must_use]
+    pub fn values(&self) -> Values {
+        self.values
+    }
+}
+
+fn days_played(world: &World) -> i16 {
+    world.globals.get(DAYS_PLAYED).copied().unwrap_or(0)
 }
 
 /// The lot's two values, as the lot's statistics work them out (0x416085)
@@ -882,6 +946,18 @@ mod tests {
                 .size
                 .points
                 .is_empty()
+        );
+        // A byte order mark before one-byte text is two bytes that are
+        // not a point: the point after it is read.
+        let marked = [[0xffu8, 0xfe].as_slice(), b"(0;90)"].concat();
+        let marked = StringTable::parse_chunk(
+            &[[1u8, 0].as_slice(), &[marked.len() as u8], &marked].concat(),
+            0x10,
+        )
+        .unwrap();
+        assert_eq!(
+            Tuning::from_tables(Some(&marked), None).size.points.len(),
+            1
         );
         // Sorted by x as the original's curves are.
         assert_eq!(
@@ -1353,6 +1429,42 @@ mod tests {
                 architecture: 30 + 3 + 2,
             }
         );
+    }
+
+    #[test]
+    fn the_stored_values_change_only_when_the_day_turns() {
+        let mut world = World::empty();
+        world.size = 10;
+        world.globals.resize(DAYS_PLAYED + 1, 0);
+        let kinds = Kinds {
+            types: BTreeMap::from([(
+                10,
+                Type {
+                    kind: 0,
+                    group: 0,
+                    build: Some(0),
+                },
+            )]),
+            ..Kinds::default()
+        };
+        let mut chair = object(1, 10, 0, 0);
+        chair.position = [5 * 16, 5 * 16, 1];
+        chair.data[VALUE] = 100;
+        world.objects.insert(1, chair);
+        world.order.push(1);
+        let prices = Prices::default();
+        let mut stored = Stored::default();
+        assert!(stored.stale(&world));
+        stored.store(&world, &kinds, &prices);
+        assert_eq!(stored.values().objects, 100);
+        // It breaks: the stored value stays until the day turns.
+        world.objects.get_mut(&1).unwrap().data[BROKEN] = 1;
+        assert!(!stored.stale(&world));
+        assert_eq!(stored.values().objects, 100);
+        world.globals[DAYS_PLAYED] += 1;
+        assert!(stored.stale(&world));
+        stored.store(&world, &kinds, &prices);
+        assert_eq!(stored.values().objects, 50);
     }
 
     #[test]

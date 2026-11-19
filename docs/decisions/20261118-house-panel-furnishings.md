@@ -6,15 +6,18 @@ The house panel's Furnishings bar now shows a rating (0x416851,
 `sims_ui::house::furnishings`). It is read from the exe. The two values
 it weighs match, to the unit, what the original's simulator held after
 loading the Goths' house: track 2's capture of update 1 has the
-simulator's +0xa0 at 14,660 and its +0xa4 at 15,277, where the house
-file saved 0 for both. Their Furnishings is 58. No screenshot of the
-panel was compared.
+simulator's +0xa0 at 14,660 and its +0xa4 at 15,277. The house file
+in the player's folder saved the same two values (the copy the
+install starts from saved 0 for both), but the panel here works them
+out from the lot and does not read them; the test checks so. Their
+Furnishings is 58. No screenshot of the panel was compared.
 
 - **The rating** (0x416851): the architecture's value (+0xa4) over the
   objects' (+0xa0), through string 1 of the global file's `STR#` 505,
-  cut toward zero. The curve's text ends at its first zero byte, before
-  any decoding, as the original copies its bytes as a C string
-  (0x4703ad). **Unverified:** its
+  cut toward zero. The curve's text is its bytes up to the first zero
+  byte, as the original copies them as a C string (0x4703ad), each read
+  as it is by its scanner (0x461435): a byte order mark is two bytes
+  that are not a point, not a change of encoding. **Unverified:** its
   points are read by the motives' curve parser
   (`sims_sim::motives::Curve::parse`), which drops a point that is not
   well formed (`(100;90 coins)`) where the original's scanner (0x4614a2)
@@ -25,14 +28,21 @@ panel was compared.
   100 (0x66674c), not a division.
 - **When the values are worked out:** the original's lot statistics
   (0x416085) store them at the load (0x41621f), at the day's turn
-  (0x41647e), on leaving build or buy mode (0x4cea9e) and from 0x50206e,
-  and the panel reads what was stored last. The panel here works them
-  out at each read (`Values::read`), without changing the world. Where
-  an object breaks, is mended or changes value between those passes,
-  ours follows at once and the original's later. This is a known
-  difference, not the original's behaviour. The simulation's
+  (0x41647e, signal 0xdc), on leaving build or buy mode (0x4cea9e,
+  through 0x416534) and from 0x50206e (through 0x416558, when word
+  +0x36 of the record at the lot's +0x20 is not 0), and the panel reads
+  what was stored last, so an object that breaks or is mended shows at
+  the next of those. The game keeps them (`sims_ui::house::Stored`): it
+  works them out when the lot is loaded and again on the first frame
+  after the days played (global 28) change. That is after the frame's
+  last update rather than at the update that turned the day, a known
+  difference, not the original's behaviour. Build and buy mode are not
+  ported and what reaches 0x50206e was not read, so those passes are
+  not made. The viewer's world does not change after the load, so it
+  works them out when the panel shows. The simulation's
   `Budget::objects_value` and `architecture_value` are left as they
-  are.
+  are; were the simulation to store both at those times, the panel
+  would read them instead.
 - **The objects** (0x444cb9), in the lot's order, in 32-bit sums that
   wrap:
   - A tile of a multi-tile group that is not its lead, and a type with
@@ -76,7 +86,10 @@ panel was compared.
 - **The prices** (`Prices::load`) come from `GameData/Build.iff`. Each
   string-table entry is three strings, and the first is the price, read
   as C's `atoi` reads its bytes (0x636029, `sims_content::atoi`), so a
-  byte order mark before the digits reads 0.
+  byte order mark before the digits reads 0. The strings are US
+  English's (language 1), as everything here reads; the original takes
+  the game's language (0x47028b, 0x470256), and some tables price a
+  style differently in another language.
 - **The string tables:** `Build.iff`'s, a pattern file's and the
   curves' (`STR#` 505) are read as the original's string loader reads
   them (0x46feac, `StringTable::parse_chunk`):
@@ -157,8 +170,12 @@ panel was compared.
     group, an unread type, a person and another type without a
     master);
   - the rating, including no valued objects;
-  - the Goths' values (14,660 and 15,277), Furnishings 58 and the
-    panel's digest, gated on `SIMS_INSTALL`.
+  - the stored values, kept until the day turns;
+  - the curve's text cut at a zero byte, and read past a byte order
+    mark;
+  - the Goths' values (14,660 and 15,277, worked out with the saved
+    ones cleared), Furnishings 58 and the panel's digest, gated on
+    `SIMS_INSTALL`.
 
 Reopen with a screenshot of the original's house panel, or if the
 simulation takes over the lot statistics' values.

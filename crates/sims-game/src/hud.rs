@@ -57,8 +57,12 @@ pub struct Hud {
     /// with.
     house: house::Tuning,
     /// Which of the lot's object types the Upkeep rating counts, read as
-    /// they show up while the house panel shows.
+    /// they show up: at the load, while the house panel shows, and when
+    /// the lot's values are stored.
     kinds: house::Kinds,
+    /// The lot's values as last stored, which the Furnishings rating
+    /// weighs: at the load and at each day's turn ([`house::Stored`]).
+    stored: house::Stored,
     /// What the relationship panel needs from outside the world: the
     /// autonomy tuning's friendship threshold (0x6c4398) for its
     /// smileys, the neighborhood's characters, and the Superstar pack.
@@ -145,6 +149,11 @@ impl Hud {
         // The architecture's prices, by the pattern catalogs the load
         // keyed the lot's floors and walls by.
         house.prices = house::Prices::load(&install, surfaces);
+        // The lot's statistics store its values at the load (0x41621f).
+        let mut kinds = house::Kinds::default();
+        kinds.learn(world, assets.index(), assets.catalog());
+        let mut stored = house::Stored::default();
+        stored.store(world, &kinds, &house.prices);
         let known = Acquaintances::read(
             assets.index(),
             assets.catalog(),
@@ -158,7 +167,8 @@ impl Hud {
             problems: Vec::new(),
             careers,
             house,
-            kinds: house::Kinds::default(),
+            kinds,
+            stored,
             known,
             labels,
             texts,
@@ -223,7 +233,7 @@ impl Hud {
         match self.controls.panel {
             UiPanel::Relationships => snapshot.with_relations(world, &self.members, &self.known),
             UiPanel::House if self.controls.expanded => {
-                snapshot.with_house(world, &self.house, &self.kinds)
+                snapshot.with_house(world, &self.house, &self.kinds, self.stored.values())
             }
             _ => snapshot,
         }
@@ -258,6 +268,11 @@ impl Hud {
         self.controls.speed = pace.speed;
         if self.controls.expanded && self.controls.panel == UiPanel::House {
             self.kinds.learn(world, assets.index(), assets.catalog());
+        }
+        // And again at the day's turn (0x41647e).
+        if self.stored.stale(world) {
+            self.kinds.learn(world, assets.index(), assets.catalog());
+            self.stored.store(world, &self.kinds, &self.house.prices);
         }
         // The pause button shows global 17, which the game's pause sets.
         let snapshot = self.snapshot(world);

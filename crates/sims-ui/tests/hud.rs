@@ -406,12 +406,27 @@ fn the_goths_house_panel() {
     }
     assert_eq!((opened.house.dirty, opened.house.broken), (3, 6));
     // The lot's values are what the original's simulator holds after
-    // the load (+0xa0 and +0xa4, track 2's capture of update 1): the
-    // house file saved 0 for both. Furnishings weighs 15,277 over 14,660,
-    // 1.042, on the curve.
+    // the load (+0xa0 and +0xa4, track 2's capture of update 1).
+    // Furnishings weighs 15,277 over 14,660, 1.042, on the curve.
     assert_eq!(
         (house.values.objects, house.values.architecture),
         (14660, 15277)
+    );
+    // The house file saved the same two values, but they are worked out
+    // from the lot, not read from what it saved.
+    assert_eq!(
+        (
+            opened.world.budget.objects_value,
+            opened.world.budget.architecture_value
+        ),
+        (14660, 15277)
+    );
+    let mut unsaved = opened.world.clone();
+    unsaved.budget.objects_value = 0;
+    unsaved.budget.architecture_value = 0;
+    assert_eq!(
+        house::Values::read(&unsaved, &opened.kinds, &opened.house.prices),
+        house.values
     );
     assert_eq!(
         house.ratings,

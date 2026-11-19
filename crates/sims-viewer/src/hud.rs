@@ -178,7 +178,10 @@ impl Hud {
                 kinds.learn(world, assets.index(), assets.catalog());
                 kinds
             });
-            snapshot = snapshot.with_house(world, &self.house, kinds);
+            // The viewer's world does not change after the load, so the
+            // values worked out now are those the load stored.
+            let values = house::Values::read(world, kinds, &self.house.prices);
+            snapshot = snapshot.with_house(world, &self.house, kinds, values);
             if !self.priced {
                 snapshot.house.ratings[house::FURNISHINGS] = None;
             }

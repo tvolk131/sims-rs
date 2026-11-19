@@ -85,7 +85,9 @@ pub fn open(root: &Path, house: &str) -> Opened {
     house.prices = house::Prices::load(&install, lot.surfaces());
     let mut kinds = house::Kinds::default();
     kinds.learn(world, &index, catalog);
-    let snapshot = snapshot.with_house(world, &house, &kinds);
+    let mut stored = house::Stored::default();
+    stored.store(world, &kinds, &house.prices);
+    let snapshot = snapshot.with_house(world, &house, &kinds, stored.values());
     let ui = UiGraphics::open(&install).unwrap();
     let mut art = Art::load(&ui, US_ENGLISH, &sims_ui::hud::RESOURCES).unwrap();
     art.load_optional(&ui, US_ENGLISH, sims_ui::balloon::BACKGROUND);

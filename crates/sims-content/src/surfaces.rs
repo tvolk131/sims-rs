@@ -231,7 +231,9 @@ impl Surfaces {
     }
 }
 
-/// A pattern file's own price (see [`SurfaceFile::price`]).
+/// A pattern file's own price (see [`SurfaceFile::price`]), in US
+/// English (language 1), as everything here reads: the original takes
+/// the game's language (0x47028b, 0x470256).
 fn price(iff: &Iff) -> Option<i32> {
     let chunk = iff.get(b"STR#", 0)?;
     let table = StringTable::parse_chunk(iff.data(chunk), iff.resource_flags(chunk)).ok()?;
