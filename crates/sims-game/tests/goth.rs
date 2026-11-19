@@ -2124,9 +2124,9 @@ fn action(a: &sims_formats::saved_objects::Interaction) -> (i32, i16, u16, i32, 
 
 /// Track 2's recording of the original ordering Mortimer onto the porch
 /// bench (goth-sit-read-order-20261115), replayed in the window: each
-/// pointer move and press at the update before its command ended, where
-/// the recording's state shows it took effect, at the recording's
-/// points. With frames after every 30th update from 170 (the recording's
+/// pointer move and press is given at the recording's point once the lot
+/// has run the update before its command ended, as its effect shows in
+/// the recording's state of the update the command ended. With frames after every 30th update from 170 (the recording's
 /// Room motives show them after 470 and 620), the lot equals the
 /// recording's after every update to 260 but for Bella's local from 203
 /// to 227, as in the snack order. From 261 on, the original lists pies
@@ -2203,10 +2203,11 @@ fn the_recorded_sit_order_replayed_in_the_window_matches_the_recording() {
 /// as the Sit order is. The second snack waits behind the first; a press
 /// on its icon takes it off, and one on the running snack's icon cancels
 /// it, which queues his own action 8318 and sets flag 0x100 on the
-/// snack. The first cancel shows at the update before its release's
-/// command ended. The second shows in update 595's state, which was
-/// saved before its release was sent, so which of its button events
-/// acts is not known; the replay presses before 595. With the frames
+/// snack. The first cancel shows in update 505's state, the update its
+/// release's command ended. The second shows in update 595's state,
+/// which was saved before its release was sent, so which of its button
+/// events acts is not known. The replay gives each press once the lot
+/// has run the update before the one its effect shows in. With the frames
 /// its Room motives show (after 316, 474, 648 and 1124), the lot equals
 /// the recording's after every update to 1300 but for the pointer's two
 /// listings ours does not make: on the kitchen counter behind its wall

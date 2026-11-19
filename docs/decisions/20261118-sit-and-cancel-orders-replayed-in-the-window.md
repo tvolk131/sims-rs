@@ -26,9 +26,10 @@ and `the_recorded_cancel_order_replayed_in_the_window_matches_the_recording`.
   pie for the fridge is moved onto the screen, ours is not
   (`a_menu_near_the_edge_moves_onto_the_screen_as_the_original_moved_it`).
 - **When.** Each harness command runs over many updates, because the
-  game stops at every update while the state is saved. Mostly the input
-  took effect in the update before its command ended. The recording's
-  state shows when:
+  game stops at every update while the state is saved. Mostly the
+  input's effect first shows in the state of the update its command
+  ended, so the replay gives it once the lot has run the update before
+  that. The recording's state shows when:
   - Mortimer's last result shows when a hover or press listed a pie.
   - The queue shows when an order or a cancel took effect.
 
@@ -37,8 +38,8 @@ and `the_recorded_cancel_order_replayed_in_the_window_matches_the_recording`.
   595's state, saved before the release was sent, already shows the
   cancel. Which of the two button events acted is not known; the replay
   presses before 595, where the effect shows.
-- **A press acts on its release.** The cancel recording sends the button
-  down and up as separate commands:
+- **A press acted on its release where the timing shows it.** The
+  cancel recording sends the button down and up as separate commands:
   - The choice of Have A Snack took effect at the release's end (257
     and 445), as did the first cancel (505). The second cancel does not
     fit this (above).
