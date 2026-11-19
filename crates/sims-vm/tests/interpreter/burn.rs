@@ -333,6 +333,70 @@ fn a_person_burning_itself_fails_loudly() {
 }
 
 #[test]
+fn a_burned_person_whose_reset_resets_the_burner_fails_loudly() {
+    // The person uses a widget on another tile, which runs Burn on it:
+    // its reset ends that use and resets the widget (0x45e814), whose
+    // thread restarts under the instruction, which was not seen.
+    use crate::visits::{PERSON, function, resident};
+    let (mut fx, widgets) = lot_and_widget_file();
+    widget(&mut fx, [3, 3], true);
+    let burner = widget(&mut fx, [1, 1], false);
+    let people = resident(&mut fx);
+    fx.program.people = people;
+    // The person's Reset tree notes 6 in the lamp's attribute 5.
+    fx.world
+        .objects
+        .get_mut(&LAMP)
+        .unwrap()
+        .attributes
+        .resize(8, 0);
+    fx.world
+        .animators
+        .insert(PERSON, sims_sim::animator::LOADED);
+    fx.add(
+        widgets,
+        4400,
+        tree(vec![assign(
+            scope::MY_DATA,
+            5,
+            scope::LITERAL,
+            9,
+            RETURN_TRUE,
+        )]),
+    );
+    function(&mut fx, widgets, 3, 4400);
+    fx.add(
+        widgets,
+        4401,
+        tree(vec![ins(
+            BURN,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [0, 1, 0, 0, 0, 0, 0, 0],
+        )]),
+    );
+    let sim = fx.world.objects.get_mut(&PERSON).unwrap();
+    sim.data[FLAGS] = 0;
+    sim.data[FLAGS_2] = CATCHES;
+    sim.data[62] = 0;
+    sim.person
+        .as_mut()
+        .unwrap()
+        .object_uses
+        .push(sims_formats::saved_objects::ObjectUse {
+            target: burner as i16,
+            stack_depth: 1,
+            unknown: 0,
+        });
+    let trap = trap(fx.run_with(burner, 4401, PERSON as i16, &[], 1000));
+    let running = format!("reset object {burner}, which is running it");
+    assert!(
+        matches!(&trap, Trap::Unsupported(m) if m.contains(&running)),
+        "{trap:?}"
+    );
+}
+
+#[test]
 fn in_front_burns_the_next_tile_in_the_stack_objects_direction() {
     // Direction 4 steps the second coordinate up a tile: from (2, 2) to
     // (2, 3), whose north side has no wall.

@@ -340,7 +340,13 @@ impl Machine<'_, '_> {
     ///
     /// A person that is running this Burn fails loudly: its reset
     /// replaces the stack the instruction would branch on, and what the
-    /// original's interpreter does then was not seen.
+    /// original's interpreter does then was not seen. So does any move
+    /// that changes the running object's stack another way, as when the
+    /// person uses it and its reset ends that use and resets it.
+    ///
+    /// A fault in the reset or the put keeps where it happened
+    /// ([`crate::fault::Fault::nested`]): an unported case stays
+    /// unsupported, and anything else is invalid state.
     fn burn_person(&mut self, id: u16) -> Result<(), Trap> {
         if id == self.me {
             return Err(Trap::Unsupported(format!(
@@ -348,11 +354,24 @@ impl Machine<'_, '_> {
                  restarts the thread the instruction would branch on (0x44df25)"
             )));
         }
+        let before = running_stack(self.me()?);
+        self.move_burned_person(id)?;
+        if running_stack(self.me()?) != before {
+            return Err(Trap::Unsupported(format!(
+                "Burn moving person {id} to its tile's centre reset object {}, which is running \
+                 it, so the instruction would branch on a restarted thread (0x44df25)",
+                self.me
+            )));
+        }
+        Ok(())
+    }
+
+    /// The move of [`Machine::burn_person`]: the reset, the put and the
+    /// refresh.
+    fn move_burned_person(&mut self, id: u16) -> Result<(), Trap> {
         let [p0, p1, level] = self.burn_object(id)?.position;
         let interpreter = self.interpreter();
         let me = self.me;
-        // A fault in the reset or the put keeps its kind and where it
-        // happened.
         let nested = |fault: crate::fault::Fault| {
             let context = format!("Burn moving person {id} to its tile's centre");
             match fault.nested(me) {
@@ -496,6 +515,28 @@ fn datum(object: &sims_sim::Object, index: usize) -> Result<i16, Trap> {
         .get(index)
         .copied()
         .ok_or_else(|| Trap::Invalid(format!("object {} has no data word {index}", object.id)))
+}
+
+/// What of an object's thread an instruction's branch depends on: each
+/// frame's place, stack object, arguments, locals and saved state.
+type RunningStack = Vec<(i16, u16, u16, Vec<i16>, Vec<i16>, i32, i16)>;
+
+fn running_stack(object: &sims_sim::Object) -> RunningStack {
+    object
+        .stack
+        .iter()
+        .map(|f| {
+            (
+                f.stack_object,
+                f.tree,
+                f.node,
+                f.parameters.clone(),
+                f.locals.clone(),
+                f.primitive_state,
+                f.code_owner_type,
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
