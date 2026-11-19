@@ -95,7 +95,7 @@ fn notes(fx: &Fixture) -> [i16; 4] {
 }
 
 /// The ID of the person some tests add.
-const PERSON: u16 = 50;
+pub(crate) const PERSON: u16 = 50;
 
 /// Creates a widget and stands it on a tile of level 1, in front of
 /// whatever stands there.
@@ -319,6 +319,197 @@ fn a_multi_tile_object_is_rebuilt_as_a_group() {
     assert_eq!(fx.world.objects[&lead].attributes[0], 7);
 }
 
+/// A person of [`resident`]'s type using a widget whose type changed, the
+/// widget noting each reset (function 3) in the lamp's attribute 7, and
+/// the widget's mark not to reset what depends on it set to `skip`.
+fn using_a_changed_widget(skip: bool) -> (Fixture, People, u16) {
+    using_a_widget(skip, true)
+}
+
+/// [`using_a_changed_widget`], the widget's type with a Reset tree or
+/// without one.
+fn using_a_widget(skip: bool, reset_tree: bool) -> (Fixture, People, u16) {
+    let (mut fx, file) = lot();
+    let people = resident(&mut fx);
+    let widget = stand(&mut fx, [2, 2]);
+    if reset_tree {
+        fx.add(file, CANCELLED, note(7, scope::LITERAL, 8));
+        function(&mut fx, file, 3, CANCELLED);
+    }
+    fx.world.changed_types.insert(WIDGET);
+    fx.world
+        .objects
+        .get_mut(&widget)
+        .unwrap()
+        .removal_skips_resets = skip;
+    let person = fx
+        .world
+        .objects
+        .get_mut(&PERSON)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap();
+    person
+        .object_uses
+        .push(sims_formats::saved_objects::ObjectUse {
+            target: widget as i16,
+            stack_depth: 1,
+            unknown: 0,
+        });
+    // The person told to let go resets with the program's people.
+    fx.program.people = people.clone();
+    (fx, people, widget)
+}
+
+#[test]
+fn a_person_using_a_changed_object_resets_fully() {
+    // 0x45e814: as the widget's visit resets it, the person told to let
+    // go of the widget it uses resets as with no object named. Its use
+    // ends and every person lets go of the widget again (this one
+    // skipped, being in the middle of it), the widget resets, then the
+    // person resets (its function 3). Then the widget's own reset and
+    // Init follow.
+    let (mut fx, people, widget) = using_a_changed_widget(false);
+    let visited = visit_with(&mut fx, widget, &people);
+    assert_eq!(
+        visited,
+        [
+            (widget, 2),
+            (widget, 3),
+            (PERSON, 3),
+            (widget, 3),
+            (widget, 0)
+        ]
+    );
+    assert_eq!(fx.lamp().attributes[7], 8);
+    let sim = &fx.world.objects[&PERSON];
+    let person = sim.person.as_ref().unwrap();
+    assert!(person.object_uses.is_empty());
+    assert_eq!((sim.stack.len(), sim.stack[0].tree), (1, RESIDENT_MAIN));
+    // The reset reloaded the profile.
+    assert_eq!(person.data[58], 27);
+}
+
+#[test]
+fn a_person_reset_for_an_object_it_uses_keeps_its_other_queued_actions() {
+    // With an object named, the full reset leaves the queue to the filter
+    // (0x45eac7): the action on the widget goes, the one on the other
+    // widget stays. With none, the reset cancels the whole queue
+    // (0x45ecc2).
+    let (mut fx, people, widget) = using_a_changed_widget(false);
+    let other = stand(&mut fx, [4, 4]);
+    let person = fx
+        .world
+        .objects
+        .get_mut(&PERSON)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap();
+    let mut on_widget = person.last.clone();
+    on_widget.target = widget as i16;
+    let mut on_other = person.last.clone();
+    on_other.target = other as i16;
+    person.queue = vec![on_widget, on_other];
+    visit_with(&mut fx, widget, &people);
+    let person = fx.world.objects[&PERSON].person.as_ref().unwrap();
+    let queued: Vec<_> = person.queue.iter().map(|a| a.target).collect();
+    assert_eq!(queued, [other as i16]);
+}
+
+#[test]
+fn a_used_object_reset_while_it_is_deleted_is_not_rebuilt() {
+    // The widget, with no Reset tree, has its deletion mark (object flag
+    // 0x40, 0x441039) before people let go of it, so the person's reset
+    // that ends its use takes it off the lot instead of rebuilding it: it
+    // runs no Init.
+    let (mut fx, _, widget) = using_a_widget(false, false);
+    let asked = RefCell::new(Vec::new());
+    let mut interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    interpreter.asked = Some(&asked);
+    interpreter.delete(&mut fx.world, widget).unwrap();
+    let asked: Vec<_> = asked
+        .into_inner()
+        .into_iter()
+        .map(|Asked { object, function }| (object, function))
+        .collect();
+    assert_eq!(asked, [(widget, 10), (PERSON, 3), (widget, 10)]);
+    assert!(!fx.world.objects.contains_key(&widget));
+    let person = fx.world.objects[&PERSON].person.as_ref().unwrap();
+    assert!(person.object_uses.is_empty());
+}
+
+#[test]
+fn a_full_reset_that_fails_takes_back_the_sounds_it_noted() {
+    // The widget resets as the person's use of it ends, which stops its
+    // sounds; then the person's own reset fails for want of a profile.
+    // The person's reset leaves the lot as it found it, and takes back
+    // the sounds it noted.
+    let (mut fx, people, widget) = using_a_changed_widget(false);
+    fx.program.people = People::default();
+    let before = fx.world.clone();
+    let sink = RefCell::new(Vec::new());
+    let mut interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    interpreter.sounds = Some(&sink);
+    let fault = interpreter
+        .visit(&mut fx.world, widget, &people)
+        .unwrap_err();
+    assert!(fault.to_string().contains("no profile"), "{fault}");
+    assert_eq!(sink.take(), []);
+    // The person still uses the widget, with the frames it had.
+    let uses = |world: &sims_sim::World| {
+        let sim = &world.objects[&PERSON];
+        let person = sim.person.as_ref().unwrap();
+        let uses: Vec<_> = person.object_uses.iter().map(|u| u.target).collect();
+        (uses, sim.stack.len())
+    };
+    assert_eq!(uses(&fx.world), uses(&before));
+}
+
+#[test]
+fn a_person_using_an_object_marked_not_to_reset_others_does_not_reset_it() {
+    // The widget's flag 0x1000 decides it (0x45e7c8): its use ends, but
+    // the person's reset neither tells anyone to let go of it nor resets
+    // it.
+    let (mut fx, people, widget) = using_a_changed_widget(true);
+    let visited = visit_with(&mut fx, widget, &people);
+    assert_eq!(
+        visited,
+        [(widget, 2), (PERSON, 3), (widget, 3), (widget, 0)]
+    );
+    let person = fx.world.objects[&PERSON].person.as_ref().unwrap();
+    assert!(person.object_uses.is_empty());
+}
+
+#[test]
+fn a_person_whose_reset_ends_its_use_of_itself_skips_its_own_reset() {
+    // The use of itself ends; the reset of the object it used is its own,
+    // which it skips, being in the middle of it (0x45e7b2).
+    let (mut fx, _) = lot();
+    let people = resident(&mut fx);
+    fx.world.changed_types.insert(RESIDENT);
+    let person = fx
+        .world
+        .objects
+        .get_mut(&PERSON)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap();
+    person
+        .object_uses
+        .push(sims_formats::saved_objects::ObjectUse {
+            target: PERSON as i16,
+            stack_depth: 1,
+            unknown: 0,
+        });
+    let visited = visit_with(&mut fx, PERSON, &people);
+    assert_eq!(visited, [(PERSON, 3), (PERSON, 0)]);
+    let person = fx.world.objects[&PERSON].person.as_ref().unwrap();
+    assert!(person.object_uses.is_empty());
+}
+
 #[test]
 fn a_person_using_a_changed_object_stops_its_visit() {
     let (mut fx, _) = lot();
@@ -338,7 +529,7 @@ fn a_person_using_a_changed_object_stops_its_visit() {
 /// The GUID of the person type some tests add, and its trees.
 const RESIDENT: u32 = 0x7777;
 const RESIDENT_INIT: u16 = 4300;
-const RESIDENT_MAIN: u16 = 4301;
+pub(crate) const RESIDENT_MAIN: u16 = 4301;
 const RESIDENT_RESET: u16 = 4302;
 const RESIDENT_LOAD: u16 = 4303;
 const CANCELLED: u16 = 4204;
@@ -348,7 +539,7 @@ const CANCELLED: u16 = 4204;
 /// record 9 of revision 10, whose person data word n holds 1000 + n, and
 /// the type's profile. Init writes 5 to the lamp's attribute 4, Reset
 /// writes 6 to its attribute 5, and Load would write 7 to its attribute 6.
-fn resident(fx: &mut Fixture) -> People {
+pub(crate) fn resident(fx: &mut Fixture) -> People {
     let file = fx.add_type(RESIDENT, 2, RESIDENT_INIT, RESIDENT_MAIN);
     fx.add(file, RESIDENT_INIT, note(4, scope::LITERAL, 5));
     fx.add(

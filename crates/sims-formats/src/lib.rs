@@ -2,6 +2,7 @@
 pub mod behavior;
 pub mod career;
 pub mod execution;
+pub mod family_file;
 pub mod far;
 pub mod ffn;
 pub mod field;

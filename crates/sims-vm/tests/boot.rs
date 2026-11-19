@@ -693,36 +693,36 @@ const TICK_2881: &str = "188f9b871cce34364855812052ecf7d07a9b00372722a2bc9003fcd
 /// the end.
 const TICK_2881_29: &str = "676bb460cff0b76873e6f22642694133f44f86bc2fd2c036618c3e51af97085a";
 /// The same at tick 3432.
-const TICK_3432: &str = "16aedd4cd03d4cfe2d971af58faab9d2d359892463677aa4632227847d2a2c08";
+const TICK_3432: &str = "55482559b1a7d5247386fdfca0709c0c5566c71af7c3c9bd1a9cb62386750158";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
-const TICK_3432_29: &str = "3a1e59fa43dd54046769ec74d68e799cd137b7908ebda673a7b026c463936d8f";
+const TICK_3432_29: &str = "9087d7f2e433612a602116c09f22c9be7199d88fdcc41527a4baafb6b23f431c";
 /// The same at tick 3602, the last whose lot random stream matches track
 /// 2's recording `goth-day-20261115`.
-const TICK_3602: &str = "2f8e80d9d198042ee0b33ebb180249f5b0da4562691821ac406ad76cc986393f";
+const TICK_3602: &str = "bdfc30d64f1e9ff32be3f2f8cceb753a7496f9f213f19b97a2451fef2b311d56";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
-const TICK_3602_29: &str = "bbcf10f59f0a9fd1cb417f60ec8e62c7f458813dad1ebfd40b44cb4e7879ba67";
+const TICK_3602_29: &str = "a7a4eab849cc91807e8dac83afb01ecf2148e022c979cf1ac2972449fe023b3d";
 /// The same at tick 3603.
-const TICK_3603: &str = "297fee6730635df7bc11aedcd80a7bbd04670654c85343ac04e358d536b2a013";
+const TICK_3603: &str = "b665bb10ce579ec16050a9288d59ff5de572b8c0fb81327378cbd89c41d10fad";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
-const TICK_3603_29: &str = "ec3305de3debfc918a1e32666d19b0e8001733ac8af5cadb13600a4226b95981";
+const TICK_3603_29: &str = "030d987956c65839e8d3238acab142e15c68af89e3cc9a65061056298f539359";
 /// The same at tick 3912.
-const TICK_3912: &str = "7c365edf428c95c25dcbb51218ccb5a348f63d4586aac92b0b1df97b705f0ac9";
+const TICK_3912: &str = "6b01ab83fb3b4e5c9f67562e6efd8afd72d8bcf6d8d63f066f43d7e832ef6065";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
-const TICK_3912_29: &str = "5b7d8a7d815f5fc6bcd84b77434f61ec46f7772c9cd354b449fca5c2b05eceeb";
+const TICK_3912_29: &str = "d2824f7125dc6bc07284101390f3c34959ccd96063863efd9d0c4aec544a43b0";
 /// The same at tick 9906.
-const TICK_9906: &str = "f1ef4b6d30e73d62aaa3ce16b257037868d7368c05fc15ebd8690a3559e5a8f0";
+const TICK_9906: &str = "16bb1385922a315de2fe4a89cac6e19a75183ec6321b07a8b7f2892c13c56bcf";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
-const TICK_9906_29: &str = "ebb7406a5204ab6b9c5eebcdac273846f16c3f58e650c5fe8ae318a97b47b30e";
+const TICK_9906_29: &str = "bef4a78bee239e45fdeaa4640dd5d48dda7e68c0d607881205dbcd7dac5a9d66";
 /// The same at tick 20186.
 const TICK_20186: &str = "f1329e6c016cff01979ca690414694866b893215fbb05ec8eaefab0f5015871b";
 /// The same state's hash under snapshot format 29, which had no person
@@ -730,11 +730,11 @@ const TICK_20186: &str = "f1329e6c016cff01979ca690414694866b893215fbb05ec8eaefab
 /// the end.
 const TICK_20186_29: &str = "1627224ca1ddeddb33318c63c184cf1968e86341bdd502b5deb9c37f7fc055f7";
 /// The same at tick 31478, when the day turns.
-const TICK_31478: &str = "63a4aebacc91d3c63cbe65fd67cbf0d4c75711755aabaa3900b20c172c66d516";
+const TICK_31478: &str = "c64924f87291fd65aa1179a08ba98d903c7c53c7e9c4d5a7d8dbd91a6ea0fdf0";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
-const TICK_31478_29: &str = "34ab8467c56703f51c38d5d187cf3e4f5e7de8c3e1e2ba2296243bb22a97bc7b";
+const TICK_31478_29: &str = "c985f5b56eb02bb507444b540262030c3d9570f16a5c5bd186237881fbc5ec05";
 /// The same at tick 43200, a whole day from the load.
 const TICK_43200: &str = "04d33609afae32752e1ce3a15bcc601e401504f1eed40154e8eaa8f9b80bb6e3";
 /// The same state's hash under snapshot format 29, which had no person

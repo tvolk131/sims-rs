@@ -55,3 +55,38 @@ fn menus_open_where_the_original_opened_them() {
         assert_eq!(inside, [0, 40, 140]);
     }
 }
+
+/// The fridge's menu in track 2's recording of a snack order
+/// (goth-snack-order-20261115): pressed at (176, 198), its four entries
+/// reach further left than the press is from the screen's edge, so the
+/// window is moved to x 0 (0x5ebb10) and its middle lands 24 pixels right
+/// of the press. The boxes are the original's menu window's.
+#[test]
+fn a_menu_near_the_edge_moves_onto_the_screen_as_the_original_moved_it() {
+    let Some(root) = common::install_root() else {
+        eprintln!("skipping: set SIMS_INSTALL to lay out a pie menu");
+        return;
+    };
+    let install = Install::detect(&root).unwrap();
+    let ui = UiGraphics::open(&install).unwrap();
+    let art = Art::load(&ui, US_ENGLISH, &pie::RESOURCES).unwrap();
+    let logged = [
+        ("Have A Snack", Rect::new(144, 109, 113, 29)),
+        ("Have Quick Breakfast", Rect::new(260, 184, 180, 29)),
+        ("Have Breakfast", Rect::new(135, 258, 130, 29)),
+        ("Serve Breakfast", Rect::new(4, 184, 136, 29)),
+    ];
+    let entries: Vec<Entry> = logged
+        .iter()
+        .map(|(label, _)| Entry {
+            label: (*label).into(),
+            enabled: true,
+        })
+        .collect();
+    let layout = pie::layout([800, 600], [176, 198], "", &entries, &art).unwrap();
+    assert_eq!([layout.window.x, layout.window.y], [0, 86]);
+    assert!(layout.moved);
+    assert_eq!(layout.center, [200, 198]);
+    let rects: Vec<Rect> = layout.labels.iter().map(|l| l.rect).collect();
+    assert_eq!(rects, logged.map(|(_, rect)| rect));
+}
