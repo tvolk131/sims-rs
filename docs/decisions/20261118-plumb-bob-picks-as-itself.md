@@ -49,7 +49,8 @@ code writes it.
   The pick lists the bob's pie for the selected Sim, as the original
   does. The listing offers nothing. Of Mortimer's object words, only word 50
   changes, to 1. His stack frames (tree, node, locals) and last result
-  stay as they were. His frame storage grows, as any check's does. This is the
+  stay as they were. His frame storage can grow (the first listing in the
+  test takes it from 80 to 108 words; a second listing leaves it there). This is the
   recording's change at 622 for the words it compares
   (`the_pointer_on_the_plumb_bob_lists_the_bobs_menu`).
 - **Unverified: where the original's bob was at 622.** The recording's

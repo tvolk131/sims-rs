@@ -519,8 +519,9 @@ fn the_pointer_reaching_an_object_lists_its_menu_and_a_click_lists_it_again() {
 /// The plumb bob is picked as itself, not as the person under it: the
 /// original's bob draw makes the bob the graphic under the pointer when
 /// it changes the depth there (0x586455), and the pick then lists the
-/// bob's pie (0x48ca2c → 0x48c834). With the pointer on the bob, the
-/// selected Sim's pie is listed on object 383. As in the snack order's
+/// bob's pie (0x48ca2c → 0x48c834). With the pointer on the bob, with no
+/// person shown within the pick's reach (`pick::REACH`), the selected
+/// Sim's pie is listed on object 383. As in the snack order's
 /// recording at update 622, of Mortimer's object words only data word 50
 /// changes, to 1 (his running checks' word, set by the bob's check
 /// trees); his frames (tree, node, locals) and his last result stay as

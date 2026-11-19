@@ -424,24 +424,34 @@ fn the_lot_hides_the_people_behind_it() {
                     let report = people.draw_on_lot(&solo, &camera, &mut on);
                     assert!(report.problems.is_empty(), "{:?}", report.problems);
                     // Drawn again, noting apart from the IDs which pixels
-                    // the canvas took: those name the person (or the
-                    // plumb bob they hold, for its own pixels), and every
-                    // other pixel names what it named before.
+                    // the canvas took: those name the person, or the
+                    // plumb bob they hold where the bob's own draw took
+                    // them, and every other pixel names what it named
+                    // before. Which pixels are the bob's is told by a
+                    // draw without it: a pixel the body took there, with
+                    // the same colour, is the body's.
                     let bob = sims_people::bob::held_by(&solo, id);
-                    let mut noted = Taken {
-                        canvas: base.clone(),
-                        taken: vec![false; base.width * base.height],
-                    };
                     let depth = sims_render::depth::Depth::new(&camera);
-                    people.draw(&solo, &camera, &mut noted, |f, e, l| depth.point(f, e, l));
+                    let mut note = |world: &World| {
+                        let mut noted = Taken {
+                            canvas: base.clone(),
+                            taken: vec![false; base.width * base.height],
+                        };
+                        people.draw(world, &camera, &mut noted, |f, e, l| depth.point(f, e, l));
+                        noted
+                    };
+                    let noted = note(&solo);
                     assert_eq!(noted.canvas, on);
+                    let mut bobless = solo.clone();
+                    if bob.is_some() {
+                        bobless.objects.get_mut(&id).unwrap().slots[2].object = 0;
+                    }
+                    let body = note(&bobless);
                     for (x, y) in pixels(&on) {
                         let i = y as usize * on.width + x as usize;
                         let expected = if noted.taken[i] {
-                            if bob.is_some() && on.id_at(x, y) == bob {
-                                continue;
-                            }
-                            Some(id)
+                            let bodys = body.taken[i] && body.canvas.color[i] == on.color[i];
+                            if bodys { Some(id) } else { bob.or(Some(id)) }
                         } else {
                             assert_eq!(on.color[i], base.color[i], "{x}, {y}");
                             base.id_at(x, y)
