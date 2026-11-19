@@ -71,10 +71,11 @@ None of this changes the strict Goth day: its hashes are those of
 **Where the old run stopped.** At step 16218 fire 46 burned person 27,
 and person 27's reset made Mortimer and person 12 let go of fire 41,
 which all three used. Person 12 sat on a sofa. For a person inside an
-object, the original takes it off the lot and tests and searches from
-where it is then. It discards what it finds, takes the person off again,
-and puts it at or near the lot's centre (0x45e8dd, 0x45e977). Taking a
-person off the lot refreshes its animator only if the house view drew
-it, which is not kept. A reset person stays on the lot afterwards, so
-that refresh would have to be held until its animator's next tick,
-possibly in a later update. That is not ported, and it fails loudly.
+object, the original takes it off the lot and tests and, on refusal,
+searches from where it is then (0x45e8dd). The position found goes
+unused. If the person is still off the lot and the deletion mark is
+clear, it takes the person off again and puts it at or near the lot's
+centre (0x45e977 to 0x45ea4d). The take-off's animator refresh depends
+on animator byte +0x109 (0x58da12), which the house view writes. The
+refresh can outlast the scheduler pass. Both reset cases still fail
+loudly. See `20261119-person-reset-inside-object-or-off-lot.md`.

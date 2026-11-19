@@ -17,7 +17,7 @@ use std::collections::BTreeSet;
 use crate::fault::{Fault, Trap};
 use crate::interpreter::Interpreter;
 use crate::object_uses::no_action;
-use crate::placement::capture;
+use crate::placement::{capture, stands_on_lot};
 use sims_content::{People, Profile, Skeleton};
 use sims_sim::World;
 use sims_sim::characters;
@@ -370,11 +370,11 @@ impl Interpreter<'_> {
     /// (0x45e8c3, 0x46e042), which changes nothing kept
     /// (`primitives::headline`).
     ///
-    /// These fail, because the original does more for them and none was
-    /// seen: a person inside another object (0x45e8dd) or, unless it is being
-    /// deleted ([`Interpreter::reset_person_to_delete`]), off the lot
-    /// (0x45e977), which the original moves; and a person whose data word
-    /// 73 is set, whose footprint the original then works out again.
+    /// A person inside another object (0x45e8dd), or off the lot outside
+    /// deletion (0x45e977), fails because its take-off can leave an
+    /// animator refresh (0x58da12) pending beyond the scheduler pass.
+    /// A person whose data word 73 is set fails because the original then
+    /// works out its footprint again.
     ///
     /// So does an animator the reset cannot handle (see
     /// [`sims_sim::animator::Animator::reset`]).
@@ -628,14 +628,20 @@ impl Interpreter<'_> {
             return Err(unsupported("whose data word 73 is set"));
         }
         let profile = profile(people, world, guid).map_err(fail)?;
-        let place = capture(world, id).map_err(fail)?;
-        if place.container.is_some() {
-            return Err(unsupported("that is inside an object (0x45e8dd)"));
+        if capture(world, id).map_err(fail)?.container.is_some() {
+            return Err(fail(Trap::Unsupported(
+                "resetting a person inside an object (0x45e8dd) can leave its animator \
+                 refresh (0x58da12) pending beyond the scheduler pass"
+                    .into(),
+            )));
         }
-        if !place.on_lot && !deleting {
-            return Err(unsupported(
-                "that is off the lot, which puts it back on the lot (0x45e977)",
-            ));
+        // 0x45e95d to 0x45e971: the deletion mark skips the lot bounds test.
+        if !deleting && !stands_on_lot(world, id).map_err(fail)? {
+            return Err(fail(Trap::Unsupported(
+                "resetting a person off the lot (0x45e977) can leave its animator \
+                 refresh (0x58da12) pending beyond the scheduler pass"
+                    .into(),
+            )));
         }
         let person = world
             .objects

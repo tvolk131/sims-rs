@@ -8,7 +8,8 @@ use crate::support::*;
 use sims_content::People;
 use sims_formats::execution::ObjectFunction;
 use sims_formats::saved_objects::Multipart;
-use sims_vm::{Asked, INDICATORS, Interpreter, Status};
+use sims_sim::animator::LOADED;
+use sims_vm::{Asked, INDICATORS, Interpreter, Status, Trap};
 use std::cell::RefCell;
 
 const BUDGET: usize = 1000;
@@ -927,11 +928,6 @@ fn a_person_the_reset_would_do_more_for_stops_its_visit() {
     };
     let wide = person(&|p| p.data[73] = 1);
     assert!(wide.contains("whose data word 73 is set"), "{wide}");
-    let away = fails(&|object| object.position = [-16, -16, 1]);
-    assert!(
-        away.contains("off the lot") && away.contains("0x45e977"),
-        "{away}"
-    );
     // Without a neighborhood record, or with one whose revision is below
     // 0, the visit fails before anything else.
     let nobody = lot_fails(&|world| world.neighbors.slots.clear());
@@ -940,6 +936,89 @@ fn a_person_the_reset_would_do_more_for_stops_its_visit() {
     assert!(bare.contains("has revision -1"), "{bare}");
     // The lot was not touched by any of it.
     assert!(fx.world.objects[&PERSON].stack.len() == 1);
+}
+
+fn resident_for_placement_reset(fx: &mut Fixture) -> People {
+    let people = resident(fx);
+    fx.world.changed_types.insert(RESIDENT);
+    let cell = (3 * 64 + 3) * 2;
+    fx.world.arrays.get_mut(&3).unwrap().data[cell..cell + 2].fill(0);
+    let mut animator = LOADED;
+    animator.clock = 123;
+    fx.world.animators.insert(PERSON, animator);
+    people
+}
+
+#[test]
+fn resetting_a_contained_person_refuses_the_pending_refresh() {
+    let (mut fx, file) = lot();
+    let people = resident_for_placement_reset(&mut fx);
+    fx.words(file)[20] = 5;
+    fx.program
+        .libraries
+        .get_mut(&file)
+        .unwrap()
+        .containers
+        .insert(5, 1);
+    let seat = stand(&mut fx, [2, 2]);
+    let position = fx.world.objects[&seat].position;
+    fx.world.objects.get_mut(&seat).unwrap().slots[1].object = PERSON as i16;
+    let sim = fx.world.objects.get_mut(&PERSON).unwrap();
+    sim.position = position;
+    (sim.data[2], sim.data[3], sim.data[14], sim.data[26]) = (seat as i16, 0, 1, seat as i16);
+    let animator = fx.world.animators[&PERSON].clone();
+
+    let asked = RefCell::new(Vec::new());
+    let mut interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    interpreter.asked = Some(&asked);
+    let fault = interpreter
+        .visit(&mut fx.world, PERSON, &people)
+        .unwrap_err();
+    assert!(matches!(&fault.trap, Trap::Unsupported(message)
+        if message.contains("0x45e8dd") && message.contains("0x58da12")));
+    assert_eq!(fx.world.objects[&PERSON].position, position);
+    assert_eq!(fx.world.objects[&seat].slots[1].object, PERSON as i16);
+    assert_eq!(grid(&fx, [2, 2]), seat);
+    assert_eq!(fx.world.animators[&PERSON], animator);
+    assert!(asked.borrow().is_empty());
+}
+
+#[test]
+fn resetting_an_off_lot_person_refuses_the_pending_refresh_except_for_deletion() {
+    let (mut fx, _) = lot();
+    let people = resident_for_placement_reset(&mut fx);
+    fx.program.people = people.clone();
+    let animator = fx.world.animators[&PERSON].clone();
+    let asked = RefCell::new(Vec::new());
+    let mut interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    interpreter.asked = Some(&asked);
+    // Tile (5, 3) is also off this six-tile lot (0x432595).
+    for position in [[88, 56, 1], [-16, -16, 1]] {
+        fx.world.objects.get_mut(&PERSON).unwrap().position = position;
+        let fault = interpreter
+            .visit(&mut fx.world, PERSON, &people)
+            .unwrap_err();
+        assert!(matches!(&fault.trap, Trap::Unsupported(message)
+            if message.contains("0x45e977") && message.contains("0x58da12")));
+        assert_eq!(fx.world.objects[&PERSON].position, position);
+        assert_eq!(grid(&fx, [3, 3]), 0);
+        assert_eq!(fx.world.animators[&PERSON], animator);
+        assert!(asked.borrow().is_empty());
+    }
+
+    // The deletion mark skips 0x45e977. The last Reset tree still runs.
+    interpreter.delete(&mut fx.world, PERSON).unwrap();
+    assert_eq!(
+        *asked.borrow(),
+        [Asked {
+            object: PERSON,
+            function: 3
+        }]
+    );
+    assert_eq!(fx.lamp().attributes[5], 6);
+    assert_eq!(grid(&fx, [3, 3]), 0);
+    assert!(!fx.world.objects.contains_key(&PERSON));
+    assert!(!fx.world.animators.contains_key(&PERSON));
 }
 
 #[test]
