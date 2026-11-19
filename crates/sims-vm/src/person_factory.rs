@@ -166,6 +166,13 @@ impl Interpreter<'_> {
         Ok(id)
     }
 
+    /// Whether the lot is residential (0x40745f): its zoning (0x42b9e3,
+    /// by the lot number in global 10) is 1. Lot 0 has zoning 1.
+    fn residential(&self, world: &World) -> bool {
+        let lot = world.globals.get(LOT).copied().unwrap_or(0);
+        lot == 0 || self.program.zoning.get(&lot) == Some(&1)
+    }
+
     /// The visitor pass (0x42a2b4), which the lot runs when the factory
     /// announces a new person (signal 0xe2, 0x440ed7, handled at
     /// 0x4163f7): every person's word 32 is worked out again
@@ -194,8 +201,7 @@ impl Interpreter<'_> {
             .ok_or_else(|| {
                 Trap::Invalid(format!("global 9 names family {family}, which is gone"))
             })?;
-        let lot = world.globals.get(LOT).copied().unwrap_or(0);
-        let residential = lot == 0 || self.program.zoning.get(&lot) == Some(&1);
+        let residential = self.residential(world);
         for id in world.people.clone() {
             let Some(object) = world.objects.get_mut(&id) else {
                 continue;
@@ -314,8 +320,7 @@ impl Interpreter<'_> {
                 .map_err(fail)?;
         }
         self.init(world, id)?;
-        let lot = world.globals.get(LOT).copied().unwrap_or(0);
-        let residential = self.program.zoning.get(&lot) == Some(&1);
+        let residential = self.residential(world);
         let person = world
             .objects
             .get_mut(&id)

@@ -36,6 +36,12 @@ which family the game holds, so the pass fails loudly
 family fails as invalid. Other objects' 0xe2 changes nothing in the
 simulation, so nothing is done for them.
 
+The construction reset's own test (0x4599f8, before 0x459a0b) goes
+through 0x40745f too, for which lot 0 (global 10 at 0) has zoning 1
+(0x42b9e3). The port took lot 0 there as not residential. Both now use
+one test. The pass that follows decides word 32 anyway, so this changes
+no result.
+
 **What it changes at 3603.** The two new people are not of the Goth
 family, so the pass makes each a visitor (word 32 is 1). Create New
 Object Instance's tail (0x44e7dd) then runs each one's "init visitor"
