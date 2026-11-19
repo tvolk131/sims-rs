@@ -175,31 +175,26 @@ fn an_empty_or_missing_name_and_another_table_are_native_errors() {
 }
 
 #[test]
-fn an_accessory_no_skeleton_file_names_fails_before_any_change() {
+fn failed_dresses_append_unnamed_entries_that_survive_undress_and_a_snapshot() {
     let mut fx = Fixture::new();
     name_accessories(&mut fx);
+    assert!(run_change(&mut fx, 2, 2, 0).unwrap());
+    assert!(run_change(&mut fx, 0, 0, 0).unwrap());
     fx.program.people.suits.remove("hat");
-    let error = trap(run_change(&mut fx, 2, 2, 0)).to_string();
-    assert!(error.contains("no decoded avatar file"), "{error}");
-    assert!(!error.contains("stopped decoding"), "{error}");
-    assert!(worn(&fx).is_empty());
-    // Taking it off needs no bind.
-    fx.sim_mut().person.as_mut().unwrap().accessories = vec![Accessory {
-        name: "hat".into(),
-        binding: String::new(),
-    }];
-    assert!(run_change(&mut fx, 2, 2, 1).unwrap());
-    assert!(worn(&fx).is_empty());
-    // Files that stopped decoding are named, since the suit may be in one.
-    fx.program
-        .people
-        .suit_errors
-        .insert("GameData/x.bcf".into(), "truncated".into());
-    let error = trap(run_change(&mut fx, 2, 2, 0)).to_string();
-    assert!(
-        error.contains("1 avatar files stopped decoding: GameData/x.bcf"),
-        "{error}"
+    assert!(run_change(&mut fx, 2, 2, 0).unwrap());
+    assert_eq!(
+        worn(&fx),
+        [("cane", ""), ("", "")].map(|(n, b)| (n.to_string(), b.to_string()))
     );
+
+    assert!(run_change(&mut fx, 2, 2, 0).unwrap());
+    let expected = [("cane", ""), ("", ""), ("", "")].map(|(n, b)| (n.to_string(), b.to_string()));
+    assert_eq!(worn(&fx), expected);
+
+    fx.world = sims_sim::World::decode(&fx.world.encode()).unwrap();
+    assert_eq!(worn(&fx), expected);
+    assert!(run_change(&mut fx, 2, 2, 1).unwrap());
+    assert_eq!(worn(&fx), expected);
 }
 
 #[test]

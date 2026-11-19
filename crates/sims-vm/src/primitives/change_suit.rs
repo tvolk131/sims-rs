@@ -17,8 +17,8 @@
 //!   0x2f, and a missing or empty string 0x30. The accessory goes on
 //!   through the animator's virtual function 0xd8 (0x58d88f, "dress")
 //!   with an empty binding, and comes off through 0xdc (0x58d919,
-//!   "undress"). Putting on a name no decoded avatar file defines fails
-//!   loudly: the original keeps an unnamed entry then, not ported.
+//!   "undress"). A failed suit lookup (0x5a044d) leaves an entry at the
+//!   end with an empty name and binding.
 //!
 //! Any other operand 1 is native error 0x2f. The primitive always
 //! branches true.
@@ -51,23 +51,7 @@ impl Machine<'_, '_> {
             1 => self.change_into(index)?,
             0 | 2 => {
                 let name = self.accessory_name(scope, index)?;
-                if !off && !self.program.people.suits.contains(&name) {
-                    let errors = &self.program.people.suit_errors;
-                    let unread = if errors.is_empty() {
-                        String::new()
-                    } else {
-                        format!(
-                            " ({} avatar files stopped decoding: {})",
-                            errors.len(),
-                            errors.keys().cloned().collect::<Vec<_>>().join(", ")
-                        )
-                    };
-                    return Err(Trap::Unsupported(format!(
-                        "Change Suit puts on accessory {name:?}, which no decoded avatar \
-                         file names{unread}: the original keeps an entry with an empty name \
-                         when the suit lookup (0x5a044d) fails, which is not ported"
-                    )));
-                }
+                let found = !off && self.program.people.suits.contains(&name);
                 let accessories = &mut self
                     .me_mut()?
                     .person
@@ -77,7 +61,7 @@ impl Machine<'_, '_> {
                 if off {
                     undress(accessories, &name);
                 } else {
-                    dress(accessories, name);
+                    dress(accessories, name, found);
                 }
             }
             _ => return Err(Trap::native(0x2f, "invalid accessory string table")),
@@ -172,23 +156,17 @@ impl Machine<'_, '_> {
     }
 }
 
-/// Puts on accessory `name` (0x58d88f): takes off any of that name, then
+/// Puts on accessory `name` (0x58d88f). Takes off any of that name, then
 /// adds one at the end with an empty binding.
 ///
-/// The original adds the entry first and then binds its suit to the
-/// skeleton (0x583559), keeping the name only when that works; an entry
-/// that does not bind stays, with an empty name. The bind fails only when
-/// the suit lookup (0x5a044d) does: the name is not in the avatar
-/// registry, or the registry's lazy load of it (0x5a38da) fails. The
-/// attach after it (0x599427, through 0x5954d8) has no failure path.
-/// Callers refuse a name no decoded avatar file defines (`People::suits`)
-/// and take any other to bind. That the registry holds exactly those
-/// names is **unverified**: the capture shows the entry count, not its
-/// name.
-pub(crate) fn dress(accessories: &mut Vec<Accessory>, name: String) {
+/// The original appends an empty entry, then fills it if it binds a suit
+/// to the skeleton (0x583559). A failed lookup (0x5a044d) leaves both
+/// strings empty. We use `People::suits` for the lookup. Its agreement
+/// with the original registry and lazy loads (0x5a38da) is unverified.
+pub(crate) fn dress(accessories: &mut Vec<Accessory>, name: String, found: bool) {
     undress(accessories, &name);
     accessories.push(Accessory {
-        name,
+        name: if found { name } else { String::new() },
         binding: String::new(),
     });
 }
@@ -213,9 +191,17 @@ mod tests {
     #[test]
     fn dressing_replaces_an_accessory_of_the_same_name_at_the_end() {
         let mut list = vec![named("suit-book101"), named("hat")];
-        dress(&mut list, "suit-book101".into());
+        dress(&mut list, "suit-book101".into(), true);
         let names: Vec<_> = list.iter().map(|a| (&*a.name, &*a.binding)).collect();
         assert_eq!(names, [("hat", "R_HAND"), ("suit-book101", "")]);
+    }
+
+    #[test]
+    fn a_failed_dress_replaces_the_named_entry_with_an_empty_one_at_the_end() {
+        let mut list = vec![named("hat"), named("cane"), named("hat")];
+        dress(&mut list, "hat".into(), false);
+        let entries: Vec<_> = list.iter().map(|a| (&*a.name, &*a.binding)).collect();
+        assert_eq!(entries, [("cane", "R_HAND"), ("", "")]);
     }
 
     #[test]
