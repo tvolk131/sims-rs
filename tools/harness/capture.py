@@ -45,11 +45,15 @@ when it cannot be worked out it waits again (watch_lost). Writes between the
 change and that stop are not seen.
 
 --late-watch FROM[-TO],NAME=EXPR[:SIZE] is a watch set at the end of lot
-update FROM - 1 (at the first stop for FROM 1) and, if TO is given, cleared
-at the end of update TO. It sees every write between the rows of updates
-FROM - 1 and TO in updates.jsonl, which are the writes that change rows FROM
-to TO: a frame drawn between two updates counts with the update after it.
-So a watch on a busy address (the random state) costs nothing while the
+update FROM - 1 (at the entry of update 1 for FROM 1, once the game's
+process is known) and, if TO is given, cleared at the end of update TO. So
+it covers the writes between the rows of updates FROM - 1 and TO in
+updates.jsonl, which are the writes that change rows FROM to TO: a frame
+drawn between two updates changes the row of the update after it. Such a
+write is logged, as any watch's is, with the update before it and
+in_update false. A moving watch misses what the paragraph above says it
+misses. The lot update's entry is a breakpoint only while a watch is set,
+so a watch on a busy address (the random state) costs nothing while the
 load and the other updates run.
 
 The executable digests that guest/launch.sh verified (share/game-identity.txt)
@@ -310,11 +314,17 @@ class Watch:
     @classmethod
     def late(cls, text):
         """A watch given as FROM[-TO],NAME=EXPR[:SIZE] (see the module's doc)."""
-        span, _, rest = text.partition(',')
-        first, _, last = span.partition('-')
-        w = cls(rest)
-        w.first, w.last = int(first), int(last) if last else None
-        assert w.first >= 1 and (w.last is None or w.last >= w.first), text
+        span, comma, rest = text.partition(',')
+        first, dash, last = span.partition('-')
+        if not (comma and first.isdigit() and (last.isdigit() or not dash)):
+            raise argparse.ArgumentTypeError(f'not FROM[-TO],NAME=EXPR[:SIZE]: {text!r}')
+        try:
+            w = cls(rest)
+        except (AssertionError, ValueError, IndexError) as e:
+            raise argparse.ArgumentTypeError(f'not a watch: {rest!r}') from e
+        w.first, w.last = int(first), int(last) if dash else None
+        if w.first < 1 or (w.last is not None and w.last < w.first):
+            raise argparse.ArgumentTypeError(f'not 1 <= FROM <= TO: {text!r}')
         w.text = text
         return w
 
@@ -885,7 +895,7 @@ def main():
                           packets=remote.packets, sim=regs['ecx'])
                     if 1 in dump_set:  # the baseline is the entry of lot update 1
                         save_dump(1, regs, raw)
-                    if not (watches or runner):
+                    if not (live_watches or pending or args.watch or runner):
                         disarm(ENTRY)
                     arm(RETURN)
                     in_update = True
@@ -893,7 +903,7 @@ def main():
                     in_update = True
                     if updates + 1 in dump_set:
                         save_dump(updates + 1, regs, raw)
-                    if not (watches or runner):
+                    if not (live_watches or pending or args.watch or runner):
                         disarm(ENTRY)
                 else:
                     elsewhere += 1
@@ -1003,6 +1013,13 @@ def main():
                     answerer.answered(record)
                 if pc == DIALOG_SHOW:
                     save_status(dialog=dict(update=updates + 1, record=record, shown=time.time()))
+            # A late watch waits for the game's process (the baseline), then for its first update.
+            for w in [w for w in late if baseline and updates + 1 >= w.first]:
+                late.remove(w)
+                pending.append(w)
+                arm(ENTRY)
+            if not foreign and live_watches:
+                check_watches(m)
             for w in [w for w in live_watches + pending if w.last is not None and updates + 1 > w.last]:
                 if w in live_watches:
                     live_watches.remove(w)
@@ -1010,11 +1027,6 @@ def main():
                 else:
                     pending.remove(w)
                 event(kind='watch_ended', name=w.name, expr=w.text, update=updates)
-            for w in [w for w in late if updates + 1 >= w.first]:
-                late.remove(w)
-                pending.append(w)
-            if not foreign and live_watches:
-                check_watches(m)
             if not foreign and pending:
                 arm_watches(m)
             # Step past the breakpoint we stopped at (if it is still armed).

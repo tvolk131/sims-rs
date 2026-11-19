@@ -6,6 +6,7 @@ capture.main runs against a fake GDB stub (FakeRemote) and fake guest memory;
 the cases come from a review of the harness (the defects it found, fixed).
 """
 import io
+import argparse
 import json
 import os
 import stat
@@ -42,23 +43,29 @@ class FakeRemote:
         self.packets = 0
         self.watch_calls = []
         self.cleared_watches = []
+        self.watch_stops = []  # (set or clear, the pc stopped at)
+        self.armed = set()  # the breakpoints set
+        self.resumed_armed = []  # the breakpoints set at each resume
 
     def stop_reply(self):
         return 'T05'
 
     def clear_break(self, a):
-        pass
+        self.armed.discard(a)
 
     def set_break(self, a):
-        pass
+        self.armed.add(a)
 
     def set_watch(self, a, size):
         self.watch_calls.append((a, size))
+        self.watch_stops.append(('set', self.current['pc']))
 
     def clear_watch(self, a, size):
         self.cleared_watches.append((a, size))
+        self.watch_stops.append(('clear', self.current['pc']))
 
     def resume(self):
+        self.resumed_armed.append(set(self.armed))
         self.stopped = False
 
     def wait(self):
@@ -210,6 +217,55 @@ class CaptureTest(unittest.TestCase):
         self.assertEqual([r['update'] for r in ended], [3])  # at the end of update 3
         rows = self.rows(output / 'watch.jsonl')
         self.assertEqual(len(rows), 1)
+
+    def test_a_late_watch_is_set_and_cleared_at_the_ends_of_updates(self):
+        remote, _, _ = self.run_capture([
+            dict(pc=0), dict(pc=capture.ENTRY), dict(pc=capture.RETURN),
+            dict(pc=capture.ENTRY), dict(pc=capture.RETURN),
+            dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
+            ['--updates', '3', '--late-watch', '2-2,state=0x70088'])
+        # Set at the end of update 1, cleared at the end of update 2.
+        self.assertEqual(remote.watch_stops, [('set', capture.RETURN), ('clear', capture.RETURN)])
+
+    def test_a_late_watch_keeps_the_entry_breakpoint_only_while_it_is_set(self):
+        remote, _, _ = self.run_capture([
+            dict(pc=0), dict(pc=capture.ENTRY), dict(pc=capture.RETURN),
+            dict(pc=capture.RETURN),  # update 2: the entry is not a breakpoint
+            dict(pc=capture.ENTRY), dict(pc=capture.RETURN),
+            dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
+            ['--updates', '4', '--late-watch', '3-3,state=0x70088'])
+        entry = [capture.ENTRY in armed for armed in remote.resumed_armed]
+        # Set for the baseline and not after it, set again at the end of
+        # update 2 for the watch, and cleared at the entry of update 4.
+        self.assertEqual(entry, [True, False, False, True, True, True, False])
+        self.assertEqual(remote.watch_stops, [('set', capture.RETURN), ('clear', capture.RETURN)])
+
+    def test_a_late_watch_from_update_1_waits_for_the_game(self):
+        # A dialog stop before the baseline does not set it.
+        remote, output, _ = self.run_capture([
+            dict(pc=0), dict(pc=capture.DIALOG_SHOW, cr3=OTHER_CR3),
+            dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
+            ['--updates', '1', '--late-watch', '1,state=0x70088'])
+        kinds = [r['kind'] for r in self.rows(output / 'events.jsonl')]
+        self.assertLess(kinds.index('baseline'), kinds.index('watch_armed'))
+        self.assertEqual(remote.watch_stops[0], ('set', capture.ENTRY))
+
+    def test_a_late_watch_already_over_is_not_set_on_resume(self):
+        def prepare(output):
+            (output / 'events.jsonl').write_text(json.dumps(dict(kind='baseline', cr3=GAME_CR3)) + '\n')
+            (output / 'updates.jsonl').write_text(''.join(
+                json.dumps(dict(update=n, tick=99, lot_rng=0, global_rng=0, crt=0, scheduler_cursor=0)) + '\n'
+                for n in (1, 2, 3)))
+        remote, output, _ = self.run_capture(
+            [dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
+            ['--updates', '4', '--resume', '--late-watch', '2-3,state=0x70088'], prepare=prepare)
+        self.assertEqual(remote.watch_calls, [])
+        self.assertEqual(self.events(output, 'watch_armed'), [])
+
+    def test_a_late_watch_that_does_not_parse_is_an_argument_error(self):
+        for text in ['3-2,x=0x70088', '3-,x=0x70088', '3x=0x70088', '0,x=0x70088', '2,x=0x70088:3', '2,=0x70088']:
+            with self.assertRaises(argparse.ArgumentTypeError, msg=text):
+                capture.Watch.late(text)
 
     def test_a_late_watch_reads_its_updates(self):
         w = capture.Watch.late('4150-4370,rng=0x6e54ac:4')
