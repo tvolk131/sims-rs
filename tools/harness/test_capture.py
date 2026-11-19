@@ -195,6 +195,28 @@ class CaptureTest(unittest.TestCase):
         armed = self.events(output, 'watch_armed')
         self.assertEqual([r['address'] for r in armed], [0x70088, 0x90088])
 
+    def test_a_late_watch_is_set_only_for_its_updates(self):
+        remote, output, _ = self.run_capture([
+            dict(pc=0), dict(pc=capture.ENTRY), dict(pc=capture.RETURN),
+            dict(pc=capture.ENTRY), dict(pc=0x123456, reply='T05watch:70088;'), dict(pc=capture.RETURN),
+            dict(pc=capture.ENTRY), dict(pc=capture.RETURN),
+            dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
+            ['--updates', '4', '--late-watch', '2-3,state=0x70088'])
+        self.assertEqual(remote.watch_calls, [(0x70088, 4)])
+        self.assertEqual(remote.cleared_watches, [(0x70088, 4)])
+        armed = self.events(output, 'watch_armed')
+        self.assertEqual([r['update'] for r in armed], [1])  # at the entry of update 2
+        ended = self.events(output, 'watch_ended')
+        self.assertEqual([r['update'] for r in ended], [3])  # at the entry of update 4
+        rows = self.rows(output / 'watch.jsonl')
+        self.assertEqual(len(rows), 1)
+
+    def test_a_late_watch_reads_its_updates(self):
+        w = capture.Watch.late('4150-4370,rng=0x6e54ac:4')
+        self.assertEqual((w.first, w.last, w.name, w.start, w.size), (4150, 4370, 'rng', 0x6e54ac, 4))
+        w = capture.Watch.late('5250,w50=object:21+0xae:2')
+        self.assertEqual((w.first, w.last, w.object, w.steps, w.size), (5250, None, 21, [('+', 0xae)], 2))
+
     def test_two_watches_can_share_a_watchpoint(self):
         remote, output, _ = self.run_capture([
             dict(pc=0), dict(pc=capture.ENTRY), dict(pc=capture.RETURN),

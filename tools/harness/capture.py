@@ -44,6 +44,11 @@ animator was replaced), the watchpoint is moved (a watch_moved event), and
 when it cannot be worked out it waits again (watch_lost). Writes between the
 change and that stop are not seen.
 
+--late-watch FROM[-TO],NAME=EXPR[:SIZE] is a watch set only from the entry
+of lot update FROM, and cleared from the entry of update TO + 1 if TO is
+given, so that a watch on a busy address (the random state) costs nothing
+while the load and the other updates run.
+
 The executable digests that guest/launch.sh verified (share/game-identity.txt)
 are recorded in status.json and as a game_identity event.
 
@@ -271,6 +276,7 @@ class Watch:
     """A write watchpoint given as NAME=EXPR[:SIZE] (see the module's doc)."""
 
     def __init__(self, text):
+        self.first, self.last = 1, None  # the lot updates it is set for (a late watch's)
         self.name, _, rest = text.partition('=')
         expr, _, size = rest.rpartition(':')
         if not size.isdigit():
@@ -297,6 +303,17 @@ class Watch:
         self.value = None
         self.pointer = None  # the object's pointer when last worked out
         self.moves = self.object is not None or any(op == '@' for op, _ in self.steps)
+
+    @classmethod
+    def late(cls, text):
+        """A watch given as FROM[-TO],NAME=EXPR[:SIZE] (see the module's doc)."""
+        span, _, rest = text.partition(',')
+        first, _, last = span.partition('-')
+        w = cls(rest)
+        w.first, w.last = int(first), int(last) if last else None
+        assert w.first >= 1 and (w.last is None or w.last >= w.first), text
+        w.text = text
+        return w
 
     def resolve(self, m, sim):
         """The address, or None while a pointer on the way is 0 or the object does not exist."""
@@ -545,6 +562,8 @@ def main():
                     'where QEMU writes the dump before it is moved to the output')
     ap.add_argument('--watch', action='append', default=[], type=Watch,
                     help='NAME=EXPR[:SIZE]: log every write to these bytes to watch.jsonl (see above)')
+    ap.add_argument('--late-watch', action='append', default=[], type=Watch.late,
+                    help='FROM[-TO],NAME=EXPR[:SIZE]: a watch set only for lot updates FROM to TO (see above)')
     ap.add_argument('--scenario', type=Path, help='run this input scenario (see input.py); needs --guest-dir. '
                     'Logged to input.jsonl')
     ap.add_argument('--window', default=os.environ.get('SIMS_WINDOW', scenario_input.WINDOW),
@@ -599,7 +618,7 @@ def main():
             kinds.append('objects_changed')
         dropped = drop_redone_events(out / 'events.jsonl', len(lines), kinds)
     events = open(out / 'events.jsonl', 'a')
-    watch_log = open(out / 'watch.jsonl', 'a') if args.watch else None
+    watch_log = open(out / 'watch.jsonl', 'a') if args.watch or args.late_watch else None
     updates_log = open(out / 'updates.jsonl', 'a')
     status = dict(started=time.time(), updates=0, state='attaching', settings={k: str(v) for k, v in vars(args).items()})
 
@@ -646,8 +665,9 @@ def main():
     sims_cr3 = None
     sim = None
     in_update = False
-    watches = args.watch
-    pending = list(watches)
+    watches = args.watch + args.late_watch
+    pending = list(args.watch)
+    late = list(args.late_watch)  # watches that wait for their first update
     live_watches = []  # watches set, each at its .address
     hardware = {}  # (address, size) -> how many armed watches use that watchpoint
 
@@ -980,6 +1000,16 @@ def main():
                     answerer.answered(record)
                 if pc == DIALOG_SHOW:
                     save_status(dialog=dict(update=updates + 1, record=record, shown=time.time()))
+            for w in [w for w in live_watches + pending if w.last is not None and updates + 1 > w.last]:
+                if w in live_watches:
+                    live_watches.remove(w)
+                    hardware_remove(w.address, w.size)
+                else:
+                    pending.remove(w)
+                event(kind='watch_ended', name=w.name, expr=w.text, update=updates)
+            for w in [w for w in late if updates + 1 >= w.first]:
+                late.remove(w)
+                pending.append(w)
             if not foreign and live_watches:
                 check_watches(m)
             if not foreign and pending:
