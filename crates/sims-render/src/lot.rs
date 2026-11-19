@@ -80,6 +80,10 @@ pub struct Lot {
     /// original reads it for the wall-top trim (0x53dbcd); None without a
     /// room 0.
     pub outdoor_light: Option<f32>,
+    /// The time of day (global 4: 0 day, 1 dusk, 2 night, 3 dawn). It
+    /// sets the brightest a lit tile is drawn ([`Lot::brightest`]) and
+    /// where the sun stands over the grass ([`crate::grass`]).
+    pub time_of_day: i16,
     /// The two triangles of each tile a diagonal wall splits, by level (1
     /// or 2), column and row: which triangle (by the corner it holds: 1
     /// south-west, 2 south-east, 3 north-east, 4 north-west) and its room.
@@ -233,6 +237,7 @@ impl Lot {
             outdoor_rooms,
             room_lights,
             outdoor_light,
+            time_of_day: world.globals.get(4).copied().unwrap_or(0),
             halves,
             lamps,
         })
@@ -300,6 +305,12 @@ impl Lot {
             return (half.1 >= 0).then_some(half.1);
         }
         (room >= 0).then_some(room)
+    }
+
+    /// The brightest a lit tile is drawn at this time of day
+    /// ([`crate::light::brightest`]).
+    pub fn brightest(&self) -> f32 {
+        crate::light::brightest(self.time_of_day)
     }
 
     /// The light byte at a fine position on a level (0 or 1): its room's

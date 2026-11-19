@@ -250,7 +250,7 @@ impl Painter<'_> {
 
     /// The light at a fine position on a level (0 or 1).
     fn light(&self, level: usize, fine: [i32; 2]) -> Light {
-        Light::from_byte(self.lot.light_at(level, fine))
+        Light::from_byte(self.lot.light_at(level, fine), self.lot.brightest())
     }
 
     /// The lamps whose pools reach tile (`x`, `y`) of a level, as view
@@ -283,7 +283,8 @@ impl Painter<'_> {
         byte: u8,
         seen: Option<(bool, [i32; 2])>,
     ) -> impl Fn(usize, usize) -> Light + use<> {
-        let pools = Light::drawn_byte(byte)
+        let brightest = self.lot.brightest();
+        let pools = Light::drawn_byte(byte, brightest)
             .zip(seen.and_then(|(along_y, tile)| self.wall_pools(level, along_y, tile)));
         let rise = pools::wall_rise(self.camera.zoom.index()) as i64;
         move |x: usize, y: usize| match &pools {
@@ -293,7 +294,7 @@ impl Painter<'_> {
                     .map(|p| u32::from(p.at(x as i64, y as i64 - rise)))
                     .sum::<u32>(),
             ),
-            None => Light::from_byte(byte),
+            None => Light::from_byte(byte, brightest),
         }
     }
 
@@ -418,7 +419,10 @@ impl Painter<'_> {
                     let lamps = self.lamps(index, [x, y]);
                     let depth = &self.depth;
                     let depth = |_, y, _| Some(depth.floor(view, height, level, at[1], y));
-                    match (Light::drawn_byte(byte), self.assets.pools()) {
+                    match (
+                        Light::drawn_byte(byte, self.lot.brightest()),
+                        self.assets.pools(),
+                    ) {
                         // A room in full light shows no pools (0x4c83d4).
                         (Some(base), Some(pools)) if lamps.iter().any(Option::is_some) => {
                             let tile = self.camera.zoom.tile_width();
@@ -433,9 +437,13 @@ impl Painter<'_> {
                             };
                             self.canvas.draw_shaded(&image, at, light, depth);
                         }
-                        _ => self
-                            .canvas
-                            .draw_lit(&image, at, false, Light::from_byte(byte), depth),
+                        _ => self.canvas.draw_lit(
+                            &image,
+                            at,
+                            false,
+                            Light::from_byte(byte, self.lot.brightest()),
+                            depth,
+                        ),
                     }
                     self.stats.floors += 1;
                 }
@@ -454,7 +462,8 @@ impl Painter<'_> {
         };
         let index = (level - 1) as usize;
         let byte = self.lot.light_at(index, [x * 16 + 8, y * 16 + 8]);
-        let strength = i32::from(strength) + 255 - Light::drawn_byte(byte).unwrap_or(255) as i32;
+        let strength = i32::from(strength) + 255
+            - Light::drawn_byte(byte, self.lot.brightest()).unwrap_or(255) as i32;
         let zoom = self.camera.zoom.index();
         // The mask sits where the plain floor tile would, centred by the
         // tile's width rather than its own.
@@ -508,7 +517,8 @@ impl Painter<'_> {
     }
 
     /// Draws a grass tile in the original's four-pixel columns (see
-    /// [`crate::grass`]).
+    /// [`crate::grass`]), straight from the palette: no room's light falls
+    /// on it (0x49da21).
     fn terrain(&mut self, [x, y]: [i32; 2]) {
         let view = self.camera.rotate_tile([x, y]);
         let Some((shades, colors)) = self.grass.tile(view) else {
@@ -527,7 +537,6 @@ impl Painter<'_> {
         if (0..2).any(|i| corner[i] < -reach || corner[i] > size[i].saturating_add(reach)) {
             return;
         }
-        let lit = self.light(0, [x * 16 + 8, y * 16 + 8]);
         // The whole tile takes one depth, from its top corner.
         let depth = self.depth.grass(view, i32::from(heights[1]));
         let left = corner[0] + GRASS_COLUMN;
@@ -535,12 +544,12 @@ impl Painter<'_> {
             for (row, pixels) in column.rows() {
                 for (i, &p) in pixels.iter().enumerate() {
                     self.canvas
-                        .plot(column.x + i as i32, row, depth, lit.apply(grass::widen(p)));
+                        .plot(column.x + i as i32, row, depth, grass::widen(p));
                 }
             }
             let index = ((column.x - left) / 4) as usize;
             for (bx, foot, height, p) in self.grass.blades(view, &column, index) {
-                let color = lit.apply(grass::widen(p));
+                let color = grass::widen(p);
                 for row in foot.saturating_sub(height - 1)..=foot {
                     self.canvas.plot(bx, row, depth, color);
                 }
@@ -789,10 +798,9 @@ impl Painter<'_> {
         let cut_height = [6, 12, 23][zoom.index()];
         // Every trim is lit as room 0, the outdoors, shows, or fully
         // without one (0x53dbb4 to 0x53dbec, set at 0x53e2f5).
-        let light = self
-            .lot
-            .outdoor_light
-            .map_or(Light::FULL, Light::from_fraction);
+        let light = self.lot.outdoor_light.map_or(Light::FULL, |light| {
+            Light::from_fraction(light, self.lot.brightest())
+        });
         for (&corner, c) in &corners.corners {
             let at = self.corner_screen(corner, level);
             let view = self.rotate_corner(corner);
@@ -1072,6 +1080,7 @@ impl Painter<'_> {
                 Light::from_byte(
                     self.lot
                         .light_at((level - 1) as usize, [o.position[0], o.position[1]]),
+                    self.lot.brightest(),
                 )
             };
             // Each pixel the object draws names it, for a click
