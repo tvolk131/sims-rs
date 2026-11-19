@@ -37,9 +37,9 @@ events, and what it asks for after them) come first.
    state sparsely (every tenth update, and every update around events)
    and the random streams every update. Delete the captures and dumps it
    supersedes, and say which. Open: strict mode runs the whole day and
-   the day's turn (#233, #244, #251). The full state matches the
-   recording through update 2810 apart from known exceptions, and at
-   its saved checkpoints from 2820 to 3340 apart from two modelled
+   the day's turn (#233, #244, #251). At the recording's saved
+   full-state checkpoints the state matches through update 2810 apart
+   from known exceptions, and from 2820 to 3340 apart from two modelled
    differences; a transient at 3350 is open. The lot's random stream
    matches through 3602 (#244, #251). Checking the rest against the recording
    is what remains. See Progress.
@@ -70,7 +70,9 @@ events, and what it asks for after them) come first.
    follows once travel is in. No recording of an expansion lot exists
    yet. Track 2 has the import snapshot and the House 69 capture queued.
    This plan is from track 4's survey of the install; it has no decision
-   file yet, and the first step 6 PR records one.
+   file of its own yet. Done for 6b: the family-file (.FAM) reader
+   (0x42886e, #252; the FAMh record fields' meanings are unverified).
+   Next: the `Patch/` import.
 
 ### Progress
 
@@ -135,9 +137,11 @@ events, and what it asks for after them) come first.
   (#249). Next: Make New Character's suit order and body strings 1 and
   2 (which head and body the draws pick), its name (Dialog kind 3),
   pets and a negative age, then House09's coverage; UI Effect (34,
-  Tutorial and Help System only); moving a gathered person in Burn;
-  removing an object that holds another (`removal.rs`); the failing
-  modes of the ported primitives. The play-mode snack test no longer
+  Tutorial and Help System only); the container and off-lot person
+  reset (0x45e8dd, 0x45e977); removing an object that holds another (`removal.rs`); the failing
+  modes of the ported primitives. A fire that burns a person resets
+  whoever uses what burns, and Burn moves a gathered person (0x44df25,
+  0x45e7b2, 0x441039, #254). The play-mode snack test no longer
   exercises Burn: #244 changed the run's path, and since #251 it
   reaches step 15799 without an error and with no fire at the end.
   Burn needs a replacement scenario on the real install.
@@ -180,11 +184,11 @@ events, and what it asks for after them) come first.
   recording covers updates 1 to 14,759. Snap mode 3 by a slot offset now
   follows the original's order (0x454b93, #244), and Set To Next mode 3
   follows a multi-tile group's links rather than the order its tiles
-  were registered in (0x44ec79, #251). Through update 2810 the full
-  state matches the recording apart from the earlier comparison's
-  exceptions: the last bits of the head targets and neighborhood record
-  301. At the recording's saved checkpoints from 2820 (every tenth
-  update) through 3340 it matches apart from two modelled differences:
+  were registered in (0x44ec79, #251). At the recording's saved
+  full-state checkpoints the state matches through update 2810 apart
+  from the earlier comparison's exceptions: the last bits of the head
+  targets and neighborhood record 301. From 2820 through 3340 (every
+  tenth update) it matches apart from two modelled differences:
   a frame local that overlays a code-owner pointer, and person word 37
   from memory the original never set. The random stream matches through
   3602. After 3340, a transient at update 3350 is open: person 21's
@@ -202,7 +206,8 @@ events, and what it asks for after them) come first.
   The whole-day test answers No, so strict boots of the day use
   `--answers 3,3`. Next: the random-stream divergence at tick 3603 and
   the transient at 3350 (track 3), then keep verifying the day against
-  track 2's Goth day recording, including the night.
+  track 2's Goth day recording, which ends at update 14,759 in the
+  afternoon; checking the night needs more recording.
   `placement::on_lot` still uses a
   fixed 64-tile bound where the original tests the lot's size
   (0x422632). Also open: the
