@@ -189,11 +189,10 @@ impl Machine<'_, '_> {
                 // or the definition a record made in play was made from
                 // (0x4237a1). Only whether there is one is simulation.
                 let id = self.frame()?.stack_object;
-                return Ok(self
-                    .world
-                    .neighbors
-                    .get(id)
-                    .is_some_and(|record| self.catalog.object(record.guid).is_some()));
+                return Ok(self.world.neighbors.get(id).is_some_and(|record| {
+                    crate::interpreter::object_definition(self.catalog, self.world, record.guid)
+                        .is_some()
+                }));
             }
             2 => {
                 let local = word(operands, 0) >> 1;
