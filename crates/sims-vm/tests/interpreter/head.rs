@@ -436,3 +436,40 @@ fn a_head_looking_at_itself_queued_for_removal_fails_loudly() {
         "{fault}"
     );
 }
+
+/// The top anchor's height (the target's second word) of a person looking
+/// at itself with its animator at `position` on a lot whose altitude
+/// array holds `altitude` at every corner.
+fn own_top_height(position: [f32; 2], altitude: u8) -> F32 {
+    let mut fx = anchored(Some("Top"));
+    fx.sim_mut().person.as_mut().unwrap().data[41] = SIM as i16;
+    fx.world.arrays.get_mut(&0).unwrap().data.fill(altitude);
+    let animator = fx.world.animators.get_mut(&SIM).unwrap();
+    animator.position[0] = F32::from_f32(position[0]);
+    animator.position[1] = F32::from_f32(position[1]);
+    let vm = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    vm.draw_frame(&mut fx.world, 1).unwrap();
+    fx.world.animators[&SIM].head.target.unwrap()[1]
+}
+
+#[test]
+fn off_the_lot_the_model_stands_at_height_0() {
+    // On the lot the model stands on the terrain (0x478dfe).
+    let on = [100.0, 200.0];
+    assert_ne!(own_top_height(on, 40), own_top_height(on, 0));
+    // Off it (0x45ee1d: a rounded coordinate's tile below 0, or not below
+    // the lot's size of 64) the altitude is not read and the height stays
+    // 0 (0x592245): the same as over terrain at height 0.
+    for off in [
+        [-16.0, 200.0],
+        [100.0, -9.0],
+        [64.0 * 16.0, 200.0],
+        [100.0, 64.0 * 16.0 - 0.4],
+    ] {
+        assert_eq!(own_top_height(off, 40), own_top_height(off, 0), "{off:?}");
+    }
+    // The tile is cut to a signed byte first: tile 256 is tile 0, on the
+    // lot.
+    let wrapped = [256.0 * 16.0 + 3.0, 200.0];
+    assert_ne!(own_top_height(wrapped, 40), own_top_height(wrapped, 0));
+}

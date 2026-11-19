@@ -82,6 +82,18 @@
 //! - **11**, interrupted on the way (0x45b3c2): the animator stops; the
 //!   next step is 7.
 //! - **8**: the route ends ([`Machine::end_route`]): the result is true.
+//! - **19** and **20**, the stack object lost (0x45ae8d): on every run
+//!   after the first, a stack object that is gone or off the lot sends
+//!   the route to step 20 if it was under way (step 3), else to step 19.
+//!   Step 20 asks the animator to stop (0x45b352, 0x589e2d), with no
+//!   sound: once it stops, the next step is 19; while it does not, the
+//!   run yields in step 20. The next run tests the stack object first,
+//!   so if it is still lost the saved step 20 becomes 19 and the route
+//!   fails without waiting for the animator any longer. Step 19 fails the
+//!   route: the next step is 7 (0x45afc4).
+//! - With byte +0x78 of the context clear, a run at any step but 2 or 3
+//!   only sets it again (0x45aebb); steps 2 and 3 fail loudly
+//!   (0x45aea5).
 //!
 //! The steps run one after another in a run until one yields or pushes a
 //! tree. Every run works on the person's last context. Its retry count
@@ -93,7 +105,9 @@
 //! person to move with this person's running action forgets it (byte
 //! +0x84 noting whether that route was under way), and the action this
 //! route asked another person to do is taken out of that person's queue
-//! (0x45d5f8), the action's object told it was cancelled.
+//! (0x45d5f8), the action's object told it was cancelled; if that person
+//! is already running it, it is cancelled as the player cancels a running
+//! action (0x45d617).
 //!
 //! Go To Relative Position (opcode 27, 0x45c634) runs the same steps
 //! with a slot record it makes from its operands instead of one of the
@@ -122,10 +136,8 @@
 //!
 //! Ported from the original's code. What the Goth house's routes to tick
 //! 9906 do not reach fails loudly: a parameter number past the frame's
-//! parameters, a stack object that is missing or off the lot in a later
-//! step, a person with bit 0 of word 68 set or other contexts, ending a
-//! route while the asked person runs the action (0x45d5f8), every other
-//! step and every other result of the planning. Past tick 1000 the routes
+//! parameters, a person with bit 0 of word 68 set or other contexts,
+//! every other step and every other result of the planning. Past tick 1000 the routes
 //! are **unverified**: there is no capture.
 
 use crate::animator::ask_stop;
@@ -191,6 +203,11 @@ const ASK: i32 = 14;
 const GIVE_UP: i32 = 16;
 const FEEDBACK: i32 = 17;
 const PLAN: i32 = 18;
+/// Step 19: the stack object was lost; the route fails (0x45afc4).
+const LOST: i32 = 19;
+/// Step 20: the stack object was lost while the route was under way; the
+/// animator stops before step 19 (0x45b352).
+const LOST_UNDER_WAY: i32 = 20;
 
 /// The trees a person asking another to move plays (0x6c4554, 0x6c453c).
 const ASK_TREE: &str = "route ask to move animation";
@@ -460,13 +477,27 @@ impl Machine<'_, '_> {
             return Ok(Flow::Yield);
         }
         if lost {
-            return Err(unsupported("0x45ae8d", "with its stack object gone"));
+            // 0x45ae8d: with the stack object gone or off the lot, a route
+            // under way stops its animator first (step 20); any other step
+            // goes to step 19, which fails the route.
+            state = if state == UNDER_WAY {
+                LOST_UNDER_WAY
+            } else {
+                LOST
+            };
         }
         if !ctx.byte_78 {
-            return Err(unsupported(
-                "0x45aea5",
-                "with byte +0x78 of its context clear",
-            ));
+            // 0x45aea5: steps 2 and 3 do more first (context +0x68, or
+            // step 15), which is not ported; every other step, the lost
+            // steps 19 and 20 among them, only sets the byte again
+            // (0x45aebb), written back with the context.
+            if matches!(state, PORTAL | UNDER_WAY) {
+                return Err(unsupported(
+                    "0x45aea5",
+                    &format!("at step {state} with byte +0x78 of its context clear"),
+                ));
+            }
+            ctx.byte_78 = true;
         }
         // The retry stage (+0x58) and the place of the last try (+0x60,
         // +0x64) are the run's own; they are written back when the run
@@ -893,6 +924,17 @@ impl Machine<'_, '_> {
                     self.set_person_word(ROUTE_RESULT, ctx.result as i16)?;
                     state = FAILED;
                 }
+                LOST_UNDER_WAY => {
+                    // 0x45b352: the animator is asked to stop (0x589e2d),
+                    // with no sound; while it does not, the run yields at
+                    // this step (0x45b9a0).
+                    if !ask_stop(self.world, me)? {
+                        break;
+                    }
+                    state = LOST;
+                }
+                // 0x45afc4.
+                LOST => state = FAILED,
                 FAILED | SUCCEEDED => return self.end_route(state, ctx, &path),
                 other => {
                     return Err(unsupported("0x45aef0", &format!("at step {other}")));
@@ -944,8 +986,8 @@ impl Machine<'_, '_> {
     ///    whether this route was under way (state 8) (0x45b89b). When
     ///    this context asked a person to move, that action is taken out
     ///    of the person's queue (0x45d5f8,
-    ///    [`Machine::release_action`]); the person running it already
-    ///    fails loudly.
+    ///    [`Machine::release_action`]); a person already running it has
+    ///    the running action cancelled instead (0x45d617).
     /// 5. The context is removed (0x45f8e8); the path stays. The frame
     ///    keeps the step.
     fn end_route(

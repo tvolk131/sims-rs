@@ -579,6 +579,9 @@ impl Interpreter<'_> {
     /// on person 259 walks over a sloped tile, and the heights the
     /// original stored fit this order of the offsets and of the corner
     /// bytes, and no other, at each of eleven points.
+    ///
+    /// A point off the lot (0x45ee1d) stands at height 0: the original
+    /// skips the altitude there.
     fn model(&self, world: &World, id: u16, a: &Animator) -> Result<Matrix, Trap> {
         let object = world
             .objects
@@ -590,22 +593,24 @@ impl Interpreter<'_> {
         let point = [round(a.position[0]), round(a.position[1])];
         let size = i32::from(world.size);
         let [first, second] = point.map(|p| (p >> 4) as i8 as i32);
-        if !(0..size).contains(&first) || !(0..size).contains(&second) {
-            return Err(unsupported(
-                "0x45ee1d",
-                &format!("person {id}'s model matrix off the lot"),
-            ));
-        }
-        let altitude = world
-            .arrays
-            .get(&ALTITUDE)
-            .filter(|a| a.stride == 4 && a.data.len() == FULL * FULL * 4)
-            .ok_or_else(|| Trap::Invalid("the lot's altitude array is missing".into()))?;
-        let at = (first as usize * FULL + second as usize) * 4;
-        let corners = [0, 1, 2, 3].map(|i| altitude.data[at + i]);
-        // 0x592242 hands 0x478dfe the rounded second coordinate, then the
-        // rounded first: its first offset is the second coordinate's.
-        let height = head::terrain_height(head::altitude_at(corners, point[1] & 15, point[0] & 15));
+        // Off the lot (0x45ee1d: either tile, as a signed byte, below 0
+        // or not below the lot's size) the altitude is not looked up and
+        // the height stays 0 (0x592245).
+        let height = if !(0..size).contains(&first) || !(0..size).contains(&second) {
+            F32::ZERO
+        } else {
+            let altitude = world
+                .arrays
+                .get(&ALTITUDE)
+                .filter(|a| a.stride == 4 && a.data.len() == FULL * FULL * 4)
+                .ok_or_else(|| Trap::Invalid("the lot's altitude array is missing".into()))?;
+            let at = (first as usize * FULL + second as usize) * 4;
+            let corners = [0, 1, 2, 3].map(|i| altitude.data[at + i]);
+            // 0x592242 hands 0x478dfe the rounded second coordinate, then
+            // the rounded first: its first offset is the second
+            // coordinate's.
+            head::terrain_height(head::altitude_at(corners, point[1] & 15, point[0] & 15))
+        };
         // Above the ground the level's rise is added (0x5922ad); see
         // docs/decisions/20261115-snap-offset-order.md.
         head::placement_on_level(a.position, height, level, self.view_rotation).ok_or_else(|| {

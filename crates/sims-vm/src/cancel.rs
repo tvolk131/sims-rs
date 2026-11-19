@@ -23,7 +23,8 @@
 //!   stack object first; the press counts when one was dropped. That is
 //!   [`Machine::release_action`], which a route that asked a person to
 //!   move also ends with, and which fails loudly where a function 4
-//!   changes the queue.
+//!   changes the queue. That route's end takes the running action's
+//!   branch above as well, when the person already runs the action.
 //!
 //! The interface plays `UI_queue_delete` for a press that counts and
 //! `UI_error` for one that does not (0x4cb16e); that is the interface's,
@@ -69,8 +70,10 @@ impl Interpreter<'_> {
 }
 
 /// The running action's branch of [`Interpreter::cancel`] (0x45d617 to
-/// 0x45d667), for `person`, the machine's running object.
-fn cancel_running(machine: &mut Machine<'_, '_>, person: u16) -> Result<(), Trap> {
+/// 0x45d667), for `person`, the machine's running object. A route that
+/// asked `person` to move and ends while it runs the action takes this
+/// branch too ([`Machine::release_action`]).
+pub(crate) fn cancel_running(machine: &mut Machine<'_, '_>, person: u16) -> Result<(), Trap> {
     let me = machine
         .me_mut()?
         .person
