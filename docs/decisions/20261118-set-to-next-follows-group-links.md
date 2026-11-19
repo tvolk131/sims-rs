@@ -27,8 +27,9 @@ is no tile would be read through a null cast in the original (0x44ecaa).
 That fails loudly.
 
 After the fix, a comparison of the port's full state with the
-recording's at every tenth update from 2820 to 3340 finds only these
-differences:
+recording's at every tenth update from 2820 to 3360 finds only these
+differences (the third at 3350, which is why the match is claimed only
+through 3340):
 
 - **Expected.** Frame local 2 of tree 0x1019 at 2820: the native value
   is −10096, and the port's is one of the modelled unknowns
@@ -86,11 +87,16 @@ With byte +0x78 of the context clear, any step but 2 and 3 only sets it
 again (0x45aebb) and goes on. Steps 2 and 3 still fail loudly
 (0x45aea5). The end of the route reads nothing of the lost object.
 
-The lost test uses the port's `on_lot`, which takes the lot as 64 tiles
-across. 0x4325b5 calls 0x422632, which tests against the lot's own size
-(lot +0x10). The two differ only on a lot smaller than 64 tiles, for an
-object standing between its edge and the arrays' edge. `on_lot` is
-shared by every placement, so that fix is left for its own change.
+The lost test is 0x432595 (`placement::stands_on_lot`). It used the
+port's `on_lot`, which takes the lot as 64 tiles across, but 0x4325b5
+calls 0x422632, which tests against the lot's own size (lot +0x10). So
+`stands_on_lot` now uses `off_lot`, which has the native bound. Its
+other callers (the daily update, the rooms' lights, Burn, dynamic
+groups) call 0x432595 too, so they take the same bound. No Goth pin
+changes with it. The two bounds differ only for an object on a lot
+smaller than 64 tiles, standing between the lot's edge and the arrays'
+edge. `on_lot` itself, which other placements use directly, is left as
+it was (unverified there) for its own change.
 
 **5. A route's end cancels the asked person's running action
 (0x45d617).** At tick 24605 object 28's route ends while the person it

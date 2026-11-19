@@ -575,9 +575,15 @@ impl Cursor {
     }
 }
 
-/// Whether an object stands on the lot (0x432595).
+/// Whether an object stands on the lot (0x432595): it takes the object's
+/// place ([`capture`], 0x4325b5, which can change its slot word), whose
+/// flag 0x4325b5 sets from 0x422632 on the object's own position, tested
+/// against the lot's size ([`off_lot`]), not the arrays' 64 tiles of
+/// [`on_lot`].
 pub(crate) fn stands_on_lot(world: &mut World, id: u16) -> Result<bool, Trap> {
-    Ok(capture(world, id)?.on_lot)
+    capture(world, id)?;
+    let [first, second, _] = position(world, id)?;
+    Ok(!off_lot(world, [first, second]))
 }
 
 /// The objects standing on a tile, with everything they hold, in the

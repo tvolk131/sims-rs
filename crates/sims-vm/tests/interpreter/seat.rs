@@ -919,10 +919,10 @@ fn a_route_whose_stack_object_is_lost_fails() {
     // animator that is under way. The route ends with result 1, the false
     // branch, and its context goes; the end of the route asks the
     // animator to stop (0x589e2d), and the request is kept.
-    for off in [false, true] {
+    for off in [None, Some([-16, -16])] {
         let (mut fx, me) = mid_route(1, 1);
-        if off {
-            fx.lamp_mut().position = [-16, -16, 1];
+        if let Some(at) = off {
+            fx.lamp_mut().position = [at[0], at[1], 1];
         } else {
             fx.world.objects.remove(&LAMP);
             fx.world.order.retain(|&id| id != LAMP);
@@ -930,11 +930,11 @@ fn a_route_whose_stack_object_is_lost_fails() {
         assert_eq!(
             turn(&mut fx, me),
             Ok(sims_vm::Status::Returned(false)),
-            "{off}"
+            "{off:?}"
         );
-        assert!(fx.world.routing.routes[&me].contexts.is_empty(), "{off}");
-        assert_eq!(route_result(&fx, me), 1, "{off}");
-        assert!(fx.world.stops_asked.contains(&me), "{off}");
+        assert!(fx.world.routing.routes[&me].contexts.is_empty(), "{off:?}");
+        assert_eq!(route_result(&fx, me), 1, "{off:?}");
+        assert!(fx.world.stops_asked.contains(&me), "{off:?}");
     }
 }
 
@@ -956,6 +956,19 @@ fn a_route_under_way_whose_stack_object_is_lost_asks_its_animator_to_stop() {
     assert_eq!(turn(&mut fx, me), Ok(sims_vm::Status::Returned(false)));
     assert_eq!(fx.world.animators[&me].arrival, 1);
     assert!(fx.world.routing.routes[&me].contexts.is_empty());
+}
+
+#[test]
+fn a_stack_object_past_the_lots_size_is_lost() {
+    // 0x432595 tests the object's place with 0x422632, against the lot's
+    // size less 1: the lot's last tile is off it, though inside the
+    // arrays' 64 tiles. Under way, the route goes to step 20 and yields.
+    let (mut fx, me) = mid_route(3, 1);
+    let last = i32::from(fx.world.size) - 1;
+    assert!(last < 63);
+    fx.lamp_mut().position = [last * 16 + 8, 40, 1];
+    assert_eq!(turn(&mut fx, me), Ok(sims_vm::Status::Yielded));
+    assert_eq!(fx.world.objects[&me].stack[0].primitive_state, 20);
 }
 
 #[test]
