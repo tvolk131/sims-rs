@@ -31,8 +31,9 @@ stream.
 update 4131–4140 (it showers) to about 4380–4390, and no other person
 has a word 30 set all day. The stream moves only in that span, at most
 once per 30 updates, and every burst is a multiple of three. A row is
-saved at the end of its lot update, before the frame after it, so the
-draws in row 4155 come from a frame after update 4154, and so on (see
+saved at the end of its lot update, before the frame after it, so if
+the draws are the mosaic's, those in row 4155 come from a frame after
+update 4154, and so on (see
 `20261118-goth-day-frame-schedule.md`). How many blocks are drawn depends
 on the zoom, the camera, and what stands in front of the person, and a
 frame whose rectangle is clipped or hidden draws none, so the rows that

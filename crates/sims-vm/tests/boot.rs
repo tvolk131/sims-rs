@@ -952,7 +952,7 @@ fn the_goth_day_under_the_recordings_frames_keeps_its_streams() {
         StepError::Tick {
             tick: 16112, error, ..
         } => {
-            for part in ["object 26", "unsupported: Burn", "0x592878"] {
+            for part in ["object 26, tree 0x1003", "unsupported: Burn", "0x592878"] {
                 assert!(error.contains(part), "{error}");
             }
         }

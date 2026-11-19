@@ -526,8 +526,8 @@ fn construct_person(
 /// take two (0x598af7 builds the file's one skeleton, then the copy). The
 /// stream at the entry of the first lot update is 7,212 draws on from its
 /// initial state 1, which the load's own work accounts for (the adult and
-/// child files, the three Goths' copies and default interests, and the two
-/// indicators). So the file was read without drawing from the stream the
+/// child files, the three Goths' copies and default interests, and the
+/// indicator pair made before the load and again during it). So the file was read without drawing from the stream the
 /// simulation draws from (the C runtime keeps one per thread, 0x63e2b3
 /// +0x14). That it was read before the load, and not between the load and
 /// the first cat, is **unverified**; so is where (the avatar registry's

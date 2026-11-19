@@ -15,8 +15,9 @@ before the first load.
 kat file there and took twice that at 6756. The stream at the entry of
 the first lot update is 7,212 draws on from its initial state 1, which
 the load's own work accounts for: the adult and child files and the
-three Goths' copies and default interests (7,084), and the two indicator
-objects (64 each). So by the first cat the kat file had been read
+three Goths' copies and default interests (7,084), and the indicator
+objects, 32 draws each, made twice: a pair before the load and a pair
+again during it (2 × 64). So by the first cat the kat file had been read
 without moving that stream. The C runtime keeps its state per thread ([_getptd]+0x14, read
 at 0x63e2b3; `_getptd` is 0x30f00d0 in all 17 captures, so the state is
 at 0x30f00e4), so a read on another thread, or before `srand`

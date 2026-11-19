@@ -25,7 +25,7 @@ phases that matched the recording through the window were kept
 | 2110 | 20 to 29 |
 | 2920 | 11 to 18 |
 | 3370 | 11 to 20 |
-| 4155 | 14 (the censor mosaic's global draws, taken to be drawn in frames; a row is saved before the frame after its update, so the draws in row 4155 come from the frame after 4154) |
+| 4155 | 14 if the global draws are the censor mosaic's, drawn in frames (unverified; 15 passes the stream checkpoints too; a row is saved before the frame after its update, so the draws in row 4155 come from the frame after 4154) |
 | 5490 | 14 and 15 match, 3 (the default) does not (the lot stream; other phases not tried) |
 
 So the original's frames are not every 30 updates: the phase moves
