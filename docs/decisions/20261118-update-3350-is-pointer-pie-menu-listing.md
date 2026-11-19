@@ -1,4 +1,4 @@
-# The difference at update 3350 is the pointer's pie menu listing, which the strict replay has no input for
+# The difference at update 3350 is taken to be the pointer's pie menu listing (unverified), which the strict replay has no input for
 
 *Decided 2026-11-18.*
 
@@ -29,7 +29,9 @@ The port has this listing: `Lot::pie_menu` (0x48d392), which the game
 runs when the pointer reaches an object, including an object that moves
 under a pointer standing still (see
 `20261115-game-lists-pie-menu-lot-when-pointer-reaches.md`). What the
-check trees change stays on the lot, as in the original.
+check trees change stays on the lot, as in the original, except that
+the listing gives the Sim its temps back, and `Lot::pie_menu` undoes the
+listing's changes if a later check faults.
 
 **Why the strict replay differs.** The strict replay of a recording
 (`Lot::step`, as the whole-day test runs it) has no pointer. In the
@@ -57,8 +59,9 @@ touched by the listing itself: 0x458705 passes 0 as the check's second
 argument (0x458711), so 0x458319 skips the copy at 0x4584af. A check tree
 can still write the record.
 
-Here none of that lasted: the fields `cmp_day` compares (data, temps,
-attributes, last result, frames with their locals and arguments, person
-data) match again at 3360, and the three random streams match through
-update 4154. Wherever the recording leaves the replay again with no
+Here no such change shows by 3360 in the fields `cmp_day` compares
+(data, temps, attributes, last result, frames with their locals and
+arguments, person data), and the three random streams match through
+update 4154. A change elsewhere, such as in a queue, would not show in
+that comparison. Wherever the recording leaves the replay again with no
 other cause, a listing under the parked pointer is a candidate.

@@ -182,9 +182,14 @@ impl Interpreter<'_> {
     /// pass tests (0x41019b); it is taken to be the family global 9 names,
     /// as for scope 24 field 1. With global 9 at 0 the World does not say
     /// which family the game holds, so that fails loudly, as does a
-    /// global 9 that names no family. The lot is residential when global
-    /// 10 is 0 or a house zoned 1 (0x40745f, 0x42b9e3).
+    /// global 9 that names no family. With no person in the person vector
+    /// the pass returns before it reads the family (0x42a2cc), so nothing
+    /// fails. The lot is residential when global 10 is 0 or a house zoned
+    /// 1 (0x40745f, 0x42b9e3).
     pub(crate) fn visitor_pass(&self, world: &mut World) -> Result<(), Trap> {
+        if !world.people.iter().any(|id| world.objects.contains_key(id)) {
+            return Ok(());
+        }
         let family = i32::from(world.globals.get(9).copied().unwrap_or(0));
         if family == 0 {
             return Err(Trap::Unsupported(

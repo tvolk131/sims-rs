@@ -36,8 +36,10 @@ which family the game holds, so the pass fails loudly
 family fails as invalid. That includes the load: while the house is
 read, 0x415fc6 clears global 9 and 0x415fd7 selects family 0, so a
 person made then (for example by an object's Init before the household
-selection) would be made in the original and fails loudly here. No
-ported load makes one.
+selection) would be made in the original and fails loudly here. That
+case is **unverified**: no capture shows one, and no ported load makes
+one. With nobody in the person vector the pass returns before it reads
+the family (0x42a2cc), so then nothing fails.
 
 For a multi-tile object the signal names the group's lead, and the lot
 tests the lead's definition. `Interpreter::create` runs the pass after a

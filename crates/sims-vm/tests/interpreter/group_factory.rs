@@ -362,4 +362,33 @@ fn a_group_whose_lead_is_a_person_type_works_out_again_who_is_a_visitor() {
     assert_eq!(made(2), 0);
     // A lead of any other type leaves it.
     assert_eq!(made(4), 2);
+    // With nobody in the person vector the pass returns before it reads
+    // the family (0x42a2cc), so global 9 at 0 does not fail. The group's
+    // tiles do not join the vector.
+    let mut fx = Fixture::new();
+    let file = group(&mut fx);
+    fx.program
+        .libraries
+        .get_mut(&file)
+        .unwrap()
+        .definitions
+        .get_mut(&130)
+        .unwrap()[9] = 2;
+    fx.world.people.clear();
+    fx.world.globals[9] = 0;
+    assert_eq!(create(&mut fx, MASTER), Ok(3));
+    assert!(fx.world.people.is_empty());
+    // With a person, it fails loudly.
+    let mut fx = Fixture::new();
+    let file = group(&mut fx);
+    fx.program
+        .libraries
+        .get_mut(&file)
+        .unwrap()
+        .definitions
+        .get_mut(&130)
+        .unwrap()[9] = 2;
+    fx.world.globals[9] = 0;
+    let fault = create(&mut fx, MASTER).unwrap_err();
+    assert!(fault.to_string().contains("0x42a2b4"), "{fault}");
 }
