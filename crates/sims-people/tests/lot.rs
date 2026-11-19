@@ -450,6 +450,11 @@ fn the_lot_hides_the_people_behind_it() {
                     for (x, y) in pixels(&on) {
                         let i = y as usize * on.width + x as usize;
                         let expected = if noted.taken[i] {
+                            // The body's pixel if the bob-less draw gave it
+                            // the same colour, else the bob's. A bob pixel
+                            // drawn over the body in the body's very colour
+                            // cannot be told apart this way (none in this
+                            // fixture).
                             let bodys = body.taken[i] && body.canvas.color[i] == on.color[i];
                             if bodys { Some(id) } else { bob.or(Some(id)) }
                         } else {
