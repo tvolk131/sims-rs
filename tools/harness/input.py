@@ -390,6 +390,16 @@ def same_action(a, b):
     return all(a.get(k) == b.get(k) for k in ('caller', 'target', 'routine', 'menu', 'args'))
 
 
+def social_of(a, pushed):
+    """Whether the running action a is the social interaction the pie menu
+    pushed (a "Talk..." submenu entry on another person). The game does not
+    run it as pushed: at once it makes an interaction object, and the
+    person's running action targets that object, with the other person as
+    its icon (and its own routine and menu)."""
+    return (a.get('caller') == pushed.get('caller') and a.get('icon') == pushed.get('target')
+            and a.get('target') not in (None, 0, pushed.get('target')) and bool(a.get('uid')))
+
+
 def check_window(window):
     """The window ID as xdotool takes it; anything else is refused, since it
     goes into guest shell commands."""
@@ -1028,7 +1038,8 @@ class Runner:
             if p:
                 queue, active = read_queue(self.m, p), self.m.action(p + ACTIVE_ACTION)
                 where = ('active' if same_action(active, push['action']) else
-                         'queue' if any(same_action(a, push['action']) for a in queue) else None)
+                         'queue' if any(same_action(a, push['action']) for a in queue) else
+                         'social' if social_of(active, push['action']) else None)
                 if where:
                     self.write(kind='taken', person=person, where=where, pushed_update=push['update'],
                                active=active, queue=queue)

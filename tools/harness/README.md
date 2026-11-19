@@ -270,7 +270,11 @@ How the checks work (the addresses are in `input.py`):
   the chosen action on the person's queue, and logs the person and the
   action. `expect-queued` waits for that record, then for the person to hold
   the action, in its queue (`+0x820`) or as its running action (`+0xa48`),
-  and logs where it found it.
+  and logs where it found it. A social interaction (a "Talk..." entry on
+  another person) is not held as pushed: in the next update the game makes
+  an interaction object, and the person's running action targets it, with
+  the other person as its icon and its own routine and menu (where
+  `social`).
 - **Dialogs.** A modal dialog holds the update it shows in, so
   `answer-dialog` runs on the dialog stops. It presses once, like
   `answer.sh`. If the game misses the press, the step waits until the dialog

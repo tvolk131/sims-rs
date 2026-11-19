@@ -63,7 +63,8 @@ class FakeMemory:
         return self.half(p + 0xf0) if p else 0
 
     def action(self, p):
-        return dict(caller=self.object_id(self.word(p + 4)), target=self.object_id(self.word(p + 8)),
+        return dict(uid=self.word(p + 60), caller=self.object_id(self.word(p + 4)),
+                    target=self.object_id(self.word(p + 8)), icon=self.object_id(self.word(p + 12)),
                     routine=self.half(p + 32), priority=self.word(p + 28))
 
 
@@ -742,6 +743,34 @@ class ReviewFindingsTest(RunnerBase):
         self.tick_until(r, lambda: r.finished)
         self.assertIsNone(r.failed)
         self.assertEqual(self.rows('taken')[0]['active']['routine'], 8213)
+
+    def test_a_social_is_taken_as_its_interaction_object(self):
+        # From goth-talk-order-20261118: Talk... > About Interests on Bella (18).
+        pushed = dict(uid=0, caller=21, target=18, icon=18, menu=24, args=[0, 0, 0, 0], routine=8273)
+        running = dict(uid=2, caller=21, target=260, icon=18, menu=21, args=[0, 0, 0, 0], routine=4235)
+        self.assertTrue(inp.social_of(running, pushed))
+        self.assertFalse(inp.social_of(dict(running, icon=132), pushed))
+        self.assertFalse(inp.social_of(dict(running, caller=18), pushed))
+        self.assertFalse(inp.social_of(dict(running, uid=0), pushed))
+        self.assertFalse(inp.social_of(dict(running, target=18), pushed))
+
+    def test_expect_queued_finds_a_social(self):
+        g = self.g
+        g.open_pie(['Joke'], target=self.bench, caller=self.person)
+        g.highlight(0)
+        r = self.runner('choose Joke\nexpect-queued 21 173 within 10')
+        self.tick_until(r, lambda: 'mousedown' in self.last_command())
+        action = g.m.alloc(0x44)
+        g.m.put_words(action + 4, self.person, self.bench)
+        r.on_queue_push(self.update + 1, False, g.m, dict(edi=self.person, esi=action))
+        g.close_pie()
+        thing = g.add_object(260, [0, 0])
+        a = self.person + inp.ACTIVE_ACTION
+        g.m.put_words(a + 4, self.person, thing, self.bench)  # caller, target, icon
+        g.m.put_words(a + 60, 2)  # the uid the queue gave it
+        self.tick_until(r, lambda: r.finished)
+        self.assertIsNone(r.failed, r.failed)
+        self.assertEqual(self.rows('taken')[0]['where'], 'social')
 
     def test_the_held_action_must_have_the_pushed_arguments(self):
         a = dict(caller=21, target=173, routine=8213, menu=0, args=[2, 0, 0, 0])
