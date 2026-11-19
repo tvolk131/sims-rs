@@ -13,7 +13,7 @@ use sims_sim::load::ExpandedWall;
 use sims_sim::motives::Curve;
 use sims_sim::{FULL_SIZE, World};
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The ratings in the panel's order (Live.iff `STR#` 133, strings 1 to
 /// 5).
@@ -76,10 +76,10 @@ impl Tuning {
             return Ok(Self::default());
         };
         let iff = Iff::parse(global.read().map_err(Error::Content)?).map_err(Error::Format)?;
-        // Looked up by ID alone, as the original's string loader does
-        // (0x415dd6, through 0x46ff01).
+        // By its ID and a flags' high byte of 0, as the original's string
+        // loader looks it up (0x415dd6, through 0x46ff01 and 0x41bab1).
         let curves = iff
-            .get_by_id(b"STR#", CURVES)
+            .get(b"STR#", CURVES)
             .map(|chunk| StringTable::parse_chunk(iff.data(chunk), iff.resource_flags(chunk)))
             .transpose()
             .map_err(Error::Format)?;
@@ -172,7 +172,10 @@ pub struct Type {
     /// Word 69 (+0x8a, the build mode type) of the type's catalog master
     /// (0x45728d): the type itself outside a group, else the first
     /// definition of its file, in resource order, with the same group and
-    /// word 11 -1, as `sims-vm` finds it. None when the group has no
+    /// word 11 -1. Of each ID it reads the definition with flags' high
+    /// byte 0, once, as the original registers the file's definitions
+    /// (0x43b9dc to 0x43ba0b; 0x43ba7b, through 0x41bab1) and its search
+    /// walks them (0x43ae36 to 0x43ae5f). None when the group has no
     /// master, where the original reads through a null pointer.
     pub build: Option<i16>,
 }
@@ -216,15 +219,7 @@ impl Kinds {
                 let master = if words[word::GROUP] == 0 {
                     Some(words)
                 } else {
-                    iff.resource_order(b"OBJD")
-                        .ok()?
-                        .into_iter()
-                        .find_map(|chunk| {
-                            let other = Self::words(iff.data(chunk));
-                            (other[word::GROUP] == words[word::GROUP]
-                                && other[word::GROUP_INDEX] == -1)
-                                .then_some(other)
-                        })
+                    Self::master(iff, words[word::GROUP])?
                 };
                 Some((words, master))
             });
@@ -246,6 +241,24 @@ impl Kinds {
     /// Whether a definition's bytes make its objects count for Upkeep.
     pub fn counts(definition: &[u8]) -> bool {
         Self::counted_words(&Self::words(definition))
+    }
+
+    /// The catalog master of group `group` in `iff` (see [`Type::build`]):
+    /// its first definition, in resource order, with that group and word
+    /// 11 -1, of each ID's definition with flags' high byte 0, each ID
+    /// once. None inside when there is none; None when the file's
+    /// resource map cannot be used.
+    fn master(iff: &Iff, group: i16) -> Option<Option<[i16; DEFINITION_BYTES / 2]>> {
+        let mut seen = BTreeSet::new();
+        Some(
+            iff.resource_order(b"OBJD")
+                .ok()?
+                .into_iter()
+                .filter(|chunk| seen.insert(chunk.id))
+                .filter_map(|chunk| iff.get(b"OBJD", chunk.id))
+                .map(|chunk| Self::words(iff.data(chunk)))
+                .find(|other| other[word::GROUP] == group && other[word::GROUP_INDEX] == -1),
+        )
     }
 
     fn counted_words(words: &[i16]) -> bool {
@@ -486,8 +499,9 @@ impl Prices {
                 ]
                 .into_iter()
                 .filter_map(|id| {
-                    // By ID alone (0x4cd45f, through 0x46ff01).
-                    let chunk = iff.get_by_id(b"STR#", id)?;
+                    // By its ID and a flags' high byte of 0 (0x4cd45f,
+                    // through 0x46ff01 and 0x41bab1).
+                    let chunk = iff.get(b"STR#", id)?;
                     Some((
                         id,
                         StringTable::parse_chunk(iff.data(chunk), iff.resource_flags(chunk))
@@ -1411,6 +1425,42 @@ mod tests {
                 architecture: 30 + 3 + 2,
             }
         );
+    }
+
+    #[test]
+    fn a_groups_master_is_read_from_each_ids_definition_of_high_byte_0() {
+        // A definition of group 3: its word 11 and build mode type.
+        let definition = |index: i16, build: i16| {
+            let mut words = [0i16; DEFINITION_BYTES / 2];
+            words[word::GROUP] = 3;
+            words[word::GROUP_INDEX] = index;
+            words[word::BUILD] = build;
+            words
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect::<Vec<u8>>()
+        };
+        let mut bytes = b"IFF FILE 2.5:TYPE FOLLOWED BY SIZE\0 JAMIE DOLINE 1998".to_vec();
+        bytes.resize(64, 0);
+        // ID 5 with flags' high byte 1 looks like a master and comes first,
+        // but the original registers ID 5 by its high byte 0 definition,
+        // which is not one; ID 6 is.
+        for (id, flags, data) in [
+            (5u16, 0x0110u16, definition(-1, 9)),
+            (5, 0x0010, definition(0, 1)),
+            (6, 0x0010, definition(-1, 2)),
+        ] {
+            bytes.extend(b"OBJD");
+            bytes.extend((76 + data.len() as u32).to_be_bytes());
+            bytes.extend(id.to_be_bytes());
+            bytes.extend(flags.to_be_bytes());
+            bytes.extend([0u8; 64]);
+            bytes.extend(data);
+        }
+        let iff = Iff::parse(bytes).unwrap();
+        let master = Kinds::master(&iff, 3).unwrap().unwrap();
+        assert_eq!(master[word::BUILD], 2);
+        assert_eq!(Kinds::master(&iff, 4).unwrap(), None);
     }
 
     #[test]

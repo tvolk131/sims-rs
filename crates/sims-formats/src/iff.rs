@@ -158,11 +158,11 @@ impl Resources {
                 // low flag bits are the map's to state, as in the
                 // prototype, which reads the payload wherever the map
                 // points and checks only the type there. **Unverified:**
-                // the original looks the resource up by the map's ID
-                // (0x41bbc5) and checks only the chunk's type (0x41d33b),
-                // so a chunk whose ID or high flag byte differs would be
-                // read there under the map's; here the map is refused. No
-                // file of the install has one.
+                // the original looks the resource up by the map's ID and
+                // flags' high byte (0x41bab1, 0x41d92b) and checks only
+                // the chunk's type (0x41d33b), so a chunk whose ID or high
+                // flag byte differs would be read there under the map's;
+                // here the map is refused. No file of the install has one.
                 let index = at(entry.offset as usize)
                     .filter(|(_, c)| {
                         c.tag == *tag && c.id == entry.id && c.flags >> 8 == entry.flags >> 8
@@ -240,30 +240,6 @@ impl Iff {
             .by_key
             .get(&(*tag, id, 0))
             .map(|&i| &self.chunks[i])
-    }
-    /// The resource of type `tag` with ID `id` whatever its flags' high
-    /// byte, as the original's lookup by ID finds one (0x41bbfb to
-    /// 0x41bc02): it compares the ID alone, walking the whole table
-    /// (0x5807c2, 0x41ddef), in a table that hashed the ID sign-extended
-    /// (0x41de42 to 0x41de4e), so resources sharing an ID share a
-    /// bucket, and put each at the head of its bucket as it was built
-    /// (0x41de8f, 0x41de94): of resources sharing an ID, the last in
-    /// resource order. **Not ported:** each type has its own table
-    /// (0x41bbdc to 0x41bbef), which grows from 193 to 389 buckets when
-    /// a 194th resource of the type is inserted (its count plus one
-    /// against the buckets, 0x41c016 to 0x41c01d, 0x41df26 to 0x41df2f).
-    /// The rehash prepends each old chain's nodes in turn (0x41df8d to
-    /// 0x41dfb9), reversing them, so there the first of resources
-    /// sharing an ID can win. No `STR#` of the install shares an ID with
-    /// another of its file, and no file has that many.
-    pub fn get_by_id(&self, tag: &[u8; 4], id: u16) -> Option<&Chunk> {
-        self.resources
-            .order
-            .get(tag)?
-            .iter()
-            .rev()
-            .map(|&i| &self.chunks[i])
-            .find(|chunk| chunk.id == id)
     }
     /// The resources of type `tag` in the original's order. When the
     /// resource map cannot be used, the chunks as if there were no map.

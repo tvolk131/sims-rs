@@ -235,11 +235,11 @@ impl Surfaces {
 /// English (language 1), as everything here reads: the original takes
 /// the game's language (0x47028b, 0x470256).
 ///
-/// The table is the `STR#` the original's lookup by ID finds
-/// ([`Iff::get_by_id`]): whatever its flags' high byte, and of two with
-/// ID 0 the last.
+/// The table is the `STR#` with ID 0 and a flags' high byte of 0, as the
+/// original's string loader looks it up (through 0x46ff01 and 0x41bab1,
+/// which matches the key's ID and high byte at 0x41d94f to 0x41d95b).
 fn price(iff: &Iff) -> Option<i32> {
-    let chunk = iff.get_by_id(b"STR#", 0)?;
+    let chunk = iff.get(b"STR#", 0)?;
     let table = StringTable::parse_chunk(iff.data(chunk), iff.resource_flags(chunk)).ok()?;
     Some(atoi(&table.entry(1, US_ENGLISH)?.raw_text))
 }
@@ -338,14 +338,21 @@ mod tests {
         big.swap(2, 3);
         assert_eq!(price(&iff_flags(&[(0, 0, big.clone())])), Some(25));
         assert_eq!(price(&iff_flags(&[(0, 0x10, big)])), None);
-        // Whatever its flags' high byte, and of two the last.
+        // Only a table whose flags' high byte is 0, wherever it stands.
         let high = iff_flags(&[(0, 0x0110, table(&["Name", "25"]))]);
-        assert_eq!(price(&high), Some(25));
-        let two = iff_flags(&[
-            (0, 0x0010, table(&["Name", "25"])),
-            (0, 0x0110, table(&["Name", "60"])),
-        ]);
-        assert_eq!(price(&two), Some(60));
+        assert_eq!(price(&high), None);
+        for two in [
+            [
+                (0, 0x0010, table(&["Name", "25"])),
+                (0, 0x0110, table(&["Name", "60"])),
+            ],
+            [
+                (0, 0x0110, table(&["Name", "60"])),
+                (0, 0x0010, table(&["Name", "25"])),
+            ],
+        ] {
+            assert_eq!(price(&iff_flags(&two)), Some(25));
+        }
         // A little-endian length-prefixed table: its count is its first word.
         let pascal = b"\x02\x00\x04Name\x0225".to_vec();
         assert_eq!(price(&iff_flags(&[(0, 0x10, pascal)])), Some(25));
