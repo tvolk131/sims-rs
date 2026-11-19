@@ -266,15 +266,14 @@ How the checks work (the addresses are in `input.py`):
   entries to change, logs that `pie`, and the next `choose` picks from it.
   `choose @N` picks the N-th item (from 0), for a submenu whose labels are
   not known ahead; the logged pie names it.
-- **Confirming.** capture.py stops at `0x48ddcb`, where the pie menu pushes
-  the chosen action on the person's queue, and logs the person and the
-  action. `expect-queued` waits for that record, then for the person to hold
-  the action, in its queue (`+0x820`) or as its running action (`+0xa48`),
-  and logs where it found it. A social interaction (a "Talk..." entry on
-  another person) is not held as pushed: in the next update the game makes
-  an interaction object, and the person's running action targets it, with
-  the other person as its icon and its own routine and menu (where
-  `social`).
+- **Confirming.** capture.py logs the chosen action at the pie menu's queue
+  call (`0x48ddcb`) and reads the result and the assigned UID at its return
+  (`0x48ddd0`). `expect-queued` looks for that UID in the person's queue
+  (`+0x820`) and running action (`+0xa48`). A social such as a "Talk..."
+  choice can target a new interaction object and use a different routine
+  and menu. Its UID identifies it while queued or active. For ordinary
+  pushes whose UID cannot be read, the step compares the action fields.
+  `taken.where` is `queue` or `active`.
 - **Dialogs.** A modal dialog holds the update it shows in, so
   `answer-dialog` runs on the dialog stops. It presses once, like
   `answer.sh`. If the game misses the press, the step waits until the dialog

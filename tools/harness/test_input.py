@@ -65,6 +65,7 @@ class FakeMemory:
     def action(self, p):
         return dict(uid=self.word(p + 60), caller=self.object_id(self.word(p + 4)),
                     target=self.object_id(self.word(p + 8)), icon=self.object_id(self.word(p + 12)),
+                    menu=self.word(p + 16), args=self.words(p + 20, 4, 2),
                     routine=self.half(p + 32), priority=self.word(p + 28))
 
 
@@ -302,6 +303,24 @@ class RunnerBase(unittest.TestCase):
     def last_command(self):
         return self.agent.commands[-1] if self.agent.commands else ''
 
+    def put_action(self, addr, caller, target, *, icon=0, menu=0, routine=0, uid=0):
+        m = self.g.m
+        m.put_words(addr + 4, caller, target, icon, menu)
+        m.put(addr + 32, struct.pack('<H', routine))
+        m.put_words(addr + 0x3c, uid)
+
+    def push(self, r, routine, *, target=None, menu=0, frame=0x80000):
+        a = self.g.m.alloc(0x44)
+        self.put_action(a, self.person, self.bench if target is None else target, icon=target or 0,
+                        menu=menu, routine=routine)
+        r.on_queue_push(self.update + 1, False, self.g.m, dict(edi=self.person, esi=a, ebp=frame))
+        return a
+
+    def queue_result(self, r, action, uid=None, *, eax=1, frame=0x80000):
+        if uid is not None:
+            self.g.m.put_words(action + 0x3c, uid)
+        r.on_queue_result(self.g.m, dict(eax=eax, ebp=frame))
+
 
 class RunnerTest(RunnerBase):
     def test_waits(self):
@@ -423,9 +442,8 @@ class RunnerTest(RunnerBase):
         self.assertNotIn('mousedown', self.last_command())  # not highlighted yet
         g.highlight(0)
         self.tick_until(r, lambda: 'mousedown' in self.last_command())
-        action = g.m.alloc(0x44)
-        g.m.put_words(action + 4, self.person, self.bench)
-        r.on_queue_push(self.update + 1, False, g.m, dict(edi=self.person, esi=action))
+        action = self.push(r, 0)
+        self.queue_result(r, action)
         self.tick(r, 4)
         self.assertFalse(r.finished)  # pushed, but the person does not hold it yet
         g.m.put_words(self.person + inp.ACTIVE_ACTION + 4, self.person, self.bench)
@@ -462,9 +480,8 @@ class RunnerTest(RunnerBase):
         g.highlight(0)
         self.tick_until(r, lambda: sum('mousedown' in c for c in self.agent.commands) == 2)
         self.assertEqual(self.rows('command')[-1]['entry'], 'Joke')
-        action = g.m.alloc(0x44)
-        g.m.put_words(action + 4, self.person, self.bench)
-        r.on_queue_push(self.update + 1, False, g.m, dict(edi=self.person, esi=action))
+        action = self.push(r, 0)
+        self.queue_result(r, action)
         g.close_pie()
         g.m.put_words(self.person + inp.ACTIVE_ACTION + 4, self.person, self.bench)
         self.tick_until(r, lambda: r.finished)
@@ -508,11 +525,9 @@ class RunnerTest(RunnerBase):
 
     def test_expect_queued_after_a_submenu_ignores_an_earlier_push(self):
         g = self.g
-        action = g.m.alloc(0x44)
-        g.m.put_words(action + 4, self.person, self.bench)
         g.m.put_words(self.person + inp.ACTIVE_ACTION + 4, self.person, self.bench)
         r = self.runner('choose Talk...\nexpect-queued 21 173 within 5')
-        r.on_queue_push(1, False, g.m, dict(edi=self.person, esi=action))  # an earlier order, still running
+        self.queue_result(r, self.push(r, 0))  # an earlier order, still running
         self.open_talk(r)
         g.open_pie(['Joke'], target=self.bench, caller=self.person, window=1)
         self.tick_until(r, lambda: r.finished)
@@ -597,14 +612,16 @@ class RunnerTest(RunnerBase):
         self.assertIn("no entry 'Dance'", r.failed)
         self.assertEqual(self.rows('step')[-1]['status'], 'failed')
 
-    def test_expect_queued_finds_the_action_in_the_queue(self):
+    def test_expect_queued_falls_back_when_the_uid_cannot_be_read(self):
         g = self.g
         action = g.m.alloc(0x44)
         g.m.put_words(action + 4, self.person, self.bench)
         g.m.put_words(self.person + 0x820 + 0x44 + 4, self.person, self.bench)
         g.m.put_words(self.person + 0xa40, 1, 2)
         r = self.runner('expect-queued 21')
-        r.on_queue_push(1, True, g.m, dict(edi=self.person, esi=action))
+        r.on_queue_push(1, True, g.m, dict(edi=self.person, esi=action, ebp=0x80000))
+        del g.m.bytes[action + 0x3c]
+        self.queue_result(r, action)
         self.tick(r)
         self.assertIsNone(r.failed)
         self.assertEqual(self.rows('taken')[0]['where'], 'queue')
@@ -709,17 +726,11 @@ class ReviewFindingsTest(RunnerBase):
         self.assertIsNone(r.failed)
         self.assertIn('mousemove', self.last_command())
 
-    def push(self, r, routine):
-        a = self.g.m.alloc(0x44)
-        self.g.m.put_words(a + 4, self.person, self.bench)
-        self.g.m.put(a + 32, struct.pack('<H', routine))
-        r.on_queue_push(self.update + 1, False, self.g.m, dict(edi=self.person, esi=a))
-
     def test_expect_queued_takes_pushes_in_order(self):
         g = self.g
         r = self.runner('expect-queued 21 173 within 5\nexpect-queued 21 173 within 5')
-        self.push(r, 8213)
-        self.push(r, 8214)
+        self.queue_result(r, self.push(r, 8213))
+        self.queue_result(r, self.push(r, 8214))
         g.m.put_words(self.person + inp.ACTIVE_ACTION + 4, self.person, self.bench)
         g.m.put(self.person + inp.ACTIVE_ACTION + 32, struct.pack('<H', 8213))
         g.m.put_words(self.person + 0x820 + 4, self.person, self.bench)
@@ -734,73 +745,112 @@ class ReviewFindingsTest(RunnerBase):
         g = self.g
         g.open_pie(['Sit'], target=self.bench, caller=self.person)
         r = self.runner('choose Sit\nexpect-queued 21 173 within 5')
-        self.push(r, 9999)  # an older interaction, never held
+        self.queue_result(r, self.push(r, 9999))  # an older interaction, never held
         g.highlight(0)
         self.tick_until(r, lambda: 'mousedown' in self.last_command())
-        self.push(r, 8213)
+        self.queue_result(r, self.push(r, 8213))
         g.m.put_words(self.person + inp.ACTIVE_ACTION + 4, self.person, self.bench)
         g.m.put(self.person + inp.ACTIVE_ACTION + 32, struct.pack('<H', 8213))
         self.tick_until(r, lambda: r.finished)
         self.assertIsNone(r.failed)
         self.assertEqual(self.rows('taken')[0]['active']['routine'], 8213)
 
-    def test_a_social_is_taken_as_its_interaction_object(self):
-        # From goth-talk-order-20261118: Talk... > About Interests on Bella (18).
-        pushed = dict(uid=0, caller=21, target=18, icon=18, menu=24, args=[0, 0, 0, 0], routine=8273)
-        running = dict(uid=2, caller=21, target=260, icon=18, menu=21, args=[0, 0, 0, 0], routine=4235)
-        before = dict(target_person=True, active_uid=1, objects={0x1800, 0x2100, 0x1320})
-        new = 0x2600  # the interaction object's pointer
-        self.assertTrue(inp.social_of(running, pushed, before, new))
-        for case in (dict(icon=132), dict(caller=18), dict(uid=0), dict(target=18),
-                     dict(uid=1)):  # the action running at the push
-            self.assertFalse(inp.social_of(dict(running, **case), pushed, before, new), case)
-        self.assertFalse(inp.social_of(running, pushed, before, 0x1320))  # an object there at the push
-        self.assertFalse(inp.social_of(running, pushed, dict(before, target_person=False), new))  # not a social
-        self.assertFalse(inp.social_of(running, pushed, None, new))  # nothing read at the push
-
-    def social_push(self, r):
-        """Choose Joke on Bella (18); returns Bella once the choice is pushed."""
+    def test_expect_queued_finds_a_social_on_a_reused_object(self):
         g = self.g
+        r = self.runner('choose "About Interests"\nexpect-queued 21 18 within 10')
         bella = g.add_object(18, [0x1b8, 0x198], person=True)
-        g.open_pie(['Joke'], target=bella, caller=self.person)
+        thing = g.add_object(260, [0, 0])
+        slot = g.m.word(g.registry + 0x1c) - 4
+        g.open_pie(['About Interests'], target=bella, caller=self.person)
         g.highlight(0)
         self.tick_until(r, lambda: 'mousedown' in self.last_command())
-        action = g.m.alloc(0x44)
-        g.m.put_words(action + 4, self.person, bella)
-        r.on_queue_push(self.update + 1, False, g.m, dict(edi=self.person, esi=action))
+        action = self.push(r, 8273, target=bella, menu=24)
+        g.remove_object(260)
+        g.m.put_words(slot, thing)  # the new interaction object reuses the ID and address
+        g.objects[260] = thing
+        queued = self.person + 0x820
+        self.put_action(queued, self.person, thing, icon=bella, menu=21, routine=4235, uid=2)
+        g.m.put_words(self.person + 0xa40, 0, 1)
+        g.m.put(action, g.m.read(queued, 0x44))  # the game copies the converted action back
+        self.queue_result(r, action)
         g.close_pie()
-        return bella
-
-    def run_as(self, target, icon, uid):
-        self.g.m.put_words(self.person + inp.ACTIVE_ACTION + 4, self.person, target, icon)
-        self.g.m.put_words(self.person + inp.ACTIVE_ACTION + 60, uid)
-
-    def test_expect_queued_finds_a_social(self):
-        r = self.runner('choose Joke\nexpect-queued 21 18 within 10')
-        bella = self.social_push(r)
-        self.run_as(self.g.add_object(260, [0, 0]), bella, 2)
         self.tick_until(r, lambda: r.finished)
-        self.assertIsNone(r.failed, r.failed)
-        self.assertEqual(self.rows('taken')[0]['where'], 'social')
+        self.assertIsNone(r.failed)
+        push = self.rows('queued')[0]['action']
+        self.assertEqual((push['uid'], push['target'], push['menu'], push['routine']), (0, 18, 24, 8273))
+        self.assertEqual([(t['where'], t['uid']) for t in self.rows('taken')], [('queue', 2)])
 
-    def test_one_conversion_is_taken_for_one_push(self):
-        r = self.runner('choose Joke\nexpect-queued 21 18 within 10\nexpect-queued 21 18 within 10')
-        bella = self.social_push(r)
-        action = self.g.m.alloc(0x44)
-        self.g.m.put_words(action + 4, self.person, bella)
-        r.on_queue_push(self.update + 1, False, self.g.m, dict(edi=self.person, esi=action))  # a second push
-        self.run_as(self.g.add_object(260, [0, 0]), bella, 2)
-        self.tick_until(r, lambda: r.finished, most=40)
-        self.assertEqual([t['where'] for t in self.rows('taken')], ['social'])
-        self.assertIn('neither', r.failed)
-
-    def test_a_social_running_before_the_push_is_not_taken(self):
+    def test_a_receiving_social_cannot_confirm_the_push(self):
+        r = self.runner('expect-queued 21 18 within 3')
+        bella = self.g.add_object(18, [0x1b8, 0x198], person=True)
+        self.queue_result(r, self.push(r, 8273, target=bella, menu=24), 2)
         thing = self.g.add_object(260, [0, 0])
-        r = self.runner('choose Joke\nexpect-queued 21 18 within 10')
-        bella = self.social_push(r)  # the push is dropped; the talk from before goes on
-        self.run_as(thing, bella, 5)  # a new action, on an object there at the push
+        self.put_action(bella + inp.ACTIVE_ACTION, bella, thing, icon=self.person, menu=50, routine=4236, uid=3)
         self.tick_until(r, lambda: r.finished)
         self.assertIn('neither', r.failed)
+        self.assertFalse(self.rows('taken'))
+
+    def test_two_social_choices_for_the_same_person_match_their_own_uid(self):
+        r = self.runner('expect-queued 21 18 within 5\nexpect-queued 21 18 within 5')
+        g = self.g
+        bella = g.add_object(18, [0x1b8, 0x198], person=True)
+        first = self.push(r, 8273, target=bella, menu=24)
+        second = self.push(r, 8274, target=bella, menu=25, frame=0x7ff00)
+        self.queue_result(r, second, 4, frame=0x7ff00)
+        self.queue_result(r, first, 2)
+        other = g.add_object(261, [0, 0])
+        self.put_action(self.person + inp.ACTIVE_ACTION, self.person, other, icon=bella, routine=4235, uid=4)
+        self.tick(r)
+        self.assertFalse(self.rows('taken'))
+        thing = g.add_object(260, [0, 0])
+        self.put_action(self.person + 0x820, self.person, self.bench, routine=8213, uid=1)
+        self.put_action(self.person + 0x820 + 0x44, self.person, thing, icon=bella, routine=4235, uid=2)
+        g.m.put_words(self.person + 0xa40, 0, 2)
+        self.tick_until(r, lambda: r.finished)
+        self.assertIsNone(r.failed)
+        self.assertEqual([(t['where'], t['uid']) for t in self.rows('taken')], [('queue', 2), ('active', 4)])
+
+    def test_a_uid_taken_in_the_queue_cannot_be_taken_again_when_active(self):
+        r = self.runner('expect-queued 21 18 within 5\nexpect-queued 21 18 within 5')
+        g = self.g
+        bella = g.add_object(18, [0x1b8, 0x198], person=True)
+        thing = g.add_object(260, [0, 0])
+        self.queue_result(r, self.push(r, 8273, target=bella), 2)
+        queued = self.person + 0x820
+        self.put_action(queued, self.person, thing, icon=bella, routine=4235, uid=2)
+        g.m.put_words(self.person + 0xa40, 0, 1)
+        self.tick(r)
+        self.queue_result(r, self.push(r, 8274, target=bella), 2)
+        g.m.put(self.person + inp.ACTIVE_ACTION, g.m.read(queued, 0x44))
+        g.m.put_words(self.person + 0xa40, 1, 1)
+        self.tick_until(r, lambda: r.finished)
+        self.assertEqual([(t['where'], t['uid']) for t in self.rows('taken')], [('queue', 2)])
+        self.assertIn('neither', r.failed)
+
+    def test_a_rejected_push_does_not_take_a_matching_active_action(self):
+        r = self.runner('expect-queued 21 173 within 3')
+        self.put_action(self.person + inp.ACTIVE_ACTION, self.person, self.bench, routine=8213, uid=5)
+        action = self.push(r, 8213)
+        self.tick(r)
+        self.assertFalse(self.rows('taken'))  # still waiting for the call to return
+        self.queue_result(r, action, eax=0x100)  # al is zero
+        self.tick_until(r, lambda: r.finished)
+        self.assertIn('neither', r.failed)
+        self.assertFalse(self.rows('taken'))
+
+    def test_a_push_that_keeps_its_old_uid_cannot_take_that_action(self):
+        r = self.runner('expect-queued 21 18 within 3')
+        g = self.g
+        bella = g.add_object(18, [0x1b8, 0x198], person=True)
+        thing = g.add_object(260, [0, 0])
+        action = g.m.alloc(0x44)
+        self.put_action(action, self.person, bella, routine=8273, uid=2)
+        self.put_action(self.person + inp.ACTIVE_ACTION, self.person, thing, icon=bella, routine=4235, uid=2)
+        r.on_queue_push(1, False, g.m, dict(edi=self.person, esi=action, ebp=0x80000))
+        self.queue_result(r, action)
+        self.tick_until(r, lambda: r.finished)
+        self.assertIn('neither', r.failed)
+        self.assertFalse(self.rows('taken'))
 
     def test_the_held_action_must_have_the_pushed_arguments(self):
         a = dict(caller=21, target=173, routine=8213, menu=0, args=[2, 0, 0, 0])
@@ -810,7 +860,7 @@ class ReviewFindingsTest(RunnerBase):
 
     def test_an_unreadable_push_is_logged_not_raised(self):
         r = self.runner('wait 1')
-        r.on_queue_push(1, True, self.g.m, dict(edi=0x10, esi=0x20))
+        r.on_queue_push(1, True, self.g.m, dict(edi=0x10, esi=0x20, ebp=0x80000))
         self.assertEqual(self.rows('queued_unread')[0]['action_pointer'], 0x20)
         self.assertEqual([p['kind'] for p in r.pushes], ['queued_unread'])
 
@@ -820,7 +870,7 @@ class ReviewFindingsTest(RunnerBase):
         g.highlight(0)
         r = self.runner('choose Sit\nanswer-dialog 400 400')
         self.tick_until(r, lambda: 'mousedown' in self.last_command())
-        r.on_queue_push(self.update + 1, False, g.m, dict(edi=0x10, esi=0x20))  # not a person: unread
+        r.on_queue_push(self.update + 1, False, g.m, dict(edi=0x10, esi=0x20, ebp=0x80000))
         self.assertTrue(self.rows('queued_unread'))
         r.on_dialog('dialog_show', self.update + 1)
         self.assertIn('400 400', self.last_command())

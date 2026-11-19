@@ -782,7 +782,8 @@ def main():
     try:
         reply = remote.stop_reply()
         event(kind='attach', reply=reply, resume=args.resume, updates=updates)
-        for a in (ENTRY, RETURN, DIALOG_SHOW, DIALOG_RESULT, DIALOG_READ, 0x415eff, scenario_input.QUEUE_PUSH):
+        for a in (ENTRY, RETURN, DIALOG_SHOW, DIALOG_RESULT, DIALOG_READ, 0x415eff,
+                  scenario_input.QUEUE_PUSH, scenario_input.QUEUE_RESULT):
             remote.clear_break(a)
             if args.resume:
                 remote.clear_break(a)
@@ -792,6 +793,7 @@ def main():
             arm(ENTRY)  # taken over before a dump at the next entry (or in the middle of it)
         if runner:
             arm(scenario_input.QUEUE_PUSH)
+            arm(scenario_input.QUEUE_RESULT)
         if watches or runner:
             arm(ENTRY)
             if args.resume:
@@ -952,6 +954,8 @@ def main():
                         arm(ENTRY)
             elif runner and pc == scenario_input.QUEUE_PUSH:
                 runner.on_queue_push(updates + 1, bool(in_update), m, regs)
+            elif runner and pc == scenario_input.QUEUE_RESULT:
+                runner.on_queue_result(m, regs)
             else:
                 # A dialog function. ecx is the dialog record (0x436da0 keeps it in esi).
                 record = regs['ecx']

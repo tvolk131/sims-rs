@@ -74,7 +74,8 @@ Ghidra on the decrypted image and checked in the running game):
   (without advancing time), so the runner goes on there.
 - 0x48ddcb is the call in the pie menu's select handler (0x48dd67) that
   pushes the chosen action onto the person's queue (0x45d20b): edi (= ecx)
-  is the person, esi the action. capture.py stops there to record it.
+  is the person, esi the action. At the return (0x48ddd0), al says whether
+  it succeeded and the action holds its assigned uid at +0x3c.
 """
 import json
 import re
@@ -87,6 +88,7 @@ GAME = 0x6e48bc
 PEOPLE_PANEL = 0x6f3b2c
 VIEW_ZOOM, VIEW_X0, VIEW_Y0 = 0x6f00d8, 0x6f00d0, 0x6f00d4
 QUEUE_PUSH = 0x48ddcb
+QUEUE_RESULT = 0x48ddd0
 ACTIVE_ACTION = 0xa48  # a person's running action (0x44 bytes); the queue is at +0x820
 PICKER_TOOL = 6
 PICKER_ACTIVE_PIE = 0xe4  # the pie window the picker's menu is in (a submenu's, once one opens)
@@ -384,25 +386,8 @@ def read_queue(m, person):
 
 
 def same_action(a, b):
-    """The same interaction: the fields the pie menu's entry sets. The uid is
-    given only when the queue takes the action, and the flags and the
-    attenuation change as it runs."""
+    """Compare the fields the pie menu sets when the assigned uid cannot be read."""
     return all(a.get(k) == b.get(k) for k in ('caller', 'target', 'routine', 'menu', 'args'))
-
-
-def social_of(a, pushed, before, target_pointer):
-    """Whether the running action a is the social interaction the pie menu
-    pushed (a "Talk..." submenu entry on another person). The game does not
-    run it as pushed: at once it makes an interaction object, and the
-    person's running action targets that object, with the other person as
-    its icon (and its own routine and menu). `before` is what was read at
-    the push: whether its target is a person, the running action's uid, and
-    the lot's object pointers; the running action must be a new one, on an
-    object made since (target_pointer: an object can get a freed ID)."""
-    return bool(before and before['target_person'] and a.get('uid') and a.get('uid') != before['active_uid']
-                and a.get('caller') == pushed.get('caller') and a.get('icon') == pushed.get('target')
-                and a.get('target') not in (None, 0, pushed.get('target'))
-                and target_pointer not in before['objects'])
 
 
 def check_window(window):
@@ -533,8 +518,9 @@ class Runner:
     capture.py calls on_update(update, m, sim) at the return of every lot
     update on the lot (update is the number of updates returned so far),
     on_queue_push(update, in_update, m, regs) at QUEUE_PUSH (update is the
-    number of the lot update that comes next), and on_dialog(kind, update)
-    for the dialog stops. m reads guest memory.
+    number of the lot update that comes next), on_queue_result(m, regs) at
+    QUEUE_RESULT, and on_dialog(kind, update) for the dialog stops. m reads
+    guest memory.
 
     input.jsonl rows (each has `kind`, `update` and `time`):
       step     a step started, ended (`status` done) or failed (`error`).
@@ -555,8 +541,9 @@ class Runner:
                level, the definition's 0xa6 bytes and the 72 data words)
                with the budget before and after and the cost.
       taken    expect-queued found the pushed action on the person: `where`
-               is queue or active (the queue had already started it), with
-               the person's active action and queue at that update return.
+               is queue or active, including for converted socials. `uid`
+               is the held action's uid when available, with the person's
+               active action and queue at that update return.
       scenario `status` done (every step and command ended) or unfinished
                (the capture ended first, with the commands still unchecked).
     """
@@ -573,8 +560,8 @@ class Runner:
         #                      ('fresh',), ('push', pushes) or ('drain',)
         self.pushes = []
         self.push_cursor = 0  # pushes before it were matched by an expect-queued
-        self.push_before = {}  # push index -> what was read at it (see social_of)
-        self.socials = set()  # (person, uid) of the conversions an expect-queued took
+        self.pending_pushes = {}  # pie menu stack frame -> push waiting for its result
+        self.taken_uids = set()  # a queued or running action can confirm only one push
         self.fresh = False  # self.m was read at this update return (not at a dialog stop)
         self.unchecked = []  # (n, row): commands whose exit code is still to be checked
         self.held = None  # the info of a held press whose release is not yet submitted
@@ -612,21 +599,23 @@ class Runner:
         except Exception as e:  # reading the push must never end the capture
             row = dict(kind='queued_unread', update=update, in_update=in_update, person=None,
                        person_pointer=person, action_pointer=action, error=f'{type(e).__name__}: {e}')
-            self.pushes.append(row)  # still a push: a choice that waits on one goes on (a dialog may follow)
-            self.write(**row)
-            return
-        try:  # what a social's conversion is told from (see social_of)
-            target = m.word(action + 8)
-            self.push_before[len(self.pushes)] = dict(
-                target_person=bool(target) and m.half(m.word(target + 0x118) + 0x12) == 2,
-                active_uid=m.word(person + ACTIVE_ACTION + 60),
-                objects=object_slots(m, self.sim) if self.sim else None)
-            if self.push_before[len(self.pushes)]['objects'] is None:
-                del self.push_before[len(self.pushes)]
-        except Exception:
-            self.push_before.pop(len(self.pushes), None)
-        self.pushes.append(row)
+        self.pending_pushes[regs['ebp']] = row
+        self.pushes.append(row)  # a choice goes on even if the push was unreadable
         self.write(**row)
+
+    def on_queue_result(self, m, regs):
+        push = self.pending_pushes.pop(regs['ebp'], None)
+        if push is None or push['kind'] != 'queued':
+            return
+        push['accepted'] = bool(regs['eax'] & 0xff)
+        push['uid'] = None
+        if push['accepted']:
+            try:
+                # 0x45d5d5 copies a social's converted action back into the
+                # pie entry for the person who made the push, including its uid.
+                push['uid'] = m.word(push['action_pointer'] + 0x3c) or None
+            except Exception:  # the return may be readable even when the uid is not
+                pass
 
     def on_dialog(self, kind, update):
         """A dialog stop. A modal dialog holds the lot update it shows in, so
@@ -1042,28 +1031,34 @@ class Runner:
         hold that action, queued or already running."""
         yield Fresh()
         start = self.update
-        push = before = None
+        push = None
         while True:
             if push is None:
                 for i in range(self.push_cursor, len(self.pushes)):
                     r = self.pushes[i]
                     if r['kind'] == 'queued' and r['person'] == person and (
                             target is None or r['action']['target'] == target):
-                        push, before, self.push_cursor = r, self.push_before.get(i), i + 1
+                        push, self.push_cursor = r, i + 1
                         break
-            p = push and find_object(self.m, self.sim, person)
+            p = push and push.get('accepted') and find_object(self.m, self.sim, person)
             if p:
                 queue, active = read_queue(self.m, p), self.m.action(p + ACTIVE_ACTION)
-                where = ('active' if same_action(active, push['action']) else
-                         'queue' if any(same_action(a, push['action']) for a in queue) else
-                         'social' if (person, active.get('uid')) not in self.socials and social_of(
-                             active, push['action'], before, self.m.word(p + ACTIVE_ACTION + 8)) else None)
-                if where == 'social':
-                    self.socials.add((person, active['uid']))
-                if where:
-                    self.write(kind='taken', person=person, where=where, pushed_update=push['update'],
-                               active=active, queue=queue)
-                    return
+                uid = push['uid']
+                for where, action in [('active', active)] + [('queue', a) for a in queue]:
+                    held_uid = action['uid']
+                    if held_uid in self.taken_uids:
+                        continue
+                    if uid is None:
+                        matches = same_action(action, push['action'])
+                    else:
+                        # A social can return with the uid it had before the call.
+                        matches = held_uid == uid and uid != push['action']['uid']
+                    if matches:
+                        if held_uid:
+                            self.taken_uids.add(held_uid)
+                        self.write(kind='taken', person=person, where=where, uid=held_uid or None,
+                                   pushed_update=push['update'], active=active, queue=queue)
+                        return
             if self.update - start >= within:
                 if push:
                     raise StepFailed(f'the action pushed on {person} was in neither its queue nor its active '
