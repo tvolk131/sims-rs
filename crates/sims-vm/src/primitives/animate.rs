@@ -491,11 +491,7 @@ impl Machine<'_, '_> {
                         "Animate Sim has no object to name its clip",
                     ))?
                     .guid;
-                let definition = self
-                    .catalog
-                    .object(guid)
-                    .ok_or_else(|| Trap::Invalid(format!("no definition for GUID 0x{guid:08X}")))?;
-                (definition.resource, table)
+                (self.definition(guid)?.resource, table)
             }
             _ => {
                 return Err(Trap::Unsupported(format!(

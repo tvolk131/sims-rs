@@ -507,6 +507,8 @@ mod tests {
             animations: Default::default(),
             people: Default::default(),
             icon_frames: None,
+            wardrobe: None,
+            character_files: Default::default(),
             expansions: 0,
             characters: Default::default(),
         }

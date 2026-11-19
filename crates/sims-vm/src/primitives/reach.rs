@@ -289,10 +289,7 @@ impl Machine<'_, '_> {
     /// person's own five records are at 0 (0x46de93).
     fn slot_height(&self, container: u16, slot: i32) -> Result<F32, Trap> {
         let object = &self.world.objects[&container];
-        let definition = self
-            .catalog
-            .object(object.guid)
-            .ok_or_else(|| Trap::Invalid(format!("object {container} has no definition")))?;
+        let definition = self.definition(object.guid)?;
         let entries: Vec<_> = self
             .program
             .slots(definition.resource, definition.chunk)

@@ -216,10 +216,9 @@ pub(crate) fn depreciate(
         if part.parent != 0 && part.parent as u16 != id {
             return Ok(());
         }
-        let definition = interpreter
-            .catalog
-            .object(object.guid)
-            .ok_or_else(|| Trap::Invalid("object has no definition".into()))?;
+        let definition =
+            crate::interpreter::object_definition(interpreter.catalog, world, object.guid)
+                .ok_or_else(|| Trap::Invalid("object has no definition".into()))?;
         match interpreter
             .program
             .master_definition(definition.resource, definition.chunk)
@@ -420,9 +419,7 @@ impl Interpreter<'_> {
         if self.words(world, id)?[word::TYPE] == PERSON {
             return Ok(true);
         }
-        let definition = self
-            .catalog
-            .object(object.guid)
+        let definition = crate::interpreter::object_definition(self.catalog, world, object.guid)
             .ok_or_else(|| Trap::Invalid(format!("object {id} has no definition")))?;
         let master = self
             .program

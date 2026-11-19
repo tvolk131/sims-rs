@@ -205,7 +205,9 @@ impl Machine<'_, '_> {
             return Ok(None);
         }
         for record in self.world.neighbors.slots.iter().flatten() {
-            if self.catalog.object(record.guid).is_none() {
+            if crate::interpreter::object_definition(self.catalog, self.world, record.guid)
+                .is_none()
+            {
                 return Err(Trap::Unsupported(format!(
                     "neighbor {} has the GUID 0x{:08X}, which no definition has; the original \
                      compares the GUID of the definition the record is linked to",
