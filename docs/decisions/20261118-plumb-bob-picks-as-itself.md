@@ -41,11 +41,16 @@ code writes it.
   after the person, so where it covers them it is the bob that is found.
 - **The port.** The bob's pixels now name the bob (`People::draw_on_lot`).
   Before, they named the person holding it, which the plumb bob note left
-  unverified. So the window's pointer on the bob finds object 383, and
-  the pick lists the bob's pie for the selected Sim, as the original
-  does. That listing changes only Mortimer's word 50, to 1; his stack
-  and last result stay as they were. This is the recording's change at
-  622
+  unverified. So the window's pointer on the bob finds object 383 unless
+  a person is shown within the pick's reach of the pixel
+  (`crate::pick` finds people first, `pick::REACH`; where the bob
+  overlaps someone nearby, as after some camera turns, the person is still
+  found, which is **unverified** against the original's draw-order rule).
+  The pick lists the bob's pie for the selected Sim, as the original
+  does. The listing offers nothing. Of Mortimer's object words, only word 50
+  changes, to 1. His stack frames (tree, node, locals) and last result
+  stay as they were. His frame storage grows, as any check's does. This is the
+  recording's change at 622 for the words it compares
   (`the_pointer_on_the_plumb_bob_lists_the_bobs_menu`).
 - **Unverified: where the original's bob was at 622.** The recording's
   pointer stays at (200, 123) from the choice at 202. Our window shows

@@ -424,8 +424,10 @@ fn the_lot_hides_the_people_behind_it() {
                     let report = people.draw_on_lot(&solo, &camera, &mut on);
                     assert!(report.problems.is_empty(), "{:?}", report.problems);
                     // Drawn again, noting apart from the IDs which pixels
-                    // the canvas took: those name the person, and every
+                    // the canvas took: those name the person (or the
+                    // plumb bob they hold, for its own pixels), and every
                     // other pixel names what it named before.
+                    let bob = sims_people::bob::held_by(&solo, id);
                     let mut noted = Taken {
                         canvas: base.clone(),
                         taken: vec![false; base.width * base.height],
@@ -436,6 +438,9 @@ fn the_lot_hides_the_people_behind_it() {
                     for (x, y) in pixels(&on) {
                         let i = y as usize * on.width + x as usize;
                         let expected = if noted.taken[i] {
+                            if bob.is_some() && on.id_at(x, y) == bob {
+                                continue;
+                            }
                             Some(id)
                         } else {
                             assert_eq!(on.color[i], base.color[i], "{x}, {y}");
