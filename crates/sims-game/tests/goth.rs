@@ -1397,8 +1397,12 @@ fn a_press_on_a_portrait_selects_that_goth_who_then_takes_the_order() {
         }
     }
     assert!(taken.is_some(), "she never took the order");
-    // The salesman (object 259) leaves at tick 510 while his animator
-    // still plays a walk. The reset removes that layer immediately.
+    // At tick 455 Mortimer (object 21), now left to himself, routes to
+    // a door one of his routes goes through, and the route fails
+    // (0x45b176). The salesman (object 259) leaves at tick 510 while his
+    // animator still plays a walk; the reset removes that layer at once
+    // (0x586b63). The lot runs on past it (checked here to tick 540; it
+    // was run to 3540 without a stop). Not compared with a recording.
     while game.lot().ticks() < 509 {
         assert_eq!(game.run(1), 1, "{:?}", game.stopped());
     }

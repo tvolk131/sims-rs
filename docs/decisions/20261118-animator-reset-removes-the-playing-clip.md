@@ -16,7 +16,10 @@ slot itself makes no change to the queue or the playing flag.
 the layer in the skin's list (+0x7c), marks the layers changed (+0x94)
 at 0x5991d4, erases the list entry through 0x59b0bd, and destroys and
 frees the layer. 0x5928fb then zeros the slot pointer. An empty slot
-returns before touching the skin.
+returns before touching the skin. (A layer not found in the skin's list
+would be dropped from the slot without marking the skin changed; a
+slot's layer is always in the list here, so the port does not keep that
+case.)
 
 **Fade gate.** A layer fades only if the byte at 0x6f6bd0 and the
 duration at 0x6d0460 are both nonzero and the slot is other than the
@@ -24,8 +27,9 @@ base. The installed Complete Collection PE places 0x6f6bd0 in the
 zero-filled tail of its data section. In the mapped executable image
 its only absolute references are the compares at 0x586cb2 (the base
 animator's clear) and 0x592887 (the person's animator's clear). The
-byte was zero in that image and the duration was 200. No direct
-writer or reference taking the byte's address was found.
+byte is 0 in the memory images of the running game taken at updates
+14, 15, 47 and 580, and the duration is 200. No direct writer or
+reference taking the byte's address was found.
 
 With the gate enabled, 0x5928a3 and 0x5928a7 set two layer fields
 (+0x7c and +0x78) to -1. 0x597a64 sets the fade flag and records the
@@ -44,11 +48,14 @@ foreground even if the playing flag is clear, as it can be for a walk.
 The blend slot stays empty in the supported executable, so the reset
 needs no fade state or refusal.
 
-**Verified in strict mode.** In the portrait-and-fridge-order test,
-the salesman leaves at tick 510 and the lot reaches tick 540. In the
-pie-menu social test, the lot runs through step 625 after passing the
-reset at step 595, which used to report a stop at tick 597 with
-`A2O-door-knock` in the foreground.
+**Runs past the reset in strict mode.** Strict mode only shows that no
+unported path is reached. In the portrait-and-fridge-order test, the
+salesman leaves at tick 510 and the lot runs on (the test checks to
+tick 540; it was run to 3540 without a stop). In the pie-menu social
+test, the salesman is deleted at tick 597 with `A2O-door-knock` in the
+foreground, where the run used to stop; the test checks that he and his
+animator are gone then, and runs to tick 625 (run to 3625 without a
+stop). Neither run was compared with a recording here.
 
 **Unverified.** The reference scan covers the mapped Complete Collection
 executable and direct addresses. A write through an indirect address

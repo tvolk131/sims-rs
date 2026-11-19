@@ -335,17 +335,23 @@ fn the_selected_goth_lists_pie_menus_and_picks_from_them() {
     assert_eq!(lot.world().headlines, BTreeMap::from([(16, shown(1))]));
     lot.step().unwrap_or_else(|e| panic!("{e}"));
     assert!(lot.world().headlines.is_empty());
-    // The salesman (object 259) still has a door knock playing before
-    // the reset that used to stop the run with the error at tick 597.
-    while lot.ticks() < 594 {
+    // The salesman (object 259) still has a door knock playing when he
+    // is taken off the lot at tick 597; the reset that deletes him
+    // removes the clip at once (0x586b63), and the lot runs on past it
+    // (checked here to tick 625; it was run to 3625 without a stop).
+    // His id is reused by another object before tick 625.
+    while lot.ticks() < 596 {
         lot.step().unwrap_or_else(|e| panic!("{e}"));
     }
     let layer = lot.world().animators[&259].foreground.as_ref().unwrap();
     assert_eq!(layer.clip, "A2O-door-knock");
-    for _ in 595..=625 {
+    lot.step().unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(lot.ticks(), 597);
+    assert!(!lot.world().objects.contains_key(&259));
+    assert!(!lot.world().animators.contains_key(&259));
+    while lot.ticks() < 625 {
         lot.step().unwrap_or_else(|e| panic!("{e}"));
     }
-    assert_eq!(lot.ticks(), 625);
 }
 
 /// The pie's entry the pointer reaches is checked again (0x48df28) as

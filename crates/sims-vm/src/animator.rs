@@ -2275,7 +2275,9 @@ fn turn(world: &mut World, id: u16, a: &mut Animator) -> Result<Next, Trap> {
 /// - The next foreground clip's priority is raised again (+0x1a0 = 1).
 /// - The foreground clip is cleared (virtual function 0xfc, 0x586b63):
 ///   the layer leaves the skin, which marks the skin's layers changed
-///   (0x592878, 0x5a0a7b, 0x5991a0), and the clip's selection becomes -1.
+///   (0x592878, 0x5a0a7b, 0x5991a0), and the clip's selection becomes -1
+///   ([`Animator::clear_foreground`]). The layer's fields +0x78 and +0x7c,
+///   set to -1 first (0x58e06f, 0x58e078), go with it.
 /// - The animator stands (state 3) where the turn was to end: the
 ///   position and the destination become the destination noted when the
 ///   turn started (+0x1dc to +0x1e4; the direction through virtual

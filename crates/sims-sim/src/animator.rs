@@ -859,7 +859,13 @@ impl Animator {
     ///
     /// The fade branch (0x592887) requires byte 0x6f6bd0 and duration
     /// 0x6d0460 to be nonzero. The Complete Collection executable
-    /// zero-initializes the byte and both direct references read it.
+    /// zero-initializes the byte, both direct references only read it,
+    /// and it is 0 in the memory images of the running game taken at
+    /// updates 14, 15, 47 and 580, so it is taken to be 0.
+    ///
+    /// 0x5991a0 marks the skin changed and frees the layer only if it
+    /// finds the layer in the skin's list; a slot's layer is always in
+    /// it here, so that case is not kept.
     pub fn clear_foreground(&mut self) {
         if self.foreground.take().is_some() {
             self.skin_dirty = true;
