@@ -551,8 +551,9 @@ impl Prices {
 /// out ([`Values::read`]) and store them (0x416118, 0x416126): on going
 /// to live mode (0x4cea9e through 0x416534), so after a load, at the
 /// day's turn (0x41647e, signal 0xdc), from the budget dialog (0x50206e
-/// through 0x416558) and before the house is written (0x41621f). So an
-/// object that breaks or is mended shows at the next of those.
+/// through 0x416558, which stores them only when the simulator's word
+/// +0x36 is not 0, 0x41655b) and before the house is written (0x41621f).
+/// So an object that breaks or is mended shows at the next of those.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Values {
     /// What the objects that are valued are worth.
@@ -581,9 +582,10 @@ impl Values {
     ///
     /// The simulation stores the objects' value at the day's turn (in
     /// `sims-vm`) and neither value elsewhere: the architecture's stays
-    /// what the house was saved with, and going to live mode stores
-    /// neither, so a house saved with values that are out of date shows
-    /// them until the day turns. A known gap in the simulation, not the
+    /// what the house was saved with, past any day's turn, and going to
+    /// live mode stores neither, so a house saved with values that are
+    /// out of date shows the objects' until the day turns and the
+    /// architecture's for good. A known gap in the simulation, not the
     /// original's behaviour; [`Values::read`] is the sum it would store.
     #[must_use]
     pub fn stored(world: &World) -> Self {
@@ -614,9 +616,10 @@ impl Values {
     ///   any tile from the lead along the chain.
     ///
     /// The original's pass also sets the lot's global 22 and 37 and two of
-    /// the family's flags, and puts right a slot word of 0 on an object it
-    /// asks (0x43264c); the simulation keeps those, and nothing here
-    /// changes the world. A type [`Kinds`] has not read is passed over.
+    /// the family's flags (0x4160e5, 0x4160f6), and puts right a slot word
+    /// of 0 on an object it asks (0x43264c). Those are the simulation's:
+    /// it keeps the globals and the slot word, and not the family's flags
+    /// (see `sims-vm`'s day's turn). Nothing here changes the world. A type [`Kinds`] has not read is passed over.
     ///
     /// The panel does not run this: it reads the stored values
     /// ([`Values::stored`]). This is the sum for the simulation to store

@@ -157,7 +157,12 @@ impl Resources {
                 // The entry's chunk must be there with the entry's key. Its
                 // low flag bits are the map's to state, as in the
                 // prototype, which reads the payload wherever the map
-                // points and checks only the type there.
+                // points and checks only the type there. **Unverified:**
+                // the original looks the resource up by the map's ID
+                // (0x41bbc5) and checks only the chunk's type (0x41d33b),
+                // so a chunk whose ID or high flag byte differs would be
+                // read there under the map's; here the map is refused. No
+                // file of the install has one.
                 let index = at(entry.offset as usize)
                     .filter(|(_, c)| {
                         c.tag == *tag && c.id == entry.id && c.flags >> 8 == entry.flags >> 8

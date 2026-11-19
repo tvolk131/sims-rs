@@ -34,17 +34,19 @@ No screenshot of the panel was compared.
   0x46d1bd). Its lot statistics (0x416085) store them (0x416118,
   0x416126) on going to live mode (0x4cea9e through 0x416534), so after
   a load, at the day's turn (0x41647e, signal 0xdc), from the budget
-  dialog (0x50206e through 0x416558) and before the house is written
+  dialog (0x50206e through 0x416558, which stores them only when the
+  simulator's word +0x36 is not 0, 0x41655b) and before the house is
+  written
   (0x41621f, ahead of the `SIMI` write at 0x416253). The panel reads
   what was stored last, so an object that breaks or is mended shows at
   the next of those. Here the panel reads the world's budget, which a
   checkpoint or snapshot keeps with the rest of the world. The
   simulation stores the objects' value at the day's turn (`sims-vm`'s
   `day_statistics`) and neither value elsewhere: the architecture's
-  stays what the house was saved with, and going to live mode stores
-  neither (`World::update_statistics`). So a house saved with values
-  out of date shows them, and after a day turns the new objects' value
-  is weighed against the saved architecture's. This is a known gap in
+  stays what the house was saved with, past any day's turn, and going
+  to live mode stores neither (`World::update_statistics`). So a house
+  saved with values out of date shows them, and after a day turns the
+  new objects' value is weighed against the saved architecture's. This is a known gap in
   the simulation, not the original's behaviour; it is the simulation's
   to close, with these sums.
 - **The objects** (0x444cb9), in the lot's order, in 32-bit sums that
@@ -113,11 +115,15 @@ No screenshot of the panel was compared.
     same when each language's strings are together. They are in all 488
     such tables of the install's `Build.iff` and pattern files: 31 loose
     and 457 in FAR archives.
-  - **Unverified:** a resource map entry whose flags' high byte differs
-    from its chunk header's. The IFF reader rejects the map then
-    (`sims_formats::iff`, from the frozen prototype), where the original
-    checks only the chunk's type. No file of the install has one, FAR
-    members included.
+  - **Unverified:** a resource map entry whose ID or flags' high byte
+    differs from its chunk header's. The IFF reader rejects the map then
+    and reads the chunks as if there were none (`sims_formats::iff`,
+    from the frozen prototype), where the original looks the resource
+    up by the map's ID (0x41bbc5) and checks only the chunk's type
+    (0x41d33b), so a pattern's price under such an entry would be
+    missed. No file of the install has one: its 3,523 mapped files, FAR
+    members included, list 160,672 entries, each with its chunk's type,
+    ID and flags' high byte.
 - **The prices by table:**
   - Wall styles (0x6e5838): `STR#` 129, entries 1 to 5, give styles 1,
     2, 13, 12 and 14 (0x4cd149), and entry 1 gives style 255 too
