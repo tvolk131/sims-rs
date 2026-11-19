@@ -54,6 +54,9 @@ struct Resources {
     order: BTreeMap<[u8; 4], Vec<usize>>,
     /// Indices into [`Iff::chunks`] by key.
     by_key: BTreeMap<([u8; 4], u16, u8), usize>,
+    /// The flags the resource map lists for a resource, by index into
+    /// [`Iff::chunks`]; see [`Iff::resource_flags`].
+    map_flags: BTreeMap<usize, u16>,
     /// Why the resource map could not be used. The table is then the
     /// chunks read as if there were no map, so lookups still work, but
     /// [`Iff::resource_order`] fails.
@@ -167,6 +170,7 @@ impl Resources {
                     })?
                     .0;
                 resources.add(chunks, index, true);
+                resources.map_flags.insert(index, entry.flags);
             }
         }
         Ok(Some(resources))
@@ -209,6 +213,17 @@ impl Iff {
             chunks,
             resources,
         })
+    }
+    /// The flags the original reads a resource's byte order from
+    /// (0x41d3a7): its resource map entry's when the file's map is used,
+    /// else the chunk header's.
+    pub fn resource_flags(&self, chunk: &Chunk) -> u16 {
+        self.chunks
+            .binary_search_by_key(&chunk.offset, |c| c.offset)
+            .ok()
+            .and_then(|index| self.resources.map_flags.get(&index))
+            .copied()
+            .unwrap_or(chunk.flags)
     }
     pub fn data(&self, chunk: &Chunk) -> &[u8] {
         &self.bytes[chunk.payload.clone()]

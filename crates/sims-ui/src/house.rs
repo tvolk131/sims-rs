@@ -474,7 +474,8 @@ impl Prices {
                     let chunk = iff.get(b"STR#", id)?;
                     Some((
                         id,
-                        StringTable::parse_chunk(iff.data(chunk), chunk.flags).ok()?,
+                        StringTable::parse_chunk(iff.data(chunk), iff.resource_flags(chunk))
+                            .ok()?,
                     ))
                 })
                 .collect()

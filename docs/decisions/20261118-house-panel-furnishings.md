@@ -66,10 +66,13 @@ panel was compared.
   - **Pool:** on level 1, a pool byte below 0x10 adds the pool's price.
   - A level whose tile flags, floors or walls are missing adds nothing.
     A missing pool array leaves out only the pool's price.
-- **The prices** (`Prices::load`) come from `GameData/Build.iff`. A
-  table in a chunk without flag 0x10 is big-endian to the original,
-  which swaps a version -1 table's count (0x470351,
-  `StringTable::parse_chunk`); so is a pattern file's. Each
+- **The prices** (`Prices::load`) come from `GameData/Build.iff`. Its
+  tables, and a pattern file's, are read as the original's string
+  loader reads them (0x46feac, `StringTable::parse_chunk`). A resource
+  without flag 0x10 is big-endian: 0x470351 swaps its leading word, and
+  the count when that is -1. The flag is the resource map's when the
+  file has one (0x41d3a7, `Iff::resource_flags`). A leading word other
+  than -1, -2 or -3 is the count of length-prefixed strings after it. Each
   string-table entry is three strings, and the first is the price, read
   as C's `atoi` reads its bytes (0x636029, `sims_content::atoi`), so a
   byte order mark before the digits reads 0:
@@ -110,8 +113,10 @@ panel was compared.
 - **Tests:**
   - `atoi`, a byte order mark included;
   - a pattern file's price from `STR#` 0, with another table first,
-    without table 0 or its string, and a big-endian count without
-    flag 0x10;
+    without table 0 or its string, a big-endian count without flag
+    0x10, and a little-endian length-prefixed table;
+  - the string loader's byte orders and layouts, and the map's flags
+    over the header's;
   - the prices from stand-in tables and pattern files;
   - the architecture of a hand-made lot (straight walls, a fence, a
     split floor, a diagonal that is not the lowest segment, a skipped

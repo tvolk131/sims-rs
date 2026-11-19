@@ -234,7 +234,7 @@ impl Surfaces {
 /// A pattern file's own price (see [`SurfaceFile::price`]).
 fn price(iff: &Iff) -> Option<i32> {
     let chunk = iff.get(b"STR#", 0)?;
-    let table = StringTable::parse_chunk(iff.data(chunk), chunk.flags).ok()?;
+    let table = StringTable::parse_chunk(iff.data(chunk), iff.resource_flags(chunk)).ok()?;
     Some(atoi(&table.entry(1, US_ENGLISH)?.raw_text))
 }
 
@@ -332,5 +332,8 @@ mod tests {
         big.swap(2, 3);
         assert_eq!(price(&iff_flags(&[(0, 0, big.clone())])), Some(25));
         assert_eq!(price(&iff_flags(&[(0, 0x10, big)])), None);
+        // A little-endian length-prefixed table: its count is its first word.
+        let pascal = b"\x02\x00\x04Name\x0225".to_vec();
+        assert_eq!(price(&iff_flags(&[(0, 0x10, pascal)])), Some(25));
     }
 }

@@ -77,22 +77,52 @@ impl StringTable {
         }
         Ok(Self { format, entries })
     }
-    /// Parses a chunk's table as the original's string loader does
-    /// (0x46feac): a chunk without flag 0x10 is taken as big-endian and
-    /// handed to 0x470351, which swaps the leading word and, when that is
-    /// then -1, the count. A version -1 table in such a chunk (`FF FF`,
-    /// then a big-endian count) is read with its count swapped. Any other
-    /// leading word is read as [`StringTable::parse`] reads it, which
-    /// already takes a word that is not a version as a big-endian count
-    /// (**unverified** for a version word other than -1 in such a chunk;
-    /// none is known).
+    /// Parses a resource's table as the original's string loader does
+    /// (0x46feac), with `flags` the resource's flags
+    /// ([`crate::iff::Iff::resource_flags`]):
+    ///
+    /// - Without flag 0x10 the resource is big-endian and 0x470351 swaps
+    ///   its leading word, and, when that is then -1, the count.
+    /// - A leading word of -1, -2 or -3 is then that version, with the
+    ///   count after it.
+    /// - Any other leading word is the count of length-prefixed strings
+    ///   that follow it (0x4700d7); 0 or below is an empty table. (Version
+    ///   0, which [`StringTable::parse`] reads with a count after it, is
+    ///   not a layout the original knows.)
+    ///
+    /// **Not ported:** the original's change of bytes 0xa1 to `o` and 0xd5
+    /// to `'` in length-prefixed strings (0x4700f5).
     pub fn parse_chunk(data: &[u8], flags: u16) -> Result<Self> {
-        if flags & 0x10 == 0 && data.len() >= 4 && data[..2] == [0xff, 0xff] {
-            let mut swapped = data.to_vec();
-            swapped.swap(2, 3);
-            return Self::parse(&swapped);
+        let Some(&[a, b]) = data.first_chunk::<2>() else {
+            return Self::parse(data);
+        };
+        let swapped = flags & 0x10 == 0;
+        let word = if swapped {
+            i16::from_be_bytes([a, b])
+        } else {
+            i16::from_le_bytes([a, b])
+        };
+        let mut normal = data.to_vec();
+        match word {
+            -3..=-1 => {
+                normal[..2].copy_from_slice(&word.to_le_bytes());
+                if word == -1 && swapped && normal.len() >= 4 {
+                    normal.swap(2, 3);
+                }
+            }
+            count if count > 0 => {
+                // `parse` reads a word that is not a version as a
+                // big-endian count.
+                normal[..2].copy_from_slice(&count.to_be_bytes());
+            }
+            _ => {
+                return Ok(Self {
+                    format: Format::MacResource,
+                    entries: Vec::new(),
+                });
+            }
         }
-        Self::parse(data)
+        Self::parse(&normal)
     }
     pub fn get(&self, index: usize, language: u8) -> Option<&str> {
         self.entry(index, language).map(|e| e.text.as_str())
