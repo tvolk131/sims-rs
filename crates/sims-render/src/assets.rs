@@ -217,7 +217,10 @@ impl Assets {
 
     /// The wall-top trim frames at a zoom, for standing or cut walls. Empty
     /// if the game lacks them, or if they hold far more pixels than the
-    /// game's do.
+    /// game's do. A cut trim's frame carries its depth sprite's bytes as
+    /// its depth (255 where nothing is drawn), when the game has a frame
+    /// of the same size for it; the original draws the two together and
+    /// draws neither without both (0x4c8b1f).
     pub fn trim(&mut self, cut: bool, zoom: Zoom) -> &[Image] {
         /// The frames the corner table can name.
         const FRAMES: usize = 46;
@@ -233,6 +236,14 @@ impl Assets {
             let Ok(set) = LegacySpriteSet::parse(data) else {
                 return Vec::new();
             };
+            // The depth sprite has no palette of its own: decode it with
+            // one that maps each byte to itself.
+            let bytes = Palette((0..=255u8).map(|v| [v; 3]).collect());
+            let depth = cut
+                .then(|| walls.get(b"SPR#", 6144 + zoom.index() as u16))
+                .flatten()
+                .map(|chunk| walls.data(chunk))
+                .and_then(|data| Some((data, LegacySpriteSet::parse(data).ok()?)));
             let mut images = Vec::new();
             let mut pixels = 0usize;
             for i in 0..set.frames.len().min(FRAMES) {
@@ -243,7 +254,23 @@ impl Assets {
                 if pixels > BUDGET {
                     return Vec::new();
                 }
-                images.push(Image::from(frame));
+                let mut image = Image::from(frame);
+                let found = depth
+                    .as_ref()
+                    .and_then(|(data, set)| set.decode_with_palette(data, i, &bytes).ok());
+                if let Some(found) = found
+                    && (found.width, found.height) == (image.width as u32, image.height as u32)
+                {
+                    let raw = found
+                        .rgba
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|p| if p[3] == 0 { 255 } else { p[0] })
+                        .collect();
+                    image.depth = Some(raw);
+                }
+                images.push(image);
             }
             images
         })
