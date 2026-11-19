@@ -231,3 +231,112 @@ fn what_the_person_factory_does_not_port_fails_loudly() {
     let fault = create(&mut fx, ADULT).unwrap_err();
     assert!(fault.to_string().contains("profile"), "{fault}");
 }
+
+/// Person word 32 (+0x5cc): 0 for a member of the household, 1 for a
+/// visitor, 2 kept.
+const VISITOR: usize = 32;
+
+fn visitor_word(fx: &Fixture, id: u16) -> i16 {
+    fx.world.objects[&id].person.as_ref().unwrap().data[VISITOR]
+}
+
+fn set_visitor_word(fx: &mut Fixture, id: u16, value: i16) {
+    fx.world
+        .objects
+        .get_mut(&id)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap()
+        .data[VISITOR] = value;
+}
+
+#[test]
+fn a_new_person_works_out_again_who_is_a_visitor() {
+    // The factory's signal 0xe2 (0x440ed7) has the lot run the visitor
+    // pass (0x42a2b4, from 0x4163f7) over every person, the new one too.
+    // The fixture's family (global 9, 109) has the Sim's type as its one
+    // member. On a residential lot a member gets 0, and anyone else keeps
+    // a word other than 0 and gets 1 for a 0.
+    let residential = |fx: &mut Fixture| {
+        let lot = fx.world.globals[10];
+        fx.program.zoning.insert(lot, 1);
+    };
+    let mut fx = lot(11);
+    residential(&mut fx);
+    set_visitor_word(&mut fx, SIM, 2);
+    let id = create(&mut fx, ADULT).unwrap();
+    assert_eq!(visitor_word(&fx, SIM), 0);
+    assert_eq!(visitor_word(&fx, id), 1);
+    // A second person leaves the first a visitor; a 2 that is no member's
+    // stays.
+    set_visitor_word(&mut fx, id, 2);
+    let other = create(&mut fx, ADULT).unwrap();
+    assert_eq!(visitor_word(&fx, id), 2);
+    assert_eq!(visitor_word(&fx, other), 1);
+    // Made as a member, the new person lives here.
+    let mut fx = lot(11);
+    residential(&mut fx);
+    fx.world.families[0].members.push(ADULT);
+    let id = create(&mut fx, ADULT).unwrap();
+    assert_eq!(visitor_word(&fx, id), 0);
+    // Global 10 at 0 is a residential lot (0x42b9e3 gives 1).
+    let mut fx = lot(11);
+    fx.world.globals[10] = 0;
+    fx.world.families[0].members.push(ADULT);
+    let id = create(&mut fx, ADULT).unwrap();
+    assert_eq!(visitor_word(&fx, id), 0);
+    // On a lot not zoned residential every 0 becomes 1, a member's too.
+    let mut fx = lot(11);
+    fx.world.families[0].members.push(ADULT);
+    let id = create(&mut fx, ADULT).unwrap();
+    assert_eq!(visitor_word(&fx, SIM), 1);
+    assert_eq!(visitor_word(&fx, id), 1);
+}
+
+#[test]
+fn the_visitor_pass_without_a_known_family_fails_loudly() {
+    // With global 9 at 0 the World does not say which family the game
+    // holds (game +0x10).
+    let mut fx = lot(11);
+    fx.world.globals[9] = 0;
+    let fault = create(&mut fx, ADULT).unwrap_err();
+    assert!(
+        matches!(fault.trap, Trap::Unsupported(ref m) if m.contains("0x42a2b4")),
+        "{fault}"
+    );
+    // A global 9 that names no family.
+    let mut fx = lot(11);
+    fx.world.families.clear();
+    let fault = create(&mut fx, ADULT).unwrap_err();
+    assert!(matches!(fault.trap, Trap::Invalid(_)), "{fault}");
+}
+
+#[test]
+fn the_construction_reset_takes_lot_0_as_residential() {
+    // Step 8 of the construction reset (0x4599f8, 0x459a0b) asks 0x40745f,
+    // for which lot 0 has zoning 1 (0x42b9e3). An Init that leaves person
+    // word 32 at 3 keeps it on lot 0, and the visitor pass keeps a word
+    // other than 0 for someone not of the family.
+    const INIT: u16 = 4098;
+    let made = |lot: i16| {
+        let (mut fx, file) = lot_with_init(11, INIT);
+        fx.add(
+            file,
+            INIT,
+            tree(vec![assign(
+                18,
+                VISITOR as i16,
+                scope::LITERAL,
+                3,
+                RETURN_TRUE,
+            )]),
+        );
+        fx.world.globals[10] = lot;
+        let id = create(&mut fx, ADULT).unwrap();
+        visitor_word(&fx, id)
+    };
+    assert_eq!(made(0), 3);
+    // On a lot not zoned residential, the reset makes it 1.
+    assert_eq!(made(110), 1);
+}
