@@ -839,6 +839,23 @@ class ReviewFindingsTest(RunnerBase):
         self.assertFalse(self.rows('taken'))
         self.assertEqual([(q['accepted'], q['uid']) for q in self.rows('queue_result')], [(False, None)])
 
+    def test_the_field_match_takes_only_an_action_given_its_uid_after_the_push(self):
+        r = self.runner('expect-queued 21 173 within 3')
+        self.put_action(self.person + inp.ACTIVE_ACTION, self.person, self.bench, routine=8213, uid=5)
+        self.g.m.put_words(inp.ACTION_SERIAL, 5)
+        self.push(r, 8213)
+        r.on_queue_result(self.g.m, dict(eax=1, ebp=0x80000))
+        r.pushes[-1]['uid'] = None  # as when the uid could not be read; the new Sit was cancelled at once
+        self.tick_until(r, lambda: r.finished)
+        self.assertIn('neither', r.failed)
+        self.assertFalse(self.rows('taken'))
+
+    def test_a_refused_unreadable_push_is_still_logged(self):
+        r = self.runner('wait 1')
+        r.on_queue_push(1, True, self.g.m, dict(edi=0x10, esi=0x20, ebp=0x80000))
+        r.on_queue_result(self.g.m, dict(eax=0, ebp=0x80000))
+        self.assertEqual([(q['accepted'], q['uid']) for q in self.rows('queue_result')], [(False, None)])
+
     def test_a_push_whose_return_is_never_seen_says_so(self):
         r = self.runner('expect-queued 21 173 within 3')
         self.push(r, 8213)

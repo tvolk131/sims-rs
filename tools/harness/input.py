@@ -90,6 +90,7 @@ VIEW_ZOOM, VIEW_X0, VIEW_Y0 = 0x6f00d8, 0x6f00d0, 0x6f00d4
 QUEUE_PUSH = 0x48ddcb
 QUEUE_RESULT = 0x48ddd0
 ACTIVE_ACTION = 0xa48  # a person's running action (0x44 bytes); the queue is at +0x820
+ACTION_SERIAL = 0x6e4904  # the last action uid given (0x41f158 adds one and gives it)
 PICKER_TOOL = 6
 PICKER_ACTIVE_PIE = 0xe4  # the pie window the picker's menu is in (a submenu's, once one opens)
 WINDOW = '0xe00013'
@@ -599,17 +600,21 @@ class Runner:
         except Exception as e:  # reading the push must never end the capture
             row = dict(kind='queued_unread', update=update, in_update=in_update, person=None,
                        person_pointer=person, action_pointer=action, error=f'{type(e).__name__}: {e}')
+        try:  # uids above this one are given after the push (the field match takes only those)
+            row['serial_before'] = m.word(ACTION_SERIAL)
+        except Exception:
+            row['serial_before'] = None
         self.pending_pushes[regs['ebp']] = row
         self.pushes.append(row)  # a choice goes on even if the push was unreadable
         self.write(**row)
 
     def on_queue_result(self, m, regs):
         push = self.pending_pushes.pop(regs['ebp'], None)
-        if push is None or push['kind'] != 'queued':
+        if push is None:
             return
         push['accepted'] = bool(regs['eax'] & 0xff)
         push['uid'] = None
-        if push['accepted']:
+        if push['accepted'] and push['kind'] == 'queued':
             try:
                 # 0x45d5d5 copies a social's converted action back into the
                 # pie entry for the person who made the push, including its uid.
@@ -619,8 +624,8 @@ class Runner:
                 push['uid'] = m.word(push['action_pointer'] + 0x3c) or None
             except Exception:  # the return may be readable even when the uid is not
                 pass
-        self.write(kind='queue_result', person=push['person'], accepted=push['accepted'], uid=push['uid'],
-                   pushed_update=push['update'])
+        self.write(kind='queue_result', person=push['person'],
+                   accepted=push['accepted'], uid=push['uid'], pushed_update=push['update'])
 
     def on_dialog(self, kind, update):
         """A dialog stop. A modal dialog holds the lot update it shows in, so
@@ -1057,8 +1062,9 @@ class Runner:
                     held_uid = action['uid']
                     if held_uid in self.taken_uids or (uid is None and held_uid in others):
                         continue
-                    if uid is None:
-                        matches = same_action(action, push['action'])
+                    if uid is None:  # only an action given its uid after the push
+                        serial = push.get('serial_before')
+                        matches = same_action(action, push['action']) and (serial is None or held_uid > serial)
                     else:
                         # A social can return with the uid it had before the call.
                         matches = held_uid == uid and uid != push['action']['uid']
