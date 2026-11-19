@@ -32,6 +32,7 @@ fn options(install: PathBuf) -> Options {
         install,
         answers: vec![3],
         play: false,
+        frames: Frames::default(),
     }
 }
 
@@ -1880,17 +1881,29 @@ fn a_press_on_the_selected_goths_portrait_centres_him_after_a_long_scroll() {
 /// Mortimer's snack with the pointer: it reached the fridge before update
 /// 124, pressed before 154, reached "Have A Snack" on the pie before 176
 /// and chose it before 202. The window, given the same input between the
-/// same ticks in strict mode, matched the recording's full state after
-/// every update from 1 to 453 but for two things the input does not
-/// change (see docs/decisions/). This pins what the recording showed
-/// the input doing: Mortimer's last result after each step, and what the
-/// fridge's check trees left in his frames when the snack starts.
+/// same ticks in strict mode, and drawing the house view's frames when
+/// the recording shows the original drew them, matched the recording's
+/// full state after every update from 1 to 1000 but for a few things
+/// (see docs/decisions/). This pins what the recording showed the input
+/// doing: Mortimer's last result after each step, and what the fridge's
+/// check trees left in his frames when the snack starts. Then what the
+/// frames did: when Bella's Room motive took her room's new score, and
+/// when the queue's listing cleared Mortimer's next action's flag 0x80.
 #[test]
 fn the_recorded_snack_order_replayed_in_the_window_matches_the_recording() {
     let Some(install) = install() else {
         return;
     };
-    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    // The frames after these ticks, as the recording shows them: one
+    // after every 30th update from 171, where the captures without input
+    // have one after every 30th from 33. Which frames the original drew
+    // before update 171 is not shown; these are the default's.
+    let frames = Frames::parse("0,1,2,3,33,63,93,123,153,171+30").expect("a schedule");
+    let mut game = Game::open(&Options {
+        frames,
+        ..options(install)
+    })
+    .expect("the Goth house opens");
     game.resize([800, 600]);
     let fridge = 118;
     let mortimer = game.lot().world().selected().expect("a Sim is selected");
@@ -1967,6 +1980,39 @@ fn the_recorded_snack_order_replayed_in_the_window_matches_the_recording() {
     };
     assert_eq!(locals(4120), [4104, 254]);
     assert_eq!(locals(4142), [363]);
+    // Bella's (person 18) Room motive takes her room's score each tick,
+    // and the room is counted again only when a frame is drawn: the
+    // daylight changed in update 453, the frame after 471 counted it,
+    // and her motive took it in update 472, as in the recording.
+    let room = |game: &Game| {
+        game.lot().world().objects[&18]
+            .person
+            .as_ref()
+            .unwrap()
+            .motives[13]
+            .to_bits()
+    };
+    run_to(&mut game, 471);
+    assert_eq!(room(&game), 0x4225_ac1d);
+    run_to(&mut game, 472);
+    assert_eq!(room(&game), 0x4277_073c);
+    // Mortimer chooses his next action in update 872; it is named, with
+    // flag 0x80, until the frame after 891 lists the queue. The recording
+    // shows it cleared after update 892, as it saves an update's state
+    // before the frame after it; this step's state is after its frame.
+    let running = |game: &Game| {
+        let active = &game.lot().world().objects[&mortimer]
+            .person
+            .as_ref()
+            .unwrap()
+            .active;
+        (active.target, active.action, active.flags)
+    };
+    run_to(&mut game, 890);
+    assert_eq!(running(&game), (263, 4170, 0x9e));
+    run_to(&mut game, 891);
+    assert_eq!(running(&game), (263, 4170, 0x1e));
+    run_to(&mut game, 1000);
     assert_eq!(game.caught(), 0, "{:?}", game.errors());
 }
 

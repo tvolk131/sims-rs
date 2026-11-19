@@ -104,3 +104,63 @@ fn a_string_with_tokens_fails_loudly_before_anything_changes() {
         assert_eq!(active_flags(&fx), 0x41);
     }
 }
+
+/// A lot whose Sim (selected if `selected`) runs an action with flags
+/// 0xc1 and an icon, and queues one with flags 0x84 and an icon and one
+/// with flags 0x80 and no icon.
+fn listed(selected: bool) -> Fixture {
+    let mut fx = Fixture::new();
+    let sim = fx.world.objects.get_mut(&SIM).unwrap();
+    sim.selected = selected;
+    let person = sim.person.as_mut().unwrap();
+    person.active.icon = LAMP as i16;
+    person.active.flags = 0xc1;
+    let mut queued = person.active.clone();
+    queued.flags = 0x84;
+    let mut iconless = person.active.clone();
+    iconless.icon = 0;
+    iconless.flags = 0x80;
+    person.queue = vec![queued, iconless];
+    fx
+}
+
+fn flags(fx: &Fixture) -> Vec<u32> {
+    let person = fx.sim().person.as_ref().unwrap();
+    std::iter::once(&person.active)
+        .chain(&person.queue)
+        .map(|a| a.flags)
+        .collect()
+}
+
+fn frame(fx: &mut Fixture, mode: sims_vm::PanelMode) {
+    let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    interpreter.draw_frame_in(&mut fx.world, 1, mode).unwrap();
+}
+
+#[test]
+fn a_live_mode_frame_clears_the_named_flag_of_the_selected_sims_listed_actions() {
+    // The queue panel lists the running action and each queued one with
+    // an icon (0x4ea31c, 0x4ea203); listing works the name out (0x41f167),
+    // which clears flag 0x80 and nothing else.
+    let mut fx = listed(true);
+    frame(&mut fx, sims_vm::PanelMode::Live);
+    assert_eq!(flags(&fx), [0x41, 0x04, 0x80]);
+    // `draw_frame` is a live-mode frame.
+    let mut fx = listed(true);
+    let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    interpreter.draw_frame(&mut fx.world, 1).unwrap();
+    assert_eq!(flags(&fx), [0x41, 0x04, 0x80]);
+}
+
+#[test]
+fn a_frame_lists_no_queue_outside_live_mode_or_without_a_selected_sim() {
+    use sims_vm::PanelMode::*;
+    for mode in [Build, Buy, Options, Camera] {
+        let mut fx = listed(true);
+        frame(&mut fx, mode);
+        assert_eq!(flags(&fx), [0xc1, 0x84, 0x80], "{mode:?}");
+    }
+    let mut fx = listed(false);
+    frame(&mut fx, Live);
+    assert_eq!(flags(&fx), [0xc1, 0x84, 0x80]);
+}

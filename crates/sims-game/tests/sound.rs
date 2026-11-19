@@ -42,6 +42,7 @@ fn the_goths_sounds_play() {
         install: install.clone(),
         answers: vec![3],
         play: false,
+        frames: sims_game::Frames::default(),
     };
     let mut game = sims_game::Game::open(&options).expect("the Goth house opens");
     // The walls leave every object where it is on the screen, so they
