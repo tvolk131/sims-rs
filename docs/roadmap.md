@@ -52,8 +52,9 @@ events, and what it asks for after them) come first.
 3. **1000 ticks on three more base-game houses**, picked for code the
    Goths do not reach (for example the Newbies and a family with
    children). Done (#221, #223, 2026-11-16): the Newbies, the Pleasants and the
-   Roomies; the Newbies' comparison is recorded through update 935,
-   and 936 to 1000 is still to compare. See Progress.
+   Roomies; all three were compared through update 1000 (the Newbies again on
+   #223's branch); the comparison has not been rerun since #258 and
+   #264 moved the strict pins. See Progress.
 4. **Player orders.** Recordings of the original with the input track's
    scripted clicks and pie-menu choices, matched through
    `Interpreter::pie_menu`, `Interpreter::pick` and `Interpreter::order`.
@@ -115,13 +116,14 @@ events, and what it asks for after them) come first.
   entries by position (#247). A press on the house view or a pie
   menu is now held while three lot updates run (#222), which the
   remaining player-order recordings (Read A Book, a social, buy mode,
-  work) need. The held press opened the fridge's pie in the finished write-watch
-  recording (`goth-snack-d50-watch-20261115`); the other recordings
-  still need it.
-- Step 3: three houses the Goths don't reach match their recordings (the
-  Pleasants and the Roomies through 1000 updates, the Newbies through
-  935: their capture holds full states to 1000, but only the comparison
-  through 935 is recorded), apart from the words the original left from
+  work) need. The held press opened the pie in the finished write-watch recording
+  (`goth-snack-d50-watch-20261115`) and in track 2's finished Talk and
+  Read A Book recordings (`goth-talk-order-20261118`,
+  `goth-read-order-20261118`); replaying those two in the window is
+  still to do, as are buy mode and work.
+- Step 3: three houses the Goths don't reach match their recordings through 1000 updates (the Newbies compared again through 1000 on
+  #223's branch; none of the three rerun since #258 and #264 moved
+  the strict pins), apart from the words the original left from
   memory it never set: the Newbies (`House07.iff`,
   `house07-ticks-20261115`, with global 12 at updates 1 and 3 also
   differing, the interface's tutorial wait), the Pleasants (`House06.iff`,
@@ -221,8 +223,10 @@ events, and what it asks for after them) come first.
   targets and neighborhood record 301. From 2820 through 3340 (every
   tenth update) it matches apart from two modelled differences:
   a frame local that overlays a code-owner pointer, and person word 37
-  from memory the original never set. After 3340, of the fields compared at the checkpoints only person 21's
-  last result differs, at update 3350 (1 in the original, 0 here); it
+  from memory the original never set. From 3340 to 3590 (every tenth update), of the fields compared only
+  person 21's last result differs, at update 3350 (1 in the original,
+  0 here), and from 3600 to 4150 those fields match apart from the
+  modelled unknowns (#258); it
   is thought to come from a pie listing under the recording's parked
   pointer, which the strict replay has no pointer to drive (#258; the
   write was never captured). A new person now makes the lot work out again who is a
@@ -264,8 +268,8 @@ events, and what it asks for after them) come first.
 - Of the base neighborhood's houses only the Goths' and the Newbies'
   (`House07.iff`) hold a family. Strict mode on the Newbie house runs to
   tick 4052; a route that gives up on a slot it may end near runs the
-  Route failure feedback tree (tick 1473). Against the recording of the house (compared through update 935; the
-  capture reaches 1000), every update's random streams, scheduler
+  Route failure feedback tree (tick 1473). Against the recording of the house (updates 0 to 1000, #223), every
+  update's random streams, scheduler
   cursor, action serial, globals and objects, and each object's data,
   temps, attributes, frames and person data match, except the words the
   original left from memory it never set (person word 37, locals on half
@@ -2634,8 +2638,9 @@ through their public interfaces only; the simulation never depends on it.
   multi-tile object is picked as itself; the simulation sends its
   interactions on (0x435286). How the original finds what the pointer is on is read for 3D
   graphics: the bob and a person each read the depth buffer at the
-  pointer before and after drawing, and the one that changed it is
-  under the pointer (0x5863eb, 0x590ebd, 0x48c9be; #260). Since #260
+  pointer before and after drawing, and the last to change it is under
+  the pointer; the bob draws after the person, so where it covers them
+  the bob wins (0x5863eb, 0x590ebd, 0x48c9be; #260). Since #260
   the bob's pixels name the bob; our picker still prefers a person
   within two pixels, which is unverified against that rule.
 - **Done: answering a dialog from the window.** A dialog with a choice
