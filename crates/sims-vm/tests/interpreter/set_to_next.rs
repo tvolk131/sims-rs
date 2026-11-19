@@ -238,31 +238,67 @@ fn mode_6_needs_a_parameter_only_with_objects_left() {
     assert_eq!(fx.run(), Ok(false));
 }
 
+/// A tile type: definition word 10 (the group) set.
+const TILE_GUID: u32 = 0x3333;
+
+/// Registers object `id` of the tile type, with `parent` as its lead
+/// (0 for the lead itself), first in registration order as a new object
+/// goes.
+fn add_tile(fx: &mut Fixture, id: u16, parent: i16) {
+    let mut tile = object(id, TILE_GUID);
+    tile.multipart = Some(sims_formats::saved_objects::Multipart {
+        offset: [0; 3],
+        group: [0; 3],
+        parent,
+    });
+    fx.world.order.insert(0, id);
+    fx.world.objects.insert(id, tile);
+}
+
+fn tile_type(fx: &mut Fixture) {
+    let resource = fx.add_type(TILE_GUID, 4, 0, 0);
+    fx.program
+        .libraries
+        .get_mut(&resource)
+        .unwrap()
+        .definitions
+        .get_mut(&128)
+        .unwrap()[10] = 7;
+}
+
+/// Mode 3 (0x44ec79) follows the tiles' next links (+0x18c), the order
+/// they joined their lead's list, and from the last tile goes back to the
+/// lead (+0x190). Registration order, where each new object goes first,
+/// plays no part: here it is 12, 11, 10, and the list is 10, 11, 12.
 #[test]
-fn mode_3_walks_a_multi_tile_group() {
+fn mode_3_follows_the_group_s_links() {
     let mut fx = Fixture::new();
-    // Tiles come before their head in registration order; the chain is
-    // still the head first, then its tiles in that order.
-    for (id, parent) in [(12, 10), (11, 10), (10, 0), (20, 0)] {
-        fx.add_object(id).multipart = Some(sims_formats::saved_objects::Multipart {
-            offset: [0; 3],
-            group: [0; 3],
-            parent,
-        });
-    }
-    for (cursor, next) in [(10, 12), (12, 11)] {
+    tile_type(&mut fx);
+    add_tile(&mut fx, 10, 0);
+    add_tile(&mut fx, 11, 10);
+    add_tile(&mut fx, 12, 10);
+    add_tile(&mut fx, 20, 0);
+    fx.world.next_parts.insert(10, 11);
+    fx.world.next_parts.insert(11, 12);
+    for (cursor, next) in [(10, 11), (11, 12), (12, 10)] {
         assert_eq!(step(&mut fx, 3, cursor), Ok(true));
         assert_eq!(fx.lamp().temps[0], next);
     }
-    // The last tile leads back to the head.
-    assert_eq!(step(&mut fx, 3, 11), Ok(true));
-    assert_eq!(fx.lamp().temps[0], 10);
-    // A head with no tiles, an object in no group and a missing object all
-    // store zero.
-    for cursor in [20, LAMP as i16, 77, 0] {
+    // A lead with no tiles, an object whose definition word 10 is 0 (the
+    // lamp), a missing object and zero all store zero (0x44ecc9).
+    for cursor in [20, LAMP as i16, 77, 0, -3] {
         assert_eq!(step(&mut fx, 3, cursor), Ok(false));
         assert_eq!(fx.lamp().temps[0], 0);
     }
+    // Word 10 is read first: a tile of a type without it stores zero.
+    let part = fx.world.objects[&12].multipart.clone();
+    fx.add_object(30).multipart = part;
+    assert_eq!(step(&mut fx, 3, 30), Ok(false));
+    assert_eq!(fx.lamp().temps[0], 0);
+    // An object of a type with word 10 that is no tile: the original reads
+    // through the null cast (0x44ecaa).
+    fx.world.objects.get_mut(&12).unwrap().multipart = None;
+    assert!(matches!(trap(step(&mut fx, 3, 12)), Trap::Unsupported(m) if m.contains("0x44ecaa")));
 }
 
 #[test]

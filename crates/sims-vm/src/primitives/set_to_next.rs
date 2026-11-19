@@ -20,7 +20,8 @@
 //!   0x44efb4), which is not registration order: a person made at run
 //!   time comes last.
 //! - 2: the next object that is not a person (definition word 9 is not 2).
-//! - 3: the next tile of the cursor's multi-tile group.
+//! - 3: the next tile of the cursor's multi-tile group, along the
+//!   group's links (0x44ec79).
 //! - 4: the next instance of the type the GUID names, in that type's list
 //!   in [`World::instances`], which is made here on first use. A GUID
 //!   with no definition is the false branch with the cursor kept.
@@ -79,6 +80,7 @@
 //! [`World::order`]: sims_sim::World::order
 //! [`World::people`]: sims_sim::World::people
 
+use crate::factory::word::GROUP;
 use crate::fault::Trap;
 use crate::interpreter::Machine;
 use sims_sim::Object;
@@ -299,45 +301,45 @@ impl Machine<'_, '_> {
         Ok((mode == 1).then_some(0))
     }
 
-    /// Mode 3: the tile after `current` in its multi-tile group, the head
-    /// after the last tile, or zero for an object in no group.
+    /// Mode 3 (0x44ec79): the tile after `current` in its multi-tile
+    /// group, or zero.
     ///
-    /// `World` keeps each tile's saved head (its parent), not the native
-    /// next links. Loading appends each tile to its head's chain in
-    /// registration order (0x423223, 0x4228a9; legacy
-    /// sims-content/src/save_storage.rs:1243-1267), so the chain is the
-    /// head followed by its tiles in [`sims_sim::World::order`]. The
-    /// original's next link (legacy multitile.rs:98) is followed, falling
-    /// back to the head. Unverified once groups are split or joined at run
-    /// time, which nothing does yet.
+    /// The original looks the cursor up (0x40743b); no object, or one
+    /// whose definition word 10 ([`GROUP`], +0x118 +0x14) is 0, gives
+    /// zero (0x44ecc9). Otherwise it casts the object to a tile (0x6c0ef8)
+    /// and takes the tile's next link (+0x18c, [`World::next_parts`]),
+    /// or, when that is null, its lead (+0x190, [`Multipart::parent`],
+    /// null for the lead itself). Both null gives zero.
+    ///
+    /// The list runs from the lead through its tiles in the order they
+    /// joined it: the file's order for a loaded group, the order they were
+    /// made for one made at run time ([`crate::factory`]), which is not
+    /// [`World::order`], where each new object goes first. An object
+    /// with word 10 set that is not a tile fails: the cast gives null and
+    /// the original reads +0x18c through it (0x44ecaa).
+    ///
+    /// [`World::next_parts`]: sims_sim::World::next_parts
+    /// [`World::order`]: sims_sim::World::order
+    /// [`Multipart::parent`]: sims_formats::saved_objects::Multipart::parent
     fn next_tile(&self, current: i16) -> Result<i16, Trap> {
-        let Some(part) = u16::try_from(current)
-            .ok()
-            .and_then(|id| self.world.objects.get(&id))
-            .and_then(|o| o.multipart.as_ref())
-        else {
+        let Some(id) = u16::try_from(current).ok().filter(|&id| id > 0) else {
             return Ok(0);
         };
-        let head = if part.parent == 0 {
-            current
-        } else {
-            part.parent
+        let Some(object) = self.world.objects.get(&id) else {
+            return Ok(0);
         };
-        let order = self.registration_order()?;
-        let tiles = order
-            .iter()
-            .filter(|(_, o)| o.multipart.as_ref().is_some_and(|p| p.parent == head));
-        let next = if head == current {
-            tiles.map(|&(id, _)| id).next()
-        } else {
-            let mut after = tiles.skip_while(|&&(id, _)| id != current);
-            after.next();
-            after.next().map(|&(id, _)| id)
-        };
-        Ok(match next {
-            Some(id) => id,
-            None if head == current => 0,
-            None => head,
+        if self.interpreter().words(self.world, id)?[GROUP] == 0 {
+            return Ok(0);
+        }
+        let part = object.multipart.as_ref().ok_or_else(|| {
+            Trap::Unsupported(format!(
+                "Set To Next mode 3: object {id} has definition word 10 set but is no tile; \
+                 the original reads its next link through a null cast (0x44ecaa)"
+            ))
+        })?;
+        Ok(match self.world.next_parts.get(&id) {
+            Some(&next) => next as i16,
+            None => part.parent,
         })
     }
 

@@ -395,6 +395,60 @@ fn mode_0_puts_the_new_object_on_the_tile_ahead_of_me() {
 }
 
 #[test]
+fn mode_3_puts_the_new_object_on_the_tile_ahead_of_the_stack_object_in_its_room() {
+    // 0x44e34c: the stack object's position moves one tile in its facing
+    // (0x42228a), on its level. Its room (data word 29) is the filter:
+    // tiles (3, 2) and (2, 3) are in the lamp's room 1, tile (1, 2) is
+    // not (0x44e582).
+    for (facing, place) in [(2, Some([56, 40])), (4, Some([40, 56])), (6, None)] {
+        let (mut fx, _) = container();
+        fx.lamp_mut().data[1] = facing;
+        let before = ids(&fx);
+        let made = create(&mut fx, 3, 0, LAMP as i16);
+        assert_eq!(made, Ok(place.is_some()), "{facing}");
+        match place {
+            Some(place) => {
+                let id = new_object(&fx, &before);
+                let widget = &fx.world.objects[&id];
+                assert_eq!(widget.position, [place[0], place[1], 1], "{facing}");
+                assert_eq!(widget.data[2], 0);
+            }
+            None => assert_eq!(ids(&fx), before),
+        }
+    }
+    // Tile (1, 2) takes it for a stack object in room 0, or in room -5,
+    // which skips the test.
+    for room in [0, -5] {
+        let (mut fx, _) = container();
+        fx.lamp_mut().data[1] = 6;
+        fx.lamp_mut().data[29] = room;
+        let before = ids(&fx);
+        assert_eq!(create(&mut fx, 3, 0, LAMP as i16), Ok(true), "{room}");
+        let id = new_object(&fx, &before);
+        assert_eq!(fx.world.objects[&id].position, [24, 40, 1], "{room}");
+    }
+    // A stack object that names no object makes nothing.
+    for stack_object in [0, -1, 99] {
+        let (mut fx, _) = container();
+        let before = ids(&fx);
+        assert_eq!(create(&mut fx, 3, 0, stack_object), Ok(false));
+        assert_eq!(ids(&fx), before);
+    }
+    // The running object's own facing and place play no part: the stack
+    // object is the Sim, on tile (2, 2) facing 2, in room 1.
+    let (mut fx, _) = container();
+    fx.lamp_mut().data[1] = 6;
+    let sim = fx.sim_mut();
+    sim.position = [40, 40, 1];
+    sim.data[1] = 2;
+    sim.data[29] = 1;
+    let before = ids(&fx);
+    assert_eq!(create(&mut fx, 3, 0, SIM as i16), Ok(true));
+    let id = new_object(&fx, &before);
+    assert_eq!(fx.world.objects[&id].position, [56, 40, 1]);
+}
+
+#[test]
 fn flag_0x8_makes_nothing_on_a_tile_where_anything_stands() {
     // 0x44e51e: a free tile takes the new object; once it stands there,
     // a second one is refused before it is made.
@@ -556,8 +610,17 @@ fn what_mode_4_does_not_port_fails_loudly() {
         );
         assert_eq!(ids(&fx), before, "word {word}");
     }
+    // Mode 3 with flag 0x2 or 0x40.
+    for flags in [0x2, 0x40] {
+        let (mut fx, _) = container();
+        let result = create(&mut fx, 3, flags, LAMP as i16);
+        assert!(
+            matches!(trap(result), Trap::Unsupported(ref m) if m.contains("mode 3")),
+            "flags {flags:#x}"
+        );
+    }
     // The modes not ported.
-    for mode in [1, 3, 7, 10, 15] {
+    for mode in [1, 7, 10, 15] {
         let (mut fx, _) = container();
         let result = create(&mut fx, mode, 0, LAMP as i16);
         assert!(
