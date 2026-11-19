@@ -37,13 +37,22 @@
 //!   the position with the anchor bone, never runs. So the anchor is not
 //!   kept. That nothing reads the layer's fields but the pose is
 //!   **unverified**.
-//! - "dress" and "undress": the person's clothes (virtual functions 0xd8
-//!   and 0xdc). Not ported; they fail.
+//! - "dress" and "undress": the value, as written, is put on as an
+//!   accessory through the animator's virtual function 0xd8 (0x58d88f)
+//!   with an empty binding (0x6de5b0), or taken off through 0xdc
+//!   (0x58d919): what Change Suit does
+//!   ([`crate::primitives::change_suit`]), but without lowering the name
+//!   first. Every such value in the shipped animations is lowercase. The
+//!   registry's keys are lowercase (0x5950f5), and whether its lookup
+//!   (0x5a044d, 0x5a25dc) ignores case is not worked out, so a name with
+//!   an ASCII capital fails.
 //!
 //! Any other key does nothing.
 
 use crate::fault::Trap;
 use crate::interpreter::Interpreter;
+use crate::primitives::change_suit::{put_on, undress};
+use sims_content::People;
 use sims_sim::World;
 use sims_sim::animator::{Advance, Animator, Layer};
 
@@ -96,6 +105,7 @@ impl Interpreter<'_> {
                     for due in layer.due(track, &times).map_err(Trap::Unsupported)? {
                         timed_event(
                             world,
+                            &self.program.people,
                             id,
                             a,
                             layer,
@@ -122,6 +132,7 @@ impl Interpreter<'_> {
 /// there is not worked out.
 fn timed_event(
     world: &mut World,
+    people: &People,
     id: u16,
     a: &mut Animator,
     layer: &mut Layer,
@@ -151,10 +162,26 @@ fn timed_event(
                 )));
             }
             "dress" | "undress" => {
-                return Err(Trap::Unsupported(format!(
-                    "the clip {:?} has a timed event {key:?} (0x5912fd), which is not ported",
-                    layer.clip
-                )));
+                if value.bytes().any(|b| b.is_ascii_uppercase()) {
+                    return Err(Trap::Unsupported(format!(
+                        "the clip {:?} has a timed event {key:?} (0x5912fd) naming {value:?}, \
+                         with a capital: whether the suit lookup (0x5a044d) ignores case is \
+                         not worked out",
+                        layer.clip
+                    )));
+                }
+                let accessories = &mut world
+                    .objects
+                    .get_mut(&id)
+                    .and_then(|o| o.person.as_mut())
+                    .ok_or_else(|| Trap::native(0x1c, "object is not a person"))?
+                    .accessories;
+                if key == "dress" {
+                    put_on(people, accessories, value.clone())?;
+                } else {
+                    undress(accessories, value);
+                }
+                continue;
             }
             // "discontinuity" finds no blend layer; the anchor is not
             // kept; the sounds are not modeled; other keys do nothing.

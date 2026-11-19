@@ -26,6 +26,7 @@
 
 use crate::fault::Trap;
 use crate::interpreter::Machine;
+use sims_content::People;
 use sims_formats::saved_objects::Accessory;
 
 /// Person data words the suit is kept in (data at person +0x58c).
@@ -62,21 +63,7 @@ impl Machine<'_, '_> {
                 if off {
                     undress(accessories, &name);
                 } else {
-                    let found = program.people.suits.contains(&name);
-                    let errors = &program.people.suit_errors;
-                    if !found && !errors.is_empty() {
-                        return Err(Trap::Unsupported(format!(
-                            "Change Suit puts on accessory {name:?}, which no decoded avatar \
-                             file names. {} avatar files stopped decoding ({})",
-                            errors.len(),
-                            errors
-                                .keys()
-                                .map(String::as_str)
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        )));
-                    }
-                    dress(accessories, name, found);
+                    put_on(&program.people, accessories, name)?;
                 }
             }
             _ => return Err(Trap::native(0x2f, "invalid accessory string table")),
@@ -169,6 +156,32 @@ impl Machine<'_, '_> {
             .ok_or(Trap::native(0x30, "no accessory name"))?;
         Ok(name.to_ascii_lowercase())
     }
+}
+
+/// Puts on accessory `name` (0x58d88f), looking it up in `people`'s
+/// suits. A miss fails if any avatar files stopped decoding, since they
+/// might name it.
+pub(crate) fn put_on(
+    people: &People,
+    accessories: &mut Vec<Accessory>,
+    name: String,
+) -> Result<(), Trap> {
+    let found = people.suits.contains(&name);
+    let errors = &people.suit_errors;
+    if !found && !errors.is_empty() {
+        return Err(Trap::Unsupported(format!(
+            "accessory {name:?} is put on, but no decoded avatar file names it. {} avatar \
+             files stopped decoding ({})",
+            errors.len(),
+            errors
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    dress(accessories, name, found);
+    Ok(())
 }
 
 /// Puts on accessory `name` (0x58d88f). Takes off any of that name, then
