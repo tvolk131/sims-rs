@@ -132,9 +132,22 @@ fn people_stand_where_a_click_finds_them() {
         changed.len()
     );
     // A click on a pixel a person was drawn in finds a person; one far
-    // from every person finds none.
+    // from every person finds none. The plumb bob's pixels name the bob
+    // itself, not the person holding it.
+    let bob = world
+        .selected()
+        .and_then(|person| sims_people::bob::held_by(world, person));
+    let (on_bob, of_people): (Vec<[i32; 2]>, Vec<[i32; 2]>) = changed
+        .iter()
+        .partition(|&&[x, y]| bob.is_some() && canvas.id_at(x, y) == bob);
+    assert!(bob.is_none() || !on_bob.is_empty(), "the bob is not drawn");
+    // Away from its holder, a click on the bob finds the bob.
+    assert!(
+        bob.is_none() || on_bob.iter().any(|&p| pick::at(world, &canvas, p) == bob),
+        "no click finds the bob"
+    );
     let mut found = std::collections::BTreeSet::new();
-    for &point in &changed {
+    for &point in &of_people {
         let id = pick::person(world, &canvas, point)
             .unwrap_or_else(|| panic!("nobody at {point:?}, which a person was drawn in"));
         assert!(world.objects[&id].person.is_some(), "object {id}");
@@ -501,6 +514,49 @@ fn the_pointer_reaching_an_object_lists_its_menu_and_a_click_lists_it_again() {
         }
     }
     assert!(opened, "no object's menu opened");
+}
+
+/// The plumb bob is picked as itself, not as the person under it: the
+/// original's bob draw makes the bob the graphic under the pointer when
+/// it changes the depth there (0x586455), and the pick then lists the
+/// bob's pie (0x48ca2c → 0x48c834). With the pointer on the bob, with no
+/// person shown within the pick's reach (`pick::REACH`), the selected
+/// Sim's pie is listed on object 383. As in the snack order's
+/// recording at update 622, of Mortimer's object words only data word 50
+/// changes, to 1 (his running checks' word, set by the bob's check
+/// trees); his frames (tree, node, locals) and his last result stay as
+/// they were.
+#[test]
+fn the_pointer_on_the_plumb_bob_lists_the_bobs_menu() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    assert_eq!(game.run(100), 100);
+    game.resize([800, 600]);
+    game.render();
+    let world = game.lot().world();
+    assert_eq!(world.selected(), Some(21));
+    let bob = sims_people::bob::held_by(world, 21).expect("Mortimer holds the bob");
+    assert_eq!(bob, 383);
+    let point = (0..600)
+        .flat_map(|y| (0..800).map(move |x| [x, y]))
+        .find(|&p| !game.over_panel(p) && game.under(p) == Some(bob))
+        .expect("the bob is shown");
+    let mortimer = |game: &Game| {
+        let o = &game.lot().world().objects[&21];
+        let stack: Vec<_> = o
+            .stack
+            .iter()
+            .map(|f| (f.tree, f.node, f.locals.clone()))
+            .collect();
+        (o.data[50], o.last_result, stack)
+    };
+    let (word, last, stack) = mortimer(&game);
+    assert_eq!(word, 0);
+    game.hover(point);
+    assert_eq!(game.listed(), Some((21, bob)));
+    assert_eq!(mortimer(&game), (1, last, stack));
 }
 
 #[test]

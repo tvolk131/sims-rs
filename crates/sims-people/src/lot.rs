@@ -671,10 +671,14 @@ impl People {
                 draw_shaded(target, part, &skinned, &shade, project);
             }
             // The plumb bob over their head, if they hold it. Its pixels
-            // name the person too.
-            if bob::held_by(world, person.id).is_none() {
+            // name the bob itself, so the pointer on it finds the bob, not
+            // the person: the original's bob draw makes the bob the
+            // graphic under the pointer when it changes the depth there
+            // (0x586455), and the house view then lists the bob's pie
+            // (0x48ca2c → 0x48c834).
+            let Some(bob_id) = bob::held_by(world, person.id) else {
                 continue;
-            }
+            };
             let Some(head) =
                 rig::bone(&person.body.skeleton, bob::HEAD_BONE).and_then(|i| person.bones.get(i))
             else {
@@ -698,6 +702,7 @@ impl People {
                 .and_then(|o| o.person.as_ref())
                 .map_or(0, |p| p.motives[sims_sim::motives::MOOD] as i32);
             let colour = bob::colour(mood);
+            target.set_id(Some(bob_id));
             let bones = [bob::root(*head, person.root, spin)];
             for part in &loaded.parts {
                 let skinned = skin(part, &bones);
