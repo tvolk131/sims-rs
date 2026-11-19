@@ -75,7 +75,7 @@ impl Light {
     /// the float 0x358637bd); any other becomes `fraction * 255 + 0.5`,
     /// truncated (0x4b76a8). After dark the cap keeps the drawing context
     /// out of full light.
-    fn drawn_fraction(light: f32, brightest: f32) -> Option<u32> {
+    pub fn drawn_fraction(light: f32, brightest: f32) -> Option<u32> {
         let fraction = if light >= 0.5 { light } else { 0.5 };
         let fraction = if brightest >= fraction {
             fraction
@@ -126,6 +126,10 @@ mod tests {
     #[test]
     fn a_fraction_short_of_one_is_not_full_light() {
         assert_eq!(Light::from_fraction(1.0, 1.0), Light::FULL);
+        // A room's light just short of 1 rounds to the full byte, but the
+        // original passes walls the float, which is shaded (0x53ea46).
+        assert_eq!(crate::lot::light_byte(0.999), 255);
+        assert_eq!(Light::from_byte(255, 1.0), Light::FULL);
         assert_eq!(Light::from_fraction(2.0, 1.0), Light::FULL);
         assert_eq!(Light::from_fraction(0.999, 1.0), Light(Some(31)));
         assert_eq!(Light::from_fraction(0.2, 1.0), Light(Some(16)));

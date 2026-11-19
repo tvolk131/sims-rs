@@ -76,6 +76,10 @@ pub struct Lot {
     /// ([`sims_sim::rooms::Room::shown_light`]) times 255, as the original
     /// stores it for the room's tiles (0x46772d).
     pub room_lights: BTreeMap<i16, u8>,
+    /// The light each room shows, by ID ([`room_fraction`]), as the
+    /// original passes it to the drawing context for a wall face or the
+    /// cap at a wall's exposed end (0x4688bf, 0x53dc78, 0x53c9d3).
+    pub room_fractions: BTreeMap<i16, f32>,
     /// The light room 0, the outdoors, shows ([`room_fraction`]), as the
     /// original reads it for the wall-top trim (0x53dbcd); None without a
     /// room 0.
@@ -220,6 +224,12 @@ impl Lot {
             .iter()
             .map(|(&id, r)| (id, room_light(r)))
             .collect();
+        let room_fractions = world
+            .rooms
+            .rooms
+            .iter()
+            .map(|(&id, r)| (id, room_fraction(r)))
+            .collect();
         let outdoor_light = world.rooms.rooms.get(&0).map(room_fraction);
         let halves = world
             .rooms
@@ -236,6 +246,7 @@ impl Lot {
             levels,
             outdoor_rooms,
             room_lights,
+            room_fractions,
             outdoor_light,
             time_of_day: world.globals.get(4).copied().unwrap_or(0),
             halves,
@@ -325,6 +336,14 @@ impl Lot {
     pub fn room_light_at(&self, level: usize, fine: [i32; 2]) -> Option<u8> {
         self.room_at(level, fine)
             .and_then(|room| self.room_lights.get(&room).copied())
+    }
+
+    /// The light the room at a fine position on a level (0 or 1) shows,
+    /// as a fraction ([`room_fraction`]), or None off the lot or outside
+    /// every room.
+    pub fn room_fraction_at(&self, level: usize, fine: [i32; 2]) -> Option<f32> {
+        self.room_at(level, fine)
+            .and_then(|room| self.room_fractions.get(&room).copied())
     }
 }
 

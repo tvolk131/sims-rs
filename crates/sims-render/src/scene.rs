@@ -266,23 +266,26 @@ impl Painter<'_> {
         })
     }
 
-    /// How a wall face whose seen side has light byte `byte` is lit, pixel
-    /// by pixel: in that light plus the pools of the lamps marked on lot
-    /// tile `seen`, for a straight face along view y (`along_y`) or x;
-    /// `seen` None for a diagonal, which takes no pools (0x4c78c5). A room
-    /// in full light shows no pools (0x4c7c59). `byte` None draws in full
-    /// light whatever the time of day, as the original's reset to 1 does
-    /// (0x4b455f). See [`crate::pools`], "Walls".
+    /// How a wall face whose seen side's room shows light `light` (a
+    /// fraction) is lit, pixel by pixel: in that light, through the
+    /// drawing's light setter (0x4b4525), plus the pools of the lamps
+    /// marked on lot tile `seen`, for a straight face along view y
+    /// (`along_y`) or x; `seen` None for a diagonal, which takes no pools
+    /// (0x4c78c5). The original passes the room's float, not its tile
+    /// byte (0x53ea46, 0x53c9df), so a light just short of 1 is shaded. A
+    /// light in full light shows no pools (0x4c7c59). `light` None draws in
+    /// full light whatever the time of day, as the original's reset to 1
+    /// does (0x4b455f). See [`crate::pools`], "Walls".
     fn wall_light(
         &self,
         level: usize,
-        byte: Option<u8>,
+        light: Option<f32>,
         seen: Option<(bool, [i32; 2])>,
     ) -> impl Fn(usize, usize) -> Light + use<> {
         let brightest = self.lot.brightest();
-        let plain = byte.map_or(Light::FULL, |byte| Light::from_byte(byte, brightest));
-        let pools = byte
-            .and_then(|byte| Light::drawn_byte(byte, brightest))
+        let plain = light.map_or(Light::FULL, |light| Light::from_fraction(light, brightest));
+        let pools = light
+            .and_then(|light| Light::drawn_fraction(light, brightest))
             .zip(seen.and_then(|(along_y, tile)| self.wall_pools(level, along_y, tile)));
         let rise = pools::wall_rise(self.camera.zoom.index()) as i64;
         move |x: usize, y: usize| match &pools {
@@ -647,9 +650,14 @@ impl Painter<'_> {
                     // The side that shows takes the light of the room on
                     // that side: sampled just beside the wall's middle, so
                     // a split tile gives the triangle touching the wall.
-                    let byte = self.lot.light_at(index, wall_side(&s, front));
+                    // Without a room there the wall pass keeps the light it
+                    // last read, first 1 (0x53dbb4, 0x53dc78); ours takes 1.
+                    let fraction = self
+                        .lot
+                        .room_fraction_at(index, wall_side(&s, front))
+                        .unwrap_or(1.0);
                     let seen = seen_tile(self.camera, s.from, s.to);
-                    let light = self.wall_light(index, Some(byte), seen);
+                    let light = self.wall_light(index, Some(fraction), seen);
                     self.place_wall(&image, frame, ends, heights, level, &light, None);
                     if let Some(shape) = capped {
                         let (trim, mask) = if shape == 7 { (252, 9) } else { (253, 10) };
@@ -800,13 +808,9 @@ impl Painter<'_> {
         let zoom = self.camera.zoom;
         let half = zoom.tile_width() / 2;
         let cut_height = [6, 12, 23][zoom.index()];
-        // Every trim is lit as room 0, the outdoors, shows, through the
-        // drawing's light setter, or in full light without one
-        // (0x53c3a7 to 0x53c3c6).
-        let light = self.lot.outdoor_light.map_or(Light::FULL, |light| {
-            Light::from_fraction(light, self.lot.brightest())
-        });
+        let (corner_light, run_light) = trim_lights(self.lot.outdoor_light, self.lot.brightest());
         for (&corner, c) in &corners.corners {
+            let light = if c.record { corner_light } else { run_light };
             let at = self.corner_screen(corner, level);
             let view = self.rotate_corner(corner);
             let ground = self.corner_elevation(corner) / 16;
@@ -941,9 +945,10 @@ impl Painter<'_> {
             .copied()
             .find(|&i| corners.walls[i].line() == cap.line)
             .unwrap_or(owner);
-        // Without a room there, the cap is drawn in full light (0x53c9e9).
-        let byte = match face(lit) {
-            Some((_, s, front)) => self.lot.room_light_at(index, wall_side(&s, front)),
+        // In the light its room shows, through the setter (0x53c9df), or
+        // without a room there in full light (0x53c9e9).
+        let fraction = match face(lit) {
+            Some((_, s, front)) => self.lot.room_fraction_at(index, wall_side(&s, front)),
             None => return,
         };
         let [tx, ty] = [c.view[0] + cap.offset[0], c.view[1] + cap.offset[1]];
@@ -996,7 +1001,7 @@ impl Painter<'_> {
             Line::X => Some((false, self.camera.unrotate_tile([tx, ty]))),
             Line::Rising | Line::Falling => None,
         };
-        let light = self.wall_light(index, byte, seen);
+        let light = self.wall_light(index, fraction, seen);
         self.place_wall(&image, frame, ends, [step; 2], level, &light, Some(columns));
     }
 
@@ -1078,9 +1083,13 @@ impl Painter<'_> {
             // An object takes the light of the room at its position (the
             // original samples the tile light map there, 0x467482). One
             // that gives light (data word 51), other than a window, shows
-            // in full light (0x437f7d, 0x4b455f).
+            // in full light (0x437f7d, 0x4b455f). Then one whose master's
+            // word 69 is 7 takes a light of 1 through the setter, held by
+            // the time of day's cap (0x437adb to 0x437aed).
             let glows = o.data.get(LIGHT).is_some_and(|&w| w != 0) && definition.kind != WINDOW;
-            let light = if glows {
+            let light = if definition.lit_at_brightest() {
+                Light::from_fraction(1.0, self.lot.brightest())
+            } else if glows {
                 Light::FULL
             } else {
                 Light::from_byte(
@@ -1248,6 +1257,20 @@ fn sprite_rise(object: [f32; 3], zoom: Zoom) -> i32 {
         return 0;
     }
     (z * (2 << zoom.level()) as f32 + 0.5).trunc() as i32
+}
+
+/// The lights of a level's trims, in room 0's light (the outdoors') as a
+/// fraction, `outdoor` (None without a room 0), at a time of day whose
+/// brightest is `brightest`: (at a corner record, along a run between
+/// them). Both take room 0's light through the drawing's light setter
+/// (0x4b4525). Without a room 0 the corner pass resets to full light,
+/// uncapped (0x53c3a7 to 0x53c3c6), but the wall pass, which draws the
+/// trim along a run, passes 1 through the setter (0x53dbb4, 0x53e2f5), so
+/// after dark that trim is held at the cap.
+fn trim_lights(outdoor: Option<f32>, brightest: f32) -> (Light, Light) {
+    let corner = outdoor.map_or(Light::FULL, |light| Light::from_fraction(light, brightest));
+    let run = Light::from_fraction(outdoor.unwrap_or(1.0), brightest);
+    (corner, run)
 }
 
 /// Where a cut wall's trim at view corner `view` on `level` takes its
@@ -1536,6 +1559,18 @@ pub fn sprite_visible(sprite: u16, base: i16, flags: &[i16]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_trim_along_a_run_is_capped_without_room_0_but_a_corners_is_not() {
+        let night = crate::light::brightest(2);
+        let (corner, run) = trim_lights(None, night);
+        assert_eq!(corner, Light::FULL);
+        assert_eq!(run, Light::from_fraction(0.8, 1.0));
+        // By day both are full; with room 0 both take its light.
+        assert_eq!(trim_lights(None, 1.0), (Light::FULL, Light::FULL));
+        let room = Light::from_fraction(0.6, night);
+        assert_eq!(trim_lights(Some(0.6), night), (room, room));
+    }
 
     fn camera(rotation: u8) -> Camera {
         Camera {

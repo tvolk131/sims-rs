@@ -800,6 +800,7 @@ mod tests {
             levels: [level(), level()],
             outdoor_rooms: Default::default(),
             room_lights: Default::default(),
+            room_fractions: Default::default(),
             outdoor_light: None,
             time_of_day: 0,
             halves: Default::default(),
