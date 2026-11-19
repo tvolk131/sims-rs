@@ -289,10 +289,12 @@ fn tile(position: [i32; 3]) -> [i8; 3] {
     World::tile(position)
 }
 
-/// Whether a position is on a tile inside the border of the lot's arrays.
-/// **Unverified** whether the original tests against the arrays' 64 tiles,
-/// as the old prototype does, or against the lot's size: no object of the
-/// house the trace loads stands between the two.
+/// Whether a position is on a tile inside the border of the lot's arrays
+/// (64 tiles). The original's place capture (0x4325b5) sets its flag from
+/// 0x422632 with the lot (0x6e552c), which tests against the lot's size
+/// (+0x10), as [`off_lot`] does; [`capture`] still uses the arrays' 64
+/// tiles here, which differs only for a position between the lot's
+/// border and the arrays' (none in the Goth day). Not yet changed.
 pub(crate) fn on_lot(position: [i32; 2]) -> bool {
     let inside = |n: i32| {
         let n = i32::from((n >> 4) as i8);
