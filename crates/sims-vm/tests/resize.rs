@@ -11,7 +11,10 @@ use sims_sim::load::Context;
 use sims_vm::{Interpreter, Program, Stream};
 
 /// The Goth house's lot when the resize returns, built the way `sims boot`
-/// builds it.
+/// builds it, but for the skeleton files the game has read before its
+/// first load (`sims_vm::read_before_the_first_load`): this lot has none,
+/// so the pins here hold no record of them. Neither file the Goths read
+/// is one of those, so their draws are the same.
 fn resized(root: &std::path::Path) -> (World, Vec<u16>) {
     let mut result = None;
     with_goth(root, |_, _, world, created| {
@@ -1388,6 +1391,8 @@ fn the_goth_house_objects_are_constructed_and_read() {
             // rest are the three people's default interests, which draw
             // until a value fits: 124 times from the state the stream is
             // in here, 64 draws on from its initial state.
+            // (The boot also has the kat file, read before the load; see
+            // [`resized`].)
             assert_eq!(world.skeleton_files.len(), 2);
             assert_eq!(read.draws, 5 * 29 * 48 + 124);
             let mut stream = before.crt_rng;
