@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
-use sims_content::{Index, Install, Neighborhood, Surfaces};
+use sims_content::{Index, Install, Neighborhood};
 use sims_ui::art::Art;
 use sims_ui::house;
 use sims_ui::household::{Acquaintances, Careers, Faces, Snapshot};
@@ -82,7 +82,7 @@ pub fn open(root: &Path, house: &str) -> Opened {
         .with_careers(&careers)
         .with_relations(world, &family.members, &known);
     let mut house = house::Tuning::load(&index, catalog).unwrap();
-    house.prices = house::Prices::load(&install, &Surfaces::build(&install).unwrap());
+    house.prices = house::Prices::load(&install, lot.surfaces());
     let mut kinds = house::Kinds::default();
     kinds.learn(world, &index, catalog);
     let snapshot = snapshot.with_house(world, &house, &kinds);

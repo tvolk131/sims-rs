@@ -66,27 +66,35 @@ panel was compared.
   - **Pool:** on level 1, a pool byte below 0x10 adds the pool's price.
   - A level whose tile flags, floors or walls are missing adds nothing.
     A missing pool array leaves out only the pool's price.
-- **The prices** (`Prices::load`) come from `GameData/Build.iff`. Its
-  tables, and a pattern file's, are read as the original's string
-  loader reads them (0x46feac, `StringTable::parse_chunk`). A resource
-  without flag 0x10 is big-endian: 0x470351 swaps its leading word, and
-  the count when that is -1. The flag is the resource map's when the
-  file has one (0x41d3a7, `Iff::resource_flags`). A leading word other
-  than -1, -2 or -3 is the count of length-prefixed strings after it,
-  and a count of 0 or below, in any layout, is an empty table. The
-  curves' table (`STR#` 505) is read the same way.
+- **The prices** (`Prices::load`) come from `GameData/Build.iff`. Each
+  string-table entry is three strings, and the first is the price, read
+  as C's `atoi` reads its bytes (0x636029, `sims_content::atoi`), so a
+  byte order mark before the digits reads 0.
+- **The string tables:** `Build.iff`'s, a pattern file's and the
+  curves' (`STR#` 505) are read as the original's string loader reads
+  them (0x46feac, `StringTable::parse_chunk`):
+  - A resource without flag 0x10 is big-endian: 0x470351 swaps its
+    leading word, and the count when that is -1. The flag is the
+    resource map's when the file has one (0x41d3a7,
+    `Iff::resource_flags`).
+  - A leading word other than -1, -2 or -3 is the count of
+    length-prefixed strings after it. A count of 0 or below, in any
+    layout, is an empty table.
+  - The linker (`sims_vm::program`), which also reads `STR#` 505, falls
+    back to this reading for a table its own reader refuses, so such a
+    table does not stop the game before the panel reads it.
   - **Not ported:** the original files a version -3 table's strings by
     language, its place starting again at each change of language
-    (0x46ffcc); here they are counted within the language, which is the
-    same when each language's strings are together, as in all 31 such
-    tables of the install's `Build.iff` and pattern files.
+    (0x46ffcc). Here they are counted within the language, which is the
+    same when each language's strings are together. They are in all 488
+    such tables of the install's `Build.iff` and pattern files: 31 loose
+    and 457 in FAR archives.
   - **Unverified:** a resource map entry whose flags' high byte differs
     from its chunk header's. The IFF reader rejects the map then
     (`sims_formats::iff`, from the frozen prototype), where the original
-    checks only the chunk's type. No file of the install has one. Each
-  string-table entry is three strings, and the first is the price, read
-  as C's `atoi` reads its bytes (0x636029, `sims_content::atoi`), so a
-  byte order mark before the digits reads 0:
+    checks only the chunk's type. No file of the install has one, FAR
+    members included.
+- **The prices by table:**
   - Wall styles (0x6e5838): `STR#` 129, entries 1 to 5, give styles 1,
     2, 13, 12 and 14 (0x4cd149), and entry 1 gives style 255 too
     (0x4cd48d). Every other style costs 0.

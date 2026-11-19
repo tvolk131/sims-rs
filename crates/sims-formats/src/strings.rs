@@ -98,7 +98,7 @@ impl StringTable {
     ///   (0x46ffcc). [`StringTable::get`] counts within the language,
     ///   which is the same when each language's strings are together, as
     ///   in every such table of the Complete Collection's `Build.iff` and
-    ///   pattern files (31).
+    ///   pattern files (488: 31 loose, 457 in FAR archives).
     pub fn parse_chunk(data: &[u8], flags: u16) -> Result<Self> {
         let Some(&[a, b]) = data.first_chunk::<2>() else {
             return Self::parse(data);
