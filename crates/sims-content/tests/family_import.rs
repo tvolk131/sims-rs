@@ -59,6 +59,12 @@ fn chunk(file: &mut Vec<u8>, tag: &[u8; 4], id: u16, data: &[u8]) {
 }
 
 fn synthetic_file() -> FamilyFile {
+    let mut gtab = saved_header(b"batG", 0);
+    words(&mut gtab, &[1, OLD_DOG, DOG]);
+    synthetic_file_with_guid_table(&gtab)
+}
+
+fn synthetic_file_with_guid_table(gtab: &[u8]) -> FamilyFile {
     let mut iff = vec![0; 64];
     iff[..13].copy_from_slice(b"IFF FILE 2.5:");
     let mut family = saved_header(b"IMAF", 7);
@@ -116,9 +122,7 @@ fn synthetic_file() -> FamilyFile {
         words(&mut types, &[73]);
     }
     chunk(&mut iff, b"objt", 0, &types);
-    let mut gtab = saved_header(b"batG", 0);
-    words(&mut gtab, &[1, OLD_DOG, DOG]);
-    chunk(&mut iff, b"Gtab", 1, &gtab);
+    chunk(&mut iff, b"Gtab", 1, gtab);
     chunk(&mut iff, b"ObjM", 1, b"lot payload");
     FamilyFile::parse(&iff).unwrap()
 }
@@ -267,6 +271,55 @@ fn clones_members_in_export_order_and_translates_their_links() {
             .guid,
         PERSON
     );
+}
+
+#[test]
+fn imports_a_big_endian_guid_table_with_existing_pairs_first() {
+    let intermediate_guid = 0x1234_5678;
+    let mut gtab = vec![1, 0, 0, 0];
+    gtab.extend(7u32.to_be_bytes());
+    gtab.extend(b"batG");
+    for word in [2, OLD_DOG, intermediate_guid, intermediate_guid, DOG] {
+        gtab.extend(word.to_be_bytes());
+    }
+    let file = synthetic_file_with_guid_table(&gtab);
+    let catalog = synthetic_catalog();
+    let input = ImportInput {
+        catalog: &catalog,
+        neighbors: &[
+            Some(template_record(1, TEMPLATE_PERSON)),
+            Some(template_record(2, TEMPLATE_DOG)),
+        ],
+        families: &BTreeMap::new(),
+        next_file: 0,
+        character_files: &BTreeSet::new(),
+        character_guids: &BTreeSet::new(),
+        house_files: &BTreeSet::from([42]),
+        zoning: &BTreeMap::from([(42, 1)]),
+        neighborhood_data: [0; 16],
+    };
+    let mut guids = MADE_DOG..;
+    let lot = import(&input, &file, PETS, &mut || guids.next().unwrap())
+        .unwrap()
+        .lot
+        .unwrap();
+    let mut expected = saved_header(b"batG", 0);
+    words(
+        &mut expected,
+        &[
+            4,
+            OLD_DOG,
+            intermediate_guid,
+            intermediate_guid,
+            DOG,
+            DOG,
+            MADE_DOG,
+            PERSON,
+            MADE_PERSON,
+        ],
+    );
+    assert_eq!(lot.chunks[b"Gtab"][0].data, expected);
+    assert_eq!(lot.object_types.entries[1].guid, MADE_DOG);
 }
 
 #[test]

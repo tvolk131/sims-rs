@@ -3,7 +3,7 @@
 use crate::{Catalog, Error, Result};
 use sims_formats::family_file::{FamilyFile, FamilyMember};
 use sims_formats::iff::Iff;
-use sims_formats::lot::ObjectTypes;
+use sims_formats::lot::{GuidTable, ObjectTypes};
 use sims_formats::neighborhood::{Family, Neighbor, Relationship};
 use sims_formats::strings::{Format, StringTable, decode};
 use std::collections::{BTreeMap, BTreeSet};
@@ -672,48 +672,18 @@ fn import_lot(iff: &Iff, house: u32, mut pairs: Vec<(u32, u32)>) -> Result<Impor
         .ok_or_else(|| unsupported("0x43dd76", format!("lot {house} has no objt #0")))?;
     let mut object_types = ObjectTypes::parse(iff.data(source_types))
         .map_err(|error| Error::format("family import: 0x43a516 objt #0", error))?;
-    if let Some(table) = iff.get(b"Gtab", 1) {
-        let bytes = iff.data(table);
-        // The version word is not checked: the import writes 0
-        // (0x4157b6 passes it to 0x415835), as in the first
-        // neighborhood's Old Town houses.
-        if bytes.get(8..12) != Some(b"batG") {
-            return Err(unsupported("0x41578e", "unrecognized Gtab #1 header"));
-        }
-        let count = bytes
-            .get(12..16)
-            .map(|n| u32::from_le_bytes(n.try_into().unwrap()));
-        let entries = bytes
-            .get(16..)
-            .filter(|data| Some(data.len() / 8) == count.map(|n| n as usize) && data.len() % 8 == 0)
-            .ok_or_else(|| unsupported("0x4158a4", "incomplete Gtab #1 pairs"))?;
-        let mut existing: Vec<_> = entries
-            .as_chunks::<8>()
-            .0
-            .iter()
-            .map(|pair| {
-                (
-                    u32::from_le_bytes(pair[..4].try_into().unwrap()),
-                    u32::from_le_bytes(pair[4..].try_into().unwrap()),
-                )
-            })
-            .collect();
-        existing.append(&mut pairs);
-        pairs = existing;
-    }
+    // The import reads at 0x429652 and appends at 0x429754.
+    let table = if let Some(chunk) = iff.get(b"Gtab", 1) {
+        let mut table = GuidTable::parse(iff.data(chunk))
+            .map_err(|error| Error::format("family import: 0x41578e/0x4158a4 Gtab #1", error))?;
+        table.pairs.append(&mut pairs);
+        table
+    } else {
+        GuidTable { version: 0, pairs }
+    };
 
     for entry in &mut object_types.entries {
-        // 0x415751 restarts its search after each hop and marks a pair
-        // used for the current lookup, so even cycles terminate.
-        let mut used = BTreeSet::new();
-        while let Some((index, &(_, new))) = pairs
-            .iter()
-            .enumerate()
-            .find(|(index, (old, _))| *old == entry.guid && !used.contains(index))
-        {
-            used.insert(index);
-            entry.guid = new;
-        }
+        entry.guid = table.translate(entry.guid);
     }
     let tags: BTreeSet<_> = iff.chunks.iter().map(|chunk| chunk.tag).collect();
     let mut chunks = BTreeMap::<_, Vec<_>>::new();
@@ -730,18 +700,11 @@ fn import_lot(iff: &Iff, house: u32, mut pairs: Vec<(u32, u32)>) -> Result<Impor
             });
         }
     }
-    // Version 0 (0x4157b6), as the shipped Old Town houses' tables have.
-    let mut table = b"\0\0\0\0\0\0\0\0batG".to_vec();
-    table.extend((pairs.len() as u32).to_le_bytes());
-    for (old, new) in pairs {
-        table.extend(old.to_le_bytes());
-        table.extend(new.to_le_bytes());
-    }
     chunks.entry(*b"Gtab").or_default().push(LotChunk {
         id: 1,
         flags: 0,
         label: String::new(),
-        data: table,
+        data: table.to_bytes(),
     });
     Ok(ImportedLot {
         house,
