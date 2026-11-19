@@ -209,7 +209,7 @@ impl GuidTable {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes);
         let swapped = r.take(4)?[0] != 0;
-        let mut number = |r: &mut Reader<'_>| -> Result<u32> {
+        let number = |r: &mut Reader<'_>| -> Result<u32> {
             let n = r.u32()?;
             Ok(if swapped { n.swap_bytes() } else { n })
         };
