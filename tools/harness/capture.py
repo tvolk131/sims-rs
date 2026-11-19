@@ -52,9 +52,12 @@ updates.jsonl, which are the writes that change rows FROM to TO: a frame
 drawn between two updates changes the row of the update after it. Such a
 write is logged, as any watch's is, with the update before it and
 in_update false. A moving watch misses what the paragraph above says it
-misses. The lot update's entry is a breakpoint only while a watch is set,
-so a watch on a busy address (the random state) costs nothing while the
-load and the other updates run.
+misses; a stop at a watchpoint does not work its address out again, as
+for --watch. A run taken over (--resume) sets the watches whose updates
+have come at its first stop; one that goes through an object waits there
+for the next entry or return. The lot update's entry is a breakpoint only
+while a watch is set, so a watch on a busy address (the random state)
+costs nothing while the load and the other updates run.
 
 The executable digests that guest/launch.sh verified (share/game-identity.txt)
 are recorded in status.json and as a game_identity event.
@@ -316,12 +319,15 @@ class Watch:
         """A watch given as FROM[-TO],NAME=EXPR[:SIZE] (see the module's doc)."""
         span, comma, rest = text.partition(',')
         first, dash, last = span.partition('-')
-        if not (comma and first.isdigit() and (last.isdigit() or not dash)):
+        digits = lambda t: t.isascii() and t.isdigit()
+        if not (comma and digits(first) and (digits(last) or not dash)):
             raise argparse.ArgumentTypeError(f'not FROM[-TO],NAME=EXPR[:SIZE]: {text!r}')
         try:
             w = cls(rest)
         except (AssertionError, ValueError, IndexError) as e:
             raise argparse.ArgumentTypeError(f'not a watch: {rest!r}') from e
+        if not w.name or w.size not in (1, 2, 4, 8):  # checked by assertions, which python -O skips
+            raise argparse.ArgumentTypeError(f'not a watch: {rest!r}')
         w.first, w.last = int(first), int(last) if dash else None
         if w.first < 1 or (w.last is not None and w.last < w.first):
             raise argparse.ArgumentTypeError(f'not 1 <= FROM <= TO: {text!r}')
@@ -812,6 +818,31 @@ def main():
             for record, (shown_in, jobs) in waiting.items():
                 if shown_in >= args.answer_from:
                     answerer.shown(shown_in, record, jobs)
+    def tend_watches(m, foreign):
+        """At a stop: start the late watches whose updates have come, work out the moving ones again,
+        end those whose updates are over, and set those waiting."""
+        # A late watch waits for the game's process (the baseline), then for its first update. One
+        # whose updates are over already (a run taken over later) is never set.
+        for w in [w for w in late if baseline and updates + 1 >= w.first]:
+            late.remove(w)
+            if w.last is None or updates + 1 <= w.last:
+                pending.append(w)
+                arm(ENTRY)
+        if not foreign and live_watches:
+            check_watches(m)
+        ended = [w for w in live_watches + pending if w.last is not None and updates + 1 > w.last]
+        for w in ended:
+            if w in live_watches:
+                live_watches.remove(w)
+                hardware_remove(w.address, w.size)
+            else:
+                pending.remove(w)
+            event(kind='watch_ended', name=w.name, expr=w.text, update=updates)
+        if ended and not (live_watches or pending or args.watch or runner or updates + 1 in dump_set):
+            disarm(ENTRY)
+        if not foreign and pending:
+            arm_watches(m)
+
     try:
         reply = remote.stop_reply()
         event(kind='attach', reply=reply, resume=args.resume, updates=updates)
@@ -825,7 +856,13 @@ def main():
             arm(ENTRY)  # taken over before a dump at the next entry (or in the middle of it)
         if runner:
             arm(scenario_input.QUEUE_PUSH)
-        if watches or runner:
+        if args.resume:
+            # The late watches whose updates have come: set at the first stop, even off a breakpoint.
+            for w in [w for w in late if updates + 1 >= w.first]:
+                late.remove(w)
+                if w.last is None or updates + 1 <= w.last:
+                    pending.append(w)
+        if args.watch or pending or runner:
             arm(ENTRY)
             if args.resume:
                 # Whether the guest is inside a lot update is known again at its next entry or return.
@@ -852,6 +889,7 @@ def main():
             if took_over and pc not in breaks:
                 # The earlier run was killed between stepping past a breakpoint and resuming.
                 event(kind='took_over_off_break', pc=pc, registers=regs)
+                tend_watches(m, sims_cr3 is not None and cr3 != sims_cr3)
                 continue
             if took_over and pc == RETURN:
                 last = json.loads(open(out / 'updates.jsonl').read().splitlines()[-1])
@@ -1013,22 +1051,7 @@ def main():
                     answerer.answered(record)
                 if pc == DIALOG_SHOW:
                     save_status(dialog=dict(update=updates + 1, record=record, shown=time.time()))
-            # A late watch waits for the game's process (the baseline), then for its first update.
-            for w in [w for w in late if baseline and updates + 1 >= w.first]:
-                late.remove(w)
-                pending.append(w)
-                arm(ENTRY)
-            if not foreign and live_watches:
-                check_watches(m)
-            for w in [w for w in live_watches + pending if w.last is not None and updates + 1 > w.last]:
-                if w in live_watches:
-                    live_watches.remove(w)
-                    hardware_remove(w.address, w.size)
-                else:
-                    pending.remove(w)
-                event(kind='watch_ended', name=w.name, expr=w.text, update=updates)
-            if not foreign and pending:
-                arm_watches(m)
+            tend_watches(m, foreign)
             # Step past the breakpoint we stopped at (if it is still armed).
             armed = pc in breaks
             if armed:
