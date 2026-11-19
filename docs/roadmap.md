@@ -138,11 +138,13 @@ events, and what it asks for after them) come first.
   2 (which head and body the draws pick), its name (Dialog kind 3),
   pets and a negative age, then House09's coverage; UI Effect (34,
   Tutorial and Help System only); the container and off-lot person
-  reset (0x45e8dd, 0x45e977); removing an object that holds another before the load has worked
-  out the lot's rooms (`Machine::leave_lot`; after that, a one-tile
-  object and what it holds leave through the lot's placement, 0x433125,
-  #254); the failing
-  modes of the ported primitives. A fire that burns a person resets
+  reset (0x45e8dd, 0x45e977); removing an object that holds another
+  before the load has worked out the lot's rooms. (For an ordinary
+  one-tile object removed at once or reset as it is deleted with no
+  Reset tree, `Machine::leave_lot` still cannot handle a holder before
+  the rooms are ready; once they are, the lot's placement, 0x433125,
+  moves the object and what it holds off the lot, #254.) Also the
+  failing modes of the ported primitives. A fire that burns a person resets
   whoever uses what burns, and Burn moves a gathered person (0x44df25,
   0x45e7b2, 0x441039, #254). The play-mode snack test no longer
   exercises Burn: #244 changed the run's path, and since #251 it
