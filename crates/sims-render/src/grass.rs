@@ -60,9 +60,6 @@ const DITHER: [i32; 4] = [0, 8, 0, 6];
 /// The jitter's seed and reach (`fJitterRandSeed`, `fJitterEnvelope`).
 const JITTER_SEED: u32 = 0x40de9;
 const JITTER: u32 = 3;
-/// The sun's angle from the zenith, as the grass's constructor stores it
-/// (0x49c187): about π/10. It stays by day ([`latitude`]).
-const LATITUDE_BITS: u32 = 0x3ea0_d973;
 /// Shades added along a wall.
 const WALL_SHADE: i32 = 64;
 
@@ -159,25 +156,23 @@ impl Random {
 }
 
 /// The sun's angle from the zenith at a time of day (global 4: 0 day, 1
-/// dusk, 2 night, 3 dawn).
+/// dusk, 2 night, 3 dawn), on an ordinary lot.
 ///
-/// The grass's constructor sets π/10 (0x49c187, the float 0x3ea0d973).
-/// Each change of the time of day sends signal 0xdd, and the panels'
-/// handler passes global 4 to the grass's setter (0x4c41bf calling
-/// 0x4a4551), which sets 1, 2, 3 or 2 tenths of the float π for 0 to 3
-/// (doubles 0x668348, 0x667ac8, 0x668710) and re-shades the grass. Any
-/// other value would set 0 (the setter's default case).
+/// Signal 0xdd goes out at the end of every load (0x416060) and on each
+/// change of the time of day. The panels' handler passes global 4 to the
+/// grass (0x4c41bf), whose override (0x49e45e) hands it to the setter
+/// (0x4a4551) when neither of its two preset flags is set. The setter sets
+/// 1, 2, 3 or 2 tenths of the float π for 0 to 3 (doubles 0x668348,
+/// 0x667ac8, 0x668710), 0 for any other value, and shades the grass again.
 ///
-/// By day this keeps the constructor's float. The setter's tenth of π is
-/// 0x3ea0d97c, 9 ulps more, and a slope can tell the difference
-/// (`the_day_sun_is_the_constructors_exact_float`); the Goth house's grass
-/// at far zoom draws the same with either. The original holds the
-/// setter's float by day once the time of day has changed since the lot
-/// was loaded, or, if the load's own 0xdd reaches the panels, from the
-/// load on; which is **unverified**.
+/// The grass's constructor sets a float 9 ulps short of the setter's
+/// tenth of π (0x3ea0d973 at 0x49c187, against 0x3ea0d97c), which a lot
+/// drawn without a load would keep; that is not modelled. Lots 28 to 29,
+/// 40 to 42, 46 to 48, 90 to 96 and 99 (global 10) take other terrain
+/// presets (0x4c4648), with other angles; those are not ported either.
 fn latitude(time_of_day: i16) -> f32 {
     let tenths = match time_of_day {
-        0 => return f32::from_bits(LATITUDE_BITS),
+        0 => 0.1,
         1 | 3 => 0.2,
         2 => 0.3,
         _ => return 0.0,
@@ -719,19 +714,18 @@ mod tests {
     }
 
     #[test]
-    fn the_day_sun_is_the_constructors_exact_float() {
-        // π/10 rounded to f32 is 0x3ea0d97c; the original stores 9 ulps
-        // less. A vertex ringed by these slopes is shade 87 with the
-        // original's float and would be 88 with the rounded one.
+    fn the_day_sun_is_the_setters_float_not_the_constructors() {
+        // The setter's π/10 is 0x3ea0d97c; the constructor stores 9 ulps
+        // less. A vertex ringed by these slopes is shade 88 with the
+        // setter's float and would be 87 with the constructor's.
         let shade = |table: [[f32; 11]; 11]| {
             let slopes = [(-5, -1), (-3, 1), (-2, -2), (-2, -3), (-5, -3), (-5, 3)];
             let sum: f32 = slopes.iter().map(|&(a, b)| lookup(&table, a, b)).sum();
             MAX_SHADE - times_127(f64::from(sum) * f64::from(1.0f32 / 6.0))
         };
-        let rounded = (f64::from(std::f32::consts::PI) * 0.1) as f32;
-        assert_eq!(rounded.to_bits(), 0x3ea0_d97c);
-        assert_eq!(shade(light_table()), 87);
-        assert_eq!(shade(light_table_at(rounded)), 88);
+        assert_eq!(latitude(0).to_bits(), 0x3ea0_d97c);
+        assert_eq!(shade(light_table()), 88);
+        assert_eq!(shade(light_table_at(f32::from_bits(0x3ea0_d973))), 87);
     }
 
     #[test]

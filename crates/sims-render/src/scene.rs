@@ -270,16 +270,19 @@ impl Painter<'_> {
     /// by pixel: in that light plus the pools of the lamps marked on lot
     /// tile `seen`, for a straight face along view y (`along_y`) or x;
     /// `seen` None for a diagonal, which takes no pools (0x4c78c5). A room
-    /// in full light shows no pools (0x4c7c59). See [`crate::pools`],
-    /// "Walls".
+    /// in full light shows no pools (0x4c7c59). `byte` None draws in full
+    /// light whatever the time of day, as the original's reset to 1 does
+    /// (0x4b455f). See [`crate::pools`], "Walls".
     fn wall_light(
         &self,
         level: usize,
-        byte: u8,
+        byte: Option<u8>,
         seen: Option<(bool, [i32; 2])>,
     ) -> impl Fn(usize, usize) -> Light + use<> {
         let brightest = self.lot.brightest();
-        let pools = Light::drawn_byte(byte, brightest)
+        let plain = byte.map_or(Light::FULL, |byte| Light::from_byte(byte, brightest));
+        let pools = byte
+            .and_then(|byte| Light::drawn_byte(byte, brightest))
             .zip(seen.and_then(|(along_y, tile)| self.wall_pools(level, along_y, tile)));
         let rise = pools::wall_rise(self.camera.zoom.index()) as i64;
         move |x: usize, y: usize| match &pools {
@@ -289,7 +292,7 @@ impl Painter<'_> {
                     .map(|p| u32::from(p.at(x as i64, y as i64 - rise)))
                     .sum::<u32>(),
             ),
-            None => Light::from_byte(byte, brightest),
+            None => plain,
         }
     }
 
@@ -646,16 +649,22 @@ impl Painter<'_> {
                     // a split tile gives the triangle touching the wall.
                     let byte = self.lot.light_at(index, wall_side(&s, front));
                     let seen = seen_tile(self.camera, s.from, s.to);
-                    let light = self.wall_light(index, byte, seen);
+                    let light = self.wall_light(index, Some(byte), seen);
                     self.place_wall(&image, frame, ends, heights, level, &light, None);
                     if let Some(shape) = capped {
                         let (trim, mask) = if shape == 7 { (252, 9) } else { (253, 10) };
                         if let Some(strip) =
                             wall_image(self.assets, trim, mask, None, false, zoom, frame)
                         {
-                            // At full light, like the trim along the top.
-                            let full = |_, _| Light::FULL;
-                            self.place_wall(&strip, frame, ends, heights, level, &full, None);
+                            // In room 0's light, or 1 without one, held
+                            // by the time of day's cap, and no pools
+                            // (0x53eba8 to 0x53ebb5).
+                            let light = Light::from_fraction(
+                                self.lot.outdoor_light.unwrap_or(1.0),
+                                self.lot.brightest(),
+                            );
+                            let lit = |_, _| light;
+                            self.place_wall(&strip, frame, ends, heights, level, &lit, None);
                         }
                     }
                     self.stats.walls += 1;
@@ -791,8 +800,9 @@ impl Painter<'_> {
         let zoom = self.camera.zoom;
         let half = zoom.tile_width() / 2;
         let cut_height = [6, 12, 23][zoom.index()];
-        // Every trim is lit as room 0, the outdoors, shows, or fully
-        // without one (0x53dbb4 to 0x53dbec, set at 0x53e2f5).
+        // Every trim is lit as room 0, the outdoors, shows, through the
+        // drawing's light setter, or in full light without one
+        // (0x53c3a7 to 0x53c3c6).
         let light = self.lot.outdoor_light.map_or(Light::FULL, |light| {
             Light::from_fraction(light, self.lot.brightest())
         });
@@ -931,8 +941,9 @@ impl Painter<'_> {
             .copied()
             .find(|&i| corners.walls[i].line() == cap.line)
             .unwrap_or(owner);
+        // Without a room there, the cap is drawn in full light (0x53c9e9).
         let byte = match face(lit) {
-            Some((_, s, front)) => self.lot.light_at(index, wall_side(&s, front)),
+            Some((_, s, front)) => self.lot.room_light_at(index, wall_side(&s, front)),
             None => return,
         };
         let [tx, ty] = [c.view[0] + cap.offset[0], c.view[1] + cap.offset[1]];

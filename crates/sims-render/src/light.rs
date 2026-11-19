@@ -70,17 +70,20 @@ impl Light {
     /// The light byte a fraction is drawn with, or None for full light.
     /// The drawing context keeps the fraction between 0.5 and `brightest`
     /// (0x4b4525: a fraction below 0.5, or not a number, becomes 0.5; then
-    /// one above `brightest` becomes it), and exactly 1 draws in full light
-    /// (0x4c7c59); any other becomes `fraction * 255 + 0.5`, truncated
-    /// (0x4b76a8). After dark nothing is drawn in full light.
+    /// it becomes `brightest` unless `brightest` is at least it). A
+    /// fraction within a millionth of 1 draws in full light (0x4c7c59,
+    /// the float 0x358637bd); any other becomes `fraction * 255 + 0.5`,
+    /// truncated (0x4b76a8). After dark the cap keeps the drawing context
+    /// out of full light.
     fn drawn_fraction(light: f32, brightest: f32) -> Option<u32> {
         let fraction = if light >= 0.5 { light } else { 0.5 };
-        let fraction = if brightest < fraction {
-            brightest
-        } else {
+        let fraction = if brightest >= fraction {
             fraction
+        } else {
+            brightest
         };
-        if fraction == 1.0 {
+        let tolerance = f64::from(f32::from_bits(0x3586_37bd));
+        if (f64::from(fraction) - 1.0).abs() <= tolerance {
             return None;
         }
         Some((f64::from(fraction) * 255.0 + 0.5) as u32)
@@ -144,6 +147,14 @@ mod tests {
         assert_eq!(Light::from_byte(153, night), Light::from_byte(153, 1.0));
         assert_eq!(Light::from_byte(0, night), Light(Some(16)));
         assert_eq!(Light::from_fraction(f32::NAN, night), Light(Some(16)));
+    }
+
+    #[test]
+    fn a_light_within_a_millionth_of_one_is_full() {
+        let below = 1.0 - 5e-7f32;
+        assert_eq!(Light::from_fraction(below, 1.0), Light::FULL);
+        let further = 1.0 - 2e-6f32;
+        assert_eq!(Light::from_fraction(further, 1.0), Light(Some(31)));
     }
 
     #[test]

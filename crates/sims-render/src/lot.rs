@@ -316,9 +316,15 @@ impl Lot {
     /// The light byte at a fine position on a level (0 or 1): its room's
     /// light. Off the lot and outside every room it is full light.
     pub fn light_at(&self, level: usize, fine: [i32; 2]) -> u8 {
+        self.room_light_at(level, fine).unwrap_or(255)
+    }
+
+    /// The light byte of the room at a fine position on a level (0 or 1),
+    /// or None off the lot, outside every room, or for a room without a
+    /// light.
+    pub fn room_light_at(&self, level: usize, fine: [i32; 2]) -> Option<u8> {
         self.room_at(level, fine)
             .and_then(|room| self.room_lights.get(&room).copied())
-            .unwrap_or(255)
     }
 }
 
