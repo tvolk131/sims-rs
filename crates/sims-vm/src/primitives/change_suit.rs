@@ -159,16 +159,17 @@ impl Machine<'_, '_> {
 }
 
 /// Puts on accessory `name` (0x58d88f), looking it up in `people`'s
-/// suits. A miss fails if any avatar files stopped decoding, since they
-/// might name it.
+/// suits. The lookup compares bytes exactly (0x5a25dc, 0x5a27f2). A miss
+/// fails if any avatar files stopped decoding, since they might name it.
+/// An empty name is not looked up (0x583569): it gets an unnamed entry.
 pub(crate) fn put_on(
     people: &People,
     accessories: &mut Vec<Accessory>,
     name: String,
 ) -> Result<(), Trap> {
-    let found = people.suits.contains(&name);
+    let found = !name.is_empty() && people.suits.contains(&name);
     let errors = &people.suit_errors;
-    if !found && !errors.is_empty() {
+    if !found && !name.is_empty() && !errors.is_empty() {
         return Err(Trap::Unsupported(format!(
             "accessory {name:?} is put on, but no decoded avatar file names it. {} avatar \
              files stopped decoding ({})",

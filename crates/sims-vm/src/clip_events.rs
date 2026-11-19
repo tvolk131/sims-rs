@@ -37,15 +37,12 @@
 //!   the position with the anchor bone, never runs. So the anchor is not
 //!   kept. That nothing reads the layer's fields but the pose is
 //!   **unverified**.
-//! - "dress" and "undress": the value, as written, is put on as an
-//!   accessory through the animator's virtual function 0xd8 (0x58d88f)
-//!   with an empty binding (0x6de5b0), or taken off through 0xdc
-//!   (0x58d919): what Change Suit does
-//!   ([`crate::primitives::change_suit`]), but without lowering the name
-//!   first. Every such value in the shipped animations is lowercase. The
-//!   registry's keys are lowercase (0x5950f5), and whether its lookup
-//!   (0x5a044d, 0x5a25dc) ignores case is not worked out, so a name with
-//!   an ASCII capital fails.
+//! - "dress" and "undress": the value is put on as an accessory through
+//!   the person animator's virtual function 0xd8 (0x58d88f) with an empty
+//!   binding (0x6de5b0), or taken off through 0xdc (0x58d919): what
+//!   Change Suit does ([`crate::primitives::change_suit`]). The value was
+//!   lowered when the clip was read (0x59431a; `Track::build`), and the
+//!   suit lookup compares bytes exactly (0x5a25dc).
 //!
 //! Any other key does nothing.
 
@@ -162,14 +159,6 @@ fn timed_event(
                 )));
             }
             "dress" | "undress" => {
-                if value.bytes().any(|b| b.is_ascii_uppercase()) {
-                    return Err(Trap::Unsupported(format!(
-                        "the clip {:?} has a timed event {key:?} (0x5912fd) naming {value:?}, \
-                         with a capital: whether the suit lookup (0x5a044d) ignores case is \
-                         not worked out",
-                        layer.clip
-                    )));
-                }
                 let accessories = &mut world
                     .objects
                     .get_mut(&id)
