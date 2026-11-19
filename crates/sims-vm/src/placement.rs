@@ -791,9 +791,7 @@ impl Interpreter<'_> {
         site: &str,
     ) -> Result<&[i16; DEFINITION_WORDS], Trap> {
         let object = world.objects.get(&id).ok_or_else(missing)?;
-        let definition = self
-            .catalog
-            .object(object.guid)
+        let definition = crate::interpreter::object_definition(self.catalog, world, object.guid)
             .ok_or_else(|| Trap::Invalid(format!("object {id} has no definition")))?;
         self.program
             .master_definition(definition.resource, definition.chunk)
@@ -829,9 +827,7 @@ impl Interpreter<'_> {
 
     pub(crate) fn words(&self, world: &World, id: u16) -> Result<&[i16; DEFINITION_WORDS], Trap> {
         let object = world.objects.get(&id).ok_or_else(missing)?;
-        let definition = self
-            .catalog
-            .object(object.guid)
+        let definition = crate::interpreter::object_definition(self.catalog, world, object.guid)
             .ok_or_else(|| Trap::Invalid("object has no definition".into()))?;
         self.program
             .definition(definition.resource, definition.chunk)
@@ -855,7 +851,9 @@ impl Interpreter<'_> {
         world
             .objects
             .get(&id)
-            .and_then(|object| self.catalog.object(object.guid))
+            .and_then(|object| {
+                crate::interpreter::object_definition(self.catalog, world, object.guid)
+            })
             .and_then(|definition| {
                 self.program
                     .libraries
@@ -1320,9 +1318,7 @@ impl Interpreter<'_> {
             return Ok(());
         }
         let object = world.objects.get(&id).ok_or_else(|| fail(missing()))?;
-        let definition = self
-            .catalog
-            .object(object.guid)
+        let definition = crate::interpreter::object_definition(self.catalog, world, object.guid)
             .ok_or_else(|| fail(Trap::Invalid("object has no definition".into())))?;
         let own = self
             .program

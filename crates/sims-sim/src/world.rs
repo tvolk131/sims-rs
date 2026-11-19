@@ -1,4 +1,5 @@
 use crate::animator::{Animator, HeldPose, Layer};
+use crate::characters::Characters;
 use crate::neighbors::{Family, Neighbors};
 use crate::rooms::Rooms;
 use crate::route::Routing;
@@ -188,6 +189,11 @@ pub struct World {
     /// from the animator so that the encodings of the states before it
     /// was kept stay a prefix of the new ones.
     pub stops_asked: BTreeSet<u16>,
+    /// The person types made while the game ran (Make New Character,
+    /// 0x4260e1), and the neighborhood's counter for their files. Kept
+    /// apart so that the encodings of the states before it was kept stay a
+    /// prefix of the new ones.
+    pub characters: Characters,
 }
 
 /// How many advertisements the record of [`World::advertisement_record`]
@@ -529,6 +535,7 @@ impl World {
             neighborhood_data: [0; 16],
             held_poses: BTreeMap::new(),
             stops_asked: BTreeSet::new(),
+            characters: Characters::default(),
         }
     }
 

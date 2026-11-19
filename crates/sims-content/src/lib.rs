@@ -10,6 +10,7 @@
 //! person's animator plays.
 
 mod animations;
+pub mod assets;
 mod catalog;
 mod error;
 mod file_table;
@@ -19,8 +20,10 @@ mod neighborhood;
 mod people;
 mod surfaces;
 pub mod ui_graphics;
+mod wardrobe;
 
 pub use animations::{Animations, Channel, Clip, Event, Track};
+pub use assets::Assets;
 pub use catalog::{Catalog, Object};
 pub use error::Error;
 pub use index::{Index, Member, Resource, far_members};
@@ -28,5 +31,6 @@ pub use install::{Expansions, Install, Layout, Mount};
 pub use neighborhood::{House, Neighborhood};
 pub use people::{Bone, People, Profile, Skeleton};
 pub use surfaces::{SurfaceCatalog, SurfaceFile, SurfaceKind, Surfaces};
+pub use wardrobe::Wardrobe;
 
 pub type Result<T> = std::result::Result<T, Error>;

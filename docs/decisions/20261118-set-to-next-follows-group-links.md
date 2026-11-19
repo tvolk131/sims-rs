@@ -128,22 +128,24 @@ Flags 0x2 and 0x40 still fail loudly.
 33 and 1103 keep their hashes. From tick 2881 on, every pin changes,
 since the run differs from update 2811:
 
-| Tick | Hash |
-|------|------|
-| 2881 | 676bb460…085a |
-| 3432 | 3a1e59fa…6d8f |
-| 3602 | bbcf10f5…ba67 |
-| 3603 | ec3305de…5981 |
-| 3912 | 5b7d8a7d…ceeb |
-| 9906 | ebb7406a…b30e |
-| 20186 | 1627224c…55f7 |
-| 31478 | 34ab8467…bc7b |
-| 43200 | 9126004c…e644 |
+| Tick | Format 30 | Format 29 |
+|------|------|------|
+| 2881 | 188f9b87…0fe7 | 676bb460…085a |
+| 3432 | 16aedd4c…2c08 | 3a1e59fa…6d8f |
+| 3602 | 2f8e80d9…393f | bbcf10f5…ba67 |
+| 3603 | 297fee67…a013 | ec3305de…5981 |
+| 3912 | 7c365edf…0ac9 | 5b7d8a7d…ceeb |
+| 9906 | f1ef4b6d…a8f0 | ebb7406a…b30e |
+| 20186 | f1329e6c…871b | 1627224c…55f7 |
+| 31478 | 63a4aeba…d516 | 34ab8467…bc7b |
+| 43200 | 04d33609…b6e3 | 9126004c…e644 |
 
 At the day turn the objects' value comes to 12524, not 12653. That value
 is unverified, since the run has left the recording.
 
-No snapshot format changes: no World field is added.
+No snapshot format changes: no World field is added. The format 29
+hashes are those of the run before format 30 (`World::characters`)
+merged. The new format changes no state on this run.
 
 **What would reopen it.** A recording past tick 3603, once the
 random-draw divergence there is fixed, would check sections 2 to 6 and

@@ -307,11 +307,7 @@ impl Interpreter<'_> {
             .get(&id)
             .ok_or_else(|| Trap::native(10, "missing object"))?
             .guid;
-        let profile = self.program.people.profiles.get(&guid).ok_or_else(|| {
-            Trap::Unsupported(format!(
-                "no profile was supplied for the person type 0x{guid:08X}"
-            ))
-        })?;
+        let profile = crate::people::profile(&self.program.people, world, guid)?;
         let [bone, point, _, _] = &profile.rig;
         let Some(bone) = bone.as_deref().filter(|b| !b.is_empty()) else {
             return Ok(Rig {
@@ -320,7 +316,7 @@ impl Interpreter<'_> {
             });
         };
         let place = self
-            .skeleton(guid)?
+            .skeleton(world, guid)?
             .bones
             .iter()
             .position(|b| b.name == bone)
@@ -345,12 +341,8 @@ impl Interpreter<'_> {
         })
     }
 
-    fn skeleton(&self, guid: u32) -> Result<&sims_content::Skeleton, Trap> {
-        self.program.people.skeletons.get(&guid).ok_or_else(|| {
-            Trap::Unsupported(format!(
-                "no skeleton was supplied for the person type 0x{guid:08X}"
-            ))
-        })
+    fn skeleton(&self, world: &World, guid: u32) -> Result<&sims_content::Skeleton, Trap> {
+        crate::people::skeleton(&self.program.people, world, guid)
     }
 
     /// Person `id`'s bones placed relative to the skeleton's root, as the
@@ -372,7 +364,7 @@ impl Interpreter<'_> {
             .get(&id)
             .ok_or_else(|| Trap::native(10, "missing object"))?
             .guid;
-        let skeleton = self.skeleton(guid)?;
+        let skeleton = self.skeleton(world, guid)?;
         // A carry clip chosen whose layer has not started yet is not
         // ported.
         if a.carry_selection != -1 && a.carry.is_none() {
