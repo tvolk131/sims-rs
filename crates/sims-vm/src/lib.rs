@@ -75,7 +75,7 @@ pub use frame::PanelMode;
 pub use interpreter::{Asked, Interpreter, MAX_STACK, Status, Stream};
 pub use load::{INDICATORS, Reconciled, Roomed};
 pub use memory::scope_name;
-pub use objects::SavedRead;
+pub use objects::{READ_BEFORE_THE_FIRST_LOAD, SavedRead, read_before_the_first_load};
 pub use people::{curve_table, persistent_fields, reload_profile};
 pub use primitives::primitive_name;
 pub use program::{

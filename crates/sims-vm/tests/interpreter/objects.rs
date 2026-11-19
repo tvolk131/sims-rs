@@ -372,6 +372,33 @@ fn constructing_people_draws_for_their_skeletons() {
     assert_eq!(done.draws, 128);
 }
 
+/// The kat skeleton file is read before the first load, under whatever
+/// spelling the install gives it, so the first person of its skeleton
+/// builds only its own copy.
+#[test]
+fn the_kat_file_read_before_the_first_load_is_matched_without_case() {
+    let kat = "ExpansionShared/ExpansionShared.FAR/Skeletons\\KAT_skeleton.cmx.bcf";
+    // Without a type whose skeleton comes from it, nothing is listed.
+    assert!(sims_vm::read_before_the_first_load(&people()).is_empty());
+    // Here the adults' skeleton is the one file's only one.
+    let mut cats = people();
+    let skeleton = cats.skeletons.get_mut(&ADULT).unwrap();
+    skeleton.file = kat.into();
+    skeleton.place = 0;
+    skeleton.scales = vec![vec![5]];
+    let listed = sims_vm::read_before_the_first_load(&cats);
+    assert_eq!(listed.iter().collect::<Vec<_>>(), [kat]);
+    // Read: its own copy only, one bone at 48 draws. Not read: the file's
+    // skeleton too.
+    for (files, draws) in [(listed, 48), (Default::default(), 96)] {
+        let mut fx = lot();
+        fx.world.skeleton_files = files;
+        let done = read(&mut fx, &file(vec![sim(3, ADULT)]), &cats).unwrap();
+        assert_eq!(done.draws, draws);
+        assert!(fx.world.skeleton_files.contains(kat));
+    }
+}
+
 #[test]
 fn a_person_with_low_interests_gets_defaults_that_only_cost_draws() {
     // Ten interests and five personality words: each draws a category
