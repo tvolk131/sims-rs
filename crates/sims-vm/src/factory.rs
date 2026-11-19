@@ -96,7 +96,21 @@ impl Interpreter<'_> {
             .definition_words(guid)
             .map_err(|trap| fail(0, trap))?[word::GROUP];
         if group != 0 {
-            return self.create_group(world, guid);
+            let lead = self.create_group(world, guid)?;
+            // The factory's signal 0xe2 names the group's lead (0x440ed7),
+            // and the lot runs the visitor pass if the lead's definition
+            // is a person's (0x4163f7).
+            let lead_guid = world.objects.get(&lead).map(|o| o.guid);
+            if let Some(lead_guid) = lead_guid {
+                let kind = self
+                    .machine(world, 0, 0, false)
+                    .definition_words(lead_guid)
+                    .map_err(|trap| fail(lead, trap))?[word::TYPE];
+                if kind == 2 {
+                    self.visitor_pass(world).map_err(|trap| fail(lead, trap))?;
+                }
+            }
+            return Ok(lead);
         }
         let id = (1..=i16::MAX as u16)
             .find(|id| !world.objects.contains_key(id))

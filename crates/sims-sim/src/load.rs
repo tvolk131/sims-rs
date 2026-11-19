@@ -444,6 +444,21 @@ const FAMILY: usize = 61;
 /// with the house number.
 const HOME: usize = 67;
 
+/// One person's word 32 after the visitor pass (0x42a2b4), from its word
+/// 32 before it: a 0 becomes 1, a member of the selected family (its type
+/// is one of the family's members, 0x41019b) gets 0, and on a lot that is
+/// not residential (0x40745f) a 0 becomes 1 again. Any other value stays.
+pub fn visitor_again(word: i16, member: bool, residential: bool) -> i16 {
+    let mut visitor = if word == 0 { 1 } else { word };
+    if member {
+        visitor = 0;
+    }
+    if !residential && visitor == 0 {
+        visitor = 1;
+    }
+    visitor
+}
+
 /// What the end of the household selection reads besides the lot. See
 /// [`World::finish_selection`].
 #[derive(Debug, Clone, Copy)]
@@ -1104,16 +1119,11 @@ impl World {
         let mut visitors = BTreeMap::new();
         for id in &people {
             let object = &self.objects[id];
-            let mut visitor = word(object, VISITOR);
-            if visitor == 0 {
-                visitor = 1;
-            }
-            if household.members.contains(&object.guid) {
-                visitor = 0;
-            }
-            if !residential && visitor == 0 {
-                visitor = 1;
-            }
+            let visitor = visitor_again(
+                word(object, VISITOR),
+                household.members.contains(&object.guid),
+                residential,
+            );
             if character(object) && household.residents.contains(id) && visitor != 0 {
                 return Err(LoadError::Selection(format!(
                     "person {id}, a neighborhood character who lived here, is now a visitor and \
