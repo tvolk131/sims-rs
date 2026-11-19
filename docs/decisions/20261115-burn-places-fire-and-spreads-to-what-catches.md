@@ -46,7 +46,8 @@ opcode 9 to 0x44d96f.
 
 **Fails loudly:**
 - a gathered person, whom the original moves to its tile's centre
-  (virtual functions 0x38, 0x58 and 0x74);
+  (virtual functions 0x38, 0x58 and 0x74). Ported since; see
+  `20261118-fire-burns-person-resets-whoever-uses-what-burns.md`;
 - a fire the factory cannot make. The original takes the false branch
   when the factory gives 0, but the port's factory faults instead;
 - a wall style the original reads from memory it never set (0x4795c5);
