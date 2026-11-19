@@ -8,8 +8,8 @@ replayed through the window's input layer, like the snack order
 
 - `goth-sit-read-order-20261115`: Mortimer is ordered onto the porch
   bench (Sit). The second order, Read A Book on the bookcase, never
-  opened in the original. Its press fell inside one of the harness's
-  stops.
+  opened in the original. One possible cause is that its press fell
+  inside one of the harness's stops (unverified).
 - `goth-cancel-order-20261116`: two snacks are ordered from the fridge.
   A press on the queued snack's icon takes it off, then a press on the
   running snack's icon cancels it.
@@ -32,14 +32,16 @@ and `the_recorded_cancel_order_replayed_in_the_window_matches_the_recording`.
   - Mortimer's last result shows when a hover or press listed a pie.
   - The queue shows when an order or a cancel took effect.
 
-  The one exception is the second cancel. Its release command ran from
-  595 to 625, and the recording shows the cancel after update 594. So
-  the input reaches the game somewhere in the command's span, and the
-  replay takes the update its effect shows.
+  The one exception is the second cancel. Its button-down command
+  ended at 593 and its release command ran from 595 to 625, yet update
+  595's state, saved before the release was sent, already shows the
+  cancel. Which of the two button events acted is not known; the replay
+  presses before 595, where the effect shows.
 - **A press acts on its release.** The cancel recording sends the button
   down and up as separate commands:
   - The choice of Have A Snack took effect at the release's end (257
-    and 445), as did the first cancel (505).
+    and 445), as did the first cancel (505). The second cancel does not
+    fit this (above).
   - The pie opened with the press given at the release (183). A press
     at the button-down was not tried.
 - **Frames.** The frames the original drew are an input of each
@@ -70,6 +72,11 @@ and `the_recorded_cancel_order_replayed_in_the_window_matches_the_recording`.
   Sit order is pushed before update 201 and is running, with an empty
   queue, as recorded.
 
+Neither comparison checks two of the salesman's words that our state
+marks as unknown, both from update 14: his person word 37 (3291
+recorded, 0 ours) and local 7 of his third frame, tree 0x1003 (2609
+recorded, 0 ours).
+
 ## Differences: what the pointer finds
 
 These are all **unverified** and not ported. The lot's state shows only
@@ -89,7 +96,8 @@ one.
   point.
 - **Under the still pointer.** After a choice the pointer stays on the
   pie entry, and the original lists pies there while the lot runs:
-  - in cancel, after 256 (Mortimer's word 50 goes to 1 for 257–259);
+  - in cancel, after 256: for 257–259 the original's word 50 is 0
+    where ours is 1, and its last result 1 where ours is 0;
   - in Sit/Read, at 261 (a failed check) and at 291 (word 50 goes to 1
     until 560);
   - in the snack order, at 622, which the write watch shows was the

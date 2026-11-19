@@ -2091,8 +2091,9 @@ fn pie_entry(game: &Game, label: &str) -> [i32; 2] {
 }
 
 /// Runs the lot to `tick`, drawing a frame after each update as the
-/// window does.
+/// window does. The lot must not be past `tick` already.
 fn run_to(game: &mut Game, tick: u32) {
+    assert!(game.lot().ticks() <= tick, "already past {tick}");
     while game.lot().ticks() < tick {
         assert_eq!(game.run(1), 1, "{:?}", game.stopped());
         game.render();
@@ -2202,13 +2203,14 @@ fn the_recorded_sit_order_replayed_in_the_window_matches_the_recording() {
 /// as the Sit order is. The second snack waits behind the first; a press
 /// on its icon takes it off, and one on the running snack's icon cancels
 /// it, which queues his own action 8318 and sets flag 0x100 on the
-/// snack. Each release presses: the recording's state shows the first
-/// at the update before its command ended, and the second at 594, just
-/// after the release was sent. With the frames its Room motives show
-/// (after 316, 474, 648 and 1124), the lot equals the recording's after
-/// every update to 1300 but for the pointer's two listings ours does
-/// not make: on the kitchen counter behind its wall at 90, and under
-/// the still pointer at 256 (see docs/decisions/).
+/// snack. The first cancel shows at the update before its release's
+/// command ended. The second shows in update 595's state, which was
+/// saved before its release was sent, so which of its button events
+/// acts is not known; the replay presses before 595. With the frames
+/// its Room motives show (after 316, 474, 648 and 1124), the lot equals
+/// the recording's after every update to 1300 but for the pointer's two
+/// listings ours does not make: on the kitchen counter behind its wall
+/// at 90, and under the still pointer at 256 (see docs/decisions/).
 #[test]
 fn the_recorded_cancel_order_replayed_in_the_window_matches_the_recording() {
     let Some(install) = install() else {
@@ -2259,18 +2261,18 @@ fn the_recorded_cancel_order_replayed_in_the_window_matches_the_recording() {
     let p = person(&game);
     assert_eq!(action(&p.active), (1, bookcase as i16, 4110, 6, 2, 0));
     assert_eq!(p.queue.iter().map(action).collect::<Vec<_>>(), [snack(2)]);
+    // The second order's first two pointer moves; his room is counted
+    // again in the frame after 316, the update the second one reached.
+    run_to(&mut game, 310);
+    game.hover(recorded([176, 222]));
     run_to(&mut game, 316);
     assert_eq!(room(&game, mortimer), 0x4225_ac1d);
+    game.hover(recorded([176, 210]));
     run_to(&mut game, 317);
     assert_eq!(room(&game, mortimer), 0x4277_073c);
     order(
         &mut game,
-        &[
-            (310, [176, 222]),
-            (316, [176, 210]),
-            (341, [176, 198]),
-            (346, [176, 186]),
-        ],
+        &[(341, [176, 198]), (346, [176, 186])],
         376,
         (396, 444),
     );
@@ -2285,9 +2287,15 @@ fn the_recorded_cancel_order_replayed_in_the_window_matches_the_recording() {
     assert_eq!(room(&game, mortimer), 0x4253_a203);
     // The queued snack's icon, second in the queue.
     run_to(&mut game, 504);
+    assert_eq!(
+        person(&game).queue.iter().map(action).collect::<Vec<_>>(),
+        [snack(5)]
+    );
     game.press([104, 54]);
     run_to(&mut game, 505);
-    assert!(person(&game).queue.is_empty());
+    let p = person(&game);
+    assert_eq!(action(&p.active), snack(2));
+    assert!(p.queue.is_empty());
     // The running snack's icon.
     run_to(&mut game, 564);
     game.hover([54, 54]);
