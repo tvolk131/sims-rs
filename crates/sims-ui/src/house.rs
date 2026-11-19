@@ -172,8 +172,9 @@ const DEFINITION_BYTES: usize = 216;
 
 impl Kinds {
     /// Reads the definition of every object type in `world` not read
-    /// yet. A type the catalog lacks, or whose file or definition cannot
-    /// be read, counts for nothing and is passed over by the values. The
+    /// yet; a person type made while the game runs reads its template's.
+    /// A type the catalog lacks, or whose file or definition cannot be
+    /// read, counts for nothing and is passed over by the values. The
     /// definition is read as the original holds it ([`Kinds::words`]).
     pub fn learn(&mut self, world: &World, index: &Index, catalog: &Catalog) {
         let mut files: BTreeMap<usize, Option<Iff>> = BTreeMap::new();
@@ -181,7 +182,10 @@ impl Kinds {
             if self.counted.contains_key(&object.guid) {
                 continue;
             }
-            let read = catalog.object(object.guid).and_then(|definition| {
+            // A type Make New Character made is a copy of its template's
+            // definition but for its GUIDs (bytes 0x1c and 0x8c).
+            let guid = world.characters.definition(object.guid);
+            let read = catalog.object(guid).and_then(|definition| {
                 let iff = files.entry(definition.resource).or_insert_with(|| {
                     let bytes = index.resources.get(definition.resource)?.read().ok()?;
                     Iff::parse(bytes).ok()

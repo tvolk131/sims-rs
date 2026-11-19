@@ -328,7 +328,7 @@ fn suit_names(
 
 /// Adds the suits one avatar file defines to `suits`. A file too short
 /// to hold a group's count ends there, as in the original.
-fn read_suits(bytes: &[u8], suits: &mut BTreeSet<String>) -> sims_formats::Result<()> {
+pub(crate) fn read_suits(bytes: &[u8], suits: &mut BTreeSet<String>) -> sims_formats::Result<()> {
     let mut catalog = Binary::new(bytes);
     for kind in [Kind::Skeleton, Kind::Appearance] {
         let Some(count) = catalog.count(kind)? else {

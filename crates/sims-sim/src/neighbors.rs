@@ -467,8 +467,9 @@ fn first_records(neighbors: &Neighbors) -> BTreeMap<u32, usize> {
 impl Neighbors {
     /// Makes a record of the person type `guid` (0x4257a5 asked for no
     /// slot, then 0x4237a1): in the last empty slot, or a new slot at the
-    /// end when none is empty. Its ID is the slot's place plus one.
-    fn make_record(&mut self, guid: u32) -> Result<(), LoadError> {
+    /// end when none is empty. Its ID is the slot's place plus one, and it
+    /// is returned.
+    pub fn make_record(&mut self, guid: u32) -> Result<i16, LoadError> {
         let place = match self.slots.iter().rposition(Option::is_none) {
             Some(place) => place,
             None => {
@@ -488,7 +489,7 @@ impl Neighbors {
             friends: 0,
             stale: true,
         });
-        Ok(())
+        Ok(id)
     }
 }
 
@@ -559,7 +560,9 @@ impl World {
     /// worked out again and kept (+0x20); the reader does not mark it up
     /// to date, so it is worked out again at every read until then. It
     /// counts the other records, in slot order, whose type is one of
-    /// `characters` (the record's type, +8, registered with kind 1:
+    /// `characters` or a type made while the game ran
+    /// ([`crate::characters`], whose file is in the Characters folder
+    /// too, 0x43c3b2) (the record's type, +8, registered with kind 1:
     /// 0x423f30 reads bits 2 and 3 of its +0xb4; a record whose type has
     /// no definition has none, and does not count), whose word 61 (the
     /// family) is not 0, and that are friends both ways with it
@@ -577,10 +580,11 @@ impl World {
         }
         let place = usize::try_from(id).ok()?.checked_sub(1)?;
         let mut count = 0i32;
+        let character =
+            |guid: u32| characters.contains(&guid) || self.characters.made.contains_key(&guid);
         for (other_place, other) in self.neighbors.slots.iter().enumerate() {
             let Some(other) = other else { continue };
-            if other_place == place || !characters.contains(&other.guid) || other.data[FAMILY] == 0
-            {
+            if other_place == place || !character(other.guid) || other.data[FAMILY] == 0 {
                 continue;
             }
             if mutual_friends(other, record, threshold) {

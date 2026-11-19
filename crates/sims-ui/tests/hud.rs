@@ -7,8 +7,8 @@ use sha2::{Digest, Sha256};
 use sims_ui::balloon::{Help, Texts};
 use sims_ui::command::{Command, Panel};
 use sims_ui::frame::{Frame, Rect};
-use sims_ui::household;
 use sims_ui::hud::{self, Controls};
+use sims_ui::{house, household};
 
 fn digest(frame: &Frame) -> String {
     let mut hash = Sha256::new();
@@ -381,6 +381,29 @@ fn the_goths_house_panel() {
     // penalties, which the install's table sets to 3 and 6.
     let counted = opened.kinds.counted.values().filter(|c| **c).count();
     assert_eq!((counted, opened.kinds.counted.len()), (73, 253));
+    // A person type Make New Character made counts as its template does.
+    for template_counts in [true, false] {
+        let (&template, _) = opened
+            .kinds
+            .counted
+            .iter()
+            .find(|&(_, &c)| c == template_counts)
+            .unwrap();
+        let mut world = opened.world.clone();
+        let made = 0x1234_0042;
+        world.characters.made.insert(
+            made,
+            sims_sim::characters::Character {
+                template,
+                file: 0,
+                strings: Default::default(),
+            },
+        );
+        world.objects.values_mut().next().unwrap().guid = made;
+        let mut kinds = house::Kinds::default();
+        kinds.learn(&world, &opened.index, &opened.catalog);
+        assert_eq!(kinds.counted[&made], template_counts);
+    }
     assert_eq!((opened.house.dirty, opened.house.broken), (3, 6));
     // The lot's values are what the original's simulator holds after
     // the load (+0xa0 and +0xa4, track 2's capture of update 1): the

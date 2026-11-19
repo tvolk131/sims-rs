@@ -1171,9 +1171,7 @@ impl Interpreter<'_> {
         } else {
             &[]
         };
-        let definition = self
-            .catalog
-            .object(object.guid)
+        let definition = crate::interpreter::object_definition(self.catalog, world, object.guid)
             .ok_or_else(|| Trap::Invalid("object has no definition".into()))?;
         let entries: Vec<_> = self
             .program
