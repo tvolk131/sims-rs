@@ -204,6 +204,27 @@ fn the_goth_house_steps_to_tick_33() {
 }
 
 #[test]
+fn an_old_town_home_loads_through_its_guid_table_and_steps() {
+    // House 69 of the first neighborhood was saved under its family's
+    // exported GUIDs; its GUID table (0x43a6fb) names the imported types.
+    // The dialogs at ticks 1 and 3 take their first buttons.
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let house = root.join("UserData/Houses/House69.iff");
+    let mut lot = Lot::load(&root, &house, &[2; 8], Frames::default()).unwrap();
+    let report = lot.load_report();
+    assert!(report.stopped.is_none(), "{:?}", report.stopped);
+    assert!(report.finished.is_some());
+    for _ in 0..5 {
+        lot.step().unwrap();
+    }
+    assert_eq!(lot.ticks(), 5);
+}
+
+#[test]
 fn a_step_before_a_complete_load_says_so() {
     // Shown through the message the CLI prints.
     assert_eq!(
