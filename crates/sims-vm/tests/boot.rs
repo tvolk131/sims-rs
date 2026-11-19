@@ -903,18 +903,18 @@ const NEWBIE_1802_27: &str = "561330e47a0f5f0a1553e4382c16c87a15ff8878fff533fd37
 const NEWBIE_1802_26: &str = "d7980d86529f1b84be10c103d0d522e5484fc54ee2484859beba71b74c8c1d58";
 /// The Newbies' house after 4052 updates, the last whose frame strict
 /// mode draws.
-const NEWBIE_4052: &str = "11027885fb508f86f8288b72774b9b773ff0e52c61620470edd529b64c500f39";
+const NEWBIE_4052: &str = "cadfde0d4c4823945e59fbe0a988ebcfb2baa7f1c0025888b3861cecd37b6af9";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
-const NEWBIE_4052_29: &str = "e4cba62b5344fa29526919fccf72069dac72442ad111c06a979dddf32d56a23b";
+const NEWBIE_4052_29: &str = "c55e174ca60099d263fcedc03c31afc39b8eed02ed0c2d8787eaaa5d83d9785e";
 /// The same state's hash under snapshot format 28, which had no record
 /// of the people whose animator was asked to stop its route
 /// ([`sims_sim::World::stops_asked`]) at the end.
-const NEWBIE_4052_28: &str = "f89e3f50e2670999480dd1d852b0ea22e125db6d060e80d10f37a62ee7b8e25f";
+const NEWBIE_4052_28: &str = "72fb2c744577b728d661b6bd5446ccb829c02eabff5ce63d420a807e19d53893";
 /// The same state's hash under snapshot format 27, which had no poses
 /// the load left in the skins ([`sims_sim::World::held_poses`]) either.
-const NEWBIE_4052_27: &str = "39b2fb2f49cdda87cfa0f1c6a56acc5a2aaac8e72fdf82ac1d02ef8e6b590d14";
+const NEWBIE_4052_27: &str = "cd9afec9613dd7022c5764ec7f6f064d92027c912dee40435a2b1356db33115a";
 
 #[test]
 fn a_newbie_gives_up_on_a_route_with_its_failure_feedback() {
@@ -955,8 +955,11 @@ fn a_newbie_gives_up_on_a_route_with_its_failure_feedback() {
     assert_eq!(digest(&format_26_bytes(lot.world())), NEWBIE_1802_26);
     // Tick 1803: object 290 (tree 0x1022) makes two neighbors' people off
     // the lot (Create New Object Instance mode 6, flag 0x4) and removes
-    // them, as the Goths' object 354 does at tick 3603. Unverified: the
-    // recording ends at update 935.
+    // them, as the Goths' object 354 does at tick 3603. Neither is of the
+    // Newbies' family, so the factory's signal 0xe2 makes each a visitor
+    // and each runs "init visitor" (see
+    // docs/decisions/20261118-new-person-works-out-visitors-again.md).
+    // Unverified: the recording ends at update 935.
     let tick = lot.step().unwrap();
     assert_eq!(tick.removed.len(), 2);
     for _ in 1804..=4052 {
@@ -966,10 +969,11 @@ fn a_newbie_gives_up_on_a_route_with_its_failure_feedback() {
     assert_eq!(digest(&format_29_bytes(lot.world())), NEWBIE_4052_29);
     assert_eq!(digest(&format_28_bytes(lot.world())), NEWBIE_4052_28);
     assert_eq!(digest(&format_27_bytes(lot.world())), NEWBIE_4052_27);
-    // The frame drawn after tick 4053 finds person 140's skin waiting for
-    // its update (0x590d26), which is not ported.
+    // The frame drawn after tick 4053 finds person 142's skin waiting for
+    // its update (0x590d26), which is not ported. Before the visitor pass
+    // above it was person 140's.
     let stopped = lot.step().unwrap_err().to_string();
-    for part in ["4053", "person 140", "0x590d26"] {
+    for part in ["4053", "person 142", "0x590d26"] {
         assert!(stopped.contains(part), "{stopped}");
     }
 }

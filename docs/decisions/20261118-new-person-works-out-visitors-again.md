@@ -84,6 +84,15 @@ streams against the recording's values after 3603 and 4154.
 | 31478 | c1305044…6c76 | ab84d202…1ea1 |
 | 43200 | 67169649…a7cf | 3594f77d…2334 |
 
+The Newbies' house (House07, `--answers 3`) does the same at tick 1803
+(object 290, tree 0x1022), so its pin at 4052 changes in formats 30,
+29, 28 and 27 (cadfde0d…6af9, c55e174c…785e, 72fb2c74…3893,
+cd9afec9…115a), and its 1802 pins stay. Its run still stops at the frame
+after tick 4053, on a skin waiting for its update (0x590d26), but now
+person 142's, not person 140's as
+`20261115-seated-route-drop-pets-runs-route-failure.md` says. That is
+unverified: the Newbies' recording ends at update 935.
+
 At the day turn the objects' value is still 12524 (unverified, since
 the run has left the recording by then). No World field is added and
 the snapshot format does not change.
