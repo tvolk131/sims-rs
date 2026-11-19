@@ -390,19 +390,19 @@ def same_action(a, b):
     return all(a.get(k) == b.get(k) for k in ('caller', 'target', 'routine', 'menu', 'args'))
 
 
-def social_of(a, pushed, before):
+def social_of(a, pushed, before, target_pointer):
     """Whether the running action a is the social interaction the pie menu
     pushed (a "Talk..." submenu entry on another person). The game does not
     run it as pushed: at once it makes an interaction object, and the
     person's running action targets that object, with the other person as
     its icon (and its own routine and menu). `before` is what was read at
     the push: whether its target is a person, the running action's uid, and
-    the IDs of the lot's objects; the running action must be a new one, on
-    an object made since."""
+    the lot's object pointers; the running action must be a new one, on an
+    object made since (target_pointer: an object can get a freed ID)."""
     return bool(before and before['target_person'] and a.get('uid') and a.get('uid') != before['active_uid']
                 and a.get('caller') == pushed.get('caller') and a.get('icon') == pushed.get('target')
                 and a.get('target') not in (None, 0, pushed.get('target'))
-                and a.get('target') not in before['objects'])
+                and target_pointer not in before['objects'])
 
 
 def check_window(window):
@@ -574,6 +574,7 @@ class Runner:
         self.pushes = []
         self.push_cursor = 0  # pushes before it were matched by an expect-queued
         self.push_before = {}  # push index -> what was read at it (see social_of)
+        self.socials = set()  # (person, uid) of the conversions an expect-queued took
         self.fresh = False  # self.m was read at this update return (not at a dialog stop)
         self.unchecked = []  # (n, row): commands whose exit code is still to be checked
         self.held = None  # the info of a held press whose release is not yet submitted
@@ -619,7 +620,7 @@ class Runner:
             self.push_before[len(self.pushes)] = dict(
                 target_person=bool(target) and m.half(m.word(target + 0x118) + 0x12) == 2,
                 active_uid=m.word(person + ACTIVE_ACTION + 60),
-                objects={m.object_id(p) for p in object_slots(m, self.sim)} if self.sim else None)
+                objects=object_slots(m, self.sim) if self.sim else None)
             if self.push_before[len(self.pushes)]['objects'] is None:
                 del self.push_before[len(self.pushes)]
         except Exception:
@@ -1055,7 +1056,10 @@ class Runner:
                 queue, active = read_queue(self.m, p), self.m.action(p + ACTIVE_ACTION)
                 where = ('active' if same_action(active, push['action']) else
                          'queue' if any(same_action(a, push['action']) for a in queue) else
-                         'social' if social_of(active, push['action'], before) else None)
+                         'social' if (person, active.get('uid')) not in self.socials and social_of(
+                             active, push['action'], before, self.m.word(p + ACTIVE_ACTION + 8)) else None)
+                if where == 'social':
+                    self.socials.add((person, active['uid']))
                 if where:
                     self.write(kind='taken', person=person, where=where, pushed_update=push['update'],
                                active=active, queue=queue)

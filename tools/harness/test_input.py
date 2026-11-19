@@ -748,14 +748,15 @@ class ReviewFindingsTest(RunnerBase):
         # From goth-talk-order-20261118: Talk... > About Interests on Bella (18).
         pushed = dict(uid=0, caller=21, target=18, icon=18, menu=24, args=[0, 0, 0, 0], routine=8273)
         running = dict(uid=2, caller=21, target=260, icon=18, menu=21, args=[0, 0, 0, 0], routine=4235)
-        before = dict(target_person=True, active_uid=1, objects={18, 21, 132})
-        self.assertTrue(inp.social_of(running, pushed, before))
+        before = dict(target_person=True, active_uid=1, objects={0x1800, 0x2100, 0x1320})
+        new = 0x2600  # the interaction object's pointer
+        self.assertTrue(inp.social_of(running, pushed, before, new))
         for case in (dict(icon=132), dict(caller=18), dict(uid=0), dict(target=18),
-                     dict(uid=1),  # the action running at the push
-                     dict(target=132)):  # an object there at the push
-            self.assertFalse(inp.social_of(dict(running, **case), pushed, before), case)
-        self.assertFalse(inp.social_of(running, pushed, dict(before, target_person=False)))  # not a social
-        self.assertFalse(inp.social_of(running, pushed, None))  # nothing read at the push
+                     dict(uid=1)):  # the action running at the push
+            self.assertFalse(inp.social_of(dict(running, **case), pushed, before, new), case)
+        self.assertFalse(inp.social_of(running, pushed, before, 0x1320))  # an object there at the push
+        self.assertFalse(inp.social_of(running, pushed, dict(before, target_person=False), new))  # not a social
+        self.assertFalse(inp.social_of(running, pushed, None, new))  # nothing read at the push
 
     def social_push(self, r):
         """Choose Joke on Bella (18); returns Bella once the choice is pushed."""
@@ -781,6 +782,17 @@ class ReviewFindingsTest(RunnerBase):
         self.tick_until(r, lambda: r.finished)
         self.assertIsNone(r.failed, r.failed)
         self.assertEqual(self.rows('taken')[0]['where'], 'social')
+
+    def test_one_conversion_is_taken_for_one_push(self):
+        r = self.runner('choose Joke\nexpect-queued 21 18 within 10\nexpect-queued 21 18 within 10')
+        bella = self.social_push(r)
+        action = self.g.m.alloc(0x44)
+        self.g.m.put_words(action + 4, self.person, bella)
+        r.on_queue_push(self.update + 1, False, self.g.m, dict(edi=self.person, esi=action))  # a second push
+        self.run_as(self.g.add_object(260, [0, 0]), bella, 2)
+        self.tick_until(r, lambda: r.finished, most=40)
+        self.assertEqual([t['where'] for t in self.rows('taken')], ['social'])
+        self.assertIn('neither', r.failed)
 
     def test_a_social_running_before_the_push_is_not_taken(self):
         thing = self.g.add_object(260, [0, 0])
