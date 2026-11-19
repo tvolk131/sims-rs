@@ -175,9 +175,10 @@ fn an_empty_or_missing_name_and_another_table_are_native_errors() {
 }
 
 #[test]
-fn failed_dresses_append_unnamed_entries_that_survive_undress_and_a_snapshot() {
+fn misses_with_no_decode_errors_append_unnamed_entries() {
     let mut fx = Fixture::new();
     name_accessories(&mut fx);
+    assert!(fx.program.people.suit_errors.is_empty());
     assert!(run_change(&mut fx, 2, 2, 0).unwrap());
     assert!(run_change(&mut fx, 0, 0, 0).unwrap());
     fx.program.people.suits.remove("hat");
@@ -195,6 +196,33 @@ fn failed_dresses_append_unnamed_entries_that_survive_undress_and_a_snapshot() {
     assert_eq!(worn(&fx), expected);
     assert!(run_change(&mut fx, 2, 2, 1).unwrap());
     assert_eq!(worn(&fx), expected);
+}
+
+#[test]
+fn a_miss_with_decode_errors_traps_before_changing_the_list() {
+    let mut fx = Fixture::new();
+    name_accessories(&mut fx);
+    fx.program.people.suit_errors.extend([
+        ("GameData/x.bcf".into(), "truncated".into()),
+        ("GameData/y.cmx".into(), "invalid".into()),
+    ]);
+    assert!(run_change(&mut fx, 2, 2, 0).unwrap());
+    let before = worn(&fx);
+    fx.program.people.suits.remove("hat");
+
+    let error = trap(run_change(&mut fx, 2, 2, 0));
+    let sims_vm::Trap::Unsupported(reason) = error else {
+        panic!("{error}");
+    };
+    assert!(reason.contains("accessory \"hat\""), "{reason}");
+    assert!(
+        reason.contains("2 avatar files stopped decoding (GameData/x.bcf, GameData/y.cmx)"),
+        "{reason}"
+    );
+    assert_eq!(worn(&fx), before);
+
+    assert!(run_change(&mut fx, 2, 2, 1).unwrap());
+    assert!(worn(&fx).is_empty());
 }
 
 #[test]

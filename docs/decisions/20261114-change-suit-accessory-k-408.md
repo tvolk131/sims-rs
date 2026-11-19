@@ -29,7 +29,9 @@ What was decided:
   suits), and keeps the suit names (`People::suits`, lowered) and the
   files that stopped decoding (`People::suit_errors`). Putting on a
   name outside that set is `Trap::Unsupported` before anything changes,
-  naming any such files. **Unverified**: that the registry holds exactly
+  naming any such files.
+  Superseded in part by [20261118-change-suit-unnamed-accessory.md](20261118-change-suit-unnamed-accessory.md).
+  **Unverified**: that the registry holds exactly
   these names (the install has no NDX index, so where it gets them is
   not read) and that its lazy load succeeds whenever ours decodes. The
   capture shows the entry count (one, from update 368), not the entry.

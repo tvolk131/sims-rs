@@ -18,7 +18,8 @@
 //!   through the animator's virtual function 0xd8 (0x58d88f, "dress")
 //!   with an empty binding, and comes off through 0xdc (0x58d919,
 //!   "undress"). A failed suit lookup (0x5a044d) leaves an entry at the
-//!   end with an empty name and binding.
+//!   end with an empty name and binding. Our lookup miss traps if any
+//!   avatar files stopped decoding, since they might name the suit.
 //!
 //! Any other operand 1 is native error 0x2f. The primitive always
 //! branches true.
@@ -51,7 +52,7 @@ impl Machine<'_, '_> {
             1 => self.change_into(index)?,
             0 | 2 => {
                 let name = self.accessory_name(scope, index)?;
-                let found = !off && self.program.people.suits.contains(&name);
+                let program = self.program;
                 let accessories = &mut self
                     .me_mut()?
                     .person
@@ -61,6 +62,20 @@ impl Machine<'_, '_> {
                 if off {
                     undress(accessories, &name);
                 } else {
+                    let found = program.people.suits.contains(&name);
+                    let errors = &program.people.suit_errors;
+                    if !found && !errors.is_empty() {
+                        return Err(Trap::Unsupported(format!(
+                            "Change Suit puts on accessory {name:?}, which no decoded avatar \
+                             file names. {} avatar files stopped decoding ({})",
+                            errors.len(),
+                            errors
+                                .keys()
+                                .map(String::as_str)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )));
+                    }
                     dress(accessories, name, found);
                 }
             }
@@ -159,10 +174,12 @@ impl Machine<'_, '_> {
 /// Puts on accessory `name` (0x58d88f). Takes off any of that name, then
 /// adds one at the end with an empty binding.
 ///
-/// The original appends an empty entry, then fills it if it binds a suit
-/// to the skeleton (0x583559). A failed lookup (0x5a044d) leaves both
-/// strings empty. We use `People::suits` for the lookup. Its agreement
-/// with the original registry and lazy loads (0x5a38da) is unverified.
+/// The original appends an empty entry, then fills it after binding its
+/// suit to the skeleton (0x583559). The attach (0x599427, through
+/// 0x5954d8) always returns its object, so a lookup miss (0x5a044d) is
+/// the only way a nonempty requested name leaves the entry unnamed.
+/// We use `People::suits` for the lookup. Its agreement with the
+/// original registry and lazy loads (0x5a38da) is unverified.
 pub(crate) fn dress(accessories: &mut Vec<Accessory>, name: String, found: bool) {
     undress(accessories, &name);
     accessories.push(Accessory {
