@@ -780,8 +780,8 @@ impl Painter<'_> {
     /// trim sprite whose frame shows the walls meeting there: standing
     /// walls' trim at the storey's height, cut walls' at the cut height.
     /// Which walls count, and the cap, follow the original's corner
-    /// records (see `caps`). The original draws the trim at full light,
-    /// whatever the room's light.
+    /// records (see `caps`). Every trim takes the outdoors' light, not its
+    /// room's.
     fn trims(&mut self, level: i32, corners: &Level) {
         let Level { corners, faces, .. } = corners;
         let zoom = self.camera.zoom;
@@ -791,9 +791,8 @@ impl Painter<'_> {
         // without one (0x53dbb4 to 0x53dbec, set at 0x53e2f5).
         let light = self
             .lot
-            .room_lights
-            .get(&0)
-            .map_or(Light::FULL, |&byte| Light::from_byte(byte));
+            .outdoor_light
+            .map_or(Light::FULL, Light::from_fraction);
         for (&corner, c) in &corners.corners {
             let at = self.corner_screen(corner, level);
             let view = self.rotate_corner(corner);
@@ -842,8 +841,10 @@ impl Painter<'_> {
                 // middle of the view tile below the corner, on the ground
                 // there (0x4b9613 from 0x53e24d; the old prototype's
                 // `geometry_side.rs` reads the same point).
-                let anchor = trim_anchor(&self.depth, self.camera, view, level, |c| {
-                    self.corner_elevation(c)
+                let last = self.lot.size as i32 - 1;
+                let anchor = trim_anchor(&self.depth, self.camera, view, level, |[x, y]| {
+                    let (x, y) = (x.clamp(0, last), y.clamp(0, last));
+                    self.lot.heights[Lot::cell(x as usize, y as usize)]
                 });
                 let left = x;
                 for (set, lift, columns) in pieces {
@@ -862,9 +863,13 @@ impl Painter<'_> {
                         continue;
                     };
                     let depth = &self.depth;
-                    if set && image.depth.is_some() {
+                    if set {
                         // A cut trim takes its depth from its depth sprite,
-                        // by column from the whole sprite's left (0x4c8b1f).
+                        // by column from the whole sprite's left, and is
+                        // not drawn without one (0x4c8b1f).
+                        if image.depth.is_none() {
+                            continue;
+                        }
                         self.canvas
                             .draw_layered(&image, [x, y], light, |sx, sy, byte| {
                                 depth.trim(anchor, sy, sx.saturating_sub(left), byte)
@@ -1231,23 +1236,22 @@ fn sprite_rise(object: [f32; 3], zoom: Zoom) -> i32 {
 }
 
 /// Where a cut wall's trim at view corner `view` on `level` takes its
-/// depth from: the middle of the view tile whose top corner that is,
-/// on that tile's ground (the mean of its corners, `elevation` giving
-/// each lot corner's in sixteenths of a step, as for an object).
+/// depth from: the middle of the view tile whose top corner that is, on
+/// the terrain there. `heights` gives a lot tile's four corner heights.
+/// The original looks the terrain up at the middle (0x478dfe), which
+/// falls on the diagonal between the tile's corners (0, 0) and (1, 1)
+/// ([`sims_sim::head::altitude_at`]).
 fn trim_anchor(
     depth: &Depth,
     camera: &Camera,
     view: [i32; 2],
     level: i32,
-    elevation: impl Fn([i32; 2]) -> i32,
+    heights: impl Fn([i32; 2]) -> [u8; 4],
 ) -> Anchor {
     let tile = camera.unrotate_tile(view);
-    let ground = (0..4)
-        .map(|c| elevation([tile[0] + (c & 1), tile[1] + (c >> 1)]))
-        .sum::<i32>()
-        / 4;
+    let ground = sims_sim::head::altitude_at(heights(tile), 8, 8).to_f32();
     let middle = [view[0] * 16 + 8, view[1] * 16 + 8];
-    place(depth, camera, middle, level, ground as f32 / 16.0)
+    place(depth, camera, middle, level, ground)
 }
 
 /// Places a point at fine view position `view` on `level`, `height`
@@ -1813,15 +1817,23 @@ mod tests {
     fn a_cut_trim_is_anchored_at_the_middle_of_the_tile_below_its_corner() {
         let camera = camera(1);
         let depth = Depth::new(&camera);
-        // Each lot corner's ground: x + 2y steps, in sixteenths.
-        let elevation = |[x, y]: [i32; 2]| 16 * (x + 2 * y);
+        // Lot tile (20, 53), which view tile (10, 20) is at this rotation,
+        // has corners (0, 1), (0, 0), (1, 0) and (1, 1) at 10, 2, 6 and 5
+        // steps; any other tile is flat.
+        let heights = |tile: [i32; 2]| {
+            if tile == [20, 53] {
+                [10, 2, 6, 5]
+            } else {
+                [0; 4]
+            }
+        };
         let view = [10, 20];
-        // View tile (10, 20) is lot tile (20, 53) at this rotation; its
-        // corners' mean is 20.5 + 2 * 53.5 = 127.5 steps, and its middle
-        // is fine view position (168, 328).
         assert_eq!(camera.unrotate_tile(view), [20, 53]);
-        let anchor = trim_anchor(&depth, &camera, view, 1, elevation);
-        assert_eq!(anchor, place(&depth, &camera, [168, 328], 1, 127.5));
+        // Its middle, fine view position (168, 328), is halfway between
+        // corners (0, 0) and (1, 1): 3.5 steps, not the corners' mean.
+        let anchor = trim_anchor(&depth, &camera, view, 1, heights);
+        assert_eq!(anchor, place(&depth, &camera, [168, 328], 1, 3.5));
+        assert_ne!(anchor, place(&depth, &camera, [168, 328], 1, 5.75));
     }
 
     #[test]

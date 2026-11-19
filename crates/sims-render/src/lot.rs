@@ -76,6 +76,10 @@ pub struct Lot {
     /// ([`sims_sim::rooms::Room::shown_light`]) times 255, as the original
     /// stores it for the room's tiles (0x46772d).
     pub room_lights: BTreeMap<i16, u8>,
+    /// The light room 0, the outdoors, shows ([`room_fraction`]), as the
+    /// original reads it for the wall-top trim (0x53dbcd); None without a
+    /// room 0.
+    pub outdoor_light: Option<f32>,
     /// The two triangles of each tile a diagonal wall splits, by level (1
     /// or 2), column and row: which triangle (by the corner it holds: 1
     /// south-west, 2 south-east, 3 north-east, 4 north-west) and its room.
@@ -212,6 +216,7 @@ impl Lot {
             .iter()
             .map(|(&id, r)| (id, room_light(r)))
             .collect();
+        let outdoor_light = world.rooms.rooms.get(&0).map(room_fraction);
         let halves = world
             .rooms
             .halves
@@ -227,6 +232,7 @@ impl Lot {
             levels,
             outdoor_rooms,
             room_lights,
+            outdoor_light,
             halves,
             lamps,
         })
@@ -376,18 +382,22 @@ pub fn gives_light(object: &sims_sim::Object) -> bool {
 }
 
 /// The light byte the original stores for a room's tiles: the light the
-/// room shows ([`sims_sim::rooms::Room::shown_light`]) as [`light_byte`]
-/// makes it. A room the room update has never counted has no light yet
-/// (every counted room has at least one tile); the outdoors is drawn in
-/// daylight then, so a house read without a load still shows, and indoors
-/// keeps its light of 0.
+/// room shows ([`room_fraction`]) as [`light_byte`] makes it.
 pub fn room_light(room: &sims_sim::rooms::Room) -> u8 {
-    let light = if room.half_tiles == 0 && room.outdoors {
+    light_byte(room_fraction(room))
+}
+
+/// The light a room shows ([`sims_sim::rooms::Room::shown_light`]). A
+/// room the room update has never counted has no light yet (every
+/// counted room has at least one tile); the outdoors is drawn in daylight
+/// then, so a house read without a load still shows, and indoors keeps
+/// its light of 0.
+pub fn room_fraction(room: &sims_sim::rooms::Room) -> f32 {
+    if room.half_tiles == 0 && room.outdoors {
         1.0
     } else {
         room.shown_light().to_f32()
-    };
-    light_byte(light)
+    }
 }
 
 /// A room's light as the byte the original stores for its tiles: the light

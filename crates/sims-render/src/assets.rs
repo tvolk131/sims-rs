@@ -219,8 +219,8 @@ impl Assets {
     /// if the game lacks them, or if they hold far more pixels than the
     /// game's do. A cut trim's frame carries its depth sprite's bytes as
     /// its depth (255 where nothing is drawn), when the game has a frame
-    /// of the same size for it; the original draws the two together
-    /// (0x4c8b1f).
+    /// of the same size for it; the original draws the two together and
+    /// draws neither without both (0x4c8b1f).
     pub fn trim(&mut self, cut: bool, zoom: Zoom) -> &[Image] {
         /// The frames the corner table can name.
         const FRAMES: usize = 46;

@@ -345,8 +345,7 @@ impl Depth {
     /// The trim stands upright like a wall ([`Depth::stand`]), and its
     /// depth byte picks one of eight layers (table 0x668440): a ramp along
     /// the wall columns `C` from one of three starts, or a step of the
-    /// columns' peak or half of it. Smaller bytes are farther, the
-    /// opposite of a sprite's.
+    /// columns' peak or half of it.
     pub fn trim(&self, anchor: Anchor, y: i32, column: i32, byte: u8) -> Option<i32> {
         // The original's starts are its column pointer for this zoom
         // (C plus 16 << zoom entries), less 8 << zoom and less one more.

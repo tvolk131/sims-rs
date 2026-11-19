@@ -761,6 +761,7 @@ mod tests {
             levels: [level(), level()],
             outdoor_rooms: Default::default(),
             room_lights: Default::default(),
+            outdoor_light: None,
             halves: Default::default(),
             lamps: Default::default(),
         }

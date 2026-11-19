@@ -45,15 +45,21 @@ a wall. The depth sprite's byte picks one of eight layers (table
 **The anchor** comes from 0x4b9613 (from 0x53e24d). It places the
 trim's context like an object, at the middle of the view tile whose top
 corner the trim's corner is: fine position (16x + 8, 16y + 8), on the
-terrain there, on the corner's level. The old prototype's
-`geometry_side.rs` reads the same point. We take the ground there as
-the mean of the tile's corners, as we do for objects.
+corner's level. The old prototype's `geometry_side.rs` reads the same
+point. The height is the terrain looked up there (0x478dfe). At a
+tile's middle, that is halfway between the tile's corners (0, 0) and
+(1, 1), not the mean of all four (`sims_sim::head::altitude_at`).
 
 **The light.** Every trim, standing or cut, is lit with one light: the
 light shown by room 0, the outdoors (0x466fcc(0), then 0x4688bf), or
 full light without one (0x53dbb4 to 0x53dbec). The original sets it at
-0x53e2f5, held between half and full. We drew trims in full light. At
-night the original's trims are half as bright.
+0x53e2f5, held between half and full. It passes the light as a float,
+so 0.999 is light level 31, not full light; we keep room 0's light as
+a float for this, not the byte its tiles store. We drew trims in full
+light. At night the original's trims are half as bright.
+
+**A missing depth sprite.** 0x4c8b1f draws nothing unless both sprites
+are found. A cut frame without a matching depth frame is not drawn.
 
 ## What we do
 
@@ -61,7 +67,7 @@ night the original's trims are half as bright.
 - `Assets::trim` attaches each cut frame's depth bytes.
 - `Canvas::draw_layered` draws with them, at a slack of one.
 - `trim_anchor` places the anchor.
-- Trims take room 0's light.
+- Trims take room 0's light (`Lot::outdoor_light`, `Light::from_fraction`).
 
 ## Checked
 
@@ -84,9 +90,6 @@ night the original's trims are half as bright.
 
 ## Unverified
 
-- The ground at the anchor. The original looks the terrain up at the
-  tile's middle (0x478dfe). The mean of the corners is the same on flat
-  ground.
 - The depth values against the game's depth buffer. They were checked
   against its screen only.
 - The diagonal cut trims drawn from the standing set (bits 0x50) still
