@@ -76,8 +76,10 @@ impl Tuning {
             return Ok(Self::default());
         };
         let iff = Iff::parse(global.read().map_err(Error::Content)?).map_err(Error::Format)?;
+        // Looked up by ID alone, as the original's string loader does
+        // (0x415dd6, through 0x46ff01).
         let curves = iff
-            .get(b"STR#", CURVES)
+            .get_by_id(b"STR#", CURVES)
             .map(|chunk| StringTable::parse_chunk(iff.data(chunk), iff.resource_flags(chunk)))
             .transpose()
             .map_err(Error::Format)?;
@@ -90,12 +92,12 @@ impl Tuning {
     }
 
     /// The tuning from the curves' string table and the constants' table.
-    /// A curve that is there but empty has no points and weighs
-    /// everything 0, as the original's empty curve does (0x4167de). A
-    /// missing table or string does the same here; the original fetches
-    /// the string without a check (0x415df9) and its scanner crashes on
-    /// the null it gets (0x415e02, 0x461435). The install's table has
-    /// both. The curve's text is its bytes up to the first zero byte
+    /// A curve that is empty, or whose table is missing, has no points
+    /// and weighs everything 0, as the original's does (0x4167de; a
+    /// missing table skips both curves, 0x415ddb). A string missing from
+    /// a table that is there does the same here; the original fetches it
+    /// without a check (0x415df9) and its scanner crashes on the null it
+    /// gets (0x415e02, 0x461435). The install's table has both. The curve's text is its bytes up to the first zero byte
     /// (0x4703ad), each read as it is. **Unverified:** the points are read by
     /// `sims_sim::motives::Curve::parse`, which the motives' curves share;
     /// where text is not well formed (a point such as `(100;90 coins)`)
@@ -481,7 +483,8 @@ impl Prices {
                 ]
                 .into_iter()
                 .filter_map(|id| {
-                    let chunk = iff.get(b"STR#", id)?;
+                    // By ID alone (0x4cd45f, through 0x46ff01).
+                    let chunk = iff.get_by_id(b"STR#", id)?;
                     Some((
                         id,
                         StringTable::parse_chunk(iff.data(chunk), iff.resource_flags(chunk))

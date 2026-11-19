@@ -241,6 +241,22 @@ impl Iff {
             .get(&(*tag, id, 0))
             .map(|&i| &self.chunks[i])
     }
+    /// The resource of type `tag` with ID `id` whatever its flags' high
+    /// byte, as the original's lookup by ID finds one (0x41bbfb to
+    /// 0x41bc02): it compares the ID alone, in a table that put each
+    /// resource at the head of its bucket as it was built (0x41de8f,
+    /// 0x41de94), so of resources sharing an ID the last in resource
+    /// order. **Unverified:** that resources sharing an ID share a
+    /// bucket, which this assumes.
+    pub fn get_by_id(&self, tag: &[u8; 4], id: u16) -> Option<&Chunk> {
+        self.resources
+            .order
+            .get(tag)?
+            .iter()
+            .rev()
+            .map(|&i| &self.chunks[i])
+            .find(|chunk| chunk.id == id)
+    }
     /// The resources of type `tag` in the original's order. When the
     /// resource map cannot be used, the chunks as if there were no map.
     pub fn all<'a>(&'a self, tag: &'a [u8; 4]) -> impl Iterator<Item = &'a Chunk> {

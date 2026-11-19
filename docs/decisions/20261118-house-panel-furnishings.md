@@ -135,16 +135,24 @@ No screenshot of the panel was compared.
     0 here. The original reads it without a check (0x4cd4d3; 0x470531
     returns null; a missing table's failed lookup is passed over at
     0x4cd45f and 0x4cd727) and crashes in `atoi` (0x4cdace, 0x635fbe).
-    The install's tables have them all. So too a missing Furnishings
-    curve string: it weighs everything 0 here, where the original's
-    scanner crashes on the null string (0x415df9, 0x415e02, 0x461435).
+    The install's tables have them all. So too a Furnishings curve
+    string missing from its table: it weighs everything 0 here, where
+    the original's scanner crashes on the null string (0x415df9,
+    0x415e02, 0x461435). A missing curve table weighs everything 0 in
+    both (the original skips both curves, 0x415ddb).
+  - The global file's and `Build.iff`'s tables are looked up by ID
+    alone, whatever their flags' high byte, as the original's string
+    loader does (0x415dd6, 0x4cd45f, through 0x46ff01 and 0x41bbfb):
+    of tables sharing an ID, the last in resource order, as its table
+    puts each at the head of its bucket (0x41de8f, 0x41de94;
+    `Iff::get_by_id`). **Unverified:** that tables sharing an ID share
+    a bucket.
   - The built-in floors, keys 1 to 29: `STR#` 130 (0x4a01cb).
   - The built-in wall patterns, keys 0 to 30 and 248 to 255: `STR#` 131
     (0x4c4ee5). Key 0 and the high keys have no entry and cost 0.
-  - A plug-in pattern costs string 1, from 0, of its file's first
-    `STR#` with ID 0 in resource order, whatever its flags' high byte,
-    as the original's lookup compares the ID alone (0x41bbfb to
-    0x41bc02; 0x4a0a84, 0x4c59a0), now kept as `SurfaceFile::price`. Without
+  - A plug-in pattern costs string 1, from 0, of its file's `STR#` with
+    ID 0, found by ID alone as above (0x4a0a84, 0x4c59a0), now kept as
+    `SurfaceFile::price`. Without
     that table or string it costs string 0 of `STR#` 134 (floors) or 135
     (walls).
   - **Not ported:** when a `STR#` is missing, the lookup (0x47028b)
