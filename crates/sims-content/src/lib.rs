@@ -13,6 +13,7 @@ mod animations;
 pub mod assets;
 mod catalog;
 mod error;
+pub mod family_import;
 mod file_table;
 mod index;
 mod install;

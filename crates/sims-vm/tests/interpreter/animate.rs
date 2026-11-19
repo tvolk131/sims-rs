@@ -5,6 +5,7 @@
 use crate::support::*;
 use sims_content::{Clip, Event, Profile, Track};
 use sims_core::F32;
+use sims_formats::saved_objects::Accessory;
 use sims_sim::animator::{Base, LOADED, Layer, UNSET};
 use sims_sim::motives::{Curve, Rates, Tuning};
 use sims_vm::{Interpreter, Status, Trap};
@@ -1391,16 +1392,77 @@ fn a_carry_clip_not_found_fails_loudly() {
     assert!(message.contains("0x59dc32"), "{message}");
 }
 
+fn worn(fx: &Fixture) -> Vec<(String, String)> {
+    fx.sim()
+        .person
+        .as_ref()
+        .unwrap()
+        .accessories
+        .iter()
+        .map(|a| (a.name.clone(), a.binding.clone()))
+        .collect()
+}
+
 #[test]
-fn a_timed_event_not_ported_fails_loudly() {
-    for key in ["dress", "undress"] {
-        let mut fx = with_events(vec![track(&[(0, &[(key, "1")])])]);
-        let message = tick(&mut fx).unwrap_err().to_string();
-        assert!(
-            message.contains(key) && message.contains("0x5912fd"),
-            "{message}"
-        );
-    }
+fn dress_and_undress_events_put_accessories_on_and_take_them_off() {
+    // 0x5912fd: "dress" puts its value on through 0x58d88f with an empty
+    // binding, after taking off any of that name; "undress" takes it off
+    // (0x58d919). A name no avatar file defines leaves an unnamed entry,
+    // as Change Suit's does. (A loaded event holds each key once, 0x59431a.)
+    let mut fx = with_events(vec![
+        track(&[
+            (0, &[("dress", "fun-fetch-ball01")]),
+            (30, &[("undress", "fun-fetch-ball01"), ("dress", "petbowl")]),
+        ]),
+        track(&[
+            (0, &[("dress", "no-such-suit")]),
+            (50, &[("dress", "fun-fetch-ball01")]),
+        ]),
+    ]);
+    fx.program.people.suits = ["fun-fetch-ball01", "petbowl"].map(String::from).into();
+    fx.sim_mut().person.as_mut().unwrap().accessories = vec![Accessory {
+        name: "petbowl".into(),
+        binding: "R_HAND".into(),
+    }];
+    tick(&mut fx).unwrap();
+    let pair = |n: &str| (n.to_string(), String::new());
+    assert_eq!(
+        worn(&fx),
+        [
+            ("petbowl".to_string(), "R_HAND".to_string()),
+            pair("fun-fetch-ball01"),
+            pair(""),
+        ]
+    );
+    tick(&mut fx).unwrap();
+    assert_eq!(
+        worn(&fx),
+        [pair(""), pair("petbowl"), pair("fun-fetch-ball01")]
+    );
+}
+
+#[test]
+fn a_dress_event_naming_a_suit_that_may_not_have_decoded_fails_loudly() {
+    // The lookup compares bytes exactly (0x5a25dc), so "petbowl" misses
+    // "Petbowl". With an avatar file undecoded a miss might be wrong, so
+    // it fails. An empty name is never looked up (0x583569): it gets an
+    // unnamed entry.
+    let mut fx = with_events(vec![track(&[
+        (0, &[("dress", "")]),
+        (30, &[("dress", "petbowl")]),
+    ])]);
+    fx.program.people.suits = ["Petbowl"].map(String::from).into();
+    fx.program
+        .people
+        .suit_errors
+        .insert("GameData/x.bcf".into(), "truncated".into());
+    tick(&mut fx).unwrap();
+    assert_eq!(worn(&fx), [(String::new(), String::new())]);
+    let message = tick(&mut fx).unwrap_err().to_string();
+    assert!(
+        message.contains("1 avatar files stopped decoding"),
+        "{message}"
+    );
 }
 
 #[test]

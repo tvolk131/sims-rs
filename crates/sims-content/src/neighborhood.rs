@@ -2,7 +2,9 @@ use crate::index::sorted_entries;
 use crate::install::resolve;
 use crate::{Catalog, Error, Result};
 use sims_formats::iff::Iff;
-use sims_formats::lot::{self, Array, HouseView, ObjectTypes, Simulator, SurfaceMapping};
+use sims_formats::lot::{
+    self, Array, GuidTable, HouseView, ObjectTypes, Simulator, SurfaceMapping,
+};
 use sims_formats::neighborhood::Neighborhood as Header;
 use sims_formats::neighborhood::{Family, Inventory, Neighbor, Neighbors};
 use sims_formats::saved_objects::Objects;
@@ -185,10 +187,11 @@ pub struct House {
     pub arrays: BTreeMap<u16, Array>,
     pub view: Option<HouseView>,
     pub model: Option<lot::House>,
-    /// Whether the file has a GUID translation table (a `Gtab` chunk),
-    /// which the original applies to the type table's GUIDs as it reads
-    /// them (0x43dd76). Nothing reads the table itself yet.
-    pub guid_table: bool,
+    /// The file's GUID translation table (`Gtab` chunk 1, 0x43ddc2), if it
+    /// has one. [`House::load`] has already passed every GUID in
+    /// [`House::types`] through it, as the original's type-table read does
+    /// before it looks a definition up (0x43a6fb).
+    pub guid_table: Option<GuidTable>,
     /// The house's map from saved floor IDs to pattern files (FLRm), or
     /// None when the file has none. See [`House::version`] for which chunk
     /// this is.
@@ -223,9 +226,21 @@ impl House {
         let chunk = one(b"SIMI")?;
         let simulator = Simulator::parse(iff.data(chunk))
             .map_err(|e| Error::format(&location("SIMI", chunk.id), e))?;
+        let guid_table = iff
+            .get(b"Gtab", 1)
+            .map(|chunk| {
+                GuidTable::parse(iff.data(chunk))
+                    .map_err(|e| Error::format(&location("Gtab", chunk.id), e))
+            })
+            .transpose()?;
         let chunk = one(b"objt")?;
-        let types = ObjectTypes::parse(iff.data(chunk))
+        let mut types = ObjectTypes::parse(iff.data(chunk))
             .map_err(|e| Error::format(&location("objt", chunk.id), e))?;
+        if let Some(table) = &guid_table {
+            for entry in &mut types.entries {
+                entry.guid = table.translate(entry.guid);
+            }
+        }
         let chunk = one(b"ObjM")?;
         let multipart = |guid| catalog.object(guid).map(|o| o.master != 0);
         let objects = Objects::parse(iff.data(chunk), &types, multipart)
@@ -271,7 +286,7 @@ impl House {
             arrays,
             view,
             model,
-            guid_table: iff.chunks.iter().any(|c| &c.tag == b"Gtab"),
+            guid_table,
             floor_map: surface_map(b"FLRm", true)?,
             wall_map: surface_map(b"WALm", false)?,
         })
