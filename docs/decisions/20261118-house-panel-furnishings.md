@@ -11,9 +11,11 @@ file saved 0 for both. Their Furnishings is 58. No screenshot of the
 panel was compared.
 
 - **The rating** (0x416851): the architecture's value (+0xa4) over the
-  objects' (+0xa0), both turned to single precision, through string 1
-  of the global file's `STR#` 505, cut toward zero. With the objects
-  worth 0 the ratio is 100 (0x66674c), not a division.
+  objects' (+0xa0), through string 1 of the global file's `STR#` 505,
+  cut toward zero. The objects' value is rounded to single precision
+  first; the architecture's is loaded whole and divided by it, and the
+  quotient is rounded to single. With the objects' value 0 the ratio is
+  100 (0x66674c), not a division.
 - **When the values are worked out:** the original's lot statistics
   (0x416085) store them at the load (0x41621f), at the day's turn
   (0x41647e), on leaving build or buy mode (0x4cea9e) and from 0x50206e,
@@ -28,9 +30,10 @@ panel was compared.
   wrap:
   - A tile of a multi-tile group that is not its lead, and a type with
     definition word 9 set to 7, are passed over.
-  - An object that stands on the lot (0x432595, read as `sims-vm`
-    reads it: its tile, as a signed byte, 1 to 62 each way) and is
-    valued adds its value to the objects'.
+  - An object that stands on the lot (0x432595, 0x422632, read as
+    `sims-vm` reads it: its tile, as a signed byte, at least 1 and below
+    the lot's size less 1 each way) and is valued adds its value to the
+    objects'.
   - Valued (0x4354d5) means: data word 43 lacks flag 0x10, and then
     either the object is a person (word 9 is 2) or its catalog master's
     word 69 (the build mode type, 0x45728d) is 0.
@@ -40,9 +43,11 @@ panel was compared.
     group. It is halved toward zero when data word 15 is not 0 on it, or
     for a group on any of its tiles.
   - The definition words are read as `sims-vm` holds them, and the
-    master is found as `sims-vm` finds it (`Kinds::types`). A group
-    without a master, where the original reads through a null pointer,
-    is neither valued nor counted to the architecture here.
+    master is found as `sims-vm` finds it (`Kinds::types`). A person
+    without a master is still valued, since the person test comes first.
+    Any other type without a master, where the original reads through a
+    null pointer, is neither valued nor counted to the architecture
+    here.
 - **The architecture** (0x47b006) goes over the tiles of levels 1 and 2
   inside the lot's size. A tile with flag 0x20 is skipped.
   - **Walls:** the tile's wall cell as the wall service gives it
@@ -59,9 +64,12 @@ panel was compared.
     floor. Those floors are kept in the cell's west style and west
     pattern words.
   - **Pool:** on level 1, a pool byte below 0x10 adds the pool's price.
+  - A level whose tile flags, floors or walls are missing adds nothing.
+    A missing pool array leaves out only the pool's price.
 - **The prices** (`Prices::load`) come from `GameData/Build.iff`. Each
   string-table entry is three strings, and the first is the price, read
-  as C's `atoi` reads it (0x636029, `sims_content::atoi`):
+  as C's `atoi` reads its bytes (0x636029, `sims_content::atoi`), so a
+  byte order mark before the digits reads 0:
   - Wall styles (0x6e5838): `STR#` 129, entries 1 to 5, give styles 1,
     2, 13, 12 and 14 (0x4cd149). Every other style costs 0.
   - The pool (0x6c5ff8): `STR#` 133, entry 1 (75 here, over the exe's
@@ -69,13 +77,22 @@ panel was compared.
   - The built-in floors, keys 1 to 29: `STR#` 130 (0x4a01cb).
   - The built-in wall patterns, keys 0 to 30 and 248 to 255: `STR#` 131
     (0x4c4ee5). Key 0 and the high keys have no entry and cost 0.
-  - A plug-in pattern costs string 1 of its file's first `STR#`
-    (0x4a0a84, 0x4c59a0), now kept as `SurfaceFile::price`. Without
-    that string it costs string 0 of `STR#` 134 (floors) or 135 (walls).
-  - **Unverified:** that "first" means the resource order.
+  - A plug-in pattern costs string 1, from 0, of its file's `STR#` with
+    ID 0 (0x4a0a84, 0x4c59a0), now kept as `SurfaceFile::price`. Without
+    that table or string it costs string 0 of `STR#` 134 (floors) or 135
+    (walls).
+  - **Not ported:** when a `STR#` is missing, the lookup (0x47028b)
+    tries a resource of type `'CST'` (0x00435354) with the same ID.
+    Which chunk tag that matches in a file was not read, and the
+    install's files have none.
   - Build mode's catalog, which fills the style table and the pool's
     price, is made on first request (0x4ce31a). The match with the
     capture needs the five style prices, so it was made by update 1.
+- **The viewer:** when the house cannot be loaded as the game loads
+  it, the viewer shows the house file as saved, whose floors and walls
+  keep the house's own pattern numbers, not the catalogs' keys. Its
+  panel then leaves Furnishings out rather than price the wrong
+  patterns.
 - **Unverified:**
   - A wall side whose neighbour does not own it costs 0. The original
     reads whatever its stack held there.
@@ -83,13 +100,18 @@ panel was compared.
     as styles, as the original's record lays them out. No lot is known
     to have one.
 - **Tests:**
-  - `atoi`;
+  - `atoi`, a byte order mark included;
+  - a pattern file's price from `STR#` 0, with another table first, and
+    without table 0 or its string;
   - the prices from stand-in tables and pattern files;
   - the architecture of a hand-made lot (straight walls, a fence, a
     split floor, a diagonal that is not the lowest segment, a skipped
-    tile, the pool);
+    tile, the pool), an ascending diagonal alone, the walls' sum
+    wrapping before it is halved, and a level missing an array;
   - the scan over hand-made objects (broken, not valued, persons, off
-    the lot, type 7, a group, an unread type);
+    the lot, the lot's edge at its size less 2 and less 1, type 7, a
+    group, an unread type, a person and another type without a
+    master);
   - the rating, including no valued objects;
   - the Goths' values (14,660 and 15,277), Furnishings 58 and the
     panel's digest, gated on `SIMS_INSTALL`.

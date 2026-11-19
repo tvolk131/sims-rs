@@ -78,12 +78,16 @@ impl StringTable {
         Ok(Self { format, entries })
     }
     pub fn get(&self, index: usize, language: u8) -> Option<&str> {
+        self.entry(index, language).map(|e| e.text.as_str())
+    }
+    /// The entry [`StringTable::get`] reads its text from: the `index`th
+    /// in `language`, else the `index`th in language 1.
+    pub fn entry(&self, index: usize, language: u8) -> Option<&TextEntry> {
         self.entries
             .iter()
             .filter(|e| e.language == language)
             .nth(index)
             .or_else(|| self.entries.iter().filter(|e| e.language == 1).nth(index))
-            .map(|e| e.text.as_str())
     }
 }
 /// Decode original game text bytes using the selected language's code page.

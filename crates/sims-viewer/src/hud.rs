@@ -37,6 +37,11 @@ pub struct Hud {
     /// when the house panel first shows: the viewer's world does not
     /// change, so once.
     kinds: Option<house::Kinds>,
+    /// Whether the world's floor and wall patterns are the catalogs' keys,
+    /// which the architecture's prices are by. When not, as in the house
+    /// file as saved, the Furnishings rating is left out rather than
+    /// priced by the wrong patterns.
+    pub priced: bool,
     /// The household's member GUIDs, in the neighborhood's order.
     members: Vec<u32>,
     /// What the relationship panel needs from outside the world.
@@ -127,6 +132,7 @@ impl Hud {
             careers,
             house,
             kinds: None,
+            priced: true,
             members,
             known,
             texts,
@@ -175,6 +181,9 @@ impl Hud {
                 kinds
             });
             snapshot = snapshot.with_house(world, &self.house, kinds);
+            if !self.priced {
+                snapshot.house.ratings[house::FURNISHINGS] = None;
+            }
         }
         self.items = hud::layout(view.size, &snapshot, &self.controls);
         hud::fit(&mut self.items, &self.art, &self.texts);

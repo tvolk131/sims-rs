@@ -420,6 +420,10 @@ fn booted(options: &Options) -> Option<sims_sim::World> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = options()?;
     let opened = open_house(&options.install, &options.house)?;
+    // Whether the world's floors and walls are the catalogs' keys, which
+    // the load gives them (load step 5): not so for the house file as
+    // saved, whose patterns keep the house's own numbers.
+    let mut renumbered = true;
     let world = match &options.snapshot {
         // Opening a snapshot store creates it if it is missing, so check
         // first rather than leave an empty file behind a mistyped path.
@@ -431,17 +435,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok_or_else(|| format!("{} holds no world named {name}", path.display()))?,
         // The panel shows what the load's steps 17 and 18 set: the
         // family's funds and its first member selected.
-        None if options.hud => booted(&options).unwrap_or(opened.world),
+        None if options.hud => booted(&options).unwrap_or_else(|| {
+            renumbered = false;
+            opened.world
+        }),
         None => opened.world,
     };
     let lot = Lot::from_world(&world)?;
     let hud = if options.hud {
-        Some(hud::Hud::open(
-            &options.install,
-            &options.house,
-            &opened.assets,
-            &world,
-        )?)
+        let mut hud = hud::Hud::open(&options.install, &options.house, &opened.assets, &world)?;
+        hud.priced = renumbered;
+        Some(hud)
     } else {
         None
     };

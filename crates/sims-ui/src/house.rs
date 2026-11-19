@@ -445,7 +445,10 @@ const BUILTIN_FLOORS: std::ops::RangeInclusive<u16> = 1..=29;
 impl Prices {
     /// Reads the prices from the install's `GameData/Build.iff` and the
     /// pattern catalogs. A missing file or table prices what it would
-    /// have priced at 0.
+    /// have priced at 0. **Not ported:** the lookup (0x47028b) tries a
+    /// resource of type `'CST'` (0x00435354) with the same ID when the
+    /// `STR#` is missing; which chunk tag that matches in a file is not
+    /// read, and the install's files have no such chunk.
     pub fn load(install: &Install, surfaces: &Surfaces) -> Self {
         let tables: BTreeMap<u16, StringTable> = install
             .file("GameData/Build.iff")
@@ -473,12 +476,12 @@ impl Prices {
 
     /// The prices from `Build.iff`'s string tables by ID and the pattern
     /// catalogs. Each entry of a table is three strings, the first its
-    /// price, read as C's `atoi` reads it; the strings are looked up with
+    /// price, read as C's `atoi` reads its bytes; the strings are looked up with
     /// the 1-based accessor (0x4704fa), so entry `n` is string `3n - 3`.
     pub fn from_tables(tables: &BTreeMap<u16, StringTable>, surfaces: &Surfaces) -> Self {
         let price = |table: u16, entry: u16| -> Option<i32> {
             let at = usize::from(entry).checked_sub(1)? * 3;
-            tables.get(&table)?.get(at, US_ENGLISH).map(atoi)
+            Some(atoi(&tables.get(&table)?.entry(at, US_ENGLISH)?.raw_text))
         };
         let styles = PRICED_STYLES
             .iter()
@@ -549,11 +552,13 @@ impl Values {
     ///
     /// - A tile of a multi-tile group that is not its lead, and an object
     ///   of type 7, are passed over.
-    /// - One that stands on the lot (0x432595: its tile, as a signed byte,
-    ///   1 to 62 each way, as `sims-vm` reads it) and is valued adds its
-    ///   value to the objects'. Valued (0x4354d5): not with flag 0x10 in
-    ///   data word 43, and then a person, or any other type whose master's
-    ///   build mode type is 0.
+    /// - One that stands on the lot (0x432595, 0x422632: its tile, as a
+    ///   signed byte, at least 1 and below the lot's size less 1 each way,
+    ///   as `sims-vm` reads it) and is valued adds its value to the
+    ///   objects'. Valued (0x4354d5): not with flag 0x10 in data word 43,
+    ///   and then a person (whatever its master), or any other type whose
+    ///   master's build mode type is 0; a type other than a person without
+    ///   a master is not valued.
     /// - Any other adds its value to the architecture's when its master's
     ///   build mode type is neither 0 nor 4 (0x445190 to 0x445223).
     /// - An object's value (0x43219a) is its data word 41, or for a tile
@@ -570,6 +575,7 @@ impl Values {
             objects: 0,
             architecture: architecture(world, prices),
         };
+        let size = i32::from(world.size);
         for &id in &world.order {
             let Some(object) = world.objects.get(&id) else {
                 continue;
@@ -585,8 +591,8 @@ impl Values {
                 continue;
             }
             let [a, b, _] = World::tile(object.position);
-            let on_lot =
-                (1..FULL - 1).contains(&i32::from(a)) && (1..FULL - 1).contains(&i32::from(b));
+            let inside = |n: i8| n >= 1 && i32::from(n) < size - 1;
+            let on_lot = inside(a) && inside(b);
             let flags = object.data.get(FLAGS).copied().unwrap_or(0);
             let valued = flags & NOT_VALUED == 0 && (ty.kind == PERSON || ty.build == Some(0));
             let value = i32::from(value(world, ty, id));
@@ -677,7 +683,10 @@ const POOL_TILE: u8 = 0x10;
 /// - **Pool:** on level 1, a pool byte below 0x10 adds the pool's price.
 ///
 /// A pattern or style without a price costs 0, as a key the catalog
-/// lacks does (0x4a145d).
+/// lacks does (0x4a145d). A level whose tile flags, floors or walls are
+/// missing (or not the size the lot's arrays are) adds nothing, and a
+/// missing pool array leaves out only the pool's price; the other level
+/// and the rest of level 1 still count.
 pub fn architecture(world: &World, prices: &Prices) -> i32 {
     let size = usize::try_from(world.size)
         .unwrap_or(0)
@@ -762,9 +771,11 @@ pub fn architecture(world: &World, prices: &Prices) -> i32 {
 const WALL_CELL: usize = 14;
 
 /// The Furnishings rating (0x416851): the architecture's value over the
-/// objects', both turned to single precision, through the furnishings
-/// curve, cut toward zero. With objects worth 0 the ratio is 100
-/// (0x66674c).
+/// objects', through the furnishings curve, cut toward zero. The objects'
+/// value is rounded to single precision first (fild, fstp); the
+/// architecture's is loaded whole (fild) and divided by it, and the
+/// quotient rounded to single. With the objects' value 0 after rounding
+/// the ratio is 100 (0x66674c).
 pub fn furnishings(values: Values, curve: &Curve) -> i32 {
     let objects = Ext::from_i32(values.objects).to_f32();
     let ratio = if objects.ext().partial_cmp(&Ext::ZERO) == Some(Ordering::Equal) {
@@ -1070,6 +1081,10 @@ mod tests {
             [0, 1, 2, 30, 31, 248, 400].map(|k| prices.walls.get(&k).copied()),
             [Some(0), Some(6), Some(-4), Some(0), None, Some(0), Some(0)]
         );
+        // The price is read from the string's bytes: a byte order mark
+        // before the digits reads 0.
+        let tables = BTreeMap::from([(POOL_TABLE, entries(&["\u{feff}75"]))]);
+        assert_eq!(Prices::from_tables(&tables, &surfaces).pool, 0);
     }
 
     /// A lot array of the arrays' full size, every byte `fill`.
@@ -1145,9 +1160,89 @@ mod tests {
         assert_eq!(architecture(&World::empty(), &prices), 0);
     }
 
+    /// The arrays' index of tile (a, b).
+    fn cell(a: usize, b: usize) -> usize {
+        a * FULL as usize + b
+    }
+
+    /// Sets a wall cell in array `id`: its segments, then its six words
+    /// (styles west and north, patterns west, north, south and east).
+    fn put_wall(world: &mut World, id: u16, (a, b): (usize, usize), segments: u8, words: [u16; 6]) {
+        let at = cell(a, b) * WALL_CELL;
+        let data = &mut world.arrays.get_mut(&id).unwrap().data[at..at + WALL_CELL];
+        data[0] = segments;
+        for (n, word) in words.iter().enumerate() {
+            data[2 + n * 2..4 + n * 2].copy_from_slice(&word.to_le_bytes());
+        }
+    }
+
+    /// A 4-tile lot with the given arrays, all 0.
+    fn lot(arrays: &[(u16, usize)]) -> World {
+        let mut world = World::empty();
+        world.size = 4;
+        for &(id, stride) in arrays {
+            world.arrays.insert(id, array(stride, 0));
+        }
+        world
+    }
+
+    #[test]
+    fn the_ascending_diagonal_alone_counts_its_first_pattern() {
+        // Level 1 only, and no pool array: the pool alone is left out.
+        let mut world = lot(&[(1, 2), (2, WALL_CELL), (8, 1)]);
+        // An ascending diagonal of style 7 (the north style word), its
+        // first pattern the south word, splitting the floor into floors 1
+        // (the west style word) and 4 (the west pattern word).
+        put_wall(&mut world, 2, (1, 1), 0x20, [1, 7, 4, 0, 3, 9]);
+        let at = cell(1, 1) * 2;
+        world.arrays.get_mut(&1).unwrap().data[at..at + 2].copy_from_slice(&0xffu16.to_le_bytes());
+        let prices = Prices {
+            styles: BTreeMap::from([(7, 10)]),
+            pool: 75,
+            floors: BTreeMap::from([(1, 5), (4, 15)]),
+            walls: BTreeMap::from([(3, 4), (9, 1000)]),
+        };
+        assert_eq!(architecture(&world, &prices), 10 / 2 + 4 + 5 / 2 + 15 / 2);
+    }
+
+    #[test]
+    fn the_walls_sum_wraps_before_it_is_halved() {
+        let mut world = lot(&[(1, 2), (2, WALL_CELL), (8, 1)]);
+        put_wall(&mut world, 2, (1, 1), 0x03, [2, 2, 0, 0, 0, 0]);
+        let prices = Prices {
+            styles: BTreeMap::from([(2, i32::MAX)]),
+            ..Prices::default()
+        };
+        assert_eq!(architecture(&world, &prices), i32::MAX.wrapping_mul(2) / 2);
+        assert_eq!(architecture(&world, &prices), -1);
+    }
+
+    #[test]
+    fn a_level_missing_an_array_counts_nothing_but_the_other_still_counts() {
+        // Level 1 has no floors, so neither its wall nor the pool counts;
+        // level 2 is whole.
+        let mut world = lot(&[
+            (2, WALL_CELL),
+            (8, 1),
+            (9, 1),
+            (101, 2),
+            (102, WALL_CELL),
+            (108, 1),
+        ]);
+        put_wall(&mut world, 2, (1, 1), 0x01, [2, 0, 0, 0, 0, 0]);
+        put_wall(&mut world, 102, (2, 2), 0x01, [2, 0, 0, 0, 0, 0]);
+        let prices = Prices {
+            styles: BTreeMap::from([(2, 30)]),
+            pool: 75,
+            ..Prices::default()
+        };
+        assert_eq!(architecture(&world, &prices), 15);
+    }
+
     #[test]
     fn the_scan_values_the_objects_and_gives_the_rest_to_the_architecture() {
         let mut world = World::empty();
+        world.size = 10;
         let ty = |kind, group, build| Type { kind, group, build };
         let kinds = Kinds {
             types: BTreeMap::from([
@@ -1157,6 +1252,9 @@ mod tests {
                 (13, ty(PERSON, 0, Some(5))),
                 (14, ty(SKIPPED, 0, Some(5))),
                 (15, ty(0, 3, Some(0))),
+                (16, ty(PERSON, 0, None)),
+                (17, ty(0, 0, None)),
+                (18, ty(0, 0, Some(5))),
             ]),
             ..Kinds::default()
         };
@@ -1183,6 +1281,15 @@ mod tests {
         add(10, 15, on_lot, 999);
         // A type not read.
         add(11, 99, on_lot, 500);
+        // Without a master, a person is still valued; any other type is
+        // neither valued nor architecture.
+        add(12, 16, on_lot, 11);
+        add(13, 17, on_lot, 600);
+        // The lot is 10 tiles: tile 8 (its size less 2) is on it, tile 9
+        // (its size less 1) is not, whatever the arrays' size.
+        add(14, 10, [8 * 16, 1 * 16, 1], 1);
+        add(15, 10, [1 * 16, 9 * 16, 1], 700);
+        add(16, 18, [9 * 16, 8 * 16, 1], 2);
         world.objects.get_mut(&2).unwrap().data[BROKEN] = 1;
         world.objects.get_mut(&3).unwrap().data[FLAGS] = NOT_VALUED;
         world.objects.get_mut(&10).unwrap().data[BROKEN] = 1;
@@ -1198,8 +1305,8 @@ mod tests {
         assert_eq!(
             values,
             Values {
-                objects: 100 - 25 + 9 + 40,
-                architecture: 30 + 3,
+                objects: 100 - 25 + 9 + 40 + 11 + 1,
+                architecture: 30 + 3 + 2,
             }
         );
     }
