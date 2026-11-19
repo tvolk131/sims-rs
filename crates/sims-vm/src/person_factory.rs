@@ -24,6 +24,9 @@
 //! 5. The construction reset (0x4598e8 with 1), in [`construction_reset`].
 //! 6. Data word 41 takes the definition's price, and the scheduler's
 //!    ready flag is set (0x4457ef).
+//! 7. The factory announces the new object (signal 0xe2, 0x440ed7), and
+//!    for a person the lot works out again who is a visitor (0x4163f7,
+//!    0x42a2b4; [`Interpreter::visitor_pass`]).
 //!
 //! Ported from the old prototype's `PostConstruction`, `ConstructionReset`,
 //! `InitialReset`, `default_traits` and `attach_person_neighbor`
@@ -61,7 +64,8 @@ mod person {
     /// 0x7ae means: do not attach to the neighborhood record again.
     pub const NO_ATTACH: usize = 25;
     /// 0 for a member of the household that lives on the lot; 1 for a
-    /// visitor; 2 kept as it is on a lot that is not residential.
+    /// visitor; 2 kept as it is by the visitor pass, unless the person is
+    /// a member of the family.
     pub const VISITOR: usize = 32;
 }
 
@@ -83,7 +87,8 @@ fn interests_low(data: &[i16]) -> bool {
 impl Interpreter<'_> {
     /// Makes a person of the type `guid` names and returns its ID. Its
     /// Init has run twice and its first update once when this returns; it
-    /// is off the lot.
+    /// is off the lot, and every person's word 32 has been worked out
+    /// again (the visitor pass, 0x42a2b4).
     ///
     /// These fail: a type that is not a person's; a pet the game does not
     /// allow (step 1); a type with no skeleton or profile in
@@ -186,7 +191,9 @@ impl Interpreter<'_> {
             .iter()
             .find(|f| f.id == family)
             .map(|f| f.members.clone())
-            .ok_or_else(|| Trap::Invalid(format!("global 9 names family {family}, which is gone")))?;
+            .ok_or_else(|| {
+                Trap::Invalid(format!("global 9 names family {family}, which is gone"))
+            })?;
         let lot = world.globals.get(LOT).copied().unwrap_or(0);
         let residential = lot == 0 || self.program.zoning.get(&lot) == Some(&1);
         for id in world.people.clone() {
