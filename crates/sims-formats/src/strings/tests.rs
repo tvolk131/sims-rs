@@ -94,4 +94,9 @@ fn a_resource_is_read_in_its_flags_byte_order() {
     // Version 0 and negative counts are empty.
     assert_eq!(read(b"\x00\x00\x02\x00\x02hi\x03you", LITTLE), 0);
     assert_eq!(read(b"\x00\x80", LITTLE), 0);
+    // So is a version's count of 0x8000 or more, strings or not.
+    let mut big = b"\xff\xff\x00\x80".to_vec();
+    big.extend(std::iter::repeat_n(0, 0x8000));
+    assert_eq!(read(&big, LITTLE), 0);
+    assert_eq!(read(b"\xff\xfe\x00\x80", 0), 0);
 }

@@ -144,6 +144,7 @@ impl Game {
             house,
             &opened.assets,
             lot.world(),
+            lot.surfaces(),
             lot.program().autonomy_constants().friendship_threshold,
         )?;
         let mut people = People::open(&options.install, house)?;

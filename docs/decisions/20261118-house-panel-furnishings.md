@@ -72,7 +72,18 @@ panel was compared.
   without flag 0x10 is big-endian: 0x470351 swaps its leading word, and
   the count when that is -1. The flag is the resource map's when the
   file has one (0x41d3a7, `Iff::resource_flags`). A leading word other
-  than -1, -2 or -3 is the count of length-prefixed strings after it. Each
+  than -1, -2 or -3 is the count of length-prefixed strings after it,
+  and a count of 0 or below, in any layout, is an empty table. The
+  curves' table (`STR#` 505) is read the same way.
+  - **Not ported:** the original files a version -3 table's strings by
+    language, its place starting again at each change of language
+    (0x46ffcc); here they are counted within the language, which is the
+    same when each language's strings are together, as in all 31 such
+    tables of the install's `Build.iff` and pattern files.
+  - **Unverified:** a resource map entry whose flags' high byte differs
+    from its chunk header's. The IFF reader rejects the map then
+    (`sims_formats::iff`, from the frozen prototype), where the original
+    checks only the chunk's type. No file of the install has one. Each
   string-table entry is three strings, and the first is the price, read
   as C's `atoi` reads its bytes (0x636029, `sims_content::atoi`), so a
   byte order mark before the digits reads 0:
@@ -97,6 +108,10 @@ panel was compared.
   - Build mode's catalog, which fills the style table and the pool's
     price, is made on first request (0x4ce31a). The match with the
     capture needs the five style prices, so it was made by update 1.
+- **The catalogs:** the game's and the viewer's panels price the
+  patterns by the catalogs the load built and keyed the lot by
+  (`sims_vm::boot::Lot::surfaces`), not by catalogs built again, so a
+  pattern file added in between cannot shift the keys.
 - **The viewer:** when the house cannot be loaded as the game loads
   it, the viewer shows the house file as saved, whose floors and walls
   keep the house's own pattern numbers, not the catalogs' keys. Its

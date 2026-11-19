@@ -66,6 +66,7 @@ impl Hud {
         house: &Path,
         assets: &Assets,
         world: &sims_sim::World,
+        surfaces: &sims_content::Surfaces,
     ) -> Result<Self, String> {
         let install = Install::detect(install).map_err(|e| e.to_string())?;
         let ui = UiGraphics::open(&install).map_err(|e| e.to_string())?;
@@ -111,12 +112,9 @@ impl Hud {
         let careers = Careers::load(assets.index()).map_err(|e| e.to_string())?;
         let mut house =
             house::Tuning::load(assets.index(), assets.catalog()).map_err(|e| e.to_string())?;
-        // The architecture's prices. Without the pattern catalogs only the
-        // plug-in patterns lose theirs.
-        house.prices = house::Prices::load(
-            &install,
-            &sims_content::Surfaces::build(&install).unwrap_or_default(),
-        );
+        // The architecture's prices, by the pattern catalogs the load
+        // keyed the lot's floors and walls by.
+        house.prices = house::Prices::load(&install, surfaces);
         let known = Acquaintances::read(
             assets.index(),
             assets.catalog(),

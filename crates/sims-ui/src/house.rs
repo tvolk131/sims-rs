@@ -81,7 +81,7 @@ impl Tuning {
         let iff = Iff::parse(global.read().map_err(Error::Content)?).map_err(Error::Format)?;
         let curves = iff
             .get(b"STR#", CURVES)
-            .map(|chunk| StringTable::parse(iff.data(chunk)))
+            .map(|chunk| StringTable::parse_chunk(iff.data(chunk), iff.resource_flags(chunk)))
             .transpose()
             .map_err(Error::Format)?;
         let constants = iff

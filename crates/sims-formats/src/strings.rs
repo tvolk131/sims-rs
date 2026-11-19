@@ -84,14 +84,21 @@ impl StringTable {
     /// - Without flag 0x10 the resource is big-endian and 0x470351 swaps
     ///   its leading word, and, when that is then -1, the count.
     /// - A leading word of -1, -2 or -3 is then that version, with the
-    ///   count after it.
+    ///   count after it, signed: 0 or below is an empty table.
     /// - Any other leading word is the count of length-prefixed strings
     ///   that follow it (0x4700d7); 0 or below is an empty table. (Version
     ///   0, which [`StringTable::parse`] reads with a count after it, is
     ///   not a layout the original knows.)
     ///
-    /// **Not ported:** the original's change of bytes 0xa1 to `o` and 0xd5
-    /// to `'` in length-prefixed strings (0x4700f5).
+    /// **Not ported:**
+    /// - the original's change of bytes 0xa1 to `o` and 0xd5 to `'` in
+    ///   length-prefixed strings (0x4700f5);
+    /// - how it files a version -3 table's strings by language, its place
+    ///   in each language starting again at each change of language
+    ///   (0x46ffcc). [`StringTable::get`] counts within the language,
+    ///   which is the same when each language's strings are together, as
+    ///   in every such table of the Complete Collection's `Build.iff` and
+    ///   pattern files (31).
     pub fn parse_chunk(data: &[u8], flags: u16) -> Result<Self> {
         let Some(&[a, b]) = data.first_chunk::<2>() else {
             return Self::parse(data);
@@ -108,6 +115,14 @@ impl StringTable {
                 normal[..2].copy_from_slice(&word.to_le_bytes());
                 if word == -1 && swapped && normal.len() >= 4 {
                     normal.swap(2, 3);
+                }
+                // The count is signed: 0 or below is an empty table.
+                if let Some(&[a, b]) = normal.get(2..4).and_then(|c| c.first_chunk::<2>())
+                    && i16::from_le_bytes([a, b]) <= 0
+                {
+                    let mut table = Self::parse(&normal[..2])?;
+                    table.entries.clear();
+                    return Ok(table);
                 }
             }
             count if count > 0 => {
