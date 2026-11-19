@@ -224,6 +224,20 @@ impl Canvas {
         self.blit(image, at, false, light, 1, |x, y, _| Some(depth(x, y)));
     }
 
+    /// Draws an image whose pixels each take their depth from `depth`
+    /// (screen column, row, the image's depth byte there), under `light`,
+    /// winning up to one unit farther as [`Canvas::draw_wall`] does: the
+    /// original's blitter for a cut wall's trim (0x49ecbc).
+    pub fn draw_layered(
+        &mut self,
+        image: &Image,
+        at: [i32; 2],
+        light: Light,
+        depth: impl Fn(i32, i32, u8) -> Option<i32>,
+    ) {
+        self.blit(image, at, false, |_, _| light, 1, depth);
+    }
+
     fn blit(
         &mut self,
         image: &Image,
