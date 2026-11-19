@@ -1021,6 +1021,26 @@ fn resetting_an_off_lot_person_refuses_the_pending_refresh_except_for_deletion()
     assert!(!fx.world.animators.contains_key(&PERSON));
 }
 
+/// Tiles 1 and 4 (the six-tile lot's size less 2) are on the lot, so the
+/// reset does not take the off-lot branch (0x45e977) there.
+#[test]
+fn resetting_a_person_on_the_lots_inner_edge_is_not_an_off_lot_reset() {
+    for position in [[72, 56, 1], [24, 24, 1], [56, 72, 1]] {
+        let (mut fx, _) = lot();
+        let people = resident_for_placement_reset(&mut fx);
+        fx.program.people = people.clone();
+        let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        fx.world.objects.get_mut(&PERSON).unwrap().position = position;
+        if let Err(fault) = interpreter.visit(&mut fx.world, PERSON, &people) {
+            assert!(
+                !matches!(&fault.trap, Trap::Unsupported(message) if message.contains("0x45e977")),
+                "{position:?}: {:?}",
+                fault.trap
+            );
+        }
+    }
+}
+
 #[test]
 fn the_step_visits_people_in_their_turn_and_stops_at_a_visit_it_cannot_make() {
     let (mut fx, _) = lot();

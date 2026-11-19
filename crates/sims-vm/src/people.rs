@@ -630,16 +630,18 @@ impl Interpreter<'_> {
         let profile = profile(people, world, guid).map_err(fail)?;
         if capture(world, id).map_err(fail)?.container.is_some() {
             return Err(fail(Trap::Unsupported(
-                "resetting a person inside an object (0x45e8dd) can leave its animator \
-                 refresh (0x58da12) pending beyond the scheduler pass"
+                "resetting a person inside an object (0x45e8dd: take-off, place test and \
+                 searches, with an animator refresh (0x58da12) that can stay pending \
+                 beyond the scheduler pass), which is not ported"
                     .into(),
             )));
         }
         // 0x45e95d to 0x45e971: the deletion mark skips the lot bounds test.
         if !deleting && !stands_on_lot(world, id).map_err(fail)? {
             return Err(fail(Trap::Unsupported(
-                "resetting a person off the lot (0x45e977) can leave its animator \
-                 refresh (0x58da12) pending beyond the scheduler pass"
+                "resetting a person off the lot (0x45e977: take-off, place test, searches \
+                 and put, with an animator refresh (0x58da12) that can stay pending \
+                 beyond the scheduler pass), which is not ported"
                     .into(),
             )));
         }

@@ -1,6 +1,6 @@
 # Reset placement for a person in an object or off the lot waits on the animator
 
-*Decided 2026-11-19.*
+*Decided 2026-11-18.*
 
 The original's call order was read from its code. It is **unverified**
 against a recording. The strict Goth day does not reach these branches.
@@ -22,7 +22,10 @@ restarted and the Reset tree runs.
    returned point is unused on every branch.
 2. Object flag 0x40 skips the rest of placement (0x45e95d). Otherwise
    0x432595 checks whether the person is on the lot using the lot's own
-   bounds. If off the lot, it takes the person off with notification
+   bounds: its place capture (0x4325b5) calls 0x422632 with the lot
+   (0x6e552c), which tests each tile against 1 and the lot's size (+0x10)
+   less 1. `placement::capture`'s own flag still uses the arrays' 64 tiles
+   (`placement::on_lot`); that difference is left for a follow-up. If off the lot, it takes the person off with notification
    (0x45e977). It reads the level again after take-off, normally level 1,
    and tests the centre of tile `(size / 2, size / 2)` (0x45e9e9). On
    refusal it runs the same two searches from that centre (0x45ea1d,
@@ -31,11 +34,15 @@ restarted and the Reset tree runs.
    both searches fail and the point is still the centre (0x45ea43).
    The person's virtual function 0x88 (0x45e4e9) puts it with notification
    and notes the new room, as `Interpreter::put_person` does. Virtual
-   function 0x74 (0x45e519, `Interpreter::refresh_person`) then unsets the
-   animator's position and sets person word 64 from the pool test.
+   function 0x74 (0x45e519, `Interpreter::refresh_person`, called at
+   0x45ea4d) then unsets the animator's position and sets person word 64
+   from the pool test. Only this branch calls it: the deletion mark and an
+   on-lot person jump to 0x45ea52 (0x45e962, 0x45e971), past the call, so
+   the port's on-lot and deletion resets rightly leave it out.
 
-The existing `fits` and `search` cover the placement tests and both
-searches. The search record has an explicit start and level, direction
+The existing `fits` and `search` should cover the placement tests and
+both searches (**unverified**: no test runs them with these parameters).
+The search record has an explicit start and level, direction
 −1, no random start and no ground-flag rule (0x4347d1, 0x45e910,
 0x45e9f0). Both searches allow occupied tiles. `Machine::leave_lot`
 handles only a narrow pre-rooms take-off for ordinary objects already
