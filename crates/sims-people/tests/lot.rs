@@ -622,8 +622,8 @@ fn the_plumb_bob_floats_over_the_selected_persons_head() {
         g.iter().sum::<u32>() / g.len() as u32
     };
     assert!(mean(&|x| x < middle) > mean(&|x| x > middle));
-    // Its pixels name Mortimer.
-    assert!(found.iter().all(|&(x, y)| canvas.id_at(x, y) == Some(21)));
+    // Its pixels name the bob, not Mortimer.
+    assert!(found.iter().all(|&(x, y)| canvas.id_at(x, y) == Some(383)));
     // Out of the slot, no bob.
     let mut without = world.clone();
     without.objects.get_mut(&21).unwrap().slots[2].object = 0;

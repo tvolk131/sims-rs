@@ -55,7 +55,8 @@ not compared one by one.
 - Which bone the slot names (its +0x20); `HEAD` puts the bob where the
   screenshot has it.
 - Rotations other than 0.
-- The bob's pixels name the person who holds it, for a click; what the
-  original does on a click there was not checked.
+- ~~The bob's pixels name the person who holds it, for a click.~~
+  Settled on 2026-11-18: they name the bob
+  (`20261118-plumb-bob-picks-as-itself.md`).
 
 **Not ported.** Modes 2 and 3, the date and star bobs.
