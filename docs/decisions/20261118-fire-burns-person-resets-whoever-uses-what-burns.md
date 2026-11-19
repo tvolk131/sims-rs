@@ -30,14 +30,18 @@ the fire's put). Then its virtual function 0x74 runs. The put is not
 place-tested first, as the original does not test it.
 
 The reset can restart the very thread running the Burn: the person may
-burn itself, or its reset may reset the object that runs the Burn.
-What the original does next on the restarted thread was not seen, so it
-fails loudly. The check is general: if
-any primitive that branches leaves the running object's stack at a
-different depth, tree or node than before it ran, `Machine::step` fails
-as unsupported rather than branching on the new thread. The work the
-primitive did is kept, as with any fault partway through one. The stack
-object is not part of the check, because an expression can set it.
+burn itself, or its reset may reset the object that runs the Burn. What
+the original does next on the restarted thread was not seen, so it fails
+loudly. The check is general: if any primitive that branches leaves the
+running object's stack at a different depth, tree or node than before
+it ran, or restarted it at all, `Machine::step` fails as unsupported
+rather than branching on the new thread. A restart onto the same tree
+and node (a Burn at the start of the person's Main tree) is told apart
+by a count of the object's restarts kept beside its frames
+(`FrameStorage::restarts`). The count is not part of the game's state
+and is not saved, so no hash changes. The work the primitive did is
+kept, as with any fault partway through one. The stack object is not
+part of the check, because an expression can set it.
 
 **A reset of a person already in the middle of one is skipped** (object
 flag 0x800, 0x45e7b2), where it used to fail loudly. On the old run,

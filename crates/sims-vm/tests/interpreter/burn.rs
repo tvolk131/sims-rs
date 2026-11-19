@@ -343,6 +343,56 @@ fn a_person_burning_itself_fails_loudly() {
 }
 
 #[test]
+fn a_person_burning_itself_from_the_start_of_its_main_tree_fails_loudly() {
+    // The Burn is node 0 of the person's only frame, its Main tree: the
+    // reset puts a new frame there at the same tree and node, which the
+    // restart count still tells apart (`Machine::step`).
+    use crate::visits::{PERSON, RESIDENT_MAIN, resident};
+    let mut fx = lot();
+    widget(&mut fx, [3, 3], true);
+    let file = fx.program.libraries.len();
+    let people = resident(&mut fx);
+    fx.program.people = people;
+    // The person's Reset tree notes 6 in the lamp's attribute 5.
+    fx.world
+        .objects
+        .get_mut(&LAMP)
+        .unwrap()
+        .attributes
+        .resize(8, 0);
+    fx.world
+        .animators
+        .insert(PERSON, sims_sim::animator::LOADED);
+    fx.add(
+        file,
+        RESIDENT_MAIN,
+        tree(vec![ins(
+            BURN,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [0, 1, 0, 0, 0, 0, 0, 0],
+        )]),
+    );
+    let sim = fx.world.objects.get_mut(&PERSON).unwrap();
+    sim.data[FLAGS] = 0;
+    sim.data[FLAGS_2] = CATCHES;
+    sim.data[62] = 0;
+    sim.stack[0].stack_object = PERSON as i16;
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let fault = interpreter.step(&mut fx.world, PERSON).unwrap_err();
+    assert!(
+        matches!(&fault.trap, Trap::Unsupported(m) if m.contains(&format!("restarted the thread of object {PERSON}"))),
+        "{fault:?}"
+    );
+    // The reset happened: the new frame is at the start of Main.
+    let sim = &fx.world.objects[&PERSON];
+    assert_eq!(
+        (sim.stack.len(), sim.stack[0].tree, sim.stack[0].node),
+        (1, RESIDENT_MAIN, 0)
+    );
+}
+
+#[test]
 fn a_burned_person_whose_reset_resets_the_burner_fails_loudly() {
     // The person uses a widget on another tile, which runs Burn on it:
     // its reset ends that use and resets the widget (0x45e814), whose

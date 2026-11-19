@@ -326,6 +326,19 @@ impl<'a> Interpreter<'a> {
     }
 }
 
+/// Where an object's thread is, for telling whether a primitive
+/// restarted it ([`Machine::step`]): its depth, its top frame's tree and
+/// node, and how many times it has been restarted
+/// ([`sims_sim::FrameStorage::restarts`]), so that a restart onto the same
+/// tree and node is seen too. The stack object is not part of it: an
+/// expression can set it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ThreadPlace {
+    depth: usize,
+    top: Option<(u16, u16)>,
+    restarts: u32,
+}
+
 /// Runs a tree synchronously for [`Interpreter::call_as`].
 #[allow(clippy::too_many_arguments)]
 fn run(
@@ -854,10 +867,10 @@ impl<'a> Machine<'a, '_> {
         self.sync_frames()?;
         let me = self.me;
         self.me_mut()?.stack.clear();
-        if let Some(storage) = self.world.frame_storage.get_mut(&me) {
-            storage.offsets.clear();
-            storage.unknown.clear();
-        }
+        let storage = self.world.frame_storage.entry(me).or_default();
+        storage.offsets.clear();
+        storage.unknown.clear();
+        storage.restarts = storage.restarts.wrapping_add(1);
         Ok(())
     }
 
@@ -974,7 +987,7 @@ impl<'a> Machine<'a, '_> {
             // object and lets go of it). Its branch would land on the new
             // thread; what the original does then was not seen. The work
             // the primitive did stays, as for any fault partway through.
-            let (tree, node) = place.and_then(|(_, top)| top).unwrap_or_default();
+            let (tree, node) = place.and_then(|place| place.top).unwrap_or_default();
             return Err(Trap::Unsupported(format!(
                 "{} (opcode {}) at tree {tree:#06x} node {node} restarted the thread of object \
                  {}, which runs it, so its branch would land on the new thread",
@@ -992,13 +1005,19 @@ impl<'a> Machine<'a, '_> {
         })
     }
 
-    /// Where the running object's thread is, for telling whether a
-    /// primitive restarted it: its depth and its top frame's tree and
-    /// node. (The stack object is not part of it: an expression can set
-    /// it.)
-    fn thread_place(&self) -> Option<(usize, Option<(u16, u16)>)> {
+    /// Where the running object's thread is ([`ThreadPlace`]). None for
+    /// an object no longer on the lot.
+    fn thread_place(&self) -> Option<ThreadPlace> {
         let stack = &self.world.objects.get(&self.me)?.stack;
-        Some((stack.len(), stack.last().map(|f| (f.tree, f.node))))
+        Some(ThreadPlace {
+            depth: stack.len(),
+            top: stack.last().map(|f| (f.tree, f.node)),
+            restarts: self
+                .world
+                .frame_storage
+                .get(&self.me)
+                .map_or(0, |storage| storage.restarts),
+        })
     }
 
     /// Calls the tree an instruction names (legacy lib.rs:1578).
