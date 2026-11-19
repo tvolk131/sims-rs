@@ -44,10 +44,13 @@ animator was replaced), the watchpoint is moved (a watch_moved event), and
 when it cannot be worked out it waits again (watch_lost). Writes between the
 change and that stop are not seen.
 
---late-watch FROM[-TO],NAME=EXPR[:SIZE] is a watch set only from the entry
-of lot update FROM, and cleared from the entry of update TO + 1 if TO is
-given, so that a watch on a busy address (the random state) costs nothing
-while the load and the other updates run.
+--late-watch FROM[-TO],NAME=EXPR[:SIZE] is a watch set at the end of lot
+update FROM - 1 (at the first stop for FROM 1) and, if TO is given, cleared
+at the end of update TO. It sees every write between the rows of updates
+FROM - 1 and TO in updates.jsonl, which are the writes that change rows FROM
+to TO: a frame drawn between two updates counts with the update after it.
+So a watch on a busy address (the random state) costs nothing while the
+load and the other updates run.
 
 The executable digests that guest/launch.sh verified (share/game-identity.txt)
 are recorded in status.json and as a game_identity event.
@@ -563,7 +566,7 @@ def main():
     ap.add_argument('--watch', action='append', default=[], type=Watch,
                     help='NAME=EXPR[:SIZE]: log every write to these bytes to watch.jsonl (see above)')
     ap.add_argument('--late-watch', action='append', default=[], type=Watch.late,
-                    help='FROM[-TO],NAME=EXPR[:SIZE]: a watch set only for lot updates FROM to TO (see above)')
+                    help='FROM[-TO],NAME=EXPR[:SIZE]: a watch for the writes that change rows FROM to TO (see above)')
     ap.add_argument('--scenario', type=Path, help='run this input scenario (see input.py); needs --guest-dir. '
                     'Logged to input.jsonl')
     ap.add_argument('--window', default=os.environ.get('SIMS_WINDOW', scenario_input.WINDOW),

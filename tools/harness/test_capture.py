@@ -205,9 +205,9 @@ class CaptureTest(unittest.TestCase):
         self.assertEqual(remote.watch_calls, [(0x70088, 4)])
         self.assertEqual(remote.cleared_watches, [(0x70088, 4)])
         armed = self.events(output, 'watch_armed')
-        self.assertEqual([r['update'] for r in armed], [1])  # at the entry of update 2
+        self.assertEqual([r['update'] for r in armed], [1])  # at the end of update 1
         ended = self.events(output, 'watch_ended')
-        self.assertEqual([r['update'] for r in ended], [3])  # at the entry of update 4
+        self.assertEqual([r['update'] for r in ended], [3])  # at the end of update 3
         rows = self.rows(output / 'watch.jsonl')
         self.assertEqual(len(rows), 1)
 
