@@ -390,14 +390,19 @@ def same_action(a, b):
     return all(a.get(k) == b.get(k) for k in ('caller', 'target', 'routine', 'menu', 'args'))
 
 
-def social_of(a, pushed):
+def social_of(a, pushed, before):
     """Whether the running action a is the social interaction the pie menu
     pushed (a "Talk..." submenu entry on another person). The game does not
     run it as pushed: at once it makes an interaction object, and the
     person's running action targets that object, with the other person as
-    its icon (and its own routine and menu)."""
-    return (a.get('caller') == pushed.get('caller') and a.get('icon') == pushed.get('target')
-            and a.get('target') not in (None, 0, pushed.get('target')) and bool(a.get('uid')))
+    its icon (and its own routine and menu). `before` is what was read at
+    the push: whether its target is a person, the running action's uid, and
+    the IDs of the lot's objects; the running action must be a new one, on
+    an object made since."""
+    return bool(before and before['target_person'] and a.get('uid') and a.get('uid') != before['active_uid']
+                and a.get('caller') == pushed.get('caller') and a.get('icon') == pushed.get('target')
+                and a.get('target') not in (None, 0, pushed.get('target'))
+                and a.get('target') not in before['objects'])
 
 
 def check_window(window):
@@ -568,6 +573,7 @@ class Runner:
         #                      ('fresh',), ('push', pushes) or ('drain',)
         self.pushes = []
         self.push_cursor = 0  # pushes before it were matched by an expect-queued
+        self.push_before = {}  # push index -> what was read at it (see social_of)
         self.fresh = False  # self.m was read at this update return (not at a dialog stop)
         self.unchecked = []  # (n, row): commands whose exit code is still to be checked
         self.held = None  # the info of a held press whose release is not yet submitted
@@ -608,6 +614,16 @@ class Runner:
             self.pushes.append(row)  # still a push: a choice that waits on one goes on (a dialog may follow)
             self.write(**row)
             return
+        try:  # what a social's conversion is told from (see social_of)
+            target = m.word(action + 8)
+            self.push_before[len(self.pushes)] = dict(
+                target_person=bool(target) and m.half(m.word(target + 0x118) + 0x12) == 2,
+                active_uid=m.word(person + ACTIVE_ACTION + 60),
+                objects={m.object_id(p) for p in object_slots(m, self.sim)} if self.sim else None)
+            if self.push_before[len(self.pushes)]['objects'] is None:
+                del self.push_before[len(self.pushes)]
+        except Exception:
+            self.push_before.pop(len(self.pushes), None)
         self.pushes.append(row)
         self.write(**row)
 
@@ -1025,21 +1041,21 @@ class Runner:
         hold that action, queued or already running."""
         yield Fresh()
         start = self.update
-        push = None
+        push = before = None
         while True:
             if push is None:
                 for i in range(self.push_cursor, len(self.pushes)):
                     r = self.pushes[i]
                     if r['kind'] == 'queued' and r['person'] == person and (
                             target is None or r['action']['target'] == target):
-                        push, self.push_cursor = r, i + 1
+                        push, before, self.push_cursor = r, self.push_before.get(i), i + 1
                         break
             p = push and find_object(self.m, self.sim, person)
             if p:
                 queue, active = read_queue(self.m, p), self.m.action(p + ACTIVE_ACTION)
                 where = ('active' if same_action(active, push['action']) else
                          'queue' if any(same_action(a, push['action']) for a in queue) else
-                         'social' if social_of(active, push['action']) else None)
+                         'social' if social_of(active, push['action'], before) else None)
                 if where:
                     self.write(kind='taken', person=person, where=where, pushed_update=push['update'],
                                active=active, queue=queue)

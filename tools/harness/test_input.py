@@ -748,29 +748,47 @@ class ReviewFindingsTest(RunnerBase):
         # From goth-talk-order-20261118: Talk... > About Interests on Bella (18).
         pushed = dict(uid=0, caller=21, target=18, icon=18, menu=24, args=[0, 0, 0, 0], routine=8273)
         running = dict(uid=2, caller=21, target=260, icon=18, menu=21, args=[0, 0, 0, 0], routine=4235)
-        self.assertTrue(inp.social_of(running, pushed))
-        self.assertFalse(inp.social_of(dict(running, icon=132), pushed))
-        self.assertFalse(inp.social_of(dict(running, caller=18), pushed))
-        self.assertFalse(inp.social_of(dict(running, uid=0), pushed))
-        self.assertFalse(inp.social_of(dict(running, target=18), pushed))
+        before = dict(target_person=True, active_uid=1, objects={18, 21, 132})
+        self.assertTrue(inp.social_of(running, pushed, before))
+        for case in (dict(icon=132), dict(caller=18), dict(uid=0), dict(target=18),
+                     dict(uid=1),  # the action running at the push
+                     dict(target=132)):  # an object there at the push
+            self.assertFalse(inp.social_of(dict(running, **case), pushed, before), case)
+        self.assertFalse(inp.social_of(running, pushed, dict(before, target_person=False)))  # not a social
+        self.assertFalse(inp.social_of(running, pushed, None))  # nothing read at the push
 
-    def test_expect_queued_finds_a_social(self):
+    def social_push(self, r):
+        """Choose Joke on Bella (18); returns Bella once the choice is pushed."""
         g = self.g
-        g.open_pie(['Joke'], target=self.bench, caller=self.person)
+        bella = g.add_object(18, [0x1b8, 0x198], person=True)
+        g.open_pie(['Joke'], target=bella, caller=self.person)
         g.highlight(0)
-        r = self.runner('choose Joke\nexpect-queued 21 173 within 10')
         self.tick_until(r, lambda: 'mousedown' in self.last_command())
         action = g.m.alloc(0x44)
-        g.m.put_words(action + 4, self.person, self.bench)
+        g.m.put_words(action + 4, self.person, bella)
         r.on_queue_push(self.update + 1, False, g.m, dict(edi=self.person, esi=action))
         g.close_pie()
-        thing = g.add_object(260, [0, 0])
-        a = self.person + inp.ACTIVE_ACTION
-        g.m.put_words(a + 4, self.person, thing, self.bench)  # caller, target, icon
-        g.m.put_words(a + 60, 2)  # the uid the queue gave it
+        return bella
+
+    def run_as(self, target, icon, uid):
+        self.g.m.put_words(self.person + inp.ACTIVE_ACTION + 4, self.person, target, icon)
+        self.g.m.put_words(self.person + inp.ACTIVE_ACTION + 60, uid)
+
+    def test_expect_queued_finds_a_social(self):
+        r = self.runner('choose Joke\nexpect-queued 21 18 within 10')
+        bella = self.social_push(r)
+        self.run_as(self.g.add_object(260, [0, 0]), bella, 2)
         self.tick_until(r, lambda: r.finished)
         self.assertIsNone(r.failed, r.failed)
         self.assertEqual(self.rows('taken')[0]['where'], 'social')
+
+    def test_a_social_running_before_the_push_is_not_taken(self):
+        thing = self.g.add_object(260, [0, 0])
+        r = self.runner('choose Joke\nexpect-queued 21 18 within 10')
+        bella = self.social_push(r)  # the push is dropped; the talk from before goes on
+        self.run_as(thing, bella, 5)  # a new action, on an object there at the push
+        self.tick_until(r, lambda: r.finished)
+        self.assertIn('neither', r.failed)
 
     def test_the_held_action_must_have_the_pushed_arguments(self):
         a = dict(caller=21, target=173, routine=8213, menu=0, args=[2, 0, 0, 0])
