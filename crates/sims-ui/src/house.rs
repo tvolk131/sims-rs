@@ -101,8 +101,11 @@ impl Tuning {
     /// (0x4703ad), each read as it is. **Unverified:** the points are read by
     /// `sims_sim::motives::Curve::parse`, which the motives' curves share;
     /// where text is not well formed (a point such as `(100;90 coins)`)
-    /// it drops a point that the original's scanner (0x4614a2) reads.
-    /// The install's curves are well formed. The original looks names
+    /// it drops a point that the original's scanner (0x4614a2) reads,
+    /// and it takes the reciprocal of the points' span whole, where the
+    /// original rounds the span to single precision first (0x4eedf5,
+    /// 0x46140a to 0x461416), which can differ for a wide span.
+    /// The install's curves are well formed and narrow. The original looks names
     /// up ignoring the case of A to Z (0x4131f4) and takes the default
     /// for a missing one (0x413271).
     pub fn from_tables(curves: Option<&StringTable>, constants: Option<&Constants>) -> Self {

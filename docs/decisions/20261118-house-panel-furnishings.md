@@ -24,8 +24,11 @@ No screenshot of the panel was compared.
   points are read by the motives' curve parser
   (`sims_sim::motives::Curve::parse`), which drops a point that is not
   well formed (`(100;90 coins)`) where the original's scanner (0x4614a2)
-  reads it. That parser is shared with the motives, so a fix belongs to
-  the simulation; the install's curves are well formed. The objects'
+  reads it, and takes the reciprocal of the points' span whole where
+  the original rounds the span to single precision first (0x4eedf5,
+  0x46140a to 0x461416), which can differ for a wide span. That parser
+  is shared with the motives, so a fix belongs to the simulation; the
+  install's curves are well formed and narrow. The objects'
   value is rounded to single precision first; the architecture's is loaded whole and divided by it, and the
   quotient is rounded to single. With the objects' value 0 the ratio is
   100 (0x66674c), not a division.
@@ -120,9 +123,10 @@ No screenshot of the panel was compared.
     and looks resources up as if there were none (`sims_formats::iff`,
     from the frozen prototype; `resource_order` reports the error),
     where the original finds the resource by the map's ID (0x41bbfb)
-    and compares only the chunk's type (0x41d33e). A price under such
-    an entry is then found only when the chunk's own ID and flags give
-    the same key. No file of the install has one: its 3,583 mapped
+    and compares only the chunk's type (0x41d33e). A price table under
+    such an entry is then found by its chunk header's ID, as the lookup
+    by ID alone ignores the flags' high byte, so it is missed only when
+    that ID differs from the map's. No file of the install has one: its 3,583 mapped
     files, FAR members and family files included, list 163,797 entries,
     each with its chunk's type, ID and flags' high byte.
 - **The prices by table:**
@@ -144,9 +148,15 @@ No screenshot of the panel was compared.
     alone, whatever their flags' high byte, as the original's string
     loader does (0x415dd6, 0x4cd45f, through 0x46ff01 and 0x41bbfb):
     of tables sharing an ID, the last in resource order, as its table
-    puts each at the head of its bucket (0x41de8f, 0x41de94;
-    `Iff::get_by_id`). **Unverified:** that tables sharing an ID share
-    a bucket.
+    hashes the ID sign-extended (0x41de42 to 0x41de4e), so they share a
+    bucket, puts each at the head of its bucket (0x41de8f, 0x41de94)
+    and its lookup walks the whole table (0x5807c2, 0x41ddef;
+    `Iff::get_by_id`). **Not ported:** past 192 resources the table
+    grows to 389 buckets and its rehash reverses each chain (0x41df8d
+    to 0x41dfb9), so there the first of tables sharing an ID can win.
+    No `STR#` of the install shares an ID with another of its file
+    (3,782 files, FAR members included; 151 have more than 192
+    resources).
   - The built-in floors, keys 1 to 29: `STR#` 130 (0x4a01cb).
   - The built-in wall patterns, keys 0 to 30 and 248 to 255: `STR#` 131
     (0x4c4ee5). Key 0 and the high keys have no entry and cost 0.

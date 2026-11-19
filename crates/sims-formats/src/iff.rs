@@ -243,11 +243,16 @@ impl Iff {
     }
     /// The resource of type `tag` with ID `id` whatever its flags' high
     /// byte, as the original's lookup by ID finds one (0x41bbfb to
-    /// 0x41bc02): it compares the ID alone, in a table that put each
-    /// resource at the head of its bucket as it was built (0x41de8f,
-    /// 0x41de94), so of resources sharing an ID the last in resource
-    /// order. **Unverified:** that resources sharing an ID share a
-    /// bucket, which this assumes.
+    /// 0x41bc02): it compares the ID alone, walking the whole table
+    /// (0x5807c2, 0x41ddef), in a table that hashed the ID sign-extended
+    /// (0x41de42 to 0x41de4e), so resources sharing an ID share a
+    /// bucket, and put each at the head of its bucket as it was built
+    /// (0x41de8f, 0x41de94): of resources sharing an ID, the last in
+    /// resource order. **Not ported:** the table grows from 193 to 389
+    /// buckets past 192 resources, and its rehash prepends each old
+    /// chain's nodes in turn (0x41df8d to 0x41dfb9), reversing them, so
+    /// there the first of resources sharing an ID can win. No `STR#` of
+    /// the install shares an ID with another of its file.
     pub fn get_by_id(&self, tag: &[u8; 4], id: u16) -> Option<&Chunk> {
         self.resources
             .order
