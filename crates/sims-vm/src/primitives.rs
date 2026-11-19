@@ -28,6 +28,7 @@ mod in_way;
 mod interacting;
 mod inventory;
 mod look_towards;
+mod make_character;
 mod motive_change;
 mod named_tree;
 mod notify;
@@ -143,6 +144,7 @@ impl Machine<'_, '_> {
             16 => self.find_location(operands)?.into(),
             17 => self.idle_for_input(operands)?,
             18 => self.remove(operands)?,
+            19 => self.make_new_character(operands)?.into(),
             20 => self.run_functional_tree(operands)?,
             21 => self.show_string().into(),
             22 => self.look_towards(operands)?,

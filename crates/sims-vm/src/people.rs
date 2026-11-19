@@ -18,8 +18,10 @@ use crate::fault::{Fault, Trap};
 use crate::interpreter::Interpreter;
 use crate::object_uses::no_action;
 use crate::placement::capture;
-use sims_content::{People, Profile};
+use sims_content::{People, Profile, Skeleton};
 use sims_sim::World;
+use sims_sim::characters;
+use std::borrow::Cow;
 
 /// The callback table's entries a person's reset asks.
 const RESET: usize = 3;
@@ -134,6 +136,71 @@ pub fn reload_profile(data: &mut [i16], profile: &Profile) -> Result<(), Trap> {
     Ok(())
 }
 
+/// The profile a person type's reset reads (0x5888d3). A type made while
+/// the game ran ([`sims_sim::characters`]) reads its template's, with the
+/// gender, age and skin tone strings Make New Character wrote. A type
+/// with no profile in `people` fails.
+pub(crate) fn profile<'p>(
+    people: &'p People,
+    world: &World,
+    guid: u32,
+) -> Result<Cow<'p, Profile>, Trap> {
+    let made = world.characters.made.get(&guid);
+    let template = made.map_or(guid, |made| made.template);
+    let profile = people.profiles.get(&template).ok_or_else(|| {
+        Trap::Unsupported(format!(
+            "no profile was supplied for the person type 0x{guid:08X}"
+        ))
+    })?;
+    let Some(made) = made else {
+        return Ok(Cow::Borrowed(profile));
+    };
+    let mut profile = profile.clone();
+    for (index, string) in [
+        (characters::GENDER, &mut profile.gender),
+        (characters::AGE, &mut profile.age),
+        (characters::SKIN, &mut profile.skin),
+    ] {
+        if let Some(written) = made.strings.get(&index) {
+            *string = Some(written.clone());
+        }
+    }
+    Ok(Cow::Owned(profile))
+}
+
+/// A person type's skeleton: the one its body string 0 names. A type made
+/// while the game ran names the skeleton Make New Character wrote, or its
+/// template's; a skeleton named so is the one any person type of that
+/// name resolved to, as the name alone chooses the file. A type with no
+/// skeleton in `people` fails.
+pub(crate) fn skeleton<'p>(
+    people: &'p People,
+    world: &World,
+    guid: u32,
+) -> Result<&'p Skeleton, Trap> {
+    let made = world.characters.made.get(&guid);
+    let template = made.map_or(guid, |made| made.template);
+    let none = || {
+        Trap::Unsupported(format!(
+            "no skeleton was supplied for the person type 0x{guid:08X}"
+        ))
+    };
+    let skeleton = people.skeletons.get(&template).ok_or_else(none)?;
+    match made.and_then(|made| made.strings.get(&characters::SKELETON)) {
+        Some(name) if !name.eq_ignore_ascii_case(&skeleton.name) => people
+            .skeletons
+            .values()
+            .find(|s| s.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| {
+                Trap::Unsupported(format!(
+                    "no person type's skeleton is named {name:?}, which the made person type \
+                         0x{guid:08X} names"
+                ))
+            }),
+        _ => Ok(skeleton),
+    }
+}
+
 /// Reads person `id`'s appearance again if its animator says it is to be
 /// read (`stale`, animator byte +0xd8), as looking up a clip does
 /// (0x5893b3, 0x592625): the flag is cleared and the appearance read from
@@ -150,23 +217,22 @@ pub(crate) fn read_appearance_if_stale(
     if !*stale {
         return Ok(());
     }
-    let object = world
+    let guid = world
+        .objects
+        .get(&id)
+        .ok_or(Trap::native(10, "missing object"))?
+        .guid;
+    // Looked up before the person is borrowed; a missing profile still
+    // fails after the person check.
+    let profile = profile(&program.people, world, guid);
+    let person = world
         .objects
         .get_mut(&id)
-        .ok_or(Trap::native(10, "missing object"))?;
-    let guid = object.guid;
-    let person = object
-        .person
-        .as_mut()
+        .and_then(|object| object.person.as_mut())
         .ok_or(Trap::native(0x1c, "object is not a person"))?;
-    let profile = program.people.profiles.get(&guid).ok_or_else(|| {
-        Trap::Unsupported(format!(
-            "no profile was supplied for the person type 0x{guid:08X}, whose appearance is to \
-             be read again"
-        ))
-    })?;
+    let profile = profile?;
     *stale = false;
-    reload_profile(&mut person.data, profile)
+    reload_profile(&mut person.data, &profile)
 }
 
 /// Which string table holds a person's motive curves (0x459d23), as
@@ -561,11 +627,7 @@ impl Interpreter<'_> {
         if person.data.get(73).is_none_or(|&word| word != 0) {
             return Err(unsupported("whose data word 73 is set"));
         }
-        let profile = people.profiles.get(&guid).ok_or_else(|| {
-            fail(Trap::Unsupported(format!(
-                "no profile was supplied for the person type 0x{guid:08X}"
-            )))
-        })?;
+        let profile = profile(people, world, guid).map_err(fail)?;
         let place = capture(world, id).map_err(fail)?;
         if place.container.is_some() {
             return Err(unsupported("that is inside an object (0x45e8dd)"));
@@ -591,7 +653,7 @@ impl Interpreter<'_> {
             .get_mut(&id)
             .and_then(|o| o.person.as_mut())
             .ok_or_else(|| fail(Trap::native(10, "missing object")))?;
-        reload_profile(&mut person.data, profile).map_err(fail)?;
+        reload_profile(&mut person.data, &profile).map_err(fail)?;
         // 0x45e8aa: the route contexts are erased (0x45fad7).
         if let Some(route) = world.routing.routes.get_mut(&id) {
             route.contexts.clear();

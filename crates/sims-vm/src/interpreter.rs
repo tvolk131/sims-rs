@@ -13,6 +13,7 @@ use crate::sounds::SoundEvent;
 use sims_content::Catalog;
 use sims_formats::behavior::{Behavior, Instruction};
 use sims_formats::saved_objects::Frame;
+use sims_sim::characters;
 use sims_sim::{Object, World};
 use std::cell::RefCell;
 
@@ -358,6 +359,17 @@ fn run(
     Err(machine.fault(Trap::BudgetExhausted { budget }))
 }
 
+/// The catalog's object a GUID is looked up as: for a person type made
+/// while the game ran (Make New Character, [`sims_sim::characters`]), its
+/// template's, as the made type's file is a copy of the template's.
+pub(crate) fn object_definition<'a>(
+    catalog: &'a Catalog,
+    world: &World,
+    guid: u32,
+) -> Option<&'a sims_content::Object> {
+    catalog.object(world.characters.definition(guid))
+}
+
 /// One object's view of the world while its thread runs. "Me" is the object
 /// whose stack runs; the frame at the top of that stack is the context for
 /// operand resolution.
@@ -494,9 +506,24 @@ impl<'a> Machine<'a, '_> {
     }
 
     pub fn definition(&self, guid: u32) -> Result<&'a sims_content::Object, Trap> {
-        self.catalog
-            .object(guid)
+        crate::interpreter::object_definition(self.catalog, self.world, guid)
             .ok_or_else(|| Trap::Invalid(format!("no definition for GUID 0x{guid:08X}")))
+    }
+
+    /// Word `index` of the object definition a GUID resolves to, as a
+    /// tree reads it. A made person type's words are its template's
+    /// ([`object_definition`]) but for the GUID words: its own GUID, and
+    /// its template's as the GUID it was copied from (0x4725d5).
+    pub fn definition_word(&self, guid: u32, index: usize) -> Result<i16, Trap> {
+        let mut words = *self.definition_words(guid)?;
+        if let Some(made) = self.world.characters.made.get(&guid) {
+            characters::put_guid(&mut words, characters::GUID_WORDS, guid);
+            characters::put_guid(&mut words, characters::ORIGINAL_GUID_WORDS, made.template);
+        }
+        words
+            .get(index)
+            .copied()
+            .ok_or_else(|| Trap::Invalid(format!("definition word {index} out of range")))
     }
 
     /// The words of the object definition a GUID resolves to.

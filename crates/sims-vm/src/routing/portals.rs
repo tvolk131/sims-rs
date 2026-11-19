@@ -154,7 +154,9 @@ impl Interpreter<'_> {
         world
             .objects
             .get(&id)
-            .and_then(|object| self.catalog.object(object.guid))
+            .and_then(|object| {
+                crate::interpreter::object_definition(self.catalog, world, object.guid)
+            })
             .and_then(|definition| {
                 self.program
                     .libraries
@@ -472,6 +474,8 @@ mod tests {
             animations: Default::default(),
             people: Default::default(),
             icon_frames: None,
+            wardrobe: None,
+            character_files: Default::default(),
             expansions: 0,
             characters: Default::default(),
         }
