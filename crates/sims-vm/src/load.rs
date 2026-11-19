@@ -206,10 +206,9 @@ impl Interpreter<'_> {
                 .objects
                 .get(&id)
                 .ok_or_else(|| fail(id, Trap::native(10, "missing object")))?;
-            let definition = self
-                .catalog
-                .object(object.guid)
-                .ok_or_else(|| fail(id, Trap::Invalid("object has no definition".into())))?;
+            let definition =
+                crate::interpreter::object_definition(self.catalog, world, object.guid)
+                    .ok_or_else(|| fail(id, Trap::Invalid("object has no definition".into())))?;
             let tree = self.program.callback(definition, Callback::RoomsChanged);
             let exists =
                 tree != 0 && !matches!(self.program.tree(definition.resource, tree), Tree::Missing);
@@ -381,12 +380,14 @@ impl Interpreter<'_> {
             let Some(object) = world.objects.get(&id) else {
                 continue;
             };
-            let definition = self.catalog.object(object.guid).ok_or_else(|| {
-                fail(Trap::Invalid(format!(
-                    "object {id} has no definition for GUID 0x{:08X}",
-                    object.guid
-                )))
-            })?;
+            let definition =
+                crate::interpreter::object_definition(self.catalog, world, object.guid)
+                    .ok_or_else(|| {
+                        fail(Trap::Invalid(format!(
+                            "object {id} has no definition for GUID 0x{:08X}",
+                            object.guid
+                        )))
+                    })?;
             if words(definition)?[GLOBAL_WORD] != 0 {
                 existing.push((id, object.guid, (definition.resource, definition.chunk)));
             }

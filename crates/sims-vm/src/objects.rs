@@ -480,7 +480,14 @@ fn construct_person(
     draws: &mut Draws<'_>,
     files: &mut BTreeSet<String>,
 ) -> Result<(), Trap> {
-    build_skeleton(guid, people, draws, files)?;
+    // The house's people are of the types the catalog registered, never
+    // of one made while the game ran.
+    let skeleton = people.skeletons.get(&guid).ok_or_else(|| {
+        Trap::Unsupported(format!(
+            "no skeleton was supplied for the person type 0x{guid:08X}"
+        ))
+    })?;
+    build_skeleton(skeleton, draws, files)?;
     // The first record of the person's type, in slot order.
     let record = neighbors.first_of(guid).ok_or_else(|| {
         Trap::Unsupported(format!(
@@ -514,16 +521,10 @@ fn construct_person(
 /// the person's own copy is built (0x598da3). A person type with no
 /// skeleton in `people` fails.
 pub(crate) fn build_skeleton(
-    guid: u32,
-    people: &People,
+    skeleton: &Skeleton,
     draws: &mut Draws<'_>,
     files: &mut BTreeSet<String>,
 ) -> Result<(), Trap> {
-    let skeleton: &Skeleton = people.skeletons.get(&guid).ok_or_else(|| {
-        Trap::Unsupported(format!(
-            "no skeleton was supplied for the person type 0x{guid:08X}"
-        ))
-    })?;
     let own = skeleton.scales.get(skeleton.place).ok_or_else(|| {
         Trap::Invalid(format!(
             "the skeleton {:?} is not in its file",

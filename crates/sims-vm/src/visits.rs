@@ -114,9 +114,7 @@ impl Interpreter<'_> {
             .objects
             .get(&id)
             .ok_or_else(|| fail(Trap::native(10, "missing object")))?;
-        let definition = self
-            .catalog
-            .object(object.guid)
+        let definition = crate::interpreter::object_definition(self.catalog, world, object.guid)
             .ok_or_else(|| fail(Trap::Invalid("object has no definition".into())))?;
         let tree = self
             .program

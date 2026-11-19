@@ -181,7 +181,7 @@ impl Machine<'_, '_> {
         } else {
             guid
         };
-        if self.catalog.object(guid).is_none() {
+        if crate::interpreter::object_definition(self.catalog, self.world, guid).is_none() {
             return Ok(false);
         }
         match mode {
