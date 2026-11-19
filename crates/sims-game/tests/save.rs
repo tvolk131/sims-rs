@@ -6,6 +6,7 @@ use sims_game::pace;
 use sims_game::view::Move;
 use sims_game::{Game, Options};
 use sims_ui::command::Speed;
+use sims_vm::boot::Frames;
 use std::path::PathBuf;
 
 fn install() -> Option<PathBuf> {
@@ -24,6 +25,7 @@ fn options(install: PathBuf) -> Options {
         install,
         answers: vec![3],
         play: false,
+        frames: Frames::default(),
     }
 }
 

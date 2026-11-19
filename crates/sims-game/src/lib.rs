@@ -34,3 +34,4 @@ pub mod sound;
 pub mod view;
 
 pub use game::{Game, Options, Outcome};
+pub use sims_vm::boot::Frames;

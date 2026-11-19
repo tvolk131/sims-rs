@@ -71,6 +71,7 @@ pub use animator::snap_to_path;
 pub use error::Error;
 pub use factory::TURN_BUDGET;
 pub use fault::{Fault, Location, Trap};
+pub use frame::PanelMode;
 pub use interpreter::{Asked, Interpreter, MAX_STACK, Status, Stream};
 pub use load::{INDICATORS, Reconciled, Roomed};
 pub use memory::scope_name;

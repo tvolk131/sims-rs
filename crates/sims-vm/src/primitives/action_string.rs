@@ -63,9 +63,10 @@ use crate::fault::Trap;
 use crate::interpreter::Machine;
 use crate::orders::MenuEntry;
 
-/// The running action's flag 0x41f1ae sets when it names the action
-/// (+0x40, 0x41f1bd).
-const NAMED: u32 = 0x80;
+/// The action flag 0x41f1ae sets when it names the action (+0x40,
+/// 0x41f1bd), and that working the name out clears (0x41f167, at
+/// 0x41f1a4).
+pub(crate) const NAMED: u32 = 0x80;
 
 impl Machine<'_, '_> {
     pub(crate) fn action_string(&mut self, operands: &[u8; 8]) -> Result<bool, Trap> {
