@@ -674,7 +674,10 @@ fn import_lot(iff: &Iff, house: u32, mut pairs: Vec<(u32, u32)>) -> Result<Impor
         .map_err(|error| Error::format("family import: 0x43a516 objt #0", error))?;
     if let Some(table) = iff.get(b"Gtab", 1) {
         let bytes = iff.data(table);
-        if bytes.get(..12) != Some(b"\0\0\0\0\x01\0\0\0batG") {
+        // The version word is not checked: the import writes 0
+        // (0x4157b6 passes it to 0x415835), as in the first
+        // neighborhood's Old Town houses.
+        if bytes.get(8..12) != Some(b"batG") {
             return Err(unsupported("0x41578e", "unrecognized Gtab #1 header"));
         }
         let count = bytes
@@ -727,7 +730,8 @@ fn import_lot(iff: &Iff, house: u32, mut pairs: Vec<(u32, u32)>) -> Result<Impor
             });
         }
     }
-    let mut table = b"\0\0\0\0\x01\0\0\0batG".to_vec();
+    // Version 0 (0x4157b6), as the shipped Old Town houses' tables have.
+    let mut table = b"\0\0\0\0\0\0\0\0batG".to_vec();
     table.extend((pairs.len() as u32).to_le_bytes());
     for (old, new) in pairs {
         table.extend(old.to_le_bytes());

@@ -116,7 +116,7 @@ fn synthetic_file() -> FamilyFile {
         words(&mut types, &[73]);
     }
     chunk(&mut iff, b"objt", 0, &types);
-    let mut gtab = saved_header(b"batG", 1);
+    let mut gtab = saved_header(b"batG", 0);
     words(&mut gtab, &[1, OLD_DOG, DOG]);
     chunk(&mut iff, b"Gtab", 1, &gtab);
     chunk(&mut iff, b"ObjM", 1, b"lot payload");
@@ -254,7 +254,7 @@ fn clones_members_in_export_order_and_translates_their_links() {
     assert_eq!(lot.chunks[b"ObjM"][0].data, b"lot payload");
     let gtab = &lot.chunks[b"Gtab"][0];
     assert_eq!(gtab.id, 1);
-    let mut expected = saved_header(b"batG", 1);
+    let mut expected = saved_header(b"batG", 0);
     words(
         &mut expected,
         &[3, OLD_DOG, DOG, DOG, MADE_DOG, PERSON, MADE_PERSON],
