@@ -224,6 +224,30 @@ fn an_object_on_the_lot_leaves_it_through_the_placement() {
 }
 
 #[test]
+fn an_object_on_the_lot_removed_at_once_leaves_through_the_placement() {
+    // 0x44123f: once the lot's rooms are worked out, an object of one
+    // tile that is not a person leaves by its virtual function 0x50 with
+    // 1, the lot's placement (0x433125), and is then deleted. The narrow
+    // way the load was compared through would refuse an object on the
+    // lot.
+    let (mut fx, _) = crate::find_location::placeable();
+    fx.lamp_mut().position = [40, 40, 1];
+    let id = crate::find_location::widget(&mut fx);
+    assert_eq!(
+        crate::find_location::find(&mut fx, LAMP as i16, id, 1),
+        Ok(true)
+    );
+    let placed = fx.world.objects[&id].position;
+    let tile = ((placed[0] >> 4) as usize, (placed[1] >> 4) as usize);
+    assert_eq!(on_grid(&fx, tile), id as i16);
+    let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    assert_eq!(interpreter.remove_now(&mut fx.world, id), Ok(()));
+    assert!(!fx.world.objects.contains_key(&id));
+    assert!(!fx.world.order.contains(&id));
+    assert_eq!(on_grid(&fx, tile), 0);
+}
+
+#[test]
 fn a_fault_in_the_removed_objects_callback_keeps_where_it_happened() {
     let (mut fx, file) = crate::find_location::placeable();
     fx.lamp_mut().position = [40, 40, 1];

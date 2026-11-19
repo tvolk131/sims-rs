@@ -35,6 +35,9 @@
 //! (0x440f37). Anything else fails with an error that says what is
 //! missing.
 
+use std::cell::RefCell;
+use std::collections::BTreeSet;
+
 use crate::fault::{Fault, Trap};
 use crate::interpreter::{Interpreter, Machine};
 use crate::sounds::SoundEvent;
@@ -154,8 +157,11 @@ impl Interpreter<'_> {
     /// Removes an object at once (0x44123f): it leaves the lot (its
     /// virtual function 0x50 with 1, 0x4412a4) and is then deleted.
     ///
-    /// An object of one tile that is not a person leaves the narrow way
-    /// of [`Machine::leave_lot`], which the load was compared through. A
+    /// An object of one tile that is not a person leaves through the
+    /// lot's placement (0x433125, [`Interpreter::take_off`]) once the load
+    /// has worked the lot's rooms out, and before that the narrow way of
+    /// [`Machine::leave_lot`], which the load was compared through
+    /// ([`Interpreter::leave_lot_to_delete`]). A
     /// tile of a group takes its whole group off through the lot's
     /// placement (its vtable 0x666c20's function 0x50, 0x422d86,
     /// [`Interpreter::take_off`]), which also needs the rooms worked out.
@@ -207,10 +213,38 @@ impl Interpreter<'_> {
             }
             self.take_off(world, id, true)?;
         } else {
-            let mut machine = self.machine(world, id, 0, false);
-            machine.leave_lot(id).map_err(fail)?;
+            self.leave_lot_to_delete(world, id)?;
         }
         self.delete(world, id)
+    }
+
+    /// An object of one tile that is not a person leaves the lot on its
+    /// way to deletion: its virtual function 0x50 with 1, which for an
+    /// ordinary object is 0x433125, the lot's placement
+    /// ([`Interpreter::take_off`]). That asks it function 10, moves it and
+    /// what it holds off the lot, and asks whatever held it function 9.
+    ///
+    /// Before the load has worked the lot's rooms out (its clear, load
+    /// step 5), the placement cannot find the off-lot place's room, so
+    /// the object goes the narrow way of [`Machine::leave_lot`], which
+    /// the load was compared through and which fails loudly for anything
+    /// but an object already off the lot that holds nothing and runs no
+    /// callback for leaving.
+    pub(crate) fn leave_lot_to_delete(&self, world: &mut World, id: u16) -> Result<(), Fault> {
+        if matches!(
+            world.room_at([OFF_LOT, OFF_LOT, 1]),
+            Err(RoomError::NoRooms)
+        ) {
+            return self
+                .machine(world, id, 0, false)
+                .leave_lot(id)
+                .map_err(|trap| Fault {
+                    object: id,
+                    at: None,
+                    trap,
+                });
+        }
+        self.take_off(world, id, true)
     }
 
     /// Deletes an object that is off the lot (0x440eeb):
@@ -270,10 +304,23 @@ impl Interpreter<'_> {
     /// interface hooks (0x4481eb, which changes nothing for a person or
     /// any object but an indicator or a star marker, and the list at
     /// registry +0x30, 0x464fa2), the interface object of GUID 0x3EEC206C
-    /// (registry +0x80), and the release of its indicator. The original
-    /// also sets the object's deletion mark (object flag 0x40), which only
-    /// a person's reset reads.
+    /// (registry +0x80), and the release of its indicator.
+    ///
+    /// Before people let go of it, the object gets its deletion mark
+    /// (object flag 0x40, 0x441039; [`Interpreter::deleting`]), which it
+    /// keeps until it is freed: a reset of it meanwhile, such as one a
+    /// person's reset makes as it ends its use of the object, is the
+    /// reset of an object being deleted. A group's lead marks every tile
+    /// before any is deleted (0x440fbc).
     pub fn delete(&self, world: &mut World, id: u16) -> Result<(), Fault> {
+        let Some(marks) = self.deleting else {
+            let marks = RefCell::new(BTreeSet::new());
+            let outer = Interpreter {
+                deleting: Some(&marks),
+                ..*self
+            };
+            return outer.delete(world, id);
+        };
         let fail = |trap| Fault {
             object: id,
             at: None,
@@ -300,12 +347,22 @@ impl Interpreter<'_> {
             }
             return self.delete(world, lead);
         }
+        marks
+            .borrow_mut()
+            .extend(self.parts(world, id).map_err(fail)?);
         let mut tile = Some(id);
         while let Some(this) = tile {
             tile = world.next_parts.get(&this).copied();
             self.delete_one(world, this)?;
         }
         Ok(())
+    }
+
+    /// Whether object `id`'s deletion has begun (object flag 0x40,
+    /// [`Interpreter::deleting`]).
+    pub(crate) fn being_deleted(&self, id: u16) -> bool {
+        self.deleting
+            .is_some_and(|marks| marks.borrow().contains(&id))
     }
 
     /// One object's deletion (0x440fff on, 0x440eeb with 1): the steps of
@@ -341,6 +398,9 @@ impl Interpreter<'_> {
         }
         if selected {
             self.select(world, None)?;
+        }
+        if let Some(marks) = self.deleting {
+            marks.borrow_mut().insert(id);
         }
         self.drop_references(world, id)?;
         if person {
@@ -380,6 +440,9 @@ impl Interpreter<'_> {
         // The object's destructor stops its sounds (0x4323c9).
         self.sound(SoundEvent::Stop { object: id as i16 });
         world.objects.remove(&id);
+        if let Some(marks) = self.deleting {
+            marks.borrow_mut().remove(&id);
+        }
         if let Some(deleted) = self.deleted {
             deleted.borrow_mut().push(id);
         }
@@ -427,20 +490,23 @@ impl Interpreter<'_> {
     /// (its virtual function 0x50 with 1, 0x432055) and that is all: a
     /// tile of a group takes what is left of its group off
     /// ([`Interpreter::take_off`], 0x422d86), so each of its tiles is
-    /// asked function 10 again; any other object leaves the narrow way of
-    /// [`Machine::leave_lot`]. Any other is rebuilt ([`Interpreter::rebuild`]):
-    /// taken off the lot, its storage reset, its Init and a first turn
-    /// run, and put back where it was.
+    /// asked function 10 again; any other object leaves as on its way to
+    /// deletion ([`Interpreter::leave_lot_to_delete`]). Any other is
+    /// rebuilt ([`Interpreter::rebuild`]): taken off the lot, its storage
+    /// reset, its Init and a first turn run, and put back where it was.
     ///
     /// Either way the scheduler's countdown for the object is dropped, its
     /// sounds are stopped (0x4320b4, [`crate::sounds`]), and the object
     /// gives up the ownership of interface events. Being deleted (object
-    /// flag 0x40) only spares the rebuild (0x432063): the deletion's reset
-    /// stops the object's sounds too, and its destructor then once more.
+    /// flag 0x40: `deleting`, or the object's deletion has begun,
+    /// [`Interpreter::deleting`]) only spares the rebuild (0x432063): the
+    /// deletion's reset stops the object's sounds too, and its destructor
+    /// then once more.
     ///
     /// A Reset entry whose tree is missing runs nothing but still counts
     /// as a Reset tree.
     pub fn reset(&self, world: &mut World, id: u16, deleting: bool) -> Result<(), Fault> {
+        let deleting = deleting || self.being_deleted(id);
         let fail = |trap| Fault {
             object: id,
             at: None,
@@ -467,9 +533,7 @@ impl Interpreter<'_> {
         } else if deleting && object.multipart.is_some() {
             self.take_off(world, id, true)?;
         } else if deleting {
-            self.machine(world, id, 0, false)
-                .leave_lot(id)
-                .map_err(fail)?;
+            self.leave_lot_to_delete(world, id)?;
         } else {
             self.rebuild(world, id)?;
         }
