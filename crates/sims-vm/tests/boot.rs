@@ -335,23 +335,17 @@ fn the_selected_goth_lists_pie_menus_and_picks_from_them() {
     assert_eq!(lot.world().headlines, BTreeMap::from([(16, shown(1))]));
     lot.step().unwrap_or_else(|e| panic!("{e}"));
     assert!(lot.world().headlines.is_empty());
-    // The lot runs on until person 259 (the salesman), whose route to a
-    // slot failed as it wants to be interrupted (0x45b18b), is taken off
-    // the lot while its animator plays a door knock: the reset that
-    // deletes it would remove that clip, which can fade it out, and that
-    // is not ported.
-    let mut steps = 359;
-    let stopped = loop {
-        steps += 1;
-        assert!(steps <= 1000, "the lot did not stop");
-        if let Err(e) = lot.step() {
-            break e.to_string();
-        }
-    };
-    assert_eq!(steps, 595, "{stopped}");
-    for part in ["tick 597,", "object 259", "A2O-door-knock", "0x592878"] {
-        assert!(stopped.contains(part), "{stopped}");
+    // The salesman (object 259) still has a door knock playing before
+    // the reset that used to stop the run with the error at tick 597.
+    while lot.ticks() < 594 {
+        lot.step().unwrap_or_else(|e| panic!("{e}"));
     }
+    let layer = lot.world().animators[&259].foreground.as_ref().unwrap();
+    assert_eq!(layer.clip, "A2O-door-knock");
+    for _ in 595..=625 {
+        lot.step().unwrap_or_else(|e| panic!("{e}"));
+    }
+    assert_eq!(lot.ticks(), 625);
 }
 
 /// The pie's entry the pointer reaches is checked again (0x48df28) as
