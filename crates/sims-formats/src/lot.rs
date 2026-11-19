@@ -186,6 +186,93 @@ impl ObjectTypes {
     }
 }
 
+/// A house's GUID translation table (`Gtab` chunk 1), written by the
+/// family import (0x4297f7) so a lot saved under a family's exported GUIDs
+/// names the types the import made. The house read loads it (0x43ddc2,
+/// 0x41578e) and passes every type-table GUID through
+/// [`GuidTable::translate`] before looking up its definition (0x43a6fb).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuidTable {
+    pub version: u32,
+    /// Old GUID, new GUID, in the file's order (0x4158a4: a 32-bit count,
+    /// then the pairs).
+    pub pairs: Vec<(u32, u32)>,
+}
+
+impl GuidTable {
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes);
+        let version = header(&mut r, b"batG")?;
+        let count = r.u32()? as usize;
+        r.count(count, 8)?;
+        let mut pairs = Vec::with_capacity(count);
+        for _ in 0..count {
+            pairs.push((r.u32()?, r.u32()?));
+        }
+        Ok(Self { version, pairs })
+    }
+
+    /// The GUID `guid` reads as (0x415751). The first pair not yet used
+    /// whose old GUID matches replaces it, and the search starts over from
+    /// the first pair, until no unused pair matches. So translations
+    /// chain, and each pair is used at most once per GUID, which ends a
+    /// cycle.
+    pub fn translate(&self, mut guid: u32) -> u32 {
+        let mut used = vec![false; self.pairs.len()];
+        while let Some(at) = self
+            .pairs
+            .iter()
+            .zip(&used)
+            .position(|(&(old, _), &done)| old == guid && !done)
+        {
+            used[at] = true;
+            guid = self.pairs[at].1;
+        }
+        guid
+    }
+}
+
+#[cfg(test)]
+mod guid_table_tests {
+    use super::*;
+
+    fn table(pairs: &[(u32, u32)]) -> Vec<u8> {
+        let mut b = vec![0; 8];
+        b.extend(b"batG");
+        b.extend((pairs.len() as u32).to_le_bytes());
+        for (old, new) in pairs {
+            b.extend(old.to_le_bytes());
+            b.extend(new.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn translations_chain_and_each_pair_is_used_once() {
+        let t = GuidTable::parse(&table(&[(1, 2), (2, 3), (3, 1), (7, 8), (7, 9)])).unwrap();
+        assert_eq!(t.pairs.len(), 5);
+        // 1 -> 2 -> 3 -> 1, then (1, 2) is used: the cycle ends at 1.
+        assert_eq!(t.translate(1), 1);
+        assert_eq!(t.translate(2), 2);
+        // The first matching pair wins.
+        assert_eq!(t.translate(7), 8);
+        assert_eq!(t.translate(5), 5);
+    }
+
+    #[test]
+    fn a_short_or_mislabelled_table_is_an_error() {
+        let mut b = table(&[(1, 2)]);
+        b.truncate(b.len() - 1);
+        assert!(GuidTable::parse(&b).is_err());
+        let mut b = table(&[]);
+        b[8] = b'x';
+        assert!(GuidTable::parse(&b).is_err());
+        let mut b = table(&[]);
+        b[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(GuidTable::parse(&b).is_err());
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Simulator {
     pub version: u32,

@@ -520,12 +520,8 @@ impl Lot {
                 &surfaces,
             )?;
             // 6c and 7: the type table, which marks the types whose scripts
-            // changed.
-            if file.guid_table {
-                return Err(
-                    "the house has a GUID translation table (Gtab), which is not ported".into(),
-                );
-            }
+            // changed. Its GUIDs have been through the house's GUID table
+            // (0x43a6fb, in `House::load`).
             let types = &file.types.entries;
             for entry in types {
                 let object = catalog
