@@ -127,7 +127,10 @@ impl Neighborhood {
     pub fn zoning(&self, expansions: u16) -> Result<BTreeMap<i16, i32>> {
         let mut table = BTreeMap::new();
         let mut magic = false;
-        for (lot, zone) in self.zoning_rows()? {
+        let Some(rows) = self.zoning_rows()? else {
+            return Ok(table);
+        };
+        for (lot, zone) in rows {
             magic |= (90..=92).contains(&lot);
             if let Ok(lot) = i16::try_from(lot) {
                 table.entry(lot).or_insert(zone);
@@ -148,21 +151,23 @@ impl Neighborhood {
     pub fn lot_rows(&self) -> Result<Vec<i16>> {
         Ok(self
             .zoning_rows()?
+            .unwrap_or_default()
             .into_iter()
             .filter_map(|(lot, _)| i16::try_from(lot).ok())
             .collect())
     }
 
     /// `LotZoning.iff`'s STR# 1 rows in its first language set: each
-    /// row's lot and zone (1 residential, 2 community), in order.
-    fn zoning_rows(&self) -> Result<Vec<(i32, i32)>> {
+    /// row's lot and zone (1 residential, 2 community), in order. `None`
+    /// when there is no such file or table.
+    fn zoning_rows(&self) -> Result<Option<Vec<(i32, i32)>>> {
         let mut rows = Vec::new();
         let Some(path) = resolve(&self.directory, "LotZoning.iff")? else {
-            return Ok(rows);
+            return Ok(None);
         };
         let iff = read_iff(&path)?;
         let Some(chunk) = iff.get(b"STR#", 1) else {
-            return Ok(rows);
+            return Ok(None);
         };
         let strings = StringTable::parse(iff.data(chunk))
             .map_err(|e| Error::format(&format!("{} STR# #1", path.display()), e))?;
@@ -178,7 +183,7 @@ impl Neighborhood {
             };
             rows.push((leading_number(lot), zone));
         }
-        Ok(rows)
+        Ok(Some(rows))
     }
 
     /// The files in the neighborhood's `Patch` folder, in name order:

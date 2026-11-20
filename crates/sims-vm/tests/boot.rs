@@ -320,6 +320,133 @@ fn an_imported_home_loads_from_the_originals_files_and_steps() {
     std::fs::remove_dir_all(&directory).unwrap();
 }
 
+/// The families the open's five pools fill after `Patch`: the Townies
+/// (2000), the ten tourist families (3000 to 3009), the celebrities
+/// (5000), the fans (5500) and Magic Town (6000). Not ported yet (6b E).
+const POOLS: [u16; 14] = [
+    2000, 3000, 3001, 3002, 3003, 3004, 3005, 3006, 3007, 3008, 3009, 5000, 5500, 6000,
+];
+
+/// The first person type file the pools made in the original's UserData2
+/// (`User00030.iff`); its import made 2 to 29.
+const FIRST_POOL_FILE: u32 = 30;
+
+/// A `Characters/User%05d.iff` file's number.
+fn user_file(path: &Path) -> Option<u32> {
+    let name = path.file_name()?.to_str()?.to_ascii_lowercase();
+    name.strip_prefix("user")?
+        .strip_suffix(".iff")?
+        .parse()
+        .ok()
+}
+
+/// The person type files in a folder, sorted by path.
+#[expect(clippy::disallowed_methods, reason = "sort paths before using them")]
+fn user_files(characters: &Path) -> Vec<(u32, PathBuf)> {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(characters)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    paths.sort();
+    paths
+        .into_iter()
+        .filter_map(|path| Some((user_file(&path)?, path)))
+        .collect()
+}
+
+#[test]
+fn an_opened_neighborhood_matches_the_originals_import() {
+    // Our open of the install's UserData2 (house 0's reload, then the six
+    // Patch families' import) against the original's, with its GUIDs. The
+    // pools are not ported, so they come from the original's files. The
+    // result must be the state the original's own files load to.
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let Some(after) = std::env::var_os("SIMS_UD2_AFTER") else {
+        eprintln!("SIMS_UD2_AFTER not set; skipping");
+        return;
+    };
+    let after = PathBuf::from(after);
+    let output = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("userdata2-opened-{}", std::process::id()));
+    if output.exists() {
+        std::fs::remove_dir_all(&output).unwrap();
+    }
+    copy_directory(&root.join("UserData2"), &output);
+
+    // The GUIDs the original drew, in file order: each made type's file
+    // number follows its draw.
+    let theirs: Vec<(u32, PathBuf)> = user_files(&after.join("Characters"));
+    let mut guids = theirs
+        .iter()
+        .filter(|(number, _)| (2..FIRST_POOL_FILE).contains(number))
+        .map(|(_, path)| {
+            let iff = sims_formats::iff::Iff::parse(std::fs::read(path).unwrap()).unwrap();
+            let objd = iff.data(iff.all(b"OBJD").next().unwrap());
+            u32::from_le_bytes(objd[0x1c..0x20].try_into().unwrap())
+        });
+    let (mut neighborhood, opened) = sims_vm::neighborhood_open::open_neighborhood(
+        &root,
+        &root.join("UserData2"),
+        &output,
+        &mut || guids.next().expect("the original drew no more GUIDs"),
+        &|house| std::fs::read(after.join(format!("Houses/House{house:02}.iff"))).ok(),
+    )
+    .unwrap();
+    assert!(guids.next().is_none(), "the import drew fewer GUIDs");
+    assert_eq!(opened.imports.len(), 6);
+
+    // The five house files, byte for byte, given the original's leftover
+    // heap bytes.
+    for house in [56, 63, 69, 76, 77] {
+        let name = format!("Houses/House{house}.iff");
+        assert!(
+            std::fs::read(output.join(&name)).unwrap() == std::fs::read(after.join(&name)).unwrap(),
+            "{name} differs"
+        );
+    }
+    // The inventories the view's set-up and each housed import made, which
+    // the pools leave alone.
+    let original = sims_content::Neighborhood::open(&after).unwrap();
+    assert_eq!(
+        format!("{:?}", neighborhood.inventories),
+        format!("{:?}", original.inventories)
+    );
+
+    // The pools, from the original: their families, records, files and
+    // done flags.
+    for (number, path) in &theirs {
+        if *number >= FIRST_POOL_FILE {
+            std::fs::copy(
+                path,
+                output.join("Characters").join(path.file_name().unwrap()),
+            )
+            .unwrap();
+        }
+    }
+    for id in POOLS {
+        neighborhood
+            .families
+            .insert(id, original.families[&id].clone());
+    }
+    let ours = neighborhood.neighbors.len();
+    // 446 less the pools' 125 people.
+    assert_eq!(ours, 321);
+    neighborhood
+        .neighbors
+        .extend(original.neighbors[ours..].iter().cloned());
+    neighborhood.options = original.options;
+
+    let house = output.join("Houses/House69.iff");
+    let lot = Lot::load_in(&root, neighborhood, &house, &[2; 8], Frames::default()).unwrap();
+    assert!(lot.load_report().finished.is_some());
+    assert_eq!(lot.world().hash_hex(), IMPORTED_69);
+    std::fs::remove_dir_all(&output).unwrap();
+}
+
 #[test]
 fn a_step_before_a_complete_load_says_so() {
     // Shown through the message the CLI prints.
