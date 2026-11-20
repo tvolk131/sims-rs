@@ -313,8 +313,8 @@ class CaptureTest(unittest.TestCase):
         def prepare(output):
             (output / 'events.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in [
                 dict(kind='baseline', cr3=GAME_CR3),
-                dict(kind='watch_armed', name='state', expr='2-2,state=0x70088', address=0x70088,
-                     value=0, update=1)]))
+                dict(kind='watch_armed', name='state', expr='2-2,state=0x70088', late=True,
+                     address=0x70088, value=0, update=1)]))
             (output / 'updates.jsonl').write_text(
                 json.dumps(dict(update=1, tick=99, lot_rng=0, global_rng=0, crt=0, scheduler_cursor=0)) + '\n')
         remote, output, _ = self.run_capture(
@@ -322,6 +322,26 @@ class CaptureTest(unittest.TestCase):
             ['--updates', '2', '--resume', '--late-watch', '2-2,state=0x70088'], prepare=prepare)
         ended = self.events(output, 'watch_ended')
         self.assertEqual([(r['update'], r['set']) for r in ended], [(2, True)])
+
+    def test_an_ordinary_watch_armed_before_is_not_a_late_watch_set(self):
+        # Given as --watch with the same text, it was armed by the earlier run.
+        def prepare(output):
+            (output / 'events.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in [
+                dict(kind='baseline', cr3=GAME_CR3),
+                dict(kind='watch_armed', name='2-2,state', expr='2-2,state=0x70088', late=False,
+                     address=0x70088, value=0, update=1)]))
+            (output / 'updates.jsonl').write_text(
+                json.dumps(dict(update=1, tick=99, lot_rng=0, global_rng=0, crt=0, scheduler_cursor=0)) + '\n')
+        remote, output, _ = self.run_capture(
+            [dict(pc=0x123456, cr3=OTHER_CR3), dict(pc=capture.RETURN)],
+            ['--updates', '2', '--resume', '--late-watch', '2-2,state=0x70088'], prepare=prepare)
+        ended = self.events(output, 'watch_ended')
+        self.assertEqual([(r['update'], r['set']) for r in ended], [(2, False)])
+
+    def test_a_late_watch_given_twice_is_an_argument_error(self):
+        with self.assertRaises(SystemExit):
+            self.run_capture([dict(pc=0)], ['--updates', '1', '--late-watch', '2,x=0x70088',
+                                            '--late-watch', '2,x=0x70088'])
 
     def test_a_watch_name_may_be_any_text_and_an_object_alone_takes_the_default_size(self):
         w = capture.Watch('\u00e9tat=0x70088:2')

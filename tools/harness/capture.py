@@ -55,15 +55,17 @@ in_update false. A moving watch misses what the paragraph above says it
 misses; a stop at a watchpoint does not work its address out again, as
 for --watch, but a watch is not moved at the stop where it ends. A run
 taken over (--resume) sets the watches whose updates have come at its first
-stop; one that goes through an object waits there for the next entry or
-return, and none is set while the guest is stopped in another process. A
+stop; one that goes through an object waits for the next entry or return
+if that stop does not give the simulator's pointer, and none is set while
+the guest is stopped in another process. A
 write seen before the taken-over run knows whether the guest is inside a
 lot update has update null (after_update is the last update recorded). A
 late watch's watch_ended event says whether it was ever set, by this run or
 one it took over (set false: no write in its updates was seen). The lot
-update's entry is a breakpoint only while a watch is set or waits to be set
-in its updates (one whose address cannot be worked out yet is tried again
-there), so a watch on a busy address (the random state) costs nothing while
+update's entry is a breakpoint for a late watch only while it is set or
+waits to be set in its updates (one whose address cannot be worked out yet
+is tried again there); the baseline, --watch and a due --dump arm it too.
+So a late watch on a busy address (the random state) costs nothing while
 the load and the other updates run.
 
 The executable digests that guest/launch.sh verified (share/game-identity.txt)
@@ -614,6 +616,10 @@ def main():
     args = ap.parse_args()
     full_set = parse_set(args.full)
     dump_set = parse_set(args.dump)
+    late_texts = [w.text for w in args.late_watch]
+    if len(set(late_texts)) != len(late_texts):
+        # A taken-over run tells them apart by their text (watch_armed's expr).
+        ap.error('a --late-watch is given twice')
     if dump_set and not args.guest_dir:
         ap.error('--dump needs --guest-dir')
     if args.scenario and not args.guest_dir:
@@ -731,7 +737,8 @@ def main():
             w.set = True
             live_watches.append(w)
             pending.remove(w)
-            event(kind='watch_armed', name=w.name, expr=w.text, address=w.address, value=w.value, update=updates)
+            event(kind='watch_armed', name=w.name, expr=w.text, late=w in args.late_watch, address=w.address,
+                  value=w.value, update=updates)
 
     def check_watches(m):
         """At a stop in the game, work out the moving watches again: move a
@@ -828,7 +835,7 @@ def main():
             event(kind='resume_dropped', events=[dict(kind=r['kind'], update=r['update']) for r in dropped])
         # A late watch an earlier run set counts as set (watch_ended's set covers its whole window).
         for w in late:
-            w.set = any(r['kind'] == 'watch_armed' and r.get('expr') == w.text for r in rows)
+            w.set = any(r['kind'] == 'watch_armed' and r.get('late') and r.get('expr') == w.text for r in rows)
         # A dialog shown since the last recorded return, and the dialogs still waiting for a result.
         dialog_pending = any(r['kind'] == 'dialog_show' and r['update'] > updates for r in rows)
         waiting = open_dialogs(rows)
