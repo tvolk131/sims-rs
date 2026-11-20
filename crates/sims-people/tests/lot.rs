@@ -764,11 +764,12 @@ fn the_lamps_of_a_persons_room_light_them() {
 /// A Sim on a bench, behind its backrest: in a state where Mortimer
 /// (person 21) reads on the porch bench (174), as in a screenshot of the
 /// original at near zoom (7:12 AM, rotation 2, camera origin (591, −2018),
-/// walls down, matched to ours pixel for pixel elsewhere), the backrest's
+/// walls down; our frame aligns with it at offset (0, 0)), the backrest's
 /// soft top edge blends over his coat, because the original draws the
 /// bench after its people (0x4aacb9, 0x4aa1d7). Drawn into the lot under
 /// him, the edge blends over the floor. The original shows (32, 16, 8)
-/// and (65, 32, 8) at the two pixels compared, in 16-bit colour.
+/// and (65, 32, 8) at the two pixels compared, in 16-bit colour; each
+/// check allows 12 per channel.
 #[test]
 fn a_bench_in_use_draws_after_the_sim_on_it() {
     let Some(root) = install() else { return };

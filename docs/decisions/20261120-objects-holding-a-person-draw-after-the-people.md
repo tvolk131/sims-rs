@@ -37,7 +37,7 @@ After the lot's picture, the frame draws the people on list +0x1d4 (0x4a9458), t
 
 This also explains the depth dumps of the original's lot picture taken for the compositing work (#125): they held no people and no in-use bench.
 
-**Checked against.** A screenshot of the original at 7:12 AM (tick 1260): near zoom, rotation 2, walls down, camera origin (591, −2018). In it, Mortimer reads on the porch bench. Our frame aligns with it at offset (0, 0). The colour comparison below is approximate, with a tolerance per channel.
+**Checked against.** A screenshot of the original showing 7:12 AM: near zoom, rotation 2, walls down, camera origin (591, −2018). In it, Mortimer reads on the porch bench. Our frame, rendered at tick 1260, aligns with it at offset (0, 0). The colour comparison below is approximate, with a tolerance per channel.
 
 - The backrest's soft top edge blends over his coat: (32, 16, 8) and (65, 32, 8) at (385, 311) and (405, 305).
 - Before this change, ours blended that edge over the floor: (196, 159, 110) and (136, 90, 45). Now it shows (35, 20, 12) and (68, 34, 11), within 12 of the original in each channel after 16-bit quantizing.
