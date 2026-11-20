@@ -86,12 +86,19 @@ run with the refresh pending.
 ## Primitives that may run with an animator refresh pending
 
 A person that takes itself off the lot has its animator's refresh pending
-until its animator's tick. Until then its thread may run only primitives
-that read no animator (`placement::reads_no_animator`). Four more are
+until its animator's tick. Until then, threads may run only primitives
+that read no animator (`placement::reads_no_animator`). Five more are
 allowed now. The reason for each is a code comment:
 
 - **Random Number (8)** reads and writes through the same memory reader as
   Expression and draws from the lot's stream.
+- **Idle For Input (17)** reads the person's words, motives and queue, and
+  the lot's zoning. The check and cancellation trees it runs, and the
+  tree it pushes, are checked one primitive at a time. Making an action
+  the running one (0x45e6cd) works the person's footprint out again when
+  person word 73 is set (0x45e756, 0x433d16). That goes through 0x43519f,
+  which calls only 0x4351ef, and that reads person words. The virtual
+  call at 0x4353c9 is in a separate routine (0x4352e8).
 - **Run Tree By Name (28)**, handled at 0x44ba26, looks a tree up and
   either runs it at once or pushes it. It also counts the use (0x45e59b).
   The tree it runs is still checked one primitive at a time.
@@ -103,23 +110,18 @@ For Play Sound Event and Stop All Sounds, whether the sound manager reads
 anything the refresh writes is **unverified**. It would change only what
 is heard.
 
-Two primitives are refused only where they would first read the
-animator, instead of at the step:
+**Go To Routing Slot (45)** is refused only where it would first read the
+animator, not at the step. 0x40743b and 0x432595 read only the stack
+object's own position, container and +0x110. As a result, a stack object
+that is off the lot gives false whether or not a refresh is pending.
+Naming the slot reads no animator either: a source that names no slot
+raises native error 0x25 (0x45ace4) first. The route that follows reads
+the person's animator.
 
-- **Go To Routing Slot (45)**: 0x40743b and 0x432595 read only the stack
-  object's own position, container and +0x110. As a result, a stack object
-  that is off the lot gives false whether or not a refresh is pending.
-  Naming the slot reads no animator either: a source that names no slot
-  raises native error 0x25 (0x45ace4) first. The route that follows reads
-  the person's animator.
-- **Idle For Input (17)** reads the person's words, motives, queue and the
-  lot's zoning. The check and cancellation trees it runs are checked one
-  primitive at a time, and so is the tree it pushes, so a queued action
-  that is cancelled (0x45dcc8) runs with a refresh pending. Making an
-  action the running one (0x45e6cd) works the person's footprint out
-  again only when person word 73 is set (0x45e756, 0x433d16). That goes
-  through 0x43519f, whose virtual call at 0x4353c9 is not traced, so only
-  that start is refused.
+**Remove Object Instance (18)** checks for itself. Only the person whose
+refresh is pending may remove, and only itself, yielding. A removal made
+on another thread meanwhile is refused, for example by a cancellation
+callback that Idle For Input runs on the action's target.
 
 ## Effect on the pins
 

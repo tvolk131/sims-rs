@@ -41,7 +41,7 @@ use sims_formats::saved_objects::{Interaction, ObjectUse};
 const USERS: usize = 62;
 
 /// Person data words that the end of a running action clears or sets.
-pub(crate) mod person {
+mod person {
     /// Takes the new action's priority (0x45e745).
     pub const PRIORITY: usize = 33;
     /// Cleared when the new action has a target (0x45e71c).

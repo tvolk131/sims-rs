@@ -543,15 +543,15 @@ fn go_to_routing_slot_reads_no_animator_before_its_route() {
     }
 }
 
-#[test]
-fn idle_for_input_cancels_a_queued_action_with_the_refresh_pending() {
-    // The visitor removes itself in its own tick and goes on, its
-    // animator's refresh pending, to Idle For Input with an action queued
-    // that interrupts. The action has no tree, so it is cancelled
-    // (0x45dcc8): nothing of that reads an animator, and the pass goes
-    // on. Only a start that works the footprint out again (person word
-    // 73, 0x45e756) is refused.
-    let (mut fx, id, file) = placed_visitor();
+/// The visitor removes itself in its own tick and goes on, its
+/// animator's refresh pending, to Idle For Input with an action queued on
+/// the lamp that interrupts. The action has no tree, so it is cancelled
+/// (0x45dcc8).
+fn cancel_with_the_refresh_pending(
+    fx: &mut Fixture,
+    id: u16,
+    file: usize,
+) -> Result<bool, sims_vm::TickError> {
     fx.world.globals = vec![0; 64];
     for object in fx.world.objects.values_mut() {
         object.registry_word = Some(if object.id == id { 0x0001_ffff } else { 0xffff });
@@ -587,8 +587,15 @@ fn idle_for_input_cancels_a_queued_action_with_the_refresh_pending() {
     let tuning = crate::tick::tuning();
     let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
     let mut update = sims_vm::Update::default();
-    let result = interpreter.scheduler_pass(&mut fx.world, &tuning, &mut update);
-    assert_eq!(result, Ok(true));
+    interpreter.scheduler_pass(&mut fx.world, &tuning, &mut update)
+}
+
+#[test]
+fn idle_for_input_cancels_a_queued_action_with_the_refresh_pending() {
+    // Nothing of the cancellation reads an animator, and the pass goes
+    // on.
+    let (mut fx, id, file) = placed_visitor();
+    assert_eq!(cancel_with_the_refresh_pending(&mut fx, id, file), Ok(true));
     assert_eq!(fx.world.removals, [id]);
     assert!(
         fx.world.objects[&id]
@@ -597,5 +604,33 @@ fn idle_for_input_cancels_a_queued_action_with_the_refresh_pending() {
             .unwrap()
             .queue
             .is_empty()
+    );
+}
+
+#[test]
+fn a_cancellation_callback_may_not_remove_the_person_with_the_refresh_pending() {
+    // The lamp's cancellation callback (function 4), run on the lamp with
+    // the visitor as its stack object, removes the visitor: a removal on
+    // another thread while the refresh is pending is refused, as any
+    // other primitive there is.
+    let (mut fx, id, file) = placed_visitor();
+    let library = fx.program.libraries.get_mut(&LAMP_FILE).unwrap();
+    let table = library.callbacks.get_mut(&128).unwrap();
+    table.resize(
+        5,
+        sims_formats::execution::ObjectFunction {
+            condition: 0,
+            action: 0,
+        },
+    );
+    table[4].action = 4200;
+    let error = cancel_with_the_refresh_pending(&mut fx, id, file).unwrap_err();
+    let sims_vm::TickError::Fault(fault) = error else {
+        panic!("{error}");
+    };
+    assert!(
+        matches!(fault.trap, Trap::Unsupported(ref m)
+            if m.contains("opcode 18") && m.contains(&format!("thread of object {LAMP}"))),
+        "{fault}"
     );
 }

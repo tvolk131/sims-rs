@@ -61,16 +61,22 @@ impl Machine<'_, '_> {
         // its animator's refresh pending, may remove only itself, and
         // yield: that removal's own refresh joins the pending one
         // (`Interpreter::refresh_again`). Anything else could read or
-        // write what the refresh did.
-        let refresh_pending = self
-            .refreshing
-            .is_some_and(|r| r.borrow().person == self.me && r.borrow().pending.is_some());
-        if refresh_pending && (id != self.me || flags & 1 != 0 || self.synchronous) {
+        // write what the refresh did, and so could a removal another
+        // thread makes meanwhile (a cancellation callback that Idle For
+        // Input runs on the action's target, for one), which is refused
+        // like any other primitive there (`Interpreter::refuse_unsettled_animator`).
+        let pending_for = self.refreshing.and_then(|r| {
+            let r = r.borrow();
+            r.pending.as_ref().map(|_| r.person)
+        });
+        if let Some(person) = pending_for
+            && (person != self.me || id != self.me || flags & 1 != 0 || self.synchronous)
+        {
             return Err(Trap::Unsupported(format!(
-                "Remove Object Instance (opcode 18) of object {id} with flags {flags:#x} after \
-                 person {} left the lot and before its animator's tick: the animator's refresh \
-                 at the take-off (0x58da12), if the house view drew the person, may have \
-                 written what it reads",
+                "Remove Object Instance (opcode 18) of object {id} with flags {flags:#x} on the \
+                 thread of object {} after person {person} left the lot and before its \
+                 animator's tick: the animator's refresh at the take-off (0x58da12), if the \
+                 house view drew the person, may have written what it reads",
                 self.me
             )));
         }

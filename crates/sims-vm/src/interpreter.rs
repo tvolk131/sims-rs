@@ -954,16 +954,10 @@ impl<'a> Machine<'a, '_> {
             self.call(instruction)?;
             return Ok(Status::Running);
         }
-        // Two primitives apply these checks themselves, at the point
-        // where they would go on to read an animator: Go To Routing Slot's
-        // first run, once its stack object is found on the lot
-        // (`Machine::go_to_slot`), and Idle For Input, once it starts a
-        // queued action (`Machine::start_queued`).
-        let checks_itself = match instruction.opcode {
-            45 => self.frame()?.primitive_state == 0,
-            17 => true,
-            _ => false,
-        };
+        // Go To Routing Slot applies these checks itself on its first run,
+        // once it has named its slot and found its stack object on the lot
+        // (`Machine::go_to_slot`), where it would go on to read an animator.
+        let checks_itself = instruction.opcode == 45 && self.frame()?.primitive_state == 0;
         if !crate::placement::reads_no_animator(instruction.opcode, &instruction.operands)
             && !checks_itself
         {

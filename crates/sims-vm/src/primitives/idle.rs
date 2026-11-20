@@ -174,25 +174,6 @@ impl Machine<'_, '_> {
         let me = self.me;
         self.check_chosen(&mut action, saved, None)?;
         let flow = if action.flags & checked::PASSED != 0 && action.action != 0 {
-            // Idle For Input reads the person's words, motives and queue,
-            // the frame's parameter and the lot's zoning (0x45d7c0, through
-            // 0x40745f and 0x453141; 0x47518b, 0x41ed43, 0x45f77b), and no
-            // animator; the check and cancellation trees it runs are checked
-            // one primitive at a time, as is the tree it pushes. Making the
-            // action the running one (0x45e6cd) works the person's
-            // footprint out again only if person word 73 is set (0x45e756,
-            // 0x433d16), through 0x43519f, whose virtual call at 0x4353c9
-            // is not traced: only then do the step's checks for an
-            // unsettled animator apply.
-            let wide = self
-                .me()?
-                .person
-                .as_ref()
-                .and_then(|p| p.data.get(crate::object_uses::person::WIDE))
-                .is_some_and(|&w| w != 0);
-            if wide {
-                self.refuse_unsettled_animator(17)?;
-            }
             let frame = self.me()?.stack.len() - 1;
             let tree = action.action;
             self.wake(me)?;
