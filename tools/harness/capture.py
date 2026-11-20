@@ -67,7 +67,10 @@ update's entry is a breakpoint for a late watch only while it is set or
 waits to be set in its updates (one whose address cannot be worked out yet
 is tried again there); the baseline, --watch, --scenario and a due --dump
 arm it too. A late watch is set (or moved) only at a stop on the lot
-captured.
+captured; at a stop on another lot, one that goes through an object is
+taken off (watch_lost with elsewhere true) until it can be set there
+again. A run taken over does not count a late watch an earlier revision
+set (those recorded no lot): it ends with set false.
 So a late watch on a busy address (the random state) costs nothing while
 the load and the other updates run.
 
@@ -751,9 +754,19 @@ def main():
     def check_watches(m, here):
         """At a stop in the game, work out the moving watches again: move a
         watchpoint whose address changed, and put one that cannot be worked
-        out (or read) back to wait. A late watch only at a stop on this lot."""
+        out (or read) back to wait. A late watch only at a stop on this lot:
+        at a stop on another, a moving late watch is taken off and waits to be
+        set again here (its address may be another lot's object's by then)."""
         for w in list(live_watches):
-            if not w.moves or (not here and w in args.late_watch):
+            if not w.moves:
+                continue
+            if not here and w in args.late_watch:
+                hardware_remove(w.address, w.size)
+                live_watches.remove(w)
+                event(kind='watch_lost', name=w.name, expr=w.text, address=w.address, update=updates,
+                      elsewhere=True)
+                w.address = w.value = None
+                pending.append(w)
                 continue
             found = locate(w, m)
             if found is not None and found[0] == w.address:
@@ -847,26 +860,17 @@ def main():
         if dropped:
             event(kind='resume_dropped', events=[dict(kind=r['kind'], update=r['update']) for r in dropped])
         # A late watch an earlier run set counts as set (watch_ended's set covers its whole window).
-        # Its event has its name and its whole text (with the updates); a --watch given the same
-        # text has the updates in its name. Earlier revisions wrote no `late`.
-        # Only an arming on this lot after the baseline within its updates counts: it is set at
-        # the end of update first - 1 at the earliest. Earlier revisions did not record the lot
-        # (and could arm on another): one of theirs counts only if no stop on another lot was
-        # recorded before it, the baseline's run included. Each run logs its first entry elsewhere
-        # and every return elsewhere, so a run that armed one elsewhere logged such a stop first.
-        start = next(i for i, r in enumerate(rows) if r['kind'] == 'baseline')
-        elsewhere_seen = False
-        for i, r in enumerate(rows):
-            if r['kind'] in ('entry_elsewhere', 'return_elsewhere'):
-                elsewhere_seen = True
-            if i < start or not (r['kind'] == 'watch_armed' and r.get('late', True)):
-                continue
-            on_lot = r['lot'] == args.lot if 'lot' in r else not elsewhere_seen
-            for w in late:
-                if (on_lot and r.get('name') == w.name and r.get('expr') == w.text
+        # Its event has its name, its whole text (with the updates), late true and the lot it was
+        # armed on; only an arming on this lot after the baseline within its updates counts (it is
+        # set at the end of update first - 1 at the earliest). Earlier revisions recorded neither
+        # `late` nor the lot, and could arm on another lot, so their armings do not count: such a
+        # watch ends with set false, and its watch_armed events have to be read by hand.
+        since = rows[next(i for i, r in enumerate(rows) if r['kind'] == 'baseline'):]
+        for w in late:
+            w.set = any(r['kind'] == 'watch_armed' and r.get('late') is True and r.get('lot') == args.lot
+                        and r.get('name') == w.name and r.get('expr') == w.text
                         and r.get('update', -1) + 1 >= w.first
-                        and (w.last is None or r['update'] + 1 <= w.last)):
-                    w.set = True
+                        and (w.last is None or r['update'] + 1 <= w.last) for r in since)
         # A dialog shown since the last recorded return, and the dialogs still waiting for a result.
         dialog_pending = any(r['kind'] == 'dialog_show' and r['update'] > updates for r in rows)
         waiting = open_dialogs(rows)

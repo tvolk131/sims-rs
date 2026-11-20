@@ -311,7 +311,8 @@ class CaptureTest(unittest.TestCase):
         # The earlier run sets it at the end of update 1 and is stopped
         # there; this one starts in another process and next stops at
         # update 2's return, where it ends. Once from the events the earlier
-        # run wrote, once from an earlier revision's, which had no `late`.
+        # run wrote, once from an earlier revision's, which had no `late` or
+        # lot and does not count.
         _, first, _ = self.run_capture(
             [dict(pc=0), dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
             ['--updates', '1', '--late-watch', '2-2,state=0x70088'])
@@ -325,6 +326,7 @@ class CaptureTest(unittest.TestCase):
                         rows = [json.loads(line) for line in text.splitlines()]
                         for r in rows:
                             r.pop('late', None)
+                            r.pop('lot', None)
                         text = ''.join(json.dumps(r) + '\n' for r in rows)
                     (output / name).write_text(text)
             remote, output, _ = self.run_capture(
@@ -332,14 +334,16 @@ class CaptureTest(unittest.TestCase):
                 ['--updates', '2', '--resume', '--late-watch', '2-2,state=0x70088'], prepare=prepare)
             self.assertEqual(remote.watch_calls, [])
             ended = self.events(output, 'watch_ended')
-            self.assertEqual([(r['update'], r['set']) for r in ended], [(2, True)], old)
+            # An earlier revision's arming is not counted.
+            self.assertEqual([(r['update'], r['set']) for r in ended], [(2, not old)], old)
 
     def test_only_an_arming_on_the_lot_within_its_updates_counts_on_resume(self):
         # Each alone would count but for one test: before the baseline
         # (another lot), with another text under the same name, below and
         # above the watch's updates, not a late watch, and on another lot.
         armed = lambda expr, update, **more: dict(dict(kind='watch_armed', name='state', expr=expr, late=True,
-                                                       address=0x70088, value=0, update=update), **more)
+                                                       lot=5, address=0x70088, value=0, update=update), **more)
+        legacy = {k: v for k, v in armed('2-2,state=0x70088', 1).items() if k not in ('late', 'lot')}
         cases = [
             [armed('2-2,state=0x70088', 1), dict(kind='baseline', cr3=GAME_CR3)],
             [dict(kind='baseline', cr3=GAME_CR3), armed('3-3,state=object:5', 1)],
@@ -347,14 +351,9 @@ class CaptureTest(unittest.TestCase):
             [dict(kind='baseline', cr3=GAME_CR3), armed('2-2,state=0x70088', 2)],
             [dict(kind='baseline', cr3=GAME_CR3), armed('2-2,state=0x70088', 1, late=False)],
             [dict(kind='baseline', cr3=GAME_CR3), armed('2-2,state=0x70088', 1, lot=7)],
-            # An earlier revision's, with no lot, after a return on another lot.
-            [dict(kind='baseline', cr3=GAME_CR3), dict(kind='return_elsewhere', lot=7),
-             armed('2-2,state=0x70088', 1)],
-            # The same, the stop elsewhere logged before the baseline.
-            [dict(kind='entry_elsewhere', lot=0, count=1), dict(kind='baseline', cr3=GAME_CR3),
-             armed('2-2,state=0x70088', 1)],
-            # And two that count: on this lot, and an earlier revision's with no stop elsewhere.
-            [dict(kind='baseline', cr3=GAME_CR3), armed('2-2,state=0x70088', 1, lot=5)],
+            # An earlier revision's, which recorded no lot (nor `late`).
+            [dict(kind='baseline', cr3=GAME_CR3), legacy],
+            # And one that counts.
             [dict(kind='baseline', cr3=GAME_CR3), armed('2-2,state=0x70088', 1)],
         ]
         for n, rows in enumerate(cases):
@@ -366,7 +365,7 @@ class CaptureTest(unittest.TestCase):
                 [dict(pc=0x123456, cr3=OTHER_CR3), dict(pc=capture.RETURN)],
                 ['--updates', '2', '--resume', '--late-watch', '2-2,state=0x70088'], prepare=prepare)
             ended = self.events(output, 'watch_ended')
-            self.assertEqual([(r['update'], r['set']) for r in ended], [(2, n >= len(cases) - 2)], n)
+            self.assertEqual([(r['update'], r['set']) for r in ended], [(2, n == len(cases) - 1)], n)
 
     def test_a_late_watch_does_not_go_through_another_lots_simulator(self):
         # Taken over after update 1: a return on lot 7 gives the simulator's
@@ -402,6 +401,24 @@ class CaptureTest(unittest.TestCase):
                 ['--updates', '2', '--resume', '--late-watch', '2-2,state=0x70088'], prepare=prepare)
             rows = self.rows(output / 'watch.jsonl')
             self.assertEqual([(r['tick'], 'before' in r, 'after' in r) for r in rows], [(tick, True, True)])
+
+    def test_a_moving_late_watch_is_taken_off_on_another_lot(self):
+        # Set at the end of update 1; the guest goes to lot 7 (an entry and
+        # a return there), where it is taken off; back on lot 5 it is set
+        # again at the next entry, and ends at update 2's return.
+        remote, output, _ = self.run_capture([
+            dict(pc=0), dict(pc=capture.ENTRY), dict(pc=capture.RETURN),
+            dict(pc=capture.ENTRY, lot=7), dict(pc=capture.RETURN, lot=7),
+            dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
+            ['--updates', '2', '--late-watch', '2-2,direction=person:259@0xadc+0x88'])
+        armed = self.events(output, 'watch_armed')
+        self.assertEqual([(r['lot'], r['update']) for r in armed], [(5, 1), (5, 1)])
+        lost = self.events(output, 'watch_lost')
+        self.assertEqual([r.get('elsewhere') for r in lost], [True])
+        self.assertEqual(len(remote.watch_calls), 2)
+        self.assertEqual(len(remote.cleared_watches), 2)
+        ended = self.events(output, 'watch_ended')
+        self.assertEqual([(r['update'], r['set']) for r in ended], [(2, True)])
 
     def test_a_watch_armed_records_the_lot_it_was_armed_on(self):
         remote, output, _ = self.run_capture(
