@@ -49,6 +49,7 @@ mod head;
 mod interpreter;
 mod load;
 mod memory;
+pub mod neighborhood_open;
 mod object_uses;
 mod objects;
 pub mod orders;

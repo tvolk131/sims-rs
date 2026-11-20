@@ -160,6 +160,16 @@ impl Neighborhood {
         Ok(table)
     }
 
+    /// The files in the neighborhood's `Patch` folder, in name order:
+    /// the order the import's scan (0x42bca4) lists them in, as NTFS
+    /// returns them. Empty when there is no such folder.
+    pub fn patches(&self) -> Result<Vec<PathBuf>> {
+        match resolve(&self.directory, "Patch")? {
+            Some(directory) => sorted_entries(&directory),
+            None => Ok(Vec::new()),
+        }
+    }
+
     /// House file paths by house number, in number order.
     pub fn houses(&self) -> Result<BTreeMap<u32, PathBuf>> {
         let mut houses = BTreeMap::new();
