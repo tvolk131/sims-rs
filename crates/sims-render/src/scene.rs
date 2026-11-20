@@ -43,7 +43,9 @@ pub struct Stats {
     pub missing_objects: usize,
 }
 
-/// Draws the lot as the camera sees it. `world` is only read.
+/// Draws the lot as the camera sees it, every object included. `world`
+/// is only read. A frame with people in it draws in three passes instead:
+/// [`draw_lot`], the people, then [`draw_held`].
 pub fn draw(
     world: &World,
     lot: &Lot,
@@ -51,37 +53,148 @@ pub fn draw(
     camera: &Camera,
     canvas: &mut Canvas,
 ) -> Stats {
+    paint(world, lot, assets, camera, canvas, Pass::All)
+}
+
+/// Draws the lot as [`draw`] does, but leaves out the objects that hold a
+/// person ([`holds_person`]): the original draws those each frame after
+/// its people, not into the lot's picture under them (0x4aacb9).
+pub fn draw_lot(
+    world: &World,
+    lot: &Lot,
+    assets: &mut Assets,
+    camera: &Camera,
+    canvas: &mut Canvas,
+) -> Stats {
+    paint(world, lot, assets, camera, canvas, Pass::Lot)
+}
+
+/// Draws the objects [`draw_lot`] left out, over a canvas that holds the
+/// lot and then the people, each pixel tested against the depth there:
+/// the original's per-frame pass draws its moving objects after its
+/// people (0x4a9458, then 0x4aa1d7 from 0x4a94ab). So an in-use bench's
+/// backrest in front of the Sim on it covers the Sim, and its soft top
+/// edge blends over the Sim's clothes, not over the floor behind.
+pub fn draw_held(
+    world: &World,
+    lot: &Lot,
+    assets: &mut Assets,
+    camera: &Camera,
+    canvas: &mut Canvas,
+) -> Stats {
+    let mut painter = Painter::new(world, lot, assets, camera, canvas, Pass::Held);
+    let top = camera.level.clamp(1, 2);
+    for level in 1..=top {
+        let cut = cut(lot, camera, level, top);
+        painter.objects(level, &cut);
+    }
+    painter.stats
+}
+
+/// Which objects a pass draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    /// Every object, in the lot's own pass.
+    All,
+    /// The objects that hold no person.
+    Lot,
+    /// The objects that hold a person, after the people.
+    Held,
+}
+
+fn paint(
+    world: &World,
+    lot: &Lot,
+    assets: &mut Assets,
+    camera: &Camera,
+    canvas: &mut Canvas,
+    pass: Pass,
+) -> Stats {
     canvas.clear(BACKGROUND);
-    let mut painter = Painter {
-        world,
-        lot,
-        camera,
-        assets,
-        canvas,
-        grass: Grass::new(lot, camera),
-        depth: Depth::new(camera),
-        stats: Stats::default(),
-    };
+    let mut painter = Painter::new(world, lot, assets, camera, canvas, pass);
     let top = camera.level.clamp(1, 2);
     for level in 1..=top {
         painter.floors(level);
-        // Only the top floor shown is cut away; the floors below it stand
-        // (0x4a8895, the old prototype's `wall_view.rs`).
-        let cut = if level < top {
-            Cut::None
-        } else {
-            match camera.walls {
-                Walls::Up => Cut::None,
-                Walls::Down => Cut::All,
-                Walls::Cutaway => Cut::Mask(Box::new(Mask::new(lot, camera))),
-            }
-        };
+        let cut = cut(lot, camera, level, top);
         let corners = painter.corners(level, &cut);
         painter.walls(level, &cut, &corners);
         painter.trims(level, &corners);
         painter.objects(level, &cut);
     }
     painter.stats
+}
+
+/// How a level's walls are cut. Only the top floor shown is cut away; the
+/// floors below it stand (0x4a8895, the old prototype's `wall_view.rs`).
+fn cut(lot: &Lot, camera: &Camera, level: i32, top: i32) -> Cut {
+    if level < top {
+        Cut::None
+    } else {
+        match camera.walls {
+            Walls::Up => Cut::None,
+            Walls::Down => Cut::All,
+            Walls::Cutaway => Cut::Mask(Box::new(Mask::new(lot, camera))),
+        }
+    }
+}
+
+/// The objects that hold a person, directly or through other objects, and
+/// everything else in the same holder's tree: the original marks them
+/// moving each time a person in the tree animates. A person's animation
+/// (0x5859fa, 0x585b80, 0x58da79, 0x58f873, 0x591dfb) calls 0x434101,
+/// which climbs the holders to the outermost one and marks it and all it
+/// holds, at every depth, as moving (0x434657, recursing at 0x4347bc). A
+/// person's own time-out is never reached (vtable +0x18 is 0x7fffffff at
+/// 0x4226b6), and a person animates every tick, so the tree stays marked
+/// while the person is in it. People themselves are not in the set; they
+/// draw in their own pass. A holder chain that loops counts as its own
+/// tree.
+pub fn holds_person(world: &World) -> BTreeSet<u16> {
+    let people = world
+        .objects
+        .iter()
+        .filter(|(_, o)| o.person.is_some())
+        .map(|(&id, _)| id)
+        .collect();
+    held_trees(&world.objects, &people)
+}
+
+/// [`holds_person`] for `objects`, of which `people` are the people.
+fn held_trees(objects: &BTreeMap<u16, Object>, people: &BTreeSet<u16>) -> BTreeSet<u16> {
+    let holder = |o: &Object| {
+        u16::try_from(o.data.get(CONTAINER).copied().unwrap_or(0))
+            .ok()
+            .filter(|&c| c != 0 && objects.contains_key(&c))
+    };
+    // The outermost holder of each object; for holders that hold each
+    // other, the lowest ID in their loop, the same from wherever the climb
+    // starts.
+    let up = |id: u16| objects.get(&id).and_then(holder);
+    let root = |id: u16| {
+        let mut at = id;
+        let mut seen = BTreeSet::from([id]);
+        while let Some(next) = up(at) {
+            if !seen.insert(next) {
+                let mut lowest = next;
+                let mut on = up(next);
+                while let Some(o) = on.filter(|&o| o != next) {
+                    lowest = lowest.min(o);
+                    on = up(o);
+                }
+                return lowest;
+            }
+            at = next;
+        }
+        at
+    };
+    // A person who holds things and is held by nothing is the root of
+    // their own tree.
+    let roots: BTreeSet<u16> = people.iter().map(|&id| root(id)).collect();
+    objects
+        .keys()
+        .filter(|&id| !people.contains(id) && roots.contains(&root(*id)))
+        .copied()
+        .collect()
 }
 
 /// Which walls of a level are cut down, and which objects hide with them.
@@ -220,6 +333,9 @@ fn wall_side(s: &Segment, side: usize) -> [i32; 2] {
 }
 
 struct Painter<'a> {
+    pass: Pass,
+    /// The objects that hold a person, for passes other than `All`.
+    held: BTreeSet<u16>,
     world: &'a World,
     lot: &'a Lot,
     camera: &'a Camera,
@@ -230,7 +346,33 @@ struct Painter<'a> {
     stats: Stats,
 }
 
-impl Painter<'_> {
+impl<'a> Painter<'a> {
+    fn new(
+        world: &'a World,
+        lot: &'a Lot,
+        assets: &'a mut Assets,
+        camera: &'a Camera,
+        canvas: &'a mut Canvas,
+        pass: Pass,
+    ) -> Self {
+        Painter {
+            pass,
+            held: if pass == Pass::All {
+                BTreeSet::new()
+            } else {
+                holds_person(world)
+            },
+            world,
+            lot,
+            camera,
+            assets,
+            canvas,
+            grass: Grass::new(lot, camera),
+            depth: Depth::new(camera),
+            stats: Stats::default(),
+        }
+    }
+
     /// The elevation of a lot corner in near-zoom pixels: 16 per terrain
     /// step.
     fn corner_elevation(&self, [cx, cy]: [i32; 2]) -> i32 {
@@ -1013,6 +1155,14 @@ impl Painter<'_> {
             if o.person.is_some() || z != level || x < 0 || y < 0 {
                 continue;
             }
+            let wanted = match self.pass {
+                Pass::All => true,
+                Pass::Lot => !self.held.contains(&id),
+                Pass::Held => self.held.contains(&id),
+            };
+            if !wanted {
+                continue;
+            }
             // A script can hide an object (data word 34); the original
             // skips it when drawing, as the old prototype did
             // (`legacy/crates/sims-render/src/lib.rs`).
@@ -1767,6 +1917,31 @@ mod tests {
             object(3, TABLE, [0, 0, 1], &[(CONTAINER, 3), (CONTAINER_SLOT, 1)]),
         );
         assert_eq!(held(&objects, slot, 3), Some(([0.0; 2], 0.0)));
+    }
+
+    #[test]
+    fn a_persons_holders_and_all_they_hold_draw_after_the_people() {
+        let held = |at: u16, slot: i16| [(CONTAINER, at as i16), (CONTAINER_SLOT, slot)];
+        let mut objects = BTreeMap::new();
+        // A bench (1) holds a person (2) and a book (3); the person holds
+        // a plumb bob (4); a table (5) holds a lamp (6); a person (7)
+        // stands alone; a person (8) holds a drink (9).
+        objects.insert(1, object(1, 1, [0, 0, 1], &[]));
+        objects.insert(2, object(2, 2, [0, 0, 1], &held(1, 1)));
+        objects.insert(3, object(3, 3, [0, 0, 1], &held(1, 0)));
+        objects.insert(4, object(4, 4, [0, 0, 1], &held(2, 0)));
+        objects.insert(5, object(5, 5, [0, 0, 1], &[]));
+        objects.insert(6, object(6, 6, [0, 0, 1], &held(5, 0)));
+        objects.insert(7, object(7, 7, [0, 0, 1], &[]));
+        objects.insert(8, object(8, 8, [0, 0, 1], &[]));
+        objects.insert(9, object(9, 9, [0, 0, 1], &held(8, 0)));
+        let people = BTreeSet::from([2, 7, 8]);
+        assert_eq!(held_trees(&objects, &people), BTreeSet::from([1, 3, 4, 9]));
+        // Holders that hold each other are one tree, whichever of them
+        // the climb starts from.
+        objects.get_mut(&5).unwrap().data[CONTAINER] = 6;
+        objects.get_mut(&1).unwrap().data[CONTAINER] = 3;
+        assert_eq!(held_trees(&objects, &people), BTreeSet::from([1, 3, 4, 9]));
     }
 
     #[test]

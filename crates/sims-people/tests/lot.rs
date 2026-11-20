@@ -760,3 +760,61 @@ fn the_lamps_of_a_persons_room_light_them() {
     };
     assert!(sum(&lit) > sum(&unlit) + changed.len() as u64 * 6);
 }
+
+/// A Sim on a bench, behind its backrest: in a state where Mortimer
+/// (person 21) reads on the porch bench (174), as in a screenshot of the
+/// original at near zoom (7:12 AM, rotation 2, camera origin (591, −2018),
+/// walls down, matched to ours pixel for pixel elsewhere), the backrest's
+/// soft top edge blends over his coat, because the original draws the
+/// bench after its people (0x4aacb9, 0x4aa1d7). Drawn into the lot under
+/// him, the edge blends over the floor. The original shows (32, 16, 8)
+/// and (65, 32, 8) at the two pixels compared, in 16-bit colour.
+#[test]
+fn a_bench_in_use_draws_after_the_sim_on_it() {
+    let Some(root) = install() else { return };
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut opened = sims_render::open_house(&root, &house).unwrap();
+    let mut lot = Lot::load(&root, &house, &[3, 3], Frames::default()).unwrap();
+    lot.wait_for_answers();
+    let mut people = People::open(&root, &house).unwrap();
+    while lot.ticks() < 1260 {
+        lot.step().unwrap();
+    }
+    let world = lot.world();
+    // Both porch benches hold someone, and Mortimer holds the plumb bob.
+    assert_eq!(
+        sims_render::holds_person(world),
+        [173, 174, 383].into_iter().collect()
+    );
+    assert_eq!(people.update(world), Vec::<String>::new());
+    let camera = LotCamera {
+        zoom: Zoom::Near,
+        rotation: 2,
+        level: 1,
+        origin: [591, -2018],
+        walls: Walls::Down,
+        focus: Default::default(),
+    };
+    let shape = sims_render::Lot::from_world(world).unwrap();
+    let mut frame = |passes: bool| {
+        let mut canvas = sims_render::Canvas::new(800, 600, [0, 0, 0]);
+        if passes {
+            sims_render::draw_lot(world, &shape, &mut opened.assets, &camera, &mut canvas);
+        } else {
+            sims_render::draw(world, &shape, &mut opened.assets, &camera, &mut canvas);
+        }
+        let drawn = people.draw_on_lot(world, &camera, &mut canvas);
+        assert!(drawn.problems.is_empty(), "{:?}", drawn.problems);
+        if passes {
+            sims_render::draw_held(world, &shape, &mut opened.assets, &camera, &mut canvas);
+        }
+        canvas
+    };
+    let [after, under] = [frame(true), frame(false)];
+    for ([x, y], original) in [([385, 311], [32, 16, 8]), ([405, 305], [65, 32, 8])] {
+        let at = |c: &sims_render::Canvas| c.rgb565()[y * 800 + x];
+        let near = |c: [u8; 3]| c.iter().zip(original).all(|(&a, b)| a.abs_diff(b) <= 12);
+        assert!(near(at(&after)), "({x}, {y}): {:?}", at(&after));
+        assert!(!near(at(&under)), "({x}, {y}): {:?}", at(&under));
+    }
+}
