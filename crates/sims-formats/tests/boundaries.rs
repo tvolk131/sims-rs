@@ -494,6 +494,16 @@ fn a_resource_map_can_choose_the_earlier_chunk() {
     assert_eq!(iff.data(iff.get(b"STR#", 1).unwrap()), b"old");
     assert!(iff.get(b"STR#", 2).is_none());
     assert_eq!(payloads(&iff, b"STR#"), [&b"old"[..], b"low bits"]);
+    // The byte order is the map's flags', not the header's (0x41d3a7).
+    let low = iff.get(b"STR#", 3).unwrap();
+    assert_eq!((low.flags, iff.resource_flags(low)), (0x10, 0));
+}
+#[test]
+fn without_a_map_a_resource_keeps_its_header_flags() {
+    let mut b = header();
+    add_flagged(&mut b, b"STR#", 3, 0x10, b"low bits");
+    let iff = Iff::parse(b).unwrap();
+    assert_eq!(iff.resource_flags(iff.get(b"STR#", 3).unwrap()), 0x10);
 }
 #[test]
 fn a_map_listing_a_map_is_ignored() {
