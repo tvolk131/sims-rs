@@ -2071,6 +2071,263 @@ fn the_recorded_snack_order_replayed_in_the_window_matches_the_recording() {
     assert_eq!(game.caught(), 0, "{:?}", game.errors());
 }
 
+/// Where a point of track 2's recordings of the Goth house is in the
+/// window at 800 by 600: the original's view shows the lot 97 pixels
+/// left of and 46 above ours (the screenshots correlate to the pixel,
+/// people too; see docs/decisions/). The panel is not moved.
+fn recorded([x, y]: [i32; 2]) -> [i32; 2] {
+    [x + 97, y + 46]
+}
+
+/// The middle of `label` on the open pie menu.
+fn pie_entry(game: &Game, label: &str) -> [i32; 2] {
+    let menu = game.menu().expect("a pie menu is open");
+    let (_, r) = menu
+        .labels()
+        .into_iter()
+        .find(|(text, _)| *text == label)
+        .unwrap_or_else(|| panic!("{label} on the pie"));
+    [r.x + r.width / 2, r.y + r.height / 2]
+}
+
+/// Runs the lot to `tick`, drawing a frame after each update as the
+/// window does. The lot must not be past `tick` already.
+fn run_to(game: &mut Game, tick: u32) {
+    assert!(game.lot().ticks() <= tick, "already past {tick}");
+    while game.lot().ticks() < tick {
+        assert_eq!(game.run(1), 1, "{:?}", game.stopped());
+        game.render();
+    }
+}
+
+/// A person's Room motive (13), as bits.
+fn room(game: &Game, id: u16) -> u32 {
+    game.lot().world().objects[&id]
+        .person
+        .as_ref()
+        .unwrap()
+        .motives[13]
+        .to_bits()
+}
+
+/// (uid, target, routine, table index, priority, flags) of an action.
+fn action(a: &sims_formats::saved_objects::Interaction) -> (i32, i16, u16, i32, i32, u32) {
+    (
+        a.uid,
+        a.target,
+        a.action,
+        a.table_index,
+        a.priority,
+        a.flags,
+    )
+}
+
+/// Track 2's recording of the original ordering Mortimer onto the porch
+/// bench (goth-sit-read-order-20261115), replayed in the window: each
+/// pointer move and press is given at the recording's point once the lot
+/// has run the update before its command ended, as its effect shows in
+/// the recording's state of the update the command ended. With frames after every 30th update from 170 (the recording's
+/// Room motives show them after 470 and 620), the lot equals the
+/// recording's after every update to 260 but for Bella's local from 203
+/// to 227, as in the snack order. From 261 on, the original lists pies
+/// under the still pointer that ours does not, and its pointer found the
+/// bookcase at 590 where ours finds the salesman (see docs/decisions/).
+#[test]
+fn the_recorded_sit_order_replayed_in_the_window_matches_the_recording() {
+    let Some(install) = install() else {
+        return;
+    };
+    let frames = Frames::parse("0,1,2,3,33,63,93,123,153,170+30").expect("a schedule");
+    let mut game = Game::open(&Options {
+        frames,
+        ..options(install)
+    })
+    .expect("the Goth house opens");
+    game.resize([800, 600]);
+    let (mortimer, bench, salesman) = (21, 173, 259);
+    assert_eq!(game.lot().world().selected(), Some(mortimer));
+    for (tick, at) in [(91, [432, 254]), (117, [432, 242])] {
+        run_to(&mut game, tick);
+        game.hover(recorded(at));
+        assert_eq!(game.listed(), None, "{tick}");
+    }
+    run_to(&mut game, 123);
+    game.hover(recorded([432, 230]));
+    assert_eq!(game.listed(), Some((mortimer, bench)));
+    run_to(&mut game, 153);
+    game.press(recorded([432, 230]));
+    game.render();
+    let labels: Vec<String> = game
+        .menu()
+        .expect("the bench's pie")
+        .labels()
+        .into_iter()
+        .map(|(text, _)| text.to_string())
+        .collect();
+    assert_eq!(labels, ["Sit"]);
+    run_to(&mut game, 173);
+    let sit = pie_entry(&game, "Sit");
+    game.hover(sit);
+    run_to(&mut game, 200);
+    game.press(sit);
+    assert!(game.menu().is_none());
+    // The recording pushed it before update 201 and had it running, with
+    // an empty queue, at 203.
+    run_to(&mut game, 201);
+    let person = game.lot().world().objects[&mortimer]
+        .person
+        .clone()
+        .unwrap();
+    assert_eq!(action(&person.active), (1, bench as i16, 8213, 0, 50, 12));
+    assert!(person.queue.is_empty());
+    // Bella's (18) room is counted again in the frame after 470, and the
+    // others' after 620.
+    run_to(&mut game, 470);
+    assert_eq!(room(&game, 18), 0x4225_ac1d);
+    run_to(&mut game, 471);
+    assert_eq!(room(&game, 18), 0x4277_073c);
+    run_to(&mut game, 620);
+    for id in [16, mortimer, salesman] {
+        assert_eq!(room(&game, id), 0x429a_aaab, "{id}");
+    }
+    run_to(&mut game, 621);
+    for id in [16, mortimer, salesman] {
+        assert_eq!(room(&game, id), 0x4232_aaab, "{id}");
+    }
+    run_to(&mut game, 800);
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
+}
+
+/// Track 2's recording of the original ordering two snacks and
+/// cancelling both (goth-cancel-order-20261116), replayed in the window
+/// as the Sit order is. The second snack waits behind the first; a press
+/// on its icon takes it off, and one on the running snack's icon cancels
+/// it, which queues his own action 8318 and sets flag 0x100 on the
+/// snack. The first cancel shows in update 505's state, the update its
+/// release's command ended. The second shows in update 595's state,
+/// which was saved before its release was sent, so which of its button
+/// events acts is not known. The replay gives each press once the lot
+/// has run the update before the one its effect shows in. With the frames
+/// its Room motives show (after 316, 474, 648 and 1124), the lot equals
+/// the recording's after every update to 1300 but for the pointer's two
+/// listings ours does not make: on the kitchen counter behind its wall
+/// at 90, and under the still pointer at 256 (see docs/decisions/).
+#[test]
+fn the_recorded_cancel_order_replayed_in_the_window_matches_the_recording() {
+    let Some(install) = install() else {
+        return;
+    };
+    let frames = Frames::parse("0,1,2,3,33,63,93,123,153,171,201,231,261,291,316,474,648,1124")
+        .expect("a schedule");
+    let mut game = Game::open(&Options {
+        frames,
+        ..options(install)
+    })
+    .expect("the Goth house opens");
+    game.resize([800, 600]);
+    let (mortimer, fridge, bookcase, salesman) = (21, 118, 132, 259);
+    assert_eq!(game.lot().world().selected(), Some(mortimer));
+    let person = |game: &Game| {
+        game.lot().world().objects[&mortimer]
+            .person
+            .clone()
+            .unwrap()
+    };
+    let snack = |uid| (uid, fridge as i16, 4103, 1, 50, 12);
+    let order = |game: &mut Game, hovers: &[(u32, [i32; 2])], press: u32, entry: (u32, u32)| {
+        for &(tick, at) in hovers {
+            run_to(game, tick);
+            game.hover(recorded(at));
+        }
+        assert_eq!(game.listed(), Some((mortimer, fridge)));
+        run_to(game, press);
+        game.press(recorded(hovers.last().unwrap().1));
+        game.render();
+        run_to(game, entry.0);
+        let at = pie_entry(game, "Have A Snack");
+        game.hover(at);
+        run_to(game, entry.1);
+        game.press(at);
+        assert!(game.menu().is_none());
+    };
+    order(
+        &mut game,
+        &[(90, [176, 222]), (123, [176, 210]), (153, [176, 198])],
+        183,
+        (201, 256),
+    );
+    // Queued behind his reading (the bookcase's 4110), as recorded at
+    // 257.
+    run_to(&mut game, 257);
+    let p = person(&game);
+    assert_eq!(action(&p.active), (1, bookcase as i16, 4110, 6, 2, 0));
+    assert_eq!(p.queue.iter().map(action).collect::<Vec<_>>(), [snack(2)]);
+    // The second order's first two pointer moves; his room is counted
+    // again in the frame after 316, the update the second one reached.
+    run_to(&mut game, 310);
+    game.hover(recorded([176, 222]));
+    run_to(&mut game, 316);
+    assert_eq!(room(&game, mortimer), 0x4225_ac1d);
+    game.hover(recorded([176, 210]));
+    run_to(&mut game, 317);
+    assert_eq!(room(&game, mortimer), 0x4277_073c);
+    order(
+        &mut game,
+        &[(341, [176, 198]), (346, [176, 186])],
+        376,
+        (396, 444),
+    );
+    run_to(&mut game, 445);
+    let p = person(&game);
+    assert_eq!(action(&p.active), snack(2));
+    assert_eq!(p.queue.iter().map(action).collect::<Vec<_>>(), [snack(5)]);
+    run_to(&mut game, 474);
+    assert_eq!(room(&game, mortimer), 0x415c_71c8);
+    game.hover([104, 54]);
+    run_to(&mut game, 475);
+    assert_eq!(room(&game, mortimer), 0x4253_a203);
+    // The queued snack's icon, second in the queue.
+    run_to(&mut game, 504);
+    assert_eq!(
+        person(&game).queue.iter().map(action).collect::<Vec<_>>(),
+        [snack(5)]
+    );
+    game.press([104, 54]);
+    run_to(&mut game, 505);
+    let p = person(&game);
+    assert_eq!(action(&p.active), snack(2));
+    assert!(p.queue.is_empty());
+    // The running snack's icon.
+    run_to(&mut game, 564);
+    game.hover([54, 54]);
+    run_to(&mut game, 594);
+    game.press([54, 54]);
+    run_to(&mut game, 595);
+    let p = person(&game);
+    assert_eq!(action(&p.active), (2, fridge as i16, 4103, 1, 50, 0x10c));
+    assert_eq!(
+        p.queue.iter().map(action).collect::<Vec<_>>(),
+        [(7, mortimer as i16, 8318, 33, 50, 0)]
+    );
+    assert_eq!(p.data[33], 0);
+    // The salesman is taken off the lot in update 597, his door knock
+    // still playing, as in the recording.
+    run_to(&mut game, 596);
+    assert!(game.lot().world().objects.contains_key(&salesman));
+    run_to(&mut game, 597);
+    assert!(!game.lot().world().objects.contains_key(&salesman));
+    run_to(&mut game, 648);
+    assert_eq!(room(&game, 16), 0x4277_073c);
+    run_to(&mut game, 649);
+    assert_eq!(room(&game, 16), 0x422c_0000);
+    run_to(&mut game, 1124);
+    assert_eq!(room(&game, mortimer), 0x4253_a203);
+    run_to(&mut game, 1125);
+    assert_eq!(room(&game, mortimer), 0x4225_ac1d);
+    run_to(&mut game, 1300);
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
+}
+
 /// Reaching a pie entry checks its action, which changes the lot;
 /// staying on it does not check it again, but leaving the window and
 /// coming back onto it does, as passing over another point of the pie
