@@ -2799,3 +2799,135 @@ fn a_fade_that_ends_a_track_beyond_the_budget_ends_it_at_once() {
     assert_eq!(fields_asked_in_order(&mut player), [7]);
     assert_eq!(fields_asked_in_order(&mut player), []);
 }
+
+/// Waits `ms` milliseconds (loadl v1; wait v1).
+fn waits(ms: u32) -> Vec<u8> {
+    let mut routine = vec![LOADL, 5];
+    routine.extend(long(ms));
+    routine.extend([WAIT, 5]);
+    routine
+}
+
+/// Asks once about field `field` (of the object its first argument
+/// names), then goes on.
+fn asks_once(field: u32) -> Vec<u8> {
+    let mut routine = vec![LOADL, 5];
+    routine.extend(long(field));
+    routine.extend([GETSRCDATAFIELD, 6, 1, 5]);
+    routine
+}
+
+#[test]
+fn a_track_started_again_before_its_turn_restarts_itself_there() {
+    // Track 10 ends track 11 and starts it again; in its turn there,
+    // track 11 sets interrupt and plays itself, which starts it anew
+    // from the top, so it never asks.
+    let killer: &[u8] = &[LOADB_V1, 5, 11, KILL_TRK, 5, PLAY_TRK, 5, END];
+    let mut restarter = vec![LOADB_V1, 55, 1, LOADB_V1, 5, 11, PLAY_TRK, 5];
+    restarter.extend(asks_once(7));
+    restarter.push(END);
+    let module = module_of_tracks(&[(10, killer), (11, &restarter)], "");
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "e10");
+    play(&mut player, "e11");
+    for _ in 0..3 {
+        assert_eq!(fields_asked_in_order(&mut player), []);
+    }
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_held_track_let_go_during_a_block_first_runs_in_the_next() {
+    // Track 0x606 asks every block; the pause holds it. Track 0x605,
+    // which the pause spares, waits a second, then plays it, which lets
+    // it go, and asks about field 99. A hold takes a track out of the
+    // list of running tracks, so 0x606 is not in that block's copy.
+    let mut releaser = waits(1000);
+    releaser.extend([LOADL, 5]);
+    releaser.extend(long(0x606));
+    releaser.extend([PLAY_TRK, 5]);
+    releaser.extend(asks_once(99));
+    releaser.push(END);
+    let asker = asks(7, true);
+    let module = module_with(&[&releaser, &asker], 1, 0x605, "");
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "e0");
+    play(&mut player, "e1");
+    assert_eq!(fields_asked_in_order(&mut player), [7]);
+    player.handle(&SoundEvent::Pause, &NoSources);
+    let mut blocks = Vec::new();
+    while blocks.len() < 1000 && !blocks.contains(&vec![99]) {
+        blocks.push(fields_asked_in_order(&mut player));
+    }
+    assert!(
+        blocks[..blocks.len() - 1].iter().all(Vec::is_empty),
+        "{blocks:?}"
+    );
+    assert_eq!(blocks.last(), Some(&vec![99]));
+    assert_eq!(fields_asked_in_order(&mut player), [7]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_play_of_a_running_track_takes_its_own_argument_kind() {
+    // The first module's track 10 takes no levels from its arguments; it
+    // asks once and waits, with interrupt 1. The second module's track 10
+    // is `kArgsIdVolPan`, and its event plays it for object 0, which
+    // would start nothing; but the running track object is the first
+    // module's, so the play restarts it.
+    let mut first = vec![LOADB_V1, 55, 1];
+    first.extend(asks_once(7));
+    first.extend([SET_LOOP, LOOP]);
+    let mut padding = vec![NOP; 400];
+    padding.push(END);
+    let second = module_of_kinds(
+        &[(99, 2, &padding), (10, 2, &[END])],
+        "again=kSndobPlay,10\n",
+    );
+    let modules = vec![module_of_kinds(&[(10, 0, &first)], ""), second];
+    let mut player = Player::new(modules, samples(), 1);
+    play(&mut player, "e10");
+    assert_eq!(fields_asked_in_order(&mut player), [7]);
+    assert_eq!(fields_asked_in_order(&mut player), []);
+    play_for(&mut player, 0, "again");
+    assert_eq!(fields_asked_in_order(&mut player), [7]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn seqgroup_kill_ends_a_holder_started_again_in_the_block() {
+    // Track 11 asks, then holds group 1. A block later, track 10 ends it
+    // and starts it again at extvol 0 (its arguments give no volume),
+    // and track 12 takes group 1 before track 11's turn: the holder's
+    // extvol is 0, so it ends at once and never asks again.
+    let mut holder = asks_once(7);
+    holder.extend(loadb(5, 1));
+    holder.extend([SEQGROUP_RETURN, 5, SET_LOOP, LOOP]);
+    let mut killer = waits(1);
+    killer.extend([LOADB_V1, 5, 11, KILL_TRK, 5, PLAY_TRK, 5, END]);
+    let mut taker = waits(1);
+    taker.extend(loadb(5, 1));
+    taker.extend([SEQGROUP_KILL, 5, END]);
+    let module = module_of_tracks(&[(10, &killer), (11, &holder), (12, &taker)], "");
+    let mut player = Player::new(vec![module], samples(), 1);
+    for name in ["e10", "e12", "e11"] {
+        play(&mut player, name);
+    }
+    assert_eq!(fields_asked_in_order(&mut player), [7]);
+    assert_eq!(fields_asked_in_order(&mut player), []);
+    assert!(player.is_idle());
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn an_unpause_runs_the_tracks_in_the_order_of_their_numbers() {
+    // Track 11 started first, then 10; the unpause lets go of each, in
+    // the order of the original's registry (here, of their numbers).
+    let module = module_of_tracks(&[(10, &asks(10, true)), (11, &asks(11, true))], "");
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "e11");
+    play(&mut player, "e10");
+    assert_eq!(fields_asked_in_order(&mut player), [11, 10]);
+    player.handle(&SoundEvent::Unpause, &NoSources);
+    assert_eq!(fields_asked_in_order(&mut player), [10, 11]);
+}

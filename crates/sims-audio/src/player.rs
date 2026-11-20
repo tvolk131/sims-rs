@@ -230,7 +230,7 @@ pub const FADE_ON: u8 = 45;
 /// `source`, which `play_trk` hands on to the track it starts.
 pub const SOURCE: u8 = 47;
 /// `interrupt`: when not 0, a start of the track while it runs starts it
-/// again (see [`Player::start`]). In the install only `loadb` writes it;
+/// again (see `Player::start`). In the install only `loadb` writes it;
 /// `set` can too (0x57e219 to 0x57e2da).
 pub const INTERRUPT: u8 = 55;
 /// `isplaying`, which a fresh start sets to 1.
@@ -615,8 +615,6 @@ pub struct Player<S> {
     cache: BTreeMap<u32, Option<Pcm>>,
     globals: [i32; 256 - GLOBALS as usize],
     threads: Vec<Thread>,
-    /// Threads started by `play_trk`, which first run in the next block.
-    pending: Vec<Thread>,
     /// Whether a block has run out of instructions; reported once.
     over_budget: bool,
     /// Sequence groups: the group a register names, to the ID of the
@@ -714,7 +712,6 @@ impl<S: Samples> Player<S> {
             cache: BTreeMap::new(),
             globals: [0; 256 - GLOBALS as usize],
             threads: Vec::new(),
-            pending: Vec::new(),
             over_budget: false,
             seqgroups: BTreeMap::new(),
             duck: BTreeMap::new(),
@@ -933,12 +930,7 @@ impl<S: Samples> Player<S> {
         // and read itself.
         let last = self.last_start.get(&track).copied();
         let newest = self.newest(track).map(|at| self.threads[at].id);
-        let running = |id: u32| {
-            self.threads
-                .iter()
-                .chain(&self.pending)
-                .find(|t| t.id == id)
-        };
+        let running = |id: u32| self.threads.iter().find(|t| t.id == id);
         // The last start's thread reads through the chain its write
         // goes through.
         let spl_of = |thread: &Thread| {
@@ -1166,7 +1158,7 @@ impl<S: Samples> Player<S> {
         }
         // *(code)* Each start lets the track go (vtable +0x2c, 0x57523f).
         let start = |player: &mut Self, track: u32, list: u32| {
-            let started = player.start([list, 0, 0], module, track, false);
+            let started = player.start([list, 0, 0], module, track);
             player.let_go(&started.threads);
         };
         let switch = |player: &mut Self, list: u32| {
@@ -1221,12 +1213,10 @@ impl<S: Samples> Player<S> {
         let ended: Vec<u32> = self
             .threads
             .iter()
-            .chain(&self.pending)
             .filter(|t| t.track == track && !spared(t.id))
             .map(|t| t.id)
             .collect();
         self.threads.retain(|t| !ended.contains(&t.id));
-        self.pending.retain(|t| !ended.contains(&t.id));
         self.notes
             .retain(|n| !(n.track == track && !spared(n.thread)));
         self.forget_ended();
@@ -1254,7 +1244,6 @@ impl<S: Samples> Player<S> {
     /// Whether nothing is running or playing.
     pub fn is_idle(&self) -> bool {
         self.threads.is_empty()
-            && self.pending.is_empty()
             && self.notes.is_empty()
             && self.voices.is_empty()
             && self.scores.values().all(|s| !s.is_started())
@@ -1380,8 +1369,16 @@ impl<S: Samples> Player<S> {
         if !alive {
             self.instances.retain(|&(t, _)| t != track);
         }
+        // *(code)* The argument kind is the track object's own (+0x28 on
+        // the object looked up, 0x573748 to 0x573756): a running track's
+        // is that of the module its thread came from.
+        let module = self
+            .threads
+            .iter()
+            .find(|t| t.track == track)
+            .map_or(module, |t| t.module);
         if self.track_args(module, track) != Some(ARGS_ID_VOL_PAN) {
-            let started = self.start(args, module, track, false);
+            let started = self.start(args, module, track);
             self.let_go(&started.threads);
             return;
         }
@@ -1390,7 +1387,7 @@ impl<S: Samples> Player<S> {
         }
         self.record(track, args[0]);
         let placed = self.placed(track, sources);
-        let started = self.start(args, module, track, false);
+        let started = self.start(args, module, track);
         self.place(&started.threads, placed);
         self.let_go(&started.threads);
     }
@@ -1429,7 +1426,6 @@ impl<S: Samples> Player<S> {
     fn spl(&self, track: u32) -> i32 {
         self.threads
             .iter()
-            .chain(&self.pending)
             .filter(|t| t.track == track)
             .max_by_key(|t| t.id)
             .map_or(SPL_NORMAL, |t| self.read(t, i64::from(SPL)))
@@ -1443,12 +1439,7 @@ impl<S: Samples> Player<S> {
         let Some((vol, pan)) = placed else {
             return;
         };
-        for thread in self
-            .threads
-            .iter_mut()
-            .chain(&mut self.pending)
-            .filter(|t| threads.contains(&t.id))
-        {
+        for thread in self.threads.iter_mut().filter(|t| threads.contains(&t.id)) {
             thread.registers[usize::from(EXTVOL)] = vol;
             thread.registers[usize::from(PAN)] = pan;
             thread.kept = i64::from(pan);
@@ -1518,12 +1509,7 @@ impl<S: Samples> Player<S> {
     /// and writes do not follow ended threads ([`Player::resolve`]).
     fn place_through(&mut self, id: u32, vol: i32, pan: i32) {
         let at = self.camera_destination(id);
-        if let Some(thread) = self
-            .threads
-            .iter_mut()
-            .chain(&mut self.pending)
-            .find(|t| t.id == at)
-        {
+        if let Some(thread) = self.threads.iter_mut().find(|t| t.id == at) {
             place_itself(thread, vol, pan);
         } else if let Some(mut thread) = self.ended.remove(&at) {
             place_itself(&mut thread, vol, pan);
@@ -1539,7 +1525,7 @@ impl<S: Samples> Player<S> {
     /// The thread a camera placement written by thread `id` lands in, and
     /// whose `Spl` it reads ([`Player::place_through`]): `id`, or on
     /// through `target` from each thread that is its track's last start,
-    /// into running or pending threads, playing or not, or ended threads
+    /// into running threads, playing or not, or ended threads
     /// whose notes still play. A link to anything else, or back to a
     /// thread already passed, stops the chain where it is.
     fn camera_destination(&self, id: u32) -> u32 {
@@ -1557,18 +1543,14 @@ impl<S: Samples> Player<S> {
         at
     }
 
-    /// The running or pending thread `id`, or the ended one if its notes
+    /// The running thread `id`, or the ended one if its notes
     /// still play.
     fn kept_thread(&self, id: u32) -> Option<&Thread> {
-        self.threads
-            .iter()
-            .chain(&self.pending)
-            .find(|t| t.id == id)
-            .or_else(|| {
-                self.ended
-                    .get(&id)
-                    .filter(|_| self.notes.iter().any(|n| n.thread == id))
-            })
+        self.threads.iter().find(|t| t.id == id).or_else(|| {
+            self.ended
+                .get(&id)
+                .filter(|_| self.notes.iter().any(|n| n.thread == id))
+        })
     }
 
     /// Writes a register of the thread at `at` as that thread would.
@@ -1636,7 +1618,6 @@ impl<S: Samples> Player<S> {
         let tracks: BTreeSet<u32> = self
             .threads
             .iter()
-            .chain(&self.pending)
             .map(|t| t.track)
             .chain(self.notes.iter().map(|n| n.track))
             .filter(|t| !PAUSE_SPARES.contains(t))
@@ -1660,13 +1641,22 @@ impl<S: Samples> Player<S> {
     /// restarts its day and night loop and its music, 0x575155, which
     /// this player does not have.) `main_duckpri` stays as the pause
     /// left it until a thread asks again.
+    ///
+    /// The original lets go of the tracks in the order of its registry of
+    /// track objects (0x57cd56 to 0x57cd82), a hash table walked bucket
+    /// by bucket (0x5807c2, 0x576be5; a track's bucket is its number
+    /// modulo their count, 0x4c93ac). Each let go is put last in the list
+    /// of running tracks, so from the next block the tracks run in that
+    /// order. Here it is the order of their numbers, which is the
+    /// registry's while it has more buckets than the largest number; the
+    /// count of buckets is **unverified**.
     pub fn unpause(&mut self) {
         self.paused = false;
         self.held.clear();
-        let now = self.frame;
-        for thread in self.threads.iter_mut().chain(&mut self.pending) {
-            thread.wake = now;
-        }
+        let mut running: Vec<(u32, u32)> = self.threads.iter().map(|t| (t.track, t.id)).collect();
+        running.sort_unstable();
+        let ids: Vec<u32> = running.into_iter().map(|(_, id)| id).collect();
+        self.let_go(&ids);
         if let Some(current) = self.ambience {
             self.with_score(current, |score, _| score.set_paused(false));
         }
@@ -1683,7 +1673,6 @@ impl<S: Samples> Player<S> {
     /// player does not have.) Sequence groups are cleared too.
     fn kill_all(&mut self) {
         self.threads.clear();
-        self.pending.clear();
         self.notes.clear();
         self.ended.clear();
         self.idle.clear();
@@ -1767,7 +1756,6 @@ impl<S: Samples> Player<S> {
                 self.threads.remove(at);
             }
         }
-        self.pending.retain(|t| t.track != track);
         // Notes that outlived their thread have no registers to fade, and
         // end at once.
         let running: BTreeSet<u32> = self.threads.iter().map(|t| t.id).collect();
@@ -1790,7 +1778,7 @@ impl<S: Samples> Player<S> {
         }
         self.record(track, args[0]);
         let placed = self.placed(track, sources);
-        let started = self.start(args, module, track, false);
+        let started = self.start(args, module, track);
         if started.fresh && self.paused {
             self.held.insert(track);
         }
@@ -1825,7 +1813,7 @@ impl<S: Samples> Player<S> {
             Ok(None) => {}
             Err(fault) => self.report(fault),
         }
-        let started = self.start(args, module, PIANO, false);
+        let started = self.start(args, module, PIANO);
         self.let_go(&started.threads);
         let object = self.track_objects.get(&PIANO).copied().unwrap_or(0);
         self.instances.retain(|&(t, _)| t != PIANO);
@@ -1833,7 +1821,7 @@ impl<S: Samples> Player<S> {
         // The skill is asked for before the skill track is looked up.
         let skill = sources.field(args[0] as i32, 5).unwrap_or(0);
         if self.owner(module, PIANO_SKILL).is_some() {
-            let started = self.start([skill as u32, 0, 0], module, PIANO_SKILL, false);
+            let started = self.start([skill as u32, 0, 0], module, PIANO_SKILL);
             self.let_go(&started.threads);
         }
     }
@@ -1902,8 +1890,9 @@ impl<S: Samples> Player<S> {
     }
 
     /// Starts a track's routine for an object (vtable +0x30, 0x57d960).
-    /// The module given is tried first, then every other. A deferred
-    /// thread first runs in the next block.
+    /// The module given is tried first, then every other. A new thread
+    /// first runs in the next block ([`Player::run`] runs the tracks
+    /// that were running when its block began).
     ///
     /// *(code)* The original has one track object per track, so a start
     /// of a track whose script still runs starts no second one. It
@@ -1920,7 +1909,7 @@ impl<S: Samples> Player<S> {
     /// Not ported: when the track's group is off (manager lookup 0x57bde7,
     /// its +0xc0 is 0), the original's start returns before all of this
     /// (0x57d969 to 0x57d9a5). This player has no group that can be off.
-    fn start(&mut self, args: [u32; 3], module: usize, track: u32, defer: bool) -> Started {
+    fn start(&mut self, args: [u32; 3], module: usize, track: u32) -> Started {
         let Some(module) = self.owner(module, track) else {
             self.report(format!("no track {track}"));
             return Started::default();
@@ -1939,7 +1928,6 @@ impl<S: Samples> Player<S> {
             let interrupt = self
                 .threads
                 .iter()
-                .chain(&self.pending)
                 .find(|t| t.id == newest)
                 .map_or(0, |t| t.registers[usize::from(INTERRUPT)]);
             self.last_start.insert(track, newest);
@@ -1954,7 +1942,6 @@ impl<S: Samples> Player<S> {
             let module = self
                 .threads
                 .iter()
-                .chain(&self.pending)
                 .find(|t| t.id == newest)
                 .map_or(module, |t| t.module);
             if !self.restart(newest, module, track) {
@@ -1966,7 +1953,7 @@ impl<S: Samples> Player<S> {
                 fresh: true,
             };
         }
-        if self.threads.len() + self.pending.len() >= THREADS {
+        if self.threads.len() >= THREADS {
             self.report(format!("track {track}: more than {THREADS} threads"));
             return Started::default();
         }
@@ -1980,11 +1967,7 @@ impl<S: Samples> Player<S> {
         self.idle.remove(&track);
         let id = thread.id;
         self.last_start.insert(track, id);
-        if defer {
-            self.pending.push(thread);
-        } else {
-            self.threads.push(thread);
-        }
+        self.threads.push(thread);
         self.set_levels(id, args, module, track);
         Started {
             threads: vec![id],
@@ -2012,17 +1995,11 @@ impl<S: Samples> Player<S> {
         // A track has one thread; its notes, and those of its scripts
         // that ended, are the one voice the original destroys.
         self.threads.retain(|t| t.track != track || t.id == id);
-        self.pending.retain(|t| t.track != track || t.id == id);
         self.notes.retain(|n| n.track != track);
         self.ended.retain(|_, t| t.track != track);
         self.idle.remove(&track);
         let now = self.frame;
-        if let Some(thread) = self
-            .threads
-            .iter_mut()
-            .chain(&mut self.pending)
-            .find(|t| t.id == id)
-        {
+        if let Some(thread) = self.threads.iter_mut().find(|t| t.id == id) {
             for (first, last) in BANKS {
                 let bank = usize::from(first)..=usize::from(last);
                 thread.registers[bank.clone()].copy_from_slice(&fresh[bank]);
@@ -2059,12 +2036,7 @@ impl<S: Samples> Player<S> {
         let Some((vol, pan)) = levels else {
             return;
         };
-        if let Some(thread) = self
-            .threads
-            .iter_mut()
-            .chain(&mut self.pending)
-            .find(|t| t.id == id)
-        {
+        if let Some(thread) = self.threads.iter_mut().find(|t| t.id == id) {
             thread.registers[usize::from(EXTVOL)] = vol as i32;
             thread.registers[usize::from(PAN)] = pan as i32;
         }
@@ -2075,12 +2047,7 @@ impl<S: Samples> Player<S> {
     /// first: none when the track does not run.
     fn refresh(&mut self, args: [u32; 3], track: u32) -> Vec<u32> {
         let mut running = Vec::new();
-        for thread in self
-            .threads
-            .iter_mut()
-            .chain(&mut self.pending)
-            .filter(|t| t.track == track)
-        {
+        for thread in self.threads.iter_mut().filter(|t| t.track == track) {
             set_arguments(thread, args);
             running.push(thread.id);
         }
@@ -2100,12 +2067,7 @@ impl<S: Samples> Player<S> {
         let now = self.frame;
         for &id in threads {
             let order = self.last_in_order();
-            if let Some(thread) = self
-                .threads
-                .iter_mut()
-                .chain(&mut self.pending)
-                .find(|t| t.id == id)
-            {
+            if let Some(thread) = self.threads.iter_mut().find(|t| t.id == id) {
                 thread.wake = now;
                 thread.order = order;
             }
@@ -2342,12 +2304,7 @@ impl<S: Samples> Player<S> {
     /// original drops a track's request when it is killed) and sets
     /// `main_duckpri` to the largest left, or 0.
     fn forget_ended(&mut self) {
-        let alive: Vec<u32> = self
-            .threads
-            .iter()
-            .chain(&self.pending)
-            .map(|t| t.id)
-            .collect();
+        let alive: Vec<u32> = self.threads.iter().map(|t| t.id).collect();
         self.duck.retain(|id, _| alive.contains(id));
         self.update_main_duckpri();
     }
@@ -2362,20 +2319,22 @@ impl<S: Samples> Player<S> {
     /// a copy of that list, calling each track object (0x57cf8f to
     /// 0x57cfda), so a track that ends or is ended on the way does not
     /// make it skip another, and a track ended and started again before
-    /// its turn still runs in it, as its new thread.
+    /// its turn still runs in it, as its new thread. A track started on
+    /// the way first runs in the next block. A held track is not in the
+    /// list (a hold takes it out, 0x57dc53 to 0x57dc5a), so one let go on
+    /// the way first runs in the next block too.
     fn run(&mut self, sources: &dyn Sources) {
         let mut budget = BLOCK_STEPS;
         self.threads.sort_by_key(|t| t.order);
-        let schedule: Vec<u32> = self.threads.iter().map(|t| t.track).collect();
+        let schedule: Vec<u32> = self
+            .threads
+            .iter()
+            .map(|t| t.track)
+            .filter(|t| !self.held.contains(t))
+            .collect();
         for (next, &track) in schedule.iter().enumerate() {
             // A track runs one thread at most.
-            let Some(mut thread) = self
-                .threads
-                .iter()
-                .chain(&self.pending)
-                .find(|t| t.track == track)
-                .cloned()
-            else {
+            let Some(mut thread) = self.threads.iter().find(|t| t.track == track).cloned() else {
                 continue;
             };
             // A held track's threads wait, without fading (0x57d7f3).
@@ -2391,17 +2350,12 @@ impl<S: Samples> Player<S> {
             // (play_trk); find this one again by ID.
             let id = thread.id;
             if alive {
-                if let Some(slot) = self
-                    .threads
-                    .iter_mut()
-                    .chain(&mut self.pending)
-                    .find(|t| t.id == id)
-                {
+                if let Some(slot) = self.threads.iter_mut().find(|t| t.id == id) {
                     *slot = thread;
                 }
                 continue;
             }
-            if !self.threads.iter().chain(&self.pending).any(|t| t.id == id) {
+            if !self.threads.iter().any(|t| t.id == id) {
                 continue;
             }
             // Its last register writes still reach its notes, as they
@@ -2415,14 +2369,10 @@ impl<S: Samples> Player<S> {
                 self.ended.insert(id, thread);
             }
             self.threads.retain(|t| t.id != id);
-            self.pending.retain(|t| t.id != id);
             // Its ducking request goes now, before the threads after it
             // run.
             self.forget_ended();
         }
-        // Threads started this block run from the next one, so a track
-        // that starts itself cannot keep this loop going.
-        self.threads.append(&mut self.pending);
         self.forget_ended();
         self.apply_levels();
     }
@@ -2445,13 +2395,7 @@ impl<S: Samples> Player<S> {
             if self.held.contains(&track) {
                 continue;
             }
-            let Some(mut thread) = self
-                .threads
-                .iter()
-                .chain(&self.pending)
-                .find(|t| t.track == track)
-                .cloned()
-            else {
+            let Some(mut thread) = self.threads.iter().find(|t| t.track == track).cloned() else {
                 continue;
             };
             let id = thread.id;
@@ -2460,17 +2404,11 @@ impl<S: Samples> Player<S> {
                 continue;
             }
             thread.order = first - (rest.len() - place) as i64;
-            if let Some(slot) = self
-                .threads
-                .iter_mut()
-                .chain(&mut self.pending)
-                .find(|t| t.id == id)
-            {
+            if let Some(slot) = self.threads.iter_mut().find(|t| t.id == id) {
                 *slot = thread;
             }
         }
         self.threads.retain(|t| !ended.contains(&t.id));
-        self.pending.retain(|t| !ended.contains(&t.id));
     }
 
     /// Runs one thread until it waits, ends, or the block's instructions
@@ -2608,11 +2546,7 @@ impl<S: Samples> Player<S> {
         let mut passed = vec![thread.id];
         while let Target::Thread(id) = target
             && !passed.contains(&id)
-            && let Some(next) = self
-                .threads
-                .iter()
-                .chain(&self.pending)
-                .find(|t| t.id == id)
+            && let Some(next) = self.threads.iter().find(|t| t.id == id)
         {
             passed.push(id);
             at = Some(id);
@@ -2635,12 +2569,7 @@ impl<S: Samples> Player<S> {
         }
         let source = self
             .resolve(thread)
-            .and_then(|id| {
-                self.threads
-                    .iter()
-                    .chain(&self.pending)
-                    .find(|t| t.id == id)
-            })
+            .and_then(|id| self.threads.iter().find(|t| t.id == id))
             .unwrap_or(thread);
         source.registers[usize::from(r)]
     }
@@ -2651,7 +2580,12 @@ impl<S: Samples> Player<S> {
     /// from the value. `target` picks the newest running thread of the
     /// track it names; 0, or a track with none running, is this thread
     /// (the original's lookup returns null, which it takes as itself).
-    /// `main_duckpri` (123) records the written thread's request and
+    /// Not ported: the original's `target` holds the track object
+    /// (0x57e023 to 0x57e028), which outlives a kill and a fresh start
+    /// (0x57dd4c, 0x57dbcf), so it still reaches the track started again.
+    /// Here it names the thread, which a kill ends, so it then reaches
+    /// that thread only while its notes play, or else falls back to this
+    /// one. `main_duckpri` (123) records the written thread's request and
     /// holds the largest.
     fn write(&mut self, thread: &mut Thread, register: i64, value: i32) {
         let Ok(r) = u8::try_from(register) else {
@@ -2665,7 +2599,6 @@ impl<S: Samples> Player<S> {
             } else {
                 self.threads
                     .iter()
-                    .chain(&self.pending)
                     .filter(|t| t.track == value as u32)
                     .map(|t| t.id)
                     .max()
@@ -2674,12 +2607,7 @@ impl<S: Samples> Player<S> {
             return;
         }
         let written = match self.resolve(thread) {
-            Some(id) => match self
-                .threads
-                .iter_mut()
-                .chain(&mut self.pending)
-                .find(|t| t.id == id)
-            {
+            Some(id) => match self.threads.iter_mut().find(|t| t.id == id) {
                 Some(other) => other,
                 None => thread,
             },
@@ -2914,7 +2842,7 @@ impl<S: Samples> Player<S> {
                 if own && let Some(stored) = self.threads.iter_mut().find(|t| t.id == thread.id) {
                     *stored = thread.clone();
                 }
-                let started = self.start(args, thread.module, track, true);
+                let started = self.start(args, thread.module, track);
                 self.let_go(&started.threads);
                 if own && let Some(stored) = self.threads.iter().find(|t| t.id == thread.id) {
                     *thread = stored.clone();
@@ -2925,7 +2853,6 @@ impl<S: Samples> Player<S> {
                 for started in self
                     .threads
                     .iter_mut()
-                    .chain(&mut self.pending)
                     .filter(|t| started.threads.contains(&t.id))
                 {
                     started.registers[usize::from(SOURCE)] = source;

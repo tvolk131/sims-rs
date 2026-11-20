@@ -60,6 +60,15 @@ number, and a start of a running one does not start a second voice.
   runs in that turn.
 - A fade that was to end its track ends it at once when it reaches its
   end (0x57d86e to 0x57d88d).
+- A hold (vtable +0x58, 0x57dc2e) takes a running track out of the list
+  (0x57dc5a → 0x57d050), so a held track is not in the update's snapshot.
+  A held track let go during an update first runs in the next.
+- Kind 1 reads the argument kind from the track object it looked up
+  (+0x28, 0x573748 to 0x573756), whichever module's event played it.
+- The unpause lets go of every track in its registry (0x57cd56 to
+  0x57cd82). The registry is a hash table walked bucket by bucket
+  (0x5807c2, 0x576be5), and a track's bucket is its number modulo the
+  bucket count (0x4c93ac).
 - In the install only `loadb` writes `interrupt`: 99 of the 4,306 tracks.
   `set` can write it too (0x57e219 to 0x57e2da).
 - The fountain's track 1346 is `note_on; wait_samp; loop`. It never sets
@@ -100,10 +109,18 @@ number, and a start of a running one does not start a second voice.
 - `play_trk` reads `source` after the start.
 - Each thread has a place in the list of running tracks (`Thread::order`);
   a fresh start and a let-go put it last. `Player::run` takes the list of
-  tracks in that order at the start of a block, and at each track's turn
-  runs the thread it has then. A thread ended or restarted during the
-  block does not make another skip its turn, and a track ended and
-  started again before its turn runs in it.
+  tracks that are not held, in that order, at the start of a block. At
+  each track's turn it runs the thread the track has then. A thread ended
+  or restarted during the block does not make another skip its turn, and
+  a track ended and started again before its turn runs in it. A track
+  started, or let go from a hold, during the block first runs in the
+  next.
+- With that snapshot, the separate list of threads started during a block
+  is gone: every running thread is in one list, where `play_trk`,
+  `seqgroup_kill` and the rest find it.
+- Kind 1 takes the argument kind of the running track's own module.
+- The unpause lets go of the running tracks in the order of their
+  numbers, which puts them last in that order.
 - When the block runs out of instructions, the tracks not reached still
   fade, and one whose fade was to end it ends then.
 - An object going leaves a track that others still have playing, placed
@@ -116,6 +133,14 @@ number, and a start of a running one does not start a second voice.
 
 - The group-off return (0x57d969 to 0x57d9a5). This player has no group
   that can be off.
+- The unpause's order is the registry's only while it has more buckets
+  than the largest track number. The bucket count is **unverified**.
+- A `target` names a thread here. The original's names the track object
+  (0x57e023 to 0x57e028), which outlives a kill and a fresh start
+  (0x57dd4c, 0x57dbcf). So after a track is ended and started again, a
+  `target` set before still reaches it in the original. Here it reaches
+  the ended thread while its notes play, or else falls back to the thread
+  itself. This was so before this change.
 - The original's run loop (0x57d8b3) runs instructions while the wait
   deadline is set and past. The fade-out-and-kill does not move the
   deadline. So, by the code, a script that ends with its note still playing
