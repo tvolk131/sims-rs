@@ -12,8 +12,8 @@ breakpoints (that run was killed while the guest was stopped, so it never
 detached) and continues the same output directory and numbering.
 
 Breakpoints (hardware, in QEMU's stub; no guest memory or register is
-written): the lot update's entry 0x46d345 (until the first one on the lot)
-and its end 0x46d51d (the body is done, the epilogue not yet run); the
+written): the lot update's entry 0x46d345 (until the first one on the lot,
+and again while a watch or a due --dump needs it; see below) and its end 0x46d51d (the body is done, the epilogue not yet run); the
 dialog functions 0x436da0 (a record is shown), 0x4370be (a button's result)
 and 0x43718f (a script reads the answer), which are logged only.
 
@@ -834,8 +834,11 @@ def main():
         if dropped:
             event(kind='resume_dropped', events=[dict(kind=r['kind'], update=r['update']) for r in dropped])
         # A late watch an earlier run set counts as set (watch_ended's set covers its whole window).
+        # Its event has its name and its whole text (with the updates); a --watch given the same
+        # text has the updates in its name. Earlier revisions wrote no `late`.
         for w in late:
-            w.set = any(r['kind'] == 'watch_armed' and r.get('late') and r.get('expr') == w.text for r in rows)
+            w.set = any(r['kind'] == 'watch_armed' and r.get('late', True) and r.get('name') == w.name
+                        and r.get('expr') == w.text for r in rows)
         # A dialog shown since the last recorded return, and the dialogs still waiting for a result.
         dialog_pending = any(r['kind'] == 'dialog_show' and r['update'] > updates for r in rows)
         waiting = open_dialogs(rows)

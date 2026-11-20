@@ -308,20 +308,31 @@ class CaptureTest(unittest.TestCase):
         self.assertEqual([(r['update'], r['set']) for r in ended], [(2, False)])
 
     def test_a_late_watch_set_by_the_run_taken_over_ends_as_set(self):
-        # The earlier run set it for update 2; this one starts in another
-        # process and next stops at update 2's return, where it ends.
-        def prepare(output):
-            (output / 'events.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in [
-                dict(kind='baseline', cr3=GAME_CR3),
-                dict(kind='watch_armed', name='state', expr='2-2,state=0x70088', late=True,
-                     address=0x70088, value=0, update=1)]))
-            (output / 'updates.jsonl').write_text(
-                json.dumps(dict(update=1, tick=99, lot_rng=0, global_rng=0, crt=0, scheduler_cursor=0)) + '\n')
-        remote, output, _ = self.run_capture(
-            [dict(pc=0x123456, cr3=OTHER_CR3), dict(pc=capture.RETURN)],
-            ['--updates', '2', '--resume', '--late-watch', '2-2,state=0x70088'], prepare=prepare)
-        ended = self.events(output, 'watch_ended')
-        self.assertEqual([(r['update'], r['set']) for r in ended], [(2, True)])
+        # The earlier run sets it at the end of update 1 and is stopped
+        # there; this one starts in another process and next stops at
+        # update 2's return, where it ends. Once from the events the earlier
+        # run wrote, once from an earlier revision's, which had no `late`.
+        _, first, _ = self.run_capture(
+            [dict(pc=0), dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
+            ['--updates', '1', '--late-watch', '2-2,state=0x70088'])
+        armed = self.events(first, 'watch_armed')
+        self.assertEqual([(r['name'], r['late']) for r in armed], [('state', True)])
+        for old in (False, True):
+            def prepare(output):
+                for name in ('events.jsonl', 'updates.jsonl', 'status.json'):
+                    text = (first / name).read_text()
+                    if old and name == 'events.jsonl':
+                        rows = [json.loads(line) for line in text.splitlines()]
+                        for r in rows:
+                            r.pop('late', None)
+                        text = ''.join(json.dumps(r) + '\n' for r in rows)
+                    (output / name).write_text(text)
+            remote, output, _ = self.run_capture(
+                [dict(pc=0x123456, cr3=OTHER_CR3), dict(pc=capture.RETURN)],
+                ['--updates', '2', '--resume', '--late-watch', '2-2,state=0x70088'], prepare=prepare)
+            self.assertEqual(remote.watch_calls, [])
+            ended = self.events(output, 'watch_ended')
+            self.assertEqual([(r['update'], r['set']) for r in ended], [(2, True)], old)
 
     def test_an_ordinary_watch_armed_before_is_not_a_late_watch_set(self):
         # Given as --watch with the same text, it was armed by the earlier run.
@@ -329,6 +340,9 @@ class CaptureTest(unittest.TestCase):
             (output / 'events.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in [
                 dict(kind='baseline', cr3=GAME_CR3),
                 dict(kind='watch_armed', name='2-2,state', expr='2-2,state=0x70088', late=False,
+                     address=0x70088, value=0, update=1),
+                # An earlier revision's, without `late`: its name has the updates.
+                dict(kind='watch_armed', name='2-2,state', expr='2-2,state=0x70088',
                      address=0x70088, value=0, update=1)]))
             (output / 'updates.jsonl').write_text(
                 json.dumps(dict(update=1, tick=99, lot_rng=0, global_rng=0, crt=0, scheduler_cursor=0)) + '\n')
