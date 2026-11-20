@@ -5,7 +5,7 @@
 Step 6a's lot is House 69, the Charmings, in the second neighborhood
 (UserData2). The original enters it only after its first open of that
 neighborhood. That open imports the `Patch` families and fills the pools
-(`20261120-neighborhood-open-fills-three-pools.md`). The pools draw
+(`20261120-neighborhood-open-fills-five-pools.md`). The pools draw
 from the wall clock, so no port can make the same files today.
 
 `an_imported_home_loads_from_the_originals_files_and_steps` (in
