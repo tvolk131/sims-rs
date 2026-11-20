@@ -112,7 +112,14 @@ pub struct Canvas {
     ids: Vec<Option<u16>>,
     /// The ID the pixels drawn now take ([`Canvas::set_id`]).
     pen: Option<u16>,
+    /// For each ID, the screen rectangle its images were drawn into since
+    /// the canvas was cleared ([`Canvas::drawn`]).
+    rects: std::collections::BTreeMap<u16, Rect>,
 }
+
+/// A screen rectangle: left, top, right and bottom, the right and bottom
+/// edges outside it.
+pub type Rect = [i32; 4];
 
 impl Canvas {
     pub fn new(width: usize, height: usize, background: [u8; 3]) -> Self {
@@ -123,6 +130,7 @@ impl Canvas {
             depth: vec![EMPTY; width * height],
             ids: vec![None; width * height],
             pen: None,
+            rects: std::collections::BTreeMap::new(),
         }
     }
 
@@ -133,6 +141,7 @@ impl Canvas {
         self.depth.fill(EMPTY);
         self.ids.fill(None);
         self.pen = None;
+        self.rects.clear();
     }
 
     /// Sets the ID the pixels drawn from now on take, until it is set
@@ -148,6 +157,14 @@ impl Canvas {
     /// hit.
     pub fn id_at(&self, x: i32, y: i32) -> Option<u16> {
         self.ids[self.index(x, y)?]
+    }
+
+    /// The rectangle the images drawn under `id` cover, each whole, drawn
+    /// pixels or not and on the canvas or not, since the canvas was
+    /// cleared: what the original keeps as an object's drawn rectangles
+    /// (object +0x160 and +0x170, 0x438f71).
+    pub fn drawn(&self, id: u16) -> Option<Rect> {
+        self.rects.get(&id).copied()
     }
 
     /// Draws `image` with its top-left corner at `at`, mirrored left to
@@ -255,6 +272,26 @@ impl Canvas {
             || self.color.is_empty()
         {
             return;
+        }
+        if let Some(id) = self.pen {
+            let side = |n: usize| i32::try_from(n).unwrap_or(i32::MAX);
+            let rect = [
+                at[0],
+                at[1],
+                at[0].saturating_add(side(image.width)),
+                at[1].saturating_add(side(image.height)),
+            ];
+            self.rects
+                .entry(id)
+                .and_modify(|r| {
+                    *r = [
+                        r[0].min(rect[0]),
+                        r[1].min(rect[1]),
+                        r[2].max(rect[2]),
+                        r[3].max(rect[3]),
+                    ]
+                })
+                .or_insert(rect);
         }
         let wide = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
         let span = |at: i32, size: usize, limit: usize| {
