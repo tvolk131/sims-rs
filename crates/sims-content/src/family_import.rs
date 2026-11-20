@@ -1,12 +1,15 @@
 //! The data changes made by the neighborhood's family importer (0x428f05).
 
-use crate::{Catalog, Error, Result};
+use crate::{Catalog, Error, ImportWardrobe, Result};
 use sims_formats::family_file::{FamilyFile, FamilyMember};
-use sims_formats::iff::Iff;
-use sims_formats::lot::ObjectTypes;
+use sims_formats::far::decode_name;
+use sims_formats::iff::{ChunkData, Iff};
+use sims_formats::lot::{GuidTable, ObjectTypes};
 use sims_formats::neighborhood::{Family, Neighbor, Relationship};
 use sims_formats::strings::{Format, StringTable, decode};
 use std::collections::{BTreeMap, BTreeSet};
+
+mod outfits;
 
 pub const TEMPLATE_PERSON: u32 = 0x7fd96b54;
 pub const TEMPLATE_DOG: u32 = 0x4a70df92;
@@ -60,6 +63,8 @@ pub struct Character {
     pub strings: BTreeMap<usize, String>,
     pub name: String,
     pub description: String,
+    member: u16,
+    language: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -182,7 +187,8 @@ pub fn import(
         let body = language_entries(&member.body_strings, raw_body, options.language, true);
         let template = choose_template(&body, id, options.pets_enabled)?;
         check_template(input, template)?;
-        let (name, description) = character_text(file, member, id, options.language)?;
+        let [name, description] = character_text(file, member, id, options.language)?
+            .map(|text| decode(&text, options.language));
         let number = reserve_file(&mut next_file, &mut character_files)?;
         let guid = new_guid();
         next_file = (number + 1) % FILE_LIMIT;
@@ -219,6 +225,8 @@ pub fn import(
                 strings: body.into_iter().enumerate().collect(),
                 name,
                 description,
+                member: id,
+                language: options.language,
             },
         );
     }
@@ -267,6 +275,243 @@ pub fn import(
         global_rng,
         lot,
     })
+}
+
+/// The live resources of a made character after the import's resource edits
+/// (0x4722b8 and 0x4293ae–0x4295ee). Use the source FAM passed to [`import`].
+/// The destination file number can be set before cloning.
+///
+/// Call [`refresh_outfits`] to perform 0x4295f7 before serializing with
+/// [`sims_formats::iff::write`]. The portrait renderer at 0x4e8c5d and
+/// its BMP_ 2002–2007 writes at 0x4e9000 are separate.
+pub fn clone_character(
+    template: &Iff,
+    character: &Character,
+    guid: u32,
+    file: &FamilyFile,
+) -> Result<Vec<ChunkData>> {
+    let id = character.member;
+    let language = character.language;
+    let member = file
+        .members
+        .get(&id)
+        .ok_or_else(|| unsupported("0x4292bb", format!("member {id} has no uChr resource")))?;
+    let body_chunk = file
+        .iff
+        .get(b"uChr", id)
+        .ok_or_else(|| unsupported("0x4292bb", format!("member {id} has no uChr resource")))?;
+    let body = raw_language_entries(
+        &member.body_strings,
+        Some(file.iff.data(body_chunk)),
+        language,
+        true,
+    );
+    let [name, description] = character_text(file, member, id, language)?;
+    if body.len() != character.strings.len()
+        || body
+            .iter()
+            .enumerate()
+            .any(|(index, text)| character.strings.get(&index) != Some(&decode(text, language)))
+        || decode(&name, language) != character.name
+        || decode(&description, language) != character.description
+    {
+        return Err(unsupported(
+            "0x4293ae",
+            "clone text differs from the source member",
+        ));
+    }
+    if !(0..FILE_LIMIT).contains(&character.file) {
+        return Err(unsupported("0x4261a2", "invalid character file number"));
+    }
+    if guid == 0 || guid == character.template {
+        return Err(unsupported("0x43bda9", "zero or colliding character GUID"));
+    }
+
+    let tags: BTreeSet<_> = template.chunks.iter().map(|chunk| chunk.tag).collect();
+    let mut chunks = Vec::new();
+    for tag in tags {
+        let live = template.resource_order(&tag).map_err(|error| {
+            Error::format("family import: 0x472331 template resource order", error)
+        })?;
+        if &tag == b"cst\0" && !live.is_empty() {
+            return Err(unsupported(
+                "0x4723e1",
+                "legacy cst conversion is not ported",
+            ));
+        }
+        for chunk in live {
+            if &tag == b"XXXX" || (tag == *b"BMP_" && (2002..=2007).contains(&chunk.id)) {
+                continue;
+            }
+            chunks.push(ChunkData {
+                tag,
+                id: chunk.id,
+                flags: chunk.flags,
+                label: chunk.label.clone(),
+                data: template.data(chunk).to_vec(),
+            });
+        }
+    }
+    let mut definitions = chunks.iter_mut().filter(|chunk| chunk.tag == *b"OBJD");
+    let definition = match (definitions.next(), definitions.next()) {
+        (Some(definition), None) if definition.flags >> 8 == 0 => definition,
+        _ => return Err(unsupported("0x47249d", "expected one default-variant OBJD")),
+    };
+    let data = &mut definition.data;
+    if data.len() < 0x90
+        || data[0x12..0x14] != 2_u16.to_le_bytes()
+        || data[0x1c..0x20] != character.template.to_le_bytes()
+    {
+        return Err(unsupported(
+            "0x4725d5",
+            "OBJD does not define the selected person template",
+        ));
+    }
+    if data[0x26..0x28] != 200_u16.to_le_bytes() {
+        return Err(unsupported(
+            "0x457fd7",
+            "the template does not load STR# 200",
+        ));
+    }
+    let catalog_id = u16::from_le_bytes(data[0x52..0x54].try_into().unwrap());
+    data[0x8c..0x90].copy_from_slice(&character.template.to_le_bytes()); // 0x4725e4
+    data[0x1c..0x20].copy_from_slice(&guid.to_le_bytes()); // 0x4725f3
+    let mut label = format!("user{:05} - ", character.file).into_bytes();
+    label.extend(&name);
+    label.truncate(63); // 0x429596, 0x46f79a
+    definition.label = decode_name(&label);
+
+    let ctss = catalog_strings(template, catalog_id, language, [&name, &description])?;
+    // 0x4063df removes legacy CATS after writing CTSS.
+    chunks.retain(|chunk| {
+        !(chunk.tag == *b"CATS" && chunk.id == catalog_id && chunk.flags >> 8 == 0)
+    });
+    for (tag, id, data) in [
+        (
+            *b"STR#",
+            200,
+            localized_strings(body.into_iter().map(|text| (1, text, &[][..])))?,
+        ),
+        (*b"CTSS", catalog_id, ctss),
+    ] {
+        let replacement = ChunkData {
+            tag,
+            id,
+            flags: 0x10,
+            label: String::new(),
+            data,
+        };
+        if let Some(chunk) = chunks
+            .iter_mut()
+            .find(|chunk| chunk.tag == tag && chunk.id == id && chunk.flags >> 8 == 0)
+        {
+            *chunk = replacement;
+        } else {
+            chunks.push(replacement);
+        }
+    }
+    Ok(chunks)
+}
+
+/// Refresh the STR# 200 of a successful [`clone_character`] using the
+/// startup wardrobe, then write it back to the clone (0x4295f7, 0x457f60).
+/// If selection reaches an unsupported branch, the clone remains intact.
+pub fn refresh_outfits(chunks: &mut [ChunkData], wardrobe: &ImportWardrobe) -> Result<()> {
+    let body = chunks
+        .iter_mut()
+        .find(|chunk| chunk.tag == *b"STR#" && chunk.id == 200 && chunk.flags >> 8 == 0)
+        .ok_or_else(|| unsupported("0x457fd7", "imported STR# 200 is absent"))?;
+    let table = StringTable::parse(&body.data)
+        .map_err(|error| Error::format("family import: 0x587b4b imported STR# 200", error))?;
+    if table.format != Format::Localized
+        || localized_entries(&table, Some(&body.data))
+            .any(|(language, entry)| language != 1 || !entry.raw_comment.is_empty())
+    {
+        return Err(unsupported(
+            "0x587b4b",
+            "expected the clone's language-1 body table",
+        ));
+    }
+    let mut rows: Vec<_> = table
+        .entries
+        .into_iter()
+        .map(|entry| entry.raw_text)
+        .collect();
+    outfits::refresh(&mut rows, wardrobe)?;
+    body.data = localized_strings(rows.iter().map(|text| (1, text.as_slice(), &[][..])))?;
+    Ok(())
+}
+
+fn catalog_strings(
+    template: &Iff,
+    id: u16,
+    language: u8,
+    name_and_description: [&[u8]; 2],
+) -> Result<Vec<u8>> {
+    let mut languages = BTreeMap::<u8, Vec<(&[u8], &[u8])>>::new();
+    let bytes = template.get(b"CTSS", id).map(|chunk| template.data(chunk));
+    let table = bytes
+        .map(StringTable::parse)
+        .transpose()
+        .map_err(|error| Error::format("family import: 0x4706f9 template CTSS", error))?;
+    if let Some(table) = &table {
+        if table.format != Format::Localized {
+            return Err(unsupported(
+                "0x470ca7",
+                "non-localized template CTSS is not ported",
+            ));
+        }
+        for (code, entry) in localized_entries(table, bytes) {
+            let code = if code == 0 { language } else { code };
+            if !(1..=20).contains(&code) {
+                return Err(unsupported("0x470e43", "invalid template CTSS language"));
+            }
+            languages
+                .entry(code)
+                .or_default()
+                .push((&entry.raw_text, &entry.raw_comment));
+        }
+    }
+    let active = languages.entry(language).or_default();
+    active.resize(active.len().max(2), (&[], &[]));
+    for (entry, text) in active.iter_mut().zip(name_and_description) {
+        entry.0 = text; // 0x470722 updates text and retains the destination comment.
+    }
+    // 0x4707be backfills missing translations from the English bank. The
+    // writer keeps only languages with at least one genuine localized row.
+    if let Some(english) = languages.get(&1).cloned() {
+        for entries in languages.values_mut() {
+            if let Some(missing) = english.get(entries.len()..) {
+                entries.extend_from_slice(missing);
+            }
+        }
+    }
+    localized_strings(languages.into_iter().flat_map(|(language, rows)| {
+        rows.into_iter()
+            .map(move |(text, comment)| (language, text, comment))
+    }))
+}
+
+fn localized_strings<'a>(
+    rows: impl IntoIterator<Item = (u8, &'a [u8], &'a [u8])>,
+) -> Result<Vec<u8>> {
+    let mut data = vec![0xfd, 0xff, 0, 0];
+    let mut count = 0;
+    for (language, text, comment) in rows {
+        data.push(language);
+        data.extend(text);
+        data.push(0);
+        data.extend(comment);
+        data.push(0);
+        count += 1;
+    }
+    let count_word =
+        i16::try_from(count).map_err(|_| unsupported("0x46fcdb", "too many character strings"))?;
+    data[2..4].copy_from_slice(&count_word.to_le_bytes());
+    // Both native writers allocate one extra byte per row (0x46fc9f,
+    // 0x47090e). Fill the unused space with zeroes.
+    data.resize(data.len() + count, 0);
+    Ok(data)
 }
 
 fn unsupported(address: &str, message: impl std::fmt::Display) -> Error {
@@ -354,8 +599,13 @@ fn displace_family(input: &ImportInput<'_>, house: i32) -> Result<Option<(u16, F
     match occupants.as_slice() {
         [] => Ok(None),
         [(id, family, secondary)] if *secondary != house => {
+            // 0x42920f to 0x42922e: the house is cleared first, so the
+            // worth 0x4272c5 gives (from 0x410271) is the budget plus the
+            // architecture value, and that becomes the budget before the
+            // architecture value is zeroed.
             let mut family = (*family).clone();
             family.house = 0;
+            family.budget = family.budget.wrapping_add(family.architecture_value);
             family.architecture_value = 0;
             family.flags &= !8;
             Ok(Some((*id, family)))
@@ -598,7 +848,7 @@ fn character_text(
     member: &FamilyMember,
     id: u16,
     language: u8,
-) -> Result<(String, String)> {
+) -> Result<[Vec<u8>; 2]> {
     let same_id = || {
         if file.iff.get(b"CATS", id).is_some() {
             return Err(unsupported(
@@ -614,19 +864,20 @@ fn character_text(
         (same_id()?, false)
     };
     let Some(bytes) = bytes else {
-        return Ok((String::new(), String::new()));
+        return Ok([Vec::new(), Vec::new()]);
     };
     let location = format!("family import: 0x42945d CTSS for member {id}");
     let table = StringTable::parse(bytes).map_err(|error| Error::format(&location, error))?;
-    let entries = language_entries(&table, Some(bytes), language, fallback);
+    let entries = raw_language_entries(&table, Some(bytes), language, fallback);
     if fallback && entries.len() < 2 {
         return Err(unsupported(
             "0x4294ad",
             format!("localized CTSS for member {id} lacks a name or description"),
         ));
     }
-    let text = |index: usize| entries.get(index).cloned().unwrap_or_default();
-    Ok((text(0), text(1)))
+    Ok(std::array::from_fn(|index| {
+        entries.get(index).copied().unwrap_or_default().to_vec()
+    }))
 }
 
 fn language_entries(
@@ -635,17 +886,47 @@ fn language_entries(
     language: u8,
     fallback: bool,
 ) -> Vec<String> {
+    raw_language_entries(table, raw, language, fallback)
+        .into_iter()
+        .map(|text| decode(text, language))
+        .collect()
+}
+
+fn raw_language_entries<'a>(
+    table: &'a StringTable,
+    raw: Option<&[u8]>,
+    language: u8,
+    fallback: bool,
+) -> Vec<&'a [u8]> {
     if table.format != Format::Localized {
         return table
             .entries
             .iter()
-            .map(|entry| decode(&entry.raw_text, language))
+            .map(|entry| entry.raw_text.as_slice())
             .collect();
     }
     let mut entries = Vec::new();
     let mut english = Vec::new();
+    for (encoded, entry) in localized_entries(table, raw) {
+        if encoded == 0 || encoded == language {
+            entries.push(entry.raw_text.as_slice());
+        }
+        if encoded == 1 {
+            english.push(entry.raw_text.as_slice());
+        }
+    }
+    if entries.is_empty() && fallback {
+        return english;
+    }
+    entries
+}
+
+fn localized_entries<'a, 'b>(
+    table: &'a StringTable,
+    raw: Option<&'b [u8]>,
+) -> impl Iterator<Item = (u8, &'a sims_formats::strings::TextEntry)> + use<'a, 'b> {
     let mut offset = 4;
-    for entry in &table.entries {
+    table.entries.iter().map(move |entry| {
         // StringTable normalizes encoded language 0 to 1. The original
         // treats 0 as the active language (0x46fffa, 0x470e3d).
         let encoded = raw
@@ -653,17 +934,8 @@ fn language_entries(
             .copied()
             .unwrap_or(entry.language);
         offset += entry.raw_text.len() + entry.raw_comment.len() + 3;
-        if encoded == 0 || encoded == language {
-            entries.push(decode(&entry.raw_text, language));
-        }
-        if encoded == 1 {
-            english.push(decode(&entry.raw_text, language));
-        }
-    }
-    if entries.is_empty() && fallback {
-        entries = english;
-    }
-    entries
+        (encoded, entry)
+    })
 }
 
 fn import_lot(iff: &Iff, house: u32, mut pairs: Vec<(u32, u32)>) -> Result<ImportedLot> {
@@ -672,48 +944,18 @@ fn import_lot(iff: &Iff, house: u32, mut pairs: Vec<(u32, u32)>) -> Result<Impor
         .ok_or_else(|| unsupported("0x43dd76", format!("lot {house} has no objt #0")))?;
     let mut object_types = ObjectTypes::parse(iff.data(source_types))
         .map_err(|error| Error::format("family import: 0x43a516 objt #0", error))?;
-    if let Some(table) = iff.get(b"Gtab", 1) {
-        let bytes = iff.data(table);
-        // The version word is not checked: the import writes 0
-        // (0x4157b6 passes it to 0x415835), as in the first
-        // neighborhood's Old Town houses.
-        if bytes.get(8..12) != Some(b"batG") {
-            return Err(unsupported("0x41578e", "unrecognized Gtab #1 header"));
-        }
-        let count = bytes
-            .get(12..16)
-            .map(|n| u32::from_le_bytes(n.try_into().unwrap()));
-        let entries = bytes
-            .get(16..)
-            .filter(|data| Some(data.len() / 8) == count.map(|n| n as usize) && data.len() % 8 == 0)
-            .ok_or_else(|| unsupported("0x4158a4", "incomplete Gtab #1 pairs"))?;
-        let mut existing: Vec<_> = entries
-            .as_chunks::<8>()
-            .0
-            .iter()
-            .map(|pair| {
-                (
-                    u32::from_le_bytes(pair[..4].try_into().unwrap()),
-                    u32::from_le_bytes(pair[4..].try_into().unwrap()),
-                )
-            })
-            .collect();
-        existing.append(&mut pairs);
-        pairs = existing;
-    }
+    // The import reads at 0x429652 and appends at 0x429754.
+    let table = if let Some(chunk) = iff.get(b"Gtab", 1) {
+        let mut table = GuidTable::parse(iff.data(chunk))
+            .map_err(|error| Error::format("family import: 0x41578e/0x4158a4 Gtab #1", error))?;
+        table.pairs.append(&mut pairs);
+        table
+    } else {
+        GuidTable { version: 0, pairs }
+    };
 
     for entry in &mut object_types.entries {
-        // 0x415751 restarts its search after each hop and marks a pair
-        // used for the current lookup, so even cycles terminate.
-        let mut used = BTreeSet::new();
-        while let Some((index, &(_, new))) = pairs
-            .iter()
-            .enumerate()
-            .find(|(index, (old, _))| *old == entry.guid && !used.contains(index))
-        {
-            used.insert(index);
-            entry.guid = new;
-        }
+        entry.guid = table.translate(entry.guid);
     }
     let tags: BTreeSet<_> = iff.chunks.iter().map(|chunk| chunk.tag).collect();
     let mut chunks = BTreeMap::<_, Vec<_>>::new();
@@ -730,18 +972,11 @@ fn import_lot(iff: &Iff, house: u32, mut pairs: Vec<(u32, u32)>) -> Result<Impor
             });
         }
     }
-    // Version 0 (0x4157b6), as the shipped Old Town houses' tables have.
-    let mut table = b"\0\0\0\0\0\0\0\0batG".to_vec();
-    table.extend((pairs.len() as u32).to_le_bytes());
-    for (old, new) in pairs {
-        table.extend(old.to_le_bytes());
-        table.extend(new.to_le_bytes());
-    }
     chunks.entry(*b"Gtab").or_default().push(LotChunk {
         id: 1,
         flags: 0,
         label: String::new(),
-        data: table,
+        data: table.to_bytes(),
     });
     Ok(ImportedLot {
         house,
