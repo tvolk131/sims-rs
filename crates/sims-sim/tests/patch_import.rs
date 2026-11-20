@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[expect(clippy::disallowed_methods, reason = "sort paths before using them")]
 fn sorted(directory: &Path) -> Vec<PathBuf> {
     let mut paths: Vec<_> = fs::read_dir(directory)
         .unwrap()
@@ -95,7 +96,7 @@ fn opening_userdata2_imports_its_patch_families_as_the_first_neighborhood_has_th
         .position(|mount| mount.path == Index::CHARACTERS)
         .unwrap();
     let mut neighborhood = Neighborhood::open(&directory).unwrap();
-    assert_eq!(neighborhood.options.unwrap()[PENDING_IMPORT], true);
+    assert!(neighborhood.options.unwrap()[PENDING_IMPORT]);
     let context = Context {
         catalog: &catalog,
         registry: &registry,
@@ -160,7 +161,7 @@ fn opening_userdata2_imports_its_patch_families_as_the_first_neighborhood_has_th
     })
     .unwrap();
     assert!(draws.next().is_none());
-    assert_eq!(neighborhood.options.unwrap()[PENDING_IMPORT], false);
+    assert!(!neighborhood.options.unwrap()[PENDING_IMPORT]);
 
     // House 0's reload made the template pets' records.
     let made: BTreeSet<u32> = opened
