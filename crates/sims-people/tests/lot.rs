@@ -820,3 +820,107 @@ fn a_bench_in_use_draws_after_the_sim_on_it() {
         assert!(!near(at(&under)), "({x}, {y}): {:?}", at(&under));
     }
 }
+
+/// Mortimer standing without his book, at tick 2854, against the live
+/// original at 8:05 AM (near zoom, rotation 2, walls down, scroll
+/// (280, −2004), which is camera origin (279, −2004) here). He has put
+/// the book back and stands by the stairs. The original's animator for
+/// person 21 then held, read from its memory:
+///
+/// - the foreground layer (+0xc) at phase 0.5004169 (+0x28) and clip
+///   time 599 ms (+0x30), 1199 ms long: here
+///   `a2o-idle-neutral-trans-stand-Mstand`;
+/// - the base layer (+0x14) at phase 0.4792362 and clip time 957 ms,
+///   1999 ms long: here `a2o-standing-loop`;
+/// - no carry layer (+0x13c);
+/// - the head (+0x210 to +0x218) at heading 0.5969, target heading
+///   5.896 and turn 0, with person data word 42 at 8 (not following).
+///
+/// The five pixels are inside his outline (the face twice, the hair, the
+/// trousers, a shoe). The original's colours are in 16-bit colour; each
+/// check allows 12 per channel. His outline is not checked: at this
+/// camera the original's sits about half a pixel right of and below
+/// ours, and at the 7:12 AM one (`a_bench_in_use_draws_after_the_sim_on_it`)
+/// it does not. Why is open.
+#[test]
+fn mortimer_stands_without_his_book_as_the_original_draws_him() {
+    let Some(root) = install() else { return };
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut opened = sims_render::open_house(&root, &house).unwrap();
+    let mut lot = Lot::load(&root, &house, &[3, 3], Frames::default()).unwrap();
+    lot.wait_for_answers();
+    let mut people = People::open(&root, &house).unwrap();
+    while lot.ticks() < 2854 {
+        lot.step().unwrap();
+    }
+    let world = lot.world();
+    let mortimer = world.objects[&21].person.as_ref().unwrap();
+    let carried: Vec<&str> = mortimer
+        .accessories
+        .iter()
+        .map(|a| a.name.as_str())
+        .collect();
+    assert_eq!(carried, Vec::<&str>::new(), "the book is put away");
+    let animator = &world.animators[&21];
+    let layers = [
+        (
+            animator.foreground.as_ref().unwrap(),
+            "a2o-idle-neutral-trans-stand-Mstand",
+            0.500_416_9,
+            599,
+        ),
+        (
+            &world.base_layers[&21],
+            "a2o-standing-loop",
+            0.479_236_2,
+            957,
+        ),
+    ];
+    for (layer, clip, phase, time) in layers {
+        assert_eq!(layer.clip, clip);
+        assert!(
+            (layer.phase.to_f32() - phase).abs() < 1e-6,
+            "{clip}: {:?}",
+            layer.phase
+        );
+        assert_eq!(layer.event_time, time, "{clip}");
+    }
+    assert!(animator.carry.is_none());
+    assert_eq!(animator.head.turn.to_f32(), 0.0);
+    assert_eq!(mortimer.data[42], 8);
+
+    assert_eq!(people.update(world), Vec::<String>::new());
+    let camera = LotCamera {
+        zoom: Zoom::Near,
+        rotation: 2,
+        level: 1,
+        origin: [279, -2004],
+        walls: Walls::Down,
+        focus: Default::default(),
+    };
+    let shape = sims_render::Lot::from_world(world).unwrap();
+    let mut lot_only = sims_render::Canvas::new(800, 600, [0, 0, 0]);
+    sims_render::draw(world, &shape, &mut opened.assets, &camera, &mut lot_only);
+    let mut canvas = sims_render::Canvas::new(800, 600, [0, 0, 0]);
+    sims_render::draw_lot(world, &shape, &mut opened.assets, &camera, &mut canvas);
+    let drawn = people.draw_on_lot(world, &camera, &mut canvas);
+    assert!(drawn.problems.is_empty(), "{:?}", drawn.problems);
+    sims_render::draw_held(world, &shape, &mut opened.assets, &camera, &mut canvas);
+    let pixels = [
+        ([446, 240], [189, 133, 106]),
+        ([435, 255], [213, 153, 123]),
+        ([435, 244], [8, 8, 8]),
+        ([442, 360], [41, 44, 57]),
+        ([446, 382], [16, 16, 16]),
+    ];
+    for ([x, y], original) in pixels {
+        let at = |c: &sims_render::Canvas| c.rgb565()[y * 800 + x];
+        let near = |c: [u8; 3]| c.iter().zip(original).all(|(&a, b)| a.abs_diff(b) <= 12);
+        assert!(near(at(&canvas)), "({x}, {y}): {:?}", at(&canvas));
+        assert!(
+            !near(at(&lot_only)),
+            "({x}, {y}) is the lot's: {:?}",
+            at(&lot_only)
+        );
+    }
+}
