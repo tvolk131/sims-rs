@@ -174,6 +174,10 @@ fn opening_userdata2_imports_its_patch_families_as_the_first_neighborhood_has_th
         })
         .collect();
     assert!(made.contains(&TEMPLATE_DOG) && made.contains(&TEMPLATE_CAT));
+    // The file's 26 empty slots, from the last, then new slots after its 49.
+    assert_eq!(opened.made_records.len(), 270);
+    assert_eq!(opened.made_records[..2], [46, 45]);
+    assert_eq!(opened.made_records[26..28], [50, 51]);
 
     // The first neighborhood had more families and records before its
     // import: 8 more family numbers and 18 more record slots.
