@@ -704,6 +704,7 @@ def main():
 
     sims_cr3 = None
     sim = None
+    sim_lot = None  # the lot whose update entry or return gave sim
     in_update = False
     watches = args.watch + args.late_watch
     pending = list(args.watch)
@@ -723,14 +724,16 @@ def main():
             remote.clear_watch(a, size)
 
     def locate(w, m):
-        """(address, value) for watch w now, or None if it cannot be worked out or read."""
+        """(address, value) for watch w now, or None if it cannot be worked out or read. A late
+        watch goes through the simulator only if the last entry or return that gave it was on this
+        lot's (a stop after a return elsewhere still has the other lot's)."""
         try:
-            a = w.resolve(m, sim)
+            a = w.resolve(m, sim if sim_lot == args.lot or w not in args.late_watch else None)
             return None if a is None else (a, w.read_at(m, a))
         except MemoryError:
             return None
 
-    def arm_watches(m, here):
+    def arm_watches(m, here, lot):
         for w in list(pending):
             if not here and w in args.late_watch:
                 continue
@@ -742,7 +745,7 @@ def main():
             w.set = True
             live_watches.append(w)
             pending.remove(w)
-            event(kind='watch_armed', name=w.name, expr=w.text, late=w in args.late_watch, lot=args.lot,
+            event(kind='watch_armed', name=w.name, expr=w.text, late=w in args.late_watch, lot=lot,
                   address=w.address, value=w.value, update=updates)
 
     def check_watches(m, here):
@@ -842,13 +845,22 @@ def main():
         # Its event has its name and its whole text (with the updates); a --watch given the same
         # text has the updates in its name. Earlier revisions wrote no `late`.
         # Only an arming on this lot after the baseline within its updates counts: it is set at
-        # the end of update first - 1 at the earliest. Earlier revisions did not record the lot.
+        # the end of update first - 1 at the earliest. Earlier revisions did not record the lot
+        # (and could arm on another): one of theirs counts only if no stop on another lot was
+        # recorded between the baseline and it.
         since = rows[next(i for i, r in enumerate(rows) if r['kind'] == 'baseline'):]
-        for w in late:
-            w.set = any(r['kind'] == 'watch_armed' and r.get('late', True) and r.get('name') == w.name
-                        and r.get('expr') == w.text and r.get('lot', args.lot) == args.lot
+        elsewhere_seen = False
+        for r in since:
+            if r['kind'] in ('entry_elsewhere', 'return_elsewhere'):
+                elsewhere_seen = True
+            if not (r['kind'] == 'watch_armed' and r.get('late', True)):
+                continue
+            on_lot = r['lot'] == args.lot if 'lot' in r else not elsewhere_seen
+            for w in late:
+                if (on_lot and r.get('name') == w.name and r.get('expr') == w.text
                         and r.get('update', -1) + 1 >= w.first
-                        and (w.last is None or r['update'] + 1 <= w.last) for r in since)
+                        and (w.last is None or r['update'] + 1 <= w.last)):
+                    w.set = True
         # A dialog shown since the last recorded return, and the dialogs still waiting for a result.
         dialog_pending = any(r['kind'] == 'dialog_show' and r['update'] > updates for r in rows)
         waiting = open_dialogs(rows)
@@ -886,13 +898,14 @@ def main():
         # A late watch is set or moved only at a stop on this lot: another lot's objects are not
         # this lot's, and one set there would count as set when the run is taken over.
         try:
-            here = m.lot() == args.lot
+            lot = m.lot()
         except MemoryError:
-            here = False
+            lot = None
+        here = lot == args.lot
         if live_watches:
             check_watches(m, here)
         if pending:
-            arm_watches(m, here)
+            arm_watches(m, here, lot)
 
     try:
         reply = remote.stop_reply()
@@ -964,7 +977,7 @@ def main():
             if foreign:
                 event(kind='foreign_stop', pc=pc, cr3=cr3)
             elif pc == ENTRY:
-                sim = regs['ecx']
+                sim, sim_lot = regs['ecx'], lot
                 if lot == args.lot and not baseline:
                     sims_cr3 = cr3
                     t0 = time.time()
@@ -999,7 +1012,7 @@ def main():
                     if elsewhere in (1, 10, 100) or elsewhere % 1000 == 0:
                         event(kind='entry_elsewhere', lot=lot, cr3=cr3, count=elsewhere)
             elif pc == RETURN:
-                sim = regs['ebx']
+                sim, sim_lot = regs['ebx'], lot
                 in_update = False
                 if lot != args.lot:
                     event(kind='return_elsewhere', lot=lot)
