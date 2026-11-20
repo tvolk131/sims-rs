@@ -254,7 +254,7 @@ mod word {
 /// Callbacks placement asks about without running them here.
 const SEAT: usize = 26;
 const SEAT_CHANGED: usize = 25;
-const WALLS_CHANGED: usize = 6;
+pub(crate) const WALLS_CHANGED: usize = 6;
 
 /// Where an object is, or is to go (0x4325b5, 0x432844).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -44,6 +44,7 @@
 
 use crate::fault::Trap;
 use crate::interpreter::{Flow, Machine};
+use crate::placement::WALLS_CHANGED;
 use crate::visits::function;
 use sims_sim::Dialog;
 
@@ -189,14 +190,18 @@ impl Machine<'_, '_> {
     ///
     /// The person made is not put on a tile: the house view's centre is
     /// presentation. The put (virtual function 0x88, 0x45e4e9) is the
-    /// placement 0x433340, which asks the person its function 9 (placed,
-    /// 0x433580) and runs code of the simulation's; a type whose callback
-    /// table names a tree there fails loudly. The rest of the put (the
+    /// placement 0x433340, which runs code of the simulation's: it asks the
+    /// person its function 9 (placed, 0x433580), and works out the walls
+    /// beside its tile (0x434fac), which asks it its function 6 when they
+    /// differ from the ones it had (0x435110). A type whose callback table
+    /// names a tree for either fails loudly. The rest of the put (the
     /// rooms, 0x440385, and the tiles, 0x4330d7) is taken to be undone by
     /// the removal: **unverified**. If no tile is found, the original
     /// removes the person without drawing it (0x4e9706), and the entry
-    /// stays without its image, to be built again at the next dialog
-    /// (0x4e92a8); here the image is taken to be built (**unverified**).
+    /// stays without its image; 0x4e938c then builds it again in the same
+    /// dialog unless the type has image 2002, and the next dialog builds it
+    /// again (0x4e92a8). Here a tile is taken to be found, so the person is
+    /// made once and the image kept (**unverified**).
     pub(crate) fn dialog_portrait(&mut self, operands: &[u8; 8]) -> Result<(), Trap> {
         let stack_object = self.frame()?.stack_object;
         let guid = match (operands[7] >> 1) & 7 {
@@ -219,16 +224,7 @@ impl Machine<'_, '_> {
         if self.world.portraits.contains(&guid) {
             return Ok(());
         }
-        if self.world.characters.made.contains_key(&guid) {
-            return Err(Trap::Unsupported(format!(
-                "a dialog's portrait of type 0x{guid:08X}, made while the game ran: whether the \
-                 interface's table of person types (0x6f2698) has it is not known"
-            )));
-        }
-        let person = crate::interpreter::object_definition(self.catalog, self.world, guid)
-            .is_some()
-            && self.definition_words(guid)?[TYPE] == PERSON_TYPE;
-        if !person {
+        if !self.listed_person_type(guid, "a dialog's portrait")? {
             return Ok(());
         }
         let on_lot = self.world.people.iter().any(|id| {
@@ -251,19 +247,24 @@ impl Machine<'_, '_> {
                      is not kept"
                 )));
             }
-            let placed = crate::interpreter::object_definition(self.catalog, self.world, guid)
-                .and_then(|d| {
-                    let library = self.program.libraries.get(&d.resource)?;
-                    library.callbacks.get(&d.chunk)?.get(function::PLACED)
-                })
-                .map_or(0, |f| f.action);
-            if placed != 0 {
-                return Err(Trap::Unsupported(format!(
-                    "a dialog's portrait of type 0x{guid:08X} with nobody of it on the lot puts a \
-                     person of it on a tile (0x45e4e9, 0x433340), which runs its function 9 \
-                     (tree {placed}, 0x433580); the tile, found from the house view's centre \
-                     (0x4347f0), is not modeled"
-                )));
+            let tree = |function: usize| {
+                crate::interpreter::object_definition(self.catalog, self.world, guid)
+                    .and_then(|d| {
+                        let library = self.program.libraries.get(&d.resource)?;
+                        library.callbacks.get(&d.chunk)?.get(function)
+                    })
+                    .map_or(0, |f| f.action)
+            };
+            for (function, at) in [(function::PLACED, "0x433580"), (WALLS_CHANGED, "0x435110")] {
+                let tree = tree(function);
+                if tree != 0 {
+                    return Err(Trap::Unsupported(format!(
+                        "a dialog's portrait of type 0x{guid:08X} with nobody of it on the lot \
+                         puts a person of it on a tile (0x45e4e9, 0x433340), which may run its \
+                         function {function} (tree {tree}, {at}); the tile, found from the house \
+                         view's centre (0x4347f0), is not modeled"
+                    )));
+                }
             }
             let interpreter = self.interpreter();
             let unsupported = |fault| {
@@ -281,6 +282,24 @@ impl Machine<'_, '_> {
         }
         self.world.portraits.insert(guid);
         Ok(())
+    }
+
+    /// Whether type `guid` is in the interface's table of person types
+    /// (0x4e9753, which gives its place, or -1): the table holds every
+    /// person type the catalog had when the game started (0x4e8b3d). A
+    /// type made since ([`sims_sim::World::characters`]) may not be in it,
+    /// and fails loudly, naming `what` asked.
+    fn listed_person_type(&self, guid: u32, what: &str) -> Result<bool, Trap> {
+        if self.world.characters.made.contains_key(&guid) {
+            return Err(Trap::Unsupported(format!(
+                "{what} of type 0x{guid:08X}, made while the game ran: whether the interface's \
+                 table of person types (0x6f2698) has it is not known"
+            )));
+        }
+        Ok(
+            crate::interpreter::object_definition(self.catalog, self.world, guid).is_some()
+                && self.definition_words(guid)?[TYPE] == PERSON_TYPE,
+        )
     }
 
     /// The strings a dialog's record loads, from STR# 301 of the running
@@ -327,7 +346,10 @@ impl Machine<'_, '_> {
     /// - `$Neighbor` (0x6e5090, from 0x6c4054; 0x44c65f to 0x44c69f): the
     ///   type of the neighbor record the stack object names (0x425afe),
     ///   when there is one. Its pass comes after `$Object`'s, so it wins
-    ///   in a string that holds both.
+    ///   in a string that holds both. It finds `$Neighbor` anywhere in the
+    ///   text as the passes before it left it, so only after the
+    ///   `$NeighborLocal` pass ([`Machine::neighbor_locals_named`]), which
+    ///   may have put a name in place of a `$NeighborLocal` token.
     ///
     /// The other tokens' text is presentation, and is not worked out.
     pub(crate) fn dialog_text_type(&self, operands: &[u8; 8]) -> Result<Option<u32>, Trap> {
@@ -342,11 +364,65 @@ impl Machine<'_, '_> {
             if text.contains("$Object") && object.is_some() {
                 found = object;
             }
-            if text.contains("$Neighbor") && neighbor.is_some() {
+            if self.neighbor_locals_named(&text)?.contains("$Neighbor") && neighbor.is_some() {
                 found = neighbor;
             }
         }
         Ok(found)
+    }
+
+    /// `text` after the formatter's `$NeighborLocal` pass (0x44c590 to
+    /// 0x44c65a), as far as it matters to the `$Neighbor` pass after it.
+    /// Each token (0x6e4fc0), searched for from one past the last
+    /// (0x44c643), is read with its `:` and number, and an optional second
+    /// `:` and number (0x44caf6). When the number is one of the running
+    /// tree's locals (below the count the tree has, frame +6), the local
+    /// names a neighbor record (0x4256f4) and the record's type is in the
+    /// interface's table of person types (0x4572af, 0x4e9753), the token
+    /// is replaced by the type's name (0x4e9c46, 0x455750); a record whose
+    /// type is not in the table ends the pass (0x44c616 to 0x44c653).
+    /// Otherwise the token stays, and the `$Neighbor` pass finds it. The
+    /// name itself is presentation; it stands here as text without a token
+    /// (a name holding `$Neighbor` is taken not to occur: **unverified**).
+    pub(crate) fn neighbor_locals_named(&self, text: &str) -> Result<String, Trap> {
+        const TOKEN: &str = "$NeighborLocal";
+        let locals = &self.frame()?.locals;
+        let mut text = text.to_owned();
+        let mut from = 0;
+        while let Some(at) = text
+            .get(from..)
+            .and_then(|t| t.find(TOKEN))
+            .map(|i| i + from)
+        {
+            let bytes = text.as_bytes();
+            let mut end = at + TOKEN.len();
+            let mut number = None;
+            for part in 0..2 {
+                if bytes.get(end) != Some(&b':') {
+                    break;
+                }
+                end += 1;
+                let digits = bytes[end..]
+                    .iter()
+                    .take_while(|b| b.is_ascii_digit())
+                    .count();
+                if part == 0 && digits > 0 {
+                    number = text[end..end + digits].parse::<usize>().ok();
+                }
+                end += digits;
+            }
+            let record = number
+                .and_then(|n| locals.get(n))
+                .and_then(|&local| self.world.neighbors.get(local));
+            if let Some(record) = record {
+                if !self.listed_person_type(record.guid, "a dialog's $NeighborLocal")? {
+                    break;
+                }
+                text.replace_range(at..end, "(name)");
+            }
+            from = at + 1;
+        }
+        Ok(text)
     }
 
     fn set_temp(&mut self, temp: usize, value: i16) -> Result<(), Trap> {

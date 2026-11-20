@@ -248,11 +248,25 @@ impl Machine<'_, '_> {
                     }
                     refreshing.pending = Some(pending);
                 }
-                None => {
-                    if let Some(taken_off) = self.taken_off {
+                None => match self.taken_off {
+                    Some(taken_off) => {
                         taken_off.borrow_mut().insert(id, pending);
                     }
-                }
+                    // Outside the scheduler's pass there is no pass for
+                    // the refresh to wait in. In a person's tick run on its
+                    // own (`Interpreter::tick_person`), dropping it would
+                    // hide it from a step run both ways (`crate::both_ways`)
+                    // and from the person's animator's tick: it fails. A
+                    // tree run alone (no person's tick) drops it.
+                    None if self.refreshing.is_some() => {
+                        return Err(Trap::Unsupported(format!(
+                            "person {id} queued for removal in a person's tick outside the \
+                             scheduler's pass: its animator's refresh (0x58da12) has no pass \
+                             to wait in"
+                        )));
+                    }
+                    None => {}
+                },
             }
         }
         let object = self

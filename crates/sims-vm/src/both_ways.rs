@@ -17,8 +17,11 @@
 //! ([`Cells`]). If the two runs give the same result, leave the same lot
 //! apart from that person's animator, and leave the same in every cell,
 //! it does not matter which the original made: the first run is kept,
-//! and both animators are kept apart as the step left them. Otherwise
-//! the step fails, and the lot and the cells are as they were before it.
+//! and both animators are kept apart as the step left them. That holds
+//! for a result that is a fault too: a step that faults the same way
+//! both ways keeps what it did before the fault, as any step does.
+//! Otherwise the step fails, and the lot and the cells are as they were
+//! before it.
 
 use crate::Trap;
 use crate::interpreter::{Asked, AtOnce, Interpreter, Machine, Status};
@@ -27,9 +30,8 @@ use crate::placement::{Kept, Pending, Refreshing};
 use crate::sounds::SoundEvent;
 use sims_formats::saved_objects::Interaction;
 use sims_sim::World;
-use std::cell::RefCell;
+use std::cell::{RefCell, RefMut};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Debug;
 
 /// Copies of what each cell an interpreter shares with the rest of the
 /// tick holds, so that a run can be made apart on them, compared with
@@ -54,17 +56,51 @@ fn copy<T: Clone>(cell: Option<&RefCell<T>>) -> Option<RefCell<T>> {
     cell.map(|c| RefCell::new(c.borrow().clone()))
 }
 
-/// What a cell holds, written out, to compare two runs' cells. The
-/// written form tells -0.0 from 0.0 and calls two NaNs alike, where `==`
-/// on the floats in an action does neither.
-fn shown<T: Debug>(cell: &Option<RefCell<T>>) -> Option<String> {
-    cell.as_ref().map(|c| format!("{:?}", c.borrow()))
+/// Whether two runs' copies of a cell hold the same, by `alike`.
+fn alike<T>(
+    a: &Option<RefCell<T>>,
+    b: &Option<RefCell<T>>,
+    alike: impl Fn(&T, &T) -> bool,
+) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => alike(&a.borrow(), &b.borrow()),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
-/// Puts what `copy` holds into `cell`.
-fn put<T>(cell: Option<&RefCell<T>>, copy: Option<RefCell<T>>) {
-    if let (Some(cell), Some(copy)) = (cell, copy) {
-        *cell.borrow_mut() = copy.into_inner();
+/// An action written out, its float (the attenuation) as its bits:
+/// `==` on it calls -0.0 and 0.0 alike and NaNs different, and its
+/// `Debug` calls every NaN alike. The other floats in the cells are
+/// [`sims_core::float::F32`]s, whose `==` compares their bits.
+fn bits(action: &Interaction) -> Vec<u8> {
+    postcard::to_allocvec(action).expect("an action is written out")
+}
+
+/// Whether two listings' checks hold the same, their actions bit for bit.
+fn same_checking(a: &Checking, b: &Checking) -> bool {
+    bits(&a.action) == bits(&b.action)
+        && a.added.len() == b.added.len()
+        && a.added
+            .iter()
+            .zip(&b.added)
+            .all(|(a, b)| bits(&a.action) == bits(&b.action) && a.name == b.name)
+}
+
+/// Whether two refreshes are the same, their animators bit for bit.
+fn same_refreshing(a: &Refreshing, b: &Refreshing) -> bool {
+    a.person == b.person && a.pending == b.pending && a.both_ways == b.both_ways
+}
+
+/// A cell borrowed to be written, before anything is.
+fn take<T>(cell: Option<&RefCell<T>>) -> Option<RefMut<'_, T>> {
+    cell.map(RefCell::borrow_mut)
+}
+
+/// Puts what `copy` holds into the cell `held` borrows.
+fn put<T>(held: Option<RefMut<'_, T>>, copy: Option<RefCell<T>>) {
+    if let (Some(mut held), Some(copy)) = (held, copy) {
+        *held = copy.into_inner();
     }
 }
 
@@ -120,35 +156,46 @@ impl Cells {
         }
     }
 
-    /// Whether two runs left the same in every cell.
+    /// Whether two runs left the same in every cell, floats bit for bit.
     pub(crate) fn same(&self, other: &Self) -> bool {
-        shown(&self.asked) == shown(&other.asked)
-            && shown(&self.deleted) == shown(&other.deleted)
-            && shown(&self.sounds) == shown(&other.sounds)
-            && shown(&self.menu) == shown(&other.menu)
-            && shown(&self.action) == shown(&other.action)
-            && shown(&self.letting_go) == shown(&other.letting_go)
-            && shown(&self.deleting) == shown(&other.deleting)
-            && shown(&self.refreshing) == shown(&other.refreshing)
-            && shown(&self.taken_off) == shown(&other.taken_off)
+        alike(&self.asked, &other.asked, PartialEq::eq)
+            && alike(&self.deleted, &other.deleted, PartialEq::eq)
+            && alike(&self.sounds, &other.sounds, PartialEq::eq)
+            && alike(&self.menu, &other.menu, same_checking)
+            && alike(&self.action, &other.action, |a, b| bits(a) == bits(b))
+            && alike(&self.letting_go, &other.letting_go, PartialEq::eq)
+            && alike(&self.deleting, &other.deleting, PartialEq::eq)
+            && self.same_refresh(other)
+            && alike(&self.taken_off, &other.taken_off, PartialEq::eq)
     }
 
     /// Whether these cells hold the same refresh as `other`'s.
     pub(crate) fn same_refresh(&self, other: &Self) -> bool {
-        shown(&self.refreshing) == shown(&other.refreshing)
+        alike(&self.refreshing, &other.refreshing, same_refreshing)
     }
 
-    /// Puts what these cells hold into `interpreter`'s, but for the
-    /// refresh pending, which the caller keeps.
-    pub(crate) fn keep(self, interpreter: &Interpreter) {
-        put(interpreter.asked, self.asked);
-        put(interpreter.deleted, self.deleted);
-        put(interpreter.sounds, self.sounds);
-        put(interpreter.menu, self.menu);
-        put(interpreter.running_at_once.map(|a| a.action), self.action);
-        put(interpreter.letting_go, self.letting_go);
-        put(interpreter.deleting, self.deleting);
-        put(interpreter.taken_off, self.taken_off);
+    /// Keeps the run these cells and `lot` hold: puts `lot` in `world`'s
+    /// place, and what these cells hold into `interpreter`'s, but for the
+    /// refresh pending, which the caller keeps. Every cell is borrowed
+    /// first, so that one held elsewhere panics before anything is kept.
+    pub(crate) fn keep(self, interpreter: &Interpreter, world: &mut World, lot: World) {
+        let asked = take(interpreter.asked);
+        let deleted = take(interpreter.deleted);
+        let sounds = take(interpreter.sounds);
+        let menu = take(interpreter.menu);
+        let action = take(interpreter.running_at_once.map(|a| a.action));
+        let letting_go = take(interpreter.letting_go);
+        let deleting = take(interpreter.deleting);
+        let taken_off = take(interpreter.taken_off);
+        *world = lot;
+        put(asked, self.asked);
+        put(deleted, self.deleted);
+        put(sounds, self.sounds);
+        put(menu, self.menu);
+        put(action, self.action);
+        put(letting_go, self.letting_go);
+        put(deleting, self.deleting);
+        put(taken_off, self.taken_off);
     }
 }
 
@@ -242,7 +289,7 @@ impl<'a> Machine<'a, '_> {
                 .refreshing
                 .as_ref()
                 .is_some_and(|r| r.borrow().pending.is_some())
-                || shown(&cells.taken_off) != shown(&start.taken_off)
+                || !alike(&cells.taken_off, &start.taken_off, PartialEq::eq)
         };
         if another(&left_cells) || another(&drawn_cells) {
             return Err(differ("takes a person off the lot"));
@@ -257,9 +304,9 @@ impl<'a> Machine<'a, '_> {
             return Err(differ("leaves another lot"));
         }
 
-        *self.world = left;
-        left_cells.keep(&self.interpreter());
-        refreshing.borrow_mut().pending = Some(Pending {
+        let mut refreshing = refreshing.borrow_mut();
+        left_cells.keep(&self.interpreter(), self.world, left);
+        refreshing.pending = Some(Pending {
             left: kept_left,
             refreshed: kept_refreshed,
         });
@@ -272,14 +319,93 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cells_are_compared_as_written_out() {
-        // `==` calls -0.0 and 0.0 alike and two NaNs different; the
-        // written form does the opposite, which is what a run reaching
-        // the same state means.
-        let cell = |v: f32| Some(RefCell::new(vec![v]));
-        assert_ne!(shown(&cell(0.0)), shown(&cell(-0.0)));
-        assert_eq!(shown(&cell(f32::NAN)), shown(&cell(f32::NAN)));
-        assert_eq!(shown::<Vec<f32>>(&None), None);
+    fn actions_are_compared_bit_for_bit() {
+        // `==` calls -0.0 and 0.0 alike and two NaNs different, and
+        // `Debug` calls every NaN alike; two runs reach the same state
+        // only when the bits are the same.
+        let action = |bits: u32| Interaction {
+            uid: 0,
+            caller: 0,
+            target: 0,
+            icon: 0,
+            table_index: 0,
+            args: [0; 4],
+            priority: 0,
+            action: 0,
+            attenuation: f32::from_bits(bits),
+            flags: 0,
+        };
+        let cells = |action_bits: u32, menu_bits: u32| Cells {
+            asked: None,
+            deleted: None,
+            sounds: None,
+            menu: Some(RefCell::new(Checking {
+                action: action(menu_bits),
+                added: vec![],
+            })),
+            action: Some(RefCell::new(action(action_bits))),
+            letting_go: None,
+            deleting: None,
+            refreshing: None,
+            taken_off: None,
+        };
+        let (nan, other_nan) = (0x7fc0_0001, 0x7fc0_0002);
+        assert!(!cells(0, 0).same(&cells(0x8000_0000, 0)), "0.0 and -0.0");
+        assert!(cells(nan, nan).same(&cells(nan, nan)), "one NaN");
+        assert!(!cells(nan, nan).same(&cells(other_nan, nan)), "the action");
+        assert!(
+            !cells(nan, nan).same(&cells(nan, other_nan)),
+            "the menu's action"
+        );
+    }
+
+    #[test]
+    fn a_cell_held_elsewhere_stops_the_keep_before_anything_is_kept() {
+        let program = crate::program::Program {
+            global: 0,
+            libraries: BTreeMap::new(),
+            semi_globals: BTreeMap::new(),
+            careers: None,
+            zoning: BTreeMap::new(),
+            animations: Default::default(),
+            people: Default::default(),
+            icon_frames: None,
+            wardrobe: None,
+            character_files: Default::default(),
+            expansions: 0,
+            characters: Default::default(),
+        };
+        let catalog = sims_content::Catalog {
+            global: 0,
+            objects: vec![],
+            by_guid: Default::default(),
+            semi_globals: Default::default(),
+            diagnostics: vec![],
+        };
+        let asked = RefCell::new(vec![]);
+        let sounds = RefCell::new(vec![]);
+        let interpreter = Interpreter {
+            asked: Some(&asked),
+            sounds: Some(&sounds),
+            ..Interpreter::new(&program, &catalog, crate::Stream::Lot)
+        };
+        let mut cells = Cells::of(&interpreter);
+        cells.asked = Some(RefCell::new(vec![Asked {
+            object: 1,
+            function: 9,
+        }]));
+        let mut world = World::empty();
+        let mut lot = World::empty();
+        lot.globals.push(7);
+        let before = world.encode();
+        let held = sounds.borrow();
+        let kept = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cells.keep(&interpreter, &mut world, lot)
+        }));
+        drop(held);
+        assert!(kept.is_err());
+        assert_eq!(world.encode(), before, "the lot was not kept");
+        assert!(asked.borrow().is_empty(), "no cell was kept");
     }
 
     #[test]

@@ -143,31 +143,32 @@ fn a_portrait_the_port_cannot_tell_was_built_fails_loudly() {
 #[test]
 fn a_portrait_whose_person_runs_code_when_put_down_fails_loudly() {
     // The person made is put on a tile (0x45e4e9, 0x433340), which asks
-    // it its function 9 (0x433580). The tile is not modeled.
-    let (mut fx, file, record) = visitors();
-    let library = fx.program.libraries.get_mut(&file).unwrap();
-    for table in library.callbacks.values_mut() {
-        table.resize(
-            10,
-            sims_formats::execution::ObjectFunction {
-                condition: 0,
-                action: 0,
-            },
+    // it its function 9 (0x433580), and its function 6 when the walls
+    // beside the tile differ from its own (0x434fac, 0x435110). The tile
+    // is not modeled.
+    for (function, at) in [(9, "0x433580"), (6, "0x435110")] {
+        let (mut fx, file, record) = visitors();
+        let library = fx.program.libraries.get_mut(&file).unwrap();
+        for table in library.callbacks.values_mut() {
+            table.resize(
+                10,
+                sims_formats::execution::ObjectFunction {
+                    condition: 0,
+                    action: 0,
+                },
+            );
+            table[function].action = 4200;
+        }
+        let objects = fx.world.objects.clone();
+        let fault = inform(&mut fx, 2, record).unwrap_err().to_string();
+        assert!(fault.contains(at) && fault.contains("tree 4200"), "{fault}");
+        assert!(fx.world.portraits.is_empty());
+        assert_eq!(
+            fx.world.objects.keys().collect::<Vec<_>>(),
+            objects.keys().collect::<Vec<_>>(),
+            "nobody was made"
         );
-        table[9].action = 4200;
     }
-    let objects = fx.world.objects.clone();
-    let fault = inform(&mut fx, 2, record).unwrap_err().to_string();
-    assert!(
-        fault.contains("0x433580") && fault.contains("tree 4200"),
-        "{fault}"
-    );
-    assert!(fx.world.portraits.is_empty());
-    assert_eq!(
-        fx.world.objects.keys().collect::<Vec<_>>(),
-        objects.keys().collect::<Vec<_>>(),
-        "nobody was made"
-    );
 }
 
 #[test]
@@ -216,5 +217,72 @@ fn a_dialogs_text_can_show_the_stack_objects_neighbor_instead() {
             [shown].into(),
             "{label} {title} {message}"
         );
+    }
+}
+
+#[test]
+fn a_neighbor_local_named_in_a_dialogs_text_is_not_its_neighbor() {
+    // The formatter's `$NeighborLocal` pass (0x44c590 to 0x44c65a) comes
+    // before the `$Neighbor` pass, which finds `$Neighbor` anywhere in the
+    // text as it is left. A token whose local names a record of a person
+    // type is replaced by that type's name, so `$Neighbor` is not found and
+    // mode 0 shows the stack object's type. One whose local names no record,
+    // or is past the tree's locals, stays, and `$Neighbor` is found in it.
+    // A record of a type not in the person types' table ends the pass
+    // (0x44c616), leaving the tokens after it too.
+    let strings = [
+        "Hi $NeighborLocal:0",
+        "$NeighborLocal:9",
+        "$NeighborLocal:1 $NeighborLocal:0",
+    ];
+    for (message, locals, shown) in [
+        (1, [0, 0], WIDGET),
+        (1, [-1, 0], SIM_GUID),
+        (2, [-1, -1], WIDGET),
+        (3, [-1, -1], SIM_GUID),
+        (3, [-1, -2], WIDGET),
+    ] {
+        // The person (2) is the stack object, and neighbor record 2 is of
+        // the widget's type, with nobody of it on the lot. Local `n` holds
+        // `locals[n]`, where -1 is the widget's record and -2 a record of
+        // the lamp's type, which is not a person.
+        let (mut fx, _, record) = visitors();
+        let neighbor = fx.world.neighbors.slots[record as usize - 1].clone();
+        let mut lamp = neighbor.clone().unwrap();
+        lamp.guid = LAMP_GUID;
+        let slots = &mut fx.world.neighbors.slots;
+        slots.resize(slots.len().max(2), None);
+        slots[usize::from(SIM) - 1] = neighbor;
+        slots.push(Some(lamp));
+        let lamp_record = slots.len() as i16;
+        fx.world.people = vec![SIM];
+        fx.program
+            .libraries
+            .get_mut(&LAMP_FILE)
+            .unwrap()
+            .strings
+            .insert(301, strings.map(str::to_owned).to_vec());
+        let local = |value: i16| match value {
+            -1 => record,
+            -2 => lamp_record,
+            v => v,
+        };
+        fx.add(
+            LAMP_FILE,
+            4096,
+            tree(vec![
+                assign(scope::LOCALS, 0, scope::LITERAL, local(locals[0]), 1),
+                assign(scope::LOCALS, 1, scope::LITERAL, local(locals[1]), 2),
+                ins(
+                    DIALOG,
+                    RETURN_TRUE,
+                    RETURN_FALSE,
+                    [0, 0, message, 0, 0, 0, 0, 1],
+                ),
+            ]),
+        );
+        let ran = fx.run_with(LAMP, 4096, SIM as i16, &[], 1000);
+        assert_eq!(ran, Ok(true), "{message} {locals:?}");
+        assert_eq!(fx.world.portraits, [shown].into(), "{message} {locals:?}");
     }
 }

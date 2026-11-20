@@ -424,8 +424,7 @@ impl Interpreter<'_> {
                 "the refresh then the tick reach another state than the tick alone",
             ));
         }
-        *world = left;
-        left_cells.keep(self);
+        left_cells.keep(self, world, left);
         ticked
     }
 

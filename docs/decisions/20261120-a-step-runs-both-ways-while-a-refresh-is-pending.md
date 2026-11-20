@@ -55,8 +55,11 @@ same in every cell:
 - the people another object took off;
 - the refresh pending.
 
-The cells are compared as written out (`Debug`), so that an action's
-floats compare bit for bit rather than by `==`.
+Floats are compared bit for bit. An action's attenuation is a plain
+`f32`, which `==` would call equal at -0.0 and 0.0 and `Debug` would call
+equal for any two NaNs, so actions (the one run at once, and the pie
+menu's) are compared written out with postcard, which keeps the bits.
+Every other float in the cells is an `F32`, whose `==` compares bits.
 
 If they do, the original reached the same state whichever branch it took.
 The lot and the cells go on with the first run, and both animators are
@@ -65,7 +68,16 @@ runs differ, or either run takes a person off the lot (itself, which
 leaves a refresh pending in its copy, or another, which changes its copy
 of the people taken off), the step fails loudly and names 0x58da12 and
 byte +0x109. Neither run is kept then: the lot and the cells are as they
-were before the step.
+were before the step. When the runs agree on a fault, the first run is
+kept with the fault, as any step that faults keeps what it did before
+it. Keeping a run borrows every cell before it writes anything, so a cell
+held elsewhere panics before the lot or any cell is kept.
+
+A person queued for removal by another person's tick has its refresh
+kept for the scheduler's pass (`taken_off`). In a person's tick run on its
+own (`Interpreter::tick_person`) there is no pass, so that fails loudly
+rather than dropping the refresh, which would hide it from the
+comparison. A tree run outside any person's tick still drops it.
 
 The refresh itself (`Interpreter::refresh_at_take_off`) and the
 animator's tick that settles the two animators
@@ -86,7 +98,10 @@ other. `a_step_both_ways_that_fails_keeps_neither_run` has a step that
 takes the person off the lot again, and checks that the lot is left as
 the take-off left it.
 `after_taking_itself_off_a_step_that_agrees_both_ways_goes_on` is the
-agreeing case. A run can take another person off only through Remove
+agreeing case. `actions_are_compared_bit_for_bit`,
+`a_cell_held_elsewhere_stops_the_keep_before_anything_is_kept` and
+`a_person_removed_in_a_persons_tick_outside_the_schedulers_pass_fails_loudly`
+cover the comparison, the keep and the removal above. A run can take another person off only through Remove
 Object Instance, which never runs both ways, or a tree that a primitive
 run both ways calls. No synthetic test reaches that case. The check is
 there so that such a run fails rather than passes.
@@ -158,6 +173,16 @@ What is not ported:
   - `$Object` (0x44c1af) gives the stack object's type;
   - `$Neighbor` (0x44c69f) gives the type of the neighbor record that
     the stack object names (0x425afe). Its pass comes after `$Object`'s.
+    It finds `$Neighbor` anywhere in the text as the passes before it
+    left it. The `$NeighborLocal` pass just before it (0x44c590 to
+    0x44c65a) replaces a token with a person type's name when the
+    token's number is one of the tree's locals, the local names a
+    neighbor record (0x4256f4), and the record's type is in the
+    interface's table of person types (0x4e9753). A record whose type is
+    not in the table ends that pass (0x44c616). A token not replaced
+    stays, and `$Neighbor` is found in it. The name itself is taken to
+    hold no `$Neighbor`. **Unverified.** Test:
+    `a_neighbor_local_named_in_a_dialogs_text_is_not_its_neighbor`.
 
   The last type found is kept, and mode 0 shows it in place of the stack
   object's (0x436308). Mode 2 does not read it. Two kinds of string are
@@ -169,14 +194,19 @@ What is not ported:
 - **Placement.** The person made is not put on a tile, because the tile is
   found from the house view's centre (0x4347f0), which is presentation.
   - The put (virtual function 0x88, 0x45e4e9) is the placement 0x433340.
-    That asks the person its function 9 (0x433580), so a type whose
-    callback table names a tree there fails loudly.
+    That asks the person its function 9 (0x433580). It also works out
+    the walls beside the tile (0x434fac) and asks function 6 when they
+    differ from the person's (0x435110). A type whose callback table
+    names a tree for either fails loudly.
   - The rest of the put (the rooms, 0x440385; the tiles, 0x4330d7) is
     taken to be undone by the removal. **Unverified.**
   - If the original finds no tile, it removes the person without drawing
-    it (0x4e9706). The entry then stays without its image, and 0x4e92a8
-    builds it again at the next dialog. The port counts the image as
-    built. **Unverified.**
+    it (0x4e9706). The entry then stays without its image. 0x4e938c then
+    builds it again in the same dialog unless the type has image 2002,
+    and 0x4e92a8 builds it again at the next dialog. Each build makes a
+    person and removes it. The port takes a tile to be found, so it makes
+    the person once and counts the image as built. **Unverified.** Whether
+    a tile is found depends on the house view's centre.
 - **Other builders.** Only the dialog's builds are counted. The household
   panel draws the family's portraits, so a portrait of a family member's
   type with nobody of it on the lot fails loudly. A type made while the

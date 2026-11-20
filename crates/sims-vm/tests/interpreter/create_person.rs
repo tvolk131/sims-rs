@@ -296,6 +296,40 @@ fn another_object_takes_a_person_off_and_nothing_reads_its_animator_after() {
 }
 
 #[test]
+fn a_person_removed_in_a_persons_tick_outside_the_schedulers_pass_fails_loudly() {
+    // The removed person's animator refresh waits for its animator's tick
+    // in the scheduler's pass. A person's tick run on its own has no pass
+    // to keep it in, and dropping it would hide it from a step run both
+    // ways: it fails.
+    let (mut fx, id, file) = placed_visitor();
+    fx.add(
+        file,
+        4203,
+        tree(vec![ins(
+            REMOVE,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [1, 0, 0, 0, 0, 0, 0, 0],
+        )]),
+    );
+    for slot in &mut fx.sim_mut().slots {
+        slot.object = 0;
+    }
+    fx.thread(id, 4203, &[]);
+    fx.world.objects.get_mut(&id).unwrap().stack[0].stack_object = SIM as i16;
+    let tuning = crate::tick::tuning();
+    let ticks = fx.world.ticks as i32;
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let fault = interpreter
+        .tick_person(&mut fx.world, id, ticks, &tuning)
+        .unwrap_err();
+    assert!(
+        matches!(fault.trap, Trap::Unsupported(ref m) if m.contains("outside the scheduler's pass")),
+        "{fault}"
+    );
+}
+
+#[test]
 fn another_object_taking_off_a_person_whose_hand_holds_something_fails_loudly() {
     let (mut fx, id, _) = placed_visitor();
     // The Sim, holding nothing itself, is in the person's hand.
