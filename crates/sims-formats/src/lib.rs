@@ -7,6 +7,7 @@ pub mod far;
 pub mod ffn;
 pub mod field;
 pub mod iff;
+pub mod iff_write;
 mod legacy_sprite;
 pub mod lot;
 pub mod neighborhood;
