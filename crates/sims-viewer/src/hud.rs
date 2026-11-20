@@ -157,10 +157,8 @@ impl Hud {
         };
         let mut snapshot = Snapshot::read(world, &self.members).with_careers(&self.careers);
         // The viewer plays no sounds, so a balloon this closes closes
-        // silently. The lot's zoning is not read: the snapshot's lot
-        // counts as residential.
-        let selected = snapshot.selected.and_then(|s| snapshot.resident(s));
-        self.controls.follow(selected.is_some());
+        // silently.
+        self.controls.follow(snapshot.selected_resident().is_some());
         // The lookup goes through every neighborhood record, so only
         // while the panel shows it.
         if self.controls.panel == Some(Panel::Relationships) {
@@ -239,8 +237,15 @@ impl Hud {
     }
 
     /// A press at `point`: the view command to carry out, if any, and
-    /// whether the panel changed.
-    pub fn press(&mut self, point: [i32; 2]) -> (Option<ViewCommand>, bool) {
+    /// whether the panel changed. A gadget button's press is checked
+    /// against `world` as it is at the press ([`hud::check_press`]). The
+    /// viewer does not read the lot's zoning, so the lot counts as
+    /// residential, and a refusal is silent: the viewer plays no sounds.
+    pub fn press(
+        &mut self,
+        point: [i32; 2],
+        world: &sims_sim::World,
+    ) -> (Option<ViewCommand>, bool) {
         if let Some(layout) = &self.dialog {
             let Some(command) = dialog::press(layout, point) else {
                 return (None, false);
@@ -253,6 +258,10 @@ impl Hud {
         let Some(command) = hud::press(&self.items, point) else {
             return (None, false);
         };
+        let selected = Snapshot::read(world, &self.members)
+            .selected_resident()
+            .is_some();
+        let command = hud::check_press(command, selected, true);
         if command.changes_simulation() {
             eprintln!("not carried out, the simulation takes no commands yet: {command:?}");
             return (None, false);

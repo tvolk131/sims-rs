@@ -68,9 +68,6 @@ pub struct Hud {
     texts: Texts,
     /// The household's member GUIDs, in the neighborhood's order.
     members: Vec<u32>,
-    /// Whether the lot is residential (`sims_vm::Lot::residential`),
-    /// which the House button needs. The game sets it before each frame.
-    pub residential: bool,
     pub controls: Controls,
     items: Vec<Item>,
     /// The dialog the world waits on, and the record it was read from
@@ -162,7 +159,6 @@ impl Hud {
             labels,
             texts,
             members,
-            residential: true,
             // The strip opens as if Live had been pressed.
             controls: Controls {
                 expanded: true,
@@ -223,11 +219,9 @@ impl Hud {
     }
 
     /// The household with what the next level of each one's career
-    /// needs, and whether the lot is residential.
+    /// needs.
     fn household(&self, world: &World) -> Snapshot {
-        let mut snapshot = Snapshot::read(world, &self.members).with_careers(&self.careers);
-        snapshot.residential = self.residential;
-        snapshot
+        Snapshot::read(world, &self.members).with_careers(&self.careers)
     }
 
     /// `snapshot` with what the open panel reads besides.
@@ -273,8 +267,10 @@ impl Hud {
         // The panel follows the selection first, so that the snapshot
         // reads what the open panel needs.
         let household = self.household(world);
-        let selected = household.selected.and_then(|s| household.resident(s));
-        if self.controls.follow(selected.is_some()) {
+        if self
+            .controls
+            .follow(household.selected_resident().is_some())
+        {
             self.play(WHOOSH);
         }
         if self.controls.expanded && self.controls.panel == Some(UiPanel::House) {
@@ -479,8 +475,11 @@ impl Hud {
     }
 
     /// A press at `point`: the command it asks for, if any. Commands that
-    /// change only the panel are applied here too.
-    pub fn press(&mut self, point: [i32; 2]) -> Option<Command> {
+    /// change only the panel are applied here too. A gadget button's
+    /// press is checked against `world` and `residential` (whether the lot
+    /// is, `sims_vm::Lot::residential`) as they are at the press, not as
+    /// the frame drew them ([`hud::check_press`]).
+    pub fn press(&mut self, point: [i32; 2], world: &World, residential: bool) -> Option<Command> {
         if let Some(layout) = &self.dialog {
             return dialog::press(layout, point);
         }
@@ -511,6 +510,15 @@ impl Hud {
             return command;
         }
         let command = hud::press(&self.items, point)?;
+        let command = match command {
+            Command::OpenPanel(_) => {
+                let selected = Snapshot::read(world, &self.members)
+                    .selected_resident()
+                    .is_some();
+                hud::check_press(command, selected, residential)
+            }
+            other => other,
+        };
         if command == (Command::Refused { error: true }) {
             self.play(ERROR);
         }

@@ -695,7 +695,7 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
         kind: Kind::Image(id::GAUGE),
         command: None,
     });
-    let selected = snapshot.selected.and_then(|s| snapshot.resident(s));
+    let selected = snapshot.selected_resident();
     if let Some(resident) = selected {
         mood_bars(items, gadget, resident.motives[sims_sim::motives::MOOD]);
     }
@@ -711,15 +711,8 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
         (id::GIFTS, Panel::Gifts, 44, 66, 27, 30),
         (id::HOUSE, Panel::House, 76, 66, 27, 30),
     ] {
-        // Each button needs a selected Sim, and House a residential lot;
-        // a refusal of House sounds (0x51bbe6 to 0x51be75).
-        let command = match panel {
-            Panel::House if selected.is_none() || !snapshot.residential => {
-                Command::Refused { error: true }
-            }
-            _ if selected.is_none() => Command::Refused { error: false },
-            _ => Command::OpenPanel(panel),
-        };
+        // Whether the panel opens is for the host to check at the press
+        // ([`check_press`]), as the original does.
         items.push(Item {
             rect: g(x, y, w, h),
             kind: Kind::Button {
@@ -727,7 +720,7 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
                 cells: 4,
                 selected: controls.panel == Some(panel),
             },
-            command: Some(command),
+            command: Some(Command::OpenPanel(panel)),
         });
     }
     // The original shows no needs without a selected Sim.
@@ -1835,6 +1828,23 @@ pub fn press(items: &[Item], point: [i32; 2]) -> Option<Command> {
     items.get(topmost(items, point)?)?.command.clone()
 }
 
+/// What a press that asks for `command` does, by the state at the press,
+/// as the original's press handler checks it then (0x51bbe6 to
+/// 0x51be75). Each gadget button needs a selected Sim (`selected`: one of
+/// the household's, the panel's +0xe8), and the House button a
+/// residential lot too (`residential`, 0x40745f). A refused House press
+/// sounds (0x51be1a); another refused press does nothing (0x51be6e).
+/// Other commands pass through.
+pub fn check_press(command: Command, selected: bool, residential: bool) -> Command {
+    match command {
+        Command::OpenPanel(Panel::House) if !selected || !residential => {
+            Command::Refused { error: true }
+        }
+        Command::OpenPanel(_) if !selected => Command::Refused { error: false },
+        other => other,
+    }
+}
+
 /// Whether the panel covers `point`, so a press there is the panel's and
 /// not the lot's.
 pub fn covers(items: &[Item], point: [i32; 2]) -> bool {
@@ -1893,7 +1903,6 @@ mod tests {
             relations: Vec::new(),
             superstar: false,
             house: crate::house::House::default(),
-            residential: true,
         }
     }
 
@@ -2739,57 +2748,64 @@ mod tests {
             id::HOUSE => Panel::House,
             _ => unreachable!(),
         };
-        // Selected, on a residential lot: each opens its panel.
+        // Each button asks for its panel, selected or not: the check is
+        // the press's. The buttons take the press either way, so they are
+        // not drawn disabled.
         let mut s = snapshot();
-        let commands = gadget_commands(&layout([800, 600], &s, &controls));
-        assert_eq!(commands.len(), 7);
-        for (id, command) in &commands {
-            assert_eq!(*command, Command::OpenPanel(opens(*id)));
-        }
-        // The House button, at (76, 66) in the gadget.
-        assert_eq!(
-            press(&layout([800, 600], &s, &controls), [413 + 80, 500 + 70]),
-            Some(Command::OpenPanel(Panel::House))
-        );
-        // On a lot that is not residential, House is refused with the
-        // error sound (0x51be1a); the others still open.
-        s.residential = false;
-        for (id, command) in gadget_commands(&layout([800, 600], &s, &controls)) {
-            let expected = if id == id::HOUSE {
-                Command::Refused { error: true }
-            } else {
-                Command::OpenPanel(opens(id))
-            };
-            assert_eq!(command, expected);
-        }
-        // With nobody selected every button is refused, and only House
-        // sounds (0x51be6e, 0x51be1a), on any lot. The buttons still take
-        // the press, so they are not drawn disabled.
-        for residential in [true, false] {
-            s.residential = residential;
-            s.selected = None;
+        for selected in [Some(21), None] {
+            s.selected = selected;
             let commands = gadget_commands(&layout([800, 600], &s, &controls));
             assert_eq!(commands.len(), 7);
-            for (id, command) in commands {
+            for (id, command) in &commands {
+                assert_eq!(*command, Command::OpenPanel(opens(*id)));
+            }
+        }
+        // The House button, at (76, 66) in the gadget.
+        let house = press(&layout([800, 600], &s, &controls), [413 + 80, 500 + 70]);
+        assert_eq!(house, Some(Command::OpenPanel(Panel::House)));
+        let check = |panel: Panel, selected: bool, residential: bool| {
+            check_press(Command::OpenPanel(panel), selected, residential)
+        };
+        for panel in [
+            Panel::Needs,
+            Panel::Interests,
+            Panel::Relationships,
+            Panel::Personality,
+            Panel::Job,
+            Panel::Gifts,
+        ] {
+            // Selected: it opens, on any lot.
+            assert_eq!(check(panel, true, true), Command::OpenPanel(panel));
+            assert_eq!(check(panel, true, false), Command::OpenPanel(panel));
+            // Nobody selected: refused, silently (0x51be6e).
+            for residential in [true, false] {
                 assert_eq!(
-                    command,
-                    Command::Refused {
-                        error: id == id::HOUSE
-                    }
+                    check(panel, false, residential),
+                    Command::Refused { error: false }
                 );
             }
         }
-        // A selected person who is not one of the household's counts as
-        // nobody.
-        s.selected = Some(999);
-        for (id, command) in gadget_commands(&layout([800, 600], &s, &controls)) {
+        // House needs both, and its refusal sounds (0x51be1a).
+        assert_eq!(
+            check(Panel::House, true, true),
+            Command::OpenPanel(Panel::House)
+        );
+        for (selected, residential) in [(true, false), (false, true), (false, false)] {
             assert_eq!(
-                command,
-                Command::Refused {
-                    error: id == id::HOUSE
-                }
+                check(Panel::House, selected, residential),
+                Command::Refused { error: true }
             );
         }
+        // Other commands pass through.
+        for command in [Command::TogglePanel, Command::Select { sim: 21 }] {
+            assert_eq!(check_press(command.clone(), false, false), command);
+        }
+        // A selected person who is not one of the household's counts as
+        // nobody.
+        s.selected = Some(21);
+        assert_eq!(s.selected_resident().map(|r| r.object), Some(21));
+        s.selected = Some(999);
+        assert!(s.selected_resident().is_none());
         // A refusal changes nothing that shows.
         let mut refused = Controls {
             panel: Some(Panel::Personality),

@@ -545,7 +545,6 @@ impl Game {
         // it was shown.
         let dialogs = self.lot.asking().map_or(world, |a| &a.world);
         self.hud.read_dialog(dialogs, &self.assets);
-        self.hud.residential = self.lot.residential();
         self.hud.draw(
             world,
             &self.assets,
@@ -615,7 +614,10 @@ impl Game {
         if self.hud.covers(point) {
             // The menu, whose entries a choice is an index into.
             let menu = self.hud.menu.clone();
-            let outcome = match self.hud.press(point) {
+            let outcome = match self
+                .hud
+                .press(point, self.lot.world(), self.lot.residential())
+            {
                 Some(command) => self.command(command, menu.as_ref()),
                 None => Outcome::redraw(),
             };

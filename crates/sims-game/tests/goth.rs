@@ -1595,6 +1595,99 @@ fn the_house_button_opens_the_house_panel_on_the_goths_lot() {
     assert_eq!(game.caught(), 0, "{:?}", game.errors());
 }
 
+/// The House button's press is checked as the lot is at the press, not
+/// as the frame drew it (0x51bdf2, 0x51be03). With nobody selected, or on
+/// a lot that is not residential, it is refused with `UI_error` for the
+/// interface (0x51be1a) and the panel stays as it was. The panel follows
+/// the selection at the next frame. A help balloon that closes then
+/// whooshes once (0x50fb7f).
+#[test]
+fn the_house_button_is_checked_at_the_press() {
+    use sims_game::hud::{ERROR, Hud, INTERFACE, WHOOSH};
+    use sims_game::pace::Pace;
+    use sims_ui::balloon::Help;
+    use sims_ui::command::{Command, Panel};
+    let Some(install) = install() else {
+        return;
+    };
+    let house = goth_house(&install);
+    let lot = Lot::load(&install, &house, &[3], Frames::default()).expect("the Goth house boots");
+    let opened = open_house(&install, &house).expect("the house opens");
+    let mut hud = Hud::open(
+        &install,
+        &house,
+        &opened.assets,
+        lot.world(),
+        lot.program().autonomy_constants().friendship_threshold,
+    )
+    .expect("the panel opens");
+    let view = View::new([800, 600], [0, 0], opened.rotation);
+    let mut canvas = Canvas::new(800, 600, [0; 3]);
+    let mut draw = |hud: &mut Hud, world: &sims_sim::World| {
+        hud.draw(
+            world,
+            &opened.assets,
+            &view,
+            &Pace::default(),
+            None,
+            &mut canvas,
+        );
+        hud.take_sounds()
+    };
+    let selected = lot.world().clone();
+    assert!(selected.selected().is_some());
+    let mut nobody = selected.clone();
+    for object in nobody.objects.values_mut() {
+        object.selected = false;
+    }
+    let sound = |name: &str| SoundEvent::Play {
+        object: INTERFACE,
+        name: name.into(),
+    };
+
+    assert!(draw(&mut hud, &selected).is_empty());
+    assert_eq!(hud.controls.panel, Some(Panel::Needs));
+    let button = hud
+        .items()
+        .iter()
+        .find(|i| i.command == Some(Command::OpenPanel(Panel::House)))
+        .expect("the House button")
+        .rect;
+    let centre = [button.x + button.width / 2, button.y + button.height / 2];
+    // Drawn with Mortimer selected; nobody is by the press.
+    let refused = Some(Command::Refused { error: true });
+    assert_eq!(hud.press(centre, &nobody, true), refused);
+    assert_eq!(hud.take_sounds(), [sound(ERROR)]);
+    assert_eq!(hud.controls.panel, Some(Panel::Needs));
+    // Selected, on a lot that is not residential.
+    assert_eq!(hud.press(centre, &selected, false), refused);
+    assert_eq!(hud.take_sounds(), [sound(ERROR)]);
+    assert_eq!(hud.controls.panel, Some(Panel::Needs));
+
+    // A balloon open when the selection goes closes at the next frame,
+    // with one whoosh, and no panel is open then.
+    hud.controls.panel = Some(Panel::Personality);
+    hud.controls.help = Some(Help::Sign(1));
+    assert_eq!(draw(&mut hud, &nobody), [sound(WHOOSH)]);
+    assert_eq!((hud.controls.panel, hud.controls.help), (None, None));
+    assert!(draw(&mut hud, &nobody).is_empty());
+    // Drawn with nobody selected; Mortimer is by the press, on the
+    // residential Goth lot, so the house panel opens, silently.
+    assert!(lot.residential());
+    assert_eq!(
+        hud.press(centre, &selected, lot.residential()),
+        Some(Command::OpenPanel(Panel::House))
+    );
+    assert!(hud.take_sounds().is_empty());
+    assert_eq!(hud.controls.panel, Some(Panel::House));
+    assert!(draw(&mut hud, &selected).is_empty());
+    assert!(
+        hud.items()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::House { .. }))
+    );
+}
+
 /// The live panel's Personality button shows the selected Sim's
 /// personality as the world holds it (person data words 7, 6, 3, 5 and
 /// 2: Neat, Outgoing, Active, Playful, Nice), and follows a press on

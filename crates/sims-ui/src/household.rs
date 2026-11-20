@@ -213,10 +213,6 @@ pub struct Snapshot {
     /// What the house panel shows: nothing until [`Snapshot::with_house`]
     /// works it out.
     pub house: House,
-    /// Whether the lot is residential (0x40745f), which the House button
-    /// needs. The world does not keep the lots' zoning, so the host sets
-    /// it (`sims_vm::Lot::residential`); true until then.
-    pub residential: bool,
 }
 
 /// What the relationship panel needs from outside the world: the
@@ -343,7 +339,6 @@ impl Snapshot {
             relations: Vec::new(),
             superstar: false,
             house: House::default(),
-            residential: true,
         }
     }
 
@@ -419,6 +414,13 @@ impl Snapshot {
             .unwrap_or_default();
         self.superstar = known.superstar;
         self
+    }
+
+    /// The selected Sim, if one of the household's: what the live panel
+    /// counts as someone selected (the original's +0xe8, the selected
+    /// Sim's place among the members, set by 0x51c5b0).
+    pub fn selected_resident(&self) -> Option<&Resident> {
+        self.selected.and_then(|s| self.resident(s))
     }
 
     pub fn resident(&self, object: u16) -> Option<&Resident> {
@@ -818,7 +820,6 @@ mod tests {
             relations: Vec::new(),
             superstar: false,
             house: House::default(),
-            residential: true,
         }
     }
 
