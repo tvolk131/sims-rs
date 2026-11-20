@@ -128,9 +128,10 @@ ENTRY, RETURN = 0x46d345, 0x46d51d
 # The clock's globals (see crates/sims-vm/src/tick.rs) and those of the date.
 HOURS, MINUTES, SECONDS = 0, 5, 6
 DATE_GLOBALS = (1, 2, 3, 7, 8)
-# The most bytes one guest write is taken to change: a 16-byte SSE store. Watch hits are matched to
-# watches whose value changed no further than this from the bytes the write could have touched.
+# The most bytes one guest store is taken to write: a 16-byte SSE store. A store that crosses into a
+# page writes no further into it than this.
 MAX_WRITE = 16
+PAGE = 0x1000
 DIALOG_SHOW, DIALOG_RESULT, DIALOG_READ = 0x436da0, 0x4370be, 0x43718f
 OWNER, GLOBAL_RNG, ACTION_SERIAL, CRT_TLS_INDEX = 0x6e48bc, 0x6e54ac, 0x6e4904, 0x6db360
 
@@ -821,22 +822,30 @@ def main():
             lot = None
         # One row per watch the write may have been to (one with name null if none), matched against
         # the watches as they were set when the write was made. The stop reply gives the base of the
-        # watchpoint that fired, not the bytes written. QEMU stops on the newest watchpoint the write
-        # touches, so the one that fired is the newest whose base is the reply's, and the write
-        # touched none newer. Each row says how it was matched (match):
-        # - named: the watch is on the watchpoint that fired;
-        # - covers: the watch takes in every byte of that watchpoint the write could have touched
-        #   (those of no newer watchpoint), so the write touched it too, whatever it wrote;
-        # - changed: the watch's value changed, and one write could reach it from the bytes the
-        #   write could have touched, with no newer watchpoint's byte between (at most MAX_WRITE
-        #   bytes). The reply and the values cannot tell such a write from an earlier one through
-        #   another mapping of the same memory (which stops nothing), so this row may be that.
-        # A watch whose value changed that one write could not reach is not put down to this one.
-        # A write that leaves a watch it reaches as it was, and does not cover, has no row there.
+        # watchpoint that fired, not the bytes written. QEMU (7.2) stops on the newest watchpoint its
+        # check overlaps (softmmu/physmem.c, cpu_check_watchpoint). Its check is the store itself
+        # for an aligned store, the page's base to the store's end for an unaligned one on a page
+        # with a watchpoint, and each page's part in turn, the first page's first, for one that
+        # crosses pages (accel/tcg/cputlb.c, store_helper_unaligned). So the watchpoint that fired
+        # need not have been written, and each row says only what the stop shows (match):
+        # - named: the watch is on the watchpoint that fired (one_of: on one of the watchpoints on
+        #   that base that could have fired; one a newer watchpoint takes in whole never fires);
+        # - encloses: the watch takes in every watchpoint that could have fired. It is a row
+        #   whatever was written: when the store touched the one that fired, it touched this too;
+        # - changed: the watch's value changed, and the store could have written it: on the page
+        #   of the watchpoint that fired, if the watch is not newer than it and no newer watchpoint
+        #   lies between them (a store reaching it would have fired that one); or in the first
+        #   MAX_WRITE bytes of the next page, which a store crossing pages may write after its first
+        #   page's part fired. Such a change may also be an earlier write through another mapping
+        #   of the same memory, which stops nothing.
+        # - at: the reply names no watchpoint's base (not one QEMU gives), and the watch holds it.
+        # A watch that kept its value and encloses nothing that fired has no row.
         # The watchpoints as set when the write was made (before any is taken off below).
         order = dict(hardware_order)
-        points = sorted(order, key=order.get, reverse=True)
-        fired = next((p for p in points if p[0] == hit), None)
+        on_base = [p for p in order if p[0] == hit]
+        def hidden(p):
+            return any(order[q] > order[p] and q[0] <= p[0] and p[0] + p[1] <= q[0] + q[1] for q in order)
+        fired = [p for p in on_base if not hidden(p)] or on_base
         candidates = list(live_watches)
         if lot != args.lot:
             # A write at a stop on another lot (before its next entry or dialog breakpoint) is not
@@ -852,32 +861,29 @@ def main():
                 return w.read(m) != w.value
             except MemoryError:
                 return False
+        def could(w, p):
+            """Whether a store that fired watchpoint p could have written watch w."""
+            lo, hi = w.address, w.address + w.size
+            page = p[0] & ~(PAGE - 1)
+            if lo < page + PAGE + MAX_WRITE and hi > page + PAGE:
+                return True
+            if not (lo < page + PAGE and hi > page) or order.get((w.address, w.size), 0) > order[p]:
+                return False
+            if lo < p[0] + p[1] and p[0] < hi:
+                return True
+            gap = (p[0] + p[1], lo) if lo >= p[0] + p[1] else (hi, p[0])
+            return not any(order[q] > order[p] and q[0] < gap[1] and gap[0] < q[0] + q[1] for q in order)
         hits = []
-        if fired is None:
-            # A reply naming no watchpoint's base (not one QEMU gives): the watches on its address.
-            hits = [(w, 'contains') for w in candidates if w.address <= hit < w.address + w.size]
+        if not fired:
+            hits = [(w, 'at') for w in candidates if w.address <= hit < w.address + w.size]
         else:
-            newer = set()
-            for p in points[:points.index(fired)]:
-                newer.update(range(p[0], p[0] + p[1]))
-            touchable = [a for a in range(hit, hit + fired[1]) if a not in newer] or \
-                list(range(hit, hit + fired[1]))
-            # The bytes one write could reach: out from those it could touch, up to a newer
-            # watchpoint's byte, MAX_WRITE - 1 bytes either way at most.
-            reach = set(touchable)
-            for start, step in ((touchable[0], -1), (touchable[-1], 1)):
-                a = start + step
-                while abs(a - start) < MAX_WRITE and a not in newer:
-                    reach.add(a)
-                    a += step
             for w in candidates:
-                span = range(w.address, w.address + w.size)
-                if (w.address, w.size) == fired:
-                    hits.append((w, 'named'))
-                elif all(a in span for a in touchable):
-                    hits.append((w, 'covers'))
-                elif order.get((w.address, w.size), 0) < order[fired] and \
-                        reach.intersection(span) and changed(w):
+                key = (w.address, w.size)
+                if key in fired:
+                    hits.append((w, 'named' if len(fired) == 1 else 'one_of'))
+                elif all(w.address <= p[0] and p[0] + p[1] <= w.address + w.size for p in fired):
+                    hits.append((w, 'encloses'))
+                elif changed(w) and any(could(w, p) for p in fired):
                     hits.append((w, 'changed'))
         for w, match in hits or [(None, None)]:
             # Taken over off a breakpoint, whether the guest is in a lot update is not known until its
@@ -971,7 +977,8 @@ def main():
         """At a stop: start the late watches whose updates have come, work out the moving ones again,
         end those whose updates are over, and set those waiting. At a stop whose lot cannot be read
         (at a breakpoint or off one, as when a run is taken over), those waiting are set as far as
-        they can be without the lot, and those set are left where they are."""
+        they can be without the lot, and those set are left where they are; before the game's
+        process is known, nothing is set there."""
         # A late watch waits for the game's process (the baseline), then for its first update. One
         # whose updates are over already (a run taken over later) is never set.
         for w in [w for w in late if baseline and updates + 1 >= w.first]:
@@ -1008,7 +1015,9 @@ def main():
         here = lot == args.lot
         if not here:
             retire_elsewhere(lot)
-        if not (live_watches or pending):
+        if not (live_watches or pending) or (not readable and sims_cr3 is None):
+            # Before the game's process is known (its first lot update), a stop whose lot cannot be
+            # read may be another process's: nothing is set from its memory.
             return
         if live_watches and readable:
             check_watches(m, here, lot)
@@ -1041,6 +1050,9 @@ def main():
                 in_update = None
         save_status(state='running', breaks=sorted(breaks))
         first = args.resume
+        # The pc after a step past a breakpoint that stopped at a watchpoint: QEMU then stops once
+        # more there, for the step itself, when the guest is resumed.
+        stepped_to = None
         while updates < args.updates:
             if args.stop_file and args.stop_file.exists():
                 event(kind='requested_stop', updates=updates)
@@ -1058,6 +1070,10 @@ def main():
             regs = {k: v for k, v in regs.items() if not k.startswith('_')}
             regs.update(fs_base=fs_base, cr3=cr3)
             m = Memory(remote)
+            after_step, stepped_to = stepped_to, None
+            if not took_over and 'watch:' not in reply and pc == after_step and pc not in breaks:
+                event(kind='step_after_watch', pc=pc)
+                continue
             if took_over and pc not in breaks:
                 # The earlier run was killed between stepping past a breakpoint and resuming.
                 event(kind='took_over_off_break', pc=pc, registers=regs)
@@ -1242,6 +1258,7 @@ def main():
                 regs = {k: v for k, v in regs.items() if not k.startswith('_')}
                 regs.update(fs_base=struct.unpack_from('<I', raw, 64)[0], cr3=struct.unpack_from('<I', raw, 84)[0])
                 watch_hit(reply, regs, Memory(remote))
+                stepped_to = regs['eip']
         event(kind='complete', updates=updates)
         save_status(state='complete')
     except BaseException as e:

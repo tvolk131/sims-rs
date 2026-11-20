@@ -84,6 +84,9 @@ class FakeRemote:
         reply = self.current.get('step', 'T05')
         if 'step_cr3' in self.current:
             self.current = dict(self.current, cr3=self.current['step_cr3'])
+        if 'step_pc' in self.current:
+            # The instruction after the one stepped over.
+            self.current = dict(self.current, pc=self.current['step_pc'])
         return reply
 
     def detach(self):
@@ -613,14 +616,14 @@ class CaptureTest(unittest.TestCase):
         self.assertEqual(remote.watch_calls, [(0x70088, 4), (0x70088, 8)])
         self.assertEqual(rows, [('pair', 'named')])
 
-    def test_a_watch_that_takes_in_what_the_write_could_touch_has_a_row_whatever_it_wrote(self):
+    def test_a_watch_that_encloses_the_one_that_fired_has_a_row_whatever_was_written(self):
         # pair (8 bytes at 0x70088), then high (0x7008c:4); a write that
-        # leaves high as it was names 0x7008c. It touched high, so it
+        # leaves high as it was names 0x7008c. If the store touched high, it
         # touched pair too.
         remote, rows = self.watch_rows(
             [dict(pc=0x123456, reply='T05watch:7008c;')],
             ['--watch', 'pair=0x70088:8', '--late-watch', '2-2,high=0x7008c:4'])
-        self.assertEqual(rows, [('pair', 'covers'), ('high', 'named')])
+        self.assertEqual(rows, [('pair', 'encloses'), ('high', 'named')])
 
     def test_an_older_watch_next_to_the_one_that_fired_has_a_row_if_it_changed(self):
         # low (0x70088:4), then high (0x7008c:4); one 8-byte store over both
@@ -651,6 +654,72 @@ class CaptureTest(unittest.TestCase):
             [dict(pc=0x123456, reply='T05watch:70088;', bytes={0x70088: 1, 0x70090: 1})],
             ['--watch', 'far=0x70090:4', '--watch', 'low=0x70088:4', '--late-watch', '2-2,mid=0x7008c:4'])
         self.assertEqual(rows, [('low', 'named')])
+
+    def test_watchpoints_on_one_base_that_could_each_have_fired_are_each_one_of(self):
+        # pair (0x70088:8) then low (0x70088:4). A store at 0x7008c fires
+        # pair, one at 0x70088 fires low: both report 0x70088.
+        remote, rows = self.watch_rows(
+            [dict(pc=0x123456, reply='T05watch:70088;', bytes={0x7008c: 1})],
+            ['--watch', 'pair=0x70088:8', '--late-watch', '2-2,low=0x70088:4'])
+        self.assertEqual(rows, [('pair', 'one_of'), ('low', 'one_of')])
+
+    def test_a_watchpoint_a_newer_one_takes_in_never_fires(self):
+        # pair (0x70088:8), low (0x70088:4), then mask (0x70087:8). Every
+        # store that low's check overlaps, mask's overlaps too, and mask is
+        # checked first: a reply of 0x70088 is pair's. mask is newer than
+        # pair, on its page, so its change is not this store's.
+        remote, rows = self.watch_rows(
+            [dict(pc=0x123456, reply='T05watch:70088;', bytes={0x7008f: 1, 0x70087: 1})],
+            ['--watch', 'pair=0x70088:8', '--watch', 'low=0x70088:4', '--late-watch', '2-2,mask=0x70087:8'])
+        self.assertEqual(rows, [('pair', 'named')])
+
+    def test_a_store_crossing_pages_may_write_a_newer_watch_on_the_next(self):
+        # low (0x72ffe:2) then high (0x73000:2). A dword store at 0x72ffe
+        # checks the first page's part first and reports low, and writes
+        # high too.
+        remote, rows = self.watch_rows(
+            [dict(pc=0x123456, reply='T05watch:72ffe;', bytes={a: 1 for a in range(0x72ffe, 0x73002)})],
+            ['--watch', 'low=0x72ffe:2', '--late-watch', '2-2,high=0x73000:2'])
+        self.assertEqual(rows, [('low', 'named'), ('high', 'changed')])
+
+    def test_an_unaligned_store_may_fire_a_watchpoint_it_did_not_write(self):
+        # wide (0x70084:8) then inner (0x70088:4). An unaligned word store
+        # at 0x70091 checks from the page's base to its end, so it reports
+        # inner, which it did not write. The rows claim no write: inner was
+        # named, and wide encloses it.
+        remote, rows = self.watch_rows(
+            [dict(pc=0x123456, reply='T05watch:70088;', bytes={0x70091: 1, 0x70092: 1})],
+            ['--watch', 'wide=0x70084:8', '--late-watch', '2-2,inner=0x70088:4'])
+        self.assertEqual(rows, [('wide', 'encloses'), ('inner', 'named')])
+
+    def test_the_stop_for_a_step_that_hit_a_watchpoint_is_passed_over(self):
+        # Stepping past the entry breakpoint writes the watched word: QEMU
+        # gives the watch stop, then, at the next resume, a plain stop at
+        # the instruction after.
+        remote, output, _ = self.run_capture([
+            dict(pc=0), dict(pc=capture.ENTRY, step='T05watch:70088;', step_pc=0x4100,
+                             bytes={0x70088: 1}),
+            dict(pc=0x4100, reply='T05'), dict(pc=capture.RETURN)],
+            ['--updates', '1', '--watch', 'state=0x70088'])
+        self.assertEqual([r['name'] for r in self.rows(output / 'watch.jsonl')], ['state'])
+        self.assertEqual([r['pc'] for r in self.events(output, 'step_after_watch')], [0x4100])
+
+    def test_a_plain_stop_elsewhere_after_a_step_that_hit_a_watchpoint_is_still_unexpected(self):
+        with self.assertRaisesRegex(RuntimeError, 'unexpected stop at 0x123456'):
+            self.run_capture([
+                dict(pc=0), dict(pc=capture.ENTRY, step='T05watch:70088;', step_pc=0x4100),
+                dict(pc=0x123456, reply='T05'), dict(pc=capture.RETURN)],
+                ['--updates', '1', '--watch', 'state=0x70088'])
+
+    def test_before_the_games_process_is_known_an_unreadable_stop_sets_nothing(self):
+        # A dialog breakpoint in another process, before the first lot
+        # update: its bytes at 0x70088 are not the game's.
+        remote, output, _ = self.run_capture([
+            dict(pc=0),
+            dict(pc=capture.DIALOG_SHOW, cr3=OTHER_CR3, lot_unreadable=True, bytes={0x70088: 0x64}),
+            dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
+            ['--updates', '1', '--watch', 'state=0x70088'])
+        self.assertNotIn(('set', capture.DIALOG_SHOW), remote.watch_stops)
 
     def test_a_run_taken_over_at_a_breakpoint_whose_lot_cannot_be_read_sets_an_ordinary_watch(self):
         # As off a breakpoint: taken over at a dialog's breakpoint with the
