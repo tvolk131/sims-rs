@@ -82,9 +82,13 @@ it into `sims_game::pick` and `Lot::sprite_pick` (sims-vm).
     position only for a level taken, so the pick tries levels 1, 2 and 3
     and takes the highest whose position and height classify as that
     level. With none, it takes the level that level 1's position
-    classifies as, at that level's own position. Where more than one
-    level fits, which the original's single 3D position would choose is
-    **unverified**.
+    classifies as, at that level's own position.
+  - Where more than one level fits, which the original's single 3D
+    position would choose is **unverified**. On steep terrain, either
+    choice misses in some made-up lots. Taking the lowest missed an
+    upstairs bookcase beside a plateau's edge. Taking the highest misses
+    a ground-floor bookcase whose level-2 reading lands on a 32-step rise
+    next to it. The Goth replays do not reach such a pixel.
   - The ground-plane fallback is flat: it leaves out the terrain, which
     the original's may not (**unverified** on a sloped lot).
   - Whether our unprojection agrees with the original's inverse matrix
