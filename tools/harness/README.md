@@ -155,9 +155,11 @@ Things to know:
   return is not one already recorded, if it is on the captured lot in the
   game's process (`took_over_at_return`; one elsewhere has `elsewhere`
   true). Taken over at a dialog shown that the earlier run logged (every
-  register as logged, no result since), the dialog is not shown again
+  register, the record's bytes and the top of the stack as logged; no
+  dialog event and no watch row since), the dialog is not shown again
   (`took_over_at_dialog_show`); its presses go on from
-  `resume_open_dialogs`. Taken over off a breakpoint, the run logs
+  `resume_open_dialogs`. A second show of the same record that matches all
+  that would be taken for the first. Taken over off a breakpoint, the run logs
   `took_over_off_break`; a run killed between a stop at a watchpoint and
   its rows loses those rows (see below for one found by a step).
 - **Memory dumps.** `--dump 14,47 --guest-dir <guest dir>` also saves,
@@ -191,7 +193,8 @@ Things to know:
   replaced), the watchpoint moves too (`watch_moved`). If it cannot be worked
   out or read, it waits again (`watch_lost`). Writes between the change and
   that stop are missed. Watches on the same bytes share a watchpoint, and a
-  stop there gives a row for each of them (`named`).
+  stop there gives a row for each of them (`named`, or `one_of` if another
+  watchpoint has the same base).
 
   QEMU's stop gives the base of the watchpoint that fired, not the bytes
   written. Which watchpoint fires, and whether it was written at all,
@@ -217,7 +220,7 @@ Things to know:
   plain stop at the next instruction on the following resume. The pc, CR3
   and thread the step left are kept in `status.json` (`stepped_to`), so a
   run taken over with `--resume` knows them too. A plain trap (`T05`, no
-  watch) there, off a breakpoint, is logged as `step_after_watch` and
+  watchpoint or breakpoint given) there, off a breakpoint, is logged as `step_after_watch` and
   passed over; any other stop is dealt with as usual, and clears it. The
   thread must be the same ID, process prefix included (`p1.1`); two stops
   that give none match. A reattach's reply, which may give no thread, is
@@ -230,14 +233,16 @@ Things to know:
 
   The watch stop's reply is kept in `status.json` (`stepped_watch`) with
   `stepped_to` before its rows are written, and taken off once they are.
-  A run killed in between is taken over off a breakpoint, and its
-  `took_over_off_break` has the reply (`unsettled_watch`): that stop's rows
-  may be missing from `watch.jsonl`. A run killed after the step stopped
-  and before `stepped_to` was kept is taken over the same way, without the
-  reply; at the next resume, a plain trap at the same pc and CR3 off a
+  A run that takes over one killed in between logs it, once attached, as
+  `unsettled_watch` (that stop's rows may be missing from `watch.jsonl`),
+  and keeps it in its own `status.json` until then, so a takeover killed
+  first hands it on (one killed just after may log it twice). A run
+  killed after the step stopped and before `stepped_to` was kept is taken
+  over off a breakpoint; with watches set, at the next resume a plain trap
+  (`T05` giving no watchpoint or breakpoint) at the same pc and CR3 off a
   breakpoint, in the thread the reattach gave (any, if it gave none), is
-  that step's pending trap, logged as `step_after_watch`
-  with `unrecorded_watch` true (its watch stop has no rows).
+  that step's pending trap, logged as `step_after_watch` with
+  `unrecorded_watch` true (its watch stop has no rows).
 
 ## Scripted input
 

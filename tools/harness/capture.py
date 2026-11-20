@@ -530,6 +530,30 @@ def open_dialogs(rows):
     return out
 
 
+def has_baseline(path):
+    """Whether these events have a baseline row, read up to the first one. A row that is not JSON (one cut
+    short by a kill) is not one."""
+    try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    if json.loads(line).get('kind') == 'baseline':
+                        return True
+                except (ValueError, AttributeError):
+                    continue
+    except OSError:
+        pass
+    return False
+
+
+def plain_trap(reply):
+    """Whether a stop reply is a plain trap: T05 with no stop reason (a watchpoint or a breakpoint)."""
+    if not reply.startswith('T05'):
+        return False
+    reasons = {'watch', 'rwatch', 'awatch', 'swbreak', 'hwbreak'}
+    return not any(field.partition(':')[0] in reasons for field in reply[3:].split(';'))
+
+
 def drop_redone_events(path, updates, kinds):
     """Before a resume: drop the events of these kinds (of hour_turned and objects_changed, the ones the
     resumed run can write again) that a lot update's return produced for an update after the last recorded
@@ -664,17 +688,15 @@ def main():
     except scenario_input.ScenarioError as e:
         ap.error(str(e))
     out = args.output
+    if args.resume and not has_baseline(out / 'events.jsonl'):
+        # Before the baseline nothing is recorded that a takeover could go on from (entry-0000 may be
+        # half written, and the game's process is not known). Checked before anything is made or
+        # changed, or the guest is attached.
+        ap.error(f'{out} has no baseline event: --resume takes over only a run that reached its '
+                 'baseline; start a new capture')
     out.mkdir(parents=True, exist_ok=args.resume)
     prior_status, dropped = {}, []
     if args.resume:
-        # Before the baseline nothing is recorded that a takeover could go on from (entry-0000 may be
-        # half written, and the game's process is not known). Checked before anything is changed or
-        # the guest is attached.
-        path = out / 'events.jsonl'
-        if not path.exists() or not any(json.loads(line)['kind'] == 'baseline'
-                                        for line in path.read_text().splitlines() if line.strip()):
-            ap.error(f'{out} has no baseline event: --resume takes over only a run that reached its '
-                     'baseline; start a new capture')
         try:
             prior_status = json.loads((out / 'status.json').read_text())
         except (OSError, ValueError):
@@ -692,7 +714,7 @@ def main():
     watch_log = open(out / 'watch.jsonl', 'a') if args.watch or args.late_watch else None
     updates_log = open(out / 'updates.jsonl', 'a')
     status = dict(started=time.time(), updates=0, state='attaching', settings={k: str(v) for k, v in vars(args).items()},
-                  stepped_watch=None, stepped_maybe=None)
+                  stepped_watch=prior_status.get('stepped_watch'), stepped_maybe=None)
 
     event_lock = threading.Lock()
 
@@ -961,13 +983,35 @@ def main():
         waiting = open_dialogs(rows)
         # The last dialog shown: a takeover at its stop (the earlier run was killed before stepping
         # past it) must not show it again, which would log it twice and reset its press jobs.
-        prior_show = next((r for r in reversed(rows) if r['kind'] == 'dialog_show'), None)
+        # Only if it is the last dialog event (a later read or result shows the guest went on past it).
+        prior_show = next((r for r in reversed(rows) if r['kind'] in ('dialog_show', 'dialog_result', 'dialog_read')),
+                          None)
+        if prior_show is not None and prior_show['kind'] != 'dialog_show':
+            prior_show = None
+        if prior_show is not None and (out / 'watch.jsonl').exists():
+            # So does a watch row after it.
+            with open(out / 'watch.jsonl') as f:
+                for line in f:
+                    try:
+                        if json.loads(line).get('time', 0) > prior_show['time']:
+                            prior_show = None
+                            break
+                    except (ValueError, AttributeError):
+                        continue
         if waiting:
             event(kind='resume_open_dialogs', dialogs=[dict(record=k, update=u, jobs=j) for k, (u, j) in waiting.items()])
         if answerer:
             for record, (shown_in, jobs) in waiting.items():
                 if shown_in >= args.answer_from:
                     answerer.shown(shown_in, record, jobs)
+    def same_bytes(m, show):
+        """Whether the dialog record's bytes and the top of the stack are as this logged show has them."""
+        try:
+            return (m.read(show['record'], 0x80).hex() == show.get('record_bytes')
+                    and m.read(show['registers']['esp'], 0x20).hex() == show.get('stack'))
+        except MemoryError:
+            return False
+
     def tend_watches(m, foreign):
         """At a stop: start the late watches whose updates have come, work out the moving ones again,
         end those whose updates are over, and set those waiting. At a stop whose lot cannot be read
@@ -1044,6 +1088,12 @@ def main():
         stepped_to = prior_status.get('stepped_to')
         save_status(state='running', breaks=sorted(breaks),
                     stepped_to=tuple(stepped_to) if stepped_to else None)
+        if status['stepped_watch']:
+            # The run taken over was killed after a step stopped at a watchpoint and before it wrote all
+            # that stop's rows: they may be missing from watch.jsonl. Kept in status.json until this is
+            # logged (a run killed before then hands it on; one killed just after may log it twice).
+            event(kind='unsettled_watch', reply=status['stepped_watch'], stepped_to=stepped_to)
+            save_status(stepped_watch=None)
         first = args.resume
         while updates < args.updates:
             if args.stop_file and args.stop_file.exists():
@@ -1068,16 +1118,16 @@ def main():
                 # The attach query leaves the trap pending and may omit the thread.
                 same_stop = (pc, cr3) == stepped_to[:2] and (
                     thread == stepped_to[2] or (took_over and thread is None))
-                plain_trap = reply.startswith('T05') and 'watch:' not in reply
-                if not took_over or not (plain_trap and same_stop):
+                plain = plain_trap(reply)
+                if not took_over or not (plain and same_stop):
                     save_status(stepped_to=None)
-                if not took_over and plain_trap and same_stop and pc not in breaks:
+                if not took_over and plain and same_stop and pc not in breaks:
                     event(kind='step_after_watch', pc=pc)
                     continue
             maybe = status.get('stepped_maybe')
             if maybe is not None and not took_over:
                 save_status(stepped_maybe=None)
-                if reply.startswith('T05') and 'watch:' not in reply and (pc, cr3) == tuple(maybe[:2]) \
+                if plain_trap(reply) and (pc, cr3) == tuple(maybe[:2]) \
                         and maybe[2] in (None, stop_thread(reply)) and pc not in breaks:
                     # Only a step's pending trap stops plainly off a breakpoint: the earlier run's
                     # step stopped at a watchpoint, and was killed before it recorded that.
@@ -1085,15 +1135,11 @@ def main():
                     continue
             if took_over and pc not in breaks:
                 # The earlier run was killed between stepping past a breakpoint and resuming.
-                row = dict(kind='took_over_off_break', pc=pc, registers=regs)
-                if prior_status.get('stepped_watch'):
-                    # ...after its step stopped at a watchpoint and before it wrote all that stop's
-                    # rows: they may be missing (the guest is still where that step left it).
-                    row['unsettled_watch'] = prior_status['stepped_watch']
-                event(**row)
-                if status['stepped_to'] is None:
+                event(kind='took_over_off_break', pc=pc, registers=regs)
+                if status['stepped_to'] is None and (args.watch or args.late_watch):
                     # Killed before it kept where that step left the guest, its pending trap is
                     # matched on the pc, the CR3 and the thread the reattach gives (if it gives one).
+                    # Only a step that stopped at a watchpoint leaves one, so only with watches.
                     save_status(stepped_maybe=(pc, cr3, stop_thread(reply)))
                 tend_watches(m, sims_cr3 is not None and cr3 != sims_cr3)
                 continue
@@ -1243,9 +1289,10 @@ def main():
                 runner.on_queue_push(updates + 1, bool(in_update), m, regs)
             elif (took_over and pc == DIALOG_SHOW and prior_show is not None
                   and prior_show.get('registers') == regs and prior_show['update'] == updates + 1
-                  and regs['ecx'] in waiting):
+                  and regs['ecx'] in waiting and same_bytes(m, prior_show)):
                 # The earlier run logged this show and was killed before stepping past it: the guest
-                # is still at that stop (every register as logged, the dialog given no result since).
+                # is still at that stop (every register, the record's bytes and the top of the stack
+                # as logged, and no dialog event or watch row since).
                 # It was shown to the answerer again above with its press jobs, so it is not shown
                 # again here. (A second show of the same record with no result between it and the
                 # first, and every register the same, would be taken for it too.)
