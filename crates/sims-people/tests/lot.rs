@@ -899,6 +899,7 @@ fn mortimer_stands_without_his_book_as_the_original_draws_him() {
     for name in &held {
         assert!(!parts.contains(name), "{name} is still drawn: {parts:?}");
     }
+    assert!(!parts.iter().any(|p| p.contains("book")), "{parts:?}");
     let mortimer = world.objects[&21].person.as_ref().unwrap();
     let carried: Vec<&str> = mortimer
         .accessories
