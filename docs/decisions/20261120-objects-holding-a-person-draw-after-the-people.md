@@ -41,7 +41,7 @@ This also explains the depth dumps of the original's lot picture taken for the c
 
 - The backrest's soft top edge blends over his coat: (32, 16, 8) and (65, 32, 8) at (385, 311) and (405, 305).
 - Before this change, ours blended that edge over the floor: (196, 159, 110) and (136, 90, 45). All 25 edge pixels along his back now match.
-- The live original's slot table at that moment lists exactly what `holds_person` finds: bench 174 holding Mortimer (21), bench 173 holding person 16, and the plumb bob (383) in Mortimer's slot.
+- The live original's slot table at that moment lists exactly what `holds_person` finds: bench 174 holding Mortimer (21), bench 173 holding person 16, the plumb bob (383) in Mortimer's slot, and object 67 in person 18's slot.
 - The test `a_bench_in_use_draws_after_the_sim_on_it` (sims-people, needs `SIMS_INSTALL`) checks both edge pixels and the held set.
 - `the_frame_draws_a_bench_in_use_after_the_sim_on_it` (sims-game) checks the same pixels in the window's own frame.
 
