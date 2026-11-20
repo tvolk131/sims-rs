@@ -230,14 +230,18 @@ fn an_old_town_home_loads_through_its_guid_table_and_steps() {
 
 /// UserData2 as the original left it after opening it for the first time,
 /// in a fresh directory: the install's UserData2, with the `Characters`
-/// and `Houses` folders and `Neighborhood.iff` that track 2 copied out of
-/// the game afterwards (`ud2-import-20261119`, `after-partial-0607utc`),
-/// which `SIMS_UD2_AFTER` names, and the emptied `Patch` folder. The copy
-/// lacks the neighborhood's other files (`LotZoning.iff` among them),
-/// which the open does not change, so they come from the install.
+/// and `Houses` folders and `Neighborhood.iff` from the folder
+/// `SIMS_UD2_AFTER` names, and the emptied `Patch` folder. That folder is
+/// track 2's finished copy (`ud2-import-20261119`, `after-with-lot-load`)
+/// with `User00000.iff` and `User00001.iff` from its `before` copy
+/// (`ud2-import-state-20261120`), not the partial copy taken during the
+/// import. It lacks the neighborhood's other files (`LotZoning.iff` among
+/// them), which the open does not change, so they come from the install.
+/// The directory is per process, so runs at the same time do not collide.
 fn imported_userdata2(root: &Path) -> Option<PathBuf> {
     let after = PathBuf::from(std::env::var_os("SIMS_UD2_AFTER")?);
-    let directory = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("userdata2-imported");
+    let directory = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("userdata2-imported-{}", std::process::id()));
     if directory.exists() {
         std::fs::remove_dir_all(&directory).unwrap();
     }
@@ -248,6 +252,8 @@ fn imported_userdata2(root: &Path) -> Option<PathBuf> {
     copy_directory(&after.join("Characters"), &directory.join("Characters"));
     copy_directory(&after.join("Houses"), &directory.join("Houses"));
     std::fs::create_dir(directory.join("Patch")).unwrap();
+    // The install's copy may be read-only, so it is removed, not overwritten.
+    std::fs::remove_file(directory.join("Neighborhood.iff")).unwrap();
     std::fs::copy(
         after.join("Neighborhood.iff"),
         directory.join("Neighborhood.iff"),
@@ -311,6 +317,7 @@ fn an_imported_home_loads_from_the_originals_files_and_steps() {
         lot.step().unwrap();
     }
     assert_eq!(lot.world().hash_hex(), IMPORTED_69_1000);
+    std::fs::remove_dir_all(&directory).unwrap();
 }
 
 #[test]

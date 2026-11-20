@@ -24,7 +24,9 @@ files.
 - **The folder used.** Track 2's snapshot (`ud2-import-20261119`,
   `after-with-lot-load`), with `User00000.iff` and `User00001.iff` from its
   `before` copy. An unrecorded House 69 load after the import rewrote those
-  two. On this machine the folder is `cache/ud2-import-state-20261120`.
+  two. They still matched `before` in the partial copy at 06:07 UTC. That
+  the rest of the import (to 06:26) left them alone is assumed, not
+  shown. On this machine the folder is `cache/ud2-import-state-20261120`.
   Its README says how it was made, and a digest list sits beside it. The
   earlier copy, `after-partial-0607utc`, was taken before the fifth box
   (Vacation) and is not used.
@@ -39,7 +41,8 @@ files.
 
 **Unverified:** the two pins. They hold only this port's own state.
 Track 2 is redoing the UD2 House 69 recording, which has to come from a
-fresh import, so its GUIDs will differ from this snapshot's. When it
+fresh import. Its GUIDs come from the clock and the C runtime, so they
+are expected to differ from this snapshot's. When it
 lands, the test moves to that recording's after-import files. It then
 checks the entry C runtime state and the per-update lot state against
 the recording, as the UD1 House 69 check does.

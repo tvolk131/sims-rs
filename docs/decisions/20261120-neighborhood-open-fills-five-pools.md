@@ -19,16 +19,16 @@ source here. Its notes and probes are kept outside the repository (track
 | 2 | Studio Town fans | 5500 | 18 | 0x5580be / 0x5580cd → 0x42d4db, 0x42d193 | Superstar 0x40 | `HDT_Generic.iff` (kind 0x200) |
 | 3 | Magic Town residents | 6000 | 30 | 0x5580da / 0x5580e9 → 0x42d92b, 0x42d5f2 | Makin' Magic 0x80 | `MMClownieGeneric.iff` (kind 0x1000) |
 | 4 | Hot Date Townies | 2000 | 30 | the view's lot and toolbar callbacks (six sites, for example 0x55855d / 0x55856c) → 0x42aff1, 0x42a98f | Hot Date 0x04 | the 36 `HDT_*_*.iff` specialties (kind 0x400), else `HDT_Generic.iff` |
-| 5 | Vacation Island tourists | 3000–3009 | 35 | the same callbacks, straight after (for example 0x558579 / 0x558588) → 0x42b8c0, 0x42b0fd | Vacation 0x08 | `HDT_Generic.iff` |
+| 5 | Vacation Island tourists | 3000–3009 | ten families of 2–4 (35 here, 34 in UserData) | the same callbacks, straight after (for example 0x558579 / 0x558588) → 0x42b8c0, 0x42b0fd | Vacation 0x08 | `HDT_Generic.iff` |
 
-- **Order of calls.** Each pool has a one-time wrapper and then a fill worker. The other view repeats calls 1–3 (0x55fb05–0x55fb4c) and 4–5 (0x56002a–0x56085a). Which callback ran 4 and 5 in the recorded open is not traced. The lot callbacks run them before the lot load (0x4f1ae9).
+- **Order of calls.** Each pool has a one-time wrapper and then a fill worker. The neighborhood setup update calls only pools 1–3; the other view's update repeats them (0x55fb05–0x55fb4c). Pools 4 and 5 run only from the six lot and toolbar callbacks (0x55855d–0x558588, 0x558757–0x558782, 0x5591e3–0x55920e and, in the other view, 0x56002a–0x560055, 0x560205–0x560230, 0x56082e–0x560859). The lot callbacks run them before the lot load (0x4f1ae9). Reopening the view alone does not run them. Which callback ran them in the recorded open is not traced.
 - **Flags and top-up.**
-  - Each wrapper reads a pending/done pair in NGBH #1, stored from file versions 66 (Townies), 68 (tourists), 70 and 73 (0x4254f6).
-  - Each worker fills its family up to its target, so a later open tops up a pool that has lost members.
-  - The tourist worker is different. It makes whichever of the ten families 3000–3009 are missing, whatever their size.
+  - Each pool has a pending/done pair in NGBH #1, stored from file versions 66 (Townies), 68 (tourists), 70 and 73. The reader loads each byte on its own (0x4254f6). Pools 1–3's wrappers test their done byte. The Townie and tourist wrappers test their pending byte (0x42b007, 0x42b8d7).
+  - Each worker of pools 1–4 fills its family up to its target, so a later run tops up a pool that has lost members.
+  - The tourist worker is different. It makes whichever of the ten families 3000–3009 are missing and leaves a family that exists, whatever its size.
 - **Families.** A missing family is made with the reserved ID, house 0, budget 0 and flags 0. Members are appended in creation order (0x410849) after each person is saved.
 - **People.**
-  - Pools 1–3 are cloned by the `Patch` clone (0x42cc96 → 0x4722b8). The Townies and tourists have their own front ends (0x426348, 0x426bc0) over the same cloner. All of them share the neighborhood's file counter, `+0x160`.
+  - Every pool person, like every `Patch` person, is cloned by 0x4722b8, through its own front end. `Patch` enters at 0x4260e1 and finds its template through the records. Pools 1–3 enter at 0x42cc96. The Townies and tourists enter at 0x426348 and 0x426bc0. All of them share the neighborhood's file counter, `+0x160`.
   - The OBJD kind becomes 2. Each record takes the last empty slot or a new one (0x4257a5 with ID −1): mode 9, revision 10, word 61 = 0.
   - Each person is edited through temporary people (0x4ea400; 0x4ea95f replaces the first): one for a Townie, two for everyone else, children included.
 - **Tourist families.** Each family's size comes from two draws on the pool generator, `R(1000) % 100`:
@@ -45,8 +45,8 @@ source here. Its notes and probes are kept outside the repository (track
    | UserData2 pool | Draws |
    |---|---:|
    | Celebrities, fans and Magic Town | 176,409 |
-   | 64 draws whose caller is unknown, then the Townies | 44,096 |
-   | 1 draw, then the tourists | 102,893 |
+   | 64 draws whose caller is unknown; then the Townies | 44,096 |
+   | No draw between; the tourists | 102,893 |
 
 3. **The game's own stream,** through the templates' scripts. These draws are not measured.
 
@@ -63,10 +63,10 @@ UserData2 before held 2 families and 49 record slots. After, it held 22 families
 | Townies | User00090–119 | 382–411 |
 | Tourists | User00120–154 | 412–446 |
 
-- Between the Magic Town pool and the Townies, a reload rebuilt word 61 of the first three pools' 60 records to their family IDs (0x424e89 → 0x425244). The 65 later records keep 0.
+- In the finished copy, word 61 of the first three pools' 60 records holds their family IDs, as a reload's rebuild writes them (0x424e89 → 0x425244). The 65 later records keep 0. So a rebuild ran after the Magic Town pool and before the Townies' families were filled, but when exactly is not traced.
 - Only the five houses the `Patch` import moved families into changed.
 
-The first neighborhood (UserData) holds the same five pools, already full, as its maker's open left them (User00048–171). Its User00013–15, 17 and 20–23 are older clones of TemplatePerson. They belong to no family, and all eight are in `Tutorial.FAM`'s records. No import makes them.
+The first neighborhood (UserData) holds the same five pools, already full, as its maker's open left them (User00048–171). Its User00013–15, 17 and 20–23 are older clones of TemplatePerson. They belong to no family, and all eight are in `Tutorial.FAM`'s records. None of the imports above makes them; what made them is not known.
 
 ## What is ported, and when
 
@@ -75,7 +75,7 @@ The first neighborhood (UserData) holds the same five pools, already full, as it
 - **Deferred, open.** The pool people's exact files and looks: the appearance picks, the scripts' draws on the game stream, the portraits and the names. These need an instrumented recording. Sol estimates 600–1,200 more lines.
 
 **Unverified:**
-- the callback that ran the Townie and tourist pools in the recorded open, the reload before them, and the 64 C runtime draws between the Magic Town pool and the first Townie;
+- the callback that ran the Townie and tourist pools in the recorded open, when the rebuild before them ran (a reload also resets the file counter), and the 64 C runtime draws between the Magic Town pool and the first Townie;
 - the C runtime state before the `Patch` import;
 - the game stream's draws inside the templates' scripts;
 - the pool generator's state across its reseeds;
