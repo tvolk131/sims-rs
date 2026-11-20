@@ -63,7 +63,11 @@ parity is not weakened: a step whose outcome depends on the branch
 stops the run.
 
 `a_step_both_ways_that_differs_fails_loudly` makes the two runs disagree
-and checks that the step fails.
+and checks that the step fails. In it, a clip's timed event is due at
+the clock the refresh reads, so only the refreshed animator has the event
+queued. Animate Sim then takes the event on one run and waits on the
+other. `after_taking_itself_off_a_step_that_agrees_both_ways_goes_on`
+is the agreeing case.
 
 The refresh lasts only for the person's own tick (`Refreshing`), and the
 people another object took off last only for the scheduler pass
@@ -135,18 +139,13 @@ What is not ported:
   not have it. The relationship panel and other interface builders are
   not counted. In the recording nothing else built the cat's image.
 
-## The dog skeleton file was read before the load
+## The cat at 24719 was the portrait
 
-At 24766 the Goths' lot makes a dog. The recording's stream moves 1,776
-draws, one dog skeleton's worth. The port read the dog file there and drew
-3,552. The kat file was already listed as read before the first load,
-because each cat takes one skeleton's worth. The dog file
-(`ExpansionShared.far/Skeletons\dog_skeleton.cmx.bcf`) is now listed too
-(`READ_BEFORE_THE_FIRST_LOAD`). When and where both were read is
-**unverified**.
-
-The doc there used to count 24719 among the cats made, from the draws
-alone. That was the portrait.
+`READ_BEFORE_THE_FIRST_LOAD` lists the kat file, because each cat made
+takes one skeleton's worth of draws. Its doc used to count 24719 among
+the cats made, from the draws alone. That was the portrait, and the doc
+now says so. The dog file is listed too (#275), and the dog the Goths'
+lot makes at 24766 draws 1,776, as in the recording.
 
 ## The rest of the day
 
@@ -168,6 +167,7 @@ and 43200.
 
 `World::portraits` is a new field at the end, so the snapshot format goes
 to 31 and every pin was taken again. Each pinned test also checks that the
-format-30 encoding equals the old pin. For the default-frames Goth day
-and the Newbies, that holds at every pin, so those runs are unchanged
-apart from the new empty field.
+format-30 encoding equals `main`'s pin. That holds at every pin of the
+default-frames Goth day and the Newbies, so those runs are unchanged apart
+from the new field. In particular, no person is made for a portrait on
+those runs: each type they build has someone on the lot.
