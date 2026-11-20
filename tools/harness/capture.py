@@ -43,7 +43,8 @@ adds, @HEX reads the word at the address plus HEX. For example
 person:259@0xadc+0x88 is the direction of person 259's animator. With --watch
 the lot update's entry stays armed, so that each write can be placed inside
 or outside the update. A watch that goes through an object or a pointer is
-worked out again at every stop in the game; when the address moved (an
+worked out again at every breakpoint stop in the game (not at a stop at a
+watchpoint); when the address moved (an
 animator was replaced), the watchpoint is moved (a watch_moved event), and
 when it cannot be worked out it waits again (watch_lost). Writes between the
 change and that stop are not seen.
@@ -54,8 +55,10 @@ process is known) and, if TO is given, cleared at the end of update TO. So
 it covers the stops between the rows of updates FROM - 1 and TO in
 updates.jsonl, which are those of the writes that change rows FROM to TO: a
 frame drawn between two updates changes the row of the update after it. A
-stop there is logged, as any watch's is, with the update before it and
-in_update false. A moving watch misses what the paragraph above says it
+stop there is logged as any watch's is: one inside a lot update's body with
+that update and in_update true (from update FROM on, so for FROM 1 a stop
+in update 1 has update 1), one between two updates with the update before
+it and in_update false. A moving watch misses what the paragraph above says it
 misses; a stop at a watchpoint does not work its address out again, as
 for --watch, but a watch is not moved at the stop where it ends. A run
 taken over (--resume) sets the watches whose updates have come at its first
@@ -664,6 +667,14 @@ def main():
     out.mkdir(parents=True, exist_ok=args.resume)
     prior_status, dropped = {}, []
     if args.resume:
+        # Before the baseline nothing is recorded that a takeover could go on from (entry-0000 may be
+        # half written, and the game's process is not known). Checked before anything is changed or
+        # the guest is attached.
+        path = out / 'events.jsonl'
+        if not path.exists() or not any(json.loads(line)['kind'] == 'baseline'
+                                        for line in path.read_text().splitlines() if line.strip()):
+            ap.error(f'{out} has no baseline event: --resume takes over only a run that reached its '
+                     'baseline; start a new capture')
         try:
             prior_status = json.loads((out / 'status.json').read_text())
         except (OSError, ValueError):
@@ -680,7 +691,8 @@ def main():
     events = open(out / 'events.jsonl', 'a')
     watch_log = open(out / 'watch.jsonl', 'a') if args.watch or args.late_watch else None
     updates_log = open(out / 'updates.jsonl', 'a')
-    status = dict(started=time.time(), updates=0, state='attaching', settings={k: str(v) for k, v in vars(args).items()})
+    status = dict(started=time.time(), updates=0, state='attaching', settings={k: str(v) for k, v in vars(args).items()},
+                  stepped_watch=None, stepped_maybe=None)
 
     event_lock = threading.Lock()
 
@@ -909,9 +921,12 @@ def main():
     last_clock = None
     last_objects = None  # {pointer: id} of the registry at the last return (None: not known)
     dialog_pending = False  # a dialog was shown since the last return
+    prior_show = None  # with --resume: the last dialog_show event recorded
+    waiting = {}  # with --resume: the dialogs recorded as shown and given no result yet
     if args.resume:
         rows = [json.loads(line) for line in open(out / 'events.jsonl')]
-        sims_cr3 = next(r['cr3'] for r in rows if r['kind'] == 'baseline')
+        first_baseline = next(i for i, r in enumerate(rows) if r['kind'] == 'baseline')
+        sims_cr3 = rows[first_baseline]['cr3']
         baseline = True
         lines = open(out / 'updates.jsonl').read().splitlines()
         updates = len(lines)
@@ -935,7 +950,7 @@ def main():
         # set at the end of update first - 1 at the earliest). Earlier revisions recorded neither
         # `late` nor the lot, and could arm on another lot, so their armings do not count: such a
         # watch ends with set false, and its watch_armed events have to be read by hand.
-        since = rows[next(i for i, r in enumerate(rows) if r['kind'] == 'baseline'):]
+        since = rows[first_baseline:]
         for w in late:
             w.set = any(r['kind'] == 'watch_armed' and r.get('late') is True and r.get('lot') == args.lot
                         and r.get('name') == w.name and r.get('expr') == w.text
@@ -944,6 +959,9 @@ def main():
         # A dialog shown since the last recorded return, and the dialogs still waiting for a result.
         dialog_pending = any(r['kind'] == 'dialog_show' and r['update'] > updates for r in rows)
         waiting = open_dialogs(rows)
+        # The last dialog shown: a takeover at its stop (the earlier run was killed before stepping
+        # past it) must not show it again, which would log it twice and reset its press jobs.
+        prior_show = next((r for r in reversed(rows) if r['kind'] == 'dialog_show'), None)
         if waiting:
             event(kind='resume_open_dialogs', dialogs=[dict(record=k, update=u, jobs=j) for k, (u, j) in waiting.items()])
         if answerer:
@@ -1056,20 +1074,47 @@ def main():
                 if not took_over and plain_trap and same_stop and pc not in breaks:
                     event(kind='step_after_watch', pc=pc)
                     continue
+            maybe = status.get('stepped_maybe')
+            if maybe is not None and not took_over:
+                save_status(stepped_maybe=None)
+                if reply.startswith('T05') and 'watch:' not in reply and (pc, cr3) == tuple(maybe[:2]) \
+                        and maybe[2] in (None, stop_thread(reply)) and pc not in breaks:
+                    # Only a step's pending trap stops plainly off a breakpoint: the earlier run's
+                    # step stopped at a watchpoint, and was killed before it recorded that.
+                    event(kind='step_after_watch', pc=pc, unrecorded_watch=True)
+                    continue
             if took_over and pc not in breaks:
                 # The earlier run was killed between stepping past a breakpoint and resuming.
-                event(kind='took_over_off_break', pc=pc, registers=regs)
+                row = dict(kind='took_over_off_break', pc=pc, registers=regs)
+                if prior_status.get('stepped_watch'):
+                    # ...after its step stopped at a watchpoint and before it wrote all that stop's
+                    # rows: they may be missing (the guest is still where that step left it).
+                    row['unsettled_watch'] = prior_status['stepped_watch']
+                event(**row)
+                if status['stepped_to'] is None:
+                    # Killed before it kept where that step left the guest, its pending trap is
+                    # matched on the pc, the CR3 and the thread the reattach gives (if it gives one).
+                    save_status(stepped_maybe=(pc, cr3, stop_thread(reply)))
                 tend_watches(m, sims_cr3 is not None and cr3 != sims_cr3)
                 continue
             if took_over and pc == RETURN:
-                recorded = out / 'updates.jsonl'
-                rows = recorded.read_text().splitlines() if recorded.exists() else []
-                last = json.loads(rows[-1]) if rows else None
-                now = m.summary(regs['ebx'], fs_base)
-                event(kind='took_over_at_return', last=last, now=now)
-                # With nothing recorded yet, this is update 1's return.
-                if last is not None and all(last[k] == now[k] for k in now):
-                    raise RuntimeError('took over at a return already recorded; refusing to guess')
+                # Only a return on this lot in the game's process can be one already recorded; any
+                # other is dealt with below as usual (its simulator may not be readable).
+                try:
+                    ours = cr3 == sims_cr3 and m.lot() == args.lot
+                except MemoryError:
+                    ours = False
+                if ours:
+                    recorded = out / 'updates.jsonl'
+                    lines = recorded.read_text().splitlines() if recorded.exists() else []
+                    last = json.loads(lines[-1]) if lines else None
+                    now = m.summary(regs['ebx'], fs_base)
+                    event(kind='took_over_at_return', last=last, now=now)
+                    # With nothing recorded yet, this is update 1's return.
+                    if last is not None and all(last[k] == now[k] for k in now):
+                        raise RuntimeError('took over at a return already recorded; refusing to guess')
+                else:
+                    event(kind='took_over_at_return', elsewhere=True, cr3=cr3)
             if not took_over and 'watch:' in reply:
                 watch_hit(reply, regs, m)
                 continue
@@ -1196,6 +1241,16 @@ def main():
                         arm(ENTRY)
             elif runner and pc == scenario_input.QUEUE_PUSH:
                 runner.on_queue_push(updates + 1, bool(in_update), m, regs)
+            elif (took_over and pc == DIALOG_SHOW and prior_show is not None
+                  and prior_show.get('registers') == regs and prior_show['update'] == updates + 1
+                  and regs['ecx'] in waiting):
+                # The earlier run logged this show and was killed before stepping past it: the guest
+                # is still at that stop (every register as logged, the dialog given no result since).
+                # It was shown to the answerer again above with its press jobs, so it is not shown
+                # again here. (A second show of the same record with no result between it and the
+                # first, and every register the same, would be taken for it too.)
+                event(kind='took_over_at_dialog_show', record=regs['ecx'], update=updates + 1)
+                save_status(dialog=dict(update=updates + 1, record=regs['ecx'], shown=prior_show['time']))
             else:
                 # A dialog function. ecx is the dialog record (0x436da0 keeps it in esi).
                 record = regs['ecx']
@@ -1237,14 +1292,20 @@ def main():
             for attempt in range(2):
                 reply = remote.step()
                 watch_stop = 'watch:' in reply
+                if not reply.startswith('T05'):
+                    # Not a trap (an error such as E22, or the guest gone): where the guest is is
+                    # not known, so the capture cannot go on.
+                    event(kind='step_failed', pc=pc, cr3=cr3, reply=reply, attempt=attempt)
+                    raise RuntimeError(f'step at {pc:#x} gave {reply!r}, not a trap')
                 if not watch_stop and status['stepped_to'] is not None:
                     save_status(stepped_to=None)
-                if not watch_stop and not reply.startswith('T05'):
-                    break
                 regs, raw = remote.registers()
                 step_cr3 = struct.unpack_from('<I', raw, 84)[0]
                 if watch_stop:
-                    save_status(stepped_to=(regs['eip'], step_cr3, stop_thread(reply)))
+                    # Kept before the rows are written, with the reply: a run killed before they
+                    # all are is taken over with the stop known (took_over_off_break's
+                    # unsettled_watch), and the pending trap accepted.
+                    save_status(stepped_to=(regs['eip'], step_cr3, stop_thread(reply)), stepped_watch=reply)
                     break
                 if (regs, raw) != step_from:
                     break
@@ -1258,6 +1319,7 @@ def main():
                 regs = {k: v for k, v in regs.items() if not k.startswith('_')}
                 regs.update(fs_base=struct.unpack_from('<I', raw, 64)[0], cr3=step_cr3)
                 watch_hit(reply, regs, Memory(remote))
+                save_status(stepped_watch=None)
         event(kind='complete', updates=updates)
         save_status(state='complete')
     except BaseException as e:

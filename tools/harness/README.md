@@ -149,7 +149,17 @@ Things to know:
   change the registry of the last recorded return, which comes from
   `status.json` (`registry_unknown` if it is of another update). The
   dialogs still waiting for a result are taken up again, with the presses
-  already handed to the guest (`resume_open_dialogs`).
+  already handed to the guest (`resume_open_dialogs`). Only a run that
+  reached its baseline can be taken over; `--resume` refuses one that did
+  not, before it attaches. Taken over at a return, the run checks that the
+  return is not one already recorded, if it is on the captured lot in the
+  game's process (`took_over_at_return`; one elsewhere has `elsewhere`
+  true). Taken over at a dialog shown that the earlier run logged (every
+  register as logged, no result since), the dialog is not shown again
+  (`took_over_at_dialog_show`); its presses go on from
+  `resume_open_dialogs`. Taken over off a breakpoint, the run logs
+  `took_over_off_break`; a run killed between a stop at a watchpoint and
+  its rows loses those rows (see below for one found by a step).
 - **Memory dumps.** `--dump 14,47 --guest-dir <guest dir>` also saves,
   at the entry of each listed lot update, every present user page of the
   game's process (`dump-NNNN/`; update 1's entry is the baseline's stop). QEMU writes each range into the guest
@@ -177,11 +187,11 @@ Things to know:
   by another process at the same virtual address, including one found while
   stepping past a breakpoint, is logged as a `foreign_watch` event, not in
   `watch.jsonl`. A watch through an object or a pointer is worked out again
-  at every stop in the game. If the address moved (an animator was
+  at every breakpoint stop in the game, not at a stop at a watchpoint. If the address moved (an animator was
   replaced), the watchpoint moves too (`watch_moved`). If it cannot be worked
   out or read, it waits again (`watch_lost`). Writes between the change and
   that stop are missed. Watches on the same bytes share a watchpoint, and a
-  stop there gives a row for each watch.
+  stop there gives a row for each of them (`named`).
 
   QEMU's stop gives the base of the watchpoint that fired, not the bytes
   written. Which watchpoint fires, and whether it was written at all,
@@ -200,7 +210,8 @@ Things to know:
 
   A watch that is not on the base the stop gives and kept its value has no
   row, even if the store wrote it the value it held: the stop does not
-  show that.
+  show that. A stop that matches no watch gives one row with `name` and
+  `match` null.
 
   When a step over a breakpoint stops on a watchpoint, QEMU gives a second,
   plain stop at the next instruction on the following resume. The pc, CR3
@@ -214,7 +225,19 @@ Things to know:
   trap can also take a step past a breakpoint before its instruction runs:
   a plain trap that leaves every register as it was is logged as
   `step_swallowed`, and the step is made again, once. A second one stops
-  the capture with an error.
+  the capture with an error, and so does a step whose reply is not a trap
+  (such as `E22`; `step_failed`).
+
+  The watch stop's reply is kept in `status.json` (`stepped_watch`) with
+  `stepped_to` before its rows are written, and taken off once they are.
+  A run killed in between is taken over off a breakpoint, and its
+  `took_over_off_break` has the reply (`unsettled_watch`): that stop's rows
+  may be missing from `watch.jsonl`. A run killed after the step stopped
+  and before `stepped_to` was kept is taken over the same way, without the
+  reply; at the next resume, a plain trap at the same pc and CR3 off a
+  breakpoint, in the thread the reattach gave (any, if it gave none), is
+  that step's pending trap, logged as `step_after_watch`
+  with `unrecorded_watch` true (its watch stop has no rows).
 
 ## Scripted input
 
@@ -368,7 +391,7 @@ python3 -B -m unittest discover -s tools/harness -p 'test_*.py'
 | `updates.jsonl` | One line per lot update: the tick, whether it was a full pass, the three random streams and the scheduler cursor; with `--around` or `--before-hour` also the clock, the date and the object count, and for a saved update why it was saved. |
 | `events.jsonl` | The dialog functions passed (each record, its status and modal byte; a result also has `result`), the baseline, other stops, the game's identity (`game_identity`), the watch events, and with `--around` the objects that appeared or left (`objects_changed`), the hours turned (`hour_turned`) and the presses of `--answer-stuck` (`dialog_auto_answer`). |
 | `dump-NNNN/` | With `--dump`: the user memory at the entry of lot update N. `ranges.json` lists the ranges (start, size, protection, file); `registers.json` holds the stop's registers and the stub's whole register packet. |
-| `watch.jsonl` | With `--watch` or `--late-watch`: one line for each watch at each stop at a watchpoint, from the baseline on, with the base the stop gives and the match (see above). |
+| `watch.jsonl` | With `--watch` or `--late-watch`: at each stop at a watchpoint from the baseline on, one line for each watch the stop matches, or one with no watch if it matches none, with the base the stop gives and the match (see above). |
 | `status.json` | Progress, and `game_identity`: the digests `launch.sh` verified, or null if the game was not started by it. |
 | `input-log.txt` | Every press made, with its time (written by `answer.sh`). |
 | `input.jsonl` | With `--scenario`: the steps, the guest commands, the pie menus and every action the pie menu queued, each with its lot update (see Scripted input). |

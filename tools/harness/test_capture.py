@@ -85,7 +85,7 @@ class FakeRemote:
 
     def registers(self):
         regs = dict(eip=self.current['pc'], ecx=self.current.get('ecx', 0x20000), ebx=0x20000, ebp=0x90000,
-                    esp=0x90010)
+                    esp=self.current.get('esp', 0x90010))
         raw = bytearray(88)
         struct.pack_into('<I', raw, 64, 0xa0000)
         struct.pack_into('<I', raw, 84, self.current.get('cr3', GAME_CR3))
@@ -768,6 +768,130 @@ class CaptureTest(unittest.TestCase):
                     self.run_capture([attached, dict(pc=0x4100, reply='T05thread:p1.1;')],
                                      ['--updates', '1', '--resume', '--watch', 'state=0x70088'], prepare=prepare)
 
+    def stepped_watch_run(self):
+        """A run whose step past update 1's return stopped at a watchpoint, leaving the guest at 0x4100."""
+        _, original, _ = self.run_capture([
+            dict(pc=0), dict(pc=capture.ENTRY),
+            dict(pc=capture.RETURN, step='T05watch:70088;thread:p1.1;', step_pc=0x4100)],
+            ['--updates', '1', '--watch', 'state=0x70088'])
+        return original
+
+    def taken_over(self, original, status):
+        def prepare(output):
+            for name in ('events.jsonl', 'updates.jsonl', 'watch.jsonl'):
+                (output / name).write_bytes((original / name).read_bytes())
+            (output / 'status.json').write_text(json.dumps(status))
+        return prepare
+
+    def test_a_stepped_watch_stop_is_kept_until_its_rows_are_written(self):
+        original = self.stepped_watch_run()
+        status = json.loads((original / 'status.json').read_text())
+        self.assertEqual(status['stepped_to'], [0x4100, GAME_CR3, 'p1.1'])
+        self.assertIsNone(status['stepped_watch'], 'its rows were written')
+        self.assertEqual(len(self.rows(original / 'watch.jsonl')), 1)
+
+        # Killed while its rows are written: the stop is kept already.
+        temporary = tempfile.TemporaryDirectory(prefix='sims-capture-test-')
+        self.addCleanup(temporary.cleanup)
+        killed = Path(temporary.name) / 'killed'
+        with patch.object(capture, 'frame_chain', side_effect=KeyboardInterrupt), \
+                patch.object(capture, 'Remote', return_value=FakeRemote([
+                    dict(pc=0), dict(pc=capture.ENTRY),
+                    dict(pc=capture.RETURN, step='T05watch:70088;thread:p1.1;', step_pc=0x4100)])), \
+                patch.object(capture, 'Memory', FakeMemory), \
+                patch.object(capture, 'game_identity', return_value=IDENTITY), \
+                patch.object(sys, 'argv', ['capture.py', '--output', str(killed), '--full', '', '--updates', '1',
+                                           '--watch', 'state=0x70088']), \
+                self.assertRaises(KeyboardInterrupt):
+            capture.main()
+        status = json.loads((killed / 'status.json').read_text())
+        self.assertEqual((status['stepped_to'], status['stepped_watch']),
+                         ([0x4100, GAME_CR3, 'p1.1'], 'T05watch:70088;thread:p1.1;'))
+        self.assertEqual(self.rows(killed / 'watch.jsonl'), [])
+
+        # Killed after it was kept and before its rows were all written: the takeover says so.
+        _, output, _ = self.run_capture([
+            dict(pc=0x4100, pending_traps=1, pending_reply='T05thread:p1.1;'),
+            dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
+            ['--updates', '2', '--resume', '--watch', 'state=0x70088'],
+            prepare=self.taken_over(original, dict(stepped_to=[0x4100, GAME_CR3, 'p1.1'],
+                                                   stepped_watch='T05watch:70088;thread:p1.1;')))
+        self.assertEqual([r.get('unsettled_watch') for r in self.events(output, 'took_over_off_break')],
+                         ['T05watch:70088;thread:p1.1;'])
+        self.assertEqual([r.get('unrecorded_watch') for r in self.events(output, 'step_after_watch')], [None])
+        self.assertEqual([r['update'] for r in self.rows(output / 'updates.jsonl')], [1, 2])
+
+    def test_takeover_passes_over_the_pending_trap_of_a_watch_stop_never_kept(self):
+        # Killed after its step stopped at the watchpoint and before stepped_to was kept: the reattach
+        # gives the thread or none, and the trap that follows at the same pc and CR3 is that step's.
+        original = self.stepped_watch_run()
+        for attach_reply in ('T05thread:p1.1;', 'T05'):
+            with self.subTest(attach_reply=attach_reply):
+                _, output, _ = self.run_capture([
+                    dict(pc=0x4100, attach_reply=attach_reply, pending_traps=1, pending_reply='T05thread:p1.1;'),
+                    dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
+                    ['--updates', '2', '--resume', '--watch', 'state=0x70088'],
+                    prepare=self.taken_over(original, dict(stepped_to=None)))
+                self.assertEqual([r['pc'] for r in self.events(output, 'took_over_off_break')], [0x4100])
+                self.assertEqual([(r['pc'], r.get('unrecorded_watch')) for r in self.events(output, 'step_after_watch')],
+                                 [(0x4100, True)])
+                self.assertEqual([r['update'] for r in self.rows(output / 'updates.jsonl')], [1, 2])
+                self.assertIsNone(json.loads((output / 'status.json').read_text())['stepped_maybe'])
+        # Taken over off a breakpoint with no trap pending, the next stop is dealt with as usual.
+        _, output, _ = self.run_capture(
+            [dict(pc=0x4100), dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
+            ['--updates', '2', '--resume', '--watch', 'state=0x70088'],
+            prepare=self.taken_over(original, dict(stepped_to=None)))
+        self.assertEqual(self.events(output, 'step_after_watch'), [])
+        self.assertEqual([r['update'] for r in self.rows(output / 'updates.jsonl')], [1, 2])
+        self.assertIsNone(json.loads((output / 'status.json').read_text())['stepped_maybe'])
+        # Only a plain trap in the reattach's thread is the pending one.
+        with self.assertRaisesRegex(RuntimeError, 'unexpected stop at 0x4100'):
+            self.run_capture(
+                [dict(pc=0x4100, attach_reply='T05thread:p2.1;'), dict(pc=0x4100, reply='T05thread:p1.1;')],
+                ['--updates', '2', '--resume', '--watch', 'state=0x70088'],
+                prepare=self.taken_over(original, dict(stepped_to=None)))
+
+    def test_a_step_whose_reply_is_not_a_trap_fails(self):
+        for stop in (dict(pc=capture.ENTRY, step='E22'),
+                     # on the retry after a swallowed step
+                     dict(pc=capture.ENTRY, pending_traps=1, step='E22'),
+                     dict(pc=capture.ENTRY, step='W00')):
+            with self.subTest(stop=stop):
+                with self.assertRaisesRegex(RuntimeError, f"step at {capture.ENTRY:#x} gave '(E22|W00)', not a trap"):
+                    self.run_capture([dict(pc=0), stop, dict(pc=capture.RETURN)],
+                                     ['--updates', '1', '--watch', 'state=0x70088'])
+
+    def test_a_resume_needs_a_run_that_reached_its_baseline(self):
+        for events in (None, [dict(kind='game_identity'), dict(kind='attach')]):
+            def prepare(output):
+                if events is not None:
+                    (output / 'events.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in events))
+            with self.subTest(events=events), self.assertRaises(SystemExit), \
+                    patch.object(sys, 'stderr', io.StringIO()) as stderr:
+                try:
+                    self.run_capture([dict(pc=0)], ['--updates', '1', '--resume'], prepare=prepare)
+                finally:
+                    self.assertIn('has no baseline event', stderr.getvalue())
+
+    def test_a_takeover_at_a_return_elsewhere_is_not_checked_against_the_last_row(self):
+        # The last row holds what FakeMemory's summary gives, so a return on this lot would be refused.
+        last = dict(update=1, tick=100, lot_rng=1, global_rng=2, crt=3, scheduler_cursor=0)
+
+        def prepare(output):
+            (output / 'events.jsonl').write_text(json.dumps(dict(kind='baseline', cr3=GAME_CR3)) + '\n')
+            (output / 'updates.jsonl').write_text(json.dumps(last) + '\n')
+
+        with self.assertRaisesRegex(RuntimeError, 'already recorded'):
+            self.run_capture([dict(pc=capture.RETURN)], ['--updates', '2', '--resume'], prepare=prepare)
+        for elsewhere in (dict(cr3=OTHER_CR3), dict(lot=7), dict(lot_unreadable=True)):
+            with self.subTest(elsewhere=elsewhere):
+                _, output, _ = self.run_capture(
+                    [dict(pc=capture.RETURN, **elsewhere), dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
+                    ['--updates', '2', '--resume', '--watch', 'state=0x70088'], prepare=prepare)
+                self.assertEqual([r.get('elsewhere') for r in self.events(output, 'took_over_at_return')], [True])
+                self.assertEqual([r['update'] for r in self.rows(output / 'updates.jsonl')], [1, 2])
+
     def test_takeover_at_a_return_retries_the_step_without_recording_the_return_twice(self):
         def prepare(output):
             (output / 'events.jsonl').write_text(json.dumps(dict(kind='baseline', cr3=GAME_CR3)) + '\n')
@@ -1164,6 +1288,45 @@ class SparseTest(CaptureTest):
         self.assertEqual(self.events(output, 'resume_open_dialogs')[0]['dialogs'],
                          [dict(record=0x4000, update=2, jobs=[7])])
         self.assertEqual(self.saved(self.rows(output / 'updates.jsonl')), {2: ['dialog']})
+
+    def test_a_takeover_at_a_dialog_already_shown_does_not_show_it_again(self):
+        registers = dict(eip=capture.DIALOG_SHOW, ecx=0x4000, ebx=0x20000, ebp=0x90000, esp=0x90010,
+                         fs_base=0xa0000, cr3=GAME_CR3)
+        shown = dict(kind='dialog_show', pc=capture.DIALOG_SHOW, update=2, record=0x4000, registers=registers,
+                     time=1)
+        pressed = dict(kind='dialog_auto_answer', update=2, record=0x4000, press=1, job=7, time=2)
+        cases = [
+            (dict(pc=capture.DIALOG_SHOW, ecx=0x4000), [shown, pressed], False),
+            # The registers differ: a show the earlier run did not log.
+            (dict(pc=capture.DIALOG_SHOW, ecx=0x4000, esp=0x90020), [shown, pressed], True),
+            (dict(pc=capture.DIALOG_SHOW, ecx=0x4001), [shown, pressed], True),
+            # The dialog was given its result since: a new show.
+            (dict(pc=capture.DIALOG_SHOW, ecx=0x4000),
+             [shown, pressed, dict(kind='dialog_result', update=2, record=0x4000, time=3)], True),
+        ]
+        for stop, events, again in cases:
+            with self.subTest(stop=stop, events=len(events)), \
+                    tempfile.TemporaryDirectory(prefix='sims-guest-test-') as guest_dir, \
+                    patch.object(capture, 'DialogAnswerer') as answerer:
+                _, output, _ = self.run_capture(
+                    [stop, dict(pc=capture.RETURN, clock=[6, 59, 58])],
+                    ['--updates', '2', '--resume', '--answer-stuck', '100', '--answer-from', '2',
+                     '--guest-dir', guest_dir],
+                    prepare=self.resumed_after({}, events))
+                shows = self.events(output, 'dialog_show')
+                taken = self.events(output, 'took_over_at_dialog_show')
+                if again:
+                    self.assertEqual(len(shows), 2)
+                    self.assertEqual(taken, [])
+                    self.assertEqual(answerer.return_value.shown.call_args.args, (2, stop['ecx']))
+                else:
+                    self.assertEqual(len(shows), 1)
+                    self.assertEqual([(r['record'], r['update']) for r in taken], [(0x4000, 2)])
+                    # Shown once, from the resume, with the press already handed to the guest.
+                    answerer.return_value.shown.assert_called_once_with(2, 0x4000, [7])
+                    status = json.loads((output / 'status.json').read_text())
+                    self.assertEqual(status['dialog']['record'], 0x4000)
+                self.assertEqual([r['update'] for r in self.rows(output / 'updates.jsonl')], [1, 2])
 
     def test_negative_windows_are_refused(self):
         with self.assertRaises(SystemExit), patch.object(sys, 'stderr', io.StringIO()):
