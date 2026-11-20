@@ -63,7 +63,9 @@ still queued after a partial pass, and both fail loudly.
    data words, and the lot's list of people loses it.
 
 The deletion writes no neighborhood record, relationship, family or
-room. Other objects' frames and relationships that name the ID keep it,
+room. (*Added 2026-11-19:* Remove Object Instance itself saves a
+removed person into its record before the deletion; see
+`docs/decisions/20261119-generic-sims-call-6-and-the-saved-neighbor-record.md`.) Other objects' frames and relationships that name the ID keep it,
 as in the original. The animator's reset now stops a route
 (0x5892dd → 0x589e2d, result to 0 at 0x5892e4). For a result other than
 1 or -1, the destination becomes the unset position (0x589e5d). A
@@ -107,5 +109,7 @@ bus at step 2703 (tick 91146).
 
 After the Goth social (the pie-menu run in `boot.rs`), the salesman
 leaves at tick 597 while his animator plays "A2O-door-knock". The reset
-that deletes him would remove that clip, which can fade it out
-(0x592878), and that run stops there.
+that deletes him removes that clip (0x592878). *Corrected 2026-11-19:*
+this is ported since #263, which takes the clip off without fading it
+(`docs/decisions/20261118-animator-reset-removes-the-playing-clip.md`),
+so that run no longer stops there.
