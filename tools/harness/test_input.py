@@ -13,7 +13,6 @@ import unittest
 from pathlib import Path
 
 import input as inp
-from capture import ACTION_SERIAL
 
 
 class FakeMemory:
@@ -443,9 +442,7 @@ class RunnerTest(RunnerBase):
         self.assertNotIn('mousedown', self.last_command())  # not highlighted yet
         g.highlight(0)
         self.tick_until(r, lambda: 'mousedown' in self.last_command())
-        g.m.put_words(ACTION_SERIAL, 5)
         action = self.push(r, 0)
-        g.m.put_words(ACTION_SERIAL, 6)
         self.queue_result(r, action, 6)
         self.tick(r, 4)
         self.assertFalse(r.finished)  # pushed, but the person does not hold it yet
@@ -814,7 +811,7 @@ class ReviewFindingsTest(RunnerBase):
         g.m.put_words(self.person + 0xa40, 1, 1)
         self.tick_until(r, lambda: r.finished)
         self.assertEqual([(t['where'], t['uid']) for t in self.rows('taken')], [('queue', 2)])
-        self.assertIn('neither', r.failed)
+        self.assertIn('already confirmed an earlier push', r.failed)
 
     def test_a_rejected_push_does_not_take_a_matching_active_action(self):
         r = self.runner('expect-queued 21 173 within 3')
@@ -832,14 +829,11 @@ class ReviewFindingsTest(RunnerBase):
     def test_an_unreadable_result_uid_cannot_take_an_unrelated_action_with_the_same_fields(self):
         r = self.runner('expect-queued 21 173 within 3')
         m = self.g.m
-        m.put_words(ACTION_SERIAL, 5)
         action = self.push(r, 8213)
-        m.put_words(ACTION_SERIAL, 6)
         m.put_words(action + 0x3c, 6)
         del m.bytes[action + 0x3c]  # the UID read fails at the return
         self.queue_result(r, action)
         # The push with uid 6 was cancelled. A different Sit is active.
-        m.put_words(ACTION_SERIAL, 7)
         self.put_action(self.person + inp.ACTIVE_ACTION, self.person, self.bench, routine=8213, uid=7)
         self.tick(r)
         self.assertTrue(r.finished)
@@ -862,6 +856,17 @@ class ReviewFindingsTest(RunnerBase):
         self.assertEqual([(q['push'], q['accepted'], q['uid']) for q in self.rows('queue_result')],
                          [(1, False, None)])
 
+    def test_a_push_whose_person_cannot_be_read_is_not_passed_over(self):
+        r = self.runner('expect-queued 21 173 within 3')
+        r.on_queue_push(1, False, self.g.m, dict(edi=0x10, esi=0x20, ebp=0x80000))  # nothing readable there
+        r.on_queue_result(self.g.m, dict(eax=1, ebp=0x80000))
+        self.queue_result(r, self.push(r, 8213), 6)
+        self.put_action(self.person + inp.ACTIVE_ACTION, self.person, self.bench, routine=8213, uid=6)
+        self.tick_until(r, lambda: r.finished)
+        self.assertIn('(or another person) could not be read', r.failed)
+        self.assertFalse(self.rows('taken'))
+        self.assertEqual(self.rows('queued_unread')[0]['step'], 0)
+
     def test_a_push_whose_return_is_never_seen_says_so(self):
         r = self.runner('expect-queued 21 173 within 3')
         self.push(r, 8213)
@@ -879,7 +884,7 @@ class ReviewFindingsTest(RunnerBase):
         r.on_queue_push(1, False, g.m, dict(edi=self.person, esi=action, ebp=0x80000))
         self.queue_result(r, action)
         self.tick_until(r, lambda: r.finished)
-        self.assertIn('neither', r.failed)
+        self.assertIn('the uid it had before the call (2)', r.failed)
         self.assertFalse(self.rows('taken'))
 
     def test_expect_queued_finds_a_uid_among_undecodable_actions(self):

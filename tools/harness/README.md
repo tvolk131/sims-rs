@@ -269,9 +269,11 @@ How the checks work (the addresses are in `input.py`):
 - **Confirming.** capture.py logs the chosen action at the pie menu's queue
   call (`0x48ddcb`) and reads the result and the assigned UID at its return
   (`0x48ddd0`). `expect-queued` checks the first push on the requested
-  person after the choice. A refused push, an unreadable pushed action,
-  an unexpected target, or a UID that is zero or cannot be read fails
-  the step at once. The step looks for the assigned UID in the person's
+  person after the choice (a push whose person could not be read counts
+  as that push). A refused push, an unreadable pushed action, an
+  unexpected target, a UID that is zero or cannot be read, a UID equal to
+  the one the action held before the call, or a UID that already
+  confirmed an earlier push fails the step at once. The step looks for the assigned UID in the person's
   queue (`+0x820`) and running action (`+0xa48`). The UID also identifies
   a social whose target, routine, and menu changed. `taken.where` is
   `queue` or `active`.
@@ -311,7 +313,9 @@ target, the routine, the priority, the menu number, the arguments and the
 flags. Each `queued` or `queued_unread` row has a `push` ID, starting at 1
 and increasing for each push. The same ID appears on its `queue_result`
 row, even when several pushes occur in one update. Replay only `queued`
-rows whose matching `queue_result` has `accepted` set to true. The other
+rows whose matching `queue_result` has `accepted` set to true
+(`manifest.json`'s `queued` list carries each push's `accepted` and
+`uid`). The other
 rows log the steps, each guest command and when it ended, the hover
 readings and the pie menus.
 

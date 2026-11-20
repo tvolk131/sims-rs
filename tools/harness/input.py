@@ -596,11 +596,10 @@ class Runner:
     def on_queue_push(self, update, in_update, m, regs):
         person, action = regs['edi'], regs['esi']
         row = dict(kind='queued', update=update, in_update=in_update, push=len(self.pushes) + 1,
-                   person=None, action_pointer=action)
+                   person=None, action_pointer=action, step=self.index)
         try:
             row['person'] = m.object_id(person)
             row['action'] = m.action(action)
-            row['step'] = self.index
         except Exception as e:  # reading the push must never end the capture
             row.update(kind='queued_unread', person_pointer=person, error=f'{type(e).__name__}: {e}')
         self.pending_pushes[regs['ebp']] = row
@@ -1040,7 +1039,9 @@ class Runner:
             if push is None:
                 for i in range(self.push_cursor, len(self.pushes)):
                     r = self.pushes[i]
-                    if r['person'] == person:
+                    # Only pie choices are logged, so a push whose person could not be read
+                    # may be this one: it is checked (and fails) rather than passed over.
+                    if r['person'] in (person, None):
                         push, self.push_cursor = r, i + 1
                         break
             uid = push.get('uid') if push else None
@@ -1049,15 +1050,19 @@ class Runner:
                 if accepted is False:
                     raise StepFailed(f'the game did not queue the action pushed on {person} (its queue call returned 0)')
                 if push['kind'] == 'queued_unread':
-                    raise StepFailed(f'the action pushed on {person} could not be read ({push["error"]})')
+                    on = person if push['person'] is not None else f'{person} (or another person)'
+                    raise StepFailed(f'the action pushed on {on} could not be read ({push["error"]})')
                 pushed_target = push['action']['target']
                 if target is not None and pushed_target != target:
                     raise StepFailed(f'the action pushed on {person} aimed at {pushed_target} (expected {target})')
                 if accepted and not uid:
                     raise StepFailed(f'the uid the game gave the action pushed on {person} could not be read')
+                if uid and uid == push['action']['uid']:
+                    raise StepFailed(f'the action pushed on {person} returned with the uid it had before the call ({uid})')
+                if uid and uid in self.taken_uids:
+                    raise StepFailed(f'uid {uid}, given to the action pushed on {person}, already confirmed an earlier push')
             p = uid and find_object(self.m, self.sim, person)
-            # A social can return with the uid it had before the call.
-            if p and uid != push['action']['uid'] and uid not in self.taken_uids:
+            if p:
                 active, queue = p + ACTIVE_ACTION, queue_slots(self.m, p)
                 for where, addr in [('active', active)] + [('queue', q) for q in queue]:
                     if self.m.word(addr + ACTION_UID) != uid:
