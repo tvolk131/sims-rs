@@ -222,3 +222,116 @@ fn reads_the_saved_type_attributes() {
         (0x1111, &[5, -1][..])
     );
 }
+
+/// A version 2 type-table entry.
+fn type_entry(guid: u32, id: u16, name: &str) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend(guid.to_le_bytes());
+    bytes.extend([0; 8]);
+    bytes.extend(id.to_le_bytes());
+    bytes.extend(0u16.to_le_bytes());
+    bytes.extend(name.as_bytes());
+    bytes.push(0);
+    if bytes.len() % 2 != 0 {
+        bytes.push(0);
+    }
+    bytes
+}
+
+/// A house whose type table names GUIDs only its `Gtab` maps to defined
+/// ones (0x43a6fb): 0x9999 to 0x2222 directly, 0x7777 through 0x8888.
+#[test]
+fn the_guid_table_translates_the_type_table() {
+    let tree = Tree::new("guid-table");
+    setup(&tree);
+    let mut types = saved(b"tjbo", 2);
+    types.extend(type_entry(0x9999, 1, "Exported"));
+    types.extend(type_entry(0x7777, 2, "Chained"));
+    types.extend(type_entry(0x1111, 3, "Chair"));
+    let mut table = saved(b"batG", 0);
+    table.extend(3u32.to_le_bytes());
+    for (old, new) in [(0x9999u32, 0x2222u32), (0x7777, 0x8888), (0x8888, 0x1111)] {
+        table.extend(old.to_le_bytes());
+        table.extend(new.to_le_bytes());
+    }
+    let objects = {
+        let mut bytes = saved(b"MjbO", 0x3e);
+        bytes.extend([1, 0]);
+        bytes
+    };
+    tree.file(
+        "Hood/Houses/House03.iff",
+        &iff(&[
+            (b"SIMI", 1, &simulator(4000, 20000)),
+            (b"Gtab", 1, &table),
+            (b"objt", 0, &types),
+            (b"ObjM", 1, &objects),
+        ]),
+    );
+    let neighborhood = Neighborhood::open(&tree.0.join("Hood")).unwrap();
+    let (_, catalog) = catalog(&tree, &neighborhood);
+    let houses = neighborhood.houses().unwrap();
+    let house = House::load(&houses[&3], &catalog).unwrap();
+    let guids: Vec<_> = house.types.entries.iter().map(|t| t.guid).collect();
+    assert_eq!(guids, [0x2222, 0x1111, 0x1111]);
+    assert_eq!(house.guid_table.unwrap().pairs.len(), 3);
+    // A table under another chunk ID is not read (0x41578e asks for 1).
+    tree.file(
+        "Hood/Houses/House03.iff",
+        &iff(&[
+            (b"SIMI", 1, &simulator(4000, 20000)),
+            (b"Gtab", 2, &table),
+            (b"objt", 0, &types),
+            (b"ObjM", 1, &objects),
+        ]),
+    );
+    let house = House::load(&houses[&3], &catalog).unwrap();
+    assert!(house.guid_table.is_none());
+    assert_eq!(house.types.entries[0].guid, 0x9999);
+}
+
+/// Needs the game: set `SIMS_INSTALL` to the install folder.
+///
+/// The first neighborhood's Old Town homes were saved under their
+/// families' exported GUIDs and carry the import's GUID table, which maps
+/// them to the characters in `UserData/Characters`. House 69's maps
+/// Claire 0x64BCCDFB to 0xBC364BF5 and Luna 0x67FDDFD9 to 0xBE24148E.
+#[test]
+fn the_old_town_homes_load_through_their_guid_tables() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("skipping: set SIMS_INSTALL to read the Old Town houses");
+        return;
+    };
+    let root = std::path::Path::new(&root);
+    let install = Install::detect(root).unwrap();
+    let neighborhood = Neighborhood::open(&root.join("UserData")).unwrap();
+    let mut index = Index::build(&install).unwrap();
+    index
+        .add_characters(&neighborhood.characters().unwrap().unwrap())
+        .unwrap();
+    let catalog = Catalog::build(&index).unwrap();
+    let houses = neighborhood.houses().unwrap();
+    for number in [56, 63, 69, 76, 77] {
+        let house = House::load(&houses[&number], &catalog)
+            .unwrap_or_else(|error| panic!("house {number}: {error}"));
+        let table = house.guid_table.as_ref().expect("a GUID table");
+        for (old, _) in &table.pairs {
+            assert!(
+                house.types.entries.iter().all(|t| t.guid != *old),
+                "house {number} still names 0x{old:08X}"
+            );
+        }
+        let (_, family) = neighborhood.family_in(number).unwrap();
+        for member in &family.members {
+            assert!(
+                house.types.entries.iter().any(|t| t.guid == *member),
+                "house {number} has no type for member 0x{member:08X}"
+            );
+        }
+    }
+    let house = House::load(&houses[&69], &catalog).unwrap();
+    assert_eq!(
+        house.guid_table.unwrap().pairs,
+        [(0x64BC_CDFB, 0xBC36_4BF5), (0x67FD_DFD9, 0xBE24_148E)]
+    );
+}

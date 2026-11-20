@@ -204,6 +204,27 @@ fn the_goth_house_steps_to_tick_33() {
 }
 
 #[test]
+fn an_old_town_home_loads_through_its_guid_table_and_steps() {
+    // House 69 of the first neighborhood was saved under its family's
+    // exported GUIDs; its GUID table (0x43a6fb) names the imported types.
+    // The dialogs at ticks 1 and 3 take their first buttons.
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let house = root.join("UserData/Houses/House69.iff");
+    let mut lot = Lot::load(&root, &house, &[2; 8], Frames::default()).unwrap();
+    let report = lot.load_report();
+    assert!(report.stopped.is_none(), "{:?}", report.stopped);
+    assert!(report.finished.is_some());
+    for _ in 0..5 {
+        lot.step().unwrap();
+    }
+    assert_eq!(lot.ticks(), 5);
+}
+
+#[test]
 fn a_step_before_a_complete_load_says_so() {
     // Shown through the message the CLI prints.
     assert_eq!(
@@ -335,22 +356,22 @@ fn the_selected_goth_lists_pie_menus_and_picks_from_them() {
     assert_eq!(lot.world().headlines, BTreeMap::from([(16, shown(1))]));
     lot.step().unwrap_or_else(|e| panic!("{e}"));
     assert!(lot.world().headlines.is_empty());
-    // The lot runs on until person 259 (the salesman), whose route to a
-    // slot failed as it wants to be interrupted (0x45b18b), is taken off
-    // the lot while its animator plays a door knock: the reset that
-    // deletes it would remove that clip, which can fade it out, and that
-    // is not ported.
-    let mut steps = 359;
-    let stopped = loop {
-        steps += 1;
-        assert!(steps <= 1000, "the lot did not stop");
-        if let Err(e) = lot.step() {
-            break e.to_string();
-        }
-    };
-    assert_eq!(steps, 595, "{stopped}");
-    for part in ["tick 597,", "object 259", "A2O-door-knock", "0x592878"] {
-        assert!(stopped.contains(part), "{stopped}");
+    // The salesman (object 259) still has a door knock playing when he
+    // is taken off the lot at tick 597; the reset that deletes him
+    // removes the clip at once (0x586b63), and the lot runs on past it
+    // (checked here to tick 625; it was run to 3625 without a stop).
+    // His id is reused by another object before tick 625.
+    while lot.ticks() < 596 {
+        lot.step().unwrap_or_else(|e| panic!("{e}"));
+    }
+    let layer = lot.world().animators[&259].foreground.as_ref().unwrap();
+    assert_eq!(layer.clip, "A2O-door-knock");
+    lot.step().unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(lot.ticks(), 597);
+    assert!(!lot.world().objects.contains_key(&259));
+    assert!(!lot.world().animators.contains_key(&259));
+    while lot.ticks() < 625 {
+        lot.step().unwrap_or_else(|e| panic!("{e}"));
     }
 }
 
@@ -946,13 +967,21 @@ fn the_goth_day_under_the_recordings_frames_keeps_its_streams() {
         assert_eq!(streams(&lot), (lot_rng, 270_289_136, crt), "after {at}");
     }
     // Tick 16112: object 26's Burn moves person 18 to its tile's centre,
-    // which resets an animator playing "A2O-panic-loop2". Removing it can
-    // fade it out (0x592878), which is not ported.
+    // which resets an animator playing "A2O-panic-loop2". The reset takes
+    // the playing clip off (0x592878); with the fade gate clear it is not
+    // faded out (`Animator::clear_foreground`). The recording ends at 16111, so
+    // from here the run is unverified.
+    while tick < 17928 {
+        lot.step().unwrap();
+        tick += 1;
+    }
+    // Tick 17929: person 18's tree 0x0189 calls Generic Sims Call routine
+    // 6, which is not ported.
     match lot.step().unwrap_err() {
         StepError::Tick {
-            tick: 16112, error, ..
+            tick: 17929, error, ..
         } => {
-            for part in ["object 26, tree 0x1003", "unsupported: Burn", "0x592878"] {
+            for part in ["object 18, tree 0x0189", "Generic Sims Call routine 6"] {
                 assert!(error.contains(part), "{error}");
             }
         }

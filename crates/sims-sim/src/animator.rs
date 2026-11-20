@@ -149,7 +149,8 @@ pub struct Animator {
     pub carry_mode: i32,
     /// +0x1ac: the carry clip chosen, or -1 for none.
     pub carry_selection: i32,
-    /// +0x98: written -1 when a script's clip starts.
+    /// +0x98: written -1 when the foreground clip is cleared or a
+    /// script's clip starts.
     pub selection: i32,
     /// +0xa0: whether Animate Sim has a clip playing.
     pub playing: bool,
@@ -851,6 +852,27 @@ impl Animator {
         }
     }
 
+    /// Clears the foreground slot and invalidates its selection (virtual
+    /// function 0xfc, 0x586b63). An occupied slot's layer is removed from
+    /// the skin (0x5928f2, 0x5a0a7b), marking its layers changed
+    /// (0x5991d4). The event queue and playing flag belong to the caller.
+    ///
+    /// The fade branch (0x592887) requires byte 0x6f6bd0 and duration
+    /// 0x6d0460 to be nonzero. The Complete Collection executable
+    /// zero-initializes the byte, both direct references only read it,
+    /// and it is 0 in the memory images of the running game taken at
+    /// updates 14, 15, 47 and 580, so it is taken to be 0.
+    ///
+    /// 0x5991a0 marks the skin changed and frees the layer only if it
+    /// finds the layer in the skin's list; a slot's layer is always in
+    /// it here, so that case is not kept.
+    pub fn clear_foreground(&mut self) {
+        if self.foreground.take().is_some() {
+            self.skin_dirty = true;
+        }
+        self.selection = -1;
+    }
+
     /// The animator's reset (virtual function 0xc, 0x589220), as far as it
     /// writes what is kept here:
     ///
@@ -862,12 +884,12 @@ impl Animator {
     ///   foreground clip's raised priority is set again, and the
     ///   appearance is to be read again (+0xd8).
     /// - The foreground clip is removed and the selection set to -1
-    ///   (virtual function 0xfc, 0x586b63); the blend, carry and base
-    ///   slots are emptied (0x592878). Removing a layer marks the skin's
-    ///   layers changed. The carry layer is removed at once: 0x592878
-    ///   fades a layer out instead only when byte 0x6f6bd0 is set, which
-    ///   holds 0 in the memory image of a running game.
-    /// - The event queue is emptied and nothing plays (+0xa0).
+    ///   ([`Animator::clear_foreground`]). The blend, carry and base slots
+    ///   are then emptied (0x592878). With fading disabled, the blend
+    ///   slot is already empty and any carry or base layer is removed
+    ///   immediately, marking the skin's layers changed.
+    /// - The event queue is emptied (0x58931d) and the playing flag
+    ///   cleared (0x58932c).
     ///
     /// - A route result (+0x188) that is not 0 stops the route
     ///   (0x5892dd, calling 0x589e2d) and becomes 0 (0x5892e4). The stop
@@ -881,17 +903,7 @@ impl Animator {
     ///
     /// The speed, its target, the clocks, the pickup flag, the count of
     /// events seen and the slow and follow flags stay as they are.
-    ///
-    /// Fails for what is not ported: a foreground clip, whose removal can
-    /// fade it out through the blend slot (0x592887).
     pub fn reset(&mut self) -> Result<(), String> {
-        if let Some(layer) = &self.foreground {
-            return Err(format!(
-                "resetting an animator that plays the clip {:?}: removing it (0x592878) can \
-                 fade it out, which is not ported",
-                layer.clip
-            ));
-        }
         self.position = [UNSET; 3];
         self.motion.segment = -1;
         self.motion.near_end = 0;
@@ -910,12 +922,12 @@ impl Animator {
         self.state = 3;
         self.walking = false;
         self.profile_stale = true;
-        self.selection = -1;
-        if self.base.is_filled() {
-            self.base = Base::Empty;
+        self.clear_foreground();
+        if self.carry.take().is_some() {
             self.skin_dirty = true;
         }
-        if self.carry.take().is_some() {
+        if self.base.is_filled() {
+            self.base = Base::Empty;
             self.skin_dirty = true;
         }
         self.events.clear();

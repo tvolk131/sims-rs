@@ -186,6 +186,114 @@ impl ObjectTypes {
     }
 }
 
+/// A house's GUID translation table (`Gtab` chunk 1), written by the
+/// family import (0x4297f7) so a lot saved under a family's exported GUIDs
+/// names the types the import made. The house read loads it (0x43ddc2,
+/// 0x41578e) and passes every type-table GUID through
+/// [`GuidTable::translate`] before looking up its definition (0x43a6fb).
+///
+/// The read (0x4158a4, through the stream at 0x464ec1) takes the byte
+/// order from the payload's first byte: nonzero means each number is
+/// stored big-endian (0x464970 swaps it). It skips the version and the
+/// "batG" tag without checking them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuidTable {
+    /// The header's version, in the payload's byte order. Not checked.
+    pub version: u32,
+    /// Old GUID, new GUID, in the file's order (0x4158a4: a 32-bit count,
+    /// then the pairs).
+    pub pairs: Vec<(u32, u32)>,
+}
+
+impl GuidTable {
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes);
+        let swapped = r.take(4)?[0] != 0;
+        let number = |r: &mut Reader<'_>| -> Result<u32> {
+            let n = r.u32()?;
+            Ok(if swapped { n.swap_bytes() } else { n })
+        };
+        let version = number(&mut r)?;
+        r.take(4)?;
+        let count = number(&mut r)? as usize;
+        r.count(count, 8)?;
+        let mut pairs = Vec::with_capacity(count);
+        for _ in 0..count {
+            pairs.push((number(&mut r)?, number(&mut r)?));
+        }
+        Ok(Self { version, pairs })
+    }
+
+    /// The GUID `guid` reads as (0x415751). The first pair not yet used
+    /// whose old GUID matches replaces it, and the search starts over from
+    /// the first pair, until no unused pair matches. So translations
+    /// chain, and each pair is used at most once per GUID, which ends a
+    /// cycle.
+    pub fn translate(&self, mut guid: u32) -> u32 {
+        let mut used = vec![false; self.pairs.len()];
+        while let Some(at) = self
+            .pairs
+            .iter()
+            .zip(&used)
+            .position(|(&(old, _), &done)| old == guid && !done)
+        {
+            used[at] = true;
+            guid = self.pairs[at].1;
+        }
+        guid
+    }
+}
+
+#[cfg(test)]
+mod guid_table_tests {
+    use super::*;
+
+    fn table(pairs: &[(u32, u32)]) -> Vec<u8> {
+        let mut b = vec![0; 8];
+        b.extend(b"batG");
+        b.extend((pairs.len() as u32).to_le_bytes());
+        for (old, new) in pairs {
+            b.extend(old.to_le_bytes());
+            b.extend(new.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn translations_chain_and_each_pair_is_used_once() {
+        let t = GuidTable::parse(&table(&[(1, 2), (2, 3), (3, 1), (7, 8), (7, 9)])).unwrap();
+        assert_eq!(t.pairs.len(), 5);
+        // 1 -> 2 -> 3 -> 1, then (1, 2) is used: the cycle ends at 1.
+        assert_eq!(t.translate(1), 1);
+        assert_eq!(t.translate(2), 2);
+        // The first matching pair wins.
+        assert_eq!(t.translate(7), 8);
+        assert_eq!(t.translate(5), 5);
+    }
+
+    #[test]
+    fn the_first_byte_picks_the_byte_order_and_the_tag_is_not_checked() {
+        // 0x464ec1 takes the order from byte 0; 0x464970 swaps each number.
+        let mut b = vec![1, 0, 0, 0, 0, 0, 0, 7, b'x', b'x', b'x', b'x'];
+        b.extend(1u32.to_be_bytes());
+        b.extend(0x1122_3344u32.to_be_bytes());
+        b.extend(0x5566_7788u32.to_be_bytes());
+        let t = GuidTable::parse(&b).unwrap();
+        assert_eq!((t.version, t.pairs), (7, vec![(0x1122_3344, 0x5566_7788)]));
+    }
+
+    #[test]
+    fn a_short_table_is_an_error() {
+        let mut b = table(&[(1, 2)]);
+        b.truncate(b.len() - 1);
+        assert!(GuidTable::parse(&b).is_err());
+        let mut b = table(&[]);
+        b[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(GuidTable::parse(&b).is_err());
+        assert!(GuidTable::parse(&b[..10]).is_err());
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Simulator {
     pub version: u32,
