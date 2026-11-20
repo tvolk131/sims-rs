@@ -28,8 +28,9 @@ it into `sims_game::pick` and `Lot::sprite_pick` (sims-vm).
      to the ground plane of the level shown (mode 1) when the depth is
      empty, when the level is not the one shown, or when the place is
      off the lot (0x422632). The view's rotation turns the place
-     (0x47bc1f). Outside the view's tile bounds (min + 1 to max − 1) the
-     pick finds nothing.
+     (0x47bc1f, which reflects fine positions about 1023). Outside the
+     view's tile bounds (the scene's +0x70 to +0x7c, min + 1 to max − 1,
+     tested on the view's tiles) the pick finds nothing.
    - **The walk.** On each tile, turned back to the lot's (0x434f58),
      the objects on the level are walked in link order (0x43f331,
      0x43f379). An object is found when its drawn rectangle holds the
@@ -48,7 +49,7 @@ it into `sims_game::pick` and `Lot::sprite_pick` (sims-vm).
        91 has bit 0.
    - **The steps.** The walk then steps toward the viewer: one column
      on, then one column back and one row on, then one column on, and
-     so on. It looks at 20 tiles at most.
+     so on. It takes 20 steps at most, so it looks at 21 tiles.
    - **The answer** is the found object, else the fallback.
 3. The pick lists the selected Sim's pie on the id when it changes
    (0x48c834, the house tool's +0x2e written at 0x48c8d9).
@@ -59,26 +60,34 @@ it into `sims_game::pick` and `Lot::sprite_pick` (sims-vm).
   pointer, if it stands on the level shown. This is the pixel itself,
   with no reach around it. `sims_people` already names each person's
   pixels and the bob's, and draws the bob after its holder.
-- `Lot::sprite_pick` follows step 2 as written. The tile bounds are
-  taken as the lot's inner tiles (**unverified**).
+- `Lot::sprite_pick` follows step 2 as written, turning by the rotation
+  the frame was drawn with. The tile bounds are taken as the lot's inner
+  tiles turned into the view (**unverified**).
 - The drawn rectangles come from the canvas (`Canvas::drawn`): it keeps
   the union of the whole images drawn under each object's id since it
   was cleared. Our people are drawn as meshes and have no rectangles, so
   the sprite pick never finds a person. Whether the original's people
   have rectangles the sprite pick tests is **unverified**.
 - The start tile comes from our depth, not the original's matrix:
-  - Our depth is affine in the screen row and the height. So
-    `Depth::unproject` inverts it exactly to the view position and the
-    height above level-1 ground.
+  - Our depth is affine in the screen row and the height, with a fixed
+    depth offset for each level above the first. So `Depth::unproject`
+    inverts it exactly, for a given level, to the view position and the
+    height above that level's floor (a unit test round-trips points at
+    every zoom and level).
   - On drawn objects this lands within about one sixteenth of a tile of
     their positions: the fountain, fridge and counter.
-  - The level counts whole floor heights above level-1 ground and
-    leaves out the terrain's height (**unverified** on a sloped lot).
+  - The pick unprojects as level 1 first. It counts whole floor heights
+    above the terrain under the point (the mean of its tile's corners),
+    as 0x4b07b3 does, and unprojects again on the level that gives.
+  - The ground-plane fallback is flat: it leaves out the terrain, which
+    the original's may not (**unverified** on a sloped lot).
   - Whether our unprojection agrees with the original's inverse matrix
     is **unverified** beyond these objects.
 - The game keeps the lot's depth from before the people are drawn and
   the camera the frame was drawn through. `Game::under` picks from them,
-  so a view moved since the last frame does not move the pick.
+  so a view moved or turned since the last frame does not move the pick.
+  Before the first frame, and off the canvas, the sprite pick finds
+  nothing.
 
 ## What the replays show
 
@@ -89,12 +98,15 @@ pointer picked from a newer frame than the original's. With this pick,
 every replay's differences from the recording are the ones it had
 before, or fewer:
 
-- **Through a wall, cancel 90: settled.** With the frames drawn on the
-  schedule, the original's listing of the counter (119) shows from 91 to
-  93 in both. The kitchen wall's pixels unproject to the wall's tile
-  (19, 31), in front of the counter's (18, 30), so the walk ends on the
-  wall's tile with nothing found. The counter is found once the cutaway
-  frame shows it.
+- **Through a wall, cancel 90: settled.** With the view drawn on the
+  schedule, the replay's state equals the recording's at every update
+  around 90. The pointer reaches the counter's spot at 90, but the last
+  frame (after 63) shows the kitchen wall there. The wall's pixels
+  unproject to the wall's tile (19, 31), in front of the counter's
+  (18, 30), so the walk ends on the wall's tile with nothing found. The
+  counter (119) is listed with the frame after 93, which cuts the wall
+  away (the cancel test pins this). Before, the window drew after every
+  update, and its state differed from the recording's at 91 to 93.
 - **Under the still pointer, cancel 257–259 and Sit 261, 291–560:
   open.** At the original's pointer, cancel's (200, 123) in the
   recording's pixels:

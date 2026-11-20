@@ -580,6 +580,52 @@ fn the_pointer_on_the_plumb_bob_lists_the_bobs_menu() {
     assert_eq!(mortimer(&game), (1, last, stack));
 }
 
+/// The sprite pick works on a turned view as on the first: in each of
+/// the four rotations, most pixels that show an object pick it. A turn
+/// takes effect on the pick with the frame drawn through it, not before:
+/// until then the pointer picks from the frame on screen.
+#[test]
+fn the_pointer_picks_what_each_turned_view_shows() {
+    use sims_game::view::Move;
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    assert_eq!(game.run(100), 100);
+    game.resize([800, 600]);
+    let points: Vec<[i32; 2]> = (0..600)
+        .step_by(3)
+        .flat_map(|y| (0..800).step_by(3).map(move |x| [x, y]))
+        .collect();
+    for turn in 0..4 {
+        game.render();
+        let picks: Vec<Option<u16>> = points.iter().map(|&p| game.under(p)).collect();
+        let world = game.lot().world();
+        let (mut shown, mut agree) = (0, 0);
+        for (&[x, y], &picked) in points.iter().zip(&picks) {
+            let Some(id) = game.canvas().id_at(x, y) else {
+                continue;
+            };
+            if game.over_panel([x, y]) || world.objects[&id].person.is_some() {
+                continue;
+            }
+            shown += 1;
+            agree += usize::from(picked == Some(id));
+        }
+        assert!(
+            shown > 1000 && agree * 4 > shown * 3,
+            "turn {turn}: the pick finds the shown object at {agree} of {shown} pixels"
+        );
+        // Turned but not drawn yet: the picks are the frame's on screen.
+        game.apply(Move::Rotate(true));
+        let after: Vec<Option<u16>> = points.iter().map(|&p| game.under(p)).collect();
+        assert!(
+            after == picks,
+            "turn {turn}: the pick moved before the frame"
+        );
+    }
+}
+
 #[test]
 fn a_snack_is_chosen_from_the_fridges_pie() {
     let Some(install) = install() else {
@@ -2273,9 +2319,19 @@ fn the_recorded_cancel_order_replayed_in_the_window_matches_the_recording() {
         game.press(at);
         assert!(game.menu().is_none());
     };
+    // The pointer reaches the kitchen counter's spot at 90 with the
+    // kitchen wall shown in front of it: nothing is listed until the frame
+    // after 93, which cuts the wall away and shows the counter (119).
+    run_to(&mut game, &schedule, 90);
+    game.hover(recorded([176, 222]));
+    assert_eq!(game.listed(), None);
+    run_to(&mut game, &schedule, 92);
+    assert_eq!(game.listed(), None);
+    run_to(&mut game, &schedule, 93);
+    assert_eq!(game.listed(), Some((mortimer, 119)));
     order(
         &mut game,
-        &[(90, [176, 222]), (123, [176, 210]), (153, [176, 198])],
+        &[(123, [176, 210]), (153, [176, 198])],
         183,
         (201, 256),
     );

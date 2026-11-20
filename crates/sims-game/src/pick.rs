@@ -56,7 +56,8 @@ pub fn noted(world: &World, camera: &Camera, canvas: &Canvas, [x, y]: [i32; 2]) 
     (three_d && object.position[2] == camera.level).then_some(id)
 }
 
-/// The sprite pick's object at `point` ([`Lot::sprite_pick`]).
+/// The sprite pick's object at `point` ([`Lot::sprite_pick`]). Nothing
+/// before the first frame is drawn, or off the canvas.
 fn sprite(
     lot: &Lot,
     camera: &Camera,
@@ -65,41 +66,66 @@ fn sprite(
     point: [i32; 2],
 ) -> Option<u16> {
     let [x, y] = point;
-    let on_canvas = (0..canvas.width as i32).contains(&x) && y >= 0;
-    let depth = on_canvas
-        .then(|| lot_depth.get(y as usize * canvas.width + x as usize))
-        .flatten()
-        .copied()
-        .filter(|&d| d != EMPTY)
-        .map(|d| place(camera, point, d));
+    let column = usize::try_from(x).ok().filter(|&x| x < canvas.width)?;
+    let row = usize::try_from(y).ok().filter(|&y| y < canvas.height)?;
+    let depth = *lot_depth.get(row * canvas.width + column)?;
+    let world = lot.world();
+    let depth = (depth != EMPTY).then(|| place(world, camera, point, depth));
     let level = camera.level;
     let lifted = [x, y + camera.zoom.floor_height() * (level - 1)];
     let ground = camera.unproject_fine(lifted);
     let level = i8::try_from(level).ok()?;
-    lot.sprite_pick(depth, ground, level, point, |id| {
+    lot.sprite_pick(depth, ground, level, camera.rotation, point, |id| {
         canvas.drawn(id).map(widen)
     })
 }
 
 /// Where a pixel of depth `depth` at `point` is: its lot position
 /// (sixteenths of a tile, rounded half away from zero as 0x454fb9 rounds)
-/// and the level its height is on. The level is one more for each
-/// floor's height the point stands above level-1 ground, as the
-/// original's 0x4b07b3 counts it against the floor height (which here
-/// leaves out the terrain's height under the point: **unverified** on a
-/// sloped lot).
-fn place(camera: &Camera, point: [i32; 2], depth: i32) -> ([i32; 2], i32) {
-    let (view, height) = Depth::new(camera).unproject(camera, point, depth);
-    let span = f64::from(sims_render::camera::ARRAY_SIZE * 16);
-    let [vx, vy] = view;
-    let lot = match camera.rotation & 3 {
-        1 => [vy, span - vx],
-        2 => [span - vx, span - vy],
-        3 => [span - vy, vx],
-        _ => [vx, vy],
+/// and the level it is on. As the original's 0x4b07b3 counts it, the
+/// level is one more for each floor's height the point stands above the
+/// terrain under it (the mean of its tile's four corners); the position
+/// is then the one on that level's floor.
+fn place(world: &World, camera: &Camera, point: [i32; 2], depth: i32) -> ([i32; 2], i32) {
+    let depths = Depth::new(camera);
+    let (view, height) = depths.unproject(camera, point, depth, 1);
+    let terrain =
+        terrain(world, to_lot(camera, view).map(round)) * f64::from(2i32 << camera.zoom.level());
+    let floor = f64::from(camera.zoom.floor_height());
+    let level = 1 + ((height - terrain) / floor).floor() as i32;
+    let view = if level > 1 {
+        depths.unproject(camera, point, depth, level).0
+    } else {
+        view
     };
-    let level = 1 + (height / f64::from(camera.zoom.floor_height())).floor() as i32;
-    (lot.map(round), level)
+    (to_lot(camera, view).map(round), level)
+}
+
+/// A fine view position turned back to the lot's, as the camera turns it.
+fn to_lot(camera: &Camera, [x, y]: [f64; 2]) -> [f64; 2] {
+    let span = f64::from(sims_render::camera::ARRAY_SIZE * 16);
+    match camera.rotation & 3 {
+        1 => [y, span - x],
+        2 => [span - x, span - y],
+        3 => [span - y, x],
+        _ => [x, y],
+    }
+}
+
+/// The terrain's height under lot position `fine`, in terrain steps: the
+/// mean of its tile's four corner heights (the lot's array 0), 0 off it.
+fn terrain(world: &World, fine: [i32; 2]) -> f64 {
+    let full = sims_render::lot::FULL;
+    let tile = fine.map(|n| usize::try_from(n >> 4).ok().filter(|&n| n < full));
+    let ([Some(x), Some(y)], Some(heights)) = (tile, world.arrays.get(&0)) else {
+        return 0.0;
+    };
+    let at = sims_render::Lot::cell(x, y) * 4;
+    heights
+        .data
+        .get(at..at + 4)
+        .filter(|_| heights.stride == 4)
+        .map_or(0.0, |c| c.iter().map(|&h| f64::from(h)).sum::<f64>() / 4.0)
 }
 
 /// Rounds half away from zero (0x636ac9, 0x636b98).
@@ -116,9 +142,9 @@ fn round(v: f64) -> i32 {
 /// left edge moved left and its right edge right to a multiple of four.
 fn widen([left, top, right, bottom]: [i32; 4]) -> [i32; 4] {
     [
-        left - left.rem_euclid(4),
+        left.saturating_sub(left.rem_euclid(4)),
         top,
-        right + (4 - right.rem_euclid(4)) % 4,
+        right.saturating_add((4 - right.rem_euclid(4)) % 4),
         bottom,
     ]
 }
@@ -140,5 +166,9 @@ mod tests {
         assert_eq!(widen([465, 250, 482, 308]), [464, 250, 484, 308]);
         assert_eq!(widen([464, 1, 484, 2]), [464, 1, 484, 2]);
         assert_eq!(widen([-3, 0, -1, 0]), [-4, 0, 0, 0]);
+        assert_eq!(
+            widen([i32::MIN, 0, i32::MAX, 0]),
+            [i32::MIN, 0, i32::MAX, 0]
+        );
     }
 }
