@@ -2377,3 +2377,38 @@ fn coming_back_onto_a_pie_entry_checks_it_again() {
     assert!(game.menu().is_some());
     assert_eq!(game.caught(), 0, "{:?}", game.errors());
 }
+
+/// The window's frame draws a bench in use after the Sim on it, as the
+/// original does: at 7:12 AM (tick 1260), near zoom, rotation 2, camera
+/// origin (591, −2018), walls down, the backrest's soft top edge blends
+/// over Mortimer's coat, (32, 16, 8) and (65, 32, 8) in the original's
+/// screenshot at the two pixels compared. Drawn into the lot under him,
+/// the edge would blend over the floor instead (see sims-people's
+/// `a_bench_in_use_draws_after_the_sim_on_it`).
+#[test]
+fn the_frame_draws_a_bench_in_use_after_the_sim_on_it() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&Options {
+        answers: vec![3, 3],
+        ..options(install)
+    })
+    .expect("the Goth house opens");
+    let left = 1260 - game.lot().ticks();
+    assert_eq!(game.run(left), left);
+    assert!(sims_render::holds_person(game.lot().world()).contains(&174));
+    game.resize([800, 600]);
+    game.view.camera.zoom = sims_render::Zoom::Near;
+    game.view.camera.rotation = 2;
+    game.view.camera.origin = [591, -2018];
+    game.view.camera.walls = sims_render::Walls::Down;
+    let frame = game.render().rgb565();
+    for ([x, y], original) in [([385, 311], [32, 16, 8]), ([405, 305], [65, 32, 8])] {
+        let at: [u8; 3] = frame[y * 800 + x];
+        assert!(
+            at.iter().zip(original).all(|(&a, b)| a.abs_diff(b) <= 12),
+            "({x}, {y}): {at:?}"
+        );
+    }
+}

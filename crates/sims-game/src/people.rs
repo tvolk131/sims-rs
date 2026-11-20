@@ -128,8 +128,9 @@ impl People {
     }
 
     /// Draws every placed person on the levels `camera` shows into
-    /// `canvas`, which holds the lot `sims_render::draw` drew with the
-    /// same camera, each pixel naming the person drawn in it.
+    /// `canvas`, which holds the lot `sims_render::draw_lot` drew with the
+    /// same camera, each pixel naming the person drawn in it. The objects
+    /// that hold a person go in after (`sims_render::draw_held`).
     pub fn draw(&mut self, world: &World, camera: &Camera, canvas: &mut Canvas) {
         let drawn = self.people.draw_on_lot(world, camera, canvas);
         self.note(drawn.problems);

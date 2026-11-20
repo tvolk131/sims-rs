@@ -489,7 +489,9 @@ impl Game {
             level: w.level,
             room: w.room.unwrap_or(NO_ROOM),
         });
-        sims_render::draw(
+        // The lot, then the people, then the objects that hold someone
+        // (a bench a Sim sits on), as the original's frame does.
+        sims_render::draw_lot(
             world,
             &self.lot_shape,
             &mut self.assets,
@@ -504,6 +506,13 @@ impl Game {
         let milliseconds = (self.clock_us / 1000) as u32;
         self.people.set_clock(milliseconds);
         self.people.draw(world, &self.view.camera, &mut self.canvas);
+        sims_render::draw_held(
+            world,
+            &self.lot_shape,
+            &mut self.assets,
+            &self.view.camera,
+            &mut self.canvas,
+        );
         // The pie menu shows the head of the Sim it is for, as posed now.
         if let Some(menu) = &mut self.hud.menu {
             menu.head = match self.people.head(world, menu.person, menu.face_size()) {

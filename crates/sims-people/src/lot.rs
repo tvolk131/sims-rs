@@ -33,9 +33,10 @@
 //! ([`View::place_on`]).
 //!
 //! **Depth.** [`People::draw_on_lot`] draws over a lot `sims_render` has
-//! drawn, as the original does: the lot first, then the people, each
-//! pixel tested against the lot's depth but never part of what the lot
-//! drew. Each vertex takes the lot renderer's [`Depth::point`] (its fine
+//! drawn, as the original does: the lot first (`sims_render::draw_lot`),
+//! then the people, each pixel tested against the lot's depth but never
+//! part of what the lot drew, then the objects that hold a person
+//! (`sims_render::draw_held`), tested against the people's depth. Each vertex takes the lot renderer's [`Depth::point`] (its fine
 //! view position, elevation and level, in the original's depth space),
 //! which the rasterizer interpolates linearly across each triangle.
 //! [`People::draw`] takes any depth function of that shape and any
@@ -599,9 +600,10 @@ impl People {
     }
 
     /// Draws every placed person on the camera's levels over a lot the lot
-    /// renderer has drawn into `canvas` (`sims_render::draw` first), each
-    /// pixel tested against the lot's depth: walls, furniture and floors
-    /// in front of a person hide them. Depth is the lot renderer's
+    /// renderer has drawn into `canvas` (`sims_render::draw_lot` first,
+    /// and `sims_render::draw_held` after, as the original's frame does),
+    /// each pixel tested against the lot's depth: walls, furniture and
+    /// floors in front of a person hide them. Depth is the lot renderer's
     /// [`Depth::point`]; the pixels go in by its sprite rule
     /// ([`sims_render::Canvas::put`]).
     pub fn draw_on_lot(
