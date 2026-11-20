@@ -49,7 +49,19 @@ files.
     (`IMPORTED_69_1000`) matches its pin.
 - **Dialogs.** Every dialog answers 2, as in track 2's recordings.
 
-**Compared.** `IMPORTED_69` matches the recording's entry. Every
-update compared so far matches it: the tick, the C runtime, the lot and
-global streams, the globals and every object. The one exception is
-object 2's last result, which differs in the UD1 House 69 check too.
+**Compared.** Track 2 recorded House 69 from this snapshot for 1,000
+updates (`house69-ud2-ticks-20261120`, ticks 227245 to 228244). Every
+dialog closed itself with result 2. Our run matches the recording at entry
+and at every update through 1,000: the tick, the C runtime, the lot and
+global streams, the globals and every object. There are two exceptions,
+both of a kind the UD1 House 69 check also has:
+- Object 2's last result.
+- One word of a person's frame block. From update 112 to 157, the
+  Charmings' first member (object 274) runs tree 8292 in its seventh
+  frame. Its one local is 5623 in the original and 0 here. That local is
+  word 77 of the person's frame block. Our block reached only 68 words
+  before this frame, so nothing had written word 77. The original's holds
+  whatever its heap left there, as the dog's frame word does in UD1.
+
+So `IMPORTED_69` and `IMPORTED_69_1000` are the recording's states, apart
+from those two.

@@ -873,7 +873,7 @@ const OPEN_DRAWS: u32 = 401_120;
 /// The imported House 69's state at entry (format 30), which matches
 /// track 2's recording of it (`house69-ud2-ticks-20261120`).
 const IMPORTED_69: &str = "647c524ea5e613ef5d94a2398525f0f3004ce7921af4ba278ee704c321722f29";
-/// The same after 1000 ticks.
+/// The same after 1000 ticks, which matches the recording's update 1000.
 const IMPORTED_69_1000: &str = "dc0cc436b4373bc1f2e4b0563195403e5dd2c2fcea44f78c7d0cfaf64a2fac9a";
 /// The same at tick 43200, a whole day from the load.
 const TICK_43200: &str = "d26a6a16a451728e40c9b6ada581665a4dfae60ddc7cd8ab306649e3eac14bb0";
