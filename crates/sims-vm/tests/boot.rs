@@ -2,6 +2,7 @@
 //! Goth house loads and steps one tick at a time to the state `sims boot`
 //! reaches.
 
+use sims_core::CrtRng;
 use sims_sim::{Headline, World};
 use sims_vm::boot::{Frames, Lot, StepError};
 use std::collections::BTreeMap;
@@ -232,11 +233,11 @@ fn an_old_town_home_loads_through_its_guid_table_and_steps() {
 /// in a fresh directory: the install's UserData2, with the `Characters`
 /// and `Houses` folders and `Neighborhood.iff` from the folder
 /// `SIMS_UD2_AFTER` names, and the emptied `Patch` folder. That folder is
-/// track 2's finished copy (`ud2-import-20261119`, `after-with-lot-load`)
-/// with `User00000.iff` and `User00001.iff` from its `before` copy
-/// (`ud2-import-state-20261120`), not the partial copy taken during the
-/// import. It lacks the neighborhood's other files (`LotZoning.iff` among
-/// them), which the open does not change, so they come from the install.
+/// track 2's second copy (`ud2-import-20261119/after-run2`), taken after
+/// the import's last write and before the lot load, in the session it
+/// recorded House 69 in (`house69-ud2-ticks-20261120`). It lacks the
+/// neighborhood's other files (`LotZoning.iff` among them), which the open
+/// does not change, so they come from the install.
 /// The directory is per process, so runs at the same time do not collide.
 fn imported_userdata2(root: &Path) -> Option<PathBuf> {
     let after = PathBuf::from(std::env::var_os("SIMS_UD2_AFTER")?);
@@ -295,23 +296,29 @@ fn an_imported_home_loads_from_the_originals_files_and_steps() {
         return;
     };
     let house = directory.join("Houses/House69.iff");
-    let mut lot = Lot::load(&root, &house, &[2; 8], Frames::default()).unwrap();
+    let mut crt = CrtRng::from_state(1);
+    for _ in 0..OPEN_DRAWS {
+        crt.next_u15();
+    }
+    let mut lot = Lot::load_with(&root, &house, &[2; 8], Frames::default(), crt).unwrap();
+    // The recording's C runtime state at entry, after the load's own draws.
+    assert_eq!(lot.world().crt_rng.state(), 3_739_951_803);
     let report = lot.load_report();
     assert!(report.stopped.is_none(), "{:?}", report.stopped);
     assert!(report.finished.is_some());
     // The original's open: 446 records, the Charmings (family 13) in
     // House 69 under the GUIDs its import drew, and the pools.
     let world = lot.world();
-    assert_eq!(world.neighbors.slots.len(), 446);
+    assert_eq!(world.neighbors.slots.len(), 444);
     let family = |id: i32| world.families.iter().find(|f| f.id == id).unwrap();
     assert_eq!(
         (family(13).house, family(13).members.as_slice()),
-        (69, [0xf11b_036c, 0xf349_2156].as_slice())
+        (69, [0xd396_4bf5, 0xd868_148e].as_slice())
     );
     let pools = [2000, 5000, 5500, 6000].map(|id| (family(id).house, family(id).members.len()));
     assert_eq!(pools, [(0, 30), (0, 12), (0, 18), (0, 30)]);
     let tours = (3000..3010).map(|id| family(id).members.len());
-    assert_eq!(tours.collect::<Vec<_>>(), [4, 2, 4, 3, 4, 3, 3, 4, 4, 4]);
+    assert_eq!(tours.collect::<Vec<_>>(), [3, 4, 4, 3, 4, 4, 3, 3, 2, 3]);
     assert_eq!(lot.world().hash_hex(), IMPORTED_69);
     for _ in 0..1000 {
         lot.step().unwrap();
@@ -858,11 +865,16 @@ const TICK_31478: &str = "34cfca302c1a9b9392b3fcabee36deacdecca0f198df291215abad
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
 const TICK_31478_29: &str = "fc3480edf33f5a146bf2541956ee129cd0200203ae66069e6c763a6835b8f8ed";
-/// The imported House 69's state at entry (format 30). **Unverified**:
-/// no recording of this lot has been compared yet.
-const IMPORTED_69: &str = "a309c70283914b7e427884e86513548472cd3e29eecae8deb1f2efd9eb426059";
-/// The same after 1000 ticks. **Unverified**, as above.
-const IMPORTED_69_1000: &str = "f48028b595a25b17d31eeb80b14fe1ca96ee3a081948706a47efdf2cbbd4d044";
+/// The C runtime's draws the original's first open of UserData2 made
+/// before House 69's load, in track 2's second run: its import's and its
+/// pools'. The recording's entry state is state 1 after 405,850 draws, and
+/// the load makes the last 4,730. Not ported (6b E): an input until then.
+const OPEN_DRAWS: u32 = 401_120;
+/// The imported House 69's state at entry (format 30), which matches
+/// track 2's recording of it (`house69-ud2-ticks-20261120`).
+const IMPORTED_69: &str = "647c524ea5e613ef5d94a2398525f0f3004ce7921af4ba278ee704c321722f29";
+/// The same after 1000 ticks.
+const IMPORTED_69_1000: &str = "dc0cc436b4373bc1f2e4b0563195403e5dd2c2fcea44f78c7d0cfaf64a2fac9a";
 /// The same at tick 43200, a whole day from the load.
 const TICK_43200: &str = "d26a6a16a451728e40c9b6ada581665a4dfae60ddc7cd8ab306649e3eac14bb0";
 /// The same state's hash under snapshot format 29, which had no person

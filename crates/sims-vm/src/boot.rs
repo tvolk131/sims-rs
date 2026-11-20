@@ -17,6 +17,7 @@ pub mod save;
 use crate::play::Play;
 use crate::{Answers, Callback, Interpreter, Program, Stream, TickError, Update};
 use sims_content::{Animations, Catalog, House, Index, Install, Neighborhood, People, Surfaces};
+use sims_core::CrtRng;
 use sims_sim::World;
 use sims_sim::load::{Context, Household};
 use sims_sim::motives::Tuning;
@@ -412,11 +413,28 @@ impl Lot {
     /// the dialogs that offer a choice; a dialog with one button takes
     /// none. The frame before the first tick is not drawn yet; the first
     /// [`Lot::step`] draws it when `frames` asks for one.
+    ///
+    /// The game is taken to have just started: nothing has drawn from the
+    /// C runtime's generator, which is at state 1, as no recording has
+    /// seen it seeded. [`Lot::load_with`] takes it as earlier play left it.
     pub fn load(
         root: &Path,
         house: &Path,
         answers: &[u8],
         frames: Frames,
+    ) -> Result<Self, BootError> {
+        Self::load_with(root, house, answers, frames, CrtRng::from_state(1))
+    }
+
+    /// [`Lot::load`] with the C runtime's generator (`World::crt_rng`) as
+    /// the game left it before the load: after a neighborhood's first
+    /// open, for one, whose import and pools draw from it.
+    pub fn load_with(
+        root: &Path,
+        house: &Path,
+        answers: &[u8],
+        frames: Frames,
+        crt: CrtRng,
     ) -> Result<Self, BootError> {
         let install = Install::detect(root)?;
         let directory = house
@@ -473,6 +491,7 @@ impl Lot {
             program.character_files = crate::program::character_files(&index, characters);
         }
         let mut world = World::empty();
+        world.crt_rng = crt;
         let mut load = LoadReport::default();
         {
             let interpreter = Interpreter {
