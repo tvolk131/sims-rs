@@ -43,9 +43,10 @@ events, and what it asks for after them) come first.
    differences; the transient at 3350 is thought to come from a pointer-triggered
    pie listing (#258; the write was never captured). All three random
    streams match through update 4154 (#258). A replay with a frame
-   schedule fitted to the recording matches the lot's and the C
-   runtime's streams at sampled updates through 16111 and stops at
-   16112 on the Burn animator's fade-out (#264); the default strict
+   schedule fitted to the recording matches the lot's and the C runtime's streams at sampled updates
+   through 24715 (#264, #263, #273) and stops at update 24716, when
+   person 12 runs Go To Routing Slot after taking itself off the lot;
+   the default strict
    boot still runs all 43,200 ticks.
    Checking the rest against the recording is what remains. See
    Progress.
@@ -53,8 +54,8 @@ events, and what it asks for after them) come first.
    Goths do not reach (for example the Newbies and a family with
    children). Done (#221, #223, 2026-11-16): the Newbies, the Pleasants and the
    Roomies; all three were compared through update 1000 (the Newbies again on
-   #223's branch); the comparison has not been rerun since #258 and
-   #264 moved the strict pins. See Progress.
+   #223's branch); all three were compared again through 1000 after #258 and #264 moved
+   the strict pins (#273). See Progress.
 4. **Player orders.** Recordings of the original with the input track's
    scripted clicks and pie-menu choices, matched through
    `Interpreter::pie_menu`, `Interpreter::pick` and `Interpreter::order`.
@@ -66,27 +67,66 @@ events, and what it asks for after them) come first.
    Help System and is not ported. Also open: Make New Character's
    remaining modes and the failing modes of the ported primitives. See
    Progress.
-6. **One expansion-pack lot**, after steps 1 to 5. The plan (track 4,
-   2026-11-18): House 69 in the second neighborhood (Unleashed, the
-   Charming family: one adult and one dog). The neighborhood's pending
-   `Patch/` family files are imported into it first, which builds the people from templates and rewrites the houses' placeholder
-   GUIDs (the clone and GUID addresses and the capture status below are
-   track 4's notes and are not yet verified). 6a: boot House 69 in
-   strict mode from the original's imported files and compare it with
-   a 1000-tick recording. 6b: port the import. It cannot be checked
+6. **One expansion-pack lot**, after steps 1 to 5. The plan (track 4, 2026-11-18): House 69 (Unleashed, the
+   Charming family: one adult and one dog). The reference for the first
+   6a comparison is House 69 in the shipped `UserData`; the
+   fresh-import check uses House 69 in `UserData2`, whose pending
+   `Patch/` family files are imported first. The import builds the
+   people from templates and saves the exported GUIDs with a `Gtab`
+   mapping to the new ones, which the house loader applies (#259). 6a:
+   boot House 69 in strict mode and compare it with a 1000-tick
+   recording. 6b: port the import. It cannot be checked
    file for file: the import clones each person (0x4260e1) and gives
    them new GUIDs drawn from the clock and the C runtime's generator
    (0x4725d5). The check: boot strict mode from the original's imported files, and
    from neighborhood 2 plus our import fed the GUIDs the original drew,
    and compare the resulting states. A community lot
-   follows once travel is in. No recording of an expansion lot exists
-   yet. Track 2 has the import snapshot and the House 69 capture queued.
-   This plan is from track 4's survey of the install; it has no decision
-   file of its own yet. Done for 6b: the family-file (.FAM) reader
-   (#252; the original's per-file loader is 0x428f05 and its `Patch/`
-   directory lookup 0x42bd13; the
-   FAMh record fields' meanings are unverified).
-   Next: the `Patch/` import.
+   follows once travel is in. Track 2's UD1 House 69 recording (`house69-ud1-ticks-20261119`) is
+   the first comparison's reference. The plan's decision file is
+   `docs/decisions/20261118-expansion-lot-house-69.md`.
+   Done for 6a: the GUID table is read and applied, the first
+   neighborhood's Old Town homes load and House 69 boots in strict mode
+   (#259); clip dress and undress events take the run to 1000 strict
+   ticks with first-button answers (#261); the port marks the dog skeleton as read before the load, so House
+   69's entry C runtime stream matches, and the compared state agrees
+   through UD1 update 259 apart from two load differences (the 0x8000 frame-tree bit on four
+   objects and object 2's last result), global 12 at update 3 and the
+   dog's frame-arena word (#275); the original's exact read timing is
+   unverified. #276 extends the comparison to update 490, where
+   the capture ends, and its UD2 test boots House 69 from the
+   original's after-import snapshot and runs 1,000 ticks.
+   Done for 6b: the family-file (.FAM) reader (#252; the original's
+   per-file loader is 0x428f05 and its `Patch/` directory lookup
+   0x42bd13); the import's data step (#257); the shared `Gtab` reader,
+   translator and writer (#268); the standalone in-place IFF writer, covering reuse, splitting and
+   close-time compaction (#269; it has no production caller); #270
+   materializes all 28 mapped character IFFs; the outfit refresh (#274)
+   matches all 35 `STR# 200` rows for each character, allowing trailing
+   allocation residue; the outfit refresh and the in-memory import at
+   neighborhood open after house 0's reload (#272) both landed in
+   #268. Portrait rendering is open.
+   In the original, the first three houseless pools fill during
+   neighborhood setup after `Patch`; the other two fill from lot or
+   toolbar callbacks. Track 4's replay matches the pool members' GUID
+   low words and saved traits. Details are in the pools decision
+   (`docs/decisions/20261120-neighborhood-open-fills-five-pools.md`,
+   #276).
+   Decided 2026-11-20 (coordinator): 6a comes first; the pools follow
+   as 6b part E, which uses recorded inputs; exact files and looks are
+   deferred.
+   Next: 6a, record and compare UD1 House 69 through 1000, and move
+   the UD2 test to the fresh rerun's own after-import files, comparing
+   the entry C runtime and each update's lot state against that
+   recording;
+   6b, wire the import into boot and compare its strict state with a
+   boot from the original's imported files using the same GUIDs; then
+   6b part E.
+   **Unverified:** the FAMh record fields' meanings; how the original
+   handles a truncated `Gtab`; the pet modes of Make New Character
+   (BHAV 4113); the writer's compaction and replacement against a
+   native save; the records the reload makes in a template
+   neighborhood; the source of eight files in User00012–00047 with no
+   GUID mapping; when the scan reads the dog skeleton.
 
 ### Progress
 
@@ -108,8 +148,16 @@ events, and what it asks for after them) come first.
   a person within reach priority (#260). The replay still leaves the word at 0 until update 872:
   our bob passes about 26 pixels below the recording's parked pointer
   during the walk to the fridge, and where the original draws the bob
-  at 622 is unverified (it needs a recording with screenshots at updates 560 to 700). Next: replay the Sit/Read
-  and cancel (`goth-cancel-order-20261116`) recordings in the window.
+  at 622 is unverified (it needs a recording with screenshots at updates 560 to 700). The Sit order and the two-snack cancel order
+  (`goth-cancel-order-20261116`) are replayed in the window (#267):
+  for the fields compared, cancel matches through update 1300 apart
+  from two pointer listings, and Sit matches through 260 apart from
+  Bella's local at updates 203–227; both comparisons skip two unknown
+  salesman fields. Which button event triggered the second cancel is
+  open. Also open: what the pointer picks
+  differs in three ways (through a wall, under the still pointer after
+  a choice, and the salesman against the bookcase at Sit update 590);
+  track 1 is on it.
   **Unverified:** when the original draws frames before update 171, and
   which camera the original opens the Goths' house with.
   Track 2's harness now opens pie submenus such as Talk and picks
@@ -122,15 +170,17 @@ events, and what it asks for after them) come first.
   `goth-read-order-20261118`); replaying those two in the window is
   still to do, as are buy mode and work.
 - Step 3: three houses the Goths don't reach match their recordings through 1000 updates (the Newbies compared again through 1000 on
-  #223's branch; none of the three rerun since #258 and #264 moved
-  the strict pins), apart from the words the original left from
-  memory it never set: the Newbies (`House07.iff`,
-  `house07-ticks-20261115`, with global 12 at updates 1 and 3 also
-  differing, the interface's tutorial wait), the Pleasants (`House06.iff`,
+  #223's branch; #273 compared updates 1–1000 for all three after #258 and #264 moved
+  the strict pins: the Roomies match in every compared field, the
+  Newbies differ in global 12 at updates 1 and 3, and the Pleasants in
+  the known load-time fields and person 241's frame local at updates
+  669–928; the comparison excludes neighborhood records). The houses are the
+  Newbies (`House07.iff`, `house07-ticks-20261115`; global 12 there is
+  the interface's tutorial wait), the Pleasants (`House06.iff`,
   a family with children, #221) and the Roomies (`House10.iff`, two
   unrelated adults, #223: a tile with water is a room's tile only under
-  an object with flag 0x1000, 0x482301). **Unverified:** whether the
-  Roomies' recording reaches a water tile under an object with flag
+  an object with flag 0x1000, 0x482301). The earlier #221 and #223 comparisons also reported
+  unset native words. **Unverified:** whether the Roomies' recording reaches a water tile under an object with flag
   0x1000; it matches either way.
 - Step 5: Drop Onto (opcode 43, 0x44e96a, #212), Snap modes 0, 1 and 2
   (0x454a4b, 0x454a1d, 0x4549d1, #214) and Find Location For mode 5,
@@ -235,14 +285,19 @@ events, and what it asks for after them) come first.
   unverified. This changed every strict pin from tick 33 (#264). With
   these, all three random streams match the recording through update
   4154 (#258), and a replay with a frame schedule fitted to the
-  recording matches the lot's and the C runtime's streams at sampled
-  updates through 16111 (#264). The recording's frame timing drifts over the day and was not logged
+  recording matches the lot's and the C runtime's streams at sampled updates
+  through 24715 (#264, #273). The recording's frame timing drifts over the day and was not logged
   (`docs/decisions/20261118-goth-day-frame-schedule.md`); new
   comparison recordings should watch the draw guard (0x6f0f48). The
   global stream moves in bursts from 4155 to 4365 in the original only;
-  they are taken to be the censor mosaic over a showering person, drawn
-  in frames (0x4ac707 → 0x4ac301), so presentation rather than
-  simulation (unverified; a vm2 recording will check it). Each fix changed the run's path, and strict mode
+  they are the censor mosaic over a showering person, drawn in frames
+  (0x4ac707 → 0x4ac301), so presentation rather than simulation. The
+  vm2 recording `goth-rng-4155-20261118` settles it: its streams match
+  the day recording at all 6,760 updates, and its RNG watch caught 147
+  out-of-update draws from the mosaic in eight frames after updates
+  4154, 4184, …, 4364, with 0x4ac89e in the call chain. Its frame watch
+  separately recorded a draw frame after 5474. #273 and its boot test
+  still call the attribution unverified. Each fix changed the run's path, and strict mode
   goes through the whole day again on the new one (#244, #251). Among
   the ports this needed: the one-tile turn (0x433f75), the wall tests
   (0x476f5a), the second take-off refresh, the full reset on letting go
@@ -253,9 +308,14 @@ events, and what it asks for after them) come first.
   Create New Object Instance mode 3 (0x44e34c) (#251). At tick 17707 the
   neighbor controller offers a baby for adoption (a dialog of kind 1).
   The whole-day test answers No, so strict boots of the day use
-  `--answers 3,3`. Next: update 16112, where the fitted-frame replay stops on the Burn
-  animator's fade-out (0x592878, not ported; the default strict boot
-  runs all 43,200 ticks) (track 3), then keep
+  `--answers 3,3`. A reset person's playing clip is now removed at once (0x586b63,
+  #263), so the replay passes 16112; Generic Sims Call routine 6's family-removal effects are ported (its
+  Escape-key side effect in the original is unverified), and Remove
+  Object Instance saves a removed person into its word-31 record
+  (#273). Next: update 24716, where the fitted-frame replay stops when
+  person 12 runs Go To Routing Slot after taking itself off the lot;
+  the draw-dependent take-off refresh (0x58da12) is still open (the
+  default strict boot runs all 43,200 ticks) (track 3), then keep
   verifying the day against track 2's Goth day recording; checking the
   night needs more recording.
   `placement::on_lot` still uses a
@@ -2108,8 +2168,8 @@ Progress:
   bus). Eating and sleeping fall outside that span, and track 2's Goth
   day recording has no meal or sleep (below).
 - Done: the standard light shines from the viewer's side, and a room's
-  lamps light its people (0x4b4b04, #241). Not ported: the level's fade
-  over 250 ms, the 0.8 cap after dark and the full-light flag; the
+  lamps light its people (0x4b4b04, #241). Not ported: the level's fade over 250 ms and the full-light flag
+  (the 0.8 cap after dark is in since #266); the
   material colours are unread. A sprite's x and y offset move it on the
   screen, so a scooted chair sits under its Sim (0x437b7e, #248), and
   the eating pose matches the original with the chair scooted in.
@@ -2139,10 +2199,21 @@ Progress:
   fall at other times (ours has no 13:13 fire; chairs are scooted at
   ticks 14000 to 16000; a visitor eats at about
   14:40).
-- Next: a night-lighting check (the original's lot looks bright in its
-  12:24 AM screenshot and ours looked dark at 1:16 AM, so the times
-  differ and this is not yet a like-for-like comparison); compare a person behind furniture with the original;
-  the light level's fade and cap; compare Mortimer standing without his
+- Done: the lawn at night (#266). In the original's 12:24 AM
+  screenshot, 98.9% of the aligned pixels that are green in the
+  original are within eight levels. The 0.8 cap is implemented,
+  including for people. Not ported: expansion lots 28–29, 40–42,
+  46–48, 90–96 and 99 use other terrain presets, chosen by global 10
+  (0x4c4648), with other sun angles. **Unverified:** that the panels
+  have subscribed before the load's 0xdd goes out (the two daytime angles shade some slopes differently and render
+  identically on the Goth lot; if the native panels miss the load's 0xdd, a save
+  loaded after dark can keep the constructor's daytime angle until
+  dawn); the pool fixtures'
+  override at night; the 0.8 cap against a native screenshot of a room
+  brighter than 0.8.
+- Next: a few cut-wall trims near the stairs that still differ in the
+  night shot; compare a person behind furniture with the original;
+  the light level's fade; compare Mortimer standing without his
   book; the edge-on diagonal strip.
 - Done: a person's base layer is the simulation's (`World::base_layers`):
   the posture's loop or a script's clip, at the phase the simulation
@@ -2567,9 +2638,13 @@ through their public interfaces only; the simulation never depends on it.
   scripts' speed register follows the game's speed.
 - **Done: the lot's sounds.** Each step's sound requests
   (`Update::sounds`) go to the player as the window wakes: a door opens,
-  a book comes off the shelf, the fountain tinkles. `begin_route` and
-  `end_route` have no event in the install's sound files and play
-  nothing.
+  a book comes off the shelf, the fountain tinkles. `begin_route` and `end_route` have no event in the install's sound files and play nothing.
+  In #273's longer Goth sound run, the fountain started a new
+  track-1346 thread every 300 updates, reaching the 256-thread limit
+  around update 74,700; #273 capped the test at 43,200 updates. Track 6 found that the original refreshes the fountain's existing
+  track on replay; replaying a running track restarts it in place when
+  its group is enabled, it is free of a pause hold, and its `interrupt`
+  register is set; the port fix is on `audio/replay-running-track`.
 - **Done: the pie menu from the simulation's listing.** When the
   pointer first reaches an object or a person, the game lists the
   selected Sim's menu on it with `Lot::pie_menu`, which changes the lot
@@ -2627,11 +2702,12 @@ through their public interfaces only; the simulation never depends on it.
   second press on the selected Sim's portrait centres the view on her
   (0x434ced; the original's slide is left out). Both play `UI_click`.
   A Goth test switches to another Goth through the window and orders
-  her a snack from the fridge's pie. She takes it, and strict mode runs
-  through tick 509 (#233). At tick 455 Mortimer's route to a door
-  already used by one of his routes fails normally (0x45b176). At tick
-  510 the Traveling Salesman is reset mid-walk and the run stops on the
-  unported fade-out (0x592878). The switch still awaits a recording.
+  her a snack from the fridge's pie. She takes it (#233, whose test then ran through tick 509). At tick 455 Mortimer's route to a door
+  already used by one of his routes fails normally (0x45b176). At tick 510 the Traveling Salesman is reset mid-walk; the reset
+  removes his playing clip at once (0x586b63, #263), and the strict
+  test runs through tick 540. The switch is recorded in
+  `goth-switch-cancel-order-20261115`; comparing against that recording
+  is open.
 - Done: a click picks what the frame shows at the pixel
   (`Canvas::id_at`, `sims_game::pick`): the person shown there or
   nearest within two pixels, else the object shown there. A tile of a
