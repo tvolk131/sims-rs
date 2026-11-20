@@ -268,12 +268,13 @@ How the checks work (the addresses are in `input.py`):
   not known ahead; the logged pie names it.
 - **Confirming.** capture.py logs the chosen action at the pie menu's queue
   call (`0x48ddcb`) and reads the result and the assigned UID at its return
-  (`0x48ddd0`). `expect-queued` looks for that UID in the person's queue
-  (`+0x820`) and running action (`+0xa48`). A social such as a "Talk..."
-  choice can target a new interaction object and use a different routine
-  and menu. Its UID identifies it while queued or active. For ordinary
-  pushes whose UID cannot be read, the step compares the action fields.
-  `taken.where` is `queue` or `active`.
+  (`0x48ddd0`). `expect-queued` checks the first push on the requested
+  person after the choice. A refused push, an unreadable pushed action,
+  an unexpected target, or a UID that is zero or cannot be read fails
+  the step at once. The step looks for the assigned UID in the person's
+  queue (`+0x820`) and running action (`+0xa48`). The UID also identifies
+  a social whose target, routine, and menu changed. `taken.where` is
+  `queue` or `active`.
 - **Dialogs.** A modal dialog holds the update it shows in, so
   `answer-dialog` runs on the dialog stops. It presses once, like
   `answer.sh`. If the game misses the press, the step waits until the dialog
@@ -307,8 +308,12 @@ scenario cannot be resumed: `--scenario` with `--resume` is refused.
 falls in: `update` N with `in_update` false means the push came before lot
 update N, after update N-1 returned. Its `action` holds the caller, the
 target, the routine, the priority, the menu number, the arguments and the
-flags. The other rows log the steps, each guest command and when it ended,
-the hover readings and the pie menus.
+flags. Each `queued` or `queued_unread` row has a `push` ID, starting at 1
+and increasing for each push. The same ID appears on its `queue_result`
+row, even when several pushes occur in one update. Replay only `queued`
+rows whose matching `queue_result` has `accepted` set to true. The other
+rows log the steps, each guest command and when it ended, the hover
+readings and the pie menus.
 
 **Unverified.** The projection was checked only in the house's starting
 view (zoom 1, no rotation). Submenus and build mode are not driven yet;
