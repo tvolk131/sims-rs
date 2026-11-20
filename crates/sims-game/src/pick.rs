@@ -86,9 +86,10 @@ fn sprite(
 /// its height above the terrain under it (the mean of its tile's four
 /// corners): two floors' height or more is level 3, one or more level 2,
 /// anything lower level 1. Our depth gives a position only for a level
-/// taken, so each level is tried from the first, and the answer is the
-/// first whose position and height classify as that level; with none,
-/// the first level's classification.
+/// taken, so each level is tried, and the answer is the highest whose
+/// position and height classify as that level (only an upper floor's
+/// depth carries its level's offset). With none, it is the level the
+/// first level's position classifies as, at that level's position.
 fn place(world: &World, camera: &Camera, point: [i32; 2], depth: i32) -> ([i32; 2], i32) {
     let depths = Depth::new(camera);
     let floor = f64::from(camera.zoom.floor_height());
@@ -100,9 +101,16 @@ fn place(world: &World, camera: &Camera, point: [i32; 2], depth: i32) -> ([i32; 
         (fine, classify(above, floor))
     };
     (1..=3)
+        .rev()
         .map(|level| (level, on(level)))
         .find(|&(level, (_, classified))| level == classified)
-        .map_or_else(|| on(1), |(_, place)| place)
+        .map_or_else(
+            || {
+                let (_, level) = on(1);
+                (on(level).0, level)
+            },
+            |(_, place)| place,
+        )
 }
 
 /// The level of a point `above` pixels above the terrain, with floors

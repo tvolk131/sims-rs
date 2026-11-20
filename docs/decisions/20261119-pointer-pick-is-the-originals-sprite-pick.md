@@ -80,8 +80,11 @@ it into `sims_game::pick` and `Lot::sprite_pick` (sims-vm).
     it (the mean of its tile's corners): one floor's height or more is
     level 2, two is level 3, anything lower level 1. Our depth gives a
     position only for a level taken, so the pick tries levels 1, 2 and 3
-    and takes the first whose position and height classify as that
-    level (with none, level 1's classification).
+    and takes the highest whose position and height classify as that
+    level. With none, it takes the level that level 1's position
+    classifies as, at that level's own position. Where more than one
+    level fits, which the original's single 3D position would choose is
+    **unverified**.
   - The ground-plane fallback is flat: it leaves out the terrain, which
     the original's may not (**unverified** on a sloped lot).
   - Whether our unprojection agrees with the original's inverse matrix
