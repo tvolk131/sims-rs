@@ -293,7 +293,9 @@ impl Interpreter<'_> {
     /// that name no object.
     ///
     /// Nothing here writes a neighborhood record, a relationship or a
-    /// family: a person's record keeps what it held, and other objects'
+    /// family: a person's record keeps what it held (Remove Object
+    /// Instance saved it there when it queued the person,
+    /// `crate::people::save_to_record`), and other objects'
     /// relationships and frames that name the ID keep it. Neither does
     /// the deletion touch the rooms: the room a person was last seen in
     /// keeps its mark that a person is in it, which the next person to

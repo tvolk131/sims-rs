@@ -76,10 +76,18 @@ pub struct Lot {
     /// ([`sims_sim::rooms::Room::shown_light`]) times 255, as the original
     /// stores it for the room's tiles (0x46772d).
     pub room_lights: BTreeMap<i16, u8>,
+    /// The light each room shows, by ID ([`room_fraction`]), as the
+    /// original passes it to the drawing context for a wall face or the
+    /// cap at a wall's exposed end (0x4688bf, 0x53dc78, 0x53c9d3).
+    pub room_fractions: BTreeMap<i16, f32>,
     /// The light room 0, the outdoors, shows ([`room_fraction`]), as the
     /// original reads it for the wall-top trim (0x53dbcd); None without a
     /// room 0.
     pub outdoor_light: Option<f32>,
+    /// The time of day (global 4: 0 day, 1 dusk, 2 night, 3 dawn). It
+    /// sets the brightest a lit tile is drawn ([`Lot::brightest`]) and
+    /// where the sun stands over the grass ([`crate::grass`]).
+    pub time_of_day: i16,
     /// The two triangles of each tile a diagonal wall splits, by level (1
     /// or 2), column and row: which triangle (by the corner it holds: 1
     /// south-west, 2 south-east, 3 north-east, 4 north-west) and its room.
@@ -216,6 +224,12 @@ impl Lot {
             .iter()
             .map(|(&id, r)| (id, room_light(r)))
             .collect();
+        let room_fractions = world
+            .rooms
+            .rooms
+            .iter()
+            .map(|(&id, r)| (id, room_fraction(r)))
+            .collect();
         let outdoor_light = world.rooms.rooms.get(&0).map(room_fraction);
         let halves = world
             .rooms
@@ -232,7 +246,9 @@ impl Lot {
             levels,
             outdoor_rooms,
             room_lights,
+            room_fractions,
             outdoor_light,
+            time_of_day: world.globals.get(4).copied().unwrap_or(0),
             halves,
             lamps,
         })
@@ -302,12 +318,32 @@ impl Lot {
         (room >= 0).then_some(room)
     }
 
+    /// The brightest a lit tile is drawn at this time of day
+    /// ([`crate::light::brightest`]).
+    pub fn brightest(&self) -> f32 {
+        crate::light::brightest(self.time_of_day)
+    }
+
     /// The light byte at a fine position on a level (0 or 1): its room's
     /// light. Off the lot and outside every room it is full light.
     pub fn light_at(&self, level: usize, fine: [i32; 2]) -> u8 {
+        self.room_light_at(level, fine).unwrap_or(255)
+    }
+
+    /// The light byte of the room at a fine position on a level (0 or 1),
+    /// or None off the lot, outside every room, or for a room without a
+    /// light.
+    pub fn room_light_at(&self, level: usize, fine: [i32; 2]) -> Option<u8> {
         self.room_at(level, fine)
             .and_then(|room| self.room_lights.get(&room).copied())
-            .unwrap_or(255)
+    }
+
+    /// The light the room at a fine position on a level (0 or 1) shows,
+    /// as a fraction ([`room_fraction`]), or None off the lot or outside
+    /// every room.
+    pub fn room_fraction_at(&self, level: usize, fine: [i32; 2]) -> Option<f32> {
+        self.room_at(level, fine)
+            .and_then(|room| self.room_fractions.get(&room).copied())
     }
 }
 
