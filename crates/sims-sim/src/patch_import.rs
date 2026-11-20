@@ -62,7 +62,7 @@ pub struct Context<'a> {
     /// Each lot's zoning ([`Neighborhood::zoning`]).
     pub zoning: BTreeMap<i16, i32>,
     /// The lots of `LotZoning.iff`'s rows, in order ([`Neighborhood::lot_rows`]).
-    pub lots: Vec<i16>,
+    pub lots: Vec<i32>,
     /// The installed-expansions mask (`[0x6e48bc]+0x66`).
     pub expansions: u8,
     /// The game's one-based language code.
@@ -101,26 +101,28 @@ pub fn open(
         ..Opened::default()
     };
     rebuild_family_words(neighborhood)?;
-    // The view's set-up (0x55693b) asks after each lot, in the rows'
-    // order, up to the first above 80 (0x5570e4 to 0x55723a, 0x557125).
-    for &lot in &context.lots {
-        if lot > LAST_VIEW_LOT {
-            break;
+    // The view's set-up asks after lots (0x4e1d8e) whose house file
+    // opens (0x4e1e04). Unleashed's view (0x4f5b42, 0x55693b) takes the
+    // rows' lots in order, up to the first above 80 as a signed double
+    // word (0x5570e4 to 0x55723a, 0x557125); the other view (0x55ec9c),
+    // lots 1 to 10 (0x55ecf8, 0x55ed9f).
+    let view: Vec<i32> = if context.expansions & PETS != 0 {
+        context
+            .lots
+            .iter()
+            .copied()
+            .take_while(|&lot| lot <= LAST_VIEW_LOT)
+            .collect()
+    } else {
+        (1..=10).collect()
+    };
+    for lot in view {
+        let opens = u32::try_from(lot).is_ok_and(|house| context.house_files.contains(&house));
+        if opens {
+            ask_after(neighborhood, lot)?;
         }
-        ask_after(neighborhood, lot)?;
     }
-    // 0x42c1d5: Unleashed's bit, then the option byte.
-    if context.expansions & PETS == 0 {
-        return Ok(opened);
-    }
-    let options = neighborhood.options.as_mut().ok_or_else(|| {
-        LoadError::Neighborhood(
-            "the neighborhood file has no NGBH #1, so whether an import is pending is the \
-             constructor's (0x4244bc), which is not ported"
-                .into(),
-        )
-    })?;
-    if !options[PENDING_IMPORT] {
+    if !pending(neighborhood, context.expansions)? {
         return Ok(opened);
     }
 
@@ -150,6 +152,7 @@ pub fn open(
     let mut character_guids = context.character_guids.clone();
     let mut next_file = 0; // the reload's (0x424e8e)
     for patch in patches {
+        preview(neighborhood, patch)?;
         let input = ImportInput {
             catalog: context.catalog,
             neighbors: &neighborhood.neighbors,
@@ -169,8 +172,9 @@ pub fn open(
         rebuild_family_words(neighborhood)?; // 0x429873 → 0x425244
         // After its save, the import asks after the family's new lot
         // (0x429a97, 0x429ac9); a houseless family has none.
+        // Its house file is the family's, renamed just before (0x429a82).
         if let Some(lot) = &import.lot {
-            let lot = i16::try_from(lot.house).map_err(|_| {
+            let lot = i32::try_from(lot.house).map_err(|_| {
                 LoadError::Neighborhood(format!("house {} does not fit a lot number", lot.house))
             })?;
             ask_after(neighborhood, lot)?;
@@ -187,8 +191,49 @@ pub fn open(
     Ok(opened)
 }
 
+/// Whether opening `neighborhood` imports its `Patch` files (0x42c1d5):
+/// Unleashed's bit in `expansions`, then the pending option byte.
+pub fn pending(neighborhood: &Neighborhood, expansions: u8) -> Result<bool, LoadError> {
+    if expansions & PETS == 0 {
+        return Ok(false);
+    }
+    let options = neighborhood.options.as_ref().ok_or_else(|| {
+        LoadError::Neighborhood(
+            "the neighborhood file has no NGBH #1, so whether an import is pending is the \
+             constructor's (0x4244bc), which is not ported"
+                .into(),
+        )
+    })?;
+    Ok(options[PENDING_IMPORT])
+}
+
+/// The scan shows each file's family before importing it (0x42bfca to
+/// 0x4e29f5), which asks after its members' GUIDs among the
+/// neighborhood's records (0x4e2a99 to 0x4e1b2b) and gets an inventory
+/// for each it finds (0x410282). That is not ported: a member GUID that
+/// some record has fails. Records only grow during the import, so the
+/// check before each import covers a preview run before all of them too.
+fn preview(neighborhood: &Neighborhood, patch: &Patch) -> Result<(), LoadError> {
+    for &guid in &patch.file.family.members {
+        if guid != 0
+            && neighborhood
+                .neighbors
+                .iter()
+                .flatten()
+                .any(|record| record.guid == guid)
+        {
+            return Err(LoadError::Neighborhood(format!(
+                "{}: member GUID {guid:#010x} has a record, so the preview (0x4e2a99) would \
+                 get it an inventory, which is not ported",
+                patch.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The last lot the view's set-up asks after (0x557125).
-const LAST_VIEW_LOT: i16 = 80;
+const LAST_VIEW_LOT: i32 = 80;
 
 /// Asks after a lot as the neighborhood view does (0x4e1d8e): the family
 /// living there, the first in the family vector whose house (+0x110) or
@@ -203,28 +248,34 @@ const LAST_VIEW_LOT: i16 = 80;
 ///   families' order (0x425209), which is not kept.
 /// - An empty slot in the inventory vector fails: the search (0x42a8cb)
 ///   would read through its null pointer.
-/// - The lot information's own read (0x4e1d8e) is taken to succeed; its
-///   failure branches are not traced.
-fn ask_after(neighborhood: &mut Neighborhood, lot: i16) -> Result<(), LoadError> {
+/// - The caller checks that the lot's house file opens (0x4e1e04). Its
+///   lot information's read (0x4e261f), whose failure would skip the
+///   family, is taken to succeed.
+/// - A member whose GUID is 0 has no record (0x425723).
+fn ask_after(neighborhood: &mut Neighborhood, lot: i32) -> Result<(), LoadError> {
     if lot <= 0 {
         return Ok(());
     }
-    let lot = i32::from(lot);
-    let mut living = neighborhood
-        .families
-        .iter()
-        .filter(|(_, family)| family.house == lot || second_house(family) == Some(lot));
-    let Some((&id, family)) = living.next() else {
+    let mut living = Vec::new();
+    for (&id, family) in &neighborhood.families {
+        if family.house == lot || second_house(family)? == Some(lot) {
+            living.push(id);
+        }
+    }
+    let [id, ..] = living[..] else {
         return Ok(());
     };
-    if let Some((other, _)) = living.next() {
+    if let Some(other) = living.get(1) {
         return Err(LoadError::Neighborhood(format!(
             "families {id} and {other} both live on lot {lot}; which the view asks after \
              depends on the families' order (0x425209), which is not kept"
         )));
     }
-    let members = family.members.clone();
+    let members = neighborhood.families[&id].members.clone();
     for guid in members {
+        if guid == 0 {
+            continue;
+        }
         let Some(record) = neighborhood
             .neighbors
             .iter()
@@ -258,13 +309,24 @@ fn ask_after(neighborhood: &mut Neighborhood, lot: i16) -> Result<(), LoadError>
     Ok(())
 }
 
-/// A family's second house (+0x13c), which FAMI saves from version 8.
-fn second_house(family: &Family) -> Option<i32> {
+/// A family's second house (+0x13c), which FAMI saves from version 8. A
+/// shorter tail fails, as the reader (0x4104ce) rejects it.
+fn second_house(family: &Family) -> Result<Option<i32>, LoadError> {
     if family.version < 8 {
-        return None;
+        return Ok(None);
     }
-    let bytes = family.tail.get(..4)?;
-    Some(i32::from_le_bytes(bytes.try_into().ok()?))
+    let bytes: [u8; 4] = family
+        .tail
+        .get(..4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| {
+            LoadError::Neighborhood(
+                "a family of version 8 or later without its second house, which the reader \
+                 (0x4104ce) rejects"
+                    .into(),
+            )
+        })?;
+    Ok(Some(i32::from_le_bytes(bytes)))
 }
 
 /// House 0's reload (0x424806), on the file's records and families, as

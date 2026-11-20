@@ -6,8 +6,8 @@
 //! folder. Each made person type becomes `Characters/User%05d.iff`
 //! (0x4722b8, then the import's resource edits and the outfit refresh,
 //! 0x4293ae to 0x4295f7). A housed family's `*.FAM` file, with its GUID
-//! table (Gtab #1) rewritten in place (0x429754), becomes its
-//! `HouseNN.iff`. Here those files go into `output`, which the caller
+//! table (Gtab #1) rewritten in place (pairs appended at 0x429754, the
+//! write from 0x4297f7), becomes its `HouseNN.iff`. Here those files go into `output`, which the caller
 //! makes as a copy of the neighborhood; the neighborhood's own folder is
 //! not touched.
 //!
@@ -26,15 +26,16 @@ use sims_formats::family_file::FamilyFile;
 use sims_formats::iff::{Iff, write};
 use sims_formats::iff_write::{ChunkWrite, write_chunk_with_residue};
 use sims_sim::neighbors::registry;
-use sims_sim::patch_import::{Context, Opened, Patch, open};
+use sims_sim::patch_import::{Context, Opened, Patch, open, pending};
 use std::path::Path;
 
 /// The context the import runs in: the complete collection's
 /// expansions and the game's language (1, English).
 const LANGUAGE: u8 = 1;
 
-/// The converted bit of a resource's flags. The original's House56, 63,
-/// 69, 76 and 77 after its UserData2 import all carry it on Gtab #1.
+/// The flags word the resource writer gives a resource it marks converted
+/// (0x419f80; otherwise 0, 0x419f88). The original's House56, 63, 69, 76
+/// and 77 after its UserData2 import all carry it on Gtab #1.
 const CONVERTED: u16 = 0x10;
 
 /// The bytes written where the original leaves its heap's, when no
@@ -90,8 +91,14 @@ pub fn open_neighborhood(
         expansions: install.expansions.0,
         language: LANGUAGE,
     };
+    // The scan reads the files only when an import is pending (0x42c1d5).
     let mut patches = Vec::new();
-    for path in neighborhood.patches()? {
+    let scanned = if pending(&neighborhood, install.expansions.0)? {
+        neighborhood.patches()?
+    } else {
+        Vec::new()
+    };
+    for path in scanned {
         let name = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -107,6 +114,10 @@ pub fn open_neighborhood(
     }
     let opened = open(&mut neighborhood, &patches, &context, new_guid)?;
 
+    if opened.imports.is_empty() {
+        neighborhood.directory = output.to_path_buf();
+        return Ok((neighborhood, opened));
+    }
     let wardrobe = ImportWardrobe::load(&install)?;
     for (name, import) in &opened.imports {
         let patch = patches
@@ -140,7 +151,7 @@ pub fn open_neighborhood(
                 ChunkWrite {
                     tag: *b"Gtab",
                     id: 1,
-                    flags: table.flags | CONVERTED,
+                    flags: CONVERTED,
                     label: table.label.as_bytes(),
                     payload: &table.data,
                 },

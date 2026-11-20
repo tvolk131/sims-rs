@@ -146,14 +146,14 @@ impl Neighborhood {
 
     /// The lots of the neighborhood's `LotZoning.iff` rows, in the file's
     /// order: the lot vector the reload builds (neighborhood +0x174,
-    /// 0x424eec to 0x425064), which the view walks. A row whose lot does
-    /// not fit a word is left out, as [`Neighborhood::zoning`] leaves it.
-    pub fn lot_rows(&self) -> Result<Vec<i16>> {
+    /// 0x424eec to 0x425064), which the view walks, comparing each lot as a
+    /// signed double word (0x557125).
+    pub fn lot_rows(&self) -> Result<Vec<i32>> {
         Ok(self
             .zoning_rows()?
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|(lot, _)| i16::try_from(lot).ok())
+            .map(|(lot, _)| lot)
             .collect())
     }
 
