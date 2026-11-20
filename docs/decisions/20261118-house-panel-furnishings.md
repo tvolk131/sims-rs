@@ -53,9 +53,10 @@ No screenshot of the panel was compared.
   the simulation, not the original's behaviour; it is the simulation's
   to close, with these sums.
 - **Not ported in `sims-vm`'s linker** (`Program`), which the day's
-  turn values objects by: it reads every `STR#` and `OBJD` chunk of a
-  file, keyed by ID alone, where the original looks each up by ID and
-  flags' high byte 0 (0x41bab1; 0x43ba7b). So a `STR#` of another high
+  turn values objects by: it parses every `STR#` chunk of a file in
+  file order and reads its `OBJD` chunks in resource order, each keyed
+  by ID alone, where the original looks each up by ID and flags' high
+  byte 0 (0x41bab1; 0x43ba7b). So a `STR#` of another high
   byte that does not parse stops the boot, and a later `OBJD` of
   another high byte replaces the definition of high byte 0. No such
   chunk is in the install (3,782 files, FAR members included). Its
@@ -63,6 +64,15 @@ No screenshot of the panel was compared.
   word 16 set, which the original does not register (0x43baba); the
   install has one such master. Both are the simulation's to close; the
   panel's own sums here follow the original.
+- **Not ported in the shared catalog** (`sims_content::Catalog`), which
+  gives the scan each object's file and definition: it registers
+  definitions of any flags' high byte and those with word 16 set, where
+  the original registers only an ID's definition of high byte 0
+  (0x43ba7b) and passes over one with word 16 set (0x43baba to
+  0x43badb). So a later such definition sharing a GUID could stand for
+  an earlier one here. The install's seven definitions with word 16 set
+  share no GUID with another, and none has another high byte. It is the
+  catalog's to close.
 - **The objects** (0x444cb9), in the lot's order, in 32-bit sums that
   wrap:
   - A tile of a multi-tile group that is not its lead, and a type with
