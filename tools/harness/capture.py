@@ -65,7 +65,9 @@ late watch's watch_ended event says whether it was ever set, by this run or
 one it took over (set false: no write in its updates was seen). The lot
 update's entry is a breakpoint for a late watch only while it is set or
 waits to be set in its updates (one whose address cannot be worked out yet
-is tried again there); the baseline, --watch and a due --dump arm it too.
+is tried again there); the baseline, --watch, --scenario and a due --dump
+arm it too. A late watch is set (or moved) only at a stop on the lot
+captured.
 So a late watch on a busy address (the random state) costs nothing while
 the load and the other updates run.
 
@@ -728,8 +730,10 @@ def main():
         except MemoryError:
             return None
 
-    def arm_watches(m):
+    def arm_watches(m, here):
         for w in list(pending):
+            if not here and w in args.late_watch:
+                continue
             found = locate(w, m)
             if found is None:
                 continue
@@ -738,15 +742,15 @@ def main():
             w.set = True
             live_watches.append(w)
             pending.remove(w)
-            event(kind='watch_armed', name=w.name, expr=w.text, late=w in args.late_watch, address=w.address,
-                  value=w.value, update=updates)
+            event(kind='watch_armed', name=w.name, expr=w.text, late=w in args.late_watch, lot=args.lot,
+                  address=w.address, value=w.value, update=updates)
 
-    def check_watches(m):
+    def check_watches(m, here):
         """At a stop in the game, work out the moving watches again: move a
         watchpoint whose address changed, and put one that cannot be worked
-        out (or read) back to wait."""
+        out (or read) back to wait. A late watch only at a stop on this lot."""
         for w in list(live_watches):
-            if not w.moves:
+            if not w.moves or (not here and w in args.late_watch):
                 continue
             found = locate(w, m)
             if found is not None and found[0] == w.address:
@@ -837,12 +841,13 @@ def main():
         # A late watch an earlier run set counts as set (watch_ended's set covers its whole window).
         # Its event has its name and its whole text (with the updates); a --watch given the same
         # text has the updates in its name. Earlier revisions wrote no `late`.
-        # Only an arming after the baseline (on this lot) within its updates counts: it is set at
-        # the end of update first - 1 at the earliest.
+        # Only an arming on this lot after the baseline within its updates counts: it is set at
+        # the end of update first - 1 at the earliest. Earlier revisions did not record the lot.
         since = rows[next(i for i, r in enumerate(rows) if r['kind'] == 'baseline'):]
         for w in late:
             w.set = any(r['kind'] == 'watch_armed' and r.get('late', True) and r.get('name') == w.name
-                        and r.get('expr') == w.text and r.get('update', -1) + 1 >= w.first
+                        and r.get('expr') == w.text and r.get('lot', args.lot) == args.lot
+                        and r.get('update', -1) + 1 >= w.first
                         and (w.last is None or r['update'] + 1 <= w.last) for r in since)
         # A dialog shown since the last recorded return, and the dialogs still waiting for a result.
         dialog_pending = any(r['kind'] == 'dialog_show' and r['update'] > updates for r in rows)
@@ -876,10 +881,18 @@ def main():
             event(kind='watch_ended', name=w.name, expr=w.text, update=updates, set=w.set)
         if ended and not (live_watches or pending or args.watch or runner or updates + 1 in dump_set):
             disarm(ENTRY)
-        if not foreign and live_watches:
-            check_watches(m)
-        if not foreign and pending:
-            arm_watches(m)
+        if foreign or not (live_watches or pending):
+            return
+        # A late watch is set or moved only at a stop on this lot: another lot's objects are not
+        # this lot's, and one set there would count as set when the run is taken over.
+        try:
+            here = m.lot() == args.lot
+        except MemoryError:
+            here = False
+        if live_watches:
+            check_watches(m, here)
+        if pending:
+            arm_watches(m, here)
 
     try:
         reply = remote.stop_reply()

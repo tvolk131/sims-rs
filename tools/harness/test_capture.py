@@ -100,7 +100,7 @@ class FakeMemory:
         self.remote = remote
 
     def lot(self):
-        return 5
+        return self.remote.current.get('lot', 5)
 
     def word(self, p):
         words = {0x20000 + 0xb0: 0x30000, 0x30000 + 0x18: 0x40000, 0x30000 + 0x1c: 0x40004, 0x40000: 0x50000,
@@ -335,23 +335,49 @@ class CaptureTest(unittest.TestCase):
             self.assertEqual([(r['update'], r['set']) for r in ended], [(2, True)], old)
 
     def test_only_an_arming_on_the_lot_within_its_updates_counts_on_resume(self):
-        # Before the baseline (another lot), with another text under the
-        # same name, and outside the watch's updates: none counts.
-        def prepare(output):
-            armed = lambda expr, update: dict(kind='watch_armed', name='state', expr=expr, late=True,
-                                              address=0x70088, value=0, update=update)
-            (output / 'events.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in [
-                armed('2-2,state=0x70088', 1),
-                dict(kind='baseline', cr3=GAME_CR3),
-                armed('3-3,state=object:5', 2),
-                armed('2-2,state=0x70088', 5)]))
-            (output / 'updates.jsonl').write_text(
-                json.dumps(dict(update=1, tick=99, lot_rng=0, global_rng=0, crt=0, scheduler_cursor=0)) + '\n')
-        remote, output, _ = self.run_capture(
-            [dict(pc=0x123456, cr3=OTHER_CR3), dict(pc=capture.RETURN)],
-            ['--updates', '2', '--resume', '--late-watch', '2-2,state=0x70088'], prepare=prepare)
-        ended = self.events(output, 'watch_ended')
-        self.assertEqual([(r['update'], r['set']) for r in ended], [(2, False)])
+        # Each alone would count but for one test: before the baseline
+        # (another lot), with another text under the same name, below and
+        # above the watch's updates, not a late watch, and on another lot.
+        armed = lambda expr, update, **more: dict(dict(kind='watch_armed', name='state', expr=expr, late=True,
+                                                       address=0x70088, value=0, update=update), **more)
+        cases = [
+            [armed('2-2,state=0x70088', 1), dict(kind='baseline', cr3=GAME_CR3)],
+            [dict(kind='baseline', cr3=GAME_CR3), armed('3-3,state=object:5', 1)],
+            [dict(kind='baseline', cr3=GAME_CR3), armed('2-2,state=0x70088', 0)],
+            [dict(kind='baseline', cr3=GAME_CR3), armed('2-2,state=0x70088', 2)],
+            [dict(kind='baseline', cr3=GAME_CR3), armed('2-2,state=0x70088', 1, late=False)],
+            [dict(kind='baseline', cr3=GAME_CR3), armed('2-2,state=0x70088', 1, lot=7)],
+            # And one that counts.
+            [dict(kind='baseline', cr3=GAME_CR3), armed('2-2,state=0x70088', 1, lot=5)],
+        ]
+        for n, rows in enumerate(cases):
+            def prepare(output):
+                (output / 'events.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
+                (output / 'updates.jsonl').write_text(
+                    json.dumps(dict(update=1, tick=99, lot_rng=0, global_rng=0, crt=0, scheduler_cursor=0)) + '\n')
+            remote, output, _ = self.run_capture(
+                [dict(pc=0x123456, cr3=OTHER_CR3), dict(pc=capture.RETURN)],
+                ['--updates', '2', '--resume', '--late-watch', '2-2,state=0x70088'], prepare=prepare)
+            ended = self.events(output, 'watch_ended')
+            self.assertEqual([(r['update'], r['set']) for r in ended], [(2, n == len(cases) - 1)], n)
+
+    def test_a_late_watch_is_set_only_at_a_stop_on_the_lot(self):
+        # Taken over after update 1: stops on lot 7 (an entry and a return
+        # there) set nothing; update 2's return on lot 5 ends the watch. Then
+        # the same stops on lot 5 set it.
+        for lot, expected in ((7, False), (5, True)):
+            def prepare(output):
+                (output / 'events.jsonl').write_text(json.dumps(dict(kind='baseline', cr3=GAME_CR3)) + '\n')
+                (output / 'updates.jsonl').write_text(
+                    json.dumps(dict(update=1, tick=99, lot_rng=0, global_rng=0, crt=0, scheduler_cursor=0)) + '\n')
+            remote, output, _ = self.run_capture(
+                [dict(pc=capture.ENTRY, lot=lot), dict(pc=capture.RETURN, lot=7), dict(pc=capture.RETURN)],
+                ['--updates', '2', '--resume', '--late-watch', '2-2,state=0x70088'], prepare=prepare)
+            self.assertEqual(bool(remote.watch_calls), expected, lot)
+            armed = self.events(output, 'watch_armed')
+            self.assertEqual([r['lot'] for r in armed], [5] if expected else [], lot)
+            ended = self.events(output, 'watch_ended')
+            self.assertEqual([(r['update'], r['set']) for r in ended], [(2, expected)], lot)
 
     def test_an_ordinary_watch_armed_before_is_not_a_late_watch_set(self):
         # Given as --watch with the same text, it was armed by the earlier run.
