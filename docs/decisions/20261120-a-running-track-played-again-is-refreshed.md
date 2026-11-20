@@ -13,10 +13,15 @@ number, and a start of a running one does not start a second voice.
 
 - The original keeps one track object per track number (looked up at
   0x573312). Kind 1 (0x5736ee) calls the object's start (vtable +0x30,
-  0x57d960), then sets its volume and pan (+0x40, +0x48), then lets it go
-  (+0x5c). `play_trk` (0x57f1f2) calls +0x2c (0x57dc0d), which is the start
-  followed by the let-go.
-- Every start begins the same way (0x57d9b2 to 0x57d9eb). It clears
+  0x57d960). For a track whose arguments are `kArgsIdVolPan` only, it then
+  sets the volume and pan (+0x40, +0x48; 0x573756, 0x5737b3). It always
+  lets the track go after (+0x5c). `play_trk` (0x57f1f2) calls +0x2c
+  (0x57dc0d), which is the start followed by the let-go. The piano's
+  starts and the music modes' starts use +0x2c too (piano 0x573e95,
+  0x573ef2; music 0x57523f, 0x5752a4, 0x57540e, 0x575501, 0x5755f1).
+- When the track's group is off (manager lookup 0x57bde7, its +0xc0 is 0),
+  the start returns before anything else (0x57d969 to 0x57d9a5).
+- Every other start begins the same way (0x57d9b2 to 0x57d9eb). It clears
   `fade_on` (+0xa8) and the flag that ends the track when its fade ends
   (+0x1cf). It points `target` back at the track (0x57d9c3) and writes the
   arguments to registers 1 to 3.
@@ -25,14 +30,27 @@ number, and a start of a running one does not start a second voice.
 - If the track is running and not held, the start reads register 55,
   `interrupt` (0x57da26 to 0x57da34):
   - 0 returns, so the script goes on where it was.
-  - Any other value takes the fresh-start path. That path resets the
-    registers from the default banks, sets the patch through 0x57f625, and
-    0x57f625 destroys the track's voice (0x57f657 to 0x57f676), so the note
-    is cut. The script then plays from the top.
+  - Any other value takes the fresh-start path on the same track object.
+    That path resets registers 17 to 47 and 50 to 62 from their defaults
+    (0x57d727 to 0x57d741); registers 1 to 16, 48 and 49 and the return
+    stack (+0x1a8) are kept. It sets the program counter and the loop
+    point to the entry (0x57db8b, 0x57db91) and resets the hit list
+    (0x57db85 to 0x57dba7). It sets the patch through 0x57f625, which
+    destroys the track's voice (0x57f657 to 0x57f676), so the note is cut.
+    It sets the deadline to now, `isplaying` to 1 (0x57dbc5) and running
+    to 1 (0x57dbcf). Anything pointing `target` at the track still
+    reaches it.
 - Letting a track go (+0x5c, 0x57dc63) moves its wait deadline to now
-  (0x57dc8e), so a running `wait` ends at the next update.
-- Only `loadb` writes `interrupt`. In the install, 99 of the 4,306 tracks
-  write it.
+  (0x57dc8e), so a running `wait` ends at the next update. Kind 30 lets go
+  only when the sound is not paused (0x573d71).
+- `play_trk` reads `source` (register 47) after the start (0x57f256), so a
+  track that starts itself hands on its own `source`: the start has pointed
+  its `target` back at itself.
+- The update loop takes a snapshot of the running tracks before it runs
+  them (0x57cf8f to 0x57cfda). A track ended or started during the update
+  does not move another out of its turn.
+- In the install only `loadb` writes `interrupt`: 99 of the 4,306 tracks.
+  `set` can write it too (0x57e219 to 0x57e2da).
 - The fountain's track 1346 is `note_on; wait_samp; loop`. It never sets
   `interrupt`, so the original ignores every play after the first: it only
   refreshes the arguments and places the track again.
@@ -50,18 +68,27 @@ number, and a start of a running one does not start a second voice.
 ## What changes here
 
 - A track runs one thread at most. `Player::start` refreshes a running
-  track's threads (`set_arguments` now clears the fade too) and starts no
-  new one unless `interrupt` is set. In that case it ends the track,
-  cutting its notes, and starts it fresh.
+  track's thread (`set_arguments` now clears the fade too) and starts no
+  new one unless `interrupt` is set.
+- With `interrupt` set, `Player::restart` starts the same thread anew, in
+  place. It keeps its id, so `target`s that point at it still reach it.
+  It resets only the default banks (registers 17 to 47 and 50 to 62,
+  `BANKS`), keeping registers 1 to 16, 48 and 49 and the return stack. It
+  sets the program counter and loop point to the entry, clears the hit
+  list, and cuts the track's notes.
 - Its callers let the threads go (`Player::let_go`) as the original does:
-  - kind 1, `play_trk` and the piano always;
+  - kind 1, `play_trk`, the piano and the music modes always;
   - kind 30 only when the sound is not paused.
 - Kind 30 now holds a track during a pause only when the start was fresh.
 - A fresh start stops the note that kind 53 played on the idle track
   (0x57f625).
 - When `play_trk` starts the track that is running it, the start acts on
-  that running thread. A fresh start there ends the thread, and the new
-  thread runs in the next block.
+  that running thread. A restart there runs it from the top in the next
+  block.
+- `play_trk` reads `source` after the start.
+- `Player::run` takes the list of threads at the start of a block and runs
+  them by id, so a thread ended or restarted during the block does not
+  make another skip its turn.
 - An object going leaves a track that others still have playing, placed
   again by the camera move's per-track placement, now
   `Player::place_track`. Before, that object's own thread faded out.
@@ -70,6 +97,8 @@ number, and a start of a running one does not start a second voice.
 
 ## Not ported, and unverified
 
+- The group-off return (0x57d969 to 0x57d9a5). This player has no group
+  that can be off.
 - The original's run loop (0x57d8b3) runs instructions while the wait
   deadline is set and past. The fade-out-and-kill does not move the
   deadline. So, by the code, a script that ends with its note still playing
@@ -77,14 +106,15 @@ number, and a start of a running one does not start a second voice.
   thread ends and the note plays on.
   - The track then counts as not running, and a later start makes a new
     thread beside the note.
-  - In the original, the track is still running, and a start would only
-    refresh it.
+  - In the original, the track is still running. A start during the fade
+    still reads `interrupt`, and clears the fade.
+  - The new thread here starts with registers 1 to 16, 48 and 49 at their
+    defaults. The original's track object would keep them from the run
+    before. This is **unverified**.
   - Not ported. Whether the original really runs past `end` is
     **unverified** at run time.
-- Ducking on a restart is **unverified**. The ended thread's
-  `main_duckpri` request goes when it ends. The original's one track
-  object may keep its request across the restart.
-- `play_trk` restarting the track that runs it is a guess, marked
-  **unverified**. The original goes on from the top within the same update.
-  Here the new thread waits for the next block, as every thread `play_trk`
-  starts does.
+- Ducking on a restart is **unverified**. The original's one track object
+  may keep its `main_duckpri` request across the restart.
+- `play_trk` restarting the track that runs it is **unverified** in its
+  timing. The original goes on from the top within the same update. Here
+  the restarted thread runs from the top in the next block.

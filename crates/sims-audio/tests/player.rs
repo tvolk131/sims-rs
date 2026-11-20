@@ -481,10 +481,10 @@ fn starting_a_held_track_gives_its_script_the_new_arguments_and_ends_its_wait() 
 #[test]
 fn starting_a_held_track_needs_no_free_thread() {
     let routine = waits_a_second();
-    let mut player = Player::new(vec![module(&[&routine, &routine], 1)], samples(), 1);
-    play(&mut player, "e0");
-    for _ in 1..sims_audio::player::THREADS {
-        play(&mut player, "e1");
+    let routines = vec![&routine[..]; sims_audio::player::THREADS];
+    let mut player = Player::new(vec![module(&routines, 1)], samples(), 1);
+    for i in 0..sims_audio::player::THREADS {
+        play(&mut player, &format!("e{i}"));
     }
     player.render(BLOCK, &NoSources);
     player.handle(&SoundEvent::Pause, &NoSources);
@@ -563,15 +563,17 @@ const PLAY_TRK: u8 = 50;
 
 #[test]
 fn a_track_that_restarts_itself_runs_once_per_block() {
-    // Track 10: interrupt = 1; v1 = 10; play_trk v1; end. Each run
-    // starts itself anew, which ends it; its replacement first runs in
-    // the next block, so `render` returns and one thread is left at a
-    // time.
-    let respawn: &[u8] = &[LOADB_V1, 55, 1, LOADB_V1, 5, 10, PLAY_TRK, 5, END];
-    let mut player = Player::new(vec![module(&[respawn], 0)], samples(), 1);
+    // Track 10: interrupt = 1; v1 = 10; play_trk v1; then a note it
+    // never reaches. Each run starts itself anew: from the top, in the
+    // next block, so `render` returns and the note never plays.
+    let respawn: &[u8] = &[
+        LOADB_V1, 55, 1, LOADB_V1, 5, 10, PLAY_TRK, 5, 2, 5, WAIT_SAMP, END,
+    ];
+    let mut player = Player::new(vec![module(&[respawn], 1)], samples(), 1);
     play(&mut player, "e0");
     assert_eq!(player.render(1, &NoSources), [0]);
-    assert_eq!(player.render(20 * BLOCK, &NoSources).len(), 20 * BLOCK);
+    let out = player.render(20 * BLOCK, &NoSources);
+    assert!(out.iter().all(|&s| s == 0));
     assert!(player.faults.is_empty(), "{:?}", player.faults);
     assert!(!player.is_idle());
     player.handle(&SoundEvent::StopAll, &NoSources);
@@ -1207,25 +1209,66 @@ fn a_fade_event_for_a_track_not_running_does_nothing() {
     assert!(player.faults.is_empty() && player.is_idle());
 }
 
+/// Object 1 is on the left of the screen, object 2 on the right.
+struct TwoSides;
+
+impl Sources for TwoSides {
+    fn field(&self, _: i32, _: i32) -> Option<i32> {
+        Some(0)
+    }
+
+    fn position(&self, object: i32) -> Option<[i32; 3]> {
+        matches!(object, 1 | 2).then_some([40, 56, 1])
+    }
+
+    fn projection(&self, object: i32) -> Option<Projection> {
+        let x = match object {
+            1 => 100,
+            2 => 700,
+            _ => return None,
+        };
+        Some(Projection {
+            at: [x, 300],
+            screen: [800, 600],
+            zoom: 1,
+            shown_level: 1,
+        })
+    }
+}
+
 #[test]
 fn an_object_that_goes_fades_out_its_instances() {
     // Objects 1 and 2 play track 10: one track, played once. Object 1
-    // goes and the track plays on for object 2, placed again.
+    // goes and the track plays on for object 2, placed again: on the
+    // right.
     let module = module_with(&[&LOOPING], 1, 10, "");
     let mut player = Player::new(vec![module], loud(10 * BLOCK), 1);
-    play_for(&mut player, 1, "e0");
-    play_for(&mut player, 2, "e0");
-    assert_eq!(player.render(1, &NoSources), [10_000]);
-    player.render(BLOCK - 1, &NoSources);
-    player.handle(&SoundEvent::StopObject { object: 1 }, &NoSources);
-    assert_eq!(player.render(1, &NoSources), [10_000]);
-    player.render(BLOCK - 1, &NoSources);
+    let sides = TwoSides;
+    for object in [1, 2] {
+        player.handle(
+            &SoundEvent::Play {
+                object,
+                name: "e0".into(),
+            },
+            &sides,
+        );
+    }
+    let both = player.render_stereo(1, &sides);
+    player.render(BLOCK - 1, &sides);
+    player.handle(&SoundEvent::StopObject { object: 1 }, &sides);
+    let right = player.render_stereo(1, &sides);
+    assert!(right[1] > right[0], "{right:?}");
+    assert!(
+        right[1] - right[0] > both[1] - both[0],
+        "{both:?} {right:?}"
+    );
+    player.render(BLOCK - 1, &sides);
     // The last object going fades the track by 100 a block, from 1024,
     // and ends it.
-    player.handle(&SoundEvent::StopObject { object: 2 }, &NoSources);
-    let first = player.render(1, &NoSources)[0];
+    player.handle(&SoundEvent::StopObject { object: 2 }, &sides);
+    let first = player.render(1, &sides)[0];
     assert!(first > 0 && first < 10_000, "{first}");
-    player.render(12 * BLOCK, &NoSources);
+    player.render(12 * BLOCK, &sides);
     assert!(player.is_idle());
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
@@ -2582,4 +2625,91 @@ fn a_forwarded_camera_move_leaves_the_ended_thread_s_levels() {
     player.render(BLOCK, &lot);
     assert_eq!(player.render(1, &lot), before);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_track_that_ends_another_and_restarts_itself_skips_no_track() {
+    // Track 10 waits; track 11 ends it and starts itself anew (interrupt
+    // 1); track 12 plays patch 1. All run in the first block: removing
+    // track 10 and restarting 11 must not make the block skip 12.
+    let waiting: &[u8] = &[SET_LOOP, LOOP];
+    let restarter: &[u8] = &[
+        LOADB_V1, 55, 1, LOADB_V1, 5, 10, KILL_TRK, 5, LOADB_V1, 5, 11, PLAY_TRK, 5, END,
+    ];
+    let module = module(&[waiting, restarter, &GENERIC], 1);
+    let mut player = Player::new(vec![module], samples(), 1);
+    for name in ["e0", "e1", "e2"] {
+        play(&mut player, name);
+    }
+    assert_eq!(player.render(3, &NoSources), [1, 2, 3]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_restart_keeps_the_track_its_targets_and_its_locals() {
+    // Track 11 counts its starts from the top in register 4 (outside the
+    // default banks) and waits. Track 10 points `target` at it and asks
+    // about its register 4 every block. Played again with interrupt 1,
+    // track 11 starts anew as the same track: the count goes on, and
+    // track 10 still reaches it.
+    let counter: &[u8] = &[LOADB_V1, 55, 1, ADD, 4, 55, SET_LOOP, LOOP];
+    let mut watcher = loadl(53, 11);
+    watcher.extend([SET_LOOP, GETSRCDATAFIELD, 6, 4, 4, LOOP]);
+    let module = module(&[&watcher, counter], 1);
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "e1");
+    play(&mut player, "e0");
+    assert_eq!(asked_in_a_block(&mut player), [(1, 1)]);
+    play(&mut player, "e1");
+    assert_eq!(asked_in_a_block(&mut player), [(2, 2)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn play_trk_reads_source_after_the_start() {
+    // Track 10 sets its source to 9, points `target` at track 11 (source
+    // 7) and plays itself: the start points its `target` back at itself
+    // first, so the source it hands on is its own 9.
+    let other: &[u8] = &[LOADB_V1, 47, 7, SET_LOOP, LOOP];
+    // (With `target` at track 11, v1 is written to and read from there.)
+    let mut caller = vec![LOADB_V1, 47, 9];
+    caller.extend(loadl(53, 11));
+    caller.extend([LOADB_V1, 5, 10, PLAY_TRK, 5]);
+    caller.extend([GETSRCDATAFIELD, 6, 47, 47, SET_LOOP, LOOP]);
+    let module = module(&[&caller, other], 1);
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "e1");
+    play(&mut player, "e0");
+    assert_eq!(asked_in_a_block(&mut player), [(9, 9)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_music_mode_lets_go_of_a_music_track_it_starts_again() {
+    use sims_audio::player::music::*;
+    // The buy and build music track waits a second, then asks about its
+    // first argument.
+    let mut waits = vec![LOADL, 5];
+    waits.extend(long(1000));
+    waits.extend([WAIT, 5]);
+    waits.extend(asks(SET_MAIN_MUSIC, false));
+    let tracks: Vec<(u32, Vec<u8>)> = vec![
+        (SET_MAIN_MUSIC, waits),
+        (SET_MAIN_KILL_FIRST, asks(SET_MAIN_KILL_FIRST, false)),
+        (RIVER_LOOP, asks(RIVER_LOOP, false)),
+    ];
+    let tracks: Vec<(u32, &[u8])> = tracks.iter().map(|(t, r)| (*t, &r[..])).collect();
+    let events: String = (0..=18).map(|m| format!("m{m}=36,{m}\n")).collect();
+    let mut player = Player::new(vec![module_of_tracks(&tracks, &events)], samples(), 1);
+    play(&mut player, "m3");
+    asked_in_a_block(&mut player);
+    play(&mut player, "m1");
+    assert_eq!(asked_in_a_block(&mut player), []);
+    // Build starts it again while it waits: it is let go, with the
+    // build list.
+    play(&mut player, "m2");
+    assert_eq!(
+        asked_in_a_block(&mut player),
+        [(BUILD as i32, SET_MAIN_MUSIC as i32)]
+    );
 }
