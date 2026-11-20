@@ -140,15 +140,15 @@ fn cut(lot: &Lot, camera: &Camera, level: i32, top: i32) -> Cut {
 
 /// The objects that hold a person, directly or through other objects, and
 /// everything else in the same holder's tree: the original marks them
-/// moving each time a person in the tree animates. A person's animation
-/// (0x5859fa, 0x585b80, 0x58da79, 0x58f873, 0x591dfb) calls 0x434101,
-/// which climbs the holders to the outermost one and marks it and all it
-/// holds, at every depth, as moving (0x434657, recursing at 0x4347bc). A
-/// person's own time-out is never reached (vtable +0x18 is 0x7fffffff at
-/// 0x4226b6), and a person animates every tick, so the tree stays marked
-/// while the person is in it. People themselves are not in the set; they
-/// draw in their own pass. A holder chain that loops counts as its own
-/// tree.
+/// moving as a person in the tree animates. The person's animation code
+/// (0x5859fa, 0x585b80, 0x58da79, 0x58f873, 0x591dfb, each on its own
+/// condition) calls 0x434101, which climbs the holders to the outermost
+/// one (0x4325b5) and marks it and all it holds, at every depth, as moving
+/// (0x434657, recursing through its slots at 0x4347bc). A person's own
+/// time-out is never reached (vtable +0x18 is 0x7fffffff at 0x4226b6).
+/// With the lot paused, the live original still drew the bench Mortimer
+/// sat on in its moving pass every frame. People themselves are not in
+/// the set; they draw in their own pass.
 pub fn holds_person(world: &World) -> BTreeSet<u16> {
     let people = world
         .objects
@@ -161,25 +161,40 @@ pub fn holds_person(world: &World) -> BTreeSet<u16> {
 
 /// [`holds_person`] for `objects`, of which `people` are the people.
 fn held_trees(objects: &BTreeMap<u16, Object>, people: &BTreeSet<u16>) -> BTreeSet<u16> {
-    let holder = |o: &Object| {
-        u16::try_from(o.data.get(CONTAINER).copied().unwrap_or(0))
+    let word = |id: u16, i: usize| objects.get(&id).and_then(|o| o.data.get(i).copied());
+    let registered = |w: i16| {
+        u16::try_from(w)
             .ok()
-            .filter(|&c| c != 0 && objects.contains_key(&c))
+            .filter(|&id| id != 0 && objects.contains_key(&id))
     };
-    // The outermost holder of each object; for holders that hold each
-    // other, the lowest ID in their loop, the same from wherever the climb
-    // starts.
-    let up = |id: u16| objects.get(&id).and_then(holder);
+    // An object's holder by its link words, as 0x4325b5 finds it: an
+    // object with slot word 0 follows the one before it on its tile, so
+    // climb those to the first with a slot word; the object before that
+    // one is the holder.
+    let holder = |id: u16| {
+        let mut at = id;
+        let mut seen = BTreeSet::from([id]);
+        while word(at, LINK_SLOT)? == 0 {
+            let before = registered(word(at, BEFORE)?)?;
+            if !seen.insert(before) {
+                return None;
+            }
+            at = before;
+        }
+        registered(word(at, BEFORE)?)
+    };
+    // The outermost holder; for holders that hold each other, the lowest
+    // ID in their loop, the same from wherever the climb starts.
     let root = |id: u16| {
         let mut at = id;
         let mut seen = BTreeSet::from([id]);
-        while let Some(next) = up(at) {
+        while let Some(next) = holder(at) {
             if !seen.insert(next) {
                 let mut lowest = next;
-                let mut on = up(next);
+                let mut on = holder(next);
                 while let Some(o) = on.filter(|&o| o != next) {
                     lowest = lowest.min(o);
-                    on = up(o);
+                    on = holder(o);
                 }
                 return lowest;
             }
@@ -187,14 +202,21 @@ fn held_trees(objects: &BTreeMap<u16, Object>, people: &BTreeSet<u16>) -> BTreeS
         }
         at
     };
-    // A person who holds things and is held by nothing is the root of
-    // their own tree.
-    let roots: BTreeSet<u16> = people.iter().map(|&id| root(id)).collect();
-    objects
-        .keys()
-        .filter(|&id| !people.contains(id) && roots.contains(&root(*id)))
-        .copied()
-        .collect()
+    // Each root and all it holds, through the objects in its slots, at
+    // every depth. A person who holds things and is held by nothing is
+    // the root of their own tree.
+    let mut tree = BTreeSet::new();
+    let mut stack: Vec<u16> = people.iter().map(|&id| root(id)).collect();
+    while let Some(id) = stack.pop() {
+        if !tree.insert(id) {
+            continue;
+        }
+        if let Some(o) = objects.get(&id) {
+            stack.extend(o.slots.iter().filter_map(|s| registered(s.object)));
+        }
+    }
+    tree.retain(|id| !people.contains(id));
+    tree
 }
 
 /// Which walls of a level are cut down, and which objects hide with them.
@@ -1330,6 +1352,13 @@ const WINDOW: i16 = 8;
 const CONTAINER: usize = 2;
 const CONTAINER_SLOT: usize = 3;
 
+/// The data words that link an object into the lot (the simulation's
+/// placement): its slot in its holder, counted from 1 (-1 for none, 0 for
+/// an object that follows another on its tile), and the object it is in
+/// or follows.
+const LINK_SLOT: usize = 14;
+const BEFORE: usize = 26;
+
 /// How far a held object stands from its own position: a fine x and y
 /// offset and a lift in height units. An object another holds (a lamp on
 /// an end table, a sink in a counter) stands at its holder's place plus
@@ -1921,27 +1950,71 @@ mod tests {
 
     #[test]
     fn a_persons_holders_and_all_they_hold_draw_after_the_people() {
-        let held = |at: u16, slot: i16| [(CONTAINER, at as i16), (CONTAINER_SLOT, slot)];
+        use sims_formats::saved_objects::Slot;
         let mut objects = BTreeMap::new();
+        // `at` holds `id` in its slot `slot` (from 0), by the link words
+        // and in the holder's slot list.
+        let put = |objects: &mut BTreeMap<u16, Object>, id: u16, at: u16, slot: usize| {
+            let o = objects.get_mut(&id).unwrap();
+            o.data[LINK_SLOT] = slot as i16 + 1;
+            o.data[BEFORE] = at as i16;
+            let holder = objects.get_mut(&at).unwrap();
+            if holder.slots.len() <= slot {
+                holder.slots.resize(
+                    slot + 1,
+                    Slot {
+                        unknown: 0,
+                        object: 0,
+                    },
+                );
+            }
+            holder.slots[slot].object = id as i16;
+        };
+        for id in 1..=10 {
+            objects.insert(id, object(id, id.into(), [0, 0, 1], &[(LINK_SLOT, -1)]));
+        }
         // A bench (1) holds a person (2) and a book (3); the person holds
         // a plumb bob (4); a table (5) holds a lamp (6); a person (7)
         // stands alone; a person (8) holds a drink (9).
-        objects.insert(1, object(1, 1, [0, 0, 1], &[]));
-        objects.insert(2, object(2, 2, [0, 0, 1], &held(1, 1)));
-        objects.insert(3, object(3, 3, [0, 0, 1], &held(1, 0)));
-        objects.insert(4, object(4, 4, [0, 0, 1], &held(2, 0)));
-        objects.insert(5, object(5, 5, [0, 0, 1], &[]));
-        objects.insert(6, object(6, 6, [0, 0, 1], &held(5, 0)));
-        objects.insert(7, object(7, 7, [0, 0, 1], &[]));
-        objects.insert(8, object(8, 8, [0, 0, 1], &[]));
-        objects.insert(9, object(9, 9, [0, 0, 1], &held(8, 0)));
+        put(&mut objects, 2, 1, 1);
+        put(&mut objects, 3, 1, 0);
+        put(&mut objects, 4, 2, 0);
+        put(&mut objects, 6, 5, 0);
+        put(&mut objects, 9, 8, 0);
+        // Object 10 follows the bench on its tile and holds nothing.
+        objects.get_mut(&10).unwrap().data[LINK_SLOT] = 0;
+        objects.get_mut(&10).unwrap().data[BEFORE] = 1;
         let people = BTreeSet::from([2, 7, 8]);
         assert_eq!(held_trees(&objects, &people), BTreeSet::from([1, 3, 4, 9]));
+        // Data word 2 is not the link: a stale one changes nothing.
+        objects.get_mut(&2).unwrap().data[CONTAINER] = 5;
+        assert_eq!(held_trees(&objects, &people), BTreeSet::from([1, 3, 4, 9]));
+        // A person who follows another object on its tile is held by what
+        // that first object is in: here object 10, in the table's slot 2,
+        // with the bench in its slot 1. The tree is what the table's slots
+        // reach, so the person's own bob, reached through no slot, is
+        // left out.
+        put(&mut objects, 1, 5, 1);
+        objects.get_mut(&1).unwrap().slots[1].object = 0;
+        objects.get_mut(&2).unwrap().data[LINK_SLOT] = 0;
+        objects.get_mut(&2).unwrap().data[BEFORE] = 10;
+        objects.get_mut(&10).unwrap().data[LINK_SLOT] = 2;
+        objects.get_mut(&10).unwrap().data[BEFORE] = 5;
+        objects.get_mut(&5).unwrap().slots.push(Slot {
+            unknown: 0,
+            object: 10,
+        });
+        assert_eq!(
+            held_trees(&objects, &people),
+            BTreeSet::from([1, 3, 5, 6, 9, 10])
+        );
         // Holders that hold each other are one tree, whichever of them
         // the climb starts from.
-        objects.get_mut(&5).unwrap().data[CONTAINER] = 6;
-        objects.get_mut(&1).unwrap().data[CONTAINER] = 3;
-        assert_eq!(held_trees(&objects, &people), BTreeSet::from([1, 3, 4, 9]));
+        put(&mut objects, 5, 3, 1);
+        assert_eq!(
+            held_trees(&objects, &people),
+            BTreeSet::from([1, 3, 5, 6, 9, 10])
+        );
     }
 
     #[test]

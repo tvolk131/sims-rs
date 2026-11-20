@@ -3,7 +3,8 @@
 //!
 //! The lot and its people are drawn into one canvas, which notes for
 //! each pixel the object or person whose pixel it took last
-//! ([`Canvas::id_at`]; `sims_render::draw` names object sprites,
+//! ([`Canvas::id_at`]; `sims_render::draw_lot` and `draw_held` name
+//! object sprites,
 //! `sims_people::People::draw_on_lot` names people, and terrain, floors
 //! and walls name nobody). So a person or object hidden behind a wall or
 //! a bookcase is shown nowhere and takes no click meant for what hides
