@@ -395,10 +395,7 @@ impl Machine<'_, '_> {
     /// flag cleared, the event queue emptied, and the state of the
     /// person's posture.
     fn end_reach(&self, a: &mut Animator) -> Result<(), Trap> {
-        if a.foreground.take().is_some() {
-            a.skin_dirty = true;
-        }
-        a.selection = -1;
+        a.clear_foreground();
         a.pickup = 0;
         a.events.clear();
         self.posture_state(a)
