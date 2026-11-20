@@ -183,13 +183,14 @@ pub(crate) fn head_slot_redraw(world: &World, id: u16) -> Result<(), Trap> {
 /// once keeps the pending refresh (`Machine::interpreter`, `Interpreter::machine`).
 ///
 /// Idle For Input reads the person's words, motives and queue, the
-/// frame's parameter and the lot's zoning (0x45d7c0, through 0x40745f and
-/// 0x453141; 0x47518b, 0x41ed43, 0x45f77b). The check and cancellation
+/// frame's parameter and the lot's zoning (0x45d7c0; the parameter
+/// through 0x47518b; 0x40745f, 0x41ed43, 0x45f77b). The check and cancellation
 /// trees it runs (0x45dc74, 0x45dcc8) are checked one primitive at a
 /// time, as is the tree it pushes. Making the action the running one
 /// (0x45e6cd) works the person's footprint out again when person word 73
 /// is set (0x45e756, 0x433d16); that goes through 0x43519f, which calls
-/// only 0x4351ef, and that reads person words (+0x614, +0x634). The
+/// only the RTTI cast (0x635abe) and 0x4351ef, and that reads person
+/// words (+0x614, +0x634). The
 /// virtual call at 0x4353c9 belongs to the separate routine 0x4352e8.
 ///
 /// Play Sound Event (0x452822) looks the sound's name up in the running

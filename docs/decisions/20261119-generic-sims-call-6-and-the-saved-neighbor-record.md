@@ -97,8 +97,9 @@ allowed now. The reason for each is a code comment:
   tree it pushes, are checked one primitive at a time. Making an action
   the running one (0x45e6cd) works the person's footprint out again when
   person word 73 is set (0x45e756, 0x433d16). That goes through 0x43519f,
-  which calls only 0x4351ef, and that reads person words. The virtual
-  call at 0x4353c9 is in a separate routine (0x4352e8).
+  which calls only the RTTI cast (0x635abe) and 0x4351ef, and that reads
+  person words. The virtual call at 0x4353c9 is in a separate routine
+  (0x4352e8).
 - **Run Tree By Name (28)**, handled at 0x44ba26, looks a tree up and
   either runs it at once or pushes it. It also counts the use (0x45e59b).
   The tree it runs is still checked one primitive at a time.
@@ -175,6 +176,22 @@ update 167,658. Over that run, the fountain (object 197) plays
 own limit of 256 threads. How the original treats a play of a track that
 its object is still playing is **unverified**. The test now runs at most
 a whole day (43,200 updates).
+
+## Left as found
+
+A review found three edge cases. None of them is reached in the four
+houses' runs:
+
+- A person that queued itself for removal earlier in its tick and removes
+  itself again (flag bit 0 clear) is refused by the step's check for a
+  queued person. The original skips the second queueing (0x442f34),
+  saves the record (0x451c03) and yields (0x451c20). The refusal fails
+  loudly.
+- Routine 6 changes the family before the visitor pass, which can fail
+  (with global 9 at 0, for one). After a failure the World is left
+  changed, but the run stops there.
+- Idle For Input does not take lot 0 as residential, as 0x42b9e3 does.
+  This was there before the change.
 
 ## Next stop
 
