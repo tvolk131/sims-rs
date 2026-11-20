@@ -12,7 +12,7 @@ const LOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("lots");
 
 /// Bumped whenever [`World`]'s encoding changes, so an old snapshot is
 /// refused instead of misread.
-pub const FORMAT: u32 = 30;
+pub const FORMAT: u32 = 31;
 
 /// A REDB file of named world snapshots.
 pub struct Snapshots {

@@ -23,7 +23,7 @@ const SEEN: usize = 36;
 /// widget's file names tree 4099 "init visitor": it writes its stack
 /// object to global 36. Gives the widget's file and the ID by which a
 /// script names its record (the record's slot plus one).
-fn visitors() -> (Fixture, usize, i16) {
+pub(crate) fn visitors() -> (Fixture, usize, i16) {
     let (mut fx, file) = placeable();
     fx.words(file)[9] = 2;
     equip(&mut fx, WIDGET, "widget", 12);

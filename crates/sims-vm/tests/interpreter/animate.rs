@@ -2397,15 +2397,37 @@ fn a_person_takes_itself_off_the_lot_in_its_own_tick() {
 }
 
 #[test]
-fn after_taking_itself_off_only_what_reads_no_animator_may_run() {
+fn after_taking_itself_off_a_step_that_agrees_both_ways_goes_on() {
     // Animate Sim reads the animator, which the refresh at the take-off
-    // may have written.
-    let mut fx = taking_itself_off(ins(44, RETURN_TRUE, RETURN_FALSE, [0; 8]));
+    // (0x58da12) may have written, so it runs both ways
+    // (`Machine::step_both_ways`). Clip 0 clears the foreground and takes
+    // the true branch whichever animator it reads: the lot goes on, and
+    // the animator's tick settles the two animators.
+    let mut fx = taking_itself_off_then(vec![ins(44, 2, RETURN_FALSE, [0; 8]), sleep()]);
+    tick(&mut fx).unwrap();
+    assert_eq!(fx.sim().stack[0].node, 2, "the thread went on to the sleep");
+}
+
+#[test]
+fn a_step_both_ways_that_differs_fails_loudly() {
+    // The clip's timed event is due at the first tick's clock. The
+    // refresh at the take-off updates the skin there, which queues the
+    // event; the take-off alone does not. Animate Sim then takes the
+    // event and its false branch on the refreshed animator, and waits on
+    // the other: which the original did depends on whether the house view
+    // drew the person (animator byte +0x109), so the step fails.
+    let mut fx = taking_itself_off(ins(44, RETURN_TRUE, RETURN_FALSE, [1, 0, 0, 0, 0, 0, 1, 0]));
+    playing_an_event(&mut fx, "xevt", "0");
+    fx.world.animators.get_mut(&SIM).unwrap().playing = true;
     let fault = tick(&mut fx).unwrap_err().to_string();
     assert!(
-        fault.contains("0x58da12") && fault.contains("opcode 44"),
+        fault.contains("0x58da12")
+            && fault.contains("+0x109")
+            && fault.contains("opcode 44")
+            && fault.contains("gives another result"),
         "{fault}"
     );
+    assert_eq!(fx.sim().stack[0].node, 1, "the thread went no further");
 }
 
 #[test]
