@@ -350,6 +350,9 @@ class CaptureTest(unittest.TestCase):
             # An earlier revision's, with no lot, after a return on another lot.
             [dict(kind='baseline', cr3=GAME_CR3), dict(kind='return_elsewhere', lot=7),
              armed('2-2,state=0x70088', 1)],
+            # The same, the stop elsewhere logged before the baseline.
+            [dict(kind='entry_elsewhere', lot=0, count=1), dict(kind='baseline', cr3=GAME_CR3),
+             armed('2-2,state=0x70088', 1)],
             # And two that count: on this lot, and an earlier revision's with no stop elsewhere.
             [dict(kind='baseline', cr3=GAME_CR3), armed('2-2,state=0x70088', 1, lot=5)],
             [dict(kind='baseline', cr3=GAME_CR3), armed('2-2,state=0x70088', 1)],
@@ -382,6 +385,23 @@ class CaptureTest(unittest.TestCase):
             self.assertEqual(bool(remote.watch_calls), expected)
             ended = self.events(output, 'watch_ended')
             self.assertEqual([(r['update'], r['set']) for r in ended], [(2, expected)])
+
+    def test_a_write_after_a_return_elsewhere_has_no_tick_but_its_values(self):
+        # Taken over after update 1: a return on lot 7, then a dialog on lot
+        # 5 where the late watch is set, then a write before lot 5's next
+        # entry: its tick is not read through lot 7's simulator. Then the
+        # same with an entry on lot 5 first.
+        def prepare(output):
+            (output / 'events.jsonl').write_text(json.dumps(dict(kind='baseline', cr3=GAME_CR3)) + '\n')
+            (output / 'updates.jsonl').write_text(
+                json.dumps(dict(update=1, tick=99, lot_rng=0, global_rng=0, crt=0, scheduler_cursor=0)) + '\n')
+        for first, tick in ((dict(pc=capture.RETURN, lot=7), None), (dict(pc=capture.ENTRY), 100)):
+            remote, output, _ = self.run_capture(
+                [first, dict(pc=capture.DIALOG_SHOW), dict(pc=0x123456, reply='T05watch:70088;'),
+                 dict(pc=capture.RETURN)],
+                ['--updates', '2', '--resume', '--late-watch', '2-2,state=0x70088'], prepare=prepare)
+            rows = self.rows(output / 'watch.jsonl')
+            self.assertEqual([(r['tick'], 'before' in r, 'after' in r) for r in rows], [(tick, True, True)])
 
     def test_a_watch_armed_records_the_lot_it_was_armed_on(self):
         remote, output, _ = self.run_capture(

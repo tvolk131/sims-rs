@@ -786,8 +786,13 @@ def main():
             row = dict(update=None if in_update is None else updates + (1 if in_update else 0),
                        after_update=updates, in_update=in_update, address=hit,
                        name=w.name if w else None, registers=regs, eip=regs['eip'])
+            # The tick through this lot's simulator only (after a return elsewhere, sim is another
+            # lot's until the next entry here), read apart so the values are kept if it fails.
             try:
-                row['tick'] = m.word(sim + 0x98) if sim else None
+                row['tick'] = m.word(sim + 0x98) if sim and sim_lot == args.lot else None
+            except MemoryError as e:
+                row['tick'], row['tick_error'] = None, str(e)
+            try:
                 if w:
                     row['before'], w.value = w.value, w.read(m)
                     row['after'] = w.value
@@ -847,13 +852,14 @@ def main():
         # Only an arming on this lot after the baseline within its updates counts: it is set at
         # the end of update first - 1 at the earliest. Earlier revisions did not record the lot
         # (and could arm on another): one of theirs counts only if no stop on another lot was
-        # recorded between the baseline and it.
-        since = rows[next(i for i, r in enumerate(rows) if r['kind'] == 'baseline'):]
+        # recorded before it, the baseline's run included. Each run logs its first entry elsewhere
+        # and every return elsewhere, so a run that armed one elsewhere logged such a stop first.
+        start = next(i for i, r in enumerate(rows) if r['kind'] == 'baseline')
         elsewhere_seen = False
-        for r in since:
+        for i, r in enumerate(rows):
             if r['kind'] in ('entry_elsewhere', 'return_elsewhere'):
                 elsewhere_seen = True
-            if not (r['kind'] == 'watch_armed' and r.get('late', True)):
+            if i < start or not (r['kind'] == 'watch_armed' and r.get('late', True)):
                 continue
             on_lot = r['lot'] == args.lot if 'lot' in r else not elsewhere_seen
             for w in late:
