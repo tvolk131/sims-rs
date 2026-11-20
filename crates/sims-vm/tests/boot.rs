@@ -849,23 +849,23 @@ const TICK_3912: &str = "869973a29b9ec91cb38a0a5c3dc461315dcadc2034942635bd27692
 /// the end.
 const TICK_3912_29: &str = "4709b76086b6c75eb736f45d20bae15272df19352656c1a8a53312d73c23a162";
 /// The same at tick 9906.
-const TICK_9906: &str = "f323956e4f37085572651410c13ca52d3e15a7a9d78123a1c219149ee7e871fe";
+const TICK_9906: &str = "0729bdb1be01619a16bdfb2852da323bf1237ecc1bf8bfa156ea52b75a506992";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
-const TICK_9906_29: &str = "344de11cfa7fe1181f731dba94d0b501e3777d169f1fecdc3c1cad04a9aedc38";
+const TICK_9906_29: &str = "458debd6fa82f9cd865b4334cdd950af01942ee517cf039657728eb6422a54f2";
 /// The same at tick 20186.
-const TICK_20186: &str = "0185475fce351b2e8b459e16dc55cd40ab919b40fb322e9ac6efc116309fe57b";
+const TICK_20186: &str = "5ee29d0a10fc9f489b1cb1c76025ec81bcebc77fbf5c508072bf867c48dce5bb";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
-const TICK_20186_29: &str = "6ead1bb05af619268565b915d4f00ac2e1ac5649e03ee6ce1f075926cd9cec58";
+const TICK_20186_29: &str = "a282f437760e7a7b5308007acc06d094a26bf6a563f7bc9863ac5d1b3013d80e";
 /// The same at tick 31478, when the day turns.
-const TICK_31478: &str = "34cfca302c1a9b9392b3fcabee36deacdecca0f198df291215abadc0dfe0bc4d";
+const TICK_31478: &str = "3216df89133960f7ea56d3456874226daa4ac3a540c1a958357a0acd4d4a584b";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
-const TICK_31478_29: &str = "fc3480edf33f5a146bf2541956ee129cd0200203ae66069e6c763a6835b8f8ed";
+const TICK_31478_29: &str = "8b7ae0ca751002b0ee36bd32ba0f921c494bebf77fba4a27f50e84fdc3754091";
 /// Where to start the C runtime's generator for House 69's load in track
 /// 2's second run: state 1 after this many draws, fitted to the recording's
 /// entry state (state 1 after 405,850 draws, of which our load makes the
@@ -882,13 +882,13 @@ const RECORDED_FRAMES: &str = "0,1,2,29,59,89,101,102,123+30";
 /// track 2's recording of it (`house69-ud2-ticks-20261120`).
 const IMPORTED_69: &str = "647c524ea5e613ef5d94a2398525f0f3004ce7921af4ba278ee704c321722f29";
 /// The same after 1000 ticks, with the recording's frames.
-const IMPORTED_69_1000: &str = "ff8c3f7ff4cc765e2245fe69915db58b569a9242cd919dfdbbc5c7e88790fc80";
+const IMPORTED_69_1000: &str = "c4aaebafe6a691b3e16e0adc650bd1c7803c14bb8ff4ce417c9e9d3ca33cbad0";
 /// The same at tick 43200, a whole day from the load.
-const TICK_43200: &str = "d26a6a16a451728e40c9b6ada581665a4dfae60ddc7cd8ab306649e3eac14bb0";
+const TICK_43200: &str = "b67d0c132d35c3579bdc28dfc91fd4476c755c76c6efa18a881615c33fda41e2";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
-const TICK_43200_29: &str = "693eb621859e6301a85064667b2f697684d3922fad1159a1a665dc67e323f256";
+const TICK_43200_29: &str = "267bf9b3850d59968acabe44f27c97d4293c9ea533df4df20b18848630a45bd0";
 
 #[test]
 fn strict_mode_runs_the_goth_houses_whole_day() {
@@ -1135,34 +1135,34 @@ fn the_goth_day_under_the_recordings_frames_keeps_its_streams() {
 // with that save left out, the earlier pins all held.
 
 /// The Newbies' house (House07) after 1802 updates, with `--answers 3`.
-const NEWBIE_1802: &str = "c397370c8585740aaff3dac3f5bc359d53ed94f40e77ac180050ba567bbc04fc";
+const NEWBIE_1802: &str = "87e686fc5db2ece81643b2c87505e4c1589441acf30022c1cb4d977f96a89593";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
-const NEWBIE_1802_29: &str = "5ffaaac2956a18cfd478b80897d74c6240f94968ce0e2f91ea28129a96e5ecb9";
+const NEWBIE_1802_29: &str = "41b1b65f24bb01bf31171825fc963936d786a77ddf8375b860eac46cf8b24ce2";
 /// The same state's hash under snapshot format 28, which had no record
 /// of the people whose animator was asked to stop its route
 /// ([`sims_sim::World::stops_asked`]) at the end.
-const NEWBIE_1802_28: &str = "e72ece6d1a408b1f0a9f2f07e325ccea5750440ef072da2dadb4ddf9049ee5ff";
+const NEWBIE_1802_28: &str = "2a2d5d3e9f9bea42598e7efc8b424d84338f16db99682958d71b2b0cb4ac6d42";
 /// The same state's hash under snapshot format 27, which had no poses
 /// the load left in the skins ([`sims_sim::World::held_poses`]) either.
-const NEWBIE_1802_27: &str = "a6321d66ebfffedb8d11815266050f55d91e3f472519d3fc78338ae5300ddc54";
+const NEWBIE_1802_27: &str = "5055fe7a40f7c1ade093d0748e7294bf92251264d4452304a8601eac89d341fc";
 /// The same state's hash under snapshot format 26.
-const NEWBIE_1802_26: &str = "12cc6cdec085b56e02b84b76b5e585ee01aba4b5ac685476ba62f59ae5b5dcb0";
+const NEWBIE_1802_26: &str = "db8b8f44bbc8273bcfb0b13e6ba1d405d5cfc78b4c6ec70d7483d240289c7af4";
 /// The Newbies' house after 4052 updates, the last whose frame strict
 /// mode draws.
-const NEWBIE_4052: &str = "e5aab4b1952c8105fcb755965a505813f0c30d5fad99c993e2483076180c0bf5";
+const NEWBIE_4052: &str = "161e7f3ce888e5ff2f4dc3257998cde6ec3ddd3eb2e1c23c728e63dad0de7f65";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
-const NEWBIE_4052_29: &str = "e5487823c9720cf5f543cdfc3b61ada1f3951c7f737b16514131f9b72f8f9620";
+const NEWBIE_4052_29: &str = "d98344ac74d997ccd7e795052582aec11ce493fc5ac2a0bf0f9ae78ad349a80b";
 /// The same state's hash under snapshot format 28, which had no record
 /// of the people whose animator was asked to stop its route
 /// ([`sims_sim::World::stops_asked`]) at the end.
-const NEWBIE_4052_28: &str = "10f36f32f90e6fa870856228b1f4da42d0884a2141f7f85136a5475ee9f8d7c8";
+const NEWBIE_4052_28: &str = "13c57c305ad63fc916977d987443e251f954254245e6cbaa66916c28768c291e";
 /// The same state's hash under snapshot format 27, which had no poses
 /// the load left in the skins ([`sims_sim::World::held_poses`]) either.
-const NEWBIE_4052_27: &str = "3c963dcfc9902a97aa02bef939b8ccf2dbf0dea19af97ab584f82730c190e724";
+const NEWBIE_4052_27: &str = "9f09c38494febb26e5951e1e49a1a6fcfd389c19a5d2ffdac219557bd3b69fd2";
 
 #[test]
 fn a_newbie_gives_up_on_a_route_with_its_failure_feedback() {

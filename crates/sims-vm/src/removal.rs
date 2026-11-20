@@ -6,9 +6,9 @@
 //!   (0x433125): it detaches the object from its tile and its container
 //!   and leaves it registered, off the lot.
 //! - [`Interpreter::delete`] is the registry's deletion (0x440eeb): the
-//!   object is marked, everything that refers to it lets go, it resets one
-//!   last time ([`Interpreter::reset`]), and its storage is unlinked from
-//!   the registry.
+//!   object is marked, people let go of it, and it resets one last time
+//!   ([`Interpreter::reset`]). Then it is unlinked and freed, and incoming
+//!   object relationships are erased.
 //! - [`Interpreter::remove_now`] is the immediate removal (0x44123f):
 //!   leave the lot, then delete.
 //!
@@ -266,12 +266,18 @@ impl Interpreter<'_> {
     /// 6. Its sounds are stopped (the base destructor 0x432331 calling
     ///    0x4323c9, [`crate::sounds`]), and it is unlinked from the
     ///    registration list and from its type's instance list (0x44383c),
-    ///    and its storage is freed. A person's destructor (0x459511) also
+    ///    and its storage, including its own relationship table (0x43242e),
+    ///    is freed. A person's destructor (0x459511) also
     ///    frees its route (+0xaec), its animator (+0xadc, 0x588080), its
     ///    uses (+0xb00), route contexts (+0xaf0), path (+0xae0) and queue
     ///    (+0x820), so what [`World`] keeps for them by the person's ID
     ///    goes: its animator, route, tick state and unknown data words. It
     ///    also leaves the lot's list of people (lot +0x84).
+    /// 7. The registry walks its remaining registered objects (+0x30,
+    ///    links at object +0xe0) and erases the first row keyed by the
+    ///    deleted object ID from each object's relationship table (+0xe4,
+    ///    call at 0x441223 to 0x464fa2). This includes the object tables
+    ///    of people. The other rows keep their order (0x59b0bd).
     ///
     /// A person using the object fails in step 3 (`crate::forget`). A
     /// route aimed at the object fails before anything changes: the
@@ -292,21 +298,19 @@ impl Interpreter<'_> {
     /// original's queue holds bare IDs and whoever drains it skips the ones
     /// that name no object.
     ///
-    /// Nothing here writes a neighborhood record, a relationship or a
-    /// family: a person's record keeps what it held (Remove Object
-    /// Instance saved it there when it queued the person,
-    /// `crate::people::save_to_record`), and other objects'
-    /// relationships and frames that name the ID keep it. Neither does
-    /// the deletion touch the rooms: the room a person was last seen in
-    /// keeps its mark that a person is in it, which the next person to
-    /// leave it clears.
+    /// The sweep uses lot object IDs. Neighborhood relationships use
+    /// neighbor IDs and stay in their records. Remove Object Instance
+    /// saves a person's data to its record when it queues the person
+    /// (`crate::people::save_to_record`). Other objects' frames keep
+    /// references to the deleted ID. The room a person was last seen in
+    /// keeps its mark that a person is in it until the next person to
+    /// leave it clears the mark.
     ///
     /// Not modeled, being presentation: the signals to the interface
     /// (0x87, 0x88), the object's redraw (0x434101), the registry's
     /// interface hooks (0x4481eb, which changes nothing for a person or
-    /// any object but an indicator or a star marker, and the list at
-    /// registry +0x30, 0x464fa2), the interface object of GUID 0x3EEC206C
-    /// (registry +0x80), and the release of its indicator.
+    /// any object but an indicator or a star marker), the interface object
+    /// of GUID 0x3EEC206C (registry +0x80), and the release of its indicator.
     ///
     /// Before people let go of it, the object gets its deletion mark
     /// (object flag 0x40, 0x441039; [`Interpreter::deleting`]), which it
@@ -477,6 +481,22 @@ impl Interpreter<'_> {
                 .routing
                 .unknown_words
                 .retain(|&(other, _)| other != id);
+        }
+        // 0x441223 passes the sign-extended lot ID to 0x464fa2.
+        let target = i32::from(id as i16);
+        for &other in &world.order {
+            let object = world.objects.get_mut(&other).ok_or_else(|| {
+                fail(Trap::Invalid(format!(
+                    "relationship cleanup (0x44120f) found missing registered object {other}"
+                )))
+            })?;
+            if let Some(row) = object
+                .relationships
+                .iter()
+                .position(|row| row.present != 0 && row.target == target)
+            {
+                object.relationships.remove(row);
+            }
         }
         Ok(())
     }
