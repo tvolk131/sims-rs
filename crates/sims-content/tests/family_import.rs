@@ -1,10 +1,15 @@
+mod common;
+
 use sims_content::family_import::{
-    ImportInput, ImportOptions, TEMPLATE_CAT, TEMPLATE_DOG, TEMPLATE_PERSON, import,
+    ImportInput, ImportOptions, TEMPLATE_CAT, TEMPLATE_DOG, TEMPLATE_PERSON, clone_character,
+    import, refresh_outfits,
 };
-use sims_content::{Catalog, Index, Install, Neighborhood, Object};
+use sims_content::{Catalog, ImportWardrobe, Index, Install, Neighborhood, Object};
 use sims_formats::family_file::FamilyFile;
-use sims_formats::lot::ObjectTypes;
+use sims_formats::iff::{Chunk, Iff, write};
+use sims_formats::lot::{GuidTable, ObjectTypes};
 use sims_formats::neighborhood::{Family, Neighbor};
+use sims_formats::strings::StringTable;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -394,15 +399,110 @@ fn paths(directory: &Path) -> Vec<PathBuf> {
     paths
 }
 
+fn read_iff(path: &Path) -> Iff {
+    Iff::parse(fs::read(path).unwrap()).unwrap()
+}
+
+fn character_guid(iff: &Iff) -> u32 {
+    let definitions = iff.resource_order(b"OBJD").unwrap();
+    assert_eq!(definitions.len(), 1);
+    u32::from_le_bytes(iff.data(definitions[0])[0x1c..0x20].try_into().unwrap())
+}
+
+fn comparable_resources(iff: &Iff) -> BTreeMap<([u8; 4], u16), &Chunk> {
+    let tags: BTreeSet<_> = iff.chunks.iter().map(|chunk| chunk.tag).collect();
+    let mut resources = BTreeMap::new();
+    for tag in tags {
+        for chunk in iff.resource_order(&tag).unwrap() {
+            if tag == *b"XXXX" || (tag == *b"BMP_" && (2002..=2007).contains(&chunk.id)) {
+                continue;
+            }
+            assert!(resources.insert((tag, chunk.id), chunk).is_none());
+        }
+    }
+    resources
+}
+
+fn string_rows(data: &[u8]) -> Vec<(u8, Vec<u8>, Vec<u8>)> {
+    StringTable::parse(data)
+        .unwrap()
+        .entries
+        .into_iter()
+        .map(|entry| (entry.language, entry.raw_text, entry.raw_comment))
+        .collect()
+}
+
+fn compare_clone(clone: &Iff, oracle: &Iff, number: i32) {
+    assert!(
+        clone
+            .all(b"BMP_")
+            .all(|chunk| !(2002..=2007).contains(&chunk.id))
+    );
+    let actual = comparable_resources(clone);
+    let expected = comparable_resources(oracle);
+    assert_eq!(
+        actual.keys().collect::<Vec<_>>(),
+        expected.keys().collect::<Vec<_>>()
+    );
+    for (key, chunk) in actual {
+        let original = expected[&key];
+        let resource_name = format!("User{number:05} {} #{}", chunk.kind(), chunk.id);
+        assert_eq!(
+            (chunk.flags, &chunk.label),
+            (original.flags, &original.label),
+            "{resource_name}"
+        );
+        let bytes = clone.data(chunk);
+        let original = oracle.data(original);
+        match (&key.0, key.1) {
+            (b"STR#", 200) => {
+                let rows = string_rows(bytes);
+                let saved = string_rows(original);
+                assert_eq!((rows.len(), saved.len()), (35, 35), "{resource_name}");
+                for (index, (row, saved)) in rows.iter().zip(&saved).enumerate() {
+                    assert_eq!(row, saved, "{resource_name} row {}", index + 1);
+                }
+                // 0x46fc9f leaves one unused byte per declared row.
+                assert_eq!(bytes.len(), original.len(), "{resource_name} size");
+                let end = bytes.len() - rows.len();
+                assert_eq!(&bytes[..end], &original[..end], "{resource_name}");
+                assert!(bytes[end..].iter().all(|&byte| byte == 0));
+            }
+            (b"CTSS", 2000) => {
+                // 0x47090e allocates one unused byte per declared row.
+                let rows = string_rows(original).len();
+                assert_eq!(bytes.len(), original.len(), "{resource_name}");
+                let end = original.len() - rows;
+                assert_eq!(&bytes[..end], &original[..end], "{resource_name}");
+                assert!(bytes[end..].iter().all(|&byte| byte == 0));
+            }
+            _ => assert!(bytes == original, "{resource_name}: payload differs"),
+        }
+    }
+}
+
 #[test]
-fn imports_the_complete_collections_userdata2_patches() {
+fn imports_and_writes_the_complete_collections_userdata2_patches() {
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("skipping: set SIMS_INSTALL to import UserData2's Patch families");
         return;
     };
     let root = PathBuf::from(root);
     let directory = root.join("UserData2");
+    let first = root.join("UserData");
+    let originals: BTreeMap<_, _> = (12..48)
+        .map(|number| {
+            let iff = read_iff(&first.join(format!("Characters/User{number:05}.iff")));
+            (character_guid(&iff), (number, iff))
+        })
+        .collect();
+    assert_eq!(originals.len(), 36);
+    let stray_guids: BTreeMap<_, _> = originals
+        .iter()
+        .filter_map(|(&guid, &(number, _))| (number >= 40).then_some((number, guid)))
+        .collect();
     let install = Install::detect(&root).unwrap();
+    let wardrobe = ImportWardrobe::load(&install).unwrap();
     let mut index = Index::build(&install).unwrap();
     index.add_characters(&directory.join("Characters")).unwrap();
     let catalog = Catalog::build(&index).unwrap();
@@ -421,8 +521,13 @@ fn imports_the_complete_collections_userdata2_patches() {
     let mut neighbors = neighborhood.neighbors.clone();
     // 0x424e72 registers people missing from the old on-disk NBRS.
     // Supply the three template records the import path looks up.
+    let mut templates = BTreeMap::new();
     for guid in [TEMPLATE_PERSON, TEMPLATE_DOG, TEMPLATE_CAT] {
-        assert!(catalog.object(guid).is_some(), "template {guid:#010x}");
+        let definition = catalog
+            .object(guid)
+            .unwrap_or_else(|| panic!("template {guid:#010x}"));
+        let template = Iff::parse(index.resources[definition.resource].read().unwrap()).unwrap();
+        templates.insert(guid, template);
         if !neighbors.iter().flatten().any(|record| record.guid == guid) {
             let slot = neighbors
                 .iter()
@@ -462,7 +567,8 @@ fn imports_the_complete_collections_userdata2_patches() {
         .collect();
     assert_eq!(patches.len(), 6);
     assert!(patches.iter().any(|path| path.ends_with("Charming_13.FAM")));
-    let mut guids = 0xf000_0000..;
+    let output = common::Tree::new("import-clones");
+    let mut written = BTreeMap::new();
     for path in patches {
         let input = ImportInput {
             catalog: &catalog,
@@ -476,8 +582,53 @@ fn imports_the_complete_collections_userdata2_patches() {
             neighborhood_data,
         };
         let file = FamilyFile::parse(&fs::read(&path).unwrap()).unwrap();
+        let member_ids: Vec<_> = file
+            .export_info
+            .member_ids
+            .into_iter()
+            .take_while(|&id| id != 0)
+            .collect();
+        let mut guids = if file.family.house == 0 {
+            stray_guids.values().copied().collect::<Vec<_>>()
+        } else {
+            let house = read_iff(&first.join(format!("Houses/House{:02}.iff", file.family.house)));
+            let table = GuidTable::parse(house.data(house.get(b"Gtab", 1).unwrap())).unwrap();
+            let exported: Vec<_> = member_ids
+                .iter()
+                .map(|&id| {
+                    file.neighbors.entries[usize::from(id) - 1]
+                        .as_ref()
+                        .unwrap()
+                        .guid
+                })
+                .collect();
+            assert_eq!(
+                table.pairs.iter().map(|&(old, _)| old).collect::<Vec<_>>(),
+                exported,
+                "{}",
+                path.display()
+            );
+            table.pairs.into_iter().map(|(_, new)| new).collect()
+        }
+        .into_iter();
         let imported = import(&input, &file, PETS, &mut || guids.next().unwrap())
             .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        assert!(guids.next().is_none());
+        for &guid in &imported.family.members {
+            let (number, oracle) = &originals[&guid];
+            let mut character = imported.made[&guid].clone();
+            character.file = *number;
+            let mut resources =
+                clone_character(&templates[&character.template], &character, guid, &file)
+                    .unwrap_or_else(|error| panic!("User{number:05}: {error}"));
+            refresh_outfits(&mut resources, &wardrobe)
+                .unwrap_or_else(|error| panic!("User{number:05}: {error}"));
+            let bytes = write(&resources).unwrap();
+            let clone = Iff::parse(bytes.clone()).unwrap();
+            compare_clone(&clone, oracle, *number);
+            output.file(&format!("Characters/User{number:05}.iff"), &bytes);
+            assert!(written.insert(guid, *number).is_none());
+        }
         if path.ends_with("Charming_13.FAM") {
             assert_eq!(imported.made.len(), 2);
             let templates: BTreeSet<_> = imported.made.values().map(|made| made.template).collect();
@@ -532,5 +683,25 @@ fn imports_the_complete_collections_userdata2_patches() {
         );
         neighborhood_data = imported.neighborhood_data;
         next_file = imported.next_file;
+    }
+    assert_eq!(written.len(), 28);
+    let unmapped: BTreeSet<_> = originals
+        .iter()
+        .filter_map(|(guid, (number, _))| (!written.contains_key(guid)).then_some(*number))
+        .collect();
+    assert_eq!(unmapped, BTreeSet::from([13, 14, 15, 17, 20, 21, 22, 23]));
+
+    let mut index = Index::build(&install).unwrap();
+    index.add_characters(&output.0.join("Characters")).unwrap();
+    let catalog = Catalog::build(&index).unwrap();
+    for (guid, number) in written {
+        let definition = catalog.object(guid).unwrap();
+        assert_eq!(definition.kind, 2);
+        assert_eq!(definition.chunk, 128);
+        let resource = &index.resources[definition.resource];
+        assert_eq!(
+            resource.path,
+            output.0.join(format!("Characters/User{number:05}.iff"))
+        );
     }
 }
