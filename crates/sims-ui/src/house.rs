@@ -493,6 +493,9 @@ impl Prices {
     /// resource of type `'CST'` (0x00435354, the chunk tag `\0CST` on
     /// disk) with the same ID when the `STR#` is missing, and reads it by
     /// another path (0x470178); the install's files have no such chunk.
+    /// Nor is `Build.iff` looked for inside a mounted archive, which the
+    /// original's file opener can read it from (0x4cd1bd, 0x5b9520 to
+    /// 0x5b9550); the install has it loose.
     pub fn load(install: &Install, surfaces: &Surfaces) -> Self {
         let tables: BTreeMap<u16, StringTable> = install
             .file("GameData/Build.iff")

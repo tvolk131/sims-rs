@@ -75,8 +75,10 @@ No screenshot of the panel was compared.
   definition parser (`ObjectDefinition::parse`) also refuses version
   137, which the original normalizes (0x431759, called at 0x43ba84) and
   registers by GUID (0x43bd90 to 0x43bdb1), so an object of such a type
-  is not valued here; the install has no version 137 definition. These
-  are the catalog's to close.
+  is not valued here, and a saved lot whose type is defined only so
+  does not load at all (`Lot::load`'s type table) before the panel or
+  the scan runs; the install has no version 137 definition. These are
+  the catalog's to close.
 - **The objects** (0x444cb9), in the lot's order, in 32-bit sums that
   wrap:
   - A tile of a multi-tile group that is not its lead, and a type with
@@ -125,7 +127,10 @@ No screenshot of the panel was compared.
   - **Pool:** on level 1, a pool byte below 0x10 adds the pool's price.
   - A level whose tile flags, floors or walls are missing adds nothing.
     A missing pool array leaves out only the pool's price.
-- **The prices** (`Prices::load`) come from `GameData/Build.iff`. Each
+- **The prices** (`Prices::load`) come from `GameData/Build.iff`, read
+  as a loose file only: the original's file opener can also read it
+  from a mounted archive (0x4cd1bd, 0x5b9520 to 0x5b9550), which is
+  not ported; the install has it loose. Each
   string-table entry is three strings, and the first is the price, read
   as C's `atoi` reads its bytes (0x636029, `sims_content::atoi`), so a
   byte order mark before the digits reads 0. The strings are US
