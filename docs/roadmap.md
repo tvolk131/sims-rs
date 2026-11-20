@@ -89,20 +89,22 @@ events, and what it asks for after them) come first.
    (#259); clip dress and undress events take the run to 1000 strict
    ticks with first-button answers (#261); the port marks the dog skeleton as read before the load, so House
    69's entry C runtime stream matches, and the compared state agrees
-   through UD1 update 259 apart from the load differences, global 12 at
-   update 3 and the dog's frame-arena word (#275); the original's exact
-   read timing is unverified. Open #276 extends the comparison to update
-   490, where the capture ends.
+   through UD1 update 259 apart from two load differences (the 0x8000 frame-tree bit on four
+   objects and object 2's last result), global 12 at update 3 and the
+   dog's frame-arena word (#275); the original's exact read timing is
+   unverified. Open #276 extends the comparison to update 490, where
+   the capture ends, and its UD2 test boots House 69 from the
+   original's after-import snapshot and runs 1,000 ticks.
    Done for 6b: the family-file (.FAM) reader (#252; the original's
    per-file loader is 0x428f05 and its `Patch/` directory lookup
    0x42bd13); the import's data step (#257); the shared `Gtab` reader,
    translator and writer (#268); the standalone in-place IFF writer, covering reuse, splitting and
-   close-time compaction (#269; no import calls it yet); all 28 mapped
-   character IFFs can be materialized (#270), and all 35 STR# 200 rows
-   match their saved-character references, allowing trailing
-   allocation residue; the outfit refresh (#274) and the in-memory
-   import at neighborhood open after house 0's reload (#272), both
-   landed in #268. Portrait rendering is open.
+   close-time compaction (#269; it has no production caller); #270
+   materializes all 28 mapped character IFFs; the outfit refresh (#274)
+   matches all 35 `STR# 200` rows for each character, allowing trailing
+   allocation residue; the outfit refresh and the in-memory import at
+   neighborhood open after house 0's reload (#272) both landed in
+   #268. Portrait rendering is open.
    In the original, the first three houseless pools fill during
    neighborhood setup after `Patch`; the other two fill from lot or
    toolbar callbacks. Track 4's replay matches the pool members' GUID
@@ -111,8 +113,10 @@ events, and what it asks for after them) come first.
    Decided 2026-11-20 (coordinator): 6a comes first; the pools follow
    as 6b part E, which uses recorded inputs; exact files and looks are
    deferred.
-   Next: 6a, record and compare UD1 House 69 through 1000, and boot
-   from the original's after-import files against track 2's UD2 rerun;
+   Next: 6a, record and compare UD1 House 69 through 1000, and move
+   the UD2 test to the fresh rerun's own after-import files, comparing
+   the entry C runtime and each update's lot state against that
+   recording;
    6b, wire the import into boot and compare its strict state with a
    boot from the original's imported files using the same GUIDs; then
    6b part E.
@@ -169,14 +173,13 @@ events, and what it asks for after them) come first.
   the strict pins: the Roomies match in every compared field, the
   Newbies differ in global 12 at updates 1 and 3, and the Pleasants in
   the known load-time fields and person 241's frame local at updates
-  669–928; the comparison excludes neighborhood records), apart from the words the original left from
-  memory it never set: the Newbies (`House07.iff`,
-  `house07-ticks-20261115`, with global 12 at updates 1 and 3 also
-  differing, the interface's tutorial wait), the Pleasants (`House06.iff`,
+  669–928; the comparison excludes neighborhood records). The houses are the
+  Newbies (`House07.iff`, `house07-ticks-20261115`; global 12 there is
+  the interface's tutorial wait), the Pleasants (`House06.iff`,
   a family with children, #221) and the Roomies (`House10.iff`, two
   unrelated adults, #223: a tile with water is a room's tile only under
-  an object with flag 0x1000, 0x482301). **Unverified:** whether the
-  Roomies' recording reaches a water tile under an object with flag
+  an object with flag 0x1000, 0x482301). The earlier #221 and #223 comparisons also reported
+  unset native words. **Unverified:** whether the Roomies' recording reaches a water tile under an object with flag
   0x1000; it matches either way.
 - Step 5: Drop Onto (opcode 43, 0x44e96a, #212), Snap modes 0, 1 and 2
   (0x454a4b, 0x454a1d, 0x4549d1, #214) and Find Location For mode 5,
@@ -2201,10 +2204,10 @@ Progress:
   including for people. Not ported: expansion lots 28–29, 40–42,
   46–48, 90–96 and 99 use other terrain presets, chosen by global 10
   (0x4c4648), with other sun angles. **Unverified:** that the panels
-  have subscribed before the load's 0xdd goes out (if not, the grass on
-  some slopes differs slightly under the two daytime angles, and a save
-  loaded at night can keep the daytime angle until the next
-  time-of-day signal; not on the Goth house); the pool fixtures'
+  have subscribed before the load's 0xdd goes out (the two daytime angles differ on some slopes and render identically
+  on the Goth lot; if the native panels miss the load's 0xdd, a save
+  loaded after dark can keep the constructor's daytime angle until
+  dawn); the pool fixtures'
   override at night; the 0.8 cap against a native screenshot of a room
   brighter than 0.8.
 - Next: a few cut-wall trims near the stairs that still differ in the
@@ -2635,11 +2638,12 @@ through their public interfaces only; the simulation never depends on it.
 - **Done: the lot's sounds.** Each step's sound requests
   (`Update::sounds`) go to the player as the window wakes: a door opens,
   a book comes off the shelf, the fountain tinkles. `begin_route` and `end_route` have no event in the install's sound files and play nothing.
-  In #273's extended test, the port starts another thread for track
-  1346 every 300 updates and hits its 256-thread limit at about update
-  74,700. Track 6 traced the original's repeat behavior to a refresh
-  of the existing track unless its interrupt register is set; the port
-  fix is on `audio/replay-running-track`.
+  In #273's longer Goth sound run, the fountain started a new
+  track-1346 thread every 300 updates, reaching the 256-thread limit
+  around update 74,700; #273 capped the test at 43,200 updates. Track 6
+  found that the original refreshes the fountain's existing track, and
+  that a running track with its interrupt register set restarts in
+  place; the port fix is on `audio/replay-running-track`.
 - **Done: the pie menu from the simulation's listing.** When the
   pointer first reaches an object or a person, the game lists the
   selected Sim's menu on it with `Lot::pie_menu`, which changes the lot
@@ -2697,8 +2701,7 @@ through their public interfaces only; the simulation never depends on it.
   second press on the selected Sim's portrait centres the view on her
   (0x434ced; the original's slide is left out). Both play `UI_click`.
   A Goth test switches to another Goth through the window and orders
-  her a snack from the fridge's pie. She takes it, and strict mode runs
-  through tick 509 (#233). At tick 455 Mortimer's route to a door
+  her a snack from the fridge's pie. She takes it (#233, whose test then ran through tick 509). At tick 455 Mortimer's route to a door
   already used by one of his routes fails normally (0x45b176). At tick 510 the Traveling Salesman is reset mid-walk; the reset
   removes his playing clip at once (0x586b63, #263), and the strict
   test runs through tick 540. The switch is recorded in
