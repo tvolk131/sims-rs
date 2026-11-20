@@ -307,6 +307,30 @@ class CaptureTest(unittest.TestCase):
         ended = self.events(output, 'watch_ended')
         self.assertEqual([(r['update'], r['set']) for r in ended], [(2, False)])
 
+    def test_a_late_watch_set_by_the_run_taken_over_ends_as_set(self):
+        # The earlier run set it for update 2; this one starts in another
+        # process and next stops at update 2's return, where it ends.
+        def prepare(output):
+            (output / 'events.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in [
+                dict(kind='baseline', cr3=GAME_CR3),
+                dict(kind='watch_armed', name='state', expr='2-2,state=0x70088', address=0x70088,
+                     value=0, update=1)]))
+            (output / 'updates.jsonl').write_text(
+                json.dumps(dict(update=1, tick=99, lot_rng=0, global_rng=0, crt=0, scheduler_cursor=0)) + '\n')
+        remote, output, _ = self.run_capture(
+            [dict(pc=0x123456, cr3=OTHER_CR3), dict(pc=capture.RETURN)],
+            ['--updates', '2', '--resume', '--late-watch', '2-2,state=0x70088'], prepare=prepare)
+        ended = self.events(output, 'watch_ended')
+        self.assertEqual([(r['update'], r['set']) for r in ended], [(2, True)])
+
+    def test_a_watch_name_may_be_any_text_and_an_object_alone_takes_the_default_size(self):
+        w = capture.Watch('\u00e9tat=0x70088:2')
+        self.assertEqual((w.name, w.start, w.size), ('\u00e9tat', 0x70088, 2))
+        w = capture.Watch.late('2,x=object:259')
+        self.assertEqual((w.object, w.steps, w.size), (259, [], 4))
+        w = capture.Watch.late('2,x=person:259:2')
+        self.assertEqual((w.object, w.person, w.size), (259, True, 2))
+
     def test_a_late_watch_that_does_not_parse_is_an_argument_error(self):
         for text in ['3-2,x=0x70088', '3-,x=0x70088', '3x=0x70088', '0,x=0x70088', '2,x=0x70088:3', '2,=0x70088', '\u00b2,x=0x70088', '2,x=0x70088:\u0664']:
             with self.assertRaises(argparse.ArgumentTypeError, msg=text):

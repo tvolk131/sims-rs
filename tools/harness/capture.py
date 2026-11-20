@@ -59,10 +59,12 @@ stop; one that goes through an object waits there for the next entry or
 return, and none is set while the guest is stopped in another process. A
 write seen before the taken-over run knows whether the guest is inside a
 lot update has update null (after_update is the last update recorded). A
-late watch's watch_ended event says whether it was ever set (set false: no
-write in its updates was seen). The lot update's entry is a breakpoint only
-while a watch is set, so a watch on a busy address (the random state)
-costs nothing while the load and the other updates run.
+late watch's watch_ended event says whether it was ever set, by this run or
+one it took over (set false: no write in its updates was seen). The lot
+update's entry is a breakpoint only while a watch is set or waits to be set
+in its updates (one whose address cannot be worked out yet is tried again
+there), so a watch on a busy address (the random state) costs nothing while
+the load and the other updates run.
 
 The executable digests that guest/launch.sh verified (share/game-identity.txt)
 are recorded in status.json and as a game_identity event.
@@ -293,12 +295,13 @@ class Watch:
     def __init__(self, text):
         self.first, self.last = 1, None  # the lot updates it is set for (a late watch's)
         self.set = False  # whether it was ever set (a late watch's)
-        if not text.isascii():
-            # int() takes other scripts' digits, which no one means here.
-            raise ValueError(f'not ASCII: {text!r}')
         self.name, _, rest = text.partition('=')
+        if not rest.isascii():
+            # int() takes other scripts' digits, which no one means here. The name may be anything.
+            raise ValueError(f'not ASCII: {rest!r}')
         expr, _, size = rest.rpartition(':')
-        if not size.isdigit():
+        if not size.isdigit() or expr in ('object', 'person'):
+            # object:N or person:N alone is the selector, with the default size.
             expr, size = rest, '4'
         self.size = int(size)
         assert self.name and expr and self.size in (1, 2, 4, 8), text
@@ -823,6 +826,9 @@ def main():
                 event(kind='registry_unknown', updates=updates, registry_update=prior_status.get('registry_update'))
         if dropped:
             event(kind='resume_dropped', events=[dict(kind=r['kind'], update=r['update']) for r in dropped])
+        # A late watch an earlier run set counts as set (watch_ended's set covers its whole window).
+        for w in late:
+            w.set = any(r['kind'] == 'watch_armed' and r.get('expr') == w.text for r in rows)
         # A dialog shown since the last recorded return, and the dialogs still waiting for a result.
         dialog_pending = any(r['kind'] == 'dialog_show' and r['update'] > updates for r in rows)
         waiting = open_dialogs(rows)
