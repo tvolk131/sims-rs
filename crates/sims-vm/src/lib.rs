@@ -53,6 +53,7 @@ mod object_uses;
 mod objects;
 pub mod orders;
 mod people;
+mod pick;
 mod person_factory;
 mod placement;
 pub mod play;

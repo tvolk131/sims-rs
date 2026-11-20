@@ -34,6 +34,36 @@ pub fn at(world: &World, canvas: &Canvas, point: [i32; 2]) -> Option<u16> {
     choose(canvas, point, |id| kind(world, id))
 }
 
+/// DRAFT: the original's pointer pick.
+pub fn pointer(lot: &sims_vm::boot::Lot, camera: &sims_render::Camera, canvas: &Canvas, lot_depth: &[i32], point: [i32; 2]) -> Option<u16> {
+    let world = lot.world();
+    let [x, y] = point;
+    let noted = canvas.id_at(x, y).filter(|&id| {
+        world.objects.get(&id).is_some_and(|o| o.person.is_some() || o.guid == sims_people::bob::STANDARD)
+    });
+    if noted.is_some() && std::env::var_os("SPIKE_OLDPICK").is_none() {
+        return noted;
+    }
+    if std::env::var_os("SPIKE_OLDPICK").is_some() {
+        return at(world, canvas, point);
+    }
+    let ground = || camera.rotate_fine(camera.unproject_fine(point)).map(|n| n >> 4);
+    let start = match lot_depth.get(y as usize * canvas.width + x as usize).copied() {
+        Some(d) if d != sims_render::depth::EMPTY && std::env::var_os("SPIKE_GROUND").is_none() => {
+            let ([fx, fy], height) = sims_render::depth::Depth::new(camera).unproject(camera, point, d);
+            let level = 1 + (height / f64::from(camera.zoom.floor_height())).floor() as i32;
+            let round = |v: f64| if v >= 0.0 { (v + 0.5).floor() } else { -((-v + 0.5).floor()) } as i32;
+            if std::env::var_os("SPIKE_DEBUG").is_some() { eprintln!("unproject {point:?} d {d} -> {fx:.2},{fy:.2} h {height:.2} level {level}"); }
+            if level == camera.level.max(1) { [round(fx) >> 4, round(fy) >> 4] } else { ground() }
+        }
+        _ => ground(),
+    };
+    lot.sprite_pick(start, camera.level as i8, point, |id| {
+        if std::env::var_os("SPIKE_NOPEOPLE").is_some() && world.objects.get(&id).is_some_and(|o| o.person.is_some()) { return None; }
+        canvas.drawn(id).map(|[l, t, r, b]| [l - l.rem_euclid(4), t, r + (4 - r.rem_euclid(4)) % 4, b])
+    })
+}
+
 /// The person shown at `point` in `canvas`, or else the one shown nearest
 /// to it within [`REACH`] (the first in row order among the nearest), if
 /// `world` holds them as a person.

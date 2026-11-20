@@ -294,6 +294,30 @@ impl Depth {
         (ground + f64::from(LEVEL_DEPTH) * f64::from(level - 1) + height) as f32
     }
 
+    /// Where a pixel of depth `depth` at screen point `at` is (the
+    /// house view's point to tile, 0x4a97c3, in its depth mode): the
+    /// inverse of [`Depth::point`] and of the upright table `L`, which
+    /// both make the depth an affine function of the point's ground row
+    /// and of its height above it. Gives the point's fine view position
+    /// (sixteenths of a tile, unrounded) and its height above level-1
+    /// ground at terrain height 0, in pixels of this zoom. The original
+    /// unprojects through its inverse view matrix instead; that the two
+    /// agree to the rounding is **unverified**.
+    pub fn unproject(&self, camera: &Camera, at: [i32; 2], depth: i32) -> ([f64; 2], f64) {
+        let scale = 65535.0 / f64::from(SCALE);
+        let a = f64::from(SCALE - 12.5) * scale;
+        let b = self.row_step * scale;
+        // A pixel up something upright is this much nearer (L, and H per
+        // terrain step of 2 << zoom pixels).
+        let k = unit() / f64::from(16i32 << self.zoom);
+        let row = f64::from(at[1] - self.origin_y);
+        let height = (a - b * row - f64::from(depth)) / (b + k);
+        let ground = row + height;
+        let sum = ground * 16.0 / f64::from(4i32 << self.zoom);
+        let difference = f64::from(at[0] - camera.origin[0]) * 16.0 / f64::from(8i32 << self.zoom);
+        ([(sum + difference) / 2.0, (sum - difference) / 2.0], height)
+    }
+
     /// The depth of a pixel on screen row `y` of something standing
     /// upright at `anchor`, without its own depth bytes or columns: the
     /// anchor's depth plus `L` for the rows `y` stands above the anchor's
