@@ -841,9 +841,14 @@ fn a_bench_in_use_draws_after_the_sim_on_it() {
 /// trousers, a shoe). Each is his in our frame (the canvas names person
 /// 21 there). The original's colours are in 16-bit colour; each check
 /// allows 12 per channel. The control frame is the same lot and held
-/// objects without the people pass, which must not already match. His
-/// outline is not checked: in this frame the best whole-figure shift
-/// tested puts ours half a pixel right and down; see the decision.
+/// objects without the people pass, which must not already match.
+///
+/// The same `People` follows the lot every tick: while Mortimer carries
+/// his book its mesh is in his rendered body, and at 8:05 it is not.
+///
+/// His outline is checked only at eight edge points where both pictures
+/// put it on the same pixel: elsewhere ours fits the original best moved
+/// half a pixel right and down; see the decision.
 #[test]
 fn mortimer_stands_without_his_book_as_the_original_draws_him() {
     let Some(root) = install() else { return };
@@ -852,10 +857,48 @@ fn mortimer_stands_without_his_book_as_the_original_draws_him() {
     let mut lot = Lot::load(&root, &house, &[3, 3], Frames::default()).unwrap();
     lot.wait_for_answers();
     let mut people = People::open(&root, &house).unwrap();
+    // The parts of Mortimer's rendered body, by appearance name.
+    let drawn_parts = |people: &mut People, world: &World| -> Vec<String> {
+        let (posed, problems) = people.posed(world, 1);
+        assert!(problems.is_empty(), "{problems:?}");
+        let mortimer = posed.iter().find(|p| p.id == 21).expect("Mortimer is posed");
+        mortimer
+            .body
+            .parts
+            .iter()
+            .map(|p| p.appearance.clone())
+            .collect()
+    };
+    // The same `People` follows the lot every tick, so the body drawn at
+    // the end is the one left after the book is put back.
+    let mut book: Option<Vec<String>> = None;
     while lot.ticks() < 2854 {
         lot.step().unwrap();
+        let world = lot.world();
+        assert_eq!(people.update(world), Vec::<String>::new());
+        let held: Vec<String> = world.objects[&21]
+            .person
+            .as_ref()
+            .unwrap()
+            .accessories
+            .iter()
+            .map(|a| a.name.clone())
+            .collect();
+        if book.is_none() && !held.is_empty() {
+            let parts = drawn_parts(&mut people, world);
+            for name in &held {
+                assert!(parts.contains(name), "{name} is drawn: {parts:?}");
+            }
+            book = Some(held);
+        }
     }
+    let held = book.expect("Mortimer carries his book before 8:05");
+    assert!(held.iter().any(|n| n.contains("book")), "{held:?}");
     let world = lot.world();
+    let parts = drawn_parts(&mut people, world);
+    for name in &held {
+        assert!(!parts.contains(name), "{name} is still drawn: {parts:?}");
+    }
     let mortimer = world.objects[&21].person.as_ref().unwrap();
     let carried: Vec<&str> = mortimer
         .accessories
@@ -898,7 +941,6 @@ fn mortimer_stands_without_his_book_as_the_original_draws_him() {
     assert!((animator.head.target_heading.to_f32() - 5.896).abs() < 5e-4);
     assert_eq!(mortimer.data[42], 8);
 
-    assert_eq!(people.update(world), Vec::<String>::new());
     let camera = LotCamera {
         zoom: Zoom::Near,
         rotation: 2,
@@ -933,5 +975,26 @@ fn mortimer_stands_without_his_book_as_the_original_draws_him() {
             "({x}, {y}) is the lot's: {:?}",
             at(&lot_only)
         );
+    }
+    // His outline at points where it lands on the same pixel in both
+    // pictures despite the half-pixel offset: for each, the pixel inside
+    // and its neighbour outside (top of the head twice, the shoes' soles,
+    // the left edge at the hair and the trousers, the right edge at the
+    // face and the trousers). In the original the inside pixel differs
+    // from the people-free render by 34 or more in some channel and the
+    // outside one by at most 1. A one-pixel move either way breaks some.
+    let edges = [
+        ([434, 233], [434, 232]),
+        ([447, 237], [447, 236]),
+        ([437, 384], [437, 385]),
+        ([446, 385], [446, 386]),
+        ([431, 268], [430, 268]),
+        ([434, 360], [433, 360]),
+        ([450, 247], [451, 247]),
+        ([447, 352], [448, 352]),
+    ];
+    for ([x, y], [ox, oy]) in edges {
+        assert_eq!(canvas.id_at(x, y), Some(21), "({x}, {y}) is his");
+        assert_ne!(canvas.id_at(ox, oy), Some(21), "({ox}, {oy}) is not his");
     }
 }
