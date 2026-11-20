@@ -490,12 +490,23 @@ impl Interpreter<'_> {
                     "relationship cleanup (0x44120f) found missing registered object {other}"
                 )))
             })?;
-            if let Some(row) = object
-                .relationships
-                .iter()
-                .position(|row| row.present != 0 && row.target == target)
-            {
-                object.relationships.remove(row);
+            // 0x464fab to 0x464fbd reads each row through its pointer, so
+            // an empty row before the match would fault there.
+            let mut found = None;
+            for (place, row) in object.relationships.iter().enumerate() {
+                if row.present == 0 {
+                    return Err(fail(Trap::Invalid(format!(
+                        "object {other}'s relationship row {place} is empty, which the \
+                         cleanup (0x464fb1) would read through"
+                    ))));
+                }
+                if row.target == target {
+                    found = Some(place);
+                    break;
+                }
+            }
+            if let Some(place) = found {
+                object.relationships.remove(place);
             }
         }
         Ok(())
