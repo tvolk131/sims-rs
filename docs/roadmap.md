@@ -92,7 +92,7 @@ events, and what it asks for after them) come first.
    through UD1 update 259 apart from two load differences (the 0x8000 frame-tree bit on four
    objects and object 2's last result), global 12 at update 3 and the
    dog's frame-arena word (#275); the original's exact read timing is
-   unverified. Open #276 extends the comparison to update 490, where
+   unverified. #276 extends the comparison to update 490, where
    the capture ends, and its UD2 test boots House 69 from the
    original's after-import snapshot and runs 1,000 ticks.
    Done for 6b: the family-file (.FAM) reader (#252; the original's
@@ -108,8 +108,9 @@ events, and what it asks for after them) come first.
    In the original, the first three houseless pools fill during
    neighborhood setup after `Patch`; the other two fill from lot or
    toolbar callbacks. Track 4's replay matches the pool members' GUID
-   low words and saved traits. Details are in track 4's pools decision
-   (#276, open).
+   low words and saved traits. Details are in the pools decision
+   (`docs/decisions/20261120-neighborhood-open-fills-five-pools.md`,
+   #276).
    Decided 2026-11-20 (coordinator): 6a comes first; the pools follow
    as 6b part E, which uses recorded inputs; exact files and looks are
    deferred.
