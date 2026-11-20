@@ -69,7 +69,9 @@ is tried again there); the baseline, --watch, --scenario and a due --dump
 arm it too. A late watch is set (or moved) only at a stop on the lot
 captured; at a stop on another lot, one that goes through an object is
 taken off (watch_lost with elsewhere true) until it can be set there
-again. A run taken over does not count a late watch an earlier revision
+again, and that includes a stop at a watchpoint on another lot: the write
+is logged with no watch's name. Each watch.jsonl row says the lot it was
+written on (lot). A run taken over does not count a late watch an earlier revision
 set (those recorded no lot): it ends with set false.
 So a late watch on a busy address (the random state) costs nothing while
 the load and the other updates run.
@@ -790,6 +792,15 @@ def main():
             # The same virtual address in another process.
             event(kind='foreign_watch', address=hit, pc=regs['eip'], cr3=regs['cr3'], update=updates)
             return
+        # A write at a stop on another lot (before its next entry or dialog breakpoint) is not this
+        # lot's: a moving late watch is taken off first, as at any stop there, so the write is not
+        # logged under its name (its address may be another lot's object's by then).
+        try:
+            lot = m.lot()
+        except MemoryError:
+            lot = None
+        if lot != args.lot:
+            check_watches(m, False)
         # One row per watch on the written bytes (one with name null if none is).
         hits = [w for w in live_watches if w.address == hit] or [w for w in live_watches if w.address <= hit < w.address + w.size]
         for w in hits or [None]:
@@ -797,7 +808,7 @@ def main():
             # next entry or return (in_update None): the write is in update `updates` or `updates` + 1,
             # so update is null and after_update says which was recorded last.
             row = dict(update=None if in_update is None else updates + (1 if in_update else 0),
-                       after_update=updates, in_update=in_update, address=hit,
+                       after_update=updates, in_update=in_update, address=hit, lot=lot,
                        name=w.name if w else None, registers=regs, eip=regs['eip'])
             # The tick through this lot's simulator only (after a return elsewhere, sim is another
             # lot's until the next entry here), read apart so the values are kept if it fails.

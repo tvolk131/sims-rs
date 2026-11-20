@@ -420,6 +420,22 @@ class CaptureTest(unittest.TestCase):
         ended = self.events(output, 'watch_ended')
         self.assertEqual([(r['update'], r['set']) for r in ended], [(2, True)])
 
+    def test_a_write_on_another_lot_is_not_logged_under_a_moving_late_watch(self):
+        # Set at the end of update 1; the guest goes to lot 7 and writes the
+        # watched address before any breakpoint there. The watch is taken
+        # off at that stop, and the row names no watch and says the lot.
+        remote, output, _ = self.run_capture([
+            dict(pc=0), dict(pc=capture.ENTRY), dict(pc=capture.RETURN),
+            dict(pc=0x123456, lot=7, reply='T05watch:70088;'),
+            dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
+            ['--updates', '2', '--late-watch', '2-2,direction=person:259@0xadc+0x88'])
+        rows = self.rows(output / 'watch.jsonl')
+        self.assertEqual([(r['name'], r['lot'], 'before' in r) for r in rows], [(None, 7, False)])
+        lost = self.events(output, 'watch_lost')
+        self.assertEqual([r.get('elsewhere') for r in lost], [True])
+        ended = self.events(output, 'watch_ended')
+        self.assertEqual([(r['update'], r['set']) for r in ended], [(2, True)])
+
     def test_a_watch_armed_records_the_lot_it_was_armed_on(self):
         remote, output, _ = self.run_capture(
             [dict(pc=0), dict(pc=capture.ENTRY, lot=7), dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
