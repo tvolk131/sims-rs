@@ -323,9 +323,17 @@ impl Machine<'_, '_> {
             .ok()
             .filter(|id| self.world.objects.contains_key(id))
             .ok_or(Trap::native(0x34, "Go To Routing Slot has no stack object"))?;
+        // 0x40743b and 0x432595 (through 0x4325b5 and 0x422632) read the
+        // stack object's own fields only: its position (+0xf4), its
+        // container (+0x66, +0x7e) and +0x110. No animator is read before
+        // this test, so a first run whose stack object is off the lot
+        // gives false whether or not an animator refresh is pending. Past
+        // it the route reads the person's animator, so the step's checks
+        // for an unsettled animator apply from here.
         if !stands_on_lot(self.world, target)? {
             return Ok(Flow::Branch(false));
         }
+        self.refuse_unsettled_animator(45)?;
         let source = word(operands, 2);
         let number = word(operands, 0);
         let (owner, index) = match source {

@@ -152,6 +152,14 @@ impl Machine<'_, '_> {
                     action.target
                 ))
             })?;
+        // Up to here Idle For Input read the person's words, motives and
+        // queue, the frame's parameter and the lot's zoning (0x45d7c0,
+        // through 0x40745f and 0x453141; 0x47518b, 0x41ed43, 0x45f77b),
+        // and no animator. Starting the action runs check trees and makes
+        // it the running one, which works the person's footprint out
+        // again (0x45e6cd calls 0x433d16), so the step's checks for an
+        // unsettled animator apply from here.
+        self.refuse_unsettled_animator(17)?;
         let mut saved = None;
         let flow = self.check_and_start(action, target, index, &mut saved);
         // The temps go back however the start ended (0x4582dd, also on

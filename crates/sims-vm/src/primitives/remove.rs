@@ -24,6 +24,9 @@
 //! leaves through `Interpreter::take_off_to_remove`, the one way a person
 //! leaves the lot that is ported.
 //!
+//! A person removed is saved into its neighborhood record (0x425a69,
+//! `crate::people::save_to_record`) once it is queued.
+//!
 //! Flag bit 1 asks that removing the object does not reset
 //! the objects that depend on it; it is recorded on the object for
 //! whatever carries the removal out.
@@ -72,6 +75,19 @@ impl Machine<'_, '_> {
             )));
         }
         self.queue_removal(id, flags)?;
+        // A person removed is saved into its neighborhood record
+        // (0x451bee to 0x451c03): the object named, not the lead tile the
+        // queue may take for it, after the queue. The save reads person
+        // words the animator's refresh at the take-off does not write
+        // (that writes words 41 to 45 and 64, `crate::head`).
+        if self
+            .world
+            .objects
+            .get(&id)
+            .is_some_and(|o| o.person.is_some())
+        {
+            crate::people::save_to_record(self.world, id)?;
+        }
         if !self.synchronous && id == self.me && flags & 1 == 0 {
             return Ok(Flow::Yield);
         }

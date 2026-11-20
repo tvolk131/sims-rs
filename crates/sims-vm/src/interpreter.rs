@@ -903,6 +903,41 @@ impl<'a> Machine<'a, '_> {
         }
     }
 
+    /// Fails if primitive `opcode` may read an animator that is not
+    /// settled: a person took itself off the lot and its animator's tick
+    /// has not run yet ([`Interpreter::take_self_off`]), or the running
+    /// person is queued for removal. The refresh at the take-off may or
+    /// may not have been made, and what it writes is what such a
+    /// primitive could read. Remove Object Instance checks for itself
+    /// (`Machine::remove`) while the refresh is pending.
+    pub(crate) fn refuse_unsettled_animator(&self, opcode: u16) -> Result<(), Trap> {
+        if let Some(refreshing) = self.refreshing
+            && let Some(person) = refreshing
+                .borrow()
+                .pending
+                .as_ref()
+                .map(|_| refreshing.borrow().person)
+            && opcode != 18
+        {
+            return Err(Trap::Unsupported(format!(
+                "{} (opcode {opcode}) after person {person} left the lot and before its \
+                 animator's tick: the animator's refresh at the take-off (0x58da12), if the \
+                 house view drew the person, may have written what it reads",
+                crate::primitives::primitive_name(opcode),
+            )));
+        }
+        if self.world.removals.contains(&self.me) && self.me()?.person.is_some() {
+            return Err(Trap::Unsupported(format!(
+                "{} (opcode {opcode}) on the thread of person {}, which is queued for removal: its \
+                 animator's refresh as it left the lot (0x58da12), if the house view drew it, \
+                 may have written what it reads",
+                crate::primitives::primitive_name(opcode),
+                self.me
+            )));
+        }
+        Ok(())
+    }
+
     /// Executes one instruction.
     pub fn step(&mut self) -> Result<Status, Trap> {
         let instruction = self.current()?;
@@ -919,36 +954,20 @@ impl<'a> Machine<'a, '_> {
             self.call(instruction)?;
             return Ok(Status::Running);
         }
-        if let Some(refreshing) = self.refreshing
-            && let Some(person) = refreshing
-                .borrow()
-                .pending
-                .as_ref()
-                .map(|_| refreshing.borrow().person)
-            && !crate::placement::reads_no_animator(instruction.opcode, &instruction.operands)
-            // Remove Object Instance checks for itself (`Machine::remove`).
-            && instruction.opcode != 18
+        // Two primitives apply these checks themselves, at the point
+        // where they would go on to read an animator: Go To Routing Slot's
+        // first run, once its stack object is found on the lot
+        // (`Machine::go_to_slot`), and Idle For Input, once it starts a
+        // queued action (`Machine::start_queued`).
+        let checks_itself = match instruction.opcode {
+            45 => self.frame()?.primitive_state == 0,
+            17 => true,
+            _ => false,
+        };
+        if !crate::placement::reads_no_animator(instruction.opcode, &instruction.operands)
+            && !checks_itself
         {
-            return Err(Trap::Unsupported(format!(
-                "{} (opcode {}) after person {person} left the lot and before its \
-                 animator's tick: the animator's refresh at the take-off (0x58da12), if the \
-                 house view drew the person, may have written what it reads",
-                crate::primitives::primitive_name(instruction.opcode),
-                instruction.opcode
-            )));
-        }
-        if self.world.removals.contains(&self.me)
-            && self.me()?.person.is_some()
-            && !crate::placement::reads_no_animator(instruction.opcode, &instruction.operands)
-        {
-            return Err(Trap::Unsupported(format!(
-                "{} (opcode {}) on the thread of person {}, which is queued for removal: its \
-                 animator's refresh as it left the lot (0x58da12), if the house view drew it, \
-                 may have written what it reads",
-                crate::primitives::primitive_name(instruction.opcode),
-                instruction.opcode,
-                self.me
-            )));
+            self.refuse_unsettled_animator(instruction.opcode)?;
         }
         let state = self.frame()?.primitive_state;
         if state == RAN_TREE && instruction.opcode == 28 {

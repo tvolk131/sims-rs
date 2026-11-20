@@ -272,7 +272,7 @@ fn another_object_takes_a_person_off_and_nothing_reads_its_animator_after() {
     fx.add(
         file,
         4201,
-        tree(vec![ins(8, RETURN_TRUE, RETURN_FALSE, [0; 8])]),
+        tree(vec![ins(44, RETURN_TRUE, RETURN_FALSE, [0; 8])]),
     );
     let result = fx.run_with(id, 4201, 0, &[], 1000);
     let t = trap(result);
@@ -352,12 +352,12 @@ fn a_person_another_took_off_ticks_with_its_refresh_pending() {
     assert_eq!(update.ticked, [LAMP, id]);
     assert_eq!(fx.world.removals, [id]);
     // Its thread may not run a primitive that reads an animator before
-    // its animator's tick (Random, opcode 8, here).
+    // its animator's tick (Animate Sim, opcode 44, here).
     fx.world = ready;
     fx.add(
         file,
         4204,
-        tree(vec![ins(8, RETURN_TRUE, RETURN_FALSE, [0; 8])]),
+        tree(vec![ins(44, RETURN_TRUE, RETURN_FALSE, [0; 8])]),
     );
     fx.thread(id, 4204, &[0; 4]);
     let (result, _) = pass(&mut fx);
@@ -402,7 +402,7 @@ fn a_person_removing_itself_and_going_on_settles_its_refresh_at_its_animators_ti
     assert_eq!(update.ticked, [id]);
     assert_eq!(fx.world.removals, [id]);
     assert_eq!(fx.world.objects[&id].position, [-16, -16, 1]);
-    // Then Random (opcode 8), which reads an animator: it fails on the
+    // Then Animate Sim (opcode 44), which reads an animator: it fails on the
     // pending refresh.
     fx.world = ready;
     fx.add(
@@ -410,11 +410,82 @@ fn a_person_removing_itself_and_going_on_settles_its_refresh_at_its_animators_ti
         4206,
         tree(vec![
             ins(REMOVE, 1, 1, [0, 0, 1, 0, 0, 0, 0, 0]),
-            ins(8, RETURN_TRUE, RETURN_FALSE, [0; 8]),
+            ins(44, RETURN_TRUE, RETURN_FALSE, [0; 8]),
         ]),
     );
     fx.thread(id, 4206, &[0; 4]);
     let (result, _) = pass(&mut fx);
     let error = result.unwrap_err().to_string();
     assert!(error.contains("left the lot and before its"), "{error}");
+}
+
+/// A record of the widget's type whose person data is all `value`.
+fn widget_record(id: i16, value: i16) -> sims_sim::neighbors::Neighbor {
+    sims_sim::neighbors::Neighbor {
+        id,
+        guid: WIDGET,
+        revision: 3,
+        data: vec![value; 256],
+        relationships: Vec::new(),
+        friends: 0,
+        stale: false,
+    }
+}
+
+#[test]
+fn a_person_removed_is_saved_into_the_record_its_word_31_names() {
+    // 0x451bee to 0x451c03, 0x425a69: the record word 31 names (by place
+    // plus one), not the first of the type, gets revision 9 (0x423e04) and
+    // the words the table at 0x423827 lists for revision 9.
+    let (mut fx, id, _) = placed_visitor();
+    let person = fx
+        .world
+        .objects
+        .get_mut(&id)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap();
+    person.data = (0..256).map(|n| 2000 + n).collect();
+    person.data[31] = 2;
+    fx.world.neighbors.slots = vec![Some(widget_record(40, -1)), Some(widget_record(41, -2))];
+    let before = fx.world.neighbors.clone();
+    assert_eq!(fx.run_with(LAMP, 4200, id as i16, &[], 1000), Ok(true));
+    assert_eq!(fx.world.removals, [id]);
+    assert_eq!(fx.world.neighbors.get(1), before.get(1));
+    let record = fx.world.neighbors.get(2).unwrap();
+    assert_eq!(record.revision, 9);
+    let saved = [
+        2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 26, 46, 47, 48, 49, 50, 51,
+        52, 53, 54, 55, 56, 57, 58, 60, 61, 63, 65, 67, 68, 69, 74, 75, 76, 80, 81, 82,
+    ];
+    for word in 0..256 {
+        let expected = if saved.contains(&word) {
+            2000 + word as i16
+        } else {
+            -2
+        };
+        assert_eq!(record.data[word], expected, "word {word}");
+    }
+    // The record's own ID is kept.
+    assert_eq!(record.id, 41);
+}
+
+#[test]
+fn a_person_whose_word_31_names_no_record_is_removed_without_a_save() {
+    let (mut fx, id, _) = placed_visitor();
+    let person = fx
+        .world
+        .objects
+        .get_mut(&id)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap();
+    person.data[31] = 3;
+    fx.world.neighbors.slots = vec![Some(widget_record(40, -1)), Some(widget_record(41, -2))];
+    let before = fx.world.neighbors.clone();
+    assert_eq!(fx.run_with(LAMP, 4200, id as i16, &[], 1000), Ok(true));
+    assert_eq!(fx.world.removals, [id]);
+    assert_eq!(fx.world.neighbors, before);
 }
