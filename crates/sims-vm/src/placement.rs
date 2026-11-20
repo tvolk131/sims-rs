@@ -58,13 +58,16 @@ pub(crate) use find::{
 pub(crate) struct Refreshing {
     pub person: u16,
     pub pending: Option<Pending>,
+    /// Whether a step is running both ways with the refresh taken out
+    /// (`crate::both_ways`).
+    pub both_ways: bool,
 }
 
 /// A person's animator refresh at its taking itself off the lot, worked
 /// out then (`Interpreter::refresh_at_take_off`): the animator and base
 /// layer the take-off left, and those the refresh would have left
 /// instead. The refresh writes nothing else.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Pending {
     pub left: Kept,
     pub refreshed: Kept,

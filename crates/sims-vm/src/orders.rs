@@ -87,7 +87,7 @@ use sims_sim::World;
 /// The original keeps the name in the action (+0x28) and queues it with
 /// the action; the queue here keeps actions only, so a picked entry's
 /// name is not kept.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MenuEntry {
     pub action: Interaction,
     pub name: Option<String>,
@@ -96,7 +96,7 @@ pub struct MenuEntry {
 /// The listing's state while it checks an action (the original's
 /// pointers 0x6e5130 and 0x6e50fc, the menu being built, and 0x6e50f8,
 /// the action being checked): see [`crate::Interpreter`]'s `menu`.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Checking {
     /// The action being checked, as the check has left it so far.
     pub action: Interaction,

@@ -909,7 +909,9 @@ impl<'a> Machine<'a, '_> {
     /// person is queued for removal. The refresh at the take-off may or
     /// may not have been made, and what it writes is what such a
     /// primitive could read. Remove Object Instance checks for itself
-    /// (`Machine::remove`) while the refresh is pending.
+    /// (`Machine::remove`) while the refresh is pending. While a step runs
+    /// both ways (`crate::both_ways`) the refresh is taken out, so the
+    /// step may read the animator.
     pub(crate) fn refuse_unsettled_animator(&self, opcode: u16) -> Result<(), Trap> {
         if let Some(refreshing) = self.refreshing
             && let Some(person) = refreshing
@@ -926,7 +928,15 @@ impl<'a> Machine<'a, '_> {
                 crate::primitives::primitive_name(opcode),
             )));
         }
-        if self.world.removals.contains(&self.me) && self.me()?.person.is_some() {
+        // A person whose own thread queued it for removal in this tick,
+        // with its refresh pending, has that removal's refresh in the
+        // pending one: the removal joins it (`Interpreter::refresh_again`)
+        // or sets it (`Interpreter::refresh_before_removal`), and a step
+        // that reads its animator runs both ways (`crate::both_ways`).
+        let both_ways = self
+            .refreshing
+            .is_some_and(|r| r.borrow().both_ways && r.borrow().person == self.me);
+        if self.world.removals.contains(&self.me) && self.me()?.person.is_some() && !both_ways {
             return Err(Trap::Unsupported(format!(
                 "{} (opcode {opcode}) on the thread of person {}, which is queued for removal: its \
                  animator's refresh as it left the lot (0x58da12), if the house view drew it, \
@@ -953,6 +963,16 @@ impl<'a> Machine<'a, '_> {
             }
             self.call(instruction)?;
             return Ok(Status::Running);
+        }
+        // With a person's animator refresh pending, a primitive that may
+        // read an animator runs both ways (`crate::both_ways`). Remove
+        // Object Instance checks for itself (`Machine::remove`).
+        if let Some(refreshing) = self.refreshing
+            && refreshing.borrow().pending.is_some()
+            && instruction.opcode != 18
+            && !crate::placement::reads_no_animator(instruction.opcode, &instruction.operands)
+        {
+            return self.step_both_ways(refreshing, instruction.opcode);
         }
         // Go To Routing Slot applies these checks itself on its first run,
         // once it has named its slot and found its stack object on the lot

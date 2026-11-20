@@ -36,7 +36,7 @@ pub struct Multipart {
     pub group: [i32; 3],
     pub parent: i16,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Interaction {
     pub uid: i32,
     pub caller: i16,

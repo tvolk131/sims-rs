@@ -638,6 +638,7 @@ impl Interpreter<'_> {
         let refreshing = RefCell::new(Refreshing {
             person: id,
             pending,
+            both_ways: false,
         });
         let ticked = Interpreter {
             refreshing: Some(&refreshing),
