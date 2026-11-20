@@ -426,9 +426,16 @@ impl Lot {
         Self::load_with(root, house, answers, frames, CrtRng::from_state(1))
     }
 
-    /// [`Lot::load`] with the C runtime's generator (`World::crt_rng`) as
-    /// the game left it before the load: after a neighborhood's first
-    /// open, for one, whose import and pools draw from it.
+    /// [`Lot::load`] with the C runtime's generator (`World::crt_rng`)
+    /// starting at `crt`: after a neighborhood's first open, for one,
+    /// whose import and pools draw from it.
+    ///
+    /// `crt` is the state from which this load's own draws reach the
+    /// original's entry state. Those include the 64 draws of making the
+    /// two indicator objects (`Interpreter::create_indicators`), which the
+    /// original may already have made before its lot load starts. So
+    /// `crt` need not be the original's state at any one point before its
+    /// load, and passing that state instead would replay those draws.
     pub fn load_with(
         root: &Path,
         house: &Path,

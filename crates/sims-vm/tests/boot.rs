@@ -867,21 +867,27 @@ const TICK_31478: &str = "3216df89133960f7ea56d3456874226daa4ac3a540c1a958357a0a
 /// the end.
 const TICK_31478_29: &str = "8b7ae0ca751002b0ee36bd32ba0f921c494bebf77fba4a27f50e84fdc3754091";
 /// Where to start the C runtime's generator for House 69's load in track
-/// 2's second run: state 1 after this many draws, fitted to the recording's
-/// entry state (state 1 after 405,850 draws, of which our load makes the
-/// last 4,730). It stands for the draws of the open's import and pools
-/// before the load, which are not ported (6b E). That nothing reseeded the
-/// generator in between is inferred from the fit, not observed.
+/// 2's second run: state 1 after this many draws, fitted so that our
+/// load's own 4,730 draws reach the recording's entry state (state 1 after
+/// 405,850 draws). It stands for the draws of the open's import and pools,
+/// which are not ported (6b E), and for any of our load's draws the
+/// original makes earlier ([`Lot::load_with`]). That the generator ran on
+/// from state 1 with no reseed is assumed, not observed.
 const OPEN_DRAWS: u32 = 401_120;
 /// The frames track 2's House 69 recordings drew: after updates 0 to 2,
 /// 29, 59, 89, 101 and 102, then every 30th from 123
 /// (`house69-ud2-ticks-20261120/watch.jsonl`, the frame watch outside
 /// an update).
 const RECORDED_FRAMES: &str = "0,1,2,29,59,89,101,102,123+30";
-/// The imported House 69's state at entry (format 30), which matches
-/// track 2's recording of it (`house69-ud2-ticks-20261120`).
+/// The imported House 69's state at entry (format 30), a regression pin of
+/// our run. Track 2's recording of it (`house69-ud2-ticks-20261120`)
+/// differs at entry in object 2's last result; see the decision
+/// `20261120-ud2-house-69-boots-from-the-originals-import.md` for what
+/// the comparison reads and skips.
 const IMPORTED_69: &str = "647c524ea5e613ef5d94a2398525f0f3004ce7921af4ba278ee704c321722f29";
-/// The same after 1000 ticks, with the recording's frames.
+/// The same after 1000 ticks, with the recording's frames: a regression
+/// pin, which differs from the recording's update 1000 in object 2's last
+/// result.
 const IMPORTED_69_1000: &str = "c4aaebafe6a691b3e16e0adc650bd1c7803c14bb8ff4ce417c9e9d3ca33cbad0";
 /// The same at tick 43200, a whole day from the load.
 const TICK_43200: &str = "b67d0c132d35c3579bdc28dfc91fd4476c755c76c6efa18a881615c33fda41e2";

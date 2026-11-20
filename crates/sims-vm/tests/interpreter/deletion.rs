@@ -129,6 +129,43 @@ fn deletion_erases_incoming_object_relationships_including_a_persons() {
 }
 
 #[test]
+fn deletion_erases_only_the_first_matching_row_and_passes_empty_rows_after_it() {
+    let (mut fx, _) = lot(3, false);
+    let row = |present, target| Relationship {
+        present,
+        target,
+        values: vec![target],
+    };
+    // 0x464fa2 stops at the first row naming the deleted ID (0x464fbd),
+    // so an empty row after it is never read and a second match stays.
+    fx.world.objects.get_mut(&1).unwrap().relationships = vec![row(1, 2), row(0, 0), row(1, 2)];
+    let mut world = fx.world.clone();
+    fx.interpreter().delete(&mut world, 2).unwrap();
+    let rows: Vec<_> = world.objects[&1]
+        .relationships
+        .iter()
+        .map(|row| (row.present, row.target))
+        .collect();
+    assert_eq!(rows, [(0, 0), (1, 2)]);
+}
+
+#[test]
+fn deletion_fails_on_an_empty_row_before_the_match() {
+    let (mut fx, _) = lot(3, false);
+    let row = |present, target| Relationship {
+        present,
+        target,
+        values: vec![target],
+    };
+    // The original reads each row through its pointer (0x464fb1), so an
+    // empty row before the match would fault there.
+    fx.world.objects.get_mut(&1).unwrap().relationships = vec![row(0, 0), row(1, 2)];
+    let mut world = fx.world.clone();
+    let error = fx.interpreter().delete(&mut world, 2).unwrap_err();
+    assert!(format!("{error:?}").contains("0x464fb1"), "{error:?}");
+}
+
+#[test]
 fn an_object_without_a_reset_tree_is_deleted_without_running_anything() {
     let (mut fx, _) = lot(2, false);
     fx.world.instances.insert(WIDGET, vec![1, 2]);
