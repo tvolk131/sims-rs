@@ -8,49 +8,56 @@
 //!    the one that changed it is the graphic under the pointer, the last
 //!    drawn winning. The pick takes it when it stands on the floor shown
 //!    (+0x110 against 0x49295d). Here, the person or bob whose pixel the
-//!    frame shows there ([`Canvas::id_at`]: `sims_people` names each
-//!    person's pixels and the bob's): the pixel itself, with no reach
-//!    around it.
+//!    frame showed there once the people were drawn (`sims_people` names
+//!    each person's pixels and the bob's): the pixel itself, with no reach
+//!    around it. The objects that hold a person draw after the people
+//!    (`sims_render::draw_held`, as the original's moving pass does), so a
+//!    bench's backrest may cover a pixel of the Sim on it; the Sim's draw
+//!    still changed the depth there, so the Sim is noted.
 //! 2. **Otherwise the sprite pick** (0x4aa713, [`Lot::sprite_pick`]):
 //!    from the tile the lot's depth at the pixel stands for, the tiles
 //!    toward the viewer, and the first whose objects' screen rectangles
 //!    hold the point ([`Canvas::drawn`], widened to whole groups of four
-//!    columns as the original keeps them, 0x438f71).
+//!    columns as the original keeps them, 0x438f71). An object drawn after
+//!    the people has its rectangle there too.
 //!
 //! The depth the original reads at the pointer is the lot's alone: a
 //! dump with Sims on screen shows them in the colour buffer only. So the
-//! sprite pick unprojects the depth the lot left before its people were
-//! drawn ([`Depth::unproject`]). Each tile of a multi-tile object is its
+//! sprite pick unprojects the depth `sims_render::draw_lot` left, before
+//! the people and the objects that hold one were drawn
+//! ([`Depth::unproject`]). Each tile of a multi-tile object is its
 //! own object and is picked as itself, not as its group's lead: that is
 //! the object the pie menu is listed on, and the simulation sends the
 //! interactions of a tile on to the tile that takes them, as the
 //! original does (`crate::menu::target`, 0x435286).
 
 use sims_render::depth::{Depth, EMPTY};
-use sims_render::{Camera, Canvas};
+use sims_render::{Camera, Canvas, Ids};
 use sims_sim::World;
 use sims_vm::boot::Lot;
 
 /// The person or object the pointer at `point` (canvas pixels) is on in
-/// `canvas`, the frame last drawn of `lot` through `camera`, whose lot
-/// left `lot_depth` (a depth per pixel, in rows of the canvas's width)
-/// before its people were drawn: the person or bob drawn at the pixel
-/// ([`noted`]), else the sprite pick's object.
+/// `canvas`, the frame last drawn of `lot` through `camera`. Its lot left
+/// `lot_depth` (a depth per pixel, in rows of the canvas's width) before
+/// anything else was drawn, and `people` are its IDs once the people were
+/// drawn. The answer is the person or bob drawn at the pixel ([`noted`]),
+/// else the sprite pick's object.
 pub fn at(
     lot: &Lot,
     camera: &Camera,
     canvas: &Canvas,
     lot_depth: &[i32],
+    people: &Ids,
     point: [i32; 2],
 ) -> Option<u16> {
-    noted(lot.world(), camera, canvas, point)
+    noted(lot.world(), camera, people, point)
         .or_else(|| sprite(lot, camera, canvas, lot_depth, point))
 }
 
-/// The person or plumb bob drawn at `point` in `canvas`, if it stands on
-/// the floor `camera` shows.
-pub fn noted(world: &World, camera: &Camera, canvas: &Canvas, [x, y]: [i32; 2]) -> Option<u16> {
-    let id = canvas.id_at(x, y)?;
+/// The person or plumb bob drawn at `point`, by `people`, a frame's IDs
+/// once its people were drawn, if it stands on the floor `camera` shows.
+pub fn noted(world: &World, camera: &Camera, people: &Ids, [x, y]: [i32; 2]) -> Option<u16> {
+    let id = people.id_at(x, y)?;
     let object = world.objects.get(&id)?;
     let three_d = object.person.is_some() || object.guid == sims_people::bob::STANDARD;
     (three_d && object.position[2] == camera.level).then_some(id)

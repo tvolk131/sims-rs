@@ -117,6 +117,35 @@ pub struct Canvas {
     rects: std::collections::BTreeMap<u16, Rect>,
 }
 
+/// Which object or person drew each pixel of a canvas, kept apart from
+/// it: what [`Canvas::id_at`] read when it was taken ([`Canvas::ids`],
+/// [`Ids::take`]). A frame drawn in passes keeps the IDs of a pass this
+/// way before the next draws over them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Ids {
+    width: usize,
+    height: usize,
+    ids: Vec<Option<u16>>,
+}
+
+impl Ids {
+    /// The ID that had drawn the pixel at (`x`, `y`) last when these were
+    /// taken, if any had and the pixel is on the canvas.
+    pub fn id_at(&self, x: i32, y: i32) -> Option<u16> {
+        let (x, y) = (usize::try_from(x).ok()?, usize::try_from(y).ok()?);
+        (x < self.width && y < self.height)
+            .then(|| self.ids[y * self.width + x])
+            .flatten()
+    }
+
+    /// Takes `canvas`'s IDs as they are now, reusing this one's storage.
+    pub fn take(&mut self, canvas: &Canvas) {
+        self.width = canvas.width;
+        self.height = canvas.height;
+        self.ids.clone_from(&canvas.ids);
+    }
+}
+
 /// A screen rectangle: left, top, right and bottom, the right and bottom
 /// edges outside it.
 pub type Rect = [i32; 4];
@@ -157,6 +186,13 @@ impl Canvas {
     /// hit.
     pub fn id_at(&self, x: i32, y: i32) -> Option<u16> {
         self.ids[self.index(x, y)?]
+    }
+
+    /// The IDs of every pixel as they are now ([`Ids`]).
+    pub fn ids(&self) -> Ids {
+        let mut ids = Ids::default();
+        ids.take(self);
+        ids
     }
 
     /// The rectangle the images drawn under `id` cover, each whole, drawn
@@ -691,6 +727,13 @@ mod tests {
         c.clear([0, 0, 0]);
         c.plot(2, 0, 0, [4, 4, 4]);
         assert_eq!([c.id_at(0, 0), c.id_at(2, 0)], [None, None]);
+        // The IDs taken keep what the canvas named then, not what it
+        // names after a later draw.
+        let taken = c.ids();
+        c.set_id(Some(9));
+        c.plot(1, 0, 0, [4, 4, 4]);
+        assert_eq!([taken.id_at(1, 0), taken.id_at(2, 0)], [None, Some(7)]);
+        assert_eq!([c.id_at(1, 0), taken.id_at(3, 0)], [Some(9), None]);
     }
 
     #[test]

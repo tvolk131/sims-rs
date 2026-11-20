@@ -98,6 +98,23 @@ it into `sims_game::pick` and `Lot::sprite_pick` (sims-vm).
   so a view moved or turned since the last frame does not move the pick.
   Before the first frame, and off the canvas, the sprite pick finds
   nothing.
+- The objects that hold a person (an in-use bench) draw after the
+  people, as the original's moving pass does
+  (`sims_render::draw_held`,
+  `20261120-objects-holding-a-person-draw-after-the-people.md`; 0x4a9458,
+  then 0x4aa1d7). So:
+  - The noted person is read from the frame's IDs as they were once the
+    people were drawn, before those objects draw over them. In the
+    original the Sim's draw changed the depth at the pointer before the
+    bench drew, so a Sim behind the backrest of the bench they sit on is
+    noted. A Goth-house test pins this: at 7:12 AM, 1134 of the in-use
+    bench's pixels cover Mortimer and pick him.
+  - The depth the sprite pick unprojects is the one `draw_lot` leaves,
+    without those objects, as the people are left out of it. That they
+    are left out of the original's too is **unverified**: the dump that
+    showed the people missing did not look at them.
+  - Their drawn rectangles are kept as the lot's are, so the sprite pick
+    finds them: the bench's other 2039 pixels in that test all pick it.
 
 ## What the replays show
 

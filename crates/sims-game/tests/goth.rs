@@ -143,11 +143,12 @@ fn people_stand_where_a_click_finds_them() {
     assert!(bob.is_none() || !on_bob.is_empty(), "the bob is not drawn");
     // A click on the bob's pixels finds the bob, not its holder.
     let camera = &view.camera;
+    let people_ids = canvas.ids();
     assert!(
         bob.is_none()
             || on_bob
                 .iter()
-                .all(|&p| pick::noted(world, camera, &canvas, p) == bob),
+                .all(|&p| pick::noted(world, camera, &people_ids, p) == bob),
         "a click on the bob finds something else"
     );
     // A click on a pixel a person was drawn in finds that person, the
@@ -157,7 +158,7 @@ fn people_stand_where_a_click_finds_them() {
         let Some(shown) = canvas.id_at(x, y) else {
             continue;
         };
-        let id = pick::noted(world, camera, &canvas, [x, y]);
+        let id = pick::noted(world, camera, &people_ids, [x, y]);
         assert_eq!(id, Some(shown), "at {:?}", [x, y]);
         assert!(world.objects[&shown].person.is_some(), "object {shown}");
         found.insert(shown);
@@ -172,7 +173,7 @@ fn people_stand_where_a_click_finds_them() {
         .iter()
         .find(|p| far(p))
         .expect("a pixel far from every person");
-    assert_eq!(pick::noted(world, camera, &canvas, far_point), None);
+    assert_eq!(pick::noted(world, camera, &people_ids, far_point), None);
     // Far from everyone, a click finds an object by the sprite pick, from
     // the lot's depth alone: never a person, and mostly the object the
     // pixel shows (a rectangle nearer the viewer may hold the point too).
@@ -181,7 +182,7 @@ fn people_stand_where_a_click_finds_them() {
     for point in points.iter().filter(|p| far(p)) {
         let shown = bare.id_at(point[0], point[1]);
         assert_eq!(canvas.id_at(point[0], point[1]), shown, "{point:?}");
-        let picked = pick::at(&lot, camera, &canvas, &bare.depth, *point);
+        let picked = pick::at(&lot, camera, &canvas, &bare.depth, &people_ids, *point);
         if shown.is_some() {
             shown_objects += 1;
             agree += usize::from(picked == shown);
@@ -202,6 +203,7 @@ fn people_stand_where_a_click_finds_them() {
     let mut covered = Canvas::new(800, 600, [0, 0, 0]);
     covered.depth.fill(i32::MIN);
     people.draw(world, camera, &mut covered);
+    let covered = covered.ids();
     for &point in changed.iter().step_by(7) {
         assert_eq!(
             pick::noted(world, camera, &covered, point),
@@ -2455,4 +2457,91 @@ fn coming_back_onto_a_pie_entry_checks_it_again() {
     assert_ne!(hash(&game), later, "coming back checked it again");
     assert!(game.menu().is_some());
     assert_eq!(game.caught(), 0, "{:?}", game.errors());
+}
+
+/// The window's frame draws a bench in use after the Sim on it, as the
+/// original does: at 7:12 AM (tick 1260), near zoom, rotation 2, camera
+/// origin (591, −2018), walls down, the backrest's soft top edge blends
+/// over Mortimer's coat, (32, 16, 8) and (65, 32, 8) in the original's
+/// screenshot at the two pixels compared. Drawn into the lot under him,
+/// the edge would blend over the floor instead (see sims-people's
+/// `a_bench_in_use_draws_after_the_sim_on_it`).
+#[test]
+fn the_frame_draws_a_bench_in_use_after_the_sim_on_it() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&Options {
+        answers: vec![3, 3],
+        ..options(install)
+    })
+    .expect("the Goth house opens");
+    let left = 1260 - game.lot().ticks();
+    assert_eq!(game.run(left), left);
+    assert!(sims_render::holds_person(game.lot().world()).contains(&174));
+    game.resize([800, 600]);
+    game.view.camera.zoom = sims_render::Zoom::Near;
+    game.view.camera.rotation = 2;
+    game.view.camera.origin = [591, -2018];
+    game.view.camera.walls = sims_render::Walls::Down;
+    let frame = game.render().rgb565();
+    for ([x, y], original) in [([385, 311], [32, 16, 8]), ([405, 305], [65, 32, 8])] {
+        let at: [u8; 3] = frame[y * 800 + x];
+        assert!(
+            at.iter().zip(original).all(|(&a, b)| a.abs_diff(b) <= 12),
+            "({x}, {y}): {at:?}"
+        );
+    }
+}
+
+/// The pointer on the in-use bench of
+/// `the_frame_draws_a_bench_in_use_after_the_sim_on_it`. Where the
+/// backrest, drawn after the people, covers Mortimer, the pick notes him:
+/// in the original his draw changed the depth there before the bench drew
+/// (0x590ebd to 0x590f84), so he is the noted graphic. Elsewhere on the
+/// bench, the sprite pick finds it by the rectangle it was drawn into
+/// after the people.
+#[test]
+fn the_pointer_notes_a_sim_behind_the_bench_they_sit_on() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&Options {
+        answers: vec![3, 3],
+        ..options(install)
+    })
+    .expect("the Goth house opens");
+    let left = 1260 - game.lot().ticks();
+    assert_eq!(game.run(left), left);
+    let bench = 174;
+    let mortimer = 21;
+    assert!(sims_render::holds_person(game.lot().world()).contains(&bench));
+    game.resize([800, 600]);
+    game.view.camera.zoom = sims_render::Zoom::Near;
+    game.view.camera.rotation = 2;
+    game.view.camera.origin = [591, -2018];
+    game.view.camera.walls = sims_render::Walls::Down;
+    game.render();
+    let on_bench: Vec<[i32; 2]> = (0..600)
+        .flat_map(|y| (0..800).map(move |x| [x, y]))
+        .filter(|&[x, y]| game.canvas().id_at(x, y) == Some(bench))
+        .collect();
+    let (behind, rest): (Vec<_>, Vec<_>) = on_bench
+        .iter()
+        .map(|&p| (p, game.under(p)))
+        .partition(|&(_, picked)| picked == Some(mortimer));
+    // 1134 of the bench's 3173 pixels cover him, and the other 2039 all
+    // pick the bench.
+    assert!(
+        behind.len() > 500,
+        "the bench covers {} of him",
+        behind.len()
+    );
+    let missed: Vec<_> = rest.iter().filter(|&&(_, p)| p != Some(bench)).collect();
+    assert!(
+        missed.is_empty(),
+        "{} of {}: {missed:?}",
+        missed.len(),
+        rest.len()
+    );
 }
