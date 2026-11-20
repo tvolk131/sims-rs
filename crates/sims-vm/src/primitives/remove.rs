@@ -24,6 +24,9 @@
 //! leaves through `Interpreter::take_off_to_remove`, the one way a person
 //! leaves the lot that is ported.
 //!
+//! A person removed is saved into its neighborhood record (0x425a69,
+//! `crate::people::save_to_record`) once it is queued.
+//!
 //! Flag bit 1 asks that removing the object does not reset
 //! the objects that depend on it; it is recorded on the object for
 //! whatever carries the removal out.
@@ -58,20 +61,39 @@ impl Machine<'_, '_> {
         // its animator's refresh pending, may remove only itself, and
         // yield: that removal's own refresh joins the pending one
         // (`Interpreter::refresh_again`). Anything else could read or
-        // write what the refresh did.
-        let refresh_pending = self
-            .refreshing
-            .is_some_and(|r| r.borrow().person == self.me && r.borrow().pending.is_some());
-        if refresh_pending && (id != self.me || flags & 1 != 0 || self.synchronous) {
+        // write what the refresh did, and so could a removal another
+        // thread makes meanwhile (a cancellation callback that Idle For
+        // Input runs on the action's target, for one), which is refused
+        // like any other primitive there (`Interpreter::refuse_unsettled_animator`).
+        let pending_for = self.refreshing.and_then(|r| {
+            let r = r.borrow();
+            r.pending.as_ref().map(|_| r.person)
+        });
+        if let Some(person) = pending_for
+            && (person != self.me || id != self.me || flags & 1 != 0 || self.synchronous)
+        {
             return Err(Trap::Unsupported(format!(
-                "Remove Object Instance (opcode 18) of object {id} with flags {flags:#x} after \
-                 person {} left the lot and before its animator's tick: the animator's refresh \
-                 at the take-off (0x58da12), if the house view drew the person, may have \
-                 written what it reads",
+                "Remove Object Instance (opcode 18) of object {id} with flags {flags:#x} on the \
+                 thread of object {} after person {person} left the lot and before its \
+                 animator's tick: the animator's refresh at the take-off (0x58da12), if the \
+                 house view drew the person, may have written what it reads",
                 self.me
             )));
         }
         self.queue_removal(id, flags)?;
+        // A person removed is saved into its neighborhood record
+        // (0x451bee to 0x451c03): the object named, not the lead tile the
+        // queue may take for it, after the queue. The save reads person
+        // words the animator's refresh at the take-off does not write
+        // (that writes words 41 to 45 and 64, `crate::head`).
+        if self
+            .world
+            .objects
+            .get(&id)
+            .is_some_and(|o| o.person.is_some())
+        {
+            crate::people::save_to_record(self.world, id)?;
+        }
         if !self.synchronous && id == self.me && flags & 1 == 0 {
             return Ok(Flow::Yield);
         }

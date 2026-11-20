@@ -532,11 +532,26 @@ fn construct_person(
 /// +0x14). That it was read before the load, and not between the load and
 /// the first cat, is **unverified**; so is where (the avatar registry's
 /// scan at startup, 0x59f844, reads files through 0x59f087, whose
-/// skeleton records go through 0x598af7), and so is the rest of the
-/// list: the same folder of `ExpansionShared.far`
-/// holds the "dog" and "effects1" skeletons, which no capture has made.
-pub const READ_BEFORE_THE_FIRST_LOAD: &[&str] =
-    &["ExpansionShared/ExpansionShared.far/Skeletons\\kat_skeleton.cmx.bcf"];
+/// skeleton records go through 0x598af7).
+///
+/// The dog file is read before the first load too. A recording of the
+/// first neighborhood's House 69 (`house69-ud1-ticks-20261119`), which
+/// holds a dog (object 9) and an adult (object 274), enters the lot with
+/// the stream 4,730 draws on from 1. Reading the dog file at the load
+/// would make it 6,497. The file costs 1,776 draws, and skipping it
+/// changes the adult's default-trait draws from 33 to 42, so the net is
+/// 1,767 more. The Goth day's first dog (strict tick 10,358; update
+/// 24,766 of the recording) likewise costs 1,776 draws, its own copy, as
+/// in the original, where reading the file there would make it 3,552.
+/// The startup scan (0x59f844 → 0x59f087 → 0x598af7) walks the
+/// Complete Collection's file map with the dog file before the kat file.
+/// The list's order has no effect here: the World keeps the files as a
+/// set. The rest of that folder, the "effects1" skeleton, no capture has
+/// made, and it is not listed.
+pub const READ_BEFORE_THE_FIRST_LOAD: &[&str] = &[
+    "ExpansionShared/ExpansionShared.far/Skeletons\\dog_skeleton.cmx.bcf",
+    "ExpansionShared/ExpansionShared.far/Skeletons\\kat_skeleton.cmx.bcf",
+];
 
 /// The files of [`READ_BEFORE_THE_FIRST_LOAD`] as `people` names them.
 /// A skeleton's file is its location in the install, spelled as it is on
