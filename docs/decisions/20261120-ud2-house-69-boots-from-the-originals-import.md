@@ -61,7 +61,9 @@ both of a kind the UD1 House 69 check also has:
   frame. Its one local is 5623 in the original and 0 here. That local is
   word 77 of the person's frame block. Our block reached only 68 words
   before this frame, so nothing had written word 77. The original's holds
-  whatever its heap left there, as the dog's frame word does in UD1.
+  whatever its heap left there. The UD1 recording shows the same: the same
+  person (object 274 there too) in the same frame from update 112, with
+  3244.
 
 So `IMPORTED_69` and `IMPORTED_69_1000` are the recording's states, apart
 from those two.
