@@ -811,8 +811,11 @@ def main():
         # One row per watch the write may have been to (one with name null if none), matched against
         # the watches as they were set when the write was made. The stop reply names the base of the
         # watchpoint that fired (QEMU checks the newest first), not the bytes written, so a write
-        # over watches that overlap names only one of them: every watch whose value changed has a
-        # row too, and a watch that only overlaps the named watchpoint has one only if it changed.
+        # over watches that overlap names only one of them: a watch that overlaps the named
+        # watchpoint has a row too if its value changed. Only those: a watch elsewhere whose value
+        # changed without a stop (a write through another mapping of the same memory, say) is not
+        # put down to this write. One that overlaps and changed that way would be; its row's before
+        # and after show the change.
         named = [w for w in live_watches if w.address == hit]
         candidates = list(live_watches)
         if lot != args.lot:
@@ -832,7 +835,9 @@ def main():
         # A reply naming no watchpoint's base (not one QEMU gives) falls back to the watches on it.
         reported = ([w for w in candidates if w in named] if named
                     else [w for w in candidates if w.address <= hit < w.address + w.size])
-        hits = [w for w in candidates if w in reported or changed(w)]
+        end = hit + max([w.size for w in named] or [1])
+        hits = [w for w in candidates
+                if w in reported or (w.address < end and hit < w.address + w.size and changed(w))]
         for w in hits or [None]:
             # Taken over off a breakpoint, whether the guest is in a lot update is not known until its
             # next entry or return (in_update None): the write is in update `updates` or `updates` + 1,

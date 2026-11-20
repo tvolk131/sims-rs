@@ -583,6 +583,18 @@ class CaptureTest(unittest.TestCase):
         self.assertEqual([(r['name'], r['before'], r['after']) for r in rows],
                          [('pair', '00' * 8, '00000000' + '01000000'), ('direction', '00' * 4, '01000000')])
 
+    def test_a_watch_elsewhere_that_changed_without_a_stop_is_not_put_down_to_a_write(self):
+        # Two ordinary watches apart, at 0x70088 and 0x70100; 0x70100
+        # changed without a stop of its own, and 0x70088 is written. Only
+        # the watch the reply names has a row.
+        remote, output, _ = self.run_capture([
+            dict(pc=0), dict(pc=capture.ENTRY),
+            dict(pc=0x123456, reply='T05watch:70088;', bytes={0x70088: 1, 0x70100: 1}),
+            dict(pc=capture.RETURN)],
+            ['--updates', '1', '--watch', 'state=0x70088', '--watch', 'far=0x70100'])
+        rows = self.rows(output / 'watch.jsonl')
+        self.assertEqual([r['name'] for r in rows], ['state'])
+
     def test_a_run_taken_over_at_update_1s_return_records_it(self):
         def prepare(output):
             (output / 'events.jsonl').write_text(json.dumps(dict(kind='baseline', cr3=GAME_CR3)) + '\n')
