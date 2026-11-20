@@ -59,7 +59,10 @@ stop). Neither run was compared with a recording here. The Goth day
 under the recording's frames used to stop at tick 16112, where object
 26's Burn resets person 18's animator with `A2O-panic-loop2` playing; it
 now runs to 17928 and stops at 17929 on Generic Sims Call routine 6.
-That recording ends at 16111, so the run past it is unverified.
+*Corrected 2026-11-19:* the recording does not end at 16111; it runs to
+update 44200. The lot and C runtime streams match it at 16112, 17562
+and 17928, pinned in `boot.rs`
+(`docs/decisions/20261119-generic-sims-call-6-and-the-saved-neighbor-record.md`).
 
 **Unverified.** The reference scan covers the mapped Complete Collection
 executable and direct addresses. A write through an indirect address
