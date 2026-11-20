@@ -70,7 +70,9 @@ arm it too. A late watch is set (or moved) only at a stop on the lot
 captured; at a stop on another lot, one that goes through an object is
 taken off (watch_lost with elsewhere true) until it can be set there
 again, and that includes a stop at a watchpoint on another lot: the write
-is logged with no watch's name. Each watch.jsonl row says the lot it was
+is logged with no moving late watch's name, and such a watch is not set
+through the simulator seen before that stop until this lot's next entry or
+return. Each watch.jsonl row says the lot it was
 written on (lot). A run taken over does not count a late watch an earlier revision
 set (those recorded no lot): it ends with set false.
 So a late watch on a busy address (the random state) costs nothing while
@@ -753,22 +755,27 @@ def main():
             event(kind='watch_armed', name=w.name, expr=w.text, late=w in args.late_watch, lot=lot,
                   address=w.address, value=w.value, update=updates)
 
-    def check_watches(m, here):
-        """At a stop in the game, work out the moving watches again: move a
-        watchpoint whose address changed, and put one that cannot be worked
-        out (or read) back to wait. A late watch only at a stop on this lot:
-        at a stop on another, a moving late watch is taken off and waits to be
-        set again here (its address may be another lot's object's by then)."""
+    def retire_elsewhere():
+        """At a stop on another lot: take each moving late watch off, to wait to be set again here."""
         for w in list(live_watches):
-            if not w.moves:
-                continue
-            if not here and w in args.late_watch:
+            if w.moves and w in args.late_watch:
                 hardware_remove(w.address, w.size)
                 live_watches.remove(w)
                 event(kind='watch_lost', name=w.name, expr=w.text, address=w.address, update=updates,
                       elsewhere=True)
                 w.address = w.value = None
                 pending.append(w)
+
+    def check_watches(m, here):
+        """At a stop in the game, work out the moving watches again: move a
+        watchpoint whose address changed, and put one that cannot be worked
+        out (or read) back to wait. A late watch only at a stop on this lot:
+        at a stop on another, a moving late watch is taken off and waits to be
+        set again here (its address may be another lot's object's by then)."""
+        if not here:
+            retire_elsewhere()
+        for w in list(live_watches):
+            if not w.moves:
                 continue
             found = locate(w, m)
             if found is not None and found[0] == w.address:
@@ -792,17 +799,23 @@ def main():
             # The same virtual address in another process.
             event(kind='foreign_watch', address=hit, pc=regs['eip'], cr3=regs['cr3'], update=updates)
             return
-        # A write at a stop on another lot (before its next entry or dialog breakpoint) is not this
-        # lot's: a moving late watch is taken off first, as at any stop there, so the write is not
-        # logged under its name (its address may be another lot's object's by then).
+        nonlocal sim_lot
         try:
             lot = m.lot()
         except MemoryError:
             lot = None
-        if lot != args.lot:
-            check_watches(m, False)
-        # One row per watch on the written bytes (one with name null if none is).
+        # One row per watch on the written bytes (one with name null if none is), matched against
+        # the watches as they were set when the write was made.
         hits = [w for w in live_watches if w.address == hit] or [w for w in live_watches if w.address <= hit < w.address + w.size]
+        if lot != args.lot:
+            # A write at a stop on another lot (before its next entry or dialog breakpoint) is not
+            # this lot's object's: it is not logged under a moving late watch's name, and those
+            # watches are taken off, as at any stop there (the address may be another lot's object's
+            # by then). The simulator last seen is not used for them again until this lot's next
+            # entry or return. Other watches are worked out again at the next breakpoint, as always.
+            hits = [w for w in hits if not (w.moves and w in args.late_watch)]
+            retire_elsewhere()
+            sim_lot = lot
         for w in hits or [None]:
             # Taken over off a breakpoint, whether the guest is in a lot update is not known until its
             # next entry or return (in_update None): the write is in update `updates` or `updates` + 1,
@@ -977,10 +990,13 @@ def main():
                 tend_watches(m, sims_cr3 is not None and cr3 != sims_cr3)
                 continue
             if took_over and pc == RETURN:
-                last = json.loads(open(out / 'updates.jsonl').read().splitlines()[-1])
+                recorded = out / 'updates.jsonl'
+                rows = recorded.read_text().splitlines() if recorded.exists() else []
+                last = json.loads(rows[-1]) if rows else None
                 now = m.summary(regs['ebx'], fs_base)
                 event(kind='took_over_at_return', last=last, now=now)
-                if all(last[k] == now[k] for k in now):
+                # With nothing recorded yet, this is update 1's return.
+                if last is not None and all(last[k] == now[k] for k in now):
                     raise RuntimeError('took over at a return already recorded; refusing to guess')
             if not took_over and 'watch:' in reply:
                 watch_hit(reply, regs, m)

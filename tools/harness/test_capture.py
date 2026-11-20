@@ -436,6 +436,44 @@ class CaptureTest(unittest.TestCase):
         ended = self.events(output, 'watch_ended')
         self.assertEqual([(r['update'], r['set']) for r in ended], [(2, True)])
 
+    def test_a_write_on_another_lot_is_matched_to_the_watches_as_set(self):
+        # An ordinary moving watch, set on lot 5 at person 259's animator
+        # 0x70000; on lot 7 the animator is 0x80000 when 0x70088 is
+        # written. The row names the watch as it was set, which is moved
+        # only at the next breakpoint.
+        remote, output, _ = self.run_capture([
+            dict(pc=0), dict(pc=capture.ENTRY), dict(pc=capture.RETURN),
+            dict(pc=0x123456, lot=7, animator=0x80000, reply='T05watch:70088;'),
+            dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
+            ['--updates', '2', '--watch', 'direction=person:259@0xadc+0x88'])
+        rows = self.rows(output / 'watch.jsonl')
+        self.assertEqual([(r['name'], r['lot'], 'before' in r) for r in rows], [('direction', 7, True)])
+
+    def test_after_a_write_on_another_lot_a_dialog_does_not_set_a_late_watch(self):
+        # A moving late watch, taken off at a write on lot 7, is not set
+        # again at a dialog on lot 5 through the simulator seen before:
+        # a write there names no watch. The next entry on lot 5 sets it.
+        remote, output, _ = self.run_capture([
+            dict(pc=0), dict(pc=capture.ENTRY), dict(pc=capture.RETURN),
+            dict(pc=0x123456, lot=7, reply='T05watch:70088;'),
+            dict(pc=capture.DIALOG_SHOW), dict(pc=0x123456, reply='T05watch:70088;'),
+            dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
+            ['--updates', '2', '--late-watch', '2-2,direction=person:259@0xadc+0x88'])
+        rows = self.rows(output / 'watch.jsonl')
+        self.assertEqual([(r['name'], r['lot']) for r in rows], [(None, 7), (None, 5)])
+        armed = self.events(output, 'watch_armed')
+        self.assertEqual([r['update'] for r in armed], [1, 1])
+        ended = self.events(output, 'watch_ended')
+        self.assertEqual([(r['update'], r['set']) for r in ended], [(2, True)])
+
+    def test_a_run_taken_over_at_update_1s_return_records_it(self):
+        def prepare(output):
+            (output / 'events.jsonl').write_text(json.dumps(dict(kind='baseline', cr3=GAME_CR3)) + '\n')
+            (output / 'updates.jsonl').write_text('')
+        remote, output, _ = self.run_capture(
+            [dict(pc=capture.RETURN)], ['--updates', '1', '--resume'], prepare=prepare)
+        self.assertEqual([r['update'] for r in self.rows(output / 'updates.jsonl')], [1])
+
     def test_a_watch_armed_records_the_lot_it_was_armed_on(self):
         remote, output, _ = self.run_capture(
             [dict(pc=0), dict(pc=capture.ENTRY, lot=7), dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
