@@ -23,10 +23,21 @@ impl ImportWardrobe {
     /// and texture cache (0x414633, 0x40895a).
     pub fn load(install: &Install) -> Result<Self> {
         let mut files = MountedFiles::default();
-        for mount in install.mounts() {
-            files.register(&install.root, &mount.path, mount.recursive)?;
+        let root = &install.root;
+        for directory in ["GameData/Global", "GameData/Objects", Install::USER_OBJECTS] {
+            files.register(root, directory, true)?;
         }
-        let providers = download_providers(&files, &install.root)?;
+        for (bit, directory, _) in Expansions::ALL {
+            if install.expansions.contains(bit) {
+                files.register(root, directory, true)?;
+            }
+        }
+        if install.expansions.0 > 3 {
+            files.register(root, "ExpansionShared", true)?;
+            files.register(root, "TemplateNPCs", false)?;
+        }
+        files.register(root, "Downloads", true)?;
+        let providers = download_providers(&files, root)?;
         let mut texture_paths = texture_paths(&mut files, install)?;
         for path in &providers {
             files.register(&install.root, path, true)?;
@@ -136,14 +147,19 @@ fn download_providers(files: &MountedFiles, root: &Path) -> Result<Vec<String>> 
                 source.location(root)
             )));
         }
-        if !definitions.iter().any(|chunk| {
+        let mut registered = false;
+        for definition in definitions {
+            let data = iff.data(definition);
+            if data.len() < 4 {
+                return Err(Error::Unsupported(format!(
+                    "0x43b89c short OBJD in {}",
+                    source.location(root)
+                )));
+            }
             // The definition loader zero-fills bytes past the original end.
-            iff.data(chunk)
-                .iter()
-                .skip(0x20)
-                .take(2)
-                .all(|&byte| byte == 0)
-        }) {
+            registered |= data.iter().skip(0x20).take(2).all(|&byte| byte == 0);
+        }
+        if !registered {
             continue;
         }
         let disk = source

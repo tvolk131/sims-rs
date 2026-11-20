@@ -44,13 +44,20 @@ pub(super) fn refresh(rows: &mut Vec<Vec<u8>>, wardrobe: &ImportWardrobe) -> Res
     // 0x40a69e write the child marker.
     if person.child {
         rows[34] = b"ADDED".to_vec();
-    } else if rows[34].is_empty() {
-        rows[34] = high_fashion(wardrobe, person, &shape);
     } else {
-        return Err(unsupported(
-            "0x40e18f",
-            "preexisting high-fashion outfit validation",
-        ));
+        let current = Descriptor::parse(&rows[34]);
+        if !matches_human(wardrobe, current, person, b'h', 9)
+            || (adult_shape(&shape) && !current.suit[6..9].eq_ignore_ascii_case(&shape))
+        {
+            let selected = high_fashion(wardrobe, person, &shape);
+            // 0x40a588 also checks that the high-fashion list has a pair
+            // before rebuilding this row. Refuse a catalog that would need
+            // a further path through 0x40af0b or 0x40af12.
+            if !matches_human(wardrobe, Descriptor::parse(&selected), person, b'h', 9) {
+                return Err(unsupported("0x40e18f", "unmatched high-fashion pair"));
+            }
+            rows[34] = selected;
+        }
     }
     rebuild_nude_and_accessories(rows, wardrobe, person, &shape, &suffix);
     Ok(())
@@ -169,9 +176,13 @@ fn check_existing_outfits(
             continue;
         }
         let pair = Descriptor::parse(value);
+        let compare_shape = if person.child {
+            shape == b"chd" || (row == 34 && adult_shape(shape))
+        } else {
+            adult_shape(shape)
+        };
         if !matches_human(wardrobe, pair, person, kind, 9)
-            || (matches!(shape, b"fit" | b"skn" | b"fat" | b"chd")
-                && !pair.suit[6..9].eq_ignore_ascii_case(shape))
+            || (compare_shape && !pair.suit[6..9].eq_ignore_ascii_case(shape))
         {
             return Err(unsupported(
                 address,
@@ -185,6 +196,10 @@ fn check_existing_outfits(
 fn starts_with(name: &[u8], prefix: &[u8]) -> bool {
     name.get(..prefix.len())
         .is_some_and(|part| part.eq_ignore_ascii_case(prefix))
+}
+
+fn adult_shape(shape: &[u8]) -> bool {
+    matches!(shape, b"fit" | b"skn" | b"fat")
 }
 
 /// 0x472a25 compares the unrounded quotient against the previous f32 score.
@@ -220,20 +235,14 @@ fn descriptor(suit: &[u8], binding: &[u8], texture: &[u8]) -> Vec<u8> {
 }
 
 fn high_fashion(wardrobe: &ImportWardrobe, person: Person<'_>, shape: &[u8]) -> Vec<u8> {
-    let shape = if matches!(shape, b"fit" | b"skn" | b"fat") {
-        shape
-    } else {
-        b"fit"
-    };
+    let shape = if adult_shape(shape) { shape } else { b"fit" };
     let tone = person.tone.to_ascii_lowercase();
     let tone = if matches!(tone.as_slice(), b"lgt" | b"med" | b"drk") {
         tone.as_slice()
     } else {
         b"lgt"
     };
-    let body_prefix = [b"ma".as_slice(), shape].concat();
-    let mut body_prefix = body_prefix;
-    body_prefix[0] = person.gender;
+    let body_prefix = [&[person.gender, b'a'][..], shape].concat();
     let matched = |name: &[u8], tail: &[u8]| {
         if starts_with(name, b"h5") && name.get(4..).is_some_and(|part| starts_with(part, tail)) {
             4 + tail.len()
@@ -301,7 +310,7 @@ fn rebuild_nude_and_accessories(
     let (nude, formal) = nude_and_formal_suits(&wardrobe.suits, person.gender, shape);
     let mut body_textures = [Best::default(), Best::default(), Best::default()];
     for name in &wardrobe.textures {
-        for (kind, best) in [b'n', b'u', b'f'].into_iter().zip(&mut body_textures) {
+        for (kind, best) in b"nuf".iter().copied().zip(&mut body_textures) {
             let prefix = nude_prefix(name, kind, person.gender, shape);
             if prefix != 0 && starts_with(&name[prefix..], person.tone) {
                 let end = prefix + person.tone.len();
