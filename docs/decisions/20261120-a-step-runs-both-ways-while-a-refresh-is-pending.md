@@ -74,10 +74,12 @@ it. Keeping a run borrows every cell before it writes anything, so a cell
 held elsewhere panics before the lot or any cell is kept.
 
 A person queued for removal by another person's tick has its refresh
-kept for the scheduler's pass (`taken_off`). In a person's tick run on its
-own (`Interpreter::tick_person`) there is no pass, so that fails loudly
-rather than dropping the refresh, which would hide it from the
-comparison. A tree run outside any person's tick still drops it.
+kept for the scheduler's pass (`taken_off`). A person's tick run on its
+own (`Interpreter::tick_person`) gets a pass of its own for its whole
+tick, its thread's run and its animator's tick alike. No other person's
+tick follows in it, so a refresh left there at the end fails loudly
+rather than being dropped, which would hide it from the comparison. A
+tree run outside any person's tick still drops it.
 
 The refresh itself (`Interpreter::refresh_at_take_off`) and the
 animator's tick that settles the two animators
@@ -180,9 +182,19 @@ What is not ported:
     neighbor record (0x4256f4), and the record's type is in the
     interface's table of person types (0x4e9753). A record whose type is
     not in the table ends that pass (0x44c616). A token not replaced
-    stays, and `$Neighbor` is found in it. The name itself is taken to
-    hold no `$Neighbor`. **Unverified.** Test:
-    `a_neighbor_local_named_in_a_dialogs_text_is_not_its_neighbor`.
+    stays, and `$Neighbor` is found in it.
+    - The token's number is read with the C runtime's 32-bit conversion
+      (0x44caf6, 0x636029), which wraps, and compared with the locals'
+      count signed.
+    - The local is read as any read of a local is (0x44c5f4), so one
+      that starts as half of a pointer the original left fails.
+    - The type's name comes from the interface's table (0x4e9c46,
+      0x4e893e), which is not ported. Where a name took a token's place
+      and the `$Neighbor` search after it would then decide between two
+      types, the port fails loudly: the name could hold `$Neighbor`.
+
+    Tests: `a_neighbor_local_named_in_a_dialogs_text_is_not_its_neighbor`,
+    `a_neighbor_local_the_original_left_unknown_fails_loudly`.
 
   The last type found is kept, and mode 0 shows it in place of the stack
   object's (0x436308). Mode 2 does not read it. Two kinds of string are
@@ -191,22 +203,35 @@ What is not ported:
   this change failed on any `$` in a mode 0 dialog's strings. On the Goth
   house that stopped the run at update 901 (object 8, tree 0x101d), so
   the tokens that give the type are ported instead.
-- **Placement.** The person made is not put on a tile, because the tile is
-  found from the house view's centre (0x4347f0), which is presentation.
-  - The put (virtual function 0x88, 0x45e4e9) is the placement 0x433340.
-    That asks the person its function 9 (0x433580). It also works out
-    the walls beside the tile (0x434fac) and asks function 6 when they
-    differ from the person's (0x435110). A type whose callback table
-    names a tree for either fails loudly.
-  - The rest of the put (the rooms, 0x440385; the tiles, 0x4330d7) is
-    taken to be undone by the removal. **Unverified.**
-  - If the original finds no tile, it removes the person without drawing
-    it (0x4e9706). The entry then stays without its image. 0x4e938c then
-    builds it again in the same dialog unless the type has image 2002,
-    and 0x4e92a8 builds it again at the next dialog. Each build makes a
-    person and removes it. The port takes a tile to be found, so it makes
-    the person once and counts the image as built. **Unverified.** Whether
-    a tile is found depends on the house view's centre.
+- **Placement.** The put (virtual function 0x88, 0x45e4e9) is the
+  placement 0x433340, on a tile the interface finds from the house
+  view's centre (0x4347f0). The view is presentation, so the tile is not
+  modeled. `Interpreter::portrait_put` does what does not depend on the
+  tile: the interface's work for an object come from outside (0x44752e,
+  `placed_from_outside`). It fails loudly where the tile could leave the
+  lot otherwise than the person's removal finds it:
+  - the person's function 9 (0x433580), 6 (walls changed, 0x435110) or
+    26 names a tree. A person with function 26 is a seat: the objects
+    on the tiles beside it are told, and may be asked their function 9
+    (0x43355d, 0x433612);
+  - its data word 40 has bit 0x400, which marks the room it lands in as
+    not counted;
+  - it is a person of kind 0 or 1 (person word 65; a pet is above 1) and
+    an indoor room that is not a pool is not marked as occupied. The
+    room it lands in is marked (0x45e43d, 0x468802), and its removal
+    leaves the mark;
+  - no tile on the ground level takes it (`Interpreter::fits` on every
+    tile of the lot). The original then removes it without drawing it
+    (0x4e9706), and 0x4e938c builds again in the same dialog unless the
+    type has image 2002.
+
+  Where some tile takes it, the search is taken to find one, and the
+  person is made once. **Unverified**: the search's reach from the
+  view's centre is not ported. The rest of the put (the rooms, 0x440385;
+  the tiles, 0x4330d7) is taken to be undone by the removal, which is
+  also **unverified**. The cat at 24719 is a pet, so the room mark does
+  not apply to it. Tests: `a_portrait_whose_person_runs_code_when_put_down_fails_loudly`,
+  `a_portrait_whose_put_depends_on_its_tile_fails_loudly`.
 - **Other builders.** Only the dialog's builds are counted. The household
   panel draws the family's portraits, so a portrait of a family member's
   type with nobody of it on the lot fails loudly. A type made while the

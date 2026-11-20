@@ -146,12 +146,12 @@ fn a_portrait_whose_person_runs_code_when_put_down_fails_loudly() {
     // it its function 9 (0x433580), and its function 6 when the walls
     // beside the tile differ from its own (0x434fac, 0x435110). The tile
     // is not modeled.
-    for (function, at) in [(9, "0x433580"), (6, "0x435110")] {
+    for (function, at) in [(9, "0x433580"), (6, "0x435110"), (26, "0x433612")] {
         let (mut fx, file, record) = visitors();
         let library = fx.program.libraries.get_mut(&file).unwrap();
         for table in library.callbacks.values_mut() {
             table.resize(
-                10,
+                27,
                 sims_formats::execution::ObjectFunction {
                     condition: 0,
                     action: 0,
@@ -159,16 +159,74 @@ fn a_portrait_whose_person_runs_code_when_put_down_fails_loudly() {
             );
             table[function].action = 4200;
         }
-        let objects = fx.world.objects.clone();
         let fault = inform(&mut fx, 2, record).unwrap_err().to_string();
         assert!(fault.contains(at) && fault.contains("tree 4200"), "{fault}");
         assert!(fx.world.portraits.is_empty());
-        assert_eq!(
-            fx.world.objects.keys().collect::<Vec<_>>(),
-            objects.keys().collect::<Vec<_>>(),
-            "nobody was made"
-        );
     }
+}
+
+#[test]
+fn a_portrait_whose_put_depends_on_its_tile_fails_loudly() {
+    // Data word 40 bit 0x400 marks the room the person lands in as not
+    // counted (0x433340).
+    let (mut fx, file, record) = visitors();
+    // The widget's Init (tree 4096, `crate::find_location::placeable`),
+    // with the bit set.
+    fx.add(
+        file,
+        4096,
+        tree(vec![
+            assign(scope::MY_DATA, 4, scope::LITERAL, 1, 1),
+            assign(scope::MY_DATA, 42, scope::LITERAL, 2, 2),
+            assign(scope::MY_DATA, 40, scope::LITERAL, 0x400, RETURN_TRUE),
+        ]),
+    );
+    let fault = inform(&mut fx, 2, record).unwrap_err().to_string();
+    assert!(fault.contains("bit 0x400"), "{fault}");
+    assert!(fx.world.portraits.is_empty());
+    // A person of kind 0 or 1 marks the indoor room it lands in as
+    // occupied (0x45e43d), which its removal leaves: it fails while an
+    // indoor room that is not a pool is not marked. One already marked,
+    // one outdoors and a pool are left as they are, and so is any room by
+    // a pet (kind above 1). The person's words come from its neighbor
+    // record (`crate::person_factory::equip`).
+    for (kind, outdoors, pool, occupied, fails) in [
+        (0, false, false, false, true),
+        (1, false, false, false, true),
+        (2, false, false, false, false),
+        (0, false, false, true, false),
+        (0, true, false, false, false),
+        (0, false, true, false, false),
+    ] {
+        let (mut fx, _, record) = visitors();
+        fx.world.rooms.rooms.clear();
+        fx.world.neighbors.slots[record as usize - 1]
+            .as_mut()
+            .unwrap()
+            .data[65] = kind;
+        fx.world.rooms.rooms.insert(
+            1,
+            sims_sim::rooms::Room {
+                outdoors,
+                pool,
+                occupied,
+                ..Default::default()
+            },
+        );
+        let ran = inform(&mut fx, 2, record);
+        if fails {
+            let fault = ran.unwrap_err().to_string();
+            assert!(fault.contains("0x468802"), "{kind}: {fault}");
+        } else {
+            assert_eq!(ran, Ok(true), "{kind} {outdoors} {pool} {occupied}");
+        }
+    }
+    // No tile takes it: the original removes it unput and builds again
+    // (0x4e9706, 0x4e938c).
+    let (mut fx, _, record) = visitors();
+    fx.world.size = 2;
+    let fault = inform(&mut fx, 2, record).unwrap_err().to_string();
+    assert!(fault.contains("0x4e9706"), "{fault}");
 }
 
 #[test]
@@ -234,13 +292,19 @@ fn a_neighbor_local_named_in_a_dialogs_text_is_not_its_neighbor() {
         "Hi $NeighborLocal:0",
         "$NeighborLocal:9",
         "$NeighborLocal:1 $NeighborLocal:0",
+        "$NeighborLocal:0 and $Neighbor",
+        "$NeighborLocal:4294967297",
+        "$NeighborLocal:4294967296",
     ];
     for (message, locals, shown) in [
-        (1, [0, 0], WIDGET),
-        (1, [-1, 0], SIM_GUID),
-        (2, [-1, -1], WIDGET),
-        (3, [-1, -1], SIM_GUID),
-        (3, [-1, -2], WIDGET),
+        (1, [0, 0], Some(WIDGET)),
+        (2, [-1, -1], Some(WIDGET)),
+        (3, [-1, -2], Some(WIDGET)),
+        (4, [-1, 0], Some(WIDGET)),
+        (5, [-1, 0], Some(WIDGET)),
+        (1, [-1, 0], None),
+        (3, [-1, -1], None),
+        (6, [-1, 0], None),
     ] {
         // The person (2) is the stack object, and neighbor record 2 is of
         // the widget's type, with nobody of it on the lot. Local `n` holds
@@ -282,7 +346,62 @@ fn a_neighbor_local_named_in_a_dialogs_text_is_not_its_neighbor() {
             ]),
         );
         let ran = fx.run_with(LAMP, 4096, SIM as i16, &[], 1000);
-        assert_eq!(ran, Ok(true), "{message} {locals:?}");
-        assert_eq!(fx.world.portraits, [shown].into(), "{message} {locals:?}");
+        match shown {
+            Some(shown) => {
+                assert_eq!(ran, Ok(true), "{message} {locals:?}");
+                assert_eq!(fx.world.portraits, [shown].into(), "{message} {locals:?}");
+            }
+            None => {
+                let fault = ran.unwrap_err().to_string();
+                assert!(
+                    fault.contains("0x4e893e") && fault.contains("0x44c65f"),
+                    "{message} {locals:?}: {fault}"
+                );
+                assert!(fx.world.portraits.is_empty());
+            }
+        }
     }
+}
+
+#[test]
+fn a_neighbor_local_the_original_left_unknown_fails_loudly() {
+    // The pass reads the local (0x44c5f4) as any read of a local does: one
+    // that starts as half of a pointer left in the frame storage fails.
+    let (mut fx, _, record) = visitors();
+    let neighbor = fx.world.neighbors.slots[record as usize - 1].clone();
+    let slots = &mut fx.world.neighbors.slots;
+    slots.resize(slots.len().max(2), None);
+    slots[usize::from(SIM) - 1] = neighbor;
+    fx.world.people = vec![SIM];
+    fx.program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .strings
+        .insert(301, vec!["$NeighborLocal:1".to_owned()]);
+    fx.add(
+        LAMP_FILE,
+        4096,
+        tree(vec![ins(
+            DIALOG,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [0, 0, 1, 0, 0, 0, 0, 1],
+        )]),
+    );
+    fx.world.frame_storage.insert(
+        LAMP,
+        sims_sim::FrameStorage {
+            unknown: [(0, 1)].into(),
+            ..Default::default()
+        },
+    );
+    let fault = fx
+        .run_with(LAMP, 4096, SIM as i16, &[], 1000)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        fault.contains("0x44c5f4") && fault.contains("half of a pointer"),
+        "{fault}"
+    );
 }

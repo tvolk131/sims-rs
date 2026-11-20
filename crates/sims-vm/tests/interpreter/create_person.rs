@@ -302,15 +302,14 @@ fn a_person_removed_in_a_persons_tick_outside_the_schedulers_pass_fails_loudly()
     // to keep it in, and dropping it would hide it from a step run both
     // ways: it fails.
     let (mut fx, id, file) = placed_visitor();
+    fx.add(GLOBAL, 256, sleeper());
     fx.add(
         file,
         4203,
-        tree(vec![ins(
-            REMOVE,
-            RETURN_TRUE,
-            RETURN_FALSE,
-            [1, 0, 0, 0, 0, 0, 0, 0],
-        )]),
+        tree(vec![
+            ins(REMOVE, 1, RETURN_FALSE, [1, 0, 0, 0, 0, 0, 0, 0]),
+            ins(256, 1, ERROR, [20, 0, 0, 0, 0, 0, 0, 0]),
+        ]),
     );
     for slot in &mut fx.sim_mut().slots {
         slot.object = 0;

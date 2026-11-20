@@ -252,7 +252,10 @@ mod word {
 }
 
 /// Callbacks placement asks about without running them here.
-const SEAT: usize = 26;
+pub(crate) const SEAT: usize = 26;
+/// Person data word 65, the person's kind: one of 0 or 1 notes the room
+/// it is in (0x45e43d).
+const PERSON_KIND: usize = 65;
 const SEAT_CHANGED: usize = 25;
 pub(crate) const WALLS_CHANGED: usize = 6;
 
@@ -1253,6 +1256,100 @@ impl Interpreter<'_> {
             world.mark_room(room);
         }
         Ok(())
+    }
+
+    /// The put of a person made for a dialog's portrait (virtual function
+    /// 0x88, 0x45e4e9: [`Self::put_person`]), on a tile the interface finds
+    /// from the house view's centre (0x4347f0), which is presentation and
+    /// not modeled. What the put does that does not depend on the tile is
+    /// done: the interface's work for an object come from outside
+    /// ([`Self::placed_from_outside`]). What depends on the tile fails
+    /// loudly where it could leave the lot otherwise than the person's
+    /// removal finds it, which the caller then makes:
+    ///
+    /// 1. its function 9 (placed), 6 (walls changed, 0x435110) or 26 (a
+    ///    seat: the objects on the tile ahead are told, and may be asked
+    ///    their function 9, 0x433612) names a tree;
+    /// 2. data word 40 has bit 0x400: the room it lands in is marked as not
+    ///    counted;
+    /// 3. it is a person of kind 0 or 1 and an indoor room that is not a
+    ///    pool is not marked as occupied: the room it lands in is marked
+    ///    ([`World::note_occupant`] through [`Self::note_room`]), and the
+    ///    removal leaves the mark;
+    /// 4. no tile on the ground level takes it ([`Self::fits`]): the
+    ///    original then removes it unput and builds again (0x4e9706,
+    ///    0x4e938c).
+    ///
+    /// Where some tile takes it, the search is taken to find one
+    /// (**unverified**: its reach from the view's centre is not ported).
+    pub(crate) fn portrait_put(&self, world: &mut World, id: u16) -> Result<(), Fault> {
+        let fail = |what: String| Fault {
+            object: id,
+            at: None,
+            trap: Trap::Unsupported(format!(
+                "a dialog's portrait puts a person on a tile found from the house view's centre \
+                 (0x45e4e9, 0x433340, 0x4347f0), which is not modeled, and {what}"
+            )),
+        };
+        for (function, at) in [
+            (function::PLACED, "0x433580"),
+            (WALLS_CHANGED, "0x435110"),
+            (SEAT, "0x433612"),
+        ] {
+            let tree = self.function_tree(world, id, function);
+            if tree != 0 {
+                return Err(fail(format!(
+                    "the person's function {function} (tree {tree}, {at}) depends on the tile"
+                )));
+            }
+        }
+        let flags = datum(world, id, data::FLAGS_2).map_err(|trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        })?;
+        if flags as u16 & 0x400 != 0 {
+            return Err(fail(
+                "data word 40 bit 0x400 marks the room it lands in as not counted".into(),
+            ));
+        }
+        let kind = world
+            .objects
+            .get(&id)
+            .and_then(|o| o.person.as_ref())
+            .and_then(|p| p.data.get(PERSON_KIND).copied())
+            .unwrap_or(0);
+        if kind <= 1
+            && world
+                .rooms
+                .rooms
+                .values()
+                .any(|r| !r.outdoors && !r.pool && !r.occupied)
+        {
+            return Err(fail(
+                "it marks the room it lands in as occupied (0x45e43d, 0x468802), and an indoor \
+                 room is not"
+                    .into(),
+            ));
+        }
+        let mut copy = world.clone();
+        let mut fits = false;
+        'tiles: for x in 1..i32::from(world.size) - 1 {
+            for y in 1..i32::from(world.size) - 1 {
+                if self.fits(&mut copy, id, [x * 16 + 8, y * 16 + 8], 1)? {
+                    fits = true;
+                    break 'tiles;
+                }
+            }
+        }
+        if !fits {
+            return Err(fail(
+                "no tile on the ground level takes it: the original removes it unput and builds \
+                 the portrait again (0x4e9706, 0x4e938c)"
+                    .into(),
+            ));
+        }
+        self.placed_from_outside(world, id)
     }
 
     /// What the interface does when an object comes onto the lot from

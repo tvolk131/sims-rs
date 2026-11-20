@@ -44,9 +44,8 @@
 
 use crate::fault::Trap;
 use crate::interpreter::{Flow, Machine};
-use crate::placement::WALLS_CHANGED;
-use crate::visits::function;
 use sims_sim::Dialog;
+use std::collections::BTreeSet;
 
 /// A definition's type word (+0x12), and its value for a person.
 const TYPE: usize = 9;
@@ -247,25 +246,6 @@ impl Machine<'_, '_> {
                      is not kept"
                 )));
             }
-            let tree = |function: usize| {
-                crate::interpreter::object_definition(self.catalog, self.world, guid)
-                    .and_then(|d| {
-                        let library = self.program.libraries.get(&d.resource)?;
-                        library.callbacks.get(&d.chunk)?.get(function)
-                    })
-                    .map_or(0, |f| f.action)
-            };
-            for (function, at) in [(function::PLACED, "0x433580"), (WALLS_CHANGED, "0x435110")] {
-                let tree = tree(function);
-                if tree != 0 {
-                    return Err(Trap::Unsupported(format!(
-                        "a dialog's portrait of type 0x{guid:08X} with nobody of it on the lot \
-                         puts a person of it on a tile (0x45e4e9, 0x433340), which may run its \
-                         function {function} (tree {tree}, {at}); the tile, found from the house \
-                         view's centre (0x4347f0), is not modeled"
-                    )));
-                }
-            }
             let interpreter = self.interpreter();
             let unsupported = |fault| {
                 Trap::Unsupported(format!(
@@ -276,6 +256,9 @@ impl Machine<'_, '_> {
             let id = interpreter
                 .create_person(self.world, guid)
                 .map_err(unsupported)?;
+            interpreter
+                .portrait_put(self.world, id)
+                .map_err(|fault| fault.trap)?;
             interpreter
                 .remove_now(self.world, id)
                 .map_err(unsupported)?;
@@ -359,35 +342,58 @@ impl Machine<'_, '_> {
             .and_then(|id| self.world.objects.get(&id))
             .map(|object| object.guid);
         let neighbor = self.world.neighbors.get(stack_object).map(|r| r.guid);
-        let mut found = None;
+        // What may have been found so far: more than one where a type's
+        // name, which is not known, took the place of a `$NeighborLocal`
+        // token and the `$Neighbor` pass depends on whether it holds
+        // `$Neighbor`.
+        let mut found = BTreeSet::from([None]);
         for text in self.dialog_strings(operands)? {
             if text.contains("$Object") && object.is_some() {
-                found = object;
+                found = BTreeSet::from([object]);
             }
-            if self.neighbor_locals_named(&text)?.contains("$Neighbor") && neighbor.is_some() {
-                found = neighbor;
+            let (text, named) = self.neighbor_locals_named(&text)?;
+            if neighbor.is_some() {
+                if text.contains("$Neighbor") {
+                    found = BTreeSet::from([neighbor]);
+                } else if named {
+                    found.insert(neighbor);
+                }
             }
         }
-        Ok(found)
+        // Mode 0 shows the stack object's own type when nothing was found.
+        let shown: BTreeSet<_> = found.iter().map(|f| f.or(object)).collect();
+        if shown.len() > 1 {
+            return Err(Trap::Unsupported(
+                "a dialog's text names a person type for `$NeighborLocal`, and whether that \
+                 type's name (0x4e9c46, from the interface's table, 0x4e893e) holds `$Neighbor` \
+                 decides the portrait (0x44c65f): the names are not ported"
+                    .into(),
+            ));
+        }
+        Ok(found.into_iter().next().flatten())
     }
 
     /// `text` after the formatter's `$NeighborLocal` pass (0x44c590 to
-    /// 0x44c65a), as far as it matters to the `$Neighbor` pass after it.
-    /// Each token (0x6e4fc0), searched for from one past the last
-    /// (0x44c643), is read with its `:` and number, and an optional second
-    /// `:` and number (0x44caf6). When the number is one of the running
-    /// tree's locals (below the count the tree has, frame +6), the local
-    /// names a neighbor record (0x4256f4) and the record's type is in the
-    /// interface's table of person types (0x4572af, 0x4e9753), the token
-    /// is replaced by the type's name (0x4e9c46, 0x455750); a record whose
-    /// type is not in the table ends the pass (0x44c616 to 0x44c653).
-    /// Otherwise the token stays, and the `$Neighbor` pass finds it. The
-    /// name itself is presentation; it stands here as text without a token
-    /// (a name holding `$Neighbor` is taken not to occur: **unverified**).
-    pub(crate) fn neighbor_locals_named(&self, text: &str) -> Result<String, Trap> {
+    /// 0x44c65a), as far as it matters to the `$Neighbor` pass after it,
+    /// and whether a type's name took the place of a token. Each token
+    /// (0x6e4fc0), searched for from one past the last (0x44c643), is read
+    /// with its `:` and number, and an optional second `:` and number
+    /// (0x44caf6; the number is the C runtime's 32-bit conversion,
+    /// 0x636029, which wraps). When the number is one of the running
+    /// tree's locals (from 0, below the count the tree has, frame +6,
+    /// compared signed), the local names a neighbor record (0x44c5f4,
+    /// 0x4256f4) and the record's type is in the interface's table of
+    /// person types (0x4572af, 0x4e9753), the token is replaced by the
+    /// type's name (0x4e9c46, 0x455750); a record whose type is not in the
+    /// table ends the pass (0x44c616 to 0x44c653). Otherwise the token
+    /// stays, and the `$Neighbor` pass finds it. The name is not known: it
+    /// stands here as text without a token, and
+    /// [`Machine::dialog_text_type`] fails where that could matter.
+    pub(crate) fn neighbor_locals_named(&self, text: &str) -> Result<(String, bool), Trap> {
         const TOKEN: &str = "$NeighborLocal";
         let locals = &self.frame()?.locals;
         let mut text = text.to_owned();
+        let mut named = false;
         let mut from = 0;
         while let Some(at) = text
             .get(from..)
@@ -396,7 +402,7 @@ impl Machine<'_, '_> {
         {
             let bytes = text.as_bytes();
             let mut end = at + TOKEN.len();
-            let mut number = None;
+            let mut number = -1i32;
             for part in 0..2 {
                 if bytes.get(end) != Some(&b':') {
                     break;
@@ -407,22 +413,33 @@ impl Machine<'_, '_> {
                     .take_while(|b| b.is_ascii_digit())
                     .count();
                 if part == 0 && digits > 0 {
-                    number = text[end..end + digits].parse::<usize>().ok();
+                    number = bytes[end..end + digits].iter().fold(0i32, |n, d| {
+                        n.wrapping_mul(10).wrapping_add(i32::from(d - b'0'))
+                    });
                 }
                 end += digits;
             }
-            let record = number
-                .and_then(|n| locals.get(n))
-                .and_then(|&local| self.world.neighbors.get(local));
+            let record = match usize::try_from(number) {
+                Ok(n) if n < locals.len() => {
+                    self.check_local(n).map_err(|trap| {
+                        Trap::Unsupported(format!(
+                            "a dialog's `$NeighborLocal:{n}` (0x44c5f4): {trap}"
+                        ))
+                    })?;
+                    self.world.neighbors.get(locals[n])
+                }
+                _ => None,
+            };
             if let Some(record) = record {
                 if !self.listed_person_type(record.guid, "a dialog's $NeighborLocal")? {
                     break;
                 }
                 text.replace_range(at..end, "(name)");
+                named = true;
             }
             from = at + 1;
         }
-        Ok(text)
+        Ok((text, named))
     }
 
     fn set_temp(&mut self, temp: usize, value: i16) -> Result<(), Trap> {

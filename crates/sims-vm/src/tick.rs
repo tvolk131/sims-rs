@@ -597,7 +597,32 @@ impl Interpreter<'_> {
         tick: i32,
         tuning: &Tuning,
     ) -> Result<bool, Fault> {
-        self.person_tick(world, id, tick, tuning, None)
+        if self.taken_off.is_some() {
+            return self.person_tick(world, id, tick, tuning, None);
+        }
+        // Outside the scheduler's pass, the tick has a pass of its own for
+        // the refreshes of anyone it queues for removal (thread or
+        // animator). No other person's tick follows in it for them to wait
+        // for, so one left there fails: dropping it would hide it from a
+        // step run both ways (`crate::both_ways`).
+        let taken_off = RefCell::new(BTreeMap::new());
+        let ticked = Interpreter {
+            taken_off: Some(&taken_off),
+            ..*self
+        }
+        .person_tick(world, id, tick, tuning, None)?;
+        if let Some(other) = taken_off.into_inner().into_keys().next() {
+            return Err(Fault {
+                object: id,
+                at: None,
+                trap: Trap::Unsupported(format!(
+                    "person {other} queued for removal in person {id}'s tick outside the \
+                     scheduler's pass: its animator's refresh (0x58da12) waits for its own \
+                     tick, which no pass here runs"
+                )),
+            });
+        }
+        Ok(ticked)
     }
 
     /// A person's tick, catching a fault in its thread's run as
