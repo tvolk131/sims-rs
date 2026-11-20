@@ -126,7 +126,9 @@ class FakeMemory:
     def read(self, p, n):
         if p == self.remote.current.get('unreadable'):
             raise MemoryError(f'read {p:#x}')
-        return bytes(n)
+        # The bytes this stop has written (`bytes`, by address); every other byte is 0.
+        written = self.remote.current.get('bytes', {})
+        return bytes(written.get(p + i, 0) for i in range(n))
 
     def summary(self, sim, teb):
         return dict(tick=100, lot_rng=1, global_rng=2, crt=3, scheduler_cursor=0)
@@ -490,12 +492,13 @@ class CaptureTest(unittest.TestCase):
 
     def test_a_write_on_another_lot_keeps_an_ordinary_watch_a_moving_late_watch_overlaps(self):
         # An ordinary 8-byte watch at 0x70088 and a moving late watch at
-        # 0x7008c; on lot 7, 0x7008c is written. The late watch is left
-        # out before the exact match, so the row is the ordinary watch's,
+        # 0x7008c; on lot 7, 0x7008c is written, and the reply names the
+        # late watch's watchpoint (the newer). The late watch is left out,
+        # and the ordinary watch's value changed, so the row is its own,
         # with its values.
         remote, output, _ = self.run_capture([
             dict(pc=0), dict(pc=capture.ENTRY), dict(pc=capture.RETURN),
-            dict(pc=0x123456, lot=7, reply='T05watch:7008c;'),
+            dict(pc=0x123456, lot=7, reply='T05watch:7008c;', bytes={0x7008c: 1}),
             dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
             ['--updates', '2', '--watch', 'pair=0x70088:8',
              '--late-watch', '2-2,direction=person:259@0xadc+0x8c'])
@@ -549,6 +552,36 @@ class CaptureTest(unittest.TestCase):
         self.assertEqual(remote.watch_stops[0], ('set', 0x123456))
         rows = self.rows(output / 'watch.jsonl')
         self.assertEqual([r['name'] for r in rows], ['state'])
+
+    def test_a_write_on_another_lot_is_not_logged_under_an_ordinary_watch_it_left_as_it_was(self):
+        # An ordinary watch at 0x70086:4 and a moving 8-byte late watch at
+        # 0x70088; on lot 7, 0x7008c is written, and the reply names the
+        # late watch's watchpoint, 0x70088, which the ordinary one also
+        # covers. The late watch is left out, and the ordinary one did not
+        # change, so the row names no watch.
+        remote, output, _ = self.run_capture([
+            dict(pc=0), dict(pc=capture.ENTRY), dict(pc=capture.RETURN),
+            dict(pc=0x123456, lot=7, reply='T05watch:70088;', bytes={0x7008c: 1}),
+            dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
+            ['--updates', '2', '--watch', 'edge=0x70086:4',
+             '--late-watch', '2-2,direction=person:259@0xadc+0x88:8'])
+        rows = self.rows(output / 'watch.jsonl')
+        self.assertEqual([(r['name'], r['lot']) for r in rows], [(None, 7)])
+
+    def test_a_write_over_overlapping_watches_is_logged_under_each_that_changed(self):
+        # An ordinary 8-byte watch at 0x70088 and a late watch at 0x7008c,
+        # both set on lot 5; 0x7008c is written, and the reply names only
+        # the newer watchpoint. The ordinary watch's upper half changed, so
+        # it has a row too.
+        remote, output, _ = self.run_capture([
+            dict(pc=0), dict(pc=capture.ENTRY), dict(pc=capture.RETURN),
+            dict(pc=capture.ENTRY), dict(pc=0x123456, reply='T05watch:7008c;', bytes={0x7008c: 1}),
+            dict(pc=capture.RETURN)],
+            ['--updates', '2', '--watch', 'pair=0x70088:8',
+             '--late-watch', '2-2,direction=person:259@0xadc+0x8c'])
+        rows = self.rows(output / 'watch.jsonl')
+        self.assertEqual([(r['name'], r['before'], r['after']) for r in rows],
+                         [('pair', '00' * 8, '00000000' + '01000000'), ('direction', '00' * 4, '01000000')])
 
     def test_a_run_taken_over_at_update_1s_return_records_it(self):
         def prepare(output):

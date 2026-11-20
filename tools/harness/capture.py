@@ -808,8 +808,12 @@ def main():
             lot = m.lot()
         except MemoryError:
             lot = None
-        # One row per watch on the written bytes (one with name null if none is), matched against
-        # the watches as they were set when the write was made.
+        # One row per watch the write may have been to (one with name null if none), matched against
+        # the watches as they were set when the write was made. The stop reply names the base of the
+        # watchpoint that fired (QEMU checks the newest first), not the bytes written, so a write
+        # over watches that overlap names only one of them: every watch whose value changed has a
+        # row too, and a watch that only overlaps the named watchpoint has one only if it changed.
+        named = [w for w in live_watches if w.address == hit]
         candidates = list(live_watches)
         if lot != args.lot:
             # A write at a stop on another lot (before its next entry or dialog breakpoint) is not
@@ -820,7 +824,15 @@ def main():
             # entry or return. Other watches are worked out again at the next breakpoint, as always.
             candidates = [w for w in candidates if not (w.moves and w in args.late_watch)]
             retire_elsewhere(lot)
-        hits = [w for w in candidates if w.address == hit] or [w for w in candidates if w.address <= hit < w.address + w.size]
+        def changed(w):
+            try:
+                return w.read(m) != w.value
+            except MemoryError:
+                return False
+        # A reply naming no watchpoint's base (not one QEMU gives) falls back to the watches on it.
+        reported = ([w for w in candidates if w in named] if named
+                    else [w for w in candidates if w.address <= hit < w.address + w.size])
+        hits = [w for w in candidates if w in reported or changed(w)]
         for w in hits or [None]:
             # Taken over off a breakpoint, whether the guest is in a lot update is not known until its
             # next entry or return (in_update None): the write is in update `updates` or `updates` + 1,
