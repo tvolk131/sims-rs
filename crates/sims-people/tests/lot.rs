@@ -861,7 +861,10 @@ fn mortimer_stands_without_his_book_as_the_original_draws_him() {
     let drawn_parts = |people: &mut People, world: &World| -> Vec<String> {
         let (posed, problems) = people.posed(world, 1);
         assert!(problems.is_empty(), "{problems:?}");
-        let mortimer = posed.iter().find(|p| p.id == 21).expect("Mortimer is posed");
+        let mortimer = posed
+            .iter()
+            .find(|p| p.id == 21)
+            .expect("Mortimer is posed");
         mortimer
             .body
             .parts
