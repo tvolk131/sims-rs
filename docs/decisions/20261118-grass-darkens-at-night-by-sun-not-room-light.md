@@ -26,8 +26,15 @@ constructor's float until the next time-of-day change. The two floats
 differ only on some slopes: flat ground is shade 13 with both, and on
 the Goth house they draw the same, so no pinned render changes. A trace
 of the first daytime draw on a slope where they differ would settle it.
-At night the question doesn't arise: the time of day has changed since
-the load, so 0xdd has reached the grass.
+The same question arises at night for a save loaded after dark. The
+load restores the saved global 4 (0x46d007) before it sends 0xdd
+(0x416060), so a save can load already at night. Its grass shows the
+night sun only if the panels receive that 0xdd. Otherwise it keeps the
+constructor's day angle until the next time-of-day change, dawn at
+6:00. The cap is set on the same signal, so the same applies to it. A
+night reached after the panels receive a time-of-day change is not in
+question. The 12:24 AM screenshot below is such a night: that game was
+played on from 6:30 AM through dusk.
 
 This corrects [20261114-sun-does-not-turn-camera](20261114-sun-does-not-turn-camera.md).
 That entry read the setter's argument as the camera's rotation and
@@ -108,6 +115,7 @@ uses one tenth at every hour. Everything above is for ordinary lots.
 
 **Unverified:**
 - That the panels have subscribed by the time the load's 0xdd goes
-  out, which decides the daytime sun angle (above).
+  out. That decides the sun angle by day, and at night for a save
+  loaded after dark (above).
 - The cap has not been compared with a screenshot of a room brighter
   than 0.8 at night.
