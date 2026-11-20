@@ -5,7 +5,7 @@
 use sims_sim::{Headline, World};
 use sims_vm::boot::{Frames, Lot, StepError};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 33 --answers 3`
 /// gives this hash with the default frames (snapshot format 30).
@@ -226,6 +226,91 @@ fn an_old_town_home_loads_through_its_guid_table_and_steps() {
         lot.step().unwrap();
     }
     assert_eq!(lot.ticks(), 5);
+}
+
+/// UserData2 as the original left it after opening it for the first time,
+/// in a fresh directory: the install's UserData2, with the `Characters`
+/// and `Houses` folders and `Neighborhood.iff` that track 2 copied out of
+/// the game afterwards (`ud2-import-20261119`, `after-partial-0607utc`),
+/// which `SIMS_UD2_AFTER` names, and the emptied `Patch` folder. The copy
+/// lacks the neighborhood's other files (`LotZoning.iff` among them),
+/// which the open does not change, so they come from the install.
+fn imported_userdata2(root: &Path) -> Option<PathBuf> {
+    let after = PathBuf::from(std::env::var_os("SIMS_UD2_AFTER")?);
+    let directory = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("userdata2-imported");
+    if directory.exists() {
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+    copy_directory(&root.join("UserData2"), &directory);
+    for folder in ["Characters", "Houses", "Patch"] {
+        std::fs::remove_dir_all(directory.join(folder)).unwrap();
+    }
+    copy_directory(&after.join("Characters"), &directory.join("Characters"));
+    copy_directory(&after.join("Houses"), &directory.join("Houses"));
+    std::fs::create_dir(directory.join("Patch")).unwrap();
+    std::fs::copy(
+        after.join("Neighborhood.iff"),
+        directory.join("Neighborhood.iff"),
+    )
+    .unwrap();
+    Some(directory)
+}
+
+#[expect(clippy::disallowed_methods, reason = "sort paths before using them")]
+fn copy_directory(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(from)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    entries.sort();
+    for path in entries {
+        let target = to.join(path.file_name().unwrap());
+        if path.is_dir() {
+            copy_directory(&path, &target);
+        } else {
+            std::fs::copy(&path, &target).unwrap();
+        }
+    }
+}
+
+#[test]
+fn an_imported_home_loads_from_the_originals_files_and_steps() {
+    // House 69 of the second neighborhood, after the original's first open
+    // imported its Patch families and filled its pools (2000, 3000 to 3009,
+    // 5000, 5500 and 6000). Every dialog answers 2, as in track 2's recordings.
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let Some(directory) = imported_userdata2(&root) else {
+        eprintln!("SIMS_UD2_AFTER not set; skipping");
+        return;
+    };
+    let house = directory.join("Houses/House69.iff");
+    let mut lot = Lot::load(&root, &house, &[2; 8], Frames::default()).unwrap();
+    let report = lot.load_report();
+    assert!(report.stopped.is_none(), "{:?}", report.stopped);
+    assert!(report.finished.is_some());
+    // The original's open: 446 records, the Charmings (family 13) in
+    // House 69 under the GUIDs its import drew, and the pools.
+    let world = lot.world();
+    assert_eq!(world.neighbors.slots.len(), 446);
+    let family = |id: i32| world.families.iter().find(|f| f.id == id).unwrap();
+    assert_eq!(
+        (family(13).house, family(13).members.as_slice()),
+        (69, [0xf11b_036c, 0xf349_2156].as_slice())
+    );
+    let pools = [2000, 5000, 5500, 6000].map(|id| (family(id).house, family(id).members.len()));
+    assert_eq!(pools, [(0, 30), (0, 12), (0, 18), (0, 30)]);
+    let tours = (3000..3010).map(|id| family(id).members.len());
+    assert_eq!(tours.collect::<Vec<_>>(), [4, 2, 4, 3, 4, 3, 3, 4, 4, 4]);
+    assert_eq!(lot.world().hash_hex(), IMPORTED_69);
+    for _ in 0..1000 {
+        lot.step().unwrap();
+    }
+    assert_eq!(lot.world().hash_hex(), IMPORTED_69_1000);
 }
 
 #[test]
@@ -766,6 +851,11 @@ const TICK_31478: &str = "34cfca302c1a9b9392b3fcabee36deacdecca0f198df291215abad
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
 const TICK_31478_29: &str = "fc3480edf33f5a146bf2541956ee129cd0200203ae66069e6c763a6835b8f8ed";
+/// The imported House 69's state at entry (format 30). **Unverified**:
+/// no recording of this lot has been compared yet.
+const IMPORTED_69: &str = "a309c70283914b7e427884e86513548472cd3e29eecae8deb1f2efd9eb426059";
+/// The same after 1000 ticks. **Unverified**, as above.
+const IMPORTED_69_1000: &str = "f48028b595a25b17d31eeb80b14fe1ca96ee3a081948706a47efdf2cbbd4d044";
 /// The same at tick 43200, a whole day from the load.
 const TICK_43200: &str = "d26a6a16a451728e40c9b6ada581665a4dfae60ddc7cd8ab306649e3eac14bb0";
 /// The same state's hash under snapshot format 29, which had no person
