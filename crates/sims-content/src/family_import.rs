@@ -1,6 +1,6 @@
 //! The data changes made by the neighborhood's family importer (0x428f05).
 
-use crate::{Catalog, Error, Result};
+use crate::{Catalog, Error, ImportWardrobe, Result};
 use sims_formats::family_file::{FamilyFile, FamilyMember};
 use sims_formats::far::decode_name;
 use sims_formats::iff::{ChunkData, Iff};
@@ -8,6 +8,8 @@ use sims_formats::lot::ObjectTypes;
 use sims_formats::neighborhood::{Family, Neighbor, Relationship};
 use sims_formats::strings::{Format, StringTable, decode};
 use std::collections::{BTreeMap, BTreeSet};
+
+mod outfits;
 
 pub const TEMPLATE_PERSON: u32 = 0x7fd96b54;
 pub const TEMPLATE_DOG: u32 = 0x4a70df92;
@@ -279,11 +281,9 @@ pub fn import(
 /// (0x4722b8 and 0x4293ae–0x4295ee). Use the source FAM passed to [`import`].
 /// The destination file number can be set before cloning.
 ///
-/// This is the file before the appearance refresh at 0x4295f7. The refresh
-/// pads the body table (0x587b4b), then can rewrite outfits from the installed
-/// wardrobe (0x409315, 0x40a588). 0x4e8c5d renders BMP_ 2002–2007 and
-/// persists them via 0x4e9000. The caller can serialize these resources with
-/// [`sims_formats::iff::write`].
+/// Call [`refresh_outfits`] to perform 0x4295f7 before serializing with
+/// [`sims_formats::iff::write`]. The portrait renderer at 0x4e8c5d and
+/// its BMP_ 2002–2007 writes at 0x4e9000 are separate.
 pub fn clone_character(
     template: &Iff,
     character: &Character,
@@ -411,6 +411,35 @@ pub fn clone_character(
         }
     }
     Ok(chunks)
+}
+
+/// Refresh the STR# 200 of a successful [`clone_character`] using the
+/// startup wardrobe, then write it back to the clone (0x4295f7, 0x457f60).
+/// If selection reaches an unsupported branch, the clone remains intact.
+pub fn refresh_outfits(chunks: &mut [ChunkData], wardrobe: &ImportWardrobe) -> Result<()> {
+    let body = chunks
+        .iter_mut()
+        .find(|chunk| chunk.tag == *b"STR#" && chunk.id == 200 && chunk.flags >> 8 == 0)
+        .ok_or_else(|| unsupported("0x457fd7", "imported STR# 200 is absent"))?;
+    let table = StringTable::parse(&body.data)
+        .map_err(|error| Error::format("family import: 0x587b4b imported STR# 200", error))?;
+    if table.format != Format::Localized
+        || localized_entries(&table, Some(&body.data))
+            .any(|(language, entry)| language != 1 || !entry.raw_comment.is_empty())
+    {
+        return Err(unsupported(
+            "0x587b4b",
+            "expected the clone's language-1 body table",
+        ));
+    }
+    let mut rows: Vec<_> = table
+        .entries
+        .into_iter()
+        .map(|entry| entry.raw_text)
+        .collect();
+    outfits::refresh(&mut rows, wardrobe)?;
+    body.data = localized_strings(rows.iter().map(|text| (1, text.as_slice(), &[][..])))?;
+    Ok(())
 }
 
 fn catalog_strings(

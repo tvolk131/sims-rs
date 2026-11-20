@@ -2,9 +2,9 @@ mod common;
 
 use sims_content::family_import::{
     ImportInput, ImportOptions, TEMPLATE_CAT, TEMPLATE_DOG, TEMPLATE_PERSON, clone_character,
-    import,
+    import, refresh_outfits,
 };
-use sims_content::{Catalog, Index, Install, Neighborhood, Object};
+use sims_content::{Catalog, ImportWardrobe, Index, Install, Neighborhood, Object};
 use sims_formats::family_file::FamilyFile;
 use sims_formats::iff::{Chunk, Iff, write};
 use sims_formats::lot::{GuidTable, ObjectTypes};
@@ -379,7 +379,7 @@ fn string_rows(data: &[u8]) -> Vec<(u8, Vec<u8>, Vec<u8>)> {
         .collect()
 }
 
-fn compare_clone(clone: &Iff, oracle: &Iff, source_body: &[u8], number: i32) {
+fn compare_clone(clone: &Iff, oracle: &Iff, number: i32) {
     assert!(
         clone
             .all(b"BMP_")
@@ -404,24 +404,16 @@ fn compare_clone(clone: &Iff, oracle: &Iff, source_body: &[u8], number: i32) {
         match (&key.0, key.1) {
             (b"STR#", 200) => {
                 let rows = string_rows(bytes);
-                assert_eq!(
-                    rows,
-                    string_rows(source_body),
-                    "{resource_name} import rows"
-                );
-                assert_eq!(bytes.len(), source_body.len(), "{resource_name} size");
-                let end = bytes.len() - rows.len();
-                assert_eq!(&bytes[..end], &source_body[..end], "{resource_name}");
-                assert!(bytes[end..].iter().all(|&byte| byte == 0));
                 let saved = string_rows(original);
-                // 0x587b4b adds row 35. 0x409315 and 0x40a588 edit the
-                // wardrobe-derived entries when the imported file is read back.
-                assert_eq!((rows.len(), saved.len()), (34, 35), "{resource_name}");
+                assert_eq!((rows.len(), saved.len()), (35, 35), "{resource_name}");
                 for (index, (row, saved)) in rows.iter().zip(&saved).enumerate() {
-                    if ![16, 27, 28, 29].contains(&index) {
-                        assert_eq!(row, saved, "{resource_name} row {}", index + 1);
-                    }
+                    assert_eq!(row, saved, "{resource_name} row {}", index + 1);
                 }
+                // 0x46fc9f leaves one unused byte per declared row.
+                assert_eq!(bytes.len(), original.len(), "{resource_name} size");
+                let end = bytes.len() - rows.len();
+                assert_eq!(&bytes[..end], &original[..end], "{resource_name}");
+                assert!(bytes[end..].iter().all(|&byte| byte == 0));
             }
             (b"CTSS", 2000) => {
                 // 0x47090e allocates one unused byte per declared row.
@@ -457,6 +449,7 @@ fn imports_and_writes_the_complete_collections_userdata2_patches() {
         .filter_map(|(&guid, &(number, _))| (number >= 40).then_some((number, guid)))
         .collect();
     let install = Install::detect(&root).unwrap();
+    let wardrobe = ImportWardrobe::load(&install).unwrap();
     let mut index = Index::build(&install).unwrap();
     index.add_characters(&directory.join("Characters")).unwrap();
     let catalog = Catalog::build(&index).unwrap();
@@ -568,17 +561,18 @@ fn imports_and_writes_the_complete_collections_userdata2_patches() {
         let imported = import(&input, &file, PETS, &mut || guids.next().unwrap())
             .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
         assert!(guids.next().is_none());
-        for (&member, &guid) in member_ids.iter().zip(&imported.family.members) {
+        for &guid in &imported.family.members {
             let (number, oracle) = &originals[&guid];
             let mut character = imported.made[&guid].clone();
             character.file = *number;
-            let resources =
+            let mut resources =
                 clone_character(&templates[&character.template], &character, guid, &file)
                     .unwrap_or_else(|error| panic!("User{number:05}: {error}"));
+            refresh_outfits(&mut resources, &wardrobe)
+                .unwrap_or_else(|error| panic!("User{number:05}: {error}"));
             let bytes = write(&resources).unwrap();
             let clone = Iff::parse(bytes.clone()).unwrap();
-            let source_body = file.iff.data(file.iff.get(b"uChr", member).unwrap());
-            compare_clone(&clone, oracle, source_body, *number);
+            compare_clone(&clone, oracle, *number);
             output.file(&format!("Characters/User{number:05}.iff"), &bytes);
             assert!(written.insert(guid, *number).is_none());
         }
