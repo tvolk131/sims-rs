@@ -71,8 +71,12 @@ No screenshot of the panel was compared.
   (0x43ba7b) and passes over one with word 16 set (0x43baba to
   0x43badb). So a later such definition sharing a GUID could stand for
   an earlier one here. The install's seven definitions with word 16 set
-  share no GUID with another, and none has another high byte. It is the
-  catalog's to close.
+  share no GUID with another, and none has another high byte. Its
+  definition parser (`ObjectDefinition::parse`) also refuses version
+  137, which the original normalizes (0x431759, called at 0x43ba84) and
+  registers by GUID (0x43bd90 to 0x43bdb1), so an object of such a type
+  is not valued here; the install has no version 137 definition. These
+  are the catalog's to close.
 - **The objects** (0x444cb9), in the lot's order, in 32-bit sums that
   wrap:
   - A tile of a multi-tile group that is not its lead, and a type with
