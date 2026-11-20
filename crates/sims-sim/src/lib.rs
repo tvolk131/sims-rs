@@ -28,6 +28,7 @@ pub mod head;
 pub mod load;
 pub mod motives;
 pub mod neighbors;
+pub mod patch_import;
 pub mod pose;
 pub mod rooms;
 pub mod route;
