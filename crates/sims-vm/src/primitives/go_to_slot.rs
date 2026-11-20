@@ -327,13 +327,14 @@ impl Machine<'_, '_> {
         // stack object's own fields only: its position (+0xf4), its
         // container (+0x66, +0x7e) and +0x110. No animator is read before
         // this test, so a first run whose stack object is off the lot
-        // gives false whether or not an animator refresh is pending. Past
-        // it the route reads the person's animator, so the step's checks
-        // for an unsettled animator apply from here.
+        // gives false whether or not an animator refresh is pending, and
+        // neither is one read naming the slot (native error 0x25 at
+        // 0x45ace4 comes first). The route that follows reads the person's
+        // animator, so the step's checks for an unsettled animator apply
+        // from there.
         if !stands_on_lot(self.world, target)? {
             return Ok(Flow::Branch(false));
         }
-        self.refuse_unsettled_animator(45)?;
         let source = word(operands, 2);
         let number = word(operands, 0);
         let (owner, index) = match source {
@@ -375,6 +376,7 @@ impl Machine<'_, '_> {
             })
         }
         .ok_or(Trap::native(0x25, "Go To Routing Slot names no slot"))?;
+        self.refuse_unsettled_animator(45)?;
         let type_slot = type_slot.clone();
         let key = (owner, index as u16);
         let near = |flags: i32| {

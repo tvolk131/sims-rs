@@ -489,3 +489,113 @@ fn a_person_whose_word_31_names_no_record_is_removed_without_a_save() {
     assert_eq!(fx.world.removals, [id]);
     assert_eq!(fx.world.neighbors, before);
 }
+
+#[test]
+fn go_to_routing_slot_reads_no_animator_before_its_route() {
+    // The visitor removes itself in its own tick and goes on, its
+    // animator's refresh pending. Go To Routing Slot (opcode 45) tests its
+    // stack object's place (0x40743b, 0x432595) and names its slot
+    // (native error 0x25 at 0x45ace4) before its route reads the
+    // animator.
+    let (mut fx, id, file) = placed_visitor();
+    fx.world.globals = vec![0; 64];
+    for object in fx.world.objects.values_mut() {
+        object.registry_word = Some(if object.id == id { 0x0001_ffff } else { 0xffff });
+    }
+    let ready = fx.world.clone();
+    // Each case: the stack object, the slot's source, and what the pass
+    // gives (Ok, or a part of its error).
+    for (n, (stack_object, source, expected)) in [
+        // Itself, off the lot now: false, and the tree goes on.
+        (id as i16, 1u8, None),
+        // The lamp, on the lot, with source 3, which names no slot.
+        (LAMP as i16, 3, Some("0x25")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        fx.world = ready.clone();
+        let tree_id = 4207 + n as u16;
+        fx.add(
+            file,
+            tree_id,
+            tree(vec![
+                ins(REMOVE, 1, 1, [0, 0, 1, 0, 0, 0, 0, 0]),
+                ins(45, RETURN_TRUE, 2, [0, 0, source, 0, 0, 0, 0, 0]),
+                ins(0, RETURN_TRUE, RETURN_FALSE, [0; 8]),
+            ]),
+        );
+        // Then it sleeps (parameter 0), which reads no animator.
+        fx.thread(id, tree_id, &[5, 0, 0, 0]);
+        fx.world.objects.get_mut(&id).unwrap().stack[0].stack_object = stack_object;
+        let tuning = crate::tick::tuning();
+        let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        let mut update = sims_vm::Update::default();
+        let result = interpreter.scheduler_pass(&mut fx.world, &tuning, &mut update);
+        match expected {
+            None => assert_eq!(result, Ok(true), "case {n}"),
+            Some(part) => {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(part), "case {n}: {error}");
+                assert!(!error.contains("left the lot"), "case {n}: {error}");
+            }
+        }
+    }
+}
+
+#[test]
+fn idle_for_input_cancels_a_queued_action_with_the_refresh_pending() {
+    // The visitor removes itself in its own tick and goes on, its
+    // animator's refresh pending, to Idle For Input with an action queued
+    // that interrupts. The action has no tree, so it is cancelled
+    // (0x45dcc8): nothing of that reads an animator, and the pass goes
+    // on. Only a start that works the footprint out again (person word
+    // 73, 0x45e756) is refused.
+    let (mut fx, id, file) = placed_visitor();
+    fx.world.globals = vec![0; 64];
+    for object in fx.world.objects.values_mut() {
+        object.registry_word = Some(if object.id == id { 0x0001_ffff } else { 0xffff });
+    }
+    fx.add(
+        file,
+        4209,
+        tree(vec![
+            ins(REMOVE, 1, 1, [0, 0, 1, 0, 0, 0, 0, 0]),
+            ins(17, RETURN_TRUE, RETURN_FALSE, [0, 0, 1, 0, 0, 0, 0, 0]),
+        ]),
+    );
+    fx.thread(id, 4209, &[3, 0, 0, 0]);
+    let person = fx
+        .world
+        .objects
+        .get_mut(&id)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap();
+    person.data[71] = 0;
+    person.data[33] = 7;
+    let mut action = person.active.clone();
+    (
+        action.uid,
+        action.target,
+        action.action,
+        action.priority,
+        action.flags,
+    ) = (0, LAMP as i16, 0, 50, 0);
+    person.queue = vec![action];
+    let tuning = crate::tick::tuning();
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let mut update = sims_vm::Update::default();
+    let result = interpreter.scheduler_pass(&mut fx.world, &tuning, &mut update);
+    assert_eq!(result, Ok(true));
+    assert_eq!(fx.world.removals, [id]);
+    assert!(
+        fx.world.objects[&id]
+            .person
+            .as_ref()
+            .unwrap()
+            .queue
+            .is_empty()
+    );
+}

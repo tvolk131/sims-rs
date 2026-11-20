@@ -103,16 +103,23 @@ For Play Sound Event and Stop All Sounds, whether the sound manager reads
 anything the refresh writes is **unverified**. It would change only what
 is heard.
 
-Two primitives are refused only at the point where they first read the
+Two primitives are refused only where they would first read the
 animator, instead of at the step:
 
 - **Go To Routing Slot (45)**: 0x40743b and 0x432595 read only the stack
   object's own position, container and +0x110. As a result, a stack object
-  that is off the lot gives false whether or not a refresh is pending. Past
-  that test the route reads the person's animator.
+  that is off the lot gives false whether or not a refresh is pending.
+  Naming the slot reads no animator either: a source that names no slot
+  raises native error 0x25 (0x45ace4) first. The route that follows reads
+  the person's animator.
 - **Idle For Input (17)** reads the person's words, motives, queue and the
-  lot's zoning until it starts an action. Starting the action works the
-  footprint out again (0x45e6cd calls 0x433d16).
+  lot's zoning. The check and cancellation trees it runs are checked one
+  primitive at a time, and so is the tree it pushes, so a queued action
+  that is cancelled (0x45dcc8) runs with a refresh pending. Making an
+  action the running one (0x45e6cd) works the person's footprint out
+  again only when person word 73 is set (0x45e756, 0x433d16). That goes
+  through 0x43519f, whose virtual call at 0x4353c9 is not traced, so only
+  that start is refused.
 
 ## Effect on the pins
 
