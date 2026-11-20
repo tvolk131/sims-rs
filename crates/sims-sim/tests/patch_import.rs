@@ -196,8 +196,13 @@ fn opening_userdata2_imports_its_patch_families_as_the_first_neighborhood_has_th
         .map(|(&number, &guid)| (guid, number))
         .collect();
     let mut made_types = BTreeMap::new();
+    // Compared as the open left the neighborhood, after every file.
+    assert_eq!(opened.imports.len(), names.len());
     for (name, import) in &opened.imports {
-        // The same GUID tables, byte for byte.
+        let ours = &neighborhood.families[&import.family_id];
+        // Every housed family has its lot, with the same GUID table, byte
+        // for byte.
+        assert_eq!(import.lot.is_some(), ours.house != 0, "{name}");
         if let Some(lot) = &import.lot {
             let house = first.join(format!("Houses/House{:02}.iff", lot.house));
             let iff = Iff::parse(fs::read(&house).unwrap()).unwrap();
@@ -208,7 +213,6 @@ fn opening_userdata2_imports_its_patch_families_as_the_first_neighborhood_has_th
             );
         }
         // The same family, under the same ID.
-        let ours = &import.family;
         let theirs = &first_neighborhood.families[&import.family_id];
         assert_eq!(
             (
@@ -233,7 +237,8 @@ fn opening_userdata2_imports_its_patch_families_as_the_first_neighborhood_has_th
         assert_eq!(ours.number + NUMBERS, theirs.number, "{name}");
         // The same records.
         assert_eq!(import.neighbors.len(), ours.members.len(), "{name}");
-        for (&id, record) in &import.neighbors {
+        for &id in import.neighbors.keys() {
+            let record = neighborhood.neighbors[id as usize - 1].as_ref().unwrap();
             let theirs = first_records[&record.guid];
             assert_eq!(id, record.id);
             assert_eq!(id + SLOTS, theirs.id, "{name}");
@@ -306,7 +311,7 @@ fn record(id: i16, guid: u32) -> Neighbor {
         name: String::new(),
         unknown_zero: 0,
         person_mode: 0,
-        person_data: Vec::new(),
+        person_data: vec![0; 256],
         id,
         guid,
         unknown_negative: -1,
@@ -422,6 +427,14 @@ fn house_zeros_reload_makes_records_and_drops_members_without_one() {
     );
     // Family 7's pet had no record when the reload checked the members.
     assert_eq!(neighborhood.families[&7].members, [BOB]);
+    // Word 61 names each member's family; the made records save none.
+    let family_words: Vec<_> = neighborhood
+        .neighbors
+        .iter()
+        .flatten()
+        .map(|record| record.person_data.get(61).copied())
+        .collect();
+    assert_eq!(family_words, [Some(4000), None, Some(7), None]);
     // Without Unleashed, nothing is imported and the option stays.
     assert_eq!(opened.renumbered, None);
     assert!(neighborhood.options.unwrap()[PENDING_IMPORT]);
@@ -486,5 +499,28 @@ fn what_the_import_path_does_not_port_fails_loudly() {
             n.families.remove(&0);
         },
         "0x425209",
+    );
+    fails(
+        &|n| {
+            n.families.insert(0x8000, family(3, &[BOB]));
+        },
+        "0x424bb6",
+    );
+    // The pet has no record, so its family is left empty.
+    fails(
+        &|n| {
+            n.families.insert(9, family(3, &[PET]));
+        },
+        "0x425efb",
+    );
+    fails(
+        &|n| {
+            n.families.insert(9, family(3, &[ANNE]));
+        },
+        "0x425244",
+    );
+    fails(
+        &|n| n.neighbors[0].as_mut().unwrap().person_data.clear(),
+        "0x425244",
     );
 }

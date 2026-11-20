@@ -354,8 +354,13 @@ fn displace_family(input: &ImportInput<'_>, house: i32) -> Result<Option<(u16, F
     match occupants.as_slice() {
         [] => Ok(None),
         [(id, family, secondary)] if *secondary != house => {
+            // 0x42920f to 0x42922e: the house is cleared first, so the
+            // worth 0x4272c5 gives (from 0x410271) is the budget plus the
+            // architecture value, and that becomes the budget before the
+            // architecture value is zeroed.
             let mut family = (*family).clone();
             family.house = 0;
+            family.budget = family.budget.wrapping_add(family.architecture_value);
             family.architecture_value = 0;
             family.flags &= !8;
             Ok(Some((*id, family)))

@@ -238,8 +238,13 @@ fn clones_members_in_export_order_and_translates_their_links() {
     assert_eq!(imported.neighborhood_data[2..4], [0, 42]);
     let (displaced_id, displaced) = imported.displaced_family.unwrap();
     assert_eq!(
-        (displaced_id, displaced.house, displaced.architecture_value),
-        (17, 0, 0)
+        (
+            displaced_id,
+            displaced.house,
+            displaced.budget,
+            displaced.architecture_value
+        ),
+        (17, 0, 500, 0)
     );
 
     let lot = imported.lot.unwrap();

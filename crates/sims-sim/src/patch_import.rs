@@ -23,10 +23,13 @@
 //! **Not modeled:** the rest of house 0's load (its objects, which the
 //! boot does not model for the base neighborhood either), the dialog the
 //! scan shows, and the files it writes. The caller takes the made types,
-//! records, families and lots from the result.
+//! records, families and lots from the result. The families' friend
+//! counts are left as the file saved them: the save (0x42542e) counts
+//! again those that are out of date, and every family is out of date
+//! after a load (0x41003c), so the lot load counts them again too.
 
 use crate::load::LoadError;
-use crate::neighbors::{RECORDED_KINDS, Registered};
+use crate::neighbors::{FAMILY, RECORDED_KINDS, Registered};
 use sims_content::family_import::{self, Import, ImportInput, ImportOptions};
 use sims_content::{Catalog, Neighborhood, PENDING_IMPORT};
 use sims_formats::family_file::FamilyFile;
@@ -95,13 +98,14 @@ pub fn open(
         made_records: reload(neighborhood, context.registry)?,
         ..Opened::default()
     };
+    rebuild_family_words(neighborhood)?;
     // 0x42c1d5: Unleashed's bit, then the option byte.
     if context.expansions & PETS == 0 {
         return Ok(opened);
     }
     let options = neighborhood.options.as_mut().ok_or_else(|| {
         LoadError::Neighborhood(
-            "the neighborhood file has no NGBH chunk, so whether an import is pending is the \
+            "the neighborhood file has no NGBH #1, so whether an import is pending is the \
              constructor's (0x4244bc), which is not ported"
                 .into(),
         )
@@ -111,7 +115,9 @@ pub fn open(
     }
 
     // 0x42c122 to 0x42c1ad. IDs are unique, so the reload's order (which
-    // family 4000 is first) does not matter.
+    // family 4000 is first) does not matter, and the reload checked that
+    // none is negative as a signed word, so the unsigned max is the
+    // signed one.
     if neighborhood.families.contains_key(&STRAYS) {
         let largest = neighborhood.families.keys().max().copied().unwrap_or(0);
         let id = largest.checked_add(1).ok_or_else(|| {
@@ -150,6 +156,7 @@ pub fn open(
                 LoadError::Neighborhood(format!("importing {}: {error}", patch.name))
             })?;
         apply(neighborhood, &import)?;
+        rebuild_family_words(neighborhood)?; // 0x429873 → 0x425244
         character_files.extend(import.made.values().map(|made| made.file));
         character_guids.extend(import.made.keys().copied());
         next_file = import.next_file;
@@ -174,9 +181,15 @@ pub fn open(
 ///   and no relationships. Its name (+0x28, from the definition) and the
 ///   fields the file saves around it are not modeled.
 ///
-/// The families' order (0x425209) and person data word 61 are not kept
-/// here: the import reads neither, and the lot load's reload works both
-/// out again. Returns the IDs of the records made.
+/// - A family whose ID is negative as a signed word fails: the reader
+///   skips ID 0xffff (0x424bb6) and keeps the others negative in +0x10c,
+///   which the pre-step's signed max then passes over; neither is ported.
+/// - A family other than family 0 left with no members fails: the house
+///   load deletes it (0x428071 to 0x4280b1, 0x425efb), which is not
+///   ported.
+///
+/// The families' order (0x425209) is not kept: [`rebuild_family_words`]
+/// fails when it would matter. Returns the IDs of the records made.
 fn reload(neighborhood: &mut Neighborhood, registry: &[Registered]) -> Result<Vec<i16>, LoadError> {
     let registered: BTreeSet<u32> = registry.iter().map(|d| d.guid).collect();
     let mut first = BTreeMap::new();
@@ -199,8 +212,25 @@ fn reload(neighborhood: &mut Neighborhood, registry: &[Registered]) -> Result<Ve
                 .into(),
         ));
     }
+    if let Some(id) = neighborhood.families.keys().find(|&&id| id >= 0x8000) {
+        return Err(LoadError::Neighborhood(format!(
+            "family {id:#06x} is negative as the reader's signed word; the reader skips 0xffff \
+             and keeps the rest negative (0x424bb6), which is not ported"
+        )));
+    }
     for family in neighborhood.families.values_mut() {
         family.members.retain(|guid| first.contains_key(guid));
+    }
+    if let Some(id) = neighborhood
+        .families
+        .iter()
+        .find(|(id, family)| **id != 0 && family.members.is_empty())
+        .map(|(id, _)| *id)
+    {
+        return Err(LoadError::Neighborhood(format!(
+            "family {id} has no member with a record; the house load deletes it (0x428071, \
+             0x425efb), which is not ported"
+        )));
     }
     let mut made = Vec::new();
     for definition in registry {
@@ -210,6 +240,53 @@ fn reload(neighborhood: &mut Neighborhood, registry: &[Registered]) -> Result<Ve
         }
     }
     Ok(made)
+}
+
+/// Person data word 61 rebuilt (0x425244), as after the reload and after
+/// each file's import (0x429873): every record's is cleared, then each
+/// family writes its ID into the first record of each member's GUID.
+///
+/// The original walks the families in its own order; a GUID two families
+/// share makes that order matter, and that fails loudly. A record whose
+/// person data stops before word 61 (a record the reload made, or one
+/// saved without person data) has it as 0, and a member's such record
+/// fails loudly.
+fn rebuild_family_words(neighborhood: &mut Neighborhood) -> Result<(), LoadError> {
+    let mut family_of = BTreeMap::new();
+    for (&id, family) in &neighborhood.families {
+        for &guid in &family.members {
+            if let Some(other) = family_of.insert(guid, id)
+                && other != id
+            {
+                return Err(LoadError::Neighborhood(format!(
+                    "the person type 0x{guid:08X} belongs to families {other} and {id}; which \
+                     one word 61 names depends on the families' order (0x425244), which is \
+                     not kept"
+                )));
+            }
+        }
+    }
+    let mut seen = BTreeSet::new();
+    for record in neighborhood.neighbors.iter_mut().flatten() {
+        let family = if seen.insert(record.guid) {
+            family_of.get(&record.guid).copied().unwrap_or(0)
+        } else {
+            0
+        };
+        match record.person_data.get_mut(FAMILY) {
+            Some(word) => {
+                *word = i16::try_from(family).expect("the reload checked the family IDs");
+            }
+            None if family == 0 => {}
+            None => {
+                return Err(LoadError::Neighborhood(format!(
+                    "record {} is family {family}'s member but saves no word 61 (0x425244)",
+                    record.id
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// [`crate::neighbors::Neighbors::make_record`] on the file's records.

@@ -49,25 +49,44 @@ records. This puts the reload's step in their place.
      revision 0, no person data and no rows.
    - The record's name and the fields the file saves around it are not
      modeled.
-   - The families' order and person data word 61 are not kept: the import
-     reads neither, and the lot load's reload works both out again.
+   - Person data word 61 is rebuilt (0x425244): each family writes its
+     ID into the first record of each member's GUID. The families' order
+     is not kept, so a GUID in two families fails loudly.
    - A neighborhood without family 0 fails loudly: the reload adds one,
      which this path does not port.
+   - A family ID that is negative as a signed word fails loudly. The
+     reader skips 0xffff and keeps the rest negative (0x424bb6), and the
+     pre-step's signed max passes over them.
+   - A family other than family 0 left with no members fails loudly: the
+     house load deletes it (0x428071 to 0x4280b1, 0x425efb).
    - The file counter starts at 0 (0x424e8e).
 2. **Nothing more without Unleashed's bit or the pending option.**
-   Without an NGBH chunk, whether an import is pending is the
-   constructor's (0x4244bc), and that fails loudly.
+   - The option is NGBH #1's (0x424a1a).
+   - Without NGBH #1, the reload reads no records (0x424a90), and
+     `Neighborhood::open` keeps none.
+   - Without NGBH #1, whether an import is pending is the constructor's
+     (0x4244bc), and that fails loudly.
 3. **The pre-step (0x42c122 to 0x42c1ad).** The family whose ID (+0x10c,
    its FAMI chunk ID) is 4000 takes the largest ID plus one, so that
    `Strays_4000` keeps 4000. IDs are unique, so the reload's order does
    not matter here.
 4. **The scan (0x42bca4).** Each file is imported with
    `family_import::import`, in the order given, and its records, family,
-   displaced family and data words are applied before the next. The
-   character file numbers and GUIDs carry over between files.
+   displaced family and data words are applied before the next, and word
+   61 is rebuilt again (0x429873 → 0x425244). The character file numbers
+   and GUIDs carry over between files.
+   - The family a lot's import displaces keeps its worth. 0x42920f clears
+     its house, so 0x4272c5 (from 0x410271) gives the budget plus the
+     architecture value. That becomes the budget, and then the
+     architecture value is zeroed (0x429226). `family_import` only zeroed
+     it before.
 5. **The option is cleared (0x42c1ba).** The save (0x4252cc), the dialog
    and the files written are not modeled. The caller takes the made
    types, records, families and lots from the result.
+   - The families' friend counts stay as the file saved them. The save
+     counts again those that are out of date (0x42542e), and a lot load
+     marks every family out of date (0x41003c), so they are counted again
+     there too.
 
 ## Checked with the original's GUIDs
 
@@ -78,7 +97,8 @@ The original imported the same six files into the first neighborhood.
 - Each housed family's `Gtab` #1 pairs its people's exported GUIDs with
   the new ones. The strays' new GUIDs are those of User00040 to 47.
 
-The install test opens UserData2 and feeds those GUIDs as the draws.
+The install test opens UserData2 and feeds those GUIDs as the draws. It
+compares the neighborhood as the open left it, after every file.
 - Every lot's `Gtab` #1 equals the first neighborhood's house's, byte for
   byte.
 - Every family equals the first neighborhood's under the same ID:

@@ -25,7 +25,8 @@ pub struct Neighborhood {
     /// The records of the neighborhood's people (NBRS), in the file's slot
     /// order, with its empty slots: the original keeps the empty slots in
     /// its record vector (0x42feb2), and a script names a record by its
-    /// place.
+    /// place. Empty when the file has no NGBH #1: the reload reads the
+    /// records only after it (0x424a90).
     pub neighbors: Vec<Option<Neighbor>>,
     /// The neighbors' inventories (the NGBH chunk's, read by 0x4254f6), in
     /// the file's order, with its empty slots. Empty when the file has no
@@ -40,7 +41,7 @@ pub struct Neighborhood {
     /// The neighborhood's option bytes at +0x1a0 to +0x1aa, as the NGBH
     /// chunk's reader (0x4254f6) leaves them: those the chunk's version
     /// saves, the reader's defaults for the rest. `None` when the file has
-    /// no NGBH chunk, and the reader does not run. Option 10 (+0x1aa) is
+    /// no NGBH #1 (0x424a1a), and the reader does not run. Option 10 (+0x1aa) is
     /// whether the `Patch` families are still to be imported: saved from
     /// version 69, set otherwise (0x42559e, 0x4255ae).
     pub options: Option<[bool; 11]>,
@@ -70,17 +71,22 @@ impl Neighborhood {
                     .map_err(|e| Error::format(&format!("{} TATT #1", path.display()), e))
             })
             .transpose()?;
+        // The reload reads NGBH #1 (0x424a28) and only then the records
+        // (0x424a90): a file without NGBH #1 keeps no records.
+        let ngbh = iff.get(b"NGBH", 1);
         let mut neighbors = Vec::new();
-        for chunk in iff.all(b"NBRS") {
-            let parsed = Neighbors::parse(iff.data(chunk))
-                .map_err(|e| Error::format(&format!("{} NBRS #{}", path.display(), chunk.id), e))?;
-            neighbors.extend(parsed.entries);
-        }
-        let (inventories, data, options) = match iff.all(b"NGBH").next() {
-            Some(chunk) => {
-                let header = Header::parse(iff.data(chunk)).map_err(|e| {
-                    Error::format(&format!("{} NGBH #{}", path.display(), chunk.id), e)
+        if ngbh.is_some() {
+            for chunk in iff.all(b"NBRS") {
+                let parsed = Neighbors::parse(iff.data(chunk)).map_err(|e| {
+                    Error::format(&format!("{} NBRS #{}", path.display(), chunk.id), e)
                 })?;
+                neighbors.extend(parsed.entries);
+            }
+        }
+        let (inventories, data, options) = match ngbh {
+            Some(chunk) => {
+                let header = Header::parse(iff.data(chunk))
+                    .map_err(|e| Error::format(&format!("{} NGBH #1", path.display()), e))?;
                 (header.inventories, header.data, Some(header.options))
             }
             None => (Vec::new(), [0; 16], None),
