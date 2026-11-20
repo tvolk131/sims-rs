@@ -932,15 +932,24 @@ def main():
             event(kind='watch_ended', name=w.name, expr=w.text, update=updates, set=w.set)
         if ended and not (live_watches or pending or args.watch or runner or updates + 1 in dump_set):
             disarm(ENTRY)
-        if foreign or not (live_watches or pending):
+        if foreign:
             return
         # A late watch is set or moved only at a stop on this lot: another lot's objects are not
-        # this lot's, and one set there would count as set when the run is taken over.
+        # this lot's, and one set there would count as set when the run is taken over. At a stop in
+        # the game's process whose lot cannot be read, or on another lot, the moving late watches are
+        # taken off and the simulator seen before is not used for them again until this lot's next
+        # entry or return, whether or not any is set now (one waiting could be set at a later stop
+        # here before then).
         try:
             lot = m.lot()
+            readable = True
         except MemoryError:
-            lot = None
+            lot, readable = None, False
         here = lot == args.lot
+        if not here:
+            retire_elsewhere(lot)
+        if not readable or not (live_watches or pending):
+            return
         if live_watches:
             check_watches(m, here, lot)
         if pending:
@@ -1157,7 +1166,9 @@ def main():
                     answerer.answered(record)
                 if pc == DIALOG_SHOW:
                     save_status(dialog=dict(update=updates + 1, record=record, shown=time.time()))
-            tend_watches(m, foreign)
+            # Only another process counts as foreign here: tend_watches reads the lot again, and a lot
+            # that cannot be read in the game's process still takes the moving late watches off.
+            tend_watches(m, sims_cr3 is not None and cr3 != sims_cr3)
             # Step past the breakpoint we stopped at (if it is still armed).
             armed = pc in breaks
             if armed:

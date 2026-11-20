@@ -100,6 +100,8 @@ class FakeMemory:
         self.remote = remote
 
     def lot(self):
+        if self.remote.current.get('lot_unreadable'):
+            raise MemoryError('the lot')
         return self.remote.current.get('lot', 5)
 
     def word(self, p):
@@ -499,6 +501,38 @@ class CaptureTest(unittest.TestCase):
              '--late-watch', '2-2,direction=person:259@0xadc+0x8c'])
         rows = self.rows(output / 'watch.jsonl')
         self.assertEqual([(r['name'], r['lot'], 'before' in r) for r in rows], [('pair', 7, True)])
+
+    def test_a_late_watch_waiting_is_not_set_through_another_lots_simulator(self):
+        # Waiting at the end of update 1 (no animator yet), the watch sees
+        # a dialog on lot 7, or on a lot that cannot be read, and then one
+        # on lot 5 before lot 5's next entry or return: it is not set there
+        # through the simulator seen before, only at the entry.
+        for elsewhere in (dict(lot=7), dict(lot_unreadable=True)):
+            remote, output, _ = self.run_capture([
+                dict(pc=0), dict(pc=capture.ENTRY), dict(pc=capture.RETURN, animator=0),
+                dict(pc=capture.DIALOG_SHOW, **elsewhere), dict(pc=capture.DIALOG_SHOW),
+                dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
+                ['--updates', '2', '--late-watch', '2-2,direction=person:259@0xadc+0x88'])
+            self.assertEqual(remote.watch_stops[0], ('set', capture.ENTRY), elsewhere)
+            ended = self.events(output, 'watch_ended')
+            self.assertEqual([(r['update'], r['set']) for r in ended], [(2, True)], elsewhere)
+
+    def test_a_stop_whose_lot_cannot_be_read_takes_a_moving_late_watch_off(self):
+        # Set at the end of update 1; a dialog in the game's process whose
+        # lot cannot be read takes it off, and a write on lot 5 before its
+        # next entry names no watch and has no tick. The entry sets it again.
+        remote, output, _ = self.run_capture([
+            dict(pc=0), dict(pc=capture.ENTRY), dict(pc=capture.RETURN),
+            dict(pc=capture.DIALOG_SHOW, lot_unreadable=True),
+            dict(pc=0x123456, reply='T05watch:70088;'),
+            dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
+            ['--updates', '2', '--late-watch', '2-2,direction=person:259@0xadc+0x88'])
+        rows = self.rows(output / 'watch.jsonl')
+        self.assertEqual([(r['name'], r['lot'], r['tick']) for r in rows], [(None, 5, None)])
+        lost = self.events(output, 'watch_lost')
+        self.assertEqual([r.get('elsewhere') for r in lost], [True])
+        armed = self.events(output, 'watch_armed')
+        self.assertEqual([r['update'] for r in armed], [1, 1])
 
     def test_a_run_taken_over_at_update_1s_return_records_it(self):
         def prepare(output):
