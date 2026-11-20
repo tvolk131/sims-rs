@@ -595,6 +595,7 @@ fn catalog() -> sims_content::Surfaces {
         name: name.into(),
         location: name.into(),
         keys: keys.iter().copied().collect(),
+        price: None,
     };
     Surfaces {
         floors: SurfaceCatalog {
