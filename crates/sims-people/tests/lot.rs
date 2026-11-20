@@ -827,21 +827,23 @@ fn a_bench_in_use_draws_after_the_sim_on_it() {
 /// the book back and stands by the stairs. The original's animator for
 /// person 21 then held, read from its memory:
 ///
-/// - the foreground layer (+0xc) at phase 0.5004169 (+0x28) and clip
-///   time 599 ms (+0x30), 1199 ms long: here
-///   `a2o-idle-neutral-trans-stand-Mstand`;
-/// - the base layer (+0x14) at phase 0.4792362 and clip time 957 ms,
-///   1999 ms long: here `a2o-standing-loop`;
+/// - the foreground layer (+0xc) at phase 0.5004169 (+0x28), clip time
+///   599 ms (+0x30), duration 1199 ms (+0x20), speed 1 (+0x24) and
+///   weight 1 (+0x2c): here `a2o-idle-neutral-trans-stand-Mstand`;
+/// - the base layer (+0x14) at phase 0.4792362, clip time 957 ms,
+///   duration 1999 ms, speed 1 and weight 1: here `a2o-standing-loop`;
 /// - no carry layer (+0x13c);
 /// - the head (+0x210 to +0x218) at heading 0.5969, target heading
-///   5.896 and turn 0, with person data word 42 at 8 (not following).
+///   5.896 (both read to four digits) and turn 0, with person data word
+///   42 at 8 (not following).
 ///
 /// The five pixels are inside his outline (the face twice, the hair, the
-/// trousers, a shoe). The original's colours are in 16-bit colour; each
-/// check allows 12 per channel. His outline is not checked: at this
-/// camera the original's sits about half a pixel right of and below
-/// ours, and at the 7:12 AM one (`a_bench_in_use_draws_after_the_sim_on_it`)
-/// it does not. Why is open.
+/// trousers, a shoe). Each is his in our frame (the canvas names person
+/// 21 there). The original's colours are in 16-bit colour; each check
+/// allows 12 per channel. The control frame is the same lot and held
+/// objects without the people pass, which must not already match. His
+/// outline is not checked: in this frame the best whole-figure shift
+/// tested puts ours half a pixel right and down; see the decision.
 #[test]
 fn mortimer_stands_without_his_book_as_the_original_draws_him() {
     let Some(root) = install() else { return };
@@ -868,15 +870,17 @@ fn mortimer_stands_without_his_book_as_the_original_draws_him() {
             "a2o-idle-neutral-trans-stand-Mstand",
             0.500_416_9,
             599,
+            1199.0,
         ),
         (
             &world.base_layers[&21],
             "a2o-standing-loop",
             0.479_236_2,
             957,
+            1999.0,
         ),
     ];
-    for (layer, clip, phase, time) in layers {
+    for (layer, clip, phase, time, duration) in layers {
         assert_eq!(layer.clip, clip);
         assert!(
             (layer.phase.to_f32() - phase).abs() < 1e-6,
@@ -884,9 +888,14 @@ fn mortimer_stands_without_his_book_as_the_original_draws_him() {
             layer.phase
         );
         assert_eq!(layer.event_time, time, "{clip}");
+        assert_eq!(layer.duration.to_f32(), duration, "{clip}");
+        assert_eq!(layer.speed.to_f32(), 1.0, "{clip}");
+        assert_eq!(layer.weight.to_f32(), 1.0, "{clip}");
     }
     assert!(animator.carry.is_none());
     assert_eq!(animator.head.turn.to_f32(), 0.0);
+    assert!((animator.head.heading.to_f32() - 0.5969).abs() < 5e-5);
+    assert!((animator.head.target_heading.to_f32() - 5.896).abs() < 5e-4);
     assert_eq!(mortimer.data[42], 8);
 
     assert_eq!(people.update(world), Vec::<String>::new());
@@ -899,13 +908,14 @@ fn mortimer_stands_without_his_book_as_the_original_draws_him() {
         focus: Default::default(),
     };
     let shape = sims_render::Lot::from_world(world).unwrap();
-    let mut lot_only = sims_render::Canvas::new(800, 600, [0, 0, 0]);
-    sims_render::draw(world, &shape, &mut opened.assets, &camera, &mut lot_only);
     let mut canvas = sims_render::Canvas::new(800, 600, [0, 0, 0]);
     sims_render::draw_lot(world, &shape, &mut opened.assets, &camera, &mut canvas);
+    let mut lot_only = canvas.clone();
     let drawn = people.draw_on_lot(world, &camera, &mut canvas);
     assert!(drawn.problems.is_empty(), "{:?}", drawn.problems);
-    sims_render::draw_held(world, &shape, &mut opened.assets, &camera, &mut canvas);
+    for c in [&mut canvas, &mut lot_only] {
+        sims_render::draw_held(world, &shape, &mut opened.assets, &camera, c);
+    }
     let pixels = [
         ([446, 240], [189, 133, 106]),
         ([435, 255], [213, 153, 123]),
@@ -916,6 +926,7 @@ fn mortimer_stands_without_his_book_as_the_original_draws_him() {
     for ([x, y], original) in pixels {
         let at = |c: &sims_render::Canvas| c.rgb565()[y * 800 + x];
         let near = |c: [u8; 3]| c.iter().zip(original).all(|(&a, b)| a.abs_diff(b) <= 12);
+        assert_eq!(canvas.id_at(x as i32, y as i32), Some(21), "({x}, {y})");
         assert!(near(at(&canvas)), "({x}, {y}): {:?}", at(&canvas));
         assert!(
             !near(at(&lot_only)),
