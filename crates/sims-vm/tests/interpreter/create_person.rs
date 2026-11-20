@@ -272,7 +272,7 @@ fn another_object_takes_a_person_off_and_nothing_reads_its_animator_after() {
     fx.add(
         file,
         4201,
-        tree(vec![ins(8, RETURN_TRUE, RETURN_FALSE, [0; 8])]),
+        tree(vec![ins(44, RETURN_TRUE, RETURN_FALSE, [0; 8])]),
     );
     let result = fx.run_with(id, 4201, 0, &[], 1000);
     let t = trap(result);
@@ -352,12 +352,12 @@ fn a_person_another_took_off_ticks_with_its_refresh_pending() {
     assert_eq!(update.ticked, [LAMP, id]);
     assert_eq!(fx.world.removals, [id]);
     // Its thread may not run a primitive that reads an animator before
-    // its animator's tick (Random, opcode 8, here).
+    // its animator's tick (Animate Sim, opcode 44, here).
     fx.world = ready;
     fx.add(
         file,
         4204,
-        tree(vec![ins(8, RETURN_TRUE, RETURN_FALSE, [0; 8])]),
+        tree(vec![ins(44, RETURN_TRUE, RETURN_FALSE, [0; 8])]),
     );
     fx.thread(id, 4204, &[0; 4]);
     let (result, _) = pass(&mut fx);
@@ -402,7 +402,7 @@ fn a_person_removing_itself_and_going_on_settles_its_refresh_at_its_animators_ti
     assert_eq!(update.ticked, [id]);
     assert_eq!(fx.world.removals, [id]);
     assert_eq!(fx.world.objects[&id].position, [-16, -16, 1]);
-    // Then Random (opcode 8), which reads an animator: it fails on the
+    // Then Animate Sim (opcode 44), which reads an animator: it fails on the
     // pending refresh.
     fx.world = ready;
     fx.add(
@@ -410,11 +410,227 @@ fn a_person_removing_itself_and_going_on_settles_its_refresh_at_its_animators_ti
         4206,
         tree(vec![
             ins(REMOVE, 1, 1, [0, 0, 1, 0, 0, 0, 0, 0]),
-            ins(8, RETURN_TRUE, RETURN_FALSE, [0; 8]),
+            ins(44, RETURN_TRUE, RETURN_FALSE, [0; 8]),
         ]),
     );
     fx.thread(id, 4206, &[0; 4]);
     let (result, _) = pass(&mut fx);
     let error = result.unwrap_err().to_string();
     assert!(error.contains("left the lot and before its"), "{error}");
+}
+
+/// A record of the widget's type whose person data is all `value`.
+fn widget_record(id: i16, value: i16) -> sims_sim::neighbors::Neighbor {
+    sims_sim::neighbors::Neighbor {
+        id,
+        guid: WIDGET,
+        revision: 3,
+        data: vec![value; 256],
+        relationships: Vec::new(),
+        friends: 0,
+        stale: false,
+    }
+}
+
+#[test]
+fn a_person_removed_is_saved_into_the_record_its_word_31_names() {
+    // 0x451bee to 0x451c03, 0x425a69: the record word 31 names (by place
+    // plus one), not the first of the type, gets revision 9 (0x423e04) and
+    // the words the table at 0x423827 lists for revision 9.
+    let (mut fx, id, _) = placed_visitor();
+    let person = fx
+        .world
+        .objects
+        .get_mut(&id)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap();
+    person.data = (0..256).map(|n| 2000 + n).collect();
+    person.data[31] = 2;
+    fx.world.neighbors.slots = vec![Some(widget_record(40, -1)), Some(widget_record(41, -2))];
+    let before = fx.world.neighbors.clone();
+    assert_eq!(fx.run_with(LAMP, 4200, id as i16, &[], 1000), Ok(true));
+    assert_eq!(fx.world.removals, [id]);
+    assert_eq!(fx.world.neighbors.get(1), before.get(1));
+    let record = fx.world.neighbors.get(2).unwrap();
+    assert_eq!(record.revision, 9);
+    let saved = [
+        2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 26, 46, 47, 48, 49, 50, 51,
+        52, 53, 54, 55, 56, 57, 58, 60, 61, 63, 65, 67, 68, 69, 74, 75, 76, 80, 81, 82,
+    ];
+    for word in 0..256 {
+        let expected = if saved.contains(&word) {
+            2000 + word as i16
+        } else {
+            -2
+        };
+        assert_eq!(record.data[word], expected, "word {word}");
+    }
+    // The record's own ID is kept.
+    assert_eq!(record.id, 41);
+}
+
+#[test]
+fn a_person_whose_word_31_names_no_record_is_removed_without_a_save() {
+    let (mut fx, id, _) = placed_visitor();
+    let person = fx
+        .world
+        .objects
+        .get_mut(&id)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap();
+    person.data[31] = 3;
+    fx.world.neighbors.slots = vec![Some(widget_record(40, -1)), Some(widget_record(41, -2))];
+    let before = fx.world.neighbors.clone();
+    assert_eq!(fx.run_with(LAMP, 4200, id as i16, &[], 1000), Ok(true));
+    assert_eq!(fx.world.removals, [id]);
+    assert_eq!(fx.world.neighbors, before);
+}
+
+#[test]
+fn go_to_routing_slot_reads_no_animator_before_its_route() {
+    // The visitor removes itself in its own tick and goes on, its
+    // animator's refresh pending. Go To Routing Slot (opcode 45) tests its
+    // stack object's place (0x40743b, 0x432595) and names its slot
+    // (native error 0x25 at 0x45ace4) before its route reads the
+    // animator.
+    let (mut fx, id, file) = placed_visitor();
+    fx.world.globals = vec![0; 64];
+    for object in fx.world.objects.values_mut() {
+        object.registry_word = Some(if object.id == id { 0x0001_ffff } else { 0xffff });
+    }
+    let ready = fx.world.clone();
+    // Each case: the stack object, the slot's source, and what the pass
+    // gives (Ok, or a part of its error).
+    for (n, (stack_object, source, expected)) in [
+        // Itself, off the lot now: false, and the tree goes on.
+        (id as i16, 1u8, None),
+        // The lamp, on the lot, with source 3, which names no slot.
+        (LAMP as i16, 3, Some("0x25")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        fx.world = ready.clone();
+        let tree_id = 4207 + n as u16;
+        fx.add(
+            file,
+            tree_id,
+            tree(vec![
+                ins(REMOVE, 1, 1, [0, 0, 1, 0, 0, 0, 0, 0]),
+                ins(45, RETURN_TRUE, 2, [0, 0, source, 0, 0, 0, 0, 0]),
+                ins(0, RETURN_TRUE, RETURN_FALSE, [0; 8]),
+            ]),
+        );
+        // Then it sleeps (parameter 0), which reads no animator.
+        fx.thread(id, tree_id, &[5, 0, 0, 0]);
+        fx.world.objects.get_mut(&id).unwrap().stack[0].stack_object = stack_object;
+        let tuning = crate::tick::tuning();
+        let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        let mut update = sims_vm::Update::default();
+        let result = interpreter.scheduler_pass(&mut fx.world, &tuning, &mut update);
+        match expected {
+            None => assert_eq!(result, Ok(true), "case {n}"),
+            Some(part) => {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(part), "case {n}: {error}");
+                assert!(!error.contains("left the lot"), "case {n}: {error}");
+            }
+        }
+    }
+}
+
+/// The visitor removes itself in its own tick and goes on, its
+/// animator's refresh pending, to Idle For Input with an action queued on
+/// the lamp that interrupts. The action has no tree, so it is cancelled
+/// (0x45dcc8).
+fn cancel_with_the_refresh_pending(
+    fx: &mut Fixture,
+    id: u16,
+    file: usize,
+) -> Result<bool, sims_vm::TickError> {
+    fx.world.globals = vec![0; 64];
+    for object in fx.world.objects.values_mut() {
+        object.registry_word = Some(if object.id == id { 0x0001_ffff } else { 0xffff });
+    }
+    fx.add(
+        file,
+        4209,
+        tree(vec![
+            ins(REMOVE, 1, 1, [0, 0, 1, 0, 0, 0, 0, 0]),
+            ins(17, RETURN_TRUE, RETURN_FALSE, [0, 0, 1, 0, 0, 0, 0, 0]),
+        ]),
+    );
+    fx.thread(id, 4209, &[3, 0, 0, 0]);
+    let person = fx
+        .world
+        .objects
+        .get_mut(&id)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap();
+    person.data[71] = 0;
+    person.data[33] = 7;
+    let mut action = person.active.clone();
+    (
+        action.uid,
+        action.target,
+        action.action,
+        action.priority,
+        action.flags,
+    ) = (0, LAMP as i16, 0, 50, 0);
+    person.queue = vec![action];
+    let tuning = crate::tick::tuning();
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let mut update = sims_vm::Update::default();
+    interpreter.scheduler_pass(&mut fx.world, &tuning, &mut update)
+}
+
+#[test]
+fn idle_for_input_cancels_a_queued_action_with_the_refresh_pending() {
+    // Nothing of the cancellation reads an animator, and the pass goes
+    // on.
+    let (mut fx, id, file) = placed_visitor();
+    assert_eq!(cancel_with_the_refresh_pending(&mut fx, id, file), Ok(true));
+    assert_eq!(fx.world.removals, [id]);
+    assert!(
+        fx.world.objects[&id]
+            .person
+            .as_ref()
+            .unwrap()
+            .queue
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_cancellation_callback_may_not_remove_the_person_with_the_refresh_pending() {
+    // The lamp's cancellation callback (function 4), run on the lamp with
+    // the visitor as its stack object, removes the visitor: a removal on
+    // another thread while the refresh is pending is refused, as any
+    // other primitive there is.
+    let (mut fx, id, file) = placed_visitor();
+    let library = fx.program.libraries.get_mut(&LAMP_FILE).unwrap();
+    let table = library.callbacks.get_mut(&128).unwrap();
+    table.resize(
+        5,
+        sims_formats::execution::ObjectFunction {
+            condition: 0,
+            action: 0,
+        },
+    );
+    table[4].action = 4200;
+    let error = cancel_with_the_refresh_pending(&mut fx, id, file).unwrap_err();
+    let sims_vm::TickError::Fault(fault) = error else {
+        panic!("{error}");
+    };
+    assert!(
+        matches!(fault.trap, Trap::Unsupported(ref m)
+            if m.contains("opcode 18") && m.contains(&format!("thread of object {LAMP}"))),
+        "{fault}"
+    );
 }

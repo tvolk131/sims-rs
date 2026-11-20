@@ -642,7 +642,7 @@ mod tests {
     #[test]
     fn shaded_pixels_take_the_light_of_their_place_in_the_image() {
         let mut c = Canvas::new(2, 1, [0, 0, 0]);
-        let dark = Light::from_byte(0);
+        let dark = Light::from_byte(0, 1.0);
         c.draw_shaded(
             &image(3, 1, [200, 200, 200, 255], None),
             [-1, 0],

@@ -1092,3 +1092,85 @@ fn get_direction_to_into_a_motive_fails_loudly() {
     ));
     assert_eq!(fx.sim().person.as_ref().unwrap().motives[3], before);
 }
+
+/// Runs Generic Sims Call routine 6 as the Sim, with `stack` the stack
+/// object (which names a record by its place plus one).
+fn leave_family(fx: &mut Fixture, stack: i16) -> Result<bool, sims_vm::Fault> {
+    sim_runs(fx, 1, [6, 0, 0, 0, 0, 0, 0, 0], stack)
+}
+
+/// The Sim's record (place 2) and Anne's (place 1), both of family 5,
+/// which global 9 selects, on a residential lot; family 7 also lists the
+/// Sim's type. Neither family's count is out of date.
+fn leaving() -> Fixture {
+    let mut fx = Fixture::new();
+    fx.world.neighbors.slots = vec![Some(member(30, ANNE, 5)), Some(member(31, SIM_GUID, 5))];
+    fx.world.families = vec![
+        family(7, 0, &[SIM_GUID]),
+        family(5, 12, &[SIM_GUID, ANNE, SIM_GUID]),
+    ];
+    for family in &mut fx.world.families {
+        family.stale = false;
+    }
+    (fx.world.globals[9], fx.world.globals[10]) = (5, 0);
+    let sim = fx.sim_mut().person.as_mut().unwrap();
+    (sim.data[FAMILY], sim.data[32]) = (5, 0);
+    fx
+}
+
+#[test]
+fn generic_call_6_takes_the_stack_objects_neighbor_out_of_its_family() {
+    let mut fx = leaving();
+    assert_eq!(leave_family(&mut fx, 2), Ok(true));
+    // The record and the live person of its type leave the family; the
+    // first member of the type goes, and the family's count is out of
+    // date. Family 7 is not touched.
+    assert_eq!(fx.world.neighbors.get(2).unwrap().data[FAMILY], 0);
+    assert_eq!(fx.world.neighbors.get(1).unwrap().data[FAMILY], 5);
+    assert_eq!(fx.world.families[1].members, [ANNE, SIM_GUID]);
+    assert!(fx.world.families[1].stale);
+    assert_eq!(fx.world.families[0].members, [SIM_GUID]);
+    assert!(!fx.world.families[0].stale);
+    let sim = fx.sim().person.as_ref().unwrap();
+    assert_eq!(sim.data[FAMILY], 0);
+    // The visitor pass: the Sim's type is still a member of family 5.
+    assert_eq!(sim.data[32], 0);
+    // Once its type is no member, the pass makes it a visitor.
+    let mut fx = leaving();
+    fx.world.families[1].members = vec![SIM_GUID, ANNE];
+    assert_eq!(leave_family(&mut fx, 2), Ok(true));
+    assert_eq!(fx.world.families[1].members, [ANNE]);
+    assert_eq!(fx.sim().person.as_ref().unwrap().data[32], 1);
+}
+
+#[test]
+fn generic_call_6_is_false_unless_the_record_is_a_member_of_its_family() {
+    // Family word 0, a family ID no family has, and a family that does
+    // not list the record's type: false, and nothing changes.
+    for change in 0..3 {
+        let mut fx = leaving();
+        match change {
+            0 => fx.world.neighbors.get_mut(2).unwrap().data[FAMILY] = 0,
+            1 => fx.world.neighbors.get_mut(2).unwrap().data[FAMILY] = 6,
+            _ => fx.world.families[1].members = vec![ANNE],
+        }
+        let mut expected = fx.world.clone();
+        assert_eq!(leave_family(&mut fx, 2), Ok(false), "case {change}");
+        expected.objects.get_mut(&SIM).unwrap().last_result = false;
+        assert_eq!(fx.world.neighbors, expected.neighbors, "case {change}");
+        assert_eq!(fx.world.families, expected.families, "case {change}");
+        assert_eq!(
+            fx.sim().person.as_ref().unwrap().data,
+            expected.objects[&SIM].person.as_ref().unwrap().data,
+            "case {change}"
+        );
+    }
+}
+
+#[test]
+fn generic_call_6_needs_a_record_at_the_stack_objects_place() {
+    let mut fx = leaving();
+    for stack in [0, 3, -1] {
+        assert_eq!(code(leave_family(&mut fx, stack)), Some(0x37), "{stack}");
+    }
+}
