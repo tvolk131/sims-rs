@@ -37,7 +37,18 @@ pub struct Neighborhood {
     /// and all of them when the file has no NGBH chunk, are 0, as the
     /// neighborhood's constructor leaves them (0x4244bc).
     pub data: [i16; 16],
+    /// The neighborhood's option bytes at +0x1a0 to +0x1aa, as the NGBH
+    /// chunk's reader (0x4254f6) leaves them: those the chunk's version
+    /// saves, the reader's defaults for the rest. `None` when the file has
+    /// no NGBH chunk, and the reader does not run. Option 10 (+0x1aa) is
+    /// whether the `Patch` families are still to be imported: saved from
+    /// version 69, set otherwise (0x42559e, 0x4255ae).
+    pub options: Option<[bool; 11]>,
 }
+
+/// The option (+0x1aa) that says the neighborhood's `Patch` families are
+/// still to be imported (0x42c1d5, 0x42c0ff).
+pub const PENDING_IMPORT: usize = 10;
 
 impl Neighborhood {
     pub fn open(directory: &Path) -> Result<Self> {
@@ -65,14 +76,14 @@ impl Neighborhood {
                 .map_err(|e| Error::format(&format!("{} NBRS #{}", path.display(), chunk.id), e))?;
             neighbors.extend(parsed.entries);
         }
-        let (inventories, data) = match iff.all(b"NGBH").next() {
+        let (inventories, data, options) = match iff.all(b"NGBH").next() {
             Some(chunk) => {
                 let header = Header::parse(iff.data(chunk)).map_err(|e| {
                     Error::format(&format!("{} NGBH #{}", path.display(), chunk.id), e)
                 })?;
-                (header.inventories, header.data)
+                (header.inventories, header.data, Some(header.options))
             }
-            None => (Vec::new(), [0; 16]),
+            None => (Vec::new(), [0; 16], None),
         };
         Ok(Self {
             directory: directory.to_path_buf(),
@@ -81,6 +92,7 @@ impl Neighborhood {
             neighbors,
             inventories,
             data,
+            options,
         })
     }
 

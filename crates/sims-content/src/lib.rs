@@ -29,7 +29,7 @@ pub use catalog::{Catalog, Object};
 pub use error::Error;
 pub use index::{Index, Member, Resource, far_members};
 pub use install::{Expansions, Install, Layout, Mount};
-pub use neighborhood::{House, Neighborhood};
+pub use neighborhood::{House, Neighborhood, PENDING_IMPORT};
 pub use people::{Bone, People, Profile, Skeleton};
 pub use surfaces::{SurfaceCatalog, SurfaceFile, SurfaceKind, Surfaces};
 pub use wardrobe::Wardrobe;
