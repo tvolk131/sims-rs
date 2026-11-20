@@ -76,9 +76,12 @@ it into `sims_game::pick` and `Lot::sprite_pick` (sims-vm).
     every zoom and level).
   - On drawn objects this lands within about one sixteenth of a tile of
     their positions: the fountain, fridge and counter.
-  - The pick unprojects as level 1 first. It counts whole floor heights
-    above the terrain under the point (the mean of its tile's corners),
-    as 0x4b07b3 does, and unprojects again on the level that gives.
+  - 0x4b07b3 classifies a point by its height above the terrain under
+    it (the mean of its tile's corners): one floor's height or more is
+    level 2, two is level 3, anything lower level 1. Our depth gives a
+    position only for a level taken, so the pick tries levels 1, 2 and 3
+    and takes the first whose position and height classify as that
+    level (with none, level 1's classification).
   - The ground-plane fallback is flat: it leaves out the terrain, which
     the original's may not (**unverified** on a sloped lot).
   - Whether our unprojection agrees with the original's inverse matrix

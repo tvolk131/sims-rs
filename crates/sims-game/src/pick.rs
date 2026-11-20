@@ -82,23 +82,39 @@ fn sprite(
 
 /// Where a pixel of depth `depth` at `point` is: its lot position
 /// (sixteenths of a tile, rounded half away from zero as 0x454fb9 rounds)
-/// and the level it is on. As the original's 0x4b07b3 counts it, the
-/// level is one more for each floor's height the point stands above the
-/// terrain under it (the mean of its tile's four corners); the position
-/// is then the one on that level's floor.
+/// and the level it is on. The original's 0x4b07b3 classifies a point by
+/// its height above the terrain under it (the mean of its tile's four
+/// corners): two floors' height or more is level 3, one or more level 2,
+/// anything lower level 1. Our depth gives a position only for a level
+/// taken, so each level is tried from the first, and the answer is the
+/// first whose position and height classify as that level; with none,
+/// the first level's classification.
 fn place(world: &World, camera: &Camera, point: [i32; 2], depth: i32) -> ([i32; 2], i32) {
     let depths = Depth::new(camera);
-    let (view, height) = depths.unproject(camera, point, depth, 1);
-    let terrain =
-        terrain(world, to_lot(camera, view).map(round)) * f64::from(2i32 << camera.zoom.level());
     let floor = f64::from(camera.zoom.floor_height());
-    let level = 1 + ((height - terrain) / floor).floor() as i32;
-    let view = if level > 1 {
-        depths.unproject(camera, point, depth, level).0
-    } else {
-        view
+    let step = f64::from(2i32 << camera.zoom.level());
+    let on = |level: i32| {
+        let (view, height) = depths.unproject(camera, point, depth, level);
+        let fine = to_lot(camera, view).map(round);
+        let above = floor * f64::from(level - 1) + height - terrain(world, fine) * step;
+        (fine, classify(above, floor))
     };
-    (to_lot(camera, view).map(round), level)
+    (1..=3)
+        .map(|level| (level, on(level)))
+        .find(|&(level, (_, classified))| level == classified)
+        .map_or_else(|| on(1), |(_, place)| place)
+}
+
+/// The level of a point `above` pixels above the terrain, with floors
+/// `floor` pixels high (0x4b07b3).
+fn classify(above: f64, floor: f64) -> i32 {
+    if above >= 2.0 * floor {
+        3
+    } else if above >= floor {
+        2
+    } else {
+        1
+    }
 }
 
 /// A fine view position turned back to the lot's, as the camera turns it.
@@ -159,6 +175,15 @@ mod tests {
         assert_eq!(round(415.49), 415);
         assert_eq!(round(-0.5), -1);
         assert_eq!(round(-0.49), 0);
+    }
+
+    #[test]
+    fn a_point_below_the_first_floor_height_is_on_level_one() {
+        assert_eq!(classify(-9.6, 58.0), 1);
+        assert_eq!(classify(57.9, 58.0), 1);
+        assert_eq!(classify(58.0, 58.0), 2);
+        assert_eq!(classify(116.0, 58.0), 3);
+        assert_eq!(classify(400.0, 58.0), 3);
     }
 
     #[test]
