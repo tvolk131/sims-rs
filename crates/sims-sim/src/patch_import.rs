@@ -33,7 +33,7 @@ use crate::neighbors::{FAMILY, RECORDED_KINDS, Registered};
 use sims_content::family_import::{self, Import, ImportInput, ImportOptions};
 use sims_content::{Catalog, Neighborhood, PENDING_IMPORT};
 use sims_formats::family_file::FamilyFile;
-use sims_formats::neighborhood::{Family, Neighbor};
+use sims_formats::neighborhood::{Family, Inventory, Neighbor};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Unleashed's bit of the installed-expansions mask (0x42c10b).
@@ -61,6 +61,8 @@ pub struct Context<'a> {
     pub house_files: BTreeSet<u32>,
     /// Each lot's zoning ([`Neighborhood::zoning`]).
     pub zoning: BTreeMap<i16, i32>,
+    /// The lots of `LotZoning.iff`'s rows, in order ([`Neighborhood::lot_rows`]).
+    pub lots: Vec<i16>,
     /// The installed-expansions mask (`[0x6e48bc]+0x66`).
     pub expansions: u8,
     /// The game's one-based language code.
@@ -99,6 +101,14 @@ pub fn open(
         ..Opened::default()
     };
     rebuild_family_words(neighborhood)?;
+    // The view's set-up (0x55693b) asks after each lot, in the rows'
+    // order, up to the first above 80 (0x5570e4 to 0x55723a, 0x557125).
+    for &lot in &context.lots {
+        if lot > LAST_VIEW_LOT {
+            break;
+        }
+        ask_after(neighborhood, lot)?;
+    }
     // 0x42c1d5: Unleashed's bit, then the option byte.
     if context.expansions & PETS == 0 {
         return Ok(opened);
@@ -157,6 +167,14 @@ pub fn open(
             })?;
         apply(neighborhood, &import)?;
         rebuild_family_words(neighborhood)?; // 0x429873 → 0x425244
+        // After its save, the import asks after the family's new lot
+        // (0x429a97, 0x429ac9); a houseless family has none.
+        if let Some(lot) = &import.lot {
+            let lot = i16::try_from(lot.house).map_err(|_| {
+                LoadError::Neighborhood(format!("house {} does not fit a lot number", lot.house))
+            })?;
+            ask_after(neighborhood, lot)?;
+        }
         character_files.extend(import.made.values().map(|made| made.file));
         character_guids.extend(import.made.keys().copied());
         next_file = import.next_file;
@@ -167,6 +185,86 @@ pub fn open(
         options[PENDING_IMPORT] = false; // 0x42c1ba
     }
     Ok(opened)
+}
+
+/// The last lot the view's set-up asks after (0x557125).
+const LAST_VIEW_LOT: i16 = 80;
+
+/// Asks after a lot as the neighborhood view does (0x4e1d8e): the family
+/// living there, the first in the family vector whose house (+0x110) or
+/// second house (+0x13c) is the lot (0x425d95), counts its MagiCoins
+/// (0x410282). That gets each member's inventory, making an empty one at
+/// the end of the vector when the member's record has none (0x42a8a1):
+/// members in order, each by the first record with its GUID (0x42571f),
+/// skipping a member with no record. Nothing else the query reads or
+/// shows changes the neighborhood.
+///
+/// - Two families on the lot fail: which is first depends on the
+///   families' order (0x425209), which is not kept.
+/// - An empty slot in the inventory vector fails: the search (0x42a8cb)
+///   would read through its null pointer.
+/// - The lot information's own read (0x4e1d8e) is taken to succeed; its
+///   failure branches are not traced.
+fn ask_after(neighborhood: &mut Neighborhood, lot: i16) -> Result<(), LoadError> {
+    if lot <= 0 {
+        return Ok(());
+    }
+    let lot = i32::from(lot);
+    let mut living = neighborhood
+        .families
+        .iter()
+        .filter(|(_, family)| family.house == lot || second_house(family) == Some(lot));
+    let Some((&id, family)) = living.next() else {
+        return Ok(());
+    };
+    if let Some((other, _)) = living.next() {
+        return Err(LoadError::Neighborhood(format!(
+            "families {id} and {other} both live on lot {lot}; which the view asks after \
+             depends on the families' order (0x425209), which is not kept"
+        )));
+    }
+    let members = family.members.clone();
+    for guid in members {
+        let Some(record) = neighborhood
+            .neighbors
+            .iter()
+            .flatten()
+            .find(|record| record.guid == guid)
+        else {
+            continue;
+        };
+        let record = record.id;
+        let mut found = false;
+        for inventory in &neighborhood.inventories {
+            let inventory = inventory.as_ref().ok_or_else(|| {
+                LoadError::Neighborhood(
+                    "an empty slot in the inventory vector, which the search (0x42a8cb) \
+                     would read through"
+                        .into(),
+                )
+            })?;
+            if inventory.neighbor == record {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            neighborhood.inventories.push(Some(Inventory {
+                neighbor: record,
+                items: Vec::new(),
+            }));
+        }
+    }
+    Ok(())
+}
+
+/// A family's second house (+0x13c), which FAMI saves from version 8.
+fn second_house(family: &Family) -> Option<i32> {
+    if family.version < 8 {
+        return None;
+    }
+    let bytes = family.tail.get(..4)?;
+    Some(i32::from_le_bytes(bytes.try_into().ok()?))
 }
 
 /// House 0's reload (0x424806), on the file's records and families, as

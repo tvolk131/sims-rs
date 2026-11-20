@@ -86,6 +86,7 @@ pub fn open_neighborhood(
             .collect(),
         house_files: neighborhood.houses()?.into_keys().collect(),
         zoning: neighborhood.zoning(u16::from(install.expansions.0))?,
+        lots: neighborhood.lot_rows()?,
         expansions: install.expansions.0,
         language: LANGUAGE,
     };
