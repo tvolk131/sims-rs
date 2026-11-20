@@ -729,11 +729,15 @@ mod tests {
         assert_eq!([c.id_at(0, 0), c.id_at(2, 0)], [None, None]);
         // The IDs taken keep what the canvas named then, not what it
         // names after a later draw.
+        c.set_id(Some(7));
+        c.plot(2, 0, 0, [4, 4, 4]);
         let taken = c.ids();
         c.set_id(Some(9));
         c.plot(1, 0, 0, [4, 4, 4]);
-        assert_eq!([taken.id_at(1, 0), taken.id_at(2, 0)], [None, Some(7)]);
-        assert_eq!([c.id_at(1, 0), taken.id_at(3, 0)], [Some(9), None]);
+        c.plot(2, 0, 0, [4, 4, 4]);
+        let then = [0, 1, 2, 3].map(|x| taken.id_at(x, 0));
+        assert_eq!(then, [None, None, Some(7), None]);
+        assert_eq!([c.id_at(1, 0), c.id_at(2, 0)], [Some(9), Some(9)]);
     }
 
     #[test]
