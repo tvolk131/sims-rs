@@ -47,6 +47,7 @@
 //! tables the first person made reads once (string tables 0x1f6 and
 //! 0x1f8); the motive curves (0x459d23); and object flag 0x80.
 
+use crate::Program;
 use crate::factory::word;
 use crate::fault::{Fault, Trap};
 use crate::interpreter::Interpreter;
@@ -169,8 +170,7 @@ impl Interpreter<'_> {
     /// Whether the lot is residential (0x40745f): its zoning (0x42b9e3,
     /// by the lot number in global 10) is 1. Lot 0 has zoning 1.
     fn residential(&self, world: &World) -> bool {
-        let lot = world.globals.get(LOT).copied().unwrap_or(0);
-        lot == 0 || self.program.zoning.get(&lot) == Some(&1)
+        residential(self.program, world)
     }
 
     /// The visitor pass (0x42a2b4), which the lot runs when the factory
@@ -187,40 +187,7 @@ impl Interpreter<'_> {
     /// fails. The lot is residential when global 10 is 0 or a house zoned
     /// 1 (0x40745f, 0x42b9e3).
     pub(crate) fn visitor_pass(&self, world: &mut World) -> Result<(), Trap> {
-        if !world.people.iter().any(|id| world.objects.contains_key(id)) {
-            return Ok(());
-        }
-        let family = i32::from(world.globals.get(9).copied().unwrap_or(0));
-        if family == 0 {
-            return Err(Trap::Unsupported(
-                "0x42a2b4: the visitor pass with global 9 at 0: which family the game holds \
-                 (game +0x10) is not kept"
-                    .into(),
-            ));
-        }
-        let members = world
-            .families
-            .iter()
-            .find(|f| f.id == family)
-            .map(|f| f.members.clone())
-            .ok_or_else(|| {
-                Trap::Invalid(format!("global 9 names family {family}, which is gone"))
-            })?;
-        let residential = self.residential(world);
-        for id in world.people.clone() {
-            let Some(object) = world.objects.get_mut(&id) else {
-                continue;
-            };
-            let member = members.contains(&object.guid);
-            if let Some(word) = object
-                .person
-                .as_mut()
-                .and_then(|p| p.data.get_mut(person::VISITOR))
-            {
-                *word = sims_sim::load::visitor_again(*word, member, residential);
-            }
-        }
-        Ok(())
+        visitor_pass(self.program, world)
     }
 
     /// Gives person `id` default interests and personality (0x459a9c) if
@@ -359,4 +326,47 @@ impl Interpreter<'_> {
         }
         Ok(())
     }
+}
+
+/// Whether the lot is residential (0x40745f): its zoning (0x42b9e3, by the
+/// lot number in global 10) is 1. Lot 0 has zoning 1.
+fn residential(program: &Program, world: &World) -> bool {
+    let lot = world.globals.get(LOT).copied().unwrap_or(0);
+    lot == 0 || program.zoning.get(&lot) == Some(&1)
+}
+
+/// The visitor pass (0x42a2b4): see [`Interpreter::visitor_pass`].
+pub(crate) fn visitor_pass(program: &Program, world: &mut World) -> Result<(), Trap> {
+    if !world.people.iter().any(|id| world.objects.contains_key(id)) {
+        return Ok(());
+    }
+    let family = i32::from(world.globals.get(9).copied().unwrap_or(0));
+    if family == 0 {
+        return Err(Trap::Unsupported(
+            "0x42a2b4: the visitor pass with global 9 at 0: which family the game holds \
+             (game +0x10) is not kept"
+                .into(),
+        ));
+    }
+    let members = world
+        .families
+        .iter()
+        .find(|f| f.id == family)
+        .map(|f| f.members.clone())
+        .ok_or_else(|| Trap::Invalid(format!("global 9 names family {family}, which is gone")))?;
+    let residential = residential(program, world);
+    for id in world.people.clone() {
+        let Some(object) = world.objects.get_mut(&id) else {
+            continue;
+        };
+        let member = members.contains(&object.guid);
+        if let Some(word) = object
+            .person
+            .as_mut()
+            .and_then(|p| p.data.get_mut(person::VISITOR))
+        {
+            *word = sims_sim::load::visitor_again(*word, member, residential);
+        }
+    }
+    Ok(())
 }

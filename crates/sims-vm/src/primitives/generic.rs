@@ -40,6 +40,8 @@
 //!   63 - y) at 2 and (y, 63 - x) at 3, and stay at 0. The sum is a
 //!   16-bit word. A stack object that is not there throws native error
 //!   0xa. Routine 12 takes the true branch.
+//! - 6 (0x44fc53): take the neighbor the stack object names out of its
+//!   family (0x42601e). See [`Machine::leave_family`].
 
 use crate::fault::Trap;
 use crate::interpreter::{Machine, word};
@@ -98,6 +100,7 @@ impl Machine<'_, '_> {
                 self.restore_magic_history();
                 Ok(true)
             }
+            6 => self.leave_family(),
             routine => Err(Trap::Unsupported(format!(
                 "Generic Sims Call routine {routine}"
             ))),
@@ -106,6 +109,90 @@ impl Machine<'_, '_> {
 }
 
 impl Machine<'_, '_> {
+    /// Routine 6 (0x44fc53): the neighbor the stack object names, by its
+    /// record's place plus one (0x4256f4), leaves its family (0x42601e).
+    /// No such record throws native error 0x37.
+    ///
+    /// Before that the routine sends the interface's top window (+0x2c of
+    /// the object `[[0x6e48bc]+0x48]` returns from its method 0x18,
+    /// 0x4b4491) the Escape key ({3, 0x10, 0x1b, 0} to its method 0) if the
+    /// window manager still holds it (0x5da49f). That is taken to be
+    /// presentation. Here no modal dialog is open while scripts run (see
+    /// `dialog.rs`), so it could close nothing the simulation keeps
+    /// (**unverified**).
+    ///
+    /// Then 0x42601e, which fails (-1, the false branch) when the record's
+    /// family word (person data word 61, +0xee) is 0, when no family has
+    /// that ID (the first in the neighborhood's order, +0x154, whose +0x10c
+    /// matches), or when the record's GUID (+4, 0x5ed65e) is not one of the
+    /// family's members (0x4101d0). Otherwise, in order:
+    ///
+    /// 1. The first person in the person vector (lot +0x84) whose type has
+    ///    that GUID (0x44093d) gets family word 61 (+0x606) set to 0.
+    /// 2. The record's word 61 becomes 0.
+    /// 3. The first member with that GUID is taken out (0x410884).
+    /// 4. Who is a visitor is worked out again (0x42a2b4,
+    ///    [`crate::person_factory::visitor_pass`]).
+    /// 5. The family's flag 8 (+0x138) is cleared. The World does not hold
+    ///    the family's flags; a script that reads them fails loudly
+    ///    (`memory.rs`).
+    /// 6. The family's friend count is out of date (+0x124 = 1).
+    /// 7. Signal 0xe8 goes to the game's eight subscribers (0x40760d). Of
+    ///    their handlers (0x41637f, 0x43c0e4, 0x44302e, 0x46d2c2, 0x47b22a,
+    ///    0x4a82db, 0x4c3ea5, 0x4f65bf) only the interface's has a case for
+    ///    it: it marks every part of the control panel for redrawing
+    ///    (0x4f6820, 0x4ceceb), which is presentation.
+    ///
+    /// Then the true branch (0x451000).
+    fn leave_family(&mut self) -> Result<bool, Trap> {
+        use sims_sim::neighbors::FAMILY;
+        let id = self.frame()?.stack_object;
+        let record = self
+            .world
+            .neighbors
+            .get(id)
+            .ok_or(Trap::native(0x37, "the stack object names no neighbor"))?;
+        let guid = record.guid;
+        let family = i32::from(record.data[FAMILY]);
+        if family == 0 {
+            return Ok(false);
+        }
+        let Some(place) = self.world.families.iter().position(|f| f.id == family) else {
+            return Ok(false);
+        };
+        let Some(member) = self.world.families[place]
+            .members
+            .iter()
+            .position(|&m| m == guid)
+        else {
+            return Ok(false);
+        };
+        let live = self.world.people.iter().copied().find(|person| {
+            self.world
+                .objects
+                .get(person)
+                .is_some_and(|o| o.person.is_some() && o.guid == guid)
+        });
+        if let Some(person) = live
+            && let Some(data) = self
+                .world
+                .objects
+                .get_mut(&person)
+                .and_then(|o| o.person.as_mut())
+            && let Some(word) = data.data.get_mut(FAMILY)
+        {
+            *word = 0;
+        }
+        if let Some(record) = self.world.neighbors.get_mut(id) {
+            record.data[FAMILY] = 0;
+        }
+        let family = &mut self.world.families[place];
+        family.members.remove(member);
+        crate::person_factory::visitor_pass(self.program, self.world)?;
+        self.world.families[place].stale = true;
+        Ok(true)
+    }
+
     /// Routine 2 (0x44fb51 to 0x44fbd8).
     fn set_action_icon(&mut self) -> Result<(), Trap> {
         let stack_object = self.frame()?.stack_object;
