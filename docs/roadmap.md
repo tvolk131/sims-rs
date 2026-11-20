@@ -2205,8 +2205,8 @@ Progress:
   including for people. Not ported: expansion lots 28–29, 40–42,
   46–48, 90–96 and 99 use other terrain presets, chosen by global 10
   (0x4c4648), with other sun angles. **Unverified:** that the panels
-  have subscribed before the load's 0xdd goes out (the two daytime angles differ on some slopes and render identically
-  on the Goth lot; if the native panels miss the load's 0xdd, a save
+  have subscribed before the load's 0xdd goes out (the two daytime angles shade some slopes differently and render
+  identically on the Goth lot; if the native panels miss the load's 0xdd, a save
   loaded after dark can keep the constructor's daytime angle until
   dawn); the pool fixtures'
   override at night; the 0.8 cap against a native screenshot of a room
@@ -2641,10 +2641,10 @@ through their public interfaces only; the simulation never depends on it.
   a book comes off the shelf, the fountain tinkles. `begin_route` and `end_route` have no event in the install's sound files and play nothing.
   In #273's longer Goth sound run, the fountain started a new
   track-1346 thread every 300 updates, reaching the 256-thread limit
-  around update 74,700; #273 capped the test at 43,200 updates. Track 6
-  found that the original refreshes the fountain's existing track, and
-  that a running track with its interrupt register set restarts in
-  place; the port fix is on `audio/replay-running-track`.
+  around update 74,700; #273 capped the test at 43,200 updates. Track 6 found that the original refreshes the fountain's existing
+  track on replay; replaying a running track restarts it in place when
+  its group is enabled, it is free of a pause hold, and its `interrupt`
+  register is set; the port fix is on `audio/replay-running-track`.
 - **Done: the pie menu from the simulation's listing.** When the
   pointer first reaches an object or a person, the game lists the
   selected Sim's menu on it with `Lot::pie_menu`, which changes the lot
