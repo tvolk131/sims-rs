@@ -44,11 +44,15 @@ original's press handler checks first. This port follows it.
   disabled: the original's take the press.
 - `Command::Refused` is presentation only. The game plays `UI_error` for
   the interface on `error`.
+- A selected person who is not one of the household's counts as nobody,
+  as the panel's other parts already treat one.
 - `Controls::follow` takes whether a Sim is selected: with none, no panel
   is open; with one and no panel, the needs open. The game and the viewer
   call it before each layout. It closes the help balloon as a panel change
   does, and the game plays `UI_whoosh` then.
-- `sims_vm::Lot::residential` gives the hosts the idle loop's check.
+- `sims_vm::Lot::residential` gives the hosts the idle loop's check. The
+  game sets `Snapshot::residential` from it before each frame. The viewer
+  does not read the lot's zoning, so there the lot counts as residential.
 - This corrects `20261115-house-panel-size-yard-and-facts.md`, which says
   the house panel shows with or without a selected Sim. Its draw
   (0x52e49e) needs none, but with nobody selected no panel is open, so it

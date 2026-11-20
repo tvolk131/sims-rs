@@ -2771,14 +2771,24 @@ mod tests {
             let commands = gadget_commands(&layout([800, 600], &s, &controls));
             assert_eq!(commands.len(), 7);
             for (id, command) in commands {
-                assert_eq!(command, Command::Refused { error: id == id::HOUSE });
+                assert_eq!(
+                    command,
+                    Command::Refused {
+                        error: id == id::HOUSE
+                    }
+                );
             }
         }
         // A selected person who is not one of the household's counts as
         // nobody.
         s.selected = Some(999);
         for (id, command) in gadget_commands(&layout([800, 600], &s, &controls)) {
-            assert_eq!(command, Command::Refused { error: id == id::HOUSE });
+            assert_eq!(
+                command,
+                Command::Refused {
+                    error: id == id::HOUSE
+                }
+            );
         }
         // A refusal changes nothing that shows.
         let mut refused = Controls {

@@ -122,7 +122,9 @@ pub enum Command {
     /// button with nobody selected or on a lot that is not residential
     /// (0x51be1a). Only the House button's refusal sounds: with `error`,
     /// the host plays `UI_error` for the interface.
-    Refused { error: bool },
+    Refused {
+        error: bool,
+    },
     /// List these people in the relationship panel (presentation only).
     ShowRelations(Relations),
     /// Show this page of the relationship panel, from 0 (presentation

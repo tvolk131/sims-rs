@@ -1553,6 +1553,48 @@ fn the_job_panel_shows_what_the_next_level_needs() {
     assert_eq!(needs(&world), [0, 0, 100, 0, 300, 0]);
 }
 
+/// The Goth house is residential, so with Mortimer selected the House
+/// button opens the house panel, silently (0x51bdf2 to 0x51be0c).
+#[test]
+fn the_house_button_opens_the_house_panel_on_the_goths_lot() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&Options {
+        play: true,
+        ..options(install)
+    })
+    .expect("the Goth house opens");
+    assert_eq!(game.run(20), 20);
+    assert!(game.lot().residential());
+    game.resize([800, 600]);
+    game.render();
+    assert!(game.lot().world().selected().is_some());
+    let house = |game: &Game| {
+        game.panel()
+            .iter()
+            .any(|item| matches!(item.kind, Kind::House { .. }))
+    };
+    assert!(!house(&game), "the needs show first");
+    let button = game
+        .panel()
+        .iter()
+        .find(|item| {
+            item.command
+                == Some(sims_ui::command::Command::OpenPanel(
+                    sims_ui::command::Panel::House,
+                ))
+        })
+        .expect("the House button opens its panel")
+        .rect;
+    game.take_sounds();
+    game.press([button.x + button.width / 2, button.y + button.height / 2]);
+    assert!(game.take_sounds().is_empty());
+    game.render();
+    assert!(house(&game));
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
+}
+
 /// The live panel's Personality button shows the selected Sim's
 /// personality as the world holds it (person data words 7, 6, 3, 5 and
 /// 2: Neat, Outgoing, Active, Playful, Nice), and follows a press on
