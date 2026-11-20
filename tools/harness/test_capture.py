@@ -274,8 +274,41 @@ class CaptureTest(unittest.TestCase):
             ['--updates', '2', '--resume', '--late-watch', '2-2,state=0x70088'], prepare=prepare)
         self.assertEqual(remote.watch_stops, [('set', 0x123456), ('clear', capture.RETURN)])
 
+    def test_a_write_seen_before_a_taken_over_run_knows_where_it_is_has_no_update(self):
+        def prepare(output):
+            (output / 'events.jsonl').write_text(json.dumps(dict(kind='baseline', cr3=GAME_CR3)) + '\n')
+            (output / 'updates.jsonl').write_text(
+                json.dumps(dict(update=1, tick=99, lot_rng=0, global_rng=0, crt=0, scheduler_cursor=0)) + '\n')
+        remote, output, _ = self.run_capture(
+            [dict(pc=0x123456), dict(pc=0x123457, reply='T05watch:70088;'),
+             dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
+            ['--updates', '2', '--resume', '--late-watch', '2-2,state=0x70088'], prepare=prepare)
+        rows = self.rows(output / 'watch.jsonl')
+        self.assertEqual([(r['update'], r['after_update'], r['in_update']) for r in rows], [(None, 1, None)])
+
+    def test_a_moving_late_watch_is_not_moved_at_the_stop_where_it_ends(self):
+        remote, output, _ = self.run_capture([
+            dict(pc=0), dict(pc=capture.ENTRY), dict(pc=capture.RETURN),
+            dict(pc=capture.ENTRY), dict(pc=capture.RETURN, animator=0x80000),
+            dict(pc=capture.RETURN, animator=0x80000)],
+            ['--updates', '3', '--late-watch', '2-2,direction=person:259@0xadc+0x88'])
+        self.assertEqual(remote.watch_calls, [(0x70088, 4)])
+        self.assertEqual(self.events(output, 'watch_moved'), [])
+        ended = self.events(output, 'watch_ended')
+        self.assertEqual([(r['update'], r['set']) for r in ended], [(2, True)])
+
+    def test_a_late_watch_never_set_ends_saying_so(self):
+        remote, output, _ = self.run_capture([
+            dict(pc=0), dict(pc=capture.ENTRY, animator=0), dict(pc=capture.RETURN, animator=0),
+            dict(pc=capture.ENTRY, animator=0), dict(pc=capture.RETURN, animator=0),
+            dict(pc=capture.RETURN, animator=0)],
+            ['--updates', '3', '--late-watch', '2-2,direction=person:259@0xadc+0x88'])
+        self.assertEqual(remote.watch_calls, [])
+        ended = self.events(output, 'watch_ended')
+        self.assertEqual([(r['update'], r['set']) for r in ended], [(2, False)])
+
     def test_a_late_watch_that_does_not_parse_is_an_argument_error(self):
-        for text in ['3-2,x=0x70088', '3-,x=0x70088', '3x=0x70088', '0,x=0x70088', '2,x=0x70088:3', '2,=0x70088', '\u00b2,x=0x70088']:
+        for text in ['3-2,x=0x70088', '3-,x=0x70088', '3x=0x70088', '0,x=0x70088', '2,x=0x70088:3', '2,=0x70088', '\u00b2,x=0x70088', '2,x=0x70088:\u0664']:
             with self.assertRaises(argparse.ArgumentTypeError, msg=text):
                 capture.Watch.late(text)
 

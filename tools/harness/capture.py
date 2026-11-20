@@ -53,9 +53,14 @@ drawn between two updates changes the row of the update after it. Such a
 write is logged, as any watch's is, with the update before it and
 in_update false. A moving watch misses what the paragraph above says it
 misses; a stop at a watchpoint does not work its address out again, as
-for --watch. A run taken over (--resume) sets the watches whose updates
-have come at its first stop; one that goes through an object waits there
-for the next entry or return. The lot update's entry is a breakpoint only
+for --watch, but a watch is not moved at the stop where it ends. A run
+taken over (--resume) sets the watches whose updates have come at its first
+stop; one that goes through an object waits there for the next entry or
+return, and none is set while the guest is stopped in another process. A
+write seen before the taken-over run knows whether the guest is inside a
+lot update has update null (after_update is the last update recorded). A
+late watch's watch_ended event says whether it was ever set (set false: no
+write in its updates was seen). The lot update's entry is a breakpoint only
 while a watch is set, so a watch on a busy address (the random state)
 costs nothing while the load and the other updates run.
 
@@ -287,6 +292,10 @@ class Watch:
 
     def __init__(self, text):
         self.first, self.last = 1, None  # the lot updates it is set for (a late watch's)
+        self.set = False  # whether it was ever set (a late watch's)
+        if not text.isascii():
+            # int() takes other scripts' digits, which no one means here.
+            raise ValueError(f'not ASCII: {text!r}')
         self.name, _, rest = text.partition('=')
         expr, _, size = rest.rpartition(':')
         if not size.isdigit():
@@ -716,6 +725,7 @@ def main():
                 continue
             w.address, w.value = found
             hardware_add(w.address, w.size)
+            w.set = True
             live_watches.append(w)
             pending.remove(w)
             event(kind='watch_armed', name=w.name, expr=w.text, address=w.address, value=w.value, update=updates)
@@ -752,7 +762,11 @@ def main():
         # One row per watch on the written bytes (one with name null if none is).
         hits = [w for w in live_watches if w.address == hit] or [w for w in live_watches if w.address <= hit < w.address + w.size]
         for w in hits or [None]:
-            row = dict(update=updates + (1 if in_update else 0), in_update=in_update, address=hit,
+            # Taken over off a breakpoint, whether the guest is in a lot update is not known until its
+            # next entry or return (in_update None): the write is in update `updates` or `updates` + 1,
+            # so update is null and after_update says which was recorded last.
+            row = dict(update=None if in_update is None else updates + (1 if in_update else 0),
+                       after_update=updates, in_update=in_update, address=hit,
                        name=w.name if w else None, registers=regs, eip=regs['eip'])
             try:
                 row['tick'] = m.word(sim + 0x98) if sim else None
@@ -828,8 +842,7 @@ def main():
             if w.last is None or updates + 1 <= w.last:
                 pending.append(w)
                 arm(ENTRY)
-        if not foreign and live_watches:
-            check_watches(m)
+        # Those whose updates are over end first, so that one is not moved at the stop where it ends.
         ended = [w for w in live_watches + pending if w.last is not None and updates + 1 > w.last]
         for w in ended:
             if w in live_watches:
@@ -837,9 +850,13 @@ def main():
                 hardware_remove(w.address, w.size)
             else:
                 pending.remove(w)
-            event(kind='watch_ended', name=w.name, expr=w.text, update=updates)
+            # set false: it never could be set (its address never worked out, or every stop in its
+            # updates was in another process), so writes in its updates were not seen.
+            event(kind='watch_ended', name=w.name, expr=w.text, update=updates, set=w.set)
         if ended and not (live_watches or pending or args.watch or runner or updates + 1 in dump_set):
             disarm(ENTRY)
+        if not foreign and live_watches:
+            check_watches(m)
         if not foreign and pending:
             arm_watches(m)
 
