@@ -909,9 +909,11 @@ def main():
             for record, (shown_in, jobs) in waiting.items():
                 if shown_in >= args.answer_from:
                     answerer.shown(shown_in, record, jobs)
-    def tend_watches(m, foreign):
+    def tend_watches(m, foreign, at_break=True):
         """At a stop: start the late watches whose updates have come, work out the moving ones again,
-        end those whose updates are over, and set those waiting."""
+        end those whose updates are over, and set those waiting. At a breakpoint (at_break) whose lot
+        cannot be read, the watches are not worked out or set, as its handler is skipped; off a
+        breakpoint (a run taken over) they are, as far as they can be without the lot."""
         # A late watch waits for the game's process (the baseline), then for its first update. One
         # whose updates are over already (a run taken over later) is never set.
         for w in [w for w in late if baseline and updates + 1 >= w.first]:
@@ -948,7 +950,7 @@ def main():
         here = lot == args.lot
         if not here:
             retire_elsewhere(lot)
-        if not readable or not (live_watches or pending):
+        if (at_break and not readable) or not (live_watches or pending):
             return
         if live_watches:
             check_watches(m, here, lot)
@@ -1001,7 +1003,7 @@ def main():
             if took_over and pc not in breaks:
                 # The earlier run was killed between stepping past a breakpoint and resuming.
                 event(kind='took_over_off_break', pc=pc, registers=regs)
-                tend_watches(m, sims_cr3 is not None and cr3 != sims_cr3)
+                tend_watches(m, sims_cr3 is not None and cr3 != sims_cr3, at_break=False)
                 continue
             if took_over and pc == RETURN:
                 recorded = out / 'updates.jsonl'

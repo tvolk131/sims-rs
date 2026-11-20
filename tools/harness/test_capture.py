@@ -534,6 +534,22 @@ class CaptureTest(unittest.TestCase):
         armed = self.events(output, 'watch_armed')
         self.assertEqual([r['update'] for r in armed], [1, 1])
 
+    def test_a_run_taken_over_off_a_breakpoint_whose_lot_cannot_be_read_sets_an_ordinary_watch(self):
+        # Taken over after update 1 off a breakpoint, in the game's process,
+        # with the lot unreadable: the ordinary watch's address and value can
+        # be read, so it is set there and the write before the entry is seen.
+        def prepare(output):
+            (output / 'events.jsonl').write_text(json.dumps(dict(kind='baseline', cr3=GAME_CR3)) + '\n')
+            (output / 'updates.jsonl').write_text(
+                json.dumps(dict(update=1, tick=99, lot_rng=0, global_rng=0, crt=0, scheduler_cursor=0)) + '\n')
+        remote, output, _ = self.run_capture(
+            [dict(pc=0x123456, lot_unreadable=True), dict(pc=0x123457, reply='T05watch:70088;'),
+             dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
+            ['--updates', '2', '--resume', '--watch', 'state=0x70088'], prepare=prepare)
+        self.assertEqual(remote.watch_stops[0], ('set', 0x123456))
+        rows = self.rows(output / 'watch.jsonl')
+        self.assertEqual([r['name'] for r in rows], ['state'])
+
     def test_a_run_taken_over_at_update_1s_return_records_it(self):
         def prepare(output):
             (output / 'events.jsonl').write_text(json.dumps(dict(kind='baseline', cr3=GAME_CR3)) + '\n')
