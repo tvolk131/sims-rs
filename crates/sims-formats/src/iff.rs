@@ -6,6 +6,45 @@ use std::ops::Range;
 /// A chunk flag: the chunk is deleted, free space to be reused.
 pub const DELETED: u16 = 4;
 
+const FILE_HEADER_SIZE: usize = 64;
+const CHUNK_HEADER_SIZE: usize = 76;
+const SIGNATURE_25: &[u8; 60] = b"IFF FILE 2.5:TYPE FOLLOWED BY SIZE\0 JAMIE DOORNBOS & MAXIS 1";
+
+/// A chunk's header fields and payload, independent of an IFF's layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkData {
+    pub tag: [u8; 4],
+    pub id: u16,
+    pub flags: u16,
+    pub label: String,
+    pub data: Vec<u8>,
+}
+
+/// Writes a fresh Maxis IFF 2.5 in the supplied chunk order, without a
+/// resource map. Labels use the same Windows-1252 encoding as [`Iff::parse`].
+pub fn write(chunks: &[ChunkData]) -> Result<Vec<u8>> {
+    let mut bytes = SIGNATURE_25.to_vec();
+    bytes.resize(FILE_HEADER_SIZE, 0);
+    for chunk in chunks {
+        let offset = bytes.len();
+        let size = u32::try_from(chunk.data.len())
+            .ok()
+            .and_then(|size| size.checked_add(CHUNK_HEADER_SIZE as u32))
+            .ok_or_else(|| crate::Error::new(offset, "IFF chunk size exceeds 32 bits"))?;
+        let label = crate::far::encode_name(&chunk.label)
+            .filter(|label| label.len() <= 64 && !label.contains(&0))
+            .ok_or_else(|| crate::Error::new(offset, "invalid IFF chunk label"))?;
+        bytes.extend(chunk.tag);
+        bytes.extend(size.to_be_bytes());
+        bytes.extend(chunk.id.to_be_bytes());
+        bytes.extend(chunk.flags.to_be_bytes());
+        bytes.extend(label);
+        bytes.resize(offset + CHUNK_HEADER_SIZE, 0);
+        bytes.extend(&chunk.data);
+    }
+    Ok(bytes)
+}
+
 #[derive(Debug, Clone)]
 pub struct Chunk {
     pub tag: [u8; 4],
@@ -175,7 +214,7 @@ impl Resources {
 impl Iff {
     pub fn parse(bytes: Vec<u8>) -> Result<Self> {
         let mut r = Reader::new(&bytes);
-        let header = r.take(64)?;
+        let header = r.take(FILE_HEADER_SIZE)?;
         if !header.starts_with(b"IFF FILE 2.5:") && !header.starts_with(b"IFF FILE 2.0:") {
             return r.fail("invalid Maxis IFF signature");
         }
@@ -184,7 +223,7 @@ impl Iff {
             let offset = r.pos;
             let tag = r.take(4)?.try_into().unwrap();
             let length = r.be32()? as usize;
-            if length < 76 {
+            if length < CHUNK_HEADER_SIZE {
                 return r.fail("IFF chunk shorter than its 76-byte header");
             }
             let id = r.be16()?;
@@ -193,7 +232,7 @@ impl Iff {
             let end = label_bytes.iter().position(|b| *b == 0).unwrap_or(64);
             let label = western(&label_bytes[..end]);
             let start = r.pos;
-            r.skip(length - 76)?;
+            r.skip(length - CHUNK_HEADER_SIZE)?;
             chunks.push(Chunk {
                 tag,
                 id,
@@ -305,5 +344,54 @@ impl ResourceMap {
             unused_bytes,
             types,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fresh_iff_round_trips_headers_payloads_and_resource_order() {
+        let chunks = [
+            ChunkData {
+                tag: *b"BMP_",
+                id: 0x1234,
+                flags: 0x0210,
+                label: "Café".into(),
+                data: vec![0, 1, 2],
+            },
+            ChunkData {
+                tag: *b"BMP_",
+                id: 0x1234,
+                flags: 0,
+                label: "X".repeat(64),
+                data: Vec::new(),
+            },
+            ChunkData {
+                tag: *b"XXXX",
+                id: 17,
+                flags: DELETED,
+                label: String::new(),
+                data: vec![255],
+            },
+        ];
+        let bytes = write(&chunks).unwrap();
+        assert_eq!(&bytes[..60], SIGNATURE_25);
+        assert_eq!(&bytes[60..64], &[0; 4]);
+        let iff = Iff::parse(bytes).unwrap();
+        assert_eq!(iff.chunks.len(), chunks.len());
+        for (actual, expected) in iff.chunks.iter().zip(&chunks) {
+            assert_eq!(actual.tag, expected.tag);
+            assert_eq!(actual.id, expected.id);
+            assert_eq!(actual.flags, expected.flags);
+            assert_eq!(actual.label, expected.label);
+            assert_eq!(iff.data(actual), expected.data);
+        }
+        let bitmaps = iff.resource_order(b"BMP_").unwrap();
+        assert_eq!(bitmaps[0].flags, 0x0210);
+        assert_eq!(bitmaps[1].flags, 0);
+        assert_eq!(iff.get(b"BMP_", 0x1234).unwrap().flags, 0);
+        assert!(iff.resource_order(b"XXXX").unwrap().is_empty());
     }
 }
