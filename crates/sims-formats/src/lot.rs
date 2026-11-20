@@ -224,6 +224,20 @@ impl GuidTable {
         Ok(Self { version, pairs })
     }
 
+    /// Writes the original's little-endian stream (0x4157b6, 0x415835).
+    /// The four stream-header bytes are zero, and the version is always 0.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = vec![0; 8];
+        bytes.extend(b"batG");
+        let count = u32::try_from(self.pairs.len()).expect("Gtab pair count exceeds u32");
+        bytes.extend(count.to_le_bytes());
+        for &(old, new) in &self.pairs {
+            bytes.extend(old.to_le_bytes());
+            bytes.extend(new.to_le_bytes());
+        }
+        bytes
+    }
+
     /// The GUID `guid` reads as (0x415751). The first pair not yet used
     /// whose old GUID matches replaces it, and the search starts over from
     /// the first pair, until no unused pair matches. So translations
@@ -257,6 +271,19 @@ mod guid_table_tests {
             b.extend(new.to_le_bytes());
         }
         b
+    }
+
+    #[test]
+    fn writes_version_zero_and_round_trips_pairs_in_order() {
+        let t = GuidTable {
+            version: 7,
+            pairs: vec![(0x1122_3344, 0x5566_7788), (0x1122_3344, 0x99aa_bbcc)],
+        };
+        let bytes = t.to_bytes();
+        assert_eq!(bytes, table(&t.pairs));
+        let parsed = GuidTable::parse(&bytes).unwrap();
+        assert_eq!(parsed.version, 0);
+        assert_eq!(parsed.pairs, t.pairs);
     }
 
     #[test]
