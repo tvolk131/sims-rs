@@ -781,11 +781,11 @@ fn a_bench_in_use_draws_after_the_sim_on_it() {
         lot.step().unwrap();
     }
     let world = lot.world();
-    // Both porch benches hold someone, Mortimer holds the plumb bob, and
-    // person 18 holds object 67, as the live original's slots list them.
+    // Both porch benches hold someone, and Mortimer holds the plumb bob.
+    // Object 67, next to person 18 on their tile, is not held.
     assert_eq!(
         sims_render::holds_person(world),
-        [67, 173, 174, 383].into_iter().collect()
+        [173, 174, 383].into_iter().collect()
     );
     assert_eq!(people.update(world), Vec::<String>::new());
     let camera = LotCamera {

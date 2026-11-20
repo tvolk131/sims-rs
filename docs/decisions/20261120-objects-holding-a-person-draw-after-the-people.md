@@ -14,7 +14,7 @@ A frame with people in it now draws in three passes:
 
 - Holders are found by the link words, as 0x4325b5 finds them (the simulation ports it as `placement::capture`). Data word 14 is the slot, counted from 1: −1 for none, 0 for an object that follows another on its tile. Word 26 is the object it is in, or follows.
 - An object with slot word 0 is held by whatever the first object of its run is in.
-- The tree is walked down through each holder's slot list, as 0x434657 recurses (0x4347bc).
+- The tree is walked down through each holder's slot list, as 0x434657 recurses (0x4347bc). The list's first entry is skipped: it links to the next object on the tile, not to a held one. 0x434657 starts at the second entry (offset 0x24 at 0x434681), and so does the list builder's scan at 0x4aad77.
 - Data word 2 (the container word the drawing uses for slot offsets) is not consulted.
 - A person held by nothing is the root of their own tree, so what they hold is in the set too.
 - Holders that hold each other form one tree, named by the lowest ID in their loop.
@@ -37,11 +37,12 @@ After the lot's picture, the frame draws the people on list +0x1d4 (0x4a9458), t
 
 This also explains the depth dumps of the original's lot picture taken for the compositing work (#125): they held no people and no in-use bench.
 
-**Checked against.** A screenshot of the original at 7:12 AM (tick 1260): near zoom, rotation 2, walls down, camera origin (591, −2018). In it, Mortimer reads on the porch bench, and our frame matches the screenshot to the pixel elsewhere.
+**Checked against.** A screenshot of the original at 7:12 AM (tick 1260): near zoom, rotation 2, walls down, camera origin (591, −2018). In it, Mortimer reads on the porch bench. Our frame aligns with it at offset (0, 0). The colour comparison below is approximate, with a tolerance per channel.
 
 - The backrest's soft top edge blends over his coat: (32, 16, 8) and (65, 32, 8) at (385, 311) and (405, 305).
-- Before this change, ours blended that edge over the floor: (196, 159, 110) and (136, 90, 45). All 25 edge pixels along his back now match.
-- The live original's slot table at that moment lists exactly what `holds_person` finds: bench 174 holding Mortimer (21), bench 173 holding person 16, the plumb bob (383) in Mortimer's slot, and object 67 in person 18's slot.
+- Before this change, ours blended that edge over the floor: (196, 159, 110) and (136, 90, 45). Now it shows (35, 20, 12) and (68, 34, 11), within 12 of the original in each channel after 16-bit quantizing.
+- Along his back, 25 edge pixels were off by more than 24 in some channel before; none are now. About five new ones are off (below).
+- The live original's slot lists at that moment agree with `holds_person`: bench 174 holds Mortimer (21), bench 173 holds person 16, and Mortimer holds the plumb bob (383). Person 18's first entry names object 67, but that entry is the tile link, so 67 is not held.
 - The test `a_bench_in_use_draws_after_the_sim_on_it` (sims-people, needs `SIMS_INSTALL`) checks both edge pixels and the held set.
 - `the_frame_draws_a_bench_in_use_after_the_sim_on_it` (sims-game) checks the same pixels in the window's own frame.
 
@@ -53,6 +54,6 @@ This also explains the depth dumps of the original's lot picture taken for the c
 - *Upper floors.* A moving object one level above the camera's is drawn (0x4aa2a1 to 0x4aa2e2) only if it is a person with the word at +0x5dc set; an ordinary moving object there is left out. Ours draws held objects only on the levels the camera shows, which agrees for objects. The person case belongs to the people pass.
 - *Cutaway.* The lot pass's cutaway test has a bypass on view byte +0x51 (0x4aea93) that the moving pass lacks. So a wall-hiding object can show in one pass and hide in the other. Ours applies the same cutaway to both, and +0x51 is not read.
 
-**Left over at that camera.** About five pixels at the left end of the backrest's edge now blend over Mortimer's coat where the original blends over the floor. So our mesh reaches slightly further behind the backrest there than the original's does. That mesh is hidden everywhere else. Person 16, standing by the other bench, stands in a different pose from the original's; that is sim timing, not drawing.
+**Left over at that camera.** About five pixels at the left end of the backrest's edge now blend over Mortimer's coat where the original blends over the floor. So our mesh reaches slightly further behind the backrest there than the original's does. That mesh is hidden everywhere else. Person 16, standing by the other bench, stands in a different pose from the screenshot's, with either draw order. A capture of the original at tick 1260 agrees with ours on that animator's position and on its foreground and carry phases. So what causes the gap stays open until a frame of the original is captured at the same tick.
 
 Reopen this if a frame shows an object drawn over a person who is neither on it nor in its tree. The time-out path above is the likely cause.
