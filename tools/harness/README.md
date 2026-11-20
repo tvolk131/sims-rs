@@ -312,10 +312,16 @@ update N, after update N-1 returned. Its `action` holds the caller, the
 target, the routine, the priority, the menu number, the arguments and the
 flags. Each `queued` or `queued_unread` row has a `push` ID, starting at 1
 and increasing for each push. The same ID appears on its `queue_result`
-row, even when several pushes occur in one update. Replay only `queued`
-rows whose matching `queue_result` has `accepted` set to true
-(`manifest.json`'s `queued` list carries each push's `accepted` and
-`uid`). The other
+row, even when several pushes occur in one update. The result's `uid` is
+the record's `+0x3c` after the call, read whether or not the call
+accepted the push (a refused call may still have used a uid from the
+counter). A replay must make every push, refused ones included, so the
+counter and the queues come out as in the original; only pushes whose
+`queue_result` has `accepted` true should end up held. `manifest.json`'s
+`queued` list carries each push's `accepted` and `uid` when its return was
+captured; a push with no `accepted` (the capture ended before the call
+returned, or a capture made before results were logged) has an unknown
+outcome. The other
 rows log the steps, each guest command and when it ended, the hover
 readings and the pie menus.
 

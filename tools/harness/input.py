@@ -612,11 +612,10 @@ class Runner:
             return
         push['accepted'] = bool(regs['eax'] & 0xff)
         push['uid'] = None
-        if push['accepted']:
-            try:
-                push['uid'] = m.word(push['action_pointer'] + ACTION_UID) or None
-            except Exception:  # the return may be readable even when the uid is not
-                pass
+        try:  # read even when refused: the game may give the uid before it finds the queue full
+            push['uid'] = m.word(push['action_pointer'] + ACTION_UID) or None
+        except Exception:  # the return may be readable even when the uid is not
+            pass
         self.write(kind='queue_result', push=push['push'], person=push['person'],
                    accepted=push['accepted'], uid=push['uid'], pushed_update=push['update'])
 

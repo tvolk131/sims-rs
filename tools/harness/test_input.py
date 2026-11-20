@@ -867,6 +867,13 @@ class ReviewFindingsTest(RunnerBase):
         self.assertFalse(self.rows('taken'))
         self.assertEqual(self.rows('queued_unread')[0]['step'], 0)
 
+    def test_a_refused_push_still_logs_the_uid_it_used(self):
+        r = self.runner('expect-queued 21 173 within 3')
+        self.queue_result(r, self.push(r, 8213), 6, eax=0)
+        self.tick(r)
+        self.assertIn('did not queue', r.failed)
+        self.assertEqual([(q['accepted'], q['uid']) for q in self.rows('queue_result')], [(False, 6)])
+
     def test_a_push_whose_return_is_never_seen_says_so(self):
         r = self.runner('expect-queued 21 173 within 3')
         self.push(r, 8213)
