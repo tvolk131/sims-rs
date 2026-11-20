@@ -2,9 +2,9 @@ mod common;
 
 use sims_content::family_import::{
     ImportInput, ImportOptions, TEMPLATE_CAT, TEMPLATE_DOG, TEMPLATE_PERSON, clone_character,
-    import,
+    import, refresh_outfits,
 };
-use sims_content::{Catalog, Index, Install, Neighborhood, Object};
+use sims_content::{Catalog, ImportWardrobe, Index, Install, Neighborhood, Object};
 use sims_formats::family_file::FamilyFile;
 use sims_formats::iff::{Chunk, Iff, write};
 use sims_formats::lot::{GuidTable, ObjectTypes};
@@ -64,6 +64,12 @@ fn chunk(file: &mut Vec<u8>, tag: &[u8; 4], id: u16, data: &[u8]) {
 }
 
 fn synthetic_file() -> FamilyFile {
+    let mut gtab = saved_header(b"batG", 0);
+    words(&mut gtab, &[1, OLD_DOG, DOG]);
+    synthetic_file_with_guid_table(&gtab)
+}
+
+fn synthetic_file_with_guid_table(gtab: &[u8]) -> FamilyFile {
     let mut iff = vec![0; 64];
     iff[..13].copy_from_slice(b"IFF FILE 2.5:");
     let mut family = saved_header(b"IMAF", 7);
@@ -121,9 +127,7 @@ fn synthetic_file() -> FamilyFile {
         words(&mut types, &[73]);
     }
     chunk(&mut iff, b"objt", 0, &types);
-    let mut gtab = saved_header(b"batG", 0);
-    words(&mut gtab, &[1, OLD_DOG, DOG]);
-    chunk(&mut iff, b"Gtab", 1, &gtab);
+    chunk(&mut iff, b"Gtab", 1, gtab);
     chunk(&mut iff, b"ObjM", 1, b"lot payload");
     FamilyFile::parse(&iff).unwrap()
 }
@@ -243,8 +247,13 @@ fn clones_members_in_export_order_and_translates_their_links() {
     assert_eq!(imported.neighborhood_data[2..4], [0, 42]);
     let (displaced_id, displaced) = imported.displaced_family.unwrap();
     assert_eq!(
-        (displaced_id, displaced.house, displaced.architecture_value),
-        (17, 0, 0)
+        (
+            displaced_id,
+            displaced.house,
+            displaced.budget,
+            displaced.architecture_value
+        ),
+        (17, 0, 500, 0)
     );
 
     let lot = imported.lot.unwrap();
@@ -272,6 +281,55 @@ fn clones_members_in_export_order_and_translates_their_links() {
             .guid,
         PERSON
     );
+}
+
+#[test]
+fn imports_a_big_endian_guid_table_with_existing_pairs_first() {
+    let intermediate_guid = 0x1234_5678;
+    let mut gtab = vec![1, 0, 0, 0];
+    gtab.extend(7u32.to_be_bytes());
+    gtab.extend(b"batG");
+    for word in [2, OLD_DOG, intermediate_guid, intermediate_guid, DOG] {
+        gtab.extend(word.to_be_bytes());
+    }
+    let file = synthetic_file_with_guid_table(&gtab);
+    let catalog = synthetic_catalog();
+    let input = ImportInput {
+        catalog: &catalog,
+        neighbors: &[
+            Some(template_record(1, TEMPLATE_PERSON)),
+            Some(template_record(2, TEMPLATE_DOG)),
+        ],
+        families: &BTreeMap::new(),
+        next_file: 0,
+        character_files: &BTreeSet::new(),
+        character_guids: &BTreeSet::new(),
+        house_files: &BTreeSet::from([42]),
+        zoning: &BTreeMap::from([(42, 1)]),
+        neighborhood_data: [0; 16],
+    };
+    let mut guids = MADE_DOG..;
+    let lot = import(&input, &file, PETS, &mut || guids.next().unwrap())
+        .unwrap()
+        .lot
+        .unwrap();
+    let mut expected = saved_header(b"batG", 0);
+    words(
+        &mut expected,
+        &[
+            4,
+            OLD_DOG,
+            intermediate_guid,
+            intermediate_guid,
+            DOG,
+            DOG,
+            MADE_DOG,
+            PERSON,
+            MADE_PERSON,
+        ],
+    );
+    assert_eq!(lot.chunks[b"Gtab"][0].data, expected);
+    assert_eq!(lot.object_types.entries[1].guid, MADE_DOG);
 }
 
 #[test]
@@ -379,7 +437,7 @@ fn string_rows(data: &[u8]) -> Vec<(u8, Vec<u8>, Vec<u8>)> {
         .collect()
 }
 
-fn compare_clone(clone: &Iff, oracle: &Iff, source_body: &[u8], number: i32) {
+fn compare_clone(clone: &Iff, oracle: &Iff, number: i32) {
     assert!(
         clone
             .all(b"BMP_")
@@ -404,24 +462,16 @@ fn compare_clone(clone: &Iff, oracle: &Iff, source_body: &[u8], number: i32) {
         match (&key.0, key.1) {
             (b"STR#", 200) => {
                 let rows = string_rows(bytes);
-                assert_eq!(
-                    rows,
-                    string_rows(source_body),
-                    "{resource_name} import rows"
-                );
-                assert_eq!(bytes.len(), source_body.len(), "{resource_name} size");
-                let end = bytes.len() - rows.len();
-                assert_eq!(&bytes[..end], &source_body[..end], "{resource_name}");
-                assert!(bytes[end..].iter().all(|&byte| byte == 0));
                 let saved = string_rows(original);
-                // 0x587b4b adds row 35. 0x409315 and 0x40a588 edit the
-                // wardrobe-derived entries when the imported file is read back.
-                assert_eq!((rows.len(), saved.len()), (34, 35), "{resource_name}");
+                assert_eq!((rows.len(), saved.len()), (35, 35), "{resource_name}");
                 for (index, (row, saved)) in rows.iter().zip(&saved).enumerate() {
-                    if ![16, 27, 28, 29].contains(&index) {
-                        assert_eq!(row, saved, "{resource_name} row {}", index + 1);
-                    }
+                    assert_eq!(row, saved, "{resource_name} row {}", index + 1);
                 }
+                // 0x46fc9f leaves one unused byte per declared row.
+                assert_eq!(bytes.len(), original.len(), "{resource_name} size");
+                let end = bytes.len() - rows.len();
+                assert_eq!(&bytes[..end], &original[..end], "{resource_name}");
+                assert!(bytes[end..].iter().all(|&byte| byte == 0));
             }
             (b"CTSS", 2000) => {
                 // 0x47090e allocates one unused byte per declared row.
@@ -457,6 +507,7 @@ fn imports_and_writes_the_complete_collections_userdata2_patches() {
         .filter_map(|(&guid, &(number, _))| (number >= 40).then_some((number, guid)))
         .collect();
     let install = Install::detect(&root).unwrap();
+    let wardrobe = ImportWardrobe::load(&install).unwrap();
     let mut index = Index::build(&install).unwrap();
     index.add_characters(&directory.join("Characters")).unwrap();
     let catalog = Catalog::build(&index).unwrap();
@@ -568,17 +619,18 @@ fn imports_and_writes_the_complete_collections_userdata2_patches() {
         let imported = import(&input, &file, PETS, &mut || guids.next().unwrap())
             .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
         assert!(guids.next().is_none());
-        for (&member, &guid) in member_ids.iter().zip(&imported.family.members) {
+        for &guid in &imported.family.members {
             let (number, oracle) = &originals[&guid];
             let mut character = imported.made[&guid].clone();
             character.file = *number;
-            let resources =
+            let mut resources =
                 clone_character(&templates[&character.template], &character, guid, &file)
                     .unwrap_or_else(|error| panic!("User{number:05}: {error}"));
+            refresh_outfits(&mut resources, &wardrobe)
+                .unwrap_or_else(|error| panic!("User{number:05}: {error}"));
             let bytes = write(&resources).unwrap();
             let clone = Iff::parse(bytes.clone()).unwrap();
-            let source_body = file.iff.data(file.iff.get(b"uChr", member).unwrap());
-            compare_clone(&clone, oracle, source_body, *number);
+            compare_clone(&clone, oracle, *number);
             output.file(&format!("Characters/User{number:05}.iff"), &bytes);
             assert!(written.insert(guid, *number).is_none());
         }

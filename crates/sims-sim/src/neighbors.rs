@@ -305,8 +305,9 @@ impl World {
     /// not ported (it fails loudly), so nothing reads them.
     ///
     /// The original reads the records only when the neighborhood file has
-    /// an NGBH chunk (0x424a90; without one it makes every record). Here
-    /// they are read either way. Every shipped neighborhood has one.
+    /// NGBH #1 (0x424a90; without it, it makes every record).
+    /// [`Neighborhood::open`] keeps no records then, so every record is
+    /// made here too. Every shipped neighborhood has one.
     ///
     /// Steps 2, 3 and 5 are ported from the old prototype
     /// (legacy/crates/sims-vm/src/neighborhood.rs, `prepare_family_reload`

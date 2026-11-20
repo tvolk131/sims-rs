@@ -1,13 +1,15 @@
 //! The data changes made by the neighborhood's family importer (0x428f05).
 
-use crate::{Catalog, Error, Result};
+use crate::{Catalog, Error, ImportWardrobe, Result};
 use sims_formats::family_file::{FamilyFile, FamilyMember};
 use sims_formats::far::decode_name;
 use sims_formats::iff::{ChunkData, Iff};
-use sims_formats::lot::ObjectTypes;
+use sims_formats::lot::{GuidTable, ObjectTypes};
 use sims_formats::neighborhood::{Family, Neighbor, Relationship};
 use sims_formats::strings::{Format, StringTable, decode};
 use std::collections::{BTreeMap, BTreeSet};
+
+mod outfits;
 
 pub const TEMPLATE_PERSON: u32 = 0x7fd96b54;
 pub const TEMPLATE_DOG: u32 = 0x4a70df92;
@@ -279,11 +281,9 @@ pub fn import(
 /// (0x4722b8 and 0x4293ae–0x4295ee). Use the source FAM passed to [`import`].
 /// The destination file number can be set before cloning.
 ///
-/// This is the file before the appearance refresh at 0x4295f7. The refresh
-/// pads the body table (0x587b4b), then can rewrite outfits from the installed
-/// wardrobe (0x409315, 0x40a588). 0x4e8c5d renders BMP_ 2002–2007 and
-/// persists them via 0x4e9000. The caller can serialize these resources with
-/// [`sims_formats::iff::write`].
+/// Call [`refresh_outfits`] to perform 0x4295f7 before serializing with
+/// [`sims_formats::iff::write`]. The portrait renderer at 0x4e8c5d and
+/// its BMP_ 2002–2007 writes at 0x4e9000 are separate.
 pub fn clone_character(
     template: &Iff,
     character: &Character,
@@ -411,6 +411,35 @@ pub fn clone_character(
         }
     }
     Ok(chunks)
+}
+
+/// Refresh the STR# 200 of a successful [`clone_character`] using the
+/// startup wardrobe, then write it back to the clone (0x4295f7, 0x457f60).
+/// If selection reaches an unsupported branch, the clone remains intact.
+pub fn refresh_outfits(chunks: &mut [ChunkData], wardrobe: &ImportWardrobe) -> Result<()> {
+    let body = chunks
+        .iter_mut()
+        .find(|chunk| chunk.tag == *b"STR#" && chunk.id == 200 && chunk.flags >> 8 == 0)
+        .ok_or_else(|| unsupported("0x457fd7", "imported STR# 200 is absent"))?;
+    let table = StringTable::parse(&body.data)
+        .map_err(|error| Error::format("family import: 0x587b4b imported STR# 200", error))?;
+    if table.format != Format::Localized
+        || localized_entries(&table, Some(&body.data))
+            .any(|(language, entry)| language != 1 || !entry.raw_comment.is_empty())
+    {
+        return Err(unsupported(
+            "0x587b4b",
+            "expected the clone's language-1 body table",
+        ));
+    }
+    let mut rows: Vec<_> = table
+        .entries
+        .into_iter()
+        .map(|entry| entry.raw_text)
+        .collect();
+    outfits::refresh(&mut rows, wardrobe)?;
+    body.data = localized_strings(rows.iter().map(|text| (1, text.as_slice(), &[][..])))?;
+    Ok(())
 }
 
 fn catalog_strings(
@@ -570,8 +599,13 @@ fn displace_family(input: &ImportInput<'_>, house: i32) -> Result<Option<(u16, F
     match occupants.as_slice() {
         [] => Ok(None),
         [(id, family, secondary)] if *secondary != house => {
+            // 0x42920f to 0x42922e: the house is cleared first, so the
+            // worth 0x4272c5 gives (from 0x410271) is the budget plus the
+            // architecture value, and that becomes the budget before the
+            // architecture value is zeroed.
             let mut family = (*family).clone();
             family.house = 0;
+            family.budget = family.budget.wrapping_add(family.architecture_value);
             family.architecture_value = 0;
             family.flags &= !8;
             Ok(Some((*id, family)))
@@ -910,48 +944,18 @@ fn import_lot(iff: &Iff, house: u32, mut pairs: Vec<(u32, u32)>) -> Result<Impor
         .ok_or_else(|| unsupported("0x43dd76", format!("lot {house} has no objt #0")))?;
     let mut object_types = ObjectTypes::parse(iff.data(source_types))
         .map_err(|error| Error::format("family import: 0x43a516 objt #0", error))?;
-    if let Some(table) = iff.get(b"Gtab", 1) {
-        let bytes = iff.data(table);
-        // The version word is not checked: the import writes 0
-        // (0x4157b6 passes it to 0x415835), as in the first
-        // neighborhood's Old Town houses.
-        if bytes.get(8..12) != Some(b"batG") {
-            return Err(unsupported("0x41578e", "unrecognized Gtab #1 header"));
-        }
-        let count = bytes
-            .get(12..16)
-            .map(|n| u32::from_le_bytes(n.try_into().unwrap()));
-        let entries = bytes
-            .get(16..)
-            .filter(|data| Some(data.len() / 8) == count.map(|n| n as usize) && data.len() % 8 == 0)
-            .ok_or_else(|| unsupported("0x4158a4", "incomplete Gtab #1 pairs"))?;
-        let mut existing: Vec<_> = entries
-            .as_chunks::<8>()
-            .0
-            .iter()
-            .map(|pair| {
-                (
-                    u32::from_le_bytes(pair[..4].try_into().unwrap()),
-                    u32::from_le_bytes(pair[4..].try_into().unwrap()),
-                )
-            })
-            .collect();
-        existing.append(&mut pairs);
-        pairs = existing;
-    }
+    // The import reads at 0x429652 and appends at 0x429754.
+    let table = if let Some(chunk) = iff.get(b"Gtab", 1) {
+        let mut table = GuidTable::parse(iff.data(chunk))
+            .map_err(|error| Error::format("family import: 0x41578e/0x4158a4 Gtab #1", error))?;
+        table.pairs.append(&mut pairs);
+        table
+    } else {
+        GuidTable { version: 0, pairs }
+    };
 
     for entry in &mut object_types.entries {
-        // 0x415751 restarts its search after each hop and marks a pair
-        // used for the current lookup, so even cycles terminate.
-        let mut used = BTreeSet::new();
-        while let Some((index, &(_, new))) = pairs
-            .iter()
-            .enumerate()
-            .find(|(index, (old, _))| *old == entry.guid && !used.contains(index))
-        {
-            used.insert(index);
-            entry.guid = new;
-        }
+        entry.guid = table.translate(entry.guid);
     }
     let tags: BTreeSet<_> = iff.chunks.iter().map(|chunk| chunk.tag).collect();
     let mut chunks = BTreeMap::<_, Vec<_>>::new();
@@ -968,18 +972,11 @@ fn import_lot(iff: &Iff, house: u32, mut pairs: Vec<(u32, u32)>) -> Result<Impor
             });
         }
     }
-    // Version 0 (0x4157b6), as the shipped Old Town houses' tables have.
-    let mut table = b"\0\0\0\0\0\0\0\0batG".to_vec();
-    table.extend((pairs.len() as u32).to_le_bytes());
-    for (old, new) in pairs {
-        table.extend(old.to_le_bytes());
-        table.extend(new.to_le_bytes());
-    }
     chunks.entry(*b"Gtab").or_default().push(LotChunk {
         id: 1,
         flags: 0,
         label: String::new(),
-        data: table,
+        data: table.to_bytes(),
     });
     Ok(ImportedLot {
         house,
