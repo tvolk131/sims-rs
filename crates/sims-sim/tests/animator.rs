@@ -221,12 +221,36 @@ fn a_reset_unplaces_the_animator_and_drops_its_posture() {
 }
 
 #[test]
-fn a_reset_with_a_clip_playing_is_refused() {
+fn a_reset_removes_the_foreground_and_clears_its_events() {
+    // A script clip sets playing (+0xa0); a walk can occupy the same
+    // foreground slot with that flag clear.
+    for playing in [false, true] {
+        let mut a = Animator {
+            foreground: Some(Layer::start("c", THOUSAND, 30, true, 1, false, 0)),
+            selection: 7,
+            playing,
+            events: vec![3, 5],
+            seen: 2,
+            ..LOADED
+        };
+        a.reset().unwrap();
+        assert!(a.foreground.is_none());
+        assert!(a.skin_dirty);
+        assert_eq!(a.selection, -1);
+        assert!(a.events.is_empty() && !a.playing);
+        assert_eq!(a.seen, 2);
+    }
+}
+
+#[test]
+fn a_reset_of_an_empty_foreground_invalidates_the_selection() {
     let mut a = Animator {
-        foreground: Some(Layer::start("c", THOUSAND, 30, true, 0, false, 0)),
+        selection: 7,
         ..LOADED
     };
-    assert!(a.reset().unwrap_err().contains("0x592878"));
+    a.reset().unwrap();
+    assert_eq!(a.selection, -1);
+    assert!(!a.skin_dirty);
 }
 
 #[test]

@@ -852,7 +852,7 @@ impl Interpreter<'_> {
 
     /// States 1 and 2, sitting and the posture after it (0x58f0eb,
     /// 0x58f12e): a foreground clip that still plays is cleared (virtual
-    /// function 0xfc, 0x586b63; see [`clear_foreground`]), the base
+    /// function 0xfc, 0x586b63; see [`Animator::clear_foreground`]), the base
     /// layer's posture forgotten (+0x198 = -1) and the base layer brought
     /// up to date (virtual function 0x58, [`Interpreter::update_base`]),
     /// except in state 1 while person word 78 (+0x628) is set. Either way
@@ -862,7 +862,7 @@ impl Interpreter<'_> {
     fn seated(&self, world: &mut World, id: u16, a: &mut Animator) -> Result<Next, Trap> {
         let held = a.state == 1 && person_word(world, id, SEATED_HOLD)? != 0;
         if a.foreground.is_some() && !held {
-            clear_foreground(a);
+            a.clear_foreground();
             a.posture = -1;
             let flags = self.base_flags(world, id)?;
             self.update_base(world, id, a, flags)?;
@@ -1049,7 +1049,7 @@ impl Interpreter<'_> {
     ///
     /// A layer the foreground slot already holds, of another clip, leaves
     /// the skin first (virtual function 0x104, 0x592878, called at
-    /// 0x59275c), as in [`clear_foreground`].
+    /// 0x59275c).
     ///
     /// Fails for what is not ported: a clip that is not found (the
     /// original then reads through a null pointer).
@@ -1077,7 +1077,7 @@ impl Interpreter<'_> {
             .clip(&name)
             .map_err(|e| unsupported("0x59dc32", &format!("finds no clip {name:?}: {e}")))?;
         // 0x59275c: a layer already in the slot is cleared first (virtual
-        // function 0x104, 0x592878; see [`clear_foreground`]).
+        // function 0x104, 0x592878).
         if a.foreground.take().is_some() {
             a.skin_dirty = true;
         }
@@ -1542,7 +1542,7 @@ impl Interpreter<'_> {
         a.destination[2] = facing.to_f32();
         a.state = 3;
         a.motion.progress = ONE;
-        clear_foreground(a);
+        a.clear_foreground();
         Ok(Next::Again)
     }
 
@@ -1683,7 +1683,7 @@ impl Interpreter<'_> {
             a.position[1] = y;
             return Ok(Next::Done);
         }
-        clear_foreground(a);
+        a.clear_foreground();
         a.position[0] = a.destination[0];
         a.position[1] = a.destination[1];
         a.destination[2] = a.position[2];
@@ -2275,10 +2275,9 @@ fn turn(world: &mut World, id: u16, a: &mut Animator) -> Result<Next, Trap> {
 /// - The next foreground clip's priority is raised again (+0x1a0 = 1).
 /// - The foreground clip is cleared (virtual function 0xfc, 0x586b63):
 ///   the layer leaves the skin, which marks the skin's layers changed
-///   (0x592878, 0x5a0a7b, 0x5991a0), and the clip's selection becomes -1.
-///   0x592878 would instead keep the layer to blend out when byte
-///   0x6f6bd0 is set; no code writes that byte, so it is taken to be 0.
-///   The layer's fields +0x78 and +0x7c, set to -1 first, go with it.
+///   (0x592878, 0x5a0a7b, 0x5991a0), and the clip's selection becomes -1
+///   ([`Animator::clear_foreground`]). The layer's fields +0x78 and +0x7c,
+///   set to -1 first (0x58e06f, 0x58e078), go with it.
 /// - The animator stands (state 3) where the turn was to end: the
 ///   position and the destination become the destination noted when the
 ///   turn started (+0x1dc to +0x1e4; the direction through virtual
@@ -2289,9 +2288,7 @@ fn turn(world: &mut World, id: u16, a: &mut Animator) -> Result<Next, Trap> {
 /// in [`Interpreter::start_route`] they are not kept.
 fn end_turn(world: &mut World, id: u16, a: &mut Animator) -> Result<(), Trap> {
     a.promote = true;
-    a.foreground = None;
-    a.skin_dirty = true;
-    a.selection = -1;
+    a.clear_foreground();
     a.state = 3;
     let to = a.motion.turn_destination;
     a.position[2] = to[2];
@@ -2462,22 +2459,6 @@ pub(crate) fn clear_base(world: &mut World, id: u16, a: &mut Animator) {
         a.skin_dirty = true;
     }
     world.base_layers.remove(&id);
-}
-
-/// The foreground clip is cleared (virtual function 0xfc, 0x586b63): a
-/// layer in the slot leaves the skin, which marks the skin's layers
-/// changed (virtual function 0x104, 0x592878, then 0x5a0a7b), and the
-/// clip's selection becomes -1.
-///
-/// 0x592878 would instead keep the layer to blend out when byte 0x6f6bd0
-/// is set. No code writes that byte, and it is 0 in the memory images of
-/// the running game taken at updates 14, 15, 47 and 580, so it is taken
-/// to be 0 (see [`end_turn`]).
-fn clear_foreground(a: &mut Animator) {
-    if a.foreground.take().is_some() {
-        a.skin_dirty = true;
-    }
-    a.selection = -1;
 }
 
 /// The walk's footfalls ([`Interpreter::footfalls`]).

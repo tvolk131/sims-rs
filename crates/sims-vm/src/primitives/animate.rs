@@ -137,10 +137,7 @@ impl Machine<'_, '_> {
             // the animator takes the state of the person's posture
             // (0x592904), and the pickup flag and person word 19 are
             // cleared. Whether a clip plays (+0xa0) stays as it is.
-            if a.foreground.take().is_some() {
-                a.skin_dirty = true;
-            }
-            a.selection = -1;
+            a.clear_foreground();
             self.posture_state(a)?;
             a.pickup = 0;
             self.clear_pickup_word()?;
@@ -152,18 +149,7 @@ impl Machine<'_, '_> {
             read_appearance_if_stale(self.world, self.program, self.me, &mut a.profile_stale)?;
             let (name, duration, frames, bound, tracks) = self.clip(operands, id)?;
             a.events.clear();
-            // 0x586b63: the foreground slot is cleared (0x592878) and the
-            // selection set to -1. A layer there is removed from the skin
-            // at once (0x5a0a7b), which marks the skin's layers changed.
-            // The original fades it out through the blend slot instead
-            // when its byte 0x6f6bd0 is set; that byte holds 0 in the
-            // memory image of a running game, and the capture shows the
-            // blend slot empty after person 18 starts its second clip in
-            // tick 24. The fade is not ported.
-            if a.foreground.take().is_some() {
-                a.skin_dirty = true;
-            }
-            a.selection = -1;
+            a.clear_foreground();
             a.slow = flags & 0x80 != 0;
             let now = a.clock_at(self.world.ticks as i32);
             let mut layer = Layer::start(&name, duration, frames, bound, tracks, reverse, now);
