@@ -84,7 +84,8 @@ class FakeRemote:
         return self.current.get('pending_reply', 'T05')
 
     def registers(self):
-        regs = dict(eip=self.current['pc'], ecx=0x20000, ebx=0x20000, ebp=0x90000, esp=0x90010)
+        regs = dict(eip=self.current['pc'], ecx=self.current.get('ecx', 0x20000), ebx=0x20000, ebp=0x90000,
+                    esp=0x90010)
         raw = bytearray(88)
         struct.pack_into('<I', raw, 64, 0xa0000)
         struct.pack_into('<I', raw, 84, self.current.get('cr3', GAME_CR3))
@@ -97,7 +98,8 @@ class FakeRemote:
             return self.pending_trap()
         reply = self.current.get('step', 'T05')
         self.current = dict(self.current, pc=self.current.get('step_pc', pc + 1),
-                            cr3=self.current.get('step_cr3', self.current.get('cr3', GAME_CR3)))
+                            cr3=self.current.get('step_cr3', self.current.get('cr3', GAME_CR3)),
+                            ecx=self.current.get('step_ecx', self.current.get('ecx', 0x20000)))
         return reply
 
     def detach(self):
@@ -785,10 +787,18 @@ class CaptureTest(unittest.TestCase):
 
     def test_a_step_whose_retry_is_swallowed_fails(self):
         with patch.object(FakeRemote, 'step', autospec=True, side_effect=FakeRemote.step) as step:
-            with self.assertRaisesRegex(RuntimeError, 'left EIP and CR3 unchanged after retry'):
+            with self.assertRaisesRegex(RuntimeError, 'left every register unchanged after retry'):
                 self.run_capture([dict(pc=0), dict(pc=capture.ENTRY, pending_traps=2)],
                                  ['--updates', '1', '--watch', 'state=0x70088'])
         self.assertEqual(step.call_count, 2)
+
+    def test_a_step_that_keeps_only_eip_is_not_swallowed(self):
+        # One round of a rep string instruction leaves EIP and CR3 where they were.
+        remote, output, _ = self.run_capture(
+            [dict(pc=0), dict(pc=capture.ENTRY, step_pc=capture.ENTRY, step_ecx=0x1f), dict(pc=capture.RETURN)],
+            ['--updates', '1', '--watch', 'state=0x70088'])
+        self.assertEqual(remote.step_calls[:1], [(capture.ENTRY, False)])
+        self.assertEqual(self.events(output, 'step_swallowed'), [])
 
     def test_before_the_games_process_is_known_a_watch_stop_is_unknown(self):
         for unreadable in (False, True):

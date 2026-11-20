@@ -26,36 +26,60 @@ and pages.json.gz (the memory pages of the people's animators);
 updates.jsonl (one line per lot update: tick, full pass or not, the three
 random streams); events.jsonl (dialogs and other stops); status.json.
 
---watch NAME=EXPR[:SIZE] (repeatable) sets a Z2 write watchpoint on SIZE bytes
-(default 4) once the first lot update establishes the game's CR3 and EXPR
-can be resolved. Each watch.jsonl row is an observation at a watch stop,
-with registers, frames, stack and lot update. Its address is the watchpoint
-base reported by the stop. The match is named for a unique watchpoint on that
-base, one_of for a shared base, changed for a value different from the last
-sample, or at for a range containing an unrecognized base. Watch stops
-before the baseline log unknown_watch. Those in another CR3 log foreign_watch.
+--watch NAME=EXPR[:SIZE] (repeatable) also sets a write watchpoint (GDB's Z2;
+nothing is written) on SIZE bytes (default 4) at the address EXPR names, as
+soon as EXPR can be worked out from the baseline on (the first lot update,
+where the game's CR3 is known), and logs a row to watch.jsonl at each stop
+at its watchpoint, with the stopped instruction's registers, its
+frame-pointer chain and the top of its stack, the lot update it falls in
+and whether it falls inside the lot update's body. A row is what the stop
+and memory show, not a write: its address is the watchpoint base the stop
+gives (see the README for its match). A watch stop before the baseline is
+logged as an unknown_watch event, and one in another process (another CR3)
+as a foreign_watch event, neither in watch.jsonl.
 EXPR is a start, a hexadecimal address, object:<id> (the object with that
 ID) or person:<id> (the same, once it is a person), followed by steps: +HEX
 adds, @HEX reads the word at the address plus HEX. For example
 person:259@0xadc+0x88 is the direction of person 259's animator. With --watch
-the lot update's entry stays armed to place stops inside or outside an
-update. A watch through an object or pointer is resolved again at stops in
-the game. A change moves the watchpoint (watch_moved). An unresolved address
-sends it back to wait (watch_lost).
+the lot update's entry stays armed, so that each write can be placed inside
+or outside the update. A watch that goes through an object or a pointer is
+worked out again at every stop in the game; when the address moved (an
+animator was replaced), the watchpoint is moved (a watch_moved event), and
+when it cannot be worked out it waits again (watch_lost). Writes between the
+change and that stop are not seen.
 
---late-watch FROM[-TO],NAME=EXPR[:SIZE] starts at the end of update FROM - 1
-(at the baseline for FROM 1) and ends at the end of TO, if given. Stops
-between updates are logged with the preceding update and in_update false.
-The entry breakpoint stays armed while the late watch is set or waiting in
-its window. The watch is set or moved only on the captured lot. A moving
-late watch is taken off when the lot changes (watch_lost with elsewhere true)
-and waits until it can be resolved again. The watch_ended event records
-whether it was ever set on this lot, including in a run taken over.
---resume tries to set watches in their window at the first stop in the
-game's process. An object watch needs the simulator pointer from a lot entry
-or return. Until the run knows whether it is inside a lot update, rows have
-update null and after_update gives the last recorded update. The lot field
-gives the lot at the watch stop.
+--late-watch FROM[-TO],NAME=EXPR[:SIZE] is a watch set at the end of lot
+update FROM - 1 (at the entry of update 1 for FROM 1, once the game's
+process is known) and, if TO is given, cleared at the end of update TO. So
+it covers the stops between the rows of updates FROM - 1 and TO in
+updates.jsonl, which are those of the writes that change rows FROM to TO: a
+frame drawn between two updates changes the row of the update after it. A
+stop there is logged, as any watch's is, with the update before it and
+in_update false. A moving watch misses what the paragraph above says it
+misses; a stop at a watchpoint does not work its address out again, as
+for --watch, but a watch is not moved at the stop where it ends. A run
+taken over (--resume) sets the watches whose updates have come at its first
+stop; one that goes through an object waits for the next entry or return
+if that stop does not give the simulator's pointer, and none is set while
+the guest is stopped in another process. A
+row before the taken-over run knows whether the guest is inside a lot
+update has update null (after_update is the last update recorded). A
+late watch's watch_ended event says whether it was ever set, by this run or
+one it took over (set false: no stop in its updates was seen). The lot
+update's entry is a breakpoint for a late watch only while it is set or
+waits to be set in its updates (one whose address cannot be worked out yet
+is tried again there); the baseline, --watch, --scenario and a due --dump
+arm it too. A late watch is set (or moved) only at a stop on the lot
+captured; at a stop on another lot, one that goes through an object is
+taken off (watch_lost with elsewhere true) until it can be set there
+again, and that includes a stop at a watchpoint on another lot: the row
+is logged with no moving late watch's name, and such a watch is not set
+through the simulator seen before that stop until this lot's next entry or
+return. Each watch.jsonl row says the lot it was
+seen on (lot). A run taken over does not count a late watch an earlier revision
+set (those recorded no lot): it ends with set false.
+So a late watch on a busy address (the random state) costs nothing while
+the load and the other updates run.
 
 The executable digests that guest/launch.sh verified (share/game-identity.txt)
 are recorded in status.json and as a game_identity event.
@@ -1207,6 +1231,9 @@ def main():
             armed = pc in breaks
             if armed:
                 remote.clear_break(pc)
+            # Every register before the step: a step the pending trap took leaves them all as they
+            # were (EIP alone stays put under a step of one round of a rep string instruction).
+            step_from = remote.registers()
             for attempt in range(2):
                 reply = remote.step()
                 watch_stop = 'watch:' in reply
@@ -1219,11 +1246,11 @@ def main():
                 if watch_stop:
                     save_status(stepped_to=(regs['eip'], step_cr3, stop_thread(reply)))
                     break
-                if (regs['eip'], step_cr3) != (pc, cr3):
+                if (regs, raw) != step_from:
                     break
                 # A pending debug trap can stop the step before the instruction executes.
                 if attempt:
-                    raise RuntimeError(f'step at {pc:#x} left EIP and CR3 unchanged after retry: {reply}')
+                    raise RuntimeError(f'step at {pc:#x} left every register unchanged after retry: {reply}')
                 event(kind='step_swallowed', pc=pc, cr3=cr3)
             if armed:
                 remote.set_break(pc)
