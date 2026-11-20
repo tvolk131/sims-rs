@@ -487,6 +487,10 @@ struct Thread {
     target: Target,
     /// End the thread when its fade ends (the original's flag at +0x1cf).
     kill_after_fade: bool,
+    /// Where the thread is in the original's list of running tracks:
+    /// threads run in this order, from the next block. A fresh start and
+    /// a let-go put it last (0x57dc9a, 0x57d017).
+    order: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -677,6 +681,8 @@ pub struct Player<S> {
     /// The frame at which the threads last ran.
     ran_at: Option<u64>,
     next_id: u32,
+    /// The next [`Thread::order`].
+    next_order: i64,
     random: u64,
     /// What went wrong while running, in order: unknown events, missing
     /// samples, threads ended for a bad instruction. At most [`FAULTS`].
@@ -732,6 +738,7 @@ impl<S: Samples> Player<S> {
             frame: 0,
             ran_at: None,
             next_id: 1,
+            next_order: 0,
             random: splitmix(seed),
             faults: Vec::new(),
         }
@@ -1942,6 +1949,14 @@ impl<S: Samples> Player<S> {
                     fresh: false,
                 };
             }
+            // The track object's own descriptor (0x57db7a to 0x57db91):
+            // the module the running thread came from.
+            let module = self
+                .threads
+                .iter()
+                .chain(&self.pending)
+                .find(|t| t.id == newest)
+                .map_or(module, |t| t.module);
             if !self.restart(newest, module, track) {
                 return Started::default();
             }
@@ -1983,8 +1998,10 @@ impl<S: Samples> Player<S> {
     /// [`BANKS`]) take their starting values again, the routine starts
     /// from the top with no loop mark (0x57db8b, 0x57db91) and the
     /// track's own hit list (0x57db85 to 0x57dba7), and its sound is cut
-    /// (0x57f625). Registers 1 to 16, 48 and 49 and the return stack
-    /// (+0x1a8) are left as they were, and the thread keeps its ID, so a
+    /// (0x57f625). Registers 1 to 16 and the return stack (+0x1a8) are
+    /// left as they were. (Registers 48 and 49 are in no bank of the
+    /// original, 0x57d727 to 0x57d775 and 0x57c7a8 to 0x57c82e; here they
+    /// are kept too.) The thread keeps its ID, so a
     /// `target` naming it still reaches it. Its wait deadline is now and
     /// `isplaying` is 1. False (reported) when the track has no entry
     /// point; the thread is then left alone.
@@ -2074,16 +2091,31 @@ impl<S: Samples> Player<S> {
     /// wait deadline moves to now (0x57dc8e), so a running script's `wait`
     /// ends at the next update. (Its hold ends too; [`Player::start`]
     /// already ended it.)
+    ///
+    /// *(code)* A running track let go also moves to the end of the list
+    /// of running tracks (0x57dc9a: 0x57d017 takes it out and appends
+    /// it), so it runs after the others from the next block. (The block
+    /// running goes through its own copy of the list.)
     fn let_go(&mut self, threads: &[u32]) {
         let now = self.frame;
-        for thread in self
-            .threads
-            .iter_mut()
-            .chain(&mut self.pending)
-            .filter(|t| threads.contains(&t.id))
-        {
-            thread.wake = now;
+        for &id in threads {
+            let order = self.last_in_order();
+            if let Some(thread) = self
+                .threads
+                .iter_mut()
+                .chain(&mut self.pending)
+                .find(|t| t.id == id)
+            {
+                thread.wake = now;
+                thread.order = order;
+            }
         }
+    }
+
+    /// An order after every thread's (see [`Thread::order`]).
+    fn last_in_order(&mut self) -> i64 {
+        self.next_order += 1;
+        self.next_order
     }
 
     /// Lets a held track's running threads go on, as starting it does
@@ -2109,8 +2141,8 @@ impl<S: Samples> Player<S> {
     ///
     /// **Unverified** gap: the original's track object outlives its
     /// script, so a start after the track ended keeps its registers 1 to
-    /// 16, 48 and 49 from the run before ([`Player::restart`]); a new
-    /// thread here starts them at 0 (but for the arguments).
+    /// 16 from the run before ([`Player::restart`]); a new thread here
+    /// starts them at 0 (but for the arguments).
     fn thread(&mut self, args: [u32; 3], module: usize, track: u32) -> Option<Thread> {
         let (pc, registers, group) = self.template(module, track)?;
         let id = self.id();
@@ -2129,6 +2161,7 @@ impl<S: Samples> Player<S> {
             group,
             target: Target::Own,
             kill_after_fade: false,
+            order: self.last_in_order(),
         };
         set_arguments(&mut thread, args);
         // *(code)* A fresh start then writes `isplaying` 1 (0x57dbc5),
@@ -2324,73 +2357,68 @@ impl<S: Samples> Player<S> {
         self.globals[usize::from(MAIN_DUCKPRI - GLOBALS)] = largest;
     }
 
-    /// Runs every thread once, in the order they were in when the block
-    /// began (the original goes through a copy of its list of running
-    /// tracks, 0x57cf8f to 0x57cfda), so threads that end or are ended
-    /// on the way do not make it skip any.
+    /// Runs every track once, in the order of the list of running tracks
+    /// when the block began ([`Thread::order`]). The original goes through
+    /// a copy of that list, calling each track object (0x57cf8f to
+    /// 0x57cfda), so a track that ends or is ended on the way does not
+    /// make it skip another, and a track ended and started again before
+    /// its turn still runs in it, as its new thread.
     fn run(&mut self, sources: &dyn Sources) {
         let mut budget = BLOCK_STEPS;
-        let schedule: Vec<u32> = self.threads.iter().map(|t| t.id).collect();
-        for (next, &id) in schedule.iter().enumerate() {
-            let Some(at) = self.threads.iter().position(|t| t.id == id) else {
+        self.threads.sort_by_key(|t| t.order);
+        let schedule: Vec<u32> = self.threads.iter().map(|t| t.track).collect();
+        for (next, &track) in schedule.iter().enumerate() {
+            // A track runs one thread at most.
+            let Some(mut thread) = self
+                .threads
+                .iter()
+                .chain(&self.pending)
+                .find(|t| t.track == track)
+                .cloned()
+            else {
                 continue;
             };
             // A held track's threads wait, without fading (0x57d7f3).
-            if self.held.contains(&self.threads[at].track) {
+            if self.held.contains(&track) {
                 continue;
             }
             if budget == 0 {
-                if !self.over_budget {
-                    self.over_budget = true;
-                    self.report(format!(
-                        "threads ran {BLOCK_STEPS} instructions in one block; the rest wait"
-                    ));
-                }
-                // The threads not reached still fade, and run first next
-                // block, so busy threads cannot starve them.
-                let rest: BTreeSet<u32> = schedule[next..].iter().copied().collect();
-                for at in 0..self.threads.len() {
-                    if !rest.contains(&self.threads[at].id)
-                        || self.held.contains(&self.threads[at].track)
-                    {
-                        continue;
-                    }
-                    let mut thread = self.threads[at].clone();
-                    self.fade(&mut thread);
-                    self.threads[at] = thread;
-                }
-                let (mut first, ran): (Vec<Thread>, Vec<Thread>) =
-                    std::mem::take(&mut self.threads)
-                        .into_iter()
-                        .partition(|t| rest.contains(&t.id));
-                first.extend(ran);
-                self.threads = first;
+                self.out_of_budget(&schedule[next..]);
                 break;
             }
-            let mut thread = self.threads[at].clone();
             let alive = self.step(&mut thread, sources, &mut budget);
             // A thread may have stopped others (kill_trk) or started some
             // (play_trk); find this one again by ID.
-            match self.threads.iter().position(|t| t.id == thread.id) {
-                Some(at) if alive => self.threads[at] = thread,
-                Some(at) => {
-                    // Its last register writes still reach its notes, as
-                    // they would have when written.
-                    let levels = self.levels(&thread);
-                    for note in self.notes.iter_mut().filter(|n| n.thread == thread.id) {
-                        note.gains = levels.gains;
-                        note.step = step(levels.rate);
-                    }
-                    if self.notes.iter().any(|n| n.thread == thread.id) {
-                        self.ended.insert(thread.id, thread.clone());
-                    }
-                    self.threads.remove(at);
-                    // Its ducking request goes now, before the threads
-                    // after it run.
-                    self.forget_ended();
+            let id = thread.id;
+            if alive {
+                if let Some(slot) = self
+                    .threads
+                    .iter_mut()
+                    .chain(&mut self.pending)
+                    .find(|t| t.id == id)
+                {
+                    *slot = thread;
                 }
-                None => {}
+                continue;
             }
+            if !self.threads.iter().chain(&self.pending).any(|t| t.id == id) {
+                continue;
+            }
+            // Its last register writes still reach its notes, as they
+            // would have when written.
+            let levels = self.levels(&thread);
+            for note in self.notes.iter_mut().filter(|n| n.thread == id) {
+                note.gains = levels.gains;
+                note.step = step(levels.rate);
+            }
+            if self.notes.iter().any(|n| n.thread == id) {
+                self.ended.insert(id, thread);
+            }
+            self.threads.retain(|t| t.id != id);
+            self.pending.retain(|t| t.id != id);
+            // Its ducking request goes now, before the threads after it
+            // run.
+            self.forget_ended();
         }
         // Threads started this block run from the next one, so a track
         // that starts itself cannot keep this loop going.
@@ -2399,15 +2427,56 @@ impl<S: Samples> Player<S> {
         self.apply_levels();
     }
 
+    /// The block has run out of instructions before the tracks `rest`
+    /// had their turn. They still fade, and end when a fade that was to
+    /// end them does, as in their turn (see [`Player::fade_or_end`]); the
+    /// rest of their turn waits for the next block, where they run first,
+    /// so busy threads cannot starve them.
+    fn out_of_budget(&mut self, rest: &[u32]) {
+        if !self.over_budget {
+            self.over_budget = true;
+            self.report(format!(
+                "threads ran {BLOCK_STEPS} instructions in one block; the rest wait"
+            ));
+        }
+        let first = self.threads.iter().map(|t| t.order).min().unwrap_or(0);
+        let mut ended = Vec::new();
+        for (place, &track) in rest.iter().enumerate() {
+            if self.held.contains(&track) {
+                continue;
+            }
+            let Some(mut thread) = self
+                .threads
+                .iter()
+                .chain(&self.pending)
+                .find(|t| t.track == track)
+                .cloned()
+            else {
+                continue;
+            };
+            let id = thread.id;
+            if !self.fade_or_end(&mut thread) {
+                ended.push(id);
+                continue;
+            }
+            thread.order = first - (rest.len() - place) as i64;
+            if let Some(slot) = self
+                .threads
+                .iter_mut()
+                .chain(&mut self.pending)
+                .find(|t| t.id == id)
+            {
+                *slot = thread;
+            }
+        }
+        self.threads.retain(|t| !ended.contains(&t.id));
+        self.pending.retain(|t| !ended.contains(&t.id));
+    }
+
     /// Runs one thread until it waits, ends, or the block's instructions
     /// run out (`budget`). False when it ended.
     fn step(&mut self, thread: &mut Thread, sources: &dyn Sources, budget: &mut usize) -> bool {
-        self.fade(thread);
-        // *(code)* A fade that was to end the track has ended: the track
-        // ends at once, with its notes.
-        if thread.kill_after_fade && thread.registers[usize::from(FADE_ON)] == 0 {
-            let id = thread.id;
-            self.notes.retain(|n| n.thread != id);
+        if !self.fade_or_end(thread) {
             return false;
         }
         if thread.wake > self.frame {
@@ -2449,6 +2518,19 @@ impl<S: Samples> Player<S> {
             }
         }
         self.fault(thread, "ran too long without waiting")
+    }
+
+    /// Moves the thread's fade one step; false when that fade was to end
+    /// the track and has ended (0x57d86e to 0x57d88d): the track ends at
+    /// once, with its notes.
+    fn fade_or_end(&mut self, thread: &mut Thread) -> bool {
+        self.fade(thread);
+        if thread.kill_after_fade && thread.registers[usize::from(FADE_ON)] == 0 {
+            let id = thread.id;
+            self.notes.retain(|n| n.thread != id);
+            return false;
+        }
+        true
     }
 
     /// Moves a fading register one step, as the original's run loop does

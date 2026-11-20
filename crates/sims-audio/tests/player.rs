@@ -2651,7 +2651,8 @@ fn a_restart_keeps_the_track_its_targets_and_its_locals() {
     // default banks) and waits. Track 10 points `target` at it and asks
     // about its register 4 every block. Played again with interrupt 1,
     // track 11 starts anew as the same track: the count goes on, and
-    // track 10 still reaches it.
+    // track 10 still reaches it. Let go, track 11 now runs after track
+    // 10, so track 10 sees the count kept first.
     let counter: &[u8] = &[LOADB_V1, 55, 1, ADD, 4, 55, SET_LOOP, LOOP];
     let mut watcher = loadl(53, 11);
     watcher.extend([SET_LOOP, GETSRCDATAFIELD, 6, 4, 4, LOOP]);
@@ -2661,6 +2662,7 @@ fn a_restart_keeps_the_track_its_targets_and_its_locals() {
     play(&mut player, "e0");
     assert_eq!(asked_in_a_block(&mut player), [(1, 1)]);
     play(&mut player, "e1");
+    assert_eq!(asked_in_a_block(&mut player), [(1, 1)]);
     assert_eq!(asked_in_a_block(&mut player), [(2, 2)]);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
@@ -2712,4 +2714,88 @@ fn a_music_mode_lets_go_of_a_music_track_it_starts_again() {
         asked_in_a_block(&mut player),
         [(BUILD as i32, SET_MAIN_MUSIC as i32)]
     );
+}
+
+/// Renders a block; returns the fields the scripts asked about in it, in
+/// the order asked.
+fn fields_asked_in_order(player: &mut Player<BTreeMap<String, Pcm>>) -> Vec<i32> {
+    let asked = Asked::default();
+    player.render(BLOCK, &asked);
+    asked.0.into_inner().into_iter().map(|(_, f)| f).collect()
+}
+
+#[test]
+fn a_track_played_again_runs_after_the_others_from_the_next_block() {
+    // Tracks 10 and 11 ask every block, in the order they started. Track
+    // 10 played again is let go, which puts it last.
+    let module = module_of_tracks(&[(10, &asks(10, true)), (11, &asks(11, true))], "");
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "e10");
+    play(&mut player, "e11");
+    assert_eq!(fields_asked_in_order(&mut player), [10, 11]);
+    play(&mut player, "e10");
+    assert_eq!(fields_asked_in_order(&mut player), [11, 10]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_restart_runs_the_track_as_the_module_it_came_from_defines_it() {
+    // Track 10 asks every block, with interrupt 1. A second module also
+    // has a track 10, elsewhere in its program, and an event that plays
+    // it: the restart is of the running track object, from its own entry.
+    let mut first = vec![LOADB_V1, 55, 1];
+    first.extend(asks(7, true));
+    let mut padding = vec![NOP; 400];
+    padding.push(END);
+    let second = module_of_tracks(&[(99, &padding), (10, &[END])], "again=kSndobPlay,10\n");
+    let modules = vec![module_of_tracks(&[(10, &first)], ""), second];
+    let mut player = Player::new(modules, samples(), 1);
+    play(&mut player, "e10");
+    assert_eq!(fields_asked_in_order(&mut player), [7]);
+    play(&mut player, "again");
+    assert_eq!(fields_asked_in_order(&mut player), [7]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_track_ended_and_started_again_before_its_turn_runs_in_it() {
+    // Track 10 ends track 11 and starts it again; track 11, after it in
+    // the block, still has its turn there (the original's copy of its
+    // list holds the same track object), and plays patch 1. (Track 11
+    // takes no levels from its arguments, so it plays at full volume.)
+    let killer: &[u8] = &[LOADB_V1, 5, 11, KILL_TRK, 5, PLAY_TRK, 5, END];
+    let module = module_of_kinds(&[(10, 2, killer), (11, 0, &GENERIC)], "");
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "e10");
+    play(&mut player, "e11");
+    assert_eq!(player.render(3, &NoSources), [1, 2, 3]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_fade_that_ends_a_track_beyond_the_budget_ends_it_at_once() {
+    // Track 10 asks once, from the top, then waits. Twenty threads that
+    // spend 10,000 instructions once and end come after it: the second
+    // ten run first in the next block (they were not reached) and use
+    // its instructions before track 10's turn. Its fade to end it
+    // reaches 0 then, which ends it at once: a play right after starts
+    // it anew, from the top, rather than reviving the faded script.
+    let mut fader = vec![LOADL, 5];
+    fader.extend(long(7));
+    fader.extend([GETSRCDATAFIELD, 6, 1, 5, SET_LOOP, LOOP]);
+    let mut busy = vec![NOP; 9_999];
+    busy.push(END);
+    let mut routines: Vec<&[u8]> = vec![&fader];
+    routines.extend(vec![&busy[..]; 20]);
+    let module = module_with(&routines, 1, 10, "kill=18,10,0,0,1\n");
+    let mut player = Player::new(vec![module], samples(), 1);
+    for i in 0..=20 {
+        play(&mut player, &format!("e{i}"));
+    }
+    assert_eq!(fields_asked_in_order(&mut player), [7]);
+    play_for(&mut player, 2048, "kill");
+    assert_eq!(fields_asked_in_order(&mut player), []);
+    play(&mut player, "e0");
+    assert_eq!(fields_asked_in_order(&mut player), [7]);
+    assert_eq!(fields_asked_in_order(&mut player), []);
 }
