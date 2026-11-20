@@ -119,7 +119,7 @@ fn opening_userdata2_imports_its_patch_families_as_the_first_neighborhood_has_th
     };
 
     // The first neighborhood's files were imported in name order, the order
-    // NTFS lists them: Burb's people are User00012 to User00019, the
+    // NTFS lists them: Burb's people are User00012, 16, 18 and 19, the
     // Charmings' 24 and 25, the Goths' 26 to 29, the Hicks' 30 to 34, the
     // Kats' 35 to 39 and the strays 40 to 47. Each housed family's GUID
     // table pairs its people's exported GUIDs with the new ones.

@@ -91,9 +91,10 @@ records. This puts the reload's step in their place.
 ## Checked with the original's GUIDs
 
 The original imported the same six files into the first neighborhood.
-- Its character numbers give the order: Burb User00012–19, Charming
-  24–25, Goth Sr 26–29, Hick 30–34, Kat 35–39, Strays 40–47. That is name
-  order, the order NTFS lists the folder in.
+- Its character numbers give the order: Burb User00012, 16, 18 and 19,
+  Charming 24–25, Goth Sr 26–29, Hick 30–34, Kat 35–39, Strays 40–47.
+  That is name order, the order NTFS lists the folder in. User00013–15,
+  17 and 20–23 come from no `Patch` file.
 - Each housed family's `Gtab` #1 pairs its people's exported GUIDs with
   the new ones. The strays' new GUIDs are those of User00040 to 47.
 
