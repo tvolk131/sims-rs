@@ -215,6 +215,10 @@ fn an_old_town_home_loads_through_its_guid_table_and_steps() {
     let root = PathBuf::from(root);
     let house = root.join("UserData/Houses/House69.iff");
     let mut lot = Lot::load(&root, &house, &[2; 8], Frames::default()).unwrap();
+    // The C runtime's stream as the original entered the lot
+    // (`house69-ud1-ticks-20261119`): the dog file was read before the
+    // load (`sims_vm::READ_BEFORE_THE_FIRST_LOAD`).
+    assert_eq!(lot.world().crt_rng.state(), 2_984_970_331);
     let report = lot.load_report();
     assert!(report.stopped.is_none(), "{:?}", report.stopped);
     assert!(report.finished.is_some());

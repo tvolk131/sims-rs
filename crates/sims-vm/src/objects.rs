@@ -532,11 +532,21 @@ fn construct_person(
 /// +0x14). That it was read before the load, and not between the load and
 /// the first cat, is **unverified**; so is where (the avatar registry's
 /// scan at startup, 0x59f844, reads files through 0x59f087, whose
-/// skeleton records go through 0x598af7), and so is the rest of the
-/// list: the same folder of `ExpansionShared.far`
-/// holds the "dog" and "effects1" skeletons, which no capture has made.
-pub const READ_BEFORE_THE_FIRST_LOAD: &[&str] =
-    &["ExpansionShared/ExpansionShared.far/Skeletons\\kat_skeleton.cmx.bcf"];
+/// skeleton records go through 0x598af7).
+///
+/// The dog file is read before the first load too. A recording of the
+/// first neighborhood's House 69 (`house69-ud1-ticks-20261119`), which
+/// holds a dog, enters the lot with the stream 4,730 draws on from 1.
+/// Reading the dog file at the load would make it 6,497: the dog's copy
+/// and the file's skeletons, 1,767 draws more. With the file read
+/// before, every other draw of the load accounts for the 4,730 (the
+/// adult file and its copies, the dog's copy, and the indicator pairs).
+/// The rest of that folder, the "effects1" skeleton, no capture has
+/// made, and it is not listed.
+pub const READ_BEFORE_THE_FIRST_LOAD: &[&str] = &[
+    "ExpansionShared/ExpansionShared.far/Skeletons\\kat_skeleton.cmx.bcf",
+    "ExpansionShared/ExpansionShared.far/Skeletons\\dog_skeleton.cmx.bcf",
+];
 
 /// The files of [`READ_BEFORE_THE_FIRST_LOAD`] as `people` names them.
 /// A skeleton's file is its location in the install, spelled as it is on
