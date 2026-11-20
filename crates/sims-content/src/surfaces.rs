@@ -37,8 +37,10 @@
 
 use crate::index::Index;
 use crate::install::resolve;
+use crate::ui_graphics::US_ENGLISH;
 use crate::{Error, Install, Resource, Result};
 use sims_formats::iff::Iff;
+use sims_formats::strings::StringTable;
 use std::collections::BTreeMap;
 
 /// Floors or walls.
@@ -94,6 +96,11 @@ pub struct SurfaceFile {
     pub location: String,
     /// Each pattern's key by its number in the file.
     pub keys: BTreeMap<u16, u16>,
+    /// The price each of the file's patterns is given (0x4a0a84,
+    /// 0x4c59a0): string 1, from 0, of the file's `STR#` with ID 0
+    /// ([`StringTable::parse_chunk`]), read as C's `atoi` reads its bytes, or None when the file lacks that
+    /// table or string (the pattern then costs the catalog's default).
+    pub price: Option<i32>,
 }
 
 /// One kind's catalog: its pattern files by index.
@@ -116,6 +123,7 @@ impl SurfaceCatalog {
             name: builtin.to_owned(),
             location: format!("GameData/{builtin}"),
             keys: BTreeMap::new(),
+            price: None,
         }];
         // The free list: 0x58055b puts each range at the front, and a key
         // is taken from the front range (0x4a1a08).
@@ -184,10 +192,12 @@ impl SurfaceCatalog {
                 keys.insert(number, low);
             }
         }
+        let price = price(&iff);
         Ok(Some(SurfaceFile {
             name: sims_formats::far::decode_name(&name),
             location,
             keys,
+            price,
         }))
     }
 
@@ -218,5 +228,133 @@ impl Surfaces {
             floors: SurfaceCatalog::build(install, SurfaceKind::Floor)?,
             walls: SurfaceCatalog::build(install, SurfaceKind::Wall)?,
         })
+    }
+}
+
+/// A pattern file's own price (see [`SurfaceFile::price`]), in US
+/// English (language 1), as everything here reads: the original takes
+/// the game's language (0x47028b, 0x470256).
+///
+/// The table is the `STR#` with ID 0 and a flags' high byte of 0, as the
+/// original's string loader looks it up (through 0x46ff01 and 0x41bab1,
+/// which matches the key's ID and high byte at 0x41d94f to 0x41d95b).
+fn price(iff: &Iff) -> Option<i32> {
+    let chunk = iff.get(b"STR#", 0)?;
+    let table = StringTable::parse_chunk(iff.data(chunk), iff.resource_flags(chunk)).ok()?;
+    Some(atoi(&table.entry(1, US_ENGLISH)?.raw_text))
+}
+
+/// A number read from the start of a string's bytes as C's `atoi` reads
+/// it (the original's 0x636029): leading white space, an optional sign,
+/// then decimal digits up to the first other byte; 0 when there are none,
+/// so a string that starts with anything else (a byte order mark, say)
+/// reads 0. It wraps where the C runtime's would overflow.
+pub fn atoi(text: &[u8]) -> i32 {
+    let start = text
+        .iter()
+        .position(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c))
+        .unwrap_or(text.len());
+    let rest = &text[start..];
+    let (negative, rest) = match rest.first() {
+        Some(b'-') => (true, &rest[1..]),
+        Some(b'+') => (false, &rest[1..]),
+        _ => (false, rest),
+    };
+    let mut value = 0i32;
+    for &digit in rest.iter().take_while(|b| b.is_ascii_digit()) {
+        value = value.wrapping_mul(10).wrapping_add(i32::from(digit - b'0'));
+    }
+    if negative {
+        value.wrapping_neg()
+    } else {
+        value
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{atoi, price};
+    use sims_formats::iff::Iff;
+
+    #[test]
+    fn atoi_reads_as_c_does() {
+        assert_eq!(atoi(b"20"), 20);
+        assert_eq!(atoi(b"  -7 dollars"), -7);
+        assert_eq!(atoi(b"+5"), 5);
+        assert_eq!(atoi(b"Price"), 0);
+        assert_eq!(atoi(b""), 0);
+        assert_eq!(atoi(b"\xef\xbb\xbf25"), 0);
+    }
+
+    /// A version -1 string table of `texts`.
+    fn table(texts: &[&str]) -> Vec<u8> {
+        let mut data = (-1i16).to_le_bytes().to_vec();
+        data.extend((texts.len() as u16).to_le_bytes());
+        for text in texts {
+            data.extend(text.as_bytes());
+            data.push(0);
+        }
+        data
+    }
+
+    /// An IFF of `STR#` chunks by ID, in file order, each with flag 0x10
+    /// (little-endian).
+    fn iff(tables: &[(u16, Vec<u8>)]) -> Iff {
+        let flagged: Vec<_> = tables
+            .iter()
+            .map(|(id, d)| (*id, 0x10, d.clone()))
+            .collect();
+        iff_flags(&flagged)
+    }
+
+    /// An IFF of `STR#` chunks by ID and flags, in file order.
+    fn iff_flags(tables: &[(u16, u16, Vec<u8>)]) -> Iff {
+        let mut bytes = b"IFF FILE 2.5:TYPE FOLLOWED BY SIZE\0 JAMIE DOLINE 1998".to_vec();
+        bytes.resize(64, 0);
+        for (id, flags, data) in tables {
+            bytes.extend(b"STR#");
+            bytes.extend((76 + data.len() as u32).to_be_bytes());
+            bytes.extend(id.to_be_bytes());
+            bytes.extend(flags.to_be_bytes());
+            bytes.extend([0u8; 64]);
+            bytes.extend(data);
+        }
+        Iff::parse(bytes).unwrap()
+    }
+
+    #[test]
+    fn a_pattern_file_is_priced_by_its_string_table_0() {
+        // Table 0 is read even when another comes first.
+        let file = iff(&[(5, table(&["x", "99"])), (0, table(&["Name", "25"]))]);
+        assert_eq!(price(&file), Some(25));
+        // Without table 0, the default.
+        assert_eq!(price(&iff(&[(1, table(&["x", "99"]))])), None);
+        // Without its string 1, too.
+        assert_eq!(price(&iff(&[(0, table(&["Name"]))])), None);
+        // A byte order mark before the digits reads 0.
+        assert_eq!(price(&iff(&[(0, table(&["Name", "\u{feff}25"]))])), Some(0));
+        // Without flag 0x10 a version -1 table's count is big-endian.
+        let mut big = table(&["Name", "25"]);
+        big.swap(2, 3);
+        assert_eq!(price(&iff_flags(&[(0, 0, big.clone())])), Some(25));
+        assert_eq!(price(&iff_flags(&[(0, 0x10, big)])), None);
+        // Only a table whose flags' high byte is 0, wherever it stands.
+        let high = iff_flags(&[(0, 0x0110, table(&["Name", "25"]))]);
+        assert_eq!(price(&high), None);
+        for two in [
+            [
+                (0, 0x0010, table(&["Name", "25"])),
+                (0, 0x0110, table(&["Name", "60"])),
+            ],
+            [
+                (0, 0x0110, table(&["Name", "60"])),
+                (0, 0x0010, table(&["Name", "25"])),
+            ],
+        ] {
+            assert_eq!(price(&iff_flags(&two)), Some(25));
+        }
+        // A little-endian length-prefixed table: its count is its first word.
+        let pascal = b"\x02\x00\x04Name\x0225".to_vec();
+        assert_eq!(price(&iff_flags(&[(0, 0x10, pascal)])), Some(25));
     }
 }

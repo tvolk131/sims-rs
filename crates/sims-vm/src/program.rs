@@ -227,7 +227,7 @@ impl Program {
                     library.names.insert(chunk.id, chunk.label.clone());
                 }
                 b"STR#" => {
-                    let table = sims_formats::strings::StringTable::parse(data)
+                    let table = string_table(data, iff.resource_flags(chunk))
                         .map_err(|e| format("STR#", chunk.id, e))?;
                     let entries: Vec<String> = table
                         .entries
@@ -945,9 +945,21 @@ pub(crate) fn definition_words(data: &[u8]) -> sims_formats::Result<[i16; DEFINI
     Ok(words)
 }
 
+/// A library's string table. One the reader here refuses is read as the
+/// original's string loader reads it (0x46feac), in its resource's byte
+/// order (`flags`): a big-endian version -1 table, say. Tables the reader
+/// takes are kept as read, so the linked strings do not change.
+fn string_table(
+    data: &[u8],
+    flags: u16,
+) -> sims_formats::Result<sims_formats::strings::StringTable> {
+    use sims_formats::strings::StringTable;
+    StringTable::parse(data).or_else(|_| StringTable::parse_chunk(data, flags))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DEFINITION_WORDS, definition_words};
+    use super::{DEFINITION_WORDS, definition_words, string_table};
 
     #[test]
     fn short_definitions_are_padded() {
@@ -966,6 +978,18 @@ mod tests {
             // The odd trailing byte is cleared.
             assert_eq!(definition_words(&data).unwrap()[..4], [138, 0, 0x1234, 0]);
         }
+    }
+
+    #[test]
+    fn a_big_endian_table_the_reader_refuses_is_read_in_its_order() {
+        // Version -1 with a big-endian count of 2, in a resource without
+        // flag 0x10.
+        let data = b"\xff\xff\x00\x02a\0b\0";
+        assert!(sims_formats::strings::StringTable::parse(data).is_err());
+        assert_eq!(string_table(data, 0).unwrap().entries.len(), 2);
+        // A table the reader takes is kept as read.
+        let pascal = b"\x00\x00\x01\x00\x02hi";
+        assert_eq!(string_table(pascal, 0x10).unwrap().entries.len(), 1);
     }
 
     #[test]

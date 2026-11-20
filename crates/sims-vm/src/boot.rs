@@ -176,6 +176,9 @@ pub struct Finished {
 pub struct Lot {
     program: Program,
     catalog: Catalog,
+    /// The floor and wall catalogs the load renumbered the lot's patterns
+    /// by (load step 6b).
+    surfaces: Surfaces,
     world: World,
     /// The motive constants, worked out at the first step: a load that
     /// runs no tick does not need them.
@@ -474,6 +477,7 @@ impl Lot {
         }
         let mut world = World::empty();
         let mut load = LoadReport::default();
+        let surfaces;
         {
             let interpreter = Interpreter {
                 view_rotation,
@@ -517,7 +521,7 @@ impl Lot {
             world.read_arrays(&file.arrays, version)?;
             // The floor and wall catalogs, which the original builds at
             // start-up.
-            let surfaces = Surfaces::build(&install)?;
+            surfaces = Surfaces::build(&install)?;
             load.renumbered = world.renumber_surfaces(
                 file.floor_map.as_deref(),
                 file.wall_map.as_deref(),
@@ -656,6 +660,7 @@ impl Lot {
         Ok(Self {
             program,
             catalog,
+            surfaces,
             world,
             tuning: None,
             player: Answers {
@@ -1114,6 +1119,13 @@ impl Lot {
         &self.world
     }
 
+    /// The floor and wall catalogs the lot's patterns are keyed by: the
+    /// ones the load built, so a reader prices or draws the patterns the
+    /// load gave the keys to.
+    pub fn surfaces(&self) -> &Surfaces {
+        &self.surfaces
+    }
+
     /// The linked code and the catalog, for reading what an object is.
     pub fn program(&self) -> &Program {
         &self.program
@@ -1195,6 +1207,7 @@ mod tests {
                 semi_globals: BTreeMap::new(),
                 diagnostics: Vec::new(),
             },
+            surfaces: sims_content::Surfaces::default(),
             world,
             tuning: None,
             player: Answers::default(),
