@@ -17,8 +17,9 @@ it into `sims_game::pick` and `Lot::sprite_pick` (sims-vm).
    is noted as under the pointer (0x58462f, the global 0x6f6bc4), and
    the last one drawn wins. The pick takes it when it stands on the
    floor shown. People and the bob are kept out of the depth the lot
-   leaves: a dump with Sims on screen shows them in the colour buffer
-   only.
+   leaves: dumps with Sims on screen show them, and the in-use porch
+   bench, in the colour buffer only
+   (`20261115-people-are-drawn-over-finished-lot-against-depth.md`).
 2. **Otherwise the sprite pick** (0x4aa713, called in mode 1):
    - **The start tile.** The view's point-to-tile (0x4a97c3, mode 0)
      multiplies (x, y, depth, 1) by the view's inverse matrix. It gets
@@ -110,9 +111,14 @@ it into `sims_game::pick` and `Lot::sprite_pick` (sims-vm).
     noted. A Goth-house test pins this: at 7:12 AM, 1134 of the in-use
     bench's pixels cover Mortimer and pick him.
   - The depth the sprite pick unprojects is the one `draw_lot` leaves,
-    without those objects, as the people are left out of it. That they
-    are left out of the original's too is **unverified**: the dump that
-    showed the people missing did not look at them.
+    without those objects or the people. The original's dump with two
+    Sims on the porch bench shows the bench missing from the depth
+    buffer too (`20261115-people-are-drawn-over-finished-lot-against-depth.md`).
+    What is **unverified** is that the dumped buffer is the one the pick
+    reads (0x4a97c3 locks the view's depth surface), at the time the pick
+    reads it: if the moving pass wrote its depth into that surface first,
+    a pixel showing only the bench would start the walk on the bench's
+    own tile rather than on what is behind it.
   - Their drawn rectangles are kept as the lot's are, so the sprite pick
     finds them: the bench's other 2039 pixels in that test all pick it.
 

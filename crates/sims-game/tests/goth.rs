@@ -2537,6 +2537,11 @@ fn the_pointer_notes_a_sim_behind_the_bench_they_sit_on() {
         "the bench covers {} of him",
         behind.len()
     );
+    assert!(
+        rest.len() > 500,
+        "only {} of the bench's pixels",
+        rest.len()
+    );
     let missed: Vec<_> = rest.iter().filter(|&&(_, p)| p != Some(bench)).collect();
     assert!(
         missed.is_empty(),

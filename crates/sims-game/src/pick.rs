@@ -21,11 +21,15 @@
 //!    columns as the original keeps them, 0x438f71). An object drawn after
 //!    the people has its rectangle there too.
 //!
-//! The depth the original reads at the pointer is the lot's alone: a
-//! dump with Sims on screen shows them in the colour buffer only. So the
-//! sprite pick unprojects the depth `sims_render::draw_lot` left, before
-//! the people and the objects that hold one were drawn
-//! ([`Depth::unproject`]). Each tile of a multi-tile object is its
+//! The original's depth buffer holds the lot alone: dumps with Sims on
+//! screen show them, and the porch bench two of them sat on, in the
+//! colour buffer only
+//! (`20261115-people-are-drawn-over-finished-lot-against-depth.md`). So
+//! the sprite pick unprojects the depth `sims_render::draw_lot` left,
+//! before the people and the objects that hold one were drawn
+//! ([`Depth::unproject`]). That the dumped buffer is the one the pick
+//! reads at the pointer (0x4a97c3 locks the view's depth surface), at the
+//! time it reads it, is **unverified**. Each tile of a multi-tile object is its
 //! own object and is picked as itself, not as its group's lead: that is
 //! the object the pie menu is listed on, and the simulation sends the
 //! interactions of a tile on to the tile that takes them, as the
