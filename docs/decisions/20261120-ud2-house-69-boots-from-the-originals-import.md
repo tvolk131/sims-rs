@@ -76,13 +76,19 @@ The differences:
   (0x4750f0, 0x4750fc), and a new frame keeps the locals it finds. The UD1
   recording shows the same: the same person (object 274 there too) in the
   same frame from update 112, with 3244.
-- **Relationships**, which the comparison does not read. At update 599,
-  objects 160 and 161 (two of GUID 0xF3AAA62F) are deleted, in both runs.
-  The original then drops the rows that objects 7 and 63 held toward them.
-  We keep the rows (`crates/sims-vm/src/removal.rs` leaves other objects'
-  relationships naming a deleted ID), so `IMPORTED_69_1000` holds two rows
-  the recording lacks. Where the original drops them is not yet found.
 
-So `IMPORTED_69` is the recording's entry. `IMPORTED_69_1000` is our run
-with the recording's frames, which differs from the recording's update
-1000 in those two rows.
+**Relationships**, which the comparison does not read, match too; we
+compared them on their own. At update 599 objects 160 and 161 (two of
+GUID 0xF3AAA62F) delete themselves, in both runs. The original's
+registry then erases, from every remaining object, the first
+relationship row naming the deleted ID (0x441223 calls 0x464fa2), so
+objects 7 and 63 lose their rows toward them. Our deletion now does the
+same (`crates/sims-vm/src/removal.rs`), and our relationships equal the
+recording's at entry and at every update through 1,000. The original
+reads each row through its pointer with no null check, so an empty row
+before the match fails loudly here. This erasure moves the Goth and
+Newbie tick pins, whose runs delete objects too.
+
+So `IMPORTED_69` is the recording's entry, and `IMPORTED_69_1000` is our
+run with the recording's frames at update 1000, which differs from the
+recording only in object 2's last result and object 274's word.
