@@ -15,7 +15,11 @@
 //!   to two shades from the original's random generator, seeded the same
 //!   each time. A tile with a wall on its far edge in the view is 64 shades
 //!   darker along that edge. The sun stays where it is when the camera
-//!   turns: it always stands toward the view's +x, π/10 from the zenith.
+//!   turns: it always stands toward the view's +x. It stands π/10 from
+//!   the zenith by day, 2π/10 at dusk and dawn and 3π/10 at night
+//!   ([`latitude`]), so the grass darkens after dark. Nothing else lights
+//!   it: the grass is drawn straight from the palette (0x49da21,
+//!   0x49d8fb), whatever room 0's light.
 //! - **Grass color** (0x49cd43). Each corner averages the four tiles' grass
 //!   values around it and scales them to 0 to 31.
 //! - **Columns** (0x49dacd, 0x49da21). A tile is drawn in columns four
@@ -56,9 +60,6 @@ const DITHER: [i32; 4] = [0, 8, 0, 6];
 /// The jitter's seed and reach (`fJitterRandSeed`, `fJitterEnvelope`).
 const JITTER_SEED: u32 = 0x40de9;
 const JITTER: u32 = 3;
-/// The sun's angle from the zenith, as the grass's constructor stores it
-/// (0x49c187): about π/10.
-const LATITUDE_BITS: u32 = 0x3ea0_d973;
 /// Shades added along a wall.
 const WALL_SHADE: i32 = 64;
 
@@ -154,20 +155,40 @@ impl Random {
     }
 }
 
-/// Light on a slope, for height differences -5 to 5 along each axis
-/// (0x4c47f7): the squared cosine between the sun and the slope's normal.
-fn light_table() -> [[f32; 11]; 11] {
-    // The sun's angle from the zenith: π/10, set by the grass's constructor
-    // (0x49c187, the float 0x3ea0d973). The base class has a setter that
-    // would tilt it by the camera's rotation (0x4a4551: 1, 2, 3 and 2
-    // tenths of π), but only a command handler reaches it (message 0xdd at
-    // 0x4c41bf), and turning the camera does not: at rotation 3 the
-    // original's grass matches π/10 and not 2π/10. The constant is 9 ulps
-    // below π/10 rounded to f32, and a slope can tell the difference.
-    light_table_at(f32::from_bits(LATITUDE_BITS))
+/// The sun's angle from the zenith at a time of day (global 4: 0 day, 1
+/// dusk, 2 night, 3 dawn), on an ordinary lot.
+///
+/// Signal 0xdd goes out at the end of every load (0x416060) and on each
+/// change of the time of day. The panels' handler passes global 4 to the
+/// grass (0x4c41bf), whose override (0x49e45e) hands it to the setter
+/// (0x4a4551) when neither of its two preset flags is set. The setter sets
+/// 1, 2, 3 or 2 tenths of the float π for 0 to 3 (doubles 0x668348,
+/// 0x667ac8, 0x668710), 0 for any other value, and shades the grass again.
+///
+/// The grass's constructor sets a float 9 ulps short of the setter's
+/// tenth of π (0x3ea0d973 at 0x49c187, against 0x3ea0d97c), which a lot
+/// drawn without a load would keep; that is not modelled. Lots 28 to 29,
+/// 40 to 42, 46 to 48, 90 to 96 and 99 (global 10) take other terrain
+/// presets (0x4c4648), with other angles; those are not ported either.
+fn latitude(time_of_day: i16) -> f32 {
+    let tenths = match time_of_day {
+        0 => 0.1,
+        1 | 3 => 0.2,
+        2 => 0.3,
+        _ => return 0.0,
+    };
+    (f64::from(std::f32::consts::PI) * tenths) as f32
 }
 
-/// The light table for a sun `latitude` radians from the zenith.
+/// Light on a slope by day ([`light_table_at`] at [`latitude`] 0).
+#[cfg(test)]
+fn light_table() -> [[f32; 11]; 11] {
+    light_table_at(latitude(0))
+}
+
+/// Light on a slope, for height differences -5 to 5 along each axis
+/// (0x4c47f7): the squared cosine between the sun, `latitude` radians from
+/// the zenith, and the slope's normal.
 fn light_table_at(latitude: f32) -> [[f32; 11]; 11] {
     // libm stands in for the x87's sine and cosine; both are within an
     // ulp of a double, far finer than the f32 they are rounded to.
@@ -333,7 +354,7 @@ impl Grass {
             let h = lot.heights[Lot::cell(lx as usize, ly as usize)];
             std::array::from_fn(|n| i32::from(h[(n + 4 - usize::from(rotation)) & 3]))
         };
-        let table = light_table();
+        let table = light_table_at(latitude(lot.time_of_day));
         let sw = |c: [i32; 4]| lookup(&table, c[0] - c[3], c[1] - c[0]);
         let ne = |c: [i32; 4]| lookup(&table, c[1] - c[2], c[3] - c[2]);
         // The vertices run 1 to the lot's size less one, x outer, each
@@ -693,19 +714,37 @@ mod tests {
     }
 
     #[test]
-    fn the_sun_angle_is_the_constructors_exact_float() {
-        // π/10 rounded to f32 is 0x3ea0d97c; the original stores 9 ulps
-        // less. A vertex ringed by these slopes is shade 87 with the
-        // original's float and would be 88 with the rounded one.
+    fn the_day_sun_is_the_setters_float_not_the_constructors() {
+        // The setter's π/10 is 0x3ea0d97c; the constructor stores 9 ulps
+        // less. A vertex ringed by these slopes is shade 88 with the
+        // setter's float and would be 87 with the constructor's.
         let shade = |table: [[f32; 11]; 11]| {
             let slopes = [(-5, -1), (-3, 1), (-2, -2), (-2, -3), (-5, -3), (-5, 3)];
             let sum: f32 = slopes.iter().map(|&(a, b)| lookup(&table, a, b)).sum();
             MAX_SHADE - times_127(f64::from(sum) * f64::from(1.0f32 / 6.0))
         };
-        let rounded = (f64::from(std::f32::consts::PI) * 0.1) as f32;
-        assert_eq!(rounded.to_bits(), 0x3ea0_d97c);
-        assert_eq!(shade(light_table()), 87);
-        assert_eq!(shade(light_table_at(rounded)), 88);
+        assert_eq!(latitude(0).to_bits(), 0x3ea0_d97c);
+        assert_eq!(shade(light_table()), 88);
+        assert_eq!(shade(light_table_at(f32::from_bits(0x3ea0_d973))), 87);
+    }
+
+    #[test]
+    fn the_sun_sinks_after_dark_and_darkens_flat_grass() {
+        // The setter's floats: tenths of the float π, rounded to f32.
+        assert_eq!(latitude(1).to_bits(), 0x3f20_d97c);
+        assert_eq!(latitude(3).to_bits(), 0x3f20_d97c);
+        assert_eq!(latitude(2).to_bits(), 0x3f71_463a);
+        assert_eq!(latitude(4), 0.0);
+        // Flat ground, before the jitter: shade 13 by day, 84 at night
+        // (the original's 12:24 AM grass shows shades 82 to 85 of the
+        // palette, undimmed).
+        let flat = |time_of_day| {
+            let table = light_table_at(latitude(time_of_day));
+            MAX_SHADE - times_127(f64::from(lookup(&table, 0, 0)))
+        };
+        assert_eq!(flat(0), 13);
+        assert_eq!(flat(1), 44);
+        assert_eq!(flat(2), 84);
     }
 
     #[test]
@@ -761,7 +800,9 @@ mod tests {
             levels: [level(), level()],
             outdoor_rooms: Default::default(),
             room_lights: Default::default(),
+            room_fractions: Default::default(),
             outdoor_light: None,
+            time_of_day: 0,
             halves: Default::default(),
             lamps: Default::default(),
         }

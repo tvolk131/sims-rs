@@ -54,9 +54,10 @@
 //! 0x49b60e) before it sets it (0x4b49c7). A person in a room at full
 //! light is drawn in full light all over; one in a dark room shows the
 //! light's side. Each lit lamp of the person's room adds a warm light from
-//! the lamp to the person ([`lamps`]). The level's fade over 250 ms, the
-//! dimmer daylight cap after dark (0.8) and the person's flag that draws
-//! them at full light are not ported (decisions entries "A person is lit
+//! the lamp to the person ([`lamps`]). After dark the level is at most
+//! 0.8, as for everything drawn ([`level`]). The level's fade over
+//! 250 ms and the person's flag that draws them at full light are not
+//! ported (decisions entries "A person is lit
 //! by the original's standard light, at their room's level" and "The
 //! standard light shines from the viewer's side, and lamps light
 //! people").
@@ -218,10 +219,10 @@ pub const STANDARD_LIGHT: Vec3 = Vec3::new(0.644_362_6, 0.417_676, 0.640_580_7);
 /// The level a person is lit at, 0.5 to 1: the light byte of the room
 /// at their position as the lot renderer draws it
 /// ([`sims_render::lot::room_light`]; full light off the lot and outside
-/// every room), over 255, held between 0.5 and 1. The original reads the
-/// level from the drawing's lighting record (0x4b4499), whose only setter
-/// holds it between 0.5 and the brightest a lit tile may be, 1 by day
-/// (0x4b4525); the lot's objects set it from the tile's light byte over
+/// every room), over 255, held between 0.5 and the brightest a lit tile
+/// may be, 1 by day and 0.8 otherwise ([`sims_render::light::brightest`]).
+/// The original reads the level from the drawing's lighting record
+/// (0x4b4499), whose only setter holds it so (0x4b4525); the lot's objects set it from the tile's light byte over
 /// 255 (0x467482). That a person's record is set the same way, from the
 /// tile they stand on, is **unverified**.
 pub fn level(world: &World, person: u16) -> f32 {
@@ -232,7 +233,8 @@ pub fn level(world: &World, person: u16) -> f32 {
         .filter(|&room| room >= 0)
         .and_then(|room| world.rooms.rooms.get(&room))
         .map_or(255, sims_render::lot::room_light);
-    (f32::from(byte) / 255.0).clamp(0.5, 1.0)
+    let brightest = sims_render::light::brightest(world.globals.get(4).copied().unwrap_or(0));
+    (f32::from(byte) / 255.0).clamp(0.5, brightest)
 }
 
 /// The furthest a lamp's light reaches a person, squared, in model units
@@ -971,6 +973,11 @@ mod tests {
     #[test]
     fn the_level_sets_the_ambient_grey_and_the_lights_strength() {
         assert_eq!(level(&World::empty(), 7), 1.0);
+        // After dark nothing is lit above 0.8.
+        let mut night = World::empty();
+        night.globals = vec![0; 32];
+        night.globals[4] = 2;
+        assert_eq!(level(&night, 7), f32::from_bits(0x3f4c_cccd));
         let towards = STANDARD_LIGHT.normalize();
         let full = Lighting::standard(STANDARD_LIGHT, 1.0);
         assert_eq!(full.shade(-towards), 1.0);
