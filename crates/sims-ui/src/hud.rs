@@ -167,7 +167,10 @@ pub struct Controls {
     /// Whether the strip beside the cluster is open. After a house loads
     /// the original shows it closed until Live is pressed.
     pub expanded: bool,
-    pub panel: Panel,
+    /// The live-mode panel open, if any. The original opens the needs
+    /// when it builds the panel (0x51a0bc); with nobody selected none is
+    /// open ([`Controls::follow`]).
+    pub panel: Option<Panel>,
     pub speed: Speed,
     pub camera: CameraState,
     /// The pointer's position, for the buttons' hover cells.
@@ -213,7 +216,7 @@ impl Default for Controls {
         Self {
             mode: Mode::Live,
             expanded: false,
-            panel: Panel::Needs,
+            panel: Some(Panel::Needs),
             speed: Speed::Normal,
             camera: CameraState::default(),
             pointer: None,
@@ -240,12 +243,7 @@ impl Controls {
                 self.expanded = !self.expanded;
                 self.help = None;
             }
-            Command::OpenPanel(panel) => {
-                if *panel != self.panel {
-                    self.help = None;
-                }
-                self.panel = *panel;
-            }
+            Command::OpenPanel(panel) => self.open(Some(*panel)),
             // A sign outside 1 to 12 has no balloon and does nothing.
             Command::Help(Help::Sign(sign)) if !(1..=12).contains(sign) => {}
             Command::Help(help) => {
@@ -258,6 +256,34 @@ impl Controls {
             Command::RelationsPage(page) => self.relations_page = *page,
             _ => {}
         }
+    }
+
+    /// Follows the selection, as the panel's household notification does
+    /// (0x51ce79): with nobody selected no panel is open (0x51d06e), and
+    /// with someone selected and no panel open the needs open
+    /// (0x51d082). True if that closed the help balloon, which the
+    /// original plays `UI_whoosh` for (0x50fb7f).
+    ///
+    /// The original follows the notification. The host calls this before
+    /// each layout; that a selection change always sends the
+    /// notification is **unverified**.
+    pub fn follow(&mut self, selected: bool) -> bool {
+        let help = self.help.is_some();
+        if !selected {
+            self.open(None);
+        } else if self.panel.is_none() {
+            self.open(Some(Panel::Needs));
+        }
+        help && self.help.is_none()
+    }
+
+    /// Opens `panel` (0x51d375): another panel closes the help balloon
+    /// (0x51d383).
+    fn open(&mut self, panel: Option<Panel>) {
+        if panel != self.panel {
+            self.help = None;
+        }
+        self.panel = panel;
     }
 }
 
@@ -685,18 +711,27 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
         (id::GIFTS, Panel::Gifts, 44, 66, 27, 30),
         (id::HOUSE, Panel::House, 76, 66, 27, 30),
     ] {
+        // Each button needs a selected Sim, and House a residential lot;
+        // a refusal of House sounds (0x51bbe6 to 0x51be75).
+        let command = match panel {
+            Panel::House if selected.is_none() || !snapshot.residential => {
+                Command::Refused { error: true }
+            }
+            _ if selected.is_none() => Command::Refused { error: false },
+            _ => Command::OpenPanel(panel),
+        };
         items.push(Item {
             rect: g(x, y, w, h),
             kind: Kind::Button {
                 id,
                 cells: 4,
-                selected: controls.panel == panel,
+                selected: controls.panel == Some(panel),
             },
-            command: Some(Command::OpenPanel(panel)),
+            command: Some(command),
         });
     }
     // The original shows no needs without a selected Sim.
-    if let (Some(resident), Panel::Needs) = (selected, controls.panel) {
+    if let (Some(resident), Some(Panel::Needs)) = (selected, controls.panel) {
         let panel = Rect::new(gadget.x + 108, strip.y, NEEDS_WIDTH - 108, STRIP);
         // The title, labels and meters, measured on the original's
         // screen: meters 60 by 5 in two columns 100 apart, rows 19 apart,
@@ -732,7 +767,7 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
             });
         }
     }
-    if let (Some(resident), Panel::Personality) = (selected, controls.panel) {
+    if let (Some(resident), Some(Panel::Personality)) = (selected, controls.panel) {
         let panel = Rect::new(gadget.x + 108, strip.y, NEEDS_WIDTH - 108, STRIP);
         items.push(Item {
             rect: panel.offset(6, 2).with_size(100, 20),
@@ -760,7 +795,7 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
             });
         }
     }
-    if let (Some(resident), Panel::Job) = (selected, controls.panel) {
+    if let (Some(resident), Some(Panel::Job)) = (selected, controls.panel) {
         let panel = Rect::new(gadget.x + 108, strip.y, NEEDS_WIDTH - 108, STRIP);
         // The title where the job panel's draw puts it in a western
         // language (0x530340).
@@ -792,12 +827,13 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
             command: None,
         });
     }
-    if let (Some(_), Panel::Relationships) = (selected, controls.panel) {
+    if let (Some(_), Some(Panel::Relationships)) = (selected, controls.panel) {
         let panel = Rect::new(gadget.x + 108, strip.y, NEEDS_WIDTH - 108, STRIP);
         relationships(items, panel, snapshot, controls);
     }
-    // The house panel needs no selected Sim (0x52e49e).
-    if controls.panel == Panel::House {
+    // The house panel's draw needs no selected Sim (0x52e49e), but with
+    // nobody selected no panel is open ([`Controls::follow`]).
+    if controls.panel == Some(Panel::House) {
         let panel = Rect::new(gadget.x + 108, strip.y, NEEDS_WIDTH - 108, STRIP);
         items.push(Item {
             rect: panel
@@ -1857,6 +1893,7 @@ mod tests {
             relations: Vec::new(),
             superstar: false,
             house: crate::house::House::default(),
+            residential: true,
         }
     }
 
@@ -2153,7 +2190,7 @@ mod tests {
         s.residents[0].zodiac = Some(9);
         let controls = Controls {
             expanded: true,
-            panel: Panel::Personality,
+            panel: Some(Panel::Personality),
             ..Controls::default()
         };
         let items = layout([800, 600], &s, &controls);
@@ -2250,7 +2287,7 @@ mod tests {
             .collect();
         let mut controls = Controls {
             expanded: true,
-            panel: Panel::Relationships,
+            panel: Some(Panel::Relationships),
             ..Controls::default()
         };
         let panel = Rect::new(521, 500, 279, 100);
@@ -2596,7 +2633,7 @@ mod tests {
         s.residents[0].zodiac = Some(1);
         let mut controls = Controls {
             expanded: true,
-            panel: Panel::Personality,
+            panel: Some(Panel::Personality),
             ..Controls::default()
         };
         let mut art = Art::default();
@@ -2668,9 +2705,125 @@ mod tests {
         }
         // With another panel showing, no balloon is laid out.
         let mut elsewhere = controls;
-        elsewhere.panel = Panel::Needs;
+        elsewhere.panel = Some(Panel::Needs);
         let items = layout([800, 600], &s, &elsewhere);
         assert!(!items.iter().any(|i| matches!(i.kind, Kind::Help { .. })));
+    }
+
+    /// The gadget buttons' commands, by button.
+    fn gadget_commands(items: &[Item]) -> Vec<(i32, Command)> {
+        items
+            .iter()
+            .filter_map(|i| match (&i.kind, &i.command) {
+                (Kind::Button { id, .. }, Some(c)) if (id::NEEDS..=id::GIFTS).contains(id) => {
+                    Some((*id, c.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_gadget_buttons_need_a_selected_sim_and_house_a_residential_lot() {
+        let controls = Controls {
+            expanded: true,
+            ..Controls::default()
+        };
+        let opens = |id: i32| match id {
+            id::NEEDS => Panel::Needs,
+            id::INTERESTS => Panel::Interests,
+            id::RELATIONSHIPS => Panel::Relationships,
+            id::PERSONALITY => Panel::Personality,
+            id::JOB => Panel::Job,
+            id::GIFTS => Panel::Gifts,
+            id::HOUSE => Panel::House,
+            _ => unreachable!(),
+        };
+        // Selected, on a residential lot: each opens its panel.
+        let mut s = snapshot();
+        let commands = gadget_commands(&layout([800, 600], &s, &controls));
+        assert_eq!(commands.len(), 7);
+        for (id, command) in &commands {
+            assert_eq!(*command, Command::OpenPanel(opens(*id)));
+        }
+        // The House button, at (76, 66) in the gadget.
+        assert_eq!(
+            press(&layout([800, 600], &s, &controls), [413 + 80, 500 + 70]),
+            Some(Command::OpenPanel(Panel::House))
+        );
+        // On a lot that is not residential, House is refused with the
+        // error sound (0x51be1a); the others still open.
+        s.residential = false;
+        for (id, command) in gadget_commands(&layout([800, 600], &s, &controls)) {
+            let expected = if id == id::HOUSE {
+                Command::Refused { error: true }
+            } else {
+                Command::OpenPanel(opens(id))
+            };
+            assert_eq!(command, expected);
+        }
+        // With nobody selected every button is refused, and only House
+        // sounds (0x51be6e, 0x51be1a), on any lot. The buttons still take
+        // the press, so they are not drawn disabled.
+        for residential in [true, false] {
+            s.residential = residential;
+            s.selected = None;
+            let commands = gadget_commands(&layout([800, 600], &s, &controls));
+            assert_eq!(commands.len(), 7);
+            for (id, command) in commands {
+                assert_eq!(command, Command::Refused { error: id == id::HOUSE });
+            }
+        }
+        // A selected person who is not one of the household's counts as
+        // nobody.
+        s.selected = Some(999);
+        for (id, command) in gadget_commands(&layout([800, 600], &s, &controls)) {
+            assert_eq!(command, Command::Refused { error: id == id::HOUSE });
+        }
+        // A refusal changes nothing that shows.
+        let mut refused = Controls {
+            panel: Some(Panel::Personality),
+            help: Some(Help::Sign(3)),
+            ..controls
+        };
+        refused.apply(&Command::Refused { error: true });
+        assert_eq!(refused.panel, Some(Panel::Personality));
+        assert_eq!(refused.help, Some(Help::Sign(3)));
+    }
+
+    #[test]
+    fn the_panel_follows_the_selection() {
+        let mut controls = Controls {
+            expanded: true,
+            panel: Some(Panel::Personality),
+            help: Some(Help::Sign(3)),
+            ..Controls::default()
+        };
+        // Someone selected: the panel stays, and so does its balloon.
+        assert!(!controls.follow(true));
+        assert_eq!(controls.panel, Some(Panel::Personality));
+        assert_eq!(controls.help, Some(Help::Sign(3)));
+        // Nobody: no panel (0x51d06e), and the balloon closes with it.
+        assert!(controls.follow(false));
+        assert_eq!(controls.panel, None);
+        assert_eq!(controls.help, None);
+        assert!(!controls.follow(false));
+        // With no panel open nothing is laid out beside the gadget.
+        let mut s = snapshot();
+        s.house = House {
+            square_feet: 1836,
+            ..House::default()
+        };
+        let items = layout([800, 600], &s, &controls);
+        assert!(!items.iter().any(|i| i.rect.x >= 521 && i.rect.y >= 500));
+        // Someone selected again: the needs open (0x51d082), whichever
+        // panel was open before.
+        assert!(!controls.follow(true));
+        assert_eq!(controls.panel, Some(Panel::Needs));
+        // The house panel closes too.
+        controls.panel = Some(Panel::House);
+        controls.follow(false);
+        assert_eq!(controls.panel, None);
     }
 
     #[test]
@@ -2689,7 +2842,7 @@ mod tests {
         s.family_friends = 4;
         let controls = Controls {
             expanded: true,
-            panel: Panel::Job,
+            panel: Some(Panel::Job),
             ..Controls::default()
         };
         let items = layout([800, 600], &s, &controls);
@@ -2849,7 +3002,7 @@ mod tests {
         };
         let controls = Controls {
             expanded: true,
-            panel: Panel::House,
+            panel: Some(Panel::House),
             ..Controls::default()
         };
         // With nobody selected too.
@@ -2902,7 +3055,7 @@ mod tests {
         s.residents[0].needs = [0, 300, 0, 0, 0, 700];
         let controls = Controls {
             expanded: true,
-            panel: Panel::Job,
+            panel: Some(Panel::Job),
             ..Controls::default()
         };
         let items = layout([800, 600], &s, &controls);

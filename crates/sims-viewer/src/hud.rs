@@ -156,13 +156,18 @@ impl Hud {
             zoom_out: camera.zoom != Zoom::Far,
         };
         let mut snapshot = Snapshot::read(world, &self.members).with_careers(&self.careers);
+        // The viewer plays no sounds, so a balloon this closes closes
+        // silently. The lot's zoning is not read: the snapshot's lot
+        // counts as residential.
+        let selected = snapshot.selected.and_then(|s| snapshot.resident(s));
+        self.controls.follow(selected.is_some());
         // The lookup goes through every neighborhood record, so only
         // while the panel shows it.
-        if self.controls.panel == Panel::Relationships {
+        if self.controls.panel == Some(Panel::Relationships) {
             snapshot = snapshot.with_relations(world, &self.members, &self.known);
         }
         // The house's ratings only while its panel shows.
-        if self.controls.expanded && self.controls.panel == Panel::House {
+        if self.controls.expanded && self.controls.panel == Some(Panel::House) {
             let kinds = self.kinds.get_or_insert_with(|| {
                 let mut kinds = house::Kinds::default();
                 kinds.learn(world, assets.index(), assets.catalog());

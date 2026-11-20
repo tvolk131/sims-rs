@@ -529,6 +529,7 @@ impl Game {
         // it was shown.
         let dialogs = self.lot.asking().map_or(world, |a| &a.world);
         self.hud.read_dialog(dialogs, &self.assets);
+        self.hud.residential = self.lot.residential();
         self.hud.draw(
             world,
             &self.assets,
@@ -537,6 +538,9 @@ impl Game {
             status.as_deref(),
             &mut self.canvas,
         );
+        // The help balloon closed by the selection's going.
+        let sounds = self.hud.take_sounds();
+        self.keep_sounds(sounds);
         let problems = self.hud.take_problems();
         self.people.note(problems);
     }
@@ -1095,6 +1099,7 @@ impl Game {
             }
             Command::TogglePanel
             | Command::OpenPanel(_)
+            | Command::Refused { .. }
             | Command::ShowRelations(_)
             | Command::RelationsPage(_)
             | Command::Help(_) => Outcome::redraw(),

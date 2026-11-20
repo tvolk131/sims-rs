@@ -213,6 +213,10 @@ pub struct Snapshot {
     /// What the house panel shows: nothing until [`Snapshot::with_house`]
     /// works it out.
     pub house: House,
+    /// Whether the lot is residential (0x40745f), which the House button
+    /// needs. The world does not keep the lots' zoning, so the host sets
+    /// it (`sims_vm::Lot::residential`); true until then.
+    pub residential: bool,
 }
 
 /// What the relationship panel needs from outside the world: the
@@ -339,6 +343,7 @@ impl Snapshot {
             relations: Vec::new(),
             superstar: false,
             house: House::default(),
+            residential: true,
         }
     }
 
@@ -813,6 +818,7 @@ mod tests {
             relations: Vec::new(),
             superstar: false,
             house: House::default(),
+            residential: true,
         }
     }
 

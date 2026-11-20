@@ -68,6 +68,9 @@ pub struct Hud {
     texts: Texts,
     /// The household's member GUIDs, in the neighborhood's order.
     members: Vec<u32>,
+    /// Whether the lot is residential (`sims_vm::Lot::residential`),
+    /// which the House button needs. The game sets it before each frame.
+    pub residential: bool,
     pub controls: Controls,
     items: Vec<Item>,
     /// The dialog the world waits on, and the record it was read from
@@ -159,6 +162,7 @@ impl Hud {
             labels,
             texts,
             members,
+            residential: true,
             // The strip opens as if Live had been pressed.
             controls: Controls {
                 expanded: true,
@@ -215,10 +219,24 @@ impl Hud {
     /// the lookup goes through every neighborhood record), or while the
     /// house panel shows (the strip open on it), the house's ratings.
     pub fn snapshot(&self, world: &World) -> Snapshot {
-        let snapshot = Snapshot::read(world, &self.members).with_careers(&self.careers);
+        self.for_panel(self.household(world), world)
+    }
+
+    /// The household with what the next level of each one's career
+    /// needs, and whether the lot is residential.
+    fn household(&self, world: &World) -> Snapshot {
+        let mut snapshot = Snapshot::read(world, &self.members).with_careers(&self.careers);
+        snapshot.residential = self.residential;
+        snapshot
+    }
+
+    /// `snapshot` with what the open panel reads besides.
+    fn for_panel(&self, snapshot: Snapshot, world: &World) -> Snapshot {
         match self.controls.panel {
-            UiPanel::Relationships => snapshot.with_relations(world, &self.members, &self.known),
-            UiPanel::House if self.controls.expanded => {
+            Some(UiPanel::Relationships) => {
+                snapshot.with_relations(world, &self.members, &self.known)
+            }
+            Some(UiPanel::House) if self.controls.expanded => {
                 snapshot.with_house(world, &self.house, &self.kinds)
             }
             _ => snapshot,
@@ -252,11 +270,18 @@ impl Hud {
             zoom_out: camera.zoom != Zoom::Far,
         };
         self.controls.speed = pace.speed;
-        if self.controls.expanded && self.controls.panel == UiPanel::House {
+        // The panel follows the selection first, so that the snapshot
+        // reads what the open panel needs.
+        let household = self.household(world);
+        let selected = household.selected.and_then(|s| household.resident(s));
+        if self.controls.follow(selected.is_some()) {
+            self.play(WHOOSH);
+        }
+        if self.controls.expanded && self.controls.panel == Some(UiPanel::House) {
             self.kinds.learn(world, assets.index(), assets.catalog());
         }
         // The pause button shows global 17, which the game's pause sets.
-        let snapshot = self.snapshot(world);
+        let snapshot = self.for_panel(household, world);
         self.items = hud::layout(view.size, &snapshot, &self.controls);
         hud::fit(&mut self.items, &self.art, &self.texts);
         self.queue = Queue::read(world, snapshot.selected);
@@ -486,6 +511,9 @@ impl Hud {
             return command;
         }
         let command = hud::press(&self.items, point)?;
+        if command == (Command::Refused { error: true }) {
+            self.play(ERROR);
+        }
         let open = self.controls.help.is_some();
         self.controls.apply(&command);
         if self.controls.help.is_some() != open {
