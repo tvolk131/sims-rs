@@ -44,6 +44,7 @@
 
 use crate::fault::Trap;
 use crate::interpreter::{Flow, Machine};
+use crate::visits::function;
 use sims_sim::Dialog;
 
 /// A definition's type word (+0x12), and its value for a person.
@@ -159,9 +160,9 @@ impl Machine<'_, '_> {
     ///
     /// - mode 0 (0x436308): the type of the object the stack object names,
     ///   when it is on the lot, unless the dialog's text named a neighbor
-    ///   whose type it shows instead (0x44bf1a, the text's tokens; not
-    ///   ported, so such a dialog builds the stack object's portrait here:
-    ///   **unverified**);
+    ///   whose type it shows instead. The record's strings are formatted
+    ///   (0x44bf1a, from 0x436219) with a place for a type (`[ebp-0x24]`),
+    ///   which mode 0 reads first ([`Machine::dialog_text_type`]);
     /// - mode 2 (0x4362f4): the type of the neighbor record the stack
     ///   object names (0x425afe: 0x4256f4, record +8);
     /// - modes 1 and 4 to 7 show no person (the type stays 0 from
@@ -184,20 +185,30 @@ impl Machine<'_, '_> {
     /// Which entries have their image is kept in [`sims_sim::World::portraits`].
     /// Only the dialog's builds are counted. The household's panel draws
     /// the family's portraits too, so a family member's type with nobody
-    /// on the lot fails loudly. The person made is not put on a tile: the
-    /// house view's centre is presentation, and the person is removed
-    /// before anything runs. If no tile is found the original removes it
-    /// without drawing it and the entry stays without its image; here the
-    /// image is taken to be built (**unverified**).
+    /// on the lot fails loudly.
+    ///
+    /// The person made is not put on a tile: the house view's centre is
+    /// presentation. The put (virtual function 0x88, 0x45e4e9) is the
+    /// placement 0x433340, which asks the person its function 9 (placed,
+    /// 0x433580) and runs code of the simulation's; a type whose callback
+    /// table names a tree there fails loudly. The rest of the put (the
+    /// rooms, 0x440385, and the tiles, 0x4330d7) is taken to be undone by
+    /// the removal: **unverified**. If no tile is found, the original
+    /// removes the person without drawing it (0x4e9706), and the entry
+    /// stays without its image, to be built again at the next dialog
+    /// (0x4e92a8); here the image is taken to be built (**unverified**).
     pub(crate) fn dialog_portrait(&mut self, operands: &[u8; 8]) -> Result<(), Trap> {
         let stack_object = self.frame()?.stack_object;
         let guid = match (operands[7] >> 1) & 7 {
-            0 => match u16::try_from(stack_object)
-                .ok()
-                .and_then(|id| self.world.objects.get(&id))
-            {
-                Some(object) => object.guid,
-                None => return Ok(()),
+            0 => match self.dialog_text_type(operands)? {
+                Some(guid) => guid,
+                None => match u16::try_from(stack_object)
+                    .ok()
+                    .and_then(|id| self.world.objects.get(&id))
+                {
+                    Some(object) => object.guid,
+                    None => return Ok(()),
+                },
             },
             2 => match self.world.neighbors.get(stack_object) {
                 Some(record) => record.guid,
@@ -240,6 +251,20 @@ impl Machine<'_, '_> {
                      is not kept"
                 )));
             }
+            let placed = crate::interpreter::object_definition(self.catalog, self.world, guid)
+                .and_then(|d| {
+                    let library = self.program.libraries.get(&d.resource)?;
+                    library.callbacks.get(&d.chunk)?.get(function::PLACED)
+                })
+                .map_or(0, |f| f.action);
+            if placed != 0 {
+                return Err(Trap::Unsupported(format!(
+                    "a dialog's portrait of type 0x{guid:08X} with nobody of it on the lot puts a \
+                     person of it on a tile (0x45e4e9, 0x433340), which runs its function 9 \
+                     (tree {placed}, 0x433580); the tile, found from the house view's centre \
+                     (0x4347f0), is not modeled"
+                )));
+            }
             let interpreter = self.interpreter();
             let unsupported = |fault| {
                 Trap::Unsupported(format!(
@@ -256,6 +281,72 @@ impl Machine<'_, '_> {
         }
         self.world.portraits.insert(guid);
         Ok(())
+    }
+
+    /// The strings a dialog's record loads, from STR# 301 of the running
+    /// code's file (0x4360b8 then 0x416920, 0x47028b, then 0x4369de), in
+    /// the order they are formatted (0x44bf1a, 0x436219 to 0x436265): the
+    /// buttons' labels its kind (operand 5) loads (0x436175: kinds 0, 3
+    /// and 4 operand 3, kind 1 operands 4 and 3, kind 2 operands 0, 4 and
+    /// 3), formatted in the order operand 3, 4, 0; then the title
+    /// (operand 6) and the message (operand 2). A string is named by its
+    /// number from 1. One the file lacks, and a button's default label
+    /// (number 0, 0x435f4e), are left out: taken to hold no token
+    /// (**unverified**).
+    pub(crate) fn dialog_strings(&self, operands: &[u8; 8]) -> Result<Vec<String>, Trap> {
+        let owner = self.owner(self.frame()?)?;
+        let strings = self
+            .program
+            .libraries
+            .get(&owner)
+            .and_then(|library| library.strings.get(&301));
+        let buttons: &[usize] = match operands[5] & 0x7f {
+            0 | 3 | 4 => &[3],
+            1 => &[3, 4],
+            2 => &[3, 4, 0],
+            _ => &[],
+        };
+        Ok(buttons
+            .iter()
+            .chain(&[6, 2])
+            .filter_map(|&operand| {
+                let index = usize::from(operands[operand]).checked_sub(1)?;
+                strings?.get(index).cloned()
+            })
+            .collect())
+    }
+
+    /// The type the formatter (0x44bf1a) finds in a dialog record's
+    /// strings ([`Machine::dialog_strings`]), each formatted in turn with
+    /// the same place for it (`[ebp-0x24]`, cleared at 0x43620d), so the
+    /// last one found is kept. Only two tokens write it:
+    ///
+    /// - `$Object` (0x6e5050, from 0x6c407c; 0x44c155 to 0x44c1af): the
+    ///   type of the object the stack object names (frame +4), when there
+    ///   is one;
+    /// - `$Neighbor` (0x6e5090, from 0x6c4054; 0x44c65f to 0x44c69f): the
+    ///   type of the neighbor record the stack object names (0x425afe),
+    ///   when there is one. Its pass comes after `$Object`'s, so it wins
+    ///   in a string that holds both.
+    ///
+    /// The other tokens' text is presentation, and is not worked out.
+    pub(crate) fn dialog_text_type(&self, operands: &[u8; 8]) -> Result<Option<u32>, Trap> {
+        let stack_object = self.frame()?.stack_object;
+        let object = u16::try_from(stack_object)
+            .ok()
+            .and_then(|id| self.world.objects.get(&id))
+            .map(|object| object.guid);
+        let neighbor = self.world.neighbors.get(stack_object).map(|r| r.guid);
+        let mut found = None;
+        for text in self.dialog_strings(operands)? {
+            if text.contains("$Object") && object.is_some() {
+                found = object;
+            }
+            if text.contains("$Neighbor") && neighbor.is_some() {
+                found = neighbor;
+            }
+        }
+        Ok(found)
     }
 
     fn set_temp(&mut self, temp: usize, value: i16) -> Result<(), Trap> {

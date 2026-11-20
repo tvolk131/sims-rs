@@ -139,3 +139,82 @@ fn a_portrait_the_port_cannot_tell_was_built_fails_loudly() {
     let fault = inform(&mut fx, 2, record).unwrap_err().to_string();
     assert!(fault.contains("0x6f2698"), "{fault}");
 }
+
+#[test]
+fn a_portrait_whose_person_runs_code_when_put_down_fails_loudly() {
+    // The person made is put on a tile (0x45e4e9, 0x433340), which asks
+    // it its function 9 (0x433580). The tile is not modeled.
+    let (mut fx, file, record) = visitors();
+    let library = fx.program.libraries.get_mut(&file).unwrap();
+    for table in library.callbacks.values_mut() {
+        table.resize(
+            10,
+            sims_formats::execution::ObjectFunction {
+                condition: 0,
+                action: 0,
+            },
+        );
+        table[9].action = 4200;
+    }
+    let objects = fx.world.objects.clone();
+    let fault = inform(&mut fx, 2, record).unwrap_err().to_string();
+    assert!(
+        fault.contains("0x433580") && fault.contains("tree 4200"),
+        "{fault}"
+    );
+    assert!(fx.world.portraits.is_empty());
+    assert_eq!(
+        fx.world.objects.keys().collect::<Vec<_>>(),
+        objects.keys().collect::<Vec<_>>(),
+        "nobody was made"
+    );
+}
+
+#[test]
+fn a_dialogs_text_can_show_the_stack_objects_neighbor_instead() {
+    // Mode 0 shows first the type the formatter (0x44bf1a) found in the
+    // record's strings, formatted in the order button (operand 3), title
+    // (operand 6), message (operand 2): `$Neighbor` gives the stack
+    // object's neighbor record's type, `$Object` the stack object's, and
+    // the last found is kept. With neither, the stack object's (0x436308).
+    let strings = ["Hello", "$Neighbor", "$Object", "$Object then $Neighbor"];
+    for ((label, title, message), shown) in [
+        ((0, 0, 1), SIM_GUID),
+        ((0, 0, 2), WIDGET),
+        ((2, 3, 0), SIM_GUID),
+        ((3, 0, 2), WIDGET),
+        ((0, 0, 4), WIDGET),
+    ] {
+        // The person (2) is the stack object, and neighbor record 2 is of
+        // the widget's type, with nobody of it on the lot.
+        let (mut fx, _, record) = visitors();
+        let neighbor = fx.world.neighbors.slots[record as usize - 1].clone();
+        let slots = &mut fx.world.neighbors.slots;
+        slots.resize(slots.len().max(2), None);
+        slots[usize::from(SIM) - 1] = neighbor;
+        fx.world.people = vec![SIM];
+        fx.program
+            .libraries
+            .get_mut(&LAMP_FILE)
+            .unwrap()
+            .strings
+            .insert(301, strings.map(str::to_owned).to_vec());
+        fx.add(
+            LAMP_FILE,
+            4096,
+            tree(vec![ins(
+                DIALOG,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [0, 0, message, label, 0, 0, title, 1],
+            )]),
+        );
+        let ran = fx.run_with(LAMP, 4096, SIM as i16, &[], 1000);
+        assert_eq!(ran, Ok(true), "{label} {title} {message}");
+        assert_eq!(
+            fx.world.portraits,
+            [shown].into(),
+            "{label} {title} {message}"
+        );
+    }
+}

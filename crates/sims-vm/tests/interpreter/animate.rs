@@ -2431,6 +2431,25 @@ fn a_step_both_ways_that_differs_fails_loudly() {
 }
 
 #[test]
+fn a_step_both_ways_that_fails_keeps_neither_run() {
+    // Find Location For moves the person and takes it off the lot again,
+    // which would leave another refresh pending: the step fails, and
+    // neither run is kept. The lot is as the take-off left it, as when the
+    // step after it fails before it writes anything.
+    let off_again = ins(16, RETURN_TRUE, RETURN_FALSE, [1, 0, 0, 0, 0, 0, 0, 0]);
+    let mut fx = taking_itself_off(off_again);
+    let fault = tick(&mut fx).unwrap_err().to_string();
+    assert!(
+        fault.contains("opcode 16") && fault.contains("takes a person off the lot"),
+        "{fault}"
+    );
+    let mut stopped = taking_itself_off(ins(255, RETURN_TRUE, RETURN_FALSE, [0; 8]));
+    let fault = tick(&mut stopped).unwrap_err().to_string();
+    assert!(fault.contains("unimplemented primitive 255"), "{fault}");
+    assert_eq!(fx.world.hash(), stopped.world.hash());
+}
+
+#[test]
 fn after_taking_itself_off_a_person_may_remove_itself_and_yield() {
     // The removal's take-off refreshes the animator again (0x442d70,
     // 0x433125, 0x58da12) in the same branch as the first: both refreshes

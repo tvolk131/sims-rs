@@ -35,12 +35,15 @@ between (`placement::reads_no_animator`), and any other primitive failed.
 Now any other primitive, except Remove Object Instance (which checks for
 itself), runs twice (`Machine::step_both_ways`, `crates/sims-vm/src/both_ways.rs`):
 
-- once on the lot as it is;
+- once on a copy of the lot as it is;
 - once on a copy that has the refreshed animator.
 
-Both runs must give the same result and leave the same lot, apart from
-that person's animator. They must also leave the same in every cell the
-machine shares with the rest of the tick:
+Each run also has its own copies of every cell the machine shares with
+the rest of the tick (`both_ways::Cells`). Both runs must give the same
+result and leave the same lot, apart from that person's animator. The
+lots are compared by their encodings and by each thread's count of
+restarts, which the encoding leaves out. The runs must also leave the
+same in every cell:
 
 - the questions asked;
 - the objects deleted;
@@ -49,13 +52,26 @@ machine shares with the rest of the tick:
 - the action run at once;
 - the objects let go;
 - the objects being deleted;
-- the people another object took off.
+- the people another object took off;
+- the refresh pending.
+
+The cells are compared as written out (`Debug`), so that an action's
+floats compare bit for bit rather than by `==`.
 
 If they do, the original reached the same state whichever branch it took.
-The lot goes on with the first run, and both animators are kept, as each
-run left them, for the animator's tick to settle. If the runs differ, or
-either run takes a person off the lot (which would leave another refresh
-pending), the step fails loudly and names 0x58da12 and byte +0x109.
+The lot and the cells go on with the first run, and both animators are
+kept, as each run left them, for the animator's tick to settle. If the
+runs differ, or either run takes a person off the lot (itself, which
+leaves a refresh pending in its copy, or another, which changes its copy
+of the people taken off), the step fails loudly and names 0x58da12 and
+byte +0x109. Neither run is kept then: the lot and the cells are as they
+were before the step.
+
+The refresh itself (`Interpreter::refresh_at_take_off`) and the
+animator's tick that settles the two animators
+(`Interpreter::tick_animator_after_take_off`) work the same way. Each
+branch runs on its own copies of the lot and the cells, and they must
+agree in all of them. The tick alone is kept only when they do.
 
 This stands in for the branch the original took, which is not known. It
 is not a substitute for the refresh's timing, which is ported. Strict
@@ -66,8 +82,14 @@ stops the run.
 and checks that the step fails. In it, a clip's timed event is due at
 the clock the refresh reads, so only the refreshed animator has the event
 queued. Animate Sim then takes the event on one run and waits on the
-other. `after_taking_itself_off_a_step_that_agrees_both_ways_goes_on`
-is the agreeing case.
+other. `a_step_both_ways_that_fails_keeps_neither_run` has a step that
+takes the person off the lot again, and checks that the lot is left as
+the take-off left it.
+`after_taking_itself_off_a_step_that_agrees_both_ways_goes_on` is the
+agreeing case. A run can take another person off only through Remove
+Object Instance, which never runs both ways, or a tree that a primitive
+run both ways calls. No synthetic test reaches that case. The check is
+there so that such a run fails rather than passes.
 
 The refresh lasts only for the person's own tick (`Refreshing`), and the
 people another object took off last only for the scheduler pass
@@ -124,14 +146,37 @@ no image yet, so a cat was made and removed. That accounts for the
 
 What is not ported:
 
-- **Text tokens.** In mode 0, the dialog's text can name a neighbor whose
-  portrait is shown instead (0x44bf1a). Text is not modeled, so the port
-  builds the stack object's portrait. **Unverified.**
-- **Placement.** The person made is not put on a tile, because the house
-  view's centre is presentation. Nothing runs between the put and the
-  removal. If the original finds no tile, it removes the person without
-  drawing it, and the entry stays without its image. The port counts the
-  image as built. **Unverified.**
+- **Text tokens.** This part is ported. The record's strings come from
+  STR# 301 of the running code's file (0x4360b8, 0x47028b):
+  - the buttons' labels its kind loads (0x436175);
+  - the title (operand 6);
+  - the message (operand 2).
+
+  Each string is formatted in that order (0x44bf1a, from 0x436219 to
+  0x436265), with one place for a type, cleared first (0x43620d). Only
+  two tokens write that place:
+  - `$Object` (0x44c1af) gives the stack object's type;
+  - `$Neighbor` (0x44c69f) gives the type of the neighbor record that
+    the stack object names (0x425afe). Its pass comes after `$Object`'s.
+
+  The last type found is kept, and mode 0 shows it in place of the stack
+  object's (0x436308). Mode 2 does not read it. Two kinds of string are
+  taken to hold no token, which is **unverified**: a string the file
+  lacks, and a button's default label (0x435f4e). The first version of
+  this change failed on any `$` in a mode 0 dialog's strings. On the Goth
+  house that stopped the run at update 901 (object 8, tree 0x101d), so
+  the tokens that give the type are ported instead.
+- **Placement.** The person made is not put on a tile, because the tile is
+  found from the house view's centre (0x4347f0), which is presentation.
+  - The put (virtual function 0x88, 0x45e4e9) is the placement 0x433340.
+    That asks the person its function 9 (0x433580), so a type whose
+    callback table names a tree there fails loudly.
+  - The rest of the put (the rooms, 0x440385; the tiles, 0x4330d7) is
+    taken to be undone by the removal. **Unverified.**
+  - If the original finds no tile, it removes the person without drawing
+    it (0x4e9706). The entry then stays without its image, and 0x4e92a8
+    builds it again at the next dialog. The port counts the image as
+    built. **Unverified.**
 - **Other builders.** Only the dialog's builds are counted. The household
   panel draws the family's portraits, so a portrait of a family member's
   type with nobody of it on the lot fails loudly. A type made while the

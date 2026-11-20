@@ -54,7 +54,7 @@ pub(crate) use find::{
 /// A person's own tick while its thread runs: the person, and the
 /// animator refresh its taking itself off the lot left pending
 /// ([`Interpreter::take_self_off`]).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Refreshing {
     pub person: u16,
     pub pending: Option<Pending>,
