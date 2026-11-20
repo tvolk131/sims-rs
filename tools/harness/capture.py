@@ -755,8 +755,13 @@ def main():
             event(kind='watch_armed', name=w.name, expr=w.text, late=w in args.late_watch, lot=lot,
                   address=w.address, value=w.value, update=updates)
 
-    def retire_elsewhere():
-        """At a stop on another lot: take each moving late watch off, to wait to be set again here."""
+    def retire_elsewhere(lot):
+        """At a stop on another lot (`lot`, None if it cannot be read): take each moving late watch
+        off, to wait to be set again here. The simulator last seen is not used for them again until
+        this lot's next entry or return, so a stop here before then (at a dialog breakpoint) cannot
+        set one through another lot's simulator."""
+        nonlocal sim_lot
+        sim_lot = lot
         for w in list(live_watches):
             if w.moves and w in args.late_watch:
                 hardware_remove(w.address, w.size)
@@ -766,14 +771,14 @@ def main():
                 w.address = w.value = None
                 pending.append(w)
 
-    def check_watches(m, here):
+    def check_watches(m, here, lot):
         """At a stop in the game, work out the moving watches again: move a
         watchpoint whose address changed, and put one that cannot be worked
         out (or read) back to wait. A late watch only at a stop on this lot:
         at a stop on another, a moving late watch is taken off and waits to be
         set again here (its address may be another lot's object's by then)."""
         if not here:
-            retire_elsewhere()
+            retire_elsewhere(lot)
         for w in list(live_watches):
             if not w.moves:
                 continue
@@ -799,23 +804,23 @@ def main():
             # The same virtual address in another process.
             event(kind='foreign_watch', address=hit, pc=regs['eip'], cr3=regs['cr3'], update=updates)
             return
-        nonlocal sim_lot
         try:
             lot = m.lot()
         except MemoryError:
             lot = None
         # One row per watch on the written bytes (one with name null if none is), matched against
         # the watches as they were set when the write was made.
-        hits = [w for w in live_watches if w.address == hit] or [w for w in live_watches if w.address <= hit < w.address + w.size]
+        candidates = list(live_watches)
         if lot != args.lot:
             # A write at a stop on another lot (before its next entry or dialog breakpoint) is not
-            # this lot's object's: it is not logged under a moving late watch's name, and those
+            # this lot's object's: it is not matched to a moving late watch (before the exact and
+            # range matches, so one cannot hide an ordinary watch on the same bytes), and those
             # watches are taken off, as at any stop there (the address may be another lot's object's
             # by then). The simulator last seen is not used for them again until this lot's next
             # entry or return. Other watches are worked out again at the next breakpoint, as always.
-            hits = [w for w in hits if not (w.moves and w in args.late_watch)]
-            retire_elsewhere()
-            sim_lot = lot
+            candidates = [w for w in candidates if not (w.moves and w in args.late_watch)]
+            retire_elsewhere(lot)
+        hits = [w for w in candidates if w.address == hit] or [w for w in candidates if w.address <= hit < w.address + w.size]
         for w in hits or [None]:
             # Taken over off a breakpoint, whether the guest is in a lot update is not known until its
             # next entry or return (in_update None): the write is in update `updates` or `updates` + 1,
@@ -937,7 +942,7 @@ def main():
             lot = None
         here = lot == args.lot
         if live_watches:
-            check_watches(m, here)
+            check_watches(m, here, lot)
         if pending:
             arm_watches(m, here, lot)
 
