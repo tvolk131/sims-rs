@@ -157,55 +157,44 @@ Things to know:
   A dump holds the whole game, about 320 MB, so keep the list short. The
   dumps let a routine of the original be run alone on real memory.
 - **Write watchpoints.** `--watch NAME=EXPR[:SIZE]` (repeatable) sets a
-  hardware write watchpoint on SIZE bytes (1, 2, 4 or 8; default 4) and logs
-  every write to them to `watch.jsonl`. EXPR starts with a hexadecimal
-  address, `object:<id>` (the object with that ID) or `person:<id>` (the
-  same, once it is a person), followed by steps: `+HEX` adds, `@HEX` reads
-  the word at the address plus HEX. For example `dir=person:259@0xadc+0x88`
-  watches the direction of person 259's animator. The watchpoint is set as
-  soon as the address can be worked out. With `--watch` the lot update's
-  entry and return stay armed, so each write can be placed inside or
-  outside an update. Each logged write holds the writer's registers, its
-  return addresses along the frame-pointer chain, the bytes before and
-  after, and the update it falls in.
+  hardware write watchpoint on SIZE bytes (1, 2, 4 or 8, default 4). Watches
+  are armed and sampled from the baseline, the first lot update that
+  establishes the game's CR3. A watch stop before then logs `unknown_watch`.
+  A watch stop in another CR3 logs `foreign_watch`. Both events leave
+  `watch.jsonl` and the sampled values alone.
 
-  Once the game's CR3 is known (at the first lot update), a write by another
-  process to the same virtual address, including one found while stepping
-  past a breakpoint, is logged as a `foreign_watch` event, not in
-  `watch.jsonl`. A watch through an object or a pointer is worked out again
-  at every stop in the game. If the address moved (an animator was
-  replaced), the watchpoint moves too (`watch_moved`). If it cannot be worked
-  out or read, it waits again (`watch_lost`). Writes between the change and
-  that stop are missed. Watches on the same bytes share a watchpoint, and a
-  write to them is logged once for each watch.
+  EXPR starts with a hexadecimal address, `object:<id>` or `person:<id>`.
+  A `+HEX` step adds an offset and `@HEX` reads the word at that offset.
+  For example, `dir=person:259@0xadc+0x88` watches the direction of person
+  259's animator. A resolved address is armed when available. A moving
+  address can produce `watch_moved` or `watch_lost` as it is resolved again
+  at stops. `--late-watch FROM[-TO],NAME=EXPR[:SIZE]` starts at the end of
+  update FROM - 1 (at the baseline for FROM 1) and ends at the end of TO,
+  if given. It is armed or moved only on the captured lot.
 
-  QEMU's stop gives the base of the watchpoint that fired, not the bytes
-  written. Which watchpoint fires, and whether it was written at all,
-  depends on how QEMU split and checked the store. In QEMU 7.2 the newest
-  watchpoint a check overlaps fires. An unaligned store on a watched page
-  can be checked from the page's base. One instruction may be several
-  stores. So each row's `match` says only what the stop and memory show:
-  - `named`: the watch is on the watchpoint whose base the stop gives. It
-    is `one_of` when several watchpoints share that base.
-  - `changed`: the watch's value is not the one last seen. This store may
-    have written it, or an earlier write that stopped nothing (through
-    another mapping of the same memory). The new value is taken up, so a
-    change is logged once.
-  - `at`: the stop gives no watchpoint's base (QEMU never does this), and
-    the watch holds the address.
+  Each `watch.jsonl` row is an observation at a watch stop, with registers,
+  frames, before and after samples when available, and lot update context.
+  `address` is the watchpoint base reported by the stop. The base and
+  samples do not identify which bytes an instruction wrote. QEMU 7.2 fires
+  the newest watchpoint a check overlaps, and an instruction can trigger
+  several checks. The `match` field records what was observed.
 
-  A watch that is not on the base the stop gives and kept its value has no
-  row, even if the store wrote it the value it held: the stop does not
-  show that.
+  - `named` means one watchpoint has the reported base. `one_of` means
+    several watchpoints share it.
+  - `changed` means the value differs from the last sample. This change
+    may have happened before the stop.
+  - `at` means the watch's range contains the reported address and no
+    watchpoint has that base.
 
-  When a step over a breakpoint stops on a watchpoint, QEMU gives a second,
-  plain stop at the next instruction on the following resume. A plain trap
-  (`T05`, no watch) at the pc, CR3 and thread the step left is logged as
-  `step_after_watch` and passed over; any other stop is dealt with as usual.
-  Before the game's process is known (its first lot update), a stop whose
-  lot cannot be read sets no watch, and a watch stop there is logged as
-  `unknown_watch`, with no row and no value taken. Its memory may be
-  another process's.
+  QEMU can leave a plain trap pending after a step hits a watchpoint.
+  The capture saves the stop's PC, CR3 and thread in `status.json` for
+  `--resume`. Off a breakpoint, a plain `T05` at that stop is logged as
+  `step_after_watch` and passed over. The trap must match the saved thread
+  ID exactly, including any process prefix. Two missing IDs also match.
+  A reattach reply without a thread leaves that check to the next trap.
+  A plain `T05` with unchanged EIP and CR3 during a breakpoint step logs
+  `step_swallowed` and triggers one retry. A second unchanged result ends
+  the capture with an error.
 
 ## Scripted input
 
@@ -359,7 +348,7 @@ python3 -B -m unittest discover -s tools/harness -p 'test_*.py'
 | `updates.jsonl` | One line per lot update: the tick, whether it was a full pass, the three random streams and the scheduler cursor; with `--around` or `--before-hour` also the clock, the date and the object count, and for a saved update why it was saved. |
 | `events.jsonl` | The dialog functions passed (each record, its status and modal byte; a result also has `result`), the baseline, other stops, the game's identity (`game_identity`), the watch events, and with `--around` the objects that appeared or left (`objects_changed`), the hours turned (`hour_turned`) and the presses of `--answer-stuck` (`dialog_auto_answer`). |
 | `dump-NNNN/` | With `--dump`: the user memory at the entry of lot update N. `ranges.json` lists the ranges (start, size, protection, file); `registers.json` holds the stop's registers and the stub's whole register packet. |
-| `watch.jsonl` | With `--watch`: one line per write to a watched address (see above). |
+| `watch.jsonl` | With `--watch` or `--late-watch`, observations at watch stops from the baseline onward, with the reported watchpoint base and match. |
 | `status.json` | Progress, and `game_identity`: the digests `launch.sh` verified, or null if the game was not started by it. |
 | `input-log.txt` | Every press made, with its time (written by `answer.sh`). |
 | `input.jsonl` | With `--scenario`: the steps, the guest commands, the pie menus and every action the pie menu queued, each with its lot update (see Scripted input). |

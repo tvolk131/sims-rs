@@ -34,7 +34,9 @@ class FakeRemote:
     """A stub that stops at the given stops in turn. A stop is a dict: pc,
     and optionally cr3, reply (the stop reply), animator (person 259's
     animator pointer while stopped there), and step (the reply to stepping
-    past it, with step_cr3 the CR3 after the step)."""
+    past it, with step_pc and step_cr3 the registers after the step).
+    pending_traps counts traps that can interrupt a step or resume without
+    executing an instruction. The attach query itself leaves them pending."""
 
     def __init__(self, stops):
         self.stops = iter(stops)
@@ -44,11 +46,13 @@ class FakeRemote:
         self.watch_calls = []
         self.cleared_watches = []
         self.watch_stops = []  # (set or clear, the pc stopped at)
+        self.memory_reads = []  # (pc, address)
+        self.step_calls = []  # (pc, whether its breakpoint is armed)
         self.armed = set()  # the breakpoints set
         self.resumed_armed = []  # the breakpoints set at each resume
 
     def stop_reply(self):
-        return 'T05'
+        return self.current.get('attach_reply', 'T05')
 
     def clear_break(self, a):
         self.armed.discard(a)
@@ -69,9 +73,15 @@ class FakeRemote:
         self.stopped = False
 
     def wait(self):
-        self.current = next(self.stops)
         self.stopped = True
+        if self.current.get('pending_traps'):
+            return self.pending_trap()
+        self.current = next(self.stops)
         return self.current.get('reply', 'T05')
+
+    def pending_trap(self):
+        self.current = dict(self.current, pending_traps=self.current['pending_traps'] - 1)
+        return self.current.get('pending_reply', 'T05')
 
     def registers(self):
         regs = dict(eip=self.current['pc'], ecx=0x20000, ebx=0x20000, ebp=0x90000, esp=0x90010)
@@ -81,12 +91,13 @@ class FakeRemote:
         return regs, raw
 
     def step(self):
+        pc = self.current['pc']
+        self.step_calls.append((pc, pc in self.armed))
+        if self.current.get('pending_traps'):
+            return self.pending_trap()
         reply = self.current.get('step', 'T05')
-        if 'step_cr3' in self.current:
-            self.current = dict(self.current, cr3=self.current['step_cr3'])
-        if 'step_pc' in self.current:
-            # The instruction after the one stepped over.
-            self.current = dict(self.current, pc=self.current['step_pc'])
+        self.current = dict(self.current, pc=self.current.get('step_pc', pc + 1),
+                            cr3=self.current.get('step_cr3', self.current.get('cr3', GAME_CR3)))
         return reply
 
     def detach(self):
@@ -127,6 +138,7 @@ class FakeMemory:
         return 1
 
     def read(self, p, n):
+        self.remote.memory_reads.append((self.remote.current['pc'], p))
         if p == self.remote.current.get('unreadable'):
             raise MemoryError(f'read {p:#x}')
         # The bytes this stop has written (`bytes`, by address); every other byte is 0.
@@ -658,13 +670,31 @@ class CaptureTest(unittest.TestCase):
         # Stepping past the entry breakpoint writes the watched word: QEMU
         # gives the watch stop, then, at the next resume, a plain stop at
         # the instruction after.
-        remote, output, _ = self.run_capture([
-            dict(pc=0), dict(pc=capture.ENTRY, step='T05watch:70088;', step_pc=0x4100,
-                             bytes={0x70088: 1}),
-            dict(pc=0x4100, reply='T05'), dict(pc=capture.RETURN)],
-            ['--updates', '1', '--watch', 'state=0x70088'])
-        self.assertEqual([r['name'] for r in self.rows(output / 'watch.jsonl')], ['state'])
-        self.assertEqual([r['pc'] for r in self.events(output, 'step_after_watch')], [0x4100])
+        for thread in ('', 'thread:1;', 'thread:p1.1;'):
+            with self.subTest(thread=thread):
+                _, output, _ = self.run_capture([
+                    dict(pc=0), dict(pc=capture.ENTRY, step='T05watch:70088;' + thread,
+                                     step_pc=0x4100, bytes={0x70088: 1}),
+                    dict(pc=0x4100, reply='T05' + thread), dict(pc=capture.RETURN)],
+                    ['--updates', '1', '--watch', 'state=0x70088'])
+                self.assertEqual([r['name'] for r in self.rows(output / 'watch.jsonl')], ['state'])
+                self.assertEqual([r['pc'] for r in self.events(output, 'step_after_watch')], [0x4100])
+                self.assertIsNone(json.loads((output / 'status.json').read_text())['stepped_to'])
+
+    def test_a_plain_stop_with_a_different_thread_after_a_stepped_watch_is_unexpected(self):
+        for stepped_thread, next_thread in (
+            ('thread:1;', 'thread:2;'),
+            ('thread:p1.1;', 'thread:p2.1;'),
+            ('thread:p1.1;', 'thread:1;'),
+            ('thread:p1.1;', ''),
+        ):
+            with self.subTest(stepped_thread=stepped_thread, next_thread=next_thread):
+                with self.assertRaisesRegex(RuntimeError, 'unexpected stop at 0x4100'):
+                    self.run_capture([
+                        dict(pc=0), dict(pc=capture.ENTRY, step='T05watch:70088;' + stepped_thread,
+                                         step_pc=0x4100),
+                        dict(pc=0x4100, reply='T05' + next_thread)],
+                        ['--updates', '1', '--watch', 'state=0x70088'])
 
     def test_a_plain_stop_elsewhere_after_a_step_that_hit_a_watchpoint_is_still_unexpected(self):
         with self.assertRaisesRegex(RuntimeError, 'unexpected stop at 0x123456'):
@@ -699,28 +729,94 @@ class CaptureTest(unittest.TestCase):
         self.assertEqual(self.events(output, 'step_after_watch'), [])
         self.assertEqual(len(self.rows(output / 'updates.jsonl')), 1, 'the return breakpoint was dealt with')
 
-    def test_before_the_games_process_is_known_a_watch_stop_whose_lot_cannot_be_read_is_not_the_games(self):
-        # Set at a readable dialog before the first update, then hit at the
-        # same address in another process whose lot cannot be read: its bytes
-        # are not taken as the watch's value.
-        remote, output, _ = self.run_capture([
-            dict(pc=0), dict(pc=capture.DIALOG_SHOW),
-            dict(pc=0x123456, reply='T05watch:70088;', cr3=OTHER_CR3, lot_unreadable=True,
-                 bytes={0x70088: 0x64}),
-            dict(pc=capture.ENTRY, bytes={0x70088: 0x64}), dict(pc=capture.RETURN, bytes={0x70088: 0x64})],
+    def test_takeover_off_a_breakpoint_passes_over_the_saved_pending_trap(self):
+        _, original, _ = self.run_capture([
+            dict(pc=0), dict(pc=capture.ENTRY),
+            dict(pc=capture.RETURN, step='T05watch:70088;thread:p1.1;', step_pc=0x4100)],
             ['--updates', '1', '--watch', 'state=0x70088'])
-        self.assertEqual(self.rows(output / 'watch.jsonl'), [])
-        self.assertEqual(len(self.events(output, 'unknown_watch')), 1)
+        self.assertEqual(json.loads((original / 'status.json').read_text())['stepped_to'],
+                         [0x4100, GAME_CR3, 'p1.1'])
 
-    def test_before_the_games_process_is_known_an_unreadable_stop_sets_nothing(self):
+        def prepare(output):
+            for name in ('events.jsonl', 'updates.jsonl', 'watch.jsonl', 'status.json'):
+                (output / name).write_bytes((original / name).read_bytes())
+
+        _, output, _ = self.run_capture([
+            dict(pc=0x4100, pending_traps=1, pending_reply='T05thread:p1.1;'),
+            dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
+            ['--updates', '2', '--resume', '--watch', 'state=0x70088'], prepare=prepare)
+        self.assertEqual([r['pc'] for r in self.events(output, 'took_over_off_break')], [0x4100])
+        self.assertEqual([r['pc'] for r in self.events(output, 'step_after_watch')], [0x4100])
+        self.assertEqual([r['update'] for r in self.rows(output / 'updates.jsonl')], [1, 2])
+        self.assertEqual(len(self.rows(output / 'watch.jsonl')), 1)
+        self.assertIsNone(json.loads((output / 'status.json').read_text())['stepped_to'])
+
+    def test_takeover_discards_a_pending_trap_for_a_different_stop(self):
+        def prepare(output):
+            (output / 'events.jsonl').write_text(json.dumps(dict(kind='baseline', cr3=GAME_CR3)) + '\n')
+            (output / 'status.json').write_text(json.dumps(dict(stepped_to=[0x4100, GAME_CR3, 'p1.1'])))
+
+        for attached in (
+            dict(pc=0x4101, attach_reply='T05thread:p1.1;'),
+            dict(pc=0x4100, cr3=OTHER_CR3, attach_reply='T05thread:p1.1;'),
+            dict(pc=0x4100, attach_reply='T05thread:p2.1;'),
+        ):
+            with self.subTest(attached=attached):
+                with self.assertRaisesRegex(RuntimeError, 'unexpected stop at 0x4100'):
+                    self.run_capture([attached, dict(pc=0x4100, reply='T05thread:p1.1;')],
+                                     ['--updates', '1', '--resume', '--watch', 'state=0x70088'], prepare=prepare)
+
+    def test_takeover_at_a_return_retries_the_step_without_recording_the_return_twice(self):
+        def prepare(output):
+            (output / 'events.jsonl').write_text(json.dumps(dict(kind='baseline', cr3=GAME_CR3)) + '\n')
+            (output / 'status.json').write_text(json.dumps(dict(stepped_to=[capture.RETURN, GAME_CR3, 'p1.1'])))
+
+        remote, output, _ = self.run_capture([
+            dict(pc=capture.RETURN, attach_reply='T05thread:p1.1;', pending_traps=1,
+                 pending_reply='T05thread:p1.1;'),
+            dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
+            ['--updates', '2', '--resume', '--watch', 'state=0x70088'], prepare=prepare)
+        self.assertEqual(remote.step_calls, [(capture.RETURN, False), (capture.RETURN, False),
+                                             (capture.ENTRY, False), (capture.RETURN, False)])
+        self.assertEqual([r['pc'] for r in self.events(output, 'step_swallowed')], [capture.RETURN])
+        self.assertEqual([r['update'] for r in self.rows(output / 'updates.jsonl')], [1, 2])
+        self.assertEqual(len(self.events(output, 'took_over_at_return')), 1)
+        self.assertIsNone(json.loads((output / 'status.json').read_text())['stepped_to'])
+
+    def test_a_step_whose_retry_is_swallowed_fails(self):
+        with patch.object(FakeRemote, 'step', autospec=True, side_effect=FakeRemote.step) as step:
+            with self.assertRaisesRegex(RuntimeError, 'left EIP and CR3 unchanged after retry'):
+                self.run_capture([dict(pc=0), dict(pc=capture.ENTRY, pending_traps=2)],
+                                 ['--updates', '1', '--watch', 'state=0x70088'])
+        self.assertEqual(step.call_count, 2)
+
+    def test_before_the_games_process_is_known_a_watch_stop_is_unknown(self):
+        for unreadable in (False, True):
+            with self.subTest(unreadable=unreadable):
+                remote, output, _ = self.run_capture([
+                    dict(pc=0), dict(pc=0x123456, reply='T05watch:70088;', cr3=OTHER_CR3,
+                                     lot_unreadable=unreadable, bytes={0x70088: 0x64}),
+                    dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
+                    ['--updates', '1', '--watch', 'state=0x70088'])
+                self.assertEqual(self.rows(output / 'watch.jsonl'), [])
+                self.assertEqual([(r['address'], r['cr3']) for r in self.events(output, 'unknown_watch')],
+                                 [(0x70088, OTHER_CR3)])
+                self.assertNotIn((0x123456, 0x70088), remote.memory_reads)
+
+    def test_no_watch_is_armed_or_sampled_before_the_baseline(self):
         # A dialog breakpoint in another process, before the first lot
-        # update: its bytes at 0x70088 are not the game's.
+        # update, with a readable lot and different bytes at 0x70088.
         remote, output, _ = self.run_capture([
             dict(pc=0),
-            dict(pc=capture.DIALOG_SHOW, cr3=OTHER_CR3, lot_unreadable=True, bytes={0x70088: 0x64}),
-            dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
+            dict(pc=capture.DIALOG_SHOW, cr3=OTHER_CR3, bytes={0x70088: 0x64}),
+            dict(pc=capture.ENTRY, bytes={0x70088: 1}),
+            dict(pc=0x123456, reply='T05watch:70088;', bytes={0x70088: 2}),
+            dict(pc=capture.RETURN)],
             ['--updates', '1', '--watch', 'state=0x70088'])
-        self.assertNotIn(('set', capture.DIALOG_SHOW), remote.watch_stops)
+        self.assertEqual([pc for action, pc in remote.watch_stops if action == 'set'], [capture.ENTRY])
+        self.assertNotIn((capture.DIALOG_SHOW, 0x70088), remote.memory_reads)
+        self.assertEqual([(r['before'], r['after']) for r in self.rows(output / 'watch.jsonl')],
+                         [('01000000', '02000000')])
 
     def test_a_run_taken_over_at_a_breakpoint_whose_lot_cannot_be_read_sets_an_ordinary_watch(self):
         # As off a breakpoint: taken over at a dialog's breakpoint with the
@@ -749,7 +845,7 @@ class CaptureTest(unittest.TestCase):
             [dict(pc=0), dict(pc=capture.ENTRY, lot=7), dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
             ['--updates', '1', '--watch', 'state=0x70088'])
         armed = self.events(output, 'watch_armed')
-        self.assertEqual([r['lot'] for r in armed], [7])
+        self.assertEqual([r['lot'] for r in armed], [5])
 
     def test_a_late_watch_is_set_only_at_a_stop_on_the_lot(self):
         # Taken over after update 1: stops on lot 7 (an entry and a return
