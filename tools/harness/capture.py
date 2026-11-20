@@ -13,7 +13,8 @@ detached) and continues the same output directory and numbering.
 
 Breakpoints (hardware, in QEMU's stub; no guest memory or register is
 written): the lot update's entry 0x46d345 (until the first one on the lot,
-and again while a watch or a due --dump needs it; see below) and its end 0x46d51d (the body is done, the epilogue not yet run); the
+and again while a watch, a due --dump or a --scenario needs it; see below)
+and its end 0x46d51d (the body is done, the epilogue not yet run); the
 dialog functions 0x436da0 (a record is shown), 0x4370be (a button's result)
 and 0x43718f (a script reads the answer), which are logged only.
 
@@ -836,9 +837,13 @@ def main():
         # A late watch an earlier run set counts as set (watch_ended's set covers its whole window).
         # Its event has its name and its whole text (with the updates); a --watch given the same
         # text has the updates in its name. Earlier revisions wrote no `late`.
+        # Only an arming after the baseline (on this lot) within its updates counts: it is set at
+        # the end of update first - 1 at the earliest.
+        since = rows[next(i for i, r in enumerate(rows) if r['kind'] == 'baseline'):]
         for w in late:
             w.set = any(r['kind'] == 'watch_armed' and r.get('late', True) and r.get('name') == w.name
-                        and r.get('expr') == w.text for r in rows)
+                        and r.get('expr') == w.text and r.get('update', -1) + 1 >= w.first
+                        and (w.last is None or r['update'] + 1 <= w.last) for r in since)
         # A dialog shown since the last recorded return, and the dialogs still waiting for a result.
         dialog_pending = any(r['kind'] == 'dialog_show' and r['update'] > updates for r in rows)
         waiting = open_dialogs(rows)
