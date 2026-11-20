@@ -66,6 +66,53 @@ pub fn persistent_fields(revision: i32) -> Vec<usize> {
     fields
 }
 
+/// The revision a neighborhood record gets when a person is saved into
+/// it (0x423e04 returns 9).
+pub const SAVED_REVISION: i32 = 9;
+
+/// Saves person `id` into its neighborhood record (0x425a69): the record
+/// is the one person data word 31 names (0x4256f4, slot `id - 1`), not
+/// the first of the person's type; it gets revision [`SAVED_REVISION`],
+/// and each word the table at 0x423827 lists for that revision
+/// ([`persistent_fields`]) is copied from the person into it. The copy
+/// does not test the words' revisions, as the attach does (0x4258ff):
+/// the table is built for revision 9 and every entry is copied. A word
+/// 31 that names no record saves nothing (0x425a84). An object that is
+/// not a person fails: the callers cast first.
+pub(crate) fn save_to_record(world: &mut World, id: u16) -> Result<(), Trap> {
+    let person = world
+        .objects
+        .get(&id)
+        .ok_or(Trap::native(10, "missing object"))?
+        .person
+        .as_ref()
+        .ok_or(Trap::native(0x1c, "object is not a person"))?;
+    let fields = persistent_fields(SAVED_REVISION);
+    let mut values = Vec::with_capacity(fields.len());
+    for &word in &fields {
+        values.push(
+            *person
+                .data
+                .get(word)
+                .ok_or_else(|| Trap::Invalid(format!("the person has no data word {word}")))?,
+        );
+    }
+    let neighbor = person.data[field::NEIGHBOR];
+    let Some(record) = world.neighbors.get_mut(neighbor) else {
+        return Ok(());
+    };
+    record.revision = SAVED_REVISION;
+    for (&word, value) in fields.iter().zip(values) {
+        *record.data.get_mut(word).ok_or_else(|| {
+            Trap::Invalid(format!(
+                "neighborhood record {} has no person data word {word}",
+                record.id
+            ))
+        })? = value;
+    }
+    Ok(())
+}
+
 /// The number a body string's age stands for, as the C runtime's `atoi`
 /// reads it and a 16-bit field keeps it: leading white space, a sign, and
 /// digits up to the first character that is not one.
