@@ -179,6 +179,23 @@ Things to know:
   that stop are missed. Watches on the same bytes share a watchpoint, and a
   write to them is logged once for each watch.
 
+  QEMU's stop gives the base of the watchpoint that fired, not the bytes
+  written. It stops on the newest watchpoint a write touches, so the one that
+  fired is the newest on that base, and the write touched none newer. Each
+  row's `match` says how its watch was matched to the write:
+  - `named`: the watch is on the watchpoint that fired.
+  - `covers`: the watch takes in every byte the write could have touched, so
+    the write touched it too, even if it wrote the same value.
+  - `changed`: the watch's value changed, and one write (16 bytes at most)
+    could reach it without touching a newer watchpoint. This is not certain:
+    the stop cannot tell such a write from an earlier write through another
+    mapping of the same memory, which stops nothing.
+  - `contains`: the stop named no watchpoint's base (not something QEMU
+    does), and the watch holds the address.
+
+  A watch that one write could touch, but that kept its value and does not
+  take in every byte, has no row.
+
 ## Scripted input
 
 `capture.py --scenario FILE --guest-dir <guest dir>` drives the game from a

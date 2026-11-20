@@ -595,6 +595,77 @@ class CaptureTest(unittest.TestCase):
         rows = self.rows(output / 'watch.jsonl')
         self.assertEqual([r['name'] for r in rows], ['state'])
 
+    def watch_rows(self, steps, flags):
+        """(name, match) for each watch row of a run with ENTRY and RETURN around the stops `steps`,
+        over two updates; the late watches start at update 2, after the ordinary ones."""
+        remote, output, _ = self.run_capture(
+            [dict(pc=0), dict(pc=capture.ENTRY), dict(pc=capture.RETURN)] + steps
+            + [dict(pc=capture.ENTRY), dict(pc=capture.RETURN)], ['--updates', '2'] + flags)
+        return remote, [(r['name'], r['match']) for r in self.rows(output / 'watch.jsonl')]
+
+    def test_of_watchpoints_on_one_base_the_newest_is_the_one_that_fired(self):
+        # low (4 bytes) then pair (8) at 0x70088; a write at 0x7008c names
+        # 0x70088. pair is newer and takes in all of low, so pair fired, and
+        # low, which kept its value, has no row.
+        remote, rows = self.watch_rows(
+            [dict(pc=0x123456, reply='T05watch:70088;', bytes={0x7008c: 1})],
+            ['--watch', 'low=0x70088:4', '--late-watch', '2-2,pair=0x70088:8'])
+        self.assertEqual(remote.watch_calls, [(0x70088, 4), (0x70088, 8)])
+        self.assertEqual(rows, [('pair', 'named')])
+
+    def test_a_watch_that_takes_in_what_the_write_could_touch_has_a_row_whatever_it_wrote(self):
+        # pair (8 bytes at 0x70088), then high (0x7008c:4); a write that
+        # leaves high as it was names 0x7008c. It touched high, so it
+        # touched pair too.
+        remote, rows = self.watch_rows(
+            [dict(pc=0x123456, reply='T05watch:7008c;')],
+            ['--watch', 'pair=0x70088:8', '--late-watch', '2-2,high=0x7008c:4'])
+        self.assertEqual(rows, [('pair', 'covers'), ('high', 'named')])
+
+    def test_an_older_watch_next_to_the_one_that_fired_has_a_row_if_it_changed(self):
+        # low (0x70088:4), then high (0x7008c:4); one 8-byte store over both
+        # names the newer, 0x7008c. low changed and one write could reach
+        # it, so it has a row, marked as matched by its change: the reply
+        # cannot tell this from a write to low through another mapping
+        # earlier.
+        remote, rows = self.watch_rows(
+            [dict(pc=0x123456, reply='T05watch:7008c;', bytes={a: 1 for a in range(0x70088, 0x70090)})],
+            ['--watch', 'low=0x70088:4', '--late-watch', '2-2,high=0x7008c:4'])
+        self.assertEqual(rows, [('low', 'changed'), ('high', 'named')])
+
+    def test_a_newer_watch_that_changed_was_not_written_by_a_write_naming_an_older_one(self):
+        # high (0x7008c:4) is newer than low (0x70088:4). A stop naming
+        # 0x70088 means the write touched no newer watchpoint, so high's
+        # change came another way.
+        remote, rows = self.watch_rows(
+            [dict(pc=0x123456, reply='T05watch:70088;', bytes={0x70088: 1, 0x7008c: 1})],
+            ['--watch', 'low=0x70088:4', '--late-watch', '2-2,high=0x7008c:4'])
+        self.assertEqual(rows, [('low', 'named')])
+
+    def test_a_newer_watchpoint_between_bounds_what_one_write_could_reach(self):
+        # far (0x70090:4), low (0x70088:4), then mid (0x7008c:4), the newest.
+        # A stop naming 0x70088 touched no byte of mid, and one write cannot
+        # reach far from low without touching mid, so far's change is not
+        # this write's.
+        remote, rows = self.watch_rows(
+            [dict(pc=0x123456, reply='T05watch:70088;', bytes={0x70088: 1, 0x70090: 1})],
+            ['--watch', 'far=0x70090:4', '--watch', 'low=0x70088:4', '--late-watch', '2-2,mid=0x7008c:4'])
+        self.assertEqual(rows, [('low', 'named')])
+
+    def test_a_run_taken_over_at_a_breakpoint_whose_lot_cannot_be_read_sets_an_ordinary_watch(self):
+        # As off a breakpoint: taken over at a dialog's breakpoint with the
+        # lot unreadable, the ordinary watch is set there.
+        def prepare(output):
+            (output / 'events.jsonl').write_text(json.dumps(dict(kind='baseline', cr3=GAME_CR3)) + '\n')
+            (output / 'updates.jsonl').write_text(
+                json.dumps(dict(update=1, tick=99, lot_rng=0, global_rng=0, crt=0, scheduler_cursor=0)) + '\n')
+        remote, output, _ = self.run_capture(
+            [dict(pc=capture.DIALOG_SHOW, lot_unreadable=True, step='T05watch:70088;'),
+             dict(pc=capture.ENTRY), dict(pc=capture.RETURN)],
+            ['--updates', '2', '--resume', '--watch', 'state=0x70088'], prepare=prepare)
+        self.assertEqual(remote.watch_stops[0], ('set', capture.DIALOG_SHOW))
+        self.assertEqual([r['name'] for r in self.rows(output / 'watch.jsonl')], ['state'])
+
     def test_a_run_taken_over_at_update_1s_return_records_it(self):
         def prepare(output):
             (output / 'events.jsonl').write_text(json.dumps(dict(kind='baseline', cr3=GAME_CR3)) + '\n')
