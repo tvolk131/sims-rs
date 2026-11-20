@@ -98,11 +98,11 @@ events, and what it asks for after them) come first.
    checked against 28 saved-character oracles (#274); and the import
    applied when a template neighborhood opens, after house 0's reload
    (#272, merged with #268).
-   Opening a neighborhood after the import also fills three houseless
-   pools from the template people: 5000 (12 people), 5500 (18) and
-   6000 (30), 88 files, taking the neighborhood from 49 to 381 records.
-   The pool generator is seeded from the clock; the C runtime's draws
-   replay exactly; the game's own generator's part is unmeasured.
+   Opening a neighborhood after the import also fills houseless pools
+   of people from the templates. The pool generator is seeded from the
+   clock, so no port can make the same files; the C runtime's draws
+   replay exactly. The pool count and details are in track 4's pools
+   decision (#276, open).
    Decided 2026-11-20 (coordinator): 6a comes first; the pools follow
    as 6b part E, a port fed the recorded inputs; matching the exact
    files and looks is deferred.
