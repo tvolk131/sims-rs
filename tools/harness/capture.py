@@ -130,8 +130,6 @@ HOURS, MINUTES, SECONDS = 0, 5, 6
 DATE_GLOBALS = (1, 2, 3, 7, 8)
 # The most bytes one guest store is taken to write: a 16-byte SSE store. A store that crosses into a
 # page writes no further into it than this.
-MAX_WRITE = 16
-PAGE = 0x1000
 DIALOG_SHOW, DIALOG_RESULT, DIALOG_READ = 0x436da0, 0x4370be, 0x43718f
 OWNER, GLOBAL_RNG, ACTION_SERIAL, CRT_TLS_INDEX = 0x6e48bc, 0x6e54ac, 0x6e4904, 0x6db360
 
@@ -595,6 +593,14 @@ def write_gz(path, value):
         json.dump(value, f, separators=(',', ':'))
 
 
+
+def stop_thread(reply):
+    """The thread a stop reply names (its thread: field), or None."""
+    for field in reply[3:].split(';'):
+        if field.startswith('thread:'):
+            return field[len('thread:'):]
+    return None
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--container', default='sims-harness-vm')
@@ -722,24 +728,16 @@ def main():
     late = list(args.late_watch)  # watches that wait for their first update
     live_watches = []  # watches set, each at its .address
     hardware = {}  # (address, size) -> how many armed watches use that watchpoint
-    hardware_order = {}  # (address, size) -> when that watchpoint was set, counting up
-    watchpoints_set = 0
 
     def hardware_add(a, size):
-        nonlocal watchpoints_set
         if not hardware.get((a, size)):
             remote.set_watch(a, size)
-            # QEMU puts a watchpoint the debugger sets in front of the others (7.2,
-            # cpu_watchpoint_insert) and a write stops on the first that it touches.
-            watchpoints_set += 1
-            hardware_order[(a, size)] = watchpoints_set
         hardware[(a, size)] = hardware.get((a, size), 0) + 1
 
     def hardware_remove(a, size):
         hardware[(a, size)] -= 1
         if not hardware[(a, size)]:
             del hardware[(a, size)]
-            del hardware_order[(a, size)]
             remote.clear_watch(a, size)
 
     def locate(w, m):
@@ -820,32 +818,13 @@ def main():
             lot = m.lot()
         except MemoryError:
             lot = None
-        # One row per watch the write may have been to (one with name null if none), matched against
-        # the watches as they were set when the write was made. The stop reply gives the base of the
-        # watchpoint that fired, not the bytes written. QEMU (7.2) stops on the newest watchpoint its
-        # check overlaps (softmmu/physmem.c, cpu_check_watchpoint). Its check is the store itself
-        # for an aligned store, the page's base to the store's end for an unaligned one on a page
-        # with a watchpoint, and each page's part in turn, the first page's first, for one that
-        # crosses pages (accel/tcg/cputlb.c, store_helper_unaligned). So the watchpoint that fired
-        # need not have been written, and each row says only what the stop shows (match):
-        # - named: the watch is on the watchpoint that fired (one_of: on one of the watchpoints on
-        #   that base that could have fired; one a newer watchpoint takes in whole never fires);
-        # - encloses: the watch takes in every watchpoint that could have fired. It is a row
-        #   whatever was written: when the store touched the one that fired, it touched this too;
-        # - changed: the watch's value changed, and the store could have written it: on the page
-        #   of the watchpoint that fired, if the watch is not newer than it and no newer watchpoint
-        #   lies between them (a store reaching it would have fired that one); or in the first
-        #   MAX_WRITE bytes of the next page, which a store crossing pages may write after its first
-        #   page's part fired. Such a change may also be an earlier write through another mapping
-        #   of the same memory, which stops nothing.
-        # - at: the reply names no watchpoint's base (not one QEMU gives), and the watch holds it.
-        # A watch that kept its value and encloses nothing that fired has no row.
+        if sims_cr3 is None and lot is None:
+            # Before the game's process is known, a stop whose lot cannot be read may be another
+            # process's: its bytes are not taken as the watches' values.
+            event(kind='unknown_watch', address=hit, pc=regs['eip'], cr3=regs['cr3'], update=updates)
+            return
         # The watchpoints as set when the write was made (before any is taken off below).
-        order = dict(hardware_order)
-        on_base = [p for p in order if p[0] == hit]
-        def hidden(p):
-            return any(order[q] > order[p] and q[0] <= p[0] and p[0] + p[1] <= q[0] + q[1] for q in order)
-        fired = [p for p in on_base if not hidden(p)] or on_base
+        on_base = [p for p in hardware if p[0] == hit]
         candidates = list(live_watches)
         if lot != args.lot:
             # A write at a stop on another lot (before its next entry or dialog breakpoint) is not
@@ -861,30 +840,27 @@ def main():
                 return w.read(m) != w.value
             except MemoryError:
                 return False
-        def could(w, p):
-            """Whether a store that fired watchpoint p could have written watch w."""
-            lo, hi = w.address, w.address + w.size
-            page = p[0] & ~(PAGE - 1)
-            if lo < page + PAGE + MAX_WRITE and hi > page + PAGE:
-                return True
-            if not (lo < page + PAGE and hi > page) or order.get((w.address, w.size), 0) > order[p]:
-                return False
-            if lo < p[0] + p[1] and p[0] < hi:
-                return True
-            gap = (p[0] + p[1], lo) if lo >= p[0] + p[1] else (hi, p[0])
-            return not any(order[q] > order[p] and q[0] < gap[1] and gap[0] < q[0] + q[1] for q in order)
+        # The stop reply gives the base of the watchpoint that fired, not the bytes written, and
+        # which of several watchpoints fires, and whether it was written at all, depends on how
+        # QEMU split and checked the store (7.2: the newest watchpoint a check overlaps fires; an
+        # unaligned store on a watched page is checked from the page's base; one instruction may
+        # be several stores). So each row says only what the stop and the memory show (match):
+        # - named: the watch is on the watchpoint whose base the stop gives (one_of: one of the
+        #   several watchpoints on that base);
+        # - changed: the watch's value is not the one last seen. This store may have written it,
+        #   or an earlier one that stopped nothing (through another mapping of the same memory);
+        # - at: the stop gives no watchpoint's base (not one QEMU gives), and the watch holds it.
+        # A watch that is not on the base the stop gives and kept its value has no row, even if
+        # the store wrote it the value it held: the stop does not show that.
         hits = []
-        if not fired:
-            hits = [(w, 'at') for w in candidates if w.address <= hit < w.address + w.size]
-        else:
-            for w in candidates:
-                key = (w.address, w.size)
-                if key in fired:
-                    hits.append((w, 'named' if len(fired) == 1 else 'one_of'))
-                elif all(w.address <= p[0] and p[0] + p[1] <= w.address + w.size for p in fired):
-                    hits.append((w, 'encloses'))
-                elif changed(w) and any(could(w, p) for p in fired):
-                    hits.append((w, 'changed'))
+        for w in candidates:
+            key = (w.address, w.size)
+            if key in on_base:
+                hits.append((w, 'named' if len(on_base) == 1 else 'one_of'))
+            elif not on_base and w.address <= hit < w.address + w.size:
+                hits.append((w, 'at'))
+            elif changed(w):
+                hits.append((w, 'changed'))
         for w, match in hits or [(None, None)]:
             # Taken over off a breakpoint, whether the guest is in a lot update is not known until its
             # next entry or return (in_update None): the write is in update `updates` or `updates` + 1,
@@ -1050,8 +1026,8 @@ def main():
                 in_update = None
         save_status(state='running', breaks=sorted(breaks))
         first = args.resume
-        # The pc after a step past a breakpoint that stopped at a watchpoint: QEMU then stops once
-        # more there, for the step itself, when the guest is resumed.
+        # Where a step past a breakpoint that stopped at a watchpoint left the guest (pc, cr3, thread):
+        # QEMU then stops once more there, a plain trap for the step itself, when it is resumed.
         stepped_to = None
         while updates < args.updates:
             if args.stop_file and args.stop_file.exists():
@@ -1071,7 +1047,8 @@ def main():
             regs.update(fs_base=fs_base, cr3=cr3)
             m = Memory(remote)
             after_step, stepped_to = stepped_to, None
-            if not took_over and 'watch:' not in reply and pc == after_step and pc not in breaks:
+            if (not took_over and reply.startswith('T05') and 'watch:' not in reply
+                    and (pc, cr3, stop_thread(reply)) == after_step and pc not in breaks):
                 event(kind='step_after_watch', pc=pc)
                 continue
             if took_over and pc not in breaks:
@@ -1258,7 +1235,7 @@ def main():
                 regs = {k: v for k, v in regs.items() if not k.startswith('_')}
                 regs.update(fs_base=struct.unpack_from('<I', raw, 64)[0], cr3=struct.unpack_from('<I', raw, 84)[0])
                 watch_hit(reply, regs, Memory(remote))
-                stepped_to = regs['eip']
+                stepped_to = (regs['eip'], regs['cr3'], stop_thread(reply))
         event(kind='complete', updates=updates)
         save_status(state='complete')
     except BaseException as e:

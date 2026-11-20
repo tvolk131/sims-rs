@@ -180,36 +180,32 @@ Things to know:
   write to them is logged once for each watch.
 
   QEMU's stop gives the base of the watchpoint that fired, not the bytes
-  written. QEMU 7.2 stops on the newest watchpoint its check overlaps. For an
-  aligned store, the check is the store itself. For an unaligned store on a
-  page with a watchpoint, it runs from the page's base to the store's end.
-  For a store that crosses pages, each page's part is checked in turn, the
-  first page's first. So the watchpoint that fired need not have been
-  written. Each row's `match` says only what the stop shows:
-  - `named`: the watch is on the watchpoint that fired. It is `one_of` when
-    several watchpoints on that base could have fired. One that a newer
-    watchpoint takes in whole never fires.
-  - `encloses`: the watch takes in every watchpoint that could have fired.
-    If the store touched the one that fired, it touched this watch too, so
-    there is a row whatever value was written.
-  - `changed`: the watch's value changed, and the store could have written
-    it. That means one of two things. The watch may be on the page of the
-    watchpoint that fired, not newer than it, with no newer watchpoint
-    between them; a store reaching it would have fired that one. Or it may
-    be in the first 16 bytes of the next page, which a store that crosses
-    pages can write after its first page's part fired. This is not certain:
-    the stop cannot tell such a write from an earlier write through another
-    mapping of the same memory, which stops nothing.
-  - `at`: the stop named no watchpoint's base (QEMU never does this), and
+  written. Which watchpoint fires, and whether it was written at all,
+  depends on how QEMU split and checked the store. In QEMU 7.2 the newest
+  watchpoint a check overlaps fires. An unaligned store on a watched page
+  can be checked from the page's base. One instruction may be several
+  stores. So each row's `match` says only what the stop and memory show:
+  - `named`: the watch is on the watchpoint whose base the stop gives. It
+    is `one_of` when several watchpoints share that base.
+  - `changed`: the watch's value is not the one last seen. This store may
+    have written it, or an earlier write that stopped nothing (through
+    another mapping of the same memory). The new value is taken up, so a
+    change is logged once.
+  - `at`: the stop gives no watchpoint's base (QEMU never does this), and
     the watch holds the address.
 
-  A watch that kept its value and encloses nothing that fired has no row.
+  A watch that is not on the base the stop gives and kept its value has no
+  row, even if the store wrote it the value it held: the stop does not
+  show that.
 
   When a step over a breakpoint stops on a watchpoint, QEMU gives a second,
-  plain stop at the next instruction on the following resume. That stop is
-  logged as `step_after_watch` and passed over. Before the game's process is
-  known (its first lot update), a stop whose lot cannot be read sets no
-  watch. Its memory may be another process's.
+  plain stop at the next instruction on the following resume. A plain trap
+  (`T05`, no watch) at the pc, CR3 and thread the step left is logged as
+  `step_after_watch` and passed over; any other stop is dealt with as usual.
+  Before the game's process is known (its first lot update), a stop whose
+  lot cannot be read sets no watch, and a watch stop there is logged as
+  `unknown_watch`, with no row and no value taken. Its memory may be
+  another process's.
 
 ## Scripted input
 

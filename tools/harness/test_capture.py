@@ -586,17 +586,19 @@ class CaptureTest(unittest.TestCase):
         self.assertEqual([(r['name'], r['before'], r['after']) for r in rows],
                          [('pair', '00' * 8, '00000000' + '01000000'), ('direction', '00' * 4, '01000000')])
 
-    def test_a_watch_elsewhere_that_changed_without_a_stop_is_not_put_down_to_a_write(self):
+    def test_a_watch_elsewhere_that_changed_without_a_stop_is_marked_only_as_changed(self):
         # Two ordinary watches apart, at 0x70088 and 0x70100; 0x70100
-        # changed without a stop of its own, and 0x70088 is written. Only
-        # the watch the reply names has a row.
+        # changed without a stop of its own, and 0x70088 is written. The
+        # watch the reply names is named; the other's row says only that it
+        # changed, not that this store wrote it, and its value is taken up,
+        # so the change is logged once.
         remote, output, _ = self.run_capture([
             dict(pc=0), dict(pc=capture.ENTRY),
             dict(pc=0x123456, reply='T05watch:70088;', bytes={0x70088: 1, 0x70100: 1}),
             dict(pc=capture.RETURN)],
             ['--updates', '1', '--watch', 'state=0x70088', '--watch', 'far=0x70100'])
         rows = self.rows(output / 'watch.jsonl')
-        self.assertEqual([r['name'] for r in rows], ['state'])
+        self.assertEqual([(r['name'], r['match']) for r in rows], [('state', 'named'), ('far', 'changed')])
 
     def watch_rows(self, steps, flags):
         """(name, match) for each watch row of a run with ENTRY and RETURN around the stops `steps`,
@@ -606,91 +608,51 @@ class CaptureTest(unittest.TestCase):
             + [dict(pc=capture.ENTRY), dict(pc=capture.RETURN)], ['--updates', '2'] + flags)
         return remote, [(r['name'], r['match']) for r in self.rows(output / 'watch.jsonl')]
 
-    def test_of_watchpoints_on_one_base_the_newest_is_the_one_that_fired(self):
-        # low (4 bytes) then pair (8) at 0x70088; a write at 0x7008c names
-        # 0x70088. pair is newer and takes in all of low, so pair fired, and
-        # low, which kept its value, has no row.
+    def test_watchpoints_on_the_base_a_stop_gives_are_each_one_of(self):
+        # low (4 bytes) then pair (8) at 0x70088: a stop giving 0x70088 may
+        # be either's, whatever was written.
         remote, rows = self.watch_rows(
             [dict(pc=0x123456, reply='T05watch:70088;', bytes={0x7008c: 1})],
             ['--watch', 'low=0x70088:4', '--late-watch', '2-2,pair=0x70088:8'])
         self.assertEqual(remote.watch_calls, [(0x70088, 4), (0x70088, 8)])
-        self.assertEqual(rows, [('pair', 'named')])
+        self.assertEqual(rows, [('low', 'one_of'), ('pair', 'one_of')])
 
-    def test_a_watch_that_encloses_the_one_that_fired_has_a_row_whatever_was_written(self):
-        # pair (8 bytes at 0x70088), then high (0x7008c:4); a write that
-        # leaves high as it was names 0x7008c. If the store touched high, it
-        # touched pair too.
-        remote, rows = self.watch_rows(
-            [dict(pc=0x123456, reply='T05watch:7008c;')],
-            ['--watch', 'pair=0x70088:8', '--late-watch', '2-2,high=0x7008c:4'])
-        self.assertEqual(rows, [('pair', 'encloses'), ('high', 'named')])
+    def test_a_watch_off_the_base_a_stop_gives_that_kept_its_value_has_no_row(self):
+        # pair (0x70088:8) takes in high (0x7008c:4). A stop giving 0x7008c
+        # need not have written high (an unaligned store is checked from its
+        # page's base), so it does not show pair was written either.
+        for reply, bytes_, named in [('T05watch:7008c;', {}, 'high'), ('T05watch:7008c;', {0x70091: 1}, 'high')]:
+            remote, rows = self.watch_rows(
+                [dict(pc=0x123456, reply=reply, bytes=bytes_)],
+                ['--watch', 'pair=0x70088:8', '--late-watch', '2-2,high=0x7008c:4'])
+            self.assertEqual(rows, [(named, 'named')])
 
-    def test_an_older_watch_next_to_the_one_that_fired_has_a_row_if_it_changed(self):
-        # low (0x70088:4), then high (0x7008c:4); one 8-byte store over both
-        # names the newer, 0x7008c. low changed and one write could reach
-        # it, so it has a row, marked as matched by its change: the reply
-        # cannot tell this from a write to low through another mapping
-        # earlier.
-        remote, rows = self.watch_rows(
-            [dict(pc=0x123456, reply='T05watch:7008c;', bytes={a: 1 for a in range(0x70088, 0x70090)})],
-            ['--watch', 'low=0x70088:4', '--late-watch', '2-2,high=0x7008c:4'])
-        self.assertEqual(rows, [('low', 'changed'), ('high', 'named')])
+    def test_every_watch_that_changed_has_a_row_wherever_it_is(self):
+        # One instruction may be several stores, and a store crossing pages
+        # is checked a page at a time, so a change anywhere may be this
+        # store's: older or newer than the watchpoint that fired, beyond a
+        # newer one, or on the next page. The row says only that it changed.
+        cases = [
+            # MOVUPS at 0x70088: two 8-byte stores; the first fires pair.
+            (['--watch', 'pair=0x70088:8', '--late-watch', '2-2,next=0x70090:8'],
+             'T05watch:70088;', range(0x70088, 0x70098), [('pair', 'named'), ('next', 'changed')]),
+            # far (0x70094:4) beyond a newer mid (0x70090:4).
+            (['--watch', 'far=0x70094:4', '--watch', 'low=0x70088:4', '--late-watch', '2-2,mid=0x70090:4'],
+             'T05watch:70088;', [0x70088, 0x70094], [('far', 'changed'), ('low', 'named')]),
+            # A dword store at 0x72ffe across the page.
+            (['--watch', 'low=0x72ffe:2', '--late-watch', '2-2,high=0x73000:2'],
+             'T05watch:72ffe;', range(0x72ffe, 0x73002), [('low', 'named'), ('high', 'changed')]),
+        ]
+        for flags, reply, written, expected in cases:
+            remote, rows = self.watch_rows(
+                [dict(pc=0x123456, reply=reply, bytes={a: 1 for a in written})], flags)
+            self.assertEqual(rows, expected, flags)
 
-    def test_a_newer_watch_that_changed_was_not_written_by_a_write_naming_an_older_one(self):
-        # high (0x7008c:4) is newer than low (0x70088:4). A stop naming
-        # 0x70088 means the write touched no newer watchpoint, so high's
-        # change came another way.
+    def test_a_stop_giving_no_watchpoints_base_names_the_watch_that_holds_it(self):
         remote, rows = self.watch_rows(
-            [dict(pc=0x123456, reply='T05watch:70088;', bytes={0x70088: 1, 0x7008c: 1})],
-            ['--watch', 'low=0x70088:4', '--late-watch', '2-2,high=0x7008c:4'])
-        self.assertEqual(rows, [('low', 'named')])
-
-    def test_a_newer_watchpoint_between_bounds_what_one_write_could_reach(self):
-        # far (0x70090:4), low (0x70088:4), then mid (0x7008c:4), the newest.
-        # A stop naming 0x70088 touched no byte of mid, and one write cannot
-        # reach far from low without touching mid, so far's change is not
-        # this write's.
-        remote, rows = self.watch_rows(
-            [dict(pc=0x123456, reply='T05watch:70088;', bytes={0x70088: 1, 0x70090: 1})],
-            ['--watch', 'far=0x70090:4', '--watch', 'low=0x70088:4', '--late-watch', '2-2,mid=0x7008c:4'])
-        self.assertEqual(rows, [('low', 'named')])
-
-    def test_watchpoints_on_one_base_that_could_each_have_fired_are_each_one_of(self):
-        # pair (0x70088:8) then low (0x70088:4). A store at 0x7008c fires
-        # pair, one at 0x70088 fires low: both report 0x70088.
-        remote, rows = self.watch_rows(
-            [dict(pc=0x123456, reply='T05watch:70088;', bytes={0x7008c: 1})],
-            ['--watch', 'pair=0x70088:8', '--late-watch', '2-2,low=0x70088:4'])
-        self.assertEqual(rows, [('pair', 'one_of'), ('low', 'one_of')])
-
-    def test_a_watchpoint_a_newer_one_takes_in_never_fires(self):
-        # pair (0x70088:8), low (0x70088:4), then mask (0x70087:8). Every
-        # store that low's check overlaps, mask's overlaps too, and mask is
-        # checked first: a reply of 0x70088 is pair's. mask is newer than
-        # pair, on its page, so its change is not this store's.
-        remote, rows = self.watch_rows(
-            [dict(pc=0x123456, reply='T05watch:70088;', bytes={0x7008f: 1, 0x70087: 1})],
-            ['--watch', 'pair=0x70088:8', '--watch', 'low=0x70088:4', '--late-watch', '2-2,mask=0x70087:8'])
-        self.assertEqual(rows, [('pair', 'named')])
-
-    def test_a_store_crossing_pages_may_write_a_newer_watch_on_the_next(self):
-        # low (0x72ffe:2) then high (0x73000:2). A dword store at 0x72ffe
-        # checks the first page's part first and reports low, and writes
-        # high too.
-        remote, rows = self.watch_rows(
-            [dict(pc=0x123456, reply='T05watch:72ffe;', bytes={a: 1 for a in range(0x72ffe, 0x73002)})],
-            ['--watch', 'low=0x72ffe:2', '--late-watch', '2-2,high=0x73000:2'])
-        self.assertEqual(rows, [('low', 'named'), ('high', 'changed')])
-
-    def test_an_unaligned_store_may_fire_a_watchpoint_it_did_not_write(self):
-        # wide (0x70084:8) then inner (0x70088:4). An unaligned word store
-        # at 0x70091 checks from the page's base to its end, so it reports
-        # inner, which it did not write. The rows claim no write: inner was
-        # named, and wide encloses it.
-        remote, rows = self.watch_rows(
-            [dict(pc=0x123456, reply='T05watch:70088;', bytes={0x70091: 1, 0x70092: 1})],
-            ['--watch', 'wide=0x70084:8', '--late-watch', '2-2,inner=0x70088:4'])
-        self.assertEqual(rows, [('wide', 'encloses'), ('inner', 'named')])
+            [dict(pc=0x123456, reply='T05watch:7008a;')],
+            ['--watch', 'pair=0x70088:8'])
+        self.assertEqual(rows, [('pair', 'at')])
 
     def test_the_stop_for_a_step_that_hit_a_watchpoint_is_passed_over(self):
         # Stepping past the entry breakpoint writes the watched word: QEMU
@@ -710,6 +672,45 @@ class CaptureTest(unittest.TestCase):
                 dict(pc=0), dict(pc=capture.ENTRY, step='T05watch:70088;', step_pc=0x4100),
                 dict(pc=0x123456, reply='T05'), dict(pc=capture.RETURN)],
                 ['--updates', '1', '--watch', 'state=0x70088'])
+
+    def test_a_stop_after_a_stepped_watch_hit_is_passed_over_only_if_it_is_the_steps_own(self):
+        # A pause (T02), a stop in another process, a second watch stop and
+        # an armed breakpoint at the stepped-to pc are each dealt with as
+        # usual.
+        step = dict(pc=capture.ENTRY, step='T05watch:70088;', step_pc=0x4100, bytes={0x70088: 1})
+        for stop, error in [
+            (dict(pc=0x4100, reply='T02'), 'unexpected stop at 0x4100'),
+            (dict(pc=0x4100, reply='T05', cr3=OTHER_CR3), 'unexpected stop at 0x4100'),
+        ]:
+            with self.assertRaisesRegex(RuntimeError, error):
+                self.run_capture([dict(pc=0), step, stop, dict(pc=capture.RETURN)],
+                                 ['--updates', '1', '--watch', 'state=0x70088'])
+        remote, output, _ = self.run_capture([
+            dict(pc=0), step, dict(pc=0x4100, reply='T05watch:70088;', bytes={0x70088: 2}),
+            dict(pc=capture.RETURN)],
+            ['--updates', '1', '--watch', 'state=0x70088'])
+        self.assertEqual([r['name'] for r in self.rows(output / 'watch.jsonl')], ['state', 'state'])
+        self.assertEqual(self.events(output, 'step_after_watch'), [])
+        remote, output, _ = self.run_capture([
+            dict(pc=0), dict(pc=capture.ENTRY, step='T05watch:70088;', step_pc=capture.RETURN,
+                             bytes={0x70088: 1}),
+            dict(pc=capture.RETURN, reply='T05')],
+            ['--updates', '1', '--watch', 'state=0x70088'])
+        self.assertEqual(self.events(output, 'step_after_watch'), [])
+        self.assertEqual(len(self.rows(output / 'updates.jsonl')), 1, 'the return breakpoint was dealt with')
+
+    def test_before_the_games_process_is_known_a_watch_stop_whose_lot_cannot_be_read_is_not_the_games(self):
+        # Set at a readable dialog before the first update, then hit at the
+        # same address in another process whose lot cannot be read: its bytes
+        # are not taken as the watch's value.
+        remote, output, _ = self.run_capture([
+            dict(pc=0), dict(pc=capture.DIALOG_SHOW),
+            dict(pc=0x123456, reply='T05watch:70088;', cr3=OTHER_CR3, lot_unreadable=True,
+                 bytes={0x70088: 0x64}),
+            dict(pc=capture.ENTRY, bytes={0x70088: 0x64}), dict(pc=capture.RETURN, bytes={0x70088: 0x64})],
+            ['--updates', '1', '--watch', 'state=0x70088'])
+        self.assertEqual(self.rows(output / 'watch.jsonl'), [])
+        self.assertEqual(len(self.events(output, 'unknown_watch')), 1)
 
     def test_before_the_games_process_is_known_an_unreadable_stop_sets_nothing(self):
         # A dialog breakpoint in another process, before the first lot
