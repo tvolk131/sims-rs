@@ -351,18 +351,24 @@ fn a_person_another_took_off_ticks_with_its_refresh_pending() {
     assert_eq!(result, Ok(true));
     assert_eq!(update.ticked, [LAMP, id]);
     assert_eq!(fx.world.removals, [id]);
-    // Its thread may not run a primitive that reads an animator before
-    // its animator's tick (Animate Sim, opcode 44, here).
+    // A primitive that reads an animator before its animator's tick
+    // (Animate Sim, opcode 44, here) runs both ways
+    // (`Machine::step_both_ways`): clip 0 takes the true branch whichever
+    // animator it reads, so the pass goes on and the animator's tick
+    // settles the two.
     fx.world = ready;
     fx.add(
         file,
         4204,
-        tree(vec![ins(44, RETURN_TRUE, RETURN_FALSE, [0; 8])]),
+        tree(vec![
+            ins(44, 1, RETURN_FALSE, [0; 8]),
+            ins(0, RETURN_TRUE, RETURN_FALSE, [0; 8]),
+        ]),
     );
-    fx.thread(id, 4204, &[0; 4]);
+    fx.thread(id, 4204, &[5, 0, 0, 0]);
     let (result, _) = pass(&mut fx);
-    let error = result.unwrap_err().to_string();
-    assert!(error.contains("left the lot and before its"), "{error}");
+    assert_eq!(result, Ok(true));
+    assert_eq!(fx.world.objects[&id].stack[0].node, 1);
 }
 
 #[test]
@@ -370,8 +376,8 @@ fn a_person_removing_itself_and_going_on_settles_its_refresh_at_its_animators_ti
     // The visitor (ID 3) removes itself in its own tick with flag bit 0,
     // so its tree goes on. Its animator's refresh at the take-off is
     // pending for its animator's tick later in the same tick, as for a
-    // person that takes itself off: until then its thread may run only
-    // what reads no animator.
+    // person that takes itself off: until then what its thread runs that
+    // reads an animator runs both ways.
     let (mut fx, id, file) = placed_visitor();
     fx.world.globals = vec![0; 64];
     for object in fx.world.objects.values_mut() {
@@ -402,21 +408,22 @@ fn a_person_removing_itself_and_going_on_settles_its_refresh_at_its_animators_ti
     assert_eq!(update.ticked, [id]);
     assert_eq!(fx.world.removals, [id]);
     assert_eq!(fx.world.objects[&id].position, [-16, -16, 1]);
-    // Then Animate Sim (opcode 44), which reads an animator: it fails on the
-    // pending refresh.
+    // Then Animate Sim (opcode 44), which reads an animator: it runs both
+    // ways (`Machine::step_both_ways`), and clip 0 agrees on both.
     fx.world = ready;
     fx.add(
         file,
         4206,
         tree(vec![
             ins(REMOVE, 1, 1, [0, 0, 1, 0, 0, 0, 0, 0]),
-            ins(44, RETURN_TRUE, RETURN_FALSE, [0; 8]),
+            ins(44, 2, RETURN_FALSE, [0; 8]),
+            ins(0, RETURN_TRUE, RETURN_FALSE, [0; 8]),
         ]),
     );
-    fx.thread(id, 4206, &[0; 4]);
+    fx.thread(id, 4206, &[5, 0, 0, 0]);
     let (result, _) = pass(&mut fx);
-    let error = result.unwrap_err().to_string();
-    assert!(error.contains("left the lot and before its"), "{error}");
+    assert_eq!(result, Ok(true));
+    assert_eq!(fx.world.objects[&id].stack[0].node, 2);
 }
 
 /// A record of the widget's type whose person data is all `value`.

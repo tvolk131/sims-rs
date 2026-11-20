@@ -60,7 +60,10 @@ fn a_neighbors_portrait_makes_a_person_of_its_type_and_removes_it_once() {
     let before = as_with_no_portrait(&fx, record);
     assert_eq!(inform(&mut fx, 2, record), Ok(true));
     assert_eq!(fx.world.portraits, [WIDGET].into());
-    assert_eq!(fx.world.objects.keys().collect::<Vec<_>>(), objects.keys().collect::<Vec<_>>());
+    assert_eq!(
+        fx.world.objects.keys().collect::<Vec<_>>(),
+        objects.keys().collect::<Vec<_>>()
+    );
     assert!(
         fx.world.skeleton_files.contains("widget.bcf"),
         "the person made read its skeleton"
@@ -118,7 +121,10 @@ fn a_portrait_the_port_cannot_tell_was_built_fails_loudly() {
         stale: false,
     });
     let fault = inform(&mut fx, 2, record).unwrap_err().to_string();
-    assert!(fault.contains("0x4e9652") && fault.contains("household"), "{fault}");
+    assert!(
+        fault.contains("0x4e9652") && fault.contains("household"),
+        "{fault}"
+    );
     assert!(fx.world.portraits.is_empty());
     // A type made while the game ran may not be in the interface's table.
     let (mut fx, _, record) = visitors();
