@@ -300,13 +300,14 @@ fn an_imported_home_loads_from_the_originals_files_and_steps() {
     for _ in 0..OPEN_DRAWS {
         crt.next_u15();
     }
-    let mut lot = Lot::load_with(&root, &house, &[2; 8], Frames::default(), crt).unwrap();
+    let frames = Frames::parse(RECORDED_FRAMES).unwrap();
+    let mut lot = Lot::load_with(&root, &house, &[2; 8], frames, crt).unwrap();
     // The recording's C runtime state at entry, after the load's own draws.
     assert_eq!(lot.world().crt_rng.state(), 3_739_951_803);
     let report = lot.load_report();
     assert!(report.stopped.is_none(), "{:?}", report.stopped);
     assert!(report.finished.is_some());
-    // The original's open: 446 records, the Charmings (family 13) in
+    // The original's open: 444 records, the Charmings (family 13) in
     // House 69 under the GUIDs its import drew, and the pools.
     let world = lot.world();
     assert_eq!(world.neighbors.slots.len(), 444);
@@ -865,16 +866,23 @@ const TICK_31478: &str = "34cfca302c1a9b9392b3fcabee36deacdecca0f198df291215abad
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
 const TICK_31478_29: &str = "fc3480edf33f5a146bf2541956ee129cd0200203ae66069e6c763a6835b8f8ed";
-/// The C runtime's draws the original's first open of UserData2 made
-/// before House 69's load, in track 2's second run: its import's and its
-/// pools'. The recording's entry state is state 1 after 405,850 draws, and
-/// the load makes the last 4,730. Not ported (6b E): an input until then.
+/// Where to start the C runtime's generator for House 69's load in track
+/// 2's second run: state 1 after this many draws, fitted to the recording's
+/// entry state (state 1 after 405,850 draws, of which our load makes the
+/// last 4,730). It stands for the draws of the open's import and pools
+/// before the load, which are not ported (6b E). That nothing reseeded the
+/// generator in between is inferred from the fit, not observed.
 const OPEN_DRAWS: u32 = 401_120;
+/// The frames track 2's House 69 recordings drew: after updates 0 to 2,
+/// 29, 59, 89, 101 and 102, then every 30th from 123
+/// (`house69-ud2-ticks-20261120/watch.jsonl`, the frame watch outside
+/// an update).
+const RECORDED_FRAMES: &str = "0,1,2,29,59,89,101,102,123+30";
 /// The imported House 69's state at entry (format 30), which matches
 /// track 2's recording of it (`house69-ud2-ticks-20261120`).
 const IMPORTED_69: &str = "647c524ea5e613ef5d94a2398525f0f3004ce7921af4ba278ee704c321722f29";
-/// The same after 1000 ticks, which matches the recording's update 1000.
-const IMPORTED_69_1000: &str = "dc0cc436b4373bc1f2e4b0563195403e5dd2c2fcea44f78c7d0cfaf64a2fac9a";
+/// The same after 1000 ticks, with the recording's frames.
+const IMPORTED_69_1000: &str = "ff8c3f7ff4cc765e2245fe69915db58b569a9242cd919dfdbbc5c7e88790fc80";
 /// The same at tick 43200, a whole day from the load.
 const TICK_43200: &str = "d26a6a16a451728e40c9b6ada581665a4dfae60ddc7cd8ab306649e3eac14bb0";
 /// The same state's hash under snapshot format 29, which had no person

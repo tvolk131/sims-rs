@@ -30,14 +30,20 @@ files.
   The first run's copy (`after-with-lot-load`, repaired as
   `cache/ud2-import-state-20261120`) is no longer used: its GUIDs and pool
   rolls are another session's, which no recording covers.
-- **The C runtime.** Nothing seeds the C runtime's generator between
-  the launch and this load. The recording's entry state is state 1 after
-  405,850 draws, and the UD1 House 69 recording's, from a launch straight
-  into the lot, is state 1 after the load's own draws. The open's import
-  and pools draw from it before the lot loads, and that is not ported
-  (6b E). So the test starts it where the open left it, through
-  `Lot::load_with`: state 1 after 401,120 draws (`OPEN_DRAWS`). The load
-  makes the last 4,730 itself. The test checks the entry state.
+- **The C runtime.** The open's import and pools draw from the C
+  runtime's generator before the lot loads, and that is not ported (6b E).
+  So the test starts the generator, through `Lot::load_with`, at state 1
+  after 401,120 draws (`OPEN_DRAWS`). That number is fitted: the
+  recording's entry state is state 1 after 405,850 draws, and our load
+  makes the last 4,730. It is the effective offset before our load's
+  steps, which include re-creating the indicators. That nothing reseeded
+  the generator in between is inferred from the fit, not observed; the
+  executable's `rand` can seed a thread from the time stamp counter
+  (0x619e5a). The test checks the entry state.
+- **Frames.** The test draws the recording's frames (`RECORDED_FRAMES`):
+  after updates 0 to 2, 29, 59, 89, 101 and 102, then every 30th from 123.
+  With the default frames, an object is made one update later (321, not
+  320), and the lot stream falls one draw behind there.
 - **What it checks.**
   - The load finishes.
   - The C runtime's state at entry is the recording's.
@@ -51,19 +57,32 @@ files.
 
 **Compared.** Track 2 recorded House 69 from this snapshot for 1,000
 updates (`house69-ud2-ticks-20261120`, ticks 227245 to 228244). Every
-dialog closed itself with result 2. Our run matches the recording at entry
-and at every update through 1,000: the tick, the C runtime, the lot and
-global streams, the globals and every object. There are two exceptions,
-both of a kind the UD1 House 69 check also has:
-- Object 2's last result.
+dialog closed itself with result 2. With the recording's frames, our run
+matches it at entry and at every update through 1,000 in what the
+comparison (track 3's `cmp_house.py`) reads: the tick, the C runtime, the
+lot and global streams, the globals, and every object's data, temps,
+attributes, frames and person data. The comparison skips any frame local
+that our port marks as starting on half of a pointer. Object 283's tree
+4099 local 7 is one, from update 14 (2609 in the original).
+
+The differences:
+- Object 2's last result, which the UD1 House 69 check shows too.
 - One word of a person's frame block. From update 112 to 157, the
   Charmings' first member (object 274) runs tree 8292 in its seventh
   frame. Its one local is 5623 in the original and 0 here. That local is
   word 77 of the person's frame block. Our block reached only 68 words
-  before this frame, so nothing had written word 77. The original's holds
-  whatever its heap left there. The UD1 recording shows the same: the same
-  person (object 274 there too) in the same frame from update 112, with
-  3244.
+  before this frame, so nothing had written word 77. The original
+  allocates the block without clearing it past its first four bytes
+  (0x4750f0, 0x4750fc), and a new frame keeps the locals it finds. The UD1
+  recording shows the same: the same person (object 274 there too) in the
+  same frame from update 112, with 3244.
+- **Relationships**, which the comparison does not read. At update 599,
+  objects 160 and 161 (two of GUID 0xF3AAA62F) are deleted, in both runs.
+  The original then drops the rows that objects 7 and 63 held toward them.
+  We keep the rows (`crates/sims-vm/src/removal.rs` leaves other objects'
+  relationships naming a deleted ID), so `IMPORTED_69_1000` holds two rows
+  the recording lacks. Where the original drops them is not yet found.
 
-So `IMPORTED_69` and `IMPORTED_69_1000` are the recording's states, apart
-from those two.
+So `IMPORTED_69` is the recording's entry. `IMPORTED_69_1000` is our run
+with the recording's frames, which differs from the recording's update
+1000 in those two rows.
