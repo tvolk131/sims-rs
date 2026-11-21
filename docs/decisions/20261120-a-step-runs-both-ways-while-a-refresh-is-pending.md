@@ -49,6 +49,7 @@ same in every cell:
 - the questions asked;
 - the objects deleted;
 - the sounds;
+- the floors whose cutaway masks were rebuilt;
 - the pie menu;
 - the action run at once;
 - the objects let go;

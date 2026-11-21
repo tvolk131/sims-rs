@@ -30,18 +30,20 @@ use crate::placement::{Kept, Pending, Refreshing};
 use crate::sounds::SoundEvent;
 use sims_formats::saved_objects::Interaction;
 use sims_sim::World;
-use std::cell::{RefCell, RefMut};
+use std::cell::{Cell, RefCell, RefMut};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Copies of what each cell an interpreter shares with the rest of the
 /// tick holds, so that a run can be made apart on them, compared with
-/// another, and kept or dropped. Every `RefCell` an [`Interpreter`] (and
-/// so a [`Machine`]) holds is here; the rest of either is values or
-/// shared inputs that nothing writes (the program, the catalog).
+/// another, and kept or dropped. Every `RefCell` and `Cell` an
+/// [`Interpreter`] (and so a [`Machine`]) holds is here; the rest of
+/// either is values or shared inputs that nothing writes (the program,
+/// the catalog).
 pub(crate) struct Cells {
     asked: Option<RefCell<Vec<Asked>>>,
     deleted: Option<RefCell<Vec<u16>>>,
     sounds: Option<RefCell<Vec<SoundEvent>>>,
+    masks_rebuilt: Option<Cell<u8>>,
     menu: Option<RefCell<Checking>>,
     /// The action of `running_at_once`.
     action: Option<RefCell<Interaction>>,
@@ -111,6 +113,7 @@ impl Cells {
             asked: copy(interpreter.asked),
             deleted: copy(interpreter.deleted),
             sounds: copy(interpreter.sounds),
+            masks_rebuilt: interpreter.masks_rebuilt.map(|c| Cell::new(c.get())),
             menu: copy(interpreter.menu),
             action: copy(interpreter.running_at_once.map(|a| a.action)),
             letting_go: copy(interpreter.letting_go),
@@ -126,6 +129,7 @@ impl Cells {
             asked: self.asked.as_ref(),
             deleted: self.deleted.as_ref(),
             sounds: self.sounds.as_ref(),
+            masks_rebuilt: self.masks_rebuilt.as_ref(),
             menu: self.menu.as_ref(),
             running_at_once: interpreter.running_at_once.zip(self.action.as_ref()).map(
                 |(a, action)| AtOnce {
@@ -147,6 +151,7 @@ impl Cells {
             asked: copy(self.asked.as_ref()),
             deleted: copy(self.deleted.as_ref()),
             sounds: copy(self.sounds.as_ref()),
+            masks_rebuilt: self.masks_rebuilt.as_ref().map(|c| Cell::new(c.get())),
             menu: copy(self.menu.as_ref()),
             action: copy(self.action.as_ref()),
             letting_go: copy(self.letting_go.as_ref()),
@@ -161,6 +166,8 @@ impl Cells {
         alike(&self.asked, &other.asked, PartialEq::eq)
             && alike(&self.deleted, &other.deleted, PartialEq::eq)
             && alike(&self.sounds, &other.sounds, PartialEq::eq)
+            && self.masks_rebuilt.as_ref().map(Cell::get)
+                == other.masks_rebuilt.as_ref().map(Cell::get)
             && alike(&self.menu, &other.menu, same_checking)
             && alike(&self.action, &other.action, |a, b| bits(a) == bits(b))
             && alike(&self.letting_go, &other.letting_go, PartialEq::eq)
@@ -191,6 +198,9 @@ impl Cells {
         put(asked, self.asked);
         put(deleted, self.deleted);
         put(sounds, self.sounds);
+        if let (Some(held), Some(copy)) = (interpreter.masks_rebuilt, self.masks_rebuilt) {
+            held.set(copy.get());
+        }
         put(menu, self.menu);
         put(action, self.action);
         put(letting_go, self.letting_go);
@@ -228,6 +238,7 @@ impl<'a> Machine<'a, '_> {
             asked: interpreter.asked,
             deleted: interpreter.deleted,
             sounds: interpreter.sounds,
+            masks_rebuilt: interpreter.masks_rebuilt,
             base: self.base,
             synchronous: self.synchronous,
             checking: self.checking,
@@ -341,6 +352,7 @@ mod tests {
             asked: None,
             deleted: None,
             sounds: None,
+            masks_rebuilt: None,
             menu: Some(RefCell::new(Checking {
                 action: action(menu_bits),
                 added: vec![],
@@ -388,9 +400,11 @@ mod tests {
         };
         let asked = RefCell::new(vec![]);
         let sounds = RefCell::new(vec![]);
+        let masks_rebuilt = Cell::new(0);
         let interpreter = Interpreter {
             asked: Some(&asked),
             sounds: Some(&sounds),
+            masks_rebuilt: Some(&masks_rebuilt),
             ..Interpreter::new(&program, &catalog, crate::Stream::Lot)
         };
         let mut cells = Cells::of(&interpreter);
@@ -398,6 +412,7 @@ mod tests {
             object: 1,
             function: 9,
         }]));
+        cells.masks_rebuilt = Some(Cell::new(3));
         let mut world = World::empty();
         let mut lot = World::empty();
         lot.globals.push(7);
@@ -410,6 +425,56 @@ mod tests {
         assert!(kept.is_err());
         assert_eq!(world.encode(), before, "the lot was not kept");
         assert!(asked.borrow().is_empty(), "no cell was kept");
+        assert_eq!(masks_rebuilt.get(), 0, "masks_rebuilt was not kept");
+    }
+
+    #[test]
+    fn masks_rebuilt_is_isolated_compared_and_kept() {
+        let program = crate::program::Program {
+            global: 0,
+            libraries: BTreeMap::new(),
+            semi_globals: BTreeMap::new(),
+            careers: None,
+            career_texts_end: false,
+            labels_hold_no_token: false,
+            zoning: BTreeMap::new(),
+            animations: Default::default(),
+            people: Default::default(),
+            icon_frames: None,
+            wardrobe: None,
+            character_files: Default::default(),
+            expansions: 0,
+            characters: Default::default(),
+        };
+        let catalog = sims_content::Catalog {
+            global: 0,
+            objects: vec![],
+            by_guid: Default::default(),
+            semi_globals: Default::default(),
+            diagnostics: vec![],
+        };
+        let masks_rebuilt = Cell::new(1);
+        let interpreter = Interpreter {
+            masks_rebuilt: Some(&masks_rebuilt),
+            ..Interpreter::new(&program, &catalog, crate::Stream::Lot)
+        };
+        let left = Cells::of(&interpreter);
+        let right = left.copy();
+        assert!(left.same(&right));
+        // Mutating the isolated copy leaves the original and the sibling untouched.
+        left.on(&interpreter).masks_rebuilt.unwrap().set(3);
+        assert_eq!(masks_rebuilt.get(), 1);
+        assert_eq!(right.on(&interpreter).masks_rebuilt.unwrap().get(), 1);
+        assert!(!left.same(&right));
+        right.on(&interpreter).masks_rebuilt.unwrap().set(3);
+        assert!(left.same(&right));
+        // A cell set differs from none.
+        let none = Cells::of(&Interpreter::new(&program, &catalog, crate::Stream::Lot));
+        assert!(!left.same(&none));
+        // Keeping writes the isolated bitmask back to the interpreter.
+        let mut world = World::empty();
+        left.keep(&interpreter, &mut world, World::empty());
+        assert_eq!(masks_rebuilt.get(), 3);
     }
 
     #[test]

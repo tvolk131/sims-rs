@@ -302,6 +302,13 @@ pub struct Update {
     /// ([`crate::sounds`]). Empty when the interpreter carries its own
     /// sink ([`Interpreter::sounds`]), which then has them.
     pub sounds: Vec<SoundEvent>,
+    /// The levels whose rooms' cutaway masks the original built again
+    /// during the update, as bits (1 for level 1, 2 for level 2): those a
+    /// room update counted, which builds them at its end at the zoom of
+    /// the moment (0x466c3c, at 0x466ef6). A view that keeps the zoom its
+    /// masks were built at reads it. Filled by [`crate::boot::Lot`]'s
+    /// steps only ([`Interpreter::masks_rebuilt`]).
+    pub masks_rebuilt: u8,
 }
 
 /// A frame of the house view that failed in play mode and was skipped

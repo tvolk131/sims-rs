@@ -49,11 +49,13 @@ impl Interpreter<'_> {
     /// 0xf0, load step 10a).
     pub fn update_rooms(&self, world: &mut World, floor: u8) -> Result<Vec<i16>, Fault> {
         let tuning = self.program.room_tuning();
-        world
+        let counted = world
             .update_rooms(&tuning, floor, &mut |world, tile| {
                 self.standing(world, tile)
             })
-            .map_err(room_fault)
+            .map_err(room_fault)?;
+        self.note_masks_rebuilt(floor);
+        Ok(counted)
     }
 
     /// The room update for the levels that have a room waiting, or
@@ -61,10 +63,34 @@ impl Interpreter<'_> {
     /// of reading a house and before it draws each frame. Returns the
     /// rooms counted.
     pub fn update_pending_rooms(&self, world: &mut World) -> Result<Vec<i16>, Fault> {
+        let floor = match world.rooms.pending {
+            1 => Some(1),
+            2 => Some(2),
+            3 => Some(0),
+            _ => None,
+        };
         let tuning = self.program.room_tuning();
-        world
+        let counted = world
             .update_pending_rooms(&tuning, &mut |world, tile| self.standing(world, tile))
-            .map_err(room_fault)
+            .map_err(room_fault)?;
+        if let Some(floor) = floor {
+            self.note_masks_rebuilt(floor);
+        }
+        Ok(counted)
+    }
+
+    /// Notes that a room update for `floor` (0 for every level) finished,
+    /// so the original built the cutaway masks of that level's rooms at
+    /// its end (0x466ef6, 0x466f0c), whether or not any room was counted
+    /// ([`Interpreter::masks_rebuilt`]).
+    fn note_masks_rebuilt(&self, floor: u8) {
+        if let Some(cell) = self.masks_rebuilt {
+            let bits = match floor {
+                0 => 3,
+                level => 1 << (level - 1),
+            };
+            cell.set(cell.get() | bits);
+        }
     }
 }
 

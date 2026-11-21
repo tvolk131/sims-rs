@@ -15,7 +15,7 @@ use sims_formats::behavior::{Behavior, Instruction};
 use sims_formats::saved_objects::Frame;
 use sims_sim::characters;
 use sims_sim::{Object, World};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 /// The deepest an object's stack may grow, counting saved frames.
 pub const MAX_STACK: usize = 128;
@@ -104,6 +104,12 @@ pub struct Interpreter<'a> {
     /// Where to note each request to the sound system, or None to note
     /// nothing. See [`crate::sounds`].
     pub sounds: Option<&'a RefCell<Vec<SoundEvent>>>,
+    /// Where to note the levels whose rooms a room update counted, as
+    /// bits (1 for level 1, 2 for level 2), or None to note nothing. The
+    /// original builds the cutaway mask of every room on such a level at
+    /// the end of the update (0x466c3c, at 0x466ef6), at the zoom of the
+    /// moment, so the view reads it ([`crate::tick::Update::masks_rebuilt`]).
+    pub masks_rebuilt: Option<&'a Cell<u8>>,
     /// The person the factory is making, while its scripts run. When in
     /// the making the original appends a person to the person vector is
     /// not read, so a walk of the vector meanwhile is refused.
@@ -187,6 +193,7 @@ impl<'a> Interpreter<'a> {
             asked: None,
             deleted: None,
             sounds: None,
+            masks_rebuilt: None,
             making_person: None,
             menu: None,
             running_at_once: None,
@@ -331,6 +338,7 @@ impl<'a> Interpreter<'a> {
             asked: self.asked,
             deleted: self.deleted,
             sounds: self.sounds,
+            masks_rebuilt: self.masks_rebuilt,
             base,
             synchronous,
             making_person: self.making_person,
@@ -417,6 +425,8 @@ pub(crate) struct Machine<'a, 'w> {
     /// See [`Interpreter::deleted`].
     pub deleted: Option<&'a RefCell<Vec<u16>>>,
     pub sounds: Option<&'a RefCell<Vec<SoundEvent>>>,
+    /// See [`Interpreter::masks_rebuilt`].
+    pub masks_rebuilt: Option<&'a Cell<u8>>,
     /// The stack depth below the frames this run owns. When a return pops
     /// the stack down to it, the run is over and the frame below is not
     /// branched.
@@ -462,6 +472,7 @@ impl<'a> Machine<'a, '_> {
             asked: self.asked,
             deleted: self.deleted,
             sounds: self.sounds,
+            masks_rebuilt: self.masks_rebuilt,
             making_person: self.making_person,
             menu: self.menu,
             running_at_once: self.running_at_once,

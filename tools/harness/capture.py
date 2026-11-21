@@ -850,7 +850,7 @@ def main():
     prior_status, dropped, torn = {}, [], dict(rows={}, ended=[])
     if args.resume:
         try:
-            torn = repair_tails(out, ('events.jsonl', 'updates.jsonl', 'watch.jsonl'))
+            torn = repair_tails(out, ('events.jsonl', 'updates.jsonl', 'watch.jsonl', 'input.jsonl'))
         except TornSidecarError:
             ap.error(f'{out / "resume-torn.json"} is not of the form this revision writes (an earlier '
                      'revision left it): read it, note its cut rows by hand, remove it, and resume again')
@@ -1207,7 +1207,8 @@ def main():
     try:
         reply = remote.stop_reply()
         event(kind='attach', reply=reply, resume=args.resume, updates=updates)
-        for a in (ENTRY, RETURN, DIALOG_SHOW, DIALOG_RESULT, DIALOG_READ, 0x415eff, scenario_input.QUEUE_PUSH):
+        for a in (ENTRY, RETURN, DIALOG_SHOW, DIALOG_RESULT, DIALOG_READ, 0x415eff,
+                  scenario_input.QUEUE_PUSH, scenario_input.QUEUE_RESULT):
             remote.clear_break(a)
             if args.resume:
                 remote.clear_break(a)
@@ -1217,6 +1218,7 @@ def main():
             arm(ENTRY)  # taken over before a dump at the next entry (or in the middle of it)
         if runner:
             arm(scenario_input.QUEUE_PUSH)
+            arm(scenario_input.QUEUE_RESULT)
         if args.resume:
             # The late watches whose updates have come: set at the first stop, even off a breakpoint.
             for w in [w for w in late if updates + 1 >= w.first]:
@@ -1322,7 +1324,11 @@ def main():
                 try:
                     lot = m.lot()
                 except MemoryError:
-                    foreign = True
+                    # A pending queue call's return in the known game process is still readable even
+                    # if m.lot() fails; tend_watches below still reads m.lot() itself for watch handling.
+                    if not (runner and pc == scenario_input.QUEUE_RESULT
+                            and sims_cr3 is not None and regs['ebp'] in runner.pending_pushes):
+                        foreign = True
             if foreign:
                 event(kind='foreign_stop', pc=pc, cr3=cr3)
             elif pc == ENTRY:
@@ -1436,6 +1442,8 @@ def main():
                         arm(ENTRY)
             elif runner and pc == scenario_input.QUEUE_PUSH:
                 runner.on_queue_push(updates + 1, bool(in_update), m, regs)
+            elif runner and pc == scenario_input.QUEUE_RESULT:
+                runner.on_queue_result(m, regs)
             elif shown_here:
                 # The earlier run handled this show (status.json's show_stop, kept from when it was
                 # handled until the step past it) and was killed before stepping past it. It was

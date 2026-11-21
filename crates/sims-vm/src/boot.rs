@@ -24,7 +24,7 @@ use sims_core::CrtRng;
 use sims_sim::World;
 use sims_sim::load::{Context, Household};
 use sims_sim::motives::Tuning;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -1007,8 +1007,10 @@ impl Lot {
         let tuning = self.tuning.as_ref().ok_or(StepError::Incomplete)?;
         let asks = self.asks;
         let sounds = RefCell::new(Vec::new());
+        let masks_rebuilt = Cell::new(0);
         let interpreter = Interpreter {
             sounds: Some(&sounds),
+            masks_rebuilt: Some(&masks_rebuilt),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
@@ -1070,6 +1072,7 @@ impl Lot {
                     // it: the errors caught, a skipped first frame, and
                     // the sounds.
                     update.sounds = sounds.take();
+                    update.masks_rebuilt = masks_rebuilt.get();
                     StepError::Tick {
                         tick,
                         start: self.start.wrapping_add(self.ticks),
@@ -1106,6 +1109,7 @@ impl Lot {
         // The step's sounds go with its update whether or not the frame
         // failed.
         update.sounds = sounds.into_inner();
+        update.masks_rebuilt = masks_rebuilt.get();
         if let Some(error) = frame {
             if play {
                 update.frame_errors.push(SkippedFrame {
