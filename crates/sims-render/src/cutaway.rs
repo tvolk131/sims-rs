@@ -255,11 +255,28 @@ impl View<'_> {
         self.corners(view)[1]
     }
 
-    /// A view tile's top corner on screen on `level`, raised by the
-    /// terrain on the lot's inner tiles (0x4a9c50).
-    fn corner(&self, p: [i32; 2], level: i32) -> [i32; 2] {
-        let height = if self.interior(p) { self.top(p) } else { 0 };
-        self.camera.project(p, level, height)
+    /// A view tile's top corner on screen on `level`, raised by terrain on
+    /// the lot's inner tiles (`0x4a9c50`), using the original's signed-byte
+    /// tile narrowing (`0x4a9c5c`..`0x4a9c71`, `0x4b3c90`..`0x4b3cef`) and
+    /// signed 16-bit projected screen coordinates (`0x4a9d9e`..`0x4a9db6`).
+    fn project_corner(&self, p: [i32; 2], level: i32) -> [i32; 2] {
+        let camera = self.camera;
+        let tile = [i32::from(p[0] as i8), i32::from(p[1] as i8)];
+        let height = if self.interior(tile) {
+            self.top(tile)
+        } else {
+            0
+        };
+        let z = camera.zoom.level();
+        let x = (tile[0] - tile[1])
+            .wrapping_mul(8 << z)
+            .wrapping_add(camera.origin[0]);
+        let y = (tile[0] + tile[1])
+            .wrapping_mul(4 << z)
+            .wrapping_add(camera.origin[1])
+            .wrapping_sub(camera.zoom.floor_height().wrapping_mul(level - 1))
+            .wrapping_sub(height.wrapping_shl(z + 1));
+        [i32::from(x as i16), i32::from(y as i16)]
     }
 
     /// The view tile under screen point `at` on the level shown, by the
@@ -275,28 +292,7 @@ impl View<'_> {
         let dy = i32::from((at[1] as i16).wrapping_sub(camera.origin[1] as i16));
         let shift = camera.zoom.level() + 3;
         let mut best = [dy.wrapping_add(dx) >> shift, dy.wrapping_sub(dx) >> shift];
-        // 0x4a9c50 (0x4a9c5c..0x4a9c71, 0x4a9d9e..0x4a9db6) and 0x4b3c88
-        // (0x4b3c90..0x4b3cef): each projected tile narrows to signed bytes
-        // and returns signed 16-bit screen coordinates.
-        let project = |p: [i32; 2]| -> [i32; 2] {
-            let tile = [i32::from(p[0] as i8), i32::from(p[1] as i8)];
-            let height = if self.interior(tile) {
-                self.top(tile)
-            } else {
-                0
-            };
-            let z = camera.zoom.level();
-            let x = (tile[0] - tile[1])
-                .wrapping_mul(8 << z)
-                .wrapping_add(camera.origin[0]);
-            let y = (tile[0] + tile[1])
-                .wrapping_mul(4 << z)
-                .wrapping_add(camera.origin[1])
-                .wrapping_sub(camera.zoom.floor_height().wrapping_mul(level - 1))
-                .wrapping_sub(height.wrapping_shl(z + 1));
-            [i32::from(x as i16), i32::from(y as i16)]
-        };
-        let mut parity = usize::from(project(best)[0] >= at16[0]);
+        let mut parity = usize::from(self.project_corner(best, level)[0] >= at16[0]);
         let mut scan = best;
         // Fast-forward pairs of alternating steps while scan[0] < 0 || scan[1] < 0:
         // every two iterations add (+1, +1) to `scan` and preserve `parity & 1`.
@@ -326,17 +322,17 @@ impl View<'_> {
                 if scan[axis] >= upper[axis] {
                     break;
                 }
-                if project(scan)[1] < at16[1] {
+                if self.project_corner(scan, level)[1] < at16[1] {
                     best = scan;
                 }
             }
         }
         loop {
             spend()?;
-            let p = project(best);
+            let p = self.project_corner(best, level);
             if at16[0] < p[0] {
                 let next = [best[0], best[1].checked_add(1)?];
-                let edge = ratio(p, project(next))?;
+                let edge = ratio(p, self.project_corner(next, level))?;
                 if ratio(p, at16)? <= edge {
                     break;
                 }
@@ -345,7 +341,7 @@ impl View<'_> {
                 break;
             } else {
                 let next = [best[0].checked_add(1)?, best[1]];
-                let edge = ratio(p, project(next))?;
+                let edge = ratio(p, self.project_corner(next, level))?;
                 if edge <= ratio(p, at16)? {
                     break;
                 }
@@ -360,24 +356,36 @@ impl View<'_> {
     /// spot within it on the terrain's slope (0x4a97c3 with flag one).
     fn fine(&self, at: [i32; 2]) -> Option<[i32; 2]> {
         let tile = self.coarse(at)?;
-        let whole = [tile[0].checked_mul(16)?, tile[1].checked_mul(16)?];
-        if !self.interior(tile) {
+        let whole = [tile[0].wrapping_shl(4), tile[1].wrapping_shl(4)];
+        // 0x4a9a29..0x4a9a8b: the interior bounds check and terrain corner
+        // lookup narrow the coarse tile to signed bytes.
+        let narrowed = [i32::from(tile[0] as i8), i32::from(tile[1] as i8)];
+        if !self.interior(narrowed) {
             return Some(whole);
         }
         let zoom = self.camera.zoom;
-        let h = self.corners(tile);
-        let center = self.corner(tile, 1);
-        let left = at[0] < center[0];
+        let h = self.corners(narrowed);
+        let center = self.project_corner(tile, 1);
+        let at16 = [i32::from(at[0] as i16), i32::from(at[1] as i16)];
+        let left = at16[0] < center[0];
         let width = zoom.tile_width() / 2;
-        let side_x = center[0] + if left { -width } else { width };
+        let side_x = i32::from((center[0] as i16).wrapping_add(if left {
+            -(width as i16)
+        } else {
+            width as i16
+        }));
         let raise = |steps: i32| steps << (zoom.level() + 1);
-        let side_y = center[1] + raise(h[1] - h[if left { 0 } else { 2 }] + 2);
-        let bottom_y = center[1] + raise(h[1] - h[3] + 4);
+        let side_y = i32::from(
+            (center[1] as i16).wrapping_add(raise(h[1] - h[if left { 0 } else { 2 }] + 2) as i16),
+        );
+        let bottom_y = i32::from((center[1] as i16).wrapping_add(raise(h[1] - h[3] + 4) as i16));
         let denominator = f64::from(center[0] - side_x);
         let first = f64::from(center[1] - side_y) / denominator;
         let second = f64::from(bottom_y - side_y) / denominator;
-        let shifted_y = f64::from(at[1] + zoom.floor_height() * (self.storey() - 1));
-        let mouse_x = f64::from(at[0]);
+        let shifted_y = f64::from(i32::from(
+            (at[1] as i16).wrapping_add((zoom.floor_height() * (self.storey() - 1)) as i16),
+        ));
+        let mouse_x = f64::from(at16[0]);
         let [side_x, side_y] = [side_x, side_y].map(f64::from);
         // The original keeps one result in a float and one in a double.
         let (stored, retained) = if first == second {
@@ -1136,15 +1144,16 @@ mod tests {
         assert_eq!(picked.map(|n| (n >> 4) as i8), [-56, -56]);
 
         // Far zoom, 800×600 view, origin [381, -3997]: signed-byte narrowing in
-        // 0x4a9c50/0x4b3c88 and signed-16-bit screen deltas in 0x4a9581..0x4a9588
-        // give [269, 268] -> signed byte [13, 12] (not [13, 11]).
+        // 0x4a9c50/0x4b3c88, signed-16-bit screen deltas in 0x4a9581..0x4a9588,
+        // and the signed-byte interior check in 0x4a9a29..0x4a9a8b give coarse
+        // [269, 268] (signed byte [13, 12]) and fine [4306, 4303].
         let wrapped = Camera {
             origin: [381, -3997],
             ..c
         };
         let picked_wrapped =
             screen_centre_pick(&lot, &wrapped, [800, 600]).expect("off-lot narrowed pick");
-        assert_eq!(picked_wrapped, [269 << 4, 268 << 4]);
+        assert_eq!(picked_wrapped, [4306, 4303]);
         assert_eq!(picked_wrapped.map(|n| (n >> 4) as i8), [13, 12]);
 
         // Negative off-lot origin: fast-forwards Loop 1 without exhausting the
@@ -1157,11 +1166,10 @@ mod tests {
         assert_eq!(picked_neg.map(|n| n >> 4), [-294, -294]);
 
         // Extreme coordinates wrap cleanly at 16-bit screen / 8-bit tile widths
-        // without panicking.
-        let extreme = Camera {
-            origin: [i32::MAX, i32::MIN],
-            ..c
-        };
-        let _ = screen_centre_pick(&lot, &extreme, [800, 600]);
+        // without panicking even in checked/debug builds.
+        for origin in [[i32::MAX, i32::MIN], [i32::MAX, 0]] {
+            let extreme = Camera { origin, ..c };
+            let _ = screen_centre_pick(&lot, &extreme, [800, 600]);
+        }
     }
 }

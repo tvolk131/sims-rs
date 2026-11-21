@@ -114,6 +114,7 @@ pub mod scope {
     pub const TEMPS: u8 = 8;
     pub const PARAMETERS: u8 = 9;
     pub const STACK_OBJECT: u8 = 10;
+    pub const MY_PERSON: u8 = 18;
     pub const STACK_PERSON: u8 = 19;
     pub const LOCALS: u8 = 25;
 }

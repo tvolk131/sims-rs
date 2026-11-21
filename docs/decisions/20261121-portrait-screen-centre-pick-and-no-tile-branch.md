@@ -36,11 +36,13 @@ items in the dialog portrait path (`0x4e92a8` → `0x4e8c5d` → `0x4e9652`):
      `-2 * ARRAY_SIZE..3 * ARRAY_SIZE`: `0x4a9581`–`0x4a9588` narrows the
      initial screen deltas to signed 16-bit values, and `0x4a9c5c`–`0x4a9c71`
      / `0x4b3c90`–`0x4b3c93` / `0x4a9d9e`–`0x4a9db6` narrow each projected tile
-     to signed bytes and return signed 16-bit screen coordinates. For example,
-     at far zoom on an 800×600 view, origin `[400, -2900]` returns `[200, 200]`
-     (signed byte `[-56, -56]`, triggering the rotated midpoint fallback) and
-     origin `[381, -3997]` returns `[269, 268]` (signed byte `[13, 12]`,
-     passing the interior bounds check).
+     to signed bytes and return signed 16-bit screen coordinates. `0x4a9a29`–`0x4a9b4d`
+     applies the same signed-byte tile narrowing and 16-bit screen coordinate
+     arithmetic in `View::fine`. For example, at far zoom on an 800×600 view,
+     origin `[400, -2900]` returns coarse `[200, 200]` (signed byte
+     `[-56, -56]`, triggering the rotated midpoint fallback) and origin
+     `[381, -3997]` returns fine `[4306, 4303]` (coarse `[269, 268]`, signed
+     byte `[13, 12]`, passing the interior bounds check).
 2. **Search start bounds check, fallback, and inverse turn (`0x434861`–`0x434921`).**
    - `0x434885` (`0x433067`) cuts the fine point to a signed-byte view tile
      `[(x >> 4) as i8, (y >> 4) as i8]`.
@@ -61,11 +63,13 @@ items in the dialog portrait path (`0x4e92a8` → `0x4e8c5d` → `0x4e9652`):
 3. **Dirty-slot gate, clean-slot `BMP_` 2002 path, and dirty-slot no-tile fallback (`0x4e92a8`, `0x4e92e5`, `0x4e9652`, `0x4e9706`, `0x4e9260`, `0x4e938c`, `0x4538fd`–`0x4539cf`).**
    - Every portrait table entry starts with all seven slots empty and clean
      (`0x4e890a` → `0x4e88fa`). Writing person data words 68, 74, or 84
-     (`0x4538fd`–`0x4539cf` → `0x45810c(1)` → `0x4eb0eb` → `0x4e895e`) or
-     creating a person with `pd[84]&1 || pd[68]&1 || pd[74]&3` (`0x44e6b6`–`0x44e712`)
-     releases all seven cached images and sets every slot's dirty byte `+0x18`
-     to `1`. Storing any non-null image (`0x4e899e`) clears that slot's dirty
-     byte to `0`.
+     (`0x4538fd`–`0x4539cf` → `0x4539c7` reading `[esi+0x11c]` → `0x45810c(1)`
+     → `0x4eb0eb` → `0x4e895e`, using the **running** object's definition even
+     for scope-19 `Stack Person Data` writes) or creating a person with
+     `pd[84]&1 || pd[68]&1 || pd[74]&3` (`0x44e6b6`–`0x44e712`) releases all
+     seven cached images and sets every slot's dirty byte `+0x18` to `1`.
+     Storing any non-null image (`0x4e899e`) clears that slot's dirty byte to
+     `0`.
    - **Clean, empty slot with `BMP_` 2002 (0 builds):** at `0x4e92e5`,
      `slot1.dirty == 0` skips `0x4e92f2` (`0x4e8c5d(index, 1, 0)`). Slot 1 is
      still empty (`0x4e9315`), so `0x4e9338` calls `0x4e9260(entry, 2002, &bmp)`,
@@ -76,12 +80,13 @@ items in the dialog portrait path (`0x4e92a8` → `0x4e8c5d` → `0x4e9652`):
    - **Read-only resources (`0x4e8cc6`):** inside `0x4e8c5d`, an off-lot build
      checks `iResFile::CanWrite` (`vtable[+0x20]`) before calling `0x4e9652`.
      Only loose `.iff` files under `UserData*/Characters` (`0x43c6b9`,
-     `0x43c2c1`, `0x43c5bf` → `0x43e48a` → `0x465970` → `0x413083`) and
-     runtime-made character files are opened writable; FAR archive members
-     (`ResolveResFile`, `0x5cfb38`) and non-`Characters` mounts (`0x43aa03`)
-     return `false`. For a read-only off-lot resource, `0x4e8c5d` skips
-     `0x4e9652` completely, so `0x4e9338` loads `BMP_` 2002 (clearing dirty)
-     when present and otherwise leaves slot 1 empty with zero builds.
+     `0x43c2c1`, `0x43c5bf` → `0x43e48a` → `0x465970` → `0x413083`) whose
+     read-write open succeeds (`0x413094`–`0x4130dd`, falling back to read-only
+     when open fails) and runtime-made character files are writable; FAR
+     archive members (`ResolveResFile`, `0x5cfb38`) and non-`Characters` mounts
+     (`0x43aa03`) return `false`. For a read-only off-lot resource, `0x4e8c5d`
+     skips `0x4e9652` completely, so `0x4e9338` loads `BMP_` 2002 (clearing
+     dirty) when present and otherwise leaves slot 1 empty with zero builds.
    - **Dirty, empty slot on a writable resource with `BMP_` 2002 (1 build +
      no-tile fallback):** at `0x4e92e5`, `slot1.dirty != 0` calls
      `0x4e92f2: 0x4e8c5d(index, 1, 0)` (`save = 0`). If `0x4347f0` finds a
@@ -100,14 +105,21 @@ items in the dialog portrait path (`0x4e92a8` → `0x4e8c5d` → `0x4e9652`):
      `0x4e8d2e` → `0x4e9000`):** when `0x4e9260(2002)` fails, `0x4e938c` calls
      `0x4e8c5d(index, 1, 1)` (`save = 1`). When that build succeeds (on-lot or
      writable off-lot `Found`) on a writable file (`0x4e9031`), `0x4e9000`
-     writes `BMP_` 2002 so a later invalidation + no-tile fallback can load it.
-     On a writable off-lot `NotFound`, a dirty slot would run a second build at
-     `0x4e938c` and a clean slot leaves slot 1 empty; both fail loudly.
+     writes `BMP_` 2002 into the type's resource file (`0x4e904e`–`0x4e90ab`),
+     so any subsequent lookup (`0x4e926a`–`0x4e9287`) for any definition in that
+     same resource file sees `BMP_` 2002. On a writable off-lot `NotFound`, a
+     dirty slot would run a second build at `0x4e938c` and a clean slot leaves
+     slot 1 empty; both fail loudly.
    - **Runtime-made person types (`0x4265fd` → `0x4e8a3a` → `0x4e8add`):**
-     cloning a character calls `0x4e8a3a`, which appends every new `type == 2`
-     definition to the portrait table `0x6f2698` once initialized
-     (`[0x6f26a4] = 1` at `0x4e8a32`), with a writable character file and no
-     initial `BMP_` 2002.
+     cloning a character copies every resource from the template
+     (`0x472356`–`0x472519`, including `BMP_` 2002 on shipped `TemplateCat.iff`
+     and `TemplateDog.iff`) into a new writable `User%05d.iff` and calls
+     `0x4e8a3a`, which appends every new `type == 2` definition to the portrait
+     table `0x6f2698` once initialized (`[0x6f26a4] = 1` at `0x4e8a32`).
+     Positive-age pet creation in `Make New Character` additionally calls
+     `0x44b126` → `0x4e8c5d(index, 0x1f, 1)`; because `make_character` does not
+     model that call, an off-lot dialog for a runtime-made pet whose template
+     lacked `BMP_` 2002 fails loudly rather than guessing.
 
 ## Decision
 
@@ -141,9 +153,14 @@ items in the dialog portrait path (`0x4e92a8` → `0x4e8c5d` → `0x4e9652`):
      `pd[84]&1 || pd[68]&1 || pd[74]&3` (`0x44e712`); clear dirty when
      `portraits` is populated (`0x4e899e`).
    - Record `Library::has_portrait_bitmap` (`BMP_` 2002 exists and decodes) and
-     `Library::writable` (loose file under the `Characters` mount) in
-     `Program::load`; treat runtime-made person types (`World::characters`) as
-     listed (`0x4265fd` → `0x4e8a3a`), writable, and without initial `BMP_` 2002.
+     `Library::writable` (loose file under the `Characters` mount whose
+     read-write open succeeds, `0x413094`–`0x4130dd`) in `Program::load`; treat
+     runtime-made person types (`World::characters`) as listed (`0x4265fd` →
+     `0x4e8a3a`), writable, and inheriting `has_portrait_bitmap` from their
+     template (`0x472356`–`0x472519`), failing loudly on a runtime-made pet
+     without `BMP_` 2002 (`0x44b126`). Look up `World::saved_portraits` at the
+     resource-file level for non-made catalog definitions (`0x4e904e`–`0x4e90ab`,
+     `0x4e926a`–`0x4e9287`) and per-GUID for runtime-made characters.
    - Split portrait placement into `portrait_search` (`Found`, `NotFound`,
      `Mixed`) and `portrait_place(&World, ...)` (borrowing `&World` immutably
      and touching no interpreter cells, explicitly rejecting `object.selected`,

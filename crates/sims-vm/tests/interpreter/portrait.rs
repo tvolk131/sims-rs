@@ -147,44 +147,78 @@ fn a_portrait_the_port_cannot_tell_was_built_fails_loudly() {
 #[test]
 fn a_runtime_made_person_type_is_listed_in_the_portrait_table() {
     // 0x4265fd calls 0x4e8a3a once the table is initialized ([0x6f26a4] = 1 at
-    // 0x4e8a32), appending newly created person types at 0x4e8add.
+    // 0x4e8a32), appending newly created person types at 0x4e8add. Cloning
+    // copies every resource from the template (0x472356..0x472519), including
+    // BMP_ 2002 when present (as on TemplateCat.iff and TemplateDog.iff), into
+    // a new writable User%05d.iff file.
     const MADE_GUID: u32 = 0x5555_0001;
-    let (mut fx, widget_file, _) = visitors();
-    // Even if the template file has BMP_ 2002, a freshly created character file
-    // does not carry BMP_ 2002 yet and is always writable.
-    let template = fx.program.libraries.get_mut(&widget_file).unwrap();
+    let attach_made =
+        |fx: &mut Fixture, strings: std::collections::BTreeMap<usize, String>| -> i16 {
+            fx.world.characters.made.insert(
+                MADE_GUID,
+                sims_sim::characters::Character {
+                    template: WIDGET,
+                    file: 3,
+                    strings,
+                },
+            );
+            fx.world
+                .neighbors
+                .slots
+                .push(Some(sims_sim::neighbors::Neighbor {
+                    id: (fx.world.neighbors.slots.len() + 1) as i16,
+                    guid: MADE_GUID,
+                    revision: 7,
+                    data: vec![12; 256],
+                    relationships: Vec::new(),
+                    friends: 0,
+                    stale: false,
+                }));
+            fx.world.neighbors.slots.len() as i16
+        };
+
+    // 1. Template with BMP_ 2002 (e.g. TemplateCat/TemplateDog): the clone
+    //    inherits BMP_ 2002, so a clean off-lot dialog loads directly with
+    //    zero builds even on a blocked lot (and is not read-only even if the
+    //    template file was read-only).
+    let (mut fx_bmp, widget_file, _) = visitors();
+    fx_bmp.world.size = 2;
+    let template = fx_bmp.program.libraries.get_mut(&widget_file).unwrap();
     template.has_portrait_bitmap = true;
     template.writable = false;
-    fx.world.characters.made.insert(
-        MADE_GUID,
-        sims_sim::characters::Character {
-            template: WIDGET,
-            file: 3,
-            strings: Default::default(),
-        },
-    );
-    fx.world
-        .neighbors
-        .slots
-        .push(Some(sims_sim::neighbors::Neighbor {
-            id: (fx.world.neighbors.slots.len() + 1) as i16,
-            guid: MADE_GUID,
-            revision: 7,
-            data: vec![12; 256],
-            relationships: Vec::new(),
-            friends: 0,
-            stale: false,
-        }));
-    let made_record = fx.world.neighbors.slots.len() as i16;
-    // Off-lot: builds once (does not inherit template's BMP_ 2002 or read-only
-    // flag) and saves BMP_ 2002 via 0x4e938c → 0x4e9000.
+    let made_record = attach_made(&mut fx_bmp, Default::default());
+    let before = as_with_no_portrait(&fx_bmp, made_record);
+    assert_eq!(inform(&mut fx_bmp, 2, made_record), Ok(true));
+    assert_eq!(fx_bmp.world.portraits, [MADE_GUID].into());
+    assert!(fx_bmp.world.saved_portraits.is_empty());
+    assert_eq!(rest(&fx_bmp), before);
+
+    // 2. Template without BMP_ 2002 (e.g. TemplatePerson): the clone's own
+    //    User%05d.iff is writable even if the template was read-only, so an
+    //    off-lot dialog builds once and saves BMP_ 2002 at 0x4e938c → 0x4e9000.
+    let (mut fx, widget_file, _) = visitors();
+    fx.program.libraries.get_mut(&widget_file).unwrap().writable = false;
+    let made_record = attach_made(&mut fx, Default::default());
     let before = as_with_no_portrait(&fx, made_record);
     assert_eq!(inform(&mut fx, 2, made_record), Ok(true));
     assert_eq!(fx.world.portraits, [MADE_GUID].into());
     assert_eq!(fx.world.saved_portraits, [MADE_GUID].into());
     assert_ne!(rest(&fx), before);
 
-    // On-lot: builds directly with zero temporary persons.
+    // 3. Positive-age runtime-made pet whose template lacks BMP_ 2002:
+    //    Make New Character does not model 0x44b126 → 0x4e8c5d(index, 0x1f, 1),
+    //    so fail loudly rather than guessing whether BMP_ 2002 was saved.
+    let (mut fx_pet, _, _) = visitors();
+    let pet_record = attach_made(&mut fx_pet, [(12usize, "catmale".to_string())].into());
+    let fault = inform(&mut fx_pet, 2, pet_record).unwrap_err().to_string();
+    assert!(
+        fault.contains("0x44b126") && fault.contains("0x4e8c5d"),
+        "{fault}"
+    );
+    assert!(fx_pet.world.portraits.is_empty());
+
+    // 4. On-lot: builds directly with zero temporary persons and records
+    //    MADE_GUID (not its template GUID).
     let (mut fx_on, _, _) = visitors();
     fx_on.world.characters.made.insert(
         MADE_GUID,
@@ -1874,10 +1908,37 @@ fn a_clean_portrait_with_bmp_2002_loads_without_creating_a_person() {
     assert!(sounds.borrow().is_empty(), "{:?}", sounds.borrow());
     assert_eq!(rest(&fx), before);
 
-    // Writing person data words 68, 74, or 84 on a person (0x4538fd..0x4539cf)
-    // releases its cached portrait and marks slot 1 dirty (0x4eb0eb → 0x4e895e),
-    // so a later off-lot dialog runs one build at 0x4e92f2 and clears dirty.
+    // Writing person data words 68, 74, or 84 calls 0x45810c(1) on [esi+0x11c]
+    // (0x4539c7) — the running object's definition (`me`), even in scope 19
+    // (Stack Person Data) when targeting another person.
     for word in [68i16, 74, 84] {
+        // 1. SIM writing My Person Data dirties SIM_GUID.
+        let mut fx = Fixture::new();
+        fx.world.people = vec![SIM];
+        fx.world.portraits.insert(SIM_GUID);
+        fx.add(
+            SIM_FILE,
+            4096,
+            tree(vec![assign(
+                scope::MY_PERSON,
+                word,
+                scope::LITERAL,
+                0,
+                RETURN_TRUE,
+            )]),
+        );
+        assert_eq!(fx.run_with(SIM, 4096, 0, &[], 1000), Ok(true));
+        assert!(
+            !fx.world.portraits.contains(&SIM_GUID),
+            "SIM writing My Person Data[{word}] releases cached portrait"
+        );
+        assert!(
+            fx.world.dirty_portraits.contains(&SIM_GUID),
+            "SIM writing My Person Data[{word}] marks slot 1 dirty"
+        );
+
+        // 2. A non-person (LAMP) writing Stack Person Data targeting SIM does
+        //    NOT dirty SIM_GUID because [esi+0x11c] is LAMP's definition.
         let mut fx = Fixture::new();
         fx.world.people = vec![SIM];
         fx.world.portraits.insert(SIM_GUID);
@@ -1894,12 +1955,42 @@ fn a_clean_portrait_with_bmp_2002_loads_without_creating_a_person() {
         );
         assert_eq!(fx.run_with(LAMP, 4096, SIM as i16, &[], 1000), Ok(true));
         assert!(
-            !fx.world.portraits.contains(&SIM_GUID),
-            "writing pd[{word}] releases cached portrait"
+            fx.world.portraits.contains(&SIM_GUID),
+            "LAMP writing Stack Person Data[{word}] keeps SIM's cached portrait"
         );
         assert!(
-            fx.world.dirty_portraits.contains(&SIM_GUID),
-            "writing pd[{word}] marks slot 1 dirty"
+            fx.world.dirty_portraits.is_empty(),
+            "LAMP writing Stack Person Data[{word}] does not dirty SIM"
+        );
+
+        // 3. SIM writing Stack Person Data targeting another person (WIDGET)
+        //    dirties SIM_GUID ([esi+0x11c]), NOT WIDGET.
+        let (mut fx, _, _) = visitors();
+        let mut other = object(40, WIDGET);
+        other.person = Some(person_data());
+        fx.world.objects.insert(40, other);
+        fx.world.people.push(40);
+        fx.world.portraits.insert(SIM_GUID);
+        fx.world.portraits.insert(WIDGET);
+        fx.add(
+            SIM_FILE,
+            4096,
+            tree(vec![assign(
+                scope::STACK_PERSON,
+                word,
+                scope::LITERAL,
+                0,
+                RETURN_TRUE,
+            )]),
+        );
+        assert_eq!(fx.run_with(SIM, 4096, 40, &[], 1000), Ok(true));
+        assert!(
+            !fx.world.portraits.contains(&SIM_GUID) && fx.world.dirty_portraits.contains(&SIM_GUID),
+            "SIM writing Stack Person Data[{word}] on WIDGET dirties SIM"
+        );
+        assert!(
+            fx.world.portraits.contains(&WIDGET) && !fx.world.dirty_portraits.contains(&WIDGET),
+            "SIM writing Stack Person Data[{word}] on WIDGET leaves WIDGET clean"
         );
     }
 }
@@ -2117,4 +2208,61 @@ fn a_successful_clean_build_saves_bmp_2002_for_a_later_no_tile_fallback() {
         fault.contains("0x4e9706") && fault.contains("0x4e938c"),
         "{fault}"
     );
+}
+
+#[test]
+fn a_saved_bmp_2002_applies_to_every_definition_in_the_same_file() {
+    // 0x4e904e..0x4e90ab writes BMP_ 2002 into the type's resource file, and
+    // 0x4e926a..0x4e9287 reads BMP_ 2002 back from that file. A clean build
+    // for one person definition in a shared writable file therefore makes
+    // BMP_ 2002 available to another person definition in that same file.
+    const SIBLING: u32 = 0x5555_0002;
+    let (mut fx, widget_file, widget_record) = visitors();
+    let index = fx.catalog.objects.len();
+    fx.catalog.objects.push(sims_content::Object {
+        guid: SIBLING,
+        resource: widget_file,
+        chunk: 129,
+        kind: 2,
+        master: 0,
+    });
+    fx.catalog.by_guid.insert(SIBLING, index);
+    let lib = fx.program.libraries.get_mut(&widget_file).unwrap();
+    let words = *lib.definitions.get(&128).unwrap();
+    lib.definitions.insert(129, words);
+    let callbacks = lib.callbacks.get(&128).unwrap().clone();
+    lib.callbacks.insert(129, callbacks);
+    crate::person_factory::equip(&mut fx, SIBLING, "sibling", 12);
+    let sibling_record = fx.world.neighbors.slots.len() as i16;
+
+    // 1. Clean off-lot build for WIDGET writes BMP_ 2002 into `widget_file`.
+    assert_eq!(
+        inform_from(&mut fx, 2, widget_record, Some([1, 1])),
+        Ok(true)
+    );
+    assert_eq!(fx.world.saved_portraits, [WIDGET].into());
+
+    // 2. Clean off-lot dialog for SIBLING (in `widget_file`) now loads that
+    //    BMP_ 2002 directly with zero builds even on a blocked lot.
+    fx.world.dialogs.records.clear();
+    fx.world.size = 2;
+    let before = as_with_no_portrait(&fx, sibling_record);
+    assert_eq!(
+        inform_from(&mut fx, 2, sibling_record, Some([1, 1])),
+        Ok(true)
+    );
+    assert!(fx.world.portraits.contains(&SIBLING));
+    assert_eq!(rest(&fx), before);
+
+    // 3. Dirty off-lot dialog for SIBLING on the blocked lot falls back to
+    //    the shared file's saved BMP_ 2002 cleanly at 0x4e9338.
+    fx.world.portraits.remove(&SIBLING);
+    fx.world.dirty_portraits.insert(SIBLING);
+    fx.world.dialogs.records.clear();
+    assert_eq!(
+        inform_from(&mut fx, 2, sibling_record, Some([1, 1])),
+        Ok(true)
+    );
+    assert!(fx.world.portraits.contains(&SIBLING));
+    assert!(!fx.world.dirty_portraits.contains(&SIBLING));
 }

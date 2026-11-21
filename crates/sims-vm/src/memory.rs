@@ -795,11 +795,17 @@ impl Machine<'_, '_> {
             Cell::StackObject => Some(&mut top_mut(world, me)?.stack_object),
         };
         *target.ok_or_else(|| Trap::Invalid("word out of range".into()))? = value;
-        if let Cell::Person(id, 68 | 74 | 84) = cell
-            && let Some(guid) = world.objects.get(&id).map(|object| object.guid)
+        // 0x4538fd..0x4539cf: writing person data words 68, 74, or 84 calls
+        // 0x45810c(1) on `[esi+0x11c]` — the running object's definition
+        // (`self.me`, even for scope 19 Stack Person Data writes targeting
+        // another object). `0x45810c` → `0x4eb0eb` → `0x4e9753` releases and
+        // dirties all seven slots iff that definition is in the portrait table.
+        if let Cell::Person(_, 68 | 74 | 84) = cell
+            && let Some(guid) = self.world.objects.get(&me).map(|object| object.guid)
+            && self.listed_person_type(guid)?
         {
-            world.portraits.remove(&guid);
-            world.dirty_portraits.insert(guid);
+            self.world.portraits.remove(&guid);
+            self.world.dirty_portraits.insert(guid);
         }
         Ok(true)
     }

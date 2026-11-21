@@ -1463,9 +1463,10 @@ impl Interpreter<'_> {
     ///    into its head slot), person word 77 > 0 (0x4477fb), or person
     ///    word 81 >= 10 (0x447a82).
     ///
-    /// Takes `&World` so `Ok(())` statically proves that placing the
-    /// temporary person leaves the exact same world and cells as removing
-    /// it unput (`0x4e9706`).
+    /// Borrows `world` immutably and touches no interpreter cells, so passing
+    /// guarantees `portrait_place` leaves the modeled state untouched; that the
+    /// original's put and immediate removal undo room and tile placement for
+    /// the remaining unmodeled work remains an unverified assumption.
     pub(crate) fn portrait_place(
         &self,
         world: &World,

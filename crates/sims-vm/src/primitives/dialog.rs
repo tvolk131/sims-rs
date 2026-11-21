@@ -434,14 +434,34 @@ impl Machine<'_, '_> {
         if !self.listed_person_type(guid)? {
             return Ok(());
         }
-        let made = self.world.characters.made.contains_key(&guid);
-        let library = crate::interpreter::object_definition(self.catalog, self.world, guid)
-            .and_then(|entry| self.program.libraries.get(&entry.resource));
+        let made = self.world.characters.made.get(&guid);
+        let entry = crate::interpreter::object_definition(self.catalog, self.world, guid);
+        let library = entry.and_then(|entry| self.program.libraries.get(&entry.resource));
         // Runtime-made characters live in loose writable files under
-        // `Characters/User%05d.iff` with no initial BMP_ 2002.
-        let writable = made || library.is_some_and(|library| library.writable);
-        let has_bitmap = self.world.saved_portraits.contains(&guid)
-            || (!made && library.is_some_and(|library| library.has_portrait_bitmap));
+        // `Characters/User%05d.iff` whose resources (including any BMP_ 2002,
+        // such as TemplateCat.iff / TemplateDog.iff) were copied from the
+        // template at 0x472356..0x472519.
+        let writable = made.is_some() || library.is_some_and(|library| library.writable);
+        // 0x4e904e..0x4e90ab writes BMP_ 2002 to the type's resource file and
+        // 0x4e926a..0x4e9287 reads it from that same file: a save for any
+        // non-made GUID in `entry.resource` makes BMP_ 2002 available to every
+        // definition sharing that file, whereas each runtime-made character
+        // has its own dedicated `User%05d.iff`.
+        let saved_in_file = if made.is_some() {
+            self.world.saved_portraits.contains(&guid)
+        } else {
+            entry.is_some_and(|entry| {
+                self.world.saved_portraits.iter().any(|&saved| {
+                    !self.world.characters.made.contains_key(&saved)
+                        && self
+                            .catalog
+                            .object(saved)
+                            .is_some_and(|other| other.resource == entry.resource)
+                })
+            })
+        };
+        let has_bitmap =
+            saved_in_file || library.is_some_and(|library| library.has_portrait_bitmap);
         let dirty = self.world.dirty_portraits.contains(&guid);
         let on_lot = self.world.people.iter().any(|id| {
             self.world
@@ -475,6 +495,27 @@ impl Machine<'_, '_> {
                 self.world.dirty_portraits.remove(&guid);
             }
             return Ok(());
+        }
+        // Make New Character's positive-age pet path (0x44b051) calls
+        // 0x44b126 → 0x4e8c5d(index, 0x1f, 1), which is not modeled there.
+        // Shipped TemplateCat/TemplateDog carry BMP_ 2002 (so clean dialogs
+        // already returned above and dirty dialogs already have `has_bitmap`),
+        // but for a custom pet template lacking BMP_ 2002 we cannot tell
+        // whether 0x44b126 populated slot 1 and saved BMP_ 2002.
+        if !has_bitmap
+            && let Some(character) = made
+            && character.strings.get(&12).is_some_and(|g| {
+                g.eq_ignore_ascii_case("dogmale")
+                    || g.eq_ignore_ascii_case("dogfemale")
+                    || g.eq_ignore_ascii_case("catmale")
+                    || g.eq_ignore_ascii_case("catfemale")
+            })
+        {
+            return Err(Trap::Unsupported(format!(
+                "a dialog's portrait of runtime-made pet 0x{guid:08X} without BMP_ 2002: whether \
+                 positive-age Make New Character built and saved its portrait at 0x44b126 \
+                 (0x4e8c5d) is not kept"
+            )));
         }
         let family = i32::from(self.world.globals.get(9).copied().unwrap_or(0));
         if self
@@ -584,7 +625,7 @@ impl Machine<'_, '_> {
     /// `[0x6f26a4] = 1` at `0x4e8a32`) plus every person type made while the
     /// game ran (`0x4265fd` calls `0x4e8a3a`, which appends new person types
     /// at `0x4e8add`).
-    fn listed_person_type(&self, guid: u32) -> Result<bool, Trap> {
+    pub(crate) fn listed_person_type(&self, guid: u32) -> Result<bool, Trap> {
         Ok(
             crate::interpreter::object_definition(self.catalog, self.world, guid).is_some()
                 && self.definition_words(guid)?[TYPE] == PERSON_TYPE,

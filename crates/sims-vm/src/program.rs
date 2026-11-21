@@ -355,11 +355,20 @@ impl Program {
         library.has_portrait_bitmap = iff
             .get(b"BMP_", PORTRAIT_BITMAP)
             .is_some_and(|chunk| sims_formats::bitmap::bmp(iff.data(chunk)).is_ok());
+        // 0x43c6b9/0x43c2c1/0x43c5bf → 0x43e48a → 0x465970 → 0x413094..0x4130dd:
+        // only loose files under `Characters` are opened with writable = 1, and
+        // `FlatFile::Open` sets `CanWrite()` (byte +8) only if the read-write
+        // open actually succeeds (falling back to read-only on failure).
         library.writable = file.member.is_none()
             && index
                 .mounts
                 .get(file.mount)
-                .is_some_and(|m| m.path == Index::CHARACTERS);
+                .is_some_and(|m| m.path == Index::CHARACTERS)
+            && std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&file.path)
+                .is_ok();
         // The string tables as the original's loader finds them.
         let ids: BTreeSet<u16> = iff
             .chunks
