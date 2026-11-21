@@ -196,11 +196,13 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(steps[0]['line'], 3)
 
     def test_build_and_buy_steps(self):
-        steps = inp.parse_scenario('press 93 458\nexpect-mode buy within 50\nexpect-mode 1\n'
-                                   'expect-new-object\nexpect-new-object within 9')
-        self.assertEqual([s['args'] for s in steps], [[93, 458], [2, 50], [1, 200], [200], [9]])
-        with self.assertRaises(inp.ScenarioError):
-            inp.parse_scenario('expect-mode flying')
+        steps = inp.parse_scenario('press 93 458\nexpect-mode build within 40\nexpect-mode buy within 50\n'
+                                   'expect-mode 1\ndrag 470 380 530 350\nexpect-new-object\nexpect-new-object within 9')
+        self.assertEqual([s['args'] for s in steps],
+                         [[93, 458], [1, 40], [2, 50], [1, 200], [470, 380, 530, 350], [200], [9]])
+        for bad in ('expect-mode flying', 'drag 1 2 3', 'drag a 2 3 4'):
+            with self.assertRaises(inp.ScenarioError):
+                inp.parse_scenario(bad)
 
     def test_errors_name_the_line(self):
         for text, message in (('jump 3', 'line 1: unknown step'), ('wait', 'line 1: wait takes'),
@@ -1068,6 +1070,45 @@ class ReviewFindingsTest(RunnerBase):
             self.assertEqual(run.returncode, 2, run.stderr)
             self.assertIn(message, run.stderr)
             self.assertFalse((d / 'out').exists())
+
+    def test_drag_holds_button_across_midpoint_and_releases(self):
+        r = self.runner('drag 100 200 300 400')
+        self.tick_until(r, lambda: r.finished, most=40)
+        self.assertIsNone(r.failed)
+        cmds = self.rows('command')
+        self.assertEqual([c['what'] for c in cmds], ['move', 'press', 'move', 'move', 'release'])
+        self.assertEqual([(c['x'], c['y']) for c in cmds],
+                         [(100, 200), (100, 200), (200, 300), (300, 400), (300, 400)])
+        self.assertEqual(cmds[1]['command'], 'xdotool mousedown 1')
+        self.assertEqual(cmds[4]['command'], 'xdotool mouseup 1')
+        self.assertGreaterEqual(cmds[2]['update'] - cmds[1]['update'], inp.HOLD_UPDATES)
+        self.assertGreaterEqual(cmds[3]['update'] - cmds[2]['update'], inp.HOLD_UPDATES)
+        self.assertGreaterEqual(cmds[4]['update'] - cmds[3]['update'], inp.HOLD_UPDATES)
+
+    def test_zero_length_drag_skips_duplicate_midpoint(self):
+        r = self.runner('drag 100 200 100 200')
+        self.tick_until(r, lambda: r.finished, most=30)
+        self.assertIsNone(r.failed)
+        cmds = self.rows('command')
+        self.assertEqual([c['what'] for c in cmds], ['move', 'press', 'move', 'release'])
+
+    def test_drag_releases_button_when_midpoint_move_fails(self):
+        r = self.runner('drag 100 200 300 400')
+        self.agent.codes = {3: 1}
+        self.tick_until(r, lambda: r.finished, most=30)
+        self.assertIn('failed with 1', r.failed)
+        release = [c for c in self.rows('command') if c['what'] == 'release']
+        self.assertEqual(len(release), 1)
+        self.assertEqual(release[0]['reason'], 'step failed')
+        self.assertEqual(release[0]['command'], 'xdotool mouseup 1')
+
+    def test_expect_mode_build(self):
+        self.g.m.put(self.g.sim + 0x36, struct.pack('<H', 1))
+        r = self.runner('expect-mode build within 5')
+        self.tick(r, 2)
+        self.assertTrue(r.finished)
+        self.assertIsNone(r.failed)
+        self.assertEqual(self.rows('mode')[0]['mode'], 1)
 
 
 class AgentScriptTest(unittest.TestCase):
