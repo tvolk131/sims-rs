@@ -394,10 +394,15 @@ impl Game {
 
     /// Runs up to `ticks` ticks, stopping at the first that fails, and,
     /// if `idle`, before a tick the idle loop's speed sets the speed for
-    /// ([`Game::idle_speed`]).
+    /// ([`Game::idle_speed`]) or after a tick that changes the
+    /// simulation's speed or return speed (such as Special Effect resetting
+    /// to normal, `0x4f684c` → `0x46d697`). Any mid-tick speed or return-speed
+    /// change updates the panel's speed and restarts the time owed, whether
+    /// `idle` is set or not.
     fn run_while(&mut self, ticks: u32, idle: bool) -> u32 {
         let mut ran = 0;
         while ran < ticks && self.stopped.is_none() && !(idle && self.idle_speed()) {
+            let speed_before = (self.lot.world().speed(), self.lot.world().return_speed());
             let step = if self.play {
                 self.lot.step_play()
             } else {
@@ -447,6 +452,9 @@ impl Game {
                     }
                     self.stop(&error);
                 }
+            }
+            if sync_speed_after_step(&mut self.pace, speed_before, self.lot.world()) && idle {
+                break;
             }
         }
         if ran > 0 || self.stopped.is_some() {
@@ -1442,6 +1450,26 @@ fn person_rise(zoom: u32) -> i32 {
     rise as i32 / 2
 }
 
+/// Syncs the panel's speed and restarts the time owed when a tick changes
+/// the simulation's speed or return speed (such as Special Effect resetting
+/// to normal, `0x4f684c` → `0x46d697`, or `World::idle_speed` clearing
+/// global 18 when someone wakes during manual stepping, `0x46d7db` →
+/// `0x46d697`). Returns whether either changed.
+fn sync_speed_after_step(
+    pace: &mut Pace,
+    speed_before: (i16, i16),
+    world: &sims_sim::World,
+) -> bool {
+    if (world.speed(), world.return_speed()) == speed_before {
+        return false;
+    }
+    if let Some(speed) = pace::shown(world) {
+        pace.speed = speed;
+    }
+    pace.restart();
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1616,5 +1644,56 @@ mod tests {
         let taken: Vec<_> = queue.drain(..).collect();
         assert_eq!(taken.len(), 4);
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn a_mid_tick_speed_reset_updates_the_panel_and_drops_owed_time() {
+        use sims_sim::speed::{FAST, IDLE, NORMAL};
+
+        let mut world = sims_sim::World::empty();
+        world.globals[18] = -1;
+        world.set_speed(i32::from(FAST));
+
+        let mut pace = Pace::default();
+        pace.set_speed(Speed::Fast);
+        // Unchanged speed keeps both the panel selection and accrued credit.
+        assert_eq!(pace.due(13_000, FAST), 0);
+        assert!(!sync_speed_after_step(&mut pace, (FAST, -1), &world));
+        assert_eq!(pace.speed, Speed::Fast);
+        assert_eq!(pace.due(1_000, FAST), 1);
+
+        // Accrue 13 ms at Fast, then drop speed to Normal inside a step:
+        // the panel switches to Normal and the 13 ms credit is dropped so
+        // the next Normal tick waits a full 42 ms.
+        assert_eq!(pace.due(13_000, FAST), 0);
+        world.set_speed(i32::from(NORMAL));
+        assert!(sync_speed_after_step(&mut pace, (FAST, -1), &world));
+        assert_eq!(pace.speed, Speed::Normal);
+        assert_eq!(pace.due(29_000, NORMAL), 0);
+        assert_eq!(pace.due(12_999, NORMAL), 0);
+        assert_eq!(pace.due(1, NORMAL), 1);
+
+        // Idle speed (1000, returning to Fast) dropping to Normal (760, 760)
+        // also switches the panel to Normal and drops accrued credit.
+        pace.set_speed(Speed::Fast);
+        world.globals[16] = IDLE;
+        world.globals[18] = FAST;
+        assert_eq!(pace.due(500, IDLE), 0);
+        world.set_speed(i32::from(NORMAL));
+        assert_eq!((world.speed(), world.return_speed()), (NORMAL, NORMAL));
+        assert!(sync_speed_after_step(&mut pace, (IDLE, FAST), &world));
+        assert_eq!(pace.speed, Speed::Normal);
+        assert_eq!(pace.due(41_999, NORMAL), 0);
+        assert_eq!(pace.due(1, NORMAL), 1);
+
+        // Wake-up clearing global 18 from (760, 760) to (760, -1) inside a
+        // manual step still calls 0x46d697 and must drop accrued credit.
+        assert_eq!(pace.due(41_000, NORMAL), 0);
+        world.globals[18] = -1;
+        assert!(sync_speed_after_step(&mut pace, (NORMAL, NORMAL), &world));
+        assert_eq!(pace.speed, Speed::Normal);
+        assert_eq!(pace.due(1_000, NORMAL), 0);
+        assert_eq!(pace.due(40_999, NORMAL), 0);
+        assert_eq!(pace.due(1, NORMAL), 1);
     }
 }

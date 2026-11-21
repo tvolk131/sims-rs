@@ -59,7 +59,6 @@ use sims_game::sound::{self, Input};
 use sims_game::view::Move;
 use sims_game::{Game, Options};
 use sims_render::{Walls, png};
-use sims_ui::command::Speed;
 use softbuffer::{Context, Surface};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -227,12 +226,8 @@ struct App {
     /// How many of the game's caught errors are printed.
     printed: usize,
     sound: Sound,
-    /// The hour, speed and ambience view the sound was last told.
-    heard: Option<(u32, Speed, i32)>,
-    /// The object answers the sound was last told.
-    told: Option<sims_audio::sources::Snapshot>,
-    /// The camera the sound last heard move.
-    shot: Option<sound::Shot>,
+    /// Tracks what the sound has been told about the lot and camera.
+    sound_feed: sound::Feed,
     /// The REDB file of saves, and this house's name in it.
     saves: PathBuf,
     slot: String,
@@ -406,20 +401,8 @@ impl App {
         let mut redraw = ran > 0 || (!waited && self.game.asking().is_some());
         // The plumb bob spins by the time passed, ticks or not.
         redraw |= self.game.spin_due();
-        // What the tick's sounds may ask about their objects, before the
-        // sounds themselves. Read on every call, not only after a step
-        // that succeeded: a failed step may still have changed the lot.
-        let sources = self.game.sound_sources();
-        if self.told.as_ref() != Some(&sources) {
-            self.sound.send(Input::Sources(sources.clone()));
-            self.told = Some(sources);
-        }
-        let sounds = self.game.take_sounds();
-        if !sounds.is_empty() {
-            self.sound.send(Input::Events(
-                sounds.into_iter().map(sound::event).collect(),
-            ));
-        }
+        self.sound_feed
+            .update(&mut self.game, |input| self.sound.send(input));
         for error in &self.game.errors()[self.printed..] {
             eprintln!("sims-game: error caught: {error}");
         }
@@ -434,23 +417,6 @@ impl App {
             redraw = true;
         }
         self.changed(redraw);
-        let now = (
-            self.game.hour(),
-            self.game.pace.speed,
-            self.game.ambience_view(),
-        );
-        if self.heard != Some(now) {
-            self.sound.send(Input::Hour(now.0));
-            self.sound.send(Input::Speed(now.1));
-            self.sound.send(Input::View(now.2));
-            self.heard = Some(now);
-        }
-        // Kind 33, after the sources and the view the moved camera shows.
-        let shot = self.game.shot();
-        if self.shot != Some(shot) {
-            self.sound.send(Input::Camera);
-            self.shot = Some(shot);
-        }
     }
 
     fn redraw(&mut self) {
@@ -717,9 +683,7 @@ fn run() -> Result<(), String> {
         reported: false,
         printed: 0,
         sound: Sound::start(&options.install, mute),
-        heard: None,
-        shot: None,
-        told: None,
+        sound_feed: sound::Feed::default(),
         saves,
         slot: slot(&options.house),
     };

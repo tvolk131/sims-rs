@@ -340,17 +340,17 @@ const UD1_DIALOGS: [(u8, Option<i16>); 6] = [
 /// UserData1's House 69 at entry (format 31), a regression pin of our
 /// run. It differs from track 2's recording only in object 2's last
 /// result; see `20261120-ud1-house-69-matches-the-recording.md`.
-const OLD_TOWN_69: &str = "cead046a20bfdb61be310dddc011a729866964f883e95ec140e78676df293e11";
+const OLD_TOWN_69: &str = "cdf5e94eb507086c61bdd5e1d18d64327e5dbba897130a7de54ee87ef99c9945";
 /// The same state's hash under snapshot format 30, which had no person
 /// types whose portrait the interface built ([`sims_sim::World::portraits`])
 /// at the end.
-const OLD_TOWN_69_30: &str = "c5e13dcc25bd62e07d7b456bf47eddfc1837434ace4575048d445e113cce67d3";
+const OLD_TOWN_69_30: &str = "e34ca24ca0aef8aa000507db5bd03ee074e85845278853616c02e38c191eae7b";
 /// The same after 1000 ticks, a regression pin, which differs from the
 /// recording's update 1000 only in object 2's last result.
-const OLD_TOWN_69_1000: &str = "bc39d708a988d37b10fb7e23bd52158929b0e42999f78ec3aef51e617f25007c";
+const OLD_TOWN_69_1000: &str = "2b4741e731424e6c7ce34462cdaff5461f69e8f19a4f5ddec37eba09efeaaac6";
 /// The same state's hash under snapshot format 30.
 const OLD_TOWN_69_1000_30: &str =
-    "5d8b7386fad6b71f7117c4a241853992dfe39f853033336022d74b8fed95ece1";
+    "21a7f3b2ade639b129c5008949647519d12432993ce3b30f13dd56fbd0e17a86";
 
 /// UserData2 as the original left it after opening it for the first time,
 /// in a fresh directory: the install's UserData2, with the `Characters`
@@ -1390,18 +1390,18 @@ const RECORDED_FRAMES: &str = "0,1,2,29,59,89,101,102,123+30";
 /// differs at entry in object 2's last result; see the decision
 /// `20261120-ud2-house-69-boots-from-the-originals-import.md` for what
 /// the comparison reads and skips.
-const IMPORTED_69: &str = "c3aa7898c77f65abbae84bb6d5c7a6669b697492f5350ec5334902a5c20d43a6";
+const IMPORTED_69: &str = "1bc128440944c2a9bfd8dc189aaa51249ee96b3eb0187dc721dcad28e4519447";
 /// The same state's hash under snapshot format 30, which had no person
 /// types whose portrait the interface built ([`sims_sim::World::portraits`])
 /// at the end.
-const IMPORTED_69_30: &str = "647c524ea5e613ef5d94a2398525f0f3004ce7921af4ba278ee704c321722f29";
+const IMPORTED_69_30: &str = "9ca0dd8afe6c5b848be0d6cdd3c8b03c006e1f2d612843c1a6bb8fc02a6bccb0";
 /// The same after 1000 ticks, with the recording's frames: a regression
 /// pin, which differs from the recording's update 1000 in object 2's last
 /// result.
-const IMPORTED_69_1000: &str = "122eb0bc6a8551178e2c87a168ebfaa0bde9d7901939e33a95af4d2421eea8fa";
+const IMPORTED_69_1000: &str = "d0a4eeb7b002caf2bd1cf872c829a9517d11665cf5dc68a9cfd6c6a01c73c210";
 /// The same state's hash under snapshot format 30.
 const IMPORTED_69_1000_30: &str =
-    "c4aaebafe6a691b3e16e0adc650bd1c7803c14bb8ff4ce417c9e9d3ca33cbad0";
+    "8d0258ba3e1a8922a59f365ad4a4031d76a9365d97d20a264c1e039cd829a921";
 /// The same at tick 43200, a whole day from the load.
 const TICK_43200: &str = "00fbe95013dd9e8141e90c1de725db049dfc5967933a9ca07db28e397122103c";
 /// The same state's hash under snapshot format 30, which had no person
@@ -1677,6 +1677,36 @@ fn the_goth_day_under_the_recordings_frames_keeps_its_streams() {
     // earlier or later, taken to be the drift of the recording's frames
     // against the schedule fitted here (unverified). The C runtime stream
     // matches the recording's at every update of the day.
+    //
+    // At tick 39610 the raccoon (object 10) runs Special Effect with flag
+    // 0x40 clear while everyone sleeps at idle speed 1000; message 0x10c
+    // drops the lot back to normal speed 760 (0x44abda..0x44abee →
+    // 0x4f684c..0x4f6873), matching `goth-day-20261115`'s update 39610.
+    while tick < 39_609 {
+        lot.step().unwrap();
+        tick += 1;
+    }
+    assert_eq!(
+        (lot.world().speed(), lot.world().return_speed()),
+        (1000, 760)
+    );
+    lot.step().unwrap();
+    tick += 1;
+    assert_eq!(
+        (lot.world().speed(), lot.world().return_speed()),
+        (760, 760)
+    );
+    while tick < 40_494 {
+        lot.step().unwrap();
+        tick += 1;
+    }
+    assert_eq!(
+        (lot.world().speed(), lot.world().return_speed()),
+        (760, 760)
+    );
+    lot.step().unwrap();
+    tick += 1;
+    assert_eq!((lot.world().speed(), lot.world().return_speed()), (760, -1));
     while tick < 43_200 {
         lot.step().unwrap();
         tick += 1;

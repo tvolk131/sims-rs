@@ -61,6 +61,10 @@ pub struct Snapshot {
     /// Where each object is on the screen, with the view, by object ID
     /// ([`Sources::projection`]).
     pub screen: BTreeMap<i32, Projection>,
+    /// The lot's house number (global 10, `0x571093`: 0 when no game is
+    /// loaded). The day and night loop (`0x57492a`) uses it to skip
+    /// `nite_loop` on lots 20 to 29.
+    pub lot: i16,
 }
 
 /// Field 13's answer for no object or no room (0x570fba).
@@ -75,6 +79,7 @@ impl Default for Snapshot {
             absent,
             positions: BTreeMap::new(),
             screen: BTreeMap::new(),
+            lot: 0,
         }
     }
 }
@@ -97,5 +102,9 @@ impl Sources for Snapshot {
 
     fn projection(&self, object: i32) -> Option<Projection> {
         self.screen.get(&object).copied()
+    }
+
+    fn lot(&self) -> i32 {
+        i32::from(self.lot)
     }
 }
