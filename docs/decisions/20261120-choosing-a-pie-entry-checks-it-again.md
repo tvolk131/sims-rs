@@ -55,8 +55,12 @@ Read note left this open
   257–259 (his word 50 and last result), which were taken for a listing
   under the still pointer. The write watch that shows the release check
   is the snack-bob recording's; the cancel recording does not rule out
-  a listing at the same updates whose effects the check covers. The
-  cancel replay now equals the recording in every word the comparison
+  a listing at the same updates whose effects the check covers. In the
+  order recorded again with the listed object watched, the original
+  listed nothing under the still pointer after either choice
+  (`20261120-cancel-order-replayed-with-the-pick-watched.md`). The
+  replay of the older cancel recording (`goth-cancel-order-20261116`)
+  now equals that recording in every word the comparison
   checks, after every update from 1 to 1300 (scratch tool). The cancel
   test pins word 50 and the last result at 257.
 - **Scripted snack.** The scripted snack order no longer checks its

@@ -2888,6 +2888,158 @@ fn the_recorded_snack_order_with_bob_shots_replayed_in_the_window_matches_the_re
     assert_eq!(game.caught(), 0, "{:?}", game.errors());
 }
 
+/// Track 2's second recording of the two-snack cancel order
+/// (`goth-cancel-pick-20261120`), replayed through the window's input
+/// layer. Its watches give the frames the original drew and the object
+/// its pointer listed, each write at a frame's update. The first two
+/// pointer moves are given within their commands; each later move is
+/// given at the update of the listing it made. Mortimer's state bounds
+/// the rest: the entry is reached before his last result goes to 1, the
+/// choice and the cancels are given at the update before their effect. A
+/// scratch comparison found the lot equal to the recording's after every
+/// update from 1 to 845, in every word it compares, except for Bella's
+/// local from 203 to 227, as in the other replays
+/// (`docs/decisions/20261120-cancel-order-replayed-with-the-pick-watched.md`);
+/// this test checks the states below.
+#[test]
+fn the_recorded_cancel_order_with_the_pick_watched_replayed_in_the_window_matches_the_recording() {
+    let Some(install) = install() else {
+        return;
+    };
+    let frames = Frames::parse(
+        "0,1,2,3,33,63,93,123,153,166,188,210,240,270,300,330,360,390,411,431,446,476+30",
+    )
+    .expect("a schedule");
+    let schedule = frames.clone();
+    let mut game = Game::open(&Options {
+        frames,
+        ..options(install)
+    })
+    .expect("the Goth house opens");
+    game.resize([800, 600]);
+    let (mortimer, bella, fridge, counter) = (21, 18, 118, 119);
+    assert_eq!(game.lot().world().selected(), Some(mortimer));
+    let last_result = |game: &Game| game.lot().world().objects[&mortimer].last_result;
+    let person = |game: &Game| {
+        game.lot().world().objects[&mortimer]
+            .person
+            .clone()
+            .unwrap()
+    };
+    let snack = |uid| (uid, fridge as i16, 4103, 1, 50, 12);
+    let choose = |game: &mut Game, reach: u32, choice: u32| {
+        run_to(game, &schedule, reach);
+        let at = pie_entry(game, "Have A Snack");
+        game.hover(at);
+        run_to(game, &schedule, reach + 1);
+        assert!(last_result(game));
+        run_to(game, &schedule, choice);
+        game.press(at);
+        assert!(game.menu().is_none());
+        game.hover(recorded([200, 123]));
+    };
+    // The second move's command ran from 88 to 94, and the original wrote
+    // no listing at 93, where our frame shows the kitchen counter at the
+    // first move's point. Where its pointer was at that frame is not
+    // known; the replay moves it at 91, before the frame.
+    run_to(&mut game, &schedule, 84);
+    game.hover(recorded([176, 222]));
+    assert_eq!(game.listed(), None);
+    run_to(&mut game, &schedule, 91);
+    game.hover(recorded([176, 210]));
+    run_to(&mut game, &schedule, 94);
+    assert_eq!(game.listed(), None);
+    assert!(last_result(&game));
+    // The move onto the fridge ended at 122; it is given at 123, the
+    // update of the original's listing, and his last result goes to 0 at
+    // 124. The press lists the fridge again at 153.
+    run_to(&mut game, &schedule, 123);
+    game.hover(recorded([176, 198]));
+    assert_eq!(game.listed(), Some((mortimer, fridge)));
+    run_to(&mut game, &schedule, 124);
+    assert!(!last_result(&game));
+    run_to(&mut game, &schedule, 153);
+    assert!(last_result(&game));
+    game.press(recorded([176, 198]));
+    game.render();
+    assert!(game.menu().is_some());
+    run_to(&mut game, &schedule, 154);
+    assert!(!last_result(&game));
+    // Have A Snack is reached after 166 and chosen after 210; taken at
+    // once, as recorded at 211.
+    choose(&mut game, 166, 210);
+    run_to(&mut game, &schedule, 211);
+    let p = person(&game);
+    assert_eq!(action(&p.active), snack(1));
+    assert!(p.queue.is_empty());
+    // Under the still pointer the original listed nothing (240).
+    run_to(&mut game, &schedule, 240);
+    assert_eq!(game.listed(), None);
+    // The second order's moves, each given at the update of the
+    // original's listing: the counter at 300, nothing at 330, the fridge
+    // at 360; the press lists it again at 390.
+    run_to(&mut game, &schedule, 300);
+    game.hover(recorded([176, 222]));
+    assert_eq!(game.listed(), Some((mortimer, counter)));
+    run_to(&mut game, &schedule, 330);
+    game.hover(recorded([176, 210]));
+    assert_eq!(game.listed(), None);
+    run_to(&mut game, &schedule, 360);
+    game.hover(recorded([176, 198]));
+    assert_eq!(game.listed(), Some((mortimer, fridge)));
+    run_to(&mut game, &schedule, 390);
+    game.press(recorded([176, 198]));
+    game.render();
+    assert!(game.menu().is_some());
+    choose(&mut game, 411, 446);
+    run_to(&mut game, &schedule, 447);
+    let p = person(&game);
+    assert_eq!(action(&p.active), snack(1));
+    assert_eq!(p.queue.iter().map(action).collect::<Vec<_>>(), [snack(5)]);
+    run_to(&mut game, &schedule, 476);
+    assert_eq!(game.listed(), None);
+    assert_eq!(room(&game, bella), 0x4225_ac1d);
+    run_to(&mut game, &schedule, 477);
+    assert_eq!(room(&game, bella), 0x4277_073c);
+    // Both presses on the icons act at their release's end: the queued
+    // snack is taken off at 537, the running one cancelled at 627, and
+    // neither earlier.
+    run_to(&mut game, &schedule, 506);
+    game.hover([104, 54]);
+    run_to(&mut game, &schedule, 536);
+    assert_eq!(
+        person(&game).queue.iter().map(action).collect::<Vec<_>>(),
+        [snack(5)]
+    );
+    game.press([104, 54]);
+    run_to(&mut game, &schedule, 537);
+    let p = person(&game);
+    assert_eq!(action(&p.active), snack(1));
+    assert!(p.queue.is_empty());
+    run_to(&mut game, &schedule, 596);
+    game.hover([54, 54]);
+    run_to(&mut game, &schedule, 626);
+    let p = person(&game);
+    assert_eq!(action(&p.active), snack(1));
+    assert!(p.queue.is_empty());
+    assert_eq!(p.data[33], 50);
+    game.press([54, 54]);
+    run_to(&mut game, &schedule, 627);
+    let p = person(&game);
+    assert_eq!(action(&p.active), (1, fridge as i16, 4103, 1, 50, 0x10c));
+    assert_eq!(
+        p.queue.iter().map(action).collect::<Vec<_>>(),
+        [(6, mortimer as i16, 8318, 33, 50, 0)]
+    );
+    assert_eq!(p.data[33], 0);
+    run_to(&mut game, &schedule, 776);
+    assert_eq!(room(&game, mortimer), 0x415c_71c8);
+    run_to(&mut game, &schedule, 777);
+    assert_eq!(room(&game, mortimer), 0x4253_a203);
+    run_to(&mut game, &schedule, 845);
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
+}
+
 /// Reaching a pie entry checks its action, which changes the lot;
 /// staying on it does not check it again, but leaving the window and
 /// coming back onto it does, as passing over another point of the pie
