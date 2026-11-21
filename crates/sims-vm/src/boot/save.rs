@@ -37,8 +37,9 @@ use std::collections::{BTreeMap, BTreeSet};
 /// dialog answer's bitmap ID ([`crate::Answer`]); layout 3 keeps the
 /// house view's centre; layout 6 keeps [`World::dirty_portraits`],
 /// [`World::generated_portrait_2002`] keyed by [`PortraitFile`], and
-/// [`World::made_portrait_head`] (superseding pre-merge layouts 4 and 5).
-pub const FORMAT: u32 = 6;
+/// [`World::made_portrait_head`], and [`World::ambiguous_portraits`]
+/// (superseding pre-merge layouts 4–6).
+pub const FORMAT: u32 = 7;
 
 /// A lot as it stood between two steps ([`Lot::save`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,10 +56,11 @@ pub struct Saved {
     loaded: [u8; 32],
     /// Format 3 on.
     view_centre: Option<[i8; 2]>,
-    /// Format 6 on: portrait dirty flags (`0x4e895e`), generated `BMP_` 2002
-    /// writebacks (`0x4e9000`), and runtime-made character `"HEAD"` binding
-    /// outcomes (`0x4e7824`), which [`World::encode`] omits to keep snapshot
-    /// format 31's wire bytes unchanged.
+    /// Format 7 on: portrait dirty flags (`0x4e895e`), generated `BMP_` 2002
+    /// writebacks (`0x4e9000`), runtime-made character `"HEAD"` binding
+    /// outcomes (`0x4e7824`), and ambiguous `0x44b126` pet renders, which
+    /// [`World::encode`] omits to keep snapshot format 31's wire bytes
+    /// unchanged.
     dirty_portraits: BTreeSet<u32>,
     generated_portrait_2002: BTreeSet<PortraitFile>,
     made_portrait_head: BTreeMap<u32, Option<bool>>,

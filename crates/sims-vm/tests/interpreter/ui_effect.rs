@@ -1215,6 +1215,28 @@ fn make_new_character_wardrobe_head_binding_drives_ui_effect_render_and_writebac
     assert_ne!(fx.world.crt_rng, crt_after_make);
     assert!(!fx.world.portraits.contains(&unplaceable_pet_guid));
 
+    // Dialog (0x4363d1 -> 0x4e92a8 -> 0x4e938c -> 0x4e9706) also retries
+    // without trapping when placement still fails.
+    let init_before_dialog = fx.world.globals[36];
+    let crt_before_dialog = fx.world.crt_rng;
+    fx.add(
+        LAMP_FILE,
+        4099,
+        tree(vec![ins(
+            36,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [0, 0, 0, 0, 0, 0, 0, 5],
+        )]),
+    );
+    assert_eq!(
+        fx.run_with(LAMP, 4099, unplaceable_pet_rec, &[], 1000),
+        Ok(true)
+    );
+    assert_eq!(fx.world.globals[36], init_before_dialog + 2);
+    assert_ne!(fx.world.crt_rng, crt_before_dialog);
+    assert!(!fx.world.portraits.contains(&unplaceable_pet_guid));
+
     // 5. Invalid pet-picker index (>= bodies) on a template whose ONLY HEAD
     // binding is in row 2 (head) — or whose row 1 has trailing whitespace
     // ("b001dog_01 ,BODY=...", preserved by 0x5874ca and rejected by 0x5a27f2):
@@ -1298,18 +1320,53 @@ fn make_new_character_wardrobe_head_binding_drives_ui_effect_render_and_writebac
 
     // 6. Negative-age copy (0x44b23c): 0x44b2d7 / 0x44b2ef compare the source's
     // body and head rows against the wardrobe via 0x472f92 (using 64-byte fixed
-    // buffers capped at 63 text bytes), classifying the MATCHED wardrobe suit
-    // serialized by 0x40d4d7 -> 0x472f41 rather than the raw source suit.
+    // buffers capped at 63 text bytes), classifying the 63-byte written suit
+    // serialized by 0x4092c5..0x4092e1 -> 0x40d4d7 -> 0x472f41 rather than the
+    // raw source suit or an overlong 64-byte registry key.
     let suit_63 = format!("c001fa_{}", "a".repeat(56));
     assert_eq!(suit_63.len(), 63);
+    let suit_64 = format!("c001fa_{}", "b".repeat(57));
+    assert_eq!(suit_64.len(), 64);
     let long_suit_row = format!("{suit_63}_extra,HEAD-HEAD=c001falgt_alice01");
+    let overlong_64_row = format!("{suit_64},HEAD-HEAD=c001falgt_alice01");
     let long_head_tex = format!("c001falgt_{}_aaa.bmp", "z".repeat(50));
     let long_head_row = format!("c001fa_alice,HEAD-HEAD=c001falgt_{}_bbb", "z".repeat(50));
-    for (head_row, expect_render) in [
-        ("c999fa_masseuse,HEAD-HEAD=c999falgt_masseuse", false),
-        ("c001fa_alice,HEAD-HEAD=C001FAlgt_Alice01", true),
-        (long_head_row.as_str(), true),
-        (long_suit_row.as_str(), true),
+    for (body_row, head_row, with_wardrobe_err, expect_render) in [
+        (
+            "b999fafit_npc,BODY=b999fafitlgt_npc",
+            "c999fa_masseuse,HEAD-HEAD=c999falgt_masseuse",
+            false,
+            false,
+        ),
+        (
+            "b999fafit_npc,BODY=b999fafitlgt_npc",
+            "c001fa_alice,HEAD-HEAD=C001FAlgt_Alice01",
+            false,
+            true,
+        ),
+        (
+            "b999fafit_npc,BODY=b999fafitlgt_npc",
+            long_head_row.as_str(),
+            false,
+            true,
+        ),
+        (
+            "b999fafit_npc,BODY=b999fafitlgt_npc",
+            long_suit_row.as_str(),
+            false,
+            true,
+        ),
+        // 64-byte registered suit whose 63-byte prefix is NOT registered:
+        // 0x4092c5..0x4092e1 writes the 63-byte prefix and 0x5a27f9 misses.
+        (
+            "b999fafit_npc,BODY=b999fafitlgt_npc",
+            overlong_64_row.as_str(),
+            false,
+            false,
+        ),
+        // Both rows "NONE" with an unread wardrobe catalog (wardrobe.errors
+        // non-empty): definite misses at 0x40d0f9 / 0x40d45d without trapping.
+        ("NONE", "NONE", true, false),
     ] {
         let (mut fx, _, _) = visitors();
         fx.world.rooms.rooms.get_mut(&1).unwrap().occupied = true;
@@ -1335,7 +1392,7 @@ fn make_new_character_wardrobe_head_binding_drives_ui_effect_render_and_writebac
         fx.program.people.profiles.insert(
             SIM_GUID,
             sims_content::Profile {
-                body: Some("b999fafit_npc,BODY=b999fafitlgt_npc".into()),
+                body: Some(body_row.into()),
                 head: Some(head_row.into()),
                 gender: Some("female".into()),
                 age: Some("27".into()),
@@ -1348,13 +1405,19 @@ fn make_new_character_wardrobe_head_binding_drives_ui_effect_render_and_writebac
             "c999fa_masseuse".to_string(),
             "c001fa_alice".to_string(),
             suit_63.clone(),
+            suit_64.clone(),
         ]
         .into();
+        let mut errors = BTreeMap::new();
+        if with_wardrobe_err {
+            errors.insert("bad.cmx".to_string(), "corrupt".to_string());
+        }
         fx.program.wardrobe = Some(Wardrobe {
             suits: [
                 "b001fafit_01".to_string(),
                 "c001fa_alice".to_string(),
                 suit_63.clone(),
+                suit_64.clone(),
             ]
             .into(),
             textures: [
@@ -1363,7 +1426,7 @@ fn make_new_character_wardrobe_head_binding_drives_ui_effect_render_and_writebac
                 long_head_tex.clone(),
             ]
             .into(),
-            errors: BTreeMap::new(),
+            errors,
         });
         fx.add(
             SIM_FILE,
@@ -1438,6 +1501,31 @@ fn make_new_character_wardrobe_head_binding_drives_ui_effect_render_and_writebac
     );
     assert_eq!(fx.world.portraits, [WIDGET].into());
     assert_ne!(fx.world.crt_rng, crt_before);
+
+    // 7c. Split US-English runs in STR# 200 (`0x470002`–`0x470049`):
+    // `loaded_strings` puts the later run ("kat") first even if physical row 0
+    // in `people.skeleton_names` was "widget", so 0x440dd5 still refuses the
+    // pet without touching CRT RNG when both pet expansions are absent.
+    let (mut fx, file, record) = visitors();
+    fx.program.expansions = 0;
+    fx.program
+        .people
+        .skeleton_names
+        .insert(WIDGET, "widget".into());
+    fx.words(file)[19] = 200;
+    {
+        let lib = fx.program.libraries.get_mut(&file).unwrap();
+        lib.strings.insert(200, vec!["widget".into(), "kat".into()]);
+        lib.loaded_strings
+            .insert(200, Some(vec!["kat".into(), "widget".into()]));
+    }
+    let crt_before = fx.world.crt_rng;
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
+        Ok(true)
+    );
+    assert!(fx.world.portraits.is_empty());
+    assert_eq!(fx.world.crt_rng, crt_before);
 }
 
 #[test]

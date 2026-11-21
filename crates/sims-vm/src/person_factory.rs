@@ -127,10 +127,10 @@ impl Interpreter<'_> {
 
     /// Reads body row 0 (skeleton name, `0x440d63` → `0x457f60` → `0x46ff01` →
     /// `0x4704fa`) without requiring the `.bcf` skeleton itself to be loaded,
-    /// checking runtime-made overrides first, then `People::skeleton_names`,
-    /// then the loader-indexed `STR#` body table (`loaded_strings`, skipping
-    /// deleted chunks at `0x41c542`, falling back to `strings` only when
-    /// `loaded_strings` has no override entry), then `People::skeletons`.
+    /// checking runtime-made overrides first, then the loader-ordered `STR#`
+    /// body table (`loaded_strings`, which skips deleted chunks per `0x41c542`
+    /// and orders split US-English runs per `0x470002`–`0x470049`), then
+    /// `People::skeleton_names` / `Library::strings` / `People::skeletons`.
     fn early_skeleton_name<'s>(&'s self, world: &'s World, guid: u32) -> Option<&'s str> {
         if let Some(name) = world
             .characters
@@ -139,23 +139,31 @@ impl Interpreter<'_> {
             return Some(name);
         }
         let template = world.characters.definition(guid);
-        if let Some(name) = self.program.people.skeleton_names.get(&template) {
-            return Some(name.as_str());
-        }
         if let Some(def) = crate::interpreter::object_definition(self.catalog, world, guid)
             && let Some(library) = self.program.libraries.get(&def.resource)
             && let Some(words) = library.definitions.get(&def.chunk)
         {
             let table = words[19] as u16;
-            let rows = match library.loaded_strings.get(&table) {
-                Some(loaded) => loaded.as_ref(),
-                None => library.strings.get(&table),
-            };
-            if let Some(row0) = rows.and_then(|rows| rows.first())
-                && !row0.is_empty()
+            if let Some(loaded) = library.loaded_strings.get(&table) {
+                return loaded
+                    .as_deref()
+                    .and_then(|rows| rows.first())
+                    .filter(|row| !row.is_empty())
+                    .map(String::as_str);
+            }
+            if let Some(name) = self.program.people.skeleton_names.get(&template) {
+                return Some(name.as_str());
+            }
+            if let Some(row0) = library
+                .strings
+                .get(&table)
+                .and_then(|rows| rows.first())
+                .filter(|row| !row.is_empty())
             {
                 return Some(row0.as_str());
             }
+        } else if let Some(name) = self.program.people.skeleton_names.get(&template) {
+            return Some(name.as_str());
         }
         self.program
             .people

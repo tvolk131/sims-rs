@@ -137,6 +137,11 @@ impl Machine<'_, '_> {
         let Some(guid) = self.world.neighbors.get(neighbor).map(|r| r.guid) else {
             return Ok(());
         };
+        self.ui_effect_portrait_for_guid(guid)
+    }
+
+    /// Runs `0x4e92a8` for a known `guid` (`0x47689c`, `0x4363d1`).
+    pub(crate) fn ui_effect_portrait_for_guid(&mut self, guid: u32) -> Result<(), Trap> {
         if !self.in_portrait_table(guid)? {
             return Ok(());
         }

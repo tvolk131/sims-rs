@@ -387,6 +387,16 @@ impl Machine<'_, '_> {
         let is_person = crate::interpreter::object_definition(self.catalog, self.world, guid)
             .is_some()
             && self.definition_words(guid)?[TYPE] == PERSON_TYPE;
+        // Characters created by Make New Character during this session are
+        // registered in 0x6f2698 via 0xe0 -> 0x4e8add; run the full 0x4e92a8
+        // portrait path (including retry at 0x4e938c / 0x4e9706 no-tile
+        // removal after a failed 0x44b126 pet placement).
+        if is_person
+            && self.world.made_portrait_head.contains_key(&guid)
+            && self.in_portrait_table(guid)?
+        {
+            return self.ui_effect_portrait_for_guid(guid);
+        }
         let has_generated_2002 = self
             .portrait_file(guid)
             .is_some_and(|file| self.world.generated_portrait_2002.contains(&file));

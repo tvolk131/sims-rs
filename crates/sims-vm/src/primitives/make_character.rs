@@ -595,6 +595,17 @@ impl Machine<'_, '_> {
         }
     }
 
+    /// Classifies a suit name written from a wardrobe entry (`0x4092c5`–
+    /// `0x4092e1` copies at most 63 bytes into the entry buffer, `0x472f41`
+    /// serializes that 63-byte string, and `0x5a27f9` matches exact length):
+    /// `Some(true)` if the written 63-byte name binds `"HEAD"`, `Some(false)`
+    /// if confirmed not to, or `None` if an earlier suit decode error left it
+    /// unknown.
+    fn classify_written_wardrobe_suit(&self, suit: &str) -> Option<bool> {
+        let written: String = suit.chars().take(63).collect();
+        self.classify_suit_head(&written)
+    }
+
     /// Whether every possible `(head, body)` selection (`0x44b151`, `0x44b167`)
     /// binds `"HEAD"` (`Some(true)`), none does (`Some(false)`), or it depends
     /// on the unmodeled wardrobe order (`None`).
@@ -604,19 +615,19 @@ impl Machine<'_, '_> {
         let bodies = wardrobe.matching_suits(false, female, child, tone);
         let all_heads = heads
             .iter()
-            .all(|s| self.classify_suit_head(s) == Some(true));
+            .all(|s| self.classify_written_wardrobe_suit(s) == Some(true));
         let all_bodies = bodies
             .iter()
-            .all(|s| self.classify_suit_head(s) == Some(true));
+            .all(|s| self.classify_written_wardrobe_suit(s) == Some(true));
         if all_heads || all_bodies {
             return Some(true);
         }
         let none_heads = heads
             .iter()
-            .all(|s| self.classify_suit_head(s) == Some(false));
+            .all(|s| self.classify_written_wardrobe_suit(s) == Some(false));
         let none_bodies = bodies
             .iter()
-            .all(|s| self.classify_suit_head(s) == Some(false));
+            .all(|s| self.classify_written_wardrobe_suit(s) == Some(false));
         if none_heads && none_bodies {
             return Some(false);
         }
@@ -645,9 +656,10 @@ impl Machine<'_, '_> {
 
     /// Whether copying `raw` via `0x40d0a4`/`0x40d10b` (body) or
     /// `0x40d408`/`0x40d46f` (head) produces a `"HEAD"`-binding suit on the
-    /// clone: looks up the matching wardrobe entry first (`0x472f92`) and
-    /// classifies the matched wardrobe suit (`0x40d4d7` → `0x472f41`), NOT the
-    /// raw source suit name (which can carry an extra suffix past byte 63).
+    /// clone: rules out rows that cannot match any wardrobe entry before
+    /// inspecting `wardrobe.errors`, then looks up the matching wardrobe entry
+    /// (`0x472f92`) and classifies the 63-byte suit name serialized by
+    /// `0x4092c5`–`0x4092e1` → `0x40d4d7` → `0x472f41`.
     fn copied_outfit_head_status(
         &self,
         raw: Option<&str>,
@@ -659,16 +671,37 @@ impl Machine<'_, '_> {
         let Some(raw) = raw else {
             return Some(false);
         };
-        let Some(wardrobe) = self.program.wardrobe.as_ref() else {
-            // Without a wardrobe we can still tell when the row has no valid
-            // `BODY=` / `HEAD-HEAD=` descriptor and could never match.
-            let before_semi = raw.split(';').next().unwrap_or(raw);
-            let tag = if is_head { "head-head=" } else { "body=" };
-            let can_match = before_semi
-                .split_once(',')
-                .is_some_and(|(_, tex)| tex.to_ascii_lowercase().starts_with(tag));
-            return (!can_match).then_some(false);
+        let before_semi = raw.split(';').next().unwrap_or(raw);
+        let Some((raw_suit, raw_tex)) = before_semi.split_once(',') else {
+            return Some(false);
         };
+        let tag = if is_head { "head-head=" } else { "body=" };
+        let row_tex: String = raw_tex.to_ascii_lowercase().chars().take(63).collect();
+        if !row_tex.starts_with(tag) {
+            return Some(false);
+        }
+        let row_suit: String = raw_suit.to_ascii_lowercase().chars().take(63).collect();
+        let (first, length) = if is_head { ('c', 6) } else { ('b', 9) };
+        let sex = if female { 'f' } else { 'm' };
+        let age = if child { 'c' } else { 'a' };
+        let chars: Vec<char> = row_suit.chars().take(length).collect();
+        let suit_matches = chars.len() == length
+            && chars[0] == first
+            && (chars[4] == sex || chars[4] == 'u')
+            && chars[5] == age
+            && !(is_head && chars[1] == 't');
+        if !suit_matches {
+            return Some(false);
+        }
+        let part: String = chars.into_iter().collect();
+        let expected_tex_prefix: String = format!("{tag}{part}{}", skin.to_ascii_lowercase())
+            .chars()
+            .take(63)
+            .collect();
+        if !row_tex.starts_with(&expected_tex_prefix) {
+            return Some(false);
+        }
+        let wardrobe = self.program.wardrobe.as_ref()?;
         if !wardrobe.errors.is_empty() {
             return None;
         }
@@ -678,12 +711,12 @@ impl Machine<'_, '_> {
         }
         if matched
             .iter()
-            .all(|s| self.classify_suit_head(s) == Some(true))
+            .all(|s| self.classify_written_wardrobe_suit(s) == Some(true))
         {
             Some(true)
         } else if matched
             .iter()
-            .all(|s| self.classify_suit_head(s) == Some(false))
+            .all(|s| self.classify_written_wardrobe_suit(s) == Some(false))
         {
             Some(false)
         } else {
@@ -699,12 +732,12 @@ impl Machine<'_, '_> {
         let bodies = wardrobe.matching_pet_suits(cat);
         if bodies
             .iter()
-            .all(|s| self.classify_suit_head(s) == Some(true))
+            .all(|s| self.classify_written_wardrobe_suit(s) == Some(true))
         {
             Some(true)
         } else if bodies
             .iter()
-            .all(|s| self.classify_suit_head(s) == Some(false))
+            .all(|s| self.classify_written_wardrobe_suit(s) == Some(false))
         {
             Some(false)
         } else {
