@@ -634,7 +634,7 @@ fn registration_order(modules: &[Module]) -> Vec<usize> {
 /// object starts nothing (its slot returns at once, 0x57bf80), and a note
 /// whose patch is a track object fails (0x57f6ac to 0x57f703).
 ///
-/// The station patches (module 0 here) register through the same routine
+/// The station patches ([`Registrant::Station`]) register through the same routine
 /// (0x5750dc calls 0x57cdd5), after the base game's tables and before the
 /// expansions', with numbers their allocator hands out without looking
 /// at the registry (0x57d386): one replaces a base game object of its

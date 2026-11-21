@@ -118,6 +118,18 @@ port now does the same.
   go of its samples. Here a kind 53 event that names a patch object
   picks from its hit list and does nothing more. No kind 53 event in the
   install names a patch.
+- Kind 1 on a number that is a patch object asks whether the object
+  plays (0x573719; a patch's slot says no, 0x4eefbd) and then removes
+  the number's instance records (0x57372a). Here it returns before that,
+  so those records stay.
+- Kind 30 on a patch object records the instance, as the original does
+  (0x573d36). The original then also works out the placement and sets
+  the volume and pan (0x573d48, 0x573d64, 0x573d6e). Here it stops after
+  the record.
+- In the install, `ltub_running` (kind 1, track 68262) is the only
+  track event that names a patch object. No event records instances of
+  68262, so the missing cleanup changes nothing there. No kind 30 event
+  names a patch object.
 
 ## Left as it was
 
