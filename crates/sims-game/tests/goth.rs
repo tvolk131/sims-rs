@@ -2532,10 +2532,12 @@ fn the_recorded_talk_order_replayed_in_the_window_matches_the_recording() {
 /// Track 2's Read A Book recording (`goth-read-order-20261118`) replayed
 /// through the window's input layer: a press on the bookcase, then Read a
 /// Book. Each input is given at the update before the recording's
-/// command ended; frames are drawn after the updates its Room motives show
-/// (every 30th from 186). With these, the lot equals the recording's after
+/// command ended, except the press on the bookcase (below); frames are
+/// drawn after the updates its Room motives show (every 30th from 186).
+/// A scratch comparison found the lot equal to the recording's after
 /// every update from 1 to 900 except for what
-/// `docs/decisions/20261120-read-order-replayed-in-the-window.md` lists.
+/// `docs/decisions/20261120-read-order-replayed-in-the-window.md` lists;
+/// this test checks the states below.
 #[test]
 fn the_recorded_read_order_replayed_in_the_window_matches_the_recording() {
     let Some(install) = install() else {
@@ -2558,16 +2560,22 @@ fn the_recorded_read_order_replayed_in_the_window_matches_the_recording() {
     // The original listed the bookcase's pie with the pointer at the
     // recording's (384, 250), a wall pixel in our frame, where our pick
     // finds the door. While it does, the replay points 7 columns right on
-    // the same row, where both frames' picks find the bookcase.
+    // the same row, where our pick finds the bookcase (the recording's
+    // harness did not try that point).
     run_to(&mut game, &schedule, 93);
     let on_bookcase = match game.under(recorded([384, 250])) {
         Some(id) if id == bookcase => recorded([384, 250]),
         _ => [488, 296],
     };
     assert_eq!(game.under(on_bookcase), Some(bookcase));
+    // His last result is 1 before and after, as recorded from 84 to 186.
+    assert!(last_result(&game));
     game.hover(on_bookcase);
     assert_eq!(game.listed(), Some((mortimer, bookcase)));
     assert!(last_result(&game));
+    // The harness's press on the bookcase ended at 122 and its release at
+    // 144; it first reported the pie at 124, so the press is given after
+    // 123, as for the Talk order's top pie.
     run_to(&mut game, &schedule, 123);
     game.press(on_bookcase);
     game.render();
@@ -2582,7 +2590,10 @@ fn the_recorded_read_order_replayed_in_the_window_matches_the_recording() {
     assert_eq!(pie, ["Study Cooking", "Study Mechanical", "Read a Book"]);
     run_to(&mut game, &schedule, 143);
     let read = pie_entry(&game, "Read a Book");
+    let hash = |game: &Game| game.lot().world().hash();
+    let before = hash(&game);
     game.hover(read);
+    assert_ne!(hash(&game), before, "reaching the entry checked it");
     run_to(&mut game, &schedule, 186);
     let person = |game: &Game, id: u16| game.lot().world().objects[&id].person.clone().unwrap();
     assert_eq!(person(&game, mortimer).active.uid, 0);

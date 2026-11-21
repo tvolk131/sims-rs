@@ -93,22 +93,27 @@ This is **unverified** and not ported.
   - Ours checks the entry once, at 143. Mortimer's frames then end at
     word 80: the mark is at 80–87, tree 4123's frame at 88 and tree
     285's at 100.
-  - By 162 his top frame then (tree 8292, at 68) has ended. With his
-    frames ending at 68, the same check puts tree 4123's frame at 76,
+  - From 150 his frames end at word 68, in the recording and in ours:
+    the frame of tree 8292 that was at 68 has ended. With his frames
+    ending there, the same check puts tree 4123's frame at 76,
     its node (254) at 77, and tree 285's frame at 88.
   - At 187, tree 4116's frame starts at 68 with local 1 at word 77, and
     tree 4114's frame has local 0 at word 88. The recording has 254
-    and 285 there: what the check leaves with his frames ending at 68.
+    and 285 there, first at 187: what the check leaves with his frames
+    ending at 68. A second check after 150 is a plausible explanation.
+    The recording has no trace of the check itself, so what wrote
+    those words, when, and what made it run are not shown.
 - **Trials (scratch tool).** Leaving the entry and coming back onto it,
   which checks it again, at 186 before the press removes both of
   Mortimer's frame differences. Doing it at 162 instead does too. No
-  single object's trial listing at 186 leaves 285 at word 88. Of 330
-  objects, 284 leave 4123, 22 leave 265, 14 leave 0 and 10 leave 321.
-- **In the original.** A UI event handler (0x51b7f6) runs the entry's
-  check (0x48df28, called at 0x51bb9e) for its event 14. Event 15
-  calls 0x48dd67. Where the pie sends event 14, and whether a
-  mousedown or a release on an entry sends it again, is not known. The
-  state shows only that the check ran again between 162 and 186.
+  single trial listing at 186 of the 330 objects ours has (the
+  recording has 345) leaves 285 at word 88: 284 leave 4123, 22 leave
+  265, 14 leave 0 and 10 leave 321.
+- **In the original (from reading the code, not traced).** A UI event
+  handler (0x51b7f6) runs the entry's check (0x48df28, called at
+  0x51bb9e) for its event 14. Event 15 calls 0x48dd67. Where the pie
+  sends event 14, and whether a mousedown or a release on an entry
+  sends it again, is not known.
 
 ## Open: under the still pointer, 726
 
@@ -143,8 +148,8 @@ recording's point once our pick finds the bookcase there. This is the
 
 With the second check of the entry at 186 and a salesman listing at
 726 (scratch tool), the replay equals the recording in every word the
-comparison checks, after every update from 1 to 900, except Bella's two
-stale locals. That fits; it does not show that the original did
+comparison checks, after every update from 1 to 900, except Bella's
+three stale locals in two frames. That fits; it does not show that the original did
 these things, or nothing else whose effects do not show.
 
 ## What would settle it
