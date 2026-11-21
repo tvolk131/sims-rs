@@ -41,15 +41,15 @@ it calls `0x4aa9bd` for the 16-bit fill colour:
 
 ## How it is modeled
 
-- `sims_render::Lot::house` stores global 10 alongside `Lot::time_of_day`
-  (global 4), both read in `Lot::from_world` with default `0`.
 - `sims_render::scene::background(time_of_day, house)` implements
   `0x4aa9bd`'s selection and passes the result through
   `canvas::quantize565` (matching `0x49f0ae` and keeping alpha-blending
   against the void in the original's 16-bit values).
   `scene::BACKGROUND` remains `[115, 113, 115]` (the daytime colour).
-- `scene::paint` clears the canvas with
-  `background(lot.time_of_day, lot.house)`.
+- `scene::paint` reads live globals 4 (`time_of_day`, falling back to
+  `lot.time_of_day` when `world.globals` lacks index 4) and 10 (`house`,
+  defaulting to `0`) directly from `world.globals` on every clear, so
+  changes to globals between ticks never leave a stale void colour.
 
 ## Measured
 

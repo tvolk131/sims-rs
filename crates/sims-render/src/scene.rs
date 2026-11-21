@@ -133,7 +133,9 @@ fn paint(
     canvas: &mut Canvas,
     pass: Pass,
 ) -> Stats {
-    canvas.clear(background(lot.time_of_day, lot.house));
+    let time_of_day = world.globals.get(4).copied().unwrap_or(lot.time_of_day);
+    let house = world.globals.get(10).copied().unwrap_or(0);
+    canvas.clear(background(time_of_day, house));
     let mut painter = Painter::new(world, lot, assets, camera, canvas, pass);
     let top = camera.level.clamp(1, 2);
     for level in 1..=top {

@@ -211,6 +211,9 @@ fn off_lot_void_colour_follows_time_of_day_and_house_99() {
         (4, 5, [0, 0, 255]),
         (2, 99, [16, 20, 140]),
     ];
+    // Build `Lot` once at daytime; `draw` reads live globals 4 and 10 on each
+    // clear (0x4aa9bd) so changes to globals take effect without rebuilding `Lot`.
+    let lot = Lot::from_world(&opened.world).unwrap();
     for (time_of_day, house_no, want) in cases {
         let mut world = opened.world.clone();
         if world.globals.len() <= 10 {
@@ -218,14 +221,13 @@ fn off_lot_void_colour_follows_time_of_day_and_house_99() {
         }
         world.globals[4] = time_of_day;
         world.globals[10] = house_no;
-        let lot = Lot::from_world(&world).unwrap();
-        assert_eq!((lot.time_of_day, lot.house), (time_of_day, house_no));
         let mut canvas = Canvas::new(800, 600, [0, 0, 0]);
         draw(&world, &lot, &mut opened.assets, &camera, &mut canvas);
-        let pixels = canvas.rgb565();
+        // Assert against raw `canvas.color` (not `rgb565()`) so the clear
+        // colour used for blending is verified to be 5-6-5 quantized.
         for [x, y] in [[10usize, 10], [790, 10]] {
             assert_eq!(
-                pixels[y * 800 + x],
+                canvas.color[y * 800 + x],
                 want,
                 "time_of_day={time_of_day} house={house_no} at ({x}, {y})"
             );
