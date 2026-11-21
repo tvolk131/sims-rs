@@ -320,7 +320,7 @@ pub fn clone_character(
         ));
     }
     if !(0..FILE_LIMIT).contains(&character.file) {
-        return Err(unsupported("0x4261a2", "invalid character file number"));
+        return Err(unsupported("0x42616a", "invalid character file number"));
     }
     if guid == 0 || guid == character.template {
         return Err(unsupported("0x43bda9", "zero or colliding character GUID"));
@@ -712,7 +712,7 @@ fn check_template(input: &ImportInput<'_>, guid: u32) -> Result<()> {
 pub fn reserve_character_file(next_file: &mut i32, files: &mut BTreeSet<i32>) -> Result<i32> {
     if !(0..FILE_LIMIT).contains(next_file) {
         return Err(unsupported(
-            "0x4261a2",
+            "0x42616a",
             "character file counter outside 0..32000 is not ported",
         ));
     }

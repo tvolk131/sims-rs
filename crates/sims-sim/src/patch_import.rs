@@ -132,9 +132,15 @@ pub fn open(
     // signed one.
     if neighborhood.families.contains_key(&STRAYS) {
         let largest = neighborhood.families.keys().max().copied().unwrap_or(0);
-        let id = largest.checked_add(1).ok_or_else(|| {
-            LoadError::Neighborhood("renumbering family 4000 overflows its ID".into())
-        })?;
+        let id = largest
+            .checked_add(1)
+            .filter(|&id| i16::try_from(id).is_ok())
+            .ok_or_else(|| {
+                LoadError::Neighborhood(
+                    "0x42c1ad: renumbering family 4000 leaves the signed range of a family ID"
+                        .into(),
+                )
+            })?;
         let family = neighborhood
             .families
             .remove(&STRAYS)
@@ -447,7 +453,11 @@ pub fn rebuild_family_words(neighborhood: &mut Neighborhood) -> Result<(), LoadE
         };
         match record.person_data.get_mut(FAMILY) {
             Some(word) => {
-                *word = i16::try_from(family).expect("the reload checked the family IDs");
+                *word = i16::try_from(family).map_err(|_| {
+                    LoadError::Neighborhood(format!(
+                        "0x425244: family {family} is outside the signed range word 61 holds"
+                    ))
+                })?;
             }
             None if family == 0 => {}
             None => {

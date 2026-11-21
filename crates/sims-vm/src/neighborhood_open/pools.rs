@@ -68,11 +68,6 @@ pub struct OpenedPools {
 const CELEBRITY_WORDS: &[usize] = &[10, 11, 12, 15, 17, 18, 80, 81, 82];
 const TOURIST_CHILD_WORDS: &[usize] = &[9, 10, 11, 12, 15, 17, 18, 56, 57];
 
-// Both human skeletons have 29 non-unit scales in Complete Collection's
-// Animation.far. This replay starts with their files already read
-// (0x598af7), and draws for every actor's own copy (0x598da3).
-const HUMAN_SCALES: [i32; 29] = [0; 29];
-
 struct Pool {
     families: Range<u16>,
     /// The tourist worker skips existing families regardless of size.
@@ -155,6 +150,7 @@ pub(super) fn fill<'a>(
     context: &Context<'_>,
     imported: &patch_import::Opened,
     input: &'a PoolInput,
+    skeletons: &BTreeMap<String, Vec<i32>>,
     crt: &mut CrtRng,
 ) -> Result<FilledPools<'a>, BootError> {
     let mut files = context.character_files.clone();
@@ -174,6 +170,7 @@ pub(super) fn fill<'a>(
             count: 0,
         },
         next_file: imported.next_file,
+        skeletons,
         files,
         made: Vec::new(),
     };
@@ -220,6 +217,8 @@ struct Fills<'a, 'b> {
     people: BTreeMap<u16, &'a [PoolPerson]>,
     draws: Draws<'b>,
     next_file: i32,
+    /// Each installed skeleton's own bone scales, by lowercase name.
+    skeletons: &'b BTreeMap<String, Vec<i32>>,
     files: BTreeSet<i32>,
     made: Vec<(i32, &'a Iff)>,
 }
@@ -423,7 +422,10 @@ impl<'a> Fills<'a, '_> {
         }
 
         let mut data = vec![0; PERSON_WORDS];
-        read_profile(iff, objd, self.context.language, &mut data)?;
+        let skeleton = read_profile(iff, objd, self.context.language, &mut data)?;
+        let scales = self.skeletons.get(skeleton).ok_or_else(|| {
+            format!("0x598da3: no installed skeleton {skeleton:?} for User{file:05}")
+        })?;
         let (age, gender) = (data[field::AGE], data[field::GENDER]);
         let editor_words = match pool.done {
             done if done == CELEBRITIES.done => CELEBRITY_WORDS,
@@ -440,10 +442,12 @@ impl<'a> Fills<'a, '_> {
                 .ok_or_else(|| format!("0x425a69: missing editor word {word} on User{file:05}"))?;
         }
 
-        // Each temporary actor copies a skeleton and draws two passes.
-        // The final pass survives 0x4ea538 → 0x425a69.
+        // Each temporary actor copies its skeleton and draws two passes.
+        // The skeleton's file is taken as already read (0x598af7), so
+        // only the actor's own copy draws (0x598da3). The final pass
+        // survives 0x4ea538 → 0x425a69.
         for _ in 0..pool.actors {
-            self.draws.skeleton(&HUMAN_SCALES);
+            self.draws.skeleton(scales);
             self.draws.default_traits();
             for (word, value) in self.draws.default_traits() {
                 data[word] = value;
@@ -474,7 +478,13 @@ impl<'a> Fills<'a, '_> {
 /// decoded as the actor's profile (0x5888d3). The human semi-global tone
 /// table (STR# 8192) at the supported Complete Collection layout indexes
 /// light, dark and medium this way.
-fn read_profile(iff: &Iff, objd: &[u8], language: u8, data: &mut [i16]) -> Result<(), BootError> {
+/// Returns the profile's skeleton name, `adult` or `child`.
+fn read_profile(
+    iff: &Iff,
+    objd: &[u8],
+    language: u8,
+    data: &mut [i16],
+) -> Result<&'static str, BootError> {
     let id = u16::from_le_bytes(objd[38..40].try_into()?);
     let body = iff
         .get(b"STR#", id)
@@ -511,5 +521,5 @@ fn read_profile(iff: &Iff, objd: &[u8], language: u8, data: &mut [i16]) -> Resul
         ..Profile::default()
     };
     reload_profile(data, &profile).map_err(|error| format!("0x5888d3: {error}"))?;
-    Ok(())
+    Ok(skeleton)
 }

@@ -6,7 +6,7 @@ use sims_core::CrtRng;
 use sims_formats::behavior::ObjectDefinition;
 use sims_formats::iff::Iff;
 use sims_sim::{Headline, World};
-use sims_vm::boot::{Frames, Lot, StepError};
+use sims_vm::boot::{Frames, Handoff, Lot, StepError};
 use sims_vm::neighborhood_open::{LotTransition, PoolInput, PoolPerson, open_neighborhood};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -504,7 +504,14 @@ fn an_opened_neighborhood_matches_the_originals_import() {
 
     let house = output.join("Houses/House69.iff");
     let frames = Frames::parse(RECORDED_FRAMES).unwrap();
-    let lot = Lot::load_after_pools(&root, neighborhood, &house, &[2; 8], frames, crt).unwrap();
+    // Run 2's handoff, as fitted: the adult skeleton read and the
+    // indicators made before the lot load.
+    let handoff = Handoff {
+        skeletons_read: ["adult".to_owned()].into(),
+        indicators_made: true,
+    };
+    let lot =
+        Lot::load_after_pools(&root, neighborhood, &house, &[2; 8], frames, crt, &handoff).unwrap();
     assert!(lot.load_report().finished.is_some());
     assert_eq!(lot.world().crt_rng.state(), 3_739_951_803);
     assert_eq!(lot.world().hash_hex(), IMPORTED_69);

@@ -23,13 +23,14 @@ pub use pools::{LotTransition, OpenedPools, PoolInput, PoolPerson};
 
 use crate::boot::BootError;
 use sims_content::family_import::{clone_character, refresh_outfits};
-use sims_content::{Catalog, ImportWardrobe, Index, Install, Neighborhood};
+use sims_content::{Catalog, ImportWardrobe, Index, Install, Neighborhood, People};
 use sims_core::CrtRng;
 use sims_formats::family_file::FamilyFile;
 use sims_formats::iff::{Iff, write};
 use sims_formats::iff_write::{ChunkWrite, write_chunk_with_residue};
 use sims_sim::neighbors::registry;
 use sims_sim::patch_import::{self, Context, Patch, open, pending};
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
 
@@ -131,15 +132,37 @@ pub fn open_neighborhood(
     }
     let patch = open(&mut neighborhood, &patches, &context, new_guid)?;
     let mut pool_crt = *crt;
-    let filled = pools::fill(&mut neighborhood, &context, &patch, pools, &mut pool_crt)?;
+    let skeletons = if pools.people.is_empty() {
+        BTreeMap::new()
+    } else {
+        human_skeletons(&install, &index, &catalog)?
+    };
+    let filled = pools::fill(
+        &mut neighborhood,
+        &context,
+        &patch,
+        pools,
+        &skeletons,
+        &mut pool_crt,
+    )?;
     write_imports(
         &install, &index, &catalog, &patches, &patch, output, captured,
     )?;
+    // The pool people's files. If one fails, the ones this open wrote
+    // are removed again, so the same inputs can be retried.
+    let mut written = Vec::new();
     for (number, iff) in filled.files {
         let path = output.join(format!("Characters/User{number:05}.iff"));
-        std::fs::File::create_new(&path)
-            .and_then(|mut file| file.write_all(&iff.bytes))
-            .map_err(|error| format!("0x4722b8: {}: {error}", path.display()))?;
+        let result = std::fs::File::create_new(&path).and_then(|mut file| {
+            written.push(path.clone());
+            file.write_all(&iff.bytes)
+        });
+        if let Err(error) = result {
+            for path in &written {
+                let _ = std::fs::remove_file(path);
+            }
+            return Err(format!("0x4722b8: {}: {error}", path.display()).into());
+        }
     }
     neighborhood.directory = output.to_path_buf();
     *crt = pool_crt;
@@ -211,4 +234,41 @@ fn write_imports(
         }
     }
     Ok(())
+}
+
+/// Each person type's skeleton's own bone scales, by lowercase skeleton
+/// name, as the installed skeleton files give them. A pool person's actor
+/// copies the skeleton its profile names (0x598da3), which draws by
+/// these scales. A name two files define with different scales fails.
+fn human_skeletons(
+    install: &Install,
+    index: &Index,
+    catalog: &Catalog,
+) -> Result<BTreeMap<String, Vec<i32>>, BootError> {
+    let person_types = catalog
+        .objects
+        .iter()
+        .filter(|object| object.kind == 2)
+        .map(|object| object.guid);
+    let (people, _) = People::load_each(install, index, catalog, person_types)?;
+    let mut skeletons = BTreeMap::new();
+    for skeleton in people.skeletons.values() {
+        let own = skeleton.scales.get(skeleton.place).ok_or_else(|| {
+            format!(
+                "0x598da3: the skeleton {:?} is not in its file",
+                skeleton.name
+            )
+        })?;
+        let name = skeleton.name.to_ascii_lowercase();
+        if let Some(other) = skeletons.insert(name, own.clone())
+            && &other != own
+        {
+            return Err(format!(
+                "0x598da3: two skeletons named {:?} have different scales",
+                skeleton.name
+            )
+            .into());
+        }
+    }
+    Ok(skeletons)
 }

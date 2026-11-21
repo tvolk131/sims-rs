@@ -55,14 +55,28 @@ Patch still takes its recorded GUIDs from `User00002.iff` through
 `User00029.iff`.
 
 The port draws each GUID's low word from the CRT (0x4725ff) and checks
-it against the OBJD. A temporary person copies its warm skeleton
-(0x4596f6, 0x598da3, 0x598a6e, 0x595d65) and consumes 1,392 draws.
+it against the OBJD. A temporary person copies the skeleton its profile
+names (0x4596f6, 0x598da3, 0x598a6e, 0x595d65), whose file is taken as
+already read. The copy draws by the installed skeleton's own bone
+scales (1,392 draws for the Complete Collection's adult and child).
 Each copy is followed by two default-trait passes (0x4598d4 and
-0x459a6d into 0x459a9c). Townies construct one temporary person at
+0x459a6d into 0x459a9c). Both are conditional; the replay takes both as
+running, which every pool person of both captures fits. Townies construct one temporary person at
 0x426646 or 0x4269c5. The other pools construct two
 (0x42cf4b/0x42cf54, 0x426e8e/0x426e97). The last pass supplies the 15
-saved trait words. The run-2 test compares all 256 words of every new
-record, along with its metadata and all 14 pool FAMI payloads.
+saved trait words. The run-2 test compares the parsed records 322–444
+(all 256 person words and the record's other fields) and the parsed
+fields of the 14 pool families, not the saved bytes (FAMI 0x410696,
+NBRS 0x423e08).
+
+**What the replay does not check.** It takes the recorded people as
+given and checks only some of what the original could have made:
+whether a template is the pool's, the GUID's low word, the age and
+order, and the tourists' make-up. It does not check that the
+first celebrities are the sex their ordinal fixes (0x42c6d7), nor that
+a Townie's template is one the specialty draw could still pick
+(0x42ac96 to 0x42acc1). Inputs from the original's files pass either
+way; hand-made inputs could describe a pool the original cannot make.
 
 | Capture | First three pools | Transition | Townies | Tourists |
 |---|---:|---:|---:|---:|
@@ -76,11 +90,18 @@ covering startup, neighborhood navigation and Patch. The offset is
 fitted from the first pool's GUID and trait sequence and assumes no
 reseed from state 1. Replay ends at draw 402,578, state 219,850,067.
 
-`Lot::load_after_pools` uses the post-pool CRT state directly. It starts
-with the adult skeleton file already read and reconstructs the existing
-indicators without charging their 64 graphic-root draws again
-(0x445e4a, 0x595d65). House 69 adds 3,272 draws on that path and
-reaches CRT state 3,739,951,803 and the existing `IMPORTED_69` pin.
+`Lot::load_after_pools` uses the post-pool CRT state directly. What the
+game already holds is a `Handoff` the caller gives: the skeletons whose
+files it has read, and whether the indicators exist. With the
+indicators made, the lot's indicator objects are made without charging
+their 64 graphics-root draws again (0x445e4a, 0x595d65). The run-2 test
+gives the handoff that fits: the adult skeleton read and the indicators
+made. House 69 adds 3,272 draws on that path and reaches CRT state
+3,739,951,803 and the `IMPORTED_69` pin, a regression pin of our run
+(`20261120-ud2-house-69-boots-from-the-originals-import.md`). The
+handoff is fitted, not traced. The 64 draws the transition charges
+before the Townies are a separate input (`LotTransition`), recorded
+whether or not they are the indicators'.
 `FILE_BOOT_DRAWS = 401_120` remains the fitted offset for the separate
 standalone test from the original's files. Its boot builds the
 indicators and reads the adult skeleton file as part of its setup.

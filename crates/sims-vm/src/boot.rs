@@ -22,6 +22,7 @@ use sims_sim::World;
 use sims_sim::load::{Context, Household};
 use sims_sim::motives::Tuning;
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 /// Anything that stops a boot, with a message that says where.
@@ -171,6 +172,16 @@ pub struct Finished {
     pub indicators_made: bool,
     pub sim: Option<u16>,
     pub counted: usize,
+}
+
+/// What the game holds when a lot loads straight after an open's pools
+/// ([`Lot::load_after_pools`]).
+#[derive(Debug, Clone, Default)]
+pub struct Handoff {
+    /// The skeletons, by name, whose files the game has already read.
+    pub skeletons_read: BTreeSet<String>,
+    /// Whether the two indicators' graphics roots already exist.
+    pub indicators_made: bool,
 }
 
 /// A booted house: its linked code, its catalog and its lot.
@@ -485,15 +496,22 @@ impl Lot {
         frames: Frames,
         crt: CrtRng,
     ) -> Result<Self, BootError> {
-        Self::load_in_state(root, neighborhood, house, answers, frames, crt, false)
+        Self::load_in_state(root, neighborhood, house, answers, frames, crt, None)
     }
 
-    /// Continues a recorded neighborhood open with the CRT state after
-    /// the pools. The adult skeleton is warm (0x598af7), and the game
-    /// already holds the two indicators from its previous lot. Recreate
-    /// those objects for the lot state without charging their 64 draws
-    /// again (0x445e4a, 0x595d65). This start models the warm human
-    /// skeleton House 69 uses in the recorded transition.
+    /// [`Lot::load_in_with`] straight after an open's pools
+    /// ([`crate::neighborhood_open::open_neighborhood`]), from the C
+    /// runtime state they leave. What the game already holds then is
+    /// given as `handoff`, not assumed: which skeleton files it has read
+    /// (0x598af7 reads a file only once), and whether the two indicators
+    /// exist, whose graphics roots draw 64 numbers when made (0x445e4a,
+    /// 0x595d65). The lot still makes its indicator objects; with
+    /// `indicators_made`, their draws are not charged again.
+    ///
+    /// Both are inputs from a recording, not ported: which callback ran
+    /// the Townies and tourists, and what it did before them, is not
+    /// traced. Track 2's run 2 fits an adult skeleton read and the
+    /// indicators made (`20261120-neighborhood-open-replays-five-pools.md`).
     pub fn load_after_pools(
         root: &Path,
         neighborhood: Neighborhood,
@@ -501,8 +519,17 @@ impl Lot {
         answers: &[u8],
         frames: Frames,
         crt: CrtRng,
+        handoff: &Handoff,
     ) -> Result<Self, BootError> {
-        Self::load_in_state(root, neighborhood, house, answers, frames, crt, true)
+        Self::load_in_state(
+            root,
+            neighborhood,
+            house,
+            answers,
+            frames,
+            crt,
+            Some(handoff),
+        )
     }
 
     fn load_in_state(
@@ -512,7 +539,7 @@ impl Lot {
         answers: &[u8],
         frames: Frames,
         crt: CrtRng,
-        after_pools: bool,
+        handoff: Option<&Handoff>,
     ) -> Result<Self, BootError> {
         let install = Install::detect(root)?;
         let mut index = Index::build(&install)?;
@@ -579,15 +606,21 @@ impl Lot {
             world
                 .skeleton_files
                 .extend(crate::objects::read_before_the_first_load(&program.people));
-            if after_pools {
-                world.skeleton_files.extend(
-                    program
-                        .people
-                        .skeletons
-                        .values()
-                        .filter(|skeleton| skeleton.name.eq_ignore_ascii_case("adult"))
-                        .map(|skeleton| skeleton.file.clone()),
-                );
+            for name in handoff.iter().flat_map(|handoff| &handoff.skeletons_read) {
+                let files: BTreeSet<&String> = program
+                    .people
+                    .skeletons
+                    .values()
+                    .filter(|skeleton| skeleton.name.eq_ignore_ascii_case(name))
+                    .map(|skeleton| &skeleton.file)
+                    .collect();
+                let [file] = files.into_iter().collect::<Vec<_>>()[..] else {
+                    return Err(format!(
+                        "0x598af7: the handoff's skeleton {name:?} is not in exactly one file"
+                    )
+                    .into());
+                };
+                world.skeleton_files.insert(file.clone());
             }
             world.read_neighbors(
                 &neighborhood,
@@ -600,9 +633,9 @@ impl Lot {
             }
             let before_indicators = world.crt_rng;
             interpreter.create_indicators(&mut world)?;
-            if after_pools {
+            if handoff.is_some_and(|handoff| handoff.indicators_made) {
                 // The factory called above builds both graphics roots
-                // (0x595d65); that happened before the recorded start.
+                // (0x595d65); the handoff says that happened before.
                 world.crt_rng = before_indicators;
             }
             // The load steps, in the original's order.
