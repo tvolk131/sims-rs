@@ -154,12 +154,14 @@ Things to know:
   not, before it attaches. Taken over at a return, the run checks that the
   return is not one already recorded, if it is on the captured lot in the
   game's process (`took_over_at_return`; one elsewhere has `elsewhere`
-  true). Taken over at a dialog shown that the earlier run logged (every
-  register, the record's bytes and the top of the stack as logged; no
-  dialog event and no watch row since), the dialog is not shown again
+  true). A dialog show's registers are kept in `status.json`
+  (`show_stop`) from when it is handled until the step past it. Taken over
+  at that stop (every register the same), the dialog is not shown again
   (`took_over_at_dialog_show`); its presses go on from
-  `resume_open_dialogs`. A second show of the same record that matches all
-  that would be taken for the first. Taken over off a breakpoint, the run logs
+  `resume_open_dialogs`. A run killed after logging the show and before
+  keeping `show_stop` has its show logged twice. A row cut short by the
+  kill at the end of `events.jsonl`, `updates.jsonl` or `watch.jsonl` is
+  taken off (`resume_torn`). Taken over off a breakpoint, the run logs
   `took_over_off_break`; a run killed between a stop at a watchpoint and
   its rows loses those rows (see below for one found by a step).
 - **Memory dumps.** `--dump 14,47 --guest-dir <guest dir>` also saves,
@@ -229,7 +231,7 @@ Things to know:
   a plain trap that leaves every register as it was is logged as
   `step_swallowed`, and the step is made again, once. A second one stops
   the capture with an error, and so does a step whose reply is not a trap
-  (such as `E22`; `step_failed`).
+  (such as `E22`) or is a trap giving a breakpoint (`step_failed`).
 
   The watch stop's reply is kept in `status.json` (`stepped_watch`) with
   `stepped_to` before its rows are written, and taken off once they are.
@@ -238,7 +240,8 @@ Things to know:
   and keeps it in its own `status.json` until then, so a takeover killed
   first hands it on (one killed just after may log it twice). A run
   killed after the step stopped and before `stepped_to` was kept is taken
-  over off a breakpoint; with watches set, at the next resume a plain trap
+  over off a breakpoint; with `--watch` or `--late-watch` given (whether or
+  not a watchpoint was set yet), at the next resume a plain trap
   (`T05` giving no watchpoint or breakpoint) at the same pc and CR3 off a
   breakpoint, in the thread the reattach gave (any, if it gave none), is
   that step's pending trap, logged as `step_after_watch` with

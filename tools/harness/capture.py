@@ -530,6 +530,28 @@ def open_dialogs(rows):
     return out
 
 
+def drop_torn_tail(path):
+    """Before a resume: a row cut short by the kill (the file does not end with a newline) is taken off
+    the end of a log, or ended if it is whole JSON. Returns the cut text, or None."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if not data or data.endswith(b'\n'):
+        return None
+    start = data.rfind(b'\n') + 1
+    tail = data[start:]
+    try:
+        json.loads(tail)
+    except ValueError:
+        with open(path, 'r+b') as f:
+            f.truncate(start)
+        return tail.decode(errors='replace')
+    with open(path, 'ab') as f:
+        f.write(b'\n')
+    return None
+
+
 def has_baseline(path):
     """Whether these events have a baseline row, read up to the first one. A row that is not JSON (one cut
     short by a kill) is not one."""
@@ -695,8 +717,12 @@ def main():
         ap.error(f'{out} has no baseline event: --resume takes over only a run that reached its '
                  'baseline; start a new capture')
     out.mkdir(parents=True, exist_ok=args.resume)
-    prior_status, dropped = {}, []
+    prior_status, dropped, torn = {}, [], {}
     if args.resume:
+        for name in ('events.jsonl', 'updates.jsonl', 'watch.jsonl'):
+            cut = drop_torn_tail(out / name)
+            if cut is not None:
+                torn[name] = cut
         try:
             prior_status = json.loads((out / 'status.json').read_text())
         except (OSError, ValueError):
@@ -714,7 +740,8 @@ def main():
     watch_log = open(out / 'watch.jsonl', 'a') if args.watch or args.late_watch else None
     updates_log = open(out / 'updates.jsonl', 'a')
     status = dict(started=time.time(), updates=0, state='attaching', settings={k: str(v) for k, v in vars(args).items()},
-                  stepped_watch=prior_status.get('stepped_watch'), stepped_maybe=None)
+                  stepped_to=prior_status.get('stepped_to'), stepped_watch=prior_status.get('stepped_watch'),
+                  stepped_maybe=None, show_stop=prior_status.get('show_stop'))
 
     event_lock = threading.Lock()
 
@@ -943,8 +970,6 @@ def main():
     last_clock = None
     last_objects = None  # {pointer: id} of the registry at the last return (None: not known)
     dialog_pending = False  # a dialog was shown since the last return
-    prior_show = None  # with --resume: the last dialog_show event recorded
-    waiting = {}  # with --resume: the dialogs recorded as shown and given no result yet
     if args.resume:
         rows = [json.loads(line) for line in open(out / 'events.jsonl')]
         first_baseline = next(i for i, r in enumerate(rows) if r['kind'] == 'baseline')
@@ -964,6 +989,8 @@ def main():
                 status.update(registry=prior_status['registry'], registry_update=updates)
             else:
                 event(kind='registry_unknown', updates=updates, registry_update=prior_status.get('registry_update'))
+        if torn:
+            event(kind='resume_torn', rows=torn)
         if dropped:
             event(kind='resume_dropped', events=[dict(kind=r['kind'], update=r['update']) for r in dropped])
         # A late watch an earlier run set counts as set (watch_ended's set covers its whole window).
@@ -981,37 +1008,12 @@ def main():
         # A dialog shown since the last recorded return, and the dialogs still waiting for a result.
         dialog_pending = any(r['kind'] == 'dialog_show' and r['update'] > updates for r in rows)
         waiting = open_dialogs(rows)
-        # The last dialog shown: a takeover at its stop (the earlier run was killed before stepping
-        # past it) must not show it again, which would log it twice and reset its press jobs.
-        # Only if it is the last dialog event (a later read or result shows the guest went on past it).
-        prior_show = next((r for r in reversed(rows) if r['kind'] in ('dialog_show', 'dialog_result', 'dialog_read')),
-                          None)
-        if prior_show is not None and prior_show['kind'] != 'dialog_show':
-            prior_show = None
-        if prior_show is not None and (out / 'watch.jsonl').exists():
-            # So does a watch row after it.
-            with open(out / 'watch.jsonl') as f:
-                for line in f:
-                    try:
-                        if json.loads(line).get('time', 0) > prior_show['time']:
-                            prior_show = None
-                            break
-                    except (ValueError, AttributeError):
-                        continue
         if waiting:
             event(kind='resume_open_dialogs', dialogs=[dict(record=k, update=u, jobs=j) for k, (u, j) in waiting.items()])
         if answerer:
             for record, (shown_in, jobs) in waiting.items():
                 if shown_in >= args.answer_from:
                     answerer.shown(shown_in, record, jobs)
-    def same_bytes(m, show):
-        """Whether the dialog record's bytes and the top of the stack are as this logged show has them."""
-        try:
-            return (m.read(show['record'], 0x80).hex() == show.get('record_bytes')
-                    and m.read(show['registers']['esp'], 0x20).hex() == show.get('stack'))
-        except MemoryError:
-            return False
-
     def tend_watches(m, foreign):
         """At a stop: start the late watches whose updates have come, work out the moving ones again,
         end those whose updates are over, and set those waiting. At a stop whose lot cannot be read
@@ -1112,6 +1114,10 @@ def main():
             regs = {k: v for k, v in regs.items() if not k.startswith('_')}
             regs.update(fs_base=fs_base, cr3=cr3)
             m = Memory(remote)
+            # A dialog show the run taken over handled and did not step past: the guest is still at it.
+            shown_here = took_over and pc == DIALOG_SHOW and status['show_stop'] == regs
+            if took_over and status['show_stop'] is not None and not shown_here:
+                save_status(show_stop=None)
             stepped_to = status['stepped_to']
             if stepped_to is not None:
                 thread = stop_thread(reply)
@@ -1287,17 +1293,13 @@ def main():
                         arm(ENTRY)
             elif runner and pc == scenario_input.QUEUE_PUSH:
                 runner.on_queue_push(updates + 1, bool(in_update), m, regs)
-            elif (took_over and pc == DIALOG_SHOW and prior_show is not None
-                  and prior_show.get('registers') == regs and prior_show['update'] == updates + 1
-                  and regs['ecx'] in waiting and same_bytes(m, prior_show)):
-                # The earlier run logged this show and was killed before stepping past it: the guest
-                # is still at that stop (every register, the record's bytes and the top of the stack
-                # as logged, and no dialog event or watch row since).
-                # It was shown to the answerer again above with its press jobs, so it is not shown
-                # again here. (A second show of the same record with no result between it and the
-                # first, and every register the same, would be taken for it too.)
+            elif shown_here:
+                # The earlier run handled this show (status.json's show_stop, kept from when it was
+                # handled until the step past it) and was killed before stepping past it. It was
+                # shown to the answerer again above with its press jobs, so it is not shown again.
                 event(kind='took_over_at_dialog_show', record=regs['ecx'], update=updates + 1)
-                save_status(dialog=dict(update=updates + 1, record=regs['ecx'], shown=prior_show['time']))
+                shown = (prior_status.get('dialog') or {}).get('shown')
+                save_status(dialog=dict(update=updates + 1, record=regs['ecx'], shown=shown or time.time()))
             else:
                 # A dialog function. ecx is the dialog record (0x436da0 keeps it in esi).
                 record = regs['ecx']
@@ -1325,7 +1327,9 @@ def main():
                 elif pc == DIALOG_RESULT and answerer:
                     answerer.answered(record)
                 if pc == DIALOG_SHOW:
-                    save_status(dialog=dict(update=updates + 1, record=record, shown=time.time()))
+                    # Kept until the step past it: a run killed in between leaves it to its takeover.
+                    # (One killed between the event above and this logs the show twice.)
+                    save_status(dialog=dict(update=updates + 1, record=record, shown=time.time()), show_stop=regs)
             # Only another process counts as foreign here: tend_watches reads the lot again, and a lot
             # that cannot be read in the game's process still takes the moving late watches off.
             tend_watches(m, sims_cr3 is not None and cr3 != sims_cr3)
@@ -1339,9 +1343,10 @@ def main():
             for attempt in range(2):
                 reply = remote.step()
                 watch_stop = 'watch:' in reply
-                if not reply.startswith('T05'):
-                    # Not a trap (an error such as E22, or the guest gone): where the guest is is
-                    # not known, so the capture cannot go on.
+                if not (watch_stop and reply.startswith('T05')) and not plain_trap(reply):
+                    # Not a trap (an error such as E22, or the guest gone), or one giving a breakpoint
+                    # (none is armed where a step goes): where the guest is is not known, so the
+                    # capture cannot go on.
                     event(kind='step_failed', pc=pc, cr3=cr3, reply=reply, attempt=attempt)
                     raise RuntimeError(f'step at {pc:#x} gave {reply!r}, not a trap')
                 if not watch_stop and status['stepped_to'] is not None:
@@ -1362,6 +1367,8 @@ def main():
                 event(kind='step_swallowed', pc=pc, cr3=cr3)
             if armed:
                 remote.set_break(pc)
+            if status['show_stop'] is not None:
+                save_status(show_stop=None)
             if watch_stop:
                 regs = {k: v for k, v in regs.items() if not k.startswith('_')}
                 regs.update(fs_base=struct.unpack_from('<I', raw, 64)[0], cr3=step_cr3)
