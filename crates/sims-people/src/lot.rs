@@ -38,16 +38,18 @@
 //! (0x5d452b, 0x5a1b5c), default point filtering (0x49b090, 0x5d3a65),
 //! Gouraud shading (0x5ce935), `D3DTOP_MODULATE` (0x5d3a30), and dithering
 //! off (0x5ce99e). [`People::draw`] wraps textured parts' writes in
-//! `Packed565` to quantize texels to 5-6-5 and expand them back to 8-bit
+//! `Packed565` to truncate texels to 5-6-5 and expand them back to 8-bit
 //! unorm by MSB bit-replication (`(r5 << 3) | (r5 >> 2)`,
-//! `(g6 << 2) | (g6 >> 4)`, `(b5 << 3) | (b5 >> 2)`) before modulation—
-//! preserving the original 8-bit bitmaps in the shared `Body` cache read by
-//! [`People::posed`] (such as the pie-menu portrait renderer) and leaving
-//! untextured meshes (such as the plumb bob's `white` material at 0x5d452b,
-//! texture handle 0 at 0x5d48ce) at full 8-bit white—and
-//! `sims_render::Canvas`'s [`Target`] implementation modulates with half-up
-//! 8-bit rounding (an approximation that avoids truncating 1-ULP barycentric
-//! shortfalls below 1.0 by a full 5-6-5 step).
+//! `(g6 << 2) | (g6 >> 4)`, `(b5 << 3) | (b5 >> 2)`) before modulation—a
+//! standard unorm5/unorm6 expansion chosen for the Direct3D 6 rasterizer
+//! (whose internal expansion is outside `Sims.exe`)—preserving the original
+//! 8-bit bitmaps in the shared `Body` cache read by [`People::posed`] (such
+//! as the pie-menu portrait renderer) and leaving untextured meshes (such as
+//! the plumb bob's `white` material at 0x5d452b, texture handle 0 at
+//! 0x5d48ce) at full 8-bit white—and `sims_render::Canvas`'s [`Target`]
+//! implementation modulates with half-up 8-bit rounding (an approximation
+//! that avoids truncating 1-ULP barycentric shortfalls below 1.0 by a full
+//! 5-6-5 step).
 //!
 //! A person stands on the terrain under it (`sims_sim::head::ground_height`:
 //! the tile's altitude where its position falls, as the original finds it,
@@ -472,14 +474,16 @@ impl Target for sims_render::Canvas {
     }
 }
 
-/// Packs a texel's RGB channels to 16-bit 5-6-5 by truncation (matching
+/// Packs a texel's RGB channels to 16-bit 5-6-5 by truncation (verified in
 /// `Sims.exe`'s texture surface upload at `0x5ca0d3` / `0x5ca1f8` for
 /// indexed 8-bit skins and `0x5ca55f` for 24-bit BMPs → `0x5ca635` →
 /// `0x49f0ae`) and expands them back to 8-bit unorm by MSB bit-replication
 /// (`(r5 << 3) | (r5 >> 2)`, `(g6 << 2) | (g6 >> 4)`,
-/// `(b5 << 3) | (b5 >> 2)`), matching Direct3D 6's 5-6-5 texel expansion
-/// before `D3DTOP_MODULATE` so maximum 5-6-5 white `(31, 63, 31)` maps to
-/// `[255, 255, 255]`.
+/// `(b5 << 3) | (b5 >> 2)`). Direct3D 6's internal 5-6-5-to-8-bit expansion
+/// before `D3DTOP_MODULATE` lives inside Direct3D's rasterizer, not
+/// `Sims.exe`; MSB bit-replication is a standard unorm5/unorm6 expansion
+/// mapping maximum 5-6-5 white `(31, 63, 31)` to `[255, 255, 255]` (and
+/// differing by at most 1 from rounded normalization on some low/mid codes).
 fn expand_565([r, g, b, a]: [u8; 4]) -> [u8; 4] {
     let r5 = r >> 3;
     let g6 = g >> 2;
@@ -806,24 +810,42 @@ impl People {
     /// each pixel tested against the lot's depth: walls, furniture and
     /// floors in front of a person hide them. Depth is the lot renderer's
     /// [`Depth::point`]; the pixels go in by its sprite rule
-    /// ([`sims_render::Canvas::put`]).
+    /// ([`sims_render::Canvas::put`]). Uses the full canvas dimensions as
+    /// the house viewport for [`View::eye`].
     pub fn draw_on_lot(
         &mut self,
         world: &World,
         camera: &Camera,
         canvas: &mut sims_render::Canvas,
     ) -> Drawn {
+        let viewport = (canvas.width as u32, canvas.height as u32);
+        self.draw_on_lot_in_viewport(world, camera, viewport, canvas)
+    }
+
+    /// Like [`People::draw_on_lot`], using `viewport` `(width, height)` as
+    /// the active 3D house viewport passed to [`View::eye`] (`0x49ae5e`,
+    /// `0x4d363b`, `0x53b2eb` → `0x4b136b` → `0x49b0bf` → `0x5cf1b6`:
+    /// `(width, height)` with the bottom strip closed, `(width, height - 100)`
+    /// with the live-mode strip open, `(width, height - 150)` with the tall
+    /// buy-mode strip open).
+    pub fn draw_on_lot_in_viewport(
+        &mut self,
+        world: &World,
+        camera: &Camera,
+        viewport: (u32, u32),
+        canvas: &mut sims_render::Canvas,
+    ) -> Drawn {
         let depth = Depth::new(camera);
-        self.draw(world, camera, canvas, |fine, elevation, level| {
+        self.draw_in_viewport(world, camera, viewport, canvas, |fine, elevation, level| {
             depth.point(fine, elevation, level)
         })
     }
 
     /// Draws every placed person on the camera's levels into `target`,
     /// far to near. `depth` gives the target's depth for a point: its fine
-    /// view position, its elevation above its level in near-zoom pixels,
-    /// and the level (the lot renderer's [`Depth::point`]). Call
-    /// [`People::update`] first.
+    /// view position, elevation above its level in near-zoom pixels, and
+    /// the level (the lot renderer's [`Depth::point`]). Uses `target.size()`
+    /// as the house viewport for [`View::eye`]. Call [`People::update`] first.
     pub fn draw<T: Target + ?Sized>(
         &mut self,
         world: &World,
@@ -831,9 +853,24 @@ impl People {
         target: &mut T,
         depth: impl Fn([f32; 2], f32, i32) -> f32,
     ) -> Drawn {
+        self.draw_in_viewport(world, camera, target.size(), target, depth)
+    }
+
+    /// Like [`People::draw`], taking the active 3D house `viewport` size
+    /// `(width, height)` for [`View::eye`] (`0x49b0de`) independently of
+    /// `target.size()` (e.g. `800×500` over an `800×600` framebuffer when
+    /// the live-mode strip is open).
+    pub fn draw_in_viewport<T: Target + ?Sized>(
+        &mut self,
+        world: &World,
+        camera: &Camera,
+        viewport: (u32, u32),
+        target: &mut T,
+        depth: impl Fn([f32; 2], f32, i32) -> f32,
+    ) -> Drawn {
         let view = View::new(camera);
         let light = view.light();
-        let eye = view.eye(target.size());
+        let eye = view.eye(viewport);
         // The plumb bob is loaded the first time the lot has one.
         let mut bob = self.bob.take();
         if bob.is_none() && world.objects.values().any(|o| o.guid == bob::STANDARD) {
@@ -1091,24 +1128,57 @@ mod tests {
         );
     }
 
-    /// `View::eye` (`0x49b0de`) places the orthographic camera so every world
-    /// point projects onto the same screen coordinates as `View::screen` at
-    /// every rotation, zoom, origin, and viewport size.
+    /// `View::eye` (`0x49b0de`) places the orthographic camera at the exact
+    /// depth and screen offset computed by `0x49b0de`: every world point
+    /// projects onto the same screen coordinates as `View::screen`, the
+    /// distance along the view axis matches `eye_dist = far - 12.5` at every
+    /// rotation and zoom (including odd viewports and negative horizontal
+    /// scroll), and shortening the viewport by the 100-pixel live strip shifts
+    /// the eye by `50 * scale_px` along the camera's up axis.
     #[test]
     fn the_house_camera_eye_projects_world_points_onto_the_lot_view() {
+        let span = sims_render::camera::ARRAY_SIZE as f32 * UNITS_PER_TILE;
+        let h = (255.0 / (2.0 * 6.0f32.sqrt())) * UNITS_PER_TILE + 68.0;
+        let far = 3.0f32.sqrt() * (2.0f32.sqrt() * span) * 0.5 + h * 0.5;
+        let expected_eye_dist = far - 12.5;
         let s2 = 0.5f32.sqrt();
+        let s6 = (3.0f32 / 8.0).sqrt();
         let s3 = 0.75f32.sqrt();
         let h2 = 0.5 * s2;
         for zoom in Zoom::ALL {
             let scale_px = 2.0f32.sqrt() * UNITS_PER_TILE / zoom.tile_width() as f32;
             for rotation in 0..4 {
-                let (right, up) = match rotation {
-                    1 => (Vec3::new(s2, 0.0, s2), Vec3::new(-h2, s3, h2)),
-                    2 => (Vec3::new(-s2, 0.0, s2), Vec3::new(-h2, s3, -h2)),
-                    3 => (Vec3::new(-s2, 0.0, -s2), Vec3::new(h2, s3, -h2)),
-                    _ => (Vec3::new(s2, 0.0, -s2), Vec3::new(h2, s3, h2)),
+                let (corner, eye_dir, right, up) = match rotation {
+                    1 => (
+                        Vec3::new(-span, 0.0, 0.0),
+                        Vec3::new(s6, 0.5, -s6),
+                        Vec3::new(s2, 0.0, s2),
+                        Vec3::new(-h2, s3, h2),
+                    ),
+                    2 => (
+                        Vec3::new(-span, 0.0, -span),
+                        Vec3::new(s6, 0.5, s6),
+                        Vec3::new(-s2, 0.0, s2),
+                        Vec3::new(-h2, s3, -h2),
+                    ),
+                    3 => (
+                        Vec3::new(0.0, 0.0, -span),
+                        Vec3::new(-s6, 0.5, s6),
+                        Vec3::new(-s2, 0.0, -s2),
+                        Vec3::new(h2, s3, -h2),
+                    ),
+                    _ => (
+                        Vec3::ZERO,
+                        Vec3::new(-s6, 0.5, -s6),
+                        Vec3::new(s2, 0.0, -s2),
+                        Vec3::new(h2, s3, h2),
+                    ),
                 };
-                for &(origin, size) in &[([279, -2004], (800, 600)), ([335, -560], (1024, 768))] {
+                for &(origin, size) in &[
+                    ([279, -2004], (800, 600)),
+                    ([335, -560], (1024, 768)),
+                    ([-250, -560], (801, 599)),
+                ] {
                     let c = Camera {
                         zoom,
                         rotation,
@@ -1119,6 +1189,12 @@ mod tests {
                     };
                     let view = View::new(&c);
                     let eye = view.eye(size);
+                    // Depth along the view axis must equal `eye_dist` from `0x49b0de`.
+                    let depth_from_corner = (eye - corner).dot(eye_dir);
+                    assert!(
+                        (depth_from_corner - expected_eye_dist).abs() < 1e-3,
+                        "{zoom:?} rot={rotation}: depth {depth_from_corner} != {expected_eye_dist}"
+                    );
                     for p in [
                         Vec3::new(-88.5, 8.674, -79.5),
                         Vec3::new(-79.5, 3.674, -72.0),
@@ -1137,6 +1213,40 @@ mod tests {
                 }
             }
         }
+        // Pin the absolute `near-r2-0805` eye position against `0x49b0de`.
+        let r2 = View::new(&Camera {
+            zoom: Zoom::Near,
+            rotation: 2,
+            level: 1,
+            origin: [279, -2004],
+            walls: Walls::Down,
+            focus: Default::default(),
+        })
+        .eye((800, 600));
+        assert!(
+            (r2.x - 37.166).abs() < 1e-3
+                && (r2.y - 101.228).abs() < 1e-3
+                && (r2.z - 42.791).abs() < 1e-3,
+            "near-r2-0805 eye: {r2:?}"
+        );
+        // Shortening an 800×600 viewport by the 100-pixel live strip moves the
+        // eye by 50 * scale_px along `up` (≈ 6.629 model units at far zoom).
+        let far_view = View::new(&Camera {
+            zoom: Zoom::Far,
+            rotation: 0,
+            level: 1,
+            origin: [367, -130],
+            walls: Walls::Cutaway,
+            focus: Default::default(),
+        });
+        let full_eye = far_view.eye((800, 600));
+        let strip_eye = far_view.eye((800, 500));
+        let shift = (strip_eye - full_eye).length();
+        let expected_shift = 50.0 * 2.0f32.sqrt() * UNITS_PER_TILE / Zoom::Far.tile_width() as f32;
+        assert!(
+            (shift - expected_shift).abs() < 1e-4,
+            "far strip eye shift: {shift} != {expected_shift}"
+        );
     }
 
     /// `project_lot_vertex` (used by `People::draw`) adds `(+0.5, +0.5)` to
@@ -1383,6 +1493,24 @@ mod tests {
         // Degenerate eye == light produces zero direction, not NaN.
         let degenerate = lamps(&world, 1, near_at, light_pos);
         assert_eq!(degenerate[0].towards, Vec3::ZERO);
+
+        // Shortening an 800×600 viewport to 800×500 (expanded live strip)
+        // shifts the far-zoom eye by ≈ 6.629 units and changes the lamp
+        // direction accordingly.
+        let far_view = View::new(&Camera {
+            zoom: Zoom::Far,
+            rotation: 0,
+            level: 1,
+            origin: [367, -130],
+            walls: Walls::Cutaway,
+            focus: Default::default(),
+        });
+        let full_dir = lamps(&world, 1, near_at, far_view.eye((800, 600)))[0].towards;
+        let strip_dir = lamps(&world, 1, near_at, far_view.eye((800, 500)))[0].towards;
+        assert!(
+            (full_dir - strip_dir).length() > 1e-2,
+            "full={full_dir:?} strip={strip_dir:?}"
+        );
     }
 
     /// The level lift is the offset `place_on` adds, at every rotation:

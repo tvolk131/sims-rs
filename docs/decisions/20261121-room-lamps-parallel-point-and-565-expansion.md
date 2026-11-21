@@ -44,26 +44,42 @@ lamps' lights are directional, not point lights") and
   `lamp_pos - camera_eye` points away from the viewer, Mortimer's viewer-facing back
   receives no lamp contribution while sides facing away from the viewer receive warm
   fill light.
+- **Active house viewport height (`0x49ae5e`, `0x4d363b`, `0x53b2eb` → `0x4b136b` → `0x49b0bf` → `0x5cf1b6`).**
+  `0x49b0de` reads the active viewport rectangle (`[viewport + 0x68..+0x74]`).
+  `0x49ae5e` initializes it to `(width, height - 100)` (`0x49aed6`); collapsing
+  the bottom strip (`0x53b2eb`, `[panel + 0x230] == 1`) restores the full
+  framebuffer `(width, height)` (`0x53b3a4`), while expanding the strip resizes
+  it to `height - 100` in live/build/options mode (`0x53b38b`, `0x4d363b`) and
+  `height - 150` in buy mode (`TALL_STRIP`). All eight ratchet scenes have the
+  strip closed (`800×600`).
 - **5-6-5 texel expansion by MSB bit-replication before `D3DTOP_MODULATE`.**
-  `Sims.exe` uploads skin BMPs into 16-bit 5-6-5 textures by truncation (`0x49f0ae`:
-  `r5 = r >> 3`, `g6 = g >> 2`, `b5 = b >> 3`). When Direct3D 6 samples a 5-6-5
-  texture for `D3DTOP_MODULATE`, it expands each channel back to 8-bit unorm by MSB
-  bit-replication (`(r5 << 3) | (r5 >> 2)`, `(g6 << 2) | (g6 >> 4)`,
-  `(b5 << 3) | (b5 >> 2)`) so maximum 5-6-5 white `(31, 63, 31)` maps to `255`
-  rather than `248`. At full light (`level = 1.0`), bit-replicated values quantize
-  back to the exact same 5-6-5 output; in dim rooms (`level < 1.0`, such as room 4
-  at `162/255`), zero-filled masking (`r & 0xf8`) darkened every modulated skin
-  texel by up to 3%.
+  `Sims.exe` verifies truncation of uploaded skin BMPs into 16-bit 5-6-5 textures
+  (`0x5ca0d3`, `0x5ca1f8`, `0x5ca55f` → `0x5ca635` → `0x49f0ae`: `r5 = r >> 3`,
+  `g6 = g >> 2`, `b5 = b >> 3`). Exact expansion from 5-6-5 back to 8-bit unorm
+  before `D3DTOP_MODULATE` lives inside Direct3D 6's rasterizer, not `Sims.exe`.
+  MSB bit-replication (`(r5 << 3) | (r5 >> 2)`, `(g6 << 2) | (g6 >> 4)`,
+  `(b5 << 3) | (b5 >> 2)`) is a standard unorm5/unorm6 expansion that maps
+  maximum 5-6-5 white `(31, 63, 31)` to `255` rather than `248` (agreeing with
+  rounded normalization at full white while differing by 1 on some low/mid codes
+  such as 5-bit `3` → `24` vs `25`). At full light (`level = 1.0`), expanded
+  values quantize back to the exact same 5-6-5 output; in dim rooms
+  (`level < 1.0`, such as room 4 at `162/255`), zero-filled masking (`r & 0xf8`)
+  darkened modulated skin texels by up to 3%.
 
 ## Changes
 
 - **`View::eye` (`crates/sims-people/src/lot.rs`):** Computes the exact `0x49b0de`
   house camera eye position in the drawing frame for any viewport `(width, height)`,
   zoom, rotation, and scroll origin.
-- **`lot::lamps` & `People::draw` (`crates/sims-people/src/lot.rs`):** Takes
-  `eye: Vec3` (computed once per frame via `view.eye(target.size())`) and sets each
+- **`lot::lamps`, `People::draw_on_lot_in_viewport`, `People::draw_in_viewport`
+  (`crates/sims-people/src/lot.rs`) and `Game::draw` (`crates/sims-game/src/game.rs`,
+  `crates/sims-game/src/people.rs`):** `lamps` takes `eye: Vec3` and sets each
   room lamp's direction to `(light - eye).normalize()` while keeping strength
   computed from the squared distance between the person's root `at` and `light`.
+  `Game::draw` passes the active house viewport (`(w, h)` when the strip is
+  closed, `(w, h - 100)` with the live/build/options strip open, `(w, h - 150)`
+  with the tall buy-mode strip open) so `View::eye` matches the original's active
+  viewport height.
 - **`Packed565` / `expand_565` (`crates/sims-people/src/lot.rs`):** Replaces
   zero-filled `mask_565` with MSB bit-replicated `expand_565` on textured lot draws
   while keeping the shared `Body` cache (used by `People::posed`) and untextured
