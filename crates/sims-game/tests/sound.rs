@@ -31,6 +31,61 @@ fn an_event_plays_and_the_inputs_are_taken() {
 }
 
 #[test]
+fn hour_change_with_still_camera_updates_the_night_loop() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL is not set; skipping the sound test");
+        return;
+    };
+    let mut mixer = Mixer::open(std::path::Path::new(&root)).expect("the sound files");
+    let snap = |hour: i32| {
+        let mut s = sims_audio::sources::Snapshot::default();
+        s.absent[4] = hour;
+        s.lot = 5;
+        s
+    };
+    // Enter live mode at 18:00 (daytime), then stop the ambience score
+    // and neighbourhood music with StopAll so every sound heard comes
+    // solely from `nite_loop`.
+    mixer.input(Input::Sources(snap(18)));
+    mixer.input(Input::View(0));
+    mixer.input(Input::Hour(18));
+    mixer.input(Input::Events(vec![
+        SoundEvent::Play {
+            object: 0,
+            name: "bkground_nhood1".into(),
+        },
+        SoundEvent::Play {
+            object: 0,
+            name: "bkground_live".into(),
+        },
+        SoundEvent::StopAll,
+    ]));
+    mixer.input(Input::Camera);
+    assert!(mixer.render(RATE as usize).iter().all(|&s| s == 0));
+
+    // Clock crosses 19:00 with NO Input::Camera (stationary camera):
+    // Input::Hour runs kind 33 (0x46d4d3 -> 0x4f66bc -> 0x57aac5) and
+    // starts `nite_loop`.
+    mixer.input(Input::Sources(snap(19)));
+    mixer.input(Input::Hour(19));
+    let night = mixer.render(RATE as usize);
+    assert!(
+        night.iter().any(|&s| s != 0),
+        "nite_loop should start at 19:00 without moving the camera"
+    );
+
+    // Clock crosses 06:00 with NO Input::Camera: `nite_loop` fades out.
+    mixer.input(Input::Sources(snap(6)));
+    mixer.input(Input::Hour(6));
+    let _ = mixer.render(RATE as usize);
+    assert!(
+        mixer.render(RATE as usize).iter().all(|&s| s == 0),
+        "nite_loop should stop at 06:00 without moving the camera"
+    );
+    assert!(mixer.new_faults().is_empty());
+}
+
+#[test]
 fn the_goths_sounds_play() {
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL is not set; skipping the Goth house sound test");

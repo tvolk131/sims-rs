@@ -381,9 +381,9 @@ impl App {
             self.game.ambience_view(),
         );
         if self.heard != Some(now) {
+            self.sound.send(Input::View(now.2));
             self.sound.send(Input::Hour(now.0));
             self.sound.send(Input::Speed(now.1));
-            self.sound.send(Input::View(now.2));
             self.heard = Some(now);
         }
         // Kind 33, after the sources and the view the moved camera shows.

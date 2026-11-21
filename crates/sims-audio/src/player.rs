@@ -1042,6 +1042,12 @@ impl<S: Samples> Player<S> {
         self.ambience.and_then(|mode| self.scores.get(&mode))
     }
 
+    /// An ambience score's player by mode (`0..=3`), whether or not it is
+    /// current.
+    pub fn score(&self, mode: u32) -> Option<&Fresh> {
+        self.scores.get(&mode)
+    }
+
     /// *(code)* Kind 33 (0x574157), which the original's game sends when
     /// the camera moves (from five places: 0x4a80bb, 0x4a8d38, 0x4ce50a,
     /// 0x4ced58 and 0x4f66c6, through 0x57a9d4 and 0x57aac5). It places
@@ -1708,15 +1714,26 @@ impl<S: Samples> Player<S> {
     /// *(code)* Writes a placement's `extvol` (0x57d57a) then `pan`
     /// (0x57d5a0) to the threads a start started or let go, as the start
     /// left them pointing at themselves: the comparison flags are the
-    /// pan's. With no placement both stay as they were.
+    /// pan's. Also updates any playing notes of those threads at once,
+    /// matching the original's immediate voice update (0x57df13 →
+    /// 0x57f759). With no placement both stay as they were.
     fn place(&mut self, threads: &[u32], placed: Option<(i32, i32)>) {
         let Some((vol, pan)) = placed else {
             return;
         };
+        let mut updated = Vec::new();
         for thread in self.threads.iter_mut().filter(|t| threads.contains(&t.id)) {
             thread.registers[usize::from(EXTVOL)] = vol;
             thread.registers[usize::from(PAN)] = pan;
             thread.kept = i64::from(pan);
+            updated.push(thread.clone());
+        }
+        for thread in updated {
+            let levels = self.levels(&thread);
+            for note in self.notes.iter_mut().filter(|n| n.thread == thread.id) {
+                note.gains = levels.gains;
+                note.step = step(levels.rate);
+            }
         }
     }
 
@@ -2139,7 +2156,7 @@ impl<S: Samples> Player<S> {
         };
         // Unregistered ID -> NULL (0x5749f6); patch object -> vtable
         // +0x70 returns true (0x57bfa6), so neither starts nor faults.
-        if self.owner(track).is_none() || self.threads.iter().any(|t| t.track == track) {
+        if self.owner(track).is_none() || self.day_night_playing(track) {
             return;
         }
         let target_vol = self.group_volumes.get(&1).copied().unwrap_or(1024);
@@ -2156,10 +2173,22 @@ impl<S: Samples> Player<S> {
         self.let_go(&started.threads);
     }
 
+    /// Whether a day and night loop track is still active: a running
+    /// thread, or a note from a script that reached `end` while its note
+    /// played (which the original keeps marked running until faded out,
+    /// `0x57edcc`). Excludes idle kind-53 notes (`thread == 0`).
+    fn day_night_playing(&self, track: u32) -> bool {
+        self.threads.iter().any(|t| t.track == track)
+            || self
+                .notes
+                .iter()
+                .any(|n| n.track == track && self.ended.contains_key(&n.thread))
+    }
+
     /// Fades out and ends a day and night loop track if it is a running
     /// track object (vtable +0x70 / +0x34, `0x5749d6`, `0x574a80`).
     fn fade_day_night(&mut self, track: u32) {
-        if self.owner(track).is_some() && self.threads.iter().any(|t| t.track == track) {
+        if self.owner(track).is_some() && self.day_night_playing(track) {
             self.fade_and_kill(track);
         }
     }
@@ -2438,14 +2467,19 @@ impl<S: Samples> Player<S> {
     /// ([`Player::let_go`]). Only a start of a track that does not run
     /// makes a thread, so only then does the thread limit apply.
     ///
-    /// Not ported: when the track's group is off (manager lookup 0x57bde7,
-    /// its +0xc0 is 0), the original's start returns before all of this
-    /// (0x57d969 to 0x57d9a5). This player has no group that can be off.
+    /// *(code)* When the track's nonzero group has volume 0 (manager
+    /// lookup `0x57bde7`, its `+0xc0 == 0`), the start returns at once
+    /// without starting, refreshing or restarting (`0x57d969`..`0x57d9a5`).
     fn start(&mut self, args: [u32; 3], track: u32) -> Started {
         let Some(module) = self.owner(track) else {
             self.no_track(track);
             return Started::default();
         };
+        let owner = &self.modules[module];
+        let group = owner.number(&owner.hot.tracks[&track].group).unwrap_or(0);
+        if group != 0 && self.group_volumes.get(&group).copied().unwrap_or(1024) == 0 {
+            return Started::default();
+        }
         if self.held.remove(&track) {
             let resumed = self.resume_held(args, track);
             if !resumed.is_empty() {

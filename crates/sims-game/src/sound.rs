@@ -20,14 +20,14 @@
 //! window resized (a [`Shot`] that changes). The mixer then does what
 //! the original's kind 33 does (`sims_audio::player::Player::camera_moved`):
 //! every track is placed again from where its objects are on the moved
-//! screen, and the ambience's cursor moves. The original sends kind 33
-//! from five places in its view code, which are not all read; that these
-//! are the moves that send it is **unverified**. The ambience's cursor
-//! also follows the latest hour and view before each block the mixer
-//! renders, so the ambience keeps to the clock while the camera is
-//! still: the original moves it only on kind 33 as far as is read, and
-//! whether anything sends kind 33 when the hour changes is
-//! **unverified**.
+//! screen, the ambience's cursor moves, and the day and night loop
+//! updates (`0x574978`). When the hour changes (`Input::Hour`, after
+//! the initial hour), the mixer also runs kind 33, as the original's
+//! clock does at minute zero (`0x46d4d3` → `0x4f66bc`..`0x4f66c6` →
+//! `0x57aac5`). The original sends kind 33 from five places in its view
+//! and clock code; that the camera moves above cover the other four is
+//! **unverified**. The ambience's cursor also follows the latest hour
+//! and view before each block the mixer renders.
 //!
 //! The game pauses the sound as the original's does (its mode handler,
 //! 0x4ce470): it sends `sims_audio::SoundEvent::Pause` (in
@@ -302,7 +302,10 @@ impl Shot {
 pub enum Input {
     /// Events from a tick, in order.
     Events(Vec<SoundEvent>),
-    /// The hour of the game's clock (global 0), for the ambience.
+    /// The hour of the game's clock (global 0), sent after
+    /// [`Input::Sources`] and [`Input::View`]. Once set, a change of
+    /// hour runs kind 33 (`camera_moved`), as the original's clock does
+    /// at minute zero (`0x46d4d3` → `0x4f66bc`..`0x4f66c6` → `0x57aac5`).
     Hour(u32),
     /// The ambience's camera value (see the module documentation).
     View(i32),
@@ -354,7 +357,14 @@ impl Mixer {
                     self.player.handle(event, &self.sources);
                 }
             }
-            Input::Hour(hour) => self.hour = hour,
+            Input::Hour(hour) => {
+                let changed = self.hour != u32::MAX && self.hour != hour;
+                self.hour = hour;
+                if changed {
+                    self.player
+                        .camera_moved(self.view, self.hour, &self.sources);
+                }
+            }
             Input::View(view) => self.view = view,
             Input::Sources(sources) => self.sources = sources,
             Input::Camera => self

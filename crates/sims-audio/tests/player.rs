@@ -3367,9 +3367,10 @@ fn kind_25_off_pauses_all_ambience_scores_in_live_mode_only() {
     assert!(player.add_score(1, &empty_score, "b"));
     play(&mut player, "amb0");
 
-    // In initial music mode 4 (non-live), kind 25 off leaves ambience unpaused.
+    // In initial music mode 4 (non-live), kind 25 off leaves every score unpaused.
     player.set_active(false, &NoSources);
-    assert!(!player.ambience().unwrap().is_paused());
+    assert!(!player.score(0).unwrap().is_paused());
+    assert!(!player.score(1).unwrap().is_paused());
     player.set_active(true, &NoSources);
 
     // Enter live music mode (mode 3 then mode 0).
@@ -3389,26 +3390,29 @@ fn kind_25_off_pauses_all_ambience_scores_in_live_mode_only() {
         },
         &day,
     );
-    assert!(!player.ambience().unwrap().is_paused());
+    assert!(!player.score(0).unwrap().is_paused());
+    assert!(!player.score(1).unwrap().is_paused());
 
-    // In live mode, kind 25 off pauses every ambience score (+0x104..+0x110).
+    // In live mode, kind 25 off pauses EVERY ambience score (+0x104..+0x110),
+    // including the non-current score 1.
     player.set_active(false, &day);
-    assert!(player.ambience().unwrap().is_paused());
+    assert!(player.score(0).unwrap().is_paused());
+    assert!(player.score(1).unwrap().is_paused());
 
-    // Kind 25 on while paused does NOT unpause the ambience score;
-    // while unpaused it DOES unpause the current score (0x573ca1).
+    // Kind 25 on while paused does NOT unpause either score; while
+    // unpaused it unpauses ONLY the current score (+0x100, 0x573ca1),
+    // leaving score 1 paused.
     player.handle(&SoundEvent::Pause, &day);
     player.set_active(true, &day);
-    assert!(player.ambience().unwrap().is_paused());
+    assert!(player.score(0).unwrap().is_paused());
+    assert!(player.score(1).unwrap().is_paused());
     player.handle(&SoundEvent::Unpause, &day);
-    assert!(!player.ambience().unwrap().is_paused());
-    // Re-verifying the non-current score (mode 1) was also paused by kind 25 off:
-    // switch to mode 1 while paused after another kind 25 off/on cycle.
-    player.set_active(false, &day);
-    player.set_active(true, &day);
-    assert!(!player.ambience().unwrap().is_paused());
+    assert!(!player.score(0).unwrap().is_paused());
+    assert!(player.score(1).unwrap().is_paused());
+
+    // Switching to mode 1 via kind 52 applies the manager's pause state (0x573fd4).
     play(&mut player, "amb1");
-    assert!(!player.ambience().unwrap().is_paused());
+    assert!(!player.score(1).unwrap().is_paused());
 }
 
 #[test]
@@ -3837,4 +3841,210 @@ fn kind_105_places_remaining_zero_object_instances_again() {
             .any(|&s| s != 0)
     );
     assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn muted_group_refuses_start_so_beach_loop_starts_after_unmuting() {
+    use sims_audio::fsc::Score;
+    use sims_audio::player::BEACH_LOOP;
+
+    let empty_score = Score::parse(
+        b"version 7\n#\tvol\tpri\n\
+          \t1024\t0\t0\t0\t1\t1\t60\t2\t1\t1\t0\t0\t0\t0\n\
+          #\tvol\n\
+          \t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\tNONE\n",
+    )
+    .unwrap();
+    let mut map = BTreeMap::new();
+    map.insert(
+        "one.xa".to_owned(),
+        Pcm {
+            rate: RATE,
+            channels: 1,
+            samples: vec![4000; RATE as usize],
+        },
+    );
+    let looping: &[u8] = &[2, 5, WAIT_SAMP, 14];
+    let (hit, addresses) = assemble(&[looping, looping]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         [Track]\n\
+         {BEACH_LOOP}=0,BeachLoop,1024,0,0,1,0,0x100,1\n\
+         20=0,ungrouped,1024,0,0,0,0,0x101,1\n\
+         [EventMapping]\n\
+         m3=36,3\n\
+         m0=36,0\n\
+         amb1=52,1\n\
+         e20=1,20\n",
+        addresses[0], addresses[1]
+    );
+    let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+    let mut player = Player::new(vec![module], map, 1);
+    assert!(player.add_score(0, &empty_score, "a"));
+    assert!(player.add_score(1, &empty_score, "b"));
+    let mut day = Snapshot::default();
+    day.absent[4] = 12;
+
+    // Mute group 1 (effects) and enter Beach live mode: 0x57d969 refuses
+    // BeachLoop's start instead of leaving it stuck at extvol = 0.
+    player.set_group_volume(1, 0);
+    for name in ["m3", "amb1", "m0"] {
+        player.handle(
+            &SoundEvent::Play {
+                object: 0,
+                name: name.into(),
+            },
+            &day,
+        );
+    }
+    player.camera_moved(0, 12, &day);
+    assert!(
+        player
+            .render_stereo(BLOCK * 4, &day)
+            .iter()
+            .all(|&s| s == 0)
+    );
+
+    // Unmuting group 1 and running kind 33 starts BeachLoop fresh and audible.
+    player.set_group_volume(1, 1024);
+    player.camera_moved(0, 12, &day);
+    let out = player.render_stereo(BLOCK * 4, &day);
+    assert!(*out.iter().max().unwrap() > 3500, "{out:?}");
+
+    // Group 0 is never refused even when group_volumes[0] is 0 (0x57d979).
+    player.set_group_volume(0, 0);
+    player.handle(
+        &SoundEvent::Play {
+            object: 0,
+            name: "e20".into(),
+        },
+        &day,
+    );
+    player.set_group_volume(0, 1024);
+    // Track 20 was already started while group 0 was 0, so raising its
+    // volume makes it audible without a second start.
+    assert!(
+        player
+            .render_stereo(BLOCK * 2, &day)
+            .iter()
+            .any(|&s| s > 3500)
+    );
+}
+
+#[test]
+fn repeated_kind_30_updates_running_note_gain_immediately() {
+    let mut map = samples();
+    map.insert(
+        "one.xa".to_owned(),
+        Pcm {
+            rate: RATE,
+            channels: 1,
+            samples: vec![4000; RATE as usize],
+        },
+    );
+    let looping: &[u8] = &[2, 5, WAIT_SAMP, 14];
+    let module = module_with(&[looping], 1, 10, "tv=30,10\n");
+    let mut player = Player::new(vec![module], map, 1);
+    let center = on_lot(&[(9, 400)]);
+    player.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: "tv".into(),
+        },
+        &center,
+    );
+    // Advance 1 frame into a block so the note is sounding at full volume.
+    let before = player.render_stereo(BLOCK + 1, &center);
+    assert_eq!(&before[before.len() - 2..], &[4000, 4000]);
+
+    // Repeat kind 30 mid-block with the object now off-screen: the very
+    // next sample drops to 0 immediately (0x573d64 -> 0x57df13).
+    let offscreen = on_lot(&[(9, 5000)]);
+    player.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: "tv".into(),
+        },
+        &offscreen,
+    );
+    assert_eq!(player.render_stereo(1, &offscreen), [0, 0]);
+}
+
+#[test]
+fn day_and_night_loop_handles_script_that_ends_while_its_note_plays() {
+    use sims_audio::fsc::Score;
+    use sims_audio::player::NITE_LOOP;
+
+    let empty_score = Score::parse(
+        b"version 7\n#\tvol\tpri\n\
+          \t1024\t0\t0\t0\t1\t1\t60\t2\t1\t1\t0\t0\t0\t0\n\
+          #\tvol\n\
+          \t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\tNONE\n",
+    )
+    .unwrap();
+    let mut map = BTreeMap::new();
+    map.insert(
+        "one.xa".to_owned(),
+        Pcm {
+            rate: RATE,
+            channels: 1,
+            samples: vec![4000; RATE as usize],
+        },
+    );
+    // Replacement loop script: `note_on v1; end` (ends immediately while
+    // its 1-second note plays on in `ended`).
+    let one_shot: &[u8] = &[2, 5, END];
+    let (hit, addresses) = assemble(&[one_shot]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         [Track]\n\
+         {NITE_LOOP}=0,nite_loop,1024,0,0,1,0,0x100,1\n\
+         [EventMapping]\n\
+         m3=36,3\n\
+         m0=36,0\n",
+        addresses[0]
+    );
+    let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+    let mut player = Player::new(vec![module], map, 1);
+    assert!(player.add_score(0, &empty_score, "a"));
+    let mut night = Snapshot::default();
+    night.absent[4] = 22;
+    let mut day = Snapshot::default();
+    day.absent[4] = 12;
+
+    for name in ["m3", "m0"] {
+        player.handle(
+            &SoundEvent::Play {
+                object: 0,
+                name: name.into(),
+            },
+            &night,
+        );
+    }
+    let first = player.render_stereo(BLOCK * 2, &night);
+    assert_eq!(&first[first.len() - 2..], &[4000, 4000]);
+
+    // Calling camera_moved again at night must NOT start a second
+    // overlapping note (which would sum to 8000).
+    player.camera_moved(0, 22, &night);
+    let second = player.render_stereo(BLOCK * 2, &night);
+    assert_eq!(&second[second.len() - 2..], &[4000, 4000]);
+
+    // Switching to daytime stops the lingering ended note.
+    player.camera_moved(0, 12, &day);
+    assert!(
+        player
+            .render_stereo(BLOCK * 2, &day)
+            .iter()
+            .all(|&s| s == 0)
+    );
 }

@@ -36,8 +36,11 @@ the "Not ported" note in
   - When turning sound **off** (`0x573cca`..`0x573d0f`):
     - in live music mode (`music_mode == 0`), pauses all four ambience
       scores (`+0x104`..`+0x110`, vtable `+0x7c(1)`). It leaves `+0x114`
-      and running tracks alone (on focus loss, `0x4f7655` pauses the
-      game first, sending kind 21).
+      and running tracks alone (on focus loss, `0x4f7608` requests
+      auto-pause only when in mode 2 with `[0x6c9fa1] != 0`,
+      `0x4f7630`..`0x4f763c`; `0x4cee4a(1)` marks the pause pending at
+      `0x4cee52`, and `0x4ce5c5` sends kind 21 later when that pending
+      change is processed).
 - **Other checks of `active` (`+0xc`).** Every read of `+0xc` in the
   sound manager (`0x5712d0`..`0x575600`):
   - kind 1 (`0x5736ee`): returns immediately when inactive;
@@ -84,6 +87,18 @@ the "Not ported" note in
     sets `fade_dest` to the effects slider volume (`0x67156c[[+0xf0]]`,
     default `1024`), `fade_var` to `extvol` (`19`), `fade_speed` to
     `5000` (`0x1388`), `fade_on` to `1`, and lets it go (`+0x5c`).
+- **Hour change sends kind 33.** The simulation clock emits signal
+  `0xdb` at `0x46d4d3`; at minute zero (`[globals + 0x1a] == 0`),
+  `0x4f66bc`..`0x4f66c6` calls the kind 33 wrapper at `0x57aac5`, which
+  updates the ambience cursor and runs `0x574978` even while the camera
+  is still.
+- **Group-off start rejection (`0x57d969`..`0x57d9a5`).** At the start
+  of `cHitTrack::start` (`0x57d960`), when the track's group ID is
+  nonzero and that group's volume (`+0xc0`, looked up via `0x57bde7`) is
+  `0`, the start returns immediately without starting, refreshing or
+  restarting the track. Thus `BeachLoop` or `nite_loop` does not start
+  at `extvol = 0` while effects are muted and can start fresh once
+  effects are unmuted.
 - **Music unpause (`0x575155`)** clears `[esi + 0xec]` (never set
   elsewhere) and calls `let_go` (`vtable +0x5c`) on `MainMusicLoop`
   (`515`, `0x203`).
@@ -97,17 +112,28 @@ the "Not ported" note in
   (filled from `world.globals[10]` in `sims_game::sound::sources`) carry
   the lot number for `0x57492a`.
 - `Player::set_active(&mut self, active: bool, sources: &dyn Sources)`,
-  `Player::is_active(&self) -> bool`, and `kind::SET_ACTIVE` (`25`,
-  removed from `kind::NOT_PORTED`) port kind 25.
+  `Player::is_active(&self) -> bool`, `Player::score(&self, mode: u32)`,
+  and `kind::SET_ACTIVE` (`25`, removed from `kind::NOT_PORTED`) port
+  kind 25.
 - `Player::unpause` now takes `sources: &dyn Sources` so `0x574904` can
   run `0x574978`. `kind::KILL_OBJECT_SOUNDS` (105) now re-places
   remaining `<= 0` instances (`0x574647`).
 - `Player::place_track` applies the `+0x114` nudge when `nudge != 0`,
   and `Player::run_at_block_start` runs the `0x573019` countdown pair
-  before `Player::run`.
-- `Player::update_day_night` (`0x574978`) and `Player::unpause_music`
-  (`0x575155`) run from the exact call sites above (`camera_moved`,
-  `set_music_mode`, `pause`, `unpause`, `set_active`).
+  before `Player::run`. `Player::place`, `place_track` and
+  `place_through` immediately update the written thread's playing notes'
+  gains (`0x57df13` → `0x57f759`).
+- `Player::start` rejects starts whose nonzero group has volume `0`
+  (`0x57d969`..`0x57d9a5`).
+- `Player::update_day_night` (`0x574978`, counting ended notes as still
+  playing until gone) and `Player::unpause_music` (`0x575155`) run from
+  the exact call sites above (`camera_moved`, `set_music_mode`, `pause`,
+  `unpause`, `set_active`).
+- `sims_game::sound::Mixer::input(Input::Hour)` runs `camera_moved` when
+  the hour changes after its initial value (`0x46d4d3` →
+  `0x4f66bc`..`0x4f66c6`), and `sims-game`'s main loop sends
+  `Input::View` before `Input::Hour` so the view is current when it
+  fires.
 - Kind 52 and kind 36 propagate pause state to started ambience scores
   as `0x573fd4`, `0x57400d` and `0x574072` do.
 
@@ -116,11 +142,15 @@ the "Not ported" note in
 - **Unverified:** none of this has been compared with audio from the
   running original; all behavior is read from the memory image.
 - **Update rate:** the 100-update `+0x114` countdown steps once per
-  64-frame block (~2.9 ms) here, matching `Player::run`, rather than on
-  the original's 1 ms sound timer (`0x572fd6` → `0x57cf37`).
+  64-frame block (~2.9 ms, ~290 ms total) here, matching `Player::run`,
+  whereas the original's sound timer (`0x572fc3` passing `0x14` = 20 ms
+  to `0x5edc57`) fires nominally every 20 ms (~2 seconds for 100
+  callbacks).
 - **Not ported:** `Player::set_group_volume` does not run `0x574978`
   (kind 37 in the original does, at `0x5740f4`; kind 37 remains in
-  `kind::NOT_PORTED`, and `set_group_volume` takes no `Sources`).
+  `kind::NOT_PORTED`, and `set_group_volume` takes no `Sources`). Once
+  effects are unmuted, the next `camera_moved`, hour change, unpause or
+  music mode call starts the loop cleanly thanks to `0x57d969`.
 - **Not ported:** `sims-game` does not yet send kind 25 on window focus
   changes.
 
