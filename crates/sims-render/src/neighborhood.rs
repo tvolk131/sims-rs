@@ -770,9 +770,8 @@ impl NeighborhoodMap {
 
         let mut lots = Vec::with_capacity(lot_ids.len());
         for lot_id in lot_ids {
-            let Some(&anchor) = locations.get(&lot_id) else {
-                continue;
-            };
+            // 0x4e2501..0x4e257c: missing LotLocations row retains [0, 0] anchor.
+            let anchor = locations.get(&lot_id).copied().unwrap_or([0, 0]);
             let house_name = format!("House{lot_id:02}.iff");
             let Some(house_path) = resolve_child(install, &houses_dir, &house_name) else {
                 continue;
@@ -1730,14 +1729,12 @@ impl FamilyOccupancy {
         } else {
             0
         };
-        if family.house != 0 {
-            self.any_house_matches.insert(family.house);
-            if secondary_raw != 0 {
-                self.primary_vacation_stays.insert(family.house);
-            }
-        }
+        // 0x54f20e & 0x54f24f compare family.house and secondary_raw directly
+        // against the lot ID without excluding lot 0.
+        self.any_house_matches.insert(family.house);
+        self.any_house_matches.insert(secondary_raw);
         if secondary_raw != 0 {
-            self.any_house_matches.insert(secondary_raw);
+            self.primary_vacation_stays.insert(family.house);
         }
         let secondary_u16 = u16::try_from(secondary_raw).ok().filter(|&lot| lot > 0);
         if let Some(house) = u16::try_from(family.house).ok().filter(|&lot| lot > 0) {
@@ -1814,21 +1811,39 @@ fn load_lot_locations(
     Ok(parse_lot_locations_table(&table))
 }
 
-/// Parses a `LotLocations.iff` `STR#` table (`"lot_id, x, y"` rows in US English).
+/// Parses a `LotLocations.iff` `STR#` table (`"lot_id, x, y"` rows in US English),
+/// matching `0x4e2501..0x4e257c`:
+/// - stops each row at its first NUL byte,
+/// - splits on the first two commas (rows with fewer than two commas are skipped),
+/// - parses signed 32-bit `id`, `x`, and `y` via C `atoi` (`0x636029`),
+/// - keeps the first matching row for each lot ID.
 pub fn parse_lot_locations_table(table: &StringTable) -> BTreeMap<u16, [i32; 2]> {
     let mut map = BTreeMap::new();
     for entry in &table.entries {
         if entry.language != US_ENGLISH {
             continue;
         }
-        let mut parts = entry.text.split(',').map(str::trim);
-        let (Some(id), Some(x), Some(y)) = (parts.next(), parts.next(), parts.next()) else {
+        let raw = if !entry.raw_text.is_empty() {
+            entry.raw_text.as_slice()
+        } else {
+            entry.text.as_bytes()
+        };
+        let nul_end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+        let cstr = &raw[..nul_end];
+        let Some(c1) = cstr.iter().position(|&b| b == b',') else {
             continue;
         };
-        let (Ok(id), Ok(x), Ok(y)) = (id.parse::<u16>(), x.parse::<i32>(), y.parse::<i32>()) else {
+        let rest1 = &cstr[c1 + 1..];
+        let Some(c2) = rest1.iter().position(|&b| b == b',') else {
             continue;
         };
-        map.insert(id, [x, y]);
+        let id = sims_content::atoi(&cstr[..c1]);
+        let Ok(lot_id) = u16::try_from(id) else {
+            continue;
+        };
+        let x = sims_content::atoi(&rest1[..c2]);
+        let y = sims_content::atoi(&rest1[c2 + 1..]);
+        map.entry(lot_id).or_insert([x, y]);
     }
     map
 }
@@ -1858,9 +1873,11 @@ fn load_lot_zoning(install: &Install, user_dir: &Path) -> Result<LotZoningTable>
 }
 
 /// Parses a `LotZoning.iff` `STR# 1` table (`"lot_id, residential|community"`),
-/// matching `0x424fb9..0x425064` verbatim:
-/// - truncates each row at the first NUL byte and to at most 99 bytes
-///   (`strncpy(buf, s, 0x63)` at `0x424fb9..0x424fcb`),
+/// following `0x424fb9..0x425064`:
+/// - truncates each row at the first NUL byte and deterministically caps it at
+///   99 bytes (native `strncpy(buf, s, 0x63)` at `0x424fb9..0x424fcb` copies at
+///   most 99 bytes and may leave a full 99-byte copy unterminated; Rust always
+///   bounds the slice at 99 bytes rather than reading past the buffer),
 /// - splits at the first `,` (rows without a comma are skipped),
 /// - parses the signed 32-bit decimal prefix before the comma via C `atoi`
 ///   (`0x636029`),
@@ -2435,6 +2452,24 @@ mod tests {
             cstr_parsed.first_zone.get(&7),
             Some(&LotZoning::Residential)
         );
+
+        // LotLocations parser accepts C atoi prefixes, NUL termination, and keeps
+        // the first matching row for each lot ID (0x4e2501..0x4e257c).
+        let loc_table = StringTable {
+            format: Format::Pascal,
+            entries: vec![
+                entry("5 # lot, 300 # x, 120 # y"),
+                entry("7, 100, 200"),
+                entry("7, 999, 888"),
+                entry("0, 50, 60\0, 999"),
+                entry("8, only_one_comma"),
+            ],
+        };
+        let locs = parse_lot_locations_table(&loc_table);
+        assert_eq!(locs.get(&5), Some(&[300, 120]));
+        assert_eq!(locs.get(&7), Some(&[100, 200]));
+        assert_eq!(locs.get(&0), Some(&[50, 60]));
+        assert_eq!(locs.get(&8), None);
     }
 
     #[test]
@@ -2578,8 +2613,10 @@ mod tests {
         multi_occ.record_family(1, &make_fam(5, 41));
         multi_occ.record_family(2, &make_fam(5, 0));
         multi_occ.record_family(3, &make_fam(6, -1));
+        multi_occ.record_family(4, &make_fam(0, 41));
         assert!(multi_occ.primary_vacation_stays.contains(&5));
         assert!(multi_occ.primary_vacation_stays.contains(&6));
+        assert!(multi_occ.primary_vacation_stays.contains(&0));
         assert!(multi_occ.any_house_matches.contains(&41));
     }
 }
