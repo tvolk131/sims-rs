@@ -1502,14 +1502,17 @@ impl<S: Samples> Player<S> {
             .filter(|t| t.track == track && !spared(t.id))
             .cloned()
             .collect();
-        for thread in &ended {
-            self.save_stopped(thread);
-        }
         let ended_ids: Vec<u32> = ended.iter().map(|t| t.id).collect();
+        // *(code)* 0x57dd87..0x57dda5 removes the track from the running list
+        // before 0x57ddd8 refreshes voices, so surviving voices never follow
+        // the ending thread's stale `target`.
         self.threads.retain(|t| !ended_ids.contains(&t.id));
         self.notes
             .retain(|n| !(n.track == track && !spared(n.thread)));
-        if !self.threads.iter().any(|t| t.track == track) {
+        for thread in &ended {
+            self.save_stopped(thread);
+        }
+        if ended.is_empty() && !self.threads.iter().any(|t| t.track == track) {
             // *(code)* 0x57dd3e runs unconditionally on the track object
             // even when it was already stopped (clearing PATCH, idle voice,
             // hold, and main_duckpri).
@@ -3223,8 +3226,10 @@ impl<S: Samples> Player<S> {
             if !self.threads.iter().any(|t| t.id == id) {
                 continue;
             }
-            self.save_stopped(&thread);
+            // *(code)* 0x57dd87..0x57dda5 clears `target` and removes the
+            // track from the running list before 0x57ddd8 refreshes voices.
             self.threads.retain(|t| t.id != id);
+            self.save_stopped(&thread);
             // Its ducking request goes now, before the threads after it
             // run.
             self.forget_ended();
@@ -3245,7 +3250,6 @@ impl<S: Samples> Player<S> {
             ));
         }
         let first = self.threads.iter().map(|t| t.order).min().unwrap_or(0);
-        let mut ended = Vec::new();
         for (place, &track) in rest.iter().enumerate() {
             if self.held.contains(&track) {
                 continue;
@@ -3255,8 +3259,8 @@ impl<S: Samples> Player<S> {
             };
             let id = thread.id;
             if !self.fade_or_end(&mut thread) {
+                self.threads.retain(|t| t.id != id);
                 self.save_stopped(&thread);
-                ended.push(id);
                 continue;
             }
             thread.order = first - (rest.len() - place) as i64;
@@ -3264,7 +3268,6 @@ impl<S: Samples> Player<S> {
                 *slot = thread;
             }
         }
-        self.threads.retain(|t| !ended.contains(&t.id));
     }
 
     /// Runs one thread until it waits, ends, or the block's instructions
@@ -3857,7 +3860,12 @@ impl<S: Samples> Player<S> {
             "kill_trk" => {
                 // *(code)* 0x57f284: the track ends at once (vtable
                 // +0x38), whatever object it plays for; one track
-                // object plays for all of them in the original.
+                // object plays for all of them in the original. Sync the
+                // caller's live clone first so the kill's `0x57d31e` voice
+                // refresh sees any same-block register changes on `thread`.
+                if let Some(stored) = self.threads.iter_mut().find(|t| t.id == thread.id) {
+                    *stored = thread.clone();
+                }
                 let track = self.read(thread, arg(0)) as u32;
                 self.end_track(track, Some(thread.id));
                 if track == thread.track {

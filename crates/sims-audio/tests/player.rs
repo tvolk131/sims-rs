@@ -6050,3 +6050,73 @@ fn render_until_idle_ends_on_block_boundary_even_with_nudge_armed() {
     assert!(player.is_idle());
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
+
+#[test]
+fn natural_track_end_clears_target_before_ducking_refresh() {
+    // `0x57dd87..0x57dda5` clears `target` and removes an ending track from
+    // the running list BEFORE `0x57ddd8` refreshes surviving voices.
+    // Track 10 plays a note and targets track 11; track 11 has EXTVOL=0 and
+    // targets track 12 (EXTVOL=1024), then ends naturally after 10 ms.
+    // While track 11 runs, track 10's target chain resolves through 11 -> 12
+    // (EXTVOL=1024). When track 11 ends, its `target` clears and it becomes
+    // stopped BEFORE the kill's voice refresh runs, so track 10 resolves to
+    // stopped track 11 (EXTVOL=0) and falls silent immediately.
+    let mut t10 = NOTE_ON_V1.to_vec();
+    t10.extend(loadl(53, 11));
+    t10.extend([SET_LOOP, LOOP]);
+
+    let mut t11 = loadl(19, 0); // local EXTVOL = 0 on track 11
+    t11.extend(loadl(53, 12)); // forward to track 12 (EXTVOL = 1024)
+    t11.extend(loadl(5, 10));
+    t11.extend([WAIT, 5, END]);
+
+    let t12: &[u8] = &[SET_LOOP, LOOP];
+
+    let mut player = Player::new(
+        vec![module_with(&[&t10, &t11, t12], 1, 10, "")],
+        long_sample("one.xa"),
+        1,
+    );
+    play(&mut player, "e2"); // start track 12 (EXTVOL=1024)
+    play(&mut player, "e1"); // start track 11 (local EXTVOL=0, target=12)
+    play(&mut player, "e0"); // start track 10 (target=11)
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    // Advance past track 11's 10 ms wait so track 11 ends naturally.
+    let _ = player.render(BLOCK * 5, &NoSources);
+    assert!(
+        player.render(BLOCK, &NoSources).iter().all(|&s| s == 0),
+        "track 10 should refresh against stopped track 11 (EXTVOL=0) when track 11 ends"
+    );
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn kill_trk_sees_caller_same_block_duckpri_update_during_refresh() {
+    // Caller (track 10) plays ducked under MAIN_DUCKPRI=5, then in one block
+    // raises its own DUCKPRI to 10 (register 25 — latched) and calls
+    // `kill_trk` on stopped track 12. The kill's `0x57d31e` voice refresh
+    // must see track 10's new DUCKPRI=10 and lift its gain to full (10_000).
+    let mut t10 = NOTE_ON_V1.to_vec();
+    t10.extend(loadl(5, 10));
+    t10.extend([WAIT, 5]);
+    t10.extend(loadl(25, 10)); // raise own DUCKPRI above 5
+    t10.extend(loadl(6, 12));
+    t10.extend([KILL_TRK, 6, SET_LOOP, LOOP]);
+
+    let mut ducker = loadl(123, 5);
+    ducker.extend([SET_LOOP, LOOP]);
+
+    let mut player = Player::new(
+        vec![module_with(&[&t10, &ducker, &[END]], 1, 10, "")],
+        long_sample("one.xa"),
+        1,
+    );
+    play(&mut player, "e1"); // MAIN_DUCKPRI = 5
+    play(&mut player, "e0"); // plays ducked
+    let initial = player.render(BLOCK, &NoSources)[0];
+    assert!(initial > 0 && initial < 6_000, "{initial}");
+    // Advance past the 10 ms wait so track 10 writes DUCKPRI=10 and runs kill_trk 12.
+    let after = player.render(BLOCK * 6, &NoSources);
+    assert_eq!(*after.last().unwrap(), 10_000);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}

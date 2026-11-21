@@ -384,9 +384,10 @@ pub struct Feed {
     shot: Option<Shot>,
     /// Whether the sound was last told the lot is paused.
     paused: bool,
-    /// Whether `0x4cee4a` marked the pause flag dirty (`or [esi + 0xc], 0x40`)
-    /// so the next [`Feed::update`] dispatches `pause_event(game.paused())`
-    /// even when the final pause boolean matches `self.paused`.
+    /// Whether `0x4cee4a` marked the pause flag dirty (`or [esi + 0xc], 0x800040`,
+    /// where `0x800000` is tested at `0x4ce59e` for pause dispatch) so the next
+    /// [`Feed::update`] dispatches `pause_event(game.paused())` even when the
+    /// final pause boolean matches `self.paused`.
     pause_dirty: bool,
     /// Whether the window is focused (`true` at startup, matching
     /// `0x4eee14` and `0x4f7610` deduplication).
@@ -447,13 +448,15 @@ impl Feed {
         }
         let pause_changed = if !focused {
             // Flush prior clicks, sounds, and camera moves before focus loss
-            // so kind 25 off cannot drop or overtake earlier events.
-            self.update(game, &mut send);
+            // so kind 25 off cannot drop or overtake earlier events, without
+            // prematurely emitting a pending focus-regain `Unpause` when a
+            // rapid refocus-then-blur occurs before the next `update`.
+            self.flush_before_blur(game, &mut send);
             self.saved_paused = game.paused();
             if !self.saved_paused {
                 game.toggle_pause();
             }
-            // `0x4cee4a` sets dirty bit `0x40` unconditionally.
+            // `0x4cee4a` sets pause dirty bit `0x800000` unconditionally.
             self.pause_dirty = true;
             game.paused() != self.saved_paused
         } else {
@@ -470,15 +473,52 @@ impl Feed {
             if before != self.saved_paused {
                 game.toggle_pause();
             }
-            // `0x4cee4a` sets dirty bit `0x40` unconditionally, so a rapid
-            // blur-then-refocus still dispatches the final pause state on
-            // the next update (`0x4ce5b0`).
+            // `0x4cee4a` sets pause dirty bit `0x800000` unconditionally, so
+            // a rapid blur-then-refocus still dispatches the final pause
+            // state on the next update (`0x4ce59e` → `0x4ce5b0`).
             self.pause_dirty = true;
             game.paused() != before
         };
         self.focused = focused;
         send(Input::Active(focused));
         pause_changed
+    }
+
+    /// Flushes prior game sources, sounds, and camera moves before focus loss
+    /// without flushing a pending `pause_dirty` transition from an earlier
+    /// focus regain (`0x4cee4a` overwrites the pending pause state before
+    /// `0x4ce59e` runs).
+    fn flush_before_blur(&mut self, game: &mut crate::Game, mut send: impl FnMut(Input)) {
+        let first = self.told.is_none();
+        let sources = game.sound_sources();
+        if self.told.as_ref() != Some(&sources) {
+            send(Input::Sources(sources.clone()));
+            self.told = Some(sources);
+        }
+        if first {
+            send(Input::Events(enter_live()));
+        }
+        let paused = game.paused();
+        if !self.pause_dirty && paused != self.paused {
+            send(Input::Events(vec![pause_event(paused)]));
+            self.paused = paused;
+        }
+        let sounds = game.take_sounds();
+        if !sounds.is_empty() {
+            send(Input::Events(sounds.into_iter().map(event).collect()));
+        }
+        let now = (game.hour(), game.pace.speed, game.ambience_view());
+        if self.heard != Some(now) {
+            send(Input::View(now.2));
+            send(Input::Hour(now.0));
+            send(Input::Speed(now.1));
+            self.heard = Some(now);
+        }
+        let shot = game.shot();
+        if self.shot != Some(shot) {
+            send(Input::Camera);
+            self.shot = Some(shot);
+        }
     }
 
     /// Sends every sound input that changed on `game` since the last call.

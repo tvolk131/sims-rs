@@ -313,7 +313,7 @@ fn window_focus_changes_forward_kind_25_and_deduplicate_initial_focus() {
 
     // Focus loss followed immediately by focus regain (with no tick in
     // between) restores `paused = false` and still marks pause dirty
-    // (`0x4cee4a` sets bit `0x40` unconditionally), so the next update
+    // (`0x4cee4a` sets bit `0x800000` unconditionally), so the next update
     // dispatches `SoundEvent::Unpause` (`0x4ce5d9`).
     assert!(feed.set_focused(false, &mut game, |input| mixer.input(input)));
     assert!(game.paused());
@@ -326,6 +326,33 @@ fn window_focus_changes_forward_kind_25_and_deduplicate_initial_focus() {
     });
     assert!(sent.contains(&Input::Events(vec![SoundEvent::Unpause])));
     assert!(!sent.contains(&Input::Events(vec![SoundEvent::Pause])));
+
+    // Settled focus-loss pause followed by rapid refocus + blur (with no
+    // update in between): must send Active(true) then Active(false) WITHOUT
+    // prematurely emitting SoundEvent::Unpause on the second blur, and the
+    // next update dispatches only SoundEvent::Pause.
+    assert!(feed.set_focused(false, &mut game, |input| mixer.input(input)));
+    feed.update(&mut game, |input| mixer.input(input));
+    sent.clear();
+    assert!(feed.set_focused(true, &mut game, |input| {
+        sent.push(input.clone());
+        mixer.input(input);
+    }));
+    assert!(feed.set_focused(false, &mut game, |input| {
+        sent.push(input.clone());
+        mixer.input(input);
+    }));
+    assert_eq!(sent, [Input::Active(true), Input::Active(false)]);
+    sent.clear();
+    feed.update(&mut game, |input| {
+        sent.push(input.clone());
+        mixer.input(input);
+    });
+    assert!(sent.contains(&Input::Events(vec![SoundEvent::Pause])));
+    assert!(!sent.contains(&Input::Events(vec![SoundEvent::Unpause])));
+    // Restore focus for the next check.
+    assert!(feed.set_focused(true, &mut game, |input| mixer.input(input)));
+    feed.update(&mut game, |input| mixer.input(input));
 
     // Focus cycling while the lot is ALREADY paused saves saved_paused=true
     // and keeps the lot and live ambience paused after refocusing (still
