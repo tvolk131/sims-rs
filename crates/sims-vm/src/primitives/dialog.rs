@@ -382,6 +382,17 @@ impl Machine<'_, '_> {
         if !self.listed_person_type(guid, "a dialog's portrait")? {
             return Ok(());
         }
+        // 0x4363d1 -> 0x4e92a8 -> 0x4e9338: on a clean empty slot, reload a
+        // BMP_ 2002 persisted earlier in the session by 0x4e938c -> 0x4e9000
+        // without calling 0x4e8c5d or creating a temporary Sim.
+        if !self.world.dirty_portraits.contains(&guid)
+            && self
+                .portrait_file(guid)
+                .is_some_and(|file| self.world.generated_portrait_2002.contains(&file))
+        {
+            self.world.portraits.insert(guid);
+            return Ok(());
+        }
         let on_lot = self.world.people.iter().any(|id| {
             self.world
                 .objects

@@ -213,13 +213,26 @@ pub struct World {
     /// `sims_vm::boot::save::Saved` preserves it across lot save/restore.
     #[serde(skip)]
     pub dirty_portraits: BTreeSet<u32>,
-    /// Person types for which `0x4e938c` → `0x4e8c5d(index, 1, 1)` →
-    /// `0x4e9000` generated and wrote `BMP_` 2002 (`0x7d2`) to a writable
-    /// resource file during this session. Kept out of [`World::encode`] so
-    /// snapshot format 31's wire bytes stay unchanged;
-    /// `sims_vm::boot::save::Saved` preserves it across lot save/restore.
+    /// Which IFF files had `BMP_` 2002 (`0x7d2`) generated and persisted by
+    /// `0x4e938c` → `0x4e8c5d(index, 1, 1)` → `0x4e9000` during this session.
+    /// Keyed by IFF file ([`PortraitFile`]) rather than GUID because `0x4e9000`
+    /// writes resource `BMP_` 2002 into the definition's IFF file, so any other
+    /// person definition in the same file sees it at `0x4e9338` → `0x4e9260`.
+    /// Kept out of [`World::encode`] so snapshot format 31's wire bytes stay
+    /// unchanged; `sims_vm::boot::save::Saved` preserves it across lot
+    /// save/restore.
     #[serde(skip)]
-    pub generated_portrait_2002: BTreeSet<u32>,
+    pub generated_portrait_2002: BTreeSet<PortraitFile>,
+}
+
+/// Which IFF file holds a portrait bitmap persisted by `0x4e9000`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum PortraitFile {
+    /// A catalog resource file (index into `sims_content::Index::resources`).
+    Resource(usize),
+    /// A runtime-made character file (`Characters/User%05d.iff`,
+    /// [`crate::characters::Character::file`]).
+    Made(i32),
 }
 
 /// How many advertisements the record of [`World::advertisement_record`]

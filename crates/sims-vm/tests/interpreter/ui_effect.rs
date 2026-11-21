@@ -12,6 +12,7 @@ use crate::factory::WIDGET;
 use crate::person_factory::equip;
 use crate::support::*;
 use sims_content::Object as CatalogObject;
+use sims_sim::PortraitFile;
 use sims_sim::neighbors::{Family, Neighbor};
 use sims_vm::Trap;
 
@@ -200,7 +201,11 @@ fn read_only_off_lot_skips_factory_and_fallback_render_persists_bmp_2002() {
         Ok(true)
     );
     assert_eq!(fx.world.portraits, [made_guid].into());
-    assert!(fx.world.generated_portrait_2002.contains(&made_guid));
+    assert!(
+        fx.world
+            .generated_portrait_2002
+            .contains(&PortraitFile::Made(8))
+    );
 
     // 4. Fallback render at 0x4e938c (save flag 1) persists BMP_ 2002 via
     // 0x4e8d2e -> 0x4e9000 -> 0x4e8feb: after a subsequent 0x4e895e
@@ -213,7 +218,11 @@ fn read_only_off_lot_skips_factory_and_fallback_render_persists_bmp_2002() {
         Ok(true)
     );
     assert_eq!(fx.world.portraits, [WIDGET].into());
-    assert!(fx.world.generated_portrait_2002.contains(&WIDGET));
+    assert!(
+        fx.world
+            .generated_portrait_2002
+            .contains(&PortraitFile::Resource(file))
+    );
 
     // Simulate 0x4e895e invalidation, and make placement fail on the next
     // attempt while counting Init runs in global 36.
@@ -238,6 +247,207 @@ fn read_only_off_lot_skips_factory_and_fallback_render_persists_bmp_2002() {
     );
     assert_eq!(fx.world.portraits, [WIDGET].into());
     assert!(!fx.world.dirty_portraits.contains(&WIDGET));
+}
+
+#[test]
+fn writeback_shares_iff_reloads_in_dialog_honors_reset_and_head_binding() {
+    // 1. Generated BMP_ 2002 is keyed by IFF file (0x4e9000 writes into the
+    // definition's IFF): a second person GUID in the same IFF loads it via
+    // 0x4e9338 -> 0x4e9260 without calling 0x4e8c5d or advancing CRT RNG.
+    let (mut fx, file, record1) = visitors();
+    let second_guid = 0x0000_3334u32;
+    let mut second_words = *fx.words(file);
+    second_words[14] = second_guid as u16 as i16;
+    second_words[15] = (second_guid >> 16) as u16 as i16;
+    {
+        let lib = fx.program.libraries.get_mut(&file).unwrap();
+        lib.definitions.insert(129, second_words);
+        lib.definition_order.push(129);
+        let cb128 = lib.callbacks[&128].clone();
+        lib.callbacks.insert(129, cb128);
+    }
+    let idx = fx.catalog.objects.len();
+    fx.catalog.objects.push(CatalogObject {
+        guid: second_guid,
+        resource: file,
+        chunk: 129,
+        kind: 2,
+        master: 0,
+    });
+    fx.catalog.by_guid.insert(second_guid, idx);
+    equip(&mut fx, second_guid, "second", 12);
+    let record2 = fx.world.neighbors.slots.len() as i16;
+
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record1, 1),
+        Ok(true)
+    );
+    assert!(
+        fx.world
+            .generated_portrait_2002
+            .contains(&PortraitFile::Resource(file))
+    );
+    let crt_after_first = fx.world.crt_rng;
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record2, 1),
+        Ok(true)
+    );
+    assert_eq!(fx.world.portraits, [WIDGET, second_guid].into());
+    assert_eq!(
+        fx.world.crt_rng, crt_after_first,
+        "second person in same IFF should load persisted BMP_ 2002 without rendering"
+    );
+    assert!(!fx.world.skeleton_files.contains("second.bcf"));
+
+    // 2. Dialog (0x4363d1 -> 0x4e92a8 -> 0x4e9338) reloads a BMP_ 2002
+    // persisted by UI Effect after a clean cache eviction (0x4e897e), without
+    // creating a temporary Sim or advancing CRT RNG.
+    fx.world.portraits.remove(&WIDGET);
+    assert!(!fx.world.dirty_portraits.contains(&WIDGET));
+    let crt_before_dialog = fx.world.crt_rng;
+    fx.add(
+        LAMP_FILE,
+        4096,
+        tree(vec![ins(
+            36,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [0, 0, 0, 0, 0, 0, 0, 5], // non-blocking (bit 0), icon mode 2 (neighbor in stack object)
+        )]),
+    );
+    assert_eq!(fx.run_with(LAMP, 4096, record1, &[], 1000), Ok(true));
+    assert!(fx.world.portraits.contains(&WIDGET));
+    assert_eq!(
+        fx.world.crt_rng, crt_before_dialog,
+        "Dialog should reload persisted BMP_ 2002 on clean slot"
+    );
+
+    // 3. Cache (0x4e8d14) and BMP_ 2002 staging (0x4e8d2e) happen BEFORE
+    // temporary-person removal (0x4e8fdb): if the temporary person's Reset
+    // callback (callback 3) creates another Sim of the same type with word 84
+    // bit 0 set (0x44e712 -> 0x45810c -> 0x4e895e), the invalidation stays!
+    let (mut fx, file, record) = visitors();
+    // Mark neighbor record's person word 74 = 1 (revision >= 10 so word 74 is
+    // copied) so Create mode 6 triggers 0x4e895e.
+    {
+        let slot = fx
+            .world
+            .neighbors
+            .slots
+            .last_mut()
+            .unwrap()
+            .as_mut()
+            .unwrap();
+        slot.revision = 10;
+        slot.data[68] = 0;
+        slot.data[74] = 1;
+        slot.data[77] = 0;
+        slot.data[81] = 0;
+        slot.data[84] = 0;
+    }
+    // Reset callback (tree 4098): if global 36 == 0, set global 36 = 1 and
+    // run Create New Object Instance mode 6 (from neighbor record in stack
+    // object `record`, placed off-lot).
+    fx.add(
+        file,
+        4098,
+        tree(vec![
+            ins(
+                2,
+                1,
+                RETURN_TRUE,
+                expr(scope::GLOBAL, 36, op::EQUAL, scope::LITERAL, 0),
+            ),
+            assign(scope::GLOBAL, 36, scope::LITERAL, 1, 2),
+            assign(scope::STACK_OBJECT, 0, scope::LITERAL, record, 3),
+            ins(
+                42, // Create New Object Instance
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [0, 0, 0, 0, 6, 0x04, 0, 0], // mode 6 (from neighbor), flag 0x04
+            ),
+        ]),
+    );
+    for cb in fx
+        .program
+        .libraries
+        .get_mut(&file)
+        .unwrap()
+        .callbacks
+        .values_mut()
+    {
+        cb.resize_with(4, || sims_formats::execution::ObjectFunction {
+            condition: 0,
+            action: 0,
+        });
+        cb[3].action = 4098;
+    }
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
+        Ok(true)
+    );
+    assert_ne!(
+        fx.world.globals[36], 0,
+        "Reset callback ran during 0x4e8fdb and created the replacement Sim"
+    );
+    assert!(
+        !fx.world.portraits.contains(&WIDGET),
+        "Reset's 0x4e895e invalidation must not be overwritten after 0x4e8fdb"
+    );
+    assert!(
+        fx.world.dirty_portraits.contains(&WIDGET),
+        "Reset's 0x4e895e dirty flag must survive 0x4e8fdb"
+    );
+    assert!(
+        fx.world
+            .generated_portrait_2002
+            .contains(&PortraitFile::Resource(file)),
+        "0x4e8d2e -> 0x4e8feb still flushes the staged BMP_ 2002"
+    );
+
+    // 4. Renderer failure (0x4e8d02 -> 0x4e725f -> 0x4e7824 missing HEAD
+    // binding): neither on-lot nor off-lot caches the portrait, clears dirty,
+    // or records generated_portrait_2002, while off-lot still creates and
+    // removes the temporary Sim and UI Effect returns true.
+    let (mut fx, file, record) = visitors();
+    fx.program.people.portrait_head.insert(WIDGET, false);
+    fx.world.dirty_portraits.insert(WIDGET);
+    let crt_before = fx.world.crt_rng;
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
+        Ok(true)
+    );
+    assert_ne!(fx.world.crt_rng, crt_before);
+    assert!(fx.world.portraits.is_empty());
+    assert!(fx.world.dirty_portraits.contains(&WIDGET));
+    assert!(
+        !fx.world
+            .generated_portrait_2002
+            .contains(&PortraitFile::Resource(file))
+    );
+
+    // Same missing HEAD binding on an on-lot person (SIM): skips caching and
+    // writeback, keeps dirty set, returns true.
+    let (mut fx, _, _) = visitors();
+    fx.program.people.portrait_head.insert(SIM_GUID, false);
+    fx.world.dirty_portraits.insert(SIM_GUID);
+    fx.world.neighbors.slots.push(Some(Neighbor {
+        guid: SIM_GUID,
+        id: 2,
+        data: vec![0; 88],
+        relationships: Vec::new(),
+        friends: 0,
+        revision: 0,
+        stale: false,
+    }));
+    let sim_record = fx.world.neighbors.slots.len() as i16;
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
+        Ok(true)
+    );
+    assert!(!fx.world.portraits.contains(&SIM_GUID));
+    assert!(fx.world.dirty_portraits.contains(&SIM_GUID));
+    assert!(fx.world.generated_portrait_2002.is_empty());
 }
 
 #[test]

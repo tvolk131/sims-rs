@@ -504,7 +504,8 @@ mod tests {
         assert!(!same_lot(&a, &b));
 
         let mut c = a.clone();
-        c.generated_portrait_2002.insert(0x1234_5678);
+        c.generated_portrait_2002
+            .insert(sims_sim::PortraitFile::Resource(7));
         assert_eq!(
             a.encode(),
             c.encode(),

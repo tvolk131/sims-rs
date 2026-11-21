@@ -26,7 +26,7 @@
 use super::Lot;
 use crate::Answers;
 use serde::{Deserialize, Serialize};
-use sims_sim::World;
+use sims_sim::{PortraitFile, World};
 use std::collections::BTreeSet;
 
 /// The version of [`Saved::encode`]'s layout: the fields of [`Saved`],
@@ -58,7 +58,7 @@ pub struct Saved {
     /// 2002 writebacks (`0x4e9000`), which [`World::encode`] omits to keep
     /// snapshot format 31's wire bytes unchanged.
     dirty_portraits: BTreeSet<u32>,
-    generated_portrait_2002: BTreeSet<u32>,
+    generated_portrait_2002: BTreeSet<PortraitFile>,
 }
 
 /// Why a lot could not be saved or restored.
@@ -217,7 +217,10 @@ mod tests {
     fn saved_round_trip_preserves_unencoded_portrait_sets() {
         let mut world = World::empty();
         world.dirty_portraits.insert(0x1111_2222);
-        world.generated_portrait_2002.insert(0x3333_4444);
+        world
+            .generated_portrait_2002
+            .insert(PortraitFile::Resource(7));
+        world.generated_portrait_2002.insert(PortraitFile::Made(3));
         let saved = Saved {
             dirty_portraits: world.dirty_portraits.clone(),
             generated_portrait_2002: world.generated_portrait_2002.clone(),
@@ -241,7 +244,7 @@ mod tests {
         );
         assert_eq!(
             decoded.world().generated_portrait_2002,
-            BTreeSet::from([0x3333_4444])
+            BTreeSet::from([PortraitFile::Resource(7), PortraitFile::Made(3)])
         );
     }
 }

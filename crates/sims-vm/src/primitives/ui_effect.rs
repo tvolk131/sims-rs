@@ -73,6 +73,7 @@
 
 use crate::fault::Trap;
 use crate::interpreter::{Machine, word};
+use sims_sim::PortraitFile;
 
 /// Scope 6: global words.
 const GLOBAL_SCOPE: u8 = 6;
@@ -187,11 +188,24 @@ impl Machine<'_, '_> {
         Ok(false)
     }
 
+    /// Which IFF file holds the winning definition for `guid` (`0x4e893e` →
+    /// `0x43ac10`), as `0x4e9000` writes `BMP_` 2002 into that file.
+    pub(crate) fn portrait_file(&self, guid: u32) -> Option<PortraitFile> {
+        if let Some(made) = self.world.characters.made.get(&guid) {
+            return Some(PortraitFile::Made(made.file));
+        }
+        crate::interpreter::object_definition(self.catalog, self.world, guid)
+            .map(|def| PortraitFile::Resource(def.resource))
+    }
+
     /// Whether the winning definition's file for `guid` (`0x4e893e` →
     /// `0x43ac10`) holds a neutral-language `BMP_` 2002 portrait (either
     /// loaded from disk or generated earlier by `0x4e938c` → `0x4e9000`).
     fn has_portrait_2002(&self, guid: u32) -> bool {
-        if self.world.generated_portrait_2002.contains(&guid) {
+        if self
+            .portrait_file(guid)
+            .is_some_and(|file| self.world.generated_portrait_2002.contains(&file))
+        {
             return true;
         }
         let Some(def) = crate::interpreter::object_definition(self.catalog, self.world, guid)
@@ -202,6 +216,19 @@ impl Machine<'_, '_> {
             .libraries
             .get(&def.resource)
             .is_some_and(|library| library.has_portrait_2002)
+    }
+
+    /// Whether the renderer (`0x4e725f` → `0x4e7817` → `0x4e810d` →
+    /// `0x4e7824`) can find a `"HEAD"` binding for `guid`. Returns `false`
+    /// only when the loaded suit catalogs confirmed no `"HEAD"` binding
+    /// exists on the person type's initial body/head suits.
+    fn can_render_portrait(&self, guid: u32) -> bool {
+        self.program
+            .people
+            .portrait_head
+            .get(&guid)
+            .copied()
+            .unwrap_or(true)
     }
 
     /// Whether the winning definition's file for `guid` is writable
@@ -225,21 +252,21 @@ impl Machine<'_, '_> {
 
     /// Runs `0x4e8c5d(index, 1, save_bitmap)` for a `guid` already verified
     /// to be in `0x6f2698`. Returns `true` when the portrait was rendered and
-    /// cached, `false` when `0x4e8cc6` skipped a read-only off-lot definition
-    /// or `0x4e9652` returned null (leaving the portrait uncached and dirty
-    /// state unchanged, while keeping all simulation side effects).
+    /// cached, `false` when `0x4e8cc6` skipped a read-only off-lot definition,
+    /// `0x4e9652` returned null, or `0x4e725f` failed (`0x4e8d08`, e.g.
+    /// missing `"HEAD"` binding at `0x4e7824`).
     fn try_render_ui_effect_portrait(
         &mut self,
         guid: u32,
         save_bitmap: bool,
     ) -> Result<bool, Trap> {
         // 0x4e8c92 -> 0x4e893e -> 0x43ac10: resolve the winning definition.
-        if crate::interpreter::object_definition(self.catalog, self.world, guid).is_none() {
+        let Some(file_key) = self.portrait_file(guid) else {
             return Ok(false);
-        }
+        };
         // 0x4e9608: reuse the first on-lot person matching `guid` (skips the
-        // 0x4e8cc6 writability check; 0x4e9000 only persists BMP_ 2002 when
-        // save_bitmap is set and the file is writable).
+        // 0x4e8cc6 writability check; 0x4e8d02 still checks 0x4e725f before
+        // caching at 0x4e8d14 and persisting BMP_ 2002 at 0x4e8d2e).
         let on_lot = self.world.people.iter().any(|id| {
             self.world
                 .objects
@@ -247,10 +274,13 @@ impl Machine<'_, '_> {
                 .is_some_and(|object| object.guid == guid)
         });
         if on_lot {
+            if !self.can_render_portrait(guid) {
+                return Ok(false);
+            }
             self.world.portraits.insert(guid);
             self.world.dirty_portraits.remove(&guid);
             if save_bitmap && self.is_portrait_file_writable(guid) {
-                self.world.generated_portrait_2002.insert(guid);
+                self.world.generated_portrait_2002.insert(file_key);
             }
             return Ok(true);
         }
@@ -305,6 +335,19 @@ impl Machine<'_, '_> {
         let placed = built
             .portrait_put_outcome(&mut copy, id)
             .map_err(|fault| fault.trap)?;
+        let rendered = placed && self.can_render_portrait(guid);
+        if rendered {
+            // 0x4e8d14 -> 0x4e899e caches the portrait and clears dirty, and
+            // 0x4e8d2e -> 0x4e9000 stages BMP_ 2002 BEFORE removing the
+            // temporary person at 0x4e8fdb (so a Reset callback during removal
+            // can still invalidate the portrait via 0x44e712 -> 0x4e895e,
+            // while 0x4e8feb flushes the staged BMP_ 2002 afterwards).
+            copy.portraits.insert(guid);
+            copy.dirty_portraits.remove(&guid);
+            if save_bitmap {
+                copy.generated_portrait_2002.insert(file_key);
+            }
+        }
         // Both normal completion (0x4e8fdb) and no-tile failure (0x4e9706)
         // remove the temporary person immediately and keep its Init/RNG
         // side effects.
@@ -316,15 +359,6 @@ impl Machine<'_, '_> {
             )));
         }
         cells.keep(&interpreter, self.world, copy);
-        if placed {
-            self.world.portraits.insert(guid);
-            self.world.dirty_portraits.remove(&guid);
-            if save_bitmap {
-                // 0x4e8d2e -> 0x4e9000 -> 0x4e8feb: persist BMP_ 2002 to the
-                // writable resource file.
-                self.world.generated_portrait_2002.insert(guid);
-            }
-        }
-        Ok(placed)
+        Ok(rendered)
     }
 }
