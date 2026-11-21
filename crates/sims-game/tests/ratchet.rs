@@ -12,12 +12,14 @@
 //!
 //! Without `SIMS_RATCHET` it prints `ratchet: skipped: no assets` and
 //! passes; the workspace's other tests run with only `SIMS_INSTALL` set.
-//! Every other setting that is partial or wrong fails, on the skip too:
-//! `SIMS_INSTALL` set but empty or not a folder with files in it;
-//! `SIMS_RATCHET` without `SIMS_INSTALL`, or not a folder with files in
-//! it; any `SIMS_RATCHET_` variable, whatever its value, without
-//! `SIMS_RATCHET`; and a `SIMS_RATCHET_` variable other than
-//! `SIMS_RATCHET_UPDATE`, `SIMS_RATCHET_NEW` and `SIMS_RATCHET_DIFF`.
+//! Every other setting that is partial or wrong fails, on the skip too,
+//! and before `--help`, `--list` or a filter ends the run: `SIMS_INSTALL`
+//! set but empty, or not a folder holding a regular file at some depth;
+//! `SIMS_RATCHET` without `SIMS_INSTALL`, or not such a folder; any
+//! `SIMS_RATCHET_` variable, whatever its value (its name matched as
+//! bytes, so one that is not text counts), without `SIMS_RATCHET`; and a
+//! `SIMS_RATCHET_` variable other than `SIMS_RATCHET_UPDATE`,
+//! `SIMS_RATCHET_NEW` and `SIMS_RATCHET_DIFF`.
 //!
 //! It fails when:
 //!
@@ -65,8 +67,9 @@
 //! here before any filter or list decides anything: an unknown flag, a
 //! flag without its value, a value on a flag that takes none
 //! (`--list=foo`), a bad value, and `--ignored` with `--include-ignored`.
-//! Filtered out, it prints `ratchet: filtered out`. Before anything else it checks its own floor
-//! and argument parsing, so a release run covers them too.
+//! Filtered out, it prints `ratchet: filtered out`. Before anything else
+//! it checks its own floor and argument parsing, so a release run covers
+//! them too.
 //!
 //! Classes come from the frame at run time, with no stored masks:
 //!
@@ -278,9 +281,10 @@ impl Config {
         };
         // Every SIMS_RATCHET_ variable, whatever its value: a misspelt one
         // must not be ignored.
+        // matched on the key's bytes, so a key that is not text is caught too.
         let mut set: Vec<String> = std::env::vars_os()
-            .filter_map(|(k, _)| k.into_string().ok())
-            .filter(|k| k.starts_with("SIMS_RATCHET_"))
+            .filter(|(k, _)| k.as_encoded_bytes().starts_with(b"SIMS_RATCHET_"))
+            .map(|(k, _)| k.to_string_lossy().into_owned())
             .collect();
         set.sort();
         if let Some(unknown) = set.iter().find(|k| !SETTINGS.contains(&k.as_str())) {
@@ -291,7 +295,7 @@ impl Config {
         }
         let install = var("SIMS_INSTALL")?.map(PathBuf::from);
         if let Some(install) = &install {
-            nonempty_folder("SIMS_INSTALL", install)?;
+            holds_a_file("SIMS_INSTALL", install)?;
         }
         let Some(references) = var("SIMS_RATCHET")?.map(PathBuf::from) else {
             if !set.is_empty() {
@@ -303,7 +307,7 @@ impl Config {
             return Ok(None);
         };
         let install = install.ok_or("SIMS_RATCHET is set, but SIMS_INSTALL is not")?;
-        nonempty_folder("SIMS_RATCHET", &references)?;
+        holds_a_file("SIMS_RATCHET", &references)?;
         let update = match var("SIMS_RATCHET_UPDATE")?.as_deref() {
             None | Some("0") => false,
             Some("1") => true,
@@ -323,18 +327,29 @@ impl Config {
     }
 }
 
-/// An error unless `dir` is a folder with at least one entry.
-fn nonempty_folder(key: &str, dir: &Path) -> Result<(), String> {
-    // Only whether it has any entry: the order does not matter.
-    #[allow(clippy::disallowed_methods)]
-    let empty = std::fs::read_dir(dir)
-        .map_err(|e| format!("{key} {dir:?} is not a folder: {e}"))?
-        .next()
-        .is_none();
-    if empty {
-        return Err(format!("{key} {dir:?} is an empty folder"));
+/// An error unless `dir` is a folder holding at least one regular file,
+/// at any depth: a folder of empty folders is as good as none. A link to
+/// a file counts; a link to a folder is not followed.
+fn holds_a_file(key: &str, dir: &Path) -> Result<(), String> {
+    if !dir.is_dir() {
+        return Err(format!("{key} {dir:?} is not a folder"));
     }
-    Ok(())
+    let mut folders = vec![dir.to_path_buf()];
+    while let Some(folder) = folders.pop() {
+        // Only whether any file exists: the order does not matter.
+        #[allow(clippy::disallowed_methods)]
+        let entries = std::fs::read_dir(&folder).map_err(|e| format!("{key} {folder:?}: {e}"))?;
+        for entry in entries {
+            let path = entry.map_err(|e| format!("{key} {folder:?}: {e}"))?.path();
+            if path.is_file() {
+                return Ok(());
+            }
+            if path.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+                folders.push(path);
+            }
+        }
+    }
+    Err(format!("{key} {dir:?} holds no file"))
 }
 
 fn main() -> ExitCode {
@@ -346,6 +361,15 @@ fn main() -> ExitCode {
         Ok(args) => args,
         Err(e) => {
             println!("ratchet: FAILED: arguments: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // The settings are checked before any exit that passes: a bad setting
+    // fails `--help`, `--list` and a filtered-out run too.
+    let config = match Config::from_env() {
+        Ok(config) => config,
+        Err(e) => {
+            println!("ratchet: FAILED: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -361,16 +385,9 @@ fn main() -> ExitCode {
         println!("{NAME}: test");
         return ExitCode::SUCCESS;
     }
-    let config = match Config::from_env() {
-        Ok(Some(config)) => config,
-        Ok(None) => {
-            println!("ratchet: skipped: no assets (SIMS_RATCHET is not set)");
-            return ExitCode::SUCCESS;
-        }
-        Err(e) => {
-            println!("ratchet: FAILED: {e}");
-            return ExitCode::FAILURE;
-        }
+    let Some(config) = config else {
+        println!("ratchet: skipped: no assets (SIMS_RATCHET is not set)");
+        return ExitCode::SUCCESS;
     };
     match run(&config) {
         Ok(()) => {

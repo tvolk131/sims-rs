@@ -76,6 +76,16 @@ IMAGE_MAGIC = re.compile(
     rb"|II\*\0|MM\0\*|qoif|RIFF....WEBP|8BPS|gimp xcf)",
     re.DOTALL,
 )
+# Longest first: the UTF-32 little-endian mark starts with UTF-16's.
+BYTE_ORDER_MARKS = (
+    (b"\xff\xfe\x00\x00", "utf-32-le"),
+    (b"\x00\x00\xfe\xff", "utf-32-be"),
+    (b"\xef\xbb\xbf", "utf-8"),
+    (b"\xff\xfe", "utf-16-le"),
+    (b"\xfe\xff", "utf-16-be"),
+)
+
+
 class _RootFound(Exception):
     pass
 
@@ -94,12 +104,21 @@ def is_svg(content):
         raise _RootFound(name)
 
     parser.StartElementHandler = start
+    # Expat is given text, so it ignores the declared encoding: an ASCII
+    # SVG that declares one expat cannot read (Shift_JIS) or one that is
+    # wrong is still found. The bytes are read by their byte order mark,
+    # or as UTF-8 with anything else replaced, which leaves the markup
+    # readable whatever the text holds.
+    for mark, encoding in BYTE_ORDER_MARKS:
+        if content.startswith(mark):
+            text = content[len(mark):].decode(encoding, errors="replace")
+            break
+    else:
+        text = content.decode("utf-8", errors="replace")
     # A browser shows an SVG with white space before its declaration, which
     # expat refuses.
-    if content.startswith(b"\xef\xbb\xbf"):
-        content = content[3:]
     try:
-        parser.Parse(content.lstrip(b" \t\r\n"), True)
+        parser.Parse(text.lstrip(" \t\r\n"), True)
     except _RootFound as root:
         return root.args[0].split(":")[-1].lower() == "svg"
     except (expat.ExpatError, ValueError, UnicodeError):

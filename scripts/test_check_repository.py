@@ -353,6 +353,8 @@ class RepositoryHygieneTests(unittest.TestCase):
             ("misc/notes.txt",
              '<!DOCTYPE x [ <!ENTITY e "]>"> <!ENTITY f \'"]>\'> ]>\n<s:svg xmlns:s="x"/>'),
             ("misc/notes.txt", '\ufeff  \n<?xml version="1.0"?><svg/>'),
+            ("misc/notes.txt", '<?xml version="1.0" encoding="Shift_JIS"?><svg/>'),
+            ("misc/notes.txt", '<?xml version="1.0" encoding="no-such-encoding"?><svg/>'),
             ("docs/picture.md", "P6\n800 600\n255\n"),
             ("tests/scene.txt", b"\x89PNG\r\n\x1a\nrest"),
             ("tests/scene.txt", b"GIF89a...."),

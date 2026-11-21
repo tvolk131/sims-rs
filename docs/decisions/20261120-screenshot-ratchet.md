@@ -122,7 +122,9 @@ Each scene names its rectangles and why:
   stops the run.
 - A screenshot is named by a plain file name, with no folder. With links
   resolved, it must be a file in `SIMS_RATCHET`, so the manifest cannot
-  point the run at any other file.
+  point the run at any other file. The reference hash is computed over
+  the bytes read, so a swapped file fails; the corpus is assumed not to
+  be hostile.
 - `SIMS_RATCHET_DIFF=<folder>` writes difference images (pixels that
   differ in magenta, the rest ours in grey) into a new folder the run
   makes inside it, each image a new file. The folder, with links
@@ -143,18 +145,23 @@ Each scene names its rectangles and why:
   under any namespace prefix). The SVG root is found with Python's expat
   parser, which reads the whole prolog, an internal document type with
   `]>` in its quoted values included, stops at the first start element,
-  and loads no external entity.
+  and loads no external entity. Expat is given decoded text (by the byte
+  order mark, otherwise UTF-8 with bad bytes replaced), so a declared
+  encoding it cannot read, such as Shift_JIS, does not hide an SVG.
 
 ## Running it
 
 Without `SIMS_RATCHET` the test prints `ratchet: skipped: no assets` and
 passes. That is what CI sees, and what a track's workspace gate sees: it
 sets only `SIMS_INSTALL`, for the other tests. Every other partial or
-wrong setting fails, on the skip too: `SIMS_INSTALL` set but empty or
-not a folder with files in it; `SIMS_RATCHET` without `SIMS_INSTALL`,
-or not a folder with files in it; any `SIMS_RATCHET_` variable, whatever
-its value (`SIMS_RATCHET_UPDATE=0` included), without `SIMS_RATCHET`;
-and a `SIMS_RATCHET_` variable that is not one of the three settings.
+wrong setting fails, on the skip too, and before `--help`, `--list` or a
+filter ends the run: `SIMS_INSTALL` set but empty, or not a folder
+holding a regular file at some depth; `SIMS_RATCHET` without
+`SIMS_INSTALL`, or not such a folder; any `SIMS_RATCHET_` variable,
+whatever its value (`SIMS_RATCHET_UPDATE=0` included), without
+`SIMS_RATCHET`, its name matched as bytes so that one that is not text
+counts; and a `SIMS_RATCHET_` variable that is not one of the three
+settings.
 With both:
 
 ```
