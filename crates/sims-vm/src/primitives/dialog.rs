@@ -123,6 +123,18 @@ fn never_ends(token: &str, name: &str) -> bool {
         .any(|(i, _)| name[i..].starts_with(token))
 }
 
+/// Outcome of formatting one string with `0x44bf1a`.
+pub(crate) struct Formatted {
+    /// Every formatted text the passes may leave (more than one when
+    /// `$Me`, `$Object` or `$Neighbor` is replaced by a type's catalog
+    /// name and `0x4061e3` could pick any of several distinct entries).
+    pub(crate) texts: BTreeSet<String>,
+    /// The portrait types written to the formatter's output slot
+    /// (`[ebp+0x14]`): `None` keeps what a previous string wrote;
+    /// `Some(guid)` replaces it.
+    pub(crate) types: BTreeSet<Option<u32>>,
+}
+
 /// The texts a pass that replaces `token` with a name (`$Me`'s,
 /// `$Object`'s, `$Neighbor`'s, at `at`) may leave from each of `texts`
 /// that holds it: one for each of the `names` it may write. Each token is
@@ -134,6 +146,7 @@ fn name_pass(
     texts: BTreeSet<String>,
     token: &str,
     names: Option<&[String]>,
+    what: &str,
     at: &str,
 ) -> Result<BTreeSet<String>, Trap> {
     let mut out = BTreeSet::new();
@@ -144,15 +157,15 @@ fn name_pass(
         }
         let Some(names) = names else {
             return Err(Trap::Unsupported(format!(
-                "a dialog's `{token}` is replaced by a name that is not known (0x4573d9, {at}), \
-                 and a name that holds `{token}` past its first character would never end \
+                "{what} `{token}` is replaced by a name that is not known (0x44bf1a, 0x4573d9, \
+                 {at}), and a name that holds `{token}` past its first character would never end \
                  (0x4558a0, 0x455750): not ported"
             )));
         };
         if let Some(name) = names.iter().find(|name| never_ends(token, name)) {
             return Err(Trap::Unsupported(format!(
-                "a dialog's `{token}` is replaced by the name {name:?}, which holds it past its \
-                 first character, so the pass never ends ({at}, 0x4558a0, 0x455750)"
+                "{what} `{token}` is replaced by the name {name:?}, which holds it past its \
+                 first character, so the pass never ends (0x44bf1a, {at}, 0x4558a0, 0x455750)"
             )));
         }
         out.extend(names.iter().map(|name| replace_each(&text, token, name)));
@@ -162,11 +175,16 @@ fn name_pass(
 
 /// Fails loudly, naming `token` and its pass, when one of `texts` holds
 /// one of `tokens`, whose passes are not ported.
-fn not_ported(texts: &BTreeSet<String>, tokens: &[&str], passes: &str) -> Result<(), Trap> {
+fn not_ported(
+    texts: &BTreeSet<String>,
+    tokens: &[&str],
+    what: &str,
+    passes: &str,
+) -> Result<(), Trap> {
     for token in tokens {
         if let Some(text) = texts.iter().find(|text| text.contains(*token)) {
             return Err(Trap::Unsupported(format!(
-                "a dialog's text holds `{token}` when its pass runs ({passes}): not ported \
+                "{what} text holds `{token}` when its pass runs (0x44bf1a, {passes}): not ported \
                  ({text:?})"
             )));
         }
@@ -186,7 +204,12 @@ fn not_ported(texts: &BTreeSet<String>, tokens: &[&str], passes: &str) -> Result
 /// so a byte above 0x7f is looked up below the C runtime's table, and
 /// some pass as digits that the conversion reads as none: where the scan
 /// meets one it fails loudly, naming `token`.
-fn local_token(bytes: &[u8], mut end: usize, token: &str) -> Result<(i32, usize), Trap> {
+fn local_token(
+    bytes: &[u8],
+    mut end: usize,
+    what: &str,
+    token: &str,
+) -> Result<(i32, usize), Trap> {
     let mut number = -1i32;
     for part in 0..2 {
         if bytes.get(end) != Some(&b':') {
@@ -199,8 +222,9 @@ fn local_token(bytes: &[u8], mut end: usize, token: &str) -> Result<(i32, usize)
             .count();
         if bytes.get(end + digits).is_some_and(|b| !b.is_ascii()) {
             return Err(Trap::Unsupported(format!(
-                "a dialog's `{token}` is read with digits up to a byte above 0x7f, which the \
-                 original's digit test (0x636993) reads sign-extended (0x44cb70): not ported"
+                "{what} `{token}` is read with digits up to a byte above 0x7f, which the \
+                 original's digit test (0x636993) reads sign-extended (0x44bf1a, 0x44cb70): not \
+                 ported"
             )));
         }
         if part == 0 && digits > 0 {
@@ -491,14 +515,36 @@ impl Machine<'_, '_> {
     /// to 0x4700d0; [`crate::program::Library::unported_strings`]), and a
     /// file with no STR# 301 but a legacy CST 301, which it reads instead
     /// (0x4702c7; [`crate::program::Library::legacy_strings`]).
+    /// Loads string table `table` of the running code's file as `0x47028b`
+    /// with argument 3 zero loads it (`loaded_strings`, falling back to
+    /// `strings`), failing loudly when the table uses an unported loader
+    /// path (`unported_strings`) or falls back to a legacy CST resource
+    /// (`legacy_strings`).
+    pub(crate) fn string_table(&self, table: u16, what: &str) -> Result<Option<&[String]>, Trap> {
+        let owner = self.owner(self.frame()?)?;
+        let Some(library) = self.program.libraries.get(&owner) else {
+            return Ok(None);
+        };
+        let strings = match library.loaded_strings.get(&table) {
+            Some(loaded) => loaded.as_deref(),
+            None => library.strings.get(&table).map(Vec::as_slice),
+        };
+        if let Some(why) = library.unported_strings.get(&table) {
+            return Err(Trap::Unsupported(format!(
+                "{what} STR# {table} {why}: not ported"
+            )));
+        }
+        if strings.is_none() && library.legacy_strings.contains(&table) {
+            return Err(Trap::Unsupported(format!(
+                "{what} file has no STR# {table} but a legacy CST {table}, which the \
+                 original's loader reads instead (0x4702c7, 0x47018e to 0x4701e6): not ported"
+            )));
+        }
+        Ok(strings)
+    }
+
     pub(crate) fn dialog_strings(&self, operands: &[u8; 8]) -> Result<Vec<String>, Trap> {
         const TABLE: u16 = 301;
-        let owner = self.owner(self.frame()?)?;
-        let library = self.program.libraries.get(&owner);
-        let strings = library.and_then(|library| match library.loaded_strings.get(&TABLE) {
-            Some(loaded) => loaded.as_ref(),
-            None => library.strings.get(&TABLE),
-        });
         // Mode 4 formats operand 1's string too, after the others
         // (0x436297 to 0x4362c0, through 0x4369de as they are).
         let mode_4: &[usize] = if (operands[7] >> 1) & 7 == 4 {
@@ -517,21 +563,11 @@ impl Machine<'_, '_> {
             .chain(&[6, 2])
             .chain(mode_4)
             .any(|&operand| operands[operand] != 0);
-        if named && let Some(library) = library {
-            if let Some(why) = library.unported_strings.get(&TABLE) {
-                return Err(Trap::Unsupported(format!(
-                    "a dialog's STR# 301 {why}: not ported"
-                )));
-            }
-            if strings.is_none() && library.legacy_strings.contains(&TABLE) {
-                return Err(Trap::Unsupported(
-                    "a dialog's file has no STR# 301 but a legacy CST 301, which the \
-                     original's loader reads instead (0x4702c7, 0x47018e to 0x4701e6): not \
-                     ported"
-                        .into(),
-                ));
-            }
-        }
+        let strings = if named {
+            self.string_table(TABLE, "a dialog's")?
+        } else {
+            None
+        };
         let mut texts = Vec::new();
         for &operand in buttons.iter().chain(&[6, 2]).chain(mode_4) {
             let text = usize::from(operands[operand])
@@ -601,6 +637,107 @@ impl Machine<'_, '_> {
     /// worked out for each; mode 0 fails loudly where that decides the
     /// portrait. The checks run in every mode: the strings are formatted
     /// before the mode is read.
+    /// Formats `text` through the original string formatter (`0x44bf1a`),
+    /// returning every formatted text the passes may leave and every
+    /// portrait type (`[ebp+0x14]`) they may write.
+    ///
+    /// When `exact_text` is true (as for an Add/Change Action String entry
+    /// added to a pie menu, whose formatted label is kept), tokens whose
+    /// output text is not substituted (`$TimeLocal` and `$Job*`) also fail
+    /// loudly instead of being treated as presentation.
+    pub(crate) fn format_text(
+        &self,
+        text: String,
+        what: &str,
+        exact_text: bool,
+    ) -> Result<Formatted, Trap> {
+        let stack_object = self.frame()?.stack_object;
+        let object = u16::try_from(stack_object)
+            .ok()
+            .and_then(|id| self.world.objects.get(&id))
+            .map(|object| object.guid);
+        let neighbor = self.world.neighbors.get(stack_object).map(|r| r.guid);
+        if text.contains("$Family") {
+            return Err(Trap::Unsupported(format!(
+                "{what} text holds `$FamilyAssets` or `$Family`, whose passes (0x44bf1a, \
+                 0x44bf66, 0x44c034) are not ported"
+            )));
+        }
+        let mut texts = BTreeSet::from([text]);
+        if texts.iter().any(|text| text.contains("$Me")) {
+            let names = self.catalog_names(self.me()?.guid)?;
+            texts = name_pass(texts, "$Me", names.as_deref(), what, "0x44c13e")?;
+        }
+        let mut out_texts = BTreeSet::new();
+        let mut out_types = BTreeSet::new();
+        for text in texts {
+            let mut texts = BTreeSet::from([text]);
+            let mut written = None;
+            if let Some(guid) = object.filter(|_| texts.iter().any(|t| t.contains("$Object"))) {
+                written = Some(guid);
+                let names = self.catalog_names(guid)?;
+                texts = name_pass(texts, "$Object", names.as_deref(), what, "0x44c1ca")?;
+            }
+            let texts = texts
+                .iter()
+                .map(|text| self.locals_written(text, what))
+                .collect::<Result<BTreeSet<_>, _>>()?;
+            not_ported(&texts, &BETWEEN, what, "0x44c280 to 0x44c590")?;
+            for text in texts {
+                self.neighbor_locals(&text, what)?;
+                let mut texts = BTreeSet::from([text]);
+                let mut written = written;
+                if let Some(guid) =
+                    neighbor.filter(|_| texts.iter().any(|t| t.contains("$Neighbor")))
+                {
+                    written = Some(guid);
+                    let names = self.catalog_names(guid)?;
+                    texts = name_pass(texts, "$Neighbor", names.as_deref(), what, "0x44c6ba")?;
+                }
+                not_ported(&texts, &AFTER, what, "0x44c6ea to 0x44c8c4")?;
+                if exact_text
+                    && let Some(text) = texts.iter().find(|text| text.contains("$TimeLocal"))
+                {
+                    return Err(Trap::Unsupported(format!(
+                        "{what} text holds `$TimeLocal`, whose formatting (0x44bf1a, 0x44c8c4, \
+                         0x4a6ab1) is not ported ({text:?})"
+                    )));
+                }
+                if let Some(text) = texts.iter().find(|text| text.contains("$Job")) {
+                    if self.me()?.person.is_none() {
+                        return Err(Trap::Unsupported(format!(
+                            "{what} text holds a career token (`$JobOffer`, `$JobDesc`, \
+                             `$Job`), whose pass casts the object running the tree to a \
+                             person (0x44bf1a, 0x44c9bc) and reads it (0x44ca27): it is not \
+                             one, so the original faults ({text:?})"
+                        )));
+                    }
+                    if exact_text {
+                        return Err(Trap::Unsupported(format!(
+                            "{what} text holds a career token (`$JobOffer`, `$JobDesc`, \
+                             `$Job`), whose text formatting (0x44bf1a, 0x44c966) is not ported \
+                             ({text:?})"
+                        )));
+                    }
+                    if !self.program.career_texts_end {
+                        return Err(Trap::Unsupported(format!(
+                            "{what} text holds a career token, and the career texts \
+                             are not known to hold none past their first character, which \
+                             would never end its pass (0x44bf1a, 0x44ca9f to 0x44cad3): not \
+                             ported ({text:?})"
+                        )));
+                    }
+                }
+                out_types.insert(written);
+                out_texts.extend(texts);
+            }
+        }
+        Ok(Formatted {
+            texts: out_texts,
+            types: out_types,
+        })
+    }
+
     pub(crate) fn dialog_text_type(
         &self,
         operands: &[u8; 8],
@@ -611,75 +748,15 @@ impl Machine<'_, '_> {
             .ok()
             .and_then(|id| self.world.objects.get(&id))
             .map(|object| object.guid);
-        let neighbor = self.world.neighbors.get(stack_object).map(|r| r.guid);
         // Mode 4's last string is formatted with no place for a type
         // (0x4362ba pushes 0), but only mode 0 reads the place.
         // What may have been found so far: more than one where the name a
         // pass writes may be one of several.
         let mut found = BTreeSet::from([None]);
         for text in self.dialog_strings(operands)? {
-            if text.contains("$Family") {
-                return Err(Trap::Unsupported(
-                    "a dialog's text holds `$FamilyAssets` or `$Family`, whose passes (0x44bf66, \
-                     0x44c034) are not ported"
-                        .into(),
-                ));
-            }
-            let mut texts = BTreeSet::from([text]);
-            if texts.iter().any(|text| text.contains("$Me")) {
-                let names = self.catalog_names(self.me()?.guid)?;
-                texts = name_pass(texts, "$Me", names.as_deref(), "0x44c13e")?;
-            }
-            // What this string may do to what was found: None keeps it,
-            // Some(type) puts that in its place.
-            let mut outcomes = BTreeSet::new();
-            for text in texts {
-                let mut texts = BTreeSet::from([text]);
-                let mut written = None;
-                if let Some(guid) = object.filter(|_| texts.iter().any(|t| t.contains("$Object"))) {
-                    written = Some(guid);
-                    let names = self.catalog_names(guid)?;
-                    texts = name_pass(texts, "$Object", names.as_deref(), "0x44c1ca")?;
-                }
-                let texts = texts
-                    .iter()
-                    .map(|text| self.locals_written(text))
-                    .collect::<Result<BTreeSet<_>, _>>()?;
-                not_ported(&texts, &BETWEEN, "0x44c280 to 0x44c590")?;
-                for text in texts {
-                    self.neighbor_locals(&text)?;
-                    let mut texts = BTreeSet::from([text]);
-                    let mut written = written;
-                    if let Some(guid) =
-                        neighbor.filter(|_| texts.iter().any(|t| t.contains("$Neighbor")))
-                    {
-                        written = Some(guid);
-                        let names = self.catalog_names(guid)?;
-                        texts = name_pass(texts, "$Neighbor", names.as_deref(), "0x44c6ba")?;
-                    }
-                    not_ported(&texts, &AFTER, "0x44c6ea to 0x44c8c4")?;
-                    if let Some(text) = texts.iter().find(|text| text.contains("$Job")) {
-                        if self.me()?.person.is_none() {
-                            return Err(Trap::Unsupported(format!(
-                                "a dialog's text holds a career token (`$JobOffer`, `$JobDesc`, \
-                                 `$Job`), whose pass casts the object running the tree to a \
-                                 person (0x44c9bc) and reads it (0x44ca27): it is not one, so \
-                                 the original faults ({text:?})"
-                            )));
-                        }
-                        if !self.program.career_texts_end {
-                            return Err(Trap::Unsupported(format!(
-                                "a dialog's text holds a career token, and the career texts \
-                                 are not known to hold none past their first character, which \
-                                 would never end its pass (0x44ca9f to 0x44cad3): not ported \
-                                 ({text:?})"
-                            )));
-                        }
-                    }
-                    outcomes.insert(written);
-                }
-            }
-            found = outcomes
+            let formatted = self.format_text(text, "a dialog's", false)?;
+            found = formatted
+                .types
                 .into_iter()
                 .flat_map(|outcome| match outcome {
                     None => found.clone(),
@@ -760,7 +837,7 @@ impl Machine<'_, '_> {
     /// frame +6, compared signed), the token and what was read with it are
     /// replaced (0x4557c0) by the local's value in decimal (0x46f941,
     /// `%d` of the word sign-extended). Otherwise the token stays.
-    fn locals_written(&self, text: &str) -> Result<String, Trap> {
+    fn locals_written(&self, text: &str, what: &str) -> Result<String, Trap> {
         const TOKEN: &str = "$Local";
         let locals = &self.frame()?.locals;
         let mut text = text.to_owned();
@@ -770,12 +847,12 @@ impl Machine<'_, '_> {
             .and_then(|t| t.find(TOKEN))
             .map(|i| i + from)
         {
-            let (number, end) = local_token(text.as_bytes(), at + TOKEN.len(), TOKEN)?;
+            let (number, end) = local_token(text.as_bytes(), at + TOKEN.len(), what, TOKEN)?;
             if let Ok(n) = usize::try_from(number)
                 && n < locals.len()
             {
                 self.check_local(n).map_err(|trap| {
-                    Trap::Unsupported(format!("a dialog's `$Local:{n}` (0x44c240): {trap}"))
+                    Trap::Unsupported(format!("{what} `$Local:{n}` (0x44bf1a, 0x44c240): {trap}"))
                 })?;
                 text.replace_range(at..end, &locals[n].to_string());
             }
@@ -796,7 +873,7 @@ impl Machine<'_, '_> {
     /// which is not ported, and fails loudly; a record whose type is not
     /// in the table ends the pass (0x44c616 to 0x44c653). Otherwise the
     /// token stays, and the `$Neighbor` pass finds it.
-    pub(crate) fn neighbor_locals(&self, text: &str) -> Result<(), Trap> {
+    pub(crate) fn neighbor_locals(&self, text: &str, what: &str) -> Result<(), Trap> {
         const TOKEN: &str = "$NeighborLocal";
         let locals = &self.frame()?.locals;
         let mut from = 0;
@@ -805,22 +882,23 @@ impl Machine<'_, '_> {
             .and_then(|t| t.find(TOKEN))
             .map(|i| i + from)
         {
-            let (number, _) = local_token(text.as_bytes(), at + TOKEN.len(), TOKEN)?;
+            let (number, _) = local_token(text.as_bytes(), at + TOKEN.len(), what, TOKEN)?;
             if let Ok(n) = usize::try_from(number)
                 && n < locals.len()
             {
                 self.check_local(n).map_err(|trap| {
                     Trap::Unsupported(format!(
-                        "a dialog's `$NeighborLocal:{n}` (0x44c5f4): {trap}"
+                        "{what} `$NeighborLocal:{n}` (0x44bf1a, 0x44c5f4): {trap}"
                     ))
                 })?;
                 if let Some(record) = self.world.neighbors.get(locals[n]) {
-                    if !self.listed_person_type(record.guid, "a dialog's $NeighborLocal")? {
+                    if !self.listed_person_type(record.guid, &format!("{what} $NeighborLocal"))? {
                         break;
                     }
                     return Err(Trap::Unsupported(format!(
-                        "a dialog's `$NeighborLocal:{n}` is replaced by the name of type \
-                         0x{:08X} from the interface's table (0x4e9c46, 0x4e893e): not ported",
+                        "{what} `$NeighborLocal:{n}` is replaced by the name of type \
+                         0x{:08X} from the interface's table (0x44bf1a, 0x4e9c46, 0x4e893e): \
+                         not ported",
                         record.guid
                     )));
                 }

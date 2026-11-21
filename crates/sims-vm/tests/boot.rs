@@ -677,25 +677,36 @@ fn the_selected_goth_lists_pie_menus_and_picks_from_them() {
             .clone()
     };
 
-    // Object 10's listing runs check trees and fails partway, on an
-    // action string with a token, whose formatter is not ported. The lot
-    // is as it was.
-    let before = lot.world().hash();
-    let refused = lot.pie_menu(sim, 10).unwrap_err();
-    assert!(refused.to_string().contains("0x44bf1a"), "{refused}");
-    assert_eq!(lot.world().hash(), before);
-    // The check tree's fault keeps its trap, here something not ported.
-    let sims_vm::boot::OrderError::Refused(fault) = &refused else {
-        panic!("{refused:?}");
-    };
-    let sims_vm::Trap::CheckTree { fault: inner, .. } = &fault.trap else {
-        panic!("{fault:?}");
-    };
-    assert!(
-        matches!(&inner.trap, sims_vm::Trap::Unsupported(m) if m.contains("0x44bf1a")),
-        "{fault}"
+    // Object 10 (phone) runs Call Cab's check tree (0x2074), which formats
+    // `$$Local:1` action strings through 0x44bf1a into cab fares and
+    // service entries.
+    let phone = lot.pie_menu(sim, 10).unwrap_or_else(|e| panic!("{e}"));
+    let phone_named: Vec<_> = phone
+        .entries
+        .iter()
+        .filter_map(|e| e.name.as_deref())
+        .collect();
+    assert_eq!(
+        phone_named,
+        [
+            "Call Cab.../Go to Magic Town - $50",
+            "Call Cab.../Go to Studio Town - $50",
+            "Call Cab.../Explore Old Town",
+            "Call Cab.../Go On Vacation - $500",
+            "Call Cab.../Go Downtown - $50",
+            "Services.../Caterer",
+        ]
     );
-    assert!(fault.trap.unported());
+    // Objects 4 and 253 (the other phones on the lot) list Call Cab too.
+    for target in [4u16, 253] {
+        let menu = lot.pie_menu(sim, target).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            menu.entries
+                .iter()
+                .any(|e| e.name.as_deref() == Some("Call Cab.../Go to Magic Town - $50")),
+            "object {target}: {menu:?}"
+        );
+    }
     // Object 18's check tree reads the advertisement record (scope 12)
     // before Find Best Interaction first copies into it: the game's start
     // left it zeroed.
@@ -1002,6 +1013,40 @@ fn a_goth_visitor_lists_category_4_and_7_objects_via_the_hotel_key_check() {
         }
     }
     assert_eq!(lot.world().neighbors.inventories.len(), inventories_before);
+}
+
+/// Every person's pie menu on every object of the Goth house lists cleanly
+/// at ticks 0, 1500, and 6000 (the three probe points from
+/// `docs/decisions/20261120-check-tree-faults-and-failed-play-steps.md`,
+/// closing Call Cab's `$$Local:1` formatter as the last of the three
+/// Goth pie-listing failures).
+#[test]
+fn every_person_lists_every_object_on_the_goth_house_at_0_1500_and_6000() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut lot = Lot::load(&root, &house, &[3, 3], Frames::default()).unwrap();
+    for target_tick in [0u32, 1500, 6000] {
+        while lot.ticks() < target_tick {
+            lot.step()
+                .unwrap_or_else(|e| panic!("tick {}: {e}", lot.ticks()));
+        }
+        let saved = lot.save().unwrap();
+        let people: Vec<u16> = lot.world().people.clone();
+        let objects: Vec<u16> = lot.world().objects.keys().copied().collect();
+        assert!(!people.is_empty(), "tick {target_tick}");
+        for &person in &people {
+            for &object in &objects {
+                lot.pie_menu(person, object).unwrap_or_else(|e| {
+                    panic!("tick {target_tick}: person {person} on object {object} failed: {e}")
+                });
+            }
+        }
+        lot.restore(saved).unwrap();
+    }
 }
 
 #[test]

@@ -60,13 +60,15 @@ pub struct Library {
     /// first-language entries in file order): the resource of the ID
     /// ([`Iff::get`]: deleted chunks skipped, 0x41c542), with its
     /// first-language entries in the loader's order ([`loaded_order`]), or
-    /// None when the file has chunks of the ID but no resource. Only the
-    /// dialog's strings read it; whether the other readers of
-    /// [`Library::strings`] load through the same loader is **unverified**.
+    /// None when the file has chunks of the ID but no resource. Dialogs
+    /// (0x43601c) and Add/Change Action String (0x44cc07) read it through
+    /// 0x47028b; whether the other readers of [`Library::strings`] load
+    /// through the same loader is **unverified**.
     pub loaded_strings: BTreeMap<u16, Option<Vec<String>>>,
     /// The string tables (STR#) whose resource the loader (0x46feac, the
-    /// dialog's call with argument 3 zero) reads in a way not ported, by
-    /// ID, each with why ([`unported_strings`]). Only the dialog reads it.
+    /// 0x47028b call with argument 3 zero) reads in a way not ported, by
+    /// ID, each with why ([`unported_strings`]). Dialogs and Add/Change
+    /// Action String read it.
     pub unported_strings: BTreeMap<u16, &'static str>,
     /// The IDs of the file's legacy string tables (CST resources), which
     /// are not read: the original's string loader falls back to one when

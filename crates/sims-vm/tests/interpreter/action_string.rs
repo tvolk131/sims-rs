@@ -103,6 +103,32 @@ fn a_string_with_tokens_fails_loudly_before_anything_changes() {
         assert!(fault.to_string().contains("0x44bf1a"), "{fault}");
         assert_eq!(active_flags(&fx), 0x41);
     }
+
+    // A non-person running `$Job` faults in the career pass (0x44ca27).
+    let mut fx = named(LAMP, LAMP_FILE, 1);
+    fx.program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .strings
+        .insert(300, vec!["$Job".to_owned()]);
+    let fault = turn(&mut fx, LAMP).unwrap_err();
+    assert!(fault.to_string().contains("0x44ca27"), "{fault}");
+
+    // In a thread's run (text dropped), `$Local` and multi-entry `$Me`
+    // succeed and set `NAMED` on a person's active interaction.
+    let mut fx = named(SIM, SIM_FILE, 1);
+    let def = fx.catalog.object(SIM_GUID).unwrap();
+    let lib = fx.program.libraries.get_mut(&SIM_FILE).unwrap();
+    lib.definitions.get_mut(&def.chunk).unwrap()[41] = 100;
+    lib.catalog_strings.insert(
+        100,
+        vec![(1, "Mortimer".to_owned()), (1, "Goth".to_owned())],
+    );
+    lib.strings
+        .insert(300, vec!["$Me pays $$Local:0 at $TimeLocal:0".to_owned()]);
+    assert_eq!(turn(&mut fx, SIM), Ok(Status::Returned(true)));
+    assert_eq!(active_flags(&fx), 0xc1);
 }
 
 /// A lot whose Sim (selected if `selected`) runs an action with flags
