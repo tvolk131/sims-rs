@@ -307,16 +307,20 @@ fn load_indexed_bcf_catalog_into(
     files: &mut BTreeSet<String>,
 ) {
     if let Some((items, _)) = people.indexed_catalogs.get(loc) {
-        if let Some(first) = items.first()
-            && files.insert(first.file.clone())
-        {
-            // 0x59f107 -> 0x598af7: every skeleton decoded from the `.bcf`
-            // draws its wiggle scales before checking whether its name is
-            // already registered in the avatar registry.
-            for item in items {
-                if let Some(scales) = item.scales.get(item.place) {
-                    draws.skeleton(scales);
-                }
+        if let Some(first) = items.first() {
+            // Mark the file read so a subsequent `build_skeleton` for the
+            // resolved person draws only its own copy (`0x598da3`).
+            files.insert(first.file.clone());
+        }
+        // 0x59e70a -> 0x59f087 -> 0x59f107 -> 0x598af7: EVERY time an
+        // unresolved `.ndx` entry opens this `.bcf` catalog (including a
+        // later reopen for another unresolved `.ndx` entry, and including
+        // duplicate skeleton entries in the file), every skeleton decoded
+        // from the catalog draws its wiggle scales before checking whether
+        // its name is already registered.
+        for item in items {
+            if let Some(scales) = item.scales.get(item.place) {
+                draws.skeleton(scales);
             }
         }
         for item in items {
@@ -334,21 +338,6 @@ fn load_indexed_bcf_catalog_into(
             }
         }
     }
-}
-
-fn load_indexed_bcf_catalog(people: &People, world: &mut World, loc: &str) {
-    let mut draws = crate::objects::Draws {
-        stream: &mut world.crt_rng,
-        count: 0,
-    };
-    load_indexed_bcf_catalog_into(
-        people,
-        loc,
-        &mut world.loaded_indexed_skeletons,
-        &mut world.loaded_indexed_suits,
-        &mut draws,
-        &mut world.skeleton_files,
-    );
 }
 
 fn resolve_skeleton_by_name_into<'p>(
@@ -549,14 +538,17 @@ pub(crate) enum ResolvedSuit {
 
 /// Whether a previously failed indexed lookup for `suit` (`loaded_indexed_suits[suit] == None`)
 /// failed because decoding stopped with an error (leaving existence / HEAD binding unknown)
-/// rather than a clean catalog miss or missing file.
+/// rather than a clean catalog miss or missing file (`0x5a392f -> 0x5a3965`).
 fn failed_indexed_suit_is_unknown(people: &People, suit: &str) -> bool {
     match people.indexed_suits.get(suit) {
         Some(Ok(loc)) => people
             .indexed_suit_catalogs
             .get(loc)
             .is_none_or(|(_, err)| err.is_some()),
-        Some(Err(_)) => !people.suit_errors.is_empty(),
+        // 0x5a392f -> 0x5a3965: an `.ndx` entry pointing to a missing file is
+        // a definite miss even if an unrelated catalog populated `suit_errors`;
+        // only a genuine lookup error recorded in `suit_errors` is unknown.
+        Some(Err(reason)) => people.suit_errors.values().any(|err| err == reason),
         None => !people.suit_errors.is_empty(),
     }
 }
@@ -588,11 +580,21 @@ pub(crate) fn peek_suit_head(people: &People, world: &World, suit: &str) -> Reso
     }
 }
 
-pub(crate) fn resolve_suit(people: &People, world: &mut World, suit: &str) -> ResolvedSuit {
+/// Resolves lowercased appearance `suit` via `0x5a044d` → `0x5a38da` →
+/// `0x59e60e` → `0x59f087` against explicit transactional registry state
+/// (used both by live runtime dressing and saved-house object reads).
+pub(crate) fn resolve_suit_into(
+    people: &People,
+    suit: &str,
+    loaded_skeletons: &mut std::collections::BTreeMap<String, Option<String>>,
+    loaded_suits: &mut std::collections::BTreeMap<String, Option<bool>>,
+    draws: &mut crate::objects::Draws<'_>,
+    files: &mut BTreeSet<String>,
+) -> ResolvedSuit {
     if people.eager_suits.contains(suit) {
         return ResolvedSuit::Found(people.head_suits.contains(suit));
     }
-    if let Some(&slot) = world.loaded_indexed_suits.get(suit) {
+    if let Some(&slot) = loaded_suits.get(suit) {
         return match slot {
             Some(has_head) => ResolvedSuit::Found(has_head),
             None if failed_indexed_suit_is_unknown(people, suit) => ResolvedSuit::Unknown,
@@ -606,8 +608,15 @@ pub(crate) fn resolve_suit(people: &People, world: &mut World, suit: &str) -> Re
                     // 0x59e60e -> 0x59f087: loading this `.bcf` builds its
                     // skeletons (`0x59f107`), registers skeletons (`0x59f18c`),
                     // and registers appearances (`0x59f34c`).
-                    load_indexed_bcf_catalog(people, world, loc);
-                    if let Some(&Some(has_head)) = world.loaded_indexed_suits.get(suit) {
+                    load_indexed_bcf_catalog_into(
+                        people,
+                        loc,
+                        loaded_skeletons,
+                        loaded_suits,
+                        draws,
+                        files,
+                    );
+                    if let Some(&Some(has_head)) = loaded_suits.get(suit) {
                         return ResolvedSuit::Found(has_head);
                     }
                     // 0x5a3965: mark the requested entry attempted (`None`)
@@ -615,22 +624,24 @@ pub(crate) fn resolve_suit(people: &People, world: &mut World, suit: &str) -> Re
                     // catalog loads cannot fill it (`0x59f34c`), while
                     // `failed_indexed_suit_is_unknown` preserves decode
                     // uncertainty for subsequent queries.
-                    world.loaded_indexed_suits.insert(suit.to_owned(), None);
+                    loaded_suits.insert(suit.to_owned(), None);
                     return if decode_error.is_some() {
                         ResolvedSuit::Unknown
                     } else {
                         ResolvedSuit::Missing
                     };
                 }
-                world.loaded_indexed_suits.insert(suit.to_owned(), None);
+                loaded_suits.insert(suit.to_owned(), None);
                 return ResolvedSuit::Unknown;
             }
-            Err(_) => {
-                world.loaded_indexed_suits.insert(suit.to_owned(), None);
-                return if people.suit_errors.is_empty() {
-                    ResolvedSuit::Missing
-                } else {
+            Err(reason) => {
+                // 0x5a392f -> 0x5a3965: missing catalog file is a definite
+                // miss regardless of unrelated `suit_errors`.
+                loaded_suits.insert(suit.to_owned(), None);
+                return if people.suit_errors.values().any(|err| err == reason) {
                     ResolvedSuit::Unknown
+                } else {
+                    ResolvedSuit::Missing
                 };
             }
         }
@@ -646,15 +657,19 @@ pub(crate) fn resolve_suit(people: &People, world: &mut World, suit: &str) -> Re
     }
 }
 
-/// Resolves whether lowercased appearance `suit` binds `"HEAD"` with a valid
-/// mesh (`0x5a044d` → `0x5a38da` → `0x59e60e` → `0x59f087`), executing lazy
-/// `.ndx` `.bcf` catalog loads in runtime call order.
-pub(crate) fn resolve_suit_head(people: &People, world: &mut World, suit: &str) -> Option<bool> {
-    match resolve_suit(people, world, suit) {
-        ResolvedSuit::Found(has_head) => Some(has_head),
-        ResolvedSuit::Missing => Some(false),
-        ResolvedSuit::Unknown => None,
-    }
+pub(crate) fn resolve_suit(people: &People, world: &mut World, suit: &str) -> ResolvedSuit {
+    let mut draws = crate::objects::Draws {
+        stream: &mut world.crt_rng,
+        count: 0,
+    };
+    resolve_suit_into(
+        people,
+        suit,
+        &mut world.loaded_indexed_skeletons,
+        &mut world.loaded_indexed_suits,
+        &mut draws,
+        &mut world.skeleton_files,
+    )
 }
 
 /// Resolves whether lowercased appearance `suit` exists in the avatar registry

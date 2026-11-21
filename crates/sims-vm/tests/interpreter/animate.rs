@@ -2118,11 +2118,12 @@ fn what_a_draw_does_not_port_fails_loudly() {
     a.undrawn = false;
     a.position[0] = UNSET;
     assert!(failed(&mut fx).contains("+0xda"));
-    // A body that follows word 8.
+    // A body that follows word 8 (`0x58a1ed`) is ported via `outfits::dress_person`.
     let mut fx = turning();
     sim_definition(&mut fx)[102] |= 8;
     fx.sim_mut().person.as_mut().unwrap().data[8] = 1;
-    assert!(failed(&mut fx).contains("word 8"));
+    draw(&mut fx).unwrap();
+    assert_eq!(fx.sim().person.as_ref().unwrap().data[8], 1);
     // The type in the view's second list.
     let mut fx = turning();
     sim_definition(&mut fx)[101] |= 2;

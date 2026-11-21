@@ -26,7 +26,7 @@
 use super::Lot;
 use crate::Answers;
 use serde::{Deserialize, Serialize};
-use sims_sim::{PortraitFile, World};
+use sims_sim::{PersonOutfit, PortraitFile, World};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The version of [`Saved::encode`]'s layout: the fields of [`Saved`],
@@ -70,6 +70,7 @@ pub struct Saved {
     loaded_indexed_skeletons: BTreeMap<String, Option<String>>,
     loaded_indexed_suits: BTreeMap<String, Option<bool>>,
     made_outfits: BTreeMap<u32, BTreeMap<usize, String>>,
+    person_outfits: BTreeMap<u16, PersonOutfit>,
 }
 
 /// Why a lot could not be saved or restored.
@@ -155,6 +156,7 @@ impl Saved {
         saved.world.loaded_indexed_skeletons = saved.loaded_indexed_skeletons.clone();
         saved.world.loaded_indexed_suits = saved.loaded_indexed_suits.clone();
         saved.world.made_outfits = saved.made_outfits.clone();
+        saved.world.person_outfits = saved.person_outfits.clone();
         Ok(saved)
     }
 }
@@ -192,6 +194,7 @@ impl Lot {
             loaded_indexed_skeletons: self.world.loaded_indexed_skeletons.clone(),
             loaded_indexed_suits: self.world.loaded_indexed_suits.clone(),
             made_outfits: self.world.made_outfits.clone(),
+            person_outfits: self.world.person_outfits.clone(),
         })
     }
 
@@ -265,6 +268,7 @@ mod tests {
             loaded_indexed_skeletons: world.loaded_indexed_skeletons.clone(),
             loaded_indexed_suits: world.loaded_indexed_suits.clone(),
             made_outfits: world.made_outfits.clone(),
+            person_outfits: world.person_outfits.clone(),
             world,
             ticks: 1,
             start: 0,

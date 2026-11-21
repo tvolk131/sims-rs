@@ -470,23 +470,9 @@ impl Machine<'_, '_> {
             return Ok(false);
         }
         // 0x440d63 -> 0x440dd5 -> 0x4e969d: a pet disallowed by the installed
-        // expansions mask is refused before any construction (and could not
-        // have been built by the household panel either).
+        // expansions mask is refused before any construction.
         if self.interpreter().is_refused_pet(self.world, guid) {
             return Ok(false);
-        }
-        let family = i32::from(self.world.globals.get(9).copied().unwrap_or(0));
-        if self
-            .world
-            .families
-            .iter()
-            .any(|f| f.id == family && f.members.contains(&guid))
-        {
-            return Err(Trap::Unsupported(format!(
-                "a dialog's portrait of the household's type 0x{guid:08X} with nobody of \
-                 it on the lot (0x4e9652): whether the household's panel built it before \
-                 is not kept"
-            )));
         }
         let interpreter = self.interpreter();
         let unsupported = |fault| {
@@ -519,7 +505,7 @@ impl Machine<'_, '_> {
             return Ok(false);
         };
         let placed = built
-            .portrait_put_outcome(&mut copy, id)
+            .portrait_put_outcome(&mut copy, id, "a dialog's portrait")
             .map_err(|fault| fault.trap)?;
         let can_render = if !placed {
             false

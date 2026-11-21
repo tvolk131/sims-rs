@@ -270,9 +270,8 @@ impl Interpreter<'_> {
         let expansions = world.globals.get(20).copied().unwrap_or(0);
         let mut objects = BTreeMap::new();
         let mut order = Vec::new();
-        // First every object is constructed, then every object is read.
-        // Only construction draws, so one pass in the file's order gives
-        // the same stream.
+        // Pass 1: construct every object in saved file order (`0x45962b` ->
+        // `0x58838b` -> `0x5a0384` skeleton resolution + default traits).
         for &id in &saved.order {
             let Some(instance) = saved.instances.get(&id) else {
                 continue;
@@ -290,6 +289,73 @@ impl Interpreter<'_> {
                 return Err(fail(id, Trap::Invalid("a saved ID is listed twice".into())));
             }
             order.push(id);
+        }
+        // Pass 2: bind every saved person's serialized appearance slots
+        // (`0x591ab4..0x591aff` -> `0x583541`), dirty portrait on non-empty
+        // saved head (`0x591b01..0x591b58` -> `0x4eb0eb`), and bind saved
+        // accessories (`0x591b66..0x591bf8` -> `0x583541`) in saved order.
+        let mut person_outfits = BTreeMap::new();
+        let mut dirtied_portraits = Vec::new();
+        for &id in &order {
+            let object = &objects[&id];
+            let Some(person) = object.person.as_ref() else {
+                continue;
+            };
+            let mut outfit = sims_sim::PersonOutfit::new();
+            let mut bind = |suit: &str, texture: &str| -> Option<sims_sim::BoundSlot> {
+                if suit.is_empty() {
+                    return None;
+                }
+                let lower = suit.to_ascii_lowercase();
+                match crate::people::resolve_suit_into(
+                    people,
+                    &lower,
+                    &mut registry.loaded_skeletons,
+                    &mut registry.loaded_suits,
+                    &mut registry.draws,
+                    &mut registry.files,
+                ) {
+                    crate::people::ResolvedSuit::Found(has_head) => Some(sims_sim::BoundSlot {
+                        suit: suit.to_owned(),
+                        texture: texture.to_owned(),
+                        has_head: Some(has_head),
+                    }),
+                    crate::people::ResolvedSuit::Missing => None,
+                    crate::people::ResolvedSuit::Unknown => Some(sims_sim::BoundSlot {
+                        suit: suit.to_owned(),
+                        texture: texture.to_owned(),
+                        has_head: None,
+                    }),
+                }
+            };
+            // 0x591a52..0x591aff: 5 slot pairs in exact native order:
+            // body [0..2], body_alt [2..4], extra_left [4..6], extra_right [6..8], head [8..10].
+            outfit.body = bind(&person.appearance[0], &person.appearance[1]);
+            outfit.body_alt = bind(&person.appearance[2], &person.appearance[3]);
+            outfit.extra_left = bind(&person.appearance[4], &person.appearance[5]);
+            outfit.extra_right = bind(&person.appearance[6], &person.appearance[7]);
+            outfit.head = bind(&person.appearance[8], &person.appearance[9]);
+            // 0x591b01..0x591b58: compare saved head suit/texture against the
+            // freshly constructed empty head slot (`""`, `""`); if either is
+            // non-empty, `0x4eb0eb` invalidates and marks the portrait dirty.
+            if !person.appearance[8].is_empty() || !person.appearance[9].is_empty() {
+                dirtied_portraits.push(object.guid);
+            }
+            // 0x591b66..0x591bf8: bind each serialized accessory via 0x583541.
+            for acc in &person.accessories {
+                if !acc.name.is_empty() {
+                    let lower = acc.name.to_ascii_lowercase();
+                    let _ = crate::people::resolve_suit_into(
+                        people,
+                        &lower,
+                        &mut registry.loaded_skeletons,
+                        &mut registry.loaded_suits,
+                        &mut registry.draws,
+                        &mut registry.files,
+                    );
+                }
+            }
+            person_outfits.insert(id, outfit);
         }
         for &(id, index) in frame_tree_bits {
             if index == 0 {
@@ -368,6 +434,11 @@ impl Interpreter<'_> {
         world.skeleton_files = files;
         world.loaded_indexed_skeletons = loaded_skeletons;
         world.loaded_indexed_suits = loaded_suits;
+        world.person_outfits.extend(person_outfits);
+        for guid in dirtied_portraits {
+            world.portraits.remove(&guid);
+            world.dirty_portraits.insert(guid);
+        }
         for &id in &order {
             if let Some(instances) = world.instances.get_mut(&objects[&id].guid) {
                 instances.push(id);

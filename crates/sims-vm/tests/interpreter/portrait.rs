@@ -109,8 +109,8 @@ fn modes_with_no_person_build_no_portrait() {
 
 #[test]
 fn a_portrait_the_port_cannot_tell_was_built_fails_loudly() {
-    // A type of the household with nobody of it on the lot: the household
-    // panel may have built it (not kept).
+    // An eligible off-lot household member proceeds to 0x4e9652 (matching
+    // native 0x4363d1 -> 0x4e92a8 -> 0x4e9652) and builds its portrait.
     let (mut fx, _, record) = visitors();
     fx.world.globals[9] = 7;
     fx.world.families.push(sims_sim::neighbors::Family {
@@ -120,12 +120,8 @@ fn a_portrait_the_port_cannot_tell_was_built_fails_loudly() {
         friends: 0,
         stale: false,
     });
-    let fault = inform(&mut fx, 2, record).unwrap_err().to_string();
-    assert!(
-        fault.contains("0x4e9652") && fault.contains("household"),
-        "{fault}"
-    );
-    assert!(fx.world.portraits.is_empty());
+    assert_eq!(inform(&mut fx, 2, record), Ok(true));
+    assert!(fx.world.portraits.contains(&WIDGET));
     // A type made while the game ran may not be in the interface's table.
     let (mut fx, _, record) = visitors();
     fx.world.characters.made.insert(

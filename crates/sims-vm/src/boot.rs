@@ -717,6 +717,32 @@ impl Lot {
                     .into());
                 };
                 world.skeleton_files.insert(file.clone());
+                // The handoff's catalog was already opened through `0x59f087`
+                // before the lot load, so its indexed skeletons and appearances
+                // are already registered in the avatar registry (preventing a
+                // duplicate lazy load and CRT RNG draw during house load).
+                if let Some((items, _)) = program.people.indexed_catalogs.get(file) {
+                    for item in items {
+                        if !program.people.skeletons_by_name.contains_key(&item.name)
+                            && !world.loaded_indexed_skeletons.contains_key(&item.name)
+                        {
+                            world
+                                .loaded_indexed_skeletons
+                                .insert(item.name.clone(), Some(file.clone()));
+                        }
+                    }
+                }
+                if let Some((suits, _)) = program.people.indexed_suit_catalogs.get(file) {
+                    for (app_name, &has_head) in suits {
+                        if !program.people.eager_suits.contains(app_name)
+                            && !world.loaded_indexed_suits.contains_key(app_name)
+                        {
+                            world
+                                .loaded_indexed_suits
+                                .insert(app_name.clone(), Some(has_head));
+                        }
+                    }
+                }
             }
             world.read_neighbors(
                 &neighborhood,

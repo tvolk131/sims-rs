@@ -54,6 +54,7 @@ pub mod neighborhood_open;
 mod object_uses;
 mod objects;
 pub mod orders;
+mod outfits;
 mod people;
 mod person_factory;
 mod pick;

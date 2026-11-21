@@ -282,6 +282,7 @@ fn world() -> World {
         loaded_indexed_skeletons: BTreeMap::new(),
         loaded_indexed_suits: BTreeMap::new(),
         made_outfits: BTreeMap::new(),
+        person_outfits: BTreeMap::new(),
     }
 }
 

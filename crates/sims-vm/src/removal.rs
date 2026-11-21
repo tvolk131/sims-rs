@@ -471,6 +471,7 @@ impl Interpreter<'_> {
         if person {
             // The person's destructor (0x459511).
             world.animators.remove(&id);
+            world.person_outfits.remove(&id);
             world.base_layers.remove(&id);
             world.translated_bones.remove(&id);
             world.held_poses.remove(&id);

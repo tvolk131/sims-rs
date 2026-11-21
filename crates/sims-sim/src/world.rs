@@ -263,6 +263,63 @@ pub struct World {
     /// 31; `sims_vm::boot::save::Saved` preserves it.
     #[serde(skip)]
     pub made_outfits: BTreeMap<u32, BTreeMap<usize, String>>,
+    /// Per-person live `cTSPerson` attachment slots (`[ebx + 0x258]` head,
+    /// `[ebx + 0x25c]` body & body_alt, `[ebx + 0x268]` left & right extras)
+    /// and cached dressing guard (`[ebx + 0x1b0..0x1bc]`, `data[8, 21, 22, 23]`).
+    /// Kept out of [`World::encode`] to preserve snapshot format 31;
+    /// `sims_vm::boot::save::Saved` preserves it across save/restore.
+    #[serde(skip)]
+    pub person_outfits: BTreeMap<u16, PersonOutfit>,
+}
+
+/// One appearance attachment slot on `cTSPerson` (`0x583559`: suit name at
+/// `[slot + 4]`, texture string at `[slot + 0x10]`, and whether the bound
+/// appearance defines a valid `"HEAD"` mesh binding).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct BoundSlot {
+    pub suit: String,
+    pub texture: String,
+    pub has_head: Option<bool>,
+}
+
+/// Live outfit attachment slots and cached dressing guard on `cTSPerson`
+/// (`0x587dfa`, `0x58a178`, `0x591a30`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonOutfit {
+    /// `[ebx + 0x258]` (head slot).
+    pub head: Option<BoundSlot>,
+    /// `[ebx + 0x25c][0]` (primary body slot).
+    pub body: Option<BoundSlot>,
+    /// `[ebx + 0x25c][1]` (secondary body slot, e.g. workwear hat/prop).
+    pub body_alt: Option<BoundSlot>,
+    /// `[ebx + 0x268][0]` (left hand / extra slot).
+    pub extra_left: Option<BoundSlot>,
+    /// `[ebx + 0x268][1]` (right hand / extra slot).
+    pub extra_right: Option<BoundSlot>,
+    /// `[ebx + 0x1b0..0x1bc]` (`data[8], data[21], data[22], data[23]`),
+    /// initialized to `[-1, -1, -1, -1]` in `cTSPerson::cTSPerson` (`0x587dfa`).
+    pub last_dressed: [i32; 4],
+}
+
+impl PersonOutfit {
+    /// Freshly constructed `cTSPerson` attachment state (`0x587dfa`): all slots
+    /// unbound and cached suit/variant/hand words at `-1`.
+    pub const fn new() -> Self {
+        Self {
+            head: None,
+            body: None,
+            body_alt: None,
+            extra_left: None,
+            extra_right: None,
+            last_dressed: [-1; 4],
+        }
+    }
+}
+
+impl Default for PersonOutfit {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Which IFF file holds a portrait bitmap persisted by `0x4e9000`.
@@ -641,6 +698,7 @@ impl World {
             loaded_indexed_skeletons: BTreeMap::new(),
             loaded_indexed_suits: BTreeMap::new(),
             made_outfits: BTreeMap::new(),
+            person_outfits: BTreeMap::new(),
         }
     }
 

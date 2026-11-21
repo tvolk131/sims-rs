@@ -2216,7 +2216,8 @@ fn live_appearance_and_runtime_indexed_skeleton_load_order() {
     );
     assert!(fx.world.portraits.contains(&SIM_GUID));
 
-    // Unmodeled costume (data[8] = 10) fails loudly instead of silently diverging.
+    // Party costume (data[8] = 10, luau via `0x45f452`) dresses via the
+    // generated costume table without trapping.
     fx.world.portraits.remove(&SIM_GUID);
     fx.world.generated_portrait_2002.clear();
     fx.world
@@ -2227,10 +2228,18 @@ fn live_appearance_and_runtime_indexed_skeleton_load_order() {
         .as_mut()
         .unwrap()
         .data[8] = 10;
-    let res = run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_rec, 1);
-    assert!(matches!(trap(res), Trap::Unsupported(ref m) if m.contains("0x58a178")));
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_rec, 1),
+        Ok(true)
+    );
+    assert!(
+        fx.world.portraits.contains(&SIM_GUID),
+        "luau costume falls back to everyday_head_body when no ct-luau suit is registered"
+    );
 
     // Skeleton lacking a "HEAD" bone cannot render (`0x595699`).
+    fx.world.portraits.remove(&SIM_GUID);
+    fx.world.generated_portrait_2002.clear();
     fx.world
         .objects
         .get_mut(&SIM)
@@ -3198,9 +3207,10 @@ fn round_16_unified_bcf_lazy_loads_dress_time_accessories_pet_reset_formal_extra
             "0x58a73e -> 0x58d742 must bind row 28 when row 30 is empty and both rows 28 & 29 are non-empty"
         );
 
-        // Removing row 29 makes `0x58d72e` skip BOTH rows 28 and 29!
+        // Removing row 29 on a freshly dressed Sim makes `0x58d72e` skip BOTH rows 28 and 29!
         fx.world.portraits.remove(&SIM_GUID);
         fx.world.generated_portrait_2002.clear();
+        fx.world.person_outfits.clear();
         fx.program
             .people
             .profiles
@@ -3474,16 +3484,35 @@ fn round_17_appearance_bcf_rng_missing_outfit_retention_hand_extras_dirty_clear_
                 ..Default::default()
             },
         );
-        let person = fx
-            .world
+        // First dress everyday (suit 0) so `everyday_head_body` is actually
+        // bound in `person_outfits`, then switch to `missing_swim_suit` (suit 2):
+        // 0x583576 miss must keep `everyday_head_body` attached.
+        {
+            let person = fx
+                .world
+                .objects
+                .get_mut(&SIM)
+                .unwrap()
+                .person
+                .as_mut()
+                .unwrap();
+            person.data[65] = 0;
+            person.data[8] = 0;
+        }
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
+            Ok(true)
+        );
+        fx.world.portraits.remove(&SIM_GUID);
+        fx.world.generated_portrait_2002.clear();
+        fx.world
             .objects
             .get_mut(&SIM)
             .unwrap()
             .person
             .as_mut()
-            .unwrap();
-        person.data[65] = 0;
-        person.data[8] = 2; // swim suit -> missing_swim_suit misses at 0x583576
+            .unwrap()
+            .data[8] = 2; // swim suit -> missing_swim_suit misses at 0x583576
         assert_eq!(
             run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
             Ok(true)
@@ -3581,7 +3610,8 @@ fn round_17_appearance_bcf_rng_missing_outfit_retention_hand_extras_dirty_clear_
             "0x58a453..0x58a675 must bind words 22/23 hand rows even on everyday suit 0"
         );
 
-        // Workwear (suit 3) traps when `.ndx` suits exist even with HEAD on head row.
+        // Workwear (suit 3, `0x45ee5f`) resolves cleanly even when unrelated
+        // `.ndx` suits exist, without trapping.
         fx.world.portraits.remove(&SIM_GUID);
         fx.world.generated_portrait_2002.clear();
         fx.program
@@ -3602,7 +3632,11 @@ fn round_17_appearance_bcf_rng_missing_outfit_retention_hand_extras_dirty_clear_
             .as_mut()
             .unwrap()
             .data[8] = 3;
-        assert!(run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1).is_err());
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
+            Ok(true)
+        );
+        assert!(fx.world.portraits.contains(&SIM_GUID));
     }
 
     // 4. P2 #5: Dressing an unbound head slot (`0x58d4e1` -> `0x4eb0cc` ->
@@ -3805,5 +3839,521 @@ fn round_17_appearance_bcf_rng_missing_outfit_retention_hand_extras_dirty_clear_
         // Draws (32 per wiggle scale): alpha.bcf file skeletons (1 + 2 = 3) +
         // person 1 own alpha (1) + person 2 own beta from alpha.bcf (2) = 6 * 32 = 192.
         assert_eq!(read.draws, 192);
+    }
+}
+
+#[test]
+fn round_18_reopen_bcf_rng_missing_file_saved_read_frame_draw_live_slots_head_dirty_costumes_and_none()
+ {
+    use sims_content::Profile;
+
+    // 1. P2 #1: Reopening a lazy `.bcf` via a second unresolved `.ndx` entry
+    // draws every skeleton in that `.bcf` AGAIN (`0x59e70a -> 0x59f107`),
+    // including duplicate skeleton entries.
+    {
+        let (mut fx, _, _) = visitors();
+        fx.words(SIM_FILE)[102] = 0;
+        fx.world.neighbors.slots.push(Some(Neighbor {
+            guid: SIM_GUID,
+            id: 2,
+            data: vec![0; 88],
+            relationships: Vec::new(),
+            friends: 0,
+            revision: 0,
+            stale: false,
+        }));
+        let sim_record = fx.world.neighbors.slots.len() as i16;
+        let dup_a = sims_content::Skeleton {
+            name: "dup".into(),
+            file: "shared.bcf".into(),
+            place: 0,
+            scales: vec![vec![1], vec![1]],
+            bones: Vec::new(),
+        };
+        let dup_b = sims_content::Skeleton {
+            name: "dup".into(),
+            file: "shared.bcf".into(),
+            place: 1,
+            scales: vec![vec![1], vec![1]],
+            bones: Vec::new(),
+        };
+        fx.program
+            .people
+            .indexed_catalogs
+            .insert("shared.bcf".into(), (vec![dup_a, dup_b], None));
+        fx.program
+            .people
+            .indexed_suit_catalogs
+            .insert("shared.bcf".into(), (BTreeMap::new(), None));
+        fx.program
+            .people
+            .indexed_suits
+            .insert("miss_one".into(), Ok("shared.bcf".into()));
+        fx.program
+            .people
+            .indexed_suits
+            .insert("miss_two".into(), Ok("shared.bcf".into()));
+        fx.program.people.profiles.insert(
+            SIM_GUID,
+            Profile {
+                body: Some("miss_one,BODY=a".into()),
+                head: Some("miss_two,HEAD-HEAD=b".into()),
+                ..Default::default()
+            },
+        );
+        let p = fx
+            .world
+            .objects
+            .get_mut(&SIM)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap();
+        p.data[65] = 0;
+        p.data[8] = 0;
+        let mut expected_rng = fx.world.crt_rng;
+        // Two opens of `shared.bcf`, each drawing 2 skeletons * 32 = 64 draws -> 128 total.
+        for _ in 0..128 {
+            let _ = expected_rng.next_u15();
+        }
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
+            Ok(true)
+        );
+        assert_eq!(
+            fx.world.crt_rng, expected_rng,
+            "reopening shared.bcf for miss_two must draw both duplicate skeletons again"
+        );
+    }
+
+    // 2. P2 #2: Indexed appearance pointing to a missing file (`0x5a392f ->
+    // 0x5a3965`) is a definite miss (retaining previous outfit) even when an
+    // unrelated catalog populated `suit_errors`.
+    {
+        let (mut fx, _, _) = visitors();
+        fx.words(SIM_FILE)[102] = 0;
+        fx.world.neighbors.slots.push(Some(Neighbor {
+            guid: SIM_GUID,
+            id: 2,
+            data: vec![0; 88],
+            relationships: Vec::new(),
+            friends: 0,
+            revision: 0,
+            stale: false,
+        }));
+        let sim_record = fx.world.neighbors.slots.len() as i16;
+        fx.program.people.eager_suits.insert("everyday_head".into());
+        fx.program.people.head_suits.insert("everyday_head".into());
+        fx.program
+            .people
+            .indexed_suits
+            .insert("missing_file_swim".into(), Err("missing file".into()));
+        fx.program
+            .people
+            .suit_errors
+            .insert("unrelated.bcf".into(), "unrelated corrupt catalog".into());
+        fx.program.people.profiles.insert(
+            SIM_GUID,
+            Profile {
+                body: Some("everyday_head,BODY=e".into()),
+                head: None,
+                suit_rows: BTreeMap::from([(16, "missing_file_swim,BODY=s".into())]),
+                ..Default::default()
+            },
+        );
+        {
+            let p = fx
+                .world
+                .objects
+                .get_mut(&SIM)
+                .unwrap()
+                .person
+                .as_mut()
+                .unwrap();
+            p.data[65] = 0;
+            p.data[8] = 0;
+        }
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
+            Ok(true)
+        );
+        fx.world.portraits.remove(&SIM_GUID);
+        fx.world.generated_portrait_2002.clear();
+        fx.world
+            .objects
+            .get_mut(&SIM)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap()
+            .data[8] = 2;
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
+            Ok(true)
+        );
+        assert!(
+            fx.world.portraits.contains(&SIM_GUID),
+            "missing indexed catalog file must be a definite miss, retaining everyday_head"
+        );
+    }
+
+    // 3. P2 #3: Saved-house read binds `appearance[0..10]` and `accessories`
+    // in pass 2 (after construction), triggers lazy `.ndx` `.bcf` RNG draws,
+    // and marks portrait dirty (`0x591b53 -> 0x4eb0eb`) for non-empty saved head.
+    {
+        let (mut fx, _, _) = visitors();
+        fx.words(SIM_FILE)[102] = 0;
+        let saved_skel = sims_content::Skeleton {
+            name: "adult".into(),
+            file: "adult.bcf".into(),
+            place: 0,
+            scales: vec![vec![1]],
+            bones: Vec::new(),
+        };
+        let app_skel = sims_content::Skeleton {
+            name: "acc_skel".into(),
+            file: "saved_app.bcf".into(),
+            place: 0,
+            scales: vec![vec![1]],
+            bones: Vec::new(),
+        };
+        fx.program
+            .people
+            .skeletons_by_name
+            .insert("adult".into(), saved_skel);
+        fx.program
+            .people
+            .skeleton_names
+            .insert(SIM_GUID, "adult".into());
+        fx.program
+            .people
+            .indexed_catalogs
+            .insert("saved_app.bcf".into(), (vec![app_skel], None));
+        fx.program.people.indexed_suit_catalogs.insert(
+            "saved_app.bcf".into(),
+            (BTreeMap::from([("saved_body".into(), true)]), None),
+        );
+        fx.program
+            .people
+            .indexed_suits
+            .insert("saved_body".into(), Ok("saved_app.bcf".into()));
+        fx.program.people.eager_suits.insert("saved_head".into());
+        fx.program.people.head_suits.insert("saved_head".into());
+
+        let mut p = person();
+        p.appearance[0] = "saved_body".into();
+        p.appearance[1] = "BODY=x".into();
+        p.appearance[8] = "saved_head".into();
+        p.appearance[9] = "HEAD-HEAD=h".into();
+        let inst = sims_formats::saved_objects::Instance {
+            id: 1,
+            type_id: 0,
+            guid: SIM_GUID,
+            footprint: [0; 4],
+            position: [0; 3],
+            unknown_short: 0,
+            attributes: Vec::new(),
+            temps: vec![0; 8],
+            data: vec![0; 72],
+            obsolete_word: 0,
+            stack_capacity_bytes: 0,
+            stack: Vec::new(),
+            relationship_flag: 0,
+            relationships: Vec::new(),
+            slots: vec![sims_formats::saved_objects::Slot {
+                unknown: 0,
+                object: 0,
+            }],
+            dynamic_sprites: Vec::new(),
+            multipart: None,
+            portal: None,
+            person: Some(p),
+            registry_word: Some(0),
+            consumed_bits: 0,
+            record: Vec::new(),
+        };
+        let saved = sims_formats::saved_objects::Objects {
+            version: 0x47,
+            order: vec![1],
+            types_by_id: BTreeMap::new(),
+            instances: BTreeMap::from([(1, inst)]),
+            tail: Vec::new(),
+        };
+        let mut world = sims_sim::World::empty();
+        world.neighbors.slots.push(Some(Neighbor {
+            guid: SIM_GUID,
+            id: 1,
+            data: vec![20; 88],
+            relationships: Vec::new(),
+            friends: 0,
+            revision: 1,
+            stale: false,
+        }));
+        let read = fx
+            .interpreter()
+            .read_objects(&mut world, &saved, &fx.program.people)
+            .expect("saved read");
+        assert!(world.loaded_indexed_suits.contains_key("saved_body"));
+        assert!(world.dirty_portraits.contains(&SIM_GUID));
+        // adult.bcf file (32) + own adult (32) + saved_app.bcf skeleton (32) = 96.
+        assert_eq!(read.draws, 96);
+        assert_eq!(
+            world.person_outfits[&1]
+                .head
+                .as_ref()
+                .map(|b| b.suit.as_str()),
+            Some("saved_head")
+        );
+    }
+
+    // 4. P2 #5 & #6 & P3 #1:
+    // - `0x583576` retains a PREVIOUS CHANGED OUTFIT (everyday non-HEAD ->
+    //   formal HEAD -> missing swim keeps formal HEAD).
+    // - NPC `def_flags & 8` with `raw_suit <= 0` does NOT count an unattached
+    //   globally registered suit as worn.
+    // - Changing a bound head descriptor runs `0x58d518 -> 0x4eb0eb` (marks
+    //   dirty & clears cache).
+    // - Literal `"none"` appearance is NOT skipped when registered (`0x583569`).
+    {
+        let (mut fx, _, _) = visitors();
+        fx.words(SIM_FILE)[102] = 0;
+        fx.world.neighbors.slots.push(Some(Neighbor {
+            guid: SIM_GUID,
+            id: 2,
+            data: vec![0; 88],
+            relationships: Vec::new(),
+            friends: 0,
+            revision: 0,
+            stale: false,
+        }));
+        let sim_record = fx.world.neighbors.slots.len() as i16;
+        fx.program.people.eager_suits.insert("plain_ev".into());
+        fx.program.people.eager_suits.insert("formal_head".into());
+        fx.program.people.head_suits.insert("formal_head".into());
+        fx.program.people.eager_suits.insert("head_a".into());
+        fx.program.people.eager_suits.insert("head_b".into());
+        fx.program.people.eager_suits.insert("none".into());
+        fx.program.people.head_suits.insert("none".into());
+        fx.program.people.profiles.insert(
+            SIM_GUID,
+            Profile {
+                body: Some("plain_ev,BODY=e".into()),
+                head: Some("head_a,HEAD-HEAD=a".into()),
+                age: Some("27".into()),
+                suit_rows: BTreeMap::from([
+                    (30, "formal_head,BODY=f".into()),
+                    (16, "missing_swim,BODY=s".into()),
+                ]),
+                ..Default::default()
+            },
+        );
+        {
+            let p = fx
+                .world
+                .objects
+                .get_mut(&SIM)
+                .unwrap()
+                .person
+                .as_mut()
+                .unwrap();
+            p.data[65] = 0;
+            p.data[8] = 4; // dress into formal_head first
+        }
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
+            Ok(true)
+        );
+        assert!(fx.world.portraits.contains(&SIM_GUID));
+
+        // Now switch to missing swim (suit 2): `formal_head` must stay attached!
+        fx.world.portraits.remove(&SIM_GUID);
+        fx.world.generated_portrait_2002.clear();
+        fx.world
+            .objects
+            .get_mut(&SIM)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap()
+            .data[8] = 2;
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
+            Ok(true)
+        );
+        assert!(
+            fx.world.portraits.contains(&SIM_GUID),
+            "0x583576 must retain previous changed outfit (formal_head), not fall back to plain_ev"
+        );
+
+        // P2 #6: Change head descriptor to `head_b` (which has NO HEAD binding)
+        // and draw a frame (`0x590cb8 -> 0x58a178(0)`): `0x58d518 -> 0x4eb0eb`
+        // must invalidate `portraits` and set `dirty_portraits`!
+        fx.program.people.profiles.get_mut(&SIM_GUID).unwrap().head =
+            Some("head_b,HEAD-HEAD=b".into());
+        fx.world
+            .objects
+            .get_mut(&SIM)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap()
+            .data[8] = 0; // trigger dress on non-forced frame draw
+        fx.world.objects.get_mut(&SIM).unwrap().position = [32, 32, 0];
+        fx.world.size = 16;
+        sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream)
+            .draw_frame(&mut fx.world, 0)
+            .expect("draw_frame");
+        assert!(
+            !fx.world.portraits.contains(&SIM_GUID) && fx.world.dirty_portraits.contains(&SIM_GUID),
+            "0x590cb8 -> 0x58d518 -> 0x4eb0eb must clear portrait and mark dirty on changed head"
+        );
+
+        // P3 #1: Literal `"none"` appearance registered in `head_suits` binds!
+        fx.world.portraits.remove(&SIM_GUID);
+        fx.world.dirty_portraits.remove(&SIM_GUID);
+        fx.program.people.profiles.get_mut(&SIM_GUID).unwrap().head =
+            Some("none,HEAD-HEAD=n".into());
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
+            Ok(true)
+        );
+        assert!(
+            fx.world.portraits.contains(&SIM_GUID),
+            "0x583569 must pass literal \"none\" to 0x5a044d instead of skipping it"
+        );
+
+        // P2 #5 NPC: `def_flags & 8` with `raw_suit <= 0` and empty slots must
+        // NOT count a globally registered profile suit as worn.
+        let (mut fx, _, _) = visitors();
+        fx.words(SIM_FILE)[102] = 8;
+        fx.world.neighbors.slots.push(Some(Neighbor {
+            guid: SIM_GUID,
+            id: 2,
+            data: vec![0; 88],
+            relationships: Vec::new(),
+            friends: 0,
+            revision: 0,
+            stale: false,
+        }));
+        let sim_record = fx.world.neighbors.slots.len() as i16;
+        fx.program.people.eager_suits.insert("global_head".into());
+        fx.program.people.head_suits.insert("global_head".into());
+        fx.program.people.profiles.insert(
+            SIM_GUID,
+            Profile {
+                body: Some("global_head,BODY=g".into()),
+                head: None,
+                ..Default::default()
+            },
+        );
+        fx.world
+            .objects
+            .get_mut(&SIM)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap()
+            .data[8] = 0;
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
+            Ok(true)
+        );
+        assert!(
+            !fx.world.portraits.contains(&SIM_GUID),
+            "0x58a1f8 NPC with raw_suit <= 0 and no bound slots must not count unattached global_head"
+        );
+    }
+
+    // 5. P2 #7: Generated matched pajamas (suit 5, `0x45f034`), skeleton (suit 6,
+    // `0x45f15a`), and Makin' Magic costume (suit 57 donkey head) bind cleanly.
+    {
+        let (mut fx, _, _) = visitors();
+        fx.words(SIM_FILE)[102] = 0;
+        fx.world.neighbors.slots.push(Some(Neighbor {
+            guid: SIM_GUID,
+            id: 2,
+            data: vec![0; 88],
+            relationships: Vec::new(),
+            friends: 0,
+            revision: 0,
+            stale: false,
+        }));
+        let sim_record = fx.world.neighbors.slots.len() as i16;
+        fx.program.people.eager_suits.insert("pajamaffit_01".into());
+        fx.program.people.head_suits.insert("pajamaffit_01".into());
+        fx.program
+            .people
+            .eager_suits
+            .insert("cmagicmafat_donkey_01".into());
+        fx.program
+            .people
+            .head_suits
+            .insert("cmagicmafat_donkey_01".into());
+        fx.program.people.profiles.insert(
+            SIM_GUID,
+            Profile {
+                body: Some("b001fafit_01,BODY=b".into()),
+                head: None,
+                gender: Some("female".into()),
+                ..Default::default()
+            },
+        );
+        {
+            let p = fx
+                .world
+                .objects
+                .get_mut(&SIM)
+                .unwrap()
+                .person
+                .as_mut()
+                .unwrap();
+            p.data[65] = 1;
+            p.data[58] = 27;
+            p.data[8] = 5; // matched pajamas (empty row 32 -> 0x45f034)
+        }
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
+            Ok(true)
+        );
+        assert!(fx.world.portraits.contains(&SIM_GUID));
+
+        fx.world.portraits.remove(&SIM_GUID);
+        fx.world.generated_portrait_2002.clear();
+        fx.world.person_outfits.clear();
+        fx.world
+            .objects
+            .get_mut(&SIM)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap()
+            .data[8] = 57; // donkey head
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
+            Ok(true)
+        );
+        assert!(fx.world.portraits.contains(&SIM_GUID));
+    }
+
+    // 6. P3 #2: Shared placement error from UI Effect labels
+    // "UI Effect's portrait" instead of "a dialog's portrait".
+    {
+        let (mut fx, file, record) = visitors();
+        fx.add(
+            file,
+            4096,
+            tree(vec![
+                assign(scope::MY_DATA, 4, scope::LITERAL, 1, 1),
+                assign(scope::MY_DATA, 42, scope::LITERAL, 2, 2),
+                assign(scope::MY_DATA, 40, scope::LITERAL, 0x400, RETURN_TRUE),
+            ]),
+        );
+        let err = run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("UI Effect's portrait") && !err.contains("a dialog's portrait"),
+            "expected UI Effect label in placement diagnostic, got: {err}"
+        );
     }
 }

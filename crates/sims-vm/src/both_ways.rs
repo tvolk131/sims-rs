@@ -230,6 +230,7 @@ pub(crate) fn same_lot(a: &World, b: &World) -> bool {
         && a.loaded_indexed_skeletons == b.loaded_indexed_skeletons
         && a.loaded_indexed_suits == b.loaded_indexed_suits
         && a.made_outfits == b.made_outfits
+        && a.person_outfits == b.person_outfits
 }
 
 impl<'a> Machine<'a, '_> {

@@ -1331,12 +1331,17 @@ impl Interpreter<'_> {
     /// view centre is given), and `Err` when placement depends on an unmodeled
     /// detail or an unknown view centre where some starts find a tile and
     /// others do not.
-    pub(crate) fn portrait_put_outcome(&self, world: &mut World, id: u16) -> Result<bool, Fault> {
+    pub(crate) fn portrait_put_outcome(
+        &self,
+        world: &mut World,
+        id: u16,
+        caller: &str,
+    ) -> Result<bool, Fault> {
         let fail = |what: String| Fault {
             object: id,
             at: None,
             trap: Trap::Unsupported(format!(
-                "a dialog's portrait puts a person on a tile searched for from the house view's \
+                "{caller} puts a person on a tile searched for from the house view's \
                  centre (0x4e96dd, 0x4347f0, 0x4a677c; `Lot::set_view_centre`), and {what}"
             )),
         };

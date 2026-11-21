@@ -421,64 +421,10 @@ impl Interpreter<'_> {
                 person.data[word] = value;
             }
         }
-        // 0x5888d3 -> 0x588914..0x588930 -> 0x58a178(0): non-NPC definitions
-        // (`(words[102] & 8) == 0`) run initial everyday dressing with
-        // `data[22] = 0, data[23] = 0` AFTER `default_traits_if_low` and BEFORE
-        // `reload_profile` (`0x588935`). Because the newly created person's
-        // head slot `[ebx + 0x258]` is null, `0x58d4e1 -> 0x4eb0cc -> 0x4e897e`
-        // clears cached bitmaps and dirty flags for `guid`, and `0x58d606`
-        // (row 2) -> `0x58d67e` (row 1) -> `0x58d742`/`0x58d759` (paired rows
-        // 17 & 18) open any `.ndx`-indexed `.bcf` catalogs in order (drawing
-        // any catalog skeletons' CRT RNG via `0x59f107 -> 0x598af7`).
-        if (words[102] & 8) == 0 {
-            world.portraits.remove(&guid);
-            world.dirty_portraits.remove(&guid);
-            if !self.program.people.indexed_suits.is_empty() {
-                let template = world.characters.definition(guid);
-                let prof = self.program.people.profiles.get(&template);
-                let made = world.characters.made.get(&guid).cloned();
-                let made_outfit = world.made_outfits.get(&guid).cloned();
-                let row = |idx: usize| -> Option<String> {
-                    made.as_ref()
-                        .and_then(|m| m.strings.get(&idx).cloned())
-                        .or_else(|| made_outfit.as_ref().and_then(|o| o.get(&idx).cloned()))
-                        .or_else(|| match idx {
-                            1 => prof.and_then(|p| p.body.clone()),
-                            2 => prof.and_then(|p| p.head.clone()),
-                            n => prof.and_then(|p| p.suit_rows.get(&n).cloned()),
-                        })
-                };
-                let suit_of = |s: &str| {
-                    s.split(';')
-                        .next()
-                        .unwrap_or(s)
-                        .split(',')
-                        .next()
-                        .unwrap_or(s)
-                        .to_ascii_lowercase()
-                };
-                for idx in [2usize, 1] {
-                    if let Some(r) = row(idx) {
-                        let suit = suit_of(&r);
-                        if !suit.is_empty() && suit != "none" {
-                            let _ = crate::people::resolve_suit(&self.program.people, world, &suit);
-                        }
-                    }
-                }
-                if let (Some(l), Some(r)) = (row(17), row(18)) {
-                    let sl = suit_of(&l);
-                    let sr = suit_of(&r);
-                    if !sl.is_empty() && !sr.is_empty() {
-                        if sl != "none" {
-                            let _ = crate::people::resolve_suit(&self.program.people, world, &sl);
-                        }
-                        if sr != "none" {
-                            let _ = crate::people::resolve_suit(&self.program.people, world, &sr);
-                        }
-                    }
-                }
-            }
-        }
+        // 0x5888d3 -> 0x588914..0x588930 -> 0x58a178(0): run initial everyday
+        // dressing with `data[22] = 0, data[23] = 0` AFTER
+        // `default_traits_if_low` and BEFORE `reload_profile` (`0x588935`).
+        crate::outfits::dress_person(self.catalog, self.program, world, id, false).map_err(fail)?;
         // Looked up before the person is borrowed; a missing profile still
         // fails where it is read.
         let profile = crate::people::profile(&self.program.people, world, guid).map_err(fail)?;
