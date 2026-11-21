@@ -499,10 +499,18 @@ fn starting_a_held_track_needs_no_free_thread() {
 }
 
 #[test]
-fn a_held_track_with_no_script_left_starts_anew() {
-    // A note alone holds the track: its thread has ended (note_on, end).
-    let note_only: &[u8] = &[2, 5, END];
-    let mut player = Player::new(vec![module(&[note_only], 1)], samples(), 1);
+fn a_held_fading_track_started_again_resumes_and_cancels_its_fade() {
+    // `note_on v1; end` followed by `loadl 5, 1000; wait 5`: `end` while
+    // the note plays starts a fade-out at speed 100 and keeps the track
+    // running (0x57e3ee → 0x57edc8 → 0x57dca3). Pausing holds it;
+    // starting it again while paused clears both the hold and the fade
+    // (0x57d9b2..0x57da12) and resumes the single note without starting
+    // a second one.
+    let note_and_end: &[u8] = &[2, 5, END];
+    let mut hold_pc = vec![SET_LOOP];
+    hold_pc.extend(loadl(5, 1000));
+    hold_pc.extend([WAIT, 5, LOOP]);
+    let mut player = Player::new(vec![module(&[note_and_end, &hold_pc], 1)], samples(), 1);
     play(&mut player, "e0");
     assert_eq!(
         player.render(10, &NoSources),
@@ -510,17 +518,9 @@ fn a_held_track_with_no_script_left_starts_anew() {
     );
     player.handle(&SoundEvent::Pause, &NoSources);
     assert!(player.render(10, &NoSources).iter().all(|&s| s == 0));
-    // Starting it clears the hold, so the old note goes on at once, and
-    // a new thread starts a second note at the next block (frame 64).
     play(&mut player, "e0");
     let out = player.render(50, &NoSources);
-    let expected: Vec<i16> = (0..50)
-        .map(|i| {
-            let new = if 20 + i >= 64 { 20 + i - 63 } else { 0 };
-            (11 + i) + new
-        })
-        .collect();
-    assert_eq!(out, expected);
+    assert_eq!(out, (11..=60).collect::<Vec<i16>>());
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
 
@@ -1120,14 +1120,19 @@ fn a_ducking_request_goes_as_soon_as_its_thread_ends() {
 }
 
 #[test]
-fn a_thread_s_last_writes_reach_its_notes_when_it_ends() {
-    // note_on, then vol 0, then end: the note plays on, silent.
+fn a_thread_s_last_writes_reach_its_notes_when_it_fades_at_end() {
+    // `note_on`, then `vol 0`, then `end` (followed by an explicit wait):
+    // the track stays running while fading out (0x57dca3), and `vol 0`
+    // silences its note immediately without faulting.
     let mut routine = NOTE_ON_V1.to_vec();
     routine.extend(loadl(18, 0));
     routine.push(END);
-    let mut player = Player::new(vec![module(&[&routine], 1)], loud(4), 1);
+    let mut hold_pc = loadl(5, 1000);
+    hold_pc.extend([WAIT, 5]);
+    let mut player = Player::new(vec![module(&[&routine, &hold_pc], 1)], loud(4), 1);
     play(&mut player, "e0");
     assert_eq!(player.render(2, &NoSources), [0, 0]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
 
 #[test]
@@ -1915,24 +1920,35 @@ fn a_mp3_too_long_once_resampled_is_a_fault() {
 }
 
 #[test]
-fn an_object_that_goes_stops_notes_its_ended_threads_left() {
-    // e0 starts a note and ends; the note plays on without its thread.
+fn an_object_that_goes_fades_a_track_still_running_after_end() {
+    // e0 plays a note and reaches `end`, then runs on into a wait loop
+    // while fading out (0x57e3ee → 0x57dca3). Object 2 playing it
+    // refreshes the running track and cancels the fade (0x57d9b2) with
+    // one voice still playing; object 1 going leaves object 2 playing;
+    // object 2 going fades it out over 11 blocks and stops it.
     let routine: &[u8] = &[2, 5, END];
-    let module = module_with(&[routine], 1, 10, "");
-    let mut player = Player::new(vec![module], loud(10 * BLOCK), 1);
+    let mut hold_pc = vec![SET_LOOP];
+    hold_pc.extend(loadl(5, 1000));
+    hold_pc.extend([WAIT, 5, LOOP]);
+    let module = module_with(&[routine, &hold_pc], 1, 10, "");
+    let mut player = Player::new(vec![module], loud(30 * BLOCK), 1);
     play_for(&mut player, 1, "e0");
     player.render(BLOCK, &NoSources);
-    // The track still plays, so object 1 stays its instance when object
-    // 2 plays it too. No thread of it runs, so that play starts it anew.
     play_for(&mut player, 2, "e0");
     player.render(BLOCK, &NoSources);
-    assert_eq!(player.render(1, &NoSources), [20_000]);
-    // Object 2 still has the track, so both notes play on.
+    assert_eq!(player.render(1, &NoSources), [10_000]);
+    // Object 2 still has the track, so it keeps playing at full volume.
     player.handle(&SoundEvent::StopObject { object: 1 }, &NoSources);
-    assert_eq!(player.render(1, &NoSources), [20_000]);
-    // The last object going stops them, having no thread to fade them.
+    player.render(2 * BLOCK, &NoSources);
+    assert_eq!(player.render(1, &NoSources), [10_000]);
+    // The last object going fades it out at speed 100 and ends it.
     player.handle(&SoundEvent::StopObject { object: 2 }, &NoSources);
+    player.render(2 * BLOCK, &NoSources);
+    let fading = player.render(1, &NoSources)[0];
+    assert!(fading > 0 && fading < 10_000, "{fading}");
+    player.render(10 * BLOCK, &NoSources);
     assert!(player.is_idle());
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
 
 #[test]
@@ -2149,7 +2165,7 @@ fn the_placement_s_pan_sets_the_comparison_flags_when_the_event_comes() {
     branches.extend(long(1000));
     branches.extend([WAIT, 5, IFLE]);
     branches.extend(long(0x101));
-    branches.extend([72, 6, 1, 2, END]); // getsrcdatafield v2, arg1, arg2
+    branches.extend([72, 6, 1, 2, WAIT_SAMP, END]); // getsrcdatafield v2, arg1, arg2
     let silent: &[u8] = &[END];
     for (x, sequenced, asks) in [
         (400, false, true),
@@ -2234,18 +2250,20 @@ fn a_camera_move_leaves_a_track_that_has_ended() {
 }
 
 #[test]
-fn a_camera_move_places_a_note_that_outlived_its_script() {
-    // `note_on; end`: the thread ends at once and its long note plays
-    // on. The original's track object outlives the script, and kind 33's
-    // write reaches the note it plays: started in the middle of the
-    // screen, it is level both sides; once the camera has moved and the
-    // object is at the right edge, it is louder on the right.
+fn a_camera_move_places_a_note_fading_after_end() {
+    // `note_on; end` (followed by an explicit wait): the track stays
+    // running while fading out at speed 100 (0x57e3ee → 0x57dca3), and
+    // kind 33's write reaches its fading note: started in the middle of
+    // the screen, it is level both sides; once the camera has moved and
+    // the object is at the right edge, it is louder on the right.
     let routine: &[u8] = &[2, 5, END];
+    let mut hold_pc = loadl(5, 1000);
+    hold_pc.extend([WAIT, 5]);
     let long = long_sample("one.xa");
     let start = on_lot(&[(9, 400)]);
     let right = on_lot(&[(9, 800)]);
     for moved in [true, false] {
-        let mut player = Player::new(vec![module(&[routine], 1)], long.clone(), 1);
+        let mut player = Player::new(vec![module(&[routine, &hold_pc], 1)], long.clone(), 1);
         play_on(&mut player, 9, &start);
         let out = player.render_stereo(2 * BLOCK, &start);
         let last = out.len() - 2;
@@ -2278,30 +2296,28 @@ fn long_sample(name: &str) -> BTreeMap<String, Pcm> {
 #[test]
 fn a_camera_move_does_not_follow_a_target_a_later_start_reset() {
     // Track 10's first start sets its `target` to track 11; global 110
-    // marks it, and its second start sees the mark and goes to routine
-    // 2, its `target` itself, as a fresh start leaves the original's
-    // track object. Track 11 waits 10 ms for object 8, which does not
-    // move, then asks with its extvol and pan. Whichever of track 10's
-    // threads still runs or plays, the camera move places the older one
-    // itself: track 11 keeps the full volume and the centre its own
-    // start gave it. Cases (Sol's reviews):
-    // - the first plays a long note and ends; the second waits;
-    // - the first plays a long note and ends; the second ends at once;
-    // - the first waits; the second plays a long note and ends.
-    let mark = |then: &[u8]| {
+    // marks it, and its second start resets `target` back to itself
+    // (0x57d9c3) and runs routine 2 (or refreshes in place). Track 11
+    // waits 10 ms for object 8, which does not move, then asks with its
+    // extvol and pan. The camera move places track 10 itself, so track
+    // 11 keeps the full volume and the centre its own start gave it.
+    let mark = |interrupt: bool, then: &[u8]| {
         let mut first = vec![TEST, 110, IFNE];
         first.extend(long(0x102));
         first.extend(loadl(110, 1));
+        if interrupt {
+            first.extend(loadb(55, 1));
+        }
         first.extend(loadl(53, 11));
         first.extend(then);
         first
     };
-    let note_and_end = [NOTE_ON_V1[0], NOTE_ON_V1[1], END];
     let wait: &[u8] = &[SET_LOOP, LOOP];
+    let note_and_end: &[u8] = &[NOTE_ON_V1[0], NOTE_ON_V1[1], END];
     let cases: [(Vec<u8>, &[u8]); 3] = [
-        (mark(&note_and_end), wait),
-        (mark(&note_and_end), &[END]),
-        (mark(wait), &note_and_end),
+        (mark(true, wait), wait),
+        (mark(false, &[END]), &[END]),
+        (mark(true, wait), note_and_end),
     ];
     let mut asks = loadl(5, 10);
     asks.extend([WAIT, 5]);
@@ -2313,7 +2329,7 @@ fn a_camera_move_does_not_follow_a_target_a_later_start_reset() {
             asked: Default::default(),
         };
         let mut player = Player::new(
-            vec![module(&[first, &asks, second], 1)],
+            vec![module(&[first, &asks, second, wait], 1)],
             long_sample("one.xa"),
             1,
         );
@@ -2339,24 +2355,27 @@ fn a_camera_move_does_not_follow_a_target_a_later_start_reset() {
 }
 
 #[test]
-fn a_camera_move_reaches_a_target_whose_script_has_ended() {
+fn a_camera_move_reaches_a_target_fading_after_end() {
     // Track 11 (object 8, which stays in the middle) plays a long note,
-    // waits and ends while the note plays on. Track 10 (object 9) starts
-    // while it waits, sets its `target` to track 11 and loops. The camera
-    // move places track 11 itself, then track 10's write goes through its
-    // `target` to track 11's track object, which outlives its script:
-    // with object 9 at the right edge, the note turns right (Sol's
-    // review).
-    let mut ended = NOTE_ON_V1.to_vec();
-    ended.extend(loadl(5, 10));
-    ended.extend([WAIT, 5, END]);
+    // waits and reaches `end` (running on into `set_loop; loop` while
+    // fading out at speed 100, 0x57dca3). Track 10 (object 9) starts
+    // while it waits, sets its `target` to track 11 and loops. While
+    // track 11 is still running and fading, the camera move writes
+    // through track 10's `target` to track 11: with object 9 at the
+    // right edge, the note turns right.
+    let mut fading = NOTE_ON_V1.to_vec();
+    fading.extend(loadl(5, 10));
+    fading.extend([WAIT, 5, END]);
     let mut targets = loadl(53, 11);
-    targets.extend([SET_LOOP, LOOP]);
+    targets.extend(loadl(5, 1000));
+    targets.extend([WAIT, 5]);
+    let mut hold_pc = loadl(5, 1000);
+    hold_pc.extend([WAIT, 5]);
     let start = on_lot(&[(8, 400), (9, 400)]);
     let right = on_lot(&[(8, 400), (9, 800)]);
     for moved in [true, false] {
         let mut player = Player::new(
-            vec![module(&[&targets, &ended], 1)],
+            vec![module(&[&targets, &fading, &hold_pc], 1)],
             long_sample("one.xa"),
             1,
         );
@@ -2388,22 +2407,21 @@ fn a_camera_move_reaches_a_target_whose_script_has_ended() {
 fn a_camera_move_goes_no_further_than_a_thread_whose_track_started_again() {
     // Track 12 (object 7, in the middle) waits 100 ms, then asks with its
     // extvol and pan. Track 11 (object 8) plays a long note, waits, sets
-    // its `target` to track 12 and ends while the note plays on; global
-    // 110 marks it, so its second start only waits. Track 10 (object 9)
-    // starts while track 11 waits, sets its `target` to it and loops.
-    // With object 9 at the right edge, the camera move goes from track 10
-    // to track 11's ended thread and, while that is still the last
-    // start, on to track 12, which turns right. Once track 11 has started
-    // again, its old thread takes the write itself and track 12 keeps
-    // the centre (Sol's review).
-    let mut ended = vec![TEST, 110, IFNE];
-    ended.extend(long(0x103));
-    ended.extend(loadl(110, 1));
-    ended.extend(NOTE_ON_V1);
-    ended.extend(loadl(5, 10));
-    ended.extend([WAIT, 5]);
-    ended.extend(loadl(53, 12));
-    ended.push(END);
+    // its `target` to track 12 and loops; global 110 marks it, so a
+    // second start resets `target` back to itself (0x57d9c3). Track 10
+    // (object 9) starts while track 11 waits, sets its `target` to it
+    // and loops. With object 9 at the right edge, the camera move goes
+    // from track 10 through track 11 to track 12, which turns right.
+    // Once track 11 has been played again, its `target` points back at
+    // itself and track 12 keeps the centre.
+    let mut middle = vec![TEST, 110, IFNE];
+    middle.extend(long(0x103));
+    middle.extend(loadl(110, 1));
+    middle.extend(NOTE_ON_V1);
+    middle.extend(loadl(5, 10));
+    middle.extend([WAIT, 5]);
+    middle.extend(loadl(53, 12));
+    middle.extend([SET_LOOP, LOOP]);
     let mut targets = loadl(53, 11);
     targets.extend([SET_LOOP, LOOP]);
     let mut asks = loadl(5, 100);
@@ -2417,7 +2435,7 @@ fn a_camera_move_goes_no_further_than_a_thread_whose_track_started_again() {
             asked: Default::default(),
         };
         let mut player = Player::new(
-            vec![module(&[&targets, &ended, &asks, wait], 1)],
+            vec![module(&[&targets, &middle, &asks, wait], 1)],
             long_sample("one.xa"),
             1,
         );
@@ -2450,18 +2468,25 @@ fn a_camera_move_goes_no_further_than_a_thread_whose_track_started_again() {
 }
 
 #[test]
-fn a_stop_fades_its_own_note_though_its_target_has_ended() {
-    // Track 11 (object 8) plays a long note, waits and ends while the
-    // note plays on. Track 10 (object 9) plays one too, sets its `target`
-    // to track 11 while it waits, and loops. Stopping object 9 fades
-    // track 10's note: the stop's fade stays with the track it stops,
-    // and does not go on to track 11's lingering note (Sol's review).
-    let mut ended = NOTE_ON_V1.to_vec();
-    ended.extend(loadl(5, 10));
+fn a_stop_with_a_stopped_target_kills_self_next_block_and_camera_leaves_self() {
+    // In 1.91 (0x57e023 → 0x57de57), `target` holds the registered track
+    // object even after that track stops. When track 10 targets stopped
+    // track 11:
+    // 1) A camera move writes to stopped track 11 (not falling back to
+    //    track 10), so track 10 keeps its centered placement.
+    // 2) Stopping object 9 calls 0x57dca3, which sends `fade_on = 1` to
+    //    stopped track 11 (where 0x57e059..0x57e064 clears it to 0) and
+    //    sets `kill_after_fade` locally on track 10 (+0x1cf). Because
+    //    track 10's own `fade_on` is 0, track 10 kills itself on the
+    //    very next update (0x57d86e → 0x57dd3e).
+    let mut ended = loadl(5, 10);
     ended.extend([WAIT, 5, END]);
     let mut targets = NOTE_ON_V1.to_vec();
     targets.extend(loadl(53, 11));
-    targets.extend([SET_LOOP, LOOP]);
+    targets.extend(loadl(5, 1000));
+    targets.extend([WAIT, 5, END]);
+    let start = on_lot(&[(8, 400), (9, 400)]);
+    let right = on_lot(&[(8, 400), (9, 800)]);
     let mut player = Player::new(
         vec![module(&[&targets, &ended], 1)],
         long_sample("one.xa"),
@@ -2473,19 +2498,28 @@ fn a_stop_fades_its_own_note_though_its_target_has_ended() {
                 object,
                 name: name.into(),
             },
-            &NoSources,
+            &start,
         );
     };
     play(&mut player, 8, "e1");
-    player.render(BLOCK, &NoSources);
+    player.render(BLOCK, &start);
     play(&mut player, 9, "e0");
-    player.render(5 * BLOCK, &NoSources);
-    assert_eq!(player.render(1, &NoSources), [20_000]);
-    player.handle(&SoundEvent::StopObject { object: 9 }, &NoSources);
-    player.render(2 * BLOCK, &NoSources);
-    // Two blocks into the fade, track 10's note is still heard.
-    let fading = player.render(1, &NoSources)[0];
-    assert!(fading > 10_000 && fading < 20_000, "{fading}");
+    // Wait until track 11 has ended (10 ms ≈ 4 blocks).
+    player.render(5 * BLOCK, &start);
+    assert_eq!(player.render_stereo(1, &start), [10_000, 10_000]);
+
+    // Camera move routes through target to stopped track 11, leaving
+    // track 10's own note centered at [10_000, 10_000].
+    player.camera_moved(0, u32::MAX, &right);
+    assert_eq!(player.render_stereo(1, &right), [10_000, 10_000]);
+
+    // StopObject sends fade_on=1 to stopped track 11 and sets local
+    // kill_after_fade on track 10; next block kills track 10 at once.
+    player.handle(&SoundEvent::StopObject { object: 9 }, &right);
+    let rest_of_block = BLOCK - (player.frame() % BLOCK as u64) as usize;
+    player.render(rest_of_block, &right);
+    assert!(player.render(BLOCK, &right).iter().all(|&s| s == 0));
+    assert!(player.is_idle());
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
 
@@ -2577,23 +2611,27 @@ fn a_camera_move_follows_a_held_track_let_go_by_a_start() {
 #[test]
 fn a_camera_move_reads_spl_where_it_writes() {
     // Track 11 (object 8) sets Spl to 10001, whose volume never falls
-    // below 800, plays a long note, waits and ends while the note plays
-    // on. Track 10 (object 9) sets its `target` to track 11 and loops.
-    // The camera move puts object 9 far off the screen; track 10's write
-    // goes through to track 11's track object, and so does its read of
-    // Spl: the note is quiet but heard. Read from track 10, whose Spl is
-    // the usual 20, the note would fall silent (Sol's review).
-    let mut ended = vec![LOADL, 57];
-    ended.extend(long(10_001));
-    ended.extend(NOTE_ON_V1);
-    ended.extend(loadl(5, 10));
-    ended.extend([WAIT, 5, END]);
+    // below 800, plays a long note, waits and reaches `end` (continuing
+    // into `set_loop; loop` while fading out, 0x57dca3). Track 10
+    // (object 9) sets its `target` to track 11 and loops. The camera
+    // move puts object 9 far off the screen; track 10's write goes
+    // through to track 11, and so does its read of Spl: the fading note
+    // is quiet but heard. Read from track 10, whose Spl is the usual 20,
+    // the note would fall silent.
+    let mut fading = vec![LOADL, 57];
+    fading.extend(long(10_001));
+    fading.extend(NOTE_ON_V1);
+    fading.extend(loadl(5, 10));
+    fading.extend([WAIT, 5, END]);
     let mut targets = loadl(53, 11);
-    targets.extend([SET_LOOP, LOOP]);
+    targets.extend(loadl(5, 1000));
+    targets.extend([WAIT, 5]);
+    let mut hold_pc = loadl(5, 1000);
+    hold_pc.extend([WAIT, 5]);
     let start = on_lot(&[(8, 400), (9, 400)]);
     let off = on_lot(&[(8, 400), (9, -7000)]);
     let mut player = Player::new(
-        vec![module(&[&targets, &ended], 1)],
+        vec![module(&[&targets, &fading, &hold_pc], 1)],
         long_sample("one.xa"),
         1,
     );
@@ -2618,22 +2656,20 @@ fn a_camera_move_reads_spl_where_it_writes() {
 }
 
 #[test]
-fn a_forwarded_camera_move_leaves_the_ended_thread_s_levels() {
-    // Track 10 (object 9) plays a long note, sets its `target` to track
-    // 11, which loops, and ends while the note plays on. Track 12 then
-    // asks for main_duckpri 30 and waits. The camera move's write goes
-    // from track 10's track object to track 11's, so track 10's note
-    // keeps the levels it was given, undimmed by the later ducking
-    // request (Sol's review).
+fn a_forwarded_camera_move_leaves_the_forwarding_thread_s_levels() {
+    // Track 10 (object 9) plays a long note in the middle, sets its
+    // `target` to track 11 (object 8), and loops. When the camera moves
+    // object 9 to the right edge, track 10's placement goes through its
+    // `target` to track 11, so track 10's own note keeps its centered
+    // levels (left == right).
     let mut forwards = NOTE_ON_V1.to_vec();
     forwards.extend(loadl(53, 11));
-    forwards.push(END);
+    forwards.extend([SET_LOOP, LOOP]);
     let wait: &[u8] = &[SET_LOOP, LOOP];
-    let mut ducker = loadl(123, 30);
-    ducker.extend([SET_LOOP, LOOP]);
-    let lot = on_lot(&[(7, 400), (8, 400), (9, 400)]);
+    let start = on_lot(&[(8, 400), (9, 400)]);
+    let moved = on_lot(&[(8, 400), (9, 800)]);
     let mut player = Player::new(
-        vec![module(&[&forwards, wait, &ducker], 1)],
+        vec![module(&[&forwards, wait], 1)],
         long_sample("one.xa"),
         1,
     );
@@ -2643,18 +2679,17 @@ fn a_forwarded_camera_move_leaves_the_ended_thread_s_levels() {
                 object,
                 name: name.into(),
             },
-            &lot,
+            &start,
         );
     };
     play(&mut player, 8, "e1");
     play(&mut player, 9, "e0");
-    player.render(BLOCK, &lot);
-    play(&mut player, 7, "e2");
-    player.render(BLOCK, &lot);
-    let before = player.render(1, &lot);
-    player.camera_moved(0, u32::MAX, &lot);
-    player.render(BLOCK, &lot);
-    assert_eq!(player.render(1, &lot), before);
+    player.render(BLOCK, &start);
+    let before = player.render_stereo(1, &start);
+    assert!(before[0] > 0 && before[0] == before[1], "{before:?}");
+    player.camera_moved(0, u32::MAX, &moved);
+    let after = player.render_stereo(1, &moved);
+    assert_eq!(after, before);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
 
@@ -4024,7 +4059,7 @@ fn muted_kind_1_still_places_and_releases_an_already_held_track() {
 }
 
 #[test]
-fn muted_replay_places_and_releases_a_held_note_whose_script_ended() {
+fn muted_replay_places_and_releases_a_held_note_fading_after_end() {
     let mut map = BTreeMap::new();
     map.insert(
         "one.xa".to_owned(),
@@ -4034,9 +4069,13 @@ fn muted_replay_places_and_releases_a_held_note_whose_script_ended() {
             samples: vec![4000; RATE as usize],
         },
     );
-    // Replacement script whose note outlives its script (`note_on v1; end`).
+    // Script that reaches `end` while its note plays, continuing into an
+    // explicit wait loop while fading out (0x57e3ee → 0x57dca3).
     let one_shot: &[u8] = &[2, 5, END];
-    let (hit, addresses) = assemble(&[one_shot]);
+    let mut hold_pc = vec![SET_LOOP];
+    hold_pc.extend(loadl(5, 1000));
+    hold_pc.extend([WAIT, 5, LOOP]);
+    let (hit, addresses) = assemble(&[one_shot, &hold_pc]);
     let hot = format!(
         "[EventMappingEquate]\n\
          [TrackData]\n\
@@ -4054,14 +4093,14 @@ fn muted_replay_places_and_releases_a_held_note_whose_script_ended() {
     let center = on_lot(&[(9, 400)]);
     let right = on_lot(&[(9, 800)]);
 
-    // Start track 10 (group 1) at center; its script ends while the 1-second
-    // note plays on in `ended`, then pause holds it.
+    // Start track 10 (group 1) at center; `end` starts its fade while
+    // keeping it running, then pause holds it mid-fade.
     play_on(&mut player, 9, &center);
     assert!(
         player
             .render_stereo(BLOCK * 2, &center)
             .iter()
-            .any(|&s| s > 3500)
+            .any(|&s| s > 2000)
     );
     player.handle(&SoundEvent::Pause, &center);
     assert!(
@@ -4072,8 +4111,8 @@ fn muted_replay_places_and_releases_a_held_note_whose_script_ended() {
     );
 
     // Mute group 1, then replay track 10 at the right edge while paused:
-    // start() returns early at 0x57d9a5 with no running thread, yet kind 1
-    // still places the lingering ended note and clears the hold at 0x57dc68.
+    // start() returns early at 0x57d9a5, yet kind 1 still places the
+    // running fading track and clears its hold at 0x57dc68.
     player.set_group_volume(1, 0);
     play_on(&mut player, 9, &right);
     assert!(
@@ -4089,13 +4128,15 @@ fn muted_replay_places_and_releases_a_held_note_whose_script_ended() {
     let out = player.render_stereo(BLOCK * 2, &right);
     let [left, right_ch] = [out[out.len() - 2], out[out.len() - 1]];
     assert!(left > 0 && right_ch > left, "{left} {right_ch}");
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
 
 #[test]
-fn muted_replay_keeps_ended_spl_releases_music_and_leaves_idle_group_levels() {
-    // 1) Ended track with high `Spl` (10001): muted replay keeps that `Spl`
-    //    (0x57314b) instead of falling back to 20, so an off-screen object
-    //    stays audible after unmuting without needing a camera update.
+fn muted_replay_keeps_fading_spl_releases_music_and_leaves_idle_group_levels() {
+    // 1) Fading track after `end` with high `Spl` (10001): muted replay
+    //    keeps that `Spl` (0x57314b) instead of falling back to 20, so
+    //    an off-screen object stays audible after unmuting without
+    //    needing a camera update.
     let mut map = BTreeMap::new();
     map.insert(
         "one.xa".to_owned(),
@@ -4105,13 +4146,17 @@ fn muted_replay_keeps_ended_spl_releases_music_and_leaves_idle_group_levels() {
             samples: vec![4000; RATE as usize],
         },
     );
-    // `loadl 57 10001; note_on v1; end`: register 57 is `Spl` (opcode 5 = loadl).
+    // `loadl 57 10001; note_on v1; end` followed by an explicit wait loop.
     let mut spl_script = vec![5, 57];
     spl_script.extend_from_slice(&10001i32.to_le_bytes());
     spl_script.extend_from_slice(&[2, 5, END]);
-    // Replacement `river_loop` (track 2957, group 1): `note_on v1; end`.
+    let mut hold_pc = vec![SET_LOOP];
+    hold_pc.extend(loadl(5, 1000));
+    hold_pc.extend([WAIT, 5, LOOP]);
+    // Replacement `river_loop` (track 2957, group 1): `note_on v1; end`
+    // followed by an explicit wait loop.
     let one_shot: &[u8] = &[2, 5, END];
-    let (hit, addresses) = assemble(&[&spl_script, one_shot]);
+    let (hit, addresses) = assemble(&[&spl_script, &hold_pc, one_shot, &hold_pc]);
     let hot = format!(
         "[EventMappingEquate]\n\
          [TrackData]\n\
@@ -4129,7 +4174,7 @@ fn muted_replay_keeps_ended_spl_releases_music_and_leaves_idle_group_levels() {
          r=1,2957\n\
          m3=36,3\n\
          seq=53,2957,0,20\n",
-        addresses[0], addresses[1]
+        addresses[0], addresses[2]
     );
     let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
     let mut player = Player::new(vec![module.clone()], map.clone(), 1);
@@ -4141,7 +4186,7 @@ fn muted_replay_keeps_ended_spl_releases_music_and_leaves_idle_group_levels() {
         player
             .render_stereo(BLOCK * 2, &center)
             .iter()
-            .any(|&s| s > 3500)
+            .any(|&s| s > 2000)
     );
     player.handle(&SoundEvent::Pause, &center);
     player.set_group_volume(1, 0);
@@ -4149,18 +4194,18 @@ fn muted_replay_keeps_ended_spl_releases_music_and_leaves_idle_group_levels() {
     player.set_group_volume(1, 1024);
     assert!(
         player.render_stereo(BLOCK * 2, &far).iter().any(|&s| s > 0),
-        "ended track's Spl (10001) should survive muted replay"
+        "fading track's Spl (10001) should survive muted replay"
     );
 
     // 2) Music-mode start (`change_music`) unconditionally clears hold on a
-    //    muted `river_loop` (2957) whose script ended (`0x57523f -> 0x57dc68`).
+    //    muted `river_loop` (2957) fading after `end` (`0x57523f -> 0x57dc68`).
     let mut music = Player::new(vec![module.clone()], map.clone(), 1);
     play(&mut music, "r");
     assert!(
         music
             .render_stereo(BLOCK * 2, &NoSources)
             .iter()
-            .any(|&s| s > 3500)
+            .any(|&s| s > 2000)
     );
     music.handle(&SoundEvent::Pause, &NoSources);
     assert!(
@@ -4176,7 +4221,7 @@ fn muted_replay_keeps_ended_spl_releases_music_and_leaves_idle_group_levels() {
         music
             .render_stereo(BLOCK * 2, &NoSources)
             .iter()
-            .any(|&s| s > 3500),
+            .any(|&s| s > 1000),
         "muted music-mode start should still clear river_loop's hold"
     );
 
@@ -4258,10 +4303,15 @@ fn day_and_night_loop_handles_script_that_ends_while_its_note_plays() {
             samples: vec![4000; RATE as usize],
         },
     );
-    // Replacement loop script: `note_on v1; end` (ends immediately while
-    // its 1-second note plays on in `ended`).
+    // Replacement loop script: `note_on v1; end` followed by an explicit
+    // wait (stays running while fading out at speed 100, 0x57dca3).
+    // On start, `update_day_night` starts `extvol` at 0 and fades it up
+    // to 1024 at speed 5000 (hits 1024 on block 0 before `note_on`),
+    // then `end` starts fading `extvol` down from 1024 at speed 100.
     let one_shot: &[u8] = &[2, 5, END];
-    let (hit, addresses) = assemble(&[one_shot]);
+    let mut hold_pc = loadl(5, 1000);
+    hold_pc.extend([WAIT, 5]);
+    let (hit, addresses) = assemble(&[one_shot, &hold_pc]);
     let hot = format!(
         "[EventMappingEquate]\n\
          [TrackData]\n\
@@ -4293,20 +4343,1091 @@ fn day_and_night_loop_handles_script_that_ends_while_its_note_plays() {
         );
     }
     let first = player.render_stereo(BLOCK * 2, &night);
-    assert_eq!(&first[first.len() - 2..], &[4000, 4000]);
+    let [l1, r1] = [first[first.len() - 2], first[first.len() - 1]];
+    assert!(l1 > 0 && l1 < 4000 && l1 == r1, "{l1} {r1}");
 
-    // Calling camera_moved again at night must NOT start a second
-    // overlapping note (which would sum to 8000).
+    // Calling camera_moved again at night while the fade is still running
+    // must NOT start a second overlapping note (`day_night_playing` sees
+    // the running thread, 0x574a00).
     player.camera_moved(0, 22, &night);
     let second = player.render_stereo(BLOCK * 2, &night);
-    assert_eq!(&second[second.len() - 2..], &[4000, 4000]);
+    let [l2, r2] = [second[second.len() - 2], second[second.len() - 1]];
+    assert!(l2 > 0 && l2 < l1 && l2 == r2, "before {l1}, after {l2}");
 
-    // Switching to daytime stops the lingering ended note.
+    // Switching to daytime stops the fading loop once its fade finishes.
     player.camera_moved(0, 12, &day);
+    let _ = player.render_stereo(BLOCK * 12, &day);
     assert!(
         player
             .render_stereo(BLOCK * 2, &day)
             .iter()
             .all(|&s| s == 0)
     );
+}
+
+#[test]
+fn end_and_return_while_a_note_plays_fade_out_at_speed_100_and_run_on() {
+    // Both `end` (opcode 12) and `return` (opcode 8) jump to 0x57e3ee:
+    // with an empty call stack and a playing note, they call 0x57dca3
+    // (fade extvol to 0 at speed 100, kill_after_fade = true), keep the
+    // track running, and continue at `next` in the SAME block (0x57d8b3).
+    use sims_audio::levels::{Inputs, levels};
+    const RETURN: u8 = 8;
+    const IFGT: u8 = 64;
+
+    let expected_sample = |extvol: i32| -> i16 {
+        let g = levels(&Inputs {
+            vol: 1024,
+            extvol,
+            pan: 512,
+            pitch: 3600,
+            duck_priority: 0,
+            three_d: false,
+            group_volume: 1024,
+            main_duck_priority: 0,
+            master: 1024,
+        })
+        .gains[0];
+        ((10_000i64 * i64::from(g)) >> 16) as i16
+    };
+
+    for opcode in [END, RETURN] {
+        // Routine 0 (0x100): `note_on v1; loadl 5, 0; <end/return>`
+        // Immediately followed by `ifgt 0x101; loadl 5, 1000; wait 5`.
+        // `loadl 5, 0` clears flags to 0, then `0x57dca3` writes FADE_ON=1
+        // last (0x57dd05 -> 0x57de98), setting positive flags so the run-on
+        // `ifgt` jumps to 0x101 in the VERY SAME block (block 0), where it
+        // queries object 9 with field 42 before yielding via `wait`.
+        let mut r0 = NOTE_ON_V1.to_vec();
+        r0.extend(loadl(5, 0));
+        r0.push(opcode);
+        r0.push(IFGT);
+        r0.extend(long(0x101));
+        r0.extend(loadl(5, 1000));
+        r0.extend([WAIT, 5]);
+        let mut r1 = loadl(7, 42);
+        r1.extend([72, 6, 1, 7]); // getsrcdatafield v2, arg1, v3 (42)
+        r1.extend(loadl(5, 1000));
+        r1.extend([WAIT, 5]);
+        let probe = Probe {
+            lot: on_lot(&[(9, 400)]),
+            asked: Default::default(),
+        };
+        let mut player = Player::new(vec![module(&[&r0, &r1], 1)], long_sample("one.xa"), 1);
+        play_on(&mut player, 9, &probe.lot);
+
+        // Block 0: note plays at extvol 1024, and the run-on `ifgt` MUST
+        // have executed during block 0 itself (before block 1's fade step).
+        let b0 = player.render(BLOCK, &probe);
+        assert_eq!(b0[0], expected_sample(1024), "op {opcode} block 0");
+        assert_eq!(
+            *probe.asked.borrow(),
+            [(9, 42)],
+            "op {opcode}: run-on branch must execute in block 0"
+        );
+        assert!(!player.is_idle(), "op {opcode}");
+
+        // Blocks 1..=10: extvol steps by EXACTLY 100 each block
+        // (924, 824, ..., 24).
+        for step_idx in 1..=10 {
+            let extvol = 1024 - 100 * step_idx;
+            let block = player.render(BLOCK, &probe);
+            assert_eq!(
+                block[0],
+                expected_sample(extvol),
+                "op {opcode} block {step_idx} (extvol {extvol})"
+            );
+        }
+        // Block 11: extvol hits 0, FADE_ON becomes 0, kill_after_fade kills
+        // the track and cuts its note.
+        let b11 = player.render(BLOCK, &probe);
+        assert!(b11.iter().all(|&s| s == 0), "op {opcode}: {b11:?}");
+        assert!(player.is_idle(), "op {opcode}");
+        assert!(player.faults.is_empty(), "{:?}", player.faults);
+    }
+}
+
+#[test]
+fn end_inside_a_call_pops_the_stack_without_fading_the_note() {
+    // When the return stack is non-empty, `end` pops the caller's address
+    // (0x57e3ee..0x57e428) and does NOT trigger 0x57dca3's fade.
+    const CALL: u8 = 7;
+    let mut caller = vec![CALL];
+    caller.extend(long(0x101));
+    caller.extend(loadl(5, 1000));
+    caller.extend([WAIT, 5]);
+    let sub: &[u8] = &[NOTE_ON_V1[0], NOTE_ON_V1[1], END];
+    let mut player = Player::new(vec![module(&[&caller, sub], 1)], long_sample("one.xa"), 1);
+    play(&mut player, "e0");
+    // Render 15 blocks (> 11 blocks of a speed-100 fade): note stays at
+    // full volume (10000) the entire time.
+    let out = player.render(15 * BLOCK, &NoSources);
+    assert_eq!(out[out.len() - 1], 10_000);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn replay_during_end_fade_cancels_fade_or_restarts_when_interrupt_is_set() {
+    // Without `interrupt`, replaying a track while it is fading after
+    // `end` refreshes it and clears the fade (0x57d9b2..0x57d9bb) with
+    // one note still playing. With `interrupt = 1`, it restarts in place
+    // and cuts the old note (0x57da26 -> 0x57f625).
+    for interrupt in [false, true] {
+        let mut r0 = Vec::new();
+        if interrupt {
+            r0.extend(loadb(55, 1));
+        }
+        r0.extend(NOTE_ON_V1);
+        r0.push(END);
+        let mut hold_pc = vec![SET_LOOP];
+        hold_pc.extend(loadl(5, 1000));
+        hold_pc.extend([WAIT, 5, LOOP]);
+        let mut player = Player::new(vec![module(&[&r0, &hold_pc], 1)], long_sample("one.xa"), 1);
+        play(&mut player, "e0");
+        // Advance 3 blocks into the fade (extvol = 1024 -> 924 -> 824).
+        let before = player.render(3 * BLOCK, &NoSources);
+        let faded = before[before.len() - 1];
+        assert!(faded > 0 && faded < 10_000, "{faded}");
+
+        // Replay mid-fade:
+        play(&mut player, "e0");
+        if !interrupt {
+            // Fade is cancelled; the single note stays at full placed
+            // volume (10000) well past 11 blocks (no second note = 20000).
+            let after = player.render(15 * BLOCK, &NoSources);
+            assert_eq!(after[after.len() - 1], 10_000);
+            assert!(!player.is_idle());
+        } else {
+            // Restarted in place: fresh start resets extvol to 1024 and
+            // starts a fresh fade after running `note_on; end` again,
+            // finishing cleanly after 11 more blocks.
+            let after_one = player.render(BLOCK, &NoSources);
+            assert_eq!(after_one[0], 10_000);
+            let _ = player.render(11 * BLOCK, &NoSources);
+            assert!(player.is_idle());
+        }
+        assert!(player.faults.is_empty(), "{:?}", player.faults);
+    }
+}
+
+#[test]
+fn end_while_a_note_plays_with_target_fades_target_and_kills_self_next_block() {
+    // `0x57dca3` writes FADE_DEST/VAR/SPEED/ON through `target` (vtable
+    // +0x84, 0x57de57), while setting `kill_after_fade` (+0x1cf) on
+    // itself. Track 10 plays a note, points `target` at track 11, and
+    // hits `end` (continuing into a wait). On the next block track 10's
+    // own FADE_ON is 0 with kill_after_fade set, so track 10 kills
+    // itself (0x57d86e -> 0x57dd3e), while track 11 fades its extvol to
+    // 0 and stays running.
+    let mut t10 = NOTE_ON_V1.to_vec();
+    t10.extend(loadl(53, 11));
+    t10.push(END);
+    t10.extend(loadl(5, 1000));
+    t10.extend([WAIT, 5]);
+    let mut t11 = NOTE_ON_V1.to_vec();
+    t11.extend(loadl(5, 1000));
+    t11.extend([WAIT, 5]);
+    let mut player = Player::new(vec![module(&[&t10, &t11], 1)], long_sample("one.xa"), 1);
+    play(&mut player, "e1");
+    play(&mut player, "e0");
+    // Block 0: both tracks' notes play (sum = 20000).
+    let b0 = player.render(BLOCK, &NoSources);
+    assert_eq!(b0[0], 20_000);
+    // Block 1: track 10 dies immediately (own FADE_ON == 0 && kill_after_fade),
+    // while track 11 begins fading (extvol 1024 -> 924, well below 10000).
+    let b1 = player.render(BLOCK, &NoSources);
+    assert!(b1[0] > 0 && b1[0] < 10_000, "b1={}", b1[0]);
+    // After 11 more blocks, track 11 has faded to 0 (silent) but is STILL
+    // running (not killed, because kill_after_fade was set on track 10).
+    let _ = player.render(11 * BLOCK, &NoSources);
+    assert!(player.render(BLOCK, &NoSources).iter().all(|&s| s == 0));
+    assert!(
+        !player.is_idle(),
+        "track 11 should remain running at extvol 0"
+    );
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn end_after_note_off_kills_immediately_and_end_at_eof_faults() {
+    // 1) `note_on v1; note_on v1; loadl v1, 999; note_off v1; end`
+    //    followed by `loadl 110, 99; end`: a track holds one active
+    //    voice (0x58015a), and `note_off` stops that voice regardless of
+    //    its operand register's value (0x57e192..0x57e1a9 → 0x5801a0).
+    //    With no note playing, `end` kills the track at once (0x57dd3e)
+    //    and does not run on into `loadl 110, 99`.
+    let mut stopped = NOTE_ON_V1.to_vec();
+    stopped.extend(NOTE_ON_V1);
+    stopped.extend(loadl(5, 999));
+    stopped.extend([3, 5, END]); // note_off v1 (overwritten); end
+    let mut after = loadl(110, 99);
+    after.push(END);
+    let asks: &[u8] = &[72, 6, 1, 110, END];
+    let probe = Probe {
+        lot: on_lot(&[(8, 400)]),
+        asked: Default::default(),
+    };
+    let mut player = Player::new(
+        vec![module(&[&stopped, &after, asks], 1)],
+        long_sample("one.xa"),
+        1,
+    );
+    play(&mut player, "e0");
+    player.render(BLOCK, &probe);
+    assert!(player.is_idle());
+    player.handle(
+        &SoundEvent::Play {
+            object: 8,
+            name: "e2".into(),
+        },
+        &probe,
+    );
+    player.render(BLOCK, &probe);
+    assert_eq!(*probe.asked.borrow(), [(8, 0)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+
+    // 2) `note_on; end` at EOF: the run-on past `end` (0x57d8b3) hits
+    //    the end of the program buffer, reports a fault, and stops the
+    //    thread and its note.
+    let at_eof: &[u8] = &[2, 5, END];
+    let mut eof_player = Player::new(vec![module(&[at_eof], 1)], long_sample("one.xa"), 1);
+    play(&mut eof_player, "e0");
+    assert!(eof_player.render(BLOCK, &NoSources).iter().all(|&s| s == 0));
+    assert!(eof_player.is_idle());
+    assert_eq!(eof_player.faults.len(), 1, "{:?}", eof_player.faults);
+    assert!(
+        eof_player.faults[0].contains("address outside the program"),
+        "{:?}",
+        eof_player.faults
+    );
+}
+
+#[test]
+fn refused_getsrcdatafield_preserves_active_note_for_end_fade() {
+    // A refused `getsrcdatafield` logs a diagnostic (0x57f33a → 0x57f3f9
+    // → 0x57f408) without killing the track or cutting its voice, so a
+    // following `end` still sees the playing note and fades it out.
+    let mut r0 = NOTE_ON_V1.to_vec();
+    r0.extend(loadl(6, 21)); // field 21 is refused by Snapshot
+    r0.extend([72, 7, 1, 6]); // getsrcdatafield v3, arg1, v2
+    r0.push(END);
+    r0.extend(loadl(5, 1000));
+    r0.extend([WAIT, 5]);
+    let mut player = Player::new(vec![module(&[&r0], 1)], long_sample("one.xa"), 1);
+    let lot = on_lot(&[(9, 400)]);
+    play_on(&mut player, 9, &lot);
+    let b0 = player.render(BLOCK, &lot);
+    assert_eq!(b0[0], 10_000);
+    assert_eq!(player.faults.len(), 1, "{:?}", player.faults);
+    assert!(player.faults[0].contains("Illegal source parameter request"));
+    let b1 = player.render(BLOCK, &lot);
+    assert!(b1[0] > 0 && b1[0] < 10_000, "b1={}", b1[0]);
+    player.render(10 * BLOCK, &lot);
+    assert!(player.is_idle());
+}
+
+#[test]
+fn pause_and_stop_object_leave_idle_kind_53_voice_playing() {
+    // In 1.91, `pause` walks only the running-track list
+    // (0x574869..0x5748c9) and hold checks `is_running` (0x57dc3d);
+    // `fade_and_kill` also checks `is_running` (0x57dca8). Neither stops
+    // or silences an idle kind-53 voice (`thread == 0`).
+    let module = module_with(&[&[END]], 1, 10, "seq=53,10,0,6\n");
+    let mut player = Player::new(vec![module], long_sample("two.xa"), 1);
+    let lot = on_lot(&[(9, 400)]);
+    play_on(&mut player, 9, &lot);
+    player.render(BLOCK, &lot);
+    assert!(player.is_idle());
+    player.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: "seq".into(),
+        },
+        &lot,
+    );
+    assert_eq!(player.render(2, &lot), [10_000, 10_000]);
+    player.handle(&SoundEvent::StopObject { object: 9 }, &lot);
+    assert_eq!(player.render(2, &lot), [10_000, 10_000]);
+    player.handle(&SoundEvent::Pause, &lot);
+    assert_eq!(player.render(2, &lot), [10_000, 10_000]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn muted_play_trk_writes_source_through_the_started_track_s_target() {
+    // `0x57f261` writes `SOURCE` (47) to the started track via vtable
+    // +0x84 (through its `target`). On a muted start (0x57d9a5), the
+    // started track keeps its existing `target`, so `SOURCE` lands in
+    // that target track instead of locally.
+    let mut t10 = loadl(53, 11);
+    t10.push(SET_LOOP);
+    t10.extend(loadl(5, 1000));
+    t10.extend([WAIT, 5, LOOP]);
+    let mut t11 = loadl(5, 20);
+    t11.extend([WAIT, 5, 72, 6, 1, 47, END]);
+    let mut t12 = loadl(47, 77);
+    t12.extend(loadl(5, 10));
+    t12.extend([PLAY_TRK, 5, END]);
+    let (hit, addresses) = assemble(&[&t10, &t11, &t12]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         0x102={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         [Track]\n\
+         10=0,muted_trk,1024,0,0,1,0,0x100,1\n\
+         11=0,dest_trk,1024,0,0,0,0,0x101,1\n\
+         12=0,caller_trk,1024,0,0,0,0,0x102,1\n\
+         [EventMapping]\n\
+         e0=1,10\n\
+         e1=1,11\n\
+         e2=1,12\n",
+        addresses[0], addresses[1], addresses[2]
+    );
+    let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+    let mut player = Player::new(vec![module], samples(), 1);
+    let probe = Probe {
+        lot: on_lot(&[(8, 400)]),
+        asked: Default::default(),
+    };
+    player.handle(
+        &SoundEvent::Play {
+            object: 8,
+            name: "e1".into(),
+        },
+        &probe,
+    );
+    player.handle(
+        &SoundEvent::Play {
+            object: 8,
+            name: "e0".into(),
+        },
+        &probe,
+    );
+    player.render(BLOCK, &probe);
+    // Mute group 1 so track 10's start returns early at 0x57d9a5 keeping
+    // target = 11, then track 12 runs `play_trk 10` with SOURCE = 77.
+    player.set_group_volume(1, 0);
+    player.handle(
+        &SoundEvent::Play {
+            object: 8,
+            name: "e2".into(),
+        },
+        &probe,
+    );
+    player.render(12 * BLOCK, &probe);
+    assert_eq!(*probe.asked.borrow(), [(8, 77)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn stopped_target_persists_registers_and_clears_fade_on() {
+    // Matches `SetMainMusicSongAndHitList`: targets stopped track 11,
+    // writes `v1 = 11` and `FADE_ON = 1` (0x57e059 forces FADE_ON back
+    // to 0 on a stopped track), reads both back, then runs `play_trk v1`.
+    // Track 11 starts cleanly and still sees `v1 == 11` (outside BANKS,
+    // 0x57da3a..0x57da87).
+    let mut t10 = loadl(53, 11);
+    t10.extend(loadl(5, 11));
+    t10.extend(loadl(45, 1));
+    t10.extend([72, 6, 1, 45]); // query FADE_ON on stopped target -> 0
+    t10.extend([72, 6, 1, 5]); // query v1 on stopped target -> 11
+    t10.extend([PLAY_TRK, 5, END]);
+    let t11: &[u8] = &[72, 6, 1, 5, END]; // query own v1 -> 11
+    let probe = Probe {
+        lot: on_lot(&[(8, 400)]),
+        asked: Default::default(),
+    };
+    let mut player = Player::new(vec![module(&[&t10, t11], 1)], samples(), 1);
+    play_on(&mut player, 8, &probe.lot);
+    player.render(4 * BLOCK, &probe);
+    // Both reads in track 10 go through `target = 11` (so stopped track 11's
+    // `arg1` is 0); track 11's own read receives `arg1 = 8` from `play_trk`.
+    assert_eq!(*probe.asked.borrow(), [(0, 0), (0, 11), (8, 11)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn routed_volume_write_to_idle_kind_53_voice_updates_level_immediately() {
+    // Track 10 ends immediately and kind 53 starts an idle voice on it.
+    // Track 11 targets stopped track 10 and writes EXTVOL = 0, then
+    // waits and restores EXTVOL = 1024. The idle voice updates at once
+    // (0x57df13 -> 0x57f759).
+    let mut t11 = loadl(53, 10);
+    t11.extend(loadl(19, 0));
+    t11.extend(loadl(5, 20));
+    t11.extend([WAIT, 5]);
+    t11.extend(loadl(19, 1024));
+    t11.push(END);
+    let (hit, addresses) = assemble(&[&[END], &t11]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         2=0,two,\"two.xa\"\n\
+         [GlobalHitList]\n\
+         6=2\n\
+         [Track]\n\
+         10=0,idle_trk,1024,0,0,0,0,0x100,1\n\
+         11=0,writer_trk,1024,0,0,0,0,0x101,1\n\
+         [EventMapping]\n\
+         e0=1,10\n\
+         e1=1,11\n\
+         seq=53,10,0,6\n",
+        addresses[0], addresses[1]
+    );
+    let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+    let mut player = Player::new(vec![module], long_sample("two.xa"), 1);
+    let lot = on_lot(&[(9, 400)]);
+    play_on(&mut player, 9, &lot);
+    player.render(BLOCK, &lot);
+    player.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: "seq".into(),
+        },
+        &lot,
+    );
+    assert_eq!(player.render(BLOCK, &lot)[0], 10_000);
+
+    // Track 11 silences the idle voice on block 0 of its run.
+    play(&mut player, "e1");
+    let silenced = player.render(BLOCK, &lot);
+    assert!(silenced.iter().all(|&s| s == 0), "{silenced:?}");
+    // After the 20 ms wait, track 11 restores EXTVOL = 1024.
+    let _ = player.render(10 * BLOCK, &lot);
+    assert_eq!(player.render(BLOCK, &lot)[0], 10_000);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn muted_play_trk_writes_source_to_stopped_track_and_spares_idle_voice() {
+    // `0x57f261` writes `SOURCE` (47) to a muted, stopped destination
+    // (including one with an idle kind-53 voice) without changing that
+    // idle voice's gain when its group is muted.
+    let mut t11 = loadl(47, 77);
+    t11.extend(loadl(5, 10));
+    t11.extend([PLAY_TRK, 5]);
+    t11.extend(loadl(53, 10));
+    t11.extend([72, 6, 1, 47, END]);
+    let (hit, addresses) = assemble(&[&[END], &t11]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         2=0,two,\"two.xa\"\n\
+         [GlobalHitList]\n\
+         6=2\n\
+         [Track]\n\
+         10=0,muted_stopped,1024,0,0,1,0,0x100,1\n\
+         11=0,caller,1024,0,0,0,0,0x101,1\n\
+         [EventMapping]\n\
+         e0=1,10\n\
+         e1=1,11\n\
+         seq=53,10,0,6\n",
+        addresses[0], addresses[1]
+    );
+    let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+    let mut player = Player::new(vec![module], long_sample("two.xa"), 1);
+    let probe = Probe {
+        lot: on_lot(&[(8, 400)]),
+        asked: Default::default(),
+    };
+    // Start an idle kind-53 voice on stopped track 10 while group 1 is unmuted,
+    // then mute group 1 before track 11 runs `play_trk 10`.
+    player.handle(
+        &SoundEvent::Play {
+            object: 8,
+            name: "seq".into(),
+        },
+        &probe,
+    );
+    assert_eq!(player.render(BLOCK, &probe)[0], 10_000);
+    player.set_group_volume(1, 0);
+    player.handle(
+        &SoundEvent::Play {
+            object: 8,
+            name: "e1".into(),
+        },
+        &probe,
+    );
+    let out = player.render(2 * BLOCK, &probe);
+    assert_eq!(out[out.len() - 1], 10_000);
+    // Both `arg1` (0) and `SOURCE` (77) are read through `target = 10`.
+    assert_eq!(*probe.asked.borrow(), [(0, 77)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn note_on_preserves_its_operand_register_and_flags() {
+    // `0x57e17f -> 0x57f595` passes the raw operand byte without writing
+    // back a note ID or changing comparison flags (relied on by install
+    // scripts such as `simsgeneratedhitsource.hit @0x18b1`).
+    const IFLT: u8 = 65;
+    let mut r0 = loadl(5, 42);
+    r0.extend(loadl(6, -5)); // comparison flags < 0
+    r0.extend(NOTE_ON_V1); // must preserve v1 == 42 and flags < 0
+    r0.push(IFLT);
+    r0.extend(long(0x101));
+    r0.extend([3, 5, END]); // unreachable if flags stayed < 0
+    let mut r1 = vec![72, 6, 1, 5]; // query v1 -> 42
+    r1.extend([3, 5, END]); // note_off; end
+    let probe = Probe {
+        lot: on_lot(&[(8, 400)]),
+        asked: Default::default(),
+    };
+    let mut player = Player::new(vec![module(&[&r0, &r1], 1)], long_sample("one.xa"), 1);
+    play_on(&mut player, 8, &probe.lot);
+    player.render(2 * BLOCK, &probe);
+    assert_eq!(*probe.asked.borrow(), [(8, 42)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn kill_paths_preserve_locals_clear_patch_and_kind_53_persists_patch() {
+    // 1) StopObject on a silent track, immediate `seqgroup_kill` (extvol == 0),
+    //    and StopAll all save the stopped register bank (preserving `v1 = 77`
+    //    and clearing `PATCH = 0` per 0x57dd62 -> 0x57f682).
+    // 2) Kind 53 writes `PATCH` to the stopped track object (0x57e0cc), so it
+    //    remains readable after the short idle sample finishes.
+    let mut writer = loadl(5, 77);
+    writer.extend(loadl(19, 0)); // extvol = 0 for immediate seqgroup_kill
+    writer.extend(loadl(6, 1));
+    writer.extend([SEQGROUP_KILL, 6]); // claim seqgroup 1
+    writer.push(SET_LOOP);
+    writer.extend(loadl(7, 1000));
+    writer.extend([WAIT, 7, LOOP]);
+
+    let mut killer = loadl(6, 1);
+    killer.extend([SEQGROUP_KILL, 6, END]);
+
+    let mut reader = loadl(53, 10);
+    reader.extend([GETSRCDATAFIELD, 6, 1, 5]); // read track 10's v1
+    reader.extend([GETSRCDATAFIELD, 6, 1, 50]); // read track 10's PATCH
+    reader.push(END);
+
+    let (hit, addresses) = assemble(&[&writer, &killer, &reader]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         0x102={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         2=0,two,\"two.xa\"\n\
+         [GlobalHitList]\n\
+         6=2\n\
+         [Track]\n\
+         10=0,victim,1024,2,0,0,0,0x100,1\n\
+         11=0,killer,1024,0,0,0,0,0x101,1\n\
+         12=0,reader,1024,0,0,0,0,0x102,1\n\
+         [EventMapping]\n\
+         e0=1,10\n\
+         e1=1,11\n\
+         e2=1,12\n\
+         seq=53,10,0,6\n",
+        addresses[0], addresses[1], addresses[2]
+    );
+    let make_player = || {
+        let m = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+        Player::new(vec![m], samples(), 1)
+    };
+
+    // Case A: StopObject on silent running track
+    let probe_a = Probe {
+        lot: on_lot(&[(9, 400)]),
+        asked: Default::default(),
+    };
+    let mut pa = make_player();
+    play_on(&mut pa, 9, &probe_a.lot);
+    pa.render(BLOCK, &probe_a);
+    pa.handle(&SoundEvent::StopObject { object: 9 }, &probe_a);
+    pa.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: "e2".into(),
+        },
+        &probe_a,
+    );
+    pa.render(2 * BLOCK, &probe_a);
+    assert_eq!(*probe_a.asked.borrow(), [(9, 77), (9, 0)]);
+    assert!(pa.faults.is_empty(), "{:?}", pa.faults);
+
+    // Case B: immediate `seqgroup_kill` (extvol == 0)
+    let probe_b = Probe {
+        lot: on_lot(&[(9, 400)]),
+        asked: Default::default(),
+    };
+    let mut pb = make_player();
+    play_on(&mut pb, 9, &probe_b.lot);
+    pb.render(BLOCK, &probe_b);
+    pb.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: "e1".into(),
+        },
+        &probe_b,
+    );
+    pb.render(BLOCK, &probe_b);
+    pb.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: "e2".into(),
+        },
+        &probe_b,
+    );
+    pb.render(2 * BLOCK, &probe_b);
+    assert_eq!(*probe_b.asked.borrow(), [(9, 77), (9, 0)]);
+    assert!(pb.faults.is_empty(), "{:?}", pb.faults);
+
+    // Case C: StopAll preserves both running-track and already-saved banks
+    let probe_c = Probe {
+        lot: on_lot(&[(9, 400)]),
+        asked: Default::default(),
+    };
+    let mut pc = make_player();
+    play_on(&mut pc, 9, &probe_c.lot);
+    pc.render(BLOCK, &probe_c);
+    pc.handle(&SoundEvent::StopAll, &probe_c);
+    pc.handle(&SoundEvent::StopAll, &probe_c); // second StopAll keeps saved bank
+    pc.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: "e2".into(),
+        },
+        &probe_c,
+    );
+    pc.render(2 * BLOCK, &probe_c);
+    assert_eq!(*probe_c.asked.borrow(), [(9, 77), (9, 0)]);
+
+    // Case D: kind 53 writes PATCH=2 to the stopped bank and keeps it after playback ends
+    pc.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: "seq".into(),
+        },
+        &probe_c,
+    );
+    pc.render_until_idle(RATE as usize, &probe_c);
+    assert!(pc.is_idle());
+    probe_c.asked.borrow_mut().clear();
+    pc.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: "e2".into(),
+        },
+        &probe_c,
+    );
+    pc.render(2 * BLOCK, &probe_c);
+    assert_eq!(*probe_c.asked.borrow(), [(9, 77), (9, 2)]);
+    assert!(pc.faults.is_empty(), "{:?}", pc.faults);
+}
+
+#[test]
+fn patch_write_stops_idle_kind_53_voice_and_is3d_does_not_refresh_muted_idle_voice() {
+    // 1) Writing `Is3d` (26) to a stopped track with an idle kind-53 voice
+    //    after muting its group must NOT refresh/silence the voice (`0x57df08`
+    //    refreshes on `IsHeadRelative` = 27, not `Is3d` = 26).
+    // 2) Writing `PATCH = 0` (`0x32` -> `0x57f625`) stops the idle voice at once.
+    let mut write_is3d = loadl(53, 10);
+    write_is3d.extend(loadl(26, 0));
+    write_is3d.push(END);
+    let mut clear_patch = loadl(53, 10);
+    clear_patch.extend(loadl(50, 0));
+    clear_patch.push(END);
+    let (hit, addresses) = assemble(&[&[END], &write_is3d, &clear_patch]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         0x102={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         2=0,two,\"two.xa\"\n\
+         [GlobalHitList]\n\
+         6=2\n\
+         [Track]\n\
+         10=0,idle_trk,1024,0,0,1,0,0x100,1\n\
+         11=0,is3d_writer,1024,0,0,0,0,0x101,1\n\
+         12=0,patch_writer,1024,0,0,0,0,0x102,1\n\
+         [EventMapping]\n\
+         e0=1,10\n\
+         e1=1,11\n\
+         e2=1,12\n\
+         seq=53,10,0,6\n",
+        addresses[0], addresses[1], addresses[2]
+    );
+    let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+    let mut player = Player::new(vec![module], long_sample("two.xa"), 1);
+    let lot = on_lot(&[(9, 400)]);
+    player.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: "seq".into(),
+        },
+        &lot,
+    );
+    assert_eq!(player.render(BLOCK, &lot)[0], 10_000);
+    player.set_group_volume(1, 0);
+    // Writing Is3d (26) leaves the idle voice audible.
+    play(&mut player, "e1");
+    assert_eq!(player.render(2 * BLOCK, &lot)[BLOCK], 10_000);
+    // Writing PATCH = 0 tears down the idle voice immediately.
+    play(&mut player, "e2");
+    let after = player.render(BLOCK, &lot);
+    assert!(after.iter().all(|&s| s == 0), "{after:?}");
+    assert!(player.is_idle());
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn camera_places_silent_instance_and_killed_hold_does_not_gate_idle_voice() {
+    // 1) Moving the camera while a track with a recorded instance is silent
+    //    writes placement to its persistent stopped bank (`0x574728`,
+    //    `0x574732`), so a following kind-53 voice starts panned right.
+    // 2) Pausing a running track, killing it with `kill_trk`, and then
+    //    starting a kind-53 voice plays audibly (hold cleared on kill and
+    //    idle voices never gated by `held`).
+    let mut hold_me = loadl(5, 1000);
+    hold_me.extend([WAIT, 5, END]);
+    let mut kill_10 = loadl(5, 10);
+    kill_10.extend([KILL_TRK, 5, END]);
+    let (hit, addresses) = assemble(&[&[END], &hold_me, &kill_10]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         0x102={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         2=0,two,\"two.xa\"\n\
+         [GlobalHitList]\n\
+         6=2\n\
+         [Track]\n\
+         10=0,silent_trk,1024,2,0,0,0,0x100,1\n\
+         11=0,held_trk,1024,0,0,0,0,0x101,1\n\
+         12=0,killer_trk,1024,0,0,0,0,0x102,1\n\
+         [EventMapping]\n\
+         e0=1,10\n\
+         e1=1,11\n\
+         e2=1,12\n\
+         seq10=53,10,0,6\n\
+         seq11=53,11,0,6\n",
+        addresses[0], addresses[1], addresses[2]
+    );
+    let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+    let mut player = Player::new(vec![module], long_sample("two.xa"), 1);
+    let center = on_lot(&[(9, 400)]);
+    let right = on_lot(&[(9, 800)]);
+
+    // Part 1: track 10 records object 9 centered, ends immediately, camera moves right.
+    play_on(&mut player, 9, &center);
+    player.render(BLOCK, &center);
+    assert!(player.is_idle());
+    player.camera_moved(0, u32::MAX, &right);
+    player.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: "seq10".into(),
+        },
+        &right,
+    );
+    let stereo = player.render_stereo(BLOCK, &right);
+    let [left_s, right_s] = [stereo[0], stereo[1]];
+    assert!(
+        right_s > left_s && left_s > 0,
+        "left={left_s} right={right_s}"
+    );
+
+    // Part 2: pause track 11, kill it via `kill_trk`, then play kind 53 on it.
+    let mut kill_11 = loadl(5, 11);
+    kill_11.extend([KILL_TRK, 5, END]);
+    let (hit2, a2) = assemble(&[&hold_me, &kill_11]);
+    let hot2 = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         2=0,two,\"two.xa\"\n\
+         [GlobalHitList]\n\
+         6=2\n\
+         [Track]\n\
+         11=0,held_trk,1024,0,0,0,0,0x100,1\n\
+         12=0,killer_trk,1024,0,0,0,0,0x101,1\n\
+         [EventMapping]\n\
+         e0=1,11\n\
+         e1=1,12\n\
+         seq11=53,11,0,6\n",
+        a2[0], a2[1]
+    );
+    let m2 = Module::parse("test", &hit2, b"v1 5\n", hot2.as_bytes()).unwrap();
+    let mut p2 = Player::new(vec![m2], long_sample("two.xa"), 1);
+    play(&mut p2, "e0");
+    p2.render(BLOCK, &NoSources);
+    p2.handle(&SoundEvent::Pause, &NoSources);
+    play(&mut p2, "e1"); // kill_trk 11 while track 11 is held
+    p2.render(BLOCK, &NoSources);
+    p2.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: "seq11".into(),
+        },
+        &center,
+    );
+    assert_eq!(p2.render(BLOCK, &center)[0], 10_000);
+    assert!(p2.faults.is_empty(), "{:?}", p2.faults);
+}
+
+#[test]
+fn routed_main_duckpri_on_stopped_track_updates_global() {
+    // `0x57e011 -> 0x57d2cb` updates the target track's `main_duckpri`
+    // request even when the target track is stopped.
+    let mut writer = loadl(53, 11);
+    writer.extend(loadl(123, 100));
+    writer.push(END);
+    let reader: &[u8] = &[GETSRCDATAFIELD, 6, 1, 123, END];
+    let probe = Probe {
+        lot: on_lot(&[(8, 400)]),
+        asked: Default::default(),
+    };
+    let mut player = Player::new(vec![module(&[&writer, &[END], reader], 1)], samples(), 1);
+    play_on(&mut player, 8, &probe.lot);
+    player.render(BLOCK, &probe);
+    player.handle(
+        &SoundEvent::Play {
+            object: 8,
+            name: "e2".into(),
+        },
+        &probe,
+    );
+    player.render(BLOCK, &probe);
+    assert_eq!(*probe.asked.borrow(), [(8, 100)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn patch_write_on_running_track_tears_down_note_so_end_kills_without_run_on() {
+    // `0x57dfe8 -> 0x57e040 -> 0x57f625`: writing `PATCH` on a running
+    // track immediately tears down its active voice, so a following `end`
+    // takes the immediate-kill branch and never runs trailing instructions.
+    let mut r0 = NOTE_ON_V1.to_vec();
+    r0.extend(loadl(50, 0)); // PATCH = 0 stops the playing voice
+    r0.push(END);
+    r0.extend(loadl(110, 99)); // must NOT run
+    r0.push(END);
+    let ask: &[u8] = &[GETSRCDATAFIELD, 6, 1, 110, END];
+    let probe = Probe {
+        lot: on_lot(&[(8, 400)]),
+        asked: Default::default(),
+    };
+    let mut player = Player::new(vec![module(&[&r0, ask], 1)], long_sample("one.xa"), 1);
+    play_on(&mut player, 8, &probe.lot);
+    let out = player.render(BLOCK, &probe);
+    assert!(out.iter().all(|&s| s == 0), "{out:?}");
+    assert!(player.is_idle());
+    player.handle(
+        &SoundEvent::Play {
+            object: 8,
+            name: "e1".into(),
+        },
+        &probe,
+    );
+    player.render(BLOCK, &probe);
+    assert_eq!(*probe.asked.borrow(), [(8, 0)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn killing_a_stopped_track_clears_patch_and_main_duckpri() {
+    // `kill_trk`, `StopAll`, and zero-`EXTVOL` `seqgroup_kill` all call
+    // `0x57dd3e` unconditionally on a stopped track, clearing both `PATCH`
+    // (written by kind 53) and `MAIN_DUCKPRI` (written through `target`).
+    let mut claim_and_stop = loadl(5, 1);
+    claim_and_stop.extend([SEQGROUP_RETURN, 5]);
+    claim_and_stop.extend(loadl(19, 0)); // extvol = 0
+    claim_and_stop.push(END);
+
+    let mut set_duck = loadl(53, 10);
+    set_duck.extend(loadl(123, 100));
+    set_duck.push(END);
+
+    let mut kill_10 = loadl(5, 10);
+    kill_10.extend([KILL_TRK, 5, END]);
+
+    let mut seq_kill = loadl(5, 1);
+    seq_kill.extend([SEQGROUP_KILL, 5, END]);
+
+    let mut read_state = loadl(53, 10);
+    read_state.extend([GETSRCDATAFIELD, 6, 1, 50]); // PATCH on stopped track 10
+    read_state.extend([GETSRCDATAFIELD, 6, 1, 123]); // global MAIN_DUCKPRI
+    read_state.push(END);
+
+    let (hit, addresses) =
+        assemble(&[&claim_and_stop, &set_duck, &kill_10, &seq_kill, &read_state]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         0x102={:#x}\n\
+         0x103={:#x}\n\
+         0x104={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         2=0,two,\"two.xa\"\n\
+         [GlobalHitList]\n\
+         6=2\n\
+         [Track]\n\
+         10=0,victim,1024,0,0,0,0,0x100,1\n\
+         11=0,ducker,1024,0,0,0,0,0x101,1\n\
+         12=0,killtrk,1024,0,0,0,0,0x102,1\n\
+         13=0,seqkill,1024,0,0,0,0,0x103,1\n\
+         14=0,reader,1024,0,0,0,0,0x104,1\n\
+         [EventMapping]\n\
+         e0=1,10\n\
+         e1=1,11\n\
+         e2=1,12\n\
+         e3=1,13\n\
+         e4=1,14\n\
+         seq=53,10,0,6\n",
+        addresses[0], addresses[1], addresses[2], addresses[3], addresses[4]
+    );
+    for mode in ["kill_trk", "stop_all", "seqgroup_kill"] {
+        let m = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+        let mut p = Player::new(vec![m], samples(), 1);
+        let probe = Probe {
+            lot: on_lot(&[(8, 400)]),
+            asked: Default::default(),
+        };
+        play(&mut p, "e0"); // track 10 claims group 1, sets extvol = 0, ends
+        p.render(BLOCK, &probe);
+        // Set PATCH = 2 via kind 53 (let short sample finish) and MAIN_DUCKPRI = 100.
+        play(&mut p, "seq");
+        p.render_until_idle(RATE as usize, &probe);
+        play(&mut p, "e1");
+        p.render(BLOCK, &probe);
+        match mode {
+            "kill_trk" => {
+                play(&mut p, "e2");
+                p.render(BLOCK, &probe);
+            }
+            "stop_all" => {
+                p.handle(&SoundEvent::StopAll, &probe);
+            }
+            "seqgroup_kill" => {
+                play(&mut p, "e3");
+                p.render(BLOCK, &probe);
+            }
+            _ => unreachable!(),
+        }
+        play(&mut p, "e4");
+        p.render(BLOCK, &probe);
+        assert_eq!(*probe.asked.borrow(), [(9, 0), (9, 0)], "mode={mode}");
+        assert!(p.faults.is_empty(), "mode={mode}: {:?}", p.faults);
+    }
+}
+
+#[test]
+fn seqgroup_kill_routes_holder_extvol_and_fade_writes_through_target() {
+    // `0x57ef5b` reads `EXTVOL` through the holder's `target`: track 10
+    // has local `EXTVOL = 1024`, plays a note, claims seqgroup 1, and
+    // targets stopped track 11 whose `EXTVOL` is 0. When track 12 runs
+    // `seqgroup_kill 1`, it reads 0 through track 10's target and kills
+    // track 10 immediately.
+    let mut set_t11_zero = loadl(53, 11);
+    set_t11_zero.extend(loadl(19, 0));
+    set_t11_zero.push(END);
+
+    let mut holder = NOTE_ON_V1.to_vec();
+    holder.extend(loadl(5, 1));
+    holder.extend([SEQGROUP_RETURN, 5]);
+    holder.extend(loadl(53, 11)); // target stopped track 11 (extvol = 0)
+    holder.push(SET_LOOP);
+    holder.extend(loadl(6, 1000));
+    holder.extend([WAIT, 6, LOOP]);
+
+    let mut killer = loadl(5, 1);
+    killer.extend([SEQGROUP_KILL, 5, END]);
+
+    let mut player = Player::new(
+        vec![module(&[&holder, &[END], &killer, &set_t11_zero], 1)],
+        long_sample("one.xa"),
+        1,
+    );
+    play(&mut player, "e3"); // write extvol = 0 on stopped track 11
+    player.render(BLOCK, &NoSources);
+    play(&mut player, "e0"); // holder runs with local extvol 1024, target 11
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    play(&mut player, "e2"); // seqgroup_kill 1 kills holder immediately
+    let after = player.render(BLOCK, &NoSources);
+    assert!(after.iter().all(|&s| s == 0), "{after:?}");
+    assert!(player.is_idle());
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn kind_18_writes_fade_registers_and_clears_fade_on_for_stopped_track() {
+    // `0x5739d4..0x5739fe` writes `FADE_DEST = 0`, `FADE_VAR = EXTVOL (19)`,
+    // `FADE_SPEED = 75`, and `FADE_ON = 1` (forced to 0 by `0x57e059`) on a
+    // stopped registered track.
+    let mut reader = loadl(53, 10);
+    reader.extend([GETSRCDATAFIELD, 6, 1, 40]); // FADE_DEST
+    reader.extend([GETSRCDATAFIELD, 6, 1, 41]); // FADE_VAR
+    reader.extend([GETSRCDATAFIELD, 6, 1, 42]); // FADE_SPEED
+    reader.extend([GETSRCDATAFIELD, 6, 1, 45]); // FADE_ON
+    reader.push(END);
+    let module = module_with(&[&[END], &reader], 1, 10, "fade75=18,10,75,0,1\n");
+    let mut player = Player::new(vec![module], samples(), 1);
+    let probe = Probe {
+        lot: on_lot(&[(8, 400)]),
+        asked: Default::default(),
+    };
+    play(&mut player, "fade75");
+    play(&mut player, "e1");
+    player.render(BLOCK, &probe);
+    assert_eq!(*probe.asked.borrow(), [(0, 0), (0, 19), (0, 75), (0, 0)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn never_started_track_reads_zero_patch_after_kill_trk_and_stop_all() {
+    // In 1.91 (`0x57db54..0x57db67`), the HOT patch ID is loaded into live
+    // register `PATCH` (50) only on a fresh start; a never-started track
+    // reads `PATCH == 0`, including after `kill_trk` or `StopAll`.
+    let mut kill_10 = loadl(5, 10);
+    kill_10.extend([KILL_TRK, 5, END]);
+    let mut read_patch = loadl(53, 10);
+    read_patch.extend([GETSRCDATAFIELD, 6, 1, 50, END]);
+    let probe = Probe {
+        lot: on_lot(&[(8, 400)]),
+        asked: Default::default(),
+    };
+    let mut player = Player::new(
+        vec![module(&[&[END], &kill_10, &read_patch], 1)],
+        samples(),
+        1,
+    );
+    play(&mut player, "e1"); // kill_trk 10 (never started)
+    player.render(BLOCK, &probe);
+    play(&mut player, "e2"); // read track 10's PATCH -> 0
+    player.render(BLOCK, &probe);
+    player.handle(&SoundEvent::StopAll, &probe);
+    play(&mut player, "e2"); // read track 10's PATCH -> 0
+    player.render(BLOCK, &probe);
+    assert_eq!(*probe.asked.borrow(), [(0, 0), (0, 0)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
