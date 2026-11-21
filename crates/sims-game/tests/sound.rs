@@ -312,8 +312,9 @@ fn window_focus_changes_forward_kind_25_and_deduplicate_initial_focus() {
     );
 
     // Focus loss followed immediately by focus regain (with no tick in
-    // between) restores pause without sending Pause or Unpause on the next
-    // update (matching 0x4cee4a dirty flag resolution at 0x4ce5b0).
+    // between) restores `paused = false` and still marks pause dirty
+    // (`0x4cee4a` sets bit `0x40` unconditionally), so the next update
+    // dispatches `SoundEvent::Unpause` (`0x4ce5d9`).
     assert!(feed.set_focused(false, &mut game, |input| mixer.input(input)));
     assert!(game.paused());
     assert!(feed.set_focused(true, &mut game, |input| mixer.input(input)));
@@ -323,11 +324,12 @@ fn window_focus_changes_forward_kind_25_and_deduplicate_initial_focus() {
         sent.push(input.clone());
         mixer.input(input);
     });
+    assert!(sent.contains(&Input::Events(vec![SoundEvent::Unpause])));
     assert!(!sent.contains(&Input::Events(vec![SoundEvent::Pause])));
-    assert!(!sent.contains(&Input::Events(vec![SoundEvent::Unpause])));
 
     // Focus cycling while the lot is ALREADY paused saves saved_paused=true
-    // and keeps the lot and live ambience paused after refocusing.
+    // and keeps the lot and live ambience paused after refocusing (still
+    // dispatching `SoundEvent::Pause` for the dirty pause bit at `0x4ce5c5`).
     game.toggle_pause();
     feed.update(&mut game, |input| mixer.input(input));
     let _ = mixer.render(6 * RATE as usize);
@@ -335,7 +337,12 @@ fn window_focus_changes_forward_kind_25_and_deduplicate_initial_focus() {
     assert!(game.paused());
     assert!(!feed.set_focused(true, &mut game, |input| mixer.input(input)));
     assert!(game.paused());
-    feed.update(&mut game, |input| mixer.input(input));
+    sent.clear();
+    feed.update(&mut game, |input| {
+        sent.push(input.clone());
+        mixer.input(input);
+    });
+    assert!(sent.contains(&Input::Events(vec![SoundEvent::Pause])));
     assert!(
         mixer.render(4 * RATE as usize).iter().all(|&s| s == 0),
         "regaining focus while paused must keep live ambience paused"

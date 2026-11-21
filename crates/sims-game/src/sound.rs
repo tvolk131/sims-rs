@@ -384,6 +384,10 @@ pub struct Feed {
     shot: Option<Shot>,
     /// Whether the sound was last told the lot is paused.
     paused: bool,
+    /// Whether `0x4cee4a` marked the pause flag dirty (`or [esi + 0xc], 0x40`)
+    /// so the next [`Feed::update`] dispatches `pause_event(game.paused())`
+    /// even when the final pause boolean matches `self.paused`.
+    pause_dirty: bool,
     /// Whether the window is focused (`true` at startup, matching
     /// `0x4eee14` and `0x4f7610` deduplication).
     focused: bool,
@@ -399,6 +403,7 @@ impl Default for Feed {
             told: None,
             shot: None,
             paused: false,
+            pause_dirty: false,
             focused: true,
             saved_paused: false,
         }
@@ -448,6 +453,8 @@ impl Feed {
             if !self.saved_paused {
                 game.toggle_pause();
             }
+            // `0x4cee4a` sets dirty bit `0x40` unconditionally.
+            self.pause_dirty = true;
             game.paused() != self.saved_paused
         } else {
             let first = self.told.is_none();
@@ -463,6 +470,10 @@ impl Feed {
             if before != self.saved_paused {
                 game.toggle_pause();
             }
+            // `0x4cee4a` sets dirty bit `0x40` unconditionally, so a rapid
+            // blur-then-refocus still dispatches the final pause state on
+            // the next update (`0x4ce5b0`).
+            self.pause_dirty = true;
             game.paused() != before
         };
         self.focused = focused;
@@ -485,9 +496,10 @@ impl Feed {
             send(Input::Events(enter_live()));
         }
         let paused = game.paused();
-        if paused != self.paused {
+        if paused != self.paused || self.pause_dirty {
             send(Input::Events(vec![pause_event(paused)]));
             self.paused = paused;
+            self.pause_dirty = false;
         }
         let sounds = game.take_sounds();
         if !sounds.is_empty() {

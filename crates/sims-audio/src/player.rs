@@ -1014,9 +1014,8 @@ impl<S: Samples> Player<S> {
     pub fn set_global(&mut self, register: u8, value: i32) {
         assert!(register >= GLOBALS, "register {register} is not global");
         let slot = &mut self.globals[usize::from(register - GLOBALS)];
-        let changed = *slot != value;
         *slot = value;
-        if register == MAIN_DUCKPRI && changed {
+        if register == MAIN_DUCKPRI {
             self.apply_running_gains(None);
         }
     }
@@ -1095,7 +1094,16 @@ impl<S: Samples> Player<S> {
         for voice in &mut self.voices {
             voice.note.gains = ambient_gains(voice.volume, voice.pan, self.master);
         }
-        self.apply_running_gains(None);
+        let gains: BTreeMap<u32, [i32; 2]> = self
+            .threads
+            .iter()
+            .map(|t| (t.id, self.levels(t).gains))
+            .collect();
+        for note in &mut self.notes {
+            if let Some(&gains) = gains.get(&note.thread) {
+                note.gains = gains;
+            }
+        }
     }
 
     /// Adds an ambience score for a mode (see [`ambience::SCORES`]), its
@@ -1894,7 +1902,7 @@ impl<S: Samples> Player<S> {
         self.idle.remove(&id);
         self.stopped.remove(&id);
         self.duck.remove(&id);
-        self.update_main_duckpri();
+        self.update_main_duckpri(true);
         self.track_objects.remove(&id);
         self.last_start.remove(&id);
         self.notes.retain(|n| n.patch != id);
@@ -2020,7 +2028,7 @@ impl<S: Samples> Player<S> {
     pub fn pause(&mut self) {
         self.paused = true;
         self.duck.clear();
-        self.update_main_duckpri();
+        self.update_main_duckpri(true);
         self.stop_day_night();
         let tracks: BTreeSet<u32> = self
             .threads
@@ -2311,7 +2319,7 @@ impl<S: Samples> Player<S> {
         for mode in modes {
             self.with_score(mode, |score, host| score.stop(host));
         }
-        self.update_main_duckpri();
+        self.update_main_duckpri(false);
     }
 
     /// Kind 23: *(code)* forgets every instance of an object (0: none)
@@ -2899,7 +2907,7 @@ impl<S: Samples> Player<S> {
         self.stopped.insert(thread.track, registers);
         self.held.remove(&thread.track);
         self.duck.remove(&thread.track);
-        self.update_main_duckpri();
+        self.update_main_duckpri(true);
     }
 
     /// *(code)* Unconditional kill on a stopped registered track object
@@ -2917,7 +2925,7 @@ impl<S: Samples> Player<S> {
         }
         self.held.remove(&track);
         self.duck.remove(&track);
-        self.update_main_duckpri();
+        self.update_main_duckpri(true);
     }
 
     /// Reads a local register (`r < GLOBALS`) from a stopped track object.
@@ -3047,12 +3055,7 @@ impl<S: Samples> Player<S> {
                 break;
             }
             let until_block = BLOCK - (self.frame % BLOCK as u64) as usize;
-            let mut count = until_block.min(limit - out.len());
-            if self.nudge != 0 {
-                let until_timer = TIMER_FRAMES - (self.frame % TIMER_FRAMES as u64) as usize;
-                count = count.min(until_timer);
-            }
-            out.extend(self.render(count, sources));
+            out.extend(self.render(until_block.min(limit - out.len()), sources));
         }
         out
     }
@@ -3134,14 +3137,17 @@ impl<S: Samples> Player<S> {
         })
     }
 
-    /// *(code)* Refreshes gains (only, not pitch) on running tracks' notes
-    /// (`0x57c0ea` → `0x57f759`, `0x57cc74` → `0x57f759`), skipping idle
-    /// kind-53 voices (`thread == 0`). When `group` is `Some(g)`, only
-    /// running tracks in group `g` are refreshed (`0x57c18b..0x57c197`).
+    /// *(code)* Refreshes gains (only, not pitch) on unheld running tracks'
+    /// notes (`0x57c0ea` → `0x57f759`, `0x57cc74` → `0x57f759`), skipping
+    /// held tracks (`0x57dc5a` removes held tracks from the running list)
+    /// and idle kind-53 voices (`thread == 0`). When `group` is `Some(g)`,
+    /// only unheld running tracks in group `g` are refreshed
+    /// (`0x57c18b..0x57c197`).
     fn apply_running_gains(&mut self, group: Option<i64>) {
         let gains: BTreeMap<u32, [i32; 2]> = self
             .threads
             .iter()
+            .filter(|t| !self.held.contains(&t.track))
             .filter(|t| group.is_none_or(|g| t.group == g))
             .map(|t| (t.id, self.levels(t).gains))
             .collect();
@@ -3156,14 +3162,19 @@ impl<S: Samples> Player<S> {
     /// request is dropped in [`Player::save_stopped`], matching `0x57d2cb`,
     /// while routed requests on stopped tracks remain until cleared).
     fn forget_ended(&mut self) {
-        self.update_main_duckpri();
+        self.update_main_duckpri(false);
     }
 
-    fn update_main_duckpri(&mut self) {
+    /// *(code)* Recomputes `main_duckpri` (global 123, `0x57d2cb`). When
+    /// `refresh_always` is true (every `MAIN_DUCKPRI` write or kill,
+    /// `0x57d31e` → `0x57cc74`), refreshes all unheld running voices even
+    /// when the maximum stays the same.
+    fn update_main_duckpri(&mut self, refresh_always: bool) {
         let largest = self.duck.values().copied().fold(0, i32::max);
         let slot = &mut self.globals[usize::from(MAIN_DUCKPRI - GLOBALS)];
-        if *slot != largest {
-            *slot = largest;
+        let changed = *slot != largest;
+        *slot = largest;
+        if refresh_always || changed {
             self.apply_running_gains(None);
         }
     }
@@ -3509,14 +3520,20 @@ impl<S: Samples> Player<S> {
                 if r < GLOBALS {
                     self.write_stopped(stopped_track, r, value);
                 } else if r == MAIN_DUCKPRI {
-                    // *(code)* 0x57e011 → 0x57d2cb: updates the track's
-                    // ducking request without checking `is_running`.
+                    // *(code)* 0x57e011 → 0x57d2cb → 0x57d31e: updates the
+                    // track's ducking request without checking `is_running`
+                    // and refreshes all unheld running voices (syncing the
+                    // caller's live clone first so same-block target/local
+                    // writes are visible).
+                    if let Some(slot) = self.threads.iter_mut().find(|t| t.id == thread.id) {
+                        *slot = thread.clone();
+                    }
                     if value == 0 {
                         self.duck.remove(&stopped_track);
                     } else {
                         self.duck.insert(stopped_track, value);
                     }
-                    self.update_main_duckpri();
+                    self.update_main_duckpri(true);
                 } else {
                     self.globals[usize::from(r - GLOBALS)] = value;
                 }
@@ -3534,11 +3551,12 @@ impl<S: Samples> Player<S> {
                 self.notes.retain(|n| n.thread != written_id);
                 return;
             }
-            // *(code)* 0x57def1..0x57e057: level/pan/duck/3D writes refresh
-            // the written track's voice gains (`0x57f759`) and `pitch`
-            // writes refresh its rate (`0x57f71d`) immediately.
-            let update_gains =
-                matches!(r, VOL | EXTVOL | PAN | DUCKPRI | THREE_D | 27 | 30..=32 | 56..=57);
+            // *(code)* 0x57def1..0x57e057: only level/pan registers (`vol`,
+            // `extvol`, `pan`, `IsHeadRelative` = 27, 30..=32, 56..=57)
+            // refresh voice gains (`0x57f759`) and only `pitch` refreshes
+            // rate (`0x57f71d`); `duckpri` (25) and `Is3d` (26) leave the
+            // voice latched until the next refresh.
+            let update_gains = matches!(r, VOL | EXTVOL | PAN | 27 | 30..=32 | 56..=57);
             let update_pitch = r == PITCH;
             if update_gains || update_pitch {
                 let snapshot = written.clone();
@@ -3561,7 +3579,7 @@ impl<S: Samples> Player<S> {
             } else {
                 self.duck.insert(duck_track, value);
             }
-            self.update_main_duckpri();
+            self.update_main_duckpri(true);
         } else {
             self.globals[usize::from(r - GLOBALS)] = value;
         }

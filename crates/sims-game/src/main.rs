@@ -549,6 +549,9 @@ impl ApplicationHandler for App {
                         .sound_feed
                         .set_focused(focused, &mut self.game, |input| self.sound.send(input))
                 {
+                    // Drop any wall-clock time spent paused or stalled while
+                    // unfocused so the first tick after resume does not catch up.
+                    self.last = Instant::now();
                     self.changed(true);
                 }
             }

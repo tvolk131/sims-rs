@@ -5901,3 +5901,152 @@ fn group_volume_refresh_reads_voice_levels_through_target() {
     assert!(player.render(BLOCK * 3, &NoSources).iter().all(|&s| s == 0));
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
+
+#[test]
+fn slider_and_ducking_updates_leave_held_voices_latched() {
+    // `0x57dc5a` removes held tracks from the running list walked by both
+    // `0x57c0ea` (group volume) and `0x57cc74` (`main_duckpri`). A held note
+    // therefore keeps its latched gain across slider/ducking updates until
+    // something refreshes it after resuming.
+    let loop_note: &[u8] = &[SET_LOOP, NOTE_ON_V1[0], NOTE_ON_V1[1], WAIT_SAMP, LOOP];
+    let mut set_duck = loadl(123, 5);
+    set_duck.extend([SET_LOOP, LOOP]);
+    let (hit, addresses) = assemble(&[loop_note, &set_duck]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         [Track]\n\
+         10=0,sfx,1024,0,0,1,0,0x100,1\n\
+         11=0,ducker,1024,0,0,0,0,0x101,1\n\
+         [EventMapping]\n\
+         sfx=1,10\n\
+         ducker=1,11\n\
+         fx0=37,0\n",
+        addresses[0], addresses[1]
+    );
+    let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+    let mut player = Player::new(vec![module], long_sample("one.xa"), 1);
+
+    play(&mut player, "sfx");
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    player.handle(&SoundEvent::Pause, &NoSources);
+    // Lower FX slider to 0 and have an unheld track raise main_duckpri
+    // while track 10 is held.
+    play(&mut player, "fx0");
+    play(&mut player, "ducker");
+    assert!(player.render(BLOCK, &NoSources).iter().all(|&s| s == 0));
+    player.handle(&SoundEvent::Unpause, &NoSources);
+    // Track 10's resumed note still plays at its latched gain (10_000)
+    // because 0x57c0ea and 0x57cc74 skipped it while held.
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn duckpri_and_is3d_latch_until_main_duckpri_refresh_including_unchanged_max_and_stopped_target() {
+    // 1) Writing `DUCKPRI` (25) or `Is3d` (26) does NOT call 0x57f759
+    //    (0x57def1..0x57e057), so a ducked note stays ducked.
+    // 2) A subsequent `MAIN_DUCKPRI` write refreshes all unheld running
+    //    voices at 0x57d31e -> 0x57cc74 EVEN when the maximum stays the same.
+    // 3) A `MAIN_DUCKPRI` write routed to a stopped target in the same block
+    //    as `target = 11` sees the caller's new `target` during that refresh.
+    let mut ducked = NOTE_ON_V1.to_vec();
+    ducked.extend([SET_LOOP, LOADL, 5, 10, 0, 0, 0, WAIT, 5]);
+    ducked.extend(loadl(25, 10)); // raise DUCKPRI above main_duckpri=5 (must stay latched!)
+    ducked.extend(loadl(26, 1)); // toggle Is3d (must stay latched!)
+    ducked.extend([SET_LOOP, LOOP]);
+
+    let mut set_duck_5 = loadl(123, 5);
+    set_duck_5.extend([SET_LOOP, LOOP]);
+
+    let mut same_max_duck = loadl(123, 5);
+    same_max_duck.push(END);
+
+    let (hit, addresses) = assemble(&[&ducked, &set_duck_5, &same_max_duck]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         0x102={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         [Track]\n\
+         10=0,t10,1024,0,0,1,0,0x100,1\n\
+         11=0,t11,1024,0,0,1,0,0x101,1\n\
+         12=0,t12,1024,0,0,1,0,0x102,1\n\
+         [EventMapping]\n\
+         e0=1,10\n\
+         e1=1,11\n\
+         e2=1,12\n",
+        addresses[0], addresses[1], addresses[2]
+    );
+    let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+    let mut player = Player::new(vec![module], long_sample("one.xa"), 1);
+
+    play(&mut player, "e1"); // sets MAIN_DUCKPRI = 5
+    play(&mut player, "e0"); // plays ducked (duckpri=0 < 5) -> half gain
+    let initial = player.render(BLOCK, &NoSources)[0];
+    assert!(initial > 0 && initial < 6_000, "{initial}");
+    // Advance past the 10 ms wait so e0 writes DUCKPRI=10 and Is3d=1.
+    // Neither refreshes the voice, so gain stays latched at `initial`.
+    let after_writes = player.render(BLOCK * 6, &NoSources);
+    assert_eq!(*after_writes.last().unwrap(), initial);
+    // Track 12 writes MAIN_DUCKPRI=5 (maximum unchanged at 5): 0x57d31e
+    // still refreshes all unheld running voices, lifting track 10 to full.
+    play(&mut player, "e2");
+    let refreshed = player.render(BLOCK, &NoSources)[0];
+    assert_eq!(refreshed, 10_000);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+
+    // Part 2: same-block target switch + stopped-target MAIN_DUCKPRI write.
+    let mut zero_11 = loadl(53, 11);
+    zero_11.extend(loadl(19, 0));
+    zero_11.push(END);
+
+    let mut same_block = NOTE_ON_V1.to_vec();
+    same_block.extend(loadl(53, 11)); // target stopped track 11 (EXTVOL=0)
+    same_block.extend(loadl(123, 5)); // routed MAIN_DUCKPRI on stopped 11
+    same_block.extend([SET_LOOP, LOOP]);
+
+    let mut player2 = Player::new(
+        vec![module_with(&[&same_block, &[END], &zero_11], 1, 10, "")],
+        long_sample("one.xa"),
+        1,
+    );
+    play(&mut player2, "e2");
+    player2.render(BLOCK, &NoSources);
+    play(&mut player2, "e0");
+    // Refresh during MAIN_DUCKPRI sees e0's new target=11 (EXTVOL=0) immediately.
+    assert!(player2.render(BLOCK, &NoSources).iter().all(|&s| s == 0));
+    assert!(player2.faults.is_empty(), "{:?}", player2.faults);
+}
+
+#[test]
+fn render_until_idle_ends_on_block_boundary_even_with_nudge_armed() {
+    // `render_until_idle` always finishes on a `BLOCK` (64-frame) boundary
+    // even when the 20 ms nudge timer (`TIMER_FRAMES = 441`) fires mid-block.
+    let mut map = BTreeMap::new();
+    map.insert(
+        "one.xa".to_owned(),
+        Pcm {
+            rate: RATE,
+            channels: 1,
+            samples: vec![1000; 440],
+        },
+    );
+    let generic: &[u8] = &[NOTE_ON_V1[0], NOTE_ON_V1[1], WAIT_SAMP, END];
+    let mut player = Player::new(vec![module(&[generic], 1)], map, 1);
+    player.set_active(true, &NoSources); // arms 20 ms nudge countdown
+    play(&mut player, "e0");
+    let out = player.render_until_idle(RATE as usize, &NoSources);
+    // Note ends at frame 440; `render_until_idle` stops at frame 448 (7 * 64),
+    // NOT at the mid-block timer tick at frame 441.
+    assert_eq!(out.len(), 7 * BLOCK);
+    assert!(player.is_idle());
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
