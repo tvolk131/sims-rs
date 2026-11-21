@@ -59,8 +59,9 @@ impl Machine<'_, '_> {
             .position;
         let position = [p0, p1];
         let interpreter = self.interpreter();
-        let unsupported =
-            |fault| Trap::Unsupported(format!("Grab of object {target} by object {me}: {fault}"));
+        let unsupported = |fault: crate::fault::Fault| {
+            fault.unsupported_in(format!("Grab of object {target} by object {me}"))
+        };
         if !interpreter
             .fits_in(self.world, target, me, 0, position, level)
             .map_err(unsupported)?
