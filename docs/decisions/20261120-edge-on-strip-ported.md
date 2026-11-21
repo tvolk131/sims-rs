@@ -48,12 +48,32 @@ hide-with-walls flag, as in the running game):
   270345 to 270155 of 336000. Medium and near get worse because of the
   open question below: there the strip is drawn on another tile.
 
-Open, recorded as evidence rather than ruled on: at medium and near our
-cutaway mask holds 18 more tiles than at far, and with it the strip is
-drawn on (27,24) and (24,31) instead of (26,23), where the original
-draws it at every zoom; at (27,24) most of the strip is behind the floor
-beyond it, and what shows is out of place. Building the medium and near
-masks as at far zoom puts it on (26,23) and gives medium 317864 and near
-271711, the strip then matching the original's from its top row.
-Whether the original's mask is the same at every zoom, or what else
-differs, is not read, so the mask is unchanged here.
+Open, and not changed here: at medium and near our cutaway mask holds
+18 more tiles than at far for room 2, and with it the strip is drawn on
+(27,24) and (24,31) instead of (26,23), where the original draws it at
+every zoom; at (27,24) most of the strip is behind the floor beyond it,
+and what shows is out of place. The cause has been read since, and it is
+the mask, not the strip:
+
+- The original builds each room's mask (0x468203, kept at the room's
+  +0x80) only when the view turns (0x4a8006), the level changes
+  (0x4a8116) or the rooms are recomputed (0x466ef6, 0x41648c). A zoom
+  change (0x4a7c9f) only combines the kept masks (0x4ab992, at
+  0x4abafe). A house opens at far zoom (0x4a6c5f), so the House02
+  medium and near shots use masks built at far. Ours is rebuilt at the
+  zoom shown.
+- Built at medium or near, the masks gain a row of tiles. The builder's
+  overlap test puts the room tile's lower edge at its top corner plus
+  half a tile less 2, and that 2 does not scale: the next row down the
+  screen just touches it at far and is left out, but overlaps by 2
+  pixels at medium and by 6 at near.
+- The original's tile sizes (View+0x58 to +0x64) and storey heights
+  (+0x124 to +0x12c), read from the running game, are ours: 32, 16, 16
+  and 8 at far, and 232, 116 and 58. In the running original, zooming in
+  from far left the view's mask byte for byte unchanged, and turning the
+  view away and back at medium changed it.
+
+With the masks built at far zoom, medium scores 317864 and near 271711,
+the strip then matching the original's from its top row. Porting the
+kept masks means the camera must remember the zoom its masks were built
+at, which is the next render change.
