@@ -17,7 +17,7 @@ use crate::command::{Camera, Command, Mode, Panel, Relations, Speed, Walls};
 use crate::font::Font;
 use crate::frame::{Frame, Rect};
 use crate::house::{self, House};
-use crate::household::{Faces, Relation, Snapshot, Work, money};
+use crate::household::{Faces, PetKind, Relation, Snapshot, Work, money};
 use sims_formats::bitmap::Image;
 
 /// The cluster's size, the size of its background (kUniversalBkgTGA).
@@ -161,9 +161,45 @@ pub const RESOURCES: [i32; 56] = [
     4918,
 ];
 
-/// Half-period of the Live-mode pause button blink in microseconds:
-/// 500 ms (`0x1f4` ms, `0x53b528`, `0x53b71e`).
+/// Half-period of the control-panel clock blink timer in microseconds:
+/// 500 ms (`0x1f4` ms, `0x53b528`, `0x53b6f7`, `0x53b71e`), shared by both
+/// pause blinking (state 2) and ultra-speed idle blinking (state 3).
 pub const PAUSE_BLINK_US: u64 = 500_000;
+
+/// Active 500 ms blink state of the clock controls (`[esi + 0x1e4]`,
+/// `0x53b4b1..0x53b7e7`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClockBlinkMode {
+    /// States 0 and 1: no 500 ms timer running.
+    #[default]
+    Off,
+    /// State 2 (`0x53b500..0x53b528`): paused (in Live or non-Live mode);
+    /// toggles `id::PAUSE` row 0 (cyan) <-> row 1 (red) every 500 ms.
+    Pause,
+    /// State 3 (`0x53b4c9..0x53b4fe`): unpaused in Live mode while idle
+    /// speed is active (`[esi + 0x1ec] != 0`) and the saved return speed is
+    /// not Ultra (`0x4b4513 != 0x46d26a`); toggles `id::ULTRA` selected
+    /// state (`[ultra + 0xe0]`) every 500 ms.
+    Ultra,
+}
+
+/// Which 500 ms blink mode (`0x53b536..0x53b7e7`) applies for the given
+/// pause, mode, idle-speed flag (`world.return_speed() >= 0 && world.speed()
+/// == sims_sim::speed::IDLE`), and highlighted speed (`speed_for(world)`).
+pub fn clock_blink_mode(
+    paused: bool,
+    mode: Mode,
+    idle_speed: bool,
+    speed: Option<Speed>,
+) -> ClockBlinkMode {
+    if paused {
+        ClockBlinkMode::Pause
+    } else if mode == Mode::Live && idle_speed && speed != Some(Speed::Ultra) {
+        ClockBlinkMode::Ultra
+    } else {
+        ClockBlinkMode::Off
+    }
+}
 
 /// Who is selected on the lot, for [`Controls::follow`] and
 /// [`check_press`].
@@ -212,6 +248,10 @@ pub struct Controls {
     /// (row 1 of `id::PAUSE`, toggled every [`PAUSE_BLINK_US`] at
     /// `0x53b500..0x53b528`; starts `false` on entry at `0x53b707..0x53b74d`).
     pub pause_lit: bool,
+    /// Whether the idle-speed ultra blink (state 3, `0x53b4c9..0x53b4fe`)
+    /// currently highlights `id::ULTRA` (toggled every [`PAUSE_BLINK_US`];
+    /// starts `false` on entry at `0x53b6e0..0x53b705`).
+    pub ultra_lit: bool,
     /// Whether the Interests (`[esi + 0x170]`) and Gifts (`[esi + 0x174]`)
     /// gadget buttons are enabled (`byte [btn + 0x168]`, `0x51c5a6..0x51c9e5`).
     /// Enabled for human household Sims, disabled for pets and non-household
@@ -264,6 +304,7 @@ impl Default for Controls {
             panel: Some(Panel::Needs),
             speed: Some(Speed::Normal),
             pause_lit: false,
+            ultra_lit: false,
             interests_gifts_enabled: true,
             camera: CameraState::default(),
             pointer: None,
@@ -422,15 +463,23 @@ pub enum Kind {
     /// The personality panel's bars, in `rect`, the subpanel: the
     /// selected Sim's traits in the panel's order
     /// ([`crate::household::PERSONALITY`]). Laid out when drawn, from the
-    /// labels' font.
+    /// labels' font. When `pet` is true (`person.data[65] > 1`,
+    /// `0x52157e..0x5215c0`), draws the pet labels from `Live.iff STR# 170`
+    /// and hides the zodiac sign (`0x51d650..0x51d663`).
     Personality {
         traits: [i16; 5],
         zodiac: Option<u8>,
+        pet: bool,
     },
     /// The job panel's skills, in `rect`, the subpanel: the selected
     /// Sim's skills and what the next level of their career needs of
     /// each, in the panel's order ([`crate::household::SKILLS`]).
     Skills { skills: [i16; 6], needs: [i32; 6] },
+    /// The pet skills panel (`[esi + 0x114]` dog at `0x531469`, `[esi + 0x118]`
+    /// cat at `0x531e43`), shown in `rect` on the Job tab when a pet is
+    /// selected (`0x51d5ca..0x51d5f0`): three skill bars reading
+    /// `person.data` words `[10, 12, 11]` (`0x66e360`).
+    PetSkills { kind: PetKind, skills: [i16; 3] },
     /// The job panel's left column, in `rect`, the subpanel: the selected
     /// Sim's career icon and title, salary, performance, and the family
     /// friends the next level needs where the family has fewer than
@@ -692,6 +741,12 @@ pub fn layout(size: [i32; 2], snapshot: &Snapshot, controls: &Controls) -> Vec<I
         },
         command: Some(Command::TogglePause),
     });
+    let ultra_blinking = clock_blink_mode(
+        snapshot.paused,
+        controls.mode,
+        snapshot.idle_speed,
+        controls.speed,
+    ) == ClockBlinkMode::Ultra;
     for (id, speed, x, w) in [
         (id::NORMAL, Speed::Normal, 105, 11),
         (id::FAST, Speed::Fast, 120, 20),
@@ -700,12 +755,16 @@ pub fn layout(size: [i32; 2], snapshot: &Snapshot, controls: &Controls) -> Vec<I
         // 0x53b0d8..0x53b16b: highlights the button matching the active speed
         // (0x46d78b) or, while idle-speed is active (0x46d7cc), the saved
         // return speed (0x46d7d6). The pause flag (0x46d866) is not checked
-        // here, so a paused lot keeps its speed button selected.
+        // here, so a paused lot keeps its speed button selected. While in
+        // state 3 (`0x53b4c9..0x53b4fe`), `id::ULTRA` additionally blinks
+        // selected every 500 ms via `controls.ultra_lit`.
+        let selected = controls.speed == Some(speed)
+            || (speed == Speed::Ultra && ultra_blinking && controls.ultra_lit);
         items.push(button(
             id,
             4,
             at(x, 135, w, 15),
-            controls.speed == Some(speed),
+            selected,
             Command::SetSpeed(speed),
         ));
     }
@@ -758,10 +817,11 @@ pub fn layout(size: [i32; 2], snapshot: &Snapshot, controls: &Controls) -> Vec<I
             command: None,
         });
     }
-    // The help balloon, over everything, while its panel shows.
+    // The help balloon, over everything, while its panel shows (pets hide
+    // the zodiac control `[esi + 0x1c4]` at `0x51d650..0x51d663`).
     if let Some(help @ Help::Sign(_)) = controls.help {
         let owner = items.iter().find_map(|i| match i.kind {
-            Kind::Personality { .. } => Some(i.rect),
+            Kind::Personality { pet: false, .. } => Some(i.rect),
             _ => None,
         });
         if let Some(owner) = owner {
@@ -817,6 +877,7 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
     // row is **unverified**; people past the two rows are left out.
     let columns = ((gadget.x - strip.x - 9) / 45).max(1);
     let mut named = None;
+    let selected = snapshot.selected_resident();
     for (n, resident) in snapshot.residents.iter().enumerate() {
         let n = i32::try_from(n).unwrap_or(i32::MAX);
         if n >= columns.saturating_mul(2) {
@@ -824,7 +885,9 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
         }
         let x = strip.x + 9 + 45 * (n % columns);
         let y = strip.y + 5 + 45 * (n / columns);
-        let selected = snapshot.selected == Some(resident.object);
+        // 0x51ca97: highlights the roster slot matching `+0xe8` (matched by
+        // neighbor/GUID at 0x51c5ef -> 0x4e97dc).
+        let is_selected = selected.is_some_and(|s| s.object == resident.object);
         let rect = Rect::new(x, y, 45, 45);
         if controls
             .pointer
@@ -836,7 +899,7 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
             rect,
             kind: Kind::Portrait {
                 guid: resident.guid,
-                selected,
+                selected: is_selected,
             },
             command: Some(Command::Select {
                 sim: resident.object,
@@ -848,7 +911,6 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
         kind: Kind::Image(id::GAUGE),
         command: None,
     });
-    let selected = snapshot.selected_resident();
     if let Some(resident) = selected {
         mood_bars(items, gadget, resident.motives[sims_sim::motives::MOOD]);
     }
@@ -860,6 +922,9 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
             Selected::of(snapshot),
             Selected::Pet | Selected::NonHousehold
         );
+    let open_panel = controls
+        .panel
+        .filter(|&panel| panel != Panel::House || snapshot.residential);
     for (id, panel, x, y, w, h) in [
         (id::NEEDS, Panel::Needs, 9, 31, 32, 39),
         (id::INTERESTS, Panel::Interests, 44, 4, 27, 30),
@@ -881,13 +946,13 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
             kind: Kind::Button {
                 id,
                 cells: 4,
-                selected: !disabled && controls.panel == Some(panel),
+                selected: !disabled && open_panel == Some(panel),
             },
             command: (!disabled).then_some(Command::OpenPanel(panel)),
         });
     }
     // The original shows no needs without a selected Sim.
-    if let (Some(resident), Some(Panel::Needs)) = (selected, controls.panel) {
+    if let (Some(resident), Some(Panel::Needs)) = (selected, open_panel) {
         let panel = Rect::new(gadget.x + 108, strip.y, NEEDS_WIDTH - 108, STRIP);
         // The title, labels and meters, measured on the original's
         // screen: meters 60 by 5 in two columns 100 apart, rows 19 apart,
@@ -923,8 +988,11 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
             });
         }
     }
-    if let (Some(resident), Some(Panel::Personality)) = (selected, controls.panel) {
+    if let (Some(resident), Some(Panel::Personality)) = (selected, open_panel) {
         let panel = Rect::new(gadget.x + 108, strip.y, NEEDS_WIDTH - 108, STRIP);
+        // 0x51d650..0x51d663, 0x51d1cc..0x51d1ee: pets (`person.data[65] > 1`)
+        // hide the zodiac sign control `[esi + 0x1c4]`.
+        let zodiac = (!resident.pet).then_some(resident.zodiac).flatten();
         items.push(Item {
             rect: panel.offset(6, 2).with_size(100, 20),
             kind: Kind::Text {
@@ -939,11 +1007,12 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
             rect: panel,
             kind: Kind::Personality {
                 traits: resident.personality,
-                zodiac: resident.zodiac,
+                zodiac,
+                pet: resident.pet,
             },
             command: None,
         });
-        if let Some(sign) = resident.zodiac {
+        if let Some(sign) = zodiac {
             items.push(Item {
                 rect: Rect::new(panel.x + 5, panel.y + panel.height - 5, 0, 0),
                 kind: Kind::Sign { sign, panel },
@@ -951,45 +1020,75 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
             });
         }
     }
-    if let (Some(resident), Some(Panel::Job)) = (selected, controls.panel) {
+    if let (Some(resident), Some(Panel::Job)) = (selected, open_panel) {
         let panel = Rect::new(gadget.x + 108, strip.y, NEEDS_WIDTH - 108, STRIP);
-        // The title where the job panel's draw puts it in a western
-        // language (0x530340).
-        items.push(Item {
-            rect: panel.offset(JOB_TITLE[0], JOB_TITLE[1]).with_size(100, 20),
-            kind: Kind::Text {
-                text: "Job".into(),
-                size: 11,
-                rgb: LABEL,
-                align: Align::Left,
-            },
-            command: None,
-        });
-        items.push(Item {
-            rect: panel,
-            kind: Kind::Skills {
-                skills: resident.skills,
-                needs: resident.needs,
-            },
-            command: None,
-        });
-        items.push(Item {
-            rect: panel,
-            kind: Kind::Work {
-                work: resident.work.clone(),
-                performance: resident.performance,
-                family_friends: snapshot.family_friends,
-            },
-            command: None,
-        });
+        // 0x51d5af..0x51d5f0, 0x51cbf8..0x51cc5a: when not in child school age
+        // (`age == 0 || age >= 18`), bit 1 of `person.data[65]` selects the
+        // Dog skills panel (`[esi + 0x114]`, `0x531469`) and bit 2 selects the
+        // Cat skills panel (`[esi + 0x118]`, `0x531e43`).
+        if !resident.school_age
+            && let Some(kind) = resident.pet_kind
+        {
+            items.push(Item {
+                rect: panel
+                    .offset(PET_SKILLS_TITLE[0], PET_SKILLS_TITLE[1])
+                    .with_size(100, 20),
+                kind: Kind::Text {
+                    text: "Pet Skills".into(),
+                    size: 11,
+                    rgb: LABEL,
+                    align: Align::Left,
+                },
+                command: None,
+            });
+            items.push(Item {
+                rect: panel,
+                kind: Kind::PetSkills {
+                    kind,
+                    skills: [resident.skills[0], resident.skills[1], resident.skills[2]],
+                },
+                command: None,
+            });
+        } else {
+            // The title where the job panel's draw puts it in a western
+            // language (0x530340).
+            items.push(Item {
+                rect: panel.offset(JOB_TITLE[0], JOB_TITLE[1]).with_size(100, 20),
+                kind: Kind::Text {
+                    text: "Job".into(),
+                    size: 11,
+                    rgb: LABEL,
+                    align: Align::Left,
+                },
+                command: None,
+            });
+            items.push(Item {
+                rect: panel,
+                kind: Kind::Skills {
+                    skills: resident.skills,
+                    needs: resident.needs,
+                },
+                command: None,
+            });
+            items.push(Item {
+                rect: panel,
+                kind: Kind::Work {
+                    work: resident.work.clone(),
+                    performance: resident.performance,
+                    family_friends: snapshot.family_friends,
+                },
+                command: None,
+            });
+        }
     }
-    if let (Some(_), Some(Panel::Relationships)) = (selected, controls.panel) {
+    if let (Some(_), Some(Panel::Relationships)) = (selected, open_panel) {
         let panel = Rect::new(gadget.x + 108, strip.y, NEEDS_WIDTH - 108, STRIP);
         relationships(items, panel, snapshot, controls);
     }
     // The house panel's draw needs no selected Sim (0x52e49e), but with
-    // nobody selected no panel is open ([`Controls::follow`]).
-    if controls.panel == Some(Panel::House) {
+    // nobody selected no panel is open ([`Controls::follow`]), and
+    // `0x51d3f9..0x51d40f` closes panel 4 on non-residential lots.
+    if open_panel == Some(Panel::House) {
         let panel = Rect::new(gadget.x + 108, strip.y, NEEDS_WIDTH - 108, STRIP);
         items.push(Item {
             rect: panel
@@ -1034,6 +1133,9 @@ const NAME_BACK: [u8; 3] = [0, 0, 0];
 
 /// The personality's labels in the panel's order (Live.iff STR# 131).
 const TRAITS: [&str; 5] = ["Neat", "Outgoing", "Active", "Playful", "Nice"];
+/// Pet personality labels in the panel's order (Live.iff STR# 170,
+/// swapped in by `0x52157e..0x5215c0` when `person.data[65] > 1`).
+const PET_TRAITS: [&str; 5] = ["Quiet", "Friendly", "Playful", "Smart", "Loyal"];
 /// The labels' font (0x6f2ae4, font 8).
 const TRAIT_FONT: u8 = 8;
 /// Where the bars end and start in the subpanel, and how far apart they
@@ -1045,14 +1147,16 @@ const TRAITS_PITCH: i32 = 18;
 /// Draws the personality bars (0x51df31, 0x521491, 0x5211bd) in the
 /// subpanel `panel`. Each bar is a label and an empty bar with the full
 /// one drawn over it, cut to 4 pixels a point. Every bar's label is as
-/// wide as the widest, plus 3, and its bar starts 3 after that; the bars
-/// end at [`TRAITS_RIGHT`]. The shorter of the label's line and the bar
-/// is centred on the other. A trait is `value / 100` points, 0 to 10.
+/// wide as the widest human label (`0x51e062..0x51e0c9`, `0x52144a`;
+/// `0x52157e` swaps pet text without resizing), plus 3, and its bar
+/// starts 3 after that; the bars end at [`TRAITS_RIGHT`]. The shorter of
+/// the label's line and the bar is centred on the other. A trait is
+/// `value / 100` points, 0 to 10.
 ///
 /// **Unverified:** the labels' color (the needs' is taken) and their
 /// alignment (right, against the bar); which of the font's heights the
 /// original compares (the line's is taken).
-fn draw_personality(frame: &mut Frame, art: &Art, panel: Rect, values: &[i16; 5]) {
+fn draw_personality(frame: &mut Frame, art: &Art, panel: Rect, values: &[i16; 5], pet: bool) {
     let (Some(font), Some(empty), Some(full)) = (
         art.font(TRAIT_FONT),
         art.image(id::TRAIT_EMPTY),
@@ -1073,7 +1177,8 @@ fn draw_personality(frame: &mut Frame, art: &Art, panel: Rect, values: &[i16; 5]
         (0, (line - empty_h) / 2)
     };
     let left = panel.x.saturating_add(TRAITS_RIGHT.saturating_sub(width));
-    for (n, (name, value)) in TRAITS.iter().zip(values).enumerate() {
+    let names = if pet { &PET_TRAITS } else { &TRAITS };
+    for (n, (name, value)) in names.iter().zip(values).enumerate() {
         let top = panel.y.saturating_add(TRAITS_TOP + TRAITS_PITCH * n as i32);
         let x = left.saturating_add(label.saturating_sub(font.width(name)));
         font.draw(frame, name, [x, top.saturating_add(text_y)], LABEL);
@@ -1207,6 +1312,68 @@ fn draw_skills(frame: &mut Frame, art: &Art, panel: Rect, skills: &[i16; 6], nee
             ),
             LABEL,
         );
+    }
+}
+
+/// The pet skills panel's title position (`0x531b7a..0x531bbf`,
+/// `0x5326a9..0x5326d4`), labels (`Live.iff STR# 171`, `0x532262..0x532285`),
+/// label boxes (`0x6f4518`, `0x66 x 0x10` right-aligned in font 7), and bar
+/// origins (`0x6f4488`, pitch 15).
+const PET_SKILLS_TITLE: [i32; 2] = [13, 8];
+const DOG_SKILL_NAMES: [&str; 3] = ["House Breaking", "Tricks", "Obedience"];
+const CAT_SKILL_NAMES: [&str; 3] = ["Hunting", "Tricks", "Obedience"];
+const PET_SKILL_LABEL: [i32; 4] = [103, 25, 102, 16];
+const PET_SKILL_BAR: [i32; 2] = [207, 27];
+
+/// Draws the Dog (`0x5319f8..0x531b5c`) or Cat (`0x532512..0x532676`)
+/// Pet Skills panel in `panel`: three right-aligned labels and skill bars
+/// using `id::SKILL_EMPTY` (4920) and `id::SKILL_FULL` (4901) for
+/// `person.data` words `[10, 12, 11]` (`0x66e360`).
+fn draw_pet_skills(frame: &mut Frame, art: &Art, panel: Rect, kind: PetKind, skills: &[i16; 3]) {
+    let (Some(font), Some(empty), Some(full)) = (
+        art.font(SKILL_FONT),
+        art.image(id::SKILL_EMPTY),
+        art.image(id::SKILL_FULL),
+    ) else {
+        return;
+    };
+    let full_w = i32::try_from(full.width).unwrap_or(0);
+    let full_h = i32::try_from(full.height).unwrap_or(0);
+    let names = match kind {
+        PetKind::Dog => &DOG_SKILL_NAMES,
+        PetKind::Cat => &CAT_SKILL_NAMES,
+    };
+    for (n, (name, skill)) in names.iter().zip(skills).enumerate() {
+        let row = SKILL_PITCH * n as i32;
+        let bar = [
+            panel.x.saturating_add(PET_SKILL_BAR[0]),
+            panel.y.saturating_add(PET_SKILL_BAR[1] + row),
+        ];
+        frame.draw_all(empty, bar);
+        let points = i32::from(*skill / 100).clamp(0, 10);
+        let width = points * 4;
+        if points > 0 {
+            let cut = if width <= full_w && points != 10 {
+                width
+            } else {
+                full_w
+            };
+            frame.draw(full, Rect::new(0, 0, cut, full_h), bar);
+        }
+        let [x, y, w, h] = PET_SKILL_LABEL;
+        let label = Rect::new(
+            panel.x.saturating_add(x),
+            panel.y.saturating_add(y + row),
+            w,
+            h,
+        );
+        let at = [
+            label.x.saturating_add(label.width - font.width(name)),
+            // 0x53180d..0x531826, 0x5321e7..0x532200, 0x5e3f0d..0x5e4053:
+            // text rect local top is 0 and the renderer draws directly at it.
+            label.y,
+        ];
+        font.draw(frame, name, at, LABEL);
     }
 }
 
@@ -1931,13 +2098,18 @@ pub fn draw(frame: &mut Frame, art: &Art, faces: &Faces, items: &[Item], control
                     draw_name(frame, font, name, r);
                 }
             }
-            Kind::Personality { traits, zodiac } => {
-                draw_personality(frame, art, r, traits);
+            Kind::Personality {
+                traits,
+                zodiac,
+                pet,
+            } => {
+                draw_personality(frame, art, r, traits, *pet);
                 if let Some(sign) = zodiac {
                     draw_zodiac(frame, art, r, *sign);
                 }
             }
             Kind::Skills { skills, needs } => draw_skills(frame, art, r, skills, needs),
+            Kind::PetSkills { kind, skills } => draw_pet_skills(frame, art, r, *kind, skills),
             Kind::Work {
                 work,
                 performance,
@@ -2003,6 +2175,7 @@ impl Item {
                     | Kind::Name { .. }
                     | Kind::Personality { .. }
                     | Kind::Skills { .. }
+                    | Kind::PetSkills { .. }
                     | Kind::Work { .. }
                     | Kind::Relation { .. }
                     | Kind::Help { .. }
@@ -2104,6 +2277,7 @@ mod tests {
             funds: 2542,
             show_money: true,
             paused: false,
+            idle_speed: false,
             residential: true,
             residents: [21, 18, 16]
                 .into_iter()
@@ -2117,13 +2291,16 @@ mod tests {
                     job: [0; 2],
                     needs: [0; 6],
                     child: false,
+                    school_age: false,
                     female: false,
                     pet: false,
+                    pet_kind: None,
                     performance: 0,
                     work: Work::default(),
                 })
                 .collect(),
             selected: Some(21),
+            selected_guid: None,
             family_friends: 0,
             cluster_friends: 0,
             relations: Vec::new(),
@@ -2217,8 +2394,10 @@ mod tests {
                 job: [0; 2],
                 needs: [0; 6],
                 child: false,
+                school_age: false,
                 female: false,
                 pet: false,
+                pet_kind: None,
                 performance: 0,
                 work: Work::default(),
             })
@@ -2441,7 +2620,8 @@ mod tests {
             panels[0].kind,
             Kind::Personality {
                 traits: [250, -5, 1500, 0, 999],
-                zodiac: Some(9)
+                zodiac: Some(9),
+                pet: false,
             }
         );
         // Presses go through it; nobody selected, no panel.
@@ -2470,6 +2650,7 @@ mod tests {
             &art,
             Rect::new(0, 0, 220, 100),
             &[250, -5, 1500, 0, 999],
+            false,
         );
         // 4 pixels a point: 2, none, 10 (all 40), none, 9.
         for (n, points) in [2, 0, 10, 0, 9].into_iter().enumerate() {
@@ -2496,9 +2677,9 @@ mod tests {
         }
         // Coordinates at the edge of i32 draw nothing rather than panic.
         let far = Rect::new(i32::MAX, i32::MAX, 220, 100);
-        draw_personality(&mut frame, &art, far, &[1000; 5]);
+        draw_personality(&mut frame, &art, far, &[1000; 5], false);
         let near = Rect::new(i32::MIN, i32::MIN, 220, 100);
-        draw_personality(&mut frame, &art, near, &[1000; 5]);
+        draw_personality(&mut frame, &art, near, &[1000; 5], false);
     }
 
     fn relation(id: i16, daily: i32, family: bool, friends: bool) -> Relation {
@@ -3888,5 +4069,236 @@ mod tests {
         assert_eq!(frame.pixel(118, 158), Some(GREEN));
         assert_eq!(frame.pixel(127, 158), Some(GREEN));
         assert_eq!(frame.pixel(128, 158), Some([0; 3]));
+    }
+
+    #[test]
+    fn pet_personality_and_pet_skills_panels_match_disassembly() {
+        // Pet Personality (`0x52157e..0x5215c0`, `0x51d650..0x51d663`):
+        // draws pet trait labels (`STR# 170`) with fixed human widest-label
+        // alignment and suppresses zodiac + `Kind::Sign` + Sign balloon.
+        let mut s = snapshot();
+        s.residents[0].pet = true;
+        s.residents[0].pet_kind = Some(PetKind::Dog);
+        s.residents[0].zodiac = Some(4); // suppressed even if non-None
+        s.residents[0].personality = [300, 700, 500, 900, 100];
+        s.residents[0].skills = [400, 1000, 200, 0, 0, 0];
+
+        let mut controls = Controls {
+            expanded: true,
+            panel: Some(Panel::Personality),
+            help: Some(Help::Sign(4)),
+            ..Controls::default()
+        };
+        let items = layout([800, 600], &s, &controls);
+        assert!(items.iter().any(|i| matches!(
+            i.kind,
+            Kind::Personality {
+                traits: [300, 700, 500, 900, 100],
+                zodiac: None,
+                pet: true,
+            }
+        )));
+        assert!(!items.iter().any(|i| matches!(i.kind, Kind::Sign { .. })));
+        assert!(!items.iter().any(|i| matches!(i.kind, Kind::Help { .. })));
+
+        // Build a synthetic font where each character has a distinct width so
+        // pet vs human labels render visibly different widths/pixels.
+        let mut glyphs = Vec::new();
+        let mut atlas_x = 0u16;
+        for (idx, ch) in (b' '..=b'z').enumerate() {
+            let w = 2 + (idx as u8 % 3);
+            glyphs.push(sims_formats::ffn::Glyph {
+                code: u16::from(ch),
+                width: w,
+                height: 2,
+                atlas_x,
+                atlas_y: 0,
+                first_bearing: 0,
+                bearing_x: 0,
+                bearing_y: 0,
+            });
+            atlas_x += u16::from(w);
+        }
+        let ffn = sims_formats::ffn::Font {
+            flags: 9,
+            glyphs,
+            width: atlas_x,
+            height: 2,
+            coverage: vec![15; usize::from(atlas_x) * 2],
+        };
+        let mut art = Art::default();
+        art.insert_font(TRAIT_FONT, Font::new(ffn.clone()));
+        art.insert_font(SKILL_FONT, Font::new(ffn));
+        art.insert(id::TRAIT_EMPTY, solid(40, 14, [1, 1, 1]));
+        art.insert(id::TRAIT_FULL, solid(40, 16, [2, 2, 2]));
+        art.insert(id::SKILL_EMPTY, solid(40, 10, [10, 10, 10]));
+        art.insert(id::SKILL_FULL, solid(40, 10, [20, 20, 20]));
+
+        let panel = Rect::new(0, 0, 279, 100);
+        let mut human_frame = Frame::new(279, 100, [0; 3]);
+        draw_personality(
+            &mut human_frame,
+            &art,
+            panel,
+            &[300, 700, 500, 900, 100],
+            false,
+        );
+        let mut pet_frame = Frame::new(279, 100, [0; 3]);
+        draw_personality(
+            &mut pet_frame,
+            &art,
+            panel,
+            &[300, 700, 500, 900, 100],
+            true,
+        );
+        assert_ne!(human_frame.rgb(), pet_frame.rgb());
+
+        // Pet Skills on Job tab (`0x51d5ca..0x51d5f0`, `0x531469`, `0x531e43`):
+        // Dog shows `"Pet Skills"` + `Kind::PetSkills { kind: Dog, .. }` and no
+        // human `Kind::Skills` or `Kind::Work`.
+        controls.panel = Some(Panel::Job);
+        let dog_items = layout([800, 600], &s, &controls);
+        assert!(dog_items.iter().any(|i| matches!(
+            &i.kind,
+            Kind::Text { text, size: 11, .. } if text == "Pet Skills"
+                && i.rect.x == 521 + PET_SKILLS_TITLE[0]
+                && i.rect.y == 500 + PET_SKILLS_TITLE[1]
+        )));
+        assert!(dog_items.iter().any(|i| matches!(
+            i.kind,
+            Kind::PetSkills {
+                kind: PetKind::Dog,
+                skills: [400, 1000, 200],
+            }
+        )));
+        assert!(
+            !dog_items
+                .iter()
+                .any(|i| matches!(i.kind, Kind::Skills { .. } | Kind::Work { .. }))
+        );
+
+        // Cat (`PetKind::Cat`) selects Cat skills panel; school-age (`age in 1..18`)
+        // takes precedence (`0x51d5af..0x51d5bf`) and falls back to Job.
+        s.residents[0].pet_kind = Some(PetKind::Cat);
+        let cat_items = layout([800, 600], &s, &controls);
+        assert!(cat_items.iter().any(|i| matches!(
+            i.kind,
+            Kind::PetSkills {
+                kind: PetKind::Cat,
+                skills: [400, 1000, 200],
+            }
+        )));
+
+        let mut dog_frame = Frame::new(279, 100, [0; 3]);
+        draw_pet_skills(&mut dog_frame, &art, panel, PetKind::Dog, &[400, 1000, 200]);
+        let mut cat_frame = Frame::new(279, 100, [0; 3]);
+        draw_pet_skills(&mut cat_frame, &art, panel, PetKind::Cat, &[400, 1000, 200]);
+        assert_ne!(dog_frame.rgb(), cat_frame.rgb());
+        // Labels are top-aligned (`local top = 0`, `0x53180d..0x531826`) in
+        // `(103, 25 + 15 * row, 102, 16)`: row 0 draws at y = 25 (not centered).
+        assert_eq!(dog_frame.pixel(204, 25), Some(LABEL));
+        assert_eq!(dog_frame.pixel(204, 24), Some([0, 0, 0]));
+        assert_eq!(dog_frame.pixel(204, 27), Some([0, 0, 0]));
+        // Row 0 bar (400 -> 4 pts -> 16 px full, rest empty) at (207, 27).
+        assert_eq!(dog_frame.pixel(207, 27), Some([20, 20, 20]));
+        assert_eq!(dog_frame.pixel(207 + 15, 27), Some([20, 20, 20]));
+        assert_eq!(dog_frame.pixel(207 + 16, 27), Some([10, 10, 10]));
+        // Row 1 bar (1000 -> 10 pts -> full 40 px) at (207, 42).
+        assert_eq!(dog_frame.pixel(207 + 39, 42), Some([20, 20, 20]));
+        // Row 2 bar (200 -> 2 pts -> 8 px full, rest empty) at (207, 57).
+        assert_eq!(dog_frame.pixel(207 + 7, 57), Some([20, 20, 20]));
+        assert_eq!(dog_frame.pixel(207 + 8, 57), Some([10, 10, 10]));
+
+        s.residents[0].school_age = true;
+        let school_items = layout([800, 600], &s, &controls);
+        assert!(
+            school_items
+                .iter()
+                .any(|i| matches!(i.kind, Kind::Skills { .. }))
+        );
+        assert!(
+            !school_items
+                .iter()
+                .any(|i| matches!(i.kind, Kind::PetSkills { .. }))
+        );
+    }
+
+    #[test]
+    fn ultra_speed_blink_duplicate_selection_and_non_residential_house() {
+        // State-3 ultra-speed blink (`0x53b4c9..0x53b7e7`):
+        assert_eq!(
+            clock_blink_mode(false, Mode::Live, true, Some(Speed::Normal)),
+            ClockBlinkMode::Ultra
+        );
+        assert_eq!(
+            clock_blink_mode(false, Mode::Live, true, Some(Speed::Ultra)),
+            ClockBlinkMode::Off
+        );
+        assert_eq!(
+            clock_blink_mode(true, Mode::Live, true, Some(Speed::Normal)),
+            ClockBlinkMode::Pause
+        );
+        assert_eq!(
+            clock_blink_mode(false, Mode::Buy, true, Some(Speed::Normal)),
+            ClockBlinkMode::Off
+        );
+
+        let mut s = snapshot();
+        s.idle_speed = true;
+        let mut controls = Controls {
+            expanded: true,
+            speed: Some(Speed::Normal),
+            ultra_lit: false,
+            ..Controls::default()
+        };
+        let speed_selected = |items: &[Item], target: i32| {
+            items
+                .iter()
+                .find_map(|i| match i.kind {
+                    Kind::Button { id, selected, .. } if id == target => Some(selected),
+                    _ => None,
+                })
+                .expect("speed button")
+        };
+        let off_items = layout([800, 600], &s, &controls);
+        assert!(speed_selected(&off_items, id::NORMAL));
+        assert!(!speed_selected(&off_items, id::ULTRA));
+
+        controls.ultra_lit = true;
+        let on_items = layout([800, 600], &s, &controls);
+        assert!(speed_selected(&on_items, id::NORMAL));
+        assert!(speed_selected(&on_items, id::ULTRA));
+
+        // Paused or non-Live suppresses ultra blink even if ultra_lit were true.
+        s.paused = true;
+        let paused_items = layout([800, 600], &s, &controls);
+        assert!(!speed_selected(&paused_items, id::ULTRA));
+        s.paused = false;
+
+        // Duplicate live instance matching by GUID (`0x51c5ef -> 0x4e97dc`):
+        // object 999 shares resident 0's GUID (21) -> still Human & highlights portrait.
+        s.selected = Some(999);
+        s.selected_guid = Some(21);
+        assert_eq!(Selected::of(&s), Selected::Human);
+        let dup_items = layout([800, 600], &s, &controls);
+        let first_portrait_selected = dup_items
+            .iter()
+            .find_map(|i| match i.kind {
+                Kind::Portrait { guid: 21, selected } => Some(selected),
+                _ => None,
+            })
+            .expect("first portrait");
+        assert!(first_portrait_selected);
+
+        // Non-residential House panel suppression (`0x51d3f9..0x51d40f`):
+        s.residential = false;
+        controls.panel = Some(Panel::House);
+        let nonres_items = layout([800, 600], &s, &controls);
+        assert!(
+            !nonres_items
+                .iter()
+                .any(|i| matches!(i.kind, Kind::House { .. }))
+        );
+        assert!(!speed_selected(&nonres_items, id::HOUSE));
     }
 }

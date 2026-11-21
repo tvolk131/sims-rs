@@ -23,6 +23,33 @@ const PAUSED: usize = 17;
 const BUDGET_MODE: usize = 32;
 
 /// A person of the household, as the panel shows them.
+/// Which pet species panel (`[esi + 0x114]` dog vs `[esi + 0x118]` cat) the
+/// live-mode Job/Skills tab shows (`0x51d5ca`..`0x51d5f0`,
+/// `0x51cbf8`..`0x51cc5a`), from `person.data[65]` (`sims_sim::neighbors::KIND`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PetKind {
+    /// Bit 1 (`(kind >> 1) & 1 != 0`): House Breaking, Tricks, Obedience.
+    Dog,
+    /// Bit 2 (`(kind >> 2) & 1 != 0`, when bit 1 is clear): Hunting, Tricks, Obedience.
+    Cat,
+}
+
+impl PetKind {
+    /// Classifies `person.data[65]` (`word [person + 0x60e]`) in the exact bit
+    /// order of `0x51d5d3`..`0x51d5e7` and `0x51cc01`..`0x51cc2e`.
+    pub fn from_kind(kind: i16) -> Option<Self> {
+        let bits = i32::from(kind);
+        if (bits >> 1) & 1 != 0 {
+            Some(Self::Dog)
+        } else if (bits >> 2) & 1 != 0 {
+            Some(Self::Cat)
+        } else {
+            None
+        }
+    }
+}
+
+/// A household member on the lot, in the family's portrait order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Resident {
     /// The person's object ID.
@@ -37,7 +64,9 @@ pub struct Resident {
     /// the panel shows no sign for.
     pub zodiac: Option<u8>,
     /// The skills in the job panel's order ([`SKILLS`]), in hundredths
-    /// of a point (0 to 1000).
+    /// of a point (0 to 1000). For pets (`0x66e360`), the first three
+    /// words (`[10, 12, 11]`) are House Breaking/Hunting, Tricks, and
+    /// Obedience.
     pub skills: [i16; 6],
     /// The career (a `CARR` resource's ID; 0 for none) and the level in
     /// it, person data 56 and 57.
@@ -50,14 +79,20 @@ pub struct Resident {
     /// (0x4ea908). The job panel shows a child at school, level 0
     /// (0x4ea722).
     pub child: bool,
+    /// Whether `0x51d5af`..`0x51d5bf` routes the Job tab to the child
+    /// Report Card panel before checking pet bits (`age != 0 && age < 18`).
+    pub school_age: bool,
     /// Whether the low bit of person data 65 is set, as the job panel
     /// tells a woman (0x4eaa75).
     pub female: bool,
     /// Whether the person is a pet: person data 65 above 1 (`0x51c61f`,
-    /// `0x51ce13`, `0x51cd11`). Pets have no zodiac sign, disable the
-    /// Interests and Gifts gadget buttons, and return from those panels
-    /// to Needs when selected.
+    /// `0x51ce13`, `0x51cd11`). Pets have no zodiac sign, use pet trait
+    /// labels (`Live.iff STR# 170`), disable the Interests and Gifts
+    /// gadget buttons, and return from those panels to Needs when selected.
     pub pet: bool,
+    /// Whether the person's `person.data[65]` selects the Dog (`[esi + 0x114]`)
+    /// or Cat (`[esi + 0x118]`) Pet Skills panel (`0x51d5ca`..`0x51d5f0`).
+    pub pet_kind: Option<PetKind>,
     /// The job panel's performance: person data 63, or a child's data 57
     /// (0x4ea88c).
     pub performance: i16,
@@ -204,6 +239,12 @@ pub struct Snapshot {
     /// (`0x4f24fa` → `0x4cfe0a` / `0x4cfe18` → `0x53b2a4..0x53b2e1`).
     pub show_money: bool,
     pub paused: bool,
+    /// Whether the idle loop is currently holding the lot at
+    /// [`sims_sim::speed::IDLE`] (`[control_panel + 0x1ec]` set by `0x46d7b5`
+    /// → `0x4f688e`, cleared on `0x46d803` or speed click at
+    /// `0x53a5e3`..`0x53a6e1`): `world.return_speed() >= 0 && world.speed() ==
+    /// sims_sim::speed::IDLE`.
+    pub idle_speed: bool,
     /// Whether the lot is residential (`0x40745f`), used to pick which
     /// family supplies [`Snapshot::family_friends`] (`0x4cfcdb`).
     /// Defaults to `true` until [`Snapshot::with_zoning`] sets it.
@@ -212,6 +253,11 @@ pub struct Snapshot {
     pub residents: Vec<Resident>,
     /// The selected Sim's object ID.
     pub selected: Option<u16>,
+    /// The selected Sim's type GUID (`0x4e986d` → `0x4e9753`), used by
+    /// [`Snapshot::selected_resident`] to match the household roster by
+    /// neighbor/GUID (`0x51c5ef` → `0x4e97dc`) even if a second live
+    /// instance of a household Sim is selected.
+    pub selected_guid: Option<u32>,
     /// How many friends the lot's family (global 9) has, as the job panel
     /// compares it (`0x4ea8ed..0x4ea8f7`, `0x531095..0x5310a4`, `0x410260`):
     /// [`sims_sim::neighbors::Family::friends`], or 0 with no such family.
@@ -309,6 +355,24 @@ pub struct Relation {
     pub family: bool,
 }
 
+/// Finds the first live person of type `guid` in person-registry order
+/// (`0x4e9608`: scans `[registry + 0x84]` = `world.people` and returns `None`
+/// on a miss). Falls back to `world.objects` only when `world.people` is empty
+/// (for synthetic worlds that never populate the person registry).
+pub fn first_person_for_guid(world: &World, guid: u32) -> Option<&sims_sim::Object> {
+    if !world.people.is_empty() {
+        return world
+            .people
+            .iter()
+            .filter_map(|id| world.objects.get(id))
+            .find(|o| o.guid == guid && o.person.is_some());
+    }
+    world
+        .objects
+        .values()
+        .find(|o| o.guid == guid && o.person.is_some())
+}
+
 impl Snapshot {
     /// Reads the snapshot. `members` is the family's member GUIDs in the
     /// order the neighborhood keeps them (`Family::members`): the world
@@ -318,17 +382,16 @@ impl Snapshot {
         let global = |n: usize| world.globals.get(n).copied().unwrap_or(0);
         let mut residents = Vec::new();
         for &guid in members {
-            // The first person of the type, as the original's lookup by
-            // type does (crates/sims-vm/src/selection.rs).
-            if let Some(object) = world
-                .objects
-                .values()
-                .find(|o| o.guid == guid && o.person.is_some())
-            {
+            // The first person of the type in person-registry order
+            // (`0x4e9608` scanning `[registry + 0x84]`).
+            if let Some(object) = first_person_for_guid(world, guid) {
                 let person = object.person.as_ref();
                 let data =
                     |word: usize| person.and_then(|p| p.data.get(word).copied()).unwrap_or(0);
-                let child = data(AGE) < GROWN;
+                let age = data(AGE);
+                let child = age < GROWN;
+                let school_age = age != 0 && age < GROWN;
+                let kind = data(sims_sim::neighbors::KIND);
                 residents.push(Resident {
                     object: object.id,
                     guid,
@@ -339,18 +402,21 @@ impl Snapshot {
                     job: JOB.map(data),
                     needs: [0; 6],
                     child,
-                    female: data(sims_sim::neighbors::KIND) & 1 == 1,
-                    pet: data(sims_sim::neighbors::KIND) > 1,
+                    school_age,
+                    female: kind & 1 == 1,
+                    pet: kind > 1,
+                    pet_kind: PetKind::from_kind(kind),
                     performance: data(if child { JOB[1] } else { PERFORMANCE }),
                     work: Work::default(),
                 });
             }
         }
-        let selected = world
+        let selected_obj = world
             .objects
             .values()
-            .find(|o| o.selected && o.person.is_some())
-            .map(|o| o.id);
+            .find(|o| o.selected && o.person.is_some());
+        let selected = selected_obj.map(|o| o.id);
+        let selected_guid = selected_obj.map(|o| o.guid);
         let lot_friends = lot_family(world).map_or(0, |f| f.friends);
         Self {
             hour: global(HOURS),
@@ -358,15 +424,28 @@ impl Snapshot {
             funds: world.budget.funds,
             show_money: global(BUDGET_MODE) != 1,
             paused: global(PAUSED) != 0,
+            idle_speed: world.return_speed() >= 0 && world.speed() == sims_sim::speed::IDLE,
             residential: true,
             residents,
             selected,
+            selected_guid,
             family_friends: lot_friends,
             cluster_friends: lot_friends,
             relations: Vec::new(),
             superstar: false,
             house: House::default(),
         }
+    }
+
+    /// Overrides [`Snapshot::idle_speed`] with the host control panel's
+    /// tracked idle-blink flag (`[control_panel + 0x1ec]`, set by `0x109(1)`,
+    /// cleared by `0x109(0)` or manual speed click `0x53a5e3..0x53a6e1`, and
+    /// preserved across Special Effect `0x10c` speed resets at
+    /// `0x4f6856..0x4f687a`).
+    #[must_use]
+    pub fn with_idle_speed(mut self, idle_speed: bool) -> Self {
+        self.idle_speed = idle_speed;
+        self
     }
 
     /// Sets whether the lot is residential (`0x40745f`) and reads both
@@ -476,8 +555,12 @@ impl Snapshot {
 
     /// The selected Sim, if one of the household's: what the live panel
     /// counts as someone selected (the original's +0xe8, the selected
-    /// Sim's place among the members, set by 0x51c5b0).
+    /// Sim's place among the members, matched by neighbor/GUID at
+    /// `0x51c5ef` → `0x4e97dc`, `0x4e986d`, `0x4e9608`).
     pub fn selected_resident(&self) -> Option<&Resident> {
+        if let Some(guid) = self.selected_guid {
+            return self.residents.iter().find(|r| r.guid == guid);
+        }
         self.selected.and_then(|s| self.resident(s))
     }
 
@@ -907,9 +990,11 @@ mod tests {
             funds,
             show_money: true,
             paused: false,
+            idle_speed: false,
             residential: true,
             residents: Vec::new(),
             selected: None,
+            selected_guid: None,
             family_friends: 0,
             cluster_friends: 0,
             relations: Vec::new(),
@@ -1132,8 +1217,10 @@ mod tests {
             job,
             needs: [7; 6],
             child: false,
+            school_age: false,
             female: false,
             pet: false,
+            pet_kind: None,
             performance: 0,
             work: Work::default(),
         };
@@ -1193,8 +1280,10 @@ mod tests {
             job,
             needs: [0; 6],
             child,
+            school_age: child,
             female,
             pet: false,
+            pet_kind: None,
             performance: 0,
             work: Work::default(),
         };
@@ -1386,5 +1475,31 @@ mod tests {
         world.objects.get_mut(&10).unwrap().selected = false;
         let nobody = Snapshot::read(&world, &members).with_zoning(&world, false, 50);
         assert_eq!((nobody.family_friends, nobody.cluster_friends), (4, 0));
+
+        // Duplicate GUID with a LOWER object ID appended later in `world.people`
+        // (`0x4e9608`): registry scan order wins over ascending object ID.
+        let mut lower_dup = make_sim(1, 200, 2, 1, true);
+        lower_dup.person.as_mut().unwrap().data[10] = 900;
+        world
+            .objects
+            .get_mut(&10)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap()
+            .data[10] = 200;
+        world.objects.insert(1, lower_dup);
+        world.people.push(1);
+        let dup_snap = Snapshot::read(&world, &members);
+        assert_eq!(dup_snap.residents[0].object, 10);
+        assert_eq!(dup_snap.residents[0].skills[0], 200);
+        assert_eq!(dup_snap.selected, Some(1));
+        assert_eq!(dup_snap.selected_guid, Some(200));
+        assert_eq!(dup_snap.selected_resident().map(|r| r.object), Some(10));
+
+        // When `world.people` is populated, an unregistered person in
+        // `world.objects` is NOT surfaced (`0x4e9625..0x4e964c` returns null).
+        world.objects.insert(99, make_sim(99, 300, 1, 1, false));
+        assert!(first_person_for_guid(&world, 300).is_none());
     }
 }
