@@ -498,3 +498,63 @@ fn the_night_and_beach_loops_play_in_live_mode() {
     let paused = player.render_stereo(RATE as usize, &downtown_noon);
     assert!(paused.iter().all(|&s| s == 0));
 }
+
+#[test]
+fn effects_volume_slider_starts_and_stops_installed_night_loop() {
+    let Some(root) = install() else { return };
+    let files = SoundFiles::scan(&root).unwrap();
+    let mut player = player(&root, 1);
+    player.add_stations(&StationLists::build(&files));
+
+    let snap = |hour: i32| {
+        let mut s = sims_audio::sources::Snapshot::default();
+        s.absent[4] = hour;
+        s.lot = 1;
+        s
+    };
+    let night = snap(22);
+    let day = snap(12);
+
+    // Enter live mode at night with effects muted (step 0): `nite_loop`
+    // cannot start while group 1 volume is 0.
+    player.set_fx_volume_step(0, &night);
+    for name in ["bkground_nhood1", "bkground_live"] {
+        player.handle(
+            &SoundEvent::Play {
+                object: 0,
+                name: name.into(),
+            },
+            &night,
+        );
+    }
+    let _ = player.render_stereo(5 * RATE as usize, &night);
+    assert!(
+        player
+            .render_stereo(RATE as usize, &night)
+            .iter()
+            .all(|&s| s == 0),
+        "nite_loop should stay silent while effects slider is at 0"
+    );
+
+    // Raising the effects slider (kind 37, step 6 -> 790) re-runs 0x574978
+    // and starts `nite_loop` without a camera move.
+    player.set_fx_volume_step(6, &night);
+    let out = player.render_stereo(RATE as usize, &night);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+    assert!(
+        out.iter().any(|&s| s != 0),
+        "raising effects slider at night should start nite_loop"
+    );
+
+    // Moving the effects slider during daytime stops `nite_loop` via 0x574978.
+    player.set_fx_volume_step(10, &day);
+    let _ = player.render_stereo(RATE as usize, &day);
+    assert!(
+        player
+            .render_stereo(RATE as usize, &day)
+            .iter()
+            .all(|&s| s == 0),
+        "kind 37 during daytime should fade out nite_loop"
+    );
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}

@@ -176,6 +176,116 @@ fn pausing_the_lot_pauses_live_ambience_and_night_loop() {
 }
 
 #[test]
+fn window_focus_changes_forward_kind_25_and_deduplicate_initial_focus() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL is not set; skipping the sound test");
+        return;
+    };
+    let install = std::path::PathBuf::from(root);
+    let options = sims_game::Options {
+        house: sims_game::game::goth_house(&install),
+        install: install.clone(),
+        answers: vec![3],
+        play: false,
+        frames: sims_game::Frames::default(),
+    };
+    let mut game = sims_game::Game::open(&options).expect("the Goth house opens");
+    let mut mixer = Mixer::open(&install).expect("the sound files");
+    let mut feed = sims_game::sound::Feed::default();
+
+    // Startup matches 0x4eee14 + 0x4f7610: `focused` begins `true`, so an
+    // initial `Focused(true)` from the windowing system sends no kind 25.
+    assert!(feed.focused());
+    let mut sent = Vec::new();
+    feed.set_focused(true, &mut game, |input| {
+        sent.push(input.clone());
+        mixer.input(input);
+    });
+    assert!(sent.is_empty(), "initial Focused(true) must be a no-op");
+
+    // First feed enters live mode and starts backyard ambience.
+    feed.update(&mut game, |input| {
+        sent.push(input.clone());
+        mixer.input(input);
+    });
+    assert!(!sent.contains(&Input::Active(true)));
+    assert!(!sent.contains(&Input::Active(false)));
+    // Set outdoor view and give the ambience score a few beats to start
+    // playing cells at hour 12 (daytime, so audio comes purely from
+    // backyard ambience, not `nite_loop`).
+    let mut noon = game.sound_sources();
+    noon.absent[4] = 12;
+    mixer.input(Input::Sources(noon));
+    mixer.input(Input::View(100));
+    mixer.input(Input::Hour(12));
+    assert!(
+        mixer.render(4 * RATE as usize).iter().any(|&s| s != 0),
+        "live ambience should play while focused"
+    );
+
+    // Losing window focus sends Input::Active(false) (kind 25 off), pausing
+    // live ambience and skipping new kind 1 plays; a duplicate false is
+    // deduplicated.
+    sent.clear();
+    feed.set_focused(false, &mut game, |input| {
+        sent.push(input.clone());
+        mixer.input(input);
+    });
+    assert!(!feed.focused());
+    assert_eq!(sent, [Input::Active(false)]);
+    sent.clear();
+    feed.set_focused(false, &mut game, |input| {
+        sent.push(input.clone());
+        mixer.input(input);
+    });
+    assert!(sent.is_empty(), "duplicate Focused(false) must be ignored");
+
+    // Let any already-started ambience cell samples finish, then confirm
+    // no new ambience cells or kind 1 plays sound while unfocused.
+    let _ = mixer.render(6 * RATE as usize);
+    mixer.input(Input::Events(vec![SoundEvent::Play {
+        object: 1,
+        name: "Phone_ring".into(),
+    }]));
+    assert!(
+        mixer.render(2 * RATE as usize).iter().all(|&s| s == 0),
+        "unfocused sound should keep ambience paused and skip kind 1 plays"
+    );
+
+    // Regaining focus sends Input::Active(true) (kind 25 on), resuming live
+    // ambience and allowing kind 1 plays again; duplicate true is ignored.
+    sent.clear();
+    feed.set_focused(true, &mut game, |input| {
+        sent.push(input.clone());
+        mixer.input(input);
+    });
+    assert!(feed.focused());
+    assert_eq!(sent, [Input::Active(true)]);
+    sent.clear();
+    feed.set_focused(true, &mut game, |input| {
+        sent.push(input.clone());
+        mixer.input(input);
+    });
+    assert!(sent.is_empty(), "duplicate Focused(true) must be ignored");
+    assert!(
+        mixer.render(4 * RATE as usize).iter().any(|&s| s != 0),
+        "regaining focus should resume live ambience"
+    );
+
+    // Focus cycling while the lot is paused does not unpause live ambience.
+    game.toggle_pause();
+    feed.update(&mut game, |input| mixer.input(input));
+    let _ = mixer.render(6 * RATE as usize);
+    feed.set_focused(false, &mut game, |input| mixer.input(input));
+    feed.set_focused(true, &mut game, |input| mixer.input(input));
+    assert!(
+        mixer.render(4 * RATE as usize).iter().all(|&s| s == 0),
+        "regaining focus while paused must keep live ambience paused"
+    );
+    assert!(mixer.new_faults().is_empty());
+}
+
+#[test]
 fn the_goths_sounds_play() {
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL is not set; skipping the Goth house sound test");

@@ -370,10 +370,10 @@ pub fn pause_event(paused: bool) -> SoundEvent {
 
 /// Bridges a [`crate::Game`] into a [`Mixer`] (or [`crate::output::Output`]):
 /// sends object sources, live-mode entry ([`enter_live`]), live-mode
-/// pause/unpause ([`pause_event`], `0x4ce5c5` / `0x4ce5d9`), the
-/// simulation's sound events, the ambience view/hour/speed, and kind 33
-/// camera moves in the order the window uses.
-#[derive(Default)]
+/// pause/unpause ([`pause_event`], `0x4ce5c5` / `0x4ce5d9`), window
+/// focus changes ([`Input::Active`], kind 25 at `0x4f7608` → `0x4f76d5`),
+/// the simulation's sound events, the ambience view/hour/speed, and kind
+/// 33 camera moves in the order the window uses.
 pub struct Feed {
     /// The hour, speed and ambience view the sound was last told.
     heard: Option<(u32, Speed, i32)>,
@@ -383,9 +383,45 @@ pub struct Feed {
     shot: Option<Shot>,
     /// Whether the sound was last told the lot is paused.
     paused: bool,
+    /// Whether the window is focused (`true` at startup, matching
+    /// `0x4eee14` and `0x4f7610` deduplication).
+    focused: bool,
+    /// Last focus state forwarded via [`Input::Active`].
+    active_sent: bool,
+}
+
+impl Default for Feed {
+    fn default() -> Self {
+        Self {
+            heard: None,
+            told: None,
+            shot: None,
+            paused: false,
+            focused: true,
+            active_sent: true,
+        }
+    }
 }
 
 impl Feed {
+    /// Whether the window is currently considered focused.
+    pub fn focused(&self) -> bool {
+        self.focused
+    }
+
+    /// Records a window focus change (`WM_ACTIVATEAPP`, `0x4f7608` →
+    /// `0x4f76d5`) and flushes it to the sound mixer as [`Input::Active`]
+    /// (kind 25). Repeated notifications with the same state are ignored,
+    /// including an initial `true` at window creation (`0x4eee14`,
+    /// `0x4f7610`).
+    pub fn set_focused(&mut self, focused: bool, game: &mut crate::Game, send: impl FnMut(Input)) {
+        if self.focused == focused {
+            return;
+        }
+        self.focused = focused;
+        self.update(game, send);
+    }
+
     /// Sends every sound input that changed on `game` since the last call.
     pub fn update(&mut self, game: &mut crate::Game, mut send: impl FnMut(Input)) {
         // What the tick's sounds may ask about their objects, before the
@@ -404,6 +440,10 @@ impl Feed {
         if paused != self.paused {
             send(Input::Events(vec![pause_event(paused)]));
             self.paused = paused;
+        }
+        if self.focused != self.active_sent {
+            send(Input::Active(self.focused));
+            self.active_sent = self.focused;
         }
         let sounds = game.take_sounds();
         if !sounds.is_empty() {
@@ -486,6 +526,8 @@ pub enum Input {
     /// The camera moved (kind 33): sent after the [`Input::Sources`]
     /// and [`Input::View`] that show the lot through the moved camera.
     Camera,
+    /// The window gained or lost focus (kind 25, `0x4f7608` → `0x4f76d5`).
+    Active(bool),
 }
 
 /// The sound player with every module, station and ambient score of an
@@ -541,6 +583,7 @@ impl Mixer {
             Input::Camera => self
                 .player
                 .camera_moved(self.view, self.hour, &self.sources),
+            Input::Active(active) => self.player.set_active(active, &self.sources),
             Input::Speed(speed) => self
                 .player
                 .set_global(SPEED_REGISTER, speed_register(speed)),
@@ -729,5 +772,10 @@ mod tests {
             matches!(stop, SoundEvent::StopObject { object: 12 }),
             "{stop:?}"
         );
+    }
+
+    #[test]
+    fn feed_starts_focused_like_app_constructor() {
+        assert!(Feed::default().focused());
     }
 }

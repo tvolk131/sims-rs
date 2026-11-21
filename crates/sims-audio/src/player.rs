@@ -133,6 +133,12 @@
 //!   [`Player::add_scores`]); a mode with no score stops the current one.
 //! - 36, `kSetMusicMode`: changes the music for the game's mode, then
 //!   the ambience and the day and night loop (see `Player::set_music_mode`).
+//! - 37, 38, 39: effects, music and voice volume sliders
+//!   ([`Player::set_fx_volume_step`], [`Player::set_music_volume_step`],
+//!   [`Player::set_vox_volume_step`], 0x57408f..0x574136): map slider
+//!   steps `0..=10` through [`VOLUME_STEPS`] (0x67156c) to groups 1, 2
+//!   and 3; kind 37 also sets every ambience score's volume and runs the
+//!   day and night loop update (0x5741b7 → 0x574978).
 //! - 43, `kPlayPiano`: starts the piano (track [`PIANO`]) where its
 //!   object is, and the skill track [`PIANO_SKILL`] (see
 //!   `Player::play_piano`).
@@ -257,6 +263,12 @@ const NUDGE_UPDATES: u32 = 100;
 /// *(code)* `fade_speed` written when starting a day and night loop
 /// (`0x574a46`: 0x1388 = 5000).
 const DAY_NIGHT_FADE_SPEED: i32 = 5000;
+/// *(code)* The 11-step volume slider table (`0x67156c`) used by kinds
+/// 37, 38 and 39 (`0x57408f`, `0x5740f9`, `0x57410d`) and the day and
+/// night loop (`0x574a10`). Steps `0..=10` map to HIT group volumes
+/// `0..=1024`; the sound manager initializes all three sliders to step
+/// `10` (`0x5713ee`..`0x571409`).
+pub const VOLUME_STEPS: [i32; 11] = [0, 300, 390, 490, 590, 690, 790, 840, 895, 960, 1024];
 /// The `extvol` register, which `seqgroup_kill` fades out.
 pub const EXTVOL: u8 = 19;
 /// The fade registers: the value to reach, the register that moves, how
@@ -393,6 +405,9 @@ pub mod kind {
     pub const SET_ACTIVE: i64 = 25;
     pub const TURN_ON_TV: i64 = 30;
     pub const SET_MUSIC_MODE: i64 = 36;
+    pub const SET_FX_VOLUME: i64 = 37;
+    pub const SET_MUSIC_VOLUME: i64 = 38;
+    pub const SET_VOX_VOLUME: i64 = 39;
     pub const PLAY_PIANO: i64 = 43;
     pub const SET_AMBIENCE_MODE: i64 = 52;
     pub const SEQUENCE_TRACK_HIT_LIST: i64 = 53;
@@ -407,9 +422,9 @@ pub mod kind {
     /// reported when an event has one. (Kind 33 is ported for the game's
     /// own calls, [`super::Player::camera_moved`], which carry the
     /// camera; no event in the install has it.)
-    pub const NOT_PORTED: [i64; 30] = [
-        2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 24, 26, 32, 33, 34, 35, 37, 38, 39,
-        40, 41, 42, 103, 104,
+    pub const NOT_PORTED: [i64; 27] = [
+        2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 24, 26, 32, 33, 34, 35, 40, 41, 42,
+        103, 104,
     ];
 }
 
@@ -856,6 +871,10 @@ pub struct Player<S> {
     /// Group volumes set by the host (the options' sliders), 1024 when
     /// not set.
     group_volumes: BTreeMap<i64, i32>,
+    /// *(code)* The effects, music and voice slider steps (`+0xf0`,
+    /// `+0xf4`, `+0xf8`, all initialized to `10` at `0x5713ee`..`0x571409`,
+    /// updated by kinds 37, 38 and 39).
+    volume_steps: [u8; 3],
     /// The master volume, 0 to 1024.
     master: i32,
     notes: Vec<Note>,
@@ -956,6 +975,7 @@ impl<S: Samples> Player<S> {
             seqgroups: BTreeMap::new(),
             duck: BTreeMap::new(),
             group_volumes: BTreeMap::new(),
+            volume_steps: [10, 10, 10],
             master: 1024,
             notes: Vec::new(),
             idle: BTreeMap::new(),
@@ -1006,6 +1026,53 @@ impl<S: Samples> Player<S> {
             }
         }
         self.apply_levels();
+    }
+
+    /// *(code)* Kind 37 (`0x57408f`): sets the effects volume slider step
+    /// (`0..=10`, clamped; table [`VOLUME_STEPS`] at `0x67156c`), updates
+    /// group 1 (`kGroupSfx`) and every ambience score to that volume, and
+    /// runs the day and night loop update (`0x5741b7` → `0x574978`).
+    pub fn set_fx_volume_step(&mut self, step: usize, sources: &dyn Sources) {
+        let step = step.min(VOLUME_STEPS.len() - 1);
+        self.volume_steps[0] = step as u8;
+        self.set_group_volume(1, VOLUME_STEPS[step]);
+        self.update_day_night(sources);
+    }
+
+    /// *(code)* Kind 38 (`0x5740f9`): sets the music volume slider step
+    /// (`0..=10`, clamped; table [`VOLUME_STEPS`] at `0x67156c`) and
+    /// updates group 2 (`kGroupMusic`) to that volume.
+    pub fn set_music_volume_step(&mut self, step: usize) {
+        let step = step.min(VOLUME_STEPS.len() - 1);
+        self.volume_steps[1] = step as u8;
+        self.set_group_volume(2, VOLUME_STEPS[step]);
+    }
+
+    /// *(code)* Kind 39 (`0x57410d`): sets the voice volume slider step
+    /// (`0..=10`, clamped; table [`VOLUME_STEPS`] at `0x67156c`) and
+    /// updates group 3 (`kGroupVox`) to that volume.
+    pub fn set_vox_volume_step(&mut self, step: usize) {
+        let step = step.min(VOLUME_STEPS.len() - 1);
+        self.volume_steps[2] = step as u8;
+        self.set_group_volume(3, VOLUME_STEPS[step]);
+    }
+
+    /// *(code)* Current effects volume slider step (`+0xf0`, read by kind
+    /// 40 at `0x574137`; initialized to `10`).
+    pub fn fx_volume_step(&self) -> u8 {
+        self.volume_steps[0]
+    }
+
+    /// *(code)* Current music volume slider step (`+0xf4`, read by kind
+    /// 41 at `0x57413f`; initialized to `10`).
+    pub fn music_volume_step(&self) -> u8 {
+        self.volume_steps[1]
+    }
+
+    /// *(code)* Current voice volume slider step (`+0xf8`, read by kind
+    /// 42 at `0x574147`; initialized to `10`).
+    pub fn vox_volume_step(&self) -> u8 {
+        self.volume_steps[2]
     }
 
     /// Sets the master volume, 0 to 1024.
@@ -1553,8 +1620,8 @@ impl<S: Samples> Player<S> {
         // The original's fields are 32 bits; a number that fits neither
         // signed nor unsigned 32 bits is a fault, not a wrapped value.
         let fits = |v: i64| (i64::from(i32::MIN)..=i64::from(u32::MAX)).contains(&v);
-        let track = track.unwrap_or(0);
-        if !fits(track) || numbers.iter().any(|&v| !fits(v)) {
+        let track_raw = track.unwrap_or(0);
+        if !fits(track_raw) || numbers.iter().any(|&v| !fits(v)) {
             self.report(format!("event {name}: a number does not fit 32 bits"));
             return;
         }
@@ -1563,7 +1630,7 @@ impl<S: Samples> Player<S> {
             v => v as u32,
         };
         let args = [given(0, object), given(1, 0), given(2, 0)];
-        let track = track as u32;
+        let track = track_raw as u32;
         match kind {
             kind::PLAY => self.play_track(track, args, sources),
             kind::FADE => self.fade_track(track, args),
@@ -1575,6 +1642,22 @@ impl<S: Samples> Player<S> {
             kind::SET_ACTIVE => self.set_active(track != 0, sources),
             kind::SET_AMBIENCE_MODE => self.set_ambience_mode(track),
             kind::SET_MUSIC_MODE => self.set_music_mode(i64::from(track as i32), sources),
+            kind::SET_FX_VOLUME | kind::SET_MUSIC_VOLUME | kind::SET_VOX_VOLUME => {
+                if let Ok(step) = usize::try_from(track_raw)
+                    && step < VOLUME_STEPS.len()
+                {
+                    match kind {
+                        kind::SET_FX_VOLUME => self.set_fx_volume_step(step, sources),
+                        kind::SET_MUSIC_VOLUME => self.set_music_volume_step(step),
+                        kind::SET_VOX_VOLUME => self.set_vox_volume_step(step),
+                        _ => unreachable!(),
+                    }
+                } else {
+                    self.report(format!(
+                        "event {name}: volume step {track_raw} out of range"
+                    ));
+                }
+            }
             kind::TURN_ON_TV => self.turn_on_tv(track, args, sources),
             kind::PLAY_PIANO => self.play_piano(args, sources),
             kind::SEQUENCE_TRACK_HIT_LIST => self.sequence(track, args[1]),
@@ -2146,6 +2229,15 @@ impl<S: Samples> Player<S> {
             self.write_at(at, FADE_VAR, i32::from(EXTVOL));
             self.write_at(at, FADE_SPEED, DAY_NIGHT_FADE_SPEED);
             self.write_at(at, FADE_ON, 1);
+        } else {
+            // *(code)* 0x574a1e..0x574a5e still writes the fade setup to
+            // the track object when `start` returned early on group volume
+            // 0 (`0x57e059` forces `FADE_ON` back to 0 on a stopped track).
+            self.write_stopped(track, EXTVOL, 0);
+            self.write_stopped(track, FADE_DEST, target_vol);
+            self.write_stopped(track, FADE_VAR, i32::from(EXTVOL));
+            self.write_stopped(track, FADE_SPEED, DAY_NIGHT_FADE_SPEED);
+            self.write_stopped(track, FADE_ON, 1);
         }
         self.let_go_track(track, &started.threads);
     }

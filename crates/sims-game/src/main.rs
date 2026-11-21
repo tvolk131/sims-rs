@@ -516,6 +516,10 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Focused(focused) => {
+                self.sound_feed
+                    .set_focused(focused, &mut self.game, |input| self.sound.send(input));
+            }
             WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::Resized(size) => {
                 self.sync_size(size);

@@ -5431,3 +5431,309 @@ fn never_started_track_reads_zero_patch_after_kill_trk_and_stop_all() {
     assert_eq!(*probe.asked.borrow(), [(0, 0), (0, 0)]);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
+
+#[test]
+fn kinds_37_38_39_map_slider_steps_to_groups_and_ambience() {
+    use sims_audio::levels::{Inputs, levels};
+    use sims_audio::player::VOLUME_STEPS;
+
+    // Three tracks in groups 1 (Sfx), 2 (Music) and 3 (Vox), each looping a
+    // constant sample of 4000, plus an ambience score to verify kind 37
+    // updates ambience volume while kinds 38 and 39 leave it alone.
+    let loop_note: &[u8] = &[SET_LOOP, NOTE_ON_V1[0], NOTE_ON_V1[1], WAIT_SAMP, LOOP];
+    let (hit, addresses) = assemble(&[loop_note]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         [Track]\n\
+         10=0,sfx,1024,0,0,1,0,0x100,1\n\
+         11=0,mus,1024,0,0,2,0,0x100,1\n\
+         12=0,vox,1024,0,0,3,0,0x100,1\n\
+         [EventMapping]\n\
+         sfx=1,10\n\
+         mus=1,11\n\
+         vox=1,12\n\
+         fx0=37,0\n\
+         fx5=37,5\n\
+         fx_bad=37,11\n\
+         fx_neg=37,-1\n\
+         mus3=38,3\n\
+         vox7=39,7\n\
+         mus_bad=38,12\n\
+         vox_bad=39,-2\n",
+        addresses[0]
+    );
+    let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+    let mut map = BTreeMap::new();
+    map.insert(
+        "one.xa".to_owned(),
+        Pcm {
+            rate: RATE,
+            channels: 1,
+            samples: vec![4000; RATE as usize],
+        },
+    );
+    let mut player = Player::new(vec![module], map, 1);
+
+    // Sound manager constructor (0x5713ee..0x571409) starts all three
+    // sliders at step 10 (1024).
+    assert_eq!(
+        (
+            player.fx_volume_step(),
+            player.music_volume_step(),
+            player.vox_volume_step()
+        ),
+        (10, 10, 10)
+    );
+    assert_eq!(
+        VOLUME_STEPS,
+        [0, 300, 390, 490, 590, 690, 790, 840, 895, 960, 1024]
+    );
+
+    let expected_mono = |group_volume: i32| -> i16 {
+        let g = levels(&Inputs {
+            vol: 1024,
+            extvol: 1024,
+            pan: 512,
+            pitch: 3600,
+            duck_priority: 0,
+            three_d: false,
+            group_volume,
+            main_duck_priority: 0,
+            master: 1024,
+        })
+        .gains;
+        let l = (4000i64 * i64::from(g[0])) >> 16;
+        let r = (4000i64 * i64::from(g[1])) >> 16;
+        ((l + r) / 2) as i16
+    };
+
+    // Kind 37 (step 5 -> 590), kind 38 (step 3 -> 490), kind 39 (step 7 -> 840).
+    for (event_name, track_event, step) in
+        [("fx5", "sfx", 5), ("mus3", "mus", 3), ("vox7", "vox", 7)]
+    {
+        player.handle(&SoundEvent::StopAll, &NoSources);
+        play(&mut player, event_name);
+        play(&mut player, track_event);
+        let out = player.render(BLOCK, &NoSources);
+        assert_eq!(
+            out[0],
+            expected_mono(VOLUME_STEPS[step]),
+            "{event_name} (step {step})"
+        );
+    }
+    assert_eq!(
+        (
+            player.fx_volume_step(),
+            player.music_volume_step(),
+            player.vox_volume_step()
+        ),
+        (5, 3, 7)
+    );
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+
+    // Out-of-range HOT event steps report faults without changing state.
+    for bad in ["fx_bad", "fx_neg", "mus_bad", "vox_bad"] {
+        play(&mut player, bad);
+    }
+    assert_eq!(player.faults.len(), 4, "{:?}", player.faults);
+    assert_eq!(
+        (
+            player.fx_volume_step(),
+            player.music_volume_step(),
+            player.vox_volume_step()
+        ),
+        (5, 3, 7)
+    );
+
+    // Direct host methods clamp steps above 10 to 10.
+    player.set_fx_volume_step(99, &NoSources);
+    player.set_music_volume_step(99);
+    player.set_vox_volume_step(99);
+    assert_eq!(
+        (
+            player.fx_volume_step(),
+            player.music_volume_step(),
+            player.vox_volume_step()
+        ),
+        (10, 10, 10)
+    );
+}
+
+#[test]
+fn kind_37_reruns_day_night_loop_and_restarts_after_mute() {
+    use sims_audio::levels::{Inputs, levels};
+    use sims_audio::player::{NITE_LOOP, VOLUME_STEPS};
+
+    let loop_note: &[u8] = &[SET_LOOP, NOTE_ON_V1[0], NOTE_ON_V1[1], WAIT_SAMP, LOOP];
+    // Reads EXTVOL (19), FADE_DEST (40), FADE_VAR (41), FADE_SPEED (42), FADE_ON (45)
+    // from NITE_LOOP through `target`.
+    let mut inspect = loadl(53, NITE_LOOP as i32);
+    for reg in [19u8, 40, 41, 42, 45] {
+        inspect.extend([GETSRCDATAFIELD, 6, 1, reg]);
+    }
+    inspect.push(END);
+    let (hit, addresses) = assemble(&[loop_note, &inspect]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         [Track]\n\
+         {NITE_LOOP}=0,nite_loop,1024,0,0,1,0,0x100,1\n\
+         20=0,inspect,1024,0,0,0,0,0x101,1\n\
+         [EventMapping]\n\
+         m3=36,3\n\
+         m0=36,0\n\
+         fx0=37,0\n\
+         fx5=37,5\n\
+         fx8=37,8\n\
+         mus5=38,5\n\
+         vox5=39,5\n\
+         inspect=1,20\n",
+        addresses[0], addresses[1]
+    );
+    let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+    let mut map = BTreeMap::new();
+    map.insert(
+        "one.xa".to_owned(),
+        Pcm {
+            rate: RATE,
+            channels: 1,
+            samples: vec![4000; RATE as usize],
+        },
+    );
+    let mut player = Player::new(vec![module], map, 1);
+
+    let snap = |hour: i32| {
+        let mut s = Snapshot::default();
+        s.absent[4] = hour;
+        s.lot = 1;
+        s
+    };
+    let night = snap(22);
+    let day = snap(12);
+
+    // Mute effects before entering live mode at night: `0x574978` picks
+    // NITE_LOOP, `start` returns early on group 1 volume 0, and
+    // `0x574a1e..0x574a5e` still writes the stopped fade setup (FADE_ON=0).
+    for name in ["fx0", "m3", "m0"] {
+        player.handle(
+            &SoundEvent::Play {
+                object: 0,
+                name: name.into(),
+            },
+            &night,
+        );
+    }
+    // `m3`/`m0` report missing music tracks (517, 2957, 519) in this
+    // minimal module; clear those so later assertions catch any new faults.
+    player.faults.clear();
+    assert!(
+        player
+            .render_stereo(BLOCK * 4, &night)
+            .iter()
+            .all(|&s| s == 0)
+    );
+    let probe = Probe {
+        lot: on_lot(&[(8, 400)]),
+        asked: Default::default(),
+    };
+    player.handle(
+        &SoundEvent::Play {
+            object: 0,
+            name: "inspect".into(),
+        },
+        &probe,
+    );
+    player.render(BLOCK, &probe);
+    assert_eq!(
+        *probe.asked.borrow(),
+        [(0, 0), (0, 0), (0, 19), (0, 5000), (0, 0)]
+    );
+
+    // Kinds 38 and 39 do NOT run 0x574978.
+    for name in ["mus5", "vox5"] {
+        player.handle(
+            &SoundEvent::Play {
+                object: 0,
+                name: name.into(),
+            },
+            &night,
+        );
+    }
+    assert!(
+        player
+            .render_stereo(BLOCK * 4, &night)
+            .iter()
+            .all(|&s| s == 0)
+    );
+
+    // Raising the effects slider via kind 37 (step 5 -> 590) with NO
+    // `camera_moved` runs 0x574978, starts `nite_loop`, and fades `extvol`
+    // up to 590 (at group 1 volume 590).
+    player.handle(
+        &SoundEvent::Play {
+            object: 0,
+            name: "fx5".into(),
+        },
+        &night,
+    );
+    let out = player.render_stereo(BLOCK * 4, &night);
+    let expected = levels(&Inputs {
+        vol: 1024,
+        extvol: VOLUME_STEPS[5],
+        pan: 512,
+        pitch: 3600,
+        duck_priority: 0,
+        three_d: false,
+        group_volume: VOLUME_STEPS[5],
+        main_duck_priority: 0,
+        master: 1024,
+    })
+    .gains;
+    let want = ((4000i64 * i64::from(expected[0])) >> 16) as i16;
+    assert_eq!(out[out.len() - 2], want, "nite_loop at fx step 5");
+
+    // When the hour is daytime, kind 37 runs 0x574978 and fades `nite_loop`
+    // out even without a camera move.
+    player.handle(
+        &SoundEvent::Play {
+            object: 0,
+            name: "fx8".into(),
+        },
+        &day,
+    );
+    let _ = player.render_stereo(BLOCK * 16, &day);
+    assert!(
+        player
+            .render_stereo(BLOCK * 4, &day)
+            .iter()
+            .all(|&s| s == 0),
+        "kind 37 in daytime should stop nite_loop"
+    );
+
+    // Inactive sound: kind 37 still updates slider step / group volume, and
+    // 0x574978 takes the stop branch instead of starting `nite_loop`.
+    player.set_active(false, &night);
+    player.handle(
+        &SoundEvent::Play {
+            object: 0,
+            name: "fx5".into(),
+        },
+        &night,
+    );
+    assert_eq!(player.fx_volume_step(), 5);
+    assert!(
+        player
+            .render_stereo(BLOCK * 4, &night)
+            .iter()
+            .all(|&s| s == 0)
+    );
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
