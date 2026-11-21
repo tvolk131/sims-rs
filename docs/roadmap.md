@@ -134,10 +134,11 @@ events, and what it asks for after them) come first.
    as 6b part E, which uses recorded inputs; exact files and looks are
    deferred.
    Next (track 4): open PR #287 moves both UD2 boot tests to
-   `ud2-import-20261119/after-run2`. It starts the C runtime at a
-   fitted offset of 401,120 draws (`Lot::load_with`), so our load
-   reaches the recording's entry state; that the generator ran on with
-   no reseed is assumed. The compared fields, relationships included,
+   `ud2-import-20261119/after-run2`. Both tests start the C runtime from
+   state 1 advanced by a fitted 401,120 draws, using `Lot::load_with`
+   and `Lot::load_in_with`. The port's next 4,730 draws reach the
+   recording's C runtime state at lot entry. The fit assumes the
+   original's generator ran from state 1 without a reseed. The compared fields, relationships included,
    agree at entry and through update 1,000, apart from object 2's last
    result and object 274's frame-block word 77 at updates 112–157
    (heap residue). The comparison skips words marked unknown. Task 2
@@ -208,8 +209,10 @@ events, and what it asks for after them) come first.
   the still pointer: Mortimer's word 50 at 521–810 and 881–925, and a
   local of tree 8333 at 568–588. Trial listings (the salesman after
   520 and 550, Bella after 880) close every difference but do not
-  show that the original made them. Track 2 still needs pick watches
-  and screenshots after 520, 550 and 880. The original's press found
+  show that the original made them. Track 2 still needs write watches on
+  the noted graphic and the house tool's current-object word at
+  updates 85–100, 515–560 and 875–885, plus screenshots after 520, 550
+  and 880. The original's press found
   Bella three rows below the lowest pixel of her feet in our frame.
   That reach is open, and the replay uses her lowest drawn pixel while
   the recorded point misses.
@@ -217,10 +220,11 @@ events, and what it asks for after them) come first.
   `docs/decisions/20261120-read-order-replayed-in-the-window.md`). In
   the compared words it agrees through updates 1–900 except for
   Mortimer's two stale frame locals from 187, his word 50 at 727–900
-  and last result at 727–874, and Bella's three stale locals. A trial
-  second entry check at 186 and a trial salesman listing at 726
-  account for all the differences except Bella's. New open case:
-  which input makes the original check a pie entry again. Track 2
+  and last result at 727–874, and Bella's three stale locals. In a trial,
+  rechecking the entry at 186 and listing the salesman at 726
+  reproduced every compared word except Bella's three stale locals.
+  Whether the original checked the entry again, and what might have
+  triggered it, remain open. Track 2
   still needs an execute watch on 0x51bb9e at updates 140–190, pick
   watches at 85–100 and 720–730, and screenshots after 93 and 726.
   The recorded bookcase point (384, 250) picks the door in our view,
@@ -2436,14 +2440,15 @@ Progress:
   in the original (not read).
 - Done: flat grass on the empty half of a split tile (#187); the Goths'
   porch matches the original there.
-- Done: which object or person drew each pixel, for clicks:
-  `Canvas::id_at` after `sims_render::draw` and `People::draw_on_lot`.
+- Done: which object or person drew each pixel, for clicks.
   Objects name themselves, people their object ID, and terrain, floors
-  and walls nobody. `Canvas::id_at` reports the last object or person
-  to name a pixel. The game saves the IDs after drawing people and the
-  bob, before `draw_held`, for the noted-graphic pick. Other picks use
-  the sprite walk from the lot's depth (see the pointer-pick entry
-  under integration, #278).
+  and walls nobody. `Canvas::id_at` returns the ID from the last draw
+  that wrote depth at that pixel, or `None` for an untagged draw. The
+  game draws the lot with `draw_lot`, draws people and the bob with
+  `People::draw_on_lot`, then snapshots the IDs before `draw_held`.
+  The first stage of the pointer pick uses that snapshot. The sprite
+  pick uses the lot depth and the canvas's drawn rectangles (see the
+  pointer-pick entry under integration, #278).
 - Done: the pools of light lit lamps throw on the floor, from the
   game's `lightMap.dat`, and lit lamps drawn in full light, as the
   original does. With the world at the screenshots' time, near zoom
@@ -2575,9 +2580,10 @@ Progress:
   clears it at the end of TO when TO is given; it serves watches such
   as the RNG watch late in the Goth day. A watch row's `match` records
   what QEMU's stop shows (`named`, `one_of`, `changed`, `at`, or null
-  when unmatched). `--resume` journals the pending trap in
-  `status.json`, refuses a run without a baseline, avoids repeating a
-  recorded dialog-show stop, and repairs a torn final log row.
+  when unmatched). The capture journals the pending trap
+  in `status.json` so `--resume` can recognize it. `--resume` refuses
+  a run without a baseline, avoids repeating a recorded dialog-show
+  stop, and repairs a torn final log row.
   **Unverified:** a live QEMU takeover; the takeover paths were tested
   only against a fake gdbstub.
 - Next: build mode (its mode number), and a replay of the recorded push and
