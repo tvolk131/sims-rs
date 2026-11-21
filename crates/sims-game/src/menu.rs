@@ -400,31 +400,62 @@ pub struct Menu {
     /// Where the pointer is to be moved, as the original moves it, until
     /// the host takes it.
     pointer: Option<[i32; 2]>,
+    /// Whether the pie has settled into click-to-choose mode (`+0x14e`,
+    /// 0x5ebab2, 0x5eb433): false right after opening from a left press
+    /// until the opening button is released, then true (and true in a
+    /// submenu opened by a release).
+    sticky: bool,
+    /// Whether the menu had to move to stay on screen (`+0x154`,
+    /// 0x5ebab2), cleared on the first release (0x5eb4b3). While set and
+    /// `!sticky`, releasing settles the menu instead of choosing
+    /// (0x5eb45d).
+    moved: bool,
+    /// Whether the left mouse button is held down over the pie, which
+    /// draws the highlighted label in cyan (0x5eb04c).
+    held: bool,
     /// The head of the Sim the menu is for, drawn in each menu's middle
     /// (`People::head`), if it was rendered.
     pub head: Option<Image>,
 }
 
-/// What a press on an open [`Menu`] did.
+/// What a left release on an open [`Menu`] did (0x5eb433).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Press {
+pub enum Release {
+    /// The opening press was released without choosing (within the dead
+    /// zone, or after the menu moved to stay on screen); the menu stays
+    /// open in click-to-choose mode.
+    Settled,
     /// The player chose this entry (its index in [`Menu::entries`]); the
     /// menu is closed.
     Chose(usize),
-    /// A submenu opened, or the press went back from one; the menu stays.
+    /// A submenu opened, or the release went back from one; the menu
+    /// stays open on the new level.
     Stays,
-    /// The press was elsewhere: the menu is closed.
+    /// The release was elsewhere: the menu is closed.
     Closed,
+}
+
+/// Distance from `layout`'s middle to `point`, as a 32-bit float
+/// (0x5eb7c9, `+0x164`).
+fn distance(layout: &pie::Layout, point: [i32; 2]) -> f32 {
+    let dx = f64::from(point[0]) - f64::from(layout.center[0]);
+    let dy = f64::from(point[1]) - f64::from(layout.center[1]);
+    (dx * dx + dy * dy).sqrt() as f32
 }
 
 impl Menu {
     /// The menu of `entries` opened at `at`, the pointer where the player
-    /// clicked, and laid out on a screen of `size` with `art` (which
+    /// pressed, and laid out on a screen of `size` with `art` (which
     /// holds [`pie::RESOURCES`] and the label font; nothing is laid out
     /// without the font). An entry whose name has a `/` goes into a
     /// submenu, and only the first [`pie::SHOWN`] of a menu are shown, as
     /// the original's picker does. Where the menu had to move to stay on
     /// the screen, the pointer is to move to its middle.
+    ///
+    /// Opens as from a held left press (`+0x14e = 0`, 0x48d56c): the
+    /// matching release settles the menu if it stays within the dead zone
+    /// or the menu moved, or chooses at once on a drag past the dead zone
+    /// (0x5eb433).
     pub fn new(
         person: u16,
         object: u16,
@@ -443,10 +474,14 @@ impl Menu {
             layouts: Vec::new(),
             size,
             pointer: None,
+            sticky: false,
+            moved: false,
+            held: true,
             head: None,
         };
         menu.layout(art, size);
-        menu.pointer = menu.layouts.first().filter(|l| l.moved).map(|l| l.center);
+        menu.moved = menu.layouts.first().is_some_and(|l| l.moved);
+        menu.pointer = menu.moved.then(|| menu.layouts[0].center);
         menu
     }
 
@@ -463,27 +498,70 @@ impl Menu {
     }
 
     /// The entry (its index in [`Menu::entries`]) highlighted under
-    /// `point`: the one a press there would choose.
+    /// `point`: the one a release there would choose.
     pub fn highlighted(&self, point: [i32; 2]) -> Option<usize> {
         self.pie.choice_at(&self.layouts, point)
     }
 
-    /// A press at `point`, as the picker takes it. A submenu opened or
-    /// closed is laid out at once, so the next press finds it; the
-    /// pointer is to move to the middle of a submenu that opens (where
-    /// the picker moves it, 0x48d9c0, or where the submenu had to move to
-    /// stay on the screen).
-    pub fn press(&mut self, art: &Art, point: [i32; 2]) -> Press {
+    /// Whether the left mouse button is currently held over the pie
+    /// (drawing the highlighted label in cyan, 0x5eb04c).
+    pub fn held(&self) -> bool {
+        self.held
+    }
+
+    /// A left press on the open pie (0x5eb3d1, with `+0x170` clear as
+    /// 0x518665 sets it): does not choose or close, only marks the button
+    /// held so the highlighted entry draws in cyan. True if that state
+    /// changed.
+    pub fn press(&mut self) -> bool {
+        let changed = !self.held;
+        self.held = true;
+        changed
+    }
+
+    /// Whether a left release at `point` will choose, open/leave a
+    /// submenu, or close (`0x5eb433`: already settled, or dragged past
+    /// the dead zone without the menu having moved on screen), rather
+    /// than settling the opening press.
+    pub fn will_choose(&self, point: [i32; 2]) -> bool {
+        if self.sticky {
+            return true;
+        }
+        !self.moved
+            && self
+                .layouts
+                .last()
+                .is_some_and(|top| distance(top, point) > pie::DEAD_ZONE as f32)
+    }
+
+    /// A left release at `point` (0x5eb433), as the picker takes it.
+    ///
+    /// While the menu is still on its opening press (`!sticky`), a
+    /// release within the dead zone or after the menu moved to stay on
+    /// screen settles it into click-to-choose mode (`Release::Settled`);
+    /// a release dragged past the dead zone on an unmoved menu acts at
+    /// once. A submenu opened or closed is laid out at once and stays
+    /// settled (`sticky`), with the pointer moved to a newly opened
+    /// submenu's middle (0x48d9c0).
+    pub fn release(&mut self, art: &Art, point: [i32; 2]) -> Release {
+        self.held = false;
+        let choose = self.will_choose(point);
+        self.moved = false;
+        if !choose {
+            self.sticky = true;
+            return Release::Settled;
+        }
         match self.pie.press(&self.layouts, point) {
-            Pressed::Chose(choice) => Press::Chose(choice),
+            Pressed::Chose(choice) => Release::Chose(choice),
             pressed @ (Pressed::Opened { .. } | Pressed::Back) => {
+                self.sticky = true;
                 self.layout(art, self.size);
                 if matches!(pressed, Pressed::Opened { .. }) {
                     self.pointer = self.layouts.last().map(|l| l.center);
                 }
-                Press::Stays
+                Release::Stays
             }
-            Pressed::Closed => Press::Closed,
+            Pressed::Closed => Release::Closed,
         }
     }
 
@@ -526,7 +604,7 @@ impl Menu {
             &self.layouts,
             self.head.as_ref(),
             pointer,
-            false,
+            self.held,
         );
     }
 }
@@ -636,44 +714,71 @@ mod tests {
     const STUDIES: [&str; 3] = ["Read a Book", "Study/Cooking", "Study/Mechanical"];
 
     #[test]
-    fn a_press_chooses_an_entry_by_its_place_in_the_listing() {
+    fn a_release_chooses_an_entry_by_its_place_in_the_listing() {
         let art = art();
         let mut menu = Menu::new(1, 2, named(&STUDIES), [400, 300], &art, [800, 600]);
-        // Laid out where it opened: the pointer stays.
+        // Laid out where it opened: the pointer stays, button held until
+        // the opening press releases.
         assert_eq!(menu.take_pointer(), None);
+        assert!(menu.held());
+        // Releasing at the center settles the menu without closing it.
+        assert_eq!(menu.release(&art, [400, 300]), Release::Settled);
+        assert!(!menu.held());
         // Two entries in the first menu: the book, and the studies'
         // submenu.
         assert_eq!(menu.layouts.len(), 1);
         assert_eq!(menu.layouts[0].labels.len(), 2);
         let study = centre(menu.layouts[0].labels[1].rect);
         assert_eq!(menu.hovered(study), (1, Some(1)));
-        assert_eq!(menu.press(&art, study), Press::Stays);
+        // A press marks held without opening the submenu; release opens it.
+        assert!(menu.press());
+        assert!(menu.held());
+        assert_eq!(menu.layouts.len(), 1);
+        assert_eq!(menu.release(&art, study), Release::Stays);
+        assert!(!menu.held());
         // The submenu is laid out at once, and the pointer goes to its
         // middle.
         assert_eq!(menu.layouts.len(), 2);
         assert_eq!(menu.take_pointer(), Some(menu.layouts[1].center));
         assert_eq!(menu.take_pointer(), None);
         // Mechanical, the second entry of the submenu, is the third entry
-        // listed.
+        // listed. Pressing then releasing chooses it.
         let mechanical = centre(menu.layouts[1].labels[1].rect);
         assert_eq!(menu.hovered(mechanical), (2, Some(1)));
-        assert_eq!(menu.press(&art, mechanical), Press::Chose(2));
+        assert!(menu.press());
+        assert_eq!(menu.release(&art, mechanical), Release::Chose(2));
 
+        // Pressing on an entry then dragging off before releasing closes
+        // without choosing.
+        let mut menu = Menu::new(1, 2, named(&["Read a Book"]), [400, 300], &art, [800, 600]);
+        assert_eq!(menu.release(&art, [400, 300]), Release::Settled);
+        let book = centre(menu.layouts[0].labels[0].rect);
+        assert_eq!(menu.hovered(book), (1, Some(0)));
+        assert!(menu.press());
+        assert_eq!(menu.release(&art, [5, 5]), Release::Closed);
+
+        // Press-drag-release from an unmoved menu past the dead zone
+        // chooses on the opening press's release (0x5eb433).
         let mut menu = Menu::new(1, 2, named(&["Read a Book"]), [400, 300], &art, [800, 600]);
         let book = centre(menu.layouts[0].labels[0].rect);
-        assert_eq!(menu.press(&art, book), Press::Chose(0));
-        assert_eq!(menu.press(&art, [5, 5]), Press::Closed);
+        assert!(menu.will_choose(book));
+        assert_eq!(menu.release(&art, book), Release::Chose(0));
+
+        // Press-drag-release past the dead zone into empty space closes.
+        let mut menu = Menu::new(1, 2, named(&["Read a Book"]), [400, 300], &art, [800, 600]);
+        assert_eq!(menu.release(&art, [5, 5]), Release::Closed);
     }
 
     #[test]
-    fn a_second_press_finds_the_submenu_the_first_opened() {
+    fn a_second_release_finds_the_submenu_the_first_opened() {
         let art = art();
         let mut menu = Menu::new(1, 2, named(&STUDIES), [400, 300], &art, [800, 600]);
+        assert_eq!(menu.release(&art, [400, 300]), Release::Settled);
         let study = centre(menu.layouts[0].labels[1].rect);
-        assert_eq!(menu.press(&art, study), Press::Stays);
-        // Pressed again where Study was, with no drawing between: that is
+        assert_eq!(menu.release(&art, study), Release::Stays);
+        // Released again where Study was, with no drawing between: that is
         // the submenu's middle, which goes back.
-        assert_eq!(menu.press(&art, study), Press::Stays);
+        assert_eq!(menu.release(&art, study), Release::Stays);
         assert_eq!(menu.layouts.len(), 1);
     }
 
@@ -681,24 +786,36 @@ mod tests {
     fn a_menu_moved_to_stay_on_the_screen_moves_the_pointer() {
         let art = art();
         // Opened near the top: the first menu moves down, and so does the
-        // pointer.
+        // pointer. Even if the opening release lands past the dead zone,
+        // `moved` settles the menu instead of choosing (0x5eb45d).
         let mut menu = Menu::new(1, 2, named(&STUDIES), [400, 20], &art, [800, 600]);
         let first = menu.layouts[0].clone();
         assert!(first.moved);
         assert_eq!(menu.take_pointer(), Some(first.center));
+        let study = centre(first.labels[1].rect);
+        assert!(!menu.will_choose(study));
+        assert_eq!(menu.release(&art, study), Release::Settled);
+        assert_eq!(menu.layouts.len(), 1);
+        // Once settled, releasing on Study opens the submenu.
+        assert!(menu.will_choose(study));
+        assert_eq!(menu.release(&art, study), Release::Stays);
+        assert_eq!(menu.layouts.len(), 2);
+
         // A submenu opened from the top entry, near the top, moves down;
         // the pointer goes to where it moved, not to the entry.
         let names = ["Study/Cooking", "Study/Mechanical", "Read a Book"];
         let mut menu = Menu::new(1, 2, named(&names), [400, 130], &art, [800, 600]);
         assert_eq!(menu.take_pointer(), None);
+        assert_eq!(menu.release(&art, [400, 130]), Release::Settled);
         let study = centre(menu.layouts[0].labels[0].rect);
-        assert_eq!(menu.press(&art, study), Press::Stays);
+        assert_eq!(menu.release(&art, study), Release::Stays);
         let submenu = menu.layouts[1].clone();
         assert!(submenu.moved, "{submenu:?}");
         assert_ne!(submenu.center, study);
         assert_eq!(menu.take_pointer(), Some(submenu.center));
-        // There a press goes back, as it does in the original.
-        assert_eq!(menu.press(&art, submenu.center), Press::Stays);
+        // There a release goes back, as it does in the original (a submenu
+        // opened by release starts settled).
+        assert_eq!(menu.release(&art, submenu.center), Release::Stays);
         assert_eq!(menu.layouts.len(), 1);
     }
 

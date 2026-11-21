@@ -535,6 +535,11 @@ impl ApplicationHandler for App {
                         self.photo();
                     }
                 }
+                (MouseButton::Left, ElementState::Released) => {
+                    let outcome = self.game.release(self.point(self.cursor));
+                    self.changed(outcome.redraw);
+                    self.move_pointer();
+                }
                 (MouseButton::Right, ElementState::Pressed) => self.drag = Some(self.cursor),
                 (MouseButton::Right, ElementState::Released) => self.drag = None,
                 _ => {}

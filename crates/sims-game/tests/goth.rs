@@ -654,7 +654,15 @@ fn a_snack_is_chosen_from_the_fridges_pie() {
     };
     let before = queued(&game);
     game.press(snack);
-    assert!(game.menu().is_none(), "choosing closes the pie");
+    assert!(
+        game.menu().is_some(),
+        "pressing on an entry does not close the pie"
+    );
+    game.release(snack);
+    assert!(
+        game.menu().is_none(),
+        "releasing on an entry closes the pie"
+    );
     // Have A Snack, not another of the fridge's entries, is queued.
     assert_eq!(queued(&game), before + 1);
     // The panel follows the lot as it runs: Mortimer pays 5 for the snack
@@ -732,6 +740,7 @@ fn snack_pie(game: &mut Game) -> (u16, [i32; 2], u32) {
         }
         game.hover(point);
         game.press(point);
+        game.release(point);
         // The pie is laid out when it is drawn.
         game.render();
         let snack = game.menu().and_then(|menu| {
@@ -770,6 +779,7 @@ fn a_press_on_an_actions_icon_cancels_it() {
     assert!(game.queue().icons.is_empty());
     let (_, snack, _) = snack_pie(&mut game);
     game.press(snack);
+    game.release(snack);
     game.render();
     let [queued] = &mortimer(&game).queue[..] else {
         panic!("{:?}", mortimer(&game).queue);
@@ -812,6 +822,7 @@ fn a_press_on_an_actions_icon_cancels_it() {
     // Queued again, he takes it 100 ticks later.
     let (_, snack, _) = snack_pie(&mut game);
     game.press(snack);
+    game.release(snack);
     let uid = mortimer(&game).queue[0].uid;
     for _ in 0..100 {
         assert_eq!(game.run(1), 1);
@@ -849,6 +860,7 @@ fn the_queues_icons_show_their_objects_catalog_pictures() {
     game.render();
     let (_, snack, _) = snack_pie(&mut game);
     game.press(snack);
+    game.release(snack);
     game.render();
     let thumbnails = Thumbnails::new(&install);
     let fridge = game.lot().world().objects[&118].guid;
@@ -1047,6 +1059,7 @@ fn order(game: &mut Game, object: u16, label: &str) {
         .unwrap_or_else(|| panic!("object {object} is not on screen"));
     game.hover(at);
     game.press(at);
+    game.release(at);
     game.render();
     let entry = {
         let menu = game
@@ -1060,6 +1073,7 @@ fn order(game: &mut Game, object: u16, label: &str) {
         [r.x + r.width / 2, r.y + r.height / 2]
     };
     game.press(entry);
+    game.release(entry);
     assert!(game.menu().is_none());
     game.render();
 }
@@ -1146,6 +1160,7 @@ fn the_snack_ordered_in_the_window_is_the_scripted_order() {
     game.hover(at);
     assert_eq!(game.listed(), Some((sim, fridge)));
     game.press(at);
+    game.release(at);
     game.render();
     let snack = {
         let menu = game.menu().expect("the fridge's pie opens");
@@ -1165,6 +1180,7 @@ fn the_snack_ordered_in_the_window_is_the_scripted_order() {
         [r.x + r.width / 2, r.y + r.height / 2]
     };
     game.press(snack);
+    game.release(snack);
     assert!(game.menu().is_none());
 
     let mut scripted = Lot::load(&install, &goth_house(&install), &[3], Frames::default()).unwrap();
@@ -2188,6 +2204,7 @@ fn the_recorded_snack_order_replayed_in_the_window_matches_the_recording() {
     assert!(last(&game));
     // The press lists the menu again, whose last check fails again.
     game.press(at);
+    game.release(at);
     game.render();
     run_to(&mut game, 154);
     assert!(!last(&game), "the press listed the menu again");
@@ -2207,6 +2224,7 @@ fn the_recorded_snack_order_replayed_in_the_window_matches_the_recording() {
     assert!(last(&game), "reaching the entry checked it");
     run_to(&mut game, 201);
     game.press(entry);
+    game.release(entry);
     assert!(game.menu().is_none());
     let queue = &game.lot().world().objects[&mortimer]
         .person
@@ -2366,6 +2384,7 @@ fn the_recorded_sit_order_replayed_in_the_window_matches_the_recording() {
     assert_eq!(game.listed(), Some((mortimer, bench)));
     run_to(&mut game, &schedule, 153);
     game.press(recorded([432, 230]));
+    game.release(recorded([432, 230]));
     game.render();
     let labels: Vec<String> = game
         .menu()
@@ -2380,6 +2399,7 @@ fn the_recorded_sit_order_replayed_in_the_window_matches_the_recording() {
     game.hover(sit);
     run_to(&mut game, &schedule, 200);
     game.press(sit);
+    game.release(sit);
     assert!(game.menu().is_none());
     // The recording pushed it before update 201 and had it running, with
     // an empty queue, at 203.
@@ -2452,13 +2472,16 @@ fn the_recorded_cancel_order_replayed_in_the_window_matches_the_recording() {
         }
         assert_eq!(game.listed(), Some((mortimer, fridge)));
         run_to(game, &schedule, press);
-        game.press(recorded(hovers.last().unwrap().1));
+        let on_fridge = recorded(hovers.last().unwrap().1);
+        game.press(on_fridge);
+        game.release(on_fridge);
         game.render();
         run_to(game, &schedule, entry.0);
         let at = pie_entry(game, "Have A Snack");
         game.hover(at);
         run_to(game, &schedule, entry.1);
         game.press(at);
+        game.release(at);
         assert!(game.menu().is_none());
     };
     // The pointer reaches the kitchen counter's spot at 90 with the
@@ -2608,6 +2631,7 @@ fn the_recorded_talk_order_replayed_in_the_window_matches_the_recording() {
     assert!(!last_result(&game));
     run_to(&mut game, &schedule, 123);
     game.press(on_bella);
+    game.release(on_bella);
     game.render();
     let pie = labels(&game);
     run_to(&mut game, &schedule, 138);
@@ -2615,6 +2639,7 @@ fn the_recorded_talk_order_replayed_in_the_window_matches_the_recording() {
     game.hover(talk);
     run_to(&mut game, &schedule, 176);
     game.press(talk);
+    game.release(talk);
     game.render();
     let submenu = labels(&game);
     // The recording's screenshot at 177 shows the same six entries; the
@@ -2636,6 +2661,7 @@ fn the_recorded_talk_order_replayed_in_the_window_matches_the_recording() {
     game.hover(interests);
     run_to(&mut game, &schedule, 250);
     game.press(interests);
+    game.release(interests);
     assert!(game.menu().is_none());
     game.hover(recorded([400, 273]));
     // Queued behind his reading (the bookcase's 4110) through the social
@@ -2722,6 +2748,7 @@ fn the_recorded_read_order_replayed_in_the_window_matches_the_recording() {
     // 123, as for the Talk order's top pie.
     run_to(&mut game, &schedule, 123);
     game.press(on_bookcase);
+    game.release(on_bookcase);
     game.render();
     let pie: Vec<String> = game
         .menu()
@@ -2744,6 +2771,7 @@ fn the_recorded_read_order_replayed_in_the_window_matches_the_recording() {
     // Choosing the entry checks it again (0x5eb433): the release ended
     // at 187.
     game.press(read);
+    game.release(read);
     assert!(game.menu().is_none());
     game.hover(recorded([384, 324]));
     // Running at once, as recorded at 187, with his last result 0.
@@ -2838,6 +2866,7 @@ fn the_recorded_snack_order_with_bob_shots_replayed_in_the_window_matches_the_re
     run_to(&mut game, &schedule, 152);
     assert!(last_result(&game));
     game.press(recorded([176, 198]));
+    game.release(recorded([176, 198]));
     game.render();
     let pie: Vec<String> = game
         .menu()
@@ -2858,16 +2887,26 @@ fn the_recorded_snack_order_with_bob_shots_replayed_in_the_window_matches_the_re
     run_to(&mut game, &schedule, 153);
     assert!(!last_result(&game));
     // The original checked Have A Snack when the pointer reached it,
-    // after 172, and again when the release chose it, after 223.
+    // after 172, did nothing at the mousedown (ended 202), and checked
+    // and chose it at the release, after 223.
     run_to(&mut game, &schedule, 172);
     let snack = pie_entry(&game, "Have A Snack");
     game.hover(snack);
     run_to(&mut game, &schedule, 173);
     assert!(last_result(&game));
+    run_to(&mut game, &schedule, 201);
+    let before_press = game.lot().world().hash();
+    game.press(snack);
+    assert_eq!(
+        game.lot().world().hash(),
+        before_press,
+        "pressing an already-hovered entry runs no check"
+    );
+    assert!(game.menu().is_some_and(|m| m.held()));
     run_to(&mut game, &schedule, 223);
     // The check's effects here are not told apart from the order's; the
     // Read and cancel tests pin them.
-    game.press(snack);
+    game.release(snack);
     assert!(game.menu().is_none());
     game.hover(recorded([200, 123]));
     // Taken at once, as recorded at 224.
@@ -2937,6 +2976,7 @@ fn the_recorded_cancel_order_with_the_pick_watched_replayed_in_the_window_matche
         assert!(last_result(game));
         run_to(game, &schedule, choice);
         game.press(at);
+        game.release(at);
         assert!(game.menu().is_none());
         game.hover(recorded([200, 123]));
     };
@@ -2963,6 +3003,7 @@ fn the_recorded_cancel_order_with_the_pick_watched_replayed_in_the_window_matche
     run_to(&mut game, &schedule, 153);
     assert!(last_result(&game));
     game.press(recorded([176, 198]));
+    game.release(recorded([176, 198]));
     game.render();
     assert!(game.menu().is_some());
     run_to(&mut game, &schedule, 154);
@@ -2991,6 +3032,7 @@ fn the_recorded_cancel_order_with_the_pick_watched_replayed_in_the_window_matche
     assert_eq!(game.listed(), Some((mortimer, fridge)));
     run_to(&mut game, &schedule, 390);
     game.press(recorded([176, 198]));
+    game.release(recorded([176, 198]));
     game.render();
     assert!(game.menu().is_some());
     choose(&mut game, 411, 446);
@@ -3206,4 +3248,125 @@ fn a_room_update_builds_the_masks_kept_from_another_zoom() {
         ticks += 1;
     }
     assert_eq!(game.view.camera.focus.masks_built_at, None, "{ticks} ticks");
+}
+
+/// Pie entries are chosen on left release, not left press (0x5eb3d1,
+/// 0x5eb433): pressing an entry and dragging off the pie before releasing
+/// closes it without re-checking or ordering; dragging to another entry
+/// orders that one; and dragging straight out from the opening press past
+/// the dead zone orders in a single gesture.
+#[test]
+fn pressing_a_pie_entry_and_dragging_off_orders_nothing() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    assert_eq!(game.run(50), 50);
+    game.resize([800, 600]);
+    game.render();
+    let person = game.lot().world().selected().expect("a Sim is selected");
+    let fridge = 118;
+    let on_fridge = (0..600)
+        .step_by(4)
+        .flat_map(|y| (0..800).step_by(4).map(move |x| [x, y]))
+        .find(|&p| !game.over_panel(p) && game.under(p) == Some(fridge))
+        .expect("the fridge is on screen");
+    let queue_len = |game: &Game| {
+        game.lot().world().objects[&person]
+            .person
+            .as_ref()
+            .unwrap()
+            .queue
+            .len()
+    };
+    let label_center = |game: &Game, name: &str| {
+        let menu = game.menu().expect("the fridge's pie is open");
+        let (_, r) = menu
+            .labels()
+            .into_iter()
+            .find(|(text, _)| *text == name)
+            .unwrap_or_else(|| panic!("{name} on the fridge's pie"));
+        [r.x + r.width / 2, r.y + r.height / 2]
+    };
+
+    // 1. Open and settle, hover Have A Snack, press it (no check, stays
+    // open), drag off the pie, release: closes without checking or ordering.
+    game.hover(on_fridge);
+    game.press(on_fridge);
+    game.release(on_fridge);
+    game.render();
+    let snack = label_center(&game, "Have A Snack");
+    game.hover(snack);
+    let after_hover = game.lot().world().hash();
+    game.press(snack);
+    assert!(game.menu().is_some_and(|m| m.held()));
+    assert_eq!(game.lot().world().hash(), after_hover);
+    assert_eq!(queue_len(&game), 0);
+    game.hover([5, 5]);
+    assert_eq!(game.lot().world().hash(), after_hover);
+    game.release([5, 5]);
+    assert!(game.menu().is_none());
+    assert_eq!(game.lot().world().hash(), after_hover);
+    assert_eq!(queue_len(&game), 0);
+
+    // 2. Press on Have A Snack, drag onto Have Quick Breakfast, release:
+    // orders Have Quick Breakfast (not Have A Snack).
+    game.hover(on_fridge);
+    game.press(on_fridge);
+    game.release(on_fridge);
+    game.render();
+    let snack = label_center(&game, "Have A Snack");
+    let quick = label_center(&game, "Have Quick Breakfast");
+    let quick_menu = game
+        .menu()
+        .unwrap()
+        .entries
+        .iter()
+        .find(|e| e.label == "Have Quick Breakfast")
+        .unwrap()
+        .menu;
+    game.hover(snack);
+    game.press(snack);
+    game.hover(quick);
+    game.release(quick);
+    assert!(game.menu().is_none());
+    assert_eq!(queue_len(&game), 1);
+    assert_eq!(
+        game.lot().world().objects[&person]
+            .person
+            .as_ref()
+            .unwrap()
+            .queue[0]
+            .table_index,
+        quick_menu as i32
+    );
+
+    // 3. Single-gesture press-drag-release from an unmoved menu chooses
+    // immediately on the opening press's release (0x5eb433).
+    game.hover(on_fridge);
+    game.press(on_fridge);
+    game.render();
+    let snack = label_center(&game, "Have A Snack");
+    let snack_menu = game
+        .menu()
+        .unwrap()
+        .entries
+        .iter()
+        .find(|e| e.label == "Have A Snack")
+        .unwrap()
+        .menu;
+    assert!(game.menu().unwrap().will_choose(snack));
+    game.hover(snack);
+    game.release(snack);
+    assert!(game.menu().is_none());
+    assert_eq!(queue_len(&game), 2);
+    assert_eq!(
+        game.lot().world().objects[&person]
+            .person
+            .as_ref()
+            .unwrap()
+            .queue[1]
+            .table_index,
+        snack_menu as i32
+    );
 }
