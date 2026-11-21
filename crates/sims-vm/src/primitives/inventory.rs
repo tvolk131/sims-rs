@@ -10,13 +10,15 @@
 //! 1. The owner is the caller, or with flag 0x2000 the object the caller's
 //!    temp 4 names. An owner that is not a person, or not there, is
 //!    native error 0x1c.
-//! 2. The owner's record is the first whose linked definition has the
-//!    owner's GUID (0x42571f).
+//! 2. The owner's record is the first whose GUID (+4, 0x5ed65e) matches
+//!    the owner's GUID (0x42571f); `linked_record` also guards against a
+//!    record with no registered definition.
 //! 3. The inventory is the first in the neighborhood's list with that
 //!    record's ID; if there is none, an empty one is added at the end
-//!    (0x42a8a1).
+//!    (0x42a8a1, at 0x455386).
 //! 4. When the operand GUID is 0, it is replaced by the stack object's
-//!    GUID (0x455397), even for operations that ignore the GUID.
+//!    GUID (0x455397, after 0x42a8a1), even for operations that ignore
+//!    the GUID.
 //!
 //! Operations:
 //!
@@ -62,10 +64,11 @@
 //!   whose 1-based slot is in the caller's temp 0 (0x4256f4) and read its
 //!   GUID (0x5ed65e, record +4). They erase every token of kind 1 (op 5)
 //!   or kind 3 (op 6) (0x41f4e5), add 1 token of that kind and GUID
-//!   through 0x41f38d (leaving the list unchanged if it already holds
-//!   0x7fff tokens), ignore the add's return value, and take the true
-//!   branch (0x455418). A missing record in temp 0 fails loudly, as the
-//!   original dereferences null at 0x45544b / 0x4553fc.
+//!   through 0x41f38d (leaving the list unchanged if at least 0x7fff
+//!   tokens remain after clearing that kind), ignore the add's return
+//!   value, and take the true branch (0x455418). A missing record in temp
+//!   0 fails loudly, as the original dereferences null at 0x45544b /
+//!   0x4553fc.
 //! - Operations 7 and above (0x4553e6) take the true branch after the
 //!   common setup (0x455418).
 //!
@@ -112,6 +115,19 @@ impl Machine<'_, '_> {
                  which the original does not expect"
             ))
         })?;
+        // 0x455386: get or create the owner's inventory before resolving a
+        // zero operand GUID from the stack object (0x455397).
+        let inventories = &mut self.world.neighbors.inventories;
+        let place = match inventories.iter().position(|i| i.neighbor == neighbor) {
+            Some(place) => place,
+            None => {
+                inventories.push(Inventory {
+                    neighbor,
+                    items: Vec::new(),
+                });
+                inventories.len() - 1
+            }
+        };
         let mut guid = u32::from_le_bytes([operands[4], operands[5], operands[6], operands[7]]);
         if guid == 0 {
             let stack_object = self.frame()?.stack_object;
@@ -127,17 +143,6 @@ impl Machine<'_, '_> {
                 })?
                 .guid;
         }
-        let inventories = &mut self.world.neighbors.inventories;
-        let place = match inventories.iter().position(|i| i.neighbor == neighbor) {
-            Some(place) => place,
-            None => {
-                inventories.push(Inventory {
-                    neighbor,
-                    items: Vec::new(),
-                });
-                inventories.len() - 1
-            }
-        };
         let read_count = |temps: &[i16]| {
             if flags & COUNT_IN_TEMP != 0 {
                 temps[usize::from((flags >> 2) & 3)]
@@ -315,11 +320,10 @@ impl Machine<'_, '_> {
         }
     }
 
-    /// The ID of the first neighborhood record whose linked definition has
-    /// the GUID `guid` (0x42571f), or None. The original compares the GUID
-    /// of the definition each record is linked to, which is the definition
-    /// of the record's own GUID; a record whose GUID has no definition
-    /// fails, as what the original compares then was not seen.
+    /// The ID of the first neighborhood record whose GUID (+4, 0x5ed65e)
+    /// matches `guid` (0x42571f), or None. As a port guard, a record whose
+    /// GUID has no registered definition fails loudly; normal neighborhood
+    /// loading already rejects such records.
     pub(crate) fn linked_record(&self, guid: u32) -> Result<Option<i16>, Trap> {
         if guid == 0 {
             return Ok(None);

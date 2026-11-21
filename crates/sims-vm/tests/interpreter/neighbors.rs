@@ -783,15 +783,28 @@ fn manage_inventory_needs_a_person_and_fails_loudly_elsewhere() {
             matches!(trap(sim_runs(&mut fx, 51, ops, 0)), Trap::Unsupported(m) if m.contains(addr))
         );
     }
-    // Operand GUID 0 reads the stack object's GUID before dispatch, even
-    // for operations 2, 5, 6 and 7+.
-    for op in [1, 2, 5, 6, 7] {
-        let mut no_guid = [op, 2, 0, 0, 0, 0, 0, 0];
-        no_guid[0] = op;
-        assert!(matches!(
-            trap(sim_runs(&mut fx, 51, no_guid, 0)),
-            Trap::Unsupported(_)
-        ));
+    // Operand GUID 0 resolves the stack object's GUID (0x455397) after
+    // getting or creating the owner's inventory (0x455386), before
+    // dispatch, even for operations 2, 5, 6 and 7+.
+    fx.sim_mut().temps[0] = 1; // valid slot so ops 5 and 6 cannot trap there
+    for op in [0, 1, 2, 3, 4, 5, 6, 7] {
+        fx.world.neighbors.inventories.retain(|i| i.neighbor != 1);
+        let no_guid = [op, 2, 0, 0, 0, 0, 0, 0];
+        assert!(
+            matches!(
+                trap(sim_runs(&mut fx, 51, no_guid, 0)),
+                Trap::Unsupported(m) if m.contains("no stack object")
+            ),
+            "op {op}"
+        );
+        assert!(
+            fx.world
+                .neighbors
+                .inventories
+                .iter()
+                .any(|i| i.neighbor == 1),
+            "op {op} should create the owner's empty inventory before reading stack object"
+        );
     }
     // A person type with no record.
     fx.world.neighbors.slots[0] = None;
@@ -818,7 +831,9 @@ fn manage_inventory_op_1_decrements_by_one_and_erases_at_zero_or_minus_one() {
     assert_eq!(sim_runs(&mut fx, 51, from_temp, 0), Ok(true));
     assert_eq!(tokens(&fx), [(1, 3), (2, 3), (2, 6)]);
 
-    // Any negative count other than -1 also subtracts 1 without erasing.
+    // Any negative count other than -1 also subtracts 1 without erasing
+    // while the remaining count stays positive (a token whose signed
+    // count is 1 or less is still erased).
     fx.sim_mut().temps[3] = -2;
     assert_eq!(sim_runs(&mut fx, 51, from_temp, 0), Ok(true));
     assert_eq!(tokens(&fx), [(1, 3), (2, 2), (2, 6)]);

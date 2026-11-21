@@ -9,8 +9,9 @@ directly from the original's dispatch (`0x4553ba` to `0x455749`):
 
 - **Common setup (`0x455304`–`0x4553b5`).** Every operation resolves the
   owner (caller or temp 4 with flag `0x2000`; native error `0x1c` if not a
-  person), looks up its neighbor record (`0x42571f`), gets or creates its
-  inventory (`0x42a8a1`), and substitutes the stack object's GUID when the
+  person), looks up its neighbor record (`0x42571f`, comparing record `+4`
+  via `0x5ed65e`), gets or creates its inventory (`0x42a8a1` at
+  `0x455386`), and then substitutes the stack object's GUID when the
   operand GUID is 0 (`0x455397`) before switching on the operation byte.
 - **Operation 1 (`0x45569d` → `0x41f427`).** Reads `count` (1, or caller's
   temp `(flags >> 2) & 3` with flag `0x2`). A count of 0 returns true
@@ -31,9 +32,9 @@ directly from the original's dispatch (`0x4553ba` to `0x455749`):
   port fails loudly (`Trap::Unsupported`) rather than dereferencing null
   (`0x45544b` / `0x4553fc`). Otherwise they remove every token of kind `1`
   (op 5) or kind `3` (op 6) (`0x41f4e5`), add one token of that kind and
-  GUID via `0x41f38d` (no-op if the inventory already holds `0x7fff`
-  tokens), ignore `0x41f38d`'s return value, and take the true branch
-  (`0x455418`).
+  GUID via `0x41f38d` (no-op if at least `0x7fff` tokens remain after
+  clearing that kind), ignore `0x41f38d`'s return value, and take the true
+  branch (`0x455418`).
 - **Operations 7 and above (`0x4553e6` → `0x455418`).** Take the true
   branch after the common setup.
 
