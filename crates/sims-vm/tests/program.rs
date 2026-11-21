@@ -851,14 +851,31 @@ fn career_texts_end_only_when_work_holds_no_career_token() {
     }
     std::fs::remove_file(dir.0.join("ExpansionShared/ExtrasFAR")).unwrap();
     // An entry that is not a directory is tried as one (0x5ba7d4): a
-    // dangling link cannot be read, so may be any; a directory whose name
-    // ends in `far` is not an archive.
+    // dangling link or non-regular file (such as a named pipe, which must
+    // fail closed without blocking on open) cannot be read as an archive;
+    // a directory whose name ends in `far` is not an archive.
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(dir.0.join("gone"), dir.0.join("ExpansionShared/ExtrasFAR"))
             .unwrap();
         assert!(!link(&dir));
         std::fs::remove_file(dir.0.join("ExpansionShared/ExtrasFAR")).unwrap();
+        assert!(link(&dir));
+
+        let index = Index::build(&Install::detect(&dir.0).unwrap()).unwrap();
+        let catalog = Catalog::build(&index).unwrap();
+        let fifo = dir.0.join("ExpansionShared/ExtrasFAR");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(
+            !Program::link(&index, &catalog, [])
+                .unwrap()
+                .career_texts_end
+        );
+        std::fs::remove_file(&fifo).unwrap();
         assert!(link(&dir));
     }
     std::fs::create_dir(dir.0.join("ExpansionShared/ExtrasFAR")).unwrap();
@@ -1004,14 +1021,25 @@ fn the_default_labels_hold_no_token_only_when_no_string_table_of_them_holds_a_do
         );
         std::fs::remove_file(dir.0.join(&path)).unwrap();
     }
-    // An archive there that cannot be read (a dangling link, 0x5ba7d4)
-    // may hold any member; a directory whose name ends in `far` is not an
-    // archive.
+    // An archive there that cannot be read as a regular file (a dangling
+    // link or a named pipe, which must fail closed without blocking on
+    // open, 0x5ba7d4) may hold any member; a directory whose name ends in
+    // `far` is not an archive.
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(dir.0.join("gone"), dir.0.join("GameData/UIFAR")).unwrap();
         assert!(!sims_vm::labels_hold_no_token(&install.root).unwrap());
         std::fs::remove_file(dir.0.join("GameData/UIFAR")).unwrap();
+        assert!(sims_vm::labels_hold_no_token(&install.root).unwrap());
+
+        let fifo = dir.0.join("GameData/UIFAR");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(!sims_vm::labels_hold_no_token(&install.root).unwrap());
+        std::fs::remove_file(&fifo).unwrap();
         assert!(sims_vm::labels_hold_no_token(&install.root).unwrap());
     }
     std::fs::create_dir(dir.0.join("GameData/UIFAR")).unwrap();

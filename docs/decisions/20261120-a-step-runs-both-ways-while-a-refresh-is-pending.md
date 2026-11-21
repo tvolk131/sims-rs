@@ -212,8 +212,9 @@ What is not ported:
     a port. The tables must not be ones the loader reads again for
     English (entries, none in US English: 0x47006b to 0x4700d0), which
     can read a string's bytes as a language byte, and an archive there
-    that cannot be read (a dangling link, say) makes it false. Otherwise
-    a dialog with a default string fails loudly. The
+    that cannot be read as a regular file (a dangling link or named
+    pipe, say) makes it false without blocking. Otherwise a dialog with
+    a default string fails loudly. The
     install's labels (OK, Cancel, Yes, No) hold no `$`. Tests:
     `the_default_button_labels_hold_no_token` (`tests/boot.rs`),
     `a_default_string_fails_loudly_unless_the_labels_hold_no_token`,
@@ -437,8 +438,9 @@ What is not ported:
      directory found at 0x415336), which the composite opener makes of a
      `.iff`, `.fam`, `.wll` and `.flr` of the name, loose or in an archive
      there (any entry not a directory whose name ends in `far`, with no
-     dot needed, 0x5ba7d4 to 0x5ba8a7, one that cannot be read counting
-     as any; a member whose name holds a path is placed in a
+     dot needed, 0x5ba7d4 to 0x5ba8a7, one that cannot be read as a
+     regular file — a dangling link or named pipe, say — counting as any
+     without blocking; a member whose name holds a path is placed in a
      subdirectory, 0x5b9dbc, so is not there), and a `.dir` of the name
      that is a directory there, listed with a `*.*` wildcard (0x5c3099
      to 0x5c3102) (0x46f50f to 0x46f542, 0x46b5d9 to 0x46b699,

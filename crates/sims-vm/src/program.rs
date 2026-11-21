@@ -1308,11 +1308,22 @@ fn resource_set(directory: &Path, stem: &str) -> Result<Option<Vec<String>>> {
         // to 0x5ba7d9) whose name ends in the letters `far`, with or
         // without a dot, as an archive (0x5ba86d to 0x5ba8a7), as the
         // index does, and tries to mount it (0x5ba8d6). One this cannot
-        // read (a dangling link, say) may hold any member.
+        // read (a dangling link, say) or that is not a regular file (a
+        // named pipe, whose open would block) fails closed without
+        // opening it.
         let archive = name.len() >= 3
             && name.is_char_boundary(name.len() - 3)
             && name[name.len() - 3..].eq_ignore_ascii_case("far");
-        if archive && !path.is_dir() {
+        if archive {
+            let Ok(meta) = std::fs::metadata(&path) else {
+                return Ok(None);
+            };
+            if meta.is_dir() {
+                continue;
+            }
+            if !meta.is_file() {
+                return Ok(None);
+            }
             let Ok((members, skipped)) = sims_content::far_members(&path) else {
                 return Ok(None);
             };
