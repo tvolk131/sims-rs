@@ -103,17 +103,26 @@ Each scene names its rectangles and why:
   scene that leaves every pixel out fails.
 - Update mode (`SIMS_RATCHET_UPDATE=1`) re-pins hashes and raises floors
   to the share reached. It never adds, lowers or removes a floor. A new
-  scene is written with `floors = none`, and `SIMS_RATCHET_NEW=<name>`
-  sets its hash and first floors; that is the only way a floor is added.
+  scene is written with both `ours = none` and `floors = none`, and
+  `SIMS_RATCHET_NEW=<name>` sets its hash and first floors; that is the
+  only way a floor is added. Once they are set, the scene's name joins
+  the baseline list in the test. A baseline scene written as new, or
+  named in `SIMS_RATCHET_NEW`, stops the run, so its floors can never be
+  set anew.
   Lowering or removing a floor is a hand edit, with the reason in the PR
   body.
 - A run that fails writes nothing. A write replaces the manifest whole (a
   new file, then a rename), and only if the manifest's SHA-256 is still
-  the one the run read; there is no lock between processes.
+  the one the run read; there is no lock between processes. Run one
+  updater at a time: the hash check catches edits made between read and
+  write, not two updaters racing.
 - The manifest is strict: an unknown or repeated setting, a setting
   before the first scene, a missing baseline scene (the eight above, named
   in the test), a bad floor, or a rectangle that is not inside the frame
   stops the run.
+- A screenshot is named by a plain file name, with no folder. With links
+  resolved, it must be a file in `SIMS_RATCHET`, so the manifest cannot
+  point the run at any other file.
 - `SIMS_RATCHET_DIFF=<folder>` writes difference images (pixels that
   differ in magenta, the rest ours in grey) into a new folder the run
   makes inside it, each image a new file. The folder, with links
@@ -122,22 +131,31 @@ Each scene names its rectangles and why:
 - The test reads its arguments once, as libtest does: a flag that takes a
   value takes the next word (`--skip --list` skips `--list`), and every
   word after `--` is a filter. Filters, `--exact`, `--skip`, `--ignored`
-  and `--include-ignored` select as libtest's do.
+  and `--include-ignored` select as libtest's do. Arguments libtest
+  refuses fail before any filter or list applies: an unknown flag, a flag
+  without its value (a bare `--skip`), a value on a flag that takes none
+  (`--list=foo`), a bad value, and `--ignored` with `--include-ignored`.
 - Before anything else the test checks its own floor and argument
   parsing, so the release run in the merge gate covers them.
 - `scripts/check_repository.py` now rejects image files anywhere in the
   repository: by suffix, or by content (raster formats; netpbm headers,
   comments ended by a line feed or a carriage return; an SVG root element
-  under any namespace prefix).
+  under any namespace prefix). The SVG root is found with Python's expat
+  parser, which reads the whole prolog, an internal document type with
+  `]>` in its quoted values included, stops at the first start element,
+  and loads no external entity.
 
 ## Running it
 
 Without `SIMS_RATCHET` the test prints `ratchet: skipped: no assets` and
 passes. That is what CI sees, and what a track's workspace gate sees: it
-sets only `SIMS_INSTALL`, for the other tests. Every other partial
-setting fails: `SIMS_RATCHET` without `SIMS_INSTALL`, either variable set
-but empty or not a folder with files in it, or an update, new-scene or
-difference setting without `SIMS_RATCHET`. With both:
+sets only `SIMS_INSTALL`, for the other tests. Every other partial or
+wrong setting fails, on the skip too: `SIMS_INSTALL` set but empty or
+not a folder with files in it; `SIMS_RATCHET` without `SIMS_INSTALL`,
+or not a folder with files in it; any `SIMS_RATCHET_` variable, whatever
+its value (`SIMS_RATCHET_UPDATE=0` included), without `SIMS_RATCHET`;
+and a `SIMS_RATCHET_` variable that is not one of the three settings.
+With both:
 
 ```
 SIMS_INSTALL=<install> SIMS_RATCHET=<sims-rs>/cache/ratchet \

@@ -6,6 +6,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
+from xml.parsers import expat
 
 
 POLICY_PATH = ".github/repository-policy.json"
@@ -75,19 +76,35 @@ IMAGE_MAGIC = re.compile(
     rb"|II\*\0|MM\0\*|qoif|RIFF....WEBP|8BPS|gimp xcf)",
     re.DOTALL,
 )
-# What may come before an XML document's root element: a byte-order mark,
-# white space, processing instructions (the XML declaration among them),
-# comments, and a document type with its internal subset.
-XML_PROLOG = re.compile(
-    rb"\A(?:\xef\xbb\xbf)?(?:\s+|<\?.*?\?>|<!--.*?-->|<!DOCTYPE[^>\[]*(?:\[.*?\])?\s*>)*",
-    re.DOTALL | re.IGNORECASE,
-)
-XML_ROOT = re.compile(rb"<([^\s/>!?]+)")
+class _RootFound(Exception):
+    pass
 
 
 def is_svg(content):
-    root = XML_ROOT.match(content, XML_PROLOG.match(content).end())
-    return bool(root) and root.group(1).split(b":")[-1].lower() == b"svg"
+    """Whether `content` is an XML document whose root element's local name
+    is `svg`, under any namespace prefix. Expat reads the prolog (the XML
+    declaration, comments, processing instructions and a document type with
+    its internal subset, quoted `]>` included) and stops at the first start
+    element. It loads no external entity or external DTD subset."""
+    parser = expat.ParserCreate()
+    parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
+    parser.ExternalEntityRefHandler = lambda *_: 1
+
+    def start(name, _attributes):
+        raise _RootFound(name)
+
+    parser.StartElementHandler = start
+    # A browser shows an SVG with white space before its declaration, which
+    # expat refuses.
+    if content.startswith(b"\xef\xbb\xbf"):
+        content = content[3:]
+    try:
+        parser.Parse(content.lstrip(b" \t\r\n"), True)
+    except _RootFound as root:
+        return root.args[0].split(":")[-1].lower() == "svg"
+    except (expat.ExpatError, ValueError, UnicodeError):
+        return False
+    return False
 
 
 HEX_RUN = re.compile(rb"(?<![0-9a-fA-F])[0-9a-fA-F]{16,}(?![0-9a-fA-F])")

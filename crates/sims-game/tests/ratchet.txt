@@ -7,15 +7,16 @@
 #   x then y) and walls (up, cutaway or down);
 # - paused and strip: whether the original was paused and its panel's
 #   strip open (yes or no);
-# - original: the screenshot's file in SIMS_RATCHET and its SHA-256;
+# - original: the screenshot's plain file name in SIMS_RATCHET (no
+#   folder; with links resolved it stays in that folder) and its SHA-256;
 # - ours: the SHA-256 of our frame's 8-bit colours;
 # - leave_out: a rectangle (left, top, right, bottom; right and bottom
 #   outside it) and why it is left out, one line each;
 # - floors: for each class with pixels in the frame, the share of
 #   pixels that must match, in percent with two decimals, at most
-#   100.00. A new scene has `floors = none` and `ours = none`;
-#   SIMS_RATCHET_NEW=<name> sets both. A new scene's name also goes in the
-#   test's BASELINE list.
+#   100.00. A new scene has `floors = none` and `ours = none`, both;
+#   SIMS_RATCHET_NEW=<name> sets both. Once they are set, its name goes
+#   in the test's BASELINE list, and a baseline scene is never new again.
 
 [near-r2-0712-bench]
 about = 7:12 AM, paused. Mortimer reads on the bench; walls down. Scroll (592, -2018).

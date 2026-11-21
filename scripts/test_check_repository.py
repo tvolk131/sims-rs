@@ -350,6 +350,9 @@ class RepositoryHygieneTests(unittest.TestCase):
             ("tests/scene.txt",
              '<!DOCTYPE svg [ <!ENTITY a "b"> ]>\n<?pi x?>\n<SVG:SVG xmlns:SVG="x"></SVG:SVG>'),
             ("misc/notes.txt", "<svg width='1'></svg>"),
+            ("misc/notes.txt",
+             '<!DOCTYPE x [ <!ENTITY e "]>"> <!ENTITY f \'"]>\'> ]>\n<s:svg xmlns:s="x"/>'),
+            ("misc/notes.txt", '\ufeff  \n<?xml version="1.0"?><svg/>'),
             ("docs/picture.md", "P6\n800 600\n255\n"),
             ("tests/scene.txt", b"\x89PNG\r\n\x1a\nrest"),
             ("tests/scene.txt", b"GIF89a...."),
@@ -365,6 +368,9 @@ class RepositoryHygieneTests(unittest.TestCase):
         self.write("crates/sims-game/tests/render.rs", 'const SVG: &str = "<svg>";\n')
         self.write("web/page.html", "<!-- a page -->\n<html><body><svg></svg></body></html>\n")
         self.write("web/notes.md", "<!-- notes -->\n# Notes about svg\n")
+        self.write("web/feed.xml",
+                   '<!DOCTYPE x SYSTEM "http://example.invalid/x.dtd" [ <!ENTITY e "<svg>]>"> ]>'
+                   '<feed>&e;</feed>')
         self.write("src/picture.ppm.rs", "// a source file\n")
         self.assert_passes()
 

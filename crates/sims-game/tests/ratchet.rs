@@ -12,10 +12,12 @@
 //!
 //! Without `SIMS_RATCHET` it prints `ratchet: skipped: no assets` and
 //! passes; the workspace's other tests run with only `SIMS_INSTALL` set.
-//! Every other partial setting fails: `SIMS_RATCHET` without
-//! `SIMS_INSTALL`, either set but empty or not a folder with files in it,
-//! or `SIMS_RATCHET_UPDATE`, `SIMS_RATCHET_NEW` or `SIMS_RATCHET_DIFF`
-//! without `SIMS_RATCHET`.
+//! Every other setting that is partial or wrong fails, on the skip too:
+//! `SIMS_INSTALL` set but empty or not a folder with files in it;
+//! `SIMS_RATCHET` without `SIMS_INSTALL`, or not a folder with files in
+//! it; any `SIMS_RATCHET_` variable, whatever its value, without
+//! `SIMS_RATCHET`; and a `SIMS_RATCHET_` variable other than
+//! `SIMS_RATCHET_UPDATE`, `SIMS_RATCHET_NEW` and `SIMS_RATCHET_DIFF`.
 //!
 //! It fails when:
 //!
@@ -31,17 +33,23 @@
 //! - a class with pixels has no floor, a class with a floor has no pixels,
 //!   or a scene leaves every pixel out;
 //! - the manifest does not parse: an unknown or repeated setting, a
-//!   setting before the first scene, a missing baseline scene, a floor
-//!   without exactly two decimals or above 100.00, or a rectangle outside
-//!   the frame.
+//!   setting before the first scene, a missing baseline scene, a baseline
+//!   scene written as new, `ours = none` without `floors = none` or the
+//!   reverse, a screenshot that is not a plain file name, a floor without
+//!   exactly two decimals or above 100.00, or a rectangle outside the
+//!   frame;
+//! - a screenshot, with links resolved, is not in `SIMS_RATCHET`.
 //!
 //! `SIMS_RATCHET_UPDATE=1` writes our new hashes into the manifest and
 //! raises each floor to the share reached. It never adds, lowers or
-//! removes a floor. A new scene is written with `floors = none`, and
-//! `SIMS_RATCHET_NEW=<name>[,<name>…]` sets its hash and first floors;
-//! that is the only way a floor is added. When any check fails nothing is
-//! written. The manifest is replaced whole (a new file, then a rename),
-//! and only if it is unchanged since the run read it.
+//! removes a floor. A new scene is written with `ours = none` and
+//! `floors = none`, and `SIMS_RATCHET_NEW=<name>[,<name>…]` sets its hash
+//! and first floors; that is the only way a floor is added. Once set, its
+//! name joins `BASELINE`, and `SIMS_RATCHET_NEW` refuses a baseline scene.
+//! When any check fails nothing is written. The manifest is replaced
+//! whole (a new file, then a rename), and only if it is unchanged since
+//! the run read it. Run one updater at a time: the hash check catches
+//! edits made between read and write, not two updaters racing.
 //!
 //! `SIMS_RATCHET_DIFF=<folder>` writes each scene's difference image
 //! (pixels that differ in magenta, the rest ours in grey) and our frame
@@ -53,8 +61,11 @@
 //! test is named `ratchet` and reads its arguments as libtest does: a flag
 //! that takes a value takes the next word whatever it is, every word after
 //! `--` is a filter, and filters, `--exact`, `--skip`, `--ignored` and
-//! `--include-ignored` select as libtest's do. Filtered out, it prints
-//! `ratchet: filtered out`. Before anything else it checks its own floor
+//! `--include-ignored` select as libtest's do. What libtest refuses fails
+//! here before any filter or list decides anything: an unknown flag, a
+//! flag without its value, a value on a flag that takes none
+//! (`--list=foo`), a bad value, and `--ignored` with `--include-ignored`.
+//! Filtered out, it prints `ratchet: filtered out`. Before anything else it checks its own floor
 //! and argument parsing, so a release run covers them too.
 //!
 //! Classes come from the frame at run time, with no stored masks:
@@ -123,6 +134,7 @@ struct Args {
     exact: bool,
     ignored_only: bool,
     include_ignored: bool,
+    help: bool,
     filters: Vec<String>,
     skips: Vec<String>,
 }
@@ -130,8 +142,31 @@ struct Args {
 impl Args {
     /// Reads the arguments once, as libtest does: a flag that takes a value
     /// takes the next word whatever it is (`--skip --list` skips the name
-    /// `--list`), and every word after `--` is a filter.
-    fn parse(words: &[String]) -> Args {
+    /// `--list`), and every word after `--` is a filter. What libtest
+    /// refuses is an error here too, before any filter or list decides
+    /// anything: an unknown flag, a flag without its value, a value given
+    /// to a flag that takes none (`--list=foo`), a bad value, and
+    /// `--ignored` with `--include-ignored`.
+    fn parse(words: &[String]) -> Result<Args, String> {
+        const PLAIN: [&str; 17] = [
+            "--list",
+            "--exact",
+            "--ignored",
+            "--include-ignored",
+            "--force-run-in-process",
+            "--exclude-should-panic",
+            "--test",
+            "--bench",
+            "--nocapture",
+            "--no-capture",
+            "--quiet",
+            "-q",
+            "--show-output",
+            "--report-time",
+            "--ensure-time",
+            "--shuffle",
+            "--help",
+        ];
         const WITH_VALUE: [&str; 7] = [
             "--test-threads",
             "--skip",
@@ -156,21 +191,45 @@ impl Args {
                 Some((flag, value)) => (flag, Some(value.to_string())),
                 None => (word.as_str(), None),
             };
-            match flag {
-                "--list" => args.list = true,
-                "--exact" => args.exact = true,
-                "--ignored" => args.ignored_only = true,
-                "--include-ignored" => args.include_ignored = true,
-                f if WITH_VALUE.contains(&f) => {
-                    let value = inline.or_else(|| words.next().cloned()).unwrap_or_default();
-                    if f == "--skip" {
-                        args.skips.push(value);
-                    }
+            if PLAIN.contains(&flag) || flag == "-h" {
+                if inline.is_some() {
+                    return Err(format!("{flag} takes no value: {word:?}"));
                 }
-                _ => {}
+                match flag {
+                    "--list" => args.list = true,
+                    "--exact" => args.exact = true,
+                    "--ignored" => args.ignored_only = true,
+                    "--include-ignored" => args.include_ignored = true,
+                    "--help" | "-h" => args.help = true,
+                    _ => {}
+                }
+                continue;
+            }
+            if !WITH_VALUE.contains(&flag) {
+                return Err(format!("unknown flag {word:?}"));
+            }
+            let value = inline
+                .or_else(|| words.next().cloned())
+                .ok_or(format!("{flag} needs a value"))?;
+            let good = match flag {
+                "--test-threads" => value.parse::<usize>().is_ok_and(|n| n > 0),
+                "--format" => ["pretty", "terse", "json", "junit"].contains(&value.as_str()),
+                "--color" => ["auto", "always", "never"].contains(&value.as_str()),
+                "--shuffle-seed" => value.parse::<u64>().is_ok(),
+                "-Z" => value == "unstable-options",
+                _ => true,
+            };
+            if !good {
+                return Err(format!("{flag} {value:?} is not a value it takes"));
+            }
+            if flag == "--skip" {
+                args.skips.push(value);
             }
         }
-        args
+        if args.ignored_only && args.include_ignored {
+            return Err("--ignored and --include-ignored are mutually exclusive".into());
+        }
+        Ok(args)
     }
 
     /// Whether these arguments run the test `name` (which is not ignored).
@@ -199,8 +258,14 @@ struct Config {
 
 impl Config {
     /// `None` when `SIMS_RATCHET` is not set (the skip); an error for any
-    /// other partial or empty setting.
+    /// other partial, empty or unknown setting. `SIMS_INSTALL` is checked
+    /// whenever it is set, on the skip too.
     fn from_env() -> Result<Option<Config>, String> {
+        const SETTINGS: [&str; 3] = [
+            "SIMS_RATCHET_UPDATE",
+            "SIMS_RATCHET_NEW",
+            "SIMS_RATCHET_DIFF",
+        ];
         let var = |key: &str| -> Result<Option<String>, String> {
             match std::env::var_os(key) {
                 None => Ok(None),
@@ -211,8 +276,34 @@ impl Config {
                     .map_err(|v| format!("{key} is not text: {v:?}")),
             }
         };
-        let install = var("SIMS_INSTALL")?;
-        let references = var("SIMS_RATCHET")?;
+        // Every SIMS_RATCHET_ variable, whatever its value: a misspelt one
+        // must not be ignored.
+        let mut set: Vec<String> = std::env::vars_os()
+            .filter_map(|(k, _)| k.into_string().ok())
+            .filter(|k| k.starts_with("SIMS_RATCHET_"))
+            .collect();
+        set.sort();
+        if let Some(unknown) = set.iter().find(|k| !SETTINGS.contains(&k.as_str())) {
+            return Err(format!(
+                "{unknown} is not a setting (the settings are {})",
+                SETTINGS.join(", ")
+            ));
+        }
+        let install = var("SIMS_INSTALL")?.map(PathBuf::from);
+        if let Some(install) = &install {
+            nonempty_folder("SIMS_INSTALL", install)?;
+        }
+        let Some(references) = var("SIMS_RATCHET")?.map(PathBuf::from) else {
+            if !set.is_empty() {
+                return Err(format!(
+                    "{} is set, but SIMS_RATCHET is not",
+                    set.join(" and ")
+                ));
+            }
+            return Ok(None);
+        };
+        let install = install.ok_or("SIMS_RATCHET is set, but SIMS_INSTALL is not")?;
+        nonempty_folder("SIMS_RATCHET", &references)?;
         let update = match var("SIMS_RATCHET_UPDATE")?.as_deref() {
             None | Some("0") => false,
             Some("1") => true,
@@ -222,29 +313,6 @@ impl Config {
             .map(|v| v.split(',').map(str::to_string).collect())
             .unwrap_or_default();
         let diff = var("SIMS_RATCHET_DIFF")?.map(PathBuf::from);
-        let Some(references) = references else {
-            if update || !new.is_empty() || diff.is_some() {
-                return Err(
-                    "SIMS_RATCHET_UPDATE, SIMS_RATCHET_NEW or SIMS_RATCHET_DIFF is set, but \
-                     SIMS_RATCHET is not"
-                        .into(),
-                );
-            }
-            return Ok(None);
-        };
-        let install = install.ok_or("SIMS_RATCHET is set, but SIMS_INSTALL is not")?;
-        let (install, references) = (PathBuf::from(install), PathBuf::from(references));
-        for (key, dir) in [("SIMS_INSTALL", &install), ("SIMS_RATCHET", &references)] {
-            // Only whether it has any entry: the order does not matter.
-            #[allow(clippy::disallowed_methods)]
-            let empty = std::fs::read_dir(dir)
-                .map_err(|e| format!("{key} {dir:?} is not a folder: {e}"))?
-                .next()
-                .is_none();
-            if empty {
-                return Err(format!("{key} {dir:?} is an empty folder"));
-            }
-        }
         Ok(Some(Config {
             install,
             references,
@@ -255,12 +323,36 @@ impl Config {
     }
 }
 
+/// An error unless `dir` is a folder with at least one entry.
+fn nonempty_folder(key: &str, dir: &Path) -> Result<(), String> {
+    // Only whether it has any entry: the order does not matter.
+    #[allow(clippy::disallowed_methods)]
+    let empty = std::fs::read_dir(dir)
+        .map_err(|e| format!("{key} {dir:?} is not a folder: {e}"))?
+        .next()
+        .is_none();
+    if empty {
+        return Err(format!("{key} {dir:?} is an empty folder"));
+    }
+    Ok(())
+}
+
 fn main() -> ExitCode {
     if let Err(e) = self_check() {
         println!("ratchet: FAILED: self-check: {e}");
         return ExitCode::FAILURE;
     }
-    let args = Args::parse(&std::env::args().skip(1).collect::<Vec<_>>());
+    let args = match Args::parse(&std::env::args().skip(1).collect::<Vec<_>>()) {
+        Ok(args) => args,
+        Err(e) => {
+            println!("ratchet: FAILED: arguments: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if args.help {
+        println!("ratchet: the screenshot ratchet; see crates/sims-game/tests/ratchet.rs");
+        return ExitCode::SUCCESS;
+    }
     if !args.selects(NAME) {
         println!("ratchet: filtered out");
         return ExitCode::SUCCESS;
@@ -336,15 +428,38 @@ fn self_check() -> Result<(), String> {
         ("unrelated --list", true, false),
         ("--list", true, true),
         ("--ignored", false, false),
-        ("--ignored --include-ignored", false, true),
+        ("--include-ignored", false, true),
+        ("--skip=", false, false),
+        ("--color always -q --nocapture", false, true),
     ] {
         let words: Vec<String> = line.split_whitespace().map(str::to_string).collect();
-        let args = Args::parse(&words);
+        let args = Args::parse(&words).map_err(|e| format!("arguments {line:?}: {e}"))?;
         if args.list != list || args.selects(NAME) != runs {
             return Err(format!(
                 "arguments {line:?}: list {}, runs {}; want list {list}, runs {runs}",
                 args.list,
                 args.selects(NAME)
+            ));
+        }
+    }
+    for line in [
+        "--skip",
+        "ratchet --skip",
+        "--list=foo",
+        "--exact=yes",
+        "--ignored --include-ignored",
+        "--frobnicate",
+        "-x",
+        "--test-threads 0",
+        "--test-threads many",
+        "--color sometimes",
+        "--format fancy",
+        "-Z nightly",
+    ] {
+        let words: Vec<String> = line.split_whitespace().map(str::to_string).collect();
+        if Args::parse(&words).is_ok() {
+            return Err(format!(
+                "arguments {line:?} are accepted, but libtest refuses them"
             ));
         }
     }
@@ -358,6 +473,75 @@ fn self_check() -> Result<(), String> {
                 return Err(format!(
                     "manifest {text:?} gives {:?}, not an error naming {want:?}",
                     other.map(|s| s.len())
+                ));
+            }
+        }
+    }
+    // One scene's settings, with `original`, `ours` and `floors` varied.
+    let hash = "0".repeat(64);
+    for (original, ours, floors, want) in [
+        ("a.ppm", hash.as_str(), "frame 1.00", None),
+        ("a.ppm", "none", "none", None),
+        (
+            "a.ppm",
+            "none",
+            "frame 1.00",
+            Some("both `ours = none` and `floors = none`"),
+        ),
+        (
+            "a.ppm",
+            hash.as_str(),
+            "none",
+            Some("both `ours = none` and `floors = none`"),
+        ),
+        (
+            "/tmp/a.ppm",
+            hash.as_str(),
+            "frame 1.00",
+            Some("plain file name"),
+        ),
+        (
+            "../a.ppm",
+            hash.as_str(),
+            "frame 1.00",
+            Some("plain file name"),
+        ),
+        (
+            "sub/a.ppm",
+            hash.as_str(),
+            "frame 1.00",
+            Some("plain file name"),
+        ),
+        (
+            "sub\\a.ppm",
+            hash.as_str(),
+            "frame 1.00",
+            Some("plain file name"),
+        ),
+        (".", hash.as_str(), "frame 1.00", Some("plain file name")),
+    ] {
+        let original = format!("{original} {hash}");
+        let fields = [
+            (0, "tick", "1"),
+            (1, "zoom", "far"),
+            (2, "rotation", "0"),
+            (3, "level", "1"),
+            (4, "origin", "0 0"),
+            (5, "walls", "up"),
+            (6, "paused", "yes"),
+            (7, "strip", "no"),
+            (8, "original", original.as_str()),
+            (9, "ours", ours),
+            (10, "floors", floors),
+        ];
+        match (scene("a", &fields), want) {
+            (Ok(_), None) => {}
+            (Err(e), Some(want)) if e.contains(want) => {}
+            (got, _) => {
+                return Err(format!(
+                    "scene with original {original:?}, ours {ours:?}, floors {floors:?} gives \
+                     {:?}, want {want:?}",
+                    got.map(|s| s.name)
                 ));
             }
         }
@@ -445,6 +629,16 @@ fn parse(text: &str) -> Result<Vec<Scene>, String> {
     if let Some(missing) = BASELINE.iter().find(|b| !names.contains(*b)) {
         return Err(format!(
             "no `[{missing}]`: the baseline scenes stay in the manifest"
+        ));
+    }
+    if let Some(reset) = scenes
+        .iter()
+        .find(|s| s.new && BASELINE.contains(&s.name.as_str()))
+    {
+        return Err(format!(
+            "`[{}]` is a baseline scene: it keeps its hash and floors (`none` is only for a \
+             new scene)",
+            reset.name
         ));
     }
     Ok(scenes)
@@ -542,6 +736,16 @@ fn scene(name: &str, fields: &[(usize, &str, &str)]) -> Result<Scene, String> {
         .1
         .split_once(' ')
         .ok_or(format!("{name}: `original` is a file and its SHA-256"))?;
+    // A plain file name: the references are the files in SIMS_RATCHET.
+    let plain = matches!(
+        Path::new(file).components().collect::<Vec<_>>()[..],
+        [std::path::Component::Normal(_)]
+    );
+    if !plain || file.contains(['/', '\\']) {
+        return Err(format!(
+            "{name}: `original` {file:?} is not a plain file name inside SIMS_RATCHET"
+        ));
+    }
     let (ours_line, ours) = get("ours")?;
     let mut leave_out = Vec::new();
     for (_, _, value) in fields.iter().filter(|f| f.1 == "leave_out") {
@@ -566,8 +770,14 @@ fn scene(name: &str, fields: &[(usize, &str, &str)]) -> Result<Scene, String> {
         leave_out.push(rect);
     }
     let (floors_line, floor_words) = get("floors")?;
-    // `none` starts a new scene: SIMS_RATCHET_NEW sets its floors.
+    // `floors = none` with `ours = none` starts a new scene:
+    // SIMS_RATCHET_NEW sets both. One without the other is an error.
     let new = floor_words == "none";
+    if new != (ours == "none") {
+        return Err(format!(
+            "{name}: a new scene has both `ours = none` and `floors = none`, not one of them"
+        ));
+    }
     let words: Vec<&str> = if new {
         Vec::new()
     } else {
@@ -848,6 +1058,12 @@ fn run(config: &Config) -> Result<(), Vec<String>> {
     let text = String::from_utf8(bytes).map_err(|e| fail(format!("{path:?}: {e}")))?;
     let scenes = parse(&text).map_err(|e| fail(format!("{path:?}: {e}")))?;
     for name in &config.new {
+        if BASELINE.contains(&name.as_str()) {
+            return Err(fail(format!(
+                "SIMS_RATCHET_NEW names {name:?}, a baseline scene: its floors are never set \
+                 anew"
+            )));
+        }
         match scenes.iter().find(|s| &s.name == name) {
             Some(s) if s.new => {}
             Some(_) => {
@@ -870,10 +1086,23 @@ fn run(config: &Config) -> Result<(), Vec<String>> {
     }
 
     // Every reference first: a changed screenshot stops the run.
+    let corpus = config
+        .references
+        .canonicalize()
+        .map_err(|e| fail(format!("SIMS_RATCHET {:?}: {e}", config.references)))?;
     let mut originals = Vec::new();
     for scene in &scenes {
         let name = &scene.name;
         let file = config.references.join(&scene.file);
+        // With links resolved, the file is still in the folder.
+        let real = file
+            .canonicalize()
+            .map_err(|e| fail(format!("{name}: {file:?}: {e}")))?;
+        if real.parent() != Some(corpus.as_path()) {
+            return Err(fail(format!(
+                "{name}: {file:?} resolves to {real:?}, outside SIMS_RATCHET {corpus:?}"
+            )));
+        }
         let bytes = std::fs::read(&file).map_err(|e| fail(format!("{name}: {file:?}: {e}")))?;
         let got = sha256(&bytes);
         if got != scene.original_sha256 {
