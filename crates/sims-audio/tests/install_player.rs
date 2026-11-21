@@ -60,6 +60,23 @@ fn assert_plays(out: &[i16], sample: &[i16]) {
 }
 
 #[test]
+fn the_registry_grows_to_24593_buckets() {
+    // Every patch and track line registers an object (21,809 IDs, three
+    // shared by a patch and a track), then every station patch (366
+    // more): the unpause walks 24,593 buckets.
+    let Some(root) = install() else { return };
+    let files = SoundFiles::scan(&root).unwrap();
+    let mut player = player(&root, 1);
+    let tables = player.registry().len();
+    player.add_stations(&StationLists::build(&files));
+    let registry = player.registry();
+    assert_eq!(
+        (tables, registry.len(), registry.buckets()),
+        (21_809, 22_175, 24_593)
+    );
+}
+
+#[test]
 fn the_phone_rings() {
     let Some(root) = install() else { return };
     let files = SoundFiles::scan(&root).unwrap();

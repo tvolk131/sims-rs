@@ -28,6 +28,15 @@ cpal = { version = "0.18.2", optional = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 cpal = "0.18.2"
 
+[dev-dependencies]
+sha2.workspace = true
+
+# The screenshot ratchet prints its skip and its table even when it
+# passes, so it runs without the test harness.
+[[test]]
+name = "ratchet"
+harness = false
+
 [features]
 sound = ["dep:cpal"]
 
