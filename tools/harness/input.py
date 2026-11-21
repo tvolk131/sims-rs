@@ -532,8 +532,10 @@ class Runner:
                and the picker's entries (label, submenu, action).
       queued   the action the pie menu pushed on a person, read at the push.
                `update` N means before lot update N (`in_update` false) or
-               inside it (true). Replay the action before update N if its
-               `queue_result` has `accepted` true.
+               inside it (true). Replay every push (refused ones included,
+               since they may advance the UID counter) before update N; only
+               pushes whose `queue_result` has `accepted` true should end up
+               held.
       queued_unread  a push whose person or action could not be read.
       queue_result  the return of the queue call, with `accepted` and the
                assigned `uid` if readable. `push` pairs this row with its

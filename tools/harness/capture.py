@@ -850,7 +850,7 @@ def main():
     prior_status, dropped, torn = {}, [], dict(rows={}, ended=[])
     if args.resume:
         try:
-            torn = repair_tails(out, ('events.jsonl', 'updates.jsonl', 'watch.jsonl'))
+            torn = repair_tails(out, ('events.jsonl', 'updates.jsonl', 'watch.jsonl', 'input.jsonl'))
         except TornSidecarError:
             ap.error(f'{out / "resume-torn.json"} is not of the form this revision writes (an earlier '
                      'revision left it): read it, note its cut rows by hand, remove it, and resume again')
@@ -1324,7 +1324,11 @@ def main():
                 try:
                     lot = m.lot()
                 except MemoryError:
-                    foreign = True
+                    # A pending queue call's return in the known game process is still readable even
+                    # if m.lot() fails; tend_watches below still reads m.lot() itself for watch handling.
+                    if not (runner and pc == scenario_input.QUEUE_RESULT
+                            and sims_cr3 is not None and regs['ebp'] in runner.pending_pushes):
+                        foreign = True
             if foreign:
                 event(kind='foreign_stop', pc=pc, cr3=cr3)
             elif pc == ENTRY:

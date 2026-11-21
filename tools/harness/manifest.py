@@ -27,7 +27,8 @@ def rows(path):
 def queued_actions(input_rows):
     """The scenario's readable pushes (queued rows), each with its queue
     call's result (accepted, uid) joined by the push id when there is one:
-    replay only the pushes the game accepted."""
+    replay every push (refused ones included, since they may advance the UID
+    counter); only pushes with accepted true should end up held."""
     results = {r['push']: r for r in input_rows if r.get('kind') == 'queue_result' and 'push' in r}
     out = []
     for r in input_rows:
