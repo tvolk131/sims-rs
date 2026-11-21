@@ -14,6 +14,7 @@ A scenario is a text file, one step per line, words split as in a shell,
   wait 10                      let 10 more lot updates return
   move X Y                     move the pointer (window coordinates)
   click X Y                    move there, rest, press and release the left button
+  drag X1 Y1 X2 Y2             move to (X1, Y1), hold left button across midpoint to (X2, Y2), release
   answer-dialog X Y            wait for a dialog to show, then click X Y
   key KEYSYM                   press a key (an xdotool key name, e.g. F2)
   click-object ID              aim at object ID until the game's picker tool
@@ -30,7 +31,7 @@ A scenario is a text file, one step per line, words split as in a shell,
   shot NAME                    save the game window as <capture>/input-shots/NAME.png
   press X Y                    press a button of the game's panels (the buy-mode
                                button, a catalog entry): rest, move over it, press
-  expect-mode live|buy|N [within N]
+  expect-mode live|build|buy|N [within N]
                                fail unless the lot's mode word becomes N
   expect-new-object [within N] fail unless an object appears in the registry
                                (logs it and the budget's change)
@@ -69,9 +70,9 @@ Ghidra on the decrypted image and checked in the running game):
   **Unverified:** rotation. The formula was checked only in the house's
   starting view; aiming always confirms through the picker.
 - The lot (the lot update's ecx at entry, ebx at return): +0x36 the mode
-  (0 live, 2 buy), +0x90 the budget, signed, +0xb0 the registry, whose
-  +0x18..+0x1c are the object slots. In buy mode the lot update still runs
-  (without advancing time), so the runner goes on there.
+  (0 live, 1 build, 2 buy), +0x90 the budget, signed, +0xb0 the registry,
+  whose +0x18..+0x1c are the object slots. In build and buy modes the lot
+  update still runs (without advancing time), so the runner goes on there.
 - 0x48ddcb is the call in the pie menu's select handler (0x48dd67) that
   pushes the chosen action onto the person's queue (0x45d20b): edi (= ecx)
   is the person, esi the pushed record. At 0x45d30d (0x45d2f6 in the
@@ -98,14 +99,13 @@ PICKER_ACTIVE_PIE = 0xe4  # the pie window the picker's menu is in (a submenu's,
 WINDOW = '0xe00013'
 
 STEPS = {
-    'until': (1, 1), 'wait': (1, 1), 'move': (2, 2), 'click': (2, 2), 'answer-dialog': (2, 2),
+    'until': (1, 1), 'wait': (1, 1), 'move': (2, 2), 'click': (2, 2), 'drag': (4, 4), 'answer-dialog': (2, 2),
     'key': (1, 1), 'click-object': (1, 1), 'choose': (1, 1), 'expect-queued': (1, 4), 'shot': (1, 1),
     'press': (2, 2), 'expect-mode': (1, 3), 'expect-new-object': (0, 2),
 }
 # The lot's mode word (sim +0x36), as read in the running game: 0 in live
-# mode, 2 after the buy-mode button. Build mode's number is not checked yet;
-# expect-mode takes a number too.
-MODES = {'live': 0, 'buy': 2}
+# mode, 1 in build mode, 2 in buy mode.
+MODES = {'live': 0, 'build': 1, 'buy': 2}
 
 
 class ScenarioError(ValueError):
@@ -135,7 +135,15 @@ def parse_scenario(text):
             if op in ('until', 'wait', 'click-object'):
                 step['args'] = [int(args[0])]
             elif op in ('move', 'click', 'answer-dialog', 'press'):
-                step['args'] = [int(args[0]), int(args[1])]
+                x, y = int(args[0]), int(args[1])
+                if x < 0 or y < 0:
+                    raise ScenarioError(f'line {n}: {op} coordinates must be non-negative')
+                step['args'] = [x, y]
+            elif op == 'drag':
+                coords = [int(a) for a in args]
+                if any(v < 0 for v in coords):
+                    raise ScenarioError(f'line {n}: drag coordinates must be non-negative')
+                step['args'] = coords
             elif op == 'expect-queued':
                 person, target, within = int(args[0]), None, 100
                 rest = args[1:]
@@ -174,9 +182,10 @@ def parse_scenario(text):
 # Pointer and key commands (run by the guest agent).
 
 def move_command(x, y, window=WINDOW):
-    """Move the pointer to (x, y) in the window, then one pixel right: the game
+    """Move the pointer to (x, y) in the window, then one pixel over: the game
     acts on a pointer that has moved over a place, not one that jumped there."""
-    return f'xdotool mousemove --window {window} {x - 1} {y} sleep 0.2 mousemove --window {window} {x} {y}'
+    pre_x = x - 1 if x > 0 else 1
+    return f'xdotool mousemove --window {window} {pre_x} {y} sleep 0.2 mousemove --window {window} {x} {y}'
 
 
 # A press on the house view or a pie menu is held while lot updates return.
@@ -569,6 +578,7 @@ class Runner:
         self.fresh = False  # self.m was read at this update return (not at a dialog stop)
         self.unchecked = []  # (n, row): commands whose exit code is still to be checked
         self.held = None  # the info of a held press whose release is not yet submitted
+        self.releasing = None  # (n, info): an in-flight release; restored to self.held if it fails
         self.dialogs = []
         self.finished = False
         self.failed = None
@@ -581,6 +591,11 @@ class Runner:
         self.known = None
 
     def close(self):
+        if self.held is None and self.releasing is not None:
+            n, info = self.releasing
+            if self.agent.result(n):
+                self.held = info
+                self.releasing = None
         self.let_go('capture ended')
         if not self.finished:
             self.write(kind='scenario', status='unfinished', index=self.index,
@@ -670,7 +685,12 @@ class Runner:
         """Log command n's end; False (and the scenario failed) if it failed."""
         code = self.agent.result(n)
         self.write(kind='command_ended', id=n, code=code, what=row['what'])
+        releasing = self.releasing
+        if releasing and releasing[0] == n:
+            self.releasing = None
         if code:
+            if releasing and releasing[0] == n:
+                self.held = releasing[1]
             self.fail(f'guest command {n} ({row["what"]}) failed with {code}')
             return False
         if row['what'] == 'shot':
@@ -755,7 +775,9 @@ class Runner:
                 n = self.agent.submit(want.command)  # if it raises, the step fails (and let_go retries a release)
                 if want.command == press_down_command():
                     self.held = want.info
+                    self.releasing = None
                 elif want.command == press_up_command():
+                    self.releasing = (n, want.info)
                     self.held = None
                 row = dict(kind='command', id=n, what=want.kind, command=want.command, **want.info)
                 self.write(**row)
@@ -816,6 +838,23 @@ class Runner:
     def step_click(self, x, y):
         yield Job('move', move_command(x, y, self.agent.window), x=x, y=y)
         yield from self.held_press(x=x, y=y)
+
+    def step_drag(self, x1, y1, x2, y2):
+        shows = self.count('dialog_show')
+        yield Job('move', move_command(x1, y1, self.agent.window), x=x1, y=y1)
+        if self.count('dialog_show') > shows:
+            return
+        cur = (x1, y1)
+        yield Job('press', press_down_command(), settle=HOLD_UPDATES, x=x1, y=y1)
+        if (x2, y2) != (x1, y1) and self.count('dialog_show') == shows:
+            mx, my = (x1 + x2) // 2, (y1 + y2) // 2
+            if (mx, my) not in ((x1, y1), (x2, y2)):
+                cur = (mx, my)
+                yield Job('move', move_command(mx, my, self.agent.window), settle=HOLD_UPDATES, x=mx, y=my)
+            if self.count('dialog_show') == shows:
+                cur = (x2, y2)
+                yield Job('move', move_command(x2, y2, self.agent.window), settle=HOLD_UPDATES, x=x2, y=y2)
+        yield Job('release', press_up_command(), wait=False, x=cur[0], y=cur[1])
 
     def held_press(self, **info):
         """Press the left button where the pointer is, keep it down until

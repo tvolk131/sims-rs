@@ -281,13 +281,14 @@ until 20                       # wait until lot update 20 has returned
 wait 10                        # let 10 more updates return
 move 300 200                   # move the pointer
 click 300 200                  # move, rest, press and release
+drag 470 380 530 350           # move to start, hold left button across midpoint to end, release
 key Escape                     # press a key (an xdotool key name)
 click-object 173               # aim at object 173, click, keep the pie menu only if it is for 173
 choose Sit                     # click the open pie menu's entry
 expect-queued 21 173 within 100  # fail unless the menu pushed an action on person 21 aimed at 173
 shot after                     # save the game window to input-shots/after.png (names are unique)
 press 93 458                   # press a button of the game's panels (rest, move over it, press)
-expect-mode buy within 300     # fail unless the lot's mode becomes buy (2); also live (0) or a number
+expect-mode buy within 300     # fail unless the lot's mode becomes buy (2); also live (0), build (1), or a number
 expect-new-object within 600   # fail unless an object appears in the registry; logs it and the budget
 ```
 
@@ -331,9 +332,10 @@ How the checks work (the addresses are in `input.py`):
   late (tens of updates under TCG), so that reading can be stale. The pie
   menu that opens is the real check: if its actions are aimed at another
   object, Escape closes it and the next aim point is tried.
-- **Pressing.** A press on the house view or a pie menu (`click`,
+- **Pressing.** A press on the house view or a pie menu (`click`, `drag`,
   `click-object`, `choose`) keeps the button down until three lot
-  updates have returned, then lets it go. capture.py holds the game still
+  updates have returned, then lets it go (`drag` holds it across the
+  midpoint and end moves as well). capture.py holds the game still
   for seconds at each stop, and a short press (down and up 0.3 s apart)
   that falls inside one stop is never seen: the game reads the button
   between frames. Twice such a press, with the picker on the object,
@@ -373,8 +375,9 @@ How the checks work (the addresses are in `input.py`):
   captures with `--answer-stuck` for those (it answers from update `--answer-from`, 3 by default). The menu may have closed by
   then; `choose` presses an item only while the menu shows it highlighted
   under the same label.
-- **Buy mode.** `expect-mode` reads the lot's mode word (lot `+0x36`: 0 in
-  live mode, 2 in buy mode). In buy mode the lot update still returns,
+- **Build and buy modes.** `expect-mode` reads the lot's mode word (lot
+  `+0x36`: 0 in live mode, 1 in build mode, 2 in buy mode). In build and
+  buy modes the lot update still returns,
   without advancing time, so the steps go on there. `expect-new-object`
   compares the registry's object pointers with those at the scenario's
   first update return (or at the last `expect-new-object`), less the
@@ -412,8 +415,7 @@ rows log the steps, each guest command and when it ended, the hover
 readings and the pie menus.
 
 **Unverified.** The projection was checked only in the house's starting
-view (zoom 1, no rotation). Submenus and build mode are not driven yet;
-build mode's mode number is not known. The dialog, panel and catalog places
+view (zoom 1, no rotation). The dialog, panel and catalog places
 are fixed in the scenario, not read from the screen. What the catalog shows
 depends on the panel's last state: after a fresh boot, Seating opens on
 chairs. A press that lands on the wrong spot of the buy panel can sell an
