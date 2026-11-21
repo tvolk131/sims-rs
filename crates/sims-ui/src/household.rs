@@ -427,9 +427,10 @@ impl Snapshot {
         self.residents.iter().find(|r| r.object == object)
     }
 
-    /// The clock as the panel writes it (`0x5fe520`, format `0x6d84a4`
-    /// `"%s %2u:%.2u"`): `AM  6:30` for single-digit hours and `PM 12:00`
-    /// for two-digit hours. Midnight and noon are 12.
+    /// The clock as the panel writes it (`0x5fe51e`, format `0x6d84a4`
+    /// `"%s %2u:%.2u"` with `"AM"`/`"PM"` at `0x6d84b0`/`0x6d84b4`):
+    /// `AM  6:30` for single-digit hours and `PM 12:00` for two-digit hours.
+    /// Midnight and noon are 12.
     pub fn clock(&self) -> String {
         let hour = self.hour.rem_euclid(24);
         let twelve = match hour % 12 {

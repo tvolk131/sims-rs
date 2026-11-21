@@ -238,16 +238,17 @@ impl Hud {
     }
 
     /// Draws the panel over the lot in `canvas`, from `world` as it is
-    /// now, with the speed of `pace`, and `status` (a line across the
-    /// top) if there is one; the dialog is the one [`Hud::read_dialog`]
-    /// last read. The catalog pictures the queue shows are read from
-    /// `assets` the first time each type shows.
+    /// now (reading the highlighted speed button directly from `world` via
+    /// [`hud::speed_for`]), and `status` (a line across the top) if there
+    /// is one; the dialog is the one [`Hud::read_dialog`] last read. The
+    /// catalog pictures the queue shows are read from `assets` the first
+    /// time each type shows.
     pub fn draw(
         &mut self,
         world: &World,
         assets: &Assets,
         view: &View,
-        pace: &Pace,
+        _pace: &Pace,
         status: Option<&str>,
         canvas: &mut Canvas,
     ) {
@@ -263,7 +264,7 @@ impl Hud {
             zoom_in: camera.zoom != Zoom::Near,
             zoom_out: camera.zoom != Zoom::Far,
         };
-        self.controls.speed = pace.speed;
+        self.controls.speed = hud::speed_for(world);
         // The panel follows the selection first, so that the snapshot
         // reads what the open panel needs.
         let household = self.household(world);

@@ -26,15 +26,17 @@ pub struct Art {
 /// Un-premultiplies a UI TGA's partially transparent pixels (`0 < a < 255`)
 /// as the original's TGA loader does at `0x4deb3d..0x4deb9d` when
 /// `[0x6c8c3c] == 1` (true for every UI TGA except the Magicland mist
-/// overlays `0x1655..0x1657`): `c = trunc(c * (255.0 / a) + 0.5) as u8`.
-/// Opaque and colorkeyed BMP pixels (`a == 0` or `a == 255`) are untouched.
+/// overlays `0x1655..0x1657`): `c = trunc(c * (255.0f / a) + 0.5f) as u8`,
+/// in 24-bit single precision (`0x4fad5c`) taking the low 8 bits on store
+/// (`0x5dff82..0x5dff94`). Opaque and colorkeyed BMP pixels (`a == 0` or
+/// `a == 255`) are untouched.
 fn unpremultiply_tga(image: &mut Image) {
     for px in image.rgba.as_chunks_mut::<4>().0 {
         let a = px[3];
         if a > 0 && a < 255 {
-            let scale = 255.0f64 / f64::from(a);
+            let scale = 255.0f32 / f32::from(a);
             for ch in &mut px[..3] {
-                *ch = ((f64::from(*ch) * scale + 0.5).trunc() as i32).clamp(0, 255) as u8;
+                *ch = ((f32::from(*ch) * scale + 0.5f32).trunc() as i32) as u8;
             }
         }
     }
@@ -119,16 +121,19 @@ mod tests {
                 // Transparent (alpha 0): untouched.
                 10, 20, 30, 0, // Opaque (alpha 255): untouched.
                 10, 20, 30, 255,
-                // Premultiplied (alpha 128): 64 * 255 / 128 + 0.5 = 128.0 -> 128.
-                64, 32, 0, 128, // Out-of-range non-premultiplied channel clamps to 255.
-                255, 128, 64, 128,
+                // Single-precision rounding (0x4fad5c): shipped UniversalBack.TGA
+                // (160, 75) has blue 56, alpha 112 -> 127 (not f64's 128).
+                64, 32, 56, 112,
+                // Low-byte wrap (0x5dff82..0x5dff94): shipped HotspotPopupTiler.TGA
+                // pixel has blue 82, alpha 35 -> trunc(597.928) & 0xff = 85.
+                0, 35, 82, 35,
             ],
         };
         unpremultiply_tga(&mut image);
         assert_eq!(
             image.rgba,
             vec![
-                10, 20, 30, 0, 10, 20, 30, 255, 128, 64, 0, 128, 255, 255, 128, 128,
+                10, 20, 30, 0, 10, 20, 30, 255, 146, 73, 127, 112, 0, 255, 85, 35,
             ]
         );
     }

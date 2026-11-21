@@ -143,18 +143,7 @@ impl Hud {
         assets: &Assets,
         canvas: &mut Canvas,
     ) {
-        let camera = &view.camera;
-        self.controls.camera = hud::CameraState {
-            floor: u8::try_from(camera.level).unwrap_or(1),
-            walls: match camera.walls {
-                Walls::Up => UiWalls::Up,
-                Walls::Cutaway => UiWalls::Cutaway,
-                Walls::Down => UiWalls::Down,
-            },
-            roof: false,
-            zoom_in: camera.zoom != Zoom::Near,
-            zoom_out: camera.zoom != Zoom::Far,
-        };
+        sync_controls(&mut self.controls, world, &view.camera);
         let mut snapshot = Snapshot::read(world, &self.members).with_careers(&self.careers);
         // The viewer plays no sounds, so a balloon this closes closes
         // silently.
@@ -292,6 +281,22 @@ impl Hud {
     }
 }
 
+/// Syncs the viewer's HUD camera and speed controls from `world` and `camera`.
+fn sync_controls(controls: &mut Controls, world: &sims_sim::World, camera: &sims_render::Camera) {
+    controls.camera = hud::CameraState {
+        floor: u8::try_from(camera.level).unwrap_or(1),
+        walls: match camera.walls {
+            Walls::Up => UiWalls::Up,
+            Walls::Cutaway => UiWalls::Cutaway,
+            Walls::Down => UiWalls::Down,
+        },
+        roof: false,
+        zoom_in: camera.zoom != Zoom::Near,
+        zoom_out: camera.zoom != Zoom::Far,
+    };
+    controls.speed = hud::speed_for(world);
+}
+
 /// The autonomy tuning's friendship threshold, which the relationship
 /// panel's smileys need. The viewer may show a snapshot or a house file
 /// it did not boot, so it links the global file alone, which holds the
@@ -301,4 +306,52 @@ fn friendship(assets: &Assets) -> Result<i32, String> {
     let program =
         sims_vm::Program::link(assets.index(), assets.catalog(), []).map_err(|e| e.to_string())?;
     Ok(program.autonomy_constants().friendship_threshold)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sims_ui::command::Speed;
+    use sims_ui::hud::{Kind, id};
+
+    #[test]
+    fn paused_viewer_snapshot_highlights_its_own_speed() {
+        let mut world = sims_sim::World::empty();
+        world.globals.resize(19, 0);
+        world.globals[16] = sims_sim::speed::FAST;
+        world.globals[17] = 1; // paused
+        world.globals[18] = -1;
+
+        let camera = View::new([800, 600], [0, 0], 0).camera;
+        let mut controls = Controls::default();
+        sync_controls(&mut controls, &world, &camera);
+        assert_eq!(controls.speed, Some(Speed::Fast));
+
+        let snapshot = Snapshot::read(&world, &[]);
+        assert!(snapshot.paused);
+        let items = hud::layout([800, 600], &snapshot, &controls);
+        let selected_ids: Vec<i32> = items
+            .iter()
+            .filter_map(|i| match i.kind {
+                Kind::Button {
+                    id, selected: true, ..
+                } if matches!(id, id::NORMAL | id::FAST | id::ULTRA) => Some(id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(selected_ids, [id::FAST]);
+
+        // While idle-speed is active (global 18 >= 0), highlights the saved
+        // return speed (0x46d7cc / 0x46d7d6).
+        world.globals[16] = sims_sim::speed::IDLE;
+        world.globals[18] = sims_sim::speed::ULTRA;
+        sync_controls(&mut controls, &world, &camera);
+        assert_eq!(controls.speed, Some(Speed::Ultra));
+
+        // An unrecognized speed highlights none (0x53b156).
+        world.globals[16] = 0;
+        world.globals[18] = -1;
+        sync_controls(&mut controls, &world, &camera);
+        assert_eq!(controls.speed, None);
+    }
 }

@@ -7,18 +7,22 @@ Collection 1.91 executable revealed six discrepancies in the live-mode
 control-panel cluster (`crates/sims-ui`) plus the reason the ratchet's
 `0816` scenes display `8:17` instead of `8:16`. Fixing the six UI
 discrepancies brings every control-panel pixel of `far-r0-cut-0816`
-except the final digit (`7` vs `6`) — 100% of the clock prefix, family
-friends count, funds, speed button, help button, and curved alpha
-border — to an exact 16-bit 565 match with the original.
+outside the ratchet's blinking-pause-button mask
+(`leave_out = 86 554 98 565`, 72 pixels) — 100% of the clock prefix,
+family friends count, funds, speed button, help button, and curved alpha
+border — to an exact 16-bit 565 match with the original, leaving only
+the 49 pixels of the final digit `7` vs `6` (121 pixels unmasked).
 
 ## Findings from the 1.91 binary
 
-- **Clock format (`0x5fe520`, `0x6d84a4`):** The original formats the
-  cluster clock with `"%s %2u:%.2u"` (`AM`/`PM` from `STR#`, then a
-  width-2 space-padded 12-hour value, colon, and zero-padded minute).
-  Single-digit hours therefore carry two spaces between the meridiem and
-  the hour digit (e.g. `"AM  6:30"`, `"AM  8:16"`), whereas double-digit
-  hours carry one (`"PM 12:00"`). `Snapshot::clock` previously formatted
+- **Clock format (`0x5fe51e`, `0x6d84a4`):** The English formatter
+  starts at `0x5fe51e`, selects the executable literals `"AM"`
+  (`0x6d84b0`) or `"PM"` (`0x6d84b4`), and formats the cluster clock
+  with `"%s %2u:%.2u"` (`0x6d84a4`: meridiem, width-2 space-padded
+  12-hour value, colon, zero-padded minute). Single-digit hours
+  therefore carry two spaces between the meridiem and the hour digit
+  (e.g. `"AM  6:30"`, `"AM  8:16"`), whereas double-digit hours carry
+  one (`"PM 12:00"`). `Snapshot::clock` previously formatted
   `"{half} {twelve}:{:02}"` with one space.
 - **Clock box and centering (`0x539ede..0x539f43`, `0x6f4578..0x6f4584`):**
   The clock text is drawn in font 8 (`[0x6f2ae4]`) in `GREEN` (`0x2f2b`)
@@ -47,10 +51,15 @@ border — to an exact 16-bit 565 match with the original.
   `178 - font10.width("$9,999,999")` (`0x6cd39c`, `0x6f4590 = 178`,
   `y = 0x6f459c = 158`). `hud::Kind::Friends(i32)` reproduces this
   placement.
-- **Speed button stays lit while paused (`0x53b0d8..0x53b16b`):** When
-  paused (`0x46d7cc`), the control panel reads the saved speed
-  (`0x46d7d6`) and keeps that speed button (`Normal`/`Fast`/`Ultra`) in
-  its selected cell rather than clearing selection on pause.
+- **Speed button selection (`0x53b0d8..0x53b16b`):** The control panel
+  checks whether the idle loop's return speed is active (`0x46d7cc`,
+  global 18 >= 0): if so it reads that saved return speed (`0x46d7d6`),
+  otherwise it reads the active speed (`0x46d78b`, global 16), and
+  matches against Normal (`0x2f8`), Fast (`0x39c`), or Ultra (`0x3e2`),
+  clearing all three if none matches. It never inspects the pause flag
+  (`0x46d866`, global 17), so a paused lot keeps its speed button lit.
+  `hud::speed_for(world)` implements this check and both `sims-game` and
+  `sims-viewer` now feed it into `Controls::speed` (`Option<Speed>`).
 - **Help button (`kHelpBtn = 4993`, `0x1381`, `0x538f41..0x538fe6`, `0x6f4530`):**
   The cluster places `cpanel\Buttons\HelpButton.bmp` (40x15, four 10x15
   cells) at `(5, 164)` in its enabled/normal state (cell 0). Added to
@@ -74,16 +83,19 @@ border — to an exact 16-bit 565 match with the original.
   When `[0x6c8c3c] == 1` (true for every UI TGA except the Magicland
   mist overlays `0x1655..0x1657`, which toggle `0x6c8c3c` to `0` at
   `0x54228f..0x5422d4`), the original's 32-bit TGA loader un-premultiplies
-  partially transparent pixels (`0 < a < 255`) by `255.0 / a` rounded
-  with `+ 0.5` truncation before storing RGB. `UniversalBack.TGA` has
-  393 premultiplied edge pixels along the cluster's curved silhouette;
-  un-premultiplying in `Art::load` and `Art::load_optional` (clamped to
-  `0..=255` for safety on synthetic non-premultiplied images) eliminates
+  partially transparent pixels (`0 < a < 255`) by `255.0f / a` rounded
+  with `+ 0.5f` truncation in 24-bit single precision (`0x4fad5c`), then
+  takes the low byte of each channel on store (`0x5dff82..0x5dff94`,
+  wrapping rather than clamping — matching shipped pixels in
+  `UniversalBack.TGA` at `(160, 75)` as well as `HotspotPopupTiler.TGA`
+  and `NScreenDialogTiler.TGA`). `UniversalBack.TGA` has 393
+  premultiplied edge pixels along the cluster's curved silhouette;
+  un-premultiplying in `Art::load` and `Art::load_optional` eliminates
   the dark fringe around the cluster.
 
 ## Ratchet impact
 
-Every scene in `crates/sims-game/tests/ratchet.txt` (relative to `origin/main` `9b006a84`) improves by +2.22% to +2.54% on `panel` and +0.21% to +0.24% on `frame`, with zero regressions in any class:
+Every scene in `crates/sims-game/tests/ratchet.txt` (relative to `origin/main` `a3e1c9bc`) improves by +2.22% to +2.54% on `panel` and +0.21% to +0.24% on `frame`, with zero regressions in any class:
 
 | Scene | `frame` before | `frame` after | `panel` before | `panel` after |
 | --- | ---: | ---: | ---: | ---: |

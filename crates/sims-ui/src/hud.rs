@@ -174,7 +174,9 @@ pub struct Controls {
     /// when it builds the panel (0x51a0bc); with nobody selected none is
     /// open ([`Controls::follow`]).
     pub panel: Option<Panel>,
-    pub speed: Speed,
+    /// Which speed button is selected (`0x53b0d8..0x53b16b`), or `None` when
+    /// the simulation holds an unrecognized speed.
+    pub speed: Option<Speed>,
     pub camera: CameraState,
     /// The pointer's position, for the buttons' hover cells.
     pub pointer: Option<[i32; 2]>,
@@ -220,7 +222,7 @@ impl Default for Controls {
             mode: Mode::Live,
             expanded: false,
             panel: Some(Panel::Needs),
-            speed: Speed::Normal,
+            speed: Some(Speed::Normal),
             camera: CameraState::default(),
             pointer: None,
             relations: Relations::default(),
@@ -409,6 +411,27 @@ pub(crate) const fn rgb565(c: u16) -> [u8; 3] {
     ]
 }
 
+/// Which speed button the control panel highlights for `world`
+/// (`0x53b0d8..0x53b16b`): reads the idle loop's saved return speed
+/// (`0x46d7cc` / `0x46d7d6`, global 18) when non-negative, otherwise the
+/// active speed (`0x46d78b`, global 16), and matches against Normal
+/// (`0x2f8`), Fast (`0x39c`), or Ultra (`0x3e2`). Does not inspect the
+/// pause flag (`0x46d866`, global 17), so a paused lot keeps its speed
+/// button highlighted; an unrecognized speed highlights none.
+pub fn speed_for(world: &sims_sim::World) -> Option<Speed> {
+    let raw = if world.return_speed() >= 0 {
+        world.return_speed()
+    } else {
+        world.speed()
+    };
+    match raw {
+        sims_sim::speed::NORMAL => Some(Speed::Normal),
+        sims_sim::speed::FAST => Some(Speed::Fast),
+        sims_sim::speed::ULTRA => Some(Speed::Ultra),
+        _ => None,
+    }
+}
+
 /// Lays the panel out in a window of `size`, in drawing order.
 pub fn layout(size: [i32; 2], snapshot: &Snapshot, controls: &Controls) -> Vec<Item> {
     // Sizes outside what a window can be are clamped, so no arithmetic
@@ -588,13 +611,15 @@ pub fn layout(size: [i32; 2], snapshot: &Snapshot, controls: &Controls) -> Vec<I
         (id::FAST, Speed::Fast, 120, 20),
         (id::ULTRA, Speed::Ultra, 141, 32),
     ] {
-        // 0x53b0d8..0x53b16b: while paused, the original reads the saved
-        // speed (0x46d7d6) and keeps that speed button selected.
+        // 0x53b0d8..0x53b16b: highlights the button matching the active speed
+        // (0x46d78b) or, while idle-speed is active (0x46d7cc), the saved
+        // return speed (0x46d7d6). The pause flag (0x46d866) is not checked
+        // here, so a paused lot keeps its speed button selected.
         items.push(button(
             id,
             4,
             at(x, 135, w, 15),
-            controls.speed == speed,
+            controls.speed == Some(speed),
             Command::SetSpeed(speed),
         ));
     }
@@ -3265,7 +3290,7 @@ mod tests {
         s.paused = true;
         s.family_friends = 12;
         let controls = Controls {
-            speed: Speed::Fast,
+            speed: Some(Speed::Fast),
             ..Controls::default()
         };
         let items = layout([800, 600], &s, &controls);
@@ -3314,6 +3339,37 @@ mod tests {
             .find(|i| matches!(i.kind, Kind::Pause { .. }))
             .expect("the pause button");
         assert_eq!(pause.kind, Kind::Pause { paused: true });
+
+        // speed_for reads idle return speed (global 18 >= 0) first, else active
+        // speed (global 16), ignoring pause (global 17); unknown speed -> None.
+        let mut world = sims_sim::World::empty();
+        world.globals.resize(19, 0);
+        world.globals[16] = sims_sim::speed::FAST;
+        world.globals[17] = 1;
+        world.globals[18] = -1;
+        assert_eq!(speed_for(&world), Some(Speed::Fast));
+        world.globals[16] = sims_sim::speed::IDLE;
+        world.globals[18] = sims_sim::speed::ULTRA;
+        assert_eq!(speed_for(&world), Some(Speed::Ultra));
+        world.globals[16] = sims_sim::speed::IDLE;
+        world.globals[18] = -1;
+        assert_eq!(speed_for(&world), None);
+        let no_speed = Controls {
+            speed: None,
+            ..Controls::default()
+        };
+        let none_items = layout([800, 600], &s, &no_speed);
+        assert!(
+            !none_items.iter().any(|i| matches!(
+                i.kind,
+                Kind::Button {
+                    id: id::NORMAL | id::FAST | id::ULTRA,
+                    selected: true,
+                    ..
+                }
+            )),
+            "unrecognized speed should select no speed button"
+        );
 
         // Family friends count is right-aligned immediately left of `$9,999,999`
         // ending at x = 178, y = 158, and lets presses pass through to buttons
