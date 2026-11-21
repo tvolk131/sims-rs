@@ -828,17 +828,14 @@ impl<'a> Painter<'a> {
                     if let Some(shape) = capped {
                         // On an edge-on diagonal the strip is always
                         // pattern 252 in shape 9, whichever end is marked
-                        // (0x53eb6d to 0x53ebf5). Shape 9's edge-on frame
-                        // is taller than the pattern's; see
-                        // `Image::masked`.
-                        let (trim, mask) = if shape == 7 || frame == 3 {
-                            (252, 9)
+                        // (0x53eb6d to 0x53ebf5).
+                        let strip = if frame == 3 {
+                            edge_on_strip(self.assets, zoom)
                         } else {
-                            (253, 10)
-                        };
-                        if let Some(strip) =
+                            let (trim, mask) = if shape == 7 { (252, 9) } else { (253, 10) };
                             wall_image(self.assets, trim, mask, None, false, zoom, frame)
-                        {
+                        };
+                        if let Some(strip) = strip {
                             // In room 0's light, or 1 without one, held
                             // by the time of day's cap, and no pools
                             // (0x53eba8 to 0x53ebb5).
@@ -848,8 +845,7 @@ impl<'a> Painter<'a> {
                             );
                             let lit = |_, _| light;
                             // On an edge-on diagonal the original moves
-                            // the strip up before drawing it (0x53ebf5);
-                            // its depth moves with it.
+                            // the strip up before drawing it (0x53ebf5).
                             let lift = if frame == 3 {
                                 edge_on_strip_lift(self.camera.zoom)
                             } else {
@@ -867,8 +863,9 @@ impl<'a> Painter<'a> {
     /// Draws a wall face on `level` standing between the screen points
     /// `a` and `b` of its ends, on terrain `heights` steps up at each,
     /// only within screen columns `columns` (from, to) when given, and
-    /// `raise` pixels higher than its place. Its depth is raised with it,
-    /// as the original's sprite carries its own depth.
+    /// `raise` pixels higher than its place. Depth is still read at the
+    /// row drawn, from the same anchor, as the original's wall depth
+    /// lookup is (0x49a5d3).
     ///
     /// The wall is placed at its end lower on the screen (the left one of
     /// a wall level on screen), and a straight wall's columns run up or
@@ -941,8 +938,8 @@ impl<'a> Painter<'a> {
             at,
             |x, y| light(x + skip, y),
             |sx, sy| match frame {
-                0 | 1 => depth.wall(anchor, sy + raise, first, sx.saturating_sub(sprite_left)),
-                _ => depth.diagonal(anchor, sy + raise, frame == 3),
+                0 | 1 => depth.wall(anchor, sy, first, sx.saturating_sub(sprite_left)),
+                _ => depth.diagonal(anchor, sy, frame == 3),
             },
         );
     }
@@ -1638,6 +1635,14 @@ fn wall_image(
         _ => assets.shape(style, cut, zoom)?[frame].clone(),
     };
     assets.pattern(pattern, zoom)?[frame].masked(&shape)
+}
+
+/// The strip on a marked edge-on diagonal: pattern 252 in shape 9, whose
+/// edge-on frame is taller than the pattern's, lined up at the top-left
+/// (see [`Image::masked_top_left`]).
+fn edge_on_strip(assets: &mut Assets, zoom: usize) -> Option<Image> {
+    let shape = assets.shape(9, false, zoom)?[3].clone();
+    assets.pattern(252, zoom)?[3].masked_top_left(&shape)
 }
 
 /// How far up the original moves the strip on a marked edge-on diagonal:
