@@ -1512,10 +1512,14 @@ impl<S: Samples> Player<S> {
         for thread in &ended {
             self.save_stopped(thread);
         }
-        if ended.is_empty() && !self.threads.iter().any(|t| t.track == track) {
-            // *(code)* 0x57dd3e runs unconditionally on the track object
-            // even when it was already stopped (clearing PATCH, idle voice,
-            // hold, and main_duckpri).
+        if ended.is_empty()
+            && !self.threads.iter().any(|t| t.track == track)
+            && self.owner(track).is_some()
+        {
+            // *(code)* 0x57dd3e runs unconditionally on registered track
+            // objects even when already stopped (clearing PATCH, idle voice,
+            // hold, and main_duckpri); unregistered IDs return NULL and
+            // patch objects' vtable +0x38 (0x57bfa6) is a no-op.
             self.kill_stopped_track(track);
         }
         self.forget_ended();

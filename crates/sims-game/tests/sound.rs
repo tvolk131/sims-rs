@@ -354,6 +354,33 @@ fn window_focus_changes_forward_kind_25_and_deduplicate_initial_focus() {
     assert!(feed.set_focused(true, &mut game, |input| mixer.input(input)));
     feed.update(&mut game, |input| mixer.input(input));
 
+    // Manual unpause followed immediately by focus loss before `feed.update`:
+    // both write the same deferred pause flag (`0x4cee52`..`0x4cee5d`), so
+    // `set_focused(false)` must NOT emit `Unpause` before `Active(false)` and
+    // the next update emits only `Pause`; later refocus restores unpaused.
+    game.toggle_pause();
+    feed.update(&mut game, |input| mixer.input(input));
+    assert!(game.paused());
+    game.toggle_pause(); // manual unpause, not yet flushed to feed
+    assert!(!game.paused());
+    sent.clear();
+    assert!(feed.set_focused(false, &mut game, |input| {
+        sent.push(input.clone());
+        mixer.input(input);
+    }));
+    assert!(game.paused());
+    assert_eq!(sent, [Input::Active(false)]);
+    sent.clear();
+    feed.update(&mut game, |input| {
+        sent.push(input.clone());
+        mixer.input(input);
+    });
+    assert!(sent.contains(&Input::Events(vec![SoundEvent::Pause])));
+    assert!(!sent.contains(&Input::Events(vec![SoundEvent::Unpause])));
+    assert!(feed.set_focused(true, &mut game, |input| mixer.input(input)));
+    assert!(!game.paused());
+    feed.update(&mut game, |input| mixer.input(input));
+
     // Focus cycling while the lot is ALREADY paused saves saved_paused=true
     // and keeps the lot and live ambience paused after refocusing (still
     // dispatching `SoundEvent::Pause` for the dirty pause bit at `0x4ce5c5`).

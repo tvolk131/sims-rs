@@ -6119,4 +6119,33 @@ fn kill_trk_sees_caller_same_block_duckpri_update_during_refresh() {
     let after = player.render(BLOCK * 6, &NoSources);
     assert_eq!(*after.last().unwrap(), 10_000);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
+
+    // Killing an unused patch ID (1) or unregistered ID (999) dispatches to
+    // patch vtable +0x38 (0x57bfa6 no-op) or NULL, so it must NOT refresh
+    // unrelated latched voices.
+    let mut kill_patch = NOTE_ON_V1.to_vec();
+    kill_patch.extend(loadl(5, 10));
+    kill_patch.extend([WAIT, 5]);
+    kill_patch.extend(loadl(25, 10)); // raise DUCKPRI above 5 (latched)
+    kill_patch.extend(loadl(6, 1)); // patch ID 1 (not a track!)
+    kill_patch.extend([KILL_TRK, 6]);
+    kill_patch.extend(loadl(6, 999)); // unregistered ID
+    kill_patch.extend([KILL_TRK, 6, SET_LOOP, LOOP]);
+
+    let mut player2 = Player::new(
+        vec![module_with(&[&kill_patch, &ducker], 1, 10, "")],
+        long_sample("one.xa"),
+        1,
+    );
+    play(&mut player2, "e1"); // MAIN_DUCKPRI = 5
+    play(&mut player2, "e0"); // plays ducked
+    let ducked = player2.render(BLOCK, &NoSources)[0];
+    assert!(ducked > 0 && ducked < 6_000, "{ducked}");
+    let after_patch_kill = player2.render(BLOCK * 6, &NoSources);
+    assert_eq!(
+        *after_patch_kill.last().unwrap(),
+        ducked,
+        "killing a patch or unregistered ID must not refresh latched voices"
+    );
+    assert!(player2.faults.is_empty(), "{:?}", player2.faults);
 }

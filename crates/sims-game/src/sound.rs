@@ -485,9 +485,10 @@ impl Feed {
     }
 
     /// Flushes prior game sources, sounds, and camera moves before focus loss
-    /// without flushing a pending `pause_dirty` transition from an earlier
-    /// focus regain (`0x4cee4a` overwrites the pending pause state before
-    /// `0x4ce59e` runs).
+    /// without flushing pending pause changes (both manual toggles at
+    /// `0x53a5bf` and focus changes at `0x4f7655` write the same deferred
+    /// pause state at `0x4cee52`..`0x4cee5d`, dispatched only on the next
+    /// [`Feed::update`] at `0x4ce59e`).
     fn flush_before_blur(&mut self, game: &mut crate::Game, mut send: impl FnMut(Input)) {
         let first = self.told.is_none();
         let sources = game.sound_sources();
@@ -497,11 +498,6 @@ impl Feed {
         }
         if first {
             send(Input::Events(enter_live()));
-        }
-        let paused = game.paused();
-        if !self.pause_dirty && paused != self.paused {
-            send(Input::Events(vec![pause_event(paused)]));
-            self.paused = paused;
         }
         let sounds = game.take_sounds();
         if !sounds.is_empty() {
