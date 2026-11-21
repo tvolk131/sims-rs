@@ -89,7 +89,12 @@ pub const FAMILY_FLAG_BIT_3: u32 = 1 << 3;
 
 /// Computes a lot's total value as `Sims.exe` 1.91 computes it (`0x4253ff`,
 /// `0x4272c5`, `0x427f78`, `0x4282bc`):
-/// `lot_value + objects_value + trunc(architecture_value as f32 * arch_multiplier)`.
+/// `fild architecture_value; fmul dword ptr [0x6e4a88]; call __ftol`.
+///
+/// `fild` loads the 32-bit integer into x87 exactly without pre-rounding to
+/// 24-bit `f32`; the product with the `f32` multiplier is rounded to single
+/// precision (the original's x87 24-bit precision mode) and then truncated
+/// toward zero.
 #[must_use]
 pub fn lot_total_value(
     lot_value: i32,
@@ -97,7 +102,7 @@ pub fn lot_total_value(
     architecture_value: i32,
     arch_multiplier: f32,
 ) -> i32 {
-    let scaled_arch = (architecture_value as f32 * arch_multiplier) as i32;
+    let scaled_arch = ((f64::from(architecture_value) * f64::from(arch_multiplier)) as f32) as i32;
     lot_value
         .wrapping_add(objects_value)
         .wrapping_add(scaled_arch)
@@ -163,8 +168,9 @@ impl StoredNeighborhood {
         }
     }
 
-    /// The family currently living in `house`, if any (`house == 0` returns
-    /// `None`).
+    /// The family currently occupying `house`, matching `Sims.exe` `0x425d95`:
+    /// checks both the primary `house` field (`+0x110`) and the v8+ secondary
+    /// house field (`+0x13c`, `tail[0..4]`). `house == 0` returns `None`.
     #[must_use]
     pub fn family_in(&self, house: u32) -> Option<(u16, &Family)> {
         if house == 0 {
@@ -172,18 +178,25 @@ impl StoredNeighborhood {
         }
         self.families
             .iter()
-            .find(|(_, family)| u32::try_from(family.house).ok() == Some(house))
+            .find(|(_, family)| {
+                u32::try_from(family.house).ok() == Some(house)
+                    || u32::try_from(family.secondary_house()).ok() == Some(house)
+            })
             .map(|(&id, family)| (id, family))
     }
 
-    /// Mutable access to the family currently living in `house`, if any.
+    /// Mutable access to the family currently occupying `house` (checking both
+    /// primary and secondary house fields per `0x425d95`), if any.
     pub fn family_in_mut(&mut self, house: u32) -> Option<(u16, &mut Family)> {
         if house == 0 {
             return None;
         }
         self.families
             .iter_mut()
-            .find(|(_, family)| u32::try_from(family.house).ok() == Some(house))
+            .find(|(_, family)| {
+                u32::try_from(family.house).ok() == Some(house)
+                    || u32::try_from(family.secondary_house()).ok() == Some(house)
+            })
             .map(|(&id, family)| (id, family))
     }
 
@@ -338,7 +351,11 @@ impl StoredNeighborhood {
         }
         self.neighbors = updated_neighbors;
 
-        // 3. FAMI records (0x4286a0..0x428771, 0x4253dd..0x425453).
+        // 3. FAMI records (0x4286a0..0x428771, 0x4253dd..0x425453, 0x410696).
+        // Native `0x410696` always serializes FAMI version 9.
+        for stored in self.families.values_mut() {
+            stored.upgrade_to_v9();
+        }
         for live_family in &world.families {
             let Ok(id) = u16::try_from(live_family.id) else {
                 continue;
@@ -354,6 +371,7 @@ impl StoredNeighborhood {
                 live_family.friends
             };
         }
+        let residential = current_house != 0 && self.is_residential(current_house);
         if family_id != 0
             && let Some(active) = self.families.get_mut(&family_id)
         {
@@ -374,11 +392,30 @@ impl StoredNeighborhood {
             if current_house != 0 && u32::try_from(active.house).ok() == Some(current_house) {
                 active.architecture_value = lot_value_total;
             }
-            if let Some(magic) = &world.magic_history
-                && magic.family == i32::from(family_id)
+            // 0x410a87: merge the signed maximum of each retained magic-history
+            // word and the live Magic Controller (GUID 0xb6c90029) attribute
+            // on a residential lot before saving FAMI v9.
+            let mut history = match &world.magic_history {
+                Some(magic) if magic.family == i32::from(family_id) => magic.values,
+                _ => active.magic_history().ok().flatten().unwrap_or([0; 6]),
+            };
+            if residential
+                && world.globals.get(9).copied().map(i32::from) == Some(i32::from(family_id))
+                && let Some(controller) = world
+                    .order
+                    .iter()
+                    .filter_map(|id| world.objects.get(id))
+                    .find(|obj| obj.guid == 0xb6c9_0029)
             {
-                let _ = active.set_magic_history(magic.values);
+                for (slot, word) in history.iter_mut().enumerate() {
+                    if let Some(&attr) = controller.attributes.get(slot)
+                        && attr > *word
+                    {
+                        *word = attr;
+                    }
+                }
             }
+            let _ = active.set_magic_history(history);
         }
 
         // 4. TATT (0x425455 → 0x43e0be): merge updated world type attributes.
@@ -458,14 +495,9 @@ impl NeighborhoodStore {
         let lot_rows = neighborhood.lot_rows().map_err(store)?;
 
         let mut characters: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-        for path in neighborhood.character_files().map_err(store)? {
-            let name = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
+        for (rel_path, path) in neighborhood.character_tree().map_err(store)? {
             let bytes = std::fs::read(&path).map_err(store)?;
-            characters.insert(name, bytes);
+            characters.insert(rel_path, bytes);
         }
 
         let mut houses: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
@@ -717,17 +749,25 @@ impl NeighborhoodStore {
     pub fn list_houses(&self, id: &str) -> Result<Vec<u32>> {
         let txn = self.db.begin_read().map_err(store)?;
         let mut houses = std::collections::BTreeSet::new();
-        if let Ok(table) = txn.open_table(NEIGHBORHOOD_HOUSES) {
-            for entry in table.range((id, 0u32)..=(id, u32::MAX)).map_err(store)? {
-                let (key, _) = entry.map_err(store)?;
-                houses.insert(key.value().1);
+        match txn.open_table(NEIGHBORHOOD_HOUSES) {
+            Ok(table) => {
+                for entry in table.range((id, 0u32)..=(id, u32::MAX)).map_err(store)? {
+                    let (key, _) = entry.map_err(store)?;
+                    houses.insert(key.value().1);
+                }
             }
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(error) => return Err(store(error)),
         }
-        if let Ok(table) = txn.open_table(NEIGHBORHOOD_LOTS) {
-            for entry in table.range((id, 0u32)..=(id, u32::MAX)).map_err(store)? {
-                let (key, _) = entry.map_err(store)?;
-                houses.insert(key.value().1);
+        match txn.open_table(NEIGHBORHOOD_LOTS) {
+            Ok(table) => {
+                for entry in table.range((id, 0u32)..=(id, u32::MAX)).map_err(store)? {
+                    let (key, _) = entry.map_err(store)?;
+                    houses.insert(key.value().1);
+                }
             }
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(error) => return Err(store(error)),
         }
         Ok(houses.into_iter().collect())
     }
@@ -779,15 +819,53 @@ impl NeighborhoodStore {
         lot_bytes: &[u8],
         state: &StoredNeighborhood,
     ) -> Result<()> {
+        let _ = self.save_lot_and_neighborhood_checked(id, house, None, lot_bytes, state, &[])?;
+        Ok(())
+    }
+
+    /// Atomically persists a saved lot blob, the updated neighborhood state,
+    /// and any character-file deletions (e.g. bulldozed tombstones per
+    /// `0x426fcd`) in a single REDB write transaction.
+    ///
+    /// When `expected_revision` is `Some(expected)`, verifies inside the write
+    /// transaction that the currently committed neighborhood revision still
+    /// equals `expected`; if another operation committed a newer revision
+    /// meanwhile, aborts the transaction cleanly and returns
+    /// `Ok(Err(current_revision))`.
+    pub fn save_lot_and_neighborhood_checked(
+        &self,
+        id: &str,
+        house: u32,
+        expected_revision: Option<u64>,
+        lot_bytes: &[u8],
+        state: &StoredNeighborhood,
+        remove_character_files: &[String],
+    ) -> Result<std::result::Result<(), u64>> {
         let encoded = state.encode();
         let txn = self.db.begin_write().map_err(store)?;
         {
+            let mut nh_table = txn.open_table(NEIGHBORHOODS).map_err(store)?;
+            if let Some(expected) = expected_revision {
+                let Some(existing) = nh_table.get(id).map_err(store)? else {
+                    return Err(Error::Store(format!("neighborhood {id:?} does not exist")));
+                };
+                let current = StoredNeighborhood::decode(id, existing.value())?;
+                if current.revision != expected {
+                    return Ok(Err(current.revision));
+                }
+            }
             let mut lot_table = txn.open_table(NEIGHBORHOOD_LOTS).map_err(store)?;
             lot_table.insert((id, house), lot_bytes).map_err(store)?;
-            let mut nh_table = txn.open_table(NEIGHBORHOODS).map_err(store)?;
             nh_table.insert(id, encoded.as_slice()).map_err(store)?;
+            if !remove_character_files.is_empty() {
+                let mut char_table = txn.open_table(NEIGHBORHOOD_CHARACTERS).map_err(store)?;
+                for rel_path in remove_character_files {
+                    char_table.remove((id, rel_path.as_str())).map_err(store)?;
+                }
+            }
         }
-        txn.commit().map_err(store)
+        txn.commit().map_err(store)?;
+        Ok(Ok(()))
     }
 
     /// Computes a base house's total lot price directly from its `SIMI` chunk

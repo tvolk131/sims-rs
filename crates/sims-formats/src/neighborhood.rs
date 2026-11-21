@@ -34,6 +34,61 @@ impl Family {
         Ok(Some(values))
     }
 
+    /// Secondary/vacation house number stored at `tail[0..4]` for FAMI
+    /// versions >= 8 (`0x425dcc`, offset `+0x13c`). Returns `0` for older
+    /// versions or truncated tails.
+    #[must_use]
+    pub fn secondary_house(&self) -> i32 {
+        if self.version >= 8 && self.tail.len() >= 4 {
+            i32::from_le_bytes(self.tail[0..4].try_into().unwrap())
+        } else {
+            0
+        }
+    }
+
+    /// Writes the secondary house number into `tail[0..4]` for FAMI versions
+    /// >= 8. Returns `false` if this record does not carry a secondary house.
+    pub fn set_secondary_house(&mut self, house: i32) -> bool {
+        if self.version < 8 || self.tail.len() < 4 {
+            return false;
+        }
+        self.tail[0..4].copy_from_slice(&house.to_le_bytes());
+        true
+    }
+
+    /// Upgrades a v7/v8 FAMI record to v9 (matching native `0x410696` which
+    /// always serializes version 9), preserving any v8 secondary-house word at
+    /// `tail[0..4]` and zero-initializing the six magic-history words at
+    /// `tail[4..16]` when absent.
+    pub fn upgrade_to_v9(&mut self) {
+        if self.version >= 9 && self.tail.len() >= 16 {
+            return;
+        }
+        let secondary = self.secondary_house();
+        if self.version < 8 {
+            let extra = std::mem::take(&mut self.tail);
+            let mut new_tail = Vec::with_capacity(16 + extra.len());
+            new_tail.extend_from_slice(&0i32.to_le_bytes());
+            new_tail.extend_from_slice(&[0u8; 12]);
+            new_tail.extend_from_slice(&extra);
+            self.tail = new_tail;
+        } else if self.version == 8 {
+            let rest = if self.tail.len() > 4 {
+                self.tail[4..].to_vec()
+            } else {
+                Vec::new()
+            };
+            let mut new_tail = Vec::with_capacity(16 + rest.len());
+            new_tail.extend_from_slice(&secondary.to_le_bytes());
+            new_tail.extend_from_slice(&[0u8; 12]);
+            new_tail.extend_from_slice(&rest);
+            self.tail = new_tail;
+        } else if self.tail.len() < 16 {
+            self.tail.resize(16, 0);
+        }
+        self.version = 9;
+    }
+
     /// Writes the six signed magic words back into `self.tail[4..16]` for FAMI
     /// versions > 8, preserving the secondary-house word (`tail[0..4]`) and any
     /// bytes past offset 16. Returns `false` if the family version or tail does

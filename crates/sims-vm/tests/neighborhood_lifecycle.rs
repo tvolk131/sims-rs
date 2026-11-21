@@ -192,6 +192,34 @@ fn move_in_unit_validation_and_accounting() {
         })
     ));
 
+    // Secondary-house occupancy check (`0x425d95`): a family owning house 4 as
+    // its secondary house blocks another family from moving in AND cannot move
+    // in from the Family Bin itself.
+    {
+        let mut nh_sec = store.load_neighborhood("TestNH").unwrap().unwrap();
+        nh_sec.families.get_mut(&3).unwrap().set_secondary_house(4);
+        store.save_neighborhood("TestNH", &nh_sec).unwrap();
+        assert!(matches!(
+            move_in_with_multiplier(&store, "TestNH", 2, 4, DEFAULT_ARCH_VALUE_MULTIPLIER),
+            Err(LifecycleError::LotOccupied {
+                house: 4,
+                family: 3
+            })
+        ));
+        nh_sec.families.get_mut(&3).unwrap().set_secondary_house(0);
+        nh_sec.families.get_mut(&2).unwrap().set_secondary_house(8);
+        store.save_neighborhood("TestNH", &nh_sec).unwrap();
+        assert!(matches!(
+            move_in_with_multiplier(&store, "TestNH", 2, 4, DEFAULT_ARCH_VALUE_MULTIPLIER),
+            Err(LifecycleError::FamilyNotInBin {
+                family: 2,
+                house: 8
+            })
+        ));
+        nh_sec.families.get_mut(&2).unwrap().set_secondary_house(0);
+        store.save_neighborhood("TestNH", &nh_sec).unwrap();
+    }
+
     // Success case:
     let expected_price = 5_500 + ((10_000.0_f32 * DEFAULT_ARCH_VALUE_MULTIPLIER) as i32);
     let report =
@@ -234,7 +262,7 @@ fn goth_to_newbie_to_goth_round_trip_preserves_and_propagates_state() {
     let goth_funds = goth.world().budget.funds;
     let goth_objects = goth.world().objects.len();
 
-    let save_goth = save_and_leave_lot(&root, &store, "UserData", &goth).unwrap();
+    let save_goth = save_and_leave_lot(&root, &store, "UserData", &mut goth).unwrap();
     assert_eq!(save_goth.house, 5);
     assert_eq!(save_goth.family, 5);
     assert_eq!(save_goth.budget, goth_funds);
@@ -247,7 +275,7 @@ fn goth_to_newbie_to_goth_round_trip_preserves_and_propagates_state() {
     }
     assert_eq!(newbie.ticks(), 20);
     let newbie_funds = newbie.world().budget.funds;
-    let save_newbie = save_and_leave_lot(&root, &store, "UserData", &newbie).unwrap();
+    let save_newbie = save_and_leave_lot(&root, &store, "UserData", &mut newbie).unwrap();
     assert_eq!(save_newbie.house, 7);
     assert_eq!(save_newbie.family, 1);
     assert_eq!(save_newbie.budget, newbie_funds);
@@ -326,7 +354,7 @@ fn move_in_enter_save_and_evict_family_bin_household_on_empty_lot() {
     for _ in 0..5 {
         lot4.step().unwrap();
     }
-    let saved = save_and_leave_lot(&root, &store, "UserData", &lot4).unwrap();
+    let saved = save_and_leave_lot(&root, &store, "UserData", &mut lot4).unwrap();
     assert_eq!(saved.house, 4);
     assert_eq!(saved.family, bin_fam_id);
     let after_save = store.load_neighborhood("UserData").unwrap().unwrap();
@@ -389,29 +417,234 @@ fn evict_then_bulldoze_goth_house_5_and_re_move_in() {
         goth_before.architecture_value
     );
 
-    // 2. Bulldoze unoccupied House 5: clears walls, floors, doors, windows,
-    //    and pool so the lot price returns to bare lot_value ($7,000).
+    // 1b. Move Goths back onto the EVICTED saved lot and verify all 3 family
+    //     members actually arrive via `visit_objects` (`Portal - Pedestrian`)!
+    let moved_shell = move_in(&root, &store, "UserData", 5, 5).unwrap();
+    assert_eq!(moved_shell.lot_price, shell_price);
+    let no_frames = Frames::parse("none").unwrap();
+    let mut shell_lot = enter_lot(&root, &store, "UserData", 5, &[3], no_frames.clone()).unwrap();
+    assert_eq!(
+        shell_lot.world().people.len(),
+        3,
+        "evicted saved lot must spawn all 3 Goth residents on move-in entry"
+    );
+    assert!(
+        shell_lot.world().objects.values().any(|o| o.selected),
+        "a Goth resident must be selected on evicted saved lot entry"
+    );
+    for _ in 0..5 {
+        shell_lot.step().unwrap();
+    }
+    save_and_leave_lot(&root, &store, "UserData", &mut shell_lot).unwrap();
+
+    // 2. Bulldoze occupied House 5: evicts Goths cleanly, clears walls, floors,
+    //    doors, windows, pool, and deletes tombstone character files (`0x426fcd`).
+    let chars_before = store.load_character_files("UserData").unwrap().len();
     let dozed = bulldoze(&root, &store, "UserData", 5).unwrap();
-    assert_eq!(dozed.evicted_family, None);
-    assert_eq!(dozed.refund, 0);
+    assert_eq!(dozed.evicted_family, Some(5));
     assert!(dozed.cleared_tiles > 0);
+    assert!(dozed.deleted_tombstones >= 1);
     assert_eq!(dozed.remaining_objects_value, 0);
     assert_eq!(dozed.remaining_architecture_value, 0);
     assert_eq!(
         lot_price(&store, "UserData", 5, DEFAULT_ARCH_VALUE_MULTIPLIER).unwrap(),
         7_000
     );
+    assert!(
+        store.load_character_files("UserData").unwrap().len() < chars_before,
+        "bulldoze must remove deleted tombstone character files from REDB"
+    );
+    // Deleted tombstone GUID (0x7757D9EE) must stay gone when entering another lot.
+    let newbie_after_doze =
+        enter_lot(&root, &store, "UserData", 7, &[3], no_frames.clone()).unwrap();
+    assert!(
+        newbie_after_doze
+            .world()
+            .neighbors
+            .first_of(0x7757_D9EE)
+            .is_none(),
+        "deleted tombstone GUID 0x7757D9EE must not reappear on reload"
+    );
 
-    // 3. Move the Goths back onto their freshly bulldozed lot and enter it!
+    // 3. Move the Goths back onto their freshly bulldozed lot and verify all 3
+    //    Goth members arrive and one is selected!
+    let nh_after_doze = store.load_neighborhood("UserData").unwrap().unwrap();
+    let goth_budget_after_doze = nh_after_doze.families[&5].budget;
     let moved_back = move_in(&root, &store, "UserData", 5, 5).unwrap();
     assert_eq!(moved_back.lot_price, 7_000);
-    assert_eq!(moved_back.budget_after, expected_net_worth - 7_000);
-    let no_frames = Frames::parse("none").unwrap();
+    assert_eq!(moved_back.budget_after, goth_budget_after_doze - 7_000);
     let mut lot5 = enter_lot(&root, &store, "UserData", 5, &[3], no_frames).unwrap();
-    assert_eq!(lot5.world().budget.funds, expected_net_worth - 7_000);
+    assert_eq!(lot5.world().budget.funds, goth_budget_after_doze - 7_000);
     assert_eq!(lot5.world().globals[0], 7);
+    assert_eq!(
+        lot5.world().people.len(),
+        3,
+        "bulldozed saved lot must spawn all 3 Goth residents on move-in entry"
+    );
+    assert!(
+        lot5.world().objects.values().any(|o| o.selected),
+        "a Goth resident must be selected on bulldozed saved lot entry"
+    );
+    assert!(
+        lot5.world().neighbors.first_of(0x7757_D9EE).is_none(),
+        "deleted tombstone GUID 0x7757D9EE must not reappear on House 5"
+    );
     for _ in 0..5 {
         lot5.step().unwrap();
+    }
+}
+
+#[test]
+fn stale_revision_and_cross_neighborhood_saves_are_rejected() {
+    let Some(root) = install() else {
+        return;
+    };
+    let db = TempDb::new("stale-and-cross");
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    store
+        .import_directory("nh_a", &root.join("UserData"), 0xff)
+        .unwrap();
+    store
+        .import_directory("nh_b", &root.join("UserData"), 0xff)
+        .unwrap();
+    let no_frames = Frames::parse("none").unwrap();
+
+    // 1. Cross-neighborhood save rejected without mutating target neighborhood.
+    let mut goth_a = enter_lot(&root, &store, "nh_a", 5, &[3], no_frames.clone()).unwrap();
+    let b_before = store.load_neighborhood("nh_b").unwrap().unwrap();
+    assert!(matches!(
+        save_and_leave_lot(&root, &store, "nh_b", &mut goth_a),
+        Err(LifecycleError::NeighborhoodMismatch { .. })
+    ));
+    assert_eq!(store.load_neighborhood("nh_b").unwrap().unwrap(), b_before);
+    assert!(store.load_saved_lot("nh_b", 5).unwrap().is_none());
+
+    // 2. Repeated saves on the SAME open lot advance tracked revision cleanly.
+    let r1 = save_and_leave_lot(&root, &store, "nh_a", &mut goth_a).unwrap();
+    let r2 = save_and_leave_lot(&root, &store, "nh_a", &mut goth_a).unwrap();
+    assert_eq!(r2.revision, r1.revision + 1);
+
+    // 3. Stale save after another committed mutation (`move_in` on House 4) is
+    //    rejected and leaves Family 2 in House 4 untouched.
+    move_in(&root, &store, "nh_a", 2, 4).unwrap();
+    assert!(matches!(
+        save_and_leave_lot(&root, &store, "nh_a", &mut goth_a),
+        Err(LifecycleError::StaleNeighborhood { .. })
+    ));
+    let a_after = store.load_neighborhood("nh_a").unwrap().unwrap();
+    assert_eq!(a_after.families[&2].house, 4);
+}
+
+#[test]
+fn runtime_made_character_persists_across_base_and_saved_lot_reentry() {
+    let Some(root) = install() else {
+        return;
+    };
+    let db = TempDb::new("made-char");
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    store
+        .import_directory("UserData", &root.join("UserData"), 0xff)
+        .unwrap();
+    let no_frames = Frames::parse("none").unwrap();
+
+    // Save Goth House 5 first so House 5 is a saved lot while House 7 stays base.
+    let mut goth = enter_lot(&root, &store, "UserData", 5, &[3], no_frames.clone()).unwrap();
+    save_and_leave_lot(&root, &store, "UserData", &mut goth).unwrap();
+
+    // Persist a runtime-made character (`Make New Character`, primitive 19)
+    // alongside its NBRS record directly in the stored neighborhood.
+    let mut nh = store.load_neighborhood("UserData").unwrap().unwrap();
+    let template_guid = nh.families[&5].members[0];
+    let made_guid = 0xDEAD_BEEFu32;
+    let next_id = nh
+        .neighbors
+        .iter()
+        .flatten()
+        .map(|n| n.id)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    nh.made_characters.made.insert(
+        made_guid,
+        sims_sim::characters::Character {
+            template: template_guid,
+            file: 999,
+            strings: BTreeMap::new(),
+        },
+    );
+    nh.made_characters.next_file = 1000;
+    nh.neighbors
+        .push(Some(sims_formats::neighborhood::Neighbor {
+            version: 10,
+            version_extra: Some(1),
+            name: "RuntimeMade".into(),
+            unknown_zero: 0,
+            person_mode: 9,
+            person_data: vec![0; sims_sim::neighbors::PERSON_WORDS],
+            id: next_id,
+            guid: made_guid,
+            unknown_negative: -1,
+            relationships: Vec::new(),
+        }));
+    store.save_neighborhood("UserData", &nh).unwrap();
+
+    // Both saved lot (House 5) and base lot (House 7) must open cleanly with
+    // the runtime-made character intact in `world.neighbors` and `made`.
+    let goth_re = enter_lot(&root, &store, "UserData", 5, &[3], no_frames.clone()).unwrap();
+    assert!(goth_re.world().neighbors.first_of(made_guid).is_some());
+    assert!(goth_re.world().characters.made.contains_key(&made_guid));
+
+    let newbie_base = enter_lot(&root, &store, "UserData", 7, &[3], no_frames).unwrap();
+    assert!(newbie_base.world().neighbors.first_of(made_guid).is_some());
+    assert!(newbie_base.world().characters.made.contains_key(&made_guid));
+}
+
+#[test]
+fn base_house_enter_lot_errors_when_visit_objects_stops() {
+    let Some(root) = install() else {
+        return;
+    };
+    let db = TempDb::new("house56-stopped");
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    store
+        .import_directory("UserData", &root.join("UserData"), 0xff)
+        .unwrap();
+    let no_frames = Frames::parse("none").unwrap();
+    // House 56 stops mid-visit in `visit_objects`; `enter_lot` must return Err
+    // rather than an incomplete `Lot`.
+    let err = enter_lot(&root, &store, "UserData", 56, &[3], no_frames)
+        .err()
+        .expect("House 56 incomplete load must return Err");
+    assert!(
+        err.to_string().contains("did not finish"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn userdata2_v7_family_upgrades_to_v9_and_persists_magic_history() {
+    let Some(root) = install() else {
+        return;
+    };
+    let db = TempDb::new("userdata2-v7-upgrade");
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    store
+        .import_directory("UserData2", &root.join("UserData2"), 0xff)
+        .unwrap();
+    let before = store.load_neighborhood("UserData2").unwrap().unwrap();
+    let fam_before = before.family_in(9).expect("UserData2 House 9 occupied").1;
+    assert_eq!(fam_before.version, 7);
+
+    let no_frames = Frames::parse("none").unwrap();
+    let mut lot9 = enter_lot(&root, &store, "UserData2", 9, &[3], no_frames).unwrap();
+    save_and_leave_lot(&root, &store, "UserData2", &mut lot9).unwrap();
+
+    let after = store.load_neighborhood("UserData2").unwrap().unwrap();
+    for fam in after.families.values() {
+        assert_eq!(
+            fam.version, 9,
+            "all families upgrade to v9 on save (0x410696)"
+        );
     }
 }
 

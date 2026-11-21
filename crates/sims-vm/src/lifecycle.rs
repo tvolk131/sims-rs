@@ -153,6 +153,15 @@ pub enum LifecycleError {
         available: i32,
         required: i32,
     },
+    NeighborhoodMismatch {
+        expected: String,
+        actual: String,
+    },
+    StaleNeighborhood {
+        neighborhood: String,
+        expected_revision: u64,
+        current_revision: u64,
+    },
     Lot(String),
 }
 
@@ -198,6 +207,19 @@ impl fmt::Display for LifecycleError {
             } => write!(
                 f,
                 "family {family} has ${available} but house {house} costs ${required}"
+            ),
+            Self::NeighborhoodMismatch { expected, actual } => write!(
+                f,
+                "lot was opened from neighborhood {expected:?}, cannot save into {actual:?}"
+            ),
+            Self::StaleNeighborhood {
+                neighborhood,
+                expected_revision,
+                current_revision,
+            } => write!(
+                f,
+                "neighborhood {neighborhood:?} changed since lot was opened (expected revision \
+                 {expected_revision}, store is at revision {current_revision})"
             ),
             Self::Lot(message) => write!(f, "{message}"),
         }
@@ -543,10 +565,14 @@ fn architecture_value_and_built(world: &World, prices: &LotPrices) -> (i32, bool
                 }
                 if level == 0
                     && let Some(pool) = array(POOL_ARRAY, 1)
-                    && pool[cell] < POOL_TILE_LIMIT
                 {
-                    built = true;
-                    rest = rest.wrapping_add(prices.pool);
+                    if pool[cell] < POOL_TILE_LIMIT {
+                        built = true;
+                        rest = rest.wrapping_add(prices.pool);
+                    } else if pool[cell] == POOL_TILE_LIMIT {
+                        // 0x47b1cc: pool byte 0x10 marks global 22 built at zero cost.
+                        built = true;
+                    }
                 }
             }
         }
@@ -941,10 +967,15 @@ pub fn move_in_with_multiplier(
     if family.members.is_empty() {
         return Err(LifecycleError::FamilyEmpty { family: family_id });
     }
-    if family.house != 0 {
+    if family.house != 0 || family.secondary_house() != 0 {
+        let occupied = if family.house != 0 {
+            family.house
+        } else {
+            family.secondary_house()
+        };
         return Err(LifecycleError::FamilyNotInBin {
             family: family_id,
-            house: family.house,
+            house: occupied,
         });
     }
     let house_i16 = i16::try_from(house).ok();
@@ -1056,6 +1087,12 @@ impl StoreRuntime {
             program.character_files =
                 crate::program::character_files(&index, Path::new(Index::CHARACTERS));
         }
+        program
+            .characters
+            .extend(stored.made_characters.made.keys().copied());
+        program
+            .character_files
+            .extend(stored.made_characters.made.values().map(|c| c.file));
         let surfaces = Surfaces::build(&install).map_err(|e| LifecycleError::Lot(e.to_string()))?;
         let tuning = NeighborhoodTuning::from_program(&program);
         Ok(Self {
@@ -1068,6 +1105,32 @@ impl StoreRuntime {
             stored,
         })
     }
+}
+
+/// Builds the definition registry for `World::read_neighbors`, including any
+/// runtime-created character definitions persisted in `made_characters`
+/// (`Make New Character`, primitive 19 / `0x43c3b2`).
+fn neighborhood_registry(
+    index: &Index,
+    catalog: &Catalog,
+    made: &sims_sim::characters::Characters,
+) -> Vec<sims_sim::neighbors::Registered> {
+    let mut reg = registry(index, catalog);
+    let existing: BTreeSet<u32> = reg.iter().map(|entry| entry.guid).collect();
+    for (&guid, character) in &made.made {
+        if existing.contains(&guid) {
+            continue;
+        }
+        let kind = catalog
+            .object(character.template)
+            .map_or(2, |object| object.kind);
+        reg.push(sims_sim::neighbors::Registered {
+            guid,
+            kind,
+            resolves: true,
+        });
+    }
+    reg
 }
 
 /// Enters `house` in `neighborhood_id` from REDB without reading or modifying
@@ -1120,7 +1183,15 @@ pub fn enter_lot_with(
         });
     }
     if let Some(saved_bytes) = saved_lot {
-        boot_from_saved_lot(runtime, house, &saved_bytes, answers, frames, view_centre)
+        boot_from_saved_lot(
+            runtime,
+            neighborhood_id,
+            house,
+            &saved_bytes,
+            answers,
+            frames,
+            view_centre,
+        )
     } else {
         boot_from_base_house(
             runtime,
@@ -1141,6 +1212,7 @@ pub fn enter_lot_with(
 /// [`StoredNeighborhood`].
 fn boot_from_saved_lot(
     runtime: StoreRuntime,
+    neighborhood_id: &str,
     house: u32,
     saved_bytes: &[u8],
     answers: &[u8],
@@ -1164,9 +1236,10 @@ fn boot_from_saved_lot(
         stored,
         ..
     } = runtime;
+    let origin_revision = stored.revision;
 
     let mut world = saved.world;
-    let reg = registry(&index, &catalog);
+    let reg = neighborhood_registry(&index, &catalog, &stored.made_characters);
     let content_nh = stored.to_content_neighborhood();
     world
         .read_neighbors(&content_nh, &reg)
@@ -1201,23 +1274,37 @@ fn boot_from_saved_lot(
             ),
             None => (0u16, 0, 0, Vec::new(), None),
         };
-    let residents_before = world.residents();
-    world
-        .select_family(
-            i16::try_from(family_id).map_err(|e| LifecycleError::Lot(e.to_string()))?,
-            i16::try_from(house).map_err(|e| LifecycleError::Lot(e.to_string()))?,
-            family_budget,
-            family_magic,
-        )
-        .map_err(|e| LifecycleError::Lot(e.to_string()))?;
-
     let effective_view_centre = view_centre.or(saved.view_centre);
+    let new_move_in = family_id != 0 && family_flags & FAMILY_FLAG_NEW_MOVE_IN != 0;
     let sim = {
         let interpreter = Interpreter {
             view_rotation: saved.view_rotation,
             view_centre: effective_view_centre,
             ..Interpreter::new(&program, &catalog, Stream::Global)
         };
+        // When a household moves into a previously saved (evicted or bulldozed)
+        // lot, run the native `cHouse::Load` controller-reconciliation and
+        // load-visit steps (`0x440328` -> `0x42830d` -> `0x43fc94` -> `0x42848d`)
+        // so global controllers removed by `evict`/`bulldoze` (including
+        // `VisitGenerator`, whose `"reset lot"` tree spawns the arriving
+        // household) are recreated before household selection and `"reset lot"`.
+        if new_move_in {
+            let _ = interpreter
+                .reconcile_controllers(&mut world)
+                .map_err(|e| LifecycleError::Lot(format!("reconciling controllers: {e}")))?;
+            let _ = world.discard_removals();
+        }
+
+        let residents_before = world.residents();
+        world
+            .select_family(
+                i16::try_from(family_id).map_err(|e| LifecycleError::Lot(e.to_string()))?,
+                i16::try_from(house).map_err(|e| LifecycleError::Lot(e.to_string()))?,
+                family_budget,
+                family_magic,
+            )
+            .map_err(|e| LifecycleError::Lot(e.to_string()))?;
+
         // Re-attach every live person's persistent fields from the latest NBRS
         // records (0x4258a3) so cross-lot edits propagate cleanly.
         for person_id in world.people.clone() {
@@ -1233,36 +1320,70 @@ fn boot_from_saved_lot(
                     })?;
             }
         }
-        finish_selection_for_lifecycle(
-            &interpreter,
-            &mut world,
-            house,
-            family_id,
-            family_flags,
-            &family_members,
-            &residents_before,
-            tuning,
-        )?;
-        let _ = interpreter
-            .ensure_indicators(&mut world)
-            .map_err(|e| LifecycleError::Lot(e.to_string()))?;
-        let sim = if family_id != 0 && selected(&world).is_none() {
-            interpreter
+        if new_move_in {
+            let visited = interpreter.visit_objects(&mut world, &program.people);
+            if let Some(fault) = visited.stopped {
+                return Err(LifecycleError::Lot(format!(
+                    "house {house} load did not finish: {fault}"
+                )));
+            }
+            let _ = interpreter
+                .ensure_indicators(&mut world)
+                .map_err(|e| LifecycleError::Lot(e.to_string()))?;
+            finish_selection_for_lifecycle(
+                &interpreter,
+                &mut world,
+                house,
+                family_id,
+                family_flags,
+                &family_members,
+                &residents_before,
+                tuning,
+            )?;
+            let _ = interpreter
+                .announce_house(&mut world)
+                .map_err(|e| LifecycleError::Lot(e.to_string()))?;
+            let sim = interpreter
                 .select_resident(&mut world, family_budget, &family_members)
-                .map_err(|e| LifecycleError::Lot(e.to_string()))?
-        } else {
-            selected(&world)
-        };
-        if family_id != 0 && (family_flags & FAMILY_FLAG_NEW_MOVE_IN != 0 || world.globals[19] != 0)
-        {
+                .map_err(|e| LifecycleError::Lot(e.to_string()))?;
             interpreter
                 .go_live(&mut world)
                 .map_err(|e| LifecycleError::Lot(e.to_string()))?;
             let _ = interpreter
                 .before_frame(&mut world)
                 .map_err(|e| LifecycleError::Lot(e.to_string()))?;
+            sim
+        } else {
+            finish_selection_for_lifecycle(
+                &interpreter,
+                &mut world,
+                house,
+                family_id,
+                family_flags,
+                &family_members,
+                &residents_before,
+                tuning,
+            )?;
+            let _ = interpreter
+                .ensure_indicators(&mut world)
+                .map_err(|e| LifecycleError::Lot(e.to_string()))?;
+            let sim = if family_id != 0 && selected(&world).is_none() {
+                interpreter
+                    .select_resident(&mut world, family_budget, &family_members)
+                    .map_err(|e| LifecycleError::Lot(e.to_string()))?
+            } else {
+                selected(&world)
+            };
+            if family_id != 0 && world.globals[19] != 0 {
+                interpreter
+                    .go_live(&mut world)
+                    .map_err(|e| LifecycleError::Lot(e.to_string()))?;
+                let _ = interpreter
+                    .before_frame(&mut world)
+                    .map_err(|e| LifecycleError::Lot(e.to_string()))?;
+            }
+            sim
         }
-        sim
     };
 
     let mut load = LoadReport {
@@ -1307,6 +1428,7 @@ fn boot_from_saved_lot(
         buy_undo: Vec::new(),
         buy_redo: Vec::new(),
         buy_orphans: Vec::new(),
+        neighborhood_origin: Some((neighborhood_id.to_owned(), origin_revision)),
     })
 }
 
@@ -1333,6 +1455,7 @@ fn boot_from_base_house(
         tuning,
         stored,
     } = runtime;
+    let origin_revision = stored.revision;
 
     let virtual_path = PathBuf::from(format!("{neighborhood_id}/Houses/House{house:02}.iff"));
     let file = House::parse_bytes(bytes, &virtual_path, &catalog)
@@ -1353,8 +1476,9 @@ fn boot_from_base_house(
             .skeleton_files
             .extend(crate::objects::read_before_the_first_load(&program.people));
         let content_nh = stored.to_content_neighborhood();
+        let reg = neighborhood_registry(&index, &catalog, &stored.made_characters);
         world
-            .read_neighbors(&content_nh, &registry(&index, &catalog))
+            .read_neighbors(&content_nh, &reg)
             .map_err(|e| LifecycleError::Lot(e.to_string()))?;
         world
             .drop_empty_families()
@@ -1507,48 +1631,51 @@ fn boot_from_base_house(
         load.visited = visited.objects.len();
         load.reset = visited.reset.len();
         load.stopped = visited.stopped.map(|fault| fault.to_string());
-
-        if load.stopped.is_none() {
-            let made = interpreter
-                .ensure_indicators(&mut world)
-                .map_err(|e| LifecycleError::Lot(e.to_string()))?
-                .is_some();
-            finish_selection_for_lifecycle(
-                &interpreter,
-                &mut world,
-                house,
-                family_id,
-                family_flags,
-                &family_members,
-                &residents,
-                tuning,
-            )?;
-            let made_again = interpreter
-                .announce_house(&mut world)
-                .map_err(|e| LifecycleError::Lot(e.to_string()))?
-                .is_some();
-            let sim = if enter_live && family_id != 0 {
-                interpreter
-                    .select_resident(&mut world, family_budget, &family_members)
-                    .map_err(|e| LifecycleError::Lot(e.to_string()))?
-            } else {
-                None
-            };
-            if enter_live {
-                interpreter
-                    .go_live(&mut world)
-                    .map_err(|e| LifecycleError::Lot(e.to_string()))?;
-            }
-            let counted = interpreter
-                .before_frame(&mut world)
-                .map_err(|e| LifecycleError::Lot(e.to_string()))?
-                .len();
-            load.finished = Some(Finished {
-                indicators_made: made || made_again,
-                sim,
-                counted,
-            });
+        if let Some(reason) = &load.stopped {
+            return Err(LifecycleError::Lot(format!(
+                "house {house} load did not finish: {reason}"
+            )));
         }
+
+        let made = interpreter
+            .ensure_indicators(&mut world)
+            .map_err(|e| LifecycleError::Lot(e.to_string()))?
+            .is_some();
+        finish_selection_for_lifecycle(
+            &interpreter,
+            &mut world,
+            house,
+            family_id,
+            family_flags,
+            &family_members,
+            &residents,
+            tuning,
+        )?;
+        let made_again = interpreter
+            .announce_house(&mut world)
+            .map_err(|e| LifecycleError::Lot(e.to_string()))?
+            .is_some();
+        let sim = if enter_live && family_id != 0 {
+            interpreter
+                .select_resident(&mut world, family_budget, &family_members)
+                .map_err(|e| LifecycleError::Lot(e.to_string()))?
+        } else {
+            None
+        };
+        if enter_live {
+            interpreter
+                .go_live(&mut world)
+                .map_err(|e| LifecycleError::Lot(e.to_string()))?;
+        }
+        let counted = interpreter
+            .before_frame(&mut world)
+            .map_err(|e| LifecycleError::Lot(e.to_string()))?
+            .len();
+        load.finished = Some(Finished {
+            indicators_made: made || made_again,
+            sim,
+            counted,
+        });
     }
 
     let saved_instances = &file.objects.instances;
@@ -1585,6 +1712,7 @@ fn boot_from_base_house(
         buy_undo: Vec::new(),
         buy_redo: Vec::new(),
         buy_orphans: Vec::new(),
+        neighborhood_origin: Some((neighborhood_id.to_owned(), origin_revision)),
     })
 }
 
@@ -1593,11 +1721,17 @@ fn boot_from_base_house(
 /// `Sims.exe` 1.91 `SaveCurrentHouse` (`0x428687`) → `cHouse::Save`
 /// (`0x41615d`) → `cXObjectManager::Save` (`0x43fb1b`) → `cTSNeighborhood::Save`
 /// (`0x4252cc`).
+///
+/// Rejects lots opened from a different neighborhood
+/// ([`LifecycleError::NeighborhoodMismatch`]) or whose neighborhood revision
+/// changed since the lot was opened ([`LifecycleError::StaleNeighborhood`]),
+/// and advances the lot's tracked revision after a successful save so repeated
+/// saves from the same live lot continue to succeed.
 pub fn save_and_leave_lot(
     install_root: &Path,
     store: &NeighborhoodStore,
     neighborhood_id: &str,
-    lot: &Lot,
+    lot: &mut Lot,
 ) -> Result<SaveReport, LifecycleError> {
     save_and_leave_lot_inner(install_root, store, neighborhood_id, lot, None)
 }
@@ -1608,7 +1742,7 @@ pub fn save_and_leave_lot_without_buy_cursor(
     install_root: &Path,
     store: &NeighborhoodStore,
     neighborhood_id: &str,
-    lot: &Lot,
+    lot: &mut Lot,
     cursor: &BuyCursor,
 ) -> Result<SaveReport, LifecycleError> {
     save_and_leave_lot_inner(install_root, store, neighborhood_id, lot, Some(cursor))
@@ -1618,18 +1752,38 @@ fn save_and_leave_lot_inner(
     install_root: &Path,
     store: &NeighborhoodStore,
     neighborhood_id: &str,
-    lot: &Lot,
+    lot: &mut Lot,
     cursor: Option<&BuyCursor>,
 ) -> Result<SaveReport, LifecycleError> {
+    let Some((ref origin_neighborhood, expected_revision)) = lot.neighborhood_origin else {
+        return Err(LifecycleError::Lot(
+            "lot was not opened from a NeighborhoodStore".into(),
+        ));
+    };
+    if origin_neighborhood != neighborhood_id {
+        return Err(LifecycleError::NeighborhoodMismatch {
+            expected: origin_neighborhood.clone(),
+            actual: neighborhood_id.to_owned(),
+        });
+    }
+
+    let mut stored = store
+        .load_neighborhood(neighborhood_id)?
+        .ok_or_else(|| LifecycleError::NeighborhoodNotFound(neighborhood_id.to_owned()))?;
+    if stored.revision != expected_revision {
+        return Err(LifecycleError::StaleNeighborhood {
+            neighborhood: neighborhood_id.to_owned(),
+            expected_revision,
+            current_revision: stored.revision,
+        });
+    }
+
     let mut saved = match cursor {
         Some(cursor) => lot.save_without_buy_cursor(cursor),
         None => lot.save(),
     }
     .map_err(|e| LifecycleError::Lot(e.to_string()))?;
 
-    let mut stored = store
-        .load_neighborhood(neighborhood_id)?
-        .ok_or_else(|| LifecycleError::NeighborhoodNotFound(neighborhood_id.to_owned()))?;
     let install = Install::detect(install_root).map_err(|e| LifecycleError::Lot(e.to_string()))?;
     let prices = LotPrices::load(&install, &lot.surfaces);
     let tuning = NeighborhoodTuning::from_program(&lot.program);
@@ -1669,7 +1823,8 @@ fn save_and_leave_lot_inner(
     let objects_value = saved.world.budget.objects_value;
     let architecture_value = saved.world.budget.architecture_value;
 
-    // 3. Write back neighborhood state (0x428687 → 0x4252cc) and commit atomically.
+    // 3. Write back neighborhood state (0x428687 → 0x4252cc) and commit atomically
+    // with an in-transaction revision check.
     stored.write_back_world(
         &saved.world,
         house,
@@ -1679,7 +1834,24 @@ fn save_and_leave_lot_inner(
         tuning.friendship_threshold,
     );
     let lot_bytes = saved.encode();
-    store.save_lot_and_neighborhood(neighborhood_id, house, &lot_bytes, &stored)?;
+    match store.save_lot_and_neighborhood_checked(
+        neighborhood_id,
+        house,
+        Some(expected_revision),
+        &lot_bytes,
+        &stored,
+        &[],
+    )? {
+        Ok(()) => {}
+        Err(current) => {
+            return Err(LifecycleError::StaleNeighborhood {
+                neighborhood: neighborhood_id.to_owned(),
+                expected_revision,
+                current_revision: current,
+            });
+        }
+    }
+    lot.neighborhood_origin = Some((neighborhood_id.to_owned(), stored.revision));
 
     Ok(SaveReport {
         neighborhood: neighborhood_id.to_owned(),
@@ -1745,6 +1917,7 @@ fn evict_or_bulldoze(
     bulldoze: bool,
 ) -> Result<BulldozeReport, LifecycleError> {
     let mut runtime = StoreRuntime::build(install_root, store, neighborhood_id)?;
+    let origin_revision = runtime.stored.revision;
     let evicted = runtime
         .stored
         .family_in(house)
@@ -1762,12 +1935,53 @@ fn evict_or_bulldoze(
         });
     }
 
-    // 0x4273d1: clear `family.house = 0` BEFORE loading the lot so the load
-    // selects no household and never runs a pending move-in reset.
+    // Map loose `Characters` files to their catalog GUIDs before `runtime` is
+    // consumed so bulldoze tombstone deletion (`0x426fcd` → `0x46b42a`) can
+    // remove the deleted character's file from `NEIGHBORHOOD_CHARACTERS`.
+    let mut char_file_by_guid: BTreeMap<u32, String> = BTreeMap::new();
+    let mut guids_per_char_file: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
+    if bulldoze
+        && let Some(char_mount) = runtime
+            .index
+            .mounts
+            .iter()
+            .position(|m| m.path == Index::CHARACTERS)
+    {
+        for object in &runtime.catalog.objects {
+            let Some(res) = runtime.index.resources.get(object.resource) else {
+                continue;
+            };
+            if res.mount == char_mount && res.member.is_none() {
+                let rel = res
+                    .path
+                    .strip_prefix(Path::new(Index::CHARACTERS))
+                    .unwrap_or(&res.path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                char_file_by_guid.insert(object.guid, rel.clone());
+                guids_per_char_file
+                    .entry(rel)
+                    .or_default()
+                    .insert(object.guid);
+            }
+        }
+    }
+
+    // 0x4273d1: clear `family.house = 0` (or `secondary_house = 0` when the
+    // family owns this lot as its secondary residence, `0x425d95`) BEFORE
+    // loading the lot so the load selects no household and never runs a
+    // pending move-in reset.
+    let house_i32 = i32::try_from(house).map_err(|e| LifecycleError::Lot(e.to_string()))?;
+    let mut cleared_secondary = false;
     if let Some((evicted_id, _)) = &evicted
         && let Some(fam) = runtime.stored.families.get_mut(evicted_id)
     {
-        fam.house = 0;
+        if fam.house == house_i32 {
+            fam.house = 0;
+        } else if fam.secondary_house() == house_i32 {
+            fam.set_secondary_house(0);
+            cleared_secondary = true;
+        }
     }
 
     let mut stored = runtime.stored.clone();
@@ -1776,7 +1990,15 @@ fn evict_or_bulldoze(
 
     // Load the lot (from saved lot if present, else base HouseXX.iff).
     let mut lot = if let Some(saved_bytes) = saved_lot {
-        boot_from_saved_lot(runtime, house, &saved_bytes, &[], Frames::default(), None)?
+        boot_from_saved_lot(
+            runtime,
+            neighborhood_id,
+            house,
+            &saved_bytes,
+            &[],
+            Frames::default(),
+            None,
+        )?
     } else {
         boot_from_base_house(
             runtime,
@@ -1849,22 +2071,14 @@ fn evict_or_bulldoze(
         route.contexts.clear();
     }
 
-    // Walk remaining non-person objects, restarting scan as 0x427528 does
-    // after each removal (since deleting a multi-tile group or container
-    // deletes multiple IDs at once).
+    // Walk every registered non-person object (including non-lead tiles of a
+    // multi-tile group, matching `0x42749a..0x427528`), restarting the scan
+    // after each removal since deleting a multi-tile group or container removes
+    // multiple IDs at once.
     loop {
         let mut next_victim = None;
         for id in lot.world.order.clone() {
-            if lot.world.indicators.contains(&id) {
-                continue;
-            }
-            let Some(obj) = lot.world.objects.get(&id) else {
-                continue;
-            };
-            // Skip non-lead tiles of a multi-tile group; the lead removes all.
-            if let Some(part) = &obj.multipart
-                && part.parent != 0
-            {
+            if lot.world.indicators.contains(&id) || !lot.world.objects.contains_key(&id) {
                 continue;
             }
             let in_container = crate::placement::capture(&mut lot.world, id)
@@ -1886,6 +2100,11 @@ fn evict_or_bulldoze(
             .map_err(|e| LifecycleError::Lot(format!("removing object {victim}: {e}")))?;
         removed_objects += count_before.saturating_sub(lot.world.objects.len());
     }
+    // Discard any pending removal IDs queued during `"evict lot"` or object
+    // removal (matching `cHouse::Load`'s `discard_removals`) without deleting
+    // surviving lot fixtures, so recycled object IDs on future move-ins never
+    // inherit stale `world.removals` entries.
+    let _ = lot.world.discard_removals();
 
     // 0x427536..0x427616: on bulldoze, clear non-0x20 floors & walls on levels
     // 1 and 2 and reset the pool array (Arry #9) to 0xff.
@@ -1920,17 +2139,18 @@ fn evict_or_bulldoze(
         .map_err(|e| LifecycleError::Lot(e.to_string()))?;
     lot.load.family = 0;
 
-    // 0x427697..0x4276ce: on bulldoze, remove home-bound tombstone character
-    // records (word 67 == house, belonging to no family).
+    // 0x427697..0x4276ce → 0x426fcd: on bulldoze, remove home-bound tombstone
+    // character records (word 67 == house, belonging to no family) AND delete
+    // their character files (`0x46b42a`) so reloads never recreate them.
     let mut deleted_tombstones = 0usize;
+    let mut removed_character_files: Vec<String> = Vec::new();
     if bulldoze {
-        let house_i32 = i32::try_from(house).map_err(|e| LifecycleError::Lot(e.to_string()))?;
         let member_guids: BTreeSet<u32> = stored
             .families
             .values()
             .flat_map(|f| f.members.iter().copied())
             .collect();
-        let tombstones: Vec<i16> = lot
+        let tombstones: Vec<(i16, u32)> = lot
             .world
             .neighbors
             .slots
@@ -1943,11 +2163,25 @@ fn evict_or_bulldoze(
                     && !member_guids.contains(&n.guid)
                     && i32::from(n.data.get(PERSON_HOME).copied().unwrap_or(0)) == house_i32
             })
-            .map(|n| n.id)
+            .map(|n| (n.id, n.guid))
             .collect();
-        for id in tombstones {
+        let mut deleted_guids: BTreeSet<u32> = BTreeSet::new();
+        for (id, guid) in tombstones {
             lot.world.neighbors.remove_record(id);
+            lot.world.characters.made.remove(&guid);
+            stored.made_characters.made.remove(&guid);
+            deleted_guids.insert(guid);
             deleted_tombstones += 1;
+        }
+        for guid in &deleted_guids {
+            if let Some(rel) = char_file_by_guid.get(guid)
+                && guids_per_char_file
+                    .get(rel)
+                    .is_some_and(|guids| guids.is_subset(&deleted_guids))
+                && !removed_character_files.contains(rel)
+            {
+                removed_character_files.push(rel.clone());
+            }
         }
     }
 
@@ -1967,26 +2201,47 @@ fn evict_or_bulldoze(
             .families
             .iter_mut()
             .find(|f| f.id == i32::from(family_id))
+            && !cleared_secondary
         {
             live_fam.house = 0;
         }
         if let Some(stored_fam) = stored.families.get_mut(&family_id) {
-            refund = stored_fam.architecture_value;
-            stored_fam.budget = funds_after_evict.wrapping_add(refund);
-            stored_fam.architecture_value = 0;
-            stored_fam.house = 0;
-            stored_fam.flags &= !(FAMILY_FLAG_BIT_3 | FAMILY_FLAG_NEW_MOVE_IN);
+            if cleared_secondary {
+                stored_fam.set_secondary_house(0);
+            } else {
+                refund = stored_fam.architecture_value;
+                stored_fam.budget = funds_after_evict.wrapping_add(refund);
+                stored_fam.architecture_value = 0;
+                stored_fam.house = 0;
+                stored_fam.flags &= !(FAMILY_FLAG_BIT_3 | FAMILY_FLAG_NEW_MOVE_IN);
+            }
         }
     }
 
-    // Write back updated NBRS / NGBH / TATT / FAMI and save the cleared lot
-    // atomically into REDB.
+    // Write back updated NBRS / NGBH / TATT / FAMI, delete removed tombstone
+    // character files, and save the cleared lot atomically into REDB.
     stored.write_back_world(&lot.world, house, 0, 0, None, tuning.friendship_threshold);
     let saved = lot
         .save()
         .map_err(|e| LifecycleError::Lot(format!("saving cleared lot {house}: {e}")))?;
     let lot_bytes = saved.encode();
-    store.save_lot_and_neighborhood(neighborhood_id, house, &lot_bytes, &stored)?;
+    match store.save_lot_and_neighborhood_checked(
+        neighborhood_id,
+        house,
+        Some(origin_revision),
+        &lot_bytes,
+        &stored,
+        &removed_character_files,
+    )? {
+        Ok(()) => {}
+        Err(current) => {
+            return Err(LifecycleError::StaleNeighborhood {
+                neighborhood: neighborhood_id.to_owned(),
+                expected_revision: origin_revision,
+                current_revision: current,
+            });
+        }
+    }
 
     Ok(BulldozeReport {
         house,
@@ -2025,9 +2280,10 @@ fn should_remove_on_evict_or_bulldoze(
             Ok(w) => *w,
             Err(_) => return false,
         };
-        // Off-lot global controllers (`words[42] != 0`) or objects with
-        // NOT_VALUED flag 0x10 stay; stray off-lot non-controllers are removed.
-        return words[DEF_GLOBAL_CONTROLLER] == 0 && (flags & FLAG_NOT_VALUED) == 0;
+        // 0x4274e2..0x4274e7: off-lot objects check only `words[42] == 0`
+        // (bypassing the `FLAG_NOT_VALUED` 0x10 check); global controllers stay
+        // while stray off-lot non-controllers are removed.
+        return words[DEF_GLOBAL_CONTROLLER] == 0;
     }
     if flags & FLAG_NOT_VALUED != 0 {
         return false;
@@ -2212,7 +2468,7 @@ mod tests {
             }
         }
         goth.world.mark_friends(goth_neighbor_id);
-        save_and_leave_lot(&root, &store, "UserData", &goth).unwrap();
+        save_and_leave_lot(&root, &store, "UserData", &mut goth).unwrap();
 
         // Enter Newbie House 7: Goth's NBRS, relationship, NGBH, and TATT edits
         // must be live immediately.
@@ -2274,7 +2530,7 @@ mod tests {
             }
         }
         newbie.world.mark_friends(newbie_neighbor_id);
-        save_and_leave_lot(&root, &store, "UserData", &newbie).unwrap();
+        save_and_leave_lot(&root, &store, "UserData", &mut newbie).unwrap();
 
         // Re-enter Goth House 5: Goth's lot-local state AND Newbie's cross-lot
         // edits must both be present and consistent.
@@ -2308,6 +2564,176 @@ mod tests {
                 .unwrap()
                 .values[0],
             91
+        );
+    }
+
+    #[test]
+    fn pool_byte_0x10_marks_lot_built_at_zero_cost() {
+        let mut world = World::empty();
+        world.size = 8;
+        let full = FULL_SIZE as usize;
+        world.arrays.insert(
+            TILE_FLAGS[0],
+            sims_formats::lot::Array {
+                width: full,
+                height: full,
+                stride: 1,
+                encoding: 0,
+                data: vec![0u8; full * full],
+            },
+        );
+        world.arrays.insert(
+            FLOORS[0],
+            sims_formats::lot::Array {
+                width: full,
+                height: full,
+                stride: 2,
+                encoding: 0,
+                data: vec![0u8; full * full * 2],
+            },
+        );
+        world.arrays.insert(
+            WALLS[0],
+            sims_formats::lot::Array {
+                width: full,
+                height: full,
+                stride: WALL_CELL,
+                encoding: 0,
+                data: vec![0u8; full * full * WALL_CELL],
+            },
+        );
+        let mut pool = vec![0xffu8; full * full];
+        // Cell (2, 2) has exact 0x10 sentinel (0x47b1cc: built=true, cost=0).
+        pool[2 * full + 2] = 0x10;
+        world.arrays.insert(
+            POOL_ARRAY,
+            sims_formats::lot::Array {
+                width: full,
+                height: full,
+                stride: 1,
+                encoding: 0,
+                data: pool,
+            },
+        );
+        let prices = LotPrices {
+            pool: 99,
+            ..LotPrices::default()
+        };
+        let (value, built) = architecture_value_and_built(&world, &prices);
+        assert_eq!(value, 0, "pool byte 0x10 adds zero cost");
+        assert!(built, "pool byte 0x10 still marks global 22 built");
+
+        // Cell (2, 3) with value < 0x10 adds prices.pool.
+        world.arrays.get_mut(&POOL_ARRAY).unwrap().data[2 * full + 3] = 0x05;
+        let (value2, built2) = architecture_value_and_built(&world, &prices);
+        assert_eq!(value2, 99);
+        assert!(built2);
+    }
+
+    #[test]
+    fn bulldoze_off_lot_ignores_flag_0x10_and_removes_group_from_non_lead_tile() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let db = TempDb::new("bulldoze-edge-predicates");
+        let store = NeighborhoodStore::open(&db.0).unwrap();
+        store
+            .import_directory("UserData", &root.join("UserData"), 0xff)
+            .unwrap();
+        let no_frames = Frames::parse("none").unwrap();
+        let mut goth = enter_lot(&root, &store, "UserData", 5, &[3], no_frames).unwrap();
+
+        // 1. Off-lot non-controller (`words[42] == 0`) with `FLAG_NOT_VALUED`
+        //    (0x10) set must still be marked removable on bulldoze (`0x4274e2`).
+        let interp = Interpreter::new(&goth.program, &goth.catalog, Stream::Global);
+        let off_lot_non_ctrl = goth
+            .world
+            .order
+            .iter()
+            .copied()
+            .find(|&id| {
+                !goth.world.indicators.contains(&id)
+                    && goth.world.objects[&id].person.is_none()
+                    && goth.world.objects[&id].multipart.is_none()
+                    && interp
+                        .words(&goth.world, id)
+                        .is_ok_and(|w| w[DEF_GLOBAL_CONTROLLER] == 0)
+            })
+            .expect("Goth lot has a single-tile non-controller object");
+        {
+            let obj = goth.world.objects.get_mut(&off_lot_non_ctrl).unwrap();
+            obj.position = [-16, -16, 1];
+            obj.data[DATA_FLAGS] |= FLAG_NOT_VALUED;
+        }
+        assert!(
+            should_remove_on_evict_or_bulldoze(&interp, &mut goth.world, off_lot_non_ctrl, true),
+            "off-lot non-controller with flag 0x10 must be removed on bulldoze (0x4274e2)"
+        );
+
+        // 2. Multi-tile group whose lead tile is marked `FLAG_NOT_VALUED` (0x10)
+        //    while a non-lead tile is unlocked & unflagged must still be
+        //    deleted as a whole group when `bulldoze` scans all registered IDs.
+        let (lead_id, non_lead_id) = goth
+            .world
+            .order
+            .iter()
+            .copied()
+            .find_map(|id| {
+                let obj = goth.world.objects.get(&id)?;
+                let part = obj.multipart.as_ref()?;
+                if part.parent != 0 && !goth.world.indicators.contains(&id) {
+                    Some((u16::try_from(part.parent).ok()?, id))
+                } else {
+                    None
+                }
+            })
+            .expect("Goth lot has a multi-tile object");
+        let lead_guid = goth.world.objects[&lead_id].guid;
+        // Make the lead tile fail both `valued` (set FLAG_NOT_VALUED) and the
+        // on-lot check while leaving the non-lead tile removable on bulldoze.
+        goth.world.objects.get_mut(&lead_id).unwrap().data[DATA_FLAGS] |= FLAG_NOT_VALUED;
+        goth.world.objects.get_mut(&non_lead_id).unwrap().data[DATA_FLAGS] &= !FLAG_NOT_VALUED;
+        // Also test Magic Controller (`0xb6c90029`) writeback on the same save.
+        if let Some(ctrl_id) = goth
+            .world
+            .order
+            .iter()
+            .copied()
+            .find(|&id| goth.world.objects[&id].guid == 0xb6c9_0029)
+        {
+            let attrs = &mut goth.world.objects.get_mut(&ctrl_id).unwrap().attributes;
+            if attrs.len() >= 6 {
+                for (i, slot) in attrs.iter_mut().take(6).enumerate() {
+                    *slot = 1000 + i as i16;
+                }
+            }
+        }
+        save_and_leave_lot(&root, &store, "UserData", &mut goth).unwrap();
+
+        let nh_saved = store.load_neighborhood("UserData").unwrap().unwrap();
+        assert_eq!(
+            nh_saved.families[&5].magic_history().unwrap(),
+            Some([1000, 1001, 1002, 1003, 1004, 1005]),
+            "Magic Controller attributes 0..6 must merge into FAMI v9 magic_history on save"
+        );
+
+        let _ = bulldoze(&root, &store, "UserData", 5).unwrap();
+        let after_doze = enter_lot(
+            &root,
+            &store,
+            "UserData",
+            5,
+            &[3],
+            Frames::parse("none").unwrap(),
+        )
+        .unwrap();
+        assert!(
+            after_doze
+                .world
+                .objects
+                .values()
+                .all(|o| o.id != lead_id && o.id != non_lead_id && o.guid != lead_guid),
+            "multi-tile group whose non-lead tile qualifies must be removed on bulldoze"
         );
     }
 }

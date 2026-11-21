@@ -109,16 +109,48 @@ impl Neighborhood {
         resolve(&self.directory, "Characters")
     }
 
-    /// Regular files in the neighborhood's `Characters` folder, in sorted name
-    /// order. Empty when there is no such folder.
+    /// Regular files in the neighborhood's `Characters` folder (including
+    /// nested subdirectories), in sorted name order. Empty when there is no
+    /// such folder.
     pub fn character_files(&self) -> Result<Vec<PathBuf>> {
-        match self.characters()? {
-            Some(directory) if directory.is_dir() => Ok(sorted_entries(&directory)?
-                .into_iter()
-                .filter(|path| path.is_file())
-                .collect()),
-            _ => Ok(Vec::new()),
+        Ok(self
+            .character_tree()?
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect())
+    }
+
+    /// Regular files in the neighborhood's `Characters` folder, recursively,
+    /// returning `(relative_slash_path, disk_path)` pairs in `sorted_entries`
+    /// traversal order. Empty when there is no such folder.
+    pub fn character_tree(&self) -> Result<Vec<(String, PathBuf)>> {
+        fn walk(dir: &Path, prefix: &str, out: &mut Vec<(String, PathBuf)>) -> Result<()> {
+            for path in sorted_entries(dir)? {
+                let name = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                let rel = if prefix.is_empty() {
+                    name
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                if path.is_dir() {
+                    walk(&path, &rel, out)?;
+                } else if path.is_file() {
+                    out.push((rel, path));
+                }
+            }
+            Ok(())
         }
+        let mut out = Vec::new();
+        if let Some(directory) = self.characters()?
+            && directory.is_dir()
+        {
+            walk(&directory, "", &mut out)?;
+        }
+        Ok(out)
     }
 
     /// Each lot's zoning by lot number, from the neighborhood's

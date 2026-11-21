@@ -110,6 +110,12 @@ fn lot_total_value_and_net_worth_match_sims_exe_191_formula() {
         lot_total_value(11500, 0, 56110, DEFAULT_ARCH_VALUE_MULTIPLIER),
         50777
     );
+    // Exact x87 fild + fmul f32 rounding (0x425408): 16_777_217 loses its LSB
+    // if prematurely narrowed to f32 before multiplying by 0.7f.
+    assert_eq!(
+        lot_total_value(0, 0, 16_777_217, DEFAULT_ARCH_VALUE_MULTIPLIER),
+        11_744_052
+    );
     let fam = sample_family(5, 2542, 33116, vec![0x1111]);
     assert_eq!(family_net_worth(&fam), 35658);
 }
@@ -356,4 +362,159 @@ fn import_userdata_and_userdata2_without_modifying_install_and_match_catalog() {
             .unwrap(),
         Some(50777)
     );
+}
+
+#[test]
+fn write_back_world_upgrades_v7_family_and_merges_magic_controller_attributes() {
+    let mut stored = sample_neighborhood("UserData2");
+    // Construct a pre-Makin'-Magic v7 family (empty tail, no magic_history yet).
+    stored.families.insert(
+        5,
+        Family {
+            version: 7,
+            house: 5,
+            number: 1,
+            budget: 5000,
+            architecture_value: 10000,
+            friends: 0,
+            flags: 0,
+            members: vec![0x1111],
+            tail: Vec::new(),
+        },
+    );
+
+    let mut world = World::empty();
+    world.budget.funds = 4000;
+    world.globals[9] = 5;
+    world.magic_history = Some(MagicHistory {
+        family: 5,
+        values: [10, 500, 30, 40, 50, 60],
+    });
+    // Place a Magic Controller (`0xb6c90029`) with mixed higher & lower attributes.
+    let controller = sims_sim::Object {
+        id: 1,
+        guid: 0xb6c9_0029,
+        footprint: [0; 4],
+        position: [-16, -16, 1],
+        unknown_short: 0,
+        attributes: vec![100, 200, 300, 10, 500, 600],
+        temps: Vec::new(),
+        data: Vec::new(),
+        obsolete_word: 0,
+        stack_capacity_bytes: 0,
+        stack: Vec::new(),
+        relationship_flag: 0,
+        relationships: Vec::new(),
+        slots: Vec::new(),
+        dynamic_sprites: Vec::new(),
+        multipart: None,
+        portal: None,
+        person: None,
+        registry_word: None,
+        last_result: false,
+        removal_skips_resets: false,
+        selected: false,
+    };
+    world.objects.insert(1, controller);
+    world.order.push(1);
+
+    stored.write_back_world(&world, 5, 5, 12000, None, 50);
+
+    let fam5 = &stored.families[&5];
+    assert_eq!(fam5.version, 9, "writeback always upgrades families to v9");
+    assert_eq!(
+        fam5.magic_history().unwrap(),
+        Some([100, 500, 300, 40, 500, 600]),
+        "signed max of retained history and Magic Controller attributes 0..6 (0x410a87)"
+    );
+    // Secondary house occupancy check (0x425d95):
+    let fam2 = stored.families.get_mut(&2).unwrap();
+    fam2.set_secondary_house(4);
+    assert_eq!(stored.family_in(4).map(|(id, _)| id), Some(2));
+}
+
+#[test]
+fn list_houses_propagates_non_missing_table_redb_errors() {
+    let db = TempDb::new("bad-houses-schema");
+    {
+        // Create `neighborhood_houses` with an incompatible key type (&str instead of (&str, u32)).
+        let raw = redb::Database::create(&db.0).unwrap();
+        let write = raw.begin_write().unwrap();
+        {
+            const WRONG: redb::TableDefinition<&str, &[u8]> =
+                redb::TableDefinition::new("neighborhood_houses");
+            let mut table = write.open_table(WRONG).unwrap();
+            table.insert("wrong", b"schema".as_slice()).unwrap();
+        }
+        write.commit().unwrap();
+    }
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    assert!(
+        store.list_houses("UserData").is_err(),
+        "list_houses must propagate schema/corruption errors rather than returning Ok([])"
+    );
+}
+
+#[test]
+fn add_character_files_matches_disk_for_subdirs_far_and_win1252_names() {
+    let Some(root) = install() else {
+        return;
+    };
+    let n = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("sims-sim-char-parity-{}-{n}", std::process::id()));
+    let sub = dir.join("SubDir");
+    std::fs::create_dir_all(&sub).unwrap();
+
+    // Grab three real character IFFs from UserData/Characters and pack one into
+    // a FAR v1 archive and one into a nested subdirectory with a Windows-1252
+    // accented filename.
+    let ud_nh = sims_content::Neighborhood::open(&root.join("UserData")).unwrap();
+    let ud_chars = ud_nh.character_tree().unwrap();
+    let real_iffs: Vec<PathBuf> = ud_chars
+        .into_iter()
+        .filter(|(rel, _)| rel.to_ascii_lowercase().ends_with(".iff"))
+        .map(|(_, path)| path)
+        .collect();
+    let bytes_a = std::fs::read(&real_iffs[0]).unwrap();
+    let bytes_b = std::fs::read(&real_iffs[1]).unwrap();
+    let bytes_c = std::fs::read(&real_iffs[2]).unwrap();
+
+    std::fs::write(dir.join("caf\u{00e9}.iff"), &bytes_a).unwrap();
+    std::fs::write(sub.join("nested.iff"), &bytes_b).unwrap();
+
+    // Build a valid FAR v1b archive containing `archived.iff`.
+    let member_name = b"archived.iff";
+    let header_len = 8 + 4 + 4; // magic + version + manifest_offset
+    let data_offset = header_len as u32;
+    let manifest_offset = data_offset + bytes_c.len() as u32;
+    let mut far = Vec::new();
+    far.extend_from_slice(b"FAR!byAZ");
+    far.extend_from_slice(&1u32.to_le_bytes());
+    far.extend_from_slice(&manifest_offset.to_le_bytes());
+    far.extend_from_slice(&bytes_c);
+    far.extend_from_slice(&1u32.to_le_bytes()); // file count
+    far.extend_from_slice(&(bytes_c.len() as u32).to_le_bytes());
+    far.extend_from_slice(&(bytes_c.len() as u32).to_le_bytes());
+    far.extend_from_slice(&data_offset.to_le_bytes());
+    far.extend_from_slice(&(member_name.len() as u32).to_le_bytes());
+    far.extend_from_slice(member_name);
+    std::fs::write(dir.join("pack.far"), &far).unwrap();
+
+    let install = Install::detect(&root).unwrap();
+    let mut disk_index = Index::build(&install).unwrap();
+    disk_index.add_characters(&dir).unwrap();
+    let disk_catalog = Catalog::build(&disk_index).unwrap();
+
+    let mut files = BTreeMap::new();
+    files.insert("caf\u{00e9}.iff".to_owned(), bytes_a);
+    files.insert("SubDir/nested.iff".to_owned(), bytes_b);
+    files.insert("pack.far".to_owned(), far);
+    let mut inline_index = Index::build(&install).unwrap();
+    inline_index.add_character_files(&files).unwrap();
+    let inline_catalog = Catalog::build(&inline_index).unwrap();
+
+    let disk_guids: Vec<u32> = disk_catalog.objects.iter().map(|o| o.guid).collect();
+    let inline_guids: Vec<u32> = inline_catalog.objects.iter().map(|o| o.guid).collect();
+    assert_eq!(inline_guids, disk_guids);
+    let _ = std::fs::remove_dir_all(&dir);
 }
