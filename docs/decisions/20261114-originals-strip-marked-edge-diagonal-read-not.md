@@ -27,3 +27,6 @@ wall.
 
 Caps on diagonal corners (the 2-pixel slices) are drawn as the corner
 records give them; they too are unverified for the same reason.
+
+Reopened and ported on 2026-11-20 with House02 screenshots: see
+`20261120-edge-on-strip-ported.md`.
