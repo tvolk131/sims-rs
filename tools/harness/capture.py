@@ -7,12 +7,12 @@ entered:
   capture.py --container sims-harness-vm --output <new dir> --lot 5 \
       --updates 1000 --full 1-100,110-1000/10
 
---resume takes over a guest that an earlier run left stopped at one of its
-breakpoints (that run was killed while the guest was stopped, so it never
-detached) and continues the same output directory and numbering.
+--resume takes over a guest that an earlier run left stopped and continues
+the same output directory and numbering.
 
 Breakpoints (hardware, in QEMU's stub; no guest memory or register is
-written): the lot update's entry 0x46d345 (until the first one on the lot)
+written): the lot update's entry 0x46d345 (until the first one on the lot,
+and again while a watch, a due --dump or a --scenario needs it; see below)
 and its end 0x46d51d (the body is done, the epilogue not yet run); the
 dialog functions 0x436da0 (a record is shown), 0x4370be (a button's result)
 and 0x43718f (a script reads the answer), which are logged only.
@@ -28,21 +28,61 @@ random streams); events.jsonl (dialogs and other stops); status.json.
 
 --watch NAME=EXPR[:SIZE] (repeatable) also sets a write watchpoint (GDB's Z2;
 nothing is written) on SIZE bytes (default 4) at the address EXPR names, as
-soon as EXPR can be worked out, and logs every write to watch.jsonl with the
-writer's registers, its frame-pointer chain and the top of its stack, the
-lot update it falls in and whether it falls inside the lot update's body.
-A write by another process (another CR3) is logged as a foreign_watch event,
-not in watch.jsonl (once the game's CR3 is known, at the first lot update).
+soon as EXPR can be worked out from the baseline on (the first lot update,
+where the game's CR3 is known), and logs a row to watch.jsonl at each stop
+at its watchpoint, with the stopped instruction's registers, its
+frame-pointer chain and the top of its stack, the lot update it falls in
+and whether it falls inside the lot update's body. A row is what the stop
+and memory show, not a write: its address is the watchpoint base the stop
+gives (see the README for its match). A watch stop before the baseline is
+logged as an unknown_watch event, and one in another process (another CR3)
+as a foreign_watch event, neither in watch.jsonl.
 EXPR is a start, a hexadecimal address, object:<id> (the object with that
 ID) or person:<id> (the same, once it is a person), followed by steps: +HEX
 adds, @HEX reads the word at the address plus HEX. For example
 person:259@0xadc+0x88 is the direction of person 259's animator. With --watch
 the lot update's entry stays armed, so that each write can be placed inside
 or outside the update. A watch that goes through an object or a pointer is
-worked out again at every stop in the game; when the address moved (an
+worked out again at every breakpoint stop in the game (not at a stop at a
+watchpoint); when the address moved (an
 animator was replaced), the watchpoint is moved (a watch_moved event), and
 when it cannot be worked out it waits again (watch_lost). Writes between the
 change and that stop are not seen.
+
+--late-watch FROM[-TO],NAME=EXPR[:SIZE] is a watch set at the end of lot
+update FROM - 1 (at the entry of update 1 for FROM 1, once the game's
+process is known) and, if TO is given, cleared at the end of update TO. So
+it covers the stops between the rows of updates FROM - 1 and TO in
+updates.jsonl, which are those of the writes that change rows FROM to TO: a
+frame drawn between two updates changes the row of the update after it. A
+stop there is logged as any watch's is: one inside a lot update's body with
+that update and in_update true (from update FROM on, so for FROM 1 a stop
+in update 1 has update 1), one between two updates with the update before
+it and in_update false. A moving watch misses what the paragraph above says it
+misses; a stop at a watchpoint does not work its address out again, as
+for --watch, but a watch is not moved at the stop where it ends. A run
+taken over (--resume) sets the watches whose updates have come at its first
+stop; one that goes through an object waits for the next entry or return
+if that stop does not give the simulator's pointer, and none is set while
+the guest is stopped in another process. A
+row before the taken-over run knows whether the guest is inside a lot
+update has update null (after_update is the last update recorded). A
+late watch's watch_ended event says whether it was ever set, by this run or
+one it took over (set false: no stop in its updates was seen). The lot
+update's entry is a breakpoint for a late watch only while it is set or
+waits to be set in its updates (one whose address cannot be worked out yet
+is tried again there); the baseline, --watch, --scenario and a due --dump
+arm it too. A late watch is set (or moved) only at a stop on the lot
+captured; at a stop on another lot, one that goes through an object is
+taken off (watch_lost with elsewhere true) until it can be set there
+again, and that includes a stop at a watchpoint on another lot: the row
+is logged with no moving late watch's name, and such a watch is not set
+through the simulator seen before that stop until this lot's next entry or
+return. Each watch.jsonl row says the lot it was
+seen on (lot). A run taken over does not count a late watch an earlier revision
+set (those recorded no lot): it ends with set false.
+So a late watch on a busy address (the random state) costs nothing while
+the load and the other updates run.
 
 The executable digests that guest/launch.sh verified (share/game-identity.txt)
 are recorded in status.json and as a game_identity event.
@@ -94,6 +134,8 @@ ENTRY, RETURN = 0x46d345, 0x46d51d
 # The clock's globals (see crates/sims-vm/src/tick.rs) and those of the date.
 HOURS, MINUTES, SECONDS = 0, 5, 6
 DATE_GLOBALS = (1, 2, 3, 7, 8)
+# The most bytes one guest store is taken to write: a 16-byte SSE store. A store that crosses into a
+# page writes no further into it than this.
 DIALOG_SHOW, DIALOG_RESULT, DIALOG_READ = 0x436da0, 0x4370be, 0x43718f
 OWNER, GLOBAL_RNG, ACTION_SERIAL, CRT_TLS_INDEX = 0x6e48bc, 0x6e54ac, 0x6e4904, 0x6db360
 
@@ -271,9 +313,15 @@ class Watch:
     """A write watchpoint given as NAME=EXPR[:SIZE] (see the module's doc)."""
 
     def __init__(self, text):
+        self.first, self.last = 1, None  # the lot updates it is set for (a late watch's)
+        self.set = False  # whether it was ever set (a late watch's)
         self.name, _, rest = text.partition('=')
+        if not rest.isascii():
+            # int() takes other scripts' digits, which no one means here. The name may be anything.
+            raise ValueError(f'not ASCII: {rest!r}')
         expr, _, size = rest.rpartition(':')
-        if not size.isdigit():
+        if not size.isdigit() or expr in ('object', 'person'):
+            # object:N or person:N alone is the selector, with the default size.
             expr, size = rest, '4'
         self.size = int(size)
         assert self.name and expr and self.size in (1, 2, 4, 8), text
@@ -297,6 +345,26 @@ class Watch:
         self.value = None
         self.pointer = None  # the object's pointer when last worked out
         self.moves = self.object is not None or any(op == '@' for op, _ in self.steps)
+
+    @classmethod
+    def late(cls, text):
+        """A watch given as FROM[-TO],NAME=EXPR[:SIZE] (see the module's doc)."""
+        span, comma, rest = text.partition(',')
+        first, dash, last = span.partition('-')
+        digits = lambda t: t.isascii() and t.isdigit()
+        if not (comma and digits(first) and (digits(last) or not dash)):
+            raise argparse.ArgumentTypeError(f'not FROM[-TO],NAME=EXPR[:SIZE]: {text!r}')
+        try:
+            w = cls(rest)
+        except (AssertionError, ValueError, IndexError) as e:
+            raise argparse.ArgumentTypeError(f'not a watch: {rest!r}') from e
+        if not w.name or w.size not in (1, 2, 4, 8):  # checked by assertions, which python -O skips
+            raise argparse.ArgumentTypeError(f'not a watch: {rest!r}')
+        w.first, w.last = int(first), int(last) if dash else None
+        if w.first < 1 or (w.last is not None and w.last < w.first):
+            raise argparse.ArgumentTypeError(f'not 1 <= FROM <= TO: {text!r}')
+        w.text = text
+        return w
 
     def resolve(self, m, sim):
         """The address, or None while a pointer on the way is 0 or the object does not exist."""
@@ -462,6 +530,184 @@ def open_dialogs(rows):
     return out
 
 
+def torn_tail(path, chunk=1 << 16):
+    """A row cut short at the end of a log by a kill (the file does not end with a newline): (where it
+    starts, its bytes), or None. Reads from the end only."""
+    try:
+        f = open(path, 'rb')
+    except OSError:
+        return None
+    with f:
+        end = f.seek(0, os.SEEK_END)
+        if end == 0:
+            return None
+        f.seek(end - 1)
+        if f.read(1) == b'\n':
+            return None
+        # Each chunk is searched once, and the chunks after it joined only at the end.
+        later, at = [], end
+        while at > 0:
+            step = min(chunk, at)
+            at -= step
+            f.seek(at)
+            data = f.read(step)
+            cut = data.rfind(b'\n')
+            if cut >= 0:
+                return at + cut + 1, data[cut + 1:] + b''.join(reversed(later))
+            later.append(data)
+        return 0, b''.join(reversed(later))
+
+
+def jsonl_rows(path):
+    """The rows of a log, split at newlines only (str.splitlines also splits at other line breaks, such as
+    a vertical tab, which would make one row two). A missing file has none. Raises ValueError for text
+    that is not UTF-8."""
+    try:
+        text = path.read_bytes()
+    except FileNotFoundError:
+        return []
+    rows = text.decode().split('\n')
+    if rows[-1] == '':
+        rows.pop()
+    return rows
+
+
+def json_object(row):
+    """A row (bytes or text) read as the resume reads it: strict UTF-8, then JSON. The object, or None
+    when it is not one (json.loads alone would also take bytes in UTF-16 or UTF-32, and surrogates)."""
+    try:
+        r = json.loads(row.decode('utf-8') if isinstance(row, bytes) else row)
+    except ValueError:
+        return None
+    return r if isinstance(r, dict) else None
+
+
+def bad_row(rows):
+    """The number (from 1) of the first row that is not a JSON object (a blank one included), or None."""
+    for n, line in enumerate(rows, 1):
+        if json_object(line) is None:
+            return n
+    return None
+
+
+class TornSidecarError(Exception):
+    """resume-torn.json is not one this revision wrote."""
+
+
+def cut_entry(c):
+    """Whether this is a cut row as resume-torn.json keeps it: [start, text, taken off, the bytes in hex]."""
+    return (isinstance(c, list) and len(c) == 4 and type(c[0]) is int and c[0] >= 0 and isinstance(c[1], str)
+            and type(c[2]) is bool and isinstance(c[3], str) and all(ch in '0123456789abcdef' for ch in c[3])
+            and len(c[3]) % 2 == 0)
+
+
+def torn_logged(path, mark):
+    """Whether these events hold the resume_torn event of this mark. Rows that are not JSON are passed."""
+    try:
+        with open(path, 'rb') as f:
+            for line in f:
+                r = json_object(line)
+                if r is not None and r.get('kind') == 'resume_torn' and r.get('mark') == mark:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def repair_tails(out, names):
+    """Before a resume: a row cut short at the end of each log is taken off, or ended with a newline if
+    it is a whole JSON object (read as the resume reads it, json_object). What is done is kept in
+    resume-torn.json first, with a mark (each cut row with where it starts, its bytes, and whether it is
+    taken off yet, and the logs ended), so a takeover killed before it logs it (resume_torn, with the mark) hands it
+    on. A cut not yet taken off whose row is no longer at the end of its log was taken off by a takeover
+    killed before it noted so, and is noted now. One killed before the cut finds the same row where it
+    was (the same bytes) and notes it once; a row cut short at the same place after the cut was made is
+    another, and noted too. One killed after logging it and before taking off resume-torn.json has its mark in the
+    events, and the file is not used again. A resume-torn.json of another form (an earlier revision's)
+    raises TornSidecarError before anything is changed. Returns dict(mark, rows, ended), rows the cut
+    rows' text by log."""
+    sidecar = out / 'resume-torn.json'
+    fresh = dict(mark=f'{time.time_ns():x}', cuts={}, ended=[])
+    try:
+        text = sidecar.read_bytes()
+    except FileNotFoundError:
+        saved = fresh
+    else:
+        saved = json_object(text)
+        if not (saved is not None and saved.keys() == {'mark', 'cuts', 'ended'} and isinstance(saved['mark'], str)
+                and isinstance(saved['cuts'], dict) and isinstance(saved['ended'], list)
+                and all(isinstance(name, str) for name in saved['ended'])
+                and all(isinstance(cuts, list) and all(cut_entry(c) for c in cuts) for cuts in saved['cuts'].values())):
+            raise TornSidecarError(sidecar)
+        if torn_logged(out / 'events.jsonl', saved['mark']):
+            saved = fresh
+
+    def keep():
+        tmp = out / 'resume-torn.json.tmp'
+        tmp.write_text(json.dumps(saved))
+        tmp.rename(sidecar)
+
+    found = {name: torn_tail(out / name) for name in names}
+    changed = False
+    for name, cuts in saved['cuts'].items():
+        if cuts and not cuts[-1][2]:
+            now = found.get(name)
+            if now is None or [now[0], now[1].hex()] != [cuts[-1][0], cuts[-1][3]]:
+                cuts[-1][2] = changed = True
+    fixes = []
+    for name in names:
+        if found[name] is None:
+            continue
+        start, tail = found[name]
+        if json_object(tail) is not None:
+            fixes.append((name, None))
+            if name not in saved['ended']:
+                saved['ended'].append(name)
+        else:
+            cut = [start, tail.decode(errors='replace'), False, tail.hex()]
+            cuts = saved['cuts'].setdefault(name, [])
+            if not (cuts and cuts[-1] == cut):
+                cuts.append(cut)
+            fixes.append((name, start))
+    if fixes or changed:
+        keep()
+    for name, start in fixes:
+        if start is None:
+            with open(out / name, 'ab') as f:
+                f.write(b'\n')
+        else:
+            with open(out / name, 'r+b') as f:
+                f.truncate(start)
+            saved['cuts'][name][-1][2] = True
+    if fixes:
+        keep()
+    rows = {name: [text for _, text, _, _ in cuts] for name, cuts in saved['cuts'].items() if cuts}
+    return dict(mark=saved['mark'], rows=rows, ended=saved['ended'])
+
+
+def has_baseline(path):
+    """Whether these events have a baseline row, read up to the first one. Rows are split at newlines only
+    and read as the resume reads them (json_object); one that is not an object (one cut short by a kill,
+    which the tail repair takes off) is not one."""
+    try:
+        with open(path, 'rb') as f:
+            for line in f:
+                r = json_object(line)
+                if r is not None and r.get('kind') == 'baseline':
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def plain_trap(reply):
+    """Whether a stop reply is a plain trap: T05 with no stop reason (a watchpoint or a breakpoint)."""
+    if not reply.startswith('T05'):
+        return False
+    reasons = {'watch', 'rwatch', 'awatch', 'swbreak', 'hwbreak'}
+    return not any(field.partition(':')[0] in reasons for field in reply[3:].split(';'))
+
+
 def drop_redone_events(path, updates, kinds):
     """Before a resume: drop the events of these kinds (of hour_turned and objects_changed, the ones the
     resumed run can write again) that a lot update's return produced for an update after the last recorded
@@ -469,9 +715,7 @@ def drop_redone_events(path, updates, kinds):
     if not path.exists():
         return []
     keep, dropped = [], []
-    for line in path.read_text().splitlines():
-        if not line.strip():
-            continue
+    for line in jsonl_rows(path):
         r = json.loads(line)
         (dropped if r['kind'] in kinds and r.get('update', 0) > updates else keep).append(line)
     if dropped:
@@ -531,6 +775,14 @@ def write_gz(path, value):
         json.dump(value, f, separators=(',', ':'))
 
 
+
+def stop_thread(reply):
+    """The thread a stop reply names (its thread: field), or None."""
+    for field in reply[3:].split(';'):
+        if field.startswith('thread:'):
+            return field[len('thread:'):]
+    return None
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--container', default='sims-harness-vm')
@@ -544,7 +796,9 @@ def main():
     ap.add_argument('--guest-dir', type=Path, help='the guest directory on the host (the container\'s /g), '
                     'where QEMU writes the dump before it is moved to the output')
     ap.add_argument('--watch', action='append', default=[], type=Watch,
-                    help='NAME=EXPR[:SIZE]: log every write to these bytes to watch.jsonl (see above)')
+                    help='NAME=EXPR[:SIZE] logs observations at watch stops to watch.jsonl from the baseline onward')
+    ap.add_argument('--late-watch', action='append', default=[], type=Watch.late,
+                    help='FROM[-TO],NAME=EXPR[:SIZE] logs observations at watch stops in the given update window')
     ap.add_argument('--scenario', type=Path, help='run this input scenario (see input.py); needs --guest-dir. '
                     'Logged to input.jsonl')
     ap.add_argument('--window', default=os.environ.get('SIMS_WINDOW', scenario_input.WINDOW),
@@ -559,11 +813,15 @@ def main():
     ap.add_argument('--answer-from', type=int, default=3,
                     help='--answer-stuck answers only dialogs shown in this lot update or later')
     ap.add_argument('--resume', action='store_true',
-                    help='take over a guest that an earlier run of this script left stopped at a breakpoint '
-                         '(it was killed, not detached): continue its output directory and numbering')
+                    help='take over a guest that an earlier run left stopped and continue its output directory '
+                         'and numbering')
     args = ap.parse_args()
     full_set = parse_set(args.full)
     dump_set = parse_set(args.dump)
+    late_texts = [w.text for w in args.late_watch]
+    if len(set(late_texts)) != len(late_texts):
+        # A taken-over run tells them apart by their text (watch_armed's expr).
+        ap.error('a --late-watch is given twice')
     if dump_set and not args.guest_dir:
         ap.error('--dump needs --guest-dir')
     if args.scenario and not args.guest_dir:
@@ -582,14 +840,36 @@ def main():
     except scenario_input.ScenarioError as e:
         ap.error(str(e))
     out = args.output
+    if args.resume and not has_baseline(out / 'events.jsonl'):
+        # Before the baseline nothing is recorded that a takeover could go on from (entry-0000 may be
+        # half written, and the game's process is not known). Checked before anything is made or
+        # changed, or the guest is attached.
+        ap.error(f'{out} has no baseline event: --resume takes over only a run that reached its '
+                 'baseline; start a new capture')
     out.mkdir(parents=True, exist_ok=args.resume)
-    prior_status, dropped = {}, []
+    prior_status, dropped, torn = {}, [], dict(rows={}, ended=[])
     if args.resume:
+        try:
+            torn = repair_tails(out, ('events.jsonl', 'updates.jsonl', 'watch.jsonl'))
+        except TornSidecarError:
+            ap.error(f'{out / "resume-torn.json"} is not of the form this revision writes (an earlier '
+                     'revision left it): read it, note its cut rows by hand, remove it, and resume again')
         try:
             prior_status = json.loads((out / 'status.json').read_text())
         except (OSError, ValueError):
             pass
-        lines = (out / 'updates.jsonl').read_text().splitlines() if (out / 'updates.jsonl').exists() else []
+        # A row of the events or the updates that is not a JSON object (not at the end, so not cut by
+        # the kill; a blank one included) would make the count or the events read wrong. Checked before
+        # anything is changed but the tails, or the guest is attached. watch.jsonl is only appended to by
+        # a takeover, and not checked.
+        for name, what in (('updates.jsonl', 'count the updates'), ('events.jsonl', 'read the events')):
+            try:
+                n = bad_row(jsonl_rows(out / name))
+            except ValueError:
+                ap.error(f'{out / name} is not UTF-8: --resume cannot {what}')
+            if n is not None:
+                ap.error(f'{out / name} row {n} is not JSON: --resume cannot {what}')
+        lines = jsonl_rows(out / 'updates.jsonl')
         # Only what the redone return can write again: an hour turn needs the last row's clock, an object
         # change the registry saved with the last row.
         kinds = []
@@ -599,9 +879,11 @@ def main():
             kinds.append('objects_changed')
         dropped = drop_redone_events(out / 'events.jsonl', len(lines), kinds)
     events = open(out / 'events.jsonl', 'a')
-    watch_log = open(out / 'watch.jsonl', 'a') if args.watch else None
+    watch_log = open(out / 'watch.jsonl', 'a') if args.watch or args.late_watch else None
     updates_log = open(out / 'updates.jsonl', 'a')
-    status = dict(started=time.time(), updates=0, state='attaching', settings={k: str(v) for k, v in vars(args).items()})
+    status = dict(started=time.time(), updates=0, state='attaching', settings={k: str(v) for k, v in vars(args).items()},
+                  stepped_to=prior_status.get('stepped_to'), stepped_watch=prior_status.get('stepped_watch'),
+                  stepped_maybe=None, show_stop=prior_status.get('show_stop'), dialog=prior_status.get('dialog'))
 
     event_lock = threading.Lock()
 
@@ -645,9 +927,11 @@ def main():
 
     sims_cr3 = None
     sim = None
+    sim_lot = None  # the lot whose update entry or return gave sim
     in_update = False
-    watches = args.watch
-    pending = list(watches)
+    watches = args.watch + args.late_watch
+    pending = list(args.watch)
+    late = list(args.late_watch)  # watches that wait for their first update
     live_watches = []  # watches set, each at its .address
     hardware = {}  # (address, size) -> how many armed watches use that watchpoint
 
@@ -663,28 +947,54 @@ def main():
             remote.clear_watch(a, size)
 
     def locate(w, m):
-        """(address, value) for watch w now, or None if it cannot be worked out or read."""
+        """(address, value) for watch w now, or None if it cannot be worked out or read. A late
+        watch goes through the simulator only if the last entry or return that gave it was on this
+        lot's (a stop after a return elsewhere still has the other lot's)."""
         try:
-            a = w.resolve(m, sim)
+            a = w.resolve(m, sim if sim_lot == args.lot or w not in args.late_watch else None)
             return None if a is None else (a, w.read_at(m, a))
         except MemoryError:
             return None
 
-    def arm_watches(m):
+    def arm_watches(m, here, lot):
         for w in list(pending):
+            if not here and w in args.late_watch:
+                continue
             found = locate(w, m)
             if found is None:
                 continue
             w.address, w.value = found
             hardware_add(w.address, w.size)
+            w.set = True
             live_watches.append(w)
             pending.remove(w)
-            event(kind='watch_armed', name=w.name, expr=w.text, address=w.address, value=w.value, update=updates)
+            event(kind='watch_armed', name=w.name, expr=w.text, late=w in args.late_watch, lot=lot,
+                  address=w.address, value=w.value, update=updates)
 
-    def check_watches(m):
+    def retire_elsewhere(lot):
+        """At a stop on another lot (`lot`, None if it cannot be read): take each moving late watch
+        off, to wait to be set again here. The simulator last seen is not used for them again until
+        this lot's next entry or return, so a stop here before then (at a dialog breakpoint) cannot
+        set one through another lot's simulator."""
+        nonlocal sim_lot
+        sim_lot = lot
+        for w in list(live_watches):
+            if w.moves and w in args.late_watch:
+                hardware_remove(w.address, w.size)
+                live_watches.remove(w)
+                event(kind='watch_lost', name=w.name, expr=w.text, address=w.address, update=updates,
+                      elsewhere=True)
+                w.address = w.value = None
+                pending.append(w)
+
+    def check_watches(m, here, lot):
         """At a stop in the game, work out the moving watches again: move a
         watchpoint whose address changed, and put one that cannot be worked
-        out (or read) back to wait."""
+        out (or read) back to wait. A late watch only at a stop on this lot:
+        at a stop on another, a moving late watch is taken off and waits to be
+        set again here (its address may be another lot's object's by then)."""
+        if not here:
+            retire_elsewhere(lot)
         for w in list(live_watches):
             if not w.moves:
                 continue
@@ -706,17 +1016,69 @@ def main():
 
     def watch_hit(reply, regs, m):
         hit = int(reply.split('watch:')[1].split(';')[0], 16)
-        if sims_cr3 is not None and regs['cr3'] != sims_cr3:
+        if sims_cr3 is None:
+            event(kind='unknown_watch', address=hit, pc=regs['eip'], cr3=regs['cr3'], update=updates)
+            return
+        if regs['cr3'] != sims_cr3:
             # The same virtual address in another process.
             event(kind='foreign_watch', address=hit, pc=regs['eip'], cr3=regs['cr3'], update=updates)
             return
-        # One row per watch on the written bytes (one with name null if none is).
-        hits = [w for w in live_watches if w.address == hit] or [w for w in live_watches if w.address <= hit < w.address + w.size]
-        for w in hits or [None]:
-            row = dict(update=updates + (1 if in_update else 0), in_update=in_update, address=hit,
-                       name=w.name if w else None, registers=regs, eip=regs['eip'])
+        try:
+            lot = m.lot()
+        except MemoryError:
+            lot = None
+        # The watchpoints as set when the write was made (before any is taken off below).
+        on_base = [p for p in hardware if p[0] == hit]
+        candidates = list(live_watches)
+        if lot != args.lot:
+            # A write at a stop on another lot (before its next entry or dialog breakpoint) is not
+            # this lot's object's: it is not matched to a moving late watch (before the exact and
+            # range matches, so one cannot hide an ordinary watch on the same bytes), and those
+            # watches are taken off, as at any stop there (the address may be another lot's object's
+            # by then). The simulator last seen is not used for them again until this lot's next
+            # entry or return. Other watches are worked out again at the next breakpoint, as always.
+            candidates = [w for w in candidates if not (w.moves and w in args.late_watch)]
+            retire_elsewhere(lot)
+        def changed(w):
             try:
-                row['tick'] = m.word(sim + 0x98) if sim else None
+                return w.read(m) != w.value
+            except MemoryError:
+                return False
+        # The stop reply gives the base of the watchpoint that fired, not the bytes written, and
+        # which of several watchpoints fires, and whether it was written at all, depends on how
+        # QEMU split and checked the store (7.2: the newest watchpoint a check overlaps fires; an
+        # unaligned store on a watched page is checked from the page's base; one instruction may
+        # be several stores). So each row says only what the stop and the memory show (match):
+        # - named: the watch is on the watchpoint whose base the stop gives (one_of: one of the
+        #   several watchpoints on that base);
+        # - changed: the watch's value is not the one last seen. This store may have written it,
+        #   or an earlier one that stopped nothing (through another mapping of the same memory);
+        # - at: the stop gives no watchpoint's base (not one QEMU gives), and the watch holds it.
+        # A watch that is not on the base the stop gives and kept its value has no row, even if
+        # the store wrote it the value it held: the stop does not show that.
+        hits = []
+        for w in candidates:
+            key = (w.address, w.size)
+            if key in on_base:
+                hits.append((w, 'named' if len(on_base) == 1 else 'one_of'))
+            elif not on_base and w.address <= hit < w.address + w.size:
+                hits.append((w, 'at'))
+            elif changed(w):
+                hits.append((w, 'changed'))
+        for w, match in hits or [(None, None)]:
+            # Taken over off a breakpoint, whether the guest is in a lot update is not known until its
+            # next entry or return (in_update None): the write is in update `updates` or `updates` + 1,
+            # so update is null and after_update says which was recorded last.
+            row = dict(update=None if in_update is None else updates + (1 if in_update else 0),
+                       after_update=updates, in_update=in_update, address=hit, lot=lot,
+                       name=w.name if w else None, match=match, registers=regs, eip=regs['eip'])
+            # The tick through this lot's simulator only (after a return elsewhere, sim is another
+            # lot's until the next entry here), read apart so the values are kept if it fails.
+            try:
+                row['tick'] = m.word(sim + 0x98) if sim and sim_lot == args.lot else None
+            except MemoryError as e:
+                row['tick'], row['tick_error'] = None, str(e)
+            try:
                 if w:
                     row['before'], w.value = w.value, w.read(m)
                     row['after'] = w.value
@@ -751,10 +1113,11 @@ def main():
     last_objects = None  # {pointer: id} of the registry at the last return (None: not known)
     dialog_pending = False  # a dialog was shown since the last return
     if args.resume:
-        rows = [json.loads(line) for line in open(out / 'events.jsonl')]
-        sims_cr3 = next(r['cr3'] for r in rows if r['kind'] == 'baseline')
+        rows = [json.loads(line) for line in jsonl_rows(out / 'events.jsonl')]
+        first_baseline = next(i for i, r in enumerate(rows) if r['kind'] == 'baseline')
+        sims_cr3 = rows[first_baseline]['cr3']
         baseline = True
-        lines = open(out / 'updates.jsonl').read().splitlines()
+        lines = jsonl_rows(out / 'updates.jsonl')
         updates = len(lines)
         if lines:
             last = json.loads(lines[-1])
@@ -768,8 +1131,23 @@ def main():
                 status.update(registry=prior_status['registry'], registry_update=updates)
             else:
                 event(kind='registry_unknown', updates=updates, registry_update=prior_status.get('registry_update'))
+        if torn['rows'] or torn['ended']:
+            event(kind='resume_torn', mark=torn['mark'], rows=torn['rows'], ended=torn['ended'])
+        (out / 'resume-torn.json').unlink(missing_ok=True)
         if dropped:
             event(kind='resume_dropped', events=[dict(kind=r['kind'], update=r['update']) for r in dropped])
+        # A late watch an earlier run set counts as set (watch_ended's set covers its whole window).
+        # Its event has its name, its whole text (with the updates), late true and the lot it was
+        # armed on; only an arming on this lot after the baseline within its updates counts (it is
+        # set at the end of update first - 1 at the earliest). Earlier revisions recorded neither
+        # `late` nor the lot, and could arm on another lot, so their armings do not count: such a
+        # watch ends with set false, and its watch_armed events have to be read by hand.
+        since = rows[first_baseline:]
+        for w in late:
+            w.set = any(r['kind'] == 'watch_armed' and r.get('late') is True and r.get('lot') == args.lot
+                        and r.get('name') == w.name and r.get('expr') == w.text
+                        and r.get('update', -1) + 1 >= w.first
+                        and (w.last is None or r['update'] + 1 <= w.last) for r in since)
         # A dialog shown since the last recorded return, and the dialogs still waiting for a result.
         dialog_pending = any(r['kind'] == 'dialog_show' and r['update'] > updates for r in rows)
         waiting = open_dialogs(rows)
@@ -779,6 +1157,53 @@ def main():
             for record, (shown_in, jobs) in waiting.items():
                 if shown_in >= args.answer_from:
                     answerer.shown(shown_in, record, jobs)
+    def tend_watches(m, foreign):
+        """At a stop: start the late watches whose updates have come, work out the moving ones again,
+        end those whose updates are over, and set those waiting. At a stop whose lot cannot be read
+        (at a breakpoint or off one, as when a run is taken over), those waiting are set as far as
+        they can be without the lot. Arming and sampling start at the baseline."""
+        if sims_cr3 is None:
+            return
+        # A late watch waits for its first update. A takeover after its window never sets it.
+        for w in [w for w in late if updates + 1 >= w.first]:
+            late.remove(w)
+            if w.last is None or updates + 1 <= w.last:
+                pending.append(w)
+                arm(ENTRY)
+        # Those whose updates are over end first, so that one is not moved at the stop where it ends.
+        ended = [w for w in live_watches + pending if w.last is not None and updates + 1 > w.last]
+        for w in ended:
+            if w in live_watches:
+                live_watches.remove(w)
+                hardware_remove(w.address, w.size)
+            else:
+                pending.remove(w)
+            # set false: it never could be set (its address never worked out, or every stop in its
+            # updates was in another process), so writes in its updates were not seen.
+            event(kind='watch_ended', name=w.name, expr=w.text, update=updates, set=w.set)
+        if ended and not (live_watches or pending or args.watch or runner or updates + 1 in dump_set):
+            disarm(ENTRY)
+        if foreign:
+            return
+        # A late watch is set or moved only at a stop on this lot: another lot's objects are not
+        # this lot's, and one set there would count as set when the run is taken over. At a stop in
+        # the game's process whose lot cannot be read, or on another lot, the moving late watches are
+        # taken off and the simulator seen before is not used for them again until this lot's next
+        # entry or return, whether or not any is set now (one waiting could be set at a later stop
+        # here before then).
+        try:
+            lot = m.lot()
+            readable = True
+        except MemoryError:
+            lot, readable = None, False
+        here = lot == args.lot
+        if not here:
+            retire_elsewhere(lot)
+        if live_watches and readable:
+            check_watches(m, here, lot)
+        if pending:
+            arm_watches(m, here, lot)
+
     try:
         reply = remote.stop_reply()
         event(kind='attach', reply=reply, resume=args.resume, updates=updates)
@@ -792,12 +1217,28 @@ def main():
             arm(ENTRY)  # taken over before a dump at the next entry (or in the middle of it)
         if runner:
             arm(scenario_input.QUEUE_PUSH)
-        if watches or runner:
+        if args.resume:
+            # The late watches whose updates have come: set at the first stop, even off a breakpoint.
+            for w in [w for w in late if updates + 1 >= w.first]:
+                late.remove(w)
+                if w.last is None or updates + 1 <= w.last:
+                    pending.append(w)
+        if args.watch or pending or runner:
             arm(ENTRY)
             if args.resume:
                 # Whether the guest is inside a lot update is known again at its next entry or return.
                 in_update = None
-        save_status(state='running', breaks=sorted(breaks))
+        # Where a step past a breakpoint that stopped at a watchpoint left the guest (pc, cr3, thread):
+        # QEMU then stops once more there, a plain trap for the step itself, when it is resumed.
+        stepped_to = prior_status.get('stepped_to')
+        save_status(state='running', breaks=sorted(breaks),
+                    stepped_to=tuple(stepped_to) if stepped_to else None)
+        if status['stepped_watch']:
+            # The run taken over was killed after a step stopped at a watchpoint and before it wrote all
+            # that stop's rows: they may be missing from watch.jsonl. Kept in status.json until this is
+            # logged (a run killed before then hands it on; one killed just after may log it twice).
+            event(kind='unsettled_watch', reply=status['stepped_watch'], stepped_to=stepped_to)
+            save_status(stepped_watch=None)
         first = args.resume
         while updates < args.updates:
             if args.stop_file and args.stop_file.exists():
@@ -816,16 +1257,59 @@ def main():
             regs = {k: v for k, v in regs.items() if not k.startswith('_')}
             regs.update(fs_base=fs_base, cr3=cr3)
             m = Memory(remote)
+            # A dialog show the run taken over handled and did not step past: the guest is still at it.
+            shown_here = took_over and pc == DIALOG_SHOW and status['show_stop'] == regs
+            if took_over and status['show_stop'] is not None and not shown_here:
+                save_status(show_stop=None)
+            stepped_to = status['stepped_to']
+            if stepped_to is not None:
+                thread = stop_thread(reply)
+                # The attach query leaves the trap pending and may omit the thread.
+                same_stop = (pc, cr3) == stepped_to[:2] and (
+                    thread == stepped_to[2] or (took_over and thread is None))
+                plain = plain_trap(reply)
+                if not took_over or not (plain and same_stop):
+                    save_status(stepped_to=None)
+                if not took_over and plain and same_stop and pc not in breaks:
+                    event(kind='step_after_watch', pc=pc)
+                    continue
+            maybe = status.get('stepped_maybe')
+            if maybe is not None and not took_over:
+                save_status(stepped_maybe=None)
+                if plain_trap(reply) and (pc, cr3) == tuple(maybe[:2]) \
+                        and maybe[2] in (None, stop_thread(reply)) and pc not in breaks:
+                    # Only a step's pending trap stops plainly off a breakpoint: the earlier run's
+                    # step stopped at a watchpoint, and was killed before it recorded that.
+                    event(kind='step_after_watch', pc=pc, unrecorded_watch=True)
+                    continue
             if took_over and pc not in breaks:
                 # The earlier run was killed between stepping past a breakpoint and resuming.
                 event(kind='took_over_off_break', pc=pc, registers=regs)
+                if status['stepped_to'] is None and (args.watch or args.late_watch):
+                    # Killed before it kept where that step left the guest, its pending trap is
+                    # matched on the pc, the CR3 and the thread the reattach gives (if it gives one).
+                    # Only a step that stopped at a watchpoint leaves one, so only with watches.
+                    save_status(stepped_maybe=(pc, cr3, stop_thread(reply)))
+                tend_watches(m, sims_cr3 is not None and cr3 != sims_cr3)
                 continue
             if took_over and pc == RETURN:
-                last = json.loads(open(out / 'updates.jsonl').read().splitlines()[-1])
-                now = m.summary(regs['ebx'], fs_base)
-                event(kind='took_over_at_return', last=last, now=now)
-                if all(last[k] == now[k] for k in now):
-                    raise RuntimeError('took over at a return already recorded; refusing to guess')
+                # Only a return on this lot in the game's process can be one already recorded; any
+                # other is dealt with below as usual (its simulator may not be readable).
+                try:
+                    ours = cr3 == sims_cr3 and m.lot() == args.lot
+                except MemoryError:
+                    ours = False
+                if ours:
+                    recorded = out / 'updates.jsonl'
+                    lines = jsonl_rows(recorded)
+                    last = json.loads(lines[-1]) if lines else None
+                    now = m.summary(regs['ebx'], fs_base)
+                    event(kind='took_over_at_return', last=last, now=now)
+                    # With nothing recorded yet, this is update 1's return.
+                    if last is not None and all(last[k] == now[k] for k in now):
+                        raise RuntimeError('took over at a return already recorded; refusing to guess')
+                else:
+                    event(kind='took_over_at_return', elsewhere=True, cr3=cr3)
             if not took_over and 'watch:' in reply:
                 watch_hit(reply, regs, m)
                 continue
@@ -842,7 +1326,7 @@ def main():
             if foreign:
                 event(kind='foreign_stop', pc=pc, cr3=cr3)
             elif pc == ENTRY:
-                sim = regs['ecx']
+                sim, sim_lot = regs['ecx'], lot
                 if lot == args.lot and not baseline:
                     sims_cr3 = cr3
                     t0 = time.time()
@@ -862,7 +1346,7 @@ def main():
                           packets=remote.packets, sim=regs['ecx'])
                     if 1 in dump_set:  # the baseline is the entry of lot update 1
                         save_dump(1, regs, raw)
-                    if not (watches or runner):
+                    if not (live_watches or pending or args.watch or runner):
                         disarm(ENTRY)
                     arm(RETURN)
                     in_update = True
@@ -870,14 +1354,14 @@ def main():
                     in_update = True
                     if updates + 1 in dump_set:
                         save_dump(updates + 1, regs, raw)
-                    if not (watches or runner):
+                    if not (live_watches or pending or args.watch or runner):
                         disarm(ENTRY)
                 else:
                     elsewhere += 1
                     if elsewhere in (1, 10, 100) or elsewhere % 1000 == 0:
                         event(kind='entry_elsewhere', lot=lot, cr3=cr3, count=elsewhere)
             elif pc == RETURN:
-                sim = regs['ebx']
+                sim, sim_lot = regs['ebx'], lot
                 in_update = False
                 if lot != args.lot:
                     event(kind='return_elsewhere', lot=lot)
@@ -952,6 +1436,13 @@ def main():
                         arm(ENTRY)
             elif runner and pc == scenario_input.QUEUE_PUSH:
                 runner.on_queue_push(updates + 1, bool(in_update), m, regs)
+            elif shown_here:
+                # The earlier run handled this show (status.json's show_stop, kept from when it was
+                # handled until the step past it) and was killed before stepping past it. It was
+                # shown to the answerer again above with its press jobs, so it is not shown again.
+                event(kind='took_over_at_dialog_show', record=regs['ecx'], update=updates + 1)
+                shown = (status.get('dialog') or {}).get('shown')
+                save_status(dialog=dict(update=updates + 1, record=regs['ecx'], shown=shown or time.time()))
             else:
                 # A dialog function. ecx is the dialog record (0x436da0 keeps it in esi).
                 record = regs['ecx']
@@ -979,24 +1470,53 @@ def main():
                 elif pc == DIALOG_RESULT and answerer:
                     answerer.answered(record)
                 if pc == DIALOG_SHOW:
-                    save_status(dialog=dict(update=updates + 1, record=record, shown=time.time()))
-            if not foreign and live_watches:
-                check_watches(m)
-            if not foreign and pending:
-                arm_watches(m)
+                    # Kept until the step past it: a run killed in between leaves it to its takeover.
+                    # (One killed between the event above and this logs the show twice.)
+                    save_status(dialog=dict(update=updates + 1, record=record, shown=time.time()), show_stop=regs)
+            # Only another process counts as foreign here: tend_watches reads the lot again, and a lot
+            # that cannot be read in the game's process still takes the moving late watches off.
+            tend_watches(m, sims_cr3 is not None and cr3 != sims_cr3)
             # Step past the breakpoint we stopped at (if it is still armed).
             armed = pc in breaks
             if armed:
                 remote.clear_break(pc)
-            reply = remote.step()
+            # Every register before the step: a step the pending trap took leaves them all as they
+            # were (EIP alone stays put under a step of one round of a rep string instruction).
+            step_from = remote.registers()
+            for attempt in range(2):
+                reply = remote.step()
+                watch_stop = 'watch:' in reply
+                if not (watch_stop and reply.startswith('T05')) and not plain_trap(reply):
+                    # Not a trap (an error such as E22, or the guest gone), or one giving a breakpoint
+                    # (none is armed where a step goes): where the guest is is not known, so the
+                    # capture cannot go on.
+                    event(kind='step_failed', pc=pc, cr3=cr3, reply=reply, attempt=attempt)
+                    raise RuntimeError(f'step at {pc:#x} gave {reply!r}, not a trap')
+                if not watch_stop and status['stepped_to'] is not None:
+                    save_status(stepped_to=None)
+                regs, raw = remote.registers()
+                step_cr3 = struct.unpack_from('<I', raw, 84)[0]
+                if watch_stop:
+                    # Kept before the rows are written, with the reply: a run killed before they
+                    # all are is taken over with the stop known (took_over_off_break's
+                    # unsettled_watch), and the pending trap accepted.
+                    save_status(stepped_to=(regs['eip'], step_cr3, stop_thread(reply)), stepped_watch=reply)
+                    break
+                if (regs, raw) != step_from:
+                    break
+                # A pending debug trap can stop the step before the instruction executes.
+                if attempt:
+                    raise RuntimeError(f'step at {pc:#x} left every register unchanged after retry: {reply}')
+                event(kind='step_swallowed', pc=pc, cr3=cr3)
             if armed:
                 remote.set_break(pc)
-            if 'watch:' in reply:
-                # The instruction stepped over wrote a watched address.
-                regs, raw = remote.registers()
+            if status['show_stop'] is not None:
+                save_status(show_stop=None)
+            if watch_stop:
                 regs = {k: v for k, v in regs.items() if not k.startswith('_')}
-                regs.update(fs_base=struct.unpack_from('<I', raw, 64)[0], cr3=struct.unpack_from('<I', raw, 84)[0])
+                regs.update(fs_base=struct.unpack_from('<I', raw, 64)[0], cr3=step_cr3)
                 watch_hit(reply, regs, Memory(remote))
+                save_status(stepped_watch=None)
         event(kind='complete', updates=updates)
         save_status(state='complete')
     except BaseException as e:

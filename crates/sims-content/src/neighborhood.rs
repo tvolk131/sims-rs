@@ -126,27 +126,11 @@ impl Neighborhood {
     /// shipped neighborhoods both files give the same table.
     pub fn zoning(&self, expansions: u16) -> Result<BTreeMap<i16, i32>> {
         let mut table = BTreeMap::new();
-        let Some(path) = resolve(&self.directory, "LotZoning.iff")? else {
-            return Ok(table);
-        };
-        let iff = read_iff(&path)?;
-        let Some(chunk) = iff.get(b"STR#", 1) else {
-            return Ok(table);
-        };
-        let strings = StringTable::parse(iff.data(chunk))
-            .map_err(|e| Error::format(&format!("{} STR# #1", path.display()), e))?;
         let mut magic = false;
-        for entry in strings.entries.iter().filter(|e| e.language == 1) {
-            let Some((lot, zone)) = entry.text.split_once(',') else {
-                continue;
-            };
-            let lot = leading_number(lot);
-            let zone = zone.to_ascii_lowercase();
-            let zone = if !zone.contains("residential") && zone.contains("community") {
-                2
-            } else {
-                1
-            };
+        let Some(rows) = self.zoning_rows()? else {
+            return Ok(table);
+        };
+        for (lot, zone) in rows {
             magic |= (90..=92).contains(&lot);
             if let Ok(lot) = i16::try_from(lot) {
                 table.entry(lot).or_insert(zone);
@@ -158,6 +142,58 @@ impl Neighborhood {
             }
         }
         Ok(table)
+    }
+
+    /// The lots of the neighborhood's `LotZoning.iff` rows, in the file's
+    /// order: the lot vector the reload builds (neighborhood +0x174,
+    /// 0x424eec to 0x425064), which the view walks, comparing each lot as a
+    /// signed double word (0x557125).
+    pub fn lot_rows(&self) -> Result<Vec<i32>> {
+        Ok(self
+            .zoning_rows()?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(lot, _)| lot)
+            .collect())
+    }
+
+    /// `LotZoning.iff`'s STR# 1 rows in its first language set: each
+    /// row's lot and zone (1 residential, 2 community), in order. `None`
+    /// when there is no such file or table.
+    fn zoning_rows(&self) -> Result<Option<Vec<(i32, i32)>>> {
+        let mut rows = Vec::new();
+        let Some(path) = resolve(&self.directory, "LotZoning.iff")? else {
+            return Ok(None);
+        };
+        let iff = read_iff(&path)?;
+        let Some(chunk) = iff.get(b"STR#", 1) else {
+            return Ok(None);
+        };
+        let strings = StringTable::parse(iff.data(chunk))
+            .map_err(|e| Error::format(&format!("{} STR# #1", path.display()), e))?;
+        for entry in strings.entries.iter().filter(|e| e.language == 1) {
+            let Some((lot, zone)) = entry.text.split_once(',') else {
+                continue;
+            };
+            let zone = zone.to_ascii_lowercase();
+            let zone = if !zone.contains("residential") && zone.contains("community") {
+                2
+            } else {
+                1
+            };
+            rows.push((leading_number(lot), zone));
+        }
+        Ok(Some(rows))
+    }
+
+    /// The files in the neighborhood's `Patch` folder, in name order:
+    /// the order the import's scan (0x42bca4) lists them in, as NTFS
+    /// returns them. Empty when there is no such folder.
+    pub fn patches(&self) -> Result<Vec<PathBuf>> {
+        match resolve(&self.directory, "Patch")? {
+            Some(directory) => sorted_entries(&directory),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// House file paths by house number, in number order.

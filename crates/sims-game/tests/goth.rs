@@ -141,17 +141,27 @@ fn people_stand_where_a_click_finds_them() {
         .iter()
         .partition(|&&[x, y]| bob.is_some() && canvas.id_at(x, y) == bob);
     assert!(bob.is_none() || !on_bob.is_empty(), "the bob is not drawn");
-    // Away from its holder, a click on the bob finds the bob.
+    // A click on the bob's pixels finds the bob, not its holder.
+    let camera = &view.camera;
+    let people_ids = canvas.ids();
     assert!(
-        bob.is_none() || on_bob.iter().any(|&p| pick::at(world, &canvas, p) == bob),
-        "no click finds the bob"
+        bob.is_none()
+            || on_bob
+                .iter()
+                .all(|&p| pick::noted(world, camera, &people_ids, p) == bob),
+        "a click on the bob finds something else"
     );
+    // A click on a pixel a person was drawn in finds that person, the
+    // pixel itself and no reach around it.
     let mut found = std::collections::BTreeSet::new();
-    for &point in &of_people {
-        let id = pick::person(world, &canvas, point)
-            .unwrap_or_else(|| panic!("nobody at {point:?}, which a person was drawn in"));
-        assert!(world.objects[&id].person.is_some(), "object {id}");
-        found.insert(id);
+    for &[x, y] in &of_people {
+        let Some(shown) = canvas.id_at(x, y) else {
+            continue;
+        };
+        let id = pick::noted(world, camera, &people_ids, [x, y]);
+        assert_eq!(id, Some(shown), "at {:?}", [x, y]);
+        assert!(world.objects[&shown].person.is_some(), "object {shown}");
+        found.insert(shown);
     }
     assert!(!found.is_empty(), "no drawn person is found by a click");
     let far = |&[x, y]: &[i32; 2]| {
@@ -163,29 +173,43 @@ fn people_stand_where_a_click_finds_them() {
         .iter()
         .find(|p| far(p))
         .expect("a pixel far from every person");
-    assert_eq!(pick::person(world, &canvas, far_point), None);
-    // Far from everyone, a click finds the object shown at the pixel, as
-    // the lot alone shows it: each object on the lot that shows a pixel
-    // there is found by a click on it.
+    assert_eq!(pick::noted(world, camera, &people_ids, far_point), None);
+    // Far from everyone, a click finds an object by the sprite pick, from
+    // the lot's depth alone: never a person, and mostly the object the
+    // pixel shows (a rectangle nearer the viewer may hold the point too).
     let mut objects = std::collections::BTreeSet::new();
+    let (mut shown_objects, mut agree) = (0, 0);
     for point in points.iter().filter(|p| far(p)) {
         let shown = bare.id_at(point[0], point[1]);
         assert_eq!(canvas.id_at(point[0], point[1]), shown, "{point:?}");
-        let picked = pick::at(world, &canvas, *point);
-        assert_eq!(picked, shown, "{point:?}");
+        let picked = pick::at(&lot, camera, &canvas, &bare.depth, &people_ids, *point);
+        if shown.is_some() {
+            shown_objects += 1;
+            agree += usize::from(picked == shown);
+        }
         if let Some(id) = picked {
             assert!(world.objects[&id].person.is_none(), "object {id}");
             objects.insert(id);
         }
     }
+    // At 100 ticks, 30689 of the 38365 pixels that show an object.
+    assert!(
+        agree * 4 > shown_objects * 3,
+        "the pick finds the shown object at only {agree} of {shown_objects} pixels"
+    );
     assert!(objects.len() > 20, "only {} objects found", objects.len());
     // Behind a lot nearer than everyone, nobody is drawn, and a click
     // where they stand finds nobody.
     let mut covered = Canvas::new(800, 600, [0, 0, 0]);
     covered.depth.fill(i32::MIN);
-    people.draw(world, &view.camera, &mut covered);
+    people.draw(world, camera, &mut covered);
+    let covered = covered.ids();
     for &point in changed.iter().step_by(7) {
-        assert_eq!(pick::at(world, &covered, point), None, "{point:?}");
+        assert_eq!(
+            pick::noted(world, camera, &covered, point),
+            None,
+            "{point:?}"
+        );
     }
 }
 
@@ -519,9 +543,8 @@ fn the_pointer_reaching_an_object_lists_its_menu_and_a_click_lists_it_again() {
 /// The plumb bob is picked as itself, not as the person under it: the
 /// original's bob draw makes the bob the graphic under the pointer when
 /// it changes the depth there (0x586455), and the pick then lists the
-/// bob's pie (0x48ca2c → 0x48c834). With the pointer on the bob, with no
-/// person shown within the pick's reach (`pick::REACH`), the selected
-/// Sim's pie is listed on object 383. As in the snack order's
+/// bob's pie (0x48ca2c → 0x48c834). With the pointer on a pixel of the
+/// bob, the selected Sim's pie is listed on object 383. As in the snack order's
 /// recording at update 622, of Mortimer's object words only data word 50
 /// changes, to 1 (his running checks' word, set by the bob's check
 /// trees); his frames (tree, node, locals) and his last result stay as
@@ -557,6 +580,52 @@ fn the_pointer_on_the_plumb_bob_lists_the_bobs_menu() {
     game.hover(point);
     assert_eq!(game.listed(), Some((21, bob)));
     assert_eq!(mortimer(&game), (1, last, stack));
+}
+
+/// The sprite pick works on a turned view as on the first: in each of
+/// the four rotations, most pixels that show an object pick it. A turn
+/// takes effect on the pick with the frame drawn through it, not before:
+/// until then the pointer picks from the frame on screen.
+#[test]
+fn the_pointer_picks_what_each_turned_view_shows() {
+    use sims_game::view::Move;
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    assert_eq!(game.run(100), 100);
+    game.resize([800, 600]);
+    let points: Vec<[i32; 2]> = (0..600)
+        .step_by(3)
+        .flat_map(|y| (0..800).step_by(3).map(move |x| [x, y]))
+        .collect();
+    for turn in 0..4 {
+        game.render();
+        let picks: Vec<Option<u16>> = points.iter().map(|&p| game.under(p)).collect();
+        let world = game.lot().world();
+        let (mut shown, mut agree) = (0, 0);
+        for (&[x, y], &picked) in points.iter().zip(&picks) {
+            let Some(id) = game.canvas().id_at(x, y) else {
+                continue;
+            };
+            if game.over_panel([x, y]) || world.objects[&id].person.is_some() {
+                continue;
+            }
+            shown += 1;
+            agree += usize::from(picked == Some(id));
+        }
+        assert!(
+            shown > 1000 && agree * 4 > shown * 3,
+            "turn {turn}: the pick finds the shown object at {agree} of {shown} pixels"
+        );
+        // Turned but not drawn yet: the picks are the frame's on screen.
+        game.apply(Move::Rotate(true));
+        let after: Vec<Option<u16>> = points.iter().map(|&p| game.under(p)).collect();
+        assert!(
+            after == picks,
+            "turn {turn}: the pick moved before the frame"
+        );
+    }
 }
 
 #[test]
@@ -1954,6 +2023,7 @@ fn the_recorded_snack_order_replayed_in_the_window_matches_the_recording() {
     // have one after every 30th from 33. Which frames the original drew
     // before update 171 is not shown; these are the default's.
     let frames = Frames::parse("0,1,2,3,33,63,93,123,153,171+30").expect("a schedule");
+    let schedule = frames.clone();
     let mut game = Game::open(&Options {
         frames,
         ..options(install)
@@ -1964,12 +2034,7 @@ fn the_recorded_snack_order_replayed_in_the_window_matches_the_recording() {
     let mortimer = game.lot().world().selected().expect("a Sim is selected");
     assert_eq!(mortimer, 21);
     let last = |game: &Game| game.lot().world().objects[&mortimer].last_result;
-    let run_to = |game: &mut Game, tick: u32| {
-        while game.lot().ticks() < tick {
-            assert_eq!(game.run(1), 1, "{:?}", game.stopped());
-            game.render();
-        }
-    };
+    let run_to = |game: &mut Game, tick: u32| run_to(game, &schedule, tick);
     run_to(&mut game, 123);
     let at = (0..600)
         .step_by(2)
@@ -2090,13 +2155,17 @@ fn pie_entry(game: &Game, label: &str) -> [i32; 2] {
     [r.x + r.width / 2, r.y + r.height / 2]
 }
 
-/// Runs the lot to `tick`, drawing a frame after each update as the
-/// window does. The lot must not be past `tick` already.
-fn run_to(game: &mut Game, tick: u32) {
+/// Runs the lot to `tick`, drawing the house view after the updates
+/// `frames` draws a frame after, as the original draws its view: the
+/// pointer then picks from the frame the original's picked from (the
+/// window draws more often). The lot must not be past `tick` already.
+fn run_to(game: &mut Game, frames: &Frames, tick: u32) {
     assert!(game.lot().ticks() <= tick, "already past {tick}");
     while game.lot().ticks() < tick {
         assert_eq!(game.run(1), 1, "{:?}", game.stopped());
-        game.render();
+        if frames.after(game.lot().ticks()) {
+            game.render();
+        }
     }
 }
 
@@ -2138,6 +2207,7 @@ fn the_recorded_sit_order_replayed_in_the_window_matches_the_recording() {
         return;
     };
     let frames = Frames::parse("0,1,2,3,33,63,93,123,153,170+30").expect("a schedule");
+    let schedule = frames.clone();
     let mut game = Game::open(&Options {
         frames,
         ..options(install)
@@ -2147,14 +2217,14 @@ fn the_recorded_sit_order_replayed_in_the_window_matches_the_recording() {
     let (mortimer, bench, salesman) = (21, 173, 259);
     assert_eq!(game.lot().world().selected(), Some(mortimer));
     for (tick, at) in [(91, [432, 254]), (117, [432, 242])] {
-        run_to(&mut game, tick);
+        run_to(&mut game, &schedule, tick);
         game.hover(recorded(at));
         assert_eq!(game.listed(), None, "{tick}");
     }
-    run_to(&mut game, 123);
+    run_to(&mut game, &schedule, 123);
     game.hover(recorded([432, 230]));
     assert_eq!(game.listed(), Some((mortimer, bench)));
-    run_to(&mut game, 153);
+    run_to(&mut game, &schedule, 153);
     game.press(recorded([432, 230]));
     game.render();
     let labels: Vec<String> = game
@@ -2165,15 +2235,15 @@ fn the_recorded_sit_order_replayed_in_the_window_matches_the_recording() {
         .map(|(text, _)| text.to_string())
         .collect();
     assert_eq!(labels, ["Sit"]);
-    run_to(&mut game, 173);
+    run_to(&mut game, &schedule, 173);
     let sit = pie_entry(&game, "Sit");
     game.hover(sit);
-    run_to(&mut game, 200);
+    run_to(&mut game, &schedule, 200);
     game.press(sit);
     assert!(game.menu().is_none());
     // The recording pushed it before update 201 and had it running, with
     // an empty queue, at 203.
-    run_to(&mut game, 201);
+    run_to(&mut game, &schedule, 201);
     let person = game.lot().world().objects[&mortimer]
         .person
         .clone()
@@ -2182,19 +2252,19 @@ fn the_recorded_sit_order_replayed_in_the_window_matches_the_recording() {
     assert!(person.queue.is_empty());
     // Bella's (18) room is counted again in the frame after 470, and the
     // others' after 620.
-    run_to(&mut game, 470);
+    run_to(&mut game, &schedule, 470);
     assert_eq!(room(&game, 18), 0x4225_ac1d);
-    run_to(&mut game, 471);
+    run_to(&mut game, &schedule, 471);
     assert_eq!(room(&game, 18), 0x4277_073c);
-    run_to(&mut game, 620);
+    run_to(&mut game, &schedule, 620);
     for id in [16, mortimer, salesman] {
         assert_eq!(room(&game, id), 0x429a_aaab, "{id}");
     }
-    run_to(&mut game, 621);
+    run_to(&mut game, &schedule, 621);
     for id in [16, mortimer, salesman] {
         assert_eq!(room(&game, id), 0x4232_aaab, "{id}");
     }
-    run_to(&mut game, 800);
+    run_to(&mut game, &schedule, 800);
     assert_eq!(game.caught(), 0, "{:?}", game.errors());
 }
 
@@ -2208,10 +2278,10 @@ fn the_recorded_sit_order_replayed_in_the_window_matches_the_recording() {
 /// which was saved before its release was sent, so which of its button
 /// events acts is not known. The replay gives each press once the lot
 /// has run the update before the one its effect shows in. With the frames
-/// its Room motives show (after 316, 474, 648 and 1124), the lot equals
-/// the recording's after every update to 1300 but for the pointer's two
-/// listings ours does not make: on the kitchen counter behind its wall
-/// at 90, and under the still pointer at 256 (see docs/decisions/).
+/// its Room motives show (after 316, 474, 648 and 1124), and the house
+/// view drawn only after those updates, the lot equals the recording's
+/// after every update to 1300 but for one listing ours does not make,
+/// under the still pointer at 256 (see docs/decisions/).
 #[test]
 fn the_recorded_cancel_order_replayed_in_the_window_matches_the_recording() {
     let Some(install) = install() else {
@@ -2219,6 +2289,7 @@ fn the_recorded_cancel_order_replayed_in_the_window_matches_the_recording() {
     };
     let frames = Frames::parse("0,1,2,3,33,63,93,123,153,171,201,231,261,291,316,474,648,1124")
         .expect("a schedule");
+    let schedule = frames.clone();
     let mut game = Game::open(&Options {
         frames,
         ..options(install)
@@ -2236,40 +2307,50 @@ fn the_recorded_cancel_order_replayed_in_the_window_matches_the_recording() {
     let snack = |uid| (uid, fridge as i16, 4103, 1, 50, 12);
     let order = |game: &mut Game, hovers: &[(u32, [i32; 2])], press: u32, entry: (u32, u32)| {
         for &(tick, at) in hovers {
-            run_to(game, tick);
+            run_to(game, &schedule, tick);
             game.hover(recorded(at));
         }
         assert_eq!(game.listed(), Some((mortimer, fridge)));
-        run_to(game, press);
+        run_to(game, &schedule, press);
         game.press(recorded(hovers.last().unwrap().1));
         game.render();
-        run_to(game, entry.0);
+        run_to(game, &schedule, entry.0);
         let at = pie_entry(game, "Have A Snack");
         game.hover(at);
-        run_to(game, entry.1);
+        run_to(game, &schedule, entry.1);
         game.press(at);
         assert!(game.menu().is_none());
     };
+    // The pointer reaches the kitchen counter's spot at 90 with the
+    // kitchen wall shown in front of it: nothing is listed until the frame
+    // after 93, which cuts the wall away and shows the counter (119).
+    run_to(&mut game, &schedule, 90);
+    game.hover(recorded([176, 222]));
+    assert_eq!(game.listed(), None);
+    run_to(&mut game, &schedule, 92);
+    assert_eq!(game.listed(), None);
+    run_to(&mut game, &schedule, 93);
+    assert_eq!(game.listed(), Some((mortimer, 119)));
     order(
         &mut game,
-        &[(90, [176, 222]), (123, [176, 210]), (153, [176, 198])],
+        &[(123, [176, 210]), (153, [176, 198])],
         183,
         (201, 256),
     );
     // Queued behind his reading (the bookcase's 4110), as recorded at
     // 257.
-    run_to(&mut game, 257);
+    run_to(&mut game, &schedule, 257);
     let p = person(&game);
     assert_eq!(action(&p.active), (1, bookcase as i16, 4110, 6, 2, 0));
     assert_eq!(p.queue.iter().map(action).collect::<Vec<_>>(), [snack(2)]);
     // The second order's first two pointer moves; his room is counted
     // again in the frame after 316, the update the second one reached.
-    run_to(&mut game, 310);
+    run_to(&mut game, &schedule, 310);
     game.hover(recorded([176, 222]));
-    run_to(&mut game, 316);
+    run_to(&mut game, &schedule, 316);
     assert_eq!(room(&game, mortimer), 0x4225_ac1d);
     game.hover(recorded([176, 210]));
-    run_to(&mut game, 317);
+    run_to(&mut game, &schedule, 317);
     assert_eq!(room(&game, mortimer), 0x4277_073c);
     order(
         &mut game,
@@ -2277,32 +2358,32 @@ fn the_recorded_cancel_order_replayed_in_the_window_matches_the_recording() {
         376,
         (396, 444),
     );
-    run_to(&mut game, 445);
+    run_to(&mut game, &schedule, 445);
     let p = person(&game);
     assert_eq!(action(&p.active), snack(2));
     assert_eq!(p.queue.iter().map(action).collect::<Vec<_>>(), [snack(5)]);
-    run_to(&mut game, 474);
+    run_to(&mut game, &schedule, 474);
     assert_eq!(room(&game, mortimer), 0x415c_71c8);
     game.hover([104, 54]);
-    run_to(&mut game, 475);
+    run_to(&mut game, &schedule, 475);
     assert_eq!(room(&game, mortimer), 0x4253_a203);
     // The queued snack's icon, second in the queue.
-    run_to(&mut game, 504);
+    run_to(&mut game, &schedule, 504);
     assert_eq!(
         person(&game).queue.iter().map(action).collect::<Vec<_>>(),
         [snack(5)]
     );
     game.press([104, 54]);
-    run_to(&mut game, 505);
+    run_to(&mut game, &schedule, 505);
     let p = person(&game);
     assert_eq!(action(&p.active), snack(2));
     assert!(p.queue.is_empty());
     // The running snack's icon.
-    run_to(&mut game, 564);
+    run_to(&mut game, &schedule, 564);
     game.hover([54, 54]);
-    run_to(&mut game, 594);
+    run_to(&mut game, &schedule, 594);
     game.press([54, 54]);
-    run_to(&mut game, 595);
+    run_to(&mut game, &schedule, 595);
     let p = person(&game);
     assert_eq!(action(&p.active), (2, fridge as i16, 4103, 1, 50, 0x10c));
     assert_eq!(
@@ -2312,19 +2393,244 @@ fn the_recorded_cancel_order_replayed_in_the_window_matches_the_recording() {
     assert_eq!(p.data[33], 0);
     // The salesman is taken off the lot in update 597, his door knock
     // still playing, as in the recording.
-    run_to(&mut game, 596);
+    run_to(&mut game, &schedule, 596);
     assert!(game.lot().world().objects.contains_key(&salesman));
-    run_to(&mut game, 597);
+    run_to(&mut game, &schedule, 597);
     assert!(!game.lot().world().objects.contains_key(&salesman));
-    run_to(&mut game, 648);
+    run_to(&mut game, &schedule, 648);
     assert_eq!(room(&game, 16), 0x4277_073c);
-    run_to(&mut game, 649);
+    run_to(&mut game, &schedule, 649);
     assert_eq!(room(&game, 16), 0x422c_0000);
-    run_to(&mut game, 1124);
+    run_to(&mut game, &schedule, 1124);
     assert_eq!(room(&game, mortimer), 0x4253_a203);
-    run_to(&mut game, 1125);
+    run_to(&mut game, &schedule, 1125);
     assert_eq!(room(&game, mortimer), 0x4225_ac1d);
-    run_to(&mut game, 1300);
+    run_to(&mut game, &schedule, 1300);
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
+}
+
+/// Track 2's recording of the original ordering Mortimer to talk to Bella
+/// about interests (goth-talk-order-20261118), replayed in the window as
+/// the Sit order is: a press on Bella opens her pie, Talk... opens its
+/// submenu, and About Interests queues the talk. The original found Bella
+/// under the pointer at the recording's (400, 274), three rows below the
+/// lowest pixel our frame draws her at; while ours finds nothing there,
+/// the replay points at that pixel (`docs/decisions/`). With the frames
+/// its Room motives show (after every 30th update from 190), the lot
+/// equals the recording's after every update to 1000, in every word our
+/// state does not mark as unknown, but for the listings the original most
+/// likely made under the still pointer, which ours does not make.
+#[test]
+fn the_recorded_talk_order_replayed_in_the_window_matches_the_recording() {
+    let Some(install) = install() else {
+        return;
+    };
+    let frames = Frames::parse("0,1,2,3,33,63,93,123,153,190+30").expect("a schedule");
+    let schedule = frames.clone();
+    let mut game = Game::open(&Options {
+        frames,
+        ..options(install)
+    })
+    .expect("the Goth house opens");
+    game.resize([800, 600]);
+    let (alexander, bella, mortimer, social, salesman) = (16, 18, 21, 260, 259);
+    assert_eq!(game.lot().world().selected(), Some(mortimer));
+    let labels = |game: &Game| -> Vec<String> {
+        game.menu()
+            .expect("a pie menu is open")
+            .labels()
+            .into_iter()
+            .map(|(text, _)| text.to_string())
+            .collect()
+    };
+    run_to(&mut game, &schedule, 85);
+    game.hover(recorded([400, 286]));
+    assert_eq!(game.listed(), None);
+    // The original listed Bella's pie with the pointer at the recording's
+    // (400, 274): Mortimer's last result goes from 1 to 0 at 94. Ours
+    // finds nothing at that point; then the replay points at her lowest
+    // drawn pixel.
+    run_to(&mut game, &schedule, 93);
+    let last_result = |game: &Game| game.lot().world().objects[&mortimer].last_result;
+    assert!(last_result(&game));
+    let on_bella = match game.under(recorded([400, 274])) {
+        Some(id) if id == bella => recorded([400, 274]),
+        _ => [499, 317],
+    };
+    game.hover(on_bella);
+    assert_eq!(game.listed(), Some((mortimer, bella)));
+    assert!(!last_result(&game));
+    run_to(&mut game, &schedule, 94);
+    assert!(!last_result(&game));
+    run_to(&mut game, &schedule, 123);
+    game.press(on_bella);
+    game.render();
+    let pie = labels(&game);
+    run_to(&mut game, &schedule, 138);
+    let talk = pie_entry(&game, "Talk...");
+    game.hover(talk);
+    run_to(&mut game, &schedule, 176);
+    game.press(talk);
+    game.render();
+    let submenu = labels(&game);
+    // The recording's screenshot at 177 shows the same six entries; the
+    // harness chose the submenu's first entry.
+    assert_eq!(
+        pie,
+        [
+            "Dance...",
+            "Hug...",
+            "Kiss...",
+            "Invite Downtown",
+            "Talk...",
+            "Invite to Old Town"
+        ]
+    );
+    assert_eq!(submenu[0], "About Interests");
+    run_to(&mut game, &schedule, 206);
+    let interests = pie_entry(&game, "About Interests");
+    game.hover(interests);
+    run_to(&mut game, &schedule, 250);
+    game.press(interests);
+    assert!(game.menu().is_none());
+    game.hover(recorded([400, 273]));
+    // Queued behind his reading (the bookcase's 4110) through the social
+    // object, with Bella's answer running, as recorded at 251; running at
+    // 252.
+    run_to(&mut game, &schedule, 251);
+    let person = |game: &Game, id: u16| game.lot().world().objects[&id].person.clone().unwrap();
+    let talking = |uid, flags| (uid, social as i16, 4235, 21, 50, flags);
+    let p = person(&game, mortimer);
+    assert_eq!(action(&p.active), (1, 132, 4110, 6, 2, 0));
+    assert_eq!(
+        p.queue.iter().map(action).collect::<Vec<_>>(),
+        [talking(2, 0)]
+    );
+    let p = person(&game, bella);
+    assert_eq!(action(&p.active), (3, social as i16, 4236, 50, 50, 12));
+    assert!(p.queue.is_empty());
+    run_to(&mut game, &schedule, 252);
+    let p = person(&game, mortimer);
+    assert_eq!(action(&p.active), talking(2, 12));
+    assert!(p.queue.is_empty());
+    // Everyone's room is counted again in the frame after 520. There the
+    // original's still pointer also lists a pie, most likely the
+    // salesman's (unverified; Mortimer's word 50 goes to 1 at 521); ours
+    // lists nothing.
+    run_to(&mut game, &schedule, 520);
+    for id in [alexander, bella, mortimer, salesman] {
+        assert_eq!(room(&game, id), 0x429a_aaab, "{id}");
+    }
+    run_to(&mut game, &schedule, 521);
+    for id in [alexander, bella, mortimer, salesman] {
+        assert_eq!(room(&game, id), 0x4234_0000, "{id}");
+    }
+    run_to(&mut game, &schedule, 1000);
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
+}
+
+/// Track 2's Read A Book recording (`goth-read-order-20261118`) replayed
+/// through the window's input layer: a press on the bookcase, then Read a
+/// Book. Each input is given at the update before the recording's
+/// command ended, except the press on the bookcase (below); frames are
+/// drawn after the updates its Room motives show (every 30th from 186).
+/// A scratch comparison found the lot equal to the recording's after
+/// every update from 1 to 900 except for what
+/// `docs/decisions/20261120-read-order-replayed-in-the-window.md` lists;
+/// this test checks the states below.
+#[test]
+fn the_recorded_read_order_replayed_in_the_window_matches_the_recording() {
+    let Some(install) = install() else {
+        return;
+    };
+    let frames = Frames::parse("0,1,2,3,33,63,93,123,153,186+30").expect("a schedule");
+    let schedule = frames.clone();
+    let mut game = Game::open(&Options {
+        frames,
+        ..options(install)
+    })
+    .expect("the Goth house opens");
+    game.resize([800, 600]);
+    let (alexander, bella, mortimer, bookcase, salesman) = (16, 18, 21, 132, 259);
+    assert_eq!(game.lot().world().selected(), Some(mortimer));
+    let last_result = |game: &Game| game.lot().world().objects[&mortimer].last_result;
+    run_to(&mut game, &schedule, 87);
+    game.hover(recorded([384, 262]));
+    assert_eq!(game.listed(), None);
+    // The original listed the bookcase's pie with the pointer at the
+    // recording's (384, 250), a wall pixel in our frame, where our pick
+    // finds the door. While it does, the replay points 7 columns right on
+    // the same row, where our pick finds the bookcase (the recording's
+    // harness did not try that point).
+    run_to(&mut game, &schedule, 93);
+    let on_bookcase = match game.under(recorded([384, 250])) {
+        Some(id) if id == bookcase => recorded([384, 250]),
+        _ => [488, 296],
+    };
+    assert_eq!(game.under(on_bookcase), Some(bookcase));
+    // His last result is 1 before and after, as recorded from 84 to 186.
+    assert!(last_result(&game));
+    game.hover(on_bookcase);
+    assert_eq!(game.listed(), Some((mortimer, bookcase)));
+    assert!(last_result(&game));
+    // The harness's press on the bookcase ended at 122 and its release at
+    // 144; it first reported the pie at 124, so the press is given after
+    // 123, as for the Talk order's top pie.
+    run_to(&mut game, &schedule, 123);
+    game.press(on_bookcase);
+    game.render();
+    let pie: Vec<String> = game
+        .menu()
+        .expect("the bookcase's pie is open")
+        .labels()
+        .into_iter()
+        .map(|(text, _)| text.to_string())
+        .collect();
+    // The recording's harness saw the same three entries.
+    assert_eq!(pie, ["Study Cooking", "Study Mechanical", "Read a Book"]);
+    run_to(&mut game, &schedule, 143);
+    let read = pie_entry(&game, "Read a Book");
+    let hash = |game: &Game| game.lot().world().hash();
+    let before = hash(&game);
+    game.hover(read);
+    assert_ne!(hash(&game), before, "reaching the entry checked it");
+    run_to(&mut game, &schedule, 186);
+    let person = |game: &Game, id: u16| game.lot().world().objects[&id].person.clone().unwrap();
+    assert_eq!(person(&game, mortimer).active.uid, 0);
+    // The locals his new frames start with at 187 are what the entry's
+    // check leaves with his frames as they are from 150, so the original
+    // may have checked the entry again after 150. What made it run is
+    // not known (its mousedown ended at 163, its release at 187). Ours
+    // checked it once, at 143 (unverified, not ported).
+    game.press(read);
+    assert!(game.menu().is_none());
+    game.hover(recorded([384, 324]));
+    // Running at once, as recorded at 187, with his last result 0.
+    run_to(&mut game, &schedule, 187);
+    let p = person(&game, mortimer);
+    assert_eq!(action(&p.active), (1, bookcase as i16, 4110, 6, 50, 12));
+    assert!(p.queue.is_empty());
+    assert!(!last_result(&game));
+    // Everyone's room is counted again in the frame after 606.
+    run_to(&mut game, &schedule, 606);
+    for (id, before) in [
+        (alexander, 0x429a_aaab),
+        (bella, 0x4225_ac1d),
+        (mortimer, 0x429a_aaab),
+        (salesman, 0x429a_aaab),
+    ] {
+        assert_eq!(room(&game, id), before, "{id}");
+    }
+    run_to(&mut game, &schedule, 607);
+    for (id, after) in [
+        (alexander, 0x4235_5555),
+        (bella, 0x4277_073c),
+        (mortimer, 0x4235_5555),
+        (salesman, 0x4235_5555),
+    ] {
+        assert_eq!(room(&game, id), after, "{id}");
+    }
+    run_to(&mut game, &schedule, 900);
     assert_eq!(game.caught(), 0, "{:?}", game.errors());
 }
 
@@ -2411,4 +2717,61 @@ fn the_frame_draws_a_bench_in_use_after_the_sim_on_it() {
             "({x}, {y}): {at:?}"
         );
     }
+}
+
+/// The pointer on the in-use bench of
+/// `the_frame_draws_a_bench_in_use_after_the_sim_on_it`. Where the
+/// backrest, drawn after the people, covers Mortimer, the pick notes him:
+/// in the original his draw changed the depth there before the bench drew
+/// (0x590ebd to 0x590f84), so he is the noted graphic. Elsewhere on the
+/// bench, the sprite pick finds it by the rectangle it was drawn into
+/// after the people.
+#[test]
+fn the_pointer_notes_a_sim_behind_the_bench_they_sit_on() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&Options {
+        answers: vec![3, 3],
+        ..options(install)
+    })
+    .expect("the Goth house opens");
+    let left = 1260 - game.lot().ticks();
+    assert_eq!(game.run(left), left);
+    let bench = 174;
+    let mortimer = 21;
+    assert!(sims_render::holds_person(game.lot().world()).contains(&bench));
+    game.resize([800, 600]);
+    game.view.camera.zoom = sims_render::Zoom::Near;
+    game.view.camera.rotation = 2;
+    game.view.camera.origin = [591, -2018];
+    game.view.camera.walls = sims_render::Walls::Down;
+    game.render();
+    let on_bench: Vec<[i32; 2]> = (0..600)
+        .flat_map(|y| (0..800).map(move |x| [x, y]))
+        .filter(|&[x, y]| game.canvas().id_at(x, y) == Some(bench))
+        .collect();
+    let (behind, rest): (Vec<_>, Vec<_>) = on_bench
+        .iter()
+        .map(|&p| (p, game.under(p)))
+        .partition(|&(_, picked)| picked == Some(mortimer));
+    // 1134 of the bench's 3173 pixels cover him, and the other 2039 all
+    // pick the bench.
+    assert!(
+        behind.len() > 500,
+        "the bench covers {} of him",
+        behind.len()
+    );
+    assert!(
+        rest.len() > 500,
+        "only {} of the bench's pixels",
+        rest.len()
+    );
+    let missed: Vec<_> = rest.iter().filter(|&&(_, p)| p != Some(bench)).collect();
+    assert!(
+        missed.is_empty(),
+        "{} of {}: {missed:?}",
+        missed.len(),
+        rest.len()
+    );
 }

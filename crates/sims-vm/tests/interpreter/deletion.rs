@@ -4,7 +4,8 @@
 use crate::factory::{WIDGET, widgets};
 use crate::support::*;
 use sims_formats::execution::ObjectFunction;
-use sims_formats::saved_objects::Slot;
+use sims_formats::saved_objects::{Relationship, Slot};
+use sims_sim::neighbors::{Neighbor, Row};
 use sims_vm::{Interpreter, SoundEvent, Trap};
 use std::cell::RefCell;
 
@@ -89,6 +90,79 @@ fn a_deleted_object_resets_one_last_time_and_is_unlinked() {
     // The freed ID is the next one the factory hands out.
     assert_eq!(interpreter.create(&mut world, WIDGET), Ok(2));
     assert_eq!(world.instances[&WIDGET], [1, 3, 2]);
+}
+
+#[test]
+fn deletion_erases_incoming_object_relationships_including_a_persons() {
+    let (mut fx, _) = lot(3, false);
+    fx.add_sim(9);
+    let row = |target| Relationship {
+        present: 1,
+        target,
+        values: vec![target, 5],
+    };
+    fx.world.objects.get_mut(&1).unwrap().relationships = vec![row(9), row(2), row(3)];
+    fx.world.objects.get_mut(&2).unwrap().relationships = vec![row(1)];
+    fx.world.objects.get_mut(&9).unwrap().relationships = vec![row(2)];
+    fx.world.neighbors.slots = vec![Some(Neighbor {
+        id: 1,
+        guid: SIM_GUID,
+        revision: 0,
+        data: Vec::new(),
+        relationships: vec![Row {
+            target: 2,
+            values: vec![42],
+        }],
+        friends: 0,
+        stale: false,
+    })];
+    let mut world = fx.world.clone();
+    fx.interpreter().delete(&mut world, 2).unwrap();
+    let rows: Vec<_> = world.objects[&1]
+        .relationships
+        .iter()
+        .map(|row| (row.target, row.values.as_slice()))
+        .collect();
+    assert_eq!(rows, [(9, &[9, 5][..]), (3, &[3, 5][..])]);
+    assert!(world.objects[&9].relationships.is_empty());
+    assert_eq!(world.neighbors, fx.world.neighbors);
+}
+
+#[test]
+fn deletion_erases_only_the_first_matching_row_and_passes_empty_rows_after_it() {
+    let (mut fx, _) = lot(3, false);
+    let row = |present, target| Relationship {
+        present,
+        target,
+        values: vec![target],
+    };
+    // 0x464fa2 stops at the first row naming the deleted ID (0x464fbd),
+    // so an empty row after it is never read and a second match stays.
+    fx.world.objects.get_mut(&1).unwrap().relationships = vec![row(1, 2), row(0, 0), row(1, 2)];
+    let mut world = fx.world.clone();
+    fx.interpreter().delete(&mut world, 2).unwrap();
+    let rows: Vec<_> = world.objects[&1]
+        .relationships
+        .iter()
+        .map(|row| (row.present, row.target))
+        .collect();
+    assert_eq!(rows, [(0, 0), (1, 2)]);
+}
+
+#[test]
+fn deletion_fails_on_an_empty_row_before_the_match() {
+    let (mut fx, _) = lot(3, false);
+    let row = |present, target| Relationship {
+        present,
+        target,
+        values: vec![target],
+    };
+    // The original reads each row through its pointer (0x464fb1), so an
+    // empty row before the match would fault there.
+    fx.world.objects.get_mut(&1).unwrap().relationships = vec![row(0, 0), row(1, 2)];
+    let mut world = fx.world.clone();
+    let error = fx.interpreter().delete(&mut world, 2).unwrap_err();
+    assert!(format!("{error:?}").contains("0x464fb1"), "{error:?}");
 }
 
 #[test]
