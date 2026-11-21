@@ -31,7 +31,7 @@ pub use cutaway::{Focus, Selected};
 pub use light::Light;
 pub use lot::Lot;
 pub use open::{Opened, open_house};
-pub use scene::{Stats, draw, draw_held, draw_lot, holds_person};
+pub use scene::{Stats, draw, draw_held, draw_lot, draw_lot_in_viewport, holds_person};
 
 /// An error with a message saying what failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
