@@ -1343,6 +1343,7 @@ fn saved_lots_round_trip_through_redb_apart_from_the_snapshots() {
 
 fn person() -> sims_formats::saved_objects::Person {
     let interaction = sims_formats::saved_objects::Interaction {
+        join: 0,
         uid: 0,
         caller: 0,
         target: 0,
@@ -1372,6 +1373,47 @@ fn person() -> sims_formats::saved_objects::Person {
         object_uses: Vec::new(),
         motive_deltas: Vec::new(),
     }
+}
+
+#[test]
+fn an_actions_join_word_keeps_the_encoding_of_one_that_does_not_join() {
+    use sims_formats::saved_objects::Interaction;
+    let action = Interaction {
+        join: 0,
+        uid: 7,
+        caller: 2,
+        target: -3,
+        icon: 4,
+        table_index: 5,
+        args: [1, -1, 6, 0],
+        priority: 50,
+        action: 0x1234,
+        attenuation: 0.5,
+        flags: 0x8000_000d,
+    };
+    // The fields as format 30 wrote them, the flags a 32-bit word.
+    let old = postcard::to_allocvec(&(
+        7i32,
+        2i16,
+        -3i16,
+        4i16,
+        5i32,
+        [1i16, -1, 6, 0],
+        50i32,
+        0x1234u16,
+        0.5f32,
+        0x8000_000du32,
+    ))
+    .unwrap();
+    assert_eq!(postcard::to_allocvec(&action).unwrap(), old);
+    // The join word is kept, and only it changes the bytes.
+    let joining = Interaction { join: 1, ..action };
+    let bytes = postcard::to_allocvec(&joining).unwrap();
+    assert_ne!(bytes, old);
+    let read: Interaction = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!((read.join, read.flags, read.uid), (1, 0x8000_000d, 7));
+    let read: Interaction = postcard::from_bytes(&old).unwrap();
+    assert_eq!((read.join, read.flags), (0, 0x8000_000d));
 }
 
 #[test]

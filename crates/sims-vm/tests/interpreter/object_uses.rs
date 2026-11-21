@@ -47,6 +47,7 @@ fn using() -> Fixture {
     let person = fx.sim_mut().person.as_mut().unwrap();
     person.data[73] = 0;
     person.active = Interaction {
+        join: 0,
         uid: 9,
         caller: SIM as i16,
         target: LAMP as i16,

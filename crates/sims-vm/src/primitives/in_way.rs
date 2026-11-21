@@ -435,6 +435,7 @@ impl Machine<'_, '_> {
         let entry = self.table(marker)?.and_then(|t| find(t, MOVE as u32));
         let constants = self.program.autonomy_constants();
         let action = Interaction {
+            join: 0,
             uid: 0,
             caller: asked as i16,
             target: marker as i16,
@@ -684,9 +685,7 @@ impl Machine<'_, '_> {
         }
         let mut saved = None;
         let result = self.check_and_run_at_once(id, &mut action, &mut saved);
-        if let Some(temps) = saved {
-            self.me_mut()?.temps = temps;
-        }
+        self.put_back_temps(saved)?;
         result
     }
 
@@ -695,7 +694,7 @@ impl Machine<'_, '_> {
         &mut self,
         id: u16,
         action: &mut Interaction,
-        saved: &mut Option<Vec<i16>>,
+        saved: &mut crate::autonomy::SavedTemps,
     ) -> Result<Option<i32>, Trap> {
         self.check_chosen(action, saved, None)?;
         if action.flags & crate::autonomy::checked::PASSED == 0 || self.running_at_once.is_some() {

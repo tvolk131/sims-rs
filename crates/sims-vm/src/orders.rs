@@ -15,19 +15,21 @@
 //! 3. Each action is checked (0x458319 with the menu's mode): rules on P
 //!    and O and the entry's check tree. One that passes is offered with
 //!    flags 4 and 8 set and 0x10 clear (0x458705).
-//! 4. When the player picks one, that action is queued on P unchanged
-//!    (0x48dd67 calls 0x45d20b). The rest is the menu closing and the
-//!    interface's feedback.
+//! 4. When the player picks one, that action is queued on its caller
+//!    unchanged (0x48ddbe calls 0x45d20b): on P, but for the offer to
+//!    join P's running interaction, whose caller is O. The rest is the
+//!    menu closing and the interface's feedback.
 //!
 //! [`Interpreter::pie_menu`] lists what the menu offers (steps 1 to 3,
-//! 0x48d392 and 0x45859c), and [`Interpreter::pick`] queues one of its
-//! actions (step 4). [`Interpreter::order`] does steps 1, 2 and 4 for an
+//! 0x48d392 and 0x45859c, and the offer to join, below), and
+//! [`Interpreter::pick`] queues one of its actions (step 4). [`Interpreter::order`] does steps 1, 2 and 4 for an
 //! entry the caller names, without the check.
 //!
 //! **Listing the menu changes the lot.** Each entry's check tree runs
 //! synchronously on the person and is not undone; only the person's
 //! temps are put back (saved before the first check tree, restored when
-//! the listing ends, 0x48d492). The person's object data word 50 is left
+//! the listing ends, 0x48d492). The offer to join runs its check tree on
+//! the other person. The person's object data word 50 is left
 //! as the last check left it. The original lists the menu when the
 //! cursor reaches an object (0x48c834), not when it is clicked, and the
 //! click shows that list. So a faithful caller lists the menu at the
@@ -55,10 +57,28 @@
 //!    as its name and the string's four arguments as its own. It is added
 //!    to the menu then, whether or not the check passes, and the action
 //!    itself is not.
-//! 4. What is not ported fails loudly: the entry to join another person's
-//!    interaction, which the original adds when the person's running
-//!    interaction may be joined and the object is another person
-//!    (0x45866d).
+//! 4. After the table's entries, the offer to join P's running
+//!    interaction (0x45866d), when its entry in its target's own table
+//!    has flag 2 (may be joined) and O is another person. The action
+//!    (0x41ee99) is a copy of P's running one (0x41edbf) with flags 2 and
+//!    4 cleared, word +0 1 (it joins), O as caller and priority 50. It
+//!    goes to the running target's interaction target (0x435286), to the
+//!    entry whose menu number is the joining index of that target's first
+//!    entry with the running menu number. Without a table, a first entry,
+//!    a joining index other than -1 or an entry with it, the action has
+//!    no target and keeps the running menu number. Its arguments are
+//!    cleared and its number is 0; its tree, attenuation (by whether O is
+//!    a visitor) and flag bit 0 come from its entry, or are 0 without
+//!    one. The listing then gives it P's object ID as its third argument
+//!    (0x4586c7) and checks and offers it as step 3 does. The check reads
+//!    O, the caller, and runs the check tree on O's stack with the
+//!    arguments 0, 1, P's ID and 0 (0x458372); one without a target is
+//!    not offered. The original copies the running action's name too, and
+//!    then gives it the entry's name (0x41efc1); here a [`MenuEntry`]
+//!    without a name shows its entry's, which is the same. The menu's
+//!    temps are those of the first person a check tree ran on, so O's
+//!    when the offer's check tree is the listing's first. A target
+//!    without a table offers nothing, this offer included (0x4585ff).
 //! 5. When the listing offers nothing (0x48d423), each object on the
 //!    clicked object's tile (object +0xfc, read through 0x43f331 and
 //!    0x43f379, in the order the lot links them, the links read again
@@ -73,7 +93,7 @@
 //!    nothing is empty. The tile is the one the object's position is on;
 //!    for an object held in a slot that is **unverified**.
 
-use crate::autonomy::{attenuation, checked, entry, find, person};
+use crate::autonomy::{JOINS, SavedTemps, attenuation, checked, entry, find, person};
 use crate::fault::{Fault, Trap};
 use crate::interpreter::{Interpreter, Machine};
 use crate::placement::Cursor;
@@ -177,11 +197,12 @@ impl Interpreter<'_> {
         machine.pie_menu(object).map_err(|trap| machine.fault(trap))
     }
 
-    /// Checks again, for `person`, the action of the pie menu's entry the
+    /// Checks again the action of the entry of `person`'s pie menu the
     /// pointer has reached, as the original does when the pointer reaches
     /// an entry (0x48df28). Returns the action with the flags the check
-    /// left. The check runs the entry's check tree on the lot, as
-    /// autonomy's check does, and is not undone but for the person's
+    /// left. The check reads the action's caller (`person`, but for the
+    /// offer to join) and runs the entry's check tree on the lot, as
+    /// autonomy's check does; it is not undone but for the caller's
     /// temps.
     pub fn highlight(
         &self,
@@ -196,12 +217,15 @@ impl Interpreter<'_> {
         Ok(action)
     }
 
-    /// Queues on `person` the action of an entry [`Self::pie_menu`]
-    /// offered, unchanged,
-    /// as picking it does (0x48dd67, 0x45d20b). Returns the action's
-    /// number, or None when the queue took nothing: it is full, or the
-    /// target's table no longer has the action's entry. What the
-    /// queue does not port fails loudly, as for [`Self::order`].
+    /// Queues the action of an entry [`Self::pie_menu`] listed for
+    /// `person` on the action's caller, unchanged, as picking it does
+    /// (0x48ddbe, 0x45d20b). The caller is `person` for every entry but
+    /// the offer to join `person`'s running interaction, whose caller is
+    /// the person the menu was listed on: picking it queues the action on
+    /// that person. Returns the action's number, or None when the queue
+    /// took nothing: it is full, or the target's table no longer has the
+    /// action's entry. What the queue does not port fails loudly, as for
+    /// [`Self::order`].
     pub fn pick(
         &self,
         world: &mut World,
@@ -219,7 +243,8 @@ impl Interpreter<'_> {
                 .table(target)?
                 .and_then(|table| find(table, action.table_index as u32))
                 .map(|record| record.flags & AT_ONCE != 0);
-            machine.queue_action(person, action, at_once)
+            let caller = machine.caller(&action)?;
+            machine.queue_action(caller, action, at_once)
         })();
         result.map_err(|trap| machine.fault(trap))
     }
@@ -262,6 +287,7 @@ impl Machine<'_, '_> {
         };
         let constants = self.program.autonomy_constants();
         let action = Interaction {
+            join: 0,
             uid: 0,
             caller: person as i16,
             target: target as i16,
@@ -283,9 +309,7 @@ impl Machine<'_, '_> {
         let listed = self.list_with_tile(object, &mut saved);
         // The first listing's temps go back last (0x48d492), after the
         // tile's.
-        if let Some(temps) = saved {
-            self.me_mut()?.temps = temps;
-        }
+        self.put_back_temps(saved)?;
         listed
     }
 
@@ -295,7 +319,7 @@ impl Machine<'_, '_> {
     fn list_with_tile(
         &mut self,
         object: u16,
-        saved: &mut Option<Vec<i16>>,
+        saved: &mut SavedTemps,
     ) -> Result<Vec<MenuEntry>, Trap> {
         let mut listed = self.listing(object, saved)?;
         if !listed.is_empty() {
@@ -324,9 +348,7 @@ impl Machine<'_, '_> {
                     // ends (0x4582dd).
                     let mut own = None;
                     let more = self.listing(other, &mut own);
-                    if let Some(temps) = own {
-                        self.me_mut()?.temps = temps;
-                    }
+                    self.put_back_temps(own)?;
                     listed.extend(more?);
                 }
             }
@@ -337,11 +359,7 @@ impl Machine<'_, '_> {
 
     /// One listing (0x4582ad, 0x458583): the entries of the table of
     /// `object`'s interaction target.
-    fn listing(
-        &mut self,
-        object: u16,
-        saved: &mut Option<Vec<i16>>,
-    ) -> Result<Vec<MenuEntry>, Trap> {
+    fn listing(&mut self, object: u16, saved: &mut SavedTemps) -> Result<Vec<MenuEntry>, Trap> {
         // Read for each listing, after the checks of any before it.
         let me = self.me;
         let data = &self
@@ -357,10 +375,17 @@ impl Machine<'_, '_> {
             ));
         }
         let target = self.interaction_target(object)?;
-        let menus: Vec<u32> = self
-            .table(target)?
-            .map(|table| table.interactions.iter().map(|e| e.string_index).collect())
-            .unwrap_or_default();
+        // A target without a table offers nothing, not even the offer to
+        // join (0x4585ff).
+        let Some(menus) = self.table(target)?.map(|table| {
+            table
+                .interactions
+                .iter()
+                .map(|e| e.string_index)
+                .collect::<Vec<_>>()
+        }) else {
+            return Ok(Vec::new());
+        };
         self.list_entries(target, &menus, saved)
     }
 
@@ -369,39 +394,71 @@ impl Machine<'_, '_> {
         &mut self,
         target: u16,
         menus: &[u32],
-        saved: &mut Option<Vec<i16>>,
+        saved: &mut SavedTemps,
     ) -> Result<Vec<MenuEntry>, Trap> {
         let me = self.me;
         let mut listed = Vec::new();
         for &menu in menus {
             // Read for each action, after the checks before it (0x41f08b).
-            let visitor = self
-                .me()?
-                .person
-                .as_ref()
-                .and_then(|p| p.data.get(person::VISITOR).copied())
-                .unwrap_or(0)
-                != 0;
-            let Some((mut action, _)) = self.menu_action(me, target, menu, visitor)? else {
+            let visitor = self.visitor(me)?;
+            let Some((action, _)) = self.menu_action(me, target, menu, visitor)? else {
                 continue;
             };
-            let before = listed.len();
-            self.check_chosen(&mut action, saved, Some(&mut listed))?;
-            // Only when the check tree added no entry (0x458724).
-            if listed.len() == before
-                && action.flags & checked::PASSED != 0
-                && action.flags & checked::MARKED == 0
-            {
-                listed.push(MenuEntry { action, name: None });
-            }
+            self.offer(action, saved, &mut listed)?;
         }
+        // Read after the entries' checks (0x45866d).
+        if let Some(action) = self.join_action(target)? {
+            self.offer(action, saved, &mut listed)?;
+        }
+        Ok(listed)
+    }
+
+    /// Checks an action and offers it (0x458705): it is offered when the
+    /// check leaves flag 8 set and 0x10 clear, and only when the check
+    /// tree added no entry of its own (0x458724).
+    fn offer(
+        &mut self,
+        mut action: Interaction,
+        saved: &mut SavedTemps,
+        listed: &mut Vec<MenuEntry>,
+    ) -> Result<(), Trap> {
+        let before = listed.len();
+        self.check_chosen(&mut action, saved, Some(listed))?;
+        if listed.len() == before
+            && action.flags & checked::PASSED != 0
+            && action.flags & checked::MARKED == 0
+        {
+            listed.push(MenuEntry { action, name: None });
+        }
+        Ok(())
+    }
+
+    /// Whether person `id` is a visitor (person data word 32, +0x5cc).
+    fn visitor(&self, id: u16) -> Result<bool, Trap> {
+        Ok(self
+            .world
+            .objects
+            .get(&id)
+            .and_then(|o| o.person.as_ref())
+            .ok_or_else(|| Trap::Invalid(format!("object {id} is not a person")))?
+            .data
+            .get(person::VISITOR)
+            .is_some_and(|&word| word != 0))
+    }
+
+    /// The offer to join the running person's running interaction, on
+    /// the pie menu of `target` (step 4 of the module's documentation;
+    /// 0x45866d, 0x41ee99), or None when there is none.
+    fn join_action(&self, target: u16) -> Result<Option<Interaction>, Trap> {
+        let me = self.me;
         let running = self
             .me()?
             .person
             .as_ref()
             .map(|p| p.active.clone())
             .ok_or_else(|| Trap::Invalid(format!("object {me} is not a person")))?;
-        // The running interaction's entry, read as autonomy reads it.
+        // The running interaction's entry, in its target's own table
+        // (0x41f0ff), read as autonomy reads it.
         let joinable = u16::try_from(running.target)
             .ok()
             .filter(|id| self.world.objects.contains_key(id))
@@ -416,12 +473,66 @@ impl Machine<'_, '_> {
                 .objects
                 .get(&target)
                 .is_some_and(|o| o.person.is_some());
-        if joinable && other_person {
-            return Err(Trap::Unsupported(format!(
-                "the pie menu on person {target} while my running interaction may be joined, \
-                 where the original offers to join it (0x45866d, 0x41ee99)"
-            )));
+        if !joinable || !other_person {
+            return Ok(None);
         }
-        Ok(listed)
+        // A copy of the running action (0x41edbf), with flags 2 and 4
+        // cleared, word +0 1, the other person as caller and priority 50
+        // (0x41eed0 to 0x41eedd).
+        let mut action = Interaction {
+            join: JOINS,
+            caller: target as i16,
+            priority: MENU_PRIORITY,
+            flags: running.flags & !6,
+            ..running.clone()
+        };
+        // It goes to the running target's interaction target, to the
+        // entry whose menu number is the joining index of that target's
+        // first entry with the running menu number; without one, to no
+        // target, the menu number left as it was (0x41eee4 to 0x41ef77).
+        // `joinable` holds only if the running target exists.
+        let goes_to = self.interaction_target(running.target as u16)?;
+        let joining = self.table(goes_to)?.and_then(|table| {
+            let first = find(table, running.table_index as u32)?;
+            let index = first.joining_index;
+            (index != -1 && find(table, index as u32).is_some()).then_some(index)
+        });
+        match joining {
+            Some(index) => {
+                action.target = goes_to as i16;
+                action.table_index = index;
+            }
+            None => action.target = 0,
+        }
+        action.args = [0; 4];
+        action.uid = 0;
+        // The rest from the action's entry (0x41f0ff), as for any action
+        // the menu makes, the attenuation by whether the other person is
+        // a visitor (0x41ef8f to 0x41eff7).
+        let record = match joining {
+            Some(_) => self
+                .table(goes_to)?
+                .and_then(|table| find(table, action.table_index as u32))
+                .cloned(),
+            None => None,
+        };
+        match record {
+            Some(record) => {
+                let constants = self.program.autonomy_constants();
+                action.action = record.action;
+                action.attenuation =
+                    attenuation(&constants, self.visitor(target)?, &record).to_f32();
+                action.flags = (action.flags & !1) | u32::from(record.flags & ENTRY_FLAG != 0);
+            }
+            None => {
+                action.action = 0;
+                action.attenuation = 0.0;
+                action.flags &= !1;
+            }
+        }
+        // The listing gives it the running person's object ID as its third
+        // argument (0x4586c7).
+        action.args[2] = me as i16;
+        Ok(Some(action))
     }
 }

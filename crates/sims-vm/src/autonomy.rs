@@ -201,23 +201,30 @@ pub use sims_sim::Advertisement;
 /// entry's menu number (its TTAB string index), its attenuation and
 /// whether its flag bit 8 is set. `join` marks the entry that joins a
 /// person's running interaction (0x41ee99), whose word +0 is 1 rather
-/// than 0; the check (0x458372) reads it.
+/// than 0, and holds its word +0x18 (its third argument); the check
+/// (0x458372) reads both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Entry {
     target: u16,
     menu: u32,
     attenuation: F32,
     first: bool,
-    join: bool,
+    join: Option<i16>,
 }
 
 /// The arguments of an entry's check tree (0x458354 to 0x458385): 1 (the
 /// scan's flag), then 1 for the entry that joins a running interaction
-/// and 0 for any other, then the join entry's word +0x18, which 0x41ee99
-/// clears, and 0; then the tree's ID, the word that follows the four in
+/// and 0 for any other, then the join entry's word +0x18 (0 for any
+/// other), and 0; then the tree's ID, the word that follows the four in
 /// the original's memory.
-fn check_arguments(join: bool, tree: u16) -> [i16; 5] {
-    [1, i16::from(join), 0, 0, tree as i16]
+fn check_arguments(join: Option<i16>, tree: u16) -> [i16; 5] {
+    [
+        1,
+        i16::from(join.is_some()),
+        join.unwrap_or(0),
+        0,
+        tree as i16,
+    ]
 }
 
 /// A candidate (16 bytes at person +0x814): the object, the menu entry,
@@ -738,7 +745,9 @@ impl Machine<'_, '_> {
                 {
                     let menu = running.joining_index as u32;
                     let mut entry = self.autonomy_entry(chooser, goes_to, table, menu);
-                    entry.join = true;
+                    // 0x41ee99 clears the arguments, and the scan writes
+                    // none (0x458aee).
+                    entry.join = Some(0);
                     entries.push(entry);
                 }
             }
@@ -771,7 +780,7 @@ impl Machine<'_, '_> {
             menu,
             attenuation,
             first,
-            join: false,
+            join: None,
         }
     }
 
@@ -793,10 +802,11 @@ impl Machine<'_, '_> {
     /// many as it has, the rest staying), and its check tree, if it has
     /// one, decides: the tree of the target's type runs
     /// synchronously on the person's stack (0x4749b5), with the target as
-    /// its stack object and the arguments 1, 0, 0, 0 (1, 1, 0, 0 for a
-    /// join entry) and the tree's ID
+    /// its stack object and the arguments 1, 0, 0, 0 (for a join entry 1,
+    /// 1, its word +0x18 and 0) and the tree's ID
     /// (the word that follows the original's four in memory). The
     /// person's temps are saved before the first check tree of the scan.
+    /// The person is `chooser.me`, the check's caller (0x45832e).
     /// Last, whatever the check returned, if the target is in another room
     /// than the person, the record's room motive delta becomes its
     /// minimum negated (0x45853f). The record is returned when the entry
@@ -815,7 +825,7 @@ impl Machine<'_, '_> {
         };
         let record = record.clone();
         let me = chooser.me;
-        self.me_mut()?.data[data::CHECKED] = 0;
+        self.checked_person_mut(me)?.data[data::CHECKED] = 0;
         let target = &self.world.objects[&entry.target];
         let target_data = |index: usize| target.data.get(index).copied().unwrap_or(0);
         let mut allowed = true;
@@ -879,13 +889,13 @@ impl Machine<'_, '_> {
             // (0x4749d9), fails to push a tree the file lacks (0x47484a),
             // and returns false (0x474ada).
             if saved.is_none() {
-                *saved = Some(self.me()?.temps.clone());
+                *saved = Some(self.checked_person(me)?.temps.clone());
             }
-            self.write_mark()?;
+            self.write_mark_on(me)?;
             false
         } else if record.test != 0 {
             if saved.is_none() {
-                *saved = Some(self.me()?.temps.clone());
+                *saved = Some(self.checked_person(me)?.temps.clone());
             }
             let tree = record.test;
             let args = check_arguments(entry.join, tree);
@@ -939,10 +949,13 @@ impl Machine<'_, '_> {
     /// the entry's action with a context that 0x458293 makes with the
     /// byte 1, and the advertisement record as its output. So it is
     /// autonomy's check ([`Machine::autonomy_allows`]): the arguments 1,
-    /// 0, 0, 0, a target whose data word 25 is above 0 fails, the entry's
-    /// advertisements are copied over the one record, and the room rule
-    /// applies. The person's temps are saved before the check tree and
-    /// put back after it (0x4582dd).
+    /// 0, 0, 0 (for the offer to join, whose word +0 is 1, 1, 1, its third
+    /// argument and 0), a target whose data word 25 is above 0 fails, the
+    /// entry's advertisements are copied over the one record, and the room
+    /// rule applies. The person checked is the action's caller (0x45832e),
+    /// which for the offer to join is the person the menu was listed on.
+    /// Its temps are saved before the check tree and put back after it
+    /// (0x4582dd).
     ///
     /// The action's flags are written as 0x458319 writes them: 8 cleared
     /// and 4 set; then, if the target's table has the action's entry, 8
@@ -966,9 +979,9 @@ impl Machine<'_, '_> {
         if find(table, menu).is_none() {
             return Ok(());
         }
-        let me = self.me;
+        let me = self.caller(action)?;
         let person = self
-            .me()?
+            .checked_person(me)?
             .person
             .as_ref()
             .ok_or(Trap::native(0x1c, "object is not a person"))?;
@@ -991,15 +1004,17 @@ impl Machine<'_, '_> {
             menu,
             attenuation: F32::ZERO,
             first: false,
-            join: false,
+            join: (action.join == JOINS).then_some(action.args[2]),
         };
         let mut saved = None;
         let allowed = self.autonomy_allows(&chooser, entry, &mut saved);
-        if let Some(temps) = saved {
-            self.me_mut()?.temps = temps;
-        }
+        self.put_back_temps(saved.map(|temps| (me, temps)))?;
         let passed = allowed?.is_some();
-        let marked = self.me()?.data.get(data::CHECKED).is_some_and(|&w| w != 0);
+        let marked = self
+            .checked_person(me)?
+            .data
+            .get(data::CHECKED)
+            .is_some_and(|&w| w != 0);
         action.flags &= !(checked::PASSED | checked::MARKED);
         if passed {
             action.flags |= checked::PASSED;
@@ -1045,10 +1060,83 @@ pub(crate) mod checked {
     pub const MARKED: u32 = 0x10;
 }
 
+/// The join word (+0) of the action that joins a person's running
+/// interaction (0x41eed4); the check passes the join's arguments when the
+/// word is exactly this (0x458372).
+pub(crate) const JOINS: i32 = 1;
+
+/// The temps a check saved before its first check tree (the context's
+/// +0x1c and +0xa, 0x4584c5): whose they were, and what. They go back to
+/// that person when the check's context ends (0x4582dd).
+pub(crate) type SavedTemps = Option<(u16, Vec<i16>)>;
+
 impl Machine<'_, '_> {
+    /// Object `id`, the person a check reads.
+    pub(crate) fn checked_person(&self, id: u16) -> Result<&sims_sim::Object, Trap> {
+        self.world
+            .objects
+            .get(&id)
+            .ok_or(Trap::native(10, "missing object"))
+    }
+
+    pub(crate) fn checked_person_mut(&mut self, id: u16) -> Result<&mut sims_sim::Object, Trap> {
+        self.world
+            .objects
+            .get_mut(&id)
+            .ok_or(Trap::native(10, "missing object"))
+    }
+
+    /// The action's caller (+4), the person 0x458319 checks: an object of
+    /// the lot that is a person.
+    pub(crate) fn caller(
+        &self,
+        action: &sims_formats::saved_objects::Interaction,
+    ) -> Result<u16, Trap> {
+        u16::try_from(action.caller)
+            .ok()
+            .filter(|id| {
+                self.world
+                    .objects
+                    .get(id)
+                    .is_some_and(|o| o.person.is_some())
+            })
+            .ok_or_else(|| {
+                Trap::Invalid(format!(
+                    "an action's caller, object {}, is not a person on the lot",
+                    action.caller
+                ))
+            })
+    }
+
+    /// The synchronous run's mark above the top frame of person `id`
+    /// (0x4749d9), as a check tree the file lacks leaves it.
+    fn write_mark_on(&mut self, id: u16) -> Result<(), Trap> {
+        if id == self.me {
+            self.write_mark()?;
+        } else {
+            self.interpreter()
+                .machine(self.world, id, 0, false)
+                .write_mark()?;
+        }
+        Ok(())
+    }
+
+    /// Puts back the temps a check saved (0x4582dd), on the person they
+    /// were saved from.
+    pub(crate) fn put_back_temps(&mut self, saved: SavedTemps) -> Result<(), Trap> {
+        if let Some((id, temps)) = saved {
+            self.checked_person_mut(id)?.temps = temps;
+        }
+        Ok(())
+    }
+
     /// The check of an action the player chose (0x458319 on a context
     /// that 0x4582ad makes with the byte 0, and no advertisements). It
-    /// writes its result to the action's flags ([`checked`]):
+    /// writes its result to the action's flags ([`checked`]). The person
+    /// it checks is the action's caller (+4, 0x45832e), which must be a
+    /// person on the lot; that is the person whose queue holds the
+    /// action, but for the pie menu's offer to join, whose caller is the
+    /// person the menu was listed on.
     ///
     /// 1. Flag 8 is cleared and flag 4 set. An action with no target, or
     ///    whose target's table has no entry with its menu number (the
@@ -1064,12 +1152,15 @@ impl Machine<'_, '_> {
     /// 5. If it has not failed, the entry's check tree, if it has one,
     ///    decides: it runs synchronously on the person's stack with the
     ///    target as its stack object and the arguments 0, 0, 0, 0 (byte 0
-    ///    and an action that does not join; the tree's ID follows). The
-    ///    person's temps are saved into `saved` first, if they were not
-    ///    already; the caller puts them back (0x4582dd). A tree the file
-    ///    lacks fails. An interface flag (0x6e5134) would pass the action
-    ///    after its tree whatever the tree returned; only interface code
-    ///    writes it, so it is taken to be clear.
+    ///    and an action that does not join; the tree's ID follows). For
+    ///    an action whose word +0 is 1 ([`JOINS`]) they are 0, 1, its
+    ///    third argument (+0x18) and 0 (0x458372). The person's temps are
+    ///    saved into `saved` first, with whose they are, if no temps were
+    ///    saved yet; the caller puts them back ([`Machine::put_back_temps`],
+    ///    0x4582dd). A tree the file lacks fails. An interface flag
+    ///    (0x6e5134) would pass the action after its tree whatever the tree
+    ///    returned; only interface code writes it, so it is taken to be
+    ///    clear.
     /// 6. Flag 8 is set if it passed, and flag 0x10 is set or cleared by
     ///    whether the person's object data word 50 is set.
     ///
@@ -1077,14 +1168,10 @@ impl Machine<'_, '_> {
     /// runs with the listing's state ([`crate::Interpreter`]'s `menu`),
     /// holding the action as step 1 left it, and the entries the tree adds
     /// (Add/Change Action String, 0x458789) are added to `menu`.
-    ///
-    /// A queued action here is taken not to join another (its word +0,
-    /// which the save does not keep, 0); 0x41f00e, which makes the pie
-    /// menu's actions, writes 0 there.
     pub(crate) fn check_chosen(
         &mut self,
         action: &mut sims_formats::saved_objects::Interaction,
-        saved: &mut Option<Vec<i16>>,
+        saved: &mut SavedTemps,
         menu: Option<&mut Vec<crate::orders::MenuEntry>>,
     ) -> Result<(), Trap> {
         action.flags = (action.flags & !checked::PASSED) | checked::RAN;
@@ -1103,10 +1190,11 @@ impl Machine<'_, '_> {
             return Ok(());
         };
         let record = record.clone();
-        self.me_mut()?.data[data::CHECKED] = 0;
+        let caller = self.caller(action)?;
+        self.checked_person_mut(caller)?.data[data::CHECKED] = 0;
         let word = |object: &sims_sim::Object, index: usize| object.data.get(index).copied();
-        let me = self.me()?;
-        let person = me
+        let person = self
+            .checked_person(caller)?
             .person
             .as_ref()
             .ok_or(Trap::native(0x1c, "object is not a person"))?;
@@ -1147,7 +1235,7 @@ impl Machine<'_, '_> {
             true
         } else {
             if saved.is_none() {
-                *saved = Some(self.me()?.temps.clone());
+                *saved = Some((caller, self.checked_person(caller)?.temps.clone()));
             }
             let resource = self.definition(self.world.objects[&target].guid)?.resource;
             match self.program.tree(resource, record.test) {
@@ -1155,7 +1243,7 @@ impl Machine<'_, '_> {
                 // (0x4749d9), fails to push a tree the file lacks
                 // (0x47484a), and returns false.
                 crate::program::Tree::Missing => {
-                    self.write_mark()?;
+                    self.write_mark_on(caller)?;
                     false
                 }
                 crate::program::Tree::Primitive(id) => {
@@ -1165,8 +1253,14 @@ impl Machine<'_, '_> {
                 }
                 crate::program::Tree::Behavior(..) => {
                     let tree = record.test;
-                    let args = [0, 0, 0, 0, tree as i16];
-                    let me = self.me;
+                    let joins = action.join == JOINS;
+                    let args = [
+                        0,
+                        i16::from(joins),
+                        if joins { action.args[2] } else { 0 },
+                        0,
+                        tree as i16,
+                    ];
                     let checking = menu.is_some().then(|| {
                         std::cell::RefCell::new(crate::orders::Checking {
                             action: action.clone(),
@@ -1181,7 +1275,7 @@ impl Machine<'_, '_> {
                     let passed = interpreter
                         .call_as(
                             self.world,
-                            me,
+                            caller,
                             target,
                             tree,
                             target as i16,
@@ -1202,7 +1296,11 @@ impl Machine<'_, '_> {
                 }
             }
         };
-        let marked = self.me()?.data.get(data::CHECKED).is_some_and(|&w| w != 0);
+        let marked = self
+            .checked_person(caller)?
+            .data
+            .get(data::CHECKED)
+            .is_some_and(|&w| w != 0);
         action.flags &= !(checked::PASSED | checked::MARKED);
         if passed {
             action.flags |= checked::PASSED;
@@ -1220,7 +1318,10 @@ mod tests {
 
     #[test]
     fn a_join_entry_runs_its_check_with_a_second_argument_of_1() {
-        assert_eq!(check_arguments(false, 0x1234), [1, 0, 0, 0, 0x1234]);
-        assert_eq!(check_arguments(true, 0x1234), [1, 1, 0, 0, 0x1234]);
+        assert_eq!(check_arguments(None, 0x1234), [1, 0, 0, 0, 0x1234]);
+        assert_eq!(check_arguments(Some(0), 0x1234), [1, 1, 0, 0, 0x1234]);
+        // The offer to join that the pie menu makes has its third argument
+        // (0x4586c7), which the pointer's check passes on.
+        assert_eq!(check_arguments(Some(7), 0x1234), [1, 1, 7, 0, 0x1234]);
     }
 }

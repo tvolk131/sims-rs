@@ -6,6 +6,7 @@ use sims_sim::motives::{Curve, MOOD, ROOM, Rates, Tuning, apply_changes};
 
 fn interaction() -> Interaction {
     Interaction {
+        join: 0,
         uid: 0,
         caller: 0,
         target: 0,

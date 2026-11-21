@@ -672,6 +672,88 @@ fn reaching_a_pie_entry_checks_its_action_again() {
     assert_eq!(lot.world().hash(), before);
 }
 
+/// At tick 1500 of the Goth house, person 18 runs menu 1 of object 217,
+/// which may be joined. Its pie menu on another person ends with the offer
+/// to join it (0x45866d, 0x41ee99), whose caller is that person; picking
+/// it queues the offer on that person, who takes it up and keeps its join
+/// word while it runs.
+#[test]
+fn the_pie_menu_on_another_goth_offers_to_join_what_i_run() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut lot = Lot::load(&root, &house, &[3, 3], Frames::default()).unwrap();
+    while lot.ticks() < 1500 {
+        lot.step().unwrap_or_else(|e| panic!("{e}"));
+    }
+    let (me, other) = (18, 16);
+    let running = |lot: &Lot, id: u16| {
+        lot.world().objects[&id]
+            .person
+            .as_ref()
+            .unwrap()
+            .active
+            .clone()
+    };
+    let mine = running(&lot, me);
+    assert_eq!((mine.target, mine.table_index), (217, 1));
+    let menu = lot.pie_menu(me, other).unwrap_or_else(|e| panic!("{e}"));
+    let (offer, entries) = menu.entries.split_last().unwrap();
+    assert!(
+        entries
+            .iter()
+            .all(|e| e.action.join == 0 && e.action.caller == me as i16)
+    );
+    let offer = offer.action.clone();
+    assert_eq!(
+        (
+            offer.join,
+            offer.caller,
+            offer.target,
+            offer.table_index,
+            offer.args,
+            offer.priority,
+            offer.flags & 0x1c,
+        ),
+        (1, other as i16, 217, 2, [0, 0, me as i16, 0], 50, 0xc)
+    );
+    // Picking it queues it on the other person, not on me.
+    let mine_queued = lot.world().objects[&me]
+        .person
+        .as_ref()
+        .unwrap()
+        .queue
+        .len();
+    let uid = lot
+        .pick(me, offer.clone())
+        .unwrap_or_else(|e| panic!("{e}"))
+        .expect("queued");
+    assert_eq!(
+        lot.world().objects[&me]
+            .person
+            .as_ref()
+            .unwrap()
+            .queue
+            .len(),
+        mine_queued
+    );
+    let queue = &lot.world().objects[&other].person.as_ref().unwrap().queue;
+    assert!(queue.iter().any(|a| a.uid == uid && a.join == 1));
+    // The other person starts it: Idle For Input's check passes the join's
+    // arguments, and the running action keeps its join word.
+    for _ in 0..100 {
+        lot.step().unwrap_or_else(|e| panic!("{e}"));
+    }
+    let joined = running(&lot, other);
+    assert_eq!(
+        (joined.uid, joined.join, joined.target, joined.table_index),
+        (uid, 1, 217, 2)
+    );
+}
+
 #[test]
 fn the_snack_order_pays_for_the_snack() {
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {

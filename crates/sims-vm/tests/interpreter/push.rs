@@ -790,12 +790,6 @@ fn what_the_pie_menu_does_not_port_fails_loudly() {
     let mut fx = menu_lot(vec![entry(3, 0)]);
     fx.sim_mut().person.as_mut().unwrap().data[65] = 2;
     unsupported(&mut fx, LAMP, "0x4585b1");
-    // Another person, while my running interaction may be joined.
-    let mut fx = menu_lot(vec![entry(3, 2)]);
-    fx.add_sim(7);
-    let person = fx.sim_mut().person.as_mut().unwrap();
-    (person.active.target, person.active.table_index) = (LAMP as i16, 3);
-    unsupported(&mut fx, 7, "0x45866d");
     // Not a person.
     let mut fx = menu_lot(vec![entry(3, 0)]);
     let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
@@ -819,6 +813,226 @@ fn a_picked_action_whose_entry_is_gone_is_not_queued() {
     }
     assert!(fx.sim().person.as_ref().unwrap().queue.is_empty());
     assert_eq!(fx.world.action_serial, 0);
+}
+
+/// The other person in the join tests.
+const OTHER: u16 = 7;
+
+/// A lot where I run the lamp's menu 3, which may be joined (flag 2) and
+/// whose joining index is 5. The lamp's menu 5 has the check tree 4302,
+/// which writes its four arguments to its person's object data words 38
+/// to 41, writes 99 to its temp 0 and passes. People's table (the
+/// person file's 1007) has menu 8, without a check tree. Person 7 is
+/// another adult resident.
+fn join_lot() -> Fixture {
+    let joinable = Interaction {
+        joining_index: 5,
+        ..entry(3, 2)
+    };
+    let mut fx = menu_lot(vec![joinable, with_test(5, 0, 4302)]);
+    fx.add(
+        LAMP_FILE,
+        4302,
+        tree(vec![
+            assign(scope::MY_DATA, 38, scope::PARAMETERS, 0, 1),
+            assign(scope::MY_DATA, 39, scope::PARAMETERS, 1, 2),
+            assign(scope::MY_DATA, 40, scope::PARAMETERS, 2, 3),
+            assign(scope::MY_DATA, 41, scope::PARAMETERS, 3, 4),
+            assign(scope::TEMPS, 0, scope::LITERAL, 99, RETURN_TRUE),
+        ]),
+    );
+    fx.program
+        .libraries
+        .get_mut(&SIM_FILE)
+        .unwrap()
+        .interactions
+        .insert(
+            TABLE,
+            Some(InteractionTable {
+                version: 7,
+                interactions: vec![entry(8, 0)],
+            }),
+        );
+    let other = fx.add_sim(OTHER).person.as_mut().unwrap();
+    (
+        other.data[32],
+        other.data[73],
+        other.data[58],
+        other.data[65],
+    ) = (0, 0, 30, 0);
+    let active = &mut fx.sim_mut().person.as_mut().unwrap().active;
+    *active = sims_formats::saved_objects::Interaction {
+        join: 0,
+        uid: 42,
+        caller: SIM as i16,
+        target: LAMP as i16,
+        icon: LAMP as i16,
+        table_index: 3,
+        args: [9, 9, 9, 9],
+        priority: 7,
+        action: ACTION,
+        attenuation: 0.5,
+        flags: 0x7f,
+    };
+    fx
+}
+
+#[test]
+fn the_pie_menu_on_another_person_offers_to_join_my_running_interaction() {
+    let mut fx = join_lot();
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let listed = interpreter
+        .pie_menu(&mut fx.world, SIM, OTHER)
+        .unwrap_or_else(|f| panic!("{f}"));
+    let shown: Vec<_> = listed
+        .iter()
+        .map(|e| &e.action)
+        .map(|a| {
+            (
+                a.join,
+                a.uid,
+                a.caller,
+                a.target,
+                a.icon,
+                a.table_index,
+                a.args,
+                a.priority,
+                a.action,
+                a.attenuation,
+                a.flags,
+            )
+        })
+        .collect();
+    let (sim, lamp, other) = (SIM as i16, LAMP as i16, OTHER as i16);
+    assert_eq!(
+        shown,
+        [
+            // Person 7's own entry, for me.
+            (0, 0, sim, other, other, 8, [0; 4], 50, ACTION, 0.25, 0xc),
+            // The offer: a copy of my running action with flags 2 and 4
+            // cleared, word +0 1, person 7 as caller, priority 50 and my
+            // ID as its third argument; the lamp's menu 5 with that
+            // entry's tree, attenuation and flag bit 0 (clear); the icon
+            // kept. The check clears 0x10 and sets 4 and 8.
+            (
+                1,
+                0,
+                other,
+                lamp,
+                lamp,
+                5,
+                [0, 0, sim, 0],
+                50,
+                ACTION,
+                0.25,
+                0x6c
+            ),
+        ]
+    );
+    assert!(listed.iter().all(|e| e.name.is_none()));
+    // The check tree ran on person 7 with the arguments 0, 1, my ID and 0,
+    // and 7's temps, the first a check tree saved, are put back.
+    let other_object = &fx.world.objects[&OTHER];
+    assert_eq!(other_object.data[38..42], [0, 1, sim, 0]);
+    assert_eq!(other_object.temps[0], 0);
+    assert!(fx.sim().person.as_ref().unwrap().queue.is_empty());
+}
+
+#[test]
+fn a_picked_offer_to_join_is_queued_on_the_other_person() {
+    let mut fx = join_lot();
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let listed = interpreter.pie_menu(&mut fx.world, SIM, OTHER).unwrap();
+    let offer = listed[1].action.clone();
+    assert_eq!(
+        interpreter.pick(&mut fx.world, SIM, offer.clone()),
+        Ok(Some(1))
+    );
+    assert!(fx.sim().person.as_ref().unwrap().queue.is_empty());
+    let queue = &fx.world.objects[&OTHER].person.as_ref().unwrap().queue;
+    let [queued] = queue.as_slice() else {
+        panic!("{queue:?}");
+    };
+    let mut expected = offer.clone();
+    expected.uid = 1;
+    assert_eq!(format!("{queued:?}"), format!("{expected:?}"));
+    // The pointer's check of the offer runs on person 7 too, with the
+    // byte 1 first. (Its check, unlike the listing's, refuses a target
+    // whose data word 25 is above 0.)
+    fx.world.objects.get_mut(&OTHER).unwrap().data[38..42].fill(-1);
+    fx.world.objects.get_mut(&LAMP).unwrap().data[25] = 0;
+    let checked = interpreter
+        .highlight(&mut fx.world, SIM, offer)
+        .unwrap_or_else(|f| panic!("{f}"));
+    assert_eq!(checked.flags & 0x18, 8);
+    assert_eq!(fx.world.objects[&OTHER].data[38..42], [1, 1, SIM as i16, 0]);
+}
+
+#[test]
+fn the_offer_to_join_needs_a_joinable_interaction_another_person_and_an_entry() {
+    let list = |fx: &mut Fixture, object: u16| {
+        let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        let listed = interpreter
+            .pie_menu(&mut fx.world, SIM, object)
+            .unwrap_or_else(|f| panic!("{f}"));
+        listed
+            .iter()
+            .map(|e| (e.action.join, e.action.table_index))
+            .collect::<Vec<_>>()
+    };
+    let lamp_table = |fx: &mut Fixture| {
+        fx.program
+            .libraries
+            .get_mut(&LAMP_FILE)
+            .unwrap()
+            .interactions
+            .get_mut(&TABLE)
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .interactions
+            .clone()
+    };
+    let set_lamp_table = |fx: &mut Fixture, entries| {
+        fx.program
+            .libraries
+            .get_mut(&LAMP_FILE)
+            .unwrap()
+            .interactions
+            .get_mut(&TABLE)
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .interactions = entries;
+    };
+    // My running interaction may not be joined.
+    let mut fx = join_lot();
+    let mut entries = lamp_table(&mut fx);
+    entries[0].flags = 0;
+    set_lamp_table(&mut fx, entries);
+    assert_eq!(list(&mut fx, OTHER), [(0, 8)]);
+    // My own menu.
+    let mut fx = join_lot();
+    assert_eq!(list(&mut fx, SIM), [(0, 8)]);
+    // No entry has the joining index, or it is -1: the offer has no
+    // target, and its check ends before its tree.
+    for index in [6, -1] {
+        let mut fx = join_lot();
+        let mut entries = lamp_table(&mut fx);
+        entries[0].joining_index = index;
+        set_lamp_table(&mut fx, entries);
+        assert_eq!(list(&mut fx, OTHER), [(0, 8)]);
+        assert_eq!(fx.world.objects[&OTHER].data[38..42], [76, 78, 80, 82]);
+    }
+    // A person without a table offers nothing, the offer included.
+    let mut fx = join_lot();
+    fx.program
+        .libraries
+        .get_mut(&SIM_FILE)
+        .unwrap()
+        .interactions
+        .clear();
+    assert_eq!(list(&mut fx, OTHER), []);
 }
 
 #[test]
