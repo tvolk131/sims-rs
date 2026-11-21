@@ -3,6 +3,9 @@
 #
 # - about: what the screenshot shows;
 # - tick: our tick, the lot's ticks since the load;
+# - paused_ticks (optional, only with `paused = yes`, default 0): partial
+#   scheduler passes (`0x46d553`) run while paused on an isolated branch at
+#   `tick` before drawing the frame, with the lot's clock standing still;
 # - zoom (far, medium or near), rotation, level, origin (the camera's,
 #   x then y) and walls (up, cutaway or down);
 # - paused and strip: whether the original was paused and its panel's
@@ -108,6 +111,7 @@ floors = frame 99.55 surface 99.72 objects 99.99 people 9.28 panel 99.88
 [near-r3-down-0816]
 about = 8:16 AM, paused. Indoors: the kitchen and the bathroom, the patio table and the fountain; walls down. Scroll (1760, -1968).
 tick = 3189
+paused_ticks = 16817
 zoom = near
 rotation = 3
 level = 1
@@ -116,15 +120,16 @@ walls = down
 paused = yes
 strip = no
 original = near-r3-down-0816.ppm f4e0c19091303a8529ed8fb57b17d4f32ec7ea688d5966dabbd9e9e57ba6873a
-ours = 5de0868aaf3d0f03de523e3218b50e44f5f439ba76bb123c3ff9a4d504c8a467
+ours = 1276c7bbffa3371a47ac1df72ccb505612aa9e2622b75e51f8921f16a226e950
 leave_out = 302 19 501 79 the original's pause notice, drawn for the screenshot; ours draws none
 leave_out = 86 554 98 565 the panel's pause button, which blinks while paused
 leave_out = 0 100 78 258 the fountain, whose water runs
-floors = frame 98.40 surface 99.69 objects 94.50 panel 99.88
+floors = frame 99.77 surface 99.69 objects 99.93 panel 99.88
 
 [near-r0-up-0816]
 about = 8:16 AM, paused. The house's side with walls up: windows, the front door, the hall and the stairs. Scroll (1036, -970).
 tick = 3189
+paused_ticks = 16817
 zoom = near
 rotation = 0
 level = 1
@@ -133,11 +138,11 @@ walls = up
 paused = yes
 strip = no
 original = near-r0-up-0816.ppm 4d665ddf77d21df7cf27850c9f90006ab4b6af60f541d1f14803421f53567a6c
-ours = d4dc2a3023689284482cd47e45c86b073d2e21a2ec939882cccf8dd56015c3f7
+ours = c74b5085f66635e99a1220044593766d0115da747a4fdbb1a5b37949d3b7c1ed
 leave_out = 302 19 501 79 the original's pause notice, drawn for the screenshot; ours draws none
 leave_out = 86 554 98 565 the panel's pause button, which blinks while paused
 leave_out = 490 0 576 106 the fountain, whose water runs
-floors = frame 99.94 surface 99.95 objects 99.93 panel 99.88
+floors = frame 99.98 surface 99.99 objects 100.00 panel 99.88
 
 [night-far-r0-cut-2153]
 about = 9:53 PM, paused. The whole lot at night; cutaway walls. Scroll (528, -16).

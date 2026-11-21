@@ -2174,6 +2174,61 @@ fn a_paused_goth_house_goes_on_updating_with_its_clock_standing() {
 }
 
 #[test]
+fn a_paused_goth_house_wakes_counter_117_at_idle_20000() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
+    // On Complete Collection, Counter - Kitchen - Moderate (0x91767a36, IDs
+    // 114..=117) resets on load (0x43a516 -> 0x431fbe) to data[0] = 0
+    // (straight DGRP #100) with data[60] = 1 (scheduler bit 17: runs in
+    // paused partial passes, 0x46d553) and enters Main -> Idle(20000).
+    for id in 114..=117 {
+        let counter = &lot.world().objects[&id];
+        assert_eq!(counter.data[0], 0, "counter {id} starts at DGRP #100");
+        assert_eq!(counter.data[60], 1, "counter {id} runs while paused");
+        assert_ne!(counter.flags() & 2, 0, "counter {id} has scheduler flag 2");
+    }
+    for _ in 0..3189 {
+        assert!(lot.step().unwrap().full);
+    }
+    assert_eq!(lot.world().objects[&117].data[0], 0);
+    assert_eq!(lot.pause(), Ok(true));
+    let clock = |lot: &Lot| {
+        let g = &lot.world().globals;
+        (lot.world().ticks, g[0], g[5], g[6])
+    };
+    let frozen = clock(&lot);
+    for paused_tick in 1..16817u32 {
+        let update = lot.step().unwrap();
+        assert!(!update.full, "paused tick {paused_tick}");
+        assert_eq!(
+            lot.world().objects[&117].data[0],
+            0,
+            "counter 117 still sleeping at paused tick {paused_tick}"
+        );
+    }
+    let wake = lot.step().unwrap();
+    assert!(!wake.full, "paused tick 16817");
+    assert_eq!(clock(&lot), frozen, "clock stands still while paused");
+    assert_eq!(
+        lot.world().objects[&117].data[0],
+        1,
+        "counter 117 wakes from Idle(20000) while paused and selects corner DGRP #101"
+    );
+    for id in [114, 115, 116] {
+        assert_eq!(
+            lot.world().objects[&id].data[0],
+            0,
+            "straight counter {id} stays at DGRP #100"
+        );
+    }
+}
+
+#[test]
 fn the_player_answers_a_dialog_when_it_is_shown() {
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");

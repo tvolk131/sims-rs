@@ -2,13 +2,14 @@
 //! compared pixel for pixel with frozen screenshots of the original.
 //!
 //! The scenes are in `ratchet.txt` beside this file. Each gives the tick
-//! and camera, whether the game is paused and the panel's strip open, the
-//! original's screenshot and its SHA-256, the SHA-256 of our frame, the
-//! regions left out (each with its reason), and for each class of pixel
-//! the share that must match exactly (its floor, in percent). The
-//! screenshots are private and are not in the repository: set
-//! `SIMS_RATCHET` to the folder that holds them (binary PPM, 800 by 600)
-//! and `SIMS_INSTALL` to the game.
+//! and camera, whether the game is paused (plus optional `paused_ticks`,
+//! partial scheduler passes run while paused before drawing the frame) and
+//! whether the panel's strip is open, the original's screenshot and its
+//! SHA-256, the SHA-256 of our frame, the regions left out (each with its
+//! reason), and for each class of pixel the share that must match exactly
+//! (its floor, in percent). The screenshots are private and are not in the
+//! repository: set `SIMS_RATCHET` to the folder that holds them (binary
+//! PPM, 800 by 600) and `SIMS_INSTALL` to the game.
 //!
 //! Without `SIMS_RATCHET` it prints `ratchet: skipped: no assets` and
 //! passes; the workspace's other tests run with only `SIMS_INSTALL` set.
@@ -633,6 +634,70 @@ fn self_check() -> Result<(), String> {
             }
         }
     }
+    let original = format!("a.ppm {hash}");
+    for (paused, extra, want_ok, want_err) in [
+        ("yes", None, Some(0), None),
+        ("yes", Some("0"), Some(0), None),
+        ("yes", Some("16817"), Some(16817), None),
+        ("no", None, Some(0), None),
+        ("no", Some("0"), None, Some("requires `paused = yes`")),
+        ("no", Some("1"), None, Some("requires `paused = yes`")),
+        ("yes", Some("-1"), None, Some("`paused_ticks`")),
+        ("yes", Some("4294967296"), None, Some("`paused_ticks`")),
+        ("yes", Some("abc"), None, Some("`paused_ticks`")),
+    ] {
+        let mut fields = vec![
+            (0, "tick", "1"),
+            (1, "zoom", "far"),
+            (2, "rotation", "0"),
+            (3, "level", "1"),
+            (4, "origin", "0 0"),
+            (5, "walls", "up"),
+            (6, "paused", paused),
+            (7, "strip", "no"),
+            (8, "original", original.as_str()),
+            (9, "ours", hash.as_str()),
+            (10, "floors", "frame 1.00"),
+        ];
+        if let Some(value) = extra {
+            fields.push((11, "paused_ticks", value));
+        }
+        match (scene("a", &fields), want_ok, want_err) {
+            (Ok(s), Some(n), None) if s.paused_ticks == n => {}
+            (Err(e), None, Some(want)) if e.contains(want) => {}
+            (got, _, _) => {
+                return Err(format!(
+                    "scene with paused={paused:?}, paused_ticks={extra:?} gives {:?}, want \
+                     ok={want_ok:?} err={want_err:?}",
+                    got.map(|s| s.paused_ticks)
+                ));
+            }
+        }
+    }
+    let dup_fields = [
+        (0, "tick", "1"),
+        (1, "zoom", "far"),
+        (2, "rotation", "0"),
+        (3, "level", "1"),
+        (4, "origin", "0 0"),
+        (5, "walls", "up"),
+        (6, "paused", "yes"),
+        (7, "paused_ticks", "1"),
+        (8, "paused_ticks", "2"),
+        (9, "strip", "no"),
+        (10, "original", original.as_str()),
+        (11, "ours", hash.as_str()),
+        (12, "floors", "frame 1.00"),
+    ];
+    match scene("a", &dup_fields) {
+        Err(e) if e.contains("given twice") => {}
+        other => {
+            return Err(format!(
+                "scene with duplicate paused_ticks gives {:?}, want `given twice`",
+                other.map(|s| s.paused_ticks)
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -641,6 +706,7 @@ fn self_check() -> Result<(), String> {
 struct Scene {
     name: String,
     tick: u32,
+    paused_ticks: u32,
     camera: Camera,
     paused: bool,
     strip: bool,
@@ -747,9 +813,10 @@ fn hundredths(word: &str) -> Option<u32> {
 }
 
 fn scene(name: &str, fields: &[(usize, &str, &str)]) -> Result<Scene, String> {
-    const KEYS: [&str; 13] = [
+    const KEYS: [&str; 14] = [
         "about",
         "tick",
+        "paused_ticks",
         "zoom",
         "rotation",
         "level",
@@ -885,11 +952,23 @@ fn scene(name: &str, fields: &[(usize, &str, &str)]) -> Result<Scene, String> {
             return Err(format!("{name}: two floors for {class}"));
         }
     }
+    let paused = yes("paused")?;
+    let paused_ticks = match fields.iter().find(|f| f.1 == "paused_ticks") {
+        Some((_, _, value)) => {
+            if !paused {
+                return Err(format!("{name}: `paused_ticks` requires `paused = yes`"));
+            }
+            u32::try_from(number("paused_ticks", value)?)
+                .map_err(|e| format!("{name}: `paused_ticks`: {e}"))?
+        }
+        None => 0,
+    };
     Ok(Scene {
         name: name.to_string(),
         tick: u32::try_from(number("tick", get("tick")?.1)?).map_err(|e| format!("{name}: {e}"))?,
+        paused_ticks,
         camera,
-        paused: yes("paused")?,
+        paused,
         strip: yes("strip")?,
         file: file.to_string(),
         original_sha256: original_sha256.to_string(),
@@ -1037,6 +1116,20 @@ fn compare(
     shares
 }
 
+/// Opens a fresh Goth house at the ratchet's frame size.
+fn open_goth(install: &Path) -> Result<Game, String> {
+    let mut game = Game::open(&Options {
+        house: goth_house(install),
+        install: install.to_path_buf(),
+        answers: vec![3],
+        play: false,
+        frames: Frames::default(),
+    })
+    .map_err(|e| format!("the Goth house does not open: {e}"))?;
+    game.resize([WIDTH as i32, HEIGHT as i32]);
+    Ok(game)
+}
+
 /// Runs the lot on to `tick`, answering each dialog with its first
 /// button.
 fn run_to(game: &mut Game, tick: u32) -> Result<(), String> {
@@ -1052,6 +1145,48 @@ fn run_to(game: &mut Game, tick: u32) -> Result<(), String> {
                 .shown
                 .object;
             game.answer(caller, 0);
+        }
+    }
+    Ok(())
+}
+
+/// Runs `ticks` partial scheduler passes while the game is paused
+/// (`0x46d553`), answering any dialog with its first button and verifying
+/// that the lot stays paused with its clock standing still.
+fn run_paused(game: &mut Game, ticks: u32) -> Result<(), String> {
+    if ticks == 0 {
+        return Ok(());
+    }
+    if !game.paused() {
+        return Err("run_paused called while unpaused".into());
+    }
+    let world_ticks_before = game.lot().world().ticks;
+    let target = game
+        .lot()
+        .ticks()
+        .checked_add(ticks)
+        .ok_or("paused tick count overflow")?;
+    while game.lot().ticks() < target {
+        let left = target - game.lot().ticks();
+        if game.run(left) < left {
+            if let Some(stop) = game.stopped() {
+                return Err(stop.to_string());
+            }
+            let caller = game
+                .asking()
+                .ok_or(format!("the lot stopped short of {ticks} paused ticks"))?
+                .shown
+                .object;
+            game.answer(caller, 0);
+        }
+        if !game.paused() {
+            return Err("the lot unpaused during paused_ticks".into());
+        }
+        if game.lot().world().ticks != world_ticks_before {
+            return Err(format!(
+                "the lot clock moved during paused_ticks ({world_ticks_before} -> {})",
+                game.lot().world().ticks
+            ));
         }
     }
     Ok(())
@@ -1183,19 +1318,15 @@ fn run(config: &Config) -> Result<(), Vec<String>> {
     }
 
     let install = &config.install;
-    let mut game = Game::open(&Options {
-        house: goth_house(install),
-        install: install.clone(),
-        answers: vec![3],
-        play: false,
-        frames: Frames::default(),
-    })
-    .map_err(|e| fail(format!("the Goth house does not open: {e}")))?;
-    game.resize([WIDTH as i32, HEIGHT as i32]);
+    let mut game = open_goth(install).map_err(fail)?;
+    // Scenes with `paused_ticks > 0` run their paused partial passes on a
+    // dedicated paused branch opened at `scene.tick`, so paused-object
+    // wakeups never leak into later unpaused scenes on `game`.
+    let mut paused_branch: Option<(u32, u32, Game)> = None;
 
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
     let mut order: Vec<usize> = (0..scenes.len()).collect();
-    order.sort_by_key(|&i| scenes[i].tick);
+    order.sort_by_key(|&i| (scenes[i].tick, scenes[i].paused_ticks));
     let mut failures = Vec::new();
     println!(
         "ratchet: {:<24} {:>8} {:>8} {:>8} {:>8} {:>8}",
@@ -1205,22 +1336,48 @@ fn run(config: &Config) -> Result<(), Vec<String>> {
         let scene = &scenes[i];
         let name = &scene.name;
         let starting = config.new.contains(name);
-        run_to(&mut game, scene.tick).map_err(|e| fail(format!("{name}: {e}")))?;
-        game.view.camera = scene.camera;
-        set_strip(&mut game, scene.strip).map_err(|e| fail(format!("{name}: {e}")))?;
-        // The original was paused for its screenshot. Paused, the lot's
-        // clock stands, so the game runs on unpaused after the frame.
-        if scene.paused {
-            game.toggle_pause();
-        }
-        game.render();
-        let canvas = game.canvas().clone();
-        if scene.paused {
-            game.toggle_pause();
-        }
+        let (active_game, canvas) = if scene.paused_ticks == 0 {
+            if matches!(paused_branch, Some((tick, _, _)) if tick != scene.tick) {
+                paused_branch = None;
+            }
+            run_to(&mut game, scene.tick).map_err(|e| fail(format!("{name}: {e}")))?;
+            game.view.camera = scene.camera;
+            set_strip(&mut game, scene.strip).map_err(|e| fail(format!("{name}: {e}")))?;
+            // The original was paused for its screenshot. Paused, the lot's
+            // clock stands, so the game runs on unpaused after the frame.
+            if scene.paused {
+                game.toggle_pause();
+            }
+            game.render();
+            let canvas = game.canvas().clone();
+            if scene.paused {
+                game.toggle_pause();
+            }
+            (&game, canvas)
+        } else {
+            let needs_new = !matches!(paused_branch, Some((tick, _, _)) if tick == scene.tick);
+            if needs_new {
+                let mut branch = open_goth(install).map_err(fail)?;
+                run_to(&mut branch, scene.tick).map_err(|e| fail(format!("{name}: {e}")))?;
+                branch.toggle_pause();
+                paused_branch = Some((scene.tick, 0, branch));
+            }
+            let (_, paused_done, branch) = paused_branch.as_mut().expect("paused branch");
+            let delta = scene
+                .paused_ticks
+                .checked_sub(*paused_done)
+                .ok_or_else(|| fail(format!("{name}: paused_ticks went backwards")))?;
+            run_paused(branch, delta).map_err(|e| fail(format!("{name}: {e}")))?;
+            *paused_done += delta;
+            branch.view.camera = scene.camera;
+            set_strip(branch, scene.strip).map_err(|e| fail(format!("{name}: {e}")))?;
+            branch.render();
+            let canvas = branch.canvas().clone();
+            (&*branch, canvas)
+        };
         let mut image = diff.as_ref().map(|_| Canvas::new(WIDTH, HEIGHT, [0, 0, 0]));
         let shares = compare(
-            &game,
+            active_game,
             &canvas,
             &originals[i],
             &scene.leave_out,
