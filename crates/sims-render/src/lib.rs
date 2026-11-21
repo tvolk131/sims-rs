@@ -18,6 +18,7 @@ pub mod depth;
 pub mod grass;
 pub mod light;
 pub mod lot;
+pub mod neighborhood;
 pub mod open;
 pub mod png;
 pub mod pools;
