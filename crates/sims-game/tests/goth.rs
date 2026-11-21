@@ -5314,17 +5314,39 @@ fn buy_mode_places_rotates_cancels_and_returns_to_live_mode() {
     game.release([437, 523]);
     assert_eq!(game.buy_selected(), Some(0x26bf_bb29));
 
-    // Hover onto the lawn, move onto the HUD to hide the cursor, then cancel:
-    // both objects are deleted and funds stay 2542.
+    // Hover onto the lawn, move onto the HUD to hide the cursor (verifying
+    // keyboard rotation while hidden does not bring it back onto the lot),
+    // save & restore mid-preview (verifying the save strips the unpaid preview
+    // and Tile Cursor), then cancel: both objects are deleted and funds stay 2542.
     let spot = recorded([480, 380]);
     let count_before = game.lot().world().objects.len();
     game.hover(spot);
     let held_first = game.buy_cursor().expect("cursor active").held;
     let cursor_first = game.buy_cursor().expect("cursor active").cursor;
     assert_eq!(game.lot().world().objects.len(), count_before + 2);
+
+    // Save while the preview stands on the lawn, then restore into a fresh
+    // game check later: the saved world must not contain the unpaid preview.
+    let saved_mid_preview = game.save().expect("saving during Buy preview succeeds");
+    assert!(!saved_mid_preview.world().objects.contains_key(&held_first));
+    assert!(
+        !saved_mid_preview
+            .world()
+            .objects
+            .contains_key(&cursor_first)
+    );
+    assert_eq!(saved_mid_preview.world().objects.len(), count_before);
+
     game.hover([300, 520]);
     assert!(!game.buy_cursor().expect("cursor kept while hidden").valid);
+    assert_eq!(game.buy_cursor().unwrap().position[0], -16);
     assert_eq!(game.lot().world().objects[&held_first].position[0], -16);
+    // Rotating while hidden must keep both objects off the lot.
+    assert!(game.rotate_held(true));
+    assert!(!game.buy_cursor().unwrap().valid);
+    assert_eq!(game.lot().world().objects[&held_first].position[0], -16);
+    assert_eq!(game.lot().world().objects[&cursor_first].position[0], -16);
+
     assert!(game.cancel_buy());
     assert!(game.buy_cursor().is_none());
     assert!(game.buy_selected().is_none());
@@ -5333,8 +5355,8 @@ fn buy_mode_places_rotates_cancels_and_returns_to_live_mode() {
     assert_eq!(game.lot().world().budget.funds, 2542);
 
     // Re-select the chair, hover onto the lawn, rotate clockwise by keyboard,
-    // then press and drag-rotate past the 6 px threshold (`dx^2 + dy^2 > 36`)
-    // toward lower-left (`dir = 4` at rotation 0), and release to commit.
+    // then press and release 20 px upper-left WITHOUT an intermediate hover
+    // event (`0x4864f0` runs move at release -> dir = 6 at rotation 0) to commit.
     let spend_before = game.lot().world().budget.days[0].expect("today")[6];
     game.press([437, 523]);
     game.release([437, 523]);
@@ -5343,36 +5365,214 @@ fn buy_mode_places_rotates_cancels_and_returns_to_live_mode() {
     assert!(game.rotate_held(true));
     assert_eq!(game.lot().world().objects[&held_first].data[1], 4);
     game.press(spot);
-    game.hover([spot[0] - 20, spot[1] - 20]);
-    assert_eq!(game.lot().world().objects[&held_first].data[1], 6);
     game.release([spot[0] - 20, spot[1] - 20]);
 
-    assert!(game.buy_cursor().is_none());
-    assert!(game.buy_selected().is_none());
+    // Werkbunnst Chair has OBJD word 96 == 1 (`keep_buying`), so committing it
+    // automatically arms a second copy (`0x4864d0` -> `0x486f5a`) with the
+    // placed chair's facing (`6`), tracking the release tile (empty lawn, so
+    // valid there); moving back onto the occupied `spot` moves the new chair
+    // off-lot while its Tile Cursor marks the occupied tile — matching
+    // `goth-buy-chair-order-20261118` u=880.
+    assert_eq!(game.buy_selected(), Some(0x26bf_bb29));
+    let next_cursor = game
+        .buy_cursor()
+        .expect("repeat purchase arms a second chair")
+        .clone();
+    assert_ne!(next_cursor.held, held_first);
+    assert!(next_cursor.valid);
+    assert_ne!(next_cursor.position, [584, 472, 1]);
+    game.hover(spot);
+    let next_on_occupied = game.buy_cursor().expect("cursor over occupied tile");
+    assert!(!next_on_occupied.valid);
     let world = game.lot().world();
-    assert!(!world.objects.contains_key(&cursor_first));
-    assert_eq!(world.objects.len(), count_before + 1);
     let chair = &world.objects[&held_first];
     assert_eq!(chair.guid, 0x26bf_bb29);
     assert_eq!(chair.position, [584, 472, 1]);
     assert_eq!(chair.data[1], 6);
-    assert_eq!(chair.data[26], 0);
+    assert_eq!(world.objects[&next_cursor.held].position[0], -16);
+    assert_eq!(world.objects[&next_cursor.held].data[1], 6);
     assert_eq!(world.budget.funds, 2462);
     assert_eq!(world.globals[13], 2462);
     assert_eq!(world.globals[14], 0);
     assert_eq!(world.budget.days[0].expect("today")[6], spend_before + 80);
 
     // Switch back to Live mode by clicking the Live button `(35, 448)`:
-    // global[19] returns to 0 (via `go_live`) and simulation ticks resume.
+    // cancels the armed second preview, returns global[19] to 0 (`go_live`),
+    // leaves only the one paid chair on the lot, and resumes simulation ticks.
     let ticks_before = game.lot().world().ticks;
     game.press([35, 448]);
     game.release([35, 448]);
     assert_eq!(game.mode(), Mode::Live);
+    assert!(game.buy_cursor().is_none());
+    assert!(game.buy_selected().is_none());
+    assert_eq!(game.lot().world().objects.len(), count_before + 1);
+    assert_eq!(game.lot().world().objects[&held_first].data[26], 0);
     assert_eq!(game.lot().world().globals[19], 0);
     game.render();
     assert_eq!(game.run(30), 30);
     assert_eq!(game.lot().world().ticks, ticks_before + 30);
+
+    // Restoring the mid-preview save and returning to Live leaves no leaked
+    // chair or Tile Cursor and keeps funds at 2542.
+    game.restore(saved_mid_preview)
+        .expect("mid-preview save restores");
+    assert_eq!(game.mode(), Mode::Buy);
+    assert!(game.buy_cursor().is_none());
+    assert_eq!(game.lot().world().objects.len(), count_before);
+    assert_eq!(game.lot().world().budget.funds, 2542);
+    game.set_mode(Mode::Live);
+    assert_eq!(game.lot().world().objects.len(), count_before);
+    assert_eq!(game.lot().world().budget.funds, 2542);
+
     assert!(game.problems().is_empty(), "{:?}", game.problems());
     assert!(game.stopped().is_none(), "{:?}", game.stopped());
     assert_eq!(game.caught(), 0, "{:?}", game.errors());
+}
+
+/// Buy Mode surface placement (`0x422050` using `data[4]` allowed heights and
+/// `0x4221e4..0x422280` surface alignment), OBJf function 11 (`USER_PLACEMENT`,
+/// `0x43562f` / `0x422e99`), and preserving the cursor handle when a commit is
+/// refused.
+#[test]
+fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_commit() {
+    use sims_ui::buy::BuyCatalog;
+    use sims_ui::command::Mode;
+    let Some(install) = install() else {
+        return;
+    };
+    let opened = sims_render::open_house(&install, &goth_house(&install)).expect("open Goth house");
+    let catalog = BuyCatalog::load(opened.assets.index(), opened.assets.catalog());
+
+    let mut lot = Lot::load(&install, &goth_house(&install), &[3], Frames::default()).unwrap();
+    for _ in 0..60 {
+        lot.step().unwrap();
+    }
+    lot.set_mode(sims_vm::PanelMode::Buy).unwrap();
+
+    // Find every empty surface slot on level 1 in the Goth house (such as the
+    // Mesquite Desk/Table) and verify all three stock desk items (Moneywell
+    // Computer, SCTC BR-8 Standard Telephone, Gloominator Desk Lamp) snap into
+    // a compatible empty surface slot with `data[4] != 0` and commit cleanly.
+    let empty_surfaces: Vec<(u16, [i32; 3])> = lot
+        .world()
+        .objects
+        .iter()
+        .filter_map(|(&id, obj)| {
+            (obj.person.is_none()
+                && obj.position[0] >= 0
+                && obj.position[2] == 1
+                && obj.slots.len() > 1
+                && obj.slots[1].object == 0)
+                .then_some((id, obj.position))
+        })
+        .collect();
+    assert!(!empty_surfaces.is_empty(), "Goth house has empty surfaces");
+
+    for needle in [
+        "Moneywell Computer",
+        "SCTC BR-8 Standard Telephone",
+        "Gloominator Desk Lamp",
+    ] {
+        let item = catalog
+            .all()
+            .iter()
+            .find(|i| i.name.contains(needle))
+            .unwrap_or_else(|| panic!("catalog item matching {needle:?}"));
+        let mut cursor = lot
+            .buy_start(item.guid, 1, 2)
+            .unwrap()
+            .unwrap_or_else(|| panic!("affordable {needle}"));
+        let mut snapped = None;
+        for &(surface_id, pos) in &empty_surfaces {
+            let valid = lot.buy_move(&mut cursor, [pos[0], pos[1]], pos[2]).unwrap();
+            if valid && cursor.container.is_some_and(|(c, _)| c == surface_id) {
+                snapped = Some(surface_id);
+                break;
+            }
+        }
+        let surface_id = snapped.unwrap_or_else(|| panic!("{needle} did not snap to any surface"));
+        // Manual rotation on the surface must keep the surface container and
+        // the user's chosen facing rather than snapping back to the desk's dir.
+        let before_dir = lot.world().objects[&cursor.held].data[1];
+        let step = lot.world().objects[&cursor.held].data[23];
+        if step > 0 {
+            let next_dir = (before_dir + step).rem_euclid(8);
+            assert!(lot.buy_rotate(&mut cursor, next_dir).unwrap());
+            assert_eq!(cursor.container.map(|(c, _)| c), Some(surface_id));
+            assert_eq!(lot.world().objects[&cursor.held].data[1], next_dir);
+        }
+        // Cancel before testing the next item so the same surface slot stays free.
+        lot.buy_cancel(&cursor).unwrap();
+    }
+
+    // Commit the Gloominator Desk Lamp onto a surface and verify container link
+    // (`data[2]`), funds deduction, and cleanup of its Tile Cursor.
+    let lamp = catalog
+        .all()
+        .iter()
+        .find(|i| i.name.contains("Gloominator Desk Lamp"))
+        .expect("Gloominator Desk Lamp");
+    let mut cursor = lot.buy_start(lamp.guid, 1, 2).unwrap().unwrap();
+    let surface_id = empty_surfaces
+        .iter()
+        .find_map(|&(id, pos)| {
+            let valid = lot.buy_move(&mut cursor, [pos[0], pos[1]], pos[2]).unwrap();
+            (valid && cursor.container.is_some_and(|(c, _)| c == id)).then_some(id)
+        })
+        .expect("surface for lamp");
+    let funds_before = lot.world().budget.funds;
+    let placed_lamp = lot.buy_commit(&cursor).unwrap();
+    assert!(!lot.world().objects.contains_key(&cursor.cursor));
+    assert_eq!(lot.world().objects[&placed_lamp].data[2], surface_id as i16);
+    assert_eq!(lot.world().budget.funds, funds_before - lamp.price);
+
+    // OBJf function 11 (`USER_PLACEMENT`, `0x43562f` / `0x422e99`): committing
+    // the Jack-O'-Lantern runs its user-placement callback cleanly.
+    if let Some(pumpkin) = catalog
+        .all()
+        .iter()
+        .find(|i| i.name.contains("Jack-O") && i.price <= lot.world().budget.funds)
+    {
+        let mut cursor = lot.buy_start(pumpkin.guid, 1, 2).unwrap().unwrap();
+        assert!(lot.buy_move(&mut cursor, [584, 472], 1).unwrap());
+        let placed = lot.buy_commit(&cursor).unwrap();
+        assert!(lot.world().objects.contains_key(&placed));
+        assert!(!lot.world().objects.contains_key(&cursor.cursor));
+    }
+
+    // Refused commit on an invalid tile retains `buy_cursor` in `Game` so
+    // cancellation still deletes both preview objects cleanly.
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    game.resize([800, 600]);
+    game.render();
+    assert_eq!(game.run(60), 60);
+    game.set_mode(Mode::Buy);
+    let objs_before = game.lot().world().objects.len();
+    game.press([258, 524]);
+    game.release([258, 524]);
+    game.press([437, 523]);
+    game.release([437, 523]);
+    // Place one chair on the lawn, leaving the repeat-purchase chair armed and
+    // invalid over the now-occupied tile; releasing there plays UI_error and
+    // keeps `buy_cursor` intact until `cancel_buy` deletes both objects.
+    let spot = recorded([480, 380]);
+    game.hover(spot);
+    game.press(spot);
+    game.release(spot);
+    let second = game.buy_cursor().expect("repeat purchase armed").clone();
+    assert!(!second.valid);
+    game.take_sounds();
+    game.press(spot);
+    game.release(spot);
+    assert!(game.buy_cursor().is_some());
+    assert!(game.lot().world().objects.contains_key(&second.held));
+    assert!(game.lot().world().objects.contains_key(&second.cursor));
+    assert!(
+        game.take_sounds()
+            .iter()
+            .any(|s| matches!(s, SoundEvent::Play { name, .. } if name == "UI_error"))
+    );
+    assert!(game.cancel_buy());
+    assert!(game.buy_cursor().is_none());
+    assert_eq!(game.lot().world().objects.len(), objs_before + 1);
 }

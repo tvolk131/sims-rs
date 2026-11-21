@@ -403,15 +403,21 @@ impl App {
             Key::Character(c) => match c.as_str() {
                 "+" | "=" => Move::ZoomIn,
                 "-" | "_" => Move::ZoomOut,
-                "[" | "," => {
-                    if self.game.rotate_held(false) {
+                "[" => Move::Rotate(false),
+                "]" => Move::Rotate(true),
+                "," => {
+                    if self.game.buy_cursor().is_some_and(|c| c.position[0] >= 0)
+                        && self.game.rotate_held(false)
+                    {
                         self.changed(true);
                         return;
                     }
                     Move::Rotate(false)
                 }
-                "]" | "." => {
-                    if self.game.rotate_held(true) {
+                "." => {
+                    if self.game.buy_cursor().is_some_and(|c| c.position[0] >= 0)
+                        && self.game.rotate_held(true)
+                    {
                         self.changed(true);
                         return;
                     }

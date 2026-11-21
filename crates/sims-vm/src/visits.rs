@@ -57,6 +57,9 @@ pub(crate) mod function {
     pub const DYNAMIC_GROUP: usize = 8;
     pub const PLACED: usize = 9;
     pub const LEAVING: usize = 10;
+    /// Run after a user places an object in Buy/Build mode (`0x421a0e` →
+    /// `0x43562f` / `0x422e99`).
+    pub const USER_PLACEMENT: usize = 11;
 }
 
 /// What [`Interpreter::visit_objects`] did.

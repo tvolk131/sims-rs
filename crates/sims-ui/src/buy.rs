@@ -312,17 +312,12 @@ impl BuyCatalog {
             }
         }
 
-        // 0x4cd9a5: sort by price ascending, then catalog name ascending
-        // (case-insensitive ASCII, then GUID for determinism).
+        // 0x4cd9a5 -> 0x430100 -> memcmp (0x6363e0): sort by price ascending,
+        // then raw catalog name bytes ascending (then GUID for determinism).
         items.sort_by(|a, b| {
             a.price
                 .cmp(&b.price)
-                .then_with(|| {
-                    a.name
-                        .bytes()
-                        .map(|c| c.to_ascii_lowercase())
-                        .cmp(b.name.bytes().map(|c| c.to_ascii_lowercase()))
-                })
+                .then_with(|| a.name.as_bytes().cmp(b.name.as_bytes()))
                 .then_with(|| a.guid.cmp(&b.guid))
         });
 
@@ -334,12 +329,7 @@ impl BuyCatalog {
         items.sort_by(|a, b| {
             a.price
                 .cmp(&b.price)
-                .then_with(|| {
-                    a.name
-                        .bytes()
-                        .map(|c| c.to_ascii_lowercase())
-                        .cmp(b.name.bytes().map(|c| c.to_ascii_lowercase()))
-                })
+                .then_with(|| a.name.as_bytes().cmp(b.name.as_bytes()))
                 .then_with(|| a.guid.cmp(&b.guid))
         });
         Self { items }
@@ -811,6 +801,33 @@ mod tests {
         assert!(state.apply(&Command::BuySubcategory(7))); // All Seating (0xff)
         let all: Vec<u32> = cat.filtered(&state).iter().map(|i| i.guid).collect();
         assert_eq!(all, [0x26bf_bb29, 0x1111_1111, 0x2222_2222]);
+
+        // Equal-price items compare raw name bytes (`0x4cd9a5` -> `0x430100`
+        // -> `memcmp` at `0x6363e0`), so uppercase `Zoo` sorts before `apple`.
+        let tied = BuyCatalog::from_items(vec![
+            BuyItem {
+                guid: 1,
+                price: 100,
+                name: "apple".into(),
+                description: String::new(),
+                room_sort: 1,
+                function_sort: 1,
+                function_subsort: 1,
+                build_mode_type: 0,
+            },
+            BuyItem {
+                guid: 2,
+                price: 100,
+                name: "Zoo".into(),
+                description: String::new(),
+                room_sort: 1,
+                function_sort: 1,
+                function_subsort: 1,
+                build_mode_type: 0,
+            },
+        ]);
+        let names: Vec<&str> = tied.all().iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, ["Zoo", "apple"]);
     }
 
     #[test]

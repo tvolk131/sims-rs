@@ -9,8 +9,9 @@ use crate::factory::word;
 use crate::fault::{Fault, Trap};
 use crate::frame::PanelMode;
 use crate::interpreter::Interpreter;
-use crate::placement::{Place, on_lot};
+use crate::placement::{Place, Refusal, on_lot, step};
 use crate::primitives::budget::spend;
+use crate::visits::function;
 use sims_sim::World;
 
 /// The `"Tile Cursor"` object GUID looked up by name (`0x43ab8f`) in
@@ -19,6 +20,10 @@ pub const TILE_CURSOR_GUID: u32 = 0x0000_0437;
 
 /// Global 19: the simulation's active UI mode (`0x4ce44f`).
 const MODE_GLOBAL: usize = 19;
+
+/// Global 26: tutorial flag (`simulator + 0x44`), checked at `0x4878f3`
+/// before enabling repeat purchases.
+const TUTORIAL_GLOBAL: usize = 26;
 
 /// Global 32: budget mode (`1` means unlimited funds, `0x46d8c9`).
 const BUDGET_MODE: usize = 32;
@@ -30,10 +35,16 @@ const UNLIMITED_FUNDS: i32 = 999_999;
 /// zero for Buy-mode objects (budget category 6, `0x4878f3`).
 const BUILD_MODE_TYPE: usize = 69;
 
+/// OBJD word 96 (`+0xc0`): `1` for objects that keep the Buy tool armed for
+/// repeat purchases after placement (`0x4878f3`).
+const KEEP_BUYING: usize = 0xc0 / 2;
+
 /// Object data word 1: facing direction (0..7).
 const DATA_FACING: usize = 1;
-/// Object data word 5: placement flags (surface heights, `0x422050`).
-const DATA_PLACEMENT_FLAGS: usize = 5;
+/// Object data word 4 (`+0x52`): allowed surface-height bitmask (`0x4220a5`).
+const DATA_ALLOWED_HEIGHTS: usize = 4;
+/// Object data word 8 (`+0x5a`): placement/intersection flags (`0x43244d`).
+const DATA_PLACEMENT_FLAGS: usize = 8;
 /// Object data word 23: rotation step in eighths (`object + 0x78`).
 const DATA_TURN_STEP: usize = 23;
 
@@ -52,6 +63,9 @@ pub struct BuyCursor {
     pub price: i32,
     /// Budget category charged on commit (`6` Buy, `7` Build, `0x4878f3`).
     pub budget_category: u8,
+    /// Whether committing this item automatically arms another copy when
+    /// affordable (`0x4878f3`: OBJD word 96 == 1 and tutorial global 26 == 0).
+    pub keep_buying: bool,
     /// Whether the held object currently sits at a valid, affordable spot.
     pub valid: bool,
     /// Last tile-snapped fine lot position `[x, y, level]`.
@@ -163,6 +177,8 @@ impl Interpreter<'_> {
             .map_err(|trap| fail(0, trap))?;
         let price = i32::from(words[word::PRICE]);
         let budget_category = if words[BUILD_MODE_TYPE] != 0 { 7 } else { 6 };
+        let keep_buying = words[KEEP_BUYING] == 1
+            && world.globals.get(TUTORIAL_GLOBAL).copied().unwrap_or(0) == 0;
         if price > 0 && price > available_funds(world) {
             return Ok(None);
         }
@@ -175,6 +191,7 @@ impl Interpreter<'_> {
             guid,
             price,
             budget_category,
+            keep_buying,
             valid: false,
             position: [-16, -16, level],
             container: None,
@@ -205,7 +222,7 @@ impl Interpreter<'_> {
             return Ok(false);
         }
         let affordable = cursor.price <= 0 || cursor.price <= available_funds(world);
-        let placement = self.test_buy_placement(world, cursor.held, pos, level)?;
+        let placement = self.test_buy_placement(world, cursor.cursor, cursor.held, pos, level)?;
         if let Some(container) = placement {
             if affordable {
                 cursor.valid = true;
@@ -234,7 +251,10 @@ impl Interpreter<'_> {
     }
 
     /// Rotates the held object to `direction` (`0x4226bc` → `0x421be4`) and
-    /// re-evaluates placement at its current tile if it is on the lot.
+    /// re-evaluates placement at its current tile if it is on the lot. When
+    /// the object is already snapped to a surface container slot, keeps that
+    /// container without re-running automatic surface-facing alignment
+    /// (`0x422050` line `0x422078`).
     pub fn buy_rotate(
         &self,
         world: &mut World,
@@ -242,29 +262,62 @@ impl Interpreter<'_> {
         direction: i16,
     ) -> Result<bool, Fault> {
         let [x, y, level] = cursor.position;
+        let prev_container = cursor.container;
         self.remove_cursor_and_held(world, cursor)?;
         self.rotate_held_to(world, cursor.cursor, cursor.held, direction)?;
-        if on_lot([x, y]) {
-            self.buy_move(world, cursor, [x, y], level)
-        } else {
-            Ok(false)
+        if !on_lot([x, y]) {
+            return Ok(false);
         }
+        if let Some((container, slot)) = prev_container {
+            let pos = snap_to_tile_centre([x, y]);
+            if inside_placement_bounds(world, pos)
+                && self.fits_in(world, cursor.held, container, i32::from(slot), pos, level)?
+            {
+                let affordable = cursor.price <= 0 || cursor.price <= available_funds(world);
+                cursor.position = [pos[0], pos[1], level];
+                cursor.valid = affordable;
+                cursor.container = Some((container, slot));
+                let held_place = Place {
+                    on_lot: true,
+                    position: pos,
+                    container: Some(container),
+                    slot: i32::from(slot),
+                    level,
+                };
+                self.put(world, cursor.held, held_place, true)?;
+                if self.fits(world, cursor.cursor, pos, level)? {
+                    let cursor_place = Place {
+                        on_lot: true,
+                        position: pos,
+                        container: None,
+                        slot: -1,
+                        level,
+                    };
+                    self.put(world, cursor.cursor, cursor_place, true)?;
+                }
+                return Ok(cursor.valid);
+            }
+        }
+        self.buy_move(world, cursor, [x, y], level)
     }
 
     /// Hides the cursor and held object off the lot while the pointer leaves
     /// the house view (`0x487d4e` → `0x421963`).
     pub fn buy_hide(&self, world: &mut World, cursor: &mut BuyCursor) -> Result<(), Fault> {
         self.remove_cursor_and_held(world, cursor)?;
+        cursor.position = [-16, -16, cursor.position[2]];
         cursor.valid = false;
         cursor.container = None;
         Ok(())
     }
 
-    /// Commits a valid Buy Mode placement (`0x486ada` → `0x421a0e`, `0x4929fb`
-    /// → `0x46d91c`): removes and deletes the `"Tile Cursor"`, places the
-    /// held object permanently at its validated tile/container, and deducts
-    /// its price from household funds. Returns the placed object's ID.
-    pub fn buy_commit(&self, world: &mut World, mut cursor: BuyCursor) -> Result<u16, Fault> {
+    /// Commits a valid Buy Mode placement (`0x486ada` → `0x421a0e` →
+    /// `0x43562f` / `0x422e99`, `0x4929fb` → `0x46d91c`): removes and deletes
+    /// the `"Tile Cursor"`, places the held object permanently at its
+    /// validated tile/container, runs OBJf function 11 (`USER_PLACEMENT`) on
+    /// the object (and every group tile / held child), and deducts its price
+    /// from household funds. Returns the placed object's ID.
+    pub fn buy_commit(&self, world: &mut World, cursor: &BuyCursor) -> Result<u16, Fault> {
         let held = cursor.held;
         let fail = |trap| Fault {
             object: held,
@@ -281,7 +334,7 @@ impl Interpreter<'_> {
                 "cannot commit Buy Mode placement: insufficient funds".into(),
             )));
         }
-        self.remove_cursor_and_held(world, &mut cursor)?;
+        self.remove_cursor_and_held(world, cursor)?;
         self.remove_now(world, cursor.cursor)?;
         let [x, y, level] = cursor.position;
         let place = Place {
@@ -292,15 +345,15 @@ impl Interpreter<'_> {
             level,
         };
         self.put(world, cursor.held, place, true)?;
+        self.run_user_placement(world, cursor.held)?;
         spend(world, cursor.budget_category, cursor.price).map_err(fail)?;
         Ok(cursor.held)
     }
 
     /// Cancels an active Buy Mode purchase (`0x487105`): deletes both the
     /// `"Tile Cursor"` and the unplaced catalog object without charging funds.
-    pub fn buy_cancel(&self, world: &mut World, cursor: BuyCursor) -> Result<(), Fault> {
-        let mut cursor = cursor;
-        self.remove_cursor_and_held(world, &mut cursor)?;
+    pub fn buy_cancel(&self, world: &mut World, cursor: &BuyCursor) -> Result<(), Fault> {
+        self.remove_cursor_and_held(world, cursor)?;
         self.remove_now(world, cursor.cursor)?;
         self.remove_now(world, cursor.held)?;
         Ok(())
@@ -451,11 +504,7 @@ impl Interpreter<'_> {
     }
 
     /// Removes `cursor` and `held` from the lot (`0x421963`).
-    fn remove_cursor_and_held(
-        &self,
-        world: &mut World,
-        cursor: &mut BuyCursor,
-    ) -> Result<(), Fault> {
+    fn remove_cursor_and_held(&self, world: &mut World, cursor: &BuyCursor) -> Result<(), Fault> {
         if world
             .objects
             .get(&cursor.cursor)
@@ -473,31 +522,82 @@ impl Interpreter<'_> {
         Ok(())
     }
 
+    /// Runs OBJf function 11 (`USER_PLACEMENT`) on `held` (or every part of a
+    /// multi-tile group) and on every non-empty object in each part's surface
+    /// slots (`0x43562f` / `0x422e99`).
+    fn run_user_placement(&self, world: &mut World, held: u16) -> Result<(), Fault> {
+        let fail = |trap| Fault {
+            object: held,
+            at: None,
+            trap,
+        };
+        let is_group = world
+            .objects
+            .get(&held)
+            .is_some_and(|o| o.multipart.is_some());
+        let parts = if is_group {
+            self.parts(world, held).map_err(fail)?
+        } else {
+            vec![held]
+        };
+        for part in parts {
+            self.callback(world, part, function::USER_PLACEMENT, 0)?;
+            let slot_count = world
+                .objects
+                .get(&part)
+                .map_or(0, |o| o.slots.len().saturating_sub(1));
+            for slot in 0..slot_count {
+                let child = world
+                    .objects
+                    .get(&part)
+                    .and_then(|o| o.slots.get(slot + 1))
+                    .map_or(0, |s| s.object);
+                if let Ok(child) = u16::try_from(child)
+                    && child != 0
+                {
+                    self.callback(world, child, function::USER_PLACEMENT, 0)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Tests whether `held` fits at `[pos, level]`, either directly on the
-    /// tile (`Some(None)`) or inside a compatible surface slot of an object
+    /// tile (`Some(None)`) or — after a collision refusal (`0x0b`) on a
+    /// single-tile object — inside a compatible surface slot of an object
     /// standing on that tile (`Some(Some((container_id, slot)))`, `0x422050`).
+    ///
+    /// When snapping into a surface slot, aligns `held`'s facing to the
+    /// container's facing (or, for a multi-tile container, the first of four
+    /// cardinal directions around the container whose adjacent tile is not
+    /// blocked by an object, `0x4221e4..0x422280` + `0x43244d`).
     fn test_buy_placement(
         &self,
         world: &mut World,
+        cursor: u16,
         held: u16,
         pos: [i32; 2],
         level: i32,
     ) -> Result<Option<Option<(u16, i16)>>, Fault> {
-        if self.fits(world, held, pos, level)? {
-            return Ok(Some(None));
+        match self.place_test(world, held, pos, level)? {
+            Ok(()) => return Ok(Some(None)),
+            Err(Refusal::Collision(_)) => {}
+            Err(_) => return Ok(None),
         }
-        // Single-tile object fallback: check surface containers on this tile
-        // (0x422050).
-        let (is_group, placement_flags) = {
+        // Single-tile object fallback after collision (0x0b): check surface
+        // containers on this tile using data word 4 (+0x52, allowed heights,
+        // `0x4220a5`).
+        let (is_group, allowed_heights, current_facing) = {
             let Some(obj) = world.objects.get(&held) else {
                 return Ok(None);
             };
             (
                 obj.multipart.is_some(),
-                obj.data.get(DATA_PLACEMENT_FLAGS).copied().unwrap_or(0),
+                obj.data.get(DATA_ALLOWED_HEIGHTS).copied().unwrap_or(0),
+                obj.data.get(DATA_FACING).copied().unwrap_or(0),
             )
         };
-        if is_group || placement_flags == 0 {
+        if is_group || allowed_heights == 0 {
             return Ok(None);
         }
         let tile = [
@@ -517,10 +617,79 @@ impl Interpreter<'_> {
                 .map_or(0, |o| o.slots.len().saturating_sub(1));
             for slot in 0..slot_count {
                 if self.fits_in(world, held, container, slot as i32, pos, level)? {
+                    let target_dir =
+                        surface_aligned_direction(world, container, current_facing, level)?;
+                    self.rotate_held_to(world, cursor, held, target_dir)?;
                     return Ok(Some(Some((container, slot as i16))));
                 }
             }
         }
         Ok(None)
     }
+}
+
+/// Computes the surface-aligned facing direction for a single-tile object
+/// placed onto `container` (`0x4221e4..0x422280`): uses `container.data[1]`
+/// directly for single-tile containers, or walks up to four quarter-turns for
+/// a multi-tile container until the tile one step forward is not blocked by an
+/// object (`0x43244d`), keeping `fallback_facing` if all four sides are blocked.
+fn surface_aligned_direction(
+    world: &World,
+    container: u16,
+    fallback_facing: i16,
+    level: i32,
+) -> Result<i16, Fault> {
+    let Some(cont) = world.objects.get(&container) else {
+        return Ok(fallback_facing);
+    };
+    let mut dir = cont.data.get(DATA_FACING).copied().unwrap_or(0);
+    if cont.multipart.is_none() {
+        return Ok(dir);
+    }
+    let origin = [cont.position[0], cont.position[1]];
+    for _ in 0..4 {
+        let delta = step(dir);
+        let probe = [
+            origin[0].wrapping_add(delta[0].wrapping_mul(16)),
+            origin[1].wrapping_add(delta[1].wrapping_mul(16)),
+        ];
+        if !tile_blocks_person(world, probe, level).map_err(|trap| Fault {
+            object: container,
+            at: None,
+            trap,
+        })? {
+            return Ok(dir);
+        }
+        dir = dir.wrapping_add(2);
+    }
+    Ok(fallback_facing)
+}
+
+/// Checks `0x43244d`: whether any object standing on `[pos, level]` blocks a
+/// person (when `data[8] & 4 == 0`: blocked if `data[8] & 0x10 == 0`; when
+/// `data[8] & 4 != 0`: blocked if `data[8] & 2 != 0`).
+fn tile_blocks_person(world: &World, pos: [i32; 2], level: i32) -> Result<bool, Trap> {
+    let tx = pos[0] >> 4;
+    let ty = pos[1] >> 4;
+    if !(0..64).contains(&tx) || !(0..64).contains(&ty) || !(1..=2).contains(&level) {
+        return Ok(false);
+    }
+    let tile = [tx as u8, ty as u8, level as u8];
+    for id in crate::placement::standing_on(world, tile)? {
+        let flags = world
+            .objects
+            .get(&id)
+            .and_then(|o| o.data.get(DATA_PLACEMENT_FLAGS))
+            .copied()
+            .unwrap_or(0) as u16;
+        let blocked = if (flags & 0x04) == 0 {
+            (flags & 0x10) == 0
+        } else {
+            (flags & 0x02) != 0
+        };
+        if blocked {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }

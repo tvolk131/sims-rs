@@ -174,6 +174,29 @@ impl Lot {
         })
     }
 
+    /// Like [`Lot::save`], but strips an active unpaid Buy Mode preview
+    /// (`cursor.held` and `cursor.cursor`) from the saved world copy without
+    /// mutating the live lot, so restoring the save never orphans an unpaid
+    /// item or `"Tile Cursor"`.
+    pub fn save_without_buy_cursor(&self, cursor: &crate::BuyCursor) -> Result<Saved, SaveError> {
+        let mut saved = self.save()?;
+        let sounds = std::cell::RefCell::new(Vec::new());
+        let interpreter = crate::interpreter::Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..crate::interpreter::Interpreter::new(
+                &self.program,
+                &self.catalog,
+                crate::interpreter::Stream::Global,
+            )
+        };
+        interpreter
+            .buy_cancel(&mut saved.world, cursor)
+            .map_err(|e| SaveError::Format(format!("clearing Buy Mode preview for save: {e}")))?;
+        Ok(saved)
+    }
+
     /// Goes on from `saved`, a save of a lot loaded from the same install
     /// and house: the lot then steps exactly as the saved lot would have.
     /// A dialog this lot waited on, or a failed step, is forgotten; a

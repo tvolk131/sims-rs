@@ -30,7 +30,8 @@ panel, and `sims-vm` had no `"Tile Cursor"` creation or Buy placement tool.
   `0x506765`, `0x507288`, `0x508342`):**
   - Residential Buy Mode includes non-person catalog masters (`sub_index == -1`
     or `master == 0`) with nonzero `OBJD +0x4e` (`room_sort`) and graphics or a
-    `TTAB`, sorted by `(price, name)` ascending.
+    `TTAB`, sorted by price ascending then raw catalog name bytes ascending
+    (`0x4cd9a5` → `0x430100` → `memcmp` at `0x6363e0`).
   - Function-sort category masks in UI order `0..8` are
     `[0x01, 0x02, 0x20, 0x08, 0x04, 0x10, 0x80, 0x40]`; function-subsort masks
     are `[0x01, 0x02, 0x04, 0x08, 0x20, 0x40, 0x90, 0xff]`; room-sort masks are
@@ -62,15 +63,27 @@ panel, and `sims-vm` had no `"Tile Cursor"` creation or Buy placement tool.
   - `OnMouseMove` (`0x485a2e`) unprojects the pointer against terrain
     (`0x4a97c3` with flag 1 → `0x4a955d`, aligned to `pick::ORIGIN_COLUMN`),
     snaps to tile centre `(v & !15) | 8` (`0x485f6d`), tests direct tile
-    placement or surface container slots (`0x422050`), and places the held
-    object first and `"Tile Cursor"` second (`0x421e72`), which automatically
-    links `held.data[26] = cursor` on the tile chain. Dragging past the 6 px
-    radius (`dx^2 + dy^2 > 0x24`) rotates the held object in screen quadrants.
-  - `OnMouseLeave` (`0x487d4e` → `0x421963`) takes both off the lot; `OnMouseUp`
-    (`0x4864d0` → `0x486ada` → `0x421a0e`, `0x4929fb` → `0x46d91c`) deletes the
-    `"Tile Cursor"`, places the held object permanently, and deducts its price
-    from household funds in budget category `6` (Buy) or `7` (Build); cancel
-    (`0x487105`) deletes both without charging funds.
+    placement and — on collision refusal `0x0b` for a single-tile object with
+    nonzero `data[4]` (`+0x52`, allowed surface heights, `0x4220a5`) — searches
+    surface container slots (`0x422050`), aligning the placed item's facing to
+    the container (or first unblocked cardinal side of a multi-tile container
+    via `0x4221e4..0x422280` + `0x43244d`). It places the held object first and
+    `"Tile Cursor"` second (`0x421e72`), which automatically links
+    `held.data[26] = cursor` on the tile chain. Dragging past the 6 px radius
+    (`dx^2 + dy^2 > 0x24`) rotates the held object in screen quadrants, while
+    movement within the 6 px radius continues normal tile placement.
+  - `OnMouseLeave` (`0x487d4e` → `0x421963`) takes both off the lot and resets
+    cursor position off-lot; `OnMouseUp` (`0x4864d0`) first invokes move at the
+    release coordinates (`0x4864f0`), then commits (`0x486ada` → `0x421a0e` →
+    `0x43562f` / `0x422e99`, `0x4929fb` → `0x46d91c`), deleting the
+    `"Tile Cursor"`, placing the held object permanently, running OBJf function
+    11 (`USER_PLACEMENT`) on the object (and every group tile / held child),
+    and deducting its price in budget category `6` (Buy) or `7` (Build). For
+    repeat-buy objects (`OBJD word 96 == 1` outside tutorial `global[26] == 0`,
+    `0x4878f3`), a successful commit immediately arms another copy with the
+    placed facing (`0x4864d0` → `0x486f5a`) if affordable. Cancel (`0x487105`)
+    deletes both without charging funds; saving mid-preview strips the unpaid
+    preview from the snapshot (`Lot::save_without_buy_cursor`).
 
 ## Decision
 

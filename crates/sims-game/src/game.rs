@@ -861,8 +861,12 @@ impl Game {
             return self.release_outside();
         }
         if self.hud.controls.mode == Mode::Buy && self.buy_dragging.is_some() {
+            // Native `0x4864f0` invokes `OnMouseMove` with the release
+            // coordinates before committing placement.
+            self.pointer = Some(point);
+            self.hover_buy(point);
             self.buy_dragging = None;
-            return self.commit_buy();
+            return self.commit_buy(point);
         }
         if self.hud.dialog().is_some() || self.hud.menu.is_none() {
             return Outcome {
@@ -1400,9 +1404,17 @@ impl Game {
 
     /// The lot as it stands, to go back to later ([`Game::restore`]).
     /// While a dialog waits, the save is of the lot before the tick that
-    /// showed it, so the restored lot shows it again.
+    /// showed it, so the restored lot shows it again. While an unpaid Buy
+    /// Mode preview is held, the preview and its `"Tile Cursor"` are stripped
+    /// from the saved snapshot without disturbing the live placement.
     pub fn save(&self) -> Result<Saved, String> {
-        self.lot.save().map_err(|e| e.to_string())
+        match &self.buy_cursor {
+            Some(cursor) => self
+                .lot
+                .save_without_buy_cursor(cursor)
+                .map_err(|e| e.to_string()),
+            None => self.lot.save().map_err(|e| e.to_string()),
+        }
     }
 
     /// Keeps the lot in `store` under `slot`, saying across the top how
@@ -1636,6 +1648,9 @@ impl Game {
     /// Live mode), and refreshes the control panel and Buy catalog strip.
     pub fn set_mode(&mut self, mode: Mode) {
         self.cancel_buy();
+        if self.buy_cursor.is_some() {
+            return;
+        }
         self.close_menu();
         self.reached = None;
         self.listed = None;
@@ -1665,6 +1680,9 @@ impl Game {
     /// (`0x487d3d`). Plays `UI_error` if the household cannot afford it.
     fn select_buy_item(&mut self, guid: u32) {
         self.cancel_buy();
+        if self.buy_cursor.is_some() {
+            return;
+        }
         let price = self
             .hud
             .ensure_buy_catalog(&self.assets)
@@ -1692,20 +1710,27 @@ impl Game {
 
     /// Cancels any active Buy Mode cursor or armed catalog selection
     /// (`0x487105`), deleting the unplaced object and `"Tile Cursor"` without
-    /// charging funds. Returns `true` if anything was cancelled.
+    /// charging funds. Returns `true` if anything was cancelled. If deleting
+    /// the preview fails, the cursor handle is kept so it can be retried.
     pub fn cancel_buy(&mut self) -> bool {
         self.buy_dragging = None;
-        let had_selection = self.buy_selected.take().is_some();
-        let had_hud = self.hud.buy_state.selected.take().is_some();
         let had_cursor = if let Some(cursor) = self.buy_cursor.take() {
-            if let Err(e) = self.lot.buy_cancel(cursor) {
-                self.note = Some(format!("The Buy cursor was not cancelled: {e}"));
+            match self.lot.buy_cancel(&cursor) {
+                Ok(()) => {
+                    self.refresh_world();
+                    true
+                }
+                Err(e) => {
+                    self.buy_cursor = Some(cursor);
+                    self.note = Some(format!("The Buy cursor was not cancelled: {e}"));
+                    return false;
+                }
             }
-            self.refresh_world();
-            true
         } else {
             false
         };
+        let had_selection = self.buy_selected.take().is_some();
+        let had_hud = self.hud.buy_state.selected.take().is_some();
         if had_selection || had_hud || had_cursor {
             if self.hud.controls.mode == Mode::Buy {
                 self.hud
@@ -1750,8 +1775,9 @@ impl Game {
 
     /// Handles pointer movement over the house view in Buy Mode (`0x487d3d`,
     /// `0x485a2e`): instantiates the armed catalog object + `"Tile Cursor"`
-    /// on first entry, moves them to the terrain-unprojected tile, or rotates
-    /// the held object while dragging past the 6 px threshold (`0x24`).
+    /// on first entry, rotates the held object in place while dragging past
+    /// the 6 px threshold (`dx^2 + dy^2 > 36`), and otherwise moves the cursor
+    /// to the terrain-unprojected tile (including within the 6 px drag radius).
     fn hover_buy(&mut self, point: [i32; 2]) -> bool {
         if self.stopped.is_some() {
             return false;
@@ -1779,7 +1805,7 @@ impl Game {
         let Some(mut cursor) = self.buy_cursor.take() else {
             return false;
         };
-        if let Some(anchor) = self.buy_dragging {
+        let rotated = if let Some(anchor) = self.buy_dragging {
             let dx = point[0] - anchor[0];
             let dy = point[1] - anchor[1];
             if dx * dx + dy * dy > 36 {
@@ -1793,8 +1819,14 @@ impl Game {
                 if let Err(e) = self.lot.buy_rotate(&mut cursor, dir) {
                     self.note = Some(format!("The object was not rotated: {e}"));
                 }
+                true
+            } else {
+                false
             }
         } else {
+            false
+        };
+        if !rotated {
             let at = [point[0] - pick::ORIGIN_COLUMN, point[1]];
             let fine = sims_render::unproject_terrain(&self.lot_shape, &self.view.camera, at)
                 .unwrap_or_else(|| self.view.camera.unproject_fine(at));
@@ -1821,8 +1853,10 @@ impl Game {
     }
 
     /// Commits a Buy Mode placement on mouse release (`0x4864d0` → `0x486ada`
-    /// → `0x421a0e`, `0x4929fb`).
-    fn commit_buy(&mut self) -> Outcome {
+    /// → `0x421a0e`, `0x4929fb`). For repeat-buy items (`cursor.keep_buying`,
+    /// OBJD word 96 == 1 outside tutorial), immediately starts another copy
+    /// with the placed item's facing (`0x4864d0` → `0x486f5a`) if affordable.
+    fn commit_buy(&mut self, point: [i32; 2]) -> Outcome {
         let Some(cursor) = self.buy_cursor.take() else {
             return Outcome::default();
         };
@@ -1833,15 +1867,65 @@ impl Game {
             self.keep_sounds(sounds);
             return Outcome::redraw();
         }
-        match self.lot.buy_commit(cursor) {
+        let last_facing = self
+            .lot
+            .world()
+            .objects
+            .get(&cursor.held)
+            .and_then(|o| o.data.get(1).copied())
+            .unwrap_or_else(|| sims_vm::default_buy_direction(self.view.camera.rotation));
+        match self.lot.buy_commit(&cursor) {
             Ok(_) => {
-                self.buy_selected = None;
-                self.hud.buy_state.selected = None;
-                self.refresh_world();
+                if cursor.keep_buying {
+                    let funds = sims_vm::available_funds(self.lot.world());
+                    if cursor.price <= 0 || cursor.price <= funds {
+                        self.buy_selected = Some(cursor.guid);
+                        self.hud.buy_state.selected = Some(cursor.guid);
+                        match self
+                            .lot
+                            .buy_start(cursor.guid, self.view.camera.level, last_facing)
+                        {
+                            Ok(Some(next)) => {
+                                self.buy_cursor = Some(next);
+                                self.refresh_world();
+                                if !self.hud.covers(point) {
+                                    self.hover_buy(point);
+                                }
+                            }
+                            Ok(None) => {
+                                self.hud.play(crate::hud::ERROR);
+                                self.buy_selected = None;
+                                self.hud.buy_state.selected = None;
+                                self.refresh_world();
+                            }
+                            Err(e) => {
+                                self.note = Some(format!(
+                                    "Could not start repeat purchase 0x{:08X}: {e}",
+                                    cursor.guid
+                                ));
+                                self.buy_selected = None;
+                                self.hud.buy_state.selected = None;
+                                self.refresh_world();
+                            }
+                        }
+                    } else {
+                        self.hud.play(crate::hud::ERROR);
+                        self.buy_selected = None;
+                        self.hud.buy_state.selected = None;
+                        self.refresh_world();
+                    }
+                } else {
+                    self.buy_selected = None;
+                    self.hud.buy_state.selected = None;
+                    self.refresh_world();
+                }
                 self.hud
                     .layout_buy(self.view.size, self.lot.world(), &self.assets);
             }
             Err(e) => {
+                // `Lot::buy_commit` rolled back the world; keep the cursor
+                // handle so the preview objects remain manageable.
+                self.buy_cursor = Some(cursor);
                 self.note = Some(format!("The item was not placed: {e}"));
                 self.hud.play(crate::hud::ERROR);
             }

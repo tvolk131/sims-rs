@@ -1493,9 +1493,11 @@ impl Lot {
     }
 
     /// Commits a valid Buy Mode placement (`0x486ada` → `0x421a0e`, `0x46d91c`):
-    /// deletes the `"Tile Cursor"`, places the held object permanently, and
-    /// deducts its price from household funds. Returns the placed object's ID.
-    pub fn buy_commit(&mut self, cursor: BuyCursor) -> Result<u16, OrderError> {
+    /// deletes the `"Tile Cursor"`, places the held object permanently, runs
+    /// OBJf function 11 (`USER_PLACEMENT`), and deducts its price from
+    /// household funds. Returns the placed object's ID. On error, the lot is
+    /// left unchanged so the caller still owns `cursor`.
+    pub fn buy_commit(&mut self, cursor: &BuyCursor) -> Result<u16, OrderError> {
         self.ready()?;
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
@@ -1513,8 +1515,9 @@ impl Lot {
     }
 
     /// Cancels an active Buy Mode purchase (`0x487105`), deleting both the
-    /// `"Tile Cursor"` and the unplaced object without charging funds.
-    pub fn buy_cancel(&mut self, cursor: BuyCursor) -> Result<(), OrderError> {
+    /// `"Tile Cursor"` and the unplaced object without charging funds. On
+    /// error, the lot is left unchanged so the caller still owns `cursor`.
+    pub fn buy_cancel(&mut self, cursor: &BuyCursor) -> Result<(), OrderError> {
         self.ready()?;
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
