@@ -1367,6 +1367,41 @@ fn saved_lots_round_trip_through_redb_apart_from_the_snapshots() {
     assert!(store.load_lot("missing").unwrap().is_none());
 }
 
+#[test]
+fn snapshot_floor_rotations_round_trip_and_clear_on_plain_save() {
+    let file = Temp::new("snapshot-floor-rot");
+    let world = world();
+    let mut overwritten = world.clone();
+    overwritten.ticks += 7;
+    {
+        let store = Snapshots::open(&file.0).unwrap();
+        assert!(store.load_with_floor_rotation("boot").unwrap().is_none());
+        store.save_with_floor_rotation("boot", &world, 7).unwrap();
+        store.save("plain", &world).unwrap();
+    }
+    {
+        let ro = ReadOnlySnapshots::open(&file.0).unwrap();
+        let (loaded, rot) = ro.load_with_floor_rotation("boot").unwrap().unwrap();
+        assert_eq!(rot, Some(3));
+        assert_eq!(loaded.encode(), world.encode());
+        assert_eq!(ro.load("boot").unwrap().unwrap().encode(), world.encode());
+        let (plain_world, plain_rot) = ro.load_with_floor_rotation("plain").unwrap().unwrap();
+        assert_eq!(plain_rot, None);
+        assert_eq!(plain_world.encode(), world.encode());
+        assert!(ro.load_with_floor_rotation("missing").unwrap().is_none());
+    }
+    // Overwriting a named snapshot with plain save (the exact legacy record
+    // format written by older writers) replaces the record and leaves no stale
+    // floor rotation behind.
+    {
+        let store = Snapshots::open(&file.0).unwrap();
+        store.save("boot", &overwritten).unwrap();
+        let (loaded, rot) = store.load_with_floor_rotation("boot").unwrap().unwrap();
+        assert_eq!(rot, None);
+        assert_eq!(loaded.ticks, world.ticks + 7);
+    }
+}
+
 fn person() -> sims_formats::saved_objects::Person {
     let interaction = sims_formats::saved_objects::Interaction {
         join: 0,
