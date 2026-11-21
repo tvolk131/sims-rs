@@ -554,7 +554,7 @@ impl Hud {
         }
         if let Some(menu) = &mut self.menu {
             menu.layout(&self.art, view.size);
-            menu.draw(&mut frame, &self.art, self.controls.pointer);
+            menu.draw_labels(&mut frame, &self.art, self.controls.pointer);
         }
         self.band = status.and_then(|status| self.status(&mut frame, status));
         canvas.color = frame.into_rgb();
@@ -660,11 +660,35 @@ impl Hud {
         self.pressed.release(uid);
     }
 
-    /// Moves the pointer; true if what it hovers changed or an open help
-    /// balloon was dismissed by moving outside the subpanel (including onto
-    /// the balloon itself, which attaches outside `LivePanel` at
-    /// `0x51a0a2..0x51a0b5`, `0x51f1f2..0x51f3e5`, `0x51d2ee..0x51d359`).
+    /// The pointer's current position in canvas pixels, if inside the window.
+    pub fn pointer(&self) -> Option<[i32; 2]> {
+        self.controls.pointer
+    }
+
+    /// Sets the pointer position directly (used when opening a pie menu so the
+    /// opening frame seeds its head pose and hit state from the press or
+    /// on-screen clamp warp rather than a stale hover, `0x5ebd05` / `0x5ebd29`).
+    pub fn set_pointer(&mut self, point: [i32; 2]) {
+        self.controls.pointer = Some(point);
+    }
+
+    /// Whether a dialog message is loaded and will cover/close any open pie
+    /// menu on this frame (`Hud::draw`).
+    pub fn will_show_dialog(&self, size: [i32; 2]) -> bool {
+        self.message
+            .as_ref()
+            .and_then(|(m, _)| dialog::layout(size, m, &self.art))
+            .is_some()
+    }
+
+    /// Moves the pointer; true if what it hovers changed, a pie menu is open
+    /// (so the Sim's 3D head follows the pointer), or an open help balloon was
+    /// dismissed by moving outside the subpanel (including onto the balloon
+    /// itself, which attaches outside `LivePanel` at `0x51a0a2..0x51a0b5`,
+    /// `0x51f1f2..0x51f3e5`, `0x51d2ee..0x51d359`).
     pub fn hover(&mut self, point: [i32; 2]) -> bool {
+        let moved_for_pie =
+            self.menu.is_some() && self.dialog.is_none() && self.controls.pointer != Some(point);
         let button = |pointer: Option<[i32; 2]>| {
             let layout = self.dialog.as_ref()?;
             let [x, y] = pointer?;
@@ -699,7 +723,7 @@ impl Hud {
         let dismissed = self.controls.help.is_some()
             && !hud::in_subpanel(&self.items, point)
             && self.dismiss_help();
-        hovered_changed || dismissed
+        moved_for_pie || hovered_changed || dismissed
     }
 
     /// The pointer left the window: no button is hovered, no name shows, and
@@ -843,7 +867,17 @@ impl Hud {
                         });
                 (release, command)
             }
-            Release::Settled | Release::Stays => {
+            Release::Settled => {
+                // Settling does not create a new cursor warp (`0x5eb53c`);
+                // leave the pointer at the release coordinate rather than
+                // re-applying an unconsumed opening warp.
+                self.menu = Some(menu);
+                (release, None)
+            }
+            Release::Stays => {
+                if let Some(point) = menu.pending_pointer() {
+                    self.controls.pointer = Some(point);
+                }
                 self.menu = Some(menu);
                 (release, None)
             }

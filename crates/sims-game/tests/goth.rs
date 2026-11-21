@@ -1542,16 +1542,35 @@ fn the_pie_shows_the_selected_goths_head() {
     game.render();
     let menu = game.menu().expect("the menu stays open");
     assert_eq!(menu.person, selected);
-    let head = menu.head.as_ref().expect("the head is drawn");
-    assert_eq!([head.width, head.height], menu.face_size());
-    // The head fills much of the face, and is clear around it.
-    let opaque = head.rgba.chunks(4).filter(|p| p[3] == 255).count();
-    let area = (head.width * head.height) as usize;
+    let head_idle = menu.head.as_ref().expect("the head is drawn").clone();
     assert!(
-        opaque > area / 5 && opaque < area * 4 / 5,
-        "{opaque} of {area}"
+        head_idle.width > 0
+            && head_idle.height > 0
+            && head_idle.width <= 800
+            && head_idle.height <= 500,
+        "head bounds {}x{}",
+        head_idle.width,
+        head_idle.height
     );
-    assert_eq!(head.rgba[3], 0);
+    // Native pie head size (~1,750–2,000 opaque pixels in the house viewport),
+    // clear around the bounding-box corners.
+    let opaque = head_idle.rgba.chunks(4).filter(|p| p[3] == 255).count();
+    assert!((1000..=4000).contains(&opaque), "opaque={opaque}");
+    assert_eq!(head_idle.rgba[3], 0);
+    // Moving the pointer onto a pie label turns and brightens the head.
+    let labels = menu.labels();
+    let first = labels[0].1;
+    let on_label = [first.x + first.width / 2, first.y + first.height / 2];
+    assert!(game.hover(on_label));
+    game.render();
+    let head_lit = game
+        .menu()
+        .expect("menu still open")
+        .head
+        .as_ref()
+        .expect("head re-rendered")
+        .clone();
+    assert_ne!(head_lit.rgba, head_idle.rgba);
     assert!(game.problems().is_empty(), "{:?}", game.problems());
 }
 
@@ -6247,4 +6266,459 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
     let collapsed_centre = game.lot().view_centre();
     game.set_mode(Mode::Buy);
     assert_ne!(game.lot().view_centre(), collapsed_centre);
+}
+
+/// Opening a pie menu near the top edge of the expanded bottom control strip
+/// (starting at `y = 500` in an 800×600 window) clips the 3D pie head to the
+/// 800×500 house viewport so zero opaque head pixels draw over the bottom
+/// strip, while the upper half of the head still draws inside the house view.
+#[test]
+fn pie_head_is_clipped_to_house_viewport_above_the_bottom_strip() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    assert_eq!(game.run(100), 100);
+    game.resize([800, 600]);
+    game.render();
+
+    // Pan the camera so the porch bench (173, single-entry "Sit" pie with no
+    // bottom label) sits right at y = 487, near the top of the expanded bottom
+    // control strip (y = 500), so its 3D pie head extends well across y = 500.
+    let bench_at = recorded([432, 230]);
+    assert_eq!(game.under(bench_at), Some(173));
+    let target_y = 487;
+    game.view.camera.origin[1] += target_y - bench_at[1];
+    let baseline = game.render().color.clone();
+    let point = [bench_at[0], target_y];
+    assert_eq!(game.under(point), Some(173));
+    assert!(!game.over_panel(point));
+    game.leave();
+    game.hover(point);
+    game.press(point);
+    game.render();
+    let menu = game.menu().expect("bench pie opened near bottom strip");
+    let origin = menu.head_origin;
+    let head = menu.head.as_ref().expect("head rendered");
+    // The head is clipped right at the bottom edge of the 800×500 house
+    // viewport (y = 500), so its bottom edge stops at 500 and its opaque count
+    // is strictly smaller than Mortimer's unclipped idle head (1,940 px).
+    assert_eq!(
+        origin[1] + head.height as i32,
+        500,
+        "expected head bottom to be clipped at y=500, origin={origin:?}, height={}",
+        head.height
+    );
+    let clipped_opaque = head.rgba.chunks(4).filter(|p| p[3] == 255).count();
+    assert!(
+        clipped_opaque > 500 && clipped_opaque < 1800,
+        "expected partial head clipped at y=500 (unclipped idle is 1940), got {clipped_opaque}"
+    );
+    let frame = game.canvas().color.clone();
+    let label_rects: Vec<Rect> = menu.labels().into_iter().map(|(_, r)| r).collect();
+    let in_label = |x: i32, y: i32| label_rects.iter().any(|r| r.contains(x, y));
+
+    // Zero pixels anywhere on the bottom control strip (y >= 500, outside pie
+    // labels) are modified by the pie head or circular backdrop.
+    for dy in 500..600 {
+        for dx in 0..800 {
+            if in_label(dx, dy) {
+                continue;
+            }
+            let idx = dy as usize * 800 + dx as usize;
+            assert_eq!(
+                frame[idx], baseline[idx],
+                "pie opened at {point:?} bled onto bottom strip at ({dx}, {dy})"
+            );
+        }
+    }
+
+    // The upper portion of the head still draws inside the 800×500 house view.
+    let mut drawn_above = 0usize;
+    for sy in 0..head.height {
+        let dy = origin[1] + sy as i32;
+        assert!(
+            (0..500).contains(&dy),
+            "head pixel outside viewport: y={dy}"
+        );
+        for sx in 0..head.width {
+            let dx = origin[0] + sx as i32;
+            let p = (sy * head.width + sx) as usize * 4;
+            if head.rgba[p + 3] != 255 || in_label(dx, dy) {
+                continue;
+            }
+            let idx = dy as usize * 800 + dx as usize;
+            let expected_head = [head.rgba[p], head.rgba[p + 1], head.rgba[p + 2]];
+            if frame[idx] == expected_head {
+                drawn_above += 1;
+            }
+        }
+    }
+    assert!(
+        drawn_above > 100,
+        "expected >100 head pixels drawn inside house viewport above y=500, got {drawn_above}"
+    );
+}
+
+/// Opening a pie menu seeds the pointer from the press (or the on-screen clamp
+/// warp when the menu shifts to stay on screen), matching native `0x5ebd05` /
+/// `0x5ebd29`, so the opening frame does not aim the head at a stale hover.
+#[test]
+fn pie_opening_frame_aims_head_at_press_not_stale_hover() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    assert_eq!(game.run(100), 100);
+    game.resize([800, 600]);
+    game.render();
+
+    // Hover above the porch bench (where its "Sit" label will appear), then
+    // press the bench center directly without sending another hover event.
+    let bench = recorded([432, 230]);
+    assert_eq!(game.under(bench), Some(173));
+    game.hover([bench[0], bench[1] - 75]);
+    game.press(bench);
+    game.render();
+    let opening_head = game
+        .menu()
+        .expect("bench pie opened")
+        .head
+        .as_ref()
+        .expect("opening head rendered")
+        .clone();
+    let opening_origin = game.menu().unwrap().head_origin;
+
+    // Hovering at the press coordinate must produce the exact same idle pose.
+    game.hover(bench);
+    game.render();
+    let settled_head = game
+        .menu()
+        .expect("bench pie still open")
+        .head
+        .as_ref()
+        .expect("settled head rendered")
+        .clone();
+    assert_eq!(opening_origin, game.menu().unwrap().head_origin);
+    assert_eq!(
+        opening_head.rgba, settled_head.rgba,
+        "opening frame aimed at stale hover instead of press coordinate"
+    );
+
+    // When a pie menu moves on screen to stay inside the window, the opening
+    // frame before `take_pointer()` must aim at the warped menu center rather
+    // than the pre-warp press point.
+    game.close_menu();
+    let edge_y = 25;
+    game.view.camera.origin[1] += edge_y - bench[1];
+    game.render();
+    let edge_bench = [bench[0], edge_y];
+    assert_eq!(game.under(edge_bench), Some(173));
+    game.hover([edge_bench[0], edge_bench[1] + 90]);
+    game.press(edge_bench);
+    let warped = game
+        .menu()
+        .expect("edge pie opened")
+        .pending_pointer()
+        .expect("edge pie moved on screen and scheduled cursor warp");
+    assert_ne!(warped, edge_bench);
+    // Render BEFORE calling take_pointer().
+    game.render();
+    let warped_opening = game
+        .menu()
+        .unwrap()
+        .head
+        .as_ref()
+        .expect("warped opening head")
+        .clone();
+    // Hovering onto "Sit" and releasing (settling the edge-clamped menu)
+    // WITHOUT consuming the pending opening warp must keep the head aimed at
+    // "Sit" rather than snapping back to `warped` (`0x5eb53c`).
+    let sit = pie_entry(&game, "Sit");
+    game.hover(sit);
+    game.render();
+    let sit_hover_head = game
+        .menu()
+        .unwrap()
+        .head
+        .as_ref()
+        .expect("Sit hover head")
+        .clone();
+    assert_ne!(sit_hover_head.rgba, warped_opening.rgba);
+    game.release(sit);
+    game.render();
+    let sit_settled_head = game
+        .menu()
+        .expect("edge pie settled and stays open")
+        .head
+        .as_ref()
+        .expect("Sit settled head")
+        .clone();
+    assert_eq!(
+        sit_settled_head.rgba, sit_hover_head.rgba,
+        "settling an edge-clamped menu snapped the head back to a stale opening warp"
+    );
+
+    assert_eq!(game.take_pointer(), Some(warped));
+    game.hover(warped);
+    game.render();
+    let warped_after = game
+        .menu()
+        .unwrap()
+        .head
+        .as_ref()
+        .expect("warped settled head")
+        .clone();
+    assert_eq!(
+        warped_opening.rgba, warped_after.rgba,
+        "edge-clamped pie aimed at pre-warp cursor instead of warped center"
+    );
+}
+
+/// Composed submenu rendering matches Complete Collection (`social-queued.png`):
+/// opening Bella's `Talk...` submenu keeps Mortimer's 3D head frozen at the
+/// parent menu's center looking down toward `Talk...`, draws the submenu's top
+/// label (`About Interests`) over the upper head while leaving the lower face
+/// visible below the label, and centers the dark circular backdrop on the
+/// submenu.
+#[test]
+fn pie_submenu_keeps_parent_head_frozen_and_draws_submenu_labels_above_it() {
+    let Some(install) = install() else {
+        return;
+    };
+    let frames = Frames::parse("0,1,2,3,33,63,93,123,153,190+30").expect("a schedule");
+    let schedule = frames.clone();
+    let mut game = Game::open(&Options {
+        frames,
+        ..options(install)
+    })
+    .expect("the Goth house opens");
+    game.resize([800, 600]);
+    let bella = 18u16;
+
+    run_to(&mut game, &schedule, 93);
+    let on_bella = match game.under(recorded([400, 274])) {
+        Some(id) if id == bella => recorded([400, 274]),
+        _ => [499, 317],
+    };
+    game.hover(on_bella);
+    run_to(&mut game, &schedule, 123);
+    let bare_lot = game.render().color.clone();
+
+    game.press(on_bella);
+    game.release(on_bella);
+    game.render();
+    let talk = pie_entry(&game, "Talk...");
+    game.hover(talk);
+    game.render();
+
+    let (parent_center, parent_origin, parent_head) = {
+        let menu = game.menu().expect("parent menu open");
+        (
+            menu.active_center().expect("parent center"),
+            menu.head_origin,
+            menu.head.as_ref().expect("parent head").clone(),
+        )
+    };
+
+    // Open the Talk... submenu.
+    game.press(talk);
+    game.release(talk);
+    let sub_frame = game.render().color.clone();
+    let menu = game.menu().expect("submenu open");
+    let sub_center = menu.active_center().expect("submenu center");
+    let sub_origin = menu.head_origin;
+    let sub_head = menu.head.as_ref().expect("submenu head");
+
+    // 1. Head stays frozen at the parent menu's origin and pose.
+    assert_eq!(sub_origin, parent_origin);
+    assert_eq!(sub_head.rgba, parent_head.rgba);
+    // 2. Active backdrop center moves down to the submenu.
+    assert_ne!(sub_center, parent_center);
+    assert!(
+        sub_center[1] > parent_center[1],
+        "Talk... submenu center {sub_center:?} should be below parent {parent_center:?}"
+    );
+
+    // 3. The submenu's top label ("About Interests") overlaps the upper head
+    //    and draws on top of it, while the lower face remains visible outside
+    //    label rects.
+    let label_rects: Vec<Rect> = menu.labels().into_iter().map(|(_, r)| r).collect();
+    let about = menu
+        .labels()
+        .into_iter()
+        .find(|(text, _)| *text == "About Interests")
+        .expect("About Interests label")
+        .1;
+    let in_any_label = |x: i32, y: i32| label_rects.iter().any(|r| r.contains(x, y));
+
+    let mut head_under_about = 0usize;
+    let mut head_occluded_by_about = 0usize;
+    let mut head_visible_outside_labels = 0usize;
+    for sy in 0..sub_head.height {
+        let dy = sub_origin[1] + sy as i32;
+        if !(0..500).contains(&dy) {
+            continue;
+        }
+        for sx in 0..sub_head.width {
+            let dx = sub_origin[0] + sx as i32;
+            if !(0..800).contains(&dx) {
+                continue;
+            }
+            let p = (sy * sub_head.width + sx) as usize * 4;
+            if sub_head.rgba[p + 3] != 255 {
+                continue;
+            }
+            let head_rgb = [sub_head.rgba[p], sub_head.rgba[p + 1], sub_head.rgba[p + 2]];
+            let actual = sub_frame[dy as usize * 800 + dx as usize];
+            if about.contains(dx, dy) {
+                head_under_about += 1;
+                if actual != head_rgb {
+                    head_occluded_by_about += 1;
+                }
+            } else if !in_any_label(dx, dy) && actual == head_rgb {
+                head_visible_outside_labels += 1;
+            }
+        }
+    }
+    assert!(
+        head_under_about > 50 && head_occluded_by_about * 2 > head_under_about,
+        "expected About Interests to draw over the upper head: under={head_under_about}, occluded={head_occluded_by_about}"
+    );
+    assert!(
+        head_visible_outside_labels > 400,
+        "expected lower frozen head to stay visible outside labels, got {head_visible_outside_labels}"
+    );
+
+    // 4. Verify the radial backdrop moved from `parent_center` to `sub_center`
+    //    (`0x462325` / `0x462342`):
+    //    - Pixels strictly inside the submenu's inner disk (r < 67) AND
+    //      strictly outside the parent's full disk (r >= 100) are shaded.
+    //    - Pixels strictly inside the parent's upper inner disk (r < 67) AND
+    //      strictly outside the submenu's full disk (r >= 100), outside labels
+    //      and the frozen head, remain unshaded (identical to `bare_lot`).
+    let dist2 = |a: [i32; 2], b: [i32; 2]| {
+        let dx = a[0] - b[0];
+        let dy = a[1] - b[1];
+        dx * dx + dy * dy
+    };
+    let in_head = |x: i32, y: i32| {
+        let sx = x - sub_origin[0];
+        let sy = y - sub_origin[1];
+        if sx < 0 || sy < 0 || sx >= sub_head.width as i32 || sy >= sub_head.height as i32 {
+            return false;
+        }
+        sub_head.rgba[(sy as usize * sub_head.width as usize + sx as usize) * 4 + 3] != 0
+    };
+
+    let mut sub_only_checked = 0usize;
+    let mut sub_only_shaded = 0usize;
+    let mut parent_only_checked = 0usize;
+    let mut parent_only_unshaded = 0usize;
+    for dy in 0..500 {
+        for dx in 0..800 {
+            if in_any_label(dx, dy) || in_head(dx, dy) {
+                continue;
+            }
+            let d_sub = dist2([dx, dy], sub_center);
+            let d_parent = dist2([dx, dy], parent_center);
+            let idx = dy as usize * 800 + dx as usize;
+            if d_sub < 67 * 67 && d_parent >= 100 * 100 {
+                sub_only_checked += 1;
+                if sub_frame[idx] != bare_lot[idx] {
+                    sub_only_shaded += 1;
+                }
+            } else if d_parent < 67 * 67 && d_sub >= 100 * 100 {
+                parent_only_checked += 1;
+                if sub_frame[idx] == bare_lot[idx] {
+                    parent_only_unshaded += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        sub_only_checked > 500 && sub_only_shaded * 10 > sub_only_checked * 9,
+        "expected submenu-only inner disk outside parent disk to be shaded: {sub_only_shaded}/{sub_only_checked}"
+    );
+    assert!(
+        parent_only_checked > 500 && parent_only_unshaded == parent_only_checked,
+        "expected parent-only inner disk outside submenu disk to be unshaded: {parent_only_unshaded}/{parent_only_checked}"
+    );
+}
+
+/// The pie head submits into the house's final 3D pass with `D3DCMP_LESSEQUAL`
+/// depth testing (`0x4a9500`, `0x5ce959`–`0x5ce977`, `0x4623f5`–`0x462414`
+/// placing the head origin at `z_screen = 0.5 * ((3000 + 10) << zoom)`). At
+/// Near zoom, Mortimer's neutral head's visible front-facing pixels span depths
+/// ~11,833–12,049, so nearer foreground scene geometry (e.g. grass at depth
+/// 8,703) occludes the head, the midpoint of those visible bounds clips only
+/// the farther half, and deeper/empty geometry lets the entire head draw and
+/// write its depths.
+#[test]
+fn pie_head_respects_house_depth_buffer_lessequal() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    assert_eq!(game.run(100), 100);
+    game.resize([800, 600]);
+    game.render();
+
+    let bench = recorded([432, 230]);
+    assert_eq!(game.under(bench), Some(173));
+    game.press(bench);
+    game.view.camera.zoom = sims_render::Zoom::Near;
+    game.render();
+
+    let menu = game.menu().expect("bench pie open");
+    let head = menu.head.as_ref().expect("Near-zoom head rendered");
+    let origin = menu.head_origin;
+    let head_depth = &menu.head_depth;
+    let opaque_depths: Vec<i32> = head
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(head_depth.iter().copied())
+        .filter(|(p, _)| p[3] == 255)
+        .map(|(_, d)| d)
+        .collect();
+    assert_eq!(opaque_depths.len(), 1_940);
+    let min_d = *opaque_depths.iter().min().unwrap();
+    let max_d = *opaque_depths.iter().max().unwrap();
+    assert!(
+        (11_800..=11_860).contains(&min_d) && (12_020..=12_080).contains(&max_d),
+        "expected Near-zoom Mortimer visible head depth ~11,833..12,049, got {min_d}..{max_d}"
+    );
+
+    // 1. Foreground scene nearer than every head vertex rejects all 1,940 pixels.
+    let fg_depth = sims_render::depth::Depth::new(&game.view.camera).grass([62, 62], 200);
+    assert!(fg_depth < min_d, "fg_depth={fg_depth} min_d={min_d}");
+    let mut fg_canvas = Canvas::new(800, 500, [1, 2, 3]);
+    fg_canvas.depth.fill(fg_depth);
+    sims_game::people::composite_pie_head(&mut fg_canvas, origin, head, head_depth, (800, 500));
+    let fg_written = fg_canvas.color.iter().filter(|p| **p != [1, 2, 3]).count();
+    assert_eq!(fg_written, 0, "nearer foreground must occlude the pie head");
+
+    // 2. Mid-head depth draws only the nearer half of visible pixels (z <= mid_d).
+    let mid_d = (min_d + max_d) / 2;
+    let mut mid_canvas = Canvas::new(800, 500, [1, 2, 3]);
+    mid_canvas.depth.fill(mid_d);
+    sims_game::people::composite_pie_head(&mut mid_canvas, origin, head, head_depth, (800, 500));
+    let mid_written = mid_canvas.color.iter().filter(|p| **p != [1, 2, 3]).count();
+    let expected_mid = opaque_depths.iter().filter(|&&d| d <= mid_d).count();
+    assert!(expected_mid > 500 && expected_mid < 1_940);
+    assert_eq!(mid_written, expected_mid);
+
+    // 3. Empty/far scene depth draws all 1,940 pixels and updates canvas.depth.
+    let mut far_canvas = Canvas::new(800, 500, [1, 2, 3]);
+    sims_game::people::composite_pie_head(&mut far_canvas, origin, head, head_depth, (800, 500));
+    let far_written = far_canvas.color.iter().filter(|p| **p != [1, 2, 3]).count();
+    assert_eq!(far_written, 1_940);
+    let updated_depths = far_canvas
+        .depth
+        .iter()
+        .filter(|&&d| d != sims_render::depth::EMPTY)
+        .count();
+    assert_eq!(updated_depths, 1_940);
 }
