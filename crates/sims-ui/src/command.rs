@@ -138,6 +138,23 @@ pub enum Command {
     /// Open the Help System dialog from the cluster's `?` button
     /// (`0x53aaad -> 0x50e8d3`, presentation only).
     OpenHelp,
+    /// Open Buy Mode top-level category `0..8` (`0x50633e`, presentation only).
+    BuyCategory(usize),
+    /// Select Buy Mode subcategory `0..8` (`0x50633e`, presentation only).
+    BuySubcategory(usize),
+    /// Return from Buy Mode subcategories to top-level categories (`0x50633e`,
+    /// presentation only).
+    BuyBack,
+    /// Step the Buy Mode catalog grid page by `-1` or `+1` (`0x50633e`,
+    /// presentation only).
+    BuyPage(i32),
+    /// Select catalog master GUID `u32` in the Buy Mode catalog grid
+    /// (`0x5065c8`).
+    BuyItem(u32),
+    /// Undo the most recent Buy/Build action (`0x4cf2e0` → `0x4932fa`).
+    Undo,
+    /// Redo the most recently undone Buy/Build action (`0x4cf317` → `0x493338`).
+    Redo,
 }
 
 impl Command {
@@ -153,6 +170,8 @@ impl Command {
                 | Self::AnswerDialog { .. }
                 | Self::ChooseInteraction { .. }
                 | Self::CancelAction { .. }
+                | Self::Undo
+                | Self::Redo
         )
     }
 }

@@ -191,6 +191,22 @@ pub struct Mask {
     rows: [u64; ARRAY_SIZE as usize],
 }
 
+/// The unrotated fine lot position (sixteenths of a tile) on the camera's
+/// current level under screen point `at`, accounting for terrain heights
+/// (`0x4a97c3` with flag 1 → `0x4a955d`, followed by `0x47bc1f` unrotation
+/// about `1024`, as `0x485a2e` / `0x4a6885` computes it).
+pub fn unproject_terrain(lot: &Lot, camera: &Camera, at: [i32; 2]) -> Option<[i32; 2]> {
+    let view = View::new(lot, camera).fine(at)?;
+    let m = ARRAY_SIZE * 16;
+    let [x, y] = view;
+    Some(match camera.rotation & 3 {
+        1 => [y, m - x],
+        2 => [m - x, m - y],
+        3 => [m - y, x],
+        _ => [x, y],
+    })
+}
+
 /// The view's tile bounds, inclusive: the lot's tiles turned into the view.
 fn bounds(lot: &Lot, camera: &Camera) -> [i32; 4] {
     let last = lot.size as i32 - 1;

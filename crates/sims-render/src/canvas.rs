@@ -471,6 +471,15 @@ impl Canvas {
         }
     }
 
+    /// Writes one pixel's color without modifying depth or pick ID, matching
+    /// the original's terrain grid drawers (`0x4c37f2`, `0x4c391d`) which
+    /// write directly to the color surface.
+    pub fn plot_color(&mut self, x: i32, y: i32, rgb: [u8; 3]) {
+        if let Some(target) = self.index(x, y) {
+            self.color[target] = rgb;
+        }
+    }
+
     /// Darkens what is at (`x`, `y`) by `light`, if it is at depth
     /// `at_least` or farther, keeping its depth and ID: a shadow cast on
     /// what is drawn there (0x4b10c4).

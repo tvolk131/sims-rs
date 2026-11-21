@@ -2705,9 +2705,21 @@ pub fn check_press(command: Command, selected: Selected, residential: bool) -> C
 /// not the lot's.
 pub fn covers(items: &[Item], point: [i32; 2]) -> bool {
     // A name box floats over the lot and takes nothing from it.
-    items
-        .iter()
-        .any(|i| !matches!(i.kind, Kind::Name { .. }) && i.rect.contains(point[0], point[1]))
+    // `4918` (`kTallSubpanel`, 150 px) extends 50 px transparently above the
+    // 100 px Buy strip; only its bottom `STRIP` pixels belong to the panel.
+    items.iter().any(|i| match i.kind {
+        Kind::Name { .. } => false,
+        Kind::Stretched(4918) => {
+            let strip = Rect::new(
+                i.rect.x,
+                i.rect.y + i.rect.height - STRIP,
+                i.rect.width,
+                STRIP,
+            );
+            strip.contains(point[0], point[1])
+        }
+        _ => i.rect.contains(point[0], point[1]),
+    })
 }
 
 /// Whether `point` lies inside the live-mode subpanel (`[gadget.x + 108..,
@@ -4347,6 +4359,21 @@ mod tests {
                 ..
             }
         )));
+
+        // Buy mode's stretched 4918 (`kTallSubpanel`, 150 px) extends 50 px
+        // transparently above the 100 px strip: only its bottom `STRIP` px
+        // cover the lot.
+        let buy_expanded = layout(
+            [800, 600],
+            &s,
+            &Controls {
+                mode: Mode::Buy,
+                expanded: true,
+                ..controls
+            },
+        );
+        assert!(!covers(&buy_expanded, [300, 470]));
+        assert!(covers(&buy_expanded, [300, 520]));
         assert!(job_items.iter().any(|i| i.kind == Kind::Friends(12)));
 
         // When show_money is false (global 32 == 1, 0x4f24fa -> 0x53b2a4),

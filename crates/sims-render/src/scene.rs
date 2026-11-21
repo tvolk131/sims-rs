@@ -77,7 +77,16 @@ pub fn draw(
     canvas: &mut Canvas,
 ) -> Stats {
     let viewport = (canvas.width as u32, canvas.height as u32);
-    paint(world, lot, assets, camera, viewport, canvas, Pass::All)
+    paint(
+        world,
+        lot,
+        assets,
+        camera,
+        viewport,
+        None,
+        canvas,
+        Pass::All,
+    )
 }
 
 /// Draws the lot as [`draw`] does, but leaves out the objects that hold a
@@ -91,7 +100,16 @@ pub fn draw_lot(
     canvas: &mut Canvas,
 ) -> Stats {
     let viewport = (canvas.width as u32, canvas.height as u32);
-    paint(world, lot, assets, camera, viewport, canvas, Pass::Lot)
+    paint(
+        world,
+        lot,
+        assets,
+        camera,
+        viewport,
+        None,
+        canvas,
+        Pass::Lot,
+    )
 }
 
 /// Draws the lot as [`draw_lot`] does, clipping grass columns and blades to
@@ -106,7 +124,40 @@ pub fn draw_lot_in_viewport(
     viewport: (u32, u32),
     canvas: &mut Canvas,
 ) -> Stats {
-    paint(world, lot, assets, camera, viewport, canvas, Pass::Lot)
+    paint(
+        world,
+        lot,
+        assets,
+        camera,
+        viewport,
+        None,
+        canvas,
+        Pass::Lot,
+    )
+}
+
+/// Draws the lot as [`draw_lot_in_viewport`] does, also rendering an invalid
+/// Buy Mode preview's off-lot held object at its on-lot `"Tile Cursor"`
+/// position (`0x42242f`) when `preview = Some((cursor_lead, held_lead))`.
+pub fn draw_lot_with_preview(
+    world: &World,
+    lot: &Lot,
+    assets: &mut Assets,
+    camera: &Camera,
+    viewport: (u32, u32),
+    preview: Option<(u16, u16)>,
+    canvas: &mut Canvas,
+) -> Stats {
+    paint(
+        world,
+        lot,
+        assets,
+        camera,
+        viewport,
+        preview,
+        canvas,
+        Pass::Lot,
+    )
 }
 
 /// Draws the objects [`draw_lot`] left out, over a canvas that holds the
@@ -123,7 +174,16 @@ pub fn draw_held(
     canvas: &mut Canvas,
 ) -> Stats {
     let viewport = (canvas.width as u32, canvas.height as u32);
-    let mut painter = Painter::new(world, lot, assets, camera, viewport, canvas, Pass::Held);
+    let mut painter = Painter::new(
+        world,
+        lot,
+        assets,
+        camera,
+        viewport,
+        None,
+        canvas,
+        Pass::Held,
+    );
     let top = camera.level.clamp(1, 2);
     for level in 1..=top {
         let cut = cut(lot, camera, level, top);
@@ -143,19 +203,21 @@ enum Pass {
     Held,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint(
     world: &World,
     lot: &Lot,
     assets: &mut Assets,
     camera: &Camera,
     viewport: (u32, u32),
+    preview: Option<(u16, u16)>,
     canvas: &mut Canvas,
     pass: Pass,
 ) -> Stats {
     let time_of_day = world.globals.get(4).copied().unwrap_or(lot.time_of_day);
     let house = world.globals.get(10).copied().unwrap_or(0);
     canvas.clear(background(time_of_day, house));
-    let mut painter = Painter::new(world, lot, assets, camera, viewport, canvas, pass);
+    let mut painter = Painter::new(world, lot, assets, camera, viewport, preview, canvas, pass);
     let top = camera.level.clamp(1, 2);
     for level in 1..=top {
         painter.floors(level);
@@ -404,6 +466,9 @@ struct Painter<'a> {
     pass: Pass,
     /// The objects that hold a person, for passes other than `All`.
     held: BTreeSet<u16>,
+    /// Off-lot Buy Mode held preview parts rendered at their on-lot
+    /// `"Tile Cursor"` positions (`0x42242f`), mapped to `([x, y, level], lift)`.
+    preview_overrides: BTreeMap<u16, ([i32; 3], f32)>,
     /// Active house viewport bottom (`word ptr [0x6f0c14]`), clamped to the
     /// canvas height.
     clip_bottom: i32,
@@ -418,12 +483,14 @@ struct Painter<'a> {
 }
 
 impl<'a> Painter<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         world: &'a World,
         lot: &'a Lot,
         assets: &'a mut Assets,
         camera: &'a Camera,
         viewport: (u32, u32),
+        preview: Option<(u16, u16)>,
         canvas: &'a mut Canvas,
         pass: Pass,
     ) -> Self {
@@ -435,6 +502,7 @@ impl<'a> Painter<'a> {
             } else {
                 holds_person(world)
             },
+            preview_overrides: buy_preview_overrides(world, preview),
             clip_bottom,
             world,
             lot,
@@ -580,6 +648,16 @@ impl<'a> Painter<'a> {
             for x in inner.clone() {
                 for y in inner.clone() {
                     self.terrain([x, y]);
+                }
+            }
+            // Buy (`2`) and Build (`1`) modes draw the dotted black lot
+            // placement grid over unfloored buildable terrain (`0x4ce44f` →
+            // `0x4c4222`, `0x4c42f0`, `0x4c3ba4`, `0x4c3c23`, `0x4c37f2`).
+            if matches!(self.world.globals.get(19).copied().unwrap_or(0), 1 | 2) {
+                for x in inner.clone() {
+                    for y in inner.clone() {
+                        self.terrain_grid([x, y]);
+                    }
                 }
             }
         }
@@ -754,6 +832,96 @@ impl<'a> Painter<'a> {
             self.clip_bottom,
             self.canvas,
         );
+    }
+
+    /// Whether view tile `[vx, vy]` is buildable for the Buy/Build Mode lot
+    /// grid (`0x4c3c23`: lot tile inside `1..size - 1` with ground flag `0x20`
+    /// clear in array `8`).
+    fn tile_buildable(&self, [vx, vy]: [i32; 2]) -> bool {
+        let [lx, ly] = self.camera.unrotate_tile([vx, vy]);
+        let limit = self.lot.size as i32 - 1;
+        if lx < 1 || lx >= limit || ly < 1 || ly >= limit {
+            return false;
+        }
+        let Some(flags) = self.world.arrays.get(&8) else {
+            return true;
+        };
+        let cell = Lot::cell(lx as usize, ly as usize);
+        flags.data.get(cell).is_none_or(|&byte| (byte & 0x20) == 0)
+    }
+
+    /// Draws the Buy/Build Mode dotted black lot placement grid on an
+    /// unfloored ground tile (`0x4c42f0`, `0x4c3ba4`, `0x4c37f2` / `0x4c391d`):
+    /// bit 1 is the tile's top-left edge and bit 2 its top-right edge, stepped
+    /// by 2 pixels on flat tiles and 4 pixels on sloped tiles (`0x4c3af9` /
+    /// `0x4c3c72`).
+    fn terrain_grid(&mut self, [x, y]: [i32; 2]) {
+        let cell = Lot::cell(x as usize, y as usize);
+        // Native `0x4c42f0` calls `0x4862ed` and skips tiles with a floor.
+        if self.lot.levels[0].floors[cell] != 0 {
+            return;
+        }
+        let view = self.camera.rotate_tile([x, y]);
+        let mask = if self.tile_buildable(view) {
+            3u8
+        } else {
+            let mut m = 0u8;
+            if view[0] > 0 && self.tile_buildable([view[0] - 1, view[1]]) {
+                m |= 1;
+            }
+            if view[1] > 0 && self.tile_buildable([view[0], view[1] - 1]) {
+                m |= 2;
+            }
+            m
+        };
+        if mask == 0 {
+            return;
+        }
+        let rotation = usize::from(self.camera.rotation & 3);
+        let h = self.lot.heights[cell];
+        let heights: [u8; 4] = std::array::from_fn(|n| h[(n + 4 - rotation) & 3]);
+        let corner = self.camera.project([view[0], view[1] + 1], 1, 0);
+        let zoom = self.camera.zoom.level();
+        let half_w = 8i32 << zoom;
+        let reach = (half_w * 2) + (255 << (zoom + 1));
+        let size = [self.canvas.width, self.canvas.height].map(|n| n as i32);
+        if (0..2).any(|i| corner[i] < -reach || corner[i] > size[i].saturating_add(reach)) {
+            return;
+        }
+        let left = corner[0] + GRASS_COLUMN;
+        let base_y = corner[1] + GRASS_ROW;
+        let shift = zoom + 1;
+        let y_left = base_y - (i32::from(heights[0]) << shift);
+        let y_top = base_y - ((i32::from(heights[1]) + 2) << shift);
+        let y_right = base_y - (i32::from(heights[2]) << shift);
+        let flat = heights[0] == heights[1] && heights[0] == heights[2] && heights[0] == heights[3];
+        let step = if flat { 2 } else { 4 };
+        if (mask & 1) != 0 {
+            let dy = ((y_top - y_left) << 16) / half_w;
+            let mut y_fp = y_left << 16;
+            let mut px = left;
+            while px < left + half_w {
+                let py = y_fp >> 16;
+                if py < self.clip_bottom {
+                    self.canvas.plot_color(px, py, [0, 0, 0]);
+                }
+                px += step;
+                y_fp += dy * step;
+            }
+        }
+        if (mask & 2) != 0 {
+            let dy = ((y_right - y_top) << 16) / half_w;
+            let mut y_fp = y_top << 16;
+            let mut px = left + half_w;
+            while px < left + half_w * 2 {
+                let py = y_fp >> 16;
+                if py < self.clip_bottom {
+                    self.canvas.plot_color(px, py, [0, 0, 0]);
+                }
+                px += step;
+                y_fp += dy * step;
+            }
+        }
     }
 
     /// The wallpaper on each side of a wall, first along its normal (the
@@ -1283,7 +1451,8 @@ impl<'a> Painter<'a> {
         let zoom = self.camera.zoom.index();
         let mut list = Vec::new();
         for (&id, o) in &self.world.objects {
-            let [x, y, z] = o.position;
+            let preview_at = self.preview_overrides.get(&id).copied();
+            let [x, y, z] = preview_at.map_or(o.position, |(pos, _)| pos);
             if o.person.is_some() || z != level || x < 0 || y < 0 {
                 continue;
             }
@@ -1309,35 +1478,44 @@ impl<'a> Painter<'a> {
             let slot = |guid, i: usize| assets.definition(guid)?.slots.get(i).copied();
             // The object's base altitude comes from `0x478dfe` (`0x4b9613`),
             // and its base screen position and depth anchor from `0x4b97ea`
-            // (unheld) or `0x4b9991` (held in a slot, `0x437fdd`).
+            // (unheld) or `0x4b9991` (held in a slot, `0x437fdd`, or an
+            // invalid Buy preview drawn via `0x42242f`).
             let base_altitude = self.lot.altitude_at([x, y]);
-            let (is_held, pose) = held(
-                &self.world.objects,
-                slot,
-                id,
-                [x as f32, y as f32, base_altitude],
-            );
-            let (screen, anchor) = if is_held {
-                let fine = [
-                    (pose[0] + 0.5).trunc() as i32,
-                    (pose[1] + 0.5).trunc() as i32,
-                ];
-                place_moved(&self.depth, self.camera, self.lot, fine, level, pose[2])
+            let (pose, screen, anchor) = if let Some((_, lift)) = preview_at {
+                let pose = [x as f32, y as f32, base_altitude + lift];
+                let (screen, anchor) =
+                    place_moved(&self.depth, self.camera, self.lot, [x, y], level, pose[2]);
+                (pose, screen, anchor)
             } else {
-                place_base(
-                    &self.depth,
-                    self.camera,
-                    self.lot,
-                    [x, y],
-                    level,
-                    base_altitude,
-                )
+                let (is_held, pose) = held(
+                    &self.world.objects,
+                    slot,
+                    id,
+                    [x as f32, y as f32, base_altitude],
+                );
+                let (screen, anchor) = if is_held {
+                    let fine = [
+                        (pose[0] + 0.5).trunc() as i32,
+                        (pose[1] + 0.5).trunc() as i32,
+                    ];
+                    place_moved(&self.depth, self.camera, self.lot, fine, level, pose[2])
+                } else {
+                    place_base(
+                        &self.depth,
+                        self.camera,
+                        self.lot,
+                        [x, y],
+                        level,
+                        base_altitude,
+                    )
+                };
+                (pose, screen, anchor)
             };
-            list.push((anchor, screen, id, pose));
+            list.push((anchor, screen, id, pose, [x, y]));
         }
         // Far objects first, so soft edges blend over what is behind them.
         list.sort_by_key(|&(a, _, id, ..)| (std::cmp::Reverse(a.depth), id));
-        for (base_anchor, base_screen, id, pose) in list {
+        for (base_anchor, base_screen, id, pose, pos) in list {
             let o = &self.world.objects[&id];
             let Some(definition) = self.assets.definition(o.guid) else {
                 self.stats.missing_objects += 1;
@@ -1347,7 +1525,7 @@ impl<'a> Painter<'a> {
             // (0x4aa446). Their scripts mark them when the lot loads; in a
             // house read without running those, the objects that shape a
             // wall still hide.
-            let tile = [o.position[0] >> 4, o.position[1] >> 4];
+            let tile = [pos[0] >> 4, pos[1] >> 4];
             let walled = cutaway::hides_with_walls(&o.data) || definition.shapes_wall();
             let hidden = walled
                 && match cut {
@@ -1385,8 +1563,7 @@ impl<'a> Painter<'a> {
                 Light::FULL
             } else {
                 Light::from_byte(
-                    self.lot
-                        .light_at((level - 1) as usize, [o.position[0], o.position[1]]),
+                    self.lot.light_at((level - 1) as usize, pos),
                     self.lot.brightest(),
                 )
             };
@@ -1451,6 +1628,90 @@ fn rotate_direction(rotation: u8, [x, y]: [i32; 2]) -> [i32; 2] {
         3 => [y, -x],
         _ => [x, y],
     }
+}
+
+/// Maps off-lot Buy Mode held preview parts to their on-lot `"Tile Cursor"`
+/// positions and surface lift (`0x42242f` + `0x46def8`), so blocked placements
+/// still draw the held object on top of the red cursor.
+fn buy_preview_overrides(
+    world: &World,
+    preview: Option<(u16, u16)>,
+) -> BTreeMap<u16, ([i32; 3], f32)> {
+    let mut out = BTreeMap::new();
+    let Some((cursor_lead, held_lead)) = preview else {
+        return out;
+    };
+    let (Some(cursor_obj), Some(held_obj)) = (
+        world.objects.get(&cursor_lead),
+        world.objects.get(&held_lead),
+    ) else {
+        return out;
+    };
+    let collect_group = |lead: u16, is_group: bool| -> Vec<u16> {
+        if !is_group {
+            return vec![lead];
+        }
+        let parent_id = lead as i16;
+        world
+            .objects
+            .iter()
+            .filter_map(|(&id, o)| {
+                let belongs =
+                    id == lead || o.multipart.as_ref().is_some_and(|m| m.parent == parent_id);
+                belongs.then_some(id)
+            })
+            .collect()
+    };
+    let cursor_parts = collect_group(cursor_lead, cursor_obj.multipart.is_some());
+    let held_parts = collect_group(held_lead, held_obj.multipart.is_some());
+    let mut pairs = Vec::with_capacity(held_parts.len());
+    if held_obj.multipart.is_some() && cursor_obj.multipart.is_some() {
+        for &hp in &held_parts {
+            let offset = world.objects[&hp].multipart.as_ref().map(|m| m.offset);
+            let matched = cursor_parts
+                .iter()
+                .copied()
+                .find(|&cp| world.objects[&cp].multipart.as_ref().map(|m| m.offset) == offset);
+            if let Some(cp) = matched {
+                pairs.push((cp, hp));
+            }
+        }
+    } else {
+        for (&cp, &hp) in cursor_parts.iter().zip(held_parts.iter()) {
+            pairs.push((cp, hp));
+        }
+    }
+    for (cp, hp) in pairs {
+        let (Some(c), Some(h)) = (world.objects.get(&cp), world.objects.get(&hp)) else {
+            continue;
+        };
+        if h.position[0] >= 0 && h.position[1] >= 0 {
+            continue;
+        }
+        if c.position[0] < 0 || c.position[1] < 0 {
+            continue;
+        }
+        if c.data.get(HIDDEN).is_some_and(|&w| w != 0) {
+            continue;
+        }
+        out.insert(hp, (c.position, preview_surface_lift(&h.data)));
+    }
+    out
+}
+
+/// Default surface-height lift for a non-floor Buy Mode preview drawn via
+/// `0x42242f` (`0x46def8`: height codes 2 = 2.5, 3 = 4.0, 4 = 4.05, 8 = 4.0).
+fn preview_surface_lift(data: &[i16]) -> f32 {
+    let allowed = data.get(4).copied().unwrap_or(0) as u16;
+    if allowed & 1 != 0 {
+        return 0.0;
+    }
+    for (code, height) in [(2u32, 2.5f32), (3, 4.0), (4, 4.05), (8, 4.0)] {
+        if allowed & (1u16 << (code - 1)) != 0 {
+            return height;
+        }
+    }
+    0.0
 }
 
 /// An object's data word that hides it when not zero (the simulation's
