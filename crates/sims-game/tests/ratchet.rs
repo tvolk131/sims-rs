@@ -137,7 +137,10 @@ fn parse(text: &str) -> Result<Vec<Scene>, String> {
         }
         if let Some(rest) = line.strip_prefix('[') {
             finish(name, &mut fields);
-            name = Some(rest.strip_suffix(']').ok_or(format!("line {}: {line}", n + 1))?);
+            name = Some(
+                rest.strip_suffix(']')
+                    .ok_or(format!("line {}: {line}", n + 1))?,
+            );
             continue;
         }
         let (key, value) = line
@@ -158,7 +161,8 @@ fn scene(name: &str, fields: &[(usize, &str, &str)]) -> Result<Scene, String> {
             .ok_or(format!("{name}: no `{key}`"))
     };
     let number = |key: &str, word: &str| -> Result<i64, String> {
-        word.parse().map_err(|_| format!("{name}: `{key}`: {word:?}"))
+        word.parse()
+            .map_err(|_| format!("{name}: `{key}`: {word:?}"))
     };
     let yes = |key: &str| -> Result<bool, String> {
         match get(key)?.1 {
@@ -465,7 +469,13 @@ fn run(install: &Path, references: &Path) -> Result<(), Vec<String>> {
         let mut diff = diff_dir
             .as_ref()
             .map(|_| Canvas::new(WIDTH, HEIGHT, [0, 0, 0]));
-        let shares = compare(&game, &canvas, &originals[i], &scene.leave_out, diff.as_mut());
+        let shares = compare(
+            &game,
+            &canvas,
+            &originals[i],
+            &scene.leave_out,
+            diff.as_mut(),
+        );
         if let (Some(dir), Some(d)) = (&diff_dir, &diff) {
             for (out, image) in [
                 (dir.join(format!("{name}.png")), d),
@@ -520,7 +530,11 @@ fn run(install: &Path, references: &Path) -> Result<(), Vec<String>> {
                     "{name}: {c} matches {share:.2}%, below its floor {floor:.2}%"
                 ));
             }
-            let kept = if update { floor.max(floor_of(share)) } else { floor };
+            let kept = if update {
+                floor.max(floor_of(share))
+            } else {
+                floor
+            };
             floors.push(format!("{c} {kept:.2}"));
         }
         if update {
