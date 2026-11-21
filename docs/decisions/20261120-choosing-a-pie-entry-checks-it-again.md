@@ -37,8 +37,10 @@ Read note left this open
   it, at the button's release; nothing ran at the mousedown. The window
   chooses at the press, as it did before this change, so a press on an
   entry followed by a drag off the pie and a release chooses the entry
-  in ours and not, most likely, in the original. The replays give the
-  press at the update the release ended in, so they do not show this.
+  in ours and not, most likely, in the original. The replays press the
+  entry once the lot has run the update before the one the release
+  ended in (in the snack-bob replay, after 223, for a release that
+  ended at 224), so they do not show this.
   Choosing at the release would change how the window takes clicks for
   every pie, and is left for a later change.
 
@@ -69,8 +71,7 @@ The recording has a press on the fridge (118) and Have A Snack. The
 test is
 `the_recorded_snack_order_with_bob_shots_replayed_in_the_window_matches_the_recording`.
 
-- **When.** Each input is given at the update the watches show it acted
-  in:
+- **When.** Each input is given at an update the watches bound:
   - pointer moves at 85 and 91 list nothing. The second move's command
     ran from 90 to 93, and the original listed nothing at the frame
     after 92; the replay moves at 91, before that frame, which the

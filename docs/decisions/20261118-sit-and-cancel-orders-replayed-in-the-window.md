@@ -60,8 +60,12 @@ and `the_recorded_cancel_order_replayed_in_the_window_matches_the_recording`.
 
 - **Cancel.** With the animator reset that removes a playing clip
   (#263), the lot equals the recording's after every update from 1 to
-  1300, except for two listings the original's pointer made and ours
-  did not (below). That covers:
+  1300, except for two differences taken for listings the original's
+  pointer made and ours did not (below). Since then, the one at 90 is
+  settled by drawing on the recording's frames, and the one at 257–259
+  by the second check of a chosen entry
+  (`20261120-choosing-a-pie-entry-checks-it-again.md`): the cancel
+  replay now equals the recording at every update to 1300. That covers:
   - the second order queued behind the first;
   - the press on its icon taking it off;
   - the press on the running snack's icon setting its flag 0x100,
@@ -98,8 +102,9 @@ one.
 - **Under the still pointer.** After a choice the pointer stays on the
   pie entry, and the original lists pies there while the lot runs:
   - in cancel, after 256: for 257–259 the original's word 50 is 0
-    where ours is 1, and its last result 1 where ours is 0. The
-    release's second check of the entry accounts for these
+    where ours was 1 before the check below was ported, and its last
+    result 1 where ours was 0. Ours now matches. The release's second
+    check of the entry accounts for these
     (`20261120-choosing-a-pie-entry-checks-it-again.md`, from the
     snack-bob recording's watch); a listing at the same updates is not
     ruled out;

@@ -2655,7 +2655,8 @@ fn the_recorded_read_order_replayed_in_the_window_matches_the_recording() {
 /// a press on the fridge, then Have A Snack. Its frame watch gives the
 /// frames the original drew, and its write watch on Mortimer's word 50
 /// shows when the original listed a pie and checked an entry, so each
-/// input is given at the update the watches show it acted in. A scratch
+/// input is given at an update the watches bound (the second pointer
+/// move's, 91, is a choice within its command's 90–93). A scratch
 /// comparison found the lot equal to the recording's after every update
 /// from 1 to 800 except for what
 /// `docs/decisions/20261120-choosing-a-pie-entry-checks-it-again.md`
