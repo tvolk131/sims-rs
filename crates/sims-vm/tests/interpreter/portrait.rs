@@ -817,10 +817,22 @@ fn an_object_name_that_may_hold_a_neighbor_token_fails_loudly() {
             assert!(fx.world.portraits.is_empty());
         }
         // Where the neighbor is found after the name, the name does not
-        // matter.
+        // matter to the portrait. A name not known may hold
+        // `$TokenNameLocal`, whose pass throws with the lamp running the
+        // dialog (0x44c57b).
+        let known = names.as_ref().is_some_and(|names| {
+            names.iter().any(|(language, _)| *language == 1)
+                && names.iter().all(|(_, name)| !name.is_empty())
+        });
         let mut fx = text_dialog((message, 0, 2), names.clone());
-        assert_eq!(fx.run_with(LAMP, 4096, SIM as i16, &[], 1000), Ok(true));
-        assert_eq!(fx.world.portraits, [WIDGET].into(), "{names:?}");
+        let ran = fx.run_with(LAMP, 4096, SIM as i16, &[], 1000);
+        if known {
+            assert_eq!(ran, Ok(true));
+            assert_eq!(fx.world.portraits, [WIDGET].into(), "{names:?}");
+        } else {
+            let fault = ran.unwrap_err().to_string();
+            assert!(fault.contains("0x44c57b"), "{names:?}: {fault}");
+        }
     }
     // Where every name gives the same, it is used: each holds `$Neighbor`,
     // or makes it with the `$` before the token, or none does.
@@ -911,7 +923,7 @@ fn a_token_of_a_pass_before_the_neighbors_that_may_decide_the_portrait_fails_lou
     // Where `$Neighbor` is found in a later string, the earlier one's
     // tokens do not matter.
     let mut fx = text_dialog((1, 0, 2), Some(vec![(1, "Grim")]));
-    message(&mut fx, "$Me");
+    message(&mut fx, "$NeighborLocal:$Local:0");
     assert_eq!(fx.run_with(LAMP, 4096, SIM as i16, &[], 1000), Ok(true));
     assert_eq!(fx.world.portraits, [WIDGET].into());
 }
@@ -984,6 +996,102 @@ fn me_is_replaced_by_the_running_objects_name_before_object_is() {
         assert!(fault.contains("0x44c65f"), "{names:?}: {fault}");
         assert!(fx.world.portraits.is_empty());
     }
+}
+
+#[test]
+fn object_is_replaced_again_from_one_past_each_place() {
+    // `$Object`'s pass, as `$Me`'s, searches again from one past each place
+    // it replaced (0x44c1e3): a name `x$` before `Object` makes `$Object`
+    // again, and its name then makes `$Neighbor`.
+    let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "x$")]));
+    fx.program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .strings
+        .get_mut(&301)
+        .unwrap()[0] = "$ObjectObjectNeighbor".to_owned();
+    assert_eq!(fx.run_with(LAMP, 4096, SIM as i16, &[], 1000), Ok(true));
+    assert_eq!(fx.world.portraits, [WIDGET].into());
+    // A name that holds `$Object` would be found again: not known.
+    let mut fx = text_dialog((2, 0, 3), Some(vec![(1, "my $Object")]));
+    let fault = fx
+        .run_with(LAMP, 4096, SIM as i16, &[], 1000)
+        .unwrap_err()
+        .to_string();
+    assert!(fault.contains("0x44c65f"), "{fault}");
+}
+
+#[test]
+fn a_name_not_known_may_take_neighbor_out_with_neighbor_local() {
+    // `$NeighborLocal:$Object` with a name `0` is `$NeighborLocal:0`, which
+    // its pass replaces when local 0 names a listed person's record, so
+    // `$Neighbor` is gone. With the names not known (no table), the
+    // `$Neighbor` left in the text is not certain.
+    let mut fx = text_dialog((0, 0, 1), None);
+    fx.program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .strings
+        .get_mut(&301)
+        .unwrap()[0] = "$NeighborLocal:$Object".to_owned();
+    let fault = fx
+        .run_with(LAMP, 4096, SIM as i16, &[], 1000)
+        .unwrap_err()
+        .to_string();
+    assert!(fault.contains("0x44c65f"), "{fault}");
+    assert!(fx.world.portraits.is_empty());
+}
+
+#[test]
+fn token_name_local_with_a_running_object_that_is_not_a_person_fails_loudly() {
+    // `$TokenNameLocal` casts the running object to a person (0x44c4f6)
+    // and throws when it is not one (0x44c57b): with the lamp running the
+    // dialog, a text that holds the token, or a name that may hold it,
+    // fails loudly, here with no stack object (no neighbor record, so the
+    // portrait does not depend on the text).
+    for (text, stack_object) in [
+        ("$TokenNameLocal:0", 0),
+        ("$NameLocal:0", 0),
+        ("$Family", 0),
+    ] {
+        let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
+        fx.program
+            .libraries
+            .get_mut(&LAMP_FILE)
+            .unwrap()
+            .strings
+            .get_mut(&301)
+            .unwrap()[0] = text.to_owned();
+        let fault = fx
+            .run_with(LAMP, 4096, stack_object, &[], 1000)
+            .unwrap_err()
+            .to_string();
+        assert!(fault.contains("0x44c57b"), "{text}: {fault}");
+    }
+    // A person running it does not throw: with no stack object, nothing
+    // is found and no portrait is shown.
+    let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
+    let strings = vec!["$TokenNameLocal:0".to_owned()];
+    fx.program
+        .libraries
+        .get_mut(&SIM_FILE)
+        .unwrap()
+        .strings
+        .insert(301, strings);
+    fx.add(
+        SIM_FILE,
+        4096,
+        tree(vec![ins(
+            DIALOG,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [0, 0, 1, 0, 0, 0, 0, 1],
+        )]),
+    );
+    assert_eq!(fx.run_with(SIM, 4096, 0, &[], 1000), Ok(true));
+    assert!(fx.world.portraits.is_empty());
 }
 
 #[test]

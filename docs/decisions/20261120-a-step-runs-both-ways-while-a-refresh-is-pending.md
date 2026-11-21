@@ -162,6 +162,15 @@ record (`Machine::dialog_portrait`). In the recording the cat's type had
 no image yet, so a cat was made and removed. That accounts for the
 1,920 draws, and the objects after it match the recording.
 
+A person made later can take its type's image away again. At the end of
+making a person (0x44e6b6 to 0x44e70b, after its traits and flag 0x20's
+turn), if person word 84 bit 0, word 68 bit 0, or word 74 bit 0 or 1 is
+set, the original calls 0x45810c, then 0x4eb0eb and 0x4e895e, which
+reset the type's image slots, so the next dialog builds the portrait
+again. `make_person` takes the type out of `World::portraits` then
+(Sol's seventh check). Test:
+`a_person_made_with_person_word_68_74_or_84_set_resets_its_types_portrait`.
+
 What is not ported:
 
 - **Text tokens.** This part is ported. The record's strings come from
@@ -193,6 +202,10 @@ What is not ported:
       0x4e893e), which is not ported. Where a name took a token's place
       and the `$Neighbor` search after it would then decide between two
       types, the port fails loudly: the name could hold `$Neighbor`.
+    - A name that is not known may also take `$Neighbor` out, by making a
+      `$NeighborLocal` token of it, so it never makes `$Neighbor` certain
+      (Sol's seventh check). Test:
+      `a_name_not_known_may_take_neighbor_out_with_neighbor_local`.
 
     Tests: `a_neighbor_local_named_in_a_dialogs_text_is_not_its_neighbor`,
     `a_neighbor_local_the_original_left_unknown_fails_loudly`.
@@ -288,6 +301,10 @@ What is not ported:
   them. The names are known only when the table has an entry in language
   1, no entry is empty, and the object's file has no legacy CATS table,
   which 0x4061e3 checks first (Sol's reading, **unverified** here).
+  As with `$Me` below, each token is replaced from the start of the
+  text, then from one past each place replaced (0x4558a0, 0x455750), so
+  a name that holds `$Object` is found again and is taken as not known
+  (Sol's seventh check).
   Where the name would decide the type, the dialog fails loudly. On the Goth
   house this matters at update 901. Test:
   `an_object_name_that_may_hold_a_neighbor_token_fails_loudly`.
@@ -316,10 +333,21 @@ What is not ported:
     check). So a text that holds a name token, or a number token together
     with `$Neighbor`, leaves what is found unknown. The dialog fails
     loudly where that decides the portrait.
+  - `$TokenNameLocal`'s pass (0x44c490) throws when it finds its token,
+    the tree has a frame and the local's index is in range, and the
+    object running the tree is not a person: it casts the formatter's
+    `this` to a person (0x44c4f6), and a failed cast throws (0x44c57b).
+    `$Family`, `$NameAttrib` and `$NameLocal` read the person too, and a
+    name not known may write the token. Where the running object is not
+    a person and the text holds one of these tokens, or a name not
+    known, the dialog fails loudly after the portrait checks (Sol's
+    seventh check). Test:
+    `token_name_local_with_a_running_object_that_is_not_a_person_fails_loudly`.
 
   Tests:
   `a_token_of_a_pass_before_the_neighbors_that_may_decide_the_portrait_fails_loudly`,
-  `me_is_replaced_by_the_running_objects_name_before_object_is`.
+  `me_is_replaced_by_the_running_objects_name_before_object_is`,
+  `object_is_replaced_again_from_one_past_each_place`.
 - **Other builders.** Only the dialog's builds are counted. The household
   panel draws the family's portraits, so a portrait of a family member's
   type with nobody of it on the lot fails loudly. A type made while the

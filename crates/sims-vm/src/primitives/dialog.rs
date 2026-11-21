@@ -82,6 +82,21 @@ fn replace_each(text: &str, token: &str, name: &str) -> String {
     text
 }
 
+/// Whether the `$TokenNameLocal` pass may throw: for a token whose local
+/// is one of the running tree's, it casts the running object to a person
+/// (0x44c4f6) and throws when it is not one (0x44c57b, 0x634e08), which
+/// is not ported. `text` is a string as the ported passes left it;
+/// `unknown` is whether a name not known stands in it, and a name from a
+/// pass that is not ported may hold the token too.
+fn may_throw(me_person: bool, text: &str, unknown: bool) -> bool {
+    !me_person
+        && (unknown
+            || text.contains("$TokenNameLocal")
+            || ["$Family", "$NameAttrib", "$NameLocal"]
+                .iter()
+                .any(|token| text.contains(token)))
+}
+
 /// Record status: made and not shown yet.
 pub const NEW: u8 = 0;
 /// Shown, not answered.
@@ -405,6 +420,11 @@ impl Machine<'_, '_> {
         // The running object's names, for `$Me`; read only when a text
         // holds the token.
         let mut me_names = None;
+        let me_person = self.me()?.person.is_some();
+        // Whether a text may hold `$TokenNameLocal` with the running
+        // object not a person ([`may_throw`]): it fails after the portrait
+        // is worked out, so a portrait that is not known names that first.
+        let mut throws = false;
         for text in self.dialog_strings(operands)? {
             // What this string may do to what was found: None keeps it,
             // Some(type) puts that in its place.
@@ -418,6 +438,7 @@ impl Machine<'_, '_> {
             // ported. The name `$Family` writes may hold `$Me`, `$Object`
             // or `$Neighbor`.
             if text.contains("$Family") {
+                throws |= may_throw(me_person, &text, true);
                 outcomes = anything();
             } else if text.contains("$Me") {
                 // `$Me` (0x44c0fc to 0x44c153) is replaced by the running
@@ -439,13 +460,25 @@ impl Machine<'_, '_> {
                                 object,
                                 neighbor,
                                 &object_names,
+                                me_person,
+                                &mut throws,
                             )?);
                         }
                     }
-                    _ => outcomes = anything(),
+                    _ => {
+                        throws |= may_throw(me_person, &text, true);
+                        outcomes = anything();
+                    }
                 }
             } else {
-                outcomes = self.text_outcomes(&text, object, neighbor, &object_names)?;
+                outcomes = self.text_outcomes(
+                    &text,
+                    object,
+                    neighbor,
+                    &object_names,
+                    me_person,
+                    &mut throws,
+                )?;
             }
             found = outcomes
                 .into_iter()
@@ -467,33 +500,50 @@ impl Machine<'_, '_> {
                     .into(),
             ));
         }
+        if throws {
+            return Err(Trap::Unsupported(
+                "a dialog's text may hold `$TokenNameLocal`, whose pass throws when the object \
+                 running the tree is not a person (0x44c4f6, 0x44c57b): not ported"
+                    .into(),
+            ));
+        }
         Ok(found.into_iter().next().flatten())
     }
 
     /// What one string, as the passes before `$Object`'s left it, may do
     /// to the type the formatter has found: None keeps it, Some(type) puts
     /// that in its place. `object_names` are the names `$Object` may be
-    /// replaced by (none when not known).
+    /// replaced by (none when not known); `me_person` is whether the
+    /// running object is a person, and `throws` is set where the
+    /// `$TokenNameLocal` pass may throw ([`may_throw`]).
     fn text_outcomes(
         &self,
         text: &str,
         object: Option<u32>,
         neighbor: Option<u32>,
         object_names: &Option<Vec<String>>,
+        me_person: bool,
+        throws: &mut bool,
     ) -> Result<BTreeSet<Option<Option<u32>>>, Trap> {
-        // `$Object` is replaced by the object's name (0x44c1ca). The text
-        // each name may leave, and whether the name stands there unknown.
-        // With no object the token stays as `(name)`.
+        // `$Object` is replaced by the object's name (0x44c1ca), from the
+        // start and then from one past each place replaced (0x44c1e3), as
+        // `$Me` is. The text each name may leave, and whether a name not
+        // known stands there: a name that holds `$Object` would be found
+        // again, and is taken as not known. With no object the token
+        // stays as `(name)`.
         let object_named = text.contains("$Object") && object.is_some();
         let kept = object_named.then_some(object);
         let texts: Vec<(String, bool)> = match object_names {
-            Some(names) if object_named => names
+            Some(names) if object_named && names.iter().all(|n| !n.contains("$Object")) => names
                 .iter()
-                .map(|name| (text.replace("$Object", name), false))
+                .map(|name| (replace_each(text, "$Object", name), false))
                 .collect(),
-            None if object_named => vec![(text.replace("$Object", "(name)"), true)],
+            _ if object_named => vec![(replace_each(text, "$Object", "(name)"), true)],
             _ => vec![(text.replace("$Object", "(name)"), false)],
         };
+        for (text, unknown) in &texts {
+            *throws |= may_throw(me_person, text, *unknown);
+        }
         let Some(neighbor) = neighbor else {
             for (text, _) in &texts {
                 self.neighbor_locals_named(text)?;
@@ -516,8 +566,11 @@ impl Machine<'_, '_> {
                 outcomes.extend([kept, Some(Some(neighbor))]);
                 continue;
             }
+            // A name not known may also finish a `$NeighborLocal` token
+            // (`$NeighborLocal:$Object` and a name `0`), whose pass may then
+            // take `$Neighbor` out, so what is found is not known.
             let (text, named) = self.neighbor_locals_named(text)?;
-            if text.contains("$Neighbor") {
+            if text.contains("$Neighbor") && !*unknown {
                 outcomes.insert(Some(Some(neighbor)));
             } else if named || *unknown {
                 outcomes.extend([kept, Some(Some(neighbor))]);

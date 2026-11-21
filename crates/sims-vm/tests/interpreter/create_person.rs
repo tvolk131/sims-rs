@@ -185,23 +185,43 @@ fn flag_0x4_runs_a_new_visitors_init_visitor_tree_at_once() {
 }
 
 #[test]
-fn a_person_made_with_person_word_68_74_or_84_set_is_made_as_any_other() {
-    // The person test (0x44e6b6 to 0x44e727) sends such a person through
-    // 0x45810c, which touches only the screen; the port leaves it out.
-    for word in [68, 74, 84] {
+fn a_person_made_with_person_word_68_74_or_84_set_resets_its_types_portrait() {
+    // The person test (0x44e6b6 to 0x44e727) sends a person with bit 0 of
+    // word 68 or 84, or bit 0 or 1 of word 74, through 0x45810c, which
+    // resets its type's entry in the interface's table (0x4eb0eb,
+    // 0x4e895e): the next dialog's portrait of the type is built again
+    // (0x4e92a8). Other bits leave it.
+    for (word, value, reset) in [
+        (68, 1, true),
+        (68, 2, false),
+        (74, 1, true),
+        (74, 2, true),
+        (74, 4, false),
+        (84, 1, true),
+        (84, 2, false),
+    ] {
         let (mut fx, _, record) = visitors();
+        fx.world.portraits.insert(WIDGET);
         let before = ids(&fx);
         let slot = fx.world.neighbors.slots.last_mut().unwrap();
         let slot = slot.as_mut().unwrap();
         slot.revision = 10;
-        slot.data[word] = 3;
+        slot.data[word] = value;
         assert_eq!(
             create(&mut fx, 0, 6, FROM_RECORD, record),
             Ok(true),
             "word {word}"
         );
         let id = new_object(&fx, &before);
-        assert_eq!(fx.world.objects[&id].person.as_ref().unwrap().data[word], 3);
+        assert_eq!(
+            fx.world.objects[&id].person.as_ref().unwrap().data[word],
+            value
+        );
+        assert_eq!(
+            fx.world.portraits.contains(&WIDGET),
+            !reset,
+            "word {word} = {value}"
+        );
     }
 }
 
