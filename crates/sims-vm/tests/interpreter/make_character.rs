@@ -814,3 +814,74 @@ fn pet_creation_without_pet_expansions_skips_temporary_portrait_pet_and_keeps_ch
     assert!(fx.world.portraits.is_empty());
     assert!(fx.world.saved_portraits.is_empty());
 }
+
+#[test]
+fn make_new_character_names_new_child_and_pet_from_last_kind3_dialog_text() {
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+
+    // 0x44b0a8..0x44b0fc: Make New Character reads global [0x6e4ac0] (populated
+    // by the last kind 3 text dialog) and writes it to the created character's
+    // catalog name.
+    let dialog_text = RefCell::new("Bella".to_owned());
+    let character_names = RefCell::new(BTreeMap::new());
+    let mut fx = fixture(0, 5, 1, 0, &TONES);
+    let mut interp = sims_vm::Interpreter::new(&fx.program, &fx.catalog, sims_vm::Stream::Global);
+    interp.dialog_text = Some(&dialog_text);
+    interp.character_names = Some(&character_names);
+    assert_eq!(
+        interp.run_tree(&mut fx.world, LAMP, 4096, SIM as i16, &[], 1000),
+        Ok(true)
+    );
+    let child_guid = expected_guid();
+    assert_eq!(
+        character_names
+            .borrow()
+            .get(&child_guid)
+            .map(String::as_str),
+        Some("Bella")
+    );
+
+    // Pet creation also receives the submitted dialog text.
+    *dialog_text.borrow_mut() = "Fido".to_owned();
+    let mut fx_pet = fixture(0, 5, 0, 1, &TONES);
+    add_pet_templates(&mut fx_pet);
+    fx_pet.program.expansions = 0;
+    let mut interp_pet =
+        sims_vm::Interpreter::new(&fx_pet.program, &fx_pet.catalog, sims_vm::Stream::Global);
+    interp_pet.dialog_text = Some(&dialog_text);
+    interp_pet.character_names = Some(&character_names);
+    assert_eq!(
+        interp_pet.run_tree(&mut fx_pet.world, LAMP, 4096, SIM as i16, &[], 1000),
+        Ok(true)
+    );
+    let pet_guid = expected_guid();
+    assert_eq!(
+        character_names.borrow().get(&pet_guid).map(String::as_str),
+        Some("Fido")
+    );
+
+    // Empty kind-3 submission falls back to localized STR# 142[5] default name
+    // (`0x44b0bf..0x44b0d6`).
+    dialog_text.borrow_mut().clear();
+    let mut fx_default = fixture(0, 5, 1, 0, &TONES);
+    let mut interp_default = sims_vm::Interpreter::new(
+        &fx_default.program,
+        &fx_default.catalog,
+        sims_vm::Stream::Global,
+    );
+    interp_default.dialog_text = Some(&dialog_text);
+    interp_default.character_names = Some(&character_names);
+    interp_default.default_character_name = Some("DefaultKid");
+    assert_eq!(
+        interp_default.run_tree(&mut fx_default.world, LAMP, 4096, SIM as i16, &[], 1000),
+        Ok(true)
+    );
+    assert_eq!(
+        character_names
+            .borrow()
+            .get(&expected_guid())
+            .map(String::as_str),
+        Some("DefaultKid")
+    );
+}

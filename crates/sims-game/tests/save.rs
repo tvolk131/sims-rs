@@ -130,7 +130,9 @@ fn a_save_made_while_the_help_dialog_waits_shows_it_again() {
     let saved = game.save().unwrap();
 
     let no = game.dialog().unwrap().buttons[1];
-    game.press([no.x + no.width / 2, no.y + no.height / 2]);
+    let pt = [no.x + no.width / 2, no.y + no.height / 2];
+    game.press(pt);
+    game.release(pt);
     assert!(game.asking().is_none());
     assert_eq!(game.run(20), 20);
     game.render();

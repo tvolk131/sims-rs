@@ -27,7 +27,7 @@ use super::Lot;
 use crate::Answers;
 use serde::{Deserialize, Serialize};
 use sims_sim::World;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The version of [`Saved::encode`]'s layout: the fields of [`Saved`],
 /// their order and their types (postcard is not self-describing). Bump it
@@ -38,8 +38,9 @@ use std::collections::BTreeSet;
 /// pre-resolved house view centre; layout 4 keeps the house file's saved
 /// floor rotation baseline (`HOUS 0` `camera_direction & 3`); layout 5
 /// keeps the view-rotated screen-centre tile pick (`0x4a7b58` cut via
-/// `0x433067`) and any frozen dialog-replay view.
-pub const FORMAT: u32 = 5;
+/// `0x433067`) and any frozen dialog-replay view; layout 6 keeps each
+/// pending dialog answer's text-entry string ([`crate::Answer::text`]).
+pub const FORMAT: u32 = 6;
 
 /// A lot as it stood between two steps ([`Lot::save`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +63,13 @@ pub struct Saved {
     /// Format 5 on: frozen `(view_rotation, view_centre)` while a dialog tick
     /// awaits replay.
     replay_view: Option<(u8, Option<[i8; 2]>)>,
+    /// Format 6 on: last kind 3 dialog text (`[0x6e4ac0]`), Make New Character
+    /// catalog names (`0x44b0e8`), and Save Card lot name & description
+    /// (`0x50e1f8..0x50e42c`).
+    last_dialog_text: String,
+    character_names: BTreeMap<u32, String>,
+    lot_name: String,
+    lot_description: String,
 }
 
 /// Why a lot could not be saved or restored.
@@ -227,6 +235,10 @@ impl Lot {
             view_centre: self.view_centre,
             floor_rotation: self.floor_rotation,
             replay_view: self.replay_view,
+            last_dialog_text: self.last_dialog_text.clone(),
+            character_names: self.character_names.clone(),
+            lot_name: self.lot_name.clone(),
+            lot_description: self.lot_description.clone(),
         })
     }
 
@@ -259,6 +271,10 @@ impl Lot {
         self.view_rotation = saved.view_rotation;
         self.view_centre = saved.view_centre;
         self.replay_view = saved.replay_view;
+        self.last_dialog_text = saved.last_dialog_text;
+        self.character_names = saved.character_names;
+        self.lot_name = saved.lot_name;
+        self.lot_description = saved.lot_description;
         self.halted = false;
         self.asking = None;
         self.answered = saved.answered;

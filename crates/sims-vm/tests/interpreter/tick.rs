@@ -124,6 +124,7 @@ fn a_dialog_click_publishes_its_bitmap_until_the_next_poll() {
         let mut player = Answers::replay(&[Answer {
             status: 2,
             bitmap_id,
+            text: None,
         }]);
         assert_eq!(update(&mut fx, &mut player).unwrap().answered, [(LAMP, 2)]);
         assert_eq!(fx.world.globals[12], expected);
@@ -131,6 +132,41 @@ fn a_dialog_click_publishes_its_bitmap_until_the_next_poll() {
         interpreter.before_frame(&mut fx.world).unwrap();
         assert_eq!(fx.world.globals[12], 0);
     }
+}
+
+#[test]
+fn a_text_entry_dialog_captures_entered_text_and_takes_true_branch() {
+    // `Answers::choices` must wait for an explicit player answer on kind 3
+    // rather than auto-accepting it as a 1-button notice.
+    let mut waiting = lot(asking(3, 0));
+    match update(&mut waiting, &mut answers(&[])) {
+        Err(TickError::Unanswered { shown, given }) => {
+            assert_eq!(
+                shown,
+                Shown {
+                    tick: 2,
+                    object: LAMP,
+                    answers: &[2],
+                    text_entry: true,
+                }
+            );
+            assert_eq!(given, None);
+        }
+        other => panic!("expected kind 3 to wait for text input, got {other:?}"),
+    }
+
+    let mut fx = lot(asking(3, 0));
+    let mut player = Answers::replay(&[Answer {
+        status: 2,
+        bitmap_id: Some(17),
+        text: Some("Bella".into()),
+    }]);
+    let first = update(&mut fx, &mut player).unwrap();
+    assert_eq!(first.answered, [(LAMP, 2)]);
+    assert_eq!(first.dialog_text.as_deref(), Some("Bella"));
+    assert_eq!(fx.world.globals[12], 17);
+    update(&mut fx, &mut player).unwrap();
+    assert_eq!(fx.lamp().data[0], 1);
 }
 
 #[test]
@@ -175,7 +211,8 @@ fn a_choice_without_an_answer_and_unported_dialogs_fail_loudly() {
                 Shown {
                     tick: 2,
                     object: LAMP,
-                    answers: &[2, 3]
+                    answers: &[2, 3],
+                    text_entry: false,
                 }
             );
             assert_eq!(given, None);
@@ -196,8 +233,8 @@ fn a_choice_without_an_answer_and_unported_dialogs_fail_loudly() {
         update(&mut fx, &mut answers(&[])),
         Err(TickError::Unsupported(_))
     ));
-    // A text dialog and the special panels.
-    for kind in [3, 5, 15] {
+    // Special panels remain unported and fail loudly.
+    for kind in [5, 15] {
         let mut fx = lot(asking(kind, 0));
         assert!(matches!(
             update(&mut fx, &mut answers(&[])),
