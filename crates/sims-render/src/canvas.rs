@@ -488,39 +488,74 @@ impl Canvas {
         let pat_rgba = &pattern.rgba;
         let mask_rgba = &mask.rgba;
         let table = blend_table();
+        let max_target = (y1 - 1) * width + x1;
+        let slice_ok = max_target <= self.color.len()
+            && max_target <= self.depth.len()
+            && max_target <= self.ids.len();
         for py in y0..y1 {
             let sy = py as i32;
             let iy = (py as i64 - ay) as usize;
             let pat_row = iy * pat_w;
             let mask_row = iy * mask_w;
             let dst_row = py * width;
-            let dst_color = &mut self.color[dst_row..dst_row + width];
-            let dst_depth = &mut self.depth[dst_row..dst_row + width];
-            let dst_ids = &mut self.ids[dst_row..dst_row + width];
             let ix_start = (x0 as i64 - ax) as usize + left_skip;
-            for (offset, px) in (x0..x1).enumerate() {
-                let ix = ix_start + offset;
-                let pi = (pat_row + ix) * 4;
-                let pa = pat_rgba[pi + 3];
-                if pa < FAINT {
-                    continue;
+            if slice_ok {
+                let dst_color = &mut self.color[dst_row + x0..dst_row + x1];
+                let dst_depth = &mut self.depth[dst_row + x0..dst_row + x1];
+                let dst_ids = &mut self.ids[dst_row + x0..dst_row + x1];
+                for (offset, px) in (x0..x1).enumerate() {
+                    let ix = ix_start + offset;
+                    let pi = (pat_row + ix) * 4;
+                    let pa = pat_rgba[pi + 3];
+                    if pa < FAINT {
+                        continue;
+                    }
+                    let ma = mask_rgba[(mask_row + ix) * 4 + 3];
+                    let a = ((u16::from(pa) * u16::from(ma)) / 255) as u8;
+                    if a < FAINT {
+                        continue;
+                    }
+                    let d = depth(px as i32, sy);
+                    if d > dst_depth[offset].saturating_add(1) {
+                        continue;
+                    }
+                    let rgb =
+                        light(ix, iy).apply([pat_rgba[pi], pat_rgba[pi + 1], pat_rgba[pi + 2]]);
+                    dst_depth[offset] = d.clamp(0, EMPTY);
+                    dst_ids[offset] = pen;
+                    if a == 255 {
+                        dst_color[offset] = rgb;
+                    } else {
+                        dst_color[offset] = blend565_with(table, rgb, dst_color[offset], a);
+                    }
                 }
-                let ma = mask_rgba[(mask_row + ix) * 4 + 3];
-                let a = ((u16::from(pa) * u16::from(ma)) / 255) as u8;
-                if a < FAINT {
-                    continue;
-                }
-                let d = depth(px as i32, sy);
-                if d > dst_depth[px].saturating_add(1) {
-                    continue;
-                }
-                let rgb = light(ix, iy).apply([pat_rgba[pi], pat_rgba[pi + 1], pat_rgba[pi + 2]]);
-                dst_depth[px] = d.clamp(0, EMPTY);
-                dst_ids[px] = pen;
-                if a == 255 {
-                    dst_color[px] = rgb;
-                } else {
-                    dst_color[px] = blend565_with(table, rgb, dst_color[px], a);
+            } else {
+                for (offset, px) in (x0..x1).enumerate() {
+                    let ix = ix_start + offset;
+                    let pi = (pat_row + ix) * 4;
+                    let pa = pat_rgba[pi + 3];
+                    if pa < FAINT {
+                        continue;
+                    }
+                    let ma = mask_rgba[(mask_row + ix) * 4 + 3];
+                    let a = ((u16::from(pa) * u16::from(ma)) / 255) as u8;
+                    if a < FAINT {
+                        continue;
+                    }
+                    let d = depth(px as i32, sy);
+                    let target = dst_row + px;
+                    if d > self.depth[target].saturating_add(1) {
+                        continue;
+                    }
+                    let rgb =
+                        light(ix, iy).apply([pat_rgba[pi], pat_rgba[pi + 1], pat_rgba[pi + 2]]);
+                    self.depth[target] = d.clamp(0, EMPTY);
+                    self.ids[target] = pen;
+                    if a == 255 {
+                        self.color[target] = rgb;
+                    } else {
+                        self.color[target] = blend565_with(table, rgb, self.color[target], a);
+                    }
                 }
             }
         }
@@ -575,41 +610,77 @@ impl Canvas {
         let rgba = &image.rgba;
         let depth_bytes = image.depth.as_deref();
         let table = blend_table();
+        let max_target = (y1 - 1) * width + x1;
+        let slice_ok = max_target <= self.color.len()
+            && max_target <= self.depth.len()
+            && max_target <= self.ids.len();
         for py in y0..y1 {
             let sy = py as i32;
             let iy = (py as i64 - ay) as usize;
             let src_row = iy * img_w;
             let dst_row = py * width;
-            let dst_color = &mut self.color[dst_row..dst_row + width];
-            let dst_depth = &mut self.depth[dst_row..dst_row + width];
-            let dst_ids = &mut self.ids[dst_row..dst_row + width];
             let ix_base = (x0 as i64 - ax) as usize + left_skip;
-            for (offset, px) in (x0..x1).enumerate() {
-                let ix = if flip {
-                    img_w - 1 - (ix_base + offset)
-                } else {
-                    ix_base + offset
-                };
-                let source = src_row + ix;
-                let si = source * 4;
-                let a = rgba[si + 3];
-                if a < FAINT {
-                    continue;
+            if slice_ok {
+                let dst_color = &mut self.color[dst_row + x0..dst_row + x1];
+                let dst_depth = &mut self.depth[dst_row + x0..dst_row + x1];
+                let dst_ids = &mut self.ids[dst_row + x0..dst_row + x1];
+                for (offset, px) in (x0..x1).enumerate() {
+                    let ix = if flip {
+                        img_w - 1 - (ix_base + offset)
+                    } else {
+                        ix_base + offset
+                    };
+                    let source = src_row + ix;
+                    let si = source * 4;
+                    let a = rgba[si + 3];
+                    if a < FAINT {
+                        continue;
+                    }
+                    let byte = depth_bytes.map_or(255, |d| d.get(source).copied().unwrap_or(255));
+                    let Some(d) = depth(px as i32, sy, byte) else {
+                        continue;
+                    };
+                    if d > dst_depth[offset].saturating_add(slack) {
+                        continue;
+                    }
+                    let rgb = light(ix, iy).apply([rgba[si], rgba[si + 1], rgba[si + 2]]);
+                    dst_depth[offset] = d.clamp(0, EMPTY);
+                    dst_ids[offset] = pen;
+                    if a == 255 {
+                        dst_color[offset] = rgb;
+                    } else {
+                        dst_color[offset] = blend565_with(table, rgb, dst_color[offset], a);
+                    }
                 }
-                let byte = depth_bytes.map_or(255, |d| d.get(source).copied().unwrap_or(255));
-                let Some(d) = depth(px as i32, sy, byte) else {
-                    continue;
-                };
-                if d > dst_depth[px].saturating_add(slack) {
-                    continue;
-                }
-                let rgb = light(ix, iy).apply([rgba[si], rgba[si + 1], rgba[si + 2]]);
-                dst_depth[px] = d.clamp(0, EMPTY);
-                dst_ids[px] = pen;
-                if a == 255 {
-                    dst_color[px] = rgb;
-                } else {
-                    dst_color[px] = blend565_with(table, rgb, dst_color[px], a);
+            } else {
+                for (offset, px) in (x0..x1).enumerate() {
+                    let ix = if flip {
+                        img_w - 1 - (ix_base + offset)
+                    } else {
+                        ix_base + offset
+                    };
+                    let source = src_row + ix;
+                    let si = source * 4;
+                    let a = rgba[si + 3];
+                    if a < FAINT {
+                        continue;
+                    }
+                    let byte = depth_bytes.map_or(255, |d| d.get(source).copied().unwrap_or(255));
+                    let Some(d) = depth(px as i32, sy, byte) else {
+                        continue;
+                    };
+                    let target = dst_row + px;
+                    if d > self.depth[target].saturating_add(slack) {
+                        continue;
+                    }
+                    let rgb = light(ix, iy).apply([rgba[si], rgba[si + 1], rgba[si + 2]]);
+                    self.depth[target] = d.clamp(0, EMPTY);
+                    self.ids[target] = pen;
+                    if a == 255 {
+                        self.color[target] = rgb;
+                    } else {
+                        self.color[target] = blend565_with(table, rgb, self.color[target], a);
+                    }
                 }
             }
         }
@@ -637,24 +708,19 @@ impl Canvas {
         else {
             return;
         };
+        self.record_rect(rect_x, at[1], rect_w, image.height);
+        let (mut y0, mut y1, ay) = clip_span(at[1], image.height, self.height);
         if let Some([ix0, iy0, ix1, iy1]) = sub_rect {
             if ix0 >= ix1 || iy0 >= iy1 {
                 return;
             }
-            let side = |n: usize| i32::try_from(n).unwrap_or(i32::MAX);
-            self.record_rect(
-                at[0].saturating_add(side(ix0)),
-                at[1].saturating_add(side(iy0)),
-                ix1 - ix0,
-                iy1 - iy0,
-            );
-        } else {
-            self.record_rect(rect_x, at[1], rect_w, image.height);
-        }
-        let (mut y0, mut y1, ay) = clip_span(at[1], image.height, self.height);
-        if let Some([ix0, iy0, ix1, iy1]) = sub_rect {
-            let sub_x0 = ax.saturating_add(ix0 as i64).clamp(0, self.width as i64) as usize;
-            let sub_x1 = ax.saturating_add(ix1 as i64).clamp(0, self.width as i64) as usize;
+            let base_x = i64::from(at[0]);
+            let sub_x0 = base_x
+                .saturating_add(ix0 as i64)
+                .clamp(0, self.width as i64) as usize;
+            let sub_x1 = base_x
+                .saturating_add(ix1 as i64)
+                .clamp(0, self.width as i64) as usize;
             let sub_y0 = ay.saturating_add(iy0 as i64).clamp(0, self.height as i64) as usize;
             let sub_y1 = ay.saturating_add(iy1 as i64).clamp(0, self.height as i64) as usize;
             x0 = x0.max(sub_x0);
@@ -670,6 +736,10 @@ impl Canvas {
         let img_w = image.width;
         let rgba = &image.rgba;
         let table = blend_table();
+        let max_target = (y1 - 1) * width + x1;
+        let slice_ok = max_target <= self.color.len()
+            && max_target <= self.depth.len()
+            && max_target <= self.ids.len();
         for py in y0..y1 {
             let sy = py as i32;
             let d = row_depth(sy);
@@ -677,27 +747,50 @@ impl Canvas {
             let iy = (py as i64 - ay) as usize;
             let src_row = iy * img_w;
             let dst_row = py * width;
-            let dst_color = &mut self.color[dst_row..dst_row + width];
-            let dst_depth = &mut self.depth[dst_row..dst_row + width];
-            let dst_ids = &mut self.ids[dst_row..dst_row + width];
             let ix_base = (x0 as i64 - ax) as usize + left_skip;
-            for (offset, px) in (x0..x1).enumerate() {
-                let ix = ix_base + offset;
-                let si = (src_row + ix) * 4;
-                let a = rgba[si + 3];
-                if a < FAINT {
-                    continue;
+            if slice_ok {
+                let dst_color = &mut self.color[dst_row + x0..dst_row + x1];
+                let dst_depth = &mut self.depth[dst_row + x0..dst_row + x1];
+                let dst_ids = &mut self.ids[dst_row + x0..dst_row + x1];
+                for offset in 0..(x1 - x0) {
+                    let ix = ix_base + offset;
+                    let si = (src_row + ix) * 4;
+                    let a = rgba[si + 3];
+                    if a < FAINT {
+                        continue;
+                    }
+                    if d > dst_depth[offset] {
+                        continue;
+                    }
+                    let rgb = light(ix, iy).apply([rgba[si], rgba[si + 1], rgba[si + 2]]);
+                    dst_depth[offset] = d_clamped;
+                    dst_ids[offset] = pen;
+                    if a == 255 {
+                        dst_color[offset] = rgb;
+                    } else {
+                        dst_color[offset] = blend565_with(table, rgb, dst_color[offset], a);
+                    }
                 }
-                if d > dst_depth[px] {
-                    continue;
-                }
-                let rgb = light(ix, iy).apply([rgba[si], rgba[si + 1], rgba[si + 2]]);
-                dst_depth[px] = d_clamped;
-                dst_ids[px] = pen;
-                if a == 255 {
-                    dst_color[px] = rgb;
-                } else {
-                    dst_color[px] = blend565_with(table, rgb, dst_color[px], a);
+            } else {
+                for (offset, px) in (x0..x1).enumerate() {
+                    let ix = ix_base + offset;
+                    let si = (src_row + ix) * 4;
+                    let a = rgba[si + 3];
+                    if a < FAINT {
+                        continue;
+                    }
+                    let target = dst_row + px;
+                    if d > self.depth[target] {
+                        continue;
+                    }
+                    let rgb = light(ix, iy).apply([rgba[si], rgba[si + 1], rgba[si + 2]]);
+                    self.depth[target] = d_clamped;
+                    self.ids[target] = pen;
+                    if a == 255 {
+                        self.color[target] = rgb;
+                    } else {
+                        self.color[target] = blend565_with(table, rgb, self.color[target], a);
+                    }
                 }
             }
         }
@@ -724,29 +817,32 @@ impl Canvas {
         let pen = self.pen;
         if x >= 0 && (x as usize).saturating_add(4) <= self.width {
             let start = row + x as usize;
-            let dst_depth = &mut self.depth[start..start + 4];
-            let dst_color = &mut self.color[start..start + 4];
-            let dst_ids = &mut self.ids[start..start + 4];
-            for i in 0..4 {
-                if depth <= dst_depth[i] {
-                    dst_depth[i] = depth_clamped;
-                    dst_color[i] = pixels[i];
-                    dst_ids[i] = pen;
-                }
-            }
-        } else {
-            let w = self.width as i32;
-            for (i, &rgb) in pixels.iter().enumerate() {
-                let Some(px) = x.checked_add(i as i32) else {
-                    continue;
-                };
-                if px >= 0 && px < w {
-                    let target = row + px as usize;
-                    if depth <= self.depth[target] {
-                        self.depth[target] = depth_clamped;
-                        self.color[target] = rgb;
-                        self.ids[target] = pen;
+            let end = start + 4;
+            if end <= self.depth.len() && end <= self.color.len() && end <= self.ids.len() {
+                let dst_depth = &mut self.depth[start..end];
+                let dst_color = &mut self.color[start..end];
+                let dst_ids = &mut self.ids[start..end];
+                for i in 0..4 {
+                    if depth <= dst_depth[i] {
+                        dst_depth[i] = depth_clamped;
+                        dst_color[i] = pixels[i];
+                        dst_ids[i] = pen;
                     }
+                }
+                return;
+            }
+        }
+        let w = self.width as i32;
+        for (i, &rgb) in pixels.iter().enumerate() {
+            let Some(px) = x.checked_add(i as i32) else {
+                continue;
+            };
+            if px >= 0 && px < w {
+                let target = row + px as usize;
+                if depth <= self.depth[target] {
+                    self.depth[target] = depth_clamped;
+                    self.color[target] = rgb;
+                    self.ids[target] = pen;
                 }
             }
         }
@@ -809,18 +905,31 @@ impl Canvas {
             return;
         }
         let width = self.width;
+        let max_target = (y1 - 1) * width + x1;
+        let slice_ok = max_target <= self.color.len() && max_target <= self.depth.len();
         for py in y0..y1 {
             let my = (py as i64 - ay) as usize;
             let at_least = row_at_least(py as i32);
             let dst_row = py * width;
-            let dst_depth = &self.depth[dst_row..dst_row + width];
-            let dst_color = &mut self.color[dst_row..dst_row + width];
             let mx_base = (x0 as i64 - ax) as usize;
-            for (offset, px) in (x0..x1).enumerate() {
-                if let Some(s) = mask.shade(mx_base + offset, my, strength)
-                    && dst_depth[px] >= at_least
-                {
-                    dst_color[px] = Light::from_sum(s).apply(dst_color[px]);
+            if slice_ok {
+                let dst_depth = &self.depth[dst_row + x0..dst_row + x1];
+                let dst_color = &mut self.color[dst_row + x0..dst_row + x1];
+                for offset in 0..(x1 - x0) {
+                    if let Some(s) = mask.shade(mx_base + offset, my, strength)
+                        && dst_depth[offset] >= at_least
+                    {
+                        dst_color[offset] = Light::from_sum(s).apply(dst_color[offset]);
+                    }
+                }
+            } else {
+                for (offset, px) in (x0..x1).enumerate() {
+                    let target = dst_row + px;
+                    if let Some(s) = mask.shade(mx_base + offset, my, strength)
+                        && self.depth[target] >= at_least
+                    {
+                        self.color[target] = Light::from_sum(s).apply(self.color[target]);
+                    }
                 }
             }
         }
@@ -1447,5 +1556,65 @@ mod tests {
             Some(5)
         });
         assert_eq!(c.drawn(7), Some([5, 3, 9, 7]));
+    }
+
+    #[test]
+    fn undersized_canvas_storage_blits_in_bounds_pixels_without_panicking() {
+        let mut c = Canvas::new(4, 1, [0, 0, 0]);
+        c.color.truncate(1);
+        c.depth.truncate(1);
+        c.ids.truncate(1);
+        c.set_id(Some(3));
+        // 1x1 opaque sprite at (0, 0) fits inside the 1-pixel backing store.
+        let one = image(1, 1, [200, 100, 50, 255], None);
+        c.draw(&one, [0, 0], false, |_, _, _| 5);
+        assert_eq!(c.color[0], [200, 100, 50]);
+        assert_eq!(c.depth[0], 5);
+        assert_eq!(c.id_at(0, 0), Some(3));
+        // 2x1 sprite whose second pixel is transparent must also avoid
+        // touching index 1 (matching origin/main's per-pixel alpha skip).
+        let two = Image {
+            width: 2,
+            height: 1,
+            rgba: vec![10, 20, 30, 255, 99, 99, 99, 0],
+            depth: None,
+        };
+        c.draw(&two, [0, 0], false, |_, _, _| 4);
+        assert_eq!(c.color[0], [10, 20, 30]);
+        assert_eq!(c.depth[0], 4);
+    }
+
+    #[test]
+    fn draw_floor_shaded_records_full_rect_and_clips_combined_columns_and_sub_rect() {
+        let sprite = image(8, 2, [200, 100, 50, 255], None);
+        let mut c = Canvas::new(10, 4, [0, 0, 0]);
+        c.set_id(Some(9));
+        // Split-floor sub-rect with active pen records the full sprite rect,
+        // matching origin/main's alpha-masked floor half.
+        c.draw_floor_shaded(
+            &sprite,
+            [1, 1],
+            Some([2, 0, 4, 2]),
+            |_, _| Light::FULL,
+            |_| 5,
+        );
+        assert_eq!(c.drawn(9), Some([1, 1, 9, 3]));
+        assert_eq!(c.color[12], [0, 0, 0]);
+        assert_eq!(c.color[13], [200, 100, 50]);
+        assert_eq!(c.color[14], [200, 100, 50]);
+        assert_eq!(c.color[15], [0, 0, 0]);
+
+        // Combined `columns` [3, 5) and source `sub_rect` [1, 3) at x = 0 have
+        // empty intersection and must draw no pixels.
+        let mut c2 = Canvas::new(10, 4, [0, 0, 0]);
+        c2.blit_row_depth(
+            &sprite,
+            [0, 0],
+            |_, _| Light::FULL,
+            Some([3, 5]),
+            Some([1, 0, 3, 2]),
+            |_| 5,
+        );
+        assert!(c2.color.iter().all(|&p| p == [0, 0, 0]));
     }
 }

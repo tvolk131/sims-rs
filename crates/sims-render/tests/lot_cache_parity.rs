@@ -573,13 +573,77 @@ fn lot_cache_matches_uncached_across_house05_states_and_mutations() {
         );
 
         // 10. Toggling `Object::person` on an already-tracked preview
-        //     participant must invalidate the cache (objects pass skips
-        //     objects with `person.is_some()`).
+        //     participant and on a wall-shaping object must invalidate the
+        //     cache while keeping `holds_person` fixed and genuinely changing
+        //     the rendered pixels and `Stats`.
         let sample_person = world
             .objects
             .get(&person_id)
             .and_then(|o| o.person.clone())
             .expect("person data");
+        // Undo the synthetic `holds_person` link from step 9 so `target_id`
+        // and `person_id` stay clean.
+        if let Some(holder) = world.objects.get_mut(&target_id)
+            && holder.slots.len() >= 2
+        {
+            holder.slots[1].object = 0;
+        }
+        if let Some(person) = world.objects.get_mut(&person_id)
+            && person.data.len() > 26
+        {
+            person.data[14] = 0;
+            person.data[26] = 0;
+        }
+
+        // Find a visible on-screen non-wall-shaping object and a visible
+        // on-screen wall-shaping object that are uncontained (so toggling
+        // `person` keeps `holds_person` unchanged) and verify both change the
+        // rendered output and `Stats.objects`.
+        let mut baseline = Canvas::new(size[0], size[1], [0xaa, 0xbb, 0xcc]);
+        let baseline_stats = draw_lot_with_preview(
+            &world,
+            &lot,
+            assets,
+            &camera,
+            (400, 300),
+            None,
+            &mut baseline,
+        );
+        let uncontained = |o: &sims_sim::Object| o.data.get(14).copied().unwrap_or(0) == 0;
+        let visible_preview_id = world
+            .objects
+            .iter()
+            .find(|&(&id, o)| {
+                o.person.is_none()
+                    && uncontained(o)
+                    && baseline.drawn(id).is_some()
+                    && assets.definition(o.guid).is_none_or(|d| !d.shapes_wall())
+            })
+            .map(|(&id, _)| id)
+            .expect("expected a visible uncontained non-wall-shaping object on House05");
+        let visible_wall_shaper_id = world
+            .objects
+            .iter()
+            .find(|&(&id, o)| {
+                o.person.is_none()
+                    && uncontained(o)
+                    && baseline.drawn(id).is_some()
+                    && assets.definition(o.guid).is_some_and(|d| d.shapes_wall())
+            })
+            .map(|(&id, _)| id)
+            .expect("expected a visible uncontained wall-shaping object on House05");
+
+        // Preview participant person-flag toggle.
+        let mut preview_before = Canvas::new(size[0], size[1], [0xaa, 0xbb, 0xcc]);
+        let preview_before_stats = cache.draw_lot_with_preview(
+            &world,
+            &lot,
+            assets,
+            &camera,
+            (400, 300),
+            Some((visible_preview_id, second_id)),
+            &mut preview_before,
+        );
         assert_parity(
             &mut cache,
             &world,
@@ -587,11 +651,29 @@ fn lot_cache_matches_uncached_across_house05_states_and_mutations() {
             assets,
             &camera,
             (400, 300),
-            Some((target_id, second_id)),
+            Some((visible_preview_id, second_id)),
             size,
             "preview participant before person flag toggle",
         );
-        world.objects.get_mut(&target_id).unwrap().person = Some(sample_person.clone());
+        world.objects.get_mut(&visible_preview_id).unwrap().person = Some(sample_person.clone());
+        let mut preview_after_uncached = Canvas::new(size[0], size[1], [0xaa, 0xbb, 0xcc]);
+        let preview_after_stats = draw_lot_with_preview(
+            &world,
+            &lot,
+            assets,
+            &camera,
+            (400, 300),
+            Some((visible_preview_id, second_id)),
+            &mut preview_after_uncached,
+        );
+        assert_ne!(
+            preview_before, preview_after_uncached,
+            "preview person toggle must change rendered canvas"
+        );
+        assert_ne!(
+            preview_before_stats.objects, preview_after_stats.objects,
+            "preview person toggle must change Stats.objects"
+        );
         assert_parity(
             &mut cache,
             &world,
@@ -599,11 +681,11 @@ fn lot_cache_matches_uncached_across_house05_states_and_mutations() {
             assets,
             &camera,
             (400, 300),
-            Some((target_id, second_id)),
+            Some((visible_preview_id, second_id)),
             size,
             "preview participant gained person flag",
         );
-        world.objects.get_mut(&target_id).unwrap().person = None;
+        world.objects.get_mut(&visible_preview_id).unwrap().person = None;
         assert_parity(
             &mut cache,
             &world,
@@ -611,56 +693,73 @@ fn lot_cache_matches_uncached_across_house05_states_and_mutations() {
             assets,
             &camera,
             (400, 300),
-            Some((target_id, second_id)),
+            Some((visible_preview_id, second_id)),
             size,
             "preview participant cleared person flag",
         );
 
-        // Also test toggling `Object::person` on a wall-shaping object.
-        if let Some(&wall_shaper_id) = world
+        // Wall-shaping object person-flag toggle.
+        assert_parity(
+            &mut cache,
+            &world,
+            &lot,
+            assets,
+            &camera,
+            (400, 300),
+            None,
+            size,
+            "wall shaper before person flag toggle",
+        );
+        world
             .objects
-            .iter()
-            .find(|(_, o)| {
-                o.person.is_none() && assets.definition(o.guid).is_some_and(|d| d.shapes_wall())
-            })
-            .map(|(id, _)| id)
-        {
-            assert_parity(
-                &mut cache,
-                &world,
-                &lot,
-                assets,
-                &camera,
-                (400, 300),
-                None,
-                size,
-                "wall shaper before person flag toggle",
-            );
-            world.objects.get_mut(&wall_shaper_id).unwrap().person = Some(sample_person);
-            assert_parity(
-                &mut cache,
-                &world,
-                &lot,
-                assets,
-                &camera,
-                (400, 300),
-                None,
-                size,
-                "wall shaper gained person flag",
-            );
-            world.objects.get_mut(&wall_shaper_id).unwrap().person = None;
-            assert_parity(
-                &mut cache,
-                &world,
-                &lot,
-                assets,
-                &camera,
-                (400, 300),
-                None,
-                size,
-                "wall shaper cleared person flag",
-            );
-        }
+            .get_mut(&visible_wall_shaper_id)
+            .unwrap()
+            .person = Some(sample_person);
+        let mut wall_after_uncached = Canvas::new(size[0], size[1], [0xaa, 0xbb, 0xcc]);
+        let wall_after_stats = draw_lot_with_preview(
+            &world,
+            &lot,
+            assets,
+            &camera,
+            (400, 300),
+            None,
+            &mut wall_after_uncached,
+        );
+        assert_ne!(
+            baseline, wall_after_uncached,
+            "wall-shaper person toggle must change rendered canvas"
+        );
+        assert_ne!(
+            baseline_stats.objects, wall_after_stats.objects,
+            "wall-shaper person toggle must change Stats.objects"
+        );
+        assert_parity(
+            &mut cache,
+            &world,
+            &lot,
+            assets,
+            &camera,
+            (400, 300),
+            None,
+            size,
+            "wall shaper gained person flag",
+        );
+        world
+            .objects
+            .get_mut(&visible_wall_shaper_id)
+            .unwrap()
+            .person = None;
+        assert_parity(
+            &mut cache,
+            &world,
+            &lot,
+            assets,
+            &camera,
+            (400, 300),
+            None,
+            size,
+            "wall shaper cleared person flag",
+        );
     }
 
     // 11. Padded canvas storage (`color`/`depth` longer than `width * height`)
@@ -773,4 +872,44 @@ fn lot_cache_matches_uncached_across_house05_states_and_mutations() {
         size,
         "alternate Assets catalog from same install",
     );
+
+    // 13. Zero-area canvases (`0×0`, `400×0`, `0×300`) with empty vs. padded
+    //     `color` buffers must never share stale object rectangles in either
+    //     order.
+    for [zw, zh] in [[0usize, 0], [400, 0], [0, 300]] {
+        for pad_first in [false, true] {
+            let mut zcache = LotCache::new();
+            for padded in [pad_first, !pad_first] {
+                let mut cached = Canvas::new(zw, zh, [0xaa, 0xbb, 0xcc]);
+                let mut uncached = Canvas::new(zw, zh, [0xaa, 0xbb, 0xcc]);
+                if padded {
+                    cached.color.push([1, 2, 3]);
+                    uncached.color.push([1, 2, 3]);
+                }
+                let sc = zcache.draw_lot_with_preview(
+                    &world,
+                    &lot,
+                    assets,
+                    &camera,
+                    (400, 300),
+                    None,
+                    &mut cached,
+                );
+                let su = draw_lot_with_preview(
+                    &world,
+                    &lot,
+                    assets,
+                    &camera,
+                    (400, 300),
+                    None,
+                    &mut uncached,
+                );
+                assert_eq!(sc, su, "zero-area stats mismatch {zw}x{zh} padded={padded}");
+                assert_eq!(
+                    cached, uncached,
+                    "zero-area canvas mismatch {zw}x{zh} padded={padded}"
+                );
+            }
+        }
+    }
 }

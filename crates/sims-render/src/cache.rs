@@ -317,7 +317,10 @@ impl LotCache {
         let house = world.globals.get(10).copied().unwrap_or(0);
         let show_grid = matches!(world.globals.get(19).copied().unwrap_or(0), 1 | 2);
         let top = camera.level.clamp(1, 2) as usize;
-        let can_cache = canvas.has_pixel_storage();
+        // Zero-area canvases can differ in rectangle recording between empty
+        // and padded `color` buffers; bypass caching for zero-area or
+        // undersized backing stores.
+        let can_cache = width > 0 && height > 0 && canvas.has_pixel_storage();
 
         // Compute `holds_person` once (cheap: only climbs from the few Sims) so
         // both the cache check and any miss reuse it.
