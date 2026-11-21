@@ -135,9 +135,15 @@ def parse_scenario(text):
             if op in ('until', 'wait', 'click-object'):
                 step['args'] = [int(args[0])]
             elif op in ('move', 'click', 'answer-dialog', 'press'):
-                step['args'] = [int(args[0]), int(args[1])]
+                x, y = int(args[0]), int(args[1])
+                if x < 0 or y < 0:
+                    raise ScenarioError(f'line {n}: {op} coordinates must be non-negative')
+                step['args'] = [x, y]
             elif op == 'drag':
-                step['args'] = [int(a) for a in args]
+                coords = [int(a) for a in args]
+                if any(v < 0 for v in coords):
+                    raise ScenarioError(f'line {n}: drag coordinates must be non-negative')
+                step['args'] = coords
             elif op == 'expect-queued':
                 person, target, within = int(args[0]), None, 100
                 rest = args[1:]
@@ -176,9 +182,10 @@ def parse_scenario(text):
 # Pointer and key commands (run by the guest agent).
 
 def move_command(x, y, window=WINDOW):
-    """Move the pointer to (x, y) in the window, then one pixel right: the game
+    """Move the pointer to (x, y) in the window, then one pixel over: the game
     acts on a pointer that has moved over a place, not one that jumped there."""
-    return f'xdotool mousemove --window {window} {x - 1} {y} sleep 0.2 mousemove --window {window} {x} {y}'
+    pre_x = x - 1 if x > 0 else 1
+    return f'xdotool mousemove --window {window} {pre_x} {y} sleep 0.2 mousemove --window {window} {x} {y}'
 
 
 # A press on the house view or a pie menu is held while lot updates return.
@@ -571,6 +578,7 @@ class Runner:
         self.fresh = False  # self.m was read at this update return (not at a dialog stop)
         self.unchecked = []  # (n, row): commands whose exit code is still to be checked
         self.held = None  # the info of a held press whose release is not yet submitted
+        self.releasing = None  # (n, info): an in-flight release; restored to self.held if it fails
         self.dialogs = []
         self.finished = False
         self.failed = None
@@ -672,7 +680,12 @@ class Runner:
         """Log command n's end; False (and the scenario failed) if it failed."""
         code = self.agent.result(n)
         self.write(kind='command_ended', id=n, code=code, what=row['what'])
+        releasing = self.releasing
+        if releasing and releasing[0] == n:
+            self.releasing = None
         if code:
+            if releasing and releasing[0] == n:
+                self.held = releasing[1]
             self.fail(f'guest command {n} ({row["what"]}) failed with {code}')
             return False
         if row['what'] == 'shot':
@@ -757,7 +770,9 @@ class Runner:
                 n = self.agent.submit(want.command)  # if it raises, the step fails (and let_go retries a release)
                 if want.command == press_down_command():
                     self.held = want.info
+                    self.releasing = None
                 elif want.command == press_up_command():
+                    self.releasing = (n, want.info)
                     self.held = None
                 row = dict(kind='command', id=n, what=want.kind, command=want.command, **want.info)
                 self.write(**row)
@@ -821,12 +836,18 @@ class Runner:
 
     def step_drag(self, x1, y1, x2, y2):
         yield Job('move', move_command(x1, y1, self.agent.window), x=x1, y=y1)
+        shows = self.count('dialog_show')
+        cur = (x1, y1)
         yield Job('press', press_down_command(), settle=HOLD_UPDATES, x=x1, y=y1)
-        mx, my = (x1 + x2) // 2, (y1 + y2) // 2
-        if (mx, my) not in ((x1, y1), (x2, y2)):
-            yield Job('move', move_command(mx, my, self.agent.window), settle=HOLD_UPDATES, x=mx, y=my)
-        yield Job('move', move_command(x2, y2, self.agent.window), settle=HOLD_UPDATES, x=x2, y=y2)
-        yield Job('release', press_up_command(), wait=False, x=x2, y=y2)
+        if (x2, y2) != (x1, y1) and self.count('dialog_show') == shows:
+            mx, my = (x1 + x2) // 2, (y1 + y2) // 2
+            if (mx, my) not in ((x1, y1), (x2, y2)):
+                cur = (mx, my)
+                yield Job('move', move_command(mx, my, self.agent.window), settle=HOLD_UPDATES, x=mx, y=my)
+            if self.count('dialog_show') == shows:
+                cur = (x2, y2)
+                yield Job('move', move_command(x2, y2, self.agent.window), settle=HOLD_UPDATES, x=x2, y=y2)
+        yield Job('release', press_up_command(), wait=False, x=cur[0], y=cur[1])
 
     def held_press(self, **info):
         """Press the left button where the pointer is, keep it down until

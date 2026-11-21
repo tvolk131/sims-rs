@@ -200,7 +200,7 @@ class ParseTest(unittest.TestCase):
                                    'expect-mode 1\ndrag 470 380 530 350\nexpect-new-object\nexpect-new-object within 9')
         self.assertEqual([s['args'] for s in steps],
                          [[93, 458], [1, 40], [2, 50], [1, 200], [470, 380, 530, 350], [200], [9]])
-        for bad in ('expect-mode flying', 'drag 1 2 3', 'drag a 2 3 4'):
+        for bad in ('expect-mode flying', 'drag 1 2 3', 'drag a 2 3 4', 'drag -1 2 3 4', 'move -1 5'):
             with self.assertRaises(inp.ScenarioError):
                 inp.parse_scenario(bad)
 
@@ -233,6 +233,8 @@ class GeometryTest(unittest.TestCase):
     def test_commands(self):
         self.assertIn('mousemove --window 0x1 9 5 sleep', inp.move_command(10, 5, '0x1'))
         self.assertTrue(inp.move_command(10, 5, '0x1').endswith('mousemove --window 0x1 10 5'))
+        self.assertIn('mousemove --window 0x1 1 5 sleep', inp.move_command(0, 5, '0x1'))
+        self.assertTrue(inp.move_command(0, 5, '0x1').endswith('mousemove --window 0x1 0 5'))
         self.assertEqual(inp.key_command('F2'), 'xdotool key F2')
         with self.assertRaises(inp.ScenarioError):
             inp.key_command('F2; rm -rf /')
@@ -1085,12 +1087,36 @@ class ReviewFindingsTest(RunnerBase):
         self.assertGreaterEqual(cmds[3]['update'] - cmds[2]['update'], inp.HOLD_UPDATES)
         self.assertGreaterEqual(cmds[4]['update'] - cmds[3]['update'], inp.HOLD_UPDATES)
 
-    def test_zero_length_drag_skips_duplicate_midpoint(self):
+    def test_zero_length_drag_does_not_move_while_held(self):
         r = self.runner('drag 100 200 100 200')
         self.tick_until(r, lambda: r.finished, most=30)
         self.assertIsNone(r.failed)
         cmds = self.rows('command')
-        self.assertEqual([c['what'] for c in cmds], ['move', 'press', 'move', 'release'])
+        self.assertEqual([c['what'] for c in cmds], ['move', 'press', 'release'])
+
+    def test_drag_releases_and_unblocks_when_dialog_shows_mid_drag(self):
+        r = self.runner('drag 0 200 300 400\nanswer-dialog 400 400')
+        self.tick_until(r, lambda: 'mousedown' in self.last_command())
+        r.on_dialog('dialog_show', self.update + 1)
+        cmds = self.rows('command')
+        self.assertEqual([c['what'] for c in cmds], ['move', 'press', 'release', 'press'])
+        self.assertEqual(cmds[2]['command'], 'xdotool mouseup 1')
+        self.assertIn('400 400', cmds[3]['command'])
+        self.assertFalse(r.finished)
+        self.agent.finish_all()
+        r.on_dialog('dialog_result', self.update + 1)
+        self.assertTrue(r.finished)
+        self.assertIsNone(r.failed)
+
+    def test_failed_release_is_retried(self):
+        r = self.runner('click 10 20')
+        self.agent.codes = {3: 1}
+        self.tick_until(r, lambda: r.finished, most=30)
+        self.assertIn('failed with 1', r.failed)
+        releases = [c for c in self.rows('command') if c['what'] == 'release']
+        self.assertEqual(len(releases), 2)
+        self.assertEqual(releases[1]['reason'], 'step failed')
+        self.assertEqual(releases[1]['command'], 'xdotool mouseup 1')
 
     def test_drag_releases_button_when_midpoint_move_fails(self):
         r = self.runner('drag 100 200 300 400')
