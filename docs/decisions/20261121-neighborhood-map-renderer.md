@@ -39,7 +39,10 @@ share the native `cWinLot` (`0x54dd4d`, vtable `0x670204`) widget pipeline:
   (`0x4e27da`, centering placement at `0x54ea0c`). The separate badged hover
   surface (`[esi + 0x264]`, `0x54e58b..0x54e680`) composites `BMP_ 513/1025`
   with `kNghVacationLogo` (`5441`) or `kVacationNoVacancy` (`5510`) centered on
-  `BMP_ 512/1024`'s dimensions and is selected on hover (`0x54ec48..0x54ec91`).
+  `BMP_ 512/1024`'s dimensions and draws unhighlighted on hover
+  (`0x54ec48..0x54ec91`, across all maps for away-on-vacation homes via
+  `0x54eb49`, and Vacation Island via `0x54eb5d`), while picking (`0x5e40b4`)
+  continues to sample the regular thumbnail `[esi + 0xd8]`.
 - **0.5× Hermite downsampler (`0x4ba778` -> `0x4ba79c`):**
   Base lots `House01..House10` lack `BMP_ 1024/1025` and `THMB 1024`. The
   Unleashed map downsamples `BMP_ 512/513` in two separable 5-6-5 passes with

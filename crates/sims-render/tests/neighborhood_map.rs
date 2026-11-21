@@ -328,7 +328,8 @@ fn neighborhood_1_matches_live_oracle_capture_if_provided() {
         ..RenderOptions::default()
     });
     let oracle_bytes = std::fs::read(&oracle_path).expect("read SIMS_HOOD_ORACLE PNG");
-    let (ow, oh, oracle_rgb) = decode_png_rgb(&oracle_bytes).expect("valid oracle PNG");
+    let (ow, oh, oracle_rgb) =
+        decode_png_rgb(&oracle_bytes, Some((800, 600))).expect("valid 800×600 oracle PNG");
     assert_eq!((ow, oh), (800, 600));
 
     let mut lot_total = 0usize;
@@ -372,8 +373,53 @@ fn neighborhood_1_matches_live_oracle_capture_if_provided() {
 
 #[test]
 fn test_png_decoder_rejects_short_and_corrupted_inputs() {
-    assert!(decode_png_rgb(&[0; 7]).is_err());
-    assert!(decode_png_rgb(b"\x89PNG\r\n\x1a\n").is_err());
+    assert!(decode_png_rgb(&[0; 7], None).is_err());
+    assert!(decode_png_rgb(b"\x89PNG\r\n\x1a\n", None).is_err());
+
+    // Build a valid 1×1 RGB PNG, then flip an Adler-32 bit (with valid outer CRC)
+    // and verify the decoder rejects the bad zlib checksum.
+    let mut png = Vec::from(&b"\x89PNG\r\n\x1a\n"[..]);
+    let push_chunk = |png: &mut Vec<u8>, tag: &[u8; 4], body: &[u8]| {
+        png.extend((body.len() as u32).to_be_bytes());
+        let start = png.len();
+        png.extend(tag);
+        png.extend(body);
+        let crc = crc32(&png[start..]);
+        png.extend(crc.to_be_bytes());
+    };
+    let mut ihdr = Vec::new();
+    ihdr.extend(1u32.to_be_bytes());
+    ihdr.extend(1u32.to_be_bytes());
+    ihdr.extend([8, 2, 0, 0, 0]);
+    push_chunk(&mut png, b"IHDR", &ihdr);
+    // Uncompressed zlib block for raw scanline [0, 10, 20, 30]
+    let raw = [0u8, 10, 20, 30];
+    let mut zlib = vec![0x78, 0x01, 0x01, 4, 0, !4u8, !0u8];
+    zlib.extend(raw);
+    zlib.extend(adler32(&raw).to_be_bytes());
+    let idat_offset = png.len();
+    push_chunk(&mut png, b"IDAT", &zlib);
+    push_chunk(&mut png, b"IEND", &[]);
+    assert!(decode_png_rgb(&png, Some((1, 1))).is_ok());
+    assert!(decode_png_rgb(&png, Some((800, 600))).is_err());
+
+    // Flip last bit of Adler-32 and recompute outer IDAT CRC32.
+    let adler_last = idat_offset + 8 + zlib.len() - 1;
+    png[adler_last] ^= 1;
+    let new_crc = crc32(&png[idat_offset + 4..idat_offset + 8 + zlib.len()]);
+    png[idat_offset + 8 + zlib.len()..idat_offset + 12 + zlib.len()]
+        .copy_from_slice(&new_crc.to_be_bytes());
+    assert!(decode_png_rgb(&png, Some((1, 1))).is_err());
+}
+
+fn adler32(bytes: &[u8]) -> u32 {
+    const MOD: u32 = 65521;
+    let (mut s1, mut s2) = (1u32, 0u32);
+    for &b in bytes {
+        s1 = (s1 + u32::from(b)) % MOD;
+        s2 = (s2 + s1) % MOD;
+    }
+    (s2 << 16) | s1
 }
 
 fn crc32(bytes: &[u8]) -> u32 {
@@ -388,7 +434,10 @@ fn crc32(bytes: &[u8]) -> u32 {
     !crc
 }
 
-fn decode_png_rgb(data: &[u8]) -> Result<(usize, usize, Vec<[u8; 3]>), String> {
+fn decode_png_rgb(
+    data: &[u8],
+    expected_dims: Option<(usize, usize)>,
+) -> Result<(usize, usize, Vec<[u8; 3]>), String> {
     if data.len() < 8 || &data[0..8] != b"\x89PNG\r\n\x1a\n" {
         return Err("invalid PNG signature".into());
     }
@@ -428,6 +477,14 @@ fn decode_png_rgb(data: &[u8]) -> Result<(usize, usize, Vec<[u8; 3]>), String> {
                 || bit_depth != 8
             {
                 return Err(format!("unsupported IHDR {w}×{h} depth={bit_depth}"));
+            }
+            if let Some(want) = expected_dims
+                && (w, h) != want
+            {
+                return Err(format!(
+                    "unexpected PNG dimensions {w}×{h} != {}×{}",
+                    want.0, want.1
+                ));
             }
             saw_ihdr = true;
         } else if tag == b"IDAT" {
@@ -634,6 +691,10 @@ fn inflate_zlib(data: &[u8], max_out: usize) -> Result<Vec<u8>, String> {
         if bfinal == 1 {
             break;
         }
+    }
+    let want_adler = u32::from_be_bytes(data[data.len() - 4..].try_into().unwrap());
+    if adler32(&out) != want_adler {
+        return Err("zlib Adler-32 checksum mismatch".into());
     }
     Ok(out)
 }
