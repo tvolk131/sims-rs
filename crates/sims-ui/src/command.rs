@@ -117,6 +117,14 @@ pub enum Command {
     TogglePanel,
     /// Open a live-mode panel (presentation only).
     OpenPanel(Panel),
+    /// A press the panel takes and refuses (presentation only): a gadget
+    /// button pressed with nobody selected (0x51be6e), or the House
+    /// button with nobody selected or on a lot that is not residential
+    /// (0x51be1a). Only the House button's refusal sounds: with `error`,
+    /// the host plays `UI_error` for the interface.
+    Refused {
+        error: bool,
+    },
     /// List these people in the relationship panel (presentation only).
     ShowRelations(Relations),
     /// Show this page of the relationship panel, from 0 (presentation
@@ -157,6 +165,7 @@ mod tests {
         assert!(!Command::Camera(Camera::ZoomIn).changes_simulation());
         assert!(!Command::OpenPanel(Panel::Job).changes_simulation());
         assert!(!Command::TogglePanel.changes_simulation());
+        assert!(!Command::Refused { error: true }.changes_simulation());
         assert!(!Command::ShowRelations(Relations::Family).changes_simulation());
         assert!(!Command::RelationsPage(1).changes_simulation());
         assert!(!Command::Help(crate::balloon::Help::Sign(2)).changes_simulation());

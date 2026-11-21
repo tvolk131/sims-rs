@@ -1191,6 +1191,12 @@ impl Lot {
         &self.program
     }
 
+    /// Whether the lot is residential (0x40745f), as the idle loop and
+    /// the live panel's House button ask.
+    pub fn residential(&self) -> bool {
+        residential(&self.world, &self.program)
+    }
+
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
     }
