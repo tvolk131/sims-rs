@@ -57,6 +57,15 @@ pub fn selected(world: &World) -> Option<u16> {
     world.selected()
 }
 
+/// Publish the application's wait check (0x4764fe → 0x476548 →
+/// 0x46d9ce, setter 0x46d9c4). A valid button release (0x5e45ed)
+/// records the button in [0x6fe9a4]. The poll reads its bitmap at +0xd8
+/// and the resource ID at bitmap +0x30, or returns 0 if either pointer
+/// is null. Destroying the button clears the pointer (0x5e39cf).
+pub(crate) fn publish_waited_for(world: &mut World, bitmap_id: i16) -> Result<(), Fault> {
+    set_global(world, WAITED_FOR, bitmap_id)
+}
+
 impl Interpreter<'_> {
     /// Load step 16: the loaded house is announced (signal 0xf6), and the
     /// object registry answers (0x44302e). If no Sim is selected it asks
@@ -376,9 +385,9 @@ impl Interpreter<'_> {
     ///     neighborhood was read.
     /// 21. The rooms that wait are counted
     ///     ([`Interpreter::update_pending_rooms`], 0x467094).
-    /// 22. The interface's wait check (0x4764fe) writes what it found to
-    ///     global 12: the control a tutorial is waiting for, or 0. There
-    ///     is no interface here, so it is 0.
+    /// 22. The interface's wait check (0x4764fe) publishes 0 to global 12.
+    ///     A modal dialog can publish a button's bitmap ID later in the
+    ///     lot update, through [`crate::Answer`].
     ///
     /// Returns the rooms counted. In a capture of the original at the
     /// Goth house's first tick, the Goth family's count is up to date
@@ -386,7 +395,7 @@ impl Interpreter<'_> {
     pub fn before_frame(&self, world: &mut World) -> Result<Vec<i16>, Fault> {
         self.refresh_family_panel(world);
         let counted = self.update_pending_rooms(world)?;
-        set_global(world, WAITED_FOR, 0)?;
+        publish_waited_for(world, 0)?;
         Ok(counted)
     }
 

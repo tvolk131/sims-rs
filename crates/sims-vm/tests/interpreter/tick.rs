@@ -7,7 +7,7 @@ use sims_core::F32;
 use sims_sim::motives::{Curve, Rates, Tuning};
 use sims_sim::{Dialog, HouseUsage, PersonTick, Usage};
 use sims_vm::play::{Play, Recovery};
-use sims_vm::{Answers, Player, Shown, SoundEvent, TickError, Trap, Update};
+use sims_vm::{Answer, Answers, Interpreter, Player, Shown, SoundEvent, TickError, Trap, Update};
 use std::collections::BTreeMap;
 
 /// Dialog (opcode 36) operands of `kind`, waiting for an answer, with the
@@ -58,14 +58,12 @@ fn lot(tree: sims_formats::behavior::Behavior) -> Fixture {
 
 fn update(fx: &mut Fixture, player: &mut dyn Player) -> Result<Update, TickError> {
     let tuning = tuning();
-    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
     interpreter.lot_update(&mut fx.world, &tuning, player)
 }
 
 fn answers(list: &[u8]) -> Answers {
-    Answers {
-        queue: list.iter().copied().collect(),
-    }
+    Answers::choices(list)
 }
 
 /// A lamp that asks a dialog of `kind` and stores 1 in data word 0 on the
@@ -115,6 +113,23 @@ fn the_second_button_takes_the_false_branch_and_marks_the_registry() {
     update(&mut fx, &mut player).unwrap();
     assert_eq!(fx.lamp().data[0], 2);
     assert_eq!(fx.world.dialogs.declined, -1);
+}
+
+#[test]
+fn a_dialog_click_publishes_its_bitmap_until_the_next_poll() {
+    for (bitmap_id, expected) in [(Some(17), 17), (None, 42), (Some(0), 0)] {
+        let mut fx = lot(asking(1, 0));
+        fx.world.globals[12] = 42;
+        let mut player = Answers::replay(&[Answer {
+            status: 2,
+            bitmap_id,
+        }]);
+        assert_eq!(update(&mut fx, &mut player).unwrap().answered, [(LAMP, 2)]);
+        assert_eq!(fx.world.globals[12], expected);
+        let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        interpreter.before_frame(&mut fx.world).unwrap();
+        assert_eq!(fx.world.globals[12], 0);
+    }
 }
 
 #[test]

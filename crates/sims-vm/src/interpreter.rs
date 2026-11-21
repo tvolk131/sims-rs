@@ -561,10 +561,12 @@ impl<'a> Machine<'a, '_> {
         }
     }
 
-    /// The top frame's current instruction (legacy lib.rs:1563).
+    /// The top frame's current instruction (0x474bcd). A caller's
+    /// instruction is also looked up on return (0x474dc2) before the
+    /// caller's tree flag is cleared by dispatch.
     fn current(&self) -> Result<&'a Instruction, Trap> {
         let frame = self.frame()?;
-        let behavior = self.behavior(self.owner(frame)?, frame.tree)?;
+        let behavior = self.behavior(self.owner(frame)?, frame.tree_id())?;
         if frame.node > u16::from(LAST_NODE) {
             return Err(Trap::native(0x44c, "invalid instruction index"));
         }
@@ -802,7 +804,9 @@ impl<'a> Machine<'a, '_> {
     /// Pushes a frame. Its locals start as the words the frame storage
     /// holds where they land, not as zero. `callback` says the frame is the
     /// first of a tree run synchronously, which goes above a mark.
+    /// A new frame's header copy clears the tree flag (0x4751bd).
     fn push_frame(&mut self, mut frame: Frame, callback: bool) -> Result<(), Trap> {
+        frame.tree = frame.tree_id();
         let start = if callback {
             self.write_mark()?
         } else {
@@ -938,19 +942,23 @@ impl<'a> Machine<'a, '_> {
         Ok(())
     }
 
-    /// Executes one instruction.
+    /// Executes one instruction. At 0x474b99 a flagged frame dispatches
+    /// through vtable slot +0xc. The object's implementation (0x44aa96)
+    /// calls 0x474b13, which clears the flag in place and redispatches
+    /// the same frame before counting or executing an instruction.
     pub fn step(&mut self) -> Result<Status, Trap> {
+        let frame = self.frame_mut()?;
+        frame.tree = frame.tree_id();
         let instruction = self.current()?;
+        if instruction.opcode & Frame::TREE_FLAG != 0 {
+            // The separate instruction-flag hook writes to the shared
+            // BHAV resource (0x474bf4 -> 0x474b33).
+            return Err(Trap::Unsupported(format!(
+                "flagged instruction {:#06x} (0x474bf4)",
+                instruction.opcode
+            )));
+        }
         if instruction.opcode >= 256 {
-            if instruction.opcode & 0x8000 != 0 {
-                // Program::signature masks this bit off when following
-                // calls; what the original's dispatch does with it is not
-                // known (legacy lib.rs:993).
-                return Err(Trap::Unsupported(format!(
-                    "flagged tree call {:#06x}",
-                    instruction.opcode
-                )));
-            }
             self.call(instruction)?;
             return Ok(Status::Running);
         }
@@ -1056,7 +1064,7 @@ impl<'a> Machine<'a, '_> {
             // Native copies a contiguous argc-word span beginning at the
             // instruction's operands, running on into the instructions that
             // follow it in memory (12 bytes each: opcode, branches, operands).
-            let tree = self.behavior(owner, parent.tree)?;
+            let tree = self.behavior(owner, parent.tree_id())?;
             let mut bytes = instruction.operands.to_vec();
             for next in tree.instructions.iter().skip(usize::from(parent.node) + 1) {
                 if bytes.len() >= argc * 2 {
@@ -1103,7 +1111,9 @@ impl<'a> Machine<'a, '_> {
 
     /// Follows a branch target from the top frame (legacy lib.rs:1665).
     /// Returns pop the frame and branch the caller on the returned value,
-    /// which may return again.
+    /// which may return again. The interpreter folds consecutive returns
+    /// into this step, including clearing each returning frame's dispatch
+    /// bit at 0x474b99/0x474b28 before its pop at 0x474d7e.
     fn branch(&mut self, mut target: u8) -> Result<Status, Trap> {
         let base = self.base;
         loop {
@@ -1117,7 +1127,9 @@ impl<'a> Machine<'a, '_> {
                     // 0xff there in the frame storage. The capture of the
                     // Goth house's second tick shows it: a person's new
                     // frame finds 254 in a local that lands on such a word.
-                    self.frame_mut()?.node = u16::from(target);
+                    let frame = self.frame_mut()?;
+                    frame.node = u16::from(target);
+                    frame.tree = frame.tree_id();
                     self.pop_frame()?;
                     // A return counts as the thread's last result too
                     // (legacy lib.rs:1714), written once the frame is
@@ -1158,7 +1170,7 @@ impl<'a> Machine<'a, '_> {
                 _ => {
                     let frame = self.frame()?;
                     let count = self
-                        .behavior(self.owner(frame)?, frame.tree)?
+                        .behavior(self.owner(frame)?, frame.tree_id())?
                         .instructions
                         .len();
                     if usize::from(target) >= count {
