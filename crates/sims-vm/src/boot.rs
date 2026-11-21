@@ -1387,21 +1387,33 @@ impl Lot {
     /// (`0x4cea5d` + `0x4ce44f`). Leaving a non-Live mode back to
     /// [`PanelMode::Live`] marks all rooms uncounted, updates lot
     /// statistics, and clears global 19 (`0x416534`). Leaving any non-Live
-    /// mode clears the Buy Mode Undo/Redo stacks (`0x4cea5d` → `0x4933dc`).
+    /// mode clears the Buy Mode Undo/Redo stacks and deletes any detached
+    /// off-lot redo instances (`0x4cea5d` → `0x4933dc` → `0x48c20e`).
     pub fn set_mode(&mut self, mode: PanelMode) -> Result<(), OrderError> {
         self.ready()?;
         let previous = self.mode();
+        let clearing = previous != PanelMode::Live && mode != previous;
+        let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
+            sounds: Some(&sounds),
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
+        if clearing {
+            interpreter
+                .buy_purge_detached(&mut world, &self.buy_redo)
+                .map_err(OrderError::Refused)?;
+            interpreter
+                .buy_purge_detached(&mut world, &self.buy_undo)
+                .map_err(OrderError::Refused)?;
+        }
         interpreter
             .set_mode(&mut world, mode)
             .map_err(OrderError::Refused)?;
         self.world = world;
-        if previous != PanelMode::Live && mode != previous {
+        if clearing {
             self.buy_undo.clear();
             self.buy_redo.clear();
         }
@@ -1510,7 +1522,8 @@ impl Lot {
     /// deletes the `"Tile Cursor"`, places the held object permanently, runs
     /// OBJf function 11 (`USER_PLACEMENT`), deducts its price from household
     /// funds, and pushes an undo record (`0x486ada` → `0x493259`, clearing the
-    /// redo stack). Returns the placed object's ID. On error, the lot is left
+    /// redo stack and deleting any detached off-lot redo instances via
+    /// `0x48c20e`). Returns the placed object's ID. On error, the lot is left
     /// unchanged so the caller still owns `cursor`.
     pub fn buy_commit(&mut self, cursor: &BuyCursor) -> Result<u16, OrderError> {
         self.ready()?;
@@ -1524,6 +1537,9 @@ impl Lot {
         let mut world = self.world.clone();
         let purchase = interpreter
             .buy_commit_record(&mut world, cursor)
+            .map_err(OrderError::Refused)?;
+        interpreter
+            .buy_purge_detached(&mut world, &self.buy_redo)
             .map_err(OrderError::Refused)?;
         let id = purchase.object;
         self.world = world;
@@ -1542,12 +1558,13 @@ impl Lot {
         !self.buy_redo.is_empty()
     }
 
-    /// Undoes the most recent committed Buy Mode purchase (`0x4cf2e0` →
-    /// `0x4932fa` → `0x48bd21`): removes the purchased object, refunds its
-    /// price to household funds and today's budget category, and pushes it onto
-    /// the redo stack. Returns `Ok(false)` when nothing can be undone (clearing
-    /// the undo stack if the top record could not be applied, matching
-    /// `0x4932fa` → `0x493376`).
+    /// Undoes the most recent committed Buy Mode purchase (`0x4cf2e0` / event
+    /// `0xec` → `0x4932fa` → `0x48bd21`): runs OBJf 12 (`USER_PICKUP`), takes
+    /// the purchased object off-lot while keeping it registered for Redo
+    /// (`0x435751` / `0x422ff5`), refunds its price to household funds and
+    /// today's budget category, and pushes it onto the redo stack. Returns
+    /// `Ok(false)` when nothing can be undone (clearing the undo stack if the
+    /// top record could not be applied, matching `0x4932fa` → `0x493376`).
     pub fn buy_undo(&mut self) -> Result<bool, OrderError> {
         self.ready()?;
         let Some(purchase) = self.buy_undo.pop() else {
@@ -1568,6 +1585,16 @@ impl Lot {
                 Ok(true)
             }
             Ok(false) => {
+                let mut cleared = self.world.clone();
+                if interpreter
+                    .buy_purge_detached(&mut cleared, std::slice::from_ref(&purchase))
+                    .is_ok()
+                    && interpreter
+                        .buy_purge_detached(&mut cleared, &self.buy_undo)
+                        .is_ok()
+                {
+                    self.world = cleared;
+                }
                 self.buy_undo.clear();
                 Ok(false)
             }
@@ -1578,12 +1605,13 @@ impl Lot {
         }
     }
 
-    /// Redoes the most recently undone Buy Mode purchase (`0x4cf317` →
-    /// `0x493338` → `0x48bdfe`): recreates and places the purchased object,
-    /// runs `USER_PLACEMENT`, re-deducts its price, and pushes it back onto the
-    /// undo stack. Returns `Ok(false)` when nothing can be redone (clearing the
-    /// redo stack if the top record could not be applied, matching `0x493338` →
-    /// `0x4933a9`).
+    /// Redoes the most recently undone Buy Mode purchase (`0x4cf317` / event
+    /// `0xed` → `0x493338` → `0x48bdfe`): reuses the detached registered
+    /// instance (`0x48c07b..0x48c082`), places it, runs `USER_PLACEMENT`,
+    /// re-deducts its price, and pushes it back onto the undo stack. Returns
+    /// `Ok(false)` when nothing can be redone (clearing the redo stack and
+    /// deleting detached redo instances if the top record could not be
+    /// applied, matching `0x493338` → `0x4933a9` → `0x48c20e`).
     pub fn buy_redo(&mut self) -> Result<bool, OrderError> {
         self.ready()?;
         let Some(mut purchase) = self.buy_redo.pop() else {
@@ -1604,6 +1632,16 @@ impl Lot {
                 Ok(true)
             }
             Ok(false) => {
+                let mut cleared = self.world.clone();
+                if interpreter
+                    .buy_purge_detached(&mut cleared, std::slice::from_ref(&purchase))
+                    .is_ok()
+                    && interpreter
+                        .buy_purge_detached(&mut cleared, &self.buy_redo)
+                        .is_ok()
+                {
+                    self.world = cleared;
+                }
                 self.buy_redo.clear();
                 Ok(false)
             }

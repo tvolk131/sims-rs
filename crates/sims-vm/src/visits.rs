@@ -60,6 +60,9 @@ pub(crate) mod function {
     /// Run after a user places an object in Buy/Build mode (`0x421a0e` →
     /// `0x43562f` / `0x422e99`).
     pub const USER_PLACEMENT: usize = 11;
+    /// Run when a user picks up or undoes an object in Buy/Build mode
+    /// (`0x48c0ea` → `0x435751` / `0x422ff5`).
+    pub const USER_PICKUP: usize = 12;
 }
 
 /// What [`Interpreter::visit_objects`] did.

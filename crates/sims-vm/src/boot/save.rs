@@ -157,8 +157,27 @@ impl Lot {
         if self.halted {
             return Err(SaveError::Halted);
         }
+        let mut world = self.world.clone();
+        if !self.buy_redo.is_empty() {
+            let sounds = std::cell::RefCell::new(Vec::new());
+            let interpreter = crate::interpreter::Interpreter {
+                sounds: Some(&sounds),
+                view_rotation: self.view_rotation,
+                view_centre: self.view_centre,
+                ..crate::interpreter::Interpreter::new(
+                    &self.program,
+                    &self.catalog,
+                    crate::interpreter::Stream::Global,
+                )
+            };
+            interpreter
+                .buy_purge_detached(&mut world, &self.buy_redo)
+                .map_err(|e| {
+                    SaveError::Format(format!("clearing detached Buy Mode redo objects: {e}"))
+                })?;
+        }
         Ok(Saved {
-            world: self.world.clone(),
+            world,
             ticks: self.ticks,
             start: self.start,
             answers: self.player.clone(),

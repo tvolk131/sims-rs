@@ -276,7 +276,9 @@ impl Interpreter<'_> {
         }
         // Both snapped and unsnapped placement failed: leave held off-lot and
         // place the `"Tile Cursor"` alone at unsnapped `fine` (`0x485f23`).
-        cursor.position = [pos[0], pos[1], level];
+        // Native `0x421fcf..0x421fed` saves the cursor's actual coordinates so
+        // manual rotation (`0x422705..0x422716`) rechecks at `fine` instead of
+        // jumping to the tile centre.
         cursor.valid = false;
         cursor.container = None;
         if self.fits(world, cursor.cursor, fine, level)? {
@@ -288,6 +290,9 @@ impl Interpreter<'_> {
                 level,
             };
             self.put(world, cursor.cursor, cursor_place, true)?;
+            cursor.position = [fine[0], fine[1], level];
+        } else {
+            cursor.position = [pos[0], pos[1], level];
         }
         Ok(false)
     }
@@ -527,11 +532,13 @@ impl Interpreter<'_> {
         self.buy_commit_record(world, cursor).map(|p| p.object)
     }
 
-    /// Undoes a committed Buy Mode purchase (`0x48bd21` → `0x48c0ea` +
-    /// `0x48bdbd`): removes and deletes the purchased object (and its group
-    /// tiles, if multi-tile) and refunds `purchase.price` to household funds
-    /// and today's budget category. Returns `Ok(false)` if the purchased
-    /// object is no longer on the lot.
+    /// Undoes a committed Buy Mode purchase (`0x48bd21` → `0x48c0ea` →
+    /// `0x435751` / `0x422ff5` + `0x48bdbd`): runs OBJf function 12
+    /// (`USER_PICKUP`) on the object (and every group tile / held child),
+    /// takes it off the lot while keeping the instance registered for Redo,
+    /// and refunds `purchase.price` to household funds and today's budget
+    /// category. Returns `Ok(false)` if the purchased object is missing or
+    /// already off the lot.
     pub fn buy_undo_purchase(
         &self,
         world: &mut World,
@@ -542,22 +549,27 @@ impl Interpreter<'_> {
             at: None,
             trap,
         };
-        if !world.objects.contains_key(&purchase.object) {
+        let Some(obj) = world.objects.get(&purchase.object) else {
+            return Ok(false);
+        };
+        if !on_lot([obj.position[0], obj.position[1]]) {
             return Ok(false);
         }
-        self.remove_now(world, purchase.object)?;
+        self.run_user_pickup(world, purchase.object)?;
+        self.take_off(world, purchase.object, true)?;
         spend(world, purchase.budget_category, -purchase.price).map_err(fail)?;
         Ok(true)
     }
 
     /// Redoes a previously undone Buy Mode purchase (`0x48bdfe` → `0x48c053`
-    /// → `0x440b2d` + `0x48bfab` + `0x48bdbd`): recreates the catalog object,
-    /// rotates it to `purchase.facing`, validates and places it at
-    /// `purchase.position`/`purchase.container`, runs OBJf function 11
-    /// (`USER_PLACEMENT`, `*piVar2 + 0x64`), and re-deducts `purchase.price`.
-    /// Updates `purchase.object` to the recreated ID and returns `Ok(true)`,
-    /// or cleans up and returns `Ok(false)` if it can no longer be placed or
-    /// afforded.
+    /// → `0x48c07b..0x48c082` + `0x48bfab` + `0x48bdbd`): reuses the detached
+    /// registered instance when still present (falling back to `create`
+    /// `0x440b2d` only if absent), rotates it to `purchase.facing`, validates
+    /// and places it at `purchase.position`/`purchase.container`, runs OBJf
+    /// function 11 (`USER_PLACEMENT`, `*piVar2 + 0x64`), and re-deducts
+    /// `purchase.price`. Updates `purchase.object` to the placed ID and
+    /// returns `Ok(true)`, or returns `Ok(false)` if it can no longer be
+    /// placed or afforded.
     pub fn buy_redo_purchase(
         &self,
         world: &mut World,
@@ -575,7 +587,14 @@ impl Interpreter<'_> {
         if !on_lot([x, y]) || !inside_placement_bounds(world, [x, y]) {
             return Ok(false);
         }
-        let id = self.create(world, purchase.guid)?;
+        let (id, created_fresh) = if let Some(existing) = world.objects.get(&purchase.object) {
+            if on_lot([existing.position[0], existing.position[1]]) {
+                return Ok(false);
+            }
+            (purchase.object, false)
+        } else {
+            (self.create(world, purchase.guid)?, true)
+        };
         let fail = |trap| Fault {
             object: id,
             at: None,
@@ -587,7 +606,9 @@ impl Interpreter<'_> {
             None => self.place_test(world, id, [x, y], level)?.is_ok(),
         };
         if !fits {
-            self.remove_now(world, id)?;
+            if created_fresh {
+                self.remove_now(world, id)?;
+            }
             return Ok(false);
         }
         let place = Place {
@@ -602,6 +623,26 @@ impl Interpreter<'_> {
         spend(world, purchase.budget_category, purchase.price).map_err(fail)?;
         purchase.object = id;
         Ok(true)
+    }
+
+    /// Deletes any detached (off-lot) instances referenced by discarded undo
+    /// or redo history records (`0x48c20e` / `0x48c258`), leaving on-lot
+    /// objects untouched.
+    pub fn buy_purge_detached(
+        &self,
+        world: &mut World,
+        purchases: &[BuyPurchase],
+    ) -> Result<(), Fault> {
+        for purchase in purchases {
+            if world
+                .objects
+                .get(&purchase.object)
+                .is_some_and(|o| !on_lot([o.position[0], o.position[1]]))
+            {
+                self.remove_now(world, purchase.object)?;
+            }
+        }
+        Ok(())
     }
 
     /// Cancels an active Buy Mode purchase (`0x487105`): deletes both the
@@ -797,10 +838,16 @@ impl Interpreter<'_> {
         Ok(())
     }
 
-    /// Runs OBJf function 11 (`USER_PLACEMENT`) on `held` (or every part of a
-    /// multi-tile group) and on every non-empty object in each part's surface
-    /// slots (`0x43562f` / `0x422e99`).
-    fn run_user_placement(&self, world: &mut World, held: u16) -> Result<(), Fault> {
+    /// Runs OBJf callback `callback` (`USER_PLACEMENT` = 11 or `USER_PICKUP` =
+    /// 12) on `held` (or every part of a multi-tile group) and on every
+    /// non-empty object in each part's surface slots (`0x43562f` / `0x422e99`,
+    /// `0x435751` / `0x422ff5`).
+    fn run_user_callback(
+        &self,
+        world: &mut World,
+        held: u16,
+        callback: usize,
+    ) -> Result<(), Fault> {
         let fail = |trap| Fault {
             object: held,
             at: None,
@@ -816,7 +863,7 @@ impl Interpreter<'_> {
             vec![held]
         };
         for part in parts {
-            self.callback(world, part, function::USER_PLACEMENT, 0)?;
+            self.callback(world, part, callback, 0)?;
             let slot_count = world
                 .objects
                 .get(&part)
@@ -830,11 +877,19 @@ impl Interpreter<'_> {
                 if let Ok(child) = u16::try_from(child)
                     && child != 0
                 {
-                    self.callback(world, child, function::USER_PLACEMENT, 0)?;
+                    self.callback(world, child, callback, 0)?;
                 }
             }
         }
         Ok(())
+    }
+
+    fn run_user_placement(&self, world: &mut World, held: u16) -> Result<(), Fault> {
+        self.run_user_callback(world, held, function::USER_PLACEMENT)
+    }
+
+    fn run_user_pickup(&self, world: &mut World, held: u16) -> Result<(), Fault> {
+        self.run_user_callback(world, held, function::USER_PICKUP)
     }
 
     /// Tests whether `held` fits at `[pos, level]`: first tries any `retained`

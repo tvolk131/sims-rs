@@ -94,15 +94,25 @@ panel, and `sims-vm` had no `"Tile Cursor"` creation or Buy placement tool.
     11 (`USER_PLACEMENT`) on the object (and every group tile / held child),
     deducting its price in budget category `6` (Buy) or `7` (Build), and
     registering a purchase undo record (`0x486f5a` → `0x48ba19` → `0x48beb5`,
-    `0x486ada` → `0x493259`, clearing the redo stack). Manual rotation
-    (`0x4226bc` → `0x421be4`) rechecks placement at the saved coordinates
-    without running pointer-move wall auto-rotation (`0x48736b`), keeping the
-    requested facing and leaving the preview invalid if it cannot fit. Undo
-    (`0x4cf2e0` / event `0xec` → `0x4932fa` → `0x48bd21`) deletes the purchased
-    object and refunds its price (`0x48bdbd`); Redo (`0x4cf317` / event `0xed`
-    → `0x493338` → `0x48bdfe`) recreates, places, runs `USER_PLACEMENT`, and
-    re-charges it; leaving a non-Live mode clears both stacks (`0x4cea5d` →
-    `0x4933dc`). When Shift is held (`VK_SHIFT`, `0x4864f9`) or for repeat-buy
+    `0x486ada` → `0x493259`, clearing the redo stack and deleting any detached
+    off-lot redo instances via `0x48c20e`). Manual rotation (`0x4226bc` →
+    `0x421be4`) rechecks placement at the tile cursor's saved coordinates
+    (`0x421fcf..0x421fed`, including unsnapped fallback positions) without
+    running pointer-move wall auto-rotation (`0x48736b`), keeping the requested
+    facing and leaving the preview invalid if it cannot fit. Undo (keyboard
+    event `0xec` at `0x4a8545` → `0x4932fa` → `0x48bd21`) runs OBJf 12
+    (`USER_PICKUP`, `0x435751` / `0x422ff5`), detaches the purchased object
+    off-lot while keeping it registered, and refunds its price (`0x48bdbd`);
+    Redo (keyboard event `0xed` at `0x4a856a` → `0x493338` → `0x48bdfe`) reuses
+    that detached instance (`0x48c07b..0x48c082`), places it, runs
+    `USER_PLACEMENT`, and re-charges it; leaving a non-Live mode clears both
+    stacks and deletes detached off-lot instances (`0x4cea5d` → `0x4933dc` →
+    `0x48c20e`). Note that on-screen Undo/Redo buttons (`kToolBtnUndo = 64` at
+    `(231, 21)`, `kToolBtnRedo = 65` at `(231, 53)`, `0x5004f5` / `0x500f87` /
+    `0x501197`) belong exclusively to Build Mode (`mode == 0` in `0x50a8ec`);
+    Buy Mode (`cWinCatalog`, `mode == 1`, `0x5050e4` / `0x507288`) has no
+    on-screen Undo/Redo buttons and uses keyboard events `0xec`/`0xed`
+    (`0x4a82db`). When Shift is held (`VK_SHIFT`, `0x4864f9`) or for repeat-buy
     objects (`OBJD word 96 == 1` outside tutorial `global[26] == 0`,
     `0x4878f3`), a successful commit immediately arms another copy with the
     placed facing (`0x4864d0` → `0x486f5a`) if affordable. Cancel (`0x487105`)

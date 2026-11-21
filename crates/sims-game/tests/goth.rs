@@ -5581,20 +5581,40 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
     assert!(lot.buy_rotate(&mut mirror_cur, 4).unwrap());
     assert!(mirror_cur.valid);
     assert_eq!(lot.world().objects[&mirror_cur.held].data[1], 4);
+    // Failed unsnapped fallback (`0x421fcf..0x421fed`) saves the cursor's
+    // actual coordinates so manual rotation (`0x422705..0x422716`) keeps the
+    // cursor at `[581, 475, 1]` instead of jumping to tile centre `[584, 472, 1]`.
+    assert!(!lot.buy_move(&mut mirror_cur, [581, 475], 1).unwrap());
+    assert_eq!(mirror_cur.position, [581, 475, 1]);
+    assert_eq!(
+        lot.world().objects[&mirror_cur.cursor].position,
+        [581, 475, 1]
+    );
+    assert!(!lot.buy_rotate(&mut mirror_cur, 2).unwrap());
+    assert_eq!(mirror_cur.position, [581, 475, 1]);
+    assert_eq!(
+        lot.world().objects[&mirror_cur.cursor].position,
+        [581, 475, 1]
+    );
     lot.buy_cancel(&mirror_cur).unwrap();
 
-    // Undo / Redo for surface purchase (`0x48ba19`, `0x4932fa`, `0x493338`):
-    // undo removes the pumpkin (if placed) then the desk lamp, refunding
-    // funds and clearing the desk slot; redo restores the lamp onto the desk.
+    // Undo / Redo for surface purchase (`0x48ba19`, `0x435751`, `0x48c07b`,
+    // `0x48c20e`): undo runs OBJf 12 (`USER_PICKUP`) and detaches the lamp
+    // off-lot while keeping it registered; redo reuses the exact same
+    // registered instance and restores its desk slot and charge.
     assert!(lot.can_buy_undo());
-    while lot.world().objects.contains_key(&placed_lamp) {
+    let lamp_reg = lot.world().objects[&placed_lamp].registry_word;
+    while lot.world().objects[&placed_lamp].position[0] >= 0 {
         assert!(lot.buy_undo().unwrap());
     }
-    assert!(!lot.world().objects.contains_key(&placed_lamp));
+    assert!(lot.world().objects.contains_key(&placed_lamp));
+    assert!(lot.world().objects[&placed_lamp].position[0] < 0);
+    assert_eq!(lot.world().objects[&placed_lamp].data[2], 0);
     assert_eq!(lot.world().budget.funds, funds_before);
     assert!(lot.can_buy_redo());
     assert!(lot.buy_redo().unwrap());
-    assert!(lot.world().objects.contains_key(&placed_lamp));
+    assert!(lot.world().objects[&placed_lamp].position[0] >= 0);
+    assert_eq!(lot.world().objects[&placed_lamp].registry_word, lamp_reg);
     assert_eq!(lot.world().objects[&placed_lamp].data[2], surface_id as i16);
     assert_eq!(lot.world().budget.funds, funds_before - lamp.price);
 
@@ -5659,6 +5679,16 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
     // keeps `buy_cursor` intact until `cancel_buy` deletes both objects.
     let spot = recorded([480, 380]);
     game.hover(spot);
+    let first_chair = game.buy_cursor().expect("first chair cursor").held;
+    let first_reg = game.lot().world().objects[&first_chair].registry_word;
+    // Unavailable Undo / Redo must not cancel the active preview or selection
+    // before any purchase has been committed.
+    assert!(!game.can_undo());
+    assert!(!game.can_redo());
+    assert!(!game.undo_buy());
+    assert!(!game.redo_buy());
+    assert!(game.buy_cursor().is_some());
+    assert!(game.buy_selected().is_some());
     game.press(spot);
     game.release(spot);
     let second = game.buy_cursor().expect("repeat purchase armed").clone();
@@ -5680,24 +5710,36 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
     let funds_after_buy = game.lot().world().budget.funds;
     assert_eq!(funds_after_buy, 2542 - 80);
 
-    // Undo / Redo through `Game` (`0x4cf2e0` -> `0x4932fa`, `0x4cf317` ->
-    // `0x493338`): after Escape/cancel drops the repeat preview, Undo removes
-    // the paid $80 Werkbunnst Chair and refunds $80; Redo puts it back and
-    // re-charges $80; leaving Buy Mode clears both stacks (`0x4cea5d` ->
-    // `0x4933dc`).
+    // Undo / Redo through `Game` (`0x4a8545`/`0x4932fa` -> `0x48bd21`,
+    // `0x4a856a`/`0x493338` -> `0x48bdfe`): after Escape/cancel drops the
+    // repeat preview, Undo detaches the paid $80 Werkbunnst Chair off-lot
+    // (keeping it registered for Redo) and refunds $80; Redo reuses that
+    // exact instance and re-charges $80; undoing again then leaving Buy Mode
+    // clears both stacks and deletes the detached instance (`0x4cea5d` ->
+    // `0x4933dc` -> `0x48c20e`).
     assert!(game.can_undo());
     assert!(!game.can_redo());
     assert!(game.undo_buy());
-    assert_eq!(game.lot().world().objects.len(), objs_before);
+    assert!(game.lot().world().objects.contains_key(&first_chair));
+    assert!(game.lot().world().objects[&first_chair].position[0] < 0);
     assert_eq!(game.lot().world().budget.funds, 2542);
     assert!(!game.can_undo());
     assert!(game.can_redo());
     assert!(game.redo_buy());
+    assert!(game.lot().world().objects[&first_chair].position[0] >= 0);
+    assert_eq!(
+        game.lot().world().objects[&first_chair].registry_word,
+        first_reg
+    );
     assert_eq!(game.lot().world().objects.len(), objs_before + 1);
     assert_eq!(game.lot().world().budget.funds, 2542 - 80);
     assert!(game.can_undo());
     assert!(!game.can_redo());
+    assert!(game.undo_buy());
+    assert!(game.lot().world().objects[&first_chair].position[0] < 0);
     game.set_mode(Mode::Live);
+    assert!(!game.lot().world().objects.contains_key(&first_chair));
+    assert_eq!(game.lot().world().objects.len(), objs_before);
     assert!(!game.lot().can_buy_undo());
     assert!(!game.lot().can_buy_redo());
 }

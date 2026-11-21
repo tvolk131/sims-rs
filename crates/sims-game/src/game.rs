@@ -1664,11 +1664,12 @@ impl Game {
         self.hud.controls.mode == Mode::Buy && self.lot.can_buy_redo()
     }
 
-    /// Undoes the most recent committed Buy Mode purchase (`0x4cf2e0` →
-    /// `0x4932fa` → `0x48bd21`), cancelling any active unplaced preview first.
-    /// Returns `true` if a purchase was undone.
+    /// Undoes the most recent committed Buy Mode purchase (`0x4cf2e0` / event
+    /// `0xec` → `0x4932fa` → `0x48bd21`), cancelling any active unplaced
+    /// preview first only when an undoable purchase exists. Returns `true` if
+    /// a purchase was undone.
     pub fn undo_buy(&mut self) -> bool {
-        if self.hud.controls.mode != Mode::Buy || self.stopped.is_some() {
+        if !self.can_undo() || self.stopped.is_some() {
             return false;
         }
         self.cancel_buy();
@@ -1690,11 +1691,12 @@ impl Game {
         }
     }
 
-    /// Redoes the most recently undone Buy Mode purchase (`0x4cf317` →
-    /// `0x493338` → `0x48bdfe`), cancelling any active unplaced preview first.
-    /// Returns `true` if a purchase was redone.
+    /// Redoes the most recently undone Buy Mode purchase (`0x4cf317` / event
+    /// `0xed` → `0x493338` → `0x48bdfe`), cancelling any active unplaced
+    /// preview first only when a redoable purchase exists. Returns `true` if a
+    /// purchase was redone.
     pub fn redo_buy(&mut self) -> bool {
-        if self.hud.controls.mode != Mode::Buy || self.stopped.is_some() {
+        if !self.can_redo() || self.stopped.is_some() {
             return false;
         }
         self.cancel_buy();
