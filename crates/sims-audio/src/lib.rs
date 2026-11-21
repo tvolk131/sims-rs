@@ -45,6 +45,7 @@ pub mod mp3;
 mod pcm;
 pub mod placement;
 pub mod player;
+pub mod registry;
 pub mod sources;
 pub mod stations;
 pub mod wav;
