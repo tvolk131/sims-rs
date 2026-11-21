@@ -935,6 +935,7 @@ mod tests {
         // record's: give person 300 a family on the lot.
         use sims_formats::saved_objects::{Interaction, Person};
         let idle = Interaction {
+            join: 0,
             uid: 0,
             caller: 0,
             target: 0,

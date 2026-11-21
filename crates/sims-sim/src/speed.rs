@@ -215,6 +215,7 @@ mod tests {
     fn one_person() -> World {
         use sims_formats::saved_objects::{Interaction, Person};
         let idle = Interaction {
+            join: 0,
             uid: 0,
             caller: 0,
             target: 0,

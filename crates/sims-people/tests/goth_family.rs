@@ -139,6 +139,7 @@ fn an_appearance_is_found_by_its_own_name() {
 /// A person record with nothing in it, as a script makes one.
 fn blank_person() -> sims_formats::saved_objects::Person {
     let idle = sims_formats::saved_objects::Interaction {
+        join: 0,
         uid: 0,
         caller: 0,
         target: 0,
