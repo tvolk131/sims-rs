@@ -673,10 +673,15 @@ impl Lot {
             Ok(assets) => sims_content::Wardrobe::load(&assets),
             Err(error) => sims_content::Wardrobe::unread(error),
         });
-        program.ordered_wardrobe = match sims_content::ImportWardrobe::load_lenient(&install) {
-            Ok((ordered, errors)) if errors.is_empty() => Some(ordered),
-            _ => None,
-        };
+        program.ordered_wardrobe =
+            Some(match sims_content::ImportWardrobe::load_lenient(&install) {
+                Ok((ordered, errors)) if errors.is_empty() => Ok(ordered),
+                Ok((_, errors)) => {
+                    let (file, error) = errors.into_iter().next().unwrap();
+                    Err(format!("{file} ({error})"))
+                }
+                Err(error) => Err(error.to_string()),
+            });
         if let Some(characters) = &characters {
             program.character_files = crate::program::character_files(&index, characters);
         }

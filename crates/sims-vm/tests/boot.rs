@@ -1660,10 +1660,15 @@ fn the_goth_day_under_the_recordings_frames_keeps_its_streams() {
     for (at, lot_rng, crt) in recorded {
         while tick < at {
             if tick == 24718 {
-                // The portrait's search at 24719 finds no tile from these
-                // four starts, each in room -5 (none), and from every other
-                // the day goes on the same.
-                every_start_gives_one_state(&mut lot, &[[19, 24], [23, 31], [26, 28], [26, 31]]);
+                // At 24719 Waggles' portrait slot is dirty (written via
+                // `My Person Data[68]` at 24716, `0x4539c7` -> `0x45810c`),
+                // so `0x4e92f2` builds temporary Waggles (+1,920 CRT draws).
+                // From the four room -5 starts (`[19, 24]`, `[23, 31]`,
+                // `[26, 28]`, `[26, 31]`), `0x4e9706` removes Waggles without
+                // caching and `0x4e9338` then loads `User00036.iff`'s
+                // embedded `BMP_` 2002, converging to the exact same state
+                // from every start on the lot.
+                every_start_gives_one_state(&mut lot, &[]);
             }
             lot.step().unwrap();
             tick += 1;

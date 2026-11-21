@@ -84,15 +84,21 @@ pub struct Profile {
 /// skeletons in file order plus any decode error encountered partway through.
 pub type IndexedCatalog = (Vec<Skeleton>, Option<String>);
 
+/// Decoded appearances of one `.ndx`-referenced `.bcf` catalog (`0x5a38da` →
+/// `0x59f35f`): each lowercased appearance name mapped to whether its first
+/// definition in that catalog has a valid `"HEAD"` mesh binding, plus any
+/// decode error encountered partway through.
+pub type IndexedSuitCatalog = (BTreeMap<String, bool>, Option<String>);
+
 /// The skeletons and profiles of a set of person types.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct People {
     /// Each person type's skeleton, by the type's GUID.
     pub skeletons: BTreeMap<u32, Skeleton>,
-    /// Skeletons already loaded at startup (eager `.bcf` catalogs plus any
-    /// `.ndx` catalogs and their siblings loaded while resolving the requested
-    /// person GUIDs), keyed byte-for-byte by skeleton name (`0x5a0384`,
-    /// `0x5a280f`).
+    /// Skeletons already loaded at startup (eager `.bcf` catalogs only —
+    /// `.ndx` catalogs stay unloaded in [`People::indexed_skeletons`] until
+    /// runtime lookup order resolves them), keyed byte-for-byte by skeleton
+    /// name (`0x5a0384`, `0x5a280f`).
     pub skeletons_by_name: BTreeMap<String, Skeleton>,
     /// Still-unloaded `.ndx`-indexed skeletons (`0x584562` → `0x59fc48`),
     /// keyed byte-for-byte by skeleton name: `Ok(catalog_location)` pointing
@@ -116,6 +122,20 @@ pub struct People {
     /// appearance entries from `0x584562` → `0x5a0212` → `0x59fc48` whose
     /// first-registered `.bcf` catalog defines the appearance).
     pub suits: BTreeSet<String>,
+    /// Appearance names registered eagerly from `.cmx` and `.bcf` catalogs at
+    /// startup (`0x59f844`, already loaded so later `.ndx` loads cannot
+    /// override them at `0x59f34c`).
+    pub eager_suits: BTreeSet<String>,
+    /// Still-unloaded `.ndx`-indexed appearances (`0x584562` → `0x59fc48`),
+    /// keyed by lowercased appearance name: `Ok(catalog_location)` pointing
+    /// into [`People::indexed_suit_catalogs`], or `Err(reason)` if its catalog
+    /// is missing or unreadable.
+    pub indexed_suits: BTreeMap<String, std::result::Result<String, String>>,
+    /// Decoded appearances for each `.bcf` catalog referenced by
+    /// [`People::indexed_suits`], keyed by catalog location, so runtime
+    /// lookups (`0x5a044d` → `0x5a38da` → `0x59f35f`) can populate unloaded
+    /// sibling appearance entries in exact runtime call order.
+    pub indexed_suit_catalogs: BTreeMap<String, IndexedSuitCatalog>,
     /// Each avatar catalog or index in the original's search paths whose
     /// skeletons or suits stopped decoding, by location, with the error:
     /// its suits after that point are missing from `suits`.
@@ -211,6 +231,9 @@ pub struct AvatarRegistry {
     skeletons: BTreeMap<String, (usize, SkeletonEntry)>,
     first_skeleton_error: Option<(usize, String)>,
     suits: BTreeSet<String>,
+    eager_suits: BTreeSet<String>,
+    indexed_suits: BTreeMap<String, std::result::Result<String, String>>,
+    indexed_suit_catalogs: BTreeMap<String, IndexedSuitCatalog>,
     head_suits: BTreeSet<String>,
     suit_errors: BTreeMap<String, String>,
 }
@@ -290,10 +313,16 @@ impl AvatarRegistry {
             }
         }
 
+        // Snapshot eager `.cmx`/`.bcf` appearances before scanning `.ndx`
+        // files (`0x59f844`): already-loaded eager appearances cannot be
+        // overwritten by later `.ndx` catalog loads (`0x59f34c`).
+        let eager_suits = suits.clone();
+
         // 0x584562 → 0x5a0212 → 0x59fc48: `.ndx` catalogs in indexed paths.
-        // Keep the first appearance registration (0x59fe53) and verify it
-        // against its referenced `.bcf` catalog below (0x5a044d → 0x5a38da).
-        let mut indexed_suits: BTreeMap<String, (String, String, Vec<u8>)> = BTreeMap::new();
+        // Keep the first appearance registration (0x59fe53) and export each
+        // referenced `.bcf` catalog so runtime lookups (`0x5a044d` → `0x5a38da`
+        // → `0x59f35f`) can fill unloaded sibling entries in call order.
+        let mut indexed_suit_entries: BTreeMap<String, (String, String, Vec<u8>)> = BTreeMap::new();
         for (directory, _, source) in resources_with_dir(&paths.files, &paths.indexed, b".ndx")? {
             let location = source.location(&install.root);
             let bytes = source.read()?;
@@ -319,10 +348,12 @@ impl AvatarRegistry {
                         }
                         Kind::Appearance => {
                             let name = decode(&entry.name, 1);
-                            if !suits.contains(&name) && !indexed_suits.contains_key(&name) {
+                            if !eager_suits.contains(&name)
+                                && !indexed_suit_entries.contains_key(&name)
+                            {
                                 let mut catalog_bcf = entry.catalog;
                                 catalog_bcf.extend_from_slice(b".bcf");
-                                indexed_suits.insert(
+                                indexed_suit_entries.insert(
                                     name,
                                     (location.clone(), directory.clone(), catalog_bcf),
                                 );
@@ -351,24 +382,40 @@ impl AvatarRegistry {
         }
 
         // Decode each referenced `.bcf` catalog once (keyed by resolved
-        // resource location so case/slash aliases share one decode) to confirm
-        // the indexed appearance names it actually defines (0x5a044d,
-        // 0x5950f5, 0x5a27f2). Unreadable suit-only catalogs record into
-        // `suit_errors` instead of aborting skeleton-only callers.
+        // resource location so case/slash aliases share one decode) to capture
+        // EVERY appearance defined in that catalog for runtime sibling filling
+        // (`0x5a044d` → `0x5a38da` → `0x59f35f`), as well as confirming each
+        // indexed appearance in `suits` / `head_suits`.
+        let mut mesh_cache: BTreeMap<String, bool> = BTreeMap::new();
+        let mut indexed_suits: BTreeMap<String, std::result::Result<String, String>> =
+            BTreeMap::new();
+        let mut indexed_suit_catalogs: BTreeMap<String, IndexedSuitCatalog> = BTreeMap::new();
         let mut by_catalog: BTreeMap<String, (Resource, Vec<String>)> = BTreeMap::new();
-        for (name, (ndx_location, directory, catalog_bcf)) in indexed_suits {
+        for (name, (ndx_location, directory, catalog_bcf)) in indexed_suit_entries {
             match paths.files.lookup(&directory, &catalog_bcf) {
                 Ok(Some(resource)) => {
                     let location = resource.location(&install.root);
+                    indexed_suits.insert(name.clone(), Ok(location.clone()));
                     by_catalog
                         .entry(location)
                         .or_insert_with(|| (resource, Vec::new()))
                         .1
                         .push(name);
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    let catalog_name = decode(&catalog_bcf, 1);
+                    indexed_suits.insert(
+                        name.clone(),
+                        Err(format!(
+                            "0x5a38da: {ndx_location} points appearance {name:?} to \
+                             {directory}/{catalog_name}, which is missing"
+                        )),
+                    );
+                }
                 Err(error) => {
-                    suit_errors.insert(ndx_location, error.to_string());
+                    let reason = error.to_string();
+                    suit_errors.insert(ndx_location, reason.clone());
+                    indexed_suits.insert(name, Err(reason));
                 }
             }
         }
@@ -376,23 +423,44 @@ impl AvatarRegistry {
             let bytes = match resource.read() {
                 Ok(bytes) => bytes,
                 Err(error) => {
-                    suit_errors.insert(location, error.to_string());
+                    let reason = error.to_string();
+                    suit_errors.insert(location.clone(), reason.clone());
+                    indexed_suit_catalogs.insert(location, (BTreeMap::new(), Some(reason)));
                     continue;
                 }
             };
             let mut binary = Binary::new(&bytes);
             let (_, skeleton_error) = read_bcf_skeletons(&mut binary);
             if let Some(error) = skeleton_error {
-                suit_errors.insert(location, error.to_string());
+                let reason = error.to_string();
+                suit_errors.insert(location.clone(), reason.clone());
+                indexed_suit_catalogs.insert(location, (BTreeMap::new(), Some(reason)));
                 continue;
             }
             let mut catalog_suits = BTreeSet::new();
             let mut catalog_head_bindings: BTreeMap<String, Vec<String>> = BTreeMap::new();
-            if let Err(error) =
-                read_bcf_appearances(&mut binary, &mut catalog_suits, &mut catalog_head_bindings)
-            {
-                suit_errors.insert(location, error.to_string());
+            let app_error = match read_bcf_appearances(
+                &mut binary,
+                &mut catalog_suits,
+                &mut catalog_head_bindings,
+            ) {
+                Ok(()) => None,
+                Err(error) => {
+                    let reason = error.to_string();
+                    suit_errors.insert(location.clone(), reason.clone());
+                    Some(reason)
+                }
+            };
+            let mut catalog_heads = BTreeMap::new();
+            for suit_name in &catalog_suits {
+                let has_head = catalog_head_bindings.get(suit_name).is_some_and(|meshes| {
+                    meshes
+                        .iter()
+                        .any(|mesh| has_valid_mesh(&paths, mesh, &mut mesh_cache))
+                });
+                catalog_heads.insert(suit_name.clone(), has_head);
             }
+            indexed_suit_catalogs.insert(location, (catalog_heads, app_error));
             for name in names {
                 if catalog_suits.contains(&name)
                     && suits.insert(name.clone())
@@ -404,10 +472,9 @@ impl AvatarRegistry {
         }
 
         // 0x595629 -> 0x59e1b6 -> 0x59e32a: a "HEAD" binding attaches only
-        // when its mesh exists and decodes as `<mesh>.bmf` (0x59a932) or falls
-        // back to `<mesh>.skn` (0x59a629) in the avatar search paths.
+        // when its mesh exists and decodes as `<mesh>.bmf` (0x59a932), or
+        // `<mesh>.skn` (0x59a629) when no `.bmf` exists.
         let mut head_suits = BTreeSet::new();
-        let mut mesh_cache: BTreeMap<String, bool> = BTreeMap::new();
         for (suit_name, meshes) in head_bindings {
             if meshes
                 .iter()
@@ -423,6 +490,9 @@ impl AvatarRegistry {
             skeletons,
             first_skeleton_error,
             suits,
+            eager_suits,
+            indexed_suits,
+            indexed_suit_catalogs,
             head_suits,
             suit_errors,
         })
@@ -756,24 +826,49 @@ impl People {
                 );
             }
         }
-        let mut registry = AvatarRegistry::load(install)?;
-        let mut skeletons = BTreeMap::new();
-        for (&guid, name) in &names {
-            match registry.skeleton(name) {
-                Ok(skeleton) => {
-                    skeletons.insert(guid, skeleton);
-                }
-                Err(Error::Unsupported(reason)) => {
-                    unresolved.insert(guid, reason);
-                }
-                Err(error) => return Err(error),
-            }
-        }
+        // Export startup skeletons BEFORE per-GUID resolution so `.ndx`
+        // skeletons stay unloaded in `indexed_skeletons` / `indexed_catalogs`
+        // rather than leaking into `skeletons_by_name` or overwriting sibling
+        // `.ndx` entries in GUID order (`0x5a0384`, `0x59f18c`–`0x59f19f`).
+        let registry = AvatarRegistry::load(install)?;
         let ExportedSkeletons {
             loaded: skeletons_by_name,
             indexed: indexed_skeletons,
             catalogs: indexed_catalogs,
         } = registry.export_skeletons();
+        let mut skeletons = BTreeMap::new();
+        for (&guid, name) in &names {
+            if let Some(skeleton) = skeletons_by_name.get(name) {
+                skeletons.insert(guid, skeleton.clone());
+            } else if let Some(entry) = indexed_skeletons.get(name) {
+                match entry {
+                    Ok(loc) => {
+                        let (items, decode_error) = &indexed_catalogs[loc];
+                        if let Some(skeleton) = items.iter().find(|s| s.name == *name) {
+                            skeletons.insert(guid, skeleton.clone());
+                        } else {
+                            let reason = if let Some(error) = decode_error {
+                                format!("0x5a3810: the skeletons of {loc} do not decode ({error})")
+                            } else {
+                                format!("0x5a03c0: {loc} does not define skeleton {name:?}")
+                            };
+                            unresolved.insert(guid, reason);
+                        }
+                    }
+                    Err(reason) => {
+                        unresolved.insert(guid, reason.clone());
+                    }
+                }
+            } else {
+                let reason = match &registry.first_skeleton_error {
+                    Some((_, reason)) => {
+                        format!("0x5a0384: {reason}, so whether it defines {name:?} is unknown")
+                    }
+                    None => format!("0x5a03c0: no skeleton file defines the skeleton {name:?}"),
+                };
+                unresolved.insert(guid, reason);
+            }
+        }
         let mut portrait_head = BTreeMap::new();
         for (guid, suits) in default_suits {
             if suits.iter().any(|s| registry.head_suits.contains(s)) {
@@ -791,6 +886,9 @@ impl People {
                 skeleton_names: names,
                 profiles,
                 suits: registry.suits,
+                eager_suits: registry.eager_suits,
+                indexed_suits: registry.indexed_suits,
+                indexed_suit_catalogs: registry.indexed_suit_catalogs,
                 suit_errors: registry.suit_errors,
                 head_suits: registry.head_suits,
                 portrait_head,
@@ -969,9 +1067,11 @@ fn skin_tones(index: &Index, resource: &Resource) -> Result<Vec<String>> {
 /// A skeleton file's skeletons: each one's name, bone scales and bones.
 type DecodedSkeletons = Vec<(String, Vec<i32>, Vec<Bone>)>;
 
-/// Whether `mesh` exists and decodes as `<mesh>.bmf` (`0x59e36d` → `0x59a932`)
-/// or falls back to `<mesh>.skn` (`0x59e403` → `0x59a629`) across the avatar
-/// search paths (`0x59e10b`–`0x59e134`).
+/// Whether `mesh` exists and decodes as `<mesh>.bmf` (`0x59e36d` → `0x59a932`),
+/// or `<mesh>.skn` (`0x59e403` → `0x59a629`) ONLY when no `<mesh>.bmf` is found
+/// across the avatar search paths (`0x59e10b`–`0x59e134`). Once a `.bmf` file
+/// opens, a decode failure at `0x59e3be` returns null (`0x59e3e1`) without
+/// falling back to `.skn`.
 fn has_valid_mesh(paths: &AvatarPaths, mesh: &str, cache: &mut BTreeMap<String, bool>) -> bool {
     if mesh.is_empty() {
         return false;
@@ -983,16 +1083,18 @@ fn has_valid_mesh(paths: &AvatarPaths, mesh: &str, cache: &mut BTreeMap<String, 
     let base = encode_name(&key).unwrap_or_else(|| key.as_bytes().to_vec());
     let mut bmf_name = base.clone();
     bmf_name.extend_from_slice(b".bmf");
+    let mut found_bmf = false;
     let mut ok = false;
     for dir in paths.appearance.iter().chain(&paths.indexed) {
         if let Ok(Some(resource)) = paths.files.lookup(dir, &bmf_name) {
+            found_bmf = true;
             if resource.read().is_ok_and(|bytes| read_bmf(&bytes).is_ok()) {
                 ok = true;
             }
             break;
         }
     }
-    if !ok {
+    if !found_bmf {
         let mut skn_name = base;
         skn_name.extend_from_slice(b".skn");
         for dir in paths.appearance.iter().chain(&paths.indexed) {
@@ -1899,11 +2001,12 @@ xskin-b001-PELVIS-BODY\r\n\
         assert_eq!(people.portrait_head.get(&1), Some(&true));
         assert_eq!(people.portrait_head.get(&2), Some(&true));
 
-        // Duplicate appearance (first PELVIS wins) and missing mesh are excluded;
-        // corrupt BMF with valid SKN fallback and valid SKN are included.
+        // Duplicate appearance (first PELVIS wins), missing mesh, and corrupt
+        // BMF (0x59e3be -> 0x59e3e1 does NOT fall back to SKN) are excluded;
+        // valid SKN with no BMF is included.
         assert!(!people.head_suits.contains("dup_pelvis_first"));
         assert!(!people.head_suits.contains("missing_mesh_head"));
-        assert!(people.head_suits.contains("corrupt_bmf_fallback"));
+        assert!(!people.head_suits.contains("corrupt_bmf_fallback"));
         assert!(people.head_suits.contains("good_head"));
 
         // Indexed alpha and beta stay unloaded in indexed_skeletons / indexed_catalogs,

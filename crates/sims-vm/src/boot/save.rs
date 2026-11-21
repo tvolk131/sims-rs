@@ -68,6 +68,7 @@ pub struct Saved {
     made_portrait_head: BTreeMap<u32, Option<bool>>,
     ambiguous_portraits: BTreeSet<u32>,
     loaded_indexed_skeletons: BTreeMap<String, Option<String>>,
+    loaded_indexed_suits: BTreeMap<String, Option<bool>>,
     made_outfits: BTreeMap<u32, (Option<String>, Option<String>)>,
 }
 
@@ -152,6 +153,7 @@ impl Saved {
         saved.world.made_portrait_head = saved.made_portrait_head.clone();
         saved.world.ambiguous_portraits = saved.ambiguous_portraits.clone();
         saved.world.loaded_indexed_skeletons = saved.loaded_indexed_skeletons.clone();
+        saved.world.loaded_indexed_suits = saved.loaded_indexed_suits.clone();
         saved.world.made_outfits = saved.made_outfits.clone();
         Ok(saved)
     }
@@ -188,6 +190,7 @@ impl Lot {
             made_portrait_head: self.world.made_portrait_head.clone(),
             ambiguous_portraits: self.world.ambiguous_portraits.clone(),
             loaded_indexed_skeletons: self.world.loaded_indexed_skeletons.clone(),
+            loaded_indexed_suits: self.world.loaded_indexed_suits.clone(),
             made_outfits: self.world.made_outfits.clone(),
         })
     }
@@ -244,6 +247,9 @@ mod tests {
         world
             .loaded_indexed_skeletons
             .insert("beta".into(), Some("alpha.bcf".into()));
+        world
+            .loaded_indexed_suits
+            .insert("suit_b".into(), Some(true));
         world.made_outfits.insert(
             0x5555_6666,
             (
@@ -257,6 +263,7 @@ mod tests {
             made_portrait_head: world.made_portrait_head.clone(),
             ambiguous_portraits: world.ambiguous_portraits.clone(),
             loaded_indexed_skeletons: world.loaded_indexed_skeletons.clone(),
+            loaded_indexed_suits: world.loaded_indexed_suits.clone(),
             made_outfits: world.made_outfits.clone(),
             world,
             ticks: 1,
@@ -291,6 +298,10 @@ mod tests {
         assert_eq!(
             decoded.world().loaded_indexed_skeletons,
             BTreeMap::from([("beta".to_owned(), Some("alpha.bcf".to_owned()))])
+        );
+        assert_eq!(
+            decoded.world().loaded_indexed_suits,
+            BTreeMap::from([("suit_b".to_owned(), Some(true))])
         );
         assert_eq!(
             decoded.world().made_outfits,

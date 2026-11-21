@@ -229,13 +229,27 @@ pub(crate) fn skeleton<'p>(
 ) -> Result<&'p Skeleton, Trap> {
     let made = world.characters.made.get(&guid);
     let template = made.map_or(guid, |made| made.template);
-    if let Some(name) = made.and_then(|made| made.strings.get(&characters::SKELETON)) {
+    let requested_name = made
+        .and_then(|made| made.strings.get(&characters::SKELETON))
+        .or_else(|| people.skeleton_names.get(&template));
+    if let Some(name) = requested_name {
+        if people.skeletons_by_name.contains_key(name)
+            || world.loaded_indexed_skeletons.contains_key(name)
+            || people.indexed_skeletons.contains_key(name)
+        {
+            return lookup_loaded_skeleton_by_name(people, world, name).ok_or_else(|| {
+                Trap::Unsupported(format!(
+                    "no person type's skeleton is named {name:?}, which the person type \
+                     0x{guid:08X} names"
+                ))
+            });
+        }
         if let Some(skeleton) = people.skeletons.get(&template).filter(|s| s.name == *name) {
             return Ok(skeleton);
         }
         return lookup_loaded_skeleton_by_name(people, world, name).ok_or_else(|| {
             Trap::Unsupported(format!(
-                "no person type's skeleton is named {name:?}, which the made person type \
+                "no person type's skeleton is named {name:?}, which the person type \
                  0x{guid:08X} names"
             ))
         });
@@ -313,7 +327,11 @@ pub(crate) fn resolve_skeleton_by_name<'p>(
     if let Some(entry) = people.indexed_skeletons.get(name) {
         let loc = match entry {
             Ok(loc) => loc,
-            Err(reason) => return Err(Trap::Unsupported(reason.clone())),
+            Err(reason) => {
+                // 0x5a389b: mark failed so later catalog loads cannot overwrite it.
+                world.loaded_indexed_skeletons.insert(name.to_owned(), None);
+                return Err(Trap::Unsupported(reason.clone()));
+            }
         };
         let (items, decode_error) = people.indexed_catalogs.get(loc).ok_or_else(|| {
             Trap::Unsupported(format!(
@@ -371,16 +389,23 @@ pub(crate) fn resolve_skeleton<'p>(
 ) -> Result<&'p Skeleton, Trap> {
     let made = world.characters.made.get(&guid);
     let template = made.map_or(guid, |made| made.template);
-    if let Some(name) = early_name {
-        if let Some(skeleton) = people.skeletons.get(&template).filter(|s| s.name == name) {
-            return Ok(skeleton);
+    let requested_name = early_name
+        .map(str::to_owned)
+        .or_else(|| {
+            made.and_then(|made| made.strings.get(&characters::SKELETON))
+                .cloned()
+        })
+        .or_else(|| people.skeleton_names.get(&template).cloned());
+    if let Some(name) = requested_name {
+        // Check startup-loaded and runtime-ordered `.ndx` registries BEFORE
+        // `people.skeletons` so catalog types whose skeletons are `.ndx`-indexed
+        // honor exact runtime lookup order (`0x5a0384`, `0x59f18c`–`0x59f19f`).
+        if people.skeletons_by_name.contains_key(&name)
+            || world.loaded_indexed_skeletons.contains_key(&name)
+            || people.indexed_skeletons.contains_key(&name)
+        {
+            return resolve_skeleton_by_name(people, world, guid, &name);
         }
-        return resolve_skeleton_by_name(people, world, guid, name);
-    }
-    if let Some(name) = made
-        .and_then(|made| made.strings.get(&characters::SKELETON))
-        .cloned()
-    {
         if let Some(skeleton) = people.skeletons.get(&template).filter(|s| s.name == name) {
             return Ok(skeleton);
         }
@@ -391,6 +416,63 @@ pub(crate) fn resolve_skeleton<'p>(
             "no skeleton was supplied for the person type 0x{guid:08X}"
         ))
     })
+}
+
+/// Resolves whether lowercased appearance `suit` binds `"HEAD"` with a valid
+/// mesh (`0x5a044d` → `0x5a38da` → `0x59f35f`), executing lazy `.ndx`
+/// appearance catalog loads in runtime call order: loading a `.bcf` catalog
+/// fills every unloaded appearance in that catalog into
+/// `world.loaded_indexed_suits` without overwriting eager or already-attempted
+/// entries (`0x59f34c`), and marks a missed lazy entry failed (`None`) so later
+/// catalog loads cannot overwrite it.
+pub(crate) fn resolve_suit_head(people: &People, world: &mut World, suit: &str) -> Option<bool> {
+    if people.eager_suits.contains(suit) {
+        return Some(people.head_suits.contains(suit));
+    }
+    if let Some(&slot) = world.loaded_indexed_suits.get(suit) {
+        return Some(slot.unwrap_or(false));
+    }
+    if let Some(entry) = people.indexed_suits.get(suit) {
+        match entry {
+            Ok(loc) => {
+                if let Some((catalog_heads, decode_error)) = people.indexed_suit_catalogs.get(loc) {
+                    for (app_name, &has_head) in catalog_heads {
+                        if !people.eager_suits.contains(app_name)
+                            && !world.loaded_indexed_suits.contains_key(app_name)
+                        {
+                            world
+                                .loaded_indexed_suits
+                                .insert(app_name.clone(), Some(has_head));
+                        }
+                    }
+                    if let Some(&Some(has_head)) = world.loaded_indexed_suits.get(suit) {
+                        return Some(has_head);
+                    }
+                    if decode_error.is_some() {
+                        return None;
+                    }
+                    world.loaded_indexed_suits.insert(suit.to_owned(), None);
+                    return Some(false);
+                }
+                return None;
+            }
+            Err(_) => {
+                world.loaded_indexed_suits.insert(suit.to_owned(), None);
+                return if people.suit_errors.is_empty() {
+                    Some(false)
+                } else {
+                    None
+                };
+            }
+        }
+    }
+    if people.head_suits.contains(suit) {
+        Some(true)
+    } else if !people.suit_errors.is_empty() && !people.suits.contains(suit) {
+        None
+    } else {
+        Some(false)
+    }
 }
 
 /// Reads person `id`'s appearance again if its animator says it is to be

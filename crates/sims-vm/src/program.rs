@@ -206,8 +206,10 @@ pub struct Program {
     pub wardrobe: Option<sims_content::Wardrobe>,
     /// Native-ordered suit and texture lists (`0x409255`, `0x40895a`) for
     /// exact index selection in Make New Character (`0x44b151`, `0x44b167`,
-    /// `0x44b07e`). [`Program::link`] leaves it None for the caller to fill.
-    pub ordered_wardrobe: Option<sims_content::ImportWardrobe>,
+    /// `0x44b07e`), or the error that blocked loading them on a real install
+    /// (failing Make New Character loudly rather than falling back to sorted
+    /// `wardrobe`). [`Program::link`] leaves it None for synthetic fixtures.
+    pub ordered_wardrobe: Option<std::result::Result<sims_content::ImportWardrobe, String>>,
     /// The numbers of the `User%05d.iff` files in the neighborhood's
     /// `Characters` folder: the file numbers Make New Character's copy
     /// finds taken (0x4722b8), besides those of the types it makes.

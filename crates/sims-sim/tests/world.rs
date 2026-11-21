@@ -280,6 +280,7 @@ fn world() -> World {
         made_portrait_head: BTreeMap::new(),
         ambiguous_portraits: BTreeSet::new(),
         loaded_indexed_skeletons: BTreeMap::new(),
+        loaded_indexed_suits: BTreeMap::new(),
         made_outfits: BTreeMap::new(),
     }
 }

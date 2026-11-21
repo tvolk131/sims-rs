@@ -1401,50 +1401,64 @@ fn make_new_character_wardrobe_head_binding_drives_ui_effect_render_and_writebac
     let overlong_64_row = format!("{suit_64},HEAD-HEAD=c001falgt_alice01");
     let long_head_tex = format!("c001falgt_{}_aaa.bmp", "z".repeat(50));
     let long_head_row = format!("c001fa_alice,HEAD-HEAD=c001falgt_{}_bbb", "z".repeat(50));
-    for (body_row, head_row, with_wardrobe_err, expect_render) in [
+    // With `c000fa_nohead` at head index 0 (not in `head_suits`), a head miss
+    // falls back to index 0 (`0x40ab7f..0x40acbc`, non-HEAD -> false), while
+    // valid HEAD matches keep their matched HEAD suit (true). When `has_body`
+    // is false (`body_count == 0`), `0x40ac57` clears BOTH body and head to ""
+    // (false) even if `head_row` matched or an unrelated `.cmx` failed.
+    for (body_row, head_row, has_body, with_wardrobe_err, expect_render) in [
         (
             "b999fafit_npc,BODY=b999fafitlgt_npc",
             "c999fa_masseuse,HEAD-HEAD=c999falgt_masseuse",
+            true,
             false,
             false,
         ),
         (
             "b999fafit_npc,BODY=b999fafitlgt_npc",
             "c001fa_alice,HEAD-HEAD=C001FAlgt_Alice01",
+            true,
             false,
             true,
         ),
         (
             "b999fafit_npc,BODY=b999fafitlgt_npc",
             long_head_row.as_str(),
+            true,
             false,
             true,
         ),
         (
             "b999fafit_npc,BODY=b999fafitlgt_npc",
             long_suit_row.as_str(),
+            true,
             false,
             true,
         ),
         // Comma past byte 255 (0x587511..0x58752c caps row at 255 bytes):
-        // definite miss with or without a wardrobe catalog error.
-        (
-            "b999fafit_npc,BODY=b999fafitlgt_npc",
-            comma_past_255_row.as_str(),
-            false,
-            false,
-        ),
+        // misses -> falls back to non-HEAD index 0 (`c000fa_nohead`).
         (
             "b999fafit_npc,BODY=b999fafitlgt_npc",
             comma_past_255_row.as_str(),
             true,
             false,
+            false,
+        ),
+        // Comma past byte 255 with empty body textures + `.cmx` error:
+        // definite miss + `body_count == 0` -> `0x40ac57` clears both to "".
+        (
+            "b999fafit_npc,BODY=b999fafitlgt_npc",
+            comma_past_255_row.as_str(),
+            false,
+            true,
+            false,
         ),
         // Valid head descriptor whose texture is missing from wardrobe.textures
-        // with an unrelated .cmx error: definite miss at 0x40a502 without trap.
+        // with empty body textures + `.cmx` error: definite miss -> `0x40ac57`.
         (
             "NONE",
             "c001fa_alice,HEAD-HEAD=c001falgt_missing",
+            false,
             true,
             false,
         ),
@@ -1453,12 +1467,21 @@ fn make_new_character_wardrobe_head_binding_drives_ui_effect_render_and_writebac
         (
             "b999fafit_npc,BODY=b999fafitlgt_npc",
             overlong_64_row.as_str(),
+            true,
             false,
             false,
         ),
-        // Both rows "NONE" with an unread wardrobe catalog (wardrobe.errors
-        // non-empty): definite misses at 0x40d0f9 / 0x40d45d without trapping.
-        ("NONE", "NONE", true, false),
+        // Both rows "NONE" with empty body textures + `.cmx` error -> `0x40ac57`.
+        ("NONE", "NONE", false, true, false),
+        // Matched head row (`c001fa_alice`) + missed body row when
+        // `body_count == 0`: `0x40ac57` clears BOTH body and head to "".
+        (
+            "b999fafit_npc,BODY=b999fafitlgt_npc",
+            "c001fa_alice,HEAD-HEAD=C001FAlgt_Alice01",
+            false,
+            false,
+            false,
+        ),
     ] {
         let (mut fx, _, _) = visitors();
         fx.world.rooms.rooms.get_mut(&1).unwrap().occupied = true;
@@ -1504,20 +1527,25 @@ fn make_new_character_wardrobe_head_binding_drives_ui_effect_render_and_writebac
         if with_wardrobe_err {
             errors.insert("bad.cmx".to_string(), "corrupt".to_string());
         }
+        let mut textures: std::collections::BTreeSet<String> = [
+            "c000falgt_nohead.bmp".to_string(),
+            "c001falgt_alice01.bmp".to_string(),
+            long_head_tex.clone(),
+        ]
+        .into();
+        if has_body {
+            textures.insert("b001fafitlgt_01.bmp".to_string());
+        }
         fx.program.wardrobe = Some(Wardrobe {
             suits: [
                 "b001fafit_01".to_string(),
+                "c000fa_nohead".to_string(),
                 "c001fa_alice".to_string(),
                 suit_63.clone(),
                 suit_64.clone(),
             ]
             .into(),
-            textures: [
-                "b001fafitlgt_01.bmp".to_string(),
-                "c001falgt_alice01.bmp".to_string(),
-                long_head_tex.clone(),
-            ]
-            .into(),
+            textures,
             errors,
         });
         fx.add(
@@ -2312,4 +2340,521 @@ fn live_appearance_and_runtime_indexed_skeleton_load_order() {
         fx_b.world.loaded_indexed_skeletons.get("beta"),
         Some(&Some("beta.bcf".to_owned()))
     );
+}
+
+#[test]
+fn person_data_invalidation_catalog_dialog_indexed_suits_live_outfits_and_ordered_wardrobe() {
+    use sims_content::{Profile, Skeleton};
+    const MY_PERSON_DATA: u8 = 18;
+    const TEMPLATE_PERSON: u32 = 0x7fd9_6b54;
+
+    // 1. P1: Writing My Person Data words 68, 74, or 84 (0x4538fd..0x4539c7 ->
+    // 0x45810c -> 0x4eb0eb) clears the running object's cached portrait and
+    // marks it dirty so Dialog/UI Effect rebuilds BEFORE checking BMP_ 2002.
+    for word_idx in [68i16, 74, 84] {
+        let (mut fx, _, _) = visitors();
+        fx.world.portraits.insert(SIM_GUID);
+        fx.add(
+            SIM_FILE,
+            4098,
+            tree(vec![assign(
+                MY_PERSON_DATA,
+                word_idx,
+                scope::LITERAL,
+                1,
+                RETURN_TRUE,
+            )]),
+        );
+        assert_eq!(fx.run_with(SIM, 4098, 0, &[], 100), Ok(true));
+        assert!(!fx.world.portraits.contains(&SIM_GUID));
+        assert!(fx.world.dirty_portraits.contains(&SIM_GUID));
+    }
+
+    // 2. P2 #1: Catalog types whose skeletons are `.ndx`-indexed honor runtime
+    // call order (even when `people.skeletons` holds per-GUID snapshots), and a
+    // failed indexed skeleton lookup records `None` (`0x5a389b`) so a later
+    // sibling catalog load cannot overwrite it.
+    let mk_skel = |name: &str, file: &str, place: usize, scales: Vec<Vec<i32>>| Skeleton {
+        name: name.to_owned(),
+        file: file.to_owned(),
+        place,
+        scales,
+        bones: Vec::new(),
+    };
+    let setup_catalog_indexed = || {
+        let (mut fx, _, _) = visitors();
+        for (guid, skel_name, rec_id) in [
+            (0x7777_0001u32, "alpha", 41i16),
+            (0x7777_0002u32, "beta", 42i16),
+            (0x7777_0003u32, "missing_first", 43i16),
+        ] {
+            let f = fx.add_type(guid, 2, 4096, 4097);
+            fx.add(
+                f,
+                4096,
+                tree(vec![assign(
+                    scope::MY_DATA,
+                    4,
+                    scope::LITERAL,
+                    1,
+                    RETURN_TRUE,
+                )]),
+            );
+            fx.add(
+                f,
+                4097,
+                tree(vec![
+                    assign(scope::PARAMETERS, 0, scope::LITERAL, 10, 1),
+                    ins(0, 0, 0, [0; 8]),
+                ]),
+            );
+            fx.program
+                .people
+                .skeleton_names
+                .insert(guid, skel_name.to_owned());
+            fx.program.people.profiles.insert(guid, Profile::default());
+            fx.world.neighbors.slots.push(Some(Neighbor {
+                guid,
+                id: rec_id,
+                data: vec![12; 88],
+                relationships: Vec::new(),
+                friends: 0,
+                revision: 1,
+                stale: false,
+            }));
+        }
+        // Populate per-GUID `people.skeletons` as `People::load_each` does,
+        // while keeping `.ndx` entries unloaded in `indexed_skeletons`.
+        fx.program.people.skeletons.insert(
+            0x7777_0001,
+            mk_skel("alpha", "alpha.bcf", 0, vec![vec![2], vec![3]]),
+        );
+        fx.program
+            .people
+            .skeletons
+            .insert(0x7777_0002, mk_skel("beta", "beta.bcf", 0, vec![vec![4]]));
+        fx.program
+            .people
+            .indexed_skeletons
+            .insert("alpha".into(), Ok("alpha.bcf".into()));
+        fx.program
+            .people
+            .indexed_skeletons
+            .insert("beta".into(), Ok("beta.bcf".into()));
+        fx.program.people.indexed_skeletons.insert(
+            "missing_first".into(),
+            Err("0x5a3810: missing_first.bcf is missing".into()),
+        );
+        fx.program.people.indexed_catalogs.insert(
+            "alpha.bcf".into(),
+            (
+                vec![
+                    mk_skel("alpha", "alpha.bcf", 0, vec![vec![2], vec![3], vec![5]]),
+                    mk_skel("beta", "alpha.bcf", 1, vec![vec![2], vec![3], vec![5]]),
+                    mk_skel(
+                        "missing_first",
+                        "alpha.bcf",
+                        2,
+                        vec![vec![2], vec![3], vec![5]],
+                    ),
+                ],
+                None,
+            ),
+        );
+        fx.program.people.indexed_catalogs.insert(
+            "beta.bcf".into(),
+            (vec![mk_skel("beta", "beta.bcf", 0, vec![vec![4]])], None),
+        );
+        fx
+    };
+    let mut fx_cat = setup_catalog_indexed();
+    let interp = sims_vm::Interpreter::new(&fx_cat.program, &fx_cat.catalog, fx_cat.stream);
+    // Querying `missing_first` fails and records `None` (`0x5a389b`).
+    assert!(
+        interp
+            .create_person(&mut fx_cat.world, 0x7777_0003)
+            .is_err()
+    );
+    assert_eq!(
+        fx_cat.world.loaded_indexed_skeletons.get("missing_first"),
+        Some(&None)
+    );
+    // Creating `alpha` fills `beta` from `alpha.bcf` (NOT `beta.bcf`!) and
+    // leaves `missing_first` as `None`.
+    interp
+        .create_person(&mut fx_cat.world, 0x7777_0001)
+        .unwrap();
+    interp
+        .create_person(&mut fx_cat.world, 0x7777_0002)
+        .unwrap();
+    assert!(!fx_cat.world.skeleton_files.contains("beta.bcf"));
+    assert_eq!(
+        fx_cat.world.loaded_indexed_skeletons.get("beta"),
+        Some(&Some("alpha.bcf".to_owned()))
+    );
+    assert_eq!(
+        fx_cat.world.loaded_indexed_skeletons.get("missing_first"),
+        Some(&None)
+    );
+    assert!(
+        interp
+            .create_person(&mut fx_cat.world, 0x7777_0003)
+            .is_err()
+    );
+
+    // 3. P2 #2: Catalog Dialog without BMP_ 2002 skips read-only off-lot Sim,
+    // does NOT cache failed HEAD render, writes BMP_ 2002 on clean render, and
+    // honors save flag 0 when dirty.
+    {
+        let (mut fx, file, record) = visitors();
+        fx.program.libraries.get_mut(&file).unwrap().read_only = true;
+        let before_rng = fx.world.crt_rng.state();
+        fx.add(
+            LAMP_FILE,
+            4098,
+            tree(vec![
+                assign(scope::STACK_OBJECT, 0, scope::LITERAL, record, 1),
+                ins(36, RETURN_TRUE, RETURN_FALSE, [0, 0, 0, 0, 0, 0, 0, 5]),
+            ]),
+        );
+        assert_eq!(fx.run_with(LAMP, 4098, 0, &[], 100), Ok(true));
+        assert_eq!(fx.world.crt_rng.state(), before_rng);
+        assert!(!fx.world.portraits.contains(&WIDGET));
+    }
+    {
+        let (mut fx, file, record) = visitors();
+        fx.world.rooms.rooms.get_mut(&1).unwrap().occupied = true;
+        fx.program.people.portrait_head.insert(WIDGET, false);
+        fx.add(
+            LAMP_FILE,
+            4098,
+            tree(vec![
+                assign(scope::STACK_OBJECT, 0, scope::LITERAL, record, 1),
+                ins(36, RETURN_TRUE, RETURN_FALSE, [0, 0, 0, 0, 0, 0, 0, 5]),
+            ]),
+        );
+        assert_eq!(fx.run_with(LAMP, 4098, 0, &[], 100), Ok(true));
+        assert!(
+            !fx.world.portraits.contains(&WIDGET),
+            "catalog Dialog must not cache portrait when HEAD binding is absent"
+        );
+        assert!(
+            !fx.world
+                .generated_portrait_2002
+                .contains(&PortraitFile::Resource(file))
+        );
+        // With HEAD binding and dirty flag set: 0x4e92f2 caches portrait with
+        // save flag 0 (no BMP_ 2002 writeback).
+        fx.program.people.portrait_head.insert(WIDGET, true);
+        fx.world.dirty_portraits.insert(WIDGET);
+        assert_eq!(fx.run_with(LAMP, 4098, 0, &[], 100), Ok(true));
+        assert!(fx.world.portraits.contains(&WIDGET));
+        assert!(!fx.world.dirty_portraits.contains(&WIDGET));
+        assert!(
+            !fx.world
+                .generated_portrait_2002
+                .contains(&PortraitFile::Resource(file)),
+            "dirty catalog Dialog rebuild uses save flag 0 (0x4e92f2)"
+        );
+        // Clean uncached catalog Dialog writes BMP_ 2002 via 0x4e938c.
+        fx.world.portraits.remove(&WIDGET);
+        assert_eq!(fx.run_with(LAMP, 4098, 0, &[], 100), Ok(true));
+        assert!(fx.world.portraits.contains(&WIDGET));
+        assert!(
+            fx.world
+                .generated_portrait_2002
+                .contains(&PortraitFile::Resource(file)),
+            "clean catalog Dialog fallback must persist BMP_ 2002 (0x4e938c)"
+        );
+    }
+
+    // 4. P2 #4: Indexed `.ndx` appearance catalog sibling filling (`0x5a044d`
+    // -> `0x5a38da` -> `0x59f35f`): loading `a_suit` first fills `b_suit` from
+    // `a.bcf` (with HEAD = true), whereas loading `b_suit` first loads `b.bcf`
+    // (with HEAD = false).
+    let setup_indexed_suits = || {
+        let (mut fx, _, record) = visitors();
+        fx.words(SIM_FILE)[102] = 0;
+        fx.world.neighbors.slots.push(Some(Neighbor {
+            guid: SIM_GUID,
+            id: 2,
+            data: vec![0; 88],
+            relationships: Vec::new(),
+            friends: 0,
+            revision: 0,
+            stale: false,
+        }));
+        let sim_record = fx.world.neighbors.slots.len() as i16;
+        fx.world.rooms.rooms.get_mut(&1).unwrap().occupied = true;
+        fx.program.people.portrait_head.remove(&WIDGET);
+        fx.program.people.portrait_head.remove(&SIM_GUID);
+        fx.program.people.profiles.insert(
+            SIM_GUID,
+            Profile {
+                body: Some("a_suit,BODY=a".into()),
+                head: None,
+                ..Default::default()
+            },
+        );
+        fx.program.people.profiles.insert(
+            WIDGET,
+            Profile {
+                body: Some("b_suit,BODY=b".into()),
+                head: None,
+                ..Default::default()
+            },
+        );
+        fx.program
+            .people
+            .indexed_suits
+            .insert("a_suit".into(), Ok("a.bcf".into()));
+        fx.program
+            .people
+            .indexed_suits
+            .insert("b_suit".into(), Ok("b.bcf".into()));
+        fx.program.people.indexed_suit_catalogs.insert(
+            "a.bcf".into(),
+            (
+                BTreeMap::from([("a_suit".into(), true), ("b_suit".into(), true)]),
+                None,
+            ),
+        );
+        fx.program.people.indexed_suit_catalogs.insert(
+            "b.bcf".into(),
+            (BTreeMap::from([("b_suit".into(), false)]), None),
+        );
+        (fx, sim_record, record)
+    };
+    {
+        let (mut fx, sim_record, record) = setup_indexed_suits();
+        // Render SIM (a_suit) first -> fills b_suit = true from a.bcf!
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
+            Ok(true)
+        );
+        assert!(fx.world.portraits.contains(&SIM_GUID));
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
+            Ok(true)
+        );
+        assert!(
+            fx.world.portraits.contains(&WIDGET),
+            "a.bcf must fill sibling b_suit with HEAD=true when a_suit loads first"
+        );
+    }
+    {
+        let (mut fx, _, record) = setup_indexed_suits();
+        // Render WIDGET (b_suit) first -> loads b.bcf (HEAD=false)!
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
+            Ok(true)
+        );
+        assert!(
+            !fx.world.portraits.contains(&WIDGET),
+            "b.bcf must supply HEAD=false when b_suit loads before a_suit"
+        );
+    }
+
+    // 5. P2 #5: Live outfit resolution — formalwear checks STR# 200 row 13 age
+    // (`0x58a6ff`, not `person.data[58]`), pets mutate `person.data[8] = 0`
+    // (`0x58a2e5`), and out-of-range suits (-1, 61) dress everyday outfit 0.
+    {
+        let (mut fx, _, _) = visitors();
+        fx.words(SIM_FILE)[102] = 0;
+        fx.world.neighbors.slots.push(Some(Neighbor {
+            guid: SIM_GUID,
+            id: 2,
+            data: vec![0; 88],
+            relationships: Vec::new(),
+            friends: 0,
+            revision: 0,
+            stale: false,
+        }));
+        let sim_record = fx.world.neighbors.slots.len() as i16;
+        fx.program
+            .people
+            .head_suits
+            .insert("adult_formal_head".into());
+        fx.program.people.profiles.insert(
+            SIM_GUID,
+            Profile {
+                body: Some("plain_body,BODY=b".into()),
+                head: None,
+                // Body string age = 27 (adult), while live `person.data[58]` = 9!
+                age: Some("27".into()),
+                suit_rows: BTreeMap::from([
+                    (27, "child_formal_nohead,BODY=c".into()),
+                    (30, "adult_formal_head,BODY=a".into()),
+                ]),
+                ..Default::default()
+            },
+        );
+        let person = fx
+            .world
+            .objects
+            .get_mut(&SIM)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap();
+        person.data[65] = 0; // adult human
+        person.data[58] = 9;
+        person.data[8] = 4; // formalwear
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
+            Ok(true)
+        );
+        assert!(
+            fx.world.portraits.contains(&SIM_GUID),
+            "formalwear must check STR# 200 row 13 age (27 -> row 30), not person.data[58]"
+        );
+
+        // Out-of-range suits (-1 and 61) fall back to everyday outfit 0 without trapping.
+        fx.program.people.head_suits.insert("plain_body".into());
+        for bad_suit in [-1i16, 61] {
+            fx.world.portraits.remove(&SIM_GUID);
+            fx.world.generated_portrait_2002.clear();
+            fx.world
+                .objects
+                .get_mut(&SIM)
+                .unwrap()
+                .person
+                .as_mut()
+                .unwrap()
+                .data[8] = bad_suit;
+            assert_eq!(
+                run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
+                Ok(true)
+            );
+            assert!(fx.world.portraits.contains(&SIM_GUID));
+        }
+
+        // Pet (gender word & 6 != 0, def_flags & 8 == 0) resets live `person.data[8] = 0`.
+        fx.world.portraits.remove(&SIM_GUID);
+        fx.world.generated_portrait_2002.clear();
+        let person = fx
+            .world
+            .objects
+            .get_mut(&SIM)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap();
+        person.data[65] = 2; // dogmale
+        person.data[8] = 4;
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
+            Ok(true)
+        );
+        assert_eq!(
+            fx.world.objects[&SIM].person.as_ref().unwrap().data[8],
+            0,
+            "0x58a2e5 must mutate live pet person.data[8] to 0"
+        );
+    }
+
+    // 6. P2 #6 + P2 #7 + P3: `program.ordered_wardrobe` (`Some(Ok(...))` uses
+    // exact native order, ignores legacy `wardrobe.errors`, caps complete
+    // `BODY=<tex>` / `HEAD-HEAD=<tex>` at 63 bytes, and runs negative-age
+    // index-0 fallback; `Some(Err(...))` fails loudly instead of falling back).
+    {
+        let (mut fx, _, _) = visitors();
+        fx.world.rooms.rooms.get_mut(&1).unwrap().occupied = true;
+        let tpl_file = fx.add_type(TEMPLATE_PERSON, 2, 4096, 4097);
+        fx.add(
+            tpl_file,
+            4096,
+            tree(vec![
+                assign(scope::MY_DATA, 4, scope::LITERAL, 1, 1),
+                assign(scope::MY_DATA, 42, scope::LITERAL, 2, RETURN_TRUE),
+            ]),
+        );
+        fx.add(
+            tpl_file,
+            4097,
+            tree(vec![
+                assign(scope::PARAMETERS, 0, scope::LITERAL, 10, 1),
+                ins(0, 0, 0, [0; 8]),
+            ]),
+        );
+        equip(&mut fx, TEMPLATE_PERSON, "adult", 12);
+        fx.program.people.profiles.insert(
+            SIM_GUID,
+            Profile {
+                body: Some("b999fafit_miss,BODY=b999fafitlgt_miss".into()),
+                head: Some("c999fa_miss,HEAD-HEAD=c999falgt_miss".into()),
+                gender: Some("female".into()),
+                age: Some("27".into()),
+                skin: Some("lgt".into()),
+                ..Default::default()
+            },
+        );
+        // `Some(Err(...))` must fail loudly even when legacy `wardrobe` is valid.
+        fx.program.wardrobe = Some(Wardrobe {
+            suits: ["b001fafit_01".into(), "c001fa_01".into()].into(),
+            textures: ["b001fafitlgt_01.bmp".into(), "c001falgt_01.bmp".into()].into(),
+            errors: BTreeMap::new(),
+        });
+        fx.program.ordered_wardrobe = Some(Err("simulated ordered wardrobe failure".into()));
+        fx.add(
+            SIM_FILE,
+            4098,
+            tree(vec![
+                assign(scope::LOCALS, 0, scope::LITERAL, 0, 1),
+                assign(scope::LOCALS, 1, scope::LITERAL, -1, 2),
+                assign(scope::LOCALS, 2, scope::LITERAL, 0, 3),
+                ins(19, 4, RETURN_FALSE, [0, 1, 2, 0, 0, 0, 0, 0]),
+                assign(scope::GLOBAL, 36, scope::STACK_OBJECT, 0, RETURN_TRUE),
+            ]),
+        );
+        assert!(fx.run_with(SIM, 4098, 0, &[], 1000).is_err());
+
+        // `Some(Ok(ordered))` succeeds even when legacy `wardrobe.errors` is
+        // non-empty, caps the complete descriptor at 63 chars, and falls back
+        // to index 0 (`c002fa_first`) on negative-age miss!
+        let long_stem = format!("b001fafitlgt_{}", "q".repeat(60));
+        let ordered = sims_content::ImportWardrobe::from_ordered_names(
+            vec![
+                b"b001fafit_01".to_vec(),
+                b"c002fa_first".to_vec(),
+                b"c001fa_second".to_vec(),
+            ],
+            vec![
+                long_stem.into_bytes(),
+                b"c002falgt_first".to_vec(),
+                b"c001falgt_second".to_vec(),
+            ],
+        );
+        let (_, picked_body_row) = ordered.pick(false, true, false, "lgt", 0).unwrap();
+        let (_, picked_desc) = picked_body_row.split_once(',').unwrap();
+        assert_eq!(picked_desc.chars().count(), 63);
+        assert!(picked_desc.starts_with("BODY="));
+
+        fx.program
+            .wardrobe
+            .as_mut()
+            .unwrap()
+            .errors
+            .insert("legacy.cmx".into(), "ignored".into());
+        fx.program.ordered_wardrobe = Some(Ok(ordered));
+        fx.program.people.head_suits.insert("c002fa_first".into());
+        assert_eq!(fx.run_with(SIM, 4098, 0, &[], 1000), Ok(true));
+        let copy_record = fx.world.globals[36];
+        let copy_guid = fx.world.neighbors.get(copy_record).unwrap().guid;
+        assert_eq!(
+            fx.world.made_outfits.get(&copy_guid),
+            Some(&(
+                Some(picked_body_row),
+                Some("c002fa_first,HEAD-HEAD=c002falgt_first".to_owned()),
+            ))
+        );
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, copy_record, 1),
+            Ok(true)
+        );
+        assert!(
+            fx.world.portraits.contains(&copy_guid),
+            "negative-age miss must fall back to index 0 (`c002fa_first`) when both lists are non-empty"
+        );
+    }
 }

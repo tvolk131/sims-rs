@@ -248,6 +248,14 @@ pub struct World {
     /// preserve snapshot format 31; `sims_vm::boot::save::Saved` preserves it.
     #[serde(skip)]
     pub loaded_indexed_skeletons: BTreeMap<String, Option<String>>,
+    /// Lazy `.ndx`-indexed appearances populated at runtime (`0x5a044d` →
+    /// `0x5a38da` → `0x59f35f`): maps lowercased appearance name to
+    /// `Some(has_head)` when loaded directly or filled as a sibling by another
+    /// catalog's load, or `None` when a lazy lookup failed so later catalog
+    /// loads cannot overwrite it. Kept out of [`World::encode`] to preserve
+    /// snapshot format 31; `sims_vm::boot::save::Saved` preserves it.
+    #[serde(skip)]
+    pub loaded_indexed_suits: BTreeMap<String, Option<bool>>,
     /// The exact `(body_row, head_row)` strings chosen by `Make New Character`
     /// (`0x40d183`, `0x40d4e7`, `0x40a5e2`) for runtime-made characters, kept
     /// out of [`World::characters`] / [`World::encode`] to preserve snapshot
@@ -630,6 +638,7 @@ impl World {
             made_portrait_head: BTreeMap::new(),
             ambiguous_portraits: BTreeSet::new(),
             loaded_indexed_skeletons: BTreeMap::new(),
+            loaded_indexed_suits: BTreeMap::new(),
             made_outfits: BTreeMap::new(),
         }
     }

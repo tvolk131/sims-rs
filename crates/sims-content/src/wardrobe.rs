@@ -216,6 +216,25 @@ impl Wardrobe {
             .collect()
     }
 
+    /// Whether `self.textures` contains any texture that could pair with a
+    /// matching human suit for `(head, female, child, skin)`.
+    pub fn has_any_texture(&self, head: bool, female: bool, child: bool, skin: &str) -> bool {
+        let (first, length) = if head { ('c', 6) } else { ('b', 9) };
+        let sex = if female { 'f' } else { 'm' };
+        let age = if child { 'c' } else { 'a' };
+        let skin = skin.to_ascii_lowercase();
+        let skin_len = skin.chars().count();
+        self.textures.iter().any(|tex| {
+            let chars: Vec<char> = tex.chars().take(length + skin_len).collect();
+            chars.len() == length + skin_len
+                && chars[0] == first
+                && (chars[4] == sex || chars[4] == 'u')
+                && chars[5] == age
+                && !(head && chars[1] == 't')
+                && chars[length..].iter().collect::<String>() == skin
+        })
+    }
+
     /// Picks the `index`-th human body (`head == false`) or head (`head == true`)
     /// entry matching [`Wardrobe::count`], returning
     /// `(suit_name_63, formatted_row)`.
@@ -255,8 +274,10 @@ impl Wardrobe {
                             .strip_suffix(".bmp")
                             .or_else(|| tex.strip_suffix(".tga"))
                             .unwrap_or(tex);
-                        let stem_63: String = stem.chars().take(63).collect();
-                        let row = format!("{suit_63},{tag}={stem_63}");
+                        // 0x409843/0x409851/0x472f41 caps the complete
+                        // `BODY=<tex>` / `HEAD-HEAD=<tex>` descriptor at 63 bytes.
+                        let desc_63: String = format!("{tag}={stem}").chars().take(63).collect();
+                        let row = format!("{suit_63},{desc_63}");
                         return Some((suit_63, row));
                     }
                     index -= 1;
@@ -288,8 +309,8 @@ impl Wardrobe {
                             .strip_suffix(".bmp")
                             .or_else(|| tex.strip_suffix(".tga"))
                             .unwrap_or(tex);
-                        let stem_63: String = stem.chars().take(63).collect();
-                        let row = format!("{suit_63},BODY={stem_63}");
+                        let desc_63: String = format!("BODY={stem}").chars().take(63).collect();
+                        let row = format!("{suit_63},{desc_63}");
                         return Some((suit_63, row));
                     }
                     index -= 1;

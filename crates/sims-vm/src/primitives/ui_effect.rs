@@ -86,6 +86,339 @@ const GLOBAL_34: i16 = 34;
 const TYPE: usize = 9;
 const PERSON_TYPE: i16 = 2;
 
+/// Extracts the lowercased suit name from a `STR# 200` outfit row
+/// (`"suit,..."`), returning `None` for empty rows or `"none"`.
+fn extract_suit_name(raw: &str) -> Option<String> {
+    let suit = raw
+        .split(';')
+        .next()
+        .unwrap_or(raw)
+        .split(',')
+        .next()
+        .unwrap_or(raw)
+        .to_ascii_lowercase();
+    (!suit.is_empty() && suit != "none").then_some(suit)
+}
+
+/// Classifies one `STR# 200` outfit row string through
+/// [`crate::people::resolve_suit_head`] (`0x5a044d` → `0x5a38da` → `0x59f35f`),
+/// honoring runtime `.ndx` appearance catalog load order.
+fn classify_portrait_row(
+    program: &crate::Program,
+    world: &mut sims_sim::World,
+    raw: Option<&str>,
+) -> Option<bool> {
+    let Some(suit) = raw.and_then(extract_suit_name) else {
+        return Some(false);
+    };
+    crate::people::resolve_suit_head(&program.people, world, &suit)
+}
+
+/// Parses a `STR# 200` age string with C `atoi` semantics (`0x58a6ff`):
+/// leading ASCII whitespace, optional `+`/`-`, and decimal digits. Missing
+/// or non-numeric strings evaluate to `0`.
+fn atoi_age(text: &str) -> i32 {
+    let text = text.trim_start_matches([' ', '\t', '\n', '\r', '\x0b', '\x0c']);
+    let (neg, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let mut value = 0i64;
+    for b in digits.bytes().take_while(u8::is_ascii_digit) {
+        value = value.saturating_mul(10).saturating_add(i64::from(b - b'0'));
+    }
+    let signed = if neg { -value } else { value };
+    signed.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
+/// Fallback GUID-level `"HEAD"` binding status for synthetic fixtures that
+/// populate `People::portrait_head` or `World::made_portrait_head` without
+/// `Profile::{body, head}`.
+fn portrait_head_status_in(
+    program: &crate::Program,
+    world: &sims_sim::World,
+    guid: u32,
+) -> Option<bool> {
+    if let Some(made) = world.characters.made.get(&guid) {
+        let mut has_suit_override = false;
+        for row in [1usize, 2] {
+            if let Some(raw) = made.strings.get(&row) {
+                has_suit_override = true;
+                if extract_suit_name(raw)
+                    .is_some_and(|suit| program.people.head_suits.contains(&suit))
+                {
+                    return Some(true);
+                }
+            }
+        }
+        if has_suit_override {
+            return Some(false);
+        }
+        if let Some(&status) = world.made_portrait_head.get(&guid) {
+            return status;
+        }
+        if let Some(&has_head) = program.people.portrait_head.get(&guid) {
+            return Some(has_head);
+        }
+        return Some(
+            program
+                .people
+                .portrait_head
+                .get(&made.template)
+                .copied()
+                .unwrap_or(false),
+        );
+    }
+    Some(
+        program
+            .people
+            .portrait_head
+            .get(&guid)
+            .copied()
+            .unwrap_or(false),
+    )
+}
+
+/// Whether the renderer (`0x4e725f` → `0x4e7801` → `0x58a178` → `0x4e7817`
+/// → `0x4e810d` → `0x4e81a4` → `0x431726` → `0x4e7824`) finds a
+/// case-sensitive `"HEAD"` binding on the specific Sim `person_id` in `world`,
+/// accounting for skeleton `"HEAD"` bone (`0x595674`), live accessories, live
+/// changed outfits (`words[102] & 8`, pet `data[8] = 0` mutation at `0x58a2e5`,
+/// formalwear `STR# 200` row 13 age at `0x58a6ff`, out-of-range suit fallback
+/// to `0` at `0x58a69d` → `0x58d475`), runtime `.ndx` appearance catalog load
+/// order (`0x5a044d` → `0x5a38da` → `0x59f35f`), and runtime-made overrides.
+pub(crate) fn can_render_person_portrait(
+    catalog: &sims_content::Catalog,
+    program: &crate::Program,
+    world: &mut sims_sim::World,
+    person_id: u16,
+    guid: u32,
+    defer_unknown_head: bool,
+) -> Result<Option<bool>, Trap> {
+    // 0x595674..0x595699: a "HEAD" binding attaches only when the Sim's
+    // skeleton defines a bone named "HEAD". Synthetic fixtures that leave
+    // `bones` empty skip this check.
+    if let Ok(skel) = crate::people::skeleton(&program.people, world, guid)
+        && !skel.bones.is_empty()
+        && !skel.bones.iter().any(|b| b.name == "HEAD")
+    {
+        return Ok(Some(false));
+    }
+
+    let (accessories, gender_word, raw_suit) = world
+        .objects
+        .get(&person_id)
+        .and_then(|object| object.person.as_ref())
+        .map(|p| {
+            (
+                p.accessories
+                    .iter()
+                    .filter(|a| !a.name.is_empty())
+                    .map(|a| a.name.clone())
+                    .collect::<Vec<_>>(),
+                p.data.get(65).copied().unwrap_or(0),
+                p.data.get(8).copied().unwrap_or(0),
+            )
+        })
+        .unwrap_or_default();
+
+    // Attached accessories (`person.accessories`, opcode 6) are dressed on
+    // the skeleton and scanned by `0x4e810d` alongside body/head suits.
+    let mut accessory_has_head = false;
+    for acc in accessories {
+        if crate::people::resolve_suit_head(&program.people, world, &acc) == Some(true) {
+            accessory_has_head = true;
+        }
+    }
+
+    let template = world.characters.definition(guid);
+    let profile = program.people.profiles.get(&template);
+    let made = world.characters.made.get(&guid);
+    let made_outfit = world.made_outfits.get(&guid);
+    let body_row: Option<String> = made
+        .and_then(|m| m.strings.get(&1).cloned())
+        .or_else(|| made_outfit.and_then(|o| o.0.clone()))
+        .or_else(|| profile.and_then(|p| p.body.clone()));
+    let head_row: Option<String> = made
+        .and_then(|m| m.strings.get(&2).cloned())
+        .or_else(|| made_outfit.and_then(|o| o.1.clone()))
+        .or_else(|| profile.and_then(|p| p.head.clone()));
+    // 0x58a6ff..0x58a718: formalwear checks `atoi(STR# 200 row 13) <= 17`,
+    // NOT `person.data[58]`. Missing/empty string parses as 0 (child).
+    let is_child = {
+        let age_str = made
+            .and_then(|m| {
+                m.strings
+                    .get(&sims_sim::characters::AGE)
+                    .map(String::as_str)
+            })
+            .or_else(|| profile.and_then(|p| p.age.as_deref()))
+            .unwrap_or("");
+        atoi_age(age_str) <= 17
+    };
+
+    let def_flags = crate::interpreter::object_definition(catalog, world, guid)
+        .and_then(|def| program.definition(def.resource, def.chunk))
+        .map(|w| w[102])
+        .unwrap_or(0);
+    let suit_row = |idx: usize| -> Option<String> {
+        profile
+            .and_then(|p| p.suit_rows.get(&idx))
+            .filter(|s| !s.is_empty())
+            .cloned()
+    };
+
+    // 0x58a1e4 vs 0x58a2d6..0x58a2e5: pets ((def_flags & 8) == 0 &&
+    // (data[65] & 6) != 0) unconditionally reset live `person.data[8] = 0`
+    // BEFORE dressing everyday outfit 0 (even when accessories bind HEAD).
+    let is_npc_suit = (def_flags & 8) != 0 && raw_suit > 0;
+    let suit = if !is_npc_suit && (gender_word & 6) != 0 {
+        if let Some(slot) = world
+            .objects
+            .get_mut(&person_id)
+            .and_then(|object| object.person.as_mut())
+            .and_then(|person| person.data.get_mut(8))
+        {
+            *slot = 0;
+        }
+        0
+    } else {
+        raw_suit
+    };
+
+    if accessory_has_head {
+        return Ok(Some(true));
+    }
+
+    let head_status = if head_row.is_some() {
+        classify_portrait_row(program, world, head_row.as_deref())
+    } else if body_row.is_none() {
+        portrait_head_status_in(program, world, guid)
+    } else {
+        Some(false)
+    };
+
+    let status = if is_npc_suit {
+        // 0x58a1e4..0x58a255: special NPC flag dresses STR# 200 row
+        // `raw_suit` as body, leaving head row untouched.
+        let npc_row = match raw_suit as usize {
+            1 => body_row.clone(),
+            2 => head_row.clone(),
+            n => suit_row(n),
+        };
+        match (
+            classify_portrait_row(program, world, npc_row.as_deref()),
+            head_status,
+        ) {
+            (Some(true), _) | (_, Some(true)) => Some(true),
+            (Some(false), Some(false)) => Some(false),
+            _ => None,
+        }
+    } else {
+        match suit {
+            // 0x58a68d..0x58a69d: suits outside 0..=60 jump to 0x58d475
+            // (everyday outfit 0).
+            0 | ..=-1 | 61.. => {
+                if body_row.is_some() || head_row.is_some() {
+                    match (
+                        classify_portrait_row(program, world, body_row.as_deref()),
+                        head_status,
+                    ) {
+                        (Some(true), _) | (_, Some(true)) => Some(true),
+                        (Some(false), Some(false)) => Some(false),
+                        _ => None,
+                    }
+                } else {
+                    portrait_head_status_in(program, world, guid)
+                }
+            }
+            1 | 2 | 4 | 17 | 18 => {
+                // 0x58d79b: suits 1 (naked), 2 (swim), 4 (formal), 17
+                // (winter), 18 (high fashion) replace the body row from
+                // STR# 200 (falling back to row 1 if empty at 0x58d492)
+                // and keep head row 2 unchanged.
+                if head_status == Some(true) {
+                    Some(true)
+                } else {
+                    let outfit_body = match suit {
+                        1 => suit_row(15),
+                        2 => suit_row(31).or_else(|| suit_row(16)),
+                        4 => {
+                            if is_child {
+                                suit_row(27)
+                            } else {
+                                suit_row(30).or_else(|| suit_row(27))
+                            }
+                        }
+                        17 => suit_row(33),
+                        18 => suit_row(34),
+                        _ => None,
+                    }
+                    .or(body_row);
+                    match (
+                        classify_portrait_row(program, world, outfit_body.as_deref()),
+                        head_status,
+                    ) {
+                        (Some(true), _) | (_, Some(true)) => Some(true),
+                        (Some(false), Some(false)) => Some(false),
+                        _ => None,
+                    }
+                }
+            }
+            5 => {
+                // Suit 5 (pajamas): row 32 if non-empty; otherwise matched
+                // pajamas (0x45f034), which is unmodeled here unless head
+                // row 2 already binds "HEAD".
+                if head_status == Some(true) {
+                    Some(true)
+                } else if let Some(pj_row) = suit_row(32) {
+                    match (
+                        classify_portrait_row(program, world, Some(&pj_row)),
+                        head_status,
+                    ) {
+                        (Some(true), _) | (_, Some(true)) => Some(true),
+                        (Some(false), Some(false)) => Some(false),
+                        _ => None,
+                    }
+                } else {
+                    return Err(Trap::Unsupported(format!(
+                        "portrait of person {person_id} (GUID 0x{guid:08X}) wearing matched \
+                         pajamas (suit 5, 0x58a178 -> 0x45f034): whether the matched body \
+                         binds HEAD is not ported"
+                    )));
+                }
+            }
+            3 => {
+                // Suit 3 (work/career, 0x45ee5f): head row 2 is kept.
+                if head_status == Some(true) {
+                    Some(true)
+                } else {
+                    return Err(Trap::Unsupported(format!(
+                        "portrait of person {person_id} (GUID 0x{guid:08X}) wearing work \
+                         clothes (suit 3, 0x58a178 -> 0x45ee5f): whether the career body \
+                         binds HEAD is not ported"
+                    )));
+                }
+            }
+            other => {
+                // Costumes (6..=16, 19..=60) can replace both body and head.
+                return Err(Trap::Unsupported(format!(
+                    "portrait of person {person_id} (GUID 0x{guid:08X}) wearing suit \
+                     {other} (0x58a178): whether that costume binds HEAD is not ported"
+                )));
+            }
+        }
+    };
+
+    if status.is_none() && !defer_unknown_head {
+        return Err(Trap::Unsupported(format!(
+            "UI Effect's portrait of type 0x{guid:08X} (0x4e7824): whether its suit binds \
+             HEAD is unknown"
+        )));
+    }
+    Ok(status)
+}
+
 impl Machine<'_, '_> {
     pub(crate) fn ui_effect(&mut self, operands: &[u8; 8]) -> Result<bool, Trap> {
         let mode = operands[0];
@@ -230,269 +563,41 @@ impl Machine<'_, '_> {
             .is_some_and(|library| library.has_portrait_2002)
     }
 
-    /// Extracts the lowercased suit name from a `STR# 200` outfit row
-    /// (`"suit,..."`), returning `None` for empty rows or `"none"`.
-    fn extract_suit_name(raw: &str) -> Option<String> {
-        let suit = raw
-            .split(';')
-            .next()
-            .unwrap_or(raw)
-            .split(',')
-            .next()
-            .unwrap_or(raw)
-            .to_ascii_lowercase();
-        (!suit.is_empty() && suit != "none").then_some(suit)
-    }
-
-    /// Classifies one `STR# 200` outfit row string against
-    /// [`sims_content::People::head_suits`]: `Some(true)` if its suit binds
-    /// `"HEAD"` with a valid mesh, `Some(false)` if confirmed not to, or
-    /// `None` if an earlier suit decode error hid that suit.
-    fn classify_portrait_row(&self, raw: Option<&str>) -> Option<bool> {
-        let Some(suit) = raw.and_then(Self::extract_suit_name) else {
-            return Some(false);
-        };
-        if self.program.people.head_suits.contains(&suit) {
-            Some(true)
-        } else if !self.program.people.suit_errors.is_empty()
-            && !self.program.people.suits.contains(&suit)
-        {
-            None
-        } else {
-            Some(false)
-        }
-    }
-
-    /// Whether the renderer (`0x4e725f` → `0x4e7801` → `0x58a178` → `0x4e7817`
-    /// → `0x4e810d` → `0x4e81a4` → `0x431726` → `0x4e7824`) finds a
-    /// case-sensitive `"HEAD"` binding on the specific Sim `person_id` in
-    /// `world`, accounting for:
-    /// - whether the Sim's skeleton defines a `"HEAD"` bone (`0x595674`);
-    /// - live attached accessories (`person.accessories`, opcode 6);
-    /// - live changed outfits (`words[102] & 8`, `person.data[65] & 6`,
-    ///   `person.data[8]` at `0x58a178`);
-    /// - runtime-made overrides (`Character::strings`, `World::made_outfits`)
-    ///   and template `Profile::{body, head}` / `People::portrait_head`.
-    fn can_render_person_portrait(
-        &self,
-        world: &sims_sim::World,
-        person_id: u16,
-        guid: u32,
-        defer_unknown_head: bool,
-    ) -> Result<Option<bool>, Trap> {
-        // 0x595674..0x595699: a "HEAD" binding attaches only when the Sim's
-        // skeleton defines a bone named "HEAD". Synthetic fixtures that leave
-        // `bones` empty skip this check.
-        if let Ok(skel) = crate::people::skeleton(&self.program.people, world, guid)
-            && !skel.bones.is_empty()
-            && !skel.bones.iter().any(|b| b.name == "HEAD")
-        {
-            return Ok(Some(false));
-        }
-
-        let person = world
-            .objects
-            .get(&person_id)
-            .and_then(|object| object.person.as_ref());
-
-        // Attached accessories (`person.accessories`, opcode 6) are dressed on
-        // the skeleton and scanned by `0x4e810d` alongside body/head suits.
-        if person.is_some_and(|p| {
-            p.accessories
-                .iter()
-                .any(|a| !a.name.is_empty() && self.program.people.head_suits.contains(&a.name))
-        }) {
-            return Ok(Some(true));
-        }
-
+    /// Whether the program/world supplies appearance, suit, or bone metadata
+    /// for `guid` (distinguishing real installs and portrait-appearance tests
+    /// from bare-bones synthetic fixtures that omit all suit/bone metadata).
+    pub(crate) fn has_portrait_render_metadata(&self, world: &sims_sim::World, guid: u32) -> bool {
         let template = world.characters.definition(guid);
         let profile = self.program.people.profiles.get(&template);
-        let made = world.characters.made.get(&guid);
-        let made_outfit = world.made_outfits.get(&guid);
-        let body_row = made
-            .and_then(|m| m.strings.get(&1).map(String::as_str))
-            .or_else(|| made_outfit.and_then(|o| o.0.as_deref()))
-            .or_else(|| profile.and_then(|p| p.body.as_deref()));
-        let head_row = made
-            .and_then(|m| m.strings.get(&2).map(String::as_str))
-            .or_else(|| made_outfit.and_then(|o| o.1.as_deref()))
-            .or_else(|| profile.and_then(|p| p.head.as_deref()));
-
-        let def_flags = self.definition_words(guid).map(|w| w[102]).unwrap_or(0);
-        let gender_word = person.and_then(|p| p.data.get(65).copied()).unwrap_or(0);
-        let age_word = person.and_then(|p| p.data.get(58).copied()).unwrap_or(0);
-        let is_child = age_word != 0 && age_word < 18;
-        let raw_suit = person.and_then(|p| p.data.get(8).copied()).unwrap_or(0);
-
-        let suit_row = |idx: usize| -> Option<&str> {
-            profile
-                .and_then(|p| p.suit_rows.get(&idx))
-                .map(String::as_str)
-                .filter(|s| !s.is_empty())
-        };
-
-        let head_status = if head_row.is_some() {
-            self.classify_portrait_row(head_row)
-        } else if body_row.is_none() {
-            self.portrait_head_status(guid)
-        } else {
-            Some(false)
-        };
-
-        let status = if (def_flags & 8) != 0 && raw_suit > 0 {
-            // 0x58a1e4..0x58a255: special NPC flag dresses STR# 200 row
-            // `raw_suit` as body, leaving head row untouched.
-            let npc_row = match raw_suit as usize {
-                1 => body_row,
-                2 => head_row,
-                n => suit_row(n),
-            };
-            match (self.classify_portrait_row(npc_row), head_status) {
-                (Some(true), _) | (_, Some(true)) => Some(true),
-                (Some(false), Some(false)) => Some(false),
-                _ => None,
-            }
-        } else {
-            // 0x58a2d6..0x58a2e5: pet species bits (data[65] & 6) wear suit 0.
-            let suit = if (gender_word & 6) != 0 { 0 } else { raw_suit };
-            match suit {
-                0 => {
-                    if body_row.is_some() || head_row.is_some() {
-                        match (
-                            self.classify_portrait_row(body_row),
-                            self.classify_portrait_row(head_row),
-                        ) {
-                            (Some(true), _) | (_, Some(true)) => Some(true),
-                            (Some(false), Some(false)) => Some(false),
-                            _ => None,
-                        }
-                    } else {
-                        self.portrait_head_status(guid)
-                    }
-                }
-                1 | 2 | 4 | 17 | 18 => {
-                    // 0x58d79b: suits 1 (naked), 2 (swim), 4 (formal), 17
-                    // (winter), 18 (high fashion) replace the body row from
-                    // STR# 200 (falling back to row 1 if empty at 0x58d492)
-                    // and keep head row 2 unchanged.
-                    if head_status == Some(true) {
-                        Some(true)
-                    } else {
-                        let outfit_body = match suit {
-                            1 => suit_row(15),
-                            2 => suit_row(31).or_else(|| suit_row(16)),
-                            4 => {
-                                if is_child {
-                                    suit_row(27)
-                                } else {
-                                    suit_row(30).or_else(|| suit_row(27))
-                                }
-                            }
-                            17 => suit_row(33),
-                            18 => suit_row(34),
-                            _ => None,
-                        }
-                        .or(body_row);
-                        match (self.classify_portrait_row(outfit_body), head_status) {
-                            (Some(true), _) | (_, Some(true)) => Some(true),
-                            (Some(false), Some(false)) => Some(false),
-                            _ => None,
-                        }
-                    }
-                }
-                5 => {
-                    // Suit 5 (pajamas): row 32 if non-empty; otherwise matched
-                    // pajamas (0x45f034), which is unmodeled here unless head
-                    // row 2 already binds "HEAD".
-                    if head_status == Some(true) {
-                        Some(true)
-                    } else if let Some(pj_row) = suit_row(32) {
-                        match (self.classify_portrait_row(Some(pj_row)), head_status) {
-                            (Some(true), _) | (_, Some(true)) => Some(true),
-                            (Some(false), Some(false)) => Some(false),
-                            _ => None,
-                        }
-                    } else {
-                        return Err(Trap::Unsupported(format!(
-                            "portrait of person {person_id} (GUID 0x{guid:08X}) wearing matched \
-                             pajamas (suit 5, 0x58a178 -> 0x45f034): whether the matched body \
-                             binds HEAD is not ported"
-                        )));
-                    }
-                }
-                3 => {
-                    // Suit 3 (work/career, 0x45ee5f): head row 2 is kept.
-                    if head_status == Some(true) {
-                        Some(true)
-                    } else {
-                        return Err(Trap::Unsupported(format!(
-                            "portrait of person {person_id} (GUID 0x{guid:08X}) wearing work \
-                             clothes (suit 3, 0x58a178 -> 0x45ee5f): whether the career body \
-                             binds HEAD is not ported"
-                        )));
-                    }
-                }
-                other => {
-                    // Costumes (6..=16, 19..=60) can replace both body and head.
-                    return Err(Trap::Unsupported(format!(
-                        "portrait of person {person_id} (GUID 0x{guid:08X}) wearing suit \
-                         {other} (0x58a178): whether that costume binds HEAD is not ported"
-                    )));
-                }
-            }
-        };
-
-        if status.is_none() && !defer_unknown_head {
-            return Err(Trap::Unsupported(format!(
-                "UI Effect's portrait of type 0x{guid:08X} (0x4e7824): whether its suit binds \
-                 HEAD is unknown"
-            )));
+        if profile.is_some_and(|p| p.body.is_some() || p.head.is_some()) {
+            return true;
         }
-        Ok(status)
+        if world
+            .characters
+            .made
+            .get(&guid)
+            .is_some_and(|m| m.strings.contains_key(&1) || m.strings.contains_key(&2))
+        {
+            return true;
+        }
+        if world.made_outfits.contains_key(&guid)
+            || world.made_portrait_head.contains_key(&guid)
+            || self.program.people.portrait_head.contains_key(&guid)
+            || self.program.people.portrait_head.contains_key(&template)
+            || !self.program.people.head_suits.is_empty()
+            || !self.program.people.suits.is_empty()
+            || !self.program.people.indexed_suits.is_empty()
+            || !self.program.people.suit_errors.is_empty()
+        {
+            return true;
+        }
+        crate::people::skeleton(&self.program.people, world, guid)
+            .is_ok_and(|skel| !skel.bones.is_empty())
     }
 
-    /// Fallback GUID-level `"HEAD"` binding status for synthetic fixtures that
-    /// populate `People::portrait_head` or `World::made_portrait_head` without
-    /// `Profile::{body, head}`.
+    /// Fallback GUID-level `"HEAD"` binding status on `self.world`.
     pub(crate) fn portrait_head_status(&self, guid: u32) -> Option<bool> {
-        if let Some(made) = self.world.characters.made.get(&guid) {
-            let mut has_suit_override = false;
-            for row in [1usize, 2] {
-                if let Some(raw) = made.strings.get(&row) {
-                    has_suit_override = true;
-                    if Self::extract_suit_name(raw)
-                        .is_some_and(|suit| self.program.people.head_suits.contains(&suit))
-                    {
-                        return Some(true);
-                    }
-                }
-            }
-            if has_suit_override {
-                return Some(false);
-            }
-            if let Some(&status) = self.world.made_portrait_head.get(&guid) {
-                return status;
-            }
-            if let Some(&has_head) = self.program.people.portrait_head.get(&guid) {
-                return Some(has_head);
-            }
-            return Some(
-                self.program
-                    .people
-                    .portrait_head
-                    .get(&made.template)
-                    .copied()
-                    .unwrap_or(false),
-            );
-        }
-        Some(
-            self.program
-                .people
-                .portrait_head
-                .get(&guid)
-                .copied()
-                .unwrap_or(false),
-        )
+        portrait_head_status_in(self.program, self.world, guid)
     }
 
     /// Resolves [`Machine::portrait_head_status`] for portrait rendering,
@@ -512,7 +617,7 @@ impl Machine<'_, '_> {
     /// (`0x4260e1`) live in newly created loose `Characters/User%05d.iff`
     /// files and are writable even if their template was inside a `.far`
     /// archive.
-    fn is_portrait_file_writable(&self, guid: u32) -> bool {
+    pub(crate) fn is_portrait_file_writable(&self, guid: u32) -> bool {
         if self.world.characters.made.contains_key(&guid) {
             return true;
         }
@@ -569,7 +674,9 @@ impl Machine<'_, '_> {
                 .is_some_and(|object| object.guid == guid)
         });
         if let Some(person_id) = on_lot_id {
-            let can_render = match self.can_render_person_portrait(
+            let can_render = match can_render_person_portrait(
+                self.catalog,
+                self.program,
                 self.world,
                 person_id,
                 guid,
@@ -645,7 +752,14 @@ impl Machine<'_, '_> {
         let can_render = if !placed {
             false
         } else {
-            match self.can_render_person_portrait(&copy, id, guid, defer_unknown_head)? {
+            match can_render_person_portrait(
+                self.catalog,
+                self.program,
+                &mut copy,
+                id,
+                guid,
+                defer_unknown_head,
+            )? {
                 Some(ok) => ok,
                 None => {
                     copy.ambiguous_portraits.insert(guid);

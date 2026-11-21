@@ -68,6 +68,12 @@ pub(crate) fn mount_avatar_paths(install: &Install, strict_archives: bool) -> Re
 }
 
 impl ImportWardrobe {
+    /// Constructs an ordered wardrobe from explicit suit and texture lists
+    /// (in exact native table/cache order), for synthetic tests.
+    pub fn from_ordered_names(suits: Vec<Vec<u8>>, textures: Vec<Vec<u8>>) -> Self {
+        Self { suits, textures }
+    }
+
     /// Replays the startup file tables (0x43ae81), avatar catalogs (0x5835ed)
     /// and texture cache (0x414633, 0x40895a).
     pub fn load(install: &Install) -> Result<Self> {
@@ -324,9 +330,16 @@ impl ImportWardrobe {
             for tex in &self.textures {
                 if tex.len() >= prefix.len() && tex[..prefix.len()].eq_ignore_ascii_case(&prefix) {
                     if index == 0 {
-                        let suit_str = decode(suit, 1).to_ascii_lowercase();
+                        let suit_str: String = decode(suit, 1)
+                            .to_ascii_lowercase()
+                            .chars()
+                            .take(63)
+                            .collect();
                         let tex_str = decode(tex, 1);
-                        let row = format!("{suit_str},{tag}={tex_str}");
+                        // 0x409843/0x409851/0x472f41 caps the complete
+                        // `BODY=<tex>` / `HEAD-HEAD=<tex>` descriptor at 63 bytes.
+                        let desc_63: String = format!("{tag}={tex_str}").chars().take(63).collect();
+                        let row = format!("{suit_str},{desc_63}");
                         return Some((suit_str, row));
                     }
                     index -= 1;
@@ -373,12 +386,74 @@ impl ImportWardrobe {
             for tex in &self.textures {
                 if tex.len() >= 7 && tex[..7].eq_ignore_ascii_case(prefix) {
                     if index == 0 {
-                        let suit_str = decode(suit, 1).to_ascii_lowercase();
+                        let suit_str: String = decode(suit, 1)
+                            .to_ascii_lowercase()
+                            .chars()
+                            .take(63)
+                            .collect();
                         let tex_str = decode(tex, 1);
-                        let row = format!("{suit_str},BODY={tex_str}");
+                        let desc_63: String = format!("BODY={tex_str}").chars().take(63).collect();
+                        let row = format!("{suit_str},{desc_63}");
                         return Some((suit_str, row));
                     }
                     index -= 1;
+                }
+            }
+        }
+        None
+    }
+
+    /// Whether the native-ordered human wardrobe list for `(head, female,
+    /// child, skin)` contains an entry equal (case-insensitively on 63-byte
+    /// suit and complete texture descriptor buffers, `0x472f92`) to `raw_row`,
+    /// returning the matched 63-byte `(suit_lower, formatted_row)` when found.
+    pub fn find_outfit(
+        &self,
+        head: bool,
+        female: bool,
+        child: bool,
+        skin: &str,
+        raw_row: &str,
+    ) -> Option<(String, String)> {
+        let row_255: String = raw_row.chars().take(255).collect();
+        let before_semi = row_255.split(';').next().unwrap_or(&row_255);
+        let (raw_suit, raw_tex) = before_semi.split_once(',')?;
+        let row_suit: String = raw_suit.to_ascii_lowercase().chars().take(63).collect();
+        let row_tex: String = raw_tex.to_ascii_lowercase().chars().take(63).collect();
+        let skin_bytes = encode_name(&skin.to_ascii_lowercase())?;
+        let (first, length, tag) = if head {
+            (b'c', 6usize, "HEAD-HEAD")
+        } else {
+            (b'b', 9usize, "BODY")
+        };
+        let sex = if female { b'f' } else { b'm' };
+        let age = if child { b'c' } else { b'a' };
+        for suit in &self.suits {
+            if suit.len() < length
+                || !suit[0].eq_ignore_ascii_case(&first)
+                || !(suit[4].eq_ignore_ascii_case(&sex) || suit[4].eq_ignore_ascii_case(&b'u'))
+                || !suit[5].eq_ignore_ascii_case(&age)
+                || (head && suit[1].eq_ignore_ascii_case(&b't'))
+            {
+                continue;
+            }
+            let suit_str: String = decode(suit, 1)
+                .to_ascii_lowercase()
+                .chars()
+                .take(63)
+                .collect();
+            if suit_str != row_suit {
+                continue;
+            }
+            let mut prefix = suit[..length].to_ascii_lowercase();
+            prefix.extend_from_slice(&skin_bytes);
+            for tex in &self.textures {
+                if tex.len() >= prefix.len() && tex[..prefix.len()].eq_ignore_ascii_case(&prefix) {
+                    let tex_str = decode(tex, 1);
+                    let desc_63: String = format!("{tag}={tex_str}").chars().take(63).collect();
+                    if desc_63.to_ascii_lowercase() == row_tex {
+                        return Some((suit_str.clone(), format!("{suit_str},{desc_63}")));
+                    }
                 }
             }
         }

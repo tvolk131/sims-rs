@@ -141,6 +141,16 @@ impl Machine<'_, '_> {
         if let Cell::Data(id, LOCKOUT) = resolved.0 {
             self.wake(id)?;
         }
+        // 0x4538e3..0x453926 -> 0x4539c7 -> 0x45810c -> 0x4eb0eb -> 0x4e895e:
+        // resolving any person-data scope (18, 19, 30, 31) with write intent
+        // on word 68 (0x44), 74 (0x4a), or 84 (0x54) invalidates the running
+        // object's cached portrait slots and marks them dirty so the next
+        // 0x4e92a8 query rebuilds before checking BMP_ 2002.
+        if write && matches!(resolved.0, Cell::Person(_, 68 | 74 | 84)) {
+            let guid = self.world.objects[&self.me].guid;
+            self.world.portraits.remove(&guid);
+            self.world.dirty_portraits.insert(guid);
+        }
         Ok(resolved)
     }
 
@@ -771,8 +781,8 @@ impl Machine<'_, '_> {
             Cell::Attribute(id, i) => object_mut(world, id)?.attributes.get_mut(i),
             Cell::Data(id, i) => object_mut(world, id)?.data.get_mut(i),
             // Writes to person data words 68, 74 and 84 invalidate cached
-            // portraits, and 77 and 81 notify indicators (legacy
-            // memory.rs:634-654). Both are presentation only.
+            // portraits in `resolve` above (0x4538fd..0x4539c7 -> 0x45810c);
+            // words 77 and 81 notify indicators (presentation only).
             Cell::Person(id, i) => {
                 world.routing.unknown_words.remove(&(id, i));
                 object_mut(world, id)?

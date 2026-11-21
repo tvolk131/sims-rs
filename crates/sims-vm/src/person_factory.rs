@@ -280,6 +280,37 @@ impl Interpreter<'_> {
         };
         build_skeleton(skeleton, &mut draws, &mut world.skeleton_files)
             .map_err(|trap| fail(id, trap))?;
+        // 0x588dcb -> 0x58a178 -> 0x5a044d -> 0x5a38da -> 0x59f35f: dressing
+        // the new person's initial body (row 1) and head (row 2) loads any
+        // `.ndx`-indexed `.bcf` appearance catalog and fills unloaded sibling
+        // entries in runtime call order.
+        if !self.program.people.indexed_suits.is_empty() {
+            let template = world.characters.definition(guid);
+            let profile = self.program.people.profiles.get(&template);
+            let made = world.characters.made.get(&guid);
+            let made_outfit = world.made_outfits.get(&guid);
+            let rows = [
+                made.and_then(|m| m.strings.get(&1).cloned())
+                    .or_else(|| made_outfit.and_then(|o| o.0.clone()))
+                    .or_else(|| profile.and_then(|p| p.body.clone())),
+                made.and_then(|m| m.strings.get(&2).cloned())
+                    .or_else(|| made_outfit.and_then(|o| o.1.clone()))
+                    .or_else(|| profile.and_then(|p| p.head.clone())),
+            ];
+            for row in rows.into_iter().flatten() {
+                let suit = row
+                    .split(';')
+                    .next()
+                    .unwrap_or(&row)
+                    .split(',')
+                    .next()
+                    .unwrap_or(&row)
+                    .to_ascii_lowercase();
+                if !suit.is_empty() && suit != "none" {
+                    let _ = crate::people::resolve_suit_head(&self.program.people, world, &suit);
+                }
+            }
+        }
         factory
             .attach_neighbor(world, id)
             .map_err(|trap| fail(id, trap))?;
