@@ -122,6 +122,45 @@ impl Interpreter<'_> {
                 )),
             ));
         }
+        self.construct_person(world, guid, skeleton)
+    }
+
+    /// Like [`Self::create_person`], but returns `Ok(None)` when the native
+    /// factory refuses a pet because neither Unleashed nor Makin' Magic is
+    /// installed (`0x440dd5`).
+    pub(crate) fn try_create_person(
+        &self,
+        world: &mut World,
+        guid: u32,
+    ) -> Result<Option<u16>, Fault> {
+        let fail = |object, trap| Fault {
+            object,
+            at: None,
+            trap,
+        };
+        let skeleton =
+            crate::people::skeleton(&self.program.people, world, guid).map_err(|t| fail(0, t))?;
+        if !pets_allowed(self.program.expansions)
+            && ["dog", "kat"]
+                .iter()
+                .any(|pet| skeleton.name.eq_ignore_ascii_case(pet))
+        {
+            return Ok(None);
+        }
+        self.construct_person(world, guid, skeleton).map(Some)
+    }
+
+    fn construct_person(
+        &self,
+        world: &mut World,
+        guid: u32,
+        skeleton: &sims_content::Skeleton,
+    ) -> Result<u16, Fault> {
+        let fail = |object, trap| Fault {
+            object,
+            at: None,
+            trap,
+        };
         let id = (1..=i16::MAX as u16)
             .find(|id| !world.objects.contains_key(id))
             .ok_or_else(|| fail(0, Trap::Unsupported("no unused object ID".into())))?;
