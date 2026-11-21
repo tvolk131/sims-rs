@@ -1210,6 +1210,7 @@ fn an_entrys_string_formats_locals_and_catalog_names() {
             "$Local:0/$Local:1:99 ($Local:99 $Local)",
             "$Me uses $Object",
             "$TimeLocal:99 $TimeLocal:2 $TimeLocal:3",
+            "$TimeLocal:4 / $TimeLocal:5 / $TimeLocal:6 / $TimeLocal:7 / $TimeLocal:8 / $TimeLocal:9",
             "",
         ],
     );
@@ -1254,17 +1255,30 @@ fn an_entrys_string_formats_locals_and_catalog_names() {
     fx.add(
         LAMP_FILE,
         4302,
-        tree(vec![
-            assign(scope::LOCALS, 0, scope::LITERAL, -5, 1),
-            assign(scope::LOCALS, 1, scope::LITERAL, 50, 2),
-            assign(scope::LOCALS, 2, scope::LITERAL, 24, 3),
-            assign(scope::LOCALS, 3, scope::LITERAL, -1, 4),
-            ins(50, 5, RETURN_FALSE, action_string(1)),
-            ins(50, 6, RETURN_FALSE, action_string(2)),
-            ins(50, 7, RETURN_FALSE, action_string(3)),
-            ins(50, 8, RETURN_FALSE, action_string(4)),
-            ins(50, RETURN_TRUE, RETURN_FALSE, action_string(5)),
-        ]),
+        shaped(
+            0x8002,
+            0,
+            4,
+            10,
+            vec![
+                assign(scope::LOCALS, 0, scope::LITERAL, -5, 1),
+                assign(scope::LOCALS, 1, scope::LITERAL, 50, 2),
+                assign(scope::LOCALS, 2, scope::LITERAL, 24, 3),
+                assign(scope::LOCALS, 3, scope::LITERAL, -1, 4),
+                assign(scope::LOCALS, 4, scope::LITERAL, 0, 5),
+                assign(scope::LOCALS, 5, scope::LITERAL, 5, 6),
+                assign(scope::LOCALS, 6, scope::LITERAL, 10, 7),
+                assign(scope::LOCALS, 7, scope::LITERAL, 12, 8),
+                assign(scope::LOCALS, 8, scope::LITERAL, 13, 9),
+                assign(scope::LOCALS, 9, scope::LITERAL, 23, 10),
+                ins(50, 11, RETURN_FALSE, action_string(1)),
+                ins(50, 12, RETURN_FALSE, action_string(2)),
+                ins(50, 13, RETURN_FALSE, action_string(3)),
+                ins(50, 14, RETURN_FALSE, action_string(4)),
+                ins(50, 15, RETURN_FALSE, action_string(5)),
+                ins(50, RETURN_TRUE, RETURN_FALSE, action_string(6)),
+            ],
+        ),
     );
     let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
     let listed = interpreter
@@ -1278,6 +1292,7 @@ fn an_entrys_string_formats_locals_and_catalog_names() {
             Some("-5/50 ($Local:99 $Local)"),
             Some("Mortimer uses Lamp"),
             Some("$TimeLocal:99 $TimeLocal:2 $TimeLocal:3"),
+            Some("12:00 am /  5:00 am / 10:00 am / 12:00 pm /  1:00 pm / 11:00 pm"),
             Some(""),
         ]
     );
@@ -1290,11 +1305,9 @@ fn an_entrys_string_formats_locals_and_catalog_names() {
 
 #[test]
 fn an_entrys_string_fails_loudly_on_unported_tokens_and_tables() {
-    // Exact-text pie labels reject in-range `$TimeLocal` (hour in [0, 24)),
-    // career tokens on a person, and other unported passes (`$Family`,
-    // `$Attrib`, `$CatalogLocal`, `$Grade`).
+    // Exact-text pie labels reject career tokens on a person and other
+    // unported passes (`$Family`, `$Attrib`, `$CatalogLocal`, `$Grade`).
     for (text, needle) in [
-        ("$TimeLocal:0", "0x4a6ab1"),
         ("$Job", "0x44c966"),
         ("$Family", "0x44c034"),
         ("$Attrib:0", "`$Attrib`"),

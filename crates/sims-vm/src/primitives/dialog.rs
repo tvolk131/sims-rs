@@ -222,6 +222,21 @@ fn local_token(
     Ok((numbers[0], numbers[1], end))
 }
 
+/// Formats an hour in `[0, 24)` as `0x4a6ab1` -> `0x5fe51e` does in US
+/// English (language 1): `sprintf("%2u:%.2u %s", display_hour, 0, suffix)`
+/// (`0x6d8498`, `0x6d84b8`, `0x6d84bc`, `0x5d4f07`).
+fn format_hour(hour: i16) -> String {
+    let suffix = if hour < 12 { "am" } else { "pm" };
+    let display = if hour == 0 {
+        12
+    } else if hour > 12 {
+        hour - 12
+    } else {
+        hour
+    };
+    format!("{display:2}:00 {suffix}")
+}
+
 /// Record status: made and not shown yet.
 pub const NEW: u8 = 0;
 /// Shown, not answered.
@@ -627,9 +642,8 @@ impl Machine<'_, '_> {
     ///
     /// When `exact_text` is true (as for an Add/Change Action String entry
     /// added to a pie menu, whose formatted label is kept), tokens whose
-    /// substitution is not ported (in-range `$TimeLocal` with hour in
-    /// `[0, 24)` and `$Job*` on a person) fail loudly instead of being
-    /// treated as presentation.
+    /// substitution is not ported (`$Job*` on a person) fail loudly instead
+    /// of being treated as presentation.
     pub(crate) fn format_text(
         &self,
         mut text: String,
@@ -667,7 +681,7 @@ impl Machine<'_, '_> {
             text = name_pass(text, "$Neighbor", name.as_deref(), what, "0x44c6ba")?;
         }
         not_ported(&text, &AFTER, what, "0x44c6ea to 0x44c8c4")?;
-        self.time_locals(&text, what, exact_text)?;
+        text = self.time_locals(&text, what)?;
         self.career_tokens(&text, what, exact_text)?;
         Ok(Formatted { text, portrait })
     }
@@ -850,21 +864,24 @@ impl Machine<'_, '_> {
         Ok(())
     }
 
-    /// The formatter's `$TimeLocal` pass (`0x44c8c4` to `0x44c965`).
-    /// Reads each in-range local (`0x44c90b`) regardless of `exact_text`;
-    /// only when the local's hour is in `[0, 24)` (`0x44c918`) does the
-    /// original call `0x4a6ab1` and replace the token, so out-of-range
-    /// indices and hours stay literal even when `exact_text` is true.
-    fn time_locals(&self, text: &str, what: &str, exact_text: bool) -> Result<(), Trap> {
+    /// `text` after the formatter's `$TimeLocal` pass (`0x44c8c4` to
+    /// `0x44c965`). Each in-range local is read (`0x44c90b`); when its hour
+    /// is in `[0, 24)` (`0x44c918`), the matched token (including any
+    /// optional second `:digits`, `0x44caf6`) is replaced (`0x44c93e`) by
+    /// the US English time string (`0x4a6ab1`, `0x5fe51e`) before the
+    /// career pass runs, so `$Job*` sees the substituted text. Out-of-range
+    /// indices and hours stay literal.
+    fn time_locals(&self, text: &str, what: &str) -> Result<String, Trap> {
         const TOKEN: &str = "$TimeLocal";
         let locals = &self.frame()?.locals;
+        let mut text = text.to_owned();
         let mut from = 0;
         while let Some(at) = text
             .get(from..)
             .and_then(|t| t.find(TOKEN))
             .map(|i| i + from)
         {
-            let (number, _, _) = local_token(text.as_bytes(), at + TOKEN.len(), what, TOKEN)?;
+            let (number, _, end) = local_token(text.as_bytes(), at + TOKEN.len(), what, TOKEN)?;
             if let Ok(n) = usize::try_from(number)
                 && n < locals.len()
             {
@@ -873,17 +890,13 @@ impl Machine<'_, '_> {
                         "{what} `$TimeLocal:{n}` (0x44bf1a, 0x44c90b): {trap}"
                     ))
                 })?;
-                if exact_text && (0..24).contains(&locals[n]) {
-                    return Err(Trap::Unsupported(format!(
-                        "{what} text holds `$TimeLocal:{n}` with hour {}, whose formatting \
-                         (0x44bf1a, 0x44c8c4, 0x4a6ab1) is not ported ({text:?})",
-                        locals[n]
-                    )));
+                if (0..24).contains(&locals[n]) {
+                    text.replace_range(at..end, &format_hour(locals[n]));
                 }
             }
             from = at + 1;
         }
-        Ok(())
+        Ok(text)
     }
 
     /// The formatter's career passes (`$JobOffer`, `$JobDesc`, `$Job`,

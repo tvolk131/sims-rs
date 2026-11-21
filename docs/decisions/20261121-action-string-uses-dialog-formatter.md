@@ -51,13 +51,15 @@ tree `0x2074` on phones 4, 10, and 253 formatting `$$Local:1` fares).
 - `Machine::action_string` loads strings via `Machine::string_table`
   (respecting `loaded_strings`, `unported_strings`, and `legacy_strings`)
   and formats via `Machine::format_text(..., exact_text = self.menu.is_some())`.
-- Both `$TimeLocal` (`0x44c8c4`, `0x44c90b`) and `$Job*` (`0x44c966`,
-  `0x44c9fc`, `0x44ca0b`) parse both `:N[:M]` numbers via `0x44caf6` and
-  validate in-range local reads (`check_local`) regardless of `exact_text`.
-  Out-of-range `$TimeLocal` indices or hours outside `[0, 24)` stay
-  literal even when `exact_text` is true; in-range hours in `[0, 24)`
-  (`0x4a6ab1`) and `$Job*` on a person fail loudly when `exact_text` is
-  true.
+- Ported `$TimeLocal` (`0x44c8c4`, `0x44c90b`, `0x4a6ab1`, `0x5fe51e`)
+  and `$Job*` (`0x44c966`, `0x44c9fc`, `0x44ca0b`) local parsing and
+  validation: `local_token` (`0x44caf6`) parses both `:N` and `:M`;
+  `$TimeLocal` validates in-range locals (`0x44c90b`) and substitutes
+  US English `%2u:%.2u %s` (`"12:00 am"`, `" 5:00 am"`, `"10:00 am"`,
+  etc.) for hours in `[0, 24)` before `$Job*` runs so `$Job*` sees the
+  substituted text (while out-of-range indices and hours stay literal).
+  `$Job*` validates both in-range locals before checking `person` and
+  fails loudly on exact-text pie labels for persons.
 - Classified genuine script null-dereference faults as `Trap::Invalid`
   (rather than `Trap::Unsupported`, so `sims-game`'s menu UI does not
   fall back to unchecked entries): missing string indices in
@@ -80,9 +82,9 @@ tree `0x2074` on phones 4, 10, and 253 formatting `$$Local:1` fares).
 - Unported `0x44bf1a` passes (`$FamilyAssets`, `$Family`, `$Attrib`,
   `$NameAttrib`, `$NameLocal`, `$TokenNameLocal`, listed `$NeighborLocal`,
   `$CatalogLocal`, `$FameTitleLocal`, `$Grade`), exact-text formatting
-  for in-range `$TimeLocal` (`0x4a6ab1`) and `$Job*`, and `0x4061e3` /
-  `0x457d3b` fallbacks when US English CTSS slot 1 is empty or absent
-  (`CATS`, all-language person fallback `0x470ca7(1, 0)`, OBJD name
-  fallback `0x457db4`) continue to fail loudly.
+  for `$Job*`, and `0x4061e3` / `0x457d3b` fallbacks when US English
+  CTSS slot 1 is empty or absent (`CATS`, all-language person fallback
+  `0x470ca7(1, 0)`, OBJD name fallback `0x457db4`) continue to fail
+  loudly.
 - `Special Effect` (`0x44aaa6`, STR# `0x131`) still treats its formatted
   text as presentation and does not call `format_text`.

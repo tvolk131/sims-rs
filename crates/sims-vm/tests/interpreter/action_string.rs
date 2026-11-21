@@ -156,6 +156,66 @@ fn a_string_with_tokens_fails_loudly_before_anything_changes() {
         assert_eq!(active_flags(&fx), 0x41, "{text}");
     }
 
+    // `$TimeLocal` substitutes its US English time string (`0x44c93e`,
+    // `0x4a6ab1`, `0x5fe51e`) before the career pass (`0x44c966`) parses
+    // `$Job*`, so it can supply or change `$Job`'s second local index even
+    // when the formatted text is discarded.
+    // With 11 locals and local 1 = 10 (`"10:00 am"`), `$Job:0:$TimeLocal:1`
+    // becomes `$Job:0:10:00 am` and reads local 0 (marked half of a pointer).
+    let mut fx = named(SIM, SIM_FILE, 1);
+    fx.sim_mut().stack[0].locals = vec![0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    fx.program.career_texts_end = true;
+    fx.program
+        .libraries
+        .get_mut(&SIM_FILE)
+        .unwrap()
+        .strings
+        .insert(300, vec!["$Job:0:$TimeLocal:1".to_owned()]);
+    fx.world.frame_storage.insert(
+        SIM,
+        sims_sim::FrameStorage {
+            offsets: vec![0],
+            unknown: [(0, 0)].into(),
+            ..Default::default()
+        },
+    );
+    let fault = turn(&mut fx, SIM).unwrap_err();
+    assert!(
+        fault.to_string().contains("0x44c9fc") && fault.to_string().contains("half of a pointer"),
+        "{fault}"
+    );
+    assert_eq!(active_flags(&fx), 0x41);
+
+    // Conversely, `$Job:0:1$TimeLocal:1` with local 1 = 10 becomes
+    // `$Job:0:110:00 am` (second index 110 >= 11), and `$Job:0:$TimeLocal:1`
+    // with local 1 = 5 becomes `$Job:0: 5:00 am` (leading space from `%2u`,
+    // so second index is -1): neither reads local 0, so both succeed.
+    for (text, hour) in [("$Job:0:1$TimeLocal:1", 10), ("$Job:0:$TimeLocal:1", 5)] {
+        let mut fx = named(SIM, SIM_FILE, 1);
+        fx.sim_mut().stack[0].locals = vec![0, hour, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        fx.program.career_texts_end = true;
+        fx.program
+            .libraries
+            .get_mut(&SIM_FILE)
+            .unwrap()
+            .strings
+            .insert(300, vec![text.to_owned()]);
+        fx.world.frame_storage.insert(
+            SIM,
+            sims_sim::FrameStorage {
+                offsets: vec![0],
+                unknown: [(0, 0)].into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            turn(&mut fx, SIM),
+            Ok(Status::Returned(true)),
+            "{text} {hour}"
+        );
+        assert_eq!(active_flags(&fx), 0xc1, "{text} {hour}");
+    }
+
     // In a thread's run (text dropped), `$Local`, `$Me` (CTSS slot 1), and
     // valid `$TimeLocal` / `$Job` (with `career_texts_end`) succeed and set
     // `NAMED` on a person's active interaction.

@@ -29,10 +29,10 @@
 //! [`Machine::format_text`] in [`crate::primitives::dialog`]) in every run
 //! before `0x44cc9a` asks where the string goes, so any unported token,
 //! invalid local, or non-person career fault fails before state changes.
-//! Passes that substitute into the label (`$Local`, `$Me`, `$Object`, and
-//! `$Neighbor`) produce the formatted menu entry text; literal `$` signs
-//! such as currency prefixes (`$$Local:1` -> `$50`) are left intact. When
-//! adding a pie menu entry, `$Neighbor` writes `frame.stack_object` into
+//! Passes that substitute into the label (`$Local`, `$Me`, `$Object`,
+//! `$Neighbor`, and `$TimeLocal`) produce the formatted menu entry text;
+//! literal `$` signs such as currency prefixes (`$$Local:1` -> `$50`) are
+//! left intact. When adding a pie menu entry, `$Neighbor` writes `frame.stack_object` into
 //! `args[0]` (`0x44c6c7`), and `0x44cca3` sets `args[0] = frame.stack_object`
 //! whenever it is still 0; `$Family` (which writes `args[1]` at `0x44c0e3`)
 //! fails loudly in `format_text`.
