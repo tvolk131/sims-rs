@@ -225,6 +225,9 @@ pub struct Lot {
 
     /// The house view's rotation, 0 to 3 ([`Lot::set_view_rotation`]).
     view_rotation: u8,
+    /// The tile at the house view's centre, if known
+    /// ([`Lot::set_view_centre`]).
+    view_centre: Option<[i8; 2]>,
     /// The world's hash as the load left it, which a save carries so it
     /// goes back only into a lot loaded from the same files
     /// ([`save`]).
@@ -451,6 +454,35 @@ impl Lot {
         Self::load_with(root, house, answers, frames, CrtRng::from_state(1))
     }
 
+    /// [`Lot::load`] with the tile at the house view's centre known from
+    /// the start ([`Lot::set_view_centre`]): the load's own steps (the
+    /// objects' visits, the selection, the frame before the first tick)
+    /// see it too.
+    pub fn load_viewed(
+        root: &Path,
+        house: &Path,
+        answers: &[u8],
+        frames: Frames,
+        view_centre: Option<[i8; 2]>,
+    ) -> Result<Self, BootError> {
+        let directory = house
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("the house file must be inside a neighborhood's Houses directory")?;
+        let neighborhood = Neighborhood::open(directory)?;
+        Self::boot(
+            root,
+            neighborhood,
+            house,
+            answers,
+            frames,
+            CrtRng::from_state(1),
+            &BTreeSet::new(),
+            None,
+            view_centre,
+        )
+    }
+
     /// [`Lot::load`] with the C runtime's generator (`World::crt_rng`)
     /// starting at `crt`: after a neighborhood's first open, for one,
     /// whose import and pools draw from it.
@@ -498,6 +530,7 @@ impl Lot {
             crt,
             frame_tree_bits,
             None,
+            None,
         )
     }
 
@@ -541,6 +574,7 @@ impl Lot {
             crt,
             &BTreeSet::new(),
             None,
+            None,
         )
     }
 
@@ -576,6 +610,7 @@ impl Lot {
             crt,
             &BTreeSet::new(),
             Some(handoff),
+            None,
         )
     }
 
@@ -590,6 +625,7 @@ impl Lot {
         crt: CrtRng,
         frame_tree_bits: &BTreeSet<(u16, usize)>,
         handoff: Option<&Handoff>,
+        view_centre: Option<[i8; 2]>,
     ) -> Result<Self, BootError> {
         let install = Install::detect(root)?;
         let mut index = Index::build(&install)?;
@@ -647,6 +683,7 @@ impl Lot {
         {
             let interpreter = Interpreter {
                 view_rotation,
+                view_centre,
                 ..Interpreter::new(&program, &catalog, Stream::Global)
             };
             // The lot the game holds before the load: empty, with the
@@ -868,6 +905,7 @@ impl Lot {
             asking: None,
 
             view_rotation,
+            view_centre,
             loaded,
         })
     }
@@ -974,6 +1012,7 @@ impl Lot {
             sounds: Some(&sounds),
             masks_rebuilt: Some(&masks_rebuilt),
             view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut frame_errors = Vec::new();
@@ -1108,6 +1147,7 @@ impl Lot {
         self.ready()?;
         let interpreter = Interpreter {
             view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -1133,6 +1173,7 @@ impl Lot {
         let interpreter = Interpreter {
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -1163,6 +1204,7 @@ impl Lot {
         let interpreter = Interpreter {
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -1192,6 +1234,7 @@ impl Lot {
         self.ready()?;
         let interpreter = Interpreter {
             view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -1214,6 +1257,7 @@ impl Lot {
         let interpreter = Interpreter {
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -1246,6 +1290,7 @@ impl Lot {
         let interpreter = Interpreter {
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -1402,6 +1447,27 @@ impl Lot {
         self.view_rotation = rotation & 3;
     }
 
+    /// The tile at the house view's centre, if known
+    /// ([`Lot::set_view_centre`]).
+    pub fn view_centre(&self) -> Option<[i8; 2]> {
+        self.view_centre
+    }
+
+    /// Sets the tile at the house view's centre, `None` for not known: the
+    /// tile a dialog's portrait searches from for a tile to put a person on
+    /// (0x4e96dd, 0x4347f0, 0x4a677c, 0x4a7b58), after the interface's
+    /// work on the view's pick ([`crate::Interpreter::view_centre`]), so
+    /// the simulation reads it, and it is an input like [`Lot::set_view_rotation`]: the view
+    /// that shows the lot would set it whenever its camera moves, and a
+    /// recording of play must note each change. Where it is not known and
+    /// the tile searched from would change what the portrait does, the
+    /// step fails as an unported branch does.
+    /// [`Lot::load`] leaves it not known (which camera the original opens a
+    /// house with is not traced); [`Lot::load_viewed`] takes it.
+    pub fn set_view_centre(&mut self, centre: Option<[i8; 2]>) {
+        self.view_centre = centre;
+    }
+
     /// What the load did.
     pub fn load_report(&self) -> &LoadReport {
         &self.load
@@ -1442,6 +1508,8 @@ mod tests {
                 libraries: BTreeMap::new(),
                 semi_globals: BTreeMap::new(),
                 careers: None,
+                career_texts_end: false,
+                labels_hold_no_token: false,
                 zoning: BTreeMap::new(),
                 animations: Default::default(),
                 people: Default::default(),
@@ -1473,6 +1541,7 @@ mod tests {
             asking: None,
 
             view_rotation: 0,
+            view_centre: None,
             loaded,
         }
     }

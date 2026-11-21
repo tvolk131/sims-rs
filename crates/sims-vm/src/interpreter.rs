@@ -140,6 +140,19 @@ pub struct Interpreter<'a> {
     /// gives 0, and a booted lot passes its own
     /// ([`crate::boot::Lot::set_view_rotation`]).
     pub view_rotation: u8,
+    /// The tile at the centre of the house view, which a dialog's portrait
+    /// searches from for a tile to put a person on (0x4e96dd, 0x4347f0:
+    /// the view's pick at the centre of its rectangle, 0x4a677c,
+    /// 0x4a7b58). It is where the player's camera is, not the lot's, so it
+    /// is an input like [`Interpreter::view_rotation`]: None (not known)
+    /// from [`Interpreter::new`], and a booted lot passes its own
+    /// ([`crate::boot::Lot::set_view_centre`]). The interface's work on
+    /// the pick is not ported (by a reading of the disassembly,
+    /// **unverified**: a bounds check with a fallback, 0x434891, the
+    /// view's rotation undone, 0x43491c, and a clamp), so the input is the
+    /// tile the search starts from, after all of it: not the pick, and
+    /// not turned by [`Interpreter::view_rotation`].
+    pub view_centre: Option<[i8; 2]>,
     /// While a person's own tick runs its thread, the person and the
     /// animator refresh pending from its taking itself off the lot
     /// ([`crate::placement::Refreshing`]). None otherwise.
@@ -154,6 +167,11 @@ pub struct Interpreter<'a> {
     /// off the lot (`Interpreter::refresh_at_take_off`), where a timed
     /// event that would play a sound fails ([`crate::clip_events`]).
     pub(crate) take_off_refresh: bool,
+    /// While a dialog's portrait searches for a tile from every start
+    /// (`Interpreter::portrait_put`): a callback tree that runs must leave
+    /// the lot and every cell as it found them, or it fails, since which
+    /// callbacks the original runs depends on the start.
+    pub(crate) callbacks_must_be_pure: bool,
 }
 
 /// One call of the original's "run this object's function" (0x422d46):
@@ -182,9 +200,11 @@ impl<'a> Interpreter<'a> {
             letting_go: None,
             deleting: None,
             view_rotation: 0,
+            view_centre: None,
             refreshing: None,
             taken_off: None,
             take_off_refresh: false,
+            callbacks_must_be_pure: false,
         }
     }
 
@@ -327,6 +347,7 @@ impl<'a> Interpreter<'a> {
             letting_go: self.letting_go,
             deleting: self.deleting,
             view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
             refreshing: self.refreshing,
             taken_off: self.taken_off,
             checking: false,
@@ -431,6 +452,8 @@ pub(crate) struct Machine<'a, 'w> {
     pub(crate) deleting: Option<&'a RefCell<std::collections::BTreeSet<u16>>>,
     /// See [`Interpreter::view_rotation`].
     pub view_rotation: u8,
+    /// See [`Interpreter::view_centre`].
+    pub view_centre: Option<[i8; 2]>,
     /// See [`Interpreter::refreshing`].
     pub(crate) refreshing: Option<&'a RefCell<crate::placement::Refreshing>>,
     /// See [`Interpreter::taken_off`].
@@ -456,9 +479,11 @@ impl<'a> Machine<'a, '_> {
             letting_go: self.letting_go,
             deleting: self.deleting,
             view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
             refreshing: self.refreshing,
             taken_off: self.taken_off,
             take_off_refresh: false,
+            callbacks_must_be_pure: false,
         }
     }
 
@@ -927,7 +952,9 @@ impl<'a> Machine<'a, '_> {
     /// person is queued for removal. The refresh at the take-off may or
     /// may not have been made, and what it writes is what such a
     /// primitive could read. Remove Object Instance checks for itself
-    /// (`Machine::remove`) while the refresh is pending.
+    /// (`Machine::remove`) while the refresh is pending. While a step runs
+    /// both ways (`crate::both_ways`) the refresh is taken out, so the
+    /// step may read the animator.
     pub(crate) fn refuse_unsettled_animator(&self, opcode: u16) -> Result<(), Trap> {
         if let Some(refreshing) = self.refreshing
             && let Some(person) = refreshing
@@ -944,7 +971,15 @@ impl<'a> Machine<'a, '_> {
                 crate::primitives::primitive_name(opcode),
             )));
         }
-        if self.world.removals.contains(&self.me) && self.me()?.person.is_some() {
+        // A person whose own thread queued it for removal in this tick,
+        // with its refresh pending, has that removal's refresh in the
+        // pending one: the removal joins it (`Interpreter::refresh_again`)
+        // or sets it (`Interpreter::refresh_before_removal`), and a step
+        // that reads its animator runs both ways (`crate::both_ways`).
+        let both_ways = self
+            .refreshing
+            .is_some_and(|r| r.borrow().both_ways && r.borrow().person == self.me);
+        if self.world.removals.contains(&self.me) && self.me()?.person.is_some() && !both_ways {
             return Err(Trap::Unsupported(format!(
                 "{} (opcode {opcode}) on the thread of person {}, which is queued for removal: its \
                  animator's refresh as it left the lot (0x58da12), if the house view drew it, \
@@ -975,6 +1010,16 @@ impl<'a> Machine<'a, '_> {
         if instruction.opcode >= 256 {
             self.call(instruction)?;
             return Ok(Status::Running);
+        }
+        // With a person's animator refresh pending, a primitive that may
+        // read an animator runs both ways (`crate::both_ways`). Remove
+        // Object Instance checks for itself (`Machine::remove`).
+        if let Some(refreshing) = self.refreshing
+            && refreshing.borrow().pending.is_some()
+            && instruction.opcode != 18
+            && !crate::placement::reads_no_animator(instruction.opcode, &instruction.operands)
+        {
+            return self.step_both_ways(refreshing, instruction.opcode);
         }
         // Go To Routing Slot applies these checks itself on its first run,
         // once it has named its slot and found its stack object on the lot

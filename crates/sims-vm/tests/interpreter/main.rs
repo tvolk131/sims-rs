@@ -31,6 +31,7 @@ mod object_type;
 mod object_uses;
 mod objects;
 mod person_factory;
+mod portrait;
 mod presentation;
 mod push;
 mod random;

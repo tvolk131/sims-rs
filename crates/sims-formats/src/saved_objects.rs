@@ -59,7 +59,7 @@ pub struct Multipart {
 /// Postcard writes an integer by its value whatever its width, so an
 /// action that does not join encodes as it did before the word was kept,
 /// and the world's pinned hashes stand.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(from = "EncodedInteraction", into = "EncodedInteraction")]
 pub struct Interaction {
     /// The action's word +0, kept as it is: the game saves it first

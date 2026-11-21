@@ -280,6 +280,13 @@ impl Iff {
             .get(&(*tag, id, 0))
             .map(|&i| &self.chunks[i])
     }
+    /// Why the file's resource map could not be used, if it could not. The
+    /// original reads the map as it is (0x41bfdd to 0x41c032), so the
+    /// resources [`Iff::get`] and [`Iff::all`] give are then not the
+    /// original's.
+    pub fn map_error(&self) -> Option<&crate::Error> {
+        self.resources.map_error.as_ref()
+    }
     /// The resources of type `tag` in the original's order. When the
     /// resource map cannot be used, the chunks as if there were no map.
     pub fn all<'a>(&'a self, tag: &'a [u8; 4]) -> impl Iterator<Item = &'a Chunk> {

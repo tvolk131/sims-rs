@@ -36,6 +36,7 @@
 mod animator;
 mod autonomy;
 pub mod boot;
+mod both_ways;
 mod cancel;
 mod clip_events;
 mod daily;
@@ -81,8 +82,8 @@ pub use objects::{READ_BEFORE_THE_FIRST_LOAD, SavedRead, read_before_the_first_l
 pub use people::{curve_table, persistent_fields, reload_profile};
 pub use primitives::primitive_name;
 pub use program::{
-    Callback, Career, DEFINITION_WORDS, ICON_FILE, Library, Program, Tree, icon_frames,
-    sprite_frames,
+    Callback, Career, DEFINITION_WORDS, ICON_FILE, LABEL_FILE, Library, Program, Tree, icon_frames,
+    labels_hold_no_token, loaded_order, sprite_frames, unported_strings,
 };
 pub use selection::selected;
 pub use sounds::SoundEvent;

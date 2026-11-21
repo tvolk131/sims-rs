@@ -421,12 +421,23 @@ fn routing_18_bytes(routing: &sims_sim::route::Routing) -> Vec<u8> {
     bytes
 }
 
+/// The encoding of `world` as snapshot format 30 wrote it: without the
+/// person types whose portrait the interface has built
+/// ([`sims_sim::World::portraits`]) that format 31 added at the end. The
+/// older formats' encodings start from this one.
+fn format_30_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = world.encode();
+    let built = postcard::to_allocvec(&world.portraits).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - built.len()), built);
+    bytes
+}
+
 /// The encoding of `world` as snapshot format 29 wrote it: without the
 /// person types made while the game runs ([`sims_sim::World::characters`])
 /// that format 30 added at the end. The older formats' encodings start
 /// from this one.
 fn format_29_bytes(world: &World) -> Vec<u8> {
-    let mut bytes = world.encode();
+    let mut bytes = format_30_bytes(world);
     let made = postcard::to_allocvec(&world.characters).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - made.len()), made);
     bytes

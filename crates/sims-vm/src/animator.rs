@@ -83,6 +83,7 @@
 //! way the layers are updated once, and which routine ran changes only the
 //! pose.
 
+use crate::both_ways::{Cells, same_lot};
 use crate::fault::Trap;
 use crate::interpreter::Interpreter;
 use crate::people::read_appearance_if_stale;
@@ -91,7 +92,6 @@ use sims_core::{Ext, F32};
 use sims_sim::World;
 use sims_sim::animator::{Animator, Base, EPSILON, LOADED, Layer, UNSET};
 use sims_sim::pose;
-use std::cell::RefCell;
 use std::cmp::Ordering;
 
 /// Person data words.
@@ -340,18 +340,19 @@ impl Interpreter<'_> {
 
     /// Person `id`'s animator refresh at its taking itself off the lot
     /// ([`Interpreter::take_self_off`]), worked out on a copy of `world`
-    /// as the take-off leaves it. It fails unless the refresh writes
-    /// nothing but the person's animator and base layer and plays no
-    /// sound, so that what runs before the person's animator tick sees
+    /// as the take-off leaves it, and on copies of the interpreter's cells
+    /// ([`Cells`]). It fails unless the refresh writes nothing but the
+    /// person's animator and base layer, and nothing in the cells (so
+    /// plays no sound), so that what runs before the person's animator tick sees
     /// the same lot whether or not the original made it. The sounds of
     /// timed events are not modeled, so a timed event with a sound key
     /// fails here ([`crate::clip_events`]).
     pub(crate) fn refresh_at_take_off(&self, world: &World, id: u16) -> Result<Pending, Trap> {
-        let sounds = RefCell::new(Vec::new());
+        let cells = Cells::of(self);
+        let refreshed_cells = cells.copy();
         let apart = Interpreter {
-            sounds: self.sounds.map(|_| &sounds),
             take_off_refresh: true,
-            ..*self
+            ..refreshed_cells.on(self)
         };
         let mut refreshed = world.clone();
         apart.refresh_animator(&mut refreshed, id)?;
@@ -360,7 +361,7 @@ impl Interpreter<'_> {
             refreshed: Kept::of(&refreshed, id),
         };
         pending.left.restore(&mut refreshed, id);
-        if refreshed.encode() != world.encode() || !sounds.borrow().is_empty() {
+        if !same_lot(&refreshed, world) || !refreshed_cells.same(&cells) {
             return Err(Trap::Unsupported(format!(
                 "person {id} left the lot, and its animator's refresh there (0x58da12), \
                  made only if the house view drew it (animator byte +0x109, which is not kept), \
@@ -381,10 +382,13 @@ impl Interpreter<'_> {
     ///    between, [`crate::placement::reads_no_animator`], read none of
     ///    them).
     /// 2. The tick from the refreshed animator and base layer, on the lot
-    ///    as it is now, reaches the same world, and the same sounds, as
-    ///    the tick alone.
+    ///    as it is now, gives the same result, reaches the same world, and
+    ///    leaves the same in every cell the interpreter shares with the
+    ///    rest of the tick ([`Cells`]), as the tick alone. Each tick runs
+    ///    on its own copies of the lot and the cells.
     ///
-    /// The tick alone is what is kept. Anything else fails.
+    /// The tick alone is what is kept. Anything else fails, and leaves the
+    /// lot and the cells as they were.
     pub(crate) fn tick_animator_after_take_off(
         &self,
         world: &mut World,
@@ -403,25 +407,25 @@ impl Interpreter<'_> {
                 "its animator or base layer changed before its animator's tick",
             ));
         }
-        let sounds = RefCell::new(Vec::new());
-        let apart = Interpreter {
-            sounds: self.sounds.map(|_| &sounds),
-            ..*self
-        };
+        let cells = Cells::of(self);
+        let mut left = world.clone();
+        let left_cells = cells.copy();
+        let ticked = left_cells.on(self).tick_animator(&mut left, id);
         let mut refreshed = world.clone();
         pending.refreshed.restore(&mut refreshed, id);
-        apart.tick_animator(&mut refreshed, id)?;
-        let before = self.sounds.map_or(0, |s| s.borrow().len());
-        self.tick_animator(world, id)?;
-        let same_sounds = self
-            .sounds
-            .is_none_or(|s| s.borrow()[before..] == sounds.borrow()[..]);
-        if refreshed.encode() != world.encode() || !same_sounds {
+        let refreshed_cells = cells.copy();
+        let refreshed_ticked = refreshed_cells.on(self).tick_animator(&mut refreshed, id);
+        if ticked != refreshed_ticked
+            || !same_lot(&left, &refreshed)
+            || !left_cells.same(&refreshed_cells)
+            || !left_cells.same_refresh(&cells)
+        {
             return Err(refused(
                 "the refresh then the tick reach another state than the tick alone",
             ));
         }
-        Ok(())
+        left_cells.keep(self, world, left);
+        ticked
     }
 
     /// Updates the foreground layer, if there is one, at clock `now`

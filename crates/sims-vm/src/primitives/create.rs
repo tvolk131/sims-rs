@@ -74,19 +74,20 @@
 //! 0x0183), which is **unverified**: the run has left track 2's recording
 //! by then.
 //!
-//! The person test (0x44e6b6 to 0x44e727) is left out. When the new
-//! object is a person (definition type 2) with bit 0 of person word 84
-//! (+0x634) or 68 (+0x614) set, or bit 0 or 1 of word 74 (+0x620), the
-//! original calls 0x45810c with 1, then sets bit 0x20000000 of the
-//! screen's flags (`[[0x6f2a58]+0xb0]+0xc`, 0x4ceceb). 0x45810c looks
-//! its type's handle up (0x4eb0eb) in the table at 0x6f2698 (0x44-byte
-//! entries, which only the interface code reads) and, when it is there,
-//! resets seven of the entry's members (0x4e895e, 0x5a5f79) and sets the
-//! same screen flag. Nothing the sim reads is written, so the port does
-//! nothing.
-//! **Unverified** that the table is only what is drawn: no capture covers
-//! a person made with these words set (the Goth house's tick 30320,
-//! object 243 making person 36).
+//! The person test (0x44e6b6 to 0x44e727): when the new object is a
+//! person (definition type 2) with bit 0 of person word 84 (+0x634) or 68
+//! (+0x614) set, or bit 0 or 1 of word 74 (+0x620), the original calls
+//! 0x45810c with 1, then sets bit 0x20000000 of the screen's flags
+//! (`[[0x6f2a58]+0xb0]+0xc`, 0x4ceceb). 0x45810c looks its type's handle
+//! up (0x4eb0eb) in the interface's table of person types at 0x6f2698
+//! (0x44-byte entries) and, when it is there, resets seven of the
+//! entry's images (0x4e895e, 0x5a5f79), each marked to be built. A
+//! dialog's portrait reads that mark (0x4e92a8) and, with nobody of the
+//! type on the lot, builds it by making a person, which runs sim code.
+//! So the port takes the type out of [`sims_sim::World::portraits`]
+//! (`Machine::make_person`); the screen flags are presentation. The Goth
+//! house's tick 30320 makes such a person (object 243 making person 36),
+//! whose type has no portrait built then, so nothing changes there.
 //!
 //! The object is made by [`crate::Interpreter::create`] (0x440b2d), or a
 //! person by [`crate::Interpreter::create_person`], so its Init and first
@@ -223,8 +224,9 @@ impl Machine<'_, '_> {
     ///    path and then takes its record's interests and personality
     ///    ([`Machine::make_person`], 0x44e608).
     /// 4. Flag 0x20 turns it ([`Machine::face_as_stack_object`]).
-    /// 5. A new person's person test (see the module's note) touches only the
-    ///    screen, and is left out.
+    /// 5. A new person's person test (see the module's note): its portrait
+    ///    entry's reset is done in [`Machine::make_person`]; the redraw is
+    ///    presentation, and is left out.
     /// 6. The place test and the put are skipped (0x44e72c): the object
     ///    stays off the lot where it was made.
     /// 7. Flag 0x4 runs a visitor's "init visitor" tree
@@ -341,6 +343,16 @@ impl Machine<'_, '_> {
     /// Makes a person (0x440b2d, [`crate::Interpreter::create_person`])
     /// and gives it its neighborhood record's interests and personality
     /// (0x425930), as 0x44e0c8 does for any new person (0x44e608).
+    ///
+    /// Then, as the original does for a new person in every mode (0x44e6b6
+    /// to 0x44e70b, after flag 0x20's turn, which touches none of the
+    /// words read): when person word 84 bit 0 (+0x634), word 68 bit 0
+    /// (+0x614), or word 74 bit 1 or bit 0 (+0x620) is set, the
+    /// interface's portrait entry of its type is reset (0x45810c,
+    /// 0x4eb0eb, 0x4e895e: each image let go and marked to build), so the
+    /// next dialog's portrait of the type builds it again
+    /// ([`sims_sim::World::portraits`], 0x4e92a8). The redraw it asks for
+    /// (0x4ceceb) is presentation.
     fn make_person(&mut self, guid: u32) -> Result<u16, Trap> {
         let interpreter = self.interpreter();
         let unsupported = |fault: crate::fault::Fault| {
@@ -356,6 +368,17 @@ impl Machine<'_, '_> {
                 trap,
             })
         })?;
+        let word = |index: usize| {
+            self.world
+                .objects
+                .get(&id)
+                .and_then(|object| object.person.as_ref())
+                .and_then(|person| person.data.get(index).copied())
+                .unwrap_or(0)
+        };
+        if word(84) & 1 != 0 || word(68) & 1 != 0 || word(74) & 3 != 0 {
+            self.world.portraits.remove(&guid);
+        }
         Ok(id)
     }
 
@@ -550,8 +573,9 @@ impl Machine<'_, '_> {
     ///    0x4c, one step each. Nothing turns when the stack object names no
     ///    object. A group turns by 0x422937, a one-tile object by 0x433f75
     ///    ([`crate::Interpreter::turn_one`]).
-    /// 6. A new person's person test (see the module's note) touches only the
-    ///    screen, and is left out.
+    /// 6. A new person's person test (see the module's note): its portrait
+    ///    entry's reset is done in [`Machine::make_person`]; the redraw is
+    ///    presentation, and is left out.
     /// 7. The place test (virtual function 0x54, with no container) at the
     ///    exact position. If it refuses, the new object is removed at once
     ///    (0x44123f) and the false branch is taken. Removing a person is
