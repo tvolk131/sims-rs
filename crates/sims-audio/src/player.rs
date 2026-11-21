@@ -593,21 +593,21 @@ fn xorshift(state: &mut u64, below: u32) -> u32 {
 /// startup: the base game's tables, then the station patches, then the
 /// expansions' and the downloads' tables ([`Registry::rank`]), each
 /// module's in file order. Modules of one rank keep their order here.
-fn registry(modules: &[Module], station_patches: &[u32]) -> Registry {
+fn registry(modules: &[Module], station_patches: &[(u32, String)]) -> Registry {
     let mut registry = Registry::new();
     let mut stations = Some(station_patches);
     for m in registration_order(modules) {
         if Registry::rank(&modules[m].name) > 0
             && let Some(ids) = stations.take()
         {
-            ids.iter().for_each(|&id| registry.insert(id));
+            ids.iter().for_each(|(id, _)| registry.insert(*id));
         }
         for &(id, _) in &modules[m].hot.registered {
             registry.insert(id);
         }
     }
     if let Some(ids) = stations {
-        ids.iter().for_each(|&id| registry.insert(id));
+        ids.iter().for_each(|(id, _)| registry.insert(*id));
     }
     registry
 }
@@ -633,10 +633,31 @@ fn registration_order(modules: &[Module]) -> Vec<usize> {
 /// tracks of a download registered later. A start that finds a patch
 /// object starts nothing (its slot returns at once, 0x57bf80), and a note
 /// whose patch is a track object fails (0x57f6ac to 0x57f703).
-fn owners(modules: &[Module]) -> (BTreeMap<u32, usize>, BTreeMap<u32, (usize, String)>) {
+///
+/// The station patches (module 0 here) register through the same routine
+/// (0x5750dc calls 0x57cdd5), after the base game's tables and before the
+/// expansions', with numbers their allocator hands out without looking
+/// at the registry (0x57d386): one replaces a base game object of its
+/// number, and an expansion's or a download's replaces it.
+fn owners(
+    modules: &[Module],
+    station_patches: &[(u32, String)],
+) -> (BTreeMap<u32, usize>, BTreeMap<u32, (usize, String)>) {
     let mut tracks = BTreeMap::new();
     let mut patches = BTreeMap::new();
+    let mut stations = Some(station_patches);
+    let add_stations = |tracks: &mut BTreeMap<u32, usize>,
+                        patches: &mut BTreeMap<u32, (usize, String)>,
+                        stations: &mut Option<&[(u32, String)]>| {
+        for (id, path) in stations.take().into_iter().flatten() {
+            patches.insert(*id, (0, path.clone()));
+            tracks.remove(id);
+        }
+    };
     for m in registration_order(modules) {
+        if Registry::rank(&modules[m].name) > 0 {
+            add_stations(&mut tracks, &mut patches, &mut stations);
+        }
         let hot = &modules[m].hot;
         for &(id, object) in &hot.registered {
             match object {
@@ -651,6 +672,7 @@ fn owners(modules: &[Module]) -> (BTreeMap<u32, usize>, BTreeMap<u32, (usize, St
             }
         }
     }
+    add_stations(&mut tracks, &mut patches, &mut stations);
     (tracks, patches)
 }
 
@@ -676,7 +698,7 @@ fn entry_points(modules: &[Module]) -> BTreeMap<u32, Place> {
 }
 
 /// *(code)* The hit lists, each from the module whose line registered it
-/// last: the HOT reader makes a new list for each `[HitList]` line
+/// last: the HOT reader makes a new list for each `[GlobalHitList]` line
 /// (0x57ba20) and the table keeps the newest for its ID (0x57d261). The
 /// stations add to the lists there are when they are built (0x574c9e to
 /// 0x574cb7, 0x574e74), after the base game's tables and before the
@@ -750,8 +772,9 @@ pub struct Player<S> {
     /// *(code)* The registry of patch and track objects (manager +0x80),
     /// for the order the unpause goes through them.
     registry: Registry,
-    /// The station patches added, in the order they were made.
-    station_patches: Vec<u32>,
+    /// The station patches added, in the order they were made, with their
+    /// samples' paths.
+    station_patches: Vec<(u32, String)>,
     cache: BTreeMap<u32, Option<Pcm>>,
     globals: [i32; 256 - GLOBALS as usize],
     threads: Vec<Thread>,
@@ -832,7 +855,7 @@ impl<S: Samples> Player<S> {
     /// [`Module::load_all`] returns them). `seed` starts its random
     /// numbers.
     pub fn new(modules: Vec<Module>, samples: S, seed: u64) -> Self {
-        let (tracks, patches) = owners(&modules);
+        let (tracks, patches) = owners(&modules, &[]);
         let track_data = entry_points(&modules);
         let hit_lists = hit_lists(&modules, &BTreeMap::new());
         let registry = registry(&modules, &[]);
@@ -1390,17 +1413,18 @@ impl<S: Samples> Player<S> {
     /// Adds the stations' hit lists and patches (see
     /// [`crate::stations`]), which the original builds from directories
     /// when it starts. A hit list the sound tables already list is added
-    /// to, as [`hit_lists`] says; a patch number already taken is left
-    /// alone.
+    /// to, as [`hit_lists`] says; a patch replaces a base game object of
+    /// its number, and an expansion's or a download's replaces it, as
+    /// [`owners`] says.
     pub fn add_stations(&mut self, lists: &StationLists) {
         add_station_lists(&mut self.station_lists, &lists.hit_lists);
         self.hit_lists = hit_lists(&self.modules, &self.station_lists);
         for (&id, path) in &lists.patches {
-            self.patches.entry(id).or_insert_with(|| (0, path.clone()));
             // Numbered in the order they are made, each registered then
             // (0x574f0e).
-            self.station_patches.push(id);
+            self.station_patches.push((id, path.clone()));
         }
+        (self.tracks, self.patches) = owners(&self.modules, &self.station_patches);
         // The original builds the stations between the base game's
         // tables and the expansions' ([`crate::registry`]).
         self.registry = registry(&self.modules, &self.station_patches);
@@ -1628,6 +1652,12 @@ impl<S: Samples> Player<S> {
         }
     }
 
+    /// Whether the registry has an object of this ID (0x573312), a track
+    /// or a patch.
+    fn registered(&self, id: u32) -> bool {
+        self.tracks.contains_key(&id) || self.patches.contains_key(&id)
+    }
+
     /// The newest running thread of a track, as an index.
     fn newest(&self, track: u32) -> Option<usize> {
         self.threads
@@ -1732,7 +1762,9 @@ impl<S: Samples> Player<S> {
     /// not exist.
     fn cancel_radio_notes(&mut self) {
         for track in RADIO_TRACKS {
-            if self.owner(track).is_none() {
+            // A patch object of the number is no track, but it exists
+            // (0x573a29 to 0x573a5c).
+            if !self.registered(track) {
                 return;
             }
             if let Some(at) = self.newest(track) {
@@ -1976,7 +2008,11 @@ impl<S: Samples> Player<S> {
     /// [`PIANO_SKILL`] starts, when it exists, with it as its first
     /// argument.
     fn play_piano(&mut self, args: [u32; 3], sources: &dyn Sources) {
-        if self.owner(PIANO).is_none() {
+        // A patch object of the number goes on: its start does nothing
+        // (0x573e95, 0x57bf80), and the skill track is still started
+        // (0x573ec3 to 0x573ef2). **Unverified:** what instance it
+        // records (its slot +0x24, 0x573e9c).
+        if !self.registered(PIANO) {
             return;
         }
         let mut args = args;
@@ -2010,9 +2046,9 @@ impl<S: Samples> Player<S> {
     /// idle track object does, chained to the patch an earlier such event
     /// started if that still plays.
     fn sequence(&mut self, track: u32, hit_list: u32) {
-        let Some(owner) = self.owner(track) else {
+        if !self.registered(track) {
             return;
-        };
+        }
         let Some(list) = self.hit_lists.get(&hit_list).cloned() else {
             self.report(format!("no hit list {hit_list}"));
             return;
@@ -2020,6 +2056,11 @@ impl<S: Samples> Player<S> {
         let patch = match list.len() {
             0 => 0,
             n => list[self.random(n as u32) as usize],
+        };
+        // A patch object of the number still picks from the list; its
+        // slot then does nothing (0x573f1b to 0x573f2b, 0x57fcd2).
+        let Some(owner) = self.owner(track) else {
+            return;
         };
         match self.newest(track) {
             Some(at) => {

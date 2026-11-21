@@ -1490,6 +1490,35 @@ fn the_piano_plays_where_its_object_is_and_sets_the_skill() {
 }
 
 #[test]
+fn a_piano_whose_number_is_a_patch_still_starts_the_skill_track() {
+    use sims_audio::player::{PIANO, PIANO_SKILL};
+    // The piano's number is registered as a patch. Its start does
+    // nothing (0x57bf80), but the skill is still asked for and the skill
+    // track started (0x573ec3 to 0x573ef2).
+    let skill = [GETSRCDATAFIELD, 6, 1, 19, GETSRCDATAFIELD, 6, 1, 20, END];
+    let events = format!("piano=43,0\n[Patch]\n{PIANO}=0,p,\"one.xa\"\n");
+    let module = module_of_tracks(&[(PIANO_SKILL, &skill)], &events);
+    let mut player = Player::new(vec![module], samples(), 1);
+    let room = PianoRoom::default();
+    let asked = || {
+        let mut asked = std::mem::take(&mut *room.0.borrow_mut());
+        asked.sort();
+        asked
+    };
+    player.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: "piano".into(),
+        },
+        &room,
+    );
+    assert_eq!(asked(), [(9, 5)]);
+    player.render(BLOCK, &room);
+    assert_eq!(asked(), [(42, 0), (42, 0)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
 fn a_piano_let_go_from_a_pause_keeps_its_object() {
     use sims_audio::player::{PIANO, PIANO_SKILL};
     let mut piano = vec![SET_LOOP];
@@ -2902,10 +2931,15 @@ fn a_track_runs_from_the_module_registered_last_whichever_module_asks() {
 fn the_expansions_register_in_their_directories_order_not_by_name() {
     // `Deluxe` registers after `ExpansionPack2` (0x414392 to 0x414458),
     // though its name sorts first and it comes first here: its track 10
-    // is the one that runs, even from the other module's event.
+    // is the one that runs, even from the other module's event. (The two
+    // tracks' entry points have different track data IDs, 0x100 and
+    // 0x101, so the descriptor decides which routine runs.)
     let mut deluxe = module_of_tracks(&[(10, &asks(8, false))], "");
     deluxe.name = "deluxe\\sound\\d".to_owned();
-    let mut pack = module_of_tracks(&[(10, &asks(7, false))], "again=kSndobPlay,10\n");
+    let mut pack = module_of_tracks(
+        &[(99, &[END]), (10, &asks(7, false))],
+        "again=kSndobPlay,10\n",
+    );
     pack.name = "expansionpack2\\sound\\e".to_owned();
     let mut player = Player::new(vec![deluxe, pack], samples(), 1);
     play(&mut player, "again");
@@ -3033,6 +3067,43 @@ fn an_id_registered_again_as_the_other_kind_is_that_kind_only() {
     play(&mut player, "e1");
     assert_eq!(player.render(3, &NoSources), [0, 0, 0]);
     assert_eq!(player.faults, ["patch 1 is a track"]);
+}
+
+#[test]
+fn a_station_patch_replaces_a_base_game_object_and_an_expansion_replaces_it() {
+    // The base game's track 10 plays patch 1, `one.xa`. Station patches
+    // register after the base game's tables (0x5750dc, 0x57cdd5): station
+    // patch 1, `two.xa`, replaces its patch 1, and station patch 10 its
+    // track 10, which then starts nothing, and no fault.
+    let base = || {
+        let mut base = module_with(&[&GENERIC], 1, 10, "");
+        base.name = "sounddata\\base".to_owned();
+        base
+    };
+    let stations = |ids: &[u32]| StationLists {
+        hit_lists: BTreeMap::new(),
+        patches: ids.iter().map(|&id| (id, "two.xa".to_owned())).collect(),
+    };
+    let mut player = Player::new(vec![base()], samples(), 1);
+    player.add_stations(&stations(&[1]));
+    play(&mut player, "e0");
+    assert_eq!(player.render(3, &NoSources), [2000, 4000, -2000]);
+    let mut player = Player::new(vec![base()], samples(), 1);
+    player.add_stations(&stations(&[10]));
+    play(&mut player, "e0");
+    assert!(player.is_idle());
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+    // An expansion's patch 1, `one.xa` again, registers after the
+    // stations and replaces station patch 1.
+    let (hit, _) = assemble(&[]);
+    let mut expansion =
+        Module::parse("test", &hit, b"v1 5\n", b"[Patch]\n1=0,one,\"one.xa\"\n").unwrap();
+    expansion.name = "expansionpack\\more".to_owned();
+    let mut player = Player::new(vec![expansion, base()], samples(), 1);
+    player.add_stations(&stations(&[1]));
+    play(&mut player, "e0");
+    assert_eq!(player.render(3, &NoSources), [1, 2, 3]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
 
 #[test]
