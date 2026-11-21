@@ -266,11 +266,17 @@ impl Interpreter<'_> {
         if !inside_placement_bounds(world, pos) {
             return Ok(false);
         }
-        if self.try_place_buy_at(world, cursor, pos, level, retained)? {
-            return Ok(cursor.valid);
-        }
-        if self.try_wall_auto_rotate(world, cursor, pos, level)? {
-            return Ok(cursor.valid);
+        // Native `0x485ced`: check whether `"Tile Cursor"` fits at snapped
+        // `pos` BEFORE trying snapped placement or wall/pool auto-rotation
+        // (`0x48736b`); if it does not fit, jump straight to unsnapped
+        // fallback (`0x485f23`).
+        if self.fits(world, cursor.cursor, pos, level)? {
+            if self.try_place_buy_at(world, cursor, pos, level, retained)? {
+                return Ok(cursor.valid);
+            }
+            if self.try_wall_auto_rotate(world, cursor, pos, level)? {
+                return Ok(cursor.valid);
+            }
         }
         // Snapped placement (and any wall/pool auto-rotation) failed: native
         // `0x485f2f` checks whether `"Tile Cursor"` fits at unsnapped `fine`
@@ -314,6 +320,9 @@ impl Interpreter<'_> {
         level: i32,
         retained: Option<(u16, i16)>,
     ) -> Result<bool, Fault> {
+        if !self.fits(world, cursor.cursor, at, level)? {
+            return Ok(false);
+        }
         let affordable = cursor.price <= 0 || cursor.price <= available_funds(world);
         let Some(container) =
             self.test_buy_placement(world, cursor.cursor, cursor.held, at, level, retained)?
@@ -333,16 +342,14 @@ impl Interpreter<'_> {
             level,
         };
         self.put(world, cursor.held, held_place, true)?;
-        if self.fits(world, cursor.cursor, at, level)? {
-            let cursor_place = Place {
-                on_lot: true,
-                position: at,
-                container: None,
-                slot: -1,
-                level,
-            };
-            self.put(world, cursor.cursor, cursor_place, true)?;
-        }
+        let cursor_place = Place {
+            on_lot: true,
+            position: at,
+            container: None,
+            slot: -1,
+            level,
+        };
+        self.put(world, cursor.cursor, cursor_place, true)?;
         Ok(true)
     }
 
@@ -446,6 +453,13 @@ impl Interpreter<'_> {
         if !on_lot([x, y]) || !inside_placement_bounds(world, [x, y]) {
             return Ok(false);
         }
+        // Native `0x422752`: gate manual rotation re-placement (including
+        // unsnapped overlap callbacks at `0x42276d` → `0x421e72` → `0x4355b5`)
+        // on `"Tile Cursor"` fitting at `[x, y, level]` first.
+        if !self.fits(world, cursor.cursor, [x, y], level)? {
+            cursor.position = [x, y, level];
+            return Ok(false);
+        }
         if self.try_place_buy_at(world, cursor, [x, y], level, retained)? {
             return Ok(cursor.valid);
         }
@@ -461,16 +475,14 @@ impl Interpreter<'_> {
         cursor.position = [x, y, level];
         cursor.valid = false;
         cursor.container = None;
-        if self.fits(world, cursor.cursor, [x, y], level)? {
-            let cursor_place = Place {
-                on_lot: true,
-                position: [x, y],
-                container: None,
-                slot: -1,
-                level,
-            };
-            self.put(world, cursor.cursor, cursor_place, true)?;
-        }
+        let cursor_place = Place {
+            on_lot: true,
+            position: [x, y],
+            container: None,
+            slot: -1,
+            level,
+        };
+        self.put(world, cursor.cursor, cursor_place, true)?;
         Ok(false)
     }
 
@@ -592,9 +604,6 @@ impl Interpreter<'_> {
         purchase: &mut BuyPurchase,
     ) -> Result<bool, Fault> {
         let [x, y, level] = purchase.position;
-        if purchase.price > 0 && purchase.price > available_funds(world) {
-            return Ok(false);
-        }
         if !on_lot([x, y]) || !inside_placement_bounds(world, [x, y]) {
             return Ok(false);
         }

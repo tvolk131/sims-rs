@@ -820,7 +820,6 @@ impl<'a> Painter<'a> {
         if (0..2).any(|i| corner[i] < -reach || corner[i] > size[i].saturating_add(reach)) {
             return;
         }
-        let depth = self.depth.grass(view, i32::from(heights[1]));
         let left = corner[0] + GRASS_COLUMN;
         let base_y = corner[1] + GRASS_ROW;
         let shift = zoom + 1;
@@ -836,7 +835,7 @@ impl<'a> Painter<'a> {
             while px < left + half_w {
                 let py = y_fp >> 16;
                 if py < self.clip_bottom {
-                    self.canvas.plot(px, py, depth, [0, 0, 0]);
+                    self.canvas.plot_color(px, py, [0, 0, 0]);
                 }
                 px += step;
                 y_fp += dy * step;
@@ -849,7 +848,7 @@ impl<'a> Painter<'a> {
             while px < left + half_w * 2 {
                 let py = y_fp >> 16;
                 if py < self.clip_bottom {
-                    self.canvas.plot(px, py, depth, [0, 0, 0]);
+                    self.canvas.plot_color(px, py, [0, 0, 0]);
                 }
                 px += step;
                 y_fp += dy * step;

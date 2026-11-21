@@ -1692,7 +1692,6 @@ impl Game {
         if !allowed || self.stopped.is_some() {
             return false;
         }
-        self.buy_dragging = None;
         let result = if undo {
             self.lot.buy_undo()
         } else {
