@@ -3553,6 +3553,22 @@ impl<S: Samples> Player<S> {
         }
     }
 
+    /// Copies the currently running thread clone into `self.threads` before an
+    /// operation that reads or refreshes all running threads.
+    fn sync_thread_to_store(&mut self, thread: &Thread) {
+        if let Some(slot) = self.threads.iter_mut().find(|t| t.id == thread.id) {
+            *slot = thread.clone();
+        }
+    }
+
+    /// Pulls any in-place updates (such as refreshed `latched_gains` from
+    /// `apply_running_gains`) from `self.threads` back into the running clone.
+    fn sync_thread_from_store(&self, thread: &mut Thread) {
+        if let Some(slot) = self.threads.iter().find(|t| t.id == thread.id) {
+            *thread = slot.clone();
+        }
+    }
+
     /// Writes a register, with the original's side effects (`0x57de57`,
     /// `0x57de98`). Every write other than to `target` (53) goes to the
     /// destination [`Player::resolve_target`] picks, globals included,
@@ -3598,17 +3614,16 @@ impl<S: Samples> Player<S> {
                     // *(code)* 0x57e011 → 0x57d2cb → 0x57d31e: updates the
                     // track's ducking request without checking `is_running`
                     // and refreshes all unheld running voices (syncing the
-                    // caller's live clone first so same-block target/local
-                    // writes are visible).
-                    if let Some(slot) = self.threads.iter_mut().find(|t| t.id == thread.id) {
-                        *slot = thread.clone();
-                    }
+                    // caller's live clone before and after so same-block writes
+                    // are visible and the refreshed latch survives).
+                    self.sync_thread_to_store(thread);
                     if value == 0 {
                         self.duck.remove(&stopped_track);
                     } else {
                         self.duck.insert(stopped_track, value);
                     }
                     self.update_main_duckpri(true);
+                    self.sync_thread_from_store(thread);
                 } else {
                     self.globals[usize::from(r - GLOBALS)] = value;
                 }
@@ -3625,6 +3640,9 @@ impl<S: Samples> Player<S> {
                 // tears down the track's active voice and recreates it with
                 // freshly latched gains and pitch (0x57f6d7..0x57f6de).
                 let snapshot = written.clone();
+                if dest != Destination::Own {
+                    self.sync_thread_to_store(thread);
+                }
                 self.notes.retain(|n| n.thread != written_id);
                 let levels = self.levels(&snapshot);
                 let rate_step = step(levels.rate);
@@ -3646,6 +3664,9 @@ impl<S: Samples> Player<S> {
             let update_pitch = r == PITCH;
             if update_gains || update_pitch {
                 let snapshot = written.clone();
+                if dest != Destination::Own {
+                    self.sync_thread_to_store(thread);
+                }
                 let levels = self.levels(&snapshot);
                 let rate_step = step(levels.rate);
                 if dest == Destination::Own {
@@ -3673,15 +3694,14 @@ impl<S: Samples> Player<S> {
                 }
             }
         } else if r == MAIN_DUCKPRI {
-            if let Some(slot) = self.threads.iter_mut().find(|t| t.id == thread.id) {
-                *slot = thread.clone();
-            }
+            self.sync_thread_to_store(thread);
             if value == 0 {
                 self.duck.remove(&duck_track);
             } else {
                 self.duck.insert(duck_track, value);
             }
             self.update_main_duckpri(true);
+            self.sync_thread_from_store(thread);
         } else {
             self.globals[usize::from(r - GLOBALS)] = value;
         }
@@ -3931,26 +3951,21 @@ impl<S: Samples> Player<S> {
                 // flags. The new thread's `target` is itself.
                 let track = self.read(thread, arg(0)) as u32;
                 let args = [1, 2, 3].map(|r| thread.registers[r] as u32);
-                // A track that starts itself is the one running: the
-                // start acts on it as it is now.
+                // A track that starts itself is the one running, and restarting
+                // another track can refresh ducking gains on this one: keep the
+                // stored thread and running clone in sync across the start.
                 let own = track == thread.track;
-                if own && let Some(stored) = self.threads.iter_mut().find(|t| t.id == thread.id) {
-                    *stored = thread.clone();
-                }
+                self.sync_thread_to_store(thread);
                 let started = self.start(args, track);
                 self.let_go_track(track, &started.threads);
-                if own && let Some(stored) = self.threads.iter().find(|t| t.id == thread.id) {
-                    *thread = stored.clone();
-                }
+                self.sync_thread_from_store(thread);
                 // `source` is read after the start (0x57f256), through the
                 // caller's `target` as the start left it, and written to
                 // the started track through its own `target` (vtable +0x84,
                 // 0x57f261) — even if the start returned early on a muted,
                 // stopped track.
                 let source = self.read(thread, i64::from(SOURCE));
-                if let Some(stored) = self.threads.iter_mut().find(|t| t.id == thread.id) {
-                    *stored = thread.clone();
-                }
+                self.sync_thread_to_store(thread);
                 if !started.threads.is_empty() {
                     for &started_id in &started.threads {
                         if let Some(at) = self.threads.iter().position(|t| t.id == started_id) {
@@ -3960,9 +3975,7 @@ impl<S: Samples> Player<S> {
                 } else if self.owner(track).is_some() {
                     self.write_stopped(track, SOURCE, source);
                 }
-                if let Some(stored) = self.threads.iter().find(|t| t.id == thread.id) {
-                    *thread = stored.clone();
-                }
+                self.sync_thread_from_store(thread);
                 // Started anew, it runs from the top, from the next block
                 // (the original goes on in the same update).
                 if own && started.fresh {
@@ -3974,16 +3987,16 @@ impl<S: Samples> Player<S> {
                 // *(code)* 0x57f284: the track ends at once (vtable
                 // +0x38), whatever object it plays for; one track
                 // object plays for all of them in the original. Sync the
-                // caller's live clone first so the kill's `0x57d31e` voice
-                // refresh sees any same-block register changes on `thread`.
-                if let Some(stored) = self.threads.iter_mut().find(|t| t.id == thread.id) {
-                    *stored = thread.clone();
-                }
+                // caller's live clone before and after so the kill's
+                // `0x57d31e` voice refresh sees same-block register changes
+                // on `thread` and updates `thread.latched_gains`.
+                self.sync_thread_to_store(thread);
                 let track = self.read(thread, arg(0)) as u32;
                 self.end_track(track, Some(thread.id));
                 if track == thread.track {
                     Flow::Kill
                 } else {
+                    self.sync_thread_from_store(thread);
                     Flow::Next
                 }
             }
@@ -4000,9 +4013,7 @@ impl<S: Samples> Player<S> {
                 // through its `target` (vtable +0x84, 0x57ef8d..0x57efba)
                 // and waits.
                 if holder != 0 && holder != me && self.owner(holder).is_some() {
-                    if let Some(stored) = self.threads.iter_mut().find(|t| t.id == thread.id) {
-                        *stored = thread.clone();
-                    }
+                    self.sync_thread_to_store(thread);
                     if let Some(at) = self.newest(holder) {
                         let other = self.threads[at].clone();
                         let other_id = other.id;
@@ -4011,6 +4022,7 @@ impl<S: Samples> Player<S> {
                             self.save_stopped(&removed);
                             self.notes.retain(|n| n.thread != other_id);
                             self.forget_ended();
+                            self.sync_thread_from_store(thread);
                         } else {
                             let fading = self.read(&other, i64::from(FADE_ON)) != 0
                                 && self.read(&other, i64::from(FADE_VAR)) == i32::from(EXTVOL);
@@ -4025,9 +4037,7 @@ impl<S: Samples> Player<S> {
                                     self.write_at(at, FADE_ON, 1);
                                 }
                             }
-                            if let Some(stored) = self.threads.iter().find(|t| t.id == thread.id) {
-                                *thread = stored.clone();
-                            }
+                            self.sync_thread_from_store(thread);
                             // Run this instruction again shortly; by then
                             // this thread holds the group.
                             thread.wake =
@@ -4036,6 +4046,7 @@ impl<S: Samples> Player<S> {
                         }
                     } else if self.read_stopped(holder, EXTVOL) == 0 {
                         self.kill_stopped_track(holder);
+                        self.sync_thread_from_store(thread);
                     } else {
                         let fading = self.read_stopped(holder, FADE_ON) != 0
                             && self.read_stopped(holder, FADE_VAR) == i32::from(EXTVOL);

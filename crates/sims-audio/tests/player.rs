@@ -6231,3 +6231,129 @@ fn non_streamed_note_on_keeps_latched_gain_across_target_while_streamed_refreshe
     assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
+
+#[test]
+fn same_block_ducking_write_and_kill_refresh_latched_gain_before_non_streamed_note_on() {
+    // `0x57e011 -> 0x57d31e -> 0x57cc74 -> 0x57f759` and `0x57ddd8 -> 0x57f759`
+    // synchronously refresh the running track's latched voice gains before a
+    // same-block non-streamed `note_on` (`0x57f601..0x57f61d`).
+    //
+    // Track 10: sets own MAIN_DUCKPRI = 5, then immediately runs non-streamed
+    // `note_on`. With default DUCKPRI = 0 < 5, gain ducks to 10% (999 PCM).
+    let mut duck_then_note = loadl(123, 5);
+    duck_then_note.extend(NOTE_ON_V1);
+    duck_then_note.extend([SET_LOOP, LOOP]);
+
+    // Track 11: routes MAIN_DUCKPRI = 5 onto stopped track 12 (stays ducked).
+    let mut set_stopped_duck = loadl(53, 12);
+    set_stopped_duck.extend(loadl(123, 5));
+    set_stopped_duck.push(END);
+
+    // Track 13: clears stopped track 12's MAIN_DUCKPRI = 0 via target, then
+    // immediately runs non-streamed `note_on` -> refreshed to unducked 10_000.
+    let mut clear_stopped_then_note = loadl(53, 12);
+    clear_stopped_then_note.extend(loadl(123, 0));
+    clear_stopped_then_note.extend(NOTE_ON_V1);
+    clear_stopped_then_note.extend([SET_LOOP, LOOP]);
+
+    // Track 14: running ducker (MAIN_DUCKPRI = 5, loops forever).
+    let mut running_ducker = loadl(123, 5);
+    running_ducker.extend([SET_LOOP, LOOP]);
+
+    // Track 15: kills running ducker 14 via `kill_trk`, then immediately runs
+    // non-streamed `note_on` -> refreshed to unducked 10_000.
+    let mut kill_running_then_note = loadl(5, 14);
+    kill_running_then_note.extend([KILL_TRK, 5]);
+    kill_running_then_note.extend(NOTE_ON_V1);
+    kill_running_then_note.extend([SET_LOOP, LOOP]);
+
+    // Track 16: kills stopped ducker 12 via `kill_trk`, then immediately runs
+    // non-streamed `note_on` -> refreshed to unducked 10_000.
+    let mut kill_stopped_then_note = loadl(5, 12);
+    kill_stopped_then_note.extend([KILL_TRK, 5]);
+    kill_stopped_then_note.extend(NOTE_ON_V1);
+    kill_stopped_then_note.extend([SET_LOOP, LOOP]);
+
+    let (hit, addresses) = assemble(&[
+        &duck_then_note,
+        &set_stopped_duck,
+        &[END],
+        &clear_stopped_then_note,
+        &running_ducker,
+        &kill_running_then_note,
+        &kill_stopped_then_note,
+    ]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         0x102={:#x}\n\
+         0x103={:#x}\n\
+         0x104={:#x}\n\
+         0x105={:#x}\n\
+         0x106={:#x}\n\
+         [Patch]\n\
+         1=0,mem,\"one.xa\",0,0,0,0,0\n\
+         [Track]\n\
+         10=0,duck_note,1024,0,0,1,0,0x100,1\n\
+         11=0,set_stopped,1024,0,0,1,0,0x101,1\n\
+         12=0,stopped_ducker,1024,0,0,1,0,0x102,1\n\
+         13=0,clear_stopped,1024,0,0,1,0,0x103,1\n\
+         14=0,running_ducker,1024,0,0,1,0,0x104,1\n\
+         15=0,kill_running,1024,0,0,1,0,0x105,1\n\
+         16=0,kill_stopped,1024,0,0,1,0,0x106,1\n\
+         [EventMapping]\n\
+         duck_note=1,10\n\
+         set_stopped=1,11\n\
+         clear_stopped=1,13\n\
+         running_ducker=1,14\n\
+         kill_running=1,15\n\
+         kill_stopped=1,16\n",
+        addresses[0],
+        addresses[1],
+        addresses[2],
+        addresses[3],
+        addresses[4],
+        addresses[5],
+        addresses[6],
+    );
+    let make = || {
+        let m = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+        Player::new(vec![m], long_sample("one.xa"), 1)
+    };
+
+    // Case 1: own MAIN_DUCKPRI = 5 immediately before non-streamed note_on.
+    let mut player = make();
+    play(&mut player, "duck_note");
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 999);
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 999);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+
+    // Case 2: routed MAIN_DUCKPRI = 0 on stopped track immediately before note_on.
+    let mut player = make();
+    play(&mut player, "set_stopped");
+    player.render(BLOCK, &NoSources);
+    play(&mut player, "clear_stopped");
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+
+    // Case 3: kill_trk on running ducker immediately before non-streamed note_on.
+    let mut player = make();
+    play(&mut player, "running_ducker");
+    player.render(BLOCK, &NoSources);
+    play(&mut player, "kill_running");
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+
+    // Case 4: kill_trk on stopped ducker immediately before non-streamed note_on.
+    let mut player = make();
+    play(&mut player, "set_stopped");
+    player.render(BLOCK, &NoSources);
+    play(&mut player, "kill_stopped");
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
