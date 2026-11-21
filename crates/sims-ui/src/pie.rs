@@ -346,8 +346,9 @@ pub fn draw(
     highlighted: Option<usize>,
     pressed: bool,
 ) {
-    // The face bitmap is all colour key in the game's art; the head is
-    // rendered into it.
+    // The face bitmap is all colour key in the game's art (`0x5eb04c`); the
+    // original draws the 3D head separately in the house-viewport pass
+    // (`0x462985`), though callers may also pass an image here.
     for image in [art.image(FACE), head].into_iter().flatten() {
         frame.draw_all(image, [layout.face.x, layout.face.y]);
     }

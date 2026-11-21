@@ -678,17 +678,14 @@ impl Menu {
         sims_people::pie_head::Look::from_menu(main.center, pointer, highlighted, main.labels.len())
     }
 
-    /// Draws the menus as last laid out, with [`Menu::head`] over the face
-    /// bitmap in the middle.
+    /// Draws the menus as last laid out, compositing [`Menu::head`] at
+    /// [`Menu::head_origin`] behind the 2D menu labels (`0x462621` →
+    /// `0x5eb04c`).
     pub fn draw(&self, frame: &mut Frame, art: &Art, pointer: Option<[i32; 2]>) {
-        Pie::draw(
-            frame,
-            art,
-            &self.layouts,
-            self.head.as_ref(),
-            pointer,
-            self.held,
-        );
+        if let Some(head) = &self.head {
+            frame.draw_all(head, self.head_origin);
+        }
+        Pie::draw(frame, art, &self.layouts, None, pointer, self.held);
     }
 
     /// Draws only the pie menu's 2D UI layer (face bitmap, title, and labels),
@@ -989,5 +986,33 @@ mod tests {
         assert_eq!(entry_label(Some(" "), 3, true, true), "Interaction 3");
         assert_eq!(entry_label(Some(" "), 3, true, false), "*Interaction 3");
         assert_eq!(entry_label(None, 3, false, true), "Interaction 3");
+    }
+
+    #[test]
+    fn menu_draw_places_cached_head_at_head_origin() {
+        let art = art();
+        let mut menu = Menu::new(1, 2, named(&STUDIES), [400, 300], &art, [800, 600]);
+        let face_origin = menu.face_origin().expect("face origin");
+        let head_origin = [face_origin[0] + 80, face_origin[1] + 68];
+        menu.head_origin = head_origin;
+        menu.head = Some(Image {
+            width: 2,
+            height: 2,
+            rgba: vec![
+                220, 40, 30, 255, 220, 40, 30, 255, //
+                220, 40, 30, 255, 220, 40, 30, 255,
+            ],
+        });
+        let mut frame = Frame::new(800, 600, [0, 0, 0]);
+        menu.draw(&mut frame, &art, Some([400, 300]));
+        assert_eq!(
+            frame.pixel(head_origin[0], head_origin[1]),
+            Some([220, 40, 30])
+        );
+        assert_eq!(
+            frame.pixel(face_origin[0], face_origin[1]),
+            Some([0, 0, 0]),
+            "head must be drawn at head_origin, not face_origin"
+        );
     }
 }

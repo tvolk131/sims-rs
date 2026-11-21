@@ -433,10 +433,18 @@ pub fn draw_body_in_viewport(
             canvas: Canvas::new(0, 0, [0; 4]),
         });
     }
-    let rx0 = (min_x.floor() as i64 - 1).clamp(0, i64::from(vp_w)) as u32;
-    let ry0 = (min_y.floor() as i64 - 1).clamp(0, i64::from(vp_h)) as u32;
-    let rx1 = (max_x.ceil() as i64 + 1).clamp(0, i64::from(vp_w)) as u32;
-    let ry1 = (max_y.ceil() as i64 + 1).clamp(0, i64::from(vp_h)) as u32;
+    let rx0 = (min_x.floor() as i64)
+        .saturating_sub(1)
+        .clamp(0, i64::from(vp_w)) as u32;
+    let ry0 = (min_y.floor() as i64)
+        .saturating_sub(1)
+        .clamp(0, i64::from(vp_h)) as u32;
+    let rx1 = (max_x.ceil() as i64)
+        .saturating_add(1)
+        .clamp(0, i64::from(vp_w)) as u32;
+    let ry1 = (max_y.ceil() as i64)
+        .saturating_add(1)
+        .clamp(0, i64::from(vp_h)) as u32;
     if rx0 >= rx1 || ry0 >= ry1 {
         return Ok(DrawnHead {
             origin: [0, 0],
@@ -577,5 +585,73 @@ mod tests {
         let nose_left = project(Vec3::new(0.0, 0.0, 1.0), origin, 0.0, 0.6);
         let nose_right = project(Vec3::new(0.0, 0.0, 1.0), origin, 0.0, -0.6);
         assert!(nose_left.x < nose.x && nose_right.x > nose.x);
+    }
+
+    #[test]
+    fn draw_body_in_viewport_handles_extreme_finite_coordinates_without_overflow() {
+        use crate::appearance::Part;
+        use crate::texture::Texture;
+        use sims_formats::avatar::{Bone, Mesh, MeshBinding, Skeleton, Vertex, Wiggle};
+
+        let body = Body {
+            skeleton: Skeleton {
+                name: "test".into(),
+                bones: vec![Bone {
+                    name: "HEAD".into(),
+                    parent: None,
+                    translation: [0.0; 3],
+                    rotation: [0.0, 0.0, 0.0, 1.0],
+                    properties: Vec::new(),
+                    flags: [0; 3],
+                    wiggle: Wiggle::default(),
+                }],
+            },
+            parts: vec![Part {
+                appearance: "extreme".into(),
+                bone: 0,
+                bones: vec![0],
+                mesh: Mesh {
+                    name: "extreme-HEAD".into(),
+                    texture: String::new(),
+                    bones: vec!["HEAD".into()],
+                    bindings: vec![MeshBinding {
+                        bone: 0,
+                        first_vertex: 0,
+                        vertex_count: 3,
+                        first_blend: 0,
+                        blend_count: 0,
+                    }],
+                    triangles: vec![[0, 1, 2]],
+                    vertices: vec![
+                        Vertex {
+                            position: [1e20, 1e20, 0.0],
+                            normal: [0.0, 0.0, 1.0],
+                            uv: [0.0, 0.0],
+                            bone: 0,
+                        },
+                        Vertex {
+                            position: [-1e20, -1e20, 0.0],
+                            normal: [0.0, 0.0, 1.0],
+                            uv: [1.0, 0.0],
+                            bone: 0,
+                        },
+                        Vertex {
+                            position: [0.0, 0.0, 1e20],
+                            normal: [0.0, 0.0, 1.0],
+                            uv: [0.0, 1.0],
+                            bone: 0,
+                        },
+                    ],
+                    blends: Vec::new(),
+                },
+                texture_name: None,
+                texture: Texture::solid([200, 200, 200, 255]),
+                censor: 0,
+            }],
+        };
+
+        let drawn = draw_body_in_viewport(&body, [800, 500], [400, 250], Look::neutral())
+            .expect("extreme finite coordinates must clamp cleanly without overflow");
+        assert!(drawn.canvas.width <= 800 && drawn.canvas.height <= 500);
     }
 }
