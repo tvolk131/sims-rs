@@ -107,3 +107,11 @@ fn a_resource_is_read_in_its_flags_byte_order() {
     assert_eq!(read(&big, LITTLE), 0);
     assert_eq!(read(b"\xff\xfe\x00\x80", 0), 0);
 }
+
+#[test]
+fn decode_keeps_leading_bom_bytes_in_the_code_page() {
+    assert_eq!(decode(b"\xef\xbb\xbfadult", 1), "\u{ef}\u{bb}\u{bf}adult");
+    assert_eq!(decode(b"\xff\xfeA", 1), "\u{ff}\u{fe}A");
+    let table = StringTable::parse(b"\xff\xff\x01\x00\xef\xbb\xbfadult\0").unwrap();
+    assert_eq!(table.get(0, 1), Some("\u{ef}\u{bb}\u{bf}adult"));
+}

@@ -290,14 +290,22 @@ pub(crate) struct MountedFiles {
 impl MountedFiles {
     /// Register a root-relative path once, preserving any existing virtual
     /// directory supplied by an earlier FAR mount (0x5ba5d8, 0x5b9dbc).
-    pub(crate) fn register(&mut self, root: &Path, path: &str, recursive: bool) -> Result<()> {
+    /// When `strict_archives` is false, unreadable FAR archives are recorded in
+    /// `diagnostics` and skipped so the directory scan continues (`0x5ba8d6`).
+    pub(crate) fn register(
+        &mut self,
+        root: &Path,
+        path: &str,
+        recursive: bool,
+        strict_archives: bool,
+    ) -> Result<()> {
         let at = mount_key(path)?;
         if !self.directories.contains_key(&at)
             && let Some(directory) = resolve(root, path)?
             && directory.is_dir()
         {
             self.scan(&at, &directory, recursive, ntfs_entries)?;
-            if let Some(reason) = self.diagnostics.first() {
+            if strict_archives && let Some(reason) = self.diagnostics.first() {
                 return Err(Error::Unsupported(format!(
                     "0x5b9dbc wardrobe FAR mount: {reason}"
                 )));
@@ -352,6 +360,41 @@ impl MountedFiles {
         let mut resources = Vec::new();
         Index::list(&mut resources, 0, &self.directories, &mount_key(path)?);
         Ok(resources)
+    }
+
+    /// Looks up `relative` (raw Windows-1252 bytes) under mounted `directory`,
+    /// matching how `0x5a3810` opens an `.ndx` entry's `dir + catalog.bcf`
+    /// through the virtual file system (`0x5b8f64` → `0x5b94ae`).
+    pub(crate) fn lookup(&self, directory: &str, relative: &[u8]) -> Result<Option<Resource>> {
+        let at = mount_key(directory)?;
+        let rel = key(relative);
+        let mut rel = rel.as_slice();
+        while let Some(rest) = rel.strip_prefix(b"\\") {
+            rel = rest;
+        }
+        let full = [at.as_slice(), rel].concat();
+        let split = full.iter().rposition(|&b| b == b'\\').map_or(0, |n| n + 1);
+        let (dir_key, name) = full.split_at(split);
+        let Some(entry) = self
+            .directories
+            .get(dir_key)
+            .and_then(|dir| dir.entries.get(name))
+        else {
+            return Ok(None);
+        };
+        Ok(match entry {
+            Entry::File(path) => Some(Resource {
+                mount: 0,
+                path: path.clone(),
+                member: None,
+            }),
+            Entry::Member(path, member) => Some(Resource {
+                mount: 0,
+                path: path.clone(),
+                member: Some(member.clone()),
+            }),
+            Entry::Directory | Entry::Archive => None,
+        })
     }
 
     /// Gathers entries the way the original's directory scan does

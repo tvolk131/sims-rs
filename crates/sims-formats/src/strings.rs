@@ -153,8 +153,11 @@ impl StringTable {
     }
 }
 /// Decode original game text bytes using the selected language's code page.
+/// Every byte is decoded in that code page without UTF-8 or UTF-16 BOM
+/// sniffing or stripping, matching [`crate::reader::western`] and the
+/// original's byte-exact string comparisons (such as `0x5a280f`).
 pub fn decode(bytes: &[u8], language: u8) -> String {
-    encoding(language).decode(bytes).0.into_owned()
+    decode_verbatim(bytes, language)
 }
 
 /// Decode a string table entry's bytes using the selected language's code
