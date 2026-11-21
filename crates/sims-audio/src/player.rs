@@ -34,13 +34,14 @@
 //! - *(code)* Every register write sets the written thread's comparison
 //!   flags from the value; `cmp a, b` sets them from `a - b` and `test r`
 //!   from `r`. The `if` branches test them.
-//! - *(code)* Writing `target` (53) with a track number sends this
-//!   thread's later reads and writes of registers other than 53 to the
-//!   newest running thread of that track, and on through that thread's
-//!   own `target`; 0, or a track with none running, sends them back here.
-//!   How the original picks among several threads of one track, and what
-//!   it does once the target has ended, are not known (see
-//!   `Player::resolve`).
+//! - *(code)* Writing `target` (53) with a registered track number
+//!   (0x57e023 → 0x573312) sends this thread's later reads and writes of
+//!   registers other than 53 to that track, and on through that track's
+//!   own `target`; 0, its own track, or an unregistered number sends them
+//!   back here (0x57de57). When the destination track has stopped, writes
+//!   still go to that stopped track rather than falling back to the
+//!   caller (with `fade_on` forced to 0 at 0x57e059..0x57e064), and once
+//!   that track starts again the link reaches it again.
 //! - *(code)* `main_duckpri` (123) is a request per thread: the global
 //!   holds the largest, and a thread's request goes as soon as it ends.
 //! - *(code)* Volume, pan and pitch: see [`crate::levels`]. Each note
@@ -527,8 +528,8 @@ struct Thread {
     /// The track's HOT group (`kGroupSfx` 1, `kGroupMusic` 2, `kGroupVox`
     /// 3), whose volume scales its own.
     group: i64,
-    /// Where register reads and writes go: this thread, or the thread
-    /// register 53 named (see [`Player::resolve`]).
+    /// Where register reads and writes go: this thread, or the track
+    /// register 53 named (see [`Player::resolve_target`]).
     target: Target,
     /// End the thread when its fade ends (the original's flag at +0x1cf).
     kill_after_fade: bool,
@@ -541,7 +542,30 @@ struct Thread {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Target {
     Own,
-    Thread(u32),
+    /// A registered track object ID (`0x57e023` → `0x573312`), kept across
+    /// stop and restart until `target` is written again or the holder starts
+    /// anew (`0x57d9c3`) or is killed (`0x57dd87`).
+    Track(u32),
+}
+
+/// Where a register read/write or placement routed through `target` lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Destination {
+    /// The starting thread itself.
+    Own,
+    /// A running thread in `self.threads`.
+    Running(u32),
+    /// A registered track object that is currently stopped (`is_running == 0`).
+    Stopped(u32),
+}
+
+/// Default value of a track register when read on a stopped track object
+/// (`0x5802cf`).
+fn default_register(register: u8) -> i32 {
+    DEFAULTS
+        .iter()
+        .find(|&&(r, _)| r == register)
+        .map_or(0, |&(_, v)| v)
 }
 
 #[derive(Debug, Clone)]
@@ -1633,23 +1657,35 @@ impl<S: Samples> Player<S> {
     }
 
     /// A track's `Spl` (`0x57314b`, register 57), read through its
-    /// `target` from its last running start, else its newest running
-    /// thread, else its idle kind-53 thread. `None` when the track has
-    /// no live state.
+    /// `target` from its running thread (preferring its last start), else
+    /// its idle kind-53 thread. `None` when the track has no live state.
     fn track_spl(&self, track: u32) -> Option<i32> {
         let last = self.last_start.get(&track).copied();
         let newest = self.newest(track).map(|at| self.threads[at].id);
         let running = |id: u32| self.threads.iter().find(|t| t.id == id);
         let spl_of = |thread: &Thread| {
-            let source = if Some(thread.id) == last {
-                self.threads
-                    .iter()
-                    .find(|t| t.id == self.camera_destination(thread.id))
-                    .unwrap_or(thread)
-            } else {
-                thread
-            };
-            source.registers[usize::from(SPL)]
+            if Some(thread.id) != last {
+                return thread.registers[usize::from(SPL)];
+            }
+            match self.resolve_target(thread) {
+                Destination::Own => thread.registers[usize::from(SPL)],
+                Destination::Running(id) => {
+                    self.threads
+                        .iter()
+                        .find(|t| t.id == id)
+                        .unwrap_or(thread)
+                        .registers[usize::from(SPL)]
+                }
+                Destination::Stopped(stopped_track) => self
+                    .idle
+                    .get(&stopped_track)
+                    .filter(|_| {
+                        self.notes
+                            .iter()
+                            .any(|n| n.thread == 0 && n.track == stopped_track)
+                    })
+                    .map_or(SPL_NORMAL, |idle| idle.registers[usize::from(SPL)]),
+            }
         };
         if let Some(thread) = last.and_then(running) {
             Some(spl_of(thread))
@@ -1777,42 +1813,32 @@ impl<S: Samples> Player<S> {
 
     /// Writes a camera placement as the thread `id`, the track's last
     /// start, writes it: `extvol`, then `pan`, through its `target`
-    /// (0x57de57). Only the running thread the chain ends at takes the
-    /// placement, and its notes take the new levels at once; a thread
-    /// that passes it on keeps its levels. A thread on the way that is
-    /// not its track's last start takes the placement itself: a later
-    /// start set the original's track object's `target` back to itself.
+    /// (0x57de57). Only the destination the chain ends at takes the
+    /// placement: a running thread updates its notes at once, a stopped
+    /// track updates any idle kind-53 note it holds and leaves the caller
+    /// untouched, and any thread that passes the write on keeps its
+    /// levels.
     fn place_through(&mut self, id: u32, vol: i32, pan: i32) {
-        let at = self.camera_destination(id);
-        if let Some(thread) = self.threads.iter_mut().find(|t| t.id == at) {
+        let Some(thread) = self.threads.iter().find(|t| t.id == id) else {
+            return;
+        };
+        let target_id = match self.resolve_target(thread) {
+            Destination::Own => id,
+            Destination::Running(dest_id) => dest_id,
+            Destination::Stopped(stopped_track) => {
+                self.place_idle(stopped_track, vol, pan);
+                return;
+            }
+        };
+        if let Some(thread) = self.threads.iter_mut().find(|t| t.id == target_id) {
             place_itself(thread, vol, pan);
             let thread = thread.clone();
             let levels = self.levels(&thread);
-            for note in self.notes.iter_mut().filter(|n| n.thread == at) {
+            for note in self.notes.iter_mut().filter(|n| n.thread == target_id) {
                 note.gains = levels.gains;
                 note.step = step(levels.rate);
             }
         }
-    }
-
-    /// The running thread a camera placement written by thread `id`
-    /// lands in, and whose `Spl` it reads ([`Player::place_through`]):
-    /// `id`, or on through `target` from each thread that is its track's
-    /// last start. A link to a stopped thread, or back to a thread
-    /// already passed, stops the chain where it is.
-    fn camera_destination(&self, id: u32) -> u32 {
-        let mut at = id;
-        let mut passed = vec![id];
-        while let Some(thread) = self.threads.iter().find(|t| t.id == at)
-            && self.last_start.get(&thread.track) == Some(&thread.id)
-            && let Target::Thread(next) = thread.target
-            && !passed.contains(&next)
-            && self.threads.iter().any(|t| t.id == next)
-        {
-            passed.push(next);
-            at = next;
-        }
-        at
     }
 
     /// Writes a register of the thread at `at` as that thread would.
@@ -1867,14 +1893,15 @@ impl<S: Samples> Player<S> {
     /// Kind 21: *(code)* pauses the sound (0x573c20, 0x57481e). The
     /// manager is marked paused; `main_duckpri` becomes 0 (0x57d361),
     /// which here drops every thread's ducking request; the day and night
-    /// loop fades out and ends (0x574844 → 0x574978); every track that
-    /// runs or plays is held except [`PAUSE_SPARES`]; and in music mode 0
-    /// the current ambience player is paused (see
-    /// [`crate::ambience::Fresh::set_paused`]). A held track's threads
-    /// do not run or fade, and its notes stay where they are, silent. A
-    /// track started while paused plays: starting a track (0x57d960)
-    /// clears its hold, and a held track whose script still runs is let
-    /// go rather than started again.
+    /// loop fades out and ends (0x574844 → 0x574978); every running track
+    /// is held except [`PAUSE_SPARES`] (0x574869..0x5748c9, and hold
+    /// itself checks `is_running` at 0x57dc3d, so idle kind-53 voices are
+    /// untouched); and in music mode 0 the current ambience player is
+    /// paused (see [`crate::ambience::Fresh::set_paused`]). A held track's
+    /// threads do not run or fade, and its notes stay where they are,
+    /// silent. A track started while paused plays: starting a track
+    /// (0x57d960) clears its hold, and a held track whose script still
+    /// runs is let go rather than started again.
     pub fn pause(&mut self) {
         self.paused = true;
         self.duck.clear();
@@ -1884,7 +1911,6 @@ impl<S: Samples> Player<S> {
             .threads
             .iter()
             .map(|t| t.track)
-            .chain(self.notes.iter().map(|n| n.track))
             .filter(|t| !PAUSE_SPARES.contains(t))
             .collect();
         self.held.extend(tracks);
@@ -3054,41 +3080,55 @@ impl<S: Samples> Player<S> {
         Ok(group)
     }
 
-    fn fault(&mut self, thread: &Thread, message: &str) -> bool {
+    /// Records a fault for `thread` without stopping it or cutting its
+    /// notes (used for non-fatal diagnostics such as a refused
+    /// `getsrcdatafield` query, 0x57f33a → 0x57f3f9 → 0x57f408).
+    fn report_fault(&mut self, thread: &Thread, message: &str) {
         let name = &self.modules[thread.module].name;
         self.report(format!(
             "track {} ({name}) at {:#x}: {message}",
             thread.track, thread.pc
         ));
+    }
+
+    /// Records a fatal fault for `thread`, cuts its active note, and
+    /// returns `false` so [`Player::step`] terminates the thread.
+    fn fault(&mut self, thread: &Thread, message: &str) -> bool {
+        self.report_fault(thread, message);
         let id = thread.id;
         self.notes.retain(|n| n.thread != id);
         false
     }
 
-    /// The thread a register access other than to `target` (53) goes
-    /// to, or `None` for `thread` itself. As in the original, an access
-    /// goes to the thread `target` names, then on to the one that
-    /// thread's `target` names, and so on. A link to a thread that has
-    /// ended (the original keeps a pointer to it; what it then does is
-    /// not known) stops the chain there, as does a thread already passed
-    /// (the original would recurse for ever).
-    fn resolve(&self, thread: &Thread) -> Option<u32> {
-        let mut at = None;
+    /// *(code)* Where a register access other than to `target` (53) goes
+    /// (`0x57de16`, `0x57de57`): follows `target` (`[ecx + 0xc8]`) across
+    /// track objects. A stopped destination track has its own `target`
+    /// cleared by kill (`0x57dd87`), so the chain ends at
+    /// [`Destination::Stopped`] without falling back to the caller. A
+    /// cycle stops before revisiting a track already passed.
+    fn resolve_target(&self, thread: &Thread) -> Destination {
+        let mut dest = Destination::Own;
         let mut target = thread.target;
-        let mut passed = vec![thread.id];
-        while let Target::Thread(id) = target
-            && !passed.contains(&id)
-            && let Some(next) = self.threads.iter().find(|t| t.id == id)
-        {
-            passed.push(id);
-            at = Some(id);
-            target = next.target;
+        let mut passed = vec![thread.track];
+        while let Target::Track(track) = target {
+            if passed.contains(&track) {
+                break;
+            }
+            passed.push(track);
+            if let Some(next) = self.threads.iter().find(|t| t.track == track) {
+                dest = Destination::Running(next.id);
+                target = next.target;
+            } else {
+                dest = Destination::Stopped(track);
+                break;
+            }
         }
-        at
+        dest
     }
 
     /// Reads a register. Registers below 100 other than `target` (53)
-    /// come from the thread [`Player::resolve`] picks; globals are shared.
+    /// come from the destination [`Player::resolve_target`] picks;
+    /// globals are shared.
     fn read(&self, thread: &Thread, register: i64) -> i32 {
         let Ok(r) = u8::try_from(register) else {
             return 0;
@@ -3099,25 +3139,34 @@ impl<S: Samples> Player<S> {
         if r == TARGET {
             return thread.registers[usize::from(r)];
         }
-        let source = self
-            .resolve(thread)
-            .and_then(|id| self.threads.iter().find(|t| t.id == id))
-            .unwrap_or(thread);
-        source.registers[usize::from(r)]
+        match self.resolve_target(thread) {
+            Destination::Own => thread.registers[usize::from(r)],
+            Destination::Running(id) => {
+                self.threads
+                    .iter()
+                    .find(|t| t.id == id)
+                    .unwrap_or(thread)
+                    .registers[usize::from(r)]
+            }
+            Destination::Stopped(track) => self.idle.get(&track).map_or_else(
+                || default_register(r),
+                |idle| idle.registers[usize::from(r)],
+            ),
+        }
     }
 
-    /// Writes a register, with the original's side effects. Every write
-    /// other than to `target` (53) goes to the thread [`Player::resolve`]
-    /// picks, globals included, and sets that thread's comparison flags
-    /// from the value. `target` picks the newest running thread of the
-    /// track it names; 0, or a track with none running, is this thread
-    /// (the original's lookup returns null, which it takes as itself).
-    /// Not ported: the original's `target` holds the track object
-    /// (0x57e023 to 0x57e028), which outlives a kill and a fresh start
-    /// (0x57dd4c, 0x57dbcf), so it still reaches the track started again.
-    /// Here it names the thread, which a kill ends, so once killed it
-    /// falls back to this one. `main_duckpri` (123) records the written
-    /// thread's request and holds the largest.
+    /// Writes a register, with the original's side effects (`0x57de57`,
+    /// `0x57de98`). Every write other than to `target` (53) goes to the
+    /// destination [`Player::resolve_target`] picks, globals included,
+    /// and sets that destination's comparison flags from the value.
+    /// Writing `target` (`0x57e018`..`0x57e036`) looks up the track in
+    /// the registry (`0x573312`): a registered track (other than this
+    /// one) is stored as [`Target::Track`], which outlives a kill and
+    /// reaches the track again on a later start; 0, this track, or an
+    /// unregistered ID sets [`Target::Own`]. Writing to a stopped
+    /// destination does not fall back to the caller, and forces
+    /// `fade_on` (45) to 0 (`0x57e059`..`0x57e064`). `main_duckpri`
+    /// (123) records the written thread's request and holds the largest.
     fn write(&mut self, thread: &mut Thread, register: i64, value: i32) {
         let Ok(r) = u8::try_from(register) else {
             return;
@@ -3125,24 +3174,38 @@ impl<S: Samples> Player<S> {
         if r == TARGET {
             thread.registers[usize::from(r)] = value;
             thread.kept = i64::from(value);
-            thread.target = if value == 0 {
-                Target::Own
+            thread.target = if value != 0 {
+                let target_track = value as u32;
+                if target_track != thread.track && self.owner(target_track).is_some() {
+                    Target::Track(target_track)
+                } else {
+                    Target::Own
+                }
             } else {
-                self.threads
-                    .iter()
-                    .filter(|t| t.track == value as u32)
-                    .map(|t| t.id)
-                    .max()
-                    .map_or(Target::Own, Target::Thread)
+                Target::Own
             };
             return;
         }
-        let written = match self.resolve(thread) {
-            Some(id) => match self.threads.iter_mut().find(|t| t.id == id) {
+        let dest = self.resolve_target(thread);
+        let written = match dest {
+            Destination::Own => thread,
+            Destination::Running(id) => match self.threads.iter_mut().find(|t| t.id == id) {
                 Some(other) => other,
                 None => thread,
             },
-            None => thread,
+            Destination::Stopped(stopped_track) => {
+                if r < GLOBALS {
+                    if let Some(idle) = self.idle.get_mut(&stopped_track) {
+                        idle.kept = i64::from(value);
+                        // *(code)* 0x57e059..0x57e064: writing `fade_on`
+                        // to a non-running track clears it back to 0.
+                        idle.registers[usize::from(r)] = if r == FADE_ON { 0 } else { value };
+                    }
+                } else if r != MAIN_DUCKPRI {
+                    self.globals[usize::from(r - GLOBALS)] = value;
+                }
+                return;
+            }
         };
         written.kept = i64::from(value);
         let id = written.id;
@@ -3214,6 +3277,15 @@ impl<S: Samples> Player<S> {
         if !self.load_patch(patch) {
             return 0;
         }
+        // *(code)* 0x57f595 → 0x58015a..0x58018d: each track owns one
+        // active voice ([esi + 0x1d0]), so starting a note replaces any
+        // prior note of the same thread (or idle track when thread == 0).
+        if thread.id != 0 {
+            self.notes.retain(|n| n.thread != thread.id);
+        } else {
+            self.notes
+                .retain(|n| !(n.thread == 0 && n.track == thread.track));
+        }
         if self.notes.len() >= NOTES {
             self.report(format!("patch {patch}: more than {NOTES} notes"));
             return 0;
@@ -3275,8 +3347,12 @@ impl<S: Samples> Player<S> {
                 Flow::Next
             }
             "note_off" => {
-                let id = self.read(thread, arg(0)) as u32;
-                self.notes.retain(|n| n.id != id);
+                // *(code)* 0x57e192..0x57e1a9 → 0x5801a0: stops the track's
+                // single active voice ([esi + 0x1d0]) unconditionally; the
+                // voice's stop method ignores the raw operand byte.
+                let id = thread.id;
+                self.notes.retain(|n| n.thread != id);
+                thread.last_note = 0;
                 Flow::Next
             }
             "loadb" | "loadl" => {
@@ -3387,19 +3463,20 @@ impl<S: Samples> Player<S> {
                     *thread = stored.clone();
                 }
                 // `source` is read after the start (0x57f256), through the
-                // caller's `target` as the start left it.
+                // caller's `target` as the start left it, and written to
+                // the started track through its own `target` (vtable +0x84,
+                // 0x57f261).
                 let source = self.read(thread, i64::from(SOURCE));
-                for started in self
-                    .threads
-                    .iter_mut()
-                    .filter(|t| started.threads.contains(&t.id))
-                {
-                    started.registers[usize::from(SOURCE)] = source;
-                    started.kept = i64::from(source);
+                if let Some(stored) = self.threads.iter_mut().find(|t| t.id == thread.id) {
+                    *stored = thread.clone();
                 }
-                if own && started.threads.contains(&thread.id) {
-                    thread.registers[usize::from(SOURCE)] = source;
-                    thread.kept = i64::from(source);
+                for &started_id in &started.threads {
+                    if let Some(at) = self.threads.iter().position(|t| t.id == started_id) {
+                        self.write_at(at, SOURCE, source);
+                    }
+                }
+                if let Some(stored) = self.threads.iter().find(|t| t.id == thread.id) {
+                    *thread = stored.clone();
                 }
                 // Started anew, it runs from the top, from the next block
                 // (the original goes on in the same update).
@@ -3486,13 +3563,13 @@ impl<S: Samples> Player<S> {
             }
             "getsrcdatafield" => {
                 // The original passes both registers' values (0x57f2e8)
-                // and logs a refused field, going on to the next
-                // instruction either way.
+                // and logs a refused field (0x57f33a → 0x57f3f9 → 0x57f408),
+                // going on to the next instruction with its voice intact.
                 let (source, field) = (self.read(thread, arg(1)), self.read(thread, arg(2)));
                 match sources.field(source, field) {
                     Some(value) => self.write(thread, arg(0), value),
                     None => {
-                        self.fault(thread, "Illegal source parameter request");
+                        self.report_fault(thread, "Illegal source parameter request");
                     }
                 }
                 Flow::Next
