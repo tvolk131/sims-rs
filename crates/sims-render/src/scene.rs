@@ -1784,9 +1784,20 @@ fn buy_preview_overrides(
     preview: Option<(u16, u16)>,
 ) -> BTreeMap<u16, ([i32; 3], f32)> {
     let mut out = BTreeMap::new();
-    let Some((cursor_lead, held_lead)) = preview else {
+    let Some((cursor_id, held_id)) = preview else {
         return out;
     };
+    let resolve_lead = |id: u16| -> u16 {
+        world
+            .objects
+            .get(&id)
+            .and_then(|o| o.multipart.as_ref())
+            .and_then(|m| u16::try_from(m.parent).ok())
+            .filter(|&p| p != 0 && world.objects.contains_key(&p))
+            .unwrap_or(id)
+    };
+    let cursor_lead = resolve_lead(cursor_id);
+    let held_lead = resolve_lead(held_id);
     let (Some(cursor_obj), Some(held_obj)) = (
         world.objects.get(&cursor_lead),
         world.objects.get(&held_lead),

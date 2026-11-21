@@ -14,7 +14,9 @@ use sims_render::{Assets, Canvas, Walls, Zoom};
 use sims_sim::World;
 use sims_ui::art::Art;
 use sims_ui::balloon::Texts;
-use sims_ui::buy::{self, BuyCatalog, BuyLayout, BuyState, BuyWidgetKind, RatingLabels};
+use sims_ui::buy::{
+    self, BuyCatalog, BuyLayout, BuyState, BuyWidgetKind, RatingLabels, SellInfo, SellLabels,
+};
 use sims_ui::command::{Command, Mode, Panel as UiPanel, Walls as UiWalls};
 use sims_ui::dialog::{self, Labels, Message};
 use sims_ui::frame::{Frame, Rect};
@@ -99,6 +101,8 @@ pub struct Hud {
     buy_catalog: Option<BuyCatalog>,
     /// Buy Mode popup rating labels (`GameData/UIText.iff STR# 160`, `0x508168`).
     rating_labels: RatingLabels,
+    /// Buy Mode sell prompt templates (`GameData/UIText.iff STR# 136`, `0x50a343`).
+    sell_labels: SellLabels,
     /// The Buy Mode catalog strip state (sort, category, subcategory, page,
     /// selected GUID).
     pub buy_state: BuyState,
@@ -140,6 +144,7 @@ impl Hud {
         }
         let labels = Labels::load(&install).map_err(|e| e.to_string())?;
         let rating_labels = RatingLabels::load(&install);
+        let sell_labels = SellLabels::load(&install);
         // Without the balloons' strings the HUD still opens; the balloons
         // show what text they have.
         let texts = Texts::load(&install).unwrap_or_default();
@@ -205,6 +210,7 @@ impl Hud {
             idle_speed: false,
             buy_catalog: None,
             rating_labels,
+            sell_labels,
             buy_state: BuyState::default(),
             buy_layout: BuyLayout::default(),
             sounds: Vec::new(),
@@ -231,8 +237,11 @@ impl Hud {
     /// Loads the residential Buy Mode catalog on first use and returns it.
     pub fn ensure_buy_catalog(&mut self, assets: &Assets) -> &BuyCatalog {
         let rating_labels = self.rating_labels.clone();
+        let sell_labels = self.sell_labels.clone();
         self.buy_catalog.get_or_insert_with(|| {
-            BuyCatalog::load(assets.index(), assets.catalog()).with_rating_labels(rating_labels)
+            BuyCatalog::load(assets.index(), assets.catalog())
+                .with_rating_labels(rating_labels)
+                .with_sell_labels(sell_labels)
         })
     }
 
@@ -258,20 +267,29 @@ impl Hud {
         point[0] >= hud::CLUSTER[0] && point[0] < size[0] && point[1] >= top && point[1] < size[1]
     }
 
-    /// Lays out the Buy Mode catalog strip for `size` and `world` (or clears
-    /// it outside expanded Buy Mode), syncing `self.buy_state.page` to the
-    /// clamped page number.
-    pub fn layout_buy(&mut self, size: [i32; 2], world: &World, assets: &Assets) {
+    /// Lays out the Buy Mode catalog strip (or active Hand Tool sell prompt)
+    /// for `size` and `world` (or clears it outside expanded Buy Mode),
+    /// syncing `self.buy_state.page` to the clamped page number.
+    pub fn layout_buy(
+        &mut self,
+        size: [i32; 2],
+        world: &World,
+        assets: &Assets,
+        sell: Option<&SellInfo>,
+    ) {
         if self.controls.mode != Mode::Buy || !self.controls.expanded {
             self.buy_layout = BuyLayout::default();
             return;
         }
         let rating_labels = self.rating_labels.clone();
+        let sell_labels = self.sell_labels.clone();
         let catalog = self.buy_catalog.get_or_insert_with(|| {
-            BuyCatalog::load(assets.index(), assets.catalog()).with_rating_labels(rating_labels)
+            BuyCatalog::load(assets.index(), assets.catalog())
+                .with_rating_labels(rating_labels)
+                .with_sell_labels(sell_labels)
         });
         let funds = sims_vm::available_funds(world);
-        let layout = buy::layout(size, catalog, &self.buy_state, &self.art, funds);
+        let layout = buy::layout_with_sell(size, catalog, &self.buy_state, &self.art, funds, sell);
         self.buy_state.page = layout.page;
         self.buy_layout = layout;
     }
@@ -290,11 +308,12 @@ impl Hud {
         world: &World,
         residential: bool,
         assets: &Assets,
+        sell: Option<&SellInfo>,
     ) {
         let snapshot = self.snapshot(world, residential);
         self.items = hud::layout(size, &snapshot, &self.controls);
         hud::fit(&mut self.items, &self.art, &self.texts);
-        self.layout_buy(size, world, assets);
+        self.layout_buy(size, world, assets, sell);
     }
 
     /// Updates the native `[control_panel + 0x1ec]` idle-blink flag
@@ -437,8 +456,26 @@ impl Hud {
         residential: bool,
         assets: &Assets,
         view: &View,
+        pace: &Pace,
+        status: Option<&str>,
+        canvas: &mut Canvas,
+    ) {
+        self.draw_with_sell(world, residential, assets, view, pace, status, None, canvas);
+    }
+
+    /// Draws the panel over the lot in `canvas`, optionally showing the Buy
+    /// Mode Hand Tool sell prompt (`0x487d7a` → `0x4cf90b` → `0x50a343`) when
+    /// `sell` is `Some`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_with_sell(
+        &mut self,
+        world: &World,
+        residential: bool,
+        assets: &Assets,
+        view: &View,
         _pace: &Pace,
         status: Option<&str>,
+        sell: Option<&SellInfo>,
         canvas: &mut Canvas,
     ) {
         let camera = &view.camera;
@@ -523,7 +560,7 @@ impl Hud {
             &self.controls,
         );
         if self.controls.mode == Mode::Buy && self.controls.expanded {
-            self.layout_buy(view.size, world, assets);
+            self.layout_buy(view.size, world, assets, sell);
             let mut guids: Vec<u32> = self
                 .buy_layout
                 .widgets
@@ -535,6 +572,9 @@ impl Hud {
                 .collect();
             if let Some(card) = &self.buy_layout.popup {
                 guids.push(card.guid);
+            }
+            if let Some(prompt) = &self.buy_layout.sell_prompt {
+                guids.push(prompt.guid);
             }
             for guid in guids {
                 let _ = self.thumbnails.read(assets.index(), assets.catalog(), guid);

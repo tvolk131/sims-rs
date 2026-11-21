@@ -19,6 +19,10 @@ use std::collections::BTreeSet;
 /// `0x486f5a` and `0x486960`.
 pub const TILE_CURSOR_GUID: u32 = 0x0000_0437;
 
+/// The `"comeandsee"` object GUID looked up by name (`0x43ab8f`) in `0x40726a`
+/// when returning from Buy/Build Mode to Live Mode (`0x4cea5d` → `0x4ceac2`).
+pub const COMEANDSEE_GUID: u32 = 0xf3aa_a62f;
+
 /// Global 19: the simulation's active UI mode (`0x4ce44f`).
 const MODE_GLOBAL: usize = 19;
 
@@ -267,6 +271,167 @@ impl Interpreter<'_> {
             trap: Trap::Invalid(format!("global {MODE_GLOBAL} out of range ({len} globals)")),
         })?;
         *slot = target;
+        Ok(())
+    }
+
+    /// Spawns or repositions `"comeandsee"` (`0xf3aaa62f`) markers for newly
+    /// bought / moved objects when leaving Buy or Build Mode back to Live Mode
+    /// (`0x4cea5d` → `0x4ceac2` → `0x40726a`).
+    pub fn update_comeandsee(&self, world: &mut World) -> Result<(), Fault> {
+        if self.catalog.object(COMEANDSEE_GUID).is_none() {
+            return Ok(());
+        }
+        let lot = world.globals.get(10).copied().unwrap_or(0);
+        let zoning = if lot == 0 {
+            1
+        } else {
+            self.program.zoning.get(&lot).copied().unwrap_or(0)
+        };
+        // 0x407299..0x4072e7: skip Downtown (21..=30), Studio (81..=89),
+        // Vacation (40..=49), and Magic (zoning == 2).
+        if (21..=30).contains(&lot)
+            || (81..=89).contains(&lot)
+            || (40..=49).contains(&lot)
+            || zoning == 2
+        {
+            return Ok(());
+        }
+        let cur_hour = world.globals.first().copied().unwrap_or(0);
+        let cur_day = world.globals.get(1).copied().unwrap_or(0);
+        let cur_min = world.globals.get(5).copied().unwrap_or(0);
+        let cur_month = world.globals.get(7).copied().unwrap_or(0);
+        let cur_year = world.globals.get(8).copied().unwrap_or(0);
+        let ids: Vec<u16> = world.objects.keys().copied().collect();
+        for id in ids {
+            let Some(obj) = world.objects.get(&id) else {
+                continue;
+            };
+            if !on_lot([obj.position[0], obj.position[1]]) {
+                continue;
+            }
+            // 0x40731e (`[obj + 0x8e] == 0`, data[34]) and 0x40732c
+            // (`[obj + 0x5b] & 0x40 == 0`, data[8] & 0x4000).
+            if obj.data.get(34).copied().unwrap_or(0) != 0 {
+                continue;
+            }
+            if (obj.data.get(8).copied().unwrap_or(0) as u16 & 0x4000) != 0 {
+                continue;
+            }
+            // 0x407351..0x40735f: only process the lead tile of multi-tile objects.
+            if obj.multipart.as_ref().is_some_and(|m| m.parent != 0) {
+                continue;
+            }
+            let fail = |trap| Fault {
+                object: id,
+                at: None,
+                trap,
+            };
+            let words = self.words(world, id).map_err(fail)?;
+            if words[word::TYPE] != 4 {
+                continue;
+            }
+            // 0x407365 → 0x4074df: check whether `id` already owns a comeandsee
+            // marker via its relationship table (`row.values[0] > 0`).
+            let existing = world.objects.get(&id).and_then(|o| {
+                o.relationships.iter().find_map(|row| {
+                    if row.present == 0 || row.values.first().copied().unwrap_or(0) <= 0 {
+                        return None;
+                    }
+                    let target = u16::try_from(row.target).ok()?;
+                    world
+                        .objects
+                        .get(&target)
+                        .filter(|t| t.guid == COMEANDSEE_GUID)
+                        .map(|_| target)
+                })
+            });
+            let helper = if let Some(helper) = existing {
+                helper
+            } else {
+                // 0x407374 → 0x43520d: age in sim-minutes must be 0 (bought at
+                // the current clock minute) and lot must be residential (`0x40745f`).
+                let Some(o) = world.objects.get(&id) else {
+                    continue;
+                };
+                let age_zero = o.data.get(21).copied().unwrap_or(0) == cur_min
+                    && o.data.get(24).copied().unwrap_or(0) == cur_hour
+                    && o.data.get(45).copied().unwrap_or(0) == cur_year
+                    && o.data.get(46).copied().unwrap_or(0) == cur_month
+                    && o.data.get(47).copied().unwrap_or(0) == cur_day;
+                if !age_zero || zoning != 1 {
+                    continue;
+                }
+                let helper = self.create(world, COMEANDSEE_GUID)?;
+                // 0x4073bb (`0x464fe2`) + 0x4073cb (`0x4650c3`): set relationship
+                // `(id -> helper)[0] = 1`.
+                if let Some(o) = world.objects.get_mut(&id) {
+                    let key = i32::from(helper);
+                    if let Some(row) = o
+                        .relationships
+                        .iter_mut()
+                        .find(|r| r.present != 0 && r.target == key)
+                    {
+                        row.values.resize(1, 0);
+                        row.values[0] = 1;
+                    } else {
+                        o.relationships
+                            .push(sims_formats::saved_objects::Relationship {
+                                present: 1,
+                                target: key,
+                                values: vec![1],
+                            });
+                    }
+                }
+                helper
+            };
+            // 0x4073d5 → 0x4071a3: average fine `(x, y)` across all group tiles.
+            let parts = if world
+                .objects
+                .get(&id)
+                .is_some_and(|o| o.multipart.is_some())
+            {
+                self.parts(world, id).map_err(fail)?
+            } else {
+                vec![id]
+            };
+            let mut sum_x = 0i64;
+            let mut sum_y = 0i64;
+            let mut count = 0i64;
+            for part in parts {
+                if let Some(o) = world.objects.get(&part) {
+                    sum_x += i64::from(o.position[0]);
+                    sum_y += i64::from(o.position[1]);
+                    count += 1;
+                }
+            }
+            let Some(o) = world.objects.get(&id) else {
+                continue;
+            };
+            let level = o.position[2];
+            let target_pos = if count > 0 {
+                [(sum_x / count) as i32, (sum_y / count) as i32]
+            } else {
+                [o.position[0], o.position[1]]
+            };
+            let needs_place = world.objects.get(&helper).is_some_and(|h| {
+                !on_lot([h.position[0], h.position[1]])
+                    || h.position != [target_pos[0], target_pos[1], level]
+            });
+            if needs_place {
+                self.put(
+                    world,
+                    helper,
+                    Place {
+                        on_lot: true,
+                        position: target_pos,
+                        container: None,
+                        slot: -1,
+                        level,
+                    },
+                    true,
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -578,20 +743,28 @@ impl Interpreter<'_> {
     /// (`0x485f98` → `0x486960` → `0x4215e6` → `0x48ba19`).
     ///
     /// Returns `Ok(None)` without mutating `world` if [`Interpreter::can_pick_up`]
-    /// refuses `id`. Otherwise wraps `id`'s group lead in a `"Tile Cursor"`
-    /// (`0x00000437`), runs `USER_PICKUP` (OBJf 12) + `take_off`, and re-places
-    /// both at the object's original tile/container so it starts valid on-lot
-    /// with `before = cursor` and its original placement saved in `origin`.
+    /// refuses `id`. Otherwise wraps `id`'s group in a `"Tile Cursor"`
+    /// (`0x00000437`), returning the cursor part and held part corresponding
+    /// to the clicked tile `id` (so multi-tile rotation pivots around the
+    /// grabbed tile and `0x486960` computes the grab offset from that tile),
+    /// runs `USER_PICKUP` (OBJf 12) + `take_off`, and re-places both at `id`'s
+    /// original tile/container with `origin` saving the group lead's original
+    /// placement.
     pub fn buy_pick_up(&self, world: &mut World, id: u16) -> Result<Option<BuyCursor>, Fault> {
         let lead = self.lead_object(world, id);
         if !self.can_pick_up(world, lead)? {
             return Ok(None);
         }
         let fail = |trap| Fault {
-            object: lead,
+            object: id,
             at: None,
             trap,
         };
+        let picked_pos = world
+            .objects
+            .get(&id)
+            .ok_or_else(|| fail(Trap::native(10, "missing picked object")))?
+            .position;
         let origin = self.capture_placement(world, lead)?;
         let guid = origin.guid;
         let words = self
@@ -600,33 +773,33 @@ impl Interpreter<'_> {
             .map_err(fail)?;
         let budget_category = if words[BUILD_MODE_TYPE] != 0 { 7 } else { 6 };
         let facing_offset = words[FACING_OFFSET];
-        let cursor = self.create_tile_cursor(world, lead)?;
+        let cursor = self.create_tile_cursor(world, id)?;
         // Native `0x4215e6`: call `UserPickup(0)` (`OBJf 12` + `take_off`),
-        // then test/put the cursor and held object back at the original spot.
+        // then test/put the cursor and held object back at the clicked tile.
         self.run_user_pickup(world, lead)?;
         self.take_off(world, lead, true)?;
-        let [ox, oy, level] = origin.position;
+        let [px, py, level] = picked_pos;
         let mut out = BuyCursor {
             cursor,
-            held: lead,
+            held: id,
             guid,
             price: 0,
             budget_category,
             facing_offset,
             keep_buying: false,
             valid: false,
-            position: origin.position,
+            position: picked_pos,
             container: origin.container,
             origin: Some(origin),
         };
         let retained = out.container;
-        if on_lot([ox, oy])
-            && self.fits(world, out.cursor, [ox, oy], level)?
-            && !self.try_place_buy_at(world, &mut out, [ox, oy], level, retained)?
+        if on_lot([px, py])
+            && self.fits(world, out.cursor, [px, py], level)?
+            && !self.try_place_buy_at(world, &mut out, [px, py], level, retained)?
         {
             let cursor_place = Place {
                 on_lot: true,
-                position: [ox, oy],
+                position: [px, py],
                 container: None,
                 slot: -1,
                 level,
@@ -669,14 +842,14 @@ impl Interpreter<'_> {
             cursor.valid = false;
             return Ok(false);
         }
-        cursor.position = [pos[0], pos[1], level];
         cursor.valid = false;
         cursor.container = None;
         // Native `0x485ced`: check whether `"Tile Cursor"` fits at snapped
-        // `pos` BEFORE trying snapped placement or wall/pool auto-rotation
-        // (`0x48736b`); if it does not fit, jump straight to unsnapped
-        // fallback (`0x485f23`).
+        // `pos` BEFORE writing `cursor.position` (`0x421e72`) or trying
+        // snapped placement / wall auto-rotation (`0x48736b`); if it does not
+        // fit, jump straight to unsnapped fallback (`0x485f23`).
         if self.fits(world, cursor.cursor, pos, level)? {
+            cursor.position = [pos[0], pos[1], level];
             if self.try_place_buy_at(world, cursor, pos, level, retained)? {
                 return Ok(cursor.valid);
             }
@@ -727,10 +900,11 @@ impl Interpreter<'_> {
             self.put(world, cursor.cursor, cursor_place, true)?;
             cursor.position = [fine[0], fine[1], level];
         } else {
-            // Native `0x485f49`: when fallback fit fails, call `TakeOff(1)`
-            // unconditionally so the Tile Cursor becomes physically off-lot
-            // (`[-16, -16]`) while preserving the saved `cursor.position`
-            // coordinates read by manual `Turn` (`0x421be4`).
+            // Native `0x485f49`: when both snapped and fallback fits fail,
+            // `0x421e72` never runs; call `TakeOff(1)` unconditionally so the
+            // Tile Cursor becomes physically off-lot (`[-16, -16]`) while
+            // preserving the last saved `cursor.position` written by `0x421e72`
+            // for manual `Turn` (`0x421be4`).
             self.take_off_cursor_and_held_unconditional(world, cursor)?;
         }
         Ok(false)
@@ -1122,7 +1296,7 @@ impl Interpreter<'_> {
             )));
         }
         self.remove_cursor_and_held(world, cursor)?;
-        self.remove_now(world, cursor.cursor)?;
+        self.remove_now(world, self.lead_object(world, cursor.cursor))?;
         let [x, y, level] = cursor.position;
         let place = Place {
             on_lot: true,
@@ -1132,11 +1306,12 @@ impl Interpreter<'_> {
             level,
         };
         self.put(world, cursor.held, place, true)?;
-        self.run_user_placement(world, cursor.held)?;
+        let held_lead = self.lead_object(world, cursor.held);
+        self.run_user_placement(world, held_lead)?;
         if !cursor.is_existing() {
             spend(world, cursor.budget_category, cursor.price).map_err(fail)?;
         }
-        let after = self.capture_placement(world, cursor.held)?;
+        let after = self.capture_placement(world, held_lead)?;
         let kind = if cursor.is_existing() {
             BuyActionKind::Move
         } else {
@@ -1144,7 +1319,7 @@ impl Interpreter<'_> {
         };
         Ok(BuyPurchase {
             kind,
-            object: cursor.held,
+            object: held_lead,
             guid: cursor.guid,
             position: after.position,
             facing: after.facing,
@@ -1191,22 +1366,23 @@ impl Interpreter<'_> {
             self.buy_cancel(world, cursor)?;
             return Ok(Some(None));
         }
+        let held_lead = self.lead_object(world, cursor.held);
         let fail = |trap| Fault {
-            object: cursor.held,
+            object: held_lead,
             at: None,
             trap,
         };
         self.remove_cursor_and_held(world, cursor)?;
-        let refund = self.resale_value(world, cursor.held)?;
+        let refund = self.resale_value(world, held_lead)?;
         spend(world, cursor.budget_category, -refund).map_err(fail)?;
-        self.remove_now(world, cursor.cursor)?;
+        self.remove_now(world, self.lead_object(world, cursor.cursor))?;
         let origin = cursor.origin.clone().unwrap_or(BuyPlacement {
-            object: cursor.held,
+            object: held_lead,
             guid: cursor.guid,
             position: cursor.position,
             facing: world
                 .objects
-                .get(&cursor.held)
+                .get(&held_lead)
                 .and_then(|o| o.data.get(DATA_FACING).copied())
                 .unwrap_or(0)
                 .rem_euclid(8),
@@ -1215,7 +1391,7 @@ impl Interpreter<'_> {
         });
         Ok(Some(Some(BuyPurchase {
             kind: BuyActionKind::Sell,
-            object: cursor.held,
+            object: held_lead,
             guid: cursor.guid,
             position: origin.position,
             facing: origin.facing,
@@ -1443,6 +1619,12 @@ impl Interpreter<'_> {
             }
         }
         for purchase in purchases {
+            // Native `0x48c20e` deletes only instances marked detached by
+            // `0x48c0ea` (`Buy` undone or `Sell` committed/redone). A `Move`
+            // record never owns a detached object for deletion.
+            if purchase.kind == BuyActionKind::Move {
+                continue;
+            }
             let mut ids = Vec::new();
             if let Some(before) = &purchase.before {
                 collect_children(before, &mut ids);
@@ -1477,17 +1659,19 @@ impl Interpreter<'_> {
     ///   via `0x48bfab` without charging funds.
     pub fn buy_cancel(&self, world: &mut World, cursor: &BuyCursor) -> Result<(), Fault> {
         self.take_off_cursor_and_held_unconditional(world, cursor)?;
-        self.remove_now(world, cursor.cursor)?;
+        self.remove_now(world, self.lead_object(world, cursor.cursor))?;
         if let Some(origin) = &cursor.origin {
             let _ = self.restore_placement(world, origin, false)?;
         } else {
-            self.remove_now(world, cursor.held)?;
+            self.remove_now(world, self.lead_object(world, cursor.held))?;
         }
         Ok(())
     }
 
-    /// Creates one `"Tile Cursor"` (`0x00000437`) per tile of `held`
-    /// (`0x4215e6` → `0x421afb` → `0x42231d`).
+    /// Creates one `"Tile Cursor"` (`0x00000437`) per tile of `held`'s group
+    /// (`0x4215e6` → `0x421afb` → `0x42231d`) and returns the cursor tile
+    /// corresponding to `held` itself (so grabbing a non-lead multi-tile part
+    /// pivots around that tile).
     fn create_tile_cursor(&self, world: &mut World, held: u16) -> Result<u16, Fault> {
         let fail = |object, trap| Fault {
             object,
@@ -1506,7 +1690,7 @@ impl Interpreter<'_> {
             vec![held]
         };
         let mut cursor_lead = None;
-        let mut cursor_parts = Vec::with_capacity(held_parts.len());
+        let mut cursor_for_held = None;
         for &part_id in &held_parts {
             let id = (1..=i16::MAX as u16)
                 .find(|id| !world.objects.contains_key(id))
@@ -1554,9 +1738,13 @@ impl Interpreter<'_> {
             if cursor_lead.is_none() {
                 cursor_lead = Some(id);
             }
-            cursor_parts.push(id);
+            if part_id == held {
+                cursor_for_held = Some(id);
+            }
         }
-        cursor_lead.ok_or_else(|| fail(held, Trap::Invalid("no tile cursor created".into())))
+        cursor_for_held
+            .or(cursor_lead)
+            .ok_or_else(|| fail(held, Trap::Invalid("no tile cursor created".into())))
     }
 
     /// Rotates `id` (or its whole multi-tile group) toward `target_dir` in

@@ -1107,12 +1107,13 @@ pub fn quantize565([r, g, b]: [u8; 3]) -> [u8; 3] {
 
 /// Red-tinted blocked-placement palette transform (`0x42242f` → `0x4b44eb(1)`
 /// → `0x4c76d1` → `0x4b9425(3, 0.9)` → `0x49bd78`): converts `rgb` to a
-/// 0.9× grayscale luminance `gray` and boosts the red channel by `+0x30`.
+/// 0.9× grayscale luminance `gray`, boosts the red channel by `+0x30`, and
+/// packs the result through the display's 16-bit RGB565 palette (`0x4b9425`).
 pub fn tint_blocked([r, g, b]: [u8; 3]) -> [u8; 3] {
     let sum = f32::from(r) + f32::from(g) + f32::from(b);
     let gray = ((sum * (1.0_f32 / 3.0) * 0.9_f32 + 0.5_f32).trunc() as i32).clamp(0, 255);
     let red = (gray + 0x30).clamp(0, 255);
-    [red as u8, gray as u8, gray as u8]
+    quantize565([red as u8, gray as u8, gray as u8])
 }
 
 /// The original's 32 × 32 × 32 5-bit alpha-blend table (`0x6e5eac`),
@@ -1445,11 +1446,12 @@ mod tests {
 
     #[test]
     fn blocked_preview_tint_matches_native_0x49bd78() {
-        // Exact `0x49bd78` formula with intensity 0.9:
+        // Exact `0x49bd78` formula with intensity 0.9 packed through native
+        // `0x4b9425` RGB565 palette storage:
         // gray = ((r + g + b) * (1/3) * 0.9 + 0.5).trunc(), red = min(255, gray + 0x30).
-        assert_eq!(tint_blocked([0, 0, 0]), [0x30, 0, 0]);
-        assert_eq!(tint_blocked([255, 255, 255]), [255, 230, 230]);
-        assert_eq!(tint_blocked([90, 120, 150]), [156, 108, 108]);
+        assert_eq!(tint_blocked([0, 0, 0]), quantize565([0x30, 0, 0]));
+        assert_eq!(tint_blocked([255, 255, 255]), quantize565([255, 230, 230]));
+        assert_eq!(tint_blocked([90, 120, 150]), quantize565([156, 108, 108]));
         let mut c = Canvas::new(1, 1, [0, 0, 0]);
         c.draw_tinted(
             &image(1, 1, [90, 120, 150, 255], None),
@@ -1457,7 +1459,7 @@ mod tests {
             false,
             |_, _, _| Some(5),
         );
-        assert_eq!(c.color[0], [156, 108, 108]);
+        assert_eq!(c.color[0], quantize565([156, 108, 108]));
         assert_eq!(c.depth[0], 5);
     }
 

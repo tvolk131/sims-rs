@@ -624,6 +624,7 @@ impl Game {
         if (self.canvas.width, self.canvas.height) != (w, h) {
             self.canvas = Canvas::new(w, h, [0, 0, 0]);
         }
+        let sell = self.buy_sell_info();
         let world = self.lot.world();
         // The cutaway also opens the room the selected Sim is in.
         self.view.camera.focus.selected = world.selected_whereabouts().map(|w| Selected {
@@ -720,13 +721,14 @@ impl Game {
         }
         self.hud.sync_clock_blink(world, self.clock_us);
         self.blink_dirty = false;
-        self.hud.draw(
+        self.hud.draw_with_sell(
             world,
             self.lot.residential(),
             &self.assets,
             &self.view,
             &self.pace,
             status.as_deref(),
+            sell.as_ref(),
             &mut self.canvas,
         );
         // The help balloon closed by the selection's going.
@@ -771,8 +773,14 @@ impl Game {
         self.sync_view_centre();
         self.hud.resize_menu(size);
         if self.hud.controls.mode == Mode::Buy {
-            self.hud
-                .relayout_panel(size, self.lot.world(), self.lot.residential(), &self.assets);
+            let sell = self.buy_sell_info();
+            self.hud.relayout_panel(
+                size,
+                self.lot.world(),
+                self.lot.residential(),
+                &self.assets,
+                sell.as_ref(),
+            );
         }
         true
     }
@@ -954,6 +962,7 @@ impl Game {
                         let sounds = self.hud.take_sounds();
                         self.keep_sounds(sounds);
                         self.refresh_world();
+                        self.layout_buy();
                         return Outcome::redraw();
                     }
                     Ok(None) => {
@@ -1779,8 +1788,7 @@ impl Game {
             }
             Command::BuyCategory(_) | Command::BuySubcategory(_) | Command::BuyBack => {
                 self.cancel_buy();
-                self.hud
-                    .layout_buy(self.view.size, self.lot.world(), &self.assets);
+                self.layout_buy();
                 Outcome::redraw()
             }
             Command::BuyToggleSort => {
@@ -1788,8 +1796,7 @@ impl Game {
                 Outcome::redraw()
             }
             Command::BuyPage(_) => {
-                self.hud
-                    .layout_buy(self.view.size, self.lot.world(), &self.assets);
+                self.layout_buy();
                 Outcome::redraw()
             }
             Command::BuyItem(guid) => {
@@ -1810,8 +1817,7 @@ impl Game {
                 }
                 self.sync_view_centre();
                 if self.hud.controls.mode == Mode::Buy {
-                    self.hud
-                        .layout_buy(self.view.size, self.lot.world(), &self.assets);
+                    self.layout_buy();
                 }
                 Outcome::redraw()
             }
@@ -1850,6 +1856,41 @@ impl Game {
         self.hud.buy_layout()
     }
 
+    /// Computes sell prompt info (`0x487d7a` → `0x4cf90b` → `0x50a343`) when
+    /// the Hand Tool is currently holding a picked-up existing lot object.
+    fn buy_sell_info(&mut self) -> Option<sims_ui::buy::SellInfo> {
+        let cursor = self.buy_cursor.as_ref()?;
+        if !cursor.is_existing() {
+            return None;
+        }
+        let held = cursor.held;
+        let guid = cursor.guid;
+        let (icon_guid, name) = self
+            .hud
+            .ensure_buy_catalog(&self.assets)
+            .display_for_object(guid);
+        let refund = self.lot.resale_value(held).unwrap_or(0);
+        let can_delete = self.lot.can_delete(held).unwrap_or(false);
+        Some(sims_ui::buy::SellInfo {
+            guid: icon_guid,
+            name,
+            refund,
+            can_delete,
+        })
+    }
+
+    /// Rebuilds the cached Buy Mode strip layout (catalog or active Hand Tool
+    /// sell prompt) for the current viewport size and world state.
+    fn layout_buy(&mut self) {
+        let sell = self.buy_sell_info();
+        self.hud.layout_buy(
+            self.view.size,
+            self.lot.world(),
+            &self.assets,
+            sell.as_ref(),
+        );
+    }
+
     /// Toggles the Buy Mode catalog sort order between `ByFunction` and
     /// `ByRoom` (`0x53a2c3` → `0x4cf3af`), cancelling any active cursor and
     /// returning to the top-level categories.
@@ -1862,8 +1903,7 @@ impl Game {
             return false;
         }
         let changed = self.hud.buy_state.apply(&Command::BuyToggleSort);
-        self.hud
-            .layout_buy(self.view.size, self.lot.world(), &self.assets);
+        self.layout_buy();
         changed
     }
 
@@ -1880,8 +1920,7 @@ impl Game {
         if !self.hud.buy_state.apply(&Command::BuyPage(delta)) {
             return false;
         }
-        self.hud
-            .layout_buy(self.view.size, self.lot.world(), &self.assets);
+        self.layout_buy();
         self.hud.buy_state.page != before
     }
 
@@ -1905,8 +1944,7 @@ impl Game {
                 self.buy_selected = None;
                 self.hud.buy_state.selected = None;
                 self.refresh_world();
-                self.hud
-                    .layout_buy(self.view.size, self.lot.world(), &self.assets);
+                self.layout_buy();
             }
             Ok(false) => {
                 self.buy_cursor = Some(cursor);
@@ -1933,14 +1971,12 @@ impl Game {
         self.hud.controls.mode == Mode::Buy && self.lot.can_buy_redo()
     }
 
-    /// Runs a Buy Mode Undo (`undo = true`) or Redo (`undo = false`) while
-    /// keeping any active placement preview and catalog selection armed
-    /// (`0x4a8545`, `0x4a856a`). Dispatches directly to the lot's purchase
-    /// history without moving or lifting the preview (matching `0x4a8545` /
-    /// `0x4a856a` + `0xee` panel dirtying at `0x4f66eb`), so an off-lot repeat
-    /// preview does not jump onto a freed tile and block immediate Redo, while
-    /// an already on-lot preview still collides with Redo (`0x4337f6`) and
-    /// preserves any manual surface rotation.
+    /// Runs a Buy Mode Undo (`undo = true`) or Redo (`undo = false`). If the
+    /// Hand Tool currently holds a picked-up existing lot object, snaps it
+    /// back and clears cursor ownership first (without clearing the redo
+    /// stack) so the Hand Tool never conflicts with or double-refunds an
+    /// undone/redone object; unpaid new catalog previews stay armed
+    /// (`0x4a8545`, `0x4a856a`).
     fn apply_buy_history(&mut self, undo: bool) -> bool {
         let allowed = if undo {
             self.can_undo()
@@ -1950,6 +1986,25 @@ impl Game {
         if !allowed || self.stopped.is_some() {
             return false;
         }
+        let snapped_existing = if self.buy_cursor.as_ref().is_some_and(BuyCursor::is_existing) {
+            let cursor = self.buy_cursor.take().unwrap();
+            match self.lot.buy_snap_back(&cursor) {
+                Ok(()) => {
+                    self.buy_dragging = None;
+                    self.buy_grab_offset = [0, 0];
+                    self.buy_commit_on_release = false;
+                    self.buy_in_house = false;
+                    true
+                }
+                Err(e) => {
+                    self.buy_cursor = Some(cursor);
+                    self.note = Some(format!("The held object could not be released: {e}"));
+                    return false;
+                }
+            }
+        } else {
+            false
+        };
         let result = if undo {
             self.lot.buy_undo()
         } else {
@@ -1969,18 +2024,23 @@ impl Game {
         match result {
             Ok(true) => {
                 self.refresh_world();
-                self.hud
-                    .layout_buy(self.view.size, self.lot.world(), &self.assets);
+                self.layout_buy();
                 true
             }
             Ok(false) => {
                 self.refresh_world();
+                if snapped_existing {
+                    self.layout_buy();
+                }
                 false
             }
             Err(e) => {
                 let verb = if undo { "undone" } else { "redone" };
                 self.note = Some(format!("The purchase was not {verb}: {e}"));
                 self.refresh_world();
+                if snapped_existing {
+                    self.layout_buy();
+                }
                 false
             }
         }
@@ -2014,6 +2074,12 @@ impl Game {
     /// updates `global[19]` (calling `go_live` `0x416534` when returning to
     /// Live mode), and refreshes the control panel and Buy catalog strip.
     pub fn set_mode(&mut self, mode: Mode) {
+        // Native `0x4cea5d`: pressing a mode shortcut for the already-active
+        // mode (e.g. F2 in Buy Mode, F1 in Live Mode) is a no-op and preserves
+        // the open catalog state and any active Hand Tool pickup.
+        if self.hud.controls.mode == mode {
+            return;
+        }
         self.cancel_buy();
         if self.buy_cursor.is_some() {
             return;
@@ -2054,6 +2120,7 @@ impl Game {
             self.lot.world(),
             self.lot.residential(),
             &self.assets,
+            None,
         );
     }
 
@@ -2086,8 +2153,7 @@ impl Game {
                 self.hud.buy_state.selected = None;
             }
         }
-        self.hud
-            .layout_buy(self.view.size, self.lot.world(), &self.assets);
+        self.layout_buy();
     }
 
     /// Cancels any active Buy Mode cursor or armed catalog selection
@@ -2118,8 +2184,7 @@ impl Game {
         let had_hud = self.hud.buy_state.selected.take().is_some();
         if had_selection || had_hud || had_cursor {
             if self.hud.controls.mode == Mode::Buy {
-                self.hud
-                    .layout_buy(self.view.size, self.lot.world(), &self.assets);
+                self.layout_buy();
             }
             true
         } else {
@@ -2183,8 +2248,7 @@ impl Game {
                         self.hud.play(crate::hud::ERROR);
                         self.buy_selected = None;
                         self.hud.buy_state.selected = None;
-                        self.hud
-                            .layout_buy(self.view.size, self.lot.world(), &self.assets);
+                        self.layout_buy();
                         return true;
                     }
                     Err(e) => {
@@ -2362,8 +2426,7 @@ impl Game {
                     self.hud.buy_state.selected = None;
                     self.refresh_world();
                 }
-                self.hud
-                    .layout_buy(self.view.size, self.lot.world(), &self.assets);
+                self.layout_buy();
             }
             Err(e) => {
                 // `Lot::buy_commit` rolled back the world; keep the cursor

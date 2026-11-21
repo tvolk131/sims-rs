@@ -1405,6 +1405,20 @@ impl Lot {
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
+        // Native `0x4cea5d` order when returning to Live Mode:
+        // 1. `0x4cea9e` -> `0x416534` (`go_live` / `set_mode`),
+        // 2. `0x4ceac2` -> `0x40726a` (`update_comeandsee`, while detached
+        //    sold/undone objects are still registered off-lot so new marker IDs
+        //    match native allocation),
+        // 3. `0x4ceaf5` -> `0x4933dc` -> `0x48c20e` (`buy_purge_detached`).
+        interpreter
+            .set_mode(&mut world, mode)
+            .map_err(OrderError::Refused)?;
+        if previous != PanelMode::Live && mode == PanelMode::Live {
+            interpreter
+                .update_comeandsee(&mut world)
+                .map_err(OrderError::Refused)?;
+        }
         if clearing {
             let empty = BTreeSet::new();
             interpreter
@@ -1417,9 +1431,6 @@ impl Lot {
                 .buy_purge_detached(&mut world, &self.buy_orphans, &empty)
                 .map_err(OrderError::Refused)?;
         }
-        interpreter
-            .set_mode(&mut world, mode)
-            .map_err(OrderError::Refused)?;
         self.world = world;
         if clearing {
             self.buy_undo.clear();
@@ -1842,12 +1853,16 @@ impl Lot {
                 Ok(true)
             }
             Ok(false) => {
-                // Native `0x48bdfe` line `0x48be72`: when `0x48c053` refuses
-                // placement for a purchase with no subactions, it skips the
-                // charge and leaves return status `0`, so `0x493353` transfers
-                // this record to Undo while leaving remaining Redo entries
-                // intact.
-                self.world = world;
+                // For a refused `Move` Redo (destination blocked), do NOT
+                // publish the detached intermediate world: keep the owned
+                // object safely on-lot at `before` so leaving Buy Mode never
+                // deletes paid furniture. For a refused `Buy` Redo (`0x48be72`
+                // -> `0x493353`), publish the world (which ran `0x48c0ea`) and
+                // transfer the record to Undo while leaving remaining Redo
+                // entries intact.
+                if purchase.kind != crate::BuyActionKind::Move {
+                    self.world = world;
+                }
                 self.buy_undo.push(purchase);
                 Ok(false)
             }
@@ -1883,7 +1898,7 @@ impl Lot {
         if cursor.is_existing() {
             let mut keep = BTreeSet::new();
             crate::buy::collect_buy_ids(&self.buy_undo, &mut keep);
-            keep.insert(cursor.held);
+            keep.insert(interpreter.lead_object(&world, cursor.held));
             interpreter
                 .buy_purge_detached(&mut world, &self.buy_redo, &keep)
                 .map_err(OrderError::Refused)?;
@@ -1892,6 +1907,27 @@ impl Lot {
         if cursor.is_existing() {
             self.buy_redo.clear();
         }
+        Ok(())
+    }
+
+    /// Snaps a picked-up existing Buy Mode object back to its pre-pickup
+    /// placement and deletes `"Tile Cursor"` WITHOUT clearing `self.buy_redo`,
+    /// used before executing Undo/Redo (`Game::apply_buy_history`) so the Hand
+    /// Tool never shares ownership with an Undo/Redo record.
+    pub fn buy_snap_back(&mut self, cursor: &BuyCursor) -> Result<(), OrderError> {
+        self.ready()?;
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        interpreter
+            .buy_cancel(&mut world, cursor)
+            .map_err(OrderError::Refused)?;
+        self.world = world;
         Ok(())
     }
 

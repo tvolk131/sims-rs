@@ -5434,15 +5434,20 @@ fn buy_mode_places_rotates_cancels_and_returns_to_live_mode() {
 
     // Switch back to Live mode by clicking the Live button `(35, 448)`:
     // cancels the armed second preview, returns global[19] to 0 (`go_live`),
-    // leaves only the one paid chair on the lot, and resumes simulation ticks.
+    // spawns the native `"comeandsee"` (`0xf3aaa62f`, `0x40726a`) marker on
+    // the newly bought chair, and resumes simulation ticks.
     let ticks_before = game.lot().world().ticks;
     game.press([35, 448]);
     game.release([35, 448]);
     assert_eq!(game.mode(), Mode::Live);
     assert!(game.buy_cursor().is_none());
     assert!(game.buy_selected().is_none());
-    assert_eq!(game.lot().world().objects.len(), count_before + 1);
-    assert_eq!(game.lot().world().objects[&held_first].data[26], 0);
+    assert_eq!(game.lot().world().objects.len(), count_before + 2);
+    let marker = game.lot().world().objects[&held_first].data[26] as u16;
+    assert_eq!(
+        game.lot().world().objects[&marker].guid,
+        sims_vm::COMEANDSEE_GUID
+    );
     assert_eq!(game.lot().world().globals[19], 0);
     game.render();
     assert_eq!(game.run(30), 30);
@@ -6248,7 +6253,7 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
             if canvas.id_at(x, y) == Some(blocked_cur.held) {
                 drew_held += 1;
                 let [r, g, b] = canvas.color[y as usize * canvas.width + x as usize];
-                if r > g && g == b {
+                if r > g + 20 && r > b + 20 && (i32::from(g) - i32::from(b)).abs() <= 4 {
                     exact_red_gray += 1;
                 }
                 if r > b {
@@ -6290,84 +6295,154 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
     assert_eq!(game.lot().view_centre(), collapsed_centre);
 }
 
-/// Strict replay of Track 2's Complete Collection 1.91 `goth-buy-move-sell`
-/// recording: enter Buy Mode (`F2`), buy Werkbunnst Chair ($80) on lawn,
-/// cancel repeat preview (`Escape`), pick up existing chair `260` by its
-/// sprite (`(480, 365)`), move with native grab offset to `(550, 380)` ->
-/// `[632, 440, 1]`, rotate with `.` to facing 4, drop, pick up 2-tile porch
-/// bench `173`/`174` at `(432, 230)`, sell with `Delete` for `$250` (`2462 ->
-/// 2712`), and return to Live Mode (`F1`) purging detached `173`/`174` before
-/// stepping 200 Live ticks.
+/// Strict 1,200-update replay of Track 2's Complete Collection 1.91
+/// `goth-buy-move-sell-20261121` recording on its exact drawn-frame schedule
+/// (`0,1,2,3+30`, verified across all 432 `watch.jsonl` rows):
+/// - Live updates `1..=93` (`tick 88445..=88537`, `funds=2542`, `n_obj=345`);
+/// - `F2` -> Buy Mode (`g[19]=2`) at `u=94` (partial passes `94..=903`);
+/// - Seating `(258, 524)` -> Werkbunnst Chair `(437, 523)` -> hover `(480, 380)`
+///   creating chair `260` + cursor `261` at `[584, 472, 1]` (`dir=2`) at `u=304`;
+/// - Buy chair `260` (`$80`, `funds=2462`) at `u=454` with repeat `261`/`263`;
+/// - `Escape` cancels repeat preview at `u=484` (`n_obj=346`, `260.data[26]=0`);
+/// - Click `(480, 365)` picks up chair `260` at `u=544` (`cursor 261.dir=2`);
+/// - Move `(550, 380)` with native grab offset -> `[632, 440, 1]` at `u=574`;
+/// - `.` rotates chair `260` to `dir=4` (`cursor 261.dir=2`) at `u=604`;
+/// - Click `(550, 380)` drops chair `260` at `[632, 440, 1]` `dir=4` at `u=694`;
+/// - Click `(432, 230)` picks up 2-tile porch bench `173`/`174` at `u=784`
+///   (showing the STR# 136 Sell Prompt for `"Parque Fresco del Aire Bench"` /
+///   `"$250"`);
+/// - `Delete` sells bench `173`/`174` at `u=844` (`funds=2712`, `+250`);
+/// - `F1` -> Live Mode (`g[19]=0`) at `u=904` (`tick=88538`, purging `173`/`174`
+///   and spawning chair helper `261`, `n_obj=345`);
+/// - Live updates `904..=1200` (`tick=88834`, `lot_rng=1_819_397_574`,
+///   `global_rng=270_289_136`, Mortimer `21` autonomously sitting in chair
+///   `260`'s helper `261` with action `(1, 261, 4102)` at `u=1144` and `u=1200`).
 #[test]
 fn buy_mode_move_and_sell_replays_recorded_goth_session() {
     use sims_ui::command::Mode;
     let Some(install) = install() else {
         return;
     };
-    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    let frames = Frames::parse("0,1,2,3+30").expect("a schedule");
+    let schedule = frames.clone();
+    let mut game = Game::open(&Options {
+        frames,
+        ..options(install)
+    })
+    .expect("the Goth house opens");
     game.resize([800, 600]);
     game.render();
-    assert_eq!(game.run(60), 60);
+
+    // Live Mode updates 1..=93 (`tick=88537`, `funds=2542`, `n_obj=345`).
+    run_to(&mut game, &schedule, 93);
+    assert_eq!(game.lot().world().ticks, 88_537);
+    assert_eq!(game.lot().world().globals[19], 0);
     assert_eq!(game.lot().world().budget.funds, 2542);
-    let orig_count = game.lot().world().objects.len();
+    assert_eq!(game.lot().world().lot_rng.state(), 2_189_872_521);
+    assert_eq!(game.lot().world().global_rng.state(), 270_289_136);
+    assert_eq!(game.lot().world().objects.len(), 345);
     assert!(game.lot().world().objects.contains_key(&173));
     assert!(game.lot().world().objects.contains_key(&174));
 
-    // F2 -> Buy Mode, Seating (258, 524), Werkbunnst Chair (437, 523).
+    // F2 -> Buy Mode before u=94 (partial pass: tick stays 88537, g[19]=2).
     game.set_mode(Mode::Buy);
     assert_eq!(game.lot().world().globals[19], 2);
+    run_to(&mut game, &schedule, 94);
+    assert_eq!(game.lot().world().ticks, 88_537);
+    assert_eq!(game.lot().world().globals[19], 2);
+
+    // Click Seating (258, 524) and Werkbunnst Chair (437, 523).
+    run_to(&mut game, &schedule, 184);
     game.press([258, 524]);
     game.release([258, 524]);
+    run_to(&mut game, &schedule, 274);
     game.press([437, 523]);
     game.release([437, 523]);
     assert_eq!(game.buy_selected(), Some(0x26bf_bb29));
 
-    // Popup card carries formatted STR# 160 ratings (`Comfort: 2`).
+    // Popup card carries formatted STR# 160 ratings (`Comfort: 2`), dynamically
+    // expands past 127 px (`0x50845d`), and renders the rating pixels visibly.
     let popup = game
         .buy_layout()
         .popup
         .as_ref()
-        .expect("selected chair popup");
+        .expect("selected chair popup")
+        .clone();
     assert!(
         popup.ratings.iter().any(|r| r == "Comfort: 2"),
         "expected Comfort: 2 on Werkbunnst Chair popup, got {:?}",
         popup.ratings
     );
+    assert!(
+        popup.rect.height > 127,
+        "popup card must grow past 127 px to fit description + Comfort: 2, got height {}",
+        popup.rect.height
+    );
+    let canvas = game.render();
+    let rating_band_top = (popup.rect.y + popup.rect.height - 28).max(popup.rect.y);
+    let rating_band_bottom = popup.rect.y + popup.rect.height;
+    let rating_pixels = (rating_band_top..rating_band_bottom)
+        .flat_map(|y| (popup.rect.x + 178..popup.rect.x + popup.rect.width).map(move |x| (x, y)))
+        .filter(|&(x, y)| {
+            let [r, g, b] = canvas.color[y as usize * canvas.width + x as usize];
+            r > 120 && g > 110 && r > b
+        })
+        .count();
+    assert!(
+        rating_pixels > 20,
+        "expected visible Comfort: 2 rating pixels in bottom band of popup, got {rating_pixels}"
+    );
 
-    // Place chair 260 at recorded (480, 380) -> [584, 472, 1], facing 2, funds 2462.
+    // Move onto lawn at recorded (480, 380) before u=304 -> creates chair 260
+    // + cursor 261 at [584, 472, 1], facing 2 (`n_obj=347`).
+    run_to(&mut game, &schedule, 303);
     let buy_spot = recorded([480, 380]);
     game.hover(buy_spot);
+    run_to(&mut game, &schedule, 304);
     let chair_id = game.buy_cursor().expect("chair cursor").held;
+    assert_eq!(chair_id, 260);
+    assert_eq!(game.lot().world().objects.len(), 347);
     assert_eq!(
         game.lot().world().objects[&chair_id].position,
         [584, 472, 1]
     );
     assert_eq!(game.lot().world().objects[&chair_id].data[1], 2);
+
+    // Place chair 260 at recorded (480, 380) before u=454 (`funds=2462`,
+    // `n_obj=348` with repeat chair 261 + cursor 263).
+    run_to(&mut game, &schedule, 453);
     game.press(buy_spot);
     game.release(buy_spot);
+    run_to(&mut game, &schedule, 454);
     assert_eq!(game.lot().world().budget.funds, 2462);
     assert_eq!(game.lot().world().globals[13], 2462);
+    assert_eq!(game.lot().world().objects.len(), 348);
 
-    // Escape cancels repeat preview; chair 260 stands alone on [584, 472, 1].
+    // Escape cancels repeat preview before u=484 (`n_obj=346`, `260.data[26]=0`).
+    run_to(&mut game, &schedule, 483);
     assert!(game.cancel_buy());
+    run_to(&mut game, &schedule, 484);
     assert!(game.buy_cursor().is_none());
-    assert_eq!(game.lot().world().objects.len(), orig_count + 1);
+    assert_eq!(game.lot().world().objects.len(), 346);
     assert_eq!(game.lot().world().objects[&chair_id].data[26], 0);
     game.render();
 
-    // Click (480, 365) (backrest of chair 260): Hand Tool picks up chair 260
-    // with click-to-pick-up (stays attached on release), cursor facing == 2,
-    // chair.before == cursor.
+    // Click (480, 365) (backrest of chair 260) before u=544: Hand Tool picks up
+    // chair 260 with click-to-pick-up (`n_obj=347`, cursor 261 dir=2).
+    run_to(&mut game, &schedule, 543);
     let pickup_chair = recorded([480, 365]);
     assert_eq!(game.under(pickup_chair), Some(chair_id));
     game.press(pickup_chair);
     game.release(pickup_chair);
+    run_to(&mut game, &schedule, 544);
     let picked = game
         .buy_cursor()
         .expect("chair stays attached after click-to-pick-up")
         .clone();
     assert!(picked.is_existing());
-    assert_eq!(picked.held, chair_id);
+    assert_eq!(picked.held, 260);
+    assert_eq!(picked.cursor, 261);
+    assert_eq!(game.lot().world().objects.len(), 347);
     assert_eq!(
         game.lot().world().objects[&chair_id].position,
         [584, 472, 1]
@@ -6383,10 +6458,12 @@ fn buy_mode_move_and_sell_replays_recorded_goth_session() {
     );
     assert_eq!(game.lot().world().budget.funds, 2462);
 
-    // Move to recorded (550, 380): grab offset places chair 260 & cursor at
-    // exact recorded tile [632, 440, 1] (`u=574`).
+    // Move to recorded (550, 380) before u=574: grab offset places chair 260 &
+    // cursor 261 at exact recorded tile [632, 440, 1].
+    run_to(&mut game, &schedule, 573);
     let drop_chair = recorded([550, 380]);
     game.hover(drop_chair);
+    run_to(&mut game, &schedule, 574);
     assert_eq!(
         game.lot().world().objects[&chair_id].position,
         [632, 440, 1]
@@ -6396,16 +6473,21 @@ fn buy_mode_move_and_sell_replays_recorded_goth_session() {
         [632, 440, 1]
     );
 
-    // `.` rotates held chair to facing 4 while Tile Cursor keeps facing 2 (`u=604`).
+    // `.` rotates held chair to facing 4 while Tile Cursor keeps facing 2 at u=604.
+    run_to(&mut game, &schedule, 603);
     assert!(game.rotate_held(true));
+    run_to(&mut game, &schedule, 604);
     assert_eq!(game.lot().world().objects[&chair_id].data[1], 4);
     assert_eq!(game.lot().world().objects[&picked.cursor].data[1], 2);
 
-    // Click (550, 380) drops chair 260 at [632, 440, 1] facing 4 (`u=694`).
+    // Click (550, 380) drops chair 260 at [632, 440, 1] facing 4 before u=694.
+    run_to(&mut game, &schedule, 693);
     game.press(drop_chair);
     game.release(drop_chair);
+    run_to(&mut game, &schedule, 694);
     assert!(game.buy_cursor().is_none());
     assert!(!game.lot().world().objects.contains_key(&picked.cursor));
+    assert_eq!(game.lot().world().objects.len(), 346);
     assert_eq!(
         game.lot().world().objects[&chair_id].position,
         [632, 440, 1]
@@ -6415,7 +6497,8 @@ fn buy_mode_move_and_sell_replays_recorded_goth_session() {
     assert_eq!(game.lot().world().budget.funds, 2462);
     game.render();
 
-    // Click (432, 230) picks up 2-tile porch bench 173/174 (`u=784`).
+    // Click (432, 230) picks up 2-tile porch bench 173/174 before u=784 (`n_obj=348`).
+    run_to(&mut game, &schedule, 783);
     let pickup_bench = recorded([432, 230]);
     let bench_hit = game.under(pickup_bench);
     assert!(
@@ -6424,43 +6507,117 @@ fn buy_mode_move_and_sell_replays_recorded_goth_session() {
     );
     game.press(pickup_bench);
     game.release(pickup_bench);
+    run_to(&mut game, &schedule, 784);
     let bench_cur = game
         .buy_cursor()
         .expect("bench stays attached after click-to-pick-up")
         .clone();
     assert!(bench_cur.is_existing());
-    assert_eq!(bench_cur.held, 173);
+    assert_eq!(Some(bench_cur.held), bench_hit);
     assert_eq!(game.lot().world().objects[&173].position, [424, 360, 1]);
     assert_eq!(game.lot().world().objects[&174].position, [424, 376, 1]);
     assert_eq!(game.lot().world().objects[&bench_cur.cursor].data[1], 2);
     assert_eq!(game.lot().world().objects[&173].data[41], 250);
-    assert_eq!(game.lot().world().objects.len(), orig_count + 3);
+    assert_eq!(game.lot().world().objects.len(), 348);
+    // Holding an existing object replaces the Buy catalog strip with the
+    // native STR# 136 Sell Prompt (`0x487d7a` -> `0x4cf90b` -> `0x50a343`).
+    assert!(game.buy_layout().widgets.is_empty());
+    let prompt = game
+        .buy_layout()
+        .sell_prompt
+        .as_ref()
+        .expect("sell prompt shown while holding porch bench")
+        .clone();
+    assert_eq!(prompt.name, "Parque Fresco del Aire Bench");
+    assert_eq!(prompt.refund, 250);
+    assert!(prompt.can_delete);
+    let prompt_text = prompt.lines.join("\n");
+    assert!(
+        prompt_text.contains("Parque Fresco del Aire Bench") && prompt_text.contains("$250"),
+        "unexpected sell prompt lines: {:?}",
+        prompt.lines
+    );
+    let canvas = game.render();
+    let prompt_text_pixels = (500..600)
+        .flat_map(|y| (420..780).map(move |x| (x, y)))
+        .filter(|&(x, y)| {
+            let [r, g, b] = canvas.color[y as usize * canvas.width + x as usize];
+            r > 180 && g > 180 && b > 200
+        })
+        .count();
+    assert!(
+        prompt_text_pixels > 80,
+        "expected drawn sell prompt text in strip, got {prompt_text_pixels} bright pixels"
+    );
 
-    // Delete sells porch bench 173/174: refunds $250 (2462 -> 2712), deletes
-    // 2-tile Tile Cursor, detaches 173/174 to [-16, -16, 1] for Undo (`u=844`).
+    // Delete sells porch bench 173/174 before u=844: refunds $250 (2462 -> 2712),
+    // deletes 2-tile Tile Cursor, detaches 173/174 to [-16, -16, 1] (`n_obj=346`).
+    run_to(&mut game, &schedule, 843);
     assert!(game.sell_held());
+    run_to(&mut game, &schedule, 844);
     assert!(game.buy_cursor().is_none());
     assert!(!game.lot().world().objects.contains_key(&bench_cur.cursor));
     assert_eq!(game.lot().world().budget.funds, 2712);
     assert_eq!(game.lot().world().globals[13], 2712);
     assert_eq!(game.lot().world().objects[&173].position, [-16, -16, 1]);
     assert_eq!(game.lot().world().objects[&174].position, [-16, -16, 1]);
-    assert_eq!(game.lot().world().objects.len(), orig_count + 1);
+    assert_eq!(game.lot().world().objects.len(), 346);
 
-    // F1 -> Live Mode: purges detached 173 & 174 (`0x48c20e`), sets g[19]=0,
-    // and runs 200 Live ticks cleanly (`u=904..1144`).
+    // F1 -> Live Mode before u=904: purges detached 173 & 174 (`0x48c20e`),
+    // sets g[19]=0, spawns chair 260 helper 261 (`n_obj=345`, `tick=88538`),
+    // and replays Live updates 904..=1200 to exact oracle parity.
+    run_to(&mut game, &schedule, 903);
+    assert_eq!(game.lot().world().ticks, 88_537);
     game.set_mode(Mode::Live);
     assert_eq!(game.lot().world().globals[19], 0);
     assert!(!game.lot().world().objects.contains_key(&173));
     assert!(!game.lot().world().objects.contains_key(&174));
-    assert!(game.lot().world().objects.contains_key(&chair_id));
+    run_to(&mut game, &schedule, 904);
+    assert_eq!(game.lot().world().ticks, 88_538);
+    assert_eq!(game.lot().world().objects.len(), 345);
+    assert_eq!(game.lot().world().objects[&chair_id].data[26], 261);
+    assert!(game.lot().world().objects.contains_key(&261));
     assert_eq!(
         game.lot().world().objects[&chair_id].position,
         [632, 440, 1]
     );
     assert_eq!(game.lot().world().objects[&chair_id].data[1], 4);
     assert_eq!(game.lot().world().budget.funds, 2712);
-    assert_eq!(game.run(200), 200);
+
+    // Update 1144 (scenario `after` shot): Mortimer autonomously sitting in
+    // chair 260's helper 261 (`uid=1, target=261, action=4102`), exact RNGs.
+    run_to(&mut game, &schedule, 1144);
+    assert_eq!(game.lot().world().ticks, 88_778);
+    assert_eq!(game.lot().world().objects.len(), 345);
+    assert_eq!(game.lot().world().lot_rng.state(), 4_116_324_892);
+    assert_eq!(game.lot().world().global_rng.state(), 270_289_136);
+    let mortimer_1144 = game.lot().world().objects[&21].person.as_ref().unwrap();
+    assert_eq!(
+        (
+            mortimer_1144.active.uid,
+            mortimer_1144.active.target,
+            mortimer_1144.active.action
+        ),
+        (1, 261, 4102)
+    );
+
+    // Final update 1200: exact tick 88834, funds 2712, object count 345,
+    // exact lot & global RNGs, and Mortimer still active on chair 260 helper 261.
+    run_to(&mut game, &schedule, 1200);
+    assert_eq!(game.lot().world().ticks, 88_834);
+    assert_eq!(game.lot().world().objects.len(), 345);
+    assert_eq!(game.lot().world().budget.funds, 2712);
+    assert_eq!(game.lot().world().lot_rng.state(), 1_819_397_574);
+    assert_eq!(game.lot().world().global_rng.state(), 270_289_136);
+    let mortimer_1200 = game.lot().world().objects[&21].person.as_ref().unwrap();
+    assert_eq!(
+        (
+            mortimer_1200.active.uid,
+            mortimer_1200.active.target,
+            mortimer_1200.active.action
+        ),
+        (1, 261, 4102)
+    );
     assert_eq!(
         game.lot().world().objects[&chair_id].position,
         [632, 440, 1]
@@ -6642,25 +6799,68 @@ fn buy_mode_hand_tool_guards_depreciation_undo_redo_and_followups() {
         world.objects.get_mut(&desk_id).unwrap().data[8] = orig_d8;
     }
 
-    // Multipart `0x485f49` fit refusal preserves saved `cursor.position`:
-    // move a 2-tile bed onto a tile where fallback `fits(fine)` fails near the
-    // lot border; physical cursor is off-lot `[-16, -16]`, while saved
-    // `cursor.position` stays at the snapped tile rather than `[-16, -16]`.
+    // Multipart `0x485f49` dual fit refusal preserves the last saved
+    // `cursor.position` written by `0x421e72`: place a 2-tile bed at a valid
+    // lawn tile `[584, 440, 1]`, then move onto the last interior corner
+    // `[edge, edge]` where both snapped and fallback `fits` fail. Physical
+    // cursor goes off-lot `[-16, -16]`, while saved `cursor.position` stays at
+    // `[584, 440, 1]` so manual `buy_turn` retries at `[584, 440, 1]`.
     let spartan = catalog
         .all()
         .iter()
         .find(|i| i.name.contains("Spartan Special"))
         .expect("Spartan Special bed");
     let mut bed_cur = lot.buy_start(spartan.guid, 1, 2).unwrap().unwrap();
-    // Place lead tile on the last interior row/column (`size - 2`) so
-    // `inside_placement_bounds` passes while the bed's other tiles extend out
-    // of bounds, hitting `0x485f49` fallback fit refusal: physical cursor is
-    // off-lot `[-16, -16]`, while saved `cursor.position` stays `[edge, edge, 1]`.
+    assert!(lot.buy_move(&mut bed_cur, [632, 440], 1).unwrap());
+    assert_eq!(bed_cur.position, [632, 440, 1]);
     let edge = (i32::from(lot.world().size) - 2) * 16 + 8;
     assert!(!lot.buy_move(&mut bed_cur, [edge, edge], 1).unwrap());
     assert!(lot.world().objects[&bed_cur.cursor].position[0] < 0);
-    assert_eq!(bed_cur.position, [edge, edge, 1]);
+    assert_eq!(bed_cur.position, [632, 440, 1]);
+    // Manual `buy_turn` retries at the preserved `[632, 440, 1]` (never `[edge, edge]`):
+    let _ = lot.buy_turn(&mut bed_cur, 1).unwrap();
+    assert_eq!(lot.world().objects[&bed_cur.cursor].position, [632, 440, 1]);
+    assert_eq!(lot.world().objects[&bed_cur.held].data[1], 4);
+    assert!(lot.buy_turn(&mut bed_cur, -1).unwrap());
+    assert_eq!(lot.world().objects[&bed_cur.held].position, [632, 440, 1]);
+    assert_eq!(lot.world().objects[&bed_cur.held].data[1], 2);
     lot.buy_cancel(&bed_cur).unwrap();
+
+    // Non-lead multi-tile pickup pivots around the clicked part (`0x4215e6` /
+    // `0x421be4`): picking up porch bench tile `174` keeps `held == 174`,
+    // anchors `174` at its moved tile during rotation, and pivots `173` around it.
+    let mut non_lead = lot
+        .buy_pick_up(174)
+        .unwrap()
+        .expect("bench tile 174 picked up");
+    assert_eq!(non_lead.held, 174);
+    assert_eq!(non_lead.position, [424, 376, 1]);
+    let mut pivoted = false;
+    'search: for tx in 32..=39 {
+        for ty in 24..=30 {
+            let spot = [tx * 16 + 8, ty * 16 + 8];
+            if !lot.buy_move(&mut non_lead, spot, 1).unwrap() {
+                continue;
+            }
+            assert_eq!(lot.world().objects[&174].position, [spot[0], spot[1], 1]);
+            let lead_before_turn = lot.world().objects[&173].position;
+            assert_ne!(lead_before_turn, [spot[0], spot[1], 1]);
+            if lot.buy_turn(&mut non_lead, 1).unwrap() {
+                assert_eq!(lot.world().objects[&174].position, [spot[0], spot[1], 1]);
+                assert_ne!(lot.world().objects[&173].position, lead_before_turn);
+                pivoted = true;
+                break 'search;
+            }
+            let _ = lot.buy_turn(&mut non_lead, -1).unwrap();
+        }
+    }
+    assert!(
+        pivoted,
+        "found open lawn tile to pivot bench around tile 174"
+    );
+    lot.buy_cancel(&non_lead).unwrap();
+    assert_eq!(lot.world().objects[&173].position, [424, 360, 1]);
+    assert_eq!(lot.world().objects[&174].position, [424, 376, 1]);
 
     // --- 2. Game-level drag-to-drop, Shift no-duplicate, catalog-drop sell,
     //        second Buy click sort toggle, and `x`/`z` catalog paging ---
@@ -6767,6 +6967,157 @@ fn buy_mode_hand_tool_guards_depreciation_undo_redo_and_followups() {
     assert!(game.buy_cursor().is_none());
     assert!(!game.lot().world().objects.contains_key(&unpaid));
     assert_eq!(game.lot().world().budget.funds, funds_before_unpaid_sell);
+
+    // Pressing F2 (`set_mode(Mode::Buy)`) while already in Buy Mode is a
+    // no-op (`0x4cea5d`): open category and active Hand Tool pickup persist.
+    assert!(game.undo_buy()); // restore chair on lawn
+    game.render();
+    let state_before_f2 = game.buy_state();
+    game.set_mode(Mode::Buy);
+    assert_eq!(game.buy_state(), state_before_f2);
+    game.press(chair_grab);
+    game.release(chair_grab);
+    let held_before_f2 = game.buy_cursor().expect("chair held").clone();
+    game.set_mode(Mode::Buy);
+    assert_eq!(game.buy_cursor(), Some(&held_before_f2));
+    game.cancel_buy();
+
+    // Undo while holding a picked-up existing object releases Hand Tool
+    // ownership first: buy a fresh chair, cancel repeat, pick it up, then
+    // press Undo. Cursor clears, chair detaches, funds refund ONCE, and
+    // Delete / Escape / Save cannot double-refund or resurrect it.
+    game.set_mode(Mode::Live);
+    game.set_mode(Mode::Buy);
+    game.press([258, 524]); // Seating -> Dining Chairs
+    game.release([258, 524]);
+    game.press([437, 523]); // Werkbunnst Chair ($80)
+    game.release([437, 523]);
+    let undo_spot = [555, 420];
+    let funds_before_undo_test = game.lot().world().budget.funds;
+    game.hover(undo_spot);
+    let undo_chair = game.buy_cursor().unwrap().held;
+    assert!(game.buy_cursor().unwrap().valid);
+    game.press(undo_spot);
+    game.release(undo_spot);
+    assert_eq!(game.lot().world().budget.funds, funds_before_undo_test - 80);
+    game.cancel_buy();
+    game.render();
+    let undo_grab = (undo_spot[0] - 25..=undo_spot[0] + 25)
+        .step_by(2)
+        .flat_map(|x| {
+            (undo_spot[1] - 35..=undo_spot[1] + 15)
+                .step_by(2)
+                .map(move |y| [x, y])
+        })
+        .find(|&pt| game.under(pt) == Some(undo_chair))
+        .expect("clickable undo_chair pixel");
+    game.press(undo_grab);
+    game.release(undo_grab);
+    assert!(
+        game.buy_cursor()
+            .is_some_and(|c| c.is_existing() && c.held == undo_chair)
+    );
+    assert!(game.undo_buy());
+    assert!(game.buy_cursor().is_none());
+    assert!(game.buy_layout().sell_prompt.is_none());
+    assert!(game.lot().world().objects[&undo_chair].position[0] < 0);
+    assert_eq!(game.lot().world().budget.funds, funds_before_undo_test);
+    assert!(!game.sell_held());
+    assert!(!game.cancel_buy());
+    assert_eq!(game.lot().world().budget.funds, funds_before_undo_test);
+    let saved_after_undo = game.save().unwrap();
+    assert!(!saved_after_undo.world().objects.contains_key(&undo_chair));
+
+    // Refused Move Redo (destination blocked by an unpaid preview) keeps the
+    // paid object on-lot at `before`, and returning to Live Mode does NOT
+    // delete it (`0x48c20e` never deletes `Move` records).
+    assert!(game.redo_buy());
+    assert_eq!(game.lot().world().budget.funds, funds_before_undo_test - 80);
+    let orig_pos = game.lot().world().objects[&undo_chair].position;
+    game.render();
+    game.press(undo_grab);
+    game.release(undo_grab);
+    let dest_spot = [577, 432];
+    game.hover(dest_spot);
+    let moved_pos = game.lot().world().objects[&undo_chair].position;
+    assert_ne!(moved_pos, orig_pos);
+    game.press(dest_spot);
+    game.release(dest_spot);
+    assert_eq!(game.lot().world().objects[&undo_chair].position, moved_pos);
+    // Undo the move -> chair returns to `orig_pos`.
+    assert!(game.undo_buy());
+    assert_eq!(game.lot().world().objects[&undo_chair].position, orig_pos);
+    // Arm a new chair preview directly on `moved_pos` so Move Redo is blocked.
+    game.press([437, 523]);
+    game.release([437, 523]);
+    let blocker_spot = [
+        dest_spot[0] - (undo_grab[0] - undo_spot[0]),
+        dest_spot[1] - (undo_grab[1] - undo_spot[1]),
+    ];
+    game.hover(blocker_spot);
+    let blocker = game.buy_cursor().unwrap().held;
+    assert_eq!(game.lot().world().objects[&blocker].position, moved_pos);
+    assert!(!game.redo_buy());
+    assert_eq!(game.lot().world().objects[&undo_chair].position, orig_pos);
+    game.cancel_buy();
+    game.set_mode(Mode::Live);
+    assert!(game.lot().world().objects.contains_key(&undo_chair));
+    assert_eq!(game.lot().world().objects[&undo_chair].position, orig_pos);
+
+    // Non-deletable Sell Prompt (`STR# 136` entry 2): holding an end table with
+    // a lamp on top shows `"<name> cannot be deleted."` and refuses `sell_held`.
+    game.set_mode(Mode::Buy);
+    game.press([295, 524]); // Surfaces -> End Tables
+    game.release([295, 524]);
+    game.press([437, 523]); // Slot 0 End Table
+    game.release([437, 523]);
+    let table_spot = recorded([440, 380]);
+    game.hover(table_spot);
+    let table_id = game.buy_cursor().unwrap().held;
+    game.press(table_spot);
+    game.release(table_spot);
+    game.cancel_buy();
+    game.press([234, 550]); // Back
+    game.release([234, 550]);
+    game.press([337, 570]); // Lighting -> Table Lamps
+    game.release([337, 570]);
+    game.press([437, 523]); // Slot 0 Gloominator Desk Lamp
+    game.release([437, 523]);
+    game.hover(table_spot);
+    assert_eq!(
+        game.buy_cursor().unwrap().container.map(|(c, _)| c),
+        Some(table_id)
+    );
+    game.press(table_spot);
+    game.release(table_spot);
+    game.cancel_buy();
+    game.render();
+    let table_pt = (table_spot[0] - 25..=table_spot[0] + 25)
+        .step_by(2)
+        .flat_map(|x| {
+            (table_spot[1] - 25..=table_spot[1] + 25)
+                .step_by(2)
+                .map(move |y| [x, y])
+        })
+        .find(|&pt| game.under(pt) == Some(table_id))
+        .expect("clickable end table pixel");
+    game.press(table_pt);
+    game.release(table_pt);
+    let cant_del = game
+        .buy_layout()
+        .sell_prompt
+        .as_ref()
+        .expect("sell prompt for table with lamp")
+        .clone();
+    assert!(!cant_del.can_delete);
+    assert!(
+        cant_del.lines.join(" ").ends_with("cannot be deleted."),
+        "unexpected non-deletable prompt: {:?}",
+        cant_del.lines
+    );
+    assert!(game.sell_held()); // handled, refused with UI_error
+    assert!(game.buy_cursor().is_some()); // still held
+    game.cancel_buy();
 }
 
 /// Opening a pie menu near the top edge of the expanded bottom control strip
