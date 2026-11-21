@@ -29,6 +29,24 @@ pub enum Trap {
     /// State the interpreter cannot make sense of, such as a frame whose
     /// code owner is not in the lot's type table.
     Invalid(String),
+    /// A check tree failed: an entry's check, run while a pie menu is
+    /// listed, an advertisement weighed or a queued action checked before
+    /// it starts, or the check Find Best Object for Function runs
+    /// (`routine` names it then). The fault keeps its
+    /// own trap, so a check that failed is told apart from one that met
+    /// something not ported ([`Trap::unported`]).
+    CheckTree {
+        routine: Option<&'static str>,
+        tree: u16,
+        object: u16,
+        fault: Box<Fault>,
+    },
+    /// Work an instruction started, such as another object's callback or
+    /// the Init of an object it made, failed on a check tree's fault,
+    /// which `fault` holds whole rather than as unsupported text.
+    /// `context` says what the work was, when there is more to say than
+    /// where `fault` is.
+    Within { context: String, fault: Box<Fault> },
 }
 
 impl Trap {
@@ -41,6 +59,20 @@ impl Trap {
         match self {
             Self::Native { code, .. } => Some(*code),
             _ => None,
+        }
+    }
+
+    /// Whether this is something the simulation has not ported (a scope,
+    /// a primitive, or anything else it reports as unsupported), rather
+    /// than a failure of the script or a wrong caller. A check tree's
+    /// fault is what its own trap is, wherever it is held.
+    pub fn unported(&self) -> bool {
+        match self {
+            Self::UnsupportedScope { .. } | Self::Unimplemented { .. } | Self::Unsupported(_) => {
+                true
+            }
+            Self::CheckTree { fault, .. } | Self::Within { fault, .. } => fault.trap.unported(),
+            _ => false,
         }
     }
 }
@@ -68,6 +100,19 @@ impl fmt::Display for Trap {
             }
             Self::Unsupported(message) => write!(f, "unsupported: {message}"),
             Self::Invalid(message) => f.write_str(message),
+            Self::CheckTree {
+                routine,
+                tree,
+                object,
+                fault,
+            } => {
+                if let Some(routine) = routine {
+                    write!(f, "{routine}: ")?;
+                }
+                write!(f, "check tree {tree:#06x} of object {object}: {fault}")
+            }
+            Self::Within { context, fault } if context.is_empty() => write!(f, "{fault}"),
+            Self::Within { context, fault } => write!(f, "{context}: {fault}"),
         }
     }
 }
@@ -103,15 +148,45 @@ impl fmt::Display for Fault {
 impl std::error::Error for Fault {}
 
 impl Fault {
+    /// Whether the fault is a check tree's, held as it is
+    /// ([`Trap::CheckTree`], [`Trap::Within`]).
+    pub(crate) fn holds_check(&self) -> bool {
+        matches!(self.trap, Trap::CheckTree { .. } | Trap::Within { .. })
+    }
+
+    /// The trap for work that failed on this fault, which the work reports
+    /// as unsupported, "`context`: fault". A check tree's fault is kept
+    /// whole instead ([`Trap::Within`], with the same text), so that
+    /// whether the check met something not ported can still be told
+    /// ([`Trap::unported`]).
+    pub(crate) fn unsupported_in(self, context: impl Into<String>) -> Trap {
+        let context = context.into();
+        if self.holds_check() {
+            Trap::Within {
+                context,
+                fault: Box::new(self),
+            }
+        } else {
+            Trap::Unsupported(format!("{context}: {self}"))
+        }
+    }
+
     /// The trap an instruction reports for a fault in work it started,
     /// such as another object's callback: the trap itself when the fault
     /// names only `me` and no frame, and otherwise one that keeps the
     /// object, tree and node the fault happened at. An unsupported trap
-    /// stays unsupported; any other becomes invalid state with the whole
+    /// stays unsupported, and a check tree's fault is kept whole
+    /// ([`Trap::Within`]); any other becomes invalid state with the whole
     /// fault as its message.
     pub(crate) fn nested(self, me: u16) -> Trap {
         if self.object == me && self.at.is_none() {
             return self.trap;
+        }
+        if self.holds_check() {
+            return Trap::Within {
+                context: String::new(),
+                fault: Box::new(self),
+            };
         }
         let mut place = format!("object {}", self.object);
         if let Some(at) = self.at {
@@ -121,5 +196,71 @@ impl Fault {
             Trap::Unsupported(message) => Trap::Unsupported(format!("{message} (in {place})")),
             trap => Trap::Invalid(format!("{place}: {trap}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check(trap: Trap) -> Fault {
+        Fault {
+            object: 3,
+            at: Some(Location {
+                tree: 0x1002,
+                node: 4,
+            }),
+            trap: Trap::CheckTree {
+                routine: None,
+                tree: 0x1012,
+                object: 7,
+                fault: Box::new(Fault {
+                    object: 3,
+                    at: Some(Location {
+                        tree: 0x1012,
+                        node: 1,
+                    }),
+                    trap,
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn work_that_meets_a_check_trees_fault_keeps_it_whole() {
+        // A check that failed stays failed through the work, and one that
+        // met something not ported stays unported.
+        let failed = check(Trap::ErrorBranch).unsupported_in("creating an object");
+        assert!(matches!(&failed, Trap::Within { .. }));
+        assert!(!failed.unported());
+        let unported = check(Trap::Unsupported("x".into())).unsupported_in("creating an object");
+        assert!(unported.unported());
+        // The text is what the unsupported trap's was.
+        let fault = check(Trap::ErrorBranch);
+        let text = format!("creating an object: {fault}");
+        assert_eq!(fault.unsupported_in("creating an object").to_string(), text);
+        // Any other fault is turned into text as before.
+        let other = Fault {
+            object: 3,
+            at: None,
+            trap: Trap::ErrorBranch,
+        };
+        let text = format!("creating an object: {other}");
+        assert_eq!(
+            other.unsupported_in("creating an object"),
+            Trap::Unsupported(text)
+        );
+        // In another object's work it keeps where it happened, and a
+        // second wrapping keeps it too.
+        let nested = check(Trap::ErrorBranch).nested(5);
+        assert_eq!(nested.to_string(), check(Trap::ErrorBranch).to_string());
+        assert!(!nested.unported());
+        let twice = Fault {
+            object: 5,
+            at: None,
+            trap: nested,
+        }
+        .unsupported_in("Grab");
+        assert!(matches!(&twice, Trap::Within { .. }) && !twice.unported());
     }
 }

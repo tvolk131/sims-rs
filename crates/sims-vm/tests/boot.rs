@@ -501,9 +501,21 @@ fn the_selected_goth_lists_pie_menus_and_picks_from_them() {
     // action string with a token, whose formatter is not ported. The lot
     // is as it was.
     let before = lot.world().hash();
-    let refused = lot.pie_menu(sim, 10).unwrap_err().to_string();
-    assert!(refused.contains("0x44bf1a"), "{refused}");
+    let refused = lot.pie_menu(sim, 10).unwrap_err();
+    assert!(refused.to_string().contains("0x44bf1a"), "{refused}");
     assert_eq!(lot.world().hash(), before);
+    // The check tree's fault keeps its trap, here something not ported.
+    let sims_vm::boot::OrderError::Refused(fault) = &refused else {
+        panic!("{refused:?}");
+    };
+    let sims_vm::Trap::CheckTree { fault: inner, .. } = &fault.trap else {
+        panic!("{fault:?}");
+    };
+    assert!(
+        matches!(&inner.trap, sims_vm::Trap::Unsupported(m) if m.contains("0x44bf1a")),
+        "{fault}"
+    );
+    assert!(fault.trap.unported());
     // Object 18's check tree reads the advertisement record (scope 12)
     // before Find Best Interaction first copies into it: the game's start
     // left it zeroed.

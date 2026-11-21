@@ -15,7 +15,7 @@
 pub mod save;
 
 use crate::play::Play;
-use crate::{Answers, Callback, Interpreter, Program, Stream, TickError, Update};
+use crate::{Answers, Callback, Interpreter, Program, SkippedFrame, Stream, TickError, Update};
 use sims_content::{Animations, Catalog, House, Index, Install, Neighborhood, People, Surfaces};
 use sims_core::CrtRng;
 use sims_sim::World;
@@ -289,11 +289,15 @@ pub enum StepError {
     /// step again.
     Asking { tick: u32 },
     /// The lot update of tick `tick` failed; the lot is as the failure
-    /// left it.
+    /// left it. In play mode `update` holds what the step did before it
+    /// failed: the errors caught in the objects' ticks, the frame before
+    /// the first tick if it was skipped, and the sounds. It is None in
+    /// strict mode.
     Tick {
         tick: u32,
         start: u32,
         error: String,
+        update: Option<Box<Update>>,
     },
     /// The frame after tick `tick` (0: before the first) failed. After a
     /// tick, that tick's update ran first, and is here.
@@ -316,7 +320,9 @@ impl std::fmt::Display for StepError {
                     "tick {tick} shows a dialog that waits for the player's answer"
                 )
             }
-            Self::Tick { tick, start, error } => write!(
+            Self::Tick {
+                tick, start, error, ..
+            } => write!(
                 f,
                 "tick {tick}, the lot update that starts at tick count {start}, failed: {error}"
             ),
@@ -759,8 +765,11 @@ impl Lot {
     /// Runs the next tick in play mode ([`crate::play`]): an error in an
     /// object's tick, such as an unported primitive, resets the object as
     /// the original does on a SimAntics error, and the lot goes on. The
-    /// errors caught are in [`Update::errors`]. Any other failure halts
-    /// the lot as [`Lot::step`] does.
+    /// errors caught are in [`Update::errors`]. A frame that fails is
+    /// skipped and noted in [`Update::frame_errors`]. Any other failure
+    /// ends the step as in [`Lot::step`]. A lot update that fails
+    /// ([`StepError::Tick`]) halts the lot, and carries what the step did
+    /// before it failed.
     ///
     /// Play mode is not the original's behaviour wherever a caught error
     /// comes from something not ported, so a lot stepped this way is not
@@ -840,7 +849,7 @@ impl Lot {
             view_rotation: self.view_rotation,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
-        let mut first_frame = None;
+        let mut frame_errors = Vec::new();
         if self.ticks == 0
             && self.frames.after(0)
             && let Err(error) = interpreter.draw_frame(&mut self.world, VIEW_LEVEL)
@@ -853,34 +862,45 @@ impl Lot {
                 }
                 .into());
             }
-            first_frame = Some(error.to_string());
+            frame_errors.push(SkippedFrame {
+                after: 0,
+                error: error.to_string(),
+            });
         }
         let tick = self.ticks + 1;
         // The idle loop sets a speed of its own before it runs the update
         // (0x46d9d6, `World::idle_speed`).
         let residential = residential(&self.world, &self.program);
         self.world.idle_speed(residential);
-        let update = interpreter
-            .lot_update_with(
-                &mut self.world,
-                tuning,
-                &mut self.player,
-                play.then_some(&mut self.play),
-            )
-            .map_err(|error| match error {
-                // Nobody has answered: the player is asked.
-                TickError::Unanswered { shown, given: None } if asks => Stop::Asks { tick, shown },
-                error => StepError::Tick {
-                    tick,
-                    start: self.start.wrapping_add(self.ticks),
-                    error: error.to_string(),
-                }
-                .into(),
-            })?;
+        let (update, result) = interpreter.lot_update_kept(
+            &mut self.world,
+            tuning,
+            &mut self.player,
+            play.then_some(&mut self.play),
+        );
         let mut update = Update {
-            frame_errors: first_frame.into_iter().collect(),
+            frame_errors,
             ..update
         };
+        if let Err(error) = result {
+            return Err(match error {
+                // Nobody has answered: the player is asked.
+                TickError::Unanswered { shown, given: None } if asks => Stop::Asks { tick, shown },
+                error => {
+                    // In play mode what came before the failure goes with
+                    // it: the errors caught, a skipped first frame, and
+                    // the sounds.
+                    update.sounds = sounds.take();
+                    StepError::Tick {
+                        tick,
+                        start: self.start.wrapping_add(self.ticks),
+                        error: error.to_string(),
+                        update: play.then(|| Box::new(update)),
+                    }
+                    .into()
+                }
+            });
+        }
         self.ticks = tick;
         // After each update (0x46da70) the idle call looks at global 11,
         // which Special Effect sets (0x44aad6): when it is set, the call
@@ -909,7 +929,10 @@ impl Lot {
         update.sounds = sounds.into_inner();
         if let Some(error) = frame {
             if play {
-                update.frame_errors.push(error.to_string());
+                update.frame_errors.push(SkippedFrame {
+                    after: tick,
+                    error: error.to_string(),
+                });
                 return Ok(update);
             }
             return Err(StepError::Frame {
@@ -1312,7 +1335,15 @@ mod tests {
         assert!(super::residential(&lot.world, &lot.program));
         // The update itself fails on an empty lot, after the idle loop
         // set its speed.
-        assert!(matches!(lot.step(), Err(StepError::Tick { tick: 1, .. })));
+        // A strict step hands back nothing with the failure.
+        assert!(matches!(
+            lot.step(),
+            Err(StepError::Tick {
+                tick: 1,
+                update: None,
+                ..
+            })
+        ));
         assert_eq!(lot.world.speed(), 1000);
         assert_eq!(lot.world.globals[18], 760);
         // A lot with no zoning is not residential: the idle loop leaves
@@ -1373,9 +1404,16 @@ mod tests {
     fn play_mode_still_halts_on_a_failure_outside_an_objects_tick() {
         let mut lot = lot(World::empty(), true, Frames::default());
         lot.tuning = Some(tuning());
-        let Err(StepError::Tick { tick: 1, .. }) = lot.step_play() else {
-            panic!("the tick should fail");
+        let Err(StepError::Tick {
+            tick: 1,
+            update: Some(update),
+            ..
+        }) = lot.step_play()
+        else {
+            panic!("the tick should fail, with what came before it");
         };
+        // Nothing was caught or skipped before the clock failed.
+        assert!(update.errors.is_empty() && update.frame_errors.is_empty());
         assert_eq!(lot.step_play().unwrap_err(), StepError::Halted);
         assert_eq!(lot.play, Play::default());
     }
