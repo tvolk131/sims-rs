@@ -394,10 +394,14 @@ impl Game {
 
     /// Runs up to `ticks` ticks, stopping at the first that fails, and,
     /// if `idle`, before a tick the idle loop's speed sets the speed for
-    /// ([`Game::idle_speed`]).
+    /// ([`Game::idle_speed`]) or after a tick that changes the
+    /// simulation's speed (such as Special Effect resetting to normal,
+    /// `0x4f684c` → `0x46d697`), which also updates the panel's speed and
+    /// restarts the time owed.
     fn run_while(&mut self, ticks: u32, idle: bool) -> u32 {
         let mut ran = 0;
         while ran < ticks && self.stopped.is_none() && !(idle && self.idle_speed()) {
+            let speed_before = self.lot.world().speed();
             let step = if self.play {
                 self.lot.step_play()
             } else {
@@ -446,6 +450,16 @@ impl Game {
                         _ => {}
                     }
                     self.stop(&error);
+                }
+            }
+            let world = self.lot.world();
+            if world.speed() != speed_before {
+                if let Some(speed) = pace::shown(world) {
+                    self.pace.speed = speed;
+                }
+                if idle {
+                    self.pace.restart();
+                    break;
                 }
             }
         }

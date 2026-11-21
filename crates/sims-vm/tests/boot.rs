@@ -1677,6 +1677,25 @@ fn the_goth_day_under_the_recordings_frames_keeps_its_streams() {
     // earlier or later, taken to be the drift of the recording's frames
     // against the schedule fitted here (unverified). The C runtime stream
     // matches the recording's at every update of the day.
+    //
+    // At tick 39610 the raccoon (object 10) runs Special Effect with flag
+    // 0x40 clear while everyone sleeps at idle speed 1000; message 0x10c
+    // drops the lot back to normal speed 760 (0x44abda..0x44abee →
+    // 0x4f684c..0x4f6873), matching `goth-day-20261115`'s update 39610.
+    while tick < 39_609 {
+        lot.step().unwrap();
+        tick += 1;
+    }
+    assert_eq!(
+        (lot.world().speed(), lot.world().return_speed()),
+        (1000, 760)
+    );
+    lot.step().unwrap();
+    tick += 1;
+    assert_eq!(
+        (lot.world().speed(), lot.world().return_speed()),
+        (760, 760)
+    );
     while tick < 43_200 {
         lot.step().unwrap();
         tick += 1;
