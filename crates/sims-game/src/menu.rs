@@ -20,7 +20,7 @@
 //! entry queues the very action offered (`Lot::pick`).
 //!
 //! Where the simulation cannot list a menu yet (it fails loudly on what
-//! it has not ported: an object that offers nothing; a version 0 table; a pet; joining; an
+//! it has not ported: an object that offers nothing; a version 0 table; a pet; an
 //! unported scope or primitive), the lot is left as it was and the menu
 //! falls back to every entry of the table without checks
 //! (`every_entry`); [`Listing::unchecked`] says why, and choosing one
@@ -55,6 +55,10 @@ use std::collections::BTreeMap;
 
 /// The language the labels are read in (US English).
 const LANGUAGE: u8 = 1;
+
+/// The join word (+0) of the offer to join a running interaction
+/// (0x41ee99).
+const JOINS: i32 = 1;
 
 /// The entry flag that puts "*" before the entry's name.
 const DEBUG: u32 = 0x80;
@@ -149,18 +153,20 @@ fn named(lot: &Lot, assets: &Assets, offered: Vec<MenuEntry>) -> Result<Vec<Entr
         });
         // The name a check tree gave is shown as it is; an entry without
         // one, or with an empty one, is named by the TTAs strings, with
-        // "*" before a debug entry (0x41f167).
+        // "*" before a debug entry (0x41f167). The offer to join already
+        // carries its entry's stored name (0x41efc1), unless a check tree
+        // named it, even with an empty name (0x4587d0).
+        let named_by_check = name.is_some();
         let label = match name.filter(|n| !n.is_empty()) {
             Some(name) => name,
             None => {
-                let name = labels
+                let strings = labels
                     .entry(target)
                     .or_insert_with(|| found.and_then(|f| self::labels(assets, f.resource, f.id)))
-                    .as_ref()
-                    .and_then(|l| l.get(menu as usize, LANGUAGE))
-                    .filter(|l| !l.trim().is_empty())
-                    .map_or_else(|| format!("Interaction {menu}"), str::to_owned);
-                if debug { format!("*{name}") } else { name }
+                    .as_ref();
+                let label = strings.and_then(|l| l.get(menu as usize, LANGUAGE));
+                let stored = action.join == JOINS && !named_by_check && strings.is_some();
+                entry_label(label, menu, debug, stored)
             }
         };
         out.push(Entry {
@@ -170,6 +176,27 @@ fn named(lot: &Lot, assets: &Assets, offered: Vec<MenuEntry>) -> Result<Vec<Entr
         });
     }
     Ok(out)
+}
+
+/// The name of an offered entry without one of its own: its TTAs
+/// `label`, or else (a blank one too) its menu number, with "*" before
+/// it for a `debug` entry (0x41f167), unless the action already carries
+/// the entry's `stored` name, as the offer to join does (0x41efc1): the
+/// getter adds the "*" only to an empty name (0x41f174).
+///
+/// The offer carries one whenever the object's TTAs strings loaded: the
+/// original stores the entry's label when its first byte is not 0
+/// (0x475bf6), and otherwise a name made from its tree (0x475c77). That
+/// made name is shown here as the menu number.
+fn entry_label(label: Option<&str>, menu: u32, debug: bool, stored: bool) -> String {
+    let name = label
+        .filter(|l| !l.trim().is_empty())
+        .map_or_else(|| format!("Interaction {menu}"), str::to_owned);
+    if debug && !stored {
+        format!("*{name}")
+    } else {
+        name
+    }
 }
 
 /// The fallback when the simulation cannot list the menu: every entry of
@@ -673,5 +700,15 @@ mod tests {
         // There a press goes back, as it does in the original.
         assert_eq!(menu.press(&art, submenu.center), Press::Stays);
         assert_eq!(menu.layouts.len(), 1);
+    }
+
+    #[test]
+    fn a_debug_entry_is_starred_unless_it_carries_its_stored_name() {
+        assert_eq!(entry_label(Some("Eat"), 3, false, false), "Eat");
+        assert_eq!(entry_label(Some("Eat"), 3, true, false), "*Eat");
+        assert_eq!(entry_label(Some("Eat"), 3, true, true), "Eat");
+        assert_eq!(entry_label(Some(" "), 3, true, true), "Interaction 3");
+        assert_eq!(entry_label(Some(" "), 3, true, false), "*Interaction 3");
+        assert_eq!(entry_label(None, 3, false, true), "Interaction 3");
     }
 }

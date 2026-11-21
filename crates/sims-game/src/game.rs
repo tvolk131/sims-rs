@@ -864,17 +864,26 @@ impl Game {
 
     /// Queues `entry` of the pie menu on `object` for `person`, as
     /// choosing it does: the action the simulation offered
-    /// (`Lot::pick`), or for a fallback entry the entry's menu number
-    /// (`Lot::queue_interaction`).
+    /// (`Lot::pick`, on the action's caller), or for a fallback entry the
+    /// entry's menu number (`Lot::queue_interaction`).
     fn order(&mut self, person: u16, object: u16, entry: &menu::Entry) {
         let label = &entry.label;
+        // A picked action is queued on its caller: `person`, but for the
+        // offer to join `person`'s running interaction.
+        let on = entry
+            .action
+            .as_ref()
+            .and_then(|a| u16::try_from(a.caller).ok())
+            .unwrap_or(person);
         let queued = match &entry.action {
             Some(action) => self.lot.pick(person, action.clone()),
             None => self.lot.queue_interaction(person, object, entry.menu),
         };
         self.note = Some(match queued {
-            Ok(Some(_)) => format!("Queued \"{label}\" for person {person}."),
-            Ok(None) => format!("Person {person}'s queue is full; \"{label}\" was not queued."),
+            Ok(Some(_)) => format!("Queued \"{label}\" for person {on}."),
+            // A full queue, an entry gone from the table, or a check
+            // that refused an action run at once.
+            Ok(None) => format!("\"{label}\" was not queued for person {on}."),
             Err(e) => format!("\"{label}\" was not queued: {e}"),
         });
     }

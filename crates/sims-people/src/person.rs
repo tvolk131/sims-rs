@@ -253,6 +253,7 @@ mod tests {
     /// A person record with nothing in it.
     fn blank_person() -> Person {
         let idle = sims_formats::saved_objects::Interaction {
+            join: 0,
             uid: 0,
             caller: 0,
             target: 0,

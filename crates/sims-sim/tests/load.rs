@@ -931,6 +931,7 @@ fn discarding_the_removals_empties_the_queue_and_touches_no_object() {
 fn person_of(id: u16, guid: u32, family: i16, visitor: i16) -> sims_sim::Object {
     use sims_formats::saved_objects::{Interaction, Person};
     let idle = Interaction {
+        join: 0,
         uid: 0,
         caller: 0,
         target: 0,
