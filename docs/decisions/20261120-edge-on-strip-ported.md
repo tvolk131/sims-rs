@@ -26,10 +26,12 @@ What the original does, from its code and those screenshots:
   the size of its pattern (`Image::masked`), because other pairs are not
   read.
 - The strip's rectangle is moved up by `(92 >> (3 - zoom)) + 1`, or `+ 2`
-  at near zoom (24, 47 and 94 pixels), before the draw and restored after.
+  at near zoom (24, 47 and 94 pixels), before the draw; the next wall
+  sets its rectangle up afresh.
   Depth is still looked up at the row drawn, from the same anchor
   (0x49a5d3, read in review); on the original's tile, reading it at the
-  unmoved row scores the same, so the screenshots do not decide this.
+  unmoved row scores the same, so the screenshots do not decide this;
+  the House02 test pins the depth written at the drawn row instead.
   Lighting is unchanged (room 0's light, capped by the time of day).
 
 Measured against the three House02 shots (focus on room 2 at far zoom,

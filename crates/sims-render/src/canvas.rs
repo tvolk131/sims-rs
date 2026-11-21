@@ -85,11 +85,15 @@ impl Image {
     /// drawn, so the mask's rows below it are left out. `None` when the
     /// mask is smaller or either image's pixels do not fill its size.
     pub fn masked_top_left(&self, mask: &Image) -> Option<Self> {
-        if mask.width < self.width
-            || mask.height < self.height
-            || self.rgba.len() != self.width * self.height * 4
-            || mask.rgba.len() != mask.width * mask.height * 4
-        {
+        // A size too large to count gives none rather than overflowing.
+        let fills = |image: &Image| {
+            image
+                .width
+                .checked_mul(image.height)
+                .and_then(|n| n.checked_mul(4))
+                == Some(image.rgba.len())
+        };
+        if mask.width < self.width || mask.height < self.height || !fills(self) || !fills(mask) {
             return None;
         }
         let mut rgba = self.rgba.clone();
@@ -542,6 +546,14 @@ mod tests {
         assert!(pattern.masked(&short).is_none());
         let empty = Image::empty();
         assert!(empty.masked_top_left(&mask).unwrap().is_empty());
+        // A size whose byte count overflows gives none, on either side.
+        let mut huge = image(1, 1, [0, 0, 0, 255], None);
+        huge.width = usize::MAX / 4 + 1;
+        huge.height = 2;
+        huge.rgba.clear();
+        assert!(huge.masked_top_left(&huge).is_none());
+        assert!(pattern.masked_top_left(&huge).is_none());
+        assert!(huge.masked(&huge).is_none());
     }
 
     #[test]

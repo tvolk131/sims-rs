@@ -71,9 +71,18 @@ fn the_edge_on_strip_starts_on_the_originals_row_and_shows_its_colours() {
         }
         sum.map(|s| s / 4)
     };
-    // Unlifted, the strip would start 24 rows lower; with its depth
-    // wrong, the floor behind would cover it; with the mask lined up at
-    // the bottom, row 79 would show the pattern's first row.
+    // The colours don't show where depth is read: on this tile the strip
+    // wins the depth test either way. So its depth is pinned: read at
+    // the row drawn (0x49a5d3), as the decision records. Read at the
+    // unlifted row, 24 rows lower, each value would be 347 more.
+    for (row, want) in [(80, 44471), (90, 44615), (100, 44760)] {
+        for x in 557..561 {
+            let got = canvas.depth[row * 800 + x];
+            assert_eq!(got, want, "depth at ({x}, {row}): read at the drawn row");
+        }
+    }
+    // Unlifted, the strip would start 24 rows lower; with the mask lined
+    // up at the bottom, row 79 would show the pattern's first row.
     let above = mean(79);
     assert!(
         above[0] < 100,
