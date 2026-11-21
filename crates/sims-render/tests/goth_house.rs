@@ -12,30 +12,30 @@ use std::path::PathBuf;
 /// SHA-256 prefixes of the 16-bit-color images, by zoom, rotation and wall
 /// mode.
 const DIGESTS: &[(u32, u8, &str, &str)] = &[
-    (1, 0, "up", "56aaf93c551cda8d"),
-    (1, 0, "cutaway", "dec9e87c010ad6eb"),
-    (1, 1, "up", "2e232070591d8874"),
-    (1, 1, "cutaway", "a2e190a331f7e762"),
-    (1, 2, "up", "99c52801f0d326f9"),
-    (1, 2, "cutaway", "db7477fb090dcb2b"),
-    (1, 3, "up", "fdb346de261d55f4"),
-    (1, 3, "cutaway", "645509af38760ed9"),
-    (2, 0, "up", "bed1ab5d05a42ab7"),
-    (2, 0, "cutaway", "1866928f0f67acf1"),
-    (2, 1, "up", "79925268174279c6"),
-    (2, 1, "cutaway", "9018ffc7e3ab7f6a"),
-    (2, 2, "up", "21c4e91b14df7ea6"),
-    (2, 2, "cutaway", "673a5e016681db12"),
-    (2, 3, "up", "6fa76d8b7ec20642"),
-    (2, 3, "cutaway", "63ba3a8bfd4da3be"),
-    (3, 0, "up", "6f47a1b76a8aaac5"),
-    (3, 0, "cutaway", "eba3d75dd2bd69bc"),
-    (3, 1, "up", "9dbeeaf9cf4ad84e"),
-    (3, 1, "cutaway", "cb2af648026d2261"),
-    (3, 2, "up", "8a82a31011820d9d"),
-    (3, 2, "cutaway", "8a82a31011820d9d"),
-    (3, 3, "up", "3629604ae2bcac81"),
-    (3, 3, "cutaway", "3629604ae2bcac81"),
+    (1, 0, "up", "489e49d35047767d"),
+    (1, 0, "cutaway", "20032461d289c46a"),
+    (1, 1, "up", "72bddc2febc0bd2e"),
+    (1, 1, "cutaway", "83511cc4400a8a8e"),
+    (1, 2, "up", "2b0a18029c134301"),
+    (1, 2, "cutaway", "5fc3f9fdb1b0f02d"),
+    (1, 3, "up", "a3c600e6189168e3"),
+    (1, 3, "cutaway", "ebece623c9ccf6a9"),
+    (2, 0, "up", "05116b4bdf73c830"),
+    (2, 0, "cutaway", "c135b92db338e7bf"),
+    (2, 1, "up", "f2ac49d9955f711b"),
+    (2, 1, "cutaway", "bb47a2398aaf781f"),
+    (2, 2, "up", "8f4c2e2aabd0a0c8"),
+    (2, 2, "cutaway", "bb4f2b0c8bed2ce1"),
+    (2, 3, "up", "96ba51bf04a1e71e"),
+    (2, 3, "cutaway", "e175524ba183b815"),
+    (3, 0, "up", "83522815a8355fb6"),
+    (3, 0, "cutaway", "e5222a8890e99e5a"),
+    (3, 1, "up", "4aa47d188bdab023"),
+    (3, 1, "cutaway", "cdd27beba0720a5e"),
+    (3, 2, "up", "5028f52b7a2b74a8"),
+    (3, 2, "cutaway", "5028f52b7a2b74a8"),
+    (3, 3, "up", "ffd2ddb9fe18940e"),
+    (3, 3, "cutaway", "ffd2ddb9fe18940e"),
 ];
 
 fn install() -> Option<PathBuf> {
@@ -183,6 +183,54 @@ fn floor_shadows_fit_the_floor_tile_and_every_code_has_a_mask() {
                 let mask = mask.unwrap_or_else(|| panic!("code {code} zoom {zoom}"));
                 assert_eq!((mask.width, mask.height), size, "code {code} zoom {zoom}");
             }
+        }
+    }
+}
+
+#[test]
+fn off_lot_void_colour_follows_time_of_day_and_house_99() {
+    let Some(root) = install() else {
+        return;
+    };
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut opened = open_house(&root, &house).unwrap();
+    // Camera at the night ratchet's scroll: (10, 10) and (790, 10) are off the lot.
+    let camera = Camera {
+        zoom: Zoom::Far,
+        rotation: 0,
+        level: 1,
+        origin: [527, -16],
+        walls: Walls::Cutaway,
+        focus: Focus::default(),
+    };
+    let cases = [
+        (0, 5, [115, 113, 115]),
+        (1, 5, [66, 65, 66]),
+        (2, 5, [24, 24, 24]),
+        (3, 5, [66, 65, 66]),
+        (4, 5, [0, 0, 255]),
+        (2, 99, [16, 20, 140]),
+    ];
+    // Build `Lot` once at daytime; `draw` reads live globals 4 and 10 on each
+    // clear (0x4aa9bd) so changes to globals take effect without rebuilding `Lot`.
+    let lot = Lot::from_world(&opened.world).unwrap();
+    for (time_of_day, house_no, want) in cases {
+        let mut world = opened.world.clone();
+        if world.globals.len() <= 10 {
+            world.globals.resize(11, 0);
+        }
+        world.globals[4] = time_of_day;
+        world.globals[10] = house_no;
+        let mut canvas = Canvas::new(800, 600, [0, 0, 0]);
+        draw(&world, &lot, &mut opened.assets, &camera, &mut canvas);
+        // Assert against raw `canvas.color` (not `rgb565()`) so the clear
+        // colour used for blending is verified to be 5-6-5 quantized.
+        for [x, y] in [[10usize, 10], [790, 10]] {
+            assert_eq!(
+                canvas.color[y * 800 + x],
+                want,
+                "time_of_day={time_of_day} house={house_no} at ({x}, {y})"
+            );
         }
     }
 }

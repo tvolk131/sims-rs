@@ -20,14 +20,14 @@
 //! window resized (a [`Shot`] that changes). The mixer then does what
 //! the original's kind 33 does (`sims_audio::player::Player::camera_moved`):
 //! every track is placed again from where its objects are on the moved
-//! screen, and the ambience's cursor moves. The original sends kind 33
-//! from five places in its view code, which are not all read; that these
-//! are the moves that send it is **unverified**. The ambience's cursor
-//! also follows the latest hour and view before each block the mixer
-//! renders, so the ambience keeps to the clock while the camera is
-//! still: the original moves it only on kind 33 as far as is read, and
-//! whether anything sends kind 33 when the hour changes is
-//! **unverified**.
+//! screen, the ambience's cursor moves, and the day and night loop
+//! updates (`0x574978`). When the hour changes (`Input::Hour`, after
+//! the initial hour), the mixer also runs kind 33, as the original's
+//! clock does at minute zero (`0x46d4d3` → `0x4f66bc`..`0x4f66c6` →
+//! `0x57aac5`). The original sends kind 33 from five places in its view
+//! and clock code; that the camera moves above cover the other four is
+//! **unverified**. The ambience's cursor also follows the latest hour
+//! and view before each block the mixer renders.
 //!
 //! The game pauses the sound as the original's does (its mode handler,
 //! 0x4ce470): it sends `sims_audio::SoundEvent::Pause` (in
@@ -161,6 +161,7 @@ pub fn sources(world: &World) -> Snapshot {
         absent,
         positions,
         screen: BTreeMap::new(),
+        lot: world.globals.get(10).copied().unwrap_or(0),
     }
 }
 
@@ -253,6 +254,89 @@ pub fn speed_register(speed: Speed) -> i32 {
     }
 }
 
+/// The sound events the window sends when opening a residential lot
+/// directly into live mode: neighbourhood mode (`bkground_nhood1`,
+/// unlocking music mode tracking as entering from the neighbourhood
+/// does), backyard ambience (`setambience_backyard`), and live mode
+/// (`bkground_live`, `0x4ce6d2`, starting backyard ambience and the day
+/// and night loop `0x574978`).
+pub fn enter_live() -> Vec<SoundEvent> {
+    ["bkground_nhood1", "setambience_backyard", "bkground_live"]
+        .into_iter()
+        .map(|name| SoundEvent::Play {
+            object: 0,
+            name: name.into(),
+        })
+        .collect()
+}
+
+/// The sound event for a live-mode pause change (`0x4ce5c5` for pause,
+/// `0x4ce5d9` for unpause).
+pub fn pause_event(paused: bool) -> SoundEvent {
+    if paused {
+        SoundEvent::Pause
+    } else {
+        SoundEvent::Unpause
+    }
+}
+
+/// Bridges a [`crate::Game`] into a [`Mixer`] (or [`crate::output::Output`]):
+/// sends object sources, live-mode entry ([`enter_live`]), live-mode
+/// pause/unpause ([`pause_event`], `0x4ce5c5` / `0x4ce5d9`), the
+/// simulation's sound events, the ambience view/hour/speed, and kind 33
+/// camera moves in the order the window uses.
+#[derive(Default)]
+pub struct Feed {
+    /// The hour, speed and ambience view the sound was last told.
+    heard: Option<(u32, Speed, i32)>,
+    /// The object answers the sound was last told.
+    told: Option<Snapshot>,
+    /// The camera the sound last heard move.
+    shot: Option<Shot>,
+    /// Whether the sound was last told the lot is paused.
+    paused: bool,
+}
+
+impl Feed {
+    /// Sends every sound input that changed on `game` since the last call.
+    pub fn update(&mut self, game: &mut crate::Game, mut send: impl FnMut(Input)) {
+        // What the tick's sounds may ask about their objects, before the
+        // sounds themselves. Read on every call, not only after a step
+        // that succeeded: a failed step may still have changed the lot.
+        let first = self.told.is_none();
+        let sources = game.sound_sources();
+        if self.told.as_ref() != Some(&sources) {
+            send(Input::Sources(sources.clone()));
+            self.told = Some(sources);
+        }
+        if first {
+            send(Input::Events(enter_live()));
+        }
+        let paused = game.paused();
+        if paused != self.paused {
+            send(Input::Events(vec![pause_event(paused)]));
+            self.paused = paused;
+        }
+        let sounds = game.take_sounds();
+        if !sounds.is_empty() {
+            send(Input::Events(sounds.into_iter().map(event).collect()));
+        }
+        let now = (game.hour(), game.pace.speed, game.ambience_view());
+        if self.heard != Some(now) {
+            send(Input::View(now.2));
+            send(Input::Hour(now.0));
+            send(Input::Speed(now.1));
+            self.heard = Some(now);
+        }
+        // Kind 33, after the sources and the view the moved camera shows.
+        let shot = game.shot();
+        if self.shot != Some(shot) {
+            send(Input::Camera);
+            self.shot = Some(shot);
+        }
+    }
+}
+
 /// The sound player's event for one of the simulation's. The
 /// simulation's object ID is 16 bits, as the script named it; it is
 /// widened without its sign, so -1 is 65535 (which the original passes is
@@ -301,7 +385,10 @@ impl Shot {
 pub enum Input {
     /// Events from a tick, in order.
     Events(Vec<SoundEvent>),
-    /// The hour of the game's clock (global 0), for the ambience.
+    /// The hour of the game's clock (global 0), sent after
+    /// [`Input::Sources`] and [`Input::View`]. Once set, a change of
+    /// hour runs kind 33 (`camera_moved`), as the original's clock does
+    /// at minute zero (`0x46d4d3` → `0x4f66bc`..`0x4f66c6` → `0x57aac5`).
     Hour(u32),
     /// The ambience's camera value (see the module documentation).
     View(i32),
@@ -353,7 +440,14 @@ impl Mixer {
                     self.player.handle(event, &self.sources);
                 }
             }
-            Input::Hour(hour) => self.hour = hour,
+            Input::Hour(hour) => {
+                let changed = self.hour != u32::MAX && self.hour != hour;
+                self.hour = hour;
+                if changed {
+                    self.player
+                        .camera_moved(self.view, self.hour, &self.sources);
+                }
+            }
             Input::View(view) => self.view = view,
             Input::Sources(sources) => self.sources = sources,
             Input::Camera => self

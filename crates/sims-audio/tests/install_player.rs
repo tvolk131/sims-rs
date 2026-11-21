@@ -370,15 +370,17 @@ fn the_backyard_ambience_plays() {
     player.add_scores(&files);
     player.add_stations(&sims_audio::stations::StationLists::build(&files));
     assert!(player.faults.is_empty(), "{:?}", player.faults);
-    // As on entering a lot from the neighbourhood: the music modes are
-    // recorded only once the neighbourhood's has been set.
+    // As on entering a lot from the neighbourhood at noon: the music
+    // modes are recorded only once the neighbourhood's has been set.
+    let mut noon = sims_audio::sources::Snapshot::default();
+    noon.absent[4] = 12;
     for name in ["bkground_nhood1", "setambience_backyard", "bkground_live"] {
         player.handle(
             &SoundEvent::Play {
                 object: 0,
                 name: name.into(),
             },
-            &NoSources,
+            &noon,
         );
     }
     assert!(player.faults.is_empty(), "{:?}", player.faults);
@@ -386,7 +388,7 @@ fn the_backyard_ambience_plays() {
     player.set_ambience_view(50, 12);
     let ambience = player.ambience().unwrap();
     assert_eq!((ambience.mode(), ambience.is_started()), (0, true));
-    let out = player.render_stereo(60 * RATE as usize, &NoSources);
+    let out = player.render_stereo(60 * RATE as usize, &noon);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
     let ambience = player.ambience().unwrap();
     // The neighbourhood's music starts and live's fades it out within a
@@ -404,4 +406,94 @@ fn the_backyard_ambience_plays() {
         ),
         "(13, 6) 3 2646000 43a4d0f5cfcb9688209f7f1760202de8ddbe276b450fbd6b35484c700e24f055"
     );
+}
+
+#[test]
+fn the_night_and_beach_loops_play_in_live_mode() {
+    let Some(root) = install() else { return };
+    let files = SoundFiles::scan(&root).unwrap();
+    let mut player = player(&root, 1);
+    // Use empty scores so every sample heard comes from `nite_loop`
+    // (2985) and `BeachLoop` (68259) in the install's tables, not FSC
+    // ambience cells.
+    let empty_score = sims_audio::fsc::Score::parse(
+        b"version 7\n#\tvol\tpri\n\
+          \t1024\t0\t0\t0\t1\t1\t60\t2\t1\t1\t0\t0\t0\t0\n\
+          #\tvol\n\
+          \t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\tNONE\n",
+    )
+    .unwrap();
+    assert!(player.add_score(0, &empty_score, "a"));
+    assert!(player.add_score(1, &empty_score, "b"));
+    player.add_stations(&sims_audio::stations::StationLists::build(&files));
+    let snap = |hour: i32, lot: i16| {
+        let mut s = sims_audio::sources::Snapshot::default();
+        s.absent[4] = hour;
+        s.lot = lot;
+        s
+    };
+    let day = snap(12, 1);
+    for name in ["bkground_nhood1", "bkground_live"] {
+        player.handle(
+            &SoundEvent::Play {
+                object: 0,
+                name: name.into(),
+            },
+            &day,
+        );
+    }
+    // Let the neighbourhood music finish fading out; daytime live mode
+    // is silent.
+    let _ = player.render_stereo(5 * RATE as usize, &day);
+    assert!(
+        player
+            .render_stereo(RATE as usize, &day)
+            .iter()
+            .all(|&s| s == 0)
+    );
+
+    // Night on a residential lot (lot 1, hour 22): `nite_loop` (2985) starts.
+    let night = snap(22, 1);
+    player.camera_moved(0, 22, &night);
+    let night_out = player.render_stereo(RATE as usize, &night);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+    assert!(
+        night_out.iter().any(|&s| s != 0),
+        "nite_loop should play at hour 22 on lot 1"
+    );
+
+    // Night on a Downtown lot (lot 25): `nite_loop` fades out to silence.
+    let downtown_night = snap(22, 25);
+    player.camera_moved(0, 22, &downtown_night);
+    let _ = player.render_stereo(RATE as usize, &downtown_night);
+    assert!(
+        player
+            .render_stereo(RATE as usize, &downtown_night)
+            .iter()
+            .all(|&s| s == 0),
+        "nite_loop should stop on Downtown lot 25"
+    );
+
+    // Switching to Beach ambience (mode 1) and moving the camera starts
+    // `BeachLoop` (68259), even at noon on Downtown lot 25.
+    let downtown_noon = snap(12, 25);
+    player.handle(
+        &SoundEvent::Play {
+            object: 0,
+            name: "setambience_beach".into(),
+        },
+        &downtown_noon,
+    );
+    player.camera_moved(0, 12, &downtown_noon);
+    let beach_out = player.render_stereo(RATE as usize, &downtown_noon);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+    assert!(
+        beach_out.iter().any(|&s| s != 0),
+        "BeachLoop should play in Beach ambience"
+    );
+
+    // Pausing stops and holds the loop immediately.
+    player.handle(&SoundEvent::Pause, &downtown_noon);
+    let paused = player.render_stereo(RATE as usize, &downtown_noon);
+    assert!(paused.iter().all(|&s| s == 0));
 }
