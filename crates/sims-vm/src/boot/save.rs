@@ -151,6 +151,19 @@ impl Lot {
     /// Once answered, until that tick runs again, the save keeps the
     /// answer, and the restored lot takes no input before its next step.
     pub fn save(&self) -> Result<Saved, SaveError> {
+        self.save_inner(None)
+    }
+
+    /// Like [`Lot::save`], but strips an active unpaid Buy Mode preview
+    /// (`cursor.held` and `cursor.cursor`) from the saved world copy before
+    /// purging detached Buy history so restoring the save never orphans an
+    /// unpaid item or `"Tile Cursor"` and never double-deletes a preview
+    /// still linked inside a detached surface container.
+    pub fn save_without_buy_cursor(&self, cursor: &crate::BuyCursor) -> Result<Saved, SaveError> {
+        self.save_inner(Some(cursor))
+    }
+
+    fn save_inner(&self, cursor: Option<&crate::BuyCursor>) -> Result<Saved, SaveError> {
         if self.load.finished.is_none() {
             return Err(SaveError::Incomplete);
         }
@@ -158,7 +171,9 @@ impl Lot {
             return Err(SaveError::Halted);
         }
         let mut world = self.world.clone();
-        if !self.buy_redo.is_empty() || !self.buy_undo.is_empty() || !self.buy_orphans.is_empty() {
+        let has_history =
+            !self.buy_redo.is_empty() || !self.buy_undo.is_empty() || !self.buy_orphans.is_empty();
+        if cursor.is_some() || has_history {
             let sounds = std::cell::RefCell::new(Vec::new());
             let interpreter = crate::interpreter::Interpreter {
                 sounds: Some(&sounds),
@@ -170,13 +185,23 @@ impl Lot {
                     crate::interpreter::Stream::Global,
                 )
             };
-            interpreter
-                .buy_purge_detached(&mut world, &self.buy_redo)
-                .and_then(|()| interpreter.buy_purge_detached(&mut world, &self.buy_undo))
-                .and_then(|()| interpreter.buy_purge_detached(&mut world, &self.buy_orphans))
-                .map_err(|e| {
-                    SaveError::Format(format!("clearing detached Buy Mode redo objects: {e}"))
+            // Strip any unpaid Buy preview first so an item linked into an
+            // undone surface container's slot is cleanly unlinked and deleted
+            // before detached history objects are purged.
+            if let Some(cursor) = cursor {
+                interpreter.buy_cancel(&mut world, cursor).map_err(|e| {
+                    SaveError::Format(format!("clearing Buy Mode preview for save: {e}"))
                 })?;
+            }
+            if has_history {
+                interpreter
+                    .buy_purge_detached(&mut world, &self.buy_redo)
+                    .and_then(|()| interpreter.buy_purge_detached(&mut world, &self.buy_undo))
+                    .and_then(|()| interpreter.buy_purge_detached(&mut world, &self.buy_orphans))
+                    .map_err(|e| {
+                        SaveError::Format(format!("clearing detached Buy Mode redo objects: {e}"))
+                    })?;
+            }
         }
         Ok(Saved {
             world,
@@ -193,29 +218,6 @@ impl Lot {
             floor_rotation: self.floor_rotation,
             replay_view: self.replay_view,
         })
-    }
-
-    /// Like [`Lot::save`], but strips an active unpaid Buy Mode preview
-    /// (`cursor.held` and `cursor.cursor`) from the saved world copy without
-    /// mutating the live lot, so restoring the save never orphans an unpaid
-    /// item or `"Tile Cursor"`.
-    pub fn save_without_buy_cursor(&self, cursor: &crate::BuyCursor) -> Result<Saved, SaveError> {
-        let mut saved = self.save()?;
-        let sounds = std::cell::RefCell::new(Vec::new());
-        let interpreter = crate::interpreter::Interpreter {
-            sounds: Some(&sounds),
-            view_rotation: self.view_rotation,
-            view_centre: self.view_centre,
-            ..crate::interpreter::Interpreter::new(
-                &self.program,
-                &self.catalog,
-                crate::interpreter::Stream::Global,
-            )
-        };
-        interpreter
-            .buy_cancel(&mut saved.world, cursor)
-            .map_err(|e| SaveError::Format(format!("clearing Buy Mode preview for save: {e}")))?;
-        Ok(saved)
     }
 
     /// Goes on from `saved`, a save of a lot loaded from the same install

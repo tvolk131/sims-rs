@@ -121,13 +121,14 @@ panel, and `sims-vm` had no `"Tile Cursor"` creation or Buy placement tool.
     instance and `0x48bdfe` line `0x48be72` skips the charge and returns `0`,
     so `0x493353` transfers the refused entry to Undo while preserving
     remaining Redo entries. Both keyboard handlers dispatch directly to history
-    without lifting any active preview (so an on-lot preview still collides with
-    Redo via `0x4337f6`), keeping any armed placement preview, manual surface
-    rotation, and catalog selection intact while refreshing preview validity.
-    Leaving a non-Live mode or discarding history on an Undo/Redo fault clears
-    the stack and deletes detached off-lot instances (`0x4cea5d` → `0x4933dc` →
-    `0x48c20e`), tracking any unpurgeable detached instances so `Lot::save`
-    never silently serializes them. Note that on-screen Undo/Redo buttons (`kToolBtnUndo = 64` at
+    without lifting or moving any active preview (`0x4a8545`, `0x4a856a`, with
+    `0xee` marking the panel dirty at `0x4f66eb`), so a stationary off-lot
+    repeat preview does not block immediate Redo, while an already on-lot
+    preview still collides with Redo via `0x4337f6` and preserves manual
+    surface rotation. Leaving a non-Live mode or discarding history on an
+    Undo/Redo fault clears the stack and deletes detached off-lot instances
+    (`0x4cea5d` → `0x4933dc` → `0x48c20e`), tracking any unpurgeable detached
+    instances so `Lot::save` never silently serializes them. Note that on-screen Undo/Redo buttons (`kToolBtnUndo = 64` at
     `(231, 21)`, `kToolBtnRedo = 65` at `(231, 53)`, `0x5004f5` / `0x500f87` /
     `0x501197`) belong exclusively to Build Mode (`mode == 0` in `0x50a8ec`);
     Buy Mode (`cWinCatalog`, `mode == 1`, `0x5050e4` / `0x507288`) has no
@@ -137,7 +138,8 @@ panel, and `sims-vm` had no `"Tile Cursor"` creation or Buy placement tool.
     `0x4878f3`), a successful commit immediately arms another copy with the
     placed facing (`0x4864d0` → `0x486f5a`) if affordable. Cancel (`0x487105`)
     deletes both without charging funds; saving mid-preview strips the unpaid
-    preview from the snapshot (`Lot::save_without_buy_cursor`).
+    preview from the snapshot before purging detached Buy history
+    (`Lot::save_without_buy_cursor`).
 
 ## Decision
 

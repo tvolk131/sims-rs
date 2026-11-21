@@ -5656,6 +5656,36 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
         // Undo the two refused records so later Undo assertions still reach `placed_lamp`.
         assert!(lot.buy_undo().unwrap());
         assert!(lot.buy_undo().unwrap());
+
+        // Saving after undoing a desk beneath an unpaid preview lamp: Undo
+        // takes the desk (and unpaid preview lamp in its slot) off-lot;
+        // `save_without_buy_cursor` must strip the preview BEFORE purging
+        // history so it does not double-delete the lamp.
+        let mut desk_cur2 = lot.buy_start(desk.guid, 1, 2).unwrap().unwrap();
+        assert!(lot.buy_move(&mut desk_cur2, [520, 472], 1).unwrap());
+        let desk_id2 = lot.buy_commit(&desk_cur2).unwrap();
+        let mut lamp_preview = lot.buy_start(lamp.guid, 1, 2).unwrap().unwrap();
+        assert!(lot.buy_move(&mut lamp_preview, [520, 472], 1).unwrap());
+        assert_eq!(lamp_preview.container.map(|(c, _)| c), Some(desk_id2));
+        assert!(lot.buy_undo().unwrap());
+        assert!(lot.world().objects[&desk_id2].position[0] < 0);
+        let saved_under_preview = lot
+            .save_without_buy_cursor(&lamp_preview)
+            .expect("save strips unpaid preview before purging undone desk");
+        assert!(!saved_under_preview.world().objects.contains_key(&desk_id2));
+        assert!(
+            !saved_under_preview
+                .world()
+                .objects
+                .contains_key(&lamp_preview.held)
+        );
+        assert!(
+            !saved_under_preview
+                .world()
+                .objects
+                .contains_key(&lamp_preview.cursor)
+        );
+        lot.buy_cancel(&lamp_preview).unwrap();
     }
 
     // Wall-mounted auto-rotation (`0x48736b` + `0x43583e`): Narcisco Wall
@@ -5822,12 +5852,12 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
             .iter()
             .any(|s| matches!(s, SoundEvent::Play { name, .. } if name == "UI_error"))
     );
-    // Available Undo (`0x4a8545`) keeps the repeat preview cursor, held chair,
-    // and catalog selection armed, moving the repeat preview onto the newly
-    // freed tile. Native Redo (`0x4a856a`) dispatches directly to history
-    // without lifting the preview, so the occupying preview chair refuses Redo
-    // (`0x4337f6`) without charging `$80`; once the preview leaves that tile,
-    // Undo + Redo restores the original chair and re-charges `$80`.
+    // Stationary Undo / Redo (`0x4a8545`, `0x4a856a`): Undo keeps the repeat
+    // preview armed and off-lot without moving it onto the freed tile, so an
+    // immediate Redo without moving the pointer restores `first_chair` and
+    // re-charges `$80`. Explicitly hovering the repeat preview onto the freed
+    // tile after Undo places it on-lot and causes Redo to be refused via
+    // `0x4337f6` without charging `$80`.
     assert!(game.can_undo());
     assert!(game.undo_buy());
     assert_eq!(game.buy_selected(), Some(0x26bf_bb29));
@@ -5837,20 +5867,28 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
         .clone();
     assert_eq!(armed_after_undo.held, second.held);
     assert_eq!(armed_after_undo.cursor, second.cursor);
-    assert!(armed_after_undo.valid);
+    assert!(!armed_after_undo.valid);
+    assert!(game.lot().world().objects[&second.held].position[0] < 0);
     assert!(game.lot().world().objects[&first_chair].position[0] < 0);
     assert_eq!(game.lot().world().budget.funds, 2542);
-    // Blocked Redo: the active repeat preview occupies `spot`, so Redo must be
-    // refused without charging and transfer the refused record to Undo.
+    // Stationary Redo succeeds immediately because `second.held` stayed off-lot.
+    assert!(game.redo_buy());
+    assert!(game.lot().world().objects[&first_chair].position[0] >= 0);
+    assert_eq!(
+        game.lot().world().objects[&first_chair].registry_word,
+        first_reg
+    );
+    assert_eq!(game.lot().world().budget.funds, 2542 - 80);
+    // Now Undo again and explicitly hover `spot`, moving `second.held` onto the
+    // freed tile so Redo collides (`0x4337f6`) and is refused without charging.
+    assert!(game.undo_buy());
+    assert_eq!(game.lot().world().budget.funds, 2542);
+    game.hover(spot);
+    let hovered_preview = game.buy_cursor().expect("preview moved onto tile").clone();
+    assert!(hovered_preview.valid);
+    assert!(game.lot().world().objects[&second.held].position[0] >= 0);
     assert!(!game.redo_buy());
     assert_eq!(game.buy_selected(), Some(0x26bf_bb29));
-    let armed_after_blocked_redo = game
-        .buy_cursor()
-        .expect("repeat preview stays armed after refused Redo")
-        .clone();
-    assert_eq!(armed_after_blocked_redo.held, second.held);
-    assert_eq!(armed_after_blocked_redo.cursor, second.cursor);
-    assert!(armed_after_blocked_redo.valid);
     assert!(game.lot().world().objects[&first_chair].position[0] < 0);
     assert_eq!(game.lot().world().budget.funds, 2542);
     // Step back the refused record to Redo and cancel the blocking preview so

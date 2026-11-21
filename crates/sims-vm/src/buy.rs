@@ -273,13 +273,16 @@ impl Interpreter<'_> {
             return Ok(cursor.valid);
         }
         // Snapped placement (and any wall/pool auto-rotation) failed: native
-        // `0x485f23` → `0x421e72` retries at unsnapped `fine`, where
-        // `UserTestPlace` (`0x4355bc..0x4355cd`) requires low nibbles == 8 for
-        // the held object, so held stays off-lot and `"Tile Cursor"` is placed
-        // alone at unsnapped `fine` when it fits. Native `0x421fcf..0x421fed`
-        // saves the cursor's actual coordinates so manual rotation
-        // (`0x422705..0x422716`) rechecks at `fine` instead of jumping to the
-        // tile centre.
+        // `0x485f23` → `0x421e72` → `0x422050` → `0x435522` runs the base
+        // placement test (including OBJf 5 overlap callbacks at `0x4355b5`)
+        // before rejecting unsnapped coordinates at `0x4355bc..0x4355cd`,
+        // leaving the held object off-lot and placing `"Tile Cursor"` alone at
+        // unsnapped `fine` when it fits. Native `0x421fcf..0x421fed` saves the
+        // cursor's actual coordinates so manual rotation (`0x422705..0x422716`)
+        // rechecks at `fine` instead of jumping to the tile centre.
+        if fine != pos && self.user_tiles_unblocked(world, cursor.held, fine)? {
+            let _ = self.place_test(world, cursor.held, fine, level)?;
+        }
         cursor.valid = false;
         cursor.container = None;
         if self.fits(world, cursor.cursor, fine, level)? {
@@ -863,11 +866,9 @@ impl Interpreter<'_> {
         {
             self.take_off(world, cursor.cursor, true)?;
         }
-        if world
-            .objects
-            .get(&cursor.held)
-            .is_some_and(|o| on_lot([o.position[0], o.position[1]]))
-        {
+        if world.objects.get(&cursor.held).is_some_and(|o| {
+            on_lot([o.position[0], o.position[1]]) || o.data.get(2).copied().unwrap_or(0) != 0
+        }) {
             self.take_off(world, cursor.held, true)?;
         }
         Ok(())
@@ -927,21 +928,16 @@ impl Interpreter<'_> {
         self.run_user_callback(world, held, function::USER_PICKUP)
     }
 
-    /// Checks the lot-border, ground-tile-flag `0x20`, and tile-centring
-    /// (`(x & 0xf) == 8 && (y & 0xf) == 8`) guards from native `UserTestPlace`
-    /// (`0x435522` lines `0x43553e..0x4355cd`, multi-tile `0x422de4`), which
-    /// reject unsnapped coordinates and any tile outside `1..size - 1` or with
-    /// bit `0x20` set in level-1 tile flags (array `8`) when `move_objects` is
-    /// off.
-    fn user_tiles_allowed(&self, world: &World, id: u16, pos: [i32; 2]) -> Result<bool, Fault> {
+    /// Checks the lot-border and ground-tile-flag `0x20` guards from native
+    /// `UserTestPlace` (`0x435522` lines `0x43553e..0x435597`, multi-tile
+    /// `0x422de4`), rejecting any tile outside `1..size - 1` or with bit `0x20`
+    /// set in level-1 tile flags (array `8`) when `move_objects` is off.
+    fn user_tiles_unblocked(&self, world: &World, id: u16, pos: [i32; 2]) -> Result<bool, Fault> {
         let fail = |trap| Fault {
             object: id,
             at: None,
             trap,
         };
-        if (pos[0] & 0x0f) != 8 || (pos[1] & 0x0f) != 8 {
-            return Ok(false);
-        }
         let check = |at: [i32; 2]| -> Result<bool, Fault> {
             if !inside_placement_bounds(world, at) {
                 return Ok(false);
@@ -979,6 +975,16 @@ impl Interpreter<'_> {
             }
         }
         Ok(true)
+    }
+
+    /// Checks `user_tiles_unblocked` plus native `UserTestPlace`'s
+    /// tile-centring requirement (`0x4355bc..0x4355cd`: `(x & 0xf) == 8 &&
+    /// (y & 0xf) == 8`).
+    fn user_tiles_allowed(&self, world: &World, id: u16, pos: [i32; 2]) -> Result<bool, Fault> {
+        if (pos[0] & 0x0f) != 8 || (pos[1] & 0x0f) != 8 {
+            return Ok(false);
+        }
+        self.user_tiles_unblocked(world, id, pos)
     }
 
     /// Native `UserTestPlace` (`0x435522` lines `0x43560c..0x435623`) for

@@ -1678,10 +1678,11 @@ impl Game {
     /// Runs a Buy Mode Undo (`undo = true`) or Redo (`undo = false`) while
     /// keeping any active placement preview and catalog selection armed
     /// (`0x4a8545`, `0x4a856a`). Dispatches directly to the lot's purchase
-    /// history without lifting the preview first so an on-lot preview still
-    /// collides with Redo (`0x4337f6`), then refreshes preview validity and
-    /// affordability at its saved position while retaining any on-lot surface
-    /// container.
+    /// history without moving or lifting the preview (matching `0x4a8545` /
+    /// `0x4a856a` + `0xee` panel dirtying at `0x4f66eb`), so an off-lot repeat
+    /// preview does not jump onto a freed tile and block immediate Redo, while
+    /// an already on-lot preview still collides with Redo (`0x4337f6`) and
+    /// preserves any manual surface rotation.
     fn apply_buy_history(&mut self, undo: bool) -> bool {
         let allowed = if undo {
             self.can_undo()
@@ -1697,23 +1698,21 @@ impl Game {
         } else {
             self.lot.buy_redo()
         };
-        if let Some(mut cursor) = self.buy_cursor.take() {
-            if cursor.position[0] >= 0 {
-                let [x, y, level] = cursor.position;
-                // Keep any surface container that is still on-lot so unrelated
-                // Undo/Redo preserves manual surface rotation (`0x421e72`).
-                cursor.container = cursor.container.filter(|(cid, _)| {
-                    self.lot
-                        .world()
-                        .objects
-                        .get(cid)
-                        .is_some_and(|o| o.position[0] >= 0)
-                });
-                if let Err(e) = self.lot.buy_move(&mut cursor, [x, y], level) {
-                    self.note = Some(format!("Could not refresh Buy preview: {e}"));
-                }
+        if let Some(cursor) = self.buy_cursor.as_mut() {
+            let held_on_lot = self
+                .lot
+                .world()
+                .objects
+                .get(&cursor.held)
+                .is_some_and(|o| o.position[0] >= 0);
+            let affordable =
+                cursor.price <= 0 || cursor.price <= sims_vm::available_funds(self.lot.world());
+            if !held_on_lot {
+                cursor.valid = false;
+                cursor.container = None;
+            } else {
+                cursor.valid = affordable;
             }
-            self.buy_cursor = Some(cursor);
         }
         match result {
             Ok(true) => {
