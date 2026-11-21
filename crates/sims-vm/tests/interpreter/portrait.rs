@@ -982,8 +982,15 @@ fn a_token_of_a_pass_not_ported_fails_loudly() {
     // the stack object, the mode, the locals or the object running. So does
     // one with a career token after `$Neighbor`'s (0x44c966) when the object
     // running is not a person, which the pass casts it to (0x44c9bc) and
-    // reads (0x44ca27).
+    // reads (0x44ca27). `$CatalogLocal`, `$FameTitleLocal` and `$Grade`
+    // after `$Neighbor`'s (0x44c6ea to 0x44c8c4) are not ported either:
+    // what they write may hold their token again or make a career token
+    // with the text around it (`$Grade` writes nothing for some numbers).
     let tokens = [
+        ("$CatalogLocal:0", "`$CatalogLocal`"),
+        ("$FameTitleLocal:0", "`$FameTitleLocal`"),
+        ("$Grade", "`$Grade`"),
+        ("$Jo$Grade:16b", "`$Grade`"),
         ("$FamilyAssets", "0x44c034"),
         ("$Family", "0x44c034"),
         ("$Attrib", "`$Attrib`"),
@@ -1078,6 +1085,32 @@ fn a_token_of_a_pass_not_ported_fails_loudly() {
         .to_string();
     assert!(fault.contains("`$TokenNameLocal`"), "{fault}");
     assert_eq!(fx.world.neighbors.inventories, inventories);
+    // The passes after `$Neighbor`'s that are not ported fail for a person
+    // too.
+    for text in ["$CatalogLocal:0", "$FameTitleLocal:0", "$Grade:16"] {
+        let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
+        fx.program
+            .libraries
+            .get_mut(&SIM_FILE)
+            .unwrap()
+            .strings
+            .insert(301, vec![text.to_owned()]);
+        fx.add(
+            SIM_FILE,
+            4096,
+            tree(vec![ins(
+                DIALOG,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [0, 0, 1, 0, 0, 0, 0, 1 | 1 << 1],
+            )]),
+        );
+        let fault = fx
+            .run_with(SIM, 4096, 0, &[], 1000)
+            .unwrap_err()
+            .to_string();
+        assert!(fault.contains("0x44c6ea to 0x44c8c4"), "{text}: {fault}");
+    }
     // A name a ported pass writes is read by the passes after it: the
     // lamp's (`$Me`), the stack object's (`$Object`), the neighbor's
     // (`$Neighbor`).
@@ -1091,6 +1124,14 @@ fn a_token_of_a_pass_not_ported_fails_loudly() {
             "`$NameLocal`",
         ),
         ("$Neighbor", "Lamp", "Grim", "a $Job", "0x44ca27"),
+        ("$Neighbor", "Lamp", "Grim", "a $Grade", "`$Grade`"),
+        (
+            "$Me",
+            "my $CatalogLocal:0",
+            "Grim",
+            "Widget",
+            "`$CatalogLocal`",
+        ),
         ("$Object", "Lamp", "Grim $Job", "Widget", "0x44ca27"),
     ] {
         let mut fx = text_dialog((0, 0, 1), Some(vec![(1, sim)]));
@@ -1124,16 +1165,11 @@ fn a_token_of_a_pass_not_ported_fails_loudly() {
 
 #[test]
 fn the_passes_after_neighbors_are_presentation_for_a_person() {
-    // `$CatalogLocal`, `$FameTitleLocal`, `$Grade` and `$TimeLocal`
-    // (0x44c6ea to 0x44c961) write text, in any mode and for any object
-    // running; the career's (0x44c966) for a person. Not worked out.
-    for text in [
-        "$TimeLocal:0",
-        "$Grade",
-        "$CatalogLocal:0",
-        "$FameTitleLocal:0",
-        "$TimeLocal:2 to $TimeLocal:3",
-    ] {
+    // `$TimeLocal` (0x44c8c4 to 0x44c961) writes text, in any mode and for
+    // any object running; the career's (0x44c966) for a person, when the
+    // texts they may write are known to hold no career token past their
+    // first character. Not worked out.
+    for text in ["$TimeLocal:0", "$TimeLocal:2 to $TimeLocal:3"] {
         for mode in [0, 1] {
             let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
             set_message(&mut fx, text);
@@ -1141,27 +1177,140 @@ fn the_passes_after_neighbors_are_presentation_for_a_person() {
             assert_eq!(fx.run_with(LAMP, 4096, SIM as i16, &[], 1000), Ok(true));
         }
     }
-    let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
-    fx.program
-        .libraries
-        .get_mut(&SIM_FILE)
-        .unwrap()
-        .strings
-        .insert(
-            301,
-            vec!["Promoted (to $Job:0:1)! $JobDesc:0:1 $JobOffer".to_owned()],
+    let promoted = || {
+        let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
+        fx.program
+            .libraries
+            .get_mut(&SIM_FILE)
+            .unwrap()
+            .strings
+            .insert(
+                301,
+                vec!["Promoted (to $Job:0:1)! $JobDesc:0:1 $JobOffer".to_owned()],
+            );
+        fx.add(
+            SIM_FILE,
+            4096,
+            tree(vec![ins(
+                DIALOG,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [0, 0, 1, 0, 0, 0, 0, 1 | 1 << 1],
+            )]),
         );
-    fx.add(
-        SIM_FILE,
-        4096,
-        tree(vec![ins(
-            DIALOG,
-            RETURN_TRUE,
-            RETURN_FALSE,
-            [0, 0, 1, 0, 0, 0, 0, 1 | 1 << 1],
-        )]),
+        fx
+    };
+    assert_eq!(promoted().run_with(SIM, 4096, 0, &[], 1000), Ok(true));
+    // When they are not known to (`work.iff` not read, or a text of it that
+    // does), a career pass may never end (0x44ca9f to 0x44cad3).
+    let mut fx = promoted();
+    fx.program.career_texts_end = false;
+    let fault = fx
+        .run_with(SIM, 4096, 0, &[], 1000)
+        .unwrap_err()
+        .to_string();
+    assert!(fault.contains("0x44ca9f"), "{fault}");
+}
+
+#[test]
+fn a_tokens_digits_up_to_a_byte_above_0x7f_fail_loudly() {
+    // 0x44caf6 reads a `$Local` or `$NeighborLocal` token's `:` and digits
+    // with a digit test handed each byte sign-extended (0x44cb70,
+    // 0x636993): a byte above 0x7f where the digits stop is looked up below
+    // the C runtime's table. Here a `«` (0xab in the table's code page).
+    for text in [
+        "$Local:\u{ab}",
+        "$Local:12\u{ab}",
+        "$Local:1:\u{ab}",
+        "$Local:1:2\u{e9}",
+        "$NeighborLocal:\u{ab}",
+        "$NeighborLocal:$Local:\u{ab}",
+    ] {
+        let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
+        set_message(&mut fx, text);
+        in_mode(&mut fx, 1, 0);
+        let fault = fx
+            .run_with(LAMP, 4096, SIM as i16, &[], 1000)
+            .unwrap_err()
+            .to_string();
+        assert!(fault.contains("0x44cb70"), "{text}: {fault}");
+    }
+    // Where the digits stop at an ASCII byte, or there is no `:`, the
+    // test is not handed the byte.
+    for text in ["$Local:12 \u{ab}", "$Local\u{ab}", "$NeighborLocal\u{ab}:"] {
+        let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
+        set_message(&mut fx, text);
+        in_mode(&mut fx, 1, 0);
+        assert_eq!(
+            fx.run_with(LAMP, 4096, SIM as i16, &[], 1000),
+            Ok(true),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn a_dialogs_strings_are_read_in_the_order_the_loader_gives() {
+    // A table with entries in more than one language is read in the order
+    // the original's loader puts its first-language entries in (0x46ffcc
+    // to 0x470069), which the library keeps apart.
+    let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
+    let library = fx.program.libraries.get_mut(&LAMP_FILE).unwrap();
+    let mut loaded = library.strings[&301].clone();
+    loaded.swap(0, 1);
+    library.loaded_strings.insert(301, loaded);
+    assert_eq!(fx.run_with(LAMP, 4096, SIM as i16, &[], 1000), Ok(true));
+    assert_eq!(fx.world.portraits, [WIDGET].into());
+    // A file with no STR# 301 but a legacy CST 301, which the loader reads
+    // instead (0x4702c7), fails loudly when the dialog names a string.
+    let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
+    let library = fx.program.libraries.get_mut(&LAMP_FILE).unwrap();
+    library.strings.remove(&301);
+    library.legacy_strings.insert(301);
+    let fault = fx
+        .run_with(LAMP, 4096, SIM as i16, &[], 1000)
+        .unwrap_err()
+        .to_string();
+    assert!(fault.contains("0x4702c7"), "{fault}");
+    let mut fx = text_dialog((0, 0, 0), Some(vec![(1, "Grim")]));
+    let library = fx.program.libraries.get_mut(&LAMP_FILE).unwrap();
+    library.strings.remove(&301);
+    library.legacy_strings.insert(301);
+    assert_eq!(fx.run_with(LAMP, 4096, SIM as i16, &[], 1000), Ok(true));
+}
+
+#[test]
+fn with_nothing_found_mode_0_shows_the_type_the_definition_stands_for() {
+    // With no type found in the text, mode 0 shows the type of the
+    // definition the stack object's stands for (0x436308 to 0x43634d,
+    // 0x45728d, 0x43ae0a): its group's master's for a tile, here one of
+    // the widget's type.
+    let tile = |master_word: i16| {
+        let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
+        fx.words(SIM_FILE)[10] = 5;
+        let mut master = definition(WIDGET, 2);
+        master[10] = 5;
+        master[11] = master_word;
+        let library = fx.program.libraries.get_mut(&SIM_FILE).unwrap();
+        library.definitions.insert(129, master);
+        library.definition_order.push(129);
+        fx
+    };
+    let mut fx = tile(-1);
+    assert_eq!(fx.run_with(LAMP, 4096, SIM as i16, &[], 1000), Ok(true));
+    assert_eq!(fx.world.portraits, [WIDGET].into());
+    // A tile whose group has no master leaves the place null: no portrait.
+    let mut no_master = tile(0);
+    assert_eq!(
+        no_master.run_with(LAMP, 4096, SIM as i16, &[], 1000),
+        Ok(true)
     );
-    assert_eq!(fx.run_with(SIM, 4096, 0, &[], 1000), Ok(true));
+    assert!(no_master.world.portraits.is_empty());
+    // A type the text found wins over it.
+    let mut fx = text_dialog((0, 0, 3), Some(vec![(1, "Grim")]));
+    fx.words(SIM_FILE)[10] = 5;
+    assert_eq!(fx.run_with(LAMP, 4096, SIM as i16, &[], 1000), Ok(true));
+    assert_eq!(fx.world.portraits, [SIM_GUID].into());
 }
 
 #[test]

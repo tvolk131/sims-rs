@@ -54,6 +54,19 @@ pub struct Library {
     /// language. A definition's word 41 names its table, whose name the
     /// dialog formatter writes for `$Object` (0x44c1ca, 0x457d3b).
     pub catalog_strings: BTreeMap<u16, Vec<(u8, String)>>,
+    /// Each string table (STR#) with an entry in a language other than
+    /// the first, by chunk ID: its first-language entries in the order the
+    /// original's loader gives them ([`loaded_order`]), which differs from
+    /// [`Library::strings`]'s when they are in more than one run. Only the
+    /// dialog's strings read it; whether the other readers of
+    /// [`Library::strings`] load through the same loader is **unverified**.
+    pub loaded_strings: BTreeMap<u16, Vec<String>>,
+    /// The IDs of the file's legacy string tables (CST), which are not
+    /// read: the original's string loader falls back to one when the file
+    /// has no STR# of the ID (0x4702c7, 0x47018e to 0x4701e6). The tag is
+    /// read as the four bytes `\0CST` or `CST\0` (the loader compares
+    /// 0x435354; which byte order it stands for is **unverified**).
+    pub legacy_strings: BTreeSet<u16>,
     /// The IDs of the file's legacy catalog string tables (CATS), which
     /// are not read: the catalog's name lookup (0x4061e3) checks for one
     /// before the CTSS table (**unverified**, from a reading of the
@@ -130,6 +143,16 @@ pub struct Program {
     /// install has no `work.iff`, or has a `Careers.txt`, which overrides
     /// the table through a loader that is not ported (0x4036e8).
     pub careers: Option<Vec<Career>>,
+    /// Whether the texts a dialog's career tokens may write are known to
+    /// hold no career token past their first character, so the career
+    /// passes end ([`crate::primitives::dialog::may_hold_career_token`]):
+    /// true only when `work.iff` was read for [`Program::careers`] and no
+    /// string of it (every STR# entry in every language, and every
+    /// career's name and level strings) holds one. That the career
+    /// tokens' texts all come from `work.iff` (0x4035d0, 0x4033d2, and
+    /// the level's +0x3b4 that 0x404328 fills from its STR# tables) is
+    /// **unverified**.
+    pub career_texts_end: bool,
     /// Each lot's zoning, by lot number: 1 residential, 2 community. It
     /// comes from the neighborhood ([`sims_content::Neighborhood::zoning`]),
     /// so [`Program::link`] leaves it empty for the caller to fill.
@@ -188,6 +211,7 @@ impl Program {
             libraries: BTreeMap::new(),
             semi_globals: BTreeMap::new(),
             careers: careers(index)?,
+            career_texts_end: career_texts_end(index)?,
             zoning: BTreeMap::new(),
             animations: Animations::default(),
             people: People::default(),
@@ -247,7 +271,15 @@ impl Program {
                     if chunk.id == TREE_NAMES {
                         library.tree_names.clone_from(&entries);
                     }
+                    if table.entries.iter().any(|entry| entry.language != 1) {
+                        library
+                            .loaded_strings
+                            .insert(chunk.id, loaded_order(&table.entries));
+                    }
                     library.strings.insert(chunk.id, entries);
+                }
+                b"\0CST" | b"CST\0" => {
+                    library.legacy_strings.insert(chunk.id);
                 }
                 b"CTSS" => {
                     let table = sims_formats::strings::StringTable::parse(data)
@@ -937,6 +969,75 @@ fn careers(index: &Index) -> Result<Option<Vec<Career>>> {
         .map(Some)
 }
 
+/// The first-language entries of a string table, in the order the
+/// original's loader (0x46feac, for a table of entries with a language,
+/// 0x46ffcc to 0x470069) puts them in: it counts the entries of each run of
+/// one language from 1 (the count starts again where the language
+/// changes, 0x470002 to 0x47000b), and inserts each entry of the wanted
+/// language at its place in its run (0x470482, which clamps the place to
+/// the entries so far plus one and moves the rest along). A later run
+/// therefore goes in front of the earlier ones. An entry with language 0
+/// counts as the wanted language (0x46fffc), as the reader gives it 1
+/// ([`sims_formats::strings::StringTable`]). The wanted language is US
+/// English (see [`Library::strings`]); its fallback to the English entries
+/// when it has none (0x47006b to 0x4700d0) adds nothing for it.
+pub fn loaded_order(entries: &[sims_formats::strings::TextEntry]) -> Vec<String> {
+    let mut loaded: Vec<String> = Vec::new();
+    let mut run = None;
+    let mut place = 0;
+    for entry in entries {
+        if run != Some(entry.language) {
+            run = Some(entry.language);
+            place = 0;
+        }
+        if entry.language == 1 {
+            loaded.insert(place.min(loaded.len()), entry.text.clone());
+            place += 1;
+        }
+    }
+    loaded
+}
+
+/// Whether no string of `work.iff` holds a career token past its first
+/// character ([`Program::career_texts_end`]): false when there is no
+/// `work.iff`, or a `Careers.txt` overrides it.
+fn career_texts_end(index: &Index) -> Result<bool> {
+    if index.named("Careers.txt").next().is_some() {
+        return Ok(false);
+    }
+    let Some((_, file)) = index.named("work.iff").next() else {
+        return Ok(false);
+    };
+    let location = file.location(&index.root);
+    let iff = Iff::parse(file.read()?).map_err(|e| sims_content::Error::format(&location, e))?;
+    let token = crate::primitives::dialog::may_hold_career_token;
+    for chunk in &iff.chunks {
+        let data = iff.data(chunk);
+        let format = |e| sims_content::Error::format(&format!("{location} #{}", chunk.id), e);
+        match &chunk.tag {
+            b"STR#" => {
+                let table = sims_formats::strings::StringTable::parse(data).map_err(format)?;
+                if table.entries.iter().any(|entry| token(&entry.text)) {
+                    return Ok(false);
+                }
+            }
+            b"CARR" => {
+                let career = sims_formats::career::Career::parse(data).map_err(format)?;
+                if token(&career.name)
+                    || career
+                        .levels
+                        .iter()
+                        .any(|level| level.strings.iter().any(|text| token(text)))
+                {
+                    return Ok(false);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(true)
+}
+
 /// An OBJD's words as the original holds them. Registration (0x43ba52)
 /// normalizes the resource with 0x431759 before reading any field
 /// (legacy/crates/sims-sim/src/object_catalog/definition.rs:9): versions
@@ -969,7 +1070,36 @@ pub(crate) fn definition_words(data: &[u8]) -> sims_formats::Result<[i16; DEFINI
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFINITION_WORDS, definition_words};
+    use super::{DEFINITION_WORDS, definition_words, loaded_order};
+
+    #[test]
+    fn a_later_run_of_the_language_goes_in_front() {
+        // 0x46ffcc to 0x470069: each entry of the wanted language goes in
+        // at its place in its run of one language, from the front.
+        let entry = |language, text: &str| sims_formats::strings::TextEntry {
+            language,
+            text: text.to_owned(),
+            comment: String::new(),
+            raw_text: text.as_bytes().to_vec(),
+            raw_comment: Vec::new(),
+        };
+        let entries = [
+            entry(1, "a"),
+            entry(1, "b"),
+            entry(2, "x"),
+            entry(1, "c"),
+            entry(1, "d"),
+            entry(3, "y"),
+            entry(3, "z"),
+            entry(1, "e"),
+        ];
+        assert_eq!(loaded_order(&entries), ["e", "c", "d", "a", "b"]);
+        // One run keeps the file's order, and other languages are left out.
+        assert_eq!(
+            loaded_order(&[entry(2, "x"), entry(1, "a"), entry(1, "b")]),
+            ["a", "b"]
+        );
+    }
 
     #[test]
     fn short_definitions_are_padded() {

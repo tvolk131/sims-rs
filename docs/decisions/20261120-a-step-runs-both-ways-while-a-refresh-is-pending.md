@@ -140,7 +140,11 @@ and 24719.
 The ordinary dialog record's constructor (0x43601c, from 0x4443ab's
 default case) picks the person whose portrait it shows (0x436279):
 
-- mode 0: the stack object's type;
+- mode 0: the type the text found (below), or else the type the stack
+  object's definition stands for (0x436308 to 0x43634d, 0x45728d through
+  0x43ae0a): its own, or a tile's group master's. A tile whose group has
+  no master leaves the type null, and no portrait is shown (Sol's tenth
+  check);
 - mode 2: the neighbor record's type (0x425afe, record +8).
 
 It then has the interface build that type's portrait:
@@ -200,6 +204,28 @@ What is not ported:
     0x4f2df8 read after `SIMS_OTHERLANGUAGE`. The interface's byte for it
     is **unverified**. No other language is supported: its strings may
     hold other tokens.
+  - A table with entries in more than one language is read in the order
+    the original's loader gives (0x46ffcc to 0x470069, Sol's tenth
+    check). The loader counts the entries of each run of one language
+    from 1, starting again where the language changes (0x470002), and
+    inserts each entry of the wanted language at its place in its run
+    (0x470482). So a later run goes in front of the earlier ones. An
+    entry with language 0 counts as the wanted language (0x46fffc). The
+    Goth day's dialog tables are multilingual: the first version of this
+    check failed loudly on them at tick 1. `Library::loaded_strings` keeps
+    that order for multilingual tables, and only the dialog reads it.
+    Whether the other readers of `Library::strings` (animations, action
+    strings, suits) load through the same loader is **unverified**. In
+    the recorded install it makes no difference: a scan of its 2,407
+    multilingual STR# tables found each with one run of US English, so the
+    loader's order is the file's for all of them. Test:
+    `a_later_run_of_the_language_goes_in_front` (`program.rs`).
+  - A file with no STR# 301 but a legacy CST 301, which the loader reads
+    instead (0x4702c7, 0x47018e to 0x4701e6), is not ported, and fails
+    loudly when the dialog names a string. The loader compares the tag
+    with 0x435354; the port takes both `\0CST` and `CST\0` as it, and
+    which one the file holds is **unverified** (the install has neither).
+    Test: `a_dialogs_strings_are_read_in_the_order_the_loader_gives`.
 
   The strings share one place for a type, cleared first (0x43620d), which
   only mode 0 reads. Only two tokens write that place:
@@ -209,8 +235,9 @@ What is not ported:
     It finds `$Neighbor` anywhere in the text as the passes before it
     left it.
 
-  The last type found is kept, and mode 0 shows it in place of the stack
-  object's (0x436308). Mode 2 does not read it. The first version of this
+  The last type found is kept, and mode 0 shows it in place of the
+  definition's (0x436308). Test:
+  `with_nothing_found_mode_0_shows_the_type_the_definition_stands_for`. Mode 2 does not read it. The first version of this
   change failed on any `$` in a mode 0 dialog's strings. On the Goth
   house that stopped the run at update 901 (object 8, tree 0x101d), so
   the passes are ported in order instead, and the ones that are not
@@ -328,18 +355,40 @@ What is not ported:
      replaced stays, and `$Neighbor` is found in it.
   7. `$Neighbor` (0x44c65f) is ported: the neighbor's type's name
      (0x4573d9), and its type for the portrait (Sol's ninth check).
-  8. The passes after it are taken to be presentation: one each for
-     `$CatalogLocal` and `$FameTitleLocal` (0x44c6ea, 0x44c797),
-     `$Grade` (0x44c861) and `$TimeLocal` (0x44c8c4), then the career's,
-     `$JobOffer`, `$JobDesc` and `$Job` (0x44c966). They write text from
-     the running object, the locals and the career tables. That they
-     change nothing else, and that the text they write holds none of
-     their own tokens, is **unverified**. Each career token casts the
-     running object to a person (0x44c9bc) and reads it (0x44ca27), on
-     every path, which faults for an object that is not one: that fails
-     loudly (Sol's ninth check). On the Goth day the promotion at 15298
-     ("You have been promoted! (to $Job:4:5)", `$JobDesc:4:5`,
-     `$TimeLocal:2`) is a person's.
+  8. `$CatalogLocal` (0x44c6ea), `$FameTitleLocal` (0x44c797) and
+     `$Grade` (0x44c861) are not ported, and a text that holds one fails
+     loudly for any object running (Sol's tenth check). `$CatalogLocal`
+     writes a catalog name (0x4573de, 0x44c771), which may hold its token
+     again, so the pass would never end. `$FameTitleLocal` (0x405241,
+     0x44c83d) and `$Grade` (0x4034ce, which writes nothing for some
+     numbers, 0x44c8ae) may join the text around them into a career token,
+     for example `$Jo$Grade:16b`, which faults for an object that is not a
+     person.
+  9. `$TimeLocal` (0x44c8c4) is presentation: an hour local in [0, 24)
+     written in one of fixed formats (0x4a6ab1), which hold no token.
+  10. The career's, `$JobOffer`, `$JobDesc` and `$Job` (0x44c966), write
+     career texts. Each career token casts the running object to a person
+     (0x44c9bc) and reads it (0x44ca27), on every path, which faults for an
+     object that is not one: that fails loudly (Sol's ninth check). For a
+     person each pass searches again from one past the place it wrote
+     (0x44ca9f to 0x44cad3), so a text that holds a career token past its
+     first character, or ends in the start of one, may never end (Sol's
+     tenth check: STR# 4 entry 15 of `work.iff`, loaded by 0x404328, set
+     to `x$JobDesc:0`). `Program::career_texts_end` is whether no string
+     of `work.iff` does: every STR# entry in every language, and every
+     career's name and level strings. The install's level strings hold a
+     `$` (in suit names such as `B004MA$b_01`) but no career token. When
+     it is false (no `work.iff`, a `Careers.txt`, or a string that does)
+     a person's career token fails loudly. That the career texts all come
+     from `work.iff` is **unverified**. On the Goth day the promotion at
+     15298 ("You have been promoted! (to $Job:4:5)", `$JobDesc:4:5`,
+     `$TimeLocal:2`) is a person's. Tests:
+     `the_installs_career_texts_hold_no_career_token` (`tests/boot.rs`),
+     `a_career_token_past_the_first_character_or_the_start_of_one_at_the_end`
+     (`dialog.rs`).
+
+  The passes after `$Neighbor`'s are taken to change nothing but the
+  text (**unverified**).
 
   The names (`$Me`, `$Object`, `$Neighbor`) are the type's catalog name
   (0x4573d9 to 0x457d3b): an entry of the CTSS table definition word 41
@@ -361,6 +410,11 @@ What is not ported:
   makes a string of 16 bytes for them, filled at most to 15, 0x46f78d to
   0x46f79d), then by the C runtime's 32-bit conversion (0x636029), which
   wraps, and compared with the locals' count signed (Sol's ninth check).
+  The digit test (0x636993) is handed each byte sign-extended (0x44cb70).
+  So a byte above 0x7f is looked up below the C runtime's table, and
+  some pass as digits that the conversion reads as none (`«`, 0xab). A
+  token whose digits stop at such a byte fails loudly (Sol's tenth check).
+  Test: `a_tokens_digits_up_to_a_byte_above_0x7f_fail_loudly`.
 
   Tests: `a_dialogs_text_can_show_the_stack_objects_neighbor_instead`,
   `an_object_name_that_may_hold_a_neighbor_token_fails_loudly`,

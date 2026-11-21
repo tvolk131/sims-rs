@@ -1584,3 +1584,21 @@ fn the_default_button_labels_hold_no_token() {
         assert!(!label.contains('$'), "{label:?}");
     }
 }
+
+#[test]
+fn the_installs_career_texts_hold_no_career_token() {
+    // A person's dialog with a career token writes career texts
+    // (0x44c966), and a pass searches again from one past the place it
+    // wrote (0x44ca9f to 0x44cad3): the port runs them only when no string
+    // of `work.iff` holds a career token past its first character
+    // (`Program::career_texts_end`). The install's do not; its career
+    // levels' strings hold a `$` (in the names of suits), but not a token.
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let house = root.join("UserData/Houses/House05.iff");
+    let lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
+    assert!(lot.program().career_texts_end);
+}

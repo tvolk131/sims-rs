@@ -63,6 +63,38 @@ const CATALOG_STRINGS: usize = 41;
 /// (0x42a8a1).
 const BETWEEN: [&str; 4] = ["$Attrib", "$NameAttrib", "$NameLocal", "$TokenNameLocal"];
 
+/// The tokens of the formatter's passes after `$Neighbor`'s and before
+/// `$TimeLocal`'s, in the order they run: `$CatalogLocal` (0x6e4fa0, from
+/// 0x6c40f0; 0x44c6ea), `$FameTitleLocal` (0x6e4f90, from 0x6c4100;
+/// 0x44c797) and `$Grade` (0x6e5000; 0x44c861). None is ported, and a text
+/// that holds one when they run fails loudly: the text they write is not
+/// known to end their passes or to make no later token. `$CatalogLocal`
+/// writes a catalog name (0x4573de, 0x44c771), which may hold its token
+/// again, and `$FameTitleLocal` (0x405241, 0x44c83d) and `$Grade`
+/// (0x4034ce; empty for some numbers, 0x44c8ae) may join the text around
+/// them into a career token, which faults for an object that is not a
+/// person (0x44ca27).
+const AFTER: [&str; 3] = ["$CatalogLocal", "$FameTitleLocal", "$Grade"];
+
+/// The career tokens, in the order their loop (0x44c966) runs them:
+/// `$JobOffer` (0x6e5010), `$JobDesc` (0x6e4ff0), `$Job` (0x6e5040).
+const CAREER: [&str; 3] = ["$JobOffer", "$JobDesc", "$Job"];
+
+/// Whether `text`, written for a career token, may hold one past its
+/// first character, or end in the start of one: a pass searches again
+/// from one past the place it wrote (0x44ca9f to 0x44cad3), so it would
+/// find the token again and might never end. [`crate::Program::career_texts_end`]
+/// is whether no text the career passes may write does.
+pub(crate) fn may_hold_career_token(text: &str) -> bool {
+    text.char_indices().skip(1).any(|(i, _)| {
+        let rest = &text[i..];
+        rest.starts_with('$')
+            && CAREER
+                .iter()
+                .any(|token| rest.starts_with(token) || token.starts_with(rest))
+    })
+}
+
 /// `text` with each `token` replaced by `name` as the formatter's passes
 /// do it (0x4558a0, 0x455750): from the start, then from one past each
 /// place replaced. Never called with a name for which [`never_ends`].
@@ -149,7 +181,12 @@ fn not_ported(texts: &BTreeSet<String>, tokens: &[&str], passes: &str) -> Result
 /// and 0x46f925 adds no more than fit, 0x46f78d to 0x46f79d), by the C
 /// runtime's 32-bit conversion (0x636029), which wraps; -1 when there is
 /// none (0x44cb34).
-fn local_token(bytes: &[u8], mut end: usize) -> (i32, usize) {
+///
+/// The digit test (0x636993) is handed each byte sign-extended (0x44cb70),
+/// so a byte above 0x7f is looked up below the C runtime's table, and
+/// some pass as digits that the conversion reads as none: where the scan
+/// meets one it fails loudly, naming `token`.
+fn local_token(bytes: &[u8], mut end: usize, token: &str) -> Result<(i32, usize), Trap> {
     let mut number = -1i32;
     for part in 0..2 {
         if bytes.get(end) != Some(&b':') {
@@ -160,6 +197,12 @@ fn local_token(bytes: &[u8], mut end: usize) -> (i32, usize) {
             .iter()
             .take_while(|b| b.is_ascii_digit())
             .count();
+        if bytes.get(end + digits).is_some_and(|b| !b.is_ascii()) {
+            return Err(Trap::Unsupported(format!(
+                "a dialog's `{token}` is read with digits up to a byte above 0x7f, which the \
+                 original's digit test (0x636993) reads sign-extended (0x44cb70): not ported"
+            )));
+        }
         if part == 0 && digits > 0 {
             number = bytes[end..end + digits].iter().take(15).fold(0i32, |n, d| {
                 n.wrapping_mul(10).wrapping_add(i32::from(d - b'0'))
@@ -167,7 +210,7 @@ fn local_token(bytes: &[u8], mut end: usize) -> (i32, usize) {
         }
         end += digits;
     }
-    (number, end)
+    Ok((number, end))
 }
 
 /// Record status: made and not shown yet.
@@ -277,11 +320,12 @@ impl Machine<'_, '_> {
     /// record is made (0x4443ab, 0x435d8a, then 0x43601c), before it joins
     /// the registry. The icon mode is operand 7's bits 1 to 3 (0x436279):
     ///
-    /// - mode 0 (0x436308): the type of the object the stack object names,
-    ///   when it is on the lot, unless the dialog's text named a neighbor
-    ///   whose type it shows instead. The record's strings are formatted
-    ///   (0x44bf1a, from 0x436219) with a place for a type (`[ebp-0x24]`),
-    ///   which mode 0 reads first ([`Machine::dialog_text_type`]);
+    /// - mode 0 (0x436308): the type the dialog's text found, or else the
+    ///   type the definition of the object the stack object names stands
+    ///   for, when it is on the lot (a tile's group master's, 0x45728d).
+    ///   The record's strings are formatted (0x44bf1a, from 0x436219) with
+    ///   a place for a type (`[ebp-0x24]`), which mode 0 reads first
+    ///   ([`Machine::dialog_text_type`]);
     /// - mode 2 (0x4362f4): the type of the neighbor record the stack
     ///   object names (0x425afe: 0x4256f4, record +8);
     /// - modes 1 and 4 to 7 show no person (the type stays 0 from
@@ -324,13 +368,7 @@ impl Machine<'_, '_> {
         let guid = match mode {
             0 => match text_type {
                 Some(guid) => guid,
-                None => match u16::try_from(stack_object)
-                    .ok()
-                    .and_then(|id| self.world.objects.get(&id))
-                {
-                    Some(object) => object.guid,
-                    None => return Ok(()),
-                },
+                None => return Ok(()),
             },
             2 => match self.world.neighbors.get(stack_object) {
                 Some(record) => record.guid,
@@ -442,13 +480,23 @@ impl Machine<'_, '_> {
     /// read after `SIMS_OTHERLANGUAGE`; the interface's +0x64 for it is
     /// **unverified**). An install in another language is not supported:
     /// its strings may hold other tokens.
+    ///
+    /// A table with entries in more than one language is read in the
+    /// order the original's loader gives its entries
+    /// ([`crate::program::loaded_order`]). A file with no STR# 301 but a
+    /// legacy CST 301, which the loader reads instead (0x4702c7;
+    /// [`crate::program::Library::legacy_strings`]), is not ported, and
+    /// fails loudly when the dialog names a string.
     pub(crate) fn dialog_strings(&self, operands: &[u8; 8]) -> Result<Vec<String>, Trap> {
+        const TABLE: u16 = 301;
         let owner = self.owner(self.frame()?)?;
-        let strings = self
-            .program
-            .libraries
-            .get(&owner)
-            .and_then(|library| library.strings.get(&301));
+        let library = self.program.libraries.get(&owner);
+        let strings = library.and_then(|library| {
+            library
+                .loaded_strings
+                .get(&TABLE)
+                .or_else(|| library.strings.get(&TABLE))
+        });
         // Mode 4 formats operand 1's string too, after the others
         // (0x436297 to 0x4362c0, through 0x4369de as they are).
         let mode_4: &[usize] = if (operands[7] >> 1) & 7 == 4 {
@@ -462,6 +510,21 @@ impl Machine<'_, '_> {
             2 => &[3, 4, 0],
             _ => &[],
         };
+        let named = buttons
+            .iter()
+            .chain(&[6, 2])
+            .chain(mode_4)
+            .any(|&operand| operands[operand] != 0);
+        if named
+            && strings.is_none()
+            && library.is_some_and(|library| library.legacy_strings.contains(&TABLE))
+        {
+            return Err(Trap::Unsupported(
+                "a dialog's file has no STR# 301 but a legacy CST 301, which the original's \
+                 loader reads instead (0x4702c7, 0x47018e to 0x4701e6): not ported"
+                    .into(),
+            ));
+        }
         Ok(buttons
             .iter()
             .chain(&[6, 2])
@@ -473,11 +536,13 @@ impl Machine<'_, '_> {
             .collect())
     }
 
-    /// The type the formatter (0x44bf1a) finds in a dialog record's
-    /// strings ([`Machine::dialog_strings`]), each formatted in turn with
-    /// the same place for it (`[ebp-0x24]`, cleared at 0x43620d), so the
-    /// last one found is kept; returned for mode 0 only. The passes run
-    /// in this order:
+    /// The type a dialog of icon mode 0 shows (None for the other modes):
+    /// the type the formatter (0x44bf1a) finds in the record's strings
+    /// ([`Machine::dialog_strings`]), each formatted in turn with the same
+    /// place for it (`[ebp-0x24]`, cleared at 0x43620d), so the last one
+    /// found is kept; or, with none found, the type the stack object's
+    /// definition stands for ([`Machine::master_type`], 0x436308 to
+    /// 0x43634d). The passes run in this order:
     ///
     /// 1. `$FamilyAssets` (0x44bf66) and `$Family` (0x44c034): not ported,
     ///    and a text that holds `$Family` fails loudly;
@@ -495,19 +560,22 @@ impl Machine<'_, '_> {
     ///    name and type of the neighbor record the stack object names
     ///    (0x425afe), when there is one; otherwise the token stays. It
     ///    comes after `$Object`'s, so it wins in a string that holds both;
-    /// 8. the passes after it (0x44c6ea on): one for a token whose name
-    ///    is at 0x6e4fa0 (0x44c6ea), one for 0x6e4f90 (0x44c797; the two
-    ///    are `$CatalogLocal` and `$FameTitleLocal`, 0x6c40f0, 0x6c4100),
-    ///    `$Grade` (0x6e5000, 0x44c861), `$TimeLocal` (0x6e5020, 0x44c8c4),
-    ///    then the career's: `$JobOffer`, `$JobDesc` and `$Job` (0x6e5010,
-    ///    0x6e4ff0, 0x6e5040; 0x44c966). They write text and read the
-    ///    running object, the locals and the career tables, and are taken
-    ///    to change nothing else (**unverified**), and the text they write
-    ///    to hold no token of their own or a later one, which would never
-    ///    end or be read again (**unverified**). Each career token found
-    ///    casts the running object to a person (0x44c9bc) and reads it
-    ///    (0x44ca27, also with the numbers not locals), which faults for an
-    ///    object that is not one: that fails loudly.
+    /// 8. the passes of [`AFTER`]: not ported, and a text that holds one
+    ///    of their tokens fails loudly;
+    /// 9. `$TimeLocal` (0x6e5020, 0x44c8c4): an hour local in [0, 24)
+    ///    written in one of fixed formats (0x4a6ab1), which hold no token;
+    /// 10. the career's: `$JobOffer`, `$JobDesc` and `$Job` ([`CAREER`];
+    ///    0x44c966). Each token found casts the running object to a person
+    ///    (0x44c9bc) and reads it (0x44ca27, also with the numbers not
+    ///    locals), which faults for an object that is not one: that fails
+    ///    loudly. For a person they write career texts, which end the
+    ///    passes only when they hold no career token past their first
+    ///    character: that fails loudly unless
+    ///    [`crate::Program::career_texts_end`].
+    ///
+    /// The passes after `$Neighbor`'s write text and read the running
+    /// object, the locals and the career tables, and are taken to change
+    /// nothing else (**unverified**).
     ///
     /// The names are the type's catalog names (0x4573d9,
     /// [`Machine::catalog_names`]), each replaced as [`name_pass`] does
@@ -571,15 +639,24 @@ impl Machine<'_, '_> {
                         let names = self.catalog_names(guid)?;
                         texts = name_pass(texts, "$Neighbor", names.as_deref(), "0x44c6ba")?;
                     }
-                    if self.me()?.person.is_none()
-                        && let Some(text) = texts.iter().find(|text| text.contains("$Job"))
-                    {
-                        return Err(Trap::Unsupported(format!(
-                            "a dialog's text holds a career token (`$JobOffer`, `$JobDesc`, \
-                             `$Job`), whose pass casts the object running the tree to a person \
-                             (0x44c9bc) and reads it (0x44ca27): it is not one, so the original \
-                             faults ({text:?})"
-                        )));
+                    not_ported(&texts, &AFTER, "0x44c6ea to 0x44c8c4")?;
+                    if let Some(text) = texts.iter().find(|text| text.contains("$Job")) {
+                        if self.me()?.person.is_none() {
+                            return Err(Trap::Unsupported(format!(
+                                "a dialog's text holds a career token (`$JobOffer`, `$JobDesc`, \
+                                 `$Job`), whose pass casts the object running the tree to a \
+                                 person (0x44c9bc) and reads it (0x44ca27): it is not one, so \
+                                 the original faults ({text:?})"
+                            )));
+                        }
+                        if !self.program.career_texts_end {
+                            return Err(Trap::Unsupported(format!(
+                                "a dialog's text holds a career token, and the career texts \
+                                 are not known to hold none past their first character, which \
+                                 would never end its pass (0x44ca9f to 0x44cad3): not ported \
+                                 ({text:?})"
+                            )));
+                        }
                     }
                     outcomes.insert(written);
                 }
@@ -595,8 +672,13 @@ impl Machine<'_, '_> {
         if mode != 0 {
             return Ok(None);
         }
-        // Mode 0 shows the stack object's own type when nothing was found.
-        let shown: BTreeSet<_> = found.iter().map(|f| f.or(object)).collect();
+        // Mode 0 shows, when nothing was found, the type the stack object's
+        // definition stands for (0x436308 to 0x43634d).
+        let fallback = match object {
+            Some(guid) => self.master_type(guid)?,
+            None => None,
+        };
+        let shown: BTreeSet<_> = found.iter().map(|f| f.or(fallback)).collect();
         if shown.len() > 1 {
             return Err(Trap::Unsupported(
                 "a dialog's `$Me`, `$Object` or `$Neighbor` is replaced by one of a type's \
@@ -606,7 +688,24 @@ impl Machine<'_, '_> {
                     .into(),
             ));
         }
-        Ok(found.into_iter().next().flatten())
+        Ok(shown.into_iter().next().flatten())
+    }
+
+    /// The type of the definition type `guid`'s definition stands for
+    /// ([`crate::Program::master_definition`], 0x45728d through 0x43ae0a):
+    /// its own for a definition alone, its group's master's for a tile.
+    /// None for a tile whose group has no master: mode 0 then has no type
+    /// and shows no portrait (0x436345 to 0x43634d leave the place null).
+    fn master_type(&self, guid: u32) -> Result<Option<u32>, Trap> {
+        let definition = self.definition(guid)?;
+        let master = self
+            .program
+            .master_definition(definition.resource, definition.chunk)
+            .map_err(Trap::Invalid)?;
+        Ok(master.map(|words| {
+            u32::from(words[crate::factory::word::GUID] as u16)
+                | u32::from(words[crate::factory::word::GUID + 1] as u16) << 16
+        }))
     }
 
     /// The names the formatter may write for a token of type `guid`
@@ -653,7 +752,7 @@ impl Machine<'_, '_> {
             .and_then(|t| t.find(TOKEN))
             .map(|i| i + from)
         {
-            let (number, end) = local_token(text.as_bytes(), at + TOKEN.len());
+            let (number, end) = local_token(text.as_bytes(), at + TOKEN.len(), TOKEN)?;
             if let Ok(n) = usize::try_from(number)
                 && n < locals.len()
             {
@@ -688,7 +787,7 @@ impl Machine<'_, '_> {
             .and_then(|t| t.find(TOKEN))
             .map(|i| i + from)
         {
-            let (number, _) = local_token(text.as_bytes(), at + TOKEN.len());
+            let (number, _) = local_token(text.as_bytes(), at + TOKEN.len(), TOKEN)?;
             if let Ok(n) = usize::try_from(number)
                 && n < locals.len()
             {
@@ -721,5 +820,27 @@ impl Machine<'_, '_> {
             .ok_or(Trap::native(2, "temp out of range"))?;
         *slot = value;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::may_hold_career_token;
+
+    #[test]
+    fn a_career_token_past_the_first_character_or_the_start_of_one_at_the_end() {
+        for text in ["a $Job", "x$JobDesc:0", "Clerk $Jo", "B$", "$$Job"] {
+            assert!(may_hold_career_token(text), "{text}");
+        }
+        for text in [
+            "$Job",
+            "B004MA$b_01",
+            "business$g$c_01",
+            "Clerk",
+            "",
+            "$JobOffer",
+        ] {
+            assert!(!may_hold_career_token(text), "{text}");
+        }
     }
 }

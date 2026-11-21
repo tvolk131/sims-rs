@@ -503,6 +503,7 @@ mod tests {
             semi_globals: BTreeMap::new(),
             libraries: BTreeMap::new(),
             careers: None,
+            career_texts_end: false,
             zoning: BTreeMap::new(),
             animations: Default::default(),
             people: Default::default(),
