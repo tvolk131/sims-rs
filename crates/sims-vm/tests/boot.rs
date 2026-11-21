@@ -1402,15 +1402,15 @@ const TICK_20186_30: &str = "5ee29d0a10fc9f489b1cb1c76025ec81bcebc77fbf5c508072b
 /// the end.
 const TICK_20186_29: &str = "a282f437760e7a7b5308007acc06d094a26bf6a563f7bc9863ac5d1b3013d80e";
 /// The same at tick 31478, when the day turns.
-const TICK_31478: &str = "24525b0793fb324f16704e9658d1d19a0787009e9cb88d3044637755b3e73875";
+const TICK_31478: &str = "eadda68a0fdb21dd003cafccca2a89018f0a07dbac3dfd77683c7e3dad2c9b75";
 /// The same state's hash under snapshot format 30, which had no person
 /// types whose portrait the interface built ([`sims_sim::World::portraits`])
 /// at the end.
-const TICK_31478_30: &str = "3216df89133960f7ea56d3456874226daa4ac3a540c1a958357a0acd4d4a584b";
+const TICK_31478_30: &str = "e4d6da3c5ee38e6bed9bcd533159e916ee1680f163539a83e5a34900890b19ff";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
-const TICK_31478_29: &str = "8b7ae0ca751002b0ee36bd32ba0f921c494bebf77fba4a27f50e84fdc3754091";
+const TICK_31478_29: &str = "387eded5b6d27220500d121b74d48bb67b17b6f2875c81a9e3e65a0111825476";
 /// Where to start the C runtime's generator for House 69's load in track
 /// 2's second run: state 1 after this many draws, fitted so that our
 /// load's own 4,730 draws reach the recording's entry state (state 1 after
@@ -1449,15 +1449,15 @@ const IMPORTED_69_1000: &str = "d0a4eeb7b002caf2bd1cf872c829a9517d11665cf5dc68a9
 const IMPORTED_69_1000_30: &str =
     "8d0258ba3e1a8922a59f365ad4a4031d76a9365d97d20a264c1e039cd829a921";
 /// The same at tick 43200, a whole day from the load.
-const TICK_43200: &str = "00fbe95013dd9e8141e90c1de725db049dfc5967933a9ca07db28e397122103c";
+const TICK_43200: &str = "c3b7a6b9a8180d9e5e6463ba4e3638313cdec8d52bdaae28918bb05ce987e915";
 /// The same state's hash under snapshot format 30, which had no person
 /// types whose portrait the interface built ([`sims_sim::World::portraits`])
 /// at the end.
-const TICK_43200_30: &str = "b67d0c132d35c3579bdc28dfc91fd4476c755c76c6efa18a881615c33fda41e2";
+const TICK_43200_30: &str = "b9a5b6ba4df149edcf1f7f68be72a6c2a02e4f692864bce1b543e062f29379e4";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
-const TICK_43200_29: &str = "267bf9b3850d59968acabe44f27c97d4293c9ea533df4df20b18848630a45bd0";
+const TICK_43200_29: &str = "723a4322520c6497fcc6317247dd5079f2b4812e64bc11f7a114dbef7883c0bd";
 
 #[test]
 fn strict_mode_runs_the_goth_houses_whole_day() {
@@ -1603,9 +1603,10 @@ fn strict_mode_runs_the_goth_houses_whole_day() {
     // The statistics work the objects' value out again after the objects
     // lost value for the day (unverified: the run has left the recording
     // by then). The run before Set To Next mode 3 followed a group's
-    // links had 12653. The architecture's value is not ported and keeps
+    // links had 12653; before Find Location For mode 5 fixed its swapped
+    // axes it had 12524. The architecture's value is not ported and keeps
     // the saved one.
-    assert_eq!(values(&lot), (12524, 15277));
+    assert_eq!(values(&lot), (12539, 15277));
     assert_eq!(lot.world().hash_hex(), TICK_31478);
     assert_eq!(digest(&format_30_bytes(lot.world())), TICK_31478_30);
     assert_eq!(digest(&format_29_bytes(lot.world())), TICK_31478_29);
@@ -1717,12 +1718,13 @@ fn the_goth_day_under_the_recordings_frames_keeps_its_streams() {
         assert_eq!(streams(&lot), (lot_rng, 270_289_136, crt), "after {at}");
     }
     // From 36718 the lot stream moves one update before or after the
-    // recording's at a few updates (36718, 36929, 37058, 37126, 37215,
-    // 41445, 41858 to 41892, 42724, 42745, 42948, 43003), and is the
-    // recording's again at the next. Each is the same draws a frame
-    // earlier or later, taken to be the drift of the recording's frames
-    // against the schedule fitted here (unverified). The C runtime stream
-    // matches the recording's at every update of the day.
+    // recording's at a few updates: 36718, 36929, 37058, 37126, and 37215
+    // from the fitted frame schedule's drift against the recording's frames,
+    // and after 40317 by one update on the raccoon's draws — inferred from
+    // the binary's unmodeled Special Effect PIP paint (0x4b3489 → 0x58da12)
+    // refreshing the raccoon's animator (`goth-day-20261115` watched no
+    // frames) — before matching again at the next update. The C runtime
+    // stream matches the recording's at every update of the day.
     //
     // At tick 39610 the raccoon (object 10) runs Special Effect with flag
     // 0x40 clear while everyone sleeps at idle speed 1000; message 0x10c
@@ -1753,6 +1755,20 @@ fn the_goth_day_under_the_recordings_frames_keeps_its_streams() {
     lot.step().unwrap();
     tick += 1;
     assert_eq!((lot.world().speed(), lot.world().return_speed()), (760, -1));
+    // At tick 41446 (one update after the recording's 41445 — inferred to
+    // follow an unmodeled Special Effect PIP paint refreshing the raccoon's
+    // animator via 0x4b3489 → 0x58da12 around update 40317; the recording
+    // watched no frames), the raccoon (object 10) runs Wander (tree 419
+    // node 8: Find Location For mode 5) and places its wander target
+    // (object 37, GUID 0x000007C4) at [648, 312, 1] (tile (40, 19)),
+    // matching `goth-day-20261115`'s update 41445.
+    while tick < 41_446 {
+        lot.step().unwrap();
+        tick += 1;
+    }
+    let wander = &lot.world().objects[&37];
+    assert_eq!(wander.guid, 0x0000_07c4);
+    assert_eq!(wander.position, [648, 312, 1]);
     while tick < 43_200 {
         lot.step().unwrap();
         tick += 1;
