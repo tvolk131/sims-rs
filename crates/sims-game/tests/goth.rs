@@ -3842,6 +3842,45 @@ fn pet_subpanels_ultra_speed_blink_and_duplicate_instance_selection() {
     );
     assert!(speed_btn(&hud, id::ULTRA));
 
+    // Scripted Special Effect `0x10c` speed reset (`0x4f6856..0x4f687a`):
+    // changes speed & return_speed from (IDLE, FAST) -> (NORMAL, NORMAL)
+    // WITHOUT clearing `[control_panel + 0x1ec]`, so Ultra keeps blinking.
+    // A manual Live-mode speed click (`0x53a5e3`) clears `[+0x1ec]`, stopping
+    // the blink even though the speed globals are identical.
+    let mut scripted_world = idle_world.clone();
+    scripted_world.globals[18] = sims_sim::speed::FAST;
+    assert!(!hud.sync_clock_blink(&scripted_world, 2_100_000));
+    assert!(hud.sync_clock_blink(&scripted_world, 2_600_000));
+    scripted_world.set_speed(i32::from(sims_sim::speed::NORMAL));
+    assert_eq!(
+        (scripted_world.speed(), scripted_world.return_speed()),
+        (sims_sim::speed::NORMAL, sims_sim::speed::NORMAL)
+    );
+    // Still lit after scripted reset, and toggles at 500 ms.
+    assert!(!hud.sync_clock_blink(&scripted_world, 2_800_000));
+    assert!(hud.controls.ultra_lit);
+    assert!(hud.sync_clock_blink(&scripted_world, 3_100_000));
+    assert!(!hud.controls.ultra_lit);
+    assert!(hud.sync_clock_blink(&scripted_world, 3_600_000));
+    assert!(hud.controls.ultra_lit);
+    hud.draw(
+        &scripted_world,
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    assert!(speed_btn(&hud, id::NORMAL));
+    assert!(speed_btn(&hud, id::ULTRA));
+    // Manual Live-mode speed click clears `[control_panel + 0x1ec]`.
+    hud.set_idle_speed(false);
+    assert!(hud.sync_clock_blink(&scripted_world, 3_700_000));
+    assert!(!hud.controls.ultra_lit);
+    assert!(!hud.sync_clock_blink(&scripted_world, 4_200_000));
+    assert!(!hud.controls.ultra_lit);
+
     // 2. Dog (`KIND = 2`) and Cat (`KIND = 4`) Personality and Pet Skills panels
     //    drawn with real UIGraphics art and fonts.
     let mut dog_world = lot.world().clone();
@@ -3950,15 +3989,50 @@ fn pet_subpanels_ultra_speed_blink_and_duplicate_instance_selection() {
     )));
     assert_ne!(dog_skills_canvas.color, cat_skills_canvas.color);
 
-    // 3. Duplicate live household Sim instance (`0x51c5ef -> 0x4e97dc`):
-    //    selecting a second instance of Mortimer keeps Interests enabled.
+    // 3. Stale Sign press guard (`0x51cd17 -> 0x51ce05`, `0x51d1cc..0x51d1ee`):
+    //    draw human Personality so `Kind::Sign` is in `hud.items()`, then click
+    //    that stale Sign rect against `dog_world` before redraw — must return
+    //    None and emit no `UI_whoosh`.
+    hud.controls.panel = Some(Panel::Personality);
+    hud.draw(
+        lot.world(),
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    let _ = hud.take_sounds();
+    let sign_rect = hud
+        .items()
+        .iter()
+        .find(|i| matches!(i.kind, Kind::Sign { .. }))
+        .expect("human zodiac sign")
+        .rect;
+    let sign_center = [
+        sign_rect.x + sign_rect.width / 2,
+        sign_rect.y + sign_rect.height / 2,
+    ];
+    assert_eq!(hud.press(sign_center, &dog_world, true), None);
+    assert!(hud.controls.help.is_none());
+    assert!(hud.take_sounds().is_empty());
+
+    // 4. Duplicate live household Sim instance (`0x51c5ef -> 0x4e97dc`,
+    //    `0x4e9608`): a clone with a LOWER object ID appended later in
+    //    `world.people` still resolves Mortimer's resident slot to the first
+    //    person in `world.people`, highlights their portrait, and keeps
+    //    Interests enabled.
     let mut dup_world = lot.world().clone();
-    let clone_id = dup_world.objects.keys().copied().max().unwrap_or(0) + 1;
+    let clone_id = (1..selected_id)
+        .find(|id| dup_world.objects.get(id).is_none_or(|o| o.person.is_none()))
+        .expect("lower non-person object ID");
     let mut clone = dup_world.objects[&selected_id].clone();
     clone.id = clone_id;
     clone.selected = true;
     dup_world.objects.get_mut(&selected_id).unwrap().selected = false;
     dup_world.objects.insert(clone_id, clone);
+    dup_world.people.push(clone_id);
     hud.controls.panel = Some(Panel::Needs);
     hud.draw(
         &dup_world,
@@ -3994,11 +4068,28 @@ fn pet_subpanels_ultra_speed_blink_and_duplicate_instance_selection() {
         "duplicate household instance must highlight the resident's portrait"
     );
 
-    // 4. Non-residential House panel suppression (`0x51d3f9..0x51d40f`).
+    // 5. Non-residential House panel suppression (`0x51d3f9..0x51d412`): clears
+    //    stored `controls.panel` to `None` so reusing the HUD on a residential
+    //    lot does not reopen House.
     hud.controls.panel = Some(Panel::House);
     hud.draw(
         lot.world(),
         false,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    assert!(
+        !hud.items()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::House { .. }))
+    );
+    assert_eq!(hud.controls.panel, None);
+    hud.draw(
+        lot.world(),
+        true,
         &opened.assets,
         &view,
         &Pace::default(),

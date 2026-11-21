@@ -355,6 +355,23 @@ pub struct Relation {
     pub family: bool,
 }
 
+/// Finds the first live person of type `guid` in person-registry order
+/// (`0x4e9608`: scans `[registry + 0x84]` = `world.people`), falling back
+/// to `world.objects` for synthetic worlds that leave `world.people` empty.
+pub fn first_person_for_guid(world: &World, guid: u32) -> Option<&sims_sim::Object> {
+    world
+        .people
+        .iter()
+        .filter_map(|id| world.objects.get(id))
+        .find(|o| o.guid == guid && o.person.is_some())
+        .or_else(|| {
+            world
+                .objects
+                .values()
+                .find(|o| o.guid == guid && o.person.is_some())
+        })
+}
+
 impl Snapshot {
     /// Reads the snapshot. `members` is the family's member GUIDs in the
     /// order the neighborhood keeps them (`Family::members`): the world
@@ -364,13 +381,9 @@ impl Snapshot {
         let global = |n: usize| world.globals.get(n).copied().unwrap_or(0);
         let mut residents = Vec::new();
         for &guid in members {
-            // The first person of the type, as the original's lookup by
-            // type does (crates/sims-vm/src/selection.rs).
-            if let Some(object) = world
-                .objects
-                .values()
-                .find(|o| o.guid == guid && o.person.is_some())
-            {
+            // The first person of the type in person-registry order
+            // (`0x4e9608` scanning `[registry + 0x84]`).
+            if let Some(object) = first_person_for_guid(world, guid) {
                 let person = object.person.as_ref();
                 let data =
                     |word: usize| person.and_then(|p| p.data.get(word).copied()).unwrap_or(0);
@@ -421,6 +434,17 @@ impl Snapshot {
             superstar: false,
             house: House::default(),
         }
+    }
+
+    /// Overrides [`Snapshot::idle_speed`] with the host control panel's
+    /// tracked idle-blink flag (`[control_panel + 0x1ec]`, set by `0x109(1)`,
+    /// cleared by `0x109(0)` or manual speed click `0x53a5e3..0x53a6e1`, and
+    /// preserved across Special Effect `0x10c` speed resets at
+    /// `0x4f6856..0x4f687a`).
+    #[must_use]
+    pub fn with_idle_speed(mut self, idle_speed: bool) -> Self {
+        self.idle_speed = idle_speed;
+        self
     }
 
     /// Sets whether the lot is residential (`0x40745f`) and reads both
@@ -1450,5 +1474,26 @@ mod tests {
         world.objects.get_mut(&10).unwrap().selected = false;
         let nobody = Snapshot::read(&world, &members).with_zoning(&world, false, 50);
         assert_eq!((nobody.family_friends, nobody.cluster_friends), (4, 0));
+
+        // Duplicate GUID with a LOWER object ID appended later in `world.people`
+        // (`0x4e9608`): registry scan order wins over ascending object ID.
+        let mut lower_dup = make_sim(1, 200, 2, 1, true);
+        lower_dup.person.as_mut().unwrap().data[10] = 900;
+        world
+            .objects
+            .get_mut(&10)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap()
+            .data[10] = 200;
+        world.objects.insert(1, lower_dup);
+        world.people.push(1);
+        let dup_snap = Snapshot::read(&world, &members);
+        assert_eq!(dup_snap.residents[0].object, 10);
+        assert_eq!(dup_snap.residents[0].skills[0], 200);
+        assert_eq!(dup_snap.selected, Some(1));
+        assert_eq!(dup_snap.selected_guid, Some(200));
+        assert_eq!(dup_snap.selected_resident().map(|r| r.object), Some(10));
     }
 }

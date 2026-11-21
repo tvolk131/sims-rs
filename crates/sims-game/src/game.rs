@@ -303,8 +303,17 @@ impl Game {
                 .set_speed(i32::from(level))
                 .map(|_| self.pace.set_speed(speed))
         });
-        if let Err(e) = result {
-            self.note = Some(format!("The speed was not changed: {e}"));
+        match result {
+            Ok(()) => {
+                // 0x53a5e3, 0x53a661..0x53a666, 0x53a6dc..0x53a6e1: manual
+                // speed presses in Live mode clear `[control_panel + 0x1ec]`.
+                if self.hud.controls.mode == sims_ui::command::Mode::Live {
+                    self.hud.set_idle_speed(false);
+                }
+            }
+            Err(e) => {
+                self.note = Some(format!("The speed was not changed: {e}"));
+            }
         }
         if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
             self.blink_dirty = true;
@@ -398,6 +407,10 @@ impl Game {
         let set = self.lot.idle_speed().unwrap_or(false);
         if set {
             self.pace.restart();
+            // 0x46d7b5 -> 0x109(1) when entering idle speed, 0x46d803 ->
+            // 0x109(0) when leaving (`return_speed` reset to -1).
+            self.hud
+                .set_idle_speed(self.lot.world().return_speed() >= 0);
             if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
                 self.blink_dirty = true;
             }
@@ -1128,7 +1141,14 @@ impl Game {
                 .zip(world.objects.get(&sim))
                 .is_some_and(|(selected, target)| selected.guid == target.guid);
         if same_neighbor {
-            self.centre_on(sim);
+            // 0x4cfa0d..0x4cfa47: centres on the first live person of that
+            // neighbor in person-registry order (`0x4e9608`).
+            let target = world
+                .objects
+                .get(&sim)
+                .and_then(|o| sims_ui::household::first_person_for_guid(world, o.guid))
+                .map_or(sim, |o| o.id);
+            self.centre_on(target);
             self.hud.play(crate::hud::CLICK);
             return;
         }

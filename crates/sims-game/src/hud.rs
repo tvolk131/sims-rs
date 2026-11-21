@@ -86,6 +86,12 @@ pub struct Hud {
     /// state 2 blinks Pause (row 0 <-> row 1) and state 3 blinks Ultra
     /// (`selected` false <-> true) during idle speed when return speed != Ultra.
     clock_blink: ClockBlink,
+    /// Native `[control_panel + 0x1ec]` idle-blink flag: set on `0x109(1)`
+    /// (`0x46d7b5 -> 0x4f688e`), cleared on `0x109(0)` (`0x46d803`) or a
+    /// Live-mode manual speed press (`0x53a5e3..0x53a6e1`), and preserved
+    /// across scripted Special Effect `0x10c` speed resets
+    /// (`0x4f6856..0x4f687a` -> `0x53b663..0x53b6ac`).
+    idle_speed: bool,
     /// The interface's sounds, until the game takes them.
     sounds: Vec<SoundEvent>,
 }
@@ -176,6 +182,7 @@ impl Hud {
             queue: Queue::default(),
             pressed: Pressed::default(),
             clock_blink: ClockBlink::default(),
+            idle_speed: false,
             sounds: Vec::new(),
         })
     }
@@ -190,8 +197,32 @@ impl Hud {
         self.dialog = None;
         self.pressed = Pressed::default();
         self.clock_blink.reset();
+        self.idle_speed = false;
         self.controls.pause_lit = false;
         self.controls.ultra_lit = false;
+    }
+
+    /// Updates the native `[control_panel + 0x1ec]` idle-blink flag
+    /// (`0x109(1/0)` at `0x4f688e`, or cleared by manual Live-mode speed
+    /// clicks at `0x53a5e3..0x53a6e1`).
+    pub fn set_idle_speed(&mut self, active: bool) {
+        self.idle_speed = active;
+    }
+
+    /// Resolves `[control_panel + 0x1ec]` against `world`: `return_speed < 0`
+    /// means idle speed has exited (`0x109(0)`), `speed == IDLE` with
+    /// `return_speed >= 0` means idle speed is active (`0x109(1)`), and
+    /// `return_speed >= 0` with `speed != IDLE` preserves `self.idle_speed`
+    /// so scripted `0x10c` speed resets keep state 3 armed while manual
+    /// Live-mode speed clicks keep it cleared.
+    fn effective_idle_speed(&self, world: &World) -> bool {
+        if world.return_speed() < 0 {
+            false
+        } else if world.speed() == sims_sim::speed::IDLE {
+            true
+        } else {
+            self.idle_speed
+        }
     }
 
     /// Syncs the clock controls' shared 500 ms blink timer (`0x53b4b0..0x53b7e7`)
@@ -199,15 +230,15 @@ impl Hud {
     /// - state 2 (`ClockBlinkMode::Pause`): blinks `id::PAUSE` row 0 <-> row 1
     ///   whenever paused (including outside Live mode, `0x53b58a -> 0x53b5e8`);
     /// - state 3 (`ClockBlinkMode::Ultra`): blinks `id::ULTRA` selected state
-    ///   while unpaused in Live mode with idle speed active
-    ///   (`world.return_speed() >= 0 && world.speed() == sims_sim::speed::IDLE`)
+    ///   while unpaused in Live mode with `[control_panel + 0x1ec]` set
     ///   and saved return speed != Ultra (`0x53b4c9..0x53b4fe`).
     ///
     /// Returns true if either `controls.pause_lit` or `controls.ultra_lit` changed.
     pub fn sync_clock_blink(&mut self, world: &World, clock_us: u64) -> bool {
-        let idle_speed = world.return_speed() >= 0 && world.speed() == sims_sim::speed::IDLE;
+        self.idle_speed = self.effective_idle_speed(world);
         let speed = hud::speed_for(world);
-        let mode = hud::clock_blink_mode(world.paused(), self.controls.mode, idle_speed, speed);
+        let mode =
+            hud::clock_blink_mode(world.paused(), self.controls.mode, self.idle_speed, speed);
         let changed = self.clock_blink.sync(mode, clock_us);
         self.controls.pause_lit = self.clock_blink.pause_lit();
         self.controls.ultra_lit = self.clock_blink.ultra_lit();
@@ -270,6 +301,7 @@ impl Hud {
     /// level of each one's career needs.
     fn household(&self, world: &World, residential: bool) -> Snapshot {
         Snapshot::read(world, self.members(world))
+            .with_idle_speed(self.effective_idle_speed(world))
             .with_zoning(world, residential, self.known.friendship)
             .with_careers(&self.careers)
     }
@@ -322,6 +354,15 @@ impl Hud {
         let household = self.household(world, residential);
         if self.controls.follow(Selected::of(&household)) {
             self.play(WHOOSH);
+        }
+        // 0x51d3f9..0x51d412: rejecting House on a non-residential lot stores
+        // panel 0 (`None`) so a reused HUD does not reopen House on a later
+        // residential lot.
+        if !residential && self.controls.panel == Some(UiPanel::House) {
+            self.controls.panel = None;
+            if self.controls.help.take().is_some() {
+                self.play(WHOOSH);
+            }
         }
         if self.controls.expanded && residential && self.controls.panel == Some(UiPanel::House) {
             self.kinds.learn(world, assets.index(), assets.catalog());
@@ -575,6 +616,17 @@ impl Hud {
                 let snapshot = Snapshot::read(world, self.members(world));
                 let selected = Selected::of(&snapshot);
                 hud::check_press(command, selected, residential)
+            }
+            // 0x51cd17 -> 0x51ce05, 0x51d1cc..0x51d1ee: selection refresh hides
+            // the zodiac sign control when a pet (or non-human / nobody) is
+            // selected, so a stale Sign hit rect before redraw must not open
+            // the balloon or play `UI_whoosh`.
+            Command::Help(sims_ui::balloon::Help::Sign(_)) => {
+                let snapshot = Snapshot::read(world, self.members(world));
+                if Selected::of(&snapshot) != Selected::Human {
+                    return None;
+                }
+                command
             }
             other => other,
         };

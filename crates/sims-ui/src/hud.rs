@@ -1369,9 +1369,9 @@ fn draw_pet_skills(frame: &mut Frame, art: &Art, panel: Rect, kind: PetKind, ski
         );
         let at = [
             label.x.saturating_add(label.width - font.width(name)),
-            label
-                .y
-                .saturating_add((label.height - font.line_height) / 2),
+            // 0x53180d..0x531826, 0x5321e7..0x532200, 0x5e3f0d..0x5e4053:
+            // text rect local top is 0 and the renderer draws directly at it.
+            label.y,
         ];
         font.draw(frame, name, at, LABEL);
     }
@@ -4194,6 +4194,11 @@ mod tests {
         let mut cat_frame = Frame::new(279, 100, [0; 3]);
         draw_pet_skills(&mut cat_frame, &art, panel, PetKind::Cat, &[400, 1000, 200]);
         assert_ne!(dog_frame.rgb(), cat_frame.rgb());
+        // Labels are top-aligned (`local top = 0`, `0x53180d..0x531826`) in
+        // `(103, 25 + 15 * row, 102, 16)`: row 0 draws at y = 25 (not centered).
+        assert_eq!(dog_frame.pixel(204, 25), Some(LABEL));
+        assert_eq!(dog_frame.pixel(204, 24), Some([0, 0, 0]));
+        assert_eq!(dog_frame.pixel(204, 27), Some([0, 0, 0]));
         // Row 0 bar (400 -> 4 pts -> 16 px full, rest empty) at (207, 27).
         assert_eq!(dog_frame.pixel(207, 27), Some([20, 20, 20]));
         assert_eq!(dog_frame.pixel(207 + 15, 27), Some([20, 20, 20]));

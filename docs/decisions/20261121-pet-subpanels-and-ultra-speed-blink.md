@@ -15,12 +15,13 @@ panel suppression).
   `0x51ca0a..0x51ca4e`, `0x51d694..0x51d6d4`):** Both human (`STR# 130`,
   `0x519621`) and pet (`STR# 180`, `0x5197f3`) Needs panels construct the
   same eight motive meters (`0x66c5e0 = [7, 5, 6, 15, 8, 14, 9, 13]`) with
-  identical labels (`Hunger`, `Energy`, `Comfort`, `Fun`, `Hygiene`,
-  `Social`, `Bladder`, `Room`) and identical western bounding box
-  `(0, 21, 200, 105)` (`0x519a34`, `0x519b23`). Only the unported
-  need-help balloon descriptions (`STR# 180` odd/even pairs and balloon
-  GUID tables `0x6f3950` vs `0x6f39d0`) differ, so Needs rendering is
-  unchanged.
+  identical English labels (`Hunger`, `Energy`, `Comfort`, `Fun`, `Hygiene`,
+  `Social`, `Bladder`, `Room`; shipped localized tables differ in e.g.
+  language 8 `Sult`/`Hunger` and language 11 `Sosiaalisuus`/`Sosiaalinen`)
+  and identical western bounding box `(0, 21, 200, 105)` (`0x519a34`,
+  `0x519b23`). Only the unported need-help balloon descriptions (`STR# 180`
+  odd/even pairs and balloon GUID tables `0x6f3950` vs `0x6f39d0`) differ
+  in English, so Needs rendering is unchanged.
 - **Pet Personality labels & zodiac hiding (`0x51df31..0x51e0c9`,
   `0x52157e..0x5215c0`, `0x51cd11..0x51ce05`, `0x51d640..0x51d68f`,
   `0x51d1bf..0x51d1f4`):**
@@ -35,7 +36,8 @@ panel suppression).
   - Both panel switch (`0x51d650..0x51d663`) and selection/personality
     refresh (`0x51cd17..0x51ce05`, `0x51d1cc..0x51d1ee`) hide the zodiac
     sign control (`[esi + 0x1c4]`) for pets (`person.data[65] > 1`),
-    suppressing `Kind::Sign` and `Help::Sign` balloons.
+    suppressing `Kind::Sign` and `Help::Sign` balloons (and guarding stale
+    `Help::Sign` clicks in `Hud::press` before redraw).
 - **Dog & Cat Pet Skills subpanels (`0x51d598..0x51d624`,
   `0x51cbf8..0x51cc5a`, `0x531469..0x531bc3`, `0x531e43..0x5326d5`):**
   - When opening or refreshing panel 3 (`Panel::Job`), `0x51d5af..0x51d5bf`
@@ -49,8 +51,9 @@ panel suppression).
   - Both panels sit at the standard subpanel origin (`0x6f3ad0`), draw
     title `"Pet Skills"` (`STR# 171[0]`) at `(13, 8)` in font 11
     (`0x531b7a..0x531bbf`, `0x5326a9..0x5326d4`), draw three right-aligned
-    font-7 labels in `102 x 16` boxes at `(103, 25 + 15 * row)`
-    (`0x6f4518`, `0x5317cd..0x531851`, `0x5321a7..0x53222b`), and draw
+    top-aligned (`local top = 0`, `0x53180d..0x531826`, `0x5321e7..0x532200`,
+    `0x5e3f0d..0x5e4053`) font-7 labels in `102 x 16` boxes at
+    `(103, 25 + 15 * row)` (`0x6f4518`), and draw
     three skill bars at `(207, 27 + 15 * row)` (`0x6f4488`) using
     `id::SKILL_EMPTY` (`0x1338` = 4920) and `id::SKILL_FULL` (`0x1325` =
     4901) from `person.data` words `[10, 12, 11]` (`0x66e360`,
@@ -62,9 +65,12 @@ panel suppression).
     which sets `[control_panel + 0x1ec] = 1` and invokes `0x53b536(2)`.
     Leaving idle speed (`0x46d7db`) sends `0x109(0)` (`+0x1ec = 0`), and
     clicking Normal/Fast/Ultra in Live mode clears `+0x1ec = 0`
-    (`0x53a5e3..0x53a6e1`) while updating global 16 away from `IDLE`.
-    Thus `Snapshot::idle_speed` tracks
-    `world.return_speed() >= 0 && world.speed() == sims_sim::speed::IDLE`.
+    (`0x53a5e3..0x53a6e1`), whereas scripted Special Effect `0x10c` speed
+    resets (`0x4f6856..0x4f687a`) change global 16/18 to `NORMAL` while
+    leaving `[control_panel + 0x1ec]` set so state 3 stays armed
+    (`0x53b663..0x53b6ac`). `sims_game::hud::Hud` tracks `[+0x1ec]` directly
+    (`Hud::idle_speed`), updated by `Game::idle_speed`, cleared by manual
+    Live-mode `Game::set_speed`, and forwarded into `Snapshot::with_idle_speed`.
   - When unpaused in Live mode with `idle_speed` active and saved return
     speed != `ULTRA` (`0x4b4513 != 0x46d26a`), the clock blink state
     machine enters `state 3` (`ClockBlinkMode::Ultra`), arming the shared
@@ -75,17 +81,22 @@ panel suppression).
     state 3 cancels the timer and clears `ultra_lit` (`0x53b76d..0x53b7aa`).
 - **Neighbor/GUID selection matching (`0x51c5ef -> 0x4e97dc`, `0x4e986d`,
   `0x4e9608`, `0x4cf9ea..0x4cfa0d`) & non-residential House suppression
-  (`0x51d3f9..0x51d40f`):**
+  (`0x51d3f9..0x51d412`):**
+  - `first_person_for_guid` scans `world.people` in person-registry order
+    (`0x4e9608`: `[registry + 0x84]`) rather than ascending object ID so a
+    lower-ID duplicate appended later never shadows the primary live Sim.
   - `Snapshot::selected_guid` records the selected person's type GUID so
     `Snapshot::selected_resident` matches the household roster by GUID
     (matching the executable's neighbor-index comparison) even when a
     second live instance of a household Sim is selected; `Game::select`
     likewise compares the selected Sim's GUID against the portrait's Sim
-    so clicking the highlighted portrait centres on the first instance
-    instead of switching selection (`0x4cf9ea..0x4cfa0d`).
-  - On non-residential lots, `hud::live_strip` suppresses `Panel::House`
-    selection and rendering (`0x51d3f9..0x51d40f`) in addition to
-    `check_press` refusing clicks with `UI_error` (`0x51bdf2..0x51be36`).
+    so clicking the highlighted portrait centres on `first_person_for_guid`
+    instead of switching selection (`0x4cf9ea..0x4cfa47`).
+  - On non-residential lots, `Hud::draw` clears a stored `Panel::House` to
+    `None` (`0x51d3f9..0x51d412` stores panel `0`) so a reused HUD does not
+    reopen House on a later residential lot, `hud::live_strip` defensively
+    suppresses `Panel::House`, and `check_press` refuses clicks with
+    `UI_error` (`0x51bdf2..0x51be36`).
 
 ## Ratchet impact
 
