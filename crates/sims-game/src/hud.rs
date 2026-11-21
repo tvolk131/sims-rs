@@ -539,6 +539,13 @@ impl Hud {
         self.controls.pointer
     }
 
+    /// Sets the pointer position directly (used when opening a pie menu so the
+    /// opening frame seeds its head pose and hit state from the press or
+    /// on-screen clamp warp rather than a stale hover, `0x5ebd05` / `0x5ebd29`).
+    pub fn set_pointer(&mut self, point: [i32; 2]) {
+        self.controls.pointer = Some(point);
+    }
+
     /// Whether a dialog message is loaded and will cover/close any open pie
     /// menu on this frame (`Hud::draw`).
     pub fn will_show_dialog(&self, size: [i32; 2]) -> bool {
@@ -689,6 +696,9 @@ impl Hud {
                 (release, command)
             }
             Release::Settled | Release::Stays => {
+                if let Some(point) = menu.pending_pointer() {
+                    self.controls.pointer = Some(point);
+                }
                 self.menu = Some(menu);
                 (release, None)
             }

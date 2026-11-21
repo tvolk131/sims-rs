@@ -247,6 +247,32 @@ impl People {
         })
     }
 
+    /// Renders `person`'s pie-menu 3D head positioned at `center` inside the
+    /// active house `viewport` (`0x462621` → `0x462985`), returning its
+    /// top-left viewport origin and tightly bounded RGBA image clipped only to
+    /// the house viewport (never cropped by the 201×201 face bitmap).
+    pub fn head_in_viewport(
+        &mut self,
+        world: &World,
+        person: u16,
+        viewport: (u32, u32),
+        center: [i32; 2],
+        look: Look,
+    ) -> Result<([i32; 2], Image), String> {
+        self.refresh(world);
+        let drawn =
+            self.people
+                .pie_head_in_viewport(person, [viewport.0, viewport.1], center, look)?;
+        Ok((
+            drawn.origin,
+            Image {
+                width: drawn.canvas.width,
+                height: drawn.canvas.height,
+                rgba: drawn.canvas.rgba,
+            },
+        ))
+    }
+
     /// Keeps the problems not kept yet, up to `KEPT` (256).
     pub fn note(&mut self, problems: Vec<String>) {
         for line in problems {

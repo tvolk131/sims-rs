@@ -62,16 +62,22 @@ and pie labels (`0x5eb04c`).
 ## Implementation & deferred animations
 
 - `sims_people::pie_head` implements `Look`, `compass_direction`, `project`,
-  and `draw_body` (with `MAX_SIDE = 4096` bounds validation), exposed on
-  `sims_people::People::pie_head`.
+  `draw_body` (with `MAX_SIDE = 4096` bounds validation), and
+  `draw_body_in_viewport` (rasterizing at exact house-viewport coordinates and
+  clipping only to the active house viewport so oversized headwear such as the
+  stock Flamingo hat is never cropped to the 201×201 face bitmap), exposed on
+  `sims_people::People::pie_head` and `pie_head_in_viewport`.
 - `sims_ui::pie::Pie::draw` draws `head` only once on `layouts[0]` so submenus
   do not duplicate the head.
 - `sims_game::menu::Menu` tracks `head_look` (freezing the parent look while a
-  submenu is open), `face_origin`, and `active_center`; `Hud::hover` requests a
-  redraw on pointer motion while a pie menu is open; `Game::draw` applies
-  `shade_pie_face` and `composite_pie_head` inside the house viewport before
-  `Hud::draw` draws the bottom control strip and `Menu::draw_labels` draws the
-  2D pie labels on top.
+  submenu is open), `main_center`, `active_center`, `pending_pointer`, and
+  `head_origin`; opening a pie menu seeds the pointer from the press or
+  on-screen clamp warp (`0x5ebd05`, `0x5ebd29`) so the opening frame does not
+  aim the head at a stale hover coordinate; `Hud::hover` requests a redraw on
+  pointer motion while a pie menu is open; `Game::draw` applies
+  `shade_pie_face` and `composite_pie_head` (from `head_in_viewport`) inside
+  the house viewport before `Hud::draw` draws the bottom control strip and
+  `Menu::draw_labels` draws the 2D pie labels on top.
 - **Deferred animations (steady-state rendered):** the three 400 ms transition
   animations are not ported yet:
   1. Backdrop pop-in and submenu/back center-and-radius linear interpolation

@@ -287,18 +287,58 @@ impl Target for PieTarget<'_> {
     }
 }
 
-/// Draws `body`'s pie-menu 3D head into an RGBA [`Canvas`] of `size` pixels
-/// (typically `[201, 201]`), clear (`[0, 0, 0, 0]`) outside the head.
-///
-/// Returns an error if `size` exceeds [`MAX_SIDE`] on either axis, or if
-/// `body`'s skeleton has no `HEAD` bone or no visible parts are bound to it.
-pub fn draw_body(body: &Body, size: [u32; 2], look: Look) -> Result<Canvas, String> {
-    let [width, height] = size;
-    if width > MAX_SIDE || height > MAX_SIDE || width.checked_mul(height).is_none() {
-        return Err(format!(
-            "pie head size {width}x{height} exceeds {MAX_SIDE}x{MAX_SIDE}"
-        ));
+/// A pie-menu 3D head rasterized at exact house-viewport coordinates and
+/// clipped only by the active house viewport (`0x462621` → `0x462985`),
+/// avoiding any crop at the 201×201 face bitmap for tall or wide headwear.
+#[derive(Debug, Clone)]
+pub struct DrawnHead {
+    /// Top-left screen pixel of [`DrawnHead::canvas`] in house-viewport
+    /// coordinates.
+    pub origin: [i32; 2],
+    /// Tightly bounded RGBA pixels clipped to the house viewport.
+    pub canvas: Canvas,
+}
+
+/// Target that rasterizes directly in full house-viewport coordinates while
+/// storing only the tight bounding rectangle clamped to the viewport.
+struct ViewportPieTarget<'a> {
+    viewport: (u32, u32),
+    origin: (u32, u32),
+    canvas: &'a mut Canvas,
+}
+
+impl Target for ViewportPieTarget<'_> {
+    fn size(&self) -> (u32, u32) {
+        self.viewport
     }
+
+    fn passes(&self, x: u32, y: u32, z: f32) -> bool {
+        let Some(lx) = x.checked_sub(self.origin.0) else {
+            return false;
+        };
+        let Some(ly) = y.checked_sub(self.origin.1) else {
+            return false;
+        };
+        self.canvas.passes(lx, ly, z)
+    }
+
+    fn write(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], s: f32) {
+        let Some(lx) = x.checked_sub(self.origin.0) else {
+            return;
+        };
+        let Some(ly) = y.checked_sub(self.origin.1) else {
+            return;
+        };
+        let lit = |c: u8| (f32::from(c) * s + 0.5).clamp(0.0, 255.0) as u8;
+        let [r, g, b, a] = texel;
+        self.canvas
+            .write(lx, ly, z, [lit(r), lit(g), lit(b), a], 1.0);
+    }
+}
+
+fn skinned_head_parts(
+    body: &Body,
+) -> Result<Vec<(&crate::appearance::Part, crate::skin::Skinned)>, String> {
     let head_bone = rig::bone(&body.skeleton, HEAD_BONE)
         .ok_or_else(|| "skeleton has no HEAD bone".to_owned())?;
     let identity = vec![Transform::IDENTITY; body.skeleton.bones.len()];
@@ -312,6 +352,22 @@ pub fn draw_body(body: &Body, size: [u32; 2], look: Look) -> Result<Canvas, Stri
     if count == 0 {
         return Err("body has no head to draw".to_owned());
     }
+    Ok(parts)
+}
+
+/// Draws `body`'s pie-menu 3D head into an RGBA [`Canvas`] of `size` pixels
+/// (typically `[201, 201]`), clear (`[0, 0, 0, 0]`) outside the head.
+///
+/// Returns an error if `size` exceeds [`MAX_SIDE`] on either axis, or if
+/// `body`'s skeleton has no `HEAD` bone or no visible parts are bound to it.
+pub fn draw_body(body: &Body, size: [u32; 2], look: Look) -> Result<Canvas, String> {
+    let [width, height] = size;
+    if width > MAX_SIDE || height > MAX_SIDE || width.checked_mul(height).is_none() {
+        return Err(format!(
+            "pie head size {width}x{height} exceeds {MAX_SIDE}x{MAX_SIDE}"
+        ));
+    }
+    let parts = skinned_head_parts(body)?;
     let mut canvas = Canvas::new(width, height, [0; 4]);
     let [pitch, yaw] = look.angles();
     // 0x4625ae + 0x462621: bone origin sits 14 px below the face center
@@ -333,6 +389,91 @@ pub fn draw_body(body: &Body, size: [u32; 2], look: Look) -> Result<Canvas, Stri
         }
     }
     Ok(canvas)
+}
+
+/// Draws `body`'s pie-menu 3D head positioned at the main pie menu's `center`
+/// inside a house viewport of `viewport` `(width, height)` pixels (`0x462621`
+/// → `0x462985`), clipping only to `[0..viewport[0], 0..viewport[1]]` so tall
+/// or wide headwear (such as stock Flamingo hats) is never cropped by the
+/// 201×201 face bitmap.
+pub fn draw_body_in_viewport(
+    body: &Body,
+    viewport: [u32; 2],
+    center: [i32; 2],
+    look: Look,
+) -> Result<DrawnHead, String> {
+    let parts = skinned_head_parts(body)?;
+    let [vp_w, vp_h] = viewport;
+    if vp_w == 0 || vp_h == 0 {
+        return Ok(DrawnHead {
+            origin: [0, 0],
+            canvas: Canvas::new(0, 0, [0; 4]),
+        });
+    }
+    let [pitch, yaw] = look.angles();
+    let origin = [center[0] as f32 + 0.5, center[1] as f32 + Y_OFFSET + 0.5];
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for (_, skinned) in &parts {
+        for &p in &skinned.positions {
+            let v = project(p, origin, pitch, yaw);
+            if v.x.is_finite() && v.y.is_finite() {
+                min_x = min_x.min(v.x);
+                min_y = min_y.min(v.y);
+                max_x = max_x.max(v.x);
+                max_y = max_y.max(v.y);
+            }
+        }
+    }
+    if !min_x.is_finite() || !min_y.is_finite() {
+        return Ok(DrawnHead {
+            origin: [0, 0],
+            canvas: Canvas::new(0, 0, [0; 4]),
+        });
+    }
+    let rx0 = (min_x.floor() as i64 - 1).clamp(0, i64::from(vp_w)) as u32;
+    let ry0 = (min_y.floor() as i64 - 1).clamp(0, i64::from(vp_h)) as u32;
+    let rx1 = (max_x.ceil() as i64 + 1).clamp(0, i64::from(vp_w)) as u32;
+    let ry1 = (max_y.ceil() as i64 + 1).clamp(0, i64::from(vp_h)) as u32;
+    if rx0 >= rx1 || ry0 >= ry1 {
+        return Ok(DrawnHead {
+            origin: [0, 0],
+            canvas: Canvas::new(0, 0, [0; 4]),
+        });
+    }
+    let rw = rx1 - rx0;
+    let rh = ry1 - ry0;
+    if rw > MAX_SIDE || rh > MAX_SIDE || rw.checked_mul(rh).is_none() {
+        return Err(format!(
+            "pie head bounds {rw}x{rh} exceed {MAX_SIDE}x{MAX_SIDE}"
+        ));
+    }
+    let mut canvas = Canvas::new(rw, rh, [0; 4]);
+    let ambient = Shade::Grey(look.ambient());
+    let mut target = ViewportPieTarget {
+        viewport: (vp_w, vp_h),
+        origin: (rx0, ry0),
+        canvas: &mut canvas,
+    };
+    for (part, skinned) in &parts {
+        let shade = vec![ambient; skinned.positions.len()];
+        let proj = |p| project(p, origin, pitch, yaw);
+        if part.texture_name.is_some() {
+            let mut packed = Packed565(&mut target);
+            draw_shaded(&mut packed, part, skinned, &shade, proj);
+        } else {
+            draw_shaded(&mut target, part, skinned, &shade, proj);
+        }
+    }
+    Ok(DrawnHead {
+        origin: [
+            i32::try_from(rx0).unwrap_or(i32::MAX),
+            i32::try_from(ry0).unwrap_or(i32::MAX),
+        ],
+        canvas,
+    })
 }
 
 #[cfg(test)]

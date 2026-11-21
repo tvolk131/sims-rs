@@ -413,9 +413,11 @@ pub struct Menu {
     /// Whether the left mouse button is held down over the pie, which
     /// draws the highlighted label in cyan (0x5eb04c).
     held: bool,
-    /// The head of the Sim the menu is for, drawn in the first menu's middle
-    /// (`People::head_looking`), if it was rendered.
+    /// The head of the Sim the menu is for, rasterized into the active house
+    /// viewport (`People::head_in_viewport`), if it was rendered.
     pub head: Option<Image>,
+    /// Top-left house-viewport pixel where [`Menu::head`] sits.
+    pub head_origin: [i32; 2],
     /// The main menu's pie-head look frozen when a submenu opened (`0x462106`,
     /// `0x462290` reads highlighted/angle/distance from the parent menu while
     /// a submenu is active).
@@ -482,6 +484,7 @@ impl Menu {
             moved: false,
             held: true,
             head: None,
+            head_origin: [0, 0],
             submenu_look: None,
         };
         menu.layout(art, size);
@@ -605,6 +608,11 @@ impl Menu {
         Release::Closed
     }
 
+    /// Where the pointer is to be moved, without consuming the pending warp.
+    pub fn pending_pointer(&self) -> Option<[i32; 2]> {
+        self.pointer
+    }
+
     /// Where the pointer is to be moved, once.
     pub fn take_pointer(&mut self) -> Option<[i32; 2]> {
         self.pointer.take()
@@ -635,10 +643,15 @@ impl Menu {
         face.map(|n| u32::try_from(n).unwrap_or(0))
     }
 
-    /// The top-left screen position of the first menu's face rectangle, where
-    /// the 3D pie head is composited in the house viewport pass (`0x462290`).
+    /// The top-left screen position of the first menu's face rectangle.
     pub fn face_origin(&self) -> Option<[i32; 2]> {
         self.layouts.first().map(|l| [l.face.x, l.face.y])
+    }
+
+    /// The center of the first (main) menu, where the 3D pie head is
+    /// positioned in the house viewport (`0x462621` → `0x462985`).
+    pub fn main_center(&self) -> Option<[i32; 2]> {
+        self.layouts.first().map(|l| l.center)
     }
 
     /// The center of the currently active menu (the submenu if one is open,

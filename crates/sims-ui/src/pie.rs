@@ -19,16 +19,20 @@
 //! Goth house), to the pixel. How the drawn menu looks has **not** been
 //! compared with a screenshot.
 //!
-//! In the middle the original draws the selected Sim's head, rendered
-//! live into the blank 201 by 201 face bitmap. The head is the host's
-//! (`sims-people`); [`draw`] takes it as an image.
+//! In the middle the original renders the selected Sim's 3D head directly
+//! into the house viewport during the 3D pass (`0x4a953e` → `0x462985`),
+//! before the 2D menu (`0x5eb04c`) draws the transparent 201 by 201 face
+//! placeholder (`PieFace1.bmp`) and labels over it. [`draw`] also accepts an
+//! optional pre-rendered head image for callers that composite in the 2D pass.
 
 use crate::art::Art;
 use crate::font::Font;
 use crate::frame::{Frame, Rect};
 use sims_formats::bitmap::Image;
 
-/// The face bitmap the head is drawn into (kPieFaceBkg).
+/// The transparent 201×201 face placeholder bitmap (`kPieFaceBkg`, all colour
+/// key); in the original the 3D head draws in the house-viewport pass behind
+/// the 2D menu (`0x462985`).
 pub const FACE: i32 = 800;
 /// Every resource the menu draws, for [`Art::load`].
 pub const RESOURCES: [i32; 1] = [FACE];

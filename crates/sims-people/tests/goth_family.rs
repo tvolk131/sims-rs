@@ -459,3 +459,71 @@ fn mortimers_pie_head_matches_recorded_menu_poses() {
         }
     }
 }
+
+/// Stock oversized headwear (`cspellboundfafit_flamingo` from Makin' Magic)
+/// overflows the 201×201 face bitmap. Rendering directly in house-viewport
+/// coordinates (`draw_body_in_viewport`, matching native `0x462621` →
+/// `0x462985`) preserves the full uncropped headwear up to the house viewport
+/// boundary while still clipping cleanly at the viewport edge.
+#[test]
+fn flamingo_pie_head_is_not_cropped_by_the_face_bitmap() {
+    let Some(root) = install() else { return };
+    let house = root.join("UserData/Houses/House05.iff");
+    let assets = Assets::scan(&root).unwrap();
+    let people = residents(&root, &house).unwrap();
+    let bella = people.iter().find(|r| r.id == 18).unwrap();
+    let mut outfit = bella.outfit.clone();
+    // Replace the head appearance with the stock Flamingo head.
+    let head_part = outfit
+        .parts
+        .iter_mut()
+        .find(|(mesh, _)| mesh.to_ascii_lowercase().starts_with('c'))
+        .expect("Bella has a head part");
+    head_part.0 = "cspellboundfafit_flamingo".into();
+    head_part.1 = String::new();
+    let body = Body::load(&assets, &bella.skeleton, &outfit).unwrap();
+
+    let look = sims_people::pie_head::Look::neutral();
+    let cropped = sims_people::pie_head::draw_body(&body, [201, 201], look).unwrap();
+    let full =
+        sims_people::pie_head::draw_body_in_viewport(&body, [800, 500], [400, 250], look).unwrap();
+    let cropped_opaque = cropped
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|p| p[3] == 255)
+        .count();
+    let full_opaque = full
+        .canvas
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|p| p[3] == 255)
+        .count();
+
+    assert_eq!(cropped_opaque, 11_628);
+    assert_eq!(full_opaque, 14_014);
+    assert!(
+        full.canvas.width > 201 || full.canvas.height > 201,
+        "expected flamingo bounds {}x{} to exceed 201x201",
+        full.canvas.width,
+        full.canvas.height
+    );
+
+    // Near the bottom of an 800×500 viewport, the viewport boundary clips the
+    // mesh cleanly instead of overflowing.
+    let edge =
+        sims_people::pie_head::draw_body_in_viewport(&body, [800, 500], [400, 487], look).unwrap();
+    assert!(edge.origin[1] + edge.canvas.height as i32 <= 500);
+    let edge_opaque = edge
+        .canvas
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|p| p[3] == 255)
+        .count();
+    assert!(edge_opaque > 0 && edge_opaque < full_opaque);
+}

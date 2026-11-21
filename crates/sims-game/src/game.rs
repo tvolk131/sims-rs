@@ -622,9 +622,10 @@ impl Game {
         self.hud.read_dialog(dialogs, &self.assets);
         // The pie menu shades the house viewport behind it (0x4a94ec →
         // 0x4ac8ff) and renders the Sim's 3D head tracking the pointer
-        // (0x4a953e → 0x462290) into the house viewport before the 2D HUD
-        // draws, so the bottom control strip clips the head while pie labels
-        // still draw over it.
+        // (0x4a953e → 0x462290 → 0x462985) directly into the house viewport
+        // before the 2D HUD draws, so oversized headwear is clipped only by
+        // the house viewport (not the 201×201 face bitmap), the bottom control
+        // strip hides anything below the viewport, and pie labels draw on top.
         if !self.hud.will_show_dialog(self.view.size) {
             self.hud.resize_menu(self.view.size);
             let pointer = self.hud.pointer();
@@ -632,21 +633,29 @@ impl Game {
                 if let Some(center) = menu.active_center() {
                     crate::people::shade_pie_face(&mut self.canvas, center, viewport);
                 }
-                let look = menu.head_look(pointer);
-                menu.head =
+                if let Some(center) = menu.main_center() {
+                    let look = menu.head_look(pointer);
                     match self
                         .people
-                        .head_looking(world, menu.person, menu.face_size(), look)
+                        .head_in_viewport(world, menu.person, viewport, center, look)
                     {
-                        Ok(head) => Some(head),
+                        Ok((origin, head)) => {
+                            crate::people::composite_pie_head(
+                                &mut self.canvas,
+                                origin,
+                                &head,
+                                viewport,
+                            );
+                            menu.head_origin = origin;
+                            menu.head = Some(head);
+                        }
                         Err(e) => {
                             self.people
                                 .note(vec![format!("the pie menu has no head: {e}")]);
-                            None
+                            menu.head_origin = [0, 0];
+                            menu.head = None;
                         }
-                    };
-                if let (Some(origin), Some(head)) = (menu.face_origin(), menu.head.as_ref()) {
-                    crate::people::composite_pie_head(&mut self.canvas, origin, head, viewport);
+                    }
                 }
             }
         }
@@ -820,6 +829,9 @@ impl Game {
         let failed = self.note.take();
         let menu = self.hud.menu.clone();
         let (_, command) = self.hud.release_menu(point);
+        if let Some(warped) = self.hud.menu.as_ref().and_then(Menu::pending_pointer) {
+            self.pointer = Some(warped);
+        }
         self.highlighted = None;
         let outcome = match command {
             Some(command) => self.command(command, menu.as_ref()),
@@ -1010,14 +1022,22 @@ impl Game {
                 } else {
                     self.note = why.map(|why| format!("Every entry is shown, as {why}"));
                     self.highlighted = None;
-                    self.hud.menu = Some(Menu::new(
+                    let menu = Menu::new(
                         person,
                         object,
                         listing.entries,
                         point,
                         &self.hud.art,
                         self.view.size,
-                    ));
+                    );
+                    // Native menu setup reads the current cursor (0x5ebd05)
+                    // after any on-screen clamp warp (0x5ebab2) and updates
+                    // hit state (0x5ebd29), so the opening frame aims the head
+                    // at the press or warped center rather than a stale hover.
+                    let effective = menu.pending_pointer().unwrap_or(point);
+                    self.pointer = Some(effective);
+                    self.hud.set_pointer(effective);
+                    self.hud.menu = Some(menu);
                 }
             }
             Err(e) => self.note = Some(format!("Object {object}'s menu is not listed: {e}")),

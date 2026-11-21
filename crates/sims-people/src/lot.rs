@@ -822,6 +822,26 @@ impl People {
         crate::pie_head::draw_body(body, size, look).map_err(|e| format!("person {person}: {e}"))
     }
 
+    /// Renders `person`'s pie-menu 3D head positioned at `center` inside the
+    /// active house `viewport` ([`crate::pie_head::draw_body_in_viewport`]),
+    /// clipped only to the house viewport boundary rather than the 201×201
+    /// face bitmap (`0x462621` → `0x462985`). Call [`People::update`] first.
+    pub fn pie_head_in_viewport(
+        &self,
+        person: u16,
+        viewport: [u32; 2],
+        center: [i32; 2],
+        look: crate::pie_head::Look,
+    ) -> Result<crate::pie_head::DrawnHead, String> {
+        let loaded = self
+            .people
+            .get(&person)
+            .ok_or_else(|| format!("person {person} is not loaded"))?;
+        let (body, _) = loaded.body.as_ref().map_err(Clone::clone)?;
+        crate::pie_head::draw_body_in_viewport(body, viewport, center, look)
+            .map_err(|e| format!("person {person}: {e}"))
+    }
+
     /// Draws every placed person on the camera's levels over a lot the lot
     /// renderer has drawn into `canvas` (`sims_render::draw_lot` first,
     /// and `sims_render::draw_held` after, as the original's frame does),
