@@ -86,10 +86,15 @@ pub struct People {
     /// skeletons or suits stopped decoding, by location, with the error:
     /// its suits after that point are missing from `suits`.
     pub suit_errors: BTreeMap<String, String>,
+    /// Every suit name (`.cmx` / `.bcf` appearance) whose bindings include
+    /// an exact byte-for-byte `"HEAD"` bone (`0x4e810d` → `0x4e81a4` →
+    /// `0x431726`), as checked by the portrait renderer at `0x4e7824`.
+    pub head_suits: BTreeSet<String>,
     /// Whether each loaded person type's initial body/head suits (body
-    /// strings 1 and 2) bind `"HEAD"` (`0x4e725f` → `0x4e7817` → `0x4e810d`
-    /// → `0x4e7824`). Absent when a suit catalog failed to decode before
-    /// confirming a binding or in synthetic fixtures that do not populate it.
+    /// strings 1 and 2) bind `"HEAD"` byte-for-byte (`0x4e725f` → `0x4e7817`
+    /// → `0x4e810d` → `0x4e81a4` → `0x431726` → `0x4e7824`). Absent when a
+    /// suit catalog failed to decode before confirming a binding or in
+    /// synthetic fixtures that do not populate it.
     pub portrait_head: BTreeMap<u32, bool>,
 }
 
@@ -612,6 +617,7 @@ impl People {
                 profiles,
                 suits: registry.suits,
                 suit_errors: registry.suit_errors,
+                head_suits: registry.head_suits,
                 portrait_head,
             },
             unresolved,
@@ -712,11 +718,7 @@ fn read_cmx_catalog(
     };
     for _ in 0..app_count {
         if let Asset::Appearance(appearance) = cmx.read(Kind::Appearance).map_err(|e| (false, e))? {
-            if appearance
-                .bindings
-                .iter()
-                .any(|b| b.bone.eq_ignore_ascii_case("HEAD"))
-            {
+            if appearance.bindings.iter().any(|b| b.bone == "HEAD") {
                 head_suits.insert(appearance.name.clone());
             }
             suits.insert(appearance.name);
@@ -786,11 +788,7 @@ fn read_bcf_appearances(
     };
     for _ in 0..count {
         if let Asset::Appearance(appearance) = binary.read(Kind::Appearance)? {
-            if appearance
-                .bindings
-                .iter()
-                .any(|b| b.bone.eq_ignore_ascii_case("HEAD"))
-            {
+            if appearance.bindings.iter().any(|b| b.bone == "HEAD") {
                 head_suits.insert(appearance.name.clone());
             }
             suits.insert(appearance.name);
@@ -1347,5 +1345,49 @@ mod tests {
         assert_eq!(suits, ["cane".to_string()].into());
         // Too short for the first count: nothing, and no error.
         read_suits(&[0, 0], &mut suits).unwrap();
+    }
+
+    #[test]
+    fn head_suits_match_bone_name_case_sensitively() {
+        // 0x4e810d -> 0x4e81a4 -> 0x431726 compares the binding bone name
+        // byte-for-byte against "HEAD".
+        let cmx = b"// test\r\n\
+version 300\r\n\
+0\r\n\
+3\r\n\
+c001_exact\r\n\
+0\r\n\
+0\r\n\
+1\r\n\
+HEAD\r\n\
+xskin-c001-HEAD-HEAD\r\n\
+0\r\n\
+0\r\n\
+c002_lower\r\n\
+0\r\n\
+0\r\n\
+1\r\n\
+head\r\n\
+xskin-c002-head\r\n\
+0\r\n\
+0\r\n\
+b001_body\r\n\
+0\r\n\
+0\r\n\
+1\r\n\
+PELVIS\r\n\
+xskin-b001-PELVIS-BODY\r\n\
+0\r\n\
+0\r\n";
+        let mut suits = BTreeSet::new();
+        let mut head_suits = BTreeSet::new();
+        read_cmx_catalog(cmx, &mut suits, &mut head_suits).unwrap();
+        assert_eq!(
+            suits,
+            ["b001_body", "c001_exact", "c002_lower"]
+                .map(String::from)
+                .into()
+        );
+        assert_eq!(head_suits, ["c001_exact".to_string()].into());
     }
 }

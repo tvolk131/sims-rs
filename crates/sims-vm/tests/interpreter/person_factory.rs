@@ -87,6 +87,7 @@ pub fn equip(fx: &mut Fixture, guid: u32, name: &str, record_word: i16) {
             rig: Default::default(),
         },
     );
+    fx.program.people.portrait_head.insert(guid, true);
     let global = fx.program.libraries.get_mut(&GLOBAL).unwrap();
     for id in [1, 5, 6] {
         global.tuning.insert(

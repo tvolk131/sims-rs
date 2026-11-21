@@ -448,6 +448,130 @@ fn writeback_shares_iff_reloads_in_dialog_honors_reset_and_head_binding() {
     assert!(!fx.world.portraits.contains(&SIM_GUID));
     assert!(fx.world.dirty_portraits.contains(&SIM_GUID));
     assert!(fx.world.generated_portrait_2002.is_empty());
+
+    // 5. Missing portrait_head metadata does NOT default to true, and
+    // runtime-made characters check Character::strings rows 1/2 against
+    // People::head_suits (or fall back to template's portrait_head).
+    let (mut fx, _, record) = visitors();
+    fx.program.people.portrait_head.remove(&WIDGET);
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
+        Ok(true)
+    );
+    assert!(
+        fx.world.portraits.is_empty(),
+        "missing portrait_head metadata must not default to render success"
+    );
+    assert!(fx.world.generated_portrait_2002.is_empty());
+
+    // Runtime-made character with explicit head suit string in Character::strings:
+    // - without matching head_suits -> render fails (no cache/writeback);
+    // - with matching head_suits -> render succeeds (caches & writes BMP_ 2002),
+    //   and after clean eviction Dialog reloads it without trapping or RNG!
+    let (mut fx, _, _) = visitors();
+    fx.world.rooms.rooms.get_mut(&1).unwrap().occupied = true;
+    let made_guid = 0x5555_0003u32;
+    fx.world.characters.made.insert(
+        made_guid,
+        sims_sim::characters::Character {
+            template: WIDGET,
+            file: 9,
+            strings: std::collections::BTreeMap::from([(
+                2,
+                "c001_custom,HEAD-HEAD=c001".to_owned(),
+            )]),
+        },
+    );
+    fx.world.neighbors.slots.push(Some(Neighbor {
+        guid: made_guid,
+        id: 53,
+        data: vec![12; 256],
+        relationships: Vec::new(),
+        friends: 0,
+        revision: 1,
+        stale: false,
+    }));
+    let made_record = fx.world.neighbors.slots.len() as i16;
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, made_record, 1),
+        Ok(true)
+    );
+    assert!(
+        fx.world.portraits.is_empty(),
+        "override head suit missing from head_suits must not cache or stage writeback"
+    );
+    assert!(fx.world.generated_portrait_2002.is_empty());
+
+    fx.program.people.head_suits.insert("c001_custom".into());
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, made_record, 1),
+        Ok(true)
+    );
+    assert!(fx.world.portraits.contains(&made_guid));
+    assert!(
+        fx.world
+            .generated_portrait_2002
+            .contains(&PortraitFile::Made(9))
+    );
+
+    // Cleanly evict made_guid and run Dialog (mode 2): Dialog reloads
+    // generated_portrait_2002 at 0x4e9338 without trapping on characters.made!
+    fx.world.portraits.remove(&made_guid);
+    let crt_before_made_dialog = fx.world.crt_rng;
+    fx.add(
+        LAMP_FILE,
+        4096,
+        tree(vec![ins(
+            36,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [0, 0, 0, 0, 0, 0, 0, 5],
+        )]),
+    );
+    assert_eq!(fx.run_with(LAMP, 4096, made_record, &[], 1000), Ok(true));
+    assert!(fx.world.portraits.contains(&made_guid));
+    assert_eq!(fx.world.crt_rng, crt_before_made_dialog);
+
+    // 6. Dialog dirty rebuild with no tile (0x4e9706) falls back to the
+    // persisted BMP_ 2002 at 0x4e9338 instead of propagating a placement fault.
+    let (mut fx, file, record) = visitors();
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
+        Ok(true)
+    );
+    assert!(
+        fx.world
+            .generated_portrait_2002
+            .contains(&PortraitFile::Resource(file))
+    );
+    fx.world.portraits.remove(&WIDGET);
+    fx.world.dirty_portraits.insert(WIDGET);
+    fx.add(
+        file,
+        4096,
+        tree(vec![
+            ins(2, 1, 1, expr(scope::GLOBAL, 36, op::ADD, scope::LITERAL, 1)),
+            assign(scope::MY_DATA, 4, scope::LITERAL, 1, 2),
+            assign(scope::MY_DATA, 42, scope::LITERAL, 0, RETURN_TRUE),
+        ]),
+    );
+    fx.add(
+        LAMP_FILE,
+        4096,
+        tree(vec![ins(
+            36,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [0, 0, 0, 0, 0, 0, 0, 5],
+        )]),
+    );
+    assert_eq!(fx.run_with(LAMP, 4096, record, &[], 1000), Ok(true));
+    assert_eq!(
+        fx.world.globals[36], 2,
+        "Dialog dirty rebuild attempted once before falling back to 0x4e9338"
+    );
+    assert!(fx.world.portraits.contains(&WIDGET));
+    assert!(!fx.world.dirty_portraits.contains(&WIDGET));
 }
 
 #[test]

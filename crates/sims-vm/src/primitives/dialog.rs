@@ -379,18 +379,62 @@ impl Machine<'_, '_> {
         if self.world.portraits.contains(&guid) {
             return Ok(());
         }
-        if !self.listed_person_type(guid, "a dialog's portrait")? {
+        // 0x4363d1 -> 0x4e92a8 -> 0x4e9338: when UI Effect persisted BMP_ 2002
+        // into this definition's IFF earlier in the session, handle both clean
+        // reloads (including runtime-made characters registered via 0x4e8add)
+        // and dirty rebuilds whose 0x4e9706 no-tile failure falls back to
+        // 0x4e9338.
+        let has_generated_2002 = self
+            .portrait_file(guid)
+            .is_some_and(|file| self.world.generated_portrait_2002.contains(&file));
+        if has_generated_2002 && self.in_portrait_table(guid)? {
+            if !self.world.dirty_portraits.contains(&guid) {
+                self.world.portraits.insert(guid);
+                return Ok(());
+            }
+            let on_lot = self.world.people.iter().any(|id| {
+                self.world
+                    .objects
+                    .get(id)
+                    .is_some_and(|object| object.guid == guid)
+            });
+            if !on_lot {
+                let interpreter = self.interpreter();
+                let unsupported = |fault| {
+                    Trap::Unsupported(format!(
+                        "making a person of type 0x{guid:08X} for a dialog's portrait (0x4e9652): \
+                         {fault}"
+                    ))
+                };
+                let mut copy = self.world.clone();
+                let cells = crate::both_ways::Cells::of(&interpreter);
+                let built = cells.on(&interpreter);
+                if let Some(id) = built
+                    .try_create_person(&mut copy, guid)
+                    .map_err(unsupported)?
+                {
+                    let _placed = built
+                        .portrait_put_outcome(&mut copy, id)
+                        .map_err(|fault| fault.trap)?;
+                    // Whether 0x4e92f2 placed or failed at 0x4e9706, remove
+                    // the temporary Sim and keep its Init/RNG side effects;
+                    // on failure 0x4e92a8 falls through to 0x4e9338 and loads
+                    // the persisted BMP_ 2002.
+                    built.remove_now(&mut copy, id).map_err(unsupported)?;
+                }
+                if !cells.same_refresh(&crate::both_ways::Cells::of(&interpreter)) {
+                    return Err(Trap::Unsupported(format!(
+                        "making a person of type 0x{guid:08X} for a dialog's portrait (0x4e9652) \
+                         changed the refresh pending, which is not ported"
+                    )));
+                }
+                cells.keep(&interpreter, self.world, copy);
+            }
+            self.world.portraits.insert(guid);
+            self.world.dirty_portraits.remove(&guid);
             return Ok(());
         }
-        // 0x4363d1 -> 0x4e92a8 -> 0x4e9338: on a clean empty slot, reload a
-        // BMP_ 2002 persisted earlier in the session by 0x4e938c -> 0x4e9000
-        // without calling 0x4e8c5d or creating a temporary Sim.
-        if !self.world.dirty_portraits.contains(&guid)
-            && self
-                .portrait_file(guid)
-                .is_some_and(|file| self.world.generated_portrait_2002.contains(&file))
-        {
-            self.world.portraits.insert(guid);
+        if !self.listed_person_type(guid, "a dialog's portrait")? {
             return Ok(());
         }
         let on_lot = self.world.people.iter().any(|id| {

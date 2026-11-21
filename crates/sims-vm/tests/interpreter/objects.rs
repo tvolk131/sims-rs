@@ -372,6 +372,7 @@ fn people() -> People {
         suits: Default::default(),
         suit_errors: Default::default(),
         profiles: BTreeMap::new(),
+        head_suits: Default::default(),
         portrait_head: BTreeMap::new(),
         skeletons: BTreeMap::from([
             (

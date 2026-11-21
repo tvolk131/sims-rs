@@ -170,7 +170,7 @@ impl Machine<'_, '_> {
     /// - runtime-made characters (`0x4262d8` → `0x43c5fc` `0xe0` → `0x4f6727`
     ///   → `0x4e8a44` → `0x4e8add`) append their person GUID while the
     ///   portrait manager is active (`[0x6f26a4] != 0`).
-    fn in_portrait_table(&self, guid: u32) -> Result<bool, Trap> {
+    pub(crate) fn in_portrait_table(&self, guid: u32) -> Result<bool, Trap> {
         if self.catalog.objects.iter().any(|object| {
             object.guid == guid
                 && self
@@ -219,16 +219,48 @@ impl Machine<'_, '_> {
     }
 
     /// Whether the renderer (`0x4e725f` → `0x4e7817` → `0x4e810d` →
-    /// `0x4e7824`) can find a `"HEAD"` binding for `guid`. Returns `false`
-    /// only when the loaded suit catalogs confirmed no `"HEAD"` binding
-    /// exists on the person type's initial body/head suits.
+    /// `0x4e81a4` → `0x431726` → `0x4e7824`) finds a case-sensitive `"HEAD"`
+    /// binding for `guid`. Never defaults missing metadata to `true`:
+    /// - checks `People::portrait_head[guid]` first;
+    /// - for runtime-made characters (`World::characters.made`), checks body
+    ///   strings 1 and 2 in `Character::strings` against `People::head_suits`
+    ///   when present, otherwise falls back to `People::portrait_head[template]`;
+    /// - returns `false` when no `"HEAD"` binding is confirmed.
     fn can_render_portrait(&self, guid: u32) -> bool {
-        self.program
-            .people
-            .portrait_head
-            .get(&guid)
-            .copied()
-            .unwrap_or(true)
+        if let Some(&has_head) = self.program.people.portrait_head.get(&guid) {
+            return has_head;
+        }
+        if let Some(made) = self.world.characters.made.get(&guid) {
+            let mut has_suit_override = false;
+            for row in [1usize, 2] {
+                if let Some(raw) = made.strings.get(&row) {
+                    has_suit_override = true;
+                    let suit = raw
+                        .split(',')
+                        .next()
+                        .unwrap_or(raw)
+                        .trim()
+                        .to_ascii_lowercase();
+                    if !suit.is_empty()
+                        && suit != "none"
+                        && self.program.people.head_suits.contains(&suit)
+                    {
+                        return true;
+                    }
+                }
+            }
+            if has_suit_override {
+                return false;
+            }
+            return self
+                .program
+                .people
+                .portrait_head
+                .get(&made.template)
+                .copied()
+                .unwrap_or(false);
+        }
+        false
     }
 
     /// Whether the winning definition's file for `guid` is writable

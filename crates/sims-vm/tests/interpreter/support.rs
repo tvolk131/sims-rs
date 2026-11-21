@@ -306,6 +306,7 @@ fn program() -> Program {
         library.definitions.insert(128, definition(guid, kind));
         library.definition_order.push(128);
     }
+    program.people.portrait_head.insert(SIM_GUID, true);
     program
 }
 
