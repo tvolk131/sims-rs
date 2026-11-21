@@ -427,10 +427,9 @@ impl Snapshot {
         self.residents.iter().find(|r| r.object == object)
     }
 
-    /// The clock as the panel writes it: `AM 6:30`. Midnight and noon
-    /// are 12. Checked against the original at 6:30 and 10:10 in the
-    /// morning and 7:31 and 7:55 in the evening (`PM 7:31`); midnight
-    /// and noon are **unverified**.
+    /// The clock as the panel writes it (`0x5fe520`, format `0x6d84a4`
+    /// `"%s %2u:%.2u"`): `AM  6:30` for single-digit hours and `PM 12:00`
+    /// for two-digit hours. Midnight and noon are 12.
     pub fn clock(&self) -> String {
         let hour = self.hour.rem_euclid(24);
         let twelve = match hour % 12 {
@@ -438,7 +437,7 @@ impl Snapshot {
             h => h,
         };
         let half = if hour < 12 { "AM" } else { "PM" };
-        format!("{half} {twelve}:{:02}", self.minute.clamp(0, 59))
+        format!("{half} {twelve:2}:{:02}", self.minute.clamp(0, 59))
     }
 
     /// The funds as the panel writes them: `$2,542`. Checked against
@@ -1001,7 +1000,7 @@ mod tests {
 
     #[test]
     fn clock_and_money_text() {
-        assert_eq!(snapshot(6, 30, 0).clock(), "AM 6:30");
+        assert_eq!(snapshot(6, 30, 0).clock(), "AM  6:30");
         assert_eq!(snapshot(0, 5, 0).clock(), "AM 12:05");
         assert_eq!(snapshot(12, 0, 0).clock(), "PM 12:00");
         assert_eq!(snapshot(23, 59, 0).clock(), "PM 11:59");

@@ -23,6 +23,23 @@ pub struct Art {
     pub missing: Vec<i32>,
 }
 
+/// Un-premultiplies a UI TGA's partially transparent pixels (`0 < a < 255`)
+/// as the original's TGA loader does at `0x4deb3d..0x4deb9d` when
+/// `[0x6c8c3c] == 1` (true for every UI TGA except the Magicland mist
+/// overlays `0x1655..0x1657`): `c = trunc(c * (255.0 / a) + 0.5) as u8`.
+/// Opaque and colorkeyed BMP pixels (`a == 0` or `a == 255`) are untouched.
+fn unpremultiply_tga(image: &mut Image) {
+    for px in image.rgba.as_chunks_mut::<4>().0 {
+        let a = px[3];
+        if a > 0 && a < 255 {
+            let scale = 255.0f64 / f64::from(a);
+            for ch in &mut px[..3] {
+                *ch = ((f64::from(*ch) * scale + 0.5).trunc() as i32).clamp(0, 255) as u8;
+            }
+        }
+    }
+}
+
 impl Art {
     /// Loads resources `ids` in `language` (falling back to the rows for
     /// every language) and the fonts of [`FONT_SIZES`].
@@ -32,6 +49,7 @@ impl Art {
             match ui.bitmap(id, language).map_err(Error::Content)? {
                 Some(mut image) => {
                     image.key(KEY);
+                    unpremultiply_tga(&mut image);
                     art.images.insert(id, image);
                 }
                 None => art.missing.push(id),
@@ -54,6 +72,7 @@ impl Art {
         match ui.bitmap(id, language) {
             Ok(Some(mut image)) => {
                 image.key(KEY);
+                unpremultiply_tga(&mut image);
                 self.images.insert(id, image);
             }
             Ok(None) | Err(_) => self.missing.push(id),
@@ -84,5 +103,33 @@ impl Art {
         let image = self.image(id)?;
         let width = image.width / cells.max(1);
         image.crop(width.checked_mul(cell)?, 0, width, image.height)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unpremultiply_tga_restores_straight_rgb_for_partial_alpha() {
+        let mut image = Image {
+            width: 4,
+            height: 1,
+            rgba: vec![
+                // Transparent (alpha 0): untouched.
+                10, 20, 30, 0, // Opaque (alpha 255): untouched.
+                10, 20, 30, 255,
+                // Premultiplied (alpha 128): 64 * 255 / 128 + 0.5 = 128.0 -> 128.
+                64, 32, 0, 128, // Out-of-range non-premultiplied channel clamps to 255.
+                255, 128, 64, 128,
+            ],
+        };
+        unpremultiply_tga(&mut image);
+        assert_eq!(
+            image.rgba,
+            vec![
+                10, 20, 30, 0, 10, 20, 30, 255, 128, 64, 0, 128, 255, 255, 128, 128,
+            ]
+        );
     }
 }
