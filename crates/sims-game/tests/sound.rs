@@ -56,12 +56,10 @@ fn the_goths_sounds_play() {
     // A second of the lot, then a second of its sound, as the window does;
     // the camera scrolls a little each second, so every track is placed
     // again (kind 33).
-    // A whole day of the lot at most. The fountain (object 197) plays
-    // "fountain_tinkle" every 300 updates, and each play starts a thread
-    // of track 1346 that does not end, so at about update 74,700 the
-    // player's limit of 256 threads is reached (how the original treats a
-    // play of a track its object is still playing is unverified).
-    while game.lot().ticks() < 43_200 && game.run(20) > 0 {
+    // The fountain (object 197) plays "fountain_tinkle" every 300
+    // updates; its track 1346 runs for ever, so each play after the first
+    // starts nothing, as in the original.
+    while game.run(20) > 0 {
         game.apply(Move::Scroll([8, 0]));
         assert_ne!(game.shot(), shot);
         mixer.input(Input::Sources(game.sound_sources()));
