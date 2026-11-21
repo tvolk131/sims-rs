@@ -8,16 +8,17 @@ control-panel cluster (`crates/sims-ui`) plus the reason the ratchet's
 `0816` scenes display `8:17` instead of `8:16`. Fixing the six UI
 discrepancies brings every control-panel pixel of `far-r0-cut-0816`
 outside the ratchet's blinking-pause-button mask
-(`leave_out = 86 554 98 565`, 72 pixels) — 100% of the clock prefix,
-family friends count, funds, speed button, help button, and curved alpha
-border — to an exact 16-bit 565 match with the original, leaving only
-the 49 pixels of the final digit `7` vs `6` (121 pixels unmasked).
+(`leave_out = 86 554 98 565`, 132 pixels hiding 72 differences) — 100%
+of the clock prefix, family friends count, funds, speed button, help
+button, and curved alpha border — to an exact 16-bit 565 match with the
+original, leaving only the 49 pixels of the final digit `7` vs `6` (121
+panel differences before applying the mask).
 
 ## Findings from the 1.91 binary
 
 - **Clock format (`0x5fe51e`, `0x6d84a4`):** The English formatter
   starts at `0x5fe51e`, selects the executable literals `"AM"`
-  (`0x6d84b0`) or `"PM"` (`0x6d84b4`), and formats the cluster clock
+  (`0x6d84b4`) or `"PM"` (`0x6d84b0`), and formats the cluster clock
   with `"%s %2u:%.2u"` (`0x6d84a4`: meridiem, width-2 space-padded
   12-hour value, colon, zero-padded minute). Single-digit hours
   therefore carry two spaces between the meridiem and the hour digit

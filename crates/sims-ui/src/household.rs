@@ -428,7 +428,7 @@ impl Snapshot {
     }
 
     /// The clock as the panel writes it (`0x5fe51e`, format `0x6d84a4`
-    /// `"%s %2u:%.2u"` with `"AM"`/`"PM"` at `0x6d84b0`/`0x6d84b4`):
+    /// `"%s %2u:%.2u"` with `"AM"` at `0x6d84b4` and `"PM"` at `0x6d84b0`):
     /// `AM  6:30` for single-digit hours and `PM 12:00` for two-digit hours.
     /// Midnight and noon are 12.
     pub fn clock(&self) -> String {
