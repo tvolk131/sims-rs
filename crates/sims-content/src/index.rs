@@ -354,6 +354,41 @@ impl MountedFiles {
         Ok(resources)
     }
 
+    /// Looks up `relative` (raw Windows-1252 bytes) under mounted `directory`,
+    /// matching how `0x5a3810` opens an `.ndx` entry's `dir + catalog.bcf`
+    /// through the virtual file system (`0x5b8f64` → `0x5b94ae`).
+    pub(crate) fn lookup(&self, directory: &str, relative: &[u8]) -> Result<Option<Resource>> {
+        let at = mount_key(directory)?;
+        let rel = key(relative);
+        let mut rel = rel.as_slice();
+        while let Some(rest) = rel.strip_prefix(b"\\") {
+            rel = rest;
+        }
+        let full = [at.as_slice(), rel].concat();
+        let split = full.iter().rposition(|&b| b == b'\\').map_or(0, |n| n + 1);
+        let (dir_key, name) = full.split_at(split);
+        let Some(entry) = self
+            .directories
+            .get(dir_key)
+            .and_then(|dir| dir.entries.get(name))
+        else {
+            return Ok(None);
+        };
+        Ok(match entry {
+            Entry::File(path) => Some(Resource {
+                mount: 0,
+                path: path.clone(),
+                member: None,
+            }),
+            Entry::Member(path, member) => Some(Resource {
+                mount: 0,
+                path: path.clone(),
+                member: Some(member.clone()),
+            }),
+            Entry::Directory | Entry::Archive => None,
+        })
+    }
+
     /// Gathers entries the way the original's directory scan does
     /// (0x5ba5d8): each entry the file system lists goes into its
     /// directory, a subdirectory is scanned as soon as it is reached, and

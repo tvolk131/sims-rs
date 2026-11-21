@@ -18,32 +18,62 @@ pub struct ImportWardrobe {
     pub(crate) textures: Vec<Vec<u8>>,
 }
 
+/// Mounted startup directories and the original's avatar search paths
+/// (`0x43ae81`, `0x5835ed`): `appearance` holds the folders scanned eagerly
+/// by `0x59f844`, `indexed` holds the folders whose `.ndx` catalogs are
+/// registered by `0x584562` → `0x5a0212` → `0x59fc48`.
+pub(crate) struct AvatarPaths {
+    pub(crate) files: MountedFiles,
+    pub(crate) appearance: Vec<String>,
+    pub(crate) indexed: Vec<String>,
+    pub(crate) texture_paths: Vec<String>,
+}
+
+/// Replays the startup file mounts (`0x43ae81`), download providers
+/// (`0x43bdc5`), texture paths (`0x414633`) and avatar search paths
+/// (`0x5835ed`). Shared by [`ImportWardrobe::load`] and
+/// [`crate::people::AvatarRegistry`].
+pub(crate) fn mount_avatar_paths(install: &Install) -> Result<AvatarPaths> {
+    let mut files = MountedFiles::default();
+    let root = &install.root;
+    for directory in ["GameData/Global", "GameData/Objects", Install::USER_OBJECTS] {
+        files.register(root, directory, true)?;
+    }
+    for (bit, directory, _) in Expansions::ALL {
+        if install.expansions.contains(bit) {
+            files.register(root, directory, true)?;
+        }
+    }
+    if install.expansions.0 > 3 {
+        files.register(root, "ExpansionShared", true)?;
+        files.register(root, "TemplateNPCs", false)?;
+    }
+    files.register(root, "Downloads", true)?;
+    let providers = download_providers(&files, root)?;
+    let mut texture_paths = texture_paths(&mut files, install)?;
+    for path in &providers {
+        files.register(&install.root, path, true)?;
+    }
+    texture_paths.extend(providers.iter().cloned());
+    let (appearance, indexed) = appearance_paths(&mut files, install, providers)?;
+    Ok(AvatarPaths {
+        files,
+        appearance,
+        indexed,
+        texture_paths,
+    })
+}
+
 impl ImportWardrobe {
     /// Replays the startup file tables (0x43ae81), avatar catalogs (0x5835ed)
     /// and texture cache (0x414633, 0x40895a).
     pub fn load(install: &Install) -> Result<Self> {
-        let mut files = MountedFiles::default();
-        let root = &install.root;
-        for directory in ["GameData/Global", "GameData/Objects", Install::USER_OBJECTS] {
-            files.register(root, directory, true)?;
-        }
-        for (bit, directory, _) in Expansions::ALL {
-            if install.expansions.contains(bit) {
-                files.register(root, directory, true)?;
-            }
-        }
-        if install.expansions.0 > 3 {
-            files.register(root, "ExpansionShared", true)?;
-            files.register(root, "TemplateNPCs", false)?;
-        }
-        files.register(root, "Downloads", true)?;
-        let providers = download_providers(&files, root)?;
-        let mut texture_paths = texture_paths(&mut files, install)?;
-        for path in &providers {
-            files.register(&install.root, path, true)?;
-        }
-        texture_paths.extend(providers.iter().cloned());
-        let (appearance, indexed) = appearance_paths(&mut files, install, providers)?;
+        let AvatarPaths {
+            files,
+            appearance,
+            indexed,
+            texture_paths,
+        } = mount_avatar_paths(install)?;
 
         // 0x59f844 loads all CMX before BCF. 0x584562 then adds the indexed
         // names, including entries whose catalog has yet to be opened.
@@ -288,11 +318,11 @@ fn appearance_paths(
 /// 0x5c1a7d walks the file map of each path in precedence order. Within
 /// each type the first occurrence of the same counted name and ID wins
 /// (0x5c11d6); the extension remains part of equality across types.
-fn resources(
+pub(crate) fn resources_with_dir(
     files: &MountedFiles,
     paths: &[String],
     extension: &[u8],
-) -> Result<Vec<(Vec<u8>, Resource)>> {
+) -> Result<Vec<(String, Vec<u8>, Resource)>> {
     let mut seen = BTreeSet::new();
     let mut result = Vec::new();
     for path in paths {
@@ -316,11 +346,22 @@ fn resources(
                 name = &prefix[end + 1..];
             }
             if seen.insert((name.to_vec(), identity)) {
-                result.push((name.to_vec(), source));
+                result.push((path.clone(), name.to_vec(), source));
             }
         }
     }
     Ok(result)
+}
+
+fn resources(
+    files: &MountedFiles,
+    paths: &[String],
+    extension: &[u8],
+) -> Result<Vec<(Vec<u8>, Resource)>> {
+    Ok(resources_with_dir(files, paths, extension)?
+        .into_iter()
+        .map(|(_, name, source)| (name, source))
+        .collect())
 }
 
 // The original's C-locale atoi reads one signed decimal prefix.

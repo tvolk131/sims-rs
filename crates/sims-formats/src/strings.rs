@@ -153,6 +153,9 @@ impl StringTable {
     }
 }
 /// Decode original game text bytes using the selected language's code page.
+/// Every byte is decoded in that code page without UTF-8 or UTF-16 BOM
+/// sniffing or stripping, matching [`crate::reader::western`] and the
+/// original's byte-exact string comparisons (such as `0x5a280f`).
 pub fn decode(bytes: &[u8], language: u8) -> String {
     use encoding_rs::*;
     let encoding = match language {
@@ -166,7 +169,7 @@ pub fn decode(bytes: &[u8], language: u8) -> String {
         20 => EUC_KR,
         _ => WINDOWS_1252,
     };
-    encoding.decode(bytes).0.into_owned()
+    encoding.decode_without_bom_handling(bytes).0.into_owned()
 }
 
 #[cfg(test)]
