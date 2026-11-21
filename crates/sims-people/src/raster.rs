@@ -317,9 +317,10 @@ impl Shade {
 }
 
 /// Draws one skinned part into `target` with each vertex's [`Shade`]
-/// given (one per vertex of the part's mesh). A grey shade goes to the
-/// target as it is; a coloured one lights each channel of the texel
-/// before it is written, with the target's own factor 1.
+/// given (one per vertex of the part's mesh). A grey shade goes to
+/// [`Target::write`]; a coloured shade goes to [`Target::write_coloured`]
+/// (whose default pre-lights each channel of the texel and calls
+/// [`Target::write`] with shade 1).
 pub fn draw_shaded<T: Target + ?Sized>(
     target: &mut T,
     part: &Part,
@@ -363,7 +364,7 @@ fn triangle<T: Target + ?Sized>(
     let grey = shade.iter().all(|s| matches!(s, Shade::Grey(_)));
     let (width, height) = target.size();
     let mut area = edge(p[0], p[1], p[2]);
-    if area.abs() <= 1e-8 || !area.is_finite() {
+    if area.abs() < 1e-8 || !area.is_finite() {
         return;
     }
     if area < 0.0 {
