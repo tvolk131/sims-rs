@@ -126,6 +126,8 @@ pub(crate) mod person {
     pub const POSTURE: usize = 0;
     /// Each 2000 takes one from the random selection count.
     pub const SELECTION: usize = 18;
+    /// The person's neighbor record ID (+0x5ca).
+    pub const NEIGHBOR: usize = 31;
     /// 0 for a member of the household that lives on the lot.
     pub const VISITOR: usize = 32;
     pub const PETS_OUTSIDE: usize = 34;
@@ -158,8 +160,10 @@ pub(crate) mod entry {
 /// Definition word 7: the interaction table's ID.
 const TABLE: usize = 7;
 /// Definition word 9: the object type. A person is 2; type 7 has no
-/// distance and no interactions with people.
+/// distance and no interactions with people; type 0xd is the hotel-key
+/// token 0x43e21a looks up.
 const TYPE: usize = 9;
+const HOTEL_KEY_TYPE: u16 = 0xd;
 
 /// Global 10: the lot's number.
 const LOT: usize = 10;
@@ -792,9 +796,12 @@ impl Machine<'_, '_> {
     /// - the target's data word 8 has bit 9 set, or its data word 25 is
     ///   above 0;
     /// - the person is a visitor, the entry lacks flag 1, and neither is
-    ///   the lot not residential with the entry's flag 0x20 set (a target
-    ///   of category 4 or 7 then asks the relationship, 0x41f660, which is
-    ///   not ported and fails);
+    ///   the lot not residential with the entry's flag 0x20 set, unless the
+    ///   target is of category 4 or 7 and the person's inventory (for
+    ///   person data word 31, created empty if absent, 0x42a8a1) holds a
+    ///   kind-0 token of the last registered type-0xd definition's GUID
+    ///   (0x43e21a, 0 if none) whose first match has a signed count above 0
+    ///   (0x41f660, 0x41f721);
     /// - by the person's age and kind, as [`Machine::autonomy_entries`].
     ///
     /// An entry still allowed has its advertisements copied over the one
@@ -828,20 +835,18 @@ impl Machine<'_, '_> {
         self.checked_person_mut(me)?.data[data::CHECKED] = 0;
         let target = &self.world.objects[&entry.target];
         let target_data = |index: usize| target.data.get(index).copied().unwrap_or(0);
+        let (target_flags, target_in_use, target_category) = (
+            target_data(data::FLAGS),
+            target_data(data::IN_USE),
+            target_data(data::CATEGORY),
+        );
         let mut allowed = true;
-        if target_data(data::FLAGS) & 0x200 != 0 || target_data(data::IN_USE) > 0 {
+        if target_flags & 0x200 != 0 || target_in_use > 0 {
             allowed = false;
         } else if record.flags & entry::VISITORS == 0 && chooser.visitor {
             let community = !chooser.residential && record.flags & entry::COMMUNITY != 0;
             if !community {
-                allowed = false;
-                if matches!(target_data(data::CATEGORY), 4 | 7) {
-                    return Err(Trap::Unsupported(
-                        "a visitor's entry on an object of category 4 or 7, which asks the \
-                         relationship (0x41f660)"
-                            .into(),
-                    ));
-                }
+                allowed = matches!(target_category, 4 | 7) && self.visitor_has_hotel_key(me)?;
             }
         }
         let flags = record.flags;
@@ -1079,6 +1084,45 @@ impl Machine<'_, '_> {
             .ok_or(Trap::native(10, "missing object"))
     }
 
+    /// The GUID of the last registered object definition of type 0xd
+    /// (0x43e21a), or 0 when the catalog has none.
+    ///
+    /// The original walks the definition registry's vector (+0x20,
+    /// 0x43ac3a) and keeps the last matching definition's GUID in a static
+    /// cache (0x6e4f5c, filled once while 0). Complete Collection registers
+    /// one such definition (`Token - Hotel Key`, 0x3ac022d6, in
+    /// `ExpansionPack4.far::Tokens.iff`); dynamically created characters
+    /// are people (type 2), so the catalog's order gives the same GUID.
+    fn hotel_key_guid(&self) -> u32 {
+        self.catalog
+            .objects
+            .iter()
+            .rev()
+            .find(|object| object.kind == HOTEL_KEY_TYPE)
+            .map_or(0, |object| object.guid)
+    }
+
+    /// Whether visitor `caller` holds a hotel-key token (kind 0, GUID from
+    /// [`Machine::hotel_key_guid`], first matching token's signed count
+    /// above 0) in the inventory of `caller`'s neighbor ID (person data
+    /// word 31, +0x5ca), creating an empty inventory for that ID if none
+    /// exists (0x42a8a1, 0x43e21a, 0x41f660, 0x41f721).
+    fn visitor_has_hotel_key(&mut self, caller: u16) -> Result<bool, Trap> {
+        let neighbor = self
+            .checked_person(caller)?
+            .person
+            .as_ref()
+            .ok_or(Trap::native(0x1c, "object is not a person"))?
+            .data
+            .get(person::NEIGHBOR)
+            .copied()
+            .unwrap_or(0);
+        let guid = self.hotel_key_guid();
+        Ok(self
+            .find_inventory_token(neighbor, 0, guid)
+            .is_some_and(|(_, count)| (count as i16) > 0))
+    }
+
     pub(crate) fn checked_person_mut(&mut self, id: u16) -> Result<&mut sims_sim::Object, Trap> {
         self.world
             .objects
@@ -1146,9 +1190,10 @@ impl Machine<'_, '_> {
     ///    autonomy's check, the target's data word 25 is not read.
     /// 4. The visitor rule and the rule by age and kind, as autonomy's
     ///    check ([`Machine::autonomy_allows`]): a visitor needs the
-    ///    entry's flag 1, or a lot that is not residential and the entry's
-    ///    flag 0x20, and a target of category 4 or 7 that would ask the
-    ///    relationship (0x41f660) fails loudly.
+    ///    entry's flag 1, a lot that is not residential with the entry's
+    ///    flag 0x20, or a target of category 4 or 7 together with the
+    ///    hotel-key token in the caller's inventory (0x42a8a1, 0x43e21a,
+    ///    0x41f660).
     /// 5. If it has not failed, the entry's check tree, if it has one,
     ///    decides: it runs synchronously on the person's stack with the
     ///    target as its stack object and the arguments 0, 0, 0, 0 (byte 0
@@ -1204,19 +1249,14 @@ impl Machine<'_, '_> {
         let kind = personal(person::KIND);
         let target_object = &self.world.objects[&target];
         let target_data = |index: usize| word(target_object, index).unwrap_or(0);
+        let (target_flags, target_category) =
+            (target_data(data::FLAGS), target_data(data::CATEGORY));
         let lot = self.world.globals.get(LOT).copied().unwrap_or(0);
-        let mut allowed = target_data(data::FLAGS) & 0x200 == 0;
+        let mut allowed = target_flags & 0x200 == 0;
         if allowed && record.flags & entry::VISITORS == 0 && visitor {
             let community = self.zoning(lot) != 1 && record.flags & entry::COMMUNITY != 0;
             if !community {
-                if matches!(target_data(data::CATEGORY), 4 | 7) {
-                    return Err(Trap::Unsupported(
-                        "a visitor's chosen action on an object of category 4 or 7, which asks \
-                         the relationship (0x41f660)"
-                            .into(),
-                    ));
-                }
-                allowed = false;
+                allowed = matches!(target_category, 4 | 7) && self.visitor_has_hotel_key(caller)?;
             }
         }
         let flags = record.flags;

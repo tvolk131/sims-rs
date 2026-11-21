@@ -105,17 +105,7 @@ impl Machine<'_, '_> {
                 })?
                 .guid;
         }
-        let inventories = &mut self.world.neighbors.inventories;
-        let place = match inventories.iter().position(|i| i.neighbor == neighbor) {
-            Some(place) => place,
-            None => {
-                inventories.push(Inventory {
-                    neighbor,
-                    items: Vec::new(),
-                });
-                inventories.len() - 1
-            }
-        };
+        let place = self.inventory_slot(neighbor);
         if operation == 0 {
             let temps = &self
                 .world
@@ -193,6 +183,41 @@ impl Machine<'_, '_> {
         temps[usize::from((flags >> 5) & 3)] = count;
         temps[usize::from((flags >> 11) & 3)] = index;
         Ok(index != -1)
+    }
+
+    /// The index in [`sims_sim::neighbors::Neighbors::inventories`] of
+    /// `neighbor`'s inventory, adding an empty one at the end when there is
+    /// none (0x42a8a1).
+    pub(crate) fn inventory_slot(&mut self, neighbor: i16) -> usize {
+        let inventories = &mut self.world.neighbors.inventories;
+        match inventories.iter().position(|i| i.neighbor == neighbor) {
+            Some(place) => place,
+            None => {
+                inventories.push(Inventory {
+                    neighbor,
+                    items: Vec::new(),
+                });
+                inventories.len() - 1
+            }
+        }
+    }
+
+    /// The index and count of the first token of `kind` and `guid` in
+    /// `neighbor`'s inventory (0x42a8a1, 0x41f660, 0x41f721), adding an
+    /// empty inventory at the end when the neighbor has none.
+    pub(crate) fn find_inventory_token(
+        &mut self,
+        neighbor: i16,
+        kind: i32,
+        guid: u32,
+    ) -> Option<(usize, u16)> {
+        let place = self.inventory_slot(neighbor);
+        self.world.neighbors.inventories[place]
+            .items
+            .iter()
+            .enumerate()
+            .find(|(_, item)| item.kind == kind && item.guid == guid)
+            .map(|(index, item)| (index, item.count))
     }
 
     /// The ID of the first neighborhood record whose linked definition has

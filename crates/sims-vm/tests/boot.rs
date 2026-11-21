@@ -869,6 +869,61 @@ fn the_pie_menu_on_another_goth_offers_to_join_what_i_run() {
     );
 }
 
+/// At tick 6000 of the Goth house, visitors (persons 24 and 26) are on the
+/// lot. Listing their pie menus on category 4 and 7 objects (objects 112,
+/// 113, 124–129 and 211–213) checks for `Token - Hotel Key` (type 0xd,
+/// 0x3ac022d6) in their neighbor-ID inventory (0x42a8a1, 0x43e21a,
+/// 0x41f660) instead of failing loudly, creating empty inventories if
+/// absent.
+#[test]
+fn a_goth_visitor_lists_category_4_and_7_objects_via_the_hotel_key_check() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut lot = Lot::load(&root, &house, &[3, 3], Frames::default()).unwrap();
+    while lot.ticks() < 6000 {
+        lot.step().unwrap_or_else(|e| panic!("{e}"));
+    }
+    let visitors: Vec<u16> = lot
+        .world()
+        .objects
+        .values()
+        .filter(|o| o.person.as_ref().is_some_and(|p| p.data[32] != 0))
+        .map(|o| o.id)
+        .collect();
+    assert!(
+        visitors.contains(&24) && visitors.contains(&26),
+        "visitors at 6000: {visitors:?}"
+    );
+    let targets = [112u16, 113, 124, 125, 126, 127, 128, 129, 211, 212, 213];
+    for &target in &targets {
+        assert!(
+            matches!(lot.world().objects[&target].data[59], 4 | 7),
+            "object {target} category {}",
+            lot.world().objects[&target].data[59]
+        );
+    }
+
+    for &visitor in &[24u16, 26] {
+        let neighbor = lot.world().objects[&visitor].person.as_ref().unwrap().data[31];
+        for &target in &targets {
+            lot.pie_menu(visitor, target)
+                .unwrap_or_else(|e| panic!("visitor {visitor} on {target}: {e}"));
+        }
+        assert!(
+            lot.world()
+                .neighbors
+                .inventories
+                .iter()
+                .any(|inv| inv.neighbor == neighbor),
+            "visitor {visitor} (neighbor {neighbor}) should have an inventory created by 0x42a8a1"
+        );
+    }
+}
+
 #[test]
 fn the_snack_order_pays_for_the_snack() {
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {

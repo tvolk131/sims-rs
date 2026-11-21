@@ -1709,3 +1709,221 @@ fn an_action_tree_run_at_once_names_nothing() {
         active
     );
 }
+
+/// On an object of category 4 or 7, a visitor checking an entry without
+/// flag 1 (and not a non-residential community entry) asks for a kind-0
+/// token of the last registered type-0xd definition's GUID in the
+/// caller's neighbor-ID inventory (0x42a8a1, 0x43e21a, 0x41f660,
+/// 0x41f721). Missing inventories are created empty, and only a first
+/// matching token with a positive signed count allows the entry.
+#[test]
+fn a_visitor_on_category_4_or_7_checks_the_hotel_key_inventory_token() {
+    use sims_sim::neighbors::{Inventory, Item};
+
+    const OLD_KEY: u32 = 0x1111_2222;
+    const KEY: u32 = 0x3ac0_22d6;
+    const NEIGHBOR: i16 = 42;
+
+    let setup = |category: i16, flags: u32, register_keys: &[u32]| {
+        let mut fx = menu_lot(vec![entry(3, flags)]);
+        fx.lamp_mut().data[59] = category;
+        let person = fx.sim_mut().person.as_mut().unwrap();
+        person.data[31] = NEIGHBOR;
+        person.data[32] = 1; // visitor
+        for &guid in register_keys {
+            fx.catalog.objects.push(sims_content::Object {
+                guid,
+                resource: 0,
+                chunk: 0,
+                kind: 0xd,
+                master: 0,
+            });
+        }
+        fx
+    };
+    let listed_menus = |fx: &mut Fixture| -> Vec<u32> {
+        let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        interpreter
+            .pie_menu(&mut fx.world, SIM, LAMP)
+            .unwrap_or_else(|f| panic!("{f}"))
+            .into_iter()
+            .map(|e| e.action.table_index as u32)
+            .collect()
+    };
+
+    // Categories 4 and 7 without an inventory: refused, and an empty
+    // inventory is appended for person data word 31 (0x42a8a1).
+    for category in [4, 7] {
+        let mut fx = setup(category, 0, &[KEY]);
+        assert!(fx.world.neighbors.inventories.is_empty());
+        assert_eq!(listed_menus(&mut fx), Vec::<u32>::new());
+        assert_eq!(
+            fx.world.neighbors.inventories,
+            vec![Inventory {
+                neighbor: NEIGHBOR,
+                items: Vec::new(),
+            }]
+        );
+    }
+
+    // With the token (kind 0, count > 0), both category 4 and 7 allow it.
+    for category in [4, 7] {
+        let mut fx = setup(category, 0, &[KEY]);
+        fx.world.neighbors.inventories.push(Inventory {
+            neighbor: NEIGHBOR,
+            items: vec![Item {
+                kind: 0,
+                guid: KEY,
+                count: 1,
+            }],
+        });
+        assert_eq!(listed_menus(&mut fx), vec![3]);
+    }
+
+    // Other categories never consult or create the inventory.
+    let mut fx = setup(5, 0, &[KEY]);
+    assert_eq!(listed_menus(&mut fx), Vec::<u32>::new());
+    assert!(fx.world.neighbors.inventories.is_empty());
+
+    // Wrong kind, signed count <= 0 (0 or 0x8000), or a first matching
+    // item with count 0 ahead of a positive duplicate all refuse.
+    for items in [
+        vec![Item {
+            kind: 1,
+            guid: KEY,
+            count: 1,
+        }],
+        vec![Item {
+            kind: 0,
+            guid: KEY,
+            count: 0,
+        }],
+        vec![Item {
+            kind: 0,
+            guid: KEY,
+            count: 0x8000,
+        }],
+        vec![
+            Item {
+                kind: 0,
+                guid: KEY,
+                count: 0,
+            },
+            Item {
+                kind: 0,
+                guid: KEY,
+                count: 2,
+            },
+        ],
+    ] {
+        let mut fx = setup(4, 0, &[KEY]);
+        fx.world.neighbors.inventories.push(Inventory {
+            neighbor: NEIGHBOR,
+            items,
+        });
+        assert_eq!(listed_menus(&mut fx), Vec::<u32>::new());
+    }
+
+    // Multiple type-0xd definitions: 0x43e21a keeps the last registered.
+    let mut fx = setup(4, 0, &[OLD_KEY, KEY]);
+    fx.world.neighbors.inventories.push(Inventory {
+        neighbor: NEIGHBOR,
+        items: vec![Item {
+            kind: 0,
+            guid: OLD_KEY,
+            count: 1,
+        }],
+    });
+    assert_eq!(listed_menus(&mut fx), Vec::<u32>::new());
+    fx.world.neighbors.inventories[0].items.push(Item {
+        kind: 0,
+        guid: KEY,
+        count: 1,
+    });
+    assert_eq!(listed_menus(&mut fx), vec![3]);
+
+    // With no type-0xd definition in the catalog, 0x43e21a returns 0, so
+    // a kind-0 token of GUID 0 matches.
+    let mut fx = setup(4, 0, &[]);
+    fx.world.neighbors.inventories.push(Inventory {
+        neighbor: NEIGHBOR,
+        items: vec![Item {
+            kind: 0,
+            guid: 0,
+            count: 1,
+        }],
+    });
+    assert_eq!(listed_menus(&mut fx), vec![3]);
+
+    // The inventory lookup runs before the age/kind check (0x458443):
+    // a child on a NOT_CHILD entry still creates the empty inventory, and
+    // holding the key still fails age/kind.
+    let mut fx = setup(4, 0x10, &[KEY]);
+    fx.sim_mut().person.as_mut().unwrap().data[58] = 9;
+    assert_eq!(listed_menus(&mut fx), Vec::<u32>::new());
+    assert_eq!(fx.world.neighbors.inventories.len(), 1);
+    fx.world.neighbors.inventories[0].items.push(Item {
+        kind: 0,
+        guid: KEY,
+        count: 1,
+    });
+    assert_eq!(listed_menus(&mut fx), Vec::<u32>::new());
+
+    // Flags that short-circuit before the visitor category check (word 8
+    // bit 9, entry::VISITORS, or non-residential entry::COMMUNITY) do not
+    // create an inventory.
+    let mut fx = setup(4, 0, &[KEY]);
+    fx.lamp_mut().data[8] |= 0x200;
+    assert_eq!(listed_menus(&mut fx), Vec::<u32>::new());
+    assert!(fx.world.neighbors.inventories.is_empty());
+
+    let mut fx = setup(4, 1, &[KEY]);
+    assert_eq!(listed_menus(&mut fx), vec![3]);
+    assert!(fx.world.neighbors.inventories.is_empty());
+
+    let mut fx = setup(4, 0x20, &[KEY]);
+    fx.world.globals[10] = 21;
+    fx.program.zoning.insert(21, 2);
+    assert_eq!(listed_menus(&mut fx), vec![3]);
+    assert!(fx.world.neighbors.inventories.is_empty());
+
+    // Highlight (`autonomy_allows`) uses the same rule, and skips it when
+    // the target is in use (data word 25 > 0).
+    let mut fx = setup(7, 0, &[KEY]);
+    let (action, _) = {
+        let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        interpreter
+            .menu_action(&mut fx.world, SIM, LAMP, 3)
+            .unwrap()
+    };
+    fx.lamp_mut().data[25] = 1;
+    let out = {
+        let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        interpreter
+            .highlight(&mut fx.world, SIM, action.clone())
+            .unwrap()
+    };
+    assert_eq!(out.flags & 8, 0);
+    assert!(fx.world.neighbors.inventories.is_empty());
+
+    fx.lamp_mut().data[25] = 0;
+    let out = {
+        let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        interpreter
+            .highlight(&mut fx.world, SIM, action.clone())
+            .unwrap()
+    };
+    assert_eq!(out.flags & 8, 0);
+    assert_eq!(fx.world.neighbors.inventories.len(), 1);
+
+    fx.world.neighbors.inventories[0].items.push(Item {
+        kind: 0,
+        guid: KEY,
+        count: 1,
+    });
+    let out = {
+        let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        interpreter.highlight(&mut fx.world, SIM, action).unwrap()
+    };
+    assert_eq!(out.flags & 8, 8);
+}
