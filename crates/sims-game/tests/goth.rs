@@ -5043,10 +5043,11 @@ fn pie_submenu_keeps_parent_head_frozen_and_draws_submenu_labels_above_it() {
 /// The pie head submits into the house's final 3D pass with `D3DCMP_LESSEQUAL`
 /// depth testing (`0x4a9500`, `0x5ce959`–`0x5ce977`, `0x4623f5`–`0x462414`
 /// placing the head origin at `z_screen = 0.5 * ((3000 + 10) << zoom)`). At
-/// Near zoom, Mortimer's neutral head spans depths ~11,833–12,147, so nearer
-/// foreground scene geometry (e.g. grass at depth 8,703) occludes the head,
-/// mid-head depth (12,040) clips only the farther half, and deeper/empty
-/// geometry lets the entire head draw and write its depths.
+/// Near zoom, Mortimer's neutral head's visible front-facing pixels span depths
+/// ~11,833–12,049, so nearer foreground scene geometry (e.g. grass at depth
+/// 8,703) occludes the head, the midpoint of those visible bounds clips only
+/// the farther half, and deeper/empty geometry lets the entire head draw and
+/// write its depths.
 #[test]
 fn pie_head_respects_house_depth_buffer_lessequal() {
     let Some(install) = install() else {

@@ -536,8 +536,8 @@ fn flamingo_pie_head_is_not_cropped_by_the_face_bitmap() {
     let far_down_opaque = count_opaque(&far_down.canvas.rgba);
     let near_down_opaque = count_opaque(&near_down.canvas.rgba);
     assert_eq!(near_down_opaque, 9_381);
-    assert_eq!(far_down_opaque, 8_984);
-    assert!(near_down_opaque - far_down_opaque == 397);
+    assert_eq!(far_down_opaque, 8_909);
+    assert_eq!(near_down_opaque - far_down_opaque, 472);
 
     // Near the bottom of an 800×500 viewport, the viewport boundary clips the
     // mesh cleanly instead of overflowing.

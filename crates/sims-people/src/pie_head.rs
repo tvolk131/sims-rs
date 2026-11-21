@@ -42,7 +42,7 @@
 use crate::appearance::Body;
 use crate::lot::Packed565;
 use crate::math::{Transform, Vec3};
-use crate::raster::{Canvas, Shade, Target, draw_shaded};
+use crate::raster::{Canvas, Shade, Target, draw_shaded_culled};
 use crate::rig;
 use crate::skin::skin;
 use std::f32::consts::{FRAC_PI_2, FRAC_PI_6, PI, SQRT_2};
@@ -333,7 +333,13 @@ impl Target for ViewportPieTarget<'_> {
         let Some(ly) = y.checked_sub(self.origin.1) else {
             return false;
         };
-        self.canvas.passes(lx, ly, z)
+        let Some(idx) = (ly as usize)
+            .checked_mul(self.canvas.width as usize)
+            .and_then(|row| row.checked_add(lx as usize))
+        else {
+            return false;
+        };
+        self.depth.get(idx).is_some_and(|&d| (z as i32) <= d)
     }
 
     fn write(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], s: f32) {
@@ -346,11 +352,20 @@ impl Target for ViewportPieTarget<'_> {
         let Some(ly) = y.checked_sub(self.origin.1) else {
             return;
         };
-        if !self.canvas.passes(lx, ly, z) {
+        let Some(idx) = (ly as usize)
+            .checked_mul(self.canvas.width as usize)
+            .and_then(|row| row.checked_add(lx as usize))
+        else {
+            return;
+        };
+        let zi = z as i32;
+        let Some(slot) = self.depth.get_mut(idx) else {
+            return;
+        };
+        if zi > *slot {
             return;
         }
-        let idx = ly as usize * self.canvas.width as usize + lx as usize;
-        self.depth[idx] = z as i32;
+        *slot = zi;
         let lit = |c: u8| (f32::from(c) * s + 0.5).clamp(0.0, 255.0) as u8;
         let [r, g, b, a] = texel;
         self.canvas
@@ -434,9 +449,9 @@ pub fn draw_body(body: &Body, size: [u32; 2], look: Look) -> Result<Canvas, Stri
         let proj = |p| project(p, origin, pitch, yaw);
         if part.texture_name.is_some() {
             let mut packed = Packed565(&mut target);
-            draw_shaded(&mut packed, part, skinned, &shade, proj);
+            draw_shaded_culled(&mut packed, part, skinned, &shade, proj);
         } else {
-            draw_shaded(&mut target, part, skinned, &shade, proj);
+            draw_shaded_culled(&mut target, part, skinned, &shade, proj);
         }
     }
     Ok(canvas)
@@ -532,9 +547,9 @@ pub fn draw_body_in_viewport(
         };
         if part.texture_name.is_some() {
             let mut packed = Packed565(&mut target);
-            draw_shaded(&mut packed, part, skinned, &shade, proj);
+            draw_shaded_culled(&mut packed, part, skinned, &shade, proj);
         } else {
-            draw_shaded(&mut target, part, skinned, &shade, proj);
+            draw_shaded_culled(&mut target, part, skinned, &shade, proj);
         }
     }
     Ok(DrawnHead {

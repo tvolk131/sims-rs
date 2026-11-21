@@ -67,11 +67,12 @@ and pie labels (`0x5eb04c`).
   house-viewport coordinates, clipping to the active house viewport and the
   native Direct3D 6 orthographic near/far frustum `[0.0, 65535.0]` for the
   current zoom at `0x49b506`, `0x4623f5`–`0x462414`, `0x49b56d`, and recording
-  per-pixel 16-bit screen depths so oversized headwear such as the stock
-  Flamingo hat is never cropped to the 201×201 face bitmap while still matching
-  near-plane clipping and `D3DCMP_LESSEQUAL` house depth testing at `0x4a9500`,
-  `0x5ce959`–`0x5ce977`), exposed on `sims_people::People::pie_head` and
-  `pie_head_in_viewport`.
+  per-pixel 16-bit screen depths with `D3DCULL_CCW` back-face culling
+  (`0x49b097`, `0x5ce97d`–`0x5ce989`) and 16-bit `D3DCMP_LESSEQUAL` depth
+  testing (`0x4a9500`, `0x5ce959`–`0x5ce977`) so oversized headwear such as the
+  stock Flamingo hat is never cropped to the 201×201 face bitmap while still
+  matching near-plane clipping, back-face culling, and house depth occlusion),
+  exposed on `sims_people::People::pie_head` and `pie_head_in_viewport`.
 - `sims_ui::pie::Pie::draw` draws `head` only once on `layouts[0]` so submenus
   do not duplicate the head.
 - `sims_game::menu::Menu` tracks `head_look` (freezing the parent look while a
