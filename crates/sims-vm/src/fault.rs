@@ -194,6 +194,7 @@ impl Fault {
         }
         match self.trap {
             Trap::Unsupported(message) => Trap::Unsupported(format!("{message} (in {place})")),
+            trap if trap.unported() => Trap::Unsupported(format!("{trap} (in {place})")),
             trap => Trap::Invalid(format!("{place}: {trap}")),
         }
     }
@@ -262,5 +263,21 @@ mod tests {
         }
         .unsupported_in("Grab");
         assert!(matches!(&twice, Trap::Within { .. }) && !twice.unported());
+
+        // Framed Unimplemented and UnsupportedScope stay unported through `nested`.
+        for trap in [
+            Trap::Unimplemented { opcode: 34 },
+            Trap::UnsupportedScope { scope: 38 },
+        ] {
+            let fault = Fault {
+                object: 3,
+                at: Some(Location {
+                    tree: 0x1002,
+                    node: 1,
+                }),
+                trap,
+            };
+            assert!(fault.nested(5).unported());
+        }
     }
 }

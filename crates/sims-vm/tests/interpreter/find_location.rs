@@ -343,8 +343,9 @@ fn mode_2_uses_local_reference_with_flag_0_and_ignores_search_flags_and_graphics
         obj.data[42] = 2 | 0x200;
     }
     assert_eq!(find_in_front(&mut fx, SIM as i16, occupant, 1), Ok(true));
+    // Search's unmarked filter (flag bit 2) reads ground array 8 (0x434b57).
     let cell = (3 * 64 + 2) as usize;
-    fx.world.arrays.get_mut(&108).unwrap().data[cell] |= 0x20;
+    fx.world.arrays.get_mut(&8).unwrap().data[cell] |= 0x20;
 
     // First verify mode 0 actually traps on 0x433bb3 for this same OBJD word 102.
     let check_mode_0 = widget(&mut fx);
@@ -719,7 +720,8 @@ fn mode_2_reads_reference_level_again_after_fits_and_preserves_callback_error_ki
     assert_eq!(fx.world.objects[&target].position, [56, 40, 2]);
 
     // If function 5 takes the explicit error branch (253), mode 2 propagates
-    // it via `Fault::nested` so `trap.unported()` stays false.
+    // it via `Fault::nested` so `trap.unported()` stays false; unimplemented
+    // opcodes and unsupported scopes stay `unported() == true`.
     fx.add(file, 4098, tree(vec![ins(2, ERROR, ERROR, [0; 8])]));
     assert_eq!(find(&mut fx, LAMP as i16, reference, 1 | 2), Ok(true));
     let failing = widget(&mut fx);
@@ -728,6 +730,25 @@ fn mode_2_reads_reference_level_again_after_fits_and_preserves_callback_error_ki
         !err.unported(),
         "callback script error marked unported: {err}"
     );
+    for (label, node) in [
+        ("unimplemented", ins(34, RETURN_TRUE, RETURN_FALSE, [0; 8])),
+        (
+            "unsupported scope",
+            ins(
+                2,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                expr(38, 0, op::EQUAL, scope::LITERAL, 0),
+            ),
+        ),
+    ] {
+        fx.add(file, 4098, tree(vec![node]));
+        let err = trap(find_in_front(&mut fx, reference as i16, failing, 1));
+        assert!(
+            err.unported(),
+            "callback {label} lost unported classification: {err}"
+        );
+    }
 }
 
 #[test]
