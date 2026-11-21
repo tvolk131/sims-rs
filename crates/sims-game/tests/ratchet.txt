@@ -1,0 +1,49 @@
+# The screenshot ratchet's scenes (tests/ratchet.rs reads them). Each
+# `[name]` opens a scene; then one `key = value` line each:
+#
+# - about: what the screenshot shows;
+# - tick: our tick, the lot's ticks since the load;
+# - zoom (far, medium or near), rotation, level, origin (the camera's,
+#   x then y) and walls (up, cutaway or down);
+# - paused and strip: whether the original was paused and its panel's
+#   strip open (yes or no);
+# - original: the screenshot's file in SIMS_RATCHET and its SHA-256;
+# - ours: the SHA-256 of our frame's 8-bit colours;
+# - leave_out: a rectangle (left, top, right, bottom; right and bottom
+#   outside it) and why it is left out, one line each;
+# - floors: for each class, the share of pixels that must match, in
+#   percent.
+
+[near-r2-0712-bench]
+about = 7:12 AM, paused. Mortimer reads on the bench; walls down. Scroll (592, -2018).
+tick = 1260
+zoom = near
+rotation = 2
+level = 1
+origin = 591 -2018
+walls = down
+paused = yes
+strip = no
+original = near-r2-0712-bench.ppm e98009dc08b82ded9c9b3a6cf2f326da330d7c2a5aa1463b87c55ae39f309b8d
+ours = c9ecff57994277498bfafa7d7e73e33539401f4c8d605abf03c1c1f81f78da96
+leave_out = 302 19 501 79 the original's pause notice, drawn for the screenshot; ours draws none
+leave_out = 388 142 414 204 the plumb bob, which spins
+leave_out = 748 88 800 195 the fish tank, whose fish swim
+floors = frame 96.51 surface 98.65 objects 92.34 people 17.16 panel 97.33
+
+[near-r2-0805]
+about = 8:05 AM, paused. Mortimer stands by the stairs, Bella sits on the sofa; walls down. Scroll (280, -2004).
+tick = 2854
+zoom = near
+rotation = 2
+level = 1
+origin = 279 -2004
+walls = down
+paused = yes
+strip = no
+original = near-r2-0805.ppm 79d158bc9f10d5eb633c5e433656266cd55bc6de45c4b7ff2b75af9f75384704
+ours = 6035d8657db213fef1f69ddaec3d3fc8ec6d83cf944f28f6b0b7274334438738
+leave_out = 302 19 501 79 the original's pause notice, drawn for the screenshot; ours draws none
+leave_out = 424 106 450 166 the plumb bob, which spins
+leave_out = 440 100 508 212 the fish tank, whose fish swim
+floors = frame 95.39 surface 98.13 objects 93.05 people 14.13 panel 96.79
