@@ -43,23 +43,16 @@ fn hour_change_with_still_camera_updates_the_night_loop() {
         s.lot = 5;
         s
     };
-    // Enter live mode at 18:00 (daytime), then stop the ambience score
-    // and neighbourhood music with StopAll so every sound heard comes
-    // solely from `nite_loop`.
+    // Enter live mode via the same helper the window sends on launch
+    // (`sound::enter_live`), then stop the ambience score and
+    // neighbourhood music with StopAll so every sound heard comes solely
+    // from `nite_loop`.
     mixer.input(Input::Sources(snap(18)));
     mixer.input(Input::View(0));
     mixer.input(Input::Hour(18));
-    mixer.input(Input::Events(vec![
-        SoundEvent::Play {
-            object: 0,
-            name: "bkground_nhood1".into(),
-        },
-        SoundEvent::Play {
-            object: 0,
-            name: "bkground_live".into(),
-        },
-        SoundEvent::StopAll,
-    ]));
+    let mut events = sims_game::sound::enter_live();
+    events.push(SoundEvent::StopAll);
+    mixer.input(Input::Events(events));
     mixer.input(Input::Camera);
     assert!(mixer.render(RATE as usize).iter().all(|&s| s == 0));
 

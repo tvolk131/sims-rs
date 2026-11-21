@@ -3399,14 +3399,22 @@ fn kind_25_off_pauses_all_ambience_scores_in_live_mode_only() {
     assert!(player.score(0).unwrap().is_paused());
     assert!(player.score(1).unwrap().is_paused());
 
-    // Kind 25 on while paused does NOT unpause either score; while
-    // unpaused it unpauses ONLY the current score (+0x100, 0x573ca1),
-    // leaving score 1 paused.
+    // Kind 25 on while paused does NOT unpause either score (0x573c8e).
     player.handle(&SoundEvent::Pause, &day);
     player.set_active(true, &day);
     assert!(player.score(0).unwrap().is_paused());
     assert!(player.score(1).unwrap().is_paused());
+
+    // Unpause, then pause both scores again via kind 25 off while unpaused;
+    // kind 25 on while unpaused resumes ONLY the current score (+0x100,
+    // 0x573ca1), leaving non-current score 1 paused.
     player.handle(&SoundEvent::Unpause, &day);
+    assert!(!player.score(0).unwrap().is_paused());
+    assert!(player.score(1).unwrap().is_paused());
+    player.set_active(false, &day);
+    assert!(player.score(0).unwrap().is_paused());
+    assert!(player.score(1).unwrap().is_paused());
+    player.set_active(true, &day);
     assert!(!player.score(0).unwrap().is_paused());
     assert!(player.score(1).unwrap().is_paused());
 
@@ -3916,24 +3924,103 @@ fn muted_group_refuses_start_so_beach_loop_starts_after_unmuting() {
     let out = player.render_stereo(BLOCK * 4, &day);
     assert!(*out.iter().max().unwrap() > 3500, "{out:?}");
 
-    // Group 0 is never refused even when group_volumes[0] is 0 (0x57d979).
-    player.set_group_volume(0, 0);
-    player.handle(
+    // Group 0 is never refused even when group_volumes[0] is 0 (0x57d979):
+    // test on a fresh player so BeachLoop cannot mask the result.
+    let mut map2 = BTreeMap::new();
+    map2.insert(
+        "one.xa".to_owned(),
+        Pcm {
+            rate: RATE,
+            channels: 1,
+            samples: vec![4000; RATE as usize],
+        },
+    );
+    let module2 = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+    let mut solo = Player::new(vec![module2], map2, 1);
+    solo.set_group_volume(0, 0);
+    solo.handle(
         &SoundEvent::Play {
             object: 0,
             name: "e20".into(),
         },
         &day,
     );
-    player.set_group_volume(0, 1024);
+    assert!(solo.render_stereo(BLOCK * 2, &day).iter().all(|&s| s == 0));
+    solo.set_group_volume(0, 1024);
     // Track 20 was already started while group 0 was 0, so raising its
     // volume makes it audible without a second start.
     assert!(
-        player
-            .render_stereo(BLOCK * 2, &day)
+        solo.render_stereo(BLOCK * 2, &day)
             .iter()
             .any(|&s| s > 3500)
     );
+}
+
+#[test]
+fn muted_kind_1_still_places_and_releases_an_already_held_track() {
+    let mut map = BTreeMap::new();
+    map.insert(
+        "one.xa".to_owned(),
+        Pcm {
+            rate: RATE,
+            channels: 1,
+            samples: vec![4000; RATE as usize],
+        },
+    );
+    let looping: &[u8] = &[2, 5, WAIT_SAMP, 14];
+    let (hit, addresses) = assemble(&[looping]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         [Track]\n\
+         10=0,sfx_loop,1024,2,0,1,0,0x100,1\n\
+         [EventMapping]\n\
+         e0=1,10\n",
+        addresses[0]
+    );
+    let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+    let mut player = Player::new(vec![module], map, 1);
+    let center = on_lot(&[(9, 400)]);
+    let right = on_lot(&[(9, 800)]);
+
+    // Start track 10 (group 1) at center, then hold it with a pause.
+    play_on(&mut player, 9, &center);
+    assert!(
+        player
+            .render_stereo(BLOCK * 2, &center)
+            .iter()
+            .any(|&s| s > 3500)
+    );
+    player.handle(&SoundEvent::Pause, &center);
+    assert!(
+        player
+            .render_stereo(BLOCK * 2, &center)
+            .iter()
+            .all(|&s| s == 0)
+    );
+
+    // Mute group 1, then play track 10 again at the right edge while still
+    // paused: start() returns early at 0x57d9a5, but kind 1 still places it
+    // (0x57379a..0x5737a4) and calls let_go (0x5737ab -> 0x57dc68), clearing
+    // its hold.
+    player.set_group_volume(1, 0);
+    play_on(&mut player, 9, &right);
+    assert!(
+        player
+            .render_stereo(BLOCK * 2, &right)
+            .iter()
+            .all(|&s| s == 0)
+    );
+
+    // Unmuting group 1 (without unpausing!) makes the released track audible
+    // immediately at its updated right-edge placement (right > left).
+    player.set_group_volume(1, 1024);
+    let out = player.render_stereo(BLOCK * 2, &right);
+    let [left, right_ch] = [out[out.len() - 2], out[out.len() - 1]];
+    assert!(left > 0 && right_ch > left, "{left} {right_ch}");
 }
 
 #[test]

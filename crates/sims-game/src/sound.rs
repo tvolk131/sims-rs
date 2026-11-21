@@ -254,6 +254,22 @@ pub fn speed_register(speed: Speed) -> i32 {
     }
 }
 
+/// The sound events the window sends when opening a residential lot
+/// directly into live mode: neighbourhood mode (`bkground_nhood1`,
+/// unlocking music mode tracking as entering from the neighbourhood
+/// does), backyard ambience (`setambience_backyard`), and live mode
+/// (`bkground_live`, `0x4ce6d2`, starting backyard ambience and the day
+/// and night loop `0x574978`).
+pub fn enter_live() -> Vec<SoundEvent> {
+    ["bkground_nhood1", "setambience_backyard", "bkground_live"]
+        .into_iter()
+        .map(|name| SoundEvent::Play {
+            object: 0,
+            name: name.into(),
+        })
+        .collect()
+}
+
 /// The sound player's event for one of the simulation's. The
 /// simulation's object ID is 16 bits, as the script named it; it is
 /// widened without its sign, so -1 is 65535 (which the original passes is

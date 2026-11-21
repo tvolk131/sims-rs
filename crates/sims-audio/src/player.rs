@@ -1712,28 +1712,19 @@ impl<S: Samples> Player<S> {
     }
 
     /// *(code)* Writes a placement's `extvol` (0x57d57a) then `pan`
-    /// (0x57d5a0) to the threads a start started or let go, as the start
-    /// left them pointing at themselves: the comparison flags are the
-    /// pan's. Also updates any playing notes of those threads at once,
-    /// matching the original's immediate voice update (0x57df13 →
-    /// 0x57f759). With no placement both stay as they were.
+    /// (0x57d5a0) to the threads a start started, refreshed or left
+    /// running (when a muted group returned early at `0x57d9a5`, `target`
+    /// was not reset, so the write still follows `target` as `0x57de57`
+    /// does; otherwise the start pointed `target` back at itself). Also
+    /// updates any playing notes of the written thread at once, matching
+    /// the original's immediate voice update (0x57df13 → 0x57f759). With
+    /// no placement both stay as they were.
     fn place(&mut self, threads: &[u32], placed: Option<(i32, i32)>) {
         let Some((vol, pan)) = placed else {
             return;
         };
-        let mut updated = Vec::new();
-        for thread in self.threads.iter_mut().filter(|t| threads.contains(&t.id)) {
-            thread.registers[usize::from(EXTVOL)] = vol;
-            thread.registers[usize::from(PAN)] = pan;
-            thread.kept = i64::from(pan);
-            updated.push(thread.clone());
-        }
-        for thread in updated {
-            let levels = self.levels(&thread);
-            for note in self.notes.iter_mut().filter(|n| n.thread == thread.id) {
-                note.gains = levels.gains;
-                note.step = step(levels.rate);
-            }
+        for &id in threads {
+            self.place_through(id, vol, pan);
         }
     }
 
@@ -2469,7 +2460,10 @@ impl<S: Samples> Player<S> {
     ///
     /// *(code)* When the track's nonzero group has volume 0 (manager
     /// lookup `0x57bde7`, its `+0xc0 == 0`), the start returns at once
-    /// without starting, refreshing or restarting (`0x57d969`..`0x57d9a5`).
+    /// without starting, refreshing or restarting (`0x57d969`..`0x57d9a5`);
+    /// any already-running thread of the track is still returned so the
+    /// caller can apply placement and `let_go` (which clears hold at
+    /// `0x57dc68`) as the original's callers do.
     fn start(&mut self, args: [u32; 3], track: u32) -> Started {
         let Some(module) = self.owner(track) else {
             self.no_track(track);
@@ -2478,7 +2472,16 @@ impl<S: Samples> Player<S> {
         let owner = &self.modules[module];
         let group = owner.number(&owner.hot.tracks[&track].group).unwrap_or(0);
         if group != 0 && self.group_volumes.get(&group).copied().unwrap_or(1024) == 0 {
-            return Started::default();
+            let existing: Vec<u32> = self
+                .threads
+                .iter()
+                .filter(|t| t.track == track)
+                .map(|t| t.id)
+                .collect();
+            return Started {
+                threads: existing,
+                fresh: false,
+            };
         }
         if self.held.remove(&track) {
             let resumed = self.resume_held(args, track);
@@ -2628,6 +2631,7 @@ impl<S: Samples> Player<S> {
         for &id in threads {
             let order = self.last_in_order();
             if let Some(thread) = self.threads.iter_mut().find(|t| t.id == id) {
+                self.held.remove(&thread.track);
                 thread.wake = now;
                 thread.order = order;
             }

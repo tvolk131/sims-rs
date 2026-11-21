@@ -124,11 +124,17 @@ the "Not ported" note in
   `place_through` immediately update the written thread's playing notes'
   gains (`0x57df13` → `0x57f759`).
 - `Player::start` rejects starts whose nonzero group has volume `0`
-  (`0x57d969`..`0x57d9a5`).
+  (`0x57d969`..`0x57d9a5`), returning any already-running thread so
+  callers still apply placement (following `target`) and `let_go`
+  (clearing hold at `0x57dc68`).
 - `Player::update_day_night` (`0x574978`, counting ended notes as still
   playing until gone) and `Player::unpause_music` (`0x575155`) run from
   the exact call sites above (`camera_moved`, `set_music_mode`, `pause`,
   `unpause`, `set_active`).
+- `sims_game::sound::enter_live()` sends `bkground_nhood1`,
+  `setambience_backyard` and `bkground_live` (`0x4ce6d2`) when the
+  window opens a residential lot directly into live mode, so backyard
+  ambience and the day and night loop run in normal launches.
 - `sims_game::sound::Mixer::input(Input::Hour)` runs `camera_moved` when
   the hour changes after its initial value (`0x46d4d3` →
   `0x4f66bc`..`0x4f66c6`), and `sims-game`'s main loop sends
@@ -146,6 +152,11 @@ the "Not ported" note in
   whereas the original's sound timer (`0x572fc3` passing `0x14` = 20 ms
   to `0x5edc57`) fires nominally every 20 ms (~2 seconds for 100
   callbacks).
+- **Not ported:** top-level `end` while a note plays (`0x57edcc`,
+  tracked separately): `day_night_playing` prevents overlapping or
+  leaking a replacement `note_on; end` loop script's ended note, but
+  such a note still plays at its last gain until it ends or is cut on
+  switch rather than fading out at `end` as the original does.
 - **Not ported:** `Player::set_group_volume` does not run `0x574978`
   (kind 37 in the original does, at `0x5740f4`; kind 37 remains in
   `kind::NOT_PORTED`, and `set_group_volume` takes no `Sources`). Once
