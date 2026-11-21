@@ -1,9 +1,7 @@
 //! Draws a lot: terrain, floors, walls and objects, level by level.
 
 use crate::assets::{Assets, Definition};
-#[cfg(test)]
-use crate::camera::Zoom;
-use crate::camera::{self, Camera, Walls};
+use crate::camera::{self, Camera, Walls, Zoom};
 use crate::canvas::{Canvas, Image};
 use crate::caps::{self, Cap, Corners, Line, solid};
 use crate::cutaway::{self, Mask};
@@ -1058,13 +1056,10 @@ impl<'a> Painter<'a> {
                 // `0x53c4fa`) comes from the standing walls' set; lone 0x10
                 // sits a little higher when zoomed in. Non-record wall-run cut
                 // trims always take the depth-sprite cut set (`0x53e2fa`–
-                // `0x53e362`).
+                // `0x53e362`), with runs along view `(1, 1)` (`bits & 0x50`)
+                // lifted by `2 >> (3 - zoom)` (`0x53e300`–`0x53e313`).
                 let diagonal = is_cut && c.record && bits & 0x50 != 0;
-                let lift = if diagonal && bits == 0x10 {
-                    [0, 2, 5][zoom.index()]
-                } else {
-                    0
-                };
+                let lift = trim_lift(is_cut, c.record, bits, zoom);
                 let set = is_cut && !diagonal;
                 let flat_offset = flat_trim_offset(is_cut, c.record, bits, level);
                 // The original subtracts one more pixel from x; its corner
@@ -1633,6 +1628,29 @@ fn draw_grass_tile(
                 canvas.plot(bx, row, depth, color);
             }
         }
+    }
+}
+
+/// Extra upward screen lift in pixels for diagonal cut wall trims:
+/// - Corner records with lone bit `0x10` (`0x53c47a`–`0x53c496`): `[0, 2, 5]`
+///   at far, medium, and near zoom.
+/// - Non-record wall-run cut trims along view `(1, 1)` (`bits & 0x50 != 0`,
+///   `0x53e300`–`0x53e313`): `2 >> (3 - zoom)` = `[0, 1, 2]` before `0x4c8b1f`.
+/// - All other trims: `0`.
+fn trim_lift(is_cut: bool, is_record: bool, bits: u8, zoom: Zoom) -> i32 {
+    if !is_cut {
+        return 0;
+    }
+    if is_record {
+        if bits == 0x10 {
+            [0, 2, 5][zoom.index()]
+        } else {
+            0
+        }
+    } else if bits & 0x50 != 0 {
+        [0, 1, 2][zoom.index()]
+    } else {
+        0
     }
 }
 
@@ -2555,6 +2573,34 @@ mod tests {
         assert_eq!(flat_trim_offset(true, false, 0x50, 1), 0);
         assert_eq!(flat_trim_offset(true, false, 0x50, 2), 0);
         assert_eq!(flat_trim_offset(true, false, 0x10, 1), 0);
+    }
+
+    #[test]
+    fn diagonal_cut_trim_lift_matches_corner_and_run_tables() {
+        // Corner record with lone 0x10 lifts [0, 2, 5] (0x53c47a–0x53c496).
+        assert_eq!(Zoom::ALL.map(|z| trim_lift(true, true, 0x10, z)), [0, 2, 5]);
+        assert_eq!(Zoom::ALL.map(|z| trim_lift(true, true, 0x50, z)), [0, 0, 0]);
+        // Non-record cut run along view (1, 1) (bits 0x50 / 0x10 / 0x40) lifts
+        // 2 >> (3 - zoom) = [0, 1, 2] before 0x4c8b1f (0x53e300–0x53e313).
+        for bits in [0x50, 0x10, 0x40] {
+            assert_eq!(
+                Zoom::ALL.map(|z| trim_lift(true, false, bits, z)),
+                [0, 1, 2]
+            );
+            assert_eq!(
+                Zoom::ALL.map(|z| trim_lift(false, false, bits, z)),
+                [0, 0, 0]
+            );
+        }
+        // Runs along view (1, -1) (0xa0) or straight edges (0x05) get no lift.
+        assert_eq!(
+            Zoom::ALL.map(|z| trim_lift(true, false, 0xa0, z)),
+            [0, 0, 0]
+        );
+        assert_eq!(
+            Zoom::ALL.map(|z| trim_lift(true, false, 0x05, z)),
+            [0, 0, 0]
+        );
     }
 
     #[test]

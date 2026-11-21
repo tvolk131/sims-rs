@@ -22,7 +22,7 @@ Three pure `sims-render` mismatches against Complete Collection 1.91 (`Sims.exe`
    The flat-depth trim drawer `0x4c8849` (`0x4c8a74`–`0x4c8aa8`) adds its caller's depth offset argument `[ebp + 0x28]` to `ground(corner, height) + (LEVEL_DEPTH + 65) * level + correction` before clamping to `0xffff` (`EMPTY`):
    - Cut diagonal corner records (`is_record && bits & 0x50 != 0`, `0x53c41d`–`0x53c4fa`): `+900` (`0x384`) for `0x10`, overridden by `+770` (`0x302`) for `0x40` on level != 2 and `+700` (`0x2bc`) on level 2.
    - Standing corner records (`0x53c65f`–`0x53c675`): `-100` (`-0x64`) when `bits & 0x40 != 0` on level 2, `0` otherwise.
-   - Wall-run trims (`0x540473` -> `0x53db67`): cut runs always use the depth-sprite drawer `0x4c8b1f` (`0x53e2fa`–`0x53e362`), and standing runs pass offset `0` to `0x4c8849` (`0x53e379`–`0x53e3b4`).
+   - Wall-run trims (`0x540473` -> `0x53db67`): cut runs always use the depth-sprite drawer `0x4c8b1f` (`0x53e2fa`–`0x53e362`), with runs along view `(1, 1)` (`bits & 0x50 != 0`) raised by `2 >> (3 - zoom)` (`[0, 1, 2]` px at far/medium/near, `0x53e300`–`0x53e313`); standing runs pass offset `0` to `0x4c8849` (`0x53e379`–`0x53e3b4`).
    - Previously, `Depth::flat` used offset `0` for all flat trims, placing cut diagonal trims 700–900 units too near so they occluded objects in front of them (such as the patio cactus outside the Goth bathroom in `near-r3-down-0816`).
 
 ## What changed
