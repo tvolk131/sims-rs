@@ -32,30 +32,32 @@ pub(crate) struct AvatarPaths {
 /// Replays the startup file mounts (`0x43ae81`), download providers
 /// (`0x43bdc5`), texture paths (`0x414633`) and avatar search paths
 /// (`0x5835ed`). Shared by [`ImportWardrobe::load`] and
-/// [`crate::people::AvatarRegistry`].
-pub(crate) fn mount_avatar_paths(install: &Install) -> Result<AvatarPaths> {
+/// [`crate::people::AvatarRegistry`]. When `strict_archives` is false,
+/// unreadable FAR archives are skipped during directory scanning as at
+/// `0x5ba8d6`.
+pub(crate) fn mount_avatar_paths(install: &Install, strict_archives: bool) -> Result<AvatarPaths> {
     let mut files = MountedFiles::default();
     let root = &install.root;
     for directory in ["GameData/Global", "GameData/Objects", Install::USER_OBJECTS] {
-        files.register(root, directory, true)?;
+        files.register(root, directory, true, strict_archives)?;
     }
     for (bit, directory, _) in Expansions::ALL {
         if install.expansions.contains(bit) {
-            files.register(root, directory, true)?;
+            files.register(root, directory, true, strict_archives)?;
         }
     }
     if install.expansions.0 > 3 {
-        files.register(root, "ExpansionShared", true)?;
-        files.register(root, "TemplateNPCs", false)?;
+        files.register(root, "ExpansionShared", true, strict_archives)?;
+        files.register(root, "TemplateNPCs", false, strict_archives)?;
     }
-    files.register(root, "Downloads", true)?;
+    files.register(root, "Downloads", true, strict_archives)?;
     let providers = download_providers(&files, root)?;
-    let mut texture_paths = texture_paths(&mut files, install)?;
+    let mut texture_paths = texture_paths(&mut files, install, strict_archives)?;
     for path in &providers {
-        files.register(&install.root, path, true)?;
+        files.register(&install.root, path, true, strict_archives)?;
     }
     texture_paths.extend(providers.iter().cloned());
-    let (appearance, indexed) = appearance_paths(&mut files, install, providers)?;
+    let (appearance, indexed) = appearance_paths(&mut files, install, providers, strict_archives)?;
     Ok(AvatarPaths {
         files,
         appearance,
@@ -73,7 +75,7 @@ impl ImportWardrobe {
             appearance,
             indexed,
             texture_paths,
-        } = mount_avatar_paths(install)?;
+        } = mount_avatar_paths(install, true)?;
 
         // 0x59f844 loads all CMX before BCF. 0x584562 then adds the indexed
         // names, including entries whose catalog has yet to be opened.
@@ -216,7 +218,11 @@ fn download_providers(files: &MountedFiles, root: &Path) -> Result<Vec<String>> 
     Ok(providers)
 }
 
-fn texture_paths(files: &mut MountedFiles, install: &Install) -> Result<Vec<String>> {
+fn texture_paths(
+    files: &mut MountedFiles,
+    install: &Install,
+    strict_archives: bool,
+) -> Result<Vec<String>> {
     let mut paths = Vec::new();
     if install.expansions.0 > 3 {
         paths.extend(
@@ -239,7 +245,12 @@ fn texture_paths(files: &mut MountedFiles, install: &Install) -> Result<Vec<Stri
     }
     paths.extend(["GameData/Skins", "GameData/Textures2", "GameData/Textures"].map(str::to_owned));
     for path in &paths {
-        files.register(&install.root, path, path == "GameData/Skins")?;
+        files.register(
+            &install.root,
+            path,
+            path == "GameData/Skins",
+            strict_archives,
+        )?;
     }
     Ok(paths)
 }
@@ -248,6 +259,7 @@ fn appearance_paths(
     files: &mut MountedFiles,
     install: &Install,
     providers: Vec<String>,
+    strict_archives: bool,
 ) -> Result<(Vec<String>, Vec<String>)> {
     let root = &install.root;
     let mut appearance = vec!["GameData/Skins".to_owned()];
@@ -310,7 +322,7 @@ fn appearance_paths(
     }
     appearance.extend(loose.into_iter().rev());
     for path in appearance.iter().chain(&indexed) {
-        files.register(root, path, true)?;
+        files.register(root, path, true, strict_archives)?;
     }
     Ok((appearance, indexed))
 }

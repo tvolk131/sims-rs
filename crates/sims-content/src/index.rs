@@ -290,14 +290,22 @@ pub(crate) struct MountedFiles {
 impl MountedFiles {
     /// Register a root-relative path once, preserving any existing virtual
     /// directory supplied by an earlier FAR mount (0x5ba5d8, 0x5b9dbc).
-    pub(crate) fn register(&mut self, root: &Path, path: &str, recursive: bool) -> Result<()> {
+    /// When `strict_archives` is false, unreadable FAR archives are recorded in
+    /// `diagnostics` and skipped so the directory scan continues (`0x5ba8d6`).
+    pub(crate) fn register(
+        &mut self,
+        root: &Path,
+        path: &str,
+        recursive: bool,
+        strict_archives: bool,
+    ) -> Result<()> {
         let at = mount_key(path)?;
         if !self.directories.contains_key(&at)
             && let Some(directory) = resolve(root, path)?
             && directory.is_dir()
         {
             self.scan(&at, &directory, recursive, ntfs_entries)?;
-            if let Some(reason) = self.diagnostics.first() {
+            if strict_archives && let Some(reason) = self.diagnostics.first() {
                 return Err(Error::Unsupported(format!(
                     "0x5b9dbc wardrobe FAR mount: {reason}"
                 )));

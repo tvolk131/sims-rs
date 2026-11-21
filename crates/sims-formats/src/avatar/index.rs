@@ -54,6 +54,22 @@ impl<'a> IndexReader<'a> {
     pub fn failed_short_read(&self) -> bool {
         self.short_read
     }
+    /// The record group (`Kind::Skeleton`, `Kind::Appearance`, or
+    /// `Kind::Animation`) whose count or entry failed, or `None` if reading
+    /// has not failed.
+    pub fn failed_kind(&self) -> Option<Kind> {
+        if !self.failed {
+            return None;
+        }
+        let index = if self.remaining > 0 {
+            self.group - 1
+        } else {
+            self.group
+        };
+        [Kind::Skeleton, Kind::Appearance, Kind::Animation]
+            .get(index)
+            .copied()
+    }
     fn take(&mut self, size: usize) -> Result<&'a [u8]> {
         let result = self.reader.take(size);
         if result.is_err() {
@@ -117,5 +133,53 @@ impl Iterator for IndexReader<'_> {
                 Some(Err(error))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn drain_failed_kind(bytes: &[u8]) -> Option<Kind> {
+        let mut reader = IndexReader::new(bytes);
+        while let Some(item) = reader.next() {
+            if item.is_err() {
+                return reader.failed_kind();
+            }
+        }
+        reader.failed_kind()
+    }
+
+    #[test]
+    fn failed_kind_reports_exact_group_on_count_and_entry_errors() {
+        // Complete empty index -> None.
+        assert_eq!(drain_failed_kind(&[0; 12]), None);
+        // Truncated skeleton count -> Skeleton.
+        assert_eq!(drain_failed_kind(&[0, 0]), Some(Kind::Skeleton));
+        // Truncated skeleton entry -> Skeleton.
+        assert_eq!(
+            drain_failed_kind(&[1, 0, 0, 0, 5, b'a']),
+            Some(Kind::Skeleton)
+        );
+        // Truncated appearance count -> Appearance.
+        assert_eq!(
+            drain_failed_kind(&[0, 0, 0, 0, 0, 0]),
+            Some(Kind::Appearance)
+        );
+        // Truncated appearance entry -> Appearance.
+        assert_eq!(
+            drain_failed_kind(&[0, 0, 0, 0, 1, 0, 0, 0, 5, b'a']),
+            Some(Kind::Appearance)
+        );
+        // Truncated animation count -> Animation.
+        assert_eq!(
+            drain_failed_kind(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            Some(Kind::Animation)
+        );
+        // Truncated animation entry -> Animation.
+        assert_eq!(
+            drain_failed_kind(&[0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 5, b'a']),
+            Some(Kind::Animation)
+        );
     }
 }

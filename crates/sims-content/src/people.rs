@@ -80,7 +80,7 @@ pub struct People {
     /// (eager `.cmx` and `.bcf` catalogs in the `0x5835ed` appearance
     /// paths, lowercased by `0x594d73`/`0x595140`, plus indexed `.ndx`
     /// appearance entries from `0x584562` → `0x5a0212` → `0x59fc48` whose
-    /// `.bcf` catalog exists in the mounted directory).
+    /// first-registered `.bcf` catalog defines the appearance).
     pub suits: BTreeSet<String>,
     /// Each avatar catalog or index in the original's search paths whose
     /// skeletons or suits stopped decoding, by location, with the error:
@@ -156,8 +156,8 @@ pub struct AvatarRegistry {
     root: PathBuf,
     paths: AvatarPaths,
     skeletons: BTreeMap<String, (usize, SkeletonEntry)>,
+    next_step: usize,
     first_skeleton_error: Option<(usize, String)>,
-    resolved: BTreeMap<String, std::result::Result<Skeleton, String>>,
     suits: BTreeSet<String>,
     suit_errors: BTreeMap<String, String>,
 }
@@ -165,7 +165,7 @@ pub struct AvatarRegistry {
 impl AvatarRegistry {
     /// Builds the startup avatar registry for `install`.
     pub fn load(install: &Install) -> Result<Self> {
-        let paths = mount_avatar_paths(install)?;
+        let paths = mount_avatar_paths(install, false)?;
         let mut skeletons: BTreeMap<String, (usize, SkeletonEntry)> = BTreeMap::new();
         let mut first_skeleton_error: Option<(usize, String)> = None;
         let mut suits = BTreeSet::new();
@@ -228,11 +228,14 @@ impl AvatarRegistry {
         }
 
         // 0x584562 → 0x5a0212 → 0x59fc48: `.ndx` catalogs in indexed paths.
+        // Keep the first appearance registration (0x59fe53) and verify it
+        // against its referenced `.bcf` catalog below (0x5a044d → 0x5a38da).
+        let mut indexed_suits: BTreeMap<String, (String, String, Vec<u8>)> = BTreeMap::new();
         for (directory, _, source) in resources_with_dir(&paths.files, &paths.indexed, b".ndx")? {
             let location = source.location(&install.root);
             let bytes = source.read()?;
-            let mut saw_non_skeleton = false;
-            for item in IndexReader::new(&bytes) {
+            let mut reader = IndexReader::new(&bytes);
+            while let Some(item) = reader.next() {
                 match item {
                     Ok(entry) => match entry.kind {
                         Kind::Skeleton => {
@@ -252,35 +255,72 @@ impl AvatarRegistry {
                             });
                         }
                         Kind::Appearance => {
-                            saw_non_skeleton = true;
                             let name = decode(&entry.name, 1);
-                            let mut catalog_bcf = entry.catalog;
-                            catalog_bcf.extend_from_slice(b".bcf");
-                            // 0x5a044d → 0x5a38da returns null if the
-                            // indexed catalog cannot be opened.
-                            match paths.files.lookup(&directory, &catalog_bcf) {
-                                Ok(Some(_)) => {
-                                    suits.insert(name);
-                                }
-                                Ok(None) => {}
-                                Err(error) => {
-                                    suit_errors.insert(location.clone(), error.to_string());
-                                }
+                            if !suits.contains(&name) && !indexed_suits.contains_key(&name) {
+                                let mut catalog_bcf = entry.catalog;
+                                catalog_bcf.extend_from_slice(b".bcf");
+                                indexed_suits.insert(
+                                    name,
+                                    (location.clone(), directory.clone(), catalog_bcf),
+                                );
                             }
                         }
-                        Kind::Animation => {
-                            saw_non_skeleton = true;
-                        }
+                        Kind::Animation => {}
                     },
-                    Err(error) => {
-                        suit_errors.insert(location.clone(), error.to_string());
-                        if !saw_non_skeleton && first_skeleton_error.is_none() {
-                            step += 1;
-                            first_skeleton_error = Some((
-                                step,
-                                format!("the index {location} does not decode ({error})"),
-                            ));
+                    Err(error) => match reader.failed_kind() {
+                        Some(Kind::Skeleton) => {
+                            suit_errors.insert(location.clone(), error.to_string());
+                            if first_skeleton_error.is_none() {
+                                step += 1;
+                                first_skeleton_error = Some((
+                                    step,
+                                    format!("the index {location} does not decode ({error})"),
+                                ));
+                            }
                         }
+                        Some(Kind::Appearance) => {
+                            suit_errors.insert(location.clone(), error.to_string());
+                        }
+                        Some(Kind::Animation) | None => {}
+                    },
+                }
+            }
+        }
+
+        // Decode each referenced `.bcf` catalog once to confirm the indexed
+        // appearance names it actually defines (0x5a044d, 0x5950f5, 0x5a27f2).
+        let mut by_catalog: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        for (name, (ndx_location, directory, catalog_bcf)) in indexed_suits {
+            by_catalog
+                .entry((directory, catalog_bcf))
+                .or_default()
+                .push((name, ndx_location));
+        }
+        for ((directory, catalog_bcf), entries) in by_catalog {
+            match paths.files.lookup(&directory, &catalog_bcf) {
+                Ok(Some(resource)) => {
+                    let location = resource.location(&install.root);
+                    let bytes = resource.read()?;
+                    let mut binary = Binary::new(&bytes);
+                    let (_, skeleton_error) = read_bcf_skeletons(&mut binary);
+                    if let Some(error) = skeleton_error {
+                        suit_errors.insert(location, error.to_string());
+                        continue;
+                    }
+                    let mut catalog_suits = BTreeSet::new();
+                    if let Err(error) = read_bcf_appearances(&mut binary, &mut catalog_suits) {
+                        suit_errors.insert(location, error.to_string());
+                    }
+                    for (name, _) in entries {
+                        if catalog_suits.contains(&name) {
+                            suits.insert(name);
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    for (_, ndx_location) in entries {
+                        suit_errors.insert(ndx_location, error.to_string());
                     }
                 }
             }
@@ -290,8 +330,8 @@ impl AvatarRegistry {
             root: install.root.clone(),
             paths,
             skeletons,
+            next_step: step,
             first_skeleton_error,
-            resolved: BTreeMap::new(),
             suits,
             suit_errors,
         })
@@ -299,29 +339,13 @@ impl AvatarRegistry {
 
     /// Resolves the skeleton named `name` byte-for-byte (`0x5a0384`,
     /// `0x5a280f`), loading an `.ndx`-indexed `.bcf` catalog on demand
-    /// (`0x5a3810` → `0x59e60e`).
+    /// (`0x5a3810` → `0x59e60e` → `0x59f087`). Every skeleton decoded from
+    /// that catalog before any error is immediately registered (filling
+    /// existing unloaded entries via `0x5a2207` and preserving already-loaded
+    /// entries via `0x59f18c`).
     pub fn skeleton(&mut self, name: &str) -> Result<Skeleton> {
-        if let Some(cached) = self.resolved.get(name) {
-            return cached.clone().map_err(Error::Unsupported);
-        }
-        let outcome = self.resolve_skeleton(name)?;
-        self.resolved.insert(name.to_owned(), outcome.clone());
-        outcome.map_err(Error::Unsupported)
-    }
-
-    /// The wiggle bone scales of the skeleton named `name` (`0x5a0384`,
-    /// `0x598da3`).
-    pub fn skeleton_scales(&mut self, name: &str) -> Result<Vec<i32>> {
-        let skeleton = self.skeleton(name)?;
-        Ok(skeleton.scales[skeleton.place].clone())
-    }
-
-    /// Resolves `name`, returning `Ok(Ok(skeleton))` on success,
-    /// `Ok(Err(reason))` for an unsupported/missing lookup, and `Err(io)`
-    /// for I/O errors.
-    fn resolve_skeleton(&self, name: &str) -> Result<std::result::Result<Skeleton, String>> {
         let Some((reg_step, entry)) = self.skeletons.get(name) else {
-            return Ok(Err(match &self.first_skeleton_error {
+            return Err(Error::Unsupported(match &self.first_skeleton_error {
                 Some((_, reason)) => {
                     format!("0x5a0384: {reason}, so whether it defines {name:?} is unknown")
                 }
@@ -331,61 +355,99 @@ impl AvatarRegistry {
         if let Some((err_step, reason)) = &self.first_skeleton_error
             && *reg_step >= *err_step
         {
-            return Ok(Err(format!(
+            return Err(Error::Unsupported(format!(
                 "0x5a0384: {reason}, so whether it defines {name:?} is unknown"
             )));
         }
-        match entry {
+        let (ndx_location, directory, catalog_bcf) = match entry {
             SkeletonEntry::Loaded {
                 file,
                 place,
                 scales,
                 bones,
-            } => Ok(Ok(Skeleton {
+            } => {
+                return Ok(Skeleton {
+                    name: name.to_owned(),
+                    file: file.clone(),
+                    place: *place,
+                    scales: scales.clone(),
+                    bones: bones.clone(),
+                });
+            }
+            SkeletonEntry::Indexed {
+                ndx_location,
+                directory,
+                catalog_bcf,
+            } => (ndx_location.clone(), directory.clone(), catalog_bcf.clone()),
+        };
+
+        let Some(resource) = self.paths.files.lookup(&directory, &catalog_bcf)? else {
+            let catalog = decode(&catalog_bcf, 1);
+            return Err(Error::Unsupported(format!(
+                "0x5a3810: {ndx_location} points skeleton {name:?} to {catalog:?}, \
+                 which is missing in {directory}"
+            )));
+        };
+        let location = resource.location(&self.root);
+        let bytes = resource.read()?;
+        let mut binary = Binary::new(&bytes);
+        let (decoded, error) = read_bcf_skeletons(&mut binary);
+        let all_scales: Vec<Vec<i32>> = decoded
+            .iter()
+            .map(|(_, scales, _)| scales.clone())
+            .collect();
+        for (place, (skel_name, _, bones)) in decoded.into_iter().enumerate() {
+            let loaded = SkeletonEntry::Loaded {
+                file: location.clone(),
+                place,
+                scales: all_scales.clone(),
+                bones,
+            };
+            match self.skeletons.get_mut(&skel_name) {
+                Some((_, entry @ SkeletonEntry::Indexed { .. })) => {
+                    *entry = loaded;
+                }
+                Some((_, SkeletonEntry::Loaded { .. })) => {}
+                None => {
+                    self.next_step += 1;
+                    self.skeletons.insert(skel_name, (self.next_step, loaded));
+                }
+            }
+        }
+        if let Some((
+            _,
+            SkeletonEntry::Loaded {
+                file,
+                place,
+                scales,
+                bones,
+            },
+        )) = self.skeletons.get(name)
+        {
+            return Ok(Skeleton {
                 name: name.to_owned(),
                 file: file.clone(),
                 place: *place,
                 scales: scales.clone(),
                 bones: bones.clone(),
-            })),
-            SkeletonEntry::Indexed {
-                ndx_location,
-                directory,
-                catalog_bcf,
-            } => {
-                let Some(resource) = self.paths.files.lookup(directory, catalog_bcf)? else {
-                    let catalog = decode(catalog_bcf, 1);
-                    return Ok(Err(format!(
-                        "0x5a3810: {ndx_location} points skeleton {name:?} to {catalog:?}, \
-                         which is missing in {directory}"
-                    )));
-                };
-                let location = resource.location(&self.root);
-                let bytes = resource.read()?;
-                let mut binary = Binary::new(&bytes);
-                let (decoded, error) = read_bcf_skeletons(&mut binary);
-                if let Some(error) = error {
-                    return Ok(Err(format!(
-                        "0x5a3810: the skeletons of {location} do not decode ({error})"
-                    )));
-                }
-                let Some(place) = decoded.iter().position(|(n, ..)| n == name) else {
-                    return Ok(Err(format!(
-                        "0x5a03c0: {ndx_location} points skeleton {name:?} to {location}, \
-                         which does not define it"
-                    )));
-                };
-                let scales = decoded.iter().map(|(_, s, _)| s.clone()).collect();
-                let bones = decoded[place].2.clone();
-                Ok(Ok(Skeleton {
-                    name: name.to_owned(),
-                    file: location,
-                    place,
-                    scales,
-                    bones,
-                }))
-            }
+            });
         }
+        if let Some(error) = error {
+            return Err(Error::Unsupported(format!(
+                "0x5a3810: the skeletons of {location} do not decode ({error})"
+            )));
+        }
+        Err(Error::Unsupported(format!(
+            "0x5a03c0: {ndx_location} points skeleton {name:?} to {location}, \
+             which does not define it"
+        )))
+    }
+
+    /// The wiggle bone scales of the skeleton named `name` (`0x5a0384`,
+    /// `0x598da3`).
+    pub fn skeleton_scales(&mut self, name: &str) -> Result<Vec<i32>> {
+        let skeleton = self.skeleton(name)?;
+        Ok(skeleton.scales[skeleton.place].clone())
     }
 }
 
@@ -567,7 +629,10 @@ fn read_cmx_catalog(
 ) -> std::result::Result<(), (bool, sims_formats::Error)> {
     let mut cmx = Cmx::new(bytes).map_err(|e| (true, e))?;
     let Some(skel_count) = cmx.count(Kind::Skeleton).map_err(|e| (true, e))? else {
-        return Ok(());
+        return Err((
+            true,
+            sims_formats::Error::new(bytes.len(), "missing CMX skeleton count"),
+        ));
     };
     if skel_count > 0 {
         cmx.read(Kind::Skeleton).map_err(|e| (true, e))?;
@@ -589,7 +654,15 @@ fn read_bcf_skeletons(binary: &mut Binary<'_>) -> (DecodedSkeletons, Option<sims
     let mut out = Vec::new();
     let count = match binary.count(Kind::Skeleton) {
         Ok(Some(count)) => count,
-        Ok(None) => return (out, None),
+        Ok(None) => {
+            return (
+                out,
+                Some(sims_formats::Error::new(
+                    binary.position(),
+                    "missing BCF skeleton count",
+                )),
+            );
+        }
         Err(error) => return (out, Some(error)),
     };
     for _ in 0..count {
@@ -869,6 +942,204 @@ mod tests {
         let mut registry = AvatarRegistry::load(&install).unwrap();
         let err = registry.skeleton_scales("adult").unwrap_err().to_string();
         assert!(err.contains("0x5a3810"), "{err}");
+    }
+
+    #[test]
+    fn unrelated_malformed_far_does_not_abort_avatar_loading() {
+        let dir = ScratchDir::new("unrelated-bad-far");
+        dir.write("GameData/Objects/unrelated.far", b"not a valid FAR");
+        dir.write(
+            "GameData/Animation/Animation.ndx",
+            &ndx(&[("adult", "adult-skeleton.cmx")], &[]),
+        );
+        dir.write(
+            "GameData/Animation/adult-skeleton.cmx.bcf",
+            &skeletons(&[("adult", 15)]),
+        );
+        let install = dir.install();
+        let mut registry = AvatarRegistry::load(&install).unwrap();
+        assert_eq!(registry.skeleton_scales("adult").unwrap(), [15]);
+    }
+
+    #[test]
+    fn lazy_skeleton_load_registers_siblings_and_keeps_prefix_before_truncation() {
+        let dir = ScratchDir::new("lazy-siblings");
+        // alpha's catalog defines both alpha and beta; beta's own indexed
+        // catalog is missing. Loading alpha populates beta (0x5a2207).
+        dir.write(
+            "GameData/Animation/Animation.ndx",
+            &ndx(
+                &[
+                    ("alpha", "shared.cmx"),
+                    ("beta", "missing.cmx"),
+                    ("gamma", "truncated.cmx"),
+                    ("delta", "truncated.cmx"),
+                ],
+                &[],
+            ),
+        );
+        dir.write(
+            "GameData/Animation/shared.cmx.bcf",
+            &skeletons(&[("alpha", 11), ("beta", 22)]),
+        );
+        // truncated.cmx.bcf claims 2 skeletons: gamma succeeds, then record 2
+        // is truncated. Native 0x59f087 registers gamma before failing.
+        let mut truncated = skeletons(&[("gamma", 33)]);
+        truncated[0..4].copy_from_slice(&2u32.to_le_bytes());
+        truncated.truncate(truncated.len() - 4); // strip 0 suits count
+        truncated.extend([9, b'x']);
+        dir.write("GameData/Animation/truncated.cmx.bcf", &truncated);
+
+        let install = dir.install();
+        let mut registry = AvatarRegistry::load(&install).unwrap();
+        assert_eq!(registry.skeleton_scales("alpha").unwrap(), [11]);
+        assert_eq!(registry.skeleton_scales("beta").unwrap(), [22]);
+        assert_eq!(registry.skeleton_scales("gamma").unwrap(), [33]);
+        let delta_err = registry.skeleton_scales("delta").unwrap_err().to_string();
+        assert!(delta_err.contains("0x5a3810"), "{delta_err}");
+    }
+
+    #[test]
+    fn indexed_suits_keep_first_reference_and_require_catalog_definition() {
+        let dir = ScratchDir::new("indexed-suits");
+        // hat's first reference is missing; its later duplicate points to an
+        // existing catalog with hat (must not override first reference).
+        // ghost points to an existing empty catalog (must not register).
+        // coat points to an existing catalog defining coat (must register).
+        dir.write(
+            "GameData/Animation/Animation.ndx",
+            &ndx(
+                &[],
+                &[
+                    ("hat", "missing.cmx"),
+                    ("hat", "real.cmx"),
+                    ("ghost", "empty.cmx"),
+                    ("coat", "real.cmx"),
+                ],
+            ),
+        );
+        dir.write(
+            "GameData/Animation/real.cmx.bcf",
+            &catalog(&["hat", "coat"], &[]),
+        );
+        dir.write("GameData/Animation/empty.cmx.bcf", &catalog(&[], &[]));
+
+        let install = dir.install();
+        let registry = AvatarRegistry::load(&install).unwrap();
+        assert!(registry.suits.contains("coat"));
+        assert!(!registry.suits.contains("hat"));
+        assert!(!registry.suits.contains("ghost"));
+        assert!(registry.suit_errors.is_empty());
+    }
+
+    #[test]
+    fn ndx_errors_are_attributed_by_failing_group() {
+        // Case 1: complete skeleton group (0 skeletons) + truncated first
+        // appearance must NOT block skeletons from a later index, only record
+        // suit_errors.
+        let dir = ScratchDir::new("ndx-app-err");
+        let mut bad_app = Vec::new();
+        bad_app.extend(0i32.to_le_bytes()); // 0 skeletons
+        bad_app.extend(1i32.to_le_bytes()); // 1 appearance, truncated
+        bad_app.extend([9, b'x']);
+        dir.write("GameData/Animation/Animation.ndx", &bad_app);
+        dir.write(
+            "GameData/Animation/other.ndx",
+            &ndx(&[("adult", "adult-skeleton.cmx")], &[]),
+        );
+        dir.write(
+            "GameData/Animation/adult-skeleton.cmx.bcf",
+            &skeletons(&[("adult", 42)]),
+        );
+        // Ensure both .ndx files are read; Animation.ndx fails in appearance
+        // group, so adult from other.ndx must still resolve.
+        let install = dir.install();
+        let mut registry = AvatarRegistry::load(&install).unwrap();
+        assert_eq!(registry.skeleton_scales("adult").unwrap(), [42]);
+        let miss = registry
+            .skeleton_scales("nonexistent")
+            .unwrap_err()
+            .to_string();
+        assert!(miss.contains("0x5a03c0"), "{miss}");
+        assert!(
+            registry
+                .suit_errors
+                .keys()
+                .any(|k| k.ends_with("Animation.ndx")),
+            "{:?}",
+            registry.suit_errors
+        );
+
+        // Case 2: complete skeleton and appearance groups + truncated
+        // animation group must add neither a skeleton error nor suit_errors.
+        let dir2 = ScratchDir::new("ndx-anim-err");
+        let mut bad_anim = Vec::new();
+        bad_anim.extend(1i32.to_le_bytes()); // 1 skeleton
+        bad_anim.push(5);
+        bad_anim.extend_from_slice(b"adult");
+        bad_anim.push(14);
+        bad_anim.extend_from_slice(b"adult-skeleton");
+        bad_anim.extend(0i32.to_le_bytes()); // 0 appearances
+        bad_anim.extend(1i32.to_le_bytes()); // 1 animation, truncated
+        bad_anim.extend([9, b'x']);
+        dir2.write("GameData/Animation/Animation.ndx", &bad_anim);
+        dir2.write(
+            "GameData/Animation/adult-skeleton.bcf",
+            &skeletons(&[("adult", 50)]),
+        );
+        let install2 = dir2.install();
+        let mut registry2 = AvatarRegistry::load(&install2).unwrap();
+        assert_eq!(registry2.skeleton_scales("adult").unwrap(), [50]);
+        assert!(
+            registry2.suit_errors.is_empty(),
+            "{:?}",
+            registry2.suit_errors
+        );
+    }
+
+    #[test]
+    fn missing_skeleton_count_in_eager_bcf_or_cmx_blocks_later_skeletons() {
+        // 3-byte BCF in GameData/Skins must block later indexed skeletons and
+        // must not report a misleading "catalog group out of sequence" error.
+        let dir = ScratchDir::new("short-bcf");
+        dir.write("GameData/Skins/short.bcf", &[1, 2, 3]);
+        dir.write(
+            "GameData/Animation/Animation.ndx",
+            &ndx(&[("adult", "adult-skeleton.cmx")], &[]),
+        );
+        dir.write(
+            "GameData/Animation/adult-skeleton.cmx.bcf",
+            &skeletons(&[("adult", 10)]),
+        );
+        let install = dir.install();
+        let mut registry = AvatarRegistry::load(&install).unwrap();
+        let err = registry.skeleton_scales("adult").unwrap_err().to_string();
+        assert!(err.contains("short.bcf"), "{err}");
+        let suit_err = registry
+            .suit_errors
+            .values()
+            .next()
+            .expect("suit_errors should record short.bcf");
+        assert!(!suit_err.contains("out of sequence"), "{suit_err}");
+
+        // Header-only CMX in GameData/Skins must also block later skeletons.
+        let dir2 = ScratchDir::new("header-only-cmx");
+        dir2.write(
+            "GameData/Skins/empty.cmx",
+            b"// header only\r\nversion 300\r\n",
+        );
+        dir2.write(
+            "GameData/Animation/Animation.ndx",
+            &ndx(&[("adult", "adult-skeleton.cmx")], &[]),
+        );
+        dir2.write(
+            "GameData/Animation/adult-skeleton.cmx.bcf",
+            &skeletons(&[("adult", 10)]),
+        );
+        let install2 = dir2.install();
+        let mut registry2 = AvatarRegistry::load(&install2).unwrap();
+        let err2 = registry2.skeleton_scales("adult").unwrap_err().to_string();
+        assert!(err2.contains("empty.cmx"), "{err2}");
     }
 
     #[test]
