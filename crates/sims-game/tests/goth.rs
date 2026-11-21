@@ -3266,7 +3266,7 @@ fn pressing_a_pie_entry_and_dragging_off_orders_nothing() {
     let Some(install) = install() else {
         return;
     };
-    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    let mut game = Game::open(&options(install.clone())).expect("the Goth house opens");
     assert_eq!(game.run(50), 50);
     game.resize([800, 600]);
     game.render();
@@ -3358,6 +3358,47 @@ fn pressing_a_pie_entry_and_dragging_off_orders_nothing() {
     assert!(game.menu().is_none());
     assert_eq!(hash(&game), later);
     assert_eq!(queue_len(&game), 0);
+
+    // 2b. Dragging out of the top of the window near a top-clamped pie
+    // (where winit can send `CursorMoved` with `y < 0` after `CursorLeft`
+    // while the point is still within pie `REACH` of the top label) closes
+    // without checking or ordering.
+    {
+        let mut top_game = Game::open(&options(install)).expect("the Goth house opens");
+        top_game.resize([800, 600]);
+        assert_eq!(top_game.run(50), 50);
+        top_game.apply(sims_game::view::Move::Scroll([0, -150]));
+        top_game.render();
+        let top_fridge = (0..600)
+            .step_by(2)
+            .flat_map(|y| (0..800).step_by(2).map(move |x| [x, y]))
+            .find(|&p| !top_game.over_panel(p) && top_game.under(p) == Some(fridge))
+            .expect("the scrolled fridge is on screen");
+        top_game.hover(top_fridge);
+        top_game.press(top_fridge);
+        top_game.release(top_fridge);
+        top_game.render();
+        let snack = label_center(&top_game, "Have A Snack");
+        let above = [snack[0], -1];
+        // Without client bounds clamping, the pie's own hit test would
+        // still highlight Have A Snack at `y = -1`.
+        assert!(
+            top_game.menu().unwrap().highlighted(above).is_some(),
+            "expected {above:?} to lie within pie reach above the clamped top entry"
+        );
+        top_game.hover(snack);
+        assert_eq!(top_game.run(60), 60);
+        top_game.render();
+        let later = hash(&top_game);
+        top_game.press(snack);
+        assert_eq!(hash(&top_game), later);
+        top_game.hover(above);
+        assert_eq!(hash(&top_game), later);
+        top_game.release(above);
+        assert!(top_game.menu().is_none());
+        assert_eq!(hash(&top_game), later);
+        assert_eq!(queue_len(&top_game), 0);
+    }
 
     // 3. Press on Have A Snack, drag onto Have Quick Breakfast, release:
     // orders Have Quick Breakfast (not Have A Snack).

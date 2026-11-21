@@ -604,10 +604,22 @@ impl Game {
         self.hud.covers(point)
     }
 
+    /// Whether `point` lies inside the canvas (`[0..width, 0..height)`).
+    fn in_view(&self, point: [i32; 2]) -> bool {
+        point[0] >= 0
+            && point[1] >= 0
+            && point[0] < self.view.size[0]
+            && point[1] < self.view.size[1]
+    }
+
     /// Moves the pointer to `point`. When it first reaches an object on
     /// the lot, the selected Sim's pie menu on it is listed, as the
     /// original lists it then (0x48c834); listing changes the lot.
+    /// A point outside the canvas is treated as [`Game::leave`].
     pub fn hover(&mut self, point: [i32; 2]) -> bool {
+        if !self.in_view(point) {
+            return self.leave();
+        }
         self.pointer = Some(point);
         let mut redraw = self.hud.hover(point);
         redraw |= self.highlight(point);
@@ -681,6 +693,9 @@ impl Game {
     ///   event `0xe` -> `0x48df28`) and chooses it, opens or leaves a
     ///   submenu, or closes the menu.
     pub fn release(&mut self, point: [i32; 2]) -> Outcome {
+        if !self.in_view(point) {
+            return self.release_outside();
+        }
         if self.hud.dialog().is_some() || self.hud.menu.is_none() {
             return Outcome {
                 redraw: false,

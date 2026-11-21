@@ -75,9 +75,9 @@ const fn rgb(r: u8, g: u8, b: u8) -> [u8; 3] {
 }
 
 /// The sounds the menu window itself plays (0x5eb421, 0x5eb593,
-/// 0x5eba16). The people panel's menus do not turn them on (+0x17c stays
-/// 0), so the game's pie menu plays none of them; they are listed for a
-/// host that wants them.
+/// 0x5eba16), gated by `+0x17c` (initialized to 1 by `0x5ea303` at
+/// `0x5ea380`); `sims-game` does not play them yet, and they are listed
+/// for a host that wants them.
 pub const SOUNDS: [&str; 3] = [
     "UI_piemenu_appear",
     "UI_piemenu_highlight",

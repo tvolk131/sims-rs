@@ -244,6 +244,16 @@ impl App {
         [(position.x / scale) as i32, (position.y / scale) as i32]
     }
 
+    fn in_window(&self, position: PhysicalPosition<f64>) -> bool {
+        self.window.as_ref().is_some_and(|w| {
+            let size = w.inner_size();
+            position.x >= 0.0
+                && position.y >= 0.0
+                && position.x < f64::from(size.width)
+                && position.y < f64::from(size.height)
+        })
+    }
+
     /// Moves the pointer where the game asks, as the original moves it
     /// to the middle of a pie menu.
     fn move_pointer(&mut self) {
@@ -557,10 +567,16 @@ impl ApplicationHandler for App {
                 self.changed(redraw);
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.cursor = Some(position);
-                let point = self.point(position);
-                let redraw = self.drag.is_none() && self.game.hover(point);
-                self.changed(redraw);
+                if self.in_window(position) {
+                    self.cursor = Some(position);
+                    let point = self.point(position);
+                    let redraw = self.drag.is_none() && self.game.hover(point);
+                    self.changed(redraw);
+                } else {
+                    self.cursor = None;
+                    let redraw = self.drag.is_none() && self.game.leave();
+                    self.changed(redraw);
+                }
                 if let Some(start) = self.drag {
                     let scale = f64::from(self.scale.max(1));
                     let dx = ((position.x - start.x) / scale) as i32;
