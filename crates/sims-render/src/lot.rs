@@ -299,6 +299,20 @@ impl Lot {
     pub fn contains(&self, x: i32, y: i32) -> bool {
         x >= 0 && y >= 0 && (x as usize) < self.size && (y as usize) < self.size
     }
+
+    /// The terrain altitude at unrotated fine position `fine` (sixteenths of
+    /// a tile), in terrain steps (`0x478dfe`, off-lot returns `0.0` as
+    /// `0x45ee1d`). The tile is divided along its diagonal into two flat
+    /// triangles (`sims_sim::head::altitude_at`), with the second coordinate
+    /// (`y & 15`) passed first as `0x478dfe` reads `{ y, x }`.
+    pub fn altitude_at(&self, fine: [i32; 2]) -> f32 {
+        let [tx, ty] = [fine[0] >> 4, fine[1] >> 4];
+        if !self.contains(tx, ty) {
+            return 0.0;
+        }
+        let corners = self.heights[Self::cell(tx as usize, ty as usize)];
+        sims_sim::head::altitude_at(corners, fine[1] & 15, fine[0] & 15).to_f32()
+    }
 }
 
 impl Lot {

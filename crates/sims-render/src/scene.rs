@@ -1,7 +1,9 @@
 //! Draws a lot: terrain, floors, walls and objects, level by level.
 
 use crate::assets::{Assets, Definition};
-use crate::camera::{self, Camera, Walls, Zoom};
+#[cfg(test)]
+use crate::camera::Zoom;
+use crate::camera::{self, Camera, Walls};
 use crate::canvas::{Canvas, Image};
 use crate::caps::{self, Cap, Corners, Line, solid};
 use crate::cutaway::{self, Mask};
@@ -741,7 +743,7 @@ impl<'a> Painter<'a> {
         let depth = self.depth.grass(view, i32::from(heights[1]));
         let left = corner[0] + GRASS_COLUMN;
         for column in grass::columns(left, corner[1] + GRASS_ROW, heights, shades, colors, zoom) {
-            for (row, pixels) in column.rows() {
+            for (row, pixels) in column.clipped(0, size[1]).rows() {
                 for (i, &p) in pixels.iter().enumerate() {
                     self.canvas
                         .plot(column.x + i as i32, row, depth, grass::widen(p));
@@ -1063,6 +1065,7 @@ impl<'a> Painter<'a> {
                     0
                 };
                 let set = is_cut && !diagonal;
+                let flat_offset = flat_trim_offset(is_cut, c.record, bits, level);
                 // The original subtracts one more pixel from x; its corner
                 // point sits one to the right of ours (fitted to the
                 // screenshot).
@@ -1125,10 +1128,10 @@ impl<'a> Painter<'a> {
                         continue;
                     }
                     // The trim lies on the wall tops, one depth a row
-                    // (fitted to the original's depth buffer, 2026-11-14).
+                    // (0x4c8849, with `flat_offset` for diagonal trims).
                     self.canvas
                         .draw_lit(&image, [x, y], false, light, |_, sy, _| {
-                            Some(depth.flat(view, ground, level, y, sy))
+                            Some(depth.flat(view, ground, level, flat_offset, y, sy))
                         });
                 }
             }
@@ -1308,26 +1311,42 @@ impl<'a> Painter<'a> {
             }
             let assets = &mut *self.assets;
             let slot = |guid, i: usize| assets.definition(guid)?.slots.get(i).copied();
-            let Some(([dx, dy], lift)) = held(&self.world.objects, slot, id) else {
+            let Some((is_held, [dx, dy], lift)) = held(&self.world.objects, slot, id) else {
                 continue;
             };
-            // Its sprites are placed from the exact position; the tile,
-            // ground and sort anchor from the rounded one.
+            // The object's base altitude comes from `0x478dfe` (`0x4b9613`),
+            // and its base screen position and depth anchor from `0x4b97ea`
+            // (unheld) or `0x4b9991` (held in a slot, `0x437fdd`).
+            let base_altitude = self.lot.altitude_at([x, y]);
             let exact = [x as f32 + dx, y as f32 + dy];
-            let [x, y] = [x + dx.round() as i32, y + dy.round() as i32];
-            let view = self.camera.rotate_fine([x, y]);
-            // The ground under the object: the mean of its tile's corners.
-            let ground = (0..4)
-                .map(|c| self.corner_elevation([tile[0] + (c & 1), tile[1] + (c >> 1)]))
-                .sum::<i32>()
-                / 4;
-            let height = ground as f32 / 16.0 + lift;
-            let anchor = place(&self.depth, self.camera, view, level, height);
-            list.push((anchor, id, ground, exact, lift));
+            let (screen, anchor) = if is_held {
+                let fine = [
+                    (exact[0] + 0.5).trunc() as i32,
+                    (exact[1] + 0.5).trunc() as i32,
+                ];
+                place_moved(
+                    &self.depth,
+                    self.camera,
+                    self.lot,
+                    fine,
+                    level,
+                    base_altitude + lift,
+                )
+            } else {
+                place_base(
+                    &self.depth,
+                    self.camera,
+                    self.lot,
+                    [x, y],
+                    level,
+                    base_altitude,
+                )
+            };
+            list.push((anchor, screen, id, base_altitude, exact, lift));
         }
         // Far objects first, so soft edges blend over what is behind them.
-        list.sort_by_key(|&(a, id, ..)| (std::cmp::Reverse(a.depth), id));
-        for (anchor, id, ground, spot, lift) in list {
+        list.sort_by_key(|&(a, _, id, ..)| (std::cmp::Reverse(a.depth), id));
+        for (base_anchor, base_screen, id, base_altitude, spot, lift) in list {
             let o = &self.world.objects[&id];
             let Some(definition) = self.assets.definition(o.guid) else {
                 self.stats.missing_objects += 1;
@@ -1362,7 +1381,6 @@ impl<'a> Painter<'a> {
                 continue;
             }
             let facing = o.data.get(1).copied().unwrap_or(0);
-            let base = ground as f32 / 16.0;
             // An object takes the light of the room at its position (the
             // original samples the tile light map there, 0x467482). One
             // that gives light (data word 51), other than a window, shows
@@ -1391,25 +1409,26 @@ impl<'a> Painter<'a> {
                 // Offsets come from the files and may be anything; the
                 // canvas clips whatever this gives.
                 let height = i32::try_from(part.image.height).unwrap_or(i32::MAX);
-                // A held object stands on its holder's slot: the slot's
-                // height adds to the sprite's own.
-                let object = [part.object[0], part.object[1], part.object[2] + lift];
-                let screen = part_screen(self.camera, spot, facing, object, level, ground);
+                // When the sprite has no world offset (`0x437af2`–`0x437b1a`),
+                // it uses the object's base screen position and depth anchor.
+                // Otherwise `0x437b7e` adds the rotated offset and calls
+                // `0x4b9991`, projecting onto the sloped terrain at the moved
+                // position and lifting by `(total_z - ground_here) * (2 << zoom)`.
+                let (screen, anchor) = if part.object == [0.0; 3] {
+                    (base_screen, base_anchor)
+                } else {
+                    let fine = part_fine(spot, facing, part.object);
+                    let total_z = base_altitude + lift + sprite_offset(part.object)[2];
+                    place_moved(&self.depth, self.camera, self.lot, fine, level, total_z)
+                };
                 let at = [
                     screen[0]
                         .saturating_add(part.offset[0])
                         .saturating_add(OBJECT_COLUMN),
                     screen[1]
                         .saturating_add(part.offset[1])
-                        .saturating_sub(height)
-                        .saturating_sub(sprite_rise(object, self.camera.zoom)),
+                        .saturating_sub(height),
                 ];
-                let anchor = if part.object == [0.0; 3] {
-                    anchor
-                } else {
-                    let depth = &self.depth;
-                    part_anchor(depth, self.camera, spot, facing, object, level, base)
-                };
                 let depth = &self.depth;
                 // A frame without a depth channel stands flat at its
                 // anchor's depth. None of the base game's objects has one,
@@ -1487,10 +1506,11 @@ fn held(
     objects: &BTreeMap<u16, Object>,
     mut slot: impl FnMut(u32, usize) -> Option<[f32; 3]>,
     id: u16,
-) -> Option<([f32; 2], f32)> {
+) -> Option<(bool, [f32; 2], f32)> {
     let mut cursor = objects.get(&id)?;
     let mut seen = BTreeSet::from([id]);
     let mut offset = [0.0f32; 3];
+    let mut is_held = false;
     loop {
         let container = cursor.data.get(CONTAINER).copied().unwrap_or(0);
         let Some((holder_id, holder)) = u16::try_from(container)
@@ -1502,11 +1522,12 @@ fn held(
             break;
         };
         if !seen.insert(holder_id) {
-            return Some(([0.0; 2], 0.0));
+            return Some((false, [0.0; 2], 0.0));
         }
         if holder.data.get(HIDDEN).is_some_and(|&w| w != 0) {
             return None;
         }
+        is_held = true;
         let at = usize::try_from(cursor.data.get(CONTAINER_SLOT).copied().unwrap_or(-1))
             .ok()
             .and_then(|i| slot(holder.guid, i))
@@ -1518,7 +1539,7 @@ fn held(
         offset = sprite_offset([offset[0] + x, offset[1] + y, offset[2] + z]);
         cursor = holder;
     }
-    Some(([offset[0], offset[1]], offset[2]))
+    Some((is_held, [offset[0], offset[1]], offset[2]))
 }
 
 /// A draw group sprite's world offset (`object`), made safe: x and y in
@@ -1541,12 +1562,34 @@ fn sprite_offset(object: [f32; 3]) -> [f32; 3] {
 /// preview (0x438ae4 to 0x438b58, read by the old prototype in
 /// `legacy/crates/sims-render/src/object_preview/software.rs`); that the
 /// lot view places sprites the same way is **unverified**.
+#[cfg(test)]
 fn sprite_rise(object: [f32; 3], zoom: Zoom) -> i32 {
     let z = sprite_offset(object)[2];
     if z == 0.0 {
         return 0;
     }
     (z * (2 << zoom.level()) as f32 + 0.5).trunc() as i32
+}
+
+/// Depth offset passed to `0x4c8849` for flat-depth wall trims:
+/// - Cut diagonal corner trims (`bits & 0x50 != 0`, `0x53c478`–`0x53c4af`):
+///   `900` (`0x384`) for `0x10`, `770` (`0x302`) for `0x40` on level 1, and
+///   `700` (`0x2bc`) for `0x40` on level 2 (`0x40` wins when both bits set).
+/// - Standing corner trims (`0x53c65f`–`0x53c675`): `-100` (`-0x64`) when
+///   `bits & 0x40 != 0` on level 2.
+/// - All other flat trims (including wall-run trims at `0x540473`): `0`.
+fn flat_trim_offset(is_cut: bool, is_record: bool, bits: u8, level: i32) -> i32 {
+    if is_cut && bits & 0x50 != 0 {
+        if bits & 0x40 != 0 {
+            if level == 2 { 700 } else { 770 }
+        } else {
+            900
+        }
+    } else if !is_cut && is_record && bits & 0x40 != 0 && level == 2 {
+        -100
+    } else {
+        0
+    }
 }
 
 /// The lights of a level's trims, in room 0's light (the outdoors') as a
@@ -1615,13 +1658,108 @@ fn part_fine(position: [f32; 2], facing: i16, object: [f32; 3]) -> [i32; 2] {
     ]
 }
 
+/// Projects rotated fine position `view_fine` on `level` using `0x4a9dc7`
+/// (and `0x4a9c50`). When `fixed_steps` is `Some(s)`, all four corners of
+/// the view tile take height `s` (`0x4a9e9b`, used by `0x4b97ea`). When
+/// `None`, the view tile's rotated terrain heights are interpolated across
+/// its two triangles (`0x4a9e22`–`0x4a9f90`, used by `0x4b9991`), falling
+/// back to `[0; 4]` on the lot's outermost ring or outside it.
+fn project_fine_terrain(
+    camera: &Camera,
+    lot: &Lot,
+    view_fine: [i32; 2],
+    level: i32,
+    fixed_steps: Option<u8>,
+) -> [i32; 2] {
+    let zoom = camera.zoom.level();
+    let [vx, vy] = view_fine;
+    let [bx, by] = [vx >> 4, vy >> 4];
+    let [sx, sy] = [vx & 15, vy & 15];
+    let heights = match fixed_steps {
+        Some(steps) => [steps; 4],
+        None => {
+            let tile = camera.unrotate_tile([bx, by]);
+            let inner = 1..(lot.size as i32 - 1);
+            if inner.contains(&tile[0]) && inner.contains(&tile[1]) {
+                let rotation = usize::from(camera.rotation & 3);
+                let h = lot.heights[Lot::cell(tile[0] as usize, tile[1] as usize)];
+                std::array::from_fn(|n| h[(n + 4 - rotation) & 3])
+            } else {
+                [0; 4]
+            }
+        }
+    };
+    let base = camera.project([bx, by], level, i32::from(heights[1]));
+    let shift = zoom + 1;
+    let half_w = 8i32 << zoom;
+    let h = heights.map(i32::from);
+    let (dx, dy) = if sx == sy {
+        let dy = (((h[1] - h[3] + 4) << shift) * sx) / 16;
+        (0, dy)
+    } else if sx > sy {
+        let y_edge = (((h[1] - h[2] + 2) << shift) * sx) / 16;
+        let y_diag = (((h[1] - h[3] + 4) << shift) * sx) / 16;
+        let dy = y_edge + ((y_diag - y_edge) * sy) / sx;
+        let x_edge = (half_w * sx) / 16;
+        let dx = x_edge - (x_edge * sy) / sx;
+        (dx, dy)
+    } else {
+        let y_edge = (((h[1] - h[0] + 2) << shift) * sy) / 16;
+        let y_diag = (((h[1] - h[3] + 4) << shift) * sy) / 16;
+        let dy = y_edge + ((y_diag - y_edge) * sx) / sy;
+        let x_edge = (half_w * sy) / -16;
+        let dx = x_edge - (x_edge * sx) / sy;
+        (dx, dy)
+    };
+    [base[0].saturating_add(dx), base[1].saturating_add(dy)]
+}
+
+/// Base screen position and depth anchor for an unheld object at unrotated
+/// fine position `fine` on `level` with terrain `altitude` (`0x4b9613` ->
+/// `0x4b97ea`): projects at the rounded whole terrain step `steps`, then
+/// anchors depth from that screen row and exact `altitude`.
+fn place_base(
+    depth: &Depth,
+    camera: &Camera,
+    lot: &Lot,
+    fine: [i32; 2],
+    level: i32,
+    altitude: f32,
+) -> ([i32; 2], Anchor) {
+    let steps = (altitude + 0.5).trunc().clamp(0.0, 255.0) as u8;
+    let screen = project_fine_terrain(camera, lot, camera.rotate_fine(fine), level, Some(steps));
+    let anchor = depth.anchor(screen[1], altitude, level);
+    (screen, anchor)
+}
+
+/// Screen position and depth anchor for a held object (`0x437fdd`) or an
+/// offset draw-group sprite (`0x437b7e`) via `0x4b9991`: projects onto the
+/// sloped terrain at `fine` (`0x4a9dc7` with no altitude override), lifts by
+/// `((total_z - ground_here) * (2 << zoom) + 0.5).trunc()`, and anchors
+/// depth from the resulting screen row and `total_z`.
+fn place_moved(
+    depth: &Depth,
+    camera: &Camera,
+    lot: &Lot,
+    fine: [i32; 2],
+    level: i32,
+    total_z: f32,
+) -> ([i32; 2], Anchor) {
+    let mut screen = project_fine_terrain(camera, lot, camera.rotate_fine(fine), level, None);
+    let ground_here = lot.altitude_at(fine);
+    let rise = ((total_z - ground_here) * (2 << camera.zoom.level()) as f32 + 0.5).trunc() as i32;
+    screen[1] = screen[1].saturating_sub(rise);
+    let anchor = depth.anchor(screen[1], total_z, level);
+    (screen, anchor)
+}
+
 /// Where on the screen a draw group sprite that sits `object` away from
 /// an object at `position` facing `facing` is placed, before its pixel
 /// offset and rise: the camera's projection of [`part_fine`], on `level`
 /// at `ground`. The sprite's x and y offset move it, as they move the
 /// object's position (0x437b7e: the original projects the moved
-/// position, 0x4b9991). Its depth ([`part_anchor`]) is taken at the same
-/// fine position.
+/// position, 0x4b9991).
+#[cfg(test)]
 fn part_screen(
     camera: &Camera,
     position: [f32; 2],
@@ -1632,25 +1770,6 @@ fn part_screen(
 ) -> [i32; 2] {
     let fine = part_fine(position, facing, object);
     camera.project_fine(camera.rotate_fine(fine), level, ground)
-}
-
-/// The depth anchor of a draw group sprite that sits `object` away from
-/// an object at fine position `position` facing `facing`, on `level`, on
-/// ground `base` terrain steps up: at [`part_fine`], raised by the
-/// offset's z, in height units of 16 near-zoom pixels (2 << 3, as
-/// [`sprite_rise`]), the same as a terrain step.
-fn part_anchor(
-    depth: &Depth,
-    camera: &Camera,
-    position: [f32; 2],
-    facing: i16,
-    object: [f32; 3],
-    level: i32,
-    base: f32,
-) -> Anchor {
-    let z = sprite_offset(object)[2];
-    let fine = part_fine(position, facing, object);
-    place(depth, camera, camera.rotate_fine(fine), level, base + z)
 }
 
 /// The draw group view (one bit of 1, 4, 16 and 64) for an object facing
@@ -2080,11 +2199,11 @@ mod tests {
             object(2, 9, [100, 200, 1], &[(CONTAINER, 1), (CONTAINER_SLOT, 1)]),
         );
         // The slot's x turns with the table into y; its height lifts.
-        assert_eq!(held(&objects, slot, 2), Some(([0.0, 4.0], 4.0)));
-        assert_eq!(held(&objects, slot, 1), Some(([0.0; 2], 0.0)));
+        assert_eq!(held(&objects, slot, 2), Some((true, [0.0, 4.0], 4.0)));
+        assert_eq!(held(&objects, slot, 1), Some((false, [0.0; 2], 0.0)));
         // A holder without that slot puts it at its own place.
         objects.get_mut(&2).unwrap().data[CONTAINER_SLOT] = 5;
-        assert_eq!(held(&objects, slot, 2), Some(([0.0; 2], 0.0)));
+        assert_eq!(held(&objects, slot, 2), Some((true, [0.0; 2], 0.0)));
         objects.get_mut(&2).unwrap().data[CONTAINER_SLOT] = 1;
         // A hidden holder hides what it holds.
         objects.get_mut(&1).unwrap().data[HIDDEN] = 1;
@@ -2093,12 +2212,12 @@ mod tests {
         // Holders that hold each other, or an object that holds itself,
         // give no offset, however many other objects there are.
         objects.get_mut(&1).unwrap().data[CONTAINER] = 2;
-        assert_eq!(held(&objects, slot, 2), Some(([0.0; 2], 0.0)));
+        assert_eq!(held(&objects, slot, 2), Some((false, [0.0; 2], 0.0)));
         objects.insert(
             3,
             object(3, TABLE, [0, 0, 1], &[(CONTAINER, 3), (CONTAINER_SLOT, 1)]),
         );
-        assert_eq!(held(&objects, slot, 3), Some(([0.0; 2], 0.0)));
+        assert_eq!(held(&objects, slot, 3), Some((false, [0.0; 2], 0.0)));
     }
 
     #[test]
@@ -2194,7 +2313,8 @@ mod tests {
             );
         }
         let limit = camera::ARRAY_SIZE * 16;
-        let ([x, y], lift) = held(&objects, huge, 199).unwrap();
+        let (is_held, [x, y], lift) = held(&objects, huge, 199).unwrap();
+        assert!(is_held);
         assert!(x.abs() <= limit as f32 && y.abs() <= limit as f32);
         assert!(lift.abs() <= limit as f32);
     }
@@ -2211,15 +2331,45 @@ mod tests {
         assert_eq!(slot_height(5, 4.0), 4.0);
     }
 
+    fn flat_lot(height: u8) -> Lot {
+        let full = lot::FULL * lot::FULL;
+        let empty = || lot::Level {
+            floors: vec![0; full],
+            walls: vec![WallCell::default(); full],
+            rooms: None,
+        };
+        Lot {
+            size: 52,
+            heights: vec![[height; 4]; full],
+            grass: vec![0; full],
+            levels: [empty(), empty()],
+            outdoor_rooms: BTreeSet::new(),
+            room_lights: BTreeMap::new(),
+            room_fractions: BTreeMap::new(),
+            outdoor_light: None,
+            time_of_day: 0,
+            halves: BTreeMap::new(),
+            lamps: [
+                vec![Default::default(); full],
+                vec![Default::default(); full],
+            ],
+            floor_rotation: 0,
+        }
+    }
+
     #[test]
     fn sprite_world_offsets_move_depth_with_the_object_and_camera() {
         let position = [100.0, 200.0];
         let base = 2.0;
+        let lot = flat_lot(2);
         let d = Depth::new(&camera(0));
         let at =
             |c: u8, fine, height| place(&d, &camera(c), camera(c).rotate_fine(fine), 1, height);
-        let part =
-            |c: u8, facing, object| part_anchor(&d, &camera(c), position, facing, object, 1, base);
+        let part = |c: u8, facing, object: [f32; 3]| {
+            let fine = part_fine(position, facing, object);
+            let total_z = base + sprite_offset(object)[2];
+            place_moved(&d, &camera(c), &lot, fine, 1, total_z).1
+        };
         assert_eq!(part(0, 0, [0.0; 3]), at(0, [100, 200], base));
         // One height unit up is one terrain step, and nearer.
         assert_eq!(part(0, 0, [0.0, 0.0, 1.0]), at(0, [100, 200], base + 1.0));
@@ -2235,9 +2385,68 @@ mod tests {
         // Nonsense in a file stays bounded.
         for bad in [f32::NAN, f32::INFINITY, f32::MAX, f32::MIN] {
             let _ = part_fine(position, i16::MIN, [bad, bad, bad]);
-            let _ = part_anchor(&d, &camera(3), position, i16::MIN, [bad, bad, bad], 1, base);
+            let _ = part(3, i16::MIN, [bad, bad, bad]);
             let _ = sprite_rise([bad, bad, bad], Zoom::Near);
         }
+    }
+
+    #[test]
+    fn sloped_objects_round_base_altitude_and_interpolate_moved_sprites() {
+        let mut lot = flat_lot(0);
+        // Tile (10, 12) has corners (0,1)=0, (0,0)=0, (1,0)=0, (1,1)=1.
+        // At its center (8, 8), 0x478dfe returns 0.5 (halfway between (0,0)
+        // and (1,1)), whereas the four-corner mean is 0.25.
+        lot.heights[Lot::cell(10, 12)] = [0, 0, 0, 1];
+        let center = [10 * 16 + 8, 12 * 16 + 8];
+        assert_eq!(lot.altitude_at(center), 0.5);
+        // Off-diagonal point checks (y & 15, x & 15) argument order:
+        // tile (10, 13) has (0,1)=4, (0,0)=0, (1,0)=0, (1,1)=0.
+        lot.heights[Lot::cell(10, 13)] = [4, 0, 0, 0];
+        assert_eq!(lot.altitude_at([10 * 16 + 2, 13 * 16 + 8]), 1.5);
+        assert_eq!(lot.altitude_at([10 * 16 + 8, 13 * 16 + 2]), 0.0);
+        // Off-lot returns 0.0.
+        assert_eq!(lot.altitude_at([-1, 0]), 0.0);
+        assert_eq!(lot.altitude_at([52 * 16, 0]), 0.0);
+
+        // At far zoom, 0x4b97ea rounds altitude 0.5 up to 1 whole step,
+        // lifting screen y by 1 << 2 = 4 px relative to flat ground.
+        let cam = Camera {
+            zoom: Zoom::Far,
+            ..camera(0)
+        };
+        let depth = Depth::new(&cam);
+        let flat = flat_lot(0);
+        let (sloped_screen, _) = place_base(&depth, &cam, &lot, center, 1, 0.5);
+        let (flat_screen, _) = place_base(&depth, &cam, &flat, center, 1, 0.0);
+        assert_eq!(sloped_screen[0], flat_screen[0]);
+        assert_eq!(flat_screen[1] - sloped_screen[1], 4);
+
+        // Moved sprite (0x4b9991 + 0x4a9dc7) on the sloped tile's center
+        // lifts by 0x4a9dc7's integer triangle slope (2 px at far zoom for
+        // h1=0, h3=1 at sx=sy=8: ((0 - 1 + 4) << 2) * 8 / 16 = 6 vs 8 flat).
+        let (moved_screen, _) = place_moved(&depth, &cam, &lot, center, 1, 0.5);
+        assert_eq!(moved_screen[0], flat_screen[0]);
+        assert_eq!(flat_screen[1] - moved_screen[1], 2);
+        // Adding 1.0 of lift above ground_here raises screen y by 4 more px.
+        let (lifted_screen, _) = place_moved(&depth, &cam, &lot, center, 1, 1.5);
+        assert_eq!(moved_screen[1] - lifted_screen[1], 4);
+    }
+
+    #[test]
+    fn flat_trim_depth_offsets_match_binary_table() {
+        assert_eq!(flat_trim_offset(true, true, 0x10, 1), 900);
+        assert_eq!(flat_trim_offset(true, true, 0x10, 2), 900);
+        assert_eq!(flat_trim_offset(true, true, 0x40, 1), 770);
+        assert_eq!(flat_trim_offset(true, true, 0x40, 2), 700);
+        // 0x40 overrides 0x10 when both diagonal bits are set (0x53c497).
+        assert_eq!(flat_trim_offset(true, true, 0x50, 1), 770);
+        assert_eq!(flat_trim_offset(true, true, 0x50, 2), 700);
+        // Standing corner trims only apply -100 for bit 0x40 on level 2.
+        assert_eq!(flat_trim_offset(false, true, 0x40, 2), -100);
+        assert_eq!(flat_trim_offset(false, true, 0x40, 1), 0);
+        assert_eq!(flat_trim_offset(false, true, 0x10, 2), 0);
+        // Non-record run trims always pass 0.
+        assert_eq!(flat_trim_offset(false, false, 0x40, 2), 0);
     }
 
     /// A dining chair scooted in to the table draws its graphic 5, whose
