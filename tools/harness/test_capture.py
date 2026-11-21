@@ -1395,6 +1395,12 @@ class SparseTest(CaptureTest):
                     self.assertEqual(json.loads((output / 'status.json').read_text())['dialog']['shown'], 1)
                 self.assertEqual([r['update'] for r in self.rows(output / 'updates.jsonl')], [1, 2])
                 self.assertIsNone(json.loads((output / 'status.json').read_text())['show_stop'])
+        # A takeover killed before its first stop hands on the show and when it was shown.
+        with patch.object(FakeRemote, 'registers', side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            self.run_capture([dict(pc=capture.DIALOG_SHOW, ecx=0x4000)], ['--updates', '2', '--resume'],
+                             prepare=self.resumed_after(kept, [shown, pressed]))
+        status = json.loads((self.last_output / 'status.json').read_text())
+        self.assertEqual((status['show_stop'], status['dialog']), (registers, kept['dialog']))
         # A stale one is not used at a later show of the same registers.
         with tempfile.TemporaryDirectory(prefix='sims-guest-test-') as guest_dir, \
                 patch.object(capture, 'DialogAnswerer'):
@@ -1419,10 +1425,44 @@ class SparseTest(CaptureTest):
         _, output, _ = self.run_capture([dict(pc=capture.RETURN, step='T05watch:70088;', step_pc=0x4100)],
                                         ['--updates', '2', '--resume', '--watch', 'state=0x70088'], prepare=prepare)
         self.assertEqual(self.events(output, 'resume_torn')[0]['rows'],
-                         {'events.jsonl': '{"kind": "hour_tur', 'updates.jsonl': '{"update": 2, "ti'})
+                         {'events.jsonl': ['{"kind": "hour_tur'], 'updates.jsonl': ['{"update": 2, "ti']})
+        self.assertFalse((output / 'resume-torn.json').exists())
         self.assertEqual([r['update'] for r in self.rows(output / 'updates.jsonl')], [1, 2])
         # A whole row that only lacks its newline is kept.
         self.assertEqual([r.get('name') for r in self.rows(output / 'watch.jsonl')], ['a', 'b', 'state'])
+
+        # A takeover killed after it took them off and before it logged them hands them on.
+        with patch.object(capture, 'drop_redone_events', side_effect=KeyboardInterrupt), \
+                self.assertRaises(KeyboardInterrupt):
+            self.run_capture([dict(pc=capture.RETURN)], ['--updates', '2', '--resume'], prepare=prepare)
+        killed = self.last_output
+        self.assertTrue((killed / 'resume-torn.json').exists())
+
+        def again(output):
+            for name in ('events.jsonl', 'updates.jsonl', 'watch.jsonl', 'resume-torn.json'):
+                (output / name).write_bytes((killed / name).read_bytes())
+        _, output, _ = self.run_capture([dict(pc=capture.RETURN)], ['--updates', '2', '--resume'], prepare=again)
+        self.assertEqual(self.events(output, 'resume_torn')[0]['rows'],
+                         {'events.jsonl': ['{"kind": "hour_tur'], 'updates.jsonl': ['{"update": 2, "ti']})
+
+    def test_the_cut_row_is_found_from_the_end(self):
+        with tempfile.TemporaryDirectory(prefix='sims-torn-test-') as d:
+            path = Path(d) / 'log'
+            for text, found in ((b'', None), (b'{"a": 1}\n', None), (b'{"a": 1}\n{"b": 22', (9, b'{"b": 22')),
+                                (b'{"b": 2', (0, b'{"b": 2')), (b'x' * 50 + b'\n' + b'y' * 30, (51, b'y' * 30))):
+                path.write_bytes(text)
+                self.assertEqual(capture.torn_tail(path, chunk=4), found)
+            self.assertIsNone(capture.torn_tail(Path(d) / 'missing'))
+
+    def test_a_row_of_updates_that_is_not_json_refuses_the_takeover(self):
+        def prepare(output):
+            self.resumed_after({})(output)
+            text = (output / 'updates.jsonl').read_text()
+            (output / 'updates.jsonl').write_text('{"upd\n' + text)
+        with self.assertRaises(SystemExit), patch.object(sys, 'stderr', io.StringIO()) as stderr:
+            self.run_capture([dict(pc=capture.RETURN)], ['--updates', '3', '--resume'], prepare=prepare)
+        self.assertIn('row 1 is not JSON', stderr.getvalue())
+        self.last_remote_class.assert_not_called()
 
     def test_negative_windows_are_refused(self):
         with self.assertRaises(SystemExit), patch.object(sys, 'stderr', io.StringIO()):

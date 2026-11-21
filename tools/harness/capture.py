@@ -530,26 +530,65 @@ def open_dialogs(rows):
     return out
 
 
-def drop_torn_tail(path):
-    """Before a resume: a row cut short by the kill (the file does not end with a newline) is taken off
-    the end of a log, or ended if it is whole JSON. Returns the cut text, or None."""
+def torn_tail(path, chunk=1 << 16):
+    """A row cut short at the end of a log by a kill (the file does not end with a newline): (where it
+    starts, its bytes), or None. Reads from the end only."""
     try:
-        data = path.read_bytes()
+        f = open(path, 'rb')
     except OSError:
         return None
-    if not data or data.endswith(b'\n'):
-        return None
-    start = data.rfind(b'\n') + 1
-    tail = data[start:]
+    with f:
+        end = f.seek(0, os.SEEK_END)
+        if end == 0:
+            return None
+        f.seek(end - 1)
+        if f.read(1) == b'\n':
+            return None
+        tail, at = b'', end
+        while at > 0:
+            step = min(chunk, at)
+            at -= step
+            f.seek(at)
+            tail = f.read(step) + tail
+            cut = tail.rfind(b'\n')
+            if cut >= 0:
+                return at + cut + 1, tail[cut + 1:]
+        return 0, tail
+
+
+def repair_tails(out, names):
+    """Before a resume: a row cut short at the end of each log is taken off, or ended with a newline if
+    it is whole JSON. The cut rows are kept in resume-torn.json first (with any an interrupted takeover
+    left there), so a takeover killed before it logs them (resume_torn) hands them on. Returns them."""
+    sidecar = out / 'resume-torn.json'
     try:
-        json.loads(tail)
-    except ValueError:
-        with open(path, 'r+b') as f:
-            f.truncate(start)
-        return tail.decode(errors='replace')
-    with open(path, 'ab') as f:
-        f.write(b'\n')
-    return None
+        cuts = json.loads(sidecar.read_text())
+    except (OSError, ValueError):
+        cuts = {}
+    fixes = []
+    for name in names:
+        found = torn_tail(out / name)
+        if found is None:
+            continue
+        start, tail = found
+        try:
+            json.loads(tail)
+            fixes.append((name, None))
+        except ValueError:
+            cuts.setdefault(name, []).append(tail.decode(errors='replace'))
+            fixes.append((name, start))
+    if cuts:
+        tmp = out / 'resume-torn.json.tmp'
+        tmp.write_text(json.dumps(cuts))
+        tmp.rename(sidecar)
+    for name, start in fixes:
+        if start is None:
+            with open(out / name, 'ab') as f:
+                f.write(b'\n')
+        else:
+            with open(out / name, 'r+b') as f:
+                f.truncate(start)
+    return cuts
 
 
 def has_baseline(path):
@@ -719,15 +758,19 @@ def main():
     out.mkdir(parents=True, exist_ok=args.resume)
     prior_status, dropped, torn = {}, [], {}
     if args.resume:
-        for name in ('events.jsonl', 'updates.jsonl', 'watch.jsonl'):
-            cut = drop_torn_tail(out / name)
-            if cut is not None:
-                torn[name] = cut
+        torn = repair_tails(out, ('events.jsonl', 'updates.jsonl', 'watch.jsonl'))
         try:
             prior_status = json.loads((out / 'status.json').read_text())
         except (OSError, ValueError):
             pass
         lines = (out / 'updates.jsonl').read_text().splitlines() if (out / 'updates.jsonl').exists() else []
+        # A row of them that is not whole JSON (not at the end, so not cut by the kill) would make the
+        # count wrong. watch.jsonl is only appended to by a takeover, and not checked.
+        for n, line in enumerate(lines, 1):
+            try:
+                json.loads(line)
+            except ValueError:
+                ap.error(f'{out / "updates.jsonl"} row {n} is not JSON: --resume cannot count the updates')
         # Only what the redone return can write again: an hour turn needs the last row's clock, an object
         # change the registry saved with the last row.
         kinds = []
@@ -741,7 +784,7 @@ def main():
     updates_log = open(out / 'updates.jsonl', 'a')
     status = dict(started=time.time(), updates=0, state='attaching', settings={k: str(v) for k, v in vars(args).items()},
                   stepped_to=prior_status.get('stepped_to'), stepped_watch=prior_status.get('stepped_watch'),
-                  stepped_maybe=None, show_stop=prior_status.get('show_stop'))
+                  stepped_maybe=None, show_stop=prior_status.get('show_stop'), dialog=prior_status.get('dialog'))
 
     event_lock = threading.Lock()
 
@@ -991,6 +1034,7 @@ def main():
                 event(kind='registry_unknown', updates=updates, registry_update=prior_status.get('registry_update'))
         if torn:
             event(kind='resume_torn', rows=torn)
+            (out / 'resume-torn.json').unlink(missing_ok=True)
         if dropped:
             event(kind='resume_dropped', events=[dict(kind=r['kind'], update=r['update']) for r in dropped])
         # A late watch an earlier run set counts as set (watch_ended's set covers its whole window).
@@ -1298,7 +1342,7 @@ def main():
                 # handled until the step past it) and was killed before stepping past it. It was
                 # shown to the answerer again above with its press jobs, so it is not shown again.
                 event(kind='took_over_at_dialog_show', record=regs['ecx'], update=updates + 1)
-                shown = (prior_status.get('dialog') or {}).get('shown')
+                shown = (status.get('dialog') or {}).get('shown')
                 save_status(dialog=dict(update=updates + 1, record=regs['ecx'], shown=shown or time.time()))
             else:
                 # A dialog function. ecx is the dialog record (0x436da0 keeps it in esi).

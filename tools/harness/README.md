@@ -161,7 +161,11 @@ Things to know:
   `resume_open_dialogs`. A run killed after logging the show and before
   keeping `show_stop` has its show logged twice. A row cut short by the
   kill at the end of `events.jsonl`, `updates.jsonl` or `watch.jsonl` is
-  taken off (`resume_torn`). Taken over off a breakpoint, the run logs
+  taken off, or ended if it is whole, and logged as `resume_torn` (kept in
+  `resume-torn.json` until then, so a takeover killed first hands it on).
+  A row of `events.jsonl` or `updates.jsonl` that is not JSON anywhere
+  else refuses the takeover; `watch.jsonl` is only appended to, and not
+  checked. Taken over off a breakpoint, the run logs
   `took_over_off_break`; a run killed between a stop at a watchpoint and
   its rows loses those rows (see below for one found by a step).
 - **Memory dumps.** `--dump 14,47 --guest-dir <guest dir>` also saves,
