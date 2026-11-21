@@ -225,6 +225,11 @@ pub struct Lot {
 
     /// The house view's rotation, 0 to 3 ([`Lot::set_view_rotation`]).
     view_rotation: u8,
+    /// The saved house's opening camera direction, 0 to 3
+    /// ([`opening_rotation`]): the rotation that level 1's road-dash floor
+    /// tiles (`10` and `11`) in `world` are oriented for (`0x4a8042`,
+    /// `0x4a861f`, `0x4a87b1`–`0x4a87dc`).
+    floor_rotation: u8,
     /// The tile at the house view's centre, if known
     /// ([`Lot::set_view_centre`]).
     view_centre: Option<[i8; 2]>,
@@ -905,6 +910,7 @@ impl Lot {
             asking: None,
 
             view_rotation,
+            floor_rotation: view_rotation,
             view_centre,
             loaded,
         })
@@ -1441,6 +1447,15 @@ impl Lot {
         self.view_rotation
     }
 
+    /// The house file's saved `HOUS 0` camera direction, 0 to 3
+    /// ([`opening_rotation`]), which pairs with level 1's stored road-dash
+    /// floor IDs (`10` and `11`, `0x4a861f`, `0x4a87b1`–`0x4a87dc`). Unlike
+    /// [`Lot::view_rotation`], this does not change when the camera turns
+    /// because the lot's floor array is not mutated on rotation.
+    pub fn floor_rotation(&self) -> u8 {
+        self.floor_rotation
+    }
+
     /// Turns the house view to `rotation` (taken modulo 4). It is the
     /// player's choice, not the lot's, but the simulation reads it, so it
     /// is an input like an order: the game window sets it whenever its
@@ -1545,6 +1560,7 @@ mod tests {
             asking: None,
 
             view_rotation: 0,
+            floor_rotation: 0,
             view_centre: None,
             loaded,
         }
@@ -1719,5 +1735,33 @@ mod tests {
         let frames = Frames::parse("0+2,1+3").unwrap();
         let drawn: Vec<u32> = (0..=10).filter(|&t| frames.after(t)).collect();
         assert_eq!(drawn, [0, 1, 2, 4, 6, 7, 8, 10]);
+    }
+
+    #[test]
+    fn restore_rejects_a_snapshot_with_a_different_floor_rotation_baseline() {
+        let mut source = lot(World::empty(), true, Frames::default());
+        source.floor_rotation = 0;
+        source.set_view_rotation(1);
+        let saved = source.save().unwrap();
+        let bytes = saved.encode();
+
+        // A lot loaded with a different saved HOUS 0 floor rotation rejects
+        // the snapshot even when the loaded world hash matches.
+        let mut mismatched = lot(World::empty(), true, Frames::default());
+        mismatched.floor_rotation = 1;
+        assert_eq!(
+            mismatched.restore(super::save::Saved::decode(&bytes).unwrap()),
+            Err(super::save::SaveError::OtherLoad)
+        );
+
+        // A lot with the matching floor rotation restores cleanly, keeping
+        // the snapshot's view_rotation and its own floor_rotation.
+        let mut matching = lot(World::empty(), true, Frames::default());
+        matching.floor_rotation = 0;
+        matching
+            .restore(super::save::Saved::decode(&bytes).unwrap())
+            .unwrap();
+        assert_eq!(matching.floor_rotation(), 0);
+        assert_eq!(matching.view_rotation(), 1);
     }
 }

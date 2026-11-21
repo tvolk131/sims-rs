@@ -159,7 +159,9 @@ impl Game {
             .map(|s| format!("The load stopped, so the lot cannot run: {s}"));
         // The booted world, not the file as read: some objects (doors,
         // windows) set how they are drawn in their own init scripts.
-        let lot_shape = sims_render::Lot::from_world(lot.world()).map_err(|e| e.to_string())?;
+        let lot_shape = sims_render::Lot::from_world(lot.world())
+            .map_err(|e| e.to_string())?
+            .with_floor_rotation(lot.floor_rotation());
         let mut hud = Hud::open(
             &options.install,
             house,
@@ -170,7 +172,7 @@ impl Game {
         hud.sync_pause_blink(lot.world().paused(), 0);
         let mut people = People::open(&options.install, house)?;
         people.refresh(lot.world());
-        let view = View::new([800, 600], lot_shape.built_center(), opened.rotation);
+        let view = View::new([800, 600], lot_shape.built_center(), lot.view_rotation());
         let drawn_camera = view.camera;
         Ok(Self {
             lot,
@@ -486,7 +488,7 @@ impl Game {
             self.people.refresh(world);
             // The room lights change as lamps and the time of day do.
             match sims_render::Lot::from_world(world) {
-                Ok(shape) => self.lot_shape = shape,
+                Ok(shape) => self.lot_shape = shape.with_floor_rotation(self.lot.floor_rotation()),
                 Err(e) => {
                     self.people
                         .note(vec![format!("the lot is not redrawn: {e}")]);
@@ -1289,7 +1291,7 @@ impl Game {
         self.pace.restart();
         self.people.refresh(world);
         match sims_render::Lot::from_world(world) {
-            Ok(shape) => self.lot_shape = shape,
+            Ok(shape) => self.lot_shape = shape.with_floor_rotation(self.lot.floor_rotation()),
             Err(e) => self
                 .people
                 .note(vec![format!("the lot is not redrawn: {e}")]),

@@ -417,6 +417,14 @@ fn booted(options: &Options) -> Option<sims_sim::World> {
     }
 }
 
+/// Builds the viewer's render [`Lot`] with the house file's saved `HOUS 0`
+/// camera rotation so level-1 road dashes (`10` and `11`) keep their saved
+/// orientation at opening (`0x4a861f`) and swap on odd-parity turns
+/// (`0x4a8042`–`0x4a80b1`).
+fn viewer_lot(world: &sims_sim::World, rotation: u8) -> sims_render::Result<Lot> {
+    Ok(Lot::from_world(world)?.with_floor_rotation(rotation))
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = options()?;
     let opened = open_house(&options.install, &options.house)?;
@@ -434,7 +442,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None if options.hud => booted(&options).unwrap_or(opened.world),
         None => opened.world,
     };
-    let lot = Lot::from_world(&world)?;
+    let lot = viewer_lot(&world, opened.rotation)?;
     let hud = if options.hud {
         Some(hud::Hud::open(
             &options.install,
@@ -466,4 +474,74 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = EventLoop::new()?;
     event_loop.run_app(&mut viewer)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn viewer_keeps_odd_saved_house_road_dashes_unswapped_at_opening() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            eprintln!("skipping: set SIMS_INSTALL to check House24 in sims-viewer");
+            return;
+        };
+        let house24 = root.join("UserData/Houses/House24.iff");
+        let mut opened = open_house(&root, &house24).unwrap();
+        assert_eq!(opened.rotation, 1);
+        let lot = viewer_lot(&opened.world, opened.rotation).unwrap();
+        assert_eq!(lot.floor_rotation, 1);
+        let view = View::new([1024, 768], lot.built_center(), opened.rotation);
+        assert_eq!(view.camera.rotation, 1);
+
+        // Tile (39, 6) holds stored floor 10 on House24's Y-road. At the
+        // viewer's opening camera (rotation 1), it must draw sprite 10, not
+        // swap to sprite 11 (0x4a861f).
+        let cell = Lot::cell(39, 6);
+        assert_eq!(lot.levels[0].floors[cell], 10);
+        let mut camera = view.camera;
+        camera.zoom = sims_render::Zoom::Near;
+        camera.level = 1;
+        camera.walls = Walls::Down;
+        camera.origin = [0, 0];
+        let elev = i32::from(lot.heights[cell][0]) * 16;
+        let p = camera.project_fine(camera.rotate_fine([39 * 16 + 8, 6 * 16 + 8]), 1, elev);
+        camera.origin = [80 - p[0], 50 - p[1]];
+
+        let mut actual = Canvas::new(160, 100, [0, 0, 0]);
+        draw(
+            &opened.world,
+            &lot,
+            &mut opened.assets,
+            &camera,
+            &mut actual,
+        );
+
+        let wrong_baseline = lot.clone().with_floor_rotation(0);
+        let mut wrong = Canvas::new(160, 100, [0, 0, 0]);
+        draw(
+            &opened.world,
+            &wrong_baseline,
+            &mut opened.assets,
+            &camera,
+            &mut wrong,
+        );
+        assert_ne!(actual, wrong);
+
+        let mut expected_lot = wrong_baseline;
+        for id in &mut expected_lot.levels[0].floors {
+            if matches!(*id, 10 | 11) {
+                *id ^= 1;
+            }
+        }
+        let mut expected = Canvas::new(160, 100, [0, 0, 0]);
+        draw(
+            &opened.world,
+            &expected_lot,
+            &mut opened.assets,
+            &camera,
+            &mut expected,
+        );
+        assert_eq!(actual, expected);
+    }
 }

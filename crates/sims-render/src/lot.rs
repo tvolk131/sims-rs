@@ -94,6 +94,14 @@ pub struct Lot {
     pub halves: BTreeMap<[u8; 3], [(u8, i16); 2]>,
     /// Each tile's lamps, by level (0 or 1) and cell: see [`Lamps`].
     pub lamps: [Vec<Lamps>; 2],
+    /// The camera rotation (`0..=3`) that `levels[0].floors`'s road-dash
+    /// tiles (`10` and `11`) are oriented for: `HOUS 0`'s saved
+    /// `camera_direction & 3` (`0` by default). The original swaps `10` and
+    /// `11` in place across level 1's floor array on each odd-parity view
+    /// turn (`0x4a7dfe`, `0x4a8042` to `0x4a80b1`) and loads without
+    /// swapping (`0x4a861f`), so saved arrays keep their last turn's
+    /// orientation.
+    pub floor_rotation: u8,
 }
 
 /// The offsets from a tile to the two nearest lit lamps of its room, in
@@ -251,7 +259,15 @@ impl Lot {
             time_of_day: world.globals.get(4).copied().unwrap_or(0),
             halves,
             lamps,
+            floor_rotation: 0,
         })
+    }
+
+    /// Sets [`Lot::floor_rotation`] to `rotation & 3`, matching a house
+    /// file's saved `camera_direction` (`HOUS 0`).
+    pub fn with_floor_rotation(mut self, rotation: u8) -> Self {
+        self.floor_rotation = rotation & 3;
+        self
     }
 
     /// The middle of what is built on the ground level (the box around its

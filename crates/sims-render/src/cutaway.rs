@@ -674,6 +674,7 @@ mod tests {
             time_of_day: 0,
             halves: Default::default(),
             lamps: Default::default(),
+            floor_rotation: 0,
         }
     }
 
