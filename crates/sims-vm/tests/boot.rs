@@ -408,6 +408,7 @@ fn recorded_pools(original: &sims_content::Neighborhood, files: &[(u32, PathBuf)
     }
     PoolInput {
         people,
+        loaded_skeletons: ["adult".to_owned(), "child".to_owned()].into(),
         transition: Some(LotTransition {
             reload: true,
             crt_draws: 64,

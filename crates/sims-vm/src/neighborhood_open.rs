@@ -32,7 +32,7 @@ use sims_formats::iff::{Iff, write};
 use sims_formats::iff_write::{ChunkWrite, write_chunk_with_residue};
 use sims_sim::neighbors::registry;
 use sims_sim::patch_import::{self, Context, Patch, open, pending};
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::Path;
 
@@ -256,26 +256,37 @@ fn pool_skeletons(
     catalog: &Catalog,
     registered: &[sims_sim::neighbors::Registered],
 ) -> Result<pools::Skeletons, BootError> {
-    let mut by_name = BTreeMap::new();
-    let mut scales = |name: &str| -> Result<Vec<i32>, String> {
-        by_name
-            .entry(name.to_ascii_lowercase())
-            .or_insert_with(|| {
-                skeleton_scales(install, index, name).map_err(|error| error.to_string())
-            })
-            .clone()
-    };
     let mut skeletons = pools::Skeletons::default();
+    let mut names = BTreeSet::from(["adult".to_owned(), "child".to_owned()]);
     for entry in registered {
-        if matches!(entry.kind, 0x800 | 0x200 | 0x1000 | 0x400) && entry.resolves {
-            let found = skeleton_name(index, catalog, entry.guid)
-                .map_err(|error| error.to_string())
-                .and_then(|name| scales(&name));
-            skeletons.templates.insert(entry.guid, found);
+        if !(matches!(entry.kind, 0x800 | 0x200 | 0x1000 | 0x400) && entry.resolves) {
+            continue;
         }
+        // The registry resolves a GUID to its last definition in reload
+        // order, but the catalog keeps the index's; with two, which one
+        // the registry gives is not followed here.
+        let definitions = catalog
+            .objects
+            .iter()
+            .filter(|object| object.guid == entry.guid)
+            .count();
+        let name = if definitions == 1 {
+            skeleton_name(index, catalog, entry.guid).map_err(|error| error.to_string())
+        } else {
+            Err(format!(
+                "{definitions} definitions have the GUID {:#010x}; reading the one the \
+                 registry resolves to is unported",
+                entry.guid
+            ))
+        };
+        if let Ok(name) = &name {
+            names.insert(name.clone());
+        }
+        skeletons.templates.insert(entry.guid, name);
     }
-    for name in ["adult", "child"] {
-        skeletons.profiles.insert(name, scales(name));
+    for name in names {
+        let scales = skeleton_scales(install, index, &name).map_err(|error| error.to_string());
+        skeletons.scales.insert(name, scales);
     }
     Ok(skeletons)
 }

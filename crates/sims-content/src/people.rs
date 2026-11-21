@@ -256,33 +256,72 @@ pub fn skeleton_name(index: &Index, catalog: &Catalog, guid: u32) -> Result<Stri
         })
 }
 
-/// The bone scales of the skeleton named `name` (looked up by name, as
-/// 0x5a0384 does), found as [`People::load`] finds a person's skeleton:
-/// among the skeleton files of `GameData/Animation` and of the indexed
-/// object directories. No file defining it, or two files defining it,
-/// fails, naming them, since the original's avatar registry, which would
-/// choose, is not ported.
+/// The bone scales of the skeleton named `name`, looked up as 0x5a0384
+/// does: by the name as given (0x5a2099), compared byte for byte
+/// (0x5a280f). The skeletons are those of the avatar files `People::load`
+/// searches (`GameData/Animation`, then the indexed object directories),
+/// each file read record by record through its skeleton group, so a file
+/// that also holds suits or animations still counts.
+///
+/// Fails, naming the files, when:
+/// - no file defines the name, or two do (the original's avatar registry,
+///   which would choose, is not ported);
+/// - a skeleton's name differs from `name` only in case, since whether
+///   the registry folds case when it registers a skeleton is not traced;
+/// - a file's skeleton group does not decode, since it could hold the
+///   name.
 pub fn skeleton_scales(install: &Install, index: &Index, name: &str) -> Result<Vec<i32>> {
-    let avatar_files = avatar_files(install, index)?;
-    let files = skeleton_files(install, &avatar_files)?;
-    let mut found = files.iter().flat_map(|(file, skeletons)| {
-        skeletons
-            .iter()
-            .filter(|(n, ..)| n.eq_ignore_ascii_case(name))
-            .map(move |(_, scales, _)| (file, scales))
-    });
-    let Some((file, scales)) = found.next() else {
-        return Err(Error::Unsupported(format!(
-            "no skeleton file defines the skeleton {name:?}"
-        )));
-    };
-    if let Some((other, _)) = found.next() {
-        return Err(Error::Unsupported(format!(
-            "the skeleton {name:?} is defined by {file} and by {other}; choosing between \
-             them needs the original's avatar registry, which is not ported"
-        )));
+    let mut found = Vec::new();
+    for resource in avatar_files(install, index)? {
+        let bytes = resource.read()?;
+        let location = resource.location(&install.root);
+        let unreadable = |error: sims_formats::Error| {
+            Error::Unsupported(format!(
+                "0x5a0384: the skeletons of {location} do not decode ({error}), \
+                 so whether it defines {name:?} is unknown"
+            ))
+        };
+        let mut catalog = Binary::new(&bytes);
+        let count = catalog
+            .count(Kind::Skeleton)
+            .map_err(unreadable)?
+            .unwrap_or(0);
+        for _ in 0..count {
+            let Asset::Skeleton(skeleton) = catalog.read(Kind::Skeleton).map_err(unreadable)?
+            else {
+                continue;
+            };
+            if skeleton.name == name {
+                let scales = skeleton
+                    .bones
+                    .iter()
+                    .map(|b| b.wiggle.gradient_scale)
+                    .collect();
+                found.push((location.clone(), scales));
+            } else if skeleton.name.eq_ignore_ascii_case(name) {
+                return Err(Error::Unsupported(format!(
+                    "0x5a280f: {location} defines the skeleton {:?}, which differs from \
+                     {name:?} only in case; whether the avatar registry folds case is not traced",
+                    skeleton.name
+                )));
+            }
+        }
     }
-    Ok(scales.clone())
+    match <[_; 1]>::try_from(found) {
+        Ok([(_, scales)]) => Ok(scales),
+        Err(found) if found.is_empty() => Err(Error::Unsupported(format!(
+            "0x5a0384: no skeleton file defines the skeleton {name:?}"
+        ))),
+        Err(found) => Err(Error::Unsupported(format!(
+            "0x5a0384: the skeleton {name:?} is defined by {}; choosing between them needs \
+             the original's avatar registry, which is not ported",
+            found
+                .iter()
+                .map(|(file, _)| file.as_str())
+                .collect::<Vec<_>>()
+                .join(" and ")
+        ))),
+    }
 }
 
 /// The body strings of the person definition `chunk` of a character

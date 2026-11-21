@@ -60,10 +60,22 @@ it against the OBJD. Each temporary person copies a skeleton (0x4596f6,
 first is made from the pool's template and copies the template's
 skeleton (0x426e8e): a tourist child's first actor is an adult. A
 second is made after the age and skeleton are set (0x426e97 via
-0x40cc2a) and copies the one the profile names. Each skeleton is looked
-up by name (0x5a0384) in the installed avatar files; a name no file
-defines, or two files define, fails, and a template the pools cannot
-use does not stop the open. The copy draws by the skeleton's own bone
+0x40cc2a) and copies the one the profile's age sets. A Townie makes
+only the first (0x426646, 0x4269c5). Each skeleton is looked up as
+0x5a0384 does, by its name compared byte for byte (0x5a280f), in the
+installed avatar files read record by record. These fail, and only when
+a pool person needs that skeleton:
+- a name no file defines, or two files define;
+- a name defined in another case, since whether the registry folds case
+  is not traced;
+- a file whose skeletons do not decode;
+- a template GUID with two definitions, since the registry and the
+  catalog order them differently.
+
+The skeletons must already be loaded (`PoolInput::loaded_skeletons`). A
+skeleton loaded on first use (0x5a03cd) fails, since its draws are not
+ported. Both captures fit `adult` and `child` loaded; that is fitted,
+not traced. The copy draws by the skeleton's own bone
 scales (1,392 draws for the Complete Collection's adult and child).
 Each copy is followed by two default-trait passes (0x4598d4 and
 0x459a6d into 0x459a9c). Both are conditional; the replay takes both as

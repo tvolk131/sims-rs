@@ -28,6 +28,11 @@ pub struct PoolInput {
     /// The later lot or toolbar dispatch. A view open alone stops after
     /// Magic Town (0x5580e9, 0x55fb4c).
     pub transition: Option<LotTransition>,
+    /// The skeletons, by name, already loaded when the pools run. A
+    /// temporary actor's skeleton not among them would be loaded on first
+    /// use (0x5a03cd), whose draws are not ported, so it fails. Both UD2
+    /// captures fit `adult` and `child` loaded; that is fitted, not traced.
+    pub loaded_skeletons: BTreeSet<String>,
 }
 
 #[derive(Debug)]
@@ -140,14 +145,15 @@ const TOURISTS: Pool = Pool {
     collision: "0x42b975",
 };
 
-/// The bone scales the pool people's temporary actors copy, or why a
+/// The skeletons the pool people's temporary actors copy, or why a
 /// lookup failed (reported only when a person needs it).
 #[derive(Debug, Default)]
 pub(super) struct Skeletons {
-    /// The first actor's: each template's skeleton, by template GUID.
-    pub templates: BTreeMap<u32, Result<Vec<i32>, String>>,
-    /// A second actor's: the skeleton its profile names, by name.
-    pub profiles: BTreeMap<&'static str, Result<Vec<i32>, String>>,
+    /// The first actor's: each template's skeleton name, by template GUID.
+    pub templates: BTreeMap<u32, Result<String, String>>,
+    /// Each skeleton's own bone scales, by name: the templates' and a
+    /// second actor's (`adult` or `child`).
+    pub scales: BTreeMap<String, Result<Vec<i32>, String>>,
 }
 
 pub(super) struct FilledPools<'a> {
@@ -181,6 +187,7 @@ pub(super) fn fill<'a>(
         },
         next_file: imported.next_file,
         skeletons,
+        loaded_skeletons: &input.loaded_skeletons,
         files,
         made: Vec::new(),
     };
@@ -228,6 +235,7 @@ struct Fills<'a, 'b> {
     draws: Draws<'b>,
     next_file: i32,
     skeletons: &'b Skeletons,
+    loaded_skeletons: &'a BTreeSet<String>,
     files: BTreeSet<i32>,
     made: Vec<(i32, &'a Iff)>,
 }
@@ -431,25 +439,57 @@ impl<'a, 'b> Fills<'a, 'b> {
         }
 
         let mut data = vec![0; PERSON_WORDS];
-        let skeleton = read_profile(iff, objd, self.context.language, &mut data)?;
-        let lookup = |scales: Option<&'b Result<Vec<i32>, String>>, what: &str| match scales {
-            Some(Ok(scales)) => Ok(scales.as_slice()),
-            Some(Err(reason)) => Err(format!("0x5a0384: {what} for User{file:05}: {reason}")),
-            None => Err(format!(
-                "0x5a0384: no skeleton looked up for {what} of User{file:05}"
-            )),
+        let skeleton = read_profile(
+            iff,
+            objd,
+            self.context.language,
+            pool.actors == 2,
+            &mut data,
+        )?;
+        let skeletons: &'b Skeletons = self.skeletons;
+        let template = match skeletons.templates.get(&source) {
+            Some(Ok(name)) => name.as_str(),
+            Some(Err(reason)) => {
+                return Err(format!(
+                    "0x5a0384: template {source:#010x}'s skeleton for User{file:05}: {reason}"
+                )
+                .into());
+            }
+            None => {
+                return Err(format!(
+                    "0x5a0384: no skeleton looked up for template {source:#010x} of User{file:05}"
+                )
+                .into());
+            }
         };
         // The first actor is made from the template (0x426e8e), a second
-        // after the age is set (0x426e97 via 0x40cc2a).
-        let skeletons: &'b Skeletons = self.skeletons;
-        let first = lookup(
-            skeletons.templates.get(&source),
-            &format!("template {source:#010x}'s skeleton"),
-        )?;
-        let second = lookup(
-            skeletons.profiles.get(skeleton),
-            &format!("the profile's skeleton {skeleton:?}"),
-        )?;
+        // after the age and skeleton are set (0x426e97 via 0x40cc2a). A
+        // Townie makes only the first (0x426646, 0x4269c5).
+        let mut copies = Vec::with_capacity(pool.actors);
+        for name in [template, skeleton].into_iter().take(pool.actors) {
+            if !self.loaded_skeletons.contains(name) {
+                return Err(format!(
+                    "0x5a03cd: the skeleton {name:?} for User{file:05} is not loaded yet; \
+                     loading it on first use is unported"
+                )
+                .into());
+            }
+            match skeletons.scales.get(name) {
+                Some(Ok(scales)) => copies.push(scales.as_slice()),
+                Some(Err(reason)) => {
+                    return Err(format!(
+                        "0x5a0384: the skeleton {name:?} for User{file:05}: {reason}"
+                    )
+                    .into());
+                }
+                None => {
+                    return Err(format!(
+                        "0x5a0384: no skeleton {name:?} looked up for User{file:05}"
+                    )
+                    .into());
+                }
+            }
+        }
         let (age, gender) = (data[field::AGE], data[field::GENDER]);
         let editor_words = match pool.done {
             done if done == CELEBRITIES.done => CELEBRITY_WORDS,
@@ -470,7 +510,7 @@ impl<'a, 'b> Fills<'a, 'b> {
         // The skeleton's file is taken as already read (0x598af7), so
         // only the actor's own copy draws (0x598da3). The final pass
         // survives 0x4ea538 → 0x425a69.
-        for scales in [first, second].into_iter().take(pool.actors) {
+        for scales in copies {
             self.draws.skeleton(scales);
             self.draws.default_traits();
             for (word, value) in self.draws.default_traits() {
@@ -502,11 +542,15 @@ impl<'a, 'b> Fills<'a, 'b> {
 /// decoded as the actor's profile (0x5888d3). The human semi-global tone
 /// table (STR# 8192) at the supported Complete Collection layout indexes
 /// light, dark and medium this way.
-/// Returns the profile's skeleton name, `adult` or `child`.
+/// Returns the skeleton 0x40cc2a sets for the profile's age, `adult` or
+/// `child`. With `check_skeleton` (a pool that makes a second actor from
+/// it), the body strings' skeleton must be that one; a one-actor pool
+/// copies only the template's.
 fn read_profile(
     iff: &Iff,
     objd: &[u8],
     language: u8,
+    check_skeleton: bool,
     data: &mut [i16],
 ) -> Result<&'static str, BootError> {
     let id = u16::from_le_bytes(objd[38..40].try_into()?);
@@ -533,7 +577,7 @@ fn read_profile(
     };
     if !matches(gender, &["male", "female"])
         || !matches(skin, &tones[1..])
-        || !matches(string(characters::SKELETON), &[skeleton])
+        || (check_skeleton && !matches(string(characters::SKELETON), &[skeleton]))
     {
         return Err("0x5888d3: unsupported pool character profile".into());
     }
