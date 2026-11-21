@@ -48,6 +48,18 @@ use crate::fault::{Fault, Trap};
 use crate::interpreter::Interpreter;
 use sims_sim::World;
 
+/// Result of resolving a multi-tile group's catalog master (`0x440b63`).
+pub(crate) enum GroupPlan {
+    /// Tile GUIDs in construction order, starting with the lead tile.
+    Tiles(Vec<u32>),
+    /// `0x440b90`: the requested definition is not a group's catalog master;
+    /// the original makes nothing and returns 0.
+    NotMaster,
+    /// `0x440c9b`: the catalog master's group names no lead tile; the
+    /// original makes nothing and returns 0.
+    NoLead,
+}
+
 impl Interpreter<'_> {
     /// Makes a multi-tile object from its group's catalog master `guid`
     /// and returns its lead tile's ID. Every tile's Init and first turn
@@ -61,11 +73,44 @@ impl Interpreter<'_> {
             at: None,
             trap,
         };
+        let plan = self.group_plan(guid).map_err(|trap| fail(0, trap))?;
+        self.create_group_tiles(world, guid, plan)
+    }
+
+    /// Like [`Self::create_group`], but returns `Ok(None)` when the native
+    /// factory refuses to construct the group and returns 0 (`0x440b90` or
+    /// `0x440c9b`).
+    pub(crate) fn try_create_group(
+        &self,
+        world: &mut World,
+        guid: u32,
+    ) -> Result<Option<u16>, Fault> {
+        let fail = |object, trap| Fault {
+            object,
+            at: None,
+            trap,
+        };
+        match self.try_group_plan(guid).map_err(|trap| fail(0, trap))? {
+            GroupPlan::Tiles(plan) => self.create_group_tiles(world, guid, plan).map(Some),
+            GroupPlan::NotMaster | GroupPlan::NoLead => Ok(None),
+        }
+    }
+
+    fn create_group_tiles(
+        &self,
+        world: &mut World,
+        guid: u32,
+        plan: Vec<u32>,
+    ) -> Result<u16, Fault> {
+        let fail = |object, trap| Fault {
+            object,
+            at: None,
+            trap,
+        };
         let master = self
             .machine(world, 0, 0, false)
             .definition_words(guid)
             .map_err(|trap| fail(0, trap))?;
-        let plan = self.group_plan(guid).map_err(|trap| fail(0, trap))?;
         let mut parts: Vec<u16> = Vec::with_capacity(plan.len());
         for tile in plan {
             let id = (1..=i16::MAX as u16)
@@ -128,6 +173,24 @@ impl Interpreter<'_> {
     /// (0x440c9b), which fails here, and so does a definition that is
     /// not a catalog master (0x440b90) or a lead that is the master.
     pub(crate) fn group_plan(&self, guid: u32) -> Result<Vec<u32>, Trap> {
+        match self.try_group_plan(guid)? {
+            GroupPlan::Tiles(tiles) => Ok(tiles),
+            GroupPlan::NotMaster => Err(Trap::Unsupported(format!(
+                "making 0x{guid:08X}, which is not a multi-tile group's catalog master: the \
+                 original makes nothing and returns 0 (0x440b90), and what its caller does \
+                 with that is not ported"
+            ))),
+            GroupPlan::NoLead => Err(Trap::Unsupported(format!(
+                "the multi-tile group of 0x{guid:08X} names no lead tile: the original \
+                 makes nothing and returns 0 (0x440c9b), and what its caller does with \
+                 that is not ported"
+            ))),
+        }
+    }
+
+    /// Like [`Self::group_plan`], distinguishing the two native factory-zero
+    /// returns (`0x440b90` and `0x440c9b`) from unported or invalid cases.
+    pub(crate) fn try_group_plan(&self, guid: u32) -> Result<GroupPlan, Trap> {
         let definition = self
             .catalog
             .object(guid)
@@ -144,11 +207,7 @@ impl Interpreter<'_> {
         })?;
         let group = master[word::GROUP];
         if group == 0 || master[word::SUB_INDEX] != -1 {
-            return Err(Trap::Unsupported(format!(
-                "making 0x{guid:08X}, which is not a multi-tile group's catalog master: the \
-                 original makes nothing and returns 0 (0x440b90), and what its caller does \
-                 with that is not ported"
-            )));
+            return Ok(GroupPlan::NotMaster);
         }
         let members: Vec<(u16, &[i16; crate::DEFINITION_WORDS])> = library
             .definition_order
@@ -156,7 +215,7 @@ impl Interpreter<'_> {
             .filter_map(|chunk| Some((*chunk, library.definitions.get(chunk)?)))
             .filter(|(_, words)| words[word::GROUP] == group)
             .collect();
-        let lead = members
+        let Some(lead) = members
             .iter()
             .find(|(_, words)| words[word::LEAD] != 0)
             .or_else(|| {
@@ -164,13 +223,9 @@ impl Interpreter<'_> {
                     .iter()
                     .find(|(_, words)| words[word::SUB_INDEX] == 0 && words[word::LEVEL] == 0)
             })
-            .ok_or_else(|| {
-                Trap::Unsupported(format!(
-                    "the multi-tile group of 0x{guid:08X} names no lead tile: the original \
-                     makes nothing and returns 0 (0x440c9b), and what its caller does with \
-                     that is not ported"
-                ))
-            })?;
+        else {
+            return Ok(GroupPlan::NoLead);
+        };
         if lead.1[word::SUB_INDEX] == -1 {
             return Err(Trap::Unsupported(format!(
                 "the multi-tile group of 0x{guid:08X} names its catalog master as its lead \
@@ -201,6 +256,6 @@ impl Interpreter<'_> {
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(tiles)
+        Ok(GroupPlan::Tiles(tiles))
     }
 }

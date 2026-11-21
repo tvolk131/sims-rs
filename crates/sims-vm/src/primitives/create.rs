@@ -77,10 +77,11 @@ use crate::factory::TURN_BUDGET;
 use crate::factory::word::{GROUP, TYPE};
 use crate::fault::Trap;
 use crate::interpreter::Machine;
-use crate::placement::{Place, closed_directions, head, on_lot, standing_on};
+use crate::placement::{Cursor, Place, closed_directions, head, on_lot};
 use crate::visits::function;
 use sims_sim::World;
 use sims_sim::rooms::NO_ROOM;
+use std::collections::BTreeSet;
 
 /// Flag 0x1: nothing is made where an object of the same type already
 /// stands (0x44e4e1).
@@ -300,7 +301,10 @@ impl Machine<'_, '_> {
                     _ => (0, 0),
                 };
                 dst.position = [p0.wrapping_add(step0 * 16), p1.wrapping_add(step1 * 16)];
-                dst.facing = Some((direction + 4) % 8);
+                // 0x44e1dc -> 0x44e5ae: `-1` is the wall-check skip sentinel
+                // (e.g. facing 0 + turn -5 => (-1) % 8 == -1).
+                let facing = (direction + 4) % 8;
+                dst.facing = (facing != -1).then_some(facing);
             }
             // Modes outside 0..=14 (0x44e147 cmp eax, 0xe; ja 0x44e4c5): fall
             // through with the initial `[0, 0]` destination.
@@ -380,11 +384,16 @@ impl Machine<'_, '_> {
                 return Ok(false);
             }
         }
-        let person = self.definition_words(guid)?[TYPE] == PERSON;
+        let words = self.definition_words(guid)?;
+        let person = words[TYPE] == PERSON && words[GROUP] == 0;
         let created = if person {
             self.make_person(guid)?
         } else {
-            self.make(guid)?
+            let Some(id) = self.make(guid)? else {
+                // 0x44e5d8: native factory returned 0 (0x440b90 / 0x440c9b).
+                return Ok(false);
+            };
+            id
         };
         if flags & FACE_AS_STACK_OBJECT != 0 {
             self.face_as_stack_object(created, person)?;
@@ -392,16 +401,19 @@ impl Machine<'_, '_> {
         if !dst.place_on_lot {
             return self.finish_new(created, flags);
         }
-        if let Some(container) = dst.container
-            && !self.world.objects.contains_key(&container)
-        {
-            return Err(Trap::Unsupported(format!(
-                "Create New Object Instance mode {mode}: object {created}'s Init removed its \
-                 container {container}, which the original reads after it is freed"
-            )));
-        }
         let dynamic = self.dynamic_group(created)?;
-        let position = if dynamic {
+        let position = if let Some(container) = dst.container {
+            let Some(host) = self.world.objects.get(&container) else {
+                return Err(Trap::Unsupported(format!(
+                    "Create New Object Instance mode {mode}: object {created}'s Init removed its \
+                     container {container}, which the original reads after it is freed"
+                )));
+            };
+            // 0x43268c: when a container is given, the place takes the
+            // container's current X/Y coordinates after Init and turning,
+            // keeping the level captured before creation (0x4326b8).
+            [host.position[0], host.position[1]]
+        } else if dynamic {
             // 0x44e770: the place is the middle of its tile.
             dst.position.map(|p| (p & !7) | 8)
         } else {
@@ -456,25 +468,32 @@ impl Machine<'_, '_> {
                     .program
                     .named_tree(owner, INIT_VISITOR_TREE)
                     .map_err(Trap::Unsupported)?
+                    && let Err(fault) = self.interpreter().call_as(
+                        self.world,
+                        created,
+                        created,
+                        tree,
+                        created as i16,
+                        &temps,
+                        temps.len(),
+                        TURN_BUDGET,
+                        self.checking,
+                    )
                 {
-                    self.interpreter()
-                        .call_as(
-                            self.world,
-                            created,
-                            created,
-                            tree,
-                            created as i16,
-                            &temps,
-                            temps.len(),
-                            TURN_BUDGET,
-                            self.checking,
-                        )
-                        .map_err(|fault: crate::fault::Fault| {
-                            fault.unsupported_in(format!(
-                                "Create New Object Instance: the \"init visitor\" tree \
-                                 {tree:#06x} of person {created}"
-                            ))
-                        })?;
+                    // 0x474aae catches a native error from "init visitor" on
+                    // the visitor's thread and returns to 0x44e87c. Without
+                    // modeling that visitor error handler we trap loudly,
+                    // except when flags 0x02|0x10 are both set: native
+                    // immediately raises 0x36 on the caller at 0x44e89c
+                    // regardless of the visitor fault.
+                    let flag_conflict = flags & (PASS_ME_AND_STACK | TEMP_0_TO_NEW)
+                        == (PASS_ME_AND_STACK | TEMP_0_TO_NEW);
+                    if !(flag_conflict && fault.trap.code().is_some()) {
+                        return Err(fault.unsupported_in(format!(
+                            "Create New Object Instance: the \"init visitor\" tree \
+                             {tree:#06x} of person {created}"
+                        )));
+                    }
                 }
             }
         }
@@ -537,9 +556,9 @@ impl Machine<'_, '_> {
         Ok(true)
     }
 
-    fn make(&mut self, guid: u32) -> Result<u16, Trap> {
+    fn make(&mut self, guid: u32) -> Result<Option<u16>, Trap> {
         self.interpreter()
-            .create(self.world, guid)
+            .try_create(self.world, guid)
             .map_err(|fault: crate::fault::Fault| {
                 fault.unsupported_in(format!("creating an object of type 0x{guid:08X}"))
             })
@@ -590,13 +609,18 @@ impl Machine<'_, '_> {
     /// Flag 0x1's test (0x44e4e1 to 0x44e51c): whether an object of type
     /// `guid` stands on the tile of `position` at `level`, or is held,
     /// however deep, by one that does. The original walks the tile's
-    /// objects and what they hold (0x43f331, 0x43f379; [`standing_on`])
-    /// and compares each one's definition (object +0x11c) with the new
-    /// object's; a tile off the lot's arrays or off levels 1 and 2 has
-    /// none (0x432500).
+    /// objects and what they hold (0x43f331, 0x43f379; [`Cursor`]),
+    /// comparing each one's definition (object +0x11c) with the new
+    /// object's and returning on the first match (0x44e508 to 0x44e50e);
+    /// a tile off the lot's arrays or off levels 1 and 2 has none (0x432500).
     fn same_type_on_tile(&self, guid: u32, position: [i32; 2], level: i32) -> Result<bool, Trap> {
-        let [a, b, level] = World::tile([position[0], position[1], level]);
-        for id in standing_on(self.world, [a as u8, b as u8, level as u8])? {
+        let mut cursor =
+            Cursor::on_tile(self.world, World::tile([position[0], position[1], level]));
+        let mut seen = BTreeSet::new();
+        while let Some(id) = cursor.current() {
+            if !seen.insert(id) {
+                return Err(Trap::Invalid("the objects on a tile link in a loop".into()));
+            }
             let object = self
                 .world
                 .objects
@@ -605,6 +629,7 @@ impl Machine<'_, '_> {
             if object.guid == guid {
                 return Ok(true);
             }
+            cursor.advance(self.world)?;
         }
         Ok(false)
     }

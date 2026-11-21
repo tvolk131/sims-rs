@@ -427,9 +427,20 @@ fn flag_0x20_turns_the_new_object_by_its_turn_step_to_the_stack_objects_facing()
 fn mode_8_with_conflicting_flags_or_a_person_it_cannot_make_fails_loudly() {
     let (mut fx, _) = placeable();
     fx.lamp_mut().position = [40, 40, 1];
-    // Flags 0x02 and 0x10 cannot be combined: native error 0x36 (0x44e88c).
+    let before: Vec<u16> = fx.world.objects.keys().copied().collect();
+    // Flags 0x02 and 0x10 cannot be combined: native error 0x36 (0x44e88c)
+    // fires after the new object is created and placed on the lot.
     let result = create(&mut fx, 0, 0x12, SIM as i16);
     assert_eq!(trap(result).code(), Some(0x36));
+    let made: Vec<u16> = fx
+        .world
+        .objects
+        .keys()
+        .copied()
+        .filter(|id| !before.contains(id))
+        .collect();
+    assert_eq!(made.len(), 1);
+    assert_eq!(fx.world.objects[&made[0]].position, [40, 40, 1]);
     // A person type with no skeleton supplied.
     let (mut fx, file) = placeable();
     fx.lamp_mut().position = [40, 40, 1];

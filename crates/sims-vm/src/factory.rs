@@ -97,21 +97,63 @@ impl Interpreter<'_> {
             .map_err(|trap| fail(0, trap))?[word::GROUP];
         if group != 0 {
             let lead = self.create_group(world, guid)?;
-            // The factory's signal 0xe2 names the group's lead (0x440ed7),
-            // and the lot runs the visitor pass if the lead's definition
-            // is a person's (0x4163f7).
-            let lead_guid = world.objects.get(&lead).map(|o| o.guid);
-            if let Some(lead_guid) = lead_guid {
-                let kind = self
-                    .machine(world, 0, 0, false)
-                    .definition_words(lead_guid)
-                    .map_err(|trap| fail(lead, trap))?[word::TYPE];
-                if kind == 2 {
-                    self.visitor_pass(world).map_err(|trap| fail(lead, trap))?;
-                }
-            }
+            self.finish_created_group(world, lead)?;
             return Ok(lead);
         }
+        self.create_single(world, guid)
+    }
+
+    /// Like [`Self::create`], but returns `Ok(None)` when the native factory
+    /// makes nothing and returns 0 (`0x440b90` non-master group member or
+    /// `0x440c9b` group master with no lead tile).
+    pub(crate) fn try_create(&self, world: &mut World, guid: u32) -> Result<Option<u16>, Fault> {
+        let fail = |object, trap| Fault {
+            object,
+            at: None,
+            trap,
+        };
+        let group = self
+            .machine(world, 0, 0, false)
+            .definition_words(guid)
+            .map_err(|trap| fail(0, trap))?[word::GROUP];
+        if group != 0 {
+            let Some(lead) = self.try_create_group(world, guid)? else {
+                return Ok(None);
+            };
+            self.finish_created_group(world, lead)?;
+            return Ok(Some(lead));
+        }
+        self.create_single(world, guid).map(Some)
+    }
+
+    fn finish_created_group(&self, world: &mut World, lead: u16) -> Result<(), Fault> {
+        let fail = |object, trap| Fault {
+            object,
+            at: None,
+            trap,
+        };
+        // The factory's signal 0xe2 names the group's lead (0x440ed7),
+        // and the lot runs the visitor pass if the lead's definition
+        // is a person's (0x4163f7).
+        let lead_guid = world.objects.get(&lead).map(|o| o.guid);
+        if let Some(lead_guid) = lead_guid {
+            let kind = self
+                .machine(world, 0, 0, false)
+                .definition_words(lead_guid)
+                .map_err(|trap| fail(lead, trap))?[word::TYPE];
+            if kind == 2 {
+                self.visitor_pass(world).map_err(|trap| fail(lead, trap))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn create_single(&self, world: &mut World, guid: u32) -> Result<u16, Fault> {
+        let fail = |object, trap| Fault {
+            object,
+            at: None,
+            trap,
+        };
         let id = (1..=i16::MAX as u16)
             .find(|id| !world.objects.contains_key(id))
             .ok_or_else(|| fail(0, Trap::Unsupported("no unused object ID".into())))?;
