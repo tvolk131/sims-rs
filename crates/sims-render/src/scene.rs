@@ -824,9 +824,18 @@ impl<'a> Painter<'a> {
                         .unwrap_or(1.0);
                     let seen = seen_tile(self.camera, s.from, s.to);
                     let light = self.wall_light(index, Some(fraction), seen);
-                    self.place_wall(&image, frame, ends, heights, level, &light, None);
+                    self.place_wall(&image, frame, ends, heights, level, &light, None, 0);
                     if let Some(shape) = capped {
-                        let (trim, mask) = if shape == 7 { (252, 9) } else { (253, 10) };
+                        // On an edge-on diagonal the strip is always
+                        // pattern 252 in shape 9, whichever end is marked
+                        // (0x53eb6d to 0x53ebf5). Shape 9's edge-on frame
+                        // is taller than the pattern's; see
+                        // `Image::masked`.
+                        let (trim, mask) = if shape == 7 || frame == 3 {
+                            (252, 9)
+                        } else {
+                            (253, 10)
+                        };
                         if let Some(strip) =
                             wall_image(self.assets, trim, mask, None, false, zoom, frame)
                         {
@@ -838,7 +847,15 @@ impl<'a> Painter<'a> {
                                 self.lot.brightest(),
                             );
                             let lit = |_, _| light;
-                            self.place_wall(&strip, frame, ends, heights, level, &lit, None);
+                            // On an edge-on diagonal the original moves
+                            // the strip up before drawing it (0x53ebf5);
+                            // its depth moves with it.
+                            let lift = if frame == 3 {
+                                edge_on_strip_lift(self.camera.zoom)
+                            } else {
+                                0
+                            };
+                            self.place_wall(&strip, frame, ends, heights, level, &lit, None, lift);
                         }
                     }
                     self.stats.walls += 1;
@@ -849,7 +866,9 @@ impl<'a> Painter<'a> {
 
     /// Draws a wall face on `level` standing between the screen points
     /// `a` and `b` of its ends, on terrain `heights` steps up at each,
-    /// only within screen columns `columns` (from, to) when given.
+    /// only within screen columns `columns` (from, to) when given, and
+    /// `raise` pixels higher than its place. Its depth is raised with it,
+    /// as the original's sprite carries its own depth.
     ///
     /// The wall is placed at its end lower on the screen (the left one of
     /// a wall level on screen), and a straight wall's columns run up or
@@ -865,6 +884,7 @@ impl<'a> Painter<'a> {
         level: i32,
         light: &dyn Fn(usize, usize) -> Light,
         columns: Option<[i32; 2]>,
+        raise: i32,
     ) {
         let rise = 4 << self.camera.zoom.level();
         let left = if a[0] <= b[0] { a } else { b };
@@ -900,6 +920,7 @@ impl<'a> Painter<'a> {
             (_, std::cmp::Ordering::Less) => self.depth.anchor(b[1], heights[1] as f32, level),
             _ => self.depth.anchor(a[1], heights[0] as f32, level),
         };
+        let at = [at[0], at[1] - raise];
         let sprite_left = at[0];
         let clipped;
         let (image, at, skip) = match columns {
@@ -920,8 +941,8 @@ impl<'a> Painter<'a> {
             at,
             |x, y| light(x + skip, y),
             |sx, sy| match frame {
-                0 | 1 => depth.wall(anchor, sy, first, sx.saturating_sub(sprite_left)),
-                _ => depth.diagonal(anchor, sy, frame == 3),
+                0 | 1 => depth.wall(anchor, sy + raise, first, sx.saturating_sub(sprite_left)),
+                _ => depth.diagonal(anchor, sy + raise, frame == 3),
             },
         );
     }
@@ -1168,7 +1189,16 @@ impl<'a> Painter<'a> {
             Line::Rising | Line::Falling => None,
         };
         let light = self.wall_light(index, fraction, seen);
-        self.place_wall(&image, frame, ends, [step; 2], level, &light, Some(columns));
+        self.place_wall(
+            &image,
+            frame,
+            ends,
+            [step; 2],
+            level,
+            &light,
+            Some(columns),
+            0,
+        );
     }
 
     fn objects(&mut self, level: i32, cut: &Cut) {
@@ -1610,6 +1640,14 @@ fn wall_image(
     assets.pattern(pattern, zoom)?[frame].masked(&shape)
 }
 
+/// How far up the original moves the strip on a marked edge-on diagonal:
+/// `(92 >> (3 - zoom)) + 1`, or `+ 2` at near zoom, passed to OffsetRect
+/// before the strip is drawn (0x53eb6d to 0x53ebf5).
+fn edge_on_strip_lift(zoom: crate::Zoom) -> i32 {
+    let level = zoom.level() as i32;
+    (92 >> (3 - level)) + if level == 3 { 2 } else { 1 }
+}
+
 /// Which side of a wall shows, as an index into `Scene::sides` (0 the
 /// side its normal points to, 1 the other), from its normal turned into
 /// the view. A wall shows the side facing the camera. An edge-on
@@ -1751,6 +1789,16 @@ mod tests {
         assert_eq!(trim_lights(None, 1.0), (Light::FULL, Light::FULL));
         let room = Light::from_fraction(0.6, night);
         assert_eq!(trim_lights(Some(0.6), night), (room, room));
+    }
+
+    #[test]
+    fn the_edge_on_strip_is_lifted_as_the_original_offsets_it() {
+        // (92 >> (3 - zoom)) + 1, + 2 at near (0x53eb6d to 0x53ebf5);
+        // these put the strip's top row on the original's at each zoom
+        // (House02, 2026-11-20).
+        assert_eq!(edge_on_strip_lift(Zoom::Far), 24);
+        assert_eq!(edge_on_strip_lift(Zoom::Medium), 47);
+        assert_eq!(edge_on_strip_lift(Zoom::Near), 94);
     }
 
     fn camera(rotation: u8) -> Camera {

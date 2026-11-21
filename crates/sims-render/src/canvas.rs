@@ -66,20 +66,31 @@ impl Image {
     }
 
     /// This image with each pixel's alpha scaled by `mask`'s alpha. The
-    /// two must be the same size; the original's wall shapes and wall
-    /// patterns always are.
+    /// original lines the mask up with the image's bottom-left corner and
+    /// draws only the image's rectangle (0x4c7fdb moves the shape's
+    /// bounds to the pattern's bottom and left), so a taller or wider mask
+    /// gives its bottom rows and left columns. `None` when the mask is
+    /// smaller: no wall pattern and shape the original draws are.
     pub fn masked(&self, mask: &Image) -> Option<Self> {
-        if (self.width, self.height) != (mask.width, mask.height) {
+        if mask.width < self.width || mask.height < self.height {
             return None;
         }
+        if self.is_empty() {
+            return Some(self.clone());
+        }
+        let top = mask.height - self.height;
         let mut rgba = self.rgba.clone();
-        for (p, m) in rgba
-            .as_chunks_mut::<4>()
-            .0
-            .iter_mut()
-            .zip(mask.rgba.as_chunks::<4>().0)
-        {
-            p[3] = ((u16::from(p[3]) * u16::from(m[3])) / 255) as u8;
+        for (y, row) in rgba.chunks_exact_mut(self.width * 4).enumerate() {
+            let start = ((top + y) * mask.width) * 4;
+            let mask_row = &mask.rgba[start..start + self.width * 4];
+            for (p, m) in row
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(mask_row.as_chunks::<4>().0)
+            {
+                p[3] = ((u16::from(p[3]) * u16::from(m[3])) / 255) as u8;
+            }
         }
         Some(Self {
             rgba,
@@ -474,6 +485,35 @@ mod tests {
             rgba: rgba.repeat(width * height),
             depth: depth.map(|d| vec![d; width * height]),
         }
+    }
+
+    #[test]
+    fn a_taller_or_wider_mask_gives_its_bottom_rows_and_left_columns() {
+        let pattern = image(2, 2, [9, 9, 9, 200], None);
+        // A 3 by 4 mask whose alpha is its row times 10 plus its column.
+        let mut mask = image(3, 4, [0, 0, 0, 0], None);
+        for y in 0..4 {
+            for x in 0..3 {
+                mask.rgba[(y * 3 + x) * 4 + 3] = (y * 10 + x) as u8 * 5;
+            }
+        }
+        let masked = pattern.masked(&mask).unwrap();
+        let alphas: Vec<u8> = masked.rgba.chunks(4).map(|p| p[3]).collect();
+        let want = |row: usize, column: usize| ((200 * (row * 10 + column) * 5) / 255) as u8;
+        assert_eq!(alphas, [want(2, 0), want(2, 1), want(3, 0), want(3, 1)]);
+        assert_eq!((masked.width, masked.height), (2, 2));
+        // The same size masks pixel for pixel; a smaller mask gives none.
+        let same = image(2, 2, [0, 0, 0, 51], None);
+        assert!(
+            pattern
+                .masked(&same)
+                .unwrap()
+                .rgba
+                .chunks(4)
+                .all(|p| p[3] == 40)
+        );
+        assert!(pattern.masked(&image(2, 1, [0, 0, 0, 255], None)).is_none());
+        assert!(pattern.masked(&image(1, 2, [0, 0, 0, 255], None)).is_none());
     }
 
     #[test]
