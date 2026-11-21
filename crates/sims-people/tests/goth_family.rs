@@ -485,23 +485,23 @@ fn flamingo_pie_head_is_not_cropped_by_the_face_bitmap() {
 
     let look = sims_people::pie_head::Look::neutral();
     let cropped = sims_people::pie_head::draw_body(&body, [201, 201], look).unwrap();
-    let full =
-        sims_people::pie_head::draw_body_in_viewport(&body, [800, 500], [400, 250], look).unwrap();
-    let cropped_opaque = cropped
-        .rgba
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .filter(|p| p[3] == 255)
-        .count();
-    let full_opaque = full
-        .canvas
-        .rgba
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .filter(|p| p[3] == 255)
-        .count();
+    let full = sims_people::pie_head::draw_body_in_viewport(
+        &body,
+        [800, 500],
+        [400, 250],
+        sims_render::Zoom::Far,
+        look,
+    )
+    .unwrap();
+    let count_opaque = |rgba: &[u8]| {
+        rgba.as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[3] == 255)
+            .count()
+    };
+    let cropped_opaque = count_opaque(&cropped.rgba);
+    let full_opaque = count_opaque(&full.canvas.rgba);
 
     assert_eq!(cropped_opaque, 11_628);
     assert_eq!(full_opaque, 14_014);
@@ -512,18 +512,44 @@ fn flamingo_pie_head_is_not_cropped_by_the_face_bitmap() {
         full.canvas.height
     );
 
+    // Aiming the tall Flamingo hat straight down pitches its tip past the
+    // native Direct3D 6 near plane (`0x49b506`, `0x462414`) at far zoom,
+    // clipping pixels that remain visible at near zoom where the near plane is
+    // 16× farther away in HEAD-bone units.
+    let down = sims_people::pie_head::Look::from_menu([400, 250], Some([400, 324]), Some(4), 6);
+    let far_down = sims_people::pie_head::draw_body_in_viewport(
+        &body,
+        [800, 500],
+        [400, 250],
+        sims_render::Zoom::Far,
+        down,
+    )
+    .unwrap();
+    let near_down = sims_people::pie_head::draw_body_in_viewport(
+        &body,
+        [800, 500],
+        [400, 250],
+        sims_render::Zoom::Near,
+        down,
+    )
+    .unwrap();
+    let far_down_opaque = count_opaque(&far_down.canvas.rgba);
+    let near_down_opaque = count_opaque(&near_down.canvas.rgba);
+    assert_eq!(near_down_opaque, 9_381);
+    assert_eq!(far_down_opaque, 8_984);
+    assert!(near_down_opaque - far_down_opaque == 397);
+
     // Near the bottom of an 800×500 viewport, the viewport boundary clips the
     // mesh cleanly instead of overflowing.
-    let edge =
-        sims_people::pie_head::draw_body_in_viewport(&body, [800, 500], [400, 487], look).unwrap();
+    let edge = sims_people::pie_head::draw_body_in_viewport(
+        &body,
+        [800, 500],
+        [400, 487],
+        sims_render::Zoom::Far,
+        look,
+    )
+    .unwrap();
     assert!(edge.origin[1] + edge.canvas.height as i32 <= 500);
-    let edge_opaque = edge
-        .canvas
-        .rgba
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .filter(|p| p[3] == 255)
-        .count();
+    let edge_opaque = count_opaque(&edge.canvas.rgba);
     assert!(edge_opaque > 0 && edge_opaque < full_opaque);
 }

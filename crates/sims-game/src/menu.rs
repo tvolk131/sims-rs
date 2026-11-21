@@ -633,8 +633,9 @@ impl Menu {
             .unwrap_or_default()
     }
 
-    /// The size of the face in each menu's middle, which the head is
-    /// drawn to fill: the face bitmap's.
+    /// The size of the transparent face placeholder bitmap in each menu's
+    /// middle (`PieFace1.bmp`, drawn by `0x5eb04c`; the 3D head itself draws
+    /// separately in the house viewport at `0x462985`).
     pub fn face_size(&self) -> [u32; 2] {
         let face = self
             .layouts

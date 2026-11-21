@@ -249,20 +249,26 @@ impl People {
 
     /// Renders `person`'s pie-menu 3D head positioned at `center` inside the
     /// active house `viewport` (`0x462621` → `0x462985`), returning its
-    /// top-left viewport origin and tightly bounded RGBA image clipped only to
-    /// the house viewport (never cropped by the 201×201 face bitmap).
+    /// top-left viewport origin and tightly bounded RGBA image clipped to the
+    /// house viewport and native near/far frustum for `zoom` (never cropped by
+    /// the 201×201 face bitmap).
     pub fn head_in_viewport(
         &mut self,
         world: &World,
         person: u16,
         viewport: (u32, u32),
         center: [i32; 2],
+        zoom: sims_render::Zoom,
         look: Look,
     ) -> Result<([i32; 2], Image), String> {
         self.refresh(world);
-        let drawn =
-            self.people
-                .pie_head_in_viewport(person, [viewport.0, viewport.1], center, look)?;
+        let drawn = self.people.pie_head_in_viewport(
+            person,
+            [viewport.0, viewport.1],
+            center,
+            zoom,
+            look,
+        )?;
         Ok((
             drawn.origin,
             Image {

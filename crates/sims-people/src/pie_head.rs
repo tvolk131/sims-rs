@@ -300,10 +300,14 @@ pub struct DrawnHead {
 }
 
 /// Target that rasterizes directly in full house-viewport coordinates while
-/// storing only the tight bounding rectangle clamped to the viewport.
+/// storing only the tight bounding rectangle clamped to the viewport, and
+/// applying the house camera's native Direct3D 6 orthographic near/far clip
+/// planes (`0x49b506`, `0x4623f5`–`0x462414`).
 struct ViewportPieTarget<'a> {
     viewport: (u32, u32),
     origin: (u32, u32),
+    near_z: f32,
+    far_z: f32,
     canvas: &'a mut Canvas,
 }
 
@@ -313,6 +317,9 @@ impl Target for ViewportPieTarget<'_> {
     }
 
     fn passes(&self, x: u32, y: u32, z: f32) -> bool {
+        if !(self.near_z..=self.far_z).contains(&z) {
+            return false;
+        }
         let Some(lx) = x.checked_sub(self.origin.0) else {
             return false;
         };
@@ -323,6 +330,9 @@ impl Target for ViewportPieTarget<'_> {
     }
 
     fn write(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], s: f32) {
+        if !(self.near_z..=self.far_z).contains(&z) {
+            return;
+        }
         let Some(lx) = x.checked_sub(self.origin.0) else {
             return;
         };
@@ -334,6 +344,32 @@ impl Target for ViewportPieTarget<'_> {
         self.canvas
             .write(lx, ly, z, [lit(r), lit(g), lit(b), a], 1.0);
     }
+}
+
+/// Native Direct3D 6 orthographic near/far frustum depth bounds `(near_z, far_z)`
+/// in unscaled HEAD-bone units for the active house camera `zoom`.
+///
+/// `0x49b506` sets `near = 0.0`, `0x49b124`–`0x49b187` computes `far`,
+/// `0x49b56d` scales NDC depth by `65535.0`, `0x4623f5`–`0x462414` places the
+/// head origin at `z_screen = 0.5 * ((3000 + 10) << zoom)` (with `zoom` 1/2/3
+/// for Far/Medium/Near), and `0x4625d9`–`0x46260d` scales the mesh by
+/// `(12.0 / (1 << zoom)) * 1.75`. Because [`project`] uses smaller (more
+/// negative) `z` for points closer to the camera, pixels outside
+/// `near_z..=far_z` are clipped by Direct3D 6 (notably oversized headwear
+/// pitched down toward the viewer at far zoom).
+pub fn depth_clip_bounds(zoom: sims_render::Zoom) -> (f32, f32) {
+    const UNITS_PER_TILE: f32 = 3.0;
+    let span = sims_render::camera::ARRAY_SIZE as f32 * UNITS_PER_TILE;
+    let h = (255.0 / (2.0 * 6.0f32.sqrt())) * UNITS_PER_TILE + 68.0;
+    let far = 3.0f32.sqrt() * (2.0f32.sqrt() * span) * 0.5 + h * 0.5;
+    let zoom_factor = (zoom.tile_width() / 16) as f32;
+    let z_screen_origin = 0.5 * (3010.0 * zoom_factor);
+    let z_view_origin = (z_screen_origin / 65_535.0) * far;
+    let head_scale = (12.0 / zoom_factor) * 1.75;
+    (
+        -z_view_origin / head_scale,
+        (far - z_view_origin) / head_scale,
+    )
 }
 
 fn skinned_head_parts(
@@ -393,13 +429,15 @@ pub fn draw_body(body: &Body, size: [u32; 2], look: Look) -> Result<Canvas, Stri
 
 /// Draws `body`'s pie-menu 3D head positioned at the main pie menu's `center`
 /// inside a house viewport of `viewport` `(width, height)` pixels (`0x462621`
-/// → `0x462985`), clipping only to `[0..viewport[0], 0..viewport[1]]` so tall
-/// or wide headwear (such as stock Flamingo hats) is never cropped by the
-/// 201×201 face bitmap.
+/// → `0x462985`), clipping to `[0..viewport[0], 0..viewport[1]]` and the
+/// house camera's native near/far frustum for `zoom` ([`depth_clip_bounds`])
+/// so tall or wide headwear is never cropped by the 201×201 face bitmap while
+/// still matching Direct3D 6 near-plane clipping.
 pub fn draw_body_in_viewport(
     body: &Body,
     viewport: [u32; 2],
     center: [i32; 2],
+    zoom: sims_render::Zoom,
     look: Look,
 ) -> Result<DrawnHead, String> {
     let parts = skinned_head_parts(body)?;
@@ -458,11 +496,14 @@ pub fn draw_body_in_viewport(
             "pie head bounds {rw}x{rh} exceed {MAX_SIDE}x{MAX_SIDE}"
         ));
     }
+    let (near_z, far_z) = depth_clip_bounds(zoom);
     let mut canvas = Canvas::new(rw, rh, [0; 4]);
     let ambient = Shade::Grey(look.ambient());
     let mut target = ViewportPieTarget {
         viewport: (vp_w, vp_h),
         origin: (rx0, ry0),
+        near_z,
+        far_z,
         canvas: &mut canvas,
     };
     for (part, skinned) in &parts {
@@ -650,8 +691,14 @@ mod tests {
             }],
         };
 
-        let drawn = draw_body_in_viewport(&body, [800, 500], [400, 250], Look::neutral())
-            .expect("extreme finite coordinates must clamp cleanly without overflow");
+        let drawn = draw_body_in_viewport(
+            &body,
+            [800, 500],
+            [400, 250],
+            sims_render::Zoom::Far,
+            Look::neutral(),
+        )
+        .expect("extreme finite coordinates must clamp cleanly without overflow");
         assert!(drawn.canvas.width <= 800 && drawn.canvas.height <= 500);
     }
 }

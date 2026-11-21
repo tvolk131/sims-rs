@@ -695,7 +695,14 @@ impl Hud {
                         });
                 (release, command)
             }
-            Release::Settled | Release::Stays => {
+            Release::Settled => {
+                // Settling does not create a new cursor warp (`0x5eb53c`);
+                // leave the pointer at the release coordinate rather than
+                // re-applying an unconsumed opening warp.
+                self.menu = Some(menu);
+                (release, None)
+            }
+            Release::Stays => {
                 if let Some(point) = menu.pending_pointer() {
                     self.controls.pointer = Some(point);
                 }

@@ -4825,6 +4825,34 @@ fn pie_opening_frame_aims_head_at_press_not_stale_hover() {
         .as_ref()
         .expect("warped opening head")
         .clone();
+    // Hovering onto "Sit" and releasing (settling the edge-clamped menu)
+    // WITHOUT consuming the pending opening warp must keep the head aimed at
+    // "Sit" rather than snapping back to `warped` (`0x5eb53c`).
+    let sit = pie_entry(&game, "Sit");
+    game.hover(sit);
+    game.render();
+    let sit_hover_head = game
+        .menu()
+        .unwrap()
+        .head
+        .as_ref()
+        .expect("Sit hover head")
+        .clone();
+    assert_ne!(sit_hover_head.rgba, warped_opening.rgba);
+    game.release(sit);
+    game.render();
+    let sit_settled_head = game
+        .menu()
+        .expect("edge pie settled and stays open")
+        .head
+        .as_ref()
+        .expect("Sit settled head")
+        .clone();
+    assert_eq!(
+        sit_settled_head.rgba, sit_hover_head.rgba,
+        "settling an edge-clamped menu snapped the head back to a stale opening warp"
+    );
+
     assert_eq!(game.take_pointer(), Some(warped));
     game.hover(warped);
     game.render();

@@ -635,10 +635,14 @@ impl Game {
                 }
                 if let Some(center) = menu.main_center() {
                     let look = menu.head_look(pointer);
-                    match self
-                        .people
-                        .head_in_viewport(world, menu.person, viewport, center, look)
-                    {
+                    match self.people.head_in_viewport(
+                        world,
+                        menu.person,
+                        viewport,
+                        center,
+                        self.view.camera.zoom,
+                        look,
+                    ) {
                         Ok((origin, head)) => {
                             crate::people::composite_pie_head(
                                 &mut self.canvas,
@@ -828,8 +832,10 @@ impl Game {
         // A failed check's note stays in front of what the choice says.
         let failed = self.note.take();
         let menu = self.hud.menu.clone();
-        let (_, command) = self.hud.release_menu(point);
-        if let Some(warped) = self.hud.menu.as_ref().and_then(Menu::pending_pointer) {
+        let (release, command) = self.hud.release_menu(point);
+        if release == menu::Release::Stays
+            && let Some(warped) = self.hud.menu.as_ref().and_then(Menu::pending_pointer)
+        {
             self.pointer = Some(warped);
         }
         self.highlighted = None;
