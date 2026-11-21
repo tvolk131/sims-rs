@@ -395,14 +395,14 @@ impl Game {
     /// Runs up to `ticks` ticks, stopping at the first that fails, and,
     /// if `idle`, before a tick the idle loop's speed sets the speed for
     /// ([`Game::idle_speed`]) or after a tick that changes the
-    /// simulation's speed (such as Special Effect resetting to normal,
-    /// `0x4f684c` → `0x46d697`). Any mid-tick speed change updates the
-    /// panel's speed and restarts the time owed, whether `idle` is set or
-    /// not.
+    /// simulation's speed or return speed (such as Special Effect resetting
+    /// to normal, `0x4f684c` → `0x46d697`). Any mid-tick speed or return-speed
+    /// change updates the panel's speed and restarts the time owed, whether
+    /// `idle` is set or not.
     fn run_while(&mut self, ticks: u32, idle: bool) -> u32 {
         let mut ran = 0;
         while ran < ticks && self.stopped.is_none() && !(idle && self.idle_speed()) {
-            let speed_before = self.lot.world().speed();
+            let speed_before = (self.lot.world().speed(), self.lot.world().return_speed());
             let step = if self.play {
                 self.lot.step_play()
             } else {
@@ -1349,10 +1349,16 @@ fn person_rise(zoom: u32) -> i32 {
 }
 
 /// Syncs the panel's speed and restarts the time owed when a tick changes
-/// the simulation's speed (such as Special Effect resetting to normal,
-/// `0x4f684c` → `0x46d697`). Returns whether the speed changed.
-fn sync_speed_after_step(pace: &mut Pace, speed_before: i16, world: &sims_sim::World) -> bool {
-    if world.speed() == speed_before {
+/// the simulation's speed or return speed (such as Special Effect resetting
+/// to normal, `0x4f684c` → `0x46d697`, or `World::idle_speed` clearing
+/// global 18 when someone wakes during manual stepping, `0x46d7db` →
+/// `0x46d697`). Returns whether either changed.
+fn sync_speed_after_step(
+    pace: &mut Pace,
+    speed_before: (i16, i16),
+    world: &sims_sim::World,
+) -> bool {
+    if (world.speed(), world.return_speed()) == speed_before {
         return false;
     }
     if let Some(speed) = pace::shown(world) {
@@ -1550,7 +1556,7 @@ mod tests {
         pace.set_speed(Speed::Fast);
         // Unchanged speed keeps both the panel selection and accrued credit.
         assert_eq!(pace.due(13_000, FAST), 0);
-        assert!(!sync_speed_after_step(&mut pace, FAST, &world));
+        assert!(!sync_speed_after_step(&mut pace, (FAST, -1), &world));
         assert_eq!(pace.speed, Speed::Fast);
         assert_eq!(pace.due(1_000, FAST), 1);
 
@@ -1559,7 +1565,7 @@ mod tests {
         // the next Normal tick waits a full 42 ms.
         assert_eq!(pace.due(13_000, FAST), 0);
         world.set_speed(i32::from(NORMAL));
-        assert!(sync_speed_after_step(&mut pace, FAST, &world));
+        assert!(sync_speed_after_step(&mut pace, (FAST, -1), &world));
         assert_eq!(pace.speed, Speed::Normal);
         assert_eq!(pace.due(29_000, NORMAL), 0);
         assert_eq!(pace.due(12_999, NORMAL), 0);
@@ -1573,9 +1579,19 @@ mod tests {
         assert_eq!(pace.due(500, IDLE), 0);
         world.set_speed(i32::from(NORMAL));
         assert_eq!((world.speed(), world.return_speed()), (NORMAL, NORMAL));
-        assert!(sync_speed_after_step(&mut pace, IDLE, &world));
+        assert!(sync_speed_after_step(&mut pace, (IDLE, FAST), &world));
         assert_eq!(pace.speed, Speed::Normal);
         assert_eq!(pace.due(41_999, NORMAL), 0);
+        assert_eq!(pace.due(1, NORMAL), 1);
+
+        // Wake-up clearing global 18 from (760, 760) to (760, -1) inside a
+        // manual step still calls 0x46d697 and must drop accrued credit.
+        assert_eq!(pace.due(41_000, NORMAL), 0);
+        world.globals[18] = -1;
+        assert!(sync_speed_after_step(&mut pace, (NORMAL, NORMAL), &world));
+        assert_eq!(pace.speed, Speed::Normal);
+        assert_eq!(pace.due(1_000, NORMAL), 0);
+        assert_eq!(pace.due(40_999, NORMAL), 0);
         assert_eq!(pace.due(1, NORMAL), 1);
     }
 }

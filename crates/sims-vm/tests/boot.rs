@@ -1696,6 +1696,17 @@ fn the_goth_day_under_the_recordings_frames_keeps_its_streams() {
         (lot.world().speed(), lot.world().return_speed()),
         (760, 760)
     );
+    while tick < 40_494 {
+        lot.step().unwrap();
+        tick += 1;
+    }
+    assert_eq!(
+        (lot.world().speed(), lot.world().return_speed()),
+        (760, 760)
+    );
+    lot.step().unwrap();
+    tick += 1;
+    assert_eq!((lot.world().speed(), lot.world().return_speed()), (760, -1));
     while tick < 43_200 {
         lot.step().unwrap();
         tick += 1;
