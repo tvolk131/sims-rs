@@ -2845,6 +2845,7 @@ mod tests {
             bedrooms: 2,
             bathrooms: 1,
             lot: 2,
+            ..House::default()
         };
         let controls = Controls {
             expanded: true,

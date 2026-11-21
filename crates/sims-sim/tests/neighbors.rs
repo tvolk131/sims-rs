@@ -74,6 +74,7 @@ fn neighborhood() -> Neighborhood {
             }],
         })],
         data: [0, 7, -3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+        options: None,
     }
 }
 

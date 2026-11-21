@@ -77,13 +77,79 @@ impl StringTable {
         }
         Ok(Self { format, entries })
     }
+    /// Parses a resource's table as the original's string loader does
+    /// (0x46feac), with `flags` the resource's flags
+    /// ([`crate::iff::Iff::resource_flags`]):
+    ///
+    /// - Without flag 0x10 the resource is big-endian and 0x470351 swaps
+    ///   its leading word, and, when that is then -1, the count.
+    /// - A leading word of -1, -2 or -3 is then that version, with the
+    ///   count after it, signed: 0 or below is an empty table.
+    /// - Any other leading word is the count of length-prefixed strings
+    ///   that follow it (0x4700d7); 0 or below is an empty table. (Version
+    ///   0, which [`StringTable::parse`] reads with a count after it, is
+    ///   not a layout the original knows.)
+    ///
+    /// **Not ported:**
+    /// - the original's change of bytes 0xa1 to `o` and 0xd5 to `'` in
+    ///   length-prefixed strings (0x4700f5);
+    /// - how it files a version -3 table's strings by language, its place
+    ///   in each language starting again at each change of language
+    ///   (0x46ffcc). [`StringTable::get`] counts within the language,
+    ///   which is the same when each language's strings are together, as
+    ///   in every such table of the Complete Collection's `Build.iff` and
+    ///   pattern files (488: 31 loose, 457 in FAR archives).
+    pub fn parse_chunk(data: &[u8], flags: u16) -> Result<Self> {
+        let Some(&[a, b]) = data.first_chunk::<2>() else {
+            return Self::parse(data);
+        };
+        let swapped = flags & 0x10 == 0;
+        let word = if swapped {
+            i16::from_be_bytes([a, b])
+        } else {
+            i16::from_le_bytes([a, b])
+        };
+        let mut normal = data.to_vec();
+        match word {
+            -3..=-1 => {
+                normal[..2].copy_from_slice(&word.to_le_bytes());
+                if word == -1 && swapped && normal.len() >= 4 {
+                    normal.swap(2, 3);
+                }
+                // The count is signed: 0 or below is an empty table.
+                if let Some(&[a, b]) = normal.get(2..4).and_then(|c| c.first_chunk::<2>())
+                    && i16::from_le_bytes([a, b]) <= 0
+                {
+                    let mut table = Self::parse(&normal[..2])?;
+                    table.entries.clear();
+                    return Ok(table);
+                }
+            }
+            count if count > 0 => {
+                // `parse` reads a word that is not a version as a
+                // big-endian count.
+                normal[..2].copy_from_slice(&count.to_be_bytes());
+            }
+            _ => {
+                return Ok(Self {
+                    format: Format::MacResource,
+                    entries: Vec::new(),
+                });
+            }
+        }
+        Self::parse(&normal)
+    }
     pub fn get(&self, index: usize, language: u8) -> Option<&str> {
+        self.entry(index, language).map(|e| e.text.as_str())
+    }
+    /// The entry [`StringTable::get`] reads its text from: the `index`th
+    /// in `language`, else the `index`th in language 1.
+    pub fn entry(&self, index: usize, language: u8) -> Option<&TextEntry> {
         self.entries
             .iter()
             .filter(|e| e.language == language)
             .nth(index)
             .or_else(|| self.entries.iter().filter(|e| e.language == 1).nth(index))
-            .map(|e| e.text.as_str())
     }
 }
 /// Decode original game text bytes using the selected language's code page.

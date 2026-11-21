@@ -31,7 +31,7 @@ pub(crate) fn key(name: &[u8]) -> Vec<u8> {
 /// The name hash (0x5b8ef9). Each byte is sign-extended before it is added.
 pub(crate) fn hash(name: &[u8]) -> u32 {
     let mut value = 0u32;
-    for &byte in name {
+    for &byte in name.iter().take_while(|&&byte| byte != 0) {
         value = value
             .wrapping_add(byte as i8 as i32 as u32)
             .wrapping_mul(0x401);
@@ -68,19 +68,38 @@ impl Table {
         self.buckets[self.bucket(key)].iter().any(|k| k == key)
     }
 
-    /// Adds a key, which must already be in [`key`] form. Returns false,
-    /// changing nothing, when it is present: the first entry of a name wins.
+    /// Inserts a file-map key. The file manager checks for a duplicate
+    /// before requesting growth (0x5bae22, 0x5baec0).
     pub(crate) fn insert(&mut self, key: Vec<u8>) -> bool {
         if self.contains(&key) {
             return false;
         }
+        self.grow();
+        self.prepend(key);
+        true
+    }
+
+    /// Inserts a suit key. The suit registry grows before testing for an
+    /// equal key, and keeps the existing node on duplicates (0x5a1fb1).
+    pub(crate) fn insert_name(&mut self, key: Vec<u8>) -> bool {
+        self.grow();
+        if self.contains(&key) {
+            return false;
+        }
+        self.prepend(key);
+        true
+    }
+
+    fn grow(&mut self) {
         let wanted = self.len + 1;
-        if self.buckets.len() < wanted {
-            let count = PRIMES
-                .iter()
-                .copied()
-                .find(|&n| n >= wanted)
-                .unwrap_or(PRIMES[27]);
+        if wanted <= self.buckets.len() {
+            return;
+        }
+        let count = PRIMES
+            .get(PRIMES.partition_point(|&prime| prime < wanted))
+            .copied()
+            .unwrap_or(PRIMES[27]);
+        if self.buckets.len() < count {
             let old = std::mem::replace(&mut self.buckets, vec![Vec::new(); count]);
             // Old buckets in order, each chain from its head, and every key
             // goes to the head of its new chain.
@@ -89,10 +108,12 @@ impl Table {
                 self.buckets[bucket].insert(0, key);
             }
         }
+    }
+
+    fn prepend(&mut self, key: Vec<u8>) {
         let bucket = self.bucket(&key);
         self.buckets[bucket].insert(0, key);
         self.len += 1;
-        true
     }
 
     /// The walk order: buckets in order, each chain from its head.
@@ -125,6 +146,19 @@ mod tests {
         value ^= value >> 6;
         value = value.wrapping_mul(9);
         assert_eq!(hash(&[0xe9]), (value ^ (value >> 11)).wrapping_mul(0x8001));
+    }
+
+    #[test]
+    fn hash_matches_the_probe() {
+        for (name, expected) in [
+            (b"a".as_slice(), 0xca2e_9442),
+            (b"\xe9", 0x4098_48ff),
+            (b"skin.bmp", 0x5682_d494),
+            (b"B123MAFit", 0xa33d_b84f),
+            (b"native\0tail", 0x4839_1b87),
+        ] {
+            assert_eq!(hash(name), expected);
+        }
     }
 
     #[test]
@@ -171,5 +205,25 @@ mod tests {
         let expected: Vec<Vec<u8>> = chains.into_iter().flatten().collect();
         let walked: Vec<Vec<u8>> = table.iter().map(<[u8]>::to_vec).collect();
         assert_eq!(walked, expected);
+    }
+
+    #[test]
+    fn a_duplicate_at_capacity_rehashes_the_suit_registry_in_walk_order() {
+        let mut suits = Table::default();
+        let mut files = Table::default();
+        for n in 0..193 {
+            let name = format!("suit-{n}").into_bytes();
+            assert!(suits.insert_name(name.clone()));
+            assert!(files.insert(name));
+        }
+        let duplicate = b"suit-3".to_vec();
+        assert!(!suits.insert_name(duplicate.clone()));
+        assert!(!files.insert(duplicate));
+        assert_eq!(files.buckets.len(), 193);
+        assert_eq!(suits.buckets.len(), 389);
+        let mut by_new_bucket: Vec<_> = files.iter().collect();
+        by_new_bucket.reverse(); // The later keys in the old walk are prepended last.
+        by_new_bucket.sort_by_key(|name| hash(name) as usize % 389);
+        assert_eq!(suits.iter().collect::<Vec<_>>(), by_new_bucket);
     }
 }

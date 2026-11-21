@@ -176,6 +176,9 @@ pub struct Finished {
 pub struct Lot {
     program: Program,
     catalog: Catalog,
+    /// The floor and wall catalogs the load renumbered the lot's patterns
+    /// by (load step 6b).
+    surfaces: Surfaces,
     world: World,
     /// The motive constants, worked out at the first step: a load that
     /// runs no tick does not need them.
@@ -474,6 +477,7 @@ impl Lot {
         }
         let mut world = World::empty();
         let mut load = LoadReport::default();
+        let surfaces;
         {
             let interpreter = Interpreter {
                 view_rotation,
@@ -481,7 +485,11 @@ impl Lot {
             };
             // The lot the game holds before the load: empty, with the
             // neighborhood's people, the type attributes the neighborhood
-            // saved and the two indicator objects.
+            // saved and the two indicator objects; and the skeleton files
+            // the game has read by then.
+            world
+                .skeleton_files
+                .extend(crate::objects::read_before_the_first_load(&program.people));
             world.read_neighbors(
                 &neighborhood,
                 &sims_sim::neighbors::registry(&index, &catalog),
@@ -513,19 +521,15 @@ impl Lot {
             world.read_arrays(&file.arrays, version)?;
             // The floor and wall catalogs, which the original builds at
             // start-up.
-            let surfaces = Surfaces::build(&install)?;
+            surfaces = Surfaces::build(&install)?;
             load.renumbered = world.renumber_surfaces(
                 file.floor_map.as_deref(),
                 file.wall_map.as_deref(),
                 &surfaces,
             )?;
             // 6c and 7: the type table, which marks the types whose scripts
-            // changed.
-            if file.guid_table {
-                return Err(
-                    "the house has a GUID translation table (Gtab), which is not ported".into(),
-                );
-            }
+            // changed. Its GUIDs have been through the house's GUID table
+            // (0x43a6fb, in `House::load`).
             let types = &file.types.entries;
             for entry in types {
                 let object = catalog
@@ -656,6 +660,7 @@ impl Lot {
         Ok(Self {
             program,
             catalog,
+            surfaces,
             world,
             tuning: None,
             player: Answers {
@@ -1114,6 +1119,13 @@ impl Lot {
         &self.world
     }
 
+    /// The floor and wall catalogs the lot's patterns are keyed by: the
+    /// ones the load built, so a reader prices or draws the patterns the
+    /// load gave the keys to.
+    pub fn surfaces(&self) -> &Surfaces {
+        &self.surfaces
+    }
+
     /// The linked code and the catalog, for reading what an object is.
     pub fn program(&self) -> &Program {
         &self.program
@@ -1195,6 +1207,7 @@ mod tests {
                 semi_globals: BTreeMap::new(),
                 diagnostics: Vec::new(),
             },
+            surfaces: sims_content::Surfaces::default(),
             world,
             tuning: None,
             player: Answers::default(),
