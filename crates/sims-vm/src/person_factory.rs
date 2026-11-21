@@ -125,6 +125,39 @@ impl Interpreter<'_> {
         self.construct_person(world, guid, skeleton)
     }
 
+    /// Reads body row 0 (skeleton name, `0x440d63` → `0x457f60` → `0x4704fa`)
+    /// without requiring the `.bcf` skeleton itself to be loaded, checking
+    /// runtime-made overrides first, then the definition's `STR#` body table,
+    /// then [`sims_content::People::skeleton_names`] / `skeletons`.
+    fn early_skeleton_name<'s>(&'s self, world: &'s World, guid: u32) -> Option<&'s str> {
+        if let Some(name) = world
+            .characters
+            .string(guid, sims_sim::characters::SKELETON)
+        {
+            return Some(name);
+        }
+        let template = world.characters.definition(guid);
+        if let Some(def) = crate::interpreter::object_definition(self.catalog, world, guid)
+            && let Some(library) = self.program.libraries.get(&def.resource)
+            && let Some(words) = library.definitions.get(&def.chunk)
+            && let Some(row0) = library
+                .strings
+                .get(&(words[19] as u16))
+                .and_then(|rows| rows.first())
+            && !row0.is_empty()
+        {
+            return Some(row0.as_str());
+        }
+        if let Some(name) = self.program.people.skeleton_names.get(&template) {
+            return Some(name.as_str());
+        }
+        self.program
+            .people
+            .skeletons
+            .get(&template)
+            .map(|s| s.name.as_str())
+    }
+
     /// Like [`Self::create_person`], but returns `Ok(None)` when the native
     /// factory refuses a pet because neither Unleashed nor Makin' Magic is
     /// installed (`0x440dd5`).
@@ -138,17 +171,15 @@ impl Interpreter<'_> {
             at: None,
             trap,
         };
-        // 0x440d63 checks body string 0 ("dog" / "kat") before constructing
-        // cXPerson or loading the skeleton.
+        // 0x440d63..0x440dd8 checks body string 0 ("dog" / "kat") for both
+        // runtime-made and catalog pets before constructing cXPerson or
+        // loading the skeleton.
         if !pets_allowed(self.program.expansions)
-            && world
-                .characters
-                .string(guid, sims_sim::characters::SKELETON)
-                .is_some_and(|name| {
-                    ["dog", "kat"]
-                        .iter()
-                        .any(|pet| name.eq_ignore_ascii_case(pet))
-                })
+            && self.early_skeleton_name(world, guid).is_some_and(|name| {
+                ["dog", "kat"]
+                    .iter()
+                    .any(|pet| name.eq_ignore_ascii_case(pet))
+            })
         {
             return Ok(None);
         }

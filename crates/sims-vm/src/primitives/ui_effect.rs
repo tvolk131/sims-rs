@@ -157,6 +157,20 @@ impl Machine<'_, '_> {
             self.world.dirty_portraits.remove(&guid);
             return Ok(());
         }
+        // If an earlier Make New Character pet render (0x44b126) ran with an
+        // unknown HEAD binding, whether it already cached the portrait or wrote
+        // BMP_ 2002 depends on unmodeled wardrobe order; fail loudly before
+        // running a second 0x4e8c5d.
+        if self.portrait_head_status(guid).is_none()
+            && self
+                .world
+                .characters
+                .string(guid, sims_sim::characters::SKELETON)
+                .is_some_and(|s| s.eq_ignore_ascii_case("dog") || s.eq_ignore_ascii_case("kat"))
+            && (self.program.expansions & (0x20 | 0x80) != 0)
+        {
+            let _ = self.can_render_portrait(guid)?;
+        }
         // 0x4e938c: BMP_ 2002 absent or invalid -> call 0x4e8c5d(index, 1, 1)
         // (save flag 1: persists BMP_ 2002 via 0x4e9000 on success when writable).
         let _ = self.try_render_ui_effect_portrait(guid, true)?;
@@ -236,10 +250,12 @@ impl Machine<'_, '_> {
                 if let Some(raw) = made.strings.get(&row) {
                     has_suit_override = true;
                     let suit = raw
+                        .split(';')
+                        .next()
+                        .unwrap_or(raw)
                         .split(',')
                         .next()
                         .unwrap_or(raw)
-                        .trim()
                         .to_ascii_lowercase();
                     if !suit.is_empty()
                         && suit != "none"
@@ -280,7 +296,7 @@ impl Machine<'_, '_> {
     /// Resolves [`Machine::portrait_head_status`] for portrait rendering,
     /// failing loudly if a `Make New Character` pick has an unknown `"HEAD"`
     /// binding.
-    fn can_render_portrait(&self, guid: u32) -> Result<bool, Trap> {
+    pub(crate) fn can_render_portrait(&self, guid: u32) -> Result<bool, Trap> {
         self.portrait_head_status(guid).ok_or_else(|| {
             Trap::Unsupported(format!(
                 "UI Effect's portrait of runtime-made type 0x{guid:08X} (0x4e7824): whether the \
@@ -318,6 +334,24 @@ impl Machine<'_, '_> {
         guid: u32,
         save_bitmap: bool,
     ) -> Result<bool, Trap> {
+        self.render_portrait(guid, save_bitmap, false)
+    }
+
+    /// Runs `0x4e8c5d(index, 0x1f, 1)` for `Make New Character` pet creation
+    /// (`0x44b126`): preserves all Init/CRT RNG/removal side effects and
+    /// caches/writes `BMP_` 2002 when `HEAD` binding is known, without turning
+    /// a mixed custom pet wardrobe into a fault inside opcode 19 (deferring
+    /// any trap until `UI Effect` or `Dialog` actually queries the portrait).
+    pub(crate) fn try_render_pet_portrait(&mut self, guid: u32) -> Result<bool, Trap> {
+        self.render_portrait(guid, true, true)
+    }
+
+    fn render_portrait(
+        &mut self,
+        guid: u32,
+        save_bitmap: bool,
+        defer_unknown_head: bool,
+    ) -> Result<bool, Trap> {
         // 0x4e8c92 -> 0x4e893e -> 0x43ac10: resolve the winning definition.
         let Some(file_key) = self.portrait_file(guid) else {
             return Ok(false);
@@ -332,7 +366,12 @@ impl Machine<'_, '_> {
                 .is_some_and(|object| object.guid == guid)
         });
         if on_lot {
-            if !self.can_render_portrait(guid)? {
+            let can_render = if defer_unknown_head {
+                self.portrait_head_status(guid).unwrap_or(false)
+            } else {
+                self.can_render_portrait(guid)?
+            };
+            if !can_render {
                 return Ok(false);
             }
             self.world.portraits.insert(guid);
@@ -393,7 +432,14 @@ impl Machine<'_, '_> {
         let placed = built
             .portrait_put_outcome(&mut copy, id)
             .map_err(|fault| fault.trap)?;
-        let rendered = placed && self.can_render_portrait(guid)?;
+        let can_render = if !placed {
+            false
+        } else if defer_unknown_head {
+            self.portrait_head_status(guid).unwrap_or(false)
+        } else {
+            self.can_render_portrait(guid)?
+        };
+        let rendered = placed && can_render;
         if rendered {
             // 0x4e8d14 -> 0x4e899e caches the portrait and clears dirty, and
             // 0x4e8d2e -> 0x4e9000 stages BMP_ 2002 BEFORE removing the

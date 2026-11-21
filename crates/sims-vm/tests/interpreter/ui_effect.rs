@@ -1121,76 +1121,114 @@ fn make_new_character_wardrobe_head_binding_drives_ui_effect_render_and_writebac
         "evicted pet portrait should reload BMP_ 2002 written at 0x44b126"
     );
 
+    // 4b. Pet with a MIXED custom pet wardrobe (one HEAD dog body, one
+    // non-HEAD dog body): Make New Character (0x44b126) still succeeds and
+    // returns true (preserving Init/CRT RNG side effects without turning
+    // opcode 19 into a VM fault); only a subsequent UI Effect query that would
+    // observe whether 0x44b126 cached the portrait fails loudly.
+    let (mut fx, record, _) = setup(
+        1,
+        TEMPLATE_DOG,
+        &["b001dog_01", "b002dog_nohead"],
+        &["b001dog_01.bmp", "b002dog_nohead.bmp"],
+        &["b001dog_01"],
+    );
+    let res = run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1);
+    assert!(
+        matches!(trap(res), Trap::Unsupported(ref m) if m.contains("0x4e7824")),
+        "mixed pet wardrobe should defer the trap until UI Effect queries the portrait"
+    );
+
     // 5. Invalid pet-picker index (>= bodies) on a template whose ONLY HEAD
-    // binding is in row 2 (head): 0x40d162 leaves body row 1 at the template's
-    // non-HEAD body while 0x44b0a3 -> 0x40a5e2 overwrites head row 2 with
-    // "NONE", so neither 0x44b126 nor UI Effect caches or persists BMP_ 2002.
-    let (mut fx, _, _) = visitors();
-    fx.program.expansions = 0xffff;
-    fx.world.rooms.rooms.get_mut(&1).unwrap().occupied = true;
-    let tpl_file = fx.add_type(TEMPLATE_DOG, 2, 4096, 4097);
-    fx.add(
-        tpl_file,
-        4096,
-        tree(vec![
-            assign(scope::MY_DATA, 4, scope::LITERAL, 1, 1),
-            assign(scope::MY_DATA, 42, scope::LITERAL, 2, RETURN_TRUE),
-        ]),
-    );
-    fx.add(
-        tpl_file,
-        4097,
-        tree(vec![
-            assign(scope::PARAMETERS, 0, scope::LITERAL, 10, 1),
-            ins(0, 0, 0, [0; 8]),
-        ]),
-    );
-    equip(&mut fx, TEMPLATE_DOG, "dog", 12);
-    {
-        let prof = fx.program.people.profiles.get_mut(&TEMPLATE_DOG).unwrap();
-        prof.body = Some("b001dog_nohead,BODY=b001dog_nohead".into());
-        prof.head = Some("c001ma_bob,HEAD-HEAD=c001malgt_bob".into());
-        prof.tones = vec!["lgt".into()];
+    // binding is in row 2 (head) — or whose row 1 has trailing whitespace
+    // ("b001dog_01 ,BODY=...", preserved by 0x5874ca and rejected by 0x5a27f2):
+    // 0x40d162 leaves body row 1 at the template's value while 0x44b0a3 ->
+    // 0x40a5e2 overwrites head row 2 with "NONE", so neither 0x44b126 nor UI
+    // Effect caches or persists BMP_ 2002.
+    for body_row in [
+        "b001dog_nohead,BODY=b001dog_nohead",
+        "b001dog_01 ,BODY=b001dog_01",
+    ] {
+        let (mut fx, _, _) = visitors();
+        fx.program.expansions = 0xffff;
+        fx.world.rooms.rooms.get_mut(&1).unwrap().occupied = true;
+        let tpl_file = fx.add_type(TEMPLATE_DOG, 2, 4096, 4097);
+        fx.add(
+            tpl_file,
+            4096,
+            tree(vec![
+                assign(scope::MY_DATA, 4, scope::LITERAL, 1, 1),
+                assign(scope::MY_DATA, 42, scope::LITERAL, 2, RETURN_TRUE),
+            ]),
+        );
+        fx.add(
+            tpl_file,
+            4097,
+            tree(vec![
+                assign(scope::PARAMETERS, 0, scope::LITERAL, 10, 1),
+                ins(0, 0, 0, [0; 8]),
+            ]),
+        );
+        equip(&mut fx, TEMPLATE_DOG, "dog", 12);
+        {
+            let prof = fx.program.people.profiles.get_mut(&TEMPLATE_DOG).unwrap();
+            prof.body = Some(body_row.into());
+            prof.head = Some("c001ma_bob,HEAD-HEAD=c001malgt_bob".into());
+            prof.tones = vec!["lgt".into()];
+        }
+        fx.program.people.portrait_head.insert(TEMPLATE_DOG, true);
+        fx.program.people.head_suits = ["c001ma_bob".to_string(), "b001dog_01".to_string()].into();
+        fx.program.wardrobe = Some(Wardrobe {
+            suits: ["b001dog_01".to_string()].into(),
+            textures: ["b001dog_01.bmp".to_string()].into(),
+            errors: BTreeMap::new(),
+        });
+        fx.world.dialogs.declined = 99; // invalid index >= bodies (1)
+        fx.add(
+            LAMP_FILE,
+            4098,
+            tree(vec![
+                assign(scope::LOCALS, 0, scope::LITERAL, 0, 1),
+                assign(scope::LOCALS, 1, scope::LITERAL, 27, 2),
+                assign(scope::LOCALS, 2, scope::LITERAL, 0, 3),
+                ins(19, 4, RETURN_FALSE, [0, 1, 2, 1, 0, 0, 0, 0]),
+                assign(scope::GLOBAL, 36, scope::STACK_OBJECT, 0, RETURN_TRUE),
+            ]),
+        );
+        assert_eq!(fx.run_with(LAMP, 4098, 0, &[], 1000), Ok(true));
+        let pet_record = fx.world.globals[36];
+        let pet_guid = fx.world.neighbors.get(pet_record).unwrap().guid;
+        assert!(
+            !fx.world.portraits.contains(&pet_guid),
+            "body_row={body_row}"
+        );
+        assert!(
+            fx.world.generated_portrait_2002.is_empty(),
+            "body_row={body_row}"
+        );
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, pet_record, 1),
+            Ok(true)
+        );
+        assert!(
+            !fx.world.portraits.contains(&pet_guid),
+            "body_row={body_row}"
+        );
+        assert!(
+            fx.world.generated_portrait_2002.is_empty(),
+            "body_row={body_row}"
+        );
     }
-    fx.program.people.portrait_head.insert(TEMPLATE_DOG, true);
-    fx.program.people.head_suits = ["c001ma_bob".to_string(), "b001dog_01".to_string()].into();
-    fx.program.wardrobe = Some(Wardrobe {
-        suits: ["b001dog_01".to_string()].into(),
-        textures: ["b001dog_01.bmp".to_string()].into(),
-        errors: BTreeMap::new(),
-    });
-    fx.world.dialogs.declined = 99; // invalid index >= bodies (1)
-    fx.add(
-        LAMP_FILE,
-        4098,
-        tree(vec![
-            assign(scope::LOCALS, 0, scope::LITERAL, 0, 1),
-            assign(scope::LOCALS, 1, scope::LITERAL, 27, 2),
-            assign(scope::LOCALS, 2, scope::LITERAL, 0, 3),
-            ins(19, 4, RETURN_FALSE, [0, 1, 2, 1, 0, 0, 0, 0]),
-            assign(scope::GLOBAL, 36, scope::STACK_OBJECT, 0, RETURN_TRUE),
-        ]),
-    );
-    assert_eq!(fx.run_with(LAMP, 4098, 0, &[], 1000), Ok(true));
-    let pet_record = fx.world.globals[36];
-    let pet_guid = fx.world.neighbors.get(pet_record).unwrap().guid;
-    assert!(!fx.world.portraits.contains(&pet_guid));
-    assert!(fx.world.generated_portrait_2002.is_empty());
-    assert_eq!(
-        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, pet_record, 1),
-        Ok(true)
-    );
-    assert!(!fx.world.portraits.contains(&pet_guid));
-    assert!(fx.world.generated_portrait_2002.is_empty());
 
     // 6. Negative-age copy (0x44b23c): 0x44b2d7 / 0x44b2ef compare the source's
-    // body and head rows against the wardrobe via 0x472f92, clearing misses to
-    // "". A catalog source with a HEAD-bearing NPC suit outside the wardrobe
-    // (like the Masseuse) deterministically produces no HEAD binding (no trap),
-    // whereas a matching wardrobe outfit preserves HEAD and writes BMP_ 2002.
+    // body and head rows against the wardrobe via 0x472f92 (using 64-byte fixed
+    // buffers capped at 63 text bytes), clearing misses to "".
+    let long_head_tex = format!("c001falgt_{}_aaa.bmp", "z".repeat(50));
+    let long_head_row = format!("c001fa_alice,HEAD-HEAD=c001falgt_{}_bbb", "z".repeat(50));
     for (head_row, expect_render) in [
         ("c999fa_masseuse,HEAD-HEAD=c999falgt_masseuse", false),
         ("c001fa_alice,HEAD-HEAD=C001FAlgt_Alice01", true),
+        (long_head_row.as_str(), true),
     ] {
         let (mut fx, _, _) = visitors();
         fx.world.rooms.rooms.get_mut(&1).unwrap().occupied = true;
@@ -1232,6 +1270,7 @@ fn make_new_character_wardrobe_head_binding_drives_ui_effect_render_and_writebac
             textures: [
                 "b001fafitlgt_01.bmp".to_string(),
                 "c001falgt_alice01.bmp".to_string(),
+                long_head_tex.clone(),
             ]
             .into(),
             errors: BTreeMap::new(),
@@ -1269,6 +1308,27 @@ fn make_new_character_wardrobe_head_binding_drives_ui_effect_render_and_writebac
             "head_row={head_row}"
         );
     }
+
+    // 7. Early pet expansion guard (0x440d63..0x440dd8) for a writable off-lot
+    // catalog pet whose STR# body row 0 is "kat" and whose .bcf skeleton is
+    // unavailable: refused cleanly (factory 0 -> portrait uncached, returns
+    // true) without faulting on the missing skeleton.
+    let (mut fx, file, record) = visitors();
+    fx.program.expansions = 0;
+    fx.program.people.skeletons.remove(&WIDGET);
+    fx.program.people.skeleton_names.remove(&WIDGET);
+    fx.words(file)[19] = 200;
+    fx.program
+        .libraries
+        .get_mut(&file)
+        .unwrap()
+        .strings
+        .insert(200, vec!["kat".into()]);
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
+        Ok(true)
+    );
+    assert!(fx.world.portraits.is_empty());
 }
 
 #[test]

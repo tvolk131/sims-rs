@@ -222,7 +222,9 @@ impl Wardrobe {
     ///
     /// Follows `0x472ec4` → `0x5874ca` (strip `;...`, split on `,`) and
     /// `0x472f92` → `0x46f874` (ASCII case-insensitive match against
-    /// `(suit, "BODY=" + stem)` or `(suit, "HEAD-HEAD=" + stem)`).
+    /// `(suit, "BODY=" + stem)` or `(suit, "HEAD-HEAD=" + stem)`), including
+    /// the native 64-byte fixed buffers (63 text characters + NUL at
+    /// `0x472e7e`, `0x472ed2`, `0x472ee2`, `0x46f79a`).
     pub fn contains_outfit(
         &self,
         head: bool,
@@ -231,38 +233,54 @@ impl Wardrobe {
         skin: &str,
         raw_row: &str,
     ) -> bool {
+        fn trunc63(s: &str) -> String {
+            s.chars().take(63).collect()
+        }
         let before_semi = raw_row.split(';').next().unwrap_or(raw_row);
         let Some((raw_suit, raw_tex)) = before_semi.split_once(',') else {
             return false;
         };
-        let suit = raw_suit.to_ascii_lowercase();
-        if !self.suits.contains(&suit) {
+        let row_suit = trunc63(&raw_suit.to_ascii_lowercase());
+        let row_tex = trunc63(&raw_tex.to_ascii_lowercase());
+        let tag = if head { "head-head=" } else { "body=" };
+        if !row_tex.starts_with(tag) {
             return false;
         }
-        let tex = raw_tex.to_ascii_lowercase();
-        let tag = if head { "head-head=" } else { "body=" };
-        let Some(stem) = tex.strip_prefix(tag) else {
-            return false;
-        };
         let (first, length) = if head { ('c', 6) } else { ('b', 9) };
         let sex = if female { 'f' } else { 'm' };
         let age = if child { 'c' } else { 'a' };
-        let chars: Vec<char> = suit.chars().take(length).collect();
-        let matches = chars.len() == length
-            && chars[0] == first
-            && (chars[4] == sex || chars[4] == 'u')
-            && chars[5] == age
-            && !(head && chars[1] == 't');
-        if !matches {
-            return false;
+        let skin = skin.to_ascii_lowercase();
+        for suit in &self.suits {
+            if trunc63(suit) != row_suit {
+                continue;
+            }
+            let chars: Vec<char> = suit.chars().take(length).collect();
+            let matches = chars.len() == length
+                && chars[0] == first
+                && (chars[4] == sex || chars[4] == 'u')
+                && chars[5] == age
+                && !(head && chars[1] == 't');
+            if !matches {
+                continue;
+            }
+            let part: String = chars.into_iter().collect();
+            let prefix = format!("{part}{skin}");
+            for tex in &self.textures {
+                if !tex.starts_with(&prefix) {
+                    continue;
+                }
+                let Some(stem) = tex
+                    .strip_suffix(".bmp")
+                    .or_else(|| tex.strip_suffix(".tga"))
+                else {
+                    continue;
+                };
+                if trunc63(&format!("{tag}{stem}")) == row_tex {
+                    return true;
+                }
+            }
         }
-        let part: String = chars.into_iter().collect();
-        let prefix = format!("{part}{}", skin.to_ascii_lowercase());
-        if !stem.starts_with(&prefix) {
-            return false;
-        }
-        self.textures.contains(&format!("{stem}.bmp"))
-            || self.textures.contains(&format!("{stem}.tga"))
+        false
     }
 }
 
@@ -394,5 +412,18 @@ mod tests {
             "lgt",
             "c999fa_masseuse,HEAD-HEAD=c999falgt_masseuse"
         ));
+
+        // 64-byte fixed buffers (63 text bytes + NUL at 0x472e7e / 0x472ee2):
+        // body and head texture names differing only past byte 63 still match.
+        let long_body_tex = format!("b006fafatlgt_{}_aaa.bmp", "x".repeat(50));
+        let long_body_row = format!("b006fafat_01,BODY=b006fafatlgt_{}_bbb", "x".repeat(50));
+        let long_head_tex = format!("c001falgt_{}_aaa.bmp", "y".repeat(50));
+        let long_head_row = format!("c001fa_mercedes,HEAD-HEAD=c001falgt_{}_bbb", "y".repeat(50));
+        let w_long = wardrobe(
+            &["b006fafat_01", "c001fa_mercedes"],
+            &[&long_body_tex, &long_head_tex],
+        );
+        assert!(w_long.contains_outfit(false, true, false, "lgt", &long_body_row));
+        assert!(w_long.contains_outfit(true, true, false, "lgt", &long_head_row));
     }
 }

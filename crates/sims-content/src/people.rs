@@ -79,6 +79,10 @@ pub struct Profile {
 pub struct People {
     /// Each person type's skeleton, by the type's GUID.
     pub skeletons: BTreeMap<u32, Skeleton>,
+    /// Each person type's body string 0 (skeleton name, `STR#` word 19 row 0),
+    /// kept even when the `.bcf` skeleton itself is unavailable (for the early
+    /// pet guard at `0x440d63`).
+    pub skeleton_names: BTreeMap<u32, String>,
     /// Each person type's profile, by the type's GUID.
     pub profiles: BTreeMap<u32, Profile>,
     /// The names of the suits (appearances) the avatar registry holds
@@ -552,10 +556,12 @@ impl People {
             let suit_name = |n: usize| {
                 body.get(n, 1)
                     .map(|raw| {
-                        raw.split(',')
+                        raw.split(';')
                             .next()
                             .unwrap_or(raw)
-                            .trim()
+                            .split(',')
+                            .next()
+                            .unwrap_or(raw)
                             .to_ascii_lowercase()
                     })
                     .filter(|s| !s.is_empty() && s != "none")
@@ -595,8 +601,8 @@ impl People {
         }
         let mut registry = AvatarRegistry::load(install)?;
         let mut skeletons = BTreeMap::new();
-        for (guid, name) in names {
-            match registry.skeleton(&name) {
+        for (&guid, name) in &names {
+            match registry.skeleton(name) {
                 Ok(skeleton) => {
                     skeletons.insert(guid, skeleton);
                 }
@@ -621,6 +627,7 @@ impl People {
         Ok((
             Self {
                 skeletons,
+                skeleton_names: names,
                 profiles,
                 suits: registry.suits,
                 suit_errors: registry.suit_errors,

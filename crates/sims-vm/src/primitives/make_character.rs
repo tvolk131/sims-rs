@@ -271,9 +271,10 @@ impl Machine<'_, '_> {
             self.frame_mut()?.stack_object = record;
             // 0x44b111..0x44b12b: pet creation immediately calls
             // 0x4e8c5d(index, 0x1f, 1), rendering and caching the portrait
-            // and persisting BMP_ 2002 before opcode 19 returns.
+            // and persisting BMP_ 2002 before opcode 19 returns (ignoring the
+            // renderer's bool return at 0x44b12b).
             if self.in_portrait_table(guid)? {
-                let _ = self.try_render_ui_effect_portrait(guid, true)?;
+                let _ = self.try_render_pet_portrait(guid)?;
             }
             Ok(true)
         }
@@ -634,7 +635,6 @@ impl Machine<'_, '_> {
             .split(',')
             .next()
             .unwrap_or(raw)
-            .trim()
             .to_ascii_lowercase();
         if suit.is_empty() || suit == "none" {
             return Some(false);
