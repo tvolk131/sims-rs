@@ -5218,3 +5218,187 @@ fn routed_main_duckpri_on_stopped_track_updates_global() {
     assert_eq!(*probe.asked.borrow(), [(8, 100)]);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
+
+#[test]
+fn patch_write_on_running_track_tears_down_note_so_end_kills_without_run_on() {
+    // `0x57dfe8 -> 0x57e040 -> 0x57f625`: writing `PATCH` on a running
+    // track immediately tears down its active voice, so a following `end`
+    // takes the immediate-kill branch and never runs trailing instructions.
+    let mut r0 = NOTE_ON_V1.to_vec();
+    r0.extend(loadl(50, 0)); // PATCH = 0 stops the playing voice
+    r0.push(END);
+    r0.extend(loadl(110, 99)); // must NOT run
+    r0.push(END);
+    let ask: &[u8] = &[GETSRCDATAFIELD, 6, 1, 110, END];
+    let probe = Probe {
+        lot: on_lot(&[(8, 400)]),
+        asked: Default::default(),
+    };
+    let mut player = Player::new(vec![module(&[&r0, ask], 1)], long_sample("one.xa"), 1);
+    play_on(&mut player, 8, &probe.lot);
+    let out = player.render(BLOCK, &probe);
+    assert!(out.iter().all(|&s| s == 0), "{out:?}");
+    assert!(player.is_idle());
+    player.handle(
+        &SoundEvent::Play {
+            object: 8,
+            name: "e1".into(),
+        },
+        &probe,
+    );
+    player.render(BLOCK, &probe);
+    assert_eq!(*probe.asked.borrow(), [(8, 0)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn killing_a_stopped_track_clears_patch_and_main_duckpri() {
+    // `kill_trk`, `StopAll`, and zero-`EXTVOL` `seqgroup_kill` all call
+    // `0x57dd3e` unconditionally on a stopped track, clearing both `PATCH`
+    // (written by kind 53) and `MAIN_DUCKPRI` (written through `target`).
+    let mut claim_and_stop = loadl(5, 1);
+    claim_and_stop.extend([SEQGROUP_RETURN, 5]);
+    claim_and_stop.extend(loadl(19, 0)); // extvol = 0
+    claim_and_stop.push(END);
+
+    let mut set_duck = loadl(53, 10);
+    set_duck.extend(loadl(123, 100));
+    set_duck.push(END);
+
+    let mut kill_10 = loadl(5, 10);
+    kill_10.extend([KILL_TRK, 5, END]);
+
+    let mut seq_kill = loadl(5, 1);
+    seq_kill.extend([SEQGROUP_KILL, 5, END]);
+
+    let mut read_state = loadl(53, 10);
+    read_state.extend([GETSRCDATAFIELD, 6, 1, 50]); // PATCH on stopped track 10
+    read_state.extend([GETSRCDATAFIELD, 6, 1, 123]); // global MAIN_DUCKPRI
+    read_state.push(END);
+
+    let (hit, addresses) =
+        assemble(&[&claim_and_stop, &set_duck, &kill_10, &seq_kill, &read_state]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         0x102={:#x}\n\
+         0x103={:#x}\n\
+         0x104={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         2=0,two,\"two.xa\"\n\
+         [GlobalHitList]\n\
+         6=2\n\
+         [Track]\n\
+         10=0,victim,1024,0,0,0,0,0x100,1\n\
+         11=0,ducker,1024,0,0,0,0,0x101,1\n\
+         12=0,killtrk,1024,0,0,0,0,0x102,1\n\
+         13=0,seqkill,1024,0,0,0,0,0x103,1\n\
+         14=0,reader,1024,0,0,0,0,0x104,1\n\
+         [EventMapping]\n\
+         e0=1,10\n\
+         e1=1,11\n\
+         e2=1,12\n\
+         e3=1,13\n\
+         e4=1,14\n\
+         seq=53,10,0,6\n",
+        addresses[0], addresses[1], addresses[2], addresses[3], addresses[4]
+    );
+    for mode in ["kill_trk", "stop_all", "seqgroup_kill"] {
+        let m = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+        let mut p = Player::new(vec![m], samples(), 1);
+        let probe = Probe {
+            lot: on_lot(&[(8, 400)]),
+            asked: Default::default(),
+        };
+        play(&mut p, "e0"); // track 10 claims group 1, sets extvol = 0, ends
+        p.render(BLOCK, &probe);
+        // Set PATCH = 2 via kind 53 (let short sample finish) and MAIN_DUCKPRI = 100.
+        play(&mut p, "seq");
+        p.render_until_idle(RATE as usize, &probe);
+        play(&mut p, "e1");
+        p.render(BLOCK, &probe);
+        match mode {
+            "kill_trk" => {
+                play(&mut p, "e2");
+                p.render(BLOCK, &probe);
+            }
+            "stop_all" => {
+                p.handle(&SoundEvent::StopAll, &probe);
+            }
+            "seqgroup_kill" => {
+                play(&mut p, "e3");
+                p.render(BLOCK, &probe);
+            }
+            _ => unreachable!(),
+        }
+        play(&mut p, "e4");
+        p.render(BLOCK, &probe);
+        assert_eq!(*probe.asked.borrow(), [(9, 0), (9, 0)], "mode={mode}");
+        assert!(p.faults.is_empty(), "mode={mode}: {:?}", p.faults);
+    }
+}
+
+#[test]
+fn seqgroup_kill_routes_holder_extvol_and_fade_writes_through_target() {
+    // `0x57ef5b` reads `EXTVOL` through the holder's `target`: track 10
+    // has local `EXTVOL = 1024`, plays a note, claims seqgroup 1, and
+    // targets stopped track 11 whose `EXTVOL` is 0. When track 12 runs
+    // `seqgroup_kill 1`, it reads 0 through track 10's target and kills
+    // track 10 immediately.
+    let mut set_t11_zero = loadl(53, 11);
+    set_t11_zero.extend(loadl(19, 0));
+    set_t11_zero.push(END);
+
+    let mut holder = NOTE_ON_V1.to_vec();
+    holder.extend(loadl(5, 1));
+    holder.extend([SEQGROUP_RETURN, 5]);
+    holder.extend(loadl(53, 11)); // target stopped track 11 (extvol = 0)
+    holder.push(SET_LOOP);
+    holder.extend(loadl(6, 1000));
+    holder.extend([WAIT, 6, LOOP]);
+
+    let mut killer = loadl(5, 1);
+    killer.extend([SEQGROUP_KILL, 5, END]);
+
+    let mut player = Player::new(
+        vec![module(&[&holder, &[END], &killer, &set_t11_zero], 1)],
+        long_sample("one.xa"),
+        1,
+    );
+    play(&mut player, "e3"); // write extvol = 0 on stopped track 11
+    player.render(BLOCK, &NoSources);
+    play(&mut player, "e0"); // holder runs with local extvol 1024, target 11
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    play(&mut player, "e2"); // seqgroup_kill 1 kills holder immediately
+    let after = player.render(BLOCK, &NoSources);
+    assert!(after.iter().all(|&s| s == 0), "{after:?}");
+    assert!(player.is_idle());
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn kind_18_writes_fade_registers_and_clears_fade_on_for_stopped_track() {
+    // `0x5739d4..0x5739fe` writes `FADE_DEST = 0`, `FADE_VAR = EXTVOL (19)`,
+    // `FADE_SPEED = 75`, and `FADE_ON = 1` (forced to 0 by `0x57e059`) on a
+    // stopped registered track.
+    let mut reader = loadl(53, 10);
+    reader.extend([GETSRCDATAFIELD, 6, 1, 40]); // FADE_DEST
+    reader.extend([GETSRCDATAFIELD, 6, 1, 41]); // FADE_VAR
+    reader.extend([GETSRCDATAFIELD, 6, 1, 42]); // FADE_SPEED
+    reader.extend([GETSRCDATAFIELD, 6, 1, 45]); // FADE_ON
+    reader.push(END);
+    let module = module_with(&[&[END], &reader], 1, 10, "fade75=18,10,75,0,1\n");
+    let mut player = Player::new(vec![module], samples(), 1);
+    let probe = Probe {
+        lot: on_lot(&[(8, 400)]),
+        asked: Default::default(),
+    };
+    play(&mut player, "fade75");
+    play(&mut player, "e1");
+    player.render(BLOCK, &probe);
+    assert_eq!(*probe.asked.borrow(), [(0, 0), (0, 19), (0, 75), (0, 0)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}

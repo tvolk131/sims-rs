@@ -111,7 +111,10 @@ and caused a replay of the track to start a second overlapping note.
   and `PATCH` per `0x57dd3e` / `0x57dd62 → 0x57f682`, plus clearing any hold
   and `main_duckpri` request), persist `PATCH` written by kind 53 (`0x57e0cc`),
   receive camera placement updates even while silent (`0x574728`, `0x574732`),
-  tear down an active idle kind-53 voice on `PATCH` writes (`0x57f625`),
+  tear down any active voice (running or idle) on `PATCH` writes (`0x57f625`),
+  route `seqgroup_kill` and kind 18 fade writes through `target` and onto
+  stopped tracks (`0x57ef5b`, `0x5739d4..0x5739fe`), clear stopped-track
+  `PATCH`/idle voice/`main_duckpri` on unconditional kills (`0x57dd3e`),
   refresh idle voice gains/pitch on the original's register set
   (`0x57def1..0x57e057`), force `FADE_ON = 0` when not running (`0x57e059`),
   and retain registers outside `BANKS` across fresh starts

@@ -1420,6 +1420,12 @@ impl<S: Samples> Player<S> {
         self.threads.retain(|t| !ended_ids.contains(&t.id));
         self.notes
             .retain(|n| !(n.track == track && !spared(n.thread)));
+        if !self.threads.iter().any(|t| t.track == track) {
+            // *(code)* 0x57dd3e runs unconditionally on the track object
+            // even when it was already stopped (clearing PATCH, idle voice,
+            // hold, and main_duckpri).
+            self.kill_stopped_track(track);
+        }
         self.forget_ended();
     }
 
@@ -1860,22 +1866,27 @@ impl<S: Samples> Player<S> {
 
     /// Kind 18: *(code)* fades a track's `extvol` to 0 at the first
     /// argument's speed (100 when 0), and ends it when the fade ends if
-    /// the third argument is not 0. No event in the install gives a
-    /// speed, so the speed is the caller's object, or 100 for none, as
-    /// the original's dispatcher passes it. The registers are written as the
-    /// track would write them. A track with no running thread is left
-    /// alone (the original writes to its idle track object).
+    /// the third argument is not 0 (`0x5739ab..0x573a07`). No event in
+    /// the install gives a speed, so the speed is the caller's object, or
+    /// 100 for none, as the original's dispatcher passes it. The
+    /// registers are written as the track would write them — including on
+    /// a stopped registered track, where `FADE_ON` is forced back to 0
+    /// (`0x57e059`).
     fn fade_track(&mut self, track: u32, args: [u32; 3]) {
-        let Some(at) = self.newest(track) else {
-            return;
-        };
         let speed = if args[0] == 0 { 100 } else { args[0] as i32 };
-        self.write_at(at, FADE_DEST, 0);
-        self.write_at(at, FADE_VAR, i32::from(EXTVOL));
-        self.write_at(at, FADE_SPEED, speed);
         if let Some(at) = self.newest(track) {
-            self.threads[at].kill_after_fade = args[2] != 0;
-            self.write_at(at, FADE_ON, 1);
+            self.write_at(at, FADE_DEST, 0);
+            self.write_at(at, FADE_VAR, i32::from(EXTVOL));
+            self.write_at(at, FADE_SPEED, speed);
+            if let Some(at) = self.newest(track) {
+                self.threads[at].kill_after_fade = args[2] != 0;
+                self.write_at(at, FADE_ON, 1);
+            }
+        } else if self.owner(track).is_some() {
+            self.write_stopped(track, FADE_DEST, 0);
+            self.write_stopped(track, FADE_VAR, i32::from(EXTVOL));
+            self.write_stopped(track, FADE_SPEED, speed);
+            self.write_stopped(track, FADE_ON, 1);
         }
     }
 
@@ -2172,6 +2183,14 @@ impl<S: Samples> Player<S> {
         let running = std::mem::take(&mut self.threads);
         for thread in &running {
             self.save_stopped(thread);
+        }
+        // *(code)* 0x57dd3e also clears PATCH / FADE_ON / ISPLAYING / TARGET
+        // on tracks that were already stopped (e.g. kind 53 PATCH).
+        for regs in self.stopped.values_mut() {
+            regs[usize::from(FADE_ON)] = 0;
+            regs[usize::from(ISPLAYING)] = 0;
+            regs[usize::from(TARGET)] = 0;
+            regs[usize::from(PATCH)] = 0;
         }
         self.notes.clear();
         self.idle.clear();
@@ -2769,6 +2788,33 @@ impl<S: Samples> Player<S> {
         self.update_main_duckpri();
     }
 
+    /// *(code)* Unconditional kill on a stopped registered track object
+    /// (`0x57dd3e`): stops any idle voice (`0x57dd59`), clears `PATCH`
+    /// (`0x57dd62 → 0x57f682`), `FADE_ON`, `ISPLAYING`, and `TARGET`,
+    /// clears any hold, and drops `main_duckpri` (`0x57d2cb`).
+    fn kill_stopped_track(&mut self, track: u32) {
+        self.notes.retain(|n| !(n.thread == 0 && n.track == track));
+        self.idle.remove(&track);
+        if let Some(regs) = self.stopped.get_mut(&track) {
+            regs[usize::from(FADE_ON)] = 0;
+            regs[usize::from(ISPLAYING)] = 0;
+            regs[usize::from(TARGET)] = 0;
+            regs[usize::from(PATCH)] = 0;
+        }
+        self.held.remove(&track);
+        self.duck.remove(&track);
+        self.update_main_duckpri();
+    }
+
+    /// Reads a local register (`r < GLOBALS`) from a stopped track object.
+    fn read_stopped(&self, track: u32, r: u8) -> i32 {
+        self.idle
+            .get(&track)
+            .map(|idle| idle.registers[usize::from(r)])
+            .or_else(|| self.stopped.get(&track).map(|regs| regs[usize::from(r)]))
+            .unwrap_or_else(|| self.default_registers(track)[usize::from(r)])
+    }
+
     /// *(code)* Writes a local register (`r < GLOBALS`) on a stopped
     /// registered track object (`0x57de98` when `is_running == 0`): forces
     /// `FADE_ON` to 0 (`0x57e059..0x57e064`), persists the register in
@@ -3338,9 +3384,15 @@ impl<S: Samples> Player<S> {
             }
         };
         written.kept = i64::from(value);
+        let written_id = written.id;
         let duck_track = written.track;
         if r < GLOBALS {
             written.registers[usize::from(r)] = value;
+            if r == PATCH {
+                // *(code)* 0x57dfe8 → 0x57e040 → 0x57f625: writing `patch`
+                // tears down the track's active voice immediately.
+                self.notes.retain(|n| n.thread != written_id);
+            }
         } else if r == MAIN_DUCKPRI {
             if value == 0 {
                 self.duck.remove(&duck_track);
@@ -3639,41 +3691,58 @@ impl<S: Samples> Player<S> {
                 let me = thread.track;
                 let mut flow = Flow::Next;
                 let holder = self.seqgroups.get(&group).copied().unwrap_or(0);
-                // The holder is a track number; its newest running thread
-                // is the one acted on. A track with none running is
-                // skipped (the original looks it up and does not check).
-                let newest = self
-                    .threads
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, t)| t.track == holder)
-                    .max_by_key(|(_, t)| t.id)
-                    .map(|(at, _)| at);
-                if holder != 0
-                    && holder != me
-                    && let Some(at) = newest
-                {
-                    let other_id = self.threads[at].id;
-                    let other = &mut self.threads[at];
-                    let reg = |r: u8| usize::from(r);
-                    if other.registers[reg(EXTVOL)] == 0 {
-                        let removed = self.threads.remove(at);
-                        self.save_stopped(&removed);
-                        self.notes.retain(|n| n.thread != other_id);
-                        self.forget_ended();
-                    } else {
-                        let other_kept = &mut other.kept;
-                        let other = &mut other.registers;
-                        let fading =
-                            other[reg(FADE_ON)] != 0 && other[reg(FADE_VAR)] == i32::from(EXTVOL);
-                        if !fading {
-                            other[reg(FADE_SPEED)] = 200;
-                            other[reg(FADE_VAR)] = i32::from(EXTVOL);
-                            other[reg(FADE_ON)] = 1;
-                            *other_kept = 1;
+                // *(code)* 0x57ef48..0x57efd8: looks up `holder` in the
+                // registry (running or stopped), reads `extvol` through its
+                // `target` (vtable +0x88, 0x57ef5b), kills it unconditionally
+                // (vtable +0x38, 0x57dd3e) when 0, or otherwise writes
+                // `fade_speed = 200`, `fade_var = extvol`, `fade_on = 1`
+                // through its `target` (vtable +0x84, 0x57ef8d..0x57efba)
+                // and waits.
+                if holder != 0 && holder != me && self.owner(holder).is_some() {
+                    if let Some(stored) = self.threads.iter_mut().find(|t| t.id == thread.id) {
+                        *stored = thread.clone();
+                    }
+                    if let Some(at) = self.newest(holder) {
+                        let other = self.threads[at].clone();
+                        let other_id = other.id;
+                        if self.read(&other, i64::from(EXTVOL)) == 0 {
+                            let removed = self.threads.remove(at);
+                            self.save_stopped(&removed);
+                            self.notes.retain(|n| n.thread != other_id);
+                            self.forget_ended();
+                        } else {
+                            let fading = self.read(&other, i64::from(FADE_ON)) != 0
+                                && self.read(&other, i64::from(FADE_VAR)) == i32::from(EXTVOL);
+                            if !fading {
+                                self.write_at(at, FADE_SPEED, 200);
+                                if let Some(at) = self.threads.iter().position(|t| t.id == other_id)
+                                {
+                                    self.write_at(at, FADE_VAR, i32::from(EXTVOL));
+                                }
+                                if let Some(at) = self.threads.iter().position(|t| t.id == other_id)
+                                {
+                                    self.write_at(at, FADE_ON, 1);
+                                }
+                            }
+                            if let Some(stored) = self.threads.iter().find(|t| t.id == thread.id) {
+                                *thread = stored.clone();
+                            }
+                            // Run this instruction again shortly; by then
+                            // this thread holds the group.
+                            thread.wake =
+                                self.frame + (SEQGROUP_WAIT_MS * u64::from(RATE)).div_ceil(1000);
+                            flow = Flow::Block;
                         }
-                        // Run this instruction again shortly; by then
-                        // this thread holds the group.
+                    } else if self.read_stopped(holder, EXTVOL) == 0 {
+                        self.kill_stopped_track(holder);
+                    } else {
+                        let fading = self.read_stopped(holder, FADE_ON) != 0
+                            && self.read_stopped(holder, FADE_VAR) == i32::from(EXTVOL);
+                        if !fading {
+                            self.write_stopped(holder, FADE_SPEED, 200);
+                            self.write_stopped(holder, FADE_VAR, i32::from(EXTVOL));
+                            self.write_stopped(holder, FADE_ON, 1);
+                        }
                         thread.wake =
                             self.frame + (SEQGROUP_WAIT_MS * u64::from(RATE)).div_ceil(1000);
                         flow = Flow::Block;
