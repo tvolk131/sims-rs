@@ -201,11 +201,19 @@ What is not ported:
     142 is one the loader reads as ported (with the map's flags), since
     one read otherwise may be read past its end, and the file is the only
     component of the `UIText` resource set: the composite opener also
-    opens a `.fam`, `.dir`, `.wll` or `.flr` of the name, loose or in an
-    archive in `GameData` (0x46f50f to 0x46f542, 0x46b627 to 0x46b699,
-    searched at 0x406a29), which is not ported
-    (`Program::labels_hold_no_token`, Sol's eleventh to thirteenth
-    checks). Otherwise a dialog with a default string fails loudly. The
+    opens a `.fam`, `.wll` or `.flr` of the name, loose or in an archive
+    in `GameData`, and a `.dir` of the name that is a directory there,
+    which the directory reader (selected at 0x46f50f and 0x46b5d9) lists
+    with a `*.*` wildcard (0x5c3099 to 0x5c3102) (0x46f50f to 0x46f542,
+    0x46b627 to 0x46b699, searched at 0x406a29), none of which is ported
+    (`Program::labels_hold_no_token`, Sol's eleventh to fourteenth
+    checks). The check also counts a `.dir` that is a file or an archive
+    member, which the original does not open: stricter than need be, not
+    a port. The tables must not be ones the loader reads again for
+    English (entries, none in US English: 0x47006b to 0x4700d0), which
+    can read a string's bytes as a language byte, and an archive there
+    that cannot be read (a dangling link, say) makes it false. Otherwise
+    a dialog with a default string fails loudly. The
     install's labels (OK, Cancel, Yes, No) hold no `$`. Tests:
     `the_default_button_labels_hold_no_token` (`tests/boot.rs`),
     `a_default_string_fails_loudly_unless_the_labels_hold_no_token`,
@@ -427,18 +435,25 @@ What is not ported:
      the passes may write does. The careers' strings come from the `Work`
      resource set of `ExpansionShared` (0x403da2 to 0x403dd9, the
      directory found at 0x415336), which the composite opener makes of a
-     `.iff`, `.fam`, `.dir`, `.wll` and `.flr` of the name (0x46f50f to
-     0x46f542, 0x46b627 to 0x46b699, 0x406a29), loose or in an archive
-     there (any file whose name ends in `far`, with no dot needed,
-     0x5ba86d to 0x5ba8a7; a member whose name holds a path is placed in a
-     subdirectory, 0x5b9dbc, so is not there). Only a set of one `work.iff` there is ported,
+     `.iff`, `.fam`, `.wll` and `.flr` of the name, loose or in an archive
+     there (any entry not a directory whose name ends in `far`, with no
+     dot needed, 0x5ba7d4 to 0x5ba8a7, one that cannot be read counting
+     as any; a member whose name holds a path is placed in a
+     subdirectory, 0x5b9dbc, so is not there), and a `.dir` of the name
+     that is a directory there, listed with a `*.*` wildcard (0x5c3099
+     to 0x5c3102) (0x46f50f to 0x46f542, 0x46b5d9 to 0x46b699,
+     0x406a29). A `.dir` that is a file or an archive member also makes
+     the check false, though the original does not open it: stricter
+     than need be, not a port. Only a set of one `work.iff` there is ported,
      and it must be the index's only `work.iff`, which `careers` reads
      (Sol's eleventh to fourteenth checks). Every string table of it
      (STR#, and CST, which the loader falls back to), deleted chunks
      included, must hold no `$` byte at all, since the loader's ways not
      ported may read a string's bytes as entries; each STR# resource must
      be one the loader reads as ported (with the map's flags), since one
-     read otherwise may be read past its end; and every career's name and
+     read otherwise may be read past its end, and not one it reads again
+     for English (0x403f37 loads with the fallback on; entries, none in
+     US English, 0x47006b to 0x4700d0); and every career's name and
      level strings must hold no career token.
      The install's STR# tables hold no `$`; its level strings hold one (in
      suit names such as `B004MA$b_01`) but no career token. When it is

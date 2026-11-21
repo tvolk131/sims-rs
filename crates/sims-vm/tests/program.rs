@@ -805,6 +805,9 @@ fn career_texts_end_only_when_work_holds_no_career_token() {
         (terminated(&["a $ sign"]), 0),
         (terminated(&["x$JobDesc:0"]), sims_formats::iff::DELETED),
         (localized(&[(3, "\x01$Job")]), 0),
+        // No `$`, but entries with a language and none in US English,
+        // which the loader reads again for English (0x47006b).
+        (localized(&[(2, "\x01Clerk"), (2, "x")]), 0),
     ] {
         dir.file("ExpansionShared/work.iff", &work(table, flags));
         assert!(!link(&dir));
@@ -847,6 +850,20 @@ fn career_texts_end_only_when_work_holds_no_career_token() {
         assert!(!link(&dir));
     }
     std::fs::remove_file(dir.0.join("ExpansionShared/ExtrasFAR")).unwrap();
+    // An entry that is not a directory is tried as one (0x5ba7d4): a
+    // dangling link cannot be read, so may be any; a directory whose name
+    // ends in `far` is not an archive.
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(dir.0.join("gone"), dir.0.join("ExpansionShared/ExtrasFAR"))
+            .unwrap();
+        assert!(!link(&dir));
+        std::fs::remove_file(dir.0.join("ExpansionShared/ExtrasFAR")).unwrap();
+        assert!(link(&dir));
+    }
+    std::fs::create_dir(dir.0.join("ExpansionShared/ExtrasFAR")).unwrap();
+    assert!(link(&dir));
+    std::fs::remove_dir(dir.0.join("ExpansionShared/ExtrasFAR")).unwrap();
     // An archive member whose name holds a path is placed in a
     // subdirectory (0x5b9dbc), so is not the `Work` set's, though its
     // archive is in `ExpansionShared`.
@@ -931,6 +948,10 @@ fn the_default_labels_hold_no_token_only_when_no_string_table_of_them_holds_a_do
     for (table, flags) in [
         (terminated(&["OK", "$Job"]), 0),
         (terminated(&["$Job"]), sims_formats::iff::DELETED),
+        // No `$`, but none in US English: the loader, its fallback on
+        // (0x435fee), reads it again for English (0x47006b), which may
+        // take `\x01` for a language and load `Quit`.
+        (localized(&[(2, "\x01Quit"), (2, "x")]), 0),
     ] {
         dir.file(sims_vm::LABEL_FILE, &labels(table, flags));
         assert!(!sims_vm::labels_hold_no_token(&install.root).unwrap());
@@ -983,4 +1004,17 @@ fn the_default_labels_hold_no_token_only_when_no_string_table_of_them_holds_a_do
         );
         std::fs::remove_file(dir.0.join(&path)).unwrap();
     }
+    // An archive there that cannot be read (a dangling link, 0x5ba7d4)
+    // may hold any member; a directory whose name ends in `far` is not an
+    // archive.
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(dir.0.join("gone"), dir.0.join("GameData/UIFAR")).unwrap();
+        assert!(!sims_vm::labels_hold_no_token(&install.root).unwrap());
+        std::fs::remove_file(dir.0.join("GameData/UIFAR")).unwrap();
+        assert!(sims_vm::labels_hold_no_token(&install.root).unwrap());
+    }
+    std::fs::create_dir(dir.0.join("GameData/UIFAR")).unwrap();
+    assert!(sims_vm::labels_hold_no_token(&install.root).unwrap());
+    std::fs::remove_dir(dir.0.join("GameData/UIFAR")).unwrap();
 }

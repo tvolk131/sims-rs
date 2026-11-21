@@ -361,7 +361,7 @@ impl Program {
             }
             let table = sims_formats::strings::StringTable::parse(data)
                 .map_err(|e| format("STR#", id, e))?;
-            if !table.entries.is_empty() && table.entries.iter().all(|entry| entry.language != 1) {
+            if english_fallback(&table.entries) {
                 library.unported_strings.insert(
                     id,
                     "has entries with a language and none in US English, which the loader \
@@ -1056,6 +1056,17 @@ pub fn unported_strings(flags: u16, data: &[u8]) -> Option<&'static str> {
     }
 }
 
+/// Whether the string loader (0x46feac) reads a table with entries
+/// `entries` again for English, a way not ported: it has entries, and none
+/// is in the wanted language, US English (language 1, which the reader
+/// also gives an entry of language 0). With its fallback on, as for the
+/// dialog's default labels (0x435fee) and the careers' strings (0x403f37),
+/// the loader then scans the table again (0x47006b to 0x4700d0) in a way
+/// that can read a string's bytes as a language byte.
+fn english_fallback(entries: &[sims_formats::strings::TextEntry]) -> bool {
+    !entries.is_empty() && entries.iter().all(|entry| entry.language != 1)
+}
+
 /// The first-language entries of a string table, in the order the
 /// original's loader (0x46feac, for a table of entries with a language,
 /// 0x46ffcc to 0x470069) puts them in: it counts the entries of each run of
@@ -1090,11 +1101,16 @@ pub fn loaded_order(entries: &[sims_formats::strings::TextEntry]) -> Vec<String>
 /// strings come from the `Work` resource set of `ExpansionShared`
 /// (0x403da2 to 0x403dd9, the directory found at 0x415336), which the
 /// composite opener makes of every component it finds: `.iff`, `.fam`,
-/// `.dir`, `.wll`, `.flr` (0x46f50f to 0x46f542, opened at 0x46b627 to
-/// 0x46b699, searched at 0x406a29). Only one component is ported, so this
-/// is false unless that directory holds exactly one entry or archive
-/// member named `work` with any extension ([`resource_set`]), `work.iff`,
-/// and it is the index's only `work.iff`, which [`careers`] reads. So do
+/// `.wll`, `.flr`, loose or in an archive there, and `.dir`, a filesystem
+/// directory, which the directory reader (selected at 0x46f50f and
+/// 0x46b5d9) lists with a `*.*` wildcard (0x5c3099 to 0x5c3102)
+/// (0x46f50f to 0x46f542, opened at 0x46b627 to 0x46b699, searched at
+/// 0x406a29). Only one component is ported, so this is false unless that
+/// directory holds exactly one entry or archive member named `work` with
+/// any extension ([`resource_set`]), `work.iff`, and it is the index's
+/// only `work.iff`, which [`careers`] reads. (A `.dir` that is a file or
+/// an archive member, which the original does not open as one, makes it
+/// false too: a check stricter than need be, not a port.) So do
 /// a `Careers.txt` (0x403e31). Every string table of it (STR#, and CST,
 /// which the loader falls back to, 0x4702c7) must hold no `$` byte at all,
 /// deleted chunks included: the loader's ways not ported
@@ -1173,7 +1189,8 @@ pub const LABEL_FILE: &str = "GameData/UIText.iff";
 /// come from the `UIText` resource set of `GameData`, which the composite
 /// opener makes as it makes `Work`'s ([`career_texts_end`]), so this is
 /// false unless that directory holds exactly one entry or archive member
-/// named `UIText` with any extension, the file [`LABEL_FILE`], and every
+/// named `UIText` with any extension (a `.dir` that is not a directory
+/// included, as there), the file [`LABEL_FILE`], and every
 /// string table of ID 142 in it (STR#, and CST, which the loader falls
 /// back to, 0x4702c7) holds no `$` byte, deleted chunks included.
 pub fn labels_hold_no_token(root: &Path) -> Result<bool> {
@@ -1209,8 +1226,10 @@ pub fn labels_hold_no_token(root: &Path) -> Result<bool> {
 /// (or only that of ID `only`) within its bytes, so that a check of them
 /// for a `$` byte holds: the resource map matches the chunks (0x41bfdd to
 /// 0x41c032), and each table is of a layout the loader reads as ported
-/// ([`unported_strings`], with the flags the map states) and parses. A
-/// table it reads otherwise may be read past its end.
+/// ([`unported_strings`], with the flags the map states), parses, and is
+/// not one the loader reads again for English ([`english_fallback`]). A
+/// table it reads otherwise may be read past its end, or have a string's
+/// bytes read as entries.
 fn strings_read_as_ported(iff: &Iff, only: Option<u16>) -> bool {
     iff.map_error().is_none()
         && iff
@@ -1219,7 +1238,8 @@ fn strings_read_as_ported(iff: &Iff, only: Option<u16>) -> bool {
             .all(|chunk| {
                 let data = iff.data(chunk);
                 unported_strings(iff.flags(chunk), data).is_none()
-                    && sims_formats::strings::StringTable::parse(data).is_ok()
+                    && sims_formats::strings::StringTable::parse(data)
+                        .is_ok_and(|table| !english_fallback(&table.entries))
             })
 }
 
@@ -1251,8 +1271,8 @@ fn find(root: &Path, relative: &str) -> Option<std::path::PathBuf> {
 }
 
 /// The names of the entries of `directory`, and of the members the
-/// archives (FAR: a file whose name ends in `far`) in it place there,
-/// whose name up to
+/// archives (FAR: an entry not a directory whose name ends in `far`) in it
+/// place there, whose name up to
 /// its first `.` is `stem`, ignoring ASCII case: whatever a resource set
 /// of that name there could be made of. None when an archive there cannot
 /// be read or has members the index leaves out
@@ -1284,13 +1304,15 @@ fn resource_set(directory: &Path, stem: &str) -> Result<Option<Vec<String>>> {
         if named(&name) {
             set.push(name.clone());
         }
-        // The original takes a file whose name ends in the letters `far`,
-        // with or without a dot, as an archive (0x5ba86d to 0x5ba8a7), as
-        // the index does.
+        // The original takes an entry that is not a directory (0x5ba7d4
+        // to 0x5ba7d9) whose name ends in the letters `far`, with or
+        // without a dot, as an archive (0x5ba86d to 0x5ba8a7), as the
+        // index does, and tries to mount it (0x5ba8d6). One this cannot
+        // read (a dangling link, say) may hold any member.
         let archive = name.len() >= 3
             && name.is_char_boundary(name.len() - 3)
             && name[name.len() - 3..].eq_ignore_ascii_case("far");
-        if archive && path.is_file() {
+        if archive && !path.is_dir() {
             let Ok((members, skipped)) = sims_content::far_members(&path) else {
                 return Ok(None);
             };
