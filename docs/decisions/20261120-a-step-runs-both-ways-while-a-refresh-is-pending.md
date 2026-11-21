@@ -259,7 +259,12 @@ What is not ported:
   - no tile is found (from the view centre given, or with none from some
     start). The original then removes it without drawing it (0x4e9706),
     and 0x4e938c builds again in the same dialog unless the type has
-    image 2002. That is not ported.
+    image 2002. That is not ported;
+  - the lot has no indicators yet. The interface's work for an object
+    come from outside (0x44752e) then makes them (0x445e4a), and their
+    Init runs while the original's person stands on its tile, in its
+    room. Here it does not, since the put is only as far as is the same
+    on every tile.
 
   The build runs on a copy of the lot and of the machine's cells (the
   sounds its Init plays, the objects it deletes), which are kept only
@@ -269,7 +274,8 @@ What is not ported:
   `a_portrait_whose_person_runs_code_when_put_down_fails_loudly`,
   `a_portrait_whose_put_depends_on_its_tile_fails_loudly`,
   `a_portrait_searches_from_the_view_centre_when_it_is_given`,
-  `a_callback_the_search_runs_must_change_nothing_when_no_centre_is_given`.
+  `a_callback_the_search_runs_must_change_nothing_when_no_centre_is_given`,
+  `a_portrait_put_on_a_lot_with_no_indicators_fails_loudly`.
 - **`$Object`'s name.** `$Object` is replaced by the stack object's
   catalog name (0x44c1ca, 0x4573d9 to 0x457d3b): an entry of the CTSS
   table definition word 41 names, read through 0x4061e3, or the
@@ -285,6 +291,23 @@ What is not ported:
   Where the name would decide the type, the dialog fails loudly. On the Goth
   house this matters at update 901. Test:
   `an_object_name_that_may_hold_a_neighbor_token_fails_loudly`.
+- **The other passes before `$Neighbor`'s.** In order (0x44bf1a):
+  `$FamilyAssets`, `$Family` and `$Me` run before `$Object`'s pass.
+  `$Local`, `$Attrib`, `$NameAttrib`, `$NameLocal` and `$TokenNameLocal`
+  run between it and `$NeighborLocal`'s (0x44c1f2 to 0x44c4a2). The
+  tokens were matched to their strings through the static constructors
+  (0x44bc00 to 0x44bf1a) in the memory capture. None of these passes is
+  ported, but they matter only when the stack object names a neighbor
+  record. A pass that writes a name may write `$Neighbor`, and one before
+  `$Object`'s may write `$Object`. `$Local` and `$Attrib` write a number
+  (0x46f941, 0x4557c0). A number cannot write either token, but it can
+  make a `$NeighborLocal` token out of text that already holds
+  `$Neighbor` (`$NeighborLocal:$Local:0`), and that token's pass may then
+  take `$Neighbor` out (Sol's sixth check). So a text that holds a name
+  token, or a number token together with `$Neighbor`, leaves what is
+  found unknown. The dialog fails loudly where that decides the
+  portrait. Test:
+  `a_token_of_a_pass_before_the_neighbors_that_may_decide_the_portrait_fails_loudly`.
 - **Other builders.** Only the dialog's builds are counted. The household
   panel draws the family's portraits, so a portrait of a family member's
   type with nobody of it on the lot fails loudly. A type made while the
@@ -301,7 +324,8 @@ border of a 64-tile lot), four find no tile: 19,24; 23,31; 26,28 and
 and the build leaves the same lot. The fitted-frame test checks this
 (`every_start_gives_one_state`). At 24718 it saves the lot, steps 24719
 once from each start, and checks two things: the four starts stop where
-the original would build again, and all the others reach one state hash.
+the original would remove the cat unput, and all the others reach one
+state hash.
 So the start does not matter outside those four cells.
 
 The recording's state shows a single 1,920-draw build at 24719 and no

@@ -85,8 +85,8 @@ const GOTH_VIEW_CENTRE: [i8; 2] = [32, 32];
 /// Steps `lot` once from every tile the portrait's search may start from
 /// (inside the lot's border), each from the same save, and checks that
 /// the starts that find a tile all reach one state and that the rest are
-/// exactly `no_tile`, each stopping where the original would build the
-/// portrait again. The lot is left as it was, with its view centre.
+/// exactly `no_tile`, each stopping where the original would remove the
+/// person unput (0x4e9706). The lot is left as it was, with its view centre.
 fn every_start_gives_one_state(lot: &mut Lot, no_tile: &[[i8; 2]]) {
     let saved = lot.save().unwrap();
     let centre = lot.view_centre();

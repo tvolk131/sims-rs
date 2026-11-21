@@ -1299,9 +1299,9 @@ impl Interpreter<'_> {
     /// 4. after the search, data word 40 has bit 0x400: the room it is put
     ///    in is marked as not counted (0x433340);
     /// 5. no tile is found (from the view centre, or with none given from
-    ///    some start): the original then removes it unput and builds again
-    ///    in the same dialog unless the type has image 2002 (0x4e9706,
-    ///    0x4e938c), which is not ported;
+    ///    some start): the original then removes it unput (0x4e9706), and
+    ///    builds again in the same dialog (0x4e938c) unless the type has
+    ///    image 2002; neither is ported;
     /// 6. noting the room of the tile the search ends on (with no view
     ///    centre given, any it may end on) changes a room's mark of who is
     ///    in it ([`World::note_occupant`] through [`Self::note_room`],
@@ -1309,7 +1309,11 @@ impl Interpreter<'_> {
     ///    65; a pet is above 1): an indoor room that is not a pool and not
     ///    marked is marked, and the room the person was last seen in (as
     ///    its first tick may have noted it) loses its mark when nobody else
-    ///    was last seen there. The removal leaves the marks.
+    ///    was last seen there. The removal leaves the marks;
+    /// 7. the lot has no indicators yet: the interface's work for an object
+    ///    come from outside makes them (0x445e4a, from 0x44752e), and their
+    ///    Init runs while the original's person stands on its tile, in its
+    ///    room, which here it does not.
     pub(crate) fn portrait_put(&self, world: &mut World, id: u16) -> Result<(), Fault> {
         let fail = |what: String| Fault {
             object: id,
@@ -1351,7 +1355,7 @@ impl Interpreter<'_> {
                 let Some([a, b]) = self.search(world, id, from, 1, rules)? else {
                     return Err(fail(format!(
                         "from the view centre {x},{y} no tile is found: the original removes it \
-                         unput and builds the portrait again (0x4e9706, 0x4e938c)"
+                         unput (0x4e9706), which is not ported"
                     )));
                 };
                 BTreeSet::from([Some([(a >> 4) as i8, (b >> 4) as i8])])
@@ -1376,8 +1380,7 @@ impl Interpreter<'_> {
                         .collect();
                     return Err(fail(format!(
                         "no view centre is given, and from {} of the starts ({}{}) no tile is \
-                         found: the original removes it unput and builds the portrait again \
-                         (0x4e9706, 0x4e938c)",
+                         found: the original removes it unput (0x4e9706), which is not ported",
                         starts.len(),
                         listed.join("; "),
                         if starts.len() > 8 { "; ..." } else { "" },
@@ -1431,6 +1434,13 @@ impl Interpreter<'_> {
                      is in them (0x45e43d, 0x468802), which its removal leaves"
                 )));
             }
+        }
+        if world.indicators[0] == 0 {
+            return Err(fail(
+                "the lot has no indicators yet: they are made (0x445e4a, from 0x44752e) while \
+                 the person stands on its tile, which is not ported"
+                    .into(),
+            ));
         }
         self.placed_from_outside(world, id)
     }

@@ -53,6 +53,27 @@ const PERSON_TYPE: i16 = 2;
 /// Definition word 41 (+0x52): the catalog string table (0x457d5f).
 const CATALOG_STRINGS: usize = 41;
 
+/// The tokens of the formatter's passes before `$Neighbor`'s that write a
+/// name, in the order they run (0x44bf1a): `$Family` (0x44c034; the text
+/// of `$FamilyAssets`, 0x44bf66, holds it too) and `$Me` (0x44c0fc) before
+/// `$Object`'s pass, then `$NameAttrib` (0x44c330), `$NameLocal`
+/// (0x44c3ff) and `$TokenNameLocal` (0x44c490) before `$NeighborLocal`'s.
+/// The names are not known. The first two run before `$Object`'s.
+const EARLIER_NAMES: [&str; 5] = [
+    "$Family",
+    "$Me",
+    "$NameAttrib",
+    "$NameLocal",
+    "$TokenNameLocal",
+];
+
+/// The tokens of the passes between `$Object`'s and `$NeighborLocal`'s
+/// that write a number (by the calls they make, 0x46f941 and 0x4557c0, as
+/// `$Local`'s does: **unverified**): `$Local` (0x44c1f2) and `$Attrib`
+/// (0x44c280). A number has no `$` and no letter, so it cannot write
+/// `$Neighbor` or `$Object`.
+const EARLIER_NUMBERS: [&str; 2] = ["$Local", "$Attrib"];
+
 /// Record status: made and not shown yet.
 pub const NEW: u8 = 0;
 /// Shown, not answered.
@@ -372,6 +393,16 @@ impl Machine<'_, '_> {
             if object_named {
                 found = BTreeSet::from([object]);
             }
+            // A pass before `$Object`'s that writes a name (`$Family`,
+            // which `$FamilyAssets` holds too, and `$Me`) may write
+            // `$Object` or `$Neighbor` into the text; the names are not
+            // known, so either may then be found.
+            if let Some(neighbor) = neighbor
+                && EARLIER_NAMES[..2].iter().any(|token| text.contains(token))
+            {
+                found.extend([object, Some(neighbor)]);
+                continue;
+            }
             let texts: Vec<(String, bool)> = match &object_names {
                 Some(names) if object_named => names
                     .iter()
@@ -391,6 +422,20 @@ impl Machine<'_, '_> {
             // known stands in it.
             let mut finds = BTreeSet::new();
             for (text, unknown) in &texts {
+                // The passes between `$Object`'s and `$NeighborLocal`'s
+                // (0x44c1f2 to 0x44c4a2) are not ported. One that writes a
+                // name may write `$Neighbor`; one that writes a number may
+                // make a `$NeighborLocal` token out of one that already
+                // holds `$Neighbor` (`$NeighborLocal:$Local:0`), and that
+                // token's pass may then take `$Neighbor` out. Either way
+                // what the `$Neighbor` pass finds is not known.
+                if EARLIER_NAMES.iter().any(|token| text.contains(token))
+                    || (text.contains("$Neighbor")
+                        && EARLIER_NUMBERS.iter().any(|token| text.contains(token)))
+                {
+                    finds.insert(None);
+                    continue;
+                }
                 let (text, named) = self.neighbor_locals_named(text)?;
                 finds.insert(if text.contains("$Neighbor") {
                     Some(true)
@@ -411,9 +456,10 @@ impl Machine<'_, '_> {
         if shown.len() > 1 {
             return Err(Trap::Unsupported(
                 "a dialog's text has a name in place of `$Object` (0x44c1ca) or \
-                 `$NeighborLocal` (0x4e9c46, from the interface's table, 0x4e893e), and whether \
-                 the text then holds `$Neighbor` decides the portrait (0x44c65f): the names are \
-                 not ported"
+                 `$NeighborLocal` (0x4e9c46, from the interface's table, 0x4e893e), or a token \
+                 of a pass before `$Neighbor`'s that is not ported (0x44bf66 to 0x44c4a2), and \
+                 whether the text then holds `$Neighbor` decides the portrait (0x44c65f): the \
+                 names are not ported"
                     .into(),
             ));
         }

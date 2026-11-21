@@ -257,8 +257,9 @@ fn a_portrait_whose_put_depends_on_its_tile_fails_loudly() {
         .insert(9, sims_sim::rooms::Room::default());
     fx.world.rooms.map[1].fill(9);
     assert_eq!(inform(&mut fx, 2, record), Ok(true));
-    // No tile takes it: the original removes it unput and builds again
-    // (0x4e9706, 0x4e938c). On a lot with no inside the start is 1,1.
+    // No tile takes it: the original removes it unput (0x4e9706), and
+    // builds again (0x4e938c) unless the type has image 2002. On a lot
+    // with no inside the start is 1,1.
     let (mut fx, _, record) = visitors();
     fx.world.size = 2;
     let fault = inform(&mut fx, 2, record).unwrap_err().to_string();
@@ -369,7 +370,7 @@ fn a_portrait_searches_from_the_view_centre_when_it_is_given() {
         .unwrap_err()
         .to_string();
     assert!(
-        fault.contains("from the view centre 7,7 no tile is found") && fault.contains("0x4e938c"),
+        fault.contains("from the view centre 7,7 no tile is found") && fault.contains("0x4e9706"),
         "{fault}"
     );
 }
@@ -652,6 +653,23 @@ fn a_portrait_put_that_takes_the_mark_off_the_room_it_was_last_seen_in_fails_lou
 }
 
 #[test]
+fn a_portrait_put_on_a_lot_with_no_indicators_fails_loudly() {
+    // The interface's work for an object come from outside (0x44752e)
+    // makes the lot's indicators when it has none (0x445e4a). Their Init
+    // runs while the original's person stands on its tile, in its room;
+    // here it does not, so the put fails.
+    let (mut fx, _, record) = visitors();
+    assert_ne!(fx.world.indicators[0], 0);
+    fx.world.indicators = [0, 0];
+    let objects: Vec<u16> = fx.world.objects.keys().copied().collect();
+    let fault = inform(&mut fx, 2, record).unwrap_err().to_string();
+    assert!(fault.contains("0x445e4a"), "{fault}");
+    assert!(fx.world.portraits.is_empty());
+    assert!(fx.world.objects.keys().copied().eq(objects));
+    assert_eq!(fx.world.indicators, [0, 0]);
+}
+
+#[test]
 fn a_portrait_build_that_fails_leaves_the_machines_cells_as_they_were() {
     // The person's Init plays a sound, and the put then fails (data word
     // 40 bit 0x400, 0x433340): the sound is not kept, as the person is
@@ -829,6 +847,72 @@ fn an_object_name_that_may_hold_a_neighbor_token_fails_loudly() {
         .unwrap_err()
         .to_string();
     assert!(fault.contains("0x44c1ca"), "{fault}");
+}
+
+#[test]
+fn a_token_of_a_pass_before_the_neighbors_that_may_decide_the_portrait_fails_loudly() {
+    // The formatter's passes before `$Neighbor`'s (0x44bf1a) that are not
+    // ported: `$FamilyAssets`, `$Family` and `$Me` before `$Object`'s;
+    // `$Local`, `$Attrib`, `$NameAttrib`, `$NameLocal` and
+    // `$TokenNameLocal` between it and `$NeighborLocal`'s. A name one
+    // writes may hold `$Neighbor` (or, before `$Object`'s, `$Object`).
+    // A number cannot, but `$Local` in `$NeighborLocal:$Local:0` makes a
+    // `$NeighborLocal` token whose pass may take `$Neighbor` out (0x44c257,
+    // 0x44c590). The person's own name is plain.
+    let message = |fx: &mut Fixture, text: &str| {
+        fx.program
+            .libraries
+            .get_mut(&LAMP_FILE)
+            .unwrap()
+            .strings
+            .get_mut(&301)
+            .unwrap()[0] = text.to_owned();
+    };
+    for text in [
+        "$NeighborLocal:$Local:0",
+        "$Neighbor, $Attrib:0",
+        "$FamilyAssets",
+        "$Family",
+        "$Me and $Object",
+        "$Object and $NameAttrib:0",
+        "$NameLocal:0",
+        "$TokenNameLocal:0",
+    ] {
+        let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
+        message(&mut fx, text);
+        let fault = fx
+            .run_with(LAMP, 4096, SIM as i16, &[], 1000)
+            .unwrap_err()
+            .to_string();
+        assert!(fault.contains("0x44c4a2"), "{text}: {fault}");
+        assert!(fx.world.portraits.is_empty(), "{text}");
+    }
+    // A number with no `$Neighbor` in the text cannot change what is found.
+    for (text, shown) in [
+        ("$Local:0 and $Attrib:1", SIM_GUID),
+        ("$Object at $Local:0", SIM_GUID),
+    ] {
+        let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
+        message(&mut fx, text);
+        assert_eq!(fx.run_with(LAMP, 4096, SIM as i16, &[], 1000), Ok(true));
+        assert_eq!(fx.world.portraits, [shown].into(), "{text}");
+    }
+    // A name written before `$Object`'s pass may hold `$Object`, which
+    // would take the place of the neighbor found in an earlier string (the
+    // button's label comes first).
+    let mut fx = text_dialog((2, 0, 1), Some(vec![(1, "Grim")]));
+    message(&mut fx, "$Me");
+    let fault = fx
+        .run_with(LAMP, 4096, SIM as i16, &[], 1000)
+        .unwrap_err()
+        .to_string();
+    assert!(fault.contains("0x44c4a2"), "{fault}");
+    // Where `$Neighbor` is found in a later string, the earlier one's
+    // tokens do not matter.
+    let mut fx = text_dialog((1, 0, 2), Some(vec![(1, "Grim")]));
+    message(&mut fx, "$Me");
+    assert_eq!(fx.run_with(LAMP, 4096, SIM as i16, &[], 1000), Ok(true));
+    assert_eq!(fx.world.portraits, [WIDGET].into());
 }
 
 #[test]
