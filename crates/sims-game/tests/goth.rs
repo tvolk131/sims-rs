@@ -1258,6 +1258,8 @@ fn the_sound_scripts_learn_about_the_goths() {
     let game = Game::open(&options(install)).expect("the Goth house opens");
     let world = game.lot().world();
     let snapshot = sims_game::sound::sources(world);
+    assert_eq!(snapshot.lot(), i32::from(world.globals[10]));
+    assert_eq!(snapshot.lot(), 5);
     let hour = i32::from(world.globals[0]);
     // Cassandra is a child (field 0 is 2 below age 12), Bella a woman
     // and Mortimer a man (person data word 65); field 1 is the age, and

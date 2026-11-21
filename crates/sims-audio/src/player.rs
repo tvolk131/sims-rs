@@ -99,9 +99,19 @@
 //! - 21, pause, and 22, unpause ([`SoundEvent::Pause`] and
 //!   [`SoundEvent::Unpause`], what the game sends): a pause holds every
 //!   track that runs or plays, but for the interface's clicks, the speed
-//!   buttons and the main music loop ([`PAUSE_SPARES`]), and the live
-//!   ambience; an unpause lets them all go on from where they were. See
-//!   [`Player::pause`].
+//!   buttons and the main music loop ([`PAUSE_SPARES`]), stops the day and
+//!   night loop and pauses the live ambience; an unpause (while sound is
+//!   active) lets them all go on from where they were, updates the day and
+//!   night loop, and lets `MainMusicLoop` go. See [`Player::pause`] and
+//!   [`Player::unpause`].
+//! - 25, sound active ([`Player::set_active`], 0x573c64): what the
+//!   original's `WM_ACTIVATEAPP` handler sends when the window loses or
+//!   regains focus (0x4f7608 → 0x4f76d5). Inactive sound skips kind 1,
+//!   holds kind 30 starts, suppresses unpause's resume, stops the day and
+//!   night loop, and pauses all ambience scores in live mode. Turning it
+//!   back on starts a 100-update volume-nudge countdown (`+0x114`,
+//!   0x573019, 0x574701), resumes if unpaused (or in neighbourhood mode),
+//!   and lets `MainMusicLoop` go.
 //! - 30, `kTurnOnTv` (radios too): kills the object's instances, then
 //!   records the object as an instance of the track (even 0), starts it
 //!   and sets its `extvol` and `pan` as kind 1 does.
@@ -112,14 +122,15 @@
 //!   stopping the one before (see [`crate::ambience`] and
 //!   [`Player::add_scores`]); a mode with no score stops the current one.
 //! - 36, `kSetMusicMode`: changes the music for the game's mode, then
-//!   the ambience (see `Player::set_music_mode`).
+//!   the ambience and the day and night loop (see `Player::set_music_mode`).
 //! - 43, `kPlayPiano`: starts the piano (track [`PIANO`]) where its
 //!   object is, and the skill track [`PIANO_SKILL`] (see
 //!   `Player::play_piano`).
 //!
 //! The game's code also calls kind 33 when the camera moves: it places
-//! every track again from where its objects are now, and moves the
-//! ambience's cursor from the camera and the hour
+//! every track again from where its objects are now, moves the
+//! ambience's cursor from the camera and the hour, and updates the day
+//! and night loop (`nite_loop` 2985 or `BeachLoop` 68259, 0x574978)
 //! ([`Player::camera_moved`]; the cursor alone is
 //! [`Player::set_ambience_view`]). The scores'
 //! voices mix with the notes, at the effects group's volume.
@@ -223,6 +234,18 @@ pub const ARGS_ID_VOL_PAN: i64 = 2;
 pub const PIANO: u32 = 1906;
 /// The track kind 43 starts after the piano, with the player's skill.
 pub const PIANO_SKILL: u32 = 1907;
+/// *(code)* The night loop track (`nite_loop`, 0x6ceb08), picked by
+/// `0x57492a` when the hour is below 6 or above 18 outside lots 20 to 29.
+pub const NITE_LOOP: u32 = 2985;
+/// *(code)* The beach loop track (`BeachLoop`, 0x6ceb10), picked by
+/// `0x57492a` when the current ambience is Beach (mode 1, manager +0x108).
+pub const BEACH_LOOP: u32 = 68_259;
+/// *(code)* How many sound-manager updates kind 25 on (`0x573c64`) nudges
+/// placed tracks' volumes for (`+0x114`, decremented in `0x573019`).
+const NUDGE_UPDATES: u32 = 100;
+/// *(code)* `fade_speed` written when starting a day and night loop
+/// (`0x574a46`: 0x1388 = 5000).
+const DAY_NIGHT_FADE_SPEED: i32 = 5000;
 /// The `extvol` register, which `seqgroup_kill` fades out.
 pub const EXTVOL: u8 = 19;
 /// The fade registers: the value to reach, the register that moves, how
@@ -356,6 +379,7 @@ pub mod kind {
     pub const PAUSE: i64 = 21;
     pub const UNPAUSE: i64 = 22;
     pub const KILL_INSTANCE: i64 = 23;
+    pub const SET_ACTIVE: i64 = 25;
     pub const TURN_ON_TV: i64 = 30;
     pub const SET_MUSIC_MODE: i64 = 36;
     pub const PLAY_PIANO: i64 = 43;
@@ -372,9 +396,9 @@ pub mod kind {
     /// reported when an event has one. (Kind 33 is ported for the game's
     /// own calls, [`super::Player::camera_moved`], which carry the
     /// camera; no event in the install has it.)
-    pub const NOT_PORTED: [i64; 31] = [
-        2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 24, 25, 26, 32, 33, 34, 35, 37, 38,
-        39, 40, 41, 42, 103, 104,
+    pub const NOT_PORTED: [i64; 30] = [
+        2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 24, 26, 32, 33, 34, 35, 37, 38, 39,
+        40, 41, 42, 103, 104,
     ];
 }
 
@@ -417,6 +441,14 @@ pub trait Sources {
     /// since `Spl` starts at 20 and no script writes it. Without it the
     /// placement is a fault, and the track keeps its `extvol` and `pan`.
     fn projection(&self, object: i32) -> Option<Projection>;
+
+    /// *(code)* The lot's house number (global 10, `0x571093`:
+    /// `[[0x6e48bc]+0x1c]+0x24`, sign-extended to 32 bits; 0 when no
+    /// game is loaded). The day and night loop (`0x57492a`) uses it to
+    /// skip [`NITE_LOOP`] on lots 20 to 29.
+    fn lot(&self) -> i32 {
+        0
+    }
 }
 
 /// What [`Player::start`] did: the threads it started or refreshed
@@ -835,8 +867,19 @@ pub struct Player<S> {
     /// mode 3 has been set, after which modes are recorded (0x6f6428).
     music_mode: i64,
     music_started: bool,
+    /// *(code)* Whether sound is active (manager +0xc, `true` at
+    /// startup, `0x5712e9`; set by kind 25, `0x573c64`).
+    active: bool,
     /// *(code)* Whether the sound is paused (manager +0xd).
     paused: bool,
+    /// *(code)* Volume-nudge countdown (manager +0x114, `0` at startup,
+    /// `0x571433`): set to `100` by kind 25 on (`0x573c64`) and counted
+    /// down once per update (`0x573019`). While nonzero, `place_track`
+    /// (`0x574701`) writes `vol - 1` (or `1` for `vol <= 0`).
+    nudge: u32,
+    /// *(code)* The remembered day and night loop track (`0x6f6424`),
+    /// updated by `0x574978`.
+    day_night: Option<u32>,
     /// *(code)* The tracks a pause holds (each track's +0x1c8): their
     /// threads do not run or fade and their notes stay where they are,
     /// silent, until an unpause or until the track starts again.
@@ -897,7 +940,10 @@ impl<S: Samples> Player<S> {
             ambience: None,
             music_mode: 4,
             music_started: false,
+            active: true,
             paused: false,
+            nudge: 0,
+            day_night: None,
             held: BTreeSet::new(),
             voices: Vec::new(),
             ambient_patches: BTreeMap::new(),
@@ -1052,12 +1098,20 @@ impl<S: Samples> Player<S> {
     /// **Unverified:** the original's older notes follow the one track
     /// object, so they would take its levels, not their own thread's.
     ///
-    /// Not ported: after a kind 25 that turns the sound on (0x573c64),
-    /// the original writes the volume less 1 (or 1 for a volume of 0;
-    /// the manager's +0x114, 0x574701). Kind 25 is not ported, and the
-    /// flag starts clear. Nor is the day and night loop that kind 33
-    /// picks last (0x574978).
+    /// While the kind 25 volume-nudge countdown (`+0x114`, set to 100
+    /// by [`Player::set_active`]`(true)` and counted down once per
+    /// update at `0x573019`) is nonzero, each placement writes `vol - 1`,
+    /// or `1` when `vol <= 0` (`0x574701`). Last, it updates the day and
+    /// night loop (`0x574978`: [`NITE_LOOP`] or [`BEACH_LOOP`]).
     pub fn camera_moved(&mut self, view: i32, hour: u32, sources: &dyn Sources) {
+        self.place_all(sources);
+        self.set_ambience_view(view, hour);
+        self.update_day_night(sources);
+    }
+
+    /// *(code)* 0x57447f: places every track with object instances again,
+    /// in the order of the instance map.
+    fn place_all(&mut self, sources: &dyn Sources) {
         self.forget_silent();
         let mut tracks: Vec<u32> = Vec::new();
         for &(track, _) in &self.instances {
@@ -1068,7 +1122,6 @@ impl<S: Samples> Player<S> {
         for track in tracks {
             self.place_track(track, sources);
         }
-        self.set_ambience_view(view, hour);
     }
 
     /// A track that was killed lets its notes go at once; what it kept
@@ -1130,6 +1183,14 @@ impl<S: Samples> Player<S> {
         let Some((vol, pan)) = self.placed_with(track, spl, sources) else {
             return;
         };
+        // *(code)* 0x574701: while `+0x114` is nonzero, write `vol - 1`,
+        // or `1` when that is negative.
+        let vol = if self.nudge != 0 {
+            let nudged = vol.wrapping_sub(1);
+            if nudged < 0 { 1 } else { nudged }
+        } else {
+            vol
+        };
         // The last start's thread, running or about to, is written as
         // it would write; with none, the newest running one takes it
         // itself.
@@ -1137,6 +1198,12 @@ impl<S: Samples> Player<S> {
             self.place_through(id, vol, pan);
         } else if let Some(at) = self.newest(track) {
             place_itself(&mut self.threads[at], vol, pan);
+            let thread = self.threads[at].clone();
+            let levels = self.levels(&thread);
+            for note in self.notes.iter_mut().filter(|n| n.thread == thread.id) {
+                note.gains = levels.gains;
+                note.step = step(levels.rate);
+            }
         }
         for id in ended {
             // The last start's thread writes through its `target`; only
@@ -1218,9 +1285,9 @@ impl<S: Samples> Player<S> {
 
     /// *(code)* Kind 52 (0x573f7a): makes the score of a mode (the event's
     /// track) the current ambience. Nothing happens when it already is;
-    /// otherwise the current one stops and the new one starts. (A mode
-    /// with no score crashes the original; here the current one stops
-    /// and none is current.)
+    /// otherwise the current one stops and the new one starts (paused if
+    /// the sound is paused, 0x573fd4). (A mode with no score crashes the
+    /// original; here the current one stops and none is current.)
     fn set_ambience_mode(&mut self, mode: u32) {
         let new = self.scores.contains_key(&mode).then_some(mode);
         if new == self.ambience {
@@ -1232,19 +1299,25 @@ impl<S: Samples> Player<S> {
         self.ambience = new;
         if let Some(new) = new {
             let frame = self.frame;
-            self.with_score(new, |score, _| score.start(frame));
+            let paused = self.paused;
+            self.with_score(new, |score, _| {
+                score.start(frame);
+                score.set_paused(paused);
+            });
         }
     }
 
     /// Kind 36 (0x573fe2): *(code)* the music mode is recorded (once mode
     /// 3 has been set), with its music ([`Player::change_music`]) when it
     /// changes, and then, on every event (the same mode again included),
-    /// for the ambience, in mode 0 (live),
-    /// the current ambience starts if it is stopped; in mode 3 (the
-    /// neighbourhood) the backyard score becomes current and starts, its
-    /// cursor first set to (1000, 500) per mille, which starting resets
-    /// when it was stopped; in any other mode the current ambience stops.
-    fn set_music_mode(&mut self, mode: i64) {
+    /// for the ambience: in mode 0 (live), the current ambience starts if
+    /// it is stopped and takes the pause state (0x57400d); in mode 3 (the
+    /// neighbourhood) the backyard score becomes current and starts
+    /// unpaused (0x574072), its cursor first set to (1000, 500) per mille,
+    /// which starting resets when it was stopped; in any other mode the
+    /// current ambience stops. Last, it updates the day and night loop
+    /// (0x5741b7 → 0x574978).
+    fn set_music_mode(&mut self, mode: i64, sources: &dyn Sources) {
         if mode != self.music_mode {
             if mode == 3 {
                 self.music_started = true;
@@ -1258,22 +1331,26 @@ impl<S: Samples> Player<S> {
         match self.music_mode {
             0 => {
                 if let Some(current) = self.ambience {
-                    self.with_score(current, |score, _| score.start(frame));
+                    let paused = self.paused;
+                    self.with_score(current, |score, _| {
+                        score.start(frame);
+                        score.set_paused(paused);
+                    });
                 }
             }
             3 => {
-                if !self.scores.contains_key(&0) {
-                    return;
+                if self.scores.contains_key(&0) {
+                    if let Some(current) = self.ambience.filter(|&m| m != 0) {
+                        self.with_score(current, |score, host| score.stop(host));
+                    }
+                    self.ambience = Some(0);
+                    self.with_score(0, |score, _| {
+                        score.set_x(1000);
+                        score.set_y(500);
+                        score.start(frame);
+                        score.set_paused(false);
+                    });
                 }
-                if let Some(current) = self.ambience.filter(|&m| m != 0) {
-                    self.with_score(current, |score, host| score.stop(host));
-                }
-                self.ambience = Some(0);
-                self.with_score(0, |score, _| {
-                    score.set_x(1000);
-                    score.set_y(500);
-                    score.start(frame);
-                });
             }
             _ => {
                 if let Some(current) = self.ambience {
@@ -1281,6 +1358,7 @@ impl<S: Samples> Player<S> {
                 }
             }
         }
+        self.update_day_night(sources);
     }
 
     /// The music half of kind 36 (0x575170): *(code)* what a change of
@@ -1472,7 +1550,7 @@ impl<S: Samples> Player<S> {
             SoundEvent::StopAll => self.kill_all(),
             // Kinds 21 and 22, as the game calls them (0x57a7f2, 0x57a8e3).
             SoundEvent::Pause => self.pause(),
-            SoundEvent::Unpause => self.unpause(),
+            SoundEvent::Unpause => self.unpause(sources),
         }
     }
 
@@ -1534,14 +1612,15 @@ impl<S: Samples> Player<S> {
             kind::CANCEL_NOTE => self.cancel_radio_notes(),
             kind::KILL_ALL => self.kill_all(),
             kind::PAUSE => self.pause(),
-            kind::UNPAUSE => self.unpause(),
+            kind::UNPAUSE => self.unpause(sources),
             kind::KILL_INSTANCE => self.kill_instance(track, sources),
+            kind::SET_ACTIVE => self.set_active(track != 0, sources),
             kind::SET_AMBIENCE_MODE => self.set_ambience_mode(track),
-            kind::SET_MUSIC_MODE => self.set_music_mode(i64::from(track as i32)),
+            kind::SET_MUSIC_MODE => self.set_music_mode(i64::from(track as i32), sources),
             kind::TURN_ON_TV => self.turn_on_tv(track, args, sources),
             kind::PLAY_PIANO => self.play_piano(args, sources),
             kind::SEQUENCE_TRACK_HIT_LIST => self.sequence(track, args[1]),
-            kind::KILL_OBJECT_SOUNDS => self.kill_object_sounds(),
+            kind::KILL_OBJECT_SOUNDS => self.kill_object_sounds(sources),
             kind if kind::NOTHING_FOR_SOUND.contains(&kind) => {}
             kind if kind::NOT_PORTED.contains(&kind) => self.report(format!(
                 "event {name}: kind {kind} is not one this player plays"
@@ -1558,6 +1637,9 @@ impl<S: Samples> Player<S> {
     /// instance of the track, and the track's `extvol` and `pan` are set
     /// from where its objects are ([`crate::placement`]).
     fn play_track(&mut self, track: u32, args: [u32; 3], sources: &dyn Sources) {
+        if !self.active {
+            return;
+        }
         if self.owner(track).is_none() {
             self.no_track(track);
             return;
@@ -1735,6 +1817,12 @@ impl<S: Samples> Player<S> {
         let at = self.camera_destination(id);
         if let Some(thread) = self.threads.iter_mut().find(|t| t.id == at) {
             place_itself(thread, vol, pan);
+            let thread = thread.clone();
+            let levels = self.levels(&thread);
+            for note in self.notes.iter_mut().filter(|n| n.thread == at) {
+                note.gains = levels.gains;
+                note.step = step(levels.rate);
+            }
         } else if let Some(mut thread) = self.ended.remove(&at) {
             place_itself(&mut thread, vol, pan);
             let levels = self.levels(&thread);
@@ -1828,19 +1916,20 @@ impl<S: Samples> Player<S> {
 
     /// Kind 21: *(code)* pauses the sound (0x573c20, 0x57481e). The
     /// manager is marked paused; `main_duckpri` becomes 0 (0x57d361),
-    /// which here drops every thread's ducking request; every track
-    /// that runs or plays is held except [`PAUSE_SPARES`]; and in music
-    /// mode 0 the current ambience player is paused (see
+    /// which here drops every thread's ducking request; the day and night
+    /// loop fades out and ends (0x574844 → 0x574978); every track that
+    /// runs or plays is held except [`PAUSE_SPARES`]; and in music mode 0
+    /// the current ambience player is paused (see
     /// [`crate::ambience::Fresh::set_paused`]). A held track's threads
     /// do not run or fade, and its notes stay where they are, silent. A
     /// track started while paused plays: starting a track (0x57d960)
     /// clears its hold, and a held track whose script still runs is let
-    /// go rather than started again. The original also stops its day and night
-    /// loop (0x574978), which this player does not have.
+    /// go rather than started again.
     pub fn pause(&mut self) {
         self.paused = true;
         self.duck.clear();
         self.update_main_duckpri();
+        self.stop_day_night();
         let tracks: BTreeSet<u32> = self
             .threads
             .iter()
@@ -1856,17 +1945,19 @@ impl<S: Samples> Player<S> {
         }
     }
 
-    /// Kind 22: *(code)* unpauses the sound (0x573c44, 0x574904): every
-    /// track is let go (0x57cd2c) and the current ambience player, in
-    /// any music mode, unpaused. Letting a track go (vtable +0x5c,
-    /// 0x57dc63) also moves its wait deadline (+0x198, which `wait`
-    /// sets at 0x57e453) to now, so every running thread's wait ends at
-    /// the next update, whether or not it was held, and whether or not
-    /// the sound was paused. (The original does this only while the
-    /// sound is on, manager +0xc, which this player always is; it also
-    /// restarts its day and night loop and its music, 0x575155, which
-    /// this player does not have.) `main_duckpri` stays as the pause
-    /// left it until a thread asks again.
+    /// Kind 22: *(code)* unpauses the sound (0x573c44, 0x574904): clears
+    /// the paused flag, and while sound is active (manager +0xc,
+    /// [`Player::is_active`]) lets every track go (0x57cd2c), updates
+    /// the day and night loop (0x574978), lets `MainMusicLoop` go
+    /// (0x575155) and unpauses the current ambience player in any music
+    /// mode. When sound is inactive, only the paused flag is cleared;
+    /// turning sound back on ([`Player::set_active`]) then resumes.
+    ///
+    /// Letting a track go (vtable +0x5c, 0x57dc63) also moves its wait
+    /// deadline (+0x198, which `wait` sets at 0x57e453) to now, so every
+    /// running thread's wait ends at the next update, whether or not it
+    /// was held, and whether or not the sound was paused. `main_duckpri`
+    /// stays as the pause left it until a thread asks again.
     ///
     /// The original lets go of the tracks in the order of its registry of
     /// patch and track objects (0x57cd56 to 0x57cd82): bucket by bucket,
@@ -1881,7 +1972,21 @@ impl<S: Samples> Player<S> {
     /// tracks go last, by number. **Unverified:** the order the original
     /// takes the files of one directory in, and the downloads' order
     /// (here, by name).
-    pub fn unpause(&mut self) {
+    pub fn unpause(&mut self, sources: &dyn Sources) {
+        self.paused = false;
+        if !self.active {
+            return;
+        }
+        self.unpause_tracks(sources);
+        if let Some(current) = self.ambience {
+            self.with_score(current, |score, _| score.set_paused(false));
+        }
+    }
+
+    /// *(code)* 0x574904: clears pause, lets every running track go in
+    /// registry order (0x57cd2c), updates the day and night loop
+    /// (0x574978), and lets `MainMusicLoop` go (0x575155).
+    fn unpause_tracks(&mut self, sources: &dyn Sources) {
         self.paused = false;
         self.held.clear();
         let running: BTreeSet<u32> = self.threads.iter().map(|t| t.track).collect();
@@ -1908,8 +2013,154 @@ impl<S: Samples> Player<S> {
         running.sort_unstable();
         let ids: Vec<u32> = running.into_iter().map(|(_, _, id)| id).collect();
         self.let_go(&ids);
-        if let Some(current) = self.ambience {
-            self.with_score(current, |score, _| score.set_paused(false));
+        self.update_day_night(sources);
+        self.unpause_music();
+    }
+
+    /// *(code)* 0x575155: lets go of `MainMusicLoop` (track 515, vtable
+    /// +0x5c). Called at the end of unpause (0x574923) and kind 25 on
+    /// (0x573cc0).
+    fn unpause_music(&mut self) {
+        if self.owner(music::MAIN_MUSIC_LOOP).is_none() {
+            return;
+        }
+        self.held.remove(&music::MAIN_MUSIC_LOOP);
+        let ids: Vec<u32> = self
+            .threads
+            .iter()
+            .filter(|t| t.track == music::MAIN_MUSIC_LOOP)
+            .map(|t| t.id)
+            .collect();
+        self.let_go(&ids);
+    }
+
+    /// Kind 25: *(code)* sets the sound-active flag (manager +0xc,
+    /// `0x573c64`), which the original's `WM_ACTIVATEAPP` handler sends
+    /// when the window loses or regains focus (`0x5d6ccb` → `0x5d6e2e`
+    /// → `0x4f7608` → `0x4f76d5`). The app constructor initializes its
+    /// own active flag to `1` (`0x4eee14`) and `0x4f7610` returns when
+    /// unchanged, so startup sends no kind 25.
+    ///
+    /// When turning sound on (`active == true`):
+    /// - nudges every placed track's volume (`+0x114 = 100`, `0x57447f`,
+    ///   then `+0x114 = 0`, `0x57447f`) and arms the 100-update
+    ///   countdown (`+0x114 = 100`, `0x573c71`..`0x573c98`);
+    /// - if not paused, calls `0x574904` (unpause tracks, day and night
+    ///   loop, `MainMusicLoop`) and unpauses the current ambience;
+    /// - if `music_mode == 3`, calls `0x574904` (even when paused);
+    /// - calls `0x575155` (`MainMusicLoop` let-go).
+    ///
+    /// When turning sound off (`active == false`):
+    /// - in live music mode (`music_mode == 0`), pauses every ambience
+    ///   score (`+0x104`..`+0x110`, `0x573cca`..`0x573d0f`).
+    pub fn set_active(&mut self, active: bool, sources: &dyn Sources) {
+        self.active = active;
+        if active {
+            self.nudge = NUDGE_UPDATES;
+            self.place_all(sources);
+            self.nudge = 0;
+            self.place_all(sources);
+            self.nudge = NUDGE_UPDATES;
+            if !self.paused {
+                self.unpause_tracks(sources);
+                if let Some(current) = self.ambience {
+                    self.with_score(current, |score, _| score.set_paused(false));
+                }
+            }
+            if self.music_mode == 3 {
+                self.unpause_tracks(sources);
+            }
+            self.unpause_music();
+        } else if self.music_mode == 0 {
+            let modes: Vec<u32> = self.scores.keys().copied().collect();
+            for mode in modes {
+                self.with_score(mode, |score, _| score.set_paused(true));
+            }
+        }
+    }
+
+    /// Whether the sound is active (manager +0xc, `true` until kind 25
+    /// turns it off).
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    /// *(code)* 0x57492a: picks the day and night background loop track:
+    /// - [`BEACH_LOOP`] (68259) when the current ambience is Beach (mode
+    ///   1, manager +0x108);
+    /// - none when the lot number (global 10, `0x571093`) is 20 to 29;
+    /// - [`NITE_LOOP`] (2985) when the hour (`sources.field(0, 4)`,
+    ///   `0x570e61`) is below 6 or above 18;
+    /// - else none.
+    fn pick_day_night(&self, sources: &dyn Sources) -> Option<u32> {
+        if self.ambience == Some(1) {
+            return Some(BEACH_LOOP);
+        }
+        let lot = sources.lot() as u32;
+        if (20..=29).contains(&lot) {
+            return None;
+        }
+        let hour = sources.field(0, 4).unwrap_or(0);
+        if !(6..=18).contains(&hour) {
+            Some(NITE_LOOP)
+        } else {
+            None
+        }
+    }
+
+    /// *(code)* The stop branch of `0x574978` (`0x574a6d`), used by
+    /// [`Player::pause`] where `paused` is always true and `sources` is
+    /// not queried.
+    fn stop_day_night(&mut self) {
+        if let Some(track) = self.day_night {
+            self.fade_day_night(track);
+        }
+    }
+
+    /// *(code)* `0x574978`: starts, switches or stops the day and night
+    /// loop (`nite_loop` 2985 or `BeachLoop` 68259).
+    fn update_day_night(&mut self, sources: &dyn Sources) {
+        let old = self.day_night;
+        if self.paused || !self.active || self.music_mode != 0 {
+            if let Some(track) = old {
+                self.fade_day_night(track);
+            }
+            return;
+        }
+        let new = self.pick_day_night(sources);
+        self.day_night = new;
+        if new != old
+            && let Some(track) = old
+        {
+            self.fade_day_night(track);
+        }
+        let Some(track) = new else {
+            return;
+        };
+        // Unregistered ID -> NULL (0x5749f6); patch object -> vtable
+        // +0x70 returns true (0x57bfa6), so neither starts nor faults.
+        if self.owner(track).is_none() || self.threads.iter().any(|t| t.track == track) {
+            return;
+        }
+        let target_vol = self.group_volumes.get(&1).copied().unwrap_or(1024);
+        let started = self.start([0; 3], track);
+        if let Some(&id) = started.threads.last()
+            && let Some(at) = self.threads.iter().position(|t| t.id == id)
+        {
+            self.write_at(at, EXTVOL, 0);
+            self.write_at(at, FADE_DEST, target_vol);
+            self.write_at(at, FADE_VAR, i32::from(EXTVOL));
+            self.write_at(at, FADE_SPEED, DAY_NIGHT_FADE_SPEED);
+            self.write_at(at, FADE_ON, 1);
+        }
+        self.let_go(&started.threads);
+    }
+
+    /// Fades out and ends a day and night loop track if it is a running
+    /// track object (vtable +0x70 / +0x34, `0x5749d6`, `0x574a80`).
+    fn fade_day_night(&mut self, track: u32) {
+        if self.owner(track).is_some() && self.threads.iter().any(|t| t.track == track) {
+            self.fade_and_kill(track);
         }
     }
 
@@ -1972,10 +2223,11 @@ impl<S: Samples> Player<S> {
         }
     }
 
-    /// Kind 105 (`kill_all_objectsounds`): *(code)* lets go of every
-    /// instance whose object is above 0 (as a signed number), fading out
-    /// and ending its track.
-    fn kill_object_sounds(&mut self) {
+    /// Kind 105 (`kill_all_objectsounds`, 0x574560): *(code)* lets go of
+    /// every instance whose object is above 0 (as a signed number),
+    /// fading out and ending its track, then places every track with
+    /// remaining instances (`<= 0`) again (0x574647 → 0x57447f).
+    fn kill_object_sounds(&mut self, sources: &dyn Sources) {
         let (killed, kept): (Vec<_>, Vec<_>) = self
             .instances
             .iter()
@@ -1985,6 +2237,7 @@ impl<S: Samples> Player<S> {
         for (track, _) in killed {
             self.fade_and_kill(track);
         }
+        self.place_all(sources);
     }
 
     /// The original's fade-out-and-kill (0x57dca3) on a track's threads:
@@ -2043,11 +2296,11 @@ impl<S: Samples> Player<S> {
         }
         let placed = self.placed(track, sources);
         let started = self.start(args, track);
-        if started.fresh && self.paused {
+        if started.fresh && (self.paused || !self.active) {
             self.held.insert(track);
         }
         self.place(&started.threads, placed);
-        if !self.paused {
+        if !self.paused && self.active {
             self.let_go(&started.threads);
         }
     }
@@ -2511,6 +2764,16 @@ impl<S: Samples> Player<S> {
     fn run_at_block_start(&mut self, sources: &dyn Sources) {
         if self.frame.is_multiple_of(BLOCK as u64) && self.ran_at != Some(self.frame) {
             self.ran_at = Some(self.frame);
+            // *(code)* 0x573019: before stepping the HIT tracks, while
+            // `+0x114` is nonzero, place every track nudged then normal
+            // and decrement the countdown.
+            if self.nudge != 0 {
+                let remaining = self.nudge;
+                self.place_all(sources);
+                self.nudge = 0;
+                self.place_all(sources);
+                self.nudge = remaining - 1;
+            }
             self.run(sources);
             self.update_ambience();
         }

@@ -161,6 +161,7 @@ pub fn sources(world: &World) -> Snapshot {
         absent,
         positions,
         screen: BTreeMap::new(),
+        lot: world.globals.get(10).copied().unwrap_or(0),
     }
 }
 
