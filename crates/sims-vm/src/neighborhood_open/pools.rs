@@ -473,7 +473,7 @@ impl<'a, 'b> Fills<'a, 'b> {
                 Some(Ok(scales)) => scales.as_slice(),
                 Some(Err(reason)) => {
                     return Err(format!(
-                        "0x5a03c0: the skeleton {name:?} for User{file:05}: {reason}"
+                        "the skeleton {name:?} for User{file:05}: {reason}"
                     )
                     .into());
                 }

@@ -67,9 +67,16 @@ registration keeps the case, 0x59f163, 0x59e899, 0x59fd58), in the
 avatar files `People::load` searches, read record by record. Those files
 are not the original's search: it registers `GameData/Skins` eagerly
 and loads through `Animation.ndx`. That predates the pools and is a
-follow-up. These fail, and only when a pool person needs that skeleton:
-- a name no file defines, or two files define (the miss, 0x5a03c0);
-- a file whose skeletons do not decode;
+follow-up. A name registered twice keeps its first registration:
+registration looks the name up first (0x59f132) and lets a second
+skeleton go when the first is read (0x59f18c, 0x598d8a); only an entry
+not yet read, as an index's is, takes the second (0x5a2207), and index
+entries are not modelled. So the lookup takes the first file, in the
+search's order, that defines the name. These fail, and only when a pool
+person needs that skeleton:
+- a name no file defines (the miss, 0x5a03c0);
+- a file searched before the name is found whose skeletons do not
+  decode;
 - a template GUID with two definitions, since the registry and the
   catalog order them differently.
 
