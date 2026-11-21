@@ -601,21 +601,34 @@ def torn_logged(path, mark):
 
 def repair_tails(out, names):
     """Before a resume: a row cut short at the end of each log is taken off, or ended with a newline if
-    it is whole JSON. What is done is kept in resume-torn.json first, with a mark (the cut rows, and the
-    logs ended), so a takeover killed before it logs it (resume_torn, with the mark) hands it on. One
-    killed before the cut hands on the same row, which is noted once; one killed after logging it and
-    before taking off resume-torn.json has its mark in the events, and the file is not used again.
-    Returns dict(mark, rows, ended)."""
+    it is whole JSON. What is done is kept in resume-torn.json first, with a mark (each cut row with where
+    it starts and whether it is taken off yet, and the logs ended), so a takeover killed before it logs it
+    (resume_torn, with the mark) hands it on. One killed before the cut finds the same row where it was
+    and notes it once; a row cut short at the same place after the cut was made is another, and noted
+    too. One killed after logging it and before taking off resume-torn.json has its mark in the events,
+    and the file is not used again. The file an earlier revision wrote (the cut rows by log, already
+    taken off) is taken up. Returns dict(mark, rows, ended), rows the cut rows' text by log."""
     sidecar = out / 'resume-torn.json'
-    fresh = lambda: dict(mark=f'{time.time_ns():x}', rows={}, ended=[])
+    fresh = lambda: dict(mark=f'{time.time_ns():x}', cuts={}, ended=[])
     try:
         saved = json.loads(sidecar.read_text())
-        if not (isinstance(saved, dict) and {'mark', 'rows', 'ended'} <= saved.keys()):
-            saved = fresh()
     except (OSError, ValueError):
+        saved = None
+    if isinstance(saved, dict) and {'mark', 'cuts', 'ended'} <= saved.keys():
+        pass
+    elif isinstance(saved, dict) and all(isinstance(v, list) and all(isinstance(t, str) for t in v)
+                                         for v in saved.values()):
+        saved = dict(fresh(), cuts={name: [[None, text, True] for text in texts] for name, texts in saved.items()})
+    else:
         saved = fresh()
     if torn_logged(out / 'events.jsonl', saved['mark']):
         saved = fresh()
+
+    def keep():
+        tmp = out / 'resume-torn.json.tmp'
+        tmp.write_text(json.dumps(saved))
+        tmp.rename(sidecar)
+
     fixes = []
     for name in names:
         found = torn_tail(out / name)
@@ -629,14 +642,12 @@ def repair_tails(out, names):
                 saved['ended'].append(name)
         except ValueError:
             text = tail.decode(errors='replace')
-            cut = saved['rows'].setdefault(name, [])
-            if not cut or cut[-1] != text:
-                cut.append(text)
+            cuts = saved['cuts'].setdefault(name, [])
+            if not (cuts and cuts[-1] == [start, text, False]):
+                cuts.append([start, text, False])
             fixes.append((name, start))
     if fixes:
-        tmp = out / 'resume-torn.json.tmp'
-        tmp.write_text(json.dumps(saved))
-        tmp.rename(sidecar)
+        keep()
     for name, start in fixes:
         if start is None:
             with open(out / name, 'ab') as f:
@@ -644,20 +655,26 @@ def repair_tails(out, names):
         else:
             with open(out / name, 'r+b') as f:
                 f.truncate(start)
-    return saved
+            saved['cuts'][name][-1][2] = True
+    if fixes:
+        keep()
+    rows = {name: [text for _, text, _ in cuts] for name, cuts in saved['cuts'].items() if cuts}
+    return dict(mark=saved['mark'], rows=rows, ended=saved['ended'])
 
 
 def has_baseline(path):
-    """Whether these events have a baseline row, read up to the first one. A row that is not JSON (one cut
-    short by a kill) is not one."""
+    """Whether these events have a baseline row, read up to the first one. Rows are split at newlines only,
+    as the resume reads them; a row that is not a JSON object (one cut short by a kill, which the tail
+    repair takes off, or one not UTF-8) is not one."""
     try:
-        with open(path) as f:
+        with open(path, 'rb') as f:
             for line in f:
                 try:
-                    if json.loads(line).get('kind') == 'baseline':
-                        return True
-                except (ValueError, AttributeError):
+                    r = json.loads(line)
+                except ValueError:
                     continue
+                if isinstance(r, dict) and r.get('kind') == 'baseline':
+                    return True
     except OSError:
         pass
     return False

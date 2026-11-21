@@ -1456,22 +1456,57 @@ class SparseTest(CaptureTest):
         _, output, _ = self.run_capture([dict(pc=capture.RETURN)], ['--updates', '2', '--resume'], prepare=torn)
         [logged] = self.events(output, 'resume_torn')
         self.assertEqual((logged['rows'], logged['ended']), ({'events.jsonl': [cut]}, ['watch.jsonl']))
-        # Killed after keeping the cut and before taking it off: the same row is noted once.
-        def kept(output):
+        # Killed after keeping the cut and before taking it off: the same row, where it was, is noted once.
+        def sidecar(output, cuts, mark='m1'):
+            (output / 'resume-torn.json').write_text(json.dumps(dict(mark=mark, cuts=cuts, ended=[])))
+        def kept(output, taken_off=False):
             torn(output)
-            (output / 'resume-torn.json').write_text(json.dumps(dict(mark='m1', rows={'events.jsonl': [cut]}, ended=[])))
+            start = (output / 'events.jsonl').stat().st_size - len(cut)
+            sidecar(output, {'events.jsonl': [[start, cut, taken_off]]})
         _, output, _ = self.run_capture([dict(pc=capture.RETURN)], ['--updates', '2', '--resume'], prepare=kept)
         [logged] = self.events(output, 'resume_torn')
         self.assertEqual((logged['mark'], logged['rows']), ('m1', {'events.jsonl': [cut]}))
+        # Cut short again at the same place after the cut was made: another row, noted too.
+        _, output, _ = self.run_capture([dict(pc=capture.RETURN)], ['--updates', '2', '--resume'],
+                                        prepare=lambda output: kept(output, taken_off=True))
+        [logged] = self.events(output, 'resume_torn')
+        self.assertEqual(logged['rows'], {'events.jsonl': [cut, cut]})
         # Killed after logging it and before taking off resume-torn.json: not logged again.
         def logged_already(output):
             self.resumed_after({})(output)
             with open(output / 'events.jsonl', 'a') as f:
                 f.write(json.dumps(dict(kind='resume_torn', mark='m1', rows={'events.jsonl': [cut]}, ended=[])) + '\n')
-            (output / 'resume-torn.json').write_text(json.dumps(dict(mark='m1', rows={'events.jsonl': [cut]}, ended=[])))
+            sidecar(output, {'events.jsonl': [[9, cut, True]]})
         _, output, _ = self.run_capture([dict(pc=capture.RETURN)], ['--updates', '2', '--resume'], prepare=logged_already)
         self.assertEqual([r['mark'] for r in self.events(output, 'resume_torn')], ['m1'])
         self.assertFalse((output / 'resume-torn.json').exists())
+        # The file an earlier revision left (the cut rows by log, already taken off) is taken up.
+        def earlier(output):
+            self.resumed_after({})(output)
+            (output / 'resume-torn.json').write_text(json.dumps({'events.jsonl': [cut]}))
+        _, output, _ = self.run_capture([dict(pc=capture.RETURN)], ['--updates', '2', '--resume'], prepare=earlier)
+        [logged] = self.events(output, 'resume_torn')
+        self.assertEqual(logged['rows'], {'events.jsonl': [cut]})
+
+    def test_the_baseline_check_reads_rows_as_the_resume_does(self):
+        # Two objects split by a bare CR in a row the kill cut short: the tail repair takes both off, so
+        # neither is a baseline.
+        def split(output):
+            self.resumed_after({})(output)
+            (output / 'events.jsonl').write_text(
+                json.dumps(dict(kind='attach')) + '\n' + json.dumps(dict(kind='note')) + '\r'
+                + json.dumps(dict(kind='baseline', cr3=GAME_CR3)))
+        with self.assertRaises(SystemExit), patch.object(sys, 'stderr', io.StringIO()) as stderr:
+            self.run_capture([dict(pc=capture.RETURN)], ['--updates', '2', '--resume'], prepare=split)
+        self.assertIn('has no baseline event', stderr.getvalue())
+        self.last_remote_class.assert_not_called()
+        # A row cut short that is not UTF-8, after the baseline, is taken off as any other.
+        def binary(output):
+            self.resumed_after({})(output)
+            with open(output / 'events.jsonl', 'ab') as f:
+                f.write(b'{"kind": "\xff')
+        _, output, _ = self.run_capture([dict(pc=capture.RETURN)], ['--updates', '2', '--resume'], prepare=binary)
+        self.assertEqual(self.events(output, 'resume_torn')[0]['rows'], {'events.jsonl': ['{"kind": "\ufffd']})
 
     def test_the_cut_row_is_found_from_the_end(self):
         with tempfile.TemporaryDirectory(prefix='sims-torn-test-') as d:
