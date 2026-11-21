@@ -291,7 +291,15 @@ impl Interpreter<'_> {
         cursor.valid = false;
         cursor.container = None;
         if self.fits(world, cursor.cursor, fine, level)? {
-            if fine != pos && self.user_tiles_unblocked(world, cursor.held, fine)? {
+            // Native `0x485f44` always calls `0x421e72` at `fine` (even when
+            // `fine == pos`): if `fine` is tile-centred, run full placement
+            // retry; otherwise run the base placement test (`0x4355b5`, OBJf 5
+            // overlap callbacks) before unsnapped rejection (`0x4355bc`).
+            if (fine[0] & 0x0f) == 8 && (fine[1] & 0x0f) == 8 {
+                if self.try_place_buy_at(world, cursor, fine, level, None)? {
+                    return Ok(cursor.valid);
+                }
+            } else if self.user_tiles_unblocked(world, cursor.held, fine)? {
                 let _ = self.place_test(world, cursor.held, fine, level)?;
             }
             let cursor_place = Place {
@@ -597,7 +605,7 @@ impl Interpreter<'_> {
     /// function 11 (`USER_PLACEMENT`, `*piVar2 + 0x64`), and re-deducts
     /// `purchase.price`. Updates `purchase.object` to the placed ID and
     /// returns `Ok(true)`, or returns `Ok(false)` if it can no longer be
-    /// placed or afforded.
+    /// placed.
     pub fn buy_redo_purchase(
         &self,
         world: &mut World,

@@ -6039,4 +6039,31 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
     // Returning to Live Mode removes the Buy Mode lot placement grid.
     game.render();
     assert_eq!(&game.canvas().color[..800 * 350], live_top350.as_slice());
+
+    // Mid-drag Undo (`0x4a8545` + `0x485bda`): place a chair at tile-centred
+    // screen point `[577, 432]`, press again on the occupied tile with the
+    // repeat preview, undo the first chair while holding the mouse button,
+    // drag in the same facing quadrant to `[589, 444]`, and release. Native
+    // re-evaluates placement at the saved tile so the second chair commits.
+    game.set_mode(Mode::Buy);
+    game.press([258, 524]);
+    game.release([258, 524]);
+    game.press([437, 523]);
+    game.release([437, 523]);
+    let centred_spot = [577, 432];
+    game.hover(centred_spot);
+    game.press(centred_spot);
+    game.release(centred_spot);
+    let drag_funds_after_first = game.lot().world().budget.funds;
+    let repeat_chair = game.buy_cursor().expect("repeat preview armed").held;
+    game.press(centred_spot);
+    assert!(game.undo_buy());
+    assert_eq!(game.lot().world().budget.funds, drag_funds_after_first + 80);
+    game.hover([589, 444]);
+    let drag_cur = game.buy_cursor().expect("drag preview revalidated").clone();
+    assert!(drag_cur.valid);
+    assert_eq!(drag_cur.held, repeat_chair);
+    game.release([589, 444]);
+    assert!(game.lot().world().objects[&repeat_chair].position[0] >= 0);
+    assert_eq!(game.lot().world().budget.funds, drag_funds_after_first);
 }

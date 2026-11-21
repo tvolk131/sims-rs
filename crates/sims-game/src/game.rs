@@ -1939,11 +1939,18 @@ impl Game {
                     .and_then(|o| o.data.get(1).copied())
                     .unwrap_or(0)
                     .rem_euclid(8);
-                if current != desired {
-                    let target = (desired - cursor.facing_offset).rem_euclid(8);
-                    if let Err(e) = self.lot.buy_rotate(&mut cursor, target) {
-                        self.note = Some(format!("The object was not rotated: {e}"));
-                    }
+                // Native `0x485bda` / `0x485da9` / `0x485e6a`: re-evaluate
+                // placement at the saved tile even when `current == desired`
+                // (so an Undo that freed the tile mid-drag makes placement
+                // valid), subtracting the OBJD `+0x7a` facing offset only when
+                // `current != desired`.
+                let target = if current != desired {
+                    (desired - cursor.facing_offset).rem_euclid(8)
+                } else {
+                    current
+                };
+                if let Err(e) = self.lot.buy_rotate(&mut cursor, target) {
+                    self.note = Some(format!("The object was not rotated: {e}"));
                 }
                 true
             } else {
