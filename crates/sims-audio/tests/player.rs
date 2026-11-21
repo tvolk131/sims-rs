@@ -4891,3 +4891,330 @@ fn note_on_preserves_its_operand_register_and_flags() {
     assert_eq!(*probe.asked.borrow(), [(8, 42)]);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
+
+#[test]
+fn kill_paths_preserve_locals_clear_patch_and_kind_53_persists_patch() {
+    // 1) StopObject on a silent track, immediate `seqgroup_kill` (extvol == 0),
+    //    and StopAll all save the stopped register bank (preserving `v1 = 77`
+    //    and clearing `PATCH = 0` per 0x57dd62 -> 0x57f682).
+    // 2) Kind 53 writes `PATCH` to the stopped track object (0x57e0cc), so it
+    //    remains readable after the short idle sample finishes.
+    let mut writer = loadl(5, 77);
+    writer.extend(loadl(19, 0)); // extvol = 0 for immediate seqgroup_kill
+    writer.extend(loadl(6, 1));
+    writer.extend([SEQGROUP_KILL, 6]); // claim seqgroup 1
+    writer.push(SET_LOOP);
+    writer.extend(loadl(7, 1000));
+    writer.extend([WAIT, 7, LOOP]);
+
+    let mut killer = loadl(6, 1);
+    killer.extend([SEQGROUP_KILL, 6, END]);
+
+    let mut reader = loadl(53, 10);
+    reader.extend([GETSRCDATAFIELD, 6, 1, 5]); // read track 10's v1
+    reader.extend([GETSRCDATAFIELD, 6, 1, 50]); // read track 10's PATCH
+    reader.push(END);
+
+    let (hit, addresses) = assemble(&[&writer, &killer, &reader]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         0x102={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         2=0,two,\"two.xa\"\n\
+         [GlobalHitList]\n\
+         6=2\n\
+         [Track]\n\
+         10=0,victim,1024,2,0,0,0,0x100,1\n\
+         11=0,killer,1024,0,0,0,0,0x101,1\n\
+         12=0,reader,1024,0,0,0,0,0x102,1\n\
+         [EventMapping]\n\
+         e0=1,10\n\
+         e1=1,11\n\
+         e2=1,12\n\
+         seq=53,10,0,6\n",
+        addresses[0], addresses[1], addresses[2]
+    );
+    let make_player = || {
+        let m = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+        Player::new(vec![m], samples(), 1)
+    };
+
+    // Case A: StopObject on silent running track
+    let probe_a = Probe {
+        lot: on_lot(&[(9, 400)]),
+        asked: Default::default(),
+    };
+    let mut pa = make_player();
+    play_on(&mut pa, 9, &probe_a.lot);
+    pa.render(BLOCK, &probe_a);
+    pa.handle(&SoundEvent::StopObject { object: 9 }, &probe_a);
+    pa.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: "e2".into(),
+        },
+        &probe_a,
+    );
+    pa.render(2 * BLOCK, &probe_a);
+    assert_eq!(*probe_a.asked.borrow(), [(9, 77), (9, 0)]);
+    assert!(pa.faults.is_empty(), "{:?}", pa.faults);
+
+    // Case B: immediate `seqgroup_kill` (extvol == 0)
+    let probe_b = Probe {
+        lot: on_lot(&[(9, 400)]),
+        asked: Default::default(),
+    };
+    let mut pb = make_player();
+    play_on(&mut pb, 9, &probe_b.lot);
+    pb.render(BLOCK, &probe_b);
+    pb.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: "e1".into(),
+        },
+        &probe_b,
+    );
+    pb.render(BLOCK, &probe_b);
+    pb.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: "e2".into(),
+        },
+        &probe_b,
+    );
+    pb.render(2 * BLOCK, &probe_b);
+    assert_eq!(*probe_b.asked.borrow(), [(9, 77), (9, 0)]);
+    assert!(pb.faults.is_empty(), "{:?}", pb.faults);
+
+    // Case C: StopAll preserves both running-track and already-saved banks
+    let probe_c = Probe {
+        lot: on_lot(&[(9, 400)]),
+        asked: Default::default(),
+    };
+    let mut pc = make_player();
+    play_on(&mut pc, 9, &probe_c.lot);
+    pc.render(BLOCK, &probe_c);
+    pc.handle(&SoundEvent::StopAll, &probe_c);
+    pc.handle(&SoundEvent::StopAll, &probe_c); // second StopAll keeps saved bank
+    pc.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: "e2".into(),
+        },
+        &probe_c,
+    );
+    pc.render(2 * BLOCK, &probe_c);
+    assert_eq!(*probe_c.asked.borrow(), [(9, 77), (9, 0)]);
+
+    // Case D: kind 53 writes PATCH=2 to the stopped bank and keeps it after playback ends
+    pc.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: "seq".into(),
+        },
+        &probe_c,
+    );
+    pc.render_until_idle(RATE as usize, &probe_c);
+    assert!(pc.is_idle());
+    probe_c.asked.borrow_mut().clear();
+    pc.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: "e2".into(),
+        },
+        &probe_c,
+    );
+    pc.render(2 * BLOCK, &probe_c);
+    assert_eq!(*probe_c.asked.borrow(), [(9, 77), (9, 2)]);
+    assert!(pc.faults.is_empty(), "{:?}", pc.faults);
+}
+
+#[test]
+fn patch_write_stops_idle_kind_53_voice_and_is3d_does_not_refresh_muted_idle_voice() {
+    // 1) Writing `Is3d` (26) to a stopped track with an idle kind-53 voice
+    //    after muting its group must NOT refresh/silence the voice (`0x57df08`
+    //    refreshes on `IsHeadRelative` = 27, not `Is3d` = 26).
+    // 2) Writing `PATCH = 0` (`0x32` -> `0x57f625`) stops the idle voice at once.
+    let mut write_is3d = loadl(53, 10);
+    write_is3d.extend(loadl(26, 0));
+    write_is3d.push(END);
+    let mut clear_patch = loadl(53, 10);
+    clear_patch.extend(loadl(50, 0));
+    clear_patch.push(END);
+    let (hit, addresses) = assemble(&[&[END], &write_is3d, &clear_patch]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         0x102={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         2=0,two,\"two.xa\"\n\
+         [GlobalHitList]\n\
+         6=2\n\
+         [Track]\n\
+         10=0,idle_trk,1024,0,0,1,0,0x100,1\n\
+         11=0,is3d_writer,1024,0,0,0,0,0x101,1\n\
+         12=0,patch_writer,1024,0,0,0,0,0x102,1\n\
+         [EventMapping]\n\
+         e0=1,10\n\
+         e1=1,11\n\
+         e2=1,12\n\
+         seq=53,10,0,6\n",
+        addresses[0], addresses[1], addresses[2]
+    );
+    let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+    let mut player = Player::new(vec![module], long_sample("two.xa"), 1);
+    let lot = on_lot(&[(9, 400)]);
+    player.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: "seq".into(),
+        },
+        &lot,
+    );
+    assert_eq!(player.render(BLOCK, &lot)[0], 10_000);
+    player.set_group_volume(1, 0);
+    // Writing Is3d (26) leaves the idle voice audible.
+    play(&mut player, "e1");
+    assert_eq!(player.render(2 * BLOCK, &lot)[BLOCK], 10_000);
+    // Writing PATCH = 0 tears down the idle voice immediately.
+    play(&mut player, "e2");
+    let after = player.render(BLOCK, &lot);
+    assert!(after.iter().all(|&s| s == 0), "{after:?}");
+    assert!(player.is_idle());
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn camera_places_silent_instance_and_killed_hold_does_not_gate_idle_voice() {
+    // 1) Moving the camera while a track with a recorded instance is silent
+    //    writes placement to its persistent stopped bank (`0x574728`,
+    //    `0x574732`), so a following kind-53 voice starts panned right.
+    // 2) Pausing a running track, killing it with `kill_trk`, and then
+    //    starting a kind-53 voice plays audibly (hold cleared on kill and
+    //    idle voices never gated by `held`).
+    let mut hold_me = loadl(5, 1000);
+    hold_me.extend([WAIT, 5, END]);
+    let mut kill_10 = loadl(5, 10);
+    kill_10.extend([KILL_TRK, 5, END]);
+    let (hit, addresses) = assemble(&[&[END], &hold_me, &kill_10]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         0x102={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         2=0,two,\"two.xa\"\n\
+         [GlobalHitList]\n\
+         6=2\n\
+         [Track]\n\
+         10=0,silent_trk,1024,2,0,0,0,0x100,1\n\
+         11=0,held_trk,1024,0,0,0,0,0x101,1\n\
+         12=0,killer_trk,1024,0,0,0,0,0x102,1\n\
+         [EventMapping]\n\
+         e0=1,10\n\
+         e1=1,11\n\
+         e2=1,12\n\
+         seq10=53,10,0,6\n\
+         seq11=53,11,0,6\n",
+        addresses[0], addresses[1], addresses[2]
+    );
+    let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+    let mut player = Player::new(vec![module], long_sample("two.xa"), 1);
+    let center = on_lot(&[(9, 400)]);
+    let right = on_lot(&[(9, 800)]);
+
+    // Part 1: track 10 records object 9 centered, ends immediately, camera moves right.
+    play_on(&mut player, 9, &center);
+    player.render(BLOCK, &center);
+    assert!(player.is_idle());
+    player.camera_moved(0, u32::MAX, &right);
+    player.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: "seq10".into(),
+        },
+        &right,
+    );
+    let stereo = player.render_stereo(BLOCK, &right);
+    let [left_s, right_s] = [stereo[0], stereo[1]];
+    assert!(
+        right_s > left_s && left_s > 0,
+        "left={left_s} right={right_s}"
+    );
+
+    // Part 2: pause track 11, kill it via `kill_trk`, then play kind 53 on it.
+    let mut kill_11 = loadl(5, 11);
+    kill_11.extend([KILL_TRK, 5, END]);
+    let (hit2, a2) = assemble(&[&hold_me, &kill_11]);
+    let hot2 = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         2=0,two,\"two.xa\"\n\
+         [GlobalHitList]\n\
+         6=2\n\
+         [Track]\n\
+         11=0,held_trk,1024,0,0,0,0,0x100,1\n\
+         12=0,killer_trk,1024,0,0,0,0,0x101,1\n\
+         [EventMapping]\n\
+         e0=1,11\n\
+         e1=1,12\n\
+         seq11=53,11,0,6\n",
+        a2[0], a2[1]
+    );
+    let m2 = Module::parse("test", &hit2, b"v1 5\n", hot2.as_bytes()).unwrap();
+    let mut p2 = Player::new(vec![m2], long_sample("two.xa"), 1);
+    play(&mut p2, "e0");
+    p2.render(BLOCK, &NoSources);
+    p2.handle(&SoundEvent::Pause, &NoSources);
+    play(&mut p2, "e1"); // kill_trk 11 while track 11 is held
+    p2.render(BLOCK, &NoSources);
+    p2.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: "seq11".into(),
+        },
+        &center,
+    );
+    assert_eq!(p2.render(BLOCK, &center)[0], 10_000);
+    assert!(p2.faults.is_empty(), "{:?}", p2.faults);
+}
+
+#[test]
+fn routed_main_duckpri_on_stopped_track_updates_global() {
+    // `0x57e011 -> 0x57d2cb` updates the target track's `main_duckpri`
+    // request even when the target track is stopped.
+    let mut writer = loadl(53, 11);
+    writer.extend(loadl(123, 100));
+    writer.push(END);
+    let reader: &[u8] = &[GETSRCDATAFIELD, 6, 1, 123, END];
+    let probe = Probe {
+        lot: on_lot(&[(8, 400)]),
+        asked: Default::default(),
+    };
+    let mut player = Player::new(vec![module(&[&writer, &[END], reader], 1)], samples(), 1);
+    play_on(&mut player, 8, &probe.lot);
+    player.render(BLOCK, &probe);
+    player.handle(
+        &SoundEvent::Play {
+            object: 8,
+            name: "e2".into(),
+        },
+        &probe,
+    );
+    player.render(BLOCK, &probe);
+    assert_eq!(*probe.asked.borrow(), [(8, 100)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}

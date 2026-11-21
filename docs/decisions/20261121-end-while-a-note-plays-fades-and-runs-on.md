@@ -105,11 +105,17 @@ and caused a replay of the track to start a second overlapping note.
 - **Track-object `target` (`Target::Track` / `Destination`) and persistent
   stopped register banks (`Player::stopped`):** `target` now stores the
   registered track ID (`0x57e023`), routing reads, writes, fades, placements,
-  and `Spl` lookups through the destination track even when it is stopped.
-  Stopped track register banks persist in `Player::stopped` (and refresh any
-  idle kind-53 voice immediately on write, `0x57df13 → 0x57f759`), force
-  `FADE_ON = 0` when not running (`0x57e059`), and retain registers outside
-  `BANKS` across fresh starts (`0x57da3a`..`0x57da87`).
+  `main_duckpri` requests (`0x57e011 → 0x57d2cb`), and `Spl` lookups through
+  the destination track even when it is stopped. Stopped track register banks
+  persist across every kill path (clearing `FADE_ON`, `ISPLAYING`, `TARGET`,
+  and `PATCH` per `0x57dd3e` / `0x57dd62 → 0x57f682`, plus clearing any hold
+  and `main_duckpri` request), persist `PATCH` written by kind 53 (`0x57e0cc`),
+  receive camera placement updates even while silent (`0x574728`, `0x574732`),
+  tear down an active idle kind-53 voice on `PATCH` writes (`0x57f625`),
+  refresh idle voice gains/pitch on the original's register set
+  (`0x57def1..0x57e057`), force `FADE_ON = 0` when not running (`0x57e059`),
+  and retain registers outside `BANKS` across fresh starts
+  (`0x57da3a`..`0x57da87`).
 - **Single voice per thread, `note_on`, and `note_off`:** `note_on` replaces
   any prior note of the same thread (`0x58015a`) without overwriting its
   operand register or comparison flags (`0x57e17f`), and `note_off` stops that

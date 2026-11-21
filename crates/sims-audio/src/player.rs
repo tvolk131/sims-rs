@@ -851,7 +851,7 @@ pub struct Player<S> {
     /// thread that last claimed it with `seqgroup_kill` or
     /// `seqgroup_return`. A slot keeps its ID after that thread ends.
     seqgroups: BTreeMap<i32, u32>,
-    /// `main_duckpri` requests by thread; the global holds the largest.
+    /// `main_duckpri` requests by track (`0x57d2cb`); the global holds the largest.
     duck: BTreeMap<u32, i32>,
     /// Group volumes set by the host (the options' sliders), 1024 when
     /// not set.
@@ -1150,9 +1150,10 @@ impl<S: Samples> Player<S> {
     /// idle tracks first ([`Player::forget_silent`]): a placement changes
     /// no note's life, so a camera move does it once for all its tracks.
     fn place_track(&mut self, track: u32, sources: &dyn Sources) {
-        let Some(spl) = self.track_spl(track) else {
+        if self.owner(track).is_none() {
             return;
-        };
+        }
+        let spl = self.spl(track);
         let last = self.last_start.get(&track).copied();
         let last_running = last.filter(|&id| self.threads.iter().any(|t| t.id == id));
         let Some((vol, pan)) = self.placed_with(track, spl, sources) else {
@@ -1168,7 +1169,8 @@ impl<S: Samples> Player<S> {
         };
         // The last start's thread, running or about to, is written as
         // it would write; with none, the newest running one takes it
-        // itself.
+        // itself; with none running, write to the persistent stopped
+        // track object (0x574728, 0x574732).
         if let Some(id) = last_running {
             self.place_through(id, vol, pan);
         } else if let Some(at) = self.newest(track) {
@@ -1179,7 +1181,7 @@ impl<S: Samples> Player<S> {
                 note.gains = levels.gains;
                 note.step = step(levels.rate);
             }
-        } else if self.idle.contains_key(&track) {
+        } else {
             self.write_stopped(track, EXTVOL, vol);
             self.write_stopped(track, PAN, pan);
         }
@@ -1788,6 +1790,8 @@ impl<S: Samples> Player<S> {
         self.held.remove(&id);
         self.idle.remove(&id);
         self.stopped.remove(&id);
+        self.duck.remove(&id);
+        self.update_main_duckpri();
         self.track_objects.remove(&id);
         self.last_start.remove(&id);
         self.notes.retain(|n| n.patch != id);
@@ -2165,19 +2169,22 @@ impl<S: Samples> Player<S> {
     /// current). (The original also stops its music stations, which this
     /// player does not have.) Sequence groups are cleared too.
     fn kill_all(&mut self) {
-        self.threads.clear();
+        let running = std::mem::take(&mut self.threads);
+        for thread in &running {
+            self.save_stopped(thread);
+        }
         self.notes.clear();
         self.idle.clear();
-        self.stopped.clear();
         self.last_start.clear();
         self.held.clear();
+        self.duck.clear();
         self.seqgroups.clear();
         self.instances.clear();
         let modes: Vec<u32> = self.scores.keys().copied().collect();
         for mode in modes {
             self.with_score(mode, |score, host| score.stop(host));
         }
-        self.forget_ended();
+        self.update_main_duckpri();
     }
 
     /// Kind 23: *(code)* forgets every instance of an object (0: none)
@@ -2252,7 +2259,8 @@ impl<S: Samples> Player<S> {
                     self.write_at(at, FADE_ON, 1);
                 }
             } else {
-                self.threads.remove(at);
+                let removed = self.threads.remove(at);
+                self.save_stopped(&removed);
             }
         }
         self.forget_ended();
@@ -2382,8 +2390,11 @@ impl<S: Samples> Player<S> {
                 if let Some(note) = idle {
                     self.chain(note, track, patch);
                 } else if let Some((place, fresh, group)) = self.template(owner, track) {
-                    let mut registers = self.stopped.get(&track).copied().unwrap_or(fresh);
-                    registers[usize::from(PATCH)] = patch as i32;
+                    // *(code)* 0x57e0cc: kind 53 writes `patch` to the track
+                    // object before starting its voice, so the stopped bank
+                    // keeps `patch` even after the sample finishes.
+                    self.write_stopped(track, PATCH, patch as i32);
+                    let registers = self.stopped.get(&track).copied().unwrap_or(fresh);
                     let thread = Thread {
                         id: 0,
                         module: place.0,
@@ -2742,22 +2753,28 @@ impl<S: Samples> Player<S> {
     }
 
     /// *(code)* Saves a killed/stopped track's register bank into
-    /// `self.stopped` with `FADE_ON`, `ISPLAYING`, and `TARGET` cleared
-    /// (`0x57dd3e`), matching the persistent track object in 1.91.
+    /// `self.stopped` with `FADE_ON`, `ISPLAYING`, `TARGET`, and `PATCH`
+    /// cleared (`0x57dd3e`, `0x57dd62 → 0x57f682`), clears its hold, and
+    /// drops its `main_duckpri` request (`0x57d2cb`), matching the
+    /// persistent track object in 1.91.
     fn save_stopped(&mut self, thread: &Thread) {
         let mut registers = thread.registers;
         registers[usize::from(FADE_ON)] = 0;
         registers[usize::from(ISPLAYING)] = 0;
         registers[usize::from(TARGET)] = 0;
+        registers[usize::from(PATCH)] = 0;
         self.stopped.insert(thread.track, registers);
+        self.held.remove(&thread.track);
+        self.duck.remove(&thread.track);
+        self.update_main_duckpri();
     }
 
     /// *(code)* Writes a local register (`r < GLOBALS`) on a stopped
     /// registered track object (`0x57de98` when `is_running == 0`): forces
     /// `FADE_ON` to 0 (`0x57e059..0x57e064`), persists the register in
-    /// `self.stopped`, and if the track has an active idle kind-53 voice
-    /// in `self.idle`, updates it and refreshes its voice gains/step at
-    /// once (`0x57df13 → 0x57f759`, `0x57f71d`).
+    /// `self.stopped`, tears down any idle kind-53 voice on `PATCH`
+    /// (`0x57dfe8 → 0x57e038 → 0x57f625`), and refreshes idle voice
+    /// gains/step on level/pitch registers (`0x57def1..0x57e057`).
     fn write_stopped(&mut self, track: u32, r: u8, value: i32) {
         if r >= GLOBALS {
             return;
@@ -2770,13 +2787,20 @@ impl<S: Samples> Player<S> {
         if let Some(regs) = self.stopped.get_mut(&track) {
             regs[usize::from(r)] = stored;
         }
+        if r == PATCH {
+            self.notes.retain(|n| !(n.thread == 0 && n.track == track));
+            self.idle.remove(&track);
+            return;
+        }
         if let Some(mut idle) = self.idle.remove(&track) {
             idle.kept = i64::from(value);
             idle.registers[usize::from(r)] = stored;
-            // *(code)* 0x57def1..0x57e057: only level/pan registers call
-            // 0x57f759 and only `pitch` calls 0x57f71d; unrelated writes
-            // (such as `SOURCE` or locals) leave the voice's gain/rate alone.
-            let update_gains = matches!(r, VOL | EXTVOL | PAN | THREE_D | 30..=32 | 56..=57);
+            // *(code)* 0x57def1..0x57e057: only level/pan registers
+            // (`vol`, `extvol`, `pan`, `IsHeadRelative` = 27, 30..=32,
+            // 56..=57) call 0x57f759 and only `pitch` calls 0x57f71d;
+            // unrelated writes (such as `Is3d` = 26, `SOURCE`, or locals)
+            // leave the voice's gain/rate alone.
+            let update_gains = matches!(r, VOL | EXTVOL | PAN | 27 | 30..=32 | 56..=57);
             let update_pitch = r == PITCH;
             if update_gains || update_pitch {
                 let levels = self.levels(&idle);
@@ -2889,9 +2913,11 @@ impl<S: Samples> Player<S> {
         let cache = &self.cache;
         let ambient_cache = &self.ambient_cache;
         let held = &self.held;
-        // A held track's notes keep their place and are not heard.
-        self.notes
-            .retain_mut(|note| held.contains(&note.track) || mix_note(note, cache, &mut sums));
+        // A held track's running-thread notes keep their place and are not
+        // heard; idle kind-53 voices (thread == 0) are never held (0x57dc3d).
+        self.notes.retain_mut(|note| {
+            (note.thread != 0 && held.contains(&note.track)) || mix_note(note, cache, &mut sums)
+        });
         let notes = &self.notes;
         self.idle.retain(|track, _| {
             notes
@@ -2943,12 +2969,10 @@ impl<S: Samples> Player<S> {
         }
     }
 
-    /// Drops the ducking requests of threads that have ended (the
-    /// original drops a track's request when it is killed) and sets
-    /// `main_duckpri` to the largest left, or 0.
+    /// Recomputes `main_duckpri` after tracks end (each killed track's
+    /// request is dropped in [`Player::save_stopped`], matching `0x57d2cb`,
+    /// while routed requests on stopped tracks remain until cleared).
     fn forget_ended(&mut self) {
-        let alive: Vec<u32> = self.threads.iter().map(|t| t.id).collect();
-        self.duck.retain(|id, _| alive.contains(id));
         self.update_main_duckpri();
     }
 
@@ -3298,21 +3322,30 @@ impl<S: Samples> Player<S> {
             Destination::Stopped(stopped_track) => {
                 if r < GLOBALS {
                     self.write_stopped(stopped_track, r, value);
-                } else if r != MAIN_DUCKPRI {
+                } else if r == MAIN_DUCKPRI {
+                    // *(code)* 0x57e011 → 0x57d2cb: updates the track's
+                    // ducking request without checking `is_running`.
+                    if value == 0 {
+                        self.duck.remove(&stopped_track);
+                    } else {
+                        self.duck.insert(stopped_track, value);
+                    }
+                    self.update_main_duckpri();
+                } else {
                     self.globals[usize::from(r - GLOBALS)] = value;
                 }
                 return;
             }
         };
         written.kept = i64::from(value);
-        let id = written.id;
+        let duck_track = written.track;
         if r < GLOBALS {
             written.registers[usize::from(r)] = value;
         } else if r == MAIN_DUCKPRI {
             if value == 0 {
-                self.duck.remove(&id);
+                self.duck.remove(&duck_track);
             } else {
-                self.duck.insert(id, value);
+                self.duck.insert(duck_track, value);
             }
             self.update_main_duckpri();
         } else {
@@ -3624,7 +3657,8 @@ impl<S: Samples> Player<S> {
                     let other = &mut self.threads[at];
                     let reg = |r: u8| usize::from(r);
                     if other.registers[reg(EXTVOL)] == 0 {
-                        self.threads.remove(at);
+                        let removed = self.threads.remove(at);
+                        self.save_stopped(&removed);
                         self.notes.retain(|n| n.thread != other_id);
                         self.forget_ended();
                     } else {
