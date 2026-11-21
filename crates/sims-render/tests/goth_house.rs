@@ -186,3 +186,49 @@ fn floor_shadows_fit_the_floor_tile_and_every_code_has_a_mask() {
         }
     }
 }
+
+#[test]
+fn off_lot_void_colour_follows_time_of_day_and_house_99() {
+    let Some(root) = install() else {
+        return;
+    };
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut opened = open_house(&root, &house).unwrap();
+    // Camera at the night ratchet's scroll: (10, 10) and (790, 10) are off the lot.
+    let camera = Camera {
+        zoom: Zoom::Far,
+        rotation: 0,
+        level: 1,
+        origin: [527, -16],
+        walls: Walls::Cutaway,
+        focus: Focus::default(),
+    };
+    let cases = [
+        (0, 5, [115, 113, 115]),
+        (1, 5, [66, 65, 66]),
+        (2, 5, [24, 24, 24]),
+        (3, 5, [66, 65, 66]),
+        (4, 5, [0, 0, 255]),
+        (2, 99, [16, 20, 140]),
+    ];
+    for (time_of_day, house_no, want) in cases {
+        let mut world = opened.world.clone();
+        if world.globals.len() <= 10 {
+            world.globals.resize(11, 0);
+        }
+        world.globals[4] = time_of_day;
+        world.globals[10] = house_no;
+        let lot = Lot::from_world(&world).unwrap();
+        assert_eq!((lot.time_of_day, lot.house), (time_of_day, house_no));
+        let mut canvas = Canvas::new(800, 600, [0, 0, 0]);
+        draw(&world, &lot, &mut opened.assets, &camera, &mut canvas);
+        let pixels = canvas.rgb565();
+        for [x, y] in [[10usize, 10], [790, 10]] {
+            assert_eq!(
+                pixels[y * 800 + x],
+                want,
+                "time_of_day={time_of_day} house={house_no} at ({x}, {y})"
+            );
+        }
+    }
+}

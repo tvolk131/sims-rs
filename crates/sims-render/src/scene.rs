@@ -27,9 +27,32 @@ const GRASS_COLUMN: i32 = 1;
 /// the decisions log, 2026-11-14).
 const OBJECT_COLUMN: i32 = 1;
 
-/// What the window shows outside the lot: the original's grey (5-6-5
-/// red 14, green 28, blue 14), widened to 8 bits a channel.
+/// What the window shows outside the lot by day: the original's grey
+/// (`0x737373`, 5-6-5 red 14, green 28, blue 14), widened to 8 bits a
+/// channel. See [`background`] for other times of day and house 99.
 pub const BACKGROUND: [u8; 3] = [115, 113, 115];
+
+/// What the window shows outside the lot (0x4aa9bd, filled by 0x4aaa26):
+/// chosen from the house number (global 10) and the time of day (global 4),
+/// then packed into the original's 16-bit display mode (0x49f0ae) and
+/// widened back to 8 bits a channel.
+///
+/// House 99 (the cloud lot) takes `0x14148c` at every time of day. Any
+/// other house takes `0x737373` by day (0), `0x404040` at dusk or dawn
+/// (1 or 3), `0x1a1a1a` at night (2) and `0x0000ff` for any other value.
+pub fn background(time_of_day: i16, house: i16) -> [u8; 3] {
+    let rgb = if house == 99 {
+        [0x14, 0x14, 0x8c]
+    } else {
+        match time_of_day {
+            0 => [0x73, 0x73, 0x73],
+            1 | 3 => [0x40, 0x40, 0x40],
+            2 => [0x1a, 0x1a, 0x1a],
+            _ => [0x00, 0x00, 0xff],
+        }
+    };
+    crate::canvas::quantize565(rgb)
+}
 
 /// Counts of what one frame drew, for tests and the viewer's status line.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -110,7 +133,7 @@ fn paint(
     canvas: &mut Canvas,
     pass: Pass,
 ) -> Stats {
-    canvas.clear(BACKGROUND);
+    canvas.clear(background(lot.time_of_day, lot.house));
     let mut painter = Painter::new(world, lot, assets, camera, canvas, pass);
     let top = camera.level.clamp(1, 2);
     for level in 1..=top {
@@ -2341,6 +2364,22 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn background_follows_time_of_day_and_house_99() {
+        assert_eq!(background(0, 5), BACKGROUND);
+        assert_eq!(background(0, 5), [115, 113, 115]);
+        assert_eq!(background(1, 5), [66, 65, 66]);
+        assert_eq!(background(2, 5), [24, 24, 24]);
+        assert_eq!(background(3, 5), [66, 65, 66]);
+        // Any time of day outside 0..=3 keeps the fallback 0x0000ff.
+        assert_eq!(background(-1, 5), [0, 0, 255]);
+        assert_eq!(background(4, 5), [0, 0, 255]);
+        // House 99 overrides every time of day with 0x14148c (5-6-5: 2, 5, 17).
+        for time_of_day in [-1, 0, 1, 2, 3, 4] {
+            assert_eq!(background(time_of_day, 99), [16, 20, 140], "{time_of_day}");
         }
     }
 }
