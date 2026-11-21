@@ -193,9 +193,15 @@ What is not ported:
     replaced by the default its caller gives (0x4369de, 0x436a21 to
     0x436a35): a button's label from STR# 142 of `GameData/UIText.iff`
     (0x435fee, 0x43600a), or else "Missing string!!!" (0x6c29bc). The
-    install's labels (OK, Cancel, Yes, No) hold no `$`, so the port leaves
-    such strings out (Sol's ninth check). Test:
-    `the_default_button_labels_hold_no_token` (`tests/boot.rs`).
+    port leaves such strings out only when the boot finds every string
+    table of ID 142 in that file (STR# and CST, deleted chunks included)
+    free of any `$` byte, with no `UIText.fam` beside it
+    (`Program::labels_hold_no_token`, Sol's eleventh check); otherwise a
+    dialog with a default string fails loudly. The install's labels (OK,
+    Cancel, Yes, No) hold no `$`. Tests:
+    `the_default_button_labels_hold_no_token` (`tests/boot.rs`),
+    `a_default_string_fails_loudly_unless_the_labels_hold_no_token`,
+    `the_default_labels_hold_no_token_only_when_no_string_table_of_them_holds_a_dollar`.
   - The table is read in the application's language (the table's
     language byte is interface +0x64 less one, 0x4702b1 to 0x4702bb;
     0x4704fa reads that language's strings and falls back on no other).
@@ -212,8 +218,18 @@ What is not ported:
     (0x470482). So a later run goes in front of the earlier ones. An
     entry with language 0 counts as the wanted language (0x46fffc). The
     Goth day's dialog tables are multilingual: the first version of this
-    check failed loudly on them at tick 1. `Library::loaded_strings` keeps
-    that order for multilingual tables, and only the dialog reads it.
+    check failed loudly on them at tick 1. The loader reads the resource
+    of the ID (deleted chunks skipped, 0x41c542), not the last chunk of
+    it, and copies each entry's bytes as they are (0x470404 to 0x470434),
+    so an entry starting `ff fe` is not a byte order mark (Sol's eleventh
+    check). `Library::loaded_strings` keeps the loader's view where it
+    differs from `Library::strings`'s (None for a file whose chunks of
+    the ID are all deleted), and only the dialog reads it. A table whose
+    entries have a language and none in US English is read again for
+    English (0x47006b to 0x4700d0), stepping through it one byte at a
+    time in a way that may read a string's bytes as entries: that is not
+    ported, and fails loudly when the dialog names a string
+    (`Library::english_fallback`).
     Whether the other readers of `Library::strings` (animations, action
     strings, suits) load through the same loader is **unverified**. In
     the recorded install it makes no difference: a scan of its 2,407
@@ -223,9 +239,11 @@ What is not ported:
   - A file with no STR# 301 but a legacy CST 301, which the loader reads
     instead (0x4702c7, 0x47018e to 0x4701e6), is not ported, and fails
     loudly when the dialog names a string. The loader compares the tag
-    with 0x435354; the port takes both `\0CST` and `CST\0` as it, and
-    which one the file holds is **unverified** (the install has neither).
-    Test: `a_dialogs_strings_are_read_in_the_order_the_loader_gives`.
+    with 0x435354, and the header reader reads the type's bytes
+    big-endian (0x41a5af, 0x472fbf), so the tag on disk is `\0CST` (Sol's
+    eleventh check; the install has none). Tests:
+    `a_dialogs_strings_are_read_in_the_order_the_loader_gives`,
+    `a_string_table_is_read_as_the_loader_finds_it` (`tests/program.rs`).
 
   The strings share one place for a type, cleared first (0x43620d), which
   only mode 0 reads. Only two tokens write that place:
@@ -374,18 +392,27 @@ What is not ported:
      (0x44ca9f to 0x44cad3), so a text that holds a career token past its
      first character, or ends in the start of one, may never end (Sol's
      tenth check: STR# 4 entry 15 of `work.iff`, loaded by 0x404328, set
-     to `x$JobDesc:0`). `Program::career_texts_end` is whether no string
-     of `work.iff` does: every STR# entry in every language, and every
-     career's name and level strings. The install's level strings hold a
-     `$` (in suit names such as `B004MA$b_01`) but no career token. When
-     it is false (no `work.iff`, a `Careers.txt`, or a string that does)
-     a person's career token fails loudly. That the career texts all come
-     from `work.iff` is **unverified**. On the Goth day the promotion at
-     15298 ("You have been promoted! (to $Job:4:5)", `$JobDesc:4:5`,
-     `$TimeLocal:2`) is a person's. Tests:
+     to `x$JobDesc:0`). `Program::career_texts_end` is whether no text
+     the passes may write does. The careers' strings come from the `Work`
+     resource set (0x403dd9): `work.iff`, and a `work.fam` beside it would
+     be searched too (0x46f539, 0x46b627, 0x406a29), which is not ported.
+     Every string table of `work.iff` (STR#, and CST, which the loader
+     falls back to), deleted chunks included, must hold no `$` byte at
+     all, since the English fallback may read a string's bytes as entries
+     (Sol's eleventh check), and every career's name and level strings no
+     career token. The install's STR# tables hold no `$`; its level
+     strings hold one (in suit names such as `B004MA$b_01`) but no career
+     token. When it is false (no `work.iff`, a `work.fam`, a
+     `Careers.txt`, a career that does not parse, or a string that holds
+     one) a person's career token fails loudly. That the career texts all
+     come from the `Work` set is **unverified**. On the Goth day the
+     promotion at 15298 ("You have been promoted! (to $Job:4:5)",
+     `$JobDesc:4:5`, `$TimeLocal:2`) is a person's. Tests:
      `the_installs_career_texts_hold_no_career_token` (`tests/boot.rs`),
      `a_career_token_past_the_first_character_or_the_start_of_one_at_the_end`
-     (`dialog.rs`).
+     (`dialog.rs`),
+     `career_texts_end_only_when_work_holds_no_career_token`
+     (`tests/program.rs`).
 
   The passes after `$Neighbor`'s are taken to change nothing but the
   text (**unverified**).

@@ -467,9 +467,10 @@ impl Machine<'_, '_> {
     /// left out: 0x4369de puts in its place the default the caller gives
     /// (0x436a21 to 0x436a35), a button's label from STR# 142 of
     /// `GameData/UIText.iff` (0x435fee, 0x43600a), or else "Missing
-    /// string!!!" (0x6c29bc). None of them holds a `$`, so the formatter
-    /// leaves them as they are (the install's labels are checked by
-    /// `tests/boot.rs`).
+    /// string!!!" (0x6c29bc). The formatter reads them too, so they are
+    /// left out only when the labels are known to hold no `$`
+    /// ([`crate::Program::labels_hold_no_token`]); otherwise a dialog with
+    /// one fails loudly.
     ///
     /// The table is read in the application's language: the table's
     /// language byte is the interface's +0x64 less one (0x4702b1 to
@@ -481,21 +482,22 @@ impl Machine<'_, '_> {
     /// **unverified**). An install in another language is not supported:
     /// its strings may hold other tokens.
     ///
-    /// A table with entries in more than one language is read in the
-    /// order the original's loader gives its entries
-    /// ([`crate::program::loaded_order`]). A file with no STR# 301 but a
-    /// legacy CST 301, which the loader reads instead (0x4702c7;
-    /// [`crate::program::Library::legacy_strings`]), is not ported, and
-    /// fails loudly when the dialog names a string.
+    /// The table is the one the original's loader finds
+    /// ([`crate::program::Library::loaded_strings`]): the resource of the
+    /// ID, its entries in the loader's order. Two of the loader's ways are
+    /// not ported, and fail loudly when the dialog names a string: a
+    /// table whose entries have a language and none is US English, which
+    /// it reads again for English (0x47006b to 0x4700d0;
+    /// [`crate::program::Library::english_fallback`]), and a file with no
+    /// STR# 301 but a legacy CST 301, which it reads instead (0x4702c7;
+    /// [`crate::program::Library::legacy_strings`]).
     pub(crate) fn dialog_strings(&self, operands: &[u8; 8]) -> Result<Vec<String>, Trap> {
         const TABLE: u16 = 301;
         let owner = self.owner(self.frame()?)?;
         let library = self.program.libraries.get(&owner);
-        let strings = library.and_then(|library| {
-            library
-                .loaded_strings
-                .get(&TABLE)
-                .or_else(|| library.strings.get(&TABLE))
+        let strings = library.and_then(|library| match library.loaded_strings.get(&TABLE) {
+            Some(loaded) => loaded.as_ref(),
+            None => library.strings.get(&TABLE),
         });
         // Mode 4 formats operand 1's string too, after the others
         // (0x436297 to 0x4362c0, through 0x4369de as they are).
@@ -515,25 +517,44 @@ impl Machine<'_, '_> {
             .chain(&[6, 2])
             .chain(mode_4)
             .any(|&operand| operands[operand] != 0);
-        if named
-            && strings.is_none()
-            && library.is_some_and(|library| library.legacy_strings.contains(&TABLE))
-        {
-            return Err(Trap::Unsupported(
-                "a dialog's file has no STR# 301 but a legacy CST 301, which the original's \
-                 loader reads instead (0x4702c7, 0x47018e to 0x4701e6): not ported"
-                    .into(),
-            ));
+        if named && let Some(library) = library {
+            if library.english_fallback.contains(&TABLE) {
+                return Err(Trap::Unsupported(
+                    "a dialog's STR# 301 has entries with a language and none in US English, \
+                     which the original's loader reads again for English (0x47006b to \
+                     0x4700d0): not ported"
+                        .into(),
+                ));
+            }
+            if strings.is_none() && library.legacy_strings.contains(&TABLE) {
+                return Err(Trap::Unsupported(
+                    "a dialog's file has no STR# 301 but a legacy CST 301, which the \
+                     original's loader reads instead (0x4702c7, 0x47018e to 0x4701e6): not \
+                     ported"
+                        .into(),
+                ));
+            }
         }
-        Ok(buttons
-            .iter()
-            .chain(&[6, 2])
-            .chain(mode_4)
-            .filter_map(|&operand| {
-                let index = usize::from(operands[operand]).checked_sub(1)?;
-                strings?.get(index).filter(|text| !text.is_empty()).cloned()
-            })
-            .collect())
+        let mut texts = Vec::new();
+        for &operand in buttons.iter().chain(&[6, 2]).chain(mode_4) {
+            let text = usize::from(operands[operand])
+                .checked_sub(1)
+                .and_then(|index| strings?.get(index))
+                .filter(|text| !text.is_empty());
+            match text {
+                Some(text) => texts.push(text.clone()),
+                None if !self.program.labels_hold_no_token => {
+                    return Err(Trap::Unsupported(
+                        "a dialog's string is its default (0x4369de, 0x436a21 to 0x436a35), \
+                         a button's label from STR# 142 of `GameData/UIText.iff` (0x435fee, \
+                         0x43600a), and the labels are not known to hold no token: not ported"
+                            .into(),
+                    ));
+                }
+                None => {}
+            }
+        }
+        Ok(texts)
     }
 
     /// The type a dialog of icon mode 0 shows (None for the other modes):
@@ -565,13 +586,13 @@ impl Machine<'_, '_> {
     /// 9. `$TimeLocal` (0x6e5020, 0x44c8c4): an hour local in [0, 24)
     ///    written in one of fixed formats (0x4a6ab1), which hold no token;
     /// 10. the career's: `$JobOffer`, `$JobDesc` and `$Job` ([`CAREER`];
-    ///    0x44c966). Each token found casts the running object to a person
-    ///    (0x44c9bc) and reads it (0x44ca27, also with the numbers not
-    ///    locals), which faults for an object that is not one: that fails
-    ///    loudly. For a person they write career texts, which end the
-    ///    passes only when they hold no career token past their first
-    ///    character: that fails loudly unless
-    ///    [`crate::Program::career_texts_end`].
+    ///     0x44c966). Each token found casts the running object to a
+    ///     person (0x44c9bc) and reads it (0x44ca27, also with the numbers
+    ///     not locals), which faults for an object that is not one: that
+    ///     fails loudly. For a person they write career texts, which end
+    ///     the passes only when they hold no career token past their first
+    ///     character: that fails loudly unless
+    ///     [`crate::Program::career_texts_end`].
     ///
     /// The passes after `$Neighbor`'s write text and read the running
     /// object, the locals and the career tables, and are taken to change

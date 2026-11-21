@@ -1566,8 +1566,10 @@ fn the_default_button_labels_hold_no_token() {
     // `GameData/UIText.iff` (0x435fee, 0x43600a, 0x436a21), and the
     // formatter (0x44bf1a) reads it as it reads the others. The port
     // leaves those strings out of the formatter's work
-    // (`Machine::dialog_strings`): the install's labels, in US English
-    // (language 1), hold no `$`, so no token.
+    // (`Machine::dialog_strings`) only when the boot finds no table of
+    // them holding a `$` (`Program::labels_hold_no_token`), and fails
+    // loudly otherwise. The install's labels, in US English (language 1),
+    // hold no `$`, so no token.
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
         return;
@@ -1583,6 +1585,11 @@ fn the_default_button_labels_hold_no_token() {
     for label in labels {
         assert!(!label.contains('$'), "{label:?}");
     }
+    // And the boot finds so.
+    let root = PathBuf::from(std::env::var_os("SIMS_INSTALL").unwrap());
+    let house = root.join("UserData/Houses/House05.iff");
+    let lot = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
+    assert!(lot.program().labels_hold_no_token);
 }
 
 #[test]

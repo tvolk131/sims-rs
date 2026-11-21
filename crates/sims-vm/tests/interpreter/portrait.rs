@@ -1258,7 +1258,7 @@ fn a_dialogs_strings_are_read_in_the_order_the_loader_gives() {
     let library = fx.program.libraries.get_mut(&LAMP_FILE).unwrap();
     let mut loaded = library.strings[&301].clone();
     loaded.swap(0, 1);
-    library.loaded_strings.insert(301, loaded);
+    library.loaded_strings.insert(301, Some(loaded));
     assert_eq!(fx.run_with(LAMP, 4096, SIM as i16, &[], 1000), Ok(true));
     assert_eq!(fx.world.portraits, [WIDGET].into());
     // A file with no STR# 301 but a legacy CST 301, which the loader reads
@@ -1277,6 +1277,70 @@ fn a_dialogs_strings_are_read_in_the_order_the_loader_gives() {
     library.strings.remove(&301);
     library.legacy_strings.insert(301);
     assert_eq!(fx.run_with(LAMP, 4096, SIM as i16, &[], 1000), Ok(true));
+    // So does one whose table is only deleted chunks: the loader finds no
+    // STR# 301 (0x41c542), whatever the chunks hold.
+    let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
+    let library = fx.program.libraries.get_mut(&LAMP_FILE).unwrap();
+    library.loaded_strings.insert(301, None);
+    library.legacy_strings.insert(301);
+    let fault = fx
+        .run_with(LAMP, 4096, SIM as i16, &[], 1000)
+        .unwrap_err()
+        .to_string();
+    assert!(fault.contains("0x4702c7"), "{fault}");
+    // With no table at all, every string is its default: here no
+    // portrait is found in the text.
+    let mut fx = text_dialog((0, 0, 2), Some(vec![(1, "Grim")]));
+    fx.program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .loaded_strings
+        .insert(301, None);
+    assert_eq!(fx.run_with(LAMP, 4096, SIM as i16, &[], 1000), Ok(true));
+    assert_eq!(fx.world.portraits, [SIM_GUID].into());
+    // A table whose entries have a language and none in US English is read
+    // again for English in a way not ported (0x47006b to 0x4700d0).
+    let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
+    fx.program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .english_fallback
+        .insert(301);
+    let fault = fx
+        .run_with(LAMP, 4096, SIM as i16, &[], 1000)
+        .unwrap_err()
+        .to_string();
+    assert!(fault.contains("0x47006b"), "{fault}");
+}
+
+#[test]
+fn a_default_string_fails_loudly_unless_the_labels_hold_no_token() {
+    // A string not named (here the button's label, operand 3 = 0) is its
+    // default, a label from STR# 142 of `GameData/UIText.iff` (0x435fee,
+    // 0x43600a, 0x436a21), which the formatter reads too.
+    let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
+    fx.program.labels_hold_no_token = false;
+    let fault = fx
+        .run_with(LAMP, 4096, SIM as i16, &[], 1000)
+        .unwrap_err()
+        .to_string();
+    assert!(fault.contains("0x435fee"), "{fault}");
+    // With every string named, no default is read.
+    let mut fx = text_dialog((1, 1, 1), Some(vec![(1, "Grim")]));
+    fx.program.labels_hold_no_token = false;
+    assert_eq!(fx.run_with(LAMP, 4096, SIM as i16, &[], 1000), Ok(true));
+    // An empty string is its default too (0x4369de).
+    let mut fx = text_dialog((1, 1, 1), Some(vec![(1, "Grim")]));
+    fx.program.labels_hold_no_token = false;
+    let library = fx.program.libraries.get_mut(&LAMP_FILE).unwrap();
+    library.strings.get_mut(&301).unwrap()[0].clear();
+    let fault = fx
+        .run_with(LAMP, 4096, SIM as i16, &[], 1000)
+        .unwrap_err()
+        .to_string();
+    assert!(fault.contains("0x435fee"), "{fault}");
 }
 
 #[test]

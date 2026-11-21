@@ -533,3 +533,184 @@ fn an_install_without_the_headline_sprites_reads_none() {
     let frames = sims_vm::icon_frames(&install).unwrap().unwrap();
     assert_eq!(frames[&616], 9);
 }
+
+/// An IFF of chunks with flags (2 bytes after the ID).
+fn iff_with_flags(chunks: &[(&[u8; 4], u16, u16, Vec<u8>)]) -> Vec<u8> {
+    let mut bytes = vec![0; 64];
+    bytes[..13].copy_from_slice(b"IFF FILE 2.5:");
+    for (tag, id, flags, data) in chunks {
+        bytes.extend(*tag);
+        bytes.extend((76 + data.len() as u32).to_be_bytes());
+        bytes.extend(id.to_be_bytes());
+        bytes.extend(flags.to_be_bytes());
+        bytes.extend([0; 64]);
+        bytes.extend(data);
+    }
+    bytes
+}
+
+/// A string table of NUL-terminated strings (version -1).
+fn terminated(texts: &[&str]) -> Vec<u8> {
+    let mut bytes = (-1i16).to_le_bytes().to_vec();
+    bytes.extend((texts.len() as u16).to_le_bytes());
+    for text in texts {
+        bytes.extend(text.as_bytes());
+        bytes.push(0);
+    }
+    bytes
+}
+
+/// A string table of entries with a language (version -3).
+fn localized(entries: &[(u8, &str)]) -> Vec<u8> {
+    let mut bytes = (-3i16).to_le_bytes().to_vec();
+    bytes.extend((entries.len() as u16).to_le_bytes());
+    for (language, text) in entries {
+        bytes.push(*language);
+        bytes.extend(text.as_bytes());
+        bytes.extend([0, 0]);
+    }
+    bytes
+}
+
+#[test]
+fn a_string_table_is_read_as_the_loader_finds_it() {
+    let dir = Dir::new("loaded-strings");
+    let (_, _) = setup(&dir);
+    const DELETED: u16 = sims_formats::iff::DELETED;
+    dir.file(
+        "GameData/Objects/Lamp.iff",
+        &iff_with_flags(&[
+            (b"OBJD", 128, 0, objd(0x1111, 4096, 4097)),
+            (b"GLOB", 128, 0, b"\x0bLampGlobals".to_vec()),
+            (b"BHAV", 4096, 0, bhav(2, &[8192, 9000, 257])),
+            (b"BHAV", 4097, 0, bhav(3, &[])),
+            (b"BCON", 4096, 0, bcon(&[99])),
+            // A live table, then a deleted one of the ID (0x41c542).
+            (b"STR#", 301, 0, terminated(&["$Job"])),
+            (b"STR#", 301, DELETED, localized(&[(1, "Plain"), (2, "x")])),
+            // Only a deleted table.
+            (b"STR#", 302, DELETED, terminated(&["Gone"])),
+            // Two runs of US English: the later goes in front (0x470482).
+            (
+                b"STR#",
+                303,
+                0,
+                localized(&[(1, "a"), (2, "x"), (1, "b"), (0, "c")]),
+            ),
+            // Entries with a language, none in US English (0x47006b).
+            (b"STR#", 304, 0, localized(&[(3, "\x01$Job"), (3, "x")])),
+            // One run: as the file has it.
+            (b"STR#", 305, 0, localized(&[(2, "x"), (1, "a"), (1, "b")])),
+            // A legacy table, live and deleted.
+            (b"\0CST", 306, 0, b"^a^".to_vec()),
+            (b"\0CST", 307, DELETED, b"^a^".to_vec()),
+            (b"CST\0", 308, 0, b"^a^".to_vec()),
+        ]),
+    );
+    let index = Index::build(&Install::detect(&dir.0).unwrap()).unwrap();
+    let catalog = Catalog::build(&index).unwrap();
+    let program = Program::link(&index, &catalog, [0x1111]).unwrap();
+    let lamp = &program.libraries[&catalog.object(0x1111).unwrap().resource];
+    let strings = |texts: &[&str]| Some(texts.iter().map(|t| t.to_string()).collect());
+    assert_eq!(lamp.strings[&301], ["Plain"]);
+    assert_eq!(lamp.loaded_strings[&301], strings(&["$Job"]));
+    assert_eq!(lamp.loaded_strings[&302], None);
+    assert_eq!(lamp.loaded_strings[&303], strings(&["b", "c", "a"]));
+    assert_eq!(lamp.loaded_strings.get(&305), None);
+    assert_eq!(lamp.strings[&305], ["a", "b"]);
+    assert_eq!(
+        lamp.english_fallback,
+        std::collections::BTreeSet::from([304])
+    );
+    assert_eq!(lamp.legacy_strings, std::collections::BTreeSet::from([306]));
+}
+
+#[test]
+fn career_texts_end_only_when_work_holds_no_career_token() {
+    let dir = Dir::new("career-texts");
+    let (index, catalog) = setup(&dir);
+    let link = |dir: &Dir| {
+        let index = Index::build(&Install::detect(&dir.0).unwrap()).unwrap();
+        let catalog = Catalog::build(&index).unwrap();
+        Program::link(&index, &catalog, [])
+            .unwrap()
+            .career_texts_end
+    };
+    // No work.iff.
+    assert!(
+        !Program::link(&index, &catalog, [])
+            .unwrap()
+            .career_texts_end
+    );
+    // A career's strings may hold `$`, but no career token; the string
+    // tables no `$` at all, deleted ones included.
+    let work = |table: Vec<u8>, flags: u16| {
+        iff_with_flags(&[(b"CARR", 1, 0, carr(2)), (b"STR#", 4, flags, table)])
+    };
+    dir.file(
+        "GameData/Objects/work.iff",
+        &work(terminated(&["Clerk"]), 0),
+    );
+    assert!(link(&dir));
+    for (table, flags) in [
+        (terminated(&["x$JobDesc:0"]), 0),
+        (terminated(&["a $ sign"]), 0),
+        (terminated(&["x$JobDesc:0"]), sims_formats::iff::DELETED),
+        (localized(&[(3, "\x01$Job")]), 0),
+    ] {
+        dir.file("GameData/Objects/work.iff", &work(table, flags));
+        assert!(!link(&dir));
+    }
+    // A legacy table that holds a `$`.
+    dir.file(
+        "GameData/Objects/work.iff",
+        &iff_with_flags(&[
+            (b"CARR", 1, 0, carr(2)),
+            (b"\0CST", 4, 0, b"^$Job^".to_vec()),
+        ]),
+    );
+    assert!(!link(&dir));
+    // A `work.fam` beside it, whose resources are searched too (0x46f539).
+    dir.file(
+        "GameData/Objects/work.iff",
+        &work(terminated(&["Clerk"]), 0),
+    );
+    dir.file("GameData/Objects/work.fam", b"");
+    assert!(!link(&dir));
+}
+
+#[test]
+fn the_default_labels_hold_no_token_only_when_no_string_table_of_them_holds_a_dollar() {
+    let dir = Dir::new("labels");
+    let (_, _) = setup(&dir);
+    let install = Install::detect(&dir.0).unwrap();
+    assert!(!sims_vm::labels_hold_no_token(&install).unwrap());
+    let labels = |table: Vec<u8>, flags: u16| iff_with_flags(&[(b"STR#", 142, flags, table)]);
+    dir.file(
+        sims_vm::LABEL_FILE,
+        &labels(terminated(&["OK", "Cancel"]), 0),
+    );
+    assert!(sims_vm::labels_hold_no_token(&install).unwrap());
+    for (table, flags) in [
+        (terminated(&["OK", "$Job"]), 0),
+        (terminated(&["$Job"]), sims_formats::iff::DELETED),
+    ] {
+        dir.file(sims_vm::LABEL_FILE, &labels(table, flags));
+        assert!(!sims_vm::labels_hold_no_token(&install).unwrap());
+    }
+    // A legacy CST table of the ID, which the loader falls back to
+    // (0x4702c7), counts too; one of another ID does not.
+    for (id, holds) in [(142, false), (143, true)] {
+        dir.file(
+            sims_vm::LABEL_FILE,
+            &iff_with_flags(&[
+                (b"STR#", 142, 0, terminated(&["OK"])),
+                (b"\0CST", id, 0, b"$Job".to_vec()),
+            ]),
+        );
+        assert_eq!(sims_vm::labels_hold_no_token(&install).unwrap(), holds);
+    }
+    dir.file(sims_vm::LABEL_FILE, &labels(terminated(&["OK"]), 0));
+    dir.file("GameData/UIText.fam", b"");
+    assert!(!sims_vm::labels_hold_no_token(&install).unwrap());
+}

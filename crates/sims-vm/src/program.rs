@@ -54,18 +54,27 @@ pub struct Library {
     /// language. A definition's word 41 names its table, whose name the
     /// dialog formatter writes for `$Object` (0x44c1ca, 0x457d3b).
     pub catalog_strings: BTreeMap<u16, Vec<(u8, String)>>,
-    /// Each string table (STR#) with an entry in a language other than
-    /// the first, by chunk ID: its first-language entries in the order the
-    /// original's loader gives them ([`loaded_order`]), which differs from
-    /// [`Library::strings`]'s when they are in more than one run. Only the
+    /// The string tables (STR#) as the original's loader finds them
+    /// (0x46feac), by ID, where that differs from [`Library::strings`]
+    /// (the chunks in file order, the last of an ID kept, each table's
+    /// first-language entries in file order): the resource of the ID
+    /// ([`Iff::get`]: deleted chunks skipped, 0x41c542), with its
+    /// first-language entries in the loader's order ([`loaded_order`]), or
+    /// None when the file has chunks of the ID but no resource. Only the
     /// dialog's strings read it; whether the other readers of
     /// [`Library::strings`] load through the same loader is **unverified**.
-    pub loaded_strings: BTreeMap<u16, Vec<String>>,
-    /// The IDs of the file's legacy string tables (CST), which are not
-    /// read: the original's string loader falls back to one when the file
-    /// has no STR# of the ID (0x4702c7, 0x47018e to 0x4701e6). The tag is
-    /// read as the four bytes `\0CST` or `CST\0` (the loader compares
-    /// 0x435354; which byte order it stands for is **unverified**).
+    pub loaded_strings: BTreeMap<u16, Option<Vec<String>>>,
+    /// The IDs of the string tables (STR#) whose resource has entries with
+    /// a language and none in the first. The loader then reads the table
+    /// again for English (0x47006b to 0x4700d0), stepping through it in a
+    /// way that may read a string's bytes as entries; that is not ported.
+    pub english_fallback: BTreeSet<u16>,
+    /// The IDs of the file's legacy string tables (CST resources), which
+    /// are not read: the original's string loader falls back to one when
+    /// the file has no STR# of the ID (0x4702c7, 0x47018e to 0x4701e6).
+    /// The loader compares the type with 0x435354, and the header reader
+    /// reads the type's bytes big-endian (0x41a5af, 0x472fbf), so the tag
+    /// is `\0CST`.
     pub legacy_strings: BTreeSet<u16>,
     /// The IDs of the file's legacy catalog string tables (CATS), which
     /// are not read: the catalog's name lookup (0x4061e3) checks for one
@@ -153,6 +162,13 @@ pub struct Program {
     /// the level's +0x3b4 that 0x404328 fills from its STR# tables) is
     /// **unverified**.
     pub career_texts_end: bool,
+    /// Whether the default button labels a dialog shows for a string it
+    /// does not name (STR# 142 of `GameData/UIText.iff`, 0x435fee,
+    /// 0x43600a) are known to hold no `$`, so no token
+    /// ([`labels_hold_no_token`]). When they are not, a dialog with a
+    /// default string fails loudly. [`Program::link`] leaves it false for
+    /// the caller to fill.
+    pub labels_hold_no_token: bool,
     /// Each lot's zoning, by lot number: 1 residential, 2 community. It
     /// comes from the neighborhood ([`sims_content::Neighborhood::zoning`]),
     /// so [`Program::link`] leaves it empty for the caller to fill.
@@ -212,6 +228,7 @@ impl Program {
             semi_globals: BTreeMap::new(),
             careers: careers(index)?,
             career_texts_end: career_texts_end(index)?,
+            labels_hold_no_token: false,
             zoning: BTreeMap::new(),
             animations: Animations::default(),
             people: People::default(),
@@ -271,15 +288,12 @@ impl Program {
                     if chunk.id == TREE_NAMES {
                         library.tree_names.clone_from(&entries);
                     }
-                    if table.entries.iter().any(|entry| entry.language != 1) {
-                        library
-                            .loaded_strings
-                            .insert(chunk.id, loaded_order(&table.entries));
-                    }
                     library.strings.insert(chunk.id, entries);
                 }
-                b"\0CST" | b"CST\0" => {
-                    library.legacy_strings.insert(chunk.id);
+                b"\0CST" => {
+                    if iff.get(b"\0CST", chunk.id).is_some() {
+                        library.legacy_strings.insert(chunk.id);
+                    }
                 }
                 b"CTSS" => {
                     let table = sims_formats::strings::StringTable::parse(data)
@@ -320,6 +334,31 @@ impl Program {
                     library.slots.insert(chunk.id, slots.entries);
                 }
                 _ => {}
+            }
+        }
+        // The string tables as the original's loader finds them.
+        let ids: BTreeSet<u16> = iff
+            .chunks
+            .iter()
+            .filter(|chunk| &chunk.tag == b"STR#")
+            .map(|chunk| chunk.id)
+            .collect();
+        for id in ids {
+            let Some(chunk) = iff.get(b"STR#", id) else {
+                library.loaded_strings.insert(id, None);
+                continue;
+            };
+            let table = sims_formats::strings::StringTable::parse(iff.data(chunk))
+                .map_err(|e| format("STR#", id, e))?;
+            if table.format == sims_formats::strings::Format::Localized
+                && !table.entries.is_empty()
+                && table.entries.iter().all(|entry| entry.language != 1)
+            {
+                library.english_fallback.insert(id);
+            }
+            let loaded = loaded_order(&table.entries);
+            if library.strings.get(&id) != Some(&loaded) {
+                library.loaded_strings.insert(id, Some(loaded));
             }
         }
         // The native resource order (the rsmp map when there is one), as the
@@ -998,11 +1037,20 @@ pub fn loaded_order(entries: &[sims_formats::strings::TextEntry]) -> Vec<String>
     loaded
 }
 
-/// Whether no string of `work.iff` holds a career token past its first
-/// character ([`Program::career_texts_end`]): false when there is no
-/// `work.iff`, or a `Careers.txt` overrides it.
+/// Whether no text the career passes may write holds a career token past
+/// its first character ([`Program::career_texts_end`]). The careers'
+/// strings come from the `Work` resource set (0x403dd9): `work.iff`, and a
+/// `work.fam` beside it would be searched too (0x46f539, 0x46b627,
+/// 0x406a29), which is not ported, so one makes this false. So do no
+/// `work.iff` and a `Careers.txt`. Of `work.iff`, every string table
+/// (STR#, and CST, which the loader falls back to, 0x4702c7) must hold no
+/// `$` byte at all, deleted chunks included: the loader's English fallback
+/// may read a string's bytes as entries (0x47006b), so only the raw bytes
+/// are sure. Every career's name and level strings must hold no career
+/// token ([`crate::primitives::dialog::may_hold_career_token`]): its suit
+/// names hold `$`.
 fn career_texts_end(index: &Index) -> Result<bool> {
-    if index.named("Careers.txt").next().is_some() {
+    if index.named("Careers.txt").next().is_some() || index.named("work.fam").next().is_some() {
         return Ok(false);
     }
     let Some((_, file)) = index.named("work.iff").next() else {
@@ -1013,16 +1061,16 @@ fn career_texts_end(index: &Index) -> Result<bool> {
     let token = crate::primitives::dialog::may_hold_career_token;
     for chunk in &iff.chunks {
         let data = iff.data(chunk);
-        let format = |e| sims_content::Error::format(&format!("{location} #{}", chunk.id), e);
         match &chunk.tag {
-            b"STR#" => {
-                let table = sims_formats::strings::StringTable::parse(data).map_err(format)?;
-                if table.entries.iter().any(|entry| token(&entry.text)) {
+            b"STR#" | b"\0CST" => {
+                if data.contains(&b'$') {
                     return Ok(false);
                 }
             }
             b"CARR" => {
-                let career = sims_formats::career::Career::parse(data).map_err(format)?;
+                let Ok(career) = sims_formats::career::Career::parse(data) else {
+                    return Ok(false);
+                };
                 if token(&career.name)
                     || career
                         .levels
@@ -1036,6 +1084,42 @@ fn career_texts_end(index: &Index) -> Result<bool> {
         }
     }
     Ok(true)
+}
+
+/// The file the default button labels come from (0x435fee, 0x43600a):
+/// its STR# 142.
+pub const LABEL_FILE: &str = "GameData/UIText.iff";
+
+/// Whether the default button labels a dialog may show hold no `$`
+/// ([`Program::labels_hold_no_token`]): every string table of ID 142 of
+/// [`LABEL_FILE`] (STR#, and CST, which the loader falls back to,
+/// 0x4702c7) holds no `$` byte, deleted chunks included, and there is no
+/// `UIText.fam` beside it, whose resources would be searched too
+/// (0x46f539, 0x46b627), which is not ported. False when there is no such
+/// file.
+pub fn labels_hold_no_token(install: &sims_content::Install) -> Result<bool> {
+    const LABELS: u16 = 142;
+    match install.file("GameData/UIText.fam") {
+        Ok(_) => return Ok(false),
+        Err(sims_content::Error::Missing { .. }) => {}
+        Err(e) => return Err(e.into()),
+    }
+    let path = match install.file(LABEL_FILE) {
+        Ok(path) => path,
+        Err(sims_content::Error::Missing { .. }) => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    let bytes = std::fs::read(&path).map_err(|source| sims_content::Error::Io {
+        path: path.clone(),
+        source,
+    })?;
+    let location = path.display().to_string();
+    let iff = Iff::parse(bytes).map_err(|e| sims_content::Error::format(&location, e))?;
+    Ok(!iff.chunks.iter().any(|chunk| {
+        matches!(&chunk.tag, b"STR#" | b"\0CST")
+            && chunk.id == LABELS
+            && iff.data(chunk).contains(&b'$')
+    }))
 }
 
 /// An OBJD's words as the original holds them. Registration (0x43ba52)
