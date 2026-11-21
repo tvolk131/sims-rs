@@ -1482,6 +1482,27 @@ impl Lot {
 
     /// Rotates an active Buy Mode cursor's held object to `direction`
     /// (`0x4226bc` → `0x421be4`) and re-evaluates placement.
+    /// Turns the held Buy Mode object by signed `steps` of its turn step in
+    /// one `cTSTileCursor::Turn(steps)` call (`0x486cb8` → `0x421be4`).
+    pub fn buy_turn(&mut self, cursor: &mut BuyCursor, steps: i32) -> Result<bool, OrderError> {
+        self.ready()?;
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let mut next = cursor.clone();
+        let valid = interpreter
+            .buy_turn(&mut world, &mut next, steps)
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        *cursor = next;
+        Ok(valid)
+    }
+
     pub fn buy_rotate(
         &mut self,
         cursor: &mut BuyCursor,

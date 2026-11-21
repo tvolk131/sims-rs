@@ -368,8 +368,10 @@ impl Interpreter<'_> {
     /// Native `0x48736b` + `0x43583e`: for wall-attached objects (`data[13] &
     /// 0x0f != 0`) or mixed pool-edge multi-tile objects (some part has
     /// `data[42] & 0x800 != 0` and another has it clear), tries each remaining
-    /// rotation step `1..(8 / step)` at `[pos, level]` and keeps the first
-    /// valid facing, restoring the original facing if none fit.
+    /// rotation step `k = 1..(8 / step)` at `[pos, level]` via paired
+    /// `cTSTileCursor::Turn(+k)` / `Turn(-k)` calls (`0x4873bb` / `0x4873d7` →
+    /// `0x421be4`), keeping the first valid facing and returning to the
+    /// original facing after each failed candidate.
     fn try_wall_auto_rotate(
         &self,
         world: &mut World,
@@ -380,34 +382,23 @@ impl Interpreter<'_> {
         if !self.needs_wall_auto_rotate(world, cursor.held)? {
             return Ok(false);
         }
-        let (orig_facing, step) = world
+        let step = world
             .objects
             .get(&cursor.held)
-            .map(|o| {
-                (
-                    o.data.get(DATA_FACING).copied().unwrap_or(0).rem_euclid(8),
-                    o.data.get(DATA_TURN_STEP).copied().unwrap_or(0),
-                )
-            })
-            .unwrap_or((0, 0));
+            .and_then(|o| o.data.get(DATA_TURN_STEP).copied())
+            .unwrap_or(0);
         if step <= 0 {
             return Ok(false);
         }
+        cursor.position = [pos[0], pos[1], level];
         let count = 8 / step;
         for k in 1..count {
-            let dir = (orig_facing + k * step).rem_euclid(8);
-            // Native `0x4873bb` invokes `cTSTileCursor::Turn(1)` (`0x421be4`),
-            // which runs `TakeOff(1)` (`0x421bff`, OBJf 10 `LEAVING`) before
-            // turning and checking placement (`0x421db6`).
-            self.take_off_cursor_and_held_unconditional(world, cursor)?;
-            self.rotate_held_to(world, cursor.cursor, cursor.held, dir)?;
-            cursor.position = [pos[0], pos[1], level];
-            if self.put_if_cursor_fits(world, cursor, None, level, true)? {
+            self.buy_turn_steps(world, cursor, i32::from(k), None, level)?;
+            if cursor.valid {
                 return Ok(true);
             }
+            self.buy_turn_steps(world, cursor, -i32::from(k), None, level)?;
         }
-        self.take_off_cursor_and_held_unconditional(world, cursor)?;
-        self.rotate_held_to(world, cursor.cursor, cursor.held, orig_facing)?;
         Ok(false)
     }
 
@@ -446,6 +437,40 @@ impl Interpreter<'_> {
             }
         }
         Ok(any_pool && any_non_pool)
+    }
+
+    /// Turns the held object by signed `steps` of `DATA_TURN_STEP` in one
+    /// `cTSTileCursor::Turn(steps)` call (`0x486cb8` / `0x4873bb` →
+    /// `0x421be4`): runs unconditional `TakeOff(1)` (`0x421bff`), rotates the
+    /// held object (and syncs cursor offsets), and runs `put_if_cursor_fits`
+    /// (`0x421db6`) at the saved coordinates.
+    pub fn buy_turn(
+        &self,
+        world: &mut World,
+        cursor: &mut BuyCursor,
+        steps: i32,
+    ) -> Result<bool, Fault> {
+        let level = cursor.position[2];
+        let retained = cursor.container;
+        self.buy_turn_steps(world, cursor, steps, retained, level)
+    }
+
+    fn buy_turn_steps(
+        &self,
+        world: &mut World,
+        cursor: &mut BuyCursor,
+        steps: i32,
+        retained: Option<(u16, i16)>,
+        level: i32,
+    ) -> Result<bool, Fault> {
+        // Native `0x421bff`: unconditional `TakeOff(1)` on cursor and held.
+        self.take_off_cursor_and_held_unconditional(world, cursor)?;
+        // Native `0x421c0d`: turn held object by signed `steps` and sync cursor
+        // multipart offsets (`0x42238d`).
+        self.turn_held_by(world, cursor.cursor, cursor.held, steps)?;
+        // Native `0x421db6`: test fit and place at saved coordinates, clearing
+        // valid on fit refusal.
+        self.put_if_cursor_fits(world, cursor, retained, level, true)
     }
 
     /// Rotates the held object to `direction` (`0x4226bc` → `0x421be4`),
@@ -491,11 +516,8 @@ impl Interpreter<'_> {
             }
             // Native `0x422737` → `0x421be4(1)`: per-step take-off (`0x421bff`),
             // one rotation step, and per-step fit+placement check (`0x421db6`).
-            self.take_off_cursor_and_held_unconditional(world, cursor)?;
-            let next_dir = (current + step).rem_euclid(8);
-            self.rotate_held_to(world, cursor.cursor, cursor.held, next_dir)?;
             cursor.position = [x, y, level];
-            self.put_if_cursor_fits(world, cursor, retained, level, true)?;
+            self.buy_turn_steps(world, cursor, 1, retained, level)?;
             current = world
                 .objects
                 .get(&cursor.held)
@@ -574,7 +596,9 @@ impl Interpreter<'_> {
     /// Cursor"` fitting first (`0x485b62..0x485bda` → `0x421e72`). When the
     /// `"Tile Cursor"` is on-lot (`0x485b74..0x485b84`), invokes `0x421963`
     /// (`TakeOff(1)` on both `cursor` and `held`, running `held`'s `LEAVING`
-    /// even if `held` was off-lot) before re-evaluating placement.
+    /// even if `held` was off-lot) before re-evaluating placement; when
+    /// off-lot (`0x485b7b`), skips the initial take-off and still runs the
+    /// `0x485bda` → `0x421e72` → `0x422c2f` placement pass.
     pub fn buy_recheck(
         &self,
         world: &mut World,
@@ -588,46 +612,66 @@ impl Interpreter<'_> {
         else {
             return Ok(false);
         };
-        if !on_lot([x, y]) {
-            cursor.position = [-16, -16, level];
-            cursor.valid = false;
-            cursor.container = None;
-            return Ok(false);
-        }
-        let retained = (cursor.position == [x, y, level])
+        let cursor_on_lot = on_lot([x, y]);
+        let retained = (cursor_on_lot && cursor.position == [x, y, level])
             .then_some(cursor.container)
             .flatten();
-        // Native `0x485b74..0x485b84` → `0x421963`: cursor is on-lot, so take
+        // Native `0x485b74..0x485b84` → `0x421963`: when cursor is on-lot, take
         // off both cursor and held unconditionally (running `held`'s LEAVING
-        // callback even if only the Tile Cursor was on-lot).
-        self.take_off_cursor_and_held_unconditional(world, cursor)?;
+        // callback even if only the Tile Cursor was on-lot). When off-lot,
+        // skip the initial take-off (`0x485b7b`) and still run `0x485bda`.
+        if cursor_on_lot {
+            self.take_off_cursor_and_held_unconditional(world, cursor)?;
+        }
         cursor.valid = false;
         cursor.container = None;
-        if !inside_placement_bounds(world, [x, y]) {
-            cursor.position = [-16, -16, level];
-            return Ok(false);
-        }
         if self.try_place_buy_at(world, cursor, [x, y], level, retained)? {
             return Ok(cursor.valid);
         }
-        cursor.position = [x, y, level];
         cursor.valid = false;
         cursor.container = None;
-        let cursor_place = Place {
-            on_lot: true,
-            position: [x, y],
-            container: None,
-            slot: -1,
-            level,
-        };
-        self.put(world, cursor.cursor, cursor_place, true)?;
+        if cursor_on_lot && inside_placement_bounds(world, [x, y]) {
+            cursor.position = [x, y, level];
+            let cursor_place = Place {
+                on_lot: true,
+                position: [x, y],
+                container: None,
+                slot: -1,
+                level,
+            };
+            self.put(world, cursor.cursor, cursor_place, true)?;
+        } else {
+            // Native `0x422c2f` lines `0x422cfc`..`0x422d37`: off-lot target
+            // calls `TakeOff(1)` and OBJf 9 (`PLACED`) on the Tile Cursor
+            // parts while keeping the saved cursor position off-lot.
+            self.take_off(world, cursor.cursor, true)?;
+            let fail = |trap| Fault {
+                object: cursor.cursor,
+                at: None,
+                trap,
+            };
+            let cursor_parts = if world
+                .objects
+                .get(&cursor.cursor)
+                .is_some_and(|o| o.multipart.is_some())
+            {
+                self.parts(world, cursor.cursor).map_err(fail)?
+            } else {
+                vec![cursor.cursor]
+            };
+            for part in cursor_parts {
+                self.callback(world, part, function::PLACED, 0)?;
+            }
+            cursor.position = [-16, -16, level];
+        }
         Ok(false)
     }
 
     /// Hides the cursor and held object off the lot while the pointer leaves
-    /// the house view (`0x487d4e` → `0x421963`).
+    /// the house view (`0x487d4e` → `0x487d60` → `0x421963`, calling
+    /// `TakeOff(1)` unconditionally whenever a cursor exists).
     pub fn buy_hide(&self, world: &mut World, cursor: &mut BuyCursor) -> Result<(), Fault> {
-        self.remove_cursor_and_held(world, cursor)?;
+        self.take_off_cursor_and_held_unconditional(world, cursor)?;
         cursor.position = [-16, -16, cursor.position[2]];
         cursor.valid = false;
         cursor.container = None;
@@ -942,6 +986,57 @@ impl Interpreter<'_> {
             self.turn_group(world, id, steps)?;
         } else {
             self.turn_one(world, id, steps)?;
+        }
+        Ok(())
+    }
+
+    /// Turns `held` by signed `steps` of its `DATA_TURN_STEP`, updating
+    /// multipart offsets on both `held` and `cursor` when multi-tile while
+    /// leaving `cursor`'s own `data[1]` unchanged (`0x421c0d` + `0x42238d`).
+    fn turn_held_by(
+        &self,
+        world: &mut World,
+        cursor: u16,
+        held: u16,
+        steps: i32,
+    ) -> Result<(), Fault> {
+        let fail = |object, trap| Fault {
+            object,
+            at: None,
+            trap,
+        };
+        let is_group = world
+            .objects
+            .get(&held)
+            .ok_or_else(|| fail(held, Trap::native(10, "missing held object")))?
+            .multipart
+            .is_some();
+        if is_group {
+            // Native `0x421c0d` dispatches to `cTSMultiTileObject::Turn`
+            // (`0x422937`), which runs `TakeOff(1)` (`0x422961`) on the group
+            // before updating facings and offsets.
+            self.turn_group(world, held, steps)?;
+            let parts = self.parts(world, held).map_err(|t| fail(held, t))?;
+            // Sync cursor parts' offsets from held parts (`0x42238d`).
+            let cursor_parts = self.parts(world, cursor).map_err(|t| fail(cursor, t))?;
+            for (&hp, &cp) in parts.iter().zip(cursor_parts.iter()) {
+                let offset = world
+                    .objects
+                    .get(&hp)
+                    .and_then(|o| o.multipart.as_ref())
+                    .map(|m| m.offset);
+                if let (Some(offset), Some(cm)) = (
+                    offset,
+                    world
+                        .objects
+                        .get_mut(&cp)
+                        .and_then(|o| o.multipart.as_mut()),
+                ) {
+                    cm.offset = offset;
+                }
+            }
+        } else {
+            self.turn_one(world, held, steps)?;
         }
         Ok(())
     }

@@ -125,6 +125,16 @@ pub struct Game {
     /// The active Buy Mode `"Tile Cursor"` and held catalog object, once the
     /// pointer has entered the house view (`0x487d3d`).
     buy_cursor: Option<BuyCursor>,
+    /// Whether the pointer is currently inside the house view in Buy Mode
+    /// (`[tool + 0x97]`, `0x487d3d` / `0x487d4e`), so re-entering after
+    /// leaving onto the catalog recreates the preview via `0x486f5a`.
+    buy_in_house: bool,
+    /// Last Buy Mode catalog GUID instantiated by `0x486f5a` (`tool[0x12]`).
+    buy_last_guid: Option<u32>,
+    /// Tool-stored Buy Mode facing (`tool[0x10]`, initialized by `0x486f5a`
+    /// when switching catalog GUIDs and updated on placement commit
+    /// `0x486ada`).
+    buy_facing: Option<i16>,
     /// The screen anchor of an active Buy Mode left-button press over the lot
     /// (`0x485f98`), for drag-to-rotate (`dx^2 + dy^2 > 36`, `0x485a2e`) and
     /// commit on release (`0x4864d0`).
@@ -204,6 +214,9 @@ impl Game {
             highlighted: None,
             buy_selected: None,
             buy_cursor: None,
+            buy_in_house: false,
+            buy_last_guid: None,
+            buy_facing: None,
             buy_dragging: None,
             shift_held: false,
             note: None,
@@ -1481,6 +1494,9 @@ impl Game {
         self.highlighted = None;
         self.buy_selected = None;
         self.buy_cursor = None;
+        self.buy_in_house = false;
+        self.buy_last_guid = None;
+        self.buy_facing = None;
         self.buy_dragging = None;
         self.hud.forget();
         self.hud.controls.mode = ui_mode(self.lot.mode());
@@ -1772,6 +1788,9 @@ impl Game {
         self.hud.controls.expanded = true;
         self.hud.controls.help = None;
         self.hud.buy_state.reset();
+        self.buy_in_house = false;
+        self.buy_last_guid = None;
+        self.buy_facing = None;
         if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
             self.blink_dirty = true;
         }
@@ -1823,6 +1842,7 @@ impl Game {
     /// the preview fails, the cursor handle is kept so it can be retried.
     pub fn cancel_buy(&mut self) -> bool {
         self.buy_dragging = None;
+        self.buy_in_house = false;
         let had_cursor = if let Some(cursor) = self.buy_cursor.take() {
             match self.lot.buy_cancel(&cursor) {
                 Ok(()) => {
@@ -1851,63 +1871,70 @@ impl Game {
         }
     }
 
-    /// Rotates the held Buy Mode object by one turn step (`0x4226bc` →
-    /// `0x421be4`), returning `true` if a Buy cursor was active.
+    /// Rotates the held Buy Mode object by one signed turn step (`0x486cb8` →
+    /// `0x421be4(±1)`), returning `true` if a Buy cursor was active.
     pub fn rotate_held(&mut self, clockwise: bool) -> bool {
         let Some(mut cursor) = self.buy_cursor.take() else {
             return false;
         };
-        let (facing, step) = self
-            .lot
-            .world()
-            .objects
-            .get(&cursor.held)
-            .map(|o| {
-                (
-                    o.data.get(1).copied().unwrap_or(0),
-                    o.data.get(23).copied().unwrap_or(0),
-                )
-            })
-            .unwrap_or((0, 0));
-        if step > 0 {
-            let delta = if clockwise { step } else { -step };
-            let next = (facing + delta).rem_euclid(8);
-            if let Err(e) = self.lot.buy_rotate(&mut cursor, next) {
-                self.note = Some(format!("The object was not rotated: {e}"));
-            } else {
-                self.refresh_world();
-            }
+        let steps = if clockwise { 1 } else { -1 };
+        if let Err(e) = self.lot.buy_turn(&mut cursor, steps) {
+            self.note = Some(format!("The object was not rotated: {e}"));
+        } else {
+            self.refresh_world();
         }
         self.buy_cursor = Some(cursor);
         true
     }
 
     /// Handles pointer movement over the house view in Buy Mode (`0x487d3d`,
-    /// `0x485a2e`): instantiates the armed catalog object + `"Tile Cursor"`
-    /// on first entry, rotates the held object in place while dragging past
-    /// the 6 px threshold (`dx^2 + dy^2 > 36`), and otherwise moves the cursor
-    /// to the terrain-unprojected tile (including within the 6 px drag radius).
+    /// `0x485a2e`): on mouse entry (`!self.buy_in_house`), recreates the
+    /// armed catalog preview at the tool's stored facing (`0x487d3d` →
+    /// `0x486f5a`); then rechecks the previous cursor position (`0x485bda`),
+    /// rotates the held object in place while dragging past the 6 px
+    /// threshold (`dx^2 + dy^2 > 36`), and otherwise moves the cursor to the
+    /// terrain-unprojected tile (including within the 6 px drag radius).
     fn hover_buy(&mut self, point: [i32; 2]) -> bool {
         if self.stopped.is_some() {
             return false;
         }
-        if self.buy_cursor.is_none()
-            && let Some(guid) = self.buy_selected
-        {
-            let dir = sims_vm::default_buy_direction(self.view.camera.rotation);
-            match self.lot.buy_start(guid, self.view.camera.level, dir) {
-                Ok(Some(cursor)) => self.buy_cursor = Some(cursor),
-                Ok(None) => {
-                    self.hud.play(crate::hud::ERROR);
-                    self.buy_selected = None;
-                    self.hud.buy_state.selected = None;
-                    self.hud
-                        .layout_buy(self.view.size, self.lot.world(), &self.assets);
+        if !self.buy_in_house {
+            self.buy_in_house = true;
+            if let Some(guid) = self.buy_selected {
+                // Native `0x487d3d` → `0x486f5a`: destroy any hidden previous
+                // preview (`0x487105`) and instantiate a fresh one using the
+                // tool's stored facing (`tool[0x10]`), resetting it to
+                // `default_buy_direction` only when switching catalog items.
+                if let Some(old) = self.buy_cursor.take()
+                    && let Err(e) = self.lot.buy_cancel(&old)
+                {
+                    self.buy_cursor = Some(old);
+                    self.buy_in_house = false;
+                    self.note = Some(format!("Could not reset Buy preview: {e}"));
                     return true;
                 }
-                Err(e) => {
-                    self.note = Some(format!("Could not start placing 0x{guid:08X}: {e}"));
-                    return true;
+                if self.buy_last_guid != Some(guid) {
+                    self.buy_facing =
+                        Some(sims_vm::default_buy_direction(self.view.camera.rotation));
+                    self.buy_last_guid = Some(guid);
+                }
+                let dir = self
+                    .buy_facing
+                    .unwrap_or_else(|| sims_vm::default_buy_direction(self.view.camera.rotation));
+                match self.lot.buy_start(guid, self.view.camera.level, dir) {
+                    Ok(Some(cursor)) => self.buy_cursor = Some(cursor),
+                    Ok(None) => {
+                        self.hud.play(crate::hud::ERROR);
+                        self.buy_selected = None;
+                        self.hud.buy_state.selected = None;
+                        self.hud
+                            .layout_buy(self.view.size, self.lot.world(), &self.assets);
+                        return true;
+                    }
+                    Err(e) => {
+                        self.note = Some(format!("Could not start placing 0x{guid:08X}: {e}"));
+                        return true;
+                    }
                 }
             }
         }
@@ -1980,8 +2007,12 @@ impl Game {
         true
     }
 
-    /// Hides the active Buy Mode cursor off the lot (`0x487d4e`).
+    /// Hides the active Buy Mode cursor off the lot on mouse exit (`0x487d4e`).
     fn hide_buy_cursor(&mut self) -> bool {
+        let was_in = std::mem::replace(&mut self.buy_in_house, false);
+        if !was_in {
+            return false;
+        }
         let Some(mut cursor) = self.buy_cursor.take() else {
             return false;
         };
@@ -2017,6 +2048,10 @@ impl Game {
             .unwrap_or_else(|| sims_vm::default_buy_direction(self.view.camera.rotation));
         match self.lot.buy_commit(&cursor) {
             Ok(_) => {
+                // Native `0x486ada` line `0x486af6`: remember the committed
+                // facing on the tool (`tool[0x10]`).
+                self.buy_facing = Some(last_facing);
+                self.buy_last_guid = Some(cursor.guid);
                 if cursor.keep_buying || self.shift_held {
                     let funds = sims_vm::available_funds(self.lot.world());
                     if cursor.price <= 0 || cursor.price <= funds {
@@ -2028,6 +2063,7 @@ impl Game {
                         {
                             Ok(Some(next)) => {
                                 self.buy_cursor = Some(next);
+                                self.buy_in_house = !self.hud.covers(point);
                                 self.refresh_world();
                                 if !self.hud.covers(point) {
                                     self.hover_buy(point);

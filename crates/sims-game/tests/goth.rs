@@ -6138,4 +6138,37 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
     game.release([589, 444]);
     assert_eq!(game.lot().world().budget.funds, funds_before_floor_drag);
     assert!(game.buy_cursor().is_some_and(|c| !c.valid));
+
+    // Leaving the house view onto the catalog and re-entering recreates the
+    // preview at the tool's stored facing (`0x487d3d` -> `0x486f5a`), discarding
+    // any uncommitted `.`/`,` rotation on the hidden preview.
+    game.view.camera.level = 1;
+    game.cancel_buy();
+    game.press([437, 523]); // Werkbunnst Chair
+    game.release([437, 523]);
+    game.hover(floor_spot);
+    assert_eq!(
+        game.lot().world().objects[&game.buy_cursor().unwrap().held].data[1],
+        2
+    );
+    assert!(game.rotate_held(false)); // `,` single counterclockwise turn -> 0
+    assert_eq!(
+        game.lot().world().objects[&game.buy_cursor().unwrap().held].data[1],
+        0
+    );
+    assert!(game.rotate_held(true)); // `.` -> 2
+    assert!(game.rotate_held(true)); // `.` -> 4
+    assert_eq!(
+        game.lot().world().objects[&game.buy_cursor().unwrap().held].data[1],
+        4
+    );
+    // Move onto the catalog panel (`0x487d4e`), then return to the lawn
+    // (`0x487d3d` -> `0x486f5a`): preview resets to stored facing `2`.
+    game.hover([300, 520]);
+    game.hover(floor_spot);
+    let reentered_chair = game.buy_cursor().unwrap().held;
+    assert_eq!(game.lot().world().objects[&reentered_chair].data[1], 2);
+    game.press(floor_spot);
+    game.release(floor_spot);
+    assert_eq!(game.lot().world().objects[&reentered_chair].data[1], 2);
 }
