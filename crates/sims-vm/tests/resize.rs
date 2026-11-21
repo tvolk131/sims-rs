@@ -248,13 +248,13 @@ fn format_7_bytes(world: &World) -> Vec<u8> {
 /// fields at the end of the encoding: the dialog records with the
 /// registry's word 0x100, and each person's tick state (the tick of the
 /// last decay and the room last seen in). Before the first tick there is
-/// no record, the word is 0 and no person has been ticked: an empty list,
-/// a zero and an empty map, one zero byte each. This checks that the
-/// encoding ends in those three bytes and drops them, so a state pinned
+/// no record, the word is -1 (0x43f72d, zigzag-encoded as 1) and no person
+/// has been ticked: an empty list, 1, and an empty map. This checks that
+/// the encoding ends in those three bytes and drops them, so a state pinned
 /// under format 8 can be shown to be the same state.
 fn format_8_bytes(world: &World) -> Vec<u8> {
     let mut encoded = format_9_bytes(world);
-    assert_eq!(encoded.split_off(encoded.len() - 3), [0; 3]);
+    assert_eq!(encoded.split_off(encoded.len() - 3), [0, 1, 0]);
     encoded
 }
 
@@ -871,6 +871,17 @@ fn with_read_flag_clear(world: &World) -> World {
     assert!(world.neighbors.relationships_changed);
     let mut old = world.clone();
     old.neighbors.relationships_changed = false;
+    old
+}
+
+/// The world with `dialogs.declined` restored to 0 (its value before
+/// `0x43f72d` initialized registry word 0x100 to -1), after asserting it is
+/// currently -1. Used to check historical Goth entry and tick-1 pins
+/// (`BASELINE_9`..`BASELINE_16`, `TICK_1_9`..`TICK_1`).
+fn with_declined_zero(world: &World) -> World {
+    assert_eq!(world.dialogs.declined, -1);
+    let mut old = world.clone();
+    old.dialogs.declined = 0;
     old
 }
 
@@ -2062,7 +2073,10 @@ fn the_goth_house_objects_are_all_visited() {
             .collect();
         assert_eq!(occupied, OCCUPIED);
         let old = without_saved_targets(world, &before);
-        assert_eq!(digest(&format_16_bytes(&old)), VISITED_16);
+        assert_eq!(
+            digest(&format_16_bytes(&with_declined_zero(&old))),
+            VISITED_16
+        );
         pinned(&without_room_notes(&old), VISITED, VISITED_7);
         // Steps 14 and 15 change nothing on this lot, and neither does
         // asking for the indicators again in step 16.
@@ -2070,7 +2084,10 @@ fn the_goth_house_objects_are_all_visited() {
         finish_goth_selection(world, &family);
         assert_eq!(interpreter.ensure_indicators(world), Ok(None));
         let old = without_saved_targets(world, &before);
-        assert_eq!(digest(&format_16_bytes(&old)), VISITED_16);
+        assert_eq!(
+            digest(&format_16_bytes(&with_declined_zero(&old))),
+            VISITED_16
+        );
         pinned(&without_room_notes(&old), VISITED, VISITED_7);
     });
 }
@@ -2275,17 +2292,21 @@ fn the_goth_house_load_ends_where_the_first_tick_starts() {
         assert_eq!(world.lot_rng, before.lot_rng);
         assert_eq!(world.crt_rng, before.crt_rng);
         let untargeted = without_saved_targets(world, &loaded);
-        assert_eq!(digest(&format_16_bytes(&untargeted)), BASELINE_16);
+        assert_eq!(
+            digest(&format_16_bytes(&with_declined_zero(&untargeted))),
+            BASELINE_16
+        );
         let noted = without_room_notes(&untargeted);
         assert_eq!(digest(&format_8_bytes(&noted)), BASELINE);
-        assert_eq!(digest(&format_9_bytes(&noted)), BASELINE_9);
+        let noted_zero = with_declined_zero(&noted);
+        assert_eq!(digest(&format_9_bytes(&noted_zero)), BASELINE_9);
         assert!(untargeted.animators.is_empty());
-        let old = with_read_flag_clear(&noted);
+        let old = with_read_flag_clear(&noted_zero);
         assert_eq!(digest(&format_10_bytes(&old)), BASELINE_10);
         assert_eq!(digest(&format_11_bytes(&old)), BASELINE_11);
         assert_eq!(digest(&format_12_bytes(&old)), BASELINE_12);
         assert_eq!(digest(&format_13_bytes(&old)), BASELINE_13);
-        assert_eq!(digest(&format_14_bytes(&noted)), BASELINE_14);
+        assert_eq!(digest(&format_14_bytes(&noted_zero)), BASELINE_14);
     });
 }
 
@@ -2565,14 +2586,15 @@ fn the_goth_house_first_tick_matches_the_original() {
                 .values()
                 .all(|t| t.last_decay == before.ticks as i32)
         );
-        assert_eq!(digest(&format_9_bytes(world)), TICK_1_9);
-        let old = with_read_flag_clear(world);
+        let tick1_zero = with_declined_zero(world);
+        assert_eq!(digest(&format_9_bytes(&tick1_zero)), TICK_1_9);
+        let old = with_read_flag_clear(&tick1_zero);
         assert_eq!(digest(&format_10_bytes(&old)), TICK_1_10);
         assert_eq!(digest(&format_11_bytes(&old)), TICK_1_11);
         assert_eq!(digest(&format_12_bytes(&old)), TICK_1_12);
         assert_eq!(digest(&format_13_bytes(&old)), TICK_1_13);
-        assert_eq!(digest(&format_14_bytes(world)), TICK_1_14);
-        assert_eq!(digest(&format_16_bytes(world)), TICK_1);
+        assert_eq!(digest(&format_14_bytes(&tick1_zero)), TICK_1_14);
+        assert_eq!(digest(&format_16_bytes(&tick1_zero)), TICK_1);
         // Ticks 2 to 5. Person 16 starts a clip with Animate Sim in tick 2
         // and yields; the capture shows that person at the same
         // instruction after ticks 2 to 5, with the same frames (the 254 in

@@ -216,7 +216,7 @@ struct App {
     window: Option<Rc<Window>>,
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
     scale: u32,
-    cursor: PhysicalPosition<f64>,
+    cursor: Option<PhysicalPosition<f64>>,
     drag: Option<PhysicalPosition<f64>>,
     last: Instant,
     dirty: bool,
@@ -233,10 +233,67 @@ struct App {
     slot: String,
 }
 
+/// The canvas dimensions for a physical client area `size` at `scale`,
+/// matching [`App::redraw`].
+fn canvas_size(size: winit::dpi::PhysicalSize<u32>, scale: u32) -> Option<[i32; 2]> {
+    if size.width == 0 || size.height == 0 {
+        return None;
+    }
+    let scale = scale.max(1);
+    Some(
+        [size.width / scale, size.height / scale]
+            .map(|n| i32::try_from(n).unwrap_or(i32::MAX).max(1)),
+    )
+}
+
+/// Maps a physical pointer `position` inside `size` at `scale` to its
+/// canvas pixel using the same edge clamp as [`App::redraw`]; `None` when
+/// `position` is outside `[0..size.width, 0..size.height)` or the client
+/// area is empty.
+fn canvas_point(
+    position: PhysicalPosition<f64>,
+    size: winit::dpi::PhysicalSize<u32>,
+    scale: u32,
+) -> Option<[i32; 2]> {
+    let [w, h] = canvas_size(size, scale)?;
+    if position.x < 0.0
+        || position.y < 0.0
+        || position.x >= f64::from(size.width)
+        || position.y >= f64::from(size.height)
+    {
+        return None;
+    }
+    let scale = f64::from(scale.max(1));
+    let x = ((position.x / scale) as i32).clamp(0, w - 1);
+    let y = ((position.y / scale) as i32).clamp(0, h - 1);
+    Some([x, y])
+}
+
 impl App {
-    fn point(&self, position: PhysicalPosition<f64>) -> [i32; 2] {
-        let scale = f64::from(self.scale.max(1));
-        [(position.x / scale) as i32, (position.y / scale) as i32]
+    fn sync_size(&mut self, size: winit::dpi::PhysicalSize<u32>) {
+        if let Some(canvas) = canvas_size(size, self.scale) {
+            self.game.resize(canvas);
+        }
+        if self
+            .cursor
+            .is_some_and(|c| canvas_point(c, size, self.scale).is_none())
+        {
+            self.cursor = None;
+            let _ = self.game.leave();
+        }
+    }
+
+    fn live_point(&mut self) -> Option<[i32; 2]> {
+        let size = self.window.as_ref()?.inner_size();
+        if let Some(canvas) = canvas_size(size, self.scale) {
+            self.game.resize(canvas);
+        }
+        let cursor = self.cursor?;
+        let point = canvas_point(cursor, size, self.scale);
+        if point.is_none() {
+            self.cursor = None;
+        }
+        point
     }
 
     /// Moves the pointer where the game asks, as the original moves it
@@ -253,11 +310,13 @@ impl App {
             // Not every platform lets a program move the pointer; the
             // menu still works where it is.
             if w.set_cursor_position(position).is_ok() {
-                self.cursor = position;
+                self.cursor = Some(position);
             }
         }
-        let redraw = self.game.hover(self.point(self.cursor));
-        self.changed(redraw);
+        if let Some(point) = self.live_point() {
+            let redraw = self.game.hover(point);
+            self.changed(redraw);
+        }
     }
 
     fn changed(&mut self, redraw: bool) {
@@ -369,8 +428,9 @@ impl App {
             return;
         };
         let scale = self.scale.max(1);
-        let canvas_size = [size.width / scale, size.height / scale]
-            .map(|n| i32::try_from(n).unwrap_or(i32::MAX).max(1));
+        let Some(canvas_size) = canvas_size(size, scale) else {
+            return;
+        };
         if self.game.resize(canvas_size) {
             self.dirty = true;
         }
@@ -457,9 +517,15 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => self.redraw(),
-            WindowEvent::Resized(_) => self.changed(true),
+            WindowEvent::Resized(size) => {
+                self.sync_size(size);
+                self.changed(true);
+            }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.scale = scale_factor.round().max(1.0) as u32;
+                if let Some(size) = self.window.as_ref().map(|w| w.inner_size()) {
+                    self.sync_size(size);
+                }
                 self.changed(true);
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
@@ -494,26 +560,51 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseInput { state, button, .. } => match (button, state) {
                 (MouseButton::Left, ElementState::Pressed) => {
-                    let outcome = self.game.press(self.point(self.cursor));
-                    self.changed(outcome.redraw);
-                    self.move_pointer();
-                    if outcome.photo {
-                        self.photo();
+                    if let Some(point) = self.live_point() {
+                        let outcome = self.game.press(point);
+                        self.changed(outcome.redraw);
+                        self.move_pointer();
+                        if outcome.photo {
+                            self.photo();
+                        }
                     }
                 }
-                (MouseButton::Right, ElementState::Pressed) => self.drag = Some(self.cursor),
+                (MouseButton::Left, ElementState::Released) => {
+                    let outcome = match self.live_point() {
+                        Some(point) => self.game.release(point),
+                        None => self.game.release_outside(),
+                    };
+                    self.changed(outcome.redraw);
+                    self.move_pointer();
+                }
+                (MouseButton::Right, ElementState::Pressed) => {
+                    self.drag = self.live_point().and(self.cursor);
+                }
                 (MouseButton::Right, ElementState::Released) => self.drag = None,
                 _ => {}
             },
             WindowEvent::CursorLeft { .. } => {
+                self.cursor = None;
                 let redraw = self.game.leave();
                 self.changed(redraw);
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.cursor = position;
-                let point = self.point(position);
-                let redraw = self.drag.is_none() && self.game.hover(point);
-                self.changed(redraw);
+                let point = self.window.as_ref().and_then(|w| {
+                    let size = w.inner_size();
+                    if let Some(canvas) = canvas_size(size, self.scale) {
+                        self.game.resize(canvas);
+                    }
+                    canvas_point(position, size, self.scale)
+                });
+                if let Some(point) = point {
+                    self.cursor = Some(position);
+                    let redraw = self.drag.is_none() && self.game.hover(point);
+                    self.changed(redraw);
+                } else {
+                    self.cursor = None;
+                    let redraw = self.drag.is_none() && self.game.leave();
+                    self.changed(redraw);
+                }
                 if let Some(start) = self.drag {
                     let scale = f64::from(self.scale.max(1));
                     let dx = ((position.x - start.x) / scale) as i32;
@@ -584,7 +675,7 @@ fn run() -> Result<(), String> {
         window: None,
         surface: None,
         scale: 1,
-        cursor: PhysicalPosition::new(0.0, 0.0),
+        cursor: None,
         drag: None,
         last: Instant::now(),
         dirty: true,
@@ -605,4 +696,43 @@ fn run() -> Result<(), String> {
 fn slot(house: &std::path::Path) -> String {
     let path = std::fs::canonicalize(house).unwrap_or_else(|_| house.to_path_buf());
     path.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use winit::dpi::PhysicalSize;
+
+    #[test]
+    fn canvas_point_matches_draw_clamp_on_odd_scaled_edges() {
+        let size = PhysicalSize::new(801, 561);
+        assert_eq!(canvas_size(size, 2), Some([400, 280]));
+        assert_eq!(
+            canvas_point(PhysicalPosition::new(800.0, 560.0), size, 2),
+            Some([399, 279])
+        );
+        assert_eq!(
+            canvas_point(PhysicalPosition::new(801.0, 560.0), size, 2),
+            None
+        );
+        assert_eq!(
+            canvas_point(PhysicalPosition::new(400.0, 561.0), size, 2),
+            None
+        );
+        assert_eq!(
+            canvas_point(PhysicalPosition::new(400.0, -1.0), size, 2),
+            None
+        );
+    }
+
+    #[test]
+    fn canvas_point_rejects_cached_cursor_after_shrink() {
+        let pos = PhysicalPosition::new(260.0, 204.0);
+        assert_eq!(
+            canvas_point(pos, PhysicalSize::new(800, 600), 1),
+            Some([260, 204])
+        );
+        assert_eq!(canvas_point(pos, PhysicalSize::new(260, 600), 1), None);
+        assert_eq!(canvas_point(pos, PhysicalSize::new(0, 600), 1), None);
+    }
 }
