@@ -129,7 +129,7 @@ fn the_goths_personality_panel() {
     assert_eq!(worked_out, signs);
     let controls = Controls {
         expanded: true,
-        panel: Panel::Personality,
+        panel: Some(Panel::Personality),
         ..Controls::default()
     };
     let mut frame = Frame::new(800, 600, [0, 0, 0]);
@@ -161,7 +161,7 @@ fn the_goths_sign_balloon() {
 
     let mut controls = Controls {
         expanded: true,
-        panel: Panel::Personality,
+        panel: Some(Panel::Personality),
         ..Controls::default()
     };
     let mut items = hud::layout([800, 600], &opened.snapshot, &controls);
@@ -242,7 +242,7 @@ fn the_goths_job_panel() {
     assert_eq!(opened.snapshot.family_friends, 0);
     let controls = Controls {
         expanded: true,
-        panel: Panel::Job,
+        panel: Some(Panel::Job),
         ..Controls::default()
     };
     let draw = |snapshot| {
@@ -337,7 +337,7 @@ fn the_goths_relationship_panel() {
     assert!(opened.snapshot.superstar);
     let controls = Controls {
         expanded: true,
-        panel: Panel::Relationships,
+        panel: Some(Panel::Relationships),
         ..Controls::default()
     };
     let mut frame = Frame::new(800, 600, [0, 0, 0]);
@@ -429,7 +429,7 @@ fn the_goths_house_panel() {
     );
     let controls = Controls {
         expanded: true,
-        panel: Panel::House,
+        panel: Some(Panel::House),
         ..Controls::default()
     };
     let mut frame = Frame::new(800, 600, [0, 0, 0]);

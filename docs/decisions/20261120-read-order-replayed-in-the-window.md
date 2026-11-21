@@ -53,7 +53,8 @@ after every update from 1 to 900 except:
 - Mortimer's frame of tree 4116, local 1, at 187–370 (recorded 254,
   ours 0);
 - his frame of tree 4114, local 0, at 187–321 (recorded 285, ours
-  4123);
+  4123). These two are gone since the second check of a chosen entry
+  was ported (below);
 - Bella's frame of tree 8292, local 0, at 203–227 (recorded 15837,
   ours 0), as in the snack and queue notes
   (`20261115-press-lists-pie-menu-again-reaching-entry-checks.md`,
@@ -79,9 +80,13 @@ The test pins:
 - everyone's Room motive at 606 and 607;
 - nothing caught to 900.
 
-## Open: the entry may be checked a second time before the order starts
+## Settled: the entry is checked a second time before the order starts
 
-This is **unverified** and not ported.
+Choosing the entry checks it again: the snack recording with plumb-bob
+shots shows the check run at the release, and it is now ported
+(`20261120-choosing-a-pie-entry-checks-it-again.md`). Mortimer's two
+frame differences below are gone, and the test pins those locals. What
+follows is the reasoning as it stood before.
 
 - **What the words show.** New frame locals are not cleared: they
   start as what earlier frames left at that place in the Sim's frame

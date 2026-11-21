@@ -198,9 +198,9 @@ impl Machine<'_, '_> {
         } else {
             self.interpreter()
                 .callback(self.world, target, CANCELLED, me as i16)
-                .map_err(|fault| {
-                    Trap::Unsupported(format!(
-                        "cancelling a queued action on object {target} (0x45dcc8): {fault}"
+                .map_err(|fault: crate::fault::Fault| {
+                    fault.unsupported_in(format!(
+                        "cancelling a queued action on object {target} (0x45dcc8)"
                     ))
                 })?;
             Flow::Yield

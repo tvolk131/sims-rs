@@ -297,11 +297,32 @@ pub struct Update {
     /// In play mode, the frames of the house view drawn with this step
     /// that failed, and were skipped ([`crate::boot::Lot::step_play`]), in
     /// the order they were drawn. Always empty in strict mode.
-    pub frame_errors: Vec<String>,
+    pub frame_errors: Vec<SkippedFrame>,
     /// The requests to the sound system made during the update, in order
     /// ([`crate::sounds`]). Empty when the interpreter carries its own
     /// sink ([`Interpreter::sounds`]), which then has them.
     pub sounds: Vec<SoundEvent>,
+}
+
+/// A frame of the house view that failed in play mode and was skipped
+/// ([`Update::frame_errors`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedFrame {
+    /// The tick the frame was drawn after, counted as
+    /// [`crate::boot::Lot::ticks`] counts them, from the load; 0 for the
+    /// frame drawn before the first tick.
+    pub after: u32,
+    /// Why it failed.
+    pub error: String,
+}
+
+impl std::fmt::Display for SkippedFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.after {
+            0 => write!(f, "the frame before tick 1: {}", self.error),
+            tick => write!(f, "the frame after tick {tick}: {}", self.error),
+        }
+    }
 }
 
 impl Interpreter<'_> {
@@ -327,6 +348,21 @@ impl Interpreter<'_> {
         player: &mut dyn Player,
         play: Option<&mut Play>,
     ) -> Result<Update, TickError> {
+        let (update, result) = self.lot_update_kept(world, tuning, player, play);
+        result.map(|()| update)
+    }
+
+    /// One lot update as [`Interpreter::lot_update_with`] runs it, with
+    /// what it did whether or not it failed: on an error the update holds
+    /// what came before it, such as, in play mode, the errors caught in
+    /// the objects' ticks, and the sounds.
+    pub fn lot_update_kept(
+        &self,
+        world: &mut World,
+        tuning: &Tuning,
+        player: &mut dyn Player,
+        play: Option<&mut Play>,
+    ) -> (Update, Result<(), TickError>) {
         let mut update = Update::default();
         // In play mode the deletions are noted, so that an object reset
         // and a later one given its ID are told apart (Interpreter::recover).
@@ -340,15 +376,30 @@ impl Interpreter<'_> {
             },
             ..*self
         };
+        let result = this.run_update(world, tuning, player, play, &deleted, &mut update);
+        update.sounds = sink.into_inner();
+        (update, result)
+    }
+
+    /// The lot update's work, for [`Interpreter::lot_update_kept`].
+    fn run_update(
+        &self,
+        world: &mut World,
+        tuning: &Tuning,
+        player: &mut dyn Player,
+        play: Option<&mut Play>,
+        deleted: &RefCell<Vec<u16>>,
+        update: &mut Update,
+    ) -> Result<(), TickError> {
         let mut play = play;
         let lot = Interpreter {
             stream: Stream::Lot,
-            ..this
+            ..*self
         };
-        update.full = lot.pass(world, tuning, &mut update, play.as_deref_mut())?;
+        update.full = lot.pass(world, tuning, update, play.as_deref_mut())?;
         let game = Interpreter {
             stream: Stream::Global,
-            ..this
+            ..*self
         };
         let mut signal = None;
         let mut hour_turned = false;
@@ -374,7 +425,7 @@ impl Interpreter<'_> {
                 }
             }
         }
-        game.end_of_update(world, !update.full, player, &mut update)?;
+        game.end_of_update(world, !update.full, player, update)?;
         if let Some(play) = play {
             for gone in deleted.take() {
                 play.fresh.remove(&gone);
@@ -406,8 +457,7 @@ impl Interpreter<'_> {
                 world.mark_all_rooms();
             }
         }
-        update.sounds = sink.into_inner();
-        Ok(update)
+        Ok(())
     }
 
     /// The scheduler's pass over the objects (0x46d553). Returns whether

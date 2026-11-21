@@ -86,7 +86,7 @@ pub use program::{
 };
 pub use selection::selected;
 pub use sounds::SoundEvent;
-pub use tick::{Answer, Answers, Player, Shown, TICK_BUDGET, TickError, Update};
+pub use tick::{Answer, Answers, Player, Shown, SkippedFrame, TICK_BUDGET, TickError, Update};
 pub use visits::Visited;
 
 pub type Result<T> = std::result::Result<T, Error>;

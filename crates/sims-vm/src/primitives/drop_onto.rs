@@ -82,9 +82,9 @@ impl Machine<'_, '_> {
             .ok_or(Trap::native(10, "missing object"))?
             .position;
         let interpreter = self.interpreter();
-        let unsupported = |fault| {
-            Trap::Unsupported(format!(
-                "Drop Onto of object {held} by object {me} into object {target}: {fault}"
+        let unsupported = |fault: crate::fault::Fault| {
+            fault.unsupported_in(format!(
+                "Drop Onto of object {held} by object {me} into object {target}"
             ))
         };
         if !interpreter
