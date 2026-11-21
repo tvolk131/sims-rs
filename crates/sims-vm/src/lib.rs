@@ -49,11 +49,13 @@ mod head;
 mod interpreter;
 mod load;
 mod memory;
+pub mod neighborhood_open;
 mod object_uses;
 mod objects;
 pub mod orders;
 mod people;
 mod person_factory;
+mod pick;
 mod placement;
 pub mod play;
 mod primitives;
@@ -75,7 +77,7 @@ pub use frame::PanelMode;
 pub use interpreter::{Asked, Interpreter, MAX_STACK, Status, Stream};
 pub use load::{INDICATORS, Reconciled, Roomed};
 pub use memory::scope_name;
-pub use objects::SavedRead;
+pub use objects::{READ_BEFORE_THE_FIRST_LOAD, SavedRead, read_before_the_first_load};
 pub use people::{curve_table, persistent_fields, reload_profile};
 pub use primitives::primitive_name;
 pub use program::{
@@ -84,7 +86,7 @@ pub use program::{
 };
 pub use selection::selected;
 pub use sounds::SoundEvent;
-pub use tick::{Answers, Player, Shown, TICK_BUDGET, TickError, Update};
+pub use tick::{Answer, Answers, Player, Shown, SkippedFrame, TICK_BUDGET, TickError, Update};
 pub use visits::Visited;
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -6,6 +6,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
+from xml.parsers import expat
 
 
 POLICY_PATH = ".github/repository-policy.json"
@@ -55,6 +56,82 @@ FORBIDDEN_SUFFIXES = {
     ".jsonl", ".mp4", ".ogg", ".otf", ".pdf", ".png", ".qcow2",
     ".ttf", ".vdi", ".webm", ".webp",
 }
+# Screenshots and other pictures never go in the repository: the screenshot
+# ratchet keeps its references, and its difference images, under cache/.
+# Image formats by name, and by their first bytes whatever the name (an
+# ASCII PPM or an SVG is text, so the binary check alone would not catch
+# it). A netpbm header may put a comment, ended by a line feed or a
+# carriage return, between any two fields; an SVG is found by its root
+# element's local name, whatever its namespace prefix.
+IMAGE_SUFFIXES = {
+    ".avif", ".bmp", ".dds", ".exr", ".gif", ".heic", ".heif", ".ico", ".jpeg",
+    ".jpg", ".jxl", ".pam", ".pbm", ".pgm", ".png", ".pnm", ".ppm", ".psd",
+    ".qoi", ".svg", ".svgz", ".tga", ".tif", ".tiff", ".webp", ".xcf",
+}
+NETPBM_GAP = rb"(?:\s|#[^\r\n]*(?:\r\n|\r|\n|\Z))+"
+IMAGE_MAGIC = re.compile(
+    rb"\A(?:\x89PNG\r\n\x1a\n|GIF8[79]a|\xff\xd8\xff"
+    rb"|P[1-6]" + NETPBM_GAP + rb"\d+" + NETPBM_GAP + rb"\d+"
+    rb"|P7" + NETPBM_GAP + rb"(?:WIDTH|HEIGHT|DEPTH|MAXVAL|TUPLTYPE|ENDHDR)"
+    rb"|II\*\0|MM\0\*|qoif|RIFF....WEBP|8BPS|gimp xcf)",
+    re.DOTALL,
+)
+# Longest first: the UTF-32 little-endian mark starts with UTF-16's.
+BYTE_ORDER_MARKS = (
+    (b"\xff\xfe\x00\x00", "utf-32-le"),
+    (b"\x00\x00\xfe\xff", "utf-32-be"),
+    (b"\xef\xbb\xbf", "utf-8"),
+    (b"\xff\xfe", "utf-16-le"),
+    (b"\xfe\xff", "utf-16-be"),
+)
+
+
+class _RootFound(Exception):
+    pass
+
+
+def is_svg(content):
+    """Whether `content` is an XML document whose root element's local name
+    is `svg`, under any namespace prefix. It is read twice, and either
+    reading that finds an `svg` root counts: as bytes, by the encoding the
+    document declares (so a Latin-1 name is read as Latin-1), and as text
+    decoded by its byte order mark or else as UTF-8 with bad bytes replaced
+    (so a declaration expat cannot read, such as Shift_JIS, is ignored).
+    Expat reads the prolog (the XML declaration, comments, processing
+    instructions and a document type with its internal subset, quoted `]>`
+    included) and stops at the first start element. It loads no external
+    entity or external DTD subset."""
+    for mark, encoding in BYTE_ORDER_MARKS:
+        if content.startswith(mark):
+            text = content[len(mark):].decode(encoding, errors="replace")
+            break
+    else:
+        text = content.decode("utf-8", errors="replace")
+    # A browser shows an SVG with white space before its declaration, which
+    # expat refuses.
+    raw = content[3:] if content.startswith(b"\xef\xbb\xbf") else content
+    return svg_root(raw.lstrip(b" \t\r\n")) or svg_root(text.lstrip(" \t\r\n"))
+
+
+def svg_root(document):
+    """Whether expat finds an `svg` root in `document` (bytes or text)."""
+    parser = expat.ParserCreate()
+    parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
+    parser.ExternalEntityRefHandler = lambda *_: 1
+
+    def start(name, _attributes):
+        raise _RootFound(name)
+
+    parser.StartElementHandler = start
+    try:
+        parser.Parse(document, True)
+    except _RootFound as root:
+        return root.args[0].split(":")[-1].lower() == "svg"
+    except (expat.ExpatError, ValueError, UnicodeError, LookupError):
+        return False
+    return False
+
+
 HEX_RUN = re.compile(rb"(?<![0-9a-fA-F])[0-9a-fA-F]{16,}(?![0-9a-fA-F])")
 BYTE_ARRAY = re.compile(rb"\[\s*(?:0x[0-9a-fA-F]{1,2}|\d{1,3})(?:\s*,\s*(?:0x[0-9a-fA-F]{1,2}|\d{1,3})){2,}\s*,?\s*\]")
 HEX_STRING = re.compile(rb'''["']([0-9a-fA-F]{2,})["']''')
@@ -80,6 +157,8 @@ def git(root, *arguments, input_bytes=None):
 
 def path_violation(name):
     path = PurePosixPath(name.lower())
+    if path.suffix in IMAGE_SUFFIXES:
+        return "image file (screenshots stay under cache/)"
     if path.parts[0] in PRIVATE_ROOTS or PRIVATE_COMPONENTS.intersection(path.parts):
         return "local/private directory"
     if path.parts[:2] == ("fixtures", "private"):
@@ -169,6 +248,8 @@ def check_blob(root, policy, name, content, object_id=None, history=False):
             content.decode("utf-8")
         except UnicodeDecodeError:
             violations.append(f"{name}: non-UTF-8 binary content is not admitted by the source-only policy")
+    if IMAGE_MAGIC.match(content) or is_svg(content):
+        violations.append(f"{name}: image content (screenshots stay under cache/)")
     if PurePosixPath(name).suffix.lower() == ".json" and name != POLICY_PATH:
         # In the tree being published, a review names the exact path. In
         # history, provenance follows the bytes: a reviewed file that was

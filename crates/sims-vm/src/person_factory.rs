@@ -24,6 +24,9 @@
 //! 5. The construction reset (0x4598e8 with 1), in [`construction_reset`].
 //! 6. Data word 41 takes the definition's price, and the scheduler's
 //!    ready flag is set (0x4457ef).
+//! 7. The factory announces the new object (signal 0xe2, 0x440ed7), and
+//!    for a person the lot works out again who is a visitor (0x4163f7,
+//!    0x42a2b4; [`Interpreter::visitor_pass`]).
 //!
 //! Ported from the old prototype's `PostConstruction`, `ConstructionReset`,
 //! `InitialReset`, `default_traits` and `attach_person_neighbor`
@@ -44,6 +47,7 @@
 //! tables the first person made reads once (string tables 0x1f6 and
 //! 0x1f8); the motive curves (0x459d23); and object flag 0x80.
 
+use crate::Program;
 use crate::factory::word;
 use crate::fault::{Fault, Trap};
 use crate::interpreter::Interpreter;
@@ -61,7 +65,8 @@ mod person {
     /// 0x7ae means: do not attach to the neighborhood record again.
     pub const NO_ATTACH: usize = 25;
     /// 0 for a member of the household that lives on the lot; 1 for a
-    /// visitor; 2 kept as it is on a lot that is not residential.
+    /// visitor; 2 kept as it is by the visitor pass, unless the person is
+    /// a member of the family.
     pub const VISITOR: usize = 32;
 }
 
@@ -83,7 +88,8 @@ fn interests_low(data: &[i16]) -> bool {
 impl Interpreter<'_> {
     /// Makes a person of the type `guid` names and returns its ID. Its
     /// Init has run twice and its first update once when this returns; it
-    /// is off the lot.
+    /// is off the lot, and every person's word 32 has been worked out
+    /// again (the visitor pass, 0x42a2b4).
     ///
     /// These fail: a type that is not a person's; a pet the game does not
     /// allow (step 1); a type with no skeleton or profile in
@@ -154,7 +160,34 @@ impl Interpreter<'_> {
             .ok_or_else(|| fail(id, Trap::Invalid("the new person was deleted".into())))?;
         object.data[41] = words[word::PRICE];
         object.set_flags(1, true);
+        // The factory's end announces the new object (signal 0xe2,
+        // 0x440ed7), and the lot's handler works out again who is a
+        // visitor when it is a person (0x4163f7).
+        self.visitor_pass(world).map_err(|trap| fail(id, trap))?;
         Ok(id)
+    }
+
+    /// Whether the lot is residential (0x40745f): its zoning (0x42b9e3,
+    /// by the lot number in global 10) is 1. Lot 0 has zoning 1.
+    fn residential(&self, world: &World) -> bool {
+        residential(self.program, world)
+    }
+
+    /// The visitor pass (0x42a2b4), which the lot runs when the factory
+    /// announces a new person (signal 0xe2, 0x440ed7, handled at
+    /// 0x4163f7): every person's word 32 is worked out again
+    /// ([`sims_sim::load::visitor_again`]), the new one's too.
+    ///
+    /// The family is the selected one (game +0x10), whose members the
+    /// pass tests (0x41019b); it is taken to be the family global 9 names,
+    /// as for scope 24 field 1. With global 9 at 0 the World does not say
+    /// which family the game holds, so that fails loudly, as does a
+    /// global 9 that names no family. With no person in the person vector
+    /// the pass returns before it reads the family (0x42a2cc), so nothing
+    /// fails. The lot is residential when global 10 is 0 or a house zoned
+    /// 1 (0x40745f, 0x42b9e3).
+    pub(crate) fn visitor_pass(&self, world: &mut World) -> Result<(), Trap> {
+        visitor_pass(self.program, world)
     }
 
     /// Gives person `id` default interests and personality (0x459a9c) if
@@ -259,8 +292,7 @@ impl Interpreter<'_> {
                 .map_err(fail)?;
         }
         self.init(world, id)?;
-        let lot = world.globals.get(LOT).copied().unwrap_or(0);
-        let residential = self.program.zoning.get(&lot) == Some(&1);
+        let residential = self.residential(world);
         let person = world
             .objects
             .get_mut(&id)
@@ -294,4 +326,47 @@ impl Interpreter<'_> {
         }
         Ok(())
     }
+}
+
+/// Whether the lot is residential (0x40745f): its zoning (0x42b9e3, by the
+/// lot number in global 10) is 1. Lot 0 has zoning 1.
+fn residential(program: &Program, world: &World) -> bool {
+    let lot = world.globals.get(LOT).copied().unwrap_or(0);
+    lot == 0 || program.zoning.get(&lot) == Some(&1)
+}
+
+/// The visitor pass (0x42a2b4): see [`Interpreter::visitor_pass`].
+pub(crate) fn visitor_pass(program: &Program, world: &mut World) -> Result<(), Trap> {
+    if !world.people.iter().any(|id| world.objects.contains_key(id)) {
+        return Ok(());
+    }
+    let family = i32::from(world.globals.get(9).copied().unwrap_or(0));
+    if family == 0 {
+        return Err(Trap::Unsupported(
+            "0x42a2b4: the visitor pass with global 9 at 0: which family the game holds \
+             (game +0x10) is not kept"
+                .into(),
+        ));
+    }
+    let members = world
+        .families
+        .iter()
+        .find(|f| f.id == family)
+        .map(|f| f.members.clone())
+        .ok_or_else(|| Trap::Invalid(format!("global 9 names family {family}, which is gone")))?;
+    let residential = residential(program, world);
+    for id in world.people.clone() {
+        let Some(object) = world.objects.get_mut(&id) else {
+            continue;
+        };
+        let member = members.contains(&object.guid);
+        if let Some(word) = object
+            .person
+            .as_mut()
+            .and_then(|p| p.data.get_mut(person::VISITOR))
+        {
+            *word = sims_sim::load::visitor_again(*word, member, residential);
+        }
+    }
+    Ok(())
 }

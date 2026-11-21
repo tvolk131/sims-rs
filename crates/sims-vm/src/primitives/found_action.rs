@@ -78,6 +78,7 @@ impl Machine<'_, '_> {
         ))?;
         let constants = self.program.autonomy_constants();
         let action = Interaction {
+            join: 0,
             uid: 0,
             caller: me as i16,
             target: target as i16,

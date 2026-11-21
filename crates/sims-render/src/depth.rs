@@ -13,6 +13,9 @@
 //!   column along it;
 //! - `T`, the sprite bytes: what a sprite pixel's depth byte adds.
 //!
+//! With `C` it keeps its peak, the depth of one tile's diagonal, which
+//! the cut walls' trim adds in steps (see [`Depth::trim`]).
+//!
 //! An object or wall is placed first (0x4c9ceb): its anchor is a screen
 //! row `w9` and a depth `w10` taken from `R` and `H` at its position. Then
 //!
@@ -20,6 +23,8 @@
 //! sprite pixel = w10 + T[byte]                             drawn if <= what is there
 //! wall pixel   = w10 + L[w9 + (8 << zoom) - y] + C[column] drawn if <= what is there + 1
 //! ground tile  = R[top corner row] + H[top corner height]
+//! cut trim     = w10 + L[w9 + (8 << zoom) - y] + layer(byte, column)
+//!                                                          drawn if <= what is there + 1
 //! ```
 //!
 //! The sprite blitter does look `L` up (0x49a5d3), but at the sprite
@@ -70,6 +75,7 @@ pub struct Depth {
     columns: Vec<i32>,
     curve: Vec<i32>,
     bytes: Vec<i32>,
+    peak: i32,
     row_step: f64,
 }
 
@@ -139,6 +145,9 @@ impl Depth {
         // (0x4ca2f8).
         let row_step =
             3f64.sqrt() * f64::from((2f64.sqrt() * 3.0 / f64::from(8 << zoom)) as f32) * 0.5;
+        // C's peak, rounded rather than truncated: the depth owner's word
+        // 18 - zoom, stored as the column table is built (0x4ca10a).
+        let peak = ftol(x + 0.5);
         Self {
             zoom,
             origin_y: camera.origin[1],
@@ -147,6 +156,7 @@ impl Depth {
             columns,
             curve,
             bytes,
+            peak,
             row_step,
         }
     }
@@ -216,10 +226,11 @@ impl Depth {
 
     /// The depth of row `y` of a sprite drawn at one depth a row from the
     /// top row `top` (0x49f2a3), standing at view corner `corner` at
-    /// terrain height `height` on `level`: the trim along wall tops (the
-    /// original's side pieces, 0x53e1f7, read by the old prototype in
-    /// `legacy/.../paint/row/geometry_side.rs`). The rows follow the
-    /// ground table from the sprite's top.
+    /// terrain height `height` on `level`: the trim along standing wall
+    /// tops (the original's side pieces, 0x53e1f7, read by the old
+    /// prototype in `legacy/.../paint/row/geometry_side.rs`). The rows
+    /// follow the ground table from the sprite's top. A cut wall's trim
+    /// has a depth sprite instead ([`Depth::trim`]).
     pub fn flat(&self, corner: [i32; 2], height: i32, level: i32, top: i32, y: i32) -> i32 {
         let at = self.origin_y.saturating_neg();
         let correction = self
@@ -283,6 +294,39 @@ impl Depth {
         (ground + f64::from(LEVEL_DEPTH) * f64::from(level - 1) + height) as f32
     }
 
+    /// Where a pixel of depth `depth` at screen point `at` is, taken as on
+    /// `level` (the house view's point to tile, 0x4a97c3, in its depth
+    /// mode): the inverse of [`Depth::point`] and of the upright table
+    /// `L`, which both make the depth an affine function of the point's
+    /// level-1 ground row and of its height above its level's floor, with
+    /// each level above the first adding its own depth offset. Gives the
+    /// point's fine view position (sixteenths of a tile, unrounded) and
+    /// its height above `level`'s floor at terrain height 0, in pixels of
+    /// this zoom. The original unprojects through its inverse view matrix
+    /// instead; that the two agree to the rounding is **unverified**.
+    pub fn unproject(
+        &self,
+        camera: &Camera,
+        at: [i32; 2],
+        depth: i32,
+        level: i32,
+    ) -> ([f64; 2], f64) {
+        let scale = 65535.0 / f64::from(SCALE);
+        let a = f64::from(SCALE - 12.5) * scale;
+        let b = self.row_step * scale;
+        // A pixel up something upright is this much nearer (L, and H per
+        // terrain step of 2 << zoom pixels).
+        let k = unit() / f64::from(16i32 << self.zoom);
+        let above = f64::from(level - 1);
+        let row = f64::from(at[1] - self.origin_y) + f64::from(self.floor_height) * above;
+        let depth = f64::from(depth) - f64::from(LEVEL_DEPTH) * above;
+        let height = (a - b * row - depth) / (b + k);
+        let ground = row + height;
+        let sum = ground * 16.0 / f64::from(4i32 << self.zoom);
+        let difference = f64::from(at[0] - camera.origin[0]) * 16.0 / f64::from(8i32 << self.zoom);
+        ([(sum + difference) / 2.0, (sum - difference) / 2.0], height)
+    }
+
     /// The depth of a pixel on screen row `y` of something standing
     /// upright at `anchor`, without its own depth bytes or columns: the
     /// anchor's depth plus `L` for the rows `y` stands above the anchor's
@@ -324,6 +368,39 @@ impl Depth {
         } else {
             depth
         }
+    }
+
+    /// The depth of a cut wall's trim pixel on row `y`, `column` columns
+    /// from the trim sprite's left, whose depth sprite holds `byte` there,
+    /// for a trim placed at `anchor` (0x49ecbc, called by 0x4c8b1f).
+    /// None for byte 255, which is not drawn.
+    ///
+    /// The trim stands upright like a wall ([`Depth::stand`]), and its
+    /// depth byte picks one of eight layers (table 0x668440): a ramp along
+    /// the wall columns `C` from one of three starts, or a step of the
+    /// columns' peak or half of it.
+    pub fn trim(&self, anchor: Anchor, y: i32, column: i32, byte: u8) -> Option<i32> {
+        // The original's starts are its column pointer for this zoom
+        // (C plus 16 << zoom entries), less 8 << zoom and less one more.
+        let e = 8i32 << self.zoom;
+        let (start, step) = match byte {
+            0..=62 | 89..=113 => (None, self.peak),
+            63..=88 | 114..=139 => (None, self.peak / 2),
+            140..=190 => (Some(2 * e), 0),
+            191..=215 => (Some(e - 1), self.peak),
+            216..=254 => (Some(e), self.peak),
+            255 => return None,
+        };
+        let ramp = start.map_or(0, |start| {
+            // The original reads past the table's ends without a check.
+            let last = self.columns.len() as i32 - 1;
+            self.columns[start.saturating_add(column).clamp(0, last) as usize]
+        });
+        Some(
+            self.stand(anchor, y)
+                .saturating_add(ramp)
+                .saturating_add(step),
+        )
     }
 
     /// Where a straight wall's columns start: the rising ramp for a wall
@@ -379,6 +456,32 @@ mod tests {
         assert_eq!(&n.lookup[..6], &[296, 228, 224, 220, 217, 213]);
         assert_eq!(m.height(6), -346);
         assert_eq!(m.height(116), -6703);
+        // C's peak, as the owner's word 18 - zoom holds it.
+        assert_eq!([d.peak, m.peak, n.peak], [462; 3]);
+    }
+
+    #[test]
+    fn a_cut_trims_depth_byte_picks_a_layer() {
+        let m = Depth::new(&camera(Zoom::Medium, [335, -560]));
+        let a = m.anchor(240, 6.0, 1);
+        let stand = m.stand(a, 230);
+        let at = |column, byte| m.trim(a, 230, column, byte).map(|d| d - stand);
+        // Steps: the peak or half of it, the same in every column.
+        for column in [0, 17, 63] {
+            assert_eq!(at(column, 0), Some(462));
+            assert_eq!(at(column, 70), Some(231));
+            assert_eq!(at(column, 100), Some(462));
+            assert_eq!(at(column, 120), Some(231));
+        }
+        // Ramps: rising to the peak half a tile in (32 columns at medium
+        // zoom), or falling from it with the peak added; 191 to 215 starts
+        // a column earlier than 216 and up.
+        assert_eq!([at(0, 150), at(32, 180)], [Some(0), Some(462)]);
+        assert_eq!([at(0, 230), at(32, 230)], [Some(462 + 462), Some(462)]);
+        assert_eq!(at(1, 200), at(0, 230));
+        assert_eq!(at(5, 255), None);
+        // Columns past the table's end hold to its last entry.
+        assert_eq!(at(i32::MAX, 150), at(1000, 150));
     }
 
     #[test]
@@ -416,6 +519,36 @@ mod tests {
                                 "{zoom:?} {origin:?} level {level} ({x}, {y}) {steps}: {p} vs {}",
                                 a.depth
                             );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unprojecting_a_point_gives_back_its_position_and_height() {
+        for zoom in Zoom::ALL {
+            for origin in [[0, 0], [37, -411], [-120, 260]] {
+                let c = camera(zoom, origin);
+                let m = Depth::new(&c);
+                let near = zoom.near_scale();
+                for level in 1..=3 {
+                    for (x, y) in [(0, 0), (64, 32), (300, 500), (512, 512), (1020, 4)] {
+                        for steps in [0, 1, 3, 10] {
+                            let elevation = steps * 16;
+                            let at = c.project_fine([x, y], level, elevation);
+                            let depth = m.point([x as f32, y as f32], elevation as f32, level);
+                            let (fine, height) = m.unproject(&c, at, depth.round() as i32, level);
+                            let case =
+                                format!("{zoom:?} {origin:?} level {level} ({x}, {y}) {steps}");
+                            assert!(
+                                (fine[0] - f64::from(x)).abs() < 0.5
+                                    && (fine[1] - f64::from(y)).abs() < 0.5,
+                                "{case}: {fine:?}"
+                            );
+                            let rise = f64::from(elevation / near);
+                            assert!((height - rise).abs() < 0.5, "{case}: {height} vs {rise}");
                         }
                     }
                 }

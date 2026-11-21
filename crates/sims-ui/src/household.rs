@@ -416,6 +416,13 @@ impl Snapshot {
         self
     }
 
+    /// The selected Sim, if one of the household's: what the live panel
+    /// counts as someone selected (the original's +0xe8, the selected
+    /// Sim's place among the members, set by 0x51c5b0).
+    pub fn selected_resident(&self) -> Option<&Resident> {
+        self.selected.and_then(|s| self.resident(s))
+    }
+
     pub fn resident(&self, object: u16) -> Option<&Resident> {
         self.residents.iter().find(|r| r.object == object)
     }
@@ -928,6 +935,7 @@ mod tests {
         // record's: give person 300 a family on the lot.
         use sims_formats::saved_objects::{Interaction, Person};
         let idle = Interaction {
+            join: 0,
             uid: 0,
             caller: 0,
             target: 0,

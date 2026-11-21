@@ -424,19 +424,39 @@ fn the_lot_hides_the_people_behind_it() {
                     let report = people.draw_on_lot(&solo, &camera, &mut on);
                     assert!(report.problems.is_empty(), "{:?}", report.problems);
                     // Drawn again, noting apart from the IDs which pixels
-                    // the canvas took: those name the person, and every
-                    // other pixel names what it named before.
-                    let mut noted = Taken {
-                        canvas: base.clone(),
-                        taken: vec![false; base.width * base.height],
-                    };
+                    // the canvas took: those name the person, or the
+                    // plumb bob they hold where the bob's own draw took
+                    // them, and every other pixel names what it named
+                    // before. Which pixels are the bob's is told by a
+                    // draw without it: a pixel the body took there, with
+                    // the same colour, is the body's.
+                    let bob = sims_people::bob::held_by(&solo, id);
                     let depth = sims_render::depth::Depth::new(&camera);
-                    people.draw(&solo, &camera, &mut noted, |f, e, l| depth.point(f, e, l));
+                    let mut note = |world: &World| {
+                        let mut noted = Taken {
+                            canvas: base.clone(),
+                            taken: vec![false; base.width * base.height],
+                        };
+                        people.draw(world, &camera, &mut noted, |f, e, l| depth.point(f, e, l));
+                        noted
+                    };
+                    let noted = note(&solo);
                     assert_eq!(noted.canvas, on);
+                    let mut bobless = solo.clone();
+                    if bob.is_some() {
+                        bobless.objects.get_mut(&id).unwrap().slots[2].object = 0;
+                    }
+                    let body = note(&bobless);
                     for (x, y) in pixels(&on) {
                         let i = y as usize * on.width + x as usize;
                         let expected = if noted.taken[i] {
-                            Some(id)
+                            // The body's pixel if the bob-less draw gave it
+                            // the same colour, else the bob's. A bob pixel
+                            // drawn over the body in the body's very colour
+                            // cannot be told apart this way (none in this
+                            // fixture).
+                            let bodys = body.taken[i] && body.canvas.color[i] == on.color[i];
+                            if bodys { Some(id) } else { bob.or(Some(id)) }
                         } else {
                             assert_eq!(on.color[i], base.color[i], "{x}, {y}");
                             base.id_at(x, y)
@@ -622,8 +642,8 @@ fn the_plumb_bob_floats_over_the_selected_persons_head() {
         g.iter().sum::<u32>() / g.len() as u32
     };
     assert!(mean(&|x| x < middle) > mean(&|x| x > middle));
-    // Its pixels name Mortimer.
-    assert!(found.iter().all(|&(x, y)| canvas.id_at(x, y) == Some(21)));
+    // Its pixels name the bob, not Mortimer.
+    assert!(found.iter().all(|&(x, y)| canvas.id_at(x, y) == Some(383)));
     // Out of the slot, no bob.
     let mut without = world.clone();
     without.objects.get_mut(&21).unwrap().slots[2].object = 0;
@@ -739,4 +759,246 @@ fn the_lamps_of_a_persons_room_light_them() {
             .sum()
     };
     assert!(sum(&lit) > sum(&unlit) + changed.len() as u64 * 6);
+}
+
+/// A Sim on a bench, behind its backrest: in a state where Mortimer
+/// (person 21) reads on the porch bench (174), as in a screenshot of the
+/// original at near zoom (7:12 AM, rotation 2, camera origin (591, −2018),
+/// walls down; our frame aligns with it at offset (0, 0)), the backrest's
+/// soft top edge blends over his coat, because the original draws the
+/// bench after its people (0x4aacb9, 0x4aa1d7). Drawn into the lot under
+/// him, the edge blends over the floor. The original shows (32, 16, 8)
+/// and (65, 32, 8) at the two pixels compared, in 16-bit colour; each
+/// check allows 12 per channel.
+#[test]
+fn a_bench_in_use_draws_after_the_sim_on_it() {
+    let Some(root) = install() else { return };
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut opened = sims_render::open_house(&root, &house).unwrap();
+    let mut lot = Lot::load(&root, &house, &[3, 3], Frames::default()).unwrap();
+    lot.wait_for_answers();
+    let mut people = People::open(&root, &house).unwrap();
+    while lot.ticks() < 1260 {
+        lot.step().unwrap();
+    }
+    let world = lot.world();
+    // Both porch benches hold someone, and Mortimer holds the plumb bob.
+    // Object 67, next to person 18 on their tile, is not held.
+    assert_eq!(
+        sims_render::holds_person(world),
+        [173, 174, 383].into_iter().collect()
+    );
+    assert_eq!(people.update(world), Vec::<String>::new());
+    let camera = LotCamera {
+        zoom: Zoom::Near,
+        rotation: 2,
+        level: 1,
+        origin: [591, -2018],
+        walls: Walls::Down,
+        focus: Default::default(),
+    };
+    let shape = sims_render::Lot::from_world(world).unwrap();
+    let mut frame = |passes: bool| {
+        let mut canvas = sims_render::Canvas::new(800, 600, [0, 0, 0]);
+        if passes {
+            sims_render::draw_lot(world, &shape, &mut opened.assets, &camera, &mut canvas);
+        } else {
+            sims_render::draw(world, &shape, &mut opened.assets, &camera, &mut canvas);
+        }
+        let drawn = people.draw_on_lot(world, &camera, &mut canvas);
+        assert!(drawn.problems.is_empty(), "{:?}", drawn.problems);
+        if passes {
+            sims_render::draw_held(world, &shape, &mut opened.assets, &camera, &mut canvas);
+        }
+        canvas
+    };
+    let [after, under] = [frame(true), frame(false)];
+    for ([x, y], original) in [([385, 311], [32, 16, 8]), ([405, 305], [65, 32, 8])] {
+        let at = |c: &sims_render::Canvas| c.rgb565()[y * 800 + x];
+        let near = |c: [u8; 3]| c.iter().zip(original).all(|(&a, b)| a.abs_diff(b) <= 12);
+        assert!(near(at(&after)), "({x}, {y}): {:?}", at(&after));
+        assert!(!near(at(&under)), "({x}, {y}): {:?}", at(&under));
+    }
+}
+
+/// Mortimer standing without his book, at tick 2854, against the live
+/// original at 8:05 AM (near zoom, rotation 2, walls down, scroll
+/// (280, −2004), which is camera origin (279, −2004) here). He has put
+/// the book back and stands by the stairs. The original's animator for
+/// person 21 then held, read from its memory:
+///
+/// - the foreground layer (+0xc) at phase 0.5004169 (+0x28), clip time
+///   599 ms (+0x30), duration 1199 ms (+0x20), speed 1 (+0x24) and
+///   weight 1 (+0x2c): here `a2o-idle-neutral-trans-stand-Mstand`;
+/// - the base layer (+0x14) at phase 0.4792362, clip time 957 ms,
+///   duration 1999 ms, speed 1 and weight 1: here `a2o-standing-loop`;
+/// - no carry layer (+0x13c);
+/// - the head (+0x210 to +0x218) at heading 0.5969, target heading
+///   5.896 (both read to four digits) and turn 0, with person data word
+///   42 at 8 (not following).
+///
+/// The five pixels are inside his outline (the face twice, the hair, the
+/// trousers, a shoe). Each is his in our frame (the canvas names person
+/// 21 there). The original's colours are in 16-bit colour; each check
+/// allows 12 per channel. The control frame is the same lot and held
+/// objects without the people pass, which must not already match.
+///
+/// The same `People` follows the lot every tick: while Mortimer carries
+/// his book its mesh is in his rendered body, and at 8:05 it is not.
+///
+/// His outline is checked only at eight edge points where both pictures
+/// put it on the same pixel: elsewhere ours fits the original best moved
+/// half a pixel right and down; see the decision.
+#[test]
+fn mortimer_stands_without_his_book_as_the_original_draws_him() {
+    let Some(root) = install() else { return };
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut opened = sims_render::open_house(&root, &house).unwrap();
+    let mut lot = Lot::load(&root, &house, &[3, 3], Frames::default()).unwrap();
+    lot.wait_for_answers();
+    let mut people = People::open(&root, &house).unwrap();
+    // The parts of Mortimer's rendered body, by appearance name.
+    let drawn_parts = |people: &mut People, world: &World| -> Vec<String> {
+        let (posed, problems) = people.posed(world, 1);
+        assert!(problems.is_empty(), "{problems:?}");
+        let mortimer = posed
+            .iter()
+            .find(|p| p.id == 21)
+            .expect("Mortimer is posed");
+        mortimer
+            .body
+            .parts
+            .iter()
+            .map(|p| p.appearance.clone())
+            .collect()
+    };
+    // The same `People` follows the lot every tick, so the body drawn at
+    // the end is the one left after the book is put back.
+    let mut book: Option<Vec<String>> = None;
+    while lot.ticks() < 2854 {
+        lot.step().unwrap();
+        let world = lot.world();
+        assert_eq!(people.update(world), Vec::<String>::new());
+        let held: Vec<String> = world.objects[&21]
+            .person
+            .as_ref()
+            .unwrap()
+            .accessories
+            .iter()
+            .map(|a| a.name.clone())
+            .collect();
+        if book.is_none() && !held.is_empty() {
+            let parts = drawn_parts(&mut people, world);
+            for name in &held {
+                assert!(parts.contains(name), "{name} is drawn: {parts:?}");
+            }
+            book = Some(held);
+        }
+    }
+    let held = book.expect("Mortimer carries his book before 8:05");
+    assert!(held.iter().any(|n| n.contains("book")), "{held:?}");
+    let world = lot.world();
+    let parts = drawn_parts(&mut people, world);
+    for name in &held {
+        assert!(!parts.contains(name), "{name} is still drawn: {parts:?}");
+    }
+    assert!(!parts.iter().any(|p| p.contains("book")), "{parts:?}");
+    let mortimer = world.objects[&21].person.as_ref().unwrap();
+    let carried: Vec<&str> = mortimer
+        .accessories
+        .iter()
+        .map(|a| a.name.as_str())
+        .collect();
+    assert_eq!(carried, Vec::<&str>::new(), "the book is put away");
+    let animator = &world.animators[&21];
+    let layers = [
+        (
+            animator.foreground.as_ref().unwrap(),
+            "a2o-idle-neutral-trans-stand-Mstand",
+            0.500_416_9,
+            599,
+            1199.0,
+        ),
+        (
+            &world.base_layers[&21],
+            "a2o-standing-loop",
+            0.479_236_2,
+            957,
+            1999.0,
+        ),
+    ];
+    for (layer, clip, phase, time, duration) in layers {
+        assert_eq!(layer.clip, clip);
+        assert!(
+            (layer.phase.to_f32() - phase).abs() < 1e-6,
+            "{clip}: {:?}",
+            layer.phase
+        );
+        assert_eq!(layer.event_time, time, "{clip}");
+        assert_eq!(layer.duration.to_f32(), duration, "{clip}");
+        assert_eq!(layer.speed.to_f32(), 1.0, "{clip}");
+        assert_eq!(layer.weight.to_f32(), 1.0, "{clip}");
+    }
+    assert!(animator.carry.is_none());
+    assert_eq!(animator.head.turn.to_f32(), 0.0);
+    assert!((animator.head.heading.to_f32() - 0.5969).abs() < 5e-5);
+    assert!((animator.head.target_heading.to_f32() - 5.896).abs() < 5e-4);
+    assert_eq!(mortimer.data[42], 8);
+
+    let camera = LotCamera {
+        zoom: Zoom::Near,
+        rotation: 2,
+        level: 1,
+        origin: [279, -2004],
+        walls: Walls::Down,
+        focus: Default::default(),
+    };
+    let shape = sims_render::Lot::from_world(world).unwrap();
+    let mut canvas = sims_render::Canvas::new(800, 600, [0, 0, 0]);
+    sims_render::draw_lot(world, &shape, &mut opened.assets, &camera, &mut canvas);
+    let mut lot_only = canvas.clone();
+    let drawn = people.draw_on_lot(world, &camera, &mut canvas);
+    assert!(drawn.problems.is_empty(), "{:?}", drawn.problems);
+    for c in [&mut canvas, &mut lot_only] {
+        sims_render::draw_held(world, &shape, &mut opened.assets, &camera, c);
+    }
+    let pixels = [
+        ([446, 240], [189, 133, 106]),
+        ([435, 255], [213, 153, 123]),
+        ([435, 244], [8, 8, 8]),
+        ([442, 360], [41, 44, 57]),
+        ([446, 382], [16, 16, 16]),
+    ];
+    for ([x, y], original) in pixels {
+        let at = |c: &sims_render::Canvas| c.rgb565()[y * 800 + x];
+        let near = |c: [u8; 3]| c.iter().zip(original).all(|(&a, b)| a.abs_diff(b) <= 12);
+        assert_eq!(canvas.id_at(x as i32, y as i32), Some(21), "({x}, {y})");
+        assert!(near(at(&canvas)), "({x}, {y}): {:?}", at(&canvas));
+        assert!(
+            !near(at(&lot_only)),
+            "({x}, {y}) is the lot's: {:?}",
+            at(&lot_only)
+        );
+    }
+    // His outline at points where it lands on the same pixel in both
+    // pictures despite the half-pixel offset: for each, the pixel inside
+    // and its neighbour outside (top of the head twice, the shoes' soles,
+    // the left edge at the hair and the trousers, the right edge at the
+    // face and the trousers). In the original the inside pixel differs
+    // from the people-free render by 34 or more in some channel and the
+    // outside one by at most 1. A one-pixel move either way breaks some.
+    let edges = [
+        ([434, 233], [434, 232]),
+        ([447, 237], [447, 236]),
+        ([437, 384], [437, 385]),
+        ([446, 385], [446, 386]),
+        ([431, 268], [430, 268]),
+        ([434, 360], [433, 360]),
+        ([450, 247], [451, 247]),
+        ([447, 352], [448, 352]),
+    ];
+    for ([x, y], [ox, oy]) in edges {
+        assert_eq!(canvas.id_at(x, y), Some(21), "({x}, {y}) is his");
+        assert_ne!(canvas.id_at(ox, oy), Some(21), "({ox}, {oy}) is not his");
+    }
 }

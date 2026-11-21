@@ -57,6 +57,7 @@ mod person {
 /// target, menu entry -1, everything else zero.
 pub(crate) fn no_action() -> Interaction {
     Interaction {
+        join: 0,
         uid: 0,
         caller: 0,
         target: 0,

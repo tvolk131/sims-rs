@@ -43,7 +43,9 @@ pub struct Stats {
     pub missing_objects: usize,
 }
 
-/// Draws the lot as the camera sees it. `world` is only read.
+/// Draws the lot as the camera sees it, every object included. `world`
+/// is only read. A frame with people in it draws in three passes instead:
+/// [`draw_lot`], the people, then [`draw_held`].
 pub fn draw(
     world: &World,
     lot: &Lot,
@@ -51,37 +53,172 @@ pub fn draw(
     camera: &Camera,
     canvas: &mut Canvas,
 ) -> Stats {
+    paint(world, lot, assets, camera, canvas, Pass::All)
+}
+
+/// Draws the lot as [`draw`] does, but leaves out the objects that hold a
+/// person ([`holds_person`]): the original draws those each frame after
+/// its people, not into the lot's picture under them (0x4aacb9).
+pub fn draw_lot(
+    world: &World,
+    lot: &Lot,
+    assets: &mut Assets,
+    camera: &Camera,
+    canvas: &mut Canvas,
+) -> Stats {
+    paint(world, lot, assets, camera, canvas, Pass::Lot)
+}
+
+/// Draws the objects [`draw_lot`] left out, over a canvas that holds the
+/// lot and then the people, each pixel tested against the depth there:
+/// the original's per-frame pass draws its moving objects after its
+/// people (0x4a9458, then 0x4aa1d7 from 0x4a94ab). So an in-use bench's
+/// backrest in front of the Sim on it covers the Sim, and its soft top
+/// edge blends over the Sim's clothes, not over the floor behind.
+pub fn draw_held(
+    world: &World,
+    lot: &Lot,
+    assets: &mut Assets,
+    camera: &Camera,
+    canvas: &mut Canvas,
+) -> Stats {
+    let mut painter = Painter::new(world, lot, assets, camera, canvas, Pass::Held);
+    let top = camera.level.clamp(1, 2);
+    for level in 1..=top {
+        let cut = cut(lot, camera, level, top);
+        painter.objects(level, &cut);
+    }
+    painter.stats
+}
+
+/// Which objects a pass draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    /// Every object, in the lot's own pass.
+    All,
+    /// The objects that hold no person.
+    Lot,
+    /// The objects that hold a person, after the people.
+    Held,
+}
+
+fn paint(
+    world: &World,
+    lot: &Lot,
+    assets: &mut Assets,
+    camera: &Camera,
+    canvas: &mut Canvas,
+    pass: Pass,
+) -> Stats {
     canvas.clear(BACKGROUND);
-    let mut painter = Painter {
-        world,
-        lot,
-        camera,
-        assets,
-        canvas,
-        grass: Grass::new(lot, camera),
-        depth: Depth::new(camera),
-        stats: Stats::default(),
-    };
+    let mut painter = Painter::new(world, lot, assets, camera, canvas, pass);
     let top = camera.level.clamp(1, 2);
     for level in 1..=top {
         painter.floors(level);
-        // Only the top floor shown is cut away; the floors below it stand
-        // (0x4a8895, the old prototype's `wall_view.rs`).
-        let cut = if level < top {
-            Cut::None
-        } else {
-            match camera.walls {
-                Walls::Up => Cut::None,
-                Walls::Down => Cut::All,
-                Walls::Cutaway => Cut::Mask(Box::new(Mask::new(lot, camera))),
-            }
-        };
+        let cut = cut(lot, camera, level, top);
         let corners = painter.corners(level, &cut);
         painter.walls(level, &cut, &corners);
         painter.trims(level, &corners);
         painter.objects(level, &cut);
     }
     painter.stats
+}
+
+/// How a level's walls are cut. Only the top floor shown is cut away; the
+/// floors below it stand (0x4a8895, the old prototype's `wall_view.rs`).
+fn cut(lot: &Lot, camera: &Camera, level: i32, top: i32) -> Cut {
+    if level < top {
+        Cut::None
+    } else {
+        match camera.walls {
+            Walls::Up => Cut::None,
+            Walls::Down => Cut::All,
+            Walls::Cutaway => Cut::Mask(Box::new(Mask::new(lot, camera))),
+        }
+    }
+}
+
+/// The objects that hold a person, directly or through other objects, and
+/// everything else in the same holder's tree: the original marks them
+/// moving as a person in the tree animates. The person's animation code
+/// (0x5859fa, 0x585b80, 0x58da79, 0x58f873, 0x591dfb, each on its own
+/// condition) calls 0x434101, which climbs the holders to the outermost
+/// one (0x4325b5) and marks it and all it holds, at every depth, as moving
+/// (0x434657, recursing through its slots at 0x4347bc). A person's own
+/// time-out is never reached (vtable +0x18 is 0x7fffffff at 0x4226b6).
+/// With the lot paused, the live original still drew the bench Mortimer
+/// sat on in its moving pass every frame. People themselves are not in
+/// the set; they draw in their own pass.
+pub fn holds_person(world: &World) -> BTreeSet<u16> {
+    let people = world
+        .objects
+        .iter()
+        .filter(|(_, o)| o.person.is_some())
+        .map(|(&id, _)| id)
+        .collect();
+    held_trees(&world.objects, &people)
+}
+
+/// [`holds_person`] for `objects`, of which `people` are the people.
+fn held_trees(objects: &BTreeMap<u16, Object>, people: &BTreeSet<u16>) -> BTreeSet<u16> {
+    let word = |id: u16, i: usize| objects.get(&id).and_then(|o| o.data.get(i).copied());
+    let registered = |w: i16| {
+        u16::try_from(w)
+            .ok()
+            .filter(|&id| id != 0 && objects.contains_key(&id))
+    };
+    // An object's holder by its link words, as 0x4325b5 finds it: an
+    // object with slot word 0 follows the one before it on its tile, so
+    // climb those to the first with a slot word; the object before that
+    // one is the holder.
+    let holder = |id: u16| {
+        let mut at = id;
+        let mut seen = BTreeSet::from([id]);
+        while word(at, LINK_SLOT)? == 0 {
+            let before = registered(word(at, BEFORE)?)?;
+            if !seen.insert(before) {
+                return None;
+            }
+            at = before;
+        }
+        registered(word(at, BEFORE)?)
+    };
+    // The outermost holder; for holders that hold each other, the lowest
+    // ID in their loop, the same from wherever the climb starts.
+    let root = |id: u16| {
+        let mut at = id;
+        let mut seen = BTreeSet::from([id]);
+        while let Some(next) = holder(at) {
+            if !seen.insert(next) {
+                let mut lowest = next;
+                let mut on = holder(next);
+                while let Some(o) = on.filter(|&o| o != next) {
+                    lowest = lowest.min(o);
+                    on = holder(o);
+                }
+                return lowest;
+            }
+            at = next;
+        }
+        at
+    };
+    // Each root and all it holds, through the objects in its slots, at
+    // every depth. A saved slot list's first entry is not a slot: it links
+    // to the next object on the tile, so the walk starts at the second, as
+    // 0x434657 does (0x434681). A person who holds things and is held by
+    // nothing is the root of their own tree.
+    let mut tree = BTreeSet::new();
+    let mut stack: Vec<u16> = people.iter().map(|&id| root(id)).collect();
+    while let Some(id) = stack.pop() {
+        if !tree.insert(id) {
+            continue;
+        }
+        if let Some(o) = objects.get(&id) {
+            stack.extend(o.slots.iter().skip(1).filter_map(|s| registered(s.object)));
+        }
+    }
+    tree.retain(|id| !people.contains(id));
+    tree
 }
 
 /// Which walls of a level are cut down, and which objects hide with them.
@@ -220,6 +357,9 @@ fn wall_side(s: &Segment, side: usize) -> [i32; 2] {
 }
 
 struct Painter<'a> {
+    pass: Pass,
+    /// The objects that hold a person, for passes other than `All`.
+    held: BTreeSet<u16>,
     world: &'a World,
     lot: &'a Lot,
     camera: &'a Camera,
@@ -230,7 +370,33 @@ struct Painter<'a> {
     stats: Stats,
 }
 
-impl Painter<'_> {
+impl<'a> Painter<'a> {
+    fn new(
+        world: &'a World,
+        lot: &'a Lot,
+        assets: &'a mut Assets,
+        camera: &'a Camera,
+        canvas: &'a mut Canvas,
+        pass: Pass,
+    ) -> Self {
+        Painter {
+            pass,
+            held: if pass == Pass::All {
+                BTreeSet::new()
+            } else {
+                holds_person(world)
+            },
+            world,
+            lot,
+            camera,
+            assets,
+            canvas,
+            grass: Grass::new(lot, camera),
+            depth: Depth::new(camera),
+            stats: Stats::default(),
+        }
+    }
+
     /// The elevation of a lot corner in near-zoom pixels: 16 per terrain
     /// step.
     fn corner_elevation(&self, [cx, cy]: [i32; 2]) -> i32 {
@@ -246,11 +412,6 @@ impl Painter<'_> {
             _ => 3,
         };
         i32::from(h[corner]) * 16
-    }
-
-    /// The light at a fine position on a level (0 or 1).
-    fn light(&self, level: usize, fine: [i32; 2]) -> Light {
-        Light::from_byte(self.lot.light_at(level, fine))
     }
 
     /// The lamps whose pools reach tile (`x`, `y`) of a level, as view
@@ -271,19 +432,26 @@ impl Painter<'_> {
         })
     }
 
-    /// How a wall face whose seen side has light byte `byte` is lit, pixel
-    /// by pixel: in that light plus the pools of the lamps marked on lot
-    /// tile `seen`, for a straight face along view y (`along_y`) or x;
-    /// `seen` None for a diagonal, which takes no pools (0x4c78c5). A room
-    /// in full light shows no pools (0x4c7c59). See [`crate::pools`],
-    /// "Walls".
+    /// How a wall face whose seen side's room shows light `light` (a
+    /// fraction) is lit, pixel by pixel: in that light, through the
+    /// drawing's light setter (0x4b4525), plus the pools of the lamps
+    /// marked on lot tile `seen`, for a straight face along view y
+    /// (`along_y`) or x; `seen` None for a diagonal, which takes no pools
+    /// (0x4c78c5). The original passes the room's float, not its tile
+    /// byte (0x53ea46, 0x53c9df), so a light just short of 1 is shaded. A
+    /// light in full light shows no pools (0x4c7c59). `light` None draws in
+    /// full light whatever the time of day, as the original's reset to 1
+    /// does (0x4b455f). See [`crate::pools`], "Walls".
     fn wall_light(
         &self,
         level: usize,
-        byte: u8,
+        light: Option<f32>,
         seen: Option<(bool, [i32; 2])>,
     ) -> impl Fn(usize, usize) -> Light + use<> {
-        let pools = Light::drawn_byte(byte)
+        let brightest = self.lot.brightest();
+        let plain = light.map_or(Light::FULL, |light| Light::from_fraction(light, brightest));
+        let pools = light
+            .and_then(|light| Light::drawn_fraction(light, brightest))
             .zip(seen.and_then(|(along_y, tile)| self.wall_pools(level, along_y, tile)));
         let rise = pools::wall_rise(self.camera.zoom.index()) as i64;
         move |x: usize, y: usize| match &pools {
@@ -293,7 +461,7 @@ impl Painter<'_> {
                     .map(|p| u32::from(p.at(x as i64, y as i64 - rise)))
                     .sum::<u32>(),
             ),
-            None => Light::from_byte(byte),
+            None => plain,
         }
     }
 
@@ -418,7 +586,10 @@ impl Painter<'_> {
                     let lamps = self.lamps(index, [x, y]);
                     let depth = &self.depth;
                     let depth = |_, y, _| Some(depth.floor(view, height, level, at[1], y));
-                    match (Light::drawn_byte(byte), self.assets.pools()) {
+                    match (
+                        Light::drawn_byte(byte, self.lot.brightest()),
+                        self.assets.pools(),
+                    ) {
                         // A room in full light shows no pools (0x4c83d4).
                         (Some(base), Some(pools)) if lamps.iter().any(Option::is_some) => {
                             let tile = self.camera.zoom.tile_width();
@@ -433,9 +604,13 @@ impl Painter<'_> {
                             };
                             self.canvas.draw_shaded(&image, at, light, depth);
                         }
-                        _ => self
-                            .canvas
-                            .draw_lit(&image, at, false, Light::from_byte(byte), depth),
+                        _ => self.canvas.draw_lit(
+                            &image,
+                            at,
+                            false,
+                            Light::from_byte(byte, self.lot.brightest()),
+                            depth,
+                        ),
                     }
                     self.stats.floors += 1;
                 }
@@ -454,7 +629,8 @@ impl Painter<'_> {
         };
         let index = (level - 1) as usize;
         let byte = self.lot.light_at(index, [x * 16 + 8, y * 16 + 8]);
-        let strength = i32::from(strength) + 255 - Light::drawn_byte(byte).unwrap_or(255) as i32;
+        let strength = i32::from(strength) + 255
+            - Light::drawn_byte(byte, self.lot.brightest()).unwrap_or(255) as i32;
         let zoom = self.camera.zoom.index();
         // The mask sits where the plain floor tile would, centred by the
         // tile's width rather than its own.
@@ -508,7 +684,8 @@ impl Painter<'_> {
     }
 
     /// Draws a grass tile in the original's four-pixel columns (see
-    /// [`crate::grass`]).
+    /// [`crate::grass`]), straight from the palette: no room's light falls
+    /// on it (0x49da21).
     fn terrain(&mut self, [x, y]: [i32; 2]) {
         let view = self.camera.rotate_tile([x, y]);
         let Some((shades, colors)) = self.grass.tile(view) else {
@@ -527,7 +704,6 @@ impl Painter<'_> {
         if (0..2).any(|i| corner[i] < -reach || corner[i] > size[i].saturating_add(reach)) {
             return;
         }
-        let lit = self.light(0, [x * 16 + 8, y * 16 + 8]);
         // The whole tile takes one depth, from its top corner.
         let depth = self.depth.grass(view, i32::from(heights[1]));
         let left = corner[0] + GRASS_COLUMN;
@@ -535,12 +711,12 @@ impl Painter<'_> {
             for (row, pixels) in column.rows() {
                 for (i, &p) in pixels.iter().enumerate() {
                     self.canvas
-                        .plot(column.x + i as i32, row, depth, lit.apply(grass::widen(p)));
+                        .plot(column.x + i as i32, row, depth, grass::widen(p));
                 }
             }
             let index = ((column.x - left) / 4) as usize;
             for (bx, foot, height, p) in self.grass.blades(view, &column, index) {
-                let color = lit.apply(grass::widen(p));
+                let color = grass::widen(p);
                 for row in foot.saturating_sub(height - 1)..=foot {
                     self.canvas.plot(bx, row, depth, color);
                 }
@@ -640,18 +816,42 @@ impl Painter<'_> {
                     // The side that shows takes the light of the room on
                     // that side: sampled just beside the wall's middle, so
                     // a split tile gives the triangle touching the wall.
-                    let byte = self.lot.light_at(index, wall_side(&s, front));
+                    // Without a room there the wall pass keeps the light it
+                    // last read, first 1 (0x53dbb4, 0x53dc78); ours takes 1.
+                    let fraction = self
+                        .lot
+                        .room_fraction_at(index, wall_side(&s, front))
+                        .unwrap_or(1.0);
                     let seen = seen_tile(self.camera, s.from, s.to);
-                    let light = self.wall_light(index, byte, seen);
-                    self.place_wall(&image, frame, ends, heights, level, &light, None);
+                    let light = self.wall_light(index, Some(fraction), seen);
+                    self.place_wall(&image, frame, ends, heights, level, &light, None, 0);
                     if let Some(shape) = capped {
-                        let (trim, mask) = if shape == 7 { (252, 9) } else { (253, 10) };
-                        if let Some(strip) =
+                        // On an edge-on diagonal the strip is always
+                        // pattern 252 in shape 9, whichever end is marked
+                        // (0x53eb6d to 0x53ebf5).
+                        let strip = if frame == 3 {
+                            edge_on_strip(self.assets, zoom)
+                        } else {
+                            let (trim, mask) = if shape == 7 { (252, 9) } else { (253, 10) };
                             wall_image(self.assets, trim, mask, None, false, zoom, frame)
-                        {
-                            // At full light, like the trim along the top.
-                            let full = |_, _| Light::FULL;
-                            self.place_wall(&strip, frame, ends, heights, level, &full, None);
+                        };
+                        if let Some(strip) = strip {
+                            // In room 0's light, or 1 without one, held
+                            // by the time of day's cap, and no pools
+                            // (0x53eba8 to 0x53ebb5).
+                            let light = Light::from_fraction(
+                                self.lot.outdoor_light.unwrap_or(1.0),
+                                self.lot.brightest(),
+                            );
+                            let lit = |_, _| light;
+                            // On an edge-on diagonal the original moves
+                            // the strip up before drawing it (0x53ebf5).
+                            let lift = if frame == 3 {
+                                edge_on_strip_lift(self.camera.zoom)
+                            } else {
+                                0
+                            };
+                            self.place_wall(&strip, frame, ends, heights, level, &lit, None, lift);
                         }
                     }
                     self.stats.walls += 1;
@@ -662,7 +862,10 @@ impl Painter<'_> {
 
     /// Draws a wall face on `level` standing between the screen points
     /// `a` and `b` of its ends, on terrain `heights` steps up at each,
-    /// only within screen columns `columns` (from, to) when given.
+    /// only within screen columns `columns` (from, to) when given, and
+    /// `raise` pixels higher than its place. Depth is still read at the
+    /// row drawn, from the same anchor, as the original's wall depth
+    /// lookup is (0x49a5d3).
     ///
     /// The wall is placed at its end lower on the screen (the left one of
     /// a wall level on screen), and a straight wall's columns run up or
@@ -678,6 +881,7 @@ impl Painter<'_> {
         level: i32,
         light: &dyn Fn(usize, usize) -> Light,
         columns: Option<[i32; 2]>,
+        raise: i32,
     ) {
         let rise = 4 << self.camera.zoom.level();
         let left = if a[0] <= b[0] { a } else { b };
@@ -713,6 +917,7 @@ impl Painter<'_> {
             (_, std::cmp::Ordering::Less) => self.depth.anchor(b[1], heights[1] as f32, level),
             _ => self.depth.anchor(a[1], heights[0] as f32, level),
         };
+        let at = [at[0], at[1] - raise];
         let sprite_left = at[0];
         let clipped;
         let (image, at, skip) = match columns {
@@ -780,14 +985,16 @@ impl Painter<'_> {
     /// trim sprite whose frame shows the walls meeting there: standing
     /// walls' trim at the storey's height, cut walls' at the cut height.
     /// Which walls count, and the cap, follow the original's corner
-    /// records (see `caps`). The original draws the trim at full light,
-    /// whatever the room's light.
+    /// records (see `caps`). Every trim takes the outdoors' light, not its
+    /// room's.
     fn trims(&mut self, level: i32, corners: &Level) {
         let Level { corners, faces, .. } = corners;
         let zoom = self.camera.zoom;
         let half = zoom.tile_width() / 2;
         let cut_height = [6, 12, 23][zoom.index()];
+        let (corner_light, run_light) = trim_lights(self.lot.outdoor_light, self.lot.brightest());
         for (&corner, c) in &corners.corners {
+            let light = if c.record { corner_light } else { run_light };
             let at = self.corner_screen(corner, level);
             let view = self.rotate_corner(corner);
             let ground = self.corner_elevation(corner) / 16;
@@ -831,6 +1038,16 @@ impl Painter<'_> {
                         pieces.push((true, 0, Some([i32::MIN, x + step - nudge])));
                     }
                 }
+                // A cut trim is placed as an object would be at the
+                // middle of the view tile below the corner, on the ground
+                // there (0x4b9613 from 0x53e24d; the old prototype's
+                // `geometry_side.rs` reads the same point).
+                let last = self.lot.size as i32 - 1;
+                let anchor = trim_anchor(&self.depth, self.camera, view, level, |[x, y]| {
+                    let (x, y) = (x.clamp(0, last), y.clamp(0, last));
+                    self.lot.heights[Lot::cell(x as usize, y as usize)]
+                });
+                let left = x;
                 for (set, lift, columns) in pieces {
                     let Some(image) = self.assets.trim(set, zoom).get(frame).cloned() else {
                         continue;
@@ -846,11 +1063,24 @@ impl Painter<'_> {
                     let Some(y) = at[1].checked_sub(rise) else {
                         continue;
                     };
+                    let depth = &self.depth;
+                    if set {
+                        // A cut trim takes its depth from its depth sprite,
+                        // by column from the whole sprite's left, and is
+                        // not drawn without one (0x4c8b1f).
+                        if image.depth.is_none() {
+                            continue;
+                        }
+                        self.canvas
+                            .draw_layered(&image, [x, y], light, |sx, sy, byte| {
+                                depth.trim(anchor, sy, sx.saturating_sub(left), byte)
+                            });
+                        continue;
+                    }
                     // The trim lies on the wall tops, one depth a row
                     // (fitted to the original's depth buffer, 2026-11-14).
-                    let depth = &self.depth;
                     self.canvas
-                        .draw_lit(&image, [x, y], false, Light::FULL, |_, sy, _| {
+                        .draw_lit(&image, [x, y], false, light, |_, sy, _| {
                             Some(depth.flat(view, ground, level, y, sy))
                         });
                 }
@@ -899,8 +1129,10 @@ impl Painter<'_> {
             .copied()
             .find(|&i| corners.walls[i].line() == cap.line)
             .unwrap_or(owner);
-        let byte = match face(lit) {
-            Some((_, s, front)) => self.lot.light_at(index, wall_side(&s, front)),
+        // In the light its room shows, through the setter (0x53c9df), or
+        // without a room there in full light (0x53c9e9).
+        let fraction = match face(lit) {
+            Some((_, s, front)) => self.lot.room_fraction_at(index, wall_side(&s, front)),
             None => return,
         };
         let [tx, ty] = [c.view[0] + cap.offset[0], c.view[1] + cap.offset[1]];
@@ -953,8 +1185,17 @@ impl Painter<'_> {
             Line::X => Some((false, self.camera.unrotate_tile([tx, ty]))),
             Line::Rising | Line::Falling => None,
         };
-        let light = self.wall_light(index, byte, seen);
-        self.place_wall(&image, frame, ends, [step; 2], level, &light, Some(columns));
+        let light = self.wall_light(index, fraction, seen);
+        self.place_wall(
+            &image,
+            frame,
+            ends,
+            [step; 2],
+            level,
+            &light,
+            Some(columns),
+            0,
+        );
     }
 
     fn objects(&mut self, level: i32, cut: &Cut) {
@@ -963,6 +1204,14 @@ impl Painter<'_> {
         for (&id, o) in &self.world.objects {
             let [x, y, z] = o.position;
             if o.person.is_some() || z != level || x < 0 || y < 0 {
+                continue;
+            }
+            let wanted = match self.pass {
+                Pass::All => true,
+                Pass::Lot => !self.held.contains(&id),
+                Pass::Held => self.held.contains(&id),
+            };
+            if !wanted {
                 continue;
             }
             // A script can hide an object (data word 34); the original
@@ -1035,14 +1284,19 @@ impl Painter<'_> {
             // An object takes the light of the room at its position (the
             // original samples the tile light map there, 0x467482). One
             // that gives light (data word 51), other than a window, shows
-            // in full light (0x437f7d, 0x4b455f).
+            // in full light (0x437f7d, 0x4b455f). Then one whose master's
+            // word 69 is 7 takes a light of 1 through the setter, held by
+            // the time of day's cap (0x437adb to 0x437aed).
             let glows = o.data.get(LIGHT).is_some_and(|&w| w != 0) && definition.kind != WINDOW;
-            let light = if glows {
+            let light = if definition.lit_at_brightest() {
+                Light::from_fraction(1.0, self.lot.brightest())
+            } else if glows {
                 Light::FULL
             } else {
                 Light::from_byte(
                     self.lot
                         .light_at((level - 1) as usize, [o.position[0], o.position[1]]),
+                    self.lot.brightest(),
                 )
             };
             // Each pixel the object draws names it, for a click
@@ -1127,6 +1381,13 @@ const WINDOW: i16 = 8;
 const CONTAINER: usize = 2;
 const CONTAINER_SLOT: usize = 3;
 
+/// The data words that link an object into the lot (the simulation's
+/// placement): its slot in its holder, counted from 1 (-1 for none, 0 for
+/// an object that follows another on its tile), and the object it is in
+/// or follows.
+const LINK_SLOT: usize = 14;
+const BEFORE: usize = 26;
+
 /// How far a held object stands from its own position: a fine x and y
 /// offset and a lift in height units. An object another holds (a lamp on
 /// an end table, a sink in a counter) stands at its holder's place plus
@@ -1204,6 +1465,39 @@ fn sprite_rise(object: [f32; 3], zoom: Zoom) -> i32 {
         return 0;
     }
     (z * (2 << zoom.level()) as f32 + 0.5).trunc() as i32
+}
+
+/// The lights of a level's trims, in room 0's light (the outdoors') as a
+/// fraction, `outdoor` (None without a room 0), at a time of day whose
+/// brightest is `brightest`: (at a corner record, along a run between
+/// them). Both take room 0's light through the drawing's light setter
+/// (0x4b4525). Without a room 0 the corner pass resets to full light,
+/// uncapped (0x53c3a7 to 0x53c3c6), but the wall pass, which draws the
+/// trim along a run, passes 1 through the setter (0x53dbb4, 0x53e2f5), so
+/// after dark that trim is held at the cap.
+fn trim_lights(outdoor: Option<f32>, brightest: f32) -> (Light, Light) {
+    let corner = outdoor.map_or(Light::FULL, |light| Light::from_fraction(light, brightest));
+    let run = Light::from_fraction(outdoor.unwrap_or(1.0), brightest);
+    (corner, run)
+}
+
+/// Where a cut wall's trim at view corner `view` on `level` takes its
+/// depth from: the middle of the view tile whose top corner that is, on
+/// the terrain there. `heights` gives a lot tile's four corner heights.
+/// The original looks the terrain up at the middle (0x478dfe), which
+/// falls on the diagonal between the tile's corners (0, 0) and (1, 1)
+/// ([`sims_sim::head::altitude_at`]).
+fn trim_anchor(
+    depth: &Depth,
+    camera: &Camera,
+    view: [i32; 2],
+    level: i32,
+    heights: impl Fn([i32; 2]) -> [u8; 4],
+) -> Anchor {
+    let tile = camera.unrotate_tile(view);
+    let ground = sims_sim::head::altitude_at(heights(tile), 8, 8).to_f32();
+    let middle = [view[0] * 16 + 8, view[1] * 16 + 8];
+    place(depth, camera, middle, level, ground)
 }
 
 /// Places a point at fine view position `view` on `level`, `height`
@@ -1343,6 +1637,22 @@ fn wall_image(
     assets.pattern(pattern, zoom)?[frame].masked(&shape)
 }
 
+/// The strip on a marked edge-on diagonal: pattern 252 in shape 9, whose
+/// edge-on frame is taller than the pattern's, lined up at the top-left
+/// (see [`Image::masked_top_left`]).
+fn edge_on_strip(assets: &mut Assets, zoom: usize) -> Option<Image> {
+    let shape = assets.shape(9, false, zoom)?[3].clone();
+    assets.pattern(252, zoom)?[3].masked_top_left(&shape)
+}
+
+/// How far up the original moves the strip on a marked edge-on diagonal:
+/// `(92 >> (3 - zoom)) + 1`, or `+ 2` at near zoom, passed to OffsetRect
+/// before the strip is drawn (0x53eb6d to 0x53ebf5).
+fn edge_on_strip_lift(zoom: crate::Zoom) -> i32 {
+    let level = zoom.level() as i32;
+    (92 >> (3 - level)) + if level == 3 { 2 } else { 1 }
+}
+
 /// Which side of a wall shows, as an index into `Scene::sides` (0 the
 /// side its normal points to, 1 the other), from its normal turned into
 /// the view. A wall shows the side facing the camera. An edge-on
@@ -1473,6 +1783,28 @@ pub fn sprite_visible(sprite: u16, base: i16, flags: &[i16]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_trim_along_a_run_is_capped_without_room_0_but_a_corners_is_not() {
+        let night = crate::light::brightest(2);
+        let (corner, run) = trim_lights(None, night);
+        assert_eq!(corner, Light::FULL);
+        assert_eq!(run, Light::from_fraction(0.8, 1.0));
+        // By day both are full; with room 0 both take its light.
+        assert_eq!(trim_lights(None, 1.0), (Light::FULL, Light::FULL));
+        let room = Light::from_fraction(0.6, night);
+        assert_eq!(trim_lights(Some(0.6), night), (room, room));
+    }
+
+    #[test]
+    fn the_edge_on_strip_is_lifted_as_the_original_offsets_it() {
+        // (92 >> (3 - zoom)) + 1, + 2 at near (0x53eb6d to 0x53ebf5);
+        // these put the strip's top row on the original's at each zoom
+        // (House02, 2026-11-20).
+        assert_eq!(edge_on_strip_lift(Zoom::Far), 24);
+        assert_eq!(edge_on_strip_lift(Zoom::Medium), 47);
+        assert_eq!(edge_on_strip_lift(Zoom::Near), 94);
+    }
 
     fn camera(rotation: u8) -> Camera {
         Camera {
@@ -1672,6 +2004,86 @@ mod tests {
     }
 
     #[test]
+    fn a_persons_holders_and_all_they_hold_draw_after_the_people() {
+        use sims_formats::saved_objects::Slot;
+        let mut objects = BTreeMap::new();
+        // Sets entry `index` of `at`'s saved slot list to `id`. Entry 0
+        // links to the next object on the tile; slot `n` (from 0) is entry
+        // `n + 1`.
+        let entry = |objects: &mut BTreeMap<u16, Object>, at: u16, index: usize, id: u16| {
+            let slots = &mut objects.get_mut(&at).unwrap().slots;
+            if slots.len() <= index {
+                let empty = Slot {
+                    unknown: 0,
+                    object: 0,
+                };
+                slots.resize(index + 1, empty);
+            }
+            slots[index].object = id as i16;
+        };
+        // `at` holds `id` in its slot `slot` (from 0), by the link words
+        // and in the holder's slot list.
+        let put = |objects: &mut BTreeMap<u16, Object>, id: u16, at: u16, slot: usize| {
+            let o = objects.get_mut(&id).unwrap();
+            o.data[LINK_SLOT] = slot as i16 + 1;
+            o.data[BEFORE] = at as i16;
+            entry(objects, at, slot + 1, id);
+        };
+        // `id` follows `before` on its tile.
+        let follow = |objects: &mut BTreeMap<u16, Object>, id: u16, before: u16| {
+            let o = objects.get_mut(&id).unwrap();
+            o.data[LINK_SLOT] = 0;
+            o.data[BEFORE] = before as i16;
+            entry(objects, before, 0, id);
+        };
+        for id in 1..=10 {
+            objects.insert(id, object(id, id.into(), [0, 0, 1], &[(LINK_SLOT, -1)]));
+        }
+        // A bench (1) holds a person (2) and a book (3); the person holds
+        // a plumb bob (4); a table (5) holds a lamp (6); a person (7)
+        // stands alone; a person (8) holds a drink (9).
+        put(&mut objects, 2, 1, 1);
+        put(&mut objects, 3, 1, 0);
+        put(&mut objects, 4, 2, 0);
+        put(&mut objects, 6, 5, 0);
+        put(&mut objects, 9, 8, 0);
+        // Object 10 follows the bench on its tile: a neighbour, not held.
+        follow(&mut objects, 10, 1);
+        let people = BTreeSet::from([2, 7, 8]);
+        assert_eq!(held_trees(&objects, &people), BTreeSet::from([1, 3, 4, 9]));
+        // Nor is an object that follows a person on their tile.
+        entry(&mut objects, 1, 0, 0);
+        follow(&mut objects, 10, 8);
+        assert_eq!(held_trees(&objects, &people), BTreeSet::from([1, 3, 4, 9]));
+        entry(&mut objects, 8, 0, 0);
+        objects.get_mut(&10).unwrap().data[LINK_SLOT] = -1;
+        objects.get_mut(&10).unwrap().data[BEFORE] = 0;
+        // Data word 2 is not the link: a stale one changes nothing.
+        objects.get_mut(&2).unwrap().data[CONTAINER] = 5;
+        assert_eq!(held_trees(&objects, &people), BTreeSet::from([1, 3, 4, 9]));
+        // A person who follows another object on its tile is held by what
+        // that first object is in: here object 10, in the table's slot 2,
+        // with the bench in its slot 1. The tree is what the table's slots
+        // reach, so the person, linked from 10's tile entry, and their own
+        // bob are left out.
+        put(&mut objects, 1, 5, 1);
+        entry(&mut objects, 1, 2, 0);
+        put(&mut objects, 10, 5, 2);
+        follow(&mut objects, 2, 10);
+        assert_eq!(
+            held_trees(&objects, &people),
+            BTreeSet::from([1, 3, 5, 6, 9, 10])
+        );
+        // Holders that hold each other are one tree, whichever of them
+        // the climb starts from.
+        put(&mut objects, 5, 3, 1);
+        assert_eq!(
+            held_trees(&objects, &people),
+            BTreeSet::from([1, 3, 5, 6, 9, 10])
+        );
+    }
+
+    #[test]
     fn a_long_chain_of_huge_slots_stays_within_a_lot() {
         let huge = |_: u32, _: usize| Some([f32::MAX, -1e30, f32::INFINITY]);
         let mut objects = BTreeMap::new();
@@ -1763,6 +2175,29 @@ mod tests {
             still,
             camera.project_fine(camera.rotate_fine([100, 200]), 1, 0)
         );
+    }
+
+    #[test]
+    fn a_cut_trim_is_anchored_at_the_middle_of_the_tile_below_its_corner() {
+        let camera = camera(1);
+        let depth = Depth::new(&camera);
+        // Lot tile (20, 53), which view tile (10, 20) is at this rotation,
+        // has corners (0, 1), (0, 0), (1, 0) and (1, 1) at 10, 2, 6 and 5
+        // steps; any other tile is flat.
+        let heights = |tile: [i32; 2]| {
+            if tile == [20, 53] {
+                [10, 2, 6, 5]
+            } else {
+                [0; 4]
+            }
+        };
+        let view = [10, 20];
+        assert_eq!(camera.unrotate_tile(view), [20, 53]);
+        // Its middle, fine view position (168, 328), is halfway between
+        // corners (0, 0) and (1, 1): 3.5 steps, not the corners' mean.
+        let anchor = trim_anchor(&depth, &camera, view, 1, heights);
+        assert_eq!(anchor, place(&depth, &camera, [168, 328], 1, 3.5));
+        assert_ne!(anchor, place(&depth, &camera, [168, 328], 1, 5.75));
     }
 
     #[test]

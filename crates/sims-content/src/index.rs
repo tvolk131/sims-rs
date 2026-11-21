@@ -208,17 +208,11 @@ impl Index {
     /// scanned recursively, as the original mounts it, and `at` the
     /// directory's key below it (empty, or ending in `\`).
     pub(crate) fn listing(directory: &Path, at: &[u8]) -> Result<Listing> {
-        let mut index = Self {
-            root: directory.to_path_buf(),
-            mounts: Vec::new(),
-            resources: Vec::new(),
-            diagnostics: Vec::new(),
-        };
-        let mut directories = Directories::new();
-        index.scan(&mut directories, &[], directory, true)?;
+        let mut files = MountedFiles::default();
+        files.scan(&[], directory, true, sorted_entries)?;
         let mut listed = Vec::new();
-        Self::list_all(&directories, at, &mut listed);
-        Ok((listed, index.diagnostics))
+        Self::list_all(&files.directories, at, &mut listed);
+        Ok((listed, files.diagnostics))
     }
 
     /// [`Index::listing`]'s walk of one directory.
@@ -247,10 +241,117 @@ impl Index {
 
     /// Lists one mount: gathers its directories, then walks them.
     fn walk(&mut self, mount: usize, directory: &Path, recursive: bool) -> Result<()> {
-        let mut directories = Directories::new();
-        self.scan(&mut directories, &[], directory, recursive)?;
-        self.list(mount, &directories, &[]);
+        let mut files = MountedFiles::default();
+        files.scan(&[], directory, recursive, sorted_entries)?;
+        Self::list(&mut self.resources, mount, &files.directories, &[]);
+        self.diagnostics.extend(files.diagnostics);
         Ok(())
+    }
+
+    /// Lists a directory in the order the object scan walks its table
+    /// (0x5ba9bd), going into each subdirectory where its name falls.
+    fn list(resources: &mut Vec<Resource>, mount: usize, directories: &Directories, at: &[u8]) {
+        let Some(directory) = directories.get(at) else {
+            // A subdirectory of a mount that is not searched recursively.
+            return;
+        };
+        for name in directory.table().iter() {
+            match directory.entries.get(name) {
+                // The object scan skips directories named `*.dir` (0x43a436).
+                Some(Entry::Directory) => {
+                    if !name.ends_with(b".dir") {
+                        Self::list(resources, mount, directories, &[at, name, b"\\"].concat());
+                    }
+                }
+                Some(Entry::File(path)) => resources.push(Resource {
+                    mount,
+                    path: path.clone(),
+                    member: None,
+                }),
+                Some(Entry::Member(path, member)) => resources.push(Resource {
+                    mount,
+                    path: path.clone(),
+                    member: Some(member.clone()),
+                }),
+                // An archive file itself.
+                Some(Entry::Archive) | None => {}
+            }
+        }
+    }
+}
+
+/// Directory tables shared by the startup mounts and the later avatar paths.
+#[derive(Default)]
+pub(crate) struct MountedFiles {
+    directories: Directories,
+    diagnostics: Vec<String>,
+}
+
+impl MountedFiles {
+    /// Register a root-relative path once, preserving any existing virtual
+    /// directory supplied by an earlier FAR mount (0x5ba5d8, 0x5b9dbc).
+    pub(crate) fn register(&mut self, root: &Path, path: &str, recursive: bool) -> Result<()> {
+        let at = mount_key(path)?;
+        if !self.directories.contains_key(&at)
+            && let Some(directory) = resolve(root, path)?
+            && directory.is_dir()
+        {
+            self.scan(&at, &directory, recursive, ntfs_entries)?;
+            if let Some(reason) = self.diagnostics.first() {
+                return Err(Error::Unsupported(format!(
+                    "0x5b9dbc wardrobe FAR mount: {reason}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn exists(&self, root: &Path, path: &str) -> Result<bool> {
+        if let Some((parent, name)) = path.rsplit_once('/') {
+            let at = mount_key(parent)?;
+            let name = key(&disk_name(name.as_ref()));
+            if self
+                .directories
+                .get(&at)
+                .is_some_and(|dir| dir.entries.contains_key(&name))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(resolve(root, path)?.is_some())
+    }
+
+    /// One directory, in its file-map order. Appearance searches at
+    /// 0x5c1a7d do not recurse into its subdirectories.
+    pub(crate) fn files(&self, path: &str) -> Result<Vec<(Vec<u8>, Resource)>> {
+        let Some(dir) = self.directories.get(&mount_key(path)?) else {
+            return Ok(Vec::new());
+        };
+        Ok(dir
+            .table()
+            .iter()
+            .filter_map(|name| {
+                let (path, member) = match &dir.entries[name] {
+                    Entry::File(path) => (path.clone(), None),
+                    Entry::Member(path, member) => (path.clone(), Some(member.clone())),
+                    Entry::Directory | Entry::Archive => return None,
+                };
+                Some((
+                    name.to_vec(),
+                    Resource {
+                        mount: 0,
+                        path,
+                        member,
+                    },
+                ))
+            })
+            .collect())
+    }
+
+    pub(crate) fn objects(&self, path: &str) -> Result<Vec<Resource>> {
+        let mut resources = Vec::new();
+        Index::list(&mut resources, 0, &self.directories, &mount_key(path)?);
+        Ok(resources)
     }
 
     /// Gathers entries the way the original's directory scan does
@@ -260,22 +361,22 @@ impl Index {
     /// mount, in key form, ending in `\`.
     fn scan(
         &mut self,
-        directories: &mut Directories,
         at: &[u8],
         directory: &Path,
         recursive: bool,
+        entries: fn(&Path) -> Result<Vec<PathBuf>>,
     ) -> Result<()> {
-        directories.entry(at.to_vec()).or_default();
-        for path in sorted_entries(directory)? {
+        self.directories.entry(at.to_vec()).or_default();
+        for path in entries(directory)? {
             let name = key(&disk_name(path.file_name().unwrap_or_default()));
-            let here = directories.get_mut(at).expect("inserted above");
+            let here = self.directories.get_mut(at).expect("inserted above");
             if path.is_dir() {
                 // A file or directory on disk replaces an archive member of
                 // the same name, keeping the member's place in the order.
                 here.put(name.clone(), Entry::Directory);
                 if recursive {
                     let child = [at, &name, b"\\"].concat();
-                    self.scan(directories, &child, &path, true)?;
+                    self.scan(&child, &path, true, entries)?;
                 }
             } else if name.ends_with(b"far") {
                 // The original tests the last three letters, with no dot.
@@ -283,7 +384,7 @@ impl Index {
                 match archive_members(&path) {
                     Ok((members, skipped)) => {
                         self.diagnostics.extend(skipped);
-                        mount_archive(directories, at, &path, members);
+                        mount_archive(&mut self.directories, at, &path, members);
                     }
                     // An unreadable archive is skipped, so one bad download
                     // does not stop the game loading.
@@ -295,37 +396,50 @@ impl Index {
         }
         Ok(())
     }
+}
 
-    /// Lists a directory in the order the object scan walks its table
-    /// (0x5ba9bd), going into each subdirectory where its name falls.
-    fn list(&mut self, mount: usize, directories: &Directories, at: &[u8]) {
-        let Some(directory) = directories.get(at) else {
-            // A subdirectory of a mount that is not searched recursively.
-            return;
-        };
-        for name in directory.table().iter() {
-            match directory.entries.get(name) {
-                // The object scan skips directories named `*.dir` (0x43a436).
-                Some(Entry::Directory) => {
-                    if !name.ends_with(b".dir") {
-                        self.list(mount, directories, &[at, name, b"\\"].concat());
-                    }
-                }
-                Some(Entry::File(path)) => self.resources.push(Resource {
-                    mount,
-                    path: path.clone(),
-                    member: None,
-                }),
-                Some(Entry::Member(path, member)) => self.resources.push(Resource {
-                    mount,
-                    path: path.clone(),
-                    member: Some(member.clone()),
-                }),
-                // An archive file itself.
-                Some(Entry::Archive) | None => {}
-            }
+fn mount_key(path: &str) -> Result<Vec<u8>> {
+    let name = far::encode_name(path).ok_or_else(|| {
+        Error::Unsupported(format!(
+            "0x5b96c8 mount path is outside Windows-1252: {path}"
+        ))
+    })?;
+    let mut at = key(&name);
+    at.push(b'\\');
+    Ok(at)
+}
+
+/// Replay the startup's NTFS upcase ordering for Windows-1252 filenames.
+/// The output is insertion order. Callers enumerate the resulting tables.
+fn ntfs_entries(directory: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = sorted_entries(directory)?;
+    for path in &paths {
+        let name = path.file_name().and_then(std::ffi::OsStr::to_str);
+        if name.and_then(far::encode_name).is_none() {
+            return Err(Error::Unsupported(format!(
+                "0x5ba5d8 filename is outside Windows-1252: {}",
+                path.display()
+            )));
         }
     }
+    paths.sort_by_cached_key(|path| {
+        path.file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .chars()
+            .map(|ch| {
+                let mut upper = ch.to_uppercase();
+                let first = upper.next().unwrap();
+                if upper.next().is_some() {
+                    ch as u16
+                } else {
+                    first as u16
+                }
+            })
+            .collect::<Vec<_>>()
+    });
+    Ok(paths)
 }
 
 /// Every directory of one mount, by key: its path below the mount in key

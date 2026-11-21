@@ -36,7 +36,7 @@ use crate::fault::{Fault, Trap};
 use crate::interpreter::Interpreter;
 use sims_content::{People, Skeleton};
 use sims_core::CrtRng;
-use sims_formats::saved_objects::{Instance, Objects, Slot};
+use sims_formats::saved_objects::{Frame, Instance, Objects, Slot};
 use sims_sim::neighbors::Neighbors;
 use sims_sim::{Object, World};
 use std::collections::{BTreeMap, BTreeSet};
@@ -157,6 +157,17 @@ fn grows(guid: u32, expansions: i16) -> bool {
 }
 
 impl Interpreter<'_> {
+    /// Load step 6e with no captured frame arena bits. See
+    /// [`Interpreter::read_objects_with_frame_tree_bits`].
+    pub fn read_objects(
+        &self,
+        world: &mut World,
+        saved: &Objects,
+        people: &People,
+    ) -> Result<SavedRead, Fault> {
+        self.read_objects_with_frame_tree_bits(world, saved, people, &BTreeSet::new())
+    }
+
     /// Load step 6e: reads a house's saved objects onto the lot (0x449c5e).
     /// The lot must hold no objects: the original clears it first.
     ///
@@ -215,12 +226,25 @@ impl Interpreter<'_> {
     ///
     /// **Unverified**: an object whose record has no scheduler word keeps
     /// the one registration gave it; and that the game has read no
-    /// skeleton file before its first load.
-    pub fn read_objects(
+    /// skeleton file before its first load but those of
+    /// [`READ_BEFORE_THE_FIRST_LOAD`].
+    ///
+    /// At 0x4750f0 the native loader allocates the stack arena and at
+    /// 0x4750fc clears its first four bytes. For each saved frame,
+    /// 0x4746e4/0x4746e8 ORs the old high bit into the word read from ObjM.
+    /// `frame_tree_bits` supplies the set bits from such an arena as
+    /// (saved object ID, zero-based frame index). Other arena bits are
+    /// taken as zero. The first frame's arena bit is always zero, so a
+    /// captured bit on frame 0 fails. That rule is for captured residue
+    /// only: a saved tree word that itself has bit 15 set is read as it
+    /// is (0x4746e8), as the native reader does. The native writer masks
+    /// the bit (0x4746c0), so a save the original wrote has none.
+    pub fn read_objects_with_frame_tree_bits(
         &self,
         world: &mut World,
         saved: &Objects,
         people: &People,
+        frame_tree_bits: &BTreeSet<(u16, usize)>,
     ) -> Result<SavedRead, Fault> {
         let fail = |object, trap| Fault {
             object,
@@ -263,6 +287,24 @@ impl Interpreter<'_> {
                 return Err(fail(id, Trap::Invalid("a saved ID is listed twice".into())));
             }
             order.push(id);
+        }
+        for &(id, index) in frame_tree_bits {
+            if index == 0 {
+                return Err(fail(
+                    id,
+                    Trap::Invalid("0x4750fc clears the first frame's arena tree bit".into()),
+                ));
+            }
+            let frame = objects
+                .get_mut(&id)
+                .and_then(|object| object.stack.get_mut(index))
+                .ok_or_else(|| {
+                    fail(
+                        id,
+                        Trap::Invalid(format!("no saved frame at index {index}")),
+                    )
+                })?;
+            frame.tree |= Frame::TREE_FLAG;
         }
         let next_parts = link_parts(&objects, &order).map_err(|(id, trap)| fail(id, trap))?;
         // Each person's animator, as its read restores it (0x5918ba) and
@@ -513,6 +555,62 @@ fn construct_person(
         draws.default_traits();
     }
     Ok(())
+}
+
+/// The skeleton files the game has read before it loads its first house,
+/// so that a person of theirs made later builds only its own copy.
+///
+/// The Goth day (`goth-day-20261115`) makes a cat ("kat" skeleton) at
+/// updates 6756, 10358, 17562 and 24719, and each time the C runtime's
+/// stream moves by 1,920 draws: one skeleton's worth, its own copy
+/// (0x598da3). Had the first cat read its file there, that update would
+/// take two (0x598af7 builds the file's one skeleton, then the copy). The
+/// stream at the entry of the first lot update is 7,212 draws on from its
+/// initial state 1, which the load's own work accounts for (the adult and
+/// child files, the three Goths' copies and default interests, and the
+/// indicator pair made before the load and again during it). So the file was read without drawing from the stream the
+/// simulation draws from (the C runtime keeps one per thread, 0x63e2b3
+/// +0x14). That it was read before the load, and not between the load and
+/// the first cat, is **unverified**; so is where (the avatar registry's
+/// scan at startup, 0x59f844, reads files through 0x59f087, whose
+/// skeleton records go through 0x598af7).
+///
+/// The dog file is read before the first load too. A recording of the
+/// first neighborhood's House 69 (`house69-ud1-ticks-20261119`), which
+/// holds a dog (object 9) and an adult (object 274), enters the lot with
+/// the stream 4,730 draws on from 1. Reading the dog file at the load
+/// would make it 6,497. The file costs 1,776 draws, and skipping it
+/// changes the adult's default-trait draws from 33 to 42, so the net is
+/// 1,767 more. The Goth day's first dog (strict tick 10,358; update
+/// 24,766 of the recording) likewise costs 1,776 draws, its own copy, as
+/// in the original, where reading the file there would make it 3,552.
+/// The startup scan (0x59f844 → 0x59f087 → 0x598af7) walks the
+/// Complete Collection's file map with the dog file before the kat file.
+/// The list's order has no effect here: the World keeps the files as a
+/// set. The rest of that folder, the "effects1" skeleton, no capture has
+/// made, and it is not listed.
+pub const READ_BEFORE_THE_FIRST_LOAD: &[&str] = &[
+    "ExpansionShared/ExpansionShared.far/Skeletons\\dog_skeleton.cmx.bcf",
+    "ExpansionShared/ExpansionShared.far/Skeletons\\kat_skeleton.cmx.bcf",
+];
+
+/// The files of [`READ_BEFORE_THE_FIRST_LOAD`] as `people` names them.
+/// A skeleton's file is its location in the install, spelled as it is on
+/// disk (`sims_content::Resource::location`), so a listed file is matched
+/// without regard to case. A listed file no person type's skeleton comes
+/// from is left out: no person made later would read it.
+pub fn read_before_the_first_load(people: &People) -> BTreeSet<String> {
+    people
+        .skeletons
+        .values()
+        .map(|skeleton| &skeleton.file)
+        .filter(|file| {
+            READ_BEFORE_THE_FIRST_LOAD
+                .iter()
+                .any(|listed| listed.eq_ignore_ascii_case(file))
+        })
+        .cloned()
+        .collect()
 }
 
 /// A person's skeleton, as far as building it draws random numbers (in

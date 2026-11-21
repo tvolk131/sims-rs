@@ -129,7 +129,7 @@ fn the_goths_personality_panel() {
     assert_eq!(worked_out, signs);
     let controls = Controls {
         expanded: true,
-        panel: Panel::Personality,
+        panel: Some(Panel::Personality),
         ..Controls::default()
     };
     let mut frame = Frame::new(800, 600, [0, 0, 0]);
@@ -161,7 +161,7 @@ fn the_goths_sign_balloon() {
 
     let mut controls = Controls {
         expanded: true,
-        panel: Panel::Personality,
+        panel: Some(Panel::Personality),
         ..Controls::default()
     };
     let mut items = hud::layout([800, 600], &opened.snapshot, &controls);
@@ -242,7 +242,7 @@ fn the_goths_job_panel() {
     assert_eq!(opened.snapshot.family_friends, 0);
     let controls = Controls {
         expanded: true,
-        panel: Panel::Job,
+        panel: Some(Panel::Job),
         ..Controls::default()
     };
     let draw = |snapshot| {
@@ -337,7 +337,7 @@ fn the_goths_relationship_panel() {
     assert!(opened.snapshot.superstar);
     let controls = Controls {
         expanded: true,
-        panel: Panel::Relationships,
+        panel: Some(Panel::Relationships),
         ..Controls::default()
     };
     let mut frame = Frame::new(800, 600, [0, 0, 0]);
@@ -365,8 +365,7 @@ fn the_goths_house_panel() {
     assert_eq!(opened.house.yard, sims_core::F32::from_f32(0.33));
     // After the load: 1,836 square feet, two bedrooms and a bathroom on
     // a large lot. Size: 612 square feet for each of three members;
-    // Yard: the outdoor rooms' score times 0.33. Furnishings and Layout
-    // are not ported.
+    // Yard: the outdoor rooms' score times 0.33. Layout is not ported.
     let house = &opened.snapshot.house;
     assert_eq!(
         (
@@ -406,10 +405,31 @@ fn the_goths_house_panel() {
         assert_eq!(kinds.counted[&made], template_counts);
     }
     assert_eq!((opened.house.dirty, opened.house.broken), (3, 6));
-    assert_eq!(house.ratings, [Some(75), None, Some(76), Some(100), None]);
+    // The panel weighs the lot's values as the simulation keeps them:
+    // the house file saved 14,660 and 15,277, what the original's
+    // simulator holds after the load (+0xa0 and +0xa4, track 2's capture
+    // of update 1). Furnishings weighs 15,277 over 14,660, 1.042, on the
+    // curve.
+    assert_eq!(
+        (house.values.objects, house.values.architecture),
+        (14660, 15277)
+    );
+    // The lot statistics' sums, worked out from the lot with the saved
+    // values cleared, come to the same two.
+    let mut unsaved = opened.world.clone();
+    unsaved.budget.objects_value = 0;
+    unsaved.budget.architecture_value = 0;
+    assert_eq!(
+        house::Values::read(&unsaved, &opened.kinds, &opened.prices),
+        house.values
+    );
+    assert_eq!(
+        house.ratings,
+        [Some(75), Some(58), Some(76), Some(100), None]
+    );
     let controls = Controls {
         expanded: true,
-        panel: Panel::House,
+        panel: Some(Panel::House),
         ..Controls::default()
     };
     let mut frame = Frame::new(800, 600, [0, 0, 0]);
@@ -419,6 +439,6 @@ fn the_goths_house_panel() {
     // screen (see docs/decisions/).
     assert_eq!(
         digest(&frame),
-        "c0d6ae63d03a10dc4b50717da2f6f145de43560ee3c59cec6c95b4f8dc143897"
+        "669ee756a9f2db4a3fdea9cfa89eb3a8a85945b7841f3e6f2d320995c1d35b4e"
     );
 }

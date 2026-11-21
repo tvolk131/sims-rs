@@ -50,7 +50,9 @@
 //! 0x44e877) a new person that is a visitor (person word 32, +0x5cc)
 //! runs the tree its file names "init visitor" at once
 //! (`Machine::finish_new`; 0x4021f2, 0x474afb). For any other object
-//! that does nothing.
+//! that does nothing. The factory has already worked out again who is a
+//! visitor (signal 0xe2, the visitor pass 0x42a2b4), so on a
+//! residential lot a new person who is not a member of the family is one.
 //!
 //! Flag 0x10 without flag 0x2 (0x44e8e1 to 0x44e90c), after "init
 //! visitor": if the new object's thread has a frame, the running object's
@@ -288,10 +290,10 @@ impl Machine<'_, '_> {
                             TURN_BUDGET,
                             self.checking,
                         )
-                        .map_err(|fault| {
-                            Trap::Unsupported(format!(
+                        .map_err(|fault: crate::fault::Fault| {
+                            fault.unsupported_in(format!(
                                 "Create New Object Instance: the \"init visitor\" tree \
-                                 {tree:#06x} of person {created}: {fault}"
+                                 {tree:#06x} of person {created}"
                             ))
                         })?;
                 }
@@ -331,8 +333,8 @@ impl Machine<'_, '_> {
     fn make(&mut self, guid: u32) -> Result<u16, Trap> {
         self.interpreter()
             .create(self.world, guid)
-            .map_err(|fault| {
-                Trap::Unsupported(format!("creating an object of type 0x{guid:08X}: {fault}"))
+            .map_err(|fault: crate::fault::Fault| {
+                fault.unsupported_in(format!("creating an object of type 0x{guid:08X}"))
             })
     }
 
@@ -341,8 +343,9 @@ impl Machine<'_, '_> {
     /// (0x425930), as 0x44e0c8 does for any new person (0x44e608).
     fn make_person(&mut self, guid: u32) -> Result<u16, Trap> {
         let interpreter = self.interpreter();
-        let unsupported =
-            |fault| Trap::Unsupported(format!("creating a person of type 0x{guid:08X}: {fault}"));
+        let unsupported = |fault: crate::fault::Fault| {
+            fault.unsupported_in(format!("creating a person of type 0x{guid:08X}"))
+        };
         let id = interpreter
             .create_person(self.world, guid)
             .map_err(unsupported)?;
@@ -786,13 +789,13 @@ impl Machine<'_, '_> {
                 if now == wanted {
                     break;
                 }
-                interpreter
-                    .turn_group(self.world, created, 1)
-                    .map_err(|fault| {
-                        Trap::Unsupported(format!(
-                            "Create New Object Instance turning group {created}: {fault}"
+                interpreter.turn_group(self.world, created, 1).map_err(
+                    |fault: crate::fault::Fault| {
+                        fault.unsupported_in(format!(
+                            "Create New Object Instance turning group {created}"
                         ))
-                    })?;
+                    },
+                )?;
             }
             return Ok(());
         }
@@ -809,13 +812,13 @@ impl Machine<'_, '_> {
             if now == wanted {
                 break;
             }
-            interpreter
-                .turn_one(self.world, created, 1)
-                .map_err(|fault| {
-                    Trap::Unsupported(format!(
-                        "Create New Object Instance turning object {created}: {fault}"
+            interpreter.turn_one(self.world, created, 1).map_err(
+                |fault: crate::fault::Fault| {
+                    fault.unsupported_in(format!(
+                        "Create New Object Instance turning object {created}"
                     ))
-                })?;
+                },
+            )?;
         }
         Ok(())
     }
@@ -833,9 +836,9 @@ impl Machine<'_, '_> {
         dynamic: bool,
     ) -> Result<bool, Trap> {
         let interpreter = self.interpreter();
-        let unsupported = |fault| {
-            Trap::Unsupported(format!(
-                "Create New Object Instance placing object {created}: {fault}"
+        let unsupported = |fault: crate::fault::Fault| {
+            fault.unsupported_in(format!(
+                "Create New Object Instance placing object {created}"
             ))
         };
         let fits = match place.container {

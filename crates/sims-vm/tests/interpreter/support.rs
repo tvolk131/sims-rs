@@ -166,6 +166,7 @@ pub fn object(id: u16, guid: u32) -> Object {
 
 fn interaction() -> Interaction {
     Interaction {
+        join: 0,
         uid: 0,
         caller: 0,
         target: 0,
@@ -216,6 +217,14 @@ pub fn world() -> World {
         people: vec![SIM],
         types: BTreeMap::from([(7, LAMP_GUID), (8, SIM_GUID)]),
         objects: BTreeMap::from([(LAMP, object(LAMP, LAMP_GUID)), (SIM, sim)]),
+        // The family global 9 names, whose one member is the Sim's type.
+        families: vec![sims_sim::neighbors::Family {
+            id: 109,
+            house: 0,
+            members: vec![SIM_GUID],
+            friends: 0,
+            stale: true,
+        }],
         ..World::empty()
     }
 }

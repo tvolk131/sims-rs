@@ -11,7 +11,10 @@ use sims_sim::load::Context;
 use sims_vm::{Interpreter, Program, Stream};
 
 /// The Goth house's lot when the resize returns, built the way `sims boot`
-/// builds it.
+/// builds it, but for the skeleton files the game has read before its
+/// first load (`sims_vm::read_before_the_first_load`): this lot has none,
+/// so the pins here hold no record of them. Neither file the Goths read
+/// is one of those, so their draws are the same.
 fn resized(root: &std::path::Path) -> (World, Vec<u16>) {
     let mut result = None;
     with_goth(root, |_, _, world, created| {
@@ -1322,10 +1325,10 @@ fn the_goth_house_type_table_marks_the_changed_types() {
 /// One thing differed: in one frame of object 19 the capture's tree ID
 /// has bit 15 set (0x8118) where the save, and this state, have 0x118.
 /// Object 17 has the same type and thread and no such bit. The frame
-/// reader (0x474694) writes only the low 15 bits and keeps bit 15 from the
-/// frame arena's memory, which is freshly allocated and not cleared
-/// (0x4750ed), and every reader masks the bit off (0x4746c0, 0x4747ea,
-/// 0x474f79), so it is left over from the heap and nothing reads it.
+/// reader (0x4746e4) keeps bit 15 from the frame arena, which only has its
+/// first four bytes cleared after allocation (0x4750fc). Dispatch tests
+/// the bit (0x474b99), clears it and resumes at the same node (0x474b13).
+/// This test loads the file alone, which carries no arena bits.
 ///
 /// The C runtime stream and six type attribute words belong to the game
 /// that was running, as in the tests above. With those copied from the
@@ -1388,6 +1391,8 @@ fn the_goth_house_objects_are_constructed_and_read() {
             // rest are the three people's default interests, which draw
             // until a value fits: 124 times from the state the stream is
             // in here, 64 draws on from its initial state.
+            // (The boot also has the kat file, read before the load; see
+            // [`resized`].)
             assert_eq!(world.skeleton_files.len(), 2);
             assert_eq!(read.draws, 5 * 29 * 48 + 124);
             let mut stream = before.crt_rng;
@@ -2565,7 +2570,7 @@ fn the_goth_house_first_tick_matches_the_original() {
         // Location For. Object 15 asks a two-button dialog, answered with
         // 3 as the capture's events show. In tick 3 people 18 and 21 start
         // a clip and 35 objects are queued for removal.
-        let mut player = sims_vm::Answers { queue: [3].into() };
+        let mut player = sims_vm::Answers::choices(&[3]);
         let mut shape = vec![];
         for tick in 2..=5 {
             let update = interpreter.lot_update(world, &tuning, &mut player).unwrap();

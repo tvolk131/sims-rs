@@ -17,7 +17,7 @@ use std::collections::BTreeSet;
 use crate::fault::{Fault, Trap};
 use crate::interpreter::Interpreter;
 use crate::object_uses::no_action;
-use crate::placement::capture;
+use crate::placement::{capture, stands_on_lot};
 use sims_content::{People, Profile, Skeleton};
 use sims_sim::World;
 use sims_sim::characters;
@@ -64,6 +64,53 @@ pub fn persistent_fields(revision: i32) -> Vec<usize> {
         }
     }
     fields
+}
+
+/// The revision a neighborhood record gets when a person is saved into
+/// it (0x423e04 returns 9).
+pub const SAVED_REVISION: i32 = 9;
+
+/// Saves person `id` into its neighborhood record (0x425a69): the record
+/// is the one person data word 31 names (0x4256f4, slot `id - 1`), not
+/// the first of the person's type; it gets revision [`SAVED_REVISION`],
+/// and each word the table at 0x423827 lists for that revision
+/// ([`persistent_fields`]) is copied from the person into it. The copy
+/// does not test the words' revisions, as the attach does (0x4258ff):
+/// the table is built for revision 9 and every entry is copied. A word
+/// 31 that names no record saves nothing (0x425a84). An object that is
+/// not a person fails: the callers cast first.
+pub(crate) fn save_to_record(world: &mut World, id: u16) -> Result<(), Trap> {
+    let person = world
+        .objects
+        .get(&id)
+        .ok_or(Trap::native(10, "missing object"))?
+        .person
+        .as_ref()
+        .ok_or(Trap::native(0x1c, "object is not a person"))?;
+    let fields = persistent_fields(SAVED_REVISION);
+    let mut values = Vec::with_capacity(fields.len());
+    for &word in &fields {
+        values.push(
+            *person
+                .data
+                .get(word)
+                .ok_or_else(|| Trap::Invalid(format!("the person has no data word {word}")))?,
+        );
+    }
+    let neighbor = person.data[field::NEIGHBOR];
+    let Some(record) = world.neighbors.get_mut(neighbor) else {
+        return Ok(());
+    };
+    record.revision = SAVED_REVISION;
+    for (&word, value) in fields.iter().zip(values) {
+        *record.data.get_mut(word).ok_or_else(|| {
+            Trap::Invalid(format!(
+                "neighborhood record {} has no person data word {word}",
+                record.id
+            ))
+        })? = value;
+    }
+    Ok(())
 }
 
 /// The number a body string's age stands for, as the C runtime's `atoi`
@@ -370,11 +417,11 @@ impl Interpreter<'_> {
     /// (0x45e8c3, 0x46e042), which changes nothing kept
     /// (`primitives::headline`).
     ///
-    /// These fail, because the original does more for them and none was
-    /// seen: a person inside another object (0x45e8dd) or, unless it is being
-    /// deleted ([`Interpreter::reset_person_to_delete`]), off the lot
-    /// (0x45e977), which the original moves; and a person whose data word
-    /// 73 is set, whose footprint the original then works out again.
+    /// A person inside another object (0x45e8dd), or off the lot outside
+    /// deletion (0x45e977), fails because its take-off can leave an
+    /// animator refresh (0x58da12) pending beyond the scheduler pass.
+    /// A person whose data word 73 is set fails because the original then
+    /// works out its footprint again.
     ///
     /// So does an animator the reset cannot handle (see
     /// [`sims_sim::animator::Animator::reset`]).
@@ -628,14 +675,22 @@ impl Interpreter<'_> {
             return Err(unsupported("whose data word 73 is set"));
         }
         let profile = profile(people, world, guid).map_err(fail)?;
-        let place = capture(world, id).map_err(fail)?;
-        if place.container.is_some() {
-            return Err(unsupported("that is inside an object (0x45e8dd)"));
+        if capture(world, id).map_err(fail)?.container.is_some() {
+            return Err(fail(Trap::Unsupported(
+                "resetting a person inside an object (0x45e8dd: take-off, place test and \
+                 searches, with an animator refresh (0x58da12) that can stay pending \
+                 beyond the scheduler pass), which is not ported"
+                    .into(),
+            )));
         }
-        if !place.on_lot && !deleting {
-            return Err(unsupported(
-                "that is off the lot, which puts it back on the lot (0x45e977)",
-            ));
+        // 0x45e95d to 0x45e971: the deletion mark skips the lot bounds test.
+        if !deleting && !stands_on_lot(world, id).map_err(fail)? {
+            return Err(fail(Trap::Unsupported(
+                "resetting a person off the lot (0x45e977: take-off, place test, searches \
+                 and put, with an animator refresh (0x58da12) that can stay pending \
+                 beyond the scheduler pass), which is not ported"
+                    .into(),
+            )));
         }
         let person = world
             .objects

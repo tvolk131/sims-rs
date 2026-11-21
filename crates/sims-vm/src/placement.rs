@@ -165,10 +165,44 @@ pub(crate) fn head_slot_redraw(world: &World, id: u16) -> Result<(), Trap> {
 /// Whether a primitive reads nothing of any animator, so it may run while
 /// an animator refresh is pending ([`Interpreter::take_self_off`]): Sleep,
 /// Expression, Change Suit/Accessory on a suit (operand 1 = 1, which
-/// writes person words 8 and 21 only), Set Motive Change and Set To Next.
+/// writes person words 8 and 21 only), Set Motive Change, Set To Next,
+/// Random Number, Idle For Input, Run Tree By Name, Play Sound Event and
+/// Stop All Sounds.
+///
+/// Random Number reads and writes its operands through the same memory
+/// reader as Expression (`Machine::resolve`) and draws from the lot's
+/// stream; the refresh writes neither (it fails if it writes anything but
+/// the animator and base layer, [`Interpreter::refresh_at_take_off`]).
+///
+/// Run Tree By Name's handler (0x44ba26) looks the name up (0x4021f2) and
+/// either runs the tree at once (0x4749b5) or pushes it, wakes the running
+/// object (0x452b98, 0x44574b) and, for a person, counts the use (virtual
+/// function 0x34, 0x45e59b: the action's icon +0xa54, the use list +0xb00
+/// and the target's +0xc6). None of that reads an animator. The tree it
+/// runs is checked one primitive at a time like any other, since a run at
+/// once keeps the pending refresh (`Machine::interpreter`, `Interpreter::machine`).
+///
+/// Idle For Input reads the person's words, motives and queue, the
+/// frame's parameter and the lot's zoning (0x45d7c0; the parameter
+/// through 0x47518b; 0x40745f, 0x41ed43, 0x45f77b). The check and cancellation
+/// trees it runs (0x45dc74, 0x45dcc8) are checked one primitive at a
+/// time, as is the tree it pushes. Making the action the running one
+/// (0x45e6cd) works the person's footprint out again when person word 73
+/// is set (0x45e756, 0x433d16); that goes through 0x43519f, which calls
+/// only the RTTI cast (0x635abe) and 0x4351ef, and that reads person
+/// words (+0x614, +0x634). The
+/// virtual call at 0x4353c9 belongs to the separate routine 0x4352e8.
+///
+/// Play Sound Event (0x452822) looks the sound's name up in the running
+/// code's files and hands the name and an object's ID to the sound manager
+/// (0x57a54c); Stop All Sounds (0x45253a) hands it an ID. The sound
+/// manager is presentation: where it places a sound is worked out from
+/// the screen when it mixes ([`crate::sounds`]). Whether anything it reads
+/// as it is handed the sound is what the refresh writes is **unverified**;
+/// it would change only what is heard.
 pub(crate) fn reads_no_animator(opcode: u16, operands: &[u8; 8]) -> bool {
     match opcode {
-        0 | 2 | 29 | 31 => true,
+        0 | 2 | 8 | 17 | 23 | 28 | 29 | 31 | 48 => true,
         6 => operands[1] == 1,
         _ => false,
     }
@@ -289,10 +323,12 @@ fn tile(position: [i32; 3]) -> [i8; 3] {
     World::tile(position)
 }
 
-/// Whether a position is on a tile inside the border of the lot's arrays.
-/// **Unverified** whether the original tests against the arrays' 64 tiles,
-/// as the old prototype does, or against the lot's size: no object of the
-/// house the trace loads stands between the two.
+/// Whether a position is on a tile inside the border of the lot's arrays
+/// (64 tiles). The original's place capture (0x4325b5) sets its flag from
+/// 0x422632 with the lot (0x6e552c), which tests against the lot's size
+/// (+0x10), as [`off_lot`] does; [`capture`] still uses the arrays' 64
+/// tiles here, which differs only for a position between the lot's
+/// border and the arrays' (none in the Goth day). Not yet changed.
 pub(crate) fn on_lot(position: [i32; 2]) -> bool {
     let inside = |n: i32| {
         let n = i32::from((n >> 4) as i8);

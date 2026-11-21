@@ -15,12 +15,17 @@
 pub mod save;
 
 use crate::play::Play;
-use crate::{Answers, Callback, Interpreter, Program, Stream, TickError, Update};
+use crate::selection::publish_waited_for;
+use crate::{
+    Answer, Answers, Callback, Interpreter, Program, SkippedFrame, Stream, TickError, Update,
+};
 use sims_content::{Animations, Catalog, House, Index, Install, Neighborhood, People, Surfaces};
+use sims_core::CrtRng;
 use sims_sim::World;
 use sims_sim::load::{Context, Household};
 use sims_sim::motives::Tuning;
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 /// Anything that stops a boot, with a message that says where.
@@ -176,6 +181,9 @@ pub struct Finished {
 pub struct Lot {
     program: Program,
     catalog: Catalog,
+    /// The floor and wall catalogs the load renumbered the lot's patterns
+    /// by (load step 6b).
+    surfaces: Surfaces,
     world: World,
     /// The motive constants, worked out at the first step: a load that
     /// runs no tick does not need them.
@@ -285,11 +293,15 @@ pub enum StepError {
     /// step again.
     Asking { tick: u32 },
     /// The lot update of tick `tick` failed; the lot is as the failure
-    /// left it.
+    /// left it. In play mode `update` holds what the step did before it
+    /// failed: the errors caught in the objects' ticks, the frame before
+    /// the first tick if it was skipped, and the sounds. It is None in
+    /// strict mode.
     Tick {
         tick: u32,
         start: u32,
         error: String,
+        update: Option<Box<Update>>,
     },
     /// The frame after tick `tick` (0: before the first) failed. After a
     /// tick, that tick's update ran first, and is here.
@@ -312,7 +324,9 @@ impl std::fmt::Display for StepError {
                     "tick {tick} shows a dialog that waits for the player's answer"
                 )
             }
-            Self::Tick { tick, start, error } => write!(
+            Self::Tick {
+                tick, start, error, ..
+            } => write!(
                 f,
                 "tick {tick}, the lot update that starts at tick count {start}, failed: {error}"
             ),
@@ -412,18 +426,121 @@ impl Lot {
     /// the dialogs that offer a choice; a dialog with one button takes
     /// none. The frame before the first tick is not drawn yet; the first
     /// [`Lot::step`] draws it when `frames` asks for one.
+    ///
+    /// The game is taken to have just started: nothing has drawn from the
+    /// C runtime's generator, which is at state 1, as no recording has
+    /// seen it seeded. [`Lot::load_with`] takes it as earlier play left it.
     pub fn load(
         root: &Path,
         house: &Path,
         answers: &[u8],
         frames: Frames,
     ) -> Result<Self, BootError> {
-        let install = Install::detect(root)?;
+        Self::load_with(root, house, answers, frames, CrtRng::from_state(1))
+    }
+
+    /// [`Lot::load`] with the C runtime's generator (`World::crt_rng`)
+    /// starting at `crt`: after a neighborhood's first open, for one,
+    /// whose import and pools draw from it.
+    ///
+    /// `crt` is the state from which this load's own draws reach the
+    /// original's entry state. Those include the 64 draws of making the
+    /// two indicator objects (`Interpreter::create_indicators`), which the
+    /// original may already have made before its lot load starts. So
+    /// `crt` need not be the original's state at any one point before its
+    /// load, and passing that state instead would replay those draws.
+    pub fn load_with(
+        root: &Path,
+        house: &Path,
+        answers: &[u8],
+        frames: Frames,
+        crt: CrtRng,
+    ) -> Result<Self, BootError> {
+        Self::load_with_frame_tree_bits(root, house, answers, frames, crt, &BTreeSet::new())
+    }
+
+    /// [`Lot::load_with`] with the tree bits the original's frame arena
+    /// held where the load reads each saved frame (0x4746e4), as
+    /// (saved object ID, zero-based frame index). The house file does
+    /// not carry them: see
+    /// [`Interpreter::read_objects_with_frame_tree_bits`].
+    pub fn load_with_frame_tree_bits(
+        root: &Path,
+        house: &Path,
+        answers: &[u8],
+        frames: Frames,
+        crt: CrtRng,
+        frame_tree_bits: &BTreeSet<(u16, usize)>,
+    ) -> Result<Self, BootError> {
         let directory = house
             .parent()
             .and_then(Path::parent)
             .ok_or("the house file must be inside a neighborhood's Houses directory")?;
         let neighborhood = Neighborhood::open(directory)?;
+        Self::boot(
+            root,
+            neighborhood,
+            house,
+            answers,
+            frames,
+            crt,
+            frame_tree_bits,
+        )
+    }
+
+    /// [`Lot::load`] with the neighborhood already open, as opening it
+    /// left it ([`sims_sim::patch_import::open`]): its records and
+    /// families come from `neighborhood`, its people's files from its
+    /// directory's `Characters`.
+    pub fn load_in(
+        root: &Path,
+        neighborhood: Neighborhood,
+        house: &Path,
+        answers: &[u8],
+        frames: Frames,
+    ) -> Result<Self, BootError> {
+        Self::load_in_with(
+            root,
+            neighborhood,
+            house,
+            answers,
+            frames,
+            CrtRng::from_state(1),
+        )
+    }
+
+    /// [`Lot::load_in`] with the C runtime's generator starting at `crt`,
+    /// as [`Lot::load_with`] takes it.
+    pub fn load_in_with(
+        root: &Path,
+        neighborhood: Neighborhood,
+        house: &Path,
+        answers: &[u8],
+        frames: Frames,
+        crt: CrtRng,
+    ) -> Result<Self, BootError> {
+        Self::boot(
+            root,
+            neighborhood,
+            house,
+            answers,
+            frames,
+            crt,
+            &BTreeSet::new(),
+        )
+    }
+
+    /// The load itself, with every input the loaders above take.
+    fn boot(
+        root: &Path,
+        neighborhood: Neighborhood,
+        house: &Path,
+        answers: &[u8],
+        frames: Frames,
+        crt: CrtRng,
+        frame_tree_bits: &BTreeSet<(u16, usize)>,
+    ) -> Result<Self, BootError> {
+        let install = Install::detect(root)?;
         let mut index = Index::build(&install)?;
         let characters = neighborhood.characters()?;
         if let Some(characters) = &characters {
@@ -473,7 +590,9 @@ impl Lot {
             program.character_files = crate::program::character_files(&index, characters);
         }
         let mut world = World::empty();
+        world.crt_rng = crt;
         let mut load = LoadReport::default();
+        let surfaces;
         {
             let interpreter = Interpreter {
                 view_rotation,
@@ -481,7 +600,11 @@ impl Lot {
             };
             // The lot the game holds before the load: empty, with the
             // neighborhood's people, the type attributes the neighborhood
-            // saved and the two indicator objects.
+            // saved and the two indicator objects; and the skeleton files
+            // the game has read by then.
+            world
+                .skeleton_files
+                .extend(crate::objects::read_before_the_first_load(&program.people));
             world.read_neighbors(
                 &neighborhood,
                 &sims_sim::neighbors::registry(&index, &catalog),
@@ -513,19 +636,15 @@ impl Lot {
             world.read_arrays(&file.arrays, version)?;
             // The floor and wall catalogs, which the original builds at
             // start-up.
-            let surfaces = Surfaces::build(&install)?;
+            surfaces = Surfaces::build(&install)?;
             load.renumbered = world.renumber_surfaces(
                 file.floor_map.as_deref(),
                 file.wall_map.as_deref(),
                 &surfaces,
             )?;
             // 6c and 7: the type table, which marks the types whose scripts
-            // changed.
-            if file.guid_table {
-                return Err(
-                    "the house has a GUID translation table (Gtab), which is not ported".into(),
-                );
-            }
+            // changed. Its GUIDs have been through the house's GUID table
+            // (0x43a6fb, in `House::load`).
             let types = &file.types.entries;
             for entry in types {
                 let object = catalog
@@ -559,7 +678,12 @@ impl Lot {
                 &catalog,
                 file.objects.instances.values().map(|o| o.guid),
             )?;
-            let read = interpreter.read_objects(&mut world, &file.objects, &people)?;
+            let read = interpreter.read_objects_with_frame_tree_bits(
+                &mut world,
+                &file.objects,
+                &people,
+                frame_tree_bits,
+            )?;
             load.read = read.objects.len();
             load.draws = read.draws;
             // 8: the lot-wide controllers, now among the saved objects. 9:
@@ -656,11 +780,10 @@ impl Lot {
         Ok(Self {
             program,
             catalog,
+            surfaces,
             world,
             tuning: None,
-            player: Answers {
-                queue: answers.iter().copied().collect(),
-            },
+            player: Answers::choices(answers),
             frames,
             ticks: 0,
             start,
@@ -694,8 +817,11 @@ impl Lot {
     /// Runs the next tick in play mode ([`crate::play`]): an error in an
     /// object's tick, such as an unported primitive, resets the object as
     /// the original does on a SimAntics error, and the lot goes on. The
-    /// errors caught are in [`Update::errors`]. Any other failure halts
-    /// the lot as [`Lot::step`] does.
+    /// errors caught are in [`Update::errors`]. A frame that fails is
+    /// skipped and noted in [`Update::frame_errors`]. Any other failure
+    /// ends the step as in [`Lot::step`]. A lot update that fails
+    /// ([`StepError::Tick`]) halts the lot, and carries what the step did
+    /// before it failed.
     ///
     /// Play mode is not the original's behaviour wherever a caught error
     /// comes from something not ported, so a lot stepped this way is not
@@ -775,7 +901,7 @@ impl Lot {
             view_rotation: self.view_rotation,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
-        let mut first_frame = None;
+        let mut frame_errors = Vec::new();
         if self.ticks == 0
             && self.frames.after(0)
             && let Err(error) = interpreter.draw_frame(&mut self.world, VIEW_LEVEL)
@@ -788,34 +914,60 @@ impl Lot {
                 }
                 .into());
             }
-            first_frame = Some(error.to_string());
+            frame_errors.push(SkippedFrame {
+                after: 0,
+                error: error.to_string(),
+            });
         }
         let tick = self.ticks + 1;
         // The idle loop sets a speed of its own before it runs the update
         // (0x46d9d6, `World::idle_speed`).
         let residential = residential(&self.world, &self.program);
         self.world.idle_speed(residential);
-        let update = interpreter
-            .lot_update_with(
-                &mut self.world,
-                tuning,
-                &mut self.player,
-                play.then_some(&mut self.play),
-            )
-            .map_err(|error| match error {
-                // Nobody has answered: the player is asked.
-                TickError::Unanswered { shown, given: None } if asks => Stop::Asks { tick, shown },
-                error => StepError::Tick {
-                    tick,
-                    start: self.start.wrapping_add(self.ticks),
-                    error: error.to_string(),
-                }
-                .into(),
-            })?;
+        // The application's poll (0x4d1a8b → 0x4764fe) before the next
+        // update sees 0 once the clicked dialog's button is destroyed.
+        // The poll runs once per pass of the application's loop, whose
+        // idle call can run several updates (0x46da70 to 0x46dac7); here
+        // every update is taken to follow a poll (unverified). Inside such
+        // a batch, the original would still show a clicked bitmap.
+        if let Err(error) = publish_waited_for(&mut self.world, 0) {
+            return Err(StepError::Tick {
+                tick,
+                start: self.start.wrapping_add(self.ticks),
+                error: TickError::from(error).to_string(),
+                update: None,
+            }
+            .into());
+        }
+        let (update, result) = interpreter.lot_update_kept(
+            &mut self.world,
+            tuning,
+            &mut self.player,
+            play.then_some(&mut self.play),
+        );
         let mut update = Update {
-            frame_errors: first_frame.into_iter().collect(),
+            frame_errors,
             ..update
         };
+        if let Err(error) = result {
+            return Err(match error {
+                // Nobody has answered: the player is asked.
+                TickError::Unanswered { shown, given: None } if asks => Stop::Asks { tick, shown },
+                error => {
+                    // In play mode what came before the failure goes with
+                    // it: the errors caught, a skipped first frame, and
+                    // the sounds.
+                    update.sounds = sounds.take();
+                    StepError::Tick {
+                        tick,
+                        start: self.start.wrapping_add(self.ticks),
+                        error: error.to_string(),
+                        update: play.then(|| Box::new(update)),
+                    }
+                    .into()
+                }
+            });
+        }
         self.ticks = tick;
         // After each update (0x46da70) the idle call looks at global 11,
         // which Special Effect sets (0x44aad6): when it is set, the call
@@ -844,7 +996,10 @@ impl Lot {
         update.sounds = sounds.into_inner();
         if let Some(error) = frame {
             if play {
-                update.frame_errors.push(error.to_string());
+                update.frame_errors.push(SkippedFrame {
+                    after: tick,
+                    error: error.to_string(),
+                });
                 return Ok(update);
             }
             return Err(StepError::Frame {
@@ -944,10 +1099,13 @@ impl Lot {
         })
     }
 
-    /// Queues on `person` the action of an entry [`Lot::pie_menu`] listed,
-    /// as picking it does ([`Interpreter::pick`]). Returns the action's number, or None
-    /// when the queue took nothing (it is full, or the action's entry is
-    /// gone). An order that fails changes nothing, as for
+    /// Queues the action of an entry [`Lot::pie_menu`] listed for
+    /// `person` on the action's caller, as picking it does
+    /// ([`Interpreter::pick`]): `person`, but for the offer to join
+    /// `person`'s running interaction, which is queued on the person the
+    /// menu was listed on. Returns the action's number, or None when the
+    /// queue took nothing (it is full, the action's entry is gone, or the
+    /// action has no caller). An order that fails changes nothing, as for
     /// [`Lot::queue_interaction`].
     pub fn pick(
         &mut self,
@@ -1060,16 +1218,26 @@ impl Lot {
         Ok(self.world.unpause())
     }
 
-    /// From now on, a dialog that offers a choice when no answer is left
-    /// in the list given at load waits for the player, as the original
-    /// waits (0x436da0): the step returns [`StepError::Asking`] and the
-    /// lot stays as it was before that tick, not halted. The window turns
-    /// this on; `sims boot` and the comparisons do not, and halt there.
+    /// Replace the pending answers with an explicit replay, one entry
+    /// per dialog shown, including one-button notices. Supply the bitmap
+    /// ID only when the replay calls for a wait-check publication
+    /// (0x4764fe). An exhausted replay leaves the next dialog unanswered.
+    /// Call between steps, before the lot is waiting for an answer.
+    /// The loaders' `&[u8]` lists still answer only dialogs with choices.
+    pub fn replay_dialogs(&mut self, answers: &[Answer]) -> Result<(), OrderError> {
+        self.ready()?;
+        self.player = Answers::replay(answers);
+        Ok(())
+    }
+
+    /// From now on, a dialog with no answer left in the list waits for
+    /// the player (0x436da0). The step returns [`StepError::Asking`] and
+    /// the lot stays ready to retry the tick. The window turns this on.
     ///
     /// The tick runs again once [`Lot::answer`] has the answer. A tick
     /// runs the same from the same lot, so it reaches the same dialog,
-    /// and the lot then goes on exactly as if the answer had been in the
-    /// list at load.
+    /// and the lot then goes on as if the answer had been queued before
+    /// the tick.
     pub fn wait_for_answers(&mut self) {
         self.asks = true;
     }
@@ -1080,14 +1248,19 @@ impl Lot {
     }
 
     /// Answers the dialog the lot waits on with `answer` (the status its
-    /// button gives: 2 the first, 3 the second, 4 the third). The next
-    /// step runs the tick again and gives it this answer; until then the
-    /// lot is as it was before that tick and takes no orders.
-    pub fn answer(&mut self, answer: u8) -> Result<(), AnswerError> {
+    /// button gives: 2 the first, 3 the second, 4 the third). The window
+    /// can include the activated button's bitmap ID in an [`Answer`].
+    /// The next step runs the tick again and gives it this answer; until
+    /// then the lot is as it was before that tick and takes no orders.
+    pub fn answer(&mut self, answer: impl Into<Answer>) -> Result<(), AnswerError> {
         let asking = self.asking.as_ref().ok_or(AnswerError::NotAsked)?;
         let offered = asking.shown.answers;
-        if !offered.contains(&answer) {
-            return Err(AnswerError::NotOffered { answer, offered });
+        let answer = answer.into();
+        if !offered.contains(&answer.status) {
+            return Err(AnswerError::NotOffered {
+                answer: answer.status,
+                offered,
+            });
         }
         self.player.queue.push_back(answer);
         self.asking = None;
@@ -1114,9 +1287,22 @@ impl Lot {
         &self.world
     }
 
+    /// The floor and wall catalogs the lot's patterns are keyed by: the
+    /// ones the load built, so a reader prices or draws the patterns the
+    /// load gave the keys to.
+    pub fn surfaces(&self) -> &Surfaces {
+        &self.surfaces
+    }
+
     /// The linked code and the catalog, for reading what an object is.
     pub fn program(&self) -> &Program {
         &self.program
+    }
+
+    /// Whether the lot is residential (0x40745f), as the idle loop and
+    /// the live panel's House button ask.
+    pub fn residential(&self) -> bool {
+        residential(&self.world, &self.program)
     }
 
     pub fn catalog(&self) -> &Catalog {
@@ -1195,6 +1381,7 @@ mod tests {
                 semi_globals: BTreeMap::new(),
                 diagnostics: Vec::new(),
             },
+            surfaces: sims_content::Surfaces::default(),
             world,
             tuning: None,
             player: Answers::default(),
@@ -1233,7 +1420,15 @@ mod tests {
         assert!(super::residential(&lot.world, &lot.program));
         // The update itself fails on an empty lot, after the idle loop
         // set its speed.
-        assert!(matches!(lot.step(), Err(StepError::Tick { tick: 1, .. })));
+        // A strict step hands back nothing with the failure.
+        assert!(matches!(
+            lot.step(),
+            Err(StepError::Tick {
+                tick: 1,
+                update: None,
+                ..
+            })
+        ));
         assert_eq!(lot.world.speed(), 1000);
         assert_eq!(lot.world.globals[18], 760);
         // A lot with no zoning is not residential: the idle loop leaves
@@ -1294,9 +1489,16 @@ mod tests {
     fn play_mode_still_halts_on_a_failure_outside_an_objects_tick() {
         let mut lot = lot(World::empty(), true, Frames::default());
         lot.tuning = Some(tuning());
-        let Err(StepError::Tick { tick: 1, .. }) = lot.step_play() else {
-            panic!("the tick should fail");
+        let Err(StepError::Tick {
+            tick: 1,
+            update: Some(update),
+            ..
+        }) = lot.step_play()
+        else {
+            panic!("the tick should fail, with what came before it");
         };
+        // Nothing was caught or skipped before the clock failed.
+        assert!(update.errors.is_empty() && update.frame_errors.is_empty());
         assert_eq!(lot.step_play().unwrap_err(), StepError::Halted);
         assert_eq!(lot.play, Play::default());
     }

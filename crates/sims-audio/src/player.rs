@@ -80,10 +80,12 @@
 //! event's own number when not 0, else the caller's (the object for the
 //! first, 0 for the others). [`kind`] lists them; ported are:
 //!
-//! - 1, play: starts the track. When the track's arguments are
+//! - 1, play: starts the track (or refreshes it, when it runs), and lets
+//!   it go. Only when the track's arguments are
 //!   `kArgsIdVolPan`, its object is recorded as an *instance* of the
 //!   track, and the track's `extvol` and `pan` are set from where all its
-//!   objects are ([`crate::placement`]); an object of 0 starts nothing.
+//!   objects are ([`crate::placement`]; 0x573756, 0x5737b3); an object
+//!   of 0 starts nothing.
 //!   A track with no running thread loses its stale instances first.
 //! - 18, fade: fades the track's `extvol` to 0 (see [`Player::play_from`]
 //!   for the speed), ending it after when the third argument says so.
@@ -129,15 +131,24 @@
 //! sound, so a 44.1 kHz song at pitch 3600 would otherwise play an octave
 //! low. That the data source delivers 22,050 Hz is **unverified**.
 //!
-//! The model differs from the original's here: the original has one
-//! track object per track number, shared by every object playing it,
-//! while this player runs a thread per play, and takes a track's newest
-//! thread where the original would use its one object. When an object
-//! lets go of a track others still have, the original re-evaluates the
-//! shared track (0x5746d9, not read); here that object's threads fade
-//! out and end. Kinds not ported (pausing, reloading, and the sound
-//! object calls only the game's code makes) are reported as faults;
-//! kinds whose case does nothing for sound are ignored.
+//! *(code)* The original has one track object per track number, shared
+//! by every object playing it; here a track runs one thread at most. A
+//! start of a track whose thread runs starts no second one: it refreshes
+//! that one, and starts it anew only when its `interrupt` is set (see
+//! `Player::start`). An object letting go of a track that others still
+//! have leaves it playing, placed again from where they are (0x5746d9).
+//! The model differs once a script ends with its note still playing:
+//! here the thread ends and the note plays on, so the track counts as
+//! not running and a start makes a new thread beside that note. The
+//! original's `end` with nothing to return to (0x57e3ee to 0x57edc8,
+//! vtable +0x34, 0x57dca3) instead fades a playing note out at speed 100
+//! and keeps the track running until the fade ends; by the code, its run
+//! loop (0x57d8b3) then goes on to the bytes after the `end`, since
+//! nothing moves the wait deadline. A start during that fade still reads
+//! `interrupt`, and clears the fade. That path is not ported.
+//! Kinds not ported (pausing, reloading, and the sound object calls only
+//! the game's code makes) are reported as faults; kinds whose case does
+//! nothing for sound are ignored.
 //!
 //! **Unverified** against the original at run time: all of the above.
 //! Left out: priorities, and the limit of 16 voices kind 1 checks first
@@ -156,17 +167,21 @@
 //! sequence groups, [`INSTANCES`] instances, and [`CHAIN`] patches
 //! chained to one note exist at once; calls nest at most [`CALL_DEPTH`] deep;
 //! a thread started by `play_trk` first runs in the next block; a patch
-//! that does not exist is not cached. How the original picks among
-//! duplicate events, patches and hit lists across modules is unknown;
-//! here the module whose name sorts first wins.
+//! that does not exist is not cached. A track, patch, hit list or track
+//! data ID that several modules define is the last one registered
+//! ([`owners`], [`hit_lists`], [`entry_points`]). How the original picks
+//! among duplicate events is unknown; here the module whose name sorts
+//! first wins.
 
 use crate::ambience::{self, Fresh, Host, Key, Voice};
 use crate::files::SoundFiles;
 use crate::fsc::Score;
 use crate::hit::{Instruction, Operand};
+use crate::hot::Object;
 use crate::levels::{self, Inputs, Levels};
 use crate::module::Module;
 use crate::placement::{self, Projection};
+use crate::registry::Registry;
 use crate::stations::StationLists;
 use crate::{Pcm, SoundEvent};
 use std::collections::{BTreeMap, BTreeSet};
@@ -218,6 +233,10 @@ pub const FADE_SPEED: u8 = 42;
 pub const FADE_ON: u8 = 45;
 /// `source`, which `play_trk` hands on to the track it starts.
 pub const SOURCE: u8 = 47;
+/// `interrupt`: when not 0, a start of the track while it runs starts it
+/// again (see `Player::start`). In the install only `loadb` writes it;
+/// `set` can too (0x57e219 to 0x57e2da).
+pub const INTERRUPT: u8 = 55;
 /// `isplaying`, which a fresh start sets to 1.
 pub const ISPLAYING: u8 = 46;
 /// `Spl`, which the placement reads ([`crate::placement`]).
@@ -243,6 +262,9 @@ pub const DEFAULTS: [(u8, i32); 10] = [
 ];
 /// `Spl`'s default, the HSM files' `spl_normal`.
 pub const SPL_NORMAL: i32 = 20;
+/// The registers a fresh start sets to their starting values, first and
+/// last: the two default banks (0x57d727 to 0x57d741).
+pub const BANKS: [(u8, u8); 2] = [(17, 47), (50, 62)];
 /// Registers with side effects: `vol`, `duckpri`, 3D, `target` and the
 /// global `main_duckpri`.
 pub const VOL: u8 = 18;
@@ -397,10 +419,23 @@ pub trait Sources {
     fn projection(&self, object: i32) -> Option<Projection>;
 }
 
-/// *(code)* Writes a starting track's argument registers 1 to 3, as the
-/// original's start does whatever the track's argument kind (0x57d9cb to
-/// 0x57d9eb, each a register write that sets the comparison flags).
+/// What [`Player::start`] did: the threads it started or refreshed
+/// (none when it could not start), and whether it started one anew.
+#[derive(Debug, Default)]
+struct Started {
+    threads: Vec<u32>,
+    fresh: bool,
+}
+
+/// *(code)* What every start does first, whether or not the track runs
+/// (0x57d9b2 to 0x57d9eb): it stops any fade and the end it was to bring
+/// (`fade_on` and the flag at +0x1cf), points `target` back at the track
+/// itself, and writes the argument registers 1 to 3, whatever the
+/// track's argument kind (each a register write that sets the comparison
+/// flags).
 fn set_arguments(thread: &mut Thread, args: [u32; 3]) {
+    thread.registers[usize::from(FADE_ON)] = 0;
+    thread.kill_after_fade = false;
     thread.target = Target::Own;
     for (register, value) in (1..=3).zip(args) {
         thread.registers[register] = value as i32;
@@ -438,13 +473,14 @@ impl Sources for NoSources {
 #[derive(Debug, Clone)]
 struct Thread {
     id: u32,
-    object: u32,
+    /// The module whose program the thread is running: where its track's
+    /// entry point, or the last `jump` or `call`, led ([`entry_points`]).
     module: usize,
     track: u32,
     pc: u32,
     registers: [i32; GLOBALS as usize],
-    stack: Vec<u32>,
-    loop_point: u32,
+    stack: Vec<Place>,
+    loop_point: Place,
     kept: i64,
     hit_list: Vec<u32>,
     last_note: u32,
@@ -457,6 +493,10 @@ struct Thread {
     target: Target,
     /// End the thread when its fade ends (the original's flag at +0x1cf).
     kill_after_fade: bool,
+    /// Where the thread is in the original's list of running tracks:
+    /// threads run in this order, from the next block. A fresh start and
+    /// a let-go put it last (0x57dc9a, 0x57d017).
+    order: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -472,7 +512,6 @@ struct Note {
     /// a track with no thread.
     thread: u32,
     track: u32,
-    object: u32,
     patch: u32,
     /// Position in source frames, 16.16 fixed point.
     position: u64,
@@ -550,6 +589,156 @@ fn xorshift(state: &mut u64, below: u32) -> u32 {
 
 /// Spreads a seed over all 64 bits (splitmix64), so nearby seeds start
 /// far apart. Never 0, which xorshift cannot leave.
+/// The registry of patch and track objects as the original fills it at
+/// startup: the base game's tables, then the station patches, then the
+/// expansions' and the downloads' tables ([`Registry::rank`]), each
+/// module's in file order. Modules of one rank keep their order here.
+fn registry(modules: &[Module], station_patches: &[(u32, String)]) -> Registry {
+    let mut registry = Registry::new();
+    let mut stations = Some(station_patches);
+    for m in registration_order(modules) {
+        if Registry::rank(&modules[m].name) > 0
+            && let Some(ids) = stations.take()
+        {
+            ids.iter().for_each(|(id, _)| registry.insert(*id));
+        }
+        for &(id, _) in &modules[m].hot.registered {
+            registry.insert(id);
+        }
+    }
+    if let Some(ids) = stations {
+        ids.iter().for_each(|(id, _)| registry.insert(*id));
+    }
+    registry
+}
+
+/// The modules in the original's order of registration
+/// ([`Registry::rank`]), as indices.
+fn registration_order(modules: &[Module]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..modules.len()).collect();
+    order.sort_by_key(|&m| Registry::rank(&modules[m].name));
+    order
+}
+
+/// *(code)* Each track's and each patch's module: the one whose line
+/// registered it last. The registry holds one object per ID, and an ID
+/// registered again replaces its object (0x57ce04 to 0x57ce32), so every
+/// start of a track looks up that object (0x573312) and runs from its
+/// descriptor (0x57db7a to 0x57db91), whichever module asked.
+///
+/// Patches and tracks share the registry, so an ID registered again as
+/// the other kind is that kind only: it is left out of the other map. In
+/// the install, track 68262's `[Track]` line comes before a `[Patch]` line
+/// of the same ID in its file, and patches 6401 and 6402 are replaced by
+/// tracks of a download registered later. A start that finds a patch
+/// object starts nothing (its slot returns at once, 0x57bf80), and a note
+/// whose patch is a track object fails (0x57f6ac to 0x57f703).
+///
+/// The station patches ([`Registrant::Station`]) register through the same routine
+/// (0x5750dc calls 0x57cdd5), after the base game's tables and before the
+/// expansions', with numbers their allocator hands out without looking
+/// at the registry (0x57d386): one replaces a base game object of its
+/// number, and an expansion's or a download's replaces it.
+fn owners(
+    modules: &[Module],
+    station_patches: &[(u32, String)],
+) -> (BTreeMap<u32, usize>, BTreeMap<u32, (Registrant, String)>) {
+    let mut tracks = BTreeMap::new();
+    let mut patches = BTreeMap::new();
+    let mut stations = Some(station_patches);
+    let add_stations = |tracks: &mut BTreeMap<u32, usize>,
+                        patches: &mut BTreeMap<u32, (Registrant, String)>,
+                        stations: &mut Option<&[(u32, String)]>| {
+        for (at, (id, path)) in stations.take().into_iter().flatten().enumerate() {
+            patches.insert(*id, (Registrant::Station(at), path.clone()));
+            tracks.remove(id);
+        }
+    };
+    for m in registration_order(modules) {
+        if Registry::rank(&modules[m].name) > 0 {
+            add_stations(&mut tracks, &mut patches, &mut stations);
+        }
+        let hot = &modules[m].hot;
+        for &(id, object) in &hot.registered {
+            match object {
+                Object::Track => {
+                    tracks.insert(id, m);
+                    patches.remove(&id);
+                }
+                Object::Patch => {
+                    patches.insert(id, (Registrant::Module(m), hot.patches[&id].path.clone()));
+                    tracks.remove(&id);
+                }
+            }
+        }
+    }
+    add_stations(&mut tracks, &mut patches, &mut stations);
+    (tracks, patches)
+}
+
+/// Whose line registered a patch: a module's, by index, or the station
+/// patch made `n`th ([`Player::add_stations`]). Each registration makes a
+/// new object (0x5750a0 to 0x5750c5), so two are never the same object,
+/// whatever their samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Registrant {
+    Module(usize),
+    Station(usize),
+}
+
+/// A place in a module's program: the module and the address.
+type Place = (usize, u32);
+
+/// *(code)* Each track data ID's place: the module whose `[TrackData]`
+/// line registered it last, and the address there. The original keeps one
+/// table of them for every module (manager +0x168): each line stores the
+/// address in the program being loaded (0x57ce70 to 0x57ce98), so an ID
+/// registered again points into the later module's program. A track's
+/// entry point (0x57dd8d, 0x57dbe2), and every `jump`, `call` and `if`
+/// (0x57e3b5, 0x57e3d4), look an ID up in it, whichever module's program
+/// is running, so a thread can go on in another module's program.
+fn entry_points(modules: &[Module]) -> BTreeMap<u32, Place> {
+    let mut places = BTreeMap::new();
+    for m in registration_order(modules) {
+        for (&id, &address) in &modules[m].hot.track_data {
+            places.insert(id, (m, address));
+        }
+    }
+    places
+}
+
+/// *(code)* The hit lists, each from the module whose line registered it
+/// last: the HOT reader makes a new list for each `[GlobalHitList]` line
+/// (0x57ba20) and the table keeps the newest for its ID (0x57d261). The
+/// stations add to the lists there are when they are built (0x574c9e to
+/// 0x574cb7, 0x574e74), after the base game's tables and before the
+/// expansions', so an expansion's list of the same ID replaces what they
+/// added.
+fn hit_lists(modules: &[Module], stations: &BTreeMap<u32, Vec<u32>>) -> BTreeMap<u32, Vec<u32>> {
+    let mut lists: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    let mut pending = Some(stations);
+    for m in registration_order(modules) {
+        if Registry::rank(&modules[m].name) > 0
+            && let Some(stations) = pending.take()
+        {
+            add_station_lists(&mut lists, stations);
+        }
+        for (&id, list) in &modules[m].hot.hit_lists {
+            lists.insert(id, list.clone());
+        }
+    }
+    if let Some(stations) = pending {
+        add_station_lists(&mut lists, stations);
+    }
+    lists
+}
+
+fn add_station_lists(lists: &mut BTreeMap<u32, Vec<u32>>, stations: &BTreeMap<u32, Vec<u32>>) {
+    for (&id, list) in stations {
+        lists.entry(id).or_default().extend(list);
+    }
+}
+
 fn splitmix(seed: u64) -> u64 {
     let mut z = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -560,13 +749,13 @@ fn splitmix(seed: u64) -> u64 {
 /// What one instruction did to its thread.
 enum Flow {
     Next,
-    Jump(u32),
+    Jump(Place),
     /// Stay on this instruction and run it again next block.
     Block,
     /// Go on to the next instruction next block.
     Yield,
     /// Go to this address next block.
-    JumpYield(u32),
+    JumpYield(Place),
     End,
     /// End the thread, whatever called it, and stop its notes.
     Kill,
@@ -576,14 +765,29 @@ enum Flow {
 pub struct Player<S> {
     modules: Vec<Module>,
     samples: S,
-    /// Patch ID to (module, path), the first module's winning.
-    patches: BTreeMap<u32, (usize, String)>,
+    /// Patch ID to (registrant, path): whose line registered it last
+    /// ([`owners`]). An ID whose last line is
+    /// a track's is not here.
+    patches: BTreeMap<u32, (Registrant, String)>,
+    /// Track ID to the module whose line registered it last
+    /// ([`owners`]): the module every start of the track runs from. An ID
+    /// whose last line is a patch's is not here.
+    tracks: BTreeMap<u32, usize>,
+    /// Track data ID to its place ([`entry_points`]).
+    track_data: BTreeMap<u32, Place>,
+    /// Hit list ID to its entries ([`hit_lists`]).
     hit_lists: BTreeMap<u32, Vec<u32>>,
+    /// The stations' hit lists added, merged.
+    station_lists: BTreeMap<u32, Vec<u32>>,
+    /// *(code)* The registry of patch and track objects (manager +0x80),
+    /// for the order the unpause goes through them.
+    registry: Registry,
+    /// The station patches added, in the order they were made, with their
+    /// samples' paths.
+    station_patches: Vec<(u32, String)>,
     cache: BTreeMap<u32, Option<Pcm>>,
     globals: [i32; 256 - GLOBALS as usize],
     threads: Vec<Thread>,
-    /// Threads started by `play_trk`, which first run in the next block.
-    pending: Vec<Thread>,
     /// Whether a block has run out of instructions; reported once.
     over_budget: bool,
     /// Sequence groups: the group a register names, to the ID of the
@@ -648,6 +852,8 @@ pub struct Player<S> {
     /// The frame at which the threads last ran.
     ran_at: Option<u64>,
     next_id: u32,
+    /// The next [`Thread::order`].
+    next_order: i64,
     random: u64,
     /// What went wrong while running, in order: unknown events, missing
     /// samples, threads ended for a bad instruction. At most [`FAULTS`].
@@ -659,27 +865,23 @@ impl<S: Samples> Player<S> {
     /// [`Module::load_all`] returns them). `seed` starts its random
     /// numbers.
     pub fn new(modules: Vec<Module>, samples: S, seed: u64) -> Self {
-        let mut patches = BTreeMap::new();
-        let mut hit_lists = BTreeMap::new();
-        for (index, module) in modules.iter().enumerate() {
-            for (&id, patch) in &module.hot.patches {
-                patches
-                    .entry(id)
-                    .or_insert_with(|| (index, patch.path.clone()));
-            }
-            for (&id, list) in &module.hot.hit_lists {
-                hit_lists.entry(id).or_insert_with(|| list.clone());
-            }
-        }
+        let (tracks, patches) = owners(&modules, &[]);
+        let track_data = entry_points(&modules);
+        let hit_lists = hit_lists(&modules, &BTreeMap::new());
+        let registry = registry(&modules, &[]);
         Self {
             modules,
             samples,
             patches,
+            tracks,
+            track_data,
             hit_lists,
+            station_lists: BTreeMap::new(),
+            registry,
+            station_patches: Vec::new(),
             cache: BTreeMap::new(),
             globals: [0; 256 - GLOBALS as usize],
             threads: Vec::new(),
-            pending: Vec::new(),
             over_budget: false,
             seqgroups: BTreeMap::new(),
             duck: BTreeMap::new(),
@@ -703,6 +905,7 @@ impl<S: Samples> Player<S> {
             frame: 0,
             ran_at: None,
             next_id: 1,
+            next_order: 0,
             random: splitmix(seed),
             faults: Vec::new(),
         }
@@ -817,9 +1020,10 @@ impl<S: Samples> Player<S> {
     /// new volume; a running thread's fade on its own `extvol`, while
     /// its `target` names an ended thread, is left as it was.
     ///
-    /// The original's track object outlives its script, and a note it
-    /// started plays on after the script ends (`note_on` then `end`);
-    /// the write reaches that note too. Here a thread that ends with
+    /// The original's track object outlives its script, and so does a
+    /// note it started (`note_on` then `end`): there it fades out (see
+    /// the module doc), here it plays on. The write reaches that note
+    /// too. Here a thread that ends with
     /// notes playing keeps its registers while they play, and the write
     /// goes to every such thread of the track as well, whose notes take
     /// their new levels at once, except the last start's thread when it
@@ -854,16 +1058,7 @@ impl<S: Samples> Player<S> {
     /// flag starts clear. Nor is the day and night loop that kind 33
     /// picks last (0x574978).
     pub fn camera_moved(&mut self, view: i32, hour: u32, sources: &dyn Sources) {
-        // A track that was killed lets its notes go at once; what it kept
-        // for them goes with them.
-        let notes = &self.notes;
-        self.ended
-            .retain(|id, _| notes.iter().any(|note| note.thread == *id));
-        self.idle.retain(|track, _| {
-            notes
-                .iter()
-                .any(|note| note.thread == 0 && note.track == *track)
-        });
+        self.forget_silent();
         let mut tracks: Vec<u32> = Vec::new();
         for &(track, _) in &self.instances {
             if !tracks.contains(&track) {
@@ -871,94 +1066,110 @@ impl<S: Samples> Player<S> {
             }
         }
         for track in tracks {
-            let ended: Vec<u32> = self
-                .ended
-                .values()
-                .filter(|t| t.track == track)
-                .map(|t| t.id)
-                .collect();
-            // Only the thread of the track's last start has the `target`
-            // the original's track object has: a later start set it back
-            // to itself, so an older thread, running or ended, is written
-            // and read itself.
-            let last = self.last_start.get(&track).copied();
-            let newest = self.newest(track).map(|at| self.threads[at].id);
-            let running = |id: u32| {
-                self.threads
-                    .iter()
-                    .chain(&self.pending)
-                    .find(|t| t.id == id)
-            };
-            // The last start's thread reads through the chain its write
-            // goes through.
-            let spl_of = |thread: &Thread| {
-                let source = if Some(thread.id) == last {
-                    self.kept_thread(self.camera_destination(thread.id))
-                        .unwrap_or(thread)
-                } else {
-                    thread
-                };
-                source.registers[usize::from(SPL)]
-            };
-            let spl = if let Some(thread) = last.and_then(running) {
-                spl_of(thread)
-            } else if let Some(thread) = last.and_then(|id| self.ended.get(&id)) {
-                spl_of(thread)
-            } else if let Some(thread) = newest.and_then(running) {
-                spl_of(thread)
-            } else if let Some(thread) = ended.last().and_then(|id| self.ended.get(id)) {
-                spl_of(thread)
-            } else if let Some(idle) = self.idle.get(&track) {
-                self.read(idle, i64::from(SPL))
-            } else {
-                continue;
-            };
-            let last_running = last.filter(|&id| running(id).is_some());
-            let Some((vol, pan)) = self.placed_with(track, spl, sources) else {
-                continue;
-            };
-            // The last start's thread, running or about to, is written as
-            // it would write; with none, the newest running one takes it
-            // itself.
-            if let Some(id) = last_running {
-                self.place_through(id, vol, pan);
-            } else if let Some(at) = self.newest(track) {
-                place_itself(&mut self.threads[at], vol, pan);
-            }
-            for id in ended {
-                // The last start's thread writes through its `target`; only
-                // the thread written takes new levels.
-                if last == Some(id) {
-                    self.place_through(id, vol, pan);
-                    continue;
-                }
-                let Some(mut thread) = self.ended.remove(&id) else {
-                    continue;
-                };
-                place_itself(&mut thread, vol, pan);
-                let levels = self.levels(&thread);
-                for note in self.notes.iter_mut().filter(|n| n.thread == id) {
-                    note.gains = levels.gains;
-                    note.step = step(levels.rate);
-                }
-                self.ended.insert(id, thread);
-            }
-            if let Some(mut idle) = self.idle.remove(&track) {
-                self.write(&mut idle, i64::from(EXTVOL), vol);
-                self.write(&mut idle, i64::from(PAN), pan);
-                let levels = self.levels(&idle);
-                for note in self
-                    .notes
-                    .iter_mut()
-                    .filter(|n| n.thread == 0 && n.track == track)
-                {
-                    note.gains = levels.gains;
-                    note.step = step(levels.rate);
-                }
-                self.idle.insert(track, idle);
-            }
+            self.place_track(track, sources);
         }
         self.set_ambience_view(view, hour);
+    }
+
+    /// A track that was killed lets its notes go at once; what it kept
+    /// for them goes with them.
+    fn forget_silent(&mut self) {
+        let notes = &self.notes;
+        self.ended
+            .retain(|id, _| notes.iter().any(|note| note.thread == *id));
+        self.idle.retain(|&track, _| {
+            notes
+                .iter()
+                .any(|note| note.thread == 0 && note.track == track)
+        });
+    }
+
+    /// Places a track again from where its objects are (0x5746d9), as
+    /// [`Player::camera_moved`] describes. The caller forgets what killed
+    /// tracks kept first ([`Player::forget_silent`]): a placement changes
+    /// no note's life, so a camera move does it once for all its tracks.
+    fn place_track(&mut self, track: u32, sources: &dyn Sources) {
+        let ended: Vec<u32> = self
+            .ended
+            .values()
+            .filter(|t| t.track == track)
+            .map(|t| t.id)
+            .collect();
+        // Only the thread of the track's last start has the `target`
+        // the original's track object has: a later start set it back
+        // to itself, so an older thread, running or ended, is written
+        // and read itself.
+        let last = self.last_start.get(&track).copied();
+        let newest = self.newest(track).map(|at| self.threads[at].id);
+        let running = |id: u32| self.threads.iter().find(|t| t.id == id);
+        // The last start's thread reads through the chain its write
+        // goes through.
+        let spl_of = |thread: &Thread| {
+            let source = if Some(thread.id) == last {
+                self.kept_thread(self.camera_destination(thread.id))
+                    .unwrap_or(thread)
+            } else {
+                thread
+            };
+            source.registers[usize::from(SPL)]
+        };
+        let spl = if let Some(thread) = last.and_then(running) {
+            spl_of(thread)
+        } else if let Some(thread) = last.and_then(|id| self.ended.get(&id)) {
+            spl_of(thread)
+        } else if let Some(thread) = newest.and_then(running) {
+            spl_of(thread)
+        } else if let Some(thread) = ended.last().and_then(|id| self.ended.get(id)) {
+            spl_of(thread)
+        } else if let Some(idle) = self.idle.get(&track) {
+            self.read(idle, i64::from(SPL))
+        } else {
+            return;
+        };
+        let last_running = last.filter(|&id| running(id).is_some());
+        let Some((vol, pan)) = self.placed_with(track, spl, sources) else {
+            return;
+        };
+        // The last start's thread, running or about to, is written as
+        // it would write; with none, the newest running one takes it
+        // itself.
+        if let Some(id) = last_running {
+            self.place_through(id, vol, pan);
+        } else if let Some(at) = self.newest(track) {
+            place_itself(&mut self.threads[at], vol, pan);
+        }
+        for id in ended {
+            // The last start's thread writes through its `target`; only
+            // the thread written takes new levels.
+            if last == Some(id) {
+                self.place_through(id, vol, pan);
+                continue;
+            }
+            let Some(mut thread) = self.ended.remove(&id) else {
+                continue;
+            };
+            place_itself(&mut thread, vol, pan);
+            let levels = self.levels(&thread);
+            for note in self.notes.iter_mut().filter(|n| n.thread == id) {
+                note.gains = levels.gains;
+                note.step = step(levels.rate);
+            }
+            self.ended.insert(id, thread);
+        }
+        if let Some(mut idle) = self.idle.remove(&track) {
+            self.write(&mut idle, i64::from(EXTVOL), vol);
+            self.write(&mut idle, i64::from(PAN), pan);
+            let levels = self.levels(&idle);
+            for note in self
+                .notes
+                .iter_mut()
+                .filter(|n| n.thread == 0 && n.track == track)
+            {
+                note.gains = levels.gains;
+                note.step = step(levels.rate);
+            }
+            self.idle.insert(track, idle);
+        }
     }
 
     /// *(code)* The ambience half of kind 33 (0x574157): moves the
@@ -1033,14 +1244,14 @@ impl<S: Samples> Player<S> {
     /// neighbourhood) the backyard score becomes current and starts, its
     /// cursor first set to (1000, 500) per mille, which starting resets
     /// when it was stopped; in any other mode the current ambience stops.
-    fn set_music_mode(&mut self, module: usize, mode: i64) {
+    fn set_music_mode(&mut self, mode: i64) {
         if mode != self.music_mode {
             if mode == 3 {
                 self.music_started = true;
             }
             if self.music_started {
                 let previous = std::mem::replace(&mut self.music_mode, mode);
-                self.change_music(module, mode, previous);
+                self.change_music(mode, previous);
             }
         }
         let frame = self.frame;
@@ -1104,7 +1315,7 @@ impl<S: Samples> Player<S> {
     /// its own thread around most of these starts (`Sleep`), so its
     /// sound thread runs between; here the events are acted on at once,
     /// in order, with nothing between.
-    fn change_music(&mut self, module: usize, mode: i64, previous: i64) {
+    fn change_music(&mut self, mode: i64, previous: i64) {
         use music::*;
         if mode == 3 {
             if EXPANSIONS & 1 != 0 {
@@ -1116,8 +1327,10 @@ impl<S: Samples> Player<S> {
         if mode != 15 {
             self.kill_track(MT_RIVER_LOOP);
         }
+        // *(code)* Each start lets the track go (vtable +0x2c, 0x57523f).
         let start = |player: &mut Self, track: u32, list: u32| {
-            player.start([list, 0, 0], module, track, false);
+            let started = player.start([list, 0, 0], track);
+            player.let_go(&started.threads);
         };
         let switch = |player: &mut Self, list: u32| {
             player.kill_track(FADE_AND_KILL_SLOW);
@@ -1142,7 +1355,7 @@ impl<S: Samples> Player<S> {
             6 => start(self, SET_MAIN_KILL_FIRST, credits(EXPANSIONS)),
             8 => {
                 for track in [RIVER_LOOP, MT_RIVER_LOOP, NHOOD_DOZE_LOOP] {
-                    self.fade_and_kill(track, None);
+                    self.fade_and_kill(track);
                 }
             }
             10..=14 | 16 => switch(self, EXPANSION_LISTS[(mode - 10) as usize]),
@@ -1171,12 +1384,10 @@ impl<S: Samples> Player<S> {
         let ended: Vec<u32> = self
             .threads
             .iter()
-            .chain(&self.pending)
             .filter(|t| t.track == track && !spared(t.id))
             .map(|t| t.id)
             .collect();
         self.threads.retain(|t| !ended.contains(&t.id));
-        self.pending.retain(|t| !ended.contains(&t.id));
         self.notes
             .retain(|n| !(n.track == track && !spared(n.thread)));
         self.forget_ended();
@@ -1204,7 +1415,6 @@ impl<S: Samples> Player<S> {
     /// Whether nothing is running or playing.
     pub fn is_idle(&self) -> bool {
         self.threads.is_empty()
-            && self.pending.is_empty()
             && self.notes.is_empty()
             && self.voices.is_empty()
             && self.scores.values().all(|s| !s.is_started())
@@ -1213,14 +1423,41 @@ impl<S: Samples> Player<S> {
     /// Adds the stations' hit lists and patches (see
     /// [`crate::stations`]), which the original builds from directories
     /// when it starts. A hit list the sound tables already list is added
-    /// to; a patch number already taken is left alone.
+    /// to, as [`hit_lists`] says; a patch replaces a base game object of
+    /// its number, and an expansion's or a download's replaces it, as
+    /// [`owners`] says.
     pub fn add_stations(&mut self, lists: &StationLists) {
-        for (&id, list) in &lists.hit_lists {
-            self.hit_lists.entry(id).or_default().extend(list);
-        }
+        add_station_lists(&mut self.station_lists, &lists.hit_lists);
+        self.hit_lists = hit_lists(&self.modules, &self.station_lists);
         for (&id, path) in &lists.patches {
-            self.patches.entry(id).or_insert_with(|| (0, path.clone()));
+            // Numbered in the order they are made, each registered then
+            // (0x574f0e).
+            self.station_patches.push((id, path.clone()));
         }
+        let (tracks, patches) = owners(&self.modules, &self.station_patches);
+        // An object replaced goes, with what it was doing (0x5750dc calls
+        // 0x57cdd5, which destroys it, 0x57ce04 to 0x57ce32). The original
+        // builds the stations before any sound plays; here they may come
+        // later.
+        let replaced: BTreeSet<u32> = self
+            .tracks
+            .iter()
+            .filter(|&(id, owner)| tracks.get(id) != Some(owner))
+            .map(|(&id, _)| id)
+            .chain(
+                self.patches
+                    .iter()
+                    .filter(|&(id, owner)| patches.get(id) != Some(owner))
+                    .map(|(&id, _)| id),
+            )
+            .collect();
+        (self.tracks, self.patches) = (tracks, patches);
+        for id in replaced {
+            self.destroy(id);
+        }
+        // The original builds the stations between the base game's
+        // tables and the expansions' ([`crate::registry`]).
+        self.registry = registry(&self.modules, &self.station_patches);
     }
 
     /// Acts on one event from the simulation. `sources` is where the
@@ -1230,7 +1467,7 @@ impl<S: Samples> Player<S> {
         match event {
             SoundEvent::Play { object, name } => self.play(*object, name, sources),
             // What the game calls with kind 23 when an object goes.
-            SoundEvent::StopObject { object } => self.kill_instance(*object),
+            SoundEvent::StopObject { object } => self.kill_instance(*object, sources),
             // Kind 20, as the game calls it.
             SoundEvent::StopAll => self.kill_all(),
             // Kinds 21 and 22, as the game calls them (0x57a7f2, 0x57a8e3).
@@ -1292,17 +1529,17 @@ impl<S: Samples> Player<S> {
         let args = [given(0, object), given(1, 0), given(2, 0)];
         let track = track as u32;
         match kind {
-            kind::PLAY => self.play_track(module, track, args, sources),
+            kind::PLAY => self.play_track(track, args, sources),
             kind::FADE => self.fade_track(track, args),
             kind::CANCEL_NOTE => self.cancel_radio_notes(),
             kind::KILL_ALL => self.kill_all(),
             kind::PAUSE => self.pause(),
             kind::UNPAUSE => self.unpause(),
-            kind::KILL_INSTANCE => self.kill_instance(track),
+            kind::KILL_INSTANCE => self.kill_instance(track, sources),
             kind::SET_AMBIENCE_MODE => self.set_ambience_mode(track),
-            kind::SET_MUSIC_MODE => self.set_music_mode(module, i64::from(track as i32)),
-            kind::TURN_ON_TV => self.turn_on_tv(module, track, args, sources),
-            kind::PLAY_PIANO => self.play_piano(module, args, sources),
+            kind::SET_MUSIC_MODE => self.set_music_mode(i64::from(track as i32)),
+            kind::TURN_ON_TV => self.turn_on_tv(track, args, sources),
+            kind::PLAY_PIANO => self.play_piano(args, sources),
             kind::SEQUENCE_TRACK_HIT_LIST => self.sequence(track, args[1]),
             kind::KILL_OBJECT_SOUNDS => self.kill_object_sounds(),
             kind if kind::NOTHING_FOR_SOUND.contains(&kind) => {}
@@ -1320,9 +1557,9 @@ impl<S: Samples> Player<S> {
     /// first argument of 0 starts nothing; any other is recorded as an
     /// instance of the track, and the track's `extvol` and `pan` are set
     /// from where its objects are ([`crate::placement`]).
-    fn play_track(&mut self, module: usize, track: u32, args: [u32; 3], sources: &dyn Sources) {
-        if self.owner(module, track).is_none() {
-            self.report(format!("no track {track}"));
+    fn play_track(&mut self, track: u32, args: [u32; 3], sources: &dyn Sources) {
+        if self.owner(track).is_none() {
+            self.no_track(track);
             return;
         }
         let alive = self.threads.iter().any(|t| t.track == track)
@@ -1330,8 +1567,11 @@ impl<S: Samples> Player<S> {
         if !alive {
             self.instances.retain(|&(t, _)| t != track);
         }
-        if self.track_args(module, track) != Some(ARGS_ID_VOL_PAN) {
-            self.start(args, module, track, false);
+        // *(code)* The argument kind is the track object's own (+0x28 on
+        // the object looked up, 0x573748 to 0x573756).
+        if self.track_args(track) != Some(ARGS_ID_VOL_PAN) {
+            let started = self.start(args, track);
+            self.let_go(&started.threads);
             return;
         }
         if args[0] == 0 {
@@ -1339,8 +1579,9 @@ impl<S: Samples> Player<S> {
         }
         self.record(track, args[0]);
         let placed = self.placed(track, sources);
-        let threads = self.start(args, module, track, false);
-        self.place(&threads, placed);
+        let started = self.start(args, track);
+        self.place(&started.threads, placed);
+        self.let_go(&started.threads);
     }
 
     /// A track's volume and pan from where its objects are, as the sum
@@ -1377,7 +1618,6 @@ impl<S: Samples> Player<S> {
     fn spl(&self, track: u32) -> i32 {
         self.threads
             .iter()
-            .chain(&self.pending)
             .filter(|t| t.track == track)
             .max_by_key(|t| t.id)
             .map_or(SPL_NORMAL, |t| self.read(t, i64::from(SPL)))
@@ -1391,12 +1631,7 @@ impl<S: Samples> Player<S> {
         let Some((vol, pan)) = placed else {
             return;
         };
-        for thread in self
-            .threads
-            .iter_mut()
-            .chain(&mut self.pending)
-            .filter(|t| threads.contains(&t.id))
-        {
+        for thread in self.threads.iter_mut().filter(|t| threads.contains(&t.id)) {
             thread.registers[usize::from(EXTVOL)] = vol;
             thread.registers[usize::from(PAN)] = pan;
             thread.kept = i64::from(pan);
@@ -1424,23 +1659,55 @@ impl<S: Samples> Player<S> {
         }
     }
 
-    /// The `args` field of the track a module (or the first other)
-    /// defines.
-    fn track_args(&self, module: usize, track: u32) -> Option<i64> {
-        let owner = self.owner(module, track)?;
+    /// The `args` field of a track, as the module it runs from defines
+    /// it.
+    fn track_args(&self, track: u32) -> Option<i64> {
+        let owner = self.owner(track)?;
         let owner = &self.modules[owner];
         owner.number(&owner.hot.tracks[&track].args)
     }
 
-    /// The module that defines a track: the one given, or else the first.
-    fn owner(&self, module: usize, track: u32) -> Option<usize> {
-        std::iter::once(module)
-            .chain(0..self.modules.len())
-            .find(|&m| {
-                self.modules
-                    .get(m)
-                    .is_some_and(|m| m.hot.tracks.contains_key(&track))
-            })
+    /// The module a track runs from, whichever module asks for it: the
+    /// one whose line registered it last ([`owners`]). `None` when no
+    /// module lists it.
+    fn owner(&self, track: u32) -> Option<usize> {
+        self.tracks.get(&track).copied()
+    }
+
+    /// Reports a start of a track no module lists. A patch object of that
+    /// ID is no fault: its start slot returns at once (0x57bf80).
+    fn no_track(&mut self, track: u32) {
+        if !self.patches.contains_key(&track) {
+            self.report(format!("no track {track}"));
+        }
+    }
+
+    /// Forgets everything the object of this ID was doing, as a track and
+    /// as a patch: its threads and notes, any note playing it as a patch,
+    /// and its cached samples. A note playing another patch with this one
+    /// queued plays on without it: releasing a patch releases its samples
+    /// (0x57fd25), not the voice it is queued on (0x57e09e to 0x57e0b6).
+    /// **Unverified:** whether that voice still plays it, from the path it
+    /// copied (0x57ff7e to 0x57ff9a). The manager's instance records stay
+    /// (0x57442d to 0x574473).
+    fn destroy(&mut self, id: u32) {
+        self.kill_track(id);
+        self.held.remove(&id);
+        self.idle.remove(&id);
+        self.ended.retain(|_, t| t.track != id);
+        self.track_objects.remove(&id);
+        self.last_start.remove(&id);
+        self.notes.retain(|n| n.patch != id);
+        for note in &mut self.notes {
+            note.chain.retain(|&patch| patch != id);
+        }
+        self.cache.remove(&id);
+    }
+
+    /// Whether the registry has an object of this ID (0x573312), a track
+    /// or a patch.
+    fn registered(&self, id: u32) -> bool {
+        self.tracks.contains_key(&id) || self.patches.contains_key(&id)
     }
 
     /// The newest running thread of a track, as an index.
@@ -1466,12 +1733,7 @@ impl<S: Samples> Player<S> {
     /// and writes do not follow ended threads ([`Player::resolve`]).
     fn place_through(&mut self, id: u32, vol: i32, pan: i32) {
         let at = self.camera_destination(id);
-        if let Some(thread) = self
-            .threads
-            .iter_mut()
-            .chain(&mut self.pending)
-            .find(|t| t.id == at)
-        {
+        if let Some(thread) = self.threads.iter_mut().find(|t| t.id == at) {
             place_itself(thread, vol, pan);
         } else if let Some(mut thread) = self.ended.remove(&at) {
             place_itself(&mut thread, vol, pan);
@@ -1487,7 +1749,7 @@ impl<S: Samples> Player<S> {
     /// The thread a camera placement written by thread `id` lands in, and
     /// whose `Spl` it reads ([`Player::place_through`]): `id`, or on
     /// through `target` from each thread that is its track's last start,
-    /// into running or pending threads, playing or not, or ended threads
+    /// into running threads, playing or not, or ended threads
     /// whose notes still play. A link to anything else, or back to a
     /// thread already passed, stops the chain where it is.
     fn camera_destination(&self, id: u32) -> u32 {
@@ -1505,18 +1767,14 @@ impl<S: Samples> Player<S> {
         at
     }
 
-    /// The running or pending thread `id`, or the ended one if its notes
+    /// The running thread `id`, or the ended one if its notes
     /// still play.
     fn kept_thread(&self, id: u32) -> Option<&Thread> {
-        self.threads
-            .iter()
-            .chain(&self.pending)
-            .find(|t| t.id == id)
-            .or_else(|| {
-                self.ended
-                    .get(&id)
-                    .filter(|_| self.notes.iter().any(|n| n.thread == id))
-            })
+        self.threads.iter().find(|t| t.id == id).or_else(|| {
+            self.ended
+                .get(&id)
+                .filter(|_| self.notes.iter().any(|n| n.thread == id))
+        })
     }
 
     /// Writes a register of the thread at `at` as that thread would.
@@ -1556,7 +1814,9 @@ impl<S: Samples> Player<S> {
     /// not exist.
     fn cancel_radio_notes(&mut self) {
         for track in RADIO_TRACKS {
-            if self.owner(0, track).is_none() {
+            // A patch object of the number is no track, but it exists
+            // (0x573a29 to 0x573a5c).
+            if !self.registered(track) {
                 return;
             }
             if let Some(at) = self.newest(track) {
@@ -1584,7 +1844,6 @@ impl<S: Samples> Player<S> {
         let tracks: BTreeSet<u32> = self
             .threads
             .iter()
-            .chain(&self.pending)
             .map(|t| t.track)
             .chain(self.notes.iter().map(|n| n.track))
             .filter(|t| !PAUSE_SPARES.contains(t))
@@ -1608,13 +1867,47 @@ impl<S: Samples> Player<S> {
     /// restarts its day and night loop and its music, 0x575155, which
     /// this player does not have.) `main_duckpri` stays as the pause
     /// left it until a thread asks again.
+    ///
+    /// The original lets go of the tracks in the order of its registry of
+    /// patch and track objects (0x57cd56 to 0x57cd82): bucket by bucket,
+    /// a track's bucket being its number modulo their count, and each
+    /// bucket from its head, as [`crate::registry`] replays them. With
+    /// the whole install registered there are 24,593 buckets, so the
+    /// order is not the tracks' numbers. Each let go is put last in the list of
+    /// running tracks, so from the next block the tracks run in that
+    /// order.
+    ///
+    /// A track no module lists has no place in the registry; such
+    /// tracks go last, by number. **Unverified:** the order the original
+    /// takes the files of one directory in, and the downloads' order
+    /// (here, by name).
     pub fn unpause(&mut self) {
         self.paused = false;
         self.held.clear();
-        let now = self.frame;
-        for thread in self.threads.iter_mut().chain(&mut self.pending) {
-            thread.wake = now;
+        let running: BTreeSet<u32> = self.threads.iter().map(|t| t.track).collect();
+        let mut place: BTreeMap<u32, usize> = BTreeMap::new();
+        for (at, id) in self.registry.order().enumerate() {
+            if running.contains(&id) {
+                place.insert(id, at);
+            }
+            if place.len() == running.len() {
+                break;
+            }
         }
+        let mut running: Vec<(usize, u32, u32)> = self
+            .threads
+            .iter()
+            .map(|t| {
+                (
+                    place.get(&t.track).copied().unwrap_or(usize::MAX),
+                    t.track,
+                    t.id,
+                )
+            })
+            .collect();
+        running.sort_unstable();
+        let ids: Vec<u32> = running.into_iter().map(|(_, _, id)| id).collect();
+        self.let_go(&ids);
         if let Some(current) = self.ambience {
             self.with_score(current, |score, _| score.set_paused(false));
         }
@@ -1625,13 +1918,18 @@ impl<S: Samples> Player<S> {
         self.paused
     }
 
+    /// The registry of patch and track objects, which orders the
+    /// unpause ([`Player::unpause`]).
+    pub fn registry(&self) -> &Registry {
+        &self.registry
+    }
+
     /// Kind 20: *(code)* ends every track at once, forgets every object
     /// instance and stops every ambience player (the current one stays
     /// current). (The original also stops its music stations, which this
     /// player does not have.) Sequence groups are cleared too.
     fn kill_all(&mut self) {
         self.threads.clear();
-        self.pending.clear();
         self.notes.clear();
         self.ended.clear();
         self.idle.clear();
@@ -1648,11 +1946,11 @@ impl<S: Samples> Player<S> {
 
     /// Kind 23: *(code)* forgets every instance of an object (0: none)
     /// and lets each of its tracks go (0x574688): a track no other
-    /// object still has fades out and ends. Here, where each object has
-    /// its own thread, the object's threads of a track that others still
-    /// have fade out and end too; the original keeps the one track
-    /// object playing for the others.
-    fn kill_instance(&mut self, object: u32) {
+    /// object still has fades out and ends; one that others still have
+    /// plays on for them, its `extvol` and `pan` set again from where
+    /// they are, as a camera move sets them (0x5746d9,
+    /// [`Player::place_track`]).
+    fn kill_instance(&mut self, object: u32, sources: &dyn Sources) {
         if object == 0 {
             return;
         }
@@ -1664,8 +1962,13 @@ impl<S: Samples> Player<S> {
             .collect();
         for track in tracks {
             self.instances.retain(|&pair| pair != (track, object));
-            let shared = self.instances.iter().any(|&(t, _)| t == track);
-            self.fade_and_kill(track, shared.then_some(object));
+            if self.instances.iter().any(|&(t, _)| t == track) {
+                // A fade before may have ended notes.
+                self.forget_silent();
+                self.place_track(track, sources);
+            } else {
+                self.fade_and_kill(track);
+            }
         }
     }
 
@@ -1680,20 +1983,20 @@ impl<S: Samples> Player<S> {
             .partition(|&(_, object)| (object as i32) > 0);
         self.instances = kept;
         for (track, _) in killed {
-            self.fade_and_kill(track, None);
+            self.fade_and_kill(track);
         }
     }
 
-    /// The original's fade-out-and-kill (0x57dca3) on a track's threads
-    /// (only `object`'s, when given): a thread with a note playing fades
+    /// The original's fade-out-and-kill (0x57dca3) on a track's threads:
+    /// a thread with a note playing fades
     /// its `extvol` to 0 at speed 100 and then ends; one without ends
     /// now. The track's notes whose thread has ended stop now (the
     /// original would fade them; here they have no registers).
-    fn fade_and_kill(&mut self, track: u32, object: Option<u32>) {
+    fn fade_and_kill(&mut self, track: u32) {
         let ids: Vec<u32> = self
             .threads
             .iter()
-            .filter(|t| t.track == track && object.is_none_or(|o| t.object == o))
+            .filter(|t| t.track == track)
             .map(|t| t.id)
             .collect();
         for id in ids {
@@ -1712,15 +2015,11 @@ impl<S: Samples> Player<S> {
                 self.threads.remove(at);
             }
         }
-        self.pending
-            .retain(|t| !(t.track == track && object.is_none_or(|o| t.object == o)));
         // Notes that outlived their thread have no registers to fade, and
         // end at once.
         let running: BTreeSet<u32> = self.threads.iter().map(|t| t.id).collect();
-        self.notes.retain(|n| {
-            running.contains(&n.thread)
-                || !(n.track == track && object.is_none_or(|o| n.object == o))
-        });
+        self.notes
+            .retain(|n| running.contains(&n.thread) || n.track != track);
         self.forget_ended();
     }
 
@@ -1730,25 +2029,27 @@ impl<S: Samples> Player<S> {
     /// started anew is left held (the start ends by holding it, 0x57dbd6)
     /// and let go only when the sound is not paused (0x573d71), so a
     /// television turned on during a pause is silent until the unpause.
-    fn turn_on_tv(&mut self, module: usize, track: u32, args: [u32; 3], sources: &dyn Sources) {
-        self.kill_instance(args[0]);
-        if self.owner(module, track).is_none() {
-            self.report(format!("no track {track}"));
+    fn turn_on_tv(&mut self, track: u32, args: [u32; 3], sources: &dyn Sources) {
+        self.kill_instance(args[0], sources);
+        if !self.registered(track) {
+            self.no_track(track);
             return;
         }
+        // The instance is recorded before the object's start (0x573d36,
+        // 0x573d5a), which for a patch object does nothing.
         self.record(track, args[0]);
+        if self.owner(track).is_none() {
+            return;
+        }
         let placed = self.placed(track, sources);
-        let resumes = self.held.contains(&track)
-            && self
-                .threads
-                .iter()
-                .chain(&self.pending)
-                .any(|t| t.track == track);
-        let threads = self.start(args, module, track, false);
-        if !threads.is_empty() && self.paused && !resumes {
+        let started = self.start(args, track);
+        if started.fresh && self.paused {
             self.held.insert(track);
         }
-        self.place(&threads, placed);
+        self.place(&started.threads, placed);
+        if !self.paused {
+            self.let_go(&started.threads);
+        }
     }
 
     /// Kind 43 (`kPlayPiano`, 0x573e5a): *(code)* the event's track is
@@ -1763,8 +2064,13 @@ impl<S: Samples> Player<S> {
     /// before any. Last, the object's source field 5 is asked for, and
     /// [`PIANO_SKILL`] starts, when it exists, with it as its first
     /// argument.
-    fn play_piano(&mut self, module: usize, args: [u32; 3], sources: &dyn Sources) {
-        if self.owner(module, PIANO).is_none() {
+    fn play_piano(&mut self, args: [u32; 3], sources: &dyn Sources) {
+        // A patch object of the number goes on: its start does nothing
+        // (0x573e95, 0x57bf80), its object is 0x80000000 (0x573e9c calls
+        // 0x57bf4e, which reads +0xb0; the patch's constructor sets it,
+        // 0x57bf0e to 0x57bf19), and the skill track is still started
+        // (0x573ec3 to 0x573ef2).
+        if !self.registered(PIANO) {
             return;
         }
         let mut args = args;
@@ -1776,14 +2082,19 @@ impl<S: Samples> Player<S> {
             Ok(None) => {}
             Err(fault) => self.report(fault),
         }
-        self.start(args, module, PIANO, false);
-        let object = self.track_objects.get(&PIANO).copied().unwrap_or(0);
+        let started = self.start(args, PIANO);
+        self.let_go(&started.threads);
+        let object = match self.owner(PIANO) {
+            Some(_) => self.track_objects.get(&PIANO).copied().unwrap_or(0),
+            None => 0x8000_0000,
+        };
         self.instances.retain(|&(t, _)| t != PIANO);
         self.record(PIANO, object);
         // The skill is asked for before the skill track is looked up.
         let skill = sources.field(args[0] as i32, 5).unwrap_or(0);
-        if self.owner(module, PIANO_SKILL).is_some() {
-            self.start([skill as u32, 0, 0], module, PIANO_SKILL, false);
+        if self.owner(PIANO_SKILL).is_some() {
+            let started = self.start([skill as u32, 0, 0], PIANO_SKILL);
+            self.let_go(&started.threads);
         }
     }
 
@@ -1796,9 +2107,9 @@ impl<S: Samples> Player<S> {
     /// idle track object does, chained to the patch an earlier such event
     /// started if that still plays.
     fn sequence(&mut self, track: u32, hit_list: u32) {
-        let Some(owner) = self.owner(0, track) else {
+        if !self.registered(track) {
             return;
-        };
+        }
         let Some(list) = self.hit_lists.get(&hit_list).cloned() else {
             self.report(format!("no hit list {hit_list}"));
             return;
@@ -1806,6 +2117,13 @@ impl<S: Samples> Player<S> {
         let patch = match list.len() {
             0 => 0,
             n => list[self.random(n as u32) as usize],
+        };
+        // A patch object of the number still picks from the list. **Not
+        // ported:** its slot (0x573f2b, 0x57fcd2) can then stop the
+        // patch's playback and let go of its samples; no kind 53 event
+        // in the install names a patch.
+        let Some(owner) = self.owner(track) else {
+            return;
         };
         match self.newest(track) {
             Some(at) => {
@@ -1850,33 +2168,129 @@ impl<S: Samples> Player<S> {
         }
     }
 
-    /// Starts a track's routine for an object. The module given is tried
-    /// first, then every other. A deferred thread first runs in the next
-    /// block. The threads started or let go: none when it could not
-    /// start.
-    fn start(&mut self, args: [u32; 3], module: usize, track: u32, defer: bool) -> Vec<u32> {
-        let Some(module) = self.owner(module, track) else {
-            self.report(format!("no track {track}"));
-            return Vec::new();
+    /// Starts a track's routine for an object (vtable +0x30, 0x57d960).
+    /// The module given is tried first, then every other. A new thread
+    /// first runs in the next block ([`Player::run`] runs the tracks
+    /// that were running when its block began).
+    ///
+    /// *(code)* The original has one track object per track, so a start
+    /// of a track whose script still runs starts no second one. It
+    /// refreshes the running one instead ([`set_arguments`]); then, when
+    /// the pause holds it, lets it go (0x57d9f1 to 0x57da12, see
+    /// [`Player::resume_held`]), and otherwise reads its `interrupt`
+    /// ([`INTERRUPT`], 0x57da26): 0 leaves the script where it is, and
+    /// anything else starts the same track object anew, which cuts its
+    /// note ([`Player::restart`]). The caller then places and lets go of
+    /// the threads returned as it does a fresh start's
+    /// ([`Player::let_go`]). Only a start of a track that does not run
+    /// makes a thread, so only then does the thread limit apply.
+    ///
+    /// Not ported: when the track's group is off (manager lookup 0x57bde7,
+    /// its +0xc0 is 0), the original's start returns before all of this
+    /// (0x57d969 to 0x57d9a5). This player has no group that can be off.
+    fn start(&mut self, args: [u32; 3], track: u32) -> Started {
+        let Some(module) = self.owner(track) else {
+            self.no_track(track);
+            return Started::default();
         };
-        // *(code)* Starting a track the pause holds while its script runs
-        // does not start it again (0x57d9f1 to 0x57da12): it lets it go
-        // (vtable +0x5c), so the script goes on from where it was, its
-        // wait ended, with the new arguments. No thread is made, so the
-        // thread limit does not apply.
         if self.held.remove(&track) {
             let resumed = self.resume_held(args, track);
             if !resumed.is_empty() {
-                return resumed;
+                return Started {
+                    threads: resumed,
+                    fresh: false,
+                };
             }
         }
-        if self.threads.len() + self.pending.len() >= THREADS {
-            self.report(format!("track {track}: more than {THREADS} threads"));
-            return Vec::new();
+        let running = self.refresh(args, track);
+        if let Some(&newest) = running.iter().max() {
+            let interrupt = self
+                .threads
+                .iter()
+                .find(|t| t.id == newest)
+                .map_or(0, |t| t.registers[usize::from(INTERRUPT)]);
+            self.last_start.insert(track, newest);
+            if interrupt == 0 {
+                return Started {
+                    threads: running,
+                    fresh: false,
+                };
+            }
+            // The track object's own descriptor (0x57db7a to 0x57db91).
+            if !self.restart(newest, module, track) {
+                return Started::default();
+            }
+            self.set_levels(newest, args, track);
+            return Started {
+                threads: vec![newest],
+                fresh: true,
+            };
         }
-        let Some(mut thread) = self.thread(args, module, track) else {
-            return Vec::new();
+        if self.threads.len() >= THREADS {
+            self.report(format!("track {track}: more than {THREADS} threads"));
+            return Started::default();
+        }
+        let Some(thread) = self.thread(args, module, track) else {
+            return Started::default();
         };
+        // *(code)* A fresh start drops the track object's sound (0x57db67
+        // to 0x57f625, 0x57f657 to 0x57f676): the note kind 53 played on
+        // the idle track stops.
+        self.notes.retain(|n| !(n.thread == 0 && n.track == track));
+        self.idle.remove(&track);
+        let id = thread.id;
+        self.last_start.insert(track, id);
+        self.threads.push(thread);
+        self.set_levels(id, args, track);
+        Started {
+            threads: vec![id],
+            fresh: true,
+        }
+    }
+
+    /// *(code)* Starts a running track's thread `id` anew in place, as the
+    /// original's fresh start does to its one track object (0x57da3a to
+    /// 0x57dbc5): the default banks (registers 17 to 47 and 50 to 62,
+    /// [`BANKS`]) take their starting values again, the routine starts
+    /// from the top with no loop mark (0x57db8b, 0x57db91) and the
+    /// track's own hit list (0x57db85 to 0x57dba7), and its sound is cut
+    /// (0x57f625). Registers 1 to 16 and the return stack (+0x1a8) are
+    /// left as they were. (Registers 48 and 49 are in no bank of the
+    /// original, 0x57d727 to 0x57d775 and 0x57c7a8 to 0x57c82e; here they
+    /// are kept too.) The thread keeps its ID, so a
+    /// `target` naming it still reaches it. Its wait deadline is now and
+    /// `isplaying` is 1. False (reported) when the track has no entry
+    /// point; the thread is then left alone.
+    fn restart(&mut self, id: u32, module: usize, track: u32) -> bool {
+        let Some((place, fresh, _)) = self.template(module, track) else {
+            return false;
+        };
+        // A track has one thread; its notes, and those of its scripts
+        // that ended, are the one voice the original destroys.
+        self.threads.retain(|t| t.track != track || t.id == id);
+        self.notes.retain(|n| n.track != track);
+        self.ended.retain(|_, t| t.track != track);
+        self.idle.remove(&track);
+        let now = self.frame;
+        if let Some(thread) = self.threads.iter_mut().find(|t| t.id == id) {
+            for (first, last) in BANKS {
+                let bank = usize::from(first)..=usize::from(last);
+                thread.registers[bank.clone()].copy_from_slice(&fresh[bank]);
+            }
+            (thread.module, thread.pc) = place;
+            thread.loop_point = place;
+            thread.hit_list.clear();
+            thread.last_note = 0;
+            thread.wake = now;
+            thread.registers[usize::from(ISPLAYING)] = 1;
+            thread.kept = 1;
+        }
+        self.forget_ended();
+        true
+    }
+
+    /// The levels a fresh start sets on thread `id` (see below).
+    fn set_levels(&mut self, id: u32, args: [u32; 3], track: u32) {
         // *(code)* A fresh start sets the levels from the arguments as the
         // track's `args` field says (0x57db01): `kArgsVolPan` has `extvol`
         // and `pan` in the first two, `kArgsIdVolPan` in the last two
@@ -1884,7 +2298,7 @@ impl<S: Samples> Player<S> {
         // never started, as kind 53 plays on, keeps its defaults.)
         // A `kArgsIdVolPan` start also makes the object the track
         // object's own (vtable +0x20).
-        let levels = match self.track_args(module, track) {
+        let levels = match self.track_args(track) {
             Some(ARGS_VOL_PAN) => Some((args[0], args[1])),
             Some(ARGS_ID_VOL_PAN) => {
                 self.track_objects.insert(track, args[0]);
@@ -1892,18 +2306,51 @@ impl<S: Samples> Player<S> {
             }
             _ => None,
         };
-        if let Some((vol, pan)) = levels {
+        let Some((vol, pan)) = levels else {
+            return;
+        };
+        if let Some(thread) = self.threads.iter_mut().find(|t| t.id == id) {
             thread.registers[usize::from(EXTVOL)] = vol as i32;
             thread.registers[usize::from(PAN)] = pan as i32;
         }
-        let id = thread.id;
-        self.last_start.insert(track, id);
-        if defer {
-            self.pending.push(thread);
-        } else {
-            self.threads.push(thread);
+    }
+
+    /// What every start does to a track whose script runs (see
+    /// [`set_arguments`]), to each of its threads. The threads, oldest
+    /// first: none when the track does not run.
+    fn refresh(&mut self, args: [u32; 3], track: u32) -> Vec<u32> {
+        let mut running = Vec::new();
+        for thread in self.threads.iter_mut().filter(|t| t.track == track) {
+            set_arguments(thread, args);
+            running.push(thread.id);
         }
-        vec![id]
+        running
+    }
+
+    /// Lets go of a started track (vtable +0x5c, 0x57dc63): *(code)* its
+    /// wait deadline moves to now (0x57dc8e), so a running script's `wait`
+    /// ends at the next update. (Its hold ends too; [`Player::start`]
+    /// already ended it.)
+    ///
+    /// *(code)* A running track let go also moves to the end of the list
+    /// of running tracks (0x57dc9a: 0x57d017 takes it out and appends
+    /// it), so it runs after the others from the next block. (The block
+    /// running goes through its own copy of the list.)
+    fn let_go(&mut self, threads: &[u32]) {
+        let now = self.frame;
+        for &id in threads {
+            let order = self.last_in_order();
+            if let Some(thread) = self.threads.iter_mut().find(|t| t.id == id) {
+                thread.wake = now;
+                thread.order = order;
+            }
+        }
+    }
+
+    /// An order after every thread's (see [`Thread::order`]).
+    fn last_in_order(&mut self) -> i64 {
+        self.next_order += 1;
+        self.next_order
     }
 
     /// Lets a held track's running threads go on, as starting it does
@@ -1916,18 +2363,8 @@ impl<S: Samples> Player<S> {
     /// every start, this one too, so the newest thread let go becomes
     /// the one [`Player::camera_moved`] writes through.
     fn resume_held(&mut self, args: [u32; 3], track: u32) -> Vec<u32> {
-        let now = self.frame;
-        let mut resumed = Vec::new();
-        for thread in self
-            .threads
-            .iter_mut()
-            .chain(&mut self.pending)
-            .filter(|t| t.track == track)
-        {
-            set_arguments(thread, args);
-            thread.wake = now;
-            resumed.push(thread.id);
-        }
+        let resumed = self.refresh(args, track);
+        self.let_go(&resumed);
         if let Some(&newest) = resumed.iter().max() {
             self.last_start.insert(track, newest);
         }
@@ -1936,10 +2373,55 @@ impl<S: Samples> Player<S> {
 
     /// A new thread of a track the module defines, with its starting
     /// registers, or `None` (reported) when the track has no entry point.
+    ///
+    /// **Unverified** gap: the original's track object outlives its
+    /// script, so a start after the track ended keeps its registers 1 to
+    /// 16 from the run before ([`Player::restart`]); a new thread here
+    /// starts them at 0 (but for the arguments).
     fn thread(&mut self, args: [u32; 3], module: usize, track: u32) -> Option<Thread> {
-        let object = args[0];
+        let (place, registers, group) = self.template(module, track)?;
+        let id = self.id();
+        let mut thread = Thread {
+            id,
+            module: place.0,
+            track,
+            pc: place.1,
+            registers,
+            stack: Vec::new(),
+            loop_point: place,
+            kept: 0,
+            hit_list: Vec::new(),
+            last_note: 0,
+            wake: 0,
+            group,
+            target: Target::Own,
+            kill_after_fade: false,
+            order: self.last_in_order(),
+        };
+        set_arguments(&mut thread, args);
+        // *(code)* A fresh start then writes `isplaying` 1 (0x57dbc5),
+        // which leaves the comparison flags positive. (It also sets the
+        // wait deadline to now and holds the track, 0x57dbd6, which its
+        // callers let go; kind 1 always does.)
+        thread.registers[usize::from(ISPLAYING)] = 1;
+        thread.kept = 1;
+        Some(thread)
+    }
+
+    /// A track's entry point, starting registers and group, or `None`
+    /// (reported) when it has no entry point. `module` is the track's
+    /// own: its descriptor names the entry point's track data ID, which
+    /// may lead into another module's program ([`entry_points`]).
+    fn template(
+        &mut self,
+        module: usize,
+        track: u32,
+    ) -> Option<(Place, [i32; GLOBALS as usize], i64)> {
         let owner = &self.modules[module];
-        let Some(pc) = owner.entry(track).and_then(|entry| owner.address(entry)) else {
+        let Some(pc) = owner
+            .entry(track)
+            .and_then(|entry| self.track_data.get(&entry).copied())
+        else {
             self.report(format!("track {track}: entry point not found"));
             return None;
         };
@@ -1957,32 +2439,7 @@ impl<S: Samples> Player<S> {
         registers[usize::from(DUCKPRI)] = owner.number(&fields.duck_priority).unwrap_or(0) as i32;
         let group = owner.number(&fields.group).unwrap_or(0);
         registers[usize::from(PATCH)] = patch as i32;
-        let id = self.id();
-        let mut thread = Thread {
-            id,
-            object,
-            module,
-            track,
-            pc,
-            registers,
-            stack: Vec::new(),
-            loop_point: pc,
-            kept: 0,
-            hit_list: Vec::new(),
-            last_note: 0,
-            wake: 0,
-            group,
-            target: Target::Own,
-            kill_after_fade: false,
-        };
-        set_arguments(&mut thread, args);
-        // *(code)* A fresh start then writes `isplaying` 1 (0x57dbc5),
-        // which leaves the comparison flags positive. (It also sets the
-        // wait deadline to now and holds the track, 0x57dbd6, which its
-        // callers let go; kind 1 always does.)
-        thread.registers[usize::from(ISPLAYING)] = 1;
-        thread.kept = 1;
-        Some(thread)
+        Some((pc, registers, group))
     }
 
     /// Records a fault, up to [`FAULTS`] of them; later ones are dropped,
@@ -2125,12 +2582,7 @@ impl<S: Samples> Player<S> {
     /// original drops a track's request when it is killed) and sets
     /// `main_duckpri` to the largest left, or 0.
     fn forget_ended(&mut self) {
-        let alive: Vec<u32> = self
-            .threads
-            .iter()
-            .chain(&self.pending)
-            .map(|t| t.id)
-            .collect();
+        let alive: Vec<u32> = self.threads.iter().map(|t| t.id).collect();
         self.duck.retain(|id, _| alive.contains(id));
         self.update_main_duckpri();
     }
@@ -2140,80 +2592,107 @@ impl<S: Samples> Player<S> {
         self.globals[usize::from(MAIN_DUCKPRI - GLOBALS)] = largest;
     }
 
+    /// Runs every track once, in the order of the list of running tracks
+    /// when the block began ([`Thread::order`]). The original goes through
+    /// a copy of that list, calling each track object (0x57cf8f to
+    /// 0x57cfda), so a track that ends or is ended on the way does not
+    /// make it skip another, and a track ended and started again before
+    /// its turn still runs in it, as its new thread. A track started on
+    /// the way first runs in the next block. A held track is not in the
+    /// list (a hold takes it out, 0x57dc53 to 0x57dc5a), so one let go on
+    /// the way first runs in the next block too.
     fn run(&mut self, sources: &dyn Sources) {
         let mut budget = BLOCK_STEPS;
-        let mut index = 0;
-        while index < self.threads.len() {
+        self.threads.sort_by_key(|t| t.order);
+        let schedule: Vec<u32> = self
+            .threads
+            .iter()
+            .map(|t| t.track)
+            .filter(|t| !self.held.contains(t))
+            .collect();
+        for (next, &track) in schedule.iter().enumerate() {
+            // A track runs one thread at most.
+            let Some(mut thread) = self.threads.iter().find(|t| t.track == track).cloned() else {
+                continue;
+            };
             // A held track's threads wait, without fading (0x57d7f3).
-            if self.held.contains(&self.threads[index].track) {
-                index += 1;
+            if self.held.contains(&track) {
                 continue;
             }
             if budget == 0 {
-                if !self.over_budget {
-                    self.over_budget = true;
-                    self.report(format!(
-                        "threads ran {BLOCK_STEPS} instructions in one block; the rest wait"
-                    ));
-                }
-                // The threads not reached still fade, and run first next
-                // block, so busy threads cannot starve them.
-                for at in index..self.threads.len() {
-                    if self.held.contains(&self.threads[at].track) {
-                        continue;
-                    }
-                    let mut thread = self.threads[at].clone();
-                    self.fade(&mut thread);
-                    self.threads[at] = thread;
-                }
-                self.threads.rotate_left(index);
+                self.out_of_budget(&schedule[next..]);
                 break;
             }
-            let mut thread = self.threads[index].clone();
             let alive = self.step(&mut thread, sources, &mut budget);
             // A thread may have stopped others (kill_trk) or started some
             // (play_trk); find this one again by ID.
-            match self.threads.iter().position(|t| t.id == thread.id) {
-                Some(at) if alive => {
-                    self.threads[at] = thread;
-                    index = at + 1;
+            let id = thread.id;
+            if alive {
+                if let Some(slot) = self.threads.iter_mut().find(|t| t.id == id) {
+                    *slot = thread;
                 }
-                Some(at) => {
-                    // Its last register writes still reach its notes, as
-                    // they would have when written.
-                    let levels = self.levels(&thread);
-                    for note in self.notes.iter_mut().filter(|n| n.thread == thread.id) {
-                        note.gains = levels.gains;
-                        note.step = step(levels.rate);
-                    }
-                    if self.notes.iter().any(|n| n.thread == thread.id) {
-                        self.ended.insert(thread.id, thread.clone());
-                    }
-                    self.threads.remove(at);
-                    // Its ducking request goes now, before the threads
-                    // after it run.
-                    self.forget_ended();
-                    index = at;
-                }
-                None => {}
+                continue;
             }
+            if !self.threads.iter().any(|t| t.id == id) {
+                continue;
+            }
+            // Its last register writes still reach its notes, as they
+            // would have when written.
+            let levels = self.levels(&thread);
+            for note in self.notes.iter_mut().filter(|n| n.thread == id) {
+                note.gains = levels.gains;
+                note.step = step(levels.rate);
+            }
+            if self.notes.iter().any(|n| n.thread == id) {
+                self.ended.insert(id, thread);
+            }
+            self.threads.retain(|t| t.id != id);
+            // Its ducking request goes now, before the threads after it
+            // run.
+            self.forget_ended();
         }
-        // Threads started this block run from the next one, so a track
-        // that starts itself cannot keep this loop going.
-        self.threads.append(&mut self.pending);
         self.forget_ended();
         self.apply_levels();
+    }
+
+    /// The block has run out of instructions before the tracks `rest`
+    /// had their turn. They still fade, and end when a fade that was to
+    /// end them does, as in their turn (see [`Player::fade_or_end`]); the
+    /// rest of their turn waits for the next block, where they run first,
+    /// so busy threads cannot starve them.
+    fn out_of_budget(&mut self, rest: &[u32]) {
+        if !self.over_budget {
+            self.over_budget = true;
+            self.report(format!(
+                "threads ran {BLOCK_STEPS} instructions in one block; the rest wait"
+            ));
+        }
+        let first = self.threads.iter().map(|t| t.order).min().unwrap_or(0);
+        let mut ended = Vec::new();
+        for (place, &track) in rest.iter().enumerate() {
+            if self.held.contains(&track) {
+                continue;
+            }
+            let Some(mut thread) = self.threads.iter().find(|t| t.track == track).cloned() else {
+                continue;
+            };
+            let id = thread.id;
+            if !self.fade_or_end(&mut thread) {
+                ended.push(id);
+                continue;
+            }
+            thread.order = first - (rest.len() - place) as i64;
+            if let Some(slot) = self.threads.iter_mut().find(|t| t.id == id) {
+                *slot = thread;
+            }
+        }
+        self.threads.retain(|t| !ended.contains(&t.id));
     }
 
     /// Runs one thread until it waits, ends, or the block's instructions
     /// run out (`budget`). False when it ended.
     fn step(&mut self, thread: &mut Thread, sources: &dyn Sources, budget: &mut usize) -> bool {
-        self.fade(thread);
-        // *(code)* A fade that was to end the track has ended: the track
-        // ends at once, with its notes.
-        if thread.kill_after_fade && thread.registers[usize::from(FADE_ON)] == 0 {
-            let id = thread.id;
-            self.notes.retain(|n| n.thread != id);
+        if !self.fade_or_end(thread) {
             return false;
         }
         if thread.wake > self.frame {
@@ -2224,26 +2703,27 @@ impl<S: Samples> Player<S> {
                 return true;
             }
             *budget -= 1;
-            let module = &self.modules[thread.module];
-            let instruction = match module.program.decode(thread.pc, &|id| module.is_target(id)) {
+            let program = &self.modules[thread.module].program;
+            let track_data = &self.track_data;
+            let instruction = match program.decode(thread.pc, &|id| track_data.contains_key(&id)) {
                 Ok(instruction) => instruction,
                 Err(error) => return self.fault(thread, &error.to_string()),
             };
             let next = thread.pc + instruction.length;
             match self.execute(thread, &instruction, next, sources) {
                 Ok(Flow::Next) => thread.pc = next,
-                Ok(Flow::Jump(pc)) => thread.pc = pc,
+                Ok(Flow::Jump(place)) => (thread.module, thread.pc) = place,
                 Ok(Flow::Block) => return true,
                 Ok(Flow::Yield) => {
                     thread.pc = next;
                     return true;
                 }
-                Ok(Flow::JumpYield(pc)) => {
-                    thread.pc = pc;
+                Ok(Flow::JumpYield(place)) => {
+                    (thread.module, thread.pc) = place;
                     return true;
                 }
                 Ok(Flow::End) => match thread.stack.pop() {
-                    Some(pc) => thread.pc = pc,
+                    Some(place) => (thread.module, thread.pc) = place,
                     None => return false,
                 },
                 Ok(Flow::Kill) => {
@@ -2255,6 +2735,19 @@ impl<S: Samples> Player<S> {
             }
         }
         self.fault(thread, "ran too long without waiting")
+    }
+
+    /// Moves the thread's fade one step; false when that fade was to end
+    /// the track and has ended (0x57d86e to 0x57d88d): the track ends at
+    /// once, with its notes.
+    fn fade_or_end(&mut self, thread: &mut Thread) -> bool {
+        self.fade(thread);
+        if thread.kill_after_fade && thread.registers[usize::from(FADE_ON)] == 0 {
+            let id = thread.id;
+            self.notes.retain(|n| n.thread != id);
+            return false;
+        }
+        true
     }
 
     /// Moves a fading register one step, as the original's run loop does
@@ -2332,11 +2825,7 @@ impl<S: Samples> Player<S> {
         let mut passed = vec![thread.id];
         while let Target::Thread(id) = target
             && !passed.contains(&id)
-            && let Some(next) = self
-                .threads
-                .iter()
-                .chain(&self.pending)
-                .find(|t| t.id == id)
+            && let Some(next) = self.threads.iter().find(|t| t.id == id)
         {
             passed.push(id);
             at = Some(id);
@@ -2359,12 +2848,7 @@ impl<S: Samples> Player<S> {
         }
         let source = self
             .resolve(thread)
-            .and_then(|id| {
-                self.threads
-                    .iter()
-                    .chain(&self.pending)
-                    .find(|t| t.id == id)
-            })
+            .and_then(|id| self.threads.iter().find(|t| t.id == id))
             .unwrap_or(thread);
         source.registers[usize::from(r)]
     }
@@ -2375,7 +2859,12 @@ impl<S: Samples> Player<S> {
     /// from the value. `target` picks the newest running thread of the
     /// track it names; 0, or a track with none running, is this thread
     /// (the original's lookup returns null, which it takes as itself).
-    /// `main_duckpri` (123) records the written thread's request and
+    /// Not ported: the original's `target` holds the track object
+    /// (0x57e023 to 0x57e028), which outlives a kill and a fresh start
+    /// (0x57dd4c, 0x57dbcf), so it still reaches the track started again.
+    /// Here it names the thread, which a kill ends, so it then reaches
+    /// that thread only while its notes play, or else falls back to this
+    /// one. `main_duckpri` (123) records the written thread's request and
     /// holds the largest.
     fn write(&mut self, thread: &mut Thread, register: i64, value: i32) {
         let Ok(r) = u8::try_from(register) else {
@@ -2389,7 +2878,6 @@ impl<S: Samples> Player<S> {
             } else {
                 self.threads
                     .iter()
-                    .chain(&self.pending)
                     .filter(|t| t.track == value as u32)
                     .map(|t| t.id)
                     .max()
@@ -2398,12 +2886,7 @@ impl<S: Samples> Player<S> {
             return;
         }
         let written = match self.resolve(thread) {
-            Some(id) => match self
-                .threads
-                .iter_mut()
-                .chain(&mut self.pending)
-                .find(|t| t.id == id)
-            {
+            Some(id) => match self.threads.iter_mut().find(|t| t.id == id) {
                 Some(other) => other,
                 None => thread,
             },
@@ -2425,9 +2908,12 @@ impl<S: Samples> Player<S> {
         }
     }
 
-    fn target(&self, thread: &Thread, id: u32) -> Result<u32, String> {
-        self.modules[thread.module]
-            .address(id)
+    /// Where a track data ID leads, whichever module's program is
+    /// running ([`entry_points`]).
+    fn target(&self, id: u32) -> Result<Place, String> {
+        self.track_data
+            .get(&id)
+            .copied()
             .ok_or_else(|| format!("no track data {id:#x}"))
     }
 
@@ -2456,8 +2942,13 @@ impl<S: Samples> Player<S> {
                 }
                 None => {
                     // Not cached: any number may name a missing patch,
-                    // so caching them would grow without bound.
-                    self.report(format!("no patch {patch}"));
+                    // so caching them would grow without bound. (A track
+                    // object fails too, 0x57f703.)
+                    if self.tracks.contains_key(&patch) {
+                        self.report(format!("patch {patch} is a track"));
+                    } else {
+                        self.report(format!("no patch {patch}"));
+                    }
                     return false;
                 }
             };
@@ -2481,7 +2972,6 @@ impl<S: Samples> Player<S> {
             id,
             thread: thread.id,
             track: thread.track,
-            object: thread.object,
             patch,
             position: 0,
             step: step(levels.rate),
@@ -2504,7 +2994,7 @@ impl<S: Samples> Player<S> {
         let kept = thread.kept;
         let branch = |taken: bool| -> Result<Flow, String> {
             if taken {
-                Ok(Flow::Jump(self.target(thread, arg(0) as u32)?))
+                Ok(Flow::Jump(self.target(arg(0) as u32)?))
             } else {
                 Ok(Flow::Next)
             }
@@ -2550,8 +3040,8 @@ impl<S: Samples> Player<S> {
                 if thread.stack.len() >= CALL_DEPTH {
                     return Err(format!("calls nested deeper than {CALL_DEPTH}"));
                 }
-                thread.stack.push(next);
-                Flow::Jump(self.target(thread, arg(0) as u32)?)
+                thread.stack.push((thread.module, next));
+                Flow::Jump(self.target(arg(0) as u32)?)
             }
             "return" | "end" => Flow::End,
             "wait" => {
@@ -2571,7 +3061,7 @@ impl<S: Samples> Player<S> {
                     Operand::Register => self.read(thread, arg(0)) as u32,
                     _ => arg(0) as u32,
                 };
-                Flow::Jump(self.target(thread, id)?)
+                Flow::Jump(self.target(id)?)
             }
             "test" => {
                 thread.kept = i64::from(self.read(thread, arg(0)));
@@ -2604,7 +3094,7 @@ impl<S: Samples> Player<S> {
                 Flow::Next
             }
             "set_loop" => {
-                thread.loop_point = next;
+                thread.loop_point = (thread.module, next);
                 Flow::Next
             }
             "loop" => Flow::JumpYield(thread.loop_point),
@@ -2633,16 +3123,36 @@ impl<S: Samples> Player<S> {
                 // flags. The new thread's `target` is itself.
                 let track = self.read(thread, arg(0)) as u32;
                 let args = [1, 2, 3].map(|r| thread.registers[r] as u32);
+                // A track that starts itself is the one running: the
+                // start acts on it as it is now.
+                let own = track == thread.track;
+                if own && let Some(stored) = self.threads.iter_mut().find(|t| t.id == thread.id) {
+                    *stored = thread.clone();
+                }
+                let started = self.start(args, track);
+                self.let_go(&started.threads);
+                if own && let Some(stored) = self.threads.iter().find(|t| t.id == thread.id) {
+                    *thread = stored.clone();
+                }
+                // `source` is read after the start (0x57f256), through the
+                // caller's `target` as the start left it.
                 let source = self.read(thread, i64::from(SOURCE));
-                let started = self.start(args, thread.module, track, true);
                 for started in self
                     .threads
                     .iter_mut()
-                    .chain(&mut self.pending)
-                    .filter(|t| started.contains(&t.id))
+                    .filter(|t| started.threads.contains(&t.id))
                 {
                     started.registers[usize::from(SOURCE)] = source;
                     started.kept = i64::from(source);
+                }
+                if own && started.threads.contains(&thread.id) {
+                    thread.registers[usize::from(SOURCE)] = source;
+                    thread.kept = i64::from(source);
+                }
+                // Started anew, it runs from the top, from the next block
+                // (the original goes on in the same update).
+                if own && started.fresh {
+                    return Ok(Flow::JumpYield((thread.module, thread.pc)));
                 }
                 Flow::Next
             }
@@ -2881,7 +3391,6 @@ impl<S: Samples> Host for AmbientHost<'_, S> {
                 id: 0,
                 thread: 0,
                 track: 0,
-                object: 0,
                 patch,
                 position: 0,
                 step: step(voice.rate),

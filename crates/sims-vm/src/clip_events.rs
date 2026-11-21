@@ -37,13 +37,19 @@
 //!   the position with the anchor bone, never runs. So the anchor is not
 //!   kept. That nothing reads the layer's fields but the pose is
 //!   **unverified**.
-//! - "dress" and "undress": the person's clothes (virtual functions 0xd8
-//!   and 0xdc). Not ported; they fail.
+//! - "dress" and "undress": the value is put on as an accessory through
+//!   the person animator's virtual function 0xd8 (0x58d88f) with an empty
+//!   binding (0x6de5b0), or taken off through 0xdc (0x58d919): what
+//!   Change Suit does ([`crate::primitives::change_suit`]). The value was
+//!   lowered when the clip was read (0x59431a; `Track::build`), and the
+//!   suit lookup compares bytes exactly (0x5a25dc).
 //!
 //! Any other key does nothing.
 
 use crate::fault::Trap;
 use crate::interpreter::Interpreter;
+use crate::primitives::change_suit::{put_on, undress};
+use sims_content::People;
 use sims_sim::World;
 use sims_sim::animator::{Advance, Animator, Layer};
 
@@ -96,6 +102,7 @@ impl Interpreter<'_> {
                     for due in layer.due(track, &times).map_err(Trap::Unsupported)? {
                         timed_event(
                             world,
+                            &self.program.people,
                             id,
                             a,
                             layer,
@@ -122,6 +129,7 @@ impl Interpreter<'_> {
 /// there is not worked out.
 fn timed_event(
     world: &mut World,
+    people: &People,
     id: u16,
     a: &mut Animator,
     layer: &mut Layer,
@@ -151,10 +159,18 @@ fn timed_event(
                 )));
             }
             "dress" | "undress" => {
-                return Err(Trap::Unsupported(format!(
-                    "the clip {:?} has a timed event {key:?} (0x5912fd), which is not ported",
-                    layer.clip
-                )));
+                let accessories = &mut world
+                    .objects
+                    .get_mut(&id)
+                    .and_then(|o| o.person.as_mut())
+                    .ok_or_else(|| Trap::native(0x1c, "object is not a person"))?
+                    .accessories;
+                if key == "dress" {
+                    put_on(people, accessories, value.clone())?;
+                } else {
+                    undress(accessories, value);
+                }
+                continue;
             }
             // "discontinuity" finds no blend layer; the anchor is not
             // kept; the sounds are not modeled; other keys do nothing.

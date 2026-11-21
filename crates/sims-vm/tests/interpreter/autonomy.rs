@@ -5,7 +5,7 @@
 
 use crate::support::*;
 use sims_formats::behavior::{InteractionTable, MotiveAdvertisement};
-use sims_vm::{Interpreter, Status};
+use sims_vm::{Interpreter, Status, Trap};
 
 /// The Sim's tree: Find Best Interaction, then Gosub Found Action.
 const CHOOSE: u16 = 4096;
@@ -407,6 +407,19 @@ fn a_check_tree_may_change_its_entry_s_advertisements() {
     let fault = interpreter.turn(&mut fx.world, SIM, 100).unwrap_err();
     assert!(fault.to_string().contains("check tree 0x1069"), "{fault}");
     assert!(fault.to_string().contains("0x1a"), "{fault}");
+    // The check's fault keeps its trap: a failure, not something
+    // unported.
+    let Trap::CheckTree {
+        routine: None,
+        tree: CHECK,
+        fault: inner,
+        ..
+    } = &fault.trap
+    else {
+        panic!("{fault:?}");
+    };
+    assert_eq!(inner.trap.code(), Some(0x1a), "{fault}");
+    assert!(!fault.trap.unported(), "{fault}");
 }
 
 /// A check tree that runs a named tree at once (Run Tree By Name mode 0)

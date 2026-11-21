@@ -60,6 +60,23 @@ fn assert_plays(out: &[i16], sample: &[i16]) {
 }
 
 #[test]
+fn the_registry_grows_to_24593_buckets() {
+    // Every patch and track line registers an object (21,809 IDs, three
+    // shared by a patch and a track), then every station patch (366
+    // more): the unpause walks 24,593 buckets.
+    let Some(root) = install() else { return };
+    let files = SoundFiles::scan(&root).unwrap();
+    let mut player = player(&root, 1);
+    let tables = player.registry().len();
+    player.add_stations(&StationLists::build(&files));
+    let registry = player.registry();
+    assert_eq!(
+        (tables, registry.len(), registry.buckets()),
+        (21_809, 22_175, 24_593)
+    );
+}
+
+#[test]
 fn the_phone_rings() {
     let Some(root) = install() else { return };
     let files = SoundFiles::scan(&root).unwrap();
@@ -221,18 +238,19 @@ fn every_event_definition_runs_without_a_bad_instruction() {
     // events with an empty track field (the original's lookup of track 0
     // finds nothing, as here) and the 2 events of kinds not ported:
     // pausing (103) and reloading (104). The 5 ambience modes (52) start
-    // and stop scores, none of which this test loads. Of the 187 events
+    // and stop scores, none of which this test loads. Of the 186 events
     // still running after 20 blocks, 5 change the music mode (36) and
     // start music or a river loop, or a slow fade of the music, that runs
     // on; the piano (43) plays notes for ever; the 60 that turn on a
-    // television or
-    // radio play their station for ever; 120 more loop (fires,
-    // appliances, voices that loop) and one, `Grimreaper_loop_kill`,
-    // fades its own vol for 21 blocks: the loop track it targets is not
-    // running, so `target` is itself. (`shoo_tub_inside_vox` waits a
-    // random time, which the station scripts' draws make short here.)
+    // television or radio play their station for ever; 119 more loop
+    // (fires, appliances, voices that loop) and one,
+    // `Grimreaper_loop_kill`, fades its own vol for 21 blocks: the loop
+    // track it targets is not running, so `target` is itself.
+    // (`shoo_tub_inside_vox` waits a random time, which the station
+    // scripts' draws make short here. `ltub_running` starts nothing: a
+    // later `[Patch]` line registers its track 68262 again as a patch.)
     assert_eq!(definitions.len(), 4494);
-    assert_eq!((still_running, format!("{unported:?}")), (187, "{}".into()));
+    assert_eq!((still_running, format!("{unported:?}")), (186, "{}".into()));
     assert_eq!(format!("{kinds:?}"), "{103: 1, 104: 1}");
     assert_eq!(
         format!("{faults:?}"),

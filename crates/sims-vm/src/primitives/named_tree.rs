@@ -112,10 +112,10 @@ impl Machine<'_, '_> {
                 TURN_BUDGET,
                 self.checking,
             );
-            let result = result.map_err(|fault| {
-                Trap::Unsupported(format!(
+            let result = result.map_err(|fault: crate::fault::Fault| {
+                fault.unsupported_in(format!(
                     "Run Tree By Name mode {}: tree {tree:#06x} of object {target} on \
-                         object {thread}'s thread: {fault}",
+                         object {thread}'s thread",
                     operands[5]
                 ))
             })?;

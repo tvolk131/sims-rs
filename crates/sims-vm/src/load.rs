@@ -283,9 +283,10 @@ impl Interpreter<'_> {
     /// the Goth house; see `docs/decisions/`. The rest is
     /// **unverified**.
     ///
-    /// Not ported: a GUID translation table in the house file
-    /// (`sims_content::House::guid_table`), which the caller must refuse;
-    /// and type ID 0, which in the original
+    /// `saved` must already be translated through the house's GUID table
+    /// (`sims_content::House::load` does this, as 0x43a6fb does).
+    ///
+    /// Not ported: type ID 0, which in the original
     /// ends up naming the last definition in the catalog that no saved type
     /// names.
     pub fn read_types(&self, world: &mut World, saved: &ObjectTypes) -> Result<Vec<u32>, Fault> {

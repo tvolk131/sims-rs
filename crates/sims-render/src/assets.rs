@@ -74,12 +74,27 @@ pub struct Definition {
     /// How faint that shadow is: added to every mask byte (OBJD word 79,
     /// byte 0x9e).
     pub shadow_strength: i16,
+    /// Word 69 (byte 0x8a) of the definition the object stands for: its
+    /// own, or for a tile of a multi-tile object, its group's master (the
+    /// first definition in the file, in resource order, with the same
+    /// master ID and sub-index -1; 0x45728d). 7 lights the object as a
+    /// lit tile at its brightest (0x437adb; [`Definition::lit_at_brightest`]).
+    /// 0 if the group has no master.
+    pub master_word_69: i16,
 }
 
 impl Definition {
     /// Whether the object cuts its own shape into the wall it is in.
     pub fn shapes_wall(&self) -> bool {
         matches!(self.wall_style, 22 | 23) && self.wall_shape != 0
+    }
+
+    /// Whether the object is drawn in a light of 1, held by the time of
+    /// day's cap, whatever its room's light or its own glow (0x437adb to
+    /// 0x437aed): its master's word 69 is 7, as for the pool's diving
+    /// board and ladder.
+    pub fn lit_at_brightest(&self) -> bool {
+        self.master_word_69 == 7
     }
 }
 
@@ -217,7 +232,10 @@ impl Assets {
 
     /// The wall-top trim frames at a zoom, for standing or cut walls. Empty
     /// if the game lacks them, or if they hold far more pixels than the
-    /// game's do.
+    /// game's do. A cut trim's frame carries its depth sprite's bytes as
+    /// its depth (255 where nothing is drawn), when the game has a frame
+    /// of the same size for it; the original draws the two together and
+    /// draws neither without both (0x4c8b1f).
     pub fn trim(&mut self, cut: bool, zoom: Zoom) -> &[Image] {
         /// The frames the corner table can name.
         const FRAMES: usize = 46;
@@ -233,6 +251,14 @@ impl Assets {
             let Ok(set) = LegacySpriteSet::parse(data) else {
                 return Vec::new();
             };
+            // The depth sprite has no palette of its own: decode it with
+            // one that maps each byte to itself.
+            let bytes = Palette((0..=255u8).map(|v| [v; 3]).collect());
+            let depth = cut
+                .then(|| walls.get(b"SPR#", 6144 + zoom.index() as u16))
+                .flatten()
+                .map(|chunk| walls.data(chunk))
+                .and_then(|data| Some((data, LegacySpriteSet::parse(data).ok()?)));
             let mut images = Vec::new();
             let mut pixels = 0usize;
             for i in 0..set.frames.len().min(FRAMES) {
@@ -243,7 +269,23 @@ impl Assets {
                 if pixels > BUDGET {
                     return Vec::new();
                 }
-                images.push(Image::from(frame));
+                let mut image = Image::from(frame);
+                let found = depth
+                    .as_ref()
+                    .and_then(|(data, set)| set.decode_with_palette(data, i, &bytes).ok());
+                if let Some(found) = found
+                    && (found.width, found.height) == (image.width as u32, image.height as u32)
+                {
+                    let raw = found
+                        .rgba
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|p| if p[3] == 0 { 255 } else { p[0] })
+                        .collect();
+                    image.depth = Some(raw);
+                }
+                images.push(image);
             }
             images
         })
@@ -280,6 +322,7 @@ impl Assets {
             })
             .unwrap_or_default();
         let shadow = shadow_code(iff, &word);
+        let master_word_69 = master_word(iff, &word, LIT_AT_BRIGHTEST);
         Some(Definition {
             resource: object.resource,
             graphic: word(3) as u16,
@@ -291,6 +334,7 @@ impl Assets {
             slots,
             shadow,
             shadow_strength: word(SHADOW_STRENGTH),
+            master_word_69,
         })
     }
 
@@ -389,6 +433,37 @@ const GROUP_PLACE: usize = 11;
 const SHADOW_SKIP: usize = 56;
 const SHADOW: usize = 57;
 const SHADOW_STRENGTH: usize = 0x9e / 2;
+/// The master's word that, at 7, lights the object at the brightest
+/// (byte 0x8a, 0x437adb).
+const LIT_AT_BRIGHTEST: usize = 0x8a / 2;
+
+/// Word `n` of the master of the definition whose words `word` gives
+/// (0x45728d): the definition itself unless it is a tile of a group (its
+/// group word not 0), else the first definition in the file, in resource
+/// order, of the same group and place -1 (`sims-vm` `group_master`). 0 if
+/// the group has none; the original would read through a null pointer.
+fn master_word(iff: &Iff, word: &impl Fn(usize) -> i16, n: usize) -> i16 {
+    let group = word(GROUP);
+    if group == 0 {
+        return word(n);
+    }
+    let words = |chunk| {
+        let data = iff.data(chunk);
+        move |n: usize| {
+            data.get(n * 2..n * 2 + 2)
+                .map_or(0, |b| i16::from_le_bytes([b[0], b[1]]))
+        }
+    };
+    iff.resource_order(b"OBJD")
+        .ok()
+        .and_then(|order| {
+            order
+                .into_iter()
+                .map(words)
+                .find(|w| w(GROUP) == group && w(GROUP_PLACE) == -1)
+        })
+        .map_or(0, |w| w(n))
+}
 
 /// The shadow code of a definition whose words `word` gives, among the
 /// definitions of its file (0x4573e7, see [`crate::shadows`]).
@@ -546,7 +621,7 @@ mod tests {
         let mut bytes = vec![0; 64];
         bytes[..13].copy_from_slice(b"IFF FILE 2.5:");
         for (id, words) in objects.iter().enumerate() {
-            let mut data = vec![0u8; 2 * (SHADOW + 1)];
+            let mut data = vec![0u8; 2 * (SHADOW_STRENGTH + 1)];
             for &(n, w) in *words {
                 data[n * 2..n * 2 + 2].copy_from_slice(&w.to_le_bytes());
             }
@@ -575,5 +650,24 @@ mod tests {
         // The second's neighbour one step back along y is (0, -1), which
         // the original refuses rather than wrapping to 0x00ff.
         assert_eq!(shadow_code(&iff, &word(second)), Some(0));
+    }
+
+    #[test]
+    fn a_group_tile_is_lit_by_its_masters_word() {
+        // The diving board's master has word 69 = 7; its tiles do not.
+        let master: &[(usize, i16)] = &[(GROUP, 3), (GROUP_PLACE, -1), (LIT_AT_BRIGHTEST, 7)];
+        let tile: &[(usize, i16)] = &[(GROUP, 3), (GROUP_PLACE, 0x0001)];
+        let other: &[(usize, i16)] = &[(GROUP, 4), (GROUP_PLACE, -1), (LIT_AT_BRIGHTEST, 2)];
+        let alone: &[(usize, i16)] = &[(LIT_AT_BRIGHTEST, 7)];
+        let orphan: &[(usize, i16)] = &[(GROUP, 5), (GROUP_PLACE, 0), (LIT_AT_BRIGHTEST, 7)];
+        let iff = definitions(&[other, tile, master, alone, orphan]);
+        let word = |words: &'static [(usize, i16)]| {
+            move |n: usize| words.iter().find(|&&(m, _)| m == n).map_or(0, |&(_, w)| w)
+        };
+        assert_eq!(master_word(&iff, &word(tile), LIT_AT_BRIGHTEST), 7);
+        assert_eq!(master_word(&iff, &word(master), LIT_AT_BRIGHTEST), 7);
+        assert_eq!(master_word(&iff, &word(alone), LIT_AT_BRIGHTEST), 7);
+        // A tile whose group has no master reads 0.
+        assert_eq!(master_word(&iff, &word(orphan), LIT_AT_BRIGHTEST), 0);
     }
 }

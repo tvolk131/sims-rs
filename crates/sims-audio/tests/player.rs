@@ -4,6 +4,7 @@ use sims_audio::module::Module;
 use sims_audio::placement::Projection;
 use sims_audio::player::{BLOCK, MIDDLE, NoSources, Player, RATE, Sources};
 use sims_audio::sources::Snapshot;
+use sims_audio::stations::{FIRST_ID, StationLists};
 use sims_audio::{Pcm, SoundEvent};
 use std::collections::BTreeMap;
 
@@ -141,10 +142,11 @@ fn notes_sum_and_clamp() {
             samples: vec![30000; 4],
         },
     );
+    // Two tracks: a second play of one track that runs starts nothing.
     let generic: &[u8] = &[2, 5, WAIT_SAMP, END];
-    let mut player = Player::new(vec![module(&[generic], 1)], map, 1);
+    let mut player = Player::new(vec![module(&[generic, generic], 1)], map, 1);
     play(&mut player, "e0");
-    play(&mut player, "e0");
+    play(&mut player, "e1");
     assert_eq!(
         player.render(5, &NoSources),
         [32767, 32767, 32767, 32767, 0]
@@ -480,10 +482,10 @@ fn starting_a_held_track_gives_its_script_the_new_arguments_and_ends_its_wait() 
 #[test]
 fn starting_a_held_track_needs_no_free_thread() {
     let routine = waits_a_second();
-    let mut player = Player::new(vec![module(&[&routine, &routine], 1)], samples(), 1);
-    play(&mut player, "e0");
-    for _ in 1..sims_audio::player::THREADS {
-        play(&mut player, "e1");
+    let routines = vec![&routine[..]; sims_audio::player::THREADS];
+    let mut player = Player::new(vec![module(&routines, 1)], samples(), 1);
+    for i in 0..sims_audio::player::THREADS {
+        play(&mut player, &format!("e{i}"));
     }
     player.render(BLOCK, &NoSources);
     player.handle(&SoundEvent::Pause, &NoSources);
@@ -562,14 +564,17 @@ const PLAY_TRK: u8 = 50;
 
 #[test]
 fn a_track_that_restarts_itself_runs_once_per_block() {
-    // Track 10: v1 = 10; play_trk v1; end. Each run starts its own
-    // replacement, which first runs in the next block, so `render`
-    // returns and one thread is left at a time.
-    let respawn: &[u8] = &[LOADB_V1, 5, 10, PLAY_TRK, 5, END];
-    let mut player = Player::new(vec![module(&[respawn], 0)], samples(), 1);
+    // Track 10: interrupt = 1; v1 = 10; play_trk v1; then a note it
+    // never reaches. Each run starts itself anew: from the top, in the
+    // next block, so `render` returns and the note never plays.
+    let respawn: &[u8] = &[
+        LOADB_V1, 55, 1, LOADB_V1, 5, 10, PLAY_TRK, 5, 2, 5, WAIT_SAMP, END,
+    ];
+    let mut player = Player::new(vec![module(&[respawn], 1)], samples(), 1);
     play(&mut player, "e0");
     assert_eq!(player.render(1, &NoSources), [0]);
-    assert_eq!(player.render(20 * BLOCK, &NoSources).len(), 20 * BLOCK);
+    let out = player.render(20 * BLOCK, &NoSources);
+    assert!(out.iter().all(|&s| s == 0));
     assert!(player.faults.is_empty(), "{:?}", player.faults);
     assert!(!player.is_idle());
     player.handle(&SoundEvent::StopAll, &NoSources);
@@ -577,12 +582,102 @@ fn a_track_that_restarts_itself_runs_once_per_block() {
 }
 
 #[test]
-fn threads_that_multiply_stop_at_the_thread_limit() {
-    // Each run starts two copies of itself: 1, 2, 4, ... threads.
-    let fork: &[u8] = &[LOADB_V1, 5, 10, PLAY_TRK, 5, PLAY_TRK, 5, END];
-    let mut player = Player::new(vec![module(&[fork], 0)], samples(), 1);
+fn a_track_that_plays_itself_without_interrupt_goes_on() {
+    // Track 10: v1 = 10; play_trk v1; end. It runs, so the play starts
+    // nothing, and the script goes on to its end.
+    let respawn: &[u8] = &[LOADB_V1, 5, 10, PLAY_TRK, 5, END];
+    let mut player = Player::new(vec![module(&[respawn], 0)], samples(), 1);
     play(&mut player, "e0");
-    player.render(40 * BLOCK, &NoSources);
+    player.render(BLOCK, &NoSources);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+    assert!(player.is_idle());
+}
+
+#[test]
+fn a_running_track_played_again_starts_no_second_thread() {
+    // Track 10 plays patch 1 over and over, as the fountain does. Played
+    // again while it runs, it neither starts again nor doubles: the ramp
+    // goes on from where it was.
+    let mut player = Player::new(vec![module(&[&LOOPING], 1)], samples(), 1);
+    play(&mut player, "e0");
+    assert_eq!(
+        player.render(10, &NoSources),
+        (1..=10).collect::<Vec<i16>>()
+    );
+    for _ in 0..1000 {
+        play(&mut player, "e0");
+    }
+    assert_eq!(
+        player.render(10, &NoSources),
+        (11..=20).collect::<Vec<i16>>()
+    );
+    for _ in 0..300 {
+        play(&mut player, "e0");
+        player.render(BLOCK, &NoSources);
+    }
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+    player.handle(&SoundEvent::StopObject { object: 9 }, &NoSources);
+    player.render(12 * BLOCK, &NoSources);
+    assert!(player.is_idle());
+}
+
+#[test]
+fn a_play_of_a_running_track_ends_its_wait() {
+    // Track 10 waits a second, then plays patch 1. Played again while it
+    // waits, it is let go: its wait ends at the next block.
+    let mut routine = loadl(6, 1000);
+    routine.extend([WAIT, 6]);
+    routine.extend(GENERIC);
+    let mut player = Player::new(vec![module(&[&routine], 1)], samples(), 1);
+    play(&mut player, "e0");
+    assert!(player.render(2 * BLOCK, &NoSources).iter().all(|&s| s == 0));
+    play(&mut player, "e0");
+    assert_eq!(player.render(3, &NoSources), [1, 2, 3]);
+}
+
+#[test]
+fn a_track_with_interrupt_set_starts_again_when_played() {
+    // Track 10 sets interrupt (55), then plays patch 1 to its end. Played
+    // again while it runs, it starts anew: its note is cut and the patch
+    // plays from the start, once.
+    let mut routine = loadb(55, 1).to_vec();
+    routine.extend(GENERIC);
+    let mut player = Player::new(vec![module(&[&routine], 1)], samples(), 1);
+    play(&mut player, "e0");
+    assert_eq!(
+        player.render(10, &NoSources),
+        (1..=10).collect::<Vec<i16>>()
+    );
+    player.render(BLOCK - 10, &NoSources);
+    play(&mut player, "e0");
+    assert_eq!(player.render(3, &NoSources), [1, 2, 3]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_fresh_start_stops_the_note_kind_53_played_on_the_idle_track() {
+    // seq plays patch 2 on track 10 while no thread of it runs; starting
+    // track 10, which waits without a note, stops that note.
+    let waiting: &[u8] = &[SET_LOOP, LOOP];
+    let module = module_with(&[waiting], 1, 10, "seq=53,10,0,6\n");
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "seq");
+    assert_eq!(player.render(1, &NoSources), [2000]);
+    play(&mut player, "e0");
+    assert_eq!(player.render(2, &NoSources), [0, 0]);
+}
+
+#[test]
+fn threads_stop_at_the_thread_limit() {
+    // A track has one thread at most, so it takes more than 256 tracks
+    // that run for ever. The tracks past the limit do not start.
+    let forever: &[u8] = &[LOOP];
+    let routines = vec![forever; 300];
+    let mut player = Player::new(vec![module(&routines, 0)], samples(), 1);
+    for i in 0..300 {
+        play(&mut player, &format!("e{i}"));
+    }
+    player.render(2 * BLOCK, &NoSources);
     assert!(
         player
             .faults
@@ -600,10 +695,12 @@ fn all_threads_share_one_instruction_budget_per_block() {
     // Twelve threads that jump to themselves forever. Ten use up the
     // block's 100,000 instructions and end as stuck; the other two wait
     // for the next block, where they end the same way.
-    let spin: &[u8] = &[13, 0, 1, 0, 0]; // jump 0x100: itself
-    let mut player = Player::new(vec![module(&[spin], 0)], samples(), 1);
-    for _ in 0..12 {
-        play(&mut player, "e0");
+    // Routine i jumps to track data 0x100 + i: itself.
+    let spins: Vec<[u8; 5]> = (0..12).map(|i| [13, i, 1, 0, 0]).collect();
+    let routines: Vec<&[u8]> = spins.iter().map(|s| &s[..]).collect();
+    let mut player = Player::new(vec![module(&routines, 0)], samples(), 1);
+    for i in 0..12 {
+        play(&mut player, &format!("e{i}"));
     }
     player.render(1, &NoSources);
     assert_eq!(player.faults.len(), 11, "{:?}", player.faults);
@@ -698,13 +795,13 @@ fn seqgroup_return_ends_its_thread_when_another_holds_the_group() {
     let out = player.render_until_idle(10 * BLOCK, &NoSources);
     // From the next block.
     assert_eq!(&out[BLOCK..BLOCK + 100], &(1..=100).collect::<Vec<i16>>());
-    // Two threads of one track do not end each other: a group holds a
-    // track number. Both play.
+    // A second play of e1 while it runs starts nothing, so it does not
+    // meet its own group: the sample plays once.
     player.handle(&SoundEvent::StopAll, &NoSources);
     play(&mut player, "e1");
     play(&mut player, "e1");
     let out = player.render_until_idle(10 * BLOCK, &NoSources);
-    assert_eq!(out.iter().find(|&&s| s != 0), Some(&2));
+    assert_eq!(out.iter().find(|&&s| s != 0), Some(&1));
 }
 
 #[test]
@@ -765,9 +862,10 @@ fn seqgroup_kill_fades_out_the_holder_then_runs_on() {
 
 #[test]
 fn the_first_module_defining_an_event_wins_and_play_from_picks_one() {
+    // The modules' events play tracks 10 and 20.
     let generic: &[u8] = &[2, 5, WAIT_SAMP, END];
     let first = module(&[generic], 1);
-    let second = module(&[generic], 2);
+    let second = module_with(&[generic], 2, 20, "");
     let mut player = Player::new(vec![first, second], samples(), 1);
     play(&mut player, "e0");
     assert_eq!(player.render(3, &NoSources), [1, 2, 3]);
@@ -833,11 +931,13 @@ fn threads_a_full_block_does_not_reach_run_first_in_the_next() {
     let mut busy = vec![NOP; 9_999];
     busy.push(LOOP);
     let generic: &[u8] = &[NOTE_ON_V1[0], NOTE_ON_V1[1], WAIT_SAMP, END];
-    let mut player = Player::new(vec![module(&[&busy, generic], 1)], samples(), 1);
-    for _ in 0..10 {
-        play(&mut player, "e0");
+    let mut routines: Vec<&[u8]> = vec![&busy; 10];
+    routines.push(generic);
+    let mut player = Player::new(vec![module(&routines, 1)], samples(), 1);
+    for i in 0..10 {
+        play(&mut player, &format!("e{i}"));
     }
-    play(&mut player, "e1");
+    play(&mut player, "e10");
     let out = player.render(3 * BLOCK, &NoSources);
     assert_eq!(&out[BLOCK..BLOCK + 3], [1, 2, 3]);
 }
@@ -932,8 +1032,11 @@ fn main_duckpri_halves_tracks_below_it_until_its_thread_ends() {
     play(&mut player, "e1");
     assert_eq!(player.render(2, &NoSources), [999, 999]);
     player.render(BLOCK - 2, &NoSources);
-    // When the ducking thread stops, its request goes with it.
+    // When the ducking thread stops, its request goes with it. (e1's
+    // thread ends in the next block, so a play after that starts it
+    // anew.)
     player.handle(&SoundEvent::StopObject { object: 1 }, &NoSources);
+    player.render(BLOCK, &NoSources);
     play(&mut player, "e1");
     assert_eq!(player.render(2, &NoSources), [10_000, 10_000]);
 }
@@ -1108,23 +1211,66 @@ fn a_fade_event_for_a_track_not_running_does_nothing() {
     assert!(player.faults.is_empty() && player.is_idle());
 }
 
+/// Object 1 is on the left of the screen, object 2 on the right.
+struct TwoSides;
+
+impl Sources for TwoSides {
+    fn field(&self, _: i32, _: i32) -> Option<i32> {
+        Some(0)
+    }
+
+    fn position(&self, object: i32) -> Option<[i32; 3]> {
+        matches!(object, 1 | 2).then_some([40, 56, 1])
+    }
+
+    fn projection(&self, object: i32) -> Option<Projection> {
+        let x = match object {
+            1 => 100,
+            2 => 700,
+            _ => return None,
+        };
+        Some(Projection {
+            at: [x, 300],
+            screen: [800, 600],
+            zoom: 1,
+            shown_level: 1,
+        })
+    }
+}
+
 #[test]
 fn an_object_that_goes_fades_out_its_instances() {
-    // Objects 1 and 2 play track 10; object 1 goes. Its note fades by 100
-    // a block, from 1024, and ends; object 2's plays on.
+    // Objects 1 and 2 play track 10: one track, played once. Object 1
+    // goes and the track plays on for object 2, placed again: on the
+    // right.
     let module = module_with(&[&LOOPING], 1, 10, "");
     let mut player = Player::new(vec![module], loud(10 * BLOCK), 1);
-    play_for(&mut player, 1, "e0");
-    play_for(&mut player, 2, "e0");
-    player.render(BLOCK, &NoSources);
-    player.handle(&SoundEvent::StopObject { object: 1 }, &NoSources);
-    let first = player.render(BLOCK, &NoSources);
-    assert!(first[0] > 10_000 && first[0] < 20_000, "{}", first[0]);
-    player.render(11 * BLOCK, &NoSources);
-    assert_eq!(player.render(1, &NoSources), [10_000]);
-    // The last object going takes the track with it.
-    player.handle(&SoundEvent::StopObject { object: 2 }, &NoSources);
-    player.render(12 * BLOCK, &NoSources);
+    let sides = TwoSides;
+    for object in [1, 2] {
+        player.handle(
+            &SoundEvent::Play {
+                object,
+                name: "e0".into(),
+            },
+            &sides,
+        );
+    }
+    let both = player.render_stereo(1, &sides);
+    player.render(BLOCK - 1, &sides);
+    player.handle(&SoundEvent::StopObject { object: 1 }, &sides);
+    let right = player.render_stereo(1, &sides);
+    assert!(right[1] > right[0], "{right:?}");
+    assert!(
+        right[1] - right[0] > both[1] - both[0],
+        "{both:?} {right:?}"
+    );
+    player.render(BLOCK - 1, &sides);
+    // The last object going fades the track by 100 a block, from 1024,
+    // and ends it.
+    player.handle(&SoundEvent::StopObject { object: 2 }, &sides);
+    let first = player.render(1, &sides)[0];
+    assert!(first > 0 && first < 10_000, "{first}");
+    player.render(12 * BLOCK, &sides);
     assert!(player.is_idle());
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
@@ -1318,8 +1464,10 @@ fn the_piano_plays_where_its_object_is_and_sets_the_skill() {
     assert_eq!(asked(), [(9, 5)]);
     player.render(BLOCK, &room);
     assert_eq!(asked(), [(9, 464), (9, 527), (42, 0), (42, 0)]);
-    // Object 8 is not on the lot: the event's levels stay. The piano's
-    // one instance is now 8, so letting go of 9 leaves it playing.
+    // The piano still runs, so a start for object 8 (not on the lot)
+    // starts no second piano: its arguments become 8 and the event's
+    // levels, but its `extvol` and `pan` stay. The skill track ended, so
+    // it starts anew.
     player.handle(
         &SoundEvent::Play {
             object: 0,
@@ -1329,16 +1477,44 @@ fn the_piano_plays_where_its_object_is_and_sets_the_skill() {
     );
     assert_eq!(asked(), [(8, 5)]);
     player.render(BLOCK, &room);
-    assert_eq!(
-        asked(),
-        [(8, 300), (8, 600), (9, 464), (9, 527), (42, 0), (42, 0)]
-    );
-    play(&mut player, "kill9");
-    player.render(12 * BLOCK, &room);
-    assert!(!player.is_idle());
+    assert_eq!(asked(), [(8, 464), (8, 527), (42, 0), (42, 0)]);
+    // The piano's one instance is the object of its last fresh start, 9:
+    // letting go of 8 leaves it playing, and of 9 ends it.
     play(&mut player, "kill8");
     player.render(12 * BLOCK, &room);
+    assert!(!player.is_idle());
+    play(&mut player, "kill9");
+    player.render(12 * BLOCK, &room);
     assert!(player.is_idle());
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_piano_whose_number_is_a_patch_still_starts_the_skill_track() {
+    use sims_audio::player::{PIANO, PIANO_SKILL};
+    // The piano's number is registered as a patch. Its start does
+    // nothing (0x57bf80), but the skill is still asked for and the skill
+    // track started (0x573ec3 to 0x573ef2).
+    let skill = [GETSRCDATAFIELD, 6, 1, 19, GETSRCDATAFIELD, 6, 1, 20, END];
+    let events = format!("piano=43,0\n[Patch]\n{PIANO}=0,p,\"one.xa\"\n");
+    let module = module_of_tracks(&[(PIANO_SKILL, &skill)], &events);
+    let mut player = Player::new(vec![module], samples(), 1);
+    let room = PianoRoom::default();
+    let asked = || {
+        let mut asked = std::mem::take(&mut *room.0.borrow_mut());
+        asked.sort();
+        asked
+    };
+    player.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: "piano".into(),
+        },
+        &room,
+    );
+    assert_eq!(asked(), [(9, 5)]);
+    player.render(BLOCK, &room);
+    assert_eq!(asked(), [(42, 0), (42, 0)]);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
 
@@ -1373,14 +1549,18 @@ fn a_piano_let_go_from_a_pause_keeps_its_object() {
 }
 
 #[test]
-fn a_piano_start_refused_at_the_thread_limit_keeps_its_object() {
+fn a_start_of_a_running_track_is_not_refused_at_the_thread_limit() {
     use sims_audio::player::{PIANO, THREADS};
-    // The piano asks about its object every block; track 20 loops.
+    // The piano asks about its object every block; tracks 20 on loop.
     let mut piano = vec![SET_LOOP];
     piano.extend([GETSRCDATAFIELD, 6, 1, 19, LOOP]);
     let filler = [SET_LOOP, LOOP];
     let events = "piano=43,0\nunplaced=43,0,8,300,600\nkill9=23,9\nkill8=23,8\n";
-    let module = module_of_tracks(&[(PIANO, &piano), (20, &filler)], events);
+    let mut tracks: Vec<(u32, &[u8])> = vec![(PIANO, &piano)];
+    for track in 20..20 + THREADS as u32 {
+        tracks.push((track, &filler));
+    }
+    let module = module_of_tracks(&tracks, events);
     let room = PianoRoom::default();
     let event = |name: &str, object| SoundEvent::Play {
         object,
@@ -1388,23 +1568,33 @@ fn a_piano_start_refused_at_the_thread_limit_keeps_its_object() {
     };
     let mut player = Player::new(vec![module], samples(), 1);
     player.handle(&event("piano", 9), &room);
-    for _ in 1..THREADS {
-        play(&mut player, "e20");
+    for track in 20..20 + THREADS as u32 - 1 {
+        play(&mut player, &format!("e{track}"));
     }
-    // The start for 8 is refused: the piano's instance stays 9.
-    player.handle(&event("unplaced", 0), &room);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+    // A fresh start is refused at the limit.
+    play(&mut player, &format!("e{}", 20 + THREADS - 1));
     assert_eq!(player.faults.len(), 1);
     assert!(player.faults[0].contains("threads"));
+    // The start for 8 makes no thread, so it is not refused: the piano
+    // asks about 8 now, and its instance stays 9.
+    player.handle(&event("unplaced", 0), &room);
+    assert_eq!(player.faults.len(), 1, "{:?}", player.faults);
+    room.0.take();
+    player.render(BLOCK, &room);
+    let asked = room.0.take();
+    assert!(asked.iter().any(|&(object, _)| object == 8), "{asked:?}");
+    assert!(asked.iter().all(|&(object, _)| object != 9), "{asked:?}");
     play(&mut player, "kill8");
     player.render(12 * BLOCK, &room);
     room.0.take();
     player.render(BLOCK, &room);
-    assert!(room.0.take().iter().any(|&(object, _)| object == 9));
+    assert!(room.0.take().iter().any(|&(object, _)| object == 8));
     play(&mut player, "kill9");
     player.render(12 * BLOCK, &room);
     room.0.take();
     player.render(BLOCK, &room);
-    assert!(room.0.take().iter().all(|&(object, _)| object != 9));
+    assert!(room.0.take().is_empty());
 }
 
 #[test]
@@ -1733,12 +1923,14 @@ fn an_object_that_goes_stops_notes_its_ended_threads_left() {
     play_for(&mut player, 1, "e0");
     player.render(BLOCK, &NoSources);
     // The track still plays, so object 1 stays its instance when object
-    // 2 plays it too.
+    // 2 plays it too. No thread of it runs, so that play starts it anew.
     play_for(&mut player, 2, "e0");
     player.render(BLOCK, &NoSources);
     assert_eq!(player.render(1, &NoSources), [20_000]);
+    // Object 2 still has the track, so both notes play on.
     player.handle(&SoundEvent::StopObject { object: 1 }, &NoSources);
-    assert_eq!(player.render(1, &NoSources), [10_000]);
+    assert_eq!(player.render(1, &NoSources), [20_000]);
+    // The last object going stops them, having no thread to fade them.
     player.handle(&SoundEvent::StopObject { object: 2 }, &NoSources);
     assert!(player.is_idle());
 }
@@ -2464,4 +2656,662 @@ fn a_forwarded_camera_move_leaves_the_ended_thread_s_levels() {
     player.render(BLOCK, &lot);
     assert_eq!(player.render(1, &lot), before);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_track_that_ends_another_and_restarts_itself_skips_no_track() {
+    // Track 10 waits; track 11 ends it and starts itself anew (interrupt
+    // 1); track 12 plays patch 1. All run in the first block: removing
+    // track 10 and restarting 11 must not make the block skip 12.
+    let waiting: &[u8] = &[SET_LOOP, LOOP];
+    let restarter: &[u8] = &[
+        LOADB_V1, 55, 1, LOADB_V1, 5, 10, KILL_TRK, 5, LOADB_V1, 5, 11, PLAY_TRK, 5, END,
+    ];
+    let module = module(&[waiting, restarter, &GENERIC], 1);
+    let mut player = Player::new(vec![module], samples(), 1);
+    for name in ["e0", "e1", "e2"] {
+        play(&mut player, name);
+    }
+    assert_eq!(player.render(3, &NoSources), [1, 2, 3]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_restart_keeps_the_track_its_targets_and_its_locals() {
+    // Track 11 counts its starts from the top in register 4 (outside the
+    // default banks) and waits. Track 10 points `target` at it and asks
+    // about its register 4 every block. Played again with interrupt 1,
+    // track 11 starts anew as the same track: the count goes on, and
+    // track 10 still reaches it. Let go, track 11 now runs after track
+    // 10, so track 10 sees the count kept first.
+    let counter: &[u8] = &[LOADB_V1, 55, 1, ADD, 4, 55, SET_LOOP, LOOP];
+    let mut watcher = loadl(53, 11);
+    watcher.extend([SET_LOOP, GETSRCDATAFIELD, 6, 4, 4, LOOP]);
+    let module = module(&[&watcher, counter], 1);
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "e1");
+    play(&mut player, "e0");
+    assert_eq!(asked_in_a_block(&mut player), [(1, 1)]);
+    play(&mut player, "e1");
+    assert_eq!(asked_in_a_block(&mut player), [(1, 1)]);
+    assert_eq!(asked_in_a_block(&mut player), [(2, 2)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn play_trk_reads_source_after_the_start() {
+    // Track 10 sets its source to 9, points `target` at track 11 (source
+    // 7) and plays itself: the start points its `target` back at itself
+    // first, so the source it hands on is its own 9.
+    let other: &[u8] = &[LOADB_V1, 47, 7, SET_LOOP, LOOP];
+    // (With `target` at track 11, v1 is written to and read from there.)
+    let mut caller = vec![LOADB_V1, 47, 9];
+    caller.extend(loadl(53, 11));
+    caller.extend([LOADB_V1, 5, 10, PLAY_TRK, 5]);
+    caller.extend([GETSRCDATAFIELD, 6, 47, 47, SET_LOOP, LOOP]);
+    let module = module(&[&caller, other], 1);
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "e1");
+    play(&mut player, "e0");
+    assert_eq!(asked_in_a_block(&mut player), [(9, 9)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_music_mode_lets_go_of_a_music_track_it_starts_again() {
+    use sims_audio::player::music::*;
+    // The buy and build music track waits a second, then asks about its
+    // first argument.
+    let mut waits = vec![LOADL, 5];
+    waits.extend(long(1000));
+    waits.extend([WAIT, 5]);
+    waits.extend(asks(SET_MAIN_MUSIC, false));
+    let tracks: Vec<(u32, Vec<u8>)> = vec![
+        (SET_MAIN_MUSIC, waits),
+        (SET_MAIN_KILL_FIRST, asks(SET_MAIN_KILL_FIRST, false)),
+        (RIVER_LOOP, asks(RIVER_LOOP, false)),
+    ];
+    let tracks: Vec<(u32, &[u8])> = tracks.iter().map(|(t, r)| (*t, &r[..])).collect();
+    let events: String = (0..=18).map(|m| format!("m{m}=36,{m}\n")).collect();
+    let mut player = Player::new(vec![module_of_tracks(&tracks, &events)], samples(), 1);
+    play(&mut player, "m3");
+    asked_in_a_block(&mut player);
+    play(&mut player, "m1");
+    assert_eq!(asked_in_a_block(&mut player), []);
+    // Build starts it again while it waits: it is let go, with the
+    // build list.
+    play(&mut player, "m2");
+    assert_eq!(
+        asked_in_a_block(&mut player),
+        [(BUILD as i32, SET_MAIN_MUSIC as i32)]
+    );
+}
+
+/// Renders a block; returns the fields the scripts asked about in it, in
+/// the order asked.
+fn fields_asked_in_order(player: &mut Player<BTreeMap<String, Pcm>>) -> Vec<i32> {
+    let asked = Asked::default();
+    player.render(BLOCK, &asked);
+    asked.0.into_inner().into_iter().map(|(_, f)| f).collect()
+}
+
+#[test]
+fn a_track_played_again_runs_after_the_others_from_the_next_block() {
+    // Tracks 10 and 11 ask every block, in the order they started. Track
+    // 10 played again is let go, which puts it last.
+    let module = module_of_tracks(&[(10, &asks(10, true)), (11, &asks(11, true))], "");
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "e10");
+    play(&mut player, "e11");
+    assert_eq!(fields_asked_in_order(&mut player), [10, 11]);
+    play(&mut player, "e10");
+    assert_eq!(fields_asked_in_order(&mut player), [11, 10]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_restart_runs_the_registered_track_object_from_its_own_entry() {
+    // Track 10 asks every block, with interrupt 1. Another module, listed
+    // first, also has a track 10, elsewhere in its program, and the
+    // events that play it; the asking module's line registers last, so
+    // its track object is the one (0x57ce04). Both the start and the
+    // restart run it, from its own entry.
+    let mut first = vec![LOADB_V1, 55, 1];
+    first.extend(asks(7, true));
+    let mut padding = vec![NOP; 400];
+    padding.push(END);
+    let second = module_of_tracks(&[(99, &padding), (10, &[END])], "again=kSndobPlay,10\n");
+    let modules = vec![second, module_of_tracks(&[(10, &first)], "")];
+    let mut player = Player::new(modules, samples(), 1);
+    play(&mut player, "e10");
+    assert_eq!(fields_asked_in_order(&mut player), [7]);
+    play(&mut player, "again");
+    assert_eq!(fields_asked_in_order(&mut player), [7]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_track_ended_and_started_again_before_its_turn_runs_in_it() {
+    // Track 10 ends track 11 and starts it again; track 11, after it in
+    // the block, still has its turn there (the original's copy of its
+    // list holds the same track object), and plays patch 1. (Track 11
+    // takes no levels from its arguments, so it plays at full volume.)
+    let killer: &[u8] = &[LOADB_V1, 5, 11, KILL_TRK, 5, PLAY_TRK, 5, END];
+    let module = module_of_kinds(&[(10, 2, killer), (11, 0, &GENERIC)], "");
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "e10");
+    play(&mut player, "e11");
+    assert_eq!(player.render(3, &NoSources), [1, 2, 3]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_fade_that_ends_a_track_beyond_the_budget_ends_it_at_once() {
+    // Track 10 asks once, from the top, then waits. Twenty threads that
+    // spend 10,000 instructions once and end come after it: the second
+    // ten run first in the next block (they were not reached) and use
+    // its instructions before track 10's turn. Its fade to end it
+    // reaches 0 then, which ends it at once: a play right after starts
+    // it anew, from the top, rather than reviving the faded script.
+    let mut fader = vec![LOADL, 5];
+    fader.extend(long(7));
+    fader.extend([GETSRCDATAFIELD, 6, 1, 5, SET_LOOP, LOOP]);
+    let mut busy = vec![NOP; 9_999];
+    busy.push(END);
+    let mut routines: Vec<&[u8]> = vec![&fader];
+    routines.extend(vec![&busy[..]; 20]);
+    let module = module_with(&routines, 1, 10, "kill=18,10,0,0,1\n");
+    let mut player = Player::new(vec![module], samples(), 1);
+    for i in 0..=20 {
+        play(&mut player, &format!("e{i}"));
+    }
+    assert_eq!(fields_asked_in_order(&mut player), [7]);
+    play_for(&mut player, 2048, "kill");
+    assert_eq!(fields_asked_in_order(&mut player), []);
+    play(&mut player, "e0");
+    assert_eq!(fields_asked_in_order(&mut player), [7]);
+    assert_eq!(fields_asked_in_order(&mut player), []);
+}
+
+/// Waits `ms` milliseconds (loadl v1; wait v1).
+fn waits(ms: u32) -> Vec<u8> {
+    let mut routine = vec![LOADL, 5];
+    routine.extend(long(ms));
+    routine.extend([WAIT, 5]);
+    routine
+}
+
+/// Asks once about field `field` (of the object its first argument
+/// names), then goes on.
+fn asks_once(field: u32) -> Vec<u8> {
+    let mut routine = vec![LOADL, 5];
+    routine.extend(long(field));
+    routine.extend([GETSRCDATAFIELD, 6, 1, 5]);
+    routine
+}
+
+#[test]
+fn a_track_started_again_before_its_turn_restarts_itself_there() {
+    // Track 10 ends track 11 and starts it again; in its turn there,
+    // track 11 sets interrupt and plays itself, which starts it anew
+    // from the top, so it never asks.
+    let killer: &[u8] = &[LOADB_V1, 5, 11, KILL_TRK, 5, PLAY_TRK, 5, END];
+    let mut restarter = vec![LOADB_V1, 55, 1, LOADB_V1, 5, 11, PLAY_TRK, 5];
+    restarter.extend(asks_once(7));
+    restarter.push(END);
+    let module = module_of_tracks(&[(10, killer), (11, &restarter)], "");
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "e10");
+    play(&mut player, "e11");
+    for _ in 0..3 {
+        assert_eq!(fields_asked_in_order(&mut player), []);
+    }
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_held_track_let_go_during_a_block_first_runs_in_the_next() {
+    // Track 0x606 asks every block; the pause holds it. Track 0x605,
+    // which the pause spares, waits a second, then plays it, which lets
+    // it go, and asks about field 99. A hold takes a track out of the
+    // list of running tracks, so 0x606 is not in that block's copy.
+    let mut releaser = waits(1000);
+    releaser.extend([LOADL, 5]);
+    releaser.extend(long(0x606));
+    releaser.extend([PLAY_TRK, 5]);
+    releaser.extend(asks_once(99));
+    releaser.push(END);
+    let asker = asks(7, true);
+    let module = module_with(&[&releaser, &asker], 1, 0x605, "");
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "e0");
+    play(&mut player, "e1");
+    assert_eq!(fields_asked_in_order(&mut player), [7]);
+    player.handle(&SoundEvent::Pause, &NoSources);
+    let mut blocks = Vec::new();
+    while blocks.len() < 1000 && !blocks.contains(&vec![99]) {
+        blocks.push(fields_asked_in_order(&mut player));
+    }
+    assert!(
+        blocks[..blocks.len() - 1].iter().all(Vec::is_empty),
+        "{blocks:?}"
+    );
+    assert_eq!(blocks.last(), Some(&vec![99]));
+    assert_eq!(fields_asked_in_order(&mut player), [7]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_track_runs_from_the_module_registered_last_whichever_module_asks() {
+    // Both modules have a track 10: the first's asks for field 7, the
+    // second's, registered last, for 8, both with interrupt 1. Every
+    // start runs the second's (0x573312, 0x57db7a), from either module's
+    // event, before or after the track is killed.
+    let asking = |field| {
+        let mut routine = vec![LOADB_V1, 55, 1];
+        routine.extend(asks(field, true));
+        routine
+    };
+    let mut padding = vec![NOP; 400];
+    padding.push(END);
+    let first = module_of_tracks(&[(10, &asking(7))], "");
+    let second = module_of_tracks(&[(99, &padding), (10, &asking(8))], "again=kSndobPlay,10\n");
+    let mut player = Player::new(vec![first, second], samples(), 1);
+    play(&mut player, "e10");
+    assert_eq!(fields_asked_in_order(&mut player), [8]);
+    play(&mut player, "again");
+    assert_eq!(fields_asked_in_order(&mut player), [8]);
+    player.handle(&SoundEvent::StopAll, &NoSources);
+    player.play_from(0, 9, "e10", &NoSources);
+    assert_eq!(fields_asked_in_order(&mut player), [8]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn the_expansions_register_in_their_directories_order_not_by_name() {
+    // `Deluxe` registers after `ExpansionPack2` (0x414392 to 0x414458),
+    // though its name sorts first and it comes first here: its track 10
+    // is the one that runs, even from the other module's event. (The two
+    // tracks' entry points have different track data IDs, 0x100 and
+    // 0x101, so the descriptor decides which routine runs.)
+    let mut deluxe = module_of_tracks(&[(10, &asks(8, false))], "");
+    deluxe.name = "deluxe\\sound\\d".to_owned();
+    let mut pack = module_of_tracks(
+        &[(99, &[END]), (10, &asks(7, false))],
+        "again=kSndobPlay,10\n",
+    );
+    pack.name = "expansionpack2\\sound\\e".to_owned();
+    let mut player = Player::new(vec![deluxe, pack], samples(), 1);
+    play(&mut player, "again");
+    assert_eq!(fields_asked_in_order(&mut player), [8]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+/// A module with no tables but `[TrackData]`: each routine at its ID.
+fn module_of_code(routines: &[(u32, &[u8])]) -> Module {
+    let code: Vec<&[u8]> = routines.iter().map(|&(_, routine)| routine).collect();
+    let (hit, addresses) = assemble(&code);
+    let mut hot = String::from("[TrackData]\n");
+    for (&(id, _), address) in routines.iter().zip(addresses) {
+        hot.push_str(&format!("{id:#x}={address:#x}\n"));
+    }
+    Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap()
+}
+
+#[test]
+fn a_track_starts_at_the_entry_point_registered_last() {
+    // Track 10's descriptor, the second module's, registered last, names
+    // track data 0x100 as its entry point. A third module, registered
+    // after it and with no tracks, puts 0x100 at its own routine: set
+    // interrupt, ask for field 9 once, wait. The original keeps one table
+    // of track data for every module (0x57ce70), so the start runs that
+    // routine (0x57dbe2), and so does the restart that a play from the
+    // first module's event makes.
+    let mut third = vec![LOADB_V1, 55, 1];
+    third.extend(asks_once(9));
+    third.extend([SET_LOOP, LOOP]);
+    let first = module_of_tracks(&[(10, &asks(7, true))], "again=kSndobPlay,10\n");
+    let second = module_of_tracks(&[(10, &asks(8, true))], "");
+    let modules = vec![first, second, module_of_code(&[(0x100, &third)])];
+    let mut player = Player::new(modules, samples(), 1);
+    play(&mut player, "e10");
+    assert_eq!(fields_asked_in_order(&mut player), [9]);
+    assert_eq!(fields_asked_in_order(&mut player), []);
+    play(&mut player, "again");
+    assert_eq!(fields_asked_in_order(&mut player), [9]);
+    assert_eq!(fields_asked_in_order(&mut player), []);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_call_runs_the_program_that_registered_its_target_last_and_returns() {
+    // Track 10 calls track data 0x101, then asks for field 7. Its module
+    // puts 0x101 at a routine that asks for 6; a module registered after
+    // it, at one that asks for 8. The call runs the later one, in that
+    // module's program (0x57e3d4), and its end returns to the caller's.
+    let mut caller = vec![CALL];
+    caller.extend(long(0x101));
+    caller.extend(asks_once(7));
+    caller.push(END);
+    let mut own = asks_once(6);
+    own.push(END);
+    let mut later = asks_once(8);
+    later.push(END);
+    let first = module_of_tracks(&[(10, &caller), (11, &own)], "");
+    let modules = vec![first, module_of_code(&[(0x101, &later)])];
+    let mut player = Player::new(modules, samples(), 1);
+    play(&mut player, "e10");
+    assert_eq!(fields_asked_in_order(&mut player), [8, 7]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn an_expansions_hit_list_replaces_the_base_games_and_what_the_stations_added() {
+    // Hit list 6 is patch 2 in the base game's table, and a station adds
+    // patch 2 to it. An expansion's list 6, patch 1 alone, registers after
+    // both (0x57ba20, 0x57d261), so the list is patch 1 alone.
+    let choose: Vec<u8> = [
+        &[5, 5][..],
+        &long(6),    // loadl v1, 6
+        &[68, 5],    // smart_setlist v1
+        &[39, 5],    // smart_choose v1
+        &[6, 50, 5], // set patch, v1
+        &[2, 5, WAIT_SAMP, END],
+    ]
+    .concat();
+    let mut base = module(&[&choose], 0);
+    base.name = "sounddata\\base".to_owned();
+    let mut expansion = module_with(&[&choose], 0, 10, "[GlobalHitList]\n6=1\n");
+    expansion.name = "expansionpack\\more".to_owned();
+    let mut player = Player::new(vec![expansion, base], samples(), 1);
+    player.add_stations(&StationLists {
+        hit_lists: BTreeMap::from([(6, vec![2])]),
+        patches: BTreeMap::new(),
+    });
+    play(&mut player, "e0");
+    assert_eq!(player.render(1, &NoSources)[0], 1);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_patch_plays_as_the_module_registered_last_lists_it() {
+    // Both modules list patch 1; the second's, registered last, is
+    // `two.xa`. The first module's track plays it.
+    let generic: &[u8] = &[2, 5, WAIT_SAMP, END];
+    let first = module(&[generic], 1);
+    let second = module_with(&[generic], 1, 20, "[Patch]\n1=0,two,\"two.xa\"\n");
+    let mut player = Player::new(vec![first, second], samples(), 1);
+    play(&mut player, "e0");
+    assert_eq!(player.render(3, &NoSources), [2000, 4000, -2000]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn an_id_registered_again_as_the_other_kind_is_that_kind_only() {
+    // The first module's track 10 is registered again, by a later line
+    // of its own, as a patch: its event starts nothing, and that is no
+    // fault (the patch's start slot returns at once, 0x57bf80). The
+    // second module's track 1 replaces patch 1, so the first module's
+    // track 11, which plays patch 1, plays nothing (0x57f703).
+    let first = module_with(
+        &[&GENERIC, &GENERIC],
+        1,
+        10,
+        "[Patch]\n10=0,ten,\"one.xa\"\n",
+    );
+    let second = module_of_tracks(&[(1, &[END])], "");
+    let mut player = Player::new(vec![first, second], samples(), 1);
+    play(&mut player, "e0");
+    assert!(player.is_idle());
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+    play(&mut player, "e1");
+    assert_eq!(player.render(3, &NoSources), [0, 0, 0]);
+    assert_eq!(player.faults, ["patch 1 is a track"]);
+}
+
+#[test]
+fn a_station_patch_replaces_a_base_game_object_and_an_expansion_replaces_it() {
+    // The base game's track 10 plays patch 1, `one.xa`. Station patches
+    // register after the base game's tables (0x5750dc, 0x57cdd5): station
+    // patch 1, `two.xa`, replaces its patch 1, and station patch 10 its
+    // track 10, which then starts nothing, and no fault.
+    let base = || {
+        let mut base = module_with(&[&GENERIC], 1, 10, "");
+        base.name = "sounddata\\base".to_owned();
+        base
+    };
+    let stations = |ids: &[u32]| StationLists {
+        hit_lists: BTreeMap::new(),
+        patches: ids.iter().map(|&id| (id, "two.xa".to_owned())).collect(),
+    };
+    let mut player = Player::new(vec![base()], samples(), 1);
+    player.add_stations(&stations(&[1]));
+    play(&mut player, "e0");
+    assert_eq!(player.render(3, &NoSources), [2000, 4000, -2000]);
+    let mut player = Player::new(vec![base()], samples(), 1);
+    player.add_stations(&stations(&[10]));
+    play(&mut player, "e0");
+    assert!(player.is_idle());
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+    // An expansion's patch 1, `one.xa` again, registers after the
+    // stations and replaces station patch 1.
+    let (hit, _) = assemble(&[]);
+    let mut expansion =
+        Module::parse("test", &hit, b"v1 5\n", b"[Patch]\n1=0,one,\"one.xa\"\n").unwrap();
+    expansion.name = "expansionpack\\more".to_owned();
+    let mut player = Player::new(vec![expansion, base()], samples(), 1);
+    player.add_stations(&stations(&[1]));
+    play(&mut player, "e0");
+    assert_eq!(player.render(3, &NoSources), [1, 2, 3]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn stations_added_after_playing_destroy_the_objects_they_replace() {
+    // Registering an ID again destroys its object (0x57ce04 to 0x57ce32).
+    // Track 10 plays patch 1, `one.xa`, which is cached; station patch 1,
+    // `two.xa`, replaces it while it plays, so the note stops and the
+    // next start plays `two.xa`.
+    let mut base = module_with(&[&GENERIC], 1, 10, "");
+    base.name = "sounddata\\base".to_owned();
+    let mut player = Player::new(vec![base], samples(), 1);
+    play(&mut player, "e0");
+    assert_eq!(player.render(BLOCK, &NoSources)[..3], [1, 2, 3]);
+    player.add_stations(&StationLists {
+        hit_lists: BTreeMap::new(),
+        patches: BTreeMap::from([(1, "two.xa".to_owned())]),
+    });
+    // The note of the patch went with it; its thread, waiting for it,
+    // ends in the next block.
+    assert!(player.render(BLOCK, &NoSources).iter().all(|&s| s == 0));
+    assert!(player.is_idle());
+    play(&mut player, "e0");
+    assert_eq!(player.render(BLOCK, &NoSources)[..3], [2000, 4000, -2000]);
+    // A running track whose number a station patch takes ends with it.
+    let mut base = module_of_tracks(&[(10, &asks(7, true))], "");
+    base.name = "sounddata\\base".to_owned();
+    let mut player = Player::new(vec![base], samples(), 1);
+    play(&mut player, "e10");
+    assert_eq!(fields_asked_in_order(&mut player), [7]);
+    player.add_stations(&StationLists {
+        hit_lists: BTreeMap::new(),
+        patches: BTreeMap::from([(10, "two.xa".to_owned())]),
+    });
+    assert!(player.is_idle());
+    assert_eq!(fields_asked_in_order(&mut player), []);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_station_patch_with_the_same_sample_is_still_a_new_object() {
+    // Station patch 1 names the same sample as the base game's patch 1,
+    // but it is a new object (0x5750a0 to 0x5750c5), and registering it
+    // destroys the old one, whose note stops.
+    let mut base = module_with(&[&GENERIC], 1, 10, "");
+    base.name = "sounddata\\base".to_owned();
+    let mut player = Player::new(vec![base], samples(), 1);
+    play(&mut player, "e0");
+    assert_eq!(player.render(3, &NoSources), [1, 2, 3]);
+    player.add_stations(&StationLists {
+        hit_lists: BTreeMap::new(),
+        patches: BTreeMap::from([(1, "one.xa".to_owned())]),
+    });
+    assert_eq!(player.render(3, &NoSources), [0, 0, 0]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn destroying_a_queued_patch_leaves_the_note_it_was_queued_on() {
+    // Kind 53 starts patch 1 on idle track 10, then queues patch 2 after
+    // it. A station patch 2 destroys the queued patch's object, which
+    // lets go of its samples (0x57fd25) but not of the voice playing
+    // patch 1 (0x57e09e to 0x57e0b6): patch 1 plays to its end.
+    let events = "[GlobalHitList]\n7=1\n[EventMapping]\nseqa=53,10,0,7\nseqb=53,10,0,6\n";
+    let mut base = module_with(&[&GENERIC], 1, 10, events);
+    base.name = "sounddata\\base".to_owned();
+    let mut player = Player::new(vec![base], samples(), 1);
+    play(&mut player, "seqa");
+    play(&mut player, "seqb");
+    assert_eq!(player.render(3, &NoSources), [1, 2, 3]);
+    player.add_stations(&StationLists {
+        hit_lists: BTreeMap::new(),
+        patches: BTreeMap::from([(2, "two.xa".to_owned())]),
+    });
+    let rest: Vec<i16> = (4..=100).chain([0]).collect();
+    assert_eq!(player.render(98, &NoSources), rest);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_play_of_a_running_track_takes_its_own_argument_kind() {
+    // One module's track 10 takes no levels from its arguments; it asks
+    // once and waits, with interrupt 1. Another's, listed first, is
+    // `kArgsIdVolPan`, and its event plays it for object 0, which would
+    // start nothing; but the track object is the one registered last,
+    // the first's, so the play restarts it.
+    let mut first = vec![LOADB_V1, 55, 1];
+    first.extend(asks_once(7));
+    first.extend([SET_LOOP, LOOP]);
+    let mut padding = vec![NOP; 400];
+    padding.push(END);
+    let second = module_of_kinds(
+        &[(99, 2, &padding), (10, 2, &[END])],
+        "again=kSndobPlay,10\n",
+    );
+    let modules = vec![second, module_of_kinds(&[(10, 0, &first)], "")];
+    let mut player = Player::new(modules, samples(), 1);
+    play(&mut player, "e10");
+    assert_eq!(fields_asked_in_order(&mut player), [7]);
+    assert_eq!(fields_asked_in_order(&mut player), []);
+    play_for(&mut player, 0, "again");
+    assert_eq!(fields_asked_in_order(&mut player), [7]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn seqgroup_kill_ends_a_holder_started_again_in_the_block() {
+    // Track 11 asks, then holds group 1. A block later, track 10 ends it
+    // and starts it again at extvol 0 (its arguments give no volume),
+    // and track 12 takes group 1 before track 11's turn: the holder's
+    // extvol is 0, so it ends at once and never asks again.
+    let mut holder = asks_once(7);
+    holder.extend(loadb(5, 1));
+    holder.extend([SEQGROUP_RETURN, 5, SET_LOOP, LOOP]);
+    let mut killer = waits(1);
+    killer.extend([LOADB_V1, 5, 11, KILL_TRK, 5, PLAY_TRK, 5, END]);
+    let mut taker = waits(1);
+    taker.extend(loadb(5, 1));
+    taker.extend([SEQGROUP_KILL, 5, END]);
+    let module = module_of_tracks(&[(10, &killer), (11, &holder), (12, &taker)], "");
+    let mut player = Player::new(vec![module], samples(), 1);
+    for name in ["e10", "e12", "e11"] {
+        play(&mut player, name);
+    }
+    assert_eq!(fields_asked_in_order(&mut player), [7]);
+    assert_eq!(fields_asked_in_order(&mut player), []);
+    assert!(player.is_idle());
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn an_unpause_runs_the_tracks_in_the_order_of_their_numbers() {
+    // Track 11 started first, then 10; the unpause lets go of each, in
+    // the order of the original's registry (with so few IDs, of their
+    // numbers).
+    let module = module_of_tracks(&[(10, &asks(10, true)), (11, &asks(11, true))], "");
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "e11");
+    play(&mut player, "e10");
+    assert_eq!(fields_asked_in_order(&mut player), [11, 10]);
+    player.handle(&SoundEvent::Unpause, &NoSources);
+    assert_eq!(fields_asked_in_order(&mut player), [10, 11]);
+}
+
+#[test]
+fn an_unpause_runs_the_tracks_bucket_by_bucket() {
+    // With three IDs registered the registry has 193 buckets: track 1005
+    // is in bucket 40 and track 719 in 140, so 1005 goes first.
+    let module = module_of_tracks(&[(719, &asks(719, true)), (1005, &asks(1005, true))], "");
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "e719");
+    play(&mut player, "e1005");
+    assert_eq!(fields_asked_in_order(&mut player), [719, 1005]);
+    player.handle(&SoundEvent::Unpause, &NoSources);
+    assert_eq!(fields_asked_in_order(&mut player), [1005, 719]);
+}
+
+#[test]
+fn the_stations_register_between_the_base_tables_and_the_expansions() {
+    // The base game's tables register 192 IDs (tracks 9998 and 190,
+    // patch 1 and 189 more patches), then the one station patch, the
+    // 193rd. The expansion's track 579 then grows the map to 389 buckets
+    // before it goes in, at the head of bucket 190, ahead of track 190.
+    // Had the station come last, 579 would have gone into bucket 0 of 193
+    // first, and growing would have put 190 ahead of it. (Track 9998
+    // takes track data 0x100, which the expansion's 579 registers again,
+    // so that 190's, 0x101, is the base game's own.)
+    let fillers: String = (2000..2189)
+        .map(|id| format!("{id}=0,f,\"one.xa\"\n"))
+        .collect();
+    let mut base = module_of_tracks(
+        &[(9998, &[END]), (190, &asks(190, true))],
+        &format!("[Patch]\n{fillers}"),
+    );
+    base.name = "sounddata\\base".to_owned();
+    let mut expansion = module_of_tracks(&[(579, &asks(579, true))], "");
+    expansion.name = "expansionpack\\more".to_owned();
+    let mut player = Player::new(vec![expansion, base], samples(), 1);
+    player.add_stations(&StationLists {
+        hit_lists: BTreeMap::new(),
+        patches: BTreeMap::from([(FIRST_ID, "one.xa".to_owned())]),
+    });
+    assert_eq!(
+        (player.registry().len(), player.registry().buckets()),
+        (194, 389)
+    );
+    play(&mut player, "e190");
+    play(&mut player, "e579");
+    assert_eq!(fields_asked_in_order(&mut player), [190, 579]);
+    player.handle(&SoundEvent::Unpause, &NoSources);
+    assert_eq!(fields_asked_in_order(&mut player), [579, 190]);
+}
+
+#[test]
+fn an_unpause_runs_a_buckets_tracks_newest_registered_first() {
+    // Tracks 5 and 198 share bucket 5; 198, listed after 5, is at its
+    // head. Track 5 started last, so it ran last before the unpause too.
+    let module = module_of_tracks(&[(5, &asks(5, true)), (198, &asks(198, true))], "");
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "e198");
+    play(&mut player, "e5");
+    assert_eq!(fields_asked_in_order(&mut player), [198, 5]);
+    player.handle(&SoundEvent::Unpause, &NoSources);
+    assert_eq!(fields_asked_in_order(&mut player), [198, 5]);
+    // Listed the other way round, 5 goes first.
+    let module = module_of_tracks(&[(198, &asks(198, true)), (5, &asks(5, true))], "");
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "e198");
+    play(&mut player, "e5");
+    player.handle(&SoundEvent::Unpause, &NoSources);
+    assert_eq!(fields_asked_in_order(&mut player), [5, 198]);
 }
