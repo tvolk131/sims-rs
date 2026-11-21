@@ -150,15 +150,40 @@ fn the_panel_shows_the_players_speed_while_the_idle_loop_holds_the_game() {
     let Some(install) = install() else {
         return;
     };
-    let game = Game::open(&options(install)).expect("the Goth house opens");
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    game.resize([800, 600]);
+    game.set_speed(Speed::Fast);
+    game.toggle_pause();
+    game.render();
+    let selected_speeds: Vec<i32> = game
+        .panel()
+        .iter()
+        .filter_map(|i| match i.kind {
+            sims_ui::hud::Kind::Button {
+                id, selected: true, ..
+            } if matches!(
+                id,
+                sims_ui::hud::id::NORMAL | sims_ui::hud::id::FAST | sims_ui::hud::id::ULTRA
+            ) =>
+            {
+                Some(id)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(selected_speeds, [sims_ui::hud::id::FAST]);
+
     let mut world = game.lot().world().clone();
     world.set_speed(i32::from(pace::level(Speed::Fast)));
     assert_eq!(pace::shown(&world), Some(Speed::Fast));
+    assert_eq!(sims_ui::hud::speed_for(&world), Some(Speed::Fast));
     // The idle loop's speed, with the player's kept in global 18.
     world.globals[18] = pace::level(Speed::Fast);
     world.globals[16] = sims_sim::speed::IDLE;
     assert_eq!(world.return_speed(), pace::level(Speed::Fast));
     assert_eq!(pace::shown(&world), Some(Speed::Fast));
+    assert_eq!(sims_ui::hud::speed_for(&world), Some(Speed::Fast));
     world.globals[18] = -1;
     assert_eq!(pace::shown(&world), None);
+    assert_eq!(sims_ui::hud::speed_for(&world), None);
 }

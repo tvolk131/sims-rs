@@ -12,10 +12,9 @@
 //!   moved down by that much, except byte 255's;
 //! - the space has no ink, and advances by half the mean ink width.
 //!
-//! A pixel's coverage is its 4-bit atlas value times 17. Here coverage
-//! blends over the frame in 8-bit color; the original blends in its 16-bit
-//! display mode, so edges can differ by one 16-bit step (**unverified**
-//! per pixel).
+//! A pixel's coverage is its 4-bit atlas value times 17 (`0x60c446`),
+//! blended through [`Frame::blend`] using the original's 16-bit 565 alpha
+//! blend table (`0x4999ea` -> `0x6e5eac`, built at `0x49a315`).
 
 use crate::frame::Frame;
 use sims_formats::ffn;
@@ -38,48 +37,15 @@ pub struct Font {
     decoded: ffn::Font,
 }
 
-/// The weight, out of 32, each coverage level from 1 to 14 gives the
-/// text's color, measured on the original's screen: every edge pixel of
-/// the two dialogs compared (about 20,000) fits this table and no other.
-/// What is under the text gets `32 - ALPHA` and one more at odd levels:
-/// the extra weight is needed by the button labels (blue under, the only
-/// place the two differ) and changes nothing elsewhere. Fitted to two
-/// backgrounds; others are **unverified**.
-const ALPHA: [u32; 15] = [0, 3, 5, 7, 9, 11, 13, 15, 18, 20, 22, 24, 26, 29, 30];
-
-/// One pixel of text. The original blends text in 15-bit color (5 bits a
-/// channel, rounding down) and shows it on a 16-bit screen, so green
-/// keeps only its top five bits; a fully covered pixel takes the color
-/// as it is.
+/// One pixel of text. The original blends antialiased font coverage
+/// (`0..=15`, mapped to `coverage * 17` in the font palette at `0x60c446`)
+/// through the same 16-bit 565 alpha blend table (`0x4999ea` -> `0x6e5eac`)
+/// used by [`Frame::blend`].
 fn ink(frame: &mut Frame, x: i32, y: i32, rgb: [u8; 3], coverage: u8) {
-    let c = usize::from(coverage.min(15));
-    if c == 0 {
-        return;
+    let c = coverage.min(15);
+    if c > 0 {
+        frame.blend(x, y, rgb, c * 17);
     }
-    if c == 15 {
-        frame.blend(x, y, rgb, 255);
-        return;
-    }
-    let Some(under) = frame.pixel(x, y) else {
-        return;
-    };
-    let a = ALPHA[c];
-    let under_weight = 32 - a + (c as u32 & 1);
-    let mix = |f: u8, b: u8| {
-        ((u32::from(f >> 3) * a + u32::from(b >> 3) * under_weight) >> 5).min(31) as u8
-    };
-    let [r, g, b] = [0, 1, 2].map(|i| mix(rgb[i], under[i]));
-    let g = g << 1;
-    frame.blend(
-        x,
-        y,
-        [
-            (r << 3) | (r >> 2),
-            (g << 2) | (g >> 4),
-            (b << 3) | (b >> 2),
-        ],
-        255,
-    );
 }
 
 impl Font {
