@@ -46,16 +46,21 @@ the original's two-pass startup registration:
      `0x59e60e`) and reads its `Kind::Skeleton` group via `Binary`. Every
      skeleton decoded before any error is immediately registered in the
      registry (`0x59f087`, filling existing unloaded entries via `0x5a2207`
-     and keeping already-loaded ones via `0x59f18c`), so sibling skeletons
-     become available even if their own indexed catalog is missing and an
+     and keeping already-loaded or previously attempted ones via
+     `0x59f18c`), so sibling skeletons become available even if their own
+     indexed catalog is missing or a later `.ndx` record failed, and an
      earlier skeleton still resolves if a later record in the same file is
-     truncated. Lookups fail loudly if the catalog is missing, fails before
-     decoding the requested name, or lacks the name.
+     truncated. Unresolved lazy lookups are marked attempted (`0x5a389b`)
+     so later catalog loads cannot overwrite them, and fail loudly if the
+     catalog is missing, fails before decoding the requested name, or lacks
+     the name.
    - Each `Kind::Appearance` entry keeps its first registration (`0x59fe53`),
-     and its referenced `.bcf` catalog is decoded once to confirm the
-     catalog actually defines the named appearance (`0x5a044d`, `0x5a38da`,
-     `0x5950f5`, `0x5a27f2`) before adding it to `suits` (decode errors are
-     recorded in `suit_errors`).
+     and its resolved `.bcf` catalog is decoded once to confirm the catalog
+     actually defines the named appearance (`0x5a044d`, `0x5a38da`,
+     `0x5950f5`, `0x5a27f2`) before adding it to `suits` (unreadable
+     suit-only catalogs and decode errors, including a short appearance
+     count at `0x59f1c1`, are recorded in `suit_errors` without aborting
+     skeleton-only callers).
    - `.ndx` stream failures are attributed by `IndexReader::failed_kind()`
      to the failing group: skeleton-group errors block later skeletons and
      record `suit_errors`; appearance-group errors record `suit_errors`

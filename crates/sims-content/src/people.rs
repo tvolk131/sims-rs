@@ -122,6 +122,9 @@ enum SkeletonEntry {
         directory: String,
         catalog_bcf: Vec<u8>,
     },
+    /// Attempted lazy lookup that did not populate the entry (`0x5a389b`):
+    /// subsequent catalog loads discard matching records (`0x59f18c`).
+    Failed(String),
 }
 
 /// The original's startup avatar registry (`0x5835ed`, `0x59f844`,
@@ -156,7 +159,6 @@ pub struct AvatarRegistry {
     root: PathBuf,
     paths: AvatarPaths,
     skeletons: BTreeMap<String, (usize, SkeletonEntry)>,
-    next_step: usize,
     first_skeleton_error: Option<(usize, String)>,
     suits: BTreeSet<String>,
     suit_errors: BTreeMap<String, String>,
@@ -287,41 +289,49 @@ impl AvatarRegistry {
             }
         }
 
-        // Decode each referenced `.bcf` catalog once to confirm the indexed
-        // appearance names it actually defines (0x5a044d, 0x5950f5, 0x5a27f2).
-        let mut by_catalog: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        // Decode each referenced `.bcf` catalog once (keyed by resolved
+        // resource location so case/slash aliases share one decode) to confirm
+        // the indexed appearance names it actually defines (0x5a044d,
+        // 0x5950f5, 0x5a27f2). Unreadable suit-only catalogs record into
+        // `suit_errors` instead of aborting skeleton-only callers.
+        let mut by_catalog: BTreeMap<String, (Resource, Vec<String>)> = BTreeMap::new();
         for (name, (ndx_location, directory, catalog_bcf)) in indexed_suits {
-            by_catalog
-                .entry((directory, catalog_bcf))
-                .or_default()
-                .push((name, ndx_location));
-        }
-        for ((directory, catalog_bcf), entries) in by_catalog {
             match paths.files.lookup(&directory, &catalog_bcf) {
                 Ok(Some(resource)) => {
                     let location = resource.location(&install.root);
-                    let bytes = resource.read()?;
-                    let mut binary = Binary::new(&bytes);
-                    let (_, skeleton_error) = read_bcf_skeletons(&mut binary);
-                    if let Some(error) = skeleton_error {
-                        suit_errors.insert(location, error.to_string());
-                        continue;
-                    }
-                    let mut catalog_suits = BTreeSet::new();
-                    if let Err(error) = read_bcf_appearances(&mut binary, &mut catalog_suits) {
-                        suit_errors.insert(location, error.to_string());
-                    }
-                    for (name, _) in entries {
-                        if catalog_suits.contains(&name) {
-                            suits.insert(name);
-                        }
-                    }
+                    by_catalog
+                        .entry(location)
+                        .or_insert_with(|| (resource, Vec::new()))
+                        .1
+                        .push(name);
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    for (_, ndx_location) in entries {
-                        suit_errors.insert(ndx_location, error.to_string());
-                    }
+                    suit_errors.insert(ndx_location, error.to_string());
+                }
+            }
+        }
+        for (location, (resource, names)) in by_catalog {
+            let bytes = match resource.read() {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    suit_errors.insert(location, error.to_string());
+                    continue;
+                }
+            };
+            let mut binary = Binary::new(&bytes);
+            let (_, skeleton_error) = read_bcf_skeletons(&mut binary);
+            if let Some(error) = skeleton_error {
+                suit_errors.insert(location, error.to_string());
+                continue;
+            }
+            let mut catalog_suits = BTreeSet::new();
+            if let Err(error) = read_bcf_appearances(&mut binary, &mut catalog_suits) {
+                suit_errors.insert(location, error.to_string());
+            }
+            for name in names {
+                if catalog_suits.contains(&name) {
+                    suits.insert(name);
                 }
             }
         }
@@ -330,7 +340,6 @@ impl AvatarRegistry {
             root: install.root.clone(),
             paths,
             skeletons,
-            next_step: step,
             first_skeleton_error,
             suits,
             suit_errors,
@@ -342,7 +351,9 @@ impl AvatarRegistry {
     /// (`0x5a3810` → `0x59e60e` → `0x59f087`). Every skeleton decoded from
     /// that catalog before any error is immediately registered (filling
     /// existing unloaded entries via `0x5a2207` and preserving already-loaded
-    /// entries via `0x59f18c`).
+    /// or previously attempted entries via `0x59f18c`). An unresolved lazy
+    /// lookup is marked attempted (`0x5a389b`) so later catalog loads cannot
+    /// overwrite it.
     pub fn skeleton(&mut self, name: &str) -> Result<Skeleton> {
         let Some((reg_step, entry)) = self.skeletons.get(name) else {
             return Err(Error::Unsupported(match &self.first_skeleton_error {
@@ -359,6 +370,7 @@ impl AvatarRegistry {
                 "0x5a0384: {reason}, so whether it defines {name:?} is unknown"
             )));
         }
+        let alpha_step = *reg_step;
         let (ndx_location, directory, catalog_bcf) = match entry {
             SkeletonEntry::Loaded {
                 file,
@@ -374,6 +386,7 @@ impl AvatarRegistry {
                     bones: bones.clone(),
                 });
             }
+            SkeletonEntry::Failed(reason) => return Err(Error::Unsupported(reason.clone())),
             SkeletonEntry::Indexed {
                 ndx_location,
                 directory,
@@ -383,10 +396,14 @@ impl AvatarRegistry {
 
         let Some(resource) = self.paths.files.lookup(&directory, &catalog_bcf)? else {
             let catalog = decode(&catalog_bcf, 1);
-            return Err(Error::Unsupported(format!(
+            let reason = format!(
                 "0x5a3810: {ndx_location} points skeleton {name:?} to {catalog:?}, \
                  which is missing in {directory}"
-            )));
+            );
+            if let Some((_, entry)) = self.skeletons.get_mut(name) {
+                *entry = SkeletonEntry::Failed(reason.clone());
+            }
+            return Err(Error::Unsupported(reason));
         };
         let location = resource.location(&self.root);
         let bytes = resource.read()?;
@@ -404,13 +421,13 @@ impl AvatarRegistry {
                 bones,
             };
             match self.skeletons.get_mut(&skel_name) {
-                Some((_, entry @ SkeletonEntry::Indexed { .. })) => {
+                Some((entry_step, entry @ SkeletonEntry::Indexed { .. })) => {
+                    *entry_step = (*entry_step).min(alpha_step);
                     *entry = loaded;
                 }
-                Some((_, SkeletonEntry::Loaded { .. })) => {}
+                Some((_, SkeletonEntry::Loaded { .. } | SkeletonEntry::Failed(_))) => {}
                 None => {
-                    self.next_step += 1;
-                    self.skeletons.insert(skel_name, (self.next_step, loaded));
+                    self.skeletons.insert(skel_name, (alpha_step, loaded));
                 }
             }
         }
@@ -432,15 +449,18 @@ impl AvatarRegistry {
                 bones: bones.clone(),
             });
         }
-        if let Some(error) = error {
-            return Err(Error::Unsupported(format!(
-                "0x5a3810: the skeletons of {location} do not decode ({error})"
-            )));
+        let reason = if let Some(error) = error {
+            format!("0x5a3810: the skeletons of {location} do not decode ({error})")
+        } else {
+            format!(
+                "0x5a03c0: {ndx_location} points skeleton {name:?} to {location}, \
+                 which does not define it"
+            )
+        };
+        if let Some((_, entry)) = self.skeletons.get_mut(name) {
+            *entry = SkeletonEntry::Failed(reason.clone());
         }
-        Err(Error::Unsupported(format!(
-            "0x5a03c0: {ndx_location} points skeleton {name:?} to {location}, \
-             which does not define it"
-        )))
+        Err(Error::Unsupported(reason))
     }
 
     /// The wiggle bone scales of the skeleton named `name` (`0x5a0384`,
@@ -694,13 +714,17 @@ fn read_bcf_skeletons(binary: &mut Binary<'_>) -> (DecodedSkeletons, Option<sims
 }
 
 /// Reads the `Kind::Appearance` group of a binary `.bcf` catalog record by
-/// record (`0x595140`, `0x5950f5` lowercasing each suit name).
+/// record (`0x595140`, `0x5950f5` lowercasing each suit name). A short
+/// appearance count (`Ok(None)`) is treated as a read failure (`0x59f1c1`).
 fn read_bcf_appearances(
     binary: &mut Binary<'_>,
     suits: &mut BTreeSet<String>,
 ) -> sims_formats::Result<()> {
     let Some(count) = binary.count(Kind::Appearance)? else {
-        return Ok(());
+        return Err(sims_formats::Error::new(
+            binary.position(),
+            "missing BCF appearance count",
+        ));
     };
     for _ in 0..count {
         if let Asset::Appearance(appearance) = binary.read(Kind::Appearance)? {
@@ -997,6 +1021,101 @@ mod tests {
         assert_eq!(registry.skeleton_scales("gamma").unwrap(), [33]);
         let delta_err = registry.skeleton_scales("delta").unwrap_err().to_string();
         assert!(delta_err.contains("0x5a3810"), "{delta_err}");
+    }
+
+    #[test]
+    fn failed_lazy_lookup_stays_failed_and_unseen_sibling_survives_later_ndx_error() {
+        // Case 1 (0x5a389b + 0x59f18c): looking up beta before alpha marks
+        // beta as attempted, so loading alpha's shared catalog cannot later
+        // overwrite beta.
+        let dir = ScratchDir::new("lazy-attempted");
+        dir.write(
+            "GameData/Animation/Animation.ndx",
+            &ndx(&[("alpha", "shared.cmx"), ("beta", "missing.cmx")], &[]),
+        );
+        dir.write(
+            "GameData/Animation/shared.cmx.bcf",
+            &skeletons(&[("alpha", 11), ("beta", 22)]),
+        );
+        let install = dir.install();
+        let mut registry = AvatarRegistry::load(&install).unwrap();
+        let beta_err = registry.skeleton_scales("beta").unwrap_err().to_string();
+        assert!(beta_err.contains("0x5a3810"), "{beta_err}");
+        assert_eq!(registry.skeleton_scales("alpha").unwrap(), [11]);
+        let beta_still_err = registry.skeleton_scales("beta").unwrap_err().to_string();
+        assert!(beta_still_err.contains("0x5a3810"), "{beta_still_err}");
+
+        // Case 2: a truncated NDX registers alpha before failing. Loading
+        // alpha decodes and registers unseen beta, which must be available
+        // despite the later NDX error.
+        let dir2 = ScratchDir::new("lazy-unseen-after-ndx-err");
+        let mut bad_ndx = Vec::new();
+        bad_ndx.extend(2i32.to_le_bytes()); // 2 skeletons, 2nd truncated
+        bad_ndx.push(5);
+        bad_ndx.extend_from_slice(b"alpha");
+        bad_ndx.push(10);
+        bad_ndx.extend_from_slice(b"shared.cmx");
+        bad_ndx.extend([9, b'x']);
+        dir2.write("GameData/Animation/Animation.ndx", &bad_ndx);
+        dir2.write(
+            "GameData/Animation/shared.cmx.bcf",
+            &skeletons(&[("alpha", 11), ("beta", 22)]),
+        );
+        let install2 = dir2.install();
+        let mut registry2 = AvatarRegistry::load(&install2).unwrap();
+        assert_eq!(registry2.skeleton_scales("alpha").unwrap(), [11]);
+        assert_eq!(registry2.skeleton_scales("beta").unwrap(), [22]);
+    }
+
+    #[test]
+    fn unreadable_suit_catalog_and_short_appearance_count_record_suit_errors_only() {
+        let dir = ScratchDir::new("unreadable-suit-cat");
+        dir.write(
+            "GameData/Animation/Animation.ndx",
+            &ndx(
+                &[("adult", "adult-skeleton.cmx")],
+                &[
+                    ("giant-suit", "oversized.cmx"),
+                    ("short-suit", "short-app.cmx"),
+                    ("alias-suit", "SHORT-APP.CMX"),
+                ],
+            ),
+        );
+        dir.write(
+            "GameData/Animation/adult-skeleton.cmx.bcf",
+            &skeletons(&[("adult", 19)]),
+        );
+        // Sparse file above the 128 MiB resource limit: unreadable for suits,
+        // but must not abort AvatarRegistry::load or skeleton lookup.
+        let oversized = dir.0.join("GameData/Animation/oversized.cmx.bcf");
+        std::fs::File::create(&oversized)
+            .unwrap()
+            .set_len(sims_formats::far::MAX_MEMBER + 1)
+            .unwrap();
+        // 0 skeletons + 2-byte truncated appearance count (0x59f1c1 failure).
+        dir.write("GameData/Animation/short-app.cmx.bcf", &[0, 0, 0, 0, 1, 0]);
+
+        let install = dir.install();
+        let mut registry = AvatarRegistry::load(&install).unwrap();
+        assert_eq!(registry.skeleton_scales("adult").unwrap(), [19]);
+        assert!(!registry.suits.contains("giant-suit"));
+        assert!(!registry.suits.contains("short-suit"));
+        assert!(
+            registry
+                .suit_errors
+                .keys()
+                .any(|k| k.ends_with("oversized.cmx.bcf")),
+            "{:?}",
+            registry.suit_errors
+        );
+        assert!(
+            registry
+                .suit_errors
+                .keys()
+                .any(|k| k.ends_with("short-app.cmx.bcf")),
+            "{:?}",
+            registry.suit_errors
+        );
     }
 
     #[test]
