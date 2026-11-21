@@ -78,7 +78,11 @@ struct Pool {
     /// The tourist worker skips existing families regardless of size.
     target: Option<usize>,
     expansion: u8,
+    /// The pending/done pair's done byte in NGBH #1 (pending follows it).
     done: usize,
+    /// Whether the one-time wrapper tests done (the first three) rather
+    /// than pending (the Townies and tourists).
+    tests_done: bool,
     template_kind: u16,
     actors: usize,
     worker: &'static str,
@@ -90,6 +94,7 @@ const CELEBRITIES: Pool = Pool {
     target: Some(12),
     expansion: 0x40,
     done: 4,
+    tests_done: true,
     template_kind: 0x800,
     actors: 2,
     worker: "0x42c1ea",
@@ -100,6 +105,7 @@ const FANS: Pool = Pool {
     target: Some(18),
     expansion: 0x40,
     done: 6,
+    tests_done: true,
     template_kind: 0x200,
     actors: 2,
     worker: "0x42d193",
@@ -110,6 +116,7 @@ const MAGIC_TOWN: Pool = Pool {
     target: Some(30),
     expansion: 0x80,
     done: 8,
+    tests_done: true,
     template_kind: 0x1000,
     actors: 2,
     worker: "0x42d5f2",
@@ -120,6 +127,7 @@ const TOWNIES: Pool = Pool {
     target: Some(30),
     expansion: 0x04,
     done: 0,
+    tests_done: false,
     template_kind: 0x200,
     actors: 1,
     worker: "0x42a98f",
@@ -130,6 +138,7 @@ const TOURISTS: Pool = Pool {
     target: None,
     expansion: 0x08,
     done: 2,
+    tests_done: false,
     template_kind: 0x200,
     actors: 2,
     worker: "0x42b0fd",
@@ -229,7 +238,7 @@ impl<'a> Fills<'a, '_> {
         let pending = pool.done + 1;
         // The first three wrappers test done; the last two test pending
         // (0x42c548, 0x42d4f1, 0x42d941, 0x42b007, 0x42b8d7).
-        let converting = if pool.done >= 4 {
+        let converting = if pool.tests_done {
             !options[pool.done]
         } else {
             options[pending]
@@ -256,7 +265,7 @@ impl<'a> Fills<'a, '_> {
             if !families.contains_key(&id) {
                 continue;
             }
-            if pool.done >= 4 {
+            if pool.tests_done {
                 // These wrappers use the loop's terminal index on a hit.
                 return Err(format!(
                     "{}: reserved family {id} sends the wrapper past the end of its family vector",
@@ -264,7 +273,8 @@ impl<'a> Fills<'a, '_> {
                 )
                 .into());
             }
-            // The Townie and tourist wrappers retain the matching index.
+            // The Townie and tourist wrappers renumber the first match to
+            // the largest family ID plus one (0x42b05e to 0x42b09f).
             let replacement = families.last_key_value().unwrap().0 + 1;
             if replacement > i16::MAX as u16 {
                 return Err(format!(

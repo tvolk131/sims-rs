@@ -1052,12 +1052,17 @@ const TICK_31478_29: &str = "8b7ae0ca751002b0ee36bd32ba0f921c494bebf77fba4a27f50
 /// Where to start the C runtime's generator for House 69's load in track
 /// 2's second run: state 1 after this many draws, fitted so that our
 /// load's own 4,730 draws reach the recording's entry state (state 1 after
-/// 405,850 draws). This is the effective offset when booting directly
-/// from the saved files with [`Lot::load_with`].
+/// 405,850 draws). It is the offset for booting from the original's own
+/// files with [`Lot::load_with`], so it stands for the open's import and
+/// pools and for any of our load's draws the original makes earlier
+/// (the indicators, the adult skeleton). That the generator ran on from
+/// state 1 with no reseed is assumed, not observed.
 const FILE_BOOT_DRAWS: u32 = 401_120;
-/// Fitted offset from state 1 to immediately before the first pool GUID
-/// in run 2. Covers startup, neighborhood navigation and Patch, assuming
-/// the stream has no intervening reseed.
+/// Where our open of run 2 starts the C runtime: state 1 after this many
+/// draws, fitted so that the first pool person's GUID low word and traits
+/// are the original's. It stands for startup, the neighborhood view and
+/// the `Patch` import, which our open does not draw for. That the
+/// generator ran on from state 1 with no reseed is assumed, not observed.
 const OPEN_DRAWS: u32 = 84_947;
 /// The frames track 2's House 69 recordings drew: after updates 0 to 2,
 /// 29, 59, 89, 101 and 102, then every 30th from 123
