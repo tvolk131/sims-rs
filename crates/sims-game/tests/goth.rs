@@ -4107,6 +4107,403 @@ fn pet_subpanels_ultra_speed_blink_and_duplicate_instance_selection() {
     );
 }
 
+/// Install-backed verification of Child Report Card (`[esi + 0x124]`),
+/// Superstar / Fame (`[esi + 0x11c]`), and Needs / Pet Needs / Pet Skills /
+/// Report Card / Fame help balloons on the Complete Collection install.
+#[test]
+fn report_card_superstar_panel_and_help_balloons() {
+    use sims_game::hud::{Hud, INTERFACE, WHOOSH};
+    use sims_game::pace::Pace;
+    use sims_ui::balloon::Help;
+    use sims_ui::command::{Command, Panel};
+    use sims_ui::hud::Kind;
+    use sims_vm::SoundEvent;
+
+    let Some(install) = install() else {
+        return;
+    };
+    let house = goth_house(&install);
+    let mut game = Game::open(&Options {
+        install: install.clone(),
+        house: house.clone(),
+        answers: vec![3],
+        play: false,
+        frames: Frames::default(),
+    })
+    .expect("the Goth house opens");
+    assert_eq!(game.run(2), 2);
+    let opened = open_house(&install, &house).expect("the Goth house opens");
+    let lot = game.lot();
+    let mut hud = Hud::open(
+        &install,
+        &house,
+        &opened.assets,
+        lot.world(),
+        lot.program().autonomy_constants().friendship_threshold,
+    )
+    .expect("HUD opens");
+    let view = View::new([800, 600], [0, 0], opened.rotation);
+    let mut canvas = Canvas::new(800, 600, [0; 3]);
+
+    // 1. Human Needs help balloons: clicking Hunger opens balloon (+ UI_whoosh),
+    //    clicking Social replaces in-place (no extra UI_whoosh, 0x50fbdf), and
+    //    clicking Social again closes it (+ UI_whoosh, 0x50fb7f).
+    hud.controls.panel = Some(Panel::Needs);
+    hud.draw(
+        lot.world(),
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    let _ = hud.take_sounds();
+    let hunger_rect = hud
+        .items()
+        .iter()
+        .find(|i| {
+            i.command
+                == Some(Command::Help(Help::Need {
+                    pet: false,
+                    index: 0,
+                }))
+        })
+        .expect("Hunger hitbox")
+        .rect;
+    let social_rect = hud
+        .items()
+        .iter()
+        .find(|i| {
+            i.command
+                == Some(Command::Help(Help::Need {
+                    pet: false,
+                    index: 5,
+                }))
+        })
+        .expect("Social hitbox")
+        .rect;
+    let center = |r: sims_ui::frame::Rect| [r.x + r.width / 2, r.y + r.height / 2];
+
+    assert_eq!(
+        hud.press(center(hunger_rect), lot.world(), true),
+        Some(Command::Help(Help::Need {
+            pet: false,
+            index: 0
+        }))
+    );
+    assert_eq!(
+        hud.take_sounds(),
+        [SoundEvent::Play {
+            object: INTERFACE,
+            name: WHOOSH.into(),
+        }]
+    );
+    assert_eq!(
+        hud.press(center(social_rect), lot.world(), true),
+        Some(Command::Help(Help::Need {
+            pet: false,
+            index: 5
+        }))
+    );
+    assert!(
+        hud.take_sounds().is_empty(),
+        "switching between open balloons replaces in place without UI_whoosh"
+    );
+    assert_eq!(
+        hud.press(center(social_rect), lot.world(), true),
+        Some(Command::Help(Help::Need {
+            pet: false,
+            index: 5
+        }))
+    );
+    assert_eq!(hud.controls.help, None);
+    assert_eq!(
+        hud.take_sounds(),
+        [SoundEvent::Play {
+            object: INTERFACE,
+            name: WHOOSH.into(),
+        }]
+    );
+
+    // 2. Child Report Card on Cassandra (object 16): opens grade button ->
+    //    Report Card balloon; switching selection to Mortimer closes the
+    //    balloon on redraw and emits UI_whoosh; stale click rejected.
+    let mut cass_world = lot.world().clone();
+    let mortimer = cass_world.selected().expect("Mortimer selected");
+    cass_world.objects.get_mut(&mortimer).unwrap().selected = false;
+    cass_world.objects.get_mut(&16).unwrap().selected = true;
+    hud.controls.panel = Some(Panel::Job);
+    hud.draw(
+        &cass_world,
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    let _ = hud.take_sounds();
+    let rc_btn = hud
+        .items()
+        .iter()
+        .find(|i| matches!(i.kind, Kind::ReportCardButton { .. }))
+        .expect("Report Card grade button")
+        .rect;
+    // Stale press against Mortimer (Adult Job) must be ignored without WHOOSH.
+    assert_eq!(hud.press(center(rc_btn), lot.world(), true), None);
+    assert!(hud.take_sounds().is_empty());
+    // Press against Cassandra opens Report Card balloon + WHOOSH.
+    assert_eq!(
+        hud.press(center(rc_btn), &cass_world, true),
+        Some(Command::Help(Help::ReportCard))
+    );
+    assert_eq!(hud.controls.help, Some(Help::ReportCard));
+    assert_eq!(hud.take_sounds().len(), 1);
+    // Drawing with Mortimer selected closes Report Card balloon + WHOOSH.
+    hud.draw(
+        lot.world(),
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    assert_eq!(hud.controls.help, None);
+    assert_eq!(hud.take_sounds().len(), 1);
+
+    // 3. Superstar / Fame panel on Bella (object 18, unemployed): setting
+    //    person.data[80] > 0 routes Job tab to Fame and opens Fame balloons.
+    let mut fame_world = lot.world().clone();
+    fame_world.objects.get_mut(&mortimer).unwrap().selected = false;
+    let bella = fame_world.objects.get_mut(&18).unwrap();
+    bella.selected = true;
+    let bp = bella.person.as_mut().unwrap();
+    bp.data[80] = 50; // FameScore > 0
+    bp.data[81] = 4; // 2.0 stars ("Studio Fly")
+    hud.controls.panel = Some(Panel::Job);
+    hud.draw(
+        &fame_world,
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    assert!(hud.items().iter().any(|i| matches!(
+        &i.kind,
+        Kind::Fame {
+            fame_level: 4,
+            fame_title,
+            ..
+        } if fame_title == "Studio Fly"
+    )));
+    let fame_lvl_rect = hud
+        .items()
+        .iter()
+        .find(|i| i.command == Some(Command::Help(Help::FameLevel(4))))
+        .expect("Fame level button")
+        .rect;
+    let _ = hud.take_sounds();
+    assert_eq!(
+        hud.press(center(fame_lvl_rect), &fame_world, true),
+        Some(Command::Help(Help::FameLevel(4)))
+    );
+    assert_eq!(hud.take_sounds().len(), 1);
+    hud.draw(
+        &fame_world,
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    assert!(hud.items().iter().any(|i| matches!(
+        &i.kind,
+        Kind::Balloon(b) if b.title.starts_with("Studio Fly")
+    )));
+    // Pressing on the open balloon itself (`0x66bd68 -> 0x5dd85f`) keeps it
+    // open without `UI_whoosh`, while hovering onto the balloon itself
+    // (`0x51a0a2..0x51a0b5`, `0x51d312`) or outside the subpanel
+    // (`0x51f1f2..0x51f3e5`, `0x51d2ee..0x51d329`) dismisses it with `UI_whoosh`.
+    let balloon_rect = hud
+        .items()
+        .iter()
+        .find(|i| matches!(i.kind, Kind::Balloon(_)))
+        .expect("Fame balloon")
+        .rect;
+    let _ = hud.take_sounds();
+    assert_eq!(hud.press(center(balloon_rect), &fame_world, true), None);
+    assert_eq!(hud.controls.help, Some(Help::FameLevel(4)));
+    assert!(hud.take_sounds().is_empty());
+    assert!(hud.hover(center(balloon_rect)));
+    assert_eq!(hud.controls.help, None);
+    assert_eq!(
+        hud.take_sounds(),
+        [SoundEvent::Play {
+            object: INTERFACE,
+            name: WHOOSH.into(),
+        }]
+    );
+
+    // 4. Moving the pointer onto the lot (`Game::hover`), leaving the window
+    //    (`Game::leave`), or clicking directly on the lot (`Game::press`, both
+    //    empty ground and an object that opens a pie menu) dismisses an open
+    //    help balloon with `UI_whoosh`. At 1024x768 (`0x518f48`, `0x51f260`),
+    //    the western subpanel spans x=521..1024 so hovering (650, 700) keeps
+    //    Hunger open.
+    game.resize([1024, 768]);
+    game.render();
+    let hunger_1024 = game
+        .panel()
+        .iter()
+        .find_map(|i| {
+            (i.command
+                == Some(Command::Help(Help::Need {
+                    pet: false,
+                    index: 0,
+                })))
+            .then_some(i.rect)
+        })
+        .expect("Hunger hitbox at 1024x768");
+    assert_eq!(hunger_1024.x, 521);
+    game.press(center(hunger_1024));
+    game.render();
+    let _ = game.take_sounds();
+    let _ = game.hover([650, 700]);
+    assert!(game.take_sounds().is_empty());
+    game.render();
+    assert!(
+        game.panel()
+            .iter()
+            .any(|i| matches!(&i.kind, Kind::Balloon(b) if b.title == "Hunger"))
+    );
+    // Moving onto the balloon itself dismisses it + WHOOSH.
+    let balloon_1024 = game
+        .panel()
+        .iter()
+        .find(|i| matches!(i.kind, Kind::Balloon(_)))
+        .expect("Hunger balloon at 1024x768")
+        .rect;
+    assert!(game.hover(center(balloon_1024)));
+    assert!(game.take_sounds().contains(&SoundEvent::Play {
+        object: INTERFACE,
+        name: WHOOSH.into(),
+    }));
+
+    game.resize([800, 600]);
+    game.render();
+    let find_hunger = |game: &Game| {
+        game.panel().iter().find_map(|i| {
+            (i.command
+                == Some(Command::Help(Help::Need {
+                    pet: false,
+                    index: 0,
+                })))
+            .then_some(i.rect)
+        })
+    };
+    let need_rect = match find_hunger(&game) {
+        Some(rect) => rect,
+        None => {
+            let toggle_rect = game
+                .panel()
+                .iter()
+                .find(|i| i.command == Some(Command::TogglePanel))
+                .expect("TogglePanel button")
+                .rect;
+            game.press(center(toggle_rect));
+            game.render();
+            find_hunger(&game).expect("Hunger hitbox on live Game")
+        }
+    };
+    game.press(center(need_rect));
+    game.render();
+    assert!(
+        game.panel()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::Balloon(_)))
+    );
+    let _ = game.take_sounds();
+    // Moving the pointer from the help control onto the lot dismisses it + WHOOSH.
+    assert!(game.hover([10, 10]));
+    assert!(game.take_sounds().contains(&SoundEvent::Play {
+        object: INTERFACE,
+        name: WHOOSH.into(),
+    }));
+    game.render();
+    assert!(
+        !game
+            .panel()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::Balloon(_)))
+    );
+    // Reopen balloon and leave the window: dismisses + WHOOSH.
+    game.press(center(need_rect));
+    game.render();
+    let _ = game.take_sounds();
+    assert!(game.leave());
+    assert!(game.take_sounds().contains(&SoundEvent::Play {
+        object: INTERFACE,
+        name: WHOOSH.into(),
+    }));
+    game.render();
+    assert!(
+        !game
+            .panel()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::Balloon(_)))
+    );
+    // Reopen balloon and press empty lot directly: balloon closes + WHOOSH + redraw.
+    game.press(center(need_rect));
+    game.render();
+    let _ = game.take_sounds();
+    let outcome = game.press([10, 10]);
+    assert!(outcome.redraw);
+    assert!(game.take_sounds().contains(&SoundEvent::Play {
+        object: INTERFACE,
+        name: WHOOSH.into(),
+    }));
+    game.render();
+    assert!(
+        !game
+            .panel()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::Balloon(_)))
+    );
+    // Reopen balloon and press a clickable lot object: balloon dismisses + WHOOSH
+    // and the object's pie menu opens.
+    game.press(center(need_rect));
+    game.render();
+    assert!(
+        game.panel()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::Balloon(_)))
+    );
+    let _ = game.take_sounds();
+    let object_pt = (100..700)
+        .step_by(12)
+        .flat_map(|x| (60..340).step_by(12).map(move |y| [x, y]))
+        .find(|&pt| game.under(pt).is_some())
+        .expect("a clickable object on the Goth lot");
+    let outcome = game.press(object_pt);
+    assert!(outcome.redraw);
+    assert!(game.take_sounds().contains(&SoundEvent::Play {
+        object: INTERFACE,
+        name: WHOOSH.into(),
+    }));
+    game.render();
+    assert!(
+        !game
+            .panel()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::Balloon(_)))
+    );
+}
+
 /// Track 2's switch-and-order recording (`goth-switch-cancel-order-20261115`)
 /// opens the live-mode panel, clicks Bella's portrait to select her (taking
 /// effect between updates 423 and 424), clicks her portrait again to centre

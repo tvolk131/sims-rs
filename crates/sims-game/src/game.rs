@@ -742,6 +742,8 @@ impl Game {
         }
         self.pointer = Some(point);
         let mut redraw = self.hud.hover(point);
+        let sounds = self.hud.take_sounds();
+        self.keep_sounds(sounds);
         redraw |= self.highlight(point);
         redraw |= self.follow();
         // The cutaway follows the rooms the pointer passes over, while
@@ -794,9 +796,14 @@ impl Game {
             self.keep_sounds(sounds);
             return outcome;
         }
+        // 0x51f3c5..0x51f3e5, 0x51d312, 0x51d354: pressing outside the live
+        // control panel dismisses any open help balloon with `UI_whoosh`.
+        let dismissed = self.hud.dismiss_help();
+        let sounds = self.hud.take_sounds();
+        self.keep_sounds(sounds);
         let Some(target) = self.under(point) else {
             return Outcome {
-                redraw: cleared,
+                redraw: cleared || dismissed,
                 photo: false,
             };
         };
@@ -827,6 +834,8 @@ impl Game {
         }
         self.pointer = Some(point);
         let mut redraw = self.hud.hover(point);
+        let sounds = self.hud.take_sounds();
+        self.keep_sounds(sounds);
         redraw |= self.highlight(point);
         let will_choose = self.hud.menu.as_ref().is_some_and(|m| m.will_choose(point));
         if !will_choose {
@@ -898,6 +907,8 @@ impl Game {
         self.pointer = None;
         self.highlighted = None;
         let redraw = self.hud.leave();
+        let sounds = self.hud.take_sounds();
+        self.keep_sounds(sounds);
         self.follow() || redraw
     }
 

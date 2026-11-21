@@ -20,17 +20,21 @@ use sims_ui::command::{Camera, Command, Panel, Walls as UiWalls};
 use sims_ui::dialog::{self, Labels, Message};
 use sims_ui::frame::Frame;
 use sims_ui::house;
-use sims_ui::household::{Acquaintances, Careers, Faces, Snapshot};
+use sims_ui::household::{Acquaintances, Careers, Faces, Fame, Snapshot};
 use sims_ui::hud::{self, Controls, Item, Selected};
+use sims_ui::thumbnail::{self, Thumbnails};
 use std::collections::BTreeMap;
 use std::path::Path;
 
 pub struct Hud {
     art: sims_ui::art::Art,
     faces: Faces,
+    thumbnails: Thumbnails,
     /// The careers of `work.iff`, for what the job panel shows the next
-    /// level needs.
+    /// level needs and Child Report Card grades.
     careers: Careers,
+    /// Superstar fame progression data (`GameData/fame.iff`).
+    fame: Fame,
     /// The curves and constants the house panel's ratings are worked out
     /// with.
     house: house::Tuning,
@@ -70,11 +74,14 @@ impl Hud {
         let resources: Vec<i32> = hud::RESOURCES
             .iter()
             .chain(&dialog::RESOURCES)
+            .chain(&thumbnail::RESOURCES)
             .copied()
             .collect();
         let mut art =
             sims_ui::art::Art::load(&ui, US_ENGLISH, &resources).map_err(|e| e.to_string())?;
-        art.load_optional(&ui, US_ENGLISH, sims_ui::balloon::BACKGROUND);
+        for id in hud::OPTIONAL_RESOURCES {
+            art.load_optional(&ui, US_ENGLISH, id);
+        }
         let message = match dialog::pending(world) {
             Some(pending) => {
                 let labels = Labels::load(&install).map_err(|e| e.to_string())?;
@@ -121,10 +128,13 @@ impl Hud {
         // Without the balloons' strings the HUD still opens; the balloons
         // show what text they have.
         let texts = Texts::load(&install).unwrap_or_default();
+        let fame = Fame::load(&install).unwrap_or_default();
         Ok(Self {
             art,
             faces,
+            thumbnails: Thumbnails::default(),
             careers,
+            fame,
             house,
             kinds: None,
             members,
@@ -172,10 +182,16 @@ impl Hud {
         let residential = is_residential(world, &self.zoning);
         let mut snapshot = Snapshot::read(world, self.members(world))
             .with_zoning(world, residential, self.known.friendship)
-            .with_careers(&self.careers);
+            .with_careers(&self.careers)
+            .with_fame(world, &self.known, &self.fame);
         // The viewer plays no sounds, so a balloon this closes closes
         // silently.
         self.controls.follow(Selected::of(&snapshot));
+        if let Some(help) = self.controls.help
+            && !hud::help_matches_snapshot(help, &snapshot, self.controls.panel)
+        {
+            self.controls.help = None;
+        }
         // The lookup goes through every neighborhood record, so only
         // while the panel shows it.
         if self.controls.panel == Some(Panel::Relationships) {
@@ -192,6 +208,12 @@ impl Hud {
         }
         self.items = hud::layout(view.size, &snapshot, &self.controls);
         hud::fit(&mut self.items, &self.art, &self.texts);
+        let balloon_guids: Vec<u32> = hud::balloon_objects(&self.items).collect();
+        for guid in balloon_guids {
+            let _ = self
+                .thumbnails
+                .read_balloon(assets.index(), assets.catalog(), guid);
+        }
         let (width, height) = (
             u32::try_from(canvas.width).unwrap_or(u32::MAX),
             u32::try_from(canvas.height).unwrap_or(u32::MAX),
@@ -204,10 +226,11 @@ impl Hud {
                 return;
             }
         };
-        hud::draw(
+        hud::draw_with_thumbnails(
             &mut frame,
             &self.art,
             &self.faces,
+            Some(&self.thumbnails),
             &self.items,
             &self.controls,
         );
@@ -233,7 +256,10 @@ impl Hud {
         self.dialog.is_some() || hud::covers(&self.items, point)
     }
 
-    /// Moves the pointer; true if what it hovers changed.
+    /// Moves the pointer; true if what it hovers changed or an open help
+    /// balloon was dismissed by moving outside the subpanel (including onto
+    /// the balloon itself, `0x51a0a2..0x51a0b5`, `0x51f1f2..0x51f3e5`,
+    /// `0x51d2ee..0x51d359`).
     pub fn hover(&mut self, point: [i32; 2]) -> bool {
         let button = |pointer: Option<[i32; 2]>| {
             let layout = self.dialog.as_ref()?;
@@ -246,11 +272,28 @@ impl Hud {
             button(self.controls.pointer),
         );
         self.controls.pointer = Some(point);
-        (
+        let hovered_changed = (
             hud::hovered(&self.items, self.controls.pointer),
             hud::lit_relation(&self.items, self.controls.pointer),
             button(self.controls.pointer),
-        ) != before
+        ) != before;
+        let dismissed = self.controls.help.is_some()
+            && !hud::in_subpanel(&self.items, point)
+            && self.dismiss_help();
+        hovered_changed || dismissed
+    }
+
+    /// The pointer left the window: no button is hovered and any open help
+    /// balloon is dismissed (`0x51d2ee..0x51d317`). True if the frame changes.
+    pub fn leave(&mut self) -> bool {
+        let left = self.controls.pointer.take().is_some();
+        let dismissed = self.dismiss_help();
+        left || dismissed
+    }
+
+    /// Dismisses any open help balloon (`0x50fb7f`). Returns true if one was open.
+    pub fn dismiss_help(&mut self) -> bool {
+        self.controls.help.take().is_some()
     }
 
     /// A press at `point`: the view command to carry out, if any, and
@@ -275,24 +318,41 @@ impl Hud {
         let command = match hud::press(&self.items, point) {
             Some(command) => command,
             None => {
-                let Some(panel) = hud::disabled_panel(&self.items, point) else {
-                    return (None, false);
-                };
-                let snapshot = Snapshot::read(world, self.members(world));
-                if Selected::of(&snapshot) == Selected::Human {
-                    Command::OpenPanel(panel)
+                if let Some(panel) = hud::disabled_panel(&self.items, point) {
+                    let snapshot = Snapshot::read(world, self.members(world));
+                    if Selected::of(&snapshot) == Selected::Human {
+                        Command::OpenPanel(panel)
+                    } else {
+                        return (None, false);
+                    }
                 } else {
-                    return (None, false);
+                    let dismissed = !hud::in_subpanel(&self.items, point)
+                        && !hud::on_balloon(&self.items, point)
+                        && self.dismiss_help();
+                    return (None, dismissed);
                 }
             }
         };
-        let snapshot = Snapshot::read(world, self.members(world));
-        let selected = Selected::of(&snapshot);
         let residential = is_residential(world, &self.zoning);
-        let command = hud::check_press(command, selected, residential);
+        let snapshot = Snapshot::read(world, self.members(world))
+            .with_zoning(world, residential, self.known.friendship)
+            .with_careers(&self.careers)
+            .with_fame(world, &self.known, &self.fame);
+        let selected = Selected::of(&snapshot);
+        let command = match command {
+            Command::Help(help) => {
+                if !hud::help_matches_snapshot(help, &snapshot, self.controls.panel) {
+                    return (None, false);
+                }
+                command
+            }
+            other => hud::check_press(other, selected, residential),
+        };
         if command.changes_simulation() {
             eprintln!("not carried out, the simulation takes no commands yet: {command:?}");
-            return (None, false);
+            let before = self.controls.help;
+            self.controls.apply(&command);
+            return (None, self.controls.help != before);
         }
         let view = match command {
             Command::Camera(Camera::ZoomIn) => Some(ViewCommand::ZoomIn),

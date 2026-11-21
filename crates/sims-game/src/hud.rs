@@ -18,7 +18,7 @@ use sims_ui::command::{Command, Panel as UiPanel, Walls as UiWalls};
 use sims_ui::dialog::{self, Labels, Message};
 use sims_ui::frame::{Frame, Rect};
 use sims_ui::house;
-use sims_ui::household::{Acquaintances, Careers, Faces, Snapshot};
+use sims_ui::household::{Acquaintances, Careers, Faces, Fame, Snapshot};
 use sims_ui::hud::{self, Controls, Item, Selected};
 use sims_ui::pie;
 use sims_ui::queue::Queue;
@@ -51,8 +51,10 @@ pub struct Hud {
     /// What could not be read while drawing, until the game takes it.
     problems: Vec<String>,
     /// The careers of `work.iff`, for what the job panel shows the next
-    /// level needs.
+    /// level needs and for Child Report Card grade strings.
     careers: Careers,
+    /// Superstar fame progression data (`GameData/fame.iff`).
+    fame: Fame,
     /// The curves and constants the house panel's ratings are worked out
     /// with.
     house: house::Tuning,
@@ -120,11 +122,14 @@ impl Hud {
             .copied()
             .collect();
         let mut art = Art::load(&ui, US_ENGLISH, &resources).map_err(|e| e.to_string())?;
-        art.load_optional(&ui, US_ENGLISH, sims_ui::balloon::BACKGROUND);
+        for id in hud::OPTIONAL_RESOURCES {
+            art.load_optional(&ui, US_ENGLISH, id);
+        }
         let labels = Labels::load(&install).map_err(|e| e.to_string())?;
         // Without the balloons' strings the HUD still opens; the balloons
         // show what text they have.
         let texts = Texts::load(&install).unwrap_or_default();
+        let fame = Fame::load(&install).unwrap_or_default();
         let neighborhood = house
             .parent()
             .and_then(Path::parent)
@@ -163,6 +168,7 @@ impl Hud {
             thumbnails: Thumbnails::default(),
             problems: Vec::new(),
             careers,
+            fame,
             house,
             kinds: house::Kinds::default(),
             known,
@@ -306,13 +312,14 @@ impl Hud {
             .map_or(&[], |f| f.members.as_slice())
     }
 
-    /// The household with zoning-aware family friends and what the next
-    /// level of each one's career needs.
+    /// The household with zoning-aware family friends, career needs/grades,
+    /// and Superstar fame progression data.
     fn household(&self, world: &World, residential: bool) -> Snapshot {
         Snapshot::read(world, self.members(world))
             .with_idle_speed(self.effective_idle_speed(world))
             .with_zoning(world, residential, self.known.friendship)
             .with_careers(&self.careers)
+            .with_fame(world, &self.known, &self.fame)
     }
 
     /// `snapshot` with what the open panel reads besides.
@@ -378,17 +385,33 @@ impl Hud {
         }
         // The pause button shows global 17, which the game's pause sets.
         let snapshot = self.for_panel(household, world);
+        if let Some(help) = self.controls.help
+            && !hud::help_matches_snapshot(help, &snapshot, self.controls.panel)
+        {
+            self.controls.help = None;
+            self.play(WHOOSH);
+        }
         self.items = hud::layout(view.size, &snapshot, &self.controls);
         hud::fit(&mut self.items, &self.art, &self.texts);
         self.queue = Queue::read(world, snapshot.selected);
         self.pressed.keep(&self.queue);
-        let objects: Vec<u32> = self.queue.objects().collect();
-        for guid in objects {
+        let queue_objects: Vec<u32> = self.queue.objects().collect();
+        for guid in queue_objects {
             // A type whose picture fails is kept as the error left it
             // (`Thumbnails::read`), and not read again.
             if let Err(e) = self.thumbnails.read(assets.index(), assets.catalog(), guid) {
                 self.problems
                     .push(format!("the catalog picture of type 0x{guid:08X}: {e}"));
+            }
+        }
+        let balloon_objects: Vec<u32> = hud::balloon_objects(&self.items).collect();
+        for guid in balloon_objects {
+            if let Err(e) = self
+                .thumbnails
+                .read_balloon(assets.index(), assets.catalog(), guid)
+            {
+                self.problems
+                    .push(format!("the balloon picture of type 0x{guid:08X}: {e}"));
             }
         }
         let (width, height) = (
@@ -402,10 +425,11 @@ impl Hud {
                 return;
             }
         };
-        hud::draw(
+        hud::draw_with_thumbnails(
             &mut frame,
             &self.art,
             &self.faces,
+            Some(&self.thumbnails),
             &self.items,
             &self.controls,
         );
@@ -534,7 +558,10 @@ impl Hud {
         self.pressed.release(uid);
     }
 
-    /// Moves the pointer; true if what it hovers changed.
+    /// Moves the pointer; true if what it hovers changed or an open help
+    /// balloon was dismissed by moving outside the subpanel (including onto
+    /// the balloon itself, which attaches outside `LivePanel` at
+    /// `0x51a0a2..0x51a0b5`, `0x51f1f2..0x51f3e5`, `0x51d2ee..0x51d359`).
     pub fn hover(&mut self, point: [i32; 2]) -> bool {
         let button = |pointer: Option<[i32; 2]>| {
             let layout = self.dialog.as_ref()?;
@@ -552,18 +579,25 @@ impl Hud {
             entry(self.controls.pointer),
         );
         self.controls.pointer = Some(point);
-        (
+        let hovered_changed = (
             hud::hovered(&self.items, self.controls.pointer),
             hud::lit_relation(&self.items, self.controls.pointer),
             button(self.controls.pointer),
             entry(self.controls.pointer),
-        ) != before
+        ) != before;
+        let dismissed = self.controls.help.is_some()
+            && !hud::in_subpanel(&self.items, point)
+            && self.dismiss_help();
+        hovered_changed || dismissed
     }
 
-    /// The pointer left the window: no button is hovered and no name
-    /// shows. True if the pointer was in it, so the frame changes.
+    /// The pointer left the window: no button is hovered, no name shows, and
+    /// any open help balloon is dismissed (`0x51d2ee..0x51d317`). True if the
+    /// frame changes.
     pub fn leave(&mut self) -> bool {
-        self.controls.pointer.take().is_some()
+        let left = self.controls.pointer.take().is_some();
+        let dismissed = self.dismiss_help();
+        left || dismissed
     }
 
     /// Where the pointer is to be moved, as the original moves it when a
@@ -578,6 +612,17 @@ impl Hud {
     pub fn resize_menu(&mut self, size: [i32; 2]) {
         if let Some(menu) = &mut self.menu {
             menu.layout(&self.art, size);
+        }
+    }
+
+    /// Dismisses any open help balloon (`0x50fb7f`) and plays `UI_whoosh`.
+    /// Returns true if a balloon was open.
+    pub fn dismiss_help(&mut self) -> bool {
+        if self.controls.help.take().is_some() {
+            self.play(WHOOSH);
+            true
+        } else {
+            false
         }
     }
 
@@ -600,9 +645,11 @@ impl Hud {
         // The status band is drawn over everything else on the lot,
         // the icons too, and takes the press.
         if self.band.is_some_and(|b| b.contains(point[0], point[1])) {
+            self.dismiss_help();
             return None;
         }
         if let Some(command) = self.press_queue(point) {
+            self.dismiss_help();
             return command;
         }
         let command = match hud::press(&self.items, point) {
@@ -611,11 +658,18 @@ impl Hud {
                 // If Interests/Gifts was laid out disabled (e.g. while a pet
                 // was selected) and selection switched to a human before
                 // redraw, the press still opens the panel (0x51c5a6).
-                let panel = hud::disabled_panel(&self.items, point)?;
-                let snapshot = Snapshot::read(world, self.members(world));
-                if Selected::of(&snapshot) == Selected::Human {
-                    Command::OpenPanel(panel)
+                if let Some(panel) = hud::disabled_panel(&self.items, point) {
+                    let snapshot = Snapshot::read(world, self.members(world));
+                    if Selected::of(&snapshot) == Selected::Human {
+                        Command::OpenPanel(panel)
+                    } else {
+                        return None;
+                    }
                 } else {
+                    if !hud::in_subpanel(&self.items, point) && !hud::on_balloon(&self.items, point)
+                    {
+                        self.dismiss_help();
+                    }
                     return None;
                 }
             }
@@ -626,13 +680,12 @@ impl Hud {
                 let selected = Selected::of(&snapshot);
                 hud::check_press(command, selected, residential)
             }
-            // 0x51cd17 -> 0x51ce05, 0x51d1cc..0x51d1ee: selection refresh hides
-            // the zodiac sign control when a pet (or non-human / nobody) is
-            // selected, so a stale Sign hit rect before redraw must not open
-            // the balloon or play `UI_whoosh`.
-            Command::Help(sims_ui::balloon::Help::Sign(_)) => {
-                let snapshot = Snapshot::read(world, self.members(world));
-                if Selected::of(&snapshot) != Selected::Human {
+            // Guard stale subpanel hit rects before redraw so a hidden control
+            // (e.g. zodiac on a pet, Report Card on an adult, or Fame on a
+            // regular career) does not open a balloon or play `UI_whoosh`.
+            Command::Help(help) => {
+                let snapshot = self.household(world, residential);
+                if !hud::help_matches_snapshot(help, &snapshot, self.controls.panel) {
                     return None;
                 }
                 command

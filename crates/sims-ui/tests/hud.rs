@@ -442,3 +442,243 @@ fn the_goths_house_panel() {
         "2cd4d2e1ac37fb40b11fbc8971d8ed8bf7f9154c68f02ac5402ab3e454b3ed5a"
     );
 }
+
+#[test]
+fn report_card_superstar_and_needs_pet_balloons_from_install() {
+    use sims_ui::balloon::Picture;
+    use sims_ui::thumbnail::Thumbnails;
+
+    let Some(root) = common::install_root() else {
+        eprintln!("skipping: set SIMS_INSTALL to test live subpanels and balloons");
+        return;
+    };
+    let opened = common::open(&root, common::GOTH_HOUSE);
+    let texts = Texts::load(&opened.install).expect("balloon texts");
+
+    // Complete Collection loads all optional panel & balloon artwork + font 18.
+    assert!(opened.art.font(18).is_some());
+    assert!(opened.art.image(hud::id::SOCIAL_POPUP).is_some());
+    assert!(opened.art.image(hud::id::JOB_POPUP).is_some());
+    assert!(opened.art.image(hud::id::FAME_BAR_FULL).is_some());
+    assert!(opened.art.image(hud::id::FAME_BAR_EMPTY).is_some());
+    assert!(opened.art.image(hud::id::FAME_FRIENDS).is_some());
+    assert!(opened.art.image(hud::id::FAME_RUNWAY).is_some());
+    assert!(opened.art.image(hud::id::FAME_MOVIE_SET).is_some());
+    assert!(opened.art.image(hud::id::FAME_MUSIC_VIDEO).is_some());
+
+    // 1. Cassandra (`residents[2]`, object 16, school_age = true, grade 4 = "B")
+    //    routes Job tab to Child Report Card and opens the Report Card balloon.
+    assert_eq!(opened.snapshot.residents[2].school_grade, "B");
+    let mut cass_snap = opened.snapshot.clone();
+    cass_snap.selected = Some(cass_snap.residents[2].object);
+    cass_snap.selected_guid = Some(cass_snap.residents[2].guid);
+    let mut controls = Controls {
+        expanded: true,
+        panel: Some(Panel::Job),
+        ..Controls::default()
+    };
+    let mut items = hud::layout([800, 600], &cass_snap, &controls);
+    hud::fit(&mut items, &opened.art, &texts);
+    assert!(items.iter().any(|i| matches!(
+        &i.kind,
+        hud::Kind::ReportCard { grade } if grade == "B"
+    )));
+    let grade_btn = items
+        .iter()
+        .find(|i| matches!(i.kind, hud::Kind::ReportCardButton { .. }))
+        .expect("Report Card grade button")
+        .rect;
+    assert_eq!(
+        hud::press(&items, [grade_btn.x + 20, grade_btn.y + 5]),
+        Some(Command::Help(Help::ReportCard))
+    );
+    controls.apply(&Command::Help(Help::ReportCard));
+    let mut items = hud::layout([800, 600], &cass_snap, &controls);
+    hud::fit(&mut items, &opened.art, &texts);
+    let rc_balloon = items
+        .iter()
+        .find_map(|i| match &i.kind {
+            hud::Kind::Balloon(b) => Some(b),
+            _ => None,
+        })
+        .expect("Report Card balloon");
+    assert_eq!(rc_balloon.title, "Grades");
+    assert!(rc_balloon.lines.iter().any(|l| l.contains("school")));
+    let mut frame_no_balloon = Frame::new(800, 600, [0, 0, 0]);
+    let mut plain_controls = controls;
+    plain_controls.help = None;
+    let plain_items = hud::layout([800, 600], &cass_snap, &plain_controls);
+    hud::draw(
+        &mut frame_no_balloon,
+        &opened.art,
+        &opened.faces,
+        &plain_items,
+        &plain_controls,
+    );
+    let mut frame_rc = Frame::new(800, 600, [0, 0, 0]);
+    hud::draw(&mut frame_rc, &opened.art, &opened.faces, &items, &controls);
+    assert_ne!(frame_rc.rgb(), frame_no_balloon.rgb());
+
+    // 2. Human Needs (`STR# 130`), Pet Needs (`STR# 180`), and Dog/Cat Pet
+    //    Skills (`STR# 172`) balloons load real strings and pictures.
+    let hunger = texts
+        .get(Help::Need {
+            pet: false,
+            index: 0,
+        })
+        .unwrap();
+    let pet_hunger = texts
+        .get(Help::Need {
+            pet: true,
+            index: 0,
+        })
+        .unwrap();
+    assert_eq!(hunger.title, "Hunger");
+    assert_eq!(pet_hunger.title, "Hunger");
+    assert_ne!(hunger.body, pet_hunger.body);
+    assert!(pet_hunger.body.contains("pet"));
+    let dog0 = texts
+        .get(Help::PetSkill {
+            cat: false,
+            index: 0,
+        })
+        .unwrap();
+    let cat0 = texts
+        .get(Help::PetSkill {
+            cat: true,
+            index: 0,
+        })
+        .unwrap();
+    assert_eq!(dog0.title, "House Breaking Skill");
+    assert_eq!(cat0.title, "Hunting Skill");
+
+    // Draw Hunger balloon with preloaded native isometric object sprites (`0x4e5306 -> 0x4384c8`),
+    // including Hunger's right-slot zoom 2 override (`0xff9f_18e0`, `0x6f3994`), and verify
+    // representative multi-tile and Superstar object GUIDs render non-empty sprites.
+    let mut thumbs = Thumbnails::default();
+    for guid in [
+        0xb947_55df, // Hunger left (fridge)
+        0xff9f_18e0, // Hunger right (zoom 2 override)
+        0x82e0_4c5b, // Comfort (chair/sofa)
+        0x8eec_19f7, // Pet Hunger left
+        0xffc0_ea58, // Pet Hunger right (zoom 2 override)
+        0x4450_e4e0, // Superstar Fame level object
+        0x4b61_d53e, // Superstar level 10 object
+    ] {
+        thumbs
+            .read_balloon(&opened.index, &opened.catalog, guid)
+            .expect("isometric balloon picture loads");
+        let pic = thumbs
+            .balloon_picture(guid, None, 168, 127)
+            .unwrap_or_else(|| panic!("isometric sprite for 0x{guid:08X}"));
+        assert!(pic.rgba.as_chunks::<4>().0.iter().any(|p| p[3] > 0));
+    }
+    let left_pic = thumbs
+        .balloon_picture(0xb947_55df, None, 168, 127)
+        .expect("fridge isometric sprite");
+    let right_pic = thumbs
+        .balloon_picture(0xff9f_18e0, Some(2), 168, 127)
+        .expect("food right-slot zoom-2 isometric sprite");
+    assert_ne!([left_pic.width, left_pic.height], [45, 45]);
+    assert!(left_pic.rgba.as_chunks::<4>().0.iter().any(|p| p[3] > 0));
+    assert!(right_pic.rgba.as_chunks::<4>().0.iter().any(|p| p[3] > 0));
+
+    let need_controls = Controls {
+        expanded: true,
+        panel: Some(Panel::Needs),
+        help: Some(Help::Need {
+            pet: false,
+            index: 0,
+        }),
+        ..Controls::default()
+    };
+    let mut need_items = hud::layout([800, 600], &opened.snapshot, &need_controls);
+    hud::fit(&mut need_items, &opened.art, &texts);
+    let mut frame_need_empty = Frame::new(800, 600, [0, 0, 0]);
+    hud::draw_with_thumbnails(
+        &mut frame_need_empty,
+        &opened.art,
+        &opened.faces,
+        None,
+        &need_items,
+        &need_controls,
+    );
+    let mut frame_need = Frame::new(800, 600, [0, 0, 0]);
+    hud::draw_with_thumbnails(
+        &mut frame_need,
+        &opened.art,
+        &opened.faces,
+        Some(&thumbs),
+        &need_items,
+        &need_controls,
+    );
+    assert_ne!(frame_need.rgb(), frame_need_empty.rgb());
+    assert!(need_items.iter().any(|i| matches!(
+        &i.kind,
+        hud::Kind::Balloon(b) if b.title == "Hunger" && b.text_left == 168
+    )));
+
+    // 3. Superstar / Fame panel loaded from `GameData/fame.iff`.
+    assert_eq!(opened.fame.title, "Fame");
+    assert_eq!(opened.fame.level_title(0), "Nobody");
+    assert_eq!(opened.fame.level_title(10), "Superstar");
+    assert_eq!(
+        texts.get(Help::FameLevel(7)).unwrap().pictures,
+        [Some(Picture::Image(hud::id::FAME_RUNWAY)), None]
+    );
+    assert_eq!(
+        texts.get(Help::FameLevel(8)).unwrap().pictures,
+        [Some(Picture::Image(hud::id::FAME_MUSIC_VIDEO)), None]
+    );
+    assert_eq!(
+        texts.get(Help::FameLevel(9)).unwrap().pictures,
+        [Some(Picture::Image(hud::id::FAME_MOVIE_SET)), None]
+    );
+    assert_eq!(
+        texts.get(Help::FameFriends).unwrap().title,
+        "Friends Total Starpower"
+    );
+
+    let mut star_snap = opened.snapshot.clone();
+    // Bella (`residents[1]`) has no career: give her fame score > 0 and level 4 (2.0 stars).
+    star_snap.selected = Some(star_snap.residents[1].object);
+    star_snap.selected_guid = Some(star_snap.residents[1].guid);
+    star_snap.residents[1].fame_score = 50;
+    star_snap.residents[1].fame_level = 4;
+    star_snap.residents[1].fame_title = opened.fame.level_title(4).to_owned();
+    star_snap.residents[1].fame_needs = opened.fame.skill_needs(4, &star_snap.residents[1].skills);
+    star_snap.residents[1].fame_friends_text = opened.fame.format_friend_star_power(4, 3);
+    assert_eq!(star_snap.residents[1].fame_title, "Studio Fly");
+    assert_eq!(star_snap.residents[1].fame_needs, [0, 0, 4, 3, 0, 4]);
+    assert_eq!(star_snap.residents[1].fame_friends_text, "1.5 (Need 2)");
+
+    let fame_controls = Controls {
+        expanded: true,
+        panel: Some(Panel::Job),
+        help: Some(Help::FameLevel(4)),
+        ..Controls::default()
+    };
+    let mut fame_items = hud::layout([800, 600], &star_snap, &fame_controls);
+    hud::fit(&mut fame_items, &opened.art, &texts);
+    assert!(fame_items.iter().any(|i| matches!(
+        &i.kind,
+        hud::Kind::Fame {
+            fame_level: 4,
+            fame_title,
+            ..
+        } if fame_title == "Studio Fly"
+    )));
+    let mut fame_frame = Frame::new(800, 600, [0, 0, 0]);
+    hud::draw_with_thumbnails(
+        &mut fame_frame,
+        &opened.art,
+        &opened.faces,
+        Some(&thumbs),
+        &fame_items,
+        &fame_controls,
+    );
+    assert!(fame_items.iter().any(|i| matches!(
+        &i.kind,
+        hud::Kind::Balloon(b) if b.title.starts_with("Studio Fly")
+    )));
+}
