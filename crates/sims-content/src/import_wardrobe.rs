@@ -79,6 +79,11 @@ impl ImportWardrobe {
         &self.suits
     }
 
+    /// The cached texture names (`0x6e48b0`), in Windows-1252 bytes.
+    pub fn textures(&self) -> &[Vec<u8>] {
+        &self.textures
+    }
+
     /// Returns a copy of this wardrobe with its suit list replaced by the
     /// shared live `0x409255` (`0x6e48a0`) scan snapshot.
     pub fn with_suits(&self, suits: Vec<Vec<u8>>) -> Self {

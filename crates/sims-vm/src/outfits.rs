@@ -35,6 +35,7 @@ fn cp1252_byte(ch: char) -> Option<u8> {
     }
     match ch {
         '\u{20ac}' => Some(0x80),
+        '\u{0081}' => Some(0x81),
         '\u{201a}' => Some(0x82),
         '\u{0192}' => Some(0x83),
         '\u{201e}' => Some(0x84),
@@ -46,7 +47,10 @@ fn cp1252_byte(ch: char) -> Option<u8> {
         '\u{0160}' => Some(0x8a),
         '\u{2039}' => Some(0x8b),
         '\u{0152}' => Some(0x8c),
+        '\u{008d}' => Some(0x8d),
         '\u{017d}' => Some(0x8e),
+        '\u{008f}' => Some(0x8f),
+        '\u{0090}' => Some(0x90),
         '\u{2018}' => Some(0x91),
         '\u{2019}' => Some(0x92),
         '\u{201c}' => Some(0x93),
@@ -59,6 +63,7 @@ fn cp1252_byte(ch: char) -> Option<u8> {
         '\u{0161}' => Some(0x9a),
         '\u{203a}' => Some(0x9b),
         '\u{0153}' => Some(0x9c),
+        '\u{009d}' => Some(0x9d),
         '\u{017e}' => Some(0x9e),
         '\u{0178}' => Some(0x9f),
         _ => None,
@@ -293,19 +298,44 @@ impl<'a> BestMatch<'a> {
 /// Returns the cached `0x409255` (`0x6e48a0`) walk of `AvatarRegistry`'s
 /// appearance hash table, building and caching it on first non-empty use
 /// (`0x40922f` retries whenever the cached vector is empty) from
-/// `people.suit_table` plus any runtime-added `.bcf` sibling appearances
-/// (`World::runtime_added_suits`).
-pub(crate) fn suit_scan_order(people: &People, world: &mut World) -> Vec<String> {
+/// `program.people.suit_table` (or `program.ordered_wardrobe` / `People` sets
+/// in synthetic fixtures) plus any runtime-added `.bcf` sibling appearances
+/// (`World::runtime_added_suits`). Shared identically by generated dressing
+/// (`0x40e622`) and `Make New Character` (`0x40976a`, `0x40a436`).
+pub(crate) fn suit_scan_order(program: &Program, world: &mut World) -> Vec<String> {
     if let Some(cached) = &world.suit_scan_cache
         && !cached.is_empty()
     {
         return cached.clone();
     }
+    let people = &program.people;
+    if people.suit_table.is_empty()
+        && world.runtime_added_suits.is_empty()
+        && let Some(Ok(ordered)) = &program.ordered_wardrobe
+    {
+        let scan: Vec<String> = ordered
+            .suits()
+            .iter()
+            .map(|b| sims_formats::strings::decode(b, 1))
+            .collect();
+        if !scan.is_empty() {
+            world.suit_scan_cache = Some(scan.clone());
+        }
+        return scan;
+    }
     let mut table: SuitTable = if !people.suit_table.is_empty() {
         people.suit_table.clone()
+    } else if let Some(Ok(ordered)) = &program.ordered_wardrobe {
+        let mut t = SuitTable::default();
+        for name in ordered.suits() {
+            if !t.contains(name) {
+                t.insert_name(name.clone());
+            }
+        }
+        t
     } else {
         // Fallback for synthetic tests that populate `People` sets directly
-        // without running `AvatarRegistry::load`.
+        // without running `AvatarRegistry::load` or supplying `ordered_wardrobe`.
         let mut t = SuitTable::default();
         for name in people
             .eager_suits
@@ -332,6 +362,33 @@ pub(crate) fn suit_scan_order(people: &People, world: &mut World) -> Vec<String>
         world.suit_scan_cache = Some(scan.clone());
     }
     scan
+}
+
+/// Returns the texture stem list (`0x40895a` / `0x6e48b0`), falling back to
+/// `ordered_wardrobe.textures()` in synthetic fixtures where `people.textures`
+/// is empty.
+fn texture_list(program: &Program) -> Vec<String> {
+    if !program.people.textures.is_empty() {
+        return program.people.textures.clone();
+    }
+    if let Some(Ok(ordered)) = &program.ordered_wardrobe {
+        return ordered
+            .textures()
+            .iter()
+            .map(|b| sims_formats::strings::decode(b, 1))
+            .collect();
+    }
+    Vec::new()
+}
+
+/// Extracts the 3-byte body type at Windows-1252 byte offset `6..9`
+/// (`0x40b84a`, `0x40e59f`, `0x40afeb`), lowercased in ASCII.
+fn cp1252_body_type(suit: &str) -> String {
+    let bytes = encode_cp1252(suit);
+    bytes
+        .get(6..9)
+        .map(|slice| sims_formats::strings::decode(slice, 1).to_ascii_lowercase())
+        .unwrap_or_default()
 }
 
 /// Expands a `$g`/`$b`/`$c` template (`0x40e477`) into a [`Pattern`].
@@ -377,19 +434,18 @@ fn expand_template_pattern(
 
 /// Matches a template against the cached `0x409255` appearance table
 /// (`0x40e5ce` / `0x40e9b2`), returning the first entry with a non-zero match.
+/// Calls `suit_scan_order` (`0x40e60e` → `0x40922f`) even when `template` is
+/// empty so the shared `0x6e48a0` scan freezes identically to native code.
 fn match_registered_suit(
-    people: &People,
+    program: &Program,
     world: &mut World,
     template: &str,
     gender_code: i32,
     body_type: &str,
     skin_3: &str,
 ) -> String {
-    if template.is_empty() {
-        return String::new();
-    }
     let pattern = expand_template_pattern(template, gender_code, body_type, skin_3);
-    let scan = suit_scan_order(people, world);
+    let scan = suit_scan_order(program, world);
     for name in &scan {
         let bytes = encode_cp1252(name);
         if pattern.match_len(&bytes) > 0 {
@@ -400,31 +456,36 @@ fn match_registered_suit(
 }
 
 /// Matches a texture template against `People::textures` (`0x40e674` for body,
-/// `0x40e891` for head), appending the optional `0x40b75a` suffix
-/// (`base_tex[17..]`) even when `template` is empty (`0x40e6dc`–`0x40e6f1`,
-/// `0x40e8f9`–`0x40e90e`), scoring via `0x472a25`, and capping the formatted
-/// descriptor to the 63-byte `StackString<64>` destination (`0x40e760`,
-/// `0x40e960`).
+/// `0x40e891` for head), capping `base_tex` to the 63-byte `0x472ed2`/`0x472ee2`
+/// field before slicing the optional `0x40b75a` suffix (`base_tex[17..]`) even
+/// when `template` is empty (`0x40e6dc`–`0x40e6f1`, `0x40e8f9`–`0x40e90e`),
+/// scoring via `0x472a25`, and capping the formatted descriptor to `max_len`
+/// Windows-1252 bytes (`63` for body at `0x40e760`, `255` for head at `0x58c7c9`).
+#[allow(clippy::too_many_arguments)]
 fn match_registered_texture(
-    people: &People,
+    program: &Program,
     template: &str,
     gender_code: i32,
     body_type: &str,
     skin_3: &str,
     base_tex: &str,
     prefix: &str,
+    max_len: usize,
 ) -> String {
     let mut pattern = expand_template_pattern(template, gender_code, body_type, skin_3);
-    // 0x40b75a: `strlen("BODY=") + 12 = 17` (used by BOTH 0x40e674 and 0x40e891).
+    // 0x472ed2 / 0x472ee2 parse `base_tex` into a 63-byte field before
+    // `0x40b75a` takes `strlen("BODY=") + 12 = 17` bytes off the front.
     let base_bytes = encode_cp1252(base_tex);
-    let suffix = if base_bytes.len() > 17 {
-        sims_formats::strings::decode(&base_bytes[17..], 1)
+    let base_63 = &base_bytes[..base_bytes.len().min(63)];
+    let suffix = if base_63.len() > 17 {
+        sims_formats::strings::decode(&base_63[17..], 1)
     } else {
         String::new()
     };
     pattern.push_choice(&suffix, "");
+    let textures = texture_list(program);
     let mut best = BestMatch::default();
-    for tex in &people.textures {
+    for tex in &textures {
         let bytes = encode_cp1252(tex);
         let matched = pattern.match_len(&bytes);
         best.consider(tex, bytes.len(), matched);
@@ -433,7 +494,7 @@ fn match_registered_texture(
         String::new()
     } else {
         let out = format!("{prefix}{}", best.name);
-        truncate_cp1252(&out, 63).to_owned()
+        truncate_cp1252(&out, max_len).to_owned()
     }
 }
 
@@ -479,6 +540,154 @@ fn format_generated_body_row(suit: &str, tex: &str) -> String {
     truncate_cp1252(&out, 63).to_owned()
 }
 
+/// Fuzzy-matches `(suit_pat, tex_pat)` against `scan` and `textures` via
+/// `0x472a25` and formats `"{suit},BODY={tex}"` capped at 63 Windows-1252 bytes.
+fn match_body_pair(
+    suit_pat: &Pattern,
+    tex_pat: &Pattern,
+    scan: &[String],
+    textures: &[String],
+) -> String {
+    let mut best_suit = BestMatch::default();
+    for name in scan {
+        let bytes = encode_cp1252(name);
+        best_suit.consider(name, bytes.len(), suit_pat.match_len(&bytes));
+    }
+    let mut best_tex = BestMatch::default();
+    for tex in textures {
+        let bytes = encode_cp1252(tex);
+        best_tex.consider(tex, bytes.len(), tex_pat.match_len(&bytes));
+    }
+    format_generated_body_row(best_suit.name, best_tex.name)
+}
+
+fn read_character_row(
+    world: &World,
+    guid: u32,
+    profile: Option<&sims_content::Profile>,
+    idx: usize,
+) -> Option<String> {
+    if let Some(s) = world
+        .characters
+        .made
+        .get(&guid)
+        .and_then(|m| m.strings.get(&idx))
+    {
+        return Some(s.clone());
+    }
+    if let Some(s) = world.made_outfits.get(&guid).and_then(|m| m.get(&idx)) {
+        return Some(s.clone());
+    }
+    match idx {
+        1 => profile.and_then(|p| p.body.clone()),
+        2 => profile.and_then(|p| p.head.clone()),
+        12 => profile.and_then(|p| p.gender.clone()),
+        13 => profile.and_then(|p| p.age.clone()),
+        14 => profile.and_then(|p| p.skin.clone()),
+        n => profile.and_then(|p| p.suit_rows.get(&n).cloned()),
+    }
+}
+
+/// Runs `0x40b7ed` (adult formal 30, swim 31, pajama 32).
+fn build_adult_fsl(
+    gender_ch: &str,
+    adult_body_type: &str,
+    skin_norm: &str,
+    scan: &[String],
+    textures: &[String],
+) -> (String, String, String) {
+    let make_pats = |kind: &str| {
+        let mut sp = Pattern::default();
+        sp.push_literal(kind);
+        sp.push_literal("100");
+        sp.push_literal(gender_ch);
+        sp.push_literal("a");
+        sp.push_literal(adult_body_type);
+        let mut tp = sp.clone();
+        tp.push_literal(skin_norm);
+        (sp, tp)
+    };
+    let (f_s, f_t) = make_pats("f");
+    let (s_s, s_t) = make_pats("s");
+    let (l_s, l_t) = make_pats("l");
+    (
+        match_body_pair(&f_s, &f_t, scan, textures),
+        match_body_pair(&s_s, &s_t, scan, textures),
+        match_body_pair(&l_s, &l_t, scan, textures),
+    )
+}
+
+/// Runs `0x40c376` (child swim 31, pajama 32; row 30 becomes `"ADDED"`).
+fn build_child_sl(
+    gender_ch: &str,
+    raw_body_type: &str,
+    skin_norm: &str,
+    scan: &[String],
+    textures: &[String],
+) -> (String, String) {
+    let make_pats = |kind: &str| {
+        let mut sp = Pattern::default();
+        sp.push_literal(kind);
+        sp.push_literal("100");
+        sp.push_literal(gender_ch);
+        sp.push_literal("c");
+        sp.push_literal(raw_body_type);
+        let mut tp = sp.clone();
+        tp.push_literal(skin_norm);
+        (sp, tp)
+    };
+    let (s_s, s_t) = make_pats("s");
+    let (l_s, l_t) = make_pats("l");
+    (
+        match_body_pair(&s_s, &s_t, scan, textures),
+        match_body_pair(&l_s, &l_t, scan, textures),
+    )
+}
+
+/// Runs `0x40bfeb` (adult high-fashion row 34).
+fn build_adult_hf(
+    gender_ch: &str,
+    adult_body_type: &str,
+    skin_norm: &str,
+    scan: &[String],
+    textures: &[String],
+) -> String {
+    let mut sp = Pattern::default();
+    sp.push_literal("h");
+    sp.push_literal("5");
+    sp.push_skip(2);
+    sp.push_literal(gender_ch);
+    sp.push_literal("a");
+    sp.push_literal(adult_body_type);
+    let mut tp = sp.clone();
+    tp.push_literal(skin_norm);
+    match_body_pair(&sp, &tp, scan, textures)
+}
+
+/// Runs `0x40c855` (winter row 33 for adult or child).
+fn build_winter(
+    gender_ch: &str,
+    is_child: bool,
+    adult_body_type: &str,
+    skin_norm: &str,
+    scan: &[String],
+    textures: &[String],
+) -> String {
+    let mut sp = Pattern::default();
+    sp.push_literal("w");
+    sp.push_literal("100");
+    sp.push_literal(gender_ch);
+    if is_child {
+        sp.push_literal("cchd");
+    } else {
+        sp.push_literal("a");
+        sp.push_literal(adult_body_type);
+    }
+    let mut tp = sp.clone();
+    tp.push_literal(skin_norm);
+    match_body_pair(&sp, &tp, scan, textures)
+}
+
 /// Runs `0x409315` (deterministic clothing-row initialization: `0x40b7ed`,
 /// `0x40bfeb`, `0x40c376`, `0x40c855`) before generated-outfit matching and
 /// before `Make New Character` edits (`0x44afc0`, `0x44b26e`, `0x44b27b`),
@@ -486,51 +695,34 @@ fn format_generated_body_row(suit: &str, tex: &str) -> String {
 /// high-fashion (34) rows into `World::made_outfits` for human profiles with a
 /// non-empty body row 1.
 pub(crate) fn init_clothing_rows(
-    people: &People,
+    program: &Program,
     world: &mut World,
     guid: u32,
     profile: Option<&sims_content::Profile>,
 ) {
-    let read_row = |world: &World, idx: usize| -> Option<String> {
-        if let Some(s) = world
-            .characters
-            .made
-            .get(&guid)
-            .and_then(|m| m.strings.get(&idx))
-        {
-            return Some(s.clone());
-        }
-        if let Some(s) = world.made_outfits.get(&guid).and_then(|m| m.get(&idx)) {
-            return Some(s.clone());
-        }
-        match idx {
-            1 => profile.and_then(|p| p.body.clone()),
-            2 => profile.and_then(|p| p.head.clone()),
-            12 => profile.and_then(|p| p.gender.clone()),
-            13 => profile.and_then(|p| p.age.clone()),
-            14 => profile.and_then(|p| p.skin.clone()),
-            n => profile.and_then(|p| p.suit_rows.get(&n).cloned()),
-        }
+    let row_empty = |world: &World, idx: usize| -> bool {
+        read_character_row(world, guid, profile, idx).is_none_or(|s| s.is_empty())
     };
-    let row_empty =
-        |world: &World, idx: usize| -> bool { read_row(world, idx).is_none_or(|s| s.is_empty()) };
-    let Some(body_row) = read_row(world, 1).filter(|s| !s.is_empty()) else {
+    let Some(body_row) = read_character_row(world, guid, profile, 1).filter(|s| !s.is_empty())
+    else {
         return;
     };
-    let gender_code = profile_gender_code(read_row(world, 12).as_deref());
+    let gender_code = profile_gender_code(read_character_row(world, guid, profile, 12).as_deref());
     if !(0..=1).contains(&gender_code) {
         return;
     }
     let gender_ch = if gender_code == 1 { "f" } else { "m" };
-    let is_child = atoi_age(read_row(world, 13).as_deref().unwrap_or("")) <= 17;
+    // 0x40937b -> 0x40cbdd copies at most 15 Windows-1252 bytes before `atoi`.
+    let age_str = read_character_row(world, guid, profile, 13).unwrap_or_default();
+    let is_child = atoi_age(truncate_cp1252(&age_str, 15)) <= 17;
     let (body_suit, _) = parse_row_descriptor(&body_row, false);
-    let raw_body_type = body_suit.get(6..9).unwrap_or("");
-    let adult_body_type = if matches!(raw_body_type, "skn" | "fit" | "fat") {
-        raw_body_type
+    let raw_body_type = cp1252_body_type(&body_suit);
+    let adult_body_type = if matches!(raw_body_type.as_str(), "skn" | "fit" | "fat") {
+        raw_body_type.as_str()
     } else {
         "fit"
     };
-    let skin_raw = read_row(world, 14).unwrap_or_else(|| "???".to_owned());
+    let skin_raw = read_character_row(world, guid, profile, 14).unwrap_or_else(|| "???".to_owned());
     let skin_3: String = skin_raw.chars().take(3).collect();
     let skin_norm = if skin_3.eq_ignore_ascii_case("lgt")
         || skin_3.eq_ignore_ascii_case("med")
@@ -540,43 +732,14 @@ pub(crate) fn init_clothing_rows(
     } else {
         "lgt"
     };
-
-    let match_pair =
-        |suit_pat: &Pattern, tex_pat: &Pattern, scan: &[String], textures: &[String]| -> String {
-            let mut best_suit = BestMatch::default();
-            for name in scan {
-                let bytes = encode_cp1252(name);
-                best_suit.consider(name, bytes.len(), suit_pat.match_len(&bytes));
-            }
-            let mut best_tex = BestMatch::default();
-            for tex in textures {
-                let bytes = encode_cp1252(tex);
-                best_tex.consider(tex, bytes.len(), tex_pat.match_len(&bytes));
-            }
-            format_generated_body_row(best_suit.name, best_tex.name)
-        };
+    let textures = texture_list(program);
 
     if !is_child {
         // 0x40938b -> 0x40b7ed: adult formal (30), swim (31), pajama (32).
         if row_empty(world, 30) {
-            let scan = suit_scan_order(people, world);
-            let make_pats = |kind: &str| {
-                let mut sp = Pattern::default();
-                sp.push_literal(kind);
-                sp.push_literal("100");
-                sp.push_literal(gender_ch);
-                sp.push_literal("a");
-                sp.push_literal(adult_body_type);
-                let mut tp = sp.clone();
-                tp.push_literal(skin_norm);
-                (sp, tp)
-            };
-            let (f_s, f_t) = make_pats("f");
-            let (s_s, s_t) = make_pats("s");
-            let (l_s, l_t) = make_pats("l");
-            let formal = match_pair(&f_s, &f_t, &scan, &people.textures);
-            let swim = match_pair(&s_s, &s_t, &scan, &people.textures);
-            let pajama = match_pair(&l_s, &l_t, &scan, &people.textures);
+            let scan = suit_scan_order(program, world);
+            let (formal, swim, pajama) =
+                build_adult_fsl(gender_ch, adult_body_type, skin_norm, &scan, &textures);
             let entry = world.made_outfits.entry(guid).or_default();
             entry.insert(30, formal);
             entry.insert(31, swim);
@@ -584,38 +747,16 @@ pub(crate) fn init_clothing_rows(
         }
         // 0x4093be -> 0x40bfeb: adult high fashion (34).
         if row_empty(world, 34) {
-            let scan = suit_scan_order(people, world);
-            let mut sp = Pattern::default();
-            sp.push_literal("h");
-            sp.push_literal("5");
-            sp.push_skip(2);
-            sp.push_literal(gender_ch);
-            sp.push_literal("a");
-            sp.push_literal(adult_body_type);
-            let mut tp = sp.clone();
-            tp.push_literal(skin_norm);
-            let hf = match_pair(&sp, &tp, &scan, &people.textures);
+            let scan = suit_scan_order(program, world);
+            let hf = build_adult_hf(gender_ch, adult_body_type, skin_norm, &scan, &textures);
             world.made_outfits.entry(guid).or_default().insert(34, hf);
         }
     } else {
         // 0x4093d8 -> 0x40c376: child "ADDED" on row 30, swim (31), pajama (32).
         if row_empty(world, 30) {
-            let scan = suit_scan_order(people, world);
-            let make_pats = |kind: &str| {
-                let mut sp = Pattern::default();
-                sp.push_literal(kind);
-                sp.push_literal("100");
-                sp.push_literal(gender_ch);
-                sp.push_literal("c");
-                sp.push_literal(raw_body_type);
-                let mut tp = sp.clone();
-                tp.push_literal(skin_norm);
-                (sp, tp)
-            };
-            let (s_s, s_t) = make_pats("s");
-            let (l_s, l_t) = make_pats("l");
-            let swim = match_pair(&s_s, &s_t, &scan, &people.textures);
-            let pajama = match_pair(&l_s, &l_t, &scan, &people.textures);
+            let scan = suit_scan_order(program, world);
+            let (swim, pajama) =
+                build_child_sl(gender_ch, &raw_body_type, skin_norm, &scan, &textures);
             let entry = world.made_outfits.entry(guid).or_default();
             entry.insert(30, "ADDED".to_owned());
             entry.insert(31, swim);
@@ -632,25 +773,289 @@ pub(crate) fn init_clothing_rows(
     }
     // 0x409452 -> 0x40c855: winter (33) for both adult and child.
     if row_empty(world, 33) {
-        let scan = suit_scan_order(people, world);
-        let mut sp = Pattern::default();
-        sp.push_literal("w");
-        sp.push_literal("100");
-        sp.push_literal(gender_ch);
-        if is_child {
-            sp.push_literal("cchd");
-        } else {
-            sp.push_literal("a");
-            sp.push_literal(adult_body_type);
-        }
-        let mut tp = sp.clone();
-        tp.push_literal(skin_norm);
-        let winter = match_pair(&sp, &tp, &scan, &people.textures);
+        let scan = suit_scan_order(program, world);
+        let winter = build_winter(
+            gender_ch,
+            is_child,
+            adult_body_type,
+            skin_norm,
+            &scan,
+            &textures,
+        );
         world
             .made_outfits
             .entry(guid)
             .or_default()
             .insert(33, winter);
+    }
+}
+
+/// Runs `0x40a588` (post-edit clothing commit for rows 30..=34) followed by
+/// `0x40af5b` (rebuilding naked row 15, swim row 16, formal row 27, and hand
+/// rows 17..=22, 28..=29) at the end of `Make New Character` human creation
+/// (`0x44b185`) and negative-age copying (`0x44b308`).
+pub(crate) fn commit_character_clothing(
+    program: &Program,
+    world: &mut World,
+    guid: u32,
+    profile: Option<&sims_content::Profile>,
+) {
+    let gender_code = profile_gender_code(read_character_row(world, guid, profile, 12).as_deref());
+    if !(0..=1).contains(&gender_code) {
+        return;
+    }
+    let gender_ch = if gender_code == 1 { "f" } else { "m" };
+    let gender_byte = gender_ch.as_bytes()[0];
+    let age_str = read_character_row(world, guid, profile, 13).unwrap_or_default();
+    let is_child = atoi_age(truncate_cp1252(&age_str, 15)) <= 17;
+    let age_byte = if is_child { b'c' } else { b'a' };
+    let body_row = read_character_row(world, guid, profile, 1).unwrap_or_default();
+    let (body_suit, body_tex) = parse_row_descriptor(&body_row, false);
+    let raw_body_type = cp1252_body_type(&body_suit);
+    let adult_body_type = if matches!(raw_body_type.as_str(), "skn" | "fit" | "fat") {
+        raw_body_type.as_str()
+    } else {
+        "fit"
+    };
+    let skin_raw = read_character_row(world, guid, profile, 14).unwrap_or_else(|| "???".to_owned());
+    let skin_3: String = skin_raw.chars().take(3).collect();
+    let skin_norm = if skin_3.eq_ignore_ascii_case("lgt")
+        || skin_3.eq_ignore_ascii_case("med")
+        || skin_3.eq_ignore_ascii_case("drk")
+    {
+        skin_3.as_str()
+    } else {
+        "lgt"
+    };
+    let skin_bytes = encode_cp1252(&skin_3.to_ascii_lowercase());
+    let scan = suit_scan_order(program, world);
+    let textures = texture_list(program);
+
+    // Build exact `0x408bf5` wardrobe list for clothing kind (`f`/`s`/`l`/`w`/`h`).
+    let build_list = |kind: u8| -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for suit in &scan {
+            let sb = encode_cp1252(suit);
+            if sb.len() < 9
+                || !sb[0].eq_ignore_ascii_case(&kind)
+                || !(sb[4].eq_ignore_ascii_case(&gender_byte) || sb[4].eq_ignore_ascii_case(&b'u'))
+                || !sb[5].eq_ignore_ascii_case(&age_byte)
+            {
+                continue;
+            }
+            let mut prefix = sb[..9].to_ascii_lowercase();
+            prefix.extend_from_slice(&skin_bytes);
+            for tex in &textures {
+                let tb = encode_cp1252(tex);
+                if tb.len() >= prefix.len() && tb[..prefix.len()].eq_ignore_ascii_case(&prefix) {
+                    out.push((suit.clone(), format_generated_body_row(suit, tex)));
+                }
+            }
+        }
+        out
+    };
+    let find_in_list = |list: &[(String, String)], raw: Option<&str>| -> Option<usize> {
+        let raw = raw?;
+        if raw.is_empty() {
+            return None;
+        }
+        let (want_suit, want_tex) = parse_row_descriptor(raw, false);
+        let want_suit_63 = truncate_cp1252(&want_suit, 63);
+        let want_tex_63 = truncate_cp1252(&want_tex, 63);
+        list.iter().position(|(_, entry_row)| {
+            let (s, t) = parse_row_descriptor(entry_row, false);
+            s.eq_ignore_ascii_case(want_suit_63) && t.eq_ignore_ascii_case(want_tex_63)
+        })
+    };
+
+    // 1. 0x40ad00..0x40aeb4: rows 30, 31, 32 (formal / swim / pajama).
+    if !is_child {
+        let formal_list = build_list(b'f');
+        let swim_list = build_list(b's');
+        let pajama_list = build_list(b'l');
+        let f_idx = find_in_list(
+            &formal_list,
+            read_character_row(world, guid, profile, 30).as_deref(),
+        );
+        let s_idx = find_in_list(
+            &swim_list,
+            read_character_row(world, guid, profile, 31).as_deref(),
+        );
+        let l_idx = find_in_list(
+            &pajama_list,
+            read_character_row(world, guid, profile, 32).as_deref(),
+        );
+        if f_idx.is_none() || s_idx.is_none() || l_idx.is_none() {
+            let entry = world.made_outfits.entry(guid).or_default();
+            if formal_list.is_empty() || swim_list.is_empty() || pajama_list.is_empty() {
+                entry.insert(30, String::new());
+                entry.insert(31, String::new());
+                entry.insert(32, String::new());
+            } else if f_idx.is_none() && s_idx.is_none() && l_idx.is_none() {
+                let (formal, swim, pajama) =
+                    build_adult_fsl(gender_ch, adult_body_type, skin_norm, &scan, &textures);
+                entry.insert(30, formal);
+                entry.insert(31, swim);
+                entry.insert(32, pajama);
+            } else {
+                entry.insert(30, formal_list[f_idx.unwrap_or(0)].1.clone());
+                entry.insert(31, swim_list[s_idx.unwrap_or(0)].1.clone());
+                entry.insert(32, pajama_list[l_idx.unwrap_or(0)].1.clone());
+            }
+        }
+    } else {
+        {
+            let entry = world.made_outfits.entry(guid).or_default();
+            entry.insert(30, "ADDED".to_owned());
+            entry.insert(34, "ADDED".to_owned());
+        }
+        let swim_list = build_list(b's');
+        let pajama_list = build_list(b'l');
+        let s_idx = find_in_list(
+            &swim_list,
+            read_character_row(world, guid, profile, 31).as_deref(),
+        );
+        let l_idx = find_in_list(
+            &pajama_list,
+            read_character_row(world, guid, profile, 32).as_deref(),
+        );
+        if s_idx.is_none() || l_idx.is_none() {
+            let entry = world.made_outfits.entry(guid).or_default();
+            if swim_list.is_empty() || pajama_list.is_empty() {
+                entry.insert(30, String::new());
+                entry.insert(31, String::new());
+                entry.insert(32, String::new());
+            } else if s_idx.is_none() && l_idx.is_none() {
+                let (swim, pajama) =
+                    build_child_sl(gender_ch, &raw_body_type, skin_norm, &scan, &textures);
+                entry.insert(30, "ADDED".to_owned());
+                entry.insert(31, swim);
+                entry.insert(32, pajama);
+            } else {
+                entry.insert(31, swim_list[s_idx.unwrap_or(0)].1.clone());
+                entry.insert(32, pajama_list[l_idx.unwrap_or(0)].1.clone());
+            }
+        }
+    }
+
+    // 2. 0x40aec8..0x40aee8: row 33 (winter).
+    {
+        let winter_list = build_list(b'w');
+        let w_idx = find_in_list(
+            &winter_list,
+            read_character_row(world, guid, profile, 33).as_deref(),
+        );
+        if w_idx.is_none() {
+            let val = if winter_list.is_empty() {
+                String::new()
+            } else {
+                build_winter(
+                    gender_ch,
+                    is_child,
+                    adult_body_type,
+                    skin_norm,
+                    &scan,
+                    &textures,
+                )
+            };
+            world.made_outfits.entry(guid).or_default().insert(33, val);
+        }
+    }
+
+    // 3. 0x40aef9..0x40af1c: row 34 (adult high fashion).
+    if !is_child {
+        let hf_list = build_list(b'h');
+        let h_idx = find_in_list(
+            &hf_list,
+            read_character_row(world, guid, profile, 34).as_deref(),
+        );
+        if h_idx.is_none() {
+            let val = if hf_list.is_empty() {
+                String::new()
+            } else {
+                build_adult_hf(gender_ch, adult_body_type, skin_norm, &scan, &textures)
+            };
+            world.made_outfits.entry(guid).or_default().insert(34, val);
+        }
+    }
+
+    // 4. 0x40af51 -> 0x40af5b: rebuild naked (15), swim (16), formal (27), and
+    //    hand rows (28, 29, 17, 18, 21, 22, 19, 20) from the clone's new body,
+    //    gender, age, and skin tone.
+    let base_bytes = encode_cp1252(&body_tex);
+    let base_63 = &base_bytes[..base_bytes.len().min(63)];
+    let suffix = if base_63.len() > 17 {
+        sims_formats::strings::decode(&base_63[17..], 1)
+    } else {
+        String::new()
+    };
+    let make_other_suit_pat = |first: &str| {
+        let mut p = Pattern::default();
+        p.push_literal(first);
+        p.push_choice("U", gender_ch);
+        p.push_literal(&raw_body_type);
+        p
+    };
+    let make_other_tex_pat = |first: &str| {
+        let mut p = make_other_suit_pat(first);
+        p.push_literal(&skin_3);
+        p.push_choice(&suffix, "");
+        p
+    };
+    let find_best = |pat: &Pattern, items: &[String]| -> String {
+        let mut best = BestMatch::default();
+        for item in items {
+            let b = encode_cp1252(item);
+            best.consider(item, b.len(), pat.match_len(&b));
+        }
+        best.name.to_owned()
+    };
+    let naked_suit = find_best(&make_other_suit_pat("N"), &scan);
+    let naked_tex = find_best(&make_other_tex_pat("N"), &textures);
+    let swim_tex_raw = find_best(&make_other_tex_pat("U"), &textures);
+    let swim_tex = if swim_tex_raw.is_empty() && is_child {
+        naked_tex.as_str()
+    } else {
+        swim_tex_raw.as_str()
+    };
+    let formal_suit = find_best(&make_other_suit_pat("F"), &scan);
+    let formal_tex = find_best(&make_other_tex_pat("F"), &textures);
+
+    let entry = world.made_outfits.entry(guid).or_default();
+    entry.insert(15, format_generated_body_row(&naked_suit, &naked_tex));
+    entry.insert(16, format_generated_body_row(&naked_suit, swim_tex));
+    entry.insert(27, format_generated_body_row(&formal_suit, &formal_tex));
+
+    let hand_gender = if is_child {
+        "u"
+    } else if gender_code == 1 {
+        "f"
+    } else {
+        "m"
+    };
+    const HAND_SPECS: [(usize, &str, &str); 8] = [
+        (28, "L", "G"),
+        (29, "R", "G"),
+        (17, "L", "O"),
+        (18, "R", "O"),
+        (21, "L", "C"),
+        (22, "R", "C"),
+        (19, "L", "P"),
+        (20, "R", "P"),
+    ];
+    for (row_idx, side, pose) in HAND_SPECS {
+        let mut hp = Pattern::default();
+        hp.push_literal("H");
+        hp.push_choice(gender_ch, "U");
+        hp.push_choice(side, "A");
+        hp.push_literal(pose);
+        hp.push_choice(&skin_3, "");
+        hp.push_choice(&suffix, "");
+        let best_hand = find_best(&hp, &textures);
+        if !best_hand.is_empty() {
+            let formatted = format!("H{hand_gender}{side}{pose},HAND={best_hand}");
+            entry.insert(row_idx, truncate_cp1252(&formatted, 63).to_owned());
+        }
     }
 }
 
@@ -1107,7 +1512,7 @@ pub(crate) fn dress_person(
     let gender_code = profile_gender_code(raw_row(12).as_deref());
     let (body_row_suit, body_row_tex) = row_desc(1);
     let (_, head_row_tex) = row_desc(2);
-    let body_type: String = body_row_suit.get(6..9).unwrap_or("").to_ascii_lowercase();
+    let body_type = cp1252_body_type(&body_row_suit);
     let skin_3: String = raw_row(14)
         .unwrap_or_else(|| "???".to_owned())
         .chars()
@@ -1171,14 +1576,19 @@ pub(crate) fn dress_person(
                     && let Some(level) = career.levels.get(lvl)
                 {
                     let live_female = (gender_word & 1) != 0;
-                    let tmpl = if live_female && !level.strings[2].is_empty() {
+                    // 0x45ef51, 0x45ef63, 0x45ef75: CARR workwear templates and
+                    // secondary suit are copied into 64-byte (`63`-byte) buffers
+                    // initialized at `0x4593c8`–`0x45940e`.
+                    let tmpl_raw = if live_female && !level.strings[2].is_empty() {
                         &level.strings[2]
                     } else {
                         &level.strings[1]
                     };
-                    init_clothing_rows(&program.people, world, guid, profile);
+                    let tmpl = truncate_cp1252(tmpl_raw, 63);
+                    let tex_tmpl = truncate_cp1252(&level.strings[3], 63);
+                    init_clothing_rows(program, world, guid, profile);
                     body_suit = match_registered_suit(
-                        &program.people,
+                        program,
                         world,
                         tmpl,
                         gender_code,
@@ -1186,15 +1596,16 @@ pub(crate) fn dress_person(
                         &skin_3,
                     );
                     body_tex = match_registered_texture(
-                        &program.people,
-                        &level.strings[3],
+                        program,
+                        tex_tmpl,
                         gender_code,
                         &body_type,
                         &skin_3,
                         &body_row_tex,
                         "BODY=",
+                        63,
                     );
-                    body_alt_suit = level.strings[4].clone();
+                    body_alt_suit = truncate_cp1252(&level.strings[4], 63).to_owned();
                 }
                 outfit.workwear_cache = Some(WorkwearCache {
                     job_type,
@@ -1229,23 +1640,18 @@ pub(crate) fn dress_person(
                 } else {
                     "pajama$g$b"
                 };
-                init_clothing_rows(&program.people, world, guid, profile);
-                body_suit = match_registered_suit(
-                    &program.people,
-                    world,
-                    tmpl,
-                    gender_code,
-                    &body_type,
-                    &skin_3,
-                );
+                init_clothing_rows(program, world, guid, profile);
+                body_suit =
+                    match_registered_suit(program, world, tmpl, gender_code, &body_type, &skin_3);
                 body_tex = match_registered_texture(
-                    &program.people,
+                    program,
                     "pajama$g$c",
                     gender_code,
                     &body_type,
                     &skin_3,
                     &body_row_tex,
                     "BODY=",
+                    63,
                 );
             }
         }
@@ -1291,23 +1697,18 @@ pub(crate) fn dress_person(
                     format!("ct-{prefix}-$gAFit$c-{v:02}"),
                 )
             };
-            init_clothing_rows(&program.people, world, guid, profile);
-            body_suit = match_registered_suit(
-                &program.people,
-                world,
-                &suit_tmpl,
-                gender_code,
-                &body_type,
-                &skin_3,
-            );
+            init_clothing_rows(program, world, guid, profile);
+            body_suit =
+                match_registered_suit(program, world, &suit_tmpl, gender_code, &body_type, &skin_3);
             body_tex = match_registered_texture(
-                &program.people,
+                program,
                 &tex_tmpl,
                 gender_code,
                 &body_type,
                 &skin_3,
                 &body_row_tex,
                 "BODY=",
+                63,
             );
         }
         17 => {
@@ -1363,47 +1764,39 @@ pub(crate) fn dress_person(
                 }
             }
             if let Some(spec) = costume_spec(suit, variant) {
-                init_clothing_rows(&program.people, world, guid, profile);
+                init_clothing_rows(program, world, guid, profile);
                 if let Some(b) = spec.body {
-                    body_suit = match_registered_suit(
-                        &program.people,
-                        world,
-                        b,
-                        gender_code,
-                        &body_type,
-                        &skin_3,
-                    );
+                    body_suit =
+                        match_registered_suit(program, world, b, gender_code, &body_type, &skin_3);
                 }
                 if let Some(bt) = spec.body_tex {
                     body_tex = match_registered_texture(
-                        &program.people,
+                        program,
                         bt,
                         gender_code,
                         &body_type,
                         &skin_3,
                         &body_row_tex,
                         "BODY=",
+                        63,
                     );
                 }
                 if let Some(h) = spec.head {
-                    head_suit = match_registered_suit(
-                        &program.people,
-                        world,
-                        h,
-                        gender_code,
-                        &body_type,
-                        &skin_3,
-                    );
+                    head_suit =
+                        match_registered_suit(program, world, h, gender_code, &body_type, &skin_3);
                 }
                 if let Some(ht) = spec.head_tex {
+                    // 0x58c7c9 passes the 256-byte (`255`-byte) destination
+                    // initialized at `0x58a3d5`–`0x58a3eb`.
                     head_tex = match_registered_texture(
-                        &program.people,
+                        program,
                         ht,
                         gender_code,
                         &body_type,
                         &skin_3,
                         &head_row_tex,
                         "HEAD-HEAD=",
+                        255,
                     );
                 }
                 if !skip_hand_templates {

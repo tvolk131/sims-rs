@@ -184,12 +184,7 @@ impl Machine<'_, '_> {
         let tpl_profile = crate::people::profile(&self.program.people, self.world, guid)
             .ok()
             .map(std::borrow::Cow::into_owned);
-        crate::outfits::init_clothing_rows(
-            &self.program.people,
-            self.world,
-            guid,
-            tpl_profile.as_ref(),
-        );
+        crate::outfits::init_clothing_rows(self.program, self.world, guid, tpl_profile.as_ref());
         let dst_is_pet = is_pet_gender(tpl_profile.as_ref().and_then(|p| p.gender.as_deref()));
         let made = self
             .world
@@ -273,6 +268,18 @@ impl Machine<'_, '_> {
                 .entry(guid)
                 .or_default()
                 .extend(outfit_rows);
+            // 0x44b185 -> 0x409492(1) -> 0x40a588 -> 0x40af5b: revalidate or
+            // regenerate rows 30..=34 and rebuild rows 15, 16, 27, and hands
+            // for the clone's new gender, age, skin tone, and body.
+            let final_profile = crate::people::profile(&self.program.people, self.world, guid)
+                .ok()
+                .map(std::borrow::Cow::into_owned);
+            crate::outfits::commit_character_clothing(
+                self.program,
+                self.world,
+                guid,
+                final_profile.as_ref(),
+            );
             self.world.made_portrait_head.insert(guid, head_status);
             self.frame_mut()?.stack_object = record;
             Ok(true)
@@ -361,16 +368,11 @@ impl Machine<'_, '_> {
         let src = crate::people::profile(&self.program.people, self.world, self_guid)?.into_owned();
         // 0x44b26e -> 0x409315 on source, then 0x44b27b -> 0x409315 on clone,
         // before editing the clone's age, skin, or gender.
-        crate::outfits::init_clothing_rows(&self.program.people, self.world, self_guid, Some(&src));
+        crate::outfits::init_clothing_rows(self.program, self.world, self_guid, Some(&src));
         let dst_profile = crate::people::profile(&self.program.people, self.world, guid)
             .ok()
             .map(std::borrow::Cow::into_owned);
-        crate::outfits::init_clothing_rows(
-            &self.program.people,
-            self.world,
-            guid,
-            dst_profile.as_ref(),
-        );
+        crate::outfits::init_clothing_rows(self.program, self.world, guid, dst_profile.as_ref());
         // 0x40ccac maps "male" -> 0, "female" -> 1, and every pet or unknown
         // gender string to 2..=5. At 0x44b2ef, 0x40d408 -> 0x40d3db ->
         // 0x408bf5(1) returns null for codes 2..=5 and 0x40d42e dereferences it.
@@ -672,6 +674,18 @@ impl Machine<'_, '_> {
                 .or_default()
                 .extend(rows);
         }
+        // 0x44b308 -> 0x409492(1) -> 0x40a588 -> 0x40af5b: revalidate or
+        // regenerate rows 30..=34 and rebuild rows 15, 16, 27, and hands for
+        // the copied clone's final profile.
+        let final_profile = crate::people::profile(&self.program.people, self.world, guid)
+            .ok()
+            .map(std::borrow::Cow::into_owned);
+        crate::outfits::commit_character_clothing(
+            self.program,
+            self.world,
+            guid,
+            final_profile.as_ref(),
+        );
         self.world.made_portrait_head.insert(guid, head_status);
         self.frame_mut()?.stack_object = record;
         Ok(true)
@@ -855,57 +869,12 @@ impl Machine<'_, '_> {
             }
             None => return Ok(None),
         };
-        if self
-            .world
-            .suit_scan_cache
-            .as_ref()
-            .is_some_and(|v| !v.is_empty())
-            || !self.program.people.suit_table.is_empty()
-            || !self.world.runtime_added_suits.is_empty()
-        {
-            let scan = if self.program.people.suit_table.is_empty()
-                && self
-                    .world
-                    .suit_scan_cache
-                    .as_ref()
-                    .is_none_or(Vec::is_empty)
-            {
-                let mut table = sims_content::SuitTable::default();
-                for name in ordered.suits() {
-                    if !table.contains(name) {
-                        table.insert_name(name.clone());
-                    }
-                }
-                for name in &self.world.runtime_added_suits {
-                    let key = crate::outfits::encode_cp1252(name);
-                    if !table.contains(&key) {
-                        table.insert_name(key);
-                    }
-                }
-                let scan = table.scan_names();
-                if !scan.is_empty() {
-                    self.world.suit_scan_cache = Some(scan.clone());
-                }
-                scan
-            } else {
-                crate::outfits::suit_scan_order(&self.program.people, self.world)
-            };
-            let bytes = scan
-                .iter()
-                .map(|s| crate::outfits::encode_cp1252(s))
-                .collect();
-            return Ok(Some(ordered.with_suits(bytes)));
-        }
-        if !ordered.suits().is_empty() {
-            self.world.suit_scan_cache = Some(
-                ordered
-                    .suits()
-                    .iter()
-                    .map(|b| sims_formats::strings::decode(b, 1))
-                    .collect(),
-            );
-        }
-        Ok(Some(ordered))
+        let scan = crate::outfits::suit_scan_order(self.program, self.world);
+        let bytes = scan
+            .iter()
+            .map(|s| crate::outfits::encode_cp1252(s))
+            .collect();
+        Ok(Some(ordered.with_suits(bytes)))
     }
 
     /// The number of bodies and heads a person of skin tone `tone` can

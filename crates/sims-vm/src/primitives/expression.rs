@@ -27,10 +27,11 @@ impl Machine<'_, '_> {
         let (operator, left_scope, right_scope) = (operands[5], operands[6], operands[7]);
         // The original resolves the right operand before the left.
         let rhs = i32::from(self.read(right_scope, right_index)?);
-        // 0x452c85: binds `[edi + 0x128]` to `[ebp - 0x04]`, which overlaps
-        // `UI Effect`'s saved `esi` (`0x44ad02`) at the same dispatcher depth
-        // and corrupts caller state if `UI Effect` subsequently reads global 34.
-        self.world.scratch_ptr_set.remove(&self.me);
+        // 0x452c85: binds `[edi + 0x128]` to `[ebp - 0x04]`. Because the
+        // dispatcher pushes 1 argument for Expression (`0x45237d`) and 2 for
+        // UI Effect (`0x45226e`), this targets UI Effect's saved `ebp` slot,
+        // which the dispatcher restores at `0x452273` without faulting.
+        self.world.scratch_ptr_set.insert(self.me);
         let write = matches!(operator, 3..=7 | 9..=13 | 17..=20);
         let (destination, writable) = self.resolve(left_scope, left_index, write)?;
         // The left operand is read even when only assigned to, so an

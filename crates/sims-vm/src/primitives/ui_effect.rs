@@ -173,9 +173,11 @@ pub(crate) fn can_render_person_portrait(
 
     // 0x595674..0x595699 (checked at 0x4e7824 AFTER 0x4e7801 -> 0x58a178): a
     // "HEAD" binding attaches only when the Sim's skeleton defines a bone named
-    // "HEAD". Synthetic fixtures that leave `bones` empty skip this check.
+    // "HEAD". A decoded zero-bone skeleton (`scales[place].is_empty()`) has no
+    // "HEAD" bone and returns false; synthetic fixtures with non-empty scales
+    // and omitted `bones` skip this check.
     if let Ok(skel) = crate::people::skeleton(&program.people, world, guid)
-        && !skel.bones.is_empty()
+        && (!skel.bones.is_empty() || skel.scales.get(skel.place).is_some_and(Vec::is_empty))
         && !skel.bones.iter().any(|b| b.name == "HEAD")
     {
         return Ok(Some(false));
@@ -280,14 +282,14 @@ impl Machine<'_, '_> {
 
     /// Reads the operand variable (`0x453141` with `write == 0`). On global 34,
     /// `0x45412b` → `0x4541d5` writes `&globals[34]` through `[object + 0x128]`
-    /// without a null check: `Random Number` (`0x451e8d`, `ebp + 0xc`),
+    /// without a null check: `Expression` (`0x452c85`, targets saved `ebp`
+    /// restored at `0x452273`), `Random Number` (`0x451e8d`, `ebp + 0xc`),
     /// `Get Direction To` (`0x45202b`, `ebp + 0xc`), and `Relationship`
-    /// (`0x44d513`, `ebp - 0xc`) leave `[object + 0x128]` on a harmless arg
-    /// slot (`World::scratch_ptr_set`), whereas an initial null pointer
-    /// (`0x431a77`), `Set To Next` (`0x44eb9d`, `ebp - 0x18` → overwrites
-    /// `0x44ad70`'s return address and faults), or `Expression` (`0x452c85`,
-    /// `ebp - 0x04` → overwrites saved `esi`) corrupts/crashes native state and
-    /// traps loudly.
+    /// (opcode 26, `0x44d513`, `ebp - 0xc`) leave `[object + 0x128]` safe
+    /// (`World::scratch_ptr_set`), whereas an initial null pointer
+    /// (`0x431a77`, unchanged by `Old Relationship` opcode 24 at `0x44d593`) or
+    /// `Set To Next` (`0x44eb9d`, `ebp - 0x18` → overwrites `0x44ad70`'s return
+    /// address and faults at `&globals[34]`) traps loudly.
     fn read_ui_effect_var(&mut self, scope: u8, index: i16) -> Result<i16, Trap> {
         if scope == GLOBAL_SCOPE
             && index == GLOBAL_34
@@ -485,16 +487,17 @@ impl Machine<'_, '_> {
         save_bitmap: bool,
         caller: &str,
     ) -> Result<bool, Trap> {
-        self.render_portrait(guid, save_bitmap, false, caller)
+        self.render_portrait(guid, save_bitmap, false, 0, caller)
     }
 
     /// Runs `0x4e8c5d(index, 0x1f, 1)` for `Make New Character` pet creation
-    /// (`0x44b126`): preserves all Init/CRT RNG/removal side effects and
-    /// caches/writes `BMP_` 2002 when `HEAD` binding is known, without turning
-    /// a mixed custom pet wardrobe into a fault inside opcode 19 (deferring
-    /// any trap until `UI Effect` or `Dialog` actually queries the portrait).
+    /// (`0x44b126`): bit `0x01` renders/caches/writes `BMP_` 2002, then bits
+    /// `0x08` (`0x4e7448`), `0x02` (`0x4e7671`), `0x04` (`0x4e81f6` × 2), and
+    /// `0x10` (`0x4e8400`) run 5 additional forced dresses (`0x4e77c6` →
+    /// `0x4e7801` → `0x58a178(1)`), which can clear the portrait cache via
+    /// `0x58d4e1` → `0x4eb0cc` → `0x4e897e` when the pet's head slot is empty.
     pub(crate) fn try_render_pet_portrait(&mut self, guid: u32) -> Result<bool, Trap> {
-        self.render_portrait(guid, true, true, "Make New Character's portrait")
+        self.render_portrait(guid, true, true, 5, "Make New Character's portrait")
     }
 
     fn render_portrait(
@@ -502,6 +505,7 @@ impl Machine<'_, '_> {
         guid: u32,
         save_bitmap: bool,
         defer_unknown_head: bool,
+        extra_passes: usize,
         caller: &str,
     ) -> Result<bool, Trap> {
         // 0x4e8c92 -> 0x4e893e -> 0x43ac10: resolve the winning definition.
@@ -534,15 +538,25 @@ impl Machine<'_, '_> {
                     false
                 }
             };
-            if !can_render {
-                return Ok(false);
+            if can_render {
+                self.world.portraits.insert(guid);
+                self.world.dirty_portraits.remove(&guid);
+                if save_bitmap && self.is_portrait_file_writable(guid) {
+                    self.world.generated_portrait_2002.insert(file_key);
+                }
             }
-            self.world.portraits.insert(guid);
-            self.world.dirty_portraits.remove(&guid);
-            if save_bitmap && self.is_portrait_file_writable(guid) {
-                self.world.generated_portrait_2002.insert(file_key);
+            // 0x4e8dab..0x4e8fbb: additional flags in `0x4e8c5d` run forced
+            // dresses (`0x4e77c6` -> `0x4e7801` -> `0x58a178(1)`).
+            for _ in 0..extra_passes {
+                crate::outfits::dress_person(
+                    self.catalog,
+                    self.program,
+                    self.world,
+                    person_id,
+                    true,
+                )?;
             }
-            return Ok(true);
+            return Ok(can_render);
         }
         // 0x4e8cc6 -> 0x4067b3 -> 0x4174dc: off-lot rendering only calls
         // 0x4e9652 when the winning definition's file is writable.
@@ -624,6 +638,14 @@ impl Machine<'_, '_> {
             copy.dirty_portraits.remove(&guid);
             if save_bitmap {
                 copy.generated_portrait_2002.insert(file_key);
+            }
+        }
+        // 0x4e8dab..0x4e8fbb: additional flags in `0x4e8c5d(index, 0x1f, 1)`
+        // run forced dresses (`0x4e77c6` -> `0x4e7801` -> `0x58a178(1)`) on the
+        // temporary person before removal.
+        if placed {
+            for _ in 0..extra_passes {
+                crate::outfits::dress_person(self.catalog, self.program, &mut copy, id, true)?;
             }
         }
         // Both normal completion (0x4e8fdb) and no-tile failure (0x4e9706)
