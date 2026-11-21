@@ -1145,7 +1145,13 @@ fn run_to(game: &mut Game, tick: u32) -> Result<(), String> {
                 .shown
                 .object;
             game.answer(caller, 0);
+            if let Some(stop) = game.stopped() {
+                return Err(stop.to_string());
+            }
         }
+    }
+    if let Some(stop) = game.stopped() {
+        return Err(stop.to_string());
     }
     Ok(())
 }
@@ -1178,6 +1184,9 @@ fn run_paused(game: &mut Game, ticks: u32) -> Result<(), String> {
                 .shown
                 .object;
             game.answer(caller, 0);
+            if let Some(stop) = game.stopped() {
+                return Err(stop.to_string());
+            }
         }
         if !game.paused() {
             return Err("the lot unpaused during paused_ticks".into());
@@ -1188,6 +1197,9 @@ fn run_paused(game: &mut Game, ticks: u32) -> Result<(), String> {
                 game.lot().world().ticks
             ));
         }
+    }
+    if let Some(stop) = game.stopped() {
+        return Err(stop.to_string());
     }
     Ok(())
 }
@@ -1319,9 +1331,10 @@ fn run(config: &Config) -> Result<(), Vec<String>> {
 
     let install = &config.install;
     let mut game = open_goth(install).map_err(fail)?;
-    // Scenes with `paused_ticks > 0` run their paused partial passes on a
-    // dedicated paused branch opened at `scene.tick`, so paused-object
-    // wakeups never leak into later unpaused scenes on `game`.
+    // Each distinct `(tick, paused_ticks)` with `paused_ticks > 0` runs all
+    // its full and paused passes on a fresh isolated `Game` before any scene
+    // changes camera or strip state, so neither paused-object wakeups nor
+    // earlier scene UI interactions can leak into later simulation passes.
     let mut paused_branch: Option<(u32, u32, Game)> = None;
 
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
@@ -1355,20 +1368,20 @@ fn run(config: &Config) -> Result<(), Vec<String>> {
             }
             (&game, canvas)
         } else {
-            let needs_new = !matches!(paused_branch, Some((tick, _, _)) if tick == scene.tick);
+            let needs_new = !matches!(
+                paused_branch,
+                Some((tick, paused_ticks, _))
+                    if tick == scene.tick && paused_ticks == scene.paused_ticks
+            );
             if needs_new {
                 let mut branch = open_goth(install).map_err(fail)?;
                 run_to(&mut branch, scene.tick).map_err(|e| fail(format!("{name}: {e}")))?;
                 branch.toggle_pause();
-                paused_branch = Some((scene.tick, 0, branch));
+                run_paused(&mut branch, scene.paused_ticks)
+                    .map_err(|e| fail(format!("{name}: {e}")))?;
+                paused_branch = Some((scene.tick, scene.paused_ticks, branch));
             }
-            let (_, paused_done, branch) = paused_branch.as_mut().expect("paused branch");
-            let delta = scene
-                .paused_ticks
-                .checked_sub(*paused_done)
-                .ok_or_else(|| fail(format!("{name}: paused_ticks went backwards")))?;
-            run_paused(branch, delta).map_err(|e| fail(format!("{name}: {e}")))?;
-            *paused_done += delta;
+            let (_, _, branch) = paused_branch.as_mut().expect("paused branch");
             branch.view.camera = scene.camera;
             set_strip(branch, scene.strip).map_err(|e| fail(format!("{name}: {e}")))?;
             branch.render();
