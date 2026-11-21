@@ -15,7 +15,8 @@
 pub mod save;
 
 use crate::play::Play;
-use crate::{Answers, Callback, Interpreter, Program, Stream, TickError, Update};
+use crate::selection::publish_waited_for;
+use crate::{Answer, Answers, Callback, Interpreter, Program, Stream, TickError, Update};
 use sims_content::{Animations, Catalog, House, Index, Install, Neighborhood, People, Surfaces};
 use sims_core::CrtRng;
 use sims_sim::World;
@@ -774,9 +775,7 @@ impl Lot {
             surfaces,
             world,
             tuning: None,
-            player: Answers {
-                queue: answers.iter().copied().collect(),
-            },
+            player: Answers::choices(answers),
             frames,
             ticks: 0,
             start,
@@ -911,13 +910,18 @@ impl Lot {
         // (0x46d9d6, `World::idle_speed`).
         let residential = residential(&self.world, &self.program);
         self.world.idle_speed(residential);
-        let update = interpreter
-            .lot_update_with(
-                &mut self.world,
-                tuning,
-                &mut self.player,
-                play.then_some(&mut self.play),
-            )
+        // The application's poll (0x4d1a8b → 0x4764fe) before the next
+        // update sees 0 once the clicked dialog's button is destroyed.
+        let update = publish_waited_for(&mut self.world, 0)
+            .map_err(TickError::from)
+            .and_then(|()| {
+                interpreter.lot_update_with(
+                    &mut self.world,
+                    tuning,
+                    &mut self.player,
+                    play.then_some(&mut self.play),
+                )
+            })
             .map_err(|error| match error {
                 // Nobody has answered: the player is asked.
                 TickError::Unanswered { shown, given: None } if asks => Stop::Asks { tick, shown },
@@ -1176,16 +1180,26 @@ impl Lot {
         Ok(self.world.unpause())
     }
 
-    /// From now on, a dialog that offers a choice when no answer is left
-    /// in the list given at load waits for the player, as the original
-    /// waits (0x436da0): the step returns [`StepError::Asking`] and the
-    /// lot stays as it was before that tick, not halted. The window turns
-    /// this on; `sims boot` and the comparisons do not, and halt there.
+    /// Replace the pending answers with an explicit replay, one entry
+    /// per dialog shown, including one-button notices. Supply the bitmap
+    /// ID only when the replay calls for a wait-check publication
+    /// (0x4764fe). An exhausted replay leaves the next dialog unanswered.
+    /// Call between steps, before the lot is waiting for an answer.
+    /// The loaders' `&[u8]` lists still answer only dialogs with choices.
+    pub fn replay_dialogs(&mut self, answers: &[Answer]) -> Result<(), OrderError> {
+        self.ready()?;
+        self.player = Answers::replay(answers);
+        Ok(())
+    }
+
+    /// From now on, a dialog with no answer left in the list waits for
+    /// the player (0x436da0). The step returns [`StepError::Asking`] and
+    /// the lot stays ready to retry the tick. The window turns this on.
     ///
     /// The tick runs again once [`Lot::answer`] has the answer. A tick
     /// runs the same from the same lot, so it reaches the same dialog,
-    /// and the lot then goes on exactly as if the answer had been in the
-    /// list at load.
+    /// and the lot then goes on as if the answer had been queued before
+    /// the tick.
     pub fn wait_for_answers(&mut self) {
         self.asks = true;
     }
@@ -1196,14 +1210,19 @@ impl Lot {
     }
 
     /// Answers the dialog the lot waits on with `answer` (the status its
-    /// button gives: 2 the first, 3 the second, 4 the third). The next
-    /// step runs the tick again and gives it this answer; until then the
-    /// lot is as it was before that tick and takes no orders.
-    pub fn answer(&mut self, answer: u8) -> Result<(), AnswerError> {
+    /// button gives: 2 the first, 3 the second, 4 the third). The window
+    /// can include the activated button's bitmap ID in an [`Answer`].
+    /// The next step runs the tick again and gives it this answer; until
+    /// then the lot is as it was before that tick and takes no orders.
+    pub fn answer(&mut self, answer: impl Into<Answer>) -> Result<(), AnswerError> {
         let asking = self.asking.as_ref().ok_or(AnswerError::NotAsked)?;
         let offered = asking.shown.answers;
-        if !offered.contains(&answer) {
-            return Err(AnswerError::NotOffered { answer, offered });
+        let answer = answer.into();
+        if !offered.contains(&answer.status) {
+            return Err(AnswerError::NotOffered {
+                answer: answer.status,
+                offered,
+            });
         }
         self.player.queue.push_back(answer);
         self.asking = None;

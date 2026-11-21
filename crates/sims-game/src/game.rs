@@ -884,7 +884,10 @@ impl Game {
             self.note = Some(format!("The dialog has no button {button}."));
             return;
         };
-        if let Err(e) = self.lot.answer(answer) {
+        if let Err(e) = self.lot.answer(sims_vm::Answer {
+            status: answer,
+            bitmap_id: Some(sims_ui::dialog::BUTTON as i16),
+        }) {
             self.note = Some(format!("The answer was not taken: {e}"));
             return;
         }

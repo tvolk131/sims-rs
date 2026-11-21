@@ -2570,7 +2570,7 @@ fn the_goth_house_first_tick_matches_the_original() {
         // Location For. Object 15 asks a two-button dialog, answered with
         // 3 as the capture's events show. In tick 3 people 18 and 21 start
         // a clip and 35 objects are queued for removal.
-        let mut player = sims_vm::Answers { queue: [3].into() };
+        let mut player = sims_vm::Answers::choices(&[3]);
         let mut shape = vec![];
         for tick in 2..=5 {
             let update = interpreter.lot_update(world, &tuning, &mut player).unwrap();

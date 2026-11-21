@@ -24,6 +24,7 @@
 //! which is not ported.
 
 use super::Lot;
+use crate::Answers;
 use serde::{Deserialize, Serialize};
 use sims_sim::World;
 use std::collections::{BTreeSet, VecDeque};
@@ -31,23 +32,56 @@ use std::collections::{BTreeSet, VecDeque};
 /// The version of [`Saved::encode`]'s layout: the fields of [`Saved`],
 /// their order and their types (postcard is not self-describing). Bump it
 /// in the commit that changes any of them. The world inside is versioned
-/// by [`sims_sim::SNAPSHOT_FORMAT`], which is written too. A save of
-/// another version is refused, not migrated.
-pub const FORMAT: u32 = 1;
+/// by [`sims_sim::SNAPSHOT_FORMAT`], which is written too. Layout 1's
+/// byte answers are read as choice-only answers with no bitmap IDs.
+pub const FORMAT: u32 = 2;
 
 /// A lot as it stood between two steps ([`Lot::save`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Saved {
+pub struct Saved(State<Answers>);
+
+/// The two layouts differ only in the pending answers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct State<A> {
     world: World,
     ticks: u32,
     start: u32,
-    answers: VecDeque<u8>,
+    answers: A,
     fresh: BTreeSet<u16>,
     view_rotation: u8,
     answered: bool,
     house: u32,
     family: u16,
     loaded: [u8; 32],
+}
+
+impl State<VecDeque<u8>> {
+    fn with_dialog_answers(self) -> State<Answers> {
+        let Self {
+            world,
+            ticks,
+            start,
+            mut answers,
+            fresh,
+            view_rotation,
+            answered,
+            house,
+            family,
+            loaded,
+        } = self;
+        State {
+            world,
+            ticks,
+            start,
+            answers: Answers::choices(answers.make_contiguous()),
+            fresh,
+            view_rotation,
+            answered,
+            house,
+            family,
+            loaded,
+        }
+    }
 }
 
 /// Why a lot could not be saved or restored.
@@ -97,7 +131,7 @@ impl std::error::Error for SaveError {}
 impl Saved {
     /// The saved world.
     pub fn world(&self) -> &World {
-        &self.world
+        &self.0.world
     }
 
     /// The bytes a save store keeps: [`FORMAT`] and the world's snapshot
@@ -110,8 +144,8 @@ impl Saved {
         out
     }
 
-    /// Reads [`Saved::encode`]'s bytes. A save of another layout or world
-    /// format is refused rather than misread.
+    /// Reads [`Saved::encode`]'s bytes, including layout 1 saves with the
+    /// current world format.
     pub fn decode(bytes: &[u8]) -> Result<Self, SaveError> {
         let format = |reason: String| SaveError::Format(reason);
         let (header, body) = bytes
@@ -119,11 +153,16 @@ impl Saved {
             .ok_or_else(|| format("shorter than its header".into()))?;
         let layout = u32::from_le_bytes(header[..4].try_into().unwrap());
         let world = u32::from_le_bytes(header[4..].try_into().unwrap());
-        if layout != FORMAT || world != sims_sim::SNAPSHOT_FORMAT {
+        if !matches!(layout, 1 | FORMAT) || world != sims_sim::SNAPSHOT_FORMAT {
             return Err(format(format!(
                 "save format {layout} with world format {world}, expected {FORMAT} with {}",
                 sims_sim::SNAPSHOT_FORMAT
             )));
+        }
+        if layout == 1 {
+            let state: State<VecDeque<u8>> =
+                postcard::from_bytes(body).map_err(|e| format(e.to_string()))?;
+            return Ok(Self(state.with_dialog_answers()));
         }
         postcard::from_bytes(body).map_err(|e| format(e.to_string()))
     }
@@ -143,18 +182,18 @@ impl Lot {
         if self.halted {
             return Err(SaveError::Halted);
         }
-        Ok(Saved {
+        Ok(Saved(State {
             world: self.world.clone(),
             ticks: self.ticks,
             start: self.start,
-            answers: self.player.queue.clone(),
+            answers: self.player.clone(),
             fresh: self.play.fresh.clone(),
             view_rotation: self.view_rotation,
             answered: self.answered,
             house: self.load.house,
             family: self.load.family,
             loaded: self.loaded,
-        })
+        }))
     }
 
     /// Goes on from `saved`, a save of a lot loaded from the same install
@@ -164,7 +203,7 @@ impl Lot {
     /// is answered here too.
     /// The frames drawn and whether the lot waits for the player's answers
     /// are this lot's, given at its load.
-    pub fn restore(&mut self, saved: Saved) -> Result<(), SaveError> {
+    pub fn restore(&mut self, Saved(saved): Saved) -> Result<(), SaveError> {
         if self.load.finished.is_none() {
             return Err(SaveError::Incomplete);
         }
@@ -181,12 +220,39 @@ impl Lot {
         self.world = saved.world;
         self.ticks = saved.ticks;
         self.start = saved.start;
-        self.player.queue = saved.answers;
+        self.player = saved.answers;
         self.play.fresh = saved.fresh;
         self.view_rotation = saved.view_rotation;
         self.halted = false;
         self.asking = None;
         self.answered = saved.answered;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_layout_one_save_keeps_its_pending_choice() {
+        let state = State {
+            world: World::empty(),
+            ticks: 1,
+            start: 0,
+            answers: VecDeque::from([3u8]),
+            fresh: BTreeSet::new(),
+            view_rotation: 0,
+            answered: true,
+            house: 5,
+            family: 1,
+            loaded: [0; 32],
+        };
+        let mut bytes = 1u32.to_le_bytes().to_vec();
+        bytes.extend(sims_sim::SNAPSHOT_FORMAT.to_le_bytes());
+        bytes.extend(postcard::to_allocvec(&state).unwrap());
+        let saved = Saved::decode(&bytes).unwrap();
+        assert_eq!(saved.0.answers, Answers::choices(&[3]));
+        assert!(saved.0.answered);
     }
 }

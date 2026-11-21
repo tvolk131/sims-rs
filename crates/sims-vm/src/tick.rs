@@ -71,7 +71,7 @@ use crate::interpreter::{Interpreter, Status, Stream};
 use crate::placement::Refreshing;
 use crate::play::{Play, Recovery, ScriptError};
 use crate::primitives::dialog::{self, DONE, NEW, SHOWN};
-use crate::selection::selected;
+use crate::selection::{publish_waited_for, selected};
 use crate::sounds::SoundEvent;
 use crate::visits::function;
 use sims_sim::motives::{self, Tuning};
@@ -155,9 +155,29 @@ const ALERTNESS: usize = 11;
 /// (a modal one) is shown during the registry's pass, and the game waits
 /// there for the answer (0x436da0).
 pub trait Player {
-    /// The answer to a dialog, as the status its button gives (2 for the
-    /// first button, 3 the second, 4 the third), or None to give none.
-    fn answer(&mut self, shown: &Shown) -> Option<u8>;
+    /// The answer to a dialog, or None to give none.
+    fn answer(&mut self, shown: &Shown) -> Option<Answer>;
+}
+
+/// The result of a modal dialog and the UI sample taken while it was open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Answer {
+    /// The status the button gives (0x4370be): 2 for the first button,
+    /// 3 for the second, 4 for the third.
+    pub status: u8,
+    /// The activated button's bitmap resource ID, as sampled by 0x476548.
+    /// The window supplies the ID and a headless replay records it here.
+    /// None leaves global 12 alone, as for a dialog that closed itself.
+    pub bitmap_id: Option<i16>,
+}
+
+impl From<u8> for Answer {
+    fn from(status: u8) -> Self {
+        Self {
+            status,
+            bitmap_id: None,
+        }
+    }
 }
 
 /// A dialog the registry shows.
@@ -171,17 +191,36 @@ pub struct Shown {
     pub answers: &'static [u8],
 }
 
-/// A player who answers from a list, in order. A dialog with one button
-/// can only be answered with it, so it takes nothing from the list.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// A player who answers from a list, in order.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Answers {
-    pub queue: VecDeque<u8>,
+    pub(crate) queue: VecDeque<Answer>,
+    include_single_button: bool,
+}
+
+impl Answers {
+    /// A list of statuses for dialogs that offer a choice. A one-button
+    /// dialog gives its only answer without consuming a list entry.
+    pub fn choices(list: &[u8]) -> Self {
+        Self {
+            queue: list.iter().copied().map(Answer::from).collect(),
+            include_single_button: false,
+        }
+    }
+
+    /// One answer for each dialog shown, including one-button notices.
+    pub fn replay(list: &[Answer]) -> Self {
+        Self {
+            queue: list.iter().copied().collect(),
+            include_single_button: true,
+        }
+    }
 }
 
 impl Player for Answers {
-    fn answer(&mut self, shown: &Shown) -> Option<u8> {
+    fn answer(&mut self, shown: &Shown) -> Option<Answer> {
         match shown.answers {
-            [only] => Some(*only),
+            [only] if !self.include_single_button => Some((*only).into()),
             _ => self.queue.pop_front(),
         }
     }
@@ -877,8 +916,9 @@ impl Interpreter<'_> {
     ///    one it acts on: a new record is shown (0x436da0: status 1) and,
     ///    if it stops the game, answered by the player then and there; a
     ///    finished one (status 5) is destroyed (0x448663). While a dialog
-    ///    waits, the family panel is redrawn
-    ///    ([`Interpreter::refresh_family_panel`]).
+    ///    waits, the family panel is redrawn and the modal message loop
+    ///    (0x5dab4b) lets the application poll the wait check (0x4d1a8b).
+    ///    The answer can carry the bitmap ID that poll writes to global 12.
     /// 2. After a full pass, the queued removals, oldest first: each ID is
     ///    taken off the queue and, if it still names an object, the
     ///    object is removed at once ([`Interpreter::remove_now`],
@@ -919,14 +959,14 @@ impl Interpreter<'_> {
             record.status = SHOWN;
             let answers = dialog::answers(record.operands[5]).ok_or_else(|| {
                 TickError::Unsupported(format!(
-                    "object {}'s dialog is of a kind that is not ported",
+                    "object {}'s dialog is of a kind that is not ported (0x436da0)",
                     record.caller
                 ))
             })?;
             if !dialog::modal(&record.operands) {
                 return Err(TickError::Unsupported(format!(
                     "object {} shows a dialog that does not stop the game; answering one \
-                     while the game runs is not ported",
+                     while the game runs is not ported (0x436da0)",
                     record.caller
                 )));
             }
@@ -939,18 +979,24 @@ impl Interpreter<'_> {
             // redraws the family panel.
             self.refresh_family_panel(world);
             let given = player.answer(&shown);
-            let Some(answer) = given.filter(|answer| answers.contains(answer)) else {
-                return Err(TickError::Unanswered { shown, given });
+            let Some(answer) = given.filter(|answer| answers.contains(&answer.status)) else {
+                return Err(TickError::Unanswered {
+                    shown,
+                    given: given.map(|answer| answer.status),
+                });
             };
+            if let Some(bitmap_id) = answer.bitmap_id {
+                publish_waited_for(world, bitmap_id)?;
+            }
             let record = &mut world.dialogs.records[index];
             // 0x4370be: the button's result, or done at once for a dialog
             // that only informs.
             record.status = if dialog::informs(&record.operands) {
                 DONE
             } else {
-                answer
+                answer.status
             };
-            update.answered.push((record.caller, answer));
+            update.answered.push((record.caller, answer.status));
         }
         if partial
             && let Some(&id) = world.removals.iter().find(|id| {
