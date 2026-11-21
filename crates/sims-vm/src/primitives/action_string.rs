@@ -25,19 +25,20 @@
 //!
 //! It always takes the true branch.
 //!
-//! **The formatting.** Each of the formatter's passes looks for its token
-//! in the string ($Me, $Object, $Local, $Attrib, $NameLocal, $Job and the
-//! others, the strings at 0x6e4f80 to 0x6e5090, each starting with "$",
-//! through 0x44caf6 and 0x4558a0) and does nothing when it is not there.
-//! So a string without "$" is left as it is, and so are the arguments.
-//! The passes are not ported: a menu entry's string with "$" in it fails
-//! loudly. Some of them write the arguments (0x44c0e3).
+//! **The formatting.** Calls the shared string formatter (`0x44bf1a`,
+//! [`Machine::format_text`] in [`crate::primitives::dialog`]) in every run
+//! before `0x44cc9a` asks where the string goes, so any unported token,
+//! invalid local, or non-person career fault fails before state changes.
+//! Passes that substitute into the label (`$Local`, `$Me`, `$Object`,
+//! `$Neighbor`, and `$TimeLocal`) produce the formatted menu entry text;
+//! literal `$` signs such as currency prefixes (`$$Local:1` -> `$50`) are
+//! left intact. When adding a pie menu entry, `$Neighbor` writes `frame.stack_object` into
+//! `args[0]` (`0x44c6c7`), and `0x44cca3` sets `args[0] = frame.stack_object`
+//! whenever it is still 0; `$Family` (which writes `args[1]` at `0x44c0e3`)
+//! fails loudly in `format_text`.
 //!
-//! The string is looked up (0x4704fa) and formatted (0x44bf1a) first, in
-//! every run, before 0x44cc9a asks whether a menu is being built. So in
-//! every run a string with "$" fails loudly, as does a string the file
-//! lacks; a pass can raise an error (one raises native error 0x1c for a
-//! non-person, 0x44c57b).
+//! The string table is loaded with `0x47028b` (argument 3 zero,
+//! [`Machine::string_table`]), the same loader `dialog.rs` uses.
 //!
 //! In an entry's check tree run outside a listing (one Find Best
 //! Interaction runs, or 0x458319's check of a queued or picked action),
@@ -59,10 +60,10 @@
 //! Any other tree run at once fails loudly: the original drops the string
 //! there too, but which of the port's runs at once are the original's
 //! synchronous run has not been checked one by one. A string the file
-//! lacks fails loudly: what the original makes of the empty string pointer
-//! 0x4704fa returns for it is not read. The old prototype's
-//! `change_action_string` (legacy/crates/sims-vm/src/person.rs) reads the
-//! code the same way.
+//! lacks faults as [`Trap::Invalid`]: `0x4704fa` returns null, which
+//! `0x44cc07` passes to `0x5b882d` (`strlen`), whereas a present empty
+//! string is valid. The old prototype's `change_action_string`
+//! (legacy/crates/sims-vm/src/person.rs) reads the code the same way.
 
 use crate::autonomy::checked;
 use crate::fault::Trap;
@@ -76,19 +77,19 @@ pub(crate) const NAMED: u32 = 0x80;
 
 impl Machine<'_, '_> {
     pub(crate) fn action_string(&mut self, operands: &[u8; 8]) -> Result<bool, Trap> {
-        // The string is looked up (0x4704fa) and formatted (0x44bf1a)
-        // before anything looks at where it goes (0x44cc9a), so a pass
-        // that fails, fails in every run.
-        let name = self.action_name(operands)?;
-        if name.contains('$') {
-            return Err(Trap::Unsupported(format!(
-                "Add/Change Action String's string {name:?}, whose tokens the formatter \
-                 replaces (0x44bf1a)"
-            )));
-        }
+        // The string is looked up (0x47028b, 0x4704fa) and formatted
+        // (0x44bf1a) before anything looks at where it goes (0x44cc9a), so
+        // a pass that fails, fails in every run.
+        let raw = self.action_name(operands)?;
+        let exact = self.menu.is_some();
+        let formatted = self.format_text(raw, "Add/Change Action String's", exact)?;
         if let Some(menu) = self.menu {
+            let name = formatted.text;
             let frame = self.frame()?;
-            // The formatter leaves the first argument 0 (0x44cca3).
+            // `$Neighbor` writes `stack_object` to `args[0]` (0x44c6c7),
+            // and otherwise `0x44cca3` sets `args[0] = stack_object` when
+            // still 0; `$Family` (which writes `args[1]`, 0x44c0e3) fails
+            // loudly in `format_text`.
             let args = [frame.stack_object, 0, 0, 0];
             let mut checking = menu.borrow_mut();
             let mut action = checking.action.clone();
@@ -120,21 +121,19 @@ impl Machine<'_, '_> {
     }
 
     /// String `byte 4` (counted from 1) of the string table `word 0` in
-    /// the running code's file (0x4704fa), unformatted.
+    /// the running code's file (0x47028b, 0x4704fa), unformatted.
     fn action_name(&self, operands: &[u8; 8]) -> Result<String, Trap> {
         let table = u16::from_le_bytes([operands[0], operands[1]]);
         let index = operands[4];
-        let owner = self.owner(self.frame()?)?;
-        self.program
-            .libraries
-            .get(&owner)
-            .and_then(|library| library.strings.get(&table))
+        let strings = self.string_table(table, "Add/Change Action String's")?;
+        strings
             .and_then(|strings| strings.get(usize::from(index).checked_sub(1)?))
             .cloned()
             .ok_or_else(|| {
-                Trap::Unsupported(format!(
+                Trap::Invalid(format!(
                     "Add/Change Action String names string {index} of table {table}, which the \
-                     running code's file lacks (0x4704fa)"
+                     running code's file lacks (0x4704fa returns null, passed to strlen at \
+                     0x5b882d)"
                 ))
             })
     }

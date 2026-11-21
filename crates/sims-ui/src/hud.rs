@@ -95,12 +95,14 @@ pub mod id {
     pub const BUY_TRIM: i32 = 4804;
     pub const BUILD_TRIM: i32 = 4805;
     pub const OPTIONS_TRIM: i32 = 4806;
+    /// The cluster's `?` help button (`kHelpBtn`, `0x538f41`).
+    pub const HELP: i32 = 4993;
 }
 
 /// Every resource the panel needs, for [`Art::load`]. The help
 /// balloon's background, [`balloon::BACKGROUND`], is loaded apart with
 /// [`Art::load_optional`]: without it the balloon shows its text alone.
-pub const RESOURCES: [i32; 55] = [
+pub const RESOURCES: [i32; 56] = [
     id::WALLS_DOWN,
     id::CUTAWAY,
     id::WALLS_UP,
@@ -155,6 +157,7 @@ pub const RESOURCES: [i32; 55] = [
     id::BUY_TRIM,
     id::BUILD_TRIM,
     id::OPTIONS_TRIM,
+    id::HELP,
     4918,
 ];
 
@@ -171,7 +174,9 @@ pub struct Controls {
     /// when it builds the panel (0x51a0bc); with nobody selected none is
     /// open ([`Controls::follow`]).
     pub panel: Option<Panel>,
-    pub speed: Speed,
+    /// Which speed button is selected (`0x53b0d8..0x53b16b`), or `None` when
+    /// the simulation holds an unrecognized speed.
+    pub speed: Option<Speed>,
     pub camera: CameraState,
     /// The pointer's position, for the buttons' hover cells.
     pub pointer: Option<[i32; 2]>,
@@ -217,7 +222,7 @@ impl Default for Controls {
             mode: Mode::Live,
             expanded: false,
             panel: Some(Panel::Needs),
-            speed: Speed::Normal,
+            speed: Some(Speed::Normal),
             camera: CameraState::default(),
             pointer: None,
             relations: Relations::default(),
@@ -315,6 +320,14 @@ pub enum Kind {
     /// A cell of a button strip of `cells` cells. A disabled button has
     /// no command.
     Button { id: i32, cells: u32, selected: bool },
+    /// A fixed cell of a button strip of `cells` cells (such as the
+    /// cluster's `?` help button at `0x538f41`, whose click action is not
+    /// yet ported).
+    Cell { id: i32, cells: u32, cell: u32 },
+    /// The cluster's family-friends count (`[esi + 0x1d0]`, `0x539219`,
+    /// `0x4cfcdb`), right-aligned immediately to the left of the
+    /// `$9,999,999`-wide funds box ending at `rect.x + rect.width`.
+    Friends(i32),
     /// The pause button: row 1 of its bitmap when paused.
     Pause { paused: bool },
     /// A resident's portrait.
@@ -376,6 +389,9 @@ pub enum Kind {
 pub enum Align {
     Left,
     Center,
+    /// Centered with signed truncation toward zero (`(width - w) / 2`), as
+    /// the cluster clock draws (`0x539f3e..0x539f43`).
+    CenterTrunc,
     Right,
 }
 
@@ -393,6 +409,27 @@ pub(crate) const fn rgb565(c: u16) -> [u8; 3] {
         (g << 2) | (g >> 4),
         (b << 3) | (b >> 2),
     ]
+}
+
+/// Which speed button the control panel highlights for `world`
+/// (`0x53b0d8..0x53b16b`): reads the idle loop's saved return speed
+/// (`0x46d7cc` / `0x46d7d6`, global 18) when non-negative, otherwise the
+/// active speed (`0x46d78b`, global 16), and matches against Normal
+/// (`0x2f8`), Fast (`0x39c`), or Ultra (`0x3e2`). Does not inspect the
+/// pause flag (`0x46d866`, global 17), so a paused lot keeps its speed
+/// button highlighted; an unrecognized speed highlights none.
+pub fn speed_for(world: &sims_sim::World) -> Option<Speed> {
+    let raw = if world.return_speed() >= 0 {
+        world.return_speed()
+    } else {
+        world.speed()
+    };
+    match raw {
+        sims_sim::speed::NORMAL => Some(Speed::Normal),
+        sims_sim::speed::FAST => Some(Speed::Fast),
+        sims_sim::speed::ULTRA => Some(Speed::Ultra),
+        _ => None,
+    }
 }
 
 /// Lays the panel out in a window of `size`, in drawing order.
@@ -574,14 +611,30 @@ pub fn layout(size: [i32; 2], snapshot: &Snapshot, controls: &Controls) -> Vec<I
         (id::FAST, Speed::Fast, 120, 20),
         (id::ULTRA, Speed::Ultra, 141, 32),
     ] {
+        // 0x53b0d8..0x53b16b: highlights the button matching the active speed
+        // (0x46d78b) or, while idle-speed is active (0x46d7cc), the saved
+        // return speed (0x46d7d6). The pause flag (0x46d866) is not checked
+        // here, so a paused lot keeps its speed button selected.
         items.push(button(
             id,
             4,
             at(x, 135, w, 15),
-            controls.speed == speed && !snapshot.paused,
+            controls.speed == Some(speed),
             Command::SetSpeed(speed),
         ));
     }
+    // 0x538f41..0x538fe6, 0x6f4530: kHelpBtn (4993) at (5, 164), 40x15
+    // four-cell strip (10x15 per cell), enabled (normal cell 0). Clicking
+    // it to open the Help dialog (0x53aaad -> 0x50e8d3) is not yet ported.
+    items.push(Item {
+        rect: at(5, 164, 10, 15),
+        kind: Kind::Cell {
+            id: id::HELP,
+            cells: 4,
+            cell: 0,
+        },
+        command: None,
+    });
     let text = |rect: Rect, text: String, size: u8, align: Align| Item {
         rect,
         kind: Kind::Text {
@@ -592,19 +645,30 @@ pub fn layout(size: [i32; 2], snapshot: &Snapshot, controls: &Controls) -> Vec<I
         },
         command: None,
     };
-    // Fonts and lines measured on the original's screen.
+    // Clock box: 0x539ede..0x539f43, 0x6f4578..0x6f4584 = (95, 118)..(151, 125),
+    // font [0x6f2ae4] (8 pt), centered with `(56 - w) / 2`.
     items.push(text(
-        at(75, 118, 100, 14),
+        at(95, 118, 56, 14),
         snapshot.clock(),
         8,
-        Align::Center,
+        Align::CenterTrunc,
     ));
+    // Money box ([esi + 0x108], 0x539071..0x53908f): font [0x6f2aec] (10 pt),
+    // right-aligned to 0x6f4590 = 178 at y = 0x6f459c = 158.
     items.push(text(
         at(70, 158, 108, 16),
         snapshot.money(),
         10,
         Align::Right,
     ));
+    // Family friends count ([esi + 0x1d0], 0x539219..0x539346, 0x4cfcdb):
+    // font [0x6f2aec] (10 pt), right-aligned immediately left of the
+    // `$9,999,999`-wide money box ending at x = 178, y = 158.
+    items.push(Item {
+        rect: at(0, 158, 178, 16),
+        kind: Kind::Friends(snapshot.family_friends),
+        command: None,
+    });
     // The help balloon, over everything, while its panel shows.
     if let Some(help @ Help::Sign(_)) = controls.help {
         let owner = items.iter().find_map(|i| match i.kind {
@@ -1688,6 +1752,20 @@ pub fn draw(frame: &mut Frame, art: &Art, faces: &Faces, items: &[Item], control
                     frame.draw_all(&image, [r.x, r.y]);
                 }
             }
+            Kind::Cell { id, cells, cell } => {
+                if let Some(image) = art.cell(*id, *cells, *cell) {
+                    frame.draw_all(&image, [r.x, r.y]);
+                }
+            }
+            Kind::Friends(count) => {
+                if let Some(font) = art.font(10) {
+                    let money_width = font.width("$9,999,999");
+                    let right = r.x.saturating_add(r.width).saturating_sub(money_width);
+                    let text = count.to_string();
+                    let x = right.saturating_sub(font.width(&text));
+                    font.draw(frame, &text, [x, r.y], GREEN);
+                }
+            }
             Kind::Pause { paused } => {
                 if let Some(image) = art.image(id::PAUSE) {
                     let row = if *paused { 15 } else { 0 };
@@ -1726,6 +1804,9 @@ pub fn draw(frame: &mut Frame, art: &Art, faces: &Faces, items: &[Item], control
                         // Odd space is split with the extra pixel on the
                         // left, as the original's labels are.
                         Align::Center => x + (width - w + 1).div_euclid(2),
+                        // Signed truncation toward zero, as the cluster
+                        // clock centers (`0x539f3e..0x539f43`).
+                        Align::CenterTrunc => x + (width - w) / 2,
                         Align::Right => x + width - w,
                     };
                     let x = x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
@@ -1803,6 +1884,7 @@ impl Item {
             || !matches!(
                 self.kind,
                 Kind::Text { .. }
+                    | Kind::Friends(_)
                     | Kind::Bars { .. }
                     | Kind::Meter(_)
                     | Kind::Name { .. }
@@ -3198,5 +3280,203 @@ mod tests {
                 &[i32::MAX; 6],
             );
         }
+    }
+
+    #[test]
+    fn the_cluster_clock_friends_help_and_paused_speed_follow_the_original() {
+        let mut s = snapshot();
+        s.hour = 8;
+        s.minute = 16;
+        s.paused = true;
+        s.family_friends = 12;
+        let controls = Controls {
+            speed: Some(Speed::Fast),
+            ..Controls::default()
+        };
+        let items = layout([800, 600], &s, &controls);
+        let cy = 600 - CLUSTER[1];
+
+        // Clock box at (95, 118, 56, 14) with signed-truncation centering.
+        let clock = items
+            .iter()
+            .find(|i| matches!(&i.kind, Kind::Text { text, .. } if text == "AM  8:16"))
+            .expect("the clock item");
+        assert_eq!(clock.rect, Rect::new(95, cy + 118, 56, 14));
+        assert!(matches!(
+            clock.kind,
+            Kind::Text {
+                size: 8,
+                align: Align::CenterTrunc,
+                ..
+            }
+        ));
+
+        // Help button at (5, 164, 10, 15) uses enabled cell 0 and does not click.
+        let help = items
+            .iter()
+            .find(|i| matches!(i.kind, Kind::Cell { id: id::HELP, .. }))
+            .expect("the help button");
+        assert_eq!(help.rect, Rect::new(5, cy + 164, 10, 15));
+        assert_eq!(
+            help.kind,
+            Kind::Cell {
+                id: id::HELP,
+                cells: 4,
+                cell: 0
+            }
+        );
+        assert_eq!(help.command, None);
+        assert_eq!(press(&items, [8, cy + 170]), None);
+
+        // Speed button stays selected while paused (0x53b0d8..0x53b16b).
+        let fast = items
+            .iter()
+            .find(|i| matches!(i.kind, Kind::Button { id: id::FAST, .. }))
+            .expect("the fast speed button");
+        assert!(matches!(fast.kind, Kind::Button { selected: true, .. }));
+        let pause = items
+            .iter()
+            .find(|i| matches!(i.kind, Kind::Pause { .. }))
+            .expect("the pause button");
+        assert_eq!(pause.kind, Kind::Pause { paused: true });
+
+        // speed_for reads idle return speed (global 18 >= 0) first, else active
+        // speed (global 16), ignoring pause (global 17); unknown speed -> None.
+        let mut world = sims_sim::World::empty();
+        world.globals.resize(19, 0);
+        world.globals[16] = sims_sim::speed::FAST;
+        world.globals[17] = 1;
+        world.globals[18] = -1;
+        assert_eq!(speed_for(&world), Some(Speed::Fast));
+        world.globals[16] = sims_sim::speed::IDLE;
+        world.globals[18] = sims_sim::speed::ULTRA;
+        assert_eq!(speed_for(&world), Some(Speed::Ultra));
+        world.globals[16] = sims_sim::speed::IDLE;
+        world.globals[18] = -1;
+        assert_eq!(speed_for(&world), None);
+        let no_speed = Controls {
+            speed: None,
+            ..Controls::default()
+        };
+        let none_items = layout([800, 600], &s, &no_speed);
+        assert!(
+            !none_items.iter().any(|i| matches!(
+                i.kind,
+                Kind::Button {
+                    id: id::NORMAL | id::FAST | id::ULTRA,
+                    selected: true,
+                    ..
+                }
+            )),
+            "unrecognized speed should select no speed button"
+        );
+
+        // Family friends count is right-aligned immediately left of `$9,999,999`
+        // ending at x = 178, y = 158, and lets presses pass through to buttons
+        // underneath (such as Zoom Out at (26, 149, 27, 27)).
+        let friends = items
+            .iter()
+            .find(|i| matches!(i.kind, Kind::Friends(_)))
+            .expect("the friends counter");
+        assert_eq!(friends.rect, Rect::new(0, cy + 158, 178, 16));
+        assert_eq!(friends.kind, Kind::Friends(12));
+        let mut zoom_controls = controls;
+        zoom_controls.camera.zoom_out = true;
+        let zoom_items = layout([800, 600], &s, &zoom_controls);
+        assert_eq!(
+            press(&zoom_items, [35, cy + 165]),
+            Some(Command::Camera(Camera::ZoomOut))
+        );
+
+        // Drawing checks: CenterTrunc puts odd slack on the right (unlike Center),
+        // Friends draws right-aligned to `178 - width("$9,999,999")`, and Help draws cell 0.
+        let mut art = Art::default();
+        let font = crate::font::tests::font(); // A=3 (2x2 at bearing_x=1), B=1 (1x1)
+        art.insert_font(8, font.clone());
+        art.insert_font(10, font.clone());
+        let mut help_strip = Image {
+            width: 40,
+            height: 15,
+            rgba: Vec::new(),
+        };
+        for _y in 0..15u32 {
+            for x in 0..40u32 {
+                let cell = (x / 10) as u8;
+                help_strip.rgba.extend_from_slice(&[cell + 1, 9, 9, 255]);
+            }
+        }
+        art.insert(id::HELP, help_strip);
+
+        let mut frame = Frame::new(220, 183, [0; 3]);
+        // CenterTrunc on width 56 with width-1 "B": (56 - 1) / 2 = 27 (vs 28 for Center).
+        let synthetic = [
+            Item {
+                rect: Rect::new(95, 118, 56, 14),
+                kind: Kind::Text {
+                    text: "B".into(),
+                    size: 8,
+                    rgb: GREEN,
+                    align: Align::CenterTrunc,
+                },
+                command: None,
+            },
+            Item {
+                rect: Rect::new(5, 164, 10, 15),
+                kind: Kind::Cell {
+                    id: id::HELP,
+                    cells: 4,
+                    cell: 0,
+                },
+                command: None,
+            },
+        ];
+        draw(&mut frame, &art, &Faces::default(), &synthetic, &controls);
+        // `B` lands at x = 95 + 27 = 122, y = 118 + 1 (shifted down by A's -1 bearing).
+        assert_eq!(frame.pixel(122, 119), Some(GREEN));
+        assert_eq!(frame.pixel(123, 119), Some([0; 3]));
+        // Help cell 0 is [1, 9, 9], not disabled cell 3 [4, 9, 9].
+        assert_eq!(frame.pixel(5, 164), Some([1, 9, 9]));
+        assert_eq!(frame.pixel(14, 178), Some([1, 9, 9]));
+
+        // Friends with a font that has digits and `$` / `,` (each 5px wide):
+        // "$9,999,999" is 10 * 5 = 50px, so right edge is 178 - 50 = 128;
+        // "12" is 10px wide, so it starts at x = 118.
+        let mut glyphs = Vec::new();
+        for (i, ch) in b"0123456789$,".iter().enumerate() {
+            glyphs.push(sims_formats::ffn::Glyph {
+                code: u16::from(*ch),
+                width: 5,
+                height: 2,
+                atlas_x: (i as u16) * 5,
+                atlas_y: 0,
+                first_bearing: 0,
+                bearing_x: 0,
+                bearing_y: 0,
+            });
+        }
+        let digit_font = Font::new(sims_formats::ffn::Font {
+            flags: 9,
+            glyphs,
+            width: 60,
+            height: 2,
+            coverage: vec![15; 120],
+        });
+        art.insert_font(10, digit_font);
+        let mut frame = Frame::new(220, 183, [0; 3]);
+        draw(
+            &mut frame,
+            &art,
+            &Faces::default(),
+            &[Item {
+                rect: Rect::new(0, 158, 178, 16),
+                kind: Kind::Friends(12),
+                command: None,
+            }],
+            &controls,
+        );
+        assert_eq!(frame.pixel(117, 158), Some([0; 3]));
+        assert_eq!(frame.pixel(118, 158), Some(GREEN));
+        assert_eq!(frame.pixel(127, 158), Some(GREEN));
+        assert_eq!(frame.pixel(128, 158), Some([0; 3]));
     }
 }

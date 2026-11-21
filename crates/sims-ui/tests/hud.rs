@@ -35,7 +35,7 @@ fn the_goths_panel_from_the_original_art() {
     assert_eq!(s.selected, Some(21));
     assert_eq!(
         (s.clock().as_str(), s.money().as_str()),
-        ("AM 6:30", "$2,542")
+        ("AM  6:30", "$2,542")
     );
     for r in &s.residents {
         let face = opened.faces.face(r.guid).expect("a face");
@@ -71,15 +71,15 @@ fn the_goths_panel_from_the_original_art() {
     let expected = [
         (
             "closed 800x600",
-            "dddb9a34934307b37843f418a06a08ac6c072fd0877bbacea83ce3190b5ec338",
+            "b1bc43432952bb7f94824e35de94f403a264990302c44589ac626558689eec71",
         ),
         (
             "open 800x600",
-            "bf2b42823851f214c8673a7f05468d22bedf28cf808911288ce8a60dee588fb8",
+            "3829280fd7136e5abc9d561e63fdec9aa38a28dec6ae0b3a72cbd3434b898f1a",
         ),
         (
             "open 1280x720",
-            "ad37fea8d004eda2bcfc8c9f2b28418eae06a22bfbab96d11853bd254dd3dee3",
+            "88a916a28ceae6f35248f44bc949d13006c5f7721e6a810c21a0754791e9c09d",
         ),
     ];
     let digests: Vec<(&str, &str)> = digests.iter().map(|(n, d)| (*n, d.as_str())).collect();
@@ -139,7 +139,7 @@ fn the_goths_personality_panel() {
     // screen (see docs/decisions/).
     assert_eq!(
         digest(&frame),
-        "2414e88dac8a620c6185b589d9bfa479073f314686f4c607bc6cbd09379ce669"
+        "ddc5cef05deafc9f9d7b56a0ea0dc55519f7197ef960c60840c3888d69fd000f"
     );
 }
 
@@ -184,7 +184,7 @@ fn the_goths_sign_balloon() {
     );
     assert_eq!(
         digest(&frame),
-        "e76b2e5deafb40d16fae70da6b664f3383fdc6693d8d70a3404506d6729cb0b3"
+        "ab457a389a9d7411856cd4aa7c3a3f924f4bbc43d88c1a6bb40985a85afbfad8"
     );
 }
 
@@ -255,7 +255,7 @@ fn the_goths_job_panel() {
     // screen (see docs/decisions/).
     assert_eq!(
         draw(&opened.snapshot),
-        "2cafffacb29e6f322fbe86b6257545d9e4c417eee6afb384b18adfd03b4f3edf"
+        "2933c5ccdbddd5c2e14db77125169b9ea324cc01e1cb8ad675aa50877f79413e"
     );
     // A level up the ladder, "Field Researcher" at $320: the next level,
     // "Science Teacher", needs a point of Charisma, three of Logic, which
@@ -275,7 +275,7 @@ fn the_goths_job_panel() {
     );
     assert_eq!(
         draw(&snapshot),
-        "d0ad6b0746169b1864e3351448cef65a4d7d7f6b8cfd83263df7d255cf86dc6a"
+        "95900f89b384d95110bddbed3482325f87c0f68580660f1c03c42e34ce8f41c2"
     );
     // Titles wider than the column break as the original's do: after a
     // hyphen or a space, and both lines start above the box's bottom.
@@ -295,7 +295,7 @@ fn the_goths_job_panel() {
     }
     assert_eq!(
         draw(&snapshot),
-        "49147ac862b847e2f8c06ede08f7f98f45b3fba31a8600ac9489926dc2ff1716"
+        "d8835a991f6c3d51fab6da35e8f4619a93b0731c272d06567516ce8595a5a4f9"
     );
 }
 
@@ -347,7 +347,7 @@ fn the_goths_relationship_panel() {
     // screen (see docs/decisions/).
     assert_eq!(
         digest(&frame),
-        "24af5346170f6ff5a621af7725e99d1b6c03b15c8b1ae61d5b1cbd65e52c90d9"
+        "f33c3a0c53302ab56f0818d272dd97fa596a5b97054337edd1173fe238c0aea1"
     );
 }
 
@@ -439,6 +439,6 @@ fn the_goths_house_panel() {
     // screen (see docs/decisions/).
     assert_eq!(
         digest(&frame),
-        "669ee756a9f2db4a3fdea9cfa89eb3a8a85945b7841f3e6f2d320995c1d35b4e"
+        "2cd4d2e1ac37fb40b11fbc8971d8ed8bf7f9154c68f02ac5402ab3e454b3ed5a"
     );
 }

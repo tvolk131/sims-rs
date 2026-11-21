@@ -44,7 +44,20 @@
 //! searches first replaces a `(1, 1)` start with a random fine point or
 //! moves any other start by random tile offsets.
 //!
-//! Mode 2 (in front of the object) fails loudly.
+//! Mode 2 (in front of the object, 0x44b484 to 0x44b503 and 0x44b70d):
+//! puts the stack object at the reference object's exact position and
+//! level (the local object if flag bit 0 is set, otherwise `self.me`),
+//! after turning it by `((((ref_facing + 5) % 8) - target_facing + 8) % 8) / 2`
+//! steps through virtual function 0x4c ([`crate::Interpreter::turn_group`]
+//! for a multi-tile group, [`crate::Interpreter::turn_one`] otherwise; for
+//! standard even facings with turn step 2, this faces opposite the
+//! reference). The reference's two horizontal coordinates are noted first,
+//! then the turn runs, then the reference's level is read for the place
+//! test (virtual function 0x54): if it refuses, the false branch is taken
+//! and the turn stays. Otherwise the reference's level is read again, the
+//! object is put there with the lot told (virtual function 0x58), and the
+//! true branch is taken without running virtual function 0x74. Flag bits
+//! 1 and 2 are ignored and no random numbers are drawn.
 
 use crate::factory::word::{GRAPHICS, GROUP};
 use crate::fault::Trap;
@@ -67,6 +80,7 @@ impl Machine<'_, '_> {
         ))?;
         let mut from = [16, 16];
         let mut level = 1;
+        let mut reference = None;
         if flags & 1 != 0 {
             let frame = self.frame()?;
             if local >= frame.locals.len() {
@@ -76,13 +90,14 @@ impl Machine<'_, '_> {
                 ));
             }
             self.check_local(local)?;
-            let reference = object(self.frame()?.locals[local]).ok_or(Trap::native(
+            let r = object(self.frame()?.locals[local]).ok_or(Trap::native(
                 0x17,
                 "Find Location For has no object to search from",
             ))?;
-            let p = self.world.objects[&reference].position;
+            let p = self.world.objects[&r].position;
             from = [p[0], p[1]];
             level = p[2];
+            reference = Some(r);
         }
         if mode == 1 {
             let me = self.me;
@@ -119,9 +134,7 @@ impl Machine<'_, '_> {
             return self.find_in_line(target, mode, flags, local, from, level, rules);
         }
         if mode == 2 {
-            return Err(Trap::Unsupported(format!(
-                "Find Location For mode {mode} is not ported"
-            )));
+            return self.find_in_front(target, reference);
         }
         // Mode 5 differs from mode 0 only in the search record's byte 0x17
         // (0x44b5a5), so each search draws its own start from the same
@@ -331,6 +344,79 @@ impl Machine<'_, '_> {
                 true,
             )
             .map_err(unsupported)?;
+        Ok(true)
+    }
+
+    /// Mode 2 (0x44b484 to 0x44b503, 0x44b70d): turn the stack object by
+    /// `((((ref_facing + 5) % 8) - target_facing + 8) % 8) / 2` steps and
+    /// place it at the reference object's position and level (the local
+    /// object if flag bit 0 was set, else `self.me`) without searching.
+    fn find_in_front(&mut self, target: u16, reference: Option<u16>) -> Result<bool, Trap> {
+        let me = self.me;
+        let reference = reference.unwrap_or(me);
+        let ref_object = self
+            .world
+            .objects
+            .get(&reference)
+            .ok_or_else(|| Trap::Invalid(format!("missing object {reference}")))?;
+        let position = [ref_object.position[0], ref_object.position[1]];
+        let ref_facing = i32::from(ref_object.data[1]);
+        let target_object = &self.world.objects[&target];
+        let target_facing = i32::from(target_object.data[1]);
+        let delta = (((ref_facing + 5) % 8) - target_facing + 8) % 8;
+        let steps = delta / 2;
+        let multipart = target_object.multipart.is_some();
+
+        let interpreter = self.interpreter();
+        if multipart {
+            interpreter
+                .turn_group(self.world, target, steps)
+                .map_err(|fault| fault.nested(me))?;
+        } else {
+            interpreter
+                .turn_one(self.world, target, steps)
+                .map_err(|fault| fault.nested(me))?;
+        }
+        let level = self
+            .world
+            .objects
+            .get(&reference)
+            .ok_or_else(|| {
+                Trap::Unsupported(format!(
+                    "Find Location For mode 2 removed reference object {reference} while turning {target}"
+                ))
+            })?
+            .position[2];
+        if !interpreter
+            .fits(self.world, target, position, level)
+            .map_err(|fault| fault.nested(me))?
+        {
+            return Ok(false);
+        }
+        let level = self
+            .world
+            .objects
+            .get(&reference)
+            .ok_or_else(|| {
+                Trap::Unsupported(format!(
+                    "Find Location For mode 2 removed reference object {reference} while testing {target}"
+                ))
+            })?
+            .position[2];
+        interpreter
+            .put(
+                self.world,
+                target,
+                Place {
+                    on_lot: on_lot(position),
+                    position,
+                    container: None,
+                    slot: -1,
+                    level,
+                },
+                true,
+            )
+            .map_err(|fault| fault.nested(me))?;
         Ok(true)
     }
 }
