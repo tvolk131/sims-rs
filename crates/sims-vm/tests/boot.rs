@@ -78,44 +78,35 @@ const TICK_1103_24: &str = "29bcebd6b87a9b15b737861bf8b4f7ebe13a6f2307607f4b1893
 
 /// The tile the Goth day's boots give for the house view's centre
 /// ([`Lot::load_viewed`], [`Lot::set_view_centre`]): the lot's middle tile. It is a stand-in
-/// start tile, not the original's camera. From every start that finds a
-/// tile the day goes on the same ([`every_start_gives_one_state`]); four
-/// starts find none, and the recording does not rule them out: the cat's
-/// type has image 2002 (`BMP_` 2002 in `User00036.iff`), so a start that
-/// finds no tile also makes the cat once (1,920 draws) and does not build
-/// again (0x4e9706, 0x4e938c). That branch is not ported and stops loudly.
+/// start tile, not the original's camera. Every start — including the four
+/// no-room starts (`19,24`, `23,31`, `26,28`, `26,31`), which remove the cat
+/// unput (`0x4e9706`) and fall back to `BMP_` 2002 (`0x4e9260`, no second
+/// build at `0x4e938c`) — as well as `view_centre = None` reaches the exact
+/// same state ([`every_start_gives_one_state`]).
 /// Which camera the original opens the Goths' house with is not traced.
 const GOTH_VIEW_CENTRE: [i8; 2] = [32, 32];
 
 /// Steps `lot` once from every tile the portrait's search may start from
-/// (inside the lot's border), each from the same save, and checks that
-/// the starts that find a tile all reach one state and that the rest are
-/// exactly `no_tile`, each stopping where the original would remove the
-/// person unput (0x4e9706). The lot is left as it was, with its view centre.
-fn every_start_gives_one_state(lot: &mut Lot, no_tile: &[[i8; 2]]) {
+/// (inside the lot's border) and from `view_centre = None`, each from the
+/// same save, and checks that all of them succeed and reach one state hash.
+/// The lot is left as it was, with its view centre.
+fn every_start_gives_one_state(lot: &mut Lot) {
     let saved = lot.save().unwrap();
     let centre = lot.view_centre();
     let size = lot.world().size as i8;
     let mut states = BTreeMap::new();
-    let mut stopped = Vec::new();
     for x in 1..size - 1 {
         for y in 1..size - 1 {
             lot.restore(saved.clone()).unwrap();
             lot.set_view_centre(Some([x, y]));
-            match lot.step() {
-                Ok(_) => *states.entry(lot.world().hash_hex()).or_insert(0) += 1,
-                Err(error) => {
-                    let error = error.to_string();
-                    assert!(
-                        error.contains(&format!("from the view centre {x},{y} no tile is found")),
-                        "{x},{y}: {error}"
-                    );
-                    stopped.push([x, y]);
-                }
-            }
+            lot.step().unwrap_or_else(|e| panic!("{x},{y}: {e}"));
+            *states.entry(lot.world().hash_hex()).or_insert(0) += 1;
         }
     }
-    assert_eq!(stopped, no_tile);
+    lot.restore(saved.clone()).unwrap();
+    lot.set_view_centre(None);
+    lot.step().unwrap_or_else(|e| panic!("None: {e}"));
+    *states.entry(lot.world().hash_hex()).or_insert(0) += 1;
     assert_eq!(states.len(), 1, "{states:?}");
     lot.restore(saved).unwrap();
     lot.set_view_centre(centre);
@@ -1707,10 +1698,10 @@ fn the_goth_day_under_the_recordings_frames_keeps_its_streams() {
     for (at, lot_rng, crt) in recorded {
         while tick < at {
             if tick == 24718 {
-                // The portrait's search at 24719 finds no tile from these
-                // four starts, each in room -5 (none), and from every other
-                // the day goes on the same.
-                every_start_gives_one_state(&mut lot, &[[19, 24], [23, 31], [26, 28], [26, 31]]);
+                // At 24719 every start — including the four no-room tiles
+                // (19,24; 23,31; 26,28; 26,31) via 0x4e9706 + BMP_ 2002 —
+                // and view_centre = None all reach the exact same state.
+                every_start_gives_one_state(&mut lot);
             }
             lot.step().unwrap();
             tick += 1;

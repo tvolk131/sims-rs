@@ -160,6 +160,13 @@ fn near(camera: &Camera, at: [i32; 2]) -> bool {
     })
 }
 
+/// The view-rotated fine ground position (sixteenths of a tile) under the
+/// centre of a house view of `size` pixels (0x4a7b58 → 0x4a97c3 with flag
+/// one, 0x4a99f9, 0x4a955d). None if the centre is far off the lot.
+pub fn screen_centre_pick(lot: &Lot, camera: &Camera, size: [i32; 2]) -> Option<[i32; 2]> {
+    View::new(lot, camera).fine([size[0] / 2, size[1] / 2])
+}
+
 /// The room of a whole tile, as 0x4899d5 gives it: none for a tile a
 /// diagonal wall splits.
 fn room_of(lot: &Lot, level: usize, [x, y]: [i32; 2]) -> Option<i16> {
@@ -1044,5 +1051,42 @@ mod tests {
                 view.fine([x, y]);
             }
         }
+    }
+
+    #[test]
+    fn screen_centre_pick_returns_the_view_rotated_fine_point_at_half_size() {
+        let mut lot = house();
+        for rotation in 0..4 {
+            for zoom in Zoom::ALL {
+                let mut c = Camera {
+                    zoom,
+                    rotation,
+                    level: 1,
+                    origin: [0, 0],
+                    walls: Walls::Cutaway,
+                    focus: Focus::default(),
+                };
+                // Centre the camera on tile (10, 12)'s middle in lot coords.
+                let fine = [10 * 16 + 8, 12 * 16 + 8];
+                let size = [801, 601];
+                c.center_on(fine, [size[0] / 2, size[1] / 2]);
+                let picked = screen_centre_pick(&lot, &c, size).expect("in-bounds centre");
+                let expected_tile = c.rotate_tile([10, 12]);
+                assert_eq!(
+                    picked.map(|n| n >> 4),
+                    expected_tile,
+                    "rot {rotation} zoom {zoom:?}"
+                );
+            }
+        }
+        // Raised terrain lifts the tile on screen, so the pick accounts for it.
+        let mut c = camera(0);
+        lot.heights[Lot::cell(10, 12)] = [12, 12, 12, 12];
+        let raised = c.project([10, 12], 1, 12);
+        let size = [800, 600];
+        c.origin[0] += size[0] / 2 - raised[0];
+        c.origin[1] += size[1] / 2 - (raised[1] + c.zoom.tile_height() / 2);
+        let picked = screen_centre_pick(&lot, &c, size).expect("raised tile");
+        assert_eq!(picked.map(|n| n >> 4), [10, 12]);
     }
 }

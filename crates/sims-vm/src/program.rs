@@ -90,7 +90,15 @@ pub struct Library {
     /// Sound Event plays (0x582c57). The name is the chunk's bytes up to
     /// the first zero, read as Latin-1.
     pub sounds: BTreeMap<u16, String>,
+    /// Whether the file holds a decodable `BMP_` 2002 ("faces") resource
+    /// (`0x4e9260` → `0x5a5752` → `0x4dece6`): when a dialog's portrait
+    /// build finds no tile (`0x4e9706`), `0x4e92a8` falls back to this
+    /// bitmap instead of calling `0x4e8c5d` again (`0x4e938c`).
+    pub has_portrait_bitmap: bool,
 }
+
+/// The `BMP_` chunk ID of a person file's portrait faces (`0x4e9260`).
+const PORTRAIT_BITMAP: u16 = 2002;
 
 /// The string table Run Tree By Name instructions name their trees in.
 pub const TREE_NAMES: u16 = 303;
@@ -337,6 +345,9 @@ impl Program {
                 _ => {}
             }
         }
+        library.has_portrait_bitmap = iff
+            .get(b"BMP_", PORTRAIT_BITMAP)
+            .is_some_and(|chunk| sims_formats::bitmap::bmp(iff.data(chunk)).is_ok());
         // The string tables as the original's loader finds them.
         let ids: BTreeSet<u16> = iff
             .chunks

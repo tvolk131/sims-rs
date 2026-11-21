@@ -374,15 +374,25 @@ impl Machine<'_, '_> {
     /// the family's portraits too, so a family member's type with nobody
     /// on the lot fails loudly.
     ///
-    /// The put is [`crate::Interpreter::portrait_put`]: the search from the
-    /// house view's centre (an input, [`crate::Interpreter::view_centre`])
-    /// and as much of the put as is the same on every tile it may end on.
-    /// It fails loudly where the tile would matter, including when no tile
-    /// is found: the original then removes the person without drawing it
-    /// (0x4e9706), the entry stays without its image, and 0x4e938c builds
-    /// it again in the same dialog unless the type has image 2002, which is
-    /// not ported. The rest of the put (the rooms, 0x440385, and the tiles,
-    /// 0x4330d7) is taken to be undone by the removal: **unverified**.
+    /// The search and put are [`crate::Interpreter::portrait_search`] and
+    /// [`crate::Interpreter::portrait_place`]: the search from the house
+    /// view's centre pick (an input, [`crate::Interpreter::view_centre`],
+    /// bounds-checked and un-rotated as in `0x434891` and `0x43491c`) and
+    /// as much of the put as is the same on every tile it may end on. When
+    /// no tile is found (`0x4e9706`), the original removes the person unput
+    /// (`0x44123f`, skipping virtual function 0x88) and `0x4e92a8` then
+    /// checks for `BMP_` 2002 in the person's file (`0x4e9260`,
+    /// `Library::has_portrait_bitmap`): with `BMP_` 2002 it populates the
+    /// portrait entry from that bitmap (`0x4e9338` to `0x4e937e`, no second
+    /// build at `0x4e938c`); without `BMP_` 2002 `0x4e938c` calls
+    /// `0x4e8c5d` again (a second build if slot 1's dirty flag `+0x18` was
+    /// set, or the first if clear), which is not ported and fails loudly
+    /// since slot 1's dirty flag is not tracked separately from
+    /// [`sims_sim::World::portraits`]. When no view centre is given and some
+    /// starts find a tile while others find none, both branches are run when
+    /// the type has `BMP_` 2002 and kept only if they leave the exact same
+    /// lot and cells. The rest of the put (the rooms, 0x440385, and the
+    /// tiles, 0x4330d7) is taken to be undone by the removal: **unverified**.
     pub(crate) fn dialog_portrait(&mut self, operands: &[u8; 8]) -> Result<(), Trap> {
         let stack_object = self.frame()?.stack_object;
         let mode = (operands[7] >> 1) & 7;
@@ -426,11 +436,23 @@ impl Machine<'_, '_> {
                      is not kept"
                 )));
             }
+            let has_bitmap = crate::interpreter::object_definition(self.catalog, self.world, guid)
+                .and_then(|entry| self.program.libraries.get(&entry.resource))
+                .is_some_and(|library| library.has_portrait_bitmap);
             let interpreter = self.interpreter();
             let unsupported = |fault| {
                 Trap::Unsupported(format!(
                     "making a person of type 0x{guid:08X} for a dialog's portrait (0x4e9652): \
                      {fault}"
+                ))
+            };
+            let no_tile_without_bitmap = |description: &str| {
+                Trap::Unsupported(format!(
+                    "a dialog's portrait puts a person on a tile searched for from the house \
+                     view's centre (0x4e96dd, 0x4347f0, 0x4a677c; `Lot::set_view_centre`), and \
+                     {description}: the original removes it unput (0x4e9706), and type \
+                     0x{guid:08X} has no BMP_ 2002 so 0x4e938c calls 0x4e8c5d again when slot \
+                     1 is marked dirty, which is not ported"
                 ))
             };
             // On a copy of the lot and of the machine's cells (the sounds
@@ -440,21 +462,86 @@ impl Machine<'_, '_> {
             // 0x4e8fdb, 0x4e9706).
             let mut copy = self.world.clone();
             let cells = crate::both_ways::Cells::of(&interpreter);
-            let built = cells.on(&interpreter);
-            let id = built.create_person(&mut copy, guid).map_err(unsupported)?;
-            built
-                .portrait_put(&mut copy, id)
-                .map_err(|fault| fault.trap)?;
-            built.remove_now(&mut copy, id).map_err(unsupported)?;
+            let search = {
+                let built = cells.on(&interpreter);
+                let id = built.create_person(&mut copy, guid).map_err(unsupported)?;
+                let found = built
+                    .portrait_search(&mut copy, id)
+                    .map_err(|fault| fault.trap)?;
+                (id, found)
+            };
+            let (id, found) = search;
+            let (final_world, final_cells) = match found {
+                crate::placement::PortraitSearch::Found(tiles) => {
+                    let built = cells.on(&interpreter);
+                    built
+                        .portrait_place(&mut copy, id, &tiles)
+                        .map_err(|fault| fault.trap)?;
+                    built.remove_now(&mut copy, id).map_err(unsupported)?;
+                    (copy, cells)
+                }
+                crate::placement::PortraitSearch::NotFound { description } => {
+                    if !has_bitmap {
+                        return Err(no_tile_without_bitmap(&description));
+                    }
+                    // 0x4e9706: remove unput (skipping virtual function 0x88),
+                    // then 0x4e9338 loads BMP_ 2002 into slot 1 so 0x4e938c
+                    // does not run.
+                    let built = cells.on(&interpreter);
+                    built.remove_now(&mut copy, id).map_err(unsupported)?;
+                    (copy, cells)
+                }
+                crate::placement::PortraitSearch::Mixed {
+                    found,
+                    no_tile_description,
+                } => {
+                    if !has_bitmap {
+                        return Err(no_tile_without_bitmap(&no_tile_description));
+                    }
+                    // Run both branches from the post-search state and keep
+                    // only if placing vs removing unput (0x4e9706) + BMP_ 2002
+                    // leave the exact same world and cells.
+                    let mut placed_world = copy.clone();
+                    let placed_cells = cells.copy();
+                    {
+                        let built = placed_cells.on(&interpreter);
+                        built
+                            .portrait_place(&mut placed_world, id, &found)
+                            .map_err(|fault| fault.trap)?;
+                        built
+                            .remove_now(&mut placed_world, id)
+                            .map_err(unsupported)?;
+                    }
+                    let mut unput_world = copy;
+                    let unput_cells = cells;
+                    {
+                        let built = unput_cells.on(&interpreter);
+                        built
+                            .remove_now(&mut unput_world, id)
+                            .map_err(unsupported)?;
+                    }
+                    if placed_world.encode() != unput_world.encode()
+                        || !placed_cells.same(&unput_cells)
+                    {
+                        return Err(Trap::Unsupported(format!(
+                            "a dialog's portrait puts a person on a tile searched for from the \
+                             house view's centre (0x4e96dd, 0x4347f0, 0x4a677c; \
+                             `Lot::set_view_centre`), and {no_tile_description}: placing the \
+                             person and removing it unput (0x4e9706) leave different lots"
+                        )));
+                    }
+                    (placed_world, placed_cells)
+                }
+            };
             // The refresh pending is the caller's to keep, and a build
             // that changed it is not ported.
-            if !cells.same_refresh(&crate::both_ways::Cells::of(&interpreter)) {
+            if !final_cells.same_refresh(&crate::both_ways::Cells::of(&interpreter)) {
                 return Err(Trap::Unsupported(format!(
                     "making a person of type 0x{guid:08X} for a dialog's portrait (0x4e9652) \
                      changed the refresh pending, which is not ported"
                 )));
             }
-            cells.keep(&interpreter, self.world, copy);
+            final_cells.keep(&interpreter, self.world, final_world);
         }
         self.world.portraits.insert(guid);
         Ok(())

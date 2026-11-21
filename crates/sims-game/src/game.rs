@@ -174,7 +174,7 @@ impl Game {
         people.refresh(lot.world());
         let view = View::new([800, 600], lot_shape.built_center(), lot.view_rotation());
         let drawn_camera = view.camera;
-        Ok(Self {
+        let mut game = Self {
             lot,
             lot_shape,
             assets: opened.assets,
@@ -198,7 +198,9 @@ impl Game {
             drawn_camera,
             lot_depth: Vec::new(),
             people_ids: sims_render::Ids::default(),
-        })
+        };
+        game.sync_view();
+        Ok(game)
     }
 
     /// The lot, for reading.
@@ -621,21 +623,32 @@ impl Game {
         &self.canvas
     }
 
+    /// Passes the house view's rotation and screen-centre pick (`0x4a7b58`
+    /// cut to a tile via `0x433067`) into the simulation.
+    fn sync_view(&mut self) {
+        self.lot.set_view_rotation(self.view.camera.rotation);
+        let centre =
+            sims_render::screen_centre_pick(&self.lot_shape, &self.view.camera, self.view.size)
+                .map(|[x, y]| [(x >> 4) as i8, (y >> 4) as i8]);
+        self.lot.set_view_centre(centre);
+    }
+
     /// Resizes the canvas to `size` of the original's pixels.
     pub fn resize(&mut self, size: [i32; 2]) -> bool {
         if size == self.view.size {
             return false;
         }
         self.view.resize(size);
+        self.sync_view();
         self.hud.resize_menu(size);
         true
     }
 
-    /// Moves the camera. A turn is the lot's input too: Generic Sims Call
-    /// 12 reads the view's rotation ([`Lot::set_view_rotation`]).
+    /// Moves the camera. The view's rotation and screen-centre pick are the
+    /// lot's inputs too ([`Lot::set_view_rotation`], [`Lot::set_view_centre`]).
     pub fn apply(&mut self, command: Move) -> bool {
         let moved = self.view.apply(command);
-        self.lot.set_view_rotation(self.view.camera.rotation);
+        self.sync_view();
         moved
     }
 
@@ -1172,7 +1185,9 @@ impl Game {
             self.centre_screen_point(at, view_size);
             return;
         }
-        self.view.apply(Move::Floor(level));
+        if self.view.apply(Move::Floor(level)) {
+            self.sync_view();
+        }
         if !self.on_lot(position) {
             return;
         }
@@ -1236,7 +1251,9 @@ impl Game {
         let native_x = target[0].max(min_x).min(max_x).wrapping_add(1) & !3;
         let clamped_x = native_x.saturating_sub(pick::ORIGIN_COLUMN);
         let clamped_y = target[1].max(min_y).min(max_y);
-        self.view.set_origin([clamped_x, clamped_y]);
+        if self.view.set_origin([clamped_x, clamped_y]) {
+            self.sync_view();
+        }
     }
 
     /// The lot as it stands, to go back to later ([`Game::restore`]).
@@ -1323,10 +1340,6 @@ impl Game {
     /// Carries out a panel command. `menu` is the pie menu that was open
     /// when it was pressed.
     fn command(&mut self, command: Command, menu: Option<&Menu>) -> Outcome {
-        let moved = |view: &mut View, m: Move| {
-            view.apply(m);
-            Outcome::redraw()
-        };
         match command {
             Command::SetSpeed(speed) => {
                 self.set_speed(speed);
@@ -1337,8 +1350,14 @@ impl Game {
                 Outcome::redraw()
             }
             Command::Camera(camera) => match camera {
-                UiCamera::ZoomIn => moved(&mut self.view, Move::ZoomIn),
-                UiCamera::ZoomOut => moved(&mut self.view, Move::ZoomOut),
+                UiCamera::ZoomIn => {
+                    self.apply(Move::ZoomIn);
+                    Outcome::redraw()
+                }
+                UiCamera::ZoomOut => {
+                    self.apply(Move::ZoomOut);
+                    Outcome::redraw()
+                }
                 // Which way the original turns for each is unverified.
                 UiCamera::RotateRight => {
                     self.apply(Move::Rotate(true));
@@ -1348,16 +1367,22 @@ impl Game {
                     self.apply(Move::Rotate(false));
                     Outcome::redraw()
                 }
-                UiCamera::FloorUp => moved(&mut self.view, Move::LevelUp),
-                UiCamera::FloorDown => moved(&mut self.view, Move::LevelDown),
-                UiCamera::Walls(w) => moved(
-                    &mut self.view,
-                    Move::Walls(match w {
+                UiCamera::FloorUp => {
+                    self.apply(Move::LevelUp);
+                    Outcome::redraw()
+                }
+                UiCamera::FloorDown => {
+                    self.apply(Move::LevelDown);
+                    Outcome::redraw()
+                }
+                UiCamera::Walls(w) => {
+                    self.apply(Move::Walls(match w {
                         UiWalls::Up => Walls::Up,
                         UiWalls::Cutaway => Walls::Cutaway,
                         UiWalls::Down => Walls::Down,
-                    }),
-                ),
+                    }));
+                    Outcome::redraw()
+                }
                 UiCamera::Photo => Outcome {
                     redraw: false,
                     photo: true,

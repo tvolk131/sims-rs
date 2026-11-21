@@ -344,11 +344,12 @@ fn a_portrait_searches_from_the_view_centre_when_it_is_given() {
         .unwrap_err()
         .to_string();
     assert!(fault.contains("0x468802"), "{fault}");
-    // From a centre outdoors the search ends outdoors, in the start's
-    // room, wherever outdoors it starts (a start outside the border is
-    // taken inside it), and the lot ends the same.
+    // From an in-bounds centre outdoors the search ends outdoors, in the
+    // start's room, and the lot ends the same. An out-of-bounds pick like
+    // [0, 0] or [2, 60] falls back to the lot midpoint [3, 3] (0x434891),
+    // which is indoors and fails on note_room.
     let mut ends = Vec::new();
-    for centre in [[1, 1], [2, 4], [0, 0], [2, 60]] {
+    for centre in [[1, 1], [2, 4]] {
         let (mut fx, _, record) = visitors();
         rooms(&mut fx);
         assert_eq!(inform_from(&mut fx, 2, record, Some(centre)), Ok(true));
@@ -356,21 +357,24 @@ fn a_portrait_searches_from_the_view_centre_when_it_is_given() {
         ends.push(hash_without_frames(&fx.world));
     }
     assert!(ends.windows(2).all(|w| w[0] == w[1]));
-    // From a centre indoors it ends indoors.
-    let (mut fx, _, record) = visitors();
-    rooms(&mut fx);
-    let fault = inform_from(&mut fx, 2, record, Some([4, 2]))
-        .unwrap_err()
-        .to_string();
-    assert!(fault.contains("0x468802"), "{fault}");
-    // From a centre no tile is found from, it fails.
+    for centre in [[0, 0], [2, 60], [4, 2]] {
+        let (mut fx, _, record) = visitors();
+        rooms(&mut fx);
+        let fault = inform_from(&mut fx, 2, record, Some(centre))
+            .unwrap_err()
+            .to_string();
+        assert!(fault.contains("0x468802"), "{centre:?}: {fault}");
+    }
+    // From a centre no tile is found from, a type without BMP_ 2002 fails.
     let (mut fx, _, record) = visitors();
     fx.world.size = 2;
     let fault = inform_from(&mut fx, 2, record, Some([7, 7]))
         .unwrap_err()
         .to_string();
     assert!(
-        fault.contains("from the view centre 7,7 no tile is found") && fault.contains("0x4e9706"),
+        fault.contains("from the view centre 7,7 no tile is found")
+            && fault.contains("0x4e9706")
+            && fault.contains("0x4e938c"),
         "{fault}"
     );
 }
@@ -1684,6 +1688,160 @@ fn a_neighbor_local_the_original_left_unknown_fails_loudly() {
         .to_string();
     assert!(
         fault.contains("0x44c5f4") && fault.contains("half of a pointer"),
+        "{fault}"
+    );
+}
+
+#[test]
+fn a_portrait_view_centre_pick_is_bounds_checked_and_unrotated() {
+    // On a 6-tile lot, tiles with x < 3 are outdoors (room 2) and x >= 3
+    // are indoors (room 1). At view rotation 1, lot tile (x, y) rotates to
+    // (63 - y, x) so the rotated interior is [59..=62, 1..=4].
+    // View-rotated pick [60, 2] un-rotates to lot tile (2, 3) (outdoors -> Ok).
+    // View-rotated pick [60, 4] un-rotates to lot tile (4, 3) (indoors -> fails).
+    // Out-of-bounds pick [2, 2] falls back to rotated midpoint (61, 3), which
+    // un-rotates to lot tile (3, 2) (indoors -> fails).
+    for (rot, pick, should_pass) in [
+        (1u8, [60i8, 2], true),
+        (1, [60, 4], false),
+        (1, [2, 2], false),
+        (3, [2, 60], false), // un-rotates to (3, 2), indoors
+        (3, [2, 61], true),  // un-rotates to (2, 2), outdoors
+        (3, [2, 2], true),   // out-of-bounds fallback (3, 61) -> un-rotates to (2, 3), outdoors
+    ] {
+        let (mut fx, _, record) = visitors();
+        indoors_and_out(&mut fx);
+        fx.add(
+            LAMP_FILE,
+            4096,
+            tree(vec![ins(
+                DIALOG,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [0, 0, 0, 0, 0, 0, 0, 1 | (2 << 1)],
+            )]),
+        );
+        let mut interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        interpreter.view_rotation = rot;
+        interpreter.view_centre = Some(pick);
+        let res = interpreter.run_tree(&mut fx.world, LAMP, 4096, record, &[], 1000);
+        if should_pass {
+            assert_eq!(res, Ok(true), "rot {rot} pick {pick:?}");
+        } else {
+            let fault = res.unwrap_err().to_string();
+            assert!(
+                fault.contains("0x468802"),
+                "rot {rot} pick {pick:?}: {fault}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_portrait_with_bmp_2002_removes_unput_when_no_tile_is_found() {
+    // When no tile is found (0x4e9706) and the type has BMP_ 2002 (0x4e9260),
+    // the original removes the person unput (skipping virtual function 0x88
+    // and placed_from_outside), loads BMP_ 2002 into slot 1, and does not
+    // call 0x4e8c5d again (0x4e938c) or on later dialogs.
+    let (mut fx, widget_file, record) = visitors();
+    fx.world.size = 2;
+    // Even without indicators and with function 9 set to trap, the unput path
+    // never calls virtual function 0x88, so it succeeds when BMP_ 2002 is present.
+    fx.world.indicators = [0, 0];
+    crate::visits::function(&mut fx, widget_file, 9, 4098);
+    fx.add(
+        widget_file,
+        4098,
+        tree(vec![ins(254, RETURN_TRUE, ERROR, [0; 8])]),
+    );
+    fx.program
+        .libraries
+        .get_mut(&widget_file)
+        .unwrap()
+        .sounds
+        .insert(5, "init_ping".into());
+    fx.add(
+        widget_file,
+        4096,
+        tree(vec![ins(23, RETURN_TRUE, ERROR, [5, 0, 0, 0, 0, 0, 0, 0])]),
+    );
+    fx.program
+        .libraries
+        .get_mut(&widget_file)
+        .unwrap()
+        .has_portrait_bitmap = true;
+
+    let people_before = fx.world.people.clone();
+    let objects_before = fx.world.objects.len();
+    let sounds = std::cell::RefCell::new(Vec::new());
+    assert_eq!(
+        inform_hearing(&mut fx, 2, record, Some([1, 1]), &sounds),
+        Ok(true)
+    );
+    assert_eq!(fx.world.portraits, [WIDGET].into());
+    assert_eq!(fx.world.people, people_before);
+    assert_eq!(fx.world.objects.len(), objects_before);
+    let pings = || {
+        sounds
+            .borrow()
+            .iter()
+            .filter(|e| matches!(e, sims_vm::SoundEvent::Play { name, .. } if name == "init_ping"))
+            .count()
+    };
+    // One build (create_person + delete's reset each run Init once = 2 pings;
+    // a second build at 0x4e938c would have produced 4).
+    assert_eq!(pings(), 2);
+    // A second dialog hits World::portraits and does not rebuild.
+    assert_eq!(
+        inform_hearing(&mut fx, 2, record, Some([1, 1]), &sounds),
+        Ok(true)
+    );
+    assert_eq!(pings(), 2);
+}
+
+#[test]
+fn a_portrait_with_mixed_starts_and_bmp_2002_succeeds_only_when_branches_agree() {
+    // Make tile (1, 1) its own unreachable room (room 9) full of a solid
+    // object so starting at (1, 1) finds no tile while all other starts
+    // land in room 1. With BMP_ 2002 and no difference between placing and
+    // removing unput, view_centre = None succeeds; when indicators are
+    // missing (so placing fails / diverges), it fails loudly.
+    let setup = |indicators: [u16; 2]| {
+        let (mut fx, widget_file, record) = visitors();
+        fx.world.indicators = indicators;
+        fx.program
+            .libraries
+            .get_mut(&widget_file)
+            .unwrap()
+            .has_portrait_bitmap = true;
+        // Put room 9 on tile (1, 1) and occupy tile (1, 1) in the object grid.
+        fx.world.rooms.map[0][64 + 1] = 9;
+        let grid = &mut fx.world.arrays.get_mut(&3).unwrap().data;
+        grid[(64 + 1) * 2..((64 + 1) * 2 + 2)].copy_from_slice(&(LAMP as i16).to_le_bytes());
+        (fx, record)
+    };
+    let (mut fx_ok, record) = setup([99, 0]);
+    assert_eq!(inform_from(&mut fx_ok, 2, record, None), Ok(true));
+    assert_eq!(fx_ok.world.portraits, [WIDGET].into());
+
+    // Without indicators, the placed branch fails loudly on missing indicators.
+    let (mut fx_no_ind, record) = setup([0, 0]);
+    let fault = inform_from(&mut fx_no_ind, 2, record, None)
+        .unwrap_err()
+        .to_string();
+    assert!(fault.contains("0x445e4a"), "{fault}");
+
+    // Without BMP_ 2002, mixed starts fail loudly on 0x4e9706 / 0x4e938c.
+    let (mut fx_no_bmp, widget_file, record) = visitors();
+    fx_no_bmp.world.rooms.map[0][64 + 1] = 9;
+    let grid = &mut fx_no_bmp.world.arrays.get_mut(&3).unwrap().data;
+    grid[(64 + 1) * 2..((64 + 1) * 2 + 2)].copy_from_slice(&(LAMP as i16).to_le_bytes());
+    let _ = widget_file;
+    let fault = inform_from(&mut fx_no_bmp, 2, record, None)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        fault.contains("0x4e9706") && fault.contains("0x4e938c"),
         "{fault}"
     );
 }

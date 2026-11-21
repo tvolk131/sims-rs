@@ -27,7 +27,7 @@ pub mod shadows;
 pub use assets::Assets;
 pub use camera::{Camera, Walls, Zoom};
 pub use canvas::{Canvas, Ids, Image};
-pub use cutaway::{Focus, Selected};
+pub use cutaway::{Focus, Selected, screen_centre_pick};
 pub use light::Light;
 pub use lot::Lot;
 pub use open::{Opened, open_house};

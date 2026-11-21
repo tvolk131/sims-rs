@@ -4274,3 +4274,45 @@ fn the_recorded_sit_and_read_orders_with_shots_replayed_in_the_window_matches_th
     );
     assert_eq!(game.caught(), 0, "{:?}", game.errors());
 }
+
+#[test]
+fn camera_moves_sync_the_lots_view_centre_pick() {
+    use sims_game::view::Move;
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    let expected = |game: &Game| {
+        let shape = sims_render::Lot::from_world(game.lot().world()).unwrap();
+        let house_size = [
+            game.view.size[0],
+            (game.view.size[1] - sims_ui::hud::STRIP).max(1),
+        ];
+        sims_render::screen_centre_pick(&shape, &game.view.camera, house_size)
+            .map(|[x, y]| [(x >> 4) as i8, (y >> 4) as i8])
+    };
+    let initial = game.lot().view_centre();
+    assert!(initial.is_some(), "opening the house sets view_centre");
+    assert_eq!(initial, expected(&game));
+
+    game.apply(Move::Scroll([160, 80]));
+    assert_eq!(game.lot().view_centre(), expected(&game));
+    assert_ne!(game.lot().view_centre(), initial);
+
+    game.apply(Move::Rotate(true));
+    assert_eq!(game.lot().view_rotation(), game.view.camera.rotation);
+    assert_eq!(game.lot().view_centre(), expected(&game));
+
+    game.apply(Move::ZoomIn);
+    assert_eq!(game.lot().view_centre(), expected(&game));
+
+    game.apply(Move::LevelUp);
+    assert_eq!(game.lot().view_centre(), expected(&game));
+
+    game.resize([1024, 768]);
+    assert_eq!(game.lot().view_centre(), expected(&game));
+
+    let mortimer = game.lot().world().selected().expect("a Sim is selected");
+    game.centre_on(mortimer);
+    assert_eq!(game.lot().view_centre(), expected(&game));
+}

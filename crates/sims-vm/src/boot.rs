@@ -1473,17 +1473,18 @@ impl Lot {
         self.view_centre
     }
 
-    /// Sets the tile at the house view's centre, `None` for not known: the
-    /// tile a dialog's portrait searches from for a tile to put a person on
-    /// (0x4e96dd, 0x4347f0, 0x4a677c, 0x4a7b58), after the interface's
-    /// work on the view's pick ([`crate::Interpreter::view_centre`]), so
-    /// the simulation reads it, and it is an input like [`Lot::set_view_rotation`]: the view
-    /// that shows the lot would set it whenever its camera moves, and a
-    /// recording of play must note each change. Where it is not known and
-    /// the tile searched from would change what the portrait does, the
-    /// step fails as an unported branch does.
-    /// [`Lot::load`] leaves it not known (which camera the original opens a
-    /// house with is not traced); [`Lot::load_viewed`] takes it.
+    /// Sets the view-rotated tile pick at the house view's centre, `None`
+    /// for not known: the pick a dialog's portrait resolves into its search
+    /// start (`0x4e96dd`, `0x4347f0`, `0x4a677c`, `0x4a7b58`, bounds-checked
+    /// at `0x434891` and un-rotated at `0x43491c`;
+    /// [`crate::Interpreter::view_centre`]). Because the simulation reads it,
+    /// it is an input like [`Lot::set_view_rotation`]: the view that shows
+    /// the lot sets it whenever its camera moves, and a recording of play
+    /// must note each change. Where it is not known and the tile searched
+    /// from would change what the portrait does, the step fails as an
+    /// unported branch does. [`Lot::load`] leaves it not known (which camera
+    /// the original opens a house with is not traced); [`Lot::load_viewed`]
+    /// takes it.
     pub fn set_view_centre(&mut self, centre: Option<[i8; 2]>) {
         self.view_centre = centre;
     }

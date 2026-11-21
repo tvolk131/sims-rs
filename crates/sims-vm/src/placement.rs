@@ -1265,26 +1265,178 @@ impl Interpreter<'_> {
         }
         Ok(())
     }
+}
 
-    /// The put of a person made for a dialog's portrait (0x4e96c5 to
-    /// 0x4e9704). The interface searches for a tile ([`Self::search`],
-    /// 0x4347f0, with the defaults of 0x4347d1: a spiral on the ground
-    /// level, in the start tile's room, on an empty tile) from the house
-    /// view's centre (0x4a677c), and puts the person there (virtual
-    /// function 0x88, 0x45e4e9: [`Self::put_person`]); with no tile it
-    /// removes the person unput (0x4e9706). The view is presentation, so
-    /// the tile the search starts from is an input
-    /// ([`Interpreter::view_centre`]): the tile after the interface's work
-    /// on the view's pick, which is not ported (by a reading of the
-    /// disassembly, **unverified**: a bounds check with a fallback,
-    /// 0x434891, then the view's rotation undone, 0x43491c, and a clamp).
-    /// When it is given the search is made from it, and when it is not the
-    /// search is made from every tile it may start from. The put is done
-    /// only as far as it is the same on every tile the search may end on:
-    /// the interface's work for an object come from outside
-    /// ([`Self::placed_from_outside`], 0x44752e). The person's removal,
-    /// which the caller then makes, is taken to undo the rest of the put
-    /// (the rooms, 0x440385; the tiles, 0x4330d7; **unverified**).
+/// What a dialog portrait's search (`0x4e96dd` → `0x4347f0`) found for a
+/// newly created person.
+pub(crate) enum PortraitSearch {
+    /// A tile was found (from `view_centre`, or from every start when
+    /// `view_centre` is None); contains the distinct tiles landed on.
+    Found(BTreeSet<[i8; 2]>),
+    /// No tile was found (from `view_centre`, or from any start when
+    /// `view_centre` is None): the original removes the person unput
+    /// (`0x4e9706`) without calling virtual function 0x88.
+    NotFound { description: String },
+    /// No `view_centre` was given, and some starts find a tile while others
+    /// find none (`no_tile_description`).
+    Mixed {
+        found: BTreeSet<[i8; 2]>,
+        no_tile_description: String,
+    },
+}
+
+/// Resolves the house view's centre tile pick (`0x4a7b58` cut to a tile by
+/// `0x433067`: view-rotated `[x, y]`) into the unturned lot fine point that
+/// `0x4347f0` clamps at `0x4349e5` (`start_tile`):
+///
+/// 1. Bounds check (`0x434891` → `0x434cb7`): test `pick` against the
+///    rotated lot's interior bounds (`[min_x + 1..=max_x - 1, min_y + 1..=max_y - 1]`,
+///    set by `0x4791a6` from the 64-tile turn table `0x407704`).
+/// 2. Fallback (`0x43489e` to `0x4348fa`): if outside, replace with the
+///    rotated lot's midpoint tile `[(size / 2) + min_x, (size / 2) + min_y]`
+///    (byte-wrapping addition, `0x434c85`), converted to tile centre
+///    `((t << 4) | 8)` (`0x434c98`).
+/// 3. Inverse view turn (`0x4348fd` to `0x43491c`): turn the fine point
+///    within the 1024-unit square (`0x47bc1f`) by `(-rotation) & 3`.
+///
+/// Any sub-tile offset `0..=15` from `0x4a99f9` maps identically after
+/// `0x47bc1f` and `>> 4` at `0x4349e5` (`(1023 - ((t << 4) | f)) >> 4 == 63 - t`),
+/// so the tile pick determines the start tile losslessly.
+pub(crate) fn portrait_start(size: i32, rotation: u8, pick: [i8; 2]) -> Result<[i32; 2], Trap> {
+    if size < 1 {
+        return Err(Trap::Unsupported(format!(
+            "a dialog's portrait search on a lot {size} tiles wide: the rotated bounds \
+             table (0x4791a6, 0x434f58) requires a positive lot size"
+        )));
+    }
+    if size > FULL && rotation & 3 != 0 {
+        return Err(Trap::Unsupported(format!(
+            "a dialog's portrait search on a lot {size} tiles wide, turned: its corners \
+             are past the table of turns (0x434f58)"
+        )));
+    }
+    let far_min = FULL - size;
+    let [min_x, min_y] = match rotation & 3 {
+        1 => [far_min, 0],
+        2 => [far_min, far_min],
+        3 => [0, far_min],
+        _ => [0, 0],
+    };
+    let [max_x, max_y] = [min_x + size - 1, min_y + size - 1];
+    let [tx, ty] = [i32::from(pick[0]), i32::from(pick[1])];
+    let in_bounds = tx > min_x && tx < max_x && ty > min_y && ty < max_y;
+    let [a, b] = if in_bounds {
+        [(tx << 4) | 8, (ty << 4) | 8]
+    } else {
+        let half = (size / 2) as u8;
+        let fx = i32::from(half.wrapping_add(min_x as u8) as i8);
+        let fy = i32::from(half.wrapping_add(min_y as u8) as i8);
+        [(fx << 4) | 8, (fy << 4) | 8]
+    };
+    // 0x47bc1f with square 0x400 (SPAN = 0x3ff) and (-rotation) & 3.
+    const SPAN: i32 = 0x3ff;
+    Ok(match (4 - i32::from(rotation & 3)) & 3 {
+        1 => [SPAN.wrapping_sub(b), a],
+        2 => [SPAN.wrapping_sub(a), SPAN.wrapping_sub(b)],
+        3 => [b, SPAN.wrapping_sub(a)],
+        _ => [a, b],
+    })
+}
+
+fn format_no_tile_starts(starts: &[[i8; 2]]) -> String {
+    let listed: Vec<String> = starts
+        .iter()
+        .take(8)
+        .map(|[x, y]| format!("{x},{y}"))
+        .collect();
+    format!(
+        "no view centre is given, and from {} of the starts ({}{}) no tile is found",
+        starts.len(),
+        listed.join("; "),
+        if starts.len() > 8 { "; ..." } else { "" },
+    )
+}
+
+impl Interpreter<'_> {
+    /// The search a dialog's portrait makes for a newly created person
+    /// (`0x4e96c5` to `0x4e96e4`): [`Self::search`] (`0x4347f0`, with the
+    /// defaults of `0x4347d1`: a spiral on the ground level, in the start
+    /// tile's room, on an empty tile) starting from the house view's
+    /// centre pick (`0x4a677c`, `0x4a7b58`), bounds-checked and un-rotated
+    /// by [`portrait_start`] (`0x434891`, `0x43491c`).
+    ///
+    /// When [`Interpreter::view_centre`] is given, the search runs once from
+    /// that pick, with its place tests' callbacks running as in the original.
+    /// When it is None, the search runs from every tile it may start from on
+    /// a copy of the lot and cells, with callbacks held to change nothing.
+    pub(crate) fn portrait_search(
+        &self,
+        world: &mut World,
+        id: u16,
+    ) -> Result<PortraitSearch, Fault> {
+        let rules = Rules {
+            same_room: true,
+            empty: true,
+            unmarked: false,
+        };
+        match self.view_centre {
+            Some(pick) => {
+                let from = portrait_start(i32::from(world.size), self.view_rotation, pick)
+                    .map_err(|trap| Fault {
+                        object: id,
+                        at: None,
+                        trap,
+                    })?;
+                match self.search(world, id, from, 1, rules)? {
+                    Some([a, b]) => Ok(PortraitSearch::Found(BTreeSet::from([[
+                        (a >> 4) as i8,
+                        (b >> 4) as i8,
+                    ]]))),
+                    None => Ok(PortraitSearch::NotFound {
+                        description: format!(
+                            "from the view centre {},{} no tile is found",
+                            pick[0], pick[1]
+                        ),
+                    }),
+                }
+            }
+            None => {
+                // On a copy of the lot and of the machine's cells, with
+                // every callback tree the search's place tests run held to
+                // leave both as they were.
+                let mut copy = world.clone();
+                let cells = crate::both_ways::Cells::of(self);
+                let probe = Interpreter {
+                    asked: None,
+                    callbacks_must_be_pure: true,
+                    ..cells.on(self)
+                };
+                let mut ends = probe.search_from_anywhere(&mut copy, id, 1, rules)?;
+                let none_starts = ends.remove(&None);
+                let found: BTreeSet<[i8; 2]> = ends.into_keys().flatten().collect();
+                match (none_starts, found.is_empty()) {
+                    (None, _) => Ok(PortraitSearch::Found(found)),
+                    (Some(starts), true) => Ok(PortraitSearch::NotFound {
+                        description: format_no_tile_starts(&starts),
+                    }),
+                    (Some(starts), false) => Ok(PortraitSearch::Mixed {
+                        found,
+                        no_tile_description: format_no_tile_starts(&starts),
+                    }),
+                }
+            }
+        }
+    }
+
+    /// The put of a person made for a dialog's portrait once
+    /// [`Self::portrait_search`] has found one or more landing tiles `tiles`
+    /// (`0x4e96e6` to `0x4e9704`, virtual function 0x88, `0x45e4e9`).
+    ///
+    /// The put is done only as far as it is the same on every tile the
+    /// search may end on: the interface's work for an object come from
+    /// outside ([`Self::placed_from_outside`], 0x44752e). The person's
+    /// removal, which the caller then makes, is taken to undo the rest of
+    /// the put (the rooms, 0x440385; the tiles, 0x4330d7; **unverified**).
     ///
     /// It fails loudly where the tile would matter:
     ///
@@ -1294,36 +1446,25 @@ impl Interpreter<'_> {
     ///    their function 9, 0x433612) and 10 (before the removal,
     ///    0x433148, which sees the room it was put in). Its Init (function
     ///    0) runs when it is made, as for any person;
-    /// 2. with no view centre given, a callback tree the search's place
-    ///    tests run changes the lot or the machine's cells (function 5 of
-    ///    the person and of the objects in its way beside a tile it tries,
-    ///    0x4337f6, 0x434b94, 0x433a1a, 0x433a35): which tiles the original
-    ///    tries depends on the start. One that changes nothing may run, and
-    ///    its answer is used. The calls are not noted in the trace of calls
-    ///    (`Interpreter::asked`). With a view centre given, the search's
-    ///    callbacks run as they do in the original;
-    /// 3. after the search, data word 7 is not 0: the room it is put in and
+    /// 2. after the search, data word 7 is not 0: the room it is put in and
     ///    taken from is marked as not counted for its light (0x433ed8,
     ///    0x4412c6);
-    /// 4. after the search, data word 40 has bit 0x400: the room it is put
+    /// 3. after the search, data word 40 has bit 0x400: the room it is put
     ///    in is marked as not counted (0x433340);
-    /// 5. no tile is found (from the view centre, or with none given from
-    ///    some start): the original then removes it unput (0x4e9706), and
-    ///    builds again in the same dialog (0x4e938c) unless the type has
-    ///    image 2002; neither is ported;
-    /// 6. noting the room of the tile the search ends on (with no view
-    ///    centre given, any it may end on) changes a room's mark of who is
-    ///    in it ([`World::note_occupant`] through [`Self::note_room`],
+    /// 4. noting the room of any tile in `tiles` changes a room's mark of
+    ///    who is in it ([`World::note_occupant`] through [`Self::note_room`],
     ///    0x45e43d, 0x468802), for a person of kind 0 or 1 (person word
-    ///    65; a pet is above 1): an indoor room that is not a pool and not
-    ///    marked is marked, and the room the person was last seen in (as
-    ///    its first tick may have noted it) loses its mark when nobody else
-    ///    was last seen there. The removal leaves the marks;
-    /// 7. the lot has no indicators yet: the interface's work for an object
+    ///    65; a pet is above 1);
+    /// 5. the lot has no indicators yet: the interface's work for an object
     ///    come from outside makes them (0x445e4a, from 0x44752e), and their
     ///    Init runs while the original's person stands on its tile, in its
     ///    room, which here it does not.
-    pub(crate) fn portrait_put(&self, world: &mut World, id: u16) -> Result<(), Fault> {
+    pub(crate) fn portrait_place(
+        &self,
+        world: &mut World,
+        id: u16,
+        tiles: &BTreeSet<[i8; 2]>,
+    ) -> Result<(), Fault> {
         let fail = |what: String| Fault {
             object: id,
             at: None,
@@ -1353,51 +1494,6 @@ impl Interpreter<'_> {
                 )));
             }
         }
-        let rules = Rules {
-            same_room: true,
-            empty: true,
-            unmarked: false,
-        };
-        let ends = match self.view_centre {
-            Some([x, y]) => {
-                let from = [(i32::from(x) << 4) | 8, (i32::from(y) << 4) | 8];
-                let Some([a, b]) = self.search(world, id, from, 1, rules)? else {
-                    return Err(fail(format!(
-                        "from the view centre {x},{y} no tile is found: the original removes it \
-                         unput (0x4e9706), which is not ported"
-                    )));
-                };
-                BTreeSet::from([Some([(a >> 4) as i8, (b >> 4) as i8])])
-            }
-            None => {
-                // On a copy of the lot and of the machine's cells, with
-                // every callback tree the search's place tests run held to
-                // leave both as they were.
-                let mut copy = world.clone();
-                let cells = crate::both_ways::Cells::of(self);
-                let probe = Interpreter {
-                    asked: None,
-                    callbacks_must_be_pure: true,
-                    ..cells.on(self)
-                };
-                let mut ends = probe.search_from_anywhere(&mut copy, id, 1, rules)?;
-                if let Some(starts) = ends.remove(&None) {
-                    let listed: Vec<String> = starts
-                        .iter()
-                        .take(8)
-                        .map(|[x, y]| format!("{x},{y}"))
-                        .collect();
-                    return Err(fail(format!(
-                        "no view centre is given, and from {} of the starts ({}{}) no tile is \
-                         found: the original removes it unput (0x4e9706), which is not ported",
-                        starts.len(),
-                        listed.join("; "),
-                        if starts.len() > 8 { "; ..." } else { "" },
-                    )));
-                }
-                ends.into_keys().collect()
-            }
-        };
         // The words are read after the search, whose callbacks may set
         // them when a view centre is given.
         if datum(world, data::LIGHTS_ROOM)? != 0 {
@@ -1416,7 +1512,7 @@ impl Interpreter<'_> {
         // The rooms the put notes ([`Self::note_room`]) for each room the
         // search may end in, on a copy: it must change no room's mark.
         let mut rooms = BTreeSet::new();
-        for [a, b] in ends.into_iter().flatten() {
+        for &[a, b] in tiles {
             rooms.insert(find::room(world, a, b, 1).map_err(|trap| Fault {
                 object: id,
                 at: None,
@@ -2199,4 +2295,46 @@ fn forward(at: [i8; 3], facing: i16) -> Result<[i8; 3], Trap> {
         at[1].wrapping_add(*second),
         at[2],
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portrait_start_checks_rotated_bounds_falls_back_and_unrotates() {
+        // 64-tile lot: in-bounds pick [32, 32] stays [32, 32] at view 0,
+        // and turns to [32, 31], [31, 31], [31, 32] at views 1, 2, 3.
+        for (rot, tile) in [(0, [32, 32]), (1, [32, 31]), (2, [31, 31]), (3, [31, 32])] {
+            let pt = portrait_start(64, rot, [32, 32]).unwrap();
+            assert_eq!(pt.map(|n| (n >> 4) as i8), tile, "in-bounds rot {rot}");
+            // Out-of-bounds pick [0, 0] triggers the midpoint fallback (half=32,
+            // min=[0,0]), then un-rotates to the same tile.
+            let fb = portrait_start(64, rot, [0, 0]).unwrap();
+            assert_eq!(fb.map(|n| (n >> 4) as i8), tile, "fallback rot {rot}");
+        }
+        // 6-tile lot: rotated interior is [59..=62, 1..=4] at view 1 and
+        // [1..=4, 59..=62] at view 3.
+        let p1 = portrait_start(6, 1, [60, 2]).unwrap();
+        assert_eq!(p1.map(|n| (n >> 4) as i8), [2, 3]);
+        // Out-of-bounds pick at view 1 falls back to (58+3, 0+3)=(61,3),
+        // un-rotated by 3 to tile (3, 2).
+        let fb1 = portrait_start(6, 1, [2, 2]).unwrap();
+        assert_eq!(fb1.map(|n| (n >> 4) as i8), [3, 2]);
+        let p3 = portrait_start(6, 3, [2, 60]).unwrap();
+        assert_eq!(p3.map(|n| (n >> 4) as i8), [3, 2]);
+        let fb3 = portrait_start(6, 3, [2, 2]).unwrap();
+        assert_eq!(fb3.map(|n| (n >> 4) as i8), [2, 3]);
+        // Size 2 falls back cleanly; size 0 and turned size > 64 trap.
+        assert!(portrait_start(2, 0, [7, 7]).is_ok());
+        assert!(portrait_start(2, 1, [7, 7]).is_ok());
+        assert!(matches!(
+            portrait_start(0, 0, [1, 1]),
+            Err(Trap::Unsupported(_))
+        ));
+        assert!(matches!(
+            portrait_start(65, 1, [1, 1]),
+            Err(Trap::Unsupported(_))
+        ));
+    }
 }
