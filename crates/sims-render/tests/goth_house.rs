@@ -234,3 +234,79 @@ fn off_lot_void_colour_follows_time_of_day_and_house_99() {
         }
     }
 }
+
+#[test]
+fn cut_doorways_draw_no_wall_stub_and_cap_both_flanking_ends() {
+    let Some(root) = install() else {
+        return;
+    };
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut opened = open_house(&root, &house).unwrap();
+    // Clear objects so the test checks only floors, walls and mid-run caps
+    // (load scripts that mark style-3 doors hidden have not run here).
+    opened.world.objects.clear();
+    let lot = Lot::from_world(&opened.world).unwrap();
+    // Control lot with every wall removed, giving the bare floor beneath.
+    let mut no_walls = lot.clone();
+    for cell in &mut no_walls.levels[0].walls {
+        cell.segments = 0;
+    }
+    // Control lot with door-like styles turned into plain walls, giving the
+    // stub that used to cover every cut doorway.
+    let mut plain_walls = lot.clone();
+    for cell in &mut plain_walls.levels[0].walls {
+        for style in &mut cell.styles {
+            if matches!(*style, 3 | 5 | 6 | 15 | 23) {
+                *style = 1;
+            }
+        }
+    }
+    // `near-r3-down-0816` camera: bathroom-to-kitchen doorway sits between
+    // its two flanking wall ends around (676, 193) and (729, 161), with the
+    // open doorway threshold around (706, 177).
+    let camera = Camera {
+        zoom: Zoom::Near,
+        rotation: 3,
+        level: 1,
+        origin: [1759, -1968],
+        walls: Walls::Down,
+        focus: Focus::default(),
+    };
+    let mut actual = Canvas::new(800, 600, [0, 0, 0]);
+    let mut bare = Canvas::new(800, 600, [0, 0, 0]);
+    let mut stubbed = Canvas::new(800, 600, [0, 0, 0]);
+    draw(
+        &opened.world,
+        &lot,
+        &mut opened.assets,
+        &camera,
+        &mut actual,
+    );
+    draw(
+        &opened.world,
+        &no_walls,
+        &mut opened.assets,
+        &camera,
+        &mut bare,
+    );
+    draw(
+        &opened.world,
+        &plain_walls,
+        &mut opened.assets,
+        &camera,
+        &mut stubbed,
+    );
+    let at = |c: &Canvas, x: usize, y: usize| c.color[y * 800 + x];
+    // Open doorway shows bare floor, not a plain-wall stub.
+    assert_eq!(at(&actual, 706, 177), at(&bare, 706, 177));
+    assert_ne!(at(&actual, 706, 177), at(&stubbed, 706, 177));
+    // Both flanking wall ends are closed by cut-height mid-run caps rather
+    // than exposing bare floor.
+    for [x, y] in [[676usize, 193], [729, 161]] {
+        assert_ne!(
+            at(&actual, x, y),
+            at(&bare, x, y),
+            "flanking end ({x}, {y}) should be capped"
+        );
+    }
+}

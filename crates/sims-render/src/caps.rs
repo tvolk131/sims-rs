@@ -98,6 +98,11 @@ pub fn solid(style: u16) -> bool {
     !matches!(style, 2 | 12 | 13 | 14 | 255)
 }
 
+/// Fence and railing styles (0x53cd2a).
+fn is_fence(style: u16) -> bool {
+    matches!(style, 2 | 12 | 13 | 14)
+}
+
 /// Door-like styles, which take no trim when cut (0x53d7d9 without 22).
 pub fn door_like(style: u16) -> bool {
     matches!(style, 3 | 5 | 6 | 15 | 23)
@@ -259,12 +264,10 @@ impl Corners {
                 record: record(*mask),
                 ..Corner::default()
             };
-            if c.record {
-                for &i in list {
-                    let d = walls[i].other(view);
-                    if let Some(s) = slot(bit([d[0] - view[0], d[1] - view[1]])) {
-                        c.slots[s].get_or_insert(i);
-                    }
+            for &i in list {
+                let d = walls[i].other(view);
+                if let Some(s) = slot(bit([d[0] - view[0], d[1] - view[1]])) {
+                    c.slots[s].get_or_insert(i);
                 }
             }
             corners.insert(corner, c);
@@ -296,12 +299,103 @@ impl Corners {
             }
         }
         // Where a run passes straight through, the run's own drawing lays
-        // the trim (0x53df0b onward, not read in full): standing walls'
-        // trim, or the cut walls' when nothing there stands, matched
-        // against the original's screen (2026-11-14).
+        // the trim and, at a cut doorway or fence join along X or Y, the
+        // wall end cap (0x53de05 to 0x53e77c).
         for (corner, (list, _)) in &at {
             let c = corners.get_mut(corner).unwrap();
             if c.record {
+                continue;
+            }
+            let straight_pairs: Vec<(Line, usize, usize)> = list
+                .iter()
+                .filter_map(|&prev| {
+                    let (line, [_, hi]) = walls[prev].run();
+                    if !matches!(line, Line::X | Line::Y) || hi != c.view {
+                        return None;
+                    }
+                    let curr = list.iter().copied().find(|&m| {
+                        let (l, [lo, _]) = walls[m].run();
+                        m != prev && l == line && lo == c.view
+                    })?;
+                    Some((line, prev, curr))
+                })
+                .collect();
+            if list.len() == 2
+                && let Some(&(line, prev, curr)) = straight_pairs.first()
+            {
+                let (prev_bit, curr_bit, prev_mark, curr_mark) = match line {
+                    Line::X => (2u8, 8u8, 4u8, 2u8),
+                    Line::Y => (1u8, 4u8, 2u8, 4u8),
+                    _ => unreachable!(),
+                };
+                let (pw, cw) = (&walls[prev], &walls[curr]);
+                let (pf, cf) = (flags[prev], flags[curr]);
+                // 0x53de05..0x53de4e: cut state follows `curr` if solid, else
+                // `prev` if solid, else standing.
+                let is_cut = if solid(cw.style) {
+                    cf & 1 != 0
+                } else if solid(pw.style) {
+                    pf & 1 != 0
+                } else {
+                    false
+                };
+                let (prev_not_fence, curr_not_fence) = (!is_fence(pw.style), !is_fence(cw.style));
+                let mut mask = prev_bit | curr_bit;
+                let mut cap_flag = false;
+                if is_cut {
+                    if door_like(cw.style) {
+                        mask = prev_bit;
+                        if !door_like(pw.style) {
+                            cap_flag = true;
+                        }
+                    }
+                    if door_like(pw.style) {
+                        if cf & curr_mark == 0 {
+                            mask &= !prev_bit;
+                        }
+                        if !door_like(cw.style) {
+                            cap_flag = true;
+                        }
+                    }
+                } else if door_like(pw.style) && pf & 1 != 0 {
+                    cap_flag = true;
+                }
+                if prev_not_fence != curr_not_fence {
+                    if curr_not_fence {
+                        mask &= !prev_bit;
+                    } else {
+                        mask &= !curr_bit;
+                    }
+                    cap_flag = true;
+                } else if !prev_not_fence {
+                    mask = 0;
+                }
+                if cf & curr_mark != 0 {
+                    mask &= !curr_bit;
+                }
+                if pf & prev_mark != 0 {
+                    mask &= !prev_bit;
+                }
+                // 0x53e184..0x53e1a8: trim height drops to standing when
+                // `curr` is marked at its near end.
+                let trim_cut = is_cut && cf & curr_mark == 0;
+                if mask != 0 {
+                    if trim_cut {
+                        c.cut = mask;
+                    } else {
+                        c.standing = mask;
+                    }
+                }
+                // 0x53e3c0..0x53e4ca: draw the exposed wall end cap when a
+                // cut doorway or fence join leaves a single straight bit.
+                if cap_flag && mask != 0 {
+                    let cap_low = if door_like(cw.style) && pf & 1 == 0 {
+                        false
+                    } else {
+                        is_cut
+                    };
+                    c.cap = cap(mask, 0, 0).map(|desc| (desc, cap_low));
+                }
                 continue;
             }
             for &i in list {
@@ -502,5 +596,109 @@ mod tests {
         // but marked walls take no trim.
         let end = &c.corners[&[5, 7]];
         assert_eq!((end.standing, end.cut), (0, 0));
+        // No door or fence at the mid-run join: standing trim, no mid-run cap.
+        let mid = &c.corners[&[5, 6]];
+        assert_eq!((mid.standing, mid.cut, mid.cap), (1, 0, None));
+    }
+
+    fn styled_wall(a: [i32; 2], b: [i32; 2], style: u16, cut: bool) -> Wall {
+        Wall {
+            lot: [a, b],
+            view: [a, b],
+            style,
+            cut,
+        }
+    }
+
+    #[test]
+    fn a_cut_doorway_in_a_straight_run_takes_mid_run_caps_on_both_sides() {
+        // Plain wall (5,5)-(5,6), cut door style 23 (5,6)-(5,7), plain wall (5,7)-(5,8).
+        let c = Corners::new(vec![
+            styled_wall([5, 5], [5, 6], 1, true),
+            styled_wall([5, 6], [5, 7], 23, true),
+            styled_wall([5, 7], [5, 8], 1, true),
+        ]);
+        // Before the doorway: trim bit 1 (-y), low cap closing slot 0 along Line::X.
+        let before = &c.corners[&[5, 6]];
+        assert!(!before.record);
+        assert_eq!((before.standing, before.cut), (0, 1));
+        assert_eq!(before.slots[0], Some(0));
+        let (bcap, blow) = before.cap.expect("mid-run cap before cut door");
+        assert_eq!(
+            (bcap.slot, bcap.line, bcap.right, blow),
+            (0, Line::X, false, true)
+        );
+        // After the doorway: trim bit 4 (+y), low cap closing slot 2 along Line::Y.
+        let after = &c.corners[&[5, 7]];
+        assert!(!after.record);
+        assert_eq!((after.standing, after.cut), (0, 4));
+        assert_eq!(after.slots[2], Some(2));
+        let (acap, alow) = after.cap.expect("mid-run cap after cut door");
+        assert_eq!(
+            (acap.slot, acap.line, acap.right, alow),
+            (2, Line::Y, true, true)
+        );
+
+        // Same along Line::X (style 3 door between two cut plain walls).
+        let cx = Corners::new(vec![
+            styled_wall([5, 5], [6, 5], 1, true),
+            styled_wall([6, 5], [7, 5], 3, true),
+            styled_wall([7, 5], [8, 5], 1, true),
+        ]);
+        let xb = &cx.corners[&[6, 5]];
+        assert_eq!((xb.standing, xb.cut), (0, 2));
+        let (xbcap, xblow) = xb.cap.expect("X mid-run cap before cut door");
+        assert_eq!(
+            (xbcap.slot, xbcap.line, xbcap.right, xblow),
+            (1, Line::Y, true, true)
+        );
+        let xa = &cx.corners[&[7, 5]];
+        assert_eq!((xa.standing, xa.cut), (0, 8));
+        let (xacap, xalow) = xa.cap.expect("X mid-run cap after cut door");
+        assert_eq!(
+            (xacap.slot, xacap.line, xacap.right, xalow),
+            (3, Line::X, false, true)
+        );
+    }
+
+    #[test]
+    fn mid_run_caps_follow_standing_doors_adjacent_doors_and_fences() {
+        // Standing wall next to a cut door on either side takes a standing cap.
+        let c = Corners::new(vec![
+            styled_wall([5, 5], [5, 6], 1, false),
+            styled_wall([5, 6], [5, 7], 23, true),
+            styled_wall([5, 7], [5, 8], 1, false),
+        ]);
+        let before = &c.corners[&[5, 6]];
+        assert_eq!((before.standing, before.cut), (1, 0));
+        assert_eq!(before.cap.map(|(d, low)| (d.slot, low)), Some((0, false)));
+        let after = &c.corners[&[5, 7]];
+        assert_eq!((after.standing, after.cut), (4, 0));
+        assert_eq!(after.cap.map(|(d, low)| (d.slot, low)), Some((2, false)));
+
+        // Two adjacent cut doors draw neither trim nor cap between them.
+        let double_door = Corners::new(vec![
+            styled_wall([5, 5], [5, 6], 3, true),
+            styled_wall([5, 6], [5, 7], 23, true),
+        ]);
+        let mid = &double_door.corners[&[5, 6]];
+        assert_eq!((mid.standing, mid.cut, mid.cap), (0, 0, None));
+
+        // A fence meeting a cut wall caps the wall at cut height; meeting a
+        // cut door draws neither trim nor cap.
+        let fence_wall = Corners::new(vec![
+            styled_wall([5, 5], [5, 6], 12, false),
+            styled_wall([5, 6], [5, 7], 1, true),
+        ]);
+        let fw = &fence_wall.corners[&[5, 6]];
+        assert_eq!((fw.standing, fw.cut), (0, 4));
+        assert_eq!(fw.cap.map(|(d, low)| (d.slot, low)), Some((2, true)));
+
+        let fence_door = Corners::new(vec![
+            styled_wall([5, 5], [5, 6], 12, false),
+            styled_wall([5, 6], [5, 7], 23, true),
+        ]);
+        let fd = &fence_door.corners[&[5, 6]];
+        assert_eq!((fd.standing, fd.cut, fd.cap), (0, 0, None));
     }
 }

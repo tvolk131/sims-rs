@@ -810,6 +810,13 @@ impl<'a> Painter<'a> {
                     let n = self.rotate_direction(s.normal);
                     let front = shown_side(n);
                     let cut = cut.cuts(self.camera, [x, y], s.bit, style);
+                    // In live and buy modes (`0x416920 != 0`), a cut door-like
+                    // wall (styles 3, 5, 6, 15 and 23) zeroes its pass count
+                    // (`0x53e9ce` to `0x53ea2b`) and draws no wall stub across
+                    // the doorway.
+                    if cut && caps::door_like(style) {
+                        continue;
+                    }
                     let key = edge(s.from, s.to);
                     let opening = openings.get(&key);
                     let pattern = patterns[front];
@@ -1154,11 +1161,18 @@ impl<'a> Painter<'a> {
             .copied()
             .find(|&i| corners.walls[i].line() == cap.line)
             .unwrap_or(owner);
-        // In the light its room shows, through the setter (0x53c9df), or
-        // without a room there in full light (0x53c9e9).
+        // At a corner record, in the light its room shows through the setter
+        // (0x53c9df), or without a room there in full light (0x53c9e9). Along
+        // a run (`!c.record`, 0x53e701), without a room the run's light stays
+        // at 1 through the setter (`0x53dbb4`), so after dark it is capped.
         let fraction = match face(lit) {
             Some((_, s, front)) => self.lot.room_fraction_at(index, wall_side(&s, front)),
             None => return,
+        };
+        let fraction = if c.record {
+            fraction
+        } else {
+            Some(fraction.unwrap_or(1.0))
         };
         let [tx, ty] = [c.view[0] + cap.offset[0], c.view[1] + cap.offset[1]];
         let ends = match cap.line {
@@ -1178,9 +1192,9 @@ impl<'a> Painter<'a> {
         let ends = ends.map(|[x, y]| self.camera.project_fine([x * 16, y * 16], level, ground));
         let zoom = self.camera.zoom.index();
         let frame = wall_frame(ends);
-        // The plain wall's shape, or style 255's for a wall of that style
-        // (0x53c8c1).
-        let style = if corners.walls[owner].style == 255 {
+        // The plain wall's shape, or style 255's for a corner-record wall of
+        // that style (0x53c8c1); mid-run caps always use style 1 (0x53e652).
+        let style = if c.record && corners.walls[owner].style == 255 {
             255
         } else {
             PLAIN_STYLE
@@ -1635,12 +1649,10 @@ const PLAIN_STYLE: u16 = 1;
 
 /// A wall face: the pattern's frame cut to the shape's frame. A wall with
 /// style 22 or 23 takes its shape from the door or window in it when it is
-/// up. Cut down, a wall of style 3, 5, 6, 15, 22 or 23 (the styles the
-/// original marks with bit 8 when it cuts them, 0x54059a; doors stand in
-/// style 3) is a plain wall's stub: the openings' own cut sprites are one
-/// small outline, and the original shows the same stub under a window or
-/// door as beside it (screenshot comparison, 2026-11-14; which style's
-/// stub it takes is unverified).
+/// up (`0x53d525`). Cut down, a window wall (style 22) takes a plain wall's
+/// stub (`0x53ead5` to `0x53eadc` replaces style `0x16` with style 1);
+/// door-like walls (styles 3, 5, 6, 15 and 23) are skipped before this in
+/// live mode (`0x53e9ce` to `0x53ea2b`).
 fn wall_image(
     assets: &mut Assets,
     pattern: u16,
@@ -1651,9 +1663,7 @@ fn wall_image(
     frame: usize,
 ) -> Option<Image> {
     let shape = match opening {
-        _ if cut && matches!(style, 3 | 5 | 6 | 15 | 22 | 23) => {
-            assets.shape(PLAIN_STYLE, true, zoom)?[frame].clone()
-        }
+        _ if cut && style == 22 => assets.shape(PLAIN_STYLE, true, zoom)?[frame].clone(),
         Some(definition) if matches!(style, 22 | 23) => {
             assets.object_shape(definition, false, zoom)?[frame].clone()
         }
