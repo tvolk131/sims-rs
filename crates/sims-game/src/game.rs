@@ -588,6 +588,7 @@ impl Game {
             return false;
         }
         self.view.resize(size);
+        self.hud.resize_menu(size);
         true
     }
 

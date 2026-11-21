@@ -474,6 +474,13 @@ impl Hud {
         Some(point)
     }
 
+    /// Re-lays out an open pie menu for a new canvas `size`.
+    pub fn resize_menu(&mut self, size: [i32; 2]) {
+        if let Some(menu) = &mut self.menu {
+            menu.layout(&self.art, size);
+        }
+    }
+
     /// A press at `point`: the command it asks for, if any. Commands that
     /// change only the panel are applied here too. A gadget button's
     /// press is checked against `world` and `residential` (whether the lot

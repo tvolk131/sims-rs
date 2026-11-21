@@ -487,8 +487,15 @@ impl Menu {
 
     /// Lays the menus out again on a screen of `size`.
     pub fn layout(&mut self, art: &Art, size: [i32; 2]) {
+        let before = self.layouts.last().map(|l| l.center);
         self.size = size;
         self.layouts = self.pie.layout(size, art).unwrap_or_default();
+        // If a resize shifts the menu's middle during the opening gesture,
+        // the opening release settles the menu instead of choosing under
+        // the unmoved cursor (0x5eb45d).
+        if !self.sticky && before.is_some() && self.layouts.last().map(|l| l.center) != before {
+            self.moved = true;
+        }
     }
 
     /// Which menu is open and the entry of it under `point`, to tell
@@ -869,6 +876,18 @@ mod tests {
         assert_eq!(menu.release(&art, submenu.center), Release::Stays);
         assert_eq!(menu.layouts.len(), 1);
         assert_eq!(menu.take_pointer(), None);
+
+        // Resizing the screen during the opening gesture so the pie's middle
+        // shifts marks `moved`, so releasing at the original click point
+        // settles instead of choosing whatever entry slid under it.
+        let mut menu = Menu::new(1, 2, named(&STUDIES), [260, 204], &art, [800, 600]);
+        assert!(!menu.layouts[0].moved);
+        let original_center = menu.layouts[0].center;
+        menu.layout(&art, [300, 600]);
+        assert_ne!(menu.layouts[0].center, original_center);
+        assert!(!menu.will_choose([260, 204]));
+        assert_eq!(menu.release(&art, [260, 204]), Release::Settled);
+        assert_eq!(menu.layouts.len(), 1);
     }
 
     #[test]

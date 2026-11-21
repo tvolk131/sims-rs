@@ -3364,7 +3364,7 @@ fn pressing_a_pie_entry_and_dragging_off_orders_nothing() {
     // while the point is still within pie `REACH` of the top label) closes
     // without checking or ordering.
     {
-        let mut top_game = Game::open(&options(install)).expect("the Goth house opens");
+        let mut top_game = Game::open(&options(install.clone())).expect("the Goth house opens");
         top_game.resize([800, 600]);
         assert_eq!(top_game.run(50), 50);
         top_game.apply(sims_game::view::Move::Scroll([0, -150]));
@@ -3398,6 +3398,43 @@ fn pressing_a_pie_entry_and_dragging_off_orders_nothing() {
         assert!(top_game.menu().is_none());
         assert_eq!(hash(&top_game), later);
         assert_eq!(queue_len(&top_game), 0);
+    }
+
+    // 2c. Shrinking the canvas during the opening press so the pie shifts
+    // settles on release instead of ordering whatever entry slid under the
+    // pointer; shrinking past the pointer treats the release as outside.
+    {
+        let mut shrink_game = Game::open(&options(install)).expect("the Goth house opens");
+        shrink_game.resize([800, 600]);
+        assert_eq!(shrink_game.run(50), 50);
+        shrink_game.render();
+        let fridge_at = (0..600)
+            .step_by(2)
+            .flat_map(|y| (0..800).step_by(2).map(move |x| [x, y]))
+            .find(|&p| !shrink_game.over_panel(p) && shrink_game.under(p) == Some(fridge))
+            .expect("the fridge is on screen");
+        shrink_game.hover(fridge_at);
+        shrink_game.press(fridge_at);
+        // Shrink wide enough that `fridge_at` stays inside, but narrow enough
+        // that the pie shifts horizontally before `render()`.
+        let narrow = (fridge_at[0] + 40).max(300);
+        shrink_game.resize([narrow, 600]);
+        shrink_game.release(fridge_at);
+        assert!(
+            shrink_game.menu().is_some_and(|m| !m.held()),
+            "resizing during the opening press settles the pie instead of choosing"
+        );
+        assert_eq!(queue_len(&shrink_game), 0);
+        // Now shrink narrower than `fridge_at[0]` while settled: releasing at
+        // the old coordinate is outside the shrunk canvas and closes without
+        // ordering.
+        let snack = label_center(&shrink_game, "Have A Snack");
+        shrink_game.hover(snack);
+        shrink_game.press(snack);
+        shrink_game.resize([snack[0], 600]);
+        shrink_game.release(snack);
+        assert!(shrink_game.menu().is_none());
+        assert_eq!(queue_len(&shrink_game), 0);
     }
 
     // 3. Press on Have A Snack, drag onto Have Quick Breakfast, release:

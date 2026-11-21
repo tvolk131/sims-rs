@@ -62,13 +62,17 @@ vtable `+0x24c` (`0x5ea7e2(0)`).
   menu or closes the pie without checking or choosing any entry. Pressing
   on an entry and dragging off the pie (or outside the window) before
   releasing now closes the menu without re-checking or ordering it.
-- `sims-game`'s window shell (`main.rs`) checks physical client bounds on
-  `CursorMoved` (clearing `cursor` and calling `Game::leave` when outside,
-  just as `CursorLeft` does), forwards left-button releases to
-  `Game::release` (or `Game::release_outside` when outside the client
-  area), and moves the pointer when a submenu opens or backs out into a
-  clamped parent. `Game::hover` and `Game::release` also route out-of-view
-  points to `Game::leave` and `Game::release_outside`.
+- `sims-game`'s window shell (`main.rs`) checks live physical client
+  bounds on `CursorMoved`, `Resized`, `ScaleFactorChanged`, and
+  `MouseInput` (mapping in-client coordinates with the same HiDPI edge
+  clamp as `redraw` and syncing `Game::resize` immediately), forwards
+  left-button releases to `Game::release` (or `Game::release_outside`
+  when outside the client area), and moves the pointer when a submenu
+  opens or backs out into a clamped parent. `Game::hover` and
+  `Game::release` also route out-of-view points to `Game::leave` and
+  `Game::release_outside`, and `Game::resize` re-lays out an open pie
+  immediately (marking `moved` if a center shift happens during the
+  opening gesture so that release settles).
 - The `goth-snack-bob-20261120` window replay in `tests/goth.rs` now sends
   the opening press at update 152, the opening release at update 154, the
   entry press at update 201 (pie stays open and held, nothing ordered),
