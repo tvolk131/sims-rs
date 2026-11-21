@@ -755,6 +755,26 @@ fn a_search_that_reaches_no_goal_gives_up_with_result_3() {
     assert!(route.contexts.is_empty() && route.path.is_empty());
 }
 
+#[test]
+fn a_person_in_no_room_has_no_way() {
+    // 0x45c3ca to 0x45c3e4: the person's room (data word 29) is looked up
+    // in the lot's rooms (0x466fcc gives null for one not there). A person
+    // in no room, such as one off the lot, gets the answer 0 (0x45c4c7) as
+    // when the planner finds no way, and the candidates are dropped.
+    let (mut fx, me) = lot([56, 40], 4, 1 << 2);
+    let room = 77;
+    assert!(!fx.world.rooms.rooms.contains_key(&room));
+    fx.world.objects.get_mut(&me).unwrap().data[29] = room;
+    // The lamp too, so the route goes to the slot and not through a door.
+    fx.lamp_mut().data[29] = room;
+    assert!(gives_up(go_to(&mut fx, me)));
+    assert!(!sat(&fx));
+    // The planner never ran, so its result (3) was not written.
+    assert_ne!(route_result(&fx, me), 3);
+    let route = &fx.world.routing.routes[&me];
+    assert!(route.contexts.is_empty() && route.path.is_empty());
+}
+
 /// A route context as the load makes it for a person saved part way
 /// through a route (0x460443): it names no object.
 fn loaded_context() -> sims_sim::route::Context {

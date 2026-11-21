@@ -77,6 +77,13 @@ fn rejects_truncation() {
 }
 
 #[test]
+fn an_entry_starting_with_ff_fe_is_not_a_byte_order_mark() {
+    // The original copies an entry's bytes as they are (0x470404).
+    let table = StringTable::parse(b"\xff\xff\x01\x00\xff\xfe$Job\0").unwrap();
+    assert_eq!(table.entries[0].text, "\u{ff}\u{fe}$Job");
+}
+
+#[test]
 fn a_resource_is_read_in_its_flags_byte_order() {
     const LITTLE: u16 = 0x10;
     let read = |data: &[u8], flags| texts(&StringTable::parse_chunk(data, flags).unwrap()).len();

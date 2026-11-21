@@ -561,19 +561,22 @@ fn construct_person(
 /// so that a person of theirs made later builds only its own copy.
 ///
 /// The Goth day (`goth-day-20261115`) makes a cat ("kat" skeleton) at
-/// updates 6756, 10358, 17562 and 24719, and each time the C runtime's
-/// stream moves by 1,920 draws: one skeleton's worth, its own copy
-/// (0x598da3). Had the first cat read its file there, that update would
-/// take two (0x598af7 builds the file's one skeleton, then the copy). The
-/// stream at the entry of the first lot update is 7,212 draws on from its
+/// updates 6756, 10358 and 17562, and each time the C runtime's stream
+/// moves by 1,920 draws: one skeleton's worth, its own copy (0x598da3).
+/// Had the first cat read its file there, that update would take two
+/// (0x598af7 builds the file's one skeleton, then the copy). At 24719 a
+/// dialog's portrait makes a cat and removes it at once (the Dialog
+/// primitive's `dialog_portrait`), with the same 1,920 draws. The stream
+/// at the entry of the first lot update is 7,212 draws on from its
 /// initial state 1, which the load's own work accounts for (the adult and
 /// child files, the three Goths' copies and default interests, and the
-/// indicator pair made before the load and again during it). So the file was read without drawing from the stream the
-/// simulation draws from (the C runtime keeps one per thread, 0x63e2b3
-/// +0x14). That it was read before the load, and not between the load and
-/// the first cat, is **unverified**; so is where (the avatar registry's
-/// scan at startup, 0x59f844, reads files through 0x59f087, whose
-/// skeleton records go through 0x598af7).
+/// indicator pair made before the load and again during it). So the file
+/// was read without drawing from the stream the simulation draws from
+/// (the C runtime keeps one per thread, 0x63e2b3 +0x14). That it was read
+/// before the load, and not between the load and the first cat, is
+/// **unverified**; so is where (the avatar registry's scan at startup,
+/// 0x59f844, reads files through 0x59f087, whose skeleton records go
+/// through 0x598af7).
 ///
 /// The dog file is read before the first load too. A recording of the
 /// first neighborhood's House 69 (`house69-ud1-ticks-20261119`), which

@@ -20,6 +20,9 @@ pub struct Options<'a> {
     /// The answers to give, in order, to dialogs that offer a choice. A
     /// dialog with one button takes none.
     pub answers: Vec<u8>,
+    /// The tile at the house view's centre ([`Lot::set_view_centre`]),
+    /// which a dialog's portrait searches from. None: not known.
+    pub view_centre: Option<[i8; 2]>,
     pub snapshot: Option<&'a Path>,
     /// When the house view draws a frame ([`Frames`]).
     pub frames: Frames,
@@ -30,11 +33,12 @@ pub struct Options<'a> {
 }
 
 pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
-    let mut lot = Lot::load(
+    let mut lot = Lot::load_viewed(
         options.root,
         options.house,
         &options.answers,
         options.frames.clone(),
+        options.view_centre,
     )
     .map_err(|error| -> Box<dyn Error> { error })?;
     // The ticks: one lot update each, with the house view's frames

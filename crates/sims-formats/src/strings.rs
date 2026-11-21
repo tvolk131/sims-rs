@@ -69,8 +69,8 @@ impl StringTable {
             };
             entries.push(TextEntry {
                 language,
-                text: decode(raw_text, language),
-                comment: decode(raw_comment, language),
+                text: decode_verbatim(raw_text, language),
+                comment: decode_verbatim(raw_comment, language),
                 raw_text: raw_text.to_vec(),
                 raw_comment: raw_comment.to_vec(),
             });
@@ -157,8 +157,23 @@ impl StringTable {
 /// sniffing or stripping, matching [`crate::reader::western`] and the
 /// original's byte-exact string comparisons (such as `0x5a280f`).
 pub fn decode(bytes: &[u8], language: u8) -> String {
+    decode_verbatim(bytes, language)
+}
+
+/// Decode a string table entry's bytes using the selected language's code
+/// page, with no byte order mark sniffed: the original copies an entry's
+/// bytes as they are (0x470404 to 0x470434), so `ff fe` at its start is
+/// two characters, not a mark.
+pub fn decode_verbatim(bytes: &[u8], language: u8) -> String {
+    encoding(language)
+        .decode_without_bom_handling(bytes)
+        .0
+        .into_owned()
+}
+
+fn encoding(language: u8) -> &'static encoding_rs::Encoding {
     use encoding_rs::*;
-    let encoding = match language {
+    match language {
         12 => WINDOWS_1255,
         13 => WINDOWS_1251,
         15 => SHIFT_JIS,
@@ -168,8 +183,7 @@ pub fn decode(bytes: &[u8], language: u8) -> String {
         19 => WINDOWS_874,
         20 => EUC_KR,
         _ => WINDOWS_1252,
-    };
-    encoding.decode_without_bom_handling(bytes).0.into_owned()
+    }
 }
 
 #[cfg(test)]

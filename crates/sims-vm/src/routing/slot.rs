@@ -1146,7 +1146,8 @@ impl Interpreter<'_> {
     /// 1. A slot with a sitting weight, for a person of a kind above 1
     ///    (person word 65), loses its seats first (0x46de84); that fails
     ///    loudly.
-    /// 2. The route is planned. With no way found the answer is 0
+    /// 2. A person in no room has no way (0x466fcc gives null); otherwise
+    ///    the route is planned. With no way found the answer is 0
     ///    (0x45c4c7).
     /// 3. Person word 37 takes the chosen candidate's word +0xe.
     /// 4. A candidate beside a seat (word +0xc, the seat's ID): a seat that
@@ -1180,9 +1181,14 @@ impl Interpreter<'_> {
                 "dropping the seats of a slot for a person of kind above 1 (0x46de84)",
             )));
         }
+        // 0x45c3ca to 0x45c3e4: the person's room (data word 29) is looked
+        // up in the lot's rooms (0x466fcc, a map's find giving null at its
+        // end). A person in no room, one off the lot for one, has no way:
+        // the answer is 0, as when the planner finds none.
         let room = datum(world, person, ROOM).map_err(fail)?;
         if !world.rooms.rooms.contains_key(&room) {
-            return Err(fail(unsupported("0x45c3b9", "a route from no room")));
+            drop_candidates(ctx);
+            return Ok(SlotRoute::Answer(0));
         }
         path.clear();
         if !self.plan(world, ctx, path)? {
