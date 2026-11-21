@@ -138,6 +138,34 @@ impl Wardrobe {
             })
             .sum()
     }
+
+    /// The number of bodies a dog (`cat` false) or cat can wear (0x408bf5
+    /// asked for list 0 with gender 2..=5, built by 0x409663): each suit
+    /// matching `"b"`, any three characters, and `"dog"` or `"cat"` (seven
+    /// characters in all), paired with each texture whose name starts with
+    /// those seven characters (no skin tone suffix, 0x40971e..0x409722 and
+    /// 0x4097e5..0x4097ec).
+    pub fn count_pet(&self, cat: bool) -> usize {
+        let species = if cat {
+            ['c', 'a', 't']
+        } else {
+            ['d', 'o', 'g']
+        };
+        self.suits
+            .iter()
+            .filter_map(|suit| {
+                let chars: Vec<char> = suit.chars().take(7).collect();
+                let matches = chars.len() == 7 && chars[0] == 'b' && chars[4..7] == species;
+                matches.then(|| chars.into_iter().collect::<String>())
+            })
+            .map(|prefix| {
+                self.textures
+                    .iter()
+                    .filter(|t| t.starts_with(&prefix))
+                    .count()
+            })
+            .sum()
+    }
 }
 
 #[cfg(test)]
@@ -200,5 +228,28 @@ mod tests {
         );
         assert_eq!(w.count(false, false, false, "lgt"), 1);
         assert_eq!(w.count(true, false, false, "lgt"), 1);
+    }
+
+    #[test]
+    fn a_pet_body_matches_seven_character_species_prefix_without_skin_tone() {
+        let w = wardrobe(
+            &[
+                "b001dog_lab",
+                "b002cat_siamese",
+                "b00édog_accent",
+                "b001mafit_01",
+                "c001dog_head",
+            ],
+            &[
+                "b001dog_lab_01.bmp",
+                "b001dog_lab_02.tga",
+                "b002cat_siamese.bmp",
+                "b00édog_accent.bmp",
+                "b001mafitlgt.bmp",
+                "c001dog_head.bmp",
+            ],
+        );
+        assert_eq!(w.count_pet(false), 3);
+        assert_eq!(w.count_pet(true), 1);
     }
 }
