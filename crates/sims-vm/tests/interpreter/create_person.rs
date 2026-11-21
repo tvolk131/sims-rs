@@ -23,7 +23,7 @@ const SEEN: usize = 36;
 /// widget's file names tree 4099 "init visitor": it writes its stack
 /// object to global 36. Gives the widget's file and the ID by which a
 /// script names its record (the record's slot plus one).
-fn visitors() -> (Fixture, usize, i16) {
+pub(crate) fn visitors() -> (Fixture, usize, i16) {
     let (mut fx, file) = placeable();
     fx.words(file)[9] = 2;
     equip(&mut fx, WIDGET, "widget", 12);
@@ -185,23 +185,43 @@ fn flag_0x4_runs_a_new_visitors_init_visitor_tree_at_once() {
 }
 
 #[test]
-fn a_person_made_with_person_word_68_74_or_84_set_is_made_as_any_other() {
-    // The person test (0x44e6b6 to 0x44e727) sends such a person through
-    // 0x45810c, which touches only the screen; the port leaves it out.
-    for word in [68, 74, 84] {
+fn a_person_made_with_person_word_68_74_or_84_set_resets_its_types_portrait() {
+    // The person test (0x44e6b6 to 0x44e727) sends a person with bit 0 of
+    // word 68 or 84, or bit 0 or 1 of word 74, through 0x45810c, which
+    // resets its type's entry in the interface's table (0x4eb0eb,
+    // 0x4e895e): the next dialog's portrait of the type is built again
+    // (0x4e92a8). Other bits leave it.
+    for (word, value, reset) in [
+        (68, 1, true),
+        (68, 2, false),
+        (74, 1, true),
+        (74, 2, true),
+        (74, 4, false),
+        (84, 1, true),
+        (84, 2, false),
+    ] {
         let (mut fx, _, record) = visitors();
+        fx.world.portraits.insert(WIDGET);
         let before = ids(&fx);
         let slot = fx.world.neighbors.slots.last_mut().unwrap();
         let slot = slot.as_mut().unwrap();
         slot.revision = 10;
-        slot.data[word] = 3;
+        slot.data[word] = value;
         assert_eq!(
             create(&mut fx, 0, 6, FROM_RECORD, record),
             Ok(true),
             "word {word}"
         );
         let id = new_object(&fx, &before);
-        assert_eq!(fx.world.objects[&id].person.as_ref().unwrap().data[word], 3);
+        assert_eq!(
+            fx.world.objects[&id].person.as_ref().unwrap().data[word],
+            value
+        );
+        assert_eq!(
+            fx.world.portraits.contains(&WIDGET),
+            !reset,
+            "word {word} = {value}"
+        );
     }
 }
 
@@ -296,6 +316,39 @@ fn another_object_takes_a_person_off_and_nothing_reads_its_animator_after() {
 }
 
 #[test]
+fn a_person_removed_in_a_persons_tick_outside_the_schedulers_pass_fails_loudly() {
+    // The removed person's animator refresh waits for its animator's tick
+    // in the scheduler's pass. A person's tick run on its own has no pass
+    // to keep it in, and dropping it would hide it from a step run both
+    // ways: it fails.
+    let (mut fx, id, file) = placed_visitor();
+    fx.add(GLOBAL, 256, sleeper());
+    fx.add(
+        file,
+        4203,
+        tree(vec![
+            ins(REMOVE, 1, RETURN_FALSE, [1, 0, 0, 0, 0, 0, 0, 0]),
+            ins(256, 1, ERROR, [20, 0, 0, 0, 0, 0, 0, 0]),
+        ]),
+    );
+    for slot in &mut fx.sim_mut().slots {
+        slot.object = 0;
+    }
+    fx.thread(id, 4203, &[]);
+    fx.world.objects.get_mut(&id).unwrap().stack[0].stack_object = SIM as i16;
+    let tuning = crate::tick::tuning();
+    let ticks = fx.world.ticks as i32;
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let fault = interpreter
+        .tick_person(&mut fx.world, id, ticks, &tuning)
+        .unwrap_err();
+    assert!(
+        matches!(fault.trap, Trap::Unsupported(ref m) if m.contains("outside the scheduler's pass")),
+        "{fault}"
+    );
+}
+
+#[test]
 fn another_object_taking_off_a_person_whose_hand_holds_something_fails_loudly() {
     let (mut fx, id, _) = placed_visitor();
     // The Sim, holding nothing itself, is in the person's hand.
@@ -351,18 +404,24 @@ fn a_person_another_took_off_ticks_with_its_refresh_pending() {
     assert_eq!(result, Ok(true));
     assert_eq!(update.ticked, [LAMP, id]);
     assert_eq!(fx.world.removals, [id]);
-    // Its thread may not run a primitive that reads an animator before
-    // its animator's tick (Animate Sim, opcode 44, here).
+    // A primitive that reads an animator before its animator's tick
+    // (Animate Sim, opcode 44, here) runs both ways
+    // (`Machine::step_both_ways`): clip 0 takes the true branch whichever
+    // animator it reads, so the pass goes on and the animator's tick
+    // settles the two.
     fx.world = ready;
     fx.add(
         file,
         4204,
-        tree(vec![ins(44, RETURN_TRUE, RETURN_FALSE, [0; 8])]),
+        tree(vec![
+            ins(44, 1, RETURN_FALSE, [0; 8]),
+            ins(0, RETURN_TRUE, RETURN_FALSE, [0; 8]),
+        ]),
     );
-    fx.thread(id, 4204, &[0; 4]);
+    fx.thread(id, 4204, &[5, 0, 0, 0]);
     let (result, _) = pass(&mut fx);
-    let error = result.unwrap_err().to_string();
-    assert!(error.contains("left the lot and before its"), "{error}");
+    assert_eq!(result, Ok(true));
+    assert_eq!(fx.world.objects[&id].stack[0].node, 1);
 }
 
 #[test]
@@ -370,8 +429,8 @@ fn a_person_removing_itself_and_going_on_settles_its_refresh_at_its_animators_ti
     // The visitor (ID 3) removes itself in its own tick with flag bit 0,
     // so its tree goes on. Its animator's refresh at the take-off is
     // pending for its animator's tick later in the same tick, as for a
-    // person that takes itself off: until then its thread may run only
-    // what reads no animator.
+    // person that takes itself off: until then what its thread runs that
+    // reads an animator runs both ways.
     let (mut fx, id, file) = placed_visitor();
     fx.world.globals = vec![0; 64];
     for object in fx.world.objects.values_mut() {
@@ -402,21 +461,22 @@ fn a_person_removing_itself_and_going_on_settles_its_refresh_at_its_animators_ti
     assert_eq!(update.ticked, [id]);
     assert_eq!(fx.world.removals, [id]);
     assert_eq!(fx.world.objects[&id].position, [-16, -16, 1]);
-    // Then Animate Sim (opcode 44), which reads an animator: it fails on the
-    // pending refresh.
+    // Then Animate Sim (opcode 44), which reads an animator: it runs both
+    // ways (`Machine::step_both_ways`), and clip 0 agrees on both.
     fx.world = ready;
     fx.add(
         file,
         4206,
         tree(vec![
             ins(REMOVE, 1, 1, [0, 0, 1, 0, 0, 0, 0, 0]),
-            ins(44, RETURN_TRUE, RETURN_FALSE, [0; 8]),
+            ins(44, 2, RETURN_FALSE, [0; 8]),
+            ins(0, RETURN_TRUE, RETURN_FALSE, [0; 8]),
         ]),
     );
-    fx.thread(id, 4206, &[0; 4]);
+    fx.thread(id, 4206, &[5, 0, 0, 0]);
     let (result, _) = pass(&mut fx);
-    let error = result.unwrap_err().to_string();
-    assert!(error.contains("left the lot and before its"), "{error}");
+    assert_eq!(result, Ok(true));
+    assert_eq!(fx.world.objects[&id].stack[0].node, 2);
 }
 
 /// A record of the widget's type whose person data is all `value`.

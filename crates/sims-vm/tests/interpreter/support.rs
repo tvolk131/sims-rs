@@ -290,6 +290,8 @@ fn program() -> Program {
         ]),
         semi_globals: BTreeMap::from([(LAMP_FILE, Some(SEMI_FILE)), (SIM_FILE, None)]),
         careers: None,
+        career_texts_end: true,
+        labels_hold_no_token: true,
         zoning: BTreeMap::new(),
         animations: Default::default(),
         people: Default::default(),

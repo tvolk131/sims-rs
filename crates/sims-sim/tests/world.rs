@@ -274,6 +274,7 @@ fn world() -> World {
             )]),
             next_file: 4,
         },
+        portraits: BTreeSet::from([0x1234_0042, 0x7fd9_6b54]),
     }
 }
 
@@ -445,7 +446,15 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "76bb018abadfef18d5ac5e7d47a751fd554b6d0a8bdef220d8fb05899c4f45c6";
+const PINNED: &str = "20fd811dcc1faebf0012fb041c894f499a0306c53d0cd7705f7530b18ea3b55f";
+
+#[test]
+fn without_the_portraits_the_encoding_is_format_30() {
+    // Snapshot format 31 added the person types whose portrait the
+    // interface has built at the end.
+    assert_eq!(digest(&format_30_bytes(&world())), PINNED_30);
+}
+const PINNED_30: &str = "76bb018abadfef18d5ac5e7d47a751fd554b6d0a8bdef220d8fb05899c4f45c6";
 
 #[test]
 fn without_the_made_characters_the_encoding_is_format_29() {
@@ -455,12 +464,23 @@ fn without_the_made_characters_the_encoding_is_format_29() {
 }
 const PINNED_29: &str = "f1663444bf686193967fab0511a75eaad4599c03369d188260cc34f84ee1f9ae";
 
+/// The encoding of `world` as snapshot format 30 wrote it: without the
+/// person types whose portrait the interface has built
+/// ([`sims_sim::World::portraits`]) that format 31 added at the end. The
+/// older formats' encodings start from this one.
+fn format_30_bytes(world: &World) -> Vec<u8> {
+    let mut bytes = world.encode();
+    let built = postcard::to_allocvec(&world.portraits).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - built.len()), built);
+    bytes
+}
+
 /// The encoding of `world` as snapshot format 29 wrote it: without the
 /// person types made while the game runs ([`World::characters`]) that
 /// format 30 added at the end. The older formats' encodings start from
 /// this one.
 fn format_29_bytes(world: &World) -> Vec<u8> {
-    let mut bytes = world.encode();
+    let mut bytes = format_30_bytes(world);
     let made = postcard::to_allocvec(&world.characters).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - made.len()), made);
     bytes
@@ -1199,6 +1219,9 @@ fn any_field_change_changes_the_hash() {
     assert_ne!(changed.hash(), base);
     let mut changed = world();
     changed.characters.next_file += 1;
+    assert_ne!(changed.hash(), base);
+    let mut changed = world();
+    changed.portraits.remove(&0x7fd9_6b54);
     assert_ne!(changed.hash(), base);
     let mut changed = world();
     changed.dialogs.records[0].status = 5;

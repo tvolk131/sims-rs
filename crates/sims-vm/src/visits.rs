@@ -126,7 +126,44 @@ impl Interpreter<'_> {
         if tree == 0 {
             return Ok(false);
         }
-        if matches!(self.program.tree(definition.resource, tree), Tree::Missing) {
+        let temps = object.temps.clone();
+        let resource = definition.resource;
+        let before = self
+            .callbacks_must_be_pure
+            .then(|| (world.clone(), crate::both_ways::Cells::of(self)));
+        let result = self.run_callback_tree(world, id, resource, tree, stack_object, args, &temps);
+        if let Some((lot, cells)) = before
+            && !(crate::both_ways::same_lot(&lot, world)
+                && cells.same(&crate::both_ways::Cells::of(self)))
+        {
+            return Err(fail(Trap::Unsupported(format!(
+                "object {id}'s function {function} (tree {tree}) changed the lot or the machine's \
+                 cells while a dialog's portrait searched for a tile from every start (0x4347f0): \
+                 which the original runs depends on the house view's centre (0x4a677c)"
+            ))));
+        }
+        result
+    }
+
+    /// The rest of [`Interpreter::callback_with`] once the table names
+    /// tree `tree`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_callback_tree(
+        &self,
+        world: &mut World,
+        id: u16,
+        resource: usize,
+        tree: u16,
+        stack_object: i16,
+        args: Option<&[i16]>,
+        temps: &[i16],
+    ) -> Result<bool, Fault> {
+        let fail = |trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        };
+        if matches!(self.program.tree(resource, tree), Tree::Missing) {
             // The original finds the tree missing only after it has
             // written its mark above the top frame.
             self.machine(world, id, 0, false)
@@ -136,10 +173,7 @@ impl Interpreter<'_> {
         }
         match args {
             Some(args) => self.call(world, id, tree, stack_object, args, args.len(), TURN_BUDGET),
-            None => {
-                let temps = object.temps.clone();
-                self.call(world, id, tree, stack_object, &temps, 8, TURN_BUDGET)
-            }
+            None => self.call(world, id, tree, stack_object, temps, 8, TURN_BUDGET),
         }
     }
 
