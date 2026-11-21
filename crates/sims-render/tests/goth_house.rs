@@ -275,7 +275,7 @@ fn cut_doorways_draw_no_wall_stub_and_cap_both_flanking_ends() {
     let mut actual = Canvas::new(800, 600, [0, 0, 0]);
     let mut bare = Canvas::new(800, 600, [0, 0, 0]);
     let mut stubbed = Canvas::new(800, 600, [0, 0, 0]);
-    draw(
+    let actual_stats = draw(
         &opened.world,
         &lot,
         &mut opened.assets,
@@ -289,24 +289,119 @@ fn cut_doorways_draw_no_wall_stub_and_cap_both_flanking_ends() {
         &camera,
         &mut bare,
     );
-    draw(
+    let stubbed_stats = draw(
         &opened.world,
         &plain_walls,
         &mut opened.assets,
         &camera,
         &mut stubbed,
     );
+    // Skipping cut door-like walls draws strictly fewer wall faces than
+    // turning them into plain walls (exact count of level-1 door segments).
+    let door_segments = lot.levels[0]
+        .walls
+        .iter()
+        .map(|cell| {
+            let mut count = 0usize;
+            if cell.segments & 1 != 0 && matches!(cell.styles[0], 3 | 5 | 6 | 15 | 23) {
+                count += 1;
+            }
+            for bit in [2u8, 4, 8] {
+                if cell.segments & bit != 0 && matches!(cell.styles[1], 3 | 5 | 6 | 15 | 23) {
+                    count += 1;
+                }
+            }
+            count
+        })
+        .sum::<usize>();
+    assert!(door_segments > 0);
+    assert_eq!(stubbed_stats.walls - actual_stats.walls, door_segments);
+
     let at = |c: &Canvas, x: usize, y: usize| c.color[y * 800 + x];
     // Open doorway shows bare floor, not a plain-wall stub.
     assert_eq!(at(&actual, 706, 177), at(&bare, 706, 177));
     assert_ne!(at(&actual, 706, 177), at(&stubbed, 706, 177));
-    // Both flanking wall ends are closed by cut-height mid-run caps rather
-    // than exposing bare floor.
-    for [x, y] in [[676usize, 193], [729, 161]] {
+    // Both flanking wall ends are closed by cut-height mid-run caps (drawn
+    // at cut height, not standing height above them).
+    for ([x, y], [above_x, above_y]) in [([676usize, 193], [676, 150]), ([729, 161], [729, 120])] {
         assert_ne!(
             at(&actual, x, y),
             at(&bare, x, y),
             "flanking end ({x}, {y}) should be capped"
+        );
+        assert_eq!(
+            at(&actual, above_x, above_y),
+            at(&bare, above_x, above_y),
+            "standing height ({above_x}, {above_y}) above cut cap should stay bare"
+        );
+    }
+
+    // Repainting only door-like wall segments must not change either
+    // flanking cap, whereas repainting non-door walls must change both
+    // caps — verifying each cap owns the surviving solid wall's slot
+    // rather than the cut doorway's opposite slot.
+    let mut repainted_doors = lot.clone();
+    let mut repainted_solids = lot.clone();
+    let size = lot.size;
+    for x in 0..size {
+        for y in 0..size {
+            let idx = sims_render::Lot::cell(x, y);
+            let cell = lot.levels[0].walls[idx];
+            let repaint = |target: &mut sims_render::Lot, west: bool| {
+                if west {
+                    target.levels[0].walls[idx].patterns[0] = 10;
+                    if x > 0 {
+                        target.levels[0].walls[sims_render::Lot::cell(x - 1, y)].patterns[3] = 10;
+                    }
+                } else {
+                    target.levels[0].walls[idx].patterns[1] = 10;
+                    if y > 0 {
+                        target.levels[0].walls[sims_render::Lot::cell(x, y - 1)].patterns[2] = 10;
+                    }
+                }
+            };
+            if cell.segments & 1 != 0 {
+                if matches!(cell.styles[0], 3 | 5 | 6 | 15 | 23) {
+                    repaint(&mut repainted_doors, true);
+                } else {
+                    repaint(&mut repainted_solids, true);
+                }
+            }
+            if cell.segments & 2 != 0 {
+                if matches!(cell.styles[1], 3 | 5 | 6 | 15 | 23) {
+                    repaint(&mut repainted_doors, false);
+                } else {
+                    repaint(&mut repainted_solids, false);
+                }
+            }
+        }
+    }
+    let mut with_door_paint = Canvas::new(800, 600, [0, 0, 0]);
+    let mut with_solid_paint = Canvas::new(800, 600, [0, 0, 0]);
+    draw(
+        &opened.world,
+        &repainted_doors,
+        &mut opened.assets,
+        &camera,
+        &mut with_door_paint,
+    );
+    draw(
+        &opened.world,
+        &repainted_solids,
+        &mut opened.assets,
+        &camera,
+        &mut with_solid_paint,
+    );
+    for [x, y] in [[676usize, 193], [729, 161]] {
+        assert_eq!(
+            at(&with_door_paint, x, y),
+            at(&actual, x, y),
+            "cap ({x}, {y}) must read the surviving wall's pattern, not the cut door's"
+        );
+        assert_ne!(
+            at(&with_solid_paint, x, y),
+            at(&actual, x, y),
+            "cap ({x}, {y}) should change when its surviving wall is repainted"
         );
     }
 }

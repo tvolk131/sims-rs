@@ -68,8 +68,8 @@ pub struct Cap {
 pub struct Corner {
     /// The corner in the view.
     pub view: [i32; 2],
-    /// The wall in each slot (records only): leaving the corner toward
-    /// view -y or (-1, -1), -x or (-1, 1), +y or (1, 1), +x or (1, -1).
+    /// The wall in each slot: leaving the corner toward view -y or
+    /// (-1, -1), -x or (-1, 1), +y or (1, 1), +x or (1, -1).
     pub slots: [Option<usize>; 4],
     /// Whether the original keeps a record here. Elsewhere a run passes
     /// straight through and its own drawing lays the trim.
@@ -80,6 +80,10 @@ pub struct Corner {
     pub cut: u8,
     /// The cap, and whether it takes the cut wall shape.
     pub cap: Option<(Cap, bool)>,
+    /// For a mid-run cap (`!record`), the run's last segment in unrotated
+    /// lot order, whose seen-side room the original stores on the run at
+    /// `0x53f95b..0x53fac7` and reuses at `0x53dc6d` / `0x53e701`.
+    pub(crate) cap_light: Option<usize>,
 }
 
 /// The walls and corners of one level.
@@ -300,34 +304,72 @@ impl Corners {
         }
         // Where a run passes straight through, the run's own drawing lays
         // the trim and, at a cut doorway or fence join along X or Y, the
-        // wall end cap (0x53de05 to 0x53e77c).
-        for (corner, (list, _)) in &at {
-            let c = corners.get_mut(corner).unwrap();
-            if c.record {
-                continue;
+        // wall end cap (0x53de05 to 0x53e77c). Each run is processed
+        // independently so a crossing diagonal never drops a straight run's
+        // cap or cut trim.
+        let run_end = |start: usize| -> usize {
+            let mut last = start;
+            let dir = [
+                (walls[last].lot[1][0] - walls[last].lot[0][0]).abs(),
+                (walls[last].lot[1][1] - walls[last].lot[0][1]).abs(),
+            ];
+            loop {
+                let next_corner = walls[last].lot[0].max(walls[last].lot[1]);
+                if corners.get(&next_corner).is_none_or(|c| c.record) {
+                    break;
+                }
+                let Some((list, _)) = at.get(&next_corner) else {
+                    break;
+                };
+                let Some(&next_wall) = list.iter().find(|&&m| {
+                    let lo = walls[m].lot[0].min(walls[m].lot[1]);
+                    let hi = walls[m].lot[0].max(walls[m].lot[1]);
+                    m != last && lo == next_corner && [hi[0] - lo[0], hi[1] - lo[1]] == dir
+                }) else {
+                    break;
+                };
+                last = next_wall;
             }
-            let straight_pairs: Vec<(Line, usize, usize)> = list
-                .iter()
-                .filter_map(|&prev| {
-                    let (line, [_, hi]) = walls[prev].run();
-                    if !matches!(line, Line::X | Line::Y) || hi != c.view {
-                        return None;
-                    }
-                    let curr = list.iter().copied().find(|&m| {
-                        let (l, [lo, _]) = walls[m].run();
-                        m != prev && l == line && lo == c.view
-                    })?;
-                    Some((line, prev, curr))
-                })
-                .collect();
-            if list.len() == 2
-                && let Some(&(line, prev, curr)) = straight_pairs.first()
-            {
+            last
+        };
+        let straight_corners: Vec<_> = at
+            .iter()
+            .filter(|(corner, _)| !corners[*corner].record)
+            .map(|(&corner, (list, _))| {
+                let view = corners[&corner].view;
+                let pairs: Vec<_> = list
+                    .iter()
+                    .filter_map(|&prev| {
+                        let (line, [_, hi]) = walls[prev].run();
+                        if !matches!(line, Line::X | Line::Y) || hi != view {
+                            return None;
+                        }
+                        let curr = list.iter().copied().find(|&m| {
+                            let (l, [lo, _]) = walls[m].run();
+                            m != prev && l == line && lo == view
+                        })?;
+                        Some((line, prev, curr, run_end(curr)))
+                    })
+                    .collect();
+                (corner, pairs)
+            })
+            .collect();
+        for (corner, pairs) in straight_corners {
+            let list = &at[&corner].0;
+            let c = corners.get_mut(&corner).unwrap();
+            let mut handled = Vec::new();
+            for (line, prev, curr, light_wall) in pairs {
+                handled.push(prev);
+                handled.push(curr);
                 let (prev_bit, curr_bit, prev_mark, curr_mark) = match line {
                     Line::X => (2u8, 8u8, 4u8, 2u8),
                     Line::Y => (1u8, 4u8, 2u8, 4u8),
                     _ => unreachable!(),
                 };
+                // Straight-run segments own their straight slots even when a
+                // diagonal crosses the same corner.
+                c.slots[slot(prev_bit).unwrap()] = Some(prev);
+                c.slots[slot(curr_bit).unwrap()] = Some(curr);
                 let (pw, cw) = (&walls[prev], &walls[curr]);
                 let (pf, cf) = (flags[prev], flags[curr]);
                 // 0x53de05..0x53de4e: cut state follows `curr` if solid, else
@@ -381,24 +423,31 @@ impl Corners {
                 let trim_cut = is_cut && cf & curr_mark == 0;
                 if mask != 0 {
                     if trim_cut {
-                        c.cut = mask;
+                        c.cut |= mask;
                     } else {
-                        c.standing = mask;
+                        c.standing |= mask;
                     }
                 }
                 // 0x53e3c0..0x53e4ca: draw the exposed wall end cap when a
                 // cut doorway or fence join leaves a single straight bit.
-                if cap_flag && mask != 0 {
+                if cap_flag
+                    && mask != 0
+                    && let Some(desc) = cap(mask, 0, 0)
+                {
                     let cap_low = if door_like(cw.style) && pf & 1 == 0 {
                         false
                     } else {
                         is_cut
                     };
-                    c.cap = cap(mask, 0, 0).map(|desc| (desc, cap_low));
+                    c.cap = Some((desc, cap_low));
+                    c.cap_light = Some(light_wall);
                 }
-                continue;
             }
+            let (mut other_standing, mut other_cut) = (0u8, 0u8);
             for &i in list {
+                if handled.contains(&i) {
+                    continue;
+                }
                 let w = &walls[i];
                 let d = w.other(c.view);
                 let b = bit([d[0] - c.view[0], d[1] - c.view[1]]);
@@ -406,14 +455,16 @@ impl Corners {
                     continue;
                 }
                 if !w.cut {
-                    c.standing |= b;
+                    other_standing |= b;
                 } else if !door_like(w.style) {
-                    c.cut |= b;
+                    other_cut |= b;
                 }
             }
-            if c.standing != 0 {
-                c.cut = 0;
+            if other_standing != 0 {
+                other_cut = 0;
             }
+            c.standing |= other_standing;
+            c.cut |= other_cut;
         }
         let mut order: Vec<[i32; 2]> = corners
             .iter()
@@ -700,5 +751,53 @@ mod tests {
         ]);
         let fd = &fence_door.corners[&[5, 6]];
         assert_eq!((fd.standing, fd.cut, fd.cap), (0, 0, None));
+    }
+
+    #[test]
+    fn a_crossing_diagonal_keeps_the_straight_runs_cap_and_cut_trim() {
+        // Straight X run: cut plain wall (5,5)-(6,5), cut door (6,5)-(7,5),
+        // cut plain wall (7,5)-(8,5), crossed at (6,5) by a standing
+        // diagonal (5,6)-(6,5) (bit 0x20, sharing slot 1 with bit 2!).
+        // Putting the diagonal first verifies straight-slot precedence too.
+        let c = Corners::new(vec![
+            styled_wall([5, 6], [6, 5], 1, false),
+            styled_wall([5, 5], [6, 5], 1, true),
+            styled_wall([6, 5], [7, 5], 23, true),
+            styled_wall([7, 5], [8, 5], 1, true),
+        ]);
+        let cross = &c.corners[&[6, 5]];
+        assert!(!cross.record);
+        // The standing diagonal keeps its standing trim (0x20) without
+        // suppressing the straight run's cut trim (bit 2).
+        assert_eq!(cross.standing & 0x20, 0x20);
+        assert_eq!(cross.cut & 2, 2);
+        // Slot 1 points to the straight plain wall (index 1), not the
+        // diagonal (index 0), and the mid-run cap is low in slot 1.
+        assert_eq!(cross.slots[1], Some(1));
+        assert_eq!(cross.cap.map(|(d, low)| (d.slot, low)), Some((1, true)));
+        // Both mid-run caps along the 3-segment run take room light from
+        // the run's last segment in unrotated lot order (index 3).
+        assert_eq!(cross.cap_light, Some(3));
+        assert_eq!(c.corners[&[7, 5]].cap_light, Some(3));
+    }
+
+    #[test]
+    fn mid_run_cap_light_follows_the_runs_lot_order_end_at_rotated_views() {
+        // Same 3-segment X run in lot coords, viewed at rotation 2 (view
+        // runs along -x, reversing `prev`/`curr` order).
+        let rot2 = |[x, y]: [i32; 2]| [64 - x, 64 - y];
+        let wall_r2 = |a, b, style, cut| Wall {
+            lot: [a, b],
+            view: [rot2(a), rot2(b)],
+            style,
+            cut,
+        };
+        let c = Corners::new(vec![
+            wall_r2([5, 5], [6, 5], 1, true),
+            wall_r2([6, 5], [7, 5], 23, true),
+            wall_r2([7, 5], [8, 5], 1, true),
+        ]);
+        assert_eq!(c.corners[&[6, 5]].cap_light, Some(2));
+        assert_eq!(c.corners[&[7, 5]].cap_light, Some(2));
     }
 }

@@ -1152,15 +1152,20 @@ impl<'a> Painter<'a> {
             return;
         };
         let pattern = self.sides(index, x, y, s.bit)[front];
-        // The light of the first wall at the corner on the cap's line,
-        // else of the slot's wall (0x53c97f).
-        let lit = c
-            .slots
-            .iter()
-            .flatten()
-            .copied()
-            .find(|&i| corners.walls[i].line() == cap.line)
-            .unwrap_or(owner);
+        // At a corner record, the light of the first wall at the corner on
+        // the cap's line, else of the slot's wall (0x53c97f). Along a run
+        // (`!c.record`), the run's seen-side room stored at `0x53f95b..0x53fac7`
+        // and read once at `0x53dc6d` / reused at `0x53e701`.
+        let lit = if c.record {
+            c.slots
+                .iter()
+                .flatten()
+                .copied()
+                .find(|&i| corners.walls[i].line() == cap.line)
+                .unwrap_or(owner)
+        } else {
+            c.cap_light.unwrap_or(owner)
+        };
         // At a corner record, in the light its room shows through the setter
         // (0x53c9df), or without a room there in full light (0x53c9e9). Along
         // a run (`!c.record`, 0x53e701), without a room the run's light stays
@@ -1643,8 +1648,8 @@ fn object_edge(position: [i32; 3], data: &[i16]) -> Option<Edge> {
     Some(edge(a, b))
 }
 
-/// The wall style whose cut-down shape a cut wall with a door or window in
-/// it takes.
+/// The wall style whose cut-down shape a cut window wall (style 22) and wall
+/// caps take (`0x53ead5`, `0x53e652`).
 const PLAIN_STYLE: u16 = 1;
 
 /// A wall face: the pattern's frame cut to the shape's frame. A wall with
