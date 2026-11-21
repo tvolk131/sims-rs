@@ -194,6 +194,18 @@ pub struct World {
     /// apart so that the encodings of the states before it was kept stay a
     /// prefix of the new ones.
     pub characters: Characters,
+    /// The person types whose portrait the interface has built this
+    /// session, by GUID: those whose entry in the interface's table of
+    /// person types (0x6f2698, one 0x44-byte entry for each person
+    /// definition the catalog holds, 0x4e8b3d) has its first image (entry
+    /// +0x14, checked by 0x4e92a8). Building one when the type has no
+    /// person on the lot makes a person and removes it at once
+    /// (0x4e8c5d, 0x4e9652), which draws from the C runtime's stream, so
+    /// what the interface has built is kept. Only the dialog's builds are
+    /// counted (see `sims_vm`'s Dialog primitive). Kept apart so that the
+    /// encodings of the states before it was kept stay a prefix of the new
+    /// ones.
+    pub portraits: BTreeSet<u32>,
 }
 
 /// How many advertisements the record of [`World::advertisement_record`]
@@ -554,6 +566,7 @@ impl World {
             held_poses: BTreeMap::new(),
             stops_asked: BTreeSet::new(),
             characters: Characters::default(),
+            portraits: BTreeSet::new(),
         }
     }
 

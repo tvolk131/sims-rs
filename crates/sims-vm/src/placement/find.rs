@@ -37,6 +37,7 @@ use super::{
 use crate::fault::{Fault, Trap};
 use crate::interpreter::Interpreter;
 use sims_sim::World;
+use std::collections::BTreeMap;
 
 /// The lot's arrays these tests read, by ID, with their cell sizes.
 const HEIGHTS: u16 = 0;
@@ -425,11 +426,74 @@ fn grid_word(world: &World, a: i8, b: i8, level: i32) -> Result<i16, Trap> {
 }
 
 /// A tile's room, from the level's room map.
-fn room(world: &World, a: i8, b: i8, level: i32) -> Result<i16, Trap> {
+/// Each tile [`Interpreter::search_from_anywhere`] ends on (None for no
+/// tile), with the starts that end there.
+pub(crate) type Ends = BTreeMap<Option<[i8; 2]>, Vec<[i8; 2]>>;
+
+pub(super) fn room(world: &World, a: i8, b: i8, level: i32) -> Result<i16, Trap> {
     let map = &world.rooms.map[level_index(level)?];
     map.get(cell(a, b)?)
         .copied()
         .ok_or_else(|| Trap::Invalid("the lot has no room map".into()))
+}
+
+/// The tile the search starts from (0x4349e5 to 0x434a3b): the tile of
+/// `from`, clamped inside the lot's border.
+fn start_tile(size: i32, from: [i32; 2]) -> [i8; 2] {
+    let clamp = |n: i32| {
+        let mut tile = (n >> 4) as i8;
+        if i32::from(tile) >= size - 1 {
+            tile = (size - 2) as i8;
+        }
+        tile.max(1)
+    };
+    [clamp(from[0]), clamp(from[1])]
+}
+
+/// The search's walk from `start` (0x434a3b to 0x434c34): up to 4096
+/// tiles, giving up once it has stepped outside the border eight times
+/// the lot's size in a row, and taking the first tile inside the border
+/// that `open` takes.
+fn walk<E>(
+    size: i32,
+    start: [i8; 2],
+    direction: Option<i32>,
+    mut open: impl FnMut([i8; 2]) -> Result<bool, E>,
+) -> Result<Option<[i8; 2]>, E> {
+    let limit = size * 8;
+    if limit <= 0 {
+        return Ok(None);
+    }
+    let inside = |n: i8| n >= 1 && i32::from(n) < size - 1;
+    let (mut dx, mut dy) = (0i32, 0i32);
+    let mut outside = 0;
+    let mut count = 0;
+    loop {
+        if count >= 0x1000 {
+            return Ok(None);
+        }
+        let a = start[0].wrapping_add(dx as i8);
+        let b = start[1].wrapping_add(dy as i8);
+        if !(inside(a) && inside(b)) {
+            outside += 1;
+        } else {
+            outside = 0;
+            if open([a, b])? {
+                return Ok(Some([a, b]));
+            }
+        }
+        // The record keeps the raw direction (0x434803 to 0x434817), and
+        // -1 there is the spiral (0x434ba9): a line search from an object
+        // facing -1 (or -3 turned by 2) spirals.
+        match direction {
+            None | Some(-1) => spiral_step(&mut dx, &mut dy),
+            Some(direction) => line_step(direction, &mut dx, &mut dy),
+        }
+        count += 1;
+        if outside >= limit {
+            return Ok(None);
+        }
+    }
 }
 
 /// One step of the search's square spiral (0x434ba9 with direction -1):
@@ -596,48 +660,66 @@ impl Interpreter<'_> {
         if size > FULL {
             return Err(fail(Trap::Unsupported(format!("a lot {size} tiles wide"))));
         }
-        let clamp = |n: i32| {
-            let mut tile = (n >> 4) as i8;
-            if i32::from(tile) >= size - 1 {
-                tile = (size - 2) as i8;
-            }
-            tile.max(1)
-        };
-        let start = [clamp(from[0]), clamp(from[1])];
+        let start = start_tile(size, from);
         let start_room = room(world, start[0], start[1], level).map_err(fail)?;
-        let limit = size * 8;
-        if limit <= 0 {
-            return Ok(None);
+        let found = walk(size, start, direction, |tile| {
+            self.open(world, id, tile, level, start_room, rules)
+        })?;
+        Ok(found.map(|[a, b]| [(i32::from(a) << 4) | 8, (i32::from(b) << 4) | 8]))
+    }
+
+    /// Where [`Interpreter::search`] (a spiral, with no random start) ends
+    /// for each tile inside the border it may start from: each tile it
+    /// takes (None where it takes none) with the starts that end there, in
+    /// order of their first and then second coordinate. Each tile's tests
+    /// but the room's are made once, when some start first reaches it; they
+    /// are the same from every start. A test that faults where only some
+    /// starts reach it faults here.
+    pub(crate) fn search_from_anywhere(
+        &self,
+        world: &mut World,
+        id: u16,
+        level: i32,
+        rules: Rules,
+    ) -> Result<Ends, Fault> {
+        let fail = |trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        };
+        let size = i32::from(world.size);
+        if size > FULL {
+            return Err(fail(Trap::Unsupported(format!("a lot {size} tiles wide"))));
         }
-        let (mut dx, mut dy) = (0i32, 0i32);
-        let mut outside = 0;
-        let mut count = 0;
-        loop {
-            if count >= 0x1000 {
-                return Ok(None);
-            }
-            let a = start[0].wrapping_add(dx as i8);
-            let b = start[1].wrapping_add(dy as i8);
-            if !inside(world, a, b) {
-                outside += 1;
-            } else {
-                outside = 0;
-                if self.open(world, id, [a, b], level, start_room, rules)? {
-                    return Ok(Some([(i32::from(a) << 4) | 8, (i32::from(b) << 4) | 8]));
-                }
-            }
-            // The record keeps the raw direction (0x434803 to 0x434817), and
-            // -1 there is the spiral (0x434ba9): a line search from an
-            // object facing -1 (or -3 turned by 2) spirals.
-            match direction {
-                None | Some(-1) => spiral_step(&mut dx, &mut dy),
-                Some(direction) => line_step(direction, &mut dx, &mut dy),
-            }
-            count += 1;
-            if outside >= limit {
-                return Ok(None);
+        let anywhere = Rules {
+            same_room: false,
+            ..rules
+        };
+        let mut known: Vec<Option<bool>> = vec![None; (FULL * FULL) as usize];
+        let mut ends: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        // The tiles `start_tile` may give: inside the border, or 1,1 on a
+        // lot too small to have an inside.
+        let last = (size - 2).max(1);
+        for x in 1..=last {
+            for y in 1..=last {
+                let start = [x as i8, y as i8];
+                let start_room = room(world, start[0], start[1], level).map_err(fail)?;
+                let end = walk(size, start, None, |[a, b]| {
+                    if rules.same_room && room(world, a, b, level).map_err(fail)? != start_room {
+                        return Ok(false);
+                    }
+                    let at = cell(a, b).map_err(fail)?;
+                    if let Some(open) = known[at] {
+                        return Ok(open);
+                    }
+                    let open = self.open(world, id, [a, b], level, start_room, anywhere)?;
+                    known[at] = Some(open);
+                    Ok(open)
+                })?;
+                ends.entry(end).or_default().push(start);
             }
         }
+        Ok(ends)
     }
 
     /// The search's tests of one tile inside the border.

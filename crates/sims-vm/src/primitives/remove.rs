@@ -218,9 +218,13 @@ impl Machine<'_, '_> {
             // lot earlier in this tick: the second refresh joins the
             // first, both pending until my animator's tick.
             if let Some(refreshing) = self.refreshing.filter(|r| r.borrow().person == id) {
-                let mut refreshing = refreshing.borrow_mut();
-                if let Some(pending) = refreshing.pending.as_mut() {
-                    self.interpreter().refresh_again(self.world, id, pending)?;
+                // Out of the cell while the refresh is worked out, which
+                // copies the cell (`crate::both_ways::Cells`).
+                let pending = refreshing.borrow().pending.clone();
+                if let Some(mut pending) = pending {
+                    self.interpreter()
+                        .refresh_again(self.world, id, &mut pending)?;
+                    refreshing.borrow_mut().pending = Some(pending);
                 }
             }
         }
@@ -244,6 +248,8 @@ impl Machine<'_, '_> {
                     }
                     refreshing.pending = Some(pending);
                 }
+                // A tree run alone (no person's tick: a person's tick
+                // always has a pass, `Interpreter::tick_person`) drops it.
                 None => {
                     if let Some(taken_off) = self.taken_off {
                         taken_off.borrow_mut().insert(id, pending);

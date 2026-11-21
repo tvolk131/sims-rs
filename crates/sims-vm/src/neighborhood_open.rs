@@ -24,7 +24,7 @@ pub use pools::{LotTransition, OpenedPools, PoolInput, PoolPerson};
 use crate::boot::BootError;
 use sims_content::family_import::{clone_character, refresh_outfits};
 use sims_content::{
-    Catalog, ImportWardrobe, Index, Install, Neighborhood, skeleton_name, skeleton_scales,
+    AvatarRegistry, Catalog, ImportWardrobe, Index, Install, Neighborhood, skeleton_name,
 };
 use sims_core::CrtRng;
 use sims_formats::family_file::FamilyFile;
@@ -284,8 +284,11 @@ fn pool_skeletons(
         }
         skeletons.templates.insert(entry.guid, name);
     }
+    let mut avatars = AvatarRegistry::load(install)?;
     for name in names {
-        let scales = skeleton_scales(install, index, &name).map_err(|error| error.to_string());
+        let scales = avatars
+            .skeleton_scales(&name)
+            .map_err(|error| error.to_string());
         skeletons.scales.insert(name, scales);
     }
     Ok(skeletons)

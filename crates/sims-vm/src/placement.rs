@@ -54,17 +54,20 @@ pub(crate) use find::{
 /// A person's own tick while its thread runs: the person, and the
 /// animator refresh its taking itself off the lot left pending
 /// ([`Interpreter::take_self_off`]).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Refreshing {
     pub person: u16,
     pub pending: Option<Pending>,
+    /// Whether a step is running both ways with the refresh taken out
+    /// (`crate::both_ways`).
+    pub both_ways: bool,
 }
 
 /// A person's animator refresh at its taking itself off the lot, worked
 /// out then (`Interpreter::refresh_at_take_off`): the animator and base
 /// layer the take-off left, and those the refresh would have left
 /// instead. The refresh writes nothing else.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Pending {
     pub left: Kept,
     pub refreshed: Kept,
@@ -249,9 +252,11 @@ mod word {
 }
 
 /// Callbacks placement asks about without running them here.
-const SEAT: usize = 26;
+pub(crate) const SEAT: usize = 26;
+/// The callback the removal asks before it takes an object off (0x433148).
+const BEFORE_REMOVAL: usize = 10;
 const SEAT_CHANGED: usize = 25;
-const WALLS_CHANGED: usize = 6;
+pub(crate) const WALLS_CHANGED: usize = 6;
 
 /// Where an object is, or is to go (0x4325b5, 0x432844).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1250,6 +1255,194 @@ impl Interpreter<'_> {
             world.mark_room(room);
         }
         Ok(())
+    }
+
+    /// The put of a person made for a dialog's portrait (0x4e96c5 to
+    /// 0x4e9704). The interface searches for a tile ([`Self::search`],
+    /// 0x4347f0, with the defaults of 0x4347d1: a spiral on the ground
+    /// level, in the start tile's room, on an empty tile) from the house
+    /// view's centre (0x4a677c), and puts the person there (virtual
+    /// function 0x88, 0x45e4e9: [`Self::put_person`]); with no tile it
+    /// removes the person unput (0x4e9706). The view is presentation, so
+    /// the tile the search starts from is an input
+    /// ([`Interpreter::view_centre`]): the tile after the interface's work
+    /// on the view's pick, which is not ported (by a reading of the
+    /// disassembly, **unverified**: a bounds check with a fallback,
+    /// 0x434891, then the view's rotation undone, 0x43491c, and a clamp).
+    /// When it is given the search is made from it, and when it is not the
+    /// search is made from every tile it may start from. The put is done
+    /// only as far as it is the same on every tile the search may end on:
+    /// the interface's work for an object come from outside
+    /// ([`Self::placed_from_outside`], 0x44752e). The person's removal,
+    /// which the caller then makes, is taken to undo the rest of the put
+    /// (the rooms, 0x440385; the tiles, 0x4330d7; **unverified**).
+    ///
+    /// It fails loudly where the tile would matter:
+    ///
+    /// 1. the person's definition names a tree for a function the put or
+    ///    the removal asks: 9 (placed, 0x433580), 6 (walls changed,
+    ///    0x435110), 25 and 26 (a seat: the objects beside it may be asked
+    ///    their function 9, 0x433612) and 10 (before the removal,
+    ///    0x433148, which sees the room it was put in). Its Init (function
+    ///    0) runs when it is made, as for any person;
+    /// 2. with no view centre given, a callback tree the search's place
+    ///    tests run changes the lot or the machine's cells (function 5 of
+    ///    the person and of the objects in its way beside a tile it tries,
+    ///    0x4337f6, 0x434b94, 0x433a1a, 0x433a35): which tiles the original
+    ///    tries depends on the start. One that changes nothing may run, and
+    ///    its answer is used. The calls are not noted in the trace of calls
+    ///    (`Interpreter::asked`). With a view centre given, the search's
+    ///    callbacks run as they do in the original;
+    /// 3. after the search, data word 7 is not 0: the room it is put in and
+    ///    taken from is marked as not counted for its light (0x433ed8,
+    ///    0x4412c6);
+    /// 4. after the search, data word 40 has bit 0x400: the room it is put
+    ///    in is marked as not counted (0x433340);
+    /// 5. no tile is found (from the view centre, or with none given from
+    ///    some start): the original then removes it unput (0x4e9706), and
+    ///    builds again in the same dialog (0x4e938c) unless the type has
+    ///    image 2002; neither is ported;
+    /// 6. noting the room of the tile the search ends on (with no view
+    ///    centre given, any it may end on) changes a room's mark of who is
+    ///    in it ([`World::note_occupant`] through [`Self::note_room`],
+    ///    0x45e43d, 0x468802), for a person of kind 0 or 1 (person word
+    ///    65; a pet is above 1): an indoor room that is not a pool and not
+    ///    marked is marked, and the room the person was last seen in (as
+    ///    its first tick may have noted it) loses its mark when nobody else
+    ///    was last seen there. The removal leaves the marks;
+    /// 7. the lot has no indicators yet: the interface's work for an object
+    ///    come from outside makes them (0x445e4a, from 0x44752e), and their
+    ///    Init runs while the original's person stands on its tile, in its
+    ///    room, which here it does not.
+    pub(crate) fn portrait_put(&self, world: &mut World, id: u16) -> Result<(), Fault> {
+        let fail = |what: String| Fault {
+            object: id,
+            at: None,
+            trap: Trap::Unsupported(format!(
+                "a dialog's portrait puts a person on a tile searched for from the house view's \
+                 centre (0x4e96dd, 0x4347f0, 0x4a677c; `Lot::set_view_centre`), and {what}"
+            )),
+        };
+        let datum = |world: &World, index: usize| {
+            datum(world, id, index).map_err(|trap| Fault {
+                object: id,
+                at: None,
+                trap,
+            })
+        };
+        for (function, at) in [
+            (WALLS_CHANGED, "0x435110"),
+            (function::PLACED, "0x433580"),
+            (BEFORE_REMOVAL, "0x433148"),
+            (SEAT_CHANGED, "0x433612"),
+            (SEAT, "0x433612"),
+        ] {
+            let tree = self.function_tree(world, id, function);
+            if tree != 0 {
+                return Err(fail(format!(
+                    "the person's function {function} names tree {tree} ({at})"
+                )));
+            }
+        }
+        let rules = Rules {
+            same_room: true,
+            empty: true,
+            unmarked: false,
+        };
+        let ends = match self.view_centre {
+            Some([x, y]) => {
+                let from = [(i32::from(x) << 4) | 8, (i32::from(y) << 4) | 8];
+                let Some([a, b]) = self.search(world, id, from, 1, rules)? else {
+                    return Err(fail(format!(
+                        "from the view centre {x},{y} no tile is found: the original removes it \
+                         unput (0x4e9706), which is not ported"
+                    )));
+                };
+                BTreeSet::from([Some([(a >> 4) as i8, (b >> 4) as i8])])
+            }
+            None => {
+                // On a copy of the lot and of the machine's cells, with
+                // every callback tree the search's place tests run held to
+                // leave both as they were.
+                let mut copy = world.clone();
+                let cells = crate::both_ways::Cells::of(self);
+                let probe = Interpreter {
+                    asked: None,
+                    callbacks_must_be_pure: true,
+                    ..cells.on(self)
+                };
+                let mut ends = probe.search_from_anywhere(&mut copy, id, 1, rules)?;
+                if let Some(starts) = ends.remove(&None) {
+                    let listed: Vec<String> = starts
+                        .iter()
+                        .take(8)
+                        .map(|[x, y]| format!("{x},{y}"))
+                        .collect();
+                    return Err(fail(format!(
+                        "no view centre is given, and from {} of the starts ({}{}) no tile is \
+                         found: the original removes it unput (0x4e9706), which is not ported",
+                        starts.len(),
+                        listed.join("; "),
+                        if starts.len() > 8 { "; ..." } else { "" },
+                    )));
+                }
+                ends.into_keys().collect()
+            }
+        };
+        // The words are read after the search, whose callbacks may set
+        // them when a view centre is given.
+        if datum(world, data::LIGHTS_ROOM)? != 0 {
+            return Err(fail(
+                "data word 7 marks the room it is put in as not counted for its light (0x433ed8, \
+                 0x4412c6)"
+                    .into(),
+            ));
+        }
+        if datum(world, data::FLAGS_2)? as u16 & 0x400 != 0 {
+            return Err(fail(
+                "data word 40 bit 0x400 marks the room it lands in as not counted (0x433340)"
+                    .into(),
+            ));
+        }
+        // The rooms the put notes ([`Self::note_room`]) for each room the
+        // search may end in, on a copy: it must change no room's mark.
+        let mut rooms = BTreeSet::new();
+        for [a, b] in ends.into_iter().flatten() {
+            rooms.insert(find::room(world, a, b, 1).map_err(|trap| Fault {
+                object: id,
+                at: None,
+                trap,
+            })?);
+        }
+        for room in rooms {
+            let mut copy = world.clone();
+            if let Some(word) = copy
+                .objects
+                .get_mut(&id)
+                .and_then(|o| o.data.get_mut(data::ROOM))
+            {
+                *word = room;
+            }
+            self.note_room(&mut copy, id).map_err(|trap| Fault {
+                object: id,
+                at: None,
+                trap,
+            })?;
+            if copy.rooms != world.rooms {
+                return Err(fail(format!(
+                    "it may land in room {room}, and noting that changes the rooms' marks of who \
+                     is in them (0x45e43d, 0x468802), which its removal leaves"
+                )));
+            }
+        }
+        if world.indicators[0] == 0 {
+            return Err(fail(
+                "the lot has no indicators yet: they are made (0x445e4a, from 0x44752e) while \
+                 the person stands on its tile, which is not ported"
+                    .into(),
+            ));
+        }
+        self.placed_from_outside(world, id)
     }
 
     /// What the interface does when an object comes onto the lot from

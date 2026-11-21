@@ -77,6 +77,13 @@ fn rejects_truncation() {
 }
 
 #[test]
+fn an_entry_starting_with_ff_fe_is_not_a_byte_order_mark() {
+    // The original copies an entry's bytes as they are (0x470404).
+    let table = StringTable::parse(b"\xff\xff\x01\x00\xff\xfe$Job\0").unwrap();
+    assert_eq!(table.entries[0].text, "\u{ff}\u{fe}$Job");
+}
+
+#[test]
 fn a_resource_is_read_in_its_flags_byte_order() {
     const LITTLE: u16 = 0x10;
     let read = |data: &[u8], flags| texts(&StringTable::parse_chunk(data, flags).unwrap()).len();
@@ -99,4 +106,12 @@ fn a_resource_is_read_in_its_flags_byte_order() {
     big.extend(std::iter::repeat_n(0, 0x8000));
     assert_eq!(read(&big, LITTLE), 0);
     assert_eq!(read(b"\xff\xfe\x00\x80", 0), 0);
+}
+
+#[test]
+fn decode_keeps_leading_bom_bytes_in_the_code_page() {
+    assert_eq!(decode(b"\xef\xbb\xbfadult", 1), "\u{ef}\u{bb}\u{bf}adult");
+    assert_eq!(decode(b"\xff\xfeA", 1), "\u{ff}\u{fe}A");
+    let table = StringTable::parse(b"\xff\xff\x01\x00\xef\xbb\xbfadult\0").unwrap();
+    assert_eq!(table.get(0, 1), Some("\u{ef}\u{bb}\u{bf}adult"));
 }
