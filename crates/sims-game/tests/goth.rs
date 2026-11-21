@@ -2742,15 +2742,12 @@ fn the_recorded_read_order_replayed_in_the_window_matches_the_recording() {
     game.hover(recorded([384, 262]));
     assert_eq!(game.listed(), None);
     // The original listed the bookcase's pie with the pointer at the
-    // recording's (384, 250), a wall pixel in our frame, where our pick
-    // finds the door. While it does, the replay points 7 columns right on
-    // the same row, where our pick finds the bookcase (the recording's
-    // harness did not try that point).
+    // recording's (384, 250). With the sprite pick unprojecting and
+    // widening rectangles against the original's origin column
+    // (`camera.origin[0] + 1`), our pick finds the bookcase at that exact
+    // point too.
     run_to(&mut game, &schedule, 93);
-    let on_bookcase = match game.under(recorded([384, 250])) {
-        Some(id) if id == bookcase => recorded([384, 250]),
-        _ => [488, 296],
-    };
+    let on_bookcase = recorded([384, 250]);
     assert_eq!(game.under(on_bookcase), Some(bookcase));
     // His last result is 1 before and after, as recorded from 84 to 186.
     assert!(last_result(&game));
@@ -3816,11 +3813,13 @@ fn the_recorded_switch_order_replayed_in_the_window_matches_the_recording() {
 
     // Second press on Bella's portrait centres the 800x500 house view on
     // Bella (standing on House 05's height-6 plateau at [374, 446, 1]),
-    // landing at origin [472, -117] so the raw recording coordinates match.
+    // landing on the original's origin [472, -117] (`camera.origin`
+    // [471, -117] in our tile-art convention) so the raw recording
+    // coordinates match to the pixel.
     run_to(&mut game, &schedule, 543);
     game.press(portrait);
     game.release(portrait);
-    assert_eq!(game.view.camera.origin, [472, -117]);
+    assert_eq!(game.view.camera.origin, [471, -117]);
     game.render();
 
     // First approach to the fridge: raw recording hover coordinates match
@@ -3930,8 +3929,9 @@ fn the_recorded_switch_order_replayed_in_the_window_matches_the_recording() {
 /// Centring on any tile of a multi-tile object averages its linked parts'
 /// positions (`0x4071a3`) before rotating and projecting (`0x434ced` →
 /// `0x4a7996`). On the Goth lot, object 25 is a 4-tile object whose parts
-/// average to `[400, 432, 1]`, yielding origin `[432, -142]` (instead of
-/// `[448, -142]` from part 25 alone).
+/// average to `[400, 432, 1]`, yielding native origin `[432, -142]`
+/// (`camera.origin` `[431, -142]` in our tile-art convention, instead of
+/// `[447, -142]` from part 25 alone).
 #[test]
 fn centring_a_multi_tile_object_averages_its_parts() {
     let Some(install) = install() else {
@@ -3953,8 +3953,324 @@ fn centring_a_multi_tile_object_averages_its_parts() {
         game.centre_on(part);
         assert_eq!(
             game.view.camera.origin,
-            [432, -142],
+            [431, -142],
             "centring part {part} of object 25"
         );
     }
+}
+
+/// Track 2's Read A Book pick-and-memory diagnostic recording
+/// (`goth-read-pick-20261121`, 900 updates) replayed through the window's
+/// input layer. Its `frame1`/`frame2`/`frame3` watches (updates 1–84,
+/// 101–719, 731–900) together with its diagnostic pick/tool watches in
+/// updates 85–100 and 720–730 pin the drawn-frame schedule
+/// (`0,1,2,3,33,63,93,123,145,165,183+30`) and confirm that at update 93
+/// the original picked bookcase 132 purely through the 2D sprite pick
+/// (`pick85 = 0 -> 0`, `tool85 = 0 -> 132`) at the exact recorded point
+/// `(384, 250)`. With `pick::sprite` unprojecting and widening rectangles
+/// against the original's origin column (`camera.origin[0] + 1`), our pick
+/// finds bookcase 132 at `recorded([384, 250])` directly.
+///
+/// An unmasked offline comparison across updates 1–900 (all three RNGs,
+/// tick, action serial, scheduler cursor, paused, mode, budget, globals,
+/// and every object's selected flag, position, registry word, data, temps,
+/// attributes, last_result, frames, person data, motives, room, last_decay,
+/// active, previous, and queue) found exactly eight raw differences: four
+/// `person.data[37]` routing words marked unknown in
+/// `routing.unknown_words` (objects 16, 18, 21, 259), two stale frame
+/// locals marked unknown in `frame_storage` (object 21 tree 8301 local 0
+/// at 668–678; object 259 tree 4099 local 7 at 14–596), and Mortimer's
+/// `data[50]` (724–900) and `last_result` (724–868) from the recording's
+/// Wine 8.0 `GetClipStatus` stub listing salesman 259 under the still
+/// pointer at 723 (`pick720 = 0 -> 0`, `tool720 = 0 -> 259`). See
+/// `docs/decisions/20261121-sprite-pick-origin-column-and-sit-read-pick-replays.md`.
+#[test]
+fn the_recorded_read_order_with_the_pick_watched_replayed_in_the_window_matches_the_recording() {
+    let Some(install) = install() else {
+        return;
+    };
+    let frames = Frames::parse("0,1,2,3,33,63,93,123,145,165,183+30").expect("a schedule");
+    let schedule = frames.clone();
+    let mut game = Game::open(&Options {
+        frames,
+        ..options(install)
+    })
+    .expect("the Goth house opens");
+    game.resize([800, 600]);
+    let (alexander, bella, mortimer, bookcase, salesman) = (16, 18, 21, 132, 259);
+    assert_eq!(game.lot().world().selected(), Some(mortimer));
+    let last_result = |game: &Game| game.lot().world().objects[&mortimer].last_result;
+    let person = |game: &Game, id: u16| game.lot().world().objects[&id].person.clone().unwrap();
+
+    run_to(&mut game, &schedule, 89);
+    game.hover(recorded([384, 262]));
+    assert_eq!(game.under(recorded([384, 262])), None);
+    assert_eq!(game.listed(), None);
+
+    // At update 93 the original's `tool85` wrote 0 -> 132 with `pick85`
+    // staying 0 at (384, 250). Ours picks bookcase 132 at the exact point.
+    run_to(&mut game, &schedule, 93);
+    assert_eq!(game.under(recorded([384, 250])), Some(bookcase));
+    assert!(last_result(&game));
+    game.hover(recorded([384, 250]));
+    assert_eq!(game.listed(), Some((mortimer, bookcase)));
+    assert!(last_result(&game));
+
+    // Press at 123 opens the held pie; release at 124 settles it.
+    run_to(&mut game, &schedule, 123);
+    game.press(recorded([384, 250]));
+    game.render();
+    assert!(game.menu().is_some_and(|m| m.held()));
+    let pie: Vec<String> = game
+        .menu()
+        .expect("the bookcase's pie is open")
+        .labels()
+        .into_iter()
+        .map(|(text, _)| text.to_string())
+        .collect();
+    assert_eq!(pie, ["Study Cooking", "Study Mechanical", "Read a Book"]);
+    run_to(&mut game, &schedule, 124);
+    game.release(recorded([384, 250]));
+    assert!(game.menu().is_some_and(|m| !m.held()));
+
+    // Hover Read a Book at 145 checks it; press at 165 holds without
+    // ordering; release at 183 re-checks and orders it (active at 184).
+    run_to(&mut game, &schedule, 145);
+    let read = pie_entry(&game, "Read a Book");
+    let before = game.lot().world().hash();
+    game.hover(read);
+    assert_ne!(game.lot().world().hash(), before);
+    run_to(&mut game, &schedule, 165);
+    game.press(read);
+    assert!(game.menu().is_some_and(|m| m.held()));
+    assert_eq!(person(&game, mortimer).active.uid, 0);
+    assert!(person(&game, mortimer).queue.is_empty());
+    run_to(&mut game, &schedule, 183);
+    game.release(read);
+    assert!(game.menu().is_none());
+    game.hover(recorded([384, 324]));
+    run_to(&mut game, &schedule, 184);
+    let p = person(&game, mortimer);
+    assert_eq!(action(&p.active), (1, bookcase as i16, 4110, 6, 50, 12));
+    assert!(p.queue.is_empty());
+    assert!(!last_result(&game));
+    let stack = &game.lot().world().objects[&mortimer].stack;
+    let locals = |tree: u16| {
+        stack
+            .iter()
+            .find(|f| f.tree == tree)
+            .map(|f| f.locals.clone())
+            .unwrap_or_else(|| panic!("a frame of tree {tree}"))
+    };
+    assert_eq!(locals(4116)[1], 254);
+    assert_eq!(locals(4114)[0], 285);
+
+    // Everyone's room is counted again in the frame after 603.
+    run_to(&mut game, &schedule, 603);
+    for (id, before) in [
+        (alexander, 0x429a_aaab),
+        (bella, 0x4225_ac1d),
+        (mortimer, 0x429a_aaab),
+        (salesman, 0x429a_aaab),
+    ] {
+        assert_eq!(room(&game, id), before, "{id}");
+    }
+    run_to(&mut game, &schedule, 604);
+    for (id, after) in [
+        (alexander, 0x4235_5555),
+        (bella, 0x4277_073c),
+        (mortimer, 0x4235_5555),
+        (salesman, 0x4235_5555),
+    ] {
+        assert_eq!(room(&game, id), after, "{id}");
+    }
+
+    // At 723 the still pointer rests on empty lawn: ours picks nothing,
+    // whereas the Wine capture's stubbed GetClipStatus gave salesman 259
+    // a full-screen +0x170 rectangle so `tool720` wrote 0 -> 259.
+    run_to(&mut game, &schedule, 723);
+    assert_eq!(game.under(recorded([384, 324])), None);
+    run_to(&mut game, &schedule, 900);
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
+}
+
+/// Track 2's Sit + Read screenshot-and-pick recording
+/// (`goth-sit-shots-20261121`, 900 updates) replayed through the window's
+/// input layer: Sit on the porch bench (173, active at 216), then Read a
+/// Book on the bookcase (132, queued behind Mortimer's active action at
+/// 789 and active by 900). Its `frame` watch gives all 35 drawn frames,
+/// `pick` stays 0 throughout, and `tool` pins every hover/press listing
+/// (`173` at 123 and 153, `132` at 695 and 725) plus the Wine 8.0
+/// `GetClipStatus` stub listings under the still pointer (`16` Alexander
+/// at 275 and `383` plumb bob at 305).
+///
+/// An unmasked offline comparison across updates 1–900 (the same full
+/// field set as the Read pick replay above) found exactly eight raw
+/// differences: four `person.data[37]` routing words marked unknown in
+/// `routing.unknown_words` (objects 16, 18, 21, 259), two stale frame
+/// locals marked unknown in `frame_storage` (object 21 tree 8228 local 2
+/// at 478–498; object 259 tree 4099 local 7 at 14–596), and Mortimer's
+/// `last_result` (276–305) and `data[50]` (306–695) from those two Wine
+/// `GetClipStatus` still-pointer listings. See
+/// `docs/decisions/20261121-sprite-pick-origin-column-and-sit-read-pick-replays.md`.
+#[test]
+fn the_recorded_sit_and_read_orders_with_shots_replayed_in_the_window_matches_the_recording() {
+    let Some(install) = install() else {
+        return;
+    };
+    let frames = Frames::parse(
+        "0,1,2,3,33,63,93,123,153,171,192,215,245,275,305,335,365,395,425,455,485,515,545,575,605,635,665,695,725,754,773,788+30",
+    )
+    .expect("a schedule");
+    let schedule = frames.clone();
+    let mut game = Game::open(&Options {
+        frames,
+        ..options(install)
+    })
+    .expect("the Goth house opens");
+    game.resize([800, 600]);
+    let (alexander, mortimer, bookcase, bench) = (16, 21, 132, 173);
+    assert_eq!(game.lot().world().selected(), Some(mortimer));
+    let last_result = |game: &Game| game.lot().world().objects[&mortimer].last_result;
+    let person = |game: &Game, id: u16| game.lot().world().objects[&id].person.clone().unwrap();
+
+    // Order 1: Sit on porch bench 173.
+    run_to(&mut game, &schedule, 85);
+    game.hover(recorded([432, 254]));
+    assert_eq!(game.listed(), None);
+    run_to(&mut game, &schedule, 92);
+    game.hover(recorded([432, 242]));
+    assert_eq!(game.listed(), None);
+    run_to(&mut game, &schedule, 123);
+    assert_eq!(game.under(recorded([432, 230])), Some(bench));
+    game.hover(recorded([432, 230]));
+    assert_eq!(game.listed(), Some((mortimer, bench)));
+    run_to(&mut game, &schedule, 124);
+    assert!(!last_result(&game));
+
+    run_to(&mut game, &schedule, 153);
+    assert!(last_result(&game));
+    game.press(recorded([432, 230]));
+    game.render();
+    assert!(game.menu().is_some_and(|m| m.held()));
+    let sit_pie: Vec<String> = game
+        .menu()
+        .expect("the bench's pie is open")
+        .labels()
+        .into_iter()
+        .map(|(text, _)| text.to_string())
+        .collect();
+    assert_eq!(sit_pie, ["Sit"]);
+    run_to(&mut game, &schedule, 154);
+    assert!(!last_result(&game));
+    run_to(&mut game, &schedule, 155);
+    game.release(recorded([432, 230]));
+    assert!(game.menu().is_some_and(|m| !m.held()));
+
+    run_to(&mut game, &schedule, 171);
+    let sit = pie_entry(&game, "Sit");
+    game.hover(sit);
+    run_to(&mut game, &schedule, 172);
+    assert!(last_result(&game));
+    run_to(&mut game, &schedule, 192);
+    game.press(sit);
+    assert!(game.menu().is_some_and(|m| m.held()));
+    assert_eq!(person(&game, mortimer).active.uid, 0);
+    run_to(&mut game, &schedule, 215);
+    game.release(sit);
+    assert!(game.menu().is_none());
+    game.hover(recorded([432, 155]));
+    run_to(&mut game, &schedule, 216);
+    let p = person(&game, mortimer);
+    assert_eq!(action(&p.active), (1, bench as i16, 8213, 0, 50, 12));
+    assert!(p.queue.is_empty());
+    assert!(!last_result(&game));
+
+    // Under the still pointer at (432, 155) (lawn behind the bedroom),
+    // ours picks nothing at 275 and 305; the Wine capture's stubbed
+    // GetClipStatus listed Alexander (16) at 275 and the plumb bob (383)
+    // at 305 via their full-screen +0x170 rectangles.
+    run_to(&mut game, &schedule, 275);
+    assert_eq!(game.under(recorded([432, 155])), None);
+    run_to(&mut game, &schedule, 305);
+    assert_eq!(game.under(recorded([432, 155])), None);
+
+    // Room update after frame 605.
+    run_to(&mut game, &schedule, 605);
+    assert_eq!(room(&game, alexander), 0x429a_aaab);
+    assert_eq!(room(&game, mortimer), 0x429a_aaab);
+    run_to(&mut game, &schedule, 606);
+    assert_eq!(room(&game, alexander), 0x4231_5555);
+    assert_eq!(room(&game, mortimer), 0x4231_5555);
+
+    // Order 2: Read a Book on bookcase 132 at the exact recorded point
+    // (384, 250).
+    run_to(&mut game, &schedule, 665);
+    game.hover(recorded([384, 262]));
+    assert_eq!(game.under(recorded([384, 262])), None);
+    assert_eq!(game.listed(), None);
+    run_to(&mut game, &schedule, 695);
+    assert_eq!(game.under(recorded([384, 250])), Some(bookcase));
+    game.hover(recorded([384, 250]));
+    assert_eq!(game.listed(), Some((mortimer, bookcase)));
+    run_to(&mut game, &schedule, 696);
+    assert!(last_result(&game));
+
+    run_to(&mut game, &schedule, 725);
+    game.press(recorded([384, 250]));
+    game.render();
+    assert!(game.menu().is_some_and(|m| m.held()));
+    let read_pie: Vec<String> = game
+        .menu()
+        .expect("the bookcase's pie is open")
+        .labels()
+        .into_iter()
+        .map(|(text, _)| text.to_string())
+        .collect();
+    assert_eq!(
+        read_pie,
+        ["Study Cooking", "Study Mechanical", "Read a Book"]
+    );
+    run_to(&mut game, &schedule, 728);
+    game.release(recorded([384, 250]));
+    assert!(game.menu().is_some_and(|m| !m.held()));
+
+    run_to(&mut game, &schedule, 754);
+    let read = pie_entry(&game, "Read a Book");
+    game.hover(read);
+    run_to(&mut game, &schedule, 773);
+    game.press(read);
+    assert!(game.menu().is_some_and(|m| m.held()));
+    run_to(&mut game, &schedule, 788);
+    game.release(read);
+    assert!(game.menu().is_none());
+    game.hover(recorded([384, 324]));
+
+    // Queued behind Mortimer's active autonomous action (uid 7 on object
+    // 217) at 789, followed by uid 9 at 818, and active by 900.
+    run_to(&mut game, &schedule, 789);
+    let p = person(&game, mortimer);
+    assert_eq!(action(&p.active), (7, 217, 4102, 1, 2, 0));
+    assert_eq!(
+        p.queue.iter().map(action).collect::<Vec<_>>(),
+        [(8, bookcase as i16, 4110, 6, 50, 12)]
+    );
+    run_to(&mut game, &schedule, 818);
+    let p = person(&game, mortimer);
+    assert_eq!(action(&p.active), (7, 217, 4102, 1, 2, 0));
+    assert_eq!(
+        p.queue.iter().map(action).collect::<Vec<_>>(),
+        [
+            (8, bookcase as i16, 4110, 6, 50, 12),
+            (9, 259, 4107, 3, 2, 0),
+        ]
+    );
+    run_to(&mut game, &schedule, 900);
+    let p = person(&game, mortimer);
+    assert_eq!(action(&p.active), (8, bookcase as i16, 4110, 6, 50, 12));
+    assert_eq!(
+        p.queue.iter().map(action).collect::<Vec<_>>(),
+        [(9, 259, 4107, 3, 2, 0)]
+    );
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
 }

@@ -1204,6 +1204,14 @@ impl Game {
     /// Moves the camera origin so screen point `at` comes to the middle
     /// of `view_size`, clamped to the original's scroll limits
     /// (`0x4a9fa9`) and x-aligned via `(x + 1) & !3` (`0x4a81cc`).
+    ///
+    /// `sims-render` draws walls and floors at `camera.origin[0]` and
+    /// objects/people at `camera.origin[0] + 1`, whereas the original
+    /// draws walls and floors one column left of `DAT_006f00d0`
+    /// (`0x4ac14b`, `0x4ac25d`) and objects/people at it. So `0x4a9fa9`
+    /// and `0x4a81cc` compute the original's `origin_x`, and we store
+    /// `origin_x - pick::ORIGIN_COLUMN` so both walls and objects land on
+    /// the original's exact screen columns.
     fn centre_screen_point(&mut self, at: [i32; 2], view_size: [i32; 2]) {
         let middle = [view_size[0] / 2, view_size[1] / 2];
         let origin = self.view.camera.origin;
@@ -1213,7 +1221,8 @@ impl Game {
         ];
         let ([min_x, max_x], [min_y, max_y]) =
             scroll_limits(&self.lot_shape, &self.view.camera, view_size);
-        let clamped_x = target[0].max(min_x).min(max_x).wrapping_add(1) & !3;
+        let native_x = target[0].max(min_x).min(max_x).wrapping_add(1) & !3;
+        let clamped_x = native_x.saturating_sub(pick::ORIGIN_COLUMN);
         let clamped_y = target[1].max(min_y).min(max_y);
         self.view.set_origin([clamped_x, clamped_y]);
     }
