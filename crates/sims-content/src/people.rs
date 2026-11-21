@@ -552,9 +552,9 @@ impl People {
             }
             let resource = &index.resources[object.resource];
             let body = body_strings(index, resource, object.chunk)?;
-            let row = |n: usize| body.get(n, 1).map(str::to_owned);
+            let row = |n: usize| body.get(n).cloned();
             let suit_name = |n: usize| {
-                body.get(n, 1)
+                body.get(n)
                     .map(|raw| {
                         raw.split(';')
                             .next()
@@ -589,9 +589,9 @@ impl People {
             );
             let location = resource.location(&index.root);
             let name = body
-                .get(0, 1)
+                .first()
                 .filter(|name| !name.is_empty())
-                .map(str::to_owned)
+                .cloned()
                 .ok_or_else(|| {
                     Error::Unsupported(format!(
                         "{location}: the person's body strings name no skeleton"
@@ -649,9 +649,9 @@ pub fn skeleton_name(index: &Index, catalog: &Catalog, guid: u32) -> Result<Stri
         .ok_or_else(|| Error::Unsupported(format!("no definition has the GUID {guid:#010x}")))?;
     let resource = &index.resources[object.resource];
     let body = body_strings(index, resource, object.chunk)?;
-    body.get(0, 1)
+    body.first()
         .filter(|name| !name.is_empty())
-        .map(str::to_owned)
+        .cloned()
         .ok_or_else(|| {
             Error::Unsupported(format!(
                 "{}: the definition's body strings name no skeleton",
@@ -667,9 +667,29 @@ pub fn skeleton_scales(install: &Install, name: &str) -> Result<Vec<i32>> {
     AvatarRegistry::load(install)?.skeleton_scales(name)
 }
 
+/// US-English entries in the native loader's order (`0x470002`–`0x470049`):
+/// when a later US-English run follows another language, it is inserted ahead
+/// of the earlier run.
+fn loaded_english_rows(entries: &[sims_formats::strings::TextEntry]) -> Vec<String> {
+    let mut loaded: Vec<String> = Vec::new();
+    let mut run = None;
+    let mut place = 0;
+    for entry in entries {
+        if run != Some(entry.language) {
+            run = Some(entry.language);
+            place = 0;
+        }
+        if entry.language == 1 {
+            loaded.insert(place.min(loaded.len()), entry.text.clone());
+            place += 1;
+        }
+    }
+    loaded
+}
+
 /// The body strings of the person definition `chunk` of a character
-/// file.
-fn body_strings(index: &Index, resource: &Resource, chunk: u16) -> Result<StringTable> {
+/// file, in the native loader's US-English order (`0x470002`–`0x470049`).
+fn body_strings(index: &Index, resource: &Resource, chunk: u16) -> Result<Vec<String>> {
     let location = resource.location(&index.root);
     let iff = Iff::parse(resource.read()?).map_err(|e| Error::format(&location, e))?;
     let missing = |what: &str| Error::Unsupported(format!("{location}: {what}"));
@@ -684,8 +704,9 @@ fn body_strings(index: &Index, resource: &Resource, chunk: u16) -> Result<String
     let strings = iff
         .get(b"STR#", table)
         .ok_or_else(|| missing("the person's body strings are missing"))?;
-    StringTable::parse(iff.data(strings))
-        .map_err(|e| Error::format(&format!("{location} STR# #{table}"), e))
+    let parsed = StringTable::parse(iff.data(strings))
+        .map_err(|e| Error::format(&format!("{location} STR# #{table}"), e))?;
+    Ok(loaded_english_rows(&parsed.entries))
 }
 
 /// The skin tone names of a semi-global file: its string table 8192.
@@ -1403,5 +1424,23 @@ xskin-b001-PELVIS-BODY\r\n\
                 .into()
         );
         assert_eq!(head_suits, ["c001_exact".to_string()].into());
+    }
+
+    #[test]
+    fn loaded_english_rows_inserts_later_us_english_run_first() {
+        let entry = |language: u8, text: &str| sims_formats::strings::TextEntry {
+            language,
+            text: text.to_owned(),
+            comment: String::new(),
+            raw_text: text.as_bytes().to_vec(),
+            raw_comment: Vec::new(),
+        };
+        let rows = loaded_english_rows(&[
+            entry(1, "kat"),
+            entry(1, "old_body"),
+            entry(2, "de_filler"),
+            entry(1, "human-custom"),
+        ]);
+        assert_eq!(rows, vec!["human-custom", "kat", "old_body"]);
     }
 }

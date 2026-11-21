@@ -348,30 +348,57 @@ impl Machine<'_, '_> {
         let has_manual_made_suit = self.world.characters.made.get(&self_guid).is_some_and(|m| {
             m.strings.contains_key(&characters::BODY) || m.strings.contains_key(&characters::HEAD)
         });
+        let loaded_body_rows =
+            crate::interpreter::object_definition(self.catalog, self.world, self_guid).and_then(
+                |def| {
+                    let library = self.program.libraries.get(&def.resource)?;
+                    let table = library.definitions.get(&def.chunk)?[19] as u16;
+                    library.loaded_strings.get(&table)
+                },
+            );
+        let src_body_override = self
+            .world
+            .characters
+            .string(self_guid, characters::BODY)
+            .map(str::to_owned);
+        let src_head_override = self
+            .world
+            .characters
+            .string(self_guid, characters::HEAD)
+            .map(str::to_owned);
+        let src_body = src_body_override
+            .as_deref()
+            .or_else(|| match loaded_body_rows {
+                Some(loaded) => loaded
+                    .as_deref()
+                    .and_then(|rows| rows.get(characters::BODY))
+                    .map(String::as_str),
+                None => src.body.as_deref(),
+            });
+        let src_head = src_head_override
+            .as_deref()
+            .or_else(|| match loaded_body_rows {
+                Some(loaded) => loaded
+                    .as_deref()
+                    .and_then(|rows| rows.get(characters::HEAD))
+                    .map(String::as_str),
+                None => src.head.as_deref(),
+            });
         let head_status = if !has_manual_made_suit
             && let Some(&status) = self.world.made_portrait_head.get(&self_guid)
         {
             status
-        } else if src.body.is_none()
-            && src.head.is_none()
+        } else if src_body.is_none()
+            && src_head.is_none()
+            && loaded_body_rows.is_none()
             && self.program.people.portrait_head.get(&self_guid) == Some(&true)
         {
             None
         } else {
-            let body = self.copied_outfit_head_status(
-                src.body.as_deref(),
-                false,
-                src_female,
-                src_child,
-                &src_skin,
-            );
-            let head = self.copied_outfit_head_status(
-                src.head.as_deref(),
-                true,
-                src_female,
-                src_child,
-                &src_skin,
-            );
+            let body =
+                self.copied_outfit_head_status(src_body, false, src_female, src_child, &src_skin);
+            let head =
+                self.copied_outfit_head_status(src_head, true, src_female, src_child, &src_skin);
             match (body, head) {
                 (Some(true), _) | (_, Some(true)) => Some(true),
                 (Some(false), Some(false)) => Some(false),

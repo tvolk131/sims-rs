@@ -200,6 +200,9 @@ impl Interpreter<'_> {
             return Ok(None);
         }
         let template = world.characters.definition(guid);
+        // 0x58833c -> 0x5a0384 -> 0x5a280f resolves skeleton names with
+        // byte-exact comparison (distinct "adult" and "Adult" rigs do not
+        // alias).
         let skeleton = match early_name {
             Some(name)
                 if self
@@ -207,13 +210,13 @@ impl Interpreter<'_> {
                     .people
                     .skeletons
                     .get(&template)
-                    .is_none_or(|s| !s.name.eq_ignore_ascii_case(name)) =>
+                    .is_none_or(|s| s.name != name) =>
             {
                 self.program
                     .people
                     .skeletons
                     .values()
-                    .find(|s| s.name.eq_ignore_ascii_case(name))
+                    .find(|s| s.name == name)
                     .ok_or_else(|| {
                         fail(
                             0,

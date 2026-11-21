@@ -1583,6 +1583,111 @@ fn make_new_character_wardrobe_head_binding_drives_ui_effect_render_and_writebac
     );
     assert_eq!(fx.world.portraits, [WIDGET].into());
     assert_ne!(fx.world.crt_rng, crt_before);
+
+    // 7e. Byte-exact skeleton binding (`0x5a280f`): when distinct "adult" and
+    // "Adult" skeletons exist and loaded_strings names "Adult", the factory
+    // binds "Adult"'s file (not "adult"'s).
+    let (mut fx, file, record) = visitors();
+    let base_skel = fx.program.people.skeletons[&WIDGET].clone();
+    let mut lower_adult = base_skel.clone();
+    lower_adult.name = "adult".into();
+    lower_adult.file = "lower-adult.bcf".into();
+    let mut upper_adult = base_skel;
+    upper_adult.name = "Adult".into();
+    upper_adult.file = "upper-adult.bcf".into();
+    fx.program.people.skeletons.insert(WIDGET, lower_adult);
+    fx.program.people.skeletons.insert(SIM_GUID, upper_adult);
+    fx.words(file)[19] = 200;
+    fx.program
+        .libraries
+        .get_mut(&file)
+        .unwrap()
+        .loaded_strings
+        .insert(200, Some(vec!["Adult".into()]));
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
+        Ok(true)
+    );
+    assert!(fx.world.skeleton_files.contains("upper-adult.bcf"));
+    assert!(!fx.world.skeleton_files.contains("lower-adult.bcf"));
+
+    // 7f. Negative-age copy prefers loader-ordered `loaded_strings` head row
+    // (`0x470049`) over physically ordered `Profile::head`: when the first run
+    // had a matching HEAD suit and the later run placed a comma-past-255 row
+    // at index 2, the native copy misses and writes "" (no portrait).
+    let (mut fx, _, _) = visitors();
+    fx.world.rooms.rooms.get_mut(&1).unwrap().occupied = true;
+    let tpl_file = fx.add_type(TEMPLATE_PERSON, 2, 4096, 4097);
+    fx.add(
+        tpl_file,
+        4096,
+        tree(vec![
+            assign(scope::MY_DATA, 4, scope::LITERAL, 1, 1),
+            assign(scope::MY_DATA, 42, scope::LITERAL, 2, RETURN_TRUE),
+        ]),
+    );
+    fx.add(
+        tpl_file,
+        4097,
+        tree(vec![
+            assign(scope::PARAMETERS, 0, scope::LITERAL, 10, 1),
+            ins(0, 0, 0, [0; 8]),
+        ]),
+    );
+    equip(&mut fx, TEMPLATE_PERSON, "adult", 12);
+    fx.program.people.portrait_head.remove(&TEMPLATE_PERSON);
+    fx.program.people.profiles.insert(
+        SIM_GUID,
+        sims_content::Profile {
+            body: Some("NONE".into()),
+            head: Some("c001fa_alice,HEAD-HEAD=c001falgt_alice01".into()),
+            gender: Some("female".into()),
+            age: Some("27".into()),
+            skin: Some("lgt".into()),
+            ..Default::default()
+        },
+    );
+    fx.program.people.portrait_head.insert(SIM_GUID, true);
+    fx.program.people.head_suits = ["c001fa_alice".to_string(), suit_63.clone()].into();
+    fx.program.wardrobe = Some(Wardrobe {
+        suits: ["c001fa_alice".to_string(), suit_63.clone()].into(),
+        textures: ["c001falgt_alice01.bmp".to_string()].into(),
+        errors: BTreeMap::new(),
+    });
+    fx.words(SIM_FILE)[19] = 200;
+    fx.program
+        .libraries
+        .get_mut(&SIM_FILE)
+        .unwrap()
+        .loaded_strings
+        .insert(
+            200,
+            Some(vec![
+                "adult".into(),
+                "NONE".into(),
+                comma_past_255_row.clone(),
+            ]),
+        );
+    fx.add(
+        SIM_FILE,
+        4098,
+        tree(vec![
+            assign(scope::LOCALS, 0, scope::LITERAL, 0, 1),
+            assign(scope::LOCALS, 1, scope::LITERAL, -1, 2),
+            assign(scope::LOCALS, 2, scope::LITERAL, 0, 3),
+            ins(19, 4, RETURN_FALSE, [0, 1, 2, 0, 0, 0, 0, 0]),
+            assign(scope::GLOBAL, 36, scope::STACK_OBJECT, 0, RETURN_TRUE),
+        ]),
+    );
+    assert_eq!(fx.run_with(SIM, 4098, 0, &[], 1000), Ok(true));
+    let copy_record = fx.world.globals[36];
+    let copy_guid = fx.world.neighbors.get(copy_record).unwrap().guid;
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, copy_record, 1),
+        Ok(true)
+    );
+    assert!(!fx.world.portraits.contains(&copy_guid));
+    assert!(fx.world.generated_portrait_2002.is_empty());
 }
 
 #[test]
