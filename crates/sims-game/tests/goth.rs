@@ -3665,4 +3665,68 @@ fn the_control_panel_pause_blink_help_budget_mode_and_pet_refresh() {
             .expect("gadget button");
         assert_eq!(btn.command, None);
     }
+
+    // Drawn while a pet is selected (Interests disabled), then switching
+    // selection back to human before the press still opens Interests.
+    let interests = hud
+        .items()
+        .iter()
+        .find(|i| {
+            matches!(
+                i.kind,
+                Kind::Button {
+                    id: id::INTERESTS,
+                    ..
+                }
+            )
+        })
+        .expect("interests button")
+        .rect;
+    let interests_center = [
+        interests.x + interests.width / 2,
+        interests.y + interests.height / 2,
+    ];
+    assert_eq!(hud.press(interests_center, &pet_world, true), None);
+    assert_eq!(
+        hud.press(interests_center, lot.world(), true),
+        Some(Command::OpenPanel(Panel::Interests))
+    );
+    assert_eq!(hud.controls.panel, Some(Panel::Interests));
+
+    // Removing the selected Sim from the live family's roster (`world.families`,
+    // 0x51c5ef -> 0x4e97dc) disables Interests on redraw and refuses clicks.
+    let mut removed = lot.world().clone();
+    let mortimer_guid = removed.objects[&selected_id].guid;
+    let family_id = i32::from(removed.globals[9]);
+    removed
+        .families
+        .iter_mut()
+        .find(|f| f.id == family_id)
+        .expect("Goth family")
+        .members
+        .retain(|&g| g != mortimer_guid);
+    hud.draw(
+        &removed,
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    let interests_btn = hud
+        .items()
+        .iter()
+        .find(|i| {
+            matches!(
+                i.kind,
+                Kind::Button {
+                    id: id::INTERESTS,
+                    ..
+                }
+            )
+        })
+        .expect("interests button");
+    assert_eq!(interests_btn.command, None);
+    assert_eq!(hud.press(interests_center, &removed, true), None);
 }

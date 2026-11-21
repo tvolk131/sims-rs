@@ -38,12 +38,16 @@ gadget button disabling.
   family (`[0x6e48bc][0] + 0x10`, global 9). Accordingly:
   - `Interpreter::refresh_family_panel` (`crates/sims-vm/src/selection.rs`)
     updates the selected Sim's family cache on non-residential lots and
-    global 9's family cache on residential lots.
+    global 9's family cache on residential lots, and `Lot::select` calls it
+    after changing selection so the simulation cache stays current on
+    non-residential lots as well.
   - `Snapshot` keeps `family_friends` (global 9, used by `Kind::Work`)
     separate from `cluster_friends` (`0x4cfcdb`, used by `Kind::Friends`).
   - Both `sims-game` (`Lot::residential()`) and `sims-viewer` (from
     `Neighborhood::zoning`) pass the lot's real residential status into
-    `Snapshot::with_zoning` and `hud::check_press`.
+    `Snapshot::with_zoning` and `hud::check_press`, and read the live
+    household roster from `world.families` (`0x4e97dc`) when families are
+    loaded.
 - **Pause button 4x2 cell selection & 500 ms blink (`0x538cd8`,
   `0x53b4b0..0x53b7e7`, `0x5e3b40..0x5e3c41`, `0x5e4b0f`,
   `0x5daf1c..0x5daf31`):** `id::PAUSE` (`0x7ea`, `cpanel\Buttons\pause.bmp`,
@@ -53,17 +57,18 @@ gadget button disabling.
   draws at `(col * 15, row * 15)`. Row 0 col 1 is cyan selected and row 1
   col 1 is red selected (while col 0 of both rows is the unlit normal
   icon, so the previous `Rect::new(0, 15, 15, 15)` drew normal gray-blue
-  pixels while paused). Entering Live-mode pause (`state 2`,
-  `0x53b707..0x53b74d`) sets `selected = 1` while leaving `row = 0` (cyan)
-  and arms a 500 ms (`0x1f4`) timer (`0x5daf06`); each timer callback
-  (`0x53b500..0x53b52e`) toggles row `0 <-> 1` (cyan <-> red) once and
-  re-arms 500 ms from the current clock (`0x5daf1c..0x5daf31`). Outside
-  Live mode (`state 1`, `0x53b55c..0x53b690 -> 0x53b736..0x53b74d`), the
-  button stays steady selected on lit row 1 (red) regardless of global 17,
-  and unpausing in Live mode (`0x53b757..0x53b7e3`) cancels the timer and
-  resets `selected = 0, row = 0`. `hud::Kind::Pause { paused, lit }`,
-  `hud::PAUSE_BLINK_US = 500_000`, and `sims-game`'s `PauseBlink` timer
-  implement this state machine.
+  pixels while paused). Pausing (`state 2`, `0x53b58a -> 0x53b5d5 ->
+  0x53b5e8 -> 0x53b707..0x53b74d`, in Live mode or outside Live mode) sets
+  `selected = 1` while leaving `row = 0` (cyan) and arms a 500 ms (`0x1f4`)
+  timer (`0x5daf06`); each timer callback (`0x53b500..0x53b52e`) toggles
+  row `0 <-> 1` (cyan <-> red) once and re-arms 500 ms from the current
+  clock (`0x5daf1c..0x5daf31`). While unpaused outside Live mode
+  (`state 1`, `0x53b55c..0x53b690 -> 0x53b736..0x53b74d`), the button stays
+  steady selected on lit row 1 (red) without a timer, and unpausing in Live
+  mode (`0x53b757..0x53b7e3`) cancels the timer and resets `selected = 0,
+  row = 0`. `hud::Kind::Pause { paused, lit }`, `hud::PAUSE_BLINK_US =
+  500_000`, and `sims-game`'s `PauseBlink` timer implement this state
+  machine.
 - **Interactive `kHelpBtn` (`0x538f41..0x538fe6`, `0x53aaad..0x53ab5a`):**
   `kHelpBtn` (`4993` at `(5, 164)`, 40x15 four-cell strip) is constructed
   as an enabled `cGZWinBtn` and opens the Help System dialog (`0x50e8d3`)

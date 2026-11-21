@@ -403,8 +403,8 @@ pub enum Kind {
     /// The pause button (`id::PAUSE`, 4 columns by 2 rows, `0x538cd8`,
     /// `0x5e4b0f`): column 0 normal, 1 selected (`paused`), 2 hover,
     /// 3 disabled (`0x5e3b40`); row 1 when `lit` (toggled every 500 ms
-    /// while paused in live mode at `0x53b500..0x53b528`, or steady row 1
-    /// while paused in non-live modes at `0x53b736..0x53b74d`).
+    /// while paused at `0x53b500..0x53b528`, or steady row 1 while
+    /// unpaused outside Live mode at `0x53b55c..0x53b690 -> 0x53b736`).
     Pause { paused: bool, lit: bool },
     /// A resident's portrait.
     Portrait { guid: u32, selected: bool },
@@ -675,16 +675,20 @@ pub fn layout(size: [i32; 2], snapshot: &Snapshot, controls: &Controls) -> Vec<I
         ),
         view(id::PHOTO, at(175, 95, 29, 29), false, true, Camera::Photo),
     ]);
-    // 0x53b55c..0x53b690 -> 0x53b736..0x53b74d: outside Live mode, state 1
-    // holds the pause button steady selected on lit row 1 (red) regardless of
-    // global 17. In Live mode, state 2 selects it while paused and toggles
-    // row 0/1 every 500 ms via `controls.pause_lit`.
-    let non_live = controls.mode != Mode::Live;
+    // 0x53b536..0x53b74d:
+    // - While paused (global 17 != 0), state 2 holds Pause selected and
+    //   blinks row 0 (cyan) <-> row 1 (red) every 500 ms via
+    //   `controls.pause_lit` (including outside Live mode,
+    //   0x53b58a -> 0x53b5d5 -> 0x53b5e8).
+    // - While unpaused outside Live mode, state 1 holds Pause steady
+    //   selected on lit row 1 (red) without blinking (0x53b55c -> 0x53b690).
+    // - While unpaused in Live mode, state 0 draws unselected row 0.
+    let steady_red = !snapshot.paused && controls.mode != Mode::Live;
     items.push(Item {
         rect: at(85, 135, 15, 15),
         kind: Kind::Pause {
-            paused: non_live || snapshot.paused,
-            lit: non_live || (snapshot.paused && controls.pause_lit),
+            paused: snapshot.paused || steady_red,
+            lit: steady_red || (snapshot.paused && controls.pause_lit),
         },
         command: Some(Command::TogglePause),
     });
@@ -2017,6 +2021,25 @@ fn topmost(items: &[Item], [x, y]: [i32; 2]) -> Option<usize> {
 /// there, if it has one. An item drawn over a button hides it.
 pub fn press(items: &[Item], point: [i32; 2]) -> Option<Command> {
     items.get(topmost(items, point)?)?.command.clone()
+}
+
+/// If the topmost press-taking item at `point` is an Interests or Gifts
+/// gadget button that was laid out disabled (`command: None`), returns the
+/// panel it opens. Hosts check this against the live selection so a press
+/// after switching from a pet to a human before redraw still opens the panel
+/// (`0x51c5a6` re-enables the button synchronously on selection).
+pub fn disabled_panel(items: &[Item], point: [i32; 2]) -> Option<Panel> {
+    let item = items.get(topmost(items, point)?)?;
+    if item.command.is_some() {
+        return None;
+    }
+    match item.kind {
+        Kind::Button {
+            id: id::INTERESTS, ..
+        } => Some(Panel::Interests),
+        Kind::Button { id: id::GIFTS, .. } => Some(Panel::Gifts),
+        _ => None,
+    }
 }
 
 /// What a press that asks for `command` does, by the state at the press,
@@ -3586,25 +3609,48 @@ mod tests {
                 lit: true
             }
         );
-        let buy_controls = Controls {
-            mode: Mode::Buy,
-            pause_lit: false,
-            ..controls
-        };
-        // Outside Live mode, state 1 holds Pause steady selected & lit red
-        // even when global 17 (snapshot.paused) is false (0x53b55c -> 0x53b690).
-        for paused in [false, true] {
-            let mut mode_snap = s.clone();
-            mode_snap.paused = paused;
-            let buy_pause = layout([800, 600], &mode_snap, &buy_controls)
-                .into_iter()
-                .find(|i| matches!(i.kind, Kind::Pause { .. }))
-                .expect("buy pause");
+        // Outside Live mode: unpaused enters state 1 (steady selected & lit red,
+        // 0x53b55c -> 0x53b690); pausing enters state 2 and blinks via pause_lit
+        // (0x53b58a -> 0x53b5d5 -> 0x53b5e8).
+        let mut unpaused_snap = s.clone();
+        unpaused_snap.paused = false;
+        let buy_unpaused = layout(
+            [800, 600],
+            &unpaused_snap,
+            &Controls {
+                mode: Mode::Buy,
+                pause_lit: false,
+                ..controls
+            },
+        )
+        .into_iter()
+        .find(|i| matches!(i.kind, Kind::Pause { .. }))
+        .expect("buy unpaused pause");
+        assert_eq!(
+            buy_unpaused.kind,
+            Kind::Pause {
+                paused: true,
+                lit: true
+            }
+        );
+        for pause_lit in [false, true] {
+            let buy_paused = layout(
+                [800, 600],
+                &s,
+                &Controls {
+                    mode: Mode::Buy,
+                    pause_lit,
+                    ..controls
+                },
+            )
+            .into_iter()
+            .find(|i| matches!(i.kind, Kind::Pause { .. }))
+            .expect("buy paused pause");
             assert_eq!(
-                buy_pause.kind,
+                buy_paused.kind,
                 Kind::Pause {
                     paused: true,
-                    lit: true
+                    lit: pause_lit
                 }
             );
         }

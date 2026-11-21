@@ -14,7 +14,7 @@ use sims_render::{Assets, Canvas, Walls, Zoom};
 use sims_sim::World;
 use sims_ui::art::Art;
 use sims_ui::balloon::Texts;
-use sims_ui::command::{Command, Mode as UiMode, Panel as UiPanel, Walls as UiWalls};
+use sims_ui::command::{Command, Panel as UiPanel, Walls as UiWalls};
 use sims_ui::dialog::{self, Labels, Message};
 use sims_ui::frame::{Frame, Rect};
 use sims_ui::house;
@@ -191,12 +191,12 @@ impl Hud {
         self.controls.pause_lit = false;
     }
 
-    /// Syncs the Live-mode pause button's 500 ms blink timer
-    /// (`0x53b4b0..0x53b7e7`) with `paused` and the monotonic `clock_us`.
-    /// Returns true if the lit phase changed.
+    /// Syncs the pause button's 500 ms blink timer (`0x53b4b0..0x53b7e7`)
+    /// with `paused` (state 2 blinks whenever paused, including outside Live
+    /// mode via `0x53b58a -> 0x53b5d5 -> 0x53b5e8`) and the monotonic
+    /// `clock_us`. Returns true if the lit phase changed.
     pub fn sync_pause_blink(&mut self, paused: bool, clock_us: u64) -> bool {
-        let blinking = paused && self.controls.mode == UiMode::Live;
-        let changed = self.pause_blink.sync(blinking, clock_us);
+        let changed = self.pause_blink.sync(paused, clock_us);
         self.controls.pause_lit = self.pause_blink.lit();
         changed
     }
@@ -235,10 +235,28 @@ impl Hud {
         self.for_panel(self.household(world, residential), world)
     }
 
+    /// The active household's live member roster (`0x4e97dc`): reads the
+    /// family named by global 9 from `world.families` when families are
+    /// loaded, falling back to the neighborhood roster opened from disk.
+    fn members<'a>(&'a self, world: &'a World) -> &'a [u32] {
+        if world.families.is_empty() {
+            return &self.members;
+        }
+        let id = i32::from(world.globals.get(9).copied().unwrap_or(0));
+        if id == 0 {
+            return &[];
+        }
+        world
+            .families
+            .iter()
+            .find(|f| f.id == id)
+            .map_or(&[], |f| f.members.as_slice())
+    }
+
     /// The household with zoning-aware family friends and what the next
     /// level of each one's career needs.
     fn household(&self, world: &World, residential: bool) -> Snapshot {
-        Snapshot::read(world, &self.members)
+        Snapshot::read(world, self.members(world))
             .with_zoning(world, residential, self.known.friendship)
             .with_careers(&self.careers)
     }
@@ -247,7 +265,7 @@ impl Hud {
     fn for_panel(&self, snapshot: Snapshot, world: &World) -> Snapshot {
         match self.controls.panel {
             Some(UiPanel::Relationships) => {
-                snapshot.with_relations(world, &self.members, &self.known)
+                snapshot.with_relations(world, self.members(world), &self.known)
             }
             Some(UiPanel::House) if self.controls.expanded => {
                 snapshot.with_house(world, &self.house, &self.kinds)
@@ -524,10 +542,24 @@ impl Hud {
         if let Some(command) = self.press_queue(point) {
             return command;
         }
-        let command = hud::press(&self.items, point)?;
+        let command = match hud::press(&self.items, point) {
+            Some(command) => command,
+            None => {
+                // If Interests/Gifts was laid out disabled (e.g. while a pet
+                // was selected) and selection switched to a human before
+                // redraw, the press still opens the panel (0x51c5a6).
+                let panel = hud::disabled_panel(&self.items, point)?;
+                let snapshot = Snapshot::read(world, self.members(world));
+                if Selected::of(&snapshot) == Selected::Human {
+                    Command::OpenPanel(panel)
+                } else {
+                    return None;
+                }
+            }
+        };
         let command = match command {
             Command::OpenPanel(_) => {
-                let snapshot = Snapshot::read(world, &self.members);
+                let snapshot = Snapshot::read(world, self.members(world));
                 let selected = Selected::of(&snapshot);
                 hud::check_press(command, selected, residential)
             }

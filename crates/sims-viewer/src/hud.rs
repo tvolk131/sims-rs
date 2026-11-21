@@ -142,6 +142,24 @@ impl Hud {
         })
     }
 
+    /// The active household's live member roster (`0x4e97dc`): reads the
+    /// family named by global 9 from `world.families` when families are
+    /// loaded, falling back to the neighborhood roster opened from disk.
+    fn members<'a>(&'a self, world: &'a sims_sim::World) -> &'a [u32] {
+        if world.families.is_empty() {
+            return &self.members;
+        }
+        let id = i32::from(world.globals.get(9).copied().unwrap_or(0));
+        if id == 0 {
+            return &[];
+        }
+        world
+            .families
+            .iter()
+            .find(|f| f.id == id)
+            .map_or(&[], |f| f.members.as_slice())
+    }
+
     /// Draws the panel over the lot in `canvas`.
     pub fn draw(
         &mut self,
@@ -152,7 +170,7 @@ impl Hud {
     ) {
         sync_controls(&mut self.controls, world, &view.camera);
         let residential = is_residential(world, &self.zoning);
-        let mut snapshot = Snapshot::read(world, &self.members)
+        let mut snapshot = Snapshot::read(world, self.members(world))
             .with_zoning(world, residential, self.known.friendship)
             .with_careers(&self.careers);
         // The viewer plays no sounds, so a balloon this closes closes
@@ -161,7 +179,7 @@ impl Hud {
         // The lookup goes through every neighborhood record, so only
         // while the panel shows it.
         if self.controls.panel == Some(Panel::Relationships) {
-            snapshot = snapshot.with_relations(world, &self.members, &self.known);
+            snapshot = snapshot.with_relations(world, self.members(world), &self.known);
         }
         // The house's ratings only while its panel shows.
         if self.controls.expanded && self.controls.panel == Some(Panel::House) {
@@ -254,10 +272,21 @@ impl Hud {
             self.dialog = None;
             return (None, true);
         }
-        let Some(command) = hud::press(&self.items, point) else {
-            return (None, false);
+        let command = match hud::press(&self.items, point) {
+            Some(command) => command,
+            None => {
+                let Some(panel) = hud::disabled_panel(&self.items, point) else {
+                    return (None, false);
+                };
+                let snapshot = Snapshot::read(world, self.members(world));
+                if Selected::of(&snapshot) == Selected::Human {
+                    Command::OpenPanel(panel)
+                } else {
+                    return (None, false);
+                }
+            }
         };
-        let snapshot = Snapshot::read(world, &self.members);
+        let snapshot = Snapshot::read(world, self.members(world));
         let selected = Selected::of(&snapshot);
         let residential = is_residential(world, &self.zoning);
         let command = hud::check_press(command, selected, residential);

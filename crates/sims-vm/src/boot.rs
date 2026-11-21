@@ -1297,6 +1297,10 @@ impl Lot {
         interpreter
             .select(&mut world, Some(person))
             .map_err(OrderError::Refused)?;
+        // Selection triggers a control-panel redraw (0x53a01f -> 0x4cfcdb),
+        // refreshing the selected Sim's family-friends cache on non-residential
+        // lots (and global 9's family on residential lots).
+        interpreter.refresh_family_panel(&mut world);
         self.world = world;
         Ok(sounds.into_inner())
     }
