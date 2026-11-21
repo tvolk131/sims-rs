@@ -5731,19 +5731,24 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
     // registered instance and restores its desk slot and charge.
     assert!(lot.can_buy_undo());
     let lamp_reg = lot.world().objects[&placed_lamp].registry_word;
+    let mut funds_before_lamp_undo = lot.world().budget.funds;
     while lot.world().objects[&placed_lamp].position[0] >= 0 {
+        funds_before_lamp_undo = lot.world().budget.funds;
         assert!(lot.buy_undo().unwrap());
     }
     assert!(lot.world().objects.contains_key(&placed_lamp));
     assert!(lot.world().objects[&placed_lamp].position[0] < 0);
     assert_eq!(lot.world().objects[&placed_lamp].data[2], 0);
-    assert_eq!(lot.world().budget.funds, funds_before);
+    assert_eq!(
+        lot.world().budget.funds,
+        funds_before_lamp_undo + lamp.price
+    );
     assert!(lot.can_buy_redo());
     assert!(lot.buy_redo().unwrap());
     assert!(lot.world().objects[&placed_lamp].position[0] >= 0);
     assert_eq!(lot.world().objects[&placed_lamp].registry_word, lamp_reg);
     assert_eq!(lot.world().objects[&placed_lamp].data[2], surface_id as i16);
-    assert_eq!(lot.world().budget.funds, funds_before - lamp.price);
+    assert_eq!(lot.world().budget.funds, funds_before_lamp_undo);
 
     // Missing CTSS fallback (`0x457d3b`): lamps without CTSS 2008 take their
     // OBJD chunk label instead of sorting with an empty name.
@@ -5795,6 +5800,8 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
     game.resize([800, 600]);
     game.render();
     assert_eq!(game.run(60), 60);
+    game.render();
+    let live_top350: Vec<[u8; 3]> = game.canvas().color[..800 * 350].to_vec();
     // Clicking the lot in Build or Options mode (`0x4cea5d`) must NOT open a
     // Live Mode pie menu or mutate simulation state.
     for non_live in [Mode::Build, Mode::Options] {
@@ -5810,6 +5817,20 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
         );
     }
     game.set_mode(Mode::Buy);
+    // Entering Buy Mode must draw the dotted black lot placement grid on
+    // unfloored buildable terrain immediately (`0x4ce44f` -> `0x4c4222`,
+    // `0x4c42f0`, `0x4c37f2`), even before selecting an item.
+    game.render();
+    let buy_top350: Vec<[u8; 3]> = game.canvas().color[..800 * 350].to_vec();
+    let added_grid_pixels = live_top350
+        .iter()
+        .zip(buy_top350.iter())
+        .filter(|&(before, after)| *before != [0, 0, 0] && *after == [0, 0, 0])
+        .count();
+    assert!(
+        added_grid_pixels > 500,
+        "expected Buy Mode lot placement grid in top 350 rows, got {added_grid_pixels} new black pixels"
+    );
     // Hovering and rendering in Buy Mode with no item armed must NOT run Live
     // Mode interaction checks (`Game::follow`) or mutate simulation state.
     let hash_before_buy_hover = game.lot().world().hash();
@@ -5891,10 +5912,11 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
     assert_eq!(game.buy_selected(), Some(0x26bf_bb29));
     assert!(game.lot().world().objects[&first_chair].position[0] < 0);
     assert_eq!(game.lot().world().budget.funds, 2542);
-    // Step back the refused record to Redo and cancel the blocking preview so
-    // Redo restores `first_chair` cleanly.
+    // Step back the refused record to Redo: native `0x48bd21` -> `0x48c0ea` ->
+    // `0x48bd88` refunds `$80` whenever the retained instance still exists;
+    // cancelling the blocking preview and redoing then re-charges `$80`.
     assert!(game.undo_buy());
-    assert_eq!(game.lot().world().budget.funds, 2542);
+    assert_eq!(game.lot().world().budget.funds, 2542 + 80);
     assert!(game.cancel_buy());
     assert!(game.buy_cursor().is_none());
     assert!(game.redo_buy());
@@ -5905,7 +5927,7 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
     );
     assert_eq!(game.lot().world().objects.len(), objs_before + 1);
     let funds_after_buy = game.lot().world().budget.funds;
-    assert_eq!(funds_after_buy, 2542 - 80);
+    assert_eq!(funds_after_buy, 2542);
 
     // Unrelated Undo while holding a manually rotated surface item (`0x421e72`):
     // click Back (`[234, 550]`), Lighting (`[337, 570]`), and slot 0
@@ -5947,14 +5969,56 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
     );
     game.cancel_buy();
 
+    // Undo / Redo of a surface beneath a manually rotated preview lamp must
+    // preserve `cursor.container` so the next hover at the same spot keeps the
+    // lamp's manual facing (`0x421e72`).
+    game.press([234, 550]); // Back from Lighting to top-level categories
+    game.release([234, 550]);
+    game.press([295, 524]); // Surfaces (cat 1 -> sub 0 End Tables)
+    game.release([295, 524]);
+    game.press([437, 523]); // Slot 0 surface item
+    game.release([437, 523]);
+    let surface_spot = recorded([440, 380]);
+    game.hover(surface_spot);
+    game.press(surface_spot);
+    game.release(surface_spot);
+    game.cancel_buy();
+    // Arm Gloominator Desk Lamp over the newly placed lawn surface, rotate it,
+    // undo and redo the surface without moving the pointer, then hover again.
+    game.press([234, 550]); // Back from Surfaces to top-level categories
+    game.release([234, 550]);
+    game.press([337, 570]); // Lighting -> Table Lamps
+    game.release([337, 570]);
+    game.press([437, 523]); // Slot 0: Gloominator Desk Lamp
+    game.release([437, 523]);
+    game.hover(surface_spot);
+    let surf_lamp = game.buy_cursor().expect("lamp over new surface").clone();
+    assert!(surf_lamp.valid && surf_lamp.container.is_some());
+    let surf_before_dir = game.lot().world().objects[&surf_lamp.held].data[1];
+    assert!(game.rotate_held(true));
+    let surf_manual_dir = game.lot().world().objects[&surf_lamp.held].data[1];
+    assert_ne!(surf_manual_dir, surf_before_dir);
+    assert!(game.undo_buy());
+    assert!(game.redo_buy());
+    game.hover(surface_spot);
+    let surf_lamp_after = game.buy_cursor().expect("lamp still armed").clone();
+    assert!(surf_lamp_after.valid);
+    assert_eq!(surf_lamp_after.container, surf_lamp.container);
+    assert_eq!(
+        game.lot().world().objects[&surf_lamp_after.held].data[1],
+        surf_manual_dir
+    );
+    game.cancel_buy();
+    // Undo the extra lawn surface so the remaining assertions check `first_chair`.
+    assert!(game.undo_buy());
+
     // Undo / Redo after cancelling the repeat preview, plus leaving Buy Mode
     // deleting the detached instance (`0x4cea5d` -> `0x4933dc` -> `0x48c20e`).
     assert!(game.can_undo());
-    assert!(!game.can_redo());
     assert!(game.undo_buy());
     assert!(game.lot().world().objects.contains_key(&first_chair));
     assert!(game.lot().world().objects[&first_chair].position[0] < 0);
-    assert_eq!(game.lot().world().budget.funds, 2542);
+    assert_eq!(game.lot().world().budget.funds, funds_after_buy + 80);
     assert!(!game.can_undo());
     assert!(game.can_redo());
     assert!(game.redo_buy());
@@ -5963,10 +6027,8 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
         game.lot().world().objects[&first_chair].registry_word,
         first_reg
     );
-    assert_eq!(game.lot().world().objects.len(), objs_before + 1);
-    assert_eq!(game.lot().world().budget.funds, 2542 - 80);
+    assert_eq!(game.lot().world().budget.funds, funds_after_buy);
     assert!(game.can_undo());
-    assert!(!game.can_redo());
     assert!(game.undo_buy());
     assert!(game.lot().world().objects[&first_chair].position[0] < 0);
     game.set_mode(Mode::Live);
@@ -5974,4 +6036,7 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
     assert_eq!(game.lot().world().objects.len(), objs_before);
     assert!(!game.lot().can_buy_undo());
     assert!(!game.lot().can_buy_redo());
+    // Returning to Live Mode removes the Buy Mode lot placement grid.
+    game.render();
+    assert_eq!(&game.canvas().color[..800 * 350], live_top350.as_slice());
 }

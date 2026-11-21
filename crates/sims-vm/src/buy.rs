@@ -273,19 +273,21 @@ impl Interpreter<'_> {
             return Ok(cursor.valid);
         }
         // Snapped placement (and any wall/pool auto-rotation) failed: native
-        // `0x485f23` → `0x421e72` → `0x422050` → `0x435522` runs the base
-        // placement test (including OBJf 5 overlap callbacks at `0x4355b5`)
-        // before rejecting unsnapped coordinates at `0x4355bc..0x4355cd`,
-        // leaving the held object off-lot and placing `"Tile Cursor"` alone at
-        // unsnapped `fine` when it fits. Native `0x421fcf..0x421fed` saves the
-        // cursor's actual coordinates so manual rotation (`0x422705..0x422716`)
-        // rechecks at `fine` instead of jumping to the tile centre.
-        if fine != pos && self.user_tiles_unblocked(world, cursor.held, fine)? {
-            let _ = self.place_test(world, cursor.held, fine, level)?;
-        }
+        // `0x485f2f` checks whether `"Tile Cursor"` fits at unsnapped `fine`
+        // FIRST, and only if it fits enters `0x421e72` → `0x422050` →
+        // `0x435522`, running the held object's base placement test (including
+        // OBJf 5 overlap callbacks at `0x4355b5`) before rejecting unsnapped
+        // coordinates at `0x4355bc..0x4355cd`, leaving the held object off-lot
+        // and placing `"Tile Cursor"` alone at `fine`. Native
+        // `0x421fcf..0x421fed` saves the cursor's actual coordinates so manual
+        // rotation (`0x422705..0x422716`) rechecks at `fine` instead of
+        // jumping to the tile centre.
         cursor.valid = false;
         cursor.container = None;
         if self.fits(world, cursor.cursor, fine, level)? {
+            if fine != pos && self.user_tiles_unblocked(world, cursor.held, fine)? {
+                let _ = self.place_test(world, cursor.held, fine, level)?;
+            }
             let cursor_place = Place {
                 on_lot: true,
                 position: fine,
@@ -447,6 +449,15 @@ impl Interpreter<'_> {
         if self.try_place_buy_at(world, cursor, [x, y], level, retained)? {
             return Ok(cursor.valid);
         }
+        // Native `0x42276d` re-enters `0x421e72` -> `0x422050` -> `0x4355b5`
+        // at saved unsnapped coordinates, running the base placement test
+        // (including OBJf 5 overlap callbacks) before rejecting unsnapped
+        // coordinates at `0x4355bc..0x4355cd`.
+        if ((x & 0x0f) != 8 || (y & 0x0f) != 8)
+            && self.user_tiles_unblocked(world, cursor.held, [x, y])?
+        {
+            let _ = self.place_test(world, cursor.held, [x, y], level)?;
+        }
         cursor.position = [x, y, level];
         cursor.valid = false;
         cursor.container = None;
@@ -538,14 +549,14 @@ impl Interpreter<'_> {
     }
 
     /// Undoes a committed Buy Mode purchase (`0x48bd21` → `0x48c0ea` →
-    /// `0x435751` / `0x422ff5` + `0x48bdbd`): runs OBJf function 12
+    /// `0x435751` / `0x422ff5` + `0x48bd88` → `0x48bdbd`): whenever the
+    /// purchase's object instance is still registered, runs OBJf function 12
     /// (`USER_PICKUP`) on the object (and every group tile / held child),
     /// takes it off the lot while keeping the instance registered for Redo,
     /// and refunds `purchase.price` to household funds and today's budget
-    /// category when `purchase.placed` is true. If `purchase.placed` is false
-    /// (a record transferred to Undo after a refused Redo at `0x48be72`),
-    /// steps back without double-refunding. Returns `Ok(false)` if a placed
-    /// object is missing or already off the lot.
+    /// category (matching native `0x48bd21` even when a refused Redo entry was
+    /// transferred back to Undo via `0x493353`). Returns `Ok(false)` only if
+    /// the object instance is no longer registered.
     pub fn buy_undo_purchase(
         &self,
         world: &mut World,
@@ -556,17 +567,7 @@ impl Interpreter<'_> {
             at: None,
             trap,
         };
-        if !purchase.placed {
-            if world.objects.contains_key(&purchase.object) {
-                self.run_user_pickup(world, purchase.object)?;
-                self.take_off(world, purchase.object, true)?;
-            }
-            return Ok(true);
-        }
-        let Some(obj) = world.objects.get(&purchase.object) else {
-            return Ok(false);
-        };
-        if !on_lot([obj.position[0], obj.position[1]]) {
+        if !world.objects.contains_key(&purchase.object) {
             return Ok(false);
         }
         self.run_user_pickup(world, purchase.object)?;
@@ -988,8 +989,9 @@ impl Interpreter<'_> {
     }
 
     /// Native `UserTestPlace` (`0x435522` lines `0x43560c..0x435623`) for
-    /// container placements: requires `fits_in` and rejects containment slots
-    /// with height `5..=7` (`4 < height < 8`) when `move_objects` is off.
+    /// container placements: requires an existing on-lot container, `fits_in`,
+    /// and rejects containment slots with height `5..=7` (`4 < height < 8`)
+    /// when `move_objects` is off.
     fn user_fits_in(
         &self,
         world: &mut World,
@@ -999,6 +1001,13 @@ impl Interpreter<'_> {
         pos: [i32; 2],
         level: i32,
     ) -> Result<bool, Fault> {
+        if !world
+            .objects
+            .get(&container)
+            .is_some_and(|c| on_lot([c.position[0], c.position[1]]))
+        {
+            return Ok(false);
+        }
         if !self.fits_in(world, id, container, slot, pos, level)? {
             return Ok(false);
         }

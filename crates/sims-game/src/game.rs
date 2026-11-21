@@ -1707,12 +1707,7 @@ impl Game {
                 .is_some_and(|o| o.position[0] >= 0);
             let affordable =
                 cursor.price <= 0 || cursor.price <= sims_vm::available_funds(self.lot.world());
-            if !held_on_lot {
-                cursor.valid = false;
-                cursor.container = None;
-            } else {
-                cursor.valid = affordable;
-            }
+            cursor.valid = held_on_lot && affordable;
         }
         match result {
             Ok(true) => {

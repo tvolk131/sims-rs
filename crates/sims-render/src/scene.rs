@@ -582,6 +582,16 @@ impl<'a> Painter<'a> {
                     self.terrain([x, y]);
                 }
             }
+            // Buy (`2`) and Build (`1`) modes draw the dotted black lot
+            // placement grid over unfloored buildable terrain (`0x4ce44f` →
+            // `0x4c4222`, `0x4c42f0`, `0x4c3ba4`, `0x4c3c23`, `0x4c37f2`).
+            if matches!(self.world.globals.get(19).copied().unwrap_or(0), 1 | 2) {
+                for x in inner.clone() {
+                    for y in inner.clone() {
+                        self.terrain_grid([x, y]);
+                    }
+                }
+            }
         }
         let index = (level - 1) as usize;
         let zoom = self.camera.zoom.index();
@@ -754,6 +764,97 @@ impl<'a> Painter<'a> {
             self.clip_bottom,
             self.canvas,
         );
+    }
+
+    /// Whether view tile `[vx, vy]` is buildable for the Buy/Build Mode lot
+    /// grid (`0x4c3c23`: lot tile inside `1..size - 1` with ground flag `0x20`
+    /// clear in array `8`).
+    fn tile_buildable(&self, [vx, vy]: [i32; 2]) -> bool {
+        let [lx, ly] = self.camera.unrotate_tile([vx, vy]);
+        let limit = self.lot.size as i32 - 1;
+        if lx < 1 || lx >= limit || ly < 1 || ly >= limit {
+            return false;
+        }
+        let Some(flags) = self.world.arrays.get(&8) else {
+            return true;
+        };
+        let cell = Lot::cell(lx as usize, ly as usize);
+        flags.data.get(cell).is_none_or(|&byte| (byte & 0x20) == 0)
+    }
+
+    /// Draws the Buy/Build Mode dotted black lot placement grid on an
+    /// unfloored ground tile (`0x4c42f0`, `0x4c3ba4`, `0x4c37f2` / `0x4c391d`):
+    /// bit 1 is the tile's top-left edge and bit 2 its top-right edge, stepped
+    /// by 2 pixels on flat tiles and 4 pixels on sloped tiles (`0x4c3af9` /
+    /// `0x4c3c72`).
+    fn terrain_grid(&mut self, [x, y]: [i32; 2]) {
+        let cell = Lot::cell(x as usize, y as usize);
+        // Native `0x4c42f0` calls `0x4862ed` and skips tiles with a floor.
+        if self.lot.levels[0].floors[cell] != 0 {
+            return;
+        }
+        let view = self.camera.rotate_tile([x, y]);
+        let mask = if self.tile_buildable(view) {
+            3u8
+        } else {
+            let mut m = 0u8;
+            if view[0] > 0 && self.tile_buildable([view[0] - 1, view[1]]) {
+                m |= 1;
+            }
+            if view[1] > 0 && self.tile_buildable([view[0], view[1] - 1]) {
+                m |= 2;
+            }
+            m
+        };
+        if mask == 0 {
+            return;
+        }
+        let rotation = usize::from(self.camera.rotation & 3);
+        let h = self.lot.heights[cell];
+        let heights: [u8; 4] = std::array::from_fn(|n| h[(n + 4 - rotation) & 3]);
+        let corner = self.camera.project([view[0], view[1] + 1], 1, 0);
+        let zoom = self.camera.zoom.level();
+        let half_w = 8i32 << zoom;
+        let reach = (half_w * 2) + (255 << (zoom + 1));
+        let size = [self.canvas.width, self.canvas.height].map(|n| n as i32);
+        if (0..2).any(|i| corner[i] < -reach || corner[i] > size[i].saturating_add(reach)) {
+            return;
+        }
+        let depth = self.depth.grass(view, i32::from(heights[1]));
+        let left = corner[0] + GRASS_COLUMN;
+        let base_y = corner[1] + GRASS_ROW;
+        let shift = zoom + 1;
+        let y_left = base_y - (i32::from(heights[0]) << shift);
+        let y_top = base_y - ((i32::from(heights[1]) + 2) << shift);
+        let y_right = base_y - (i32::from(heights[2]) << shift);
+        let flat = heights[0] == heights[1] && heights[0] == heights[2] && heights[0] == heights[3];
+        let step = if flat { 2 } else { 4 };
+        if (mask & 1) != 0 {
+            let dy = ((y_top - y_left) << 16) / half_w;
+            let mut y_fp = y_left << 16;
+            let mut px = left;
+            while px < left + half_w {
+                let py = y_fp >> 16;
+                if py < self.clip_bottom {
+                    self.canvas.plot(px, py, depth, [0, 0, 0]);
+                }
+                px += step;
+                y_fp += dy * step;
+            }
+        }
+        if (mask & 2) != 0 {
+            let dy = ((y_right - y_top) << 16) / half_w;
+            let mut y_fp = y_top << 16;
+            let mut px = left + half_w;
+            while px < left + half_w * 2 {
+                let py = y_fp >> 16;
+                if py < self.clip_bottom {
+                    self.canvas.plot(px, py, depth, [0, 0, 0]);
+                }
+                px += step;
+                y_fp += dy * step;
+            }
+        }
     }
 
     /// The wallpaper on each side of a wall, first along its normal (the

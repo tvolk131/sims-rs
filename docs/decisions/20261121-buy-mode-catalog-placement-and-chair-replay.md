@@ -18,14 +18,19 @@ panel, and `sims-vm` had no `"Tile Cursor"` creation or Buy placement tool.
 
 ## Findings from Complete Collection 1.91 `Sims.exe`
 
-- **Mode switching (`0x53a2c3`, `0x4cea5d`, `0x4ce44f`):** UI modes map to
-  `global[19]` (`0` Live, `1` Build, `2` Buy, `3` Options, `4` Camera). Entering
-  Buy Mode on a residential lot resets the catalog to By-Function top-level
-  categories (`0x4cebf4`), sets `global[19] = 2`, and arms tool 7
-  (`cTSObjectTool`). Returning to Live Mode runs `go_live` (`0x416534`), marking
-  rooms uncounted, refreshing lot statistics, and clearing `global[19]` to `0`.
-  During `draw_frame`, the active `PanelMode` is read from `global[19]` rather
-  than hardcoded to `PanelMode::Live`.
+- **Mode switching & lot grid (`0x53a2c3`, `0x4cea5d`, `0x4ce44f`, `0x4c4222`,
+  `0x4c42f0`, `0x4c3ba4`, `0x4c3c23`, `0x4c37f2` / `0x4c391d`):** UI modes map
+  to `global[19]` (`0` Live, `1` Build, `2` Buy, `3` Options, `4` Camera).
+  Entering Buy Mode on a residential lot resets the catalog to By-Function
+  top-level categories (`0x4cebf4`), sets `global[19] = 2`, enables the dotted
+  black lot placement grid on unfloored buildable terrain (`0x4c4222(1)`,
+  skipping floored tiles via `0x4862ed` and tiles with ground flag `0x20` via
+  `0x4c3c23`, stepping 2 px on flat tiles and 4 px on sloped tiles), and arms
+  tool 7 (`cTSObjectTool`). Returning to Live Mode runs `go_live` (`0x416534`),
+  marking rooms uncounted, refreshing lot statistics, clearing `global[19]` to
+  `0`, and hiding the placement grid. During `draw_frame`, the active
+  `PanelMode` is read from `global[19]` rather than hardcoded to
+  `PanelMode::Live`.
 - **Buy Catalog (`0x4cd149`, `0x4cd9a5`, `0x4cb8e7..0x4cb93b`, `0x5050e4`,
   `0x506765`, `0x507288`, `0x508342`):**
   - Residential Buy Mode includes non-person catalog masters (`sub_index == -1`
