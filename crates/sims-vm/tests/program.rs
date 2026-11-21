@@ -549,6 +549,43 @@ fn iff_with_flags(chunks: &[(&[u8; 4], u16, u16, Vec<u8>)]) -> Vec<u8> {
     bytes
 }
 
+/// `iff_with_flags(chunks)` with a version-0 resource map listing
+/// `entries` as (tag, index into `chunks` of the chunk it points at, ID,
+/// flags).
+fn with_map(
+    chunks: &[(&[u8; 4], u16, u16, Vec<u8>)],
+    entries: &[(&[u8; 4], usize, u16, u16)],
+) -> Vec<u8> {
+    let mut offsets = Vec::new();
+    let mut at = 64u32;
+    for (_, _, _, data) in chunks {
+        offsets.push(at);
+        at += 76 + data.len() as u32;
+    }
+    let mut types: Vec<&[u8; 4]> = entries.iter().map(|e| e.0).collect();
+    types.dedup();
+    let mut map = vec![0; 8];
+    map.extend(b"pmsr");
+    map.extend(0u32.to_le_bytes());
+    map.extend((types.len() as u32).to_le_bytes());
+    for tag in types {
+        let listed: Vec<_> = entries.iter().filter(|e| e.0 == tag).collect();
+        map.extend(u32::from_be_bytes(*tag).to_le_bytes());
+        map.extend((listed.len() as u32).to_le_bytes());
+        for (_, chunk, id, flags) in listed {
+            map.extend(offsets[*chunk].to_le_bytes());
+            map.extend(id.to_le_bytes());
+            map.extend(flags.to_le_bytes());
+            map.extend([0, 0]);
+        }
+    }
+    let mut all = chunks.to_vec();
+    all.push((b"rsmp", 0, 0x10, map));
+    let mut bytes = iff_with_flags(&all);
+    bytes[60..64].copy_from_slice(&at.to_be_bytes());
+    bytes
+}
+
 /// A FAR archive (version 1a) of members `(name, unpacked size, bytes)`.
 fn far(members: &[(&str, u32, &[u8])]) -> Vec<u8> {
     let mut data: Vec<u8> = Vec::new();
@@ -672,6 +709,68 @@ fn a_string_table_is_read_as_the_loader_finds_it() {
         assert!(why.contains(at), "{why}");
     }
     assert_eq!(lamp.legacy_strings, std::collections::BTreeSet::from([306]));
+    // With a resource map, the flags tested are the map's (0x41b7fa to
+    // 0x41b813): a map stating no flag 0x10 for a chunk that has it.
+    let chunks = [
+        (b"OBJD", 128, 0, objd(0x1111, 4096, 4097)),
+        (b"GLOB", 128, 0, b"\x0bLampGlobals".to_vec()),
+        (b"BHAV", 4096, 0, bhav(2, &[8192, 9000, 257])),
+        (b"BHAV", 4097, 0, bhav(3, &[])),
+        (b"BCON", 4096, 0, bcon(&[99])),
+        (b"STR#", 301, LE, terminated(&["$Neighbor"])),
+    ];
+    let link = |bytes: Vec<u8>| {
+        dir.file("GameData/Objects/Lamp.iff", &bytes);
+        let index = Index::build(&Install::detect(&dir.0).unwrap()).unwrap();
+        let catalog = Catalog::build(&index).unwrap();
+        let program = Program::link(&index, &catalog, [0x1111]).unwrap();
+        let lamp = &program.libraries[&catalog.object(0x1111).unwrap().resource];
+        lamp.unported_strings.get(&301).copied()
+    };
+    let entries = |str_flags: u16, str_chunk: usize| {
+        let mut entries: Vec<(&[u8; 4], usize, u16, u16)> = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, (tag, id, flags, _))| (*tag, i, *id, *flags))
+            .collect();
+        entries[5] = (b"STR#", str_chunk, 301, str_flags);
+        entries
+    };
+    assert_eq!(link(with_map(&chunks, &entries(LE, 5))), None);
+    let why = link(with_map(&chunks, &entries(0, 5))).unwrap();
+    assert!(why.contains("0x41d3a7"), "{why}");
+    // A map whose entry does not match the chunk it points at, which the
+    // loader reads as it is (0x41bfdd to 0x41c032), fails the link. (In a
+    // file with a definition, the catalog leaves the file out first.)
+    dir.file(
+        "GameData/Objects/Lamp.iff",
+        &with_map(&chunks, &entries(LE, 5)),
+    );
+    let globals = [
+        (b"BHAV", 8192, 0, bhav(5, &[256, 8193])),
+        (b"BHAV", 8193, 0, bhav(7, &[8192])),
+        (b"BCON", 8193, 0, bcon(&[-3, -4])),
+        (b"STR#", 301, LE, terminated(&["$Neighbor"])),
+    ];
+    let globals_entries = |str_chunk: usize| {
+        let mut entries: Vec<(&[u8; 4], usize, u16, u16)> = globals
+            .iter()
+            .enumerate()
+            .map(|(i, (tag, id, flags, _))| (*tag, i, *id, *flags))
+            .collect();
+        entries[3] = (b"STR#", str_chunk, 301, LE);
+        entries
+    };
+    for (str_chunk, fails) in [(3, false), (2, true)] {
+        dir.file(
+            "GameData/Objects/LampGlobals.iff",
+            &with_map(&globals, &globals_entries(str_chunk)),
+        );
+        let index = Index::build(&Install::detect(&dir.0).unwrap()).unwrap();
+        let catalog = Catalog::build(&index).unwrap();
+        let linked = Program::link(&index, &catalog, [0x1111]);
+        assert_eq!(linked.is_err(), fails);
+    }
 }
 
 #[test]
@@ -697,7 +796,7 @@ fn career_texts_end_only_when_work_holds_no_career_token() {
     // A career's strings may hold `$`, but no career token; the string
     // tables no `$` at all, deleted ones included.
     let work = |table: Vec<u8>, flags: u16| {
-        iff_with_flags(&[(b"CARR", 1, 0, carr(2)), (b"STR#", 4, flags, table)])
+        iff_with_flags(&[(b"CARR", 1, 0, carr(2)), (b"STR#", 4, flags | 0x10, table)])
     };
     dir.file("ExpansionShared/work.iff", &work(terminated(&["Clerk"]), 0));
     assert!(link(&dir));
@@ -741,6 +840,36 @@ fn career_texts_end_only_when_work_holds_no_career_token() {
         &far(&[("other.iff", 0, b"")]),
     );
     assert!(link(&dir));
+    // An archive is any file whose name ends in `far`, with no dot
+    // (0x5ba86d to 0x5ba8a7); one that cannot be read may be any.
+    for archive in [far(&[("work.fam", 0, b"")]), b"not an archive".to_vec()] {
+        dir.file("ExpansionShared/ExtrasFAR", &archive);
+        assert!(!link(&dir));
+    }
+    std::fs::remove_file(dir.0.join("ExpansionShared/ExtrasFAR")).unwrap();
+    // A resource map that does not match the chunks, or that states a
+    // table's flags without 0x10.
+    let chunks = [
+        (b"CARR", 1, 0x10, carr(2)),
+        (b"STR#", 4, 0x10, terminated(&["Clerk"])),
+    ];
+    for (entries, holds) in [
+        (vec![(b"CARR", 0, 1, 0x10), (b"STR#", 1, 4, 0x10)], true),
+        (vec![(b"CARR", 0, 1, 0x10), (b"STR#", 1, 4, 0)], false),
+    ] {
+        dir.file("ExpansionShared/work.iff", &with_map(&chunks, &entries));
+        assert_eq!(link(&dir), holds);
+    }
+    // A map that does not match fails the link (`careers`).
+    dir.file(
+        "ExpansionShared/work.iff",
+        &with_map(&chunks, &[(b"CARR", 0, 1, 0x10), (b"STR#", 0, 4, 0x10)]),
+    );
+    let index = Index::build(&Install::detect(&dir.0).unwrap()).unwrap();
+    let catalog = Catalog::build(&index).unwrap();
+    assert!(Program::link(&index, &catalog, []).is_err());
+    dir.file("ExpansionShared/work.iff", &work(terminated(&["Clerk"]), 0));
+    assert!(link(&dir));
     // Another `work.iff` elsewhere, which the original does not open as
     // `Work` but the index finds too, before it or after it.
     for other in ["GameData/Objects/work.iff", "TemplateNPCs/work.iff"] {
@@ -769,7 +898,8 @@ fn the_default_labels_hold_no_token_only_when_no_string_table_of_them_holds_a_do
     let (_, _) = setup(&dir);
     let install = Install::detect(&dir.0).unwrap();
     assert!(!sims_vm::labels_hold_no_token(&install.root).unwrap());
-    let labels = |table: Vec<u8>, flags: u16| iff_with_flags(&[(b"STR#", 142, flags, table)]);
+    let labels =
+        |table: Vec<u8>, flags: u16| iff_with_flags(&[(b"STR#", 142, flags | 0x10, table)]);
     dir.file(
         sims_vm::LABEL_FILE,
         &labels(terminated(&["OK", "Cancel"]), 0),
@@ -788,7 +918,7 @@ fn the_default_labels_hold_no_token_only_when_no_string_table_of_them_holds_a_do
         dir.file(
             sims_vm::LABEL_FILE,
             &iff_with_flags(&[
-                (b"STR#", 142, 0, terminated(&["OK"])),
+                (b"STR#", 142, 0x10, terminated(&["OK"])),
                 (b"\0CST", id, 0, b"$Job".to_vec()),
             ]),
         );
@@ -796,6 +926,30 @@ fn the_default_labels_hold_no_token_only_when_no_string_table_of_them_holds_a_do
     }
     dir.file(sims_vm::LABEL_FILE, &labels(terminated(&["OK"]), 0));
     assert!(sims_vm::labels_hold_no_token(&install.root).unwrap());
+    // A resource map that points ID 142 at another chunk: the original
+    // reads that chunk (0x41bfdd to 0x41c032, 0x41d313 to 0x41d341).
+    let chunks = [
+        (b"STR#", 142, 0x10, terminated(&["OK"])),
+        (b"STR#", 143, 0x10, terminated(&["$Neighbor"])),
+    ];
+    for (entries, holds) in [
+        (vec![(b"STR#", 0, 142, 0x10), (b"STR#", 1, 143, 0x10)], true),
+        (vec![(b"STR#", 1, 142, 0x10)], false),
+        // A table read in a way not ported may be read past its end.
+        (vec![(b"STR#", 0, 142, 0), (b"STR#", 1, 143, 0x10)], false),
+        // Another ID's is not read.
+        (vec![(b"STR#", 0, 142, 0x10), (b"STR#", 1, 143, 0)], true),
+    ] {
+        dir.file(sims_vm::LABEL_FILE, &with_map(&chunks, &entries));
+        assert_eq!(sims_vm::labels_hold_no_token(&install.root).unwrap(), holds);
+    }
+    // A table with fewer strings than its count is read past its end.
+    dir.file(
+        sims_vm::LABEL_FILE,
+        &labels(b"\xff\xff\x02\0OK\0".to_vec(), 0),
+    );
+    assert!(!sims_vm::labels_hold_no_token(&install.root).unwrap());
+    dir.file(sims_vm::LABEL_FILE, &labels(terminated(&["OK"]), 0));
     // Any other component of the `UIText` set beside it.
     for companion in ["UIText.fam", "uitext.wll", "UIText.flr", "UIText.dir"] {
         let path = format!("GameData/{companion}");

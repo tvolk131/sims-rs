@@ -195,13 +195,18 @@ What is not ported:
     (0x435fee, 0x43600a), or else "Missing string!!!" (0x6c29bc). The
     port leaves such strings out only when the link finds every string
     table of ID 142 in that file (STR# and CST, deleted chunks included)
-    free of any `$` byte, and the file is the only component of the
-    `UIText` resource set: the composite opener also opens a `.fam`,
-    `.dir`, `.wll` or `.flr` of the name (0x46f50f to 0x46f542, 0x46b627
-    to 0x46b699, searched at 0x406a29), which is not ported
-    (`Program::labels_hold_no_token`, Sol's eleventh and twelfth checks).
-    Otherwise a dialog with a default string fails loudly. The install's labels (OK,
-    Cancel, Yes, No) hold no `$`. Tests:
+    free of any `$` byte, its resource map matches its chunks (the
+    original reads the map as it is, 0x41bfdd to 0x41c032, so a map that
+    points ID 142 at another chunk changes the labels), its table of ID
+    142 is one the loader reads as ported (with the map's flags), since
+    one read otherwise may be read past its end, and the file is the only
+    component of the `UIText` resource set: the composite opener also
+    opens a `.fam`, `.dir`, `.wll` or `.flr` of the name, loose or in an
+    archive in `GameData` (0x46f50f to 0x46f542, 0x46b627 to 0x46b699,
+    searched at 0x406a29), which is not ported
+    (`Program::labels_hold_no_token`, Sol's eleventh to thirteenth
+    checks). Otherwise a dialog with a default string fails loudly. The
+    install's labels (OK, Cancel, Yes, No) hold no `$`. Tests:
     `the_default_button_labels_hold_no_token` (`tests/boot.rs`),
     `a_default_string_fails_loudly_unless_the_labels_hold_no_token`,
     `the_default_labels_hold_no_token_only_when_no_string_table_of_them_holds_a_dollar`.
@@ -246,9 +251,11 @@ What is not ported:
       read again for English (0x47006b to 0x4700d0), stepping through it
       one byte at a time in a way that may read a string's bytes as
       entries;
-    - a chunk without flag 0x10 has its header byte-swapped first
-      (0x41d3a7 to 0x41d3d4, through 0x470351; which field the test reads
-      is Sol's reading, **unverified**);
+    - a resource without flag 0x10 has its header byte-swapped first
+      (0x41d3a7 to 0x41d3d4, through 0x470351). The flags are the ones
+      the resource map states when the file has one (0x41b7fa to
+      0x41b813, `Iff::flags`), not the chunk header's (Sol's reading,
+      **unverified**);
     - a format other than -1, -2 and -3 (version 0 and the classic Mac
       layout) is read with its leading word as the count, so a version-0
       table has no entries, and with bytes 0xa1 and 0xd5 rewritten as `o`
@@ -257,7 +264,9 @@ What is not ported:
       is none, and a table with no count is read past its end.
 
     Every STR# 301 of the recorded install is of format -3 or -2 with
-    flag 0x10.
+    flag 0x10. A file whose resource map does not match its chunks, which
+    the original reads as it is (0x41bfdd to 0x41c032), fails the link
+    (`Iff::resource_order`), so no dialog reads it.
   - A file with no STR# 301 but a legacy CST 301, which the loader reads
     instead (0x4702c7, 0x47018e to 0x4701e6), is not ported, and fails
     loudly when the dialog names a string. The loader compares the tag
@@ -419,19 +428,25 @@ What is not ported:
      resource set of `ExpansionShared` (0x403da2 to 0x403dd9, the
      directory found at 0x415336), which the composite opener makes of a
      `.iff`, `.fam`, `.dir`, `.wll` and `.flr` of the name (0x46f50f to
-     0x46f542, 0x46b627 to 0x46b699, 0x406a29). Only a set of one
-     `work.iff` there is ported, and it must be the index's only
-     `work.iff`, which `careers` reads (Sol's eleventh and twelfth
-     checks). Every string table of it (STR#, and CST, which the loader
-     falls back to), deleted chunks included, must hold no `$` byte at
-     all, since the loader's ways not ported may read a string's bytes as
-     entries, and every career's name and level strings no career token.
+     0x46f542, 0x46b627 to 0x46b699, 0x406a29), loose or in an archive
+     there (any file whose name ends in `far`, with no dot needed,
+     0x5ba86d to 0x5ba8a7). Only a set of one `work.iff` there is ported,
+     and it must be the index's only `work.iff`, which `careers` reads
+     (Sol's eleventh to thirteenth checks). Every string table of it
+     (STR#, and CST, which the loader falls back to), deleted chunks
+     included, must hold no `$` byte at all, since the loader's ways not
+     ported may read a string's bytes as entries; each STR# resource must
+     be one the loader reads as ported (with the map's flags), since one
+     read otherwise may be read past its end; and every career's name and
+     level strings must hold no career token.
      The install's STR# tables hold no `$`; its level strings hold one (in
      suit names such as `B004MA$b_01`) but no career token. When it is
      false (any other `Work` set, another `work.iff`, a `Careers.txt`, or
      a string that holds one) a person's career token fails loudly. A
-     career that does not parse fails the link first (`careers`; the
-     original loads them at 0x403e3f to 0x403f1f). That the career texts all
+     career `careers` lists (the file's CARR resources, as the original
+     loads them at 0x403e3f to 0x403f1f) that does not parse fails the
+     link first; a CARR chunk it does not list (deleted, or left out by
+     the map) that does not parse clears `career_texts_end`. That the career texts all
      come from the `Work` set is **unverified**. On the Goth day the
      promotion at 15298 ("You have been promoted! (to $Job:4:5)",
      `$JobDesc:4:5`, `$TimeLocal:2`) is a person's. Tests:

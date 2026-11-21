@@ -97,6 +97,11 @@ struct Resources {
     /// chunks read as if there were no map, so lookups still work, but
     /// [`Iff::resource_order`] fails.
     map_error: Option<crate::Error>,
+    /// The flags the resource map states for each resource it lists, by
+    /// index into [`Iff::chunks`]: the resource's flags, which the
+    /// original's reader holds and tests (0x41b7fa to 0x41b813), whatever
+    /// the chunk's header says.
+    flags: BTreeMap<usize, u16>,
 }
 
 impl Resources {
@@ -206,6 +211,7 @@ impl Resources {
                     })?
                     .0;
                 resources.add(chunks, index, true);
+                resources.flags.insert(index, entry.flags);
             }
         }
         Ok(Some(resources))
@@ -259,6 +265,24 @@ impl Iff {
             .by_key
             .get(&(*tag, id, 0))
             .map(|&i| &self.chunks[i])
+    }
+    /// A resource's flags as the original holds them: those the resource
+    /// map states for it (0x41b7fa to 0x41b813), or else its chunk
+    /// header's.
+    pub fn flags(&self, chunk: &Chunk) -> u16 {
+        self.chunks
+            .binary_search_by_key(&chunk.offset, |c| c.offset)
+            .ok()
+            .and_then(|index| self.resources.flags.get(&index))
+            .copied()
+            .unwrap_or(chunk.flags)
+    }
+    /// Why the file's resource map could not be used, if it could not. The
+    /// original reads the map as it is (0x41bfdd to 0x41c032), so the
+    /// resources [`Iff::get`] and [`Iff::all`] give are then not the
+    /// original's.
+    pub fn map_error(&self) -> Option<&crate::Error> {
+        self.resources.map_error.as_ref()
     }
     /// The resources of type `tag` in the original's order. When the
     /// resource map cannot be used, the chunks as if there were no map.

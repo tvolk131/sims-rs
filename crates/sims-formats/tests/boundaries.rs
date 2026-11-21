@@ -425,6 +425,10 @@ fn deleted_chunks_are_not_resources() {
     assert_eq!(iff.data(iff.get(b"STR#", 1).unwrap()), b"live");
     assert!(iff.get(b"STR#", 2).is_none());
     assert_eq!(payloads(&iff, b"STR#"), [b"live"]);
+    // With no map, a resource's flags are its chunk header's.
+    let live = iff.get(b"STR#", 1).unwrap();
+    assert_eq!(iff.flags(live), live.flags);
+    assert!(iff.map_error().is_none());
     // The chunks themselves are all still there.
     assert_eq!(iff.chunks.len(), 3);
 }
@@ -494,6 +498,11 @@ fn a_resource_map_can_choose_the_earlier_chunk() {
     assert_eq!(iff.data(iff.get(b"STR#", 1).unwrap()), b"old");
     assert!(iff.get(b"STR#", 2).is_none());
     assert_eq!(payloads(&iff, b"STR#"), [&b"old"[..], b"low bits"]);
+    // The resource's flags are the map's, not the chunk header's
+    // (0x41b7fa to 0x41b813).
+    let low = iff.get(b"STR#", 3).unwrap();
+    assert_eq!((low.flags, iff.flags(low)), (0x10, 0));
+    assert!(iff.map_error().is_none());
 }
 #[test]
 fn a_map_listing_a_map_is_ignored() {
@@ -517,6 +526,7 @@ fn lookup_survives_a_resource_map_that_cannot_be_used() {
     add_map(&mut b, &[(b"STR#", 9999, 1, 0)]);
     let iff = Iff::parse(b).unwrap();
     assert!(iff.resource_order(b"STR#").is_err());
+    assert!(iff.map_error().is_some());
     assert_eq!(iff.data(iff.get(b"STR#", 1).unwrap()), b"live");
     assert_eq!(iff.all(b"STR#").count(), 1);
 }

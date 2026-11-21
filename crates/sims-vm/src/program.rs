@@ -351,8 +351,11 @@ impl Program {
                 library.loaded_strings.insert(id, None);
                 continue;
             };
+            // A file whose resource map does not match its chunks, which
+            // the original reads as the map has it (0x41bfdd to 0x41c032),
+            // fails the link below (`resource_order`).
             let data = iff.data(chunk);
-            if let Some(why) = unported_strings(chunk.flags, data) {
+            if let Some(why) = unported_strings(iff.flags(chunk), data) {
                 library.unported_strings.insert(id, why);
                 continue;
             }
@@ -1019,14 +1022,14 @@ fn careers(index: &Index) -> Result<Option<Vec<Career>>> {
 }
 
 /// Why the string loader (0x46feac, called with argument 3 zero) reads a
-/// STR# resource with chunk flags `flags` and bytes `data` in a way not
-/// ported, or None when it reads it as [`loaded_order`] does: a table of
+/// STR# resource with flags `flags` ([`Iff::flags`]: the resource map's
+/// when it has one) and bytes `data` in a way not ported, or None when it reads it as [`loaded_order`] does: a table of
 /// format -1, -2 or -3 (0x46ff37, 0x46ff7f, 0x46ffcc) with a count read
 /// as a signed word (`jle` at 0x46ff50, 0x46ff92) up to 0x7fff, whose
 /// header the resource reader leaves as it is. It byte-swaps the header of
-/// a chunk without flag 0x10 (0x41d3a7 to 0x41d3d4, through 0x470351; Sol's
-/// reading of which field it tests, **unverified**; every STR# 301 of the
-/// recorded install has the flag), and reads any other format with its
+/// a resource without flag 0x10 (0x41d3a7 to 0x41d3d4, through 0x470351;
+/// the flags are the map's, 0x41b7fa to 0x41b813, by Sol's reading,
+/// **unverified**; every STR# 301 of the recorded install has the flag), and reads any other format with its
 /// leading word as the count and bytes 0xa1 and 0xd5 rewritten
 /// (0x4700d7 to 0x47014c), so a version-0 table has no entries.
 pub fn unported_strings(flags: u16, data: &[u8]) -> Option<&'static str> {
@@ -1121,6 +1124,9 @@ fn career_texts_end(index: &Index) -> Result<bool> {
     }
     let location = file.location(&index.root);
     let iff = Iff::parse(file.read()?).map_err(|e| sims_content::Error::format(&location, e))?;
+    if !strings_read_as_ported(&iff, None) {
+        return Ok(false);
+    }
     let token = crate::primitives::dialog::may_hold_career_token;
     for chunk in &iff.chunks {
         let data = iff.data(chunk);
@@ -1180,11 +1186,32 @@ pub fn labels_hold_no_token(root: &Path) -> Result<bool> {
     })?;
     let location = path.display().to_string();
     let iff = Iff::parse(bytes).map_err(|e| sims_content::Error::format(&location, e))?;
+    if !strings_read_as_ported(&iff, Some(LABELS)) {
+        return Ok(false);
+    }
     Ok(!iff.chunks.iter().any(|chunk| {
         matches!(&chunk.tag, b"STR#" | b"\0CST")
             && chunk.id == LABELS
             && iff.data(chunk).contains(&b'$')
     }))
+}
+
+/// Whether the loader reads every string table (STR#) resource of `iff`
+/// (or only that of ID `only`) within its bytes, so that a check of them
+/// for a `$` byte holds: the resource map matches the chunks (0x41bfdd to
+/// 0x41c032), and each table is of a layout the loader reads as ported
+/// ([`unported_strings`], with the flags the map states) and parses. A
+/// table it reads otherwise may be read past its end.
+fn strings_read_as_ported(iff: &Iff, only: Option<u16>) -> bool {
+    iff.map_error().is_none()
+        && iff
+            .all(b"STR#")
+            .filter(|chunk| only.is_none_or(|id| chunk.id == id))
+            .all(|chunk| {
+                let data = iff.data(chunk);
+                unported_strings(iff.flags(chunk), data).is_none()
+                    && sims_formats::strings::StringTable::parse(data).is_ok()
+            })
 }
 
 /// `relative` (`/`-separated) under `root`, each component matched
@@ -1215,9 +1242,10 @@ fn find(root: &Path, relative: &str) -> Option<std::path::PathBuf> {
 }
 
 /// The names of the entries of `directory`, and of the members of the
-/// archives (FAR) in it, whose name up to its first `.` is `stem`, ignoring
-/// ASCII case: whatever a resource set of that name there could be made
-/// of. None when an archive there has members the index leaves out
+/// archives (FAR: a file whose name ends in `far`) in it, whose name up to
+/// its first `.` is `stem`, ignoring ASCII case: whatever a resource set
+/// of that name there could be made of. None when an archive there cannot
+/// be read or has members the index leaves out
 /// ([`sims_content::far_members`]), which may be any.
 fn resource_set(directory: &Path, stem: &str) -> Result<Option<Vec<String>>> {
     let named = |name: &str| {
@@ -1246,11 +1274,16 @@ fn resource_set(directory: &Path, stem: &str) -> Result<Option<Vec<String>>> {
         if named(&name) {
             set.push(name.clone());
         }
-        let archive = name
-            .rsplit_once('.')
-            .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("far"));
+        // The original takes a file whose name ends in the letters `far`,
+        // with or without a dot, as an archive (0x5ba86d to 0x5ba8a7), as
+        // the index does.
+        let archive = name.len() >= 3
+            && name.is_char_boundary(name.len() - 3)
+            && name[name.len() - 3..].eq_ignore_ascii_case("far");
         if archive && path.is_file() {
-            let (members, skipped) = sims_content::far_members(&path)?;
+            let Ok((members, skipped)) = sims_content::far_members(&path) else {
+                return Ok(None);
+            };
             if !skipped.is_empty() {
                 return Ok(None);
             }

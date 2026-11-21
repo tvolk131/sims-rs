@@ -81,7 +81,7 @@ pub use people::{curve_table, persistent_fields, reload_profile};
 pub use primitives::primitive_name;
 pub use program::{
     Callback, Career, DEFINITION_WORDS, ICON_FILE, LABEL_FILE, Library, Program, Tree, icon_frames,
-    labels_hold_no_token, loaded_order, sprite_frames,
+    labels_hold_no_token, loaded_order, sprite_frames, unported_strings,
 };
 pub use selection::selected;
 pub use sounds::SoundEvent;
