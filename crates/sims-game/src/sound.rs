@@ -370,10 +370,11 @@ pub fn pause_event(paused: bool) -> SoundEvent {
 
 /// Bridges a [`crate::Game`] into a [`Mixer`] (or [`crate::output::Output`]):
 /// sends object sources, live-mode entry ([`enter_live`]), live-mode
-/// pause/unpause ([`pause_event`], `0x4ce5c5` / `0x4ce5d9`), the
-/// simulation's sound events, the ambience view/hour/speed, and kind 33
-/// camera moves in the order the window uses.
-#[derive(Default)]
+/// pause/unpause ([`pause_event`], `0x4ce5c5` / `0x4ce5d9`), window
+/// focus changes ([`Input::Active`], kind 25 at `0x4f7608` → `0x4f76d5`,
+/// with live-mode auto-pause matching `byte [0x6c9fa1] == 1` at
+/// `0x4f7635`..`0x4f7666`), the simulation's sound events, the ambience
+/// view/hour/speed, and kind 33 camera moves in the order the window uses.
 pub struct Feed {
     /// The hour, speed and ambience view the sound was last told.
     heard: Option<(u32, Speed, i32)>,
@@ -381,11 +382,164 @@ pub struct Feed {
     told: Option<Snapshot>,
     /// The camera the sound last heard move.
     shot: Option<Shot>,
-    /// Whether the sound was last told the lot is paused.
-    paused: bool,
+    /// The last `game.paused()` value observed from [`crate::Game`], used to
+    /// distinguish manual pause toggles from a focus-loss pause request that a
+    /// modal dialog refused on the simulation side.
+    observed_game_paused: bool,
+    /// The requested pause state (`byte [esi + 0x40]` at `0x4cee5d`, read by
+    /// `0x4939c0` on focus loss and tested at `0x4ce5b0` to choose kind 21 vs
+    /// kind 22 independently of whether the simulation accepted the pause).
+    requested_paused: bool,
+    /// Whether `0x4cee4a` marked the pause flag dirty (`or [esi + 0xc], 0x800040`,
+    /// where `0x800000` is tested at `0x4ce59e` for pause dispatch) so the next
+    /// [`Feed::update`] dispatches `pause_event(self.requested_paused)` even
+    /// when the requested boolean matches the previous one.
+    pause_dirty: bool,
+    /// Whether the window is focused (`true` at startup, matching
+    /// `0x4eee14` and `0x4f7610` deduplication).
+    focused: bool,
+    /// The requested pause state saved on focus loss (`[esi + 0xbc]` at
+    /// `0x4f7645`..`0x4f764a`), restored on focus regain (`0x4f765c`..`0x4f7666`).
+    saved_paused: bool,
+}
+
+impl Default for Feed {
+    fn default() -> Self {
+        Self {
+            heard: None,
+            told: None,
+            shot: None,
+            observed_game_paused: false,
+            requested_paused: false,
+            pause_dirty: false,
+            focused: true,
+            saved_paused: false,
+        }
+    }
 }
 
 impl Feed {
+    /// Whether the window is currently considered focused.
+    pub fn focused(&self) -> bool {
+        self.focused
+    }
+
+    /// Handles a window focus change (`WM_ACTIVATEAPP`, `0x4f7608`..`0x4f76dc`),
+    /// returning whether the lot's pause state changed (so the window should
+    /// redraw).
+    ///
+    /// Repeated notifications with the same state are ignored, including an
+    /// initial `true` at window creation (`0x4eee14`, `0x4f7610`).
+    ///
+    /// - On focus loss (`true -> false`): flushes any already-pending game
+    ///   sources, sounds, and camera moves first so kind 25 off does not
+    ///   overtake earlier events; saves the requested pause state and requests
+    ///   pause (`0x4f7635`..`0x4f765a`, matching `byte [0x6c9fa1] == 1`);
+    ///   then sends [`Input::Active`]`(false)` (`0x4f76d5`). The pending
+    ///   pause reaches sound as [`SoundEvent::Pause`] on the next
+    ///   [`Feed::update`] (`0x4ce5b0`..`0x4ce5c5`), even if a modal dialog
+    ///   kept `game.paused()` false.
+    /// - On focus regain (`false -> true`): refreshes [`Input::Sources`]
+    ///   (and initial [`enter_live`] if needed) without flushing a stale
+    ///   pending focus-loss pause; restores the saved pause state
+    ///   (`0x4f765c`..`0x4f7666`); then sends [`Input::Active`]`(true)`
+    ///   (`0x4f76d5`). The restored pause request reaches sound as
+    ///   [`SoundEvent::Pause`] or [`SoundEvent::Unpause`] on the next
+    ///   [`Feed::update`] (`0x4ce5b0`..`0x4ce5d9`).
+    pub fn set_focused(
+        &mut self,
+        focused: bool,
+        game: &mut crate::Game,
+        mut send: impl FnMut(Input),
+    ) -> bool {
+        if self.focused == focused {
+            return false;
+        }
+        // Pick up any manual pause toggle that happened since the last update
+        // so `0x4f7645 -> 0x4939c0` saves the latest requested pause state.
+        let current_game_paused = game.paused();
+        if current_game_paused != self.observed_game_paused {
+            self.observed_game_paused = current_game_paused;
+            self.requested_paused = current_game_paused;
+        }
+        let pause_changed = if !focused {
+            // Flush prior clicks, sounds, and camera moves before focus loss
+            // so kind 25 off cannot drop or overtake earlier events, without
+            // prematurely emitting a pending focus-regain `Unpause` when a
+            // rapid refocus-then-blur occurs before the next `update`.
+            self.flush_before_blur(game, &mut send);
+            self.saved_paused = self.requested_paused;
+            let before = game.paused();
+            if !before {
+                game.toggle_pause();
+            }
+            self.observed_game_paused = game.paused();
+            // `0x4cee52`..`0x4cee5d` records requested pause = true and marks
+            // pause dirty (`0x800000`) unconditionally.
+            self.requested_paused = true;
+            self.pause_dirty = true;
+            self.observed_game_paused != before
+        } else {
+            let first = self.told.is_none();
+            let sources = game.sound_sources();
+            if self.told.as_ref() != Some(&sources) {
+                send(Input::Sources(sources.clone()));
+                self.told = Some(sources);
+            }
+            if first {
+                send(Input::Events(enter_live()));
+            }
+            let before = game.paused();
+            if before != self.saved_paused {
+                game.toggle_pause();
+            }
+            self.observed_game_paused = game.paused();
+            // `0x4cee52`..`0x4cee5d` records requested pause = saved_paused and
+            // marks pause dirty (`0x800000`) unconditionally, so a rapid
+            // blur-then-refocus still dispatches the final pause state on the
+            // next update (`0x4ce59e` → `0x4ce5b0`).
+            self.requested_paused = self.saved_paused;
+            self.pause_dirty = true;
+            self.observed_game_paused != before
+        };
+        self.focused = focused;
+        send(Input::Active(focused));
+        pause_changed
+    }
+
+    /// Flushes prior game sources, sounds, and camera moves before focus loss
+    /// without flushing pending pause changes (both manual toggles at
+    /// `0x53a5bf` and focus changes at `0x4f7655` write the same deferred
+    /// pause state at `0x4cee52`..`0x4cee5d`, dispatched only on the next
+    /// [`Feed::update`] at `0x4ce59e`).
+    fn flush_before_blur(&mut self, game: &mut crate::Game, mut send: impl FnMut(Input)) {
+        let first = self.told.is_none();
+        let sources = game.sound_sources();
+        if self.told.as_ref() != Some(&sources) {
+            send(Input::Sources(sources.clone()));
+            self.told = Some(sources);
+        }
+        if first {
+            send(Input::Events(enter_live()));
+        }
+        let sounds = game.take_sounds();
+        if !sounds.is_empty() {
+            send(Input::Events(sounds.into_iter().map(event).collect()));
+        }
+        let now = (game.hour(), game.pace.speed, game.ambience_view());
+        if self.heard != Some(now) {
+            send(Input::View(now.2));
+            send(Input::Hour(now.0));
+            send(Input::Speed(now.1));
+            self.heard = Some(now);
+        }
+        let shot = game.shot();
+        if self.shot != Some(shot) {
+            send(Input::Camera);
+            self.shot = Some(shot);
+        }
+    }
+
     /// Sends every sound input that changed on `game` since the last call.
     pub fn update(&mut self, game: &mut crate::Game, mut send: impl FnMut(Input)) {
         // What the tick's sounds may ask about their objects, before the
@@ -400,10 +554,15 @@ impl Feed {
         if first {
             send(Input::Events(enter_live()));
         }
-        let paused = game.paused();
-        if paused != self.paused {
-            send(Input::Events(vec![pause_event(paused)]));
-            self.paused = paused;
+        let game_paused = game.paused();
+        if game_paused != self.observed_game_paused {
+            self.observed_game_paused = game_paused;
+            self.requested_paused = game_paused;
+            self.pause_dirty = true;
+        }
+        if self.pause_dirty {
+            send(Input::Events(vec![pause_event(self.requested_paused)]));
+            self.pause_dirty = false;
         }
         let sounds = game.take_sounds();
         if !sounds.is_empty() {
@@ -486,6 +645,8 @@ pub enum Input {
     /// The camera moved (kind 33): sent after the [`Input::Sources`]
     /// and [`Input::View`] that show the lot through the moved camera.
     Camera,
+    /// The window gained or lost focus (kind 25, `0x4f7608` → `0x4f76d5`).
+    Active(bool),
 }
 
 /// The sound player with every module, station and ambient score of an
@@ -541,6 +702,7 @@ impl Mixer {
             Input::Camera => self
                 .player
                 .camera_moved(self.view, self.hour, &self.sources),
+            Input::Active(active) => self.player.set_active(active, &self.sources),
             Input::Speed(speed) => self
                 .player
                 .set_global(SPEED_REGISTER, speed_register(speed)),
@@ -729,5 +891,10 @@ mod tests {
             matches!(stop, SoundEvent::StopObject { object: 12 }),
             "{stop:?}"
         );
+    }
+
+    #[test]
+    fn feed_starts_focused_like_app_constructor() {
+        assert!(Feed::default().focused());
     }
 }

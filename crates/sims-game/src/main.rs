@@ -228,9 +228,36 @@ struct App {
     sound: Sound,
     /// Tracks what the sound has been told about the lot and camera.
     sound_feed: sound::Feed,
+    /// Filters winit's synthetic pre-activation focus events at startup
+    /// (notably macOS `WindowEvent::Focused(false)` queued during
+    /// `create_window` before `makeKeyAndOrderFront`).
+    focus_filter: FocusFilter,
     /// The REDB file of saves, and this house's name in it.
     saves: PathBuf,
     slot: String,
+}
+
+/// Filters startup `WindowEvent::Focused` notifications so ordinary window
+/// launch sends no kind 25 (matching `0x4eee14` + `0x4f7610`). Winit 0.30 on
+/// macOS queues a synthetic `Focused(false)` when creating the window delegate
+/// before `makeKeyAndOrderFront` emits `Focused(true)`; dropping pre-activation
+/// events until the window first becomes active prevents a spurious
+/// off/on pair that would pause ambience and arm the 2-second nudge countdown.
+#[derive(Default)]
+struct FocusFilter {
+    activated: bool,
+}
+
+impl FocusFilter {
+    fn filter(&mut self, focused: bool) -> Option<bool> {
+        if !self.activated {
+            if focused {
+                self.activated = true;
+            }
+            return None;
+        }
+        Some(focused)
+    }
 }
 
 /// The canvas dimensions for a physical client area `size` at `scale`,
@@ -517,6 +544,18 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Focused(focused) => {
+                if let Some(focused) = self.focus_filter.filter(focused)
+                    && self
+                        .sound_feed
+                        .set_focused(focused, &mut self.game, |input| self.sound.send(input))
+                {
+                    // Drop any wall-clock time spent paused or stalled while
+                    // unfocused so the first tick after resume does not catch up.
+                    self.last = Instant::now();
+                    self.changed(true);
+                }
+            }
             WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::Resized(size) => {
                 self.sync_size(size);
@@ -685,6 +724,7 @@ fn run() -> Result<(), String> {
         printed: 0,
         sound: Sound::start(&options.install, mute),
         sound_feed: sound::Feed::default(),
+        focus_filter: FocusFilter::default(),
         saves,
         slot: slot(&options.house),
     };
@@ -735,5 +775,21 @@ mod tests {
         );
         assert_eq!(canvas_point(pos, PhysicalSize::new(260, 600), 1), None);
         assert_eq!(canvas_point(pos, PhysicalSize::new(0, 600), 1), None);
+    }
+
+    #[test]
+    fn focus_filter_drops_macos_startup_false_then_forwards_transitions() {
+        // Winit 0.30 on macOS queues synthetic Focused(false) during window
+        // creation before makeKeyAndOrderFront emits Focused(true).
+        let mut filter = FocusFilter::default();
+        assert_eq!(filter.filter(false), None);
+        assert_eq!(filter.filter(true), None);
+        assert_eq!(filter.filter(false), Some(false));
+        assert_eq!(filter.filter(true), Some(true));
+
+        // Platforms starting directly with Focused(true) also send no startup kind 25.
+        let mut direct = FocusFilter::default();
+        assert_eq!(direct.filter(true), None);
+        assert_eq!(direct.filter(false), Some(false));
     }
 }

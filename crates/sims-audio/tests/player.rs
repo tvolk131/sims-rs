@@ -2158,7 +2158,9 @@ fn the_placement_s_pan_sets_the_comparison_flags_when_the_event_comes() {
     // far off the left of the screen, the pan is 0 and the flags with
     // it, and the script's `ifle` goes to the silent routine 0x101; in
     // the middle, the pan is 512 and the script asks about its object. A
-    // kind 53 after it writes the patch, and the flags are that.
+    // kind 53 after it writes the patch (`0x57e0cc`), whose `0x57f6e3`..`0x57f6fb`
+    // copies the patch's `Is3d` flag into register `0x1a` via `vtable +0x84`,
+    // overwriting the comparison flags with `is_3d` (0 for 2D, 1 for 3D).
     let mut branches = vec![LOADL, 57];
     branches.extend(long(10_001));
     branches.extend([LOADL, 5]);
@@ -2166,17 +2168,42 @@ fn the_placement_s_pan_sets_the_comparison_flags_when_the_event_comes() {
     branches.extend([WAIT, 5, IFLE]);
     branches.extend(long(0x101));
     branches.extend([72, 6, 1, 2, WAIT_SAMP, END]); // getsrcdatafield v2, arg1, arg2
-    let silent: &[u8] = &[END];
-    for (x, sequenced, asks) in [
-        (400, false, true),
-        (-7000, false, false),
-        (-7000, true, true),
+    let silent: &[u8] = &[WAIT_SAMP, END];
+    let (hit, addresses) = assemble(&[&branches, silent]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         kSndobPlay=1\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\",0,0,0,0,0\n\
+         2=0,two,\"two.xa\",0,0,0,0,0\n\
+         3=0,two3d,\"two.xa\",0,0,0,1,0\n\
+         [GlobalHitList]\n\
+         6=2\n\
+         7=3\n\
+         [Track]\n\
+         10=0,t0,1024,2,0,0,0,0x100,1\n\
+         11=0,t1,1024,2,0,0,0,0x101,1\n\
+         [EventMapping]\n\
+         e0=kSndobPlay,10\n\
+         e1=kSndobPlay,11\n\
+         seq2d=53,10,0,6\n\
+         seq3d=53,10,0,7\n",
+        addresses[0], addresses[1]
+    );
+    for (x, seq_event, asks) in [
+        (400, None, true),
+        (-7000, None, false),
+        (400, Some("seq2d"), false),
+        (-7000, Some("seq3d"), true),
     ] {
         let probe = Probe {
             lot: on_lot(&[(9, x)]),
             asked: Default::default(),
         };
-        let module = module_with(&[&branches, silent], 1, 10, "seq=53,10,0,6\n");
+        let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
         let mut player = Player::new(vec![module], samples(), 1);
         let event = |name: &str| SoundEvent::Play {
             object: 9,
@@ -2186,12 +2213,12 @@ fn the_placement_s_pan_sets_the_comparison_flags_when_the_event_comes() {
         player.render(BLOCK, &probe);
         player.handle(&SoundEvent::Pause, &probe);
         player.handle(&event("e0"), &probe);
-        if sequenced {
-            player.handle(&event("seq"), &probe);
+        if let Some(seq) = seq_event {
+            player.handle(&event(seq), &probe);
         }
         player.handle(&SoundEvent::Unpause, &probe);
         player.render(2 * BLOCK, &probe);
-        assert_eq!(!probe.asked.borrow().is_empty(), asks, "{x}");
+        assert_eq!(!probe.asked.borrow().is_empty(), asks, "{x} {seq_event:?}");
         assert!(player.faults.is_empty(), "{:?}", player.faults);
     }
 }
@@ -3529,7 +3556,7 @@ fn kind_25_volume_nudge_adjusts_placement_for_100_updates_then_stops() {
         );
         m
     };
-    let looping: &[u8] = &[2, 5, WAIT_SAMP, 14];
+    let looping: &[u8] = &[2, 5, WAIT_SAMP, LOOP];
     let day_at = |x: i32| {
         let mut s = on_lot(&[(9, x)]);
         s.absent[4] = 12;
@@ -3591,14 +3618,17 @@ fn kind_25_volume_nudge_adjusts_placement_for_100_updates_then_stops() {
     p_one.camera_moved(0, 12, &barely);
     assert_eq!(p_one.render_stereo(1, &barely), [0, 0]);
 
-    // At each block boundary, 0x573019 restores vol and decrements
-    // +0x114. Advance 99 full block starts (1 remains -> still nudging),
-    // then 1 more block start (0 remains -> nudging stops).
-    let to_next = BLOCK - (p_zero.frame() as usize % BLOCK);
-    let _ = p_zero.render_stereo(to_next + 98 * BLOCK + 1, &offscreen);
+    // At each 20 ms timer boundary (`TIMER_FRAMES` = 441 frames at 22,050 Hz,
+    // `0x572fc3` -> `0x573019`), the countdown restores normal vol and
+    // decrements `+0x114` (100 updates = 2.00 s). Advance 99 timer ticks
+    // (1 remains -> still nudging), then 1 more timer tick (0 remains ->
+    // nudging stops).
+    let timer = sims_audio::player::TIMER_FRAMES;
+    let to_next = timer - (p_zero.frame() as usize % timer);
+    let _ = p_zero.render_stereo(to_next + 98 * timer + 1, &offscreen);
     p_zero.camera_moved(0, 12, &offscreen);
     assert!(p_zero.render_stereo(1, &offscreen)[0] > 0);
-    let to_next = BLOCK - (p_zero.frame() as usize % BLOCK);
+    let to_next = timer - (p_zero.frame() as usize % timer);
     let _ = p_zero.render_stereo(to_next + 1, &offscreen);
     p_zero.camera_moved(0, 12, &offscreen);
     assert_eq!(p_zero.render_stereo(1, &offscreen), [0, 0]);
@@ -3714,13 +3744,14 @@ fn day_and_night_loop_picks_nite_loop_beach_loop_and_skips_downtown() {
             .all(|&s| s == 0)
     );
 
-    // Hour 19 (> 18) on lot 1: nite_loop starts and fades to group 1 volume.
-    player.set_group_volume(1, 512);
+    // Hour 19 (> 18) on lot 1: nite_loop starts and fades to VOLUME_STEPS[fx_step]
+    // (0x574a07..0x574a10; step 3 -> 490).
+    player.set_fx_volume_step(3, &day18);
     let night19 = snap(19, 1);
     player.camera_moved(0, 19, &night19);
     let out_half = player.render_stereo(BLOCK * 4, &night19);
     assert!(out_half.iter().any(|&s| s > 0), "{out_half:?}");
-    // Fade target was 512 (and group 1 is 512, so logarithmic attenuation
+    // Fade target was 490 (and group 1 is 490, so logarithmic attenuation
     // scales 4000 far below full volume).
     let peak_half = *out_half.iter().max().unwrap();
     assert!(peak_half > 0 && peak_half < 400, "{peak_half}");
@@ -3737,7 +3768,7 @@ fn day_and_night_loop_picks_nite_loop_beach_loop_and_skips_downtown() {
         "lot 20 should silence nite_loop"
     );
     // Lot 19 and lot 30 are outside Downtown, so hour 5 plays nite_loop again.
-    player.set_group_volume(1, 1024);
+    player.set_fx_volume_step(10, &downtown20);
     let lot30 = snap(5, 30);
     player.camera_moved(0, 5, &lot30);
     let out_full = player.render_stereo(BLOCK * 4, &lot30);
@@ -5429,5 +5460,1001 @@ fn never_started_track_reads_zero_patch_after_kill_trk_and_stop_all() {
     play(&mut player, "e2"); // read track 10's PATCH -> 0
     player.render(BLOCK, &probe);
     assert_eq!(*probe.asked.borrow(), [(0, 0), (0, 0)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn kinds_37_38_39_map_slider_steps_to_groups_and_ambience() {
+    use sims_audio::fsc::Score;
+    use sims_audio::levels::{Inputs, levels};
+    use sims_audio::player::VOLUME_STEPS;
+
+    // Three tracks in groups 1 (Sfx), 2 (Music) and 3 (Vox), each looping a
+    // constant sample of 4000, plus a 1-cell looping ambience score to verify
+    // kind 37 updates ambience volume (0x5740b4..0x5740f1) while kinds 38
+    // and 39 leave it alone.
+    let loop_note: &[u8] = &[SET_LOOP, NOTE_ON_V1[0], NOTE_ON_V1[1], WAIT_SAMP, LOOP];
+    let (hit, addresses) = assemble(&[loop_note]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         [Track]\n\
+         10=0,sfx,1024,0,0,1,0,0x100,1\n\
+         11=0,mus,1024,0,0,2,0,0x100,1\n\
+         12=0,vox,1024,0,0,3,0,0x100,1\n\
+         [EventMapping]\n\
+         sfx=1,10\n\
+         mus=1,11\n\
+         vox=1,12\n\
+         amb0=52,0\n\
+         fx0=37,0\n\
+         fx5=37,5\n\
+         fx_bad=37,11\n\
+         fx_neg=37,-1\n\
+         mus3=38,3\n\
+         vox7=39,7\n\
+         mus_bad=38,12\n\
+         vox_bad=39,-2\n",
+        addresses[0]
+    );
+    let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+    let score = Score::parse(
+        b"version 7\n#\tvol\tpri\n\
+          \t1024\t0\t1\t1\t1\t1\t600\t2\t1\t1\t0\t0\t0\t0\n\
+          #\tvol\n\
+          \t1024\t0\t512\t512\t0\t0\t0\t0\t0\t0\t1\t0\t20\t0\t0\t0\t0\t0\tamb.xa\n",
+    )
+    .unwrap();
+    let mut map = BTreeMap::new();
+    map.insert(
+        "one.xa".to_owned(),
+        Pcm {
+            rate: RATE,
+            channels: 1,
+            samples: vec![4000; RATE as usize],
+        },
+    );
+    map.insert(
+        "dir\\amb.xa".to_owned(),
+        Pcm {
+            rate: RATE,
+            channels: 1,
+            samples: vec![4000; RATE as usize],
+        },
+    );
+    let mut player = Player::new(vec![module], map, 1);
+    assert!(player.add_score(0, &score, "dir"));
+
+    // Sound manager constructor (0x5713ee..0x571409) starts all three
+    // sliders at step 10 (1024).
+    assert_eq!(
+        (
+            player.fx_volume_step(),
+            player.music_volume_step(),
+            player.vox_volume_step()
+        ),
+        (10, 10, 10)
+    );
+    assert_eq!(
+        VOLUME_STEPS,
+        [0, 300, 390, 490, 590, 690, 790, 840, 895, 960, 1024]
+    );
+
+    let expected_mono = |group_volume: i32| -> i16 {
+        let g = levels(&Inputs {
+            vol: 1024,
+            extvol: 1024,
+            pan: 512,
+            pitch: 3600,
+            duck_priority: 0,
+            three_d: false,
+            group_volume,
+            main_duck_priority: 0,
+            master: 1024,
+        })
+        .gains;
+        let l = (4000i64 * i64::from(g[0])) >> 16;
+        let r = (4000i64 * i64::from(g[1])) >> 16;
+        ((l + r) / 2) as i16
+    };
+
+    // Kind 37 (step 5 -> 690), kind 38 (step 3 -> 490), kind 39 (step 7 -> 840).
+    for (event_name, track_event, step) in
+        [("fx5", "sfx", 5), ("mus3", "mus", 3), ("vox7", "vox", 7)]
+    {
+        player.handle(&SoundEvent::StopAll, &NoSources);
+        play(&mut player, event_name);
+        play(&mut player, track_event);
+        let out = player.render(BLOCK, &NoSources);
+        assert_eq!(
+            out[0],
+            expected_mono(VOLUME_STEPS[step]),
+            "{event_name} (step {step})"
+        );
+    }
+    assert_eq!(
+        (
+            player.fx_volume_step(),
+            player.music_volume_step(),
+            player.vox_volume_step()
+        ),
+        (5, 3, 7)
+    );
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+
+    // Kind 37 updates ambience score volume (0x5740b4..0x5740f1), while
+    // kinds 38 and 39 leave ambience volume unchanged.
+    player.handle(&SoundEvent::StopAll, &NoSources);
+    play(&mut player, "amb0");
+    let amb_at_5 = player.render(RATE as usize / 2, &NoSources);
+    let sample_at_5 = *amb_at_5.last().unwrap();
+    assert_eq!(sample_at_5, expected_mono(VOLUME_STEPS[5]));
+    play(&mut player, "mus3");
+    play(&mut player, "vox7");
+    assert_eq!(player.render(BLOCK, &NoSources)[0], sample_at_5);
+    play(&mut player, "fx0");
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 0);
+    player.handle(&SoundEvent::StopAll, &NoSources);
+    play(&mut player, "fx5");
+
+    // Out-of-range HOT event steps report faults without changing state.
+    for bad in ["fx_bad", "fx_neg", "mus_bad", "vox_bad"] {
+        play(&mut player, bad);
+    }
+    assert_eq!(player.faults.len(), 4, "{:?}", player.faults);
+    assert_eq!(
+        (
+            player.fx_volume_step(),
+            player.music_volume_step(),
+            player.vox_volume_step()
+        ),
+        (5, 3, 7)
+    );
+
+    // Direct host methods clamp steps above 10 to 10.
+    player.set_fx_volume_step(99, &NoSources);
+    player.set_music_volume_step(99);
+    player.set_vox_volume_step(99);
+    assert_eq!(
+        (
+            player.fx_volume_step(),
+            player.music_volume_step(),
+            player.vox_volume_step()
+        ),
+        (10, 10, 10)
+    );
+}
+
+#[test]
+fn kind_37_reruns_day_night_loop_and_restarts_after_mute() {
+    use sims_audio::levels::{Inputs, levels};
+    use sims_audio::player::{NITE_LOOP, VOLUME_STEPS};
+
+    let loop_note: &[u8] = &[SET_LOOP, NOTE_ON_V1[0], NOTE_ON_V1[1], WAIT_SAMP, LOOP];
+    // Reads EXTVOL (19), FADE_DEST (40), FADE_VAR (41), FADE_SPEED (42), FADE_ON (45)
+    // from NITE_LOOP through `target`.
+    let mut inspect = loadl(53, NITE_LOOP as i32);
+    for reg in [19u8, 40, 41, 42, 45] {
+        inspect.extend([GETSRCDATAFIELD, 6, 1, reg]);
+    }
+    inspect.push(END);
+    let (hit, addresses) = assemble(&[loop_note, &inspect]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         [Track]\n\
+         {NITE_LOOP}=0,nite_loop,1024,0,0,1,0,0x100,1\n\
+         20=0,inspect,1024,0,0,0,0,0x101,1\n\
+         [EventMapping]\n\
+         m3=36,3\n\
+         m0=36,0\n\
+         fx0=37,0\n\
+         fx5=37,5\n\
+         fx8=37,8\n\
+         mus5=38,5\n\
+         vox5=39,5\n\
+         inspect=1,20\n",
+        addresses[0], addresses[1]
+    );
+    let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+    let mut map = BTreeMap::new();
+    map.insert(
+        "one.xa".to_owned(),
+        Pcm {
+            rate: RATE,
+            channels: 1,
+            samples: vec![4000; RATE as usize],
+        },
+    );
+    let mut player = Player::new(vec![module], map, 1);
+
+    let snap = |hour: i32| {
+        let mut s = Snapshot::default();
+        s.absent[4] = hour;
+        s.lot = 1;
+        s
+    };
+    let night = snap(22);
+    let day = snap(12);
+
+    // Mute effects before entering live mode at night: `0x574978` picks
+    // NITE_LOOP, `start` returns early on group 1 volume 0, and
+    // `0x574a1e..0x574a5e` still writes the stopped fade setup (FADE_ON=0).
+    for name in ["fx0", "m3", "m0"] {
+        player.handle(
+            &SoundEvent::Play {
+                object: 0,
+                name: name.into(),
+            },
+            &night,
+        );
+    }
+    // `m3`/`m0` report missing music tracks (517, 2957, 519) in this
+    // minimal module; clear those so later assertions catch any new faults.
+    player.faults.clear();
+    assert!(
+        player
+            .render_stereo(BLOCK * 4, &night)
+            .iter()
+            .all(|&s| s == 0)
+    );
+    let probe = Probe {
+        lot: on_lot(&[(8, 400)]),
+        asked: Default::default(),
+    };
+    player.handle(
+        &SoundEvent::Play {
+            object: 0,
+            name: "inspect".into(),
+        },
+        &probe,
+    );
+    player.render(BLOCK, &probe);
+    assert_eq!(
+        *probe.asked.borrow(),
+        [(0, 0), (0, 0), (0, 19), (0, 5000), (0, 0)]
+    );
+
+    // Kinds 38 and 39 do NOT run 0x574978.
+    for name in ["mus5", "vox5"] {
+        player.handle(
+            &SoundEvent::Play {
+                object: 0,
+                name: name.into(),
+            },
+            &night,
+        );
+    }
+    assert!(
+        player
+            .render_stereo(BLOCK * 4, &night)
+            .iter()
+            .all(|&s| s == 0)
+    );
+
+    // Raising the effects slider via kind 37 (step 5 -> 690) with NO
+    // `camera_moved` runs 0x574978, starts `nite_loop`, and fades `extvol`
+    // up to 690 (at group 1 volume 690).
+    player.handle(
+        &SoundEvent::Play {
+            object: 0,
+            name: "fx5".into(),
+        },
+        &night,
+    );
+    let out = player.render_stereo(BLOCK * 4, &night);
+    let expected = levels(&Inputs {
+        vol: 1024,
+        extvol: VOLUME_STEPS[5],
+        pan: 512,
+        pitch: 3600,
+        duck_priority: 0,
+        three_d: false,
+        group_volume: VOLUME_STEPS[5],
+        main_duck_priority: 0,
+        master: 1024,
+    })
+    .gains;
+    let want = ((4000i64 * i64::from(expected[0])) >> 16) as i16;
+    assert_eq!(out[out.len() - 2], want, "nite_loop at fx step 5");
+
+    // When the hour is daytime, kind 37 runs 0x574978 and fades `nite_loop`
+    // out even without a camera move.
+    player.handle(
+        &SoundEvent::Play {
+            object: 0,
+            name: "fx8".into(),
+        },
+        &day,
+    );
+    let _ = player.render_stereo(BLOCK * 16, &day);
+    assert!(
+        player
+            .render_stereo(BLOCK * 4, &day)
+            .iter()
+            .all(|&s| s == 0),
+        "kind 37 in daytime should stop nite_loop"
+    );
+
+    // Inactive sound: kind 37 still updates slider step / group volume, and
+    // 0x574978 takes the stop branch instead of starting `nite_loop`.
+    player.set_active(false, &night);
+    player.handle(
+        &SoundEvent::Play {
+            object: 0,
+            name: "fx5".into(),
+        },
+        &night,
+    );
+    assert_eq!(player.fx_volume_step(), 5);
+    assert!(
+        player
+            .render_stereo(BLOCK * 4, &night)
+            .iter()
+            .all(|&s| s == 0)
+    );
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn day_night_fade_target_reads_fx_slider_step_not_raw_group_volume() {
+    use sims_audio::player::NITE_LOOP;
+
+    // `0x574a07..0x574a10` reads `VOLUME_STEPS[+0xf0]` independently of raw
+    // `group_volumes[1]` (`0x57c102`). With fx slider at default step 10
+    // (1024) and raw `set_group_volume(1, 0)`, a muted start still writes
+    // `FADE_DEST = 1024`, and with `set_group_volume(1, 512)`, `nite_loop`
+    // starts with `FADE_DEST = 1024` (not 512).
+    let loop_note: &[u8] = &[SET_LOOP, NOTE_ON_V1[0], NOTE_ON_V1[1], WAIT_SAMP, LOOP];
+    let mut inspect = loadl(53, NITE_LOOP as i32);
+    inspect.extend([GETSRCDATAFIELD, 6, 1, 40, END]); // FADE_DEST
+    let (hit, addresses) = assemble(&[loop_note, &inspect]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         [Track]\n\
+         {NITE_LOOP}=0,nite_loop,1024,0,0,1,0,0x100,1\n\
+         20=0,inspect,1024,0,0,0,0,0x101,1\n\
+         [EventMapping]\n\
+         m3=36,3\n\
+         m0=36,0\n\
+         inspect=1,20\n",
+        addresses[0], addresses[1]
+    );
+    let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+    let mut player = Player::new(vec![module], long_sample("one.xa"), 1);
+    let mut night = Snapshot::default();
+    night.absent[4] = 22;
+    night.lot = 1;
+
+    // Slider stays at 10 (1024), raw group 1 volume set to 0 -> stopped
+    // track still receives FADE_DEST = 1024.
+    player.set_group_volume(1, 0);
+    for name in ["m3", "m0"] {
+        player.handle(
+            &SoundEvent::Play {
+                object: 0,
+                name: name.into(),
+            },
+            &night,
+        );
+    }
+    let probe = Probe {
+        lot: on_lot(&[(8, 400)]),
+        asked: Default::default(),
+    };
+    player.handle(
+        &SoundEvent::Play {
+            object: 0,
+            name: "inspect".into(),
+        },
+        &probe,
+    );
+    player.render(BLOCK, &probe);
+    assert_eq!(*probe.asked.borrow(), [(0, 1024)]);
+
+    // Raw group 1 volume set to 512 -> nite_loop starts with FADE_DEST = 1024.
+    player.set_group_volume(1, 512);
+    player.camera_moved(0, 22, &night);
+    probe.asked.borrow_mut().clear();
+    player.handle(
+        &SoundEvent::Play {
+            object: 0,
+            name: "inspect".into(),
+        },
+        &probe,
+    );
+    player.render(BLOCK, &probe);
+    assert_eq!(*probe.asked.borrow(), [(0, 1024)]);
+}
+
+#[test]
+fn group_volume_refresh_reads_voice_levels_through_target() {
+    // `0x57c197` -> `0x57f759` reads `VOL`, `EXTVOL`, `DUCKPRI`, and `Is3d`
+    // through `target` (`vtable[+0x88]` -> `0x57de16`), while keeping `PAN`
+    // local (`0x57f85f`). Track 10 (group 1) starts a note at local
+    // EXTVOL=1024, then targets stopped track 11 whose EXTVOL was set to 0.
+    // A kind 37 slider update refreshes track 10's voice through `0x57f759`,
+    // silencing it immediately and keeping it silent on later blocks.
+    let mut set_t11_zero = loadl(53, 11);
+    set_t11_zero.extend(loadl(19, 0));
+    set_t11_zero.push(END);
+
+    let mut targeter = NOTE_ON_V1.to_vec();
+    targeter.extend(loadl(53, 11));
+    targeter.extend([SET_LOOP, LOOP]);
+
+    let (hit, addresses) = assemble(&[&targeter, &[END], &set_t11_zero]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         0x102={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         [Track]\n\
+         10=0,t10,1024,0,0,1,0,0x100,1\n\
+         11=0,t11,1024,0,0,1,0,0x101,1\n\
+         12=0,t12,1024,0,0,0,0,0x102,1\n\
+         [EventMapping]\n\
+         e0=1,10\n\
+         e2=1,12\n\
+         fx8=37,8\n",
+        addresses[0], addresses[1], addresses[2]
+    );
+    let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+    let mut player = Player::new(vec![module], long_sample("one.xa"), 1);
+
+    play(&mut player, "e2"); // write EXTVOL = 0 on stopped track 11
+    player.render(BLOCK, &NoSources);
+    play(&mut player, "e0"); // starts note at local EXTVOL=1024, then sets target=11
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+
+    // Slider change refreshes group 1 tracks via 0x57f759 -> reads EXTVOL=0
+    // through target 11 -> silent immediately and on subsequent blocks.
+    play(&mut player, "fx8");
+    assert!(player.render(BLOCK * 3, &NoSources).iter().all(|&s| s == 0));
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn slider_and_ducking_updates_leave_held_voices_latched() {
+    // `0x57dc5a` removes held tracks from the running list walked by both
+    // `0x57c0ea` (group volume) and `0x57cc74` (`main_duckpri`). A held note
+    // therefore keeps its latched gain across slider/ducking updates until
+    // something refreshes it after resuming.
+    let loop_note: &[u8] = &[SET_LOOP, NOTE_ON_V1[0], NOTE_ON_V1[1], WAIT_SAMP, LOOP];
+    let mut set_duck = loadl(123, 5);
+    set_duck.extend([SET_LOOP, LOOP]);
+    let (hit, addresses) = assemble(&[loop_note, &set_duck]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         [Track]\n\
+         10=0,sfx,1024,0,0,1,0,0x100,1\n\
+         11=0,ducker,1024,0,0,0,0,0x101,1\n\
+         [EventMapping]\n\
+         sfx=1,10\n\
+         ducker=1,11\n\
+         fx0=37,0\n",
+        addresses[0], addresses[1]
+    );
+    let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+    let mut player = Player::new(vec![module], long_sample("one.xa"), 1);
+
+    play(&mut player, "sfx");
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    player.handle(&SoundEvent::Pause, &NoSources);
+    // Lower FX slider to 0 and have an unheld track raise main_duckpri
+    // while track 10 is held.
+    play(&mut player, "fx0");
+    play(&mut player, "ducker");
+    assert!(player.render(BLOCK, &NoSources).iter().all(|&s| s == 0));
+    player.handle(&SoundEvent::Unpause, &NoSources);
+    // Track 10's resumed note still plays at its latched gain (10_000)
+    // because 0x57c0ea and 0x57cc74 skipped it while held.
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn duckpri_and_is3d_latch_until_main_duckpri_refresh_including_unchanged_max_and_stopped_target() {
+    // 1) Writing `DUCKPRI` (25) or `Is3d` (26) does NOT call 0x57f759
+    //    (0x57def1..0x57e057), so a ducked note stays ducked.
+    // 2) A subsequent `MAIN_DUCKPRI` write refreshes all unheld running
+    //    voices at 0x57d31e -> 0x57cc74 EVEN when the maximum stays the same.
+    // 3) A `MAIN_DUCKPRI` write routed to a stopped target in the same block
+    //    as `target = 11` sees the caller's new `target` during that refresh.
+    let mut ducked = NOTE_ON_V1.to_vec();
+    ducked.extend([SET_LOOP, LOADL, 5, 10, 0, 0, 0, WAIT, 5]);
+    ducked.extend(loadl(25, 10)); // raise DUCKPRI above main_duckpri=5 (must stay latched!)
+    ducked.extend(loadl(26, 1)); // toggle Is3d (must stay latched!)
+    ducked.extend([SET_LOOP, LOOP]);
+
+    let mut set_duck_5 = loadl(123, 5);
+    set_duck_5.extend([SET_LOOP, LOOP]);
+
+    let mut same_max_duck = loadl(123, 5);
+    same_max_duck.push(END);
+
+    let (hit, addresses) = assemble(&[&ducked, &set_duck_5, &same_max_duck]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         0x102={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         [Track]\n\
+         10=0,t10,1024,0,0,1,0,0x100,1\n\
+         11=0,t11,1024,0,0,1,0,0x101,1\n\
+         12=0,t12,1024,0,0,1,0,0x102,1\n\
+         [EventMapping]\n\
+         e0=1,10\n\
+         e1=1,11\n\
+         e2=1,12\n",
+        addresses[0], addresses[1], addresses[2]
+    );
+    let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+    let mut player = Player::new(vec![module], long_sample("one.xa"), 1);
+
+    play(&mut player, "e1"); // sets MAIN_DUCKPRI = 5
+    play(&mut player, "e0"); // plays ducked (duckpri=0 < 5) -> half gain
+    let initial = player.render(BLOCK, &NoSources)[0];
+    assert!(initial > 0 && initial < 6_000, "{initial}");
+    // Advance past the 10 ms wait so e0 writes DUCKPRI=10 and Is3d=1.
+    // Neither refreshes the voice, so gain stays latched at `initial`.
+    let after_writes = player.render(BLOCK * 6, &NoSources);
+    assert_eq!(*after_writes.last().unwrap(), initial);
+    // Track 12 writes MAIN_DUCKPRI=5 (maximum unchanged at 5): 0x57d31e
+    // still refreshes all unheld running voices, lifting track 10 to full.
+    play(&mut player, "e2");
+    let refreshed = player.render(BLOCK, &NoSources)[0];
+    assert_eq!(refreshed, 10_000);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+
+    // Part 2: same-block target switch + stopped-target MAIN_DUCKPRI write.
+    let mut zero_11 = loadl(53, 11);
+    zero_11.extend(loadl(19, 0));
+    zero_11.push(END);
+
+    let mut same_block = NOTE_ON_V1.to_vec();
+    same_block.extend(loadl(53, 11)); // target stopped track 11 (EXTVOL=0)
+    same_block.extend(loadl(123, 5)); // routed MAIN_DUCKPRI on stopped 11
+    same_block.extend([SET_LOOP, LOOP]);
+
+    let mut player2 = Player::new(
+        vec![module_with(&[&same_block, &[END], &zero_11], 1, 10, "")],
+        long_sample("one.xa"),
+        1,
+    );
+    play(&mut player2, "e2");
+    player2.render(BLOCK, &NoSources);
+    play(&mut player2, "e0");
+    // Refresh during MAIN_DUCKPRI sees e0's new target=11 (EXTVOL=0) immediately.
+    assert!(player2.render(BLOCK, &NoSources).iter().all(|&s| s == 0));
+    assert!(player2.faults.is_empty(), "{:?}", player2.faults);
+}
+
+#[test]
+fn render_until_idle_ends_on_block_boundary_even_with_nudge_armed() {
+    // `render_until_idle` always finishes on a `BLOCK` (64-frame) boundary
+    // even when the 20 ms nudge timer (`TIMER_FRAMES = 441`) fires mid-block.
+    let mut map = BTreeMap::new();
+    map.insert(
+        "one.xa".to_owned(),
+        Pcm {
+            rate: RATE,
+            channels: 1,
+            samples: vec![1000; 440],
+        },
+    );
+    let generic: &[u8] = &[NOTE_ON_V1[0], NOTE_ON_V1[1], WAIT_SAMP, END];
+    let mut player = Player::new(vec![module(&[generic], 1)], map, 1);
+    player.set_active(true, &NoSources); // arms 20 ms nudge countdown
+    play(&mut player, "e0");
+    let out = player.render_until_idle(RATE as usize, &NoSources);
+    // Note ends at frame 440; `render_until_idle` stops at frame 448 (7 * 64),
+    // NOT at the mid-block timer tick at frame 441.
+    assert_eq!(out.len(), 7 * BLOCK);
+    assert!(player.is_idle());
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn natural_track_end_clears_target_before_ducking_refresh() {
+    // `0x57dd87..0x57dda5` clears `target` and removes an ending track from
+    // the running list BEFORE `0x57ddd8` refreshes surviving voices.
+    // Track 10 plays a note and targets track 11; track 11 has EXTVOL=0 and
+    // targets track 12 (EXTVOL=1024), then ends naturally after 10 ms.
+    // While track 11 runs, track 10's target chain resolves through 11 -> 12
+    // (EXTVOL=1024). When track 11 ends, its `target` clears and it becomes
+    // stopped BEFORE the kill's voice refresh runs, so track 10 resolves to
+    // stopped track 11 (EXTVOL=0) and falls silent immediately.
+    let mut t10 = NOTE_ON_V1.to_vec();
+    t10.extend(loadl(53, 11));
+    t10.extend([SET_LOOP, LOOP]);
+
+    let mut t11 = loadl(19, 0); // local EXTVOL = 0 on track 11
+    t11.extend(loadl(53, 12)); // forward to track 12 (EXTVOL = 1024)
+    t11.extend(loadl(5, 10));
+    t11.extend([WAIT, 5, END]);
+
+    let t12: &[u8] = &[SET_LOOP, LOOP];
+
+    let mut player = Player::new(
+        vec![module_with(&[&t10, &t11, t12], 1, 10, "")],
+        long_sample("one.xa"),
+        1,
+    );
+    play(&mut player, "e2"); // start track 12 (EXTVOL=1024)
+    play(&mut player, "e1"); // start track 11 (local EXTVOL=0, target=12)
+    play(&mut player, "e0"); // start track 10 (target=11)
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    // Advance past track 11's 10 ms wait so track 11 ends naturally.
+    let _ = player.render(BLOCK * 5, &NoSources);
+    assert!(
+        player.render(BLOCK, &NoSources).iter().all(|&s| s == 0),
+        "track 10 should refresh against stopped track 11 (EXTVOL=0) when track 11 ends"
+    );
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn kill_trk_sees_caller_same_block_duckpri_update_during_refresh() {
+    // Caller (track 10) plays ducked under MAIN_DUCKPRI=5, then in one block
+    // raises its own DUCKPRI to 10 (register 25 — latched) and calls
+    // `kill_trk` on stopped track 12. The kill's `0x57d31e` voice refresh
+    // must see track 10's new DUCKPRI=10 and lift its gain to full (10_000).
+    let mut t10 = NOTE_ON_V1.to_vec();
+    t10.extend(loadl(5, 10));
+    t10.extend([WAIT, 5]);
+    t10.extend(loadl(25, 10)); // raise own DUCKPRI above 5
+    t10.extend(loadl(6, 12));
+    t10.extend([KILL_TRK, 6, SET_LOOP, LOOP]);
+
+    let mut ducker = loadl(123, 5);
+    ducker.extend([SET_LOOP, LOOP]);
+
+    let mut player = Player::new(
+        vec![module_with(&[&t10, &ducker, &[END]], 1, 10, "")],
+        long_sample("one.xa"),
+        1,
+    );
+    play(&mut player, "e1"); // MAIN_DUCKPRI = 5
+    play(&mut player, "e0"); // plays ducked
+    let initial = player.render(BLOCK, &NoSources)[0];
+    assert!(initial > 0 && initial < 6_000, "{initial}");
+    // Advance past the 10 ms wait so track 10 writes DUCKPRI=10 and runs kill_trk 12.
+    let after = player.render(BLOCK * 6, &NoSources);
+    assert_eq!(*after.last().unwrap(), 10_000);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+
+    // Killing an unused patch ID (1) or unregistered ID (999) dispatches to
+    // patch vtable +0x38 (0x57bfa6 no-op) or NULL, so it must NOT refresh
+    // unrelated latched voices.
+    let mut kill_patch = NOTE_ON_V1.to_vec();
+    kill_patch.extend(loadl(5, 10));
+    kill_patch.extend([WAIT, 5]);
+    kill_patch.extend(loadl(25, 10)); // raise DUCKPRI above 5 (latched)
+    kill_patch.extend(loadl(6, 1)); // patch ID 1 (not a track!)
+    kill_patch.extend([KILL_TRK, 6]);
+    kill_patch.extend(loadl(6, 999)); // unregistered ID
+    kill_patch.extend([KILL_TRK, 6, SET_LOOP, LOOP]);
+
+    let mut player2 = Player::new(
+        vec![module_with(&[&kill_patch, &ducker], 1, 10, "")],
+        long_sample("one.xa"),
+        1,
+    );
+    play(&mut player2, "e1"); // MAIN_DUCKPRI = 5
+    play(&mut player2, "e0"); // plays ducked
+    let ducked = player2.render(BLOCK, &NoSources)[0];
+    assert!(ducked > 0 && ducked < 6_000, "{ducked}");
+    let after_patch_kill = player2.render(BLOCK * 6, &NoSources);
+    assert_eq!(
+        *after_patch_kill.last().unwrap(),
+        ducked,
+        "killing a patch or unregistered ID must not refresh latched voices"
+    );
+    assert!(player2.faults.is_empty(), "{:?}", player2.faults);
+}
+
+#[test]
+fn non_streamed_note_on_keeps_latched_gain_across_target_while_streamed_refreshes() {
+    // `0x57f601..0x57f618`: `note_on` refreshes gains/pitch through `target`
+    // only when the patch's `IsStreamed` flag (register 38) is set; a
+    // non-streamed patch keeps the voice's latched gains from fresh start.
+    let mut zero_11 = loadl(53, 11);
+    zero_11.extend(loadl(19, 0));
+    zero_11.push(END);
+
+    let mut target_then_note = loadl(53, 11); // target stopped 11 (EXTVOL=0)
+    target_then_note.extend(NOTE_ON_V1);
+    target_then_note.extend([SET_LOOP, LOOP]);
+
+    let (hit, addresses) = assemble(&[&target_then_note, &[END], &zero_11]);
+    // Patch 1: IsStreamed = 0; Patch 2: IsStreamed = 1 (second flag after path);
+    // Patch 3: IsStreamed = 1 in HOT, but path contains "sounddata\\" so 0x57b5d1 clears it.
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         0x102={:#x}\n\
+         [Patch]\n\
+         1=0,mem,\"one.xa\",0,0,0,0,0\n\
+         2=0,stream,\"stream.xa\",0,1,0,0,0\n\
+         3=0,sd,\"SoundData\\sd.xa\",0,1,0,0,0\n\
+         [Track]\n\
+         10=0,mem_trk,1024,0,0,1,0,0x100,1\n\
+         11=0,stopped,1024,0,0,1,0,0x101,1\n\
+         12=0,zero,1024,0,0,0,0,0x102,1\n\
+         13=0,stream_trk,1024,0,0,1,0,0x100,2\n\
+         14=0,sd_trk,1024,0,0,1,0,0x100,3\n\
+         [EventMapping]\n\
+         mem=1,10\n\
+         zero=1,12\n\
+         stream=1,13\n\
+         sd=1,14\n",
+        addresses[0], addresses[1], addresses[2]
+    );
+    let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+    let mut map = long_sample("one.xa");
+    map.insert(
+        "stream.xa".to_owned(),
+        Pcm {
+            rate: RATE,
+            channels: 1,
+            samples: vec![10_000; 20 * BLOCK],
+        },
+    );
+    map.insert(
+        "SoundData\\sd.xa".to_owned(),
+        Pcm {
+            rate: RATE,
+            channels: 1,
+            samples: vec![10_000; 20 * BLOCK],
+        },
+    );
+    let mut player = Player::new(vec![module], map, 1);
+
+    play(&mut player, "zero");
+    player.render(BLOCK, &NoSources);
+
+    // Non-streamed patch 1 keeps its fresh-start latched gain (10_000).
+    play(&mut player, "mem");
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    player.handle(&SoundEvent::StopAll, &NoSources);
+
+    // Streamed patch 2 refreshes through target 11 (EXTVOL=0) -> silent.
+    play(&mut player, "zero");
+    player.render(BLOCK, &NoSources);
+    play(&mut player, "stream");
+    assert!(player.render(BLOCK, &NoSources).iter().all(|&s| s == 0));
+    player.handle(&SoundEvent::StopAll, &NoSources);
+
+    // Patch 3 has "SoundData\\" in its path, so 0x57b5d1 clears IsStreamed -> 10_000.
+    play(&mut player, "zero");
+    player.render(BLOCK, &NoSources);
+    play(&mut player, "sd");
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn same_block_ducking_write_and_kill_refresh_latched_gain_before_non_streamed_note_on() {
+    // `0x57e011 -> 0x57d31e -> 0x57cc74 -> 0x57f759` and `0x57ddd8 -> 0x57f759`
+    // synchronously refresh the running track's latched voice gains before a
+    // same-block non-streamed `note_on` (`0x57f601..0x57f61d`).
+    //
+    // Track 10: sets own MAIN_DUCKPRI = 5, then immediately runs non-streamed
+    // `note_on`. With default DUCKPRI = 0 < 5, gain ducks to 10% (999 PCM).
+    let mut duck_then_note = loadl(123, 5);
+    duck_then_note.extend(NOTE_ON_V1);
+    duck_then_note.extend([SET_LOOP, LOOP]);
+
+    // Track 11: routes MAIN_DUCKPRI = 5 onto stopped track 12 (stays ducked).
+    let mut set_stopped_duck = loadl(53, 12);
+    set_stopped_duck.extend(loadl(123, 5));
+    set_stopped_duck.push(END);
+
+    // Track 13: clears stopped track 12's MAIN_DUCKPRI = 0 via target, then
+    // immediately runs non-streamed `note_on` -> refreshed to unducked 10_000.
+    let mut clear_stopped_then_note = loadl(53, 12);
+    clear_stopped_then_note.extend(loadl(123, 0));
+    clear_stopped_then_note.extend(NOTE_ON_V1);
+    clear_stopped_then_note.extend([SET_LOOP, LOOP]);
+
+    // Track 14: running ducker (MAIN_DUCKPRI = 5, loops forever).
+    let mut running_ducker = loadl(123, 5);
+    running_ducker.extend([SET_LOOP, LOOP]);
+
+    // Track 15: kills running ducker 14 via `kill_trk`, then immediately runs
+    // non-streamed `note_on` -> refreshed to unducked 10_000.
+    let mut kill_running_then_note = loadl(5, 14);
+    kill_running_then_note.extend([KILL_TRK, 5]);
+    kill_running_then_note.extend(NOTE_ON_V1);
+    kill_running_then_note.extend([SET_LOOP, LOOP]);
+
+    // Track 16: kills stopped ducker 12 via `kill_trk`, then immediately runs
+    // non-streamed `note_on` -> refreshed to unducked 10_000.
+    let mut kill_stopped_then_note = loadl(5, 12);
+    kill_stopped_then_note.extend([KILL_TRK, 5]);
+    kill_stopped_then_note.extend(NOTE_ON_V1);
+    kill_stopped_then_note.extend([SET_LOOP, LOOP]);
+
+    let (hit, addresses) = assemble(&[
+        &duck_then_note,
+        &set_stopped_duck,
+        &[END],
+        &clear_stopped_then_note,
+        &running_ducker,
+        &kill_running_then_note,
+        &kill_stopped_then_note,
+    ]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         0x102={:#x}\n\
+         0x103={:#x}\n\
+         0x104={:#x}\n\
+         0x105={:#x}\n\
+         0x106={:#x}\n\
+         [Patch]\n\
+         1=0,mem,\"one.xa\",0,0,0,0,0\n\
+         [Track]\n\
+         10=0,duck_note,1024,0,0,1,0,0x100,1\n\
+         11=0,set_stopped,1024,0,0,1,0,0x101,1\n\
+         12=0,stopped_ducker,1024,0,0,1,0,0x102,1\n\
+         13=0,clear_stopped,1024,0,0,1,0,0x103,1\n\
+         14=0,running_ducker,1024,0,0,1,0,0x104,1\n\
+         15=0,kill_running,1024,0,0,1,0,0x105,1\n\
+         16=0,kill_stopped,1024,0,0,1,0,0x106,1\n\
+         [EventMapping]\n\
+         duck_note=1,10\n\
+         set_stopped=1,11\n\
+         clear_stopped=1,13\n\
+         running_ducker=1,14\n\
+         kill_running=1,15\n\
+         kill_stopped=1,16\n",
+        addresses[0],
+        addresses[1],
+        addresses[2],
+        addresses[3],
+        addresses[4],
+        addresses[5],
+        addresses[6],
+    );
+    let make = || {
+        let m = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+        Player::new(vec![m], long_sample("one.xa"), 1)
+    };
+
+    // Case 1: own MAIN_DUCKPRI = 5 immediately before non-streamed note_on.
+    let mut player = make();
+    play(&mut player, "duck_note");
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 999);
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 999);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+
+    // Case 2: routed MAIN_DUCKPRI = 0 on stopped track immediately before note_on.
+    let mut player = make();
+    play(&mut player, "set_stopped");
+    player.render(BLOCK, &NoSources);
+    play(&mut player, "clear_stopped");
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+
+    // Case 3: kill_trk on running ducker immediately before non-streamed note_on.
+    let mut player = make();
+    play(&mut player, "running_ducker");
+    player.render(BLOCK, &NoSources);
+    play(&mut player, "kill_running");
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+
+    // Case 4: kill_trk on stopped ducker immediately before non-streamed note_on.
+    let mut player = make();
+    play(&mut player, "set_stopped");
+    player.render(BLOCK, &NoSources);
+    play(&mut player, "kill_stopped");
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn patch_write_copies_is3d_and_flags_before_refreshing_gains() {
+    // `0x57f6e3..0x57f6fb` copies the replacement patch's `Is3d` flag into
+    // track register `THREE_D` (26) via `vtable +0x84` (setting comparison
+    // flags from `is_3d` at `0x57de98..0x57dec5`) before `0x57e04b` refreshes
+    // gains.
+    //
+    // Track 10 starts with 3D patch 1 (Is3d=1), sets PAN=0 (hard left), then
+    // replaces PATCH=2 (2D patch, Is3d=0) and runs non-streamed `note_on`.
+    // Because Is3d became 0 before the gain refresh, the note plays hard-left
+    // ([10_000, 0]) instead of 3D-centered ([10_000, 10_000]).
+    let mut replace_3d_with_2d = loadl(20, 0); // PAN = 0 (hard left)
+    replace_3d_with_2d.extend(loadl(50, 2)); // PATCH = 2 (Is3d = 0)
+    replace_3d_with_2d.extend(NOTE_ON_V1);
+    replace_3d_with_2d.extend([SET_LOOP, LOOP]);
+
+    // Track 11 writes PATCH=2 (Is3d=0, so comparison flags become zero) and
+    // checks `ifeq` -> jumps to 0x102 which plays `note_on`.
+    const IFEQ: u8 = 62;
+    let mut patch_then_ifeq = loadl(50, 2);
+    patch_then_ifeq.push(IFEQ);
+    patch_then_ifeq.extend(long(0x102));
+    patch_then_ifeq.push(END);
+
+    let mut branch_taken = Vec::from(NOTE_ON_V1);
+    branch_taken.extend([SET_LOOP, LOOP]);
+
+    let (hit, addresses) = assemble(&[&replace_3d_with_2d, &patch_then_ifeq, &branch_taken]);
+    // Patch 1: 4th flag after path = 1 (`Is3d = 1`).
+    // Patch 2: 4th flag after path = 0 (`Is3d = 0`).
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         0x102={:#x}\n\
+         [Patch]\n\
+         1=0,p3d,\"one.xa\",0,0,0,1,0\n\
+         2=0,p2d,\"two.xa\",0,0,0,0,0\n\
+         [Track]\n\
+         10=0,pan_test,1024,0,0,1,0,0x100,1\n\
+         11=0,flag_test,1024,0,0,1,0,0x101,1\n\
+         [EventMapping]\n\
+         pan=1,10\n\
+         flag=1,11\n",
+        addresses[0], addresses[1], addresses[2],
+    );
+    let mut map = long_sample("one.xa");
+    map.insert(
+        "two.xa".to_owned(),
+        Pcm {
+            rate: RATE,
+            channels: 1,
+            samples: vec![10_000; 20 * BLOCK],
+        },
+    );
+    let make = || {
+        let m = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+        Player::new(vec![m], map.clone(), 1)
+    };
+
+    let mut player = make();
+    play(&mut player, "pan");
+    let out = player.render_stereo(BLOCK, &NoSources);
+    assert_eq!((out[0], out[1]), (10_000, 0));
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+
+    let mut player = make();
+    play(&mut player, "flag");
+    let out = player.render_stereo(BLOCK, &NoSources);
+    assert_eq!((out[0], out[1]), (10_000, 10_000));
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }

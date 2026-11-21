@@ -93,6 +93,15 @@ pub struct Patch {
     pub name: String,
     /// The sample's path relative to the install.
     pub path: String,
+    /// *(code)* Whether the patch's `IsStreamed` flag (register 38, `0x26`)
+    /// is set: the second flag field after the quoted path is `1`, cleared
+    /// when the path contains `"sounddata\\"` (`0x57b4a2`..`0x57b4bc`,
+    /// `0x57b5b4`..`0x57b5d1`).
+    pub is_streamed: bool,
+    /// *(code)* Whether the patch's `Is3d` flag (register 26, `0x1a`) is set:
+    /// the fourth flag field after the quoted path is `1`
+    /// (`0x57b4fe`..`0x57b539`, `0x57fa2b`..`0x57fa34`).
+    pub is_3d: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,9 +203,23 @@ impl Hot {
                 }
                 "Patch" => {
                     let fields: Vec<&str> = value.split(',').collect();
-                    let Some(path) = fields.iter().find(|f| f.starts_with('"')) else {
+                    let Some(path_index) = fields.iter().position(|f| f.starts_with('"')) else {
                         return fail(number_of, "patch without a quoted path");
                     };
+                    let path = fields[path_index].trim_matches('"').to_owned();
+                    // *(code)* 0x57b4a2..0x57b539, 0x57b5b4..0x57b5d1: the
+                    // second flag after the path sets `IsStreamed` (cleared
+                    // when the path contains `"sounddata\\"`), and the fourth
+                    // sets `Is3d` (register 26, `0x1a`).
+                    let is_streamed = fields
+                        .get(path_index + 2)
+                        .and_then(|f| number(f))
+                        .is_some_and(|n| n == 1)
+                        && !path.to_ascii_lowercase().contains("sounddata\\");
+                    let is_3d = fields
+                        .get(path_index + 4)
+                        .and_then(|f| number(f))
+                        .is_some_and(|n| n == 1);
                     let id = id()?;
                     if id != 0 {
                         hot.registered.push((id, Object::Patch));
@@ -205,7 +228,9 @@ impl Hot {
                         id,
                         Patch {
                             name: fields.get(1).unwrap_or(&"").to_string(),
-                            path: path.trim_matches('"').to_owned(),
+                            path,
+                            is_streamed,
+                            is_3d,
                         },
                     );
                 }

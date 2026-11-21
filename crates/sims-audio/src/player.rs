@@ -133,6 +133,12 @@
 //!   [`Player::add_scores`]); a mode with no score stops the current one.
 //! - 36, `kSetMusicMode`: changes the music for the game's mode, then
 //!   the ambience and the day and night loop (see `Player::set_music_mode`).
+//! - 37, 38, 39: effects, music and voice volume sliders
+//!   ([`Player::set_fx_volume_step`], [`Player::set_music_volume_step`],
+//!   [`Player::set_vox_volume_step`], 0x57408f..0x574136): map slider
+//!   steps `0..=10` through [`VOLUME_STEPS`] (0x67156c) to groups 1, 2
+//!   and 3; kind 37 also sets every ambience score's volume and runs the
+//!   day and night loop update (0x5741b7 → 0x574978).
 //! - 43, `kPlayPiano`: starts the piano (track [`PIANO`]) where its
 //!   object is, and the skill track [`PIANO_SKILL`] (see
 //!   `Player::play_piano`).
@@ -212,6 +218,9 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const RATE: u32 = 22_050;
 /// Frames mixed between two runs of the threads (about 2.9 ms).
 pub const BLOCK: usize = 64;
+/// *(code)* Frames per 20 ms (50 Hz) periodic sound-manager timer tick
+/// (`0x572fc3`: `push 0x14` → `0x572fd6` → `0x573019`), exact at [`RATE`].
+pub const TIMER_FRAMES: usize = (RATE as usize * 20) / 1000;
 /// Instructions one thread may run in one block before the player calls
 /// it stuck and ends it.
 pub const STEPS: usize = 10_000;
@@ -257,6 +266,12 @@ const NUDGE_UPDATES: u32 = 100;
 /// *(code)* `fade_speed` written when starting a day and night loop
 /// (`0x574a46`: 0x1388 = 5000).
 const DAY_NIGHT_FADE_SPEED: i32 = 5000;
+/// *(code)* The 11-step volume slider table (`0x67156c`) used by kinds
+/// 37, 38 and 39 (`0x57408f`, `0x5740f9`, `0x57410d`) and the day and
+/// night loop (`0x574a10`). Steps `0..=10` map to HIT group volumes
+/// `0..=1024`; the sound manager initializes all three sliders to step
+/// `10` (`0x5713ee`..`0x571409`).
+pub const VOLUME_STEPS: [i32; 11] = [0, 300, 390, 490, 590, 690, 790, 840, 895, 960, 1024];
 /// The `extvol` register, which `seqgroup_kill` fades out.
 pub const EXTVOL: u8 = 19;
 /// The fade registers: the value to reach, the register that moves, how
@@ -393,6 +408,9 @@ pub mod kind {
     pub const SET_ACTIVE: i64 = 25;
     pub const TURN_ON_TV: i64 = 30;
     pub const SET_MUSIC_MODE: i64 = 36;
+    pub const SET_FX_VOLUME: i64 = 37;
+    pub const SET_MUSIC_VOLUME: i64 = 38;
+    pub const SET_VOX_VOLUME: i64 = 39;
     pub const PLAY_PIANO: i64 = 43;
     pub const SET_AMBIENCE_MODE: i64 = 52;
     pub const SEQUENCE_TRACK_HIT_LIST: i64 = 53;
@@ -407,9 +425,9 @@ pub mod kind {
     /// reported when an event has one. (Kind 33 is ported for the game's
     /// own calls, [`super::Player::camera_moved`], which carry the
     /// camera; no event in the install has it.)
-    pub const NOT_PORTED: [i64; 30] = [
-        2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 24, 26, 32, 33, 34, 35, 37, 38, 39,
-        40, 41, 42, 103, 104,
+    pub const NOT_PORTED: [i64; 27] = [
+        2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 24, 26, 32, 33, 34, 35, 40, 41, 42,
+        103, 104,
     ];
 }
 
@@ -540,6 +558,12 @@ struct Thread {
     /// threads run in this order, from the next block. A fresh start and
     /// a let-go put it last (0x57dc9a, 0x57d017).
     order: i64,
+    /// *(code)* The voice's latched stereo gains (`0x57f759`) and pitch step
+    /// (`0x57f71d`), initialized on fresh start / `PATCH` write and updated
+    /// on level/pan/pitch/group/ducking refreshes. Non-streamed `note_on`
+    /// (`0x57f601..0x57f60d`) reuses these without re-reading through `target`.
+    latched_gains: [i32; 2],
+    latched_step: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -696,18 +720,36 @@ fn registration_order(modules: &[Module]) -> Vec<usize> {
 /// expansions', with numbers their allocator hands out without looking
 /// at the registry (0x57d386): one replaces a base game object of its
 /// number, and an expansion's or a download's replaces it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PatchMeta {
+    registrant: Registrant,
+    path: String,
+    is_streamed: bool,
+    is_3d: bool,
+}
+
 fn owners(
     modules: &[Module],
     station_patches: &[(u32, String)],
-) -> (BTreeMap<u32, usize>, BTreeMap<u32, (Registrant, String)>) {
+) -> (BTreeMap<u32, usize>, BTreeMap<u32, PatchMeta>) {
     let mut tracks = BTreeMap::new();
     let mut patches = BTreeMap::new();
     let mut stations = Some(station_patches);
     let add_stations = |tracks: &mut BTreeMap<u32, usize>,
-                        patches: &mut BTreeMap<u32, (Registrant, String)>,
+                        patches: &mut BTreeMap<u32, PatchMeta>,
                         stations: &mut Option<&[(u32, String)]>| {
         for (at, (id, path)) in stations.take().into_iter().flatten().enumerate() {
-            patches.insert(*id, (Registrant::Station(at), path.clone()));
+            // *(code)* 0x5750b8..0x5750c5: station patches pass 0 for all
+            // five flags (including IsStreamed and Is3d).
+            patches.insert(
+                *id,
+                PatchMeta {
+                    registrant: Registrant::Station(at),
+                    path: path.clone(),
+                    is_streamed: false,
+                    is_3d: false,
+                },
+            );
             tracks.remove(id);
         }
     };
@@ -723,7 +765,16 @@ fn owners(
                     patches.remove(&id);
                 }
                 Object::Patch => {
-                    patches.insert(id, (Registrant::Module(m), hot.patches[&id].path.clone()));
+                    let patch = &hot.patches[&id];
+                    patches.insert(
+                        id,
+                        PatchMeta {
+                            registrant: Registrant::Module(m),
+                            path: patch.path.clone(),
+                            is_streamed: patch.is_streamed,
+                            is_3d: patch.is_3d,
+                        },
+                    );
                     tracks.remove(&id);
                 }
             }
@@ -822,10 +873,10 @@ enum Flow {
 pub struct Player<S> {
     modules: Vec<Module>,
     samples: S,
-    /// Patch ID to (registrant, path): whose line registered it last
-    /// ([`owners`]). An ID whose last line is
-    /// a track's is not here.
-    patches: BTreeMap<u32, (Registrant, String)>,
+    /// Patch ID to metadata: whose line registered it last ([`owners`]), its
+    /// sample path, and its `IsStreamed` flag. An ID whose last line is a
+    /// track's is not here.
+    patches: BTreeMap<u32, PatchMeta>,
     /// Track ID to the module whose line registered it last
     /// ([`owners`]): the module every start of the track runs from. An ID
     /// whose last line is a patch's is not here.
@@ -856,6 +907,10 @@ pub struct Player<S> {
     /// Group volumes set by the host (the options' sliders), 1024 when
     /// not set.
     group_volumes: BTreeMap<i64, i32>,
+    /// *(code)* The effects, music and voice slider steps (`+0xf0`,
+    /// `+0xf4`, `+0xf8`, all initialized to `10` at `0x5713ee`..`0x571409`,
+    /// updated by kinds 37, 38 and 39).
+    volume_steps: [u8; 3],
     /// The master volume, 0 to 1024.
     master: i32,
     notes: Vec<Note>,
@@ -921,6 +976,8 @@ pub struct Player<S> {
     frame: u64,
     /// The frame at which the threads last ran.
     ran_at: Option<u64>,
+    /// The frame at which the 20 ms volume-nudge timer last stepped (`0x573019`).
+    nudged_at: Option<u64>,
     next_id: u32,
     /// The next [`Thread::order`].
     next_order: i64,
@@ -956,6 +1013,7 @@ impl<S: Samples> Player<S> {
             seqgroups: BTreeMap::new(),
             duck: BTreeMap::new(),
             group_volumes: BTreeMap::new(),
+            volume_steps: [10, 10, 10],
             master: 1024,
             notes: Vec::new(),
             idle: BTreeMap::new(),
@@ -977,6 +1035,7 @@ impl<S: Samples> Player<S> {
             ambient_cache: BTreeMap::new(),
             frame: 0,
             ran_at: None,
+            nudged_at: None,
             next_id: 1,
             next_order: 0,
             random: splitmix(seed),
@@ -987,15 +1046,22 @@ impl<S: Samples> Player<S> {
     /// Sets a global register (100 to 255), such as `SimSpeed`.
     pub fn set_global(&mut self, register: u8, value: i32) {
         assert!(register >= GLOBALS, "register {register} is not global");
-        self.globals[usize::from(register - GLOBALS)] = value;
+        let slot = &mut self.globals[usize::from(register - GLOBALS)];
+        *slot = value;
+        if register == MAIN_DUCKPRI {
+            self.apply_running_gains(None);
+        }
     }
 
     /// Sets a track group's volume, 0 to 1024 (the options' sliders):
     /// `kGroupSfx` 1, `kGroupMusic` 2, `kGroupVox` 3.
     ///
-    /// *(code)* The effects group's volume is also every ambience
-    /// player's volume, as kind 37 sets both (to its slider's step,
-    /// table 0x67156c).
+    /// *(code)* Refreshes gains only on running tracks in `group` through
+    /// `0x57c0ea` → `0x57f759` (reading `vol`, `extvol`, `3D` and
+    /// `duckpri` through `target` via `0x57de16`, leaving idle kind-53
+    /// voices and other groups untouched). The effects group's volume is
+    /// also every ambience player's volume, as kind 37 sets both (to its
+    /// slider's step, table 0x67156c).
     pub fn set_group_volume(&mut self, group: i64, volume: i32) {
         let volume = volume.clamp(0, 1024);
         self.group_volumes.insert(group, volume);
@@ -1005,7 +1071,54 @@ impl<S: Samples> Player<S> {
                 self.with_score(mode, |score, host| score.set_volume(volume, host));
             }
         }
-        self.apply_levels();
+        self.apply_running_gains(Some(group));
+    }
+
+    /// *(code)* Kind 37 (`0x57408f`): sets the effects volume slider step
+    /// (`0..=10`, clamped; table [`VOLUME_STEPS`] at `0x67156c`), updates
+    /// group 1 (`kGroupSfx`) and every ambience score to that volume, and
+    /// runs the day and night loop update (`0x5741b7` → `0x574978`).
+    pub fn set_fx_volume_step(&mut self, step: usize, sources: &dyn Sources) {
+        let step = step.min(VOLUME_STEPS.len() - 1);
+        self.volume_steps[0] = step as u8;
+        self.set_group_volume(1, VOLUME_STEPS[step]);
+        self.update_day_night(sources);
+    }
+
+    /// *(code)* Kind 38 (`0x5740f9`): sets the music volume slider step
+    /// (`0..=10`, clamped; table [`VOLUME_STEPS`] at `0x67156c`) and
+    /// updates group 2 (`kGroupMusic`) to that volume.
+    pub fn set_music_volume_step(&mut self, step: usize) {
+        let step = step.min(VOLUME_STEPS.len() - 1);
+        self.volume_steps[1] = step as u8;
+        self.set_group_volume(2, VOLUME_STEPS[step]);
+    }
+
+    /// *(code)* Kind 39 (`0x57410d`): sets the voice volume slider step
+    /// (`0..=10`, clamped; table [`VOLUME_STEPS`] at `0x67156c`) and
+    /// updates group 3 (`kGroupVox`) to that volume.
+    pub fn set_vox_volume_step(&mut self, step: usize) {
+        let step = step.min(VOLUME_STEPS.len() - 1);
+        self.volume_steps[2] = step as u8;
+        self.set_group_volume(3, VOLUME_STEPS[step]);
+    }
+
+    /// *(code)* Current effects volume slider step (`+0xf0`, read by kind
+    /// 40 at `0x574137`; initialized to `10`).
+    pub fn fx_volume_step(&self) -> u8 {
+        self.volume_steps[0]
+    }
+
+    /// *(code)* Current music volume slider step (`+0xf4`, read by kind
+    /// 41 at `0x57413f`; initialized to `10`).
+    pub fn music_volume_step(&self) -> u8 {
+        self.volume_steps[1]
+    }
+
+    /// *(code)* Current voice volume slider step (`+0xf8`, read by kind
+    /// 42 at `0x574147`; initialized to `10`).
+    pub fn vox_volume_step(&self) -> u8 {
+        self.volume_steps[2]
     }
 
     /// Sets the master volume, 0 to 1024.
@@ -1014,7 +1127,21 @@ impl<S: Samples> Player<S> {
         for voice in &mut self.voices {
             voice.note.gains = ambient_gains(voice.volume, voice.pan, self.master);
         }
-        self.apply_levels();
+        let gains: BTreeMap<u32, [i32; 2]> = self
+            .threads
+            .iter()
+            .map(|t| (t.id, self.levels(t).gains))
+            .collect();
+        for thread in &mut self.threads {
+            if let Some(&gains) = gains.get(&thread.id) {
+                thread.latched_gains = gains;
+            }
+        }
+        for note in &mut self.notes {
+            if let Some(&gains) = gains.get(&note.thread) {
+                note.gains = gains;
+            }
+        }
     }
 
     /// Adds an ambience score for a mode (see [`ambience::SCORES`]), its
@@ -1177,9 +1304,12 @@ impl<S: Samples> Player<S> {
             place_itself(&mut self.threads[at], vol, pan);
             let thread = self.threads[at].clone();
             let levels = self.levels(&thread);
+            let rate_step = step(levels.rate);
+            self.threads[at].latched_gains = levels.gains;
+            self.threads[at].latched_step = rate_step;
             for note in self.notes.iter_mut().filter(|n| n.thread == thread.id) {
                 note.gains = levels.gains;
-                note.step = step(levels.rate);
+                note.step = rate_step;
             }
         } else {
             self.write_stopped(track, EXTVOL, vol);
@@ -1413,17 +1543,24 @@ impl<S: Samples> Player<S> {
             .filter(|t| t.track == track && !spared(t.id))
             .cloned()
             .collect();
-        for thread in &ended {
-            self.save_stopped(thread);
-        }
         let ended_ids: Vec<u32> = ended.iter().map(|t| t.id).collect();
+        // *(code)* 0x57dd87..0x57dda5 removes the track from the running list
+        // before 0x57ddd8 refreshes voices, so surviving voices never follow
+        // the ending thread's stale `target`.
         self.threads.retain(|t| !ended_ids.contains(&t.id));
         self.notes
             .retain(|n| !(n.track == track && !spared(n.thread)));
-        if !self.threads.iter().any(|t| t.track == track) {
-            // *(code)* 0x57dd3e runs unconditionally on the track object
-            // even when it was already stopped (clearing PATCH, idle voice,
-            // hold, and main_duckpri).
+        for thread in &ended {
+            self.save_stopped(thread);
+        }
+        if ended.is_empty()
+            && !self.threads.iter().any(|t| t.track == track)
+            && self.owner(track).is_some()
+        {
+            // *(code)* 0x57dd3e runs unconditionally on registered track
+            // objects even when already stopped (clearing PATCH, idle voice,
+            // hold, and main_duckpri); unregistered IDs return NULL and
+            // patch objects' vtable +0x38 (0x57bfa6) is a no-op.
             self.kill_stopped_track(track);
         }
         self.forget_ended();
@@ -1553,8 +1690,8 @@ impl<S: Samples> Player<S> {
         // The original's fields are 32 bits; a number that fits neither
         // signed nor unsigned 32 bits is a fault, not a wrapped value.
         let fits = |v: i64| (i64::from(i32::MIN)..=i64::from(u32::MAX)).contains(&v);
-        let track = track.unwrap_or(0);
-        if !fits(track) || numbers.iter().any(|&v| !fits(v)) {
+        let track_raw = track.unwrap_or(0);
+        if !fits(track_raw) || numbers.iter().any(|&v| !fits(v)) {
             self.report(format!("event {name}: a number does not fit 32 bits"));
             return;
         }
@@ -1563,7 +1700,7 @@ impl<S: Samples> Player<S> {
             v => v as u32,
         };
         let args = [given(0, object), given(1, 0), given(2, 0)];
-        let track = track as u32;
+        let track = track_raw as u32;
         match kind {
             kind::PLAY => self.play_track(track, args, sources),
             kind::FADE => self.fade_track(track, args),
@@ -1575,6 +1712,22 @@ impl<S: Samples> Player<S> {
             kind::SET_ACTIVE => self.set_active(track != 0, sources),
             kind::SET_AMBIENCE_MODE => self.set_ambience_mode(track),
             kind::SET_MUSIC_MODE => self.set_music_mode(i64::from(track as i32), sources),
+            kind::SET_FX_VOLUME | kind::SET_MUSIC_VOLUME | kind::SET_VOX_VOLUME => {
+                if let Ok(step) = usize::try_from(track_raw)
+                    && step < VOLUME_STEPS.len()
+                {
+                    match kind {
+                        kind::SET_FX_VOLUME => self.set_fx_volume_step(step, sources),
+                        kind::SET_MUSIC_VOLUME => self.set_music_volume_step(step),
+                        kind::SET_VOX_VOLUME => self.set_vox_volume_step(step),
+                        _ => unreachable!(),
+                    }
+                } else {
+                    self.report(format!(
+                        "event {name}: volume step {track_raw} out of range"
+                    ));
+                }
+            }
             kind::TURN_ON_TV => self.turn_on_tv(track, args, sources),
             kind::PLAY_PIANO => self.play_piano(args, sources),
             kind::SEQUENCE_TRACK_HIT_LIST => self.sequence(track, args[1]),
@@ -1797,7 +1950,7 @@ impl<S: Samples> Player<S> {
         self.idle.remove(&id);
         self.stopped.remove(&id);
         self.duck.remove(&id);
-        self.update_main_duckpri();
+        self.update_main_duckpri(true);
         self.track_objects.remove(&id);
         self.last_start.remove(&id);
         self.notes.retain(|n| n.patch != id);
@@ -1845,11 +1998,16 @@ impl<S: Samples> Player<S> {
         };
         if let Some(thread) = self.threads.iter_mut().find(|t| t.id == target_id) {
             place_itself(thread, vol, pan);
-            let thread = thread.clone();
-            let levels = self.levels(&thread);
+            let snapshot = thread.clone();
+            let levels = self.levels(&snapshot);
+            let rate_step = step(levels.rate);
+            if let Some(slot) = self.threads.iter_mut().find(|t| t.id == target_id) {
+                slot.latched_gains = levels.gains;
+                slot.latched_step = rate_step;
+            }
             for note in self.notes.iter_mut().filter(|n| n.thread == target_id) {
                 note.gains = levels.gains;
-                note.step = step(levels.rate);
+                note.step = rate_step;
             }
         }
     }
@@ -1923,7 +2081,7 @@ impl<S: Samples> Player<S> {
     pub fn pause(&mut self) {
         self.paused = true;
         self.duck.clear();
-        self.update_main_duckpri();
+        self.update_main_duckpri(true);
         self.stop_day_night();
         let tracks: BTreeSet<u32> = self
             .threads
@@ -2136,7 +2294,9 @@ impl<S: Samples> Player<S> {
         if self.owner(track).is_none() || self.day_night_playing(track) {
             return;
         }
-        let target_vol = self.group_volumes.get(&1).copied().unwrap_or(1024);
+        // *(code)* 0x574a07..0x574a10: reads manager `+0xf0` (`fx_volume_step`)
+        // through `0x67156c` (`VOLUME_STEPS`), independent of raw group 1 volume.
+        let target_vol = VOLUME_STEPS[usize::from(self.volume_steps[0])];
         let started = self.start([0; 3], track);
         if let Some(&id) = started.threads.last()
             && let Some(at) = self.threads.iter().position(|t| t.id == id)
@@ -2146,6 +2306,15 @@ impl<S: Samples> Player<S> {
             self.write_at(at, FADE_VAR, i32::from(EXTVOL));
             self.write_at(at, FADE_SPEED, DAY_NIGHT_FADE_SPEED);
             self.write_at(at, FADE_ON, 1);
+        } else {
+            // *(code)* 0x574a1e..0x574a5e still writes the fade setup to
+            // the track object when `start` returned early on group volume
+            // 0 (`0x57e059` forces `FADE_ON` back to 0 on a stopped track).
+            self.write_stopped(track, EXTVOL, 0);
+            self.write_stopped(track, FADE_DEST, target_vol);
+            self.write_stopped(track, FADE_VAR, i32::from(EXTVOL));
+            self.write_stopped(track, FADE_SPEED, DAY_NIGHT_FADE_SPEED);
+            self.write_stopped(track, FADE_ON, 1);
         }
         self.let_go_track(track, &started.threads);
     }
@@ -2203,7 +2372,7 @@ impl<S: Samples> Player<S> {
         for mode in modes {
             self.with_score(mode, |score, host| score.stop(host));
         }
-        self.update_main_duckpri();
+        self.update_main_duckpri(false);
     }
 
     /// Kind 23: *(code)* forgets every instance of an object (0: none)
@@ -2394,9 +2563,12 @@ impl<S: Samples> Player<S> {
                     self.chain(note, track, patch);
                 } else {
                     self.write_at(at, PATCH, patch as i32);
-                    let thread = self.threads[at].clone();
-                    let id = self.note_on(&thread);
-                    self.threads[at].last_note = id;
+                    let mut thread = self.threads[at].clone();
+                    let id = self.note_on(&mut thread);
+                    thread.last_note = id;
+                    if let Some(slot) = self.threads.iter_mut().find(|t| t.id == thread.id) {
+                        *slot = thread;
+                    }
                 }
             }
             None => {
@@ -2414,7 +2586,7 @@ impl<S: Samples> Player<S> {
                     // keeps `patch` even after the sample finishes.
                     self.write_stopped(track, PATCH, patch as i32);
                     let registers = self.stopped.get(&track).copied().unwrap_or(fresh);
-                    let thread = Thread {
+                    let mut thread = Thread {
                         id: 0,
                         module: place.0,
                         track,
@@ -2430,8 +2602,10 @@ impl<S: Samples> Player<S> {
                         target: Target::Own,
                         kill_after_fade: false,
                         order: 0,
+                        latched_gains: [0; 2],
+                        latched_step: step(RATE),
                     };
-                    self.note_on(&thread);
+                    self.note_on(&mut thread);
                     self.idle.insert(track, thread);
                 }
             }
@@ -2587,7 +2761,8 @@ impl<S: Samples> Player<S> {
         true
     }
 
-    /// The levels a fresh start sets on thread `id` (see below).
+    /// The levels a fresh start sets on thread `id` (see below), plus the
+    /// initial voice gain/pitch latch (`0x57db6e`..`0x57db75`).
     fn set_levels(&mut self, id: u32, args: [u32; 3], track: u32) {
         // *(code)* A fresh start sets the levels from the arguments as the
         // track's `args` field says (0x57db01): `kArgsVolPan` has `extvol`
@@ -2604,12 +2779,18 @@ impl<S: Samples> Player<S> {
             }
             _ => None,
         };
-        let Some((vol, pan)) = levels else {
-            return;
-        };
-        if let Some(thread) = self.threads.iter_mut().find(|t| t.id == id) {
+        if let Some((vol, pan)) = levels
+            && let Some(thread) = self.threads.iter_mut().find(|t| t.id == id)
+        {
             thread.registers[usize::from(EXTVOL)] = vol as i32;
             thread.registers[usize::from(PAN)] = pan as i32;
+        }
+        if let Some(snapshot) = self.threads.iter().find(|t| t.id == id).cloned() {
+            let latched = self.levels(&snapshot);
+            if let Some(thread) = self.threads.iter_mut().find(|t| t.id == id) {
+                thread.latched_gains = latched.gains;
+                thread.latched_step = step(latched.rate);
+            }
         }
     }
 
@@ -2717,6 +2898,8 @@ impl<S: Samples> Player<S> {
             target: Target::Own,
             kill_after_fade: false,
             order: self.last_in_order(),
+            latched_gains: [0; 2],
+            latched_step: step(RATE),
         };
         set_arguments(&mut thread, args);
         // *(code)* A fresh start then writes `isplaying` 1 (0x57dbc5),
@@ -2749,10 +2932,16 @@ impl<S: Samples> Player<S> {
         let patch = owner.number(&fields.patch).unwrap_or(0) as i32;
         let group = owner.number(&fields.group).unwrap_or(0);
         let mut registers = self.default_registers(track);
-        // *(code)* 0x57db54..0x57db67: a fresh start loads the HOT patch ID
-        // into live register `PATCH` (50); before its first start (or after
-        // any kill, 0x57dd62 → 0x57f682), `PATCH` is 0.
+        // *(code)* 0x57db54..0x57db67 -> 0x57f625: a fresh start loads the HOT
+        // patch ID into live register `PATCH` (50) and copies the patch's
+        // `Is3d` flag (`0x57f6e3`..`0x57f6fb`) into `THREE_D` (26). Before its
+        // first start (or after any kill, 0x57dd62 → 0x57f682), `PATCH` is 0.
         registers[usize::from(PATCH)] = patch;
+        if patch != 0
+            && let Some(meta) = self.patches.get(&(patch as u32))
+        {
+            registers[usize::from(THREE_D)] = i32::from(meta.is_3d);
+        }
         Some((pc, registers, group))
     }
 
@@ -2791,7 +2980,7 @@ impl<S: Samples> Player<S> {
         self.stopped.insert(thread.track, registers);
         self.held.remove(&thread.track);
         self.duck.remove(&thread.track);
-        self.update_main_duckpri();
+        self.update_main_duckpri(true);
     }
 
     /// *(code)* Unconditional kill on a stopped registered track object
@@ -2809,7 +2998,7 @@ impl<S: Samples> Player<S> {
         }
         self.held.remove(&track);
         self.duck.remove(&track);
-        self.update_main_duckpri();
+        self.update_main_duckpri(true);
     }
 
     /// Reads a local register (`r < GLOBALS`) from a stopped track object.
@@ -2840,6 +3029,14 @@ impl<S: Samples> Player<S> {
             regs[usize::from(r)] = stored;
         }
         if r == PATCH {
+            if value != 0
+                && let Some(meta) = self.patches.get(&(value as u32))
+                && let Some(regs) = self.stopped.get_mut(&track)
+            {
+                // *(code)* 0x57f6e3..0x57f6fb: `set_patch` copies the patch's
+                // `Is3d` flag into track register `0x1a` (`THREE_D`).
+                regs[usize::from(THREE_D)] = i32::from(meta.is_3d);
+            }
             self.notes.retain(|n| !(n.thread == 0 && n.track == track));
             self.idle.remove(&track);
             return;
@@ -2856,6 +3053,13 @@ impl<S: Samples> Player<S> {
             let update_pitch = r == PITCH;
             if update_gains || update_pitch {
                 let levels = self.levels(&idle);
+                let rate_step = step(levels.rate);
+                if update_gains {
+                    idle.latched_gains = levels.gains;
+                }
+                if update_pitch {
+                    idle.latched_step = rate_step;
+                }
                 for note in self
                     .notes
                     .iter_mut()
@@ -2865,7 +3069,7 @@ impl<S: Samples> Player<S> {
                         note.gains = levels.gains;
                     }
                     if update_pitch {
-                        note.step = step(levels.rate);
+                        note.step = rate_step;
                     }
                 }
             }
@@ -2912,9 +3116,14 @@ impl<S: Samples> Player<S> {
         };
         let mut out = Vec::with_capacity(samples.min(2 * RATE as usize));
         while out.len() < samples {
+            self.step_nudge_timer(sources);
             self.run_at_block_start(sources);
             let until_block = BLOCK - (self.frame % BLOCK as u64) as usize;
-            let count = until_block.min(frames - out.len() / 2);
+            let mut count = until_block.min(frames - out.len() / 2);
+            if self.nudge != 0 {
+                let until_timer = TIMER_FRAMES - (self.frame % TIMER_FRAMES as u64) as usize;
+                count = count.min(until_timer);
+            }
             self.mix(count, &mut out);
             self.frame += count as u64;
         }
@@ -2928,6 +3137,7 @@ impl<S: Samples> Player<S> {
         let limit = limit.min(RENDER_LIMIT);
         let mut out = Vec::new();
         while out.len() < limit {
+            self.step_nudge_timer(sources);
             self.run_at_block_start(sources);
             if self.is_idle() {
                 break;
@@ -2938,20 +3148,29 @@ impl<S: Samples> Player<S> {
         out
     }
 
+    /// *(code)* `0x572fc3` → `0x572fd6` → `0x573019`: every 20 ms
+    /// ([`TIMER_FRAMES`] = 441 frames at 22,050 Hz), while `+0x114`
+    /// (`self.nudge`) is nonzero, places every track nudged then normal
+    /// and decrements the countdown (100 updates = 2.00 s).
+    fn step_nudge_timer(&mut self, sources: &dyn Sources) {
+        if self.nudge != 0
+            && self.frame > 0
+            && self.frame.is_multiple_of(TIMER_FRAMES as u64)
+            && self.nudged_at != Some(self.frame)
+        {
+            self.nudged_at = Some(self.frame);
+            let remaining = self.nudge;
+            self.place_all(sources);
+            self.nudge = 0;
+            self.place_all(sources);
+            self.nudge = remaining - 1;
+        }
+    }
+
     /// Runs the threads once at the start of each block.
     fn run_at_block_start(&mut self, sources: &dyn Sources) {
         if self.frame.is_multiple_of(BLOCK as u64) && self.ran_at != Some(self.frame) {
             self.ran_at = Some(self.frame);
-            // *(code)* 0x573019: before stepping the HIT tracks, while
-            // `+0x114` is nonzero, place every track nudged then normal
-            // and decrement the countdown.
-            if self.nudge != 0 {
-                let remaining = self.nudge;
-                self.place_all(sources);
-                self.nudge = 0;
-                self.place_all(sources);
-                self.nudge = remaining - 1;
-            }
             self.run(sources);
             self.update_ambience();
         }
@@ -2982,16 +3201,20 @@ impl<S: Samples> Player<S> {
         debug_assert_eq!(out.len(), start + 2 * frames);
     }
 
-    /// A thread's levels from its registers and the player's settings.
+    /// *(code)* A thread's levels from its registers and the player's
+    /// settings (`0x57f759` for volume/pan/ducking and `0x57f71d` for
+    /// pitch): `vol`, `extvol`, `duckpri`, and `Is3d` are read through
+    /// `target` (`vtable[+0x88]` → `0x57de16`), while `pan` (`[esi + 0x44]`,
+    /// `0x57f85f`), `pitch` (`[esi + 0x48]`, `0x57f734`), and the track's
+    /// HOT group (`[esi + 0xc4]`, `0x57f867`) come from the thread itself.
     fn levels(&self, thread: &Thread) -> Levels {
-        let register = |r: u8| thread.registers[usize::from(r)];
         levels::levels(&Inputs {
-            vol: register(VOL),
-            extvol: register(EXTVOL),
-            pan: register(PAN),
-            pitch: register(PITCH),
-            duck_priority: register(DUCKPRI),
-            three_d: register(THREE_D) != 0,
+            vol: self.read(thread, i64::from(VOL)),
+            extvol: self.read(thread, i64::from(EXTVOL)),
+            pan: thread.registers[usize::from(PAN)],
+            pitch: thread.registers[usize::from(PITCH)],
+            duck_priority: self.read(thread, i64::from(DUCKPRI)),
+            three_d: self.read(thread, i64::from(THREE_D)) != 0,
             group_volume: self
                 .group_volumes
                 .get(&thread.group)
@@ -3002,21 +3225,28 @@ impl<S: Samples> Player<S> {
         })
     }
 
-    /// Gives every note of a running track its thread's levels
-    /// (`0x57c0ea` walks the running-track list and does not include
-    /// idle kind-53 voices). (The original sets them as registers
-    /// change; here once per block, after the threads run, and on group
-    /// or master volume changes.)
-    fn apply_levels(&mut self) {
-        let levels: BTreeMap<u32, Levels> = self
+    /// *(code)* Refreshes gains (only, not pitch) on unheld running tracks'
+    /// notes (`0x57c0ea` → `0x57f759`, `0x57cc74` → `0x57f759`), skipping
+    /// held tracks (`0x57dc5a` removes held tracks from the running list)
+    /// and idle kind-53 voices (`thread == 0`). When `group` is `Some(g)`,
+    /// only unheld running tracks in group `g` are refreshed
+    /// (`0x57c18b..0x57c197`).
+    fn apply_running_gains(&mut self, group: Option<i64>) {
+        let gains: BTreeMap<u32, [i32; 2]> = self
             .threads
             .iter()
-            .map(|t| (t.id, self.levels(t)))
+            .filter(|t| !self.held.contains(&t.track))
+            .filter(|t| group.is_none_or(|g| t.group == g))
+            .map(|t| (t.id, self.levels(t).gains))
             .collect();
+        for thread in &mut self.threads {
+            if let Some(&gains) = gains.get(&thread.id) {
+                thread.latched_gains = gains;
+            }
+        }
         for note in &mut self.notes {
-            if let Some(levels) = levels.get(&note.thread) {
-                note.gains = levels.gains;
-                note.step = step(levels.rate);
+            if let Some(&gains) = gains.get(&note.thread) {
+                note.gains = gains;
             }
         }
     }
@@ -3025,12 +3255,21 @@ impl<S: Samples> Player<S> {
     /// request is dropped in [`Player::save_stopped`], matching `0x57d2cb`,
     /// while routed requests on stopped tracks remain until cleared).
     fn forget_ended(&mut self) {
-        self.update_main_duckpri();
+        self.update_main_duckpri(false);
     }
 
-    fn update_main_duckpri(&mut self) {
+    /// *(code)* Recomputes `main_duckpri` (global 123, `0x57d2cb`). When
+    /// `refresh_always` is true (every `MAIN_DUCKPRI` write or kill,
+    /// `0x57d31e` → `0x57cc74`), refreshes all unheld running voices even
+    /// when the maximum stays the same.
+    fn update_main_duckpri(&mut self, refresh_always: bool) {
         let largest = self.duck.values().copied().fold(0, i32::max);
-        self.globals[usize::from(MAIN_DUCKPRI - GLOBALS)] = largest;
+        let slot = &mut self.globals[usize::from(MAIN_DUCKPRI - GLOBALS)];
+        let changed = *slot != largest;
+        *slot = largest;
+        if refresh_always || changed {
+            self.apply_running_gains(None);
+        }
     }
 
     /// Runs every track once, in the order of the list of running tracks
@@ -3077,14 +3316,15 @@ impl<S: Samples> Player<S> {
             if !self.threads.iter().any(|t| t.id == id) {
                 continue;
             }
-            self.save_stopped(&thread);
+            // *(code)* 0x57dd87..0x57dda5 clears `target` and removes the
+            // track from the running list before 0x57ddd8 refreshes voices.
             self.threads.retain(|t| t.id != id);
+            self.save_stopped(&thread);
             // Its ducking request goes now, before the threads after it
             // run.
             self.forget_ended();
         }
         self.forget_ended();
-        self.apply_levels();
     }
 
     /// The block has run out of instructions before the tracks `rest`
@@ -3100,7 +3340,6 @@ impl<S: Samples> Player<S> {
             ));
         }
         let first = self.threads.iter().map(|t| t.order).min().unwrap_or(0);
-        let mut ended = Vec::new();
         for (place, &track) in rest.iter().enumerate() {
             if self.held.contains(&track) {
                 continue;
@@ -3110,8 +3349,8 @@ impl<S: Samples> Player<S> {
             };
             let id = thread.id;
             if !self.fade_or_end(&mut thread) {
+                self.threads.retain(|t| t.id != id);
                 self.save_stopped(&thread);
-                ended.push(id);
                 continue;
             }
             thread.order = first - (rest.len() - place) as i64;
@@ -3119,7 +3358,6 @@ impl<S: Samples> Player<S> {
                 *slot = thread;
             }
         }
-        self.threads.retain(|t| !ended.contains(&t.id));
     }
 
     /// Runs one thread until it waits, ends, or the block's instructions
@@ -3333,6 +3571,22 @@ impl<S: Samples> Player<S> {
         }
     }
 
+    /// Copies the currently running thread clone into `self.threads` before an
+    /// operation that reads or refreshes all running threads.
+    fn sync_thread_to_store(&mut self, thread: &Thread) {
+        if let Some(slot) = self.threads.iter_mut().find(|t| t.id == thread.id) {
+            *slot = thread.clone();
+        }
+    }
+
+    /// Pulls any in-place updates (such as refreshed `latched_gains` from
+    /// `apply_running_gains`) from `self.threads` back into the running clone.
+    fn sync_thread_from_store(&self, thread: &mut Thread) {
+        if let Some(slot) = self.threads.iter().find(|t| t.id == thread.id) {
+            *thread = slot.clone();
+        }
+    }
+
     /// Writes a register, with the original's side effects (`0x57de57`,
     /// `0x57de98`). Every write other than to `target` (53) goes to the
     /// destination [`Player::resolve_target`] picks, globals included,
@@ -3366,23 +3620,28 @@ impl<S: Samples> Player<S> {
         }
         let dest = self.resolve_target(thread);
         let written = match dest {
-            Destination::Own => thread,
+            Destination::Own => &mut *thread,
             Destination::Running(id) => match self.threads.iter_mut().find(|t| t.id == id) {
                 Some(other) => other,
-                None => thread,
+                None => &mut *thread,
             },
             Destination::Stopped(stopped_track) => {
                 if r < GLOBALS {
                     self.write_stopped(stopped_track, r, value);
                 } else if r == MAIN_DUCKPRI {
-                    // *(code)* 0x57e011 → 0x57d2cb: updates the track's
-                    // ducking request without checking `is_running`.
+                    // *(code)* 0x57e011 → 0x57d2cb → 0x57d31e: updates the
+                    // track's ducking request without checking `is_running`
+                    // and refreshes all unheld running voices (syncing the
+                    // caller's live clone before and after so same-block writes
+                    // are visible and the refreshed latch survives).
+                    self.sync_thread_to_store(thread);
                     if value == 0 {
                         self.duck.remove(&stopped_track);
                     } else {
                         self.duck.insert(stopped_track, value);
                     }
-                    self.update_main_duckpri();
+                    self.update_main_duckpri(true);
+                    self.sync_thread_from_store(thread);
                 } else {
                     self.globals[usize::from(r - GLOBALS)] = value;
                 }
@@ -3396,16 +3655,92 @@ impl<S: Samples> Player<S> {
             written.registers[usize::from(r)] = value;
             if r == PATCH {
                 // *(code)* 0x57dfe8 → 0x57e040 → 0x57f625: writing `patch`
-                // tears down the track's active voice immediately.
+                // tears down the track's active voice, copies a registered
+                // patch's `Is3d` flag into register `0x1a` (`THREE_D`) via
+                // `vtable +0x84` (`0x57f6e3`..`0x57f6fb`, updating comparison
+                // flags to `is_3d` at `0x57de98`..`0x57dec5`), and — unless
+                // lookup failed (`0x57f69a` → `0x57e047`) — refreshes gains
+                // and pitch with the updated `THREE_D` (`0x57e04b`, `0x57e052`).
+                let patch_id = value as u32;
+                let patch_is_3d = (value != 0)
+                    .then(|| {
+                        self.patches
+                            .get(&patch_id)
+                            .map(|meta| i32::from(meta.is_3d))
+                    })
+                    .flatten();
+                let refresh_after =
+                    value == 0 || patch_is_3d.is_some() || self.tracks.contains_key(&patch_id);
+                if let Some(is_3d) = patch_is_3d {
+                    written.registers[usize::from(THREE_D)] = is_3d;
+                    written.kept = i64::from(is_3d);
+                }
+                let snapshot = written.clone();
+                if dest != Destination::Own {
+                    self.sync_thread_to_store(thread);
+                }
                 self.notes.retain(|n| n.thread != written_id);
+                if refresh_after {
+                    let levels = self.levels(&snapshot);
+                    let rate_step = step(levels.rate);
+                    if dest == Destination::Own {
+                        thread.latched_gains = levels.gains;
+                        thread.latched_step = rate_step;
+                    } else if let Some(slot) = self.threads.iter_mut().find(|t| t.id == written_id)
+                    {
+                        slot.latched_gains = levels.gains;
+                        slot.latched_step = rate_step;
+                    }
+                }
+                return;
+            }
+            // *(code)* 0x57def1..0x57e057: only level/pan registers (`vol`,
+            // `extvol`, `pan`, `IsHeadRelative` = 27, 30..=32, 56..=57)
+            // refresh voice gains (`0x57f759`) and only `pitch` refreshes
+            // rate (`0x57f71d`); `duckpri` (25) and `Is3d` (26) leave the
+            // voice latched until the next refresh.
+            let update_gains = matches!(r, VOL | EXTVOL | PAN | 27 | 30..=32 | 56..=57);
+            let update_pitch = r == PITCH;
+            if update_gains || update_pitch {
+                let snapshot = written.clone();
+                if dest != Destination::Own {
+                    self.sync_thread_to_store(thread);
+                }
+                let levels = self.levels(&snapshot);
+                let rate_step = step(levels.rate);
+                if dest == Destination::Own {
+                    if update_gains {
+                        thread.latched_gains = levels.gains;
+                    }
+                    if update_pitch {
+                        thread.latched_step = rate_step;
+                    }
+                } else if let Some(slot) = self.threads.iter_mut().find(|t| t.id == written_id) {
+                    if update_gains {
+                        slot.latched_gains = levels.gains;
+                    }
+                    if update_pitch {
+                        slot.latched_step = rate_step;
+                    }
+                }
+                for note in self.notes.iter_mut().filter(|n| n.thread == written_id) {
+                    if update_gains {
+                        note.gains = levels.gains;
+                    }
+                    if update_pitch {
+                        note.step = rate_step;
+                    }
+                }
             }
         } else if r == MAIN_DUCKPRI {
+            self.sync_thread_to_store(thread);
             if value == 0 {
                 self.duck.remove(&duck_track);
             } else {
                 self.duck.insert(duck_track, value);
             }
-            self.update_main_duckpri();
+            self.update_main_duckpri(true);
+            self.sync_thread_from_store(thread);
         } else {
             self.globals[usize::from(r - GLOBALS)] = value;
         }
@@ -3425,7 +3760,7 @@ impl<S: Samples> Player<S> {
     /// (see the module notes).
     fn load_patch(&mut self, patch: u32) -> bool {
         if !self.cache.contains_key(&patch) {
-            let pcm = match self.patches.get(&patch).map(|(_, path)| path.clone()) {
+            let pcm = match self.patches.get(&patch).map(|p| p.path.clone()) {
                 Some(path) => {
                     let pcm = self.samples.load(&path);
                     if pcm.is_none() {
@@ -3460,7 +3795,7 @@ impl<S: Samples> Player<S> {
         matches!(self.cache.get(&patch), Some(Some(_)))
     }
 
-    fn note_on(&mut self, thread: &Thread) -> u32 {
+    fn note_on(&mut self, thread: &mut Thread) -> u32 {
         let patch = thread.registers[usize::from(PATCH)] as u32;
         if !self.load_patch(patch) {
             return 0;
@@ -3478,7 +3813,21 @@ impl<S: Samples> Player<S> {
             self.report(format!("patch {patch}: more than {NOTES} notes"));
             return 0;
         }
-        let levels = self.levels(thread);
+        // *(code)* 0x57f601..0x57f618: non-streamed patches play with the
+        // voice's already-latched gains and pitch (set at fresh start /
+        // `PATCH` write / level refreshes), whereas streamed patches
+        // (`IsStreamed != 0`) refresh both through `0x57f759` and `0x57f71d`.
+        // Idle kind-53 voices (`thread.id == 0`) just wrote `PATCH` (0x57e0cc).
+        let is_streamed = self.patches.get(&patch).is_some_and(|p| p.is_streamed);
+        let (gains, rate_step) = if thread.id == 0 || is_streamed {
+            let levels = self.levels(thread);
+            let rate_step = step(levels.rate);
+            thread.latched_gains = levels.gains;
+            thread.latched_step = rate_step;
+            (levels.gains, rate_step)
+        } else {
+            (thread.latched_gains, thread.latched_step)
+        };
         let id = self.id();
         self.notes.push(Note {
             id,
@@ -3486,8 +3835,8 @@ impl<S: Samples> Player<S> {
             track: thread.track,
             patch,
             position: 0,
-            step: step(levels.rate),
-            gains: levels.gains,
+            step: rate_step,
+            gains,
             chain: Vec::new(),
             looping: false,
         });
@@ -3641,26 +3990,21 @@ impl<S: Samples> Player<S> {
                 // flags. The new thread's `target` is itself.
                 let track = self.read(thread, arg(0)) as u32;
                 let args = [1, 2, 3].map(|r| thread.registers[r] as u32);
-                // A track that starts itself is the one running: the
-                // start acts on it as it is now.
+                // A track that starts itself is the one running, and restarting
+                // another track can refresh ducking gains on this one: keep the
+                // stored thread and running clone in sync across the start.
                 let own = track == thread.track;
-                if own && let Some(stored) = self.threads.iter_mut().find(|t| t.id == thread.id) {
-                    *stored = thread.clone();
-                }
+                self.sync_thread_to_store(thread);
                 let started = self.start(args, track);
                 self.let_go_track(track, &started.threads);
-                if own && let Some(stored) = self.threads.iter().find(|t| t.id == thread.id) {
-                    *thread = stored.clone();
-                }
+                self.sync_thread_from_store(thread);
                 // `source` is read after the start (0x57f256), through the
                 // caller's `target` as the start left it, and written to
                 // the started track through its own `target` (vtable +0x84,
                 // 0x57f261) — even if the start returned early on a muted,
                 // stopped track.
                 let source = self.read(thread, i64::from(SOURCE));
-                if let Some(stored) = self.threads.iter_mut().find(|t| t.id == thread.id) {
-                    *stored = thread.clone();
-                }
+                self.sync_thread_to_store(thread);
                 if !started.threads.is_empty() {
                     for &started_id in &started.threads {
                         if let Some(at) = self.threads.iter().position(|t| t.id == started_id) {
@@ -3670,9 +4014,7 @@ impl<S: Samples> Player<S> {
                 } else if self.owner(track).is_some() {
                     self.write_stopped(track, SOURCE, source);
                 }
-                if let Some(stored) = self.threads.iter().find(|t| t.id == thread.id) {
-                    *thread = stored.clone();
-                }
+                self.sync_thread_from_store(thread);
                 // Started anew, it runs from the top, from the next block
                 // (the original goes on in the same update).
                 if own && started.fresh {
@@ -3683,12 +4025,17 @@ impl<S: Samples> Player<S> {
             "kill_trk" => {
                 // *(code)* 0x57f284: the track ends at once (vtable
                 // +0x38), whatever object it plays for; one track
-                // object plays for all of them in the original.
+                // object plays for all of them in the original. Sync the
+                // caller's live clone before and after so the kill's
+                // `0x57d31e` voice refresh sees same-block register changes
+                // on `thread` and updates `thread.latched_gains`.
+                self.sync_thread_to_store(thread);
                 let track = self.read(thread, arg(0)) as u32;
                 self.end_track(track, Some(thread.id));
                 if track == thread.track {
                     Flow::Kill
                 } else {
+                    self.sync_thread_from_store(thread);
                     Flow::Next
                 }
             }
@@ -3705,9 +4052,7 @@ impl<S: Samples> Player<S> {
                 // through its `target` (vtable +0x84, 0x57ef8d..0x57efba)
                 // and waits.
                 if holder != 0 && holder != me && self.owner(holder).is_some() {
-                    if let Some(stored) = self.threads.iter_mut().find(|t| t.id == thread.id) {
-                        *stored = thread.clone();
-                    }
+                    self.sync_thread_to_store(thread);
                     if let Some(at) = self.newest(holder) {
                         let other = self.threads[at].clone();
                         let other_id = other.id;
@@ -3716,6 +4061,7 @@ impl<S: Samples> Player<S> {
                             self.save_stopped(&removed);
                             self.notes.retain(|n| n.thread != other_id);
                             self.forget_ended();
+                            self.sync_thread_from_store(thread);
                         } else {
                             let fading = self.read(&other, i64::from(FADE_ON)) != 0
                                 && self.read(&other, i64::from(FADE_VAR)) == i32::from(EXTVOL);
@@ -3730,9 +4076,7 @@ impl<S: Samples> Player<S> {
                                     self.write_at(at, FADE_ON, 1);
                                 }
                             }
-                            if let Some(stored) = self.threads.iter().find(|t| t.id == thread.id) {
-                                *thread = stored.clone();
-                            }
+                            self.sync_thread_from_store(thread);
                             // Run this instruction again shortly; by then
                             // this thread holds the group.
                             thread.wake =
@@ -3741,6 +4085,7 @@ impl<S: Samples> Player<S> {
                         }
                     } else if self.read_stopped(holder, EXTVOL) == 0 {
                         self.kill_stopped_track(holder);
+                        self.sync_thread_from_store(thread);
                     } else {
                         let fading = self.read_stopped(holder, FADE_ON) != 0
                             && self.read_stopped(holder, FADE_VAR) == i32::from(EXTVOL);
