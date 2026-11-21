@@ -10,6 +10,7 @@
 //! `docs/decisions/`.
 
 pub mod assets;
+pub mod cache;
 pub mod camera;
 pub mod canvas;
 pub mod caps;
@@ -25,6 +26,7 @@ pub mod scene;
 pub mod shadows;
 
 pub use assets::Assets;
+pub use cache::LotCache;
 pub use camera::{Camera, Walls, Zoom};
 pub use canvas::{Canvas, Ids, Image};
 pub use cutaway::{Focus, Selected, screen_centre_pick, unproject_terrain};

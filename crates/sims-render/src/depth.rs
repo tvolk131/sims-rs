@@ -197,6 +197,33 @@ impl Depth {
         self.ground(top, height).clamp(0, EMPTY) + 80
     }
 
+    /// Precomputes `(base, first_row)` for [`Depth::floor`] across all rows
+    /// of a floor tile so each row only evaluates `self.row(y - origin_y)`.
+    #[inline]
+    pub(crate) fn floor_base(
+        &self,
+        top: [i32; 2],
+        height: i32,
+        level: i32,
+        first: i32,
+    ) -> (i32, i32) {
+        let base = self
+            .ground(top, height)
+            .saturating_add(LEVEL_DEPTH.saturating_mul(level - 1))
+            .saturating_add(65);
+        let first_row = self.row(first.saturating_sub(self.origin_y));
+        (base, first_row)
+    }
+
+    /// Evaluates row `y` of [`Depth::floor`] from [`Depth::floor_base`].
+    #[inline]
+    pub(crate) fn floor_row(&self, base: i32, first_row: i32, y: i32) -> i32 {
+        base.saturating_add(
+            self.row(y.saturating_sub(self.origin_y))
+                .saturating_sub(first_row),
+        )
+    }
+
     /// The depth of row `y` of a floor tile on `level` whose top corner,
     /// after rotation, is view corner `top` at terrain height `height`,
     /// drawn from screen row `first` down: the ground's depth there, 65
@@ -204,10 +231,8 @@ impl Depth {
     /// prototype's `sprite_depth` in
     /// `legacy/.../paint/row/placement.rs`). **Unverified** above level 1.
     pub fn floor(&self, top: [i32; 2], height: i32, level: i32, first: i32, y: i32) -> i32 {
-        self.ground(top, height)
-            .saturating_add(LEVEL_DEPTH.saturating_mul(level - 1))
-            .saturating_add(65)
-            .saturating_add(self.follow(first, y))
+        let (base, first_row) = self.floor_base(top, height, level, first);
+        self.floor_row(base, first_row, y)
     }
 
     /// The depth at or past which a floor shadow darkens row `y` of the
