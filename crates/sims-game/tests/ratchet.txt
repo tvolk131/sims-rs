@@ -11,8 +11,9 @@
 # - ours: the SHA-256 of our frame's 8-bit colours;
 # - leave_out: a rectangle (left, top, right, bottom; right and bottom
 #   outside it) and why it is left out, one line each;
-# - floors: for each class, the share of pixels that must match, in
-#   percent.
+# - floors: for each class with pixels in the frame, the share of
+#   pixels that must match, in percent with two decimals (`none` for a
+#   new scene, whose first update sets them).
 
 [near-r2-0712-bench]
 about = 7:12 AM, paused. Mortimer reads on the bench; walls down. Scroll (592, -2018).

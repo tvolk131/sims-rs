@@ -18,14 +18,26 @@
 //! - our frame's hash differs from the pinned one (re-pin it, and give the
 //!   new shares in the PR);
 //! - a class falls below its floor (lower it on purpose, with the reason
-//!   in the PR).
+//!   in the PR);
+//! - a class with pixels has no floor, or a class with a floor has no
+//!   pixels;
+//! - the manifest does not parse: an unknown or repeated setting, a
+//!   setting before the first scene, no scenes, a floor without exactly
+//!   two decimals, or a rectangle outside the frame.
 //!
 //! `SIMS_RATCHET_UPDATE=1` writes our new hashes into the manifest and
-//! raises each floor to the share reached. It never lowers a floor, and a
-//! class below its floor still fails. `SIMS_RATCHET_DIFF=<folder>` writes
+//! raises each floor to the share reached; `floors = none` gives a new
+//! scene its first floors. It never lowers or removes a floor, and when
+//! any check fails it writes nothing. `SIMS_RATCHET_DIFF=<folder>` writes
 //! each scene's difference image (pixels that differ in magenta, the rest
-//! ours in grey) and our frame there: a folder under `cache/`, never in
-//! the repository.
+//! ours in grey) and our frame there. The folder must exist under a folder
+//! named `cache` and outside the checkout's files (its own `cache/` is
+//! fine), so the images never land in the repository.
+//!
+//! `cargo test` passes its filter and flags to every test binary. The
+//! test is named `ratchet` and follows libtest's filters, `--exact`,
+//! `--skip` and `--ignored`; filtered out, it prints `ratchet: filtered
+//! out`.
 //!
 //! Classes come from the frame at run time, with no stored masks:
 //!
@@ -37,8 +49,7 @@
 //!   wall trims and the road;
 //! - `frame`: every pixel not left out.
 //!
-//! A class with no pixels in a frame shows as `-` and keeps no floor; a
-//! floor kept on a class that then has no pixels fails.
+//! A class with no pixels in a frame shows as `-` and has no floor.
 //!
 //! A pixel matches when both colours are the same in 16-bit colour (5, 6
 //! and 5 bits), which is what the original draws in.
@@ -65,16 +76,64 @@ fn manifest_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/ratchet.txt")
 }
 
+/// Whether the test harness's arguments select this test, named
+/// `ratchet`: `cargo test` passes its filters and flags to every test
+/// binary. Filters match as libtest's do (a part of the name, or the whole
+/// name with `--exact`); `--skip` leaves it out; `--ignored` runs only
+/// ignored tests, which this is not.
+fn selected(args: &[String]) -> bool {
+    const NAME: &str = "ratchet";
+    // libtest's flags that take a value as the next argument.
+    const WITH_VALUE: [&str; 7] = [
+        "--test-threads",
+        "--skip",
+        "--logfile",
+        "--format",
+        "--color",
+        "--shuffle-seed",
+        "-Z",
+    ];
+    let (mut filters, mut skips) = (Vec::new(), Vec::new());
+    let (mut exact, mut ignored_only) = (false, false);
+    let mut words = args.iter();
+    while let Some(word) = words.next() {
+        let (flag, inline) = match word.split_once('=') {
+            Some((flag, value)) if word.starts_with('-') => (flag, Some(value.to_string())),
+            _ => (word.as_str(), None),
+        };
+        match flag {
+            "--exact" => exact = true,
+            "--ignored" => ignored_only = true,
+            f if WITH_VALUE.contains(&f) => {
+                let value = inline.or_else(|| words.next().cloned()).unwrap_or_default();
+                if f == "--skip" {
+                    skips.push(value);
+                }
+            }
+            f if f.starts_with('-') => {}
+            _ => filters.push(word.clone()),
+        }
+    }
+    let matches = |pattern: &String| {
+        if exact {
+            pattern == NAME
+        } else {
+            NAME.contains(pattern.as_str())
+        }
+    };
+    !ignored_only
+        && (filters.is_empty() || filters.iter().any(matches))
+        && !skips.iter().any(matches)
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "--list") {
-        println!("ratchet: test");
+    if !selected(&args) {
+        println!("ratchet: filtered out");
         return ExitCode::SUCCESS;
     }
-    // `cargo test <filter>` passes the filter to every test binary.
-    if let Some(filter) = args.iter().find(|a| !a.starts_with('-'))
-        && !"ratchet".contains(filter.as_str())
-    {
+    if args.iter().any(|a| a == "--list") {
+        println!("ratchet: test");
         return ExitCode::SUCCESS;
     }
     let (Some(install), Some(references)) = (
@@ -111,7 +170,8 @@ struct Scene {
     ours_sha256: String,
     /// Left out: [left, top, right, bottom) rectangles.
     leave_out: Vec<[i64; 4]>,
-    floors: BTreeMap<String, f64>,
+    /// Each class's floor, in hundredths of a percent.
+    floors: BTreeMap<&'static str, u32>,
     /// The manifest's lines that hold `ours` and `floors`, which an update
     /// rewrites.
     ours_line: usize,
@@ -137,22 +197,87 @@ fn parse(text: &str) -> Result<Vec<Scene>, String> {
         }
         if let Some(rest) = line.strip_prefix('[') {
             finish(name, &mut fields);
-            name = Some(
-                rest.strip_suffix(']')
-                    .ok_or(format!("line {}: {line}", n + 1))?,
-            );
+            let new = rest
+                .strip_suffix(']')
+                .ok_or(format!("line {}: {line}", n + 1))?;
+            // The name names the difference images too.
+            if new.is_empty()
+                || !new
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            {
+                return Err(format!(
+                    "line {}: a scene's name is lowercase letters, digits and hyphens: {new:?}",
+                    n + 1
+                ));
+            }
+            name = Some(new);
             continue;
         }
         let (key, value) = line
             .split_once(" = ")
             .ok_or(format!("line {}: not `key = value`: {line}", n + 1))?;
+        if name.is_none() {
+            return Err(format!(
+                "line {}: a setting before the first scene: {line}",
+                n + 1
+            ));
+        }
         fields.push((n, key, value));
     }
     finish(name, &mut fields);
-    scenes.into_iter().collect()
+    let scenes: Vec<Scene> = scenes.into_iter().collect::<Result<_, _>>()?;
+    if scenes.is_empty() {
+        return Err("no scenes".into());
+    }
+    let mut names = std::collections::BTreeSet::new();
+    if let Some(twice) = scenes.iter().find(|s| !names.insert(s.name.as_str())) {
+        return Err(format!("two scenes named {:?}", twice.name));
+    }
+    Ok(scenes)
+}
+
+/// A floor or share in hundredths of a percent: `96.51` is 9651. A floor
+/// is written with exactly two decimals.
+fn hundredths(word: &str) -> Option<u32> {
+    let (whole, part) = word.split_once('.')?;
+    if whole.is_empty()
+        || part.len() != 2
+        || !whole
+            .bytes()
+            .chain(part.bytes())
+            .all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let value = whole.parse::<u32>().ok()?.checked_mul(100)? + part.parse::<u32>().ok()?;
+    (value <= 10_000).then_some(value)
 }
 
 fn scene(name: &str, fields: &[(usize, &str, &str)]) -> Result<Scene, String> {
+    const KEYS: [&str; 13] = [
+        "about",
+        "tick",
+        "zoom",
+        "rotation",
+        "level",
+        "origin",
+        "walls",
+        "paused",
+        "strip",
+        "original",
+        "ours",
+        "leave_out",
+        "floors",
+    ];
+    for (n, key, _) in fields {
+        if !KEYS.contains(key) {
+            return Err(format!("{name}: line {}: no setting {key:?}", n + 1));
+        }
+        if *key != "leave_out" && fields.iter().filter(|f| f.1 == *key).count() > 1 {
+            return Err(format!("{name}: `{key}` is given twice"));
+        }
+    }
     let get = |key: &str| -> Result<(usize, &str), String> {
         fields
             .iter()
@@ -217,22 +342,39 @@ fn scene(name: &str, fields: &[(usize, &str, &str)]) -> Result<Scene, String> {
         for (r, w) in rect.iter_mut().zip(&words) {
             *r = number("leave_out", w)?;
         }
+        let [left, top, right, bottom] = rect;
+        // Inside the frame and not empty: a typo must not hide the rest
+        // of a row.
+        if !(0 <= left && left < right && right <= WIDTH as i64)
+            || !(0 <= top && top < bottom && bottom <= HEIGHT as i64)
+        {
+            return Err(format!(
+                "{name}: `leave_out` {rect:?} is not a rectangle inside {WIDTH} by {HEIGHT}"
+            ));
+        }
         leave_out.push(rect);
     }
     let (floors_line, floor_words) = get("floors")?;
-    let words: Vec<&str> = floor_words.split_whitespace().collect();
+    // `none` starts a new scene: an update sets its floors.
+    let words: Vec<&str> = if floor_words == "none" {
+        Vec::new()
+    } else {
+        floor_words.split_whitespace().collect()
+    };
     let mut floors = BTreeMap::new();
     for pair in words.chunks(2) {
         let [class, value] = pair else {
             return Err(format!("{name}: `floors` is class and share pairs"));
         };
-        if !CLASSES.contains(class) {
+        let Some(&class) = CLASSES.iter().find(|c| *c == class) else {
             return Err(format!("{name}: no class {class:?}"));
+        };
+        let floor = hundredths(value).ok_or(format!(
+            "{name}: floor {value:?} is not a share with two decimals, at most 100.00"
+        ))?;
+        if floors.insert(class, floor).is_some() {
+            return Err(format!("{name}: two floors for {class}"));
         }
-        let share: f64 = value
-            .parse()
-            .map_err(|_| format!("{name}: floor {value:?}"))?;
-        floors.insert(class.to_string(), share);
     }
     Ok(Scene {
         name: name.to_string(),
@@ -322,17 +464,15 @@ fn key([r, g, b]: [u8; 3]) -> [u8; 3] {
 /// Matched and counted pixels for each class.
 type Shares = BTreeMap<&'static str, (u64, u64)>;
 
-fn percent((matched, counted): (u64, u64)) -> f64 {
-    if counted == 0 {
-        100.0
-    } else {
-        matched as f64 * 100.0 / counted as f64
-    }
+/// The share matched, in hundredths of a percent, rounded down: a share
+/// meets a floor exactly when this is at least the floor. `counted` is
+/// not zero.
+fn share_of((matched, counted): (u64, u64)) -> u32 {
+    u32::try_from(matched * 10_000 / counted).expect("at most 10000")
 }
 
-/// Rounds a share down to the hundredth of a percent a floor is kept in.
-fn floor_of(share: f64) -> f64 {
-    (share * 100.0).floor() / 100.0
+fn shown(hundredths: u32) -> String {
+    format!("{}.{:02}", hundredths / 100, hundredths % 100)
 }
 
 fn compare(
@@ -407,13 +547,37 @@ fn run_to(game: &mut Game, tick: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// The folder for difference images. It must exist under a folder named
+/// `cache`, and not inside this checkout's files unless under its own
+/// `cache/` (which git ignores), so no image lands in the repository.
+fn diff_folder(dir: &Path) -> Result<PathBuf, String> {
+    let dir = dir
+        .canonicalize()
+        .map_err(|e| format!("SIMS_RATCHET_DIFF {dir:?}: {e}"))?;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .map_err(|e| format!("the checkout's folder: {e}"))?;
+    let under_cache = dir.components().any(|c| c.as_os_str() == "cache");
+    let outside_checkout = !dir.starts_with(&root) || dir.starts_with(root.join("cache"));
+    if !dir.is_dir() || !under_cache || !outside_checkout {
+        return Err(format!(
+            "SIMS_RATCHET_DIFF {dir:?} is not a folder under `cache` outside the checkout's files"
+        ));
+    }
+    Ok(dir)
+}
+
 fn run(install: &Path, references: &Path) -> Result<(), Vec<String>> {
     let fail = |e: String| vec![e];
     let path = manifest_path();
     let text = std::fs::read_to_string(&path).map_err(|e| fail(format!("{path:?}: {e}")))?;
     let scenes = parse(&text).map_err(|e| fail(format!("{path:?}: {e}")))?;
     let update = std::env::var_os("SIMS_RATCHET_UPDATE").is_some_and(|v| v == "1");
-    let diff_dir = std::env::var_os("SIMS_RATCHET_DIFF").map(PathBuf::from);
+    let diff_dir = std::env::var_os("SIMS_RATCHET_DIFF")
+        .map(|d| diff_folder(Path::new(&d)))
+        .transpose()
+        .map_err(fail)?;
 
     // Every reference first: a changed screenshot stops the run.
     let mut originals = Vec::new();
@@ -492,7 +656,7 @@ fn run(install: &Path, references: &Path) -> Result<(), Vec<String>> {
             .iter()
             .map(|c| match shares[c] {
                 (_, 0) => format!("{:>8}", "-"),
-                share => format!("{:>7.2}%", percent(share)),
+                share => format!("{:>7}%", shown(share_of(share))),
             })
             .collect();
         println!("ratchet: {name:<24} {}", row.join(" "));
@@ -513,38 +677,52 @@ fn run(install: &Path, references: &Path) -> Result<(), Vec<String>> {
         for c in CLASSES {
             let floor = scene.floors.get(c).copied();
             if shares[c].1 == 0 {
-                // A floor on a class the frame no longer has fails: the
-                // frame lost what the floor was kept for.
-                if let Some(floor) = floor.filter(|&f| f > 0.0) {
+                // The frame lost what the floor was kept for.
+                if let Some(floor) = floor {
                     failures.push(format!(
-                        "{name}: {c} has no pixels, but its floor is {floor:.2}%"
+                        "{name}: {c} has no pixels, but it has a floor of {}%: remove the \
+                         floor by hand, with the reason in the PR",
+                        shown(floor)
                     ));
-                    floors.push(format!("{c} {floor:.2}"));
                 }
                 continue;
             }
-            let floor = floor.unwrap_or(0.0);
-            let share = percent(shares[c]);
-            if share < floor {
-                failures.push(format!(
-                    "{name}: {c} matches {share:.2}%, below its floor {floor:.2}%"
-                ));
-            }
-            let kept = if update {
-                floor.max(floor_of(share))
-            } else {
-                floor
+            let share = share_of(shares[c]);
+            let kept = match floor {
+                Some(floor) if share < floor => {
+                    failures.push(format!(
+                        "{name}: {c} matches {}%, below its floor {}%",
+                        shown(share),
+                        shown(floor)
+                    ));
+                    floor
+                }
+                Some(floor) if update => floor.max(share),
+                Some(floor) => floor,
+                None if update => share,
+                None => {
+                    failures.push(format!(
+                        "{name}: {c} matches {}% and has no floor: set one \
+                         (SIMS_RATCHET_UPDATE=1)",
+                        shown(share)
+                    ));
+                    continue;
+                }
             };
-            floors.push(format!("{c} {kept:.2}"));
+            floors.push(format!("{c} {}", shown(kept)));
         }
         if update {
             lines[scene.floors_line] = format!("floors = {}", floors.join(" "));
         }
     }
-    if update {
+    // An update that failed writes nothing: it must not re-pin a frame
+    // that fails, or keep a floor it could not meet.
+    if update && failures.is_empty() {
         let text = lines.join("\n") + "\n";
         std::fs::write(&path, text).map_err(|e| fail(format!("{path:?}: {e}")))?;
         println!("ratchet: wrote {path:?}");
+    } else if update {
+        println!("ratchet: wrote nothing: the run failed");
     }
     if failures.is_empty() {
         Ok(())
