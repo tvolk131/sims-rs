@@ -12,6 +12,8 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Frame {
     pub stack_object: i16,
+    /// The raw tree word. In memory, bit 15 selects the dispatch hook
+    /// (0x474b99). The native ObjM writer masks it off (0x4746c0).
     pub tree: u16,
     pub node: u16,
     pub parameters: Vec<i16>,
@@ -19,6 +21,20 @@ pub struct Frame {
     pub primitive_state: i32,
     pub code_owner_type: i16,
 }
+
+impl Frame {
+    pub const TREE_FLAG: u16 = 0x8000;
+
+    /// The tree ID used for lookup (0x47536b), preserving the 0xffff mark.
+    pub fn tree_id(&self) -> u16 {
+        if self.tree == u16::MAX {
+            self.tree
+        } else {
+            self.tree & !Self::TREE_FLAG
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Relationship {
     pub present: i32,
@@ -36,8 +52,24 @@ pub struct Multipart {
     pub group: [i32; 3],
     pub parent: i16,
 }
+/// An action: a person's running one, its last, or one in its queue.
+///
+/// Its serde encoding folds [`Interaction::join`] into the high half of
+/// the flags, written as one 64-bit integer ([`EncodedInteraction`]).
+/// Postcard writes an integer by its value whatever its width, so an
+/// action that does not join encodes as it did before the word was kept,
+/// and the world's pinned hashes stand.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "EncodedInteraction", into = "EncodedInteraction")]
 pub struct Interaction {
+    /// The action's word +0, kept as it is: the game saves it first
+    /// (0x41f1d8). The action that joins a person's running interaction
+    /// has 1 there (0x41ee99), and a check passes the join's arguments to
+    /// its tree only for exactly 1 (0x458372). The menu's other listing,
+    /// which is not ported, writes 2 (0x41ee2f); actions made here
+    /// otherwise have 0.
+    pub join: i32,
+    /// The action's number (+0x3c), given when it is queued.
     pub uid: i32,
     pub caller: i16,
     pub target: i16,
@@ -49,12 +81,58 @@ pub struct Interaction {
     pub attenuation: f32,
     pub flags: u32,
 }
+/// [`Interaction`] as serde writes it: the flags' low half and the join
+/// word's bits in the high half.
+#[derive(Serialize, Deserialize)]
+struct EncodedInteraction {
+    uid: i32,
+    caller: i16,
+    target: i16,
+    icon: i16,
+    table_index: i32,
+    args: [i16; 4],
+    priority: i32,
+    action: u16,
+    attenuation: f32,
+    flags: u64,
+}
+impl From<Interaction> for EncodedInteraction {
+    fn from(i: Interaction) -> Self {
+        Self {
+            uid: i.uid,
+            caller: i.caller,
+            target: i.target,
+            icon: i.icon,
+            table_index: i.table_index,
+            args: i.args,
+            priority: i.priority,
+            action: i.action,
+            attenuation: i.attenuation,
+            flags: u64::from(i.flags) | (u64::from(i.join as u32) << 32),
+        }
+    }
+}
+impl From<EncodedInteraction> for Interaction {
+    fn from(e: EncodedInteraction) -> Self {
+        Self {
+            join: (e.flags >> 32) as u32 as i32,
+            uid: e.uid,
+            caller: e.caller,
+            target: e.target,
+            icon: e.icon,
+            table_index: e.table_index,
+            args: e.args,
+            priority: e.priority,
+            action: e.action,
+            attenuation: e.attenuation,
+            flags: e.flags as u32,
+        }
+    }
+}
 impl Interaction {
     fn read(f: &mut Fields<'_>) -> Result<Self> {
-        if f.i32()? != 0 {
-            return Err(Error::new(f.byte_position(), "unknown interaction header"));
-        }
         Ok(Self {
+            join: f.i32()?,
             uid: f.i32()?,
             caller: f.i16()?,
             target: f.i16()?,

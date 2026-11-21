@@ -427,7 +427,7 @@ fn deleted_chunks_are_not_resources() {
     assert_eq!(payloads(&iff, b"STR#"), [b"live"]);
     // With no map, a resource's flags are its chunk header's.
     let live = iff.get(b"STR#", 1).unwrap();
-    assert_eq!(iff.flags(live), live.flags);
+    assert_eq!(iff.resource_flags(live), live.flags);
     assert!(iff.map_error().is_none());
     // The chunks themselves are all still there.
     assert_eq!(iff.chunks.len(), 3);
@@ -499,10 +499,17 @@ fn a_resource_map_can_choose_the_earlier_chunk() {
     assert!(iff.get(b"STR#", 2).is_none());
     assert_eq!(payloads(&iff, b"STR#"), [&b"old"[..], b"low bits"]);
     // The resource's flags are the map's, not the chunk header's
-    // (0x41b7fa to 0x41b813).
+    // (0x41b7fa to 0x41b813, 0x41d3a7).
     let low = iff.get(b"STR#", 3).unwrap();
-    assert_eq!((low.flags, iff.flags(low)), (0x10, 0));
+    assert_eq!((low.flags, iff.resource_flags(low)), (0x10, 0));
     assert!(iff.map_error().is_none());
+}
+#[test]
+fn without_a_map_a_resource_keeps_its_header_flags() {
+    let mut b = header();
+    add_flagged(&mut b, b"STR#", 3, 0x10, b"low bits");
+    let iff = Iff::parse(b).unwrap();
+    assert_eq!(iff.resource_flags(iff.get(b"STR#", 3).unwrap()), 0x10);
 }
 #[test]
 fn a_map_listing_a_map_is_ignored() {

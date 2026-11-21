@@ -82,3 +82,28 @@ fn an_entry_starting_with_ff_fe_is_not_a_byte_order_mark() {
     let table = StringTable::parse(b"\xff\xff\x01\x00\xff\xfe$Job\0").unwrap();
     assert_eq!(table.entries[0].text, "\u{ff}\u{fe}$Job");
 }
+
+#[test]
+fn a_resource_is_read_in_its_flags_byte_order() {
+    const LITTLE: u16 = 0x10;
+    let read = |data: &[u8], flags| texts(&StringTable::parse_chunk(data, flags).unwrap()).len();
+    // Version -1: big-endian, both words swap; little-endian, neither.
+    assert_eq!(read(b"\xff\xff\x00\x02a\0b\0", 0), 2);
+    assert_eq!(read(b"\xff\xff\x02\x00a\0b\0", LITTLE), 2);
+    // Versions -2 and -3: only the version word swaps.
+    assert_eq!(read(b"\xff\xfe\x01\x00hi\0note\0", 0), 1);
+    let table = StringTable::parse_chunk(b"\xff\xfd\x01\x00\x01hi\0\0", 0).unwrap();
+    assert_eq!(table.format, Format::Localized);
+    // Any other word is a count of length-prefixed strings, in the
+    // resource's order.
+    assert_eq!(read(b"\x00\x02\x02hi\x03you", 0), 2);
+    assert_eq!(read(b"\x02\x00\x02hi\x03you", LITTLE), 2);
+    // Version 0 and negative counts are empty.
+    assert_eq!(read(b"\x00\x00\x02\x00\x02hi\x03you", LITTLE), 0);
+    assert_eq!(read(b"\x00\x80", LITTLE), 0);
+    // So is a version's count of 0x8000 or more, strings or not.
+    let mut big = b"\xff\xff\x00\x80".to_vec();
+    big.extend(std::iter::repeat_n(0, 0x8000));
+    assert_eq!(read(&big, LITTLE), 0);
+    assert_eq!(read(b"\xff\xfe\x00\x80", 0), 0);
+}

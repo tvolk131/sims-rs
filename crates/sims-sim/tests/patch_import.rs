@@ -114,6 +114,7 @@ fn opening_userdata2_imports_its_patch_families_as_the_first_neighborhood_has_th
         zoning: neighborhood
             .zoning(u16::from(install.expansions.0))
             .unwrap(),
+        lots: neighborhood.lot_rows().unwrap(),
         expansions: install.expansions.0,
         language: 1,
     };
@@ -185,6 +186,33 @@ fn opening_userdata2_imports_its_patch_families_as_the_first_neighborhood_has_th
     const NUMBERS: i32 = 8;
     const SLOTS: i16 = 18;
     let first_neighborhood = Neighborhood::open(&first).unwrap();
+    // The view's set-up made inventories for the one housed family's
+    // records, 48 and 47; each housed import, for its people, in import
+    // order. The first neighborhood's import made the same ones, SLOTS
+    // further on, after its two housed families' own.
+    let inventories: Vec<i16> = neighborhood
+        .inventories
+        .iter()
+        .map(|inventory| {
+            let inventory = inventory.as_ref().unwrap();
+            assert!(inventory.items.is_empty());
+            inventory.neighbor
+        })
+        .collect();
+    assert_eq!(inventories[..2], [48, 47]);
+    assert_eq!(inventories[2..], (294..314).collect::<Vec<_>>());
+    let first_inventories: Vec<i16> = first_neighborhood
+        .inventories
+        .iter()
+        .map(|inventory| inventory.as_ref().unwrap().neighbor)
+        .collect();
+    assert_eq!(
+        first_inventories[first_inventories.len() - 20..],
+        inventories[2..]
+            .iter()
+            .map(|&id| id + SLOTS)
+            .collect::<Vec<_>>()
+    );
     let first_records: BTreeMap<u32, _> = first_neighborhood
         .neighbors
         .iter()
@@ -381,6 +409,7 @@ fn small_context<'a>(
         character_guids: BTreeSet::new(),
         house_files: BTreeSet::new(),
         zoning: BTreeMap::new(),
+        lots: Vec::new(),
         expansions,
         language: 1,
     }
@@ -438,6 +467,24 @@ fn house_zeros_reload_makes_records_and_drops_members_without_one() {
     // Without Unleashed, nothing is imported and the option stays.
     assert_eq!(opened.renumbered, None);
     assert!(neighborhood.options.unwrap()[PENDING_IMPORT]);
+}
+
+#[test]
+fn freeing_family_4000_past_the_largest_signed_id_fails() {
+    let catalog = catalog();
+    let registry = [registered(ANNE, 2), registered(BOB, 2), registered(PET, 2)];
+    let mut neighborhood = small();
+    // Family 7 as 32767, the largest signed ID.
+    let family = neighborhood.families.remove(&7).unwrap();
+    neighborhood.families.insert(32767, family);
+    let error = open(
+        &mut neighborhood,
+        &[],
+        &small_context(&catalog, &registry, PETS),
+        &mut no_draws,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("0x42c1ad"), "{error}");
 }
 
 #[test]

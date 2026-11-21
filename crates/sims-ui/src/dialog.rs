@@ -34,8 +34,8 @@ pub const LABELS: u16 = 142;
 /// A dialog's icon is `BMP_` 5000 plus operand 1 in the caller's file
 /// (icon mode 3; legacy/crates/sims-vm/src/dialog.rs `private_bitmap_id`).
 pub const ICONS: u16 = 5000;
-/// The button bitmap: four cells of 65 by 33 (normal, selected, hover,
-/// disabled).
+/// The shared `WinBtn.bmp` (registered at 0x4efe20, 0x4efe33 and
+/// 0x5e7d90): four cells of 65 by 33 (normal, selected, hover, disabled).
 pub const BUTTON: i32 = 17;
 /// The art a dialog needs besides the fonts.
 pub const RESOURCES: [i32; 1] = [BUTTON];

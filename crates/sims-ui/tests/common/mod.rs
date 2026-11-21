@@ -16,6 +16,8 @@ pub const GOTH_HOUSE: &str = "UserData/Houses/House05.iff";
 pub struct Opened {
     pub careers: Careers,
     pub house: house::Tuning,
+    /// The architecture's prices, as the load's catalogs key them.
+    pub prices: house::Prices,
     pub kinds: house::Kinds,
     pub snapshot: Snapshot,
     pub art: Art,
@@ -82,6 +84,9 @@ pub fn open(root: &Path, house: &str) -> Opened {
         .with_careers(&careers)
         .with_relations(world, &family.members, &known);
     let house = house::Tuning::load(&index, catalog).unwrap();
+    // The architecture's prices, by the pattern catalogs the load keyed
+    // the lot's floors and walls by.
+    let prices = house::Prices::load(&install, lot.surfaces());
     let mut kinds = house::Kinds::default();
     kinds.learn(world, &index, catalog);
     let snapshot = snapshot.with_house(world, &house, &kinds);
@@ -92,6 +97,7 @@ pub fn open(root: &Path, house: &str) -> Opened {
     Opened {
         careers,
         house,
+        prices,
         kinds,
         snapshot,
         art,

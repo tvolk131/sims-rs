@@ -67,19 +67,49 @@ impl Image {
 
     /// This image with each pixel's alpha scaled by `mask`'s alpha. The
     /// two must be the same size; the original's wall shapes and wall
-    /// patterns always are.
+    /// patterns always are, except on an edge-on diagonal's strip (see
+    /// [`Image::masked_top_left`]).
     pub fn masked(&self, mask: &Image) -> Option<Self> {
         if (self.width, self.height) != (mask.width, mask.height) {
             return None;
         }
+        self.masked_top_left(mask)
+    }
+
+    /// This image masked by a mask at least as large, lined up at their
+    /// top-left corners, as the original draws the strip on an edge-on
+    /// diagonal: pattern 252 in shape 9, whose edge-on frame is taller.
+    /// The blit starts both at their first row (0x4c76d1, 0x4c7fdb), and
+    /// the mask's transparent first rows hide the pattern's, as House02's
+    /// screenshots show at every zoom. Only this image's rectangle is
+    /// drawn, so the mask's rows below it are left out. `None` when the
+    /// mask is smaller or either image's pixels do not fill its size.
+    pub fn masked_top_left(&self, mask: &Image) -> Option<Self> {
+        // A size too large to count gives none rather than overflowing.
+        let fills = |image: &Image| {
+            image
+                .width
+                .checked_mul(image.height)
+                .and_then(|n| n.checked_mul(4))
+                == Some(image.rgba.len())
+        };
+        if mask.width < self.width || mask.height < self.height || !fills(self) || !fills(mask) {
+            return None;
+        }
         let mut rgba = self.rgba.clone();
-        for (p, m) in rgba
-            .as_chunks_mut::<4>()
-            .0
-            .iter_mut()
-            .zip(mask.rgba.as_chunks::<4>().0)
-        {
-            p[3] = ((u16::from(p[3]) * u16::from(m[3])) / 255) as u8;
+        if !self.is_empty() {
+            for (y, row) in rgba.chunks_exact_mut(self.width * 4).enumerate() {
+                let start = y * mask.width * 4;
+                let mask_row = &mask.rgba[start..start + self.width * 4];
+                for (p, m) in row
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(mask_row.as_chunks::<4>().0)
+                {
+                    p[3] = ((u16::from(p[3]) * u16::from(m[3])) / 255) as u8;
+                }
+            }
         }
         Some(Self {
             rgba,
@@ -112,7 +142,43 @@ pub struct Canvas {
     ids: Vec<Option<u16>>,
     /// The ID the pixels drawn now take ([`Canvas::set_id`]).
     pen: Option<u16>,
+    /// For each ID, the screen rectangle its images were drawn into since
+    /// the canvas was cleared ([`Canvas::drawn`]).
+    rects: std::collections::BTreeMap<u16, Rect>,
 }
+
+/// Which object or person drew each pixel of a canvas, kept apart from
+/// it: what [`Canvas::id_at`] read when it was taken ([`Canvas::ids`],
+/// [`Ids::take`]). A frame drawn in passes keeps the IDs of a pass this
+/// way before the next draws over them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Ids {
+    width: usize,
+    height: usize,
+    ids: Vec<Option<u16>>,
+}
+
+impl Ids {
+    /// The ID that had drawn the pixel at (`x`, `y`) last when these were
+    /// taken, if any had and the pixel is on the canvas.
+    pub fn id_at(&self, x: i32, y: i32) -> Option<u16> {
+        let (x, y) = (usize::try_from(x).ok()?, usize::try_from(y).ok()?);
+        (x < self.width && y < self.height)
+            .then(|| self.ids[y * self.width + x])
+            .flatten()
+    }
+
+    /// Takes `canvas`'s IDs as they are now, reusing this one's storage.
+    pub fn take(&mut self, canvas: &Canvas) {
+        self.width = canvas.width;
+        self.height = canvas.height;
+        self.ids.clone_from(&canvas.ids);
+    }
+}
+
+/// A screen rectangle: left, top, right and bottom, the right and bottom
+/// edges outside it.
+pub type Rect = [i32; 4];
 
 impl Canvas {
     pub fn new(width: usize, height: usize, background: [u8; 3]) -> Self {
@@ -123,6 +189,7 @@ impl Canvas {
             depth: vec![EMPTY; width * height],
             ids: vec![None; width * height],
             pen: None,
+            rects: std::collections::BTreeMap::new(),
         }
     }
 
@@ -133,6 +200,7 @@ impl Canvas {
         self.depth.fill(EMPTY);
         self.ids.fill(None);
         self.pen = None;
+        self.rects.clear();
     }
 
     /// Sets the ID the pixels drawn from now on take, until it is set
@@ -148,6 +216,21 @@ impl Canvas {
     /// hit.
     pub fn id_at(&self, x: i32, y: i32) -> Option<u16> {
         self.ids[self.index(x, y)?]
+    }
+
+    /// The IDs of every pixel as they are now ([`Ids`]).
+    pub fn ids(&self) -> Ids {
+        let mut ids = Ids::default();
+        ids.take(self);
+        ids
+    }
+
+    /// The rectangle the images drawn under `id` cover, each whole, drawn
+    /// pixels or not and on the canvas or not, since the canvas was
+    /// cleared: what the original keeps as an object's drawn rectangles
+    /// (object +0x160 and +0x170, 0x438f71).
+    pub fn drawn(&self, id: u16) -> Option<Rect> {
+        self.rects.get(&id).copied()
     }
 
     /// Draws `image` with its top-left corner at `at`, mirrored left to
@@ -255,6 +338,26 @@ impl Canvas {
             || self.color.is_empty()
         {
             return;
+        }
+        if let Some(id) = self.pen {
+            let side = |n: usize| i32::try_from(n).unwrap_or(i32::MAX);
+            let rect = [
+                at[0],
+                at[1],
+                at[0].saturating_add(side(image.width)),
+                at[1].saturating_add(side(image.height)),
+            ];
+            self.rects
+                .entry(id)
+                .and_modify(|r| {
+                    *r = [
+                        r[0].min(rect[0]),
+                        r[1].min(rect[1]),
+                        r[2].max(rect[2]),
+                        r[3].max(rect[3]),
+                    ]
+                })
+                .or_insert(rect);
         }
         let wide = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
         let span = |at: i32, size: usize, limit: usize| {
@@ -401,6 +504,56 @@ mod tests {
             rgba: rgba.repeat(width * height),
             depth: depth.map(|d| vec![d; width * height]),
         }
+    }
+
+    #[test]
+    fn a_taller_or_wider_mask_lines_up_at_the_top_left() {
+        let pattern = image(2, 2, [9, 9, 9, 200], None);
+        // A 3 by 4 mask whose alpha is its row times 10 plus its column,
+        // times 5.
+        let mut mask = image(3, 4, [0, 0, 0, 0], None);
+        for y in 0..4 {
+            for x in 0..3 {
+                mask.rgba[(y * 3 + x) * 4 + 3] = (y * 10 + x) as u8 * 5;
+            }
+        }
+        let masked = pattern.masked_top_left(&mask).unwrap();
+        let alphas: Vec<u8> = masked.rgba.chunks(4).map(|p| p[3]).collect();
+        let want = |row: usize, column: usize| ((200 * (row * 10 + column) * 5) / 255) as u8;
+        assert_eq!(alphas, [want(0, 0), want(0, 1), want(1, 0), want(1, 1)]);
+        assert_eq!((masked.width, masked.height), (2, 2));
+        // `masked` keeps to masks of the same size.
+        assert!(pattern.masked(&mask).is_none());
+        let same = image(2, 2, [0, 0, 0, 51], None);
+        for masked in [pattern.masked(&same), pattern.masked_top_left(&same)] {
+            assert!(masked.unwrap().rgba.chunks(4).all(|p| p[3] == 40));
+        }
+        // A smaller mask, or one whose pixels fall short of its size,
+        // gives none; an empty image stays empty.
+        assert!(
+            pattern
+                .masked_top_left(&image(2, 1, [0, 0, 0, 255], None))
+                .is_none()
+        );
+        assert!(
+            pattern
+                .masked_top_left(&image(1, 2, [0, 0, 0, 255], None))
+                .is_none()
+        );
+        let mut short = image(2, 2, [0, 0, 0, 255], None);
+        short.rgba.truncate(12);
+        assert!(pattern.masked_top_left(&short).is_none());
+        assert!(pattern.masked(&short).is_none());
+        let empty = Image::empty();
+        assert!(empty.masked_top_left(&mask).unwrap().is_empty());
+        // A size whose byte count overflows gives none, on either side.
+        let mut huge = image(1, 1, [0, 0, 0, 255], None);
+        huge.width = usize::MAX / 4 + 1;
+        huge.height = 2;
+        huge.rgba.clear();
+        assert!(huge.masked_top_left(&huge).is_none());
+        assert!(pattern.masked_top_left(&huge).is_none());
+        assert!(huge.masked(&huge).is_none());
     }
 
     #[test]
@@ -654,6 +807,17 @@ mod tests {
         c.clear([0, 0, 0]);
         c.plot(2, 0, 0, [4, 4, 4]);
         assert_eq!([c.id_at(0, 0), c.id_at(2, 0)], [None, None]);
+        // The IDs taken keep what the canvas named then, not what it
+        // names after a later draw.
+        c.set_id(Some(7));
+        c.plot(2, 0, 0, [4, 4, 4]);
+        let taken = c.ids();
+        c.set_id(Some(9));
+        c.plot(1, 0, 0, [4, 4, 4]);
+        c.plot(2, 0, 0, [4, 4, 4]);
+        let then = [0, 1, 2, 3].map(|x| taken.id_at(x, 0));
+        assert_eq!(then, [None, None, Some(7), None]);
+        assert_eq!([c.id_at(1, 0), c.id_at(2, 0)], [Some(9), Some(9)]);
     }
 
     #[test]

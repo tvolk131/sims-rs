@@ -263,7 +263,7 @@ What is not ported:
     - a resource without flag 0x10 has its header byte-swapped first
       (0x41d3a7 to 0x41d3d4, through 0x470351). The flags are the ones
       the resource map states when the file has one (0x41b7fa to
-      0x41b813, `Iff::flags`), not the chunk header's (Sol's reading,
+      0x41b813, `Iff::resource_flags`), not the chunk header's (Sol's reading,
       **unverified**);
     - a format other than -1, -2 and -3 (version 0 and the classic Mac
       layout) is read with its leading word as the count, so a version-0
@@ -309,7 +309,7 @@ What is not ported:
   view's centre is an input, as the view's rotation is
   (`Interpreter::view_centre`, `Lot::set_view_centre`, `sims boot
   --view-centre X,Y`, `Lot::load_viewed`, saved with a lot from save
-  format 2). The interface's work on the pick is not ported, so the input
+  format 3). The interface's work on the pick is not ported, so the input
   is the tile the search starts from (see "The view's centre at 24719"
   below). When the tile
   is given, the search runs from it as in the original, its place tests'

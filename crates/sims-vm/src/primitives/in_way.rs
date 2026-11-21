@@ -161,9 +161,7 @@ impl Machine<'_, '_> {
     pub(super) fn find_in_way(&mut self, ctx: &mut Context) -> Result<bool, Trap> {
         let me = self.me;
         let interpreter = self.interpreter();
-        let wrap = |fault: Fault| {
-            Trap::Unsupported(format!("finding a person in the way (0x45ba28): {fault}"))
-        };
+        let wrap = |fault: Fault| fault.unsupported_in("finding a person in the way (0x45ba28)");
         // The person vector Set To Next walks too ([person +0xdc] +0x84),
         // checked the same way: each entry a person, and no person in the
         // making.
@@ -299,8 +297,8 @@ impl Machine<'_, '_> {
         }
         let interpreter = self.interpreter();
         let wrap = |fault: Fault| {
-            Trap::Unsupported(format!(
-                "asking person {asked} to move out of the way (0x45bf2e): {fault}"
+            fault.unsupported_in(format!(
+                "asking person {asked} to move out of the way (0x45bf2e)"
             ))
         };
         let marker = interpreter.create(self.world, MARKER).map_err(wrap)?;
@@ -385,8 +383,8 @@ impl Machine<'_, '_> {
             .position;
         let interpreter = self.interpreter();
         let wrap = |fault: Fault| {
-            Trap::Unsupported(format!(
-                "asking person {asked} to make way for a Snap (0x45bd5e): {fault}"
+            fault.unsupported_in(format!(
+                "asking person {asked} to make way for a Snap (0x45bd5e)"
             ))
         };
         let marker = interpreter.create(self.world, MARKER).map_err(wrap)?;
@@ -435,6 +433,7 @@ impl Machine<'_, '_> {
         let entry = self.table(marker)?.and_then(|t| find(t, MOVE as u32));
         let constants = self.program.autonomy_constants();
         let action = Interaction {
+            join: 0,
             uid: 0,
             caller: asked as i16,
             target: marker as i16,
@@ -603,10 +602,10 @@ impl Machine<'_, '_> {
             {
                 self.interpreter()
                     .callback(self.world, target, CANCELLED, id as i16)
-                    .map_err(|fault| {
-                        Trap::Unsupported(format!(
+                    .map_err(|fault: crate::fault::Fault| {
+                        fault.unsupported_in(format!(
                             "telling object {target} its queued action was dropped \
-                             (0x45d541): {fault}"
+                             (0x45d541)"
                         ))
                     })?;
             }
@@ -684,9 +683,7 @@ impl Machine<'_, '_> {
         }
         let mut saved = None;
         let result = self.check_and_run_at_once(id, &mut action, &mut saved);
-        if let Some(temps) = saved {
-            self.me_mut()?.temps = temps;
-        }
+        self.put_back_temps(saved)?;
         result
     }
 
@@ -695,7 +692,7 @@ impl Machine<'_, '_> {
         &mut self,
         id: u16,
         action: &mut Interaction,
-        saved: &mut Option<Vec<i16>>,
+        saved: &mut crate::autonomy::SavedTemps,
     ) -> Result<Option<i32>, Trap> {
         self.check_chosen(action, saved, None)?;
         if action.flags & crate::autonomy::checked::PASSED == 0 || self.running_at_once.is_some() {
@@ -764,6 +761,9 @@ impl Machine<'_, '_> {
                     }),
                     ..self.interpreter()
                 };
+                // The tree runs through the synchronous run (0x45d2d3,
+                // 0x474afb, 0x4749b5), which clears 0x6c4d6c (0x474a37):
+                // Add/Change Action String names nothing there.
                 interpreter
                     .call_as(
                         self.world,
@@ -774,11 +774,11 @@ impl Machine<'_, '_> {
                         &args,
                         args.len(),
                         crate::TURN_BUDGET,
-                        false,
+                        true,
                     )
-                    .map_err(|fault| {
-                        Trap::Unsupported(format!(
-                            "the tree {tree:#06x} of object {target}, run at once: {fault}"
+                    .map_err(|fault: crate::fault::Fault| {
+                        fault.unsupported_in(format!(
+                            "the tree {tree:#06x} of object {target}, run at once"
                         ))
                     })?;
                 *action = running.into_inner();
@@ -863,9 +863,9 @@ impl Machine<'_, '_> {
             if action.target != 0 {
                 interpreter
                     .callback(self.world, action.target as u16, CANCELLED, id as i16)
-                    .map_err(|fault| {
-                        Trap::Unsupported(format!(
-                            "cancelling action {uid} of person {id} (0x45d6c4): {fault}"
+                    .map_err(|fault: crate::fault::Fault| {
+                        fault.unsupported_in(format!(
+                            "cancelling action {uid} of person {id} (0x45d6c4)"
                         ))
                     })?;
             }

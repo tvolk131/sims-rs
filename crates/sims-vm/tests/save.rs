@@ -113,8 +113,13 @@ fn an_answered_save_takes_input_after_its_step_in_a_lot_that_does_not_wait() {
     asked.wait_for_answers();
     asked.step().unwrap();
     assert_eq!(asked.step().unwrap_err(), StepError::Asking { tick: 2 });
-    asked.answer(3).unwrap();
-    let saved = asked.save().unwrap();
+    asked
+        .answer(sims_vm::Answer {
+            status: 3,
+            bitmap_id: Some(17),
+        })
+        .unwrap();
+    let saved = Saved::decode(&asked.save().unwrap().encode()).unwrap();
 
     // Restored into a lot that does not wait: the saved answer is given at
     // the tick, and the lot then takes input.
@@ -123,6 +128,7 @@ fn an_answered_save_takes_input_after_its_step_in_a_lot_that_does_not_wait() {
     assert_eq!(restored.pause().unwrap_err(), OrderError::Asking);
     restored.step().unwrap();
     asked.step().unwrap();
+    assert_eq!(restored.world().globals[12], 17);
     assert_eq!(restored.world().hash(), asked.world().hash());
     restored.pause().unwrap();
 }
@@ -161,13 +167,22 @@ fn a_halted_lot_is_not_saved() {
 #[test]
 fn bytes_of_another_layout_are_refused() {
     assert!(matches!(Saved::decode(&[1, 0]), Err(SaveError::Format(_))));
-    // A save of the layout before this one (format 1 had no view centre).
+    // A save of the layout before this one (format 2 had no view centre),
+    // and one from a future format.
     let older = sims_vm::boot::save::FORMAT - 1;
     let mut header = older.to_le_bytes().to_vec();
     header.extend(sims_sim::SNAPSHOT_FORMAT.to_le_bytes());
     let refused = Saved::decode(&header).unwrap_err().to_string();
     assert!(
         refused.contains(&format!("save format {older}")),
+        "{refused}"
+    );
+    let future = sims_vm::boot::save::FORMAT + 1;
+    let mut header = future.to_le_bytes().to_vec();
+    header.extend(sims_sim::SNAPSHOT_FORMAT.to_le_bytes());
+    let refused = Saved::decode(&header).unwrap_err().to_string();
+    assert!(
+        refused.contains(&format!("save format {future}")),
         "{refused}"
     );
     // The world's encoding is checked as well.

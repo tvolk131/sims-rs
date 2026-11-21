@@ -2,10 +2,15 @@
 //! Goth house loads and steps one tick at a time to the state `sims boot`
 //! reaches.
 
+use sims_core::CrtRng;
+use sims_formats::behavior::ObjectDefinition;
+use sims_formats::iff::Iff;
 use sims_sim::{Headline, World};
-use sims_vm::boot::{Frames, Lot, StepError};
+use sims_vm::Answer;
+use sims_vm::boot::{Frames, Handoff, Lot, StepError};
+use sims_vm::neighborhood_open::{LotTransition, PoolInput, PoolPerson, open_neighborhood};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 33 --answers 3`
 /// gives this hash with the default frames (snapshot format 31).
@@ -272,25 +277,369 @@ fn the_goth_house_steps_to_tick_33() {
 fn an_old_town_home_loads_through_its_guid_table_and_steps() {
     // House 69 of the first neighborhood was saved under its family's
     // exported GUIDs; its GUID table (0x43a6fb) names the imported types.
-    // The dialogs at ticks 1 and 3 take their first buttons.
+    // Track 2 recorded it for 1,000 updates (`house69-ud1-ticks-20261120`).
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
         return;
     };
     let root = PathBuf::from(root);
     let house = root.join("UserData/Houses/House69.iff");
-    let mut lot = Lot::load(&root, &house, &[2; 8], Frames::default()).unwrap();
-    // The C runtime's stream as the original entered the lot
-    // (`house69-ud1-ticks-20261119`): the dog file was read before the
-    // load (`sims_vm::READ_BEFORE_THE_FIRST_LOAD`).
+    let frames = Frames::parse(UD1_RECORDED_FRAMES).unwrap();
+    let bits = UD1_FRAME_TREE_BITS.into_iter().collect();
+    let mut lot = Lot::load_with_frame_tree_bits(
+        &root,
+        &house,
+        &[2; 8],
+        frames,
+        CrtRng::from_state(1),
+        &bits,
+    )
+    .unwrap();
+    lot.replay_dialogs(&UD1_DIALOGS.map(|(status, bitmap_id)| Answer { status, bitmap_id }))
+        .unwrap();
+    // The C runtime's stream as the original entered the lot: the dog file
+    // was read before the load (`sims_vm::READ_BEFORE_THE_FIRST_LOAD`).
     assert_eq!(lot.world().crt_rng.state(), 2_984_970_331);
     let report = lot.load_report();
     assert!(report.stopped.is_none(), "{:?}", report.stopped);
     assert!(report.finished.is_some());
-    for _ in 0..5 {
+    assert_eq!(lot.world().hash_hex(), OLD_TOWN_69);
+    assert_eq!(digest(&format_30_bytes(lot.world())), OLD_TOWN_69_30);
+    for _ in 0..1000 {
         lot.step().unwrap();
     }
-    assert_eq!(lot.ticks(), 5);
+    assert_eq!(lot.ticks(), 1000);
+    assert_eq!(lot.world().hash_hex(), OLD_TOWN_69_1000);
+    assert_eq!(digest(&format_30_bytes(lot.world())), OLD_TOWN_69_1000_30);
+}
+
+/// The frames track 2's UserData1 House 69 recording drew
+/// (`house69-ud1-ticks-20261120/watch.jsonl`, the frame watch outside an
+/// update).
+const UD1_RECORDED_FRAMES: &str = "0,1,2,3,4,32,62,92,101,102,128+30";
+/// The saved frames whose arena words had bit 15 set when the original
+/// read them (0x4746e4), as track 2's recording shows them at entry:
+/// frame 1 of objects 263, 264, 265 and 268. The bit is what the arena
+/// held before, not what the house file stores
+/// (`20261115-household-selection-works-out-again-who-visitor.md`).
+const UD1_FRAME_TREE_BITS: [(u16, usize); 4] = [(263, 1), (264, 1), (265, 1), (268, 1)];
+/// The recording's dialogs after the load, in order. Each closed with
+/// result 2. While the fourth was open, the wait check published 17
+/// (`WinBtn.bmp`, 0x46d9c4), the bitmap of the button that closed it,
+/// which global 12 holds until the next update. While the others were
+/// open, global 12 did not change in the recording, so they publish
+/// nothing.
+const UD1_DIALOGS: [(u8, Option<i16>); 6] = [
+    (2, None),
+    (2, None),
+    (2, None),
+    (2, Some(17)),
+    (2, None),
+    (2, None),
+];
+/// UserData1's House 69 at entry (format 31), a regression pin of our
+/// run. It differs from track 2's recording only in object 2's last
+/// result; see `20261120-ud1-house-69-matches-the-recording.md`.
+const OLD_TOWN_69: &str = "cead046a20bfdb61be310dddc011a729866964f883e95ec140e78676df293e11";
+/// The same state's hash under snapshot format 30, which had no person
+/// types whose portrait the interface built ([`sims_sim::World::portraits`])
+/// at the end.
+const OLD_TOWN_69_30: &str = "c5e13dcc25bd62e07d7b456bf47eddfc1837434ace4575048d445e113cce67d3";
+/// The same after 1000 ticks, a regression pin, which differs from the
+/// recording's update 1000 only in object 2's last result.
+const OLD_TOWN_69_1000: &str = "bc39d708a988d37b10fb7e23bd52158929b0e42999f78ec3aef51e617f25007c";
+/// The same state's hash under snapshot format 30.
+const OLD_TOWN_69_1000_30: &str =
+    "5d8b7386fad6b71f7117c4a241853992dfe39f853033336022d74b8fed95ece1";
+
+/// UserData2 as the original left it after opening it for the first time,
+/// in a fresh directory: the install's UserData2, with the `Characters`
+/// and `Houses` folders and `Neighborhood.iff` from the folder
+/// `SIMS_UD2_AFTER` names, and the emptied `Patch` folder. That folder is
+/// track 2's second copy (`ud2-import-20261119/after-run2`), taken after
+/// the import's last write and before the lot load, in the session it
+/// recorded House 69 in (`house69-ud2-ticks-20261120`). It lacks the
+/// neighborhood's other files (`LotZoning.iff` among them), which the open
+/// does not change, so they come from the install.
+/// The directory is per process, so runs at the same time do not collide.
+fn imported_userdata2(root: &Path) -> Option<PathBuf> {
+    let after = PathBuf::from(std::env::var_os("SIMS_UD2_AFTER")?);
+    let directory = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("userdata2-imported-{}", std::process::id()));
+    if directory.exists() {
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+    copy_directory(&root.join("UserData2"), &directory);
+    for folder in ["Characters", "Houses", "Patch"] {
+        std::fs::remove_dir_all(directory.join(folder)).unwrap();
+    }
+    copy_directory(&after.join("Characters"), &directory.join("Characters"));
+    copy_directory(&after.join("Houses"), &directory.join("Houses"));
+    std::fs::create_dir(directory.join("Patch")).unwrap();
+    // The install's copy may be read-only, so it is removed, not overwritten.
+    std::fs::remove_file(directory.join("Neighborhood.iff")).unwrap();
+    std::fs::copy(
+        after.join("Neighborhood.iff"),
+        directory.join("Neighborhood.iff"),
+    )
+    .unwrap();
+    Some(directory)
+}
+
+#[expect(clippy::disallowed_methods, reason = "sort paths before using them")]
+fn copy_directory(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(from)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    entries.sort();
+    for path in entries {
+        let target = to.join(path.file_name().unwrap());
+        if path.is_dir() {
+            copy_directory(&path, &target);
+        } else {
+            std::fs::copy(&path, &target).unwrap();
+        }
+    }
+}
+
+#[test]
+fn an_imported_home_loads_from_the_originals_files_and_steps() {
+    // House 69 of the second neighborhood, after the original's first open
+    // imported its Patch families and filled its pools (2000, 3000 to 3009,
+    // 5000, 5500 and 6000). Every dialog answers 2, as in track 2's recordings.
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let Some(directory) = imported_userdata2(&root) else {
+        eprintln!("SIMS_UD2_AFTER not set; skipping");
+        return;
+    };
+    let house = directory.join("Houses/House69.iff");
+    let mut crt = CrtRng::from_state(1);
+    for _ in 0..FILE_BOOT_DRAWS {
+        crt.next_u15();
+    }
+    let frames = Frames::parse(RECORDED_FRAMES).unwrap();
+    let mut lot = Lot::load_with(&root, &house, &[2; 8], frames, crt).unwrap();
+    // The recording's C runtime state at entry, after the load's own draws.
+    assert_eq!(lot.world().crt_rng.state(), 3_739_951_803);
+    let report = lot.load_report();
+    assert!(report.stopped.is_none(), "{:?}", report.stopped);
+    assert!(report.finished.is_some());
+    // The original's open: 444 records, the Charmings (family 13) in
+    // House 69 under the GUIDs its import drew, and the pools.
+    let world = lot.world();
+    assert_eq!(world.neighbors.slots.len(), 444);
+    let family = |id: i32| world.families.iter().find(|f| f.id == id).unwrap();
+    assert_eq!(
+        (family(13).house, family(13).members.as_slice()),
+        (69, [0xd396_4bf5, 0xd868_148e].as_slice())
+    );
+    let pools = [2000, 5000, 5500, 6000].map(|id| (family(id).house, family(id).members.len()));
+    assert_eq!(pools, [(0, 30), (0, 12), (0, 18), (0, 30)]);
+    let tours = (3000..3010).map(|id| family(id).members.len());
+    assert_eq!(tours.collect::<Vec<_>>(), [3, 4, 4, 3, 4, 4, 3, 3, 2, 3]);
+    assert_eq!(lot.world().hash_hex(), IMPORTED_69);
+    assert_eq!(digest(&format_30_bytes(lot.world())), IMPORTED_69_30);
+    for _ in 0..1000 {
+        lot.step().unwrap();
+    }
+    assert_eq!(lot.world().hash_hex(), IMPORTED_69_1000);
+    assert_eq!(digest(&format_30_bytes(lot.world())), IMPORTED_69_1000_30);
+    std::fs::remove_dir_all(&directory).unwrap();
+}
+
+/// The families the open's five pools fill after `Patch`: the Townies
+/// (2000), the ten tourist families (3000 to 3009), the celebrities
+/// (5000), the fans (5500) and Magic Town (6000).
+const POOLS: [u16; 14] = [
+    2000, 3000, 3001, 3002, 3003, 3004, 3005, 3006, 3007, 3008, 3009, 5000, 5500, 6000,
+];
+
+/// The first person type file the pools made in the original's UserData2
+/// (`User00030.iff`); its import made 2 to 29.
+const FIRST_POOL_FILE: u32 = 30;
+
+/// A `Characters/User%05d.iff` file's number.
+fn user_file(path: &Path) -> Option<u32> {
+    let name = path.file_name()?.to_str()?.to_ascii_lowercase();
+    name.strip_prefix("user")?
+        .strip_suffix(".iff")?
+        .parse()
+        .ok()
+}
+
+/// The person type files in a folder, sorted by path.
+#[expect(clippy::disallowed_methods, reason = "sort paths before using them")]
+fn user_files(characters: &Path) -> Vec<(u32, PathBuf)> {
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(characters)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    paths.sort();
+    paths
+        .into_iter()
+        .filter_map(|path| Some((user_file(&path)?, path)))
+        .collect()
+}
+
+fn recorded_character(path: &Path) -> (Iff, u32) {
+    let iff = Iff::parse(std::fs::read(path).unwrap()).unwrap();
+    let objd = iff.data(iff.all(b"OBJD").next().unwrap());
+    let guid = ObjectDefinition::parse(objd).unwrap().guid;
+    (iff, guid)
+}
+
+/// Read only the pool outcomes the port needs from the capture. The
+/// FAMI member GUIDs identify each file's pool; the files give its
+/// template, clock word and profile. NBRS supplies the non-CRT editor
+/// outcomes. The open creates its own families and neighbors.
+fn recorded_pools(original: &sims_content::Neighborhood, files: &[(u32, PathBuf)]) -> PoolInput {
+    let mut people = BTreeMap::<u16, Vec<PoolPerson>>::new();
+    for (_, path) in files
+        .iter()
+        .filter(|(number, _)| *number >= FIRST_POOL_FILE)
+    {
+        let (character, guid) = recorded_character(path);
+        let family = POOLS
+            .into_iter()
+            .find(|id| original.families[id].members.contains(&guid))
+            .expect("every recorded pool file belongs to a pool");
+        let record = original
+            .neighbors
+            .iter()
+            .flatten()
+            .find(|record| record.guid == guid)
+            .unwrap();
+        let words: &[usize] = match (family, record.person_data[58]) {
+            (5000, _) => &[10, 11, 12, 15, 17, 18, 80, 81, 82],
+            (3000..=3009, 9) => &[9, 10, 11, 12, 15, 17, 18, 56, 57],
+            _ => &[],
+        };
+        people.entry(family).or_default().push(PoolPerson {
+            character,
+            editor_words: words
+                .iter()
+                .map(|&word| (word, record.person_data[word]))
+                .collect(),
+        });
+    }
+    PoolInput {
+        people,
+        loaded_skeletons: ["adult".to_owned(), "child".to_owned()].into(),
+        transition: Some(LotTransition {
+            reload: true,
+            crt_draws: 64,
+        }),
+    }
+}
+
+#[test]
+fn an_opened_neighborhood_matches_the_originals_import() {
+    // Our open of the install's UserData2, from house 0 through Patch
+    // and the five pools, against track 2's second run (SIMS_UD2_AFTER).
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let Some(after) = std::env::var_os("SIMS_UD2_AFTER") else {
+        eprintln!("SIMS_UD2_AFTER not set; skipping");
+        return;
+    };
+    let after = PathBuf::from(after);
+    let output = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("userdata2-opened-{}", std::process::id()));
+    if output.exists() {
+        std::fs::remove_dir_all(&output).unwrap();
+    }
+    copy_directory(&root.join("UserData2"), &output);
+
+    // The GUIDs the original drew, in file order: each made type's file
+    // number follows its draw.
+    let theirs: Vec<(u32, PathBuf)> = user_files(&after.join("Characters"));
+    let original = sims_content::Neighborhood::open(&after).unwrap();
+    let pools = recorded_pools(&original, &theirs);
+    let mut guids = theirs
+        .iter()
+        .filter(|(number, _)| (2..FIRST_POOL_FILE).contains(number))
+        .map(|(_, path)| recorded_character(path).1);
+    let mut crt = CrtRng::from_state(1);
+    for _ in 0..OPEN_DRAWS {
+        crt.next_u15();
+    }
+    let (neighborhood, opened) = open_neighborhood(
+        &root,
+        &root.join("UserData2"),
+        &output,
+        &mut || guids.next().expect("the original drew no more GUIDs"),
+        &|house| std::fs::read(after.join(format!("Houses/House{house:02}.iff"))).ok(),
+        &pools,
+        &mut crt,
+    )
+    .unwrap();
+    assert!(guids.next().is_none(), "the import drew fewer GUIDs");
+    assert_eq!(opened.patch.imports.len(), 6);
+    assert_eq!(opened.patch.next_file, 30);
+    assert_eq!(opened.pools.next_file, 153);
+    assert_eq!(opened.pools.update_draws, 176_444);
+    assert_eq!(opened.pools.townie_draws, 44_096);
+    assert_eq!(opened.pools.tourist_draws, 97_027);
+    assert_eq!(crt.state(), 0x0d1a_a553);
+
+    // The five house files, byte for byte, given the original's leftover
+    // heap bytes.
+    for house in [56, 63, 69, 76, 77] {
+        let name = format!("Houses/House{house}.iff");
+        assert!(
+            std::fs::read(output.join(&name)).unwrap() == std::fs::read(after.join(&name)).unwrap(),
+            "{name} differs"
+        );
+    }
+    // The inventories the view's set-up and each housed import made, which
+    // the pools leave alone.
+    assert_eq!(
+        format!("{:?}", neighborhood.inventories),
+        format!("{:?}", original.inventories)
+    );
+
+    assert_eq!(neighborhood.families.len(), original.families.len());
+    for id in POOLS {
+        assert_eq!(
+            neighborhood.families[&id], original.families[&id],
+            "family {id}"
+        );
+    }
+    assert_eq!(neighborhood.options, original.options);
+    assert_eq!(neighborhood.neighbors.len(), 444);
+    assert_eq!(neighborhood.neighbors.len(), original.neighbors.len());
+    for (slot, (ours, theirs)) in neighborhood.neighbors[321..]
+        .iter()
+        .zip(&original.neighbors[321..])
+        .enumerate()
+    {
+        assert_eq!(ours, theirs, "pool record {}", 322 + slot);
+    }
+
+    let house = output.join("Houses/House69.iff");
+    let frames = Frames::parse(RECORDED_FRAMES).unwrap();
+    // Run 2's handoff, as fitted: the adult skeleton read and the
+    // indicators made before the lot load.
+    let handoff = Handoff {
+        skeletons_read: ["adult".to_owned()].into(),
+        indicators_made: true,
+    };
+    let lot =
+        Lot::load_after_pools(&root, neighborhood, &house, &[2; 8], frames, crt, &handoff).unwrap();
+    assert!(lot.load_report().finished.is_some());
+    assert_eq!(lot.world().crt_rng.state(), 3_739_951_803);
+    assert_eq!(lot.world().hash_hex(), IMPORTED_69);
+    assert_eq!(digest(&format_30_bytes(lot.world())), IMPORTED_69_30);
+    std::fs::remove_dir_all(&output).unwrap();
 }
 
 #[test]
@@ -332,9 +681,21 @@ fn the_selected_goth_lists_pie_menus_and_picks_from_them() {
     // action string with a token, whose formatter is not ported. The lot
     // is as it was.
     let before = lot.world().hash();
-    let refused = lot.pie_menu(sim, 10).unwrap_err().to_string();
-    assert!(refused.contains("0x44bf1a"), "{refused}");
+    let refused = lot.pie_menu(sim, 10).unwrap_err();
+    assert!(refused.to_string().contains("0x44bf1a"), "{refused}");
     assert_eq!(lot.world().hash(), before);
+    // The check tree's fault keeps its trap, here something not ported.
+    let sims_vm::boot::OrderError::Refused(fault) = &refused else {
+        panic!("{refused:?}");
+    };
+    let sims_vm::Trap::CheckTree { fault: inner, .. } = &fault.trap else {
+        panic!("{fault:?}");
+    };
+    assert!(
+        matches!(&inner.trap, sims_vm::Trap::Unsupported(m) if m.contains("0x44bf1a")),
+        "{fault}"
+    );
+    assert!(fault.trap.unported());
     // Object 18's check tree reads the advertisement record (scope 12)
     // before Find Best Interaction first copies into it: the game's start
     // left it zeroed.
@@ -501,6 +862,88 @@ fn reaching_a_pie_entry_checks_its_action_again() {
     };
     assert!(lot.highlight(sim, gone).is_err());
     assert_eq!(lot.world().hash(), before);
+}
+
+/// At tick 1500 of the Goth house, person 18 runs menu 1 of object 217,
+/// which may be joined. Its pie menu on another person ends with the offer
+/// to join it (0x45866d, 0x41ee99), whose caller is that person; picking
+/// it queues the offer on that person, who takes it up and keeps its join
+/// word while it runs.
+#[test]
+fn the_pie_menu_on_another_goth_offers_to_join_what_i_run() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut lot = Lot::load(&root, &house, &[3, 3], Frames::default()).unwrap();
+    while lot.ticks() < 1500 {
+        lot.step().unwrap_or_else(|e| panic!("{e}"));
+    }
+    let (me, other) = (18, 16);
+    let running = |lot: &Lot, id: u16| {
+        lot.world().objects[&id]
+            .person
+            .as_ref()
+            .unwrap()
+            .active
+            .clone()
+    };
+    let mine = running(&lot, me);
+    assert_eq!((mine.target, mine.table_index), (217, 1));
+    let menu = lot.pie_menu(me, other).unwrap_or_else(|e| panic!("{e}"));
+    let (offer, entries) = menu.entries.split_last().unwrap();
+    assert!(
+        entries
+            .iter()
+            .all(|e| e.action.join == 0 && e.action.caller == me as i16)
+    );
+    let offer = offer.action.clone();
+    assert_eq!(
+        (
+            offer.join,
+            offer.caller,
+            offer.target,
+            offer.table_index,
+            offer.args,
+            offer.priority,
+            offer.flags & 0x1c,
+        ),
+        (1, other as i16, 217, 2, [0, 0, me as i16, 0], 50, 0xc)
+    );
+    // Picking it queues it on the other person, not on me.
+    let mine_queued = lot.world().objects[&me]
+        .person
+        .as_ref()
+        .unwrap()
+        .queue
+        .len();
+    let uid = lot
+        .pick(me, offer.clone())
+        .unwrap_or_else(|e| panic!("{e}"))
+        .expect("queued");
+    assert_eq!(
+        lot.world().objects[&me]
+            .person
+            .as_ref()
+            .unwrap()
+            .queue
+            .len(),
+        mine_queued
+    );
+    let queue = &lot.world().objects[&other].person.as_ref().unwrap().queue;
+    assert!(queue.iter().any(|a| a.uid == uid && a.join == 1));
+    // The other person starts it: Idle For Input's check passes the join's
+    // arguments, and the running action keeps its join word.
+    for _ in 0..100 {
+        lot.step().unwrap_or_else(|e| panic!("{e}"));
+    }
+    let joined = running(&lot, other);
+    assert_eq!(
+        (joined.uid, joined.join, joined.target, joined.table_index),
+        (uid, 1, 217, 2)
+    );
 }
 
 #[test]
@@ -835,45 +1278,82 @@ const TICK_3912_30: &str = "869973a29b9ec91cb38a0a5c3dc461315dcadc2034942635bd27
 /// the end.
 const TICK_3912_29: &str = "4709b76086b6c75eb736f45d20bae15272df19352656c1a8a53312d73c23a162";
 /// The same at tick 9906.
-const TICK_9906: &str = "216bdf3e88270625c5a8af9b13872c6168642e855ad5cd81a5fa9a16c9425e01";
+const TICK_9906: &str = "cd6bf73af970a9fb740e063ad6f2f52614f525c8fb85d413fe6f4910dc9c83f5";
 /// The same state's hash under snapshot format 30, which had no person
 /// types whose portrait the interface built ([`sims_sim::World::portraits`])
 /// at the end.
-const TICK_9906_30: &str = "f323956e4f37085572651410c13ca52d3e15a7a9d78123a1c219149ee7e871fe";
+const TICK_9906_30: &str = "0729bdb1be01619a16bdfb2852da323bf1237ecc1bf8bfa156ea52b75a506992";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
-const TICK_9906_29: &str = "344de11cfa7fe1181f731dba94d0b501e3777d169f1fecdc3c1cad04a9aedc38";
+const TICK_9906_29: &str = "458debd6fa82f9cd865b4334cdd950af01942ee517cf039657728eb6422a54f2";
 /// The same at tick 20186.
-const TICK_20186: &str = "b97d51c3d4d54eeb49bcb97bf623ba9b0e8534c992b2b5f9b64451066d58c606";
+const TICK_20186: &str = "20c02362265912d3469be08f31e90e6bfecd59ddd33db3332e1b4be3da0ae0bb";
 /// The same state's hash under snapshot format 30, which had no person
 /// types whose portrait the interface built ([`sims_sim::World::portraits`])
 /// at the end.
-const TICK_20186_30: &str = "0185475fce351b2e8b459e16dc55cd40ab919b40fb322e9ac6efc116309fe57b";
+const TICK_20186_30: &str = "5ee29d0a10fc9f489b1cb1c76025ec81bcebc77fbf5c508072bf867c48dce5bb";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
-const TICK_20186_29: &str = "6ead1bb05af619268565b915d4f00ac2e1ac5649e03ee6ce1f075926cd9cec58";
+const TICK_20186_29: &str = "a282f437760e7a7b5308007acc06d094a26bf6a563f7bc9863ac5d1b3013d80e";
 /// The same at tick 31478, when the day turns.
-const TICK_31478: &str = "d7cd7e1ad0cca83dcf69d1e4c7e9039ddbe01b2bad59081f2c0ca90991c4f5c4";
+const TICK_31478: &str = "24525b0793fb324f16704e9658d1d19a0787009e9cb88d3044637755b3e73875";
 /// The same state's hash under snapshot format 30, which had no person
 /// types whose portrait the interface built ([`sims_sim::World::portraits`])
 /// at the end.
-const TICK_31478_30: &str = "34cfca302c1a9b9392b3fcabee36deacdecca0f198df291215abadc0dfe0bc4d";
+const TICK_31478_30: &str = "3216df89133960f7ea56d3456874226daa4ac3a540c1a958357a0acd4d4a584b";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
-const TICK_31478_29: &str = "fc3480edf33f5a146bf2541956ee129cd0200203ae66069e6c763a6835b8f8ed";
+const TICK_31478_29: &str = "8b7ae0ca751002b0ee36bd32ba0f921c494bebf77fba4a27f50e84fdc3754091";
+/// Where to start the C runtime's generator for House 69's load in track
+/// 2's second run: state 1 after this many draws, fitted so that our
+/// load's own 4,730 draws reach the recording's entry state (state 1 after
+/// 405,850 draws). It is the offset for booting from the original's own
+/// files with [`Lot::load_with`], so it stands for the open's import and
+/// pools and for any of our load's draws the original makes earlier
+/// (the indicators, the adult skeleton). That the generator ran on from
+/// state 1 with no reseed is assumed, not observed.
+const FILE_BOOT_DRAWS: u32 = 401_120;
+/// Where our open of run 2 starts the C runtime: state 1 after this many
+/// draws, fitted so that the first pool person's GUID low word and traits
+/// are the original's. It stands for startup, the neighborhood view and
+/// the `Patch` import, which our open does not draw for. That the
+/// generator ran on from state 1 with no reseed is assumed, not observed.
+const OPEN_DRAWS: u32 = 84_947;
+/// The frames track 2's House 69 recordings drew: after updates 0 to 2,
+/// 29, 59, 89, 101 and 102, then every 30th from 123
+/// (`house69-ud2-ticks-20261120/watch.jsonl`, the frame watch outside
+/// an update).
+const RECORDED_FRAMES: &str = "0,1,2,29,59,89,101,102,123+30";
+/// The imported House 69's state at entry (format 31), a regression pin of
+/// our run. Track 2's recording of it (`house69-ud2-ticks-20261120`)
+/// differs at entry in object 2's last result; see the decision
+/// `20261120-ud2-house-69-boots-from-the-originals-import.md` for what
+/// the comparison reads and skips.
+const IMPORTED_69: &str = "c3aa7898c77f65abbae84bb6d5c7a6669b697492f5350ec5334902a5c20d43a6";
+/// The same state's hash under snapshot format 30, which had no person
+/// types whose portrait the interface built ([`sims_sim::World::portraits`])
+/// at the end.
+const IMPORTED_69_30: &str = "647c524ea5e613ef5d94a2398525f0f3004ce7921af4ba278ee704c321722f29";
+/// The same after 1000 ticks, with the recording's frames: a regression
+/// pin, which differs from the recording's update 1000 in object 2's last
+/// result.
+const IMPORTED_69_1000: &str = "122eb0bc6a8551178e2c87a168ebfaa0bde9d7901939e33a95af4d2421eea8fa";
+/// The same state's hash under snapshot format 30.
+const IMPORTED_69_1000_30: &str =
+    "c4aaebafe6a691b3e16e0adc650bd1c7803c14bb8ff4ce417c9e9d3ca33cbad0";
 /// The same at tick 43200, a whole day from the load.
-const TICK_43200: &str = "353ba04857127a4b06df90d1c8e4996eb0022690df1b8a6316691250e6d99fd8";
+const TICK_43200: &str = "00fbe95013dd9e8141e90c1de725db049dfc5967933a9ca07db28e397122103c";
 /// The same state's hash under snapshot format 30, which had no person
 /// types whose portrait the interface built ([`sims_sim::World::portraits`])
 /// at the end.
-const TICK_43200_30: &str = "d26a6a16a451728e40c9b6ada581665a4dfae60ddc7cd8ab306649e3eac14bb0";
+const TICK_43200_30: &str = "b67d0c132d35c3579bdc28dfc91fd4476c755c76c6efa18a881615c33fda41e2";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
-const TICK_43200_29: &str = "693eb621859e6301a85064667b2f697684d3922fad1159a1a665dc67e323f256";
+const TICK_43200_29: &str = "267bf9b3850d59968acabe44f27c97d4293c9ea533df4df20b18848630a45bd0";
 
 #[test]
 fn strict_mode_runs_the_goth_houses_whole_day() {
@@ -1156,42 +1636,42 @@ fn the_goth_day_under_the_recordings_frames_keeps_its_streams() {
 // with that save left out, the earlier pins all held.
 
 /// The Newbies' house (House07) after 1802 updates, with `--answers 3`.
-const NEWBIE_1802: &str = "a3d6c372601612ec222692ed6e5208f9a00820f8166eb189b6f0d61dade70269";
+const NEWBIE_1802: &str = "db81050f8a226c22fda89496a8485387f772ecb33480d53c5e2207532ecd2ac0";
 /// The same state's hash under snapshot format 30, which had no person
 /// types whose portrait the interface built ([`sims_sim::World::portraits`])
 /// at the end.
-const NEWBIE_1802_30: &str = "c397370c8585740aaff3dac3f5bc359d53ed94f40e77ac180050ba567bbc04fc";
+const NEWBIE_1802_30: &str = "87e686fc5db2ece81643b2c87505e4c1589441acf30022c1cb4d977f96a89593";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
-const NEWBIE_1802_29: &str = "5ffaaac2956a18cfd478b80897d74c6240f94968ce0e2f91ea28129a96e5ecb9";
+const NEWBIE_1802_29: &str = "41b1b65f24bb01bf31171825fc963936d786a77ddf8375b860eac46cf8b24ce2";
 /// The same state's hash under snapshot format 28, which had no record
 /// of the people whose animator was asked to stop its route
 /// ([`sims_sim::World::stops_asked`]) at the end.
-const NEWBIE_1802_28: &str = "e72ece6d1a408b1f0a9f2f07e325ccea5750440ef072da2dadb4ddf9049ee5ff";
+const NEWBIE_1802_28: &str = "2a2d5d3e9f9bea42598e7efc8b424d84338f16db99682958d71b2b0cb4ac6d42";
 /// The same state's hash under snapshot format 27, which had no poses
 /// the load left in the skins ([`sims_sim::World::held_poses`]) either.
-const NEWBIE_1802_27: &str = "a6321d66ebfffedb8d11815266050f55d91e3f472519d3fc78338ae5300ddc54";
+const NEWBIE_1802_27: &str = "5055fe7a40f7c1ade093d0748e7294bf92251264d4452304a8601eac89d341fc";
 /// The same state's hash under snapshot format 26.
-const NEWBIE_1802_26: &str = "12cc6cdec085b56e02b84b76b5e585ee01aba4b5ac685476ba62f59ae5b5dcb0";
+const NEWBIE_1802_26: &str = "db8b8f44bbc8273bcfb0b13e6ba1d405d5cfc78b4c6ec70d7483d240289c7af4";
 /// The Newbies' house after 4052 updates, the last whose frame strict
 /// mode draws.
-const NEWBIE_4052: &str = "8d2d04cc1407efedffdec3d7f01bbdaa375a350500fa67442ecab3a8e0292f58";
+const NEWBIE_4052: &str = "330dc7e29a0fdff17b58601f3f0ff0190430ac430e933757264d8f450cd9b33e";
 /// The same state's hash under snapshot format 30, which had no person
 /// types whose portrait the interface built ([`sims_sim::World::portraits`])
 /// at the end.
-const NEWBIE_4052_30: &str = "e5aab4b1952c8105fcb755965a505813f0c30d5fad99c993e2483076180c0bf5";
+const NEWBIE_4052_30: &str = "161e7f3ce888e5ff2f4dc3257998cde6ec3ddd3eb2e1c23c728e63dad0de7f65";
 /// The same state's hash under snapshot format 29, which had no person
 /// types made while the game runs ([`sims_sim::World::characters`]) at
 /// the end.
-const NEWBIE_4052_29: &str = "e5487823c9720cf5f543cdfc3b61ada1f3951c7f737b16514131f9b72f8f9620";
+const NEWBIE_4052_29: &str = "d98344ac74d997ccd7e795052582aec11ce493fc5ac2a0bf0f9ae78ad349a80b";
 /// The same state's hash under snapshot format 28, which had no record
 /// of the people whose animator was asked to stop its route
 /// ([`sims_sim::World::stops_asked`]) at the end.
-const NEWBIE_4052_28: &str = "10f36f32f90e6fa870856228b1f4da42d0884a2141f7f85136a5475ee9f8d7c8";
+const NEWBIE_4052_28: &str = "13c57c305ad63fc916977d987443e251f954254245e6cbaa66916c28768c291e";
 /// The same state's hash under snapshot format 27, which had no poses
 /// the load left in the skins ([`sims_sim::World::held_poses`]) either.
-const NEWBIE_4052_27: &str = "3c963dcfc9902a97aa02bef939b8ccf2dbf0dea19af97ab584f82730c190e724";
+const NEWBIE_4052_27: &str = "9f09c38494febb26e5951e1e49a1a6fcfd389c19a5d2ffdac219557bd3b69fd2";
 
 #[test]
 fn a_newbie_gives_up_on_a_route_with_its_failure_feedback() {

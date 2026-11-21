@@ -325,6 +325,7 @@ mod tests {
         // `Debug` calls every NaN alike; two runs reach the same state
         // only when the bits are the same.
         let action = |bits: u32| Interaction {
+            join: 0,
             uid: 0,
             caller: 0,
             target: 0,

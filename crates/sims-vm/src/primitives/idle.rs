@@ -156,9 +156,7 @@ impl Machine<'_, '_> {
         let flow = self.check_and_start(action, target, index, &mut saved);
         // The temps go back however the start ended (0x4582dd, also on
         // the original's unwinding, 0x64e050).
-        if let Some(temps) = saved {
-            self.me_mut()?.temps = temps;
-        }
+        self.put_back_temps(saved)?;
         flow
     }
 
@@ -169,7 +167,7 @@ impl Machine<'_, '_> {
         mut action: sims_formats::saved_objects::Interaction,
         target: u16,
         index: usize,
-        saved: &mut Option<Vec<i16>>,
+        saved: &mut crate::autonomy::SavedTemps,
     ) -> Result<Flow, Trap> {
         let me = self.me;
         self.check_chosen(&mut action, saved, None)?;
@@ -198,9 +196,9 @@ impl Machine<'_, '_> {
         } else {
             self.interpreter()
                 .callback(self.world, target, CANCELLED, me as i16)
-                .map_err(|fault| {
-                    Trap::Unsupported(format!(
-                        "cancelling a queued action on object {target} (0x45dcc8): {fault}"
+                .map_err(|fault: crate::fault::Fault| {
+                    fault.unsupported_in(format!(
+                        "cancelling a queued action on object {target} (0x45dcc8)"
                     ))
                 })?;
             Flow::Yield

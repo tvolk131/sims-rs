@@ -254,7 +254,7 @@ impl Machine<'_, '_> {
         let kind = operands[5] & 0x7f;
         if answers(kind).is_none() {
             return Err(Trap::Unsupported(format!(
-                "Dialog kind {kind} (operand 5) is {}, which is not ported",
+                "Dialog kind {kind} (operand 5) is {}, which is not ported (0x451552)",
                 if kind == 3 {
                     "a dialog that asks for text"
                 } else {

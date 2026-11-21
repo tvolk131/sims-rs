@@ -45,6 +45,8 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
     // between them.
     let mut ticked = Vec::new();
     let mut failed = None;
+    // In play mode, what a tick that failed did before it failed.
+    let mut stopped_update = None;
     if options.ticks > 0 && lot.load_report().finished.is_none() {
         return Err("ticks were asked for, but the load did not complete".into());
     }
@@ -67,6 +69,13 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
                 } = &error
                 {
                     ticked.push((**update).clone());
+                }
+                if let StepError::Tick {
+                    update: Some(update),
+                    ..
+                } = &error
+                {
+                    stopped_update = Some((**update).clone());
                 }
                 failed = Some(error.to_string());
                 break;
@@ -221,8 +230,10 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
         );
     }
     if options.play {
-        let errors: Vec<_> = ticked.iter().flat_map(|u| &u.errors).collect();
-        let frames: Vec<_> = ticked.iter().flat_map(|u| &u.frame_errors).collect();
+        // The tick that failed counts here, though not as a tick ran.
+        let steps = || ticked.iter().chain(&stopped_update);
+        let errors: Vec<_> = steps().flat_map(|u| &u.errors).collect();
+        let frames: Vec<_> = steps().flat_map(|u| &u.frame_errors).collect();
         let _ = writeln!(
             out,
             "Play:    {} errors caught, {} frames skipped{}",
@@ -235,7 +246,7 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
         );
         let mut played = std::collections::BTreeMap::<&str, usize>::new();
         let mut stopped = 0;
-        for event in ticked.iter().flat_map(|u| &u.sounds) {
+        for event in steps().flat_map(|u| &u.sounds) {
             match event {
                 SoundEvent::Play { name, .. } => *played.entry(name).or_default() += 1,
                 SoundEvent::Stop { .. } => stopped += 1,

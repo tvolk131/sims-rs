@@ -292,10 +292,10 @@ impl Machine<'_, '_> {
                             TURN_BUDGET,
                             self.checking,
                         )
-                        .map_err(|fault| {
-                            Trap::Unsupported(format!(
+                        .map_err(|fault: crate::fault::Fault| {
+                            fault.unsupported_in(format!(
                                 "Create New Object Instance: the \"init visitor\" tree \
-                                 {tree:#06x} of person {created}: {fault}"
+                                 {tree:#06x} of person {created}"
                             ))
                         })?;
                 }
@@ -335,8 +335,8 @@ impl Machine<'_, '_> {
     fn make(&mut self, guid: u32) -> Result<u16, Trap> {
         self.interpreter()
             .create(self.world, guid)
-            .map_err(|fault| {
-                Trap::Unsupported(format!("creating an object of type 0x{guid:08X}: {fault}"))
+            .map_err(|fault: crate::fault::Fault| {
+                fault.unsupported_in(format!("creating an object of type 0x{guid:08X}"))
             })
     }
 
@@ -355,8 +355,9 @@ impl Machine<'_, '_> {
     /// (0x4ceceb) is presentation.
     fn make_person(&mut self, guid: u32) -> Result<u16, Trap> {
         let interpreter = self.interpreter();
-        let unsupported =
-            |fault| Trap::Unsupported(format!("creating a person of type 0x{guid:08X}: {fault}"));
+        let unsupported = |fault: crate::fault::Fault| {
+            fault.unsupported_in(format!("creating a person of type 0x{guid:08X}"))
+        };
         let id = interpreter
             .create_person(self.world, guid)
             .map_err(unsupported)?;
@@ -812,13 +813,13 @@ impl Machine<'_, '_> {
                 if now == wanted {
                     break;
                 }
-                interpreter
-                    .turn_group(self.world, created, 1)
-                    .map_err(|fault| {
-                        Trap::Unsupported(format!(
-                            "Create New Object Instance turning group {created}: {fault}"
+                interpreter.turn_group(self.world, created, 1).map_err(
+                    |fault: crate::fault::Fault| {
+                        fault.unsupported_in(format!(
+                            "Create New Object Instance turning group {created}"
                         ))
-                    })?;
+                    },
+                )?;
             }
             return Ok(());
         }
@@ -835,13 +836,13 @@ impl Machine<'_, '_> {
             if now == wanted {
                 break;
             }
-            interpreter
-                .turn_one(self.world, created, 1)
-                .map_err(|fault| {
-                    Trap::Unsupported(format!(
-                        "Create New Object Instance turning object {created}: {fault}"
+            interpreter.turn_one(self.world, created, 1).map_err(
+                |fault: crate::fault::Fault| {
+                    fault.unsupported_in(format!(
+                        "Create New Object Instance turning object {created}"
                     ))
-                })?;
+                },
+            )?;
         }
         Ok(())
     }
@@ -859,9 +860,9 @@ impl Machine<'_, '_> {
         dynamic: bool,
     ) -> Result<bool, Trap> {
         let interpreter = self.interpreter();
-        let unsupported = |fault| {
-            Trap::Unsupported(format!(
-                "Create New Object Instance placing object {created}: {fault}"
+        let unsupported = |fault: crate::fault::Fault| {
+            fault.unsupported_in(format!(
+                "Create New Object Instance placing object {created}"
             ))
         };
         let fits = match place.container {

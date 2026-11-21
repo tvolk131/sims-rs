@@ -235,6 +235,97 @@ impl People {
     }
 }
 
+/// The skeleton the definition `guid` names: the first of its body
+/// strings (the string table its word 19 names, 0x457f60). Unlike
+/// [`People::load`], this reads any definition, such as the pools'
+/// person templates, whose OBJD types are not 2.
+pub fn skeleton_name(index: &Index, catalog: &Catalog, guid: u32) -> Result<String> {
+    let object = catalog
+        .object(guid)
+        .ok_or_else(|| Error::Unsupported(format!("no definition has the GUID {guid:#010x}")))?;
+    let resource = &index.resources[object.resource];
+    let body = body_strings(index, resource, object.chunk)?;
+    body.get(0, 1)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            Error::Unsupported(format!(
+                "{}: the definition's body strings name no skeleton",
+                resource.location(&index.root)
+            ))
+        })
+}
+
+/// The bone scales of the skeleton named `name`, looked up as 0x5a0384
+/// does: by the name as given (0x5a2099), compared byte for byte
+/// (0x5a280f). Registration keeps each name's case (0x59f163, 0x59e899,
+/// 0x59fd58), so `Adult` and `adult` are two skeletons.
+///
+/// A name registered twice keeps its first registration. Registration
+/// looks the name up first (0x59f132). For a name already registered
+/// with its skeleton read, the new skeleton is let go (0x59f18c,
+/// 0x598d8a). An entry not yet read (+0x30 null, as an index's entry
+/// is) takes the new one instead (0x5a2207); index entries are not
+/// modelled. The insert itself keeps an existing key (0x5a2b30).
+///
+/// The files are those `People::load` searches, in its order:
+/// `GameData/Animation`'s archives, then the indexed object directories.
+/// Each is read record by record through its skeleton group, so a file
+/// that also holds suits or animations still counts. That is not the
+/// original's search or order, which registers `GameData/Skins` eagerly
+/// and reads `Animation.ndx` (a follow-up).
+///
+/// Fails, naming the file, when no file defines the name (the miss,
+/// 0x5a03c0), or when a file searched before the name is found does not
+/// decode, since it could hold the name.
+pub fn skeleton_scales(install: &Install, index: &Index, name: &str) -> Result<Vec<i32>> {
+    let files = avatar_files(install, index)?;
+    first_skeleton(
+        files
+            .iter()
+            .map(|resource| Ok((resource.location(&install.root), resource.read()?))),
+        name,
+    )
+}
+
+/// [`skeleton_scales`] over `files`, each a location and its bytes, in
+/// registration order.
+fn first_skeleton<B: AsRef<[u8]>>(
+    files: impl IntoIterator<Item = Result<(String, B)>>,
+    name: &str,
+) -> Result<Vec<i32>> {
+    for file in files {
+        let (location, bytes) = file?;
+        let unreadable = |error: sims_formats::Error| {
+            Error::Unsupported(format!(
+                "0x5a0384: the skeletons of {location} do not decode ({error}), \
+                 so whether it defines {name:?} is unknown"
+            ))
+        };
+        let mut catalog = Binary::new(bytes.as_ref());
+        let count = catalog
+            .count(Kind::Skeleton)
+            .map_err(unreadable)?
+            .unwrap_or(0);
+        for _ in 0..count {
+            let Asset::Skeleton(skeleton) = catalog.read(Kind::Skeleton).map_err(unreadable)?
+            else {
+                continue;
+            };
+            if skeleton.name == name {
+                return Ok(skeleton
+                    .bones
+                    .iter()
+                    .map(|b| b.wiggle.gradient_scale)
+                    .collect());
+            }
+        }
+    }
+    Err(Error::Unsupported(format!(
+        "0x5a03c0: no skeleton file defines the skeleton {name:?}"
+    )))
+}
+
 /// The body strings of the person definition `chunk` of a character
 /// file.
 fn body_strings(index: &Index, resource: &Resource, chunk: u16) -> Result<StringTable> {
@@ -399,6 +490,52 @@ mod tests {
         }
         bytes.extend(tail);
         bytes
+    }
+
+    /// An avatar file holding the one-bone skeletons `skeletons`, each a
+    /// name and its bone's scale, and no suits.
+    fn skeletons(skeletons: &[(&str, i32)]) -> Vec<u8> {
+        let string = |bytes: &mut Vec<u8>, text: &str| {
+            bytes.push(text.len() as u8);
+            bytes.extend(text.as_bytes());
+        };
+        let mut bytes = (skeletons.len() as u32).to_le_bytes().to_vec();
+        for &(name, scale) in skeletons {
+            string(&mut bytes, name);
+            bytes.extend(1u32.to_le_bytes());
+            string(&mut bytes, "ROOT");
+            string(&mut bytes, "NULL");
+            bytes.extend(0u32.to_le_bytes()); // no properties
+            for value in [0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0] {
+                bytes.extend(value.to_le_bytes()); // translation, rotation
+            }
+            bytes.extend([0u8; 12]); // flags
+            bytes.extend(scale.to_le_bytes());
+            bytes.extend(0.0f32.to_le_bytes()); // amplitude
+        }
+        bytes.extend(0u32.to_le_bytes()); // no suits
+        bytes
+    }
+
+    #[test]
+    fn a_skeleton_name_registered_twice_keeps_its_first_registration() {
+        let files = [
+            ("a.bcf", skeletons(&[("child", 3)])),
+            ("b.bcf", skeletons(&[("Adult", 5), ("adult", 1)])),
+            ("c.bcf", skeletons(&[("adult", 2)])),
+        ];
+        let lookup = |name: &str| {
+            first_skeleton(
+                files
+                    .iter()
+                    .map(|(file, bytes)| Ok((file.to_string(), bytes.as_slice()))),
+                name,
+            )
+        };
+        assert_eq!(lookup("adult").unwrap(), [1]);
+        assert_eq!(lookup("Adult").unwrap(), [5]);
+        let miss = lookup("ADULT").unwrap_err().to_string();
+        assert!(miss.contains("0x5a03c0"), "{miss}");
     }
 
     #[test]

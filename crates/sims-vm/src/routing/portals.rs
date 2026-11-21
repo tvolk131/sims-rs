@@ -509,6 +509,7 @@ mod tests {
 
     fn interaction() -> Interaction {
         Interaction {
+            join: 0,
             uid: 0,
             caller: 0,
             target: 0,

@@ -112,8 +112,9 @@ impl Machine<'_, '_> {
             unmarked: flags & 4 != 0,
         };
         let interpreter = self.interpreter();
-        let unsupported =
-            |fault| Trap::Unsupported(format!("Find Location For on object {target}: {fault}"));
+        let unsupported = |fault: crate::fault::Fault| {
+            fault.unsupported_in(format!("Find Location For on object {target}"))
+        };
         if mode == 3 || mode == 4 {
             return self.find_in_line(target, mode, flags, local, from, level, rules);
         }
@@ -286,8 +287,9 @@ impl Machine<'_, '_> {
         );
         let direction = if mode == 4 { (facing + 2) % 8 } else { facing };
         let interpreter = self.interpreter();
-        let unsupported =
-            |fault| Trap::Unsupported(format!("Find Location For on object {target}: {fault}"));
+        let unsupported = |fault: crate::fault::Fault| {
+            fault.unsupported_in(format!("Find Location For on object {target}"))
+        };
         let Some(position) = interpreter
             .search_line(self.world, target, from, level, rules, direction)
             .map_err(unsupported)?

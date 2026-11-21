@@ -36,7 +36,7 @@ use crate::fault::{Fault, Trap};
 use crate::interpreter::Interpreter;
 use sims_content::{People, Skeleton};
 use sims_core::CrtRng;
-use sims_formats::saved_objects::{Instance, Objects, Slot};
+use sims_formats::saved_objects::{Frame, Instance, Objects, Slot};
 use sims_sim::neighbors::Neighbors;
 use sims_sim::{Object, World};
 use std::collections::{BTreeMap, BTreeSet};
@@ -89,7 +89,7 @@ pub(crate) struct Draws<'a> {
 }
 
 impl Draws<'_> {
-    fn next(&mut self) -> u16 {
+    pub(crate) fn next(&mut self) -> u16 {
         self.count += 1;
         self.stream.next_u15()
     }
@@ -100,7 +100,7 @@ impl Draws<'_> {
     /// bone whose wiggle scale is not 1 then has its four gradients made
     /// again at that scale: 16 more. The records are for animation, which
     /// is not modeled, so only the draws are kept.
-    fn skeleton(&mut self, scales: &[i32]) {
+    pub(crate) fn skeleton(&mut self, scales: &[i32]) {
         for &scale in scales {
             for _ in 0..if scale == 1 { 32 } else { 48 } {
                 self.next();
@@ -157,6 +157,17 @@ fn grows(guid: u32, expansions: i16) -> bool {
 }
 
 impl Interpreter<'_> {
+    /// Load step 6e with no captured frame arena bits. See
+    /// [`Interpreter::read_objects_with_frame_tree_bits`].
+    pub fn read_objects(
+        &self,
+        world: &mut World,
+        saved: &Objects,
+        people: &People,
+    ) -> Result<SavedRead, Fault> {
+        self.read_objects_with_frame_tree_bits(world, saved, people, &BTreeSet::new())
+    }
+
     /// Load step 6e: reads a house's saved objects onto the lot (0x449c5e).
     /// The lot must hold no objects: the original clears it first.
     ///
@@ -217,11 +228,23 @@ impl Interpreter<'_> {
     /// the one registration gave it; and that the game has read no
     /// skeleton file before its first load but those of
     /// [`READ_BEFORE_THE_FIRST_LOAD`].
-    pub fn read_objects(
+    ///
+    /// At 0x4750f0 the native loader allocates the stack arena and at
+    /// 0x4750fc clears its first four bytes. For each saved frame,
+    /// 0x4746e4/0x4746e8 ORs the old high bit into the word read from ObjM.
+    /// `frame_tree_bits` supplies the set bits from such an arena as
+    /// (saved object ID, zero-based frame index). Other arena bits are
+    /// taken as zero. The first frame's arena bit is always zero, so a
+    /// captured bit on frame 0 fails. That rule is for captured residue
+    /// only: a saved tree word that itself has bit 15 set is read as it
+    /// is (0x4746e8), as the native reader does. The native writer masks
+    /// the bit (0x4746c0), so a save the original wrote has none.
+    pub fn read_objects_with_frame_tree_bits(
         &self,
         world: &mut World,
         saved: &Objects,
         people: &People,
+        frame_tree_bits: &BTreeSet<(u16, usize)>,
     ) -> Result<SavedRead, Fault> {
         let fail = |object, trap| Fault {
             object,
@@ -264,6 +287,24 @@ impl Interpreter<'_> {
                 return Err(fail(id, Trap::Invalid("a saved ID is listed twice".into())));
             }
             order.push(id);
+        }
+        for &(id, index) in frame_tree_bits {
+            if index == 0 {
+                return Err(fail(
+                    id,
+                    Trap::Invalid("0x4750fc clears the first frame's arena tree bit".into()),
+                ));
+            }
+            let frame = objects
+                .get_mut(&id)
+                .and_then(|object| object.stack.get_mut(index))
+                .ok_or_else(|| {
+                    fail(
+                        id,
+                        Trap::Invalid(format!("no saved frame at index {index}")),
+                    )
+                })?;
+            frame.tree |= Frame::TREE_FLAG;
         }
         let next_parts = link_parts(&objects, &order).map_err(|(id, trap)| fail(id, trap))?;
         // Each person's animator, as its read restores it (0x5918ba) and

@@ -50,11 +50,13 @@ mod head;
 mod interpreter;
 mod load;
 mod memory;
+pub mod neighborhood_open;
 mod object_uses;
 mod objects;
 pub mod orders;
 mod people;
 mod person_factory;
+mod pick;
 mod placement;
 pub mod play;
 mod primitives;
@@ -85,7 +87,7 @@ pub use program::{
 };
 pub use selection::selected;
 pub use sounds::SoundEvent;
-pub use tick::{Answers, Player, Shown, TICK_BUDGET, TickError, Update};
+pub use tick::{Answer, Answers, Player, Shown, SkippedFrame, TICK_BUDGET, TickError, Update};
 pub use visits::Visited;
 
 pub type Result<T> = std::result::Result<T, Error>;

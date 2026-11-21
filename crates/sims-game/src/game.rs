@@ -21,10 +21,10 @@ use crate::sound;
 use crate::view::{Move, View};
 use sims_render::{Camera, Canvas, Selected, Walls, open_house};
 use sims_ui::command::{Camera as UiCamera, Command, Speed, Walls as UiWalls};
-use sims_vm::SoundEvent;
 use sims_vm::boot::save::Saved;
 use sims_vm::boot::{Frames, Lot, StepError};
 use sims_vm::play::{Recovery, ScriptError};
+use sims_vm::{SkippedFrame, SoundEvent};
 use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
@@ -126,6 +126,13 @@ pub struct Game {
     /// `clock_us` when the frame was last drawn.
     drawn_us: u64,
     canvas: Canvas,
+    /// The camera the frame last drawn was drawn through, the depth its
+    /// lot left before anything else was drawn, and its IDs once its
+    /// people were drawn, before the objects holding them: what the
+    /// pointer picks from ([`Game::under`]).
+    drawn_camera: Camera,
+    lot_depth: Vec<i32>,
+    people_ids: sims_render::Ids,
 }
 
 impl Game {
@@ -160,6 +167,7 @@ impl Game {
         let mut people = People::open(&options.install, house)?;
         people.refresh(lot.world());
         let view = View::new([800, 600], lot_shape.built_center(), opened.rotation);
+        let drawn_camera = view.camera;
         Ok(Self {
             lot,
             lot_shape,
@@ -180,6 +188,9 @@ impl Game {
             clock_us: 0,
             drawn_us: 0,
             canvas: Canvas::new(1, 1, [0, 0, 0]),
+            drawn_camera,
+            lot_depth: Vec::new(),
+            people_ids: sims_render::Ids::default(),
         })
     }
 
@@ -396,7 +407,7 @@ impl Game {
                 Ok(update) => {
                     ran += 1;
                     let at = self.lot.ticks();
-                    for line in in_order(at == 1, &update.errors, &update.frame_errors) {
+                    for line in in_order(at, &update.errors, &update.frame_errors) {
                         self.errors.push(at, line);
                     }
                     self.keep_sounds(update.sounds);
@@ -408,14 +419,26 @@ impl Game {
                     break;
                 }
                 Err(error) => {
-                    // A strict step whose frame failed after its tick ran
-                    // still made that tick's sounds.
-                    if let StepError::Frame {
-                        update: Some(update),
-                        ..
-                    } = &error
-                    {
-                        self.keep_sounds(update.sounds.clone());
+                    match &error {
+                        // A strict step whose frame failed after its tick
+                        // ran still made that tick's sounds.
+                        StepError::Frame {
+                            update: Some(update),
+                            ..
+                        } => self.keep_sounds(update.sounds.clone()),
+                        // A play step whose tick failed hands back what
+                        // it caught and made before the failure.
+                        StepError::Tick {
+                            tick,
+                            update: Some(update),
+                            ..
+                        } => {
+                            for line in in_order(*tick, &update.errors, &update.frame_errors) {
+                                self.errors.push(*tick, line);
+                            }
+                            self.keep_sounds(update.sounds.clone());
+                        }
+                        _ => {}
                     }
                     self.stop(&error);
                 }
@@ -489,13 +512,17 @@ impl Game {
             level: w.level,
             room: w.room.unwrap_or(NO_ROOM),
         });
-        sims_render::draw(
+        // The lot, then the people, then the objects that hold someone
+        // (a bench a Sim sits on), as the original's frame does.
+        sims_render::draw_lot(
             world,
             &self.lot_shape,
             &mut self.assets,
             &self.view.camera,
             &mut self.canvas,
         );
+        self.drawn_camera = self.view.camera;
+        self.lot_depth.clone_from(&self.canvas.depth);
         // The plumb bob spins by the game's clock in milliseconds (the
         // original's 0x6e54e0); here the time passed in, which runs on
         // while the lot is paused or a dialog waits (**unverified**
@@ -504,6 +531,16 @@ impl Game {
         let milliseconds = (self.clock_us / 1000) as u32;
         self.people.set_clock(milliseconds);
         self.people.draw(world, &self.view.camera, &mut self.canvas);
+        // Who the pick notes: the people as drawn, before a bench they sit
+        // on draws over them.
+        self.people_ids.take(&self.canvas);
+        sims_render::draw_held(
+            world,
+            &self.lot_shape,
+            &mut self.assets,
+            &self.view.camera,
+            &mut self.canvas,
+        );
         // The pie menu shows the head of the Sim it is for, as posed now.
         if let Some(menu) = &mut self.hud.menu {
             menu.head = match self.people.head(world, menu.person, menu.face_size()) {
@@ -528,6 +565,9 @@ impl Game {
             status.as_deref(),
             &mut self.canvas,
         );
+        // The help balloon closed by the selection's going.
+        let sounds = self.hud.take_sounds();
+        self.keep_sounds(sounds);
         let problems = self.hud.take_problems();
         self.people.note(problems);
     }
@@ -584,12 +624,34 @@ impl Game {
     pub fn press(&mut self, point: [i32; 2]) -> Outcome {
         let cleared = self.note.take().is_some();
         if self.hud.covers(point) {
+            // Choosing an entry checks it again first: the pie's
+            // button-up handler (0x5eb433) tells the house view about the
+            // entry under the pointer as chosen (0x1ac with 1), and the
+            // house view runs its check (0x48df28) as it does when the
+            // pointer reaches the entry. The original chooses at the
+            // button's release; the window chooses at the press, as it
+            // did before this check was ported.
+            if let Some(entry) = self.hud.menu.as_ref().and_then(|m| m.highlighted(point)) {
+                self.check_entry(entry);
+            }
+            // A failed check's note stays in front of what the choice
+            // says.
+            let failed = self.note.take();
             // The menu, whose entries a choice is an index into.
             let menu = self.hud.menu.clone();
-            let outcome = match self.hud.press(point) {
+            let outcome = match self
+                .hud
+                .press(point, self.lot.world(), self.lot.residential())
+            {
                 Some(command) => self.command(command, menu.as_ref()),
                 None => Outcome::redraw(),
             };
+            if let Some(failed) = failed {
+                self.note = Some(match self.note.take() {
+                    Some(note) => format!("{failed} {note}"),
+                    None => failed,
+                });
+            }
             let sounds = self.hud.take_sounds();
             self.keep_sounds(sounds);
             return outcome;
@@ -656,7 +718,17 @@ impl Game {
             return false;
         }
         self.highlighted = entry;
-        let Some((i, Some(action))) = entry.map(|i| (i, menu.entries[i].action.clone())) else {
+        entry.is_some_and(|i| self.check_entry(i))
+    }
+
+    /// Checks again the action of the open pie menu's entry `i`
+    /// (0x48df28, `Lot::highlight`), keeping the action the check leaves
+    /// for choosing it. True if the check ran.
+    fn check_entry(&mut self, i: usize) -> bool {
+        let Some(menu) = &self.hud.menu else {
+            return false;
+        };
+        let Some(action) = menu.entries.get(i).and_then(|e| e.action.clone()) else {
             return false;
         };
         if self.stopped.is_some() {
@@ -675,10 +747,17 @@ impl Game {
         true
     }
 
-    /// The person or object shown at `point` on the lot in the frame last
-    /// drawn.
+    /// The person or object the pointer at `point` is on in the frame
+    /// last drawn, by the original's pointer pick ([`pick::at`]).
     pub fn under(&self, point: [i32; 2]) -> Option<u16> {
-        pick::at(self.lot.world(), &self.canvas, point)
+        pick::at(
+            &self.lot,
+            &self.drawn_camera,
+            &self.canvas,
+            &self.lot_depth,
+            &self.people_ids,
+            point,
+        )
     }
 
     /// Lists the selected Sim's pie menu on `object` (`Lot::pie_menu`,
@@ -785,17 +864,26 @@ impl Game {
 
     /// Queues `entry` of the pie menu on `object` for `person`, as
     /// choosing it does: the action the simulation offered
-    /// (`Lot::pick`), or for a fallback entry the entry's menu number
-    /// (`Lot::queue_interaction`).
+    /// (`Lot::pick`, on the action's caller), or for a fallback entry the
+    /// entry's menu number (`Lot::queue_interaction`).
     fn order(&mut self, person: u16, object: u16, entry: &menu::Entry) {
         let label = &entry.label;
+        // A picked action is queued on its caller: `person`, but for the
+        // offer to join `person`'s running interaction.
+        let on = entry
+            .action
+            .as_ref()
+            .and_then(|a| u16::try_from(a.caller).ok())
+            .unwrap_or(person);
         let queued = match &entry.action {
             Some(action) => self.lot.pick(person, action.clone()),
             None => self.lot.queue_interaction(person, object, entry.menu),
         };
         self.note = Some(match queued {
-            Ok(Some(_)) => format!("Queued \"{label}\" for person {person}."),
-            Ok(None) => format!("Person {person}'s queue is full; \"{label}\" was not queued."),
+            Ok(Some(_)) => format!("Queued \"{label}\" for person {on}."),
+            // A full queue, an entry gone from the table, or a check
+            // that refused an action run at once.
+            Ok(None) => format!("\"{label}\" was not queued for person {on}."),
             Err(e) => format!("\"{label}\" was not queued: {e}"),
         });
     }
@@ -852,7 +940,10 @@ impl Game {
             self.note = Some(format!("The dialog has no button {button}."));
             return;
         };
-        if let Err(e) = self.lot.answer(answer) {
+        if let Err(e) = self.lot.answer(sims_vm::Answer {
+            status: answer,
+            bitmap_id: Some(sims_ui::dialog::BUTTON as i16),
+        }) {
             self.note = Some(format!("The answer was not taken: {e}"));
             return;
         }
@@ -1086,6 +1177,7 @@ impl Game {
             }
             Command::TogglePanel
             | Command::OpenPanel(_)
+            | Command::Refused { .. }
             | Command::ShowRelations(_)
             | Command::RelationsPage(_)
             | Command::Help(_) => Outcome::redraw(),
@@ -1160,20 +1252,27 @@ fn keep(queue: &mut VecDeque<SoundEvent>, sounds: Vec<SoundEvent>, kept: usize) 
     queue.drain(..over);
 }
 
-/// The lines for one update's caught errors, in the order they happened.
-/// An update lists the frame drawn before the lot's first tick (only on
-/// the `first` step) ahead of the one drawn after its tick, and the
-/// objects' errors happen between the two. On the first step a single
-/// skipped frame could be either; it is taken to be the one before the
-/// tick (the update does not say).
-fn in_order(first: bool, errors: &[ScriptError], frames: &[String]) -> Vec<String> {
-    let before = if first { frames.len().min(1) } else { 0 };
-    let frame = |error: &String| format!("a frame was skipped: {error}");
-    frames[..before]
-        .iter()
+/// The lines for the caught errors of the step that runs the lot's tick
+/// `tick` ([`Lot::ticks`]), in the order they happened: the frame drawn
+/// before the lot's first tick, the objects' errors in the tick, then the
+/// frame drawn after it. A frame's line says which of the two it was,
+/// and not the tick: an object's line starts with the clock's tick count,
+/// which is another count, and the error log takes the same failure at
+/// later ticks for a repeat ([`Errors::push`]).
+fn in_order(tick: u32, errors: &[ScriptError], frames: &[SkippedFrame]) -> Vec<String> {
+    let frame = |frame: &SkippedFrame| match frame.after {
+        0 => format!(
+            "the frame before the first tick was skipped: {}",
+            frame.error
+        ),
+        _ => format!("the frame after the tick was skipped: {}", frame.error),
+    };
+    let before = frames.iter().filter(|frame| frame.after < tick);
+    let after = frames.iter().filter(|frame| frame.after >= tick);
+    before
         .map(frame)
         .chain(errors.iter().map(describe))
-        .chain(frames[before..].iter().map(frame))
+        .chain(after.map(frame))
         .collect()
 }
 
@@ -1305,29 +1404,48 @@ mod tests {
             then: None,
             recovery: Recovery::Reset,
         };
-        let frames =
-            |names: &[&str]| -> Vec<String> { names.iter().map(|n| (*n).to_string()).collect() };
+        let frames = |skipped: &[(u32, &str)]| -> Vec<SkippedFrame> {
+            skipped
+                .iter()
+                .map(|&(after, error)| SkippedFrame {
+                    after,
+                    error: error.to_string(),
+                })
+                .collect()
+        };
         let starts = |lines: Vec<String>| -> Vec<String> {
-            lines.into_iter().map(|l| l[..9].to_string()).collect()
+            lines.into_iter().map(|l| l[..13].to_string()).collect()
         };
         let errors = std::slice::from_ref(&error);
         // The first step: the frame before the tick, the tick, the frame
         // after it.
+        let first = in_order(1, errors, &frames(&[(1, "a"), (0, "b")]));
         assert_eq!(
-            starts(in_order(true, errors, &frames(&["b", "a"]))),
-            ["a frame w", "tick 1, o", "a frame w"]
+            starts(first.clone()),
+            ["the frame bef", "tick 1, objec", "the frame aft"]
         );
-        assert!(in_order(true, errors, &frames(&["b", "a"]))[2].ends_with(": a"));
+        assert_eq!(first[0], "the frame before the first tick was skipped: b");
+        assert_eq!(first[2], "the frame after the tick was skipped: a");
+        // A single frame on the first step says which one it was.
         assert_eq!(
-            starts(in_order(true, errors, &frames(&["b"]))),
-            ["a frame w", "tick 1, o"]
+            starts(in_order(1, errors, &frames(&[(1, "a")]))),
+            ["tick 1, objec", "the frame aft"]
+        );
+        assert_eq!(
+            starts(in_order(1, errors, &frames(&[(0, "b")]))),
+            ["the frame bef", "tick 1, objec"]
+        );
+        // A step that failed hands back the frame before its tick only.
+        assert_eq!(
+            in_order(1, &[], &frames(&[(0, "b")])),
+            ["the frame before the first tick was skipped: b"]
         );
         // Later steps draw only after the tick.
         assert_eq!(
-            starts(in_order(false, errors, &frames(&["a"]))),
-            ["tick 1, o", "a frame w"]
+            in_order(34, &[], &frames(&[(34, "a")])),
+            ["the frame after the tick was skipped: a"]
         );
-        assert!(in_order(false, &[], &[]).is_empty());
+        assert!(in_order(2, &[], &[]).is_empty());
     }
 
     #[test]

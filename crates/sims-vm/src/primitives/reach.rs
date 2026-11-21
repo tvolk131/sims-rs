@@ -423,9 +423,9 @@ impl Machine<'_, '_> {
             .position;
         let position = [p0, p1];
         let interpreter = self.interpreter();
-        let unsupported = |fault| {
-            Trap::Unsupported(format!(
-                "Reach by object {me} moving object {object} into object {container}: {fault}"
+        let unsupported = |fault: crate::fault::Fault| {
+            fault.unsupported_in(format!(
+                "Reach by object {me} moving object {object} into object {container}"
             ))
         };
         if !interpreter
@@ -480,10 +480,10 @@ impl Machine<'_, '_> {
                 crate::TURN_BUDGET,
                 self.checking,
             )
-            .map_err(|fault| {
-                Trap::Unsupported(format!(
+            .map_err(|fault: crate::fault::Fault| {
+                fault.unsupported_in(format!(
                     "Reach: the {name:?} tree {tree:#06x} of object {object}, run by person \
-                     {me}: {fault}"
+                     {me}"
                 ))
             })?;
         Ok(())
