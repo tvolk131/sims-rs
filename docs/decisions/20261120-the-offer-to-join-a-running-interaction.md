@@ -127,10 +127,12 @@ Picking an entry queues its action on the action's caller (0x48ddbe,
   code only.
 - The offer's name: the original copies the running action's name and
   then gives it the entry's stored name (0x41efc1). A `MenuEntry`
-  without a name shows its entry's name, which is the same. The window's
-  getter puts "*" before the name of an entry with flag 0x80 only when
-  the action's name is still empty (0x41f174); whether the stored name
-  can be empty there is not read. The game's menu leaves the "*" off an
-  offer whose entry has a TTAs label, since 0x475c77 loads that label
-  into the entry.
+  without a name shows its entry's name, which is the same. The stored
+  name is the TTAs label when its first byte is not 0 (0x475bf6), else a
+  name made from the entry's tree (0x475c77), so the offer carries one
+  whenever the TTAs strings load, and the window's getter, which adds
+  "*" for a debug entry only to an empty name (0x41f174), adds none. The
+  game's menu follows that, unless a check tree named the offer, even
+  with an empty name (0x4587d0). It shows the made name as the menu
+  number, as it does for any entry without a label.
 - Other readers of word +0 were not searched for.
