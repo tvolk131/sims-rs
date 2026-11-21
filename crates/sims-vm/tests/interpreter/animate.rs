@@ -1414,6 +1414,13 @@ fn dress_and_undress_events_put_accessories_on_and_take_them_off() {
         ]),
     ]);
     fx.program.people.suits = ["fun-fetch-ball01", "petbowl"].map(String::from).into();
+    fx.world.animators.insert(
+        SIM,
+        sims_sim::animator::Animator {
+            profile_stale: false,
+            ..LOADED
+        },
+    );
     fx.sim_mut().person.as_mut().unwrap().accessories = vec![Accessory {
         name: "petbowl".into(),
         binding: "R_HAND".into(),

@@ -1,18 +1,21 @@
 //! Person outfit dressing (`cTSPerson::Dress`, `0x58a178`), covering all 61
-//! native suit IDs (`0..=60`), NPC flag `0x08` (`0x58a1e4`), pet suit reset
-//! (`0x58a2c7..0x58a2e5`), cached-guard early exit (`0x58a2ed..0x58a333`),
-//! per-slot attachment retention on lookup miss (`0x583559` / `0x583576`),
-//! head slot invalidation before rebinding (`0x58d4c1..0x58d51d` → `0x4eb0cc` /
-//! `0x4eb0eb`), extra hand pieces (`0x58a453..0x58a675` → `0x58d712..0x58d75e`),
-//! career workwear (`0x45ee5f`), matched pajamas (`0x45f034`), skeleton
-//! costumes (`0x45f15a`), party costumes (`0x45f452`), and Superstar / Makin'
-//! Magic costumes (`0x58a948..0x58d475`).
+//! native suit IDs (`0..=60`), NPC flag `0x08` (`0x58a1e4` / `0x58a224`), pet
+//! suit reset (`0x58a2c7..0x58a2e5`), cached-guard early exit
+//! (`0x58a2ed..0x58a333`), per-slot attachment retention on lookup miss
+//! (`0x583559` / `0x583576`), head slot invalidation before rebinding
+//! (`0x58d4c1..0x58d51d` → `0x4eb0cc` / `0x4eb0eb`), extra hand pieces
+//! (`0x58a453..0x58a675` → `0x58d712..0x58d75e`), clothing-row initialization
+//! (`0x409315` → `0x40b7ed` / `0x40bfeb` / `0x40c376` / `0x40c855`), native
+//! `cTSHashMap` suit walk (`0x409255`), fuzzy texture matching (`0x40e674` /
+//! `0x40e891` → `0x472a25`), career workwear (`0x45ee5f`), matched pajamas
+//! (`0x45f034`), skeleton costumes (`0x45f15a`), party costumes (`0x45f452`),
+//! and Superstar / Makin' Magic costumes (`0x58a948..0x58d475`).
 
 use crate::Program;
 use crate::fault::Trap;
 use crate::people::{ResolvedSuit, resolve_suit};
-use sims_content::{Catalog, People};
-use sims_sim::{BoundSlot, World};
+use sims_content::{Catalog, People, SuitTable};
+use sims_sim::{BoundSlot, WorkwearCache, World};
 
 /// Person data word indices read/written by `0x58a178`.
 const BODY_SUIT: usize = 8;
@@ -64,7 +67,7 @@ pub(crate) fn parse_row_descriptor(row: &str, second_half: bool) -> (String, Str
     (suit, texture)
 }
 
-/// Parses an ASCII integer prefix the way CRT `atoi` does (`0x58a712`).
+/// Parses an ASCII integer prefix the way CRT `atoi` does (`0x58a712`, `0x40cbdd`).
 fn atoi_age(s: &str) -> i32 {
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -90,136 +93,481 @@ fn atoi_age(s: &str) -> i32 {
     if neg { acc.wrapping_neg() } else { acc }
 }
 
-/// Expands a `$g`/`$b`/`$c` template (`0x40e477`) into candidate ASCII
-/// case-insensitive prefix patterns (branching on `$g` → `('f'|'u')` for
-/// female, `('m'|'u')` for male).
-fn expand_suit_template(
-    template: &str,
-    is_female: bool,
-    body_type: &str,
-    skin_tone: &str,
-) -> Vec<String> {
-    let mut prefixes = vec![String::new()];
-    let bytes = template.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'$' && i + 1 < bytes.len() {
-            match bytes[i + 1] {
-                b'g' | b'G' => {
-                    let g = if is_female { 'f' } else { 'm' };
-                    let mut next = Vec::with_capacity(prefixes.len() * 2);
-                    for p in &prefixes {
-                        let mut a = p.clone();
-                        a.push(g);
-                        next.push(a);
-                        let mut b = p.clone();
-                        b.push('u');
-                        next.push(b);
-                    }
-                    prefixes = next;
-                    i += 2;
-                    continue;
-                }
-                b'b' | b'B' => {
-                    for p in &mut prefixes {
-                        p.push_str(body_type);
-                    }
-                    i += 2;
-                    continue;
-                }
-                b'c' | b'C' => {
-                    for p in &mut prefixes {
-                        p.push_str(skin_tone);
-                    }
-                    i += 2;
-                    continue;
-                }
-                _ => {
-                    i += 2;
-                    continue;
+/// Native gender code returned by `0x40ccac`: `0` male, `1` female, `2`
+/// dogmale, `3` dogfemale, `4` catmale, `5` catfemale, `-1` unknown/missing.
+fn profile_gender_code(gender: Option<&str>) -> i32 {
+    let Some(g) = gender else {
+        return -1;
+    };
+    const GENDERS: [&str; 6] = [
+        "male",
+        "female",
+        "dogmale",
+        "dogfemale",
+        "catmale",
+        "catfemale",
+    ];
+    GENDERS
+        .iter()
+        .position(|name| name.eq_ignore_ascii_case(g))
+        .map_or(-1, |idx| idx as i32)
+}
+
+/// One node of the native pattern matcher (`0x472657`, `0x4726c5`, `0x47275d`).
+#[derive(Debug, Clone)]
+enum PatternStep {
+    Literal(String),
+    Choice(String, String),
+    Skip(usize),
+}
+
+/// Prefix pattern automaton (`0x472657`–`0x4729b2`), returning the maximum
+/// matched prefix byte length on ASCII case-insensitive comparison.
+#[derive(Debug, Clone, Default)]
+struct Pattern {
+    steps: Vec<PatternStep>,
+}
+
+impl Pattern {
+    fn push_literal(&mut self, s: impl Into<String>) {
+        self.steps.push(PatternStep::Literal(s.into()));
+    }
+
+    fn push_choice(&mut self, a: impl Into<String>, b: impl Into<String>) {
+        self.steps.push(PatternStep::Choice(a.into(), b.into()));
+    }
+
+    fn push_skip(&mut self, count: usize) {
+        self.steps.push(PatternStep::Skip(count));
+    }
+
+    /// `0x4727f1`: returns the longest matched prefix length across all paths,
+    /// or `0` if no path completes all steps.
+    fn match_len(&self, candidate: &str) -> usize {
+        if self.steps.is_empty() {
+            return 0;
+        }
+        let cand = candidate.as_bytes();
+        let mut best = 0usize;
+        self.walk(0, 0, cand, &mut best);
+        best
+    }
+
+    fn walk(&self, step_idx: usize, pos: usize, cand: &[u8], best: &mut usize) {
+        let Some(step) = self.steps.get(step_idx) else {
+            if pos > *best {
+                *best = pos;
+            }
+            return;
+        };
+        let try_lit = |lit: &str, best: &mut usize| {
+            let bytes = lit.as_bytes();
+            if pos + bytes.len() <= cand.len()
+                && cand[pos..pos + bytes.len()].eq_ignore_ascii_case(bytes)
+            {
+                self.walk(step_idx + 1, pos + bytes.len(), cand, best);
+            }
+        };
+        match step {
+            PatternStep::Literal(lit) => try_lit(lit, best),
+            PatternStep::Choice(a, b) => {
+                try_lit(a, best);
+                try_lit(b, best);
+            }
+            PatternStep::Skip(n) => {
+                if pos + *n <= cand.len() {
+                    self.walk(step_idx + 1, pos + *n, cand, best);
                 }
             }
         }
-        for p in &mut prefixes {
-            p.push(bytes[i] as char);
-        }
-        i += 1;
     }
-    prefixes
 }
 
-/// Matches a template against the avatar registry's appearance table
-/// (`0x40e5ce` / `0x40e9b2` → `0x409255`, skipping `"suit-*"` at `0x409296`),
-/// returning the first appearance whose name starts with any expanded prefix
-/// (ASCII case-insensitive, `0x4727f1`).
+/// Fuzzy best-ratio selector (`0x472a25`), comparing `matched / len` in double
+/// precision against the stored `f32` score with the native epsilon at
+/// `0x667878` (`0.0001_f32`).
+#[derive(Default)]
+struct BestMatch<'a> {
+    name: &'a str,
+    score: f32,
+    matched: usize,
+}
+
+impl<'a> BestMatch<'a> {
+    fn consider(&mut self, candidate: &'a str, matched: usize) {
+        if matched == 0 || candidate.is_empty() {
+            return;
+        }
+        let fraction = matched as f64 / candidate.len() as f64;
+        let old = f64::from(self.score);
+        if fraction > old
+            || ((fraction - old).abs() <= f64::from(0.0001_f32) && matched > self.matched)
+        {
+            self.name = candidate;
+            self.score = fraction as f32;
+            self.matched = matched;
+        }
+    }
+}
+
+/// Returns the cached `0x409255` (`0x6e48a0`) walk of `AvatarRegistry`'s
+/// appearance hash table, building and caching it on first use from
+/// `people.suit_table` plus any runtime-added `.bcf` sibling appearances
+/// (`World::runtime_added_suits`).
+fn suit_scan_order(people: &People, world: &mut World) -> Vec<String> {
+    if let Some(cached) = &world.suit_scan_cache {
+        return cached.clone();
+    }
+    let mut table: SuitTable = if !people.suit_table.is_empty() {
+        people.suit_table.clone()
+    } else {
+        // Fallback for synthetic tests that populate `People` sets directly
+        // without running `AvatarRegistry::load`.
+        let mut t = SuitTable::default();
+        for name in people
+            .eager_suits
+            .iter()
+            .chain(people.indexed_suits.keys())
+            .chain(people.suits.iter())
+            .chain(people.head_suits.iter())
+        {
+            let key =
+                sims_formats::far::encode_name(name).unwrap_or_else(|| name.as_bytes().to_vec());
+            if !t.contains(&key) {
+                t.insert_name(key);
+            }
+        }
+        t
+    };
+    for name in &world.runtime_added_suits {
+        let key = sims_formats::far::encode_name(name).unwrap_or_else(|| name.as_bytes().to_vec());
+        if !table.contains(&key) {
+            table.insert_name(key);
+        }
+    }
+    let scan = table.scan_names();
+    world.suit_scan_cache = Some(scan.clone());
+    scan
+}
+
+/// Expands a `$g`/`$b`/`$c` template (`0x40e477`) into a [`Pattern`].
+fn expand_template_pattern(
+    template: &str,
+    gender_code: i32,
+    body_type: &str,
+    skin_3: &str,
+) -> Pattern {
+    let mut pattern = Pattern::default();
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    let mut lit = String::new();
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            if !lit.is_empty() {
+                pattern.push_literal(std::mem::take(&mut lit));
+            }
+            if i + 1 < bytes.len() {
+                match bytes[i + 1] {
+                    b'g' | b'G' => {
+                        let g = if gender_code == 1 { "f" } else { "m" };
+                        pattern.push_choice(g, "u");
+                    }
+                    b'b' | b'B' => {
+                        pattern.push_literal(body_type);
+                    }
+                    b'c' | b'C' => {
+                        pattern.push_literal(skin_3);
+                    }
+                    _ => {}
+                }
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        lit.push(bytes[i] as char);
+        i += 1;
+    }
+    if !lit.is_empty() {
+        pattern.push_literal(lit);
+    }
+    pattern
+}
+
+/// Matches a template against the cached `0x409255` appearance table
+/// (`0x40e5ce` / `0x40e9b2`), returning the first entry with a non-zero match.
 fn match_registered_suit(
     people: &People,
+    world: &mut World,
     template: &str,
-    is_female: bool,
+    gender_code: i32,
     body_type: &str,
-    skin_tone: &str,
+    skin_3: &str,
 ) -> String {
     if template.is_empty() {
         return String::new();
     }
-    let patterns = expand_suit_template(template, is_female, body_type, skin_tone);
-    if patterns.iter().all(String::is_empty) {
-        return String::new();
-    }
-    let matches_any = |cand: &str| -> bool {
-        if cand.starts_with("suit-") {
-            return false;
-        }
-        patterns.iter().any(|pat| {
-            !pat.is_empty()
-                && cand.len() >= pat.len()
-                && cand[..pat.len()].eq_ignore_ascii_case(pat)
-        })
-    };
-    for name in people
-        .eager_suits
-        .iter()
-        .chain(people.indexed_suits.keys())
-        .chain(people.suits.iter())
-        .chain(people.head_suits.iter())
-    {
-        if matches_any(name) {
+    let pattern = expand_template_pattern(template, gender_code, body_type, skin_3);
+    let scan = suit_scan_order(people, world);
+    for name in &scan {
+        if pattern.match_len(name) > 0 {
             return name.clone();
         }
     }
     String::new()
 }
 
+/// Matches a texture template against `People::textures` (`0x40e674` for body,
+/// `0x40e891` for head), appending the optional `0x40b75a` suffix
+/// (`base_tex[17..]`) and scoring via `0x472a25`.
+fn match_registered_texture(
+    people: &People,
+    template: &str,
+    gender_code: i32,
+    body_type: &str,
+    skin_3: &str,
+    base_tex: &str,
+    prefix: &str,
+) -> String {
+    if template.is_empty() {
+        return String::new();
+    }
+    let mut pattern = expand_template_pattern(template, gender_code, body_type, skin_3);
+    // 0x40b75a: `strlen("BODY=") + 12 = 17` (used by BOTH 0x40e674 and 0x40e891).
+    let suffix = base_tex.get(17..).unwrap_or("");
+    pattern.push_choice(suffix, "");
+    let mut best = BestMatch::default();
+    for tex in &people.textures {
+        let matched = pattern.match_len(tex);
+        best.consider(tex, matched);
+    }
+    if best.name.is_empty() {
+        String::new()
+    } else {
+        format!("{prefix}{}", best.name)
+    }
+}
+
 /// Expands a hand template (`0x40e795`), replacing `$h` with `'O'`/`'P'`/`'C'`
-/// for gesture 0/1/2 and `$g` with `'f'`/`'m'`, prefixing `"HAND="` when no
-/// `$g` was present (`0x40e7ec`).
-fn expand_hand_template(template: &str, gesture: i16, is_female: bool) -> String {
+/// for gesture 0/1/2 and `$g` with `'f'`/`'m'`, prefixing `"HAND="` on BOTH
+/// the `$g`-absent (`0x40e7f3`) and `$g`-present (`0x40e856`) paths.
+fn expand_hand_template(template: &str, gesture: i16, gender_code: i32) -> String {
     let ch = match gesture {
         1 => 'P',
         2 => 'C',
         _ => 'O',
     };
-    let mut out = if let Some(pos) = template.find("$h") {
-        let mut s = String::new();
-        if !template.contains("$g") {
-            s.push_str("HAND=");
-        }
-        s.push_str(&template[..pos]);
-        s.push(ch);
-        s.push_str(&template[pos + 2..]);
-        s
-    } else {
-        template.to_owned()
+    let pos_h = template.find("$h");
+    let pos_g = template.find("$g");
+    let Some(ph) = pos_h else {
+        return template.to_owned();
     };
-    if let Some(pos) = out.find("$g") {
-        let g = if is_female { 'f' } else { 'm' };
-        let mut s = String::with_capacity(out.len());
-        s.push_str(&out[..pos]);
+    let mut out = String::new();
+    if pos_g.is_none() {
+        out.push_str("HAND=");
+    }
+    out.push_str(&template[..ph]);
+    out.push(ch);
+    out.push_str(&template[ph + 2..]);
+    if let Some(pg) = pos_g {
+        let g = if gender_code == 1 { 'f' } else { 'm' };
+        let split = pg.min(out.len());
+        let mut s = String::from("HAND=");
+        s.push_str(&out[..split]);
         s.push(g);
-        s.push_str(&out[pos + 2..]);
+        if split + 2 <= out.len() {
+            s.push_str(&out[split + 2..]);
+        }
         out = s;
     }
     out
+}
+
+/// Formats `"{suit},BODY={tex}"` truncated to the 63-byte `StackString<64>`
+/// capacity (`0x40be06`, `0x40c2ef`, `0x40c74a`, `0x40cb56`).
+fn format_generated_body_row(suit: &str, tex: &str) -> String {
+    let mut out = format!("{suit},BODY={tex}");
+    if out.len() > 63 {
+        let mut cut = 63;
+        while !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+    }
+    out
+}
+
+/// Runs `0x409315` (deterministic clothing-row initialization: `0x40b7ed`,
+/// `0x40bfeb`, `0x40c376`, `0x40c855`) before generated-outfit matching,
+/// populating missing formal (30), swim (31), pajama (32), winter (33), and
+/// high-fashion (34) rows into `World::made_outfits` for human profiles with a
+/// non-empty body row 1.
+fn init_clothing_rows(
+    people: &People,
+    world: &mut World,
+    guid: u32,
+    profile: Option<&sims_content::Profile>,
+) {
+    let read_row = |world: &World, idx: usize| -> Option<String> {
+        if let Some(s) = world
+            .characters
+            .made
+            .get(&guid)
+            .and_then(|m| m.strings.get(&idx))
+        {
+            return Some(s.clone());
+        }
+        if let Some(s) = world.made_outfits.get(&guid).and_then(|m| m.get(&idx)) {
+            return Some(s.clone());
+        }
+        match idx {
+            1 => profile.and_then(|p| p.body.clone()),
+            2 => profile.and_then(|p| p.head.clone()),
+            12 => profile.and_then(|p| p.gender.clone()),
+            13 => profile.and_then(|p| p.age.clone()),
+            14 => profile.and_then(|p| p.skin.clone()),
+            n => profile.and_then(|p| p.suit_rows.get(&n).cloned()),
+        }
+    };
+    let row_empty =
+        |world: &World, idx: usize| -> bool { read_row(world, idx).is_none_or(|s| s.is_empty()) };
+    let Some(body_row) = read_row(world, 1).filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let gender_code = profile_gender_code(read_row(world, 12).as_deref());
+    if !(0..=1).contains(&gender_code) {
+        return;
+    }
+    let gender_ch = if gender_code == 1 { "f" } else { "m" };
+    let is_child = atoi_age(read_row(world, 13).as_deref().unwrap_or("")) <= 17;
+    let (body_suit, _) = parse_row_descriptor(&body_row, false);
+    let raw_body_type = body_suit.get(6..9).unwrap_or("");
+    let adult_body_type = if matches!(raw_body_type, "skn" | "fit" | "fat") {
+        raw_body_type
+    } else {
+        "fit"
+    };
+    let skin_raw = read_row(world, 14).unwrap_or_else(|| "???".to_owned());
+    let skin_3: String = skin_raw.chars().take(3).collect();
+    let skin_norm = if skin_3.eq_ignore_ascii_case("lgt")
+        || skin_3.eq_ignore_ascii_case("med")
+        || skin_3.eq_ignore_ascii_case("drk")
+    {
+        skin_3.as_str()
+    } else {
+        "lgt"
+    };
+
+    let match_pair =
+        |suit_pat: &Pattern, tex_pat: &Pattern, scan: &[String], textures: &[String]| -> String {
+            let mut best_suit = BestMatch::default();
+            for name in scan {
+                best_suit.consider(name, suit_pat.match_len(name));
+            }
+            let mut best_tex = BestMatch::default();
+            for tex in textures {
+                best_tex.consider(tex, tex_pat.match_len(tex));
+            }
+            format_generated_body_row(best_suit.name, best_tex.name)
+        };
+
+    if !is_child {
+        // 0x40938b -> 0x40b7ed: adult formal (30), swim (31), pajama (32).
+        if row_empty(world, 30) {
+            let scan = suit_scan_order(people, world);
+            let make_pats = |kind: &str| {
+                let mut sp = Pattern::default();
+                sp.push_literal(kind);
+                sp.push_literal("100");
+                sp.push_literal(gender_ch);
+                sp.push_literal("a");
+                sp.push_literal(adult_body_type);
+                let mut tp = sp.clone();
+                tp.push_literal(skin_norm);
+                (sp, tp)
+            };
+            let (f_s, f_t) = make_pats("f");
+            let (s_s, s_t) = make_pats("s");
+            let (l_s, l_t) = make_pats("l");
+            let formal = match_pair(&f_s, &f_t, &scan, &people.textures);
+            let swim = match_pair(&s_s, &s_t, &scan, &people.textures);
+            let pajama = match_pair(&l_s, &l_t, &scan, &people.textures);
+            let entry = world.made_outfits.entry(guid).or_default();
+            entry.insert(30, formal);
+            entry.insert(31, swim);
+            entry.insert(32, pajama);
+        }
+        // 0x4093be -> 0x40bfeb: adult high fashion (34).
+        if row_empty(world, 34) {
+            let scan = suit_scan_order(people, world);
+            let mut sp = Pattern::default();
+            sp.push_literal("h");
+            sp.push_literal("5");
+            sp.push_skip(2);
+            sp.push_literal(gender_ch);
+            sp.push_literal("a");
+            sp.push_literal(adult_body_type);
+            let mut tp = sp.clone();
+            tp.push_literal(skin_norm);
+            let hf = match_pair(&sp, &tp, &scan, &people.textures);
+            world.made_outfits.entry(guid).or_default().insert(34, hf);
+        }
+    } else {
+        // 0x4093d8 -> 0x40c376: child "ADDED" on row 30, swim (31), pajama (32).
+        if row_empty(world, 30) {
+            let scan = suit_scan_order(people, world);
+            let make_pats = |kind: &str| {
+                let mut sp = Pattern::default();
+                sp.push_literal(kind);
+                sp.push_literal("100");
+                sp.push_literal(gender_ch);
+                sp.push_literal("c");
+                sp.push_literal(raw_body_type);
+                let mut tp = sp.clone();
+                tp.push_literal(skin_norm);
+                (sp, tp)
+            };
+            let (s_s, s_t) = make_pats("s");
+            let (l_s, l_t) = make_pats("l");
+            let swim = match_pair(&s_s, &s_t, &scan, &people.textures);
+            let pajama = match_pair(&l_s, &l_t, &scan, &people.textures);
+            let entry = world.made_outfits.entry(guid).or_default();
+            entry.insert(30, "ADDED".to_owned());
+            entry.insert(31, swim);
+            entry.insert(32, pajama);
+        }
+        // 0x40941b: child "ADDED" on row 34.
+        if row_empty(world, 34) {
+            world
+                .made_outfits
+                .entry(guid)
+                .or_default()
+                .insert(34, "ADDED".to_owned());
+        }
+    }
+    // 0x409452 -> 0x40c855: winter (33) for both adult and child.
+    if row_empty(world, 33) {
+        let scan = suit_scan_order(people, world);
+        let mut sp = Pattern::default();
+        sp.push_literal("w");
+        sp.push_literal("100");
+        sp.push_literal(gender_ch);
+        if is_child {
+            sp.push_literal("cchd");
+        } else {
+            sp.push_literal("a");
+            sp.push_literal(adult_body_type);
+        }
+        let mut tp = sp.clone();
+        tp.push_literal(skin_norm);
+        let winter = match_pair(&sp, &tp, &scan, &people.textures);
+        world
+            .made_outfits
+            .entry(guid)
+            .or_default()
+            .insert(33, winter);
+    }
 }
 
 /// Costume table entry for Superstar & Makin' Magic suits (`19..=60`).
@@ -556,6 +904,7 @@ fn slot_differs(existing: &Option<BoundSlot>, suit: &str, texture: &str) -> bool
 ///
 /// Called from:
 /// - `person_factory::construction_reset` (`0x588930`, `force = false`)
+/// - `people::read_appearance_if_stale` (`0x5888d3` → `0x588930`, `force = false`)
 /// - `frame::draw_person` (`0x590cb8`, `force = false`)
 /// - portrait rendering in `ui_effect` / `dialog` (`0x4e7801`, `force = true`)
 pub(crate) fn dress_person(
@@ -602,6 +951,9 @@ pub(crate) fn dress_person(
         match idx {
             1 => profile.and_then(|p| p.body.clone()),
             2 => profile.and_then(|p| p.head.clone()),
+            12 => profile.and_then(|p| p.gender.clone()),
+            13 => profile.and_then(|p| p.age.clone()),
+            14 => profile.and_then(|p| p.skin.clone()),
             n => profile.and_then(|p| p.suit_rows.get(&n).cloned()),
         }
     };
@@ -618,11 +970,18 @@ pub(crate) fn dress_person(
         if raw_suit <= 0 {
             return Ok(());
         }
-        // 0x58a1fe..0x58a2c2: `raw_suit > 0` binds `STR# 200` row `raw_suit`
-        // onto the primary body slot (`0x583559`) and jumps to `0x58d78a`
-        // without touching the head slot or calling `0x4eb0cc`.
-        let (suit, tex) = row_desc(raw_suit as usize);
+        // 0x58a224..0x58a2c2: `raw_suit > 0` skips rebinding whenever
+        // `last_dressed[0] == raw_suit` (even when `force == true`!), and
+        // otherwise updates `last_dressed[0]` and binds `STR# 200` row
+        // `raw_suit` onto the primary body slot (`0x583559`) without touching
+        // the head slot or calling `0x4eb0cc`.
         let mut outfit = world.person_outfits.remove(&person_id).unwrap_or_default();
+        if outfit.last_dressed[0] == i32::from(raw_suit) {
+            world.person_outfits.insert(person_id, outfit);
+            return Ok(());
+        }
+        outfit.last_dressed[0] = i32::from(raw_suit);
+        let (suit, tex) = row_desc(raw_suit as usize);
         bind_slot(&program.people, world, &mut outfit.body, &suit, &tex);
         world.person_outfits.insert(person_id, outfit);
         return Ok(());
@@ -661,29 +1020,17 @@ pub(crate) fn dress_person(
     }
     outfit.last_dressed = dress_key;
 
-    // 0x40ccac: female when `STR# 200` row 12 is `"female"`, falling back to
-    // `person.data[65] & 1`.
-    let is_female = made_strings
-        .as_ref()
-        .and_then(|m| m.get(&sims_sim::characters::GENDER).map(String::as_str))
-        .or_else(|| profile.and_then(|p| p.gender.as_deref()))
-        .map_or((gender_word & 1) != 0, |g| g.eq_ignore_ascii_case("female"));
-    let body_row_str = raw_row(1).unwrap_or_default();
-    let body_type: String = body_row_str.get(6..9).unwrap_or("").to_ascii_lowercase();
-    let skin_tone: String = made_strings
-        .as_ref()
-        .and_then(|m| m.get(&sims_sim::characters::SKIN).map(String::as_str))
-        .or_else(|| profile.and_then(|p| p.skin.as_deref()))
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let is_formal_child = {
-        let age_str = made_strings
-            .as_ref()
-            .and_then(|m| m.get(&sims_sim::characters::AGE).map(String::as_str))
-            .or_else(|| profile.and_then(|p| p.age.as_deref()))
-            .unwrap_or("");
-        atoi_age(age_str) <= 17
-    };
+    // 0x40ccac: gender code from `STR# 200` row 12.
+    let gender_code = profile_gender_code(raw_row(12).as_deref());
+    let (body_row_suit, body_row_tex) = row_desc(1);
+    let (_, head_row_tex) = row_desc(2);
+    let body_type: String = body_row_suit.get(6..9).unwrap_or("").to_ascii_lowercase();
+    let skin_3: String = raw_row(14)
+        .unwrap_or_else(|| "???".to_owned())
+        .chars()
+        .take(3)
+        .collect();
+    let is_formal_child = atoi_age(raw_row(13).as_deref().unwrap_or("")) <= 17;
     let is_word_child = age_word != 0 && age_word < 18;
 
     // Default head (row 2) and hand extras (words 22 & 23, `0x58a453..0x58a675`).
@@ -714,64 +1061,109 @@ pub(crate) fn dress_person(
             (body_suit, body_tex) = row_desc(15);
         }
         2 => {
-            let (s31, t31) = row_desc(31);
-            if !s31.is_empty() {
-                body_suit = s31;
-                body_tex = t31;
+            // 0x58a6d6: checks raw row 31 presence BEFORE parsing.
+            if raw_row(31).is_some_and(|r| !r.is_empty()) {
+                (body_suit, body_tex) = row_desc(31);
             } else {
                 (body_suit, body_tex) = row_desc(16);
             }
         }
         3 => {
-            // 0x45ee5f: career workwear from `Work.iff` (`Program::careers`).
-            let level_idx = if is_word_child { 0 } else { job_level };
-            if let Some(careers) = program.careers.as_ref()
-                && let Some(career) = careers.iter().find(|c| c.id == i32::from(job_type))
-                && let Ok(lvl) = usize::try_from(level_idx)
-                && let Some(level) = career.levels.get(lvl)
+            // 0x45ee5f: career workwear cached by `(job_type, job_level)` on
+            // `cXPerson` (`[esi + 0xb2c..0xbc8]`), choosing the CARR string
+            // using live `person.data[65] & 1`.
+            if let Some(cached) = outfit
+                .workwear_cache
+                .as_ref()
+                .filter(|c| c.job_type == job_type && c.job_level == job_level)
             {
-                let tmpl = if is_female && !level.strings[2].is_empty() {
-                    &level.strings[2]
-                } else {
-                    &level.strings[1]
-                };
-                body_suit =
-                    match_registered_suit(&program.people, tmpl, is_female, &body_type, &skin_tone);
-                body_tex = level.strings[3].to_ascii_lowercase();
-                body_alt_suit = level.strings[4].to_ascii_lowercase();
+                body_suit = cached.body_suit.clone();
+                body_tex = cached.body_tex.clone();
+                body_alt_suit = cached.body_alt_suit.clone();
+            } else {
+                let level_idx = if is_word_child { 0 } else { job_level };
+                if let Some(careers) = program.careers.as_ref()
+                    && let Some(career) = careers.iter().find(|c| c.id == i32::from(job_type))
+                    && let Ok(lvl) = usize::try_from(level_idx)
+                    && let Some(level) = career.levels.get(lvl)
+                {
+                    let live_female = (gender_word & 1) != 0;
+                    let tmpl = if live_female && !level.strings[2].is_empty() {
+                        &level.strings[2]
+                    } else {
+                        &level.strings[1]
+                    };
+                    init_clothing_rows(&program.people, world, guid, profile);
+                    body_suit = match_registered_suit(
+                        &program.people,
+                        world,
+                        tmpl,
+                        gender_code,
+                        &body_type,
+                        &skin_3,
+                    );
+                    body_tex = match_registered_texture(
+                        &program.people,
+                        &level.strings[3],
+                        gender_code,
+                        &body_type,
+                        &skin_3,
+                        &body_row_tex,
+                        "BODY=",
+                    );
+                    body_alt_suit = level.strings[4].clone();
+                }
+                outfit.workwear_cache = Some(WorkwearCache {
+                    job_type,
+                    job_level,
+                    body_suit: body_suit.clone(),
+                    body_tex: body_tex.clone(),
+                    body_alt_suit: body_alt_suit.clone(),
+                });
             }
         }
         4 => {
-            // 0x58a6ff..0x58a7b0: formalwear checks `atoi(STR# 200 row 13) <= 17`.
+            // 0x58a6ff..0x58a7b0: formalwear checks `atoi(STR# 200 row 13) <= 17`,
+            // then checks raw row 30 presence BEFORE parsing (`0x58a733`).
             if is_formal_child {
                 (body_suit, body_tex) = row_desc(27);
+            } else if raw_row(30).is_some_and(|r| !r.is_empty()) {
+                (body_suit, body_tex) = row_desc(30);
             } else {
-                let (s30, t30) = row_desc(30);
-                if !s30.is_empty() {
-                    body_suit = s30;
-                    body_tex = t30;
-                } else {
-                    (body_suit, body_tex) = row_desc(27);
-                    (extra_left_suit, extra_left_tex) = row_desc(28);
-                    (extra_right_suit, extra_right_tex) = row_desc(29);
-                }
+                (body_suit, body_tex) = row_desc(27);
+                (extra_left_suit, extra_left_tex) = row_desc(28);
+                (extra_right_suit, extra_right_tex) = row_desc(29);
             }
         }
         5 => {
-            // 0x58a7db: row 32 if non-empty; otherwise matched pajamas (`0x45f034`).
-            let (s32, t32) = row_desc(32);
-            if !s32.is_empty() {
-                body_suit = s32;
-                body_tex = t32;
+            // 0x58a7f0: checks raw row 32 presence BEFORE parsing; otherwise
+            // matched pajamas (`0x45f034`).
+            if raw_row(32).is_some_and(|r| !r.is_empty()) {
+                (body_suit, body_tex) = row_desc(32);
             } else {
                 let tmpl = if is_word_child {
                     "pjs$gchd"
                 } else {
                     "pajama$g$b"
                 };
-                body_suit =
-                    match_registered_suit(&program.people, tmpl, is_female, &body_type, &skin_tone);
-                body_tex = "pajama$g$c".to_owned();
+                init_clothing_rows(&program.people, world, guid, profile);
+                body_suit = match_registered_suit(
+                    &program.people,
+                    world,
+                    tmpl,
+                    gender_code,
+                    &body_type,
+                    &skin_3,
+                );
+                body_tex = match_registered_texture(
+                    &program.people,
+                    "pajama$g$c",
+                    gender_code,
+                    &body_type,
+                    &skin_3,
+                    &body_row_tex,
+                    "BODY=",
+                );
             }
         }
         6 | 7 => {
@@ -798,20 +1190,42 @@ pub(crate) fn dress_person(
         }
         8..=16 => {
             // 0x45f452: themed party costumes (`ct-{prefix}-$gC-{v:02}` /
-            // `ct-{prefix}-$gAFit-{v:02}` with `v = data[21] + 1`).
+            // `ct-{prefix}-$gAFit-{v:02}` with `v = data[21] + 1`; texture
+            // inserts `$c` before `-{v:02}`).
             const PREFIXES: [&str; 9] = [
                 "toga", "cow", "luau", "rave", "cost", "nice", "swim", "pj", "disco",
             ];
             let prefix = PREFIXES[(suit - 8) as usize];
             let v = i32::from(variant) + 1;
-            let tmpl = if is_word_child {
-                format!("ct-{prefix}-$gC-{v:02}")
+            let (suit_tmpl, tex_tmpl) = if is_word_child {
+                (
+                    format!("ct-{prefix}-$gC-{v:02}"),
+                    format!("ct-{prefix}-$gC$c-{v:02}"),
+                )
             } else {
-                format!("ct-{prefix}-$gAFit-{v:02}")
+                (
+                    format!("ct-{prefix}-$gAFit-{v:02}"),
+                    format!("ct-{prefix}-$gAFit$c-{v:02}"),
+                )
             };
-            body_suit =
-                match_registered_suit(&program.people, &tmpl, is_female, &body_type, &skin_tone);
-            body_tex = tmpl;
+            init_clothing_rows(&program.people, world, guid, profile);
+            body_suit = match_registered_suit(
+                &program.people,
+                world,
+                &suit_tmpl,
+                gender_code,
+                &body_type,
+                &skin_3,
+            );
+            body_tex = match_registered_texture(
+                &program.people,
+                &tex_tmpl,
+                gender_code,
+                &body_type,
+                &skin_3,
+                &body_row_tex,
+                "BODY=",
+            );
         }
         17 => {
             (body_suit, body_tex) = row_desc(33);
@@ -820,45 +1234,101 @@ pub(crate) fn dress_person(
             (body_suit, body_tex) = row_desc(34);
         }
         19..=60 => {
+            let mut skip_hand_templates = false;
+            if matches!(suit, 55 | 56) {
+                // 0x58c3cf, 0x58c3dc: mummy suits clear live words 22 and 23.
+                if let Some(person) = world
+                    .objects
+                    .get_mut(&person_id)
+                    .and_then(|o| o.person.as_mut())
+                {
+                    if let Some(w) = person.data.get_mut(HAND_LEFT) {
+                        *w = 0;
+                    }
+                    if let Some(w) = person.data.get_mut(HAND_RIGHT) {
+                        *w = 0;
+                    }
+                }
+                world.routing.unknown_words.remove(&(person_id, HAND_LEFT));
+                world.routing.unknown_words.remove(&(person_id, HAND_RIGHT));
+                // 0x58c5d9, 0x58c5f0: variant 3 binds `nohandl` and `nohandr`
+                // BEFORE `0x409315` / `0x40e5ce` / `0x40e9b2` at `0x58c76f`.
+                if variant == 3 {
+                    extra_left_suit = "nohandl".to_owned();
+                    extra_left_tex = "nohand".to_owned();
+                    extra_right_suit = "nohandr".to_owned();
+                    extra_right_tex = "nohand".to_owned();
+                    if slot_differs(&outfit.extra_left, &extra_left_suit, &extra_left_tex) {
+                        bind_slot(
+                            &program.people,
+                            world,
+                            &mut outfit.extra_left,
+                            &extra_left_suit,
+                            &extra_left_tex,
+                        );
+                    }
+                    if slot_differs(&outfit.extra_right, &extra_right_suit, &extra_right_tex) {
+                        bind_slot(
+                            &program.people,
+                            world,
+                            &mut outfit.extra_right,
+                            &extra_right_suit,
+                            &extra_right_tex,
+                        );
+                    }
+                    skip_hand_templates = true;
+                }
+            }
             if let Some(spec) = costume_spec(suit, variant) {
+                init_clothing_rows(&program.people, world, guid, profile);
                 if let Some(b) = spec.body {
                     body_suit = match_registered_suit(
                         &program.people,
+                        world,
                         b,
-                        is_female,
+                        gender_code,
                         &body_type,
-                        &skin_tone,
+                        &skin_3,
                     );
                 }
                 if let Some(bt) = spec.body_tex {
-                    body_tex = bt.to_owned();
+                    body_tex = match_registered_texture(
+                        &program.people,
+                        bt,
+                        gender_code,
+                        &body_type,
+                        &skin_3,
+                        &body_row_tex,
+                        "BODY=",
+                    );
                 }
                 if let Some(h) = spec.head {
                     head_suit = match_registered_suit(
                         &program.people,
+                        world,
                         h,
-                        is_female,
+                        gender_code,
                         &body_type,
-                        &skin_tone,
+                        &skin_3,
                     );
                 }
                 if let Some(ht) = spec.head_tex {
-                    head_tex = ht.to_owned();
+                    head_tex = match_registered_texture(
+                        &program.people,
+                        ht,
+                        gender_code,
+                        &body_type,
+                        &skin_3,
+                        &head_row_tex,
+                        "HEAD-HEAD=",
+                    );
                 }
-                if let Some(hl) = spec.hand_left {
-                    if hl == "nohandl" {
-                        extra_left_suit = "nohandl".to_owned();
-                        extra_left_tex = "nohand".to_owned();
-                    } else {
-                        extra_left_tex = expand_hand_template(hl, hand_left_word, is_female);
+                if !skip_hand_templates {
+                    if let Some(hl) = spec.hand_left {
+                        extra_left_tex = expand_hand_template(hl, hand_left_word, gender_code);
                     }
-                }
-                if let Some(hr) = spec.hand_right {
-                    if hr == "nohandr" {
-                        extra_right_suit = "nohandr".to_owned();
-                        extra_right_tex = "nohand".to_owned();
-                    } else {
-                        extra_right_tex = expand_hand_template(hr, hand_right_word, is_female);
+                    if let Some(hr) = spec.hand_right {
+                        extra_right_tex = expand_hand_template(hr, hand_right_word, gender_code);
                     }
                 }
             }

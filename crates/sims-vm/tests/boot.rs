@@ -635,7 +635,7 @@ fn an_opened_neighborhood_matches_the_originals_import() {
     // Run 2's handoff, as fitted: the adult skeleton read and the
     // indicators made before the lot load.
     let handoff = Handoff {
-        skeletons_read: ["adult".to_owned()].into(),
+        skeletons_read: vec!["adult".to_owned()],
         indicators_made: true,
     };
     let lot =

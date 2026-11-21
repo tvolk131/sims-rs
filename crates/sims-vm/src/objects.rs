@@ -266,6 +266,7 @@ impl Interpreter<'_> {
             files: world.skeleton_files.clone(),
             loaded_skeletons: world.loaded_indexed_skeletons.clone(),
             loaded_suits: world.loaded_indexed_suits.clone(),
+            runtime_added_suits: world.runtime_added_suits.clone(),
         };
         let expansions = world.globals.get(20).copied().unwrap_or(0);
         let mut objects = BTreeMap::new();
@@ -306,15 +307,16 @@ impl Interpreter<'_> {
                 if suit.is_empty() {
                     return None;
                 }
-                let lower = suit.to_ascii_lowercase();
-                match crate::people::resolve_suit_into(
-                    people,
-                    &lower,
-                    &mut registry.loaded_skeletons,
-                    &mut registry.loaded_suits,
-                    &mut registry.draws,
-                    &mut registry.files,
-                ) {
+                // 0x591af3 / 0x591bf3 pass serialized names directly to
+                // `0x5a044d` -> `0x5a27f2` (byte-exact, no case folding).
+                let mut reg = crate::people::RegistryMut {
+                    loaded_skeletons: &mut registry.loaded_skeletons,
+                    loaded_suits: &mut registry.loaded_suits,
+                    runtime_added_suits: &mut registry.runtime_added_suits,
+                    draws: &mut registry.draws,
+                    files: &mut registry.files,
+                };
+                match crate::people::resolve_suit_into(people, suit, &mut reg) {
                     crate::people::ResolvedSuit::Found(has_head) => Some(sims_sim::BoundSlot {
                         suit: suit.to_owned(),
                         texture: texture.to_owned(),
@@ -341,18 +343,11 @@ impl Interpreter<'_> {
             if !person.appearance[8].is_empty() || !person.appearance[9].is_empty() {
                 dirtied_portraits.push(object.guid);
             }
-            // 0x591b66..0x591bf8: bind each serialized accessory via 0x583541.
+            // 0x591b66..0x591bf8: bind each serialized accessory via 0x583541
+            // (byte-exact); only successfully bound entries attach to `[ebx + 0x274]`.
             for acc in &person.accessories {
-                if !acc.name.is_empty() {
-                    let lower = acc.name.to_ascii_lowercase();
-                    let _ = crate::people::resolve_suit_into(
-                        people,
-                        &lower,
-                        &mut registry.loaded_skeletons,
-                        &mut registry.loaded_suits,
-                        &mut registry.draws,
-                        &mut registry.files,
-                    );
+                if let Some(bound) = bind(&acc.name, &acc.binding) {
+                    outfit.accessories.push(bound);
                 }
             }
             person_outfits.insert(id, outfit);
@@ -428,12 +423,14 @@ impl Interpreter<'_> {
             files,
             loaded_skeletons,
             loaded_suits,
+            runtime_added_suits,
         } = registry;
         let count = draws.count;
         world.crt_rng = crt;
         world.skeleton_files = files;
         world.loaded_indexed_skeletons = loaded_skeletons;
         world.loaded_indexed_suits = loaded_suits;
+        world.runtime_added_suits = runtime_added_suits;
         world.person_outfits.extend(person_outfits);
         for guid in dirtied_portraits {
             world.portraits.remove(&guid);
@@ -602,6 +599,7 @@ struct SavedPersonRegistry<'a> {
     files: BTreeSet<String>,
     loaded_skeletons: BTreeMap<String, Option<String>>,
     loaded_suits: BTreeMap<String, Option<bool>>,
+    runtime_added_suits: Vec<String>,
 }
 
 /// A person's constructor, as far as it draws random numbers (0x45962b).
@@ -614,14 +612,16 @@ fn construct_person(
     // 0x58838b -> 0x5a073b -> 0x5a0384: saved-house people resolve through the
     // avatar registry in load order, populating sibling skeletons & appearances
     // from any lazy `.ndx` `.bcf` catalog they open.
-    let skeleton = crate::people::resolve_skeleton_for_saved(
-        people,
-        guid,
-        &mut registry.loaded_skeletons,
-        &mut registry.loaded_suits,
-        &mut registry.draws,
-        &mut registry.files,
-    )?;
+    let skeleton = {
+        let mut reg = crate::people::RegistryMut {
+            loaded_skeletons: &mut registry.loaded_skeletons,
+            loaded_suits: &mut registry.loaded_suits,
+            runtime_added_suits: &mut registry.runtime_added_suits,
+            draws: &mut registry.draws,
+            files: &mut registry.files,
+        };
+        crate::people::resolve_skeleton_for_saved(people, guid, &mut reg)?
+    };
     build_skeleton(skeleton, &mut registry.draws, &mut registry.files)?;
     // The first record of the person's type, in slot order.
     let record = neighbors.first_of(guid).ok_or_else(|| {

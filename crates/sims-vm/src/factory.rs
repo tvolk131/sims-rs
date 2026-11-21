@@ -404,6 +404,7 @@ impl<'a> Machine<'a, '_> {
         self.world.person_ticks.remove(&id);
         self.world.animators.remove(&id);
         self.world.person_outfits.remove(&id);
+        self.world.scratch_ptr_set.remove(&id);
         self.world.base_layers.remove(&id);
         self.world.translated_bones.remove(&id);
         self.world.held_poses.remove(&id);

@@ -28,6 +28,7 @@ pub use animations::{Animations, Channel, Clip, Event, Track};
 pub use assets::Assets;
 pub use catalog::{Catalog, Object};
 pub use error::Error;
+pub use file_table::SuitTable;
 pub use import_wardrobe::ImportWardrobe;
 pub use index::{Index, Member, Resource, far_members};
 pub use install::{Expansions, Install, Layout, Mount};

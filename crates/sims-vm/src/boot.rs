@@ -181,10 +181,10 @@ pub struct Finished {
 /// ([`Lot::load_after_pools`]).
 #[derive(Debug, Clone, Default)]
 pub struct Handoff {
-    /// The skeletons, by name, whose files the game has already read.
-    /// They are added to the files our load counts as read before the
-    /// first lot.
-    pub skeletons_read: BTreeSet<String>,
+    /// The skeletons, by name, whose files the game has already read, in exact
+    /// open order so duplicate entries across already-opened catalogs preserve
+    /// native first-registration order (`0x59f18c`, `0x59f34c`).
+    pub skeletons_read: Vec<String>,
     /// Whether the two indicators' graphics roots already exist.
     pub indicators_made: bool,
 }
@@ -733,13 +733,18 @@ impl Lot {
                     }
                 }
                 if let Some((suits, _)) = program.people.indexed_suit_catalogs.get(file) {
-                    for (app_name, &has_head) in suits {
+                    for (app_name, has_head) in suits {
                         if !program.people.eager_suits.contains(app_name)
                             && !world.loaded_indexed_suits.contains_key(app_name)
                         {
                             world
                                 .loaded_indexed_suits
-                                .insert(app_name.clone(), Some(has_head));
+                                .insert(app_name.clone(), Some(*has_head));
+                            if !program.people.indexed_suits.contains_key(app_name)
+                                && !world.runtime_added_suits.contains(app_name)
+                            {
+                                world.runtime_added_suits.push(app_name.clone());
+                            }
                         }
                     }
                 }

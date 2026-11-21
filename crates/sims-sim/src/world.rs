@@ -264,12 +264,37 @@ pub struct World {
     #[serde(skip)]
     pub made_outfits: BTreeMap<u32, BTreeMap<usize, String>>,
     /// Per-person live `cTSPerson` attachment slots (`[ebx + 0x258]` head,
-    /// `[ebx + 0x25c]` body & body_alt, `[ebx + 0x268]` left & right extras)
-    /// and cached dressing guard (`[ebx + 0x1b0..0x1bc]`, `data[8, 21, 22, 23]`).
+    /// `[ebx + 0x25c]` body & body_alt, `[ebx + 0x268]` left & right extras,
+    /// `[ebx + 0x274]` accessories), cached dressing guard (`[ebx + 0x1b0..0x1bc]`),
+    /// and cached career workwear (`[esi + 0xb2c..0xbc8]`).
     /// Kept out of [`World::encode`] to preserve snapshot format 31;
     /// `sims_vm::boot::save::Saved` preserves it across save/restore.
     #[serde(skip)]
     pub person_outfits: BTreeMap<u16, PersonOutfit>,
+    /// Objects whose scratch destination pointer (`[object + 0x128]`, zeroed
+    /// at `0x431a77`) has been populated by `Expression` (`0x452c85`),
+    /// `Random Number` (`0x451e8d`), `Get Direction To` (`0x45202b`),
+    /// `Relationship`/`Old Relationship` (`0x44d513`), or `Set To Next`
+    /// (`0x44eb9d`). Once set, `UI Effect` reading global 34 (`0x4541d5`)
+    /// writes through that pointer and succeeds instead of dereferencing null.
+    /// Kept out of [`World::encode`] to preserve snapshot format 31;
+    /// `sims_vm::boot::save::Saved` preserves it across save/restore.
+    #[serde(skip)]
+    pub scratch_ptr_set: BTreeSet<u16>,
+    /// Appearance names newly inserted into `AvatarRegistry`'s hash table by
+    /// runtime `.bcf` catalog loads (`0x59f320` → `0x5a1fb1`) that were not
+    /// already present in startup eager or `.ndx` registrations, in exact
+    /// insertion order. Kept out of [`World::encode`] to preserve snapshot
+    /// format 31; `sims_vm::boot::save::Saved` preserves it across save/restore.
+    #[serde(skip)]
+    pub runtime_added_suits: Vec<String>,
+    /// First-call snapshot of `AvatarRegistry`'s appearance hash-table walk
+    /// (`0x409255` → `0x6e48a0`, skipping `"suit-*"`), cached for the rest of
+    /// the session once any generated-outfit matcher runs. Kept out of
+    /// [`World::encode`] to preserve snapshot format 31;
+    /// `sims_vm::boot::save::Saved` preserves it across save/restore.
+    #[serde(skip)]
+    pub suit_scan_cache: Option<Vec<String>>,
 }
 
 /// One appearance attachment slot on `cTSPerson` (`0x583559`: suit name at
@@ -282,8 +307,20 @@ pub struct BoundSlot {
     pub has_head: Option<bool>,
 }
 
+/// Cached career workwear descriptor on `cXPerson` (`0x45ee5f`: `[esi + 0xb2c]`
+/// job type, `[esi + 0xb2e]` job level, `[esi + 0xb30]` body suit,
+/// `[esi + 0xb7c]` body texture, `[esi + 0xbc8]` body_alt suit).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkwearCache {
+    pub job_type: i16,
+    pub job_level: i16,
+    pub body_suit: String,
+    pub body_tex: String,
+    pub body_alt_suit: String,
+}
+
 /// Live outfit attachment slots and cached dressing guard on `cTSPerson`
-/// (`0x587dfa`, `0x58a178`, `0x591a30`).
+/// (`0x587dfa`, `0x58a178`, `0x591a30`, `0x45ee5f`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersonOutfit {
     /// `[ebx + 0x258]` (head slot).
@@ -296,9 +333,13 @@ pub struct PersonOutfit {
     pub extra_left: Option<BoundSlot>,
     /// `[ebx + 0x268][1]` (right hand / extra slot).
     pub extra_right: Option<BoundSlot>,
+    /// `[ebx + 0x274]` (actually bound accessory attachments).
+    pub accessories: Vec<BoundSlot>,
     /// `[ebx + 0x1b0..0x1bc]` (`data[8], data[21], data[22], data[23]`),
     /// initialized to `[-1, -1, -1, -1]` in `cTSPerson::cTSPerson` (`0x587dfa`).
     pub last_dressed: [i32; 4],
+    /// `[esi + 0xb2c..0xbc8]` cached workwear descriptors (`0x45ee5f`).
+    pub workwear_cache: Option<WorkwearCache>,
 }
 
 impl PersonOutfit {
@@ -311,7 +352,9 @@ impl PersonOutfit {
             body_alt: None,
             extra_left: None,
             extra_right: None,
+            accessories: Vec::new(),
             last_dressed: [-1; 4],
+            workwear_cache: None,
         }
     }
 }
@@ -699,6 +742,9 @@ impl World {
             loaded_indexed_suits: BTreeMap::new(),
             made_outfits: BTreeMap::new(),
             person_outfits: BTreeMap::new(),
+            scratch_ptr_set: BTreeSet::new(),
+            runtime_added_suits: Vec::new(),
+            suit_scan_cache: None,
         }
     }
 

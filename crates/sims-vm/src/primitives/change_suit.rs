@@ -56,13 +56,7 @@ impl Machine<'_, '_> {
                 let program = self.program;
                 let me = self.me;
                 if off {
-                    let accessories = &mut self
-                        .me_mut()?
-                        .person
-                        .as_mut()
-                        .ok_or(Trap::native(0x1c, "object is not a person"))?
-                        .accessories;
-                    undress(accessories, &name);
+                    undress_person(self.world, me, &name)?;
                 } else {
                     put_on(&program.people, self.world, me, name)?;
                 }
@@ -170,12 +164,13 @@ pub(crate) fn put_on(
     id: u16,
     name: String,
 ) -> Result<(), Trap> {
-    let found = if name.is_empty() {
-        false
+    let resolved = if name.is_empty() {
+        None
     } else {
-        match crate::people::resolve_suit_exists(people, world, &name) {
-            Some(found) => found,
-            None => {
+        match crate::people::resolve_suit(people, world, &name) {
+            crate::people::ResolvedSuit::Found(has_head) => Some(has_head),
+            crate::people::ResolvedSuit::Missing => None,
+            crate::people::ResolvedSuit::Unknown => {
                 let errors = &people.suit_errors;
                 return Err(Trap::Unsupported(format!(
                     "accessory {name:?} is put on, but no decoded avatar file names it. {} avatar \
@@ -190,13 +185,40 @@ pub(crate) fn put_on(
             }
         }
     };
+    let found = resolved.is_some();
     let accessories = &mut world
         .objects
         .get_mut(&id)
         .and_then(|o| o.person.as_mut())
         .ok_or(Trap::native(0x1c, "object is not a person"))?
         .accessories;
-    dress(accessories, name, found);
+    dress(accessories, name.clone(), found);
+    if let Some(outfit) = world.person_outfits.get_mut(&id) {
+        outfit.accessories.retain(|slot| slot.suit != name);
+        if let Some(has_head) = resolved {
+            outfit.accessories.push(sims_sim::BoundSlot {
+                suit: name,
+                texture: String::new(),
+                has_head: Some(has_head),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Takes off every accessory named exactly `name` on person `id` (`0x58d919`),
+/// updating both `person.accessories` and `world.person_outfits[&id].accessories`.
+pub(crate) fn undress_person(world: &mut sims_sim::World, id: u16, name: &str) -> Result<(), Trap> {
+    let accessories = &mut world
+        .objects
+        .get_mut(&id)
+        .and_then(|o| o.person.as_mut())
+        .ok_or(Trap::native(0x1c, "object is not a person"))?
+        .accessories;
+    undress(accessories, name);
+    if let Some(outfit) = world.person_outfits.get_mut(&id) {
+        outfit.accessories.retain(|slot| slot.suit != name);
+    }
     Ok(())
 }
 

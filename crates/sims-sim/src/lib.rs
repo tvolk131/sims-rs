@@ -41,7 +41,7 @@ pub use snapshot::{FORMAT as SNAPSHOT_FORMAT, ReadOnlySnapshots, Snapshots};
 pub use world::{
     ADVERTISEMENTS, Advertisement, BoundSlot, Budget, Dialog, Dialogs, FULL_SIZE, FrameStorage,
     Headline, HouseUsage, MagicHistory, Object, PersonOutfit, PersonTick, PortraitFile,
-    TypeAttributes, Usage, Whereabouts, World,
+    TypeAttributes, Usage, Whereabouts, WorkwearCache, World,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;

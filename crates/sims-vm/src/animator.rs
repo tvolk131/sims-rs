@@ -786,7 +786,13 @@ impl Interpreter<'_> {
         if flags & 4 == 0 && !(a.base.is_filled() && kind <= 1) {
             a.posture = posture;
             if let Some(selection) = base_selection(posture) {
-                read_appearance_if_stale(world, self.program, id, &mut a.profile_stale)?;
+                read_appearance_if_stale(
+                    self.catalog,
+                    world,
+                    self.program,
+                    id,
+                    &mut a.profile_stale,
+                )?;
                 // 0x5904af: with no name the lookup gives no clip, and
                 // nothing starts.
                 let Some(name) = self.posture_clip(world, id, selection)? else {
@@ -1069,7 +1075,7 @@ impl Interpreter<'_> {
         if a.foreground.is_some() && a.selection == selection as i32 {
             return Ok(());
         }
-        read_appearance_if_stale(world, self.program, id, &mut a.profile_stale)?;
+        read_appearance_if_stale(self.catalog, world, self.program, id, &mut a.profile_stale)?;
         let name = self.posture_clip(world, id, selection)?;
         a.selection = selection as i32;
         let name = name.ok_or_else(|| {
@@ -1128,7 +1134,7 @@ impl Interpreter<'_> {
         a: &mut Animator,
         now: i32,
     ) -> Result<(), Trap> {
-        read_appearance_if_stale(world, self.program, id, &mut a.profile_stale)?;
+        read_appearance_if_stale(self.catalog, world, self.program, id, &mut a.profile_stale)?;
         let name = self.posture_clip(world, id, CARRY)?.ok_or_else(|| {
             unsupported(
                 "0x59db2f",

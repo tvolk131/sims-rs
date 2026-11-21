@@ -108,6 +108,9 @@ const FAMILY: usize = 61;
 
 impl Machine<'_, '_> {
     pub(crate) fn set_to_next(&mut self, operands: &[u8; 8]) -> Result<bool, Trap> {
+        // 0x44eb9d: binds `[edi + 0x128]` to the local scratch slot right at
+        // entry and never clears it.
+        self.world.scratch_ptr_set.insert(self.me);
         let (scope, index) = if operands[4] & 0x80 == 0 {
             (10, 0)
         } else {

@@ -283,6 +283,9 @@ fn world() -> World {
         loaded_indexed_suits: BTreeMap::new(),
         made_outfits: BTreeMap::new(),
         person_outfits: BTreeMap::new(),
+        scratch_ptr_set: BTreeSet::new(),
+        runtime_added_suits: Vec::new(),
+        suit_scan_cache: None,
     }
 }
 

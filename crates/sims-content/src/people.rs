@@ -2,6 +2,7 @@
 //! records, to construct the people a house's saved objects include: their
 //! skeletons and the profiles their resets read.
 
+use crate::file_table::SuitTable;
 use crate::import_wardrobe::{AvatarPaths, mount_avatar_paths, resources_with_dir};
 use crate::{Catalog, Error, Index, Install, Resource, Result};
 use sims_formats::avatar::catalog::{Asset, Binary};
@@ -85,10 +86,10 @@ pub struct Profile {
 pub type IndexedCatalog = (Vec<Skeleton>, Option<String>);
 
 /// Decoded appearances of one `.ndx`-referenced `.bcf` catalog (`0x5a38da` →
-/// `0x59f35f`): each lowercased appearance name mapped to whether its first
-/// definition in that catalog has a valid `"HEAD"` mesh binding, plus any
-/// decode error encountered partway through.
-pub type IndexedSuitCatalog = (BTreeMap<String, bool>, Option<String>);
+/// `0x59f35f`): each lowercased appearance name in file order mapped to whether
+/// its first definition in that catalog has a valid `"HEAD"` mesh binding, plus
+/// any decode error encountered partway through.
+pub type IndexedSuitCatalog = (Vec<(String, bool)>, Option<String>);
 
 /// The skeletons and profiles of a set of person types.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -152,6 +153,14 @@ pub struct People {
     /// `0x4e7824`). Absent when a suit catalog failed to decode before
     /// confirming a binding or in synthetic fixtures that do not populate it.
     pub portrait_head: BTreeMap<u32, bool>,
+    /// The startup avatar registry's appearance hash table (`[AvatarRegistry + 0x28]`,
+    /// `0x59f844` + `0x59fc48`), in exact native bucket/chain layout for
+    /// `0x409255` (`0x6e48a0`).
+    pub suit_table: SuitTable,
+    /// Texture stems (`BMP` then `TGA`, truncated to 63 bytes) from the
+    /// startup texture search paths (`0x414633` → `0x40895a` → `0x6e48b0`),
+    /// in exact native scan order.
+    pub textures: Vec<String>,
 }
 
 /// The body strings that name a person's initial body and head suits.
@@ -237,6 +246,8 @@ pub struct AvatarRegistry {
     indexed_suit_catalogs: BTreeMap<String, IndexedSuitCatalog>,
     head_suits: BTreeSet<String>,
     suit_errors: BTreeMap<String, String>,
+    suit_table: SuitTable,
+    textures: Vec<String>,
 }
 
 /// Exported startup skeleton state from [`AvatarRegistry::export_skeletons`].
@@ -253,6 +264,7 @@ impl AvatarRegistry {
         let mut skeletons: BTreeMap<String, (usize, SkeletonEntry)> = BTreeMap::new();
         let mut first_skeleton_error: Option<(usize, String)> = None;
         let mut suits = BTreeSet::new();
+        let mut suit_table = SuitTable::default();
         let mut head_bindings: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut suit_errors = BTreeMap::new();
         let mut step = 0usize;
@@ -262,7 +274,7 @@ impl AvatarRegistry {
             let location = source.location(&install.root);
             let bytes = source.read()?;
             if let Err((blocks_skeletons, error)) =
-                read_cmx_catalog(&bytes, &mut suits, &mut head_bindings)
+                read_cmx_catalog(&bytes, &mut suits, &mut suit_table, &mut head_bindings)
             {
                 suit_errors.insert(location.clone(), error.to_string());
                 if blocks_skeletons && first_skeleton_error.is_none() {
@@ -309,7 +321,13 @@ impl AvatarRegistry {
                 }
                 continue;
             }
-            if let Err(error) = read_bcf_appearances(&mut binary, &mut suits, &mut head_bindings) {
+            if let Err(error) = read_bcf_appearances(
+                &mut binary,
+                &mut suits,
+                Some(&mut suit_table),
+                None,
+                &mut head_bindings,
+            ) {
                 suit_errors.insert(location, error.to_string());
             }
         }
@@ -348,6 +366,9 @@ impl AvatarRegistry {
                             });
                         }
                         Kind::Appearance => {
+                            if !suit_table.contains(&entry.name) {
+                                suit_table.insert_name(entry.name.clone());
+                            }
                             let name = decode(&entry.name, 1);
                             if !eager_suits.contains(&name)
                                 && !indexed_suit_entries.contains_key(&name)
@@ -443,7 +464,7 @@ impl AvatarRegistry {
                         suit_errors.insert(location.clone(), reason.clone());
                     }
                     indexed_catalogs.insert(location.clone(), (Vec::new(), Some(reason.clone())));
-                    indexed_suit_catalogs.insert(location, (BTreeMap::new(), Some(reason)));
+                    indexed_suit_catalogs.insert(location, (Vec::new(), Some(reason)));
                     continue;
                 }
             };
@@ -474,14 +495,17 @@ impl AvatarRegistry {
                 if has_suit_refs {
                     suit_errors.insert(location.clone(), reason.clone());
                 }
-                indexed_suit_catalogs.insert(location, (BTreeMap::new(), Some(reason)));
+                indexed_suit_catalogs.insert(location, (Vec::new(), Some(reason)));
                 continue;
             }
             let mut catalog_suits = BTreeSet::new();
+            let mut catalog_suit_order = Vec::new();
             let mut catalog_head_bindings: BTreeMap<String, Vec<String>> = BTreeMap::new();
             let app_error = match read_bcf_appearances(
                 &mut binary,
                 &mut catalog_suits,
+                None,
+                Some(&mut catalog_suit_order),
                 &mut catalog_head_bindings,
             ) {
                 Ok(()) => None,
@@ -493,14 +517,14 @@ impl AvatarRegistry {
                     Some(reason)
                 }
             };
-            let mut catalog_heads = BTreeMap::new();
-            for suit_name in &catalog_suits {
+            let mut catalog_heads = Vec::with_capacity(catalog_suit_order.len());
+            for suit_name in &catalog_suit_order {
                 let has_head = catalog_head_bindings.get(suit_name).is_some_and(|meshes| {
                     meshes
                         .iter()
                         .any(|mesh| has_valid_mesh(&paths, mesh, &mut mesh_cache))
                 });
-                catalog_heads.insert(suit_name.clone(), has_head);
+                catalog_heads.push((suit_name.clone(), has_head));
             }
             indexed_suit_catalogs.insert(location, (catalog_heads, app_error));
             for name in names {
@@ -510,6 +534,18 @@ impl AvatarRegistry {
                 {
                     head_bindings.insert(name, meshes);
                 }
+            }
+        }
+
+        // 0x40895a: collect all BMP then TGA texture stems in startup texture
+        // search paths (`paths.texture_paths`), truncated to 63 bytes.
+        let mut textures = Vec::new();
+        for extension in [b".bmp", b".tga"] {
+            for (_, mut name, _) in
+                resources_with_dir(&paths.files, &paths.texture_paths, extension)?
+            {
+                name.truncate(63);
+                textures.push(decode(&name, 1));
             }
         }
 
@@ -538,6 +574,8 @@ impl AvatarRegistry {
             indexed_suit_catalogs,
             head_suits,
             suit_errors,
+            suit_table,
+            textures,
         })
     }
 
@@ -913,6 +951,8 @@ impl People {
                 suit_errors: registry.suit_errors,
                 head_suits: registry.head_suits,
                 portrait_head,
+                suit_table: registry.suit_table,
+                textures: registry.textures,
             },
             unresolved,
         ))
@@ -1140,6 +1180,7 @@ fn has_valid_mesh(paths: &AvatarPaths, mesh: &str, cache: &mut BTreeMap<String, 
 fn read_cmx_catalog(
     bytes: &[u8],
     suits: &mut BTreeSet<String>,
+    suit_table: &mut SuitTable,
     head_bindings: &mut BTreeMap<String, Vec<String>>,
 ) -> std::result::Result<(), (bool, sims_formats::Error)> {
     let mut cmx = Cmx::new(bytes).map_err(|e| (true, e))?;
@@ -1159,6 +1200,11 @@ fn read_cmx_catalog(
         if let Asset::Appearance(appearance) = cmx.read(Kind::Appearance).map_err(|e| (false, e))?
             && suits.insert(appearance.name.clone())
         {
+            let key = encode_name(&appearance.name)
+                .unwrap_or_else(|| appearance.name.as_bytes().to_vec());
+            if !suit_table.contains(&key) {
+                suit_table.insert_name(key);
+            }
             let meshes: Vec<String> = appearance
                 .bindings
                 .into_iter()
@@ -1226,6 +1272,8 @@ fn read_bcf_skeletons(binary: &mut Binary<'_>) -> (DecodedSkeletons, Option<sims
 fn read_bcf_appearances(
     binary: &mut Binary<'_>,
     suits: &mut BTreeSet<String>,
+    mut suit_table: Option<&mut SuitTable>,
+    mut order: Option<&mut Vec<String>>,
     head_bindings: &mut BTreeMap<String, Vec<String>>,
 ) -> sims_formats::Result<()> {
     let Some(count) = binary.count(Kind::Appearance)? else {
@@ -1238,6 +1286,16 @@ fn read_bcf_appearances(
         if let Asset::Appearance(appearance) = binary.read(Kind::Appearance)?
             && suits.insert(appearance.name.clone())
         {
+            if let Some(table) = suit_table.as_deref_mut() {
+                let key = encode_name(&appearance.name)
+                    .unwrap_or_else(|| appearance.name.as_bytes().to_vec());
+                if !table.contains(&key) {
+                    table.insert_name(key);
+                }
+            }
+            if let Some(order) = order.as_deref_mut() {
+                order.push(appearance.name.clone());
+            }
             let meshes: Vec<String> = appearance
                 .bindings
                 .into_iter()
@@ -1835,8 +1893,9 @@ xskin-b001-PELVIS-BODY\r\n\
 0\r\n\
 0\r\n";
         let mut suits = BTreeSet::new();
+        let mut suit_table = SuitTable::default();
         let mut head_bindings = BTreeMap::new();
-        read_cmx_catalog(cmx, &mut suits, &mut head_bindings).unwrap();
+        read_cmx_catalog(cmx, &mut suits, &mut suit_table, &mut head_bindings).unwrap();
         assert_eq!(
             suits,
             ["b001_body", "c001_exact", "c002_lower"]

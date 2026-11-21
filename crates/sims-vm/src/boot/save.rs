@@ -71,6 +71,9 @@ pub struct Saved {
     loaded_indexed_suits: BTreeMap<String, Option<bool>>,
     made_outfits: BTreeMap<u32, BTreeMap<usize, String>>,
     person_outfits: BTreeMap<u16, PersonOutfit>,
+    scratch_ptr_set: BTreeSet<u16>,
+    runtime_added_suits: Vec<String>,
+    suit_scan_cache: Option<Vec<String>>,
 }
 
 /// Why a lot could not be saved or restored.
@@ -157,6 +160,9 @@ impl Saved {
         saved.world.loaded_indexed_suits = saved.loaded_indexed_suits.clone();
         saved.world.made_outfits = saved.made_outfits.clone();
         saved.world.person_outfits = saved.person_outfits.clone();
+        saved.world.scratch_ptr_set = saved.scratch_ptr_set.clone();
+        saved.world.runtime_added_suits = saved.runtime_added_suits.clone();
+        saved.world.suit_scan_cache = saved.suit_scan_cache.clone();
         Ok(saved)
     }
 }
@@ -195,6 +201,9 @@ impl Lot {
             loaded_indexed_suits: self.world.loaded_indexed_suits.clone(),
             made_outfits: self.world.made_outfits.clone(),
             person_outfits: self.world.person_outfits.clone(),
+            scratch_ptr_set: self.world.scratch_ptr_set.clone(),
+            runtime_added_suits: self.world.runtime_added_suits.clone(),
+            suit_scan_cache: self.world.suit_scan_cache.clone(),
         })
     }
 
@@ -260,6 +269,9 @@ mod tests {
                 (2, "c001,HEAD-HEAD=c001".into()),
             ]),
         );
+        world.scratch_ptr_set.insert(42);
+        world.runtime_added_suits.push("late_suit".into());
+        world.suit_scan_cache = Some(vec!["suit_a".into(), "late_suit".into()]);
         let saved = Saved {
             dirty_portraits: world.dirty_portraits.clone(),
             generated_portrait_2002: world.generated_portrait_2002.clone(),
@@ -269,6 +281,9 @@ mod tests {
             loaded_indexed_suits: world.loaded_indexed_suits.clone(),
             made_outfits: world.made_outfits.clone(),
             person_outfits: world.person_outfits.clone(),
+            scratch_ptr_set: world.scratch_ptr_set.clone(),
+            runtime_added_suits: world.runtime_added_suits.clone(),
+            suit_scan_cache: world.suit_scan_cache.clone(),
             world,
             ticks: 1,
             start: 0,
@@ -316,6 +331,15 @@ mod tests {
                     (2, "c001,HEAD-HEAD=c001".to_owned()),
                 ])
             )])
+        );
+        assert_eq!(decoded.world().scratch_ptr_set, BTreeSet::from([42]));
+        assert_eq!(
+            decoded.world().runtime_added_suits,
+            vec!["late_suit".to_owned()]
+        );
+        assert_eq!(
+            decoded.world().suit_scan_cache,
+            Some(vec!["suit_a".to_owned(), "late_suit".to_owned()])
         );
     }
 }

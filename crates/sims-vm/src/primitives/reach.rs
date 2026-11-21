@@ -348,7 +348,13 @@ impl Machine<'_, '_> {
             return Ok(false);
         };
         let mut a = self.reach_animator();
-        read_appearance_if_stale(self.world, self.program, me, &mut a.profile_stale)?;
+        read_appearance_if_stale(
+            self.catalog,
+            self.world,
+            self.program,
+            me,
+            &mut a.profile_stale,
+        )?;
         let table = if self.person_word(AGE)? <= 17 {
             CHILD_REACHES
         } else {

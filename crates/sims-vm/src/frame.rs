@@ -187,7 +187,7 @@ impl Interpreter<'_> {
         let mut a = world.animators.get(&id).cloned().unwrap_or(LOADED);
 
         // 1. Byte +0xd8.
-        read_appearance_if_stale(world, self.program, id, &mut a.profile_stale)?;
+        read_appearance_if_stale(self.catalog, world, self.program, id, &mut a.profile_stale)?;
 
         // 2. The body (`0x590cb8` → `0x58a178(0)`): runs full dressing side
         // effects (pet `data[8] = 0`, cached-guard early exit `0x58a333`,

@@ -160,6 +160,9 @@ impl Machine<'_, '_> {
                 .ok_or_else(|| Trap::Invalid("a relationship row vanished".into()))?
                 .resize(column + 1, 0);
         }
+        // 0x44d513: binds `[edi + 0x128]` to the local scratch slot before
+        // resolving the value operand and never clears it.
+        self.world.scratch_ptr_set.insert(self.me);
         // The operand is resolved for writing in both directions.
         let (cell, writable) = self.resolve(operands[4], word(operands, 6), true)?;
         let vanished = || Trap::Invalid("a relationship row vanished".into());

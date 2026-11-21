@@ -400,7 +400,7 @@ impl Machine<'_, '_> {
             && self.in_portrait_table(guid)?
             && (self.world.made_portrait_head.contains_key(&guid) || self.has_portrait_2002(guid))
         {
-            return self.ui_effect_portrait_for_guid(guid);
+            return self.ui_effect_portrait_for_guid(guid, "a dialog's portrait");
         }
         if !self.listed_person_type(guid, "a dialog's portrait")? {
             return Ok(());
@@ -448,6 +448,7 @@ impl Machine<'_, '_> {
                     person_id,
                     guid,
                     false,
+                    "a dialog's portrait",
                 )?
                 .unwrap_or(false);
                 if !can_render {
@@ -517,6 +518,7 @@ impl Machine<'_, '_> {
                 id,
                 guid,
                 false,
+                "a dialog's portrait",
             )?
             .unwrap_or(false)
         } else {

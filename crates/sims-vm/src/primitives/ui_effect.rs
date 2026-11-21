@@ -164,7 +164,9 @@ pub(crate) fn can_render_person_portrait(
     person_id: u16,
     guid: u32,
     defer_unknown_head: bool,
+    caller: &str,
 ) -> Result<Option<bool>, Trap> {
+    let had_outfit_before = world.person_outfits.contains_key(&person_id);
     // 0x4e7801 -> 0x58a178(1): run full forced dressing BEFORE 0x4e7824 checks
     // for a usable "HEAD" bone.
     crate::outfits::dress_person(catalog, program, world, person_id, true)?;
@@ -180,9 +182,10 @@ pub(crate) fn can_render_person_portrait(
     }
 
     // Inspect actually attached slots (`[ebx + 0x258]`, `[ebx + 0x25c]`,
-    // `[ebx + 0x268]`) and live bound accessories (`[ebx + 0x274]`).
+    // `[ebx + 0x268]`, and `[ebx + 0x274]` accessories).
     let mut any_slot_bound = false;
     let mut status = Some(false);
+    let mut has_bound_accessories = false;
     if let Some(outfit) = world.person_outfits.get(&person_id) {
         for bound in [
             &outfit.head,
@@ -193,16 +196,22 @@ pub(crate) fn can_render_person_portrait(
         ]
         .into_iter()
         .flatten()
+        .chain(&outfit.accessories)
         {
             any_slot_bound = true;
             status = combine_head_status(status, bound.has_head);
         }
+        has_bound_accessories = !outfit.accessories.is_empty();
     }
-    if let Some(accessories) = world
-        .objects
-        .get(&person_id)
-        .and_then(|o| o.person.as_ref())
-        .map(|p| &p.accessories)
+    // Fallback only for synthetic fixtures that directly populate
+    // `person.accessories` on a Sim with no pre-existing `PersonOutfit` entry.
+    if !had_outfit_before
+        && !has_bound_accessories
+        && let Some(accessories) = world
+            .objects
+            .get(&person_id)
+            .and_then(|o| o.person.as_ref())
+            .map(|p| &p.accessories)
     {
         for acc in accessories {
             if acc.name.is_empty() {
@@ -233,8 +242,7 @@ pub(crate) fn can_render_person_portrait(
 
     if status.is_none() && !defer_unknown_head {
         return Err(Trap::Unsupported(format!(
-            "UI Effect's portrait of type 0x{guid:08X} (0x4e7824): whether its suit binds \
-             HEAD is unknown"
+            "{caller} of type 0x{guid:08X} (0x4e7824): whether its suit binds HEAD is unknown"
         )));
     }
     Ok(status)
@@ -270,11 +278,17 @@ impl Machine<'_, '_> {
         Ok(true)
     }
 
-    /// Reads the operand variable (`0x453141` with `write == 0`), failing
-    /// loudly on global 34 where `0x45412b` → `0x4541d5` writes through the
-    /// uninitialized pointer at `object + 0x128`.
+    /// Reads the operand variable (`0x453141` with `write == 0`). On global 34,
+    /// `0x45412b` → `0x4541d5` writes `&globals[34]` through `[object + 0x128]`
+    /// without a null check: if an earlier `Expression`, `Random Number`,
+    /// `Get Direction To`, `Relationship`, or `Set To Next` on this object
+    /// already populated `[object + 0x128]` (`World::scratch_ptr_set`), the
+    /// read succeeds and returns `globals[34]`; otherwise it traps.
     fn read_ui_effect_var(&mut self, scope: u8, index: i16) -> Result<i16, Trap> {
-        if scope == GLOBAL_SCOPE && index == GLOBAL_34 {
+        if scope == GLOBAL_SCOPE
+            && index == GLOBAL_34
+            && !self.world.scratch_ptr_set.contains(&self.me)
+        {
             return Err(Trap::Unsupported(
                 "UI Effect reading global 34 (0x45412b -> 0x4541d5 writes through uninitialized \
                  object +0x128)"
@@ -291,18 +305,22 @@ impl Machine<'_, '_> {
         let Some(guid) = self.world.neighbors.get(neighbor).map(|r| r.guid) else {
             return Ok(());
         };
-        self.ui_effect_portrait_for_guid(guid)
+        self.ui_effect_portrait_for_guid(guid, "UI Effect's portrait")
     }
 
     /// Runs `0x4e92a8` for a known `guid` (`0x47689c`, `0x4363d1`).
-    pub(crate) fn ui_effect_portrait_for_guid(&mut self, guid: u32) -> Result<(), Trap> {
+    pub(crate) fn ui_effect_portrait_for_guid(
+        &mut self,
+        guid: u32,
+        caller: &str,
+    ) -> Result<(), Trap> {
         if !self.in_portrait_table(guid)? {
             return Ok(());
         }
         // 0x4e92e5: when the slot's dirty flag ([entry + 0x18], set by
         // 0x4e895e) is set, call 0x4e8c5d(index, 1, 0) first (save flag 0).
         if self.world.dirty_portraits.contains(&guid) {
-            let _ = self.try_render_ui_effect_portrait(guid, false)?;
+            let _ = self.try_render_ui_effect_portrait(guid, false, caller)?;
         }
         // 0x4e931c: if the slot now holds a cached bitmap, done.
         if self.world.portraits.contains(&guid) {
@@ -321,11 +339,11 @@ impl Machine<'_, '_> {
         // already cached the portrait or wrote BMP_ 2002 depends on unmodeled
         // wardrobe order; fail loudly before running a second 0x4e8c5d.
         if self.world.ambiguous_portraits.contains(&guid) {
-            let _ = self.can_render_portrait(guid)?;
+            let _ = self.can_render_portrait(guid, caller)?;
         }
         // 0x4e938c: BMP_ 2002 absent or invalid -> call 0x4e8c5d(index, 1, 1)
         // (save flag 1: persists BMP_ 2002 via 0x4e9000 on success when writable).
-        let _ = self.try_render_ui_effect_portrait(guid, true)?;
+        let _ = self.try_render_ui_effect_portrait(guid, true, caller)?;
         Ok(())
     }
 
@@ -424,11 +442,11 @@ impl Machine<'_, '_> {
     /// Resolves [`Machine::portrait_head_status`] for portrait rendering,
     /// failing loudly if a `Make New Character` pick has an unknown `"HEAD"`
     /// binding.
-    pub(crate) fn can_render_portrait(&self, guid: u32) -> Result<bool, Trap> {
+    pub(crate) fn can_render_portrait(&self, guid: u32, caller: &str) -> Result<bool, Trap> {
         self.portrait_head_status(guid).ok_or_else(|| {
             Trap::Unsupported(format!(
-                "UI Effect's portrait of runtime-made type 0x{guid:08X} (0x4e7824): whether the \
-                 wardrobe pick binds HEAD is unknown"
+                "{caller} of runtime-made type 0x{guid:08X} (0x4e7824): whether the wardrobe \
+                 pick binds HEAD is unknown"
             ))
         })
     }
@@ -461,8 +479,9 @@ impl Machine<'_, '_> {
         &mut self,
         guid: u32,
         save_bitmap: bool,
+        caller: &str,
     ) -> Result<bool, Trap> {
-        self.render_portrait(guid, save_bitmap, false)
+        self.render_portrait(guid, save_bitmap, false, caller)
     }
 
     /// Runs `0x4e8c5d(index, 0x1f, 1)` for `Make New Character` pet creation
@@ -471,7 +490,7 @@ impl Machine<'_, '_> {
     /// a mixed custom pet wardrobe into a fault inside opcode 19 (deferring
     /// any trap until `UI Effect` or `Dialog` actually queries the portrait).
     pub(crate) fn try_render_pet_portrait(&mut self, guid: u32) -> Result<bool, Trap> {
-        self.render_portrait(guid, true, true)
+        self.render_portrait(guid, true, true, "Make New Character's portrait")
     }
 
     fn render_portrait(
@@ -479,6 +498,7 @@ impl Machine<'_, '_> {
         guid: u32,
         save_bitmap: bool,
         defer_unknown_head: bool,
+        caller: &str,
     ) -> Result<bool, Trap> {
         // 0x4e8c92 -> 0x4e893e -> 0x43ac10: resolve the winning definition.
         let Some(file_key) = self.portrait_file(guid) else {
@@ -502,6 +522,7 @@ impl Machine<'_, '_> {
                 person_id,
                 guid,
                 defer_unknown_head,
+                caller,
             )? {
                 Some(ok) => ok,
                 None => {
@@ -529,8 +550,7 @@ impl Machine<'_, '_> {
         let interpreter = self.interpreter();
         let unsupported = |fault| {
             Trap::Unsupported(format!(
-                "making a person of type 0x{guid:08X} for UI Effect's portrait (0x4e9652): \
-                 {fault}"
+                "making a person of type 0x{guid:08X} for {caller} (0x4e9652): {fault}"
             ))
         };
         let mut copy = self.world.clone();
@@ -545,8 +565,8 @@ impl Machine<'_, '_> {
             let _ = built.try_create(&mut copy, guid).map_err(unsupported)?;
             if !cells.same_refresh(&crate::both_ways::Cells::of(&interpreter)) {
                 return Err(Trap::Unsupported(format!(
-                    "making an object of type 0x{guid:08X} for UI Effect's portrait (0x4e9652) \
-                     changed the refresh pending, which is not ported"
+                    "making an object of type 0x{guid:08X} for {caller} (0x4e9652) changed the \
+                     refresh pending, which is not ported"
                 )));
             }
             cells.keep(&interpreter, self.world, copy);
@@ -560,15 +580,15 @@ impl Machine<'_, '_> {
             // side effects, leave portrait uncached, return false.
             if !cells.same_refresh(&crate::both_ways::Cells::of(&interpreter)) {
                 return Err(Trap::Unsupported(format!(
-                    "making a person of type 0x{guid:08X} for UI Effect's portrait (0x4e9652) \
-                     changed the refresh pending, which is not ported"
+                    "making a person of type 0x{guid:08X} for {caller} (0x4e9652) changed the \
+                     refresh pending, which is not ported"
                 )));
             }
             cells.keep(&interpreter, self.world, copy);
             return Ok(false);
         };
         let placed = built
-            .portrait_put_outcome(&mut copy, id, "UI Effect's portrait")
+            .portrait_put_outcome(&mut copy, id, caller)
             .map_err(|fault| fault.trap)?;
         let can_render = if !placed {
             false
@@ -580,6 +600,7 @@ impl Machine<'_, '_> {
                 id,
                 guid,
                 defer_unknown_head,
+                caller,
             )? {
                 Some(ok) => ok,
                 None => {
@@ -607,8 +628,8 @@ impl Machine<'_, '_> {
         built.remove_now(&mut copy, id).map_err(unsupported)?;
         if !cells.same_refresh(&crate::both_ways::Cells::of(&interpreter)) {
             return Err(Trap::Unsupported(format!(
-                "making a person of type 0x{guid:08X} for UI Effect's portrait (0x4e9652) \
-                 changed the refresh pending, which is not ported"
+                "making a person of type 0x{guid:08X} for {caller} (0x4e9652) changed the \
+                 refresh pending, which is not ported"
             )));
         }
         cells.keep(&interpreter, self.world, copy);
