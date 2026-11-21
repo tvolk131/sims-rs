@@ -77,6 +77,16 @@ class BuildTest(unittest.TestCase):
         self.assertEqual((m['house'], m['notes'], m['baseline']), ('House05', ['a note'], dict(tick=99, lot=5)))
 
 
+class QueuedTest(unittest.TestCase):
+    def test_a_push_takes_its_result_by_push_id(self):
+        rows = [dict(kind='queued', push=1, person=21, update=5), dict(kind='queued', push=2, person=21, update=5),
+                dict(kind='queue_result', push=2, accepted=False, uid=None),
+                dict(kind='queue_result', push=1, accepted=True, uid=6),
+                dict(kind='queued_unread', push=3, person=None), dict(kind='queued', person=18, update=9)]
+        self.assertEqual([(q.get('push'), q.get('accepted'), q.get('uid')) for q in manifest.queued_actions(rows)],
+                         [(1, True, 6), (2, False, None), (None, None, None)])
+
+
 class DialogsTest(unittest.TestCase):
     def test_overlapping_dialogs_are_paired_by_record(self):
         events = [dict(kind='dialog_show', update=1, record=0xa, time=0),

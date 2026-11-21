@@ -633,3 +633,135 @@ fn test_sim_interacting_with_looks_at_the_objects_in_use() {
     let fault = interpreter.turn(&mut fx.world, SIM, 100).unwrap_err();
     assert_eq!(fault.trap.code(), Some(0x1c));
 }
+
+/// In Find Best Interaction, a visitor joining another person's running
+/// interaction on a category 4 or 7 object reaches 0x458319's hotel-key
+/// check when the joining entry lacks flag 1: without the key it creates
+/// an empty inventory and declines; with the key it chooses the join.
+#[test]
+fn autonomy_allows_a_visitor_join_on_category_4_only_with_the_hotel_key() {
+    use sims_sim::neighbors::{Inventory, Item};
+
+    const KEY: u32 = 0x3ac0_22d6;
+    const OTHER: u16 = 7;
+    const NEIGHBOR: i16 = 55;
+
+    let setup = |with_key: bool| {
+        let mut fx = lot(0x100);
+        // Lamp is category 4; menu 3 is joinable into menu 5, and neither
+        // has flag 1 (VISITORS).
+        fx.lamp_mut().data[59] = 4;
+        let table = fx
+            .program
+            .libraries
+            .get_mut(&LAMP_FILE)
+            .unwrap()
+            .interactions
+            .get_mut(&TABLE)
+            .unwrap()
+            .as_mut()
+            .unwrap();
+        table.interactions[0].flags = 2; // JOINABLE
+        table.interactions[0].joining_index = 5;
+        table.interactions[1].flags = 0x100; // FIRST, no VISITORS
+
+        // A second person running menu 3 on the lamp; advertises, is not
+        // in use, and has object type 2 and a table so autonomy_entries
+        // appends the join offer.
+        fx.words(SIM_FILE)[9] = 2;
+        let mut other = fx.sim().clone();
+        other.id = OTHER;
+        other.data[25] = 0;
+        other.registry_word = Some(8 << 16);
+        let op = other.person.as_mut().unwrap();
+        op.data[32] = 0;
+        op.active.target = LAMP as i16;
+        op.active.table_index = 3;
+        fx.world.objects.insert(OTHER, other);
+        let sim_table = fx.words(SIM_FILE)[7] as u16;
+        fx.program
+            .libraries
+            .get_mut(&SIM_FILE)
+            .unwrap()
+            .interactions
+            .insert(
+                sim_table,
+                Some(InteractionTable {
+                    version: 7,
+                    interactions: Vec::new(),
+                }),
+            );
+
+        // SIM is a visitor with neighbor ID 55.
+        let sim = fx.sim_mut().person.as_mut().unwrap();
+        sim.data[31] = NEIGHBOR;
+        sim.data[32] = 1;
+        fx.catalog.objects.push(sims_content::Object {
+            guid: KEY,
+            resource: 0,
+            chunk: 0,
+            kind: 0xd,
+            master: 0,
+        });
+        if with_key {
+            fx.world.neighbors.inventories.push(Inventory {
+                neighbor: NEIGHBOR,
+                items: vec![Item {
+                    kind: 0,
+                    guid: KEY,
+                    count: 1,
+                }],
+            });
+        }
+        fx
+    };
+
+    let mut fx = setup(false);
+    assert_eq!(turn(&mut fx), Status::Returned(false));
+    assert_eq!(
+        fx.world.neighbors.inventories,
+        vec![Inventory {
+            neighbor: NEIGHBOR,
+            items: Vec::new(),
+        }]
+    );
+
+    let mut fx = setup(true);
+    assert_eq!(turn(&mut fx), Status::Yielded);
+    assert_eq!(fx.sim().data[20], 5);
+
+    // 0x458319 reads person word 32 live for each action check: if an
+    // earlier check tree in the scan clears the visitor flag, the later
+    // category-4 join is allowed without touching or creating inventories.
+    let mut fx = setup(false);
+    // Give OTHER a visitor-allowed entry checked before the join entry;
+    // its check tree clears SIM's person data word 32 and returns false.
+    fx.add(
+        SIM_FILE,
+        4305,
+        tree(vec![assign(
+            18, // My Person Data
+            32,
+            scope::LITERAL,
+            0,
+            RETURN_FALSE,
+        )]),
+    );
+    let sim_table = fx.words(SIM_FILE)[7] as u16;
+    let mut clear_visitor = entry(1, 0, 1); // VISITORS
+    clear_visitor.test = 4305;
+    fx.program
+        .libraries
+        .get_mut(&SIM_FILE)
+        .unwrap()
+        .interactions
+        .get_mut(&sim_table)
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .interactions
+        .push(clear_visitor);
+    assert_eq!(turn(&mut fx), Status::Yielded);
+    assert_eq!(fx.sim().data[20], 5);
+    assert!(fx.world.neighbors.inventories.is_empty());
+}
