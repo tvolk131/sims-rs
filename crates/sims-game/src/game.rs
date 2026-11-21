@@ -979,6 +979,11 @@ impl Game {
     /// a menu, or once the lot has stopped. True if a listing may have
     /// changed the lot.
     fn follow(&mut self) -> bool {
+        if self.hud.controls.mode != Mode::Live {
+            self.reached = None;
+            self.listed = None;
+            return false;
+        }
         let under = match self.pointer {
             Some(point) if self.stopped.is_none() && !self.hud.covers(point) => self.under(point),
             _ => None,

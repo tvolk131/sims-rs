@@ -5513,6 +5513,19 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
             assert!(lot.buy_move(&mut cursor, [pos[0], pos[1]], pos[2]).unwrap());
             assert_eq!(cursor.container.map(|(c, _)| c), Some(surface_id));
             assert_eq!(lot.world().objects[&cursor.held].data[1], next_dir);
+            // Temporarily unaffordable preview must still retain its surface
+            // container so manual rotation survives when funds recover again.
+            let orig_price = cursor.price;
+            cursor.price = lot.world().budget.funds + 10;
+            assert!(!lot.buy_move(&mut cursor, [pos[0], pos[1]], pos[2]).unwrap());
+            assert!(!cursor.valid);
+            assert_eq!(cursor.container.map(|(c, _)| c), Some(surface_id));
+            assert_eq!(lot.world().objects[&cursor.held].data[1], next_dir);
+            cursor.price = orig_price;
+            assert!(lot.buy_move(&mut cursor, [pos[0], pos[1]], pos[2]).unwrap());
+            assert!(cursor.valid);
+            assert_eq!(cursor.container.map(|(c, _)| c), Some(surface_id));
+            assert_eq!(lot.world().objects[&cursor.held].data[1], next_dir);
         }
         // Cancel before testing the next item so the same surface slot stays free.
         lot.buy_cancel(&cursor).unwrap();
@@ -5597,6 +5610,52 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
         assert_eq!(lot.world().budget.funds, funds_after_undos - 80);
         assert!(lot.world().objects[&ch_id].position[0] >= 0);
         // Clean up the chair back to undo/redo off-lot so the test continues cleanly.
+        assert!(lot.buy_undo().unwrap());
+    }
+
+    // Ground flag `0x20` (`UserTestPlace`, `0x435522`): road/curb tile
+    // `[24, 328, 1]` has ground flags `0x27` (`& 0x20 != 0`) and must be
+    // refused by Buy placement.
+    let mut blocked_cur = lot.buy_start(0x26bf_bb29, 1, 2).unwrap().unwrap();
+    assert!(!lot.buy_move(&mut blocked_cur, [24, 328], 1).unwrap());
+    assert!(!blocked_cur.valid);
+    lot.buy_cancel(&blocked_cur).unwrap();
+
+    // Blocked container Redo: buying a Mesquite Desk on the lawn and placing a
+    // Gloominator Desk Lamp on it, undoing both, blocking the desk's tile with
+    // a previewed chair, then redoing both must refuse BOTH the desk and the
+    // lamp (since the desk is still detached off-lot) without charging for the
+    // lamp.
+    if let Some(desk) = catalog
+        .all()
+        .iter()
+        .find(|i| i.name.contains("Mesquite") && i.name.contains("Desk"))
+    {
+        let mut desk_cur = lot.buy_start(desk.guid, 1, 2).unwrap().unwrap();
+        assert!(lot.buy_move(&mut desk_cur, [520, 472], 1).unwrap());
+        let desk_id = lot.buy_commit(&desk_cur).unwrap();
+        let mut lamp_cur = lot.buy_start(lamp.guid, 1, 2).unwrap().unwrap();
+        assert!(lot.buy_move(&mut lamp_cur, [520, 472], 1).unwrap());
+        assert_eq!(lamp_cur.container.map(|(c, _)| c), Some(desk_id));
+        let desk_lamp_id = lot.buy_commit(&lamp_cur).unwrap();
+        assert!(lot.buy_undo().unwrap());
+        assert!(lot.buy_undo().unwrap());
+        assert!(lot.world().objects[&desk_id].position[0] < 0);
+        assert!(lot.world().objects[&desk_lamp_id].position[0] < 0);
+        let funds_before_blocked_redo = lot.world().budget.funds;
+        let mut blocker = lot.buy_start(0x26bf_bb29, 1, 2).unwrap().unwrap();
+        assert!(lot.buy_move(&mut blocker, [520, 472], 1).unwrap());
+        // Desk redo is refused because the preview chair occupies `[520, 472]`.
+        assert!(!lot.buy_redo().unwrap());
+        assert!(lot.world().objects[&desk_id].position[0] < 0);
+        assert_eq!(lot.world().budget.funds, funds_before_blocked_redo);
+        // Lamp redo must also be refused because its container desk is off-lot.
+        assert!(!lot.buy_redo().unwrap());
+        assert!(lot.world().objects[&desk_lamp_id].position[0] < 0);
+        assert_eq!(lot.world().budget.funds, funds_before_blocked_redo);
+        lot.buy_cancel(&blocker).unwrap();
+        // Undo the two refused records so later Undo assertions still reach `placed_lamp`.
+        assert!(lot.buy_undo().unwrap());
         assert!(lot.buy_undo().unwrap());
     }
 
@@ -5708,6 +5767,13 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
     game.render();
     assert_eq!(game.run(60), 60);
     game.set_mode(Mode::Buy);
+    // Hovering and rendering in Buy Mode with no item armed must NOT run Live
+    // Mode interaction checks (`Game::follow`) or mutate simulation state.
+    let hash_before_buy_hover = game.lot().world().hash();
+    game.hover([266, 190]);
+    game.render();
+    assert_eq!(game.listed(), None);
+    assert_eq!(game.lot().world().hash(), hash_before_buy_hover);
     let objs_before = game.lot().world().objects.len();
     game.press([258, 524]);
     game.release([258, 524]);
