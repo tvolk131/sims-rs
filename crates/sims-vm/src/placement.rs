@@ -38,6 +38,20 @@
 use crate::fault::{Fault, Trap};
 use crate::interpreter::Interpreter;
 use crate::load::INDICATORS;
+
+/// Placement strategy for `0x4e9652` temporary portrait persons.
+pub(crate) enum PortraitPutPlan {
+    /// No valid tile found (`0x4e96e4` → `0x4e9706`): remove unput.
+    NoTile,
+    /// Tile-independent fast path already ran `placed_from_outside`.
+    FastPlaced,
+    /// Exact tile known (`view_centre` given or unique reachable tile): run
+    /// `put_person(world, id, pos, 1)` directly.
+    Exact([i32; 2]),
+    /// Multiple reachable tiles with unset `view_centre` and a tile-sensitive
+    /// hook: verify invariance across all candidates.
+    Candidates(Vec<[i32; 2]>),
+}
 use crate::program::DEFINITION_WORDS;
 use crate::visits::function;
 use sims_sim::World;
@@ -1467,6 +1481,149 @@ impl Interpreter<'_> {
         }
         self.placed_from_outside(world, id)?;
         Ok(true)
+    }
+
+    /// Plans how `UI Effect` / pet portrait creation (`0x4e9652` → `0x4e96fe`)
+    /// places its temporary person on the lot.
+    ///
+    /// - When [`Interpreter::view_centre`] is given, or when every interior
+    ///   start lands on the same unique tile, returns [`PortraitPutPlan::Exact`]
+    ///   so the caller executes [`Interpreter::put_person`] directly (including
+    ///   `function::PLACED`, `WALLS_CHANGED`, `SEAT`, `BEFORE_REMOVAL`,
+    ///   `LIGHTS_ROOM`, `FLAGS_2`, `note_room`, and `ensure_indicators`).
+    /// - When no tile is found from the view centre (or from every interior
+    ///   start), returns [`PortraitPutPlan::NoTile`].
+    /// - When `view_centre` is unset and multiple tiles are reachable: uses the
+    ///   O(1) tile-independent fast path ([`PortraitPutPlan::FastPlaced`]) when
+    ///   no tile-sensitive hook is active, or returns
+    ///   [`PortraitPutPlan::Candidates`] so the caller can verify whether all
+    ///   reachable tiles produce identical post-removal state.
+    pub(crate) fn portrait_put_plan(
+        &self,
+        world: &mut World,
+        id: u16,
+        caller: &str,
+    ) -> Result<PortraitPutPlan, Fault> {
+        let fail = |what: String| Fault {
+            object: id,
+            at: None,
+            trap: Trap::Unsupported(format!(
+                "{caller} puts a person on a tile searched for from the house view's \
+                 centre (0x4e96dd, 0x4347f0, 0x4a677c; `Lot::set_view_centre`), and {what}"
+            )),
+        };
+        let datum = |world: &World, index: usize| {
+            datum(world, id, index).map_err(|trap| Fault {
+                object: id,
+                at: None,
+                trap,
+            })
+        };
+        let rules = Rules {
+            same_room: true,
+            empty: true,
+            unmarked: false,
+        };
+        let tiles: Vec<[i8; 2]> = match self.view_centre {
+            Some([x, y]) => {
+                let from = [(i32::from(x) << 4) | 8, (i32::from(y) << 4) | 8];
+                let Some(pos) = self.search(world, id, from, 1, rules)? else {
+                    return Ok(PortraitPutPlan::NoTile);
+                };
+                return Ok(PortraitPutPlan::Exact(pos));
+            }
+            None => {
+                let mut copy = world.clone();
+                let cells = crate::both_ways::Cells::of(self);
+                let probe = Interpreter {
+                    asked: None,
+                    callbacks_must_be_pure: true,
+                    ..cells.on(self)
+                };
+                let mut ends = probe.search_from_anywhere(&mut copy, id, 1, rules)?;
+                if let Some(starts) = ends.remove(&None) {
+                    if ends.is_empty() {
+                        return Ok(PortraitPutPlan::NoTile);
+                    }
+                    let listed: Vec<String> = starts
+                        .iter()
+                        .take(8)
+                        .map(|[x, y]| format!("{x},{y}"))
+                        .collect();
+                    return Err(fail(format!(
+                        "no view centre is given, and from {} of the starts ({}{}) no tile is \
+                         found while other starts find one: the outcome (placed vs unput removal \
+                         at 0x4e9706) depends on the missing view centre",
+                        starts.len(),
+                        listed.join("; "),
+                        if starts.len() > 8 { "; ..." } else { "" },
+                    )));
+                }
+                ends.into_keys().flatten().collect()
+            }
+        };
+        if let &[[tx, ty]] = tiles.as_slice() {
+            return Ok(PortraitPutPlan::Exact([
+                (i32::from(tx) << 4) | 8,
+                (i32::from(ty) << 4) | 8,
+            ]));
+        }
+        let has_callback = [
+            WALLS_CHANGED,
+            function::PLACED,
+            BEFORE_REMOVAL,
+            SEAT_CHANGED,
+            SEAT,
+        ]
+        .iter()
+        .any(|&f| self.function_tree(world, id, f) != 0);
+        let tile_sensitive = has_callback
+            || datum(world, data::LIGHTS_ROOM)? != 0
+            || datum(world, data::FLAGS_2)? as u16 & 0x400 != 0
+            || world.indicators[0] == 0;
+        let room_changed = if tile_sensitive {
+            true
+        } else {
+            let mut rooms = BTreeSet::new();
+            for &[a, b] in &tiles {
+                rooms.insert(find::room(world, a, b, 1).map_err(|trap| Fault {
+                    object: id,
+                    at: None,
+                    trap,
+                })?);
+            }
+            let mut changed = false;
+            for room in rooms {
+                let mut copy = world.clone();
+                if let Some(word) = copy
+                    .objects
+                    .get_mut(&id)
+                    .and_then(|o| o.data.get_mut(data::ROOM))
+                {
+                    *word = room;
+                }
+                self.note_room(&mut copy, id).map_err(|trap| Fault {
+                    object: id,
+                    at: None,
+                    trap,
+                })?;
+                if copy.rooms != world.rooms {
+                    changed = true;
+                    break;
+                }
+            }
+            changed
+        };
+        if !room_changed {
+            self.placed_from_outside(world, id)?;
+            return Ok(PortraitPutPlan::FastPlaced);
+        }
+        Ok(PortraitPutPlan::Candidates(
+            tiles
+                .into_iter()
+                .map(|[tx, ty]| [(i32::from(tx) << 4) | 8, (i32::from(ty) << 4) | 8])
+                .collect(),
+        ))
     }
 
     /// What the interface does when an object comes onto the lot from

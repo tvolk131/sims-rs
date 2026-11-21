@@ -320,6 +320,47 @@ impl Wardrobe {
         None
     }
 
+    /// Whether the pet body wardrobe list (`0x409663`) for `cat` (`true` = cat,
+    /// `false` = dog) contains an entry matching `raw_row` under `0x472ec4` →
+    /// `0x5874ca` and `0x472f92` (63-byte suit and `BODY=` descriptor buffers),
+    /// returning `(suit_name_63, formatted_row)` when found.
+    pub fn find_pet_outfit(&self, cat: bool, raw_row: &str) -> Option<(String, String)> {
+        let row_255: String = raw_row.chars().take(255).collect();
+        let before_semi = row_255.split(';').next().unwrap_or(&row_255);
+        let (raw_suit, raw_tex) = before_semi.split_once(',')?;
+        let row_suit: String = raw_suit.to_ascii_lowercase().chars().take(63).collect();
+        let row_tex: String = raw_tex.to_ascii_lowercase().chars().take(63).collect();
+        let species = if cat {
+            ['c', 'a', 't']
+        } else {
+            ['d', 'o', 'g']
+        };
+        for suit in &self.suits {
+            let chars: Vec<char> = suit.chars().take(7).collect();
+            if !(chars.len() == 7 && chars[0] == 'b' && chars[4..7] == species) {
+                continue;
+            }
+            let suit_63: String = suit.to_ascii_lowercase().chars().take(63).collect();
+            if suit_63 != row_suit {
+                continue;
+            }
+            let prefix: String = chars.into_iter().collect();
+            for tex in &self.textures {
+                if tex.starts_with(&prefix) {
+                    let stem = tex
+                        .strip_suffix(".bmp")
+                        .or_else(|| tex.strip_suffix(".tga"))
+                        .unwrap_or(tex);
+                    let desc_63: String = format!("BODY={stem}").chars().take(63).collect();
+                    if desc_63.to_ascii_lowercase() == row_tex {
+                        return Some((suit_63.clone(), format!("{suit_63},{desc_63}")));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Parses a `STR# 200` body (`head == false`, `0x40d0a4`) or head
     /// (`head == true`, `0x40d408`) outfit row under `0x472ec4` → `0x5874ca`
     /// (255-char row buffer at `0x587511`–`0x58752c`, strip `;...`, split on

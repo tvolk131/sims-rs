@@ -25,7 +25,17 @@ impl Machine<'_, '_> {
     pub(crate) fn expression(&mut self, operands: &[u8; 8]) -> Result<bool, Trap> {
         let (left_index, right_index) = (word(operands, 0), word(operands, 2));
         let (operator, left_scope, right_scope) = (operands[5], operands[6], operands[7]);
-        // The original resolves the right operand before the left.
+        // The original resolves the right operand (`0x452c76`) BEFORE binding
+        // `[edi + 0x128]` at `0x452c85`. On a fresh object whose scratch
+        // pointer is still null, reading global 34 dereferences null at
+        // `0x4541db`.
+        if right_scope == 6 && right_index == 34 && !self.world.scratch_ptr_set.contains(&self.me) {
+            return Err(Trap::Unsupported(
+                "Expression reading global 34 before [object + 0x128] is initialized \
+                 (0x452c76 -> 0x4541db) dereferences null"
+                    .into(),
+            ));
+        }
         let rhs = i32::from(self.read(right_scope, right_index)?);
         // 0x452c85: binds `[edi + 0x128]` to `[ebp - 0x04]`. Because the
         // dispatcher pushes 1 argument for Expression (`0x45237d`) and 2 for

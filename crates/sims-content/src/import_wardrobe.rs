@@ -422,6 +422,47 @@ impl ImportWardrobe {
         None
     }
 
+    /// Whether the native-ordered pet body wardrobe list (`0x409663`) for
+    /// `cat` (`true` = cat, `false` = dog) contains an entry equal
+    /// (case-insensitively on 63-byte suit and complete `BODY=` descriptor
+    /// buffers, `0x472f92`) to `raw_row`, returning the matched 63-byte
+    /// `(suit_lower, formatted_row)` when found.
+    pub fn find_pet_outfit(&self, cat: bool, raw_row: &str) -> Option<(String, String)> {
+        let row_255: String = raw_row.chars().take(255).collect();
+        let before_semi = row_255.split(';').next().unwrap_or(&row_255);
+        let (raw_suit, raw_tex) = before_semi.split_once(',')?;
+        let row_suit: String = raw_suit.to_ascii_lowercase().chars().take(63).collect();
+        let row_tex: String = raw_tex.to_ascii_lowercase().chars().take(63).collect();
+        let species = if cat { b"cat" } else { b"dog" };
+        for suit in &self.suits {
+            if suit.len() < 7
+                || !suit[0].eq_ignore_ascii_case(&b'b')
+                || !suit[4..7].eq_ignore_ascii_case(species)
+            {
+                continue;
+            }
+            let suit_str: String = decode(suit, 1)
+                .to_ascii_lowercase()
+                .chars()
+                .take(63)
+                .collect();
+            if suit_str != row_suit {
+                continue;
+            }
+            let prefix = &suit[..7];
+            for tex in &self.textures {
+                if tex.len() >= 7 && tex[..7].eq_ignore_ascii_case(prefix) {
+                    let tex_str = decode(tex, 1);
+                    let desc_63: String = format!("BODY={tex_str}").chars().take(63).collect();
+                    if desc_63.to_ascii_lowercase() == row_tex {
+                        return Some((suit_str.clone(), format!("{suit_str},{desc_63}")));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Whether the native-ordered human wardrobe list for `(head, female,
     /// child, skin)` contains an entry equal (case-insensitively on 63-byte
     /// suit and complete texture descriptor buffers, `0x472f92`) to `raw_row`,

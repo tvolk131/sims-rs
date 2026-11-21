@@ -279,6 +279,8 @@ impl Machine<'_, '_> {
                 self.world,
                 guid,
                 final_profile.as_ref(),
+                crate::outfits::BodyCommitState::Matched,
+                None,
             );
             self.world.made_portrait_head.insert(guid, head_status);
             self.frame_mut()?.stack_object = record;
@@ -301,35 +303,46 @@ impl Machine<'_, '_> {
                 None
             };
             self.world.dialogs.declined = -1;
-            let (body_row, head_status) = if let Some(idx) = picked_idx {
-                let picked = self.pick_pet_suit(species == 2, idx);
-                let status = picked
-                    .as_ref()
-                    .and_then(|(s, _)| self.classify_written_wardrobe_suit(s));
-                (picked.map(|(_, row)| row), status)
-            } else {
-                // 0x40d14d / 0x40d162 leaves body row 1 at the template's
-                // value, while 0x44b0a3 -> 0x40a5e2 writes "NONE" into head
-                // row 2 and rows 30..=34. Only the template's body row 1 can
-                // supply a HEAD binding.
-                let tpl_body = self
-                    .program
-                    .people
-                    .profiles
-                    .get(&template)
-                    .and_then(|p| p.body.clone());
-                let status = self.suit_row_head_status(tpl_body.as_deref());
-                (tpl_body, status)
-            };
             let mut outfit_rows = std::collections::BTreeMap::new();
-            if let Some(row) = body_row {
-                outfit_rows.insert(1, row);
-            }
             // 0x40a5d5..0x40a614: pet commits write "NONE" to 1-based rows
             // 3 (head, 0-based 2) and 0x1f..=0x23 (0-based 30..=34).
             for row in [2usize, 30, 31, 32, 33, 34] {
                 outfit_rows.insert(row, "NONE".to_owned());
             }
+            let head_status = if let Some(idx) = picked_idx {
+                let picked = self.pick_pet_suit(species == 2, idx);
+                let status = picked
+                    .as_ref()
+                    .and_then(|(s, _)| self.classify_written_wardrobe_suit(s));
+                if let Some((_, row)) = picked {
+                    outfit_rows.insert(1, row);
+                }
+                status
+            } else {
+                // 0x40d14d / 0x40d162 leaves body row 1 at the template's
+                // value, then 0x44b0a3 -> 0x40a588 -> 0x40a5a1 rechecks it
+                // against the pet wardrobe list (`0x40d0a4`). On a miss (-1),
+                // the empty pet head list sends execution to `0x40ac57..0x40acac`,
+                // clearing 0-based rows `1, 2, 15, 16, 17, 18` to `""` (leaving
+                // rows `30..=34` as `"NONE"`).
+                let tpl_body = crate::people::profile(&self.program.people, self.world, guid)
+                    .ok()
+                    .and_then(|p| p.body.clone());
+                let matched = tpl_body
+                    .as_deref()
+                    .and_then(|raw| self.find_pet_suit(species == 2, raw));
+                if let Some((suit, _)) = matched {
+                    if let Some(row) = tpl_body {
+                        outfit_rows.insert(1, row);
+                    }
+                    self.classify_written_wardrobe_suit(&suit)
+                } else {
+                    for row in [1usize, 2, 15, 16, 17, 18] {
+                        outfit_rows.insert(row, String::new());
+                    }
+                    Some(false)
+                }
+            };
             self.world
                 .made_outfits
                 .entry(guid)
@@ -496,177 +509,209 @@ impl Machine<'_, '_> {
             rows
         };
         let live_ordered = self.live_ordered_wardrobe()?;
-        let (copied_outfits, head_status) = match &live_ordered {
-            Some(ordered) => {
-                let mut body_hit = src_body.and_then(|raw| {
-                    ordered.find_outfit(false, src_female, src_child, &src_skin, raw)
-                });
-                let mut head_hit = src_head.and_then(|raw| {
-                    ordered.find_outfit(true, src_female, src_child, &src_skin, raw)
-                });
-                let mut cleared_empty_list = false;
-                if body_hit.is_none() || head_hit.is_none() {
-                    let body_count = ordered.count(false, src_female, src_child, &src_skin);
-                    let head_count = ordered.count(true, src_female, src_child, &src_skin);
-                    if body_count > 0 && head_count > 0 {
-                        if body_hit.is_none() {
-                            body_hit = ordered.pick(false, src_female, src_child, &src_skin, 0);
-                        }
-                        if head_hit.is_none() {
-                            head_hit = ordered.pick(true, src_female, src_child, &src_skin, 0);
-                        }
-                    } else {
-                        body_hit = None;
-                        head_hit = None;
-                        cleared_empty_list = true;
-                    }
-                }
-                let body_status = match &body_hit {
-                    Some((suit, _)) => self.classify_written_wardrobe_suit(suit),
-                    None => Some(false),
-                };
-                let head_only_status = match &head_hit {
-                    Some((suit, _)) => self.classify_written_wardrobe_suit(suit),
-                    None => Some(false),
-                };
-                let combined = match (body_status, head_only_status) {
-                    (Some(true), _) | (_, Some(true)) => Some(true),
-                    (Some(false), Some(false)) => Some(false),
-                    _ => None,
-                };
-                let rows = build_copy_rows(
-                    body_hit.map(|(_, row)| row),
-                    head_hit.map(|(_, row)| row),
-                    cleared_empty_list,
-                );
-                (Some(rows), combined)
-            }
-            None => {
-                let has_made_outfit = self
-                    .world
-                    .made_outfits
-                    .get(&self_guid)
-                    .is_some_and(|m| m.contains_key(&1) || m.contains_key(&2));
-                match self.program.wardrobe.as_ref() {
-                    None => {
-                        let status = if !has_manual_made_suit
-                            && !has_made_outfit
-                            && let Some(&status) = self.world.made_portrait_head.get(&self_guid)
-                        {
-                            status
-                        } else if src_body.is_none()
-                            && src_head.is_none()
-                            && loaded_body_rows.is_none()
-                            && self.program.people.portrait_head.get(&self_guid) == Some(&true)
-                        {
-                            None
-                        } else {
-                            Some(false)
-                        };
-                        (None, status)
-                    }
-                    Some(wardrobe) if wardrobe.errors.is_empty() => {
-                        let format_matched_row = |raw: &str, matched_suit: &str| -> String {
-                            let row_255: String = raw.chars().take(255).collect();
-                            let before_semi = row_255.split(';').next().unwrap_or(&row_255);
-                            let raw_tex = before_semi.split_once(',').map_or("", |(_, t)| t);
-                            let suit_63: String = matched_suit.chars().take(63).collect();
-                            let tex_63: String = raw_tex.chars().take(63).collect();
-                            format!("{suit_63},{tex_63}")
-                        };
-                        let mut body_suits: Option<(Vec<String>, String)> =
-                            src_body.and_then(|raw| {
-                                let matched = wardrobe
-                                    .matching_outfits(false, src_female, src_child, &src_skin, raw);
-                                (!matched.is_empty()).then(|| {
-                                    let row = format_matched_row(raw, matched[0]);
-                                    (matched.into_iter().map(str::to_owned).collect(), row)
-                                })
-                            });
-                        let mut head_suits: Option<(Vec<String>, String)> =
-                            src_head.and_then(|raw| {
-                                let matched = wardrobe
-                                    .matching_outfits(true, src_female, src_child, &src_skin, raw);
-                                (!matched.is_empty()).then(|| {
-                                    let row = format_matched_row(raw, matched[0]);
-                                    (matched.into_iter().map(str::to_owned).collect(), row)
-                                })
-                            });
-                        let mut cleared_empty_list = false;
-                        if body_suits.is_none() || head_suits.is_none() {
-                            let body_count =
-                                wardrobe.count(false, src_female, src_child, &src_skin);
-                            let head_count = wardrobe.count(true, src_female, src_child, &src_skin);
-                            if body_count > 0 && head_count > 0 {
-                                if body_suits.is_none() {
-                                    body_suits = wardrobe
-                                        .pick(false, src_female, src_child, &src_skin, 0)
-                                        .map(|(s, r)| (vec![s], r));
-                                }
-                                if head_suits.is_none() {
-                                    head_suits = wardrobe
-                                        .pick(true, src_female, src_child, &src_skin, 0)
-                                        .map(|(s, r)| (vec![s], r));
-                                }
-                            } else {
-                                body_suits = None;
-                                head_suits = None;
-                                cleared_empty_list = true;
+        let (copied_outfits, head_status, body_commit_state, pre_clear_body_row) =
+            match &live_ordered {
+                Some(ordered) => {
+                    let mut body_hit = src_body.and_then(|raw| {
+                        ordered.find_outfit(false, src_female, src_child, &src_skin, raw)
+                    });
+                    let mut head_hit = src_head.and_then(|raw| {
+                        ordered.find_outfit(true, src_female, src_child, &src_skin, raw)
+                    });
+                    let initial_body_row = body_hit.as_ref().map(|(_, row)| row.clone());
+                    let mut cleared_empty_list = false;
+                    let mut body_state = crate::outfits::BodyCommitState::Matched;
+                    if body_hit.is_none() || head_hit.is_none() {
+                        let body_count = ordered.count(false, src_female, src_child, &src_skin);
+                        let head_count = ordered.count(true, src_female, src_child, &src_skin);
+                        if body_count > 0 && head_count > 0 {
+                            if body_hit.is_none() {
+                                body_hit = ordered.pick(false, src_female, src_child, &src_skin, 0);
+                                body_state = crate::outfits::BodyCommitState::ReplacedWithFallback;
                             }
+                            if head_hit.is_none() {
+                                head_hit = ordered.pick(true, src_female, src_child, &src_skin, 0);
+                            }
+                        } else {
+                            if body_hit.is_none() {
+                                body_state = crate::outfits::BodyCommitState::ClearedEmptyList;
+                            }
+                            body_hit = None;
+                            head_hit = None;
+                            cleared_empty_list = true;
                         }
-                        let classify_list = |hit: &Option<(Vec<String>, String)>| -> Option<bool> {
-                            let Some((suits, _)) = hit else {
-                                return Some(false);
-                            };
-                            if suits
-                                .iter()
-                                .all(|s| self.classify_written_wardrobe_suit(s) == Some(true))
+                    }
+                    let body_status = match &body_hit {
+                        Some((suit, _)) => self.classify_written_wardrobe_suit(suit),
+                        None => Some(false),
+                    };
+                    let head_only_status = match &head_hit {
+                        Some((suit, _)) => self.classify_written_wardrobe_suit(suit),
+                        None => Some(false),
+                    };
+                    let combined = match (body_status, head_only_status) {
+                        (Some(true), _) | (_, Some(true)) => Some(true),
+                        (Some(false), Some(false)) => Some(false),
+                        _ => None,
+                    };
+                    let rows = build_copy_rows(
+                        body_hit.map(|(_, row)| row),
+                        head_hit.map(|(_, row)| row),
+                        cleared_empty_list,
+                    );
+                    (Some(rows), combined, body_state, initial_body_row)
+                }
+                None => {
+                    let has_made_outfit = self
+                        .world
+                        .made_outfits
+                        .get(&self_guid)
+                        .is_some_and(|m| m.contains_key(&1) || m.contains_key(&2));
+                    match self.program.wardrobe.as_ref() {
+                        None => {
+                            let status = if !has_manual_made_suit
+                                && !has_made_outfit
+                                && let Some(&status) = self.world.made_portrait_head.get(&self_guid)
                             {
-                                Some(true)
-                            } else if suits
-                                .iter()
-                                .all(|s| self.classify_written_wardrobe_suit(s) == Some(false))
+                                status
+                            } else if src_body.is_none()
+                                && src_head.is_none()
+                                && loaded_body_rows.is_none()
+                                && self.program.people.portrait_head.get(&self_guid) == Some(&true)
                             {
-                                Some(false)
-                            } else {
                                 None
-                            }
-                        };
-                        let combined =
-                            match (classify_list(&body_suits), classify_list(&head_suits)) {
-                                (Some(true), _) | (_, Some(true)) => Some(true),
-                                (Some(false), Some(false)) => Some(false),
-                                _ => None,
+                            } else {
+                                Some(false)
                             };
-                        let rows = build_copy_rows(
-                            body_suits.map(|(_, row)| row),
-                            head_suits.map(|(_, row)| row),
-                            cleared_empty_list,
-                        );
-                        (Some(rows), combined)
-                    }
-                    Some(wardrobe) => {
-                        let body_miss = self.is_definite_outfit_miss(
-                            wardrobe, src_body, false, src_female, src_child, &src_skin,
-                        );
-                        let head_miss = self.is_definite_outfit_miss(
-                            wardrobe, src_head, true, src_female, src_child, &src_skin,
-                        );
-                        let empty_list = !wardrobe
-                            .errors
-                            .contains_key("the install's person files")
-                            && (!wardrobe.has_any_texture(false, src_female, src_child, &src_skin)
-                                || !wardrobe
-                                    .has_any_texture(true, src_female, src_child, &src_skin));
-                        if (body_miss || head_miss) && empty_list {
-                            (Some(build_copy_rows(None, None, true)), Some(false))
-                        } else {
-                            (None, None)
+                            (None, status, crate::outfits::BodyCommitState::Matched, None)
+                        }
+                        Some(wardrobe) if wardrobe.errors.is_empty() => {
+                            // Match `0x40d0a4 -> 0x408bf5 -> 0x409663 -> 0x40922f`:
+                            // freeze the shared `0x6e48a0` suit scan cache.
+                            let _ = crate::outfits::suit_scan_order(self.program, self.world);
+                            let format_matched_row = |raw: &str, matched_suit: &str| -> String {
+                                let row_255: String = raw.chars().take(255).collect();
+                                let before_semi = row_255.split(';').next().unwrap_or(&row_255);
+                                let raw_tex = before_semi.split_once(',').map_or("", |(_, t)| t);
+                                let suit_63: String = matched_suit.chars().take(63).collect();
+                                let tex_63: String = raw_tex.chars().take(63).collect();
+                                format!("{suit_63},{tex_63}")
+                            };
+                            let mut body_suits: Option<(Vec<String>, String)> =
+                                src_body.and_then(|raw| {
+                                    let matched = wardrobe.matching_outfits(
+                                        false, src_female, src_child, &src_skin, raw,
+                                    );
+                                    (!matched.is_empty()).then(|| {
+                                        let row = format_matched_row(raw, matched[0]);
+                                        (matched.into_iter().map(str::to_owned).collect(), row)
+                                    })
+                                });
+                            let mut head_suits: Option<(Vec<String>, String)> =
+                                src_head.and_then(|raw| {
+                                    let matched = wardrobe.matching_outfits(
+                                        true, src_female, src_child, &src_skin, raw,
+                                    );
+                                    (!matched.is_empty()).then(|| {
+                                        let row = format_matched_row(raw, matched[0]);
+                                        (matched.into_iter().map(str::to_owned).collect(), row)
+                                    })
+                                });
+                            let initial_body_row = body_suits.as_ref().map(|(_, row)| row.clone());
+                            let mut cleared_empty_list = false;
+                            let mut body_state = crate::outfits::BodyCommitState::Matched;
+                            if body_suits.is_none() || head_suits.is_none() {
+                                let body_count =
+                                    wardrobe.count(false, src_female, src_child, &src_skin);
+                                let head_count =
+                                    wardrobe.count(true, src_female, src_child, &src_skin);
+                                if body_count > 0 && head_count > 0 {
+                                    if body_suits.is_none() {
+                                        body_suits = wardrobe
+                                            .pick(false, src_female, src_child, &src_skin, 0)
+                                            .map(|(s, r)| (vec![s], r));
+                                        body_state =
+                                            crate::outfits::BodyCommitState::ReplacedWithFallback;
+                                    }
+                                    if head_suits.is_none() {
+                                        head_suits = wardrobe
+                                            .pick(true, src_female, src_child, &src_skin, 0)
+                                            .map(|(s, r)| (vec![s], r));
+                                    }
+                                } else {
+                                    if body_suits.is_none() {
+                                        body_state =
+                                            crate::outfits::BodyCommitState::ClearedEmptyList;
+                                    }
+                                    body_suits = None;
+                                    head_suits = None;
+                                    cleared_empty_list = true;
+                                }
+                            }
+                            let classify_list =
+                                |hit: &Option<(Vec<String>, String)>| -> Option<bool> {
+                                    let Some((suits, _)) = hit else {
+                                        return Some(false);
+                                    };
+                                    if suits.iter().all(|s| {
+                                        self.classify_written_wardrobe_suit(s) == Some(true)
+                                    }) {
+                                        Some(true)
+                                    } else if suits.iter().all(|s| {
+                                        self.classify_written_wardrobe_suit(s) == Some(false)
+                                    }) {
+                                        Some(false)
+                                    } else {
+                                        None
+                                    }
+                                };
+                            let combined =
+                                match (classify_list(&body_suits), classify_list(&head_suits)) {
+                                    (Some(true), _) | (_, Some(true)) => Some(true),
+                                    (Some(false), Some(false)) => Some(false),
+                                    _ => None,
+                                };
+                            let rows = build_copy_rows(
+                                body_suits.map(|(_, row)| row),
+                                head_suits.map(|(_, row)| row),
+                                cleared_empty_list,
+                            );
+                            (Some(rows), combined, body_state, initial_body_row)
+                        }
+                        Some(wardrobe) => {
+                            let _ = crate::outfits::suit_scan_order(self.program, self.world);
+                            let body_miss = self.is_definite_outfit_miss(
+                                wardrobe, src_body, false, src_female, src_child, &src_skin,
+                            );
+                            let head_miss = self.is_definite_outfit_miss(
+                                wardrobe, src_head, true, src_female, src_child, &src_skin,
+                            );
+                            let empty_list = !wardrobe
+                                .errors
+                                .contains_key("the install's person files")
+                                && (!wardrobe
+                                    .has_any_texture(false, src_female, src_child, &src_skin)
+                                    || !wardrobe
+                                        .has_any_texture(true, src_female, src_child, &src_skin));
+                            if (body_miss || head_miss) && empty_list {
+                                let state = if body_miss {
+                                    crate::outfits::BodyCommitState::ClearedEmptyList
+                                } else {
+                                    crate::outfits::BodyCommitState::Matched
+                                };
+                                (
+                                    Some(build_copy_rows(None, None, true)),
+                                    Some(false),
+                                    state,
+                                    src_body.map(str::to_owned),
+                                )
+                            } else {
+                                (None, None, crate::outfits::BodyCommitState::Matched, None)
+                            }
                         }
                     }
                 }
-            }
-        };
+            };
         if let Some(rows) = copied_outfits {
             self.world
                 .made_outfits
@@ -685,6 +730,8 @@ impl Machine<'_, '_> {
             self.world,
             guid,
             final_profile.as_ref(),
+            body_commit_state,
+            pre_clear_body_row.as_deref(),
         );
         self.world.made_portrait_head.insert(guid, head_status);
         self.frame_mut()?.stack_object = record;
@@ -902,6 +949,9 @@ impl Machine<'_, '_> {
                  ({error})"
             )));
         }
+        // 0x40d077 -> 0x408bf5 -> 0x409663 -> 0x40922f freezes `0x6e48a0` on
+        // the first non-empty scan even when using the fallback `Wardrobe`.
+        let _ = crate::outfits::suit_scan_order(self.program, self.world);
         let count = |head| {
             u32::try_from(wardrobe.count(head, female, child, tone))
                 .map_err(|_| Trap::Invalid("more suits than a count holds".into()))
@@ -929,6 +979,7 @@ impl Machine<'_, '_> {
                  ({error})"
             )));
         }
+        let _ = crate::outfits::suit_scan_order(self.program, self.world);
         u32::try_from(wardrobe.count_pet(cat))
             .map_err(|_| Trap::Invalid("more suits than a count holds".into()))
     }
@@ -951,6 +1002,19 @@ impl Machine<'_, '_> {
                 .wardrobe
                 .as_ref()?
                 .pick(head, female, child, tone, index)
+        }
+    }
+
+    /// Looks up `raw_row` in the pet body wardrobe list (`0x40a5a1` →
+    /// `0x40d0a4` → `0x472f92`), returning `(suit_name_63, formatted_row)` on hit.
+    fn find_pet_suit(&mut self, cat: bool, raw_row: &str) -> Option<(String, String)> {
+        if let Ok(Some(ordered)) = self.live_ordered_wardrobe() {
+            ordered.find_pet_outfit(cat, raw_row)
+        } else {
+            self.program
+                .wardrobe
+                .as_ref()?
+                .find_pet_outfit(cat, raw_row)
         }
     }
 
@@ -989,26 +1053,6 @@ impl Machine<'_, '_> {
     fn classify_written_wardrobe_suit(&self, suit: &str) -> Option<bool> {
         let written: String = suit.chars().take(63).collect();
         self.classify_suit_head(&written)
-    }
-
-    /// Classifies a single `STR# 200` outfit row string (`"suit,..."`) by
-    /// whether its suit binds `"HEAD"`.
-    fn suit_row_head_status(&self, raw: Option<&str>) -> Option<bool> {
-        let Some(raw) = raw else {
-            return Some(false);
-        };
-        let suit = raw
-            .split(';')
-            .next()
-            .unwrap_or(raw)
-            .split(',')
-            .next()
-            .unwrap_or(raw)
-            .to_ascii_lowercase();
-        if suit.is_empty() || suit == "none" {
-            return Some(false);
-        }
-        self.classify_suit_head(&suit)
     }
 
     /// Whether `raw` is guaranteed to miss in `0x40d0a4`/`0x40d408` even if

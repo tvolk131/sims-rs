@@ -605,60 +605,106 @@ impl Machine<'_, '_> {
             cells.keep(&interpreter, self.world, copy);
             return Ok(false);
         };
-        let placed = built
-            .portrait_put_outcome(&mut copy, id, caller)
+        let plan = built
+            .portrait_put_plan(&mut copy, id, caller)
             .map_err(|fault| fault.trap)?;
-        let can_render = if !placed {
-            false
-        } else {
-            match can_render_person_portrait(
-                self.catalog,
-                self.program,
-                &mut copy,
-                id,
-                guid,
-                defer_unknown_head,
-                caller,
-            )? {
-                Some(ok) => ok,
-                None => {
-                    copy.ambiguous_portraits.insert(guid);
-                    false
+        let finish_at = |tile: Option<[i32; 2]>,
+                         placed: bool,
+                         mut lot: sims_sim::World,
+                         run_cells: crate::both_ways::Cells|
+         -> Result<(bool, sims_sim::World, crate::both_ways::Cells), Trap> {
+            let run = run_cells.on(&interpreter);
+            if let Some(pos) = tile {
+                run.put_person(&mut lot, id, pos, 1)?;
+            }
+            let can_render = if !placed {
+                false
+            } else {
+                match can_render_person_portrait(
+                    self.catalog,
+                    self.program,
+                    &mut lot,
+                    id,
+                    guid,
+                    defer_unknown_head,
+                    caller,
+                )? {
+                    Some(ok) => ok,
+                    None => {
+                        lot.ambiguous_portraits.insert(guid);
+                        false
+                    }
+                }
+            };
+            let rendered = placed && can_render;
+            if rendered {
+                // 0x4e8d14 -> 0x4e899e caches the portrait and clears dirty, and
+                // 0x4e8d2e -> 0x4e9000 stages BMP_ 2002 BEFORE removing the
+                // temporary person at 0x4e8fdb (so a Reset callback during removal
+                // can still invalidate the portrait via 0x44e712 -> 0x4e895e,
+                // while 0x4e8feb flushes the staged BMP_ 2002 afterwards).
+                lot.portraits.insert(guid);
+                lot.dirty_portraits.remove(&guid);
+                if save_bitmap {
+                    lot.generated_portrait_2002.insert(file_key);
                 }
             }
+            // 0x4e8dab..0x4e8fbb: additional flags in `0x4e8c5d(index, 0x1f, 1)`
+            // run forced dresses (`0x4e77c6` -> `0x4e7801` -> `0x58a178(1)`) on the
+            // temporary person before removal.
+            if placed {
+                for _ in 0..extra_passes {
+                    crate::outfits::dress_person(self.catalog, self.program, &mut lot, id, true)?;
+                }
+            }
+            // Both normal completion (0x4e8fdb) and no-tile failure (0x4e9706)
+            // remove the temporary person immediately and keep its Init/RNG
+            // side effects.
+            run.remove_now(&mut lot, id).map_err(unsupported)?;
+            if !run_cells.same_refresh(&crate::both_ways::Cells::of(&interpreter)) {
+                return Err(Trap::Unsupported(format!(
+                    "making a person of type 0x{guid:08X} for {caller} (0x4e9652) changed the \
+                     refresh pending, which is not ported"
+                )));
+            }
+            Ok((rendered, lot, run_cells))
         };
-        let rendered = placed && can_render;
-        if rendered {
-            // 0x4e8d14 -> 0x4e899e caches the portrait and clears dirty, and
-            // 0x4e8d2e -> 0x4e9000 stages BMP_ 2002 BEFORE removing the
-            // temporary person at 0x4e8fdb (so a Reset callback during removal
-            // can still invalidate the portrait via 0x44e712 -> 0x4e895e,
-            // while 0x4e8feb flushes the staged BMP_ 2002 afterwards).
-            copy.portraits.insert(guid);
-            copy.dirty_portraits.remove(&guid);
-            if save_bitmap {
-                copy.generated_portrait_2002.insert(file_key);
+        let (rendered, final_world, final_cells) = match plan {
+            crate::placement::PortraitPutPlan::NoTile => finish_at(None, false, copy, cells)?,
+            crate::placement::PortraitPutPlan::FastPlaced => finish_at(None, true, copy, cells)?,
+            crate::placement::PortraitPutPlan::Exact(pos) => {
+                finish_at(Some(pos), true, copy, cells)?
             }
-        }
-        // 0x4e8dab..0x4e8fbb: additional flags in `0x4e8c5d(index, 0x1f, 1)`
-        // run forced dresses (`0x4e77c6` -> `0x4e7801` -> `0x58a178(1)`) on the
-        // temporary person before removal.
-        if placed {
-            for _ in 0..extra_passes {
-                crate::outfits::dress_person(self.catalog, self.program, &mut copy, id, true)?;
+            crate::placement::PortraitPutPlan::Candidates(positions) => {
+                const MAX_CANDIDATES: usize = 256;
+                if positions.len() > MAX_CANDIDATES {
+                    return Err(Trap::Unsupported(format!(
+                        "{caller} puts a person on a tile searched for from the house view's \
+                         centre (0x4e96dd, 0x4347f0, 0x4a677c; `Lot::set_view_centre`), and with \
+                         no view centre given {} candidate tiles have tile-sensitive placement \
+                         hooks",
+                        positions.len()
+                    )));
+                }
+                let first = finish_at(Some(positions[0]), true, copy.clone(), cells.copy())?;
+                for &pos in &positions[1..] {
+                    let next = finish_at(Some(pos), true, copy.clone(), cells.copy())?;
+                    if next.0 != first.0
+                        || !crate::both_ways::same_lot(&first.1, &next.1)
+                        || !first.2.same(&next.2)
+                    {
+                        return Err(Trap::Unsupported(format!(
+                            "{caller} puts a person on a tile searched for from the house view's \
+                             centre (0x4e96dd, 0x4347f0, 0x4a677c; `Lot::set_view_centre`), and \
+                             with no view centre given the placement outcome depends on which tile \
+                             the search picks"
+                        )));
+                    }
+                }
+                first
             }
-        }
-        // Both normal completion (0x4e8fdb) and no-tile failure (0x4e9706)
-        // remove the temporary person immediately and keep its Init/RNG
-        // side effects.
-        built.remove_now(&mut copy, id).map_err(unsupported)?;
-        if !cells.same_refresh(&crate::both_ways::Cells::of(&interpreter)) {
-            return Err(Trap::Unsupported(format!(
-                "making a person of type 0x{guid:08X} for {caller} (0x4e9652) changed the \
-                 refresh pending, which is not ported"
-            )));
-        }
-        cells.keep(&interpreter, self.world, copy);
+        };
+        final_cells.keep(&interpreter, self.world, final_world);
         Ok(rendered)
     }
 }

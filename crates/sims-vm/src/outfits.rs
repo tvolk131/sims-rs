@@ -381,13 +381,17 @@ fn texture_list(program: &Program) -> Vec<String> {
     Vec::new()
 }
 
-/// Extracts the 3-byte body type at Windows-1252 byte offset `6..9`
-/// (`0x40b84a`, `0x40e59f`, `0x40afeb`), lowercased in ASCII.
+/// Extracts up to 3 bytes of body type starting at Windows-1252 byte offset 6
+/// (`0x40b84a`, `0x40e59f` → `0x46f775`, `0x40afeb`), stopping at the end of
+/// the string and lowercased in ASCII.
 fn cp1252_body_type(suit: &str) -> String {
     let bytes = encode_cp1252(suit);
     bytes
-        .get(6..9)
-        .map(|slice| sims_formats::strings::decode(slice, 1).to_ascii_lowercase())
+        .get(6..)
+        .map(|rest| {
+            let end = rest.len().min(3);
+            sims_formats::strings::decode(&rest[..end], 1).to_ascii_lowercase()
+        })
         .unwrap_or_default()
 }
 
@@ -790,6 +794,23 @@ pub(crate) fn init_clothing_rows(
     }
 }
 
+/// How `0x40a588`'s body check (`0x40a5a1`, `0x40a6a6`, `0x40ab7f..0x40acbc`)
+/// resolved row 1 before clothing validation (`0x40acbc`) and `0x40af5b`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BodyCommitState {
+    /// `body_idx != -1`: run the `0x40a6a6..0x40ab7b` body-type comparisons
+    /// against the matched body row.
+    Matched,
+    /// `body_idx == -1` and both body and head lists were non-empty:
+    /// `0x40abf9..0x40ac50` replaced row 1 with index 0 and invalidated all
+    /// relevant clothing indices (`f/s/l/w/h` for adults, `s/l/w` for children).
+    ReplacedWithFallback,
+    /// `body_idx == -1` and an empty body or head list sent execution to
+    /// `0x40ac57` (clearing rows `1, 2, 15..=18`): `0x40a6b4` skipped body-type
+    /// comparisons and did not invalidate inherited clothing indices.
+    ClearedEmptyList,
+}
+
 /// Runs `0x40a588` (post-edit clothing commit for rows 30..=34) followed by
 /// `0x40af5b` (rebuilding naked row 15, swim row 16, formal row 27, and hand
 /// rows 17..=22, 28..=29) at the end of `Make New Character` human creation
@@ -799,6 +820,8 @@ pub(crate) fn commit_character_clothing(
     world: &mut World,
     guid: u32,
     profile: Option<&sims_content::Profile>,
+    body_state: BodyCommitState,
+    pre_clear_body_row: Option<&str>,
 ) {
     let gender_code = profile_gender_code(read_character_row(world, guid, profile, 12).as_deref());
     if !(0..=1).contains(&gender_code) {
@@ -832,7 +855,9 @@ pub(crate) fn commit_character_clothing(
     let textures = texture_list(program);
 
     // Build exact `0x408bf5` wardrobe list for clothing kind (`f`/`s`/`l`/`w`/`h`).
-    let build_list = |kind: u8| -> Vec<(String, String)> {
+    // `0x472e7e–0x472eb7` store separate 63-byte suit and `BODY=<tex>` fields
+    // joined at `0x472f41` as `"{suit_63},{desc_63}"` (up to 127 bytes).
+    let build_list = |kind: u8| -> Vec<(String, String, String)> {
         let mut out = Vec::new();
         for suit in &scan {
             let sb = encode_cp1252(suit);
@@ -843,140 +868,200 @@ pub(crate) fn commit_character_clothing(
             {
                 continue;
             }
+            let suit_63 = truncate_cp1252(suit, 63).to_owned();
             let mut prefix = sb[..9].to_ascii_lowercase();
             prefix.extend_from_slice(&skin_bytes);
             for tex in &textures {
                 let tb = encode_cp1252(tex);
                 if tb.len() >= prefix.len() && tb[..prefix.len()].eq_ignore_ascii_case(&prefix) {
-                    out.push((suit.clone(), format_generated_body_row(suit, tex)));
+                    let desc_full = format!("BODY={tex}");
+                    let desc_63 = truncate_cp1252(&desc_full, 63).to_owned();
+                    let row = format!("{suit_63},{desc_63}");
+                    out.push((suit_63.clone(), desc_63, row));
                 }
             }
         }
         out
     };
-    let find_in_list = |list: &[(String, String)], raw: Option<&str>| -> Option<usize> {
+    // `0x472ec4 -> 0x5874ca -> 0x472f92`: cap raw row at 255 CP1252 bytes,
+    // strip `;...`, split on `,`, and compare 63-byte suit and texture
+    // descriptor fields case-insensitively.
+    let find_in_list = |list: &[(String, String, String)], raw: Option<&str>| -> Option<usize> {
         let raw = raw?;
         if raw.is_empty() {
             return None;
         }
-        let (want_suit, want_tex) = parse_row_descriptor(raw, false);
-        let want_suit_63 = truncate_cp1252(&want_suit, 63);
-        let want_tex_63 = truncate_cp1252(&want_tex, 63);
-        list.iter().position(|(_, entry_row)| {
-            let (s, t) = parse_row_descriptor(entry_row, false);
+        let row_255 = truncate_cp1252(raw, 255);
+        let before_semi = row_255.split(';').next().unwrap_or(row_255);
+        let (want_suit, want_tex) = before_semi.split_once(',')?;
+        let want_suit_63 = truncate_cp1252(want_suit, 63);
+        let want_tex_63 = truncate_cp1252(want_tex, 63);
+        list.iter().position(|(s, t, _)| {
             s.eq_ignore_ascii_case(want_suit_63) && t.eq_ignore_ascii_case(want_tex_63)
         })
     };
 
-    // 1. 0x40ad00..0x40aeb4: rows 30, 31, 32 (formal / swim / pajama).
-    if !is_child {
-        let formal_list = build_list(b'f');
-        let swim_list = build_list(b's');
-        let pajama_list = build_list(b'l');
-        let f_idx = find_in_list(
-            &formal_list,
-            read_character_row(world, guid, profile, 30).as_deref(),
-        );
-        let s_idx = find_in_list(
-            &swim_list,
-            read_character_row(world, guid, profile, 31).as_deref(),
-        );
-        let l_idx = find_in_list(
-            &pajama_list,
-            read_character_row(world, guid, profile, 32).as_deref(),
-        );
-        if f_idx.is_none() || s_idx.is_none() || l_idx.is_none() {
-            let entry = world.made_outfits.entry(guid).or_default();
-            if formal_list.is_empty() || swim_list.is_empty() || pajama_list.is_empty() {
-                entry.insert(30, String::new());
-                entry.insert(31, String::new());
-                entry.insert(32, String::new());
-            } else if f_idx.is_none() && s_idx.is_none() && l_idx.is_none() {
+    // Snapshot inherited clothing rows before writing `"ADDED"` / fallbacks.
+    let row_30 = read_character_row(world, guid, profile, 30);
+    let row_31 = read_character_row(world, guid, profile, 31);
+    let row_32 = read_character_row(world, guid, profile, 32);
+    let row_33 = read_character_row(world, guid, profile, 33);
+    let row_34 = read_character_row(world, guid, profile, 34);
+
+    let formal_list = build_list(b'f');
+    let swim_list = build_list(b's');
+    let pajama_list = build_list(b'l');
+    let winter_list = build_list(b'w');
+    let hf_list = if !is_child {
+        build_list(b'h')
+    } else {
+        Vec::new()
+    };
+
+    let (mut f_idx, mut s_idx, mut l_idx, mut w_idx, mut h_idx) = if !is_child {
+        (
+            find_in_list(&formal_list, row_30.as_deref()),
+            find_in_list(&swim_list, row_31.as_deref()),
+            find_in_list(&pajama_list, row_32.as_deref()),
+            find_in_list(&winter_list, row_33.as_deref()),
+            find_in_list(&hf_list, row_34.as_deref()),
+        )
+    } else {
+        // 0x40a667..0x40a6a3: child commits write "ADDED" to rows 30 and 34
+        // and leave f_idx = 0, h_idx = 0.
+        let entry = world.made_outfits.entry(guid).or_default();
+        entry.insert(30, "ADDED".to_owned());
+        entry.insert(34, "ADDED".to_owned());
+        (
+            Some(0),
+            find_in_list(&swim_list, row_31.as_deref()),
+            find_in_list(&pajama_list, row_32.as_deref()),
+            find_in_list(&winter_list, row_33.as_deref()),
+            Some(0),
+        )
+    };
+
+    // 0x40a6a6..0x40ab7b: when `body_idx != -1`, compare each matched clothing
+    // row's body type (offset 6, up to 3 bytes) against row 1's body type.
+    // When `body_idx == -1` and replaced with index 0 (`0x40abf9..0x40ac34`),
+    // invalidate all relevant clothing indices instead.
+    match body_state {
+        BodyCommitState::Matched => {
+            let validation_body_row = pre_clear_body_row.unwrap_or(&body_row);
+            let body_bt = cp1252_body_type(validation_body_row);
+            if !is_child {
+                if matches!(body_bt.as_str(), "skn" | "fit" | "fat") {
+                    if f_idx.is_some()
+                        && cp1252_body_type(row_30.as_deref().unwrap_or("")) != body_bt
+                    {
+                        f_idx = None;
+                    }
+                    if s_idx.is_some()
+                        && cp1252_body_type(row_31.as_deref().unwrap_or("")) != body_bt
+                    {
+                        s_idx = None;
+                    }
+                    if l_idx.is_some()
+                        && cp1252_body_type(row_32.as_deref().unwrap_or("")) != body_bt
+                    {
+                        l_idx = None;
+                    }
+                    if h_idx.is_some()
+                        && cp1252_body_type(row_34.as_deref().unwrap_or("")) != body_bt
+                    {
+                        h_idx = None;
+                    }
+                }
+            } else if body_bt == "chd" {
+                if s_idx.is_some() && cp1252_body_type(row_31.as_deref().unwrap_or("")) != body_bt {
+                    s_idx = None;
+                }
+                if l_idx.is_some() && cp1252_body_type(row_32.as_deref().unwrap_or("")) != body_bt {
+                    l_idx = None;
+                }
+            }
+            if matches!(body_bt.as_str(), "skn" | "fit" | "fat" | "chd")
+                && w_idx.is_some()
+                && cp1252_body_type(row_33.as_deref().unwrap_or("")) != body_bt
+            {
+                w_idx = None;
+            }
+        }
+        BodyCommitState::ReplacedWithFallback => {
+            if !is_child {
+                f_idx = None;
+                s_idx = None;
+                l_idx = None;
+                w_idx = None;
+                h_idx = None;
+            } else {
+                s_idx = None;
+                l_idx = None;
+                w_idx = None;
+            }
+        }
+        BodyCommitState::ClearedEmptyList => {}
+    }
+
+    // 1. 0x40acbc..0x40aeb4: rows 30, 31, 32 (formal / swim / pajama).
+    // Note `0x40acd4..0x40acf9` checks ALL THREE list counts (`formal`, `swim`,
+    // `pajama`) before branching on `is_child` (`0x40acff`), clearing rows
+    // 30..=32 to `""` if any of the three lists is empty.
+    if f_idx.is_none() || s_idx.is_none() || l_idx.is_none() {
+        let entry = world.made_outfits.entry(guid).or_default();
+        if formal_list.is_empty() || swim_list.is_empty() || pajama_list.is_empty() {
+            entry.insert(30, String::new());
+            entry.insert(31, String::new());
+            entry.insert(32, String::new());
+        } else if !is_child {
+            if f_idx.is_none() && s_idx.is_none() && l_idx.is_none() {
                 let (formal, swim, pajama) =
                     build_adult_fsl(gender_ch, adult_body_type, skin_norm, &scan, &textures);
                 entry.insert(30, formal);
                 entry.insert(31, swim);
                 entry.insert(32, pajama);
             } else {
-                entry.insert(30, formal_list[f_idx.unwrap_or(0)].1.clone());
-                entry.insert(31, swim_list[s_idx.unwrap_or(0)].1.clone());
-                entry.insert(32, pajama_list[l_idx.unwrap_or(0)].1.clone());
+                entry.insert(30, formal_list[f_idx.unwrap_or(0)].2.clone());
+                entry.insert(31, swim_list[s_idx.unwrap_or(0)].2.clone());
+                entry.insert(32, pajama_list[l_idx.unwrap_or(0)].2.clone());
             }
-        }
-    } else {
-        {
-            let entry = world.made_outfits.entry(guid).or_default();
+        } else if s_idx.is_none() && l_idx.is_none() {
+            let (swim, pajama) =
+                build_child_sl(gender_ch, &raw_body_type, skin_norm, &scan, &textures);
             entry.insert(30, "ADDED".to_owned());
-            entry.insert(34, "ADDED".to_owned());
-        }
-        let swim_list = build_list(b's');
-        let pajama_list = build_list(b'l');
-        let s_idx = find_in_list(
-            &swim_list,
-            read_character_row(world, guid, profile, 31).as_deref(),
-        );
-        let l_idx = find_in_list(
-            &pajama_list,
-            read_character_row(world, guid, profile, 32).as_deref(),
-        );
-        if s_idx.is_none() || l_idx.is_none() {
-            let entry = world.made_outfits.entry(guid).or_default();
-            if swim_list.is_empty() || pajama_list.is_empty() {
-                entry.insert(30, String::new());
-                entry.insert(31, String::new());
-                entry.insert(32, String::new());
-            } else if s_idx.is_none() && l_idx.is_none() {
-                let (swim, pajama) =
-                    build_child_sl(gender_ch, &raw_body_type, skin_norm, &scan, &textures);
-                entry.insert(30, "ADDED".to_owned());
-                entry.insert(31, swim);
-                entry.insert(32, pajama);
-            } else {
-                entry.insert(31, swim_list[s_idx.unwrap_or(0)].1.clone());
-                entry.insert(32, pajama_list[l_idx.unwrap_or(0)].1.clone());
-            }
+            entry.insert(31, swim);
+            entry.insert(32, pajama);
+        } else {
+            entry.insert(31, swim_list[s_idx.unwrap_or(0)].2.clone());
+            entry.insert(32, pajama_list[l_idx.unwrap_or(0)].2.clone());
         }
     }
 
-    // 2. 0x40aec8..0x40aee8: row 33 (winter).
-    {
-        let winter_list = build_list(b'w');
-        let w_idx = find_in_list(
-            &winter_list,
-            read_character_row(world, guid, profile, 33).as_deref(),
-        );
-        if w_idx.is_none() {
-            let val = if winter_list.is_empty() {
-                String::new()
-            } else {
-                build_winter(
-                    gender_ch,
-                    is_child,
-                    adult_body_type,
-                    skin_norm,
-                    &scan,
-                    &textures,
-                )
-            };
-            world.made_outfits.entry(guid).or_default().insert(33, val);
-        }
+    // 2. 0x40aec4..0x40aee8: row 33 (winter).
+    if w_idx.is_none() {
+        let val = if winter_list.is_empty() {
+            String::new()
+        } else {
+            build_winter(
+                gender_ch,
+                is_child,
+                adult_body_type,
+                skin_norm,
+                &scan,
+                &textures,
+            )
+        };
+        world.made_outfits.entry(guid).or_default().insert(33, val);
     }
 
-    // 3. 0x40aef9..0x40af1c: row 34 (adult high fashion).
-    if !is_child {
-        let hf_list = build_list(b'h');
-        let h_idx = find_in_list(
-            &hf_list,
-            read_character_row(world, guid, profile, 34).as_deref(),
-        );
-        if h_idx.is_none() {
-            let val = if hf_list.is_empty() {
-                String::new()
-            } else {
-                build_adult_hf(gender_ch, adult_body_type, skin_norm, &scan, &textures)
-            };
-            world.made_outfits.entry(guid).or_default().insert(34, val);
-        }
+    // 3. 0x40aef8..0x40af1c: row 34 (adult high fashion).
+    if h_idx.is_none() {
+        let val = if hf_list.is_empty() {
+            String::new()
+        } else {
+            build_adult_hf(gender_ch, adult_body_type, skin_norm, &scan, &textures)
+        };
+        world.made_outfits.entry(guid).or_default().insert(34, val);
     }
 
     // 4. 0x40af51 -> 0x40af5b: rebuild naked (15), swim (16), formal (27), and
@@ -1052,10 +1137,15 @@ pub(crate) fn commit_character_clothing(
         hp.push_choice(&skin_3, "");
         hp.push_choice(&suffix, "");
         let best_hand = find_best(&hp, &textures);
-        if !best_hand.is_empty() {
+        // 0x40b5e3..0x40b657: clears the buffer and unconditionally writes it
+        // to `row_idx`, clearing stale inherited hand rows on a miss.
+        let value = if best_hand.is_empty() {
+            String::new()
+        } else {
             let formatted = format!("H{hand_gender}{side}{pose},HAND={best_hand}");
-            entry.insert(row_idx, truncate_cp1252(&formatted, 63).to_owned());
-        }
+            truncate_cp1252(&formatted, 63).to_owned()
+        };
+        entry.insert(row_idx, value);
     }
 }
 

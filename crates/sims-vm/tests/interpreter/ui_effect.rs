@@ -4351,6 +4351,14 @@ fn round_18_reopen_bcf_rng_missing_file_saved_read_frame_draw_live_slots_head_di
     // "UI Effect's portrait" instead of "a dialog's portrait".
     {
         let (mut fx, file, record) = visitors();
+        // Two rooms so `data[40] = 0x400` marks a different room depending on
+        // which tile the missing `view_centre` selects.
+        fx.world.rooms.rooms.insert(2, Default::default());
+        for a in 3..6 {
+            for b in 1..5 {
+                fx.world.rooms.map[0][a * 64 + b] = 2;
+            }
+        }
         fx.add(
             file,
             4096,
@@ -6001,6 +6009,541 @@ fn round_21_old_rel_mnc_commit_empty_suit_freeze_pet_0x1f_and_p3_limits() {
         assert!(
             !fx.world.portraits.contains(&SIM_GUID),
             "decoded zero-bone skeleton has no HEAD bone and must fail portrait render"
+        );
+    }
+}
+
+#[test]
+fn round_22_clothing_commit_pet_fallback_placed_callback_and_global_34() {
+    use sims_content::{Profile, SuitTable};
+
+    let add_template = |fx: &mut Fixture, guid: u32, skel: &str| {
+        let tpl_file = fx.add_type(guid, 2, 4096, 4097);
+        let id = fx.world.neighbors.slots.len() as i16 + 1;
+        fx.world.neighbors.slots.push(Some(Neighbor {
+            guid,
+            id,
+            data: vec![0; 88],
+            relationships: Vec::new(),
+            friends: 0,
+            revision: 0,
+            stale: false,
+        }));
+        fx.add(
+            tpl_file,
+            4096,
+            tree(vec![assign(
+                scope::MY_DATA,
+                4,
+                scope::LITERAL,
+                1,
+                RETURN_TRUE,
+            )]),
+        );
+        fx.add(
+            tpl_file,
+            4097,
+            tree(vec![
+                assign(scope::PARAMETERS, 0, scope::LITERAL, 10, 1),
+                ins(0, 0, 0, [0; 8]),
+            ]),
+        );
+        equip(fx, guid, skel, 12);
+    };
+
+    let run_make_char = |fx: &mut Fixture,
+                         caller: u16,
+                         file: usize,
+                         skin: i16,
+                         age: i16,
+                         sex: i16,
+                         template: u8| {
+        let mut t = tree(vec![
+            assign(scope::LOCALS, 0, scope::LITERAL, skin, 1),
+            assign(scope::LOCALS, 1, scope::LITERAL, age, 2),
+            assign(scope::LOCALS, 2, scope::LITERAL, sex, 3),
+            ins(
+                19,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [0, 1, 2, template, 0, 0, 0, 0],
+            ),
+        ]);
+        t.locals = 3;
+        fx.add(file, 4096, t);
+        fx.run_with(caller, 4096, 0, &[], 1000)
+    };
+
+    // 1. P2 #1: Child clothing fallback checks formalwear list too (`0x40acd4..0x40acf9`),
+    // clearing rows 30..=32 to `""` when formalwear is empty (as on the stock install).
+    {
+        let (mut fx, _, _) = visitors();
+        const TEMPLATE_PERSON: u32 = 0x7FD9_6B54;
+        add_template(&mut fx, TEMPLATE_PERSON, "child");
+        fx.program.people.profiles.insert(
+            TEMPLATE_PERSON,
+            Profile {
+                body: Some("b001mcchd_01,BODY=b001mcchdlgt_01".into()),
+                head: Some("c001mc_01,HEAD-HEAD=c001mclgt_01".into()),
+                gender: Some("male".into()),
+                age: Some("9".into()),
+                skin: Some("lgt".into()),
+                tones: vec!["lgt".into()],
+                suit_rows: BTreeMap::from([
+                    // Row 30 already populated so `0x409315` doesn't regenerate row 32;
+                    // row 32 missing -> triggers `0x40acd2` three-list check!
+                    (30, "ADDED".into()),
+                    (31, "s100mcchd_01,BODY=s100mcchdlgt_01".into()),
+                ]),
+                ..Default::default()
+            },
+        );
+        let mut table = SuitTable::default();
+        for name in [
+            "b001mcchd_01",
+            "c001mc_01",
+            "s100mcchd_01",
+            "l100mcchd_01",
+            // Intentionally NO child formalwear `f...mc...`!
+        ] {
+            table.insert_name(name.into());
+        }
+        fx.program.people.suit_table = table;
+        fx.program.people.textures = vec![
+            "b001mcchdlgt_01".into(),
+            "c001mclgt_01".into(),
+            "s100mcchdlgt_01".into(),
+            "l100mcchdlgt_01".into(),
+        ];
+        fx.program.wardrobe = Some(Wardrobe {
+            suits: vec!["b001mcchd_01".into(), "c001mc_01".into()]
+                .into_iter()
+                .collect(),
+            textures: vec!["b001mcchdlgt_01.bmp".into(), "c001mclgt_01.bmp".into()]
+                .into_iter()
+                .collect(),
+            errors: Default::default(),
+        });
+        assert_eq!(
+            run_make_char(&mut fx, LAMP, LAMP_FILE, 0, 9, 0, 0),
+            Ok(true)
+        );
+        let made_guid = *fx.world.characters.made.keys().next().unwrap();
+        let outfits = &fx.world.made_outfits[&made_guid];
+        assert_eq!(outfits.get(&30).map(String::as_str), Some(""));
+        assert_eq!(outfits.get(&31).map(String::as_str), Some(""));
+        assert_eq!(outfits.get(&32).map(String::as_str), Some(""));
+    }
+
+    // 2. P2 #2 + P2 #5 + P3 #1: Body-type validation (`0x40a757..0x40ab7b`),
+    // hand-texture miss writing `""` (`0x40b5e3..0x40b657`), and separate 63-byte
+    // suit/texture caps in `build_list`/`find_in_list` (`0x472e7e..0x472f41`).
+    {
+        let (mut fx, _, _) = visitors();
+        const TEMPLATE_PERSON: u32 = 0x7FD9_6B54;
+        add_template(&mut fx, TEMPLATE_PERSON, "adult");
+        // 40-byte suit + 40-byte `BODY=...` -> 81-byte valid formal row (exceeds 63 bytes total!).
+        let long_formal_suit = format!("f100mafat_{}", "a".repeat(30));
+        let long_formal_tex = format!("f100mafatlgt_{}", "b".repeat(22));
+        let long_formal_row = format!("{long_formal_suit},BODY={long_formal_tex}");
+        assert!(long_formal_row.len() > 63);
+        fx.program.people.profiles.insert(
+            TEMPLATE_PERSON,
+            Profile {
+                body: Some("b001mafat_01,BODY=b001mafatlgt_01".into()),
+                head: Some("c001ma_01,HEAD-HEAD=c001malgt_01".into()),
+                gender: Some("male".into()),
+                age: Some("27".into()),
+                skin: Some("lgt".into()),
+                tones: vec!["lgt".into()],
+                suit_rows: BTreeMap::from([
+                    (30, long_formal_row.clone()), // matches fat body -> MUST be kept intact (> 63 bytes)!
+                    (31, "s100mafit_01,BODY=s100mafitlgt_01".into()), // fit != fat -> MUST be invalidated!
+                    (32, "l100mafit_01,BODY=l100mafitlgt_01".into()), // fit != fat -> MUST be invalidated!
+                    (33, "w100mafit_01,BODY=w100mafitlgt_01".into()), // fit != fat -> MUST be invalidated!
+                    (34, "h500mafit_01,BODY=h500mafitlgt_01".into()), // fit != fat -> MUST be invalidated!
+                    (17, "HMLO,HAND=stale_hand_tex".into()), // hand miss -> MUST be cleared to ""!
+                ]),
+                ..Default::default()
+            },
+        );
+        let mut table = SuitTable::default();
+        for name in [
+            "b001mafat_01",
+            "c001ma_01",
+            long_formal_suit.as_str(),
+            "s100mafit_01",
+            "s100mafat_01",
+            "l100mafit_01",
+            "l100mafat_01",
+            "w100mafit_01",
+            "w100mafat_01",
+            "h500mafit_01",
+            "h500mafat_01",
+        ] {
+            table.insert_name(name.into());
+        }
+        fx.program.people.suit_table = table;
+        fx.program.people.textures = vec![
+            "b001mafatlgt_01".into(),
+            "c001malgt_01".into(),
+            long_formal_tex.clone(),
+            "s100mafitlgt_01".into(),
+            "s100mafatlgt_01".into(),
+            "l100mafitlgt_01".into(),
+            "l100mafatlgt_01".into(),
+            "w100mafitlgt_01".into(),
+            "w100mafatlgt_01".into(),
+            "h500mafitlgt_01".into(),
+            "h500mafatlgt_01".into(),
+            // Intentionally NO hand textures (`H...`)!
+        ];
+        fx.program.wardrobe = Some(Wardrobe {
+            suits: vec!["b001mafat_01".into(), "c001ma_01".into()]
+                .into_iter()
+                .collect(),
+            textures: vec!["b001mafatlgt_01.bmp".into(), "c001malgt_01.bmp".into()]
+                .into_iter()
+                .collect(),
+            errors: Default::default(),
+        });
+        assert_eq!(
+            run_make_char(&mut fx, LAMP, LAMP_FILE, 0, 27, 0, 0),
+            Ok(true)
+        );
+        let made_guid = *fx.world.characters.made.keys().next().unwrap();
+        let outfits = &fx.world.made_outfits[&made_guid];
+        // Row 30 matched fat & survived > 63 bytes without truncation!
+        assert_eq!(
+            outfits.get(&30).map(String::as_str),
+            Some(long_formal_row.as_str())
+        );
+        // Winter (33) and hf (34) mismatched fat -> regenerated with `fat`!
+        assert_eq!(
+            outfits.get(&33).map(String::as_str),
+            Some("w100mafat_01,BODY=w100mafatlgt_01"),
+            "mismatched fit winter row must be invalidated and regenerated for fat"
+        );
+        assert_eq!(
+            outfits.get(&34).map(String::as_str),
+            Some("h500mafat_01,BODY=h500mafatlgt_01"),
+            "mismatched fit high-fashion row must be invalidated and regenerated for fat"
+        );
+        // Hand miss cleared inherited stale row 17 to ""!
+        assert_eq!(
+            outfits.get(&17).map(String::as_str),
+            Some(""),
+            "0x40b5e3..0x40b657 must clear stale hand row on texture miss"
+        );
+    }
+
+    // 3. P2 #3: Invalid pet picker index rechecks inherited body (`0x40a5a1`);
+    // on a miss, `0x40ac57..0x40acac` clears rows 1, 2, 15..=18 and does NOT render BMP_ 2002.
+    {
+        let (mut fx, _, _) = visitors();
+        const TEMPLATE_DOG: u32 = 0x4A70_DF92;
+        add_template(&mut fx, TEMPLATE_DOG, "dog");
+        fx.program.people.profiles.insert(
+            TEMPLATE_DOG,
+            Profile {
+                body: Some("unlisted_dog_suit,BODY=unlisted_dog_tex".into()),
+                gender: Some("dog".into()),
+                tones: vec!["lgt".into()],
+                ..Default::default()
+            },
+        );
+        fx.program
+            .people
+            .eager_suits
+            .insert("unlisted_dog_suit".into());
+        fx.program
+            .people
+            .head_suits
+            .insert("unlisted_dog_suit".into());
+        fx.program.people.eager_suits.insert("b001dog_01".into());
+        fx.program.people.head_suits.insert("b001dog_01".into());
+        fx.program.wardrobe = Some(Wardrobe {
+            suits: vec!["b001dog_01".into()].into_iter().collect(),
+            textures: vec!["b001dog_01.bmp".into()].into_iter().collect(),
+            errors: Default::default(),
+        });
+        // Set out-of-range pet picker index (99 >= 1).
+        fx.world.dialogs.declined = 99;
+        assert_eq!(
+            run_make_char(&mut fx, LAMP, LAMP_FILE, 0, 27, 0, 1),
+            Ok(true)
+        );
+        let made_guid = *fx.world.characters.made.keys().next().unwrap();
+        let outfits = &fx.world.made_outfits[&made_guid];
+        for row in [1usize, 2, 15, 16, 17, 18] {
+            assert_eq!(
+                outfits.get(&row).map(String::as_str),
+                Some(""),
+                "pet body miss must clear row {row} to empty string"
+            );
+        }
+        assert_eq!(outfits.get(&30).map(String::as_str), Some("NONE"));
+        assert!(
+            !fx.world.portraits.contains(&made_guid),
+            "unlisted inherited pet body must NOT render or cache portrait"
+        );
+        assert!(
+            fx.world.generated_portrait_2002.is_empty(),
+            "unlisted inherited pet body must NOT write BMP_ 2002"
+        );
+    }
+
+    // 4. P2 #4: Negative-age body fallback invalidates inherited clothing rows
+    // (`0x40abf9..0x40ac34`) so `0x40b7ed` regenerates them instead of keeping
+    // inherited clothing that happened to match the list.
+    {
+        let (mut fx, _, _) = visitors();
+        const TEMPLATE_PERSON: u32 = 0x7FD9_6B54;
+        add_template(&mut fx, TEMPLATE_PERSON, "adult");
+        fx.program.people.profiles.insert(
+            TEMPLATE_PERSON,
+            Profile {
+                body: Some("b001mafit_01,BODY=b001mafitlgt_01".into()),
+                head: Some("c001ma_01,HEAD-HEAD=c001malgt_01".into()),
+                gender: Some("male".into()),
+                age: Some("27".into()),
+                skin: Some("lgt".into()),
+                tones: vec!["lgt".into()],
+                suit_rows: BTreeMap::from([
+                    // Listed in formal_list (`f200mafit_01`), NOT the `f100` generated default!
+                    (30, "f200mafit_01,BODY=f200mafitlgt_01".into()),
+                    (31, "s100mafit_01,BODY=s100mafitlgt_01".into()),
+                    (32, "l100mafit_01,BODY=l100mafitlgt_01".into()),
+                ]),
+                ..Default::default()
+            },
+        );
+        // Running person (SIM) has an UNLISTED body so negative-age copy falls back to index 0!
+        fx.program.people.profiles.insert(
+            SIM_GUID,
+            Profile {
+                body: Some("b999mafit_unlisted,BODY=b999mafitlgt_unlisted".into()),
+                head: Some("c001ma_01,HEAD-HEAD=c001malgt_01".into()),
+                gender: Some("male".into()),
+                age: Some("27".into()),
+                skin: Some("lgt".into()),
+                ..Default::default()
+            },
+        );
+        let mut table = SuitTable::default();
+        for name in [
+            "b001mafit_01",
+            "c001ma_01",
+            "f200mafit_01",
+            "f100mafit_01",
+            "s100mafit_01",
+            "l100mafit_01",
+        ] {
+            table.insert_name(name.into());
+        }
+        fx.program.people.suit_table = table;
+        fx.program.people.textures = vec![
+            "b001mafitlgt_01".into(),
+            "c001malgt_01".into(),
+            "f200mafitlgt_01".into(),
+            "f100mafitlgt_01".into(),
+            "s100mafitlgt_01".into(),
+            "l100mafitlgt_01".into(),
+        ];
+        fx.program.wardrobe = Some(Wardrobe {
+            suits: vec!["b001mafit_01".into(), "c001ma_01".into()]
+                .into_iter()
+                .collect(),
+            textures: vec!["b001mafitlgt_01.bmp".into(), "c001malgt_01.bmp".into()]
+                .into_iter()
+                .collect(),
+            errors: Default::default(),
+        });
+        assert_eq!(run_make_char(&mut fx, SIM, SIM_FILE, 0, -1, 0, 0), Ok(true));
+        let made_guid = *fx.world.characters.made.keys().next().unwrap();
+        let outfits = &fx.world.made_outfits[&made_guid];
+        // Because body fell back to index 0, `f_idx/s_idx/l_idx` were all invalidated -> `f100` regenerated!
+        assert_eq!(
+            outfits.get(&30).map(String::as_str),
+            Some("f100mafit_01,BODY=f100mafitlgt_01"),
+            "negative-age body fallback must invalidate inherited formal row and regenerate f100"
+        );
+    }
+
+    // 5. P2 #6: Valid off-lot portrait placement executes `function::PLACED` (function 9)
+    // instead of trapping (`0x4e96fe` -> `0x433580`), both with explicit `view_centre` and
+    // when invariant across all reachable tiles with `view_centre == None`.
+    {
+        for centre in [Some([2i8, 2i8]), None] {
+            let (mut fx, file, record) = visitors();
+            fx.add(
+                file,
+                4200,
+                tree(vec![assign(
+                    scope::GLOBAL,
+                    36,
+                    scope::LITERAL,
+                    77,
+                    RETURN_TRUE,
+                )]),
+            );
+            let library = fx.program.libraries.get_mut(&file).unwrap();
+            for table in library.callbacks.values_mut() {
+                table.resize(
+                    27,
+                    sims_formats::execution::ObjectFunction {
+                        condition: 0,
+                        action: 0,
+                    },
+                );
+                table[9].action = 4200; // function::PLACED
+            }
+            let [lo, hi] = record.to_le_bytes();
+            fx.add(
+                LAMP_FILE,
+                4096,
+                tree(vec![ins(
+                    UI_EFFECT,
+                    RETURN_TRUE,
+                    RETURN_FALSE,
+                    [1, scope::LITERAL, lo, hi, 1, 0, 0, 0],
+                )]),
+            );
+            let mut interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+            interpreter.view_centre = centre;
+            assert_eq!(
+                interpreter.run_tree(&mut fx.world, LAMP, 4096, 0, &[], 1000),
+                Ok(true),
+                "UI Effect with Placed callback must succeed for view_centre={centre:?}"
+            );
+            assert_eq!(fx.world.globals[36], 77, "Placed callback must have run");
+            assert!(fx.world.portraits.contains(&WIDGET));
+        }
+    }
+
+    // 6. P3 #2: Short 7-byte body-type suffix (`b100mas` -> `"s"`, `0x40e59f -> 0x46f775`).
+    {
+        let (mut fx, _, _) = visitors();
+        fx.words(SIM_FILE)[102] = 0;
+        fx.world.neighbors.slots.push(Some(Neighbor {
+            guid: SIM_GUID,
+            id: 2,
+            data: vec![0; 88],
+            relationships: Vec::new(),
+            friends: 0,
+            revision: 0,
+            stale: false,
+        }));
+        let sim_record = fx.world.neighbors.slots.len() as i16;
+        fx.program.people.suit_table.insert_name("mwork_s".into());
+        fx.program.people.eager_suits.insert("mwork_s".into());
+        fx.program.people.head_suits.insert("mwork_s".into());
+        fx.program.careers = Some(vec![sims_vm::Career {
+            id: 1,
+            levels: vec![sims_formats::career::Level {
+                values: [0; 21],
+                strings: [
+                    "L0".into(),
+                    "mwork_$b".into(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                ],
+            }],
+        }]);
+        fx.program.people.profiles.insert(
+            SIM_GUID,
+            Profile {
+                body: Some("b100mas,BODY=b100maslgt".into()),
+                gender: Some("male".into()),
+                age: Some("27".into()),
+                skin: Some("lgt".into()),
+                ..Default::default()
+            },
+        );
+        {
+            let p = fx
+                .world
+                .objects
+                .get_mut(&SIM)
+                .unwrap()
+                .person
+                .as_mut()
+                .unwrap();
+            p.data[65] = 0;
+            p.data[58] = 27;
+            p.data[56] = 1;
+            p.data[57] = 0;
+            p.data[8] = 3; // workwear -> expands `mwork_$b` to `mwork_s`
+        }
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
+            Ok(true)
+        );
+        assert_eq!(
+            fx.world.person_outfits[&SIM]
+                .body
+                .as_ref()
+                .map(|b| b.suit.as_str()),
+            Some("mwork_s"),
+            "7-byte suit b100mas must supply 's' for $b"
+        );
+    }
+
+    // 7. P3 #3: Fallback `Wardrobe` in Make New Character freezes `suit_scan_cache`.
+    {
+        let (mut fx, _, _) = visitors();
+        const TEMPLATE_PERSON: u32 = 0x7FD9_6B54;
+        add_template(&mut fx, TEMPLATE_PERSON, "adult");
+        fx.program.people.profiles.insert(
+            TEMPLATE_PERSON,
+            Profile {
+                tones: vec!["lgt".into()],
+                ..Default::default()
+            },
+        );
+        fx.program.people.eager_suits.insert("b001mafit_01".into());
+        fx.program.wardrobe = Some(Wardrobe {
+            suits: vec!["b001mafit_01".into(), "c001ma_01".into()]
+                .into_iter()
+                .collect(),
+            textures: vec!["b001mafitlgt_01.bmp".into(), "c001malgt_01.bmp".into()]
+                .into_iter()
+                .collect(),
+            errors: Default::default(),
+        });
+        assert!(fx.world.suit_scan_cache.is_none());
+        assert_eq!(
+            run_make_char(&mut fx, LAMP, LAMP_FILE, 0, 27, 0, 0),
+            Ok(true)
+        );
+        assert!(
+            fx.world.suit_scan_cache.is_some(),
+            "fallback Wardrobe Make New Character must freeze suit_scan_cache"
+        );
+    }
+
+    // 8. P3 #4: Expression reading Global 34 on the RHS of a fresh object traps
+    // (`0x452c76 -> 0x4541db` before `0x452c85` initializes `[object + 0x128]`).
+    {
+        let (mut fx, _, _) = visitors();
+        fx.add(
+            LAMP_FILE,
+            4096,
+            tree(vec![assign(
+                scope::TEMPS,
+                0,
+                scope::GLOBAL,
+                34,
+                RETURN_TRUE,
+            )]),
+        );
+        let err = fx
+            .run_with(LAMP, 4096, 0, &[], 1000)
+            .expect_err("fresh object reading global 34 on Expression RHS must trap");
+        assert!(
+            matches!(err.trap, Trap::Unsupported(_)),
+            "expected Unsupported trap, got {err}"
         );
     }
 }
