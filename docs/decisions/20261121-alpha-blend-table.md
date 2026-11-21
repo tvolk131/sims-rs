@@ -19,8 +19,9 @@ blitters and blend table were read from `Sims.exe` rather than fitted.
   pixels with `alpha <= 7` (neither colour nor depth is written) and
   treat `alpha >= 0xf8` as opaque. That confirms the previously fitted
   `FAINT = 65` (`8 * 255 / 31`) threshold from code.
-  Opaque `op == 1` / `op == 6` runs (`0x4bbce3`) write the lit 16-bit
-  RGB565 palette colour directly, keeping all 6 bits of green.
+  Opaque `op == 1` runs (`0x4bbce3`) and `op == 6` runs (`0x49f544`)
+  write the lit 16-bit RGB565 palette colour directly, keeping all 6
+  bits of green.
 - **Blend lookup table (`0x6e5eac`, filled once by `0x49a315..0x49a41c`):**
   A 32 × 32 × 32 byte table indexed by `(alpha5 << 10) | (src5 << 5) | dst5`.
   For each 5-bit triple `(alpha5, src5, dst5)`, it averages over all
@@ -45,9 +46,10 @@ blitters and blend table were read from `Sims.exe` rather than fitted.
 - For every 5-bit SPR2 alpha `k` in `0..=31`, `((k * 255) / 31) >> 3 == k`
   exactly, so `a >> 3` recovers the original 5-bit alpha without
   changing `sims_formats::sprite::Frame`'s 8-bit RGBA representation.
-- `Canvas::write` keeps `*pixel = rgb` for `a == 255` (opaque pixels,
+- `Canvas::blit` keeps `*pixel = rgb` for `a == 255` (opaque pixels,
   preserving all 6 bits of green) and uses `blend565(rgb, *pixel, a)`
-  for `a < 255`.
+  for `a < 255`. `Canvas::put` (3D person mesh pixels) keeps straight-
+  alpha blending rather than the SPR2 lookup table.
 - Scanning every `SPR2` chunk across `GameData/Objects/Objects.far`
   (3,836,354 `op == 2` pixels) finds 744,238 pixels with alpha `0..=7`,
   3,092,116 with alpha `8..=30`, and 0 with alpha `31`.

@@ -395,15 +395,15 @@ impl Canvas {
                 }
                 let s = &image.rgba[source * 4..source * 4 + 3];
                 let rgb = light(ix, iy).apply([s[0], s[1], s[2]]);
-                self.write(target, rgb, a, d);
+                self.write_sprite(target, rgb, a, d);
             }
         }
     }
 
-    /// Writes a pixel that passed its depth test: its depth, and its
+    /// Writes a sprite pixel that passed its depth test: its depth, and its
     /// colour, blended by `a` through the original's 5-5-5 lookup table
     /// ([`blend565`]) if it is not opaque.
-    fn write(&mut self, target: usize, rgb: [u8; 3], a: u8, d: i32) {
+    fn write_sprite(&mut self, target: usize, rgb: [u8; 3], a: u8, d: i32) {
         let pixel = &mut self.color[target];
         self.depth[target] = d.clamp(0, EMPTY);
         self.ids[target] = self.pen;
@@ -411,6 +411,24 @@ impl Canvas {
             *pixel = rgb;
         } else {
             *pixel = blend565(rgb, *pixel, a);
+        }
+    }
+
+    /// Writes a pixel that passed its depth test: its depth, and its
+    /// colour, straight-alpha blended by `a` if it is not opaque. Used for
+    /// 3D mesh pixels ([`Canvas::put`]), which do not go through the SPR2
+    /// 5-5-5 lookup table.
+    fn write(&mut self, target: usize, rgb: [u8; 3], a: u8, d: i32) {
+        let pixel = &mut self.color[target];
+        self.depth[target] = d.clamp(0, EMPTY);
+        self.ids[target] = self.pen;
+        if a == 255 {
+            *pixel = rgb;
+        } else {
+            let a = u32::from(a);
+            for (c, &s) in pixel.iter_mut().zip(&rgb) {
+                *c = ((u32::from(s) * a + u32::from(*c) * (255 - a) + 127) / 255) as u8;
+            }
         }
     }
 
@@ -786,12 +804,18 @@ mod tests {
         }
         assert_eq!(c.color, vec![[0, 0, 0], [10, 20, 30], [0, 0, 0], [0, 0, 0]]);
         assert_eq!(c.depth, vec![EMPTY, 100, EMPTY, EMPTY]);
-        // A tie wins; a soft pixel blends and writes its depth.
+        // A tie wins; a soft pixel straight-alpha blends and writes its depth
+        // without passing through the SPR2 5-5-5 lookup table.
         assert!(c.passes(1, 0, 100) && !c.passes(1, 0, 101));
         assert!(c.put(1, 0, [255, 255, 255, 255], 100));
         assert!(c.put(0, 1, [255, 255, 255, 128], -7));
         assert_eq!(c.color[1], [255, 255, 255]);
-        assert_eq!((c.color[2], c.depth[2]), ([132, 130, 132], 0));
+        assert_eq!((c.color[2], c.depth[2]), ([128, 128, 128], 0));
+        // Odd 6-bit green is preserved on mesh pixels (whereas sprite blits
+        // drop green's low bit through `blend565`).
+        let mut g = Canvas::new(1, 1, [0, 4, 0]);
+        assert!(g.put(0, 0, [0, 4, 0, 128], 10));
+        assert_eq!(g.color[0], [0, 4, 0]);
     }
 
     #[test]
@@ -900,11 +924,14 @@ mod tests {
             assert_eq!(u16::from(a >> 3), k, "k={k} a={a}");
             assert_eq!(a >= FAINT, k >= 8, "k={k} a={a}");
         }
-        // Endpoints and midpoint from `0x49a315..0x49a41c`.
+        // Endpoints, midpoint, and a rounding-sensitive interior point from
+        // `0x49a315..0x49a41c` (`[0; 3]` over `[104; 3]` at alpha 65 pins
+        // both `+ 0.5` rounding steps in `blend_table`).
         assert_eq!(blend565([255, 255, 255], [0, 0, 0], 0), [0, 0, 0]);
         assert_eq!(blend565([255, 255, 255], [0, 0, 0], 65), [66, 65, 66]);
         assert_eq!(blend565([255, 255, 255], [0, 0, 0], 131), [132, 130, 132]);
         assert_eq!(blend565([255, 255, 255], [0, 0, 0], 255), [255, 251, 255]);
+        assert_eq!(blend565([0, 0, 0], [104, 104, 104], 65), [82, 81, 82]);
         // Blended pixels always clear bit 0 of 6-bit green (`g5 << 1`) and
         // are already 5-6-5 quantized.
         for a in [65u8, 128, 197, 246] {
