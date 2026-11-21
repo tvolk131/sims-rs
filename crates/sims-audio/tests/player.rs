@@ -862,9 +862,10 @@ fn seqgroup_kill_fades_out_the_holder_then_runs_on() {
 
 #[test]
 fn the_first_module_defining_an_event_wins_and_play_from_picks_one() {
+    // The modules' events play tracks 10 and 20.
     let generic: &[u8] = &[2, 5, WAIT_SAMP, END];
     let first = module(&[generic], 1);
-    let second = module(&[generic], 2);
+    let second = module_with(&[generic], 2, 20, "");
     let mut player = Player::new(vec![first, second], samples(), 1);
     play(&mut player, "e0");
     assert_eq!(player.render(3, &NoSources), [1, 2, 3]);
@@ -1485,6 +1486,35 @@ fn the_piano_plays_where_its_object_is_and_sets_the_skill() {
     play(&mut player, "kill9");
     player.render(12 * BLOCK, &room);
     assert!(player.is_idle());
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_piano_whose_number_is_a_patch_still_starts_the_skill_track() {
+    use sims_audio::player::{PIANO, PIANO_SKILL};
+    // The piano's number is registered as a patch. Its start does
+    // nothing (0x57bf80), but the skill is still asked for and the skill
+    // track started (0x573ec3 to 0x573ef2).
+    let skill = [GETSRCDATAFIELD, 6, 1, 19, GETSRCDATAFIELD, 6, 1, 20, END];
+    let events = format!("piano=43,0\n[Patch]\n{PIANO}=0,p,\"one.xa\"\n");
+    let module = module_of_tracks(&[(PIANO_SKILL, &skill)], &events);
+    let mut player = Player::new(vec![module], samples(), 1);
+    let room = PianoRoom::default();
+    let asked = || {
+        let mut asked = std::mem::take(&mut *room.0.borrow_mut());
+        asked.sort();
+        asked
+    };
+    player.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: "piano".into(),
+        },
+        &room,
+    );
+    assert_eq!(asked(), [(9, 5)]);
+    player.render(BLOCK, &room);
+    assert_eq!(asked(), [(42, 0), (42, 0)]);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
 
@@ -2740,16 +2770,18 @@ fn a_track_played_again_runs_after_the_others_from_the_next_block() {
 }
 
 #[test]
-fn a_restart_runs_the_track_as_the_module_it_came_from_defines_it() {
-    // Track 10 asks every block, with interrupt 1. A second module also
-    // has a track 10, elsewhere in its program, and an event that plays
-    // it: the restart is of the running track object, from its own entry.
+fn a_restart_runs_the_registered_track_object_from_its_own_entry() {
+    // Track 10 asks every block, with interrupt 1. Another module, listed
+    // first, also has a track 10, elsewhere in its program, and the
+    // events that play it; the asking module's line registers last, so
+    // its track object is the one (0x57ce04). Both the start and the
+    // restart run it, from its own entry.
     let mut first = vec![LOADB_V1, 55, 1];
     first.extend(asks(7, true));
     let mut padding = vec![NOP; 400];
     padding.push(END);
     let second = module_of_tracks(&[(99, &padding), (10, &[END])], "again=kSndobPlay,10\n");
-    let modules = vec![module_of_tracks(&[(10, &first)], ""), second];
+    let modules = vec![second, module_of_tracks(&[(10, &first)], "")];
     let mut player = Player::new(modules, samples(), 1);
     play(&mut player, "e10");
     assert_eq!(fields_asked_in_order(&mut player), [7]);
@@ -2870,12 +2902,293 @@ fn a_held_track_let_go_during_a_block_first_runs_in_the_next() {
 }
 
 #[test]
+fn a_track_runs_from_the_module_registered_last_whichever_module_asks() {
+    // Both modules have a track 10: the first's asks for field 7, the
+    // second's, registered last, for 8, both with interrupt 1. Every
+    // start runs the second's (0x573312, 0x57db7a), from either module's
+    // event, before or after the track is killed.
+    let asking = |field| {
+        let mut routine = vec![LOADB_V1, 55, 1];
+        routine.extend(asks(field, true));
+        routine
+    };
+    let mut padding = vec![NOP; 400];
+    padding.push(END);
+    let first = module_of_tracks(&[(10, &asking(7))], "");
+    let second = module_of_tracks(&[(99, &padding), (10, &asking(8))], "again=kSndobPlay,10\n");
+    let mut player = Player::new(vec![first, second], samples(), 1);
+    play(&mut player, "e10");
+    assert_eq!(fields_asked_in_order(&mut player), [8]);
+    play(&mut player, "again");
+    assert_eq!(fields_asked_in_order(&mut player), [8]);
+    player.handle(&SoundEvent::StopAll, &NoSources);
+    player.play_from(0, 9, "e10", &NoSources);
+    assert_eq!(fields_asked_in_order(&mut player), [8]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn the_expansions_register_in_their_directories_order_not_by_name() {
+    // `Deluxe` registers after `ExpansionPack2` (0x414392 to 0x414458),
+    // though its name sorts first and it comes first here: its track 10
+    // is the one that runs, even from the other module's event. (The two
+    // tracks' entry points have different track data IDs, 0x100 and
+    // 0x101, so the descriptor decides which routine runs.)
+    let mut deluxe = module_of_tracks(&[(10, &asks(8, false))], "");
+    deluxe.name = "deluxe\\sound\\d".to_owned();
+    let mut pack = module_of_tracks(
+        &[(99, &[END]), (10, &asks(7, false))],
+        "again=kSndobPlay,10\n",
+    );
+    pack.name = "expansionpack2\\sound\\e".to_owned();
+    let mut player = Player::new(vec![deluxe, pack], samples(), 1);
+    play(&mut player, "again");
+    assert_eq!(fields_asked_in_order(&mut player), [8]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+/// A module with no tables but `[TrackData]`: each routine at its ID.
+fn module_of_code(routines: &[(u32, &[u8])]) -> Module {
+    let code: Vec<&[u8]> = routines.iter().map(|&(_, routine)| routine).collect();
+    let (hit, addresses) = assemble(&code);
+    let mut hot = String::from("[TrackData]\n");
+    for (&(id, _), address) in routines.iter().zip(addresses) {
+        hot.push_str(&format!("{id:#x}={address:#x}\n"));
+    }
+    Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap()
+}
+
+#[test]
+fn a_track_starts_at_the_entry_point_registered_last() {
+    // Track 10's descriptor, the second module's, registered last, names
+    // track data 0x100 as its entry point. A third module, registered
+    // after it and with no tracks, puts 0x100 at its own routine: set
+    // interrupt, ask for field 9 once, wait. The original keeps one table
+    // of track data for every module (0x57ce70), so the start runs that
+    // routine (0x57dbe2), and so does the restart that a play from the
+    // first module's event makes.
+    let mut third = vec![LOADB_V1, 55, 1];
+    third.extend(asks_once(9));
+    third.extend([SET_LOOP, LOOP]);
+    let first = module_of_tracks(&[(10, &asks(7, true))], "again=kSndobPlay,10\n");
+    let second = module_of_tracks(&[(10, &asks(8, true))], "");
+    let modules = vec![first, second, module_of_code(&[(0x100, &third)])];
+    let mut player = Player::new(modules, samples(), 1);
+    play(&mut player, "e10");
+    assert_eq!(fields_asked_in_order(&mut player), [9]);
+    assert_eq!(fields_asked_in_order(&mut player), []);
+    play(&mut player, "again");
+    assert_eq!(fields_asked_in_order(&mut player), [9]);
+    assert_eq!(fields_asked_in_order(&mut player), []);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_call_runs_the_program_that_registered_its_target_last_and_returns() {
+    // Track 10 calls track data 0x101, then asks for field 7. Its module
+    // puts 0x101 at a routine that asks for 6; a module registered after
+    // it, at one that asks for 8. The call runs the later one, in that
+    // module's program (0x57e3d4), and its end returns to the caller's.
+    let mut caller = vec![CALL];
+    caller.extend(long(0x101));
+    caller.extend(asks_once(7));
+    caller.push(END);
+    let mut own = asks_once(6);
+    own.push(END);
+    let mut later = asks_once(8);
+    later.push(END);
+    let first = module_of_tracks(&[(10, &caller), (11, &own)], "");
+    let modules = vec![first, module_of_code(&[(0x101, &later)])];
+    let mut player = Player::new(modules, samples(), 1);
+    play(&mut player, "e10");
+    assert_eq!(fields_asked_in_order(&mut player), [8, 7]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn an_expansions_hit_list_replaces_the_base_games_and_what_the_stations_added() {
+    // Hit list 6 is patch 2 in the base game's table, and a station adds
+    // patch 2 to it. An expansion's list 6, patch 1 alone, registers after
+    // both (0x57ba20, 0x57d261), so the list is patch 1 alone.
+    let choose: Vec<u8> = [
+        &[5, 5][..],
+        &long(6),    // loadl v1, 6
+        &[68, 5],    // smart_setlist v1
+        &[39, 5],    // smart_choose v1
+        &[6, 50, 5], // set patch, v1
+        &[2, 5, WAIT_SAMP, END],
+    ]
+    .concat();
+    let mut base = module(&[&choose], 0);
+    base.name = "sounddata\\base".to_owned();
+    let mut expansion = module_with(&[&choose], 0, 10, "[GlobalHitList]\n6=1\n");
+    expansion.name = "expansionpack\\more".to_owned();
+    let mut player = Player::new(vec![expansion, base], samples(), 1);
+    player.add_stations(&StationLists {
+        hit_lists: BTreeMap::from([(6, vec![2])]),
+        patches: BTreeMap::new(),
+    });
+    play(&mut player, "e0");
+    assert_eq!(player.render(1, &NoSources)[0], 1);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_patch_plays_as_the_module_registered_last_lists_it() {
+    // Both modules list patch 1; the second's, registered last, is
+    // `two.xa`. The first module's track plays it.
+    let generic: &[u8] = &[2, 5, WAIT_SAMP, END];
+    let first = module(&[generic], 1);
+    let second = module_with(&[generic], 1, 20, "[Patch]\n1=0,two,\"two.xa\"\n");
+    let mut player = Player::new(vec![first, second], samples(), 1);
+    play(&mut player, "e0");
+    assert_eq!(player.render(3, &NoSources), [2000, 4000, -2000]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn an_id_registered_again_as_the_other_kind_is_that_kind_only() {
+    // The first module's track 10 is registered again, by a later line
+    // of its own, as a patch: its event starts nothing, and that is no
+    // fault (the patch's start slot returns at once, 0x57bf80). The
+    // second module's track 1 replaces patch 1, so the first module's
+    // track 11, which plays patch 1, plays nothing (0x57f703).
+    let first = module_with(
+        &[&GENERIC, &GENERIC],
+        1,
+        10,
+        "[Patch]\n10=0,ten,\"one.xa\"\n",
+    );
+    let second = module_of_tracks(&[(1, &[END])], "");
+    let mut player = Player::new(vec![first, second], samples(), 1);
+    play(&mut player, "e0");
+    assert!(player.is_idle());
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+    play(&mut player, "e1");
+    assert_eq!(player.render(3, &NoSources), [0, 0, 0]);
+    assert_eq!(player.faults, ["patch 1 is a track"]);
+}
+
+#[test]
+fn a_station_patch_replaces_a_base_game_object_and_an_expansion_replaces_it() {
+    // The base game's track 10 plays patch 1, `one.xa`. Station patches
+    // register after the base game's tables (0x5750dc, 0x57cdd5): station
+    // patch 1, `two.xa`, replaces its patch 1, and station patch 10 its
+    // track 10, which then starts nothing, and no fault.
+    let base = || {
+        let mut base = module_with(&[&GENERIC], 1, 10, "");
+        base.name = "sounddata\\base".to_owned();
+        base
+    };
+    let stations = |ids: &[u32]| StationLists {
+        hit_lists: BTreeMap::new(),
+        patches: ids.iter().map(|&id| (id, "two.xa".to_owned())).collect(),
+    };
+    let mut player = Player::new(vec![base()], samples(), 1);
+    player.add_stations(&stations(&[1]));
+    play(&mut player, "e0");
+    assert_eq!(player.render(3, &NoSources), [2000, 4000, -2000]);
+    let mut player = Player::new(vec![base()], samples(), 1);
+    player.add_stations(&stations(&[10]));
+    play(&mut player, "e0");
+    assert!(player.is_idle());
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+    // An expansion's patch 1, `one.xa` again, registers after the
+    // stations and replaces station patch 1.
+    let (hit, _) = assemble(&[]);
+    let mut expansion =
+        Module::parse("test", &hit, b"v1 5\n", b"[Patch]\n1=0,one,\"one.xa\"\n").unwrap();
+    expansion.name = "expansionpack\\more".to_owned();
+    let mut player = Player::new(vec![expansion, base()], samples(), 1);
+    player.add_stations(&stations(&[1]));
+    play(&mut player, "e0");
+    assert_eq!(player.render(3, &NoSources), [1, 2, 3]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn stations_added_after_playing_destroy_the_objects_they_replace() {
+    // Registering an ID again destroys its object (0x57ce04 to 0x57ce32).
+    // Track 10 plays patch 1, `one.xa`, which is cached; station patch 1,
+    // `two.xa`, replaces it while it plays, so the note stops and the
+    // next start plays `two.xa`.
+    let mut base = module_with(&[&GENERIC], 1, 10, "");
+    base.name = "sounddata\\base".to_owned();
+    let mut player = Player::new(vec![base], samples(), 1);
+    play(&mut player, "e0");
+    assert_eq!(player.render(BLOCK, &NoSources)[..3], [1, 2, 3]);
+    player.add_stations(&StationLists {
+        hit_lists: BTreeMap::new(),
+        patches: BTreeMap::from([(1, "two.xa".to_owned())]),
+    });
+    // The note of the patch went with it; its thread, waiting for it,
+    // ends in the next block.
+    assert!(player.render(BLOCK, &NoSources).iter().all(|&s| s == 0));
+    assert!(player.is_idle());
+    play(&mut player, "e0");
+    assert_eq!(player.render(BLOCK, &NoSources)[..3], [2000, 4000, -2000]);
+    // A running track whose number a station patch takes ends with it.
+    let mut base = module_of_tracks(&[(10, &asks(7, true))], "");
+    base.name = "sounddata\\base".to_owned();
+    let mut player = Player::new(vec![base], samples(), 1);
+    play(&mut player, "e10");
+    assert_eq!(fields_asked_in_order(&mut player), [7]);
+    player.add_stations(&StationLists {
+        hit_lists: BTreeMap::new(),
+        patches: BTreeMap::from([(10, "two.xa".to_owned())]),
+    });
+    assert!(player.is_idle());
+    assert_eq!(fields_asked_in_order(&mut player), []);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_station_patch_with_the_same_sample_is_still_a_new_object() {
+    // Station patch 1 names the same sample as the base game's patch 1,
+    // but it is a new object (0x5750a0 to 0x5750c5), and registering it
+    // destroys the old one, whose note stops.
+    let mut base = module_with(&[&GENERIC], 1, 10, "");
+    base.name = "sounddata\\base".to_owned();
+    let mut player = Player::new(vec![base], samples(), 1);
+    play(&mut player, "e0");
+    assert_eq!(player.render(3, &NoSources), [1, 2, 3]);
+    player.add_stations(&StationLists {
+        hit_lists: BTreeMap::new(),
+        patches: BTreeMap::from([(1, "one.xa".to_owned())]),
+    });
+    assert_eq!(player.render(3, &NoSources), [0, 0, 0]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn destroying_a_queued_patch_leaves_the_note_it_was_queued_on() {
+    // Kind 53 starts patch 1 on idle track 10, then queues patch 2 after
+    // it. A station patch 2 destroys the queued patch's object, which
+    // lets go of its samples (0x57fd25) but not of the voice playing
+    // patch 1 (0x57e09e to 0x57e0b6): patch 1 plays to its end.
+    let events = "[GlobalHitList]\n7=1\n[EventMapping]\nseqa=53,10,0,7\nseqb=53,10,0,6\n";
+    let mut base = module_with(&[&GENERIC], 1, 10, events);
+    base.name = "sounddata\\base".to_owned();
+    let mut player = Player::new(vec![base], samples(), 1);
+    play(&mut player, "seqa");
+    play(&mut player, "seqb");
+    assert_eq!(player.render(3, &NoSources), [1, 2, 3]);
+    player.add_stations(&StationLists {
+        hit_lists: BTreeMap::new(),
+        patches: BTreeMap::from([(2, "two.xa".to_owned())]),
+    });
+    let rest: Vec<i16> = (4..=100).chain([0]).collect();
+    assert_eq!(player.render(98, &NoSources), rest);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
 fn a_play_of_a_running_track_takes_its_own_argument_kind() {
-    // The first module's track 10 takes no levels from its arguments; it
-    // asks once and waits, with interrupt 1. The second module's track 10
-    // is `kArgsIdVolPan`, and its event plays it for object 0, which
-    // would start nothing; but the running track object is the first
-    // module's, so the play restarts it.
+    // One module's track 10 takes no levels from its arguments; it asks
+    // once and waits, with interrupt 1. Another's, listed first, is
+    // `kArgsIdVolPan`, and its event plays it for object 0, which would
+    // start nothing; but the track object is the one registered last,
+    // the first's, so the play restarts it.
     let mut first = vec![LOADB_V1, 55, 1];
     first.extend(asks_once(7));
     first.extend([SET_LOOP, LOOP]);
@@ -2885,7 +3198,7 @@ fn a_play_of_a_running_track_takes_its_own_argument_kind() {
         &[(99, 2, &padding), (10, 2, &[END])],
         "again=kSndobPlay,10\n",
     );
-    let modules = vec![module_of_kinds(&[(10, 0, &first)], ""), second];
+    let modules = vec![second, module_of_kinds(&[(10, 0, &first)], "")];
     let mut player = Player::new(modules, samples(), 1);
     play(&mut player, "e10");
     assert_eq!(fields_asked_in_order(&mut player), [7]);
@@ -2949,16 +3262,21 @@ fn an_unpause_runs_the_tracks_bucket_by_bucket() {
 
 #[test]
 fn the_stations_register_between_the_base_tables_and_the_expansions() {
-    // The base game's tables register 192 IDs (track 190, patch 1 and
-    // 190 more patches), then the one station patch, the 193rd. The
-    // expansion's track 579 then grows the map to 389 buckets before it
-    // goes in, at the head of bucket 190, ahead of track 190. Had the
-    // station come last, 579 would have gone into bucket 0 of 193 first,
-    // and growing would have put 190 ahead of it.
-    let fillers: String = (2000..2190)
+    // The base game's tables register 192 IDs (tracks 9998 and 190,
+    // patch 1 and 189 more patches), then the one station patch, the
+    // 193rd. The expansion's track 579 then grows the map to 389 buckets
+    // before it goes in, at the head of bucket 190, ahead of track 190.
+    // Had the station come last, 579 would have gone into bucket 0 of 193
+    // first, and growing would have put 190 ahead of it. (Track 9998
+    // takes track data 0x100, which the expansion's 579 registers again,
+    // so that 190's, 0x101, is the base game's own.)
+    let fillers: String = (2000..2189)
         .map(|id| format!("{id}=0,f,\"one.xa\"\n"))
         .collect();
-    let mut base = module_of_tracks(&[(190, &asks(190, true))], &format!("[Patch]\n{fillers}"));
+    let mut base = module_of_tracks(
+        &[(9998, &[END]), (190, &asks(190, true))],
+        &format!("[Patch]\n{fillers}"),
+    );
     base.name = "sounddata\\base".to_owned();
     let mut expansion = module_of_tracks(&[(579, &asks(579, true))], "");
     expansion.name = "expansionpack\\more".to_owned();
