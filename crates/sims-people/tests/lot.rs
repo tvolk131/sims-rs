@@ -357,6 +357,13 @@ impl Target for Taken {
         Target::write(&mut self.canvas, x, y, z, texel, shade);
     }
 
+    fn write_coloured(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], shade: [f32; 3]) {
+        if texel[3] >= sims_render::canvas::FAINT && Target::passes(&self.canvas, x, y, z) {
+            self.taken[y as usize * self.canvas.width + x as usize] = true;
+        }
+        Target::write_coloured(&mut self.canvas, x, y, z, texel, shade);
+    }
+
     fn set_id(&mut self, id: Option<u16>) {
         Target::set_id(&mut self.canvas, id);
     }
@@ -629,7 +636,11 @@ fn the_plumb_bob_floats_over_the_selected_persons_head() {
         (x0 - 427).abs() <= 1 && (x1 - 434).abs() <= 1,
         "x {x0}..{x1}"
     );
-    assert!((y0 - 74).abs() <= 1 && (y1 - 97).abs() <= 1, "y {y0}..{y1}");
+    // At spin 0 under Direct3D 6's integer pixel centres, the bob's sharp
+    // top and bottom tips (2.1 units ≈ 27.4 medium-zoom px) land on a pixel
+    // column and reach y = 72..=99, within 2 px of the 7:38 AM screenshot's
+    // 74..=97 at a different spin and pose.
+    assert!((y0 - 74).abs() <= 2 && (y1 - 97).abs() <= 2, "y {y0}..{y1}");
     // Brighter on the viewer's left than on the right, as in the
     // screenshot.
     let middle = (x0 + x1) / 2;
@@ -846,9 +857,10 @@ fn a_bench_in_use_draws_after_the_sim_on_it() {
 /// The same `People` follows the lot every tick: while Mortimer carries
 /// his book its mesh is in his rendered body, and at 8:05 it is not.
 ///
-/// His outline is checked only at eight edge points where both pictures
-/// put it on the same pixel: elsewhere ours fits the original best moved
-/// half a pixel right and down; see the decision.
+/// His outline is checked at eleven edge points against the original
+/// screenshot, including the trousers' edges and the lowest row of his
+/// shoe that previously missed by a pixel before matching Direct3D 6's
+/// integer pixel centres (0x5cf263, 0x5d3b44).
 #[test]
 fn mortimer_stands_without_his_book_as_the_original_draws_him() {
     let Some(root) = install() else { return };
@@ -980,21 +992,23 @@ fn mortimer_stands_without_his_book_as_the_original_draws_him() {
             at(&lot_only)
         );
     }
-    // His outline at points where it lands on the same pixel in both
-    // pictures despite the half-pixel offset: for each, the pixel inside
-    // and its neighbour outside (top of the head twice, the shoes' soles,
-    // the left edge at the hair and the trousers, the right edge at the
-    // face and the trousers). In the original the inside pixel differs
-    // from the people-free render by 34 or more in some channel and the
-    // outside one by at most 1. A one-pixel move either way breaks some.
+    // His outline against the original screenshot: for each, the pixel
+    // inside and its neighbour outside (top of the head twice, the shoes'
+    // soles including the lowest toe pixel at (449, 386) that Direct3D 6's
+    // integer pixel centres align, the left edge at the hair and trousers,
+    // and the right edge at the face and trousers). A half-pixel shift back
+    // left/up breaks the trousers and toe edges.
     let edges = [
         ([434, 233], [434, 232]),
         ([447, 237], [447, 236]),
         ([437, 384], [437, 385]),
         ([446, 385], [446, 386]),
+        ([449, 386], [449, 387]),
         ([431, 268], [430, 268]),
+        ([433, 350], [432, 350]),
         ([434, 360], [433, 360]),
         ([450, 247], [451, 247]),
+        ([447, 350], [448, 350]),
         ([447, 352], [448, 352]),
     ];
     for ([x, y], [ox, oy]) in edges {

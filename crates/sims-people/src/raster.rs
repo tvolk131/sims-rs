@@ -230,6 +230,13 @@ pub trait Target {
     /// Writes a texel that passed: its colour times `shade` (0 to 1, see
     /// [`Lighting`]). Its alpha is never 0.
     fn write(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], shade: f32);
+    /// Writes a texel that passed, lit channel by channel by `shade`.
+    /// Defaults to multiplying each channel by `shade` and calling
+    /// [`Target::write`] with shade 1.
+    fn write_coloured(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], shade: [f32; 3]) {
+        let lit = |k: usize| (f32::from(texel[k]) * shade[k]).clamp(0.0, 255.0) as u8;
+        self.write(x, y, z, [lit(0), lit(1), lit(2), texel[3]], 1.0);
+    }
     /// Says whose pixels are written from now on: a person's object ID,
     /// or None once they are drawn. A target that keeps, per pixel, what
     /// drew it (the lot renderer's canvas, `sims_render::Canvas::id_at`)
@@ -356,11 +363,9 @@ fn triangle<T: Target + ?Sized>(
     let grey = shade.iter().all(|s| matches!(s, Shade::Grey(_)));
     let (width, height) = target.size();
     let mut area = edge(p[0], p[1], p[2]);
-    if area.abs() < 1e-8 || !area.is_finite() {
+    if area.abs() <= 1e-8 || !area.is_finite() {
         return;
     }
-    // Wind every triangle the same way, so the fill rule below can
-    // tell which side of each edge is inside.
     if area < 0.0 {
         p.swap(1, 2);
         uv.swap(1, 2);
@@ -435,8 +440,7 @@ fn triangle<T: Target + ?Sized>(
             if grey {
                 target.write(x, y, z, texel, s[0]);
             } else {
-                let lit = |k: usize| (f32::from(texel[k]) * s[k]).clamp(0.0, 255.0) as u8;
-                target.write(x, y, z, [lit(0), lit(1), lit(2), texel[3]], 1.0);
+                target.write_coloured(x, y, z, texel, s);
             }
         }
     }

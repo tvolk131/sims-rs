@@ -20,7 +20,23 @@
 //! near-zoom pixels. [`View::screen`] then projects as the lot renderer's
 //! `project_fine` does, with a level's floor height per level above the
 //! first, and one column right as the lot renderer draws objects (its
-//! `OBJECT_COLUMN`; unchecked for people).
+//! `OBJECT_COLUMN`).
+//!
+//! **Direct3D 6 rasterization.** The original submits person and plumb-bob
+//! meshes to Direct3D 6 (`IDirect3DDevice3::DrawIndexedPrimitive` at
+//! 0x5d3b44 and `DrawIndexedPrimitiveVB` at 0x5d36c6) through the house
+//! camera (0x49b0de, viewport matrix at 0x5cf263 mapping NDC (0, 0) to
+//! integer `(vp.dwX + width/2, vp.dwY + height/2)` with no half-pixel
+//! offset). Under Direct3D 6 rasterization rules, pixel `(x, y)` has its
+//! sample centre at integer `(x, y)`, whereas [`crate::raster`] samples at
+//! `(x + 0.5, y + 0.5)`. [`People::draw`] therefore adds `(+0.5, +0.5)` to
+//! each projected vertex so triangles sample at integer pixel centres. Skin
+//! bitmaps are uploaded as 16-bit 5-6-5 textures (0x5ca55f → 0x5ca635 →
+//! 0x49f0ae, truncating `r >> 3`, `g >> 2`, `b >> 3`) with white materials
+//! (0x5d452b, 0x5a1b5c), point filtering (0x5d3a65), Gouraud shading
+//! (0x5ce935), `D3DTOP_MODULATE` (0x5d3a30), and dithering off (0x5ce99e);
+//! `sims_render::Canvas`'s [`Target`] implementation matches that 5-6-5
+//! texel masking and rounded 8-bit modulation.
 //!
 //! A person stands on the terrain under it (`sims_sim::head::ground_height`:
 //! the tile's altitude where its position falls, as the original finds it,
@@ -337,7 +353,9 @@ pub fn lamp_strength(squared: f32) -> Option<f32> {
 /// rule: a depth no farther than what is there wins (ties too), a pixel
 /// fainter than its `FAINT` is left out, a soft one blends, and every
 /// pixel drawn writes its depth. Depths are cut to whole units toward
-/// zero.
+/// zero. Texels are masked to the original's 16-bit 5-6-5 texture format
+/// (0x49f0ae) and modulated with half-up 8-bit rounding before `Canvas`
+/// packs them to 5-6-5 with dithering off (0x5ce99e).
 impl Target for sims_render::Canvas {
     fn size(&self) -> (u32, u32) {
         (self.width as u32, self.height as u32)
@@ -348,9 +366,28 @@ impl Target for sims_render::Canvas {
     }
 
     fn write(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], shade: f32) {
-        let lit = |c: u8| (f32::from(c) * shade).min(255.0) as u8;
+        self.write_coloured(x, y, z, texel, [shade; 3]);
+    }
+
+    fn write_coloured(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], shade: [f32; 3]) {
+        // The original packs skin BMPs into 16-bit 5-6-5 texture surfaces
+        // (0x5ca55f -> 0x5ca635 -> 0x49f0ae: r>>3, g>>2, b>>3) before
+        // Direct3D 6 modulates them by the Gouraud diffuse colour
+        // (D3DTOP_MODULATE at 0x5d3a30) into a 5-6-5 frame buffer with
+        // dithering off (D3DRENDERSTATE_DITHERENABLE = 0 at 0x5ce99e).
+        let lit = |c: u8, mask: u8, s: f32| (f32::from(c & mask) * s + 0.5).clamp(0.0, 255.0) as u8;
         let [r, g, b, a] = texel;
-        self.put(x as i32, y as i32, [lit(r), lit(g), lit(b), a], z as i32);
+        self.put(
+            x as i32,
+            y as i32,
+            [
+                lit(r, 0xf8, shade[0]),
+                lit(g, 0xfc, shade[1]),
+                lit(b, 0xf8, shade[2]),
+                a,
+            ],
+            z as i32,
+        );
     }
 
     fn set_id(&mut self, id: Option<u16>) {
@@ -651,7 +688,9 @@ impl People {
             let project = |p| {
                 let (fine, elevation) = view.place_on(p, person.level);
                 let [x, y] = view.screen(fine, elevation, person.level);
-                Vec3::new(x, y, depth(fine, elevation, person.level))
+                // Direct3D 6 samples pixel (x, y) at integer (x, y);
+                // raster::triangle samples at (x + 0.5, y + 0.5).
+                Vec3::new(x + 0.5, y + 0.5, depth(fine, elevation, person.level))
             };
             // Each pixel the person draws names them, for a click.
             target.set_id(Some(person.id));
@@ -849,10 +888,138 @@ mod tests {
             [200, 100, 50, sims_render::canvas::FAINT - 1],
             1.0,
         );
-        assert_eq!(canvas.color, vec![[100, 50, 25], [0, 0, 0]]);
+        assert_eq!(canvas.color, vec![[100, 50, 24], [0, 0, 0]]);
         assert_eq!(canvas.depth, vec![100, sims_render::depth::EMPTY]);
         // The pixel taken names the person; the one left out names nobody.
         assert_eq!([canvas.id_at(0, 0), canvas.id_at(1, 0)], [Some(5), None]);
+    }
+
+    /// The lot canvas masks texel channels to the original's 5-6-5 texture
+    /// surface precision (0x49f0ae) and rounds the modulated 8-bit result
+    /// so a 1-ULP barycentric shortfall below 1.0 never loses a 5-6-5 step.
+    #[test]
+    fn the_lot_canvas_packs_texels_to_565_and_rounds_modulation() {
+        use sims_render::Canvas as LotCanvas;
+        let mut canvas = LotCanvas::new(3, 1, [0, 0, 0]);
+        let target: &mut dyn Target = &mut canvas;
+        // 5-6-5 masking drops the low 3/2/3 bits before modulation.
+        target.write(0, 0, 0.0, [207, 199, 55, 255], 1.0);
+        // 1 ULP below 1.0 (as barycentric weights w0 + w1 + w2 can give)
+        // must round back to [40, 136, 40], not truncate to [39, 135, 39].
+        target.write(1, 0, 0.0, [40, 136, 40, 255], 0.999_999_94);
+        // Coloured (lamp-lit) shading follows the exact same rule per channel.
+        target.write_coloured(2, 0, 0.0, [207, 199, 55, 255], [1.0, 0.5, 0.5]);
+        assert_eq!(
+            canvas.color,
+            vec![[200, 196, 48], [40, 136, 40], [200, 98, 24]]
+        );
+    }
+
+    /// Direct3D 6 samples pixel (x, y) at integer (x, y), so a triangle
+    /// spanning [2.0, 4.0] x [3.0, 5.0] in screen coordinates covers pixels
+    /// x = 2..=3 and y = 3..=4 (top-left rule) once shifted by (+0.5, +0.5)
+    /// into `raster`'s half-integer pixel-centre grid.
+    #[test]
+    fn direct3d_integer_pixel_centers_shift_projected_triangles_half_a_pixel() {
+        use crate::appearance::Part;
+        use crate::skin::Skinned;
+        use crate::texture::Texture;
+        use sims_formats::avatar::{Mesh, MeshBinding, Vertex};
+        use sims_render::Canvas as LotCanvas;
+
+        let vertex = |x: f32, y: f32| Vertex {
+            position: [x, y, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            uv: [0.5, 0.5],
+            bone: 0,
+        };
+        let part = Part {
+            appearance: "quad".into(),
+            bone: 0,
+            bones: vec![0],
+            mesh: Mesh {
+                name: "quad".into(),
+                texture: String::new(),
+                bones: vec!["ROOT".into()],
+                bindings: vec![MeshBinding {
+                    bone: 0,
+                    first_vertex: 0,
+                    vertex_count: 4,
+                    first_blend: 0,
+                    blend_count: 0,
+                }],
+                triangles: vec![[0, 1, 2], [0, 2, 3]],
+                vertices: vec![
+                    vertex(2.0, 3.0),
+                    vertex(4.0, 3.0),
+                    vertex(4.0, 5.0),
+                    vertex(2.0, 5.0),
+                ],
+                blends: Vec::new(),
+            },
+            texture_name: None,
+            texture: Texture::solid([248, 252, 248, 255]),
+            censor: 0,
+        };
+        let skinned = Skinned {
+            positions: vec![
+                Vec3::new(2.0, 3.0, 0.0),
+                Vec3::new(4.0, 3.0, 0.0),
+                Vec3::new(4.0, 5.0, 0.0),
+                Vec3::new(2.0, 5.0, 0.0),
+            ],
+            normals: vec![Vec3::new(0.0, 0.0, 1.0); 4],
+        };
+        // Shift a thin box spanning [2.0, 2.2] x [3.0, 3.2]: integer sample
+        // point (2, 3) is inside it, while half-integer (2.5, 3.5) is not.
+        let tiny = Skinned {
+            positions: vec![
+                Vec3::new(1.8, 2.8, 0.0),
+                Vec3::new(2.2, 2.8, 0.0),
+                Vec3::new(2.2, 3.2, 0.0),
+                Vec3::new(1.8, 3.2, 0.0),
+            ],
+            normals: vec![Vec3::new(0.0, 0.0, 1.0); 4],
+        };
+        let mut unshifted = LotCanvas::new(6, 6, [0, 0, 0]);
+        draw_part(
+            &mut unshifted,
+            &part,
+            &tiny,
+            Lighting::standard(Vec3::new(0.0, 0.0, 1.0), 1.0),
+            |p| p,
+        );
+        let mut d3d6 = LotCanvas::new(6, 6, [0, 0, 0]);
+        draw_part(
+            &mut d3d6,
+            &part,
+            &tiny,
+            Lighting::standard(Vec3::new(0.0, 0.0, 1.0), 1.0),
+            |p| Vec3::new(p.x + 0.5, p.y + 0.5, p.z),
+        );
+        // Without the D3D6 (+0.5, +0.5) shift, [1.8, 2.2] x [2.8, 3.2] hits
+        // no half-integer centre; with it, integer pixel (2, 3) is hit.
+        assert_eq!(unshifted.color[3 * 6 + 2], [0, 0, 0]);
+        assert_eq!(d3d6.color[3 * 6 + 2], [248, 252, 248]);
+        // And the 2x2 quad [2, 4] x [3, 5] covers exactly x=2..=3, y=3..=4.
+        let mut quad = LotCanvas::new(6, 6, [0, 0, 0]);
+        draw_part(
+            &mut quad,
+            &part,
+            &skinned,
+            Lighting::standard(Vec3::new(0.0, 0.0, 1.0), 1.0),
+            |p| Vec3::new(p.x + 0.5, p.y + 0.5, p.z),
+        );
+        for y in 0..6 {
+            for x in 0..6 {
+                let want = if (2..=3).contains(&x) && (3..=4).contains(&y) {
+                    [248, 252, 248]
+                } else {
+                    [0, 0, 0]
+                };
+                assert_eq!(quad.color[y * 6 + x], want, "({x}, {y})");
+            }
+        }
     }
 
     /// The light keeps its place relative to the viewer as the view
