@@ -294,6 +294,39 @@ impl Depth {
         (ground + f64::from(LEVEL_DEPTH) * f64::from(level - 1) + height) as f32
     }
 
+    /// Where a pixel of depth `depth` at screen point `at` is, taken as on
+    /// `level` (the house view's point to tile, 0x4a97c3, in its depth
+    /// mode): the inverse of [`Depth::point`] and of the upright table
+    /// `L`, which both make the depth an affine function of the point's
+    /// level-1 ground row and of its height above its level's floor, with
+    /// each level above the first adding its own depth offset. Gives the
+    /// point's fine view position (sixteenths of a tile, unrounded) and
+    /// its height above `level`'s floor at terrain height 0, in pixels of
+    /// this zoom. The original unprojects through its inverse view matrix
+    /// instead; that the two agree to the rounding is **unverified**.
+    pub fn unproject(
+        &self,
+        camera: &Camera,
+        at: [i32; 2],
+        depth: i32,
+        level: i32,
+    ) -> ([f64; 2], f64) {
+        let scale = 65535.0 / f64::from(SCALE);
+        let a = f64::from(SCALE - 12.5) * scale;
+        let b = self.row_step * scale;
+        // A pixel up something upright is this much nearer (L, and H per
+        // terrain step of 2 << zoom pixels).
+        let k = unit() / f64::from(16i32 << self.zoom);
+        let above = f64::from(level - 1);
+        let row = f64::from(at[1] - self.origin_y) + f64::from(self.floor_height) * above;
+        let depth = f64::from(depth) - f64::from(LEVEL_DEPTH) * above;
+        let height = (a - b * row - depth) / (b + k);
+        let ground = row + height;
+        let sum = ground * 16.0 / f64::from(4i32 << self.zoom);
+        let difference = f64::from(at[0] - camera.origin[0]) * 16.0 / f64::from(8i32 << self.zoom);
+        ([(sum + difference) / 2.0, (sum - difference) / 2.0], height)
+    }
+
     /// The depth of a pixel on screen row `y` of something standing
     /// upright at `anchor`, without its own depth bytes or columns: the
     /// anchor's depth plus `L` for the rows `y` stands above the anchor's
@@ -486,6 +519,36 @@ mod tests {
                                 "{zoom:?} {origin:?} level {level} ({x}, {y}) {steps}: {p} vs {}",
                                 a.depth
                             );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unprojecting_a_point_gives_back_its_position_and_height() {
+        for zoom in Zoom::ALL {
+            for origin in [[0, 0], [37, -411], [-120, 260]] {
+                let c = camera(zoom, origin);
+                let m = Depth::new(&c);
+                let near = zoom.near_scale();
+                for level in 1..=3 {
+                    for (x, y) in [(0, 0), (64, 32), (300, 500), (512, 512), (1020, 4)] {
+                        for steps in [0, 1, 3, 10] {
+                            let elevation = steps * 16;
+                            let at = c.project_fine([x, y], level, elevation);
+                            let depth = m.point([x as f32, y as f32], elevation as f32, level);
+                            let (fine, height) = m.unproject(&c, at, depth.round() as i32, level);
+                            let case =
+                                format!("{zoom:?} {origin:?} level {level} ({x}, {y}) {steps}");
+                            assert!(
+                                (fine[0] - f64::from(x)).abs() < 0.5
+                                    && (fine[1] - f64::from(y)).abs() < 0.5,
+                                "{case}: {fine:?}"
+                            );
+                            let rise = f64::from(elevation / near);
+                            assert!((height - rise).abs() < 0.5, "{case}: {height} vs {rise}");
                         }
                     }
                 }

@@ -112,7 +112,43 @@ pub struct Canvas {
     ids: Vec<Option<u16>>,
     /// The ID the pixels drawn now take ([`Canvas::set_id`]).
     pen: Option<u16>,
+    /// For each ID, the screen rectangle its images were drawn into since
+    /// the canvas was cleared ([`Canvas::drawn`]).
+    rects: std::collections::BTreeMap<u16, Rect>,
 }
+
+/// Which object or person drew each pixel of a canvas, kept apart from
+/// it: what [`Canvas::id_at`] read when it was taken ([`Canvas::ids`],
+/// [`Ids::take`]). A frame drawn in passes keeps the IDs of a pass this
+/// way before the next draws over them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Ids {
+    width: usize,
+    height: usize,
+    ids: Vec<Option<u16>>,
+}
+
+impl Ids {
+    /// The ID that had drawn the pixel at (`x`, `y`) last when these were
+    /// taken, if any had and the pixel is on the canvas.
+    pub fn id_at(&self, x: i32, y: i32) -> Option<u16> {
+        let (x, y) = (usize::try_from(x).ok()?, usize::try_from(y).ok()?);
+        (x < self.width && y < self.height)
+            .then(|| self.ids[y * self.width + x])
+            .flatten()
+    }
+
+    /// Takes `canvas`'s IDs as they are now, reusing this one's storage.
+    pub fn take(&mut self, canvas: &Canvas) {
+        self.width = canvas.width;
+        self.height = canvas.height;
+        self.ids.clone_from(&canvas.ids);
+    }
+}
+
+/// A screen rectangle: left, top, right and bottom, the right and bottom
+/// edges outside it.
+pub type Rect = [i32; 4];
 
 impl Canvas {
     pub fn new(width: usize, height: usize, background: [u8; 3]) -> Self {
@@ -123,6 +159,7 @@ impl Canvas {
             depth: vec![EMPTY; width * height],
             ids: vec![None; width * height],
             pen: None,
+            rects: std::collections::BTreeMap::new(),
         }
     }
 
@@ -133,6 +170,7 @@ impl Canvas {
         self.depth.fill(EMPTY);
         self.ids.fill(None);
         self.pen = None;
+        self.rects.clear();
     }
 
     /// Sets the ID the pixels drawn from now on take, until it is set
@@ -148,6 +186,21 @@ impl Canvas {
     /// hit.
     pub fn id_at(&self, x: i32, y: i32) -> Option<u16> {
         self.ids[self.index(x, y)?]
+    }
+
+    /// The IDs of every pixel as they are now ([`Ids`]).
+    pub fn ids(&self) -> Ids {
+        let mut ids = Ids::default();
+        ids.take(self);
+        ids
+    }
+
+    /// The rectangle the images drawn under `id` cover, each whole, drawn
+    /// pixels or not and on the canvas or not, since the canvas was
+    /// cleared: what the original keeps as an object's drawn rectangles
+    /// (object +0x160 and +0x170, 0x438f71).
+    pub fn drawn(&self, id: u16) -> Option<Rect> {
+        self.rects.get(&id).copied()
     }
 
     /// Draws `image` with its top-left corner at `at`, mirrored left to
@@ -255,6 +308,26 @@ impl Canvas {
             || self.color.is_empty()
         {
             return;
+        }
+        if let Some(id) = self.pen {
+            let side = |n: usize| i32::try_from(n).unwrap_or(i32::MAX);
+            let rect = [
+                at[0],
+                at[1],
+                at[0].saturating_add(side(image.width)),
+                at[1].saturating_add(side(image.height)),
+            ];
+            self.rects
+                .entry(id)
+                .and_modify(|r| {
+                    *r = [
+                        r[0].min(rect[0]),
+                        r[1].min(rect[1]),
+                        r[2].max(rect[2]),
+                        r[3].max(rect[3]),
+                    ]
+                })
+                .or_insert(rect);
         }
         let wide = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
         let span = |at: i32, size: usize, limit: usize| {
@@ -654,6 +727,17 @@ mod tests {
         c.clear([0, 0, 0]);
         c.plot(2, 0, 0, [4, 4, 4]);
         assert_eq!([c.id_at(0, 0), c.id_at(2, 0)], [None, None]);
+        // The IDs taken keep what the canvas named then, not what it
+        // names after a later draw.
+        c.set_id(Some(7));
+        c.plot(2, 0, 0, [4, 4, 4]);
+        let taken = c.ids();
+        c.set_id(Some(9));
+        c.plot(1, 0, 0, [4, 4, 4]);
+        c.plot(2, 0, 0, [4, 4, 4]);
+        let then = [0, 1, 2, 3].map(|x| taken.id_at(x, 0));
+        assert_eq!(then, [None, None, Some(7), None]);
+        assert_eq!([c.id_at(1, 0), c.id_at(2, 0)], [Some(9), Some(9)]);
     }
 
     #[test]

@@ -33,7 +33,7 @@ pub use index::{Index, Member, Resource, far_members};
 pub use install::{Expansions, Install, Layout, Mount};
 pub use neighborhood::{House, Neighborhood, PENDING_IMPORT};
 pub use people::{Bone, People, Profile, Skeleton};
-pub use surfaces::{SurfaceCatalog, SurfaceFile, SurfaceKind, Surfaces};
+pub use surfaces::{SurfaceCatalog, SurfaceFile, SurfaceKind, Surfaces, atoi};
 pub use wardrobe::Wardrobe;
 
 pub type Result<T> = std::result::Result<T, Error>;
