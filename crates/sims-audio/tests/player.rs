@@ -862,9 +862,10 @@ fn seqgroup_kill_fades_out_the_holder_then_runs_on() {
 
 #[test]
 fn the_first_module_defining_an_event_wins_and_play_from_picks_one() {
+    // The modules' events play tracks 10 and 20.
     let generic: &[u8] = &[2, 5, WAIT_SAMP, END];
     let first = module(&[generic], 1);
-    let second = module(&[generic], 2);
+    let second = module_with(&[generic], 2, 20, "");
     let mut player = Player::new(vec![first, second], samples(), 1);
     play(&mut player, "e0");
     assert_eq!(player.render(3, &NoSources), [1, 2, 3]);
@@ -2740,16 +2741,18 @@ fn a_track_played_again_runs_after_the_others_from_the_next_block() {
 }
 
 #[test]
-fn a_restart_runs_the_track_as_the_module_it_came_from_defines_it() {
-    // Track 10 asks every block, with interrupt 1. A second module also
-    // has a track 10, elsewhere in its program, and an event that plays
-    // it: the restart is of the running track object, from its own entry.
+fn a_restart_runs_the_registered_track_object_from_its_own_entry() {
+    // Track 10 asks every block, with interrupt 1. Another module, listed
+    // first, also has a track 10, elsewhere in its program, and the
+    // events that play it; the asking module's line registers last, so
+    // its track object is the one (0x57ce04). Both the start and the
+    // restart run it, from its own entry.
     let mut first = vec![LOADB_V1, 55, 1];
     first.extend(asks(7, true));
     let mut padding = vec![NOP; 400];
     padding.push(END);
     let second = module_of_tracks(&[(99, &padding), (10, &[END])], "again=kSndobPlay,10\n");
-    let modules = vec![module_of_tracks(&[(10, &first)], ""), second];
+    let modules = vec![second, module_of_tracks(&[(10, &first)], "")];
     let mut player = Player::new(modules, samples(), 1);
     play(&mut player, "e10");
     assert_eq!(fields_asked_in_order(&mut player), [7]);
@@ -2870,12 +2873,64 @@ fn a_held_track_let_go_during_a_block_first_runs_in_the_next() {
 }
 
 #[test]
+fn a_track_runs_from_the_module_registered_last_whichever_module_asks() {
+    // Both modules have a track 10: the first's asks for field 7, the
+    // second's, registered last, for 8, both with interrupt 1. Every
+    // start runs the second's (0x573312, 0x57db7a), from either module's
+    // event, before or after the track is killed.
+    let asking = |field| {
+        let mut routine = vec![LOADB_V1, 55, 1];
+        routine.extend(asks(field, true));
+        routine
+    };
+    let mut padding = vec![NOP; 400];
+    padding.push(END);
+    let first = module_of_tracks(&[(10, &asking(7))], "");
+    let second = module_of_tracks(&[(99, &padding), (10, &asking(8))], "again=kSndobPlay,10\n");
+    let mut player = Player::new(vec![first, second], samples(), 1);
+    play(&mut player, "e10");
+    assert_eq!(fields_asked_in_order(&mut player), [8]);
+    play(&mut player, "again");
+    assert_eq!(fields_asked_in_order(&mut player), [8]);
+    player.handle(&SoundEvent::StopAll, &NoSources);
+    player.play_from(0, 9, "e10", &NoSources);
+    assert_eq!(fields_asked_in_order(&mut player), [8]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn the_expansions_register_in_their_directories_order_not_by_name() {
+    // `ExpansionShared` registers after `ExpansionPack`, whatever the
+    // modules' order: its track 10 is the one that runs.
+    let mut shared = module_of_tracks(&[(10, &asks(8, false))], "");
+    shared.name = "expansionshared\\sound\\gnome".to_owned();
+    let mut pack = module_of_tracks(&[(10, &asks(7, false))], "");
+    pack.name = "expansionpack\\xpack".to_owned();
+    let mut player = Player::new(vec![shared, pack], samples(), 1);
+    play(&mut player, "e10");
+    assert_eq!(fields_asked_in_order(&mut player), [8]);
+}
+
+#[test]
+fn a_patch_plays_as_the_module_registered_last_lists_it() {
+    // Both modules list patch 1; the second's, registered last, is
+    // `two.xa`. The first module's track plays it.
+    let generic: &[u8] = &[2, 5, WAIT_SAMP, END];
+    let first = module(&[generic], 1);
+    let second = module_with(&[generic], 1, 20, "[Patch]\n1=0,two,\"two.xa\"\n");
+    let mut player = Player::new(vec![first, second], samples(), 1);
+    play(&mut player, "e0");
+    assert_eq!(player.render(3, &NoSources), [2000, 4000, -2000]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
 fn a_play_of_a_running_track_takes_its_own_argument_kind() {
-    // The first module's track 10 takes no levels from its arguments; it
-    // asks once and waits, with interrupt 1. The second module's track 10
-    // is `kArgsIdVolPan`, and its event plays it for object 0, which
-    // would start nothing; but the running track object is the first
-    // module's, so the play restarts it.
+    // One module's track 10 takes no levels from its arguments; it asks
+    // once and waits, with interrupt 1. Another's, listed first, is
+    // `kArgsIdVolPan`, and its event plays it for object 0, which would
+    // start nothing; but the track object is the one registered last,
+    // the first's, so the play restarts it.
     let mut first = vec![LOADB_V1, 55, 1];
     first.extend(asks_once(7));
     first.extend([SET_LOOP, LOOP]);
@@ -2885,7 +2940,7 @@ fn a_play_of_a_running_track_takes_its_own_argument_kind() {
         &[(99, 2, &padding), (10, 2, &[END])],
         "again=kSndobPlay,10\n",
     );
-    let modules = vec![module_of_kinds(&[(10, 0, &first)], ""), second];
+    let modules = vec![second, module_of_kinds(&[(10, 0, &first)], "")];
     let mut player = Player::new(modules, samples(), 1);
     play(&mut player, "e10");
     assert_eq!(fields_asked_in_order(&mut player), [7]);
