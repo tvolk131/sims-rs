@@ -2,7 +2,7 @@
 
 use sims_audio::module::Module;
 use sims_audio::placement::Projection;
-use sims_audio::player::{BLOCK, MIDDLE, NoSources, Player, RATE, Sources};
+use sims_audio::player::{MIDDLE, NoSources, Player, RATE, Sources, TIMER_FRAMES};
 use sims_audio::sources::Snapshot;
 use sims_audio::stations::{FIRST_ID, StationLists};
 use sims_audio::{Pcm, SoundEvent};
@@ -30,6 +30,11 @@ fn long(value: u32) -> [u8; 4] {
 const NOTE_ON_V1: [u8; 2] = [2, 5];
 const WAIT_SAMP: u8 = 11;
 const END: u8 = 12;
+/// Waits 1 HIT timer tick (20 ms) per iteration forever, using local register 15
+/// (inside the track's own 1..=16 local bank, outside 1.91's shared 90..=99 bank).
+const WAIT_FOREVER: [u8; 7] = [LOADB_V1, 15, 1, SET_LOOP, WAIT, 15, LOOP];
+/// Waits 1 HIT timer tick (20 ms) and jumps to the loop point.
+const WAIT_1_LOOP: [u8; 6] = [LOADB_V1, 15, 1, WAIT, 15, LOOP];
 
 /// A module whose routine `i` has track data ID `0x100 + i` and is run by
 /// track `10 + i` (with `kArgsIdVolPan` arguments) and event `e{i}`.
@@ -101,12 +106,12 @@ fn a_note_plays_its_patch_and_the_thread_waits_for_it() {
     let generic: &[u8] = &[NOTE_ON_V1[0], NOTE_ON_V1[1], WAIT_SAMP, END];
     let mut player = Player::new(vec![module(&[generic], 1)], samples(), 1);
     play(&mut player, "E0");
-    let out = player.render_until_idle(10 * BLOCK, &NoSources);
+    let out = player.render_until_idle(10 * TIMER_FRAMES, &NoSources);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
     // The sample, then silence for the rest of the block in which the
     // thread saw the note end.
     assert_eq!(&out[..100], &(1..=100).collect::<Vec<i16>>());
-    assert_eq!(out.len(), 2 * BLOCK);
+    assert_eq!(out.len(), 2 * TIMER_FRAMES);
     assert!(out[100..].iter().all(|&s| s == 0));
     assert!(player.is_idle());
 }
@@ -173,7 +178,7 @@ fn calls_return_at_end_and_branches_follow_compares() {
     let stop: &[u8] = &[END];
     let mut player = Player::new(vec![module(&[&main, &add, stop], 1)], samples(), 1);
     play(&mut player, "e0");
-    let out = player.render_until_idle(10 * BLOCK, &NoSources);
+    let out = player.render_until_idle(10 * TIMER_FRAMES, &NoSources);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
     assert_eq!(out[0], 1, "the note played");
 
@@ -181,26 +186,27 @@ fn calls_return_at_end_and_branches_follow_compares() {
     let main5: Vec<u8> = [&[4, 6, 5][..], &main[3..]].concat();
     let mut player = Player::new(vec![module(&[&main5, &add, stop], 1)], samples(), 1);
     play(&mut player, "e0");
-    let out = player.render_until_idle(10 * BLOCK, &NoSources);
+    let out = player.render_until_idle(10 * TIMER_FRAMES, &NoSources);
     assert!(out.iter().all(|&s| s == 0) && player.is_idle());
 }
 
 #[test]
-fn waits_count_milliseconds_and_loops_wait_a_block() {
-    // wait 10 ms, then play, then loop back to the start.
-    let routine: Vec<u8> = [&[4, 6, 10][..], &[9, 6], &[2, 5, WAIT_SAMP], &[32], &[END]].concat();
+fn waits_count_20ms_ticks_and_loops_jump_without_gap() {
+    // wait 2 HIT ticks (40 ms = 2 * TIMER_FRAMES), play 100-frame sample,
+    // wait_samp (polls every 2 ticks), then loop immediately in the same tick
+    // back to wait 2 (0x57e42d, 0x57e468 -> 0x57e6bd, 0x57ee33).
+    let routine: Vec<u8> = [&[4, 6, 2][..], &[9, 6], &[2, 5, WAIT_SAMP], &[32], &[END]].concat();
     let mut player = Player::new(vec![module(&[&routine], 1)], samples(), 1);
     play(&mut player, "e0");
-    let out = player.render(2000, &NoSources);
-    // 10 ms is 220.5 frames: the thread wakes at the first block start
-    // at or after frame 221.
+    let out = player.render(8 * TIMER_FRAMES, &NoSources);
+    // Tick 0 executes `wait 2` -> wakes at tick 2 (2 * TIMER_FRAMES = 882).
     let first = out.iter().position(|&s| s != 0).unwrap();
-    assert_eq!(first, 256);
+    assert_eq!(first, 2 * TIMER_FRAMES);
+    // Sample finishes within tick 2; `wait_samp` polls at tick 2 + 2 = 4,
+    // sees it ended, `loop` jumps in tick 4 with zero extra gap to `wait 2`,
+    // waking at tick 4 + 2 = 6 (6 * TIMER_FRAMES = 2646).
     let second = out[first + 100..].iter().position(|&s| s != 0).unwrap() + first + 100;
-    assert!(
-        second > first + 100 + 220,
-        "the loop waited again: {second}"
-    );
+    assert_eq!(second, 6 * TIMER_FRAMES);
     assert!(!player.is_idle());
     player.handle(&SoundEvent::StopObject { object: 9 }, &NoSources);
     assert!(player.is_idle());
@@ -342,7 +348,12 @@ fn a_pause_holds_a_playing_note_where_it_is() {
     player.handle(&SoundEvent::Pause, &NoSources);
     assert!(player.is_paused());
     // Held: silent, and the thread waits, however long.
-    assert!(player.render(3 * BLOCK, &NoSources).iter().all(|&s| s == 0));
+    assert!(
+        player
+            .render(3 * TIMER_FRAMES, &NoSources)
+            .iter()
+            .all(|&s| s == 0)
+    );
     assert!(!player.is_idle());
     player.handle(&SoundEvent::Unpause, &NoSources);
     assert!(!player.is_paused());
@@ -351,16 +362,17 @@ fn a_pause_holds_a_playing_note_where_it_is() {
         player.render(60, &NoSources),
         (41..=100).collect::<Vec<i16>>()
     );
-    player.render_until_idle(4 * BLOCK, &NoSources);
+    player.render_until_idle(4 * TIMER_FRAMES, &NoSources);
     assert!(player.is_idle());
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
 
-/// Waits a second (loadl v1, 1000; wait v1), then plays.
+/// Waits a second (50 HIT timer ticks at 20 ms each: `loadl v1, 50; wait v1`),
+/// then plays.
 fn waits_a_second() -> Vec<u8> {
     [
         &[LOADL, 5][..],
-        &long(1000),
+        &long(50),
         &[WAIT, 5],
         &[2, 5, WAIT_SAMP, END],
     ]
@@ -372,9 +384,19 @@ fn an_unpause_ends_a_wait_held_by_the_pause() {
     let routine = waits_a_second();
     let mut player = Player::new(vec![module(&[&routine], 1)], samples(), 1);
     play(&mut player, "e0");
-    assert!(player.render(BLOCK, &NoSources).iter().all(|&s| s == 0));
+    assert!(
+        player
+            .render(TIMER_FRAMES, &NoSources)
+            .iter()
+            .all(|&s| s == 0)
+    );
     player.handle(&SoundEvent::Pause, &NoSources);
-    assert!(player.render(BLOCK, &NoSources).iter().all(|&s| s == 0));
+    assert!(
+        player
+            .render(TIMER_FRAMES, &NoSources)
+            .iter()
+            .all(|&s| s == 0)
+    );
     // Letting the track go moves its deadline to now (0x57dc8e): the
     // thread runs at the next block, long before its second is up.
     player.handle(&SoundEvent::Unpause, &NoSources);
@@ -390,7 +412,12 @@ fn an_unpause_without_a_pause_ends_every_wait() {
     let routine = waits_a_second();
     let mut player = Player::new(vec![module(&[&routine], 1)], samples(), 1);
     play(&mut player, "e0");
-    assert!(player.render(BLOCK, &NoSources).iter().all(|&s| s == 0));
+    assert!(
+        player
+            .render(TIMER_FRAMES, &NoSources)
+            .iter()
+            .all(|&s| s == 0)
+    );
     player.handle(&SoundEvent::Unpause, &NoSources);
     assert_eq!(
         player.render(10, &NoSources),
@@ -468,13 +495,13 @@ fn starting_a_held_track_gives_its_script_the_new_arguments_and_ends_its_wait() 
     let mut player = Player::new(vec![module(&[&routine], 1)], samples(), 1);
     let asked = Asked::default();
     play(&mut player, "e0");
-    player.render(BLOCK, &asked);
+    player.render(TIMER_FRAMES, &asked);
     player.handle(&SoundEvent::Pause, &NoSources);
     // Started again for object 4 while held: the same script goes on,
     // with arguments 4, 0 and 0 (0x57d9cb to 0x57d9eb), at the next
     // block, its second's wait cut short (0x57dc8e).
     play_for(&mut player, 4, "e0");
-    player.render(BLOCK, &asked);
+    player.render(TIMER_FRAMES, &asked);
     assert_eq!(*asked.0.borrow(), [(4, 0)]);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
@@ -487,7 +514,7 @@ fn starting_a_held_track_needs_no_free_thread() {
     for i in 0..sims_audio::player::THREADS {
         play(&mut player, &format!("e{i}"));
     }
-    player.render(BLOCK, &NoSources);
+    player.render(TIMER_FRAMES, &NoSources);
     player.handle(&SoundEvent::Pause, &NoSources);
     // Every thread is taken, but the held e0 is let go, not started.
     play(&mut player, "e0");
@@ -549,7 +576,7 @@ fn unknown_events_and_bad_code_are_faults_not_panics() {
     play(&mut player, "other");
     play(&mut player, "e0");
     play(&mut player, "e1");
-    player.render(BLOCK, &NoSources);
+    player.render(TIMER_FRAMES, &NoSources);
     assert_eq!(player.faults.len(), 4, "{:?}", player.faults);
     assert!(player.faults[0].contains("no event nothing"));
     assert!(player.faults[1].contains("kind 7 is not one"));
@@ -563,21 +590,40 @@ const LOADB_V1: u8 = 4;
 const PLAY_TRK: u8 = 50;
 
 #[test]
-fn a_track_that_restarts_itself_runs_once_per_block() {
-    // Track 10: interrupt = 1; v1 = 10; play_trk v1; then a note it
-    // never reaches. Each run starts itself anew: from the top, in the
-    // next block, so `render` returns and the note never plays.
+fn a_track_that_restarts_itself_continues_in_same_tick_until_done_or_step_cap() {
+    // `0x57f1f2` -> `0x57dc0d` -> `0x57dc8e` -> `0x57f267`: `play_trk` on self
+    // with `interrupt = 1` sets `wake = hit_clock` and continues from its entry
+    // point in the SAME 20 ms tick (no artificial 20 ms delay).
+    //
+    // Case 1: finite self-restart (runs twice via global 110, then plays note
+    // in tick 0 with zero delay). Use kArgsNormal (0) so self-restart keeps
+    // EXTVOL = 1024.
+    let mut finite = vec![TEST, 110, IFNE];
+    finite.extend(long(0x101)); // jump to play_note on 2nd pass
+    finite.extend([
+        LOADB_V1, 110, 1, LOADB_V1, 55, 1, LOADB_V1, 5, 10, PLAY_TRK, 5, END,
+    ]);
+    let play_note: &[u8] = &[2, 5, WAIT_SAMP, END];
+    let mut player = Player::new(
+        vec![module_of_kinds(&[(10, 0, &finite), (11, 0, play_note)], "")],
+        samples(),
+        1,
+    );
+    play(&mut player, "e10");
+    assert_eq!(player.render(3, &NoSources), [1, 2, 3]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+
+    // Case 2: unconditional self-restart hits 1.91's 102-instruction per-tick
+    // cap (`0x57d909..0x57d91f`) and kills the track in tick 0 without playing.
     let respawn: &[u8] = &[
         LOADB_V1, 55, 1, LOADB_V1, 5, 10, PLAY_TRK, 5, 2, 5, WAIT_SAMP, END,
     ];
     let mut player = Player::new(vec![module(&[respawn], 1)], samples(), 1);
     play(&mut player, "e0");
-    assert_eq!(player.render(1, &NoSources), [0]);
-    let out = player.render(20 * BLOCK, &NoSources);
+    let out = player.render(TIMER_FRAMES, &NoSources);
     assert!(out.iter().all(|&s| s == 0));
-    assert!(player.faults.is_empty(), "{:?}", player.faults);
-    assert!(!player.is_idle());
-    player.handle(&SoundEvent::StopAll, &NoSources);
+    assert_eq!(player.faults.len(), 1, "{:?}", player.faults);
+    assert!(player.faults[0].contains("ran too long"));
     assert!(player.is_idle());
 }
 
@@ -588,7 +634,7 @@ fn a_track_that_plays_itself_without_interrupt_goes_on() {
     let respawn: &[u8] = &[LOADB_V1, 5, 10, PLAY_TRK, 5, END];
     let mut player = Player::new(vec![module(&[respawn], 0)], samples(), 1);
     play(&mut player, "e0");
-    player.render(BLOCK, &NoSources);
+    player.render(TIMER_FRAMES, &NoSources);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
     assert!(player.is_idle());
 }
@@ -613,11 +659,11 @@ fn a_running_track_played_again_starts_no_second_thread() {
     );
     for _ in 0..300 {
         play(&mut player, "e0");
-        player.render(BLOCK, &NoSources);
+        player.render(TIMER_FRAMES, &NoSources);
     }
     assert!(player.faults.is_empty(), "{:?}", player.faults);
     player.handle(&SoundEvent::StopObject { object: 9 }, &NoSources);
-    player.render(12 * BLOCK, &NoSources);
+    player.render(12 * TIMER_FRAMES, &NoSources);
     assert!(player.is_idle());
 }
 
@@ -630,7 +676,12 @@ fn a_play_of_a_running_track_ends_its_wait() {
     routine.extend(GENERIC);
     let mut player = Player::new(vec![module(&[&routine], 1)], samples(), 1);
     play(&mut player, "e0");
-    assert!(player.render(2 * BLOCK, &NoSources).iter().all(|&s| s == 0));
+    assert!(
+        player
+            .render(2 * TIMER_FRAMES, &NoSources)
+            .iter()
+            .all(|&s| s == 0)
+    );
     play(&mut player, "e0");
     assert_eq!(player.render(3, &NoSources), [1, 2, 3]);
 }
@@ -648,7 +699,7 @@ fn a_track_with_interrupt_set_starts_again_when_played() {
         player.render(10, &NoSources),
         (1..=10).collect::<Vec<i16>>()
     );
-    player.render(BLOCK - 10, &NoSources);
+    player.render(TIMER_FRAMES - 10, &NoSources);
     play(&mut player, "e0");
     assert_eq!(player.render(3, &NoSources), [1, 2, 3]);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
@@ -658,7 +709,7 @@ fn a_track_with_interrupt_set_starts_again_when_played() {
 fn a_fresh_start_stops_the_note_kind_53_played_on_the_idle_track() {
     // seq plays patch 2 on track 10 while no thread of it runs; starting
     // track 10, which waits without a note, stops that note.
-    let waiting: &[u8] = &[SET_LOOP, LOOP];
+    let waiting: &[u8] = &WAIT_FOREVER;
     let module = module_with(&[waiting], 1, 10, "seq=53,10,0,6\n");
     let mut player = Player::new(vec![module], samples(), 1);
     play(&mut player, "seq");
@@ -671,13 +722,13 @@ fn a_fresh_start_stops_the_note_kind_53_played_on_the_idle_track() {
 fn threads_stop_at_the_thread_limit() {
     // A track has one thread at most, so it takes more than 256 tracks
     // that run for ever. The tracks past the limit do not start.
-    let forever: &[u8] = &[LOOP];
+    let forever: &[u8] = &WAIT_FOREVER;
     let routines = vec![forever; 300];
     let mut player = Player::new(vec![module(&routines, 0)], samples(), 1);
     for i in 0..300 {
         play(&mut player, &format!("e{i}"));
     }
-    player.render(2 * BLOCK, &NoSources);
+    player.render(2 * TIMER_FRAMES, &NoSources);
     assert!(
         player
             .faults
@@ -691,25 +742,42 @@ fn threads_stop_at_the_thread_limit() {
 }
 
 #[test]
-fn all_threads_share_one_instruction_budget_per_block() {
-    // Twelve threads that jump to themselves forever. Ten use up the
-    // block's 100,000 instructions and end as stuck; the other two wait
-    // for the next block, where they end the same way.
-    // Routine i jumps to track data 0x100 + i: itself.
+fn runaway_track_is_killed_after_102_instructions_without_deferring_other_tracks() {
+    // `0x57d909..0x57d91f`: each track executes up to 101 instructions freely,
+    // and is killed after the 102nd instruction in one tick (`cmp eax, 0x64;
+    // jle`). Twelve runaway tracks all die in tick 0 without deferring a
+    // thirteenth healthy track.
+    //
+    // Boundary check: 100 NOPs + END = 101 instructions succeeds with no fault.
+    let mut ok101 = vec![NOP; 99];
+    ok101.extend([2, 5, WAIT_SAMP]); // 99 NOP + note_on + wait_samp = 101 instructions!
+    let mut player = Player::new(vec![module(&[&ok101], 1)], samples(), 1);
+    play(&mut player, "e0");
+    assert_eq!(player.render(3, &NoSources), [1, 2, 3]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+
+    // 100 NOPs + note_on + wait_samp = 102 instructions -> killed on #102!
+    let mut kill102 = vec![NOP; 100];
+    kill102.extend([2, 5, WAIT_SAMP]);
+    let mut player = Player::new(vec![module(&[&kill102], 1)], samples(), 1);
+    play(&mut player, "e0");
+    assert_eq!(player.render(3, &NoSources), [0, 0, 0]);
+    assert_eq!(player.faults.len(), 1, "{:?}", player.faults);
+    assert!(player.faults[0].contains("ran too long"));
+    assert!(player.is_idle());
+
+    // Twelve runaway tracks + a 13th healthy track: all 12 runaway tracks are
+    // killed in tick 0 and track 13 still plays immediately in tick 0.
     let spins: Vec<[u8; 5]> = (0..12).map(|i| [13, i, 1, 0, 0]).collect();
-    let routines: Vec<&[u8]> = spins.iter().map(|s| &s[..]).collect();
-    let mut player = Player::new(vec![module(&routines, 0)], samples(), 1);
-    for i in 0..12 {
+    let mut routines: Vec<&[u8]> = spins.iter().map(|s| &s[..]).collect();
+    routines.push(&GENERIC);
+    let mut player = Player::new(vec![module(&routines, 1)], samples(), 1);
+    for i in 0..=12 {
         play(&mut player, &format!("e{i}"));
     }
-    player.render(1, &NoSources);
-    assert_eq!(player.faults.len(), 11, "{:?}", player.faults);
-    assert!(player.faults[10].contains("100000 instructions in one block"));
-    assert!(!player.is_idle());
-    player.render(BLOCK, &NoSources);
+    assert_eq!(player.render(3, &NoSources), [1, 2, 3]);
     let stuck = player.faults.iter().filter(|f| f.contains("ran too long"));
     assert_eq!(stuck.count(), 12);
-    assert!(player.is_idle());
 }
 
 #[test]
@@ -780,7 +848,7 @@ fn seqgroup_return_ends_its_thread_when_another_holds_the_group() {
     let mut player = Player::new(vec![module(&[&routine, &routine], 1)], samples(), 1);
     play(&mut player, "e0");
     play(&mut player, "e1");
-    let out = player.render_until_idle(10 * BLOCK, &NoSources);
+    let out = player.render_until_idle(10 * TIMER_FRAMES, &NoSources);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
     // e1's thread found e0's track holding the group and ended: the
     // sample plays once, not twice as loud.
@@ -788,19 +856,22 @@ fn seqgroup_return_ends_its_thread_when_another_holds_the_group() {
     // The slot keeps e1's track after its thread ended, so e0 now ends
     // too, until StopAll clears the slots.
     play(&mut player, "e0");
-    let out = player.render_until_idle(10 * BLOCK, &NoSources);
+    let out = player.render_until_idle(10 * TIMER_FRAMES, &NoSources);
     assert!(out.iter().all(|&s| s == 0));
     player.handle(&SoundEvent::StopAll, &NoSources);
     play(&mut player, "e0");
-    let out = player.render_until_idle(10 * BLOCK, &NoSources);
+    let out = player.render_until_idle(10 * TIMER_FRAMES, &NoSources);
     // From the next block.
-    assert_eq!(&out[BLOCK..BLOCK + 100], &(1..=100).collect::<Vec<i16>>());
+    assert_eq!(
+        &out[TIMER_FRAMES..TIMER_FRAMES + 100],
+        &(1..=100).collect::<Vec<i16>>()
+    );
     // A second play of e1 while it runs starts nothing, so it does not
     // meet its own group: the sample plays once.
     player.handle(&SoundEvent::StopAll, &NoSources);
     play(&mut player, "e1");
     play(&mut player, "e1");
-    let out = player.render_until_idle(10 * BLOCK, &NoSources);
+    let out = player.render_until_idle(10 * TIMER_FRAMES, &NoSources);
     assert_eq!(out.iter().find(|&&s| s != 0), Some(&1));
 }
 
@@ -809,7 +880,8 @@ fn seqgroup_kill_stops_a_holder_whose_extvol_is_0_at_once() {
     // e0 sets its extvol (19) to 0, claims group 1 and runs forever.
     let mut holder = loadb(19, 0).to_vec();
     holder.extend(loadb(5, 1));
-    holder.extend([SEQGROUP_RETURN, 5, SET_LOOP, LOOP]);
+    holder.extend([SEQGROUP_RETURN, 5]);
+    holder.extend(WAIT_FOREVER);
     // e1 takes group 1, then plays only if the group has a holder (which
     // it should: itself), using patch 2.
     let mut killer = loadb(5, 1).to_vec();
@@ -822,12 +894,12 @@ fn seqgroup_kill_stops_a_holder_whose_extvol_is_0_at_once() {
     play(&mut player, "e0");
     let mut out = player.render(32, &NoSources);
     play(&mut player, "e1");
-    out.extend(player.render_until_idle(10 * BLOCK, &NoSources));
+    out.extend(player.render_until_idle(10 * TIMER_FRAMES, &NoSources));
     assert!(player.faults.is_empty(), "{:?}", player.faults);
     // e1 ended e0 in the next block and played patch 2 (two.xa's frames
     // at 22,050 Hz); then nothing was left running.
-    assert!(out[..BLOCK].iter().all(|&s| s == 0));
-    assert_eq!(&out[BLOCK..BLOCK + 3], [2000, 4000, -2000]);
+    assert!(out[..TIMER_FRAMES].iter().all(|&s| s == 0));
+    assert_eq!(&out[TIMER_FRAMES..TIMER_FRAMES + 3], [2000, 4000, -2000]);
     assert!(player.is_idle());
 }
 
@@ -847,16 +919,19 @@ fn seqgroup_kill_fades_out_the_holder_then_runs_on() {
     let mut player = Player::new(vec![module(&[&holder, &killer], 1)], samples(), 1);
     play(&mut player, "e0");
     play(&mut player, "e1");
-    let out = player.render_until_idle(20 * BLOCK, &NoSources);
+    let out = player.render_until_idle(20 * TIMER_FRAMES, &NoSources);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
-    // e1 waits 2 ms, so it plays from the second block. e0's extvol falls
-    // by 200 a block from 1024 to fade_dest, which starts at 0, passing
-    // over 1. e1's second try (0x57eef3) finds the group its own and runs
-    // on, so nothing ends e0: it stays, silent, waiting for an extvol it
-    // has passed.
-    assert!(out[..BLOCK].iter().all(|&s| s == 0));
-    assert_eq!(&out[BLOCK..BLOCK + 3], [2000, 4000, -2000]);
-    assert!(out[BLOCK + 3..].iter().all(|&s| s == 0));
+    // e1 sleeps POLL_TICKS (2) timer ticks (40 ms = 2 * TIMER_FRAMES) on
+    // seqgroup_kill (0x57efc0..0x57efd2), so it plays at tick 2. e0's extvol
+    // falls by 200 per tick from 1024 to fade_dest (0), passing over 1.
+    // e1's second try (0x57eef3) finds the group its own and runs on, so
+    // nothing ends e0: it stays, silent, waiting for an extvol it has passed.
+    assert!(out[..2 * TIMER_FRAMES].iter().all(|&s| s == 0));
+    assert_eq!(
+        &out[2 * TIMER_FRAMES..2 * TIMER_FRAMES + 3],
+        [2000, 4000, -2000]
+    );
+    assert!(out[2 * TIMER_FRAMES + 3..].iter().all(|&s| s == 0));
     assert!(!player.is_idle());
 }
 
@@ -871,7 +946,7 @@ fn the_first_module_defining_an_event_wins_and_play_from_picks_one() {
     assert_eq!(player.render(3, &NoSources), [1, 2, 3]);
     player.handle(&SoundEvent::StopAll, &NoSources);
     player.play_from(1, 9, "e0", &NoSources);
-    player.render(BLOCK - 3, &NoSources);
+    player.render(TIMER_FRAMES - 3, &NoSources);
     assert_eq!(player.render(3, &NoSources), [2000, 4000, -2000]);
     player.handle(&SoundEvent::StopAll, &NoSources);
     player.play_from(2, 9, "e0", &NoSources);
@@ -888,12 +963,13 @@ const NOP: u8 = 15;
 
 #[test]
 fn sequence_groups_stop_at_the_group_limit() {
-    // Claim a new group every block: 1, 2, 3, ...
+    // Claim a new group every timer tick: 1, 2, 3, ...
     let mut routine = loadb(6, 1).to_vec();
-    routine.extend([SET_LOOP, ADD, 5, 6, SEQGROUP_RETURN, 5, LOOP]);
+    routine.extend([SET_LOOP, ADD, 5, 6, SEQGROUP_RETURN, 5]);
+    routine.extend(WAIT_1_LOOP);
     let mut player = Player::new(vec![module(&[&routine], 1)], samples(), 1);
     play(&mut player, "e0");
-    player.render(300 * BLOCK, &NoSources);
+    player.render(300 * TIMER_FRAMES, &NoSources);
     assert_eq!(player.faults.len(), 1, "{:?}", player.faults);
     assert!(player.faults[0].contains("more than 256 sequence groups"));
     assert!(player.is_idle());
@@ -901,12 +977,13 @@ fn sequence_groups_stop_at_the_group_limit() {
 
 #[test]
 fn calls_across_waits_stop_at_the_depth_limit() {
-    // wait 0 ms (register 7), then call this routine again.
-    let mut routine = vec![WAIT, 7, CALL];
+    // Wait 1 HIT tick (20 ms), then call this routine again across ticks.
+    let mut routine = loadb(7, 1).to_vec();
+    routine.extend([WAIT, 7, CALL]);
     routine.extend(long(0x100));
     let mut player = Player::new(vec![module(&[&routine], 1)], samples(), 1);
     play(&mut player, "e0");
-    player.render(100 * BLOCK, &NoSources);
+    player.render(100 * TIMER_FRAMES, &NoSources);
     assert_eq!(player.faults.len(), 1, "{:?}", player.faults);
     assert!(player.faults[0].contains("calls nested deeper than 64"));
     assert!(player.is_idle());
@@ -917,29 +994,32 @@ fn a_missing_patch_is_not_cached() {
     // Each block, play patch 77, which no table defines: each attempt is
     // looked up (and reported) again, so nothing is kept for it.
     let mut routine = loadb(50, 77).to_vec();
-    routine.extend([SET_LOOP, 2, 6, LOOP]);
+    routine.extend([SET_LOOP, 2, 6]);
+    routine.extend(WAIT_1_LOOP);
     let mut player = Player::new(vec![module(&[&routine], 1)], samples(), 1);
     play(&mut player, "e0");
-    player.render(3 * BLOCK, &NoSources);
+    player.render(3 * TIMER_FRAMES, &NoSources);
     assert_eq!(player.faults, ["no patch 77"; 3]);
 }
 
 #[test]
-fn threads_a_full_block_does_not_reach_run_first_in_the_next() {
-    // Ten threads that each spend 10,000 instructions a block use the
-    // whole block budget; an eleventh still gets to play its note.
-    let mut busy = vec![NOP; 9_999];
-    busy.push(LOOP);
+fn busy_tracks_under_step_cap_do_not_defer_later_tracks() {
+    // Ten threads that each spend 101 instructions (100 NOP + wait 1) stay
+    // under 1.91's 102-instruction per-track cap without starving an eleventh
+    // track, which still plays in tick 0.
+    let mut busy = loadb(15, 1).to_vec();
+    busy.extend(vec![NOP; 98]);
+    busy.extend([WAIT, 15, END]); // 1 + 98 + 1 = 100 instructions in tick 0
     let generic: &[u8] = &[NOTE_ON_V1[0], NOTE_ON_V1[1], WAIT_SAMP, END];
     let mut routines: Vec<&[u8]> = vec![&busy; 10];
     routines.push(generic);
     let mut player = Player::new(vec![module(&routines, 1)], samples(), 1);
-    for i in 0..10 {
+    for i in 0..=10 {
         play(&mut player, &format!("e{i}"));
     }
-    play(&mut player, "e10");
-    let out = player.render(3 * BLOCK, &NoSources);
-    assert_eq!(&out[BLOCK..BLOCK + 3], [1, 2, 3]);
+    let out = player.render(3, &NoSources);
+    assert_eq!(out, [1, 2, 3]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
 
 #[test]
@@ -959,9 +1039,12 @@ fn a_fade_near_the_largest_value_stops_at_its_destination() {
     routine.extend([WAITEQ, 7, 8, 2, 6, WAIT_SAMP, END]);
     let mut player = Player::new(vec![module(&[&routine], 1)], samples(), 1);
     play(&mut player, "e0");
-    let out = player.render(3 * BLOCK, &NoSources);
+    let out = player.render(3 * TIMER_FRAMES, &NoSources);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
-    assert_eq!(&out[BLOCK..BLOCK + 3], [1, 2, 3]);
+    // `waiteq` polls every POLL_TICKS (2) timer ticks (0x57e6bd): tick 0
+    // arms the fade and sleeps until tick 2, tick 1 finishes the fade at
+    // i32::MAX, and tick 2 wakes and plays patch 1.
+    assert_eq!(&out[2 * TIMER_FRAMES..2 * TIMER_FRAMES + 3], [1, 2, 3]);
 }
 
 const IFNE: u8 = 63;
@@ -1020,7 +1103,7 @@ fn main_duckpri_halves_tracks_below_it_until_its_thread_ends() {
     // e0 asks for main_duckpri 30 and waits for ever; e1 (duck priority
     // 0) plays.
     let mut ducker = loadl(123, 30);
-    ducker.extend([SET_LOOP, LOOP]);
+    ducker.extend(WAIT_FOREVER);
     let mut player = Player::new(vec![module(&[&ducker, &GENERIC], 1)], loud(4), 1);
     player.handle(
         &SoundEvent::Play {
@@ -1031,12 +1114,12 @@ fn main_duckpri_halves_tracks_below_it_until_its_thread_ends() {
     );
     play(&mut player, "e1");
     assert_eq!(player.render(2, &NoSources), [999, 999]);
-    player.render(BLOCK - 2, &NoSources);
+    player.render(TIMER_FRAMES - 2, &NoSources);
     // When the ducking thread stops, its request goes with it. (e1's
-    // thread ends in the next block, so a play after that starts it
-    // anew.)
+    // `wait_samp` polls 2 ticks after tick 0, so after tick 2 e1 ends and
+    // a play after that starts it anew.)
     player.handle(&SoundEvent::StopObject { object: 1 }, &NoSources);
-    player.render(BLOCK, &NoSources);
+    player.render(2 * TIMER_FRAMES, &NoSources);
     play(&mut player, "e1");
     assert_eq!(player.render(2, &NoSources), [10_000, 10_000]);
 }
@@ -1088,7 +1171,7 @@ fn target_follows_the_target_s_own_target() {
     // e0 targets track 11 (e1, a note) and waits; e2 targets track 10
     // (e0) and sets vol 512, which goes on to e1.
     let mut middle = loadl(53, 11);
-    middle.extend([SET_LOOP, LOOP]);
+    middle.extend(WAIT_FOREVER);
     let mut setter = loadl(53, 10);
     setter.extend(loadl(18, 512));
     setter.push(END);
@@ -1145,10 +1228,10 @@ fn too_many_frames_at_once_is_a_fault_not_a_panic() {
     let over = sims_audio::player::RENDER_LIMIT + 1;
     assert!(player.render_stereo(over, &NoSources).is_empty());
     assert_eq!(player.faults.len(), 3, "{:?}", player.faults);
-    // Rendering until idle stops at the limit.
+    // Rendering until idle stops at the 2-tick `wait_samp` poll boundary.
     play(&mut player, "e0");
     let out = player.render_until_idle(usize::MAX, &NoSources);
-    assert!(out.len() <= BLOCK);
+    assert!(out.len() <= 2 * TIMER_FRAMES);
 }
 
 /// Plays patch 1 over and over: `note_on v1; wait_samp; loop`.
@@ -1172,14 +1255,14 @@ fn a_fade_event_fades_a_track_and_may_end_it() {
     let events = "keep=18,10\nkill=18,10,0,0,1\nfast=18,10,512\n";
     for (event, blocks) in [("keep", None), ("kill", Some(11)), ("fast", None)] {
         let module = module_with(&[&LOOPING], 1, 10, events);
-        let mut player = Player::new(vec![module], loud(10 * BLOCK), 1);
+        let mut player = Player::new(vec![module], loud(10 * TIMER_FRAMES), 1);
         play(&mut player, "e0");
-        player.render(BLOCK, &NoSources);
+        player.render(TIMER_FRAMES, &NoSources);
         play_for(&mut player, 0, event);
         // extvol falls by the speed each block, from 1024.
         let mut ended = None;
         for block in 1..=20 {
-            player.render(BLOCK, &NoSources);
+            player.render(TIMER_FRAMES, &NoSources);
             if player.is_idle() && ended.is_none() {
                 ended = Some(block);
             }
@@ -1188,7 +1271,12 @@ fn a_fade_event_fades_a_track_and_may_end_it() {
         assert_eq!(ended, blocks, "{event}");
         if blocks.is_none() {
             // Faded to silence, still running.
-            assert!(player.render(BLOCK, &NoSources).iter().all(|&s| s == 0));
+            assert!(
+                player
+                    .render(TIMER_FRAMES, &NoSources)
+                    .iter()
+                    .all(|&s| s == 0)
+            );
         }
     }
 }
@@ -1196,14 +1284,14 @@ fn a_fade_event_fades_a_track_and_may_end_it() {
 #[test]
 fn a_fade_event_s_speed_is_the_object_when_it_gives_none() {
     let module = module_with(&[&LOOPING], 1, 10, "kill=18,10,0,0,1\n");
-    let mut player = Player::new(vec![module], loud(10 * BLOCK), 1);
+    let mut player = Player::new(vec![module], loud(10 * TIMER_FRAMES), 1);
     play(&mut player, "e0");
-    player.render(BLOCK, &NoSources);
+    player.render(TIMER_FRAMES, &NoSources);
     // Object 512: two blocks to 0.
     play_for(&mut player, 512, "kill");
-    player.render(2 * BLOCK, &NoSources);
+    player.render(2 * TIMER_FRAMES, &NoSources);
     assert!(!player.is_idle());
-    player.render(BLOCK, &NoSources);
+    player.render(TIMER_FRAMES, &NoSources);
     assert!(player.is_idle());
 }
 
@@ -1212,7 +1300,7 @@ fn a_fade_event_for_a_track_not_running_does_nothing() {
     let module = module_with(&[&LOOPING], 1, 10, "kill=18,10,0,0,1\n");
     let mut player = Player::new(vec![module], loud(4), 1);
     play(&mut player, "kill");
-    player.render(BLOCK, &NoSources);
+    player.render(TIMER_FRAMES, &NoSources);
     assert!(player.faults.is_empty() && player.is_idle());
 }
 
@@ -1249,7 +1337,7 @@ fn an_object_that_goes_fades_out_its_instances() {
     // goes and the track plays on for object 2, placed again: on the
     // right.
     let module = module_with(&[&LOOPING], 1, 10, "");
-    let mut player = Player::new(vec![module], loud(10 * BLOCK), 1);
+    let mut player = Player::new(vec![module], loud(10 * TIMER_FRAMES), 1);
     let sides = TwoSides;
     for object in [1, 2] {
         player.handle(
@@ -1261,7 +1349,7 @@ fn an_object_that_goes_fades_out_its_instances() {
         );
     }
     let both = player.render_stereo(1, &sides);
-    player.render(BLOCK - 1, &sides);
+    player.render(TIMER_FRAMES - 1, &sides);
     player.handle(&SoundEvent::StopObject { object: 1 }, &sides);
     let right = player.render_stereo(1, &sides);
     assert!(right[1] > right[0], "{right:?}");
@@ -1269,13 +1357,13 @@ fn an_object_that_goes_fades_out_its_instances() {
         right[1] - right[0] > both[1] - both[0],
         "{both:?} {right:?}"
     );
-    player.render(BLOCK - 1, &sides);
+    player.render(TIMER_FRAMES - 1, &sides);
     // The last object going fades the track by 100 a block, from 1024,
     // and ends it.
     player.handle(&SoundEvent::StopObject { object: 2 }, &sides);
     let first = player.render(1, &sides)[0];
     assert!(first > 0 && first < 10_000, "{first}");
-    player.render(12 * BLOCK, &sides);
+    player.render(12 * TIMER_FRAMES, &sides);
     assert!(player.is_idle());
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
@@ -1283,11 +1371,11 @@ fn an_object_that_goes_fades_out_its_instances() {
 #[test]
 fn an_object_that_goes_ends_its_silent_threads_at_once() {
     // e0 waits for ever without a note.
-    let waiting: &[u8] = &[SET_LOOP, LOOP];
+    let waiting: &[u8] = &WAIT_FOREVER;
     let module = module_with(&[waiting], 1, 10, "");
     let mut player = Player::new(vec![module], samples(), 1);
     play_for(&mut player, 1, "e0");
-    player.render(BLOCK, &NoSources);
+    player.render(TIMER_FRAMES, &NoSources);
     player.handle(&SoundEvent::StopObject { object: 1 }, &NoSources);
     assert!(player.is_idle());
 }
@@ -1298,23 +1386,23 @@ fn turning_on_a_tv_lets_go_of_what_it_had_playing() {
     // first argument.
     let events = "on0=30,10,3\non1=30,11,3\noff=31,10\n";
     let module = module_with(&[&LOOPING, &LOOPING], 1, 10, events);
-    let mut player = Player::new(vec![module], loud(10 * BLOCK), 1);
+    let mut player = Player::new(vec![module], loud(10 * TIMER_FRAMES), 1);
     play(&mut player, "on0");
     assert_eq!(player.render(1, &NoSources), [10_000]);
-    player.render(BLOCK - 1, &NoSources);
+    player.render(TIMER_FRAMES - 1, &NoSources);
     // kTurnOffTv does nothing (the scripts turn sets off themselves).
     play(&mut player, "off");
     assert_eq!(player.render(1, &NoSources), [10_000]);
-    player.render(BLOCK - 1, &NoSources);
+    player.render(TIMER_FRAMES - 1, &NoSources);
     // A new channel: track 10 fades out while track 11 plays.
     play(&mut player, "on1");
     let both = player.render(1, &NoSources)[0];
     assert!(both > 10_000 && both < 20_000, "{both}");
-    player.render(12 * BLOCK, &NoSources);
+    player.render(12 * TIMER_FRAMES, &NoSources);
     assert_eq!(player.render(1, &NoSources), [10_000]);
     // Object 3 going ends track 11 too.
     player.handle(&SoundEvent::StopObject { object: 3 }, &NoSources);
-    player.render(12 * BLOCK, &NoSources);
+    player.render(12 * TIMER_FRAMES, &NoSources);
     assert!(player.is_idle());
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
@@ -1327,7 +1415,7 @@ fn a_sequenced_patch_plays_right_after_the_track_s_note() {
     play(&mut player, "e0");
     player.render(10, &NoSources);
     play(&mut player, "seq");
-    let out = player.render_until_idle(10 * BLOCK, &NoSources);
+    let out = player.render_until_idle(10 * TIMER_FRAMES, &NoSources);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
     // One.xa's last 90 frames, then two.xa with no gap, as one note the
     // thread waits for.
@@ -1341,13 +1429,13 @@ fn a_sequenced_patch_plays_right_after_the_track_s_note() {
 fn a_sequenced_patch_with_no_note_playing_starts_one() {
     // e0 waits for ever with no note; with no thread at all the patch
     // plays alone.
-    let waiting: &[u8] = &[SET_LOOP, LOOP];
+    let waiting: &[u8] = &WAIT_FOREVER;
     for run in [true, false] {
         let module = module_with(&[waiting], 1, 10, "seq=53,10,0,6\n");
         let mut player = Player::new(vec![module], samples(), 1);
         if run {
             play(&mut player, "e0");
-            player.render(BLOCK, &NoSources);
+            player.render(TIMER_FRAMES, &NoSources);
         }
         play(&mut player, "seq");
         assert_eq!(player.render(4, &NoSources), [2000, 4000, -2000, 0]);
@@ -1360,10 +1448,10 @@ fn radio_next_song_stops_each_station_s_note() {
     // Tracks 260 (0x104) and 261; kind 19 stops 260's note, so its
     // script goes on (here, to the end). 261 is not a radio track.
     let module = module_with(&[&GENERIC, &GENERIC], 1, 260, "next=19,0\n");
-    let mut player = Player::new(vec![module], loud(10 * BLOCK), 1);
+    let mut player = Player::new(vec![module], loud(10 * TIMER_FRAMES), 1);
     play(&mut player, "e0");
     play(&mut player, "e1");
-    player.render(BLOCK, &NoSources);
+    player.render(TIMER_FRAMES, &NoSources);
     play(&mut player, "next");
     assert_eq!(player.render(1, &NoSources), [10_000]);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
@@ -1373,29 +1461,29 @@ fn radio_next_song_stops_each_station_s_note() {
 fn kill_all_and_kill_object_sounds_events() {
     let events = "all=20,0\nobjects=105,0\non=30,10\n";
     let module = module_with(&[&LOOPING], 1, 10, events);
-    let mut player = Player::new(vec![module], loud(10 * BLOCK), 1);
+    let mut player = Player::new(vec![module], loud(10 * TIMER_FRAMES), 1);
     play_for(&mut player, 1, "e0");
-    player.render(BLOCK, &NoSources);
+    player.render(TIMER_FRAMES, &NoSources);
     play(&mut player, "all");
     assert!(player.is_idle());
     // kind 105 fades out instances of objects above 0.
     let module = module_with(&[&LOOPING], 1, 10, events);
-    let mut player = Player::new(vec![module], loud(10 * BLOCK), 1);
+    let mut player = Player::new(vec![module], loud(10 * TIMER_FRAMES), 1);
     play_for(&mut player, 1, "e0");
-    player.render(BLOCK, &NoSources);
+    player.render(TIMER_FRAMES, &NoSources);
     play(&mut player, "objects");
-    player.render(12 * BLOCK, &NoSources);
+    player.render(12 * TIMER_FRAMES, &NoSources);
     assert!(player.is_idle());
     // Kind 1 starts nothing for an object of 0 (0x57375b). Kind 30
     // records it, but kind 105 leaves it: its track plays on.
     let module = module_with(&[&LOOPING], 1, 10, events);
-    let mut player = Player::new(vec![module], loud(10 * BLOCK), 1);
+    let mut player = Player::new(vec![module], loud(10 * TIMER_FRAMES), 1);
     play_for(&mut player, 0, "e0");
     assert!(player.is_idle());
     play_for(&mut player, 0, "on");
-    player.render(BLOCK, &NoSources);
+    player.render(TIMER_FRAMES, &NoSources);
     play(&mut player, "objects");
-    player.render(12 * BLOCK, &NoSources);
+    player.render(12 * TIMER_FRAMES, &NoSources);
     assert_eq!(player.render(1, &NoSources), [10_000]);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
@@ -1445,7 +1533,8 @@ fn the_piano_plays_where_its_object_is_and_sets_the_skill() {
     // Both tracks ask about their first argument, as the fields their
     // `extvol` and `pan`: the piano every block, the skill once.
     let mut piano = vec![SET_LOOP];
-    piano.extend([GETSRCDATAFIELD, 6, 1, 19, GETSRCDATAFIELD, 6, 1, 20, LOOP]);
+    piano.extend([GETSRCDATAFIELD, 6, 1, 19, GETSRCDATAFIELD, 6, 1, 20]);
+    piano.extend(WAIT_1_LOOP);
     let skill = [GETSRCDATAFIELD, 6, 1, 19, GETSRCDATAFIELD, 6, 1, 20, END];
     let events = "piano=43,0\nunplaced=43,0,8,300,600\nkill9=23,9\nkill8=23,8\n";
     let module = module_of_tracks(&[(PIANO, &piano), (PIANO_SKILL, &skill)], events);
@@ -1467,7 +1556,7 @@ fn the_piano_plays_where_its_object_is_and_sets_the_skill() {
         &room,
     );
     assert_eq!(asked(), [(9, 5)]);
-    player.render(BLOCK, &room);
+    player.render(TIMER_FRAMES, &room);
     assert_eq!(asked(), [(9, 464), (9, 527), (42, 0), (42, 0)]);
     // The piano still runs, so a start for object 8 (not on the lot)
     // starts no second piano: its arguments become 8 and the event's
@@ -1481,15 +1570,15 @@ fn the_piano_plays_where_its_object_is_and_sets_the_skill() {
         &room,
     );
     assert_eq!(asked(), [(8, 5)]);
-    player.render(BLOCK, &room);
+    player.render(TIMER_FRAMES, &room);
     assert_eq!(asked(), [(8, 464), (8, 527), (42, 0), (42, 0)]);
     // The piano's one instance is the object of its last fresh start, 9:
     // letting go of 8 leaves it playing, and of 9 ends it.
     play(&mut player, "kill8");
-    player.render(12 * BLOCK, &room);
+    player.render(12 * TIMER_FRAMES, &room);
     assert!(!player.is_idle());
     play(&mut player, "kill9");
-    player.render(12 * BLOCK, &room);
+    player.render(12 * TIMER_FRAMES, &room);
     assert!(player.is_idle());
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
@@ -1518,7 +1607,7 @@ fn a_piano_whose_number_is_a_patch_still_starts_the_skill_track() {
         &room,
     );
     assert_eq!(asked(), [(9, 5)]);
-    player.render(BLOCK, &room);
+    player.render(TIMER_FRAMES, &room);
     assert_eq!(asked(), [(42, 0), (42, 0)]);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
@@ -1527,7 +1616,8 @@ fn a_piano_whose_number_is_a_patch_still_starts_the_skill_track() {
 fn a_piano_let_go_from_a_pause_keeps_its_object() {
     use sims_audio::player::{PIANO, PIANO_SKILL};
     let mut piano = vec![SET_LOOP];
-    piano.extend([GETSRCDATAFIELD, 6, 1, 19, LOOP]);
+    piano.extend([GETSRCDATAFIELD, 6, 1, 19]);
+    piano.extend(WAIT_1_LOOP);
     let skill = [END];
     let events = "piano=43,0\nunplaced=43,0,8,300,600\nkill9=23,9\nkill8=23,8\n";
     let module = module_of_tracks(&[(PIANO, &piano), (PIANO_SKILL, &skill)], events);
@@ -1540,15 +1630,15 @@ fn a_piano_let_go_from_a_pause_keeps_its_object() {
     // lets it go, and the piano's one instance is still 9.
     let mut player = Player::new(vec![module], samples(), 1);
     player.handle(&event("piano", 9), &room);
-    player.render(BLOCK, &room);
+    player.render(TIMER_FRAMES, &room);
     player.handle(&SoundEvent::Pause, &room);
     player.handle(&event("unplaced", 0), &room);
     player.handle(&SoundEvent::Unpause, &room);
     play(&mut player, "kill8");
-    player.render(12 * BLOCK, &room);
+    player.render(12 * TIMER_FRAMES, &room);
     assert!(!player.is_idle());
     play(&mut player, "kill9");
-    player.render(12 * BLOCK, &room);
+    player.render(12 * TIMER_FRAMES, &room);
     assert!(player.is_idle());
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
@@ -1558,8 +1648,9 @@ fn a_start_of_a_running_track_is_not_refused_at_the_thread_limit() {
     use sims_audio::player::{PIANO, THREADS};
     // The piano asks about its object every block; tracks 20 on loop.
     let mut piano = vec![SET_LOOP];
-    piano.extend([GETSRCDATAFIELD, 6, 1, 19, LOOP]);
-    let filler = [SET_LOOP, LOOP];
+    piano.extend([GETSRCDATAFIELD, 6, 1, 19]);
+    piano.extend(WAIT_1_LOOP);
+    let filler = WAIT_FOREVER;
     let events = "piano=43,0\nunplaced=43,0,8,300,600\nkill9=23,9\nkill8=23,8\n";
     let mut tracks: Vec<(u32, &[u8])> = vec![(PIANO, &piano)];
     for track in 20..20 + THREADS as u32 {
@@ -1586,19 +1677,19 @@ fn a_start_of_a_running_track_is_not_refused_at_the_thread_limit() {
     player.handle(&event("unplaced", 0), &room);
     assert_eq!(player.faults.len(), 1, "{:?}", player.faults);
     room.0.take();
-    player.render(BLOCK, &room);
+    player.render(TIMER_FRAMES, &room);
     let asked = room.0.take();
     assert!(asked.iter().any(|&(object, _)| object == 8), "{asked:?}");
     assert!(asked.iter().all(|&(object, _)| object != 9), "{asked:?}");
     play(&mut player, "kill8");
-    player.render(12 * BLOCK, &room);
+    player.render(12 * TIMER_FRAMES, &room);
     room.0.take();
-    player.render(BLOCK, &room);
+    player.render(TIMER_FRAMES, &room);
     assert!(room.0.take().iter().any(|&(object, _)| object == 8));
     play(&mut player, "kill9");
-    player.render(12 * BLOCK, &room);
+    player.render(12 * TIMER_FRAMES, &room);
     room.0.take();
-    player.render(BLOCK, &room);
+    player.render(TIMER_FRAMES, &room);
     assert!(room.0.take().is_empty());
 }
 
@@ -1686,22 +1777,26 @@ fn module_of_kinds(tracks: &[(u32, u8, &[u8])], events: &str) -> Module {
 
 /// Asks the simulation about field `field` of the object its first
 /// argument names (getsrcdatafield v2, arg1, v1), then ends, or, with
-/// `again`, asks again every block.
+/// `again`, waits one 20 ms tick and asks again every timer tick.
 fn asks(field: u32, again: bool) -> Vec<u8> {
     let mut routine = vec![LOADL, 5];
     routine.extend(long(field));
     if again {
-        routine.push(SET_LOOP);
+        routine.extend([LOADB_V1, 7, 1, SET_LOOP]);
     }
     routine.extend([GETSRCDATAFIELD, 6, 1, 5]);
-    routine.push(if again { LOOP } else { END });
+    if again {
+        routine.extend([WAIT, 7, LOOP]);
+    } else {
+        routine.push(END);
+    }
     routine
 }
 
-/// Renders a block; returns what the scripts asked in it, sorted.
+/// Renders one 20 ms HIT timer tick; returns what the scripts asked in it, sorted.
 fn asked_in_a_block(player: &mut Player<BTreeMap<String, Pcm>>) -> Vec<(i32, i32)> {
     let asked = Asked::default();
-    player.render(BLOCK, &asked);
+    player.render(TIMER_FRAMES, &asked);
     let mut asked = asked.0.into_inner();
     asked.sort();
     asked
@@ -1797,7 +1892,8 @@ fn play_trk_hands_on_the_arguments_and_source_and_kill_trk_ends_the_whole_track(
     // Track 10 asks about arg1's field arg2, then arg3's field `source`,
     // every block.
     let mut asker = vec![SET_LOOP];
-    asker.extend([GETSRCDATAFIELD, 6, 1, 2, GETSRCDATAFIELD, 6, 3, 47, LOOP]);
+    asker.extend([GETSRCDATAFIELD, 6, 1, 2, GETSRCDATAFIELD, 6, 3, 47]);
+    asker.extend(WAIT_1_LOOP);
     // Track 11: arg2 = 7, arg3 = 8, source = 5, then play_trk 10.
     let mut starter = [loadb(2, 7), loadb(3, 8), loadb(47, 5), loadb(5, 10)].concat();
     starter.extend([PLAY_TRK, 5, END]);
@@ -1834,9 +1930,10 @@ fn play_trk_reads_source_through_the_target_but_the_arguments_from_its_own() {
     // Track 10 asks about arg1's field arg2, then arg3's field `source`,
     // every block. Track 14 holds `source` 6 and loops.
     let mut asker = vec![SET_LOOP];
-    asker.extend([GETSRCDATAFIELD, 6, 1, 2, GETSRCDATAFIELD, 6, 3, 47, LOOP]);
+    asker.extend([GETSRCDATAFIELD, 6, 1, 2, GETSRCDATAFIELD, 6, 3, 47]);
+    asker.extend(WAIT_1_LOOP);
     let mut holder = loadb(47, 6).to_vec();
-    holder.extend([SET_LOOP, LOOP]);
+    holder.extend(WAIT_FOREVER);
     // Track 15: arg2 = 7, arg3 = 8, source = 5, all its own, then targets
     // track 14 and plays track 10.
     let mut starter = [
@@ -1851,7 +1948,7 @@ fn play_trk_reads_source_through_the_target_but_the_arguments_from_its_own() {
     let module = module_of_tracks(&[(10, &asker), (14, &holder), (15, &starter)], "");
     let mut player = Player::new(vec![module], samples(), 1);
     play(&mut player, "e14");
-    player.render(BLOCK, &NoSources);
+    player.render(TIMER_FRAMES, &NoSources);
     play(&mut player, "e15");
     assert_eq!(asked_in_a_block(&mut player), []);
     assert_eq!(asked_in_a_block(&mut player), [(8, 6), (9, 7)]);
@@ -1914,7 +2011,7 @@ fn a_mp3_too_long_once_resampled_is_a_fault() {
     );
     let mut player = Player::new(vec![module], files, 1);
     play(&mut player, "e0");
-    player.render(BLOCK, &NoSources);
+    player.render(TIMER_FRAMES, &NoSources);
     assert!(player.faults[0].contains("too long"), "{:?}", player.faults);
     assert!(player.is_idle());
 }
@@ -1931,22 +2028,22 @@ fn an_object_that_goes_fades_a_track_still_running_after_end() {
     hold_pc.extend(loadl(5, 1000));
     hold_pc.extend([WAIT, 5, LOOP]);
     let module = module_with(&[routine, &hold_pc], 1, 10, "");
-    let mut player = Player::new(vec![module], loud(30 * BLOCK), 1);
+    let mut player = Player::new(vec![module], loud(30 * TIMER_FRAMES), 1);
     play_for(&mut player, 1, "e0");
-    player.render(BLOCK, &NoSources);
+    player.render(TIMER_FRAMES, &NoSources);
     play_for(&mut player, 2, "e0");
-    player.render(BLOCK, &NoSources);
+    player.render(TIMER_FRAMES, &NoSources);
     assert_eq!(player.render(1, &NoSources), [10_000]);
     // Object 2 still has the track, so it keeps playing at full volume.
     player.handle(&SoundEvent::StopObject { object: 1 }, &NoSources);
-    player.render(2 * BLOCK, &NoSources);
+    player.render(2 * TIMER_FRAMES, &NoSources);
     assert_eq!(player.render(1, &NoSources), [10_000]);
     // The last object going fades it out at speed 100 and ends it.
     player.handle(&SoundEvent::StopObject { object: 2 }, &NoSources);
-    player.render(2 * BLOCK, &NoSources);
+    player.render(2 * TIMER_FRAMES, &NoSources);
     let fading = player.render(1, &NoSources)[0];
     assert!(fading > 0 && fading < 10_000, "{fading}");
-    player.render(10 * BLOCK, &NoSources);
+    player.render(10 * TIMER_FRAMES, &NoSources);
     assert!(player.is_idle());
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
@@ -2011,9 +2108,14 @@ fn a_television_turned_on_during_a_pause_waits_for_the_unpause() {
     let mut player = Player::new(vec![module], samples(), 1);
     player.handle(&SoundEvent::Pause, &NoSources);
     play(&mut player, "on");
-    assert!(player.render(2 * BLOCK, &NoSources).iter().all(|&s| s == 0));
+    assert!(
+        player
+            .render(2 * TIMER_FRAMES, &NoSources)
+            .iter()
+            .all(|&s| s == 0)
+    );
     player.handle(&SoundEvent::Unpause, &NoSources);
-    let out = player.render(2 * BLOCK, &NoSources);
+    let out = player.render(2 * TIMER_FRAMES, &NoSources);
     let first = out.iter().position(|&s| s != 0).expect("the note plays");
     assert_eq!(&out[first..first + 5], [1, 2, 3, 4, 5]);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
@@ -2113,7 +2215,7 @@ fn a_track_s_objects_go_first_recorded_then_newest_first() {
                 &probe,
             );
         }
-        player.render(BLOCK, &probe);
+        player.render(TIMER_FRAMES, &probe);
         // The second start's objects go first recorded, then the new
         // one (0x5761c2).
         let second = i32::from(order[1] as u8);
@@ -2142,7 +2244,7 @@ fn a_track_s_objects_go_first_recorded_then_newest_first() {
             &probe,
         );
     }
-    player.render(BLOCK, &probe);
+    player.render(TIMER_FRAMES, &probe);
     assert!(
         probe.asked.borrow().contains(&(4, 529)),
         "{:?}",
@@ -2210,14 +2312,14 @@ fn the_placement_s_pan_sets_the_comparison_flags_when_the_event_comes() {
             name: name.into(),
         };
         player.handle(&event("e0"), &probe);
-        player.render(BLOCK, &probe);
+        player.render(TIMER_FRAMES, &probe);
         player.handle(&SoundEvent::Pause, &probe);
         player.handle(&event("e0"), &probe);
         if let Some(seq) = seq_event {
             player.handle(&event(seq), &probe);
         }
         player.handle(&SoundEvent::Unpause, &probe);
-        player.render(2 * BLOCK, &probe);
+        player.render(2 * TIMER_FRAMES, &probe);
         assert_eq!(!probe.asked.borrow().is_empty(), asks, "{x} {seq_event:?}");
         assert!(player.faults.is_empty(), "{:?}", player.faults);
     }
@@ -2243,11 +2345,11 @@ fn a_camera_move_places_every_track_again() {
         };
         let mut player = Player::new(vec![module(&[&routine], 1)], samples(), 1);
         play_on(&mut player, 9, &start);
-        player.render(BLOCK, &probe);
+        player.render(TIMER_FRAMES, &probe);
         if moved {
             player.camera_moved(0, u32::MAX, &probe);
         }
-        player.render(8 * BLOCK, &probe);
+        player.render(10 * TIMER_FRAMES, &probe);
         assert_eq!(*probe.asked.borrow(), [(9, extvol), (9, pan)], "{moved}");
         assert!(player.faults.is_empty(), "{:?}", player.faults);
     }
@@ -2265,13 +2367,13 @@ fn a_camera_move_leaves_a_track_that_has_ended() {
     };
     let mut player = Player::new(vec![module(&[generic], 1)], samples(), 1);
     play_on(&mut player, 9, &on_lot(&[(9, 400)]));
-    player.render(BLOCK, &probe);
+    player.render(TIMER_FRAMES, &probe);
     assert_eq!(*probe.asked.borrow(), [(9, 512)]);
     player.camera_moved(0, u32::MAX, &probe);
-    player.render(BLOCK, &probe);
+    player.render(TIMER_FRAMES, &probe);
     assert_eq!(*probe.asked.borrow(), [(9, 512)]);
     play_on(&mut player, 9, &probe.lot);
-    player.render(BLOCK, &probe);
+    player.render(TIMER_FRAMES, &probe);
     assert_eq!(*probe.asked.borrow(), [(9, 512), (9, 542)]);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
@@ -2292,14 +2394,14 @@ fn a_camera_move_places_a_note_fading_after_end() {
     for moved in [true, false] {
         let mut player = Player::new(vec![module(&[routine, &hold_pc], 1)], long.clone(), 1);
         play_on(&mut player, 9, &start);
-        let out = player.render_stereo(2 * BLOCK, &start);
+        let out = player.render_stereo(2 * TIMER_FRAMES, &start);
         let last = out.len() - 2;
         assert_eq!(out[last], out[last + 1], "{out:?}");
         assert_ne!(out[last], 0);
         if moved {
             player.camera_moved(0, u32::MAX, &right);
         }
-        let out = player.render_stereo(2 * BLOCK, &right);
+        let out = player.render_stereo(2 * TIMER_FRAMES, &right);
         let last = out.len() - 2;
         assert_eq!(out[last + 1] > out[last], moved, "{:?}", &out[last..]);
         assert!(player.faults.is_empty(), "{:?}", player.faults);
@@ -2314,7 +2416,7 @@ fn long_sample(name: &str) -> BTreeMap<String, Pcm> {
         Pcm {
             rate: RATE,
             channels: 1,
-            samples: vec![10_000; 20 * BLOCK],
+            samples: vec![10_000; 20 * TIMER_FRAMES],
         },
     );
     map
@@ -2339,7 +2441,7 @@ fn a_camera_move_does_not_follow_a_target_a_later_start_reset() {
         first.extend(then);
         first
     };
-    let wait: &[u8] = &[SET_LOOP, LOOP];
+    let wait: &[u8] = &WAIT_FOREVER;
     let note_and_end: &[u8] = &[NOTE_ON_V1[0], NOTE_ON_V1[1], END];
     let cases: [(Vec<u8>, &[u8]); 3] = [
         (mark(true, wait), wait),
@@ -2371,11 +2473,11 @@ fn a_camera_move_does_not_follow_a_target_a_later_start_reset() {
         };
         play(&mut player, 8, "e1");
         play(&mut player, 9, "e0");
-        player.render(BLOCK, &start);
+        player.render(TIMER_FRAMES, &start);
         play(&mut player, 9, "e0");
-        player.render(BLOCK, &start);
+        player.render(TIMER_FRAMES, &start);
         player.camera_moved(0, u32::MAX, &probe);
-        player.render(8 * BLOCK, &probe);
+        player.render(10 * TIMER_FRAMES, &probe);
         assert_eq!(*probe.asked.borrow(), [(8, 1024), (8, 512)], "case {case}");
         assert!(player.faults.is_empty(), "{:?}", player.faults);
     }
@@ -2416,13 +2518,13 @@ fn a_camera_move_reaches_a_target_fading_after_end() {
             );
         };
         play(&mut player, 8, "e1");
-        player.render(BLOCK, &start);
+        player.render(TIMER_FRAMES, &start);
         play(&mut player, 9, "e0");
-        player.render(7 * BLOCK, &start);
+        player.render(7 * TIMER_FRAMES, &start);
         if moved {
             player.camera_moved(0, u32::MAX, &right);
         }
-        let out = player.render_stereo(2 * BLOCK, &right);
+        let out = player.render_stereo(2 * TIMER_FRAMES, &right);
         let last = out.len() - 2;
         assert_ne!(out[last], 0);
         assert_eq!(out[last + 1] > out[last], moved, "{:?}", &out[last..]);
@@ -2445,16 +2547,16 @@ fn a_camera_move_goes_no_further_than_a_thread_whose_track_started_again() {
     middle.extend(long(0x103));
     middle.extend(loadl(110, 1));
     middle.extend(NOTE_ON_V1);
-    middle.extend(loadl(5, 10));
+    middle.extend(loadl(5, 4));
     middle.extend([WAIT, 5]);
     middle.extend(loadl(53, 12));
-    middle.extend([SET_LOOP, LOOP]);
+    middle.extend(WAIT_FOREVER);
     let mut targets = loadl(53, 11);
-    targets.extend([SET_LOOP, LOOP]);
-    let mut asks = loadl(5, 100);
+    targets.extend(WAIT_FOREVER);
+    let mut asks = loadl(5, 15);
     asks.extend([WAIT, 5]);
     asks.extend([72, 6, 1, 19, 72, 6, 1, 20, END]);
-    let wait: &[u8] = &[SET_LOOP, LOOP];
+    let wait: &[u8] = &WAIT_FOREVER;
     let start = on_lot(&[(7, 400), (8, 400), (9, 400)]);
     for restarted in [true, false] {
         let probe = Probe {
@@ -2476,17 +2578,17 @@ fn a_camera_move_goes_no_further_than_a_thread_whose_track_started_again() {
             );
         };
         play(&mut player, 7, "e2");
-        player.render(BLOCK, &start);
+        player.render(TIMER_FRAMES, &start);
         play(&mut player, 8, "e1");
-        player.render(BLOCK, &start);
+        player.render(TIMER_FRAMES, &start);
         play(&mut player, 9, "e0");
-        player.render(5 * BLOCK, &start);
+        player.render(5 * TIMER_FRAMES, &start);
         if restarted {
             play(&mut player, 8, "e1");
         }
-        player.render(BLOCK, &start);
+        player.render(TIMER_FRAMES, &start);
         player.camera_moved(0, u32::MAX, &probe);
-        player.render(40 * BLOCK, &probe);
+        player.render(40 * TIMER_FRAMES, &probe);
         let asked = probe.asked.borrow().clone();
         assert_eq!(asked.len(), 2, "{asked:?}");
         assert_eq!(asked[1] == (7, 512), restarted, "{asked:?}");
@@ -2529,10 +2631,10 @@ fn a_stop_with_a_stopped_target_kills_self_next_block_and_camera_leaves_self() {
         );
     };
     play(&mut player, 8, "e1");
-    player.render(BLOCK, &start);
+    player.render(TIMER_FRAMES, &start);
     play(&mut player, 9, "e0");
-    // Wait until track 11 has ended (10 ms ≈ 4 blocks).
-    player.render(5 * BLOCK, &start);
+    // Wait until track 11 has ended (10 HIT ticks = 200 ms).
+    player.render(10 * TIMER_FRAMES, &start);
     assert_eq!(player.render_stereo(1, &start), [10_000, 10_000]);
 
     // Camera move routes through target to stopped track 11, leaving
@@ -2543,9 +2645,9 @@ fn a_stop_with_a_stopped_target_kills_self_next_block_and_camera_leaves_self() {
     // StopObject sends fade_on=1 to stopped track 11 and sets local
     // kill_after_fade on track 10; next block kills track 10 at once.
     player.handle(&SoundEvent::StopObject { object: 9 }, &right);
-    let rest_of_block = BLOCK - (player.frame() % BLOCK as u64) as usize;
+    let rest_of_block = TIMER_FRAMES - (player.frame() % TIMER_FRAMES as u64) as usize;
     player.render(rest_of_block, &right);
-    assert!(player.render(BLOCK, &right).iter().all(|&s| s == 0));
+    assert!(player.render(TIMER_FRAMES, &right).iter().all(|&s| s == 0));
     assert!(player.is_idle());
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
@@ -2562,7 +2664,7 @@ fn a_camera_move_places_a_sequenced_note_with_no_thread() {
         let module = module_with(&[&[END]], 1, 10, "seq=53,10,0,6\n");
         let mut player = Player::new(vec![module], long_sample("two.xa"), 1);
         play_on(&mut player, 9, &start);
-        player.render(BLOCK, &start);
+        player.render(TIMER_FRAMES, &start);
         player.handle(
             &SoundEvent::Play {
                 object: 9,
@@ -2570,14 +2672,14 @@ fn a_camera_move_places_a_sequenced_note_with_no_thread() {
             },
             &start,
         );
-        let out = player.render_stereo(2 * BLOCK, &start);
+        let out = player.render_stereo(2 * TIMER_FRAMES, &start);
         let last = out.len() - 2;
         assert_eq!(out[last], out[last + 1], "{out:?}");
         assert_ne!(out[last], 0);
         if moved {
             player.camera_moved(0, u32::MAX, &right);
         }
-        let out = player.render_stereo(2 * BLOCK, &right);
+        let out = player.render_stereo(2 * TIMER_FRAMES, &right);
         let last = out.len() - 2;
         assert_eq!(out[last + 1] > out[last], moved, "{:?}", &out[last..]);
         assert!(player.faults.is_empty(), "{:?}", player.faults);
@@ -2595,7 +2697,7 @@ fn a_camera_move_follows_a_held_track_let_go_by_a_start() {
     let mut first = vec![TEST, 110, IFNE];
     first.extend(long(0x102));
     first.extend(loadl(110, 1));
-    first.extend([SET_LOOP, LOOP]);
+    first.extend(WAIT_FOREVER);
     let mut second = NOTE_ON_V1.to_vec();
     second.extend(loadl(53, 11));
     second.push(END);
@@ -2623,14 +2725,14 @@ fn a_camera_move_follows_a_held_track_let_go_by_a_start() {
     };
     play(&mut player, 8, "e1");
     play(&mut player, 9, "e0");
-    player.render(BLOCK, &start);
+    player.render(TIMER_FRAMES, &start);
     play(&mut player, 9, "e0");
-    player.render(BLOCK, &start);
+    player.render(TIMER_FRAMES, &start);
     player.handle(&SoundEvent::Pause, &start);
     play(&mut player, 9, "e0");
     player.camera_moved(0, u32::MAX, &probe);
     player.handle(&SoundEvent::Unpause, &probe);
-    player.render(8 * BLOCK, &probe);
+    player.render(8 * TIMER_FRAMES, &probe);
     assert_eq!(*probe.asked.borrow(), [(8, 1024), (8, 512)]);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
@@ -2672,11 +2774,11 @@ fn a_camera_move_reads_spl_where_it_writes() {
         );
     };
     play(&mut player, 8, "e1");
-    player.render(BLOCK, &start);
+    player.render(TIMER_FRAMES, &start);
     play(&mut player, 9, "e0");
-    player.render(7 * BLOCK, &start);
+    player.render(7 * TIMER_FRAMES, &start);
     player.camera_moved(0, u32::MAX, &off);
-    let out = player.render_stereo(2 * BLOCK, &off);
+    let out = player.render_stereo(2 * TIMER_FRAMES, &off);
     let last = out.len() - 2;
     assert_ne!(out[last..], [0, 0], "{:?}", &out[last..]);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
@@ -2691,8 +2793,8 @@ fn a_forwarded_camera_move_leaves_the_forwarding_thread_s_levels() {
     // levels (left == right).
     let mut forwards = NOTE_ON_V1.to_vec();
     forwards.extend(loadl(53, 11));
-    forwards.extend([SET_LOOP, LOOP]);
-    let wait: &[u8] = &[SET_LOOP, LOOP];
+    forwards.extend(WAIT_FOREVER);
+    let wait: &[u8] = &WAIT_FOREVER;
     let start = on_lot(&[(8, 400), (9, 400)]);
     let moved = on_lot(&[(8, 400), (9, 800)]);
     let mut player = Player::new(
@@ -2711,7 +2813,7 @@ fn a_forwarded_camera_move_leaves_the_forwarding_thread_s_levels() {
     };
     play(&mut player, 8, "e1");
     play(&mut player, 9, "e0");
-    player.render(BLOCK, &start);
+    player.render(TIMER_FRAMES, &start);
     let before = player.render_stereo(1, &start);
     assert!(before[0] > 0 && before[0] == before[1], "{before:?}");
     player.camera_moved(0, u32::MAX, &moved);
@@ -2722,14 +2824,19 @@ fn a_forwarded_camera_move_leaves_the_forwarding_thread_s_levels() {
 
 #[test]
 fn a_track_that_ends_another_and_restarts_itself_skips_no_track() {
-    // Track 10 waits; track 11 ends it and starts itself anew (interrupt
-    // 1); track 12 plays patch 1. All run in the first block: removing
-    // track 10 and restarting 11 must not make the block skip 12.
-    let waiting: &[u8] = &[SET_LOOP, LOOP];
-    let restarter: &[u8] = &[
-        LOADB_V1, 55, 1, LOADB_V1, 5, 10, KILL_TRK, 5, LOADB_V1, 5, 11, PLAY_TRK, 5, END,
-    ];
-    let module = module(&[waiting, restarter, &GENERIC], 1);
+    // Track 10 waits; track 11 ends it and restarts itself once (interrupt 1,
+    // guarded by local register 4 which survives restart); track 12 plays
+    // patch 1. All run in tick 0: removing track 10 and restarting 11 must not
+    // make the tick skip 12.
+    let waiting: &[u8] = &WAIT_FOREVER;
+    let mut restarter = vec![TEST, 4, IFNE];
+    restarter.extend(long(0x103)); // done on 2nd pass
+    restarter.extend([
+        LOADB_V1, 4, 1, LOADB_V1, 55, 1, LOADB_V1, 5, 10, KILL_TRK, 5, LOADB_V1, 5, 11, PLAY_TRK,
+        5, END,
+    ]);
+    let done: &[u8] = &[END];
+    let module = module(&[waiting, &restarter, &GENERIC, done], 1);
     let mut player = Player::new(vec![module], samples(), 1);
     for name in ["e0", "e1", "e2"] {
         play(&mut player, name);
@@ -2746,9 +2853,12 @@ fn a_restart_keeps_the_track_its_targets_and_its_locals() {
     // track 11 starts anew as the same track: the count goes on, and
     // track 10 still reaches it. Let go, track 11 now runs after track
     // 10, so track 10 sees the count kept first.
-    let counter: &[u8] = &[LOADB_V1, 55, 1, ADD, 4, 55, SET_LOOP, LOOP];
+    let mut counter = vec![LOADB_V1, 55, 1, ADD, 4, 55];
+    counter.extend(WAIT_FOREVER);
+    let counter = counter.as_slice();
     let mut watcher = loadl(53, 11);
-    watcher.extend([SET_LOOP, GETSRCDATAFIELD, 6, 4, 4, LOOP]);
+    watcher.extend([SET_LOOP, GETSRCDATAFIELD, 6, 4, 4]);
+    watcher.extend(WAIT_1_LOOP);
     let module = module(&[&watcher, counter], 1);
     let mut player = Player::new(vec![module], samples(), 1);
     play(&mut player, "e1");
@@ -2765,12 +2875,15 @@ fn play_trk_reads_source_after_the_start() {
     // Track 10 sets its source to 9, points `target` at track 11 (source
     // 7) and plays itself: the start points its `target` back at itself
     // first, so the source it hands on is its own 9.
-    let other: &[u8] = &[LOADB_V1, 47, 7, SET_LOOP, LOOP];
+    let mut other = vec![LOADB_V1, 47, 7];
+    other.extend(WAIT_FOREVER);
+    let other = other.as_slice();
     // (With `target` at track 11, v1 is written to and read from there.)
     let mut caller = vec![LOADB_V1, 47, 9];
     caller.extend(loadl(53, 11));
     caller.extend([LOADB_V1, 5, 10, PLAY_TRK, 5]);
-    caller.extend([GETSRCDATAFIELD, 6, 47, 47, SET_LOOP, LOOP]);
+    caller.extend([GETSRCDATAFIELD, 6, 47, 47]);
+    caller.extend(WAIT_FOREVER);
     let module = module(&[&caller, other], 1);
     let mut player = Player::new(vec![module], samples(), 1);
     play(&mut player, "e1");
@@ -2813,7 +2926,7 @@ fn a_music_mode_lets_go_of_a_music_track_it_starts_again() {
 /// the order asked.
 fn fields_asked_in_order(player: &mut Player<BTreeMap<String, Pcm>>) -> Vec<i32> {
     let asked = Asked::default();
-    player.render(BLOCK, &asked);
+    player.render(TIMER_FRAMES, &asked);
     asked.0.into_inner().into_iter().map(|(_, f)| f).collect()
 }
 
@@ -2868,37 +2981,30 @@ fn a_track_ended_and_started_again_before_its_turn_runs_in_it() {
 }
 
 #[test]
-fn a_fade_that_ends_a_track_beyond_the_budget_ends_it_at_once() {
-    // Track 10 asks once, from the top, then waits. Twenty threads that
-    // spend 10,000 instructions once and end come after it: the second
-    // ten run first in the next block (they were not reached) and use
-    // its instructions before track 10's turn. Its fade to end it
-    // reaches 0 then, which ends it at once: a play right after starts
-    // it anew, from the top, rather than reviving the faded script.
+fn a_fade_that_ends_a_track_kills_it_before_running_its_instructions() {
+    // Track 10 asks once from the top, then waits. When a fade-and-kill
+    // completes on the next tick, `0x57d86e..0x57d88d` kills track 10 before
+    // any instructions run: a play right after starts it anew from the top.
     let mut fader = vec![LOADL, 5];
     fader.extend(long(7));
-    fader.extend([GETSRCDATAFIELD, 6, 1, 5, SET_LOOP, LOOP]);
-    let mut busy = vec![NOP; 9_999];
-    busy.push(END);
-    let mut routines: Vec<&[u8]> = vec![&fader];
-    routines.extend(vec![&busy[..]; 20]);
-    let module = module_with(&routines, 1, 10, "kill=18,10,0,0,1\n");
+    fader.extend([GETSRCDATAFIELD, 6, 1, 5]);
+    fader.extend(WAIT_FOREVER);
+    let module = module_with(&[&fader], 1, 10, "kill=18,10,0,0,1\n");
     let mut player = Player::new(vec![module], samples(), 1);
-    for i in 0..=20 {
-        play(&mut player, &format!("e{i}"));
-    }
+    play(&mut player, "e0");
     assert_eq!(fields_asked_in_order(&mut player), [7]);
     play_for(&mut player, 2048, "kill");
     assert_eq!(fields_asked_in_order(&mut player), []);
+    assert!(player.is_idle());
     play(&mut player, "e0");
     assert_eq!(fields_asked_in_order(&mut player), [7]);
-    assert_eq!(fields_asked_in_order(&mut player), []);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
 
-/// Waits `ms` milliseconds (loadl v1; wait v1).
-fn waits(ms: u32) -> Vec<u8> {
+/// Waits `ticks` 20 ms HIT timer ticks (`loadl v1; wait v1`).
+fn waits(ticks: u32) -> Vec<u8> {
     let mut routine = vec![LOADL, 5];
-    routine.extend(long(ms));
+    routine.extend(long(ticks));
     routine.extend([WAIT, 5]);
     routine
 }
@@ -2915,8 +3021,9 @@ fn asks_once(field: u32) -> Vec<u8> {
 #[test]
 fn a_track_started_again_before_its_turn_restarts_itself_there() {
     // Track 10 ends track 11 and starts it again; in its turn there,
-    // track 11 sets interrupt and plays itself, which starts it anew
-    // from the top, so it never asks.
+    // track 11 sets interrupt and plays itself, which restarts it in the
+    // same tick until `0x57d909..0x57d91f` (102-instruction cap) kills it,
+    // so it never asks.
     let killer: &[u8] = &[LOADB_V1, 5, 11, KILL_TRK, 5, PLAY_TRK, 5, END];
     let mut restarter = vec![LOADB_V1, 55, 1, LOADB_V1, 5, 11, PLAY_TRK, 5];
     restarter.extend(asks_once(7));
@@ -2925,19 +3032,19 @@ fn a_track_started_again_before_its_turn_restarts_itself_there() {
     let mut player = Player::new(vec![module], samples(), 1);
     play(&mut player, "e10");
     play(&mut player, "e11");
-    for _ in 0..3 {
-        assert_eq!(fields_asked_in_order(&mut player), []);
-    }
-    assert!(player.faults.is_empty(), "{:?}", player.faults);
+    assert_eq!(fields_asked_in_order(&mut player), []);
+    assert_eq!(player.faults.len(), 1, "{:?}", player.faults);
+    assert!(player.faults[0].contains("ran too long"));
+    assert!(player.is_idle());
 }
 
 #[test]
 fn a_held_track_let_go_during_a_block_first_runs_in_the_next() {
-    // Track 0x606 asks every block; the pause holds it. Track 0x605,
-    // which the pause spares, waits a second, then plays it, which lets
-    // it go, and asks about field 99. A hold takes a track out of the
-    // list of running tracks, so 0x606 is not in that block's copy.
-    let mut releaser = waits(1000);
+    // Track 0x606 asks every tick; the pause holds it. Track 0x605,
+    // which the pause spares, waits 50 ticks (1 second), then plays it,
+    // which lets it go, and asks about field 99. A hold takes a track out
+    // of the list of running tracks, so 0x606 is not in that tick's copy.
+    let mut releaser = waits(50);
     releaser.extend([LOADL, 5]);
     releaser.extend(long(0x606));
     releaser.extend([PLAY_TRK, 5]);
@@ -3031,7 +3138,7 @@ fn a_track_starts_at_the_entry_point_registered_last() {
     // first module's event makes.
     let mut third = vec![LOADB_V1, 55, 1];
     third.extend(asks_once(9));
-    third.extend([SET_LOOP, LOOP]);
+    third.extend(WAIT_FOREVER);
     let first = module_of_tracks(&[(10, &asks(7, true))], "again=kSndobPlay,10\n");
     let second = module_of_tracks(&[(10, &asks(8, true))], "");
     let modules = vec![first, second, module_of_code(&[(0x100, &third)])];
@@ -3178,17 +3285,25 @@ fn stations_added_after_playing_destroy_the_objects_they_replace() {
     base.name = "sounddata\\base".to_owned();
     let mut player = Player::new(vec![base], samples(), 1);
     play(&mut player, "e0");
-    assert_eq!(player.render(BLOCK, &NoSources)[..3], [1, 2, 3]);
+    assert_eq!(player.render(TIMER_FRAMES, &NoSources)[..3], [1, 2, 3]);
     player.add_stations(&StationLists {
         hit_lists: BTreeMap::new(),
         patches: BTreeMap::from([(1, "two.xa".to_owned())]),
     });
-    // The note of the patch went with it; its thread, waiting for it,
-    // ends in the next block.
-    assert!(player.render(BLOCK, &NoSources).iter().all(|&s| s == 0));
+    // The note of the patch went with it; its thread, waiting on `wait_samp`
+    // (which polls every 2 HIT ticks), ends at tick 2.
+    assert!(
+        player
+            .render(2 * TIMER_FRAMES, &NoSources)
+            .iter()
+            .all(|&s| s == 0)
+    );
     assert!(player.is_idle());
     play(&mut player, "e0");
-    assert_eq!(player.render(BLOCK, &NoSources)[..3], [2000, 4000, -2000]);
+    assert_eq!(
+        player.render(TIMER_FRAMES, &NoSources)[..3],
+        [2000, 4000, -2000]
+    );
     // A running track whose number a station patch takes ends with it.
     let mut base = module_of_tracks(&[(10, &asks(7, true))], "");
     base.name = "sounddata\\base".to_owned();
@@ -3253,7 +3368,7 @@ fn a_play_of_a_running_track_takes_its_own_argument_kind() {
     // the first's, so the play restarts it.
     let mut first = vec![LOADB_V1, 55, 1];
     first.extend(asks_once(7));
-    first.extend([SET_LOOP, LOOP]);
+    first.extend(WAIT_FOREVER);
     let mut padding = vec![NOP; 400];
     padding.push(END);
     let second = module_of_kinds(
@@ -3278,7 +3393,8 @@ fn seqgroup_kill_ends_a_holder_started_again_in_the_block() {
     // extvol is 0, so it ends at once and never asks again.
     let mut holder = asks_once(7);
     holder.extend(loadb(5, 1));
-    holder.extend([SEQGROUP_RETURN, 5, SET_LOOP, LOOP]);
+    holder.extend([SEQGROUP_RETURN, 5]);
+    holder.extend(WAIT_FOREVER);
     let mut killer = waits(1);
     killer.extend([LOADB_V1, 5, 11, KILL_TRK, 5, PLAY_TRK, 5, END]);
     let mut taker = waits(1);
@@ -3392,23 +3508,43 @@ fn kind_25_inactive_blocks_kind_1_holds_kind_30_and_suppresses_unpause() {
 
     // Kind 1 is ignored while inactive (0x5736ee).
     play(&mut player, "e0");
-    assert!(player.render(BLOCK * 2, &NoSources).iter().all(|&s| s == 0));
+    assert!(
+        player
+            .render(TIMER_FRAMES * 2, &NoSources)
+            .iter()
+            .all(|&s| s == 0)
+    );
 
     // Kind 30 starts the track held and skips let_go while inactive (0x573d7b).
     play(&mut player, "tv");
-    assert!(player.render(BLOCK * 2, &NoSources).iter().all(|&s| s == 0));
+    assert!(
+        player
+            .render(TIMER_FRAMES * 2, &NoSources)
+            .iter()
+            .all(|&s| s == 0)
+    );
 
     // Unpause while inactive clears paused but does not release held tracks (0x573c48).
     player.handle(&SoundEvent::Pause, &NoSources);
     assert!(player.is_paused());
     player.handle(&SoundEvent::Unpause, &NoSources);
     assert!(!player.is_paused());
-    assert!(player.render(BLOCK * 2, &NoSources).iter().all(|&s| s == 0));
+    assert!(
+        player
+            .render(TIMER_FRAMES * 2, &NoSources)
+            .iter()
+            .all(|&s| s == 0)
+    );
 
     // Kind 25 on resumes held tracks because the player is not paused (0x573c8e).
     play(&mut player, "on");
     assert!(player.is_active());
-    assert!(player.render(BLOCK * 2, &NoSources).iter().any(|&s| s != 0));
+    assert!(
+        player
+            .render(TIMER_FRAMES * 2, &NoSources)
+            .iter()
+            .any(|&s| s != 0)
+    );
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
 
@@ -3580,9 +3716,9 @@ fn kind_25_volume_nudge_adjusts_placement_for_100_updates_then_stops() {
     play_on(&mut p_right, 9, &right);
     play_on(&mut p_zero, 9, &offscreen);
     play_on(&mut p_one, 9, &barely);
-    let _ = p_right.render_stereo(BLOCK + 1, &right);
-    let _ = p_zero.render_stereo(BLOCK + 1, &offscreen);
-    let _ = p_one.render_stereo(BLOCK + 1, &barely);
+    let _ = p_right.render_stereo(TIMER_FRAMES + 1, &right);
+    let _ = p_zero.render_stereo(TIMER_FRAMES + 1, &offscreen);
+    let _ = p_one.render_stereo(TIMER_FRAMES + 1, &barely);
 
     // Before kind 25: camera_moved writes exact vol (750, 0, 1).
     p_right.camera_moved(0, 12, &right);
@@ -3702,7 +3838,7 @@ fn day_and_night_loop_picks_nite_loop_beach_loop_and_skips_downtown() {
     player.camera_moved(0, 22, &night);
     assert!(
         player
-            .render_stereo(BLOCK * 4, &night)
+            .render_stereo(TIMER_FRAMES * 4, &night)
             .iter()
             .all(|&s| s == 0)
     );
@@ -3715,7 +3851,7 @@ fn day_and_night_loop_picks_nite_loop_beach_loop_and_skips_downtown() {
     );
     assert!(
         player
-            .render_stereo(BLOCK * 4, &night)
+            .render_stereo(TIMER_FRAMES * 4, &night)
             .iter()
             .all(|&s| s == 0)
     );
@@ -3731,7 +3867,7 @@ fn day_and_night_loop_picks_nite_loop_beach_loop_and_skips_downtown() {
     );
     assert!(
         player
-            .render_stereo(BLOCK * 4, &day6)
+            .render_stereo(TIMER_FRAMES * 4, &day6)
             .iter()
             .all(|&s| s == 0)
     );
@@ -3739,7 +3875,7 @@ fn day_and_night_loop_picks_nite_loop_beach_loop_and_skips_downtown() {
     player.camera_moved(0, 18, &day18);
     assert!(
         player
-            .render_stereo(BLOCK * 4, &day18)
+            .render_stereo(TIMER_FRAMES * 4, &day18)
             .iter()
             .all(|&s| s == 0)
     );
@@ -3749,7 +3885,7 @@ fn day_and_night_loop_picks_nite_loop_beach_loop_and_skips_downtown() {
     player.set_fx_volume_step(3, &day18);
     let night19 = snap(19, 1);
     player.camera_moved(0, 19, &night19);
-    let out_half = player.render_stereo(BLOCK * 4, &night19);
+    let out_half = player.render_stereo(TIMER_FRAMES * 4, &night19);
     assert!(out_half.iter().any(|&s| s > 0), "{out_half:?}");
     // Fade target was 490 (and group 1 is 490, so logarithmic attenuation
     // scales 4000 far below full volume).
@@ -3759,10 +3895,10 @@ fn day_and_night_loop_picks_nite_loop_beach_loop_and_skips_downtown() {
     // Downtown lots 20..=29 silence nite_loop (0x57494e..0x574956).
     let downtown20 = snap(5, 20);
     player.camera_moved(0, 5, &downtown20);
-    let _ = player.render_stereo(BLOCK * 16, &downtown20);
+    let _ = player.render_stereo(TIMER_FRAMES * 16, &downtown20);
     assert!(
         player
-            .render_stereo(BLOCK * 4, &downtown20)
+            .render_stereo(TIMER_FRAMES * 4, &downtown20)
             .iter()
             .all(|&s| s == 0),
         "lot 20 should silence nite_loop"
@@ -3771,7 +3907,7 @@ fn day_and_night_loop_picks_nite_loop_beach_loop_and_skips_downtown() {
     player.set_fx_volume_step(10, &downtown20);
     let lot30 = snap(5, 30);
     player.camera_moved(0, 5, &lot30);
-    let out_full = player.render_stereo(BLOCK * 4, &lot30);
+    let out_full = player.render_stereo(TIMER_FRAMES * 4, &lot30);
     assert!(*out_full.iter().max().unwrap() > 3500);
 
     // Kind 52 (amb1 -> Beach) alone does NOT call 0x574978, so nite_loop
@@ -3787,39 +3923,39 @@ fn day_and_night_loop_picks_nite_loop_beach_loop_and_skips_downtown() {
     );
     assert!(
         player
-            .render_stereo(BLOCK * 4, &downtown_noon)
+            .render_stereo(TIMER_FRAMES * 4, &downtown_noon)
             .iter()
             .any(|&s| s > 0)
     );
     player.camera_moved(0, 12, &downtown_noon);
     // Let nite_loop finish fading out (11 blocks at speed 100); BeachLoop plays (-8000).
-    let _ = player.render_stereo(BLOCK * 16, &downtown_noon);
-    let beach = player.render_stereo(BLOCK * 4, &downtown_noon);
+    let _ = player.render_stereo(TIMER_FRAMES * 16, &downtown_noon);
+    let beach = player.render_stereo(TIMER_FRAMES * 4, &downtown_noon);
     assert!(*beach.iter().min().unwrap() < -7000, "{beach:?}");
 
     // Pause stops the loop (0x574844); unpause while active restarts it (0x574918).
     player.handle(&SoundEvent::Pause, &downtown_noon);
     assert!(
         player
-            .render_stereo(BLOCK * 4, &downtown_noon)
+            .render_stereo(TIMER_FRAMES * 4, &downtown_noon)
             .iter()
             .all(|&s| s == 0)
     );
     player.handle(&SoundEvent::Unpause, &downtown_noon);
     // Note: BeachLoop was mid-fade-out when paused, so let that fade finish,
     // then the next camera_moved starts it fresh.
-    let _ = player.render_stereo(BLOCK * 16, &downtown_noon);
+    let _ = player.render_stereo(TIMER_FRAMES * 16, &downtown_noon);
     player.camera_moved(0, 12, &downtown_noon);
-    let resumed = player.render_stereo(BLOCK * 4, &downtown_noon);
+    let resumed = player.render_stereo(TIMER_FRAMES * 4, &downtown_noon);
     assert!(*resumed.iter().min().unwrap() < -7000);
 
     // Inactive sound stops the loop on 0x574978 (0x5749a1).
     player.set_active(false, &downtown_noon);
     player.camera_moved(0, 12, &downtown_noon);
-    let _ = player.render_stereo(BLOCK * 16, &downtown_noon);
+    let _ = player.render_stereo(TIMER_FRAMES * 16, &downtown_noon);
     assert!(
         player
-            .render_stereo(BLOCK * 4, &downtown_noon)
+            .render_stereo(TIMER_FRAMES * 4, &downtown_noon)
             .iter()
             .all(|&s| s == 0)
     );
@@ -3857,7 +3993,7 @@ fn day_and_night_loop_ignores_a_patch_object_without_fault() {
     player.camera_moved(0, 0, &night);
     assert!(
         player
-            .render_stereo(BLOCK * 4, &night)
+            .render_stereo(TIMER_FRAMES * 4, &night)
             .iter()
             .all(|&s| s == 0)
     );
@@ -3895,7 +4031,7 @@ fn kind_105_places_remaining_zero_object_instances_again() {
     );
     assert!(
         player
-            .render_stereo(BLOCK * 2, &NoSources)
+            .render_stereo(TIMER_FRAMES * 2, &NoSources)
             .iter()
             .all(|&s| s == 0)
     );
@@ -3910,7 +4046,7 @@ fn kind_105_places_remaining_zero_object_instances_again() {
     );
     assert!(
         player
-            .render_stereo(BLOCK * 2, &NoSources)
+            .render_stereo(TIMER_FRAMES * 2, &NoSources)
             .iter()
             .any(|&s| s != 0)
     );
@@ -3979,7 +4115,7 @@ fn muted_group_refuses_start_so_beach_loop_starts_after_unmuting() {
     player.camera_moved(0, 12, &day);
     assert!(
         player
-            .render_stereo(BLOCK * 4, &day)
+            .render_stereo(TIMER_FRAMES * 4, &day)
             .iter()
             .all(|&s| s == 0)
     );
@@ -3987,7 +4123,7 @@ fn muted_group_refuses_start_so_beach_loop_starts_after_unmuting() {
     // Unmuting group 1 and running kind 33 starts BeachLoop fresh and audible.
     player.set_group_volume(1, 1024);
     player.camera_moved(0, 12, &day);
-    let out = player.render_stereo(BLOCK * 4, &day);
+    let out = player.render_stereo(TIMER_FRAMES * 4, &day);
     assert!(*out.iter().max().unwrap() > 3500, "{out:?}");
 
     // Group 0 is never refused even when group_volumes[0] is 0 (0x57d979):
@@ -4011,12 +4147,16 @@ fn muted_group_refuses_start_so_beach_loop_starts_after_unmuting() {
         },
         &day,
     );
-    assert!(solo.render_stereo(BLOCK * 2, &day).iter().all(|&s| s == 0));
+    assert!(
+        solo.render_stereo(TIMER_FRAMES * 2, &day)
+            .iter()
+            .all(|&s| s == 0)
+    );
     solo.set_group_volume(0, 1024);
     // Track 20 was already started while group 0 was 0, so raising its
     // volume makes it audible without a second start.
     assert!(
-        solo.render_stereo(BLOCK * 2, &day)
+        solo.render_stereo(TIMER_FRAMES * 2, &day)
             .iter()
             .any(|&s| s > 3500)
     );
@@ -4056,14 +4196,14 @@ fn muted_kind_1_still_places_and_releases_an_already_held_track() {
     play_on(&mut player, 9, &center);
     assert!(
         player
-            .render_stereo(BLOCK * 2, &center)
+            .render_stereo(TIMER_FRAMES * 2, &center)
             .iter()
             .any(|&s| s > 3500)
     );
     player.handle(&SoundEvent::Pause, &center);
     assert!(
         player
-            .render_stereo(BLOCK * 2, &center)
+            .render_stereo(TIMER_FRAMES * 2, &center)
             .iter()
             .all(|&s| s == 0)
     );
@@ -4076,7 +4216,7 @@ fn muted_kind_1_still_places_and_releases_an_already_held_track() {
     play_on(&mut player, 9, &right);
     assert!(
         player
-            .render_stereo(BLOCK * 2, &right)
+            .render_stereo(TIMER_FRAMES * 2, &right)
             .iter()
             .all(|&s| s == 0)
     );
@@ -4084,7 +4224,7 @@ fn muted_kind_1_still_places_and_releases_an_already_held_track() {
     // Unmuting group 1 (without unpausing!) makes the released track audible
     // immediately at its updated right-edge placement (right > left).
     player.set_group_volume(1, 1024);
-    let out = player.render_stereo(BLOCK * 2, &right);
+    let out = player.render_stereo(TIMER_FRAMES * 2, &right);
     let [left, right_ch] = [out[out.len() - 2], out[out.len() - 1]];
     assert!(left > 0 && right_ch > left, "{left} {right_ch}");
 }
@@ -4129,14 +4269,14 @@ fn muted_replay_places_and_releases_a_held_note_fading_after_end() {
     play_on(&mut player, 9, &center);
     assert!(
         player
-            .render_stereo(BLOCK * 2, &center)
+            .render_stereo(TIMER_FRAMES * 2, &center)
             .iter()
             .any(|&s| s > 2000)
     );
     player.handle(&SoundEvent::Pause, &center);
     assert!(
         player
-            .render_stereo(BLOCK * 2, &center)
+            .render_stereo(TIMER_FRAMES * 2, &center)
             .iter()
             .all(|&s| s == 0)
     );
@@ -4148,7 +4288,7 @@ fn muted_replay_places_and_releases_a_held_note_fading_after_end() {
     play_on(&mut player, 9, &right);
     assert!(
         player
-            .render_stereo(BLOCK * 2, &right)
+            .render_stereo(TIMER_FRAMES * 2, &right)
             .iter()
             .all(|&s| s == 0)
     );
@@ -4156,7 +4296,7 @@ fn muted_replay_places_and_releases_a_held_note_fading_after_end() {
     // Unmuting group 1 (without global unpause) makes the held note resume
     // immediately at its updated right-edge placement (right > left).
     player.set_group_volume(1, 1024);
-    let out = player.render_stereo(BLOCK * 2, &right);
+    let out = player.render_stereo(TIMER_FRAMES * 2, &right);
     let [left, right_ch] = [out[out.len() - 2], out[out.len() - 1]];
     assert!(left > 0 && right_ch > left, "{left} {right_ch}");
     assert!(player.faults.is_empty(), "{:?}", player.faults);
@@ -4215,7 +4355,7 @@ fn muted_replay_keeps_fading_spl_releases_music_and_leaves_idle_group_levels() {
     play_on(&mut player, 9, &center);
     assert!(
         player
-            .render_stereo(BLOCK * 2, &center)
+            .render_stereo(TIMER_FRAMES * 2, &center)
             .iter()
             .any(|&s| s > 2000)
     );
@@ -4224,7 +4364,10 @@ fn muted_replay_keeps_fading_spl_releases_music_and_leaves_idle_group_levels() {
     play_on(&mut player, 9, &far);
     player.set_group_volume(1, 1024);
     assert!(
-        player.render_stereo(BLOCK * 2, &far).iter().any(|&s| s > 0),
+        player
+            .render_stereo(TIMER_FRAMES * 2, &far)
+            .iter()
+            .any(|&s| s > 0),
         "fading track's Spl (10001) should survive muted replay"
     );
 
@@ -4234,14 +4377,14 @@ fn muted_replay_keeps_fading_spl_releases_music_and_leaves_idle_group_levels() {
     play(&mut music, "r");
     assert!(
         music
-            .render_stereo(BLOCK * 2, &NoSources)
+            .render_stereo(TIMER_FRAMES * 2, &NoSources)
             .iter()
             .any(|&s| s > 2000)
     );
     music.handle(&SoundEvent::Pause, &NoSources);
     assert!(
         music
-            .render_stereo(BLOCK * 2, &NoSources)
+            .render_stereo(TIMER_FRAMES * 2, &NoSources)
             .iter()
             .all(|&s| s == 0)
     );
@@ -4250,7 +4393,7 @@ fn muted_replay_keeps_fading_spl_releases_music_and_leaves_idle_group_levels() {
     music.set_group_volume(1, 1024);
     assert!(
         music
-            .render_stereo(BLOCK * 2, &NoSources)
+            .render_stereo(TIMER_FRAMES * 2, &NoSources)
             .iter()
             .any(|&s| s > 1000),
         "muted music-mode start should still clear river_loop's hold"
@@ -4261,13 +4404,13 @@ fn muted_replay_keeps_fading_spl_releases_music_and_leaves_idle_group_levels() {
     let mut idle = Player::new(vec![module], map, 1);
     play(&mut idle, "seq");
     assert!(
-        idle.render_stereo(BLOCK * 2, &NoSources)
+        idle.render_stereo(TIMER_FRAMES * 2, &NoSources)
             .iter()
             .any(|&s| s > 3500)
     );
     idle.set_group_volume(1, 0);
     assert!(
-        idle.render_stereo(BLOCK * 2, &NoSources)
+        idle.render_stereo(TIMER_FRAMES * 2, &NoSources)
             .iter()
             .any(|&s| s > 3500),
         "group volume change should leave an idle kind-53 voice at its started gain"
@@ -4297,7 +4440,7 @@ fn repeated_kind_30_updates_running_note_gain_immediately() {
         &center,
     );
     // Advance 1 frame into a block so the note is sounding at full volume.
-    let before = player.render_stereo(BLOCK + 1, &center);
+    let before = player.render_stereo(TIMER_FRAMES + 1, &center);
     assert_eq!(&before[before.len() - 2..], &[4000, 4000]);
 
     // Repeat kind 30 mid-block with the object now off-screen: the very
@@ -4373,7 +4516,7 @@ fn day_and_night_loop_handles_script_that_ends_while_its_note_plays() {
             &night,
         );
     }
-    let first = player.render_stereo(BLOCK * 2, &night);
+    let first = player.render_stereo(TIMER_FRAMES * 2, &night);
     let [l1, r1] = [first[first.len() - 2], first[first.len() - 1]];
     assert!(l1 > 0 && l1 < 4000 && l1 == r1, "{l1} {r1}");
 
@@ -4381,16 +4524,16 @@ fn day_and_night_loop_handles_script_that_ends_while_its_note_plays() {
     // must NOT start a second overlapping note (`day_night_playing` sees
     // the running thread, 0x574a00).
     player.camera_moved(0, 22, &night);
-    let second = player.render_stereo(BLOCK * 2, &night);
+    let second = player.render_stereo(TIMER_FRAMES * 2, &night);
     let [l2, r2] = [second[second.len() - 2], second[second.len() - 1]];
     assert!(l2 > 0 && l2 < l1 && l2 == r2, "before {l1}, after {l2}");
 
     // Switching to daytime stops the fading loop once its fade finishes.
     player.camera_moved(0, 12, &day);
-    let _ = player.render_stereo(BLOCK * 12, &day);
+    let _ = player.render_stereo(TIMER_FRAMES * 12, &day);
     assert!(
         player
-            .render_stereo(BLOCK * 2, &day)
+            .render_stereo(TIMER_FRAMES * 2, &day)
             .iter()
             .all(|&s| s == 0)
     );
@@ -4449,7 +4592,7 @@ fn end_and_return_while_a_note_plays_fade_out_at_speed_100_and_run_on() {
 
         // Block 0: note plays at extvol 1024, and the run-on `ifgt` MUST
         // have executed during block 0 itself (before block 1's fade step).
-        let b0 = player.render(BLOCK, &probe);
+        let b0 = player.render(TIMER_FRAMES, &probe);
         assert_eq!(b0[0], expected_sample(1024), "op {opcode} block 0");
         assert_eq!(
             *probe.asked.borrow(),
@@ -4462,7 +4605,7 @@ fn end_and_return_while_a_note_plays_fade_out_at_speed_100_and_run_on() {
         // (924, 824, ..., 24).
         for step_idx in 1..=10 {
             let extvol = 1024 - 100 * step_idx;
-            let block = player.render(BLOCK, &probe);
+            let block = player.render(TIMER_FRAMES, &probe);
             assert_eq!(
                 block[0],
                 expected_sample(extvol),
@@ -4471,7 +4614,7 @@ fn end_and_return_while_a_note_plays_fade_out_at_speed_100_and_run_on() {
         }
         // Block 11: extvol hits 0, FADE_ON becomes 0, kill_after_fade kills
         // the track and cuts its note.
-        let b11 = player.render(BLOCK, &probe);
+        let b11 = player.render(TIMER_FRAMES, &probe);
         assert!(b11.iter().all(|&s| s == 0), "op {opcode}: {b11:?}");
         assert!(player.is_idle(), "op {opcode}");
         assert!(player.faults.is_empty(), "{:?}", player.faults);
@@ -4492,7 +4635,7 @@ fn end_inside_a_call_pops_the_stack_without_fading_the_note() {
     play(&mut player, "e0");
     // Render 15 blocks (> 11 blocks of a speed-100 fade): note stays at
     // full volume (10000) the entire time.
-    let out = player.render(15 * BLOCK, &NoSources);
+    let out = player.render(15 * TIMER_FRAMES, &NoSources);
     assert_eq!(out[out.len() - 1], 10_000);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
@@ -4516,7 +4659,7 @@ fn replay_during_end_fade_cancels_fade_or_restarts_when_interrupt_is_set() {
         let mut player = Player::new(vec![module(&[&r0, &hold_pc], 1)], long_sample("one.xa"), 1);
         play(&mut player, "e0");
         // Advance 3 blocks into the fade (extvol = 1024 -> 924 -> 824).
-        let before = player.render(3 * BLOCK, &NoSources);
+        let before = player.render(3 * TIMER_FRAMES, &NoSources);
         let faded = before[before.len() - 1];
         assert!(faded > 0 && faded < 10_000, "{faded}");
 
@@ -4525,16 +4668,16 @@ fn replay_during_end_fade_cancels_fade_or_restarts_when_interrupt_is_set() {
         if !interrupt {
             // Fade is cancelled; the single note stays at full placed
             // volume (10000) well past 11 blocks (no second note = 20000).
-            let after = player.render(15 * BLOCK, &NoSources);
+            let after = player.render(15 * TIMER_FRAMES, &NoSources);
             assert_eq!(after[after.len() - 1], 10_000);
             assert!(!player.is_idle());
         } else {
             // Restarted in place: fresh start resets extvol to 1024 and
             // starts a fresh fade after running `note_on; end` again,
             // finishing cleanly after 11 more blocks.
-            let after_one = player.render(BLOCK, &NoSources);
+            let after_one = player.render(TIMER_FRAMES, &NoSources);
             assert_eq!(after_one[0], 10_000);
-            let _ = player.render(11 * BLOCK, &NoSources);
+            let _ = player.render(11 * TIMER_FRAMES, &NoSources);
             assert!(player.is_idle());
         }
         assert!(player.faults.is_empty(), "{:?}", player.faults);
@@ -4562,16 +4705,21 @@ fn end_while_a_note_plays_with_target_fades_target_and_kills_self_next_block() {
     play(&mut player, "e1");
     play(&mut player, "e0");
     // Block 0: both tracks' notes play (sum = 20000).
-    let b0 = player.render(BLOCK, &NoSources);
+    let b0 = player.render(TIMER_FRAMES, &NoSources);
     assert_eq!(b0[0], 20_000);
     // Block 1: track 10 dies immediately (own FADE_ON == 0 && kill_after_fade),
     // while track 11 begins fading (extvol 1024 -> 924, well below 10000).
-    let b1 = player.render(BLOCK, &NoSources);
+    let b1 = player.render(TIMER_FRAMES, &NoSources);
     assert!(b1[0] > 0 && b1[0] < 10_000, "b1={}", b1[0]);
     // After 11 more blocks, track 11 has faded to 0 (silent) but is STILL
     // running (not killed, because kill_after_fade was set on track 10).
-    let _ = player.render(11 * BLOCK, &NoSources);
-    assert!(player.render(BLOCK, &NoSources).iter().all(|&s| s == 0));
+    let _ = player.render(11 * TIMER_FRAMES, &NoSources);
+    assert!(
+        player
+            .render(TIMER_FRAMES, &NoSources)
+            .iter()
+            .all(|&s| s == 0)
+    );
     assert!(
         !player.is_idle(),
         "track 11 should remain running at extvol 0"
@@ -4604,7 +4752,7 @@ fn end_after_note_off_kills_immediately_and_end_at_eof_faults() {
         1,
     );
     play(&mut player, "e0");
-    player.render(BLOCK, &probe);
+    player.render(TIMER_FRAMES, &probe);
     assert!(player.is_idle());
     player.handle(
         &SoundEvent::Play {
@@ -4613,7 +4761,7 @@ fn end_after_note_off_kills_immediately_and_end_at_eof_faults() {
         },
         &probe,
     );
-    player.render(BLOCK, &probe);
+    player.render(TIMER_FRAMES, &probe);
     assert_eq!(*probe.asked.borrow(), [(8, 0)]);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 
@@ -4623,7 +4771,12 @@ fn end_after_note_off_kills_immediately_and_end_at_eof_faults() {
     let at_eof: &[u8] = &[2, 5, END];
     let mut eof_player = Player::new(vec![module(&[at_eof], 1)], long_sample("one.xa"), 1);
     play(&mut eof_player, "e0");
-    assert!(eof_player.render(BLOCK, &NoSources).iter().all(|&s| s == 0));
+    assert!(
+        eof_player
+            .render(TIMER_FRAMES, &NoSources)
+            .iter()
+            .all(|&s| s == 0)
+    );
     assert!(eof_player.is_idle());
     assert_eq!(eof_player.faults.len(), 1, "{:?}", eof_player.faults);
     assert!(
@@ -4647,13 +4800,13 @@ fn refused_getsrcdatafield_preserves_active_note_for_end_fade() {
     let mut player = Player::new(vec![module(&[&r0], 1)], long_sample("one.xa"), 1);
     let lot = on_lot(&[(9, 400)]);
     play_on(&mut player, 9, &lot);
-    let b0 = player.render(BLOCK, &lot);
+    let b0 = player.render(TIMER_FRAMES, &lot);
     assert_eq!(b0[0], 10_000);
     assert_eq!(player.faults.len(), 1, "{:?}", player.faults);
     assert!(player.faults[0].contains("Illegal source parameter request"));
-    let b1 = player.render(BLOCK, &lot);
+    let b1 = player.render(TIMER_FRAMES, &lot);
     assert!(b1[0] > 0 && b1[0] < 10_000, "b1={}", b1[0]);
-    player.render(10 * BLOCK, &lot);
+    player.render(10 * TIMER_FRAMES, &lot);
     assert!(player.is_idle());
 }
 
@@ -4667,7 +4820,7 @@ fn pause_and_stop_object_leave_idle_kind_53_voice_playing() {
     let mut player = Player::new(vec![module], long_sample("two.xa"), 1);
     let lot = on_lot(&[(9, 400)]);
     play_on(&mut player, 9, &lot);
-    player.render(BLOCK, &lot);
+    player.render(TIMER_FRAMES, &lot);
     assert!(player.is_idle());
     player.handle(
         &SoundEvent::Play {
@@ -4738,7 +4891,7 @@ fn muted_play_trk_writes_source_through_the_started_track_s_target() {
         },
         &probe,
     );
-    player.render(BLOCK, &probe);
+    player.render(TIMER_FRAMES, &probe);
     // Mute group 1 so track 10's start returns early at 0x57d9a5 keeping
     // target = 11, then track 12 runs `play_trk 10` with SOURCE = 77.
     player.set_group_volume(1, 0);
@@ -4749,7 +4902,7 @@ fn muted_play_trk_writes_source_through_the_started_track_s_target() {
         },
         &probe,
     );
-    player.render(12 * BLOCK, &probe);
+    player.render(20 * TIMER_FRAMES, &probe);
     assert_eq!(*probe.asked.borrow(), [(8, 77)]);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
@@ -4774,7 +4927,7 @@ fn stopped_target_persists_registers_and_clears_fade_on() {
     };
     let mut player = Player::new(vec![module(&[&t10, t11], 1)], samples(), 1);
     play_on(&mut player, 8, &probe.lot);
-    player.render(4 * BLOCK, &probe);
+    player.render(4 * TIMER_FRAMES, &probe);
     // Both reads in track 10 go through `target = 11` (so stopped track 11's
     // `arg1` is 0); track 11's own read receives `arg1 = 8` from `play_trk`.
     assert_eq!(*probe.asked.borrow(), [(0, 0), (0, 11), (8, 11)]);
@@ -4789,7 +4942,7 @@ fn routed_volume_write_to_idle_kind_53_voice_updates_level_immediately() {
     // (0x57df13 -> 0x57f759).
     let mut t11 = loadl(53, 10);
     t11.extend(loadl(19, 0));
-    t11.extend(loadl(5, 20));
+    t11.extend(loadl(5, 5));
     t11.extend([WAIT, 5]);
     t11.extend(loadl(19, 1024));
     t11.push(END);
@@ -4817,7 +4970,7 @@ fn routed_volume_write_to_idle_kind_53_voice_updates_level_immediately() {
     let mut player = Player::new(vec![module], long_sample("two.xa"), 1);
     let lot = on_lot(&[(9, 400)]);
     play_on(&mut player, 9, &lot);
-    player.render(BLOCK, &lot);
+    player.render(TIMER_FRAMES, &lot);
     player.handle(
         &SoundEvent::Play {
             object: 9,
@@ -4825,15 +4978,15 @@ fn routed_volume_write_to_idle_kind_53_voice_updates_level_immediately() {
         },
         &lot,
     );
-    assert_eq!(player.render(BLOCK, &lot)[0], 10_000);
+    assert_eq!(player.render(TIMER_FRAMES, &lot)[0], 10_000);
 
     // Track 11 silences the idle voice on block 0 of its run.
     play(&mut player, "e1");
-    let silenced = player.render(BLOCK, &lot);
+    let silenced = player.render(TIMER_FRAMES, &lot);
     assert!(silenced.iter().all(|&s| s == 0), "{silenced:?}");
     // After the 20 ms wait, track 11 restores EXTVOL = 1024.
-    let _ = player.render(10 * BLOCK, &lot);
-    assert_eq!(player.render(BLOCK, &lot)[0], 10_000);
+    let _ = player.render(10 * TIMER_FRAMES, &lot);
+    assert_eq!(player.render(TIMER_FRAMES, &lot)[0], 10_000);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
 
@@ -4882,7 +5035,7 @@ fn muted_play_trk_writes_source_to_stopped_track_and_spares_idle_voice() {
         },
         &probe,
     );
-    assert_eq!(player.render(BLOCK, &probe)[0], 10_000);
+    assert_eq!(player.render(TIMER_FRAMES, &probe)[0], 10_000);
     player.set_group_volume(1, 0);
     player.handle(
         &SoundEvent::Play {
@@ -4891,7 +5044,7 @@ fn muted_play_trk_writes_source_to_stopped_track_and_spares_idle_voice() {
         },
         &probe,
     );
-    let out = player.render(2 * BLOCK, &probe);
+    let out = player.render(2 * TIMER_FRAMES, &probe);
     assert_eq!(out[out.len() - 1], 10_000);
     // Both `arg1` (0) and `SOURCE` (77) are read through `target = 10`.
     assert_eq!(*probe.asked.borrow(), [(0, 77)]);
@@ -4918,7 +5071,7 @@ fn note_on_preserves_its_operand_register_and_flags() {
     };
     let mut player = Player::new(vec![module(&[&r0, &r1], 1)], long_sample("one.xa"), 1);
     play_on(&mut player, 8, &probe.lot);
-    player.render(2 * BLOCK, &probe);
+    player.render(2 * TIMER_FRAMES, &probe);
     assert_eq!(*probe.asked.borrow(), [(8, 42)]);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
@@ -4981,7 +5134,7 @@ fn kill_paths_preserve_locals_clear_patch_and_kind_53_persists_patch() {
     };
     let mut pa = make_player();
     play_on(&mut pa, 9, &probe_a.lot);
-    pa.render(BLOCK, &probe_a);
+    pa.render(TIMER_FRAMES, &probe_a);
     pa.handle(&SoundEvent::StopObject { object: 9 }, &probe_a);
     pa.handle(
         &SoundEvent::Play {
@@ -4990,7 +5143,7 @@ fn kill_paths_preserve_locals_clear_patch_and_kind_53_persists_patch() {
         },
         &probe_a,
     );
-    pa.render(2 * BLOCK, &probe_a);
+    pa.render(2 * TIMER_FRAMES, &probe_a);
     assert_eq!(*probe_a.asked.borrow(), [(9, 77), (9, 0)]);
     assert!(pa.faults.is_empty(), "{:?}", pa.faults);
 
@@ -5001,7 +5154,7 @@ fn kill_paths_preserve_locals_clear_patch_and_kind_53_persists_patch() {
     };
     let mut pb = make_player();
     play_on(&mut pb, 9, &probe_b.lot);
-    pb.render(BLOCK, &probe_b);
+    pb.render(TIMER_FRAMES, &probe_b);
     pb.handle(
         &SoundEvent::Play {
             object: 9,
@@ -5009,7 +5162,7 @@ fn kill_paths_preserve_locals_clear_patch_and_kind_53_persists_patch() {
         },
         &probe_b,
     );
-    pb.render(BLOCK, &probe_b);
+    pb.render(TIMER_FRAMES, &probe_b);
     pb.handle(
         &SoundEvent::Play {
             object: 9,
@@ -5017,7 +5170,7 @@ fn kill_paths_preserve_locals_clear_patch_and_kind_53_persists_patch() {
         },
         &probe_b,
     );
-    pb.render(2 * BLOCK, &probe_b);
+    pb.render(2 * TIMER_FRAMES, &probe_b);
     assert_eq!(*probe_b.asked.borrow(), [(9, 77), (9, 0)]);
     assert!(pb.faults.is_empty(), "{:?}", pb.faults);
 
@@ -5028,7 +5181,7 @@ fn kill_paths_preserve_locals_clear_patch_and_kind_53_persists_patch() {
     };
     let mut pc = make_player();
     play_on(&mut pc, 9, &probe_c.lot);
-    pc.render(BLOCK, &probe_c);
+    pc.render(TIMER_FRAMES, &probe_c);
     pc.handle(&SoundEvent::StopAll, &probe_c);
     pc.handle(&SoundEvent::StopAll, &probe_c); // second StopAll keeps saved bank
     pc.handle(
@@ -5038,7 +5191,7 @@ fn kill_paths_preserve_locals_clear_patch_and_kind_53_persists_patch() {
         },
         &probe_c,
     );
-    pc.render(2 * BLOCK, &probe_c);
+    pc.render(2 * TIMER_FRAMES, &probe_c);
     assert_eq!(*probe_c.asked.borrow(), [(9, 77), (9, 0)]);
 
     // Case D: kind 53 writes PATCH=2 to the stopped bank and keeps it after playback ends
@@ -5059,7 +5212,7 @@ fn kill_paths_preserve_locals_clear_patch_and_kind_53_persists_patch() {
         },
         &probe_c,
     );
-    pc.render(2 * BLOCK, &probe_c);
+    pc.render(2 * TIMER_FRAMES, &probe_c);
     assert_eq!(*probe_c.asked.borrow(), [(9, 77), (9, 2)]);
     assert!(pc.faults.is_empty(), "{:?}", pc.faults);
 }
@@ -5109,14 +5262,14 @@ fn patch_write_stops_idle_kind_53_voice_and_is3d_does_not_refresh_muted_idle_voi
         },
         &lot,
     );
-    assert_eq!(player.render(BLOCK, &lot)[0], 10_000);
+    assert_eq!(player.render(TIMER_FRAMES, &lot)[0], 10_000);
     player.set_group_volume(1, 0);
     // Writing Is3d (26) leaves the idle voice audible.
     play(&mut player, "e1");
-    assert_eq!(player.render(2 * BLOCK, &lot)[BLOCK], 10_000);
+    assert_eq!(player.render(2 * TIMER_FRAMES, &lot)[TIMER_FRAMES], 10_000);
     // Writing PATCH = 0 tears down the idle voice immediately.
     play(&mut player, "e2");
-    let after = player.render(BLOCK, &lot);
+    let after = player.render(TIMER_FRAMES, &lot);
     assert!(after.iter().all(|&s| s == 0), "{after:?}");
     assert!(player.is_idle());
     assert!(player.faults.is_empty(), "{:?}", player.faults);
@@ -5165,7 +5318,7 @@ fn camera_places_silent_instance_and_killed_hold_does_not_gate_idle_voice() {
 
     // Part 1: track 10 records object 9 centered, ends immediately, camera moves right.
     play_on(&mut player, 9, &center);
-    player.render(BLOCK, &center);
+    player.render(TIMER_FRAMES, &center);
     assert!(player.is_idle());
     player.camera_moved(0, u32::MAX, &right);
     player.handle(
@@ -5175,7 +5328,7 @@ fn camera_places_silent_instance_and_killed_hold_does_not_gate_idle_voice() {
         },
         &right,
     );
-    let stereo = player.render_stereo(BLOCK, &right);
+    let stereo = player.render_stereo(TIMER_FRAMES, &right);
     let [left_s, right_s] = [stereo[0], stereo[1]];
     assert!(
         right_s > left_s && left_s > 0,
@@ -5208,10 +5361,10 @@ fn camera_places_silent_instance_and_killed_hold_does_not_gate_idle_voice() {
     let m2 = Module::parse("test", &hit2, b"v1 5\n", hot2.as_bytes()).unwrap();
     let mut p2 = Player::new(vec![m2], long_sample("two.xa"), 1);
     play(&mut p2, "e0");
-    p2.render(BLOCK, &NoSources);
+    p2.render(TIMER_FRAMES, &NoSources);
     p2.handle(&SoundEvent::Pause, &NoSources);
     play(&mut p2, "e1"); // kill_trk 11 while track 11 is held
-    p2.render(BLOCK, &NoSources);
+    p2.render(TIMER_FRAMES, &NoSources);
     p2.handle(
         &SoundEvent::Play {
             object: 9,
@@ -5219,7 +5372,7 @@ fn camera_places_silent_instance_and_killed_hold_does_not_gate_idle_voice() {
         },
         &center,
     );
-    assert_eq!(p2.render(BLOCK, &center)[0], 10_000);
+    assert_eq!(p2.render(TIMER_FRAMES, &center)[0], 10_000);
     assert!(p2.faults.is_empty(), "{:?}", p2.faults);
 }
 
@@ -5237,7 +5390,7 @@ fn routed_main_duckpri_on_stopped_track_updates_global() {
     };
     let mut player = Player::new(vec![module(&[&writer, &[END], reader], 1)], samples(), 1);
     play_on(&mut player, 8, &probe.lot);
-    player.render(BLOCK, &probe);
+    player.render(TIMER_FRAMES, &probe);
     player.handle(
         &SoundEvent::Play {
             object: 8,
@@ -5245,7 +5398,7 @@ fn routed_main_duckpri_on_stopped_track_updates_global() {
         },
         &probe,
     );
-    player.render(BLOCK, &probe);
+    player.render(TIMER_FRAMES, &probe);
     assert_eq!(*probe.asked.borrow(), [(8, 100)]);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
@@ -5267,7 +5420,7 @@ fn patch_write_on_running_track_tears_down_note_so_end_kills_without_run_on() {
     };
     let mut player = Player::new(vec![module(&[&r0, ask], 1)], long_sample("one.xa"), 1);
     play_on(&mut player, 8, &probe.lot);
-    let out = player.render(BLOCK, &probe);
+    let out = player.render(TIMER_FRAMES, &probe);
     assert!(out.iter().all(|&s| s == 0), "{out:?}");
     assert!(player.is_idle());
     player.handle(
@@ -5277,7 +5430,7 @@ fn patch_write_on_running_track_tears_down_note_so_end_kills_without_run_on() {
         },
         &probe,
     );
-    player.render(BLOCK, &probe);
+    player.render(TIMER_FRAMES, &probe);
     assert_eq!(*probe.asked.borrow(), [(8, 0)]);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
@@ -5345,28 +5498,28 @@ fn killing_a_stopped_track_clears_patch_and_main_duckpri() {
             asked: Default::default(),
         };
         play(&mut p, "e0"); // track 10 claims group 1, sets extvol = 0, ends
-        p.render(BLOCK, &probe);
+        p.render(TIMER_FRAMES, &probe);
         // Set PATCH = 2 via kind 53 (let short sample finish) and MAIN_DUCKPRI = 100.
         play(&mut p, "seq");
         p.render_until_idle(RATE as usize, &probe);
         play(&mut p, "e1");
-        p.render(BLOCK, &probe);
+        p.render(TIMER_FRAMES, &probe);
         match mode {
             "kill_trk" => {
                 play(&mut p, "e2");
-                p.render(BLOCK, &probe);
+                p.render(TIMER_FRAMES, &probe);
             }
             "stop_all" => {
                 p.handle(&SoundEvent::StopAll, &probe);
             }
             "seqgroup_kill" => {
                 play(&mut p, "e3");
-                p.render(BLOCK, &probe);
+                p.render(TIMER_FRAMES, &probe);
             }
             _ => unreachable!(),
         }
         play(&mut p, "e4");
-        p.render(BLOCK, &probe);
+        p.render(TIMER_FRAMES, &probe);
         assert_eq!(*probe.asked.borrow(), [(9, 0), (9, 0)], "mode={mode}");
         assert!(p.faults.is_empty(), "mode={mode}: {:?}", p.faults);
     }
@@ -5400,11 +5553,11 @@ fn seqgroup_kill_routes_holder_extvol_and_fade_writes_through_target() {
         1,
     );
     play(&mut player, "e3"); // write extvol = 0 on stopped track 11
-    player.render(BLOCK, &NoSources);
+    player.render(TIMER_FRAMES, &NoSources);
     play(&mut player, "e0"); // holder runs with local extvol 1024, target 11
-    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    assert_eq!(player.render(TIMER_FRAMES, &NoSources)[0], 10_000);
     play(&mut player, "e2"); // seqgroup_kill 1 kills holder immediately
-    let after = player.render(BLOCK, &NoSources);
+    let after = player.render(TIMER_FRAMES, &NoSources);
     assert!(after.iter().all(|&s| s == 0), "{after:?}");
     assert!(player.is_idle());
     assert!(player.faults.is_empty(), "{:?}", player.faults);
@@ -5429,7 +5582,7 @@ fn kind_18_writes_fade_registers_and_clears_fade_on_for_stopped_track() {
     };
     play(&mut player, "fade75");
     play(&mut player, "e1");
-    player.render(BLOCK, &probe);
+    player.render(TIMER_FRAMES, &probe);
     assert_eq!(*probe.asked.borrow(), [(0, 0), (0, 19), (0, 75), (0, 0)]);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
@@ -5453,12 +5606,12 @@ fn never_started_track_reads_zero_patch_after_kill_trk_and_stop_all() {
         1,
     );
     play(&mut player, "e1"); // kill_trk 10 (never started)
-    player.render(BLOCK, &probe);
+    player.render(TIMER_FRAMES, &probe);
     play(&mut player, "e2"); // read track 10's PATCH -> 0
-    player.render(BLOCK, &probe);
+    player.render(TIMER_FRAMES, &probe);
     player.handle(&SoundEvent::StopAll, &probe);
     play(&mut player, "e2"); // read track 10's PATCH -> 0
-    player.render(BLOCK, &probe);
+    player.render(TIMER_FRAMES, &probe);
     assert_eq!(*probe.asked.borrow(), [(0, 0), (0, 0)]);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
@@ -5568,7 +5721,7 @@ fn kinds_37_38_39_map_slider_steps_to_groups_and_ambience() {
         player.handle(&SoundEvent::StopAll, &NoSources);
         play(&mut player, event_name);
         play(&mut player, track_event);
-        let out = player.render(BLOCK, &NoSources);
+        let out = player.render(TIMER_FRAMES, &NoSources);
         assert_eq!(
             out[0],
             expected_mono(VOLUME_STEPS[step]),
@@ -5594,9 +5747,9 @@ fn kinds_37_38_39_map_slider_steps_to_groups_and_ambience() {
     assert_eq!(sample_at_5, expected_mono(VOLUME_STEPS[5]));
     play(&mut player, "mus3");
     play(&mut player, "vox7");
-    assert_eq!(player.render(BLOCK, &NoSources)[0], sample_at_5);
+    assert_eq!(player.render(TIMER_FRAMES, &NoSources)[0], sample_at_5);
     play(&mut player, "fx0");
-    assert_eq!(player.render(BLOCK, &NoSources)[0], 0);
+    assert_eq!(player.render(TIMER_FRAMES, &NoSources)[0], 0);
     player.handle(&SoundEvent::StopAll, &NoSources);
     play(&mut player, "fx5");
 
@@ -5701,7 +5854,7 @@ fn kind_37_reruns_day_night_loop_and_restarts_after_mute() {
     player.faults.clear();
     assert!(
         player
-            .render_stereo(BLOCK * 4, &night)
+            .render_stereo(TIMER_FRAMES * 4, &night)
             .iter()
             .all(|&s| s == 0)
     );
@@ -5716,7 +5869,7 @@ fn kind_37_reruns_day_night_loop_and_restarts_after_mute() {
         },
         &probe,
     );
-    player.render(BLOCK, &probe);
+    player.render(TIMER_FRAMES, &probe);
     assert_eq!(
         *probe.asked.borrow(),
         [(0, 0), (0, 0), (0, 19), (0, 5000), (0, 0)]
@@ -5734,7 +5887,7 @@ fn kind_37_reruns_day_night_loop_and_restarts_after_mute() {
     }
     assert!(
         player
-            .render_stereo(BLOCK * 4, &night)
+            .render_stereo(TIMER_FRAMES * 4, &night)
             .iter()
             .all(|&s| s == 0)
     );
@@ -5749,7 +5902,7 @@ fn kind_37_reruns_day_night_loop_and_restarts_after_mute() {
         },
         &night,
     );
-    let out = player.render_stereo(BLOCK * 4, &night);
+    let out = player.render_stereo(TIMER_FRAMES * 4, &night);
     let expected = levels(&Inputs {
         vol: 1024,
         extvol: VOLUME_STEPS[5],
@@ -5774,10 +5927,10 @@ fn kind_37_reruns_day_night_loop_and_restarts_after_mute() {
         },
         &day,
     );
-    let _ = player.render_stereo(BLOCK * 16, &day);
+    let _ = player.render_stereo(TIMER_FRAMES * 16, &day);
     assert!(
         player
-            .render_stereo(BLOCK * 4, &day)
+            .render_stereo(TIMER_FRAMES * 4, &day)
             .iter()
             .all(|&s| s == 0),
         "kind 37 in daytime should stop nite_loop"
@@ -5796,7 +5949,7 @@ fn kind_37_reruns_day_night_loop_and_restarts_after_mute() {
     assert_eq!(player.fx_volume_step(), 5);
     assert!(
         player
-            .render_stereo(BLOCK * 4, &night)
+            .render_stereo(TIMER_FRAMES * 4, &night)
             .iter()
             .all(|&s| s == 0)
     );
@@ -5861,7 +6014,7 @@ fn day_night_fade_target_reads_fx_slider_step_not_raw_group_volume() {
         },
         &probe,
     );
-    player.render(BLOCK, &probe);
+    player.render(TIMER_FRAMES, &probe);
     assert_eq!(*probe.asked.borrow(), [(0, 1024)]);
 
     // Raw group 1 volume set to 512 -> nite_loop starts with FADE_DEST = 1024.
@@ -5875,7 +6028,7 @@ fn day_night_fade_target_reads_fx_slider_step_not_raw_group_volume() {
         },
         &probe,
     );
-    player.render(BLOCK, &probe);
+    player.render(TIMER_FRAMES, &probe);
     assert_eq!(*probe.asked.borrow(), [(0, 1024)]);
 }
 
@@ -5893,7 +6046,7 @@ fn group_volume_refresh_reads_voice_levels_through_target() {
 
     let mut targeter = NOTE_ON_V1.to_vec();
     targeter.extend(loadl(53, 11));
-    targeter.extend([SET_LOOP, LOOP]);
+    targeter.extend(WAIT_FOREVER);
 
     let (hit, addresses) = assemble(&[&targeter, &[END], &set_t11_zero]);
     let hot = format!(
@@ -5918,14 +6071,19 @@ fn group_volume_refresh_reads_voice_levels_through_target() {
     let mut player = Player::new(vec![module], long_sample("one.xa"), 1);
 
     play(&mut player, "e2"); // write EXTVOL = 0 on stopped track 11
-    player.render(BLOCK, &NoSources);
+    player.render(TIMER_FRAMES, &NoSources);
     play(&mut player, "e0"); // starts note at local EXTVOL=1024, then sets target=11
-    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    assert_eq!(player.render(TIMER_FRAMES, &NoSources)[0], 10_000);
 
     // Slider change refreshes group 1 tracks via 0x57f759 -> reads EXTVOL=0
     // through target 11 -> silent immediately and on subsequent blocks.
     play(&mut player, "fx8");
-    assert!(player.render(BLOCK * 3, &NoSources).iter().all(|&s| s == 0));
+    assert!(
+        player
+            .render(TIMER_FRAMES * 3, &NoSources)
+            .iter()
+            .all(|&s| s == 0)
+    );
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
 
@@ -5937,7 +6095,7 @@ fn slider_and_ducking_updates_leave_held_voices_latched() {
     // something refreshes it after resuming.
     let loop_note: &[u8] = &[SET_LOOP, NOTE_ON_V1[0], NOTE_ON_V1[1], WAIT_SAMP, LOOP];
     let mut set_duck = loadl(123, 5);
-    set_duck.extend([SET_LOOP, LOOP]);
+    set_duck.extend(WAIT_FOREVER);
     let (hit, addresses) = assemble(&[loop_note, &set_duck]);
     let hot = format!(
         "[EventMappingEquate]\n\
@@ -5959,17 +6117,22 @@ fn slider_and_ducking_updates_leave_held_voices_latched() {
     let mut player = Player::new(vec![module], long_sample("one.xa"), 1);
 
     play(&mut player, "sfx");
-    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    assert_eq!(player.render(TIMER_FRAMES, &NoSources)[0], 10_000);
     player.handle(&SoundEvent::Pause, &NoSources);
     // Lower FX slider to 0 and have an unheld track raise main_duckpri
     // while track 10 is held.
     play(&mut player, "fx0");
     play(&mut player, "ducker");
-    assert!(player.render(BLOCK, &NoSources).iter().all(|&s| s == 0));
+    assert!(
+        player
+            .render(TIMER_FRAMES, &NoSources)
+            .iter()
+            .all(|&s| s == 0)
+    );
     player.handle(&SoundEvent::Unpause, &NoSources);
     // Track 10's resumed note still plays at its latched gain (10_000)
     // because 0x57c0ea and 0x57cc74 skipped it while held.
-    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    assert_eq!(player.render(TIMER_FRAMES, &NoSources)[0], 10_000);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
 
@@ -5985,10 +6148,10 @@ fn duckpri_and_is3d_latch_until_main_duckpri_refresh_including_unchanged_max_and
     ducked.extend([SET_LOOP, LOADL, 5, 10, 0, 0, 0, WAIT, 5]);
     ducked.extend(loadl(25, 10)); // raise DUCKPRI above main_duckpri=5 (must stay latched!)
     ducked.extend(loadl(26, 1)); // toggle Is3d (must stay latched!)
-    ducked.extend([SET_LOOP, LOOP]);
+    ducked.extend(WAIT_FOREVER);
 
     let mut set_duck_5 = loadl(123, 5);
-    set_duck_5.extend([SET_LOOP, LOOP]);
+    set_duck_5.extend(WAIT_FOREVER);
 
     let mut same_max_duck = loadl(123, 5);
     same_max_duck.push(END);
@@ -6017,16 +6180,16 @@ fn duckpri_and_is3d_latch_until_main_duckpri_refresh_including_unchanged_max_and
 
     play(&mut player, "e1"); // sets MAIN_DUCKPRI = 5
     play(&mut player, "e0"); // plays ducked (duckpri=0 < 5) -> half gain
-    let initial = player.render(BLOCK, &NoSources)[0];
+    let initial = player.render(TIMER_FRAMES, &NoSources)[0];
     assert!(initial > 0 && initial < 6_000, "{initial}");
-    // Advance past the 10 ms wait so e0 writes DUCKPRI=10 and Is3d=1.
+    // Advance past the 10-tick wait so e0 writes DUCKPRI=10 and Is3d=1.
     // Neither refreshes the voice, so gain stays latched at `initial`.
-    let after_writes = player.render(BLOCK * 6, &NoSources);
+    let after_writes = player.render(TIMER_FRAMES * 10, &NoSources);
     assert_eq!(*after_writes.last().unwrap(), initial);
     // Track 12 writes MAIN_DUCKPRI=5 (maximum unchanged at 5): 0x57d31e
     // still refreshes all unheld running voices, lifting track 10 to full.
     play(&mut player, "e2");
-    let refreshed = player.render(BLOCK, &NoSources)[0];
+    let refreshed = player.render(TIMER_FRAMES, &NoSources)[0];
     assert_eq!(refreshed, 10_000);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 
@@ -6038,7 +6201,7 @@ fn duckpri_and_is3d_latch_until_main_duckpri_refresh_including_unchanged_max_and
     let mut same_block = NOTE_ON_V1.to_vec();
     same_block.extend(loadl(53, 11)); // target stopped track 11 (EXTVOL=0)
     same_block.extend(loadl(123, 5)); // routed MAIN_DUCKPRI on stopped 11
-    same_block.extend([SET_LOOP, LOOP]);
+    same_block.extend(WAIT_FOREVER);
 
     let mut player2 = Player::new(
         vec![module_with(&[&same_block, &[END], &zero_11], 1, 10, "")],
@@ -6046,17 +6209,23 @@ fn duckpri_and_is3d_latch_until_main_duckpri_refresh_including_unchanged_max_and
         1,
     );
     play(&mut player2, "e2");
-    player2.render(BLOCK, &NoSources);
+    player2.render(TIMER_FRAMES, &NoSources);
     play(&mut player2, "e0");
     // Refresh during MAIN_DUCKPRI sees e0's new target=11 (EXTVOL=0) immediately.
-    assert!(player2.render(BLOCK, &NoSources).iter().all(|&s| s == 0));
+    assert!(
+        player2
+            .render(TIMER_FRAMES, &NoSources)
+            .iter()
+            .all(|&s| s == 0)
+    );
     assert!(player2.faults.is_empty(), "{:?}", player2.faults);
 }
 
 #[test]
-fn render_until_idle_ends_on_block_boundary_even_with_nudge_armed() {
-    // `render_until_idle` always finishes on a `BLOCK` (64-frame) boundary
-    // even when the 20 ms nudge timer (`TIMER_FRAMES = 441`) fires mid-block.
+fn render_until_idle_ends_on_timer_boundary_even_with_nudge_armed() {
+    // `render_until_idle` finishes on the 20 ms HIT timer boundary
+    // (`TIMER_FRAMES = 441`) where `wait_samp` polls (every 2 ticks = 882
+    // frames) and ends the thread, even when the 20 ms nudge timer is armed.
     let mut map = BTreeMap::new();
     map.insert(
         "one.xa".to_owned(),
@@ -6071,9 +6240,9 @@ fn render_until_idle_ends_on_block_boundary_even_with_nudge_armed() {
     player.set_active(true, &NoSources); // arms 20 ms nudge countdown
     play(&mut player, "e0");
     let out = player.render_until_idle(RATE as usize, &NoSources);
-    // Note ends at frame 440; `render_until_idle` stops at frame 448 (7 * 64),
-    // NOT at the mid-block timer tick at frame 441.
-    assert_eq!(out.len(), 7 * BLOCK);
+    // Note ends at frame 440; `wait_samp` polls every 2 ticks (`2 * 441 = 882`),
+    // so `render_until_idle` stops at frame 882.
+    assert_eq!(out.len(), 2 * TIMER_FRAMES);
     assert!(player.is_idle());
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
@@ -6090,14 +6259,15 @@ fn natural_track_end_clears_target_before_ducking_refresh() {
     // stopped track 11 (EXTVOL=0) and falls silent immediately.
     let mut t10 = NOTE_ON_V1.to_vec();
     t10.extend(loadl(53, 11));
-    t10.extend([SET_LOOP, LOOP]);
+    t10.extend(loadl(8, 100));
+    t10.extend([WAIT, 8, END]);
 
     let mut t11 = loadl(19, 0); // local EXTVOL = 0 on track 11
     t11.extend(loadl(53, 12)); // forward to track 12 (EXTVOL = 1024)
     t11.extend(loadl(5, 10));
     t11.extend([WAIT, 5, END]);
 
-    let t12: &[u8] = &[SET_LOOP, LOOP];
+    let t12: &[u8] = &WAIT_FOREVER;
 
     let mut player = Player::new(
         vec![module_with(&[&t10, &t11, t12], 1, 10, "")],
@@ -6107,11 +6277,14 @@ fn natural_track_end_clears_target_before_ducking_refresh() {
     play(&mut player, "e2"); // start track 12 (EXTVOL=1024)
     play(&mut player, "e1"); // start track 11 (local EXTVOL=0, target=12)
     play(&mut player, "e0"); // start track 10 (target=11)
-    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
-    // Advance past track 11's 10 ms wait so track 11 ends naturally.
-    let _ = player.render(BLOCK * 5, &NoSources);
+    assert_eq!(player.render(TIMER_FRAMES, &NoSources)[0], 10_000);
+    // Advance past track 11's 10-tick wait so track 11 ends naturally.
+    let _ = player.render(TIMER_FRAMES * 10, &NoSources);
     assert!(
-        player.render(BLOCK, &NoSources).iter().all(|&s| s == 0),
+        player
+            .render(TIMER_FRAMES, &NoSources)
+            .iter()
+            .all(|&s| s == 0),
         "track 10 should refresh against stopped track 11 (EXTVOL=0) when track 11 ends"
     );
     assert!(player.faults.is_empty(), "{:?}", player.faults);
@@ -6128,10 +6301,11 @@ fn kill_trk_sees_caller_same_block_duckpri_update_during_refresh() {
     t10.extend([WAIT, 5]);
     t10.extend(loadl(25, 10)); // raise own DUCKPRI above 5
     t10.extend(loadl(6, 12));
-    t10.extend([KILL_TRK, 6, SET_LOOP, LOOP]);
+    t10.extend([KILL_TRK, 6]);
+    t10.extend(WAIT_FOREVER);
 
     let mut ducker = loadl(123, 5);
-    ducker.extend([SET_LOOP, LOOP]);
+    ducker.extend(WAIT_FOREVER);
 
     let mut player = Player::new(
         vec![module_with(&[&t10, &ducker, &[END]], 1, 10, "")],
@@ -6140,10 +6314,10 @@ fn kill_trk_sees_caller_same_block_duckpri_update_during_refresh() {
     );
     play(&mut player, "e1"); // MAIN_DUCKPRI = 5
     play(&mut player, "e0"); // plays ducked
-    let initial = player.render(BLOCK, &NoSources)[0];
+    let initial = player.render(TIMER_FRAMES, &NoSources)[0];
     assert!(initial > 0 && initial < 6_000, "{initial}");
-    // Advance past the 10 ms wait so track 10 writes DUCKPRI=10 and runs kill_trk 12.
-    let after = player.render(BLOCK * 6, &NoSources);
+    // Advance past the 10-tick wait so track 10 writes DUCKPRI=10 and runs kill_trk 12.
+    let after = player.render(TIMER_FRAMES * 10, &NoSources);
     assert_eq!(*after.last().unwrap(), 10_000);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 
@@ -6157,7 +6331,8 @@ fn kill_trk_sees_caller_same_block_duckpri_update_during_refresh() {
     kill_patch.extend(loadl(6, 1)); // patch ID 1 (not a track!)
     kill_patch.extend([KILL_TRK, 6]);
     kill_patch.extend(loadl(6, 999)); // unregistered ID
-    kill_patch.extend([KILL_TRK, 6, SET_LOOP, LOOP]);
+    kill_patch.extend([KILL_TRK, 6]);
+    kill_patch.extend(WAIT_FOREVER);
 
     let mut player2 = Player::new(
         vec![module_with(&[&kill_patch, &ducker], 1, 10, "")],
@@ -6166,9 +6341,9 @@ fn kill_trk_sees_caller_same_block_duckpri_update_during_refresh() {
     );
     play(&mut player2, "e1"); // MAIN_DUCKPRI = 5
     play(&mut player2, "e0"); // plays ducked
-    let ducked = player2.render(BLOCK, &NoSources)[0];
+    let ducked = player2.render(TIMER_FRAMES, &NoSources)[0];
     assert!(ducked > 0 && ducked < 6_000, "{ducked}");
-    let after_patch_kill = player2.render(BLOCK * 6, &NoSources);
+    let after_patch_kill = player2.render(TIMER_FRAMES * 6, &NoSources);
     assert_eq!(
         *after_patch_kill.last().unwrap(),
         ducked,
@@ -6188,7 +6363,7 @@ fn non_streamed_note_on_keeps_latched_gain_across_target_while_streamed_refreshe
 
     let mut target_then_note = loadl(53, 11); // target stopped 11 (EXTVOL=0)
     target_then_note.extend(NOTE_ON_V1);
-    target_then_note.extend([SET_LOOP, LOOP]);
+    target_then_note.extend(WAIT_FOREVER);
 
     let (hit, addresses) = assemble(&[&target_then_note, &[END], &zero_11]);
     // Patch 1: IsStreamed = 0; Patch 2: IsStreamed = 1 (second flag after path);
@@ -6223,7 +6398,7 @@ fn non_streamed_note_on_keeps_latched_gain_across_target_while_streamed_refreshe
         Pcm {
             rate: RATE,
             channels: 1,
-            samples: vec![10_000; 20 * BLOCK],
+            samples: vec![10_000; 20 * TIMER_FRAMES],
         },
     );
     map.insert(
@@ -6231,31 +6406,36 @@ fn non_streamed_note_on_keeps_latched_gain_across_target_while_streamed_refreshe
         Pcm {
             rate: RATE,
             channels: 1,
-            samples: vec![10_000; 20 * BLOCK],
+            samples: vec![10_000; 20 * TIMER_FRAMES],
         },
     );
     let mut player = Player::new(vec![module], map, 1);
 
     play(&mut player, "zero");
-    player.render(BLOCK, &NoSources);
+    player.render(TIMER_FRAMES, &NoSources);
 
     // Non-streamed patch 1 keeps its fresh-start latched gain (10_000).
     play(&mut player, "mem");
-    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    assert_eq!(player.render(TIMER_FRAMES, &NoSources)[0], 10_000);
     player.handle(&SoundEvent::StopAll, &NoSources);
 
     // Streamed patch 2 refreshes through target 11 (EXTVOL=0) -> silent.
     play(&mut player, "zero");
-    player.render(BLOCK, &NoSources);
+    player.render(TIMER_FRAMES, &NoSources);
     play(&mut player, "stream");
-    assert!(player.render(BLOCK, &NoSources).iter().all(|&s| s == 0));
+    assert!(
+        player
+            .render(TIMER_FRAMES, &NoSources)
+            .iter()
+            .all(|&s| s == 0)
+    );
     player.handle(&SoundEvent::StopAll, &NoSources);
 
     // Patch 3 has "SoundData\\" in its path, so 0x57b5d1 clears IsStreamed -> 10_000.
     play(&mut player, "zero");
-    player.render(BLOCK, &NoSources);
+    player.render(TIMER_FRAMES, &NoSources);
     play(&mut player, "sd");
-    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    assert_eq!(player.render(TIMER_FRAMES, &NoSources)[0], 10_000);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
 
@@ -6269,7 +6449,7 @@ fn same_block_ducking_write_and_kill_refresh_latched_gain_before_non_streamed_no
     // `note_on`. With default DUCKPRI = 0 < 5, gain ducks to 10% (999 PCM).
     let mut duck_then_note = loadl(123, 5);
     duck_then_note.extend(NOTE_ON_V1);
-    duck_then_note.extend([SET_LOOP, LOOP]);
+    duck_then_note.extend(WAIT_FOREVER);
 
     // Track 11: routes MAIN_DUCKPRI = 5 onto stopped track 12 (stays ducked).
     let mut set_stopped_duck = loadl(53, 12);
@@ -6281,25 +6461,25 @@ fn same_block_ducking_write_and_kill_refresh_latched_gain_before_non_streamed_no
     let mut clear_stopped_then_note = loadl(53, 12);
     clear_stopped_then_note.extend(loadl(123, 0));
     clear_stopped_then_note.extend(NOTE_ON_V1);
-    clear_stopped_then_note.extend([SET_LOOP, LOOP]);
+    clear_stopped_then_note.extend(WAIT_FOREVER);
 
     // Track 14: running ducker (MAIN_DUCKPRI = 5, loops forever).
     let mut running_ducker = loadl(123, 5);
-    running_ducker.extend([SET_LOOP, LOOP]);
+    running_ducker.extend(WAIT_FOREVER);
 
     // Track 15: kills running ducker 14 via `kill_trk`, then immediately runs
     // non-streamed `note_on` -> refreshed to unducked 10_000.
     let mut kill_running_then_note = loadl(5, 14);
     kill_running_then_note.extend([KILL_TRK, 5]);
     kill_running_then_note.extend(NOTE_ON_V1);
-    kill_running_then_note.extend([SET_LOOP, LOOP]);
+    kill_running_then_note.extend(WAIT_FOREVER);
 
     // Track 16: kills stopped ducker 12 via `kill_trk`, then immediately runs
     // non-streamed `note_on` -> refreshed to unducked 10_000.
     let mut kill_stopped_then_note = loadl(5, 12);
     kill_stopped_then_note.extend([KILL_TRK, 5]);
     kill_stopped_then_note.extend(NOTE_ON_V1);
-    kill_stopped_then_note.extend([SET_LOOP, LOOP]);
+    kill_stopped_then_note.extend(WAIT_FOREVER);
 
     let (hit, addresses) = assemble(&[
         &duck_then_note,
@@ -6353,35 +6533,35 @@ fn same_block_ducking_write_and_kill_refresh_latched_gain_before_non_streamed_no
     // Case 1: own MAIN_DUCKPRI = 5 immediately before non-streamed note_on.
     let mut player = make();
     play(&mut player, "duck_note");
-    assert_eq!(player.render(BLOCK, &NoSources)[0], 999);
-    assert_eq!(player.render(BLOCK, &NoSources)[0], 999);
+    assert_eq!(player.render(TIMER_FRAMES, &NoSources)[0], 999);
+    assert_eq!(player.render(TIMER_FRAMES, &NoSources)[0], 999);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 
     // Case 2: routed MAIN_DUCKPRI = 0 on stopped track immediately before note_on.
     let mut player = make();
     play(&mut player, "set_stopped");
-    player.render(BLOCK, &NoSources);
+    player.render(TIMER_FRAMES, &NoSources);
     play(&mut player, "clear_stopped");
-    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
-    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    assert_eq!(player.render(TIMER_FRAMES, &NoSources)[0], 10_000);
+    assert_eq!(player.render(TIMER_FRAMES, &NoSources)[0], 10_000);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 
     // Case 3: kill_trk on running ducker immediately before non-streamed note_on.
     let mut player = make();
     play(&mut player, "running_ducker");
-    player.render(BLOCK, &NoSources);
+    player.render(TIMER_FRAMES, &NoSources);
     play(&mut player, "kill_running");
-    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
-    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    assert_eq!(player.render(TIMER_FRAMES, &NoSources)[0], 10_000);
+    assert_eq!(player.render(TIMER_FRAMES, &NoSources)[0], 10_000);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 
     // Case 4: kill_trk on stopped ducker immediately before non-streamed note_on.
     let mut player = make();
     play(&mut player, "set_stopped");
-    player.render(BLOCK, &NoSources);
+    player.render(TIMER_FRAMES, &NoSources);
     play(&mut player, "kill_stopped");
-    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
-    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    assert_eq!(player.render(TIMER_FRAMES, &NoSources)[0], 10_000);
+    assert_eq!(player.render(TIMER_FRAMES, &NoSources)[0], 10_000);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
 
@@ -6399,7 +6579,7 @@ fn patch_write_copies_is3d_and_flags_before_refreshing_gains() {
     let mut replace_3d_with_2d = loadl(20, 0); // PAN = 0 (hard left)
     replace_3d_with_2d.extend(loadl(50, 2)); // PATCH = 2 (Is3d = 0)
     replace_3d_with_2d.extend(NOTE_ON_V1);
-    replace_3d_with_2d.extend([SET_LOOP, LOOP]);
+    replace_3d_with_2d.extend(WAIT_FOREVER);
 
     // Track 11 writes PATCH=2 (Is3d=0, so comparison flags become zero) and
     // checks `ifeq` -> jumps to 0x102 which plays `note_on`.
@@ -6410,7 +6590,7 @@ fn patch_write_copies_is3d_and_flags_before_refreshing_gains() {
     patch_then_ifeq.push(END);
 
     let mut branch_taken = Vec::from(NOTE_ON_V1);
-    branch_taken.extend([SET_LOOP, LOOP]);
+    branch_taken.extend(WAIT_FOREVER);
 
     let (hit, addresses) = assemble(&[&replace_3d_with_2d, &patch_then_ifeq, &branch_taken]);
     // Patch 1: 4th flag after path = 1 (`Is3d = 1`).
@@ -6438,7 +6618,7 @@ fn patch_write_copies_is3d_and_flags_before_refreshing_gains() {
         Pcm {
             rate: RATE,
             channels: 1,
-            samples: vec![10_000; 20 * BLOCK],
+            samples: vec![10_000; 20 * TIMER_FRAMES],
         },
     );
     let make = || {
@@ -6448,13 +6628,321 @@ fn patch_write_copies_is3d_and_flags_before_refreshing_gains() {
 
     let mut player = make();
     play(&mut player, "pan");
-    let out = player.render_stereo(BLOCK, &NoSources);
+    let out = player.render_stereo(TIMER_FRAMES, &NoSources);
     assert_eq!((out[0], out[1]), (10_000, 0));
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 
     let mut player = make();
     play(&mut player, "flag");
-    let out = player.render_stereo(BLOCK, &NoSources);
+    let out = player.render_stereo(TIMER_FRAMES, &NoSources);
     assert_eq!((out[0], out[1]), (10_000, 10_000));
     assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn fades_step_once_per_20ms_timer_tick_not_per_64_frame_block() {
+    // `0x572fc3` (`push 0x14` = 20 ms = 441 frames at 22,050 Hz) -> `0x57cf37`
+    // -> `0x57d7cd`: fades step once per 441-frame timer tick, remaining
+    // constant across all 441 frames (including every 64-frame ambience block
+    // boundary inside the tick).
+    let mut routine = NOTE_ON_V1.to_vec();
+    routine.extend(loadl(40, 0)); // FADE_DEST = 0
+    routine.extend(loadl(41, 18)); // FADE_VAR = VOL (18)
+    routine.extend(loadl(42, 256)); // FADE_SPEED = 256 per 20 ms tick (4 ticks to 0)
+    routine.extend(loadl(45, 1)); // FADE_ON = 1
+    routine.extend(WAIT_FOREVER);
+
+    let mut player = Player::new(vec![module(&[&routine], 1)], long_sample("one.xa"), 1);
+    play(&mut player, "e0");
+    // Render 5 ticks (5 * 441 = 2205 frames).
+    let out = player.render(5 * TIMER_FRAMES, &NoSources);
+    // Tick 0 (frames 0..441): fade armed after fade_or_end ran -> full vol (1024).
+    // Tick 1 (441..882): vol 768. Tick 2 (882..1323): vol 512.
+    // Tick 3 (1323..1764): vol 256. Tick 4 (1764..2205): vol 0 (silent).
+    let mut tick_levels = Vec::new();
+    for tick in 0..5 {
+        let slice = &out[tick * TIMER_FRAMES..(tick + 1) * TIMER_FRAMES];
+        let first = slice[0];
+        assert!(
+            slice.iter().all(|&s| s == first),
+            "tick {tick} must stay constant across all {TIMER_FRAMES} frames (not step at 64-frame blocks)"
+        );
+        tick_levels.push(first);
+    }
+    assert_eq!(tick_levels[0], 10_000);
+    assert!(tick_levels[0] > tick_levels[1] && tick_levels[1] > tick_levels[2]);
+    assert!(tick_levels[2] > tick_levels[3] && tick_levels[3] > 0);
+    assert_eq!(tick_levels[4], 0);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn wait_zero_continues_in_same_tick_and_invalid_wait_or_note_registers_kill_track() {
+    // `0x57e42d..0x57e463`: `wait r` adds `read(r)` (in 20 ms ticks) to
+    // `[hit + 0x58]`. When `read(r) == 0`, `wake == hit_clock`, so `0x57d8c0`
+    // continues executing in the same tick.
+    let mut wait_zero = loadb(6, 0).to_vec();
+    wait_zero.extend([WAIT, 6]);
+    wait_zero.extend(GENERIC);
+
+    let mut player = Player::new(vec![module(&[&wait_zero], 1)], samples(), 1);
+    play(&mut player, "e0");
+    assert_eq!(player.render(3, &NoSources), [1, 2, 3]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+
+    // Invalid register operands in `wait` (0 or >127, `0x57e434` / `0x57f584`),
+    // `waiteq` (0 or >127 on either operand, `0x57e48a..0x57e4e7`), and `note`
+    // (>127 on either operand, `0x57e145..0x57e165`) call `0x57bd45` ->
+    // `Track::Kill` (`0x57bd91`), stopping the track before any following note.
+    const NOTE: u8 = 1;
+    let cases: [(&[u8], &str); 6] = [
+        (&[WAIT, 0], "wait: bad register"),
+        (&[WAIT, 128], "wait: bad register"),
+        (&[WAITEQ, 0, 5], "waiteq: bad register"),
+        (&[WAITEQ, 5, 128], "waiteq: bad register"),
+        (&[NOTE, 128, 5], "note: bad register"),
+        (&[NOTE, 5, 200], "note: bad register"),
+    ];
+    for (op, expected) in cases {
+        let mut routine = op.to_vec();
+        routine.extend(GENERIC);
+        let mut p = Player::new(vec![module(&[&routine], 1)], samples(), 1);
+        play(&mut p, "e0");
+        assert_eq!(p.render(3, &NoSources), [0, 0, 0], "{expected}");
+        assert_eq!(p.faults.len(), 1, "{expected}: {:?}", p.faults);
+        assert!(p.faults[0].contains(expected), "{:?}", p.faults);
+        assert!(p.is_idle(), "{expected}");
+    }
+}
+
+#[test]
+fn timed_note_deadline_persists_across_interrupt_restart_and_kill() {
+    // `0x57d6b6` initializes `[track + 0x194]` once in the constructor; neither
+    // restart (`0x57da3a..0x57dbc5`) nor kill (`0x57dd3e`) clears it. When the
+    // track starts again before that deadline, `0x57d929..0x57d951` stops its
+    // replacement `note_on` voice at the original deadline.
+    const NOTE: u8 = 1;
+
+    // Pass 1 (global 110 == 0): set interrupt=1, global 110=1, arm timed `note`
+    // with duration 3 ticks (expires at tick 3), then wait forever.
+    // Pass 2 (global 110 != 0): jump to `0x101` (`note_on` + wait forever — no
+    // timed `note` of its own!).
+    let mut entry = vec![TEST, 110, IFNE];
+    entry.extend(long(0x101));
+    entry.extend(loadb(55, 1)); // interrupt = 1
+    entry.extend(loadb(110, 1));
+    entry.extend(loadb(6, 60));
+    entry.extend(loadb(7, 3)); // duration = 3 ticks -> deadline = hit_clock(2) + 3 = 5
+    entry.extend([NOTE, 6, 7]);
+    entry.extend(WAIT_FOREVER);
+
+    let mut replacement = NOTE_ON_V1.to_vec();
+    replacement.extend(WAIT_FOREVER);
+
+    // Case 1: interrupt restart on tick 1 -> replacement `note_on` plays during
+    // ticks 1 and 2, then auto-stops at tick 3 when the old deadline expires.
+    let mut player = Player::new(
+        vec![module(&[&entry, &replacement], 1)],
+        long_sample("one.xa"),
+        1,
+    );
+    play(&mut player, "e0");
+    assert!(
+        player
+            .render(TIMER_FRAMES, &NoSources)
+            .iter()
+            .all(|&s| s == 10_000)
+    );
+    play(&mut player, "e0"); // interrupt restart!
+    assert!(
+        player
+            .render(TIMER_FRAMES, &NoSources)
+            .iter()
+            .all(|&s| s == 10_000)
+    ); // tick 1
+    assert!(
+        player
+            .render(TIMER_FRAMES, &NoSources)
+            .iter()
+            .all(|&s| s == 10_000)
+    ); // tick 2
+    assert!(
+        player
+            .render(TIMER_FRAMES, &NoSources)
+            .iter()
+            .all(|&s| s == 0),
+        "old timed-note deadline should stop the replacement note_on at tick 3"
+    );
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+
+    // Case 2: StopAll (kill) on tick 1, then fresh start -> old deadline still
+    // persists on the track object and stops the replacement voice at tick 3.
+    let mut player2 = Player::new(
+        vec![module(&[&entry, &replacement], 1)],
+        long_sample("one.xa"),
+        1,
+    );
+    play(&mut player2, "e0");
+    assert!(
+        player2
+            .render(TIMER_FRAMES, &NoSources)
+            .iter()
+            .all(|&s| s == 10_000)
+    );
+    player2.handle(&SoundEvent::StopAll, &NoSources);
+    play(&mut player2, "e0"); // fresh start -> takes replacement branch (global 110 == 1)
+    assert!(
+        player2
+            .render(TIMER_FRAMES, &NoSources)
+            .iter()
+            .all(|&s| s == 10_000)
+    ); // tick 1
+    assert!(
+        player2
+            .render(TIMER_FRAMES, &NoSources)
+            .iter()
+            .all(|&s| s == 10_000)
+    ); // tick 2
+    assert!(
+        player2
+            .render(TIMER_FRAMES, &NoSources)
+            .iter()
+            .all(|&s| s == 0),
+        "old timed-note deadline should persist across kill and stop replacement at tick 3"
+    );
+    assert!(player2.faults.is_empty(), "{:?}", player2.faults);
+}
+
+#[test]
+fn unified_timer_callback_does_not_run_nudge_after_hit_on_same_frame() {
+    // Low 1 regression: `0x572fd6` runs nudge (`0x573019`) and HIT (`0x57cf37`)
+    // atomically in one callback. If `render_until_idle` already consumed the
+    // timer tick at frame 882, arming `set_active(true)` at frame 882 and
+    // rendering again must NOT fire a nudge at frame 882 after HIT already ran;
+    // both phases wait until the next timer boundary (frame 1323).
+    let mut map = BTreeMap::new();
+    map.insert(
+        "one.xa".to_owned(),
+        Pcm {
+            rate: RATE,
+            channels: 1,
+            samples: vec![16_384; 100],
+        },
+    );
+    let generic: &[u8] = &[NOTE_ON_V1[0], NOTE_ON_V1[1], WAIT_SAMP, END];
+    let mut player = Player::new(vec![module(&[generic], 1)], map, 1);
+    let mut offscreen = on_lot(&[(9, 5000)]);
+    offscreen.absent[4] = 12;
+
+    play_on(&mut player, 9, &offscreen);
+    let out = player.render_until_idle(RATE as usize, &offscreen);
+    assert_eq!(out.len(), 2 * TIMER_FRAMES);
+    assert_eq!(player.frame(), (2 * TIMER_FRAMES) as u64);
+
+    // Arm nudge = 100 at frame 882 (whose timer callback already ran).
+    player.set_active(true, &offscreen);
+    // Start a long-running track at frame 882 and render 1 frame (frame 882..883):
+    // neither nudge nor HIT should run again at frame 882.
+    let _ = player.render_stereo(1, &offscreen);
+    // Now advance 99 timer ticks (still 1 nudge remaining -> nudged vol = 1 > 0),
+    // then 1 more timer tick (0 nudges remaining -> normal vol = 0). If frame 882
+    // had spuriously consumed 1 nudge, 99 ticks later would already be 0!
+    let mut long_map = BTreeMap::new();
+    long_map.insert(
+        "one.xa".to_owned(),
+        Pcm {
+            rate: RATE,
+            channels: 1,
+            samples: vec![16_384; RATE as usize],
+        },
+    );
+    let mut p2 = Player::new(vec![module(&[generic, &LOOPING], 1)], long_map, 1);
+    play_on(&mut p2, 9, &offscreen);
+    let _ = p2.render(2 * TIMER_FRAMES, &offscreen); // consumes tick at 0 and 441
+    let _ = p2.render_until_idle(RATE as usize, &offscreen); // consumes boundary tick and goes idle
+    let boundary = p2.frame();
+    assert_eq!(boundary % TIMER_FRAMES as u64, 0);
+    p2.set_active(true, &offscreen);
+    // Start looping track at `boundary`; tick at `boundary` already ran, so
+    // the first periodic nudge fires at `boundary + TIMER_FRAMES` (not `boundary`).
+    p2.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: "e1".into(),
+        },
+        &offscreen,
+    );
+    let _ = p2.render_stereo(1, &offscreen); // must NOT decrement nudge at `boundary`!
+    // Advance 99 timer boundaries: 1 nudge must still remain (`camera_moved` -> vol 1 > 0).
+    let to_next = TIMER_FRAMES - (p2.frame() as usize % TIMER_FRAMES);
+    let _ = p2.render_stereo(to_next + 98 * TIMER_FRAMES + 1, &offscreen);
+    p2.camera_moved(0, 12, &offscreen);
+    assert!(p2.render_stereo(1, &offscreen)[0] > 0);
+    // One more timer boundary consumes the 100th nudge (`camera_moved` -> vol 0).
+    let to_next = TIMER_FRAMES - (p2.frame() as usize % TIMER_FRAMES);
+    let _ = p2.render_stereo(to_next + 1, &offscreen);
+    p2.camera_moved(0, 12, &offscreen);
+    assert_eq!(p2.render_stereo(1, &offscreen), [0, 0]);
+}
+
+#[test]
+fn timed_note_auto_stops_voice_after_duration_ticks_and_unpause_advances_hit_clock() {
+    // `0x57e145..0x57e18d` + `0x57d929..0x57d951`: opcode 1 (`note key, dur`)
+    // sets `[esi + 0x194] = [hit + 0x58] + dur` and starts the patch voice.
+    // At the end of any tick with `hit_clock >= note_off`, the voice stops and
+    // `note_off` clears.
+    const NOTE: u8 = 1;
+
+    // Case 1: duration = 3 ticks -> plays for ticks 0, 1, 2 (3 * 441 frames),
+    // auto-stops at the end of tick 3 (frame 3 * 441).
+    let mut timed3 = loadb(6, 60).to_vec(); // key
+    timed3.extend(loadb(7, 3)); // duration = 3 ticks
+    timed3.extend([NOTE, 6, 7]);
+    timed3.extend(WAIT_FOREVER);
+
+    let mut player = Player::new(vec![module(&[&timed3], 1)], long_sample("one.xa"), 1);
+    play(&mut player, "e0");
+    let out = player.render(5 * TIMER_FRAMES, &NoSources);
+    assert!(
+        out[..3 * TIMER_FRAMES].iter().all(|&s| s == 10_000),
+        "timed note should play across ticks 0..3"
+    );
+    assert!(
+        out[3 * TIMER_FRAMES..].iter().all(|&s| s == 0),
+        "timed note should auto-stop at tick 3"
+    );
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+
+    // Case 2: duration = 0 -> `note_off == hit_clock` on tick 0, so `0x57d929`
+    // stops the voice at the end of tick 0 before any audio frame is mixed.
+    let mut timed0 = loadb(6, 60).to_vec();
+    timed0.extend(loadb(7, 0));
+    timed0.extend([NOTE, 6, 7]);
+    timed0.extend(WAIT_FOREVER);
+
+    let mut player0 = Player::new(vec![module(&[&timed0], 1)], long_sample("one.xa"), 1);
+    play(&mut player0, "e0");
+    let out0 = player0.render(TIMER_FRAMES, &NoSources);
+    assert!(
+        out0.iter().all(|&s| s == 0),
+        "duration 0 stops at end of tick 0"
+    );
+    assert!(player0.faults.is_empty(), "{:?}", player0.faults);
+
+    // Case 3: `0x57cd46` — `Unpause` increments `[hit + 0x58]` by 1 before
+    // `let_go`, so a timed `note` with duration 3 stops 1 tick earlier (at
+    // tick 2 instead of tick 3) after one `Unpause` during tick 0..1.
+    let mut player_u = Player::new(vec![module(&[&timed3], 1)], long_sample("one.xa"), 1);
+    play(&mut player_u, "e0");
+    let tick0 = player_u.render(TIMER_FRAMES, &NoSources);
+    assert!(tick0.iter().all(|&s| s == 10_000));
+    player_u.handle(&SoundEvent::Unpause, &NoSources);
+    let tick1 = player_u.render(TIMER_FRAMES, &NoSources);
+    assert!(tick1.iter().all(|&s| s == 10_000));
+    let tick2 = player_u.render(TIMER_FRAMES, &NoSources);
+    assert!(
+        tick2.iter().all(|&s| s == 0),
+        "unpause incremented hit_clock by 1 (0x57cd46), so duration 3 expires at tick 2"
+    );
+    assert!(player_u.faults.is_empty(), "{:?}", player_u.faults);
 }
