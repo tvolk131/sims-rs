@@ -26,7 +26,9 @@ and neither changes the state a lot loads:
 
 The pools (`20261120-neighborhood-open-fills-five-pools.md`, 6b E) are
 not ported either, and they do change it: their families, records and
-person files, and the option bytes, all enter the loaded world.
+person files enter the loaded world. They also set the neighborhood's
+option bytes, which the lot load does not read (`World::read_neighbors`
+ignores them), so the boot's hash does not check them.
 
 **The converted flag.** The resource writer sets a resource's flags
 word to 0x10 when it marks it converted (0x419f80), and to 0 otherwise.
