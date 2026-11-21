@@ -1050,8 +1050,8 @@ impl Interpreter<'_> {
     ///    ([`sims_sim::neighbors::Neighbors::relationships_changed`]) is cleared
     ///    (0x4424cb).
     /// 4. If no Sim is selected, or the selected one is a visitor on a
-    ///    residential lot, the game selects another (0x445501), which is
-    ///    not ported and fails.
+    ///    residential lot, the game selects another household member
+    ///    (`0x445501`, [`Interpreter::select_next_resident`]).
     pub fn end_of_update(
         &self,
         world: &mut World,
@@ -1183,11 +1183,7 @@ impl Interpreter<'_> {
             }
         };
         if reselect {
-            return Err(TickError::Unsupported(
-                "no Sim of the household is selected at the end of the lot update, and \
-                 selecting another (0x445501) is not ported"
-                    .into(),
-            ));
+            self.select_next_resident(world)?;
         }
         Ok(())
     }

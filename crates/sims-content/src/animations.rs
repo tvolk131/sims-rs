@@ -154,6 +154,7 @@ impl Animations {
                             mount: 0,
                             path: path.clone(),
                             member: Some(member),
+                            inline: None,
                         });
                     }
                 }

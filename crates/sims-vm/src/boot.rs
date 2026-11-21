@@ -192,65 +192,65 @@ pub struct Handoff {
 
 /// A booted house: its linked code, its catalog and its lot.
 pub struct Lot {
-    program: Program,
-    catalog: Catalog,
+    pub(crate) program: Program,
+    pub(crate) catalog: Catalog,
     /// The floor and wall catalogs the load renumbered the lot's patterns
     /// by (load step 6b).
-    surfaces: Surfaces,
-    world: World,
+    pub(crate) surfaces: Surfaces,
+    pub(crate) world: World,
     /// The motive constants, worked out at the first step: a load that
     /// runs no tick does not need them.
-    tuning: Option<Tuning>,
-    player: Answers,
-    frames: Frames,
+    pub(crate) tuning: Option<Tuning>,
+    pub(crate) player: Answers,
+    pub(crate) frames: Frames,
     /// Ticks run, and the lot's tick count when the first one started.
-    ticks: u32,
-    start: u32,
-    load: LoadReport,
+    pub(crate) ticks: u32,
+    pub(crate) start: u32,
+    pub(crate) load: LoadReport,
     /// Set when a tick or a frame failed. The lot is then as the failure
     /// left it, partway through a tick or a frame, so no later step runs.
-    halted: bool,
+    pub(crate) halted: bool,
     /// Play mode's own state ([`crate::play`]), used by
     /// [`Lot::step_play`] only.
-    play: Play,
+    pub(crate) play: Play,
     /// Whether a dialog that offers a choice, with no answer left in the
     /// list given at load, waits for the player ([`Lot::wait_for_answers`])
     /// rather than halting the lot.
-    asks: bool,
+    pub(crate) asks: bool,
     /// The dialog the lot waits on, while it waits.
-    asking: Option<Box<Asking>>,
+    pub(crate) asking: Option<Box<Asking>>,
     /// The dialog is answered and the tick that showed it has not run
     /// again yet: the lot is as it was before that tick, so it takes no
     /// input until the next step.
-    answered: bool,
+    pub(crate) answered: bool,
 
     /// The house view's rotation, 0 to 3 ([`Lot::set_view_rotation`]).
-    view_rotation: u8,
+    pub(crate) view_rotation: u8,
     /// The saved house's opening camera direction, 0 to 3
     /// ([`opening_rotation`]): the rotation that level 1's road-dash floor
     /// tiles (`10` and `11`) in `world` are oriented for (`0x4a8042`,
     /// `0x4a861f`, `0x4a87b1`–`0x4a87dc`).
-    floor_rotation: u8,
+    pub(crate) floor_rotation: u8,
     /// The tile at the house view's centre, if known
     /// ([`Lot::set_view_centre`]).
-    view_centre: Option<[i8; 2]>,
+    pub(crate) view_centre: Option<[i8; 2]>,
     /// The view rotation and centre frozen when a tick paused on an
     /// unanswered dialog (`Stop::Asks`), so moving the camera while a
     /// dialog is showing does not alter the tick's replay once answered.
-    replay_view: Option<(u8, Option<[i8; 2]>)>,
+    pub(crate) replay_view: Option<(u8, Option<[i8; 2]>)>,
     /// The world's hash as the load left it, which a save carries so it
     /// goes back only into a lot loaded from the same files
     /// ([`save`]).
-    loaded: [u8; 32],
+    pub(crate) loaded: [u8; 32],
     /// Committed Buy Mode purchases available for Undo (`0x493259`, `0x4932fa`).
     /// Cleared when leaving a non-Live mode (`0x4cea5d` → `0x4933dc`) or
     /// restoring a save.
-    buy_undo: Vec<crate::BuyPurchase>,
+    pub(crate) buy_undo: Vec<crate::BuyPurchase>,
     /// Undone Buy Mode purchases available for Redo (`0x493338`).
-    buy_redo: Vec<crate::BuyPurchase>,
+    pub(crate) buy_redo: Vec<crate::BuyPurchase>,
     /// Detached Buy Mode objects whose history cleanup (`0x48c20e`) faulted,
     /// tracked so [`Lot::save`] and mode switches never leak them silently.
-    buy_orphans: Vec<crate::BuyPurchase>,
+    pub(crate) buy_orphans: Vec<crate::BuyPurchase>,
 }
 
 /// A dialog the lot waits on ([`Lot::asking`]). The tick that showed it
@@ -2011,17 +2011,7 @@ mod tests {
         let mut lot = lot(world, true, Frames::default());
         lot.tuning = Some(tuning());
         assert!(super::residential(&lot.world, &lot.program));
-        // The update itself fails on an empty lot, after the idle loop
-        // set its speed.
-        // A strict step hands back nothing with the failure.
-        assert!(matches!(
-            lot.step(),
-            Err(StepError::Tick {
-                tick: 1,
-                update: None,
-                ..
-            })
-        ));
+        lot.step().expect("empty residential lot steps cleanly");
         assert_eq!(lot.world.speed(), 1000);
         assert_eq!(lot.world.globals[18], 760);
         // A lot with no zoning is not residential: the idle loop leaves
@@ -2051,9 +2041,10 @@ mod tests {
 
     #[test]
     fn a_failed_tick_halts_the_lot() {
-        // An empty lot has no selected Sim at the end of its update, which
-        // stops the tick partway.
-        let mut lot = lot(World::empty(), true, Frames::default());
+        // Truncated globals stop the lot update outside any object's tick.
+        let mut world = World::empty();
+        world.globals.truncate(15);
+        let mut lot = lot(world, true, Frames::default());
         lot.tuning = Some(tuning());
         let Err(StepError::Tick { tick: 1, .. }) = lot.step() else {
             panic!("the tick should fail");
@@ -2080,7 +2071,9 @@ mod tests {
 
     #[test]
     fn play_mode_still_halts_on_a_failure_outside_an_objects_tick() {
-        let mut lot = lot(World::empty(), true, Frames::default());
+        let mut world = World::empty();
+        world.globals.truncate(15);
+        let mut lot = lot(world, true, Frames::default());
         lot.tuning = Some(tuning());
         let Err(StepError::Tick {
             tick: 1,

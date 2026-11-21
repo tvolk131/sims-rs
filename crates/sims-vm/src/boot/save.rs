@@ -44,24 +44,24 @@ pub const FORMAT: u32 = 5;
 /// A lot as it stood between two steps ([`Lot::save`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Saved {
-    world: World,
-    ticks: u32,
-    start: u32,
-    answers: Answers,
-    fresh: BTreeSet<u16>,
-    view_rotation: u8,
-    answered: bool,
-    house: u32,
-    family: u16,
-    loaded: [u8; 32],
+    pub(crate) world: World,
+    pub(crate) ticks: u32,
+    pub(crate) start: u32,
+    pub(crate) answers: Answers,
+    pub(crate) fresh: BTreeSet<u16>,
+    pub(crate) view_rotation: u8,
+    pub(crate) answered: bool,
+    pub(crate) house: u32,
+    pub(crate) family: u16,
+    pub(crate) loaded: [u8; 32],
     /// Format 3 on (view-rotated screen-centre tile pick from format 5).
-    view_centre: Option<[i8; 2]>,
+    pub(crate) view_centre: Option<[i8; 2]>,
     /// Format 4 on: the saved house's opening camera rotation (`0..=3`)
     /// paired with its level-1 road-dash floor IDs (`0x4a87b1`–`0x4a87dc`).
-    floor_rotation: u8,
+    pub(crate) floor_rotation: u8,
     /// Format 5 on: frozen `(view_rotation, view_centre)` while a dialog tick
     /// awaits replay.
-    replay_view: Option<(u8, Option<[i8; 2]>)>,
+    pub(crate) replay_view: Option<(u8, Option<[i8; 2]>)>,
 }
 
 /// Why a lot could not be saved or restored.

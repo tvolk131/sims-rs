@@ -23,10 +23,13 @@ pub struct Member {
 pub struct Resource {
     /// Index into [`Index::mounts`].
     pub mount: usize,
-    /// The file on disk.
+    /// The file on disk (or a virtual path for in-memory character files).
     pub path: PathBuf,
     /// Set when this resource is a member of the archive at `path`.
     pub member: Option<Member>,
+    /// In-memory bytes for resources loaded from a persistence store rather
+    /// than disk (e.g. REDB-stored neighborhood character IFFs).
+    pub(crate) inline: Option<Vec<u8>>,
 }
 
 impl Resource {
@@ -74,6 +77,15 @@ impl Resource {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, message),
             )
         };
+        if let Some(bytes) = &self.inline {
+            if bytes.len() as u64 > far::MAX_MEMBER {
+                return Err(invalid(format!(
+                    "{} exceeds the 128 MiB resource limit",
+                    self.name()
+                )));
+            }
+            return Ok(bytes.clone());
+        }
         let mut file = File::open(&self.path).map_err(io)?;
         let len = file.metadata().map_err(io)?.len();
         let (offset, size) = match &self.member {
@@ -182,6 +194,54 @@ impl Index {
         Ok(())
     }
 
+    /// Adds a neighborhood's `Characters` files from in-memory bytes (such as
+    /// those imported into a REDB store) as a mount named `Characters`, in the
+    /// exact same mount position and file-table hash order as
+    /// [`Index::add_characters`].
+    pub fn add_character_files(&mut self, files: &BTreeMap<String, Vec<u8>>) -> Result<()> {
+        let number = self
+            .mounts
+            .iter()
+            .position(|m| m.path == Install::USER_OBJECTS)
+            .map_or(self.mounts.len(), |n| n + 1);
+        self.mounts.insert(
+            number,
+            Mount {
+                path: Self::CHARACTERS.to_owned(),
+                recursive: true,
+            },
+        );
+        let at = self
+            .resources
+            .iter()
+            .position(|r| r.mount >= number)
+            .unwrap_or(self.resources.len());
+        let later = self.resources.split_off(at);
+        let mut table = Table::default();
+        let mut by_key: BTreeMap<Vec<u8>, (&str, &Vec<u8>)> = BTreeMap::new();
+        for (name, bytes) in files {
+            let k = key(name.as_bytes());
+            if by_key.insert(k.clone(), (name.as_str(), bytes)).is_none() {
+                table.insert(k);
+            }
+        }
+        for name_key in table.iter() {
+            if let Some(&(name, bytes)) = by_key.get(name_key) {
+                self.resources.push(Resource {
+                    mount: number,
+                    path: PathBuf::from(Self::CHARACTERS).join(name),
+                    member: None,
+                    inline: Some(bytes.clone()),
+                });
+            }
+        }
+        self.resources.extend(later.into_iter().map(|mut r| {
+            r.mount += 1;
+            r
+        }));
+        Ok(())
+    }
+
     /// Resources whose name matches, ignoring ASCII case, in load order,
     /// with their positions in [`Index::resources`]. A name without a
     /// directory matches a resource's file name, the last component of its
@@ -225,6 +285,7 @@ impl Index {
                 mount: 0,
                 path: path.clone(),
                 member: member.cloned(),
+                inline: None,
             };
             match here.entries.get(name) {
                 Some(Entry::File(path)) => listed.push((name.to_vec(), resource(path, None))),
@@ -267,11 +328,13 @@ impl Index {
                     mount,
                     path: path.clone(),
                     member: None,
+                    inline: None,
                 }),
                 Some(Entry::Member(path, member)) => resources.push(Resource {
                     mount,
                     path: path.clone(),
                     member: Some(member.clone()),
+                    inline: None,
                 }),
                 // An archive file itself.
                 Some(Entry::Archive) | None => {}
@@ -350,6 +413,7 @@ impl MountedFiles {
                         mount: 0,
                         path,
                         member,
+                        inline: None,
                     },
                 ))
             })
@@ -387,11 +451,13 @@ impl MountedFiles {
                 mount: 0,
                 path: path.clone(),
                 member: None,
+                inline: None,
             }),
             Entry::Member(path, member) => Some(Resource {
                 mount: 0,
                 path: path.clone(),
                 member: Some(member.clone()),
+                inline: None,
             }),
             Entry::Directory | Entry::Archive => None,
         })

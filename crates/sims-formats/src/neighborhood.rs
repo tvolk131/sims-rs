@@ -33,6 +33,21 @@ impl Family {
         }
         Ok(Some(values))
     }
+
+    /// Writes the six signed magic words back into `self.tail[4..16]` for FAMI
+    /// versions > 8, preserving the secondary-house word (`tail[0..4]`) and any
+    /// bytes past offset 16. Returns `false` if the family version or tail does
+    /// not carry a magic history.
+    pub fn set_magic_history(&mut self, values: [i16; 6]) -> bool {
+        if self.version <= 8 || self.tail.len() < 16 {
+            return false;
+        }
+        for (index, value) in values.into_iter().enumerate() {
+            let at = 4 + index * 2;
+            self.tail[at..at + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        true
+    }
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes);
         let version = header(&mut r, b"IMAF")?;
@@ -161,13 +176,13 @@ impl Neighbors {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InventoryItem {
     pub kind: i32,
     pub guid: u32,
     pub count: u16,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Inventory {
     pub neighbor: i16,
     pub items: Vec<InventoryItem>,

@@ -785,14 +785,27 @@ fn registry_byte_0x12_is_cleared_on_a_tick_count_that_is_a_multiple_of_40() {
 }
 
 #[test]
-fn no_selected_sim_fails_loudly() {
+fn no_selected_sim_auto_selects_household_member_or_stays_none() {
     let mut fx = lot(sleeper());
     fx.thread(LAMP, 4096, &[3]);
     fx.sim_mut().selected = false;
-    assert!(matches!(
-        update(&mut fx, &mut answers(&[])),
-        Err(TickError::Unsupported(m)) if m.contains("0x445501")
-    ));
+    // With no family members registered, 0x445501 leaves nobody selected.
+    update(&mut fx, &mut answers(&[])).unwrap();
+    assert_eq!(sims_vm::selected(&fx.world), None);
+
+    // With the Sim's GUID in the lot's family, 0x445501 selects it cleanly.
+    let sim_guid = fx.sim().guid;
+    fx.world.globals[9] = 5;
+    fx.world.families.push(sims_sim::neighbors::Family {
+        id: 5,
+        house: 5,
+        members: vec![sim_guid],
+        friends: 0,
+        stale: false,
+    });
+    update(&mut fx, &mut answers(&[])).unwrap();
+    assert_eq!(sims_vm::selected(&fx.world), Some(SIM));
+    assert_eq!(fx.world.globals[3], SIM as i16);
 }
 
 #[test]

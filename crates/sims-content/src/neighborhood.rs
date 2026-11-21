@@ -109,6 +109,18 @@ impl Neighborhood {
         resolve(&self.directory, "Characters")
     }
 
+    /// Regular files in the neighborhood's `Characters` folder, in sorted name
+    /// order. Empty when there is no such folder.
+    pub fn character_files(&self) -> Result<Vec<PathBuf>> {
+        match self.characters()? {
+            Some(directory) if directory.is_dir() => Ok(sorted_entries(&directory)?
+                .into_iter()
+                .filter(|path| path.is_file())
+                .collect()),
+            _ => Ok(Vec::new()),
+        }
+    }
+
     /// Each lot's zoning by lot number, from the neighborhood's
     /// `LotZoning.iff`: 1 residential, 2 community. Empty when the
     /// neighborhood has no such file.
@@ -266,7 +278,16 @@ impl House {
     /// through `catalog`, which must already include the neighborhood's
     /// characters; an object whose GUID it lacks is an error.
     pub fn load(path: &Path, catalog: &Catalog) -> Result<Self> {
-        let iff = read_iff(path)?;
+        let bytes = std::fs::read(path).map_err(|e| Error::io(path, e))?;
+        Self::parse_bytes(bytes, path, catalog)
+    }
+
+    /// Parses a house file from in-memory bytes (such as bytes stored in a
+    /// persistence database). Saved objects are matched to their definitions
+    /// through `catalog`, which must already include the neighborhood's
+    /// characters.
+    pub fn parse_bytes(bytes: Vec<u8>, path: &Path, catalog: &Catalog) -> Result<Self> {
+        let iff = Iff::parse(bytes).map_err(|e| Error::format(&path.display().to_string(), e))?;
         let location = |tag: &str, id: u16| format!("{} {tag} #{id}", path.display());
         let one = |tag: &'static [u8; 4]| {
             iff.chunks
