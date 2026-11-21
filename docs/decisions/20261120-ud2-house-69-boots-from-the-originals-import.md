@@ -30,17 +30,18 @@ files.
   The first run's copy (`after-with-lot-load`, repaired as
   `cache/ud2-import-state-20261120`) is no longer used: its GUIDs and pool
   rolls are another session's, which no recording covers.
-- **The C runtime.** The open's import and pools draw from the C
-  runtime's generator before the lot loads, and that is not ported (6b E).
-  So the test starts the generator, through `Lot::load_with`, at state 1
-  after 401,120 draws (`OPEN_DRAWS`). That number is fitted: the
+- **The C runtime.** This test boots directly from the saved files, so
+  it starts the generator, through `Lot::load_with`, at state 1
+  after 401,120 draws (`FILE_BOOT_DRAWS`). That number is fitted: the
   recording's entry state is state 1 after 405,850 draws, and our load
   makes the last 4,730. It is the effective offset before our load's
   steps, which include making the two indicators (64 draws) that the
   original may already have made before its lot load. That the generator
   ran on from state 1 with no reseed is assumed, not observed; the
   executable's `rand` can seed a thread from the time stamp counter
-  (0x619e5a). The test checks the entry state.
+  (0x619e5a). The test checks the entry state. The in-memory open test
+  replays the pool draws separately
+  (`20261120-neighborhood-open-replays-five-pools.md`).
 - **Frames.** The test draws the recording's frames (`RECORDED_FRAMES`):
   after updates 0 to 2, 29, 59, 89, 101 and 102, then every 30th from 123.
   With the default frames, an object is made one update later (321, not

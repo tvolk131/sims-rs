@@ -103,8 +103,32 @@ impl View {
         if self.camera.level != before.level {
             self.camera.focus.forget();
         }
+        // A change of zoom keeps the rooms' cutaway masks as they were
+        // built (0x4a7c9f); turning the view (0x4a8006) or changing the
+        // floor (0x4a8116) builds them again at the zoom shown.
+        if self.camera.zoom != before.zoom {
+            let built = before.focus.masks_built_at.unwrap_or(before.zoom);
+            self.camera.focus.masks_built_at = (built != self.camera.zoom).then_some(built);
+        }
+        if self.camera.rotation != before.rotation || self.camera.level != before.level {
+            self.camera.focus.masks_built_at = None;
+        }
         self.bound();
         self.camera != before
+    }
+
+    /// A lot update built the rooms' cutaway masks again for the levels in
+    /// `levels` (bits, 1 for level 1, 2 for level 2;
+    /// [`sims_vm::Update::masks_rebuilt`]): if the floor shown is one,
+    /// its masks are now at the zoom shown. Returns whether the picture
+    /// changes.
+    pub fn masks_rebuilt(&mut self, levels: u8) -> bool {
+        let bit = 1 << (self.camera.level.clamp(1, 2) - 1);
+        let rebuilt = levels & bit != 0 && self.camera.focus.masks_built_at.is_some();
+        if rebuilt {
+            self.camera.focus.masks_built_at = None;
+        }
+        rebuilt
     }
 }
 
@@ -157,5 +181,42 @@ mod tests {
         assert!(v.apply(Move::Floor(2)));
         assert_eq!(v.camera.level, 2);
         assert!(!v.apply(Move::Floor(5)));
+    }
+
+    #[test]
+    fn a_change_of_zoom_keeps_the_masks_and_a_turn_or_a_floor_builds_them() {
+        let mut v = View::new([800, 600], [32 * 16, 32 * 16], 0);
+        let built = |v: &View| v.camera.focus.masks_built_at;
+        assert_eq!(built(&v), None);
+        v.apply(Move::ZoomIn);
+        assert_eq!(built(&v), Some(Zoom::Far));
+        v.apply(Move::ZoomIn);
+        assert_eq!(built(&v), Some(Zoom::Far));
+        // Back at the zoom they were built at, they are the zoom shown's.
+        v.apply(Move::ZoomOut);
+        v.apply(Move::ZoomOut);
+        assert_eq!(built(&v), None);
+        v.apply(Move::ZoomIn);
+        v.apply(Move::Rotate(true));
+        assert_eq!(built(&v), None);
+        v.apply(Move::ZoomIn);
+        assert_eq!(built(&v), Some(Zoom::Medium));
+        // A scroll or a change of walls builds nothing.
+        v.apply(Move::Scroll([5, 5]));
+        v.apply(Move::Walls(Walls::Down));
+        assert_eq!(built(&v), Some(Zoom::Medium));
+        v.apply(Move::LevelUp);
+        assert_eq!(built(&v), None);
+        // A room update builds the masks of the levels it counted: here
+        // only the floor shown counts.
+        v.apply(Move::ZoomOut);
+        assert!(!v.masks_rebuilt(0));
+        assert!(!v.masks_rebuilt(1));
+        assert_eq!(built(&v), Some(Zoom::Near));
+        assert!(v.masks_rebuilt(2));
+        assert_eq!(built(&v), None);
+        v.apply(Move::ZoomIn);
+        assert!(v.masks_rebuilt(3));
+        assert!(!v.masks_rebuilt(3));
     }
 }

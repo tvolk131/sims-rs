@@ -470,6 +470,24 @@ fn house_zeros_reload_makes_records_and_drops_members_without_one() {
 }
 
 #[test]
+fn freeing_family_4000_past_the_largest_signed_id_fails() {
+    let catalog = catalog();
+    let registry = [registered(ANNE, 2), registered(BOB, 2), registered(PET, 2)];
+    let mut neighborhood = small();
+    // Family 7 as 32767, the largest signed ID.
+    let family = neighborhood.families.remove(&7).unwrap();
+    neighborhood.families.insert(32767, family);
+    let error = open(
+        &mut neighborhood,
+        &[],
+        &small_context(&catalog, &registry, PETS),
+        &mut no_draws,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("0x42c1ad"), "{error}");
+}
+
+#[test]
 fn a_pending_import_first_frees_family_4000_and_then_clears_the_option() {
     let catalog = catalog();
     let registry = [registered(ANNE, 2), registered(BOB, 2), registered(PET, 2)];
