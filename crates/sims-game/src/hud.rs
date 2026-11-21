@@ -289,10 +289,7 @@ impl Hud {
         // The panel follows the selection first, so that the snapshot
         // reads what the open panel needs.
         let household = self.household(world, residential);
-        if self
-            .controls
-            .follow(Selected::of(household.selected_resident()))
-        {
+        if self.controls.follow(Selected::of(&household)) {
             self.play(WHOOSH);
         }
         if self.controls.expanded && self.controls.panel == Some(UiPanel::House) {
@@ -531,7 +528,7 @@ impl Hud {
         let command = match command {
             Command::OpenPanel(_) => {
                 let snapshot = Snapshot::read(world, &self.members);
-                let selected = Selected::of(snapshot.selected_resident());
+                let selected = Selected::of(&snapshot);
                 hud::check_press(command, selected, residential)
             }
             other => other,
@@ -643,15 +640,14 @@ impl PauseBlink {
                 self.since = Some(clock_us);
                 self.lit = false;
             }
-            Some(since) => {
-                let flips = clock_us.saturating_sub(since) / hud::PAUSE_BLINK_US;
-                if flips > 0 {
-                    if !flips.is_multiple_of(2) {
-                        self.lit = !self.lit;
-                    }
-                    self.since = Some(since.saturating_add(flips * hud::PAUSE_BLINK_US));
-                }
+            Some(since) if clock_us.saturating_sub(since) >= hud::PAUSE_BLINK_US => {
+                // 0x53b500..0x53b52e -> 0x5daf1c..0x5daf31: a single timer
+                // callback toggles the row once and re-arms 500 ms from the
+                // current clock, even after a long stall.
+                self.lit = !self.lit;
+                self.since = Some(clock_us);
             }
+            Some(_) => {}
         }
         self.lit != before
     }
@@ -679,16 +675,22 @@ mod tests {
         // At 1000 ms: flips back to unlit.
         assert!(blink.sync(true, 1_100_000));
         assert!(!blink.lit());
-        // Three half-periods (1500 ms) at once: flips to lit without losing phase.
-        assert!(blink.sync(true, 2_600_000));
+        // A 1-second stall (2x 500 ms) toggles once and re-arms 500 ms from
+        // the current clock (0x53b500..0x53b52e -> 0x5daf1c..0x5daf31).
+        assert!(blink.sync(true, 2_100_000));
         assert!(blink.lit());
+        assert!(!blink.sync(true, 2_599_999));
+        assert!(blink.sync(true, 2_600_000));
+        assert!(!blink.lit());
         // Unpausing clears lit and kills the timer; re-pausing starts fresh unlit.
-        assert!(blink.sync(false, 2_700_000));
+        assert!(blink.sync(true, 3_100_000));
+        assert!(blink.lit());
+        assert!(blink.sync(false, 3_200_000));
         assert!(!blink.lit());
-        assert!(!blink.sync(true, 2_900_000));
+        assert!(!blink.sync(true, 3_400_000));
         assert!(!blink.lit());
-        assert!(!blink.sync(true, 3_399_999));
-        assert!(blink.sync(true, 3_400_000));
+        assert!(!blink.sync(true, 3_899_999));
+        assert!(blink.sync(true, 3_900_000));
         assert!(blink.lit());
     }
 

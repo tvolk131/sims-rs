@@ -3588,6 +3588,19 @@ fn the_control_panel_pause_blink_help_budget_mode_and_pet_refresh() {
     .expect("the panel opens");
     let view = View::new([800, 600], [0, 0], opened.rotation);
     let mut canvas = Canvas::new(800, 600, [0; 3]);
+    hud.draw(
+        lot.world(),
+        lot.residential(),
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    assert_eq!(
+        hud.press(help_center, lot.world(), lot.residential()),
+        Some(Command::OpenHelp)
+    );
 
     let mut budget = lot.world().clone();
     if budget.globals.len() <= 32 {

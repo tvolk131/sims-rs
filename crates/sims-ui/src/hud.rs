@@ -165,22 +165,29 @@ pub const RESOURCES: [i32; 56] = [
 /// 500 ms (`0x1f4` ms, `0x53b528`, `0x53b71e`).
 pub const PAUSE_BLINK_US: u64 = 500_000;
 
-/// Who of the household is selected, for [`Controls::follow`] and
+/// Who is selected on the lot, for [`Controls::follow`] and
 /// [`check_press`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Selected {
+    /// Nobody is selected on the lot (`0x4e986d == -1`).
     None,
+    /// Someone is selected on the lot (`0x4e986d != -1`), but is not one
+    /// of the household's members (`+0xe8 == -1`, `0x51c5e7..0x51c619`).
+    NonHousehold,
+    /// A human household Sim (`person.data[65] <= 1`).
     Human,
+    /// A pet household Sim (`person.data[65] > 1`, `0x51c61f`, `0x51ce13`).
     Pet,
 }
 
 impl Selected {
-    /// Classifies `resident` as returned by [`Snapshot::selected_resident`].
-    pub fn of(resident: Option<&crate::household::Resident>) -> Self {
-        match resident {
-            None => Self::None,
+    /// Classifies the selection in `snapshot`.
+    pub fn of(snapshot: &Snapshot) -> Self {
+        match snapshot.selected_resident() {
             Some(r) if r.pet => Self::Pet,
             Some(_) => Self::Human,
+            None if snapshot.selected.is_some() => Self::NonHousehold,
+            None => Self::None,
         }
     }
 }
@@ -205,6 +212,11 @@ pub struct Controls {
     /// (row 1 of `id::PAUSE`, toggled every [`PAUSE_BLINK_US`] at
     /// `0x53b500..0x53b528`; starts `false` on entry at `0x53b707..0x53b74d`).
     pub pause_lit: bool,
+    /// Whether the Interests (`[esi + 0x170]`) and Gifts (`[esi + 0x174]`)
+    /// gadget buttons are enabled (`byte [btn + 0x168]`, `0x51c5a6..0x51c9e5`).
+    /// Enabled for human household Sims, disabled for pets and non-household
+    /// selections, and preserved when selection clears (`0x51c5e1 -> 0x51c775`).
+    pub interests_gifts_enabled: bool,
     pub camera: CameraState,
     /// The pointer's position, for the buttons' hover cells.
     pub pointer: Option<[i32; 2]>,
@@ -252,6 +264,7 @@ impl Default for Controls {
             panel: Some(Panel::Needs),
             speed: Some(Speed::Normal),
             pause_lit: false,
+            interests_gifts_enabled: true,
             camera: CameraState::default(),
             pointer: None,
             relations: Relations::default(),
@@ -293,13 +306,24 @@ impl Controls {
     }
 
     /// Follows the selection, as the panel's household notification and
-    /// selection refresh do (`0x51ce79`, `0x51c5a6`): with nobody selected
-    /// no panel is open (`0x51d06e`), with someone selected and no panel
-    /// open the needs open (`0x51d082`), and with a pet selected
-    /// (`person.data[65] > 1`, `0x51ce13..0x51ce36`) an open Interests or
-    /// Gifts panel switches to Needs (`0x51d375(1)`). True if that closed
-    /// the help balloon, which the original plays `UI_whoosh` for
-    /// (`0x50fb7f`).
+    /// selection refresh do (`0x51ce79`, `0x51c5a6`):
+    /// - with nobody selected on the lot (`Selected::None`, `0x4cf9a4 == -1`),
+    ///   no panel is open (`0x51d06e`) and the Interests/Gifts enabled state
+    ///   is preserved (`0x51c5e1 -> 0x51c775`);
+    /// - with a non-household Sim selected (`Selected::NonHousehold`,
+    ///   `0x4cf9a4 != -1` but `+0xe8 == -1`), the open panel stays (opening
+    ///   Needs if none, `0x51d082`) while Interests and Gifts are disabled
+    ///   (`0x51c609..0x51c619 -> 0x51c8c2`);
+    /// - with a human household Sim selected (`Selected::Human`), Interests
+    ///   and Gifts are enabled (`0x51c6f1..0x51c8b3`) and Needs opens if no
+    ///   panel is open;
+    /// - with a pet household Sim selected (`Selected::Pet`,
+    ///   `person.data[65] > 1`), Interests and Gifts are disabled
+    ///   (`0x51c61f -> 0x51c8c2`) and an open Interests or Gifts panel
+    ///   switches to Needs (`0x51ce13..0x51ce36 -> 0x51d375(1)`).
+    ///
+    /// True if that closed the help balloon, which the original plays
+    /// `UI_whoosh` for (`0x50fb7f`).
     ///
     /// The original follows the notification. The host calls this before
     /// each layout; that a selection change always sends the
@@ -308,12 +332,20 @@ impl Controls {
         let help = self.help.is_some();
         match selected {
             Selected::None => self.open(None),
+            Selected::NonHousehold => {
+                self.interests_gifts_enabled = false;
+                if self.panel.is_none() {
+                    self.open(Some(Panel::Needs));
+                }
+            }
             Selected::Human => {
+                self.interests_gifts_enabled = true;
                 if self.panel.is_none() {
                     self.open(Some(Panel::Needs));
                 }
             }
             Selected::Pet => {
+                self.interests_gifts_enabled = false;
                 if self.panel.is_none()
                     || matches!(self.panel, Some(Panel::Interests | Panel::Gifts))
                 {
@@ -643,11 +675,16 @@ pub fn layout(size: [i32; 2], snapshot: &Snapshot, controls: &Controls) -> Vec<I
         ),
         view(id::PHOTO, at(175, 95, 29, 29), false, true, Camera::Photo),
     ]);
+    // 0x53b55c..0x53b690 -> 0x53b736..0x53b74d: outside Live mode, state 1
+    // holds the pause button steady selected on lit row 1 (red) regardless of
+    // global 17. In Live mode, state 2 selects it while paused and toggles
+    // row 0/1 every 500 ms via `controls.pause_lit`.
+    let non_live = controls.mode != Mode::Live;
     items.push(Item {
         rect: at(85, 135, 15, 15),
         kind: Kind::Pause {
-            paused: snapshot.paused,
-            lit: snapshot.paused && (controls.mode != Mode::Live || controls.pause_lit),
+            paused: non_live || snapshot.paused,
+            lit: non_live || (snapshot.paused && controls.pause_lit),
         },
         command: Some(Command::TogglePause),
     });
@@ -713,7 +750,7 @@ pub fn layout(size: [i32; 2], snapshot: &Snapshot, controls: &Controls) -> Vec<I
         // `$9,999,999`-wide money box ending at x = 178, y = 158.
         items.push(Item {
             rect: at(0, 158, 178, 16),
-            kind: Kind::Friends(snapshot.family_friends),
+            kind: Kind::Friends(snapshot.cluster_friends),
             command: None,
         });
     }
@@ -814,7 +851,11 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
     // Measured on the original's screen; the old prototype had the needs
     // button at (4, 33) and the first two rows two and one pixels higher.
     let g = |x: i32, y: i32, w: i32, h: i32| gadget.offset(x, y).with_size(w, h);
-    let pet_selected = selected.is_some_and(|r| r.pet);
+    let ig_disabled = !controls.interests_gifts_enabled
+        || matches!(
+            Selected::of(snapshot),
+            Selected::Pet | Selected::NonHousehold
+        );
     for (id, panel, x, y, w, h) in [
         (id::NEEDS, Panel::Needs, 9, 31, 32, 39),
         (id::INTERESTS, Panel::Interests, 44, 4, 27, 30),
@@ -824,11 +865,13 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
         (id::GIFTS, Panel::Gifts, 44, 66, 27, 30),
         (id::HOUSE, Panel::House, 76, 66, 27, 30),
     ] {
-        // 0x51c61f..0x51c9e5: selecting a pet (`person.data[65] > 1`)
-        // disables the Interests ([esi + 0x170]) and Gifts ([esi + 0x174])
-        // gadget buttons (`byte [btn + 0x168] = 0`). Whether another panel
-        // opens is for the host to check at the press ([`check_press`]).
-        let disabled = pet_selected && matches!(panel, Panel::Interests | Panel::Gifts);
+        // 0x51c5a6..0x51c9e5: selecting a pet (`person.data[65] > 1`) or
+        // non-household Sim disables Interests ([esi + 0x170]) and Gifts
+        // ([esi + 0x174]), and clearing selection (`0x51c5e1 -> 0x51c775`)
+        // preserves their previous enabled state via
+        // `controls.interests_gifts_enabled`. Whether another panel opens is
+        // for the host to check at the press ([`check_press`]).
+        let disabled = ig_disabled && matches!(panel, Panel::Interests | Panel::Gifts);
         items.push(Item {
             rect: g(x, y, w, h),
             kind: Kind::Button {
@@ -1986,10 +2029,14 @@ pub fn press(items: &[Item], point: [i32; 2]) -> Option<Command> {
 /// press does nothing (`0x51be6e`). Other commands pass through.
 pub fn check_press(command: Command, selected: Selected, residential: bool) -> Command {
     match command {
-        Command::OpenPanel(Panel::House) if selected == Selected::None || !residential => {
+        Command::OpenPanel(Panel::House)
+            if matches!(selected, Selected::None | Selected::NonHousehold) || !residential =>
+        {
             Command::Refused { error: true }
         }
-        Command::OpenPanel(_) if selected == Selected::None => Command::Refused { error: false },
+        Command::OpenPanel(_) if matches!(selected, Selected::None | Selected::NonHousehold) => {
+            Command::Refused { error: false }
+        }
         Command::OpenPanel(Panel::Interests | Panel::Gifts) if selected == Selected::Pet => {
             Command::Refused { error: false }
         }
@@ -2055,6 +2102,7 @@ mod tests {
                 .collect(),
             selected: Some(21),
             family_friends: 0,
+            cluster_friends: 0,
             relations: Vec::new(),
             superstar: false,
             house: crate::house::House::default(),
@@ -2947,15 +2995,17 @@ mod tests {
             };
             assert_eq!(check(panel, Selected::Pet, true), pet_expected);
             assert_eq!(check(panel, Selected::Pet, false), pet_expected);
-            // Nobody selected: refused, silently (0x51be6e).
-            for residential in [true, false] {
-                assert_eq!(
-                    check(panel, Selected::None, residential),
-                    Command::Refused { error: false }
-                );
+            // Nobody or non-household Sim selected (+0xe8 == -1): refused silently (0x51be6e).
+            for missing in [Selected::None, Selected::NonHousehold] {
+                for residential in [true, false] {
+                    assert_eq!(
+                        check(panel, missing, residential),
+                        Command::Refused { error: false }
+                    );
+                }
             }
         }
-        // House needs someone selected and a residential lot, and its refusal sounds (0x51be1a).
+        // House needs a household Sim selected and a residential lot, and its refusal sounds (0x51be1a).
         assert_eq!(
             check(Panel::House, Selected::Human, true),
             Command::OpenPanel(Panel::House)
@@ -2969,6 +3019,8 @@ mod tests {
             (Selected::Pet, false),
             (Selected::None, true),
             (Selected::None, false),
+            (Selected::NonHousehold, true),
+            (Selected::NonHousehold, false),
         ] {
             assert_eq!(
                 check(Panel::House, selected, residential),
@@ -3041,8 +3093,51 @@ mod tests {
         controls.panel = Some(Panel::Personality);
         assert!(!controls.follow(Selected::Pet));
         assert_eq!(controls.panel, Some(Panel::Personality));
-        // Selecting a pet also disables the Interests and Gifts gadget buttons
-        // in the layout (0x51c61f..0x51c9e5).
+        // Selecting a pet disables Interests and Gifts (0x51c61f..0x51c9e5),
+        // and clearing selection (0x51c5e1 -> 0x51c775) preserves that disabled
+        // state until a human household Sim re-enables them.
+        assert!(!controls.interests_gifts_enabled);
+        assert!(!controls.follow(Selected::None));
+        assert_eq!(controls.panel, None);
+        assert!(!controls.interests_gifts_enabled);
+        let mut nobody_snap = snapshot();
+        nobody_snap.selected = None;
+        let cleared_items = layout([800, 600], &nobody_snap, &controls);
+        for id in [id::INTERESTS, id::GIFTS] {
+            let btn = cleared_items
+                .iter()
+                .find(|i| matches!(i.kind, Kind::Button { id: bid, .. } if bid == id))
+                .expect("gadget button");
+            assert_eq!(btn.command, None);
+        }
+        // Selecting a human re-enables Interests and Gifts (0x51c6f1..0x51c8b3).
+        assert!(!controls.follow(Selected::Human));
+        assert!(controls.interests_gifts_enabled);
+        assert_eq!(controls.panel, Some(Panel::Needs));
+        // Non-household selection (0x4cf9a4 != -1, +0xe8 == -1): keeps the open
+        // panel (0x51d06e) while disabling Interests and Gifts (0x51c609..0x51c619).
+        controls.panel = Some(Panel::Personality);
+        assert!(!controls.follow(Selected::NonHousehold));
+        assert_eq!(controls.panel, Some(Panel::Personality));
+        assert!(!controls.interests_gifts_enabled);
+        let mut visitor_snap = snapshot();
+        visitor_snap.selected = Some(999);
+        assert_eq!(Selected::of(&visitor_snap), Selected::NonHousehold);
+        let visitor_items = layout([800, 600], &visitor_snap, &controls);
+        for (id, want_disabled) in [
+            (id::INTERESTS, true),
+            (id::GIFTS, true),
+            (id::NEEDS, false),
+            (id::PERSONALITY, false),
+        ] {
+            let btn = visitor_items
+                .iter()
+                .find(|i| matches!(i.kind, Kind::Button { id: bid, .. } if bid == id))
+                .expect("gadget button");
+            assert_eq!(btn.command.is_none(), want_disabled);
+        }
+        // Selecting a pet directly in the snapshot also disables Interests/Gifts.
+        controls.follow(Selected::Human);
         let mut pet_snap = snapshot();
         pet_snap.residents[0].pet = true;
         let pet_items = layout([800, 600], &pet_snap, &controls);
@@ -3414,7 +3509,8 @@ mod tests {
         s.hour = 8;
         s.minute = 16;
         s.paused = true;
-        s.family_friends = 12;
+        s.family_friends = 3;
+        s.cluster_friends = 12;
         let controls = Controls {
             speed: Some(Speed::Fast),
             ..Controls::default()
@@ -3495,17 +3591,39 @@ mod tests {
             pause_lit: false,
             ..controls
         };
-        let buy_pause = layout([800, 600], &s, &buy_controls)
-            .into_iter()
-            .find(|i| matches!(i.kind, Kind::Pause { .. }))
-            .expect("buy pause");
-        assert_eq!(
-            buy_pause.kind,
-            Kind::Pause {
-                paused: true,
-                lit: true
+        // Outside Live mode, state 1 holds Pause steady selected & lit red
+        // even when global 17 (snapshot.paused) is false (0x53b55c -> 0x53b690).
+        for paused in [false, true] {
+            let mut mode_snap = s.clone();
+            mode_snap.paused = paused;
+            let buy_pause = layout([800, 600], &mode_snap, &buy_controls)
+                .into_iter()
+                .find(|i| matches!(i.kind, Kind::Pause { .. }))
+                .expect("buy pause");
+            assert_eq!(
+                buy_pause.kind,
+                Kind::Pause {
+                    paused: true,
+                    lit: true
+                }
+            );
+        }
+        // Cluster uses cluster_friends (12, 0x4cfcdb), while Job panel keeps
+        // family_friends (3, 0x4ea8ed, 0x531095).
+        let job_controls = Controls {
+            expanded: true,
+            panel: Some(Panel::Job),
+            ..controls
+        };
+        let job_items = layout([800, 600], &s, &job_controls);
+        assert!(job_items.iter().any(|i| matches!(
+            i.kind,
+            Kind::Work {
+                family_friends: 3,
+                ..
             }
-        );
+        )));
+        assert!(job_items.iter().any(|i| i.kind == Kind::Friends(12)));
 
         // When show_money is false (global 32 == 1, 0x4f24fa -> 0x53b2a4),
         // both the money box and the family-friends counter are omitted.

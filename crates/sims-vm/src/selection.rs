@@ -404,9 +404,12 @@ impl Interpreter<'_> {
     /// vtable at 0x66f220, which the generic window update 0x5dce19 calls
     /// at 0x5dd0de): 0x4cfcdb → 0x410260 → 0x427219, which works the
     /// count out again if a relationship write put it out of date
-    /// ([`sims_sim::World::family_friends`]). The family is the first
-    /// whose ID is global 9, with or without a house; on an empty lot (0)
-    /// nothing is counted, which is **unverified**.
+    /// ([`sims_sim::World::family_friends`]). On residential lots
+    /// (`0x40745f`: global 10 is 0 or has zoning 1), the family is the
+    /// first whose ID is global 9 (`0x4cfd4a`; 0 counts nothing). On
+    /// non-residential lots (`0x4cfd1a..0x4cfd48`), it looks up the
+    /// selected Sim's person data word 61 (`person::FAMILY`,
+    /// `[person + 0x606]`) via `0x425d69`.
     ///
     /// The game updates its windows whenever it handles its messages:
     /// between lot updates, and while a dialog that stops the game waits
@@ -425,10 +428,32 @@ impl Interpreter<'_> {
     /// out of date, so the two differ only if a relationship write and a
     /// read of the count fall between the same two redraws.
     pub fn refresh_family_panel(&self, world: &mut World) {
-        let family = i32::from(world.globals.get(9).copied().unwrap_or(0));
-        if family != 0
-            && let Some(place) = world.families.iter().position(|f| f.id == family)
-        {
+        let lot = world.globals.get(LOT).copied().unwrap_or(0);
+        let residential = lot == 0 || self.program.zoning.get(&lot) == Some(&1);
+        let place = if residential {
+            let family = i32::from(world.globals.get(FAMILY).copied().unwrap_or(0));
+            (family != 0)
+                .then(|| world.families.iter().position(|f| f.id == family))
+                .flatten()
+        } else {
+            selected(world)
+                .and_then(|id| {
+                    let obj = world.objects.get(&id)?;
+                    world
+                        .people
+                        .iter()
+                        .filter_map(|pid| world.objects.get(pid))
+                        .find(|o| o.guid == obj.guid && o.person.is_some())
+                        .unwrap_or(obj)
+                        .person
+                        .as_ref()
+                })
+                .and_then(|p| {
+                    let family = i32::from(p.data.get(person::FAMILY).copied().unwrap_or(0));
+                    world.families.iter().position(|f| f.id == family)
+                })
+        };
+        if let Some(place) = place {
             let threshold = self.program.autonomy_constants().friendship_threshold;
             world.family_friends(place, threshold);
         }
@@ -451,4 +476,168 @@ fn person_word(world: &World, id: u16, index: usize) -> Result<i16, Fault> {
         .and_then(|person| person.data.get(index))
         .copied()
         .ok_or_else(|| fault(id, Trap::Invalid(format!("no person data word {index}"))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Program;
+    use sims_formats::saved_objects::{Interaction, Person};
+
+    fn test_person(id: u16, guid: u32, family: i16, selected: bool) -> sims_sim::Object {
+        let idle = Interaction {
+            join: 0,
+            uid: 0,
+            caller: 0,
+            target: 0,
+            icon: 0,
+            table_index: -1,
+            args: [0; 4],
+            priority: 0,
+            action: 0,
+            attenuation: 0.0,
+            flags: 0,
+        };
+        let mut data = vec![0; sims_sim::neighbors::PERSON_WORDS];
+        data[person::FAMILY] = family;
+        let person = Person {
+            animation_events: 0,
+            engaged: 0,
+            appearance: Default::default(),
+            accessories: Vec::new(),
+            animations: Default::default(),
+            routing_state: 0,
+            floats: [0.0; 9],
+            previous_motives: [0.0; 16],
+            motives: [0.0; 16],
+            data,
+            routing_frames: 0,
+            active: idle.clone(),
+            last: idle,
+            queue: Vec::new(),
+            object_uses: Vec::new(),
+            motive_deltas: Vec::new(),
+        };
+        sims_sim::Object {
+            id,
+            guid,
+            footprint: [0; 4],
+            position: [0; 3],
+            unknown_short: 0,
+            attributes: Vec::new(),
+            temps: Vec::new(),
+            data: vec![0; 128],
+            obsolete_word: 0,
+            stack_capacity_bytes: 0,
+            stack: Vec::new(),
+            relationship_flag: 0,
+            relationships: Vec::new(),
+            slots: Vec::new(),
+            dynamic_sprites: Vec::new(),
+            multipart: None,
+            portal: None,
+            person: Some(person),
+            registry_word: None,
+            last_result: false,
+            removal_skips_resets: false,
+            selected,
+        }
+    }
+
+    fn neighbor(
+        id: i16,
+        guid: u32,
+        family: i16,
+        rows: &[(i32, i32)],
+    ) -> sims_sim::neighbors::Neighbor {
+        let mut data = vec![0; sims_sim::neighbors::PERSON_WORDS];
+        data[person::FAMILY] = family;
+        sims_sim::neighbors::Neighbor {
+            id,
+            guid,
+            revision: 1,
+            data,
+            relationships: rows
+                .iter()
+                .map(|&(target, daily)| sims_sim::neighbors::Row {
+                    target,
+                    values: vec![daily, 0, 0, 0],
+                })
+                .collect(),
+            friends: 0,
+            stale: false,
+        }
+    }
+
+    #[test]
+    fn refresh_family_panel_updates_selected_sims_family_cache_on_community_lots() {
+        use sims_content::Catalog;
+        use std::collections::BTreeMap;
+        let program = Program {
+            global: 0,
+            libraries: BTreeMap::new(),
+            semi_globals: BTreeMap::new(),
+            careers: None,
+            career_texts_end: false,
+            labels_hold_no_token: false,
+            zoning: BTreeMap::from([(5, 1), (7, 2)]),
+            animations: Default::default(),
+            people: Default::default(),
+            icon_frames: None,
+            wardrobe: None,
+            character_files: Default::default(),
+            expansions: 0,
+            characters: Default::default(),
+        };
+        let catalog = Catalog {
+            global: 0,
+            objects: Vec::new(),
+            by_guid: BTreeMap::new(),
+            semi_globals: BTreeMap::new(),
+            diagnostics: Vec::new(),
+        };
+        let mut world = World::empty();
+        world.globals.resize(16, 0);
+        world.globals[FAMILY] = 1;
+        world.globals[LOT] = 7; // community lot
+        world.families.push(sims_sim::neighbors::Family {
+            id: 1,
+            house: 5,
+            members: vec![100],
+            friends: 0,
+            stale: true,
+        });
+        world.families.push(sims_sim::neighbors::Family {
+            id: 2,
+            house: 9,
+            members: vec![200],
+            friends: 0,
+            stale: true,
+        });
+        world.neighbors.slots = vec![
+            Some(neighbor(1, 100, 1, &[(3, 80)])),
+            Some(neighbor(2, 200, 2, &[(3, 80)])),
+            Some(neighbor(3, 300, 3, &[(1, 80), (2, 80)])),
+        ];
+        world.objects.insert(10, test_person(10, 200, 2, true));
+        world.order.push(10);
+        world.people.push(10);
+
+        let interpreter = Interpreter::new(&program, &catalog, crate::Stream::Lot);
+        interpreter.refresh_family_panel(&mut world);
+
+        // On community lot 7, 0x4cfcdb refreshes the selected Sim's family (2),
+        // clearing its stale flag and caching its count, while leaving global 9's
+        // family (1) stale and untouched.
+        assert!(world.families[0].stale);
+        assert_eq!(world.families[0].friends, 0);
+        assert!(!world.families[1].stale);
+        assert_eq!(world.families[1].friends, 1);
+
+        // Switching to residential lot 5 refreshes global 9's family (1).
+        world.globals[LOT] = 5;
+        interpreter.refresh_family_panel(&mut world);
+        assert!(!world.families[0].stale);
+        assert_eq!(world.families[0].friends, 1);
+    }
 }
