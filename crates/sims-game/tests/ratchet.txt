@@ -29,11 +29,11 @@ walls = down
 paused = yes
 strip = no
 original = near-r2-0712-bench.ppm e98009dc08b82ded9c9b3a6cf2f326da330d7c2a5aa1463b87c55ae39f309b8d
-ours = 8d358dbc2a806cf5e3cb92be68e7e1007ead2059b7575fd30ba62e12b33b8a9e
+ours = a3269913cfeb11403d0893d1677ff689e13af3301ad8017fe3fce9a476f449ce
 leave_out = 302 19 501 79 the original's pause notice, drawn for the screenshot; ours draws none
 leave_out = 388 142 414 204 the plumb bob, which spins
 leave_out = 748 88 800 195 the fish tank, whose fish swim
-floors = frame 98.78 surface 99.67 objects 99.65 people 17.16 panel 97.33
+floors = frame 99.00 surface 99.67 objects 99.65 people 17.16 panel 99.76
 
 [near-r2-0805]
 about = 8:05 AM, paused. Mortimer stands by the stairs, Bella sits on the sofa; walls down. Scroll (280, -2004).
@@ -46,11 +46,11 @@ walls = down
 paused = yes
 strip = no
 original = near-r2-0805.ppm 79d158bc9f10d5eb633c5e433656266cd55bc6de45c4b7ff2b75af9f75384704
-ours = cd9fb1f2eff9eabd55a7219b0ca05831efcfe7a886048fc7c29dadf7bfdd0f12
+ours = 6d48964fdf68631b7670552c8dc2b2c82d4e078769136e504088f97dcceadd29
 leave_out = 302 19 501 79 the original's pause notice, drawn for the screenshot; ours draws none
 leave_out = 424 106 450 166 the plumb bob, which spins
 leave_out = 440 100 508 212 the fish tank, whose fish swim
-floors = frame 98.13 surface 99.55 objects 99.79 people 14.13 panel 97.28
+floors = frame 98.37 surface 99.55 objects 99.79 people 14.13 panel 99.82
 
 [far-r0-cut-0816]
 about = 8:16 AM, paused. The whole lot from the front; the school bus and the carpool are at the curb; cutaway walls. Scroll (368, -130).
@@ -63,11 +63,11 @@ walls = cutaway
 paused = yes
 strip = no
 original = far-r0-cut-0816.ppm aa699b1e5e05f380dfe92aa7d4d9f9e6b46280a7f35023de67663735e5fd0284
-ours = accd1497b952f27259a1ed00ed7202073464d65625e74fc6eff97adef574b57f
+ours = 6ce31612828c4a75d87e7d9202a974c35522fb8c525d411b46f5b76e929727fd
 leave_out = 302 19 501 79 the original's pause notice, drawn for the screenshot; ours draws none
 leave_out = 86 554 98 565 the panel's pause button, which blinks while paused
 leave_out = 414 308 432 345 the plumb bob, which spins (the original's and ours)
-floors = frame 99.30 surface 99.60 objects 99.13 people 1.07 panel 97.50
+floors = frame 99.52 surface 99.60 objects 99.13 people 1.07 panel 99.88
 
 [far-r1-cut-0816]
 about = 8:16 AM, paused. The whole lot turned once; cutaway walls. Scroll (284, -203).
@@ -80,12 +80,12 @@ walls = cutaway
 paused = yes
 strip = no
 original = far-r1-cut-0816.ppm 14bab6892f135bae298bb9580fb9d281c4e19e093c9cb3200fe25c8e8cf33ad0
-ours = d64b8e0ecd624afc52d54a91c4b01922d973329c82f7fc0a299cd34441ec2107
+ours = 09e8aaa1b18899e2cbbbf64523627b53b2277e0348be36cf1ea4d3a86725ec14
 leave_out = 302 19 501 79 the original's pause notice, drawn for the screenshot; ours draws none
 leave_out = 86 554 98 565 the panel's pause button, which blinks while paused
 leave_out = 228 254 246 276 the plumb bob, which spins
 leave_out = 260 254 278 276 the plumb bob, which spins
-floors = frame 99.01 surface 99.32 objects 99.17 people 0.74 panel 96.62
+floors = frame 99.22 surface 99.32 objects 99.17 people 0.74 panel 98.97
 
 [medium-r1-cut-0816]
 about = 8:16 AM, paused. The front porch and a Sim walking on the lawn; cutaway walls. Scroll (168, -706).
@@ -98,12 +98,12 @@ walls = cutaway
 paused = yes
 strip = no
 original = medium-r1-cut-0816.ppm 079e12ab280b58a7f312cb70a7ad4e7a391cd03e76a2576c627991eb3e8029be
-ours = 79b1ab8eb80731ca8e35801f853ebce7fc22e99d873a512166d45f8baad6f49b
+ours = 12d871d2563e2c9d27cb66859568abca76892c9e84adf9a21fe89ed23f426d9b
 leave_out = 302 19 501 79 the original's pause notice, drawn for the screenshot; ours draws none
 leave_out = 86 554 98 565 the panel's pause button, which blinks while paused
 leave_out = 64 212 84 248 the plumb bob, which spins
 leave_out = 126 210 146 248 the plumb bob, which spins
-floors = frame 99.27 surface 99.66 objects 99.97 people 1.60 panel 97.50
+floors = frame 99.48 surface 99.66 objects 99.97 people 1.60 panel 99.87
 
 [near-r3-down-0816]
 about = 8:16 AM, paused. Indoors: the kitchen and the bathroom, the patio table and the fountain; walls down. Scroll (1760, -1968).
@@ -116,11 +116,11 @@ walls = down
 paused = yes
 strip = no
 original = near-r3-down-0816.ppm f4e0c19091303a8529ed8fb57b17d4f32ec7ea688d5966dabbd9e9e57ba6873a
-ours = a482e452a31d8c0deb66fcea3095bd0df5998bd3ba3f4f2f1049b70f9e7d26bd
+ours = fa42df8349268e66be59a4cdde739a02bcc984f8ad9c6f637afe33d5fb647ff5
 leave_out = 302 19 501 79 the original's pause notice, drawn for the screenshot; ours draws none
 leave_out = 86 554 98 565 the panel's pause button, which blinks while paused
 leave_out = 0 100 78 258 the fountain, whose water runs
-floors = frame 98.10 surface 99.58 objects 94.46 panel 97.50
+floors = frame 98.32 surface 99.58 objects 94.46 panel 99.88
 
 [near-r0-up-0816]
 about = 8:16 AM, paused. The house's side with walls up: windows, the front door, the hall and the stairs. Scroll (1036, -970).
@@ -133,11 +133,11 @@ walls = up
 paused = yes
 strip = no
 original = near-r0-up-0816.ppm 4d665ddf77d21df7cf27850c9f90006ab4b6af60f541d1f14803421f53567a6c
-ours = 95124d903c5aab4c15e9ee9c1c233e6783c45f6f61888d3fe39ff7cd4314c497
+ours = c147c0d586483b99cc341a0d87bf22a562eec5547ffde591c01b1ae190369f5d
 leave_out = 302 19 501 79 the original's pause notice, drawn for the screenshot; ours draws none
 leave_out = 86 554 98 565 the panel's pause button, which blinks while paused
 leave_out = 490 0 576 106 the fountain, whose water runs
-floors = frame 99.29 surface 99.34 objects 99.93 panel 97.50
+floors = frame 99.51 surface 99.34 objects 99.93 panel 99.88
 
 [night-far-r0-cut-2153]
 about = 9:53 PM, paused. The whole lot at night; cutaway walls. Scroll (528, -16).
@@ -150,10 +150,10 @@ walls = cutaway
 paused = yes
 strip = no
 original = night-far-r0-cut-2153.ppm 38a2f43c0e0c41e118ad39e6d5e2ca4becd590d57ef09fce5622f37957b26458
-ours = 3d883a6dde76ac9d3ce3afcbb82382c68b5866eff5e81a13e6177cb50e5f5fd9
+ours = d90ebb9c732a985dee7e4ec7504b1419c2aa882a4047682f00b1747f5e9e8c91
 leave_out = 302 19 501 79 the original's pause notice, drawn for the screenshot; ours draws none
 leave_out = 86 554 98 565 the panel's pause button, which blinks while paused
 leave_out = 442 306 458 332 the plumb bob, which spins
 leave_out = 272 228 662 442 the house: the live run had a kitchen fire that ours does not (the run, not the drawing)
 leave_out = 32 30 80 80 the tab over the lot, which shows what the run's Sim is doing
-floors = frame 99.30 surface 99.78 objects 96.61 panel 96.97
+floors = frame 99.54 surface 99.78 objects 96.61 panel 99.19

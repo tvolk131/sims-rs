@@ -2,6 +2,44 @@
 //! and `cargo test` can check it.
 
 use sims_formats::bitmap::Image;
+use std::sync::OnceLock;
+
+/// The original's 32x32x32 5-bit alpha blend table (`0x6e5eac`, built once
+/// at `0x49a315`), shared by 16-bit 565 alpha sprites (`0x4986c6`) and
+/// antialiased font glyphs (`0x4999ea`). Each entry averages the 8x8x8
+/// 8-bit sub-bucket `d + (s - d) * (a / 255.0f)` and keeps the top 5 bits.
+fn blend_table() -> &'static [u8; 32_768] {
+    static TABLE: OnceLock<Box<[u8; 32_768]>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = vec![0u8; 32_768].into_boxed_slice();
+        let inv255 = f64::from(f32::from_bits(0x3b80_8081)); // 0x6682d8 (1.0f / 255.0f)
+        let inv512 = f64::from(f32::from_bits(0x3b00_0000)); // 0x6682d4 (1.0f / 512.0f)
+        for d5 in 0..32usize {
+            for s5 in 0..32usize {
+                for a5 in 0..32usize {
+                    let mut sum = 0.0f64;
+                    for dd in 0..8usize {
+                        let d = (d5 * 8 + dd) as i32;
+                        for ds in 0..8usize {
+                            let diff = (s5 * 8 + ds) as i32 - d;
+                            for da in 0..8usize {
+                                let a = (a5 * 8 + da) as i32;
+                                let v = (f64::from(d)
+                                    + f64::from(diff) * (f64::from(a) * inv255)
+                                    + 0.5)
+                                    .trunc() as i32;
+                                sum += f64::from(v & 0xff);
+                            }
+                        }
+                    }
+                    let avg = (sum * inv512 + 0.5).trunc() as i32;
+                    table[(a5 << 10) | (s5 << 5) | d5] = (avg >> 3) as u8;
+                }
+            }
+        }
+        table.try_into().expect("32768-byte blend table")
+    })
+}
 
 /// A rectangle in pixels. Width and height are never negative.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -105,20 +143,34 @@ impl Frame {
         self.index(x, y).map(|i| self.rgb[i])
     }
 
-    /// Blends `rgb` over one pixel with coverage `alpha` (255 opaque).
+    /// Blends `rgb` over one pixel with coverage `alpha` (255 opaque),
+    /// matching the original's 16-bit 565 alpha blender (`0x4986c6` for
+    /// sprites, `0x4999ea` for fonts): `alpha <= 7` is skipped,
+    /// `alpha >= 248` copies `rgb` opaquely, and `8..=247` looks up each
+    /// 5-bit channel in [`blend_table`] (`0x6e5eac`) and widens
+    /// `(r5 << 11) | (g5 << 6) | b5` back to 8-bit RGB.
     pub fn blend(&mut self, x: i32, y: i32, rgb: [u8; 3], alpha: u8) {
         let Some(i) = self.index(x, y) else {
             return;
         };
         let pixel = &mut self.rgb[i];
-        if alpha == 255 {
-            *pixel = rgb;
-        } else if alpha > 0 {
-            let a = u32::from(alpha);
-            for (c, s) in pixel.iter_mut().zip(rgb) {
-                *c = ((u32::from(s) * a + u32::from(*c) * (255 - a) + 127) / 255) as u8;
-            }
+        if alpha <= 7 {
+            return;
         }
+        if alpha >= 248 {
+            *pixel = rgb;
+            return;
+        }
+        let table = blend_table();
+        let a5 = usize::from(alpha >> 3) << 10;
+        let r5 = table[a5 | (usize::from(rgb[0] >> 3) << 5) | usize::from(pixel[0] >> 3)];
+        let g5 = table[a5 | (usize::from(rgb[1] >> 3) << 5) | usize::from(pixel[1] >> 3)];
+        let b5 = table[a5 | (usize::from(rgb[2] >> 3) << 5) | usize::from(pixel[2] >> 3)];
+        *pixel = [
+            (r5 << 3) | (r5 >> 2),
+            (g5 << 3) | (g5 >> 3),
+            (b5 << 3) | (b5 >> 2),
+        ];
     }
 
     /// Fills `rect` (clipped to the frame) with `rgb`.
@@ -303,7 +355,7 @@ mod tests {
         );
         f.draw_all(&im, [2, 0]);
         assert_eq!(f.pixel(2, 0), Some([255, 0, 0]));
-        assert_eq!(f.pixel(2, 1), Some([0, 128, 0]));
+        assert_eq!(f.pixel(2, 1), Some([0, 130, 0]));
         // Outside the image or the frame: nothing happens, nothing panics.
         f.draw(&im, Rect::new(-5, -5, 50, 50), [-100, 1000]);
         f.draw(
@@ -313,6 +365,26 @@ mod tests {
         );
         f.fill(Rect::new(i32::MAX - 1, 0, i32::MAX, 5), [1, 1, 1]);
         assert_eq!(f.pixel(0, 0), Some([0, 0, 0]));
+    }
+
+    #[test]
+    fn blend_thresholds_and_565_table_match_original() {
+        let mut f = Frame::new(5, 1, [40, 80, 120]);
+        // alpha <= 7 is skipped (0x498766, 0x499a7a).
+        f.blend(0, 0, [255, 255, 255], 7);
+        assert_eq!(f.pixel(0, 0), Some([40, 80, 120]));
+        // alpha >= 248 copies rgb opaquely.
+        f.blend(1, 0, [11, 22, 33], 248);
+        assert_eq!(f.pixel(1, 0), Some([11, 22, 33]));
+        // 8..=247 looks up the 32x32x32 table and widens (r5<<11)|(g5<<6)|b5.
+        f.fill(Rect::new(2, 0, 3, 1), [0, 0, 0]);
+        f.blend(2, 0, [255, 255, 255], 128);
+        // a5=16, s5=31, d5=0 -> table entry 16 -> r=132, g=130 (g6=32), b=132.
+        assert_eq!(f.pixel(2, 0), Some([132, 130, 132]));
+        f.blend(3, 0, [255, 255, 255], 8);
+        assert_ne!(f.pixel(3, 0), Some([0, 0, 0]));
+        f.blend(4, 0, [255, 255, 255], 247);
+        assert_eq!(f.pixel(4, 0), Some([247, 243, 247]));
     }
 
     #[test]
