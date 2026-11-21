@@ -104,12 +104,20 @@ panel, and `sims-vm` had no `"Tile Cursor"` creation or Buy placement tool.
     (`USER_PICKUP`, `0x435751` / `0x422ff5`), detaches the purchased object
     off-lot while keeping it registered, and refunds its price (`0x48bdbd`);
     Redo (keyboard event `0xed` at `0x4a856a` → `0x493338` → `0x48bdfe`) reuses
-    that detached instance (`0x48c07b..0x48c082`), invokes `USER_PICKUP`
-    (`0x48bfcb`), places it, runs `USER_PLACEMENT`, and re-charges it; both
-    keyboard handlers keep any armed placement preview and catalog selection
-    intact while refreshing preview validity. Leaving a non-Live mode or
-    discarding history on a failed/errored Undo/Redo clears the stack and
-    deletes detached off-lot instances (`0x4cea5d` → `0x4933dc` → `0x48c20e`). Note that on-screen Undo/Redo buttons (`kToolBtnUndo = 64` at
+    that detached instance (`0x48c07b..0x48c082`), invokes `UserPickup(0)`
+    (`0x48bfcb` → OBJf 12 + take-off `0x435835` → OBJf 10 `LEAVING`), checks
+    tile-centred placement (`0x4355bc..0x4355cd`), places it, runs
+    `USER_PLACEMENT`, and re-charges it. When `0x48c053` refuses placement for
+    a purchase with no subactions (such as an awning whose `update` set
+    `data[13] = 4` on open lawn, or an unsnapped coordinate), `0x48bdfe` line
+    `0x48be72` skips the charge and returns `0`, so `0x493353` transfers the
+    refused entry to Undo while preserving remaining Redo entries. Both
+    keyboard handlers keep any armed placement preview, manual surface
+    rotation, and catalog selection intact while refreshing preview validity.
+    Leaving a non-Live mode or discarding history on an Undo/Redo fault clears
+    the stack and deletes detached off-lot instances (`0x4cea5d` → `0x4933dc` →
+    `0x48c20e`), tracking any unpurgeable detached instances so `Lot::save`
+    never silently serializes them. Note that on-screen Undo/Redo buttons (`kToolBtnUndo = 64` at
     `(231, 21)`, `kToolBtnRedo = 65` at `(231, 53)`, `0x5004f5` / `0x500f87` /
     `0x501197`) belong exclusively to Build Mode (`mode == 0` in `0x50a8ec`);
     Buy Mode (`cWinCatalog`, `mode == 1`, `0x5050e4` / `0x507288`) has no

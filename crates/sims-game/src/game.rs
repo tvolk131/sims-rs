@@ -1681,7 +1681,8 @@ impl Game {
         }
         self.buy_dragging = None;
         let saved_cursor = if let Some(mut cursor) = self.buy_cursor.take() {
-            let saved_pos = (cursor.position[0] >= 0).then_some(cursor.position);
+            let saved_pos =
+                (cursor.position[0] >= 0).then_some((cursor.position, cursor.container));
             if saved_pos.is_some()
                 && let Err(e) = self.lot.buy_hide(&mut cursor)
             {
@@ -1699,10 +1700,21 @@ impl Game {
             self.lot.buy_redo()
         };
         if let Some((mut cursor, saved_pos)) = saved_cursor {
-            if let Some([x, y, level]) = saved_pos
-                && let Err(e) = self.lot.buy_move(&mut cursor, [x, y], level)
-            {
-                self.note = Some(format!("Could not restore Buy preview: {e}"));
+            if let Some(([x, y, level], saved_container)) = saved_pos {
+                // Preserve the surface container (if still on-lot) before
+                // re-running `buy_move` so unrelated Undo/Redo does not
+                // discard a manual rotation on a surface (`0x421e72`).
+                cursor.position = [x, y, level];
+                cursor.container = saved_container.filter(|(cid, _)| {
+                    self.lot
+                        .world()
+                        .objects
+                        .get(cid)
+                        .is_some_and(|o| o.position[0] >= 0)
+                });
+                if let Err(e) = self.lot.buy_move(&mut cursor, [x, y], level) {
+                    self.note = Some(format!("Could not restore Buy preview: {e}"));
+                }
             }
             self.buy_cursor = Some(cursor);
         }

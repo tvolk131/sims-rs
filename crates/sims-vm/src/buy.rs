@@ -103,6 +103,10 @@ pub struct BuyPurchase {
     pub price: i32,
     /// Budget category charged/refunded (`6` Buy, `7` Build, `0x48bdbd`).
     pub budget_category: u8,
+    /// Whether this record currently holds a paid, on-lot placement (`true`
+    /// after commit or successful Redo; `false` after Undo or after a refused
+    /// Redo transferred to Undo via `0x48be72` → `0x493353`).
+    pub placed: bool,
 }
 
 /// Default facing direction for a newly purchased object at camera rotation
@@ -524,6 +528,7 @@ impl Interpreter<'_> {
             container: cursor.container,
             price: cursor.price,
             budget_category: cursor.budget_category,
+            placed: true,
         })
     }
 
@@ -537,18 +542,27 @@ impl Interpreter<'_> {
     /// (`USER_PICKUP`) on the object (and every group tile / held child),
     /// takes it off the lot while keeping the instance registered for Redo,
     /// and refunds `purchase.price` to household funds and today's budget
-    /// category. Returns `Ok(false)` if the purchased object is missing or
-    /// already off the lot.
+    /// category when `purchase.placed` is true. If `purchase.placed` is false
+    /// (a record transferred to Undo after a refused Redo at `0x48be72`),
+    /// steps back without double-refunding. Returns `Ok(false)` if a placed
+    /// object is missing or already off the lot.
     pub fn buy_undo_purchase(
         &self,
         world: &mut World,
-        purchase: &BuyPurchase,
+        purchase: &mut BuyPurchase,
     ) -> Result<bool, Fault> {
         let fail = |trap| Fault {
             object: purchase.object,
             at: None,
             trap,
         };
+        if !purchase.placed {
+            if world.objects.contains_key(&purchase.object) {
+                self.run_user_pickup(world, purchase.object)?;
+                self.take_off(world, purchase.object, true)?;
+            }
+            return Ok(true);
+        }
         let Some(obj) = world.objects.get(&purchase.object) else {
             return Ok(false);
         };
@@ -558,6 +572,7 @@ impl Interpreter<'_> {
         self.run_user_pickup(world, purchase.object)?;
         self.take_off(world, purchase.object, true)?;
         spend(world, purchase.budget_category, -purchase.price).map_err(fail)?;
+        purchase.placed = false;
         Ok(true)
     }
 
@@ -600,14 +615,22 @@ impl Interpreter<'_> {
             at: None,
             trap,
         };
-        // Native `0x48bfab` line `0x48bfcb`: invoke `UserPickup(0)` (OBJf 12)
+        // Native `0x48bfab` line `0x48bfcb`: invoke `UserPickup(0)` (`0x435751`
+        // / `0x422ff5` -> OBJf 12 + take-off `0x435835` -> OBJf 10 `LEAVING`)
         // on the instance before rotating or testing placement.
         self.run_user_pickup(world, id)?;
+        self.take_off(world, id, true)?;
         self.rotate_object_to(world, id, purchase.facing)?;
-        let fits = match purchase.container {
-            Some((cid, slot)) => self.fits_in(world, id, cid, i32::from(slot), [x, y], level)?,
-            None => self.place_test(world, id, [x, y], level)?.is_ok(),
-        };
+        // Native `UserTestPlace` (`0x435522` lines `0x4355bc..0x4355cd`)
+        // requires tile-centred coordinates (`(x & 0xf) == 8 && (y & 0xf) == 8`).
+        let tile_centred = (x & 0x0f) == 8 && (y & 0x0f) == 8;
+        let fits = tile_centred
+            && match purchase.container {
+                Some((cid, slot)) => {
+                    self.fits_in(world, id, cid, i32::from(slot), [x, y], level)?
+                }
+                None => self.place_test(world, id, [x, y], level)?.is_ok(),
+            };
         if !fits {
             if created_fresh {
                 self.remove_now(world, id)?;
@@ -625,6 +648,7 @@ impl Interpreter<'_> {
         self.run_user_placement(world, id)?;
         spend(world, purchase.budget_category, purchase.price).map_err(fail)?;
         purchase.object = id;
+        purchase.placed = true;
         Ok(true)
     }
 

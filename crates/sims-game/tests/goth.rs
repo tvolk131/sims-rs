@@ -5555,11 +5555,50 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
 
     // Unsnapped retry (`0x485f23` -> `0x421e72`): Werkbunnst Chair collides
     // with object 121 at snapped `[296, 424]` but fits at unsnapped `[292, 431]`.
+    // Committing, undoing, and redoing at unsnapped `[292, 431]` must reject
+    // Redo (`0x4355bc..0x4355cd` requires low nibbles == 8) without charging.
     let mut unsnapped = lot.buy_start(0x26bf_bb29, 1, 2).unwrap().unwrap();
     assert!(lot.buy_move(&mut unsnapped, [292, 431], 1).unwrap());
     assert_eq!(unsnapped.position, [292, 431, 1]);
     assert_eq!(lot.world().objects[&unsnapped.held].position, [292, 431, 1]);
-    lot.buy_cancel(&unsnapped).unwrap();
+    let funds_before_unsnapped = lot.world().budget.funds;
+    let unsnapped_id = lot.buy_commit(&unsnapped).unwrap();
+    assert_eq!(lot.world().budget.funds, funds_before_unsnapped - 80);
+    assert!(lot.buy_undo().unwrap());
+    assert_eq!(lot.world().budget.funds, funds_before_unsnapped);
+    assert!(lot.world().objects[&unsnapped_id].position[0] < 0);
+    assert!(!lot.buy_redo().unwrap());
+    assert_eq!(lot.world().budget.funds, funds_before_unsnapped);
+    assert!(lot.world().objects[&unsnapped_id].position[0] < 0);
+
+    // Awning placement refusal (`0x48bdfe` line `0x48be72` -> `0x493353`):
+    // buying Scrimpon Crimson Awnings (`0xefba77ca`) on open lawn `[584, 472]`
+    // then a Werkbunnst Chair at `[552, 472]`, undoing both, and redoing must
+    // transfer the refused awning record to Undo without charging while
+    // keeping the chair available for the next Redo.
+    if catalog.get(0xefba_77ca).is_some() {
+        let mut awn = lot.buy_start(0xefba_77ca, 1, 2).unwrap().unwrap();
+        assert!(lot.buy_move(&mut awn, [584, 472], 1).unwrap());
+        let awn_id = lot.buy_commit(&awn).unwrap();
+        let mut ch = lot.buy_start(0x26bf_bb29, 1, 2).unwrap().unwrap();
+        assert!(lot.buy_move(&mut ch, [552, 472], 1).unwrap());
+        let ch_id = lot.buy_commit(&ch).unwrap();
+        assert!(lot.buy_undo().unwrap());
+        assert!(lot.buy_undo().unwrap());
+        let funds_after_undos = lot.world().budget.funds;
+        // First redo pops the awning: refused (data[13] == 4 on open lawn),
+        // not charged, transferred to Undo, leaving the chair on Redo.
+        assert!(!lot.buy_redo().unwrap());
+        assert_eq!(lot.world().budget.funds, funds_after_undos);
+        assert!(lot.world().objects[&awn_id].position[0] < 0);
+        assert!(lot.can_buy_redo());
+        // Second redo restores the chair and re-charges $80.
+        assert!(lot.buy_redo().unwrap());
+        assert_eq!(lot.world().budget.funds, funds_after_undos - 80);
+        assert!(lot.world().objects[&ch_id].position[0] >= 0);
+        // Clean up the chair back to undo/redo off-lot so the test continues cleanly.
+        assert!(lot.buy_undo().unwrap());
+    }
 
     // Wall-mounted auto-rotation (`0x48736b` + `0x43583e`): Narcisco Wall
     // Mirror fails at facing 2 at `[264, 504]` and auto-rotates to facing 4.
@@ -5740,6 +5779,46 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
     assert_eq!(game.lot().world().objects.len(), objs_before + 1);
     let funds_after_buy = game.lot().world().budget.funds;
     assert_eq!(funds_after_buy, 2542 - 80);
+
+    // Unrelated Undo while holding a manually rotated surface item (`0x421e72`):
+    // click Back (`[234, 550]`), Lighting (`[337, 570]`), and slot 0
+    // (Gloominator Desk Lamp, $85), hover over the surface at `[381, 190]`,
+    // rotate manually, undo the lawn chair, and verify the lamp stays armed on
+    // the surface with its manual facing intact.
+    game.press([234, 550]); // Back from Seating to top-level categories
+    game.release([234, 550]);
+    game.press([337, 570]); // Lighting (cat 6 -> sub 0 Table Lamps)
+    game.release([337, 570]);
+    game.press([437, 523]); // Slot 0: Gloominator Desk Lamp ($85)
+    game.release([437, 523]);
+    assert_eq!(game.buy_selected(), Some(lamp.guid));
+    game.hover([381, 190]);
+    let lamp_cur = game.buy_cursor().expect("lamp cursor active").clone();
+    assert!(lamp_cur.valid && lamp_cur.container.is_some());
+    let before_dir = game.lot().world().objects[&lamp_cur.held].data[1];
+    assert!(game.rotate_held(true));
+    let manual_dir = game.lot().world().objects[&lamp_cur.held].data[1];
+    assert_ne!(manual_dir, before_dir);
+    // Undo the unrelated lawn chair purchase: lamp stays armed on the surface
+    // and keeps `manual_dir`.
+    assert!(game.undo_buy());
+    let after_undo = game.buy_cursor().expect("lamp stays armed").clone();
+    assert!(after_undo.valid);
+    assert_eq!(after_undo.container, lamp_cur.container);
+    assert_eq!(
+        game.lot().world().objects[&after_undo.held].data[1],
+        manual_dir
+    );
+    // Redo the lawn chair purchase: lamp still keeps `manual_dir`.
+    assert!(game.redo_buy());
+    let after_redo = game.buy_cursor().expect("lamp stays armed").clone();
+    assert!(after_redo.valid);
+    assert_eq!(after_redo.container, lamp_cur.container);
+    assert_eq!(
+        game.lot().world().objects[&after_redo.held].data[1],
+        manual_dir
+    );
+    game.cancel_buy();
 
     // Undo / Redo after cancelling the repeat preview, plus leaving Buy Mode
     // deleting the detached instance (`0x4cea5d` -> `0x4933dc` -> `0x48c20e`).

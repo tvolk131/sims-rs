@@ -248,6 +248,9 @@ pub struct Lot {
     buy_undo: Vec<crate::BuyPurchase>,
     /// Undone Buy Mode purchases available for Redo (`0x493338`).
     buy_redo: Vec<crate::BuyPurchase>,
+    /// Detached Buy Mode objects whose history cleanup (`0x48c20e`) faulted,
+    /// tracked so [`Lot::save`] and mode switches never leak them silently.
+    buy_orphans: Vec<crate::BuyPurchase>,
 }
 
 /// A dialog the lot waits on ([`Lot::asking`]). The tick that showed it
@@ -928,6 +931,7 @@ impl Lot {
             loaded,
             buy_undo: Vec::new(),
             buy_redo: Vec::new(),
+            buy_orphans: Vec::new(),
         })
     }
 
@@ -1408,6 +1412,9 @@ impl Lot {
             interpreter
                 .buy_purge_detached(&mut world, &self.buy_undo)
                 .map_err(OrderError::Refused)?;
+            interpreter
+                .buy_purge_detached(&mut world, &self.buy_orphans)
+                .map_err(OrderError::Refused)?;
         }
         interpreter
             .set_mode(&mut world, mode)
@@ -1416,6 +1423,7 @@ impl Lot {
         if clearing {
             self.buy_undo.clear();
             self.buy_redo.clear();
+            self.buy_orphans.clear();
         }
         Ok(())
     }
@@ -1559,8 +1567,9 @@ impl Lot {
     }
 
     /// Deletes any detached (off-lot) instances referenced by `dropped` from
-    /// `self.world` one by one (`0x48c20e` / `0x48c258`), so clearing history
-    /// on failure or error never leaves orphaned off-lot objects behind.
+    /// `self.world` one by one (`0x48c20e` / `0x48c258`). Any still-registered
+    /// off-lot instance whose deletion faults is retained in `self.buy_orphans`
+    /// so [`Lot::save`] never silently serializes a detached object.
     fn purge_buy_history(&mut self, dropped: &[crate::BuyPurchase]) {
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
@@ -1571,11 +1580,19 @@ impl Lot {
         };
         for purchase in dropped {
             let mut next = self.world.clone();
-            if interpreter
-                .buy_purge_detached(&mut next, std::slice::from_ref(purchase))
-                .is_ok()
-            {
-                self.world = next;
+            match interpreter.buy_purge_detached(&mut next, std::slice::from_ref(purchase)) {
+                Ok(()) => self.world = next,
+                Err(_) => {
+                    if self
+                        .world
+                        .objects
+                        .get(&purchase.object)
+                        .is_some_and(|o| o.position[0] < 0)
+                        && !self.buy_orphans.iter().any(|p| p.object == purchase.object)
+                    {
+                        self.buy_orphans.push(purchase.clone());
+                    }
+                }
             }
         }
     }
@@ -1589,7 +1606,7 @@ impl Lot {
     /// top record could not be applied, matching `0x4932fa` → `0x493376`).
     pub fn buy_undo(&mut self) -> Result<bool, OrderError> {
         self.ready()?;
-        let Some(purchase) = self.buy_undo.pop() else {
+        let Some(mut purchase) = self.buy_undo.pop() else {
             return Ok(false);
         };
         let sounds = RefCell::new(Vec::new());
@@ -1600,7 +1617,7 @@ impl Lot {
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
-        match interpreter.buy_undo_purchase(&mut world, &purchase) {
+        match interpreter.buy_undo_purchase(&mut world, &mut purchase) {
             Ok(true) => {
                 self.world = world;
                 self.buy_redo.push(purchase);
@@ -1649,9 +1666,13 @@ impl Lot {
                 Ok(true)
             }
             Ok(false) => {
-                let mut dropped = std::mem::take(&mut self.buy_redo);
-                dropped.push(purchase);
-                self.purge_buy_history(&dropped);
+                // Native `0x48bdfe` line `0x48be72`: when `0x48c053` refuses
+                // placement for a purchase with no subactions, it skips the
+                // charge and leaves return status `0`, so `0x493353` transfers
+                // this record to Undo while leaving remaining Redo entries
+                // intact.
+                self.world = world;
+                self.buy_undo.push(purchase);
                 Ok(false)
             }
             Err(fault) => {
@@ -1900,6 +1921,7 @@ mod tests {
             loaded,
             buy_undo: Vec::new(),
             buy_redo: Vec::new(),
+            buy_orphans: Vec::new(),
         }
     }
 
