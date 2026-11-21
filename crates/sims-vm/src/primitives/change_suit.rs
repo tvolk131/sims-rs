@@ -54,16 +54,17 @@ impl Machine<'_, '_> {
             0 | 2 => {
                 let name = self.accessory_name(scope, index)?;
                 let program = self.program;
-                let accessories = &mut self
-                    .me_mut()?
-                    .person
-                    .as_mut()
-                    .ok_or(Trap::native(0x1c, "object is not a person"))?
-                    .accessories;
+                let me = self.me;
                 if off {
+                    let accessories = &mut self
+                        .me_mut()?
+                        .person
+                        .as_mut()
+                        .ok_or(Trap::native(0x1c, "object is not a person"))?
+                        .accessories;
                     undress(accessories, &name);
                 } else {
-                    put_on(&program.people, accessories, name)?;
+                    put_on(&program.people, self.world, me, name)?;
                 }
             }
             _ => return Err(Trap::native(0x2f, "invalid accessory string table")),
@@ -158,29 +159,43 @@ impl Machine<'_, '_> {
     }
 }
 
-/// Puts on accessory `name` (0x58d88f), looking it up in `people`'s
-/// suits. The lookup compares bytes exactly (0x5a25dc, 0x5a27f2). A miss
-/// fails if any avatar files stopped decoding, since they might name it.
-/// An empty name is not looked up (0x583569): it gets an unnamed entry.
+/// Puts on accessory `name` (`0x58d88f` → `0x58d903` → `0x583559` → `0x5a044d`),
+/// looking it up in `people`'s avatar registry in runtime `.ndx` load order.
+/// The lookup compares bytes exactly (`0x5a25dc`, `0x5a27f2`). A miss fails if
+/// any avatar files stopped decoding, since they might name it. An empty name
+/// is not looked up (`0x583569`): it gets an unnamed entry.
 pub(crate) fn put_on(
     people: &People,
-    accessories: &mut Vec<Accessory>,
+    world: &mut sims_sim::World,
+    id: u16,
     name: String,
 ) -> Result<(), Trap> {
-    let found = !name.is_empty() && people.suits.contains(&name);
-    let errors = &people.suit_errors;
-    if !found && !name.is_empty() && !errors.is_empty() {
-        return Err(Trap::Unsupported(format!(
-            "accessory {name:?} is put on, but no decoded avatar file names it. {} avatar \
-             files stopped decoding ({})",
-            errors.len(),
-            errors
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(", ")
-        )));
-    }
+    let found = if name.is_empty() {
+        false
+    } else {
+        match crate::people::resolve_suit_exists(people, world, &name) {
+            Some(found) => found,
+            None => {
+                let errors = &people.suit_errors;
+                return Err(Trap::Unsupported(format!(
+                    "accessory {name:?} is put on, but no decoded avatar file names it. {} avatar \
+                     files stopped decoding ({})",
+                    errors.len(),
+                    errors
+                        .keys()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+        }
+    };
+    let accessories = &mut world
+        .objects
+        .get_mut(&id)
+        .and_then(|o| o.person.as_mut())
+        .ok_or(Trap::native(0x1c, "object is not a person"))?
+        .accessories;
     dress(accessories, name, found);
     Ok(())
 }

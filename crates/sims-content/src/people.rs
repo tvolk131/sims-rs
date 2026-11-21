@@ -233,6 +233,7 @@ pub struct AvatarRegistry {
     suits: BTreeSet<String>,
     eager_suits: BTreeSet<String>,
     indexed_suits: BTreeMap<String, std::result::Result<String, String>>,
+    indexed_catalogs: BTreeMap<String, IndexedCatalog>,
     indexed_suit_catalogs: BTreeMap<String, IndexedSuitCatalog>,
     head_suits: BTreeSet<String>,
     suit_errors: BTreeMap<String, String>,
@@ -381,26 +382,26 @@ impl AvatarRegistry {
             }
         }
 
-        // Decode each referenced `.bcf` catalog once (keyed by resolved
-        // resource location so case/slash aliases share one decode) to capture
-        // EVERY appearance defined in that catalog for runtime sibling filling
-        // (`0x5a044d` → `0x5a38da` → `0x59f35f`), as well as confirming each
-        // indexed appearance in `suits` / `head_suits`.
+        // Decode every `.bcf` catalog referenced by EITHER an `.ndx` appearance
+        // OR an `.ndx` skeleton ONCE (keyed by resolved resource location) so
+        // runtime lazy loads (`0x5a0384` / `0x5a044d` → `0x59e60e` → `0x59f087`)
+        // populate BOTH skeletons and appearances from the same catalog.
         let mut mesh_cache: BTreeMap<String, bool> = BTreeMap::new();
         let mut indexed_suits: BTreeMap<String, std::result::Result<String, String>> =
             BTreeMap::new();
+        let mut indexed_catalogs: BTreeMap<String, IndexedCatalog> = BTreeMap::new();
         let mut indexed_suit_catalogs: BTreeMap<String, IndexedSuitCatalog> = BTreeMap::new();
-        let mut by_catalog: BTreeMap<String, (Resource, Vec<String>)> = BTreeMap::new();
+        let mut by_catalog: BTreeMap<String, (Resource, Vec<String>, bool)> = BTreeMap::new();
         for (name, (ndx_location, directory, catalog_bcf)) in indexed_suit_entries {
             match paths.files.lookup(&directory, &catalog_bcf) {
                 Ok(Some(resource)) => {
                     let location = resource.location(&install.root);
                     indexed_suits.insert(name.clone(), Ok(location.clone()));
-                    by_catalog
+                    let entry = by_catalog
                         .entry(location)
-                        .or_insert_with(|| (resource, Vec::new()))
-                        .1
-                        .push(name);
+                        .or_insert_with(|| (resource, Vec::new(), true));
+                    entry.1.push(name);
+                    entry.2 = true;
                 }
                 Ok(None) => {
                     let catalog_name = decode(&catalog_bcf, 1);
@@ -419,21 +420,60 @@ impl AvatarRegistry {
                 }
             }
         }
-        for (location, (resource, names)) in by_catalog {
+        for (_, entry) in skeletons.values() {
+            if let SkeletonEntry::Indexed {
+                directory,
+                catalog_bcf,
+                ..
+            } = entry
+                && let Ok(Some(resource)) = paths.files.lookup(directory, catalog_bcf)
+            {
+                let location = resource.location(&install.root);
+                by_catalog
+                    .entry(location)
+                    .or_insert_with(|| (resource, Vec::new(), false));
+            }
+        }
+        for (location, (resource, names, has_suit_refs)) in by_catalog {
             let bytes = match resource.read() {
                 Ok(bytes) => bytes,
                 Err(error) => {
                     let reason = error.to_string();
-                    suit_errors.insert(location.clone(), reason.clone());
+                    if has_suit_refs {
+                        suit_errors.insert(location.clone(), reason.clone());
+                    }
+                    indexed_catalogs.insert(location.clone(), (Vec::new(), Some(reason.clone())));
                     indexed_suit_catalogs.insert(location, (BTreeMap::new(), Some(reason)));
                     continue;
                 }
             };
             let mut binary = Binary::new(&bytes);
-            let (_, skeleton_error) = read_bcf_skeletons(&mut binary);
+            let (decoded_skels, skeleton_error) = read_bcf_skeletons(&mut binary);
+            let all_scales: Vec<Vec<i32>> =
+                decoded_skels.iter().map(|(_, s, _)| s.clone()).collect();
+            let catalog_skels = decoded_skels
+                .into_iter()
+                .enumerate()
+                .map(|(place, (skel_name, _, bones))| Skeleton {
+                    name: skel_name,
+                    file: location.clone(),
+                    place,
+                    scales: all_scales.clone(),
+                    bones,
+                })
+                .collect();
+            indexed_catalogs.insert(
+                location.clone(),
+                (
+                    catalog_skels,
+                    skeleton_error.as_ref().map(ToString::to_string),
+                ),
+            );
             if let Some(error) = skeleton_error {
                 let reason = error.to_string();
-                suit_errors.insert(location.clone(), reason.clone());
+                if has_suit_refs {
+                    suit_errors.insert(location.clone(), reason.clone());
+                }
                 indexed_suit_catalogs.insert(location, (BTreeMap::new(), Some(reason)));
                 continue;
             }
@@ -447,7 +487,9 @@ impl AvatarRegistry {
                 Ok(()) => None,
                 Err(error) => {
                     let reason = error.to_string();
-                    suit_errors.insert(location.clone(), reason.clone());
+                    if has_suit_refs {
+                        suit_errors.insert(location.clone(), reason.clone());
+                    }
                     Some(reason)
                 }
             };
@@ -492,6 +534,7 @@ impl AvatarRegistry {
             suits,
             eager_suits,
             indexed_suits,
+            indexed_catalogs,
             indexed_suit_catalogs,
             head_suits,
             suit_errors,
@@ -635,7 +678,7 @@ impl AvatarRegistry {
     fn export_skeletons(&self) -> ExportedSkeletons {
         let mut loaded = BTreeMap::new();
         let mut indexed = BTreeMap::new();
-        let mut catalogs: BTreeMap<String, IndexedCatalog> = BTreeMap::new();
+        let catalogs = self.indexed_catalogs.clone();
         for (name, (reg_step, entry)) in &self.skeletons {
             if let Some((err_step, reason)) = &self.first_skeleton_error
                 && *reg_step >= *err_step
@@ -676,28 +719,6 @@ impl AvatarRegistry {
                 } => match self.paths.files.lookup(directory, catalog_bcf) {
                     Ok(Some(resource)) => {
                         let location = resource.location(&self.root);
-                        catalogs.entry(location.clone()).or_insert_with(|| {
-                            let bytes = match resource.read() {
-                                Ok(bytes) => bytes,
-                                Err(error) => return (Vec::new(), Some(error.to_string())),
-                            };
-                            let mut binary = Binary::new(&bytes);
-                            let (items, error) = read_bcf_skeletons(&mut binary);
-                            let all_scales: Vec<Vec<i32>> =
-                                items.iter().map(|(_, s, _)| s.clone()).collect();
-                            let skeletons = items
-                                .into_iter()
-                                .enumerate()
-                                .map(|(place, (skel_name, _, bones))| Skeleton {
-                                    name: skel_name,
-                                    file: location.clone(),
-                                    place,
-                                    scales: all_scales.clone(),
-                                    bones,
-                                })
-                                .collect();
-                            (skeletons, error.map(|e| e.to_string()))
-                        });
                         indexed.insert(name.clone(), Ok(location));
                     }
                     Ok(None) => {

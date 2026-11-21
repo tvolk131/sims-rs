@@ -280,22 +280,22 @@ impl Interpreter<'_> {
         };
         build_skeleton(skeleton, &mut draws, &mut world.skeleton_files)
             .map_err(|trap| fail(id, trap))?;
-        // 0x588dcb -> 0x58a178 -> 0x5a044d -> 0x5a38da -> 0x59f35f: dressing
-        // the new person's initial body (row 1) and head (row 2) loads any
-        // `.ndx`-indexed `.bcf` appearance catalog and fills unloaded sibling
-        // entries in runtime call order.
+        // 0x588dcb -> 0x58a178 -> 0x58d606 (head row 2) -> 0x58d67e (body row 1)
+        // -> 0x5a044d -> 0x5a38da -> 0x59e60e -> 0x59f087: dressing the new
+        // person's initial head and body loads any `.ndx`-indexed `.bcf`
+        // catalog and fills unloaded sibling skeletons & appearances in order.
         if !self.program.people.indexed_suits.is_empty() {
             let template = world.characters.definition(guid);
             let profile = self.program.people.profiles.get(&template);
             let made = world.characters.made.get(&guid);
             let made_outfit = world.made_outfits.get(&guid);
             let rows = [
-                made.and_then(|m| m.strings.get(&1).cloned())
-                    .or_else(|| made_outfit.and_then(|o| o.0.clone()))
-                    .or_else(|| profile.and_then(|p| p.body.clone())),
                 made.and_then(|m| m.strings.get(&2).cloned())
-                    .or_else(|| made_outfit.and_then(|o| o.1.clone()))
+                    .or_else(|| made_outfit.and_then(|o| o.get(&2).cloned()))
                     .or_else(|| profile.and_then(|p| p.head.clone())),
+                made.and_then(|m| m.strings.get(&1).cloned())
+                    .or_else(|| made_outfit.and_then(|o| o.get(&1).cloned()))
+                    .or_else(|| profile.and_then(|p| p.body.clone())),
             ];
             for row in rows.into_iter().flatten() {
                 let suit = row

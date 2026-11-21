@@ -257,11 +257,24 @@ fn a_portrait_whose_put_depends_on_its_tile_fails_loudly() {
         .insert(9, sims_sim::rooms::Room::default());
     fx.world.rooms.map[1].fill(9);
     assert_eq!(inform(&mut fx, 2, record), Ok(true));
-    // No tile takes it: the original removes it unput (0x4e9706), and
-    // builds again (0x4e938c) unless the type has image 2002. On a lot
-    // with no inside the start is 1,1.
+    // No tile takes it from ANY start: the original removes the temporary
+    // person unput (0x4e9706), keeps its Init/RNG side effects, leaves the
+    // portrait uncached, and completes the dialog nonfatally.
     let (mut fx, _, record) = visitors();
     fx.world.size = 2;
+    let before_rng = fx.world.crt_rng.state();
+    assert_eq!(inform(&mut fx, 2, record), Ok(true));
+    assert!(fx.world.portraits.is_empty());
+    assert_ne!(fx.world.crt_rng.state(), before_rng);
+    // When no view centre is given and SOME starts find a tile while others
+    // do not, placement still fails loudly because the outcome depends on the
+    // unknown camera start: put LAMP on (1,1) in its own isolated room 99.
+    let (mut fx, _, record) = visitors();
+    fx.world.rooms.map[0][64 + 1] = 99;
+    fx.world.objects.get_mut(&LAMP).unwrap().position = [1, 1, 1];
+    fx.world.objects.get_mut(&LAMP).unwrap().data[29] = 99;
+    fx.world.arrays.get_mut(&3).unwrap().data[(64 + 1) * 2..(64 + 1) * 2 + 2]
+        .copy_from_slice(&(LAMP as i16).to_le_bytes());
     let fault = inform(&mut fx, 2, record).unwrap_err().to_string();
     assert!(
         fault.contains("0x4e9706") && fault.contains("from 1 of the starts (1,1)"),
@@ -363,16 +376,15 @@ fn a_portrait_searches_from_the_view_centre_when_it_is_given() {
         .unwrap_err()
         .to_string();
     assert!(fault.contains("0x468802"), "{fault}");
-    // From a centre no tile is found from, it fails.
+    // From a centre no tile is found from, the original removes the temporary
+    // person unput (0x4e9706), leaves the portrait uncached, keeps Init/RNG
+    // side effects, and completes the dialog nonfatally.
     let (mut fx, _, record) = visitors();
     fx.world.size = 2;
-    let fault = inform_from(&mut fx, 2, record, Some([7, 7]))
-        .unwrap_err()
-        .to_string();
-    assert!(
-        fault.contains("from the view centre 7,7 no tile is found") && fault.contains("0x4e9706"),
-        "{fault}"
-    );
+    let before_rng = fx.world.crt_rng.state();
+    assert_eq!(inform_from(&mut fx, 2, record, Some([7, 7])), Ok(true));
+    assert!(fx.world.portraits.is_empty());
+    assert_ne!(fx.world.crt_rng.state(), before_rng);
 }
 
 /// An object type with a function 5 (may overlap, 0x4337f6), tree 4300.

@@ -159,15 +159,15 @@ fn timed_event(
                 )));
             }
             "dress" | "undress" => {
-                let accessories = &mut world
-                    .objects
-                    .get_mut(&id)
-                    .and_then(|o| o.person.as_mut())
-                    .ok_or_else(|| Trap::native(0x1c, "object is not a person"))?
-                    .accessories;
                 if key == "dress" {
-                    put_on(people, accessories, value.clone())?;
+                    put_on(people, world, id, value.clone())?;
                 } else {
+                    let accessories = &mut world
+                        .objects
+                        .get_mut(&id)
+                        .and_then(|o| o.person.as_mut())
+                        .ok_or_else(|| Trap::native(0x1c, "object is not a person"))?
+                        .accessories;
                     undress(accessories, value);
                 }
                 continue;

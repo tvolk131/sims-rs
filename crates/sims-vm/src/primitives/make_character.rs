@@ -249,13 +249,19 @@ impl Machine<'_, '_> {
                 (Some(false), Some(false)) => Some(false),
                 _ => None,
             };
-            self.world.made_outfits.insert(
-                guid,
-                (
-                    picked_body.map(|(_, row)| row),
-                    picked_head.map(|(_, row)| row),
-                ),
-            );
+            let mut outfit_rows = std::collections::BTreeMap::new();
+            if let Some((_, row)) = picked_body {
+                outfit_rows.insert(1, row);
+            }
+            if let Some((_, row)) = picked_head {
+                outfit_rows.insert(2, row);
+            }
+            if child {
+                // 0x40a667: child commits write "ADDED" into rows 30 and 34.
+                outfit_rows.insert(30, "ADDED".to_owned());
+                outfit_rows.insert(34, "ADDED".to_owned());
+            }
+            self.world.made_outfits.insert(guid, outfit_rows);
             self.world.made_portrait_head.insert(guid, head_status);
             self.frame_mut()?.stack_object = record;
             Ok(true)
@@ -286,8 +292,8 @@ impl Machine<'_, '_> {
             } else {
                 // 0x40d14d / 0x40d162 leaves body row 1 at the template's
                 // value, while 0x44b0a3 -> 0x40a5e2 writes "NONE" into head
-                // row 2. Only the template's body row 1 can supply a HEAD
-                // binding.
+                // row 2 and rows 30..=34. Only the template's body row 1 can
+                // supply a HEAD binding.
                 let tpl_body = self
                     .program
                     .people
@@ -297,9 +303,16 @@ impl Machine<'_, '_> {
                 let status = self.suit_row_head_status(tpl_body.as_deref());
                 (tpl_body, status)
             };
-            self.world
-                .made_outfits
-                .insert(guid, (body_row, Some("NONE".to_owned())));
+            let mut outfit_rows = std::collections::BTreeMap::new();
+            if let Some(row) = body_row {
+                outfit_rows.insert(1, row);
+            }
+            // 0x40a5d5..0x40a614: pet commits write "NONE" to 1-based rows
+            // 3 (head, 0-based 2) and 0x1f..=0x23 (0-based 30..=34).
+            for row in [2usize, 30, 31, 32, 33, 34] {
+                outfit_rows.insert(row, "NONE".to_owned());
+            }
+            self.world.made_outfits.insert(guid, outfit_rows);
             self.world.made_portrait_head.insert(guid, head_status);
             self.frame_mut()?.stack_object = record;
             // 0x44b111..0x44b12b: pet creation immediately calls
@@ -398,7 +411,7 @@ impl Machine<'_, '_> {
                 self.world
                     .made_outfits
                     .get(&self_guid)
-                    .and_then(|o| o.0.clone())
+                    .and_then(|o| o.get(&1).cloned())
             });
         let src_head_override = self
             .world
@@ -409,7 +422,7 @@ impl Machine<'_, '_> {
                 self.world
                     .made_outfits
                     .get(&self_guid)
-                    .and_then(|o| o.1.clone())
+                    .and_then(|o| o.get(&2).cloned())
             });
         let src_body = src_body_override
             .as_deref()
@@ -436,6 +449,27 @@ impl Machine<'_, '_> {
         // either lookup misses (-1), 0x40ab7f checks both counts: when both
         // body_count > 0 and head_count > 0, each missed slot falls back to
         // index 0 of its list; otherwise 0x40ac57 clears BOTH body and head to "".
+        let build_copy_rows = |body: Option<String>,
+                               head: Option<String>,
+                               cleared_empty_list: bool|
+         -> std::collections::BTreeMap<usize, String> {
+            let mut rows = std::collections::BTreeMap::new();
+            rows.insert(1, body.unwrap_or_default());
+            rows.insert(2, head.unwrap_or_default());
+            if src_child {
+                // 0x40a667: child commits write "ADDED" into rows 30 and 34.
+                rows.insert(30, "ADDED".to_owned());
+                rows.insert(34, "ADDED".to_owned());
+            }
+            if cleared_empty_list {
+                // 0x40ac57..0x40acb0: empty-list fallback clears 1-based rows
+                // 2, 3, 0x10..=0x13 (0-based 1, 2, 15..=18) to "".
+                for idx in [15usize, 16, 17, 18] {
+                    rows.insert(idx, String::new());
+                }
+            }
+            rows
+        };
         let (copied_outfits, head_status) = match &self.program.ordered_wardrobe {
             Some(Err(reason)) => {
                 return Err(Trap::Unsupported(format!(
@@ -450,6 +484,7 @@ impl Machine<'_, '_> {
                 let mut head_hit = src_head.and_then(|raw| {
                     ordered.find_outfit(true, src_female, src_child, &src_skin, raw)
                 });
+                let mut cleared_empty_list = false;
                 if body_hit.is_none() || head_hit.is_none() {
                     let body_count = ordered.count(false, src_female, src_child, &src_skin);
                     let head_count = ordered.count(true, src_female, src_child, &src_skin);
@@ -463,6 +498,7 @@ impl Machine<'_, '_> {
                     } else {
                         body_hit = None;
                         head_hit = None;
+                        cleared_empty_list = true;
                     }
                 }
                 let body_status = match &body_hit {
@@ -478,9 +514,10 @@ impl Machine<'_, '_> {
                     (Some(false), Some(false)) => Some(false),
                     _ => None,
                 };
-                let rows = (
-                    Some(body_hit.map_or_else(String::new, |(_, row)| row)),
-                    Some(head_hit.map_or_else(String::new, |(_, row)| row)),
+                let rows = build_copy_rows(
+                    body_hit.map(|(_, row)| row),
+                    head_hit.map(|(_, row)| row),
+                    cleared_empty_list,
                 );
                 (Some(rows), combined)
             }
@@ -531,6 +568,7 @@ impl Machine<'_, '_> {
                                     (matched.into_iter().map(str::to_owned).collect(), row)
                                 })
                             });
+                        let mut cleared_empty_list = false;
                         if body_suits.is_none() || head_suits.is_none() {
                             let body_count =
                                 wardrobe.count(false, src_female, src_child, &src_skin);
@@ -549,6 +587,7 @@ impl Machine<'_, '_> {
                             } else {
                                 body_suits = None;
                                 head_suits = None;
+                                cleared_empty_list = true;
                             }
                         }
                         let classify_list = |hit: &Option<(Vec<String>, String)>| -> Option<bool> {
@@ -575,9 +614,10 @@ impl Machine<'_, '_> {
                                 (Some(false), Some(false)) => Some(false),
                                 _ => None,
                             };
-                        let rows = (
-                            Some(body_suits.map_or_else(String::new, |(_, row)| row)),
-                            Some(head_suits.map_or_else(String::new, |(_, row)| row)),
+                        let rows = build_copy_rows(
+                            body_suits.map(|(_, row)| row),
+                            head_suits.map(|(_, row)| row),
+                            cleared_empty_list,
                         );
                         (Some(rows), combined)
                     }
@@ -595,10 +635,7 @@ impl Machine<'_, '_> {
                                 || !wardrobe
                                     .has_any_texture(true, src_female, src_child, &src_skin));
                         if (body_miss || head_miss) && empty_list {
-                            (
-                                Some((Some(String::new()), Some(String::new()))),
-                                Some(false),
-                            )
+                            (Some(build_copy_rows(None, None, true)), Some(false))
                         } else {
                             (None, None)
                         }

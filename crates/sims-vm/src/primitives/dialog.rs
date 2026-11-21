@@ -350,7 +350,7 @@ impl Machine<'_, '_> {
     /// the family's portraits too, so a family member's type with nobody
     /// on the lot fails loudly.
     ///
-    /// The put is [`crate::Interpreter::portrait_put`]: the search from the
+    /// The put is [`crate::Interpreter::portrait_put_outcome`]: the search from the
     /// house view's centre (an input, [`crate::Interpreter::view_centre`])
     /// and as much of the put as is the same on every tile it may end on.
     /// When the winning definition's file holds an embedded or persisted
@@ -495,11 +495,27 @@ impl Machine<'_, '_> {
         let mut copy = self.world.clone();
         let cells = crate::both_ways::Cells::of(&interpreter);
         let built = cells.on(&interpreter);
-        let id = built.create_person(&mut copy, guid).map_err(unsupported)?;
-        built
-            .portrait_put(&mut copy, id)
+        let Some(id) = built
+            .try_create_person(&mut copy, guid)
+            .map_err(unsupported)?
+        else {
+            // 0x4e969d: factory returned 0 (e.g. refused pet). Keep any side
+            // effects, leave portrait uncached, return false.
+            if !cells.same_refresh(&crate::both_ways::Cells::of(&interpreter)) {
+                return Err(Trap::Unsupported(format!(
+                    "making a person of type 0x{guid:08X} for a dialog's portrait (0x4e9652) \
+                     changed the refresh pending, which is not ported"
+                )));
+            }
+            cells.keep(&interpreter, self.world, copy);
+            return Ok(false);
+        };
+        let placed = built
+            .portrait_put_outcome(&mut copy, id)
             .map_err(|fault| fault.trap)?;
-        let can_render = if self.has_portrait_render_metadata(&copy, guid) {
+        let can_render = if !placed {
+            false
+        } else if self.has_portrait_render_metadata(&copy, guid) {
             crate::primitives::ui_effect::can_render_person_portrait(
                 self.catalog,
                 self.program,
@@ -512,7 +528,8 @@ impl Machine<'_, '_> {
         } else {
             true
         };
-        if can_render {
+        let rendered = placed && can_render;
+        if rendered {
             // 0x4e8d14 caches the portrait and clears dirty, and 0x4e8d2e ->
             // 0x4e9000 stages BMP_ 2002 BEFORE removing the temporary person.
             copy.portraits.insert(guid);
@@ -521,6 +538,9 @@ impl Machine<'_, '_> {
                 copy.generated_portrait_2002.insert(file_key);
             }
         }
+        // Both normal completion (0x4e8fdb) and no-tile failure (0x4e9706)
+        // remove the temporary person immediately and keep its Init/RNG side
+        // effects.
         built.remove_now(&mut copy, id).map_err(unsupported)?;
         // The refresh pending is the caller's to keep, and a build
         // that changed it is not ported.
@@ -531,7 +551,7 @@ impl Machine<'_, '_> {
             )));
         }
         cells.keep(&interpreter, self.world, copy);
-        Ok(can_render)
+        Ok(rendered)
     }
 
     /// Whether type `guid` is in the interface's table of person types

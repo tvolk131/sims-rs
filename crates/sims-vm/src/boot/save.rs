@@ -69,7 +69,7 @@ pub struct Saved {
     ambiguous_portraits: BTreeSet<u32>,
     loaded_indexed_skeletons: BTreeMap<String, Option<String>>,
     loaded_indexed_suits: BTreeMap<String, Option<bool>>,
-    made_outfits: BTreeMap<u32, (Option<String>, Option<String>)>,
+    made_outfits: BTreeMap<u32, BTreeMap<usize, String>>,
 }
 
 /// Why a lot could not be saved or restored.
@@ -252,10 +252,10 @@ mod tests {
             .insert("suit_b".into(), Some(true));
         world.made_outfits.insert(
             0x5555_6666,
-            (
-                Some("b001,BODY=b001".into()),
-                Some("c001,HEAD-HEAD=c001".into()),
-            ),
+            BTreeMap::from([
+                (1, "b001,BODY=b001".into()),
+                (2, "c001,HEAD-HEAD=c001".into()),
+            ]),
         );
         let saved = Saved {
             dirty_portraits: world.dirty_portraits.clone(),
@@ -307,10 +307,10 @@ mod tests {
             decoded.world().made_outfits,
             BTreeMap::from([(
                 0x5555_6666,
-                (
-                    Some("b001,BODY=b001".to_owned()),
-                    Some("c001,HEAD-HEAD=c001".to_owned())
-                )
+                BTreeMap::from([
+                    (1, "b001,BODY=b001".to_owned()),
+                    (2, "c001,HEAD-HEAD=c001".to_owned()),
+                ])
             )])
         );
     }

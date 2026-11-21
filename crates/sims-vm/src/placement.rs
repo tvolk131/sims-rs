@@ -1323,27 +1323,14 @@ impl Interpreter<'_> {
     ///    come from outside makes them (0x445e4a, from 0x44752e), and their
     ///    Init runs while the original's person stands on its tile, in its
     ///    room, which here it does not.
-    pub(crate) fn portrait_put(&self, world: &mut World, id: u16) -> Result<(), Fault> {
-        let _ = self.portrait_put_inner(world, id, false)?;
-        Ok(())
-    }
-
-    /// [`Interpreter::portrait_put`] with the `0x4e96e4` → `0x4e9706` no-tile
-    /// outcome distinguished: returns `Ok(true)` when a tile is found and
-    /// placed, `Ok(false)` when no tile is found (from the given view centre,
-    /// or from every interior start when no view centre is given), and `Err`
-    /// when placement depends on an unmodeled detail or an unknown view centre
-    /// where some starts find a tile and others do not.
+    ///
+    /// Distinguishes the `0x4e96e4` → `0x4e9706` no-tile outcome: returns
+    /// `Ok(true)` when a tile is found and placed, `Ok(false)` when no tile is
+    /// found (from the given view centre, or from every interior start when no
+    /// view centre is given), and `Err` when placement depends on an unmodeled
+    /// detail or an unknown view centre where some starts find a tile and
+    /// others do not.
     pub(crate) fn portrait_put_outcome(&self, world: &mut World, id: u16) -> Result<bool, Fault> {
-        self.portrait_put_inner(world, id, true)
-    }
-
-    fn portrait_put_inner(
-        &self,
-        world: &mut World,
-        id: u16,
-        allow_no_tile: bool,
-    ) -> Result<bool, Fault> {
         let fail = |what: String| Fault {
             object: id,
             at: None,
@@ -1359,22 +1346,6 @@ impl Interpreter<'_> {
                 trap,
             })
         };
-        if !allow_no_tile {
-            for (function, at) in [
-                (WALLS_CHANGED, "0x435110"),
-                (function::PLACED, "0x433580"),
-                (BEFORE_REMOVAL, "0x433148"),
-                (SEAT_CHANGED, "0x433612"),
-                (SEAT, "0x433612"),
-            ] {
-                let tree = self.function_tree(world, id, function);
-                if tree != 0 {
-                    return Err(fail(format!(
-                        "the person's function {function} names tree {tree} ({at})"
-                    )));
-                }
-            }
-        }
         let rules = Rules {
             same_room: true,
             empty: true,
@@ -1384,13 +1355,7 @@ impl Interpreter<'_> {
             Some([x, y]) => {
                 let from = [(i32::from(x) << 4) | 8, (i32::from(y) << 4) | 8];
                 let Some([a, b]) = self.search(world, id, from, 1, rules)? else {
-                    if allow_no_tile {
-                        return Ok(false);
-                    }
-                    return Err(fail(format!(
-                        "from the view centre {x},{y} no tile is found: the original removes it \
-                         unput (0x4e9706), which is not ported"
-                    )));
+                    return Ok(false);
                 };
                 BTreeSet::from([Some([(a >> 4) as i8, (b >> 4) as i8])])
             }
@@ -1407,7 +1372,7 @@ impl Interpreter<'_> {
                 };
                 let mut ends = probe.search_from_anywhere(&mut copy, id, 1, rules)?;
                 if let Some(starts) = ends.remove(&None) {
-                    if allow_no_tile && ends.is_empty() {
+                    if ends.is_empty() {
                         return Ok(false);
                     }
                     let listed: Vec<String> = starts
@@ -1426,20 +1391,18 @@ impl Interpreter<'_> {
                 ends.into_keys().collect()
             }
         };
-        if allow_no_tile {
-            for (function, at) in [
-                (WALLS_CHANGED, "0x435110"),
-                (function::PLACED, "0x433580"),
-                (BEFORE_REMOVAL, "0x433148"),
-                (SEAT_CHANGED, "0x433612"),
-                (SEAT, "0x433612"),
-            ] {
-                let tree = self.function_tree(world, id, function);
-                if tree != 0 {
-                    return Err(fail(format!(
-                        "the person's function {function} names tree {tree} ({at})"
-                    )));
-                }
+        for (function, at) in [
+            (WALLS_CHANGED, "0x435110"),
+            (function::PLACED, "0x433580"),
+            (BEFORE_REMOVAL, "0x433148"),
+            (SEAT_CHANGED, "0x433612"),
+            (SEAT, "0x433612"),
+        ] {
+            let tree = self.function_tree(world, id, function);
+            if tree != 0 {
+                return Err(fail(format!(
+                    "the person's function {function} names tree {tree} ({at})"
+                )));
             }
         }
         // The words are read after the search, whose callbacks may set

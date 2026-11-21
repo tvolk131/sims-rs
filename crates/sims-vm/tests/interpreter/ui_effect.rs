@@ -1075,8 +1075,7 @@ fn make_new_character_wardrobe_head_binding_drives_ui_effect_render_and_writebac
         &["c001ma_bob"],
     );
     let picked_head_is_bob = fx.world.made_outfits[&guid]
-        .1
-        .as_deref()
+        .get(&2)
         .is_some_and(|r| r.starts_with("c001ma_bob,"));
     assert_eq!(
         run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
@@ -2843,10 +2842,10 @@ fn person_data_invalidation_catalog_dialog_indexed_suits_live_outfits_and_ordere
         let copy_guid = fx.world.neighbors.get(copy_record).unwrap().guid;
         assert_eq!(
             fx.world.made_outfits.get(&copy_guid),
-            Some(&(
-                Some(picked_body_row),
-                Some("c002fa_first,HEAD-HEAD=c002falgt_first".to_owned()),
-            ))
+            Some(&BTreeMap::from([
+                (1, picked_body_row),
+                (2, "c002fa_first,HEAD-HEAD=c002falgt_first".to_owned()),
+            ]))
         );
         assert_eq!(
             run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, copy_record, 1),
@@ -2856,5 +2855,512 @@ fn person_data_invalidation_catalog_dialog_indexed_suits_live_outfits_and_ordere
             fx.world.portraits.contains(&copy_guid),
             "negative-age miss must fall back to index 0 (`c002fa_first`) when both lists are non-empty"
         );
+    }
+}
+
+#[test]
+fn round_16_unified_bcf_lazy_loads_dress_time_accessories_pet_reset_formal_extras_and_dialog_refusal()
+ {
+    use sims_content::{Bone, Profile, Skeleton};
+    const MY_PERSON_DATA: u8 = 18;
+    const STACK_OBJECT_PERSON_DATA: u8 = 19;
+    const TEMPLATE_PERSON: u32 = 0x7fd9_6b54;
+    const TEMPLATE_DOG: u32 = 0x4a70_df92;
+    let mk_skel =
+        |name: &str, file: &str, place: usize, scales: Vec<Vec<i32>>, bones: Vec<Bone>| Skeleton {
+            name: name.to_owned(),
+            file: file.to_owned(),
+            place,
+            scales,
+            bones,
+        };
+
+    // 1. P2 #1 & #2 & #3: Unified `.bcf` lazy load populates BOTH skeletons
+    // AND appearances; failed decode marks the appearance attempted (`0x5a3965`)
+    // so later catalogs cannot overwrite it; Change Suit (opcode 6) resolves
+    // `.ndx` accessories at dress time (`0x58d903`); and a HEAD-binding head
+    // row does NOT skip resolving the body suit.
+    {
+        let (mut fx, _, _) = visitors();
+        fx.words(SIM_FILE)[102] = 0;
+        fx.world.neighbors.slots.push(Some(Neighbor {
+            guid: SIM_GUID,
+            id: 2,
+            data: vec![0; 88],
+            relationships: Vec::new(),
+            friends: 0,
+            revision: 0,
+            stale: false,
+        }));
+        let sim_record = fx.world.neighbors.slots.len() as i16;
+        fx.world
+            .objects
+            .get_mut(&SIM)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap()
+            .data[65] = 0;
+
+        // Mixed catalog `mixed.bcf` defines skeleton `shared_rig` (scale 7) AND
+        // appearance `shared_acc` (HEAD=true) AND `sib_body` (HEAD=true).
+        // `broken.bcf` stops decoding with an error before defining `broken_suit`.
+        fx.program
+            .people
+            .indexed_skeletons
+            .insert("shared_rig".into(), Ok("other_rig.bcf".into()));
+        fx.program
+            .people
+            .indexed_suits
+            .insert("shared_acc".into(), Ok("mixed.bcf".into()));
+        fx.program
+            .people
+            .indexed_suits
+            .insert("sib_body".into(), Ok("other_body.bcf".into()));
+        fx.program
+            .people
+            .indexed_suits
+            .insert("broken_suit".into(), Ok("broken.bcf".into()));
+        fx.program.people.indexed_catalogs.insert(
+            "mixed.bcf".into(),
+            (
+                vec![mk_skel("shared_rig", "mixed.bcf", 0, vec![vec![7]], vec![])],
+                None,
+            ),
+        );
+        fx.program.people.indexed_catalogs.insert(
+            "other_rig.bcf".into(),
+            (
+                vec![mk_skel(
+                    "shared_rig",
+                    "other_rig.bcf",
+                    0,
+                    vec![vec![9]],
+                    vec![],
+                )],
+                None,
+            ),
+        );
+        fx.program.people.indexed_suit_catalogs.insert(
+            "mixed.bcf".into(),
+            (
+                BTreeMap::from([
+                    ("shared_acc".into(), true),
+                    ("sib_body".into(), true),
+                    ("broken_suit".into(), true),
+                ]),
+                None,
+            ),
+        );
+        fx.program.people.indexed_suit_catalogs.insert(
+            "other_body.bcf".into(),
+            (BTreeMap::from([("sib_body".into(), false)]), None),
+        );
+        fx.program.people.indexed_suit_catalogs.insert(
+            "broken.bcf".into(),
+            (BTreeMap::new(), Some("corrupt".into())),
+        );
+        fx.program
+            .people
+            .suit_errors
+            .insert("broken.bcf".into(), "corrupt".into());
+
+        // Attempt `broken_suit` via Change Suit -> traps on decode error AND
+        // records `loaded_indexed_suits["broken_suit"] = None` (`0x5a3965`).
+        fx.program
+            .libraries
+            .get_mut(&SIM_FILE)
+            .unwrap()
+            .strings
+            .insert(304, vec!["broken_suit".into(), "shared_acc".into()]);
+        fx.add(
+            SIM_FILE,
+            4098,
+            tree(vec![ins(
+                6,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [0, 2, 0, 0, 0, 0, 0, 0],
+            )]),
+        );
+        assert!(fx.run_with(SIM, 4098, 0, &[], 100).is_err());
+        assert_eq!(
+            fx.world.loaded_indexed_suits.get("broken_suit"),
+            Some(&None)
+        );
+
+        // Now dress `shared_acc` via Change Suit (opcode 6): loads `mixed.bcf`
+        // at dress time, populating BOTH `loaded_indexed_skeletons["shared_rig"]`
+        // AND `loaded_indexed_suits["sib_body"]`, while leaving `broken_suit`
+        // as `None` (`0x59f34c`)!
+        fx.add(
+            SIM_FILE,
+            4099,
+            tree(vec![ins(
+                6,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [1, 2, 0, 0, 0, 0, 0, 0],
+            )]),
+        );
+        assert_eq!(fx.run_with(SIM, 4099, 0, &[], 100), Ok(true));
+        assert_eq!(
+            fx.world.loaded_indexed_skeletons.get("shared_rig"),
+            Some(&Some("mixed.bcf".to_owned()))
+        );
+        assert_eq!(
+            fx.world.loaded_indexed_suits.get("sib_body"),
+            Some(&Some(true))
+        );
+        assert_eq!(
+            fx.world.loaded_indexed_suits.get("broken_suit"),
+            Some(&None),
+            "0x5a3965 failed appearance must not be overwritten by later mixed.bcf"
+        );
+
+        // Non-short-circuiting outfit lookup: a Sim with an eager HEAD row
+        // STILL resolves its indexed body suit `body_trigger` during portrait
+        // rendering, populating `body_trigger.bcf`'s sibling `body_sib`.
+        fx.program.people.eager_suits.insert("eager_head".into());
+        fx.program.people.head_suits.insert("eager_head".into());
+        fx.program
+            .people
+            .indexed_suits
+            .insert("body_trigger".into(), Ok("body_trigger.bcf".into()));
+        fx.program.people.indexed_suit_catalogs.insert(
+            "body_trigger.bcf".into(),
+            (
+                BTreeMap::from([("body_trigger".into(), false), ("body_sib".into(), true)]),
+                None,
+            ),
+        );
+        fx.program.people.profiles.insert(
+            SIM_GUID,
+            Profile {
+                body: Some("body_trigger,BODY=b".into()),
+                head: Some("eager_head,HEAD-HEAD=h".into()),
+                ..Default::default()
+            },
+        );
+        fx.world
+            .objects
+            .get_mut(&SIM)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap()
+            .data[8] = 0;
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
+            Ok(true)
+        );
+        assert_eq!(
+            fx.world.loaded_indexed_suits.get("body_sib"),
+            Some(&Some(true)),
+            "HEAD-binding head row must not skip resolving the outfit body suit"
+        );
+    }
+
+    // 2. P2 #4: Pet `data[8] = 0` mutation runs BEFORE skeleton HEAD bone check,
+    // and definitions with `def_flags & 8 != 0` and negative suit do NOT reset
+    // `person.data[8]` to 0.
+    {
+        let (mut fx, _, _) = visitors();
+        fx.words(SIM_FILE)[102] = 0;
+        fx.world.neighbors.slots.push(Some(Neighbor {
+            guid: SIM_GUID,
+            id: 2,
+            data: vec![0; 88],
+            relationships: Vec::new(),
+            friends: 0,
+            revision: 0,
+            stale: false,
+        }));
+        let sim_record = fx.world.neighbors.slots.len() as i16;
+        fx.program.people.skeletons.insert(
+            SIM_GUID,
+            mk_skel(
+                "nohead_skel",
+                "nohead.bcf",
+                0,
+                vec![vec![]],
+                vec![Bone {
+                    name: "PELVIS".into(),
+                    parent: None,
+                    translation: [0; 3],
+                    rotation: [0, 0, 0, 1.0f32.to_bits()],
+                    blends: false,
+                }],
+            ),
+        );
+        let person = fx
+            .world
+            .objects
+            .get_mut(&SIM)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap();
+        person.data[65] = 2; // dogmale
+        person.data[8] = 4;
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
+            Ok(true)
+        );
+        assert!(!fx.world.portraits.contains(&SIM_GUID));
+        assert_eq!(
+            fx.world.objects[&SIM].person.as_ref().unwrap().data[8],
+            0,
+            "0x4e7801 -> 0x58a2e5 must clear pet data[8] even when skeleton lacks HEAD bone"
+        );
+
+        // With def_flags & 8 set and negative suit: bypasses 0x58a2e5.
+        fx.words(SIM_FILE)[102] = 8;
+        fx.world
+            .objects
+            .get_mut(&SIM)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap()
+            .data[8] = -2;
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
+            Ok(true)
+        );
+        assert_eq!(
+            fx.world.objects[&SIM].person.as_ref().unwrap().data[8],
+            -2,
+            "0x58a1e4 -> 0x58a1f8 must NOT reset data[8] when def_flags & 8 != 0 and suit <= 0"
+        );
+    }
+
+    // 3. P2 #5: Adult formalwear with empty row 30 (`0x58a73e`) binds rows 28 &
+    // 29 (`0x58d742`/`0x58d759`) ONLY when BOTH have non-empty suit names.
+    {
+        let (mut fx, _, _) = visitors();
+        fx.words(SIM_FILE)[102] = 0;
+        fx.world.neighbors.slots.push(Some(Neighbor {
+            guid: SIM_GUID,
+            id: 2,
+            data: vec![0; 88],
+            relationships: Vec::new(),
+            friends: 0,
+            revision: 0,
+            stale: false,
+        }));
+        let sim_record = fx.world.neighbors.slots.len() as i16;
+        fx.program.people.head_suits.insert("extra28_head".into());
+        fx.program.people.profiles.insert(
+            SIM_GUID,
+            Profile {
+                body: Some("plain_body,BODY=b".into()),
+                head: None,
+                age: Some("27".into()),
+                suit_rows: BTreeMap::from([
+                    (27, "formal27_nohead,BODY=f".into()),
+                    (28, "extra28_head,HEAD-HEAD=e".into()),
+                    (29, "extra29_nohead,BODY=e".into()),
+                ]),
+                ..Default::default()
+            },
+        );
+        let person = fx
+            .world
+            .objects
+            .get_mut(&SIM)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap();
+        person.data[65] = 0;
+        person.data[8] = 4;
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
+            Ok(true)
+        );
+        assert!(
+            fx.world.portraits.contains(&SIM_GUID),
+            "0x58a73e -> 0x58d742 must bind row 28 when row 30 is empty and both rows 28 & 29 are non-empty"
+        );
+
+        // Removing row 29 makes `0x58d72e` skip BOTH rows 28 and 29!
+        fx.world.portraits.remove(&SIM_GUID);
+        fx.world.generated_portrait_2002.clear();
+        fx.program
+            .people
+            .profiles
+            .get_mut(&SIM_GUID)
+            .unwrap()
+            .suit_rows
+            .remove(&29);
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
+            Ok(true)
+        );
+        assert!(
+            !fx.world.portraits.contains(&SIM_GUID),
+            "0x58d72e must skip row 28 when row 29 is empty"
+        );
+    }
+
+    // 4. P2 #6: Catalog Dialog without BMP_ 2002 handles refused pet (`0x4e969d`)
+    // nonfatally instead of trapping.
+    {
+        let (mut fx, _, record) = visitors();
+        fx.program.expansions = 0; // no Unleashed / Makin' Magic
+        fx.program
+            .people
+            .skeleton_names
+            .insert(WIDGET, "dog".into());
+        fx.add(
+            LAMP_FILE,
+            4098,
+            tree(vec![
+                assign(scope::STACK_OBJECT, 0, scope::LITERAL, record, 1),
+                ins(36, RETURN_TRUE, RETURN_FALSE, [0, 0, 0, 0, 0, 0, 0, 5]),
+            ]),
+        );
+        assert_eq!(fx.run_with(LAMP, 4098, 0, &[], 100), Ok(true));
+        assert!(!fx.world.portraits.contains(&WIDGET));
+    }
+
+    // 5. P2 #7: Pet creation (`0x40a5e2`) overwrites rows 30..=34 with "NONE",
+    // and negative-age empty-list (`0x40ac57`) clears rows 15..=18 to "".
+    {
+        let (mut fx, _, _) = visitors();
+        fx.world.rooms.rooms.get_mut(&1).unwrap().occupied = true;
+        fx.program.expansions = 0x20;
+        let pet_file = fx.add_type(TEMPLATE_DOG, 2, 4096, 4097);
+        fx.add(
+            pet_file,
+            4096,
+            tree(vec![
+                assign(scope::MY_DATA, 4, scope::LITERAL, 1, 1),
+                assign(scope::MY_DATA, 42, scope::LITERAL, 2, RETURN_TRUE),
+            ]),
+        );
+        fx.add(
+            pet_file,
+            4097,
+            tree(vec![
+                assign(scope::PARAMETERS, 0, scope::LITERAL, 10, 1),
+                ins(0, 0, 0, [0; 8]),
+            ]),
+        );
+        equip(&mut fx, TEMPLATE_DOG, "dog", 12);
+        fx.program
+            .people
+            .profiles
+            .get_mut(&TEMPLATE_DOG)
+            .unwrap()
+            .tones = vec!["lgt".into()];
+        fx.program.wardrobe = Some(Wardrobe {
+            suits: ["b001dog_01".into()].into(),
+            textures: ["b001dog_01.bmp".into()].into(),
+            errors: BTreeMap::new(),
+        });
+        fx.add(
+            SIM_FILE,
+            4098,
+            tree(vec![
+                assign(scope::LOCALS, 0, scope::LITERAL, 0, 1),
+                assign(scope::LOCALS, 1, scope::LITERAL, 27, 2),
+                assign(scope::LOCALS, 2, scope::LITERAL, 0, 3),
+                ins(19, 4, RETURN_FALSE, [0, 1, 2, 1, 0, 0, 0, 0]),
+                assign(scope::GLOBAL, 36, scope::STACK_OBJECT, 0, RETURN_TRUE),
+            ]),
+        );
+        assert_eq!(fx.run_with(SIM, 4098, 0, &[], 1000), Ok(true));
+        let pet_guid = fx.world.neighbors.get(fx.world.globals[36]).unwrap().guid;
+        let pet_rows = &fx.world.made_outfits[&pet_guid];
+        for r in [2usize, 30, 31, 32, 33, 34] {
+            assert_eq!(pet_rows.get(&r).map(String::as_str), Some("NONE"));
+        }
+
+        // Negative-age empty-list branch (`0x40ac57`): clears rows 1, 2, 15..=18.
+        let tpl_file = fx.add_type(TEMPLATE_PERSON, 2, 4096, 4097);
+        fx.add(
+            tpl_file,
+            4096,
+            tree(vec![assign(
+                scope::MY_DATA,
+                4,
+                scope::LITERAL,
+                1,
+                RETURN_TRUE,
+            )]),
+        );
+        fx.add(
+            tpl_file,
+            4097,
+            tree(vec![
+                assign(scope::PARAMETERS, 0, scope::LITERAL, 10, 1),
+                ins(0, 0, 0, [0; 8]),
+            ]),
+        );
+        equip(&mut fx, TEMPLATE_PERSON, "adult", 12);
+        fx.program.people.profiles.insert(
+            SIM_GUID,
+            Profile {
+                body: Some("b999fafit_miss,BODY=x".into()),
+                head: Some("c999fa_miss,HEAD-HEAD=y".into()),
+                gender: Some("female".into()),
+                age: Some("27".into()),
+                skin: Some("lgt".into()),
+                ..Default::default()
+            },
+        );
+        fx.add(
+            SIM_FILE,
+            4099,
+            tree(vec![
+                assign(scope::LOCALS, 0, scope::LITERAL, 0, 1),
+                assign(scope::LOCALS, 1, scope::LITERAL, -1, 2),
+                assign(scope::LOCALS, 2, scope::LITERAL, 0, 3),
+                ins(19, 4, RETURN_FALSE, [0, 1, 2, 0, 0, 0, 0, 0]),
+                assign(scope::GLOBAL, 36, scope::STACK_OBJECT, 0, RETURN_TRUE),
+            ]),
+        );
+        assert_eq!(fx.run_with(SIM, 4099, 0, &[], 1000), Ok(true));
+        let copy_guid = fx.world.neighbors.get(fx.world.globals[36]).unwrap().guid;
+        let copy_rows = &fx.world.made_outfits[&copy_guid];
+        for r in [1usize, 2, 15, 16, 17, 18] {
+            assert_eq!(copy_rows.get(&r).map(String::as_str), Some(""));
+        }
+    }
+
+    // 6. P3 #1: Writing stack-object person data from a non-person (`LAMP`)
+    // must NOT insert `LAMP_GUID` into `dirty_portraits` (`0x4eb0eb` exits on
+    // portrait-table miss).
+    {
+        let (mut fx, _, _) = visitors();
+        fx.add(
+            LAMP_FILE,
+            4098,
+            tree(vec![
+                assign(scope::STACK_OBJECT, 0, scope::LITERAL, SIM as i16, 1),
+                assign(STACK_OBJECT_PERSON_DATA, 68, scope::LITERAL, 1, RETURN_TRUE),
+            ]),
+        );
+        assert_eq!(fx.run_with(LAMP, 4098, 0, &[], 100), Ok(true));
+        assert!(
+            !fx.world.dirty_portraits.contains(&LAMP_GUID),
+            "0x4eb0eb must ignore non-person GUIDs not in the portrait table"
+        );
+        // Writing My Person Data[68] from a person (`SIM`) DOES dirty `SIM_GUID`.
+        fx.add(
+            SIM_FILE,
+            4098,
+            tree(vec![assign(
+                MY_PERSON_DATA,
+                68,
+                scope::LITERAL,
+                1,
+                RETURN_TRUE,
+            )]),
+        );
+        assert_eq!(fx.run_with(SIM, 4098, 0, &[], 100), Ok(true));
+        assert!(fx.world.dirty_portraits.contains(&SIM_GUID));
     }
 }

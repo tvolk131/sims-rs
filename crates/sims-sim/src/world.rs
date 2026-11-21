@@ -256,12 +256,13 @@ pub struct World {
     /// snapshot format 31; `sims_vm::boot::save::Saved` preserves it.
     #[serde(skip)]
     pub loaded_indexed_suits: BTreeMap<String, Option<bool>>,
-    /// The exact `(body_row, head_row)` strings chosen by `Make New Character`
-    /// (`0x40d183`, `0x40d4e7`, `0x40a5e2`) for runtime-made characters, kept
-    /// out of [`World::characters`] / [`World::encode`] to preserve snapshot
-    /// format 31; `sims_vm::boot::save::Saved` preserves it.
+    /// `STR# 200` outfit rows rewritten by `Make New Character` (`0x40d183`,
+    /// `0x40d4e7`, `0x40a5e2` rows 2 and 30–34, `0x40a667` rows 30 and 34,
+    /// `0x40ac57` rows 1, 2, and 15–18) for runtime-made characters, kept out
+    /// of [`World::characters`] / [`World::encode`] to preserve snapshot format
+    /// 31; `sims_vm::boot::save::Saved` preserves it.
     #[serde(skip)]
-    pub made_outfits: BTreeMap<u32, (Option<String>, Option<String>)>,
+    pub made_outfits: BTreeMap<u32, BTreeMap<usize, String>>,
 }
 
 /// Which IFF file holds a portrait bitmap persisted by `0x4e9000`.

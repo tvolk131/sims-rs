@@ -78,20 +78,20 @@ const TICK_1103_24: &str = "29bcebd6b87a9b15b737861bf8b4f7ebe13a6f2307607f4b1893
 
 /// The tile the Goth day's boots give for the house view's centre
 /// ([`Lot::load_viewed`], [`Lot::set_view_centre`]): the lot's middle tile. It is a stand-in
-/// start tile, not the original's camera. From every start that finds a
-/// tile the day goes on the same ([`every_start_gives_one_state`]); four
-/// starts find none, and the recording does not rule them out: the cat's
-/// type has image 2002 (`BMP_` 2002 in `User00036.iff`), so a start that
-/// finds no tile also makes the cat once (1,920 draws) and does not build
-/// again (0x4e9706, 0x4e938c). That branch is not ported and stops loudly.
-/// Which camera the original opens the Goths' house with is not traced.
+/// start tile, not the original's camera. From every start on the lot —
+/// including the four room -5 starts where `0x4e92f2` finds no tile, removes
+/// the temporary cat at `0x4e9706`, and `0x4e9338` loads `User00036.iff`'s
+/// `BMP_` 2002 — the day goes on with the exact same state
+/// ([`every_start_gives_one_state`]). Which camera the original opens the
+/// Goths' house with is not traced.
 const GOTH_VIEW_CENTRE: [i8; 2] = [32, 32];
 
 /// Steps `lot` once from every tile the portrait's search may start from
 /// (inside the lot's border), each from the same save, and checks that
-/// the starts that find a tile all reach one state and that the rest are
-/// exactly `no_tile`, each stopping where the original would remove the
-/// person unput (0x4e9706). The lot is left as it was, with its view centre.
+/// the starts that succeed all reach one state (matching both the encoded
+/// world hash AND the full `Saved` digest including portrait & indexed-catalog
+/// fields) and that any that stop are exactly `no_tile`. The lot is left as
+/// it was, with its view centre.
 fn every_start_gives_one_state(lot: &mut Lot, no_tile: &[[i8; 2]]) {
     let saved = lot.save().unwrap();
     let centre = lot.view_centre();
@@ -103,7 +103,12 @@ fn every_start_gives_one_state(lot: &mut Lot, no_tile: &[[i8; 2]]) {
             lot.restore(saved.clone()).unwrap();
             lot.set_view_centre(Some([x, y]));
             match lot.step() {
-                Ok(_) => *states.entry(lot.world().hash_hex()).or_insert(0) += 1,
+                Ok(_) => {
+                    let world_hash = lot.world().hash_hex();
+                    lot.set_view_centre(centre);
+                    let full_hash = digest(&lot.save().unwrap().encode());
+                    *states.entry((world_hash, full_hash)).or_insert(0) += 1;
+                }
                 Err(error) => {
                     let error = error.to_string();
                     assert!(

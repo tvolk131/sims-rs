@@ -293,12 +293,42 @@ fn lookup_loaded_skeleton_by_name<'p>(
     people.skeletons.values().find(|s| s.name == name)
 }
 
+/// Loads one `.ndx`-referenced `.bcf` catalog (`0x59e60e` → `0x59f087`),
+/// populating BOTH unloaded skeletons (`0x59f18c`–`0x59f19f`) AND unloaded
+/// appearances (`0x59f34c`–`0x59f35f`) from that catalog without overwriting
+/// eager or previously attempted entries.
+fn load_indexed_bcf_catalog(people: &People, world: &mut World, loc: &str) {
+    if let Some((items, _)) = people.indexed_catalogs.get(loc) {
+        for item in items {
+            if !people.skeletons_by_name.contains_key(&item.name)
+                && !world.loaded_indexed_skeletons.contains_key(&item.name)
+            {
+                world
+                    .loaded_indexed_skeletons
+                    .insert(item.name.clone(), Some(loc.to_owned()));
+            }
+        }
+    }
+    if let Some((catalog_heads, _)) = people.indexed_suit_catalogs.get(loc) {
+        for (app_name, &has_head) in catalog_heads {
+            if !people.eager_suits.contains(app_name)
+                && !world.loaded_indexed_suits.contains_key(app_name)
+            {
+                world
+                    .loaded_indexed_suits
+                    .insert(app_name.clone(), Some(has_head));
+            }
+        }
+    }
+}
+
 /// Resolves a skeleton by exact byte-for-byte name (`0x5a0384`, `0x5a280f`),
 /// executing lazy `.ndx` catalog loads in runtime call order: loading a
-/// catalog populates every decoded skeleton in that `.bcf` into
-/// `world.loaded_indexed_skeletons` for any name not already loaded or
-/// previously attempted (`0x59f18c`–`0x59f19f`), and marks a missed lazy entry
-/// failed (`0x5a389b`) so later catalog loads cannot overwrite it.
+/// catalog populates every decoded skeleton AND appearance in that `.bcf` into
+/// `world.loaded_indexed_skeletons` / `world.loaded_indexed_suits` for any
+/// name not already loaded or previously attempted (`0x59e60e` → `0x59f087`),
+/// and marks a missed lazy entry failed (`0x5a389b`) so later catalog loads
+/// cannot overwrite it.
 pub(crate) fn resolve_skeleton_by_name<'p>(
     people: &'p People,
     world: &mut World,
@@ -333,22 +363,14 @@ pub(crate) fn resolve_skeleton_by_name<'p>(
                 return Err(Trap::Unsupported(reason.clone()));
             }
         };
-        let (items, decode_error) = people.indexed_catalogs.get(loc).ok_or_else(|| {
+        let (_, decode_error) = people.indexed_catalogs.get(loc).ok_or_else(|| {
             Trap::Unsupported(format!(
                 "0x5a3810: indexed catalog {loc} for skeleton {name:?} is unavailable"
             ))
         })?;
-        // 0x59f18c..0x59f19f: every skeleton decoded from this catalog fills
-        // any unloaded (and not previously attempted) entry in the registry.
-        for item in items {
-            if !people.skeletons_by_name.contains_key(&item.name)
-                && !world.loaded_indexed_skeletons.contains_key(&item.name)
-            {
-                world
-                    .loaded_indexed_skeletons
-                    .insert(item.name.clone(), Some(loc.clone()));
-            }
-        }
+        // 0x59e60e -> 0x59f087: loading this `.bcf` populates both its
+        // skeletons (`0x59f18c`) and its appearances (`0x59f34c`).
+        load_indexed_bcf_catalog(people, world, loc);
         if let Some(Some(filled_loc)) = world.loaded_indexed_skeletons.get(name)
             && let Some(skeleton) = people
                 .indexed_catalogs
@@ -418,60 +440,91 @@ pub(crate) fn resolve_skeleton<'p>(
     })
 }
 
-/// Resolves whether lowercased appearance `suit` binds `"HEAD"` with a valid
-/// mesh (`0x5a044d` → `0x5a38da` → `0x59f35f`), executing lazy `.ndx`
-/// appearance catalog loads in runtime call order: loading a `.bcf` catalog
-/// fills every unloaded appearance in that catalog into
-/// `world.loaded_indexed_suits` without overwriting eager or already-attempted
-/// entries (`0x59f34c`), and marks a missed lazy entry failed (`None`) so later
-/// catalog loads cannot overwrite it.
-pub(crate) fn resolve_suit_head(people: &People, world: &mut World, suit: &str) -> Option<bool> {
+/// Result of looking up lowercased appearance `suit` via `0x5a044d` →
+/// `0x5a38da` → `0x59e60e` → `0x59f087`.
+enum ResolvedSuit {
+    /// Appearance exists; `bool` is whether it binds `"HEAD"` with a valid mesh.
+    Found(bool),
+    /// Appearance is confirmed absent (or previously attempted and failed at `0x5a3965`).
+    Missing,
+    /// An earlier decode error prevented knowing whether `suit` exists / binds `"HEAD"`.
+    Unknown,
+}
+
+fn resolve_suit(people: &People, world: &mut World, suit: &str) -> ResolvedSuit {
     if people.eager_suits.contains(suit) {
-        return Some(people.head_suits.contains(suit));
+        return ResolvedSuit::Found(people.head_suits.contains(suit));
     }
     if let Some(&slot) = world.loaded_indexed_suits.get(suit) {
-        return Some(slot.unwrap_or(false));
+        return match slot {
+            Some(has_head) => ResolvedSuit::Found(has_head),
+            None => ResolvedSuit::Missing,
+        };
     }
     if let Some(entry) = people.indexed_suits.get(suit) {
         match entry {
             Ok(loc) => {
-                if let Some((catalog_heads, decode_error)) = people.indexed_suit_catalogs.get(loc) {
-                    for (app_name, &has_head) in catalog_heads {
-                        if !people.eager_suits.contains(app_name)
-                            && !world.loaded_indexed_suits.contains_key(app_name)
-                        {
-                            world
-                                .loaded_indexed_suits
-                                .insert(app_name.clone(), Some(has_head));
-                        }
-                    }
+                if let Some((_, decode_error)) = people.indexed_suit_catalogs.get(loc) {
+                    // 0x59e60e -> 0x59f087: loading this `.bcf` populates both
+                    // its skeletons (`0x59f18c`) and its appearances (`0x59f34c`).
+                    load_indexed_bcf_catalog(people, world, loc);
                     if let Some(&Some(has_head)) = world.loaded_indexed_suits.get(suit) {
-                        return Some(has_head);
+                        return ResolvedSuit::Found(has_head);
                     }
-                    if decode_error.is_some() {
-                        return None;
-                    }
+                    // 0x5a3965: mark the requested entry attempted (`None`)
+                    // BEFORE returning even on a decode error, so later
+                    // catalog loads cannot fill it (`0x59f34c`).
                     world.loaded_indexed_suits.insert(suit.to_owned(), None);
-                    return Some(false);
+                    return if decode_error.is_some() {
+                        ResolvedSuit::Unknown
+                    } else {
+                        ResolvedSuit::Missing
+                    };
                 }
-                return None;
+                world.loaded_indexed_suits.insert(suit.to_owned(), None);
+                return ResolvedSuit::Unknown;
             }
             Err(_) => {
                 world.loaded_indexed_suits.insert(suit.to_owned(), None);
                 return if people.suit_errors.is_empty() {
-                    Some(false)
+                    ResolvedSuit::Missing
                 } else {
-                    None
+                    ResolvedSuit::Unknown
                 };
             }
         }
     }
     if people.head_suits.contains(suit) {
-        Some(true)
-    } else if !people.suit_errors.is_empty() && !people.suits.contains(suit) {
-        None
+        ResolvedSuit::Found(true)
+    } else if people.suits.contains(suit) {
+        ResolvedSuit::Found(false)
+    } else if !people.suit_errors.is_empty() {
+        ResolvedSuit::Unknown
     } else {
-        Some(false)
+        ResolvedSuit::Missing
+    }
+}
+
+/// Resolves whether lowercased appearance `suit` binds `"HEAD"` with a valid
+/// mesh (`0x5a044d` → `0x5a38da` → `0x59e60e` → `0x59f087`), executing lazy
+/// `.ndx` `.bcf` catalog loads in runtime call order.
+pub(crate) fn resolve_suit_head(people: &People, world: &mut World, suit: &str) -> Option<bool> {
+    match resolve_suit(people, world, suit) {
+        ResolvedSuit::Found(has_head) => Some(has_head),
+        ResolvedSuit::Missing => Some(false),
+        ResolvedSuit::Unknown => None,
+    }
+}
+
+/// Resolves whether lowercased appearance `suit` exists in the avatar registry
+/// at dress time (`0x58d903` → `0x583559` → `0x5a044d`), executing lazy `.ndx`
+/// `.bcf` catalog loads in runtime call order. Returns `None` if decode errors
+/// could hide `suit`.
+pub(crate) fn resolve_suit_exists(people: &People, world: &mut World, suit: &str) -> Option<bool> {
+    match resolve_suit(people, world, suit) {
+        ResolvedSuit::Found(_) => Some(true),
+        ResolvedSuit::Missing => Some(false),
+        ResolvedSuit::Unknown => None,
     }
 }
 
