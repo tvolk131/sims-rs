@@ -60,9 +60,12 @@ lot-drawn people.
   onto `raster`'s half-integer pixel-centre sampler. `View::screen` stays in unshifted screen
   coordinates, and offscreen `raster::Canvas` renders (pinned in `goth_family` and `playback`)
   stay bit-identical.
-- **`pack_body_565` & `People::update` (`crates/sims-people/src/lot.rs`):** Truncates textured
-  parts (`part.texture_name.is_some()`) to 5-6-5 (`r & 0xf8`, `g & 0xfc`, `b & 0xf8`) on load,
-  leaving untextured parts (the plumb bob's `white` material) at full 8-bit white.
+- **`Packed565` in `People::draw` (`crates/sims-people/src/lot.rs`):** Wraps textured parts'
+  (`part.texture_name.is_some()`) target writes to truncate RGB texels to 5-6-5
+  (`r & 0xf8`, `g & 0xfc`, `b & 0xf8`) on the lot draw path without mutating the shared `Body`
+  cache read by `People::posed` (preserving full 8-bit skin texels for offscreen callers such
+  as the pie-menu portrait renderer) and leaving untextured parts (the plumb bob's `white`
+  material) at full 8-bit white.
 - **`Target::write_coloured` (`crates/sims-people/src/raster.rs`) & `impl Target for sims_render::Canvas`
   (`crates/sims-people/src/lot.rs`):** Routes both grey and coloured (lamp-lit and plumb-bob)
   shading on the lot canvas through one half-up 8-bit rounding implementation while preserving

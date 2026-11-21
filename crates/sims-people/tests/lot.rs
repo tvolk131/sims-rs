@@ -585,8 +585,9 @@ fn bob_green([r, g, b]: [u8; 3]) -> bool {
 /// (person 21) reads on the porch bench, as in a screenshot of the
 /// original at medium zoom (7:38 AM, camera origin (335, −560), cutaway),
 /// its green pixels span the box the original's do, x 427 to 434 and
-/// y 74 to 97, each edge within a pixel; the pixels inside the box are
-/// not compared one by one. Taken out of his head slot, it is not drawn.
+/// y 74 to 97, within a pixel in x and two pixels in y; the pixels inside
+/// the box are not compared one by one. Taken out of his head slot, it is
+/// not drawn.
 #[test]
 fn the_plumb_bob_floats_over_the_selected_persons_head() {
     let Some(root) = install() else { return };
@@ -915,6 +916,23 @@ fn mortimer_stands_without_his_book_as_the_original_draws_him() {
         assert!(!parts.contains(name), "{name} is still drawn: {parts:?}");
     }
     assert!(!parts.iter().any(|p| p.contains("book")), "{parts:?}");
+    // The shared `Body` cache read by `People::posed` (used by the pie-menu
+    // portrait renderer) keeps full 8-bit skin texels; 5-6-5 packing happens
+    // only on the lot draw path (`Packed565`).
+    {
+        let (posed, problems) = people.posed(world, 1);
+        assert!(problems.is_empty(), "{problems:?}");
+        let mortimer_body = posed.iter().find(|p| p.id == 21).unwrap().body;
+        assert!(
+            mortimer_body
+                .parts
+                .iter()
+                .filter(|p| p.texture_name.is_some())
+                .flat_map(|p| p.texture.rgba.as_chunks::<4>().0)
+                .any(|px| (px[0] & 0x07) != 0 || (px[1] & 0x03) != 0 || (px[2] & 0x07) != 0),
+            "cached skin textures should preserve their original 8-bit low bits"
+        );
+    }
     let mortimer = world.objects[&21].person.as_ref().unwrap();
     let carried: Vec<&str> = mortimer
         .accessories
