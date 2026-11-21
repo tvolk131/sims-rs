@@ -82,8 +82,10 @@ pub struct Hud {
     queue: Queue,
     /// The actions whose icons were pressed while they show.
     pressed: Pressed,
-    /// The Live-mode pause button's 500 ms blink timer (`0x53b4b0..0x53b7e7`).
-    pause_blink: PauseBlink,
+    /// The clock controls' shared 500 ms blink timer (`0x53b4b0..0x53b7e7`):
+    /// state 2 blinks Pause (row 0 <-> row 1) and state 3 blinks Ultra
+    /// (`selected` false <-> true) during idle speed when return speed != Ultra.
+    clock_blink: ClockBlink,
     /// The interface's sounds, until the game takes them.
     sounds: Vec<SoundEvent>,
 }
@@ -173,7 +175,7 @@ impl Hud {
             band: None,
             queue: Queue::default(),
             pressed: Pressed::default(),
-            pause_blink: PauseBlink::default(),
+            clock_blink: ClockBlink::default(),
             sounds: Vec::new(),
         })
     }
@@ -187,17 +189,28 @@ impl Hud {
         self.message = None;
         self.dialog = None;
         self.pressed = Pressed::default();
-        self.pause_blink.reset();
+        self.clock_blink.reset();
         self.controls.pause_lit = false;
+        self.controls.ultra_lit = false;
     }
 
-    /// Syncs the pause button's 500 ms blink timer (`0x53b4b0..0x53b7e7`)
-    /// with `paused` (state 2 blinks whenever paused, including outside Live
-    /// mode via `0x53b58a -> 0x53b5d5 -> 0x53b5e8`) and the monotonic
-    /// `clock_us`. Returns true if the lit phase changed.
-    pub fn sync_pause_blink(&mut self, paused: bool, clock_us: u64) -> bool {
-        let changed = self.pause_blink.sync(paused, clock_us);
-        self.controls.pause_lit = self.pause_blink.lit();
+    /// Syncs the clock controls' shared 500 ms blink timer (`0x53b4b0..0x53b7e7`)
+    /// with `world` and the monotonic `clock_us`:
+    /// - state 2 (`ClockBlinkMode::Pause`): blinks `id::PAUSE` row 0 <-> row 1
+    ///   whenever paused (including outside Live mode, `0x53b58a -> 0x53b5e8`);
+    /// - state 3 (`ClockBlinkMode::Ultra`): blinks `id::ULTRA` selected state
+    ///   while unpaused in Live mode with idle speed active
+    ///   (`world.return_speed() >= 0 && world.speed() == sims_sim::speed::IDLE`)
+    ///   and saved return speed != Ultra (`0x53b4c9..0x53b4fe`).
+    ///
+    /// Returns true if either `controls.pause_lit` or `controls.ultra_lit` changed.
+    pub fn sync_clock_blink(&mut self, world: &World, clock_us: u64) -> bool {
+        let idle_speed = world.return_speed() >= 0 && world.speed() == sims_sim::speed::IDLE;
+        let speed = hud::speed_for(world);
+        let mode = hud::clock_blink_mode(world.paused(), self.controls.mode, idle_speed, speed);
+        let changed = self.clock_blink.sync(mode, clock_us);
+        self.controls.pause_lit = self.clock_blink.pause_lit();
+        self.controls.ultra_lit = self.clock_blink.ultra_lit();
         changed
     }
 
@@ -267,7 +280,7 @@ impl Hud {
             Some(UiPanel::Relationships) => {
                 snapshot.with_relations(world, self.members(world), &self.known)
             }
-            Some(UiPanel::House) if self.controls.expanded => {
+            Some(UiPanel::House) if self.controls.expanded && snapshot.residential => {
                 snapshot.with_house(world, &self.house, &self.kinds)
             }
             _ => snapshot,
@@ -310,7 +323,7 @@ impl Hud {
         if self.controls.follow(Selected::of(&household)) {
             self.play(WHOOSH);
         }
-        if self.controls.expanded && self.controls.panel == Some(UiPanel::House) {
+        if self.controls.expanded && residential && self.controls.panel == Some(UiPanel::House) {
             self.kinds.learn(world, assets.index(), assets.catalog());
         }
         // The pause button shows global 17, which the game's pause sets.
@@ -642,30 +655,46 @@ impl Pressed {
     }
 }
 
-/// The Live-mode pause button's 500 ms blink timer (`0x53b4b0..0x53b7e7`):
-/// starts unlit (cyan row 0, `0x53b707..0x53b74d`) on entry and toggles row
-/// every [`hud::PAUSE_BLINK_US`] (`0x53b500..0x53b528`).
+/// The clock controls' shared 500 ms blink timer (`0x53b4b0..0x53b7e7`):
+/// state 2 (`Pause`) starts unlit (cyan row 0, `0x53b707..0x53b74d`) and
+/// toggles row every [`hud::PAUSE_BLINK_US`] (`0x53b500..0x53b528`);
+/// state 3 (`Ultra`) starts unlit (`selected = false`, `0x53b6e0..0x53b705`)
+/// and toggles `id::ULTRA` selected every [`hud::PAUSE_BLINK_US`]
+/// (`0x53b4c9..0x53b4fe`). Transitioning between modes cancels the old timer,
+/// clears the previous lit flag, and starts fresh (`0x53b6bc -> 0x53b757`).
 #[derive(Debug, Default)]
-struct PauseBlink {
+struct ClockBlink {
+    mode: hud::ClockBlinkMode,
     since: Option<u64>,
     lit: bool,
 }
 
-impl PauseBlink {
-    fn lit(&self) -> bool {
-        self.lit
+impl ClockBlink {
+    fn pause_lit(&self) -> bool {
+        self.mode == hud::ClockBlinkMode::Pause && self.lit
+    }
+
+    fn ultra_lit(&self) -> bool {
+        self.mode == hud::ClockBlinkMode::Ultra && self.lit
     }
 
     fn reset(&mut self) {
+        self.mode = hud::ClockBlinkMode::Off;
         self.since = None;
         self.lit = false;
     }
 
-    fn sync(&mut self, blinking: bool, clock_us: u64) -> bool {
-        let before = self.lit;
-        if !blinking {
+    fn sync(&mut self, mode: hud::ClockBlinkMode, clock_us: u64) -> bool {
+        let before = (self.pause_lit(), self.ultra_lit());
+        if mode == hud::ClockBlinkMode::Off {
             self.reset();
-            return self.lit != before;
+            return (self.pause_lit(), self.ultra_lit()) != before;
+        }
+        if self.mode != mode {
+            self.mode = mode;
+            self.since = Some(clock_us);
+            self.lit = false;
+            return (self.pause_lit(), self.ultra_lit()) != before;
         }
         match self.since {
             None => {
@@ -673,15 +702,15 @@ impl PauseBlink {
                 self.lit = false;
             }
             Some(since) if clock_us.saturating_sub(since) >= hud::PAUSE_BLINK_US => {
-                // 0x53b500..0x53b52e -> 0x5daf1c..0x5daf31: a single timer
-                // callback toggles the row once and re-arms 500 ms from the
-                // current clock, even after a long stall.
+                // 0x53b4c9..0x53b52e -> 0x5daf1c..0x5daf31: a single timer
+                // callback toggles once and re-arms 500 ms from the current
+                // clock, even after a long stall.
                 self.lit = !self.lit;
                 self.since = Some(clock_us);
             }
             Some(_) => {}
         }
-        self.lit != before
+        (self.pause_lit(), self.ultra_lit()) != before
     }
 }
 
@@ -693,37 +722,49 @@ mod tests {
 
     #[test]
     fn pause_blink_toggles_every_500ms_and_resets_unlit() {
-        let mut blink = PauseBlink::default();
-        assert!(!blink.lit());
+        let mut blink = ClockBlink::default();
+        assert!(!blink.pause_lit());
         // Entering Live-mode pause starts unlit (cyan row 0, 0x53b707..0x53b74d).
-        assert!(!blink.sync(true, 100_000));
-        assert!(!blink.lit());
+        assert!(!blink.sync(hud::ClockBlinkMode::Pause, 100_000));
+        assert!(!blink.pause_lit());
         // 499.999 ms later: still unlit.
-        assert!(!blink.sync(true, 599_999));
-        assert!(!blink.lit());
+        assert!(!blink.sync(hud::ClockBlinkMode::Pause, 599_999));
+        assert!(!blink.pause_lit());
         // At 500 ms: flips to lit (red row 1, 0x53b500..0x53b528).
-        assert!(blink.sync(true, 600_000));
-        assert!(blink.lit());
+        assert!(blink.sync(hud::ClockBlinkMode::Pause, 600_000));
+        assert!(blink.pause_lit());
         // At 1000 ms: flips back to unlit.
-        assert!(blink.sync(true, 1_100_000));
-        assert!(!blink.lit());
+        assert!(blink.sync(hud::ClockBlinkMode::Pause, 1_100_000));
+        assert!(!blink.pause_lit());
         // A 1-second stall (2x 500 ms) toggles once and re-arms 500 ms from
         // the current clock (0x53b500..0x53b52e -> 0x5daf1c..0x5daf31).
-        assert!(blink.sync(true, 2_100_000));
-        assert!(blink.lit());
-        assert!(!blink.sync(true, 2_599_999));
-        assert!(blink.sync(true, 2_600_000));
-        assert!(!blink.lit());
+        assert!(blink.sync(hud::ClockBlinkMode::Pause, 2_100_000));
+        assert!(blink.pause_lit());
+        assert!(!blink.sync(hud::ClockBlinkMode::Pause, 2_599_999));
+        assert!(blink.sync(hud::ClockBlinkMode::Pause, 2_600_000));
+        assert!(!blink.pause_lit());
         // Unpausing clears lit and kills the timer; re-pausing starts fresh unlit.
-        assert!(blink.sync(true, 3_100_000));
-        assert!(blink.lit());
-        assert!(blink.sync(false, 3_200_000));
-        assert!(!blink.lit());
-        assert!(!blink.sync(true, 3_400_000));
-        assert!(!blink.lit());
-        assert!(!blink.sync(true, 3_899_999));
-        assert!(blink.sync(true, 3_900_000));
-        assert!(blink.lit());
+        assert!(blink.sync(hud::ClockBlinkMode::Pause, 3_100_000));
+        assert!(blink.pause_lit());
+        assert!(blink.sync(hud::ClockBlinkMode::Off, 3_200_000));
+        assert!(!blink.pause_lit());
+        assert!(!blink.sync(hud::ClockBlinkMode::Pause, 3_400_000));
+        assert!(!blink.pause_lit());
+        assert!(!blink.sync(hud::ClockBlinkMode::Pause, 3_899_999));
+        assert!(blink.sync(hud::ClockBlinkMode::Pause, 3_900_000));
+        assert!(blink.pause_lit());
+
+        // Switching directly from lit Pause (state 2) to Ultra (state 3)
+        // clears pause_lit, starts ultra_lit unlit, and toggles ultra_lit at
+        // 500 ms (`0x53b6bc -> 0x53b757`, `0x53b4c9..0x53b4fe`).
+        assert!(blink.sync(hud::ClockBlinkMode::Ultra, 4_000_000));
+        assert!(!blink.pause_lit());
+        assert!(!blink.ultra_lit());
+        assert!(!blink.sync(hud::ClockBlinkMode::Ultra, 4_499_999));
+        assert!(blink.sync(hud::ClockBlinkMode::Ultra, 4_500_000));
+        assert!(blink.ultra_lit());
+        assert!(blink.sync(hud::ClockBlinkMode::Off, 4_600_000));
+        assert!(!blink.ultra_lit());
     }
 
     #[test]

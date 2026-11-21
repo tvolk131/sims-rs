@@ -169,7 +169,7 @@ impl Game {
             lot.world(),
             lot.program().autonomy_constants().friendship_threshold,
         )?;
-        hud.sync_pause_blink(lot.world().paused(), 0);
+        hud.sync_clock_blink(lot.world(), 0);
         let mut people = People::open(&options.install, house)?;
         people.refresh(lot.world());
         let view = View::new([800, 600], lot_shape.built_center(), lot.view_rotation());
@@ -306,7 +306,7 @@ impl Game {
         if let Err(e) = result {
             self.note = Some(format!("The speed was not changed: {e}"));
         }
-        if self.hud.sync_pause_blink(self.paused(), self.clock_us) {
+        if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
             self.blink_dirty = true;
         }
     }
@@ -328,7 +328,7 @@ impl Game {
         if let Err(e) = result {
             self.note = Some(format!("The pause was not changed: {e}"));
         }
-        if self.hud.sync_pause_blink(self.paused(), self.clock_us) {
+        if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
             self.blink_dirty = true;
         }
     }
@@ -372,7 +372,7 @@ impl Game {
     /// (**unverified**, and the window's timing, not the simulation's).
     pub fn advance(&mut self, elapsed_us: u64) -> u32 {
         self.clock_us = self.clock_us.saturating_add(elapsed_us);
-        if self.hud.sync_pause_blink(self.paused(), self.clock_us) {
+        if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
             self.blink_dirty = true;
         }
         if self.lot.asking().is_some() {
@@ -384,7 +384,7 @@ impl Game {
         }
         let due = self.pace.due(elapsed_us, self.lot.world().speed());
         let ran = self.run_while(due, true);
-        if self.hud.sync_pause_blink(self.paused(), self.clock_us) {
+        if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
             self.blink_dirty = true;
         }
         ran
@@ -398,6 +398,9 @@ impl Game {
         let set = self.lot.idle_speed().unwrap_or(false);
         if set {
             self.pace.restart();
+            if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
+                self.blink_dirty = true;
+            }
         }
         set
     }
@@ -598,7 +601,7 @@ impl Game {
         // it was shown.
         let dialogs = self.lot.asking().map_or(world, |a| &a.world);
         self.hud.read_dialog(dialogs, &self.assets);
-        self.hud.sync_pause_blink(world.paused(), self.clock_us);
+        self.hud.sync_clock_blink(world, self.clock_us);
         self.blink_dirty = false;
         self.hud.draw(
             world,
@@ -707,6 +710,9 @@ impl Game {
                 Some(command) => self.command(command, menu.as_ref()),
                 None => Outcome::redraw(),
             };
+            if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
+                self.blink_dirty = true;
+            }
             let sounds = self.hud.take_sounds();
             self.keep_sounds(sounds);
             return outcome;
@@ -1114,7 +1120,14 @@ impl Game {
     /// on a press on the selected Sim's portrait (0x51ea7a, behind a
     /// check of global 0x6f6bac) whose effect has not been read.
     pub fn select(&mut self, sim: u16) {
-        if self.lot.world().selected() == Some(sim) {
+        let world = self.lot.world();
+        let same_neighbor = world.selected() == Some(sim)
+            || world
+                .selected()
+                .and_then(|id| world.objects.get(&id))
+                .zip(world.objects.get(&sim))
+                .is_some_and(|(selected, target)| selected.guid == target.guid);
+        if same_neighbor {
             self.centre_on(sim);
             self.hud.play(crate::hud::CLICK);
             return;
@@ -1296,7 +1309,7 @@ impl Game {
         self.hud.forget();
         self.blink_dirty = false;
         let world = self.lot.world();
-        self.hud.sync_pause_blink(world.paused(), self.clock_us);
+        self.hud.sync_clock_blink(world, self.clock_us);
         if let Some(speed) = pace::shown(world) {
             self.pace.speed = speed;
         }
