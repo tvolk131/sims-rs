@@ -4325,8 +4325,9 @@ fn report_card_superstar_panel_and_help_balloons() {
         &i.kind,
         Kind::Balloon(b) if b.title.starts_with("Studio Fly")
     )));
-    // Pressing on the open balloon itself (`0x66bd78 -> 0x5dd8e6`) keeps it
-    // open without `UI_whoosh`, while hovering outside the subpanel & balloon
+    // Pressing on the open balloon itself (`0x66bd68 -> 0x5dd85f`) keeps it
+    // open without `UI_whoosh`, while hovering onto the balloon itself
+    // (`0x51a0a2..0x51a0b5`, `0x51d312`) or outside the subpanel
     // (`0x51f1f2..0x51f3e5`, `0x51d2ee..0x51d329`) dismisses it with `UI_whoosh`.
     let balloon_rect = hud
         .items()
@@ -4338,7 +4339,7 @@ fn report_card_superstar_panel_and_help_balloons() {
     assert_eq!(hud.press(center(balloon_rect), &fame_world, true), None);
     assert_eq!(hud.controls.help, Some(Help::FameLevel(4)));
     assert!(hud.take_sounds().is_empty());
-    assert!(hud.hover([10, 10]));
+    assert!(hud.hover(center(balloon_rect)));
     assert_eq!(hud.controls.help, None);
     assert_eq!(
         hud.take_sounds(),
@@ -4351,7 +4352,48 @@ fn report_card_superstar_panel_and_help_balloons() {
     // 4. Moving the pointer onto the lot (`Game::hover`), leaving the window
     //    (`Game::leave`), or clicking directly on the lot (`Game::press`, both
     //    empty ground and an object that opens a pie menu) dismisses an open
-    //    help balloon with `UI_whoosh`.
+    //    help balloon with `UI_whoosh`. At 1024x768 (`0x518f48`, `0x51f260`),
+    //    the western subpanel spans x=521..1024 so hovering (650, 700) keeps
+    //    Hunger open.
+    game.resize([1024, 768]);
+    game.render();
+    let hunger_1024 = game
+        .panel()
+        .iter()
+        .find_map(|i| {
+            (i.command
+                == Some(Command::Help(Help::Need {
+                    pet: false,
+                    index: 0,
+                })))
+            .then_some(i.rect)
+        })
+        .expect("Hunger hitbox at 1024x768");
+    assert_eq!(hunger_1024.x, 521);
+    game.press(center(hunger_1024));
+    game.render();
+    let _ = game.take_sounds();
+    let _ = game.hover([650, 700]);
+    assert!(game.take_sounds().is_empty());
+    game.render();
+    assert!(
+        game.panel()
+            .iter()
+            .any(|i| matches!(&i.kind, Kind::Balloon(b) if b.title == "Hunger"))
+    );
+    // Moving onto the balloon itself dismisses it + WHOOSH.
+    let balloon_1024 = game
+        .panel()
+        .iter()
+        .find(|i| matches!(i.kind, Kind::Balloon(_)))
+        .expect("Hunger balloon at 1024x768")
+        .rect;
+    assert!(game.hover(center(balloon_1024)));
+    assert!(game.take_sounds().contains(&SoundEvent::Play {
+        object: INTERFACE,
+        name: WHOOSH.into(),
+    }));
+
     game.resize([800, 600]);
     game.render();
     let find_hunger = |game: &Game| {

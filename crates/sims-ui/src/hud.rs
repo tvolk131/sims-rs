@@ -354,8 +354,10 @@ impl Controls {
     /// not the text), when another panel opens (`0x51d375`), when the strip
     /// closes, or when a control outside the live panel takes a press
     /// (`0x51d312`, `0x51d354`: portraits, cluster, speed, camera, mode,
-    /// help dialog, or action queue). Pointer exits and presses outside the
-    /// subpanel and balloon are dismissed by the host via [`keeps_help_open`].
+    /// help dialog, or action queue). Pointer motion/exits outside the
+    /// subpanel (including onto the balloon itself, `0x51a0a2..0x51a0b5`,
+    /// `0x51d312`) and presses outside both the subpanel and balloon are
+    /// dismissed by the host via [`in_subpanel`] and [`on_balloon`].
     pub fn apply(&mut self, command: &Command) {
         match command {
             Command::TogglePanel => {
@@ -995,10 +997,23 @@ pub fn balloon_objects(items: &[Item]) -> impl Iterator<Item = u32> + '_ {
         .flatten()
 }
 
-/// The live-mode strip: portraits at the left, the gadget and the needs
-/// at the right.
+/// The live-mode strip: portraits at the left, the gadget and the subpanel
+/// at the right. At width 1024 (`0x518f40..0x518f48`, `0x51f258..0x51f260`,
+/// `0x51f527..0x51f52f`), the gadget stays at `x = 413` and only the subpanel's
+/// right edge extends by 224 pixels (`0xe0`).
 fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls: &Controls) {
-    let gadget = Rect::new(strip.x + strip.width - NEEDS_WIDTH, strip.y, 108, STRIP);
+    let extra = if strip.x.saturating_add(strip.width) == 1024 {
+        224
+    } else {
+        0
+    };
+    let subpanel_width = NEEDS_WIDTH - 108 + extra;
+    let gadget = Rect::new(
+        strip.x + strip.width - (NEEDS_WIDTH + extra),
+        strip.y,
+        108,
+        STRIP,
+    );
     // The portraits, 45 by 45 from (9, 5) in a strip (the old prototype's
     // padding), in as many columns as fit before the gadget and two rows:
     // four columns at 800 by 600, so a family of eight fits. The second
@@ -1081,7 +1096,7 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
     }
     // The original shows no needs without a selected Sim.
     if let (Some(resident), Some(Panel::Needs)) = (selected, open_panel) {
-        let panel = Rect::new(gadget.x + 108, strip.y, NEEDS_WIDTH - 108, STRIP);
+        let panel = Rect::new(gadget.x + 108, strip.y, subpanel_width, STRIP);
         items.push(Item {
             rect: panel,
             kind: Kind::Needs { pet: resident.pet },
@@ -1132,7 +1147,7 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
         }
     }
     if let (Some(resident), Some(Panel::Personality)) = (selected, open_panel) {
-        let panel = Rect::new(gadget.x + 108, strip.y, NEEDS_WIDTH - 108, STRIP);
+        let panel = Rect::new(gadget.x + 108, strip.y, subpanel_width, STRIP);
         // 0x51d650..0x51d663, 0x51d1cc..0x51d1ee: pets (`person.data[65] > 1`)
         // hide the zodiac sign control `[esi + 0x1c4]`.
         let zodiac = (!resident.pet).then_some(resident.zodiac).flatten();
@@ -1164,7 +1179,7 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
         }
     }
     if let (Some(resident), Some(Panel::Job)) = (selected, open_panel) {
-        let panel = Rect::new(gadget.x + 108, strip.y, NEEDS_WIDTH - 108, STRIP);
+        let panel = Rect::new(gadget.x + 108, strip.y, subpanel_width, STRIP);
         // 0x51d598..0x51d624, 0x51cbf8..0x51ccf4: Job-tab subpanel priority:
         // 1) school-age child -> Report Card ([esi + 0x124]),
         // 2) dog/cat pet -> Pet Skills ([esi + 0x114]/[esi + 0x118]),
@@ -1294,14 +1309,14 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
         }
     }
     if let (Some(_), Some(Panel::Relationships)) = (selected, open_panel) {
-        let panel = Rect::new(gadget.x + 108, strip.y, NEEDS_WIDTH - 108, STRIP);
+        let panel = Rect::new(gadget.x + 108, strip.y, subpanel_width, STRIP);
         relationships(items, panel, snapshot, controls);
     }
     // The house panel's draw needs no selected Sim (0x52e49e), but with
     // nobody selected no panel is open ([`Controls::follow`]), and
     // `0x51d3f9..0x51d40f` closes panel 4 on non-residential lots.
     if open_panel == Some(Panel::House) {
-        let panel = Rect::new(gadget.x + 108, strip.y, NEEDS_WIDTH - 108, STRIP);
+        let panel = Rect::new(gadget.x + 108, strip.y, subpanel_width, STRIP);
         items.push(Item {
             rect: panel
                 .offset(HOUSE_TITLE[0], HOUSE_TITLE[1])
@@ -2695,24 +2710,26 @@ pub fn covers(items: &[Item], point: [i32; 2]) -> bool {
         .any(|i| !matches!(i.kind, Kind::Name { .. }) && i.rect.contains(point[0], point[1]))
 }
 
-/// Whether `point` stays inside a region that keeps an open help balloon alive:
-/// the active subpanel (`[gadget.x + 108.., gadget.y..]`, `0x51f22b..0x51f3e5`)
-/// or the open balloon itself (`Kind::Balloon`, whose `OnMouseDown` at `0x66bd78`
-/// forwards without closing it). Moving or pressing outside these regions (onto
-/// the lot, cluster, portraits, gadget left of the subpanel, status band, action
-/// queue, or out of the window) dismisses an open help balloon with `UI_whoosh`
+/// Whether `point` lies inside the live-mode subpanel (`[gadget.x + 108..,
+/// gadget.y..]`, `0x51f22b..0x51f3e5`). Moving the pointer outside this area
+/// (including onto an open help balloon, which attaches outside `LivePanel` at
+/// `0x51a0a2..0x51a0b5`, onto the lot, cluster, portraits, gadget buttons, or
+/// out of the window) dismisses an open help balloon with `UI_whoosh`
 /// (`0x51f1f2..0x51f3e5`, `0x51d2ee..0x51d359`).
-pub fn keeps_help_open(items: &[Item], [x, y]: [i32; 2]) -> bool {
-    if items
-        .iter()
-        .any(|i| matches!(i.kind, Kind::Balloon(_)) && i.rect.contains(x, y))
-    {
-        return true;
-    }
+pub fn in_subpanel(items: &[Item], [x, y]: [i32; 2]) -> bool {
     let Some(gadget) = items.iter().find(|i| i.kind == Kind::Image(id::GAUGE)) else {
         return false;
     };
     x >= gadget.rect.x.saturating_add(108) && y >= gadget.rect.y
+}
+
+/// Whether `point` lies inside an open help balloon (`Kind::Balloon`). A
+/// direct left press on the balloon (`0x66bd68 -> 0x5dd85f`) is absorbed
+/// without dismissing it.
+pub fn on_balloon(items: &[Item], [x, y]: [i32; 2]) -> bool {
+    items
+        .iter()
+        .any(|i| matches!(i.kind, Kind::Balloon(_)) && i.rect.contains(x, y))
 }
 
 /// The item under `point` that a press would act on, for hover changes.
@@ -4931,19 +4948,46 @@ mod tests {
                 index: 7,
             }))
         );
-        assert!(keeps_help_open(
+        assert!(in_subpanel(
             &need_items,
             [need_panel.x + 10, need_panel.y + 10]
         ));
-        assert!(!keeps_help_open(&need_items, [10, 550]));
-        assert!(!keeps_help_open(
+        assert!(!in_subpanel(&need_items, [10, 550]));
+        assert!(!in_subpanel(
             &need_items,
             [need_panel.x + 10, need_panel.y - 1]
         ));
-        assert!(!keeps_help_open(
+        assert!(!in_subpanel(
             &need_items,
             [need_panel.x - 10, need_panel.y + 10]
         ));
+        // At 1024x768 (`0x518f40..0x518f48`, `0x51f258..0x51f260`), the western
+        // subpanel stays anchored at x=521 and extends its right edge by 224px.
+        let need_1024 = layout([1024, 768], &s, &controls);
+        let panel_1024 = need_1024
+            .iter()
+            .find(|i| matches!(i.kind, Kind::Needs { pet: false }))
+            .unwrap()
+            .rect;
+        assert_eq!(panel_1024, Rect::new(521, 668, 503, 100));
+        assert!(in_subpanel(&need_1024, [650, 700]));
+        // Report Card grade button spans the full 503px subpanel at 1024px (`0x532c08`).
+        let mut rc_snap = s.clone();
+        rc_snap.residents[0].school_age = true;
+        rc_snap.residents[0].child = true;
+        let rc_controls = Controls {
+            expanded: true,
+            panel: Some(Panel::Job),
+            ..Controls::default()
+        };
+        let mut rc_1024 = layout([1024, 768], &rc_snap, &rc_controls);
+        fit(&mut rc_1024, &art, &texts);
+        let rc_btn_1024 = rc_1024
+            .iter()
+            .find(|i| matches!(i.kind, Kind::ReportCardButton { .. }))
+            .unwrap()
+            .rect;
+        assert_eq!((rc_btn_1024.x, rc_btn_1024.width), (521, 503));
         controls.help = Some(Help::Need {
             pet: false,
             index: 0,

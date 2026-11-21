@@ -390,6 +390,17 @@ impl ApplicationHandler for Viewer {
                     }
                 }
             }
+            WindowEvent::CursorLeft { .. } => {
+                self.drag = None;
+                if let Some(hud) = &mut self.hud
+                    && hud.leave()
+                {
+                    self.dirty = true;
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                }
+            }
             _ => {}
         }
     }
