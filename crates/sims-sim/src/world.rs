@@ -276,14 +276,25 @@ impl HouseUsage {
 /// it was answered. The registry's pass at the end of a lot update
 /// (0x4412d1) shows each new record and destroys the ones that are done.
 /// What a dialog says and shows is presentation and is not kept.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Dialogs {
     /// The records in the order they were made.
     pub records: Vec<Dialog>,
-    /// Registry word 0x100. An ordinary dialog sets it to -1 when its
-    /// second button is pressed (0x451a49). Only a kind of dialog that is
-    /// not ported reads it.
+    /// Registry word 0x100. `cObjectRegistry` initializes it to -1 (0x43f72d),
+    /// an ordinary dialog sets it to -1 when its second button is pressed
+    /// (0x451a49), a pet-picker dialog writes the chosen pet body index
+    /// (0x441d95), and Make New Character's pet branch reads it and resets it
+    /// to -1 (0x44b064, 0x44b09b).
     pub declined: i16,
+}
+
+impl Default for Dialogs {
+    fn default() -> Self {
+        Self {
+            records: Vec::new(),
+            declined: -1,
+        }
+    }
 }
 
 /// One dialog record (0x4443ab makes it; the original's record is far

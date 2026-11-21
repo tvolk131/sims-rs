@@ -273,10 +273,10 @@ const UD1_DIALOGS: [(u8, Option<i16>); 6] = [
 /// UserData1's House 69 at entry (format 30), a regression pin of our
 /// run. It differs from track 2's recording only in object 2's last
 /// result; see `20261120-ud1-house-69-matches-the-recording.md`.
-const OLD_TOWN_69: &str = "c5e13dcc25bd62e07d7b456bf47eddfc1837434ace4575048d445e113cce67d3";
+const OLD_TOWN_69: &str = "e34ca24ca0aef8aa000507db5bd03ee074e85845278853616c02e38c191eae7b";
 /// The same after 1000 ticks, a regression pin, which differs from the
 /// recording's update 1000 only in object 2's last result.
-const OLD_TOWN_69_1000: &str = "5d8b7386fad6b71f7117c4a241853992dfe39f853033336022d74b8fed95ece1";
+const OLD_TOWN_69_1000: &str = "21a7f3b2ade639b129c5008949647519d12432993ce3b30f13dd56fbd0e17a86";
 
 /// UserData2 as the original left it after opening it for the first time,
 /// in a fresh directory: the install's UserData2, with the `Characters`
@@ -1280,11 +1280,11 @@ const RECORDED_FRAMES: &str = "0,1,2,29,59,89,101,102,123+30";
 /// differs at entry in object 2's last result; see the decision
 /// `20261120-ud2-house-69-boots-from-the-originals-import.md` for what
 /// the comparison reads and skips.
-const IMPORTED_69: &str = "647c524ea5e613ef5d94a2398525f0f3004ce7921af4ba278ee704c321722f29";
+const IMPORTED_69: &str = "9ca0dd8afe6c5b848be0d6cdd3c8b03c006e1f2d612843c1a6bb8fc02a6bccb0";
 /// The same after 1000 ticks, with the recording's frames: a regression
 /// pin, which differs from the recording's update 1000 in object 2's last
 /// result.
-const IMPORTED_69_1000: &str = "c4aaebafe6a691b3e16e0adc650bd1c7803c14bb8ff4ce417c9e9d3ca33cbad0";
+const IMPORTED_69_1000: &str = "8d0258ba3e1a8922a59f365ad4a4031d76a9365d97d20a264c1e039cd829a921";
 /// The same at tick 43200, a whole day from the load.
 const TICK_43200: &str = "b67d0c132d35c3579bdc28dfc91fd4476c755c76c6efa18a881615c33fda41e2";
 /// The same state's hash under snapshot format 29, which had no person

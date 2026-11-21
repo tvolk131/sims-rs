@@ -1169,7 +1169,10 @@ fn without_dialogs_or_person_ticks_the_encoding_is_format_8_and_three_zero_bytes
     // state at the end. Emptied, they are three zero bytes, and the rest
     // hashes to the digest pinned under format 8.
     let mut world = world();
-    world.dialogs = Dialogs::default();
+    world.dialogs = Dialogs {
+        records: Vec::new(),
+        declined: 0,
+    };
     world.person_ticks.clear();
     world.neighbors = Neighbors::default();
     let mut bytes = format_10_bytes(world);

@@ -105,6 +105,7 @@ fn a_one_button_dialog_yields_is_answered_at_the_end_of_the_update_and_then_retu
 #[test]
 fn the_second_button_takes_the_false_branch_and_marks_the_registry() {
     let mut fx = lot(asking(1, 0));
+    fx.world.dialogs.declined = 5;
     let mut player = answers(&[3]);
     assert_eq!(
         update(&mut fx, &mut player).unwrap().answered,
@@ -136,12 +137,13 @@ fn a_dialog_click_publishes_its_bitmap_until_the_next_poll() {
 fn a_three_button_dialog_writes_its_temp() {
     for (answer, data, temp) in [(2, 1, 9), (3, 2, 0), (4, 2, 1)] {
         let mut fx = lot(asking(2, 5));
+        fx.world.dialogs.declined = 5;
         fx.lamp_mut().temps[5] = 9;
         let mut player = answers(&[answer]);
         update(&mut fx, &mut player).unwrap();
         update(&mut fx, &mut player).unwrap();
         assert_eq!((fx.lamp().data[0], fx.lamp().temps[5]), (data, temp));
-        assert_eq!(fx.world.dialogs.declined, if answer == 3 { -1 } else { 0 });
+        assert_eq!(fx.world.dialogs.declined, if answer == 3 { -1 } else { 5 });
     }
 }
 

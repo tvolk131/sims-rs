@@ -492,6 +492,44 @@ impl Neighbors {
         });
         Ok(id)
     }
+
+    /// Removes the neighbor record at slot `id - 1` (0x4259a2):
+    ///
+    /// 1. Looks up or appends the record's inventory (`0x42a8a1`) and clears
+    ///    tokens of kinds `0..=9` (`0x41f4e5`), leaving the inventory entry
+    ///    in [`Neighbors::inventories`].
+    /// 2. Vacates slot `id - 1` in place (`slots.len()` stays unchanged,
+    ///    `0x425a33`).
+    /// 3. Erases the first relationship row targeting `id` from every
+    ///    remaining neighbor record (`0x425a38` → `0x464fa2`).
+    pub fn remove_record(&mut self, id: i16) {
+        let inv = match self.inventories.iter_mut().find(|inv| inv.neighbor == id) {
+            Some(inv) => inv,
+            None => {
+                self.inventories.push(Inventory {
+                    neighbor: id,
+                    items: Vec::new(),
+                });
+                self.inventories.last_mut().expect("just pushed")
+            }
+        };
+        inv.items.retain(|item| !(0..=9).contains(&item.kind));
+        if let Some(place) = usize::try_from(id).ok().and_then(|n| n.checked_sub(1))
+            && let Some(slot) = self.slots.get_mut(place)
+        {
+            *slot = None;
+        }
+        let target = i32::from(id);
+        for neighbor in self.slots.iter_mut().flatten() {
+            if let Some(pos) = neighbor
+                .relationships
+                .iter()
+                .position(|row| row.target == target)
+            {
+                neighbor.relationships.remove(pos);
+            }
+        }
+    }
 }
 
 /// Whether two records are friends both ways (0x4271c5): each has a row
