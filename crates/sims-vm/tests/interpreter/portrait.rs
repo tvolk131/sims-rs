@@ -869,21 +869,19 @@ fn a_dialogs_text_can_show_the_stack_objects_neighbor_instead() {
 #[test]
 fn an_object_name_that_may_hold_a_neighbor_token_fails_loudly() {
     // `$Object` is replaced by the stack object's catalog name (0x44c1ca,
-    // 0x4573d9), and the `$Neighbor` pass after it reads the text with the
-    // name in it: a name holding `$Neighbor`, or making it with the text
-    // around it, shows the neighbor's type. The entry 0x4061e3 picks is not
-    // ported, so every entry is tried; the names are not known when the
-    // table has no entry in language 1, an entry is empty (which falls
-    // back to the definition's own name, 0x457db4), or there is no table.
-    // Where the names do not agree on the portrait, the dialog fails; names
-    // not known fail too, since one may never end (0x4558a0).
-    for (names, message, fault_at) in [
-        (None, 3, "not known"),
-        (Some(vec![(1, "Grim"), (2, "$Neighbor")]), 3, "0x4061e3"),
-        (Some(vec![(1, "")]), 3, "not known"),
-        (Some(vec![(2, "Grim")]), 3, "not known"),
-        (Some(vec![(1, "Neighbor"), (2, "Grim")]), 5, "0x4061e3"),
-        (None, 5, "not known"),
+    // 0x4573d9, 0x4061e3), and the `$Neighbor` pass after it reads the text
+    // with the name in it: a name holding `$Neighbor`, or making it with
+    // the text around it, shows the neighbor's type. `0x4061e3` loads US
+    // English via `0x470ca7(0, 0)` and reads slot 1 (`0x471411(1, -1)`):
+    // the name is not known when the table has no entry in language 1, slot
+    // 1 is empty (which falls back to every language for a person or the
+    // definition's own name, 0x457db4), or there is no table. Names not
+    // known fail loudly, since one may never end (0x4558a0).
+    for (names, message) in [
+        (None, 3),
+        (Some(vec![(1, "")]), 3),
+        (Some(vec![(2, "Grim")]), 3),
+        (None, 5),
     ] {
         for strings in [(2, message, 0), (0, 0, message)] {
             let mut fx = text_dialog(strings, names.clone());
@@ -891,29 +889,33 @@ fn an_object_name_that_may_hold_a_neighbor_token_fails_loudly() {
                 .run_with(LAMP, 4096, SIM as i16, &[], 1000)
                 .unwrap_err()
                 .to_string();
-            assert!(fault.contains(fault_at), "{names:?} {strings:?}: {fault}");
+            assert!(
+                fault.contains("not known"),
+                "{names:?} {strings:?}: {fault}"
+            );
             assert!(fx.world.portraits.is_empty());
         }
-        // Where the neighbor is found after the name, the name does not
-        // matter to the portrait. A name not known may hold `$Object` past
-        // its first character, which never ends.
+        // Even where the neighbor is found after the name, a name not known
+        // may hold `$Object` past its first character, which never ends.
         let mut fx = text_dialog((message, 0, 2), names.clone());
-        let ran = fx.run_with(LAMP, 4096, SIM as i16, &[], 1000);
-        if fault_at == "not known" {
-            let fault = ran.unwrap_err().to_string();
-            assert!(
-                fault.contains("0x44c1ca") && fault.contains("not known"),
-                "{names:?}: {fault}"
-            );
-        } else {
-            assert_eq!(ran, Ok(true));
-            assert_eq!(fx.world.portraits, [WIDGET].into(), "{names:?}");
-        }
+        let fault = fx
+            .run_with(LAMP, 4096, SIM as i16, &[], 1000)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            fault.contains("0x44c1ca") && fault.contains("not known"),
+            "{names:?}: {fault}"
+        );
     }
-    // Where every name gives the same, it is used: each holds `$Neighbor`,
-    // or makes it with the `$` before the token, or none does.
+    // `0x4061e3` picks slot 1 in US English (`0x470ca7(0, 0)` + `0x471343`):
+    // slot 2 (the description) and other languages are ignored, and a later
+    // US English run overwrites slot 1.
     for (names, message, shown) in [
         (vec![(1, "Grim $Neighbor")], 3, WIDGET),
+        (vec![(1, "Grim"), (1, "$Neighbor")], 3, SIM_GUID),
+        (vec![(1, "Grim"), (2, "$Neighbor")], 3, SIM_GUID),
+        (vec![(1, "Grim"), (2, "Other"), (1, "$Neighbor")], 3, WIDGET),
+        (vec![(1, "Neighbor"), (2, "Grim")], 5, WIDGET),
         (vec![(1, "Neighbor"), (2, "Neighbors")], 5, WIDGET),
         (vec![(1, "Grim"), (2, "Grimm")], 5, SIM_GUID),
     ] {
@@ -1462,6 +1464,8 @@ fn me_is_replaced_by_the_running_objects_name_before_object_is() {
     };
     for (names, shown) in [
         (vec![(1, "Lamp"), (2, "Lampe")], WIDGET),
+        (vec![(1, "Lamp"), (2, "$Object")], WIDGET),
+        (vec![(1, "Lamp"), (2, "$$Me")], WIDGET),
         (vec![(1, "the $Object")], SIM_GUID),
         (vec![(1, "the $Object $Neighbor")], WIDGET),
     ] {
@@ -1481,14 +1485,15 @@ fn me_is_replaced_by_the_running_objects_name_before_object_is() {
     let mut fx = with_lamp_names(Some(vec![(1, "$Me $Object")]));
     assert_eq!(fx.run_with(LAMP, 4096, SIM as i16, &[], 1000), Ok(true));
     assert_eq!(fx.world.portraits, [SIM_GUID].into());
-    // Names that disagree fail where they decide the portrait. A name that
-    // holds `$Me` past its first character puts it back past each place
-    // the search goes on from, so the pass never ends; names not known may
-    // be one. Both fail whatever the portrait.
+    // A name that holds `$Me` past its first character puts it back past
+    // each place the search goes on from, so the pass never ends; names
+    // not known may be one. Both fail whatever the portrait.
     for (names, fault_at) in [
-        (Some(vec![(1, "Lamp"), (2, "$Object")]), "0x4061e3"),
         (Some(vec![(1, "my $Me")]), "never ends"),
-        (Some(vec![(1, "Lamp"), (2, "$$Me")]), "never ends"),
+        (
+            Some(vec![(1, "Lamp"), (2, "Other"), (1, "$$Me")]),
+            "never ends",
+        ),
         (None, "not known"),
     ] {
         let mut fx = with_lamp_names(names.clone());

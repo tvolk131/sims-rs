@@ -51,22 +51,29 @@ pub struct Library {
     /// language, in order.
     pub strings: BTreeMap<u16, Vec<String>>,
     /// Each catalog string table (CTSS) by chunk ID: every entry, with its
-    /// language. A definition's word 41 names its table, whose name the
-    /// dialog formatter writes for `$Object` (0x44c1ca, 0x457d3b).
+    /// language, from the resource the loader finds (`Iff::get`). A
+    /// definition's word 41 names its table, whose US English slot 1
+    /// (`0x4061e3`, `0x470ca7(0, 0)`, `0x471411(1, -1)`) the formatter writes
+    /// for `$Me`, `$Object`, and `$Neighbor` (`0x457d3b`).
     pub catalog_strings: BTreeMap<u16, Vec<(u8, String)>>,
+    /// The catalog string tables (CTSS) whose resource the loader (`0x470ca7`)
+    /// reads in a way not ported, by ID, each with why ([`unported_strings`]).
+    pub unported_catalog_strings: BTreeMap<u16, &'static str>,
     /// The string tables (STR#) as the original's loader finds them
     /// (0x46feac), by ID, where that differs from [`Library::strings`]
     /// (the chunks in file order, the last of an ID kept, each table's
     /// first-language entries in file order): the resource of the ID
     /// ([`Iff::get`]: deleted chunks skipped, 0x41c542), with its
     /// first-language entries in the loader's order ([`loaded_order`]), or
-    /// None when the file has chunks of the ID but no resource. Only the
-    /// dialog's strings read it; whether the other readers of
-    /// [`Library::strings`] load through the same loader is **unverified**.
+    /// None when the file has chunks of the ID but no resource. Dialogs
+    /// (0x43601c) and Add/Change Action String (0x44cc07) read it through
+    /// 0x47028b; whether the other readers of [`Library::strings`] load
+    /// through the same loader is **unverified**.
     pub loaded_strings: BTreeMap<u16, Option<Vec<String>>>,
     /// The string tables (STR#) whose resource the loader (0x46feac, the
-    /// dialog's call with argument 3 zero) reads in a way not ported, by
-    /// ID, each with why ([`unported_strings`]). Only the dialog reads it.
+    /// 0x47028b call with argument 3 zero) reads in a way not ported, by
+    /// ID, each with why ([`unported_strings`]). Dialogs and Add/Change
+    /// Action String read it.
     pub unported_strings: BTreeMap<u16, &'static str>,
     /// The IDs of the file's legacy string tables (CST resources), which
     /// are not read: the original's string loader falls back to one when
@@ -76,9 +83,8 @@ pub struct Library {
     /// is `\0CST`.
     pub legacy_strings: BTreeSet<u16>,
     /// The IDs of the file's legacy catalog string tables (CATS), which
-    /// are not read: the catalog's name lookup (0x4061e3) checks for one
-    /// before the CTSS table (**unverified**, from a reading of the
-    /// disassembly not checked here).
+    /// are not read: the catalog's name lookup (`0x4061e3`) checks for a
+    /// `CATS` resource of the table's ID before reading `CTSS`.
     pub legacy_catalog_strings: BTreeSet<u16>,
     /// The sound event each FWAV chunk names, by chunk ID: what Play
     /// Sound Event plays (0x582c57). The name is the chunk's bytes up to
@@ -298,18 +304,10 @@ impl Program {
                         library.legacy_strings.insert(chunk.id);
                     }
                 }
-                b"CTSS" => {
-                    let table = sims_formats::strings::StringTable::parse(data)
-                        .map_err(|e| format("CTSS", chunk.id, e))?;
-                    let entries = table
-                        .entries
-                        .iter()
-                        .map(|entry| (entry.language, entry.text.clone()))
-                        .collect();
-                    library.catalog_strings.insert(chunk.id, entries);
-                }
                 b"CATS" => {
-                    library.legacy_catalog_strings.insert(chunk.id);
+                    if iff.get(b"CATS", chunk.id).is_some() {
+                        library.legacy_catalog_strings.insert(chunk.id);
+                    }
                 }
                 b"FWAV" => {
                     let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
@@ -373,6 +371,31 @@ impl Program {
             if library.strings.get(&id) != Some(&loaded) {
                 library.loaded_strings.insert(id, Some(loaded));
             }
+        }
+        // Catalog string tables (CTSS) as `0x4061e3` / `0x470ca7` loads them.
+        let ctss_ids: BTreeSet<u16> = iff
+            .chunks
+            .iter()
+            .filter(|chunk| &chunk.tag == b"CTSS")
+            .map(|chunk| chunk.id)
+            .collect();
+        for id in ctss_ids {
+            let Some(chunk) = iff.get(b"CTSS", id) else {
+                continue;
+            };
+            let data = iff.data(chunk);
+            if let Some(why) = unported_strings(iff.resource_flags(chunk), data) {
+                library.unported_catalog_strings.insert(id, why);
+                continue;
+            }
+            let table = sims_formats::strings::StringTable::parse(data)
+                .map_err(|e| format("CTSS", id, e))?;
+            let entries = table
+                .entries
+                .iter()
+                .map(|entry| (entry.language, entry.text.clone()))
+                .collect();
+            library.catalog_strings.insert(id, entries);
         }
         // The native resource order (the rsmp map when there is one), as the
         // catalog registers definitions. The old prototype kept physical
