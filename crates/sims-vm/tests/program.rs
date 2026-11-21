@@ -1120,3 +1120,104 @@ fn the_default_labels_hold_no_token_only_when_no_string_table_of_them_holds_a_do
     assert!(sims_vm::labels_hold_no_token(&install.root).unwrap());
     std::fs::remove_dir(dir.0.join("GameData/UIFAR")).unwrap();
 }
+
+/// Minimal valid 1x1 24-bit Windows BMP (58 bytes), decodable by
+/// `sims_formats::bitmap::bmp`.
+fn tiny_bmp() -> Vec<u8> {
+    let mut bmp = vec![0u8; 58];
+    bmp[0..2].copy_from_slice(b"BM");
+    bmp[2..6].copy_from_slice(&58u32.to_le_bytes()); // file size
+    bmp[10..14].copy_from_slice(&54u32.to_le_bytes()); // pixel offset
+    bmp[14..18].copy_from_slice(&40u32.to_le_bytes()); // DIB header size
+    bmp[18..22].copy_from_slice(&1i32.to_le_bytes()); // width = 1
+    bmp[22..26].copy_from_slice(&1i32.to_le_bytes()); // height = 1
+    bmp[26..28].copy_from_slice(&1u16.to_le_bytes()); // planes = 1
+    bmp[28..30].copy_from_slice(&24u16.to_le_bytes()); // bpp = 24
+    bmp[34..38].copy_from_slice(&4u32.to_le_bytes()); // image size
+    bmp
+}
+
+/// Raw IFF bytes for a single object definition plus extra flagged chunks.
+fn iff_bytes(chunks: &[(&[u8; 4], u16, u16, Vec<u8>)]) -> Vec<u8> {
+    let mut bytes = vec![0; 64];
+    bytes[..13].copy_from_slice(b"IFF FILE 2.5:");
+    for (tag, id, flags, data) in chunks {
+        bytes.extend(*tag);
+        bytes.extend((76 + data.len() as u32).to_be_bytes());
+        bytes.extend(id.to_be_bytes());
+        bytes.extend(flags.to_be_bytes());
+        bytes.extend([0; 64]);
+        bytes.extend(data);
+    }
+    bytes
+}
+
+/// Minimal 1-entry FAR v1 archive holding `(name, bytes)`.
+fn far_archive(name: &str, payload: &[u8]) -> Vec<u8> {
+    let manifest_offset = 16u32 + payload.len() as u32;
+    let mut out = Vec::new();
+    out.extend_from_slice(b"FAR!byAZ");
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&manifest_offset.to_le_bytes());
+    out.extend_from_slice(payload);
+    out.extend_from_slice(&1u32.to_le_bytes()); // entry count
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    out.extend_from_slice(name.as_bytes());
+    out
+}
+
+#[test]
+fn portrait_2002_uses_neutral_flags_and_marks_far_members_read_only() {
+    let dir = Dir::new("portrait-2002");
+    dir.file("GameData/Behavior.iff", &iff_bytes(&[]));
+    dir.file("GameData/Global/Global.iff", &iff_bytes(&[]));
+
+    // 1. Loose file with neutral (high byte 0) BMP_ 2002 -> has_portrait_2002 = true, read_only = false.
+    let neutral_guid = 0x9000_0001u32;
+    dir.file(
+        "GameData/Objects/neutral.iff",
+        &iff_bytes(&[
+            (b"OBJD", 128, 0x0010, objd(neutral_guid, 0, 0)),
+            (b"BMP_", 2002, 0x0010, tiny_bmp()),
+        ]),
+    );
+
+    // 2. Loose file with English-only (high byte 1) BMP_ 2002 -> has_portrait_2002 = false
+    // because 0x41bab1 -> 0x41bad8 forces the lookup key's high byte to 0.
+    let lang1_guid = 0x9000_0002u32;
+    dir.file(
+        "GameData/Objects/lang1.iff",
+        &iff_bytes(&[
+            (b"OBJD", 128, 0x0010, objd(lang1_guid, 0, 0)),
+            (b"BMP_", 2002, 0x0110, tiny_bmp()),
+        ]),
+    );
+
+    // 3. Archive (.far) member without BMP_ 2002 -> read_only = true, has_portrait_2002 = false.
+    let archived_guid = 0x9000_0003u32;
+    let archived_iff = iff_bytes(&[(b"OBJD", 128, 0x0010, objd(archived_guid, 0, 0))]);
+    dir.file(
+        "GameData/Objects/Archived.far",
+        &far_archive("Archived.iff", &archived_iff),
+    );
+
+    let install = Install::detect(&dir.0).unwrap();
+    let index = Index::build(&install).unwrap();
+    let catalog = Catalog::build(&index).unwrap();
+    let program =
+        Program::link(&index, &catalog, [neutral_guid, lang1_guid, archived_guid]).unwrap();
+
+    let lib = |guid| {
+        let obj = catalog.object(guid).unwrap();
+        &program.libraries[&obj.resource]
+    };
+    assert!(lib(neutral_guid).has_portrait_2002);
+    assert!(!lib(neutral_guid).read_only);
+    assert!(!lib(lang1_guid).has_portrait_2002);
+    assert!(!lib(lang1_guid).read_only);
+    assert!(!lib(archived_guid).has_portrait_2002);
+    assert!(lib(archived_guid).read_only);
+}

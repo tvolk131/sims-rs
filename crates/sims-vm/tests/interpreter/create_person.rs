@@ -222,6 +222,11 @@ fn a_person_made_with_person_word_68_74_or_84_set_resets_its_types_portrait() {
             !reset,
             "word {word} = {value}"
         );
+        assert_eq!(
+            fx.world.dirty_portraits.contains(&WIDGET),
+            reset,
+            "dirty flag word {word} = {value}"
+        );
     }
 }
 

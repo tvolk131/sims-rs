@@ -276,6 +276,7 @@ fn world() -> World {
         },
         portraits: BTreeSet::from([0x1234_0042, 0x7fd9_6b54]),
         dirty_portraits: BTreeSet::new(),
+        generated_portrait_2002: BTreeSet::new(),
     }
 }
 

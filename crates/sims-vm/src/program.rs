@@ -84,10 +84,17 @@ pub struct Library {
     /// Sound Event plays (0x582c57). The name is the chunk's bytes up to
     /// the first zero, read as Latin-1.
     pub sounds: BTreeMap<u16, String>,
-    /// Whether the file holds a decodable `BMP_` 2002 (`0x7d2`) portrait
-    /// image that `0x4e92a8` → `0x4e9260` → `0x4dece6` can load without
+    /// Whether the file holds a decodable neutral-language `BMP_` 2002
+    /// (`0x7d2`, high byte of flags 0) portrait image that `0x4e92a8` →
+    /// `0x4e9260` → `0x4dece6` → `0x41cb2f` → `0x41bab1` can load without
     /// calling `0x4e8c5d`.
     pub has_portrait_2002: bool,
+    /// Whether the underlying resource file is read-only (e.g. a `.far`
+    /// archive member or a read-only file on disk). `0x4e8c5d` checks
+    /// writability at `0x4e8cc6` (`0x4067b3` → `0x4174dc`) before calling
+    /// `0x4e9652` for an off-lot person, and `0x4e9000` only persists a
+    /// generated `BMP_` 2002 to a writable file.
+    pub read_only: bool,
 }
 
 /// The string table Run Tree By Name instructions name their trees in.
@@ -379,13 +386,17 @@ impl Program {
             }
         }
         // Portrait bitmap 2002 (0x7d2) read by 0x4e92a8 -> 0x4e9260 -> 0x4dece6
-        // in US English (language 1) with fallback to language-neutral (0).
-        let portrait_2002 = iff
-            .all(b"BMP_")
-            .find(|chunk| chunk.id == 2002 && (chunk.flags >> 8) == 1)
-            .or_else(|| iff.get(b"BMP_", 2002));
-        library.has_portrait_2002 =
-            portrait_2002.is_some_and(|chunk| sims_formats::bitmap::bmp(iff.data(chunk)).is_ok());
+        // -> 0x41cb2f -> 0x41bab1: 0x41bad8 zeros the lookup key's high byte,
+        // so only a neutral-language (high byte 0) BMP_ 2002 matches.
+        library.has_portrait_2002 = iff
+            .get(b"BMP_", 2002)
+            .is_some_and(|chunk| sims_formats::bitmap::bmp(iff.data(chunk)).is_ok());
+        // Archive members (.far) and read-only loose files report IsWritable ==
+        // false at 0x4067b3 -> 0x4174dc.
+        library.read_only = file.member.is_some()
+            || std::fs::metadata(&file.path)
+                .map(|m| m.permissions().readonly())
+                .unwrap_or(true);
         // The native resource order (the rsmp map when there is one), as the
         // catalog registers definitions. The old prototype kept physical
         // file order instead (legacy/crates/sims-content/src/vm.rs:187).

@@ -208,10 +208,18 @@ pub struct World {
     pub portraits: BTreeSet<u32>,
     /// Person types whose portrait entry (`0x6f2698`) has been marked to
     /// rebuild (`[entry + 0x18] != 0`, set by `0x4e895e` / `0x4eb0eb` and
-    /// cleared by `0x4e899e` when an image is stored). Kept unencoded so
-    /// snapshot format 31's wire bytes stay unchanged.
+    /// cleared by `0x4e899e` when an image is stored). Kept out of
+    /// [`World::encode`] so snapshot format 31's wire bytes stay unchanged;
+    /// `sims_vm::boot::save::Saved` preserves it across lot save/restore.
     #[serde(skip)]
     pub dirty_portraits: BTreeSet<u32>,
+    /// Person types for which `0x4e938c` → `0x4e8c5d(index, 1, 1)` →
+    /// `0x4e9000` generated and wrote `BMP_` 2002 (`0x7d2`) to a writable
+    /// resource file during this session. Kept out of [`World::encode`] so
+    /// snapshot format 31's wire bytes stay unchanged;
+    /// `sims_vm::boot::save::Saved` preserves it across lot save/restore.
+    #[serde(skip)]
+    pub generated_portrait_2002: BTreeSet<u32>,
 }
 
 /// How many advertisements the record of [`World::advertisement_record`]
@@ -574,6 +582,7 @@ impl World {
             characters: Characters::default(),
             portraits: BTreeSet::new(),
             dirty_portraits: BTreeSet::new(),
+            generated_portrait_2002: BTreeSet::new(),
         }
     }
 

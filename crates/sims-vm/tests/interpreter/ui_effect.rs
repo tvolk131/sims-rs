@@ -110,7 +110,8 @@ fn clean_slot_with_bmp_2002_caches_without_creating_a_sim_while_dirty_slot_rende
 
     // Dirty slot (0x4e895e, e.g. after Create New Object Instance with person
     // word 84/68/74 set) with BMP_ 2002 present: 0x4e92e5 calls 0x4e8c5d FIRST
-    // (0x4e92f2), creating and removing the temporary person and clearing dirty.
+    // (0x4e92f2, save flag 0), creating and removing the temporary person and
+    // clearing dirty without recording a generated writeback.
     let (mut fx, file, record) = visitors();
     fx.program
         .libraries
@@ -125,8 +126,118 @@ fn clean_slot_with_bmp_2002_caches_without_creating_a_sim_while_dirty_slot_rende
     );
     assert_eq!(fx.world.portraits, [WIDGET].into());
     assert!(!fx.world.dirty_portraits.contains(&WIDGET));
+    assert!(fx.world.generated_portrait_2002.is_empty());
     assert!(fx.world.skeleton_files.contains("widget.bcf"));
     assert_ne!(fx.world.crt_rng, crt_before);
+}
+
+#[test]
+fn read_only_off_lot_skips_factory_and_fallback_render_persists_bmp_2002() {
+    // 1. Read-only off-lot definition (0x4e8cc6 -> 0x4067b3 -> 0x4174dc, e.g.
+    // People\TemplatePerson.iff in Objects.far without BMP_ 2002): skips
+    // 0x4e9652 completely (no Init, no CRT RNG draw, portrait stays uncached,
+    // returns true).
+    let (mut fx, file, record) = visitors();
+    fx.program.libraries.get_mut(&file).unwrap().read_only = true;
+    let crt_before = fx.world.crt_rng;
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
+        Ok(true)
+    );
+    assert!(fx.world.portraits.is_empty());
+    assert!(fx.world.skeleton_files.is_empty());
+    assert_eq!(fx.world.crt_rng, crt_before);
+
+    // 2. Read-only on-lot person: 0x4e9608 finds the on-lot Sim and skips the
+    // 0x4e8cc6 writability gate, caching the portrait without persisting a
+    // generated BMP_ 2002 to the read-only file.
+    let (mut fx, _, _) = visitors();
+    fx.program.libraries.get_mut(&SIM_FILE).unwrap().read_only = true;
+    fx.world.neighbors.slots.push(Some(Neighbor {
+        guid: SIM_GUID,
+        id: 2,
+        data: vec![0; 88],
+        relationships: Vec::new(),
+        friends: 0,
+        revision: 0,
+        stale: false,
+    }));
+    let sim_record = fx.world.neighbors.slots.len() as i16;
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
+        Ok(true)
+    );
+    assert_eq!(fx.world.portraits, [SIM_GUID].into());
+    assert!(fx.world.generated_portrait_2002.is_empty());
+
+    // 3. Runtime-made character cloned from a read-only template lives in a
+    // loose writable Characters/User%05d.iff file (0x4260e1), so off-lot
+    // rendering succeeds and persists BMP_ 2002.
+    let (mut fx, file, _) = visitors();
+    fx.world.rooms.rooms.get_mut(&1).unwrap().occupied = true;
+    fx.program.libraries.get_mut(&file).unwrap().read_only = true;
+    let made_guid = 0x5555_0002u32;
+    fx.world.characters.made.insert(
+        made_guid,
+        sims_sim::characters::Character {
+            template: WIDGET,
+            file: 8,
+            strings: Default::default(),
+        },
+    );
+    fx.world.neighbors.slots.push(Some(Neighbor {
+        guid: made_guid,
+        id: 52,
+        data: vec![12; 88],
+        relationships: Vec::new(),
+        friends: 0,
+        revision: 1,
+        stale: false,
+    }));
+    let made_record = fx.world.neighbors.slots.len() as i16;
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, made_record, 1),
+        Ok(true)
+    );
+    assert_eq!(fx.world.portraits, [made_guid].into());
+    assert!(fx.world.generated_portrait_2002.contains(&made_guid));
+
+    // 4. Fallback render at 0x4e938c (save flag 1) persists BMP_ 2002 via
+    // 0x4e8d2e -> 0x4e9000 -> 0x4e8feb: after a subsequent 0x4e895e
+    // invalidation (dirty = 1, bitmap cleared), a failed dirty render at
+    // 0x4e92f2 loads the persisted BMP_ 2002 at 0x4e9338 instead of running
+    // the factory a second time at 0x4e938c!
+    let (mut fx, file, record) = visitors();
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
+        Ok(true)
+    );
+    assert_eq!(fx.world.portraits, [WIDGET].into());
+    assert!(fx.world.generated_portrait_2002.contains(&WIDGET));
+
+    // Simulate 0x4e895e invalidation, and make placement fail on the next
+    // attempt while counting Init runs in global 36.
+    fx.world.portraits.remove(&WIDGET);
+    fx.world.dirty_portraits.insert(WIDGET);
+    fx.add(
+        file,
+        4096,
+        tree(vec![
+            ins(2, 1, 1, expr(scope::GLOBAL, 36, op::ADD, scope::LITERAL, 1)),
+            assign(scope::MY_DATA, 4, scope::LITERAL, 1, 2),
+            assign(scope::MY_DATA, 42, scope::LITERAL, 0, RETURN_TRUE),
+        ]),
+    );
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
+        Ok(true)
+    );
+    assert_eq!(
+        fx.world.globals[36], 2,
+        "persisted BMP_ 2002 satisfies 0x4e9338 after 0x4e92f2 fails (no second render)"
+    );
+    assert_eq!(fx.world.portraits, [WIDGET].into());
+    assert!(!fx.world.dirty_portraits.contains(&WIDGET));
 }
 
 #[test]

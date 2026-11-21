@@ -209,9 +209,11 @@ impl Cells {
     }
 }
 
-/// Whether two lots are the same: their encodings, and each object's
-/// count of its thread's restarts (`FrameStorage::restarts`), which the
-/// encoding leaves out and the interpreter reads.
+/// Whether two lots are the same: their encodings, each object's count of
+/// its thread's restarts (`FrameStorage::restarts`), and the unencoded
+/// portrait dirty/writeback sets (`World::dirty_portraits`,
+/// `World::generated_portrait_2002`), which the encoding leaves out and
+/// the interpreter reads.
 pub(crate) fn same_lot(a: &World, b: &World) -> bool {
     let restarts = |w: &World| {
         w.frame_storage
@@ -219,7 +221,10 @@ pub(crate) fn same_lot(a: &World, b: &World) -> bool {
             .map(|(id, s)| (*id, s.restarts))
             .collect::<Vec<_>>()
     };
-    a.encode() == b.encode() && restarts(a) == restarts(b)
+    a.encode() == b.encode()
+        && restarts(a) == restarts(b)
+        && a.dirty_portraits == b.dirty_portraits
+        && a.generated_portrait_2002 == b.generated_portrait_2002
 }
 
 impl<'a> Machine<'a, '_> {
@@ -488,5 +493,23 @@ mod tests {
         assert!(!same_lot(&a, &b));
         a.frame_storage.get_mut(&7).unwrap().restarts = 1;
         assert!(same_lot(&a, &b));
+    }
+
+    #[test]
+    fn lots_that_differ_only_in_portrait_flags_are_not_the_same() {
+        let a = World::empty();
+        let mut b = a.clone();
+        b.dirty_portraits.insert(0x1234_5678);
+        assert_eq!(a.encode(), b.encode(), "dirty_portraits is not encoded");
+        assert!(!same_lot(&a, &b));
+
+        let mut c = a.clone();
+        c.generated_portrait_2002.insert(0x1234_5678);
+        assert_eq!(
+            a.encode(),
+            c.encode(),
+            "generated_portrait_2002 is not encoded"
+        );
+        assert!(!same_lot(&a, &c));
     }
 }

@@ -35,8 +35,9 @@ use std::collections::BTreeSet;
 /// by [`sims_sim::SNAPSHOT_FORMAT`], which is written too. A save of
 /// another version is refused, not migrated. Layout 2 keeps each pending
 /// dialog answer's bitmap ID ([`crate::Answer`]); layout 3 keeps the
-/// house view's centre.
-pub const FORMAT: u32 = 3;
+/// house view's centre; layout 4 keeps [`World::dirty_portraits`] and
+/// [`World::generated_portrait_2002`].
+pub const FORMAT: u32 = 4;
 
 /// A lot as it stood between two steps ([`Lot::save`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +54,11 @@ pub struct Saved {
     loaded: [u8; 32],
     /// Format 3 on.
     view_centre: Option<[i8; 2]>,
+    /// Format 4 on: portrait dirty flags (`0x4e895e`) and generated `BMP_`
+    /// 2002 writebacks (`0x4e9000`), which [`World::encode`] omits to keep
+    /// snapshot format 31's wire bytes unchanged.
+    dirty_portraits: BTreeSet<u32>,
+    generated_portrait_2002: BTreeSet<u32>,
 }
 
 /// Why a lot could not be saved or restored.
@@ -130,7 +136,10 @@ impl Saved {
                 sims_sim::SNAPSHOT_FORMAT
             )));
         }
-        postcard::from_bytes(body).map_err(|e| format(e.to_string()))
+        let mut saved: Self = postcard::from_bytes(body).map_err(|e| format(e.to_string()))?;
+        saved.world.dirty_portraits = saved.dirty_portraits.clone();
+        saved.world.generated_portrait_2002 = saved.generated_portrait_2002.clone();
+        Ok(saved)
     }
 }
 
@@ -160,6 +169,8 @@ impl Lot {
             family: self.load.family,
             loaded: self.loaded,
             view_centre: self.view_centre,
+            dirty_portraits: self.world.dirty_portraits.clone(),
+            generated_portrait_2002: self.world.generated_portrait_2002.clone(),
         })
     }
 
@@ -195,5 +206,42 @@ impl Lot {
         self.asking = None;
         self.answered = saved.answered;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saved_round_trip_preserves_unencoded_portrait_sets() {
+        let mut world = World::empty();
+        world.dirty_portraits.insert(0x1111_2222);
+        world.generated_portrait_2002.insert(0x3333_4444);
+        let saved = Saved {
+            dirty_portraits: world.dirty_portraits.clone(),
+            generated_portrait_2002: world.generated_portrait_2002.clone(),
+            world,
+            ticks: 1,
+            start: 0,
+            answers: Answers::default(),
+            fresh: BTreeSet::new(),
+            view_rotation: 0,
+            answered: false,
+            house: 5,
+            family: 1,
+            loaded: [0; 32],
+            view_centre: Some([32, 32]),
+        };
+        let bytes = saved.encode();
+        let decoded = Saved::decode(&bytes).unwrap();
+        assert_eq!(
+            decoded.world().dirty_portraits,
+            BTreeSet::from([0x1111_2222])
+        );
+        assert_eq!(
+            decoded.world().generated_portrait_2002,
+            BTreeSet::from([0x3333_4444])
+        );
     }
 }
