@@ -2900,15 +2900,103 @@ fn a_track_runs_from_the_module_registered_last_whichever_module_asks() {
 
 #[test]
 fn the_expansions_register_in_their_directories_order_not_by_name() {
-    // `ExpansionShared` registers after `ExpansionPack`, whatever the
-    // modules' order: its track 10 is the one that runs.
-    let mut shared = module_of_tracks(&[(10, &asks(8, false))], "");
-    shared.name = "expansionshared\\sound\\gnome".to_owned();
-    let mut pack = module_of_tracks(&[(10, &asks(7, false))], "");
-    pack.name = "expansionpack\\xpack".to_owned();
-    let mut player = Player::new(vec![shared, pack], samples(), 1);
-    play(&mut player, "e10");
+    // `Deluxe` registers after `ExpansionPack2` (0x414392 to 0x414458),
+    // though its name sorts first and it comes first here: its track 10
+    // is the one that runs, even from the other module's event.
+    let mut deluxe = module_of_tracks(&[(10, &asks(8, false))], "");
+    deluxe.name = "deluxe\\sound\\d".to_owned();
+    let mut pack = module_of_tracks(&[(10, &asks(7, false))], "again=kSndobPlay,10\n");
+    pack.name = "expansionpack2\\sound\\e".to_owned();
+    let mut player = Player::new(vec![deluxe, pack], samples(), 1);
+    play(&mut player, "again");
     assert_eq!(fields_asked_in_order(&mut player), [8]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+/// A module with no tables but `[TrackData]`: each routine at its ID.
+fn module_of_code(routines: &[(u32, &[u8])]) -> Module {
+    let code: Vec<&[u8]> = routines.iter().map(|&(_, routine)| routine).collect();
+    let (hit, addresses) = assemble(&code);
+    let mut hot = String::from("[TrackData]\n");
+    for (&(id, _), address) in routines.iter().zip(addresses) {
+        hot.push_str(&format!("{id:#x}={address:#x}\n"));
+    }
+    Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap()
+}
+
+#[test]
+fn a_track_starts_at_the_entry_point_registered_last() {
+    // Track 10's descriptor, the second module's, registered last, names
+    // track data 0x100 as its entry point. A third module, registered
+    // after it and with no tracks, puts 0x100 at its own routine: set
+    // interrupt, ask for field 9 once, wait. The original keeps one table
+    // of track data for every module (0x57ce70), so the start runs that
+    // routine (0x57dbe2), and so does the restart that a play from the
+    // first module's event makes.
+    let mut third = vec![LOADB_V1, 55, 1];
+    third.extend(asks_once(9));
+    third.extend([SET_LOOP, LOOP]);
+    let first = module_of_tracks(&[(10, &asks(7, true))], "again=kSndobPlay,10\n");
+    let second = module_of_tracks(&[(10, &asks(8, true))], "");
+    let modules = vec![first, second, module_of_code(&[(0x100, &third)])];
+    let mut player = Player::new(modules, samples(), 1);
+    play(&mut player, "e10");
+    assert_eq!(fields_asked_in_order(&mut player), [9]);
+    assert_eq!(fields_asked_in_order(&mut player), []);
+    play(&mut player, "again");
+    assert_eq!(fields_asked_in_order(&mut player), [9]);
+    assert_eq!(fields_asked_in_order(&mut player), []);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn a_call_runs_the_program_that_registered_its_target_last_and_returns() {
+    // Track 10 calls track data 0x101, then asks for field 7. Its module
+    // puts 0x101 at a routine that asks for 6; a module registered after
+    // it, at one that asks for 8. The call runs the later one, in that
+    // module's program (0x57e3d4), and its end returns to the caller's.
+    let mut caller = vec![CALL];
+    caller.extend(long(0x101));
+    caller.extend(asks_once(7));
+    caller.push(END);
+    let mut own = asks_once(6);
+    own.push(END);
+    let mut later = asks_once(8);
+    later.push(END);
+    let first = module_of_tracks(&[(10, &caller), (11, &own)], "");
+    let modules = vec![first, module_of_code(&[(0x101, &later)])];
+    let mut player = Player::new(modules, samples(), 1);
+    play(&mut player, "e10");
+    assert_eq!(fields_asked_in_order(&mut player), [8, 7]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn an_expansions_hit_list_replaces_the_base_games_and_what_the_stations_added() {
+    // Hit list 6 is patch 2 in the base game's table, and a station adds
+    // patch 2 to it. An expansion's list 6, patch 1 alone, registers after
+    // both (0x57ba20, 0x57d261), so the list is patch 1 alone.
+    let choose: Vec<u8> = [
+        &[5, 5][..],
+        &long(6),    // loadl v1, 6
+        &[68, 5],    // smart_setlist v1
+        &[39, 5],    // smart_choose v1
+        &[6, 50, 5], // set patch, v1
+        &[2, 5, WAIT_SAMP, END],
+    ]
+    .concat();
+    let mut base = module(&[&choose], 0);
+    base.name = "sounddata\\base".to_owned();
+    let mut expansion = module_with(&[&choose], 0, 10, "[GlobalHitList]\n6=1\n");
+    expansion.name = "expansionpack\\more".to_owned();
+    let mut player = Player::new(vec![expansion, base], samples(), 1);
+    player.add_stations(&StationLists {
+        hit_lists: BTreeMap::from([(6, vec![2])]),
+        patches: BTreeMap::new(),
+    });
+    play(&mut player, "e0");
+    assert_eq!(player.render(1, &NoSources)[0], 1);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
 
 #[test]
@@ -2922,6 +3010,29 @@ fn a_patch_plays_as_the_module_registered_last_lists_it() {
     play(&mut player, "e0");
     assert_eq!(player.render(3, &NoSources), [2000, 4000, -2000]);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn an_id_registered_again_as_the_other_kind_is_that_kind_only() {
+    // The first module's track 10 is registered again, by a later line
+    // of its own, as a patch: its event starts nothing, and that is no
+    // fault (the patch's start slot returns at once, 0x57bf80). The
+    // second module's track 1 replaces patch 1, so the first module's
+    // track 11, which plays patch 1, plays nothing (0x57f703).
+    let first = module_with(
+        &[&GENERIC, &GENERIC],
+        1,
+        10,
+        "[Patch]\n10=0,ten,\"one.xa\"\n",
+    );
+    let second = module_of_tracks(&[(1, &[END])], "");
+    let mut player = Player::new(vec![first, second], samples(), 1);
+    play(&mut player, "e0");
+    assert!(player.is_idle());
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+    play(&mut player, "e1");
+    assert_eq!(player.render(3, &NoSources), [0, 0, 0]);
+    assert_eq!(player.faults, ["patch 1 is a track"]);
 }
 
 #[test]
@@ -3004,16 +3115,21 @@ fn an_unpause_runs_the_tracks_bucket_by_bucket() {
 
 #[test]
 fn the_stations_register_between_the_base_tables_and_the_expansions() {
-    // The base game's tables register 192 IDs (track 190, patch 1 and
-    // 190 more patches), then the one station patch, the 193rd. The
-    // expansion's track 579 then grows the map to 389 buckets before it
-    // goes in, at the head of bucket 190, ahead of track 190. Had the
-    // station come last, 579 would have gone into bucket 0 of 193 first,
-    // and growing would have put 190 ahead of it.
-    let fillers: String = (2000..2190)
+    // The base game's tables register 192 IDs (tracks 9998 and 190,
+    // patch 1 and 189 more patches), then the one station patch, the
+    // 193rd. The expansion's track 579 then grows the map to 389 buckets
+    // before it goes in, at the head of bucket 190, ahead of track 190.
+    // Had the station come last, 579 would have gone into bucket 0 of 193
+    // first, and growing would have put 190 ahead of it. (Track 9998
+    // takes track data 0x100, which the expansion's 579 registers again,
+    // so that 190's, 0x101, is the base game's own.)
+    let fillers: String = (2000..2189)
         .map(|id| format!("{id}=0,f,\"one.xa\"\n"))
         .collect();
-    let mut base = module_of_tracks(&[(190, &asks(190, true))], &format!("[Patch]\n{fillers}"));
+    let mut base = module_of_tracks(
+        &[(9998, &[END]), (190, &asks(190, true))],
+        &format!("[Patch]\n{fillers}"),
+    );
     base.name = "sounddata\\base".to_owned();
     let mut expansion = module_of_tracks(&[(579, &asks(579, true))], "");
     expansion.name = "expansionpack\\more".to_owned();
