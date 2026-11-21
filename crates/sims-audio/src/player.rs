@@ -725,6 +725,7 @@ struct PatchMeta {
     registrant: Registrant,
     path: String,
     is_streamed: bool,
+    is_3d: bool,
 }
 
 fn owners(
@@ -738,13 +739,15 @@ fn owners(
                         patches: &mut BTreeMap<u32, PatchMeta>,
                         stations: &mut Option<&[(u32, String)]>| {
         for (at, (id, path)) in stations.take().into_iter().flatten().enumerate() {
-            // *(code)* 0x5750b8..0x5750c5: station patches pass IsStreamed = 0.
+            // *(code)* 0x5750b8..0x5750c5: station patches pass 0 for all
+            // five flags (including IsStreamed and Is3d).
             patches.insert(
                 *id,
                 PatchMeta {
                     registrant: Registrant::Station(at),
                     path: path.clone(),
                     is_streamed: false,
+                    is_3d: false,
                 },
             );
             tracks.remove(id);
@@ -769,6 +772,7 @@ fn owners(
                             registrant: Registrant::Module(m),
                             path: patch.path.clone(),
                             is_streamed: patch.is_streamed,
+                            is_3d: patch.is_3d,
                         },
                     );
                     tracks.remove(&id);
@@ -2928,10 +2932,16 @@ impl<S: Samples> Player<S> {
         let patch = owner.number(&fields.patch).unwrap_or(0) as i32;
         let group = owner.number(&fields.group).unwrap_or(0);
         let mut registers = self.default_registers(track);
-        // *(code)* 0x57db54..0x57db67: a fresh start loads the HOT patch ID
-        // into live register `PATCH` (50); before its first start (or after
-        // any kill, 0x57dd62 → 0x57f682), `PATCH` is 0.
+        // *(code)* 0x57db54..0x57db67 -> 0x57f625: a fresh start loads the HOT
+        // patch ID into live register `PATCH` (50) and copies the patch's
+        // `Is3d` flag (`0x57f6e3`..`0x57f6fb`) into `THREE_D` (26). Before its
+        // first start (or after any kill, 0x57dd62 → 0x57f682), `PATCH` is 0.
         registers[usize::from(PATCH)] = patch;
+        if patch != 0
+            && let Some(meta) = self.patches.get(&(patch as u32))
+        {
+            registers[usize::from(THREE_D)] = i32::from(meta.is_3d);
+        }
         Some((pc, registers, group))
     }
 
@@ -3019,6 +3029,14 @@ impl<S: Samples> Player<S> {
             regs[usize::from(r)] = stored;
         }
         if r == PATCH {
+            if value != 0
+                && let Some(meta) = self.patches.get(&(value as u32))
+                && let Some(regs) = self.stopped.get_mut(&track)
+            {
+                // *(code)* 0x57f6e3..0x57f6fb: `set_patch` copies the patch's
+                // `Is3d` flag into track register `0x1a` (`THREE_D`).
+                regs[usize::from(THREE_D)] = i32::from(meta.is_3d);
+            }
             self.notes.retain(|n| !(n.thread == 0 && n.track == track));
             self.idle.remove(&track);
             return;
@@ -3637,21 +3655,42 @@ impl<S: Samples> Player<S> {
             written.registers[usize::from(r)] = value;
             if r == PATCH {
                 // *(code)* 0x57dfe8 → 0x57e040 → 0x57f625: writing `patch`
-                // tears down the track's active voice and recreates it with
-                // freshly latched gains and pitch (0x57f6d7..0x57f6de).
+                // tears down the track's active voice, copies a registered
+                // patch's `Is3d` flag into register `0x1a` (`THREE_D`) via
+                // `vtable +0x84` (`0x57f6e3`..`0x57f6fb`, updating comparison
+                // flags to `is_3d` at `0x57de98`..`0x57dec5`), and — unless
+                // lookup failed (`0x57f69a` → `0x57e047`) — refreshes gains
+                // and pitch with the updated `THREE_D` (`0x57e04b`, `0x57e052`).
+                let patch_id = value as u32;
+                let patch_is_3d = (value != 0)
+                    .then(|| {
+                        self.patches
+                            .get(&patch_id)
+                            .map(|meta| i32::from(meta.is_3d))
+                    })
+                    .flatten();
+                let refresh_after =
+                    value == 0 || patch_is_3d.is_some() || self.tracks.contains_key(&patch_id);
+                if let Some(is_3d) = patch_is_3d {
+                    written.registers[usize::from(THREE_D)] = is_3d;
+                    written.kept = i64::from(is_3d);
+                }
                 let snapshot = written.clone();
                 if dest != Destination::Own {
                     self.sync_thread_to_store(thread);
                 }
                 self.notes.retain(|n| n.thread != written_id);
-                let levels = self.levels(&snapshot);
-                let rate_step = step(levels.rate);
-                if dest == Destination::Own {
-                    thread.latched_gains = levels.gains;
-                    thread.latched_step = rate_step;
-                } else if let Some(slot) = self.threads.iter_mut().find(|t| t.id == written_id) {
-                    slot.latched_gains = levels.gains;
-                    slot.latched_step = rate_step;
+                if refresh_after {
+                    let levels = self.levels(&snapshot);
+                    let rate_step = step(levels.rate);
+                    if dest == Destination::Own {
+                        thread.latched_gains = levels.gains;
+                        thread.latched_step = rate_step;
+                    } else if let Some(slot) = self.threads.iter_mut().find(|t| t.id == written_id)
+                    {
+                        slot.latched_gains = levels.gains;
+                        slot.latched_step = rate_step;
+                    }
                 }
                 return;
             }

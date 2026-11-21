@@ -402,6 +402,43 @@ fn window_focus_changes_forward_kind_25_and_deduplicate_initial_focus() {
         "regaining focus while paused must keep live ambience paused"
     );
     assert!(mixer.new_faults().is_empty());
+
+    // Focus loss while an unanswered modal dialog refuses `game.toggle_pause()`
+    // still records requested pause = true (`0x4cee52`..`0x4cee5d`) and
+    // dispatches `SoundEvent::Pause` (`0x4ce5b0`..`0x4ce5c5`) rather than
+    // `Unpause`, keeps audio paused across further updates while unfocused,
+    // and dispatches `SoundEvent::Unpause` on focus regain.
+    let modal_options = sims_game::Options {
+        house: sims_game::game::goth_house(&install),
+        install: install.clone(),
+        answers: Vec::new(),
+        play: false,
+        frames: sims_game::Frames::default(),
+    };
+    let mut modal_game = sims_game::Game::open(&modal_options).expect("the Goth house opens");
+    let _ = modal_game.run(2); // opens the initial Help dialog and waits for an answer
+    assert!(!modal_game.paused());
+    let mut modal_feed = sims_game::sound::Feed::default();
+    modal_feed.update(&mut modal_game, |_| {});
+    let mut modal_sent = Vec::new();
+    assert!(!modal_feed.set_focused(false, &mut modal_game, |input| modal_sent.push(input)));
+    assert!(!modal_game.paused()); // refused while modal dialog waits
+    assert_eq!(modal_sent, [Input::Active(false)]);
+    modal_sent.clear();
+    modal_feed.update(&mut modal_game, |input| modal_sent.push(input));
+    assert!(modal_sent.contains(&Input::Events(vec![SoundEvent::Pause])));
+    assert!(!modal_sent.contains(&Input::Events(vec![SoundEvent::Unpause])));
+    // Subsequent updates while still unfocused must not spuriously unpause.
+    modal_sent.clear();
+    modal_feed.update(&mut modal_game, |input| modal_sent.push(input));
+    assert!(!modal_sent.contains(&Input::Events(vec![SoundEvent::Unpause])));
+    // Regaining focus dispatches Active(true), then Unpause on the next update.
+    modal_sent.clear();
+    assert!(!modal_feed.set_focused(true, &mut modal_game, |input| modal_sent.push(input)));
+    assert_eq!(modal_sent, [Input::Active(true)]);
+    modal_sent.clear();
+    modal_feed.update(&mut modal_game, |input| modal_sent.push(input));
+    assert!(modal_sent.contains(&Input::Events(vec![SoundEvent::Unpause])));
 }
 
 #[test]

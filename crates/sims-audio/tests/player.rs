@@ -2158,7 +2158,9 @@ fn the_placement_s_pan_sets_the_comparison_flags_when_the_event_comes() {
     // far off the left of the screen, the pan is 0 and the flags with
     // it, and the script's `ifle` goes to the silent routine 0x101; in
     // the middle, the pan is 512 and the script asks about its object. A
-    // kind 53 after it writes the patch, and the flags are that.
+    // kind 53 after it writes the patch (`0x57e0cc`), whose `0x57f6e3`..`0x57f6fb`
+    // copies the patch's `Is3d` flag into register `0x1a` via `vtable +0x84`,
+    // overwriting the comparison flags with `is_3d` (0 for 2D, 1 for 3D).
     let mut branches = vec![LOADL, 57];
     branches.extend(long(10_001));
     branches.extend([LOADL, 5]);
@@ -2166,17 +2168,42 @@ fn the_placement_s_pan_sets_the_comparison_flags_when_the_event_comes() {
     branches.extend([WAIT, 5, IFLE]);
     branches.extend(long(0x101));
     branches.extend([72, 6, 1, 2, WAIT_SAMP, END]); // getsrcdatafield v2, arg1, arg2
-    let silent: &[u8] = &[END];
-    for (x, sequenced, asks) in [
-        (400, false, true),
-        (-7000, false, false),
-        (-7000, true, true),
+    let silent: &[u8] = &[WAIT_SAMP, END];
+    let (hit, addresses) = assemble(&[&branches, silent]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         kSndobPlay=1\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\",0,0,0,0,0\n\
+         2=0,two,\"two.xa\",0,0,0,0,0\n\
+         3=0,two3d,\"two.xa\",0,0,0,1,0\n\
+         [GlobalHitList]\n\
+         6=2\n\
+         7=3\n\
+         [Track]\n\
+         10=0,t0,1024,2,0,0,0,0x100,1\n\
+         11=0,t1,1024,2,0,0,0,0x101,1\n\
+         [EventMapping]\n\
+         e0=kSndobPlay,10\n\
+         e1=kSndobPlay,11\n\
+         seq2d=53,10,0,6\n\
+         seq3d=53,10,0,7\n",
+        addresses[0], addresses[1]
+    );
+    for (x, seq_event, asks) in [
+        (400, None, true),
+        (-7000, None, false),
+        (400, Some("seq2d"), false),
+        (-7000, Some("seq3d"), true),
     ] {
         let probe = Probe {
             lot: on_lot(&[(9, x)]),
             asked: Default::default(),
         };
-        let module = module_with(&[&branches, silent], 1, 10, "seq=53,10,0,6\n");
+        let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
         let mut player = Player::new(vec![module], samples(), 1);
         let event = |name: &str| SoundEvent::Play {
             object: 9,
@@ -2186,12 +2213,12 @@ fn the_placement_s_pan_sets_the_comparison_flags_when_the_event_comes() {
         player.render(BLOCK, &probe);
         player.handle(&SoundEvent::Pause, &probe);
         player.handle(&event("e0"), &probe);
-        if sequenced {
-            player.handle(&event("seq"), &probe);
+        if let Some(seq) = seq_event {
+            player.handle(&event(seq), &probe);
         }
         player.handle(&SoundEvent::Unpause, &probe);
         player.render(2 * BLOCK, &probe);
-        assert_eq!(!probe.asked.borrow().is_empty(), asks, "{x}");
+        assert_eq!(!probe.asked.borrow().is_empty(), asks, "{x} {seq_event:?}");
         assert!(player.faults.is_empty(), "{:?}", player.faults);
     }
 }
@@ -6355,5 +6382,79 @@ fn same_block_ducking_write_and_kill_refresh_latched_gain_before_non_streamed_no
     play(&mut player, "kill_stopped");
     assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
     assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn patch_write_copies_is3d_and_flags_before_refreshing_gains() {
+    // `0x57f6e3..0x57f6fb` copies the replacement patch's `Is3d` flag into
+    // track register `THREE_D` (26) via `vtable +0x84` (setting comparison
+    // flags from `is_3d` at `0x57de98..0x57dec5`) before `0x57e04b` refreshes
+    // gains.
+    //
+    // Track 10 starts with 3D patch 1 (Is3d=1), sets PAN=0 (hard left), then
+    // replaces PATCH=2 (2D patch, Is3d=0) and runs non-streamed `note_on`.
+    // Because Is3d became 0 before the gain refresh, the note plays hard-left
+    // ([10_000, 0]) instead of 3D-centered ([10_000, 10_000]).
+    let mut replace_3d_with_2d = loadl(20, 0); // PAN = 0 (hard left)
+    replace_3d_with_2d.extend(loadl(50, 2)); // PATCH = 2 (Is3d = 0)
+    replace_3d_with_2d.extend(NOTE_ON_V1);
+    replace_3d_with_2d.extend([SET_LOOP, LOOP]);
+
+    // Track 11 writes PATCH=2 (Is3d=0, so comparison flags become zero) and
+    // checks `ifeq` -> jumps to 0x102 which plays `note_on`.
+    const IFEQ: u8 = 62;
+    let mut patch_then_ifeq = loadl(50, 2);
+    patch_then_ifeq.push(IFEQ);
+    patch_then_ifeq.extend(long(0x102));
+    patch_then_ifeq.push(END);
+
+    let mut branch_taken = Vec::from(NOTE_ON_V1);
+    branch_taken.extend([SET_LOOP, LOOP]);
+
+    let (hit, addresses) = assemble(&[&replace_3d_with_2d, &patch_then_ifeq, &branch_taken]);
+    // Patch 1: 4th flag after path = 1 (`Is3d = 1`).
+    // Patch 2: 4th flag after path = 0 (`Is3d = 0`).
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         0x102={:#x}\n\
+         [Patch]\n\
+         1=0,p3d,\"one.xa\",0,0,0,1,0\n\
+         2=0,p2d,\"two.xa\",0,0,0,0,0\n\
+         [Track]\n\
+         10=0,pan_test,1024,0,0,1,0,0x100,1\n\
+         11=0,flag_test,1024,0,0,1,0,0x101,1\n\
+         [EventMapping]\n\
+         pan=1,10\n\
+         flag=1,11\n",
+        addresses[0], addresses[1], addresses[2],
+    );
+    let mut map = long_sample("one.xa");
+    map.insert(
+        "two.xa".to_owned(),
+        Pcm {
+            rate: RATE,
+            channels: 1,
+            samples: vec![10_000; 20 * BLOCK],
+        },
+    );
+    let make = || {
+        let m = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+        Player::new(vec![m], map.clone(), 1)
+    };
+
+    let mut player = make();
+    play(&mut player, "pan");
+    let out = player.render_stereo(BLOCK, &NoSources);
+    assert_eq!((out[0], out[1]), (10_000, 0));
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+
+    let mut player = make();
+    play(&mut player, "flag");
+    let out = player.render_stereo(BLOCK, &NoSources);
+    assert_eq!((out[0], out[1]), (10_000, 10_000));
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }

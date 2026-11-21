@@ -98,6 +98,10 @@ pub struct Patch {
     /// when the path contains `"sounddata\\"` (`0x57b4a2`..`0x57b4bc`,
     /// `0x57b5b4`..`0x57b5d1`).
     pub is_streamed: bool,
+    /// *(code)* Whether the patch's `Is3d` flag (register 26, `0x1a`) is set:
+    /// the fourth flag field after the quoted path is `1`
+    /// (`0x57b4fe`..`0x57b539`, `0x57fa2b`..`0x57fa34`).
+    pub is_3d: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,14 +207,19 @@ impl Hot {
                         return fail(number_of, "patch without a quoted path");
                     };
                     let path = fields[path_index].trim_matches('"').to_owned();
-                    // *(code)* 0x57b4a2..0x57b4bc, 0x57b5b4..0x57b5d1: the
-                    // second flag after the path sets `IsStreamed` when equal
-                    // to 1, except paths containing `"sounddata\\"` clear it.
+                    // *(code)* 0x57b4a2..0x57b539, 0x57b5b4..0x57b5d1: the
+                    // second flag after the path sets `IsStreamed` (cleared
+                    // when the path contains `"sounddata\\"`), and the fourth
+                    // sets `Is3d` (register 26, `0x1a`).
                     let is_streamed = fields
                         .get(path_index + 2)
                         .and_then(|f| number(f))
                         .is_some_and(|n| n == 1)
                         && !path.to_ascii_lowercase().contains("sounddata\\");
+                    let is_3d = fields
+                        .get(path_index + 4)
+                        .and_then(|f| number(f))
+                        .is_some_and(|n| n == 1);
                     let id = id()?;
                     if id != 0 {
                         hot.registered.push((id, Object::Patch));
@@ -221,6 +230,7 @@ impl Hot {
                             name: fields.get(1).unwrap_or(&"").to_string(),
                             path,
                             is_streamed,
+                            is_3d,
                         },
                     );
                 }
