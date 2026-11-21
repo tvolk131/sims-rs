@@ -427,31 +427,19 @@ impl App {
                     "-" | "_" => Move::ZoomOut,
                     "[" => Move::Rotate(false),
                     "]" => Move::Rotate(true),
-                    "," => {
+                    "," | "<" => {
                         if self.game.rotate_held(false) {
                             self.changed(true);
                             return;
                         }
                         Move::Rotate(false)
                     }
-                    "." => {
+                    "." | ">" => {
                         if self.game.rotate_held(true) {
                             self.changed(true);
                             return;
                         }
                         Move::Rotate(true)
-                    }
-                    "<" => {
-                        if self.game.rotate_held(false) {
-                            self.changed(true);
-                        }
-                        return;
-                    }
-                    ">" => {
-                        if self.game.rotate_held(true) {
-                            self.changed(true);
-                        }
-                        return;
                     }
                     "1" => Move::Walls(Walls::Up),
                     "2" => Move::Walls(Walls::Cutaway),

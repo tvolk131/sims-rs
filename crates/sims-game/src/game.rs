@@ -616,12 +616,14 @@ impl Game {
         let viewport = self.house_viewport_size();
         // The lot, then the people, then the objects that hold someone
         // (a bench a Sim sits on), as the original's frame does.
-        sims_render::draw_lot_in_viewport(
+        let preview = self.buy_cursor.as_ref().map(|c| (c.cursor, c.held));
+        sims_render::draw_lot_with_preview(
             world,
             &self.lot_shape,
             &mut self.assets,
             &self.view.camera,
             viewport,
+            preview,
             &mut self.canvas,
         );
         self.drawn_camera = self.view.camera;
@@ -1784,8 +1786,12 @@ impl Game {
             self.note = Some(format!("The mode was not changed: {e}"));
             return;
         }
+        let was_expanded = self.hud.controls.expanded;
         self.hud.controls.mode = mode;
         self.hud.controls.expanded = true;
+        if !was_expanded {
+            self.sync_view_centre();
+        }
         self.hud.controls.help = None;
         self.hud.buy_state.reset();
         // Native `0x487191` clears the active selection/cursor while retaining

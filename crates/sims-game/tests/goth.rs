@@ -6207,4 +6207,44 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
         game.lot().world().objects[&game.buy_cursor().unwrap().held].data[1],
         4
     );
+
+    // Blocked placement preview (`0x42242f`): hovering the chair onto a
+    // blocked spot leaves the chair off-lot and the Tile Cursor on-lot, yet
+    // rendering still draws the chair's sprites at the cursor's position.
+    let blocked_spot = [338, 276];
+    game.hover(blocked_spot);
+    let blocked_cur = game.buy_cursor().unwrap().clone();
+    assert!(!blocked_cur.valid);
+    assert_eq!(
+        game.lot().world().objects[&blocked_cur.held].position[0],
+        -16
+    );
+    assert!(game.lot().world().objects[&blocked_cur.cursor].position[0] >= 0);
+    let canvas = game.render();
+    let drew_held = (0..canvas.height as i32)
+        .any(|y| (0..canvas.width as i32).any(|x| canvas.id_at(x, y) == Some(blocked_cur.held)));
+    assert!(
+        drew_held,
+        "blocked held chair must still draw at the on-lot Tile Cursor position (0x42242f)"
+    );
+
+    // Entering Buy Mode from a collapsed Live panel refreshes `view_centre`.
+    game.set_mode(Mode::Live);
+    game.render();
+    let toggle = game
+        .panel()
+        .iter()
+        .find(|item| item.command == Some(sims_ui::command::Command::TogglePanel))
+        .map(|item| {
+            [
+                item.rect.x + item.rect.width / 2,
+                item.rect.y + item.rect.height / 2,
+            ]
+        })
+        .expect("TogglePanel button");
+    game.press(toggle);
+    game.release(toggle);
+    let collapsed_centre = game.lot().view_centre();
+    game.set_mode(Mode::Buy);
+    assert_ne!(game.lot().view_centre(), collapsed_centre);
 }

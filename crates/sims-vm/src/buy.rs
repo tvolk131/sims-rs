@@ -261,12 +261,15 @@ impl Interpreter<'_> {
             .then_some(cursor.container)
             .flatten();
         self.remove_cursor_and_held(world, cursor)?;
+        if !inside_placement_bounds(world, pos) {
+            // Native `0x485c75` -> `0x422632`: exit immediately on border
+            // rejection without overwriting the last saved turn position.
+            cursor.valid = false;
+            return Ok(false);
+        }
         cursor.position = [pos[0], pos[1], level];
         cursor.valid = false;
         cursor.container = None;
-        if !inside_placement_bounds(world, pos) {
-            return Ok(false);
-        }
         // Native `0x485ced`: check whether `"Tile Cursor"` fits at snapped
         // `pos` BEFORE trying snapped placement or wall/pool auto-rotation
         // (`0x48736b`); if it does not fit, jump straight to unsnapped
@@ -682,11 +685,10 @@ impl Interpreter<'_> {
     /// Hides the cursor and held object off the lot while the pointer leaves
     /// the house view (`0x487d4e` → `0x487d60` → `0x421963`, calling
     /// `TakeOff(1)` unconditionally whenever a cursor exists while preserving
-    /// the saved coordinates read by `Turn` `0x421be4`).
+    /// the saved coordinates and surface container read by `Turn` `0x421be4`).
     pub fn buy_hide(&self, world: &mut World, cursor: &mut BuyCursor) -> Result<(), Fault> {
         self.take_off_cursor_and_held_unconditional(world, cursor)?;
         cursor.valid = false;
-        cursor.container = None;
         Ok(())
     }
 
