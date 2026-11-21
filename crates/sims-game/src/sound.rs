@@ -169,9 +169,15 @@ pub fn sources(world: &World) -> Snapshot {
 /// high, through `camera`, as the original's sound code asks the view
 /// (0x570e09): the object's fine position rotated into the view about
 /// 1023, not the drawing's 1024 (0x47bc1f), then projected on its level
-/// by [`fine_point`]. Empty for a camera so far off that its arithmetic
-/// would overflow, which no view the controls make comes near.
-pub fn screen(world: &World, camera: &Camera, size: [i32; 2]) -> BTreeMap<i32, Projection> {
+/// with the tile's terrain heights ([`object_point_on_lot`]). Empty for a
+/// camera so far off that its arithmetic would overflow, which no view
+/// the controls make comes near.
+pub fn screen(
+    world: &World,
+    lot: &sims_render::Lot,
+    camera: &Camera,
+    size: [i32; 2],
+) -> BTreeMap<i32, Projection> {
     if camera.origin.iter().any(|n| n.unsigned_abs() >= 1 << 26) {
         return BTreeMap::new();
     }
@@ -180,7 +186,7 @@ pub fn screen(world: &World, camera: &Camera, size: [i32; 2]) -> BTreeMap<i32, P
         .values()
         .filter(|object| object.id > 0)
         .map(|object| {
-            let at = object_point(camera, object.position);
+            let at = object_point_on_lot(camera, lot, object.position);
             let view = Projection {
                 at,
                 screen: size,
@@ -192,50 +198,132 @@ pub fn screen(world: &World, camera: &Camera, size: [i32; 2]) -> BTreeMap<i32, P
         .collect()
 }
 
-/// The screen point of an object at `position` (fine, fine, level), as
-/// the original's view works it out for an object (0x4071a3, 0x47bc1f,
-/// 0x4a9dc7): the fine position rotated into the view about 1023, not
-/// the drawing's 1024, then projected on its level by [`fine_point`].
-pub fn object_point(camera: &Camera, position: [i32; 3]) -> [i32; 2] {
+/// The active lot's rotated tile bounds `[min_x, max_x, min_y, max_y]`
+/// (0x4791a6).
+pub(crate) fn lot_bounds(lot: &sims_render::Lot, camera: &Camera) -> [i32; 4] {
+    if lot.size == 0 {
+        return [0; 4];
+    }
+    let last = lot.size as i32 - 1;
+    let a = camera.rotate_tile([0, 0]);
+    let b = camera.rotate_tile([last, last]);
+    [
+        a[0].min(b[0]),
+        a[0].max(b[0]),
+        a[1].min(b[1]),
+        a[1].max(b[1]),
+    ]
+}
+
+/// A view tile's four corner terrain heights in view order (0x479567,
+/// corner table 0x6c4ebc: left, top, right, bottom). Returns `[0; 4]` if
+/// the unrotated tile is outside the lot.
+pub(crate) fn raw_tile_corners(
+    lot: &sims_render::Lot,
+    camera: &Camera,
+    view_tile: [i32; 2],
+) -> [u8; 4] {
+    let [x, y] = camera.unrotate_tile(view_tile);
+    if !lot.contains(x, y) {
+        return [0; 4];
+    }
+    let h = lot.heights[sims_render::Lot::cell(x as usize, y as usize)];
+    let rotation = usize::from(camera.rotation & 3);
+    std::array::from_fn(|n| h[(n + 4 - rotation) & 3])
+}
+
+/// A view tile's four corner terrain heights as `0x4a9c50` and `0x4a9dc7`
+/// read them: [`raw_tile_corners`] on the lot's inner tiles
+/// (`min_x + 1..=max_x - 1`, `min_y + 1..=max_y - 1`), and `[0; 4]` on
+/// the border or off the lot.
+pub fn tile_corners(lot: &sims_render::Lot, camera: &Camera, view_tile: [i32; 2]) -> [i32; 4] {
+    if lot.size < 3 {
+        return [0; 4];
+    }
+    let b = lot_bounds(lot, camera);
+    if view_tile[0] <= b[0] || view_tile[0] >= b[1] || view_tile[1] <= b[2] || view_tile[1] >= b[3]
+    {
+        return [0; 4];
+    }
+    raw_tile_corners(lot, camera, view_tile).map(i32::from)
+}
+
+/// Rotates a fine lot position into view coordinates about 1023, as
+/// `0x47bc1f` does with `param_4 = 0x400`.
+pub(crate) fn rotate_object_fine(camera: &Camera, [x, y]: [i32; 2]) -> [i32; 2] {
     let m = 1023;
-    let [x, y, level] = position;
-    let rotated = match camera.rotation & 3 {
+    match camera.rotation & 3 {
         1 => [m - y, x],
         2 => [m - x, m - y],
         3 => [y, m - x],
         _ => [x, y],
-    };
-    fine_point(camera, rotated, level)
+    }
+}
+
+/// The screen point of an object at `position` (fine, fine, level) on flat
+/// ground, as the original's view works it out (0x4071a3, 0x47bc1f,
+/// 0x4a9dc7): the fine position rotated into the view about 1023, not
+/// the drawing's 1024, then projected on its level by [`fine_point`].
+pub fn object_point(camera: &Camera, position: [i32; 3]) -> [i32; 2] {
+    let [x, y, level] = position;
+    fine_point(camera, rotate_object_fine(camera, [x, y]), level)
+}
+
+/// The screen point of an object at `position` (fine, fine, level) on
+/// `lot`, including the tile's terrain heights (0x4071a3, 0x47bc1f,
+/// 0x4a9dc7, 0x479567).
+pub fn object_point_on_lot(
+    camera: &Camera,
+    lot: &sims_render::Lot,
+    position: [i32; 3],
+) -> [i32; 2] {
+    let [x, y, level] = position;
+    let rotated = rotate_object_fine(camera, [x, y]);
+    let tile = [rotated[0] >> 4, rotated[1] >> 4].map(|n| i32::from(n as i16));
+    let corners = tile_corners(lot, camera, tile);
+    fine_point_with_heights(camera, rotated, level, corners)
+}
+
+/// The screen point of a fine view position on `level` on flat ground, as
+/// the original's view works it out (0x4a9dc7): see
+/// [`fine_point_with_heights`].
+pub fn fine_point(camera: &Camera, fine: [i32; 2], level: i32) -> [i32; 2] {
+    fine_point_with_heights(camera, fine, level, [0; 4])
 }
 
 /// The screen point of a fine view position on `level`, as the
-/// original's view works it out (0x4a9dc7), which the drawing's
-/// [`Camera::project_fine`] does not: the tile's corner is projected and
-/// cut to 16 bits each way, then each part of the step across the tile
-/// is cut toward zero on its own and added in 16 bits. The result can be
-/// a pixel off the drawing's.
-///
-/// The original also raises the corner, and slants the step, by the
-/// heights of the tile's four corners. Those are left out (the ground is
-/// taken as flat), which only moves the point up or down
-/// (**unverified** on a lot that is not flat).
-pub fn fine_point(camera: &Camera, [x, y]: [i32; 2], level: i32) -> [i32; 2] {
+/// original's view works it out (0x4a9dc7, 0x4a9c50): the tile's top
+/// corner is projected at `corners[1]` and cut to 16 bits each way, then
+/// each part of the step across the tile (slanted by `corners`, in view
+/// order: left, top, right, bottom) is cut toward zero on its own and
+/// added in 16 bits. The result can be a pixel off the drawing's
+/// [`Camera::project_fine`].
+pub fn fine_point_with_heights(
+    camera: &Camera,
+    [x, y]: [i32; 2],
+    level: i32,
+    corners: [i32; 4],
+) -> [i32; 2] {
     let shift = camera.zoom.level();
     let [tx, ty] = [x >> 4, y >> 4].map(|n| i32::from(n as i16));
     let [fx, fy] = [x & 15, y & 15];
-    let [cx, cy] = camera.project([tx, ty], level, 0).map(|n| n as i16);
-    // Down the tile, (rise + 2) or (rise + 4) steps of the zoom's half
-    // tile, for a part `f` of 16; the rises are 0 on flat ground.
+    let [cx, cy] = camera
+        .project([tx, ty], level, corners[1])
+        .map(|n| n as i16);
+    // Down the tile, (top - corner + 2) or (top - bottom + 4) steps of
+    // the zoom's half tile, for a part `f` of 16 (0x4a9dc7).
     let down = |steps: i32, f: i32| (steps << (shift + 1)) * f / 16;
     let across = 8 << shift;
     let (dx, dy) = if fx == fy {
-        (0, down(4, fx))
+        (0, down(corners[1] - corners[3] + 4, fx))
     } else if fx > fy {
-        let (side, diagonal) = (down(2, fx), down(4, fx));
+        let side = down(corners[1] - corners[2] + 2, fx);
+        let diagonal = down(corners[1] - corners[3] + 4, fx);
         let right = across * fx / 16;
         (right - right * fy / fx, (diagonal - side) * fy / fx + side)
     } else {
-        let (side, diagonal) = (down(2, fy), down(4, fy));
+        let side = down(corners[1] - corners[0] + 2, fy);
+        let diagonal = down(corners[1] - corners[3] + 4, fy);
         let left = across * fy / -16;
         (left - left * fx / fy, (diagonal - side) * fx / fy + side)
     };
@@ -530,6 +618,95 @@ mod tests {
             fine_point(&camera, [163, 167], 1),
             camera.project_fine([163, 167], 1, 0)
         );
+    }
+
+    #[test]
+    fn terrain_heights_raise_and_slant_fine_point() {
+        use sims_render::camera::{Walls, Zoom};
+        let camera = Camera {
+            zoom: Zoom::Far,
+            rotation: 0,
+            level: 1,
+            origin: [400, 100],
+            walls: Walls::Up,
+            focus: sims_render::Focus::default(),
+        };
+        // A flat elevated tile raises y by `h << (zoom + 1)` without
+        // changing x or the sub-tile step.
+        let flat = fine_point(&camera, [163, 161], 1);
+        assert_eq!(
+            fine_point_with_heights(&camera, [163, 161], 1, [6, 6, 6, 6]),
+            [flat[0], flat[1] - (6 << 2)]
+        );
+        // Sloped tile: top=6, right=2, bottom=0, left=4.
+        // Diagonal (fx == fy == 8): corner raised by 6*4=24, step down by
+        // ((6 - 0 + 4) << 2) * 8 / 16 = 20 (vs flat 8).
+        let diag_flat = fine_point(&camera, [168, 168], 1);
+        assert_eq!(
+            fine_point_with_heights(&camera, [168, 168], 1, [4, 6, 2, 0]),
+            [diag_flat[0], diag_flat[1] - 24 + 12]
+        );
+        // fx > fy (fx=8, fy=4): side = ((6-2+2)<<2)*8/16 = 12,
+        // diagonal = ((6-0+4)<<2)*8/16 = 20 -> dy = (20-12)*4/8 + 12 = 16.
+        let right_base = camera.project([10, 10], 1, 6);
+        assert_eq!(
+            fine_point_with_heights(&camera, [168, 164], 1, [4, 6, 2, 0]),
+            [right_base[0] + 4, right_base[1] + 16]
+        );
+        // fx < fy (fx=4, fy=8): side = ((6-4+2)<<2)*8/16 = 8,
+        // diagonal = ((6-0+4)<<2)*8/16 = 20 -> dy = (20-8)*4/8 + 8 = 14.
+        assert_eq!(
+            fine_point_with_heights(&camera, [164, 168], 1, [4, 6, 2, 0]),
+            [right_base[0] - 4, right_base[1] + 14]
+        );
+    }
+
+    #[test]
+    fn tile_corners_rotate_and_zero_the_border() {
+        use sims_render::camera::{Walls, Zoom};
+        let mut world = World::empty();
+        world.size = 52;
+        let full = sims_render::lot::FULL * sims_render::lot::FULL;
+        for (id, stride) in [(0, 4), (1, 1), (2, 8), (101, 1), (102, 8)] {
+            world.arrays.insert(
+                id,
+                sims_formats::lot::Array {
+                    width: sims_render::lot::FULL,
+                    height: sims_render::lot::FULL,
+                    stride,
+                    encoding: 0,
+                    data: vec![0; full * stride],
+                },
+            );
+        }
+        // Set inner tile (10, 20) to [1, 2, 3, 4] and border tile (0, 20)
+        // to [9, 9, 9, 9].
+        let cell = |x: usize, y: usize| (x * sims_render::lot::FULL + y) * 4;
+        let arr0 = world.arrays.get_mut(&0).unwrap();
+        arr0.data[cell(10, 20)..cell(10, 20) + 4].copy_from_slice(&[1, 2, 3, 4]);
+        arr0.data[cell(0, 20)..cell(0, 20) + 4].copy_from_slice(&[9, 9, 9, 9]);
+        let lot = sims_render::Lot::from_world(&world).unwrap();
+
+        let expected = [[1, 2, 3, 4], [4, 1, 2, 3], [3, 4, 1, 2], [2, 3, 4, 1]];
+        for rotation in 0u8..4 {
+            let camera = Camera {
+                zoom: Zoom::Far,
+                rotation,
+                level: 1,
+                origin: [0, 0],
+                walls: Walls::Up,
+                focus: sims_render::Focus::default(),
+            };
+            let view_inner = camera.rotate_tile([10, 20]);
+            assert_eq!(
+                tile_corners(&lot, &camera, view_inner),
+                expected[usize::from(rotation)],
+                "rotation {rotation}"
+            );
+            // Border tile is zeroed by 0x4a9c50 / 0x4a9dc7.
+            let view_border = camera.rotate_tile([0, 20]);
+            assert_eq!(tile_corners(&lot, &camera, view_border), [0; 4]);
+        }
     }
 
     #[test]
