@@ -17,9 +17,13 @@
 //! set but empty, or not a folder holding a regular file at some depth;
 //! `SIMS_RATCHET` without `SIMS_INSTALL`, or not such a folder; any
 //! `SIMS_RATCHET_` variable, whatever its value (its name matched as
-//! bytes, so one that is not text counts), without `SIMS_RATCHET`; and a
+//! bytes, so one that is not text counts), without `SIMS_RATCHET`; a
 //! `SIMS_RATCHET_` variable other than `SIMS_RATCHET_UPDATE`,
-//! `SIMS_RATCHET_NEW` and `SIMS_RATCHET_DIFF`.
+//! `SIMS_RATCHET_NEW` and `SIMS_RATCHET_DIFF`; `SIMS_RATCHET_UPDATE`
+//! other than 1 or 0; `SIMS_RATCHET_NEW` naming a baseline scene, a scene
+//! with floors or no scene; and `SIMS_RATCHET_DIFF` that is not an
+//! existing folder where difference images may go (below). All of these
+//! are checked in one place, before the arguments are read.
 //!
 //! It fails when:
 //!
@@ -250,19 +254,50 @@ impl Args {
     }
 }
 
-/// The run's settings, from the environment.
+/// The run's settings, from the environment, each already checked.
 struct Config {
     install: PathBuf,
+    /// `SIMS_RATCHET`, links resolved.
     references: PathBuf,
     update: bool,
     new: Vec<String>,
+    /// `SIMS_RATCHET_DIFF`, links resolved and allowed.
     diff: Option<PathBuf>,
+    manifest: Manifest,
+}
+
+/// The manifest as the run read it.
+struct Manifest {
+    path: PathBuf,
+    /// Its SHA-256 when read, so a write can tell it is unchanged.
+    read: String,
+    text: String,
+    scenes: Vec<Scene>,
+}
+
+impl Manifest {
+    fn read() -> Result<Manifest, String> {
+        let path = manifest_path();
+        let bytes = std::fs::read(&path).map_err(|e| format!("{path:?}: {e}"))?;
+        let read = sha256(&bytes);
+        let text = String::from_utf8(bytes).map_err(|e| format!("{path:?}: {e}"))?;
+        let scenes = parse(&text).map_err(|e| format!("{path:?}: {e}"))?;
+        Ok(Manifest {
+            path,
+            read,
+            text,
+            scenes,
+        })
+    }
 }
 
 impl Config {
-    /// `None` when `SIMS_RATCHET` is not set (the skip); an error for any
-    /// other partial, empty or unknown setting. `SIMS_INSTALL` is checked
-    /// whenever it is set, on the skip too.
+    /// Every check on the settings, in one place: `main` calls it first,
+    /// before the arguments, a list or a filter can end the run, so a bad
+    /// setting fails however the test exits. `None` when `SIMS_RATCHET`
+    /// is not set (the skip); an error for any other partial, empty,
+    /// unknown or wrong setting. `SIMS_INSTALL` is checked whenever it is
+    /// set, on the skip too.
     fn from_env() -> Result<Option<Config>, String> {
         const SETTINGS: [&str; 3] = [
             "SIMS_RATCHET_UPDATE",
@@ -313,16 +348,51 @@ impl Config {
             Some("1") => true,
             Some(other) => return Err(format!("SIMS_RATCHET_UPDATE is 1 or 0, not {other:?}")),
         };
+        let references = references
+            .canonicalize()
+            .map_err(|e| format!("SIMS_RATCHET {references:?}: {e}"))?;
+        let manifest = Manifest::read()?;
         let new: Vec<String> = var("SIMS_RATCHET_NEW")?
             .map(|v| v.split(',').map(str::to_string).collect())
             .unwrap_or_default();
-        let diff = var("SIMS_RATCHET_DIFF")?.map(PathBuf::from);
+        for name in &new {
+            if BASELINE.contains(&name.as_str()) {
+                return Err(format!(
+                    "SIMS_RATCHET_NEW names {name:?}, a baseline scene: its floors are never \
+                     set anew"
+                ));
+            }
+            match manifest.scenes.iter().find(|s| &s.name == name) {
+                Some(s) if s.new => {}
+                Some(_) => {
+                    return Err(format!(
+                        "SIMS_RATCHET_NEW names {name:?}, which has floors: only a scene \
+                         written with `floors = none` is new"
+                    ));
+                }
+                None => return Err(format!("SIMS_RATCHET_NEW names no scene {name:?}")),
+            }
+        }
+        let diff = match var("SIMS_RATCHET_DIFF")?.map(PathBuf::from) {
+            Some(parent) => {
+                let parent = parent
+                    .canonicalize()
+                    .map_err(|e| format!("SIMS_RATCHET_DIFF {parent:?}: {e}"))?;
+                if !parent.is_dir() {
+                    return Err(format!("SIMS_RATCHET_DIFF {parent:?} is not a folder"));
+                }
+                DiffOut::allowed(&parent, &checkout_root()?)?;
+                Some(parent)
+            }
+            None => None,
+        };
         Ok(Some(Config {
             install,
             references,
             update,
             new,
             diff,
+            manifest,
         }))
     }
 }
@@ -357,19 +427,19 @@ fn main() -> ExitCode {
         println!("ratchet: FAILED: self-check: {e}");
         return ExitCode::FAILURE;
     }
-    let args = match Args::parse(&std::env::args().skip(1).collect::<Vec<_>>()) {
-        Ok(args) => args,
-        Err(e) => {
-            println!("ratchet: FAILED: arguments: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    // The settings are checked before any exit that passes: a bad setting
-    // fails `--help`, `--list` and a filtered-out run too.
+    // Every setting is checked first, before any exit that passes: a bad
+    // setting fails `--help`, `--list` and a filtered-out run too.
     let config = match Config::from_env() {
         Ok(config) => config,
         Err(e) => {
             println!("ratchet: FAILED: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let args = match Args::parse(&std::env::args().skip(1).collect::<Vec<_>>()) {
+        Ok(args) => args,
+        Err(e) => {
+            println!("ratchet: FAILED: arguments: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -1069,29 +1139,12 @@ fn replace_manifest(path: &Path, read: &str, text: &str) -> Result<(), String> {
 
 fn run(config: &Config) -> Result<(), Vec<String>> {
     let fail = |e: String| vec![e];
-    let path = manifest_path();
-    let bytes = std::fs::read(&path).map_err(|e| fail(format!("{path:?}: {e}")))?;
-    let read = sha256(&bytes);
-    let text = String::from_utf8(bytes).map_err(|e| fail(format!("{path:?}: {e}")))?;
-    let scenes = parse(&text).map_err(|e| fail(format!("{path:?}: {e}")))?;
-    for name in &config.new {
-        if BASELINE.contains(&name.as_str()) {
-            return Err(fail(format!(
-                "SIMS_RATCHET_NEW names {name:?}, a baseline scene: its floors are never set \
-                 anew"
-            )));
-        }
-        match scenes.iter().find(|s| &s.name == name) {
-            Some(s) if s.new => {}
-            Some(_) => {
-                return Err(fail(format!(
-                    "SIMS_RATCHET_NEW names {name:?}, which has floors: only a scene \
-                     written with `floors = none` is new"
-                )));
-            }
-            None => return Err(fail(format!("SIMS_RATCHET_NEW names no scene {name:?}"))),
-        }
-    }
+    let Manifest {
+        path,
+        read,
+        text,
+        scenes,
+    } = &config.manifest;
     let diff = config
         .diff
         .as_deref()
@@ -1103,12 +1156,9 @@ fn run(config: &Config) -> Result<(), Vec<String>> {
     }
 
     // Every reference first: a changed screenshot stops the run.
-    let corpus = config
-        .references
-        .canonicalize()
-        .map_err(|e| fail(format!("SIMS_RATCHET {:?}: {e}", config.references)))?;
+    let corpus = &config.references;
     let mut originals = Vec::new();
-    for scene in &scenes {
+    for scene in scenes {
         let name = &scene.name;
         let file = config.references.join(&scene.file);
         // With links resolved, the file is still in the folder.
@@ -1266,7 +1316,7 @@ fn run(config: &Config) -> Result<(), Vec<String>> {
     // fails, or keep a floor it could not meet.
     if writes && failures.is_empty() {
         let text = lines.join("\n") + "\n";
-        replace_manifest(&path, &read, &text).map_err(fail)?;
+        replace_manifest(path, read, &text).map_err(fail)?;
         println!("ratchet: wrote {path:?}");
     } else if writes {
         println!("ratchet: wrote nothing: the run failed");

@@ -145,9 +145,12 @@ Each scene names its rectangles and why:
   under any namespace prefix). The SVG root is found with Python's expat
   parser, which reads the whole prolog, an internal document type with
   `]>` in its quoted values included, stops at the first start element,
-  and loads no external entity. Expat is given decoded text (by the byte
-  order mark, otherwise UTF-8 with bad bytes replaced), so a declared
-  encoding it cannot read, such as Shift_JIS, does not hide an SVG.
+  and loads no external entity. Each file is read twice and either
+  reading that finds an `svg` root counts: as bytes in the encoding the
+  document declares (a Latin-1 prefix such as `·` is read as Latin-1),
+  and as text decoded by the byte order mark or else as UTF-8 with bad
+  bytes replaced (so a declared encoding expat cannot read, such as
+  Shift_JIS, or an unknown one, does not hide an SVG).
 
 ## Running it
 
@@ -160,8 +163,13 @@ holding a regular file at some depth; `SIMS_RATCHET` without
 `SIMS_INSTALL`, or not such a folder; any `SIMS_RATCHET_` variable,
 whatever its value (`SIMS_RATCHET_UPDATE=0` included), without
 `SIMS_RATCHET`, its name matched as bytes so that one that is not text
-counts; and a `SIMS_RATCHET_` variable that is not one of the three
-settings.
+counts; a `SIMS_RATCHET_` variable that is not one of the three
+settings; `SIMS_RATCHET_UPDATE` other than 1 or 0; `SIMS_RATCHET_NEW`
+naming a baseline scene, a scene with floors or no scene; and
+`SIMS_RATCHET_DIFF` that is not an existing folder allowed to hold
+difference images. Every one of these is checked in one function that
+runs before the arguments are read, so no way out of the test skips a
+check.
 With both:
 
 ```

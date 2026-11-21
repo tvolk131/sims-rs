@@ -92,23 +92,15 @@ class _RootFound(Exception):
 
 def is_svg(content):
     """Whether `content` is an XML document whose root element's local name
-    is `svg`, under any namespace prefix. Expat reads the prolog (the XML
-    declaration, comments, processing instructions and a document type with
-    its internal subset, quoted `]>` included) and stops at the first start
-    element. It loads no external entity or external DTD subset."""
-    parser = expat.ParserCreate()
-    parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
-    parser.ExternalEntityRefHandler = lambda *_: 1
-
-    def start(name, _attributes):
-        raise _RootFound(name)
-
-    parser.StartElementHandler = start
-    # Expat is given text, so it ignores the declared encoding: an ASCII
-    # SVG that declares one expat cannot read (Shift_JIS) or one that is
-    # wrong is still found. The bytes are read by their byte order mark,
-    # or as UTF-8 with anything else replaced, which leaves the markup
-    # readable whatever the text holds.
+    is `svg`, under any namespace prefix. It is read twice, and either
+    reading that finds an `svg` root counts: as bytes, by the encoding the
+    document declares (so a Latin-1 name is read as Latin-1), and as text
+    decoded by its byte order mark or else as UTF-8 with bad bytes replaced
+    (so a declaration expat cannot read, such as Shift_JIS, is ignored).
+    Expat reads the prolog (the XML declaration, comments, processing
+    instructions and a document type with its internal subset, quoted `]>`
+    included) and stops at the first start element. It loads no external
+    entity or external DTD subset."""
     for mark, encoding in BYTE_ORDER_MARKS:
         if content.startswith(mark):
             text = content[len(mark):].decode(encoding, errors="replace")
@@ -117,11 +109,25 @@ def is_svg(content):
         text = content.decode("utf-8", errors="replace")
     # A browser shows an SVG with white space before its declaration, which
     # expat refuses.
+    raw = content[3:] if content.startswith(b"\xef\xbb\xbf") else content
+    return svg_root(raw.lstrip(b" \t\r\n")) or svg_root(text.lstrip(" \t\r\n"))
+
+
+def svg_root(document):
+    """Whether expat finds an `svg` root in `document` (bytes or text)."""
+    parser = expat.ParserCreate()
+    parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
+    parser.ExternalEntityRefHandler = lambda *_: 1
+
+    def start(name, _attributes):
+        raise _RootFound(name)
+
+    parser.StartElementHandler = start
     try:
-        parser.Parse(text.lstrip(" \t\r\n"), True)
+        parser.Parse(document, True)
     except _RootFound as root:
         return root.args[0].split(":")[-1].lower() == "svg"
-    except (expat.ExpatError, ValueError, UnicodeError):
+    except (expat.ExpatError, ValueError, UnicodeError, LookupError):
         return False
     return False
 

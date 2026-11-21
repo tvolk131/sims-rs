@@ -355,6 +355,10 @@ class RepositoryHygieneTests(unittest.TestCase):
             ("misc/notes.txt", '\ufeff  \n<?xml version="1.0"?><svg/>'),
             ("misc/notes.txt", '<?xml version="1.0" encoding="Shift_JIS"?><svg/>'),
             ("misc/notes.txt", '<?xml version="1.0" encoding="no-such-encoding"?><svg/>'),
+            ("misc/notes.txt",
+             b'<?xml version="1.0" encoding="ISO-8859-1"?>'
+             b'<\xc2\xb7:svg xmlns:\xc2\xb7="http://www.w3.org/2000/svg"/>'),
+            ("misc/notes.txt", "\ufeff<svg/>".encode("utf-16")),
             ("docs/picture.md", "P6\n800 600\n255\n"),
             ("tests/scene.txt", b"\x89PNG\r\n\x1a\nrest"),
             ("tests/scene.txt", b"GIF89a...."),
