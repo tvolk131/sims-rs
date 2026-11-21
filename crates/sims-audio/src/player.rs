@@ -915,9 +915,10 @@ impl<S: Samples> Player<S> {
     }
 
     /// Places a track again from where its objects are (0x5746d9), as
-    /// [`Player::camera_moved`] describes.
+    /// [`Player::camera_moved`] describes. The caller forgets what killed
+    /// tracks kept first ([`Player::forget_silent`]): a placement changes
+    /// no note's life, so a camera move does it once for all its tracks.
     fn place_track(&mut self, track: u32, sources: &dyn Sources) {
-        self.forget_silent();
         let ended: Vec<u32> = self
             .ended
             .values()
@@ -1706,6 +1707,8 @@ impl<S: Samples> Player<S> {
         for track in tracks {
             self.instances.retain(|&pair| pair != (track, object));
             if self.instances.iter().any(|&(t, _)| t == track) {
+                // A fade before may have ended notes.
+                self.forget_silent();
                 self.place_track(track, sources);
             } else {
                 self.fade_and_kill(track);
