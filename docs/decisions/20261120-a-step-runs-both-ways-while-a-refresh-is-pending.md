@@ -430,9 +430,10 @@ What is not ported:
      `.iff`, `.fam`, `.dir`, `.wll` and `.flr` of the name (0x46f50f to
      0x46f542, 0x46b627 to 0x46b699, 0x406a29), loose or in an archive
      there (any file whose name ends in `far`, with no dot needed,
-     0x5ba86d to 0x5ba8a7). Only a set of one `work.iff` there is ported,
+     0x5ba86d to 0x5ba8a7; a member whose name holds a path is placed in a
+     subdirectory, 0x5b9dbc, so is not there). Only a set of one `work.iff` there is ported,
      and it must be the index's only `work.iff`, which `careers` reads
-     (Sol's eleventh to thirteenth checks). Every string table of it
+     (Sol's eleventh to fourteenth checks). Every string table of it
      (STR#, and CST, which the loader falls back to), deleted chunks
      included, must hold no `$` byte at all, since the loader's ways not
      ported may read a string's bytes as entries; each STR# resource must

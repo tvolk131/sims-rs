@@ -847,6 +847,29 @@ fn career_texts_end_only_when_work_holds_no_career_token() {
         assert!(!link(&dir));
     }
     std::fs::remove_file(dir.0.join("ExpansionShared/ExtrasFAR")).unwrap();
+    // An archive member whose name holds a path is placed in a
+    // subdirectory (0x5b9dbc), so is not the `Work` set's, though its
+    // archive is in `ExpansionShared`.
+    std::fs::remove_file(dir.0.join("ExpansionShared/work.iff")).unwrap();
+    let member = work(terminated(&["Clerk"]), 0);
+    for name in ["work.iff", "sub\\work.iff", "sub/work.iff"] {
+        dir.file(
+            "ExpansionShared/ExpansionShared.far",
+            &far(&[(name, member.len() as u32, &member)]),
+        );
+        assert_eq!(link(&dir), name == "work.iff", "{name}");
+    }
+    // Nor is one beside `work.iff`.
+    dir.file("ExpansionShared/work.iff", &member);
+    dir.file(
+        "ExpansionShared/ExpansionShared.far",
+        &far(&[("sub\\work.fam", 0, b"")]),
+    );
+    assert!(link(&dir));
+    dir.file(
+        "ExpansionShared/ExpansionShared.far",
+        &far(&[("other.iff", 0, b"")]),
+    );
     // A resource map that does not match the chunks, or that states a
     // table's flags without 0x10.
     let chunks = [

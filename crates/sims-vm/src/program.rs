@@ -1118,6 +1118,15 @@ fn career_texts_end(index: &Index) -> Result<bool> {
     let (Some((_, file)), None) = (works.next(), works.next()) else {
         return Ok(false);
     };
+    // A member whose name holds a path is in a subdirectory of its
+    // archive's (0x5b9dbc), whose path is `file.path`.
+    if file
+        .member
+        .as_ref()
+        .is_some_and(|member| member.name.contains(['\\', '/']))
+    {
+        return Ok(false);
+    }
     let parent = file.path.parent().map(|parent| parent.to_string_lossy());
     if !parent.is_some_and(|parent| parent.eq_ignore_ascii_case(&directory.to_string_lossy())) {
         return Ok(false);
@@ -1241,8 +1250,9 @@ fn find(root: &Path, relative: &str) -> Option<std::path::PathBuf> {
     Some(path)
 }
 
-/// The names of the entries of `directory`, and of the members of the
-/// archives (FAR: a file whose name ends in `far`) in it, whose name up to
+/// The names of the entries of `directory`, and of the members the
+/// archives (FAR: a file whose name ends in `far`) in it place there,
+/// whose name up to
 /// its first `.` is `stem`, ignoring ASCII case: whatever a resource set
 /// of that name there could be made of. None when an archive there cannot
 /// be read or has members the index leaves out
@@ -1287,10 +1297,11 @@ fn resource_set(directory: &Path, stem: &str) -> Result<Option<Vec<String>>> {
             if !skipped.is_empty() {
                 return Ok(None);
             }
+            // A member whose name holds a path is placed in a
+            // subdirectory (0x5b9dbc, `/` read as `\\`, 0x5b96c8), not here.
             for member in members {
-                let name = member.name.rsplit(['\\', '/']).next().unwrap_or_default();
-                if named(name) {
-                    set.push(name.to_owned());
+                if !member.name.contains(['\\', '/']) && named(&member.name) {
+                    set.push(member.name);
                 }
             }
         }
