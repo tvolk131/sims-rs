@@ -229,25 +229,26 @@ pub(crate) fn skeleton<'p>(
 ) -> Result<&'p Skeleton, Trap> {
     let made = world.characters.made.get(&guid);
     let template = made.map_or(guid, |made| made.template);
-    let none = || {
-        Trap::Unsupported(format!(
-            "no skeleton was supplied for the person type 0x{guid:08X}"
-        ))
-    };
-    let skeleton = people.skeletons.get(&template).ok_or_else(none)?;
-    match made.and_then(|made| made.strings.get(&characters::SKELETON)) {
-        Some(name) if name != &skeleton.name => people
+    if let Some(name) = made.and_then(|made| made.strings.get(&characters::SKELETON)) {
+        if let Some(skeleton) = people.skeletons.get(&template).filter(|s| s.name == *name) {
+            return Ok(skeleton);
+        }
+        return people
             .skeletons_by_name
             .get(name)
             .or_else(|| people.skeletons.values().find(|s| s.name == *name))
             .ok_or_else(|| {
                 Trap::Unsupported(format!(
                     "no person type's skeleton is named {name:?}, which the made person type \
-                         0x{guid:08X} names"
+                     0x{guid:08X} names"
                 ))
-            }),
-        _ => Ok(skeleton),
+            });
     }
+    people.skeletons.get(&template).ok_or_else(|| {
+        Trap::Unsupported(format!(
+            "no skeleton was supplied for the person type 0x{guid:08X}"
+        ))
+    })
 }
 
 /// Reads person `id`'s appearance again if its animator says it is to be

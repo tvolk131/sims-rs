@@ -509,15 +509,76 @@ impl AvatarRegistry {
         Ok(skeleton.scales[skeleton.place].clone())
     }
 
-    /// Resolves every skeleton currently registered in the avatar registry
-    /// (both eagerly loaded `.bcf` skeletons and `.ndx`-indexed catalogs that
-    /// resolve cleanly), keyed byte-for-byte by skeleton name (`0x5a280f`).
-    pub fn all_skeletons(&mut self) -> BTreeMap<String, Skeleton> {
-        let names: Vec<String> = self.skeletons.keys().cloned().collect();
+    /// Snapshots every skeleton registered in the avatar registry keyed
+    /// byte-for-byte by skeleton name (`0x5a280f`) without mutating lazy `.ndx`
+    /// state across entries:
+    /// - every already-`Loaded` skeleton (eager `.bcf` catalogs plus any `.ndx`
+    ///   catalogs and their siblings already loaded for the requested person
+    ///   GUIDs) is included as-is;
+    /// - each still-unloaded `Indexed` entry is resolved from its own
+    ///   `catalog_bcf` in isolation so alphabetically earlier `.ndx` catalogs
+    ///   cannot shadow another entry's own catalog (`0x5a03c2`–`0x5a03cd`).
+    fn snapshot_skeletons(&self) -> BTreeMap<String, Skeleton> {
         let mut out = BTreeMap::new();
-        for name in names {
-            if let Ok(skeleton) = self.skeleton(&name) {
-                out.insert(name, skeleton);
+        let mut catalog_cache: BTreeMap<String, Vec<Skeleton>> = BTreeMap::new();
+        for (name, (reg_step, entry)) in &self.skeletons {
+            if let Some((err_step, _)) = &self.first_skeleton_error
+                && *reg_step >= *err_step
+            {
+                continue;
+            }
+            match entry {
+                SkeletonEntry::Loaded {
+                    file,
+                    place,
+                    scales,
+                    bones,
+                } => {
+                    out.insert(
+                        name.clone(),
+                        Skeleton {
+                            name: name.clone(),
+                            file: file.clone(),
+                            place: *place,
+                            scales: scales.clone(),
+                            bones: bones.clone(),
+                        },
+                    );
+                }
+                SkeletonEntry::Failed(_) => {}
+                SkeletonEntry::Indexed {
+                    directory,
+                    catalog_bcf,
+                    ..
+                } => {
+                    let Ok(Some(resource)) = self.paths.files.lookup(directory, catalog_bcf) else {
+                        continue;
+                    };
+                    let location = resource.location(&self.root);
+                    let decoded = catalog_cache.entry(location.clone()).or_insert_with(|| {
+                        let Ok(bytes) = resource.read() else {
+                            return Vec::new();
+                        };
+                        let mut binary = Binary::new(&bytes);
+                        let (items, _) = read_bcf_skeletons(&mut binary);
+                        let all_scales: Vec<Vec<i32>> =
+                            items.iter().map(|(_, s, _)| s.clone()).collect();
+                        items
+                            .into_iter()
+                            .enumerate()
+                            .map(|(place, (skel_name, _, bones))| Skeleton {
+                                name: skel_name,
+                                file: location.clone(),
+                                place,
+                                scales: all_scales.clone(),
+                                bones,
+                            })
+                            .collect()
+                    });
+                    if let Some(skeleton) = decoded.iter().find(|s| s.name == *name) {
+                        out.insert(name.clone(), skeleton.clone());
+                    }
+                }
             }
         }
         out
@@ -631,8 +692,7 @@ impl People {
                 Err(error) => return Err(error),
             }
         }
-        let skeletons_by_name = registry.all_skeletons();
-        profiles.retain(|guid, _| !unresolved.contains_key(guid));
+        let skeletons_by_name = registry.snapshot_skeletons();
         let mut portrait_head = BTreeMap::new();
         for (guid, suits) in default_suits {
             if unresolved.contains_key(&guid) {
@@ -712,22 +772,30 @@ fn loaded_english_rows(entries: &[sims_formats::strings::TextEntry]) -> Vec<Stri
 /// `0x46feac(0, 1)`) does:
 /// - uses [`StringTable::parse_chunk`] with `flags` (honoring flag `0x10` for
 ///   little-endian length-prefixed tables at `0x4700d7`–`0x47014c`);
-/// - applies the length-prefixed `0xa1 -> 'o'` / `0xd5 -> '\''` byte mapping
-///   (`0x4700f5`–`0x47010f`);
+/// - for length-prefixed strings, truncates at the first embedded NUL
+///   (`0x470404`–`0x470434`) and applies the `0xa1 -> 'o'` / `0xd5 -> '\''`
+///   byte mapping (`0x4700f5`–`0x47010f`);
 /// - orders version `-3` US-English entries with later runs inserted first
 ///   (`0x470002`–`0x470049`);
 /// - when a version `-3` table has entries (`count > 0`) and none matched US
 ///   English (`0x46fae6 == 0`), runs the native byte-by-byte English rescan
-///   (`0x47006b`–`0x4700d0`).
+///   (`0x47006b`–`0x4700d0`);
+/// - pads short tables to 35 rows (`0x23`) with empty strings
+///   (`0x587b7b`–`0x587ba5`).
 fn decode_body_string_table(data: &[u8], flags: u16, label: &str) -> Result<Vec<String>> {
+    const BODY_ROWS: usize = 35;
     let parsed = StringTable::parse_chunk(data, flags).map_err(|e| Error::format(label, e))?;
-    if parsed.format == sims_formats::strings::Format::MacResource {
-        return Ok(parsed
+    let mut loaded = if parsed.format == sims_formats::strings::Format::MacResource {
+        parsed
             .entries
             .iter()
             .map(|entry| {
-                let mapped: Vec<u8> = entry
+                let before_nul = entry
                     .raw_text
+                    .split(|&b| b == 0)
+                    .next()
+                    .unwrap_or(&entry.raw_text);
+                let mapped: Vec<u8> = before_nul
                     .iter()
                     .map(|&b| match b {
                         0xa1 => b'o',
@@ -737,37 +805,42 @@ fn decode_body_string_table(data: &[u8], flags: u16, label: &str) -> Result<Vec<
                     .collect();
                 decode(&mapped, 1)
             })
-            .collect());
-    }
-    let mut loaded = loaded_english_rows(&parsed.entries);
-    if parsed.format == sims_formats::strings::Format::Localized
-        && loaded.is_empty()
-        && !parsed.entries.is_empty()
-    {
-        let mut pos = 4usize;
-        for _ in 0..parsed.entries.len() {
-            let Some(&b) = data.get(pos) else {
-                return Err(Error::Unsupported(format!(
-                    "{label}: English rescan (0x47006b..0x4700d0) reads past chunk end"
-                )));
-            };
-            pos += 1;
-            if b == 1 {
-                let Some(end1) = data[pos..].iter().position(|&c| c == 0) else {
+            .collect()
+    } else {
+        let mut loaded = loaded_english_rows(&parsed.entries);
+        if parsed.format == sims_formats::strings::Format::Localized
+            && loaded.is_empty()
+            && !parsed.entries.is_empty()
+        {
+            let mut pos = 4usize;
+            for _ in 0..parsed.entries.len() {
+                let Some(&b) = data.get(pos) else {
                     return Err(Error::Unsupported(format!(
-                        "{label}: unterminated string in English rescan (0x4700a3)"
+                        "{label}: English rescan (0x47006b..0x4700d0) reads past chunk end"
                     )));
                 };
-                loaded.push(decode(&data[pos..pos + end1], 1));
-                pos += end1 + 1;
-                let Some(end2) = data[pos..].iter().position(|&c| c == 0) else {
-                    return Err(Error::Unsupported(format!(
-                        "{label}: unterminated comment in English rescan (0x4700bf)"
-                    )));
-                };
-                pos += end2 + 1;
+                pos += 1;
+                if b == 1 {
+                    let Some(end1) = data[pos..].iter().position(|&c| c == 0) else {
+                        return Err(Error::Unsupported(format!(
+                            "{label}: unterminated string in English rescan (0x4700a3)"
+                        )));
+                    };
+                    loaded.push(decode(&data[pos..pos + end1], 1));
+                    pos += end1 + 1;
+                    let Some(end2) = data[pos..].iter().position(|&c| c == 0) else {
+                        return Err(Error::Unsupported(format!(
+                            "{label}: unterminated comment in English rescan (0x4700bf)"
+                        )));
+                    };
+                    pos += end2 + 1;
+                }
             }
         }
+        loaded
+    };
+    if loaded.len() < BODY_ROWS {
+        loaded.resize(BODY_ROWS, String::new());
     }
     Ok(loaded)
 }
@@ -1550,9 +1623,22 @@ xskin-b001-PELVIS-BODY\r\n\
         assert_eq!(rows[0], "adult");
         assert_eq!(rows[34], "row34");
 
+        // Length-prefixed string with embedded NUL (0x470404..0x470434):
+        // bytes after the first NUL are dropped, and short tables are padded
+        // to 35 empty rows (0x587b7b..0x587ba5).
+        let mut nul_pascal = Vec::from(1u16.to_le_bytes());
+        nul_pascal.push(7);
+        nul_pascal.extend_from_slice(b"adult\0x");
+        let rows = decode_body_string_table(&nul_pascal, 0x10, "nul").unwrap();
+        assert_eq!(rows.len(), 35);
+        assert_eq!(rows[0], "adult");
+        assert_eq!(rows[13], "");
+        assert_eq!(rows[14], "");
+
         // Version -3 table with no US-English entries (language 3 only) whose
         // bytes include an embedded 0x01 byte: 0x587b65 -> 0x47006b..0x4700d0
-        // rescans byte-by-byte and extracts the string following 0x01.
+        // rescans byte-by-byte and extracts the string following 0x01, then
+        // pads to 35 rows.
         let mut rescan = Vec::new();
         rescan.extend_from_slice(&(-3i16).to_le_bytes());
         rescan.extend_from_slice(&2u16.to_le_bytes());
@@ -1561,6 +1647,9 @@ xskin-b001-PELVIS-BODY\r\n\
         rescan.push(3);
         rescan.extend_from_slice(b"unused\0\0");
         let rows = decode_body_string_table(&rescan, 0x10, "rescan").unwrap();
-        assert_eq!(rows, vec!["adult"]);
+        assert_eq!(rows.len(), 35);
+        assert_eq!(rows[0], "adult");
+        assert_eq!(rows[13], "");
+        assert_eq!(rows[14], "");
     }
 }

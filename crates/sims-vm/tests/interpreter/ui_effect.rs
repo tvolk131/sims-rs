@@ -1654,6 +1654,49 @@ fn make_new_character_wardrobe_head_binding_drives_ui_effect_render_and_writebac
     assert!(fx.world.skeleton_files.contains("lower-adult.bcf"));
     assert!(!fx.world.skeleton_files.contains("upper-adult.bcf"));
 
+    // 7e3. Runtime-made character with a valid skeleton override succeeds in
+    // BOTH `Interpreter::create_person` and UI Effect even when its template's
+    // own rig is missing from `people.skeletons` (template profile retained).
+    let (mut fx, _, _) = visitors();
+    fx.world.rooms.rooms.get_mut(&1).unwrap().occupied = true;
+    let adult_skel = fx.program.people.skeletons.remove(&WIDGET).unwrap();
+    let mut named_adult = adult_skel;
+    named_adult.name = "adult".into();
+    named_adult.file = "override-adult.bcf".into();
+    fx.program
+        .people
+        .skeletons_by_name
+        .insert("adult".into(), named_adult);
+    let made_guid = 0x5555_999au32;
+    fx.world.characters.made.insert(
+        made_guid,
+        sims_sim::characters::Character {
+            template: WIDGET,
+            file: 100,
+            strings: [(sims_sim::characters::SKELETON, "adult".to_owned())].into(),
+        },
+    );
+    fx.world.neighbors.slots.push(Some(Neighbor {
+        guid: made_guid,
+        id: 100,
+        data: vec![12; 88],
+        relationships: Vec::new(),
+        friends: 0,
+        revision: 1,
+        stale: false,
+    }));
+    let made_rec = fx.world.neighbors.slots.len() as i16;
+    let id = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream)
+        .create_person(&mut fx.world, made_guid)
+        .expect("public create_person should resolve runtime-made override even when template rig is absent");
+    assert!(fx.world.objects.contains_key(&id));
+    assert!(fx.world.skeleton_files.contains("override-adult.bcf"));
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, made_rec, 1),
+        Ok(true)
+    );
+    assert_eq!(fx.world.portraits, [made_guid].into());
+
     // 7f. Negative-age copy prefers loader-ordered `loaded_strings` head row
     // (`0x470049`) over physically ordered `Profile::head`: when the first run
     // had a matching HEAD suit and the later run placed a comma-past-255 row
