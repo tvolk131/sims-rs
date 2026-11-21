@@ -1399,7 +1399,8 @@ fn a_new_object_can_be_created_off_the_lot_and_run_a_tree_by_name() {
     // stack object and the lamp's temps as its arguments.
     assert_eq!(widget.attributes[2], 4);
     assert!(fx.lamp().stack.is_empty());
-    // Mode 1 is not ported.
+    // Mode 1 targets my container slot 0; the lamp has no container slot
+    // here, so the object is refused and removed, taking the false branch.
     fx.add(
         LAMP_FILE,
         4096,
@@ -1410,8 +1411,7 @@ fn a_new_object_can_be_created_off_the_lot_and_run_a_tree_by_name() {
             [guid[0], guid[1], guid[2], guid[3], 1, 0, 0, 0],
         )]),
     );
-    let text = trap(fx.run()).to_string();
-    assert!(text.contains("Create New Object Instance mode 1"), "{text}");
+    assert_eq!(fx.run(), Ok(false));
 }
 
 /// A route context of `person` to slot 0 of the lamp.

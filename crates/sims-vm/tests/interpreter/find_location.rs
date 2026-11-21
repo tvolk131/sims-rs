@@ -424,11 +424,12 @@ fn flag_0x20_turns_the_new_object_by_its_turn_step_to_the_stack_objects_facing()
 }
 
 #[test]
-fn mode_8_with_other_flags_or_a_person_it_cannot_make_fails_loudly() {
+fn mode_8_with_conflicting_flags_or_a_person_it_cannot_make_fails_loudly() {
     let (mut fx, _) = placeable();
     fx.lamp_mut().position = [40, 40, 1];
-    let result = create(&mut fx, 0, 0x02, SIM as i16);
-    assert!(matches!(trap(result), Trap::Unsupported(_)));
+    // Flags 0x02 and 0x10 cannot be combined: native error 0x36 (0x44e88c).
+    let result = create(&mut fx, 0, 0x12, SIM as i16);
+    assert_eq!(trap(result).code(), Some(0x36));
     // A person type with no skeleton supplied.
     let (mut fx, file) = placeable();
     fx.lamp_mut().position = [40, 40, 1];
