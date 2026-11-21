@@ -2414,11 +2414,12 @@ fn the_recorded_cancel_order_replayed_in_the_window_matches_the_recording() {
 /// the Sit order is: a press on Bella opens her pie, Talk... opens its
 /// submenu, and About Interests queues the talk. The original found Bella
 /// under the pointer at the recording's (400, 274), three rows below the
-/// lowest pixel our frame draws her at; ours finds nothing there, so the
-/// replay points at that pixel (`docs/decisions/`). With the frames its
-/// Room motives show (after every 30th update from 190), the lot equals the
-/// recording's after every update to 1000 but for the listings the
-/// original made under the still pointer, which ours does not make.
+/// lowest pixel our frame draws her at; while ours finds nothing there,
+/// the replay points at that pixel (`docs/decisions/`). With the frames
+/// its Room motives show (after every 30th update from 190), the lot
+/// equals the recording's after every update to 1000 but for the listings
+/// the original most likely made under the still pointer, which ours does
+/// not make, and two of the salesman's words our state marks as unknown.
 #[test]
 fn the_recorded_talk_order_replayed_in_the_window_matches_the_recording() {
     let Some(install) = install() else {
@@ -2446,13 +2447,21 @@ fn the_recorded_talk_order_replayed_in_the_window_matches_the_recording() {
     game.hover(recorded([400, 286]));
     assert_eq!(game.listed(), None);
     // The original listed Bella's pie with the pointer at the recording's
-    // (400, 274) (Mortimer's last result changes at 94). Ours finds
-    // nothing at that point, and finds her at her lowest drawn pixel.
+    // (400, 274): Mortimer's last result goes from 1 to 0 at 94. Ours
+    // finds nothing at that point; then the replay points at her lowest
+    // drawn pixel.
     run_to(&mut game, &schedule, 93);
-    assert_eq!(game.under(recorded([400, 274])), None);
-    let on_bella = [499, 317];
+    let last_result = |game: &Game| game.lot().world().objects[&mortimer].last_result;
+    assert!(last_result(&game));
+    let on_bella = match game.under(recorded([400, 274])) {
+        Some(id) if id == bella => recorded([400, 274]),
+        _ => [499, 317],
+    };
     game.hover(on_bella);
     assert_eq!(game.listed(), Some((mortimer, bella)));
+    assert!(!last_result(&game));
+    run_to(&mut game, &schedule, 94);
+    assert!(!last_result(&game));
     run_to(&mut game, &schedule, 123);
     game.press(on_bella);
     game.render();
@@ -2505,8 +2514,9 @@ fn the_recorded_talk_order_replayed_in_the_window_matches_the_recording() {
     assert_eq!(action(&p.active), talking(2, 12));
     assert!(p.queue.is_empty());
     // Everyone's room is counted again in the frame after 520. There the
-    // original's still pointer also lists the salesman's pie (Mortimer's
-    // word 50 goes to 1 at 521); ours lists nothing.
+    // original's still pointer also lists a pie, most likely the
+    // salesman's (unverified; Mortimer's word 50 goes to 1 at 521); ours
+    // lists nothing.
     run_to(&mut game, &schedule, 520);
     for id in [alexander, bella, mortimer, salesman] {
         assert_eq!(room(&game, id), 0x429a_aaab, "{id}");
