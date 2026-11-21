@@ -79,3 +79,5 @@ With the masks built at far zoom, medium scores 317864 and near 271711,
 the strip then matching the original's from its top row. Porting the
 kept masks means the camera must remember the zoom its masks were built
 at, which is the next render change.
+
+Ported since: [20261120-kept-cutaway-masks](20261120-kept-cutaway-masks.md).
