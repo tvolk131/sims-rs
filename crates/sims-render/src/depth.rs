@@ -226,18 +226,30 @@ impl Depth {
 
     /// The depth of row `y` of a sprite drawn at one depth a row from the
     /// top row `top` (0x49f2a3), standing at view corner `corner` at
-    /// terrain height `height` on `level`: the trim along standing wall
-    /// tops (the original's side pieces, 0x53e1f7, read by the old
-    /// prototype in `legacy/.../paint/row/geometry_side.rs`). The rows
-    /// follow the ground table from the sprite's top. A cut wall's trim
-    /// has a depth sprite instead ([`Depth::trim`]).
-    pub fn flat(&self, corner: [i32; 2], height: i32, level: i32, top: i32, y: i32) -> i32 {
+    /// terrain height `height` on `level`, with `0x4c8849`'s per-trim depth
+    /// `offset` (`0x4c8a7c`–`0x4c8aa8`): 0 for plain standing trims,
+    /// `900` (`0x384`) for cut diagonal `0x10` trims, `770` (`0x302`) or
+    /// `700` (`0x2bc`, level 2) for cut diagonal `0x40` trims (`0x53c478`–
+    /// `0x53c4af`), and `-100` (`-0x64`) for standing `0x40` trims on level
+    /// 2 (`0x53c663`–`0x53c675`). The rows follow the ground table from the
+    /// sprite's top. Non-diagonal cut wall trims use a depth sprite instead
+    /// ([`Depth::trim`]).
+    pub fn flat(
+        &self,
+        corner: [i32; 2],
+        height: i32,
+        level: i32,
+        offset: i32,
+        top: i32,
+        y: i32,
+    ) -> i32 {
         let at = self.origin_y.saturating_neg();
         let correction = self
             .row(at)
             .saturating_sub(self.row(at.saturating_add((4 << self.zoom) + 1)));
         let base = self
             .ground(corner, height)
+            .saturating_add(offset)
             .saturating_add((LEVEL_DEPTH + 65).saturating_mul(level))
             .saturating_add(correction)
             .min(EMPTY);
@@ -581,6 +593,22 @@ mod tests {
         let top = 255.0 * 16.0;
         assert_eq!(p(100.0, 100.0, top, 1), p(100.0, 100.0, top * 2.0, 1));
         assert_eq!(p(100.0, 100.0, -top, 1), p(100.0, 100.0, -top * 2.0, 1));
+    }
+
+    #[test]
+    fn flat_depth_adds_trim_offset_and_clamps_to_empty() {
+        let m = Depth::new(&camera(Zoom::Near, [0, 0]));
+        let plain = m.flat([10, 10], 0, 1, 0, 100, 110);
+        let cut_10 = m.flat([10, 10], 0, 1, 900, 100, 110);
+        let cut_40 = m.flat([10, 10], 0, 1, 770, 100, 110);
+        let standing_40_l2 = m.flat([10, 10], 0, 2, -100, 100, 110);
+        let standing_plain_l2 = m.flat([10, 10], 0, 2, 0, 100, 110);
+        assert_eq!(cut_10 - plain, 900);
+        assert_eq!(cut_40 - plain, 770);
+        assert_eq!(standing_40_l2 - standing_plain_l2, -100);
+        // Large positive offset clamps base to EMPTY before following rows.
+        let clamped = m.flat([10, 10], 0, 1, EMPTY, 100, 100);
+        assert_eq!(clamped, EMPTY);
     }
 
     #[test]

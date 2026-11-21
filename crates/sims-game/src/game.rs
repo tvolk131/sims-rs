@@ -582,13 +582,15 @@ impl Game {
             level: w.level,
             room: w.room.unwrap_or(NO_ROOM),
         });
+        let viewport = self.house_viewport_size();
         // The lot, then the people, then the objects that hold someone
         // (a bench a Sim sits on), as the original's frame does.
-        sims_render::draw_lot(
+        sims_render::draw_lot_in_viewport(
             world,
             &self.lot_shape,
             &mut self.assets,
             &self.view.camera,
+            viewport,
             &mut self.canvas,
         );
         self.drawn_camera = self.view.camera;
@@ -600,7 +602,6 @@ impl Game {
         self.drawn_us = self.clock_us;
         let milliseconds = (self.clock_us / 1000) as u32;
         self.people.set_clock(milliseconds);
-        let viewport = self.house_viewport_size();
         self.people
             .draw_in_viewport(world, &self.view.camera, viewport, &mut self.canvas);
         // Who the pick notes: the people as drawn, before a bench they sit
