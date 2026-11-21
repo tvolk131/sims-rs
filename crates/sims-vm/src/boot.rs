@@ -1526,6 +1526,27 @@ impl Lot {
         Ok(())
     }
 
+    /// Re-evaluates Buy Mode placement directly at the cursor's saved
+    /// coordinates (`0x485bda` → `0x421e72`).
+    pub fn buy_recheck(&mut self, cursor: &mut BuyCursor) -> Result<bool, OrderError> {
+        self.ready()?;
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let mut next = cursor.clone();
+        let valid = interpreter
+            .buy_recheck(&mut world, &mut next)
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        *cursor = next;
+        Ok(valid)
+    }
+
     /// Commits a valid Buy Mode placement (`0x486ada` → `0x421a0e`, `0x46d91c`):
     /// deletes the `"Tile Cursor"`, places the held object permanently, runs
     /// OBJf function 11 (`USER_PLACEMENT`), deducts its price from household

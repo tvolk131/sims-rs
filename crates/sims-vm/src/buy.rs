@@ -292,15 +292,12 @@ impl Interpreter<'_> {
         cursor.container = None;
         if self.fits(world, cursor.cursor, fine, level)? {
             // Native `0x485f44` always calls `0x421e72` at `fine` (even when
-            // `fine == pos`): if `fine` is tile-centred, run full placement
-            // retry; otherwise run the base placement test (`0x4355b5`, OBJf 5
-            // overlap callbacks) before unsnapped rejection (`0x4355bc`).
-            if (fine[0] & 0x0f) == 8 && (fine[1] & 0x0f) == 8 {
-                if self.try_place_buy_at(world, cursor, fine, level, None)? {
-                    return Ok(cursor.valid);
-                }
-            } else {
-                self.run_unsnapped_user_test_place(world, cursor.held, fine, level)?;
+            // `fine == pos`): `try_place_buy_at` runs `UserTestPlace`
+            // (`0x435522` / `0x422de4`), which succeeds only if `fine` is
+            // tile-centred and otherwise runs `test_tile` (`0x4355b5`) on the
+            // first part before rejecting unsnapped coordinates (`0x4355bc`).
+            if self.try_place_buy_at(world, cursor, fine, level, None)? {
+                return Ok(cursor.valid);
             }
             let cursor_place = Place {
                 on_lot: true,
@@ -472,12 +469,35 @@ impl Interpreter<'_> {
         if self.try_place_buy_at(world, cursor, [x, y], level, retained)? {
             return Ok(cursor.valid);
         }
-        // Native `0x42276d` re-enters `0x421e72` -> `0x422050` -> `0x4355b5`
-        // at saved unsnapped coordinates, running the base placement test
-        // (including OBJf 5 overlap callbacks) on the first part before
-        // rejecting unsnapped coordinates at `0x4355bc..0x4355cd`.
-        if (x & 0x0f) != 8 || (y & 0x0f) != 8 {
-            self.run_unsnapped_user_test_place(world, cursor.held, [x, y], level)?;
+        cursor.position = [x, y, level];
+        cursor.valid = false;
+        cursor.container = None;
+        let cursor_place = Place {
+            on_lot: true,
+            position: [x, y],
+            container: None,
+            slot: -1,
+            level,
+        };
+        self.put(world, cursor.cursor, cursor_place, true)?;
+        Ok(false)
+    }
+
+    /// Re-evaluates Buy Mode placement directly at the cursor's saved
+    /// coordinates without gating on `"Tile Cursor"` fitting first
+    /// (`0x485bda` → `0x421e72`), retaining any existing surface container
+    /// (`0x422050` line `0x422078`).
+    pub fn buy_recheck(&self, world: &mut World, cursor: &mut BuyCursor) -> Result<bool, Fault> {
+        let [x, y, level] = cursor.position;
+        let retained = cursor.container;
+        self.remove_cursor_and_held(world, cursor)?;
+        cursor.valid = false;
+        cursor.container = None;
+        if !on_lot([x, y]) || !inside_placement_bounds(world, [x, y]) {
+            return Ok(false);
+        }
+        if self.try_place_buy_at(world, cursor, [x, y], level, retained)? {
+            return Ok(cursor.valid);
         }
         cursor.position = [x, y, level];
         cursor.valid = false;
@@ -638,21 +658,14 @@ impl Interpreter<'_> {
         // lot-interior tiles without ground flag `0x20`, and (for surface
         // placements) an existing on-lot container whose slot height is not
         // in `5..=7` (`0x43560c..0x435623`).
-        let container_on_lot = match purchase.container {
-            Some((cid, _)) => world
-                .objects
-                .get(&cid)
-                .is_some_and(|c| on_lot([c.position[0], c.position[1]])),
-            None => true,
+        let fits = match purchase.container {
+            Some((cid, slot)) => {
+                self.user_fits_in(world, id, cid, i32::from(slot), [x, y], level)?
+            }
+            None => self
+                .user_test_place_ground(world, id, [x, y], level)?
+                .is_ok(),
         };
-        let fits = container_on_lot
-            && self.user_tiles_allowed(world, id, [x, y])?
-            && match purchase.container {
-                Some((cid, slot)) => {
-                    self.user_fits_in(world, id, cid, i32::from(slot), [x, y], level)?
-                }
-                None => self.place_test(world, id, [x, y], level)?.is_ok(),
-            };
         if !fits {
             if created_fresh {
                 self.remove_now(world, id)?;
@@ -843,13 +856,24 @@ impl Interpreter<'_> {
             at: None,
             trap,
         };
-        let is_group = world
-            .objects
-            .get(&held)
-            .ok_or_else(|| fail(held, Trap::native(10, "missing held object")))?
-            .multipart
-            .is_some();
-        self.rotate_object_to(world, held, target_dir)?;
+        let (current, is_group) = {
+            let h = world
+                .objects
+                .get(&held)
+                .ok_or_else(|| fail(held, Trap::native(10, "missing held object")))?;
+            (
+                h.data.get(DATA_FACING).copied().unwrap_or(0).rem_euclid(8),
+                h.multipart.is_some(),
+            )
+        };
+        let target = target_dir.rem_euclid(8);
+        if current != target {
+            // Native `0x42271d` / `0x421bff` invokes `TakeOff(1)` (`0x433148`,
+            // running OBJf 10 `LEAVING`) on `held` before turning even while
+            // off-lot.
+            self.take_off(world, held, true)?;
+        }
+        self.rotate_object_to(world, held, target)?;
         if is_group {
             let parts = self.parts(world, held).map_err(|t| fail(held, t))?;
             // Sync cursor parts' offsets from held parts (`0x42238d`).
@@ -945,24 +969,47 @@ impl Interpreter<'_> {
         self.run_user_callback(world, held, function::USER_PICKUP)
     }
 
-    /// Checks the lot-border and ground-tile-flag `0x20` guards from native
-    /// `UserTestPlace` (`0x435522` lines `0x43553e..0x435597`, multi-tile
-    /// `0x422de4`), rejecting any tile outside `1..size - 1` or with bit `0x20`
-    /// set in level-1 tile flags (array `8`) when `move_objects` is off.
-    fn user_tiles_unblocked(&self, world: &World, id: u16, pos: [i32; 2]) -> Result<bool, Fault> {
+    /// Native `UserTestPlace` (`0x435522`, multi-tile `0x422de4`) for ground
+    /// placements: checks each part in native order, stopping immediately at
+    /// the first refusal (`0x422e82`):
+    /// 1. Lot-interior bounds `1..size - 1` and level-1 tile flag `0x20` clear
+    ///    (array `8`, `0x43553e..0x435597`).
+    /// 2. Base single-tile placement test (`self.test_tile`, `0x4355b5`).
+    /// 3. Tile-centred coordinates `(x & 0xf) == 8 && (y & 0xf) == 8`
+    ///    (`0x4355bc..0x4355cd`).
+    fn user_test_place_ground(
+        &self,
+        world: &mut World,
+        id: u16,
+        pos: [i32; 2],
+        level: i32,
+    ) -> Result<Result<(), Refusal>, Fault> {
         let fail = |trap| Fault {
             object: id,
             at: None,
             trap,
         };
-        let check = |at: [i32; 2]| -> Result<bool, Fault> {
+        let test_one = |world: &mut World,
+                        part: u16,
+                        at: [i32; 2],
+                        part_level: i32|
+         -> Result<Result<(), Refusal>, Fault> {
             if !inside_placement_bounds(world, at) {
-                return Ok(false);
+                return Ok(Err(Refusal::OffLot));
             }
             let a = i8::try_from(at[0] >> 4).unwrap_or(-1);
             let b = i8::try_from(at[1] >> 4).unwrap_or(-1);
             let flags = crate::placement::tile_flags(world, a, b, 1).map_err(fail)?;
-            Ok((flags & 0x20) == 0)
+            if (flags & 0x20) != 0 {
+                return Ok(Err(Refusal::OffLot));
+            }
+            if let Err(refusal) = self.test_tile(world, part, at, part_level, None)? {
+                return Ok(Err(refusal));
+            }
+            if (at[0] & 0x0f) != 8 || (at[1] & 0x0f) != 8 {
+                return Ok(Err(Refusal::Other));
+            }
+            Ok(Ok(()))
         };
         let Some(selected) = world
             .objects
@@ -970,12 +1017,13 @@ impl Interpreter<'_> {
             .and_then(|o| o.multipart.as_ref())
             .map(|m| m.offset)
         else {
-            return check(pos);
+            return test_one(world, id, pos, level);
         };
         let origin = [
             pos[0].wrapping_sub(selected[0].wrapping_mul(16)),
             pos[1].wrapping_sub(selected[1].wrapping_mul(16)),
         ];
+        let origin_level = level.wrapping_sub(selected[2]);
         for part in self.parts(world, id).map_err(fail)? {
             let offset = world
                 .objects
@@ -987,88 +1035,19 @@ impl Interpreter<'_> {
                 origin[0].wrapping_add(offset[0].wrapping_mul(16)),
                 origin[1].wrapping_add(offset[1].wrapping_mul(16)),
             ];
-            if !check(at)? {
-                return Ok(false);
+            let part_level = origin_level.wrapping_add(offset[2]);
+            if let Err(refusal) = test_one(world, part, at, part_level)? {
+                return Ok(Err(refusal));
             }
         }
-        Ok(true)
+        Ok(Ok(()))
     }
 
-    /// Runs the base single-tile placement test (`0x4355b5`) for an unsnapped
-    /// `UserTestPlace` call (`0x435522` / multi-tile `0x422de4`) on only the
-    /// first tile, matching `0x422de4` stopping at the first part's centring
-    /// rejection (`0x4355bc..0x4355cd`) without running overlap callbacks on
-    /// remaining parts.
-    fn run_unsnapped_user_test_place(
-        &self,
-        world: &mut World,
-        id: u16,
-        pos: [i32; 2],
-        level: i32,
-    ) -> Result<(), Fault> {
-        let fail = |trap| Fault {
-            object: id,
-            at: None,
-            trap,
-        };
-        let (part, at, part_level) = if let Some(selected) = world
-            .objects
-            .get(&id)
-            .and_then(|o| o.multipart.as_ref())
-            .map(|m| m.offset)
-        {
-            let parts = self.parts(world, id).map_err(fail)?;
-            let Some(&first) = parts.first() else {
-                return Ok(());
-            };
-            let first_offset = world
-                .objects
-                .get(&first)
-                .and_then(|o| o.multipart.as_ref())
-                .map(|m| m.offset)
-                .ok_or_else(|| fail(Trap::native(10, "missing multipart part")))?;
-            let origin = [
-                pos[0].wrapping_sub(selected[0].wrapping_mul(16)),
-                pos[1].wrapping_sub(selected[1].wrapping_mul(16)),
-            ];
-            let origin_level = level.wrapping_sub(selected[2]);
-            (
-                first,
-                [
-                    origin[0].wrapping_add(first_offset[0].wrapping_mul(16)),
-                    origin[1].wrapping_add(first_offset[1].wrapping_mul(16)),
-                ],
-                origin_level.wrapping_add(first_offset[2]),
-            )
-        } else {
-            (id, pos, level)
-        };
-        if !inside_placement_bounds(world, at) {
-            return Ok(());
-        }
-        let a = i8::try_from(at[0] >> 4).unwrap_or(-1);
-        let b = i8::try_from(at[1] >> 4).unwrap_or(-1);
-        let flags = crate::placement::tile_flags(world, a, b, 1).map_err(fail)?;
-        if (flags & 0x20) == 0 {
-            let _ = self.test_tile(world, part, at, part_level, None)?;
-        }
-        Ok(())
-    }
-
-    /// Checks `user_tiles_unblocked` plus native `UserTestPlace`'s
-    /// tile-centring requirement (`0x4355bc..0x4355cd`: `(x & 0xf) == 8 &&
-    /// (y & 0xf) == 8`).
-    fn user_tiles_allowed(&self, world: &World, id: u16, pos: [i32; 2]) -> Result<bool, Fault> {
-        if (pos[0] & 0x0f) != 8 || (pos[1] & 0x0f) != 8 {
-            return Ok(false);
-        }
-        self.user_tiles_unblocked(world, id, pos)
-    }
-
-    /// Native `UserTestPlace` (`0x435522` lines `0x43560c..0x435623`) for
-    /// container placements: requires an existing on-lot container, `fits_in`,
-    /// and rejects containment slots with height `5..=7` (`4 < height < 8`)
-    /// when `move_objects` is off.
+    /// Native `UserTestPlace` (`0x435522`) for container placements: requires
+    /// an existing on-lot container, lot-interior bounds and ground flag
+    /// `0x20` clear, `fits_in` (`0x4355b5`), tile-centred coordinates
+    /// (`0x4355bc..0x4355cd`), and containment slot height not in `5..=7`
+    /// (`0x43560c..0x435623`) when `move_objects` is off.
     fn user_fits_in(
         &self,
         world: &mut World,
@@ -1078,6 +1057,11 @@ impl Interpreter<'_> {
         pos: [i32; 2],
         level: i32,
     ) -> Result<bool, Fault> {
+        let fail = |trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        };
         if !world
             .objects
             .get(&container)
@@ -1085,27 +1069,33 @@ impl Interpreter<'_> {
         {
             return Ok(false);
         }
+        if !inside_placement_bounds(world, pos) {
+            return Ok(false);
+        }
+        let a = i8::try_from(pos[0] >> 4).unwrap_or(-1);
+        let b = i8::try_from(pos[1] >> 4).unwrap_or(-1);
+        if (crate::placement::tile_flags(world, a, b, 1).map_err(fail)? & 0x20) != 0 {
+            return Ok(false);
+        }
         if !self.fits_in(world, id, container, slot, pos, level)? {
+            return Ok(false);
+        }
+        if (pos[0] & 0x0f) != 8 || (pos[1] & 0x0f) != 8 {
             return Ok(false);
         }
         let height = self
             .container_slot_height(world, container, slot)
-            .map_err(|trap| Fault {
-                object: id,
-                at: None,
-                trap,
-            })?;
+            .map_err(fail)?;
         Ok(!matches!(height, Some(5..=7)))
     }
 
-    /// Tests whether `held` fits at `[pos, level]`: first rejects tiles
-    /// forbidden by `UserTestPlace` (`0x435522` tile-centring + ground flag
-    /// `0x20`), then tries any `retained` surface container at the same tile
-    /// without re-aligning facing (`0x422050` line `0x422078`), then tries
-    /// direct tile placement (`Some(None)`), and — after a collision refusal
-    /// (`0x0b`) on a single-tile object — searches compatible surface slots on
-    /// that tile (`Some(Some((container_id, slot)))`), rejecting slot heights
-    /// `5..=7` (`0x43560c..0x435623`) and aligning facing via
+    /// Tests whether `held` fits at `[pos, level]` (`0x422050`): first tries
+    /// any `retained` surface container at the same tile without re-aligning
+    /// facing (`0x422050` line `0x422078`), then runs `UserTestPlace`
+    /// (`0x435522` / `0x422de4`, `Some(None)`), and — after a collision
+    /// refusal (`0x0b`) on a single-tile object — searches compatible surface
+    /// slots on that tile (`Some(Some((container_id, slot)))`), rejecting slot
+    /// heights `5..=7` (`0x43560c..0x435623`) and aligning facing via
     /// `0x4221e4..0x422280` + `0x43244d`.
     fn test_buy_placement(
         &self,
@@ -1116,15 +1106,12 @@ impl Interpreter<'_> {
         level: i32,
         retained: Option<(u16, i16)>,
     ) -> Result<Option<Option<(u16, i16)>>, Fault> {
-        if !self.user_tiles_allowed(world, held, pos)? {
-            return Ok(None);
-        }
         if let Some((container, slot)) = retained
             && self.user_fits_in(world, held, container, i32::from(slot), pos, level)?
         {
             return Ok(Some(Some((container, slot))));
         }
-        match self.place_test(world, held, pos, level)? {
+        match self.user_test_place_ground(world, held, pos, level)? {
             Ok(()) => return Ok(Some(None)),
             Err(Refusal::Collision(_)) => {}
             Err(_) => return Ok(None),

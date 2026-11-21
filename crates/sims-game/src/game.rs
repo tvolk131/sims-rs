@@ -1918,19 +1918,12 @@ impl Game {
             let dx = point[0] - anchor[0];
             let dy = point[1] - anchor[1];
             if dx * dx + dy * dy > 36 {
-                // Native `0x485bda`: re-evaluate placement at the saved tile
-                // FIRST (so a restored surface snaps the held item and updates
-                // its container/facing, or a freed tile makes it valid) BEFORE
-                // reading `current` facing at `0x485da9`.
-                let before = self
-                    .lot
-                    .world()
-                    .objects
-                    .get(&cursor.held)
-                    .and_then(|o| o.data.get(1).copied())
-                    .unwrap_or(0)
-                    .rem_euclid(8);
-                if let Err(e) = self.lot.buy_rotate(&mut cursor, before) {
+                // Native `0x485bda`: re-evaluate placement directly at the
+                // saved tile FIRST (without gating on Tile Cursor fit) so a
+                // restored surface snaps the held item and updates its
+                // container/facing BEFORE `0x485da9` compares `current`
+                // against `desired`.
+                if let Err(e) = self.lot.buy_recheck(&mut cursor) {
                     self.note = Some(format!("Could not recheck Buy placement: {e}"));
                 }
                 // Native `0x485d5d..0x485dad`: `iVar6 = dy`, `iVar8 = dx`.
@@ -1960,6 +1953,20 @@ impl Game {
                     if let Err(e) = self.lot.buy_rotate(&mut cursor, target) {
                         self.note = Some(format!("The object was not rotated: {e}"));
                     }
+                }
+                // Native `0x485e59` → `0x485e72`: run the final Tile-Cursor-
+                // gated placement pass at the saved tile, including when the
+                // facing was unchanged.
+                let post_facing = self
+                    .lot
+                    .world()
+                    .objects
+                    .get(&cursor.held)
+                    .and_then(|o| o.data.get(1).copied())
+                    .unwrap_or(0)
+                    .rem_euclid(8);
+                if let Err(e) = self.lot.buy_rotate(&mut cursor, post_facing) {
+                    self.note = Some(format!("Could not finalize Buy placement: {e}"));
                 }
                 true
             } else {

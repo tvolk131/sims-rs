@@ -5583,32 +5583,48 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
     assert!(lot.buy_commit(&unsnapped).is_err());
     lot.buy_cancel(&unsnapped).unwrap();
 
-    // Awning placement refusal (`0x48bdfe` line `0x48be72` -> `0x493353`):
-    // buying Scrimpon Crimson Awnings (`0xefba77ca`) on open lawn `[584, 472]`
-    // then a Werkbunnst Chair at `[552, 472]`, undoing both, and redoing must
-    // transfer the refused awning record to Undo without charging while
-    // keeping the chair available for the next Redo.
+    // Initial off-lot rotation runs `LEAVING` (`0x42271d` / `0x421bff` ->
+    // `0x433148`): starting Scrimpon Crimson Awnings (`0xefba77ca`) at facing 2
+    // runs its OBJf 10 `LEAVING` callback while off-lot, setting `data[13] = 4`
+    // so open-lawn placement at `[584, 472]` is refused immediately.
     if catalog.get(0xefba_77ca).is_some() {
         let mut awn = lot.buy_start(0xefba_77ca, 1, 2).unwrap().unwrap();
-        assert!(lot.buy_move(&mut awn, [584, 472], 1).unwrap());
-        let awn_id = lot.buy_commit(&awn).unwrap();
-        let mut ch = lot.buy_start(0x26bf_bb29, 1, 2).unwrap().unwrap();
-        assert!(lot.buy_move(&mut ch, [552, 472], 1).unwrap());
-        let ch_id = lot.buy_commit(&ch).unwrap();
+        assert_eq!(lot.world().objects[&awn.held].data[13], 4);
+        assert!(!lot.buy_move(&mut awn, [584, 472], 1).unwrap());
+        assert!(!awn.valid);
+        assert!(lot.buy_commit(&awn).is_err());
+        lot.buy_cancel(&awn).unwrap();
+    }
+
+    // Refused Redo transfer (`0x48bdfe` line `0x48be72` -> `0x493353`):
+    // buying two Werkbunnst Chairs at `[552, 472]` and `[520, 472]`, undoing
+    // both, blocking the first chair's tile `[552, 472]` with a preview chair,
+    // and redoing must transfer the refused first chair to Undo without
+    // charging while keeping the second chair on Redo so the next Redo restores
+    // it and re-charges `$80`.
+    {
+        let mut ch1 = lot.buy_start(0x26bf_bb29, 1, 2).unwrap().unwrap();
+        assert!(lot.buy_move(&mut ch1, [552, 472], 1).unwrap());
+        let ch1_id = lot.buy_commit(&ch1).unwrap();
+        let mut ch2 = lot.buy_start(0x26bf_bb29, 1, 2).unwrap().unwrap();
+        assert!(lot.buy_move(&mut ch2, [520, 472], 1).unwrap());
+        let ch2_id = lot.buy_commit(&ch2).unwrap();
         assert!(lot.buy_undo().unwrap());
         assert!(lot.buy_undo().unwrap());
         let funds_after_undos = lot.world().budget.funds;
-        // First redo pops the awning: refused (data[13] == 4 on open lawn),
-        // not charged, transferred to Undo, leaving the chair on Redo.
+        let mut blocker = lot.buy_start(0x26bf_bb29, 1, 2).unwrap().unwrap();
+        assert!(lot.buy_move(&mut blocker, [552, 472], 1).unwrap());
+        // First redo pops `ch1`: blocked, not charged, transferred to Undo,
+        // leaving `ch2` on Redo.
         assert!(!lot.buy_redo().unwrap());
         assert_eq!(lot.world().budget.funds, funds_after_undos);
-        assert!(lot.world().objects[&awn_id].position[0] < 0);
+        assert!(lot.world().objects[&ch1_id].position[0] < 0);
         assert!(lot.can_buy_redo());
-        // Second redo restores the chair and re-charges $80.
+        // Second redo restores `ch2` and re-charges `$80`.
         assert!(lot.buy_redo().unwrap());
         assert_eq!(lot.world().budget.funds, funds_after_undos - 80);
-        assert!(lot.world().objects[&ch_id].position[0] >= 0);
-        // Clean up the chair back to undo/redo off-lot so the test continues cleanly.
+        assert!(lot.world().objects[&ch2_id].position[0] >= 0);
+        lot.buy_cancel(&blocker).unwrap();
         assert!(lot.buy_undo().unwrap());
     }
 
