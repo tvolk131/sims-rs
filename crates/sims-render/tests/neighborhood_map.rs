@@ -183,6 +183,21 @@ fn hover_cutaway_highlight_and_community_filter_badges_modify_expected_pixels() 
         "hover must not alter pixels outside lot 5"
     );
 
+    // Highlighting stock Unleashed Lot 1 across its full two-cell strip
+    // (0x54f347..0x54f3e1) outlines the cell-0/cell-1 boundary pixel at
+    // (559, 83) with native yellow 5-6-5 0xf7e3.
+    let mut lot1_set = BTreeSet::new();
+    lot1_set.insert(1);
+    let lot1_hi = map.render(&RenderOptions {
+        highlighted_lots: lot1_set,
+        ..RenderOptions::default()
+    });
+    assert_eq!(
+        sims_render::neighborhood::pack_565(lot1_hi.color[83 * 800 + 559]),
+        0xf7e3,
+        "Unleashed Lot 1 two-cell strip boundary at (559, 83) must be outlined"
+    );
+
     // Highlighting a set of lots without cutaway also changes pixels.
     let mut set = BTreeSet::new();
     set.insert(70);

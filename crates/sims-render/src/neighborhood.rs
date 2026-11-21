@@ -539,6 +539,10 @@ pub struct MapLot {
     pub zoning: LotZoning,
     /// Occupancy / destination status from `Neighborhood.iff` and `LotZoning.iff`.
     pub status: LotStatus,
+    /// Whether any family in `Neighborhood.iff` has `primary_house == id` and
+    /// a non-zero secondary vacation house (`0x54f20e`), tracked independently
+    /// of [`Self::zoning`] / [`Self::status`].
+    pub has_primary_vacation_stay: bool,
     /// Community amenity filter bitmask from `SIMI` `globals[37]` (`0x427f46`).
     pub filter_mask: u16,
     /// Normal idle thumbnail cell (`BMP_ 512/1024` composited under `BMP_ 513/1025`).
@@ -804,6 +808,10 @@ impl NeighborhoodMap {
                     NeighborhoodKind::Unleashed => LotZoning::Unknown,
                 });
             let status = resolve_lot_status(lot_id, kind, zoning, &occupancy);
+            let has_primary_vacation_stay = occupancy
+                .primary_lot
+                .get(&lot_id)
+                .is_some_and(|&(_, vac)| vac.is_some());
             let cell_origin = compute_cell_origin(anchor, metrics, [normal.width, normal.height]);
 
             lots.push(MapLot {
@@ -813,6 +821,7 @@ impl NeighborhoodMap {
                 cell_origin,
                 zoning,
                 status,
+                has_primary_vacation_stay,
                 filter_mask,
                 normal,
                 roofs_off,
@@ -1042,7 +1051,8 @@ impl NeighborhoodMap {
     }
 
     /// Like [`Self::hit_test`], testing the exact active regular thumbnail
-    /// (`[esi + 0xd8]`, possibly highlighted) selected by `options`, matching
+    /// (`[esi + 0xd8]`, possibly highlighted across its full two-cell strip
+    /// width per `0x54f347..0x54f3e1`) selected by `options`, matching
     /// `0x54f2af` + `0x5e4071` + `0x5e40b4`. Bounds are checked before any
     /// highlight evaluation, and only the single sampled scanline is
     /// highlighted on hit candidates.
@@ -1050,7 +1060,8 @@ impl NeighborhoodMap {
         let origin = map_origin(options.viewport);
         for lot in self.lots.iter().rev() {
             let is_hovered = options.hovered_lot == Some(lot.id);
-            let base = lot.active_surface(is_hovered && options.hover_roofs_off);
+            let show_cutaway = is_hovered && options.hover_roofs_off;
+            let base = lot.active_surface(show_cutaway);
             if !base.is_valid() {
                 continue;
             }
@@ -1063,12 +1074,7 @@ impl NeighborhoodMap {
             }
             let (ux, uy) = (lx as usize, ly as usize);
             let pixel = match self.highlight_rgb_for(lot, options) {
-                Some(rgb) => {
-                    let row_start = uy * base.width;
-                    let mut row = base.pixels[row_start..row_start + base.width].to_vec();
-                    highlight_row_in_place(&mut row, pack_565(rgb));
-                    row[ux]
-                }
+                Some(rgb) => highlight_lot_row_pixel(lot, uy, ux, show_cutaway, pack_565(rgb)),
                 None => base.pixels[uy * base.width + ux],
             };
             if pixel != COLOR_KEY_565 {
@@ -1079,24 +1085,26 @@ impl NeighborhoodMap {
     }
 
     /// Whether `lot` satisfies the native Vacation badge predicate: `0x54eb49`
-    /// (`0x54f20e`: primary house has a secondary vacation stay, checked on
-    /// every map including Magic Town homes) or `0x54eb52..0x54eb64`
-    /// (`0x54f24f`: Vacation Island lot occupied by a family's primary or
-    /// secondary house).
+    /// (`0x54f20e`: primary house has a secondary vacation stay, independent
+    /// of zoning and checked on every map including Magic Town homes) or
+    /// `0x54eb52..0x54eb64` (`0x54f24f`: Vacation Island lot occupied by a
+    /// family's primary or secondary house).
     fn has_vacation_badge(&self, lot: &MapLot) -> bool {
-        matches!(
-            lot.status,
-            LotStatus::Occupied {
-                vacation_lot: Some(_),
-                ..
-            }
-        ) || (self.kind == NeighborhoodKind::Vacation
-            && matches!(
+        lot.has_primary_vacation_stay
+            || matches!(
                 lot.status,
-                LotStatus::Community {
-                    occupied_by_family: Some(_),
+                LotStatus::Occupied {
+                    vacation_lot: Some(_),
+                    ..
                 }
-            ))
+            )
+            || (self.kind == NeighborhoodKind::Vacation
+                && matches!(
+                    lot.status,
+                    LotStatus::Community {
+                        occupied_by_family: Some(_),
+                    } | LotStatus::Occupied { .. }
+                ))
     }
 
     /// Returns the unhighlighted `[esi + 0x264]` vacation-badged surface when
@@ -1133,17 +1141,18 @@ impl NeighborhoodMap {
     }
 
     /// Resolves `lot`'s regular thumbnail surface `[esi + 0xd8]` (possibly
-    /// highlighted) under `options`, matching `0x54f2af` + `0x5e40b4`.
+    /// highlighted across its full native two-cell strip width per
+    /// `0x54f347..0x54f3e1`) under `options`, matching `0x54f2af` + `0x5e40b4`.
     fn resolved_pick_surface<'a>(
         &'a self,
         lot: &'a MapLot,
         options: &RenderOptions,
     ) -> Cow<'a, Surface565> {
         let is_hovered = options.hovered_lot == Some(lot.id);
-        let base = lot.active_surface(is_hovered && options.hover_roofs_off);
+        let show_cutaway = is_hovered && options.hover_roofs_off;
         match self.highlight_rgb_for(lot, options) {
-            Some(rgb) => Cow::Owned(highlight_surface(base, rgb)),
-            None => Cow::Borrowed(base),
+            Some(rgb) => Cow::Owned(highlight_lot_cell(lot, show_cutaway, rgb)),
+            None => Cow::Borrowed(lot.active_surface(show_cutaway)),
         }
     }
 }
@@ -1430,6 +1439,72 @@ fn highlight_row_in_place(row: &mut [u16], outline_565: u16) {
                 row[x - 1] = outline_565;
             }
         }
+    }
+}
+
+/// Highlights a single scanline `uy` of `lot`'s native `[esi + 0xd8]` strip
+/// (`[normal_row | roofs_off_row]` when both cells exist with matching
+/// dimensions, per `0x54e844..0x54e8d6` and `0x54f347..0x54f3e1`) and returns
+/// pixel `ux` in the selected cell.
+fn highlight_lot_row_pixel(
+    lot: &MapLot,
+    uy: usize,
+    ux: usize,
+    show_cutaway: bool,
+    outline_565: u16,
+) -> u16 {
+    let normal = &lot.normal;
+    if let Some(cutaway) = lot.roofs_off.as_ref().filter(|c| {
+        c.is_valid() && normal.is_valid() && c.width == normal.width && c.height == normal.height
+    }) {
+        let w = normal.width;
+        let start = uy * w;
+        let mut strip_row = Vec::with_capacity(w * 2);
+        strip_row.extend_from_slice(&normal.pixels[start..start + w]);
+        strip_row.extend_from_slice(&cutaway.pixels[start..start + w]);
+        highlight_row_in_place(&mut strip_row, outline_565);
+        let offset = if show_cutaway { w } else { 0 };
+        strip_row[offset + ux]
+    } else {
+        let base = lot.active_surface(show_cutaway);
+        let w = base.width;
+        let start = uy * w;
+        let mut row = base.pixels[start..start + w].to_vec();
+        highlight_row_in_place(&mut row, outline_565);
+        row[ux]
+    }
+}
+
+/// Highlights `lot`'s active cell using the full native `[esi + 0xd8]`
+/// two-cell strip row width (`0x54f347..0x54f3e1`).
+fn highlight_lot_cell(lot: &MapLot, show_cutaway: bool, highlight_rgb: [u8; 3]) -> Surface565 {
+    let normal = &lot.normal;
+    let outline_565 = pack_565(highlight_rgb);
+    if let Some(cutaway) = lot.roofs_off.as_ref().filter(|c| {
+        c.is_valid() && normal.is_valid() && c.width == normal.width && c.height == normal.height
+    }) {
+        let w = normal.width;
+        let h = normal.height;
+        if w == 0 || h == 0 {
+            return Surface565::filled(0, 0, COLOR_KEY_565);
+        }
+        let mut out = Vec::with_capacity(w * h);
+        let mut strip_row = vec![0u16; w * 2];
+        let slice_range = if show_cutaway { w..w * 2 } else { 0..w };
+        for uy in 0..h {
+            let start = uy * w;
+            strip_row[..w].copy_from_slice(&normal.pixels[start..start + w]);
+            strip_row[w..].copy_from_slice(&cutaway.pixels[start..start + w]);
+            highlight_row_in_place(&mut strip_row, outline_565);
+            out.extend_from_slice(&strip_row[slice_range.clone()]);
+        }
+        Surface565 {
+            width: w,
+            height: h,
+            pixels: out,
+        }
+    } else {
+        highlight_surface(lot.active_surface(show_cutaway), highlight_rgb)
     }
 }
 
@@ -1759,9 +1834,15 @@ fn load_lot_zoning(install: &Install, user_dir: &Path) -> Result<LotZoningTable>
 }
 
 /// Parses a `LotZoning.iff` `STR# 1` table (`"lot_id, residential|community"`),
-/// preserving every row in file order with signed 32-bit IDs (`0x425016..0x425064`),
-/// defaulting unrecognized zone text to [`LotZoning::Residential`] (`0x425052..0x42505e`),
-/// and recording the first matching zone per lot ID (`0x42b9fc..0x42ba09`).
+/// matching `0x424fb9..0x425064` verbatim:
+/// - splits at the first `,` (rows without a comma are skipped),
+/// - parses the signed 32-bit decimal prefix before the comma via C `atoi`
+///   (`0x636029`),
+/// - searches the lowercased text after the comma for `"residential"` first
+///   (`0x6c25a4`), then `"community"` (`0x6c2598`), defaulting to
+///   [`LotZoning::Residential`] (`0x425052..0x42505e`),
+/// - preserves every row in file order (`0x425064`) and records the first
+///   matching zone per lot ID (`0x42b9fc..0x42ba09`).
 pub fn parse_lot_zoning_table(table: &StringTable) -> LotZoningTable {
     let mut rows = Vec::new();
     let mut first_zone = BTreeMap::new();
@@ -1769,14 +1850,14 @@ pub fn parse_lot_zoning_table(table: &StringTable) -> LotZoningTable {
         if entry.language != US_ENGLISH {
             continue;
         }
-        let mut parts = entry.text.split(',').map(str::trim);
-        let (Some(id), Some(kind)) = (parts.next(), parts.next()) else {
+        let Some((before_comma, after_comma)) = entry.text.split_once(',') else {
             continue;
         };
-        let Ok(id) = id.parse::<i32>() else {
-            continue;
-        };
-        let zoning = if kind.eq_ignore_ascii_case("community") {
+        let id = sims_content::atoi(before_comma.as_bytes());
+        let lower = after_comma.to_ascii_lowercase();
+        let zoning = if lower.contains("residential") {
+            LotZoning::Residential
+        } else if lower.contains("community") {
             LotZoning::Community
         } else {
             LotZoning::Residential
@@ -1990,6 +2071,7 @@ mod tests {
             cell_origin: origin,
             zoning: LotZoning::Residential,
             status: LotStatus::Vacant,
+            has_primary_vacation_stay: false,
             filter_mask: 0,
             normal: surface,
             roofs_off: None,
@@ -2240,6 +2322,21 @@ mod tests {
         let canvas = hi_map.render(&opts);
         assert_eq!(canvas.id_at(11, 10), None);
         assert_eq!(hi_map.hit_test_with_options(&opts, [11, 10]), None);
+        // Two-cell strip highlight boundary (0x54f347..0x54f3e1): when normal's
+        // last pixel is opaque and cutaway's first pixel is COLOR_KEY_565, the
+        // full-width scan turns normal's last pixel into outline_565 (which is
+        // COLOR_KEY_565 for magenta highlight), so BOTH hit_test & Canvas::id_at
+        // return None there.
+        let mut two_cell_normal = Surface565::filled(2, 1, pack_565([40, 80, 120]));
+        two_cell_normal.pixels[0] = pack_565([40, 80, 120]);
+        let mut two_cell_cutaway = Surface565::filled(2, 1, pack_565([40, 80, 120]));
+        two_cell_cutaway.pixels[0] = COLOR_KEY_565;
+        let mut two_lot = make_lot(1, [10, 10], two_cell_normal);
+        two_lot.roofs_off = Some(two_cell_cutaway);
+        let two_map = make_test_map(NeighborhoodKind::Classic, vec![two_lot]);
+        let two_canvas = two_map.render(&opts);
+        assert_eq!(two_canvas.id_at(11, 10), None);
+        assert_eq!(two_map.hit_test_with_options(&opts, [11, 10]), None);
     }
 
     #[test]
@@ -2257,23 +2354,28 @@ mod tests {
                 entry("1, residential"),
                 entry("1, community"),
                 entry("3, bogus_zone"),
-                entry("65536, residential"),
+                entry("4, community (park)"),
+                entry("5, residential community"),
+                entry("65536 # stop, residential"),
                 entry("2, residential"),
             ],
         };
         let parsed = parse_lot_zoning_table(&table);
-        assert_eq!(parsed.rows.len(), 5);
+        assert_eq!(parsed.rows.len(), 7);
         assert_eq!(parsed.first_zone.get(&1), Some(&LotZoning::Residential));
         // Unrecognized zoning text defaults to Residential (0x425052..0x42505e).
         assert_eq!(parsed.first_zone.get(&3), Some(&LotZoning::Residential));
+        // Substring match after first comma (0x425004, 0x42502f).
+        assert_eq!(parsed.first_zone.get(&4), Some(&LotZoning::Community));
+        assert_eq!(parsed.first_zone.get(&5), Some(&LotZoning::Residential));
         let unleashed: Vec<u16> = parsed
             .rows
             .iter()
             .take_while(|&&(id, _)| id <= 80)
             .filter_map(|&(id, _)| u16::try_from(id).ok())
             .collect();
-        // Stops at signed 32-bit 65536 (does not include lot 2 after it), matching 0x557125.
-        assert_eq!(unleashed, vec![1, 1, 3]);
+        // C atoi parses "65536 # stop" as 65536 and stops before lot 2 (0x557125).
+        assert_eq!(unleashed, vec![1, 1, 3, 4, 5]);
     }
 
     #[test]
@@ -2372,10 +2474,12 @@ mod tests {
         let mut lot = make_lot(90, [10, 10], on.clone());
         lot.roofs_off = Some(cutaway);
         lot.vacation_badged = Some(badged.clone());
-        lot.status = LotStatus::Occupied {
-            family_id: 7,
-            vacation_lot: Some(41),
+        lot.zoning = LotZoning::Community;
+        lot.status = LotStatus::Community {
+            occupied_by_family: None,
         };
+        // Even under Community zoning, primary vacation stay triggers the badge (0x54f20e).
+        lot.has_primary_vacation_stay = true;
         let magic_map = make_test_map(NeighborhoodKind::MagicTown, vec![lot]);
         let hover_opts = RenderOptions {
             hovered_lot: Some(90),

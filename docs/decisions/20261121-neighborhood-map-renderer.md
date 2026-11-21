@@ -71,10 +71,11 @@ share the native `cWinLot` (`0x54dd4d`, vtable `0x670204`) widget pipeline:
   `RGB(0, 0, 255)` (`0x54f520`) for community lots when an Unleashed filter is
   active (`0x55d5e9..0x55d5ff`).
 - **Hit-testing (`0x5e4071` -> `0x5dd79a`, `0x5dc83c`):**
-  Reverse draw-order scan testing each lot's widget bounds and active
-  (possibly highlighted or badged) surface silhouette without applying the
-  `+0x230` drawing clip. Inside the clipped map rect, `Canvas::id_at` agrees
-  with `hit_test_with_options`.
+  Reverse draw-order scan testing each lot's widget bounds and regular
+  thumbnail silhouette (`[esi + 0xd8]`, possibly highlighted across its full
+  two-cell strip width per `0x54f347..0x54f3e1`) without applying the `+0x230`
+  drawing clip. Inside the clipped map rect, `Canvas::id_at` agrees with
+  `hit_test_with_options`.
 - **Community filter badges & occupancy (`0x55d5ac..0x55d7cc`, `0x54cd60`,
   `0x56bdc7`, `0x566fa7`, `0x5550da`, `0x410602`, `0x410673`, `0x54f270`):**
   Reads community amenity bitmasks from `SIMI` `globals[37]`, enforces per-map
