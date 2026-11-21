@@ -14,14 +14,13 @@
 //! objects; without it the tile must be empty. Flag bit 2 refuses tiles
 //! with ground flag 0x20.
 //!
-//! Only mode 0 is ported, along with modes 6 and up, which the original
-//! treats the same: the lot's search ([`crate::Interpreter::search`])
-//! looks for a tile in the start tile's room, then anywhere. It draws no
-//! random numbers. A tile found is tested once more with the place test,
-//! the object is put there with the lot told (virtual function 0x58,
-//! 0x433340), and virtual function 0x74 runs. The true branch is taken;
-//! if no tile is found or the second test fails nothing moves and the
-//! false branch is taken.
+//! Mode 0, along with modes 6 and up, which the original treats the same:
+//! the lot's search ([`crate::Interpreter::search`]) looks for a tile in
+//! the start tile's room, then anywhere. It draws no random numbers. A
+//! tile found is tested once more with the place test, the object is put
+//! there with the lot told (virtual function 0x58, 0x433340), and virtual
+//! function 0x74 runs. The true branch is taken; if no tile is found or
+//! the second test fails nothing moves and the false branch is taken.
 //!
 //! Mode 1 takes the object off the lot (0x44b519 to 0x44b565): its virtual
 //! function 0x50 runs, asked to tell the registry (as Remove Object
@@ -47,16 +46,17 @@
 //! Mode 2 (in front of the object, 0x44b484 to 0x44b503 and 0x44b70d):
 //! puts the stack object at the reference object's exact position and
 //! level (the local object if flag bit 0 is set, otherwise `self.me`),
-//! turned to face opposite it. Its `(x, y)` position is noted first, then
-//! the target turns by `((((ref_facing + 5) % 8) - target_facing + 8) % 8) / 2`
+//! after turning it by `((((ref_facing + 5) % 8) - target_facing + 8) % 8) / 2`
 //! steps through virtual function 0x4c ([`crate::Interpreter::turn_group`]
-//! for a multi-tile group, [`crate::Interpreter::turn_one`] otherwise).
-//! The reference's level is then read for the place test (virtual function
-//! 0x54): if it refuses, the false branch is taken and the turn stays.
-//! Otherwise the reference's level is read again, the object is put there
-//! with the lot told (virtual function 0x58), and the true branch is taken
-//! without running virtual function 0x74. Flag bits 1 and 2 are ignored
-//! and no random numbers are drawn.
+//! for a multi-tile group, [`crate::Interpreter::turn_one`] otherwise; for
+//! standard even facings with turn step 2, this faces opposite the
+//! reference). The reference's two horizontal coordinates are noted first,
+//! then the turn runs, then the reference's level is read for the place
+//! test (virtual function 0x54): if it refuses, the false branch is taken
+//! and the turn stays. Otherwise the reference's level is read again, the
+//! object is put there with the lot told (virtual function 0x58), and the
+//! true branch is taken without running virtual function 0x74. Flag bits
+//! 1 and 2 are ignored and no random numbers are drawn.
 
 use crate::factory::word::{GRAPHICS, GROUP};
 use crate::fault::Trap;
@@ -331,12 +331,13 @@ impl Machine<'_, '_> {
         Ok(true)
     }
 
-    /// Mode 2 (0x44b484 to 0x44b503, 0x44b70d): turn the stack object to
-    /// face opposite the reference object (the local object if flag bit 0
-    /// was set, else `self.me`) and place it at the reference's position
-    /// and level without searching.
+    /// Mode 2 (0x44b484 to 0x44b503, 0x44b70d): turn the stack object by
+    /// `((((ref_facing + 5) % 8) - target_facing + 8) % 8) / 2` steps and
+    /// place it at the reference object's position and level (the local
+    /// object if flag bit 0 was set, else `self.me`) without searching.
     fn find_in_front(&mut self, target: u16, reference: Option<u16>) -> Result<bool, Trap> {
-        let reference = reference.unwrap_or(self.me);
+        let me = self.me;
+        let reference = reference.unwrap_or(me);
         let ref_object = self
             .world
             .objects
@@ -351,17 +352,14 @@ impl Machine<'_, '_> {
         let multipart = target_object.multipart.is_some();
 
         let interpreter = self.interpreter();
-        let unsupported = |fault: crate::fault::Fault| {
-            fault.unsupported_in(format!("Find Location For on object {target}"))
-        };
         if multipart {
             interpreter
                 .turn_group(self.world, target, steps)
-                .map_err(unsupported)?;
+                .map_err(|fault| fault.nested(me))?;
         } else {
             interpreter
                 .turn_one(self.world, target, steps)
-                .map_err(unsupported)?;
+                .map_err(|fault| fault.nested(me))?;
         }
         let level = self
             .world
@@ -375,7 +373,7 @@ impl Machine<'_, '_> {
             .position[2];
         if !interpreter
             .fits(self.world, target, position, level)
-            .map_err(unsupported)?
+            .map_err(|fault| fault.nested(me))?
         {
             return Ok(false);
         }
@@ -402,7 +400,7 @@ impl Machine<'_, '_> {
                 },
                 true,
             )
-            .map_err(unsupported)?;
+            .map_err(|fault| fault.nested(me))?;
         Ok(true)
     }
 }

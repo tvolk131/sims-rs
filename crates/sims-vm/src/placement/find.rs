@@ -160,15 +160,12 @@ fn side_of(rules: i16, facing: i16) -> Option<u16> {
 
 /// The refusal a group keeps when a tile refuses `later` after the
 /// refusal `first` of the tiles before it (0x422b9e to 0x422bb3): the
-/// first, unless the later code is 0x1e or 0x1f. None when that is not
-/// told apart: a later [`Refusal::Other`] after an earlier refusal that is
-/// not. A later [`Refusal::Other`] after an earlier one is the same
-/// refusal either way.
-fn kept_by_group(first: Option<Refusal>, later: Refusal) -> Option<Refusal> {
+/// first, unless the later code is 0x1e or 0x1f.
+fn kept_by_group(first: Option<Refusal>, later: Refusal) -> Refusal {
     match first {
-        None => Some(later),
-        Some(first) if later == Refusal::Other && first != Refusal::Other => None,
-        Some(first) => Some(first),
+        None => later,
+        Some(_) if matches!(later, Refusal::Coded(0x1e | 0x1f)) => later,
+        Some(first) => first,
     }
 }
 
@@ -190,12 +187,13 @@ pub(crate) enum Refusal {
     /// solid either stands against the same wall (0x433b56). It leaves
     /// 0x6e4ad0 as the caller set it.
     SameWall,
-    /// A code other than these, known to be none of 0x1e and 0x1f (which
-    /// a group's later tile would keep, 0x422ba2 to 0x422bb3): the wall
-    /// rules' 0x17, 4, 5 and 6 ([`against_walls`]).
+    /// A specific code that a group's refusal rule needs to tell apart
+    /// (0x422ba2 to 0x422bb3): the wall rules' 0x17, 4, 5 and 6
+    /// ([`against_walls`]), and the pool codes 0x1e and 0x1f that replace
+    /// an earlier tile's refusal.
     Coded(u16),
     /// One of the other codes the steps of [`Interpreter::fits`] name,
-    /// which may be 0x1e or 0x1f.
+    /// none of which is 0x1e or 0x1f.
     Other,
 }
 
@@ -917,11 +915,6 @@ impl Interpreter<'_> {
     ///    object collided with (0x6e4ad0, 0x433b42) over the last: a
     ///    [`Refusal::Collision`] of the group names the last one written
     ///    by any tile, which is not always the tile whose code is kept.
-    ///
-    /// A later tile refusing with [`Refusal::Other`] after an earlier one
-    /// that is not fails loudly: whether its code is 0x1e or 0x1f, which
-    /// would replace the earlier, is not told apart. Any other later
-    /// refusal, [`Refusal::Coded`] among them, keeps the first.
     fn test_group(
         &self,
         world: &mut World,
@@ -981,13 +974,7 @@ impl Interpreter<'_> {
                 written = Some(other);
             }
             if let Err(later) = test {
-                refusal = Some(kept_by_group(refusal, later).ok_or_else(|| {
-                    fail(Trap::Unsupported(format!(
-                        "the place test of a group: tile {part} refuses after an earlier \
-                         tile did, and whether its code (0x1e or 0x1f) replaces the \
-                         earlier one's (0x422ba9) is not told apart"
-                    )))
-                })?);
+                refusal = Some(kept_by_group(refusal, later));
             }
         }
         Ok((refusal.map_or(Ok(()), Err), written))
@@ -1021,9 +1008,9 @@ impl Interpreter<'_> {
         if !(1..=3).contains(&level) {
             return Ok(Err(Refusal::Other));
         }
-        // Code 0x1f.
+        // Code 0x1f (0x432ab6).
         if level > 1 && placement & 0x1000 != 0 {
-            return Ok(Err(Refusal::Other));
+            return Ok(Err(Refusal::Coded(0x1f)));
         }
         // A person skips the wall rules (0x432ac5), and a place in a
         // container is not refused by them (0x432aeb).
@@ -1067,12 +1054,12 @@ impl Interpreter<'_> {
         }
         let pool = array(world, POOL, 1).map_err(fail)?[at];
         if level == 1 {
-            // Codes 0x1d and 0x1e.
+            // Codes 0x1d (0x432b85) and 0x1e (0x432be7).
             if placement & 0x800 == 0 && pool < 0x10 {
                 return Ok(Err(Refusal::Other));
             }
             if placement & 0x1000 != 0 && pool >= 0x10 {
-                return Ok(Err(Refusal::Other));
+                return Ok(Err(Refusal::Coded(0x1e)));
             }
         }
         if let Some((container, slot)) = container {
@@ -1652,29 +1639,44 @@ mod tests {
     }
 
     #[test]
-    fn a_group_keeps_its_first_refusal_unless_a_later_code_may_be_0x1e_or_0x1f() {
+    fn a_group_keeps_its_first_refusal_unless_a_later_code_is_0x1e_or_0x1f() {
         // The first refusal is kept.
-        assert_eq!(kept_by_group(None, Refusal::Wall), Some(Refusal::Wall));
-        // The wall rules' known codes (0x17, 4, 5, 6) are none of 0x1e and
-        // 0x1f: a forbidden wall (7) then a missing one (6) keeps 7.
+        assert_eq!(kept_by_group(None, Refusal::Wall), Refusal::Wall);
+        // The wall rules' known codes (0x17, 4, 5, 6) and Refusal::Other
+        // are none of 0x1e and 0x1f: the earlier refusal is kept.
         for code in [0x17, 4, 5, 6] {
             assert_eq!(
                 kept_by_group(Some(Refusal::Wall), Refusal::Coded(code)),
-                Some(Refusal::Wall)
+                Refusal::Wall
             );
         }
         assert_eq!(
             kept_by_group(Some(Refusal::Coded(6)), Refusal::Collision(None)),
-            Some(Refusal::Coded(6))
+            Refusal::Coded(6)
         );
-        // An unknown later code after a known earlier one is not told
-        // apart; after an unknown one it is the same refusal.
-        assert_eq!(kept_by_group(Some(Refusal::Coded(4)), Refusal::Other), None);
-        assert_eq!(kept_by_group(Some(Refusal::Wall), Refusal::Other), None);
+        assert_eq!(
+            kept_by_group(Some(Refusal::Coded(4)), Refusal::Other),
+            Refusal::Coded(4)
+        );
+        assert_eq!(
+            kept_by_group(Some(Refusal::Wall), Refusal::Other),
+            Refusal::Wall
+        );
         assert_eq!(
             kept_by_group(Some(Refusal::Other), Refusal::Other),
-            Some(Refusal::Other)
+            Refusal::Other
         );
+        // Codes 0x1e and 0x1f replace any earlier refusal (0x422ba9).
+        for code in [0x1e, 0x1f] {
+            assert_eq!(
+                kept_by_group(Some(Refusal::Wall), Refusal::Coded(code)),
+                Refusal::Coded(code)
+            );
+            assert_eq!(
+                kept_by_group(Some(Refusal::Collision(Some(9))), Refusal::Coded(code)),
+                Refusal::Coded(code)
+            );
+        }
     }
 
     #[test]

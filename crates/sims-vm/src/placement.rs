@@ -735,11 +735,6 @@ fn footprint(
     facing: i16,
     person: Option<&[i16]>,
 ) -> Result<[i32; 4], Trap> {
-    if !(0..=7).contains(&facing) {
-        return Err(Trap::Unsupported(format!(
-            "the footprint of an object facing {facing}"
-        )));
-    }
     let field = |index: usize| -> Result<u16, Trap> {
         match person {
             None => Ok(0),
@@ -771,10 +766,24 @@ fn footprint(
         0
     };
     let mask = words[word::INSETS] as u16;
+    // 0x433d8e to 0x433d97: with no insets or person extension, the
+    // facing-dependent rotation is skipped completely.
+    if mask == 0 && extension == 0 {
+        return Ok([bounds[3], bounds[2], bounds[1], bounds[0]]);
+    }
+    // 0x433e02 to 0x433e46: `i = (8 - facing) / 2` indexes `inset[i % 4]`
+    // through `inset[(i + 3) % 4]`. Facing above 9 yields a negative `i`
+    // and would index before the stack array in the original.
+    let i = (8 - i32::from(facing)) / 2;
+    if i < 0 {
+        return Err(Trap::Unsupported(format!(
+            "the footprint of an object facing {facing}"
+        )));
+    }
     let inset: [i32; 4] = std::array::from_fn(|i| {
         i32::from((mask >> (i * 4)) & 15) - i32::from((extension >> (i * 4)) & 15)
     });
-    let i = usize::from((8 - facing as u8) / 2) % 4;
+    let i = (i as usize) % 4;
     bounds[2] += inset[i];
     bounds[1] -= inset[(i + 1) % 4];
     bounds[0] -= inset[(i + 2) % 4];

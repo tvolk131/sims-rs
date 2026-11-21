@@ -325,27 +325,57 @@ fn mode_2_turns_and_places_at_self_by_default_for_all_facings() {
 #[test]
 fn mode_2_uses_local_reference_with_flag_0_and_ignores_search_flags_and_graphics() {
     // Flag bit 0 picks the local object as reference instead of `self.me`,
-    // flag bits 1 and 2 are ignored, and vtable +0x74 (GRAPHICS bit 0) is
-    // not called.
+    // flag bits 1 and 2 are ignored (even on an occupied tile marked with
+    // ground flag 0x20), and vtable +0x74 (OBJD word 102 bit 0) is not called.
     let (mut fx, file) = placeable();
-    fx.words(file)[16] |= 1; // GRAPHICS bit 0 (mode 0 traps on 0x433bb3)
+    fx.words(file)[102] |= 1; // GRAPHICS bit 0 (0x433bb3)
     fx.lamp_mut().position = [24, 24, 1];
     fx.lamp_mut().data[1] = 4;
-    fx.sim_mut().position = [56, 40, 2];
+    fx.sim_mut().position = [56, 40, 2]; // tile (3, 2) level 2
     fx.sim_mut().data[1] = 2;
-    let id = widget(&mut fx);
+
+    // Place a non-solid occupant on (3, 2) level 2 and mark ground flag 0x20.
+    let occupant = widget(&mut fx);
     {
-        let obj = fx.world.objects.get_mut(&id).unwrap();
-        obj.data[4] = 1; // ground/floor height
-        obj.data[42] = 2 | 0x200; // allow no floor on ground and upstairs
-        obj.data[23] = 2;
-        obj.data[1] = 0;
+        let obj = fx.world.objects.get_mut(&occupant).unwrap();
+        obj.data[4] = 1;
+        obj.data[8] = 4; // not solid
+        obj.data[42] = 2 | 0x200;
     }
-    assert_eq!(find_in_front(&mut fx, SIM as i16, id, 1 | 2 | 4), Ok(true));
-    let placed = &fx.world.objects[&id];
-    assert_eq!(placed.position, [56, 40, 2]);
-    // ref_facing = 2 -> ((2 + 5) % 8 - 0 + 8) % 8 = 7 -> steps = 3 -> 0 + 6 = 6.
-    assert_eq!(placed.data[1], 6);
+    assert_eq!(find_in_front(&mut fx, SIM as i16, occupant, 1), Ok(true));
+    let cell = (3 * 64 + 2) as usize;
+    fx.world.arrays.get_mut(&108).unwrap().data[cell] |= 0x20;
+
+    // First verify mode 0 actually traps on 0x433bb3 for this same OBJD word 102.
+    let check_mode_0 = widget(&mut fx);
+    assert!(matches!(
+        trap(find(&mut fx, 0, check_mode_0, 0)),
+        Trap::Unsupported(m) if m.contains("0x433bb3")
+    ));
+
+    // Mode 2 with flags = 1 (bit 1 clear: occupied tile still allowed) and
+    // with flags = 1 | 4 (bit 2 set: flag 0x20 still ignored) both succeed
+    // and skip 0x433bb3!
+    for flags in [1u8, 1 | 2 | 4] {
+        let id = widget(&mut fx);
+        {
+            let obj = fx.world.objects.get_mut(&id).unwrap();
+            obj.data[4] = 1; // ground/floor height
+            obj.data[8] = 4; // not solid, so Fits allows sharing tile with occupant
+            obj.data[42] = 2 | 0x200; // allow no floor on ground and upstairs
+            obj.data[23] = 2;
+            obj.data[1] = 0;
+        }
+        assert_eq!(
+            find_in_front(&mut fx, SIM as i16, id, flags),
+            Ok(true),
+            "flags={flags}"
+        );
+        let placed = &fx.world.objects[&id];
+        assert_eq!(placed.position, [56, 40, 2]);
+        // ref_facing = 2 -> ((2 + 5) % 8 - 0 + 8) % 8 = 7 -> steps = 3 -> 0 + 6 = 6.
+        assert_eq!(placed.data[1], 6);
+    }
 }
 
 #[test]
@@ -375,16 +405,23 @@ fn mode_2_keeps_rotation_when_place_test_refuses() {
 fn mode_2_validates_target_and_local_reference_before_turning() {
     let (mut fx, _) = placeable();
     let id = widget(&mut fx);
-    // Missing stack object -> 0x15.
-    assert_eq!(
-        code(run(&mut fx, 0, 77, FIND_LOCATION, [2, 0, 0, 0, 0, 0, 0, 0],)),
-        Some(0x15)
-    );
-    // Flag bit 0 with out-of-range local -> 0x33.
+    // Missing stack object (0x15) takes precedence over out-of-range local
+    // (0x33) and missing reference object (0x17).
     assert_eq!(
         code(run(
             &mut fx,
-            0,
+            77,
+            77,
+            FIND_LOCATION,
+            [2, 99, 1, 0, 0, 0, 0, 0]
+        )),
+        Some(0x15)
+    );
+    // Out-of-range local (0x33) takes precedence over missing reference object.
+    assert_eq!(
+        code(run(
+            &mut fx,
+            77,
             id as i16,
             FIND_LOCATION,
             [2, 99, 1, 0, 0, 0, 0, 0],
@@ -552,6 +589,145 @@ fn mode_2_matches_signed_x86_division_for_out_of_range_facings() {
     assert_eq!(find_in_front(&mut fx, 0, id, 0), Ok(true));
     assert_eq!(fx.world.objects[&id].position, [40, 40, 1]);
     assert_eq!(fx.world.objects[&id].data[1], 5);
+}
+
+#[test]
+fn mode_2_zero_step_turn_preserves_raw_facing_8_and_places_with_zero_insets() {
+    // ref_facing = 3 -> (3 + 5) % 8 = 0; target_facing = 8 -> (0 - 8 + 8) % 8 = 0
+    // -> steps = 0. Native Rotate (0x433f75) leaves facing 8 untouched, and
+    // footprint (0x433d8e..0x433d97) skips facing rotation when insets are 0.
+    let (mut fx, _) = placeable();
+    fx.lamp_mut().position = [40, 40, 1];
+    fx.lamp_mut().data[1] = 3;
+    let id = widget(&mut fx);
+    {
+        let obj = fx.world.objects.get_mut(&id).unwrap();
+        obj.data[1] = 8;
+        obj.data[23] = 2;
+    }
+    assert_eq!(find_in_front(&mut fx, 0, id, 0), Ok(true));
+    assert_eq!(fx.world.objects[&id].position, [40, 40, 1]);
+    assert_eq!(fx.world.objects[&id].data[1], 8);
+}
+
+#[test]
+fn mode_2_multitile_group_mixed_refusal_returns_false_and_keeps_rotation() {
+    // 0x422b9e..0x422c22: lead tile collides (code 11) and tail tile fails
+    // ground-height check (code 0x18, data[4] = 0). Group Fits must return
+    // false (never trap), and mode 2 keeps the rotation.
+    use sims_formats::saved_objects::Multipart;
+    let (mut fx, _) = placeable();
+    let lead = widget(&mut fx);
+    let tail = widget(&mut fx);
+    for (id, group, offset, parent, levels) in [
+        (lead, [0, 0, 0], [0, 0, 0], 0, 1),
+        (tail, [1, 0, 0], [1, 0, 0], lead as i16, 0),
+    ] {
+        let obj = fx.world.objects.get_mut(&id).unwrap();
+        obj.data[1] = 0;
+        obj.data[4] = levels;
+        obj.data[23] = 2;
+        obj.multipart = Some(Multipart {
+            offset,
+            group,
+            parent,
+        });
+    }
+    fx.world.next_parts.insert(lead, tail);
+    fx.lamp_mut().position = [40, 40, 1];
+    fx.lamp_mut().data[1] = 0;
+    let blocker = widget(&mut fx);
+    assert_eq!(find(&mut fx, LAMP as i16, blocker, 1), Ok(true));
+
+    assert_eq!(find_in_front(&mut fx, 0, lead, 0), Ok(false));
+    assert_eq!(fx.world.objects[&lead].data[1], 4);
+    assert_eq!(fx.world.objects[&tail].data[1], 4);
+    assert_eq!(fx.world.objects[&lead].position, [-16, -16, 1]);
+}
+
+#[test]
+fn mode_2_reads_reference_level_again_after_fits_and_preserves_callback_error_kind() {
+    // 0x44b4f9: the reference object's level is read a second time AFTER Fits.
+    // Function 5 (ALLOW_OVERLAP) on a blocking object at (3, 2) level 1 moves
+    // `reference` to level 2 and returns true -> Put places `target` on level 2!
+    let (mut fx, file) = placeable();
+    fx.lamp_mut().position = [56, 40, 1];
+    let blocker = widget(&mut fx);
+    assert_eq!(find(&mut fx, LAMP as i16, blocker, 1), Ok(true));
+
+    // Place `reference` properly on (3, 2) level 1 as a non-solid object so
+    // moving it to level 2 unlinks only `reference` and leaves `blocker` on
+    // the tile's grid chain.
+    let reference = widget(&mut fx);
+    {
+        let obj = fx.world.objects.get_mut(&reference).unwrap();
+        obj.data[4] = 1;
+        obj.data[8] = 4; // not solid
+        obj.data[42] = 2 | 0x200;
+        obj.data[1] = 0;
+    }
+    assert_eq!(find(&mut fx, LAMP as i16, reference, 1 | 2), Ok(true));
+    assert_eq!(fx.world.objects[&reference].position, [56, 40, 1]);
+
+    let marker = widget(&mut fx);
+    fx.world.objects.get_mut(&marker).unwrap().position = [56, 56, 2];
+
+    // Tree 4098 (function 5 ALLOW_OVERLAP): move `reference` to `marker` on
+    // level 2 and return true so Fits succeeds.
+    fx.add(
+        file,
+        4098,
+        tree(vec![
+            assign(scope::LOCALS, 0, scope::LITERAL, marker as i16, 1),
+            assign(scope::STACK_OBJECT, 0, scope::LITERAL, reference as i16, 2),
+            ins(
+                FIND_LOCATION,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [2, 0, 1, 0, 0, 0, 0, 0],
+            ),
+        ]),
+    );
+    for table in fx
+        .program
+        .libraries
+        .get_mut(&file)
+        .unwrap()
+        .callbacks
+        .values_mut()
+    {
+        table.resize_with(6, || sims_formats::execution::ObjectFunction {
+            condition: 0,
+            action: 0,
+        });
+        table[5].action = 4098;
+    }
+
+    let target = widget(&mut fx);
+    {
+        let obj = fx.world.objects.get_mut(&target).unwrap();
+        obj.data[4] = 1;
+        obj.data[42] = 2 | 0x200;
+        obj.data[23] = 2;
+        obj.data[1] = 0;
+    }
+    assert_eq!(
+        find_in_front(&mut fx, reference as i16, target, 1),
+        Ok(true)
+    );
+    assert_eq!(fx.world.objects[&reference].position, [56, 56, 2]);
+    assert_eq!(fx.world.objects[&target].position, [56, 40, 2]);
+
+    // If function 5 takes the explicit error branch (253), mode 2 propagates
+    // it via `Fault::nested` so `trap.unported()` stays false.
+    fx.add(file, 4098, tree(vec![ins(2, ERROR, ERROR, [0; 8])]));
+    assert_eq!(find(&mut fx, LAMP as i16, reference, 1 | 2), Ok(true));
+    let failing = widget(&mut fx);
+    let err = trap(find_in_front(&mut fx, reference as i16, failing, 1));
+    assert!(
+        !err.unported(),
+        "callback script error marked unported: {err}"
+    );
 }
 
 #[test]
