@@ -20,7 +20,7 @@
 //! entry queues the very action offered (`Lot::pick`).
 //!
 //! Where the simulation cannot list a menu yet (it fails loudly on what
-//! it has not ported: an object that offers nothing; a version 0 table; a pet; joining; an
+//! it has not ported: an object that offers nothing; a version 0 table; a pet; an
 //! unported scope or primitive), the lot is left as it was and the menu
 //! falls back to every entry of the table without checks
 //! (`every_entry`); [`Listing::unchecked`] says why, and choosing one

@@ -92,11 +92,22 @@
 //!    first listing's are put back last. A menu that still offers
 //!    nothing is empty. The tile is the one the object's position is on;
 //!    for an object held in a slot that is **unverified**.
+//!
+//! The listing names no entry: the menu's window works the names out
+//! when it is built (0x48d5ce, 0x41f167), which also clears each action's
+//! flag 0x80 (0x41f1a4). So a listed action may still have that flag
+//! (the offer copies it from the running action), and [`Interpreter::pick`]
+//! and [`Interpreter::highlight`] clear it as the window would have.
+//!
+//! When the menu's mode (+0x3c) is 2 or 3, 0x48d392 lists differently
+//! (0x48d4b7), with actions made by 0x41ee2f, whose word +0 is 2. That
+//! listing is not ported.
 
 use crate::autonomy::{JOINS, SavedTemps, attenuation, checked, entry, find, person};
 use crate::fault::{Fault, Trap};
 use crate::interpreter::{Interpreter, Machine};
 use crate::placement::Cursor;
+use crate::primitives::action_string::NAMED;
 use sims_formats::saved_objects::Interaction;
 use sims_sim::World;
 
@@ -204,12 +215,22 @@ impl Interpreter<'_> {
     /// offer to join) and runs the entry's check tree on the lot, as
     /// autonomy's check does; it is not undone but for the caller's
     /// temps.
+    ///
+    /// The menu's window works out each entry's name when it is built
+    /// (0x48d5ce, 0x41f167), which clears the action's flag 0x80
+    /// (0x41f1a4), so the action is taken with that flag clear. An action
+    /// without a caller is not checked (0x48dfa5) and comes back as it
+    /// went in, but for that flag.
     pub fn highlight(
         &self,
         world: &mut World,
         person: u16,
         mut action: Interaction,
     ) -> Result<Interaction, Fault> {
+        action.flags &= !NAMED;
+        if action.caller == 0 {
+            return Ok(action);
+        }
         let mut machine = self.machine(world, person, 0, false);
         machine
             .highlight(&mut action)
@@ -226,12 +247,20 @@ impl Interpreter<'_> {
     /// took nothing: it is full, or the target's table no longer has the
     /// action's entry. What the queue does not port fails loudly, as for
     /// [`Self::order`].
+    ///
+    /// As for [`Self::highlight`], the action is taken with flag 0x80
+    /// clear, as the menu's window leaves it. An action without a caller
+    /// is not queued (0x48ddc6) and None comes back.
     pub fn pick(
         &self,
         world: &mut World,
         person: u16,
-        action: Interaction,
+        mut action: Interaction,
     ) -> Result<Option<i32>, Fault> {
+        action.flags &= !NAMED;
+        if action.caller == 0 {
+            return Ok(None);
+        }
         let mut machine = self.machine(world, person, 0, false);
         let result = (|| {
             let target = u16::try_from(action.target)

@@ -1272,6 +1272,10 @@ impl Machine<'_, '_> {
                         menu: checking.as_ref().or(outer.menu),
                         ..outer
                     };
+                    // The check runs at once (0x4749b5), which clears
+                    // 0x6c4d6c for the run (0x474a37): outside a listing,
+                    // Add/Change Action String names nothing and takes
+                    // the true branch, as in autonomy's checks.
                     let passed = interpreter
                         .call_as(
                             self.world,
@@ -1282,7 +1286,7 @@ impl Machine<'_, '_> {
                             &args,
                             args.len(),
                             TURN_BUDGET,
-                            false,
+                            true,
                         )
                         .map_err(|fault| {
                             Trap::Unsupported(format!(

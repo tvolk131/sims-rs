@@ -1542,3 +1542,134 @@ fn an_action_run_at_once_that_fails_puts_my_priority_back() {
     assert!(interpreter.order(&mut fx.world, SIM, LAMP, 4).is_err());
     assert_eq!(fx.sim().person.as_ref().unwrap().data[33], 7);
 }
+
+/// The menu's window works out each entry's name as it is built
+/// (0x48d5ce, 0x41f167), which clears the action's flag 0x80 (0x41f1a4):
+/// picking or pointing at a listed action takes it with that flag clear.
+/// An action without a caller is neither queued (0x48ddc6) nor checked
+/// (0x48dfa5), and the lot is left as it was.
+#[test]
+fn the_menu_clears_flag_0x80_and_skips_an_action_without_a_caller() {
+    let mut fx = join_lot();
+    fx.sim_mut().person.as_mut().unwrap().active.flags = 0xff;
+    fx.world.objects.get_mut(&LAMP).unwrap().data[25] = 0;
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let listed = interpreter.pie_menu(&mut fx.world, SIM, OTHER).unwrap();
+    // The offer copies the running action's flag 0x80, and the listing
+    // keeps it.
+    let offer = listed[1].action.clone();
+    assert_eq!((offer.join, offer.flags), (1, 0xec));
+
+    // Without a caller: nothing is queued or checked.
+    let callerless = sims_formats::saved_objects::Interaction {
+        caller: 0,
+        ..offer.clone()
+    };
+    let before = format!("{:?}", fx.world.objects);
+    assert_eq!(
+        interpreter.pick(&mut fx.world, SIM, callerless.clone()),
+        Ok(None)
+    );
+    let pointed = interpreter
+        .highlight(&mut fx.world, SIM, callerless.clone())
+        .unwrap_or_else(|f| panic!("{f}"));
+    let mut expected = callerless;
+    expected.flags = 0x6c;
+    assert_eq!(format!("{pointed:?}"), format!("{expected:?}"));
+    assert_eq!(format!("{:?}", fx.world.objects), before);
+
+    // Pointed at and picked, the offer has flag 0x80 clear.
+    let pointed = interpreter
+        .highlight(&mut fx.world, SIM, offer.clone())
+        .unwrap_or_else(|f| panic!("{f}"));
+    assert_eq!(pointed.flags, 0x6c);
+    assert_eq!(interpreter.pick(&mut fx.world, SIM, offer), Ok(Some(1)));
+    let queue = &fx.world.objects[&OTHER].person.as_ref().unwrap().queue;
+    assert_eq!(
+        queue.iter().map(|a| (a.join, a.flags)).collect::<Vec<_>>(),
+        [(1, 0x6c)]
+    );
+}
+
+/// A check tree run outside a listing, for a picked action that runs at
+/// once, runs at once (0x4749b5), which clears 0x6c4d6c (0x474a37): its
+/// Add/Change Action String names nothing and takes the true branch.
+#[test]
+fn a_check_tree_outside_the_listing_names_nothing() {
+    let mut fx = menu_lot(vec![with_test(4, 4, 4300)]);
+    recording_action(&mut fx);
+    fx.program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .strings
+        .insert(300, vec!["Eat".to_owned()]);
+    let mut operands = [0; 8];
+    operands[..2].copy_from_slice(&300u16.to_le_bytes());
+    operands[4] = 1;
+    fx.add(
+        LAMP_FILE,
+        4300,
+        tree(vec![ins(50, RETURN_TRUE, RETURN_FALSE, operands)]),
+    );
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    // In the listing, the string is the entry.
+    let listed = interpreter
+        .pie_menu(&mut fx.world, SIM, LAMP)
+        .unwrap_or_else(|f| panic!("{f}"));
+    let [named] = listed.as_slice() else {
+        panic!("{listed:?}");
+    };
+    assert_eq!(named.name.as_deref(), Some("Eat"));
+    // Picked, the entry runs at once after its check, which passes and
+    // leaves my running action as it was.
+    let active = format!("{:?}", fx.sim().person.as_ref().unwrap().active);
+    assert_eq!(
+        interpreter.pick(&mut fx.world, SIM, named.action.clone()),
+        Ok(Some(1))
+    );
+    assert_eq!(fx.world.objects[&LAMP].data[23], ACTION as i16);
+    assert_eq!(
+        format!("{:?}", fx.sim().person.as_ref().unwrap().active),
+        active
+    );
+}
+
+/// Idle For Input's check of a queued action that joins (word +0 1)
+/// passes the check tree 0, 1, the action's third argument and 0
+/// (0x458372); any other word passes 0, 0, 0 and 0.
+#[test]
+fn idle_for_input_checks_a_queued_join_with_its_arguments() {
+    // Menu 3's check passes only for parameters 1 and 2 of 1 and 7.
+    let refuses_unless_joining = |fx: &mut Fixture| {
+        fx.add(
+            LAMP_FILE,
+            4302,
+            tree(vec![
+                ins(
+                    2,
+                    1,
+                    RETURN_FALSE,
+                    expr(scope::PARAMETERS, 1, op::EQUAL, scope::LITERAL, 1),
+                ),
+                expression(scope::PARAMETERS, 2, op::EQUAL, scope::LITERAL, 7),
+            ]),
+        );
+        entry_trees(fx, 4302, ACTION);
+    };
+    // The action tree sleeps on its first argument, 2.
+    for (join, starts) in [(1, true), (0, false), (2, false)] {
+        let mut fx = ordered();
+        refuses_unless_joining(&mut fx);
+        let queued = &mut fx.sim_mut().person.as_mut().unwrap().queue[0];
+        (queued.join, queued.args) = (join, [2, 0, 7, 0]);
+        let (status, _) = idle_turn(&mut fx);
+        assert_eq!(status, Status::Yielded, "join {join}");
+        let person = fx.sim().person.as_ref().unwrap();
+        assert!(person.queue.is_empty(), "join {join}");
+        assert_eq!(person.active.uid == 1, starts, "join {join}");
+        if starts {
+            assert_eq!(person.active.join, 1);
+        }
+    }
+}

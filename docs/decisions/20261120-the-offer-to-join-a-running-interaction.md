@@ -73,8 +73,22 @@ Picking an entry queues its action on the action's caller (0x48ddbe,
   - the queue's actions, which Push Interaction, the menu and Idle For
     Input all make with the queue's person as caller.
 
-  So nothing else changes. An action whose caller is not a person on the
-  lot fails as invalid. The original would read through a null pointer.
+  So nothing else changes. Picking an action without a caller queues
+  nothing (0x48ddc6), and pointing at one checks nothing (0x48dfa5), as
+  in the original. Any other action whose caller is not a person on the
+  lot fails as invalid.
+- **The check of a queued or picked action runs as a check.** Its tree
+  runs at once (0x4749b5), which clears 0x6c4d6c (0x474a37). So outside
+  a listing, Add/Change Action String names nothing and takes the true
+  branch, as it already did in autonomy's checks. Before, a picked entry
+  that runs at once, or a queued action Idle For Input checks, failed
+  loudly there.
+- **Picking and pointing clear flag 0x80.** The menu's window works out
+  each shown entry's name when it is built (0x48d5ce, 0x41f167), and
+  that always clears the action's flag 0x80 (0x41f1a4). The listing
+  doesn't, so the offer keeps the running action's 0x80 there.
+  `Interpreter::pick` and `Interpreter::highlight` clear it as the
+  window would have.
 - **The saved temps say whose they are** (`SavedTemps`), and go back to
   that person.
 - **Picking queues on the caller** (`Interpreter::pick`).
@@ -91,9 +105,17 @@ Picking an entry queues its action on the action's caller (0x48ddbe,
     exactly as before.
   - So every pinned hash stands and the snapshot format stays 30. A
     format-30 snapshot reads the same. Only a world holding a join
-    differs, and an older build would refuse it.
-- **The check reads exactly 1 at word +0, as the original does.** No
-  other action has 1 there.
+    differs.
+  - **Why the format isn't bumped.** Bumping it would change every
+    pinned hash, since the world's hash is that of its encoding, and it
+    buys nothing: every snapshot written before reads the same. An older
+    build reading a world that holds a join gets a flags value too wide
+    for its 32-bit field, so it fails to read the snapshot rather than
+    misreading it.
+- **The word is kept as it is.** The check passes the join's arguments
+  for exactly 1, as the original does (0x458372). The menu's other
+  listing (mode 2 or 3, 0x48d4b7) makes actions with 2 there (0x41ee2f);
+  that listing is not ported.
 - **Autonomy's join entry** (0x458aee) is unchanged. Its third argument
   is 0: 0x41ee99 clears it and the scan writes none.
 
@@ -102,6 +124,10 @@ Picking an entry queues its action on the action's caller (0x48ddbe,
 - No recording shows a join offer picked, so picking it is read from the
   code only.
 - The offer's name: the original copies the running action's name and
-  then gives it the entry's (0x41efc1). A `MenuEntry` without a name
-  shows its entry's name, which is the same.
+  then gives it the entry's stored name (0x41efc1). A `MenuEntry`
+  without a name shows its entry's name, which is the same. The window's
+  getter puts "*" before the name of an entry with flag 0x80 only when
+  the action's name is still empty (0x41f174); whether the stored name
+  can be empty there is not read, so the "*" the game's menu adds to such
+  an entry is unverified for the offer.
 - Other readers of word +0 were not searched for.

@@ -46,10 +46,12 @@ pub struct Multipart {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(from = "EncodedInteraction", into = "EncodedInteraction")]
 pub struct Interaction {
-    /// The action's word +0, which the game saves first (0x41f1d8): 1 for
-    /// the action that joins a person's running interaction (0x41ee99),
-    /// whose check passes the join's arguments to its tree (0x458372),
-    /// and 0 for any other.
+    /// The action's word +0, kept as it is: the game saves it first
+    /// (0x41f1d8). The action that joins a person's running interaction
+    /// has 1 there (0x41ee99), and a check passes the join's arguments to
+    /// its tree only for exactly 1 (0x458372). The menu's other listing,
+    /// which is not ported, writes 2 (0x41ee2f); actions made here
+    /// otherwise have 0.
     pub join: i32,
     /// The action's number (+0x3c), given when it is queued.
     pub uid: i32,
