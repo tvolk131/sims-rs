@@ -27,8 +27,10 @@ two fails any more. The listings that fail today are these:
   person is running, when it can be joined, and that offer is not ported
   (`orders.rs`, after the entries are listed). The offer is made on
   another person's pie menu. So a person running a joinable interaction
-  meets it when listing any other person, an idle one included, and not
-  when listing an object or itself.
+  meets it when listing any other person, an idle one included. Listing
+  an object, or itself, meets it too when that menu offers nothing and
+  the listing falls back to another person on the same tile
+  (`list_with_tile`).
 - **A visitor's chosen action on a category 4 or 7 object (0x41f660).**
   From 6000 ticks, check trees 0x2025 and 0x103e ask the relationship
   between the visitor and the person ordered, which is not ported.
@@ -77,8 +79,11 @@ What changes:
 - An `Unsupported` trap whose own text happens to start with "check
   tree" is now unported. The old parser took it for a failure.
 - A check tree's fault met in a route's callbacks on the routing
-  person's own thread now keeps the callback's place, in
-  `Trap::Within`. Before, only its trap was kept.
+  person's own thread is now held in `Trap::Within`, which reads as the
+  check does. Before, only its trap was kept. Either way the fault names
+  the check's frame, the top of that thread's stack, and not the
+  callback that ran it; the animator's arrival check keeps only the trap.
+  The callback's place is left out of these diagnostics.
 - `sims boot --play` counts the errors, skipped frames and sounds a
   failed tick hands back with the rest.
 - A check tree's fault met while a tree is pushed (Gosub Found Action,
