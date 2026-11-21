@@ -22,6 +22,7 @@ use sims_sim::World;
 use sims_sim::load::{Context, Household};
 use sims_sim::motives::Tuning;
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 /// Anything that stops a boot, with a message that says where.
@@ -446,12 +447,36 @@ impl Lot {
         frames: Frames,
         crt: CrtRng,
     ) -> Result<Self, BootError> {
+        Self::load_with_frame_tree_bits(root, house, answers, frames, crt, &BTreeSet::new())
+    }
+
+    /// [`Lot::load_with`] with the tree bits the original's frame arena
+    /// held where the load reads each saved frame (0x4746e4), as
+    /// (saved object ID, zero-based frame index). The house file does
+    /// not carry them: see
+    /// [`Interpreter::read_objects_with_frame_tree_bits`].
+    pub fn load_with_frame_tree_bits(
+        root: &Path,
+        house: &Path,
+        answers: &[u8],
+        frames: Frames,
+        crt: CrtRng,
+        frame_tree_bits: &BTreeSet<(u16, usize)>,
+    ) -> Result<Self, BootError> {
         let directory = house
             .parent()
             .and_then(Path::parent)
             .ok_or("the house file must be inside a neighborhood's Houses directory")?;
         let neighborhood = Neighborhood::open(directory)?;
-        Self::load_in_with(root, neighborhood, house, answers, frames, crt)
+        Self::boot(
+            root,
+            neighborhood,
+            house,
+            answers,
+            frames,
+            crt,
+            frame_tree_bits,
+        )
     }
 
     /// [`Lot::load`] with the neighborhood already open, as opening it
@@ -484,6 +509,27 @@ impl Lot {
         answers: &[u8],
         frames: Frames,
         crt: CrtRng,
+    ) -> Result<Self, BootError> {
+        Self::boot(
+            root,
+            neighborhood,
+            house,
+            answers,
+            frames,
+            crt,
+            &BTreeSet::new(),
+        )
+    }
+
+    /// The load itself, with every input the loaders above take.
+    fn boot(
+        root: &Path,
+        neighborhood: Neighborhood,
+        house: &Path,
+        answers: &[u8],
+        frames: Frames,
+        crt: CrtRng,
+        frame_tree_bits: &BTreeSet<(u16, usize)>,
     ) -> Result<Self, BootError> {
         let install = Install::detect(root)?;
         let mut index = Index::build(&install)?;
@@ -623,7 +669,12 @@ impl Lot {
                 &catalog,
                 file.objects.instances.values().map(|o| o.guid),
             )?;
-            let read = interpreter.read_objects(&mut world, &file.objects, &people)?;
+            let read = interpreter.read_objects_with_frame_tree_bits(
+                &mut world,
+                &file.objects,
+                &people,
+                frame_tree_bits,
+            )?;
             load.read = read.objects.len();
             load.draws = read.draws;
             // 8: the lot-wide controllers, now among the saved objects. 9:

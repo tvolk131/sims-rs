@@ -174,6 +174,7 @@ fn resolving_data_word_25_wakes_a_sleeping_object() {
     turn(&mut fx, LAMP);
     // Six ticks pass: the scheduler has counted 8 down to 2.
     fx.lamp_mut().set_countdown(2);
+    fx.lamp_mut().stack[0].tree |= 0x8000;
     peek(&mut fx);
     assert_eq!(fx.run_with(SIM, 4096, LAMP as i16, &[], BUDGET), Ok(true));
     let lamp = fx.lamp();
@@ -182,9 +183,11 @@ fn resolving_data_word_25_wakes_a_sleeping_object() {
     assert_eq!(lamp.countdown(), Some(-2));
     assert_eq!(lamp.flags(), 1);
     assert_eq!(lamp.stack[0].parameters, [2]);
+    assert_eq!(lamp.stack[0].tree, 0x9000, "lookup leaves the flag set");
     // Its next turn hands the remaining count back to the scheduler.
     assert_eq!(turn(&mut fx, LAMP), Status::Yielded);
     assert_eq!(fx.lamp().countdown(), Some(1));
+    assert_eq!(fx.lamp().stack[0].tree, 4096);
 }
 
 #[test]

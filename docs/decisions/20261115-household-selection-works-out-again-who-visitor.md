@@ -51,11 +51,12 @@ attributes, frames and person data, but for two things:
 
 - Person 241's fourth frame has tree 0xa029 in the capture and 0x2029
   here and in the file, like object 19's 0x8118 in the Goth captures.
-  The frame reader (0x474694) writes only the low 15 bits of the tree
-  word and keeps bit 15 from the frame arena, which is freshly allocated
-  and not cleared (0x4750ed clears only its first four bytes); every
-  reader masks the bit off (0x4746c0, 0x4747ea, 0x474f79). The bit is
-  left over from the heap and nothing reads it, so it is not kept.
+  The frame reader (0x4746e4) keeps bit 15 from the arena. Only its
+  first four bytes are cleared after allocation (0x4750fc). Lookups
+  and saving mask the bit off (0x47536b, 0x4746c0). Dispatch tests it
+  at 0x474b99 and the object's hook (0x44aa96 to 0x474b13) clears it
+  before executing the instruction. A load from the file alone has
+  no arena bits to inherit.
 - Person 243, the Sim selected, has object data word 50 at 1 and its
   last result true in the capture, 0 and false here. Word 50 is the
   word a check tree sets; something in the original's load runs a tree
