@@ -82,3 +82,59 @@ fn the_second_step_needs_a_stack_object() {
     fx.lamp_mut().stack[0].stack_object = 77;
     assert_eq!(turn(&mut fx).unwrap_err().trap.code(), Some(0x17));
 }
+
+#[test]
+fn a_shown_effect_without_flag_0x40_resets_speed_to_normal() {
+    // 0x44abda..0x44abee → 0x4f684c..0x4f6873: message 0x10c sets speed
+    // to NORMAL (760) through 0x46d697, updating global 18 when non-negative.
+    let mut fx = effect(0);
+    fx.world.globals[LOT] = 0;
+    fx.world.globals[16] = 1000;
+    fx.world.globals[18] = 924;
+    // State 0 yields without changing speed.
+    assert_eq!(turn(&mut fx), Ok(Status::Yielded));
+    assert_eq!((fx.world.speed(), fx.world.return_speed()), (1000, 924));
+    // State 1 shows the effect and drops speed to 760.
+    assert_eq!(turn(&mut fx), Ok(Status::Yielded));
+    assert_eq!((fx.world.speed(), fx.world.return_speed()), (760, 760));
+    assert_eq!(turn(&mut fx), Ok(Status::Returned(true)));
+
+    // Negative return speed stays negative when 0x46d697 runs.
+    let mut fx = effect(0);
+    fx.world.globals[LOT] = 0;
+    fx.world.globals[16] = 994;
+    fx.world.globals[18] = -1;
+    assert_eq!(turn(&mut fx), Ok(Status::Yielded));
+    assert_eq!(turn(&mut fx), Ok(Status::Yielded));
+    assert_eq!((fx.world.speed(), fx.world.return_speed()), (760, -1));
+}
+
+#[test]
+fn flag_0x40_or_unshown_or_already_normal_leaves_speed_alone() {
+    // Flag 0x40 suppresses message 0x10c.
+    let mut fx = effect(0x40);
+    fx.world.globals[LOT] = 0;
+    fx.world.globals[16] = 1000;
+    fx.world.globals[18] = 924;
+    assert_eq!(turn(&mut fx), Ok(Status::Yielded));
+    assert_eq!(turn(&mut fx), Ok(Status::Yielded));
+    assert_eq!((fx.world.speed(), fx.world.return_speed()), (1000, 924));
+
+    // Unshown effect does not broadcast 0x10c.
+    let mut fx = effect(0);
+    fx.world.globals[LOT] = 9;
+    fx.world.globals[16] = 1000;
+    fx.world.globals[18] = 924;
+    assert_eq!(turn(&mut fx), Ok(Status::Yielded));
+    assert_eq!(turn(&mut fx), Ok(Status::Returned(true)));
+    assert_eq!((fx.world.speed(), fx.world.return_speed()), (1000, 924));
+
+    // Already at NORMAL (760): 0x4f686c skips 0x46d697, so global 18 stays.
+    let mut fx = effect(0);
+    fx.world.globals[LOT] = 0;
+    fx.world.globals[16] = 760;
+    fx.world.globals[18] = 924;
+    assert_eq!(turn(&mut fx), Ok(Status::Yielded));
+    assert_eq!(turn(&mut fx), Ok(Status::Yielded));
+    assert_eq!((fx.world.speed(), fx.world.return_speed()), (760, 924));
+}

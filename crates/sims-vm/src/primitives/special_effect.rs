@@ -35,17 +35,28 @@
 //! here; the panel is not ported. See
 //! docs/decisions/20261115-snap-offset-order.md.
 //!
-//! What showing does is presentation and is not modeled: the message
-//! 0x10c to the game's listeners unless flag 0x40 is set (0x40760d), the
-//! text from STR# 0x131 formatted by 0x44bf1a, and the effect itself
-//! (0x4a6950). That the listeners write nothing the simulation reads is
-//! **unverified**.
+//! When the effect is shown and flag 0x40 is clear, the primitive broadcasts
+//! message 0x10c to the game's listeners (0x44abda to 0x44abee, 0x40760d).
+//! Of the eight listeners registered on that list (0x407577), only the
+//! control panel's handler (0x4f65bf → 0x4f684c) handles 0x10c: it reads
+//! normal speed (760, 0x4425a2), compares it with the lot's speed
+//! (global 16, 0x46d78b), and when they differ calls the speed setter
+//! (0x46d697, [`sims_sim::World::set_speed`]), which writes global 16 and,
+//! while non-negative, global 18, then marks the panel dirty (0x4ceceb,
+//! 0x4ce41b, presentation). Thus a shown effect without flag 0x40 drops the
+//! lot from idle/fast/ultra speed back to normal speed (for instance at
+//! tick 39610 of the Goth day when the raccoon runs Special Effect with
+//! flag 0x40 clear while everyone sleeps at speed 1000).
+//!
+//! What else showing does is presentation and is not modeled: the text from
+//! STR# 0x131 formatted by 0x44bf1a, and the effect itself (0x4a6950).
 //!
 //! Ported from the original's code (above). The old prototype's port
 //! (legacy/crates/sims-vm/src/effect.rs) agrees on the states and gates.
 
 use crate::fault::Trap;
 use crate::interpreter::{Flow, Machine, word};
+use sims_sim::speed::NORMAL;
 
 /// Global 9: the family of the lot.
 const FAMILY: usize = 9;
@@ -55,6 +66,9 @@ const LOT: usize = 10;
 /// loop clears it before the next update and ends its frame there
 /// (0x46da98, `crate::boot`).
 const EFFECT: usize = 11;
+/// Operand flag bit 0x40: when set, suppresses broadcasting message 0x10c
+/// (0x44abe1 to 0x44abee).
+const KEEP_SPEED: u8 = 0x40;
 /// Person data words.
 mod person {
     pub const FAMILY: usize = 61;
@@ -85,11 +99,16 @@ impl Machine<'_, '_> {
                 let flags = operands[4];
                 let scope = if flags & 0x20 != 0 { 25 } else { 7 };
                 self.read(scope, word(operands, 0))?;
-                Ok(if self.shows_effect(flags)? {
-                    Flow::Yield
+                if self.shows_effect(flags)? {
+                    // 0x44abda to 0x44abee → 0x4f684c to 0x4f6873: message
+                    // 0x10c resets speed to normal unless flag 0x40 is set.
+                    if flags & KEEP_SPEED == 0 && self.world.speed() != NORMAL {
+                        self.world.set_speed(i32::from(NORMAL));
+                    }
+                    Ok(Flow::Yield)
                 } else {
-                    Flow::Branch(true)
-                })
+                    Ok(Flow::Branch(true))
+                }
             }
             _ => Ok(Flow::Branch(true)),
         }

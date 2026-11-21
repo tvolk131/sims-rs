@@ -5,7 +5,7 @@
 //! The panel turns presses into `sims_ui` commands; [`Hud::press`] hands
 //! them to the game, which carries out what it can.
 
-use crate::menu::{Menu, Press};
+use crate::menu::{Menu, Release};
 use crate::pace::Pace;
 use crate::view::View;
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
@@ -475,6 +475,13 @@ impl Hud {
         Some(point)
     }
 
+    /// Re-lays out an open pie menu for a new canvas `size`.
+    pub fn resize_menu(&mut self, size: [i32; 2]) {
+        if let Some(menu) = &mut self.menu {
+            menu.layout(&self.art, size);
+        }
+    }
+
     /// A press at `point`: the command it asks for, if any. Commands that
     /// change only the panel are applied here too. A gadget button's
     /// press is checked against `world` and `residential` (whether the lot
@@ -484,23 +491,12 @@ impl Hud {
         if let Some(layout) = &self.dialog {
             return dialog::press(layout, point);
         }
-        // A press on an entry chooses it, one on a submenu's entry or
-        // back from it keeps the menu open, and one elsewhere closes it.
-        // `interaction` is the entry's index in the menu; the game reads
-        // its menu number from the menu it had open.
-        if let Some(mut menu) = self.menu.take() {
-            return match menu.press(&self.art, point) {
-                Press::Chose(choice) => Some(Command::ChooseInteraction {
-                    sim: menu.person,
-                    object: menu.object,
-                    interaction: u16::try_from(choice).ok()?,
-                }),
-                Press::Stays => {
-                    self.menu = Some(menu);
-                    None
-                }
-                Press::Closed => None,
-            };
+        // A press on an open pie menu only marks the button held
+        // (0x5eb3d1 with +0x170 clear); choosing happens on release
+        // (`Hud::release_menu`, 0x5eb433).
+        if let Some(menu) = &mut self.menu {
+            menu.press();
+            return None;
         }
         // The status band is drawn over everything else on the lot,
         // the icons too, and takes the press.
@@ -529,6 +525,47 @@ impl Hud {
             self.play(WHOOSH);
         }
         Some(command)
+    }
+
+    /// A left release on an open pie menu at `point` (0x5eb433): settles
+    /// the opening press, opens or leaves a submenu, chooses an entry, or
+    /// closes the menu.
+    pub fn release_menu(&mut self, point: [i32; 2]) -> (Release, Option<Command>) {
+        let Some(mut menu) = self.menu.take() else {
+            return (Release::Closed, None);
+        };
+        let release = menu.release(&self.art, point);
+        match release {
+            Release::Chose(choice) => {
+                let command =
+                    u16::try_from(choice)
+                        .ok()
+                        .map(|interaction| Command::ChooseInteraction {
+                            sim: menu.person,
+                            object: menu.object,
+                            interaction,
+                        });
+                (release, command)
+            }
+            Release::Settled | Release::Stays => {
+                self.menu = Some(menu);
+                (release, None)
+            }
+            Release::Closed => (release, None),
+        }
+    }
+
+    /// A left release on an open pie menu while the pointer is outside the
+    /// window: settles a moved opening menu or closes the pie.
+    pub fn release_menu_outside(&mut self) -> Release {
+        let Some(mut menu) = self.menu.take() else {
+            return Release::Closed;
+        };
+        let release = menu.release_outside();
+        if release == Release::Settled {
+            self.menu = Some(menu);
+        }
+        release
     }
 }
 

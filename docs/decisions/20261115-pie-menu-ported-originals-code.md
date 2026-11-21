@@ -32,8 +32,8 @@ screenshot: whether the box fill is opaque (the surface's fill, function
 the head sits in the face. The picker pages past 12 entries on an answer
 of -3; what sends -3 is not traced, so only the first 12 are shown. The
 menu window's own sounds (`UI_piemenu_appear`, `_highlight`, `_select`)
-play only when its flag +0x17c is set, and the people panel never sets
-it, so the game's pie menu plays none of them.
+are gated by its flag `+0x17c`, which `0x5ea303` initializes to `1`
+(`0x5ea380`); `sims-game` does not yet play those UI cues.
 
 **Reopen** when a screenshot of an open pie menu disagrees, or when the
 paging trigger is found.

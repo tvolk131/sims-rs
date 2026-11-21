@@ -394,10 +394,15 @@ impl Game {
 
     /// Runs up to `ticks` ticks, stopping at the first that fails, and,
     /// if `idle`, before a tick the idle loop's speed sets the speed for
-    /// ([`Game::idle_speed`]).
+    /// ([`Game::idle_speed`]) or after a tick that changes the
+    /// simulation's speed or return speed (such as Special Effect resetting
+    /// to normal, `0x4f684c` → `0x46d697`). Any mid-tick speed or return-speed
+    /// change updates the panel's speed and restarts the time owed, whether
+    /// `idle` is set or not.
     fn run_while(&mut self, ticks: u32, idle: bool) -> u32 {
         let mut ran = 0;
         while ran < ticks && self.stopped.is_none() && !(idle && self.idle_speed()) {
+            let speed_before = (self.lot.world().speed(), self.lot.world().return_speed());
             let step = if self.play {
                 self.lot.step_play()
             } else {
@@ -447,6 +452,9 @@ impl Game {
                     }
                     self.stop(&error);
                 }
+            }
+            if sync_speed_after_step(&mut self.pace, speed_before, self.lot.world()) && idle {
+                break;
             }
         }
         if ran > 0 || self.stopped.is_some() {
@@ -588,6 +596,7 @@ impl Game {
             return false;
         }
         self.view.resize(size);
+        self.hud.resize_menu(size);
         true
     }
 
@@ -604,10 +613,22 @@ impl Game {
         self.hud.covers(point)
     }
 
+    /// Whether `point` lies inside the canvas (`[0..width, 0..height)`).
+    fn in_view(&self, point: [i32; 2]) -> bool {
+        point[0] >= 0
+            && point[1] >= 0
+            && point[0] < self.view.size[0]
+            && point[1] < self.view.size[1]
+    }
+
     /// Moves the pointer to `point`. When it first reaches an object on
     /// the lot, the selected Sim's pie menu on it is listed, as the
     /// original lists it then (0x48c834); listing changes the lot.
+    /// A point outside the canvas is treated as [`Game::leave`].
     pub fn hover(&mut self, point: [i32; 2]) -> bool {
+        if !self.in_view(point) {
+            return self.leave();
+        }
         self.pointer = Some(point);
         let mut redraw = self.hud.hover(point);
         redraw |= self.highlight(point);
@@ -626,22 +647,26 @@ impl Game {
     }
 
     /// A left press at `point`, which is over the panel or the lot.
+    ///
+    /// While a pie menu is open (with no dialog over it), a press only
+    /// updates which entry is under `point` and marks the button held
+    /// (0x5eb3d1 with `+0x170` clear); the entry is chosen, or the menu
+    /// closed, on the matching [`Game::release`] (0x5eb433).
     pub fn press(&mut self, point: [i32; 2]) -> Outcome {
+        if self.hud.dialog().is_none() && self.hud.menu.is_some() {
+            self.pointer = Some(point);
+            let mut redraw = self.hud.hover(point);
+            redraw |= self.highlight(point);
+            if let Some(menu) = &mut self.hud.menu {
+                redraw |= menu.press();
+            }
+            return Outcome {
+                redraw,
+                photo: false,
+            };
+        }
         let cleared = self.note.take().is_some();
         if self.hud.covers(point) {
-            // Choosing an entry checks it again first: the pie's
-            // button-up handler (0x5eb433) tells the house view about the
-            // entry under the pointer as chosen (0x1ac with 1), and the
-            // house view runs its check (0x48df28) as it does when the
-            // pointer reaches the entry. The original chooses at the
-            // button's release; the window chooses at the press, as it
-            // did before this check was ported.
-            if let Some(entry) = self.hud.menu.as_ref().and_then(|m| m.highlighted(point)) {
-                self.check_entry(entry);
-            }
-            // A failed check's note stays in front of what the choice
-            // says.
-            let failed = self.note.take();
             // The menu, whose entries a choice is an index into.
             let menu = self.hud.menu.clone();
             let outcome = match self
@@ -651,12 +676,6 @@ impl Game {
                 Some(command) => self.command(command, menu.as_ref()),
                 None => Outcome::redraw(),
             };
-            if let Some(failed) = failed {
-                self.note = Some(match self.note.take() {
-                    Some(note) => format!("{failed} {note}"),
-                    None => failed,
-                });
-            }
             let sounds = self.hud.take_sounds();
             self.keep_sounds(sounds);
             return outcome;
@@ -669,6 +688,93 @@ impl Game {
         };
         self.open_menu(target, point);
         Outcome::redraw()
+    }
+
+    /// A left release at `point` (0x5eb433).
+    ///
+    /// Acts only while a pie menu is open with no dialog over it:
+    /// - updates which entry is under `point` as mouse-move does
+    ///   (`+0xfc`, 0x5eb4d7);
+    /// - for the opening press's release, settles the menu into
+    ///   click-to-choose mode unless the pointer moved past the dead zone
+    ///   without the menu having moved on screen;
+    /// - otherwise checks the entry under `point` again (`0x5eb62a` ->
+    ///   event `0xe` -> `0x48df28`) and chooses it, opens or leaves a
+    ///   submenu, or closes the menu.
+    pub fn release(&mut self, point: [i32; 2]) -> Outcome {
+        if !self.in_view(point) {
+            return self.release_outside();
+        }
+        if self.hud.dialog().is_some() || self.hud.menu.is_none() {
+            return Outcome {
+                redraw: false,
+                photo: false,
+            };
+        }
+        self.pointer = Some(point);
+        let mut redraw = self.hud.hover(point);
+        redraw |= self.highlight(point);
+        let will_choose = self.hud.menu.as_ref().is_some_and(|m| m.will_choose(point));
+        if !will_choose {
+            let was_held = self.hud.menu.as_ref().is_some_and(|m| m.held());
+            let (release, command) = self.hud.release_menu(point);
+            debug_assert_eq!((release, command), (menu::Release::Settled, None));
+            return Outcome {
+                redraw: redraw || was_held,
+                photo: false,
+            };
+        }
+        let _ = self.note.take();
+        // Choosing an entry checks it again first (0x5eb433 -> 0x5eb62a
+        // -> event 0xe -> 0x48df28).
+        if let Some(entry) = self.hud.menu.as_ref().and_then(|m| m.highlighted(point)) {
+            self.check_entry(entry);
+        }
+        // A failed check's note stays in front of what the choice says.
+        let failed = self.note.take();
+        let menu = self.hud.menu.clone();
+        let (_, command) = self.hud.release_menu(point);
+        self.highlighted = None;
+        let outcome = match command {
+            Some(command) => self.command(command, menu.as_ref()),
+            None => Outcome::redraw(),
+        };
+        if let Some(failed) = failed {
+            self.note = Some(match self.note.take() {
+                Some(note) => format!("{failed} {note}"),
+                None => failed,
+            });
+        }
+        let sounds = self.hud.take_sounds();
+        self.keep_sounds(sounds);
+        outcome
+    }
+
+    /// A left release while the pointer is outside the window (after
+    /// [`Game::leave`]): settles an opening press on a moved menu, or
+    /// closes the pie without checking or choosing any entry.
+    pub fn release_outside(&mut self) -> Outcome {
+        if self.hud.dialog().is_some() || self.hud.menu.is_none() {
+            return Outcome {
+                redraw: false,
+                photo: false,
+            };
+        }
+        self.pointer = None;
+        self.highlighted = None;
+        let redraw = self.hud.leave();
+        let was_held = self.hud.menu.as_ref().is_some_and(|m| m.held());
+        match self.hud.release_menu_outside() {
+            menu::Release::Settled => Outcome {
+                redraw: redraw || was_held,
+                photo: false,
+            },
+            menu::Release::Closed => {
+                let _ = self.note.take();
+                Outcome::redraw()
+            }
+            menu::Release::Chose(_) | menu::Release::Stays => unreachable!(),
+        }
     }
 
     /// The pointer left the window: it is on no object, button, portrait
@@ -864,7 +970,11 @@ impl Game {
 
     /// Closes the pie menu; false if none was open.
     pub fn close_menu(&mut self) -> bool {
-        self.hud.menu.take().is_some()
+        let closed = self.hud.menu.take().is_some();
+        if closed {
+            self.highlighted = None;
+        }
+        closed
     }
 
     /// Queues `entry` of the pie menu on `object` for `person`, as
@@ -1340,6 +1450,26 @@ fn person_rise(zoom: u32) -> i32 {
     rise as i32 / 2
 }
 
+/// Syncs the panel's speed and restarts the time owed when a tick changes
+/// the simulation's speed or return speed (such as Special Effect resetting
+/// to normal, `0x4f684c` → `0x46d697`, or `World::idle_speed` clearing
+/// global 18 when someone wakes during manual stepping, `0x46d7db` →
+/// `0x46d697`). Returns whether either changed.
+fn sync_speed_after_step(
+    pace: &mut Pace,
+    speed_before: (i16, i16),
+    world: &sims_sim::World,
+) -> bool {
+    if (world.speed(), world.return_speed()) == speed_before {
+        return false;
+    }
+    if let Some(speed) = pace::shown(world) {
+        pace.speed = speed;
+    }
+    pace.restart();
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1514,5 +1644,56 @@ mod tests {
         let taken: Vec<_> = queue.drain(..).collect();
         assert_eq!(taken.len(), 4);
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn a_mid_tick_speed_reset_updates_the_panel_and_drops_owed_time() {
+        use sims_sim::speed::{FAST, IDLE, NORMAL};
+
+        let mut world = sims_sim::World::empty();
+        world.globals[18] = -1;
+        world.set_speed(i32::from(FAST));
+
+        let mut pace = Pace::default();
+        pace.set_speed(Speed::Fast);
+        // Unchanged speed keeps both the panel selection and accrued credit.
+        assert_eq!(pace.due(13_000, FAST), 0);
+        assert!(!sync_speed_after_step(&mut pace, (FAST, -1), &world));
+        assert_eq!(pace.speed, Speed::Fast);
+        assert_eq!(pace.due(1_000, FAST), 1);
+
+        // Accrue 13 ms at Fast, then drop speed to Normal inside a step:
+        // the panel switches to Normal and the 13 ms credit is dropped so
+        // the next Normal tick waits a full 42 ms.
+        assert_eq!(pace.due(13_000, FAST), 0);
+        world.set_speed(i32::from(NORMAL));
+        assert!(sync_speed_after_step(&mut pace, (FAST, -1), &world));
+        assert_eq!(pace.speed, Speed::Normal);
+        assert_eq!(pace.due(29_000, NORMAL), 0);
+        assert_eq!(pace.due(12_999, NORMAL), 0);
+        assert_eq!(pace.due(1, NORMAL), 1);
+
+        // Idle speed (1000, returning to Fast) dropping to Normal (760, 760)
+        // also switches the panel to Normal and drops accrued credit.
+        pace.set_speed(Speed::Fast);
+        world.globals[16] = IDLE;
+        world.globals[18] = FAST;
+        assert_eq!(pace.due(500, IDLE), 0);
+        world.set_speed(i32::from(NORMAL));
+        assert_eq!((world.speed(), world.return_speed()), (NORMAL, NORMAL));
+        assert!(sync_speed_after_step(&mut pace, (IDLE, FAST), &world));
+        assert_eq!(pace.speed, Speed::Normal);
+        assert_eq!(pace.due(41_999, NORMAL), 0);
+        assert_eq!(pace.due(1, NORMAL), 1);
+
+        // Wake-up clearing global 18 from (760, 760) to (760, -1) inside a
+        // manual step still calls 0x46d697 and must drop accrued credit.
+        assert_eq!(pace.due(41_000, NORMAL), 0);
+        world.globals[18] = -1;
+        assert!(sync_speed_after_step(&mut pace, (NORMAL, NORMAL), &world));
+        assert_eq!(pace.speed, Speed::Normal);
+        assert_eq!(pace.due(1_000, NORMAL), 0);
+        assert_eq!(pace.due(40_999, NORMAL), 0);
+        assert_eq!(pace.due(1, NORMAL), 1);
     }
 }
