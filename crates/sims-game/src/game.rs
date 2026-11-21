@@ -623,18 +623,25 @@ impl Game {
         &self.canvas
     }
 
-    /// Passes the house view's rotation and screen-centre pick (`0x4a7b58`
-    /// over the house view above the 100-pixel live-mode strip, cut to a
-    /// tile via `0x433067`) into the simulation.
+    /// Passes the house view's screen-centre pick (`0x4a7b58` over the active
+    /// house viewport [`Game::house_viewport_size`], at the original's origin
+    /// column `camera.origin[0] + pick::ORIGIN_COLUMN`, cut to a tile via
+    /// `0x433067`) into the simulation.
+    fn sync_view_centre(&mut self) {
+        let (w, h) = self.house_viewport_size();
+        let mut camera = self.view.camera;
+        camera.origin[0] = camera.origin[0].saturating_add(pick::ORIGIN_COLUMN);
+        let centre =
+            sims_render::screen_centre_pick(&self.lot_shape, &camera, [w as i32, h as i32])
+                .map(|[x, y]| [(x >> 4) as i8, (y >> 4) as i8]);
+        self.lot.set_view_centre(centre);
+    }
+
+    /// Passes the house view's rotation and screen-centre pick into the
+    /// simulation.
     fn sync_view(&mut self) {
         self.lot.set_view_rotation(self.view.camera.rotation);
-        let centre = sims_render::screen_centre_pick(
-            &self.lot_shape,
-            &self.view.camera,
-            self.house_view_size(),
-        )
-        .map(|[x, y]| [(x >> 4) as i8, (y >> 4) as i8]);
-        self.lot.set_view_centre(centre);
+        self.sync_view_centre();
     }
 
     /// Resizes the canvas to `size` of the original's pixels.
@@ -643,7 +650,7 @@ impl Game {
             return false;
         }
         self.view.resize(size);
-        self.sync_view();
+        self.sync_view_centre();
         self.hud.resize_menu(size);
         true
     }
@@ -1434,8 +1441,11 @@ impl Game {
                 self.note = Some("The Help System dialog is not ported yet.".into());
                 Outcome::redraw()
             }
-            Command::TogglePanel
-            | Command::OpenPanel(_)
+            Command::TogglePanel => {
+                self.sync_view_centre();
+                Outcome::redraw()
+            }
+            Command::OpenPanel(_)
             | Command::Refused { .. }
             | Command::ShowRelations(_)
             | Command::RelationsPage(_)
@@ -2112,5 +2122,56 @@ mod tests {
 
         // Short windows clamp to at least 1 pixel rather than wrapping.
         assert_eq!(viewport_for_controls([800, 80], &controls), (800, 1));
+    }
+
+    #[test]
+    fn screen_centre_pick_uses_active_viewport_and_native_origin_column() {
+        use sims_render::camera::{Walls, Zoom};
+        use sims_ui::hud::Controls;
+
+        let mut world = sims_sim::World::empty();
+        world.size = 64;
+        let full = sims_render::lot::FULL * sims_render::lot::FULL;
+        for (id, stride) in [(0, 4), (1, 1), (2, 8), (101, 1), (102, 8)] {
+            world.arrays.insert(
+                id,
+                sims_formats::lot::Array {
+                    width: sims_render::lot::FULL,
+                    height: sims_render::lot::FULL,
+                    stride,
+                    encoding: 0,
+                    data: vec![0; full * stride],
+                },
+            );
+        }
+        let lot = sims_render::Lot::from_world(&world).unwrap();
+        let pick_tile = |game_origin: [i32; 2], expanded: bool| {
+            let controls = Controls {
+                expanded,
+                ..Controls::default()
+            };
+            let (w, h) = viewport_for_controls([800, 600], &controls);
+            let camera = Camera {
+                origin: [
+                    game_origin[0].saturating_add(pick::ORIGIN_COLUMN),
+                    game_origin[1],
+                ],
+                zoom: Zoom::Far,
+                rotation: 0,
+                level: 1,
+                walls: Walls::Cutaway,
+                focus: sims_render::Focus::default(),
+            };
+            sims_render::screen_centre_pick(&lot, &camera, [w as i32, h as i32])
+                .map(|[x, y]| [(x >> 4) as i8, (y >> 4) as i8])
+        };
+        // Native origin [400, 0] (game origin [399, 0]): expanded 800x500 picks
+        // [15, 15], collapsed 800x600 picks [18, 18].
+        assert_eq!(pick_tile([399, 0], true), Some([15, 15]));
+        assert_eq!(pick_tile([399, 0], false), Some([18, 18]));
+        // Expanded 800x500: game origin [398, -6] (native [399, -6]) picks
+        // [16, 15], while game origin [399, -6] (native [400, -6]) picks [16, 16].
+        assert_eq!(pick_tile([398, -6], true), Some([16, 15]));
+        assert_eq!(pick_tile([399, -6], true), Some([16, 16]));
     }
 }

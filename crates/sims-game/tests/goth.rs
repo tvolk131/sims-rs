@@ -4282,39 +4282,67 @@ fn camera_moves_sync_the_lots_view_centre_pick() {
         return;
     };
     let mut game = Game::open(&options(install)).expect("the Goth house opens");
-    let expected = |game: &Game| {
+    let expected = |game: &Game, expanded: bool| {
         let shape = sims_render::Lot::from_world(game.lot().world()).unwrap();
-        let house_size = [
-            game.view.size[0],
-            (game.view.size[1] - sims_ui::hud::STRIP).max(1),
-        ];
-        sims_render::screen_centre_pick(&shape, &game.view.camera, house_size)
+        let strip = if expanded { sims_ui::hud::STRIP } else { 0 };
+        let house_size = [game.view.size[0], (game.view.size[1] - strip).max(1)];
+        let mut camera = game.view.camera;
+        camera.origin[0] = camera.origin[0].saturating_add(1);
+        sims_render::screen_centre_pick(&shape, &camera, house_size)
             .map(|[x, y]| [(x >> 4) as i8, (y >> 4) as i8])
     };
     let initial = game.lot().view_centre();
     assert!(initial.is_some(), "opening the house sets view_centre");
-    assert_eq!(initial, expected(&game));
+    assert_eq!(initial, expected(&game, true));
 
     game.apply(Move::Scroll([160, 80]));
-    assert_eq!(game.lot().view_centre(), expected(&game));
+    assert_eq!(game.lot().view_centre(), expected(&game, true));
     assert_ne!(game.lot().view_centre(), initial);
 
     game.apply(Move::Rotate(true));
     assert_eq!(game.lot().view_rotation(), game.view.camera.rotation);
-    assert_eq!(game.lot().view_centre(), expected(&game));
+    assert_eq!(game.lot().view_centre(), expected(&game, true));
 
     game.apply(Move::ZoomIn);
-    assert_eq!(game.lot().view_centre(), expected(&game));
+    assert_eq!(game.lot().view_centre(), expected(&game, true));
 
     game.apply(Move::LevelUp);
-    assert_eq!(game.lot().view_centre(), expected(&game));
+    assert_eq!(game.lot().view_centre(), expected(&game, true));
 
     game.resize([1024, 768]);
-    assert_eq!(game.lot().view_centre(), expected(&game));
+    assert_eq!(game.lot().view_centre(), expected(&game, true));
 
     let mortimer = game.lot().world().selected().expect("a Sim is selected");
     game.centre_on(mortimer);
-    assert_eq!(game.lot().view_centre(), expected(&game));
+    assert_eq!(game.lot().view_centre(), expected(&game, true));
+
+    // Collapsing and re-expanding the control panel changes the active house
+    // viewport height (0x4a7b58) and must re-sync `view_centre`.
+    game.render();
+    let toggle_point = |game: &Game| {
+        game.panel()
+            .iter()
+            .find(|item| item.command == Some(sims_ui::command::Command::TogglePanel))
+            .map(|item| {
+                [
+                    item.rect.x + item.rect.width / 2,
+                    item.rect.y + item.rect.height / 2,
+                ]
+            })
+            .expect("TogglePanel button is laid out")
+    };
+    let before_collapse = game.lot().view_centre();
+    let p = toggle_point(&game);
+    game.press(p);
+    game.release(p);
+    assert_eq!(game.lot().view_centre(), expected(&game, false));
+    assert_ne!(game.lot().view_centre(), before_collapse);
+    game.render();
+    let p = toggle_point(&game);
+    game.press(p);
+    game.release(p);
+    assert_eq!(game.lot().view_centre(), expected(&game, true));
+    assert_eq!(game.lot().view_centre(), before_collapse);
 
     // Restoring a saved game keeps its saved view_centre; no-op and wall-mode
     // camera commands do not overwrite it until camera geometry actually moves.
@@ -4329,5 +4357,5 @@ fn camera_moves_sync_the_lots_view_centre_pick() {
     game.apply(Move::Walls(sims_render::Walls::Down));
     assert_eq!(game.lot().view_centre(), saved_centre);
     assert!(game.apply(Move::Scroll([160, 80])));
-    assert_eq!(game.lot().view_centre(), expected(&game));
+    assert_eq!(game.lot().view_centre(), expected(&game, true));
 }

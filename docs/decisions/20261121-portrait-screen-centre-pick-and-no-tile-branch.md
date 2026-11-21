@@ -111,15 +111,18 @@ items in the dialog portrait path (`0x4e92a8` → `0x4e8c5d` → `0x4e9652`):
      dirty slot would run a second build at `0x4e938c` and a clean slot leaves
      slot 1 empty; both fail loudly.
    - **Runtime-made person types (`0x4265fd` → `0x4e8a3a` → `0x4e8add`):**
-     cloning a character copies every resource from the template
-     (`0x472356`–`0x472519`, including `BMP_` 2002 on shipped `TemplateCat.iff`
-     and `TemplateDog.iff`) into a new writable `User%05d.iff` and calls
-     `0x4e8a3a`, which appends every new `type == 2` definition to the portrait
-     table `0x6f2698` once initialized (`[0x6f26a4] = 1` at `0x4e8a32`).
-     Positive-age pet creation in `Make New Character` additionally calls
-     `0x44b126` → `0x4e8c5d(index, 0x1f, 1)`; because `make_character` does not
-     model that call, an off-lot dialog for a runtime-made pet whose template
-     lacked `BMP_` 2002 fails loudly rather than guessing.
+     cloning a character copies every resource currently in the template's file
+     (`0x472356`–`0x472519`, including load-time `BMP_` 2002 on shipped
+     `TemplateCat.iff` / `TemplateDog.iff` as well as any `BMP_` 2002 saved
+     into a writable template during play) into a new writable `User%05d.iff`
+     and calls `0x4e8a3a`, which appends every new `type == 2` definition to
+     the portrait table `0x6f2698` once initialized (`[0x6f26a4] = 1` at
+     `0x4e8a32`). Positive-age pet creation in `Make New Character`
+     unconditionally calls `0x44b126` → `0x4e8c5d(index, 0x1f, 1)` regardless
+     of whether the cloned template already carried `BMP_` 2002, creating a
+     temporary pet, running `Init`, placing and saving `BMP_` 2002 + populating
+     slot 1 on `Found`, or removing unput (`0x4e9706`) and returning `false`
+     (ignored by `0x44b126`) on `NotFound`.
 
 ## Decision
 
@@ -137,28 +140,30 @@ items in the dialog portrait path (`0x4e92a8` → `0x4e8c5d` → `0x4e9652`):
      fallback and `0x43491c` inverse rotation before `search`'s `0x4349e5`
      clamp. Retain `Lot::replay_view` across `Stop::Asks`, `save`, and
      `restore` so moving the camera while a dialog waits does not alter the
-     tick's replay once answered. Bump `sims_vm::boot::save::FORMAT` from 3 to
-     4.
-   - Wire `sims_game::Game::sync_view` (passing `self.house_view_size()`,
-     matching the house view above the 100-pixel strip) in `open`, `resize`,
-     `centre_on`, `command`, and in `apply` only when camera geometry
-     (`origin`, `zoom`, `rotation`, or `level`) changes so no-op or wall-mode
-     commands preserve a restored pick.
+     tick's replay once answered. Bump `sims_vm::boot::save::FORMAT` from 4
+     (keeping `floor_rotation`) to 5.
+   - Wire `sims_game::Game::sync_view` (passing `self.house_viewport_size()`,
+     reflecting the active expanded vs collapsed control-panel strip, and the
+     native origin column `camera.origin[0] + pick::ORIGIN_COLUMN`) in `open`,
+     `resize`, `centre_on`, `command` (including `Command::TogglePanel`), and
+     in `apply` only when camera geometry (`origin`, `zoom`, `rotation`, or
+     `level`) changes so no-op or wall-mode commands preserve a restored pick.
 2. **Dirty-slot gate, writability, saved bitmaps, and no-tile branch (`sims-sim`, `sims-vm`):**
    - Append `World::dirty_portraits: BTreeSet<u32>` and
      `World::saved_portraits: BTreeSet<u32>` (bumping `sims_sim::SNAPSHOT_FORMAT`
      from 31 to 32, with format 31 as an exact prefix). Mark dirty and clear
      `portraits` on person data writes to words 68, 74, and 84
-     (`0x4538fd`–`0x4539cf`) and on `make_person` when
-     `pd[84]&1 || pd[68]&1 || pd[74]&3` (`0x44e712`); clear dirty when
-     `portraits` is populated (`0x4e899e`).
+     (`0x4538fd`–`0x4539cf`, on `[esi+0x11c]`, the running object's definition)
+     and on `make_person` when `pd[84]&1 || pd[68]&1 || pd[74]&3`
+     (`0x44e712`); clear dirty when `portraits` is populated (`0x4e899e`).
    - Record `Library::has_portrait_bitmap` (`BMP_` 2002 exists and decodes) and
      `Library::writable` (loose file under the `Characters` mount whose
      read-write open succeeds, `0x413094`–`0x4130dd`) in `Program::load`; treat
      runtime-made person types (`World::characters`) as listed (`0x4265fd` →
-     `0x4e8a3a`), writable, and inheriting `has_portrait_bitmap` from their
-     template (`0x472356`–`0x472519`), failing loudly on a runtime-made pet
-     without `BMP_` 2002 (`0x44b126`). Look up `World::saved_portraits` at the
+     `0x4e8a3a`), writable, and inheriting both load-time `has_portrait_bitmap`
+     and any template `BMP_` 2002 saved before cloning (`0x472356`–`0x472519`).
+     Run `0x44b126` → `0x4e8c5d(index, 0x1f, 1)` directly in `make_character`
+     for positive-age pets. Look up `World::saved_portraits` at the
      resource-file level for non-made catalog definitions (`0x4e904e`–`0x4e90ab`,
      `0x4e926a`–`0x4e9287`) and per-GUID for runtime-made characters.
    - Split portrait placement into `portrait_search` (`Found`, `NotFound`,

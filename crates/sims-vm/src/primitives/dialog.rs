@@ -366,8 +366,8 @@ impl Machine<'_, '_> {
     /// 0x4a677c) and puts it there (virtual function 0x88), draws it,
     /// and removes it at once (0x44123f, [`crate::Interpreter::remove_now`]).
     /// The table holds every person type the catalog had when the game
-    /// started (0x4e8b3d); a type made later ([`sims_sim::World::characters`]) may
-    /// not be in it, and fails loudly.
+    /// started (0x4e8b3d) plus every person type made while the game ran
+    /// (`0x4265fd` → `0x4e8a3a`).
     ///
     /// Which entries have their image is kept in [`sims_sim::World::portraits`],
     /// which entries have slot 1's dirty byte (`+0x18`) set is kept in
@@ -442,24 +442,7 @@ impl Machine<'_, '_> {
         // such as TemplateCat.iff / TemplateDog.iff) were copied from the
         // template at 0x472356..0x472519.
         let writable = made.is_some() || library.is_some_and(|library| library.writable);
-        // 0x4e904e..0x4e90ab writes BMP_ 2002 to the type's resource file and
-        // 0x4e926a..0x4e9287 reads it from that same file: a save for any
-        // non-made GUID in `entry.resource` makes BMP_ 2002 available to every
-        // definition sharing that file, whereas each runtime-made character
-        // has its own dedicated `User%05d.iff`.
-        let saved_in_file = if made.is_some() {
-            self.world.saved_portraits.contains(&guid)
-        } else {
-            entry.is_some_and(|entry| {
-                self.world.saved_portraits.iter().any(|&saved| {
-                    !self.world.characters.made.contains_key(&saved)
-                        && self
-                            .catalog
-                            .object(saved)
-                            .is_some_and(|other| other.resource == entry.resource)
-                })
-            })
-        };
+        let saved_in_file = self.file_has_saved_portrait(guid);
         let has_bitmap =
             saved_in_file || library.is_some_and(|library| library.has_portrait_bitmap);
         let dirty = self.world.dirty_portraits.contains(&guid);
@@ -495,27 +478,6 @@ impl Machine<'_, '_> {
                 self.world.dirty_portraits.remove(&guid);
             }
             return Ok(());
-        }
-        // Make New Character's positive-age pet path (0x44b051) calls
-        // 0x44b126 → 0x4e8c5d(index, 0x1f, 1), which is not modeled there.
-        // Shipped TemplateCat/TemplateDog carry BMP_ 2002 (so clean dialogs
-        // already returned above and dirty dialogs already have `has_bitmap`),
-        // but for a custom pet template lacking BMP_ 2002 we cannot tell
-        // whether 0x44b126 populated slot 1 and saved BMP_ 2002.
-        if !has_bitmap
-            && let Some(character) = made
-            && character.strings.get(&12).is_some_and(|g| {
-                g.eq_ignore_ascii_case("dogmale")
-                    || g.eq_ignore_ascii_case("dogfemale")
-                    || g.eq_ignore_ascii_case("catmale")
-                    || g.eq_ignore_ascii_case("catfemale")
-            })
-        {
-            return Err(Trap::Unsupported(format!(
-                "a dialog's portrait of runtime-made pet 0x{guid:08X} without BMP_ 2002: whether \
-                 positive-age Make New Character built and saved its portrait at 0x44b126 \
-                 (0x4e8c5d) is not kept"
-            )));
         }
         let family = i32::from(self.world.globals.get(9).copied().unwrap_or(0));
         if self
@@ -616,6 +578,126 @@ impl Machine<'_, '_> {
         cells.keep(&interpreter, self.world, copy);
         self.world.portraits.insert(guid);
         self.world.dirty_portraits.remove(&guid);
+        Ok(())
+    }
+
+    /// Whether a `BMP_` 2002 portrait was saved during play into the resource
+    /// file holding `guid` (`0x4e904e..0x4e90ab`, `0x4e926a..0x4e9287`): each
+    /// runtime-made character has its own dedicated `User%05d.iff`, while
+    /// catalog definitions sharing a file share any `BMP_` 2002 written to it.
+    pub(crate) fn file_has_saved_portrait(&self, guid: u32) -> bool {
+        if self.world.characters.made.contains_key(&guid) {
+            return self.world.saved_portraits.contains(&guid);
+        }
+        self.catalog.object(guid).is_some_and(|entry| {
+            self.world.saved_portraits.iter().any(|&saved| {
+                !self.world.characters.made.contains_key(&saved)
+                    && self
+                        .catalog
+                        .object(saved)
+                        .is_some_and(|other| other.resource == entry.resource)
+            })
+        })
+    }
+
+    /// Runs `0x44b126` → `0x4e8c5d(index, 0x1f, 1)` at the end of positive-age
+    /// pet creation in `Make New Character`.
+    ///
+    /// Unlike `0x4e92a8`, this calls `0x4e8c5d` unconditionally regardless of
+    /// whether the cloned file already carries `BMP_` 2002 (mask `0x1f`
+    /// includes bit 0, so a found tile populates slot 1 and saves `BMP_` 2002;
+    /// when `0x4347f0` finds no tile, `0x4e9706` removes the person unput and
+    /// `0x4e8c5d` returns `false`, which `0x44b126` ignores, leaving slot 1
+    /// empty and not saving `BMP_` 2002).
+    pub(crate) fn build_pet_portraits(&mut self, guid: u32) -> Result<(), Trap> {
+        if !self.listed_person_type(guid)? {
+            return Ok(());
+        }
+        let made = self.world.characters.made.contains_key(&guid);
+        let entry = crate::interpreter::object_definition(self.catalog, self.world, guid);
+        let library = entry.and_then(|entry| self.program.libraries.get(&entry.resource));
+        let writable = made || library.is_some_and(|library| library.writable);
+        let on_lot = self.world.people.iter().any(|id| {
+            self.world
+                .objects
+                .get(id)
+                .is_some_and(|object| object.guid == guid)
+        });
+        if on_lot {
+            if writable {
+                self.world.saved_portraits.insert(guid);
+            }
+            self.world.portraits.insert(guid);
+            self.world.dirty_portraits.remove(&guid);
+            return Ok(());
+        }
+        if !writable {
+            return Ok(());
+        }
+        let family = i32::from(self.world.globals.get(9).copied().unwrap_or(0));
+        if self
+            .world
+            .families
+            .iter()
+            .any(|f| f.id == family && f.members.contains(&guid))
+        {
+            return Err(Trap::Unsupported(format!(
+                "building a pet portrait of household type 0x{guid:08X} with nobody of it \
+                 on the lot (0x44b126, 0x4e9652): whether the household's panel built it \
+                 before is not kept"
+            )));
+        }
+        let interpreter = self.interpreter();
+        let unsupported = |fault| {
+            Trap::Unsupported(format!(
+                "making a person of type 0x{guid:08X} for Make New Character's pet portrait \
+                 (0x44b126, 0x4e9652): {fault}"
+            ))
+        };
+        let mut copy = self.world.clone();
+        let cells = crate::both_ways::Cells::of(&interpreter);
+        {
+            let built = cells.on(&interpreter);
+            let id = built.create_person(&mut copy, guid).map_err(unsupported)?;
+            let found = built
+                .portrait_search(&mut copy, id)
+                .map_err(|fault| fault.trap)?;
+            match found {
+                crate::placement::PortraitSearch::Found(tiles) => {
+                    built
+                        .portrait_place(&copy, id, &tiles)
+                        .map_err(|fault| fault.trap)?;
+                    built.remove_now(&mut copy, id).map_err(unsupported)?;
+                    copy.saved_portraits.insert(guid);
+                    copy.portraits.insert(guid);
+                    copy.dirty_portraits.remove(&guid);
+                }
+                crate::placement::PortraitSearch::NotFound { .. } => {
+                    // 0x4e9706 removes unput and returns NULL → 0x4e8c5d
+                    // returns false without storing slot 1 or saving BMP_ 2002;
+                    // 0x44b126 ignores the return value.
+                    built.remove_now(&mut copy, id).map_err(unsupported)?;
+                }
+                crate::placement::PortraitSearch::Mixed {
+                    no_tile_description,
+                    ..
+                } => {
+                    return Err(Trap::Unsupported(format!(
+                        "Make New Character's pet portrait build (0x44b126, 0x4e8c5d, 0x4e9652) \
+                         for type 0x{guid:08X} depends on the house view's centre \
+                         (`Lot::set_view_centre`), and {no_tile_description}: placing populates \
+                         slot 1 and saves BMP_ 2002 while removing unput (0x4e9706) does neither"
+                    )));
+                }
+            }
+        }
+        if !cells.same_refresh(&crate::both_ways::Cells::of(&interpreter)) {
+            return Err(Trap::Unsupported(format!(
+                "making a person of type 0x{guid:08X} for Make New Character's pet portrait \
+                 (0x44b126, 0x4e9652) changed the refresh pending, which is not ported"
+            )));
+        }
+        cells.keep(&interpreter, self.world, copy);
         Ok(())
     }
 

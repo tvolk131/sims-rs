@@ -205,19 +205,7 @@ fn a_runtime_made_person_type_is_listed_in_the_portrait_table() {
     assert_eq!(fx.world.saved_portraits, [MADE_GUID].into());
     assert_ne!(rest(&fx), before);
 
-    // 3. Positive-age runtime-made pet whose template lacks BMP_ 2002:
-    //    Make New Character does not model 0x44b126 → 0x4e8c5d(index, 0x1f, 1),
-    //    so fail loudly rather than guessing whether BMP_ 2002 was saved.
-    let (mut fx_pet, _, _) = visitors();
-    let pet_record = attach_made(&mut fx_pet, [(12usize, "catmale".to_string())].into());
-    let fault = inform(&mut fx_pet, 2, pet_record).unwrap_err().to_string();
-    assert!(
-        fault.contains("0x44b126") && fault.contains("0x4e8c5d"),
-        "{fault}"
-    );
-    assert!(fx_pet.world.portraits.is_empty());
-
-    // 4. On-lot: builds directly with zero temporary persons and records
+    // 3. On-lot: builds directly with zero temporary persons and records
     //    MADE_GUID (not its template GUID).
     let (mut fx_on, _, _) = visitors();
     fx_on.world.characters.made.insert(
