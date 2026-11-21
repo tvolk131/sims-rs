@@ -490,14 +490,15 @@ impl Machine<'_, '_> {
                 {
                     // 0x474aae catches any native SimAntics error (including
                     // Sleep yield 0x44f and explicit error branch 0xfd / 0x44c)
-                    // on the visitor's thread, records it via 0x439a4e
-                    // (setting scheduler flag CHECK_ERROR = 4), and returns to
-                    // 0x44e87c. Without modeling the deferred visitor error
-                    // word we trap loudly, except when flags 0x02|0x10 are
+                    // on the visitor's thread, records the error word and calls
+                    // 0x439a4e (setting scheduler flag CHECK_ERROR = 4), and
+                    // returns to 0x44e87c. Without a serialized error word on
+                    // `Object` we trap loudly, except when flags 0x02|0x10 are
                     // both set: native immediately raises 0x36 on the caller
-                    // at 0x44e89c. Mark the visitor with CHECK_ERROR and clear
-                    // its stack so the failed "init visitor" frame can never
-                    // resume on a later turn or scheduler pass.
+                    // at 0x44e89c. Mark the visitor with CHECK_ERROR and drop
+                    // its live frames (keeping frame-storage metadata in sync
+                    // so play-mode recovery can reset the visitor cleanly) so
+                    // the failed "init visitor" frame can never resume.
                     let flag_conflict = flags & (PASS_ME_AND_STACK | TEMP_0_TO_NEW)
                         == (PASS_ME_AND_STACK | TEMP_0_TO_NEW);
                     let native_error =
@@ -511,6 +512,11 @@ impl Machine<'_, '_> {
                     if let Some(visitor) = self.world.objects.get_mut(&created) {
                         visitor.set_flags(CHECK_ERROR, true);
                         visitor.stack.clear();
+                    }
+                    if let Some(storage) = self.world.frame_storage.get_mut(&created) {
+                        storage.offsets.clear();
+                        storage.unknown.clear();
+                        storage.restarts = storage.restarts.wrapping_add(1);
                     }
                 }
             }

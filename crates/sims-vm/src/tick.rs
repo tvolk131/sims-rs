@@ -475,9 +475,12 @@ impl Interpreter<'_> {
     /// highest ID it saw when it started; an object made during the pass
     /// with a higher ID waits for the next pass. For each object:
     ///
-    /// 1. If its scheduler flags have bit 2 (value 4), the pass would stop
-    ///    on an object with an error (object word 0x28); no object holds
-    ///    one here, so the flag is just cleared.
+    /// 1. If its scheduler flags have bit 2 (value 4), the pass checks for
+    ///    a deferred thread error (`0x46d5da` → `0x439a6f`), represented here
+    ///    by a ready object whose stack was cleared when `0x474aae` caught an
+    ///    error on another thread (stopping the pass and recovering in play
+    ///    mode, or failing loudly in strict mode); otherwise the flag is
+    ///    cleared.
     /// 2. Without flag 1 it is skipped, and in a partial pass so is one
     ///    without flag 2.
     /// 3. A countdown above 0 is counted down by 1. Otherwise the object

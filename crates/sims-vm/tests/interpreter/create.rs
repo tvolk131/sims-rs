@@ -952,6 +952,25 @@ fn flag_0x02_passes_me_and_caller_stack_object_to_new_bottom_frame() {
     );
     assert_ne!(fx.world.objects[&id].flags() & 4, 0);
     assert_eq!(fx.world.globals[37], 0);
+    // In play mode, the scheduler stops the pass and cleanly resets the
+    // visitor (Recovery::Reset, not Parked) without executing node 3.
+    fx.world.objects.get_mut(&SIM).unwrap().selected = true;
+    fx.world.scheduler_cursor = id as i16;
+    let mut play = sims_vm::play::Play::default();
+    let mut player = sims_vm::Answers::choices(&[]);
+    let (update, result) = vm.lot_update_kept(
+        &mut fx.world,
+        &crate::tick::tuning(),
+        &mut player,
+        Some(&mut play),
+    );
+    assert_eq!(result, Ok(()));
+    assert!(!update.full);
+    assert_eq!(update.errors.len(), 1);
+    assert_eq!(update.errors[0].object, id);
+    assert_eq!(update.errors[0].recovery, sims_vm::play::Recovery::Reset);
+    assert_eq!(fx.world.objects[&id].stack.len(), 1);
+    assert_eq!(fx.world.globals[37], 0);
 
     // Explicit error branch (0xfd -> native 0x44c) in "init visitor" under
     // 0x16 also delivers 0x36 to the caller and leaves the visitor unable to
@@ -996,6 +1015,25 @@ fn flag_0x02_passes_me_and_caller_stack_object_to_new_bottom_frame() {
         "{pass:?}"
     );
     assert_ne!(fx.world.objects[&id].flags() & 4, 0);
+    assert_eq!(fx.world.globals[37], 0);
+    // In play mode, the scheduler stops the pass and cleanly resets the
+    // visitor (Recovery::Reset, not Parked) without executing node 3.
+    fx.world.objects.get_mut(&SIM).unwrap().selected = true;
+    fx.world.scheduler_cursor = id as i16;
+    let mut play = sims_vm::play::Play::default();
+    let mut player = sims_vm::Answers::choices(&[]);
+    let (update, result) = vm.lot_update_kept(
+        &mut fx.world,
+        &crate::tick::tuning(),
+        &mut player,
+        Some(&mut play),
+    );
+    assert_eq!(result, Ok(()));
+    assert!(!update.full);
+    assert_eq!(update.errors.len(), 1);
+    assert_eq!(update.errors[0].object, id);
+    assert_eq!(update.errors[0].recovery, sims_vm::play::Recovery::Reset);
+    assert_eq!(fx.world.objects[&id].stack.len(), 1);
     assert_eq!(fx.world.globals[37], 0);
 
     let (mut fx, _) = container();
