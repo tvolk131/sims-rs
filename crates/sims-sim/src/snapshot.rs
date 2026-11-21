@@ -10,6 +10,11 @@ const SNAPSHOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshots"
 /// the lot's own state, kept as its bytes.
 const LOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("lots");
 
+/// Saved `HOUS 0` camera rotation (`0..=3`) for a named world snapshot, so a
+/// viewer drawing a snapshot knows which rotation its level-1 road-dash tiles
+/// (`10` and `11`) are oriented for even when opened with another house's art.
+const FLOOR_ROTATIONS: TableDefinition<&str, u8> = TableDefinition::new("floor_rotations");
+
 /// Bumped whenever [`World`]'s encoding changes, so an old snapshot is
 /// refused instead of misread.
 pub const FORMAT: u32 = 31;
@@ -31,7 +36,8 @@ impl Snapshots {
         })
     }
 
-    /// Saves `world` under `name`, replacing any snapshot of that name.
+    /// Saves `world` under `name`, replacing any snapshot of that name and
+    /// clearing any floor rotation recorded for an earlier snapshot of `name`.
     pub fn save(&self, name: &str, world: &World) -> Result<()> {
         let mut value = FORMAT.to_le_bytes().to_vec();
         value.extend(world.encode());
@@ -40,12 +46,44 @@ impl Snapshots {
             let mut table = txn.open_table(SNAPSHOTS).map_err(store)?;
             table.insert(name, value.as_slice()).map_err(store)?;
         }
+        {
+            let mut rotations = txn.open_table(FLOOR_ROTATIONS).map_err(store)?;
+            rotations.remove(name).map_err(store)?;
+        }
+        txn.commit().map_err(store)
+    }
+
+    /// Saves `world` under `name` together with the `HOUS 0` camera rotation
+    /// (`floor_rotation & 3`) that its level-1 road-dash floor tiles (`10` and
+    /// `11`) are oriented for (`0x4a8042`, `0x4a861f`).
+    pub fn save_with_floor_rotation(
+        &self,
+        name: &str,
+        world: &World,
+        floor_rotation: u8,
+    ) -> Result<()> {
+        let mut value = FORMAT.to_le_bytes().to_vec();
+        value.extend(world.encode());
+        let txn = self.db.begin_write().map_err(store)?;
+        {
+            let mut table = txn.open_table(SNAPSHOTS).map_err(store)?;
+            table.insert(name, value.as_slice()).map_err(store)?;
+        }
+        {
+            let mut rotations = txn.open_table(FLOOR_ROTATIONS).map_err(store)?;
+            rotations.insert(name, floor_rotation & 3).map_err(store)?;
+        }
         txn.commit().map_err(store)
     }
 
     /// The snapshot saved under `name`, if any.
     pub fn load(&self, name: &str) -> Result<Option<World>> {
         load(&self.db, name)
+    }
+
+    /// The `HOUS 0` floor rotation (`0..=3`) recorded alongside `name`, if any.
+    pub fn load_floor_rotation(&self, name: &str) -> Result<Option<u8>> {
+        load_floor_rotation(&self.db, name)
     }
 
     /// Keeps a saved lot's bytes under `name`, replacing any of that name.
@@ -98,6 +136,22 @@ impl ReadOnlySnapshots {
     pub fn load(&self, name: &str) -> Result<Option<World>> {
         load(&self.db, name)
     }
+
+    /// The `HOUS 0` floor rotation (`0..=3`) recorded alongside `name`, if any,
+    /// as [`Snapshots::load_floor_rotation`].
+    pub fn load_floor_rotation(&self, name: &str) -> Result<Option<u8>> {
+        load_floor_rotation(&self.db, name)
+    }
+}
+
+fn load_floor_rotation(db: &impl ReadableDatabase, name: &str) -> Result<Option<u8>> {
+    let txn = db.begin_read().map_err(store)?;
+    let table = match txn.open_table(FLOOR_ROTATIONS) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(error) => return Err(store(error)),
+    };
+    Ok(table.get(name).map_err(store)?.map(|v| v.value() & 3))
 }
 
 fn load(db: &impl ReadableDatabase, name: &str) -> Result<Option<World>> {

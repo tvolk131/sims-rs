@@ -35,7 +35,7 @@ use sims_render::{Canvas, Lot, Walls, draw, open_house, png};
 use softbuffer::{Context, Surface};
 use std::ffi::OsString;
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use view::{Command, View};
 use winit::application::ApplicationHandler;
@@ -393,7 +393,7 @@ impl ApplicationHandler for Viewer {
 /// first tick, or None, with the reason printed, when the load does not
 /// complete: a house nobody lives in, or a step-13 visit that is not
 /// ported. The viewer then shows the house file as it was saved.
-fn booted(options: &Options) -> Option<sims_sim::World> {
+fn booted(options: &Options) -> Option<(sims_sim::World, u8)> {
     let frames = sims_vm::boot::Frames {
         after: Vec::new(),
         every: Vec::new(),
@@ -413,8 +413,31 @@ fn booted(options: &Options) -> Option<sims_sim::World> {
             eprintln!("the load stopped at step 13 ({stop}); {fallback}");
             None
         }
-        Ok(lot) => Some(lot.world().clone()),
+        Ok(lot) => Some((lot.world().clone(), lot.floor_rotation())),
     }
+}
+
+/// Loads a named world snapshot and its saved `HOUS 0` floor rotation (falling
+/// back to `fallback_rotation` for snapshots written before floor rotations
+/// were stored alongside worlds).
+fn load_snapshot(
+    path: &Path,
+    name: &str,
+    fallback_rotation: u8,
+) -> Result<(sims_sim::World, u8), Box<dyn std::error::Error>> {
+    // Opening a snapshot store creates it if it is missing, so check
+    // first rather than leave an empty file behind a mistyped path.
+    if !path.is_file() {
+        return Err(format!("no snapshot file at {}", path.display()).into());
+    }
+    let store = sims_sim::Snapshots::open(path)?;
+    let world = store
+        .load(name)?
+        .ok_or_else(|| format!("{} holds no world named {name}", path.display()))?;
+    let floor_rotation = store
+        .load_floor_rotation(name)?
+        .unwrap_or(fallback_rotation);
+    Ok((world, floor_rotation))
 }
 
 /// Builds the viewer's render [`Lot`] with the house file's saved `HOUS 0`
@@ -428,21 +451,14 @@ fn viewer_lot(world: &sims_sim::World, rotation: u8) -> sims_render::Result<Lot>
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = options()?;
     let opened = open_house(&options.install, &options.house)?;
-    let world = match &options.snapshot {
-        // Opening a snapshot store creates it if it is missing, so check
-        // first rather than leave an empty file behind a mistyped path.
-        Some((path, _)) if !path.is_file() => {
-            return Err(format!("no snapshot file at {}", path.display()).into());
-        }
-        Some((path, name)) => sims_sim::Snapshots::open(path)?
-            .load(name)?
-            .ok_or_else(|| format!("{} holds no world named {name}", path.display()))?,
+    let (world, floor_rotation) = match &options.snapshot {
+        Some((path, name)) => load_snapshot(path, name, opened.rotation)?,
         // The panel shows what the load's steps 17 and 18 set: the
         // family's funds and its first member selected.
-        None if options.hud => booted(&options).unwrap_or(opened.world),
-        None => opened.world,
+        None if options.hud => booted(&options).unwrap_or((opened.world, opened.rotation)),
+        None => (opened.world, opened.rotation),
     };
-    let lot = viewer_lot(&world, opened.rotation)?;
+    let lot = viewer_lot(&world, floor_rotation)?;
     let hud = if options.hud {
         Some(hud::Hud::open(
             &options.install,
@@ -453,7 +469,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    let view = View::new([1024, 768], lot.built_center(), opened.rotation);
+    let view = View::new([1024, 768], lot.built_center(), floor_rotation);
     let mut viewer = Viewer {
         world,
         lot,
@@ -543,5 +559,109 @@ mod tests {
             &mut expected,
         );
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn viewer_snapshot_uses_snapshots_floor_rotation_not_art_houses() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            eprintln!("skipping: set SIMS_INSTALL to check --snapshot floor rotation");
+            return;
+        };
+        let house05 = root.join("UserData/Houses/House05.iff");
+        let house24 = root.join("UserData/Houses/House24.iff");
+        let booted_h05 = sims_vm::boot::Lot::load(
+            &root,
+            &house05,
+            &[3],
+            sims_vm::boot::Frames {
+                after: Vec::new(),
+                every: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(booted_h05.floor_rotation(), 0);
+
+        let snap_path = std::env::temp_dir().join(format!(
+            "sims-viewer-snapshot-floor-rot-{}.redb",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&snap_path);
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(snap_path.clone());
+
+        {
+            let store = sims_sim::Snapshots::open(&snap_path).unwrap();
+            store
+                .save_with_floor_rotation("boot", booted_h05.world(), booted_h05.floor_rotation())
+                .unwrap();
+            store.save("legacy", booted_h05.world()).unwrap();
+        }
+
+        // Open House24 (saved at rotation 1) as the art house and draw House05's
+        // boot snapshot (saved at rotation 0) across all four camera rotations.
+        let mut h24 = open_house(&root, &house24).unwrap();
+        assert_eq!(h24.rotation, 1);
+
+        let (world, floor_rotation) = load_snapshot(&snap_path, "boot", h24.rotation).unwrap();
+        assert_eq!(floor_rotation, 0);
+        let lot = viewer_lot(&world, floor_rotation).unwrap();
+        assert_eq!(lot.floor_rotation, 0);
+
+        // Legacy snapshots without a recorded rotation fall back to the art house.
+        let (_, legacy_rotation) = load_snapshot(&snap_path, "legacy", h24.rotation).unwrap();
+        assert_eq!(legacy_rotation, h24.rotation);
+
+        // Tile (46, 5) holds stored floor 11 on House05's Y-road. With House24's
+        // rotation (1) erroneously used as the baseline, all four camera rotations
+        // draw the perpendicular dash.
+        let cell = Lot::cell(46, 5);
+        assert_eq!(lot.levels[0].floors[cell], 11);
+        let wrong_lot = lot.clone().with_floor_rotation(h24.rotation);
+        let elev = i32::from(lot.heights[cell][0]) * 16;
+
+        for rotation in 0u8..4 {
+            let mut camera = View::new([160, 100], lot.built_center(), rotation).camera;
+            camera.zoom = sims_render::Zoom::Near;
+            camera.level = 1;
+            camera.walls = Walls::Down;
+            camera.origin = [0, 0];
+            let p = camera.project_fine(camera.rotate_fine([46 * 16 + 8, 5 * 16 + 8]), 1, elev);
+            camera.origin = [80 - p[0], 50 - p[1]];
+
+            let mut actual = Canvas::new(160, 100, [0, 0, 0]);
+            draw(&world, &lot, &mut h24.assets, &camera, &mut actual);
+
+            let mut wrong = Canvas::new(160, 100, [0, 0, 0]);
+            draw(&world, &wrong_lot, &mut h24.assets, &camera, &mut wrong);
+            assert_ne!(
+                actual, wrong,
+                "rotation {rotation} should differ from wrong art-house baseline"
+            );
+
+            let mut expected_lot = lot.clone().with_floor_rotation(0);
+            if rotation & 1 == 1 {
+                for id in &mut expected_lot.levels[0].floors {
+                    if matches!(*id, 10 | 11) {
+                        *id ^= 1;
+                    }
+                }
+            }
+            // Bypass swap on expected_lot by matching floor_rotation to camera.rotation.
+            expected_lot.floor_rotation = rotation;
+            let mut expected = Canvas::new(160, 100, [0, 0, 0]);
+            draw(
+                &world,
+                &expected_lot,
+                &mut h24.assets,
+                &camera,
+                &mut expected,
+            );
+            assert_eq!(actual, expected, "rotation {rotation} road dashes mismatch");
+        }
     }
 }

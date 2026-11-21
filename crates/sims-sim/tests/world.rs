@@ -1367,6 +1367,32 @@ fn saved_lots_round_trip_through_redb_apart_from_the_snapshots() {
     assert!(store.load_lot("missing").unwrap().is_none());
 }
 
+#[test]
+fn snapshot_floor_rotations_round_trip_and_clear_on_plain_save() {
+    let file = Temp::new("snapshot-floor-rot");
+    let world = world();
+    {
+        let store = Snapshots::open(&file.0).unwrap();
+        assert_eq!(store.load_floor_rotation("boot").unwrap(), None);
+        store.save_with_floor_rotation("boot", &world, 5).unwrap();
+        store.save("plain", &world).unwrap();
+    }
+    {
+        let ro = ReadOnlySnapshots::open(&file.0).unwrap();
+        assert_eq!(ro.load_floor_rotation("boot").unwrap(), Some(1));
+        assert_eq!(ro.load_floor_rotation("plain").unwrap(), None);
+        assert_eq!(ro.load_floor_rotation("missing").unwrap(), None);
+        assert_eq!(ro.load("boot").unwrap().unwrap().encode(), world.encode());
+    }
+    // Overwriting a named snapshot with plain save clears any earlier floor rotation.
+    {
+        let store = Snapshots::open(&file.0).unwrap();
+        assert_eq!(store.load_floor_rotation("boot").unwrap(), Some(1));
+        store.save("boot", &world).unwrap();
+        assert_eq!(store.load_floor_rotation("boot").unwrap(), None);
+    }
+}
+
 fn person() -> sims_formats::saved_objects::Person {
     let interaction = sims_formats::saved_objects::Interaction {
         join: 0,

@@ -430,10 +430,11 @@ fn residential(world: &World, program: &Program) -> bool {
 }
 
 /// The rotation a house opens at: the camera direction its file saved
-/// (the HOUS chunk), as the render track opens the view
-/// (`sims_render::open_house`). That the original's load turns the scene
-/// (0x6e5528, +0x84) to it is not traced; the comparison harness saw the
-/// Goth house (`House05.iff`, which saved 0) open at rotation 0.
+/// (`HOUS 0`, `0x4a87b1`–`0x4a87dc`), as the render track opens the view
+/// (`sims_render::open_house`). On load, the original calls `0x4a7dfe` at
+/// `0x4a861f` with `force_no_swap = 1`, which turns the scene
+/// (`[0x6e5528] + 0x84` via `0x4791a6`) to that direction without swapping
+/// road-dash floors.
 pub fn opening_rotation(file: &House) -> u8 {
     file.view
         .as_ref()
