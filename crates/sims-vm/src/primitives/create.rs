@@ -114,6 +114,10 @@ const FACE_AS_STACK_OBJECT: u8 = 0x20;
 /// (0x44e564 to 0x44e577).
 const IGNORE_ROOM_AND_WALL: u8 = 0x40;
 
+/// Scheduler flag 4 (`0x439a4e`, `0x46d5da`): set when a thread error is
+/// caught (`0x474aae`).
+const CHECK_ERROR: u16 = 4;
+
 /// Person data word 32 (+0x5cc): nonzero for a visitor.
 const VISITOR: usize = 32;
 
@@ -387,10 +391,14 @@ impl Machine<'_, '_> {
         let words = self.definition_words(guid)?;
         let person = words[TYPE] == PERSON && words[GROUP] == 0;
         let created = if person {
-            self.make_person(guid)?
+            let Some(id) = self.make_person(guid)? else {
+                // 0x44e5d8: native person factory returned 0 (0x440dd5).
+                return Ok(false);
+            };
+            id
         } else {
             let Some(id) = self.make(guid)? else {
-                // 0x44e5d8: native factory returned 0 (0x440b90 / 0x440c9b).
+                // 0x44e5d8: native factory returned 0 (0x440b90 / 0x440c9b / 0x4409f2).
                 return Ok(false);
             };
             id
@@ -480,19 +488,29 @@ impl Machine<'_, '_> {
                         self.checking,
                     )
                 {
-                    // 0x474aae catches a native error from "init visitor" on
-                    // the visitor's thread and returns to 0x44e87c. Without
-                    // modeling that visitor error handler we trap loudly,
-                    // except when flags 0x02|0x10 are both set: native
-                    // immediately raises 0x36 on the caller at 0x44e89c
-                    // regardless of the visitor fault.
+                    // 0x474aae catches any native SimAntics error (including
+                    // Sleep yield 0x44f and explicit error branch 0xfd / 0x44c)
+                    // on the visitor's thread, records it via 0x439a4e
+                    // (setting scheduler flag CHECK_ERROR = 4), and returns to
+                    // 0x44e87c. Without modeling the deferred visitor error
+                    // word we trap loudly, except when flags 0x02|0x10 are
+                    // both set: native immediately raises 0x36 on the caller
+                    // at 0x44e89c. Mark the visitor with CHECK_ERROR and clear
+                    // its stack so the failed "init visitor" frame can never
+                    // resume on a later turn or scheduler pass.
                     let flag_conflict = flags & (PASS_ME_AND_STACK | TEMP_0_TO_NEW)
                         == (PASS_ME_AND_STACK | TEMP_0_TO_NEW);
-                    if !(flag_conflict && fault.trap.code().is_some()) {
+                    let native_error =
+                        !fault.trap.unported() && !matches!(fault.trap, Trap::Invalid(_));
+                    if !(flag_conflict && native_error) {
                         return Err(fault.unsupported_in(format!(
                             "Create New Object Instance: the \"init visitor\" tree \
                              {tree:#06x} of person {created}"
                         )));
+                    }
+                    if let Some(visitor) = self.world.objects.get_mut(&created) {
+                        visitor.set_flags(CHECK_ERROR, true);
+                        visitor.stack.clear();
                     }
                 }
             }
@@ -577,14 +595,17 @@ impl Machine<'_, '_> {
     /// next dialog's portrait of the type builds it again
     /// ([`sims_sim::World::portraits`], 0x4e92a8). The redraw it asks for
     /// (0x4ceceb) is presentation.
-    fn make_person(&mut self, guid: u32) -> Result<u16, Trap> {
+    fn make_person(&mut self, guid: u32) -> Result<Option<u16>, Trap> {
         let interpreter = self.interpreter();
         let unsupported = |fault: crate::fault::Fault| {
             fault.unsupported_in(format!("creating a person of type 0x{guid:08X}"))
         };
-        let id = interpreter
-            .create_person(self.world, guid)
-            .map_err(unsupported)?;
+        let Some(id) = interpreter
+            .try_create_person(self.world, guid)
+            .map_err(unsupported)?
+        else {
+            return Ok(None);
+        };
         interpreter.attach_traits(self.world, id).map_err(|trap| {
             unsupported(crate::fault::Fault {
                 object: id,
@@ -603,7 +624,7 @@ impl Machine<'_, '_> {
         if word(84) & 1 != 0 || word(68) & 1 != 0 || word(74) & 3 != 0 {
             self.world.portraits.remove(&guid);
         }
-        Ok(id)
+        Ok(Some(id))
     }
 
     /// Flag 0x1's test (0x44e4e1 to 0x44e51c): whether an object of type
@@ -636,7 +657,7 @@ impl Machine<'_, '_> {
 
     /// Flag 0x8's test (0x44e51e to 0x44e541): whether any object stands
     /// on the tile of `position` at `level`. The original starts the walk
-    /// flag 0x1's test makes ([`standing_on`], 0x43f331) and reads only
+    /// flag 0x1's test makes ([`Cursor`], 0x43f331) and reads only
     /// its first object, the tile's first ([`head`]), so nothing past it is
     /// looked at.
     fn anything_on_tile(&self, position: [i32; 2], level: i32) -> Result<bool, Trap> {

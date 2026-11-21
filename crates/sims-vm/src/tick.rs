@@ -532,6 +532,32 @@ impl Interpreter<'_> {
                 continue;
             };
             if object.flags() & CHECK_ERROR != 0 {
+                if object.flags() & READY != 0 && object.stack.is_empty() {
+                    // 0x46d5da -> 0x46d68c -> 0x439a6f: a deferred thread
+                    // error recorded by 0x474aae (such as a faulted "init
+                    // visitor") stops the pass and resets the object instead
+                    // of running its tick.
+                    let fault = Fault {
+                        object: id,
+                        at: None,
+                        trap: Trap::Unsupported(format!(
+                            "object {id} has a deferred thread error (0x46d5da -> 0x439a6f)"
+                        )),
+                    };
+                    if let Some(play) = play.as_deref_mut() {
+                        let recovery = self.recover(world, id, play);
+                        update.errors.push(ScriptError {
+                            tick: world.ticks,
+                            object: id,
+                            fault,
+                            in_thread: true,
+                            then: None,
+                            recovery,
+                        });
+                        return Ok(false);
+                    }
+                    return Err(fault.into());
+                }
                 object.set_flags(CHECK_ERROR, false);
             }
             let flags = object.flags();

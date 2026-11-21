@@ -104,24 +104,28 @@ impl Interpreter<'_> {
     }
 
     /// Like [`Self::create`], but returns `Ok(None)` when the native factory
-    /// makes nothing and returns 0 (`0x440b90` non-master group member or
-    /// `0x440c9b` group master with no lead tile).
+    /// makes nothing and returns 0 (`0x440b90` non-master group member,
+    /// `0x440c9b` group master with no lead tile, or `0x4409f2` -> `0x440df3`
+    /// ungrouped definition types 8 and 9).
     pub(crate) fn try_create(&self, world: &mut World, guid: u32) -> Result<Option<u16>, Fault> {
         let fail = |object, trap| Fault {
             object,
             at: None,
             trap,
         };
-        let group = self
+        let words = self
             .machine(world, 0, 0, false)
             .definition_words(guid)
-            .map_err(|trap| fail(0, trap))?[word::GROUP];
-        if group != 0 {
+            .map_err(|trap| fail(0, trap))?;
+        if words[word::GROUP] != 0 {
             let Some(lead) = self.try_create_group(world, guid)? else {
                 return Ok(None);
             };
             self.finish_created_group(world, lead)?;
             return Ok(Some(lead));
+        }
+        if matches!(words[word::TYPE], 8 | 9) {
+            return Ok(None);
         }
         self.create_single(world, guid).map(Some)
     }

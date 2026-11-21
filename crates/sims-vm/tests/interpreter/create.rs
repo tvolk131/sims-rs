@@ -882,8 +882,10 @@ fn flag_0x02_passes_me_and_caller_stack_object_to_new_bottom_frame() {
     assert_eq!(fx.lamp().stack[0].stack_object, SIM as i16);
 
     // Combined with 0x04 on a visitor: "init visitor" runs before 0x36, and
-    // even if "init visitor" yields (0x44f, caught by 0x474aae on the
-    // visitor's thread), the caller still receives 0x36 (0x44e89c).
+    // if "init visitor" yields (0x44f) or takes an explicit error branch
+    // (0xfd / 0x44c), 0x474aae records CHECK_ERROR (flag 4) on the visitor
+    // and returns to 0x44e87c, so the caller still receives 0x36 (0x44e89c)
+    // and later turns never resume "init visitor".
     let (mut fx, _, record) = crate::create_person::visitors();
     let before = ids(&fx);
     assert_eq!(
@@ -895,15 +897,36 @@ fn flag_0x02_passes_me_and_caller_stack_object_to_new_bottom_frame() {
     assert_eq!(fx.world.globals[36], id as i16);
     assert_eq!(fx.lamp().stack[0].stack_object, record);
 
+    // Genuine Sleep yield (0x44f): parameter 0 holds 10 ticks, node 2 sleeps
+    // on parameter 0, and node 3 (unreachable after the fault) would write
+    // global 37.
+    let yielding_init_visitor = || {
+        shaped(
+            0x8002,
+            0,
+            1,
+            0,
+            vec![
+                assign(scope::GLOBAL, 36, scope::STACK_OBJECT, 0, 1),
+                assign(scope::PARAMETERS, 0, scope::LITERAL, 10, 2),
+                ins(0, 3, ERROR, [0, 0, 0, 0, 0, 0, 0, 0]),
+                assign(scope::GLOBAL, 37, scope::LITERAL, 99, RETURN_TRUE),
+            ],
+        )
+    };
+    // Confirm the fixture genuinely raises 0x44f (not 0x08) without 0x12.
     let (mut fx, file, record) = crate::create_person::visitors();
-    fx.add(
-        file,
-        4099,
-        tree(vec![
-            assign(scope::GLOBAL, 36, scope::STACK_OBJECT, 0, 1),
-            ins(0, RETURN_TRUE, RETURN_FALSE, [10, 0, 0, 0, 0, 0, 0, 0]),
-        ]),
+    fx.add(file, 4099, yielding_init_visitor());
+    let fault = create_guid(&mut fx, 0, 5, 0x04, record).unwrap_err();
+    assert!(
+        matches!(&fault.trap, Trap::Unsupported(m) if m.contains("0x44f")),
+        "{fault}"
     );
+    // With 0x16, caller receives 0x36 and the visitor is marked CHECK_ERROR
+    // with an empty stack so subsequent turns never execute node 3.
+    let (mut fx, file, record) = crate::create_person::visitors();
+    fx.add(file, 4099, yielding_init_visitor());
+    fx.world.globals[37] = 0;
     let before = ids(&fx);
     assert_eq!(
         code(create_guid(&mut fx, 0, 5, 0x04 | 0x02 | 0x10, record)),
@@ -913,6 +936,67 @@ fn flag_0x02_passes_me_and_caller_stack_object_to_new_bottom_frame() {
     assert_eq!(fx.world.objects[&id].position, [40, 40, 1]);
     assert_eq!(fx.world.globals[36], id as i16);
     assert_eq!(fx.lamp().stack[0].stack_object, record);
+    assert_ne!(fx.world.objects[&id].flags() & 4, 0);
+    assert!(fx.world.objects[&id].stack.is_empty());
+    let vm = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    assert!(vm.turn(&mut fx.world, id, 1000).is_err());
+    fx.world.scheduler_cursor = id as i16;
+    let pass = vm.scheduler_pass(
+        &mut fx.world,
+        &crate::tick::tuning(),
+        &mut sims_vm::Update::default(),
+    );
+    assert!(
+        matches!(pass, Err(sims_vm::TickError::Fault(ref f)) if f.object == id && f.to_string().contains("0x46d5da")),
+        "{pass:?}"
+    );
+    assert_ne!(fx.world.objects[&id].flags() & 4, 0);
+    assert_eq!(fx.world.globals[37], 0);
+
+    // Explicit error branch (0xfd -> native 0x44c) in "init visitor" under
+    // 0x16 also delivers 0x36 to the caller and leaves the visitor unable to
+    // resume node 2.
+    let (mut fx, file, record) = crate::create_person::visitors();
+    fx.add(
+        file,
+        4099,
+        tree(vec![
+            assign(scope::GLOBAL, 36, scope::STACK_OBJECT, 0, 1),
+            ins(
+                2,
+                ERROR,
+                ERROR,
+                expr(scope::LITERAL, 0, op::EQUAL, scope::LITERAL, 0),
+            ),
+            assign(scope::GLOBAL, 37, scope::LITERAL, 99, RETURN_TRUE),
+        ]),
+    );
+    fx.world.globals[37] = 0;
+    let before = ids(&fx);
+    assert_eq!(
+        code(create_guid(&mut fx, 0, 5, 0x04 | 0x02 | 0x10, record)),
+        Some(0x36)
+    );
+    let id = new_object(&fx, &before);
+    assert_eq!(fx.world.objects[&id].position, [40, 40, 1]);
+    assert_eq!(fx.world.globals[36], id as i16);
+    assert_eq!(fx.lamp().stack[0].stack_object, record);
+    assert_ne!(fx.world.objects[&id].flags() & 4, 0);
+    assert!(fx.world.objects[&id].stack.is_empty());
+    let vm = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    assert!(vm.turn(&mut fx.world, id, 1000).is_err());
+    fx.world.scheduler_cursor = id as i16;
+    let pass = vm.scheduler_pass(
+        &mut fx.world,
+        &crate::tick::tuning(),
+        &mut sims_vm::Update::default(),
+    );
+    assert!(
+        matches!(pass, Err(sims_vm::TickError::Fault(ref f)) if f.object == id && f.to_string().contains("0x46d5da")),
+        "{pass:?}"
+    );
+    assert_ne!(fx.world.objects[&id].flags() & 4, 0);
+    assert_eq!(fx.world.globals[37], 0);
 
     let (mut fx, _) = container();
     fx.lamp_mut().position = [-16, -16, 1];
@@ -1047,8 +1131,9 @@ fn container_mode_rereads_container_coordinates_after_init() {
 #[test]
 fn native_factory_zero_returns_false_without_creating() {
     // 0x44e5d8: when the factory makes nothing and returns 0 (0x440b90
-    // non-master group member or 0x440c9b group master with no lead tile),
-    // opcode 42 takes the false branch cleanly.
+    // non-master group member, 0x440c9b group master with no lead tile,
+    // 0x440dd5 pet without Unleashed/Makin' Magic, or 0x4409f2 ungrouped
+    // types 8 and 9), opcode 42 takes the false branch cleanly.
     for mode in [5u8, 6] {
         let (mut fx, _) = container();
         crate::group_factory::group(&mut fx);
@@ -1076,6 +1161,33 @@ fn native_factory_zero_returns_false_without_creating() {
             "0x440c9b mode {mode}"
         );
         assert_eq!(ids(&fx), before, "0x440c9b mode {mode}");
+
+        // 0x440dd5: pet person refused when expansions lack Unleashed (0x20)
+        // and Makin' Magic (0x80).
+        let (mut fx, file) = container();
+        fx.program.expansions = 0;
+        fx.words(file)[9] = 2;
+        crate::person_factory::equip(&mut fx, WIDGET, "dog", 12);
+        let before = ids(&fx);
+        assert_eq!(
+            create(&mut fx, mode, 0, 0),
+            Ok(false),
+            "0x440dd5 mode {mode}"
+        );
+        assert_eq!(ids(&fx), before, "0x440dd5 mode {mode}");
+
+        // 0x4409f2 -> 0x440df3: ungrouped definition types 8 and 9 return 0.
+        for kind in [8i16, 9] {
+            let (mut fx, file) = container();
+            fx.words(file)[9] = kind;
+            let before = ids(&fx);
+            assert_eq!(
+                create(&mut fx, mode, 0, 0),
+                Ok(false),
+                "0x4409f2 kind {kind} mode {mode}"
+            );
+            assert_eq!(ids(&fx), before, "0x4409f2 kind {kind} mode {mode}");
+        }
     }
 }
 
