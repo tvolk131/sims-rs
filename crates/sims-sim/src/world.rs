@@ -215,6 +215,13 @@ pub struct World {
     /// apart so that the encodings of the states before it was kept stay a
     /// prefix of the new ones.
     pub dirty_portraits: BTreeSet<u32>,
+    /// The person types whose `BMP_` 2002 portrait was written to a writable
+    /// character file during this run (`0x4e938c` → `0x4e8d2e` → `0x4e9000`),
+    /// so a later invalidation (`dirty_portraits`) and no-tile fallback
+    /// (`0x4e9706` → `0x4e9338`) can load the saved bitmap even when the file
+    /// had none at load. Kept apart so that the encodings of the states before
+    /// it was kept stay a prefix of the new ones.
+    pub saved_portraits: BTreeSet<u32>,
 }
 
 /// How many advertisements the record of [`World::advertisement_record`]
@@ -577,6 +584,7 @@ impl World {
             characters: Characters::default(),
             portraits: BTreeSet::new(),
             dirty_portraits: BTreeSet::new(),
+            saved_portraits: BTreeSet::new(),
         }
     }
 

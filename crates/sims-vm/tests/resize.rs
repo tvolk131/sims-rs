@@ -422,11 +422,13 @@ fn routing_18_bytes(routing: &sims_sim::route::Routing) -> Vec<u8> {
 }
 
 /// The encoding of `world` as snapshot format 31 wrote it: without the
-/// person types whose portrait slot 1 is marked dirty
-/// ([`sims_sim::World::dirty_portraits`]) that format 32 added at the end.
+/// portrait dirty and saved sets ([`sims_sim::World::dirty_portraits`],
+/// [`sims_sim::World::saved_portraits`]) that format 32 added at the end.
 /// The older formats' encodings start from this one.
 fn format_31_bytes(world: &World) -> Vec<u8> {
     let mut bytes = world.encode();
+    let saved = postcard::to_allocvec(&world.saved_portraits).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - saved.len()), saved);
     let dirty = postcard::to_allocvec(&world.dirty_portraits).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - dirty.len()), dirty);
     bytes

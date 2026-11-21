@@ -95,6 +95,13 @@ pub struct Library {
     /// build finds no tile (`0x4e9706`), `0x4e92a8` falls back to this
     /// bitmap instead of calling `0x4e8c5d` again (`0x4e938c`).
     pub has_portrait_bitmap: bool,
+    /// Whether the original opens this file writable (`iResFile::CanWrite`,
+    /// `vtable[+0x20]`, checked at `0x4e8cc6` and `0x4e9031`): true only for
+    /// loose `.iff` files under the neighborhood's `Characters` mount
+    /// (`0x43c6b9`, `0x43c2c1`, `0x43c5bf`, `0x43e48a`, `0x465970`,
+    /// `0x413083`). FAR archive members (`ResolveResFile`, `0x5cfb38`) and
+    /// files from other mounts (`0x43aa03`) are read-only.
+    pub writable: bool,
 }
 
 /// The `BMP_` chunk ID of a person file's portrait faces (`0x4e9260`).
@@ -348,6 +355,11 @@ impl Program {
         library.has_portrait_bitmap = iff
             .get(b"BMP_", PORTRAIT_BITMAP)
             .is_some_and(|chunk| sims_formats::bitmap::bmp(iff.data(chunk)).is_ok());
+        library.writable = file.member.is_none()
+            && index
+                .mounts
+                .get(file.mount)
+                .is_some_and(|m| m.path == Index::CHARACTERS);
         // The string tables as the original's loader finds them.
         let ids: BTreeSet<u16> = iff
             .chunks

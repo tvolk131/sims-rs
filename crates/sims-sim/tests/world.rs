@@ -276,6 +276,7 @@ fn world() -> World {
         },
         portraits: BTreeSet::from([0x1234_0042, 0x7fd9_6b54]),
         dirty_portraits: BTreeSet::from([0xdead_beef]),
+        saved_portraits: BTreeSet::from([0xfeed_face]),
     }
 }
 
@@ -447,12 +448,11 @@ fn the_hash_is_the_same_on_every_platform() {
     // encoding changes on purpose, bump snapshot::FORMAT and update this.
     assert_eq!(world().hash_hex(), PINNED);
 }
-const PINNED: &str = "7f806896f7b97c468bc6bd8882796a5e010500ae9a6b8079f6cf7334ed21d6f0";
+const PINNED: &str = "34b77b707e0e920d6b4a00e824b93934c9b7bbecf32898ea5e96df18219b8a2e";
 
 #[test]
-fn without_the_dirty_portraits_the_encoding_is_format_31() {
-    // Snapshot format 32 added the person types whose portrait slot 1 is
-    // marked dirty at the end.
+fn without_the_dirty_and_saved_portraits_the_encoding_is_format_31() {
+    // Snapshot format 32 added the portrait dirty and saved sets at the end.
     assert_eq!(digest(&format_31_bytes(&world())), PINNED_31);
 }
 const PINNED_31: &str = "20fd811dcc1faebf0012fb041c894f499a0306c53d0cd7705f7530b18ea3b55f";
@@ -474,11 +474,13 @@ fn without_the_made_characters_the_encoding_is_format_29() {
 const PINNED_29: &str = "f1663444bf686193967fab0511a75eaad4599c03369d188260cc34f84ee1f9ae";
 
 /// The encoding of `world` as snapshot format 31 wrote it: without the
-/// person types whose portrait slot 1 is marked dirty
-/// ([`sims_sim::World::dirty_portraits`]) that format 32 added at the end.
+/// portrait dirty and saved sets ([`sims_sim::World::dirty_portraits`],
+/// [`sims_sim::World::saved_portraits`]) that format 32 added at the end.
 /// The older formats' encodings start from this one.
 fn format_31_bytes(world: &World) -> Vec<u8> {
     let mut bytes = world.encode();
+    let saved = postcard::to_allocvec(&world.saved_portraits).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - saved.len()), saved);
     let dirty = postcard::to_allocvec(&world.dirty_portraits).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - dirty.len()), dirty);
     bytes
@@ -1248,6 +1250,9 @@ fn any_field_change_changes_the_hash() {
     assert_ne!(changed.hash(), base);
     let mut changed = world();
     changed.dirty_portraits.remove(&0xdead_beef);
+    assert_ne!(changed.hash(), base);
+    let mut changed = world();
+    changed.saved_portraits.remove(&0xfeed_face);
     assert_ne!(changed.hash(), base);
     let mut changed = world();
     changed.dialogs.records[0].status = 5;

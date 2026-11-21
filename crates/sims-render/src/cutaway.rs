@@ -264,28 +264,39 @@ impl View<'_> {
 
     /// The view tile under screen point `at` on the level shown, by the
     /// original's search over the tiles' raised corners (0x4a955d). None
-    /// only when coordinates overflow 32-bit projection arithmetic or the
-    /// refinement budget runs out.
+    /// only when the refinement ratio divides by zero or its budget runs out.
     fn coarse(&self, at: [i32; 2]) -> Option<[i32; 2]> {
         let camera = self.camera;
         let level = self.storey();
-        let dx = (i64::from(at[0]) - i64::from(camera.origin[0])) / 2;
-        let dy = i64::from(at[1]) - i64::from(camera.origin[1]);
+        // 0x4a956c..0x4a95a5: screen coordinates and initial deltas narrow to
+        // signed 16-bit values before halving and shifting.
+        let at16 = [i32::from(at[0] as i16), i32::from(at[1] as i16)];
+        let dx = i32::from((at[0] as i16).wrapping_sub(camera.origin[0] as i16)) / 2;
+        let dy = i32::from((at[1] as i16).wrapping_sub(camera.origin[1] as i16));
         let shift = camera.zoom.level() + 3;
-        let mut best = [
-            i32::try_from((dy + dx) >> shift).ok()?,
-            i32::try_from((dy - dx) >> shift).ok()?,
-        ];
-        let project = |p: [i32; 2]| -> Option<[i32; 2]> {
-            let height = if self.interior(p) { self.top(p) } else { 0 };
+        let mut best = [dy.wrapping_add(dx) >> shift, dy.wrapping_sub(dx) >> shift];
+        // 0x4a9c50 (0x4a9c5c..0x4a9c71, 0x4a9d9e..0x4a9db6) and 0x4b3c88
+        // (0x4b3c90..0x4b3cef): each projected tile narrows to signed bytes
+        // and returns signed 16-bit screen coordinates.
+        let project = |p: [i32; 2]| -> [i32; 2] {
+            let tile = [i32::from(p[0] as i8), i32::from(p[1] as i8)];
+            let height = if self.interior(tile) {
+                self.top(tile)
+            } else {
+                0
+            };
             let z = camera.zoom.level();
-            let x = (i64::from(p[0]) - i64::from(p[1])) * (8i64 << z) + i64::from(camera.origin[0]);
-            let y = (i64::from(p[0]) + i64::from(p[1])) * (4i64 << z) + i64::from(camera.origin[1])
-                - i64::from(camera.zoom.floor_height()) * i64::from(level - 1)
-                - (i64::from(height) << (z + 1));
-            Some([i32::try_from(x).ok()?, i32::try_from(y).ok()?])
+            let x = (tile[0] - tile[1])
+                .wrapping_mul(8 << z)
+                .wrapping_add(camera.origin[0]);
+            let y = (tile[0] + tile[1])
+                .wrapping_mul(4 << z)
+                .wrapping_add(camera.origin[1])
+                .wrapping_sub(camera.zoom.floor_height().wrapping_mul(level - 1))
+                .wrapping_sub(height.wrapping_shl(z + 1));
+            [i32::from(x as i16), i32::from(y as i16)]
         };
-        let mut parity = usize::from(project(best)?[0] >= at[0]);
+        let mut parity = usize::from(project(best)[0] >= at16[0]);
         let mut scan = best;
         // Fast-forward pairs of alternating steps while scan[0] < 0 || scan[1] < 0:
         // every two iterations add (+1, +1) to `scan` and preserve `parity & 1`.
@@ -315,27 +326,27 @@ impl View<'_> {
                 if scan[axis] >= upper[axis] {
                     break;
                 }
-                if project(scan)?[1] < at[1] {
+                if project(scan)[1] < at16[1] {
                     best = scan;
                 }
             }
         }
         loop {
             spend()?;
-            let p = project(best)?;
-            if at[0] < p[0] {
+            let p = project(best);
+            if at16[0] < p[0] {
                 let next = [best[0], best[1].checked_add(1)?];
-                let edge = ratio(p, project(next)?)?;
-                if ratio(p, at)? <= edge {
+                let edge = ratio(p, project(next))?;
+                if ratio(p, at16)? <= edge {
                     break;
                 }
                 best[0] = best[0].checked_sub(1)?;
-            } else if at[0] == p[0] {
+            } else if at16[0] == p[0] {
                 break;
             } else {
                 let next = [best[0].checked_add(1)?, best[1]];
-                let edge = ratio(p, project(next)?)?;
-                if edge <= ratio(p, at)? {
+                let edge = ratio(p, project(next))?;
+                if edge <= ratio(p, at16)? {
                     break;
                 }
                 best[1] = best[1].checked_sub(1)?;
@@ -1124,6 +1135,18 @@ mod tests {
         assert_eq!(picked, [200 << 4, 200 << 4]);
         assert_eq!(picked.map(|n| (n >> 4) as i8), [-56, -56]);
 
+        // Far zoom, 800×600 view, origin [381, -3997]: signed-byte narrowing in
+        // 0x4a9c50/0x4b3c88 and signed-16-bit screen deltas in 0x4a9581..0x4a9588
+        // give [269, 268] -> signed byte [13, 12] (not [13, 11]).
+        let wrapped = Camera {
+            origin: [381, -3997],
+            ..c
+        };
+        let picked_wrapped =
+            screen_centre_pick(&lot, &wrapped, [800, 600]).expect("off-lot narrowed pick");
+        assert_eq!(picked_wrapped, [269 << 4, 268 << 4]);
+        assert_eq!(picked_wrapped.map(|n| (n >> 4) as i8), [13, 12]);
+
         // Negative off-lot origin: fast-forwards Loop 1 without exhausting the
         // budget and returns the exact flat off-lot tile.
         let neg = Camera {
@@ -1133,11 +1156,12 @@ mod tests {
         let picked_neg = screen_centre_pick(&lot, &neg, [800, 600]).expect("negative off-lot pick");
         assert_eq!(picked_neg.map(|n| n >> 4), [-294, -294]);
 
-        // Extreme coordinates that overflow 32-bit projection return None cleanly.
+        // Extreme coordinates wrap cleanly at 16-bit screen / 8-bit tile widths
+        // without panicking.
         let extreme = Camera {
             origin: [i32::MAX, i32::MIN],
             ..c
         };
-        assert_eq!(screen_centre_pick(&lot, &extreme, [800, 600]), None);
+        let _ = screen_centre_pick(&lot, &extreme, [800, 600]);
     }
 }

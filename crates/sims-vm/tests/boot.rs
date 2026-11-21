@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 33 --answers 3`
 /// gives this hash with the default frames (snapshot format 32).
-const TICK_33: &str = "36d75173aabd8d9c97f15030d86a860de7dba216ab7cf3a8e4ae647c0ec88754";
+const TICK_33: &str = "7fc16846136f3dd5b18a941d4173446d42a799451883d990ed10534b5e994e6d";
 /// The same state's hash under snapshot format 31, which had no dirty
 /// portrait types ([`sims_sim::World::dirty_portraits`]) at the end.
 const TICK_33_31: &str = "2b92c91c5b17dc809efe537e4ee8eaf58c9472ed6bc6f59147f5b785a0c856d8";
@@ -56,7 +56,7 @@ const TICK_33_22: &str = "df613032818282316988f8f6da93c53ece0e93eb12e268c6f5b40b
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 1103 --answers
 /// 3` gives this hash, the tick before the salesman leaves.
-const TICK_1103: &str = "863a057dd4bb21f5d2e5bf62d3142c3e74759f0a86658f83ef14cb1f27fa81b3";
+const TICK_1103: &str = "eedfc4514d339f5974e74f2cc8a9dfe7abf046ce1182fbd67ce1d1bfd280785b";
 /// The same state's hash under snapshot format 31, which had no dirty
 /// portrait types ([`sims_sim::World::dirty_portraits`]) at the end.
 const TICK_1103_31: &str = "251262c7f68366bcb78e52134c37caa134bacd0ae674168202b5ef99fb328bdf";
@@ -127,11 +127,13 @@ fn digest(bytes: &[u8]) -> String {
 }
 
 /// The encoding of `world` as snapshot format 31 wrote it: without the
-/// person types whose portrait slot 1 is marked dirty
-/// ([`sims_sim::World::dirty_portraits`]) that format 32 added at the end.
+/// portrait dirty and saved sets ([`sims_sim::World::dirty_portraits`],
+/// [`sims_sim::World::saved_portraits`]) that format 32 added at the end.
 /// The older formats' encodings start from this one.
 fn format_31_bytes(world: &World) -> Vec<u8> {
     let mut bytes = world.encode();
+    let saved = postcard::to_allocvec(&world.saved_portraits).unwrap();
+    assert_eq!(bytes.split_off(bytes.len() - saved.len()), saved);
     let dirty = postcard::to_allocvec(&world.dirty_portraits).unwrap();
     assert_eq!(bytes.split_off(bytes.len() - dirty.len()), dirty);
     bytes
@@ -351,7 +353,7 @@ const UD1_DIALOGS: [(u8, Option<i16>); 6] = [
 /// UserData1's House 69 at entry (format 32), a regression pin of our
 /// run. It differs from track 2's recording only in object 2's last
 /// result; see `20261120-ud1-house-69-matches-the-recording.md`.
-const OLD_TOWN_69: &str = "9a6e396ddf856cd19c396a0354e9f24cd16194c170350bc9a20b31bd3829be20";
+const OLD_TOWN_69: &str = "e9484416b362e561a08b610f0907172b40cc1000d5580ee6bb5ecb33ec3205e4";
 /// The same state's hash under snapshot format 31, which had no dirty
 /// portrait types ([`sims_sim::World::dirty_portraits`]) at the end.
 const OLD_TOWN_69_31: &str = "cdf5e94eb507086c61bdd5e1d18d64327e5dbba897130a7de54ee87ef99c9945";
@@ -361,7 +363,7 @@ const OLD_TOWN_69_31: &str = "cdf5e94eb507086c61bdd5e1d18d64327e5dbba897130a7de5
 const OLD_TOWN_69_30: &str = "e34ca24ca0aef8aa000507db5bd03ee074e85845278853616c02e38c191eae7b";
 /// The same after 1000 ticks, a regression pin, which differs from the
 /// recording's update 1000 only in object 2's last result.
-const OLD_TOWN_69_1000: &str = "f97b6e3d78957f7c00a8c11f223dfbe7050d9ddda2ffc15c697df58d4606f503";
+const OLD_TOWN_69_1000: &str = "b7c954177ae6ef7f39b84ed9be036d69bb463040400a72971c81bccc6e5d6df5";
 /// The same state's hash under snapshot format 31.
 const OLD_TOWN_69_1000_31: &str =
     "2b4741e731424e6c7ce34462cdaff5461f69e8f19a4f5ddec37eba09efeaaac6";
@@ -1353,7 +1355,7 @@ fn the_player_selects_another_goth() {
 
 /// `sims boot <install> UserData/Houses/House05.iff --ticks 2881
 /// --answers 3` gives this hash.
-const TICK_2881: &str = "0c8d65820b08a05f8126756a439589c4a7daea78269fadd2aa2b0c7162e9d987";
+const TICK_2881: &str = "1c35e511b989396f535182e4708f0236c47508b22c36d895aac10ecbe7fd47a0";
 /// The same state's hash under snapshot format 31, which had no dirty
 /// portrait types ([`sims_sim::World::dirty_portraits`]) at the end.
 const TICK_2881_31: &str = "19d7b50f5b2bfac7a956243431234932a50b70cd127d10df879aa2cb447b4d2e";
@@ -1366,7 +1368,7 @@ const TICK_2881_30: &str = "74fec2adeef2e9989a771cda7c804c71c316f3a3079cfadb0297
 /// the end.
 const TICK_2881_29: &str = "02c627905a1ecda4dd7f7c69cd34c4b761e151f17cf3219087aa42b916c27f04";
 /// The same at tick 3432.
-const TICK_3432: &str = "92d4b922b16482dcc82ec02eb7a5524695aac586cb5a233f6821393fba3ed796";
+const TICK_3432: &str = "bdec938512fe1b57e3794375aa79497b8995cd3497c1023d51284c72067e391d";
 /// The same state's hash under snapshot format 31.
 const TICK_3432_31: &str = "0fde2e4c331a9886d91f904c397e027e543eac965bd597eccc47db63f78726c1";
 /// The same state's hash under snapshot format 30, which had no person
@@ -1378,7 +1380,7 @@ const TICK_3432_30: &str = "4d6afff42d138ca4897cc6444879538129409a21f8e5e6e4380c
 /// the end.
 const TICK_3432_29: &str = "0319f1e79ae994cd1bb261ff5f97d337733974aa88521e358802f97cad66877b";
 /// The same at tick 3602, the update before the two neighbors are made.
-const TICK_3602: &str = "e9aa1c7557f78dd87ca78712552e7f30fde2ec2ffcc977d76965f33704fe8dd8";
+const TICK_3602: &str = "86a4973ecc82ea69659cb0e0bdbf9f8b867004cbab69be314352729162cc854e";
 /// The same state's hash under snapshot format 31.
 const TICK_3602_31: &str = "e8e4f6fbf1ca47ca227b41ab16b18614f5ee5a560948325613282e536807af56";
 /// The same state's hash under snapshot format 30, which had no person
@@ -1390,7 +1392,7 @@ const TICK_3602_30: &str = "fc4abfd2c3b7d10cc490e0aed6c6e6c02d4c69c078470319f30b
 /// the end.
 const TICK_3602_29: &str = "72420f0bab54d2357f6c2007b3d94bab905067a0cafa242c4e6902302706f1b7";
 /// The same at tick 3603, after the two neighbors are made.
-const TICK_3603: &str = "13d023a5264bbb4b967baccc07d61ce9de4b1e4005061ee8d4a09c07c1dc344b";
+const TICK_3603: &str = "d63adb8f22e90455f0a702c6352a4337796083ab267ed5fda6257746d08d3f02";
 /// The same state's hash under snapshot format 31.
 const TICK_3603_31: &str = "98fc002d96b1afd8e4a8abf5de638d86b6c70dfcb567e0bd79c8bc21c6d04a4f";
 /// The same state's hash under snapshot format 30, which had no person
@@ -1402,7 +1404,7 @@ const TICK_3603_30: &str = "512738a0ecce31e27efd58e297632a3de66775f4df3eed76adf0
 /// the end.
 const TICK_3603_29: &str = "d2596aa251487225ce687aa8b69daf749e857d87b650e3a00c4cc34b877f9e89";
 /// The same at tick 3912.
-const TICK_3912: &str = "ca479e2ecdab8c6c85c247c1c8e9badc43475f8c490fa516b047e127a7d67d5b";
+const TICK_3912: &str = "d1ed0b309460fd0e1d338b8c71b28a6a2c713aa6b92c378af2da745c47ff0f83";
 /// The same state's hash under snapshot format 31.
 const TICK_3912_31: &str = "95d787696736ad2187b34b1248218e59db3e54721c7372884380bf53a1df9a6f";
 /// The same state's hash under snapshot format 30, which had no person
@@ -1414,7 +1416,7 @@ const TICK_3912_30: &str = "869973a29b9ec91cb38a0a5c3dc461315dcadc2034942635bd27
 /// the end.
 const TICK_3912_29: &str = "4709b76086b6c75eb736f45d20bae15272df19352656c1a8a53312d73c23a162";
 /// The same at tick 9906.
-const TICK_9906: &str = "ae990e417de0be4bdc90cf1473b09f88948dcae5ed47739c55f68023eb8f8c80";
+const TICK_9906: &str = "d630e0f02bf88ba7b955223daafcbb29668db33e57839cf2db396a54699c5298";
 /// The same state's hash under snapshot format 31.
 const TICK_9906_31: &str = "cd6bf73af970a9fb740e063ad6f2f52614f525c8fb85d413fe6f4910dc9c83f5";
 /// The same state's hash under snapshot format 30, which had no person
@@ -1426,7 +1428,7 @@ const TICK_9906_30: &str = "0729bdb1be01619a16bdfb2852da323bf1237ecc1bf8bfa156ea
 /// the end.
 const TICK_9906_29: &str = "458debd6fa82f9cd865b4334cdd950af01942ee517cf039657728eb6422a54f2";
 /// The same at tick 20186.
-const TICK_20186: &str = "7444815db7cb1457547b0e51dfe53e3ebcfaecfd10a9709531aa07a4004996bf";
+const TICK_20186: &str = "58aec17557a340a501be645247d8e9b97353d810e0a456577edf140e26102882";
 /// The same state's hash under snapshot format 31.
 const TICK_20186_31: &str = "20c02362265912d3469be08f31e90e6bfecd59ddd33db3332e1b4be3da0ae0bb";
 /// The same state's hash under snapshot format 30, which had no person
@@ -1438,7 +1440,7 @@ const TICK_20186_30: &str = "5ee29d0a10fc9f489b1cb1c76025ec81bcebc77fbf5c508072b
 /// the end.
 const TICK_20186_29: &str = "a282f437760e7a7b5308007acc06d094a26bf6a563f7bc9863ac5d1b3013d80e";
 /// The same at tick 31478, when the day turns.
-const TICK_31478: &str = "71c9a6ffd2b2da08019c541d106ca86e3a03d4a1e135bc93d56911340dd5a9ac";
+const TICK_31478: &str = "89e73f89da7f801d50e6305a9636520249ece061c8bf8628c563d72b1e9d7bab";
 /// The same state's hash under snapshot format 31.
 const TICK_31478_31: &str = "eadda68a0fdb21dd003cafccca2a89018f0a07dbac3dfd77683c7e3dad2c9b75";
 /// The same state's hash under snapshot format 30, which had no person
@@ -1474,7 +1476,7 @@ const RECORDED_FRAMES: &str = "0,1,2,29,59,89,101,102,123+30";
 /// differs at entry in object 2's last result; see the decision
 /// `20261120-ud2-house-69-boots-from-the-originals-import.md` for what
 /// the comparison reads and skips.
-const IMPORTED_69: &str = "a5e743da9501595a310c94248f703b230e1ccd965dac7b9cceb75e3bb3d14569";
+const IMPORTED_69: &str = "fffff4c0c0ef8ebe192ffdcaf3f22190bd072332efed7acfd1d2c919e1c5fc06";
 /// The same state's hash under snapshot format 31, which had no dirty
 /// portrait types ([`sims_sim::World::dirty_portraits`]) at the end.
 const IMPORTED_69_31: &str = "1bc128440944c2a9bfd8dc189aaa51249ee96b3eb0187dc721dcad28e4519447";
@@ -1485,7 +1487,7 @@ const IMPORTED_69_30: &str = "9ca0dd8afe6c5b848be0d6cdd3c8b03c006e1f2d612843c1a6
 /// The same after 1000 ticks, with the recording's frames: a regression
 /// pin, which differs from the recording's update 1000 in object 2's last
 /// result.
-const IMPORTED_69_1000: &str = "999bf7829e28f32dd37681cb96452ceba018d71c159d1f7282107e292580de36";
+const IMPORTED_69_1000: &str = "125946e1704ba6aa9c044e84c013e7f1feeb215edc8aecf4a90492525d603038";
 /// The same state's hash under snapshot format 31.
 const IMPORTED_69_1000_31: &str =
     "d0a4eeb7b002caf2bd1cf872c829a9517d11665cf5dc68a9cfd6c6a01c73c210";
@@ -1493,7 +1495,7 @@ const IMPORTED_69_1000_31: &str =
 const IMPORTED_69_1000_30: &str =
     "8d0258ba3e1a8922a59f365ad4a4031d76a9365d97d20a264c1e039cd829a921";
 /// The same at tick 43200, a whole day from the load.
-const TICK_43200: &str = "09371360e1b0796cdcf339c506b51528fce851d73bb315dee466164c744ec2f8";
+const TICK_43200: &str = "48440355df84c6963b8e634c29c6a379e85e33d86a14d08a9aebb1d51bf85586";
 /// The same state's hash under snapshot format 31.
 const TICK_43200_31: &str = "c3b7a6b9a8180d9e5e6463ba4e3638313cdec8d52bdaae28918bb05ce987e915";
 /// The same state's hash under snapshot format 30, which had no person
@@ -1841,7 +1843,7 @@ fn the_goth_day_under_the_recordings_frames_keeps_its_streams() {
 // with that save left out, the earlier pins all held.
 
 /// The Newbies' house (House07) after 1802 updates, with `--answers 3`.
-const NEWBIE_1802: &str = "fe5f3d9feedd94551be9321b41b9a865c4ed3b640e2b83df421069fb29484883";
+const NEWBIE_1802: &str = "c48b2f3896ce0bd2dfe1574288d69b62bdedca4ff09d1f1c760e941eb370ad45";
 /// The same state's hash under snapshot format 31, which had no dirty
 /// portrait types ([`sims_sim::World::dirty_portraits`]) at the end.
 const NEWBIE_1802_31: &str = "db81050f8a226c22fda89496a8485387f772ecb33480d53c5e2207532ecd2ac0";
@@ -1864,7 +1866,7 @@ const NEWBIE_1802_27: &str = "5055fe7a40f7c1ade093d0748e7294bf92251264d4452304a8
 const NEWBIE_1802_26: &str = "db8b8f44bbc8273bcfb0b13e6ba1d405d5cfc78b4c6ec70d7483d240289c7af4";
 /// The Newbies' house after 4052 updates, the last whose frame strict
 /// mode draws.
-const NEWBIE_4052: &str = "4ed6ad6e32e2af672f16db6a51ba772d3a5a6cf13fd72df2c0df2eee078ae9fc";
+const NEWBIE_4052: &str = "13bf15702ca5c43185cc4add8972b30668eb79677c4646ad5857dcac3fdca23a";
 /// The same state's hash under snapshot format 31.
 const NEWBIE_4052_31: &str = "330dc7e29a0fdff17b58601f3f0ff0190430ac430e933757264d8f450cd9b33e";
 /// The same state's hash under snapshot format 30, which had no person

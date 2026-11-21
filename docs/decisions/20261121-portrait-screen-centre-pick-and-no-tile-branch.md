@@ -33,10 +33,14 @@ items in the dialog portrait path (`0x4e92a8` → `0x4e8c5d` → `0x4e9652`):
      calculation (`View::fine`), returning a view-rotated fine point
      `[(tx << 4) | fx, (ty << 4) | fy]` with `fx, fy in 0..=15`.
    - `0x4a955d` does not bail out when the initial guess lies outside
-     `-2 * ARRAY_SIZE..3 * ARRAY_SIZE`: e.g., at far zoom on an 800×600 view
-     with origin `[400, -2900]`, it returns `[200, 200]`, which `0x433067`
-     cuts to signed byte `[-56, -56]`, sending `0x434891` to the rotated
-     midpoint fallback rather than treating the camera pick as unknown.
+     `-2 * ARRAY_SIZE..3 * ARRAY_SIZE`: `0x4a9581`–`0x4a9588` narrows the
+     initial screen deltas to signed 16-bit values, and `0x4a9c5c`–`0x4a9c71`
+     / `0x4b3c90`–`0x4b3c93` / `0x4a9d9e`–`0x4a9db6` narrow each projected tile
+     to signed bytes and return signed 16-bit screen coordinates. For example,
+     at far zoom on an 800×600 view, origin `[400, -2900]` returns `[200, 200]`
+     (signed byte `[-56, -56]`, triggering the rotated midpoint fallback) and
+     origin `[381, -3997]` returns `[269, 268]` (signed byte `[13, 12]`,
+     passing the interior bounds check).
 2. **Search start bounds check, fallback, and inverse turn (`0x434861`–`0x434921`).**
    - `0x434885` (`0x433067`) cuts the fine point to a signed-byte view tile
      `[(x >> 4) as i8, (y >> 4) as i8]`.
@@ -67,24 +71,43 @@ items in the dialog portrait path (`0x4e92a8` → `0x4e8c5d` → `0x4e9652`):
      still empty (`0x4e9315`), so `0x4e9338` calls `0x4e9260(entry, 2002, &bmp)`,
      stores slot 0 (`0x4e9354`), composites with `[0x6f26a8]` (`kPeopleTemplate
      = 4600`), stores slot 1 (`0x4e937e`, clearing dirty), and returns `true`
-     without ever creating a temporary person, running `Init`, or drawing RNG.
-   - **Dirty, empty slot with `BMP_` 2002 (1 build + no-tile fallback):** at
-     `0x4e92e5`, `slot1.dirty != 0` calls `0x4e92f2: 0x4e8c5d(index, 1, 0)`.
-     If `0x4347f0` finds a tile, `0x4e96fe` places the person (virtual `0x88`),
-     draws it, stores slot 1 (clearing dirty), and removes it (`0x4e8fdb`). If
-     no tile is found (`0x4e9706`), it removes the person unput (`0x44123f`,
-     skipping virtual `0x88`) and returns `NULL`; back in `0x4e92a8`, slot 1 is
-     still empty, so `0x4e9338` loads `BMP_` 2002, stores slot 1 (clearing
-     dirty), and skips `0x4e938c` (no second build). At Goth tick 24,716,
-     Waggles (`0xDC7419A2`) runs `CatGlobals.iff` BHAV 8328 (`Kill pet for
-     Good`) node 16 (`My Person Data 68 := 1`), marking slot 1 dirty via
-     `0x4539cf` → `0x4eb0eb`; three ticks later at 24,719, `UrnStonePet.iff`
-     shows the death dialog on that dirty slot, triggering the single
-     1,920-draw build recorded in `goth-day-20261115`.
-   - **Missing `BMP_` 2002 (`0x4e9385` → `0x4e938c`):** `0x4e938c` calls
-     `0x4e8c5d(index, 1, 1)`. On `NotFound`, a dirty slot would run a second
-     build, and a clean slot leaves slot 1 empty and depends on file
-     writability (`0x4e8cc6`, unmodeled); both fail loudly.
+     without ever creating a temporary person, running `Init`, drawing RNG, or
+     checking household membership.
+   - **Read-only resources (`0x4e8cc6`):** inside `0x4e8c5d`, an off-lot build
+     checks `iResFile::CanWrite` (`vtable[+0x20]`) before calling `0x4e9652`.
+     Only loose `.iff` files under `UserData*/Characters` (`0x43c6b9`,
+     `0x43c2c1`, `0x43c5bf` → `0x43e48a` → `0x465970` → `0x413083`) and
+     runtime-made character files are opened writable; FAR archive members
+     (`ResolveResFile`, `0x5cfb38`) and non-`Characters` mounts (`0x43aa03`)
+     return `false`. For a read-only off-lot resource, `0x4e8c5d` skips
+     `0x4e9652` completely, so `0x4e9338` loads `BMP_` 2002 (clearing dirty)
+     when present and otherwise leaves slot 1 empty with zero builds.
+   - **Dirty, empty slot on a writable resource with `BMP_` 2002 (1 build +
+     no-tile fallback):** at `0x4e92e5`, `slot1.dirty != 0` calls
+     `0x4e92f2: 0x4e8c5d(index, 1, 0)` (`save = 0`). If `0x4347f0` finds a
+     tile, `0x4e96fe` places the person (virtual `0x88`), draws it, stores slot
+     1 (clearing dirty, without saving `BMP_` 2002), and removes it
+     (`0x4e8fdb`). If no tile is found (`0x4e9706`), it removes the person
+     unput (`0x44123f`, skipping virtual `0x88`) and returns `NULL`; back in
+     `0x4e92a8`, slot 1 is still empty, so `0x4e9338` loads `BMP_` 2002, stores
+     slot 1 (clearing dirty), and skips `0x4e938c` (no second build). At Goth
+     tick 24,716, Waggles (`0xDC7419A2`) runs `CatGlobals.iff` BHAV 8328
+     (`Kill pet for Good`) node 16 (`My Person Data 68 := 1`), marking slot 1
+     dirty via `0x4539cf` → `0x4eb0eb`; three ticks later at 24,719,
+     `UrnStonePet.iff` shows the death dialog on that dirty slot, triggering
+     the single 1,920-draw build recorded in `goth-day-20261115`.
+   - **Missing `BMP_` 2002 and saving on first build (`0x4e9385` → `0x4e938c` →
+     `0x4e8d2e` → `0x4e9000`):** when `0x4e9260(2002)` fails, `0x4e938c` calls
+     `0x4e8c5d(index, 1, 1)` (`save = 1`). When that build succeeds (on-lot or
+     writable off-lot `Found`) on a writable file (`0x4e9031`), `0x4e9000`
+     writes `BMP_` 2002 so a later invalidation + no-tile fallback can load it.
+     On a writable off-lot `NotFound`, a dirty slot would run a second build at
+     `0x4e938c` and a clean slot leaves slot 1 empty; both fail loudly.
+   - **Runtime-made person types (`0x4265fd` → `0x4e8a3a` → `0x4e8add`):**
+     cloning a character calls `0x4e8a3a`, which appends every new `type == 2`
+     definition to the portrait table `0x6f2698` once initialized
+     (`[0x6f26a4] = 1` at `0x4e8a32`), with a writable character file and no
+     initial `BMP_` 2002.
 
 ## Decision
 
@@ -92,10 +115,10 @@ items in the dialog portrait path (`0x4e92a8` → `0x4e8c5d` → `0x4e9652`):
    - Expose `sims_render::screen_centre_pick(lot, camera, size)` calling
      `View::new(lot, camera).fine([size[0] / 2, size[1] / 2])` (`0x4a7b58` →
      `0x4a97c3(1)`). Remove the `-2 * ARRAY_SIZE..3 * ARRAY_SIZE` bailout in
-     `View::coarse`, using `i64` projection bounds and an O(1) fast-forward for
-     negative off-lot scans so off-lot cameras return their exact tile pick
-     (falling back to the rotated midpoint in `portrait_start`) without
-     panicking on extreme coordinates.
+     `View::coarse`, match `0x4a9581`–`0x4a9588` signed 16-bit screen deltas
+     and `0x4a9c5c`–`0x4a9c71` / `0x4b3c90`–`0x4b3c93` signed-byte tile
+     projection narrowing, and fast-forward negative off-lot scans in O(1) so
+     off-lot cameras match `0x4a955d` without panicking on extreme coordinates.
    - Treat `Interpreter::view_centre` / `Lot::set_view_centre` (`Option<[i8; 2]>`)
      as the view-rotated tile pick (`0x4a7b58` cut via `0x433067`), and resolve
      it in `placement::portrait_start` using `0x434891` bounds check + midpoint
@@ -109,26 +132,37 @@ items in the dialog portrait path (`0x4e92a8` → `0x4e8c5d` → `0x4e9652`):
      `centre_on`, `command`, and in `apply` only when camera geometry
      (`origin`, `zoom`, `rotation`, or `level`) changes so no-op or wall-mode
      commands preserve a restored pick.
-2. **Dirty-slot gate and no-tile branch (`sims-sim`, `sims-vm`):**
-   - Append `World::dirty_portraits: BTreeSet<u32>` (bumping
-     `sims_sim::SNAPSHOT_FORMAT` from 31 to 32, with format 31 as an exact
-     prefix). Mark dirty and clear `portraits` on person data writes to words
-     68, 74, and 84 (`0x4538fd`–`0x4539cf`) and on `make_person` when
+2. **Dirty-slot gate, writability, saved bitmaps, and no-tile branch (`sims-sim`, `sims-vm`):**
+   - Append `World::dirty_portraits: BTreeSet<u32>` and
+     `World::saved_portraits: BTreeSet<u32>` (bumping `sims_sim::SNAPSHOT_FORMAT`
+     from 31 to 32, with format 31 as an exact prefix). Mark dirty and clear
+     `portraits` on person data writes to words 68, 74, and 84
+     (`0x4538fd`–`0x4539cf`) and on `make_person` when
      `pd[84]&1 || pd[68]&1 || pd[74]&3` (`0x44e712`); clear dirty when
      `portraits` is populated (`0x4e899e`).
-   - Record `Library::has_portrait_bitmap` in `Program::load` by checking
-     whether `BMP_` 2002 exists and decodes cleanly.
+   - Record `Library::has_portrait_bitmap` (`BMP_` 2002 exists and decodes) and
+     `Library::writable` (loose file under the `Characters` mount) in
+     `Program::load`; treat runtime-made person types (`World::characters`) as
+     listed (`0x4265fd` → `0x4e8a3a`), writable, and without initial `BMP_` 2002.
    - Split portrait placement into `portrait_search` (`Found`, `NotFound`,
-     `Mixed`) and `portrait_place(&World, ...)` (immutable borrow, explicitly
-     rejecting `object.selected`, `pd[77] > 0`, and `pd[81] >= 10` so `Ok(())`
-     statically proves placing leaves the exact same world and cells as
-     removing unput).
-   - In `dialog_portrait` when `!on_lot`:
-     - Clean + `BMP_` 2002: insert into `World::portraits` with **0 builds**.
-     - Dirty + `BMP_` 2002: run 1 build; on `NotFound` remove unput (`0x4e9706`,
-       skipping `portrait_place`), on `Mixed` verify `portrait_place` before
-       removing, and populate `World::portraits` / clear `dirty_portraits`.
-     - Missing `BMP_` 2002: run 1 build; on `NotFound` or `Mixed`, fail loudly.
+     `Mixed`) and `portrait_place(&World, ...)` (borrowing `&World` immutably
+     and touching no interpreter cells, explicitly rejecting `object.selected`,
+     `pd[77] > 0`, and `pd[81] >= 10`; native put+remove equivalence for rooms
+     and tiles remains an unverified assumption as documented in
+     `placement.rs`).
+   - In `dialog_portrait`:
+     - `on_lot`: record `saved_portraits` if `!dirty && !has_bitmap && writable`,
+       insert into `portraits`, clear `dirty_portraits`.
+     - `!on_lot`:
+       - Clean + `has_bitmap`: insert into `portraits` with **0 builds** (even
+         for household members).
+       - `!writable`: **0 builds** (`0x4e8cc6`); if `has_bitmap`, insert into
+         `portraits` and clear `dirty_portraits`; otherwise leave slot 1 empty.
+       - Writable + (`dirty || !has_bitmap`): check household guard, then run
+         1 build; on `Found` record `saved_portraits` only when `!dirty`
+         (`save = 1`); on `NotFound` remove unput (`0x4e9706`) when `has_bitmap`
+         or fail loudly otherwise; on `Mixed` check `portrait_place` when
+         `has_bitmap` or fail loudly otherwise.
 
 ## Results
 

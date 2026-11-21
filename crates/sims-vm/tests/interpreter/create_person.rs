@@ -39,10 +39,9 @@ pub(crate) fn visitors() -> (Fixture, usize, i16) {
             RETURN_TRUE,
         )]),
     );
-    fx.program
-        .libraries
-        .get_mut(&file)
-        .unwrap()
+    let library = fx.program.libraries.get_mut(&file).unwrap();
+    library.writable = true;
+    library
         .names
         .insert(INIT_VISITOR, "init visitor".to_owned());
     fx.world.globals[SEEN] = 0;
