@@ -301,7 +301,9 @@ impl Interpreter<'_> {
         let cur_min = world.globals.get(5).copied().unwrap_or(0);
         let cur_month = world.globals.get(7).copied().unwrap_or(0);
         let cur_year = world.globals.get(8).copied().unwrap_or(0);
-        let ids: Vec<u16> = world.objects.keys().copied().collect();
+        // 0x4072ed: walk the object registry linked list (`[registry + 0x30]`
+        // / `[obj + 0xe0]`, mirrored in `world.order` newest-first).
+        let ids: Vec<u16> = world.order.clone();
         for id in ids {
             let Some(obj) = world.objects.get(&id) else {
                 continue;
@@ -1485,7 +1487,12 @@ impl Interpreter<'_> {
         };
         match purchase.kind {
             BuyActionKind::Buy => {
-                if !world.objects.contains_key(&purchase.object) {
+                if !purchase.placed
+                    || !world
+                        .objects
+                        .get(&purchase.object)
+                        .is_some_and(|o| on_lot([o.position[0], o.position[1]]))
+                {
                     return Ok(false);
                 }
                 self.run_user_pickup(world, purchase.object)?;
@@ -1590,7 +1597,12 @@ impl Interpreter<'_> {
                 Ok(true)
             }
             BuyActionKind::Sell => {
-                if !world.objects.contains_key(&purchase.object) {
+                if !purchase.placed
+                    || !world
+                        .objects
+                        .get(&purchase.object)
+                        .is_some_and(|o| on_lot([o.position[0], o.position[1]]))
+                {
                     return Ok(false);
                 }
                 self.run_user_pickup(world, purchase.object)?;
@@ -1661,7 +1673,15 @@ impl Interpreter<'_> {
         self.take_off_cursor_and_held_unconditional(world, cursor)?;
         self.remove_now(world, self.lead_object(world, cursor.cursor))?;
         if let Some(origin) = &cursor.origin {
-            let _ = self.restore_placement(world, origin, false)?;
+            if self.restore_placement(world, origin, false)?.is_none() {
+                return Err(Fault {
+                    object: cursor.held,
+                    at: None,
+                    trap: Trap::Invalid(
+                        "cannot restore picked-up object to its original placement".into(),
+                    ),
+                });
+            }
         } else {
             self.remove_now(world, self.lead_object(world, cursor.held))?;
         }

@@ -575,6 +575,9 @@ impl Hud {
             }
             if let Some(prompt) = &self.buy_layout.sell_prompt {
                 guids.push(prompt.guid);
+                let _ = self
+                    .thumbnails
+                    .read_balloon(assets.index(), assets.catalog(), prompt.guid);
             }
             for guid in guids {
                 let _ = self.thumbnails.read(assets.index(), assets.catalog(), guid);

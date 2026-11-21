@@ -953,21 +953,20 @@ pub fn layout_with_sell(
             let card_x = 240.min(width);
             let card_w = (width - card_x).max(0);
             let ratings = catalog.rating_labels.format(item);
-            // Native `0x50845d` expands the popup card height beyond 127 px to
-            // fit wrapped description lines plus all formatted STR# 160 ratings.
+            // Native `0x50845d` places each formatted STR# 160 rating on its
+            // own line and expands the popup card height past 127 px to fit
+            // wrapped description lines plus all rating lines.
             let max_w = (card_w - 190).max(40);
-            let ratings_text = ratings.join(", ");
             let card_h = if let Some(font) = art.font(10) {
                 let desc_lines = if item.description.is_empty() {
                     0
                 } else {
                     font.wrap(&item.description, max_w).len() as i32
                 };
-                let rating_lines = if ratings_text.is_empty() {
-                    0
-                } else {
-                    font.wrap(&ratings_text, max_w).len() as i32
-                };
+                let rating_lines: i32 = ratings
+                    .iter()
+                    .map(|r| font.wrap(r, max_w).len() as i32)
+                    .sum();
                 let line_step = font.line_height + 2;
                 let ratings_gap = if desc_lines > 0 && rating_lines > 0 {
                     4
@@ -1008,7 +1007,21 @@ pub fn draw(
     pointer: Option<[i32; 2]>,
 ) {
     if let Some(prompt) = &layout.sell_prompt {
-        if let Some(icon) = thumbnails.icon(art, prompt.guid) {
+        // Native `0x50a343`: draw the object's isometric preview inside the
+        // left portrait box of the sell strip (`after-sell.png`), falling back
+        // to the catalog icon/thumbnail when no isometric sprite is cached.
+        let box_x = prompt.rect.x + 12;
+        let box_w = 152;
+        let box_h = (prompt.rect.height - 8).max(1);
+        if let Some(pic) = thumbnails.balloon_picture(prompt.guid, None, box_w, box_h) {
+            let draw_w = (pic.width as i32).min(box_w);
+            let draw_h = (pic.height as i32).min(box_h);
+            let src_x = ((pic.width as i32 - draw_w) / 2).max(0);
+            let src_y = ((pic.height as i32 - draw_h) / 2).max(0);
+            let dst_x = box_x + (box_w - draw_w) / 2;
+            let dst_y = prompt.rect.y + (prompt.rect.height - draw_h) / 2;
+            frame.draw(pic, Rect::new(src_x, src_y, draw_w, draw_h), [dst_x, dst_y]);
+        } else if let Some(icon) = thumbnails.icon(art, prompt.guid) {
             let draw_h = (icon.height as i32).min(prompt.rect.height);
             let src_y = ((icon.height as i32 - draw_h) / 2).max(0);
             let dst_y = prompt.rect.y + ((prompt.rect.height - draw_h) / 2).max(0);
@@ -1144,12 +1157,10 @@ pub fn draw(
             } else {
                 font.wrap(&card.description, max_w)
             };
-            let ratings_text = card.ratings.join(", ");
-            let rating_lines = if ratings_text.is_empty() {
-                Vec::new()
-            } else {
-                font.wrap(&ratings_text, max_w)
-            };
+            let mut rating_lines = Vec::new();
+            for rating in &card.ratings {
+                rating_lines.extend(font.wrap(rating, max_w));
+            }
             let bottom = card.rect.y + card.rect.height - 4;
             for line in &desc_lines {
                 if y + font.line_height <= bottom {

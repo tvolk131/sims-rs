@@ -5629,38 +5629,6 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
         lot.buy_cancel(&awn).unwrap();
     }
 
-    // Refused Redo transfer (`0x48bdfe` line `0x48be72` -> `0x493353`):
-    // buying two Werkbunnst Chairs at `[552, 472]` and `[520, 472]`, undoing
-    // both, blocking the first chair's tile `[552, 472]` with a preview chair,
-    // and redoing must transfer the refused first chair to Undo without
-    // charging while keeping the second chair on Redo so the next Redo restores
-    // it and re-charges `$80`.
-    {
-        let mut ch1 = lot.buy_start(0x26bf_bb29, 1, 2).unwrap().unwrap();
-        assert!(lot.buy_move(&mut ch1, [552, 472], 1).unwrap());
-        let ch1_id = lot.buy_commit(&ch1).unwrap();
-        let mut ch2 = lot.buy_start(0x26bf_bb29, 1, 2).unwrap().unwrap();
-        assert!(lot.buy_move(&mut ch2, [520, 472], 1).unwrap());
-        let ch2_id = lot.buy_commit(&ch2).unwrap();
-        assert!(lot.buy_undo().unwrap());
-        assert!(lot.buy_undo().unwrap());
-        let funds_after_undos = lot.world().budget.funds;
-        let mut blocker = lot.buy_start(0x26bf_bb29, 1, 2).unwrap().unwrap();
-        assert!(lot.buy_move(&mut blocker, [552, 472], 1).unwrap());
-        // First redo pops `ch1`: blocked, not charged, transferred to Undo,
-        // leaving `ch2` on Redo.
-        assert!(!lot.buy_redo().unwrap());
-        assert_eq!(lot.world().budget.funds, funds_after_undos);
-        assert!(lot.world().objects[&ch1_id].position[0] < 0);
-        assert!(lot.can_buy_redo());
-        // Second redo restores `ch2` and re-charges `$80`.
-        assert!(lot.buy_redo().unwrap());
-        assert_eq!(lot.world().budget.funds, funds_after_undos - 80);
-        assert!(lot.world().objects[&ch2_id].position[0] >= 0);
-        lot.buy_cancel(&blocker).unwrap();
-        assert!(lot.buy_undo().unwrap());
-    }
-
     // Ground flag `0x20` (`UserTestPlace`, `0x435522`): road/curb tile
     // `[24, 328, 1]` has ground flags `0x27` (`& 0x20 != 0`) and must be
     // refused by Buy placement.
@@ -5668,74 +5636,6 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
     assert!(!lot.buy_move(&mut blocked_cur, [24, 328], 1).unwrap());
     assert!(!blocked_cur.valid);
     lot.buy_cancel(&blocked_cur).unwrap();
-
-    // Blocked container Redo: buying a Mesquite Desk on the lawn and placing a
-    // Gloominator Desk Lamp on it, undoing both, blocking the desk's tile with
-    // a previewed chair, then redoing both must refuse BOTH the desk and the
-    // lamp (since the desk is still detached off-lot) without charging for the
-    // lamp.
-    if let Some(desk) = catalog
-        .all()
-        .iter()
-        .find(|i| i.name.contains("Mesquite") && i.name.contains("Desk"))
-    {
-        let mut desk_cur = lot.buy_start(desk.guid, 1, 2).unwrap().unwrap();
-        assert!(lot.buy_move(&mut desk_cur, [520, 472], 1).unwrap());
-        let desk_id = lot.buy_commit(&desk_cur).unwrap();
-        let mut lamp_cur = lot.buy_start(lamp.guid, 1, 2).unwrap().unwrap();
-        assert!(lot.buy_move(&mut lamp_cur, [520, 472], 1).unwrap());
-        assert_eq!(lamp_cur.container.map(|(c, _)| c), Some(desk_id));
-        let desk_lamp_id = lot.buy_commit(&lamp_cur).unwrap();
-        assert!(lot.buy_undo().unwrap());
-        assert!(lot.buy_undo().unwrap());
-        assert!(lot.world().objects[&desk_id].position[0] < 0);
-        assert!(lot.world().objects[&desk_lamp_id].position[0] < 0);
-        let funds_before_blocked_redo = lot.world().budget.funds;
-        let mut blocker = lot.buy_start(0x26bf_bb29, 1, 2).unwrap().unwrap();
-        assert!(lot.buy_move(&mut blocker, [520, 472], 1).unwrap());
-        // Desk redo is refused because the preview chair occupies `[520, 472]`.
-        assert!(!lot.buy_redo().unwrap());
-        assert!(lot.world().objects[&desk_id].position[0] < 0);
-        assert_eq!(lot.world().budget.funds, funds_before_blocked_redo);
-        // Lamp redo must also be refused because its container desk is off-lot.
-        assert!(!lot.buy_redo().unwrap());
-        assert!(lot.world().objects[&desk_lamp_id].position[0] < 0);
-        assert_eq!(lot.world().budget.funds, funds_before_blocked_redo);
-        lot.buy_cancel(&blocker).unwrap();
-        // Undo the two refused records so later Undo assertions still reach `placed_lamp`.
-        assert!(lot.buy_undo().unwrap());
-        assert!(lot.buy_undo().unwrap());
-
-        // Saving after undoing a desk beneath an unpaid preview lamp: Undo
-        // takes the desk (and unpaid preview lamp in its slot) off-lot;
-        // `save_without_buy_cursor` must strip the preview BEFORE purging
-        // history so it does not double-delete the lamp.
-        let mut desk_cur2 = lot.buy_start(desk.guid, 1, 2).unwrap().unwrap();
-        assert!(lot.buy_move(&mut desk_cur2, [520, 472], 1).unwrap());
-        let desk_id2 = lot.buy_commit(&desk_cur2).unwrap();
-        let mut lamp_preview = lot.buy_start(lamp.guid, 1, 2).unwrap().unwrap();
-        assert!(lot.buy_move(&mut lamp_preview, [520, 472], 1).unwrap());
-        assert_eq!(lamp_preview.container.map(|(c, _)| c), Some(desk_id2));
-        assert!(lot.buy_undo().unwrap());
-        assert!(lot.world().objects[&desk_id2].position[0] < 0);
-        let saved_under_preview = lot
-            .save_without_buy_cursor(&lamp_preview)
-            .expect("save strips unpaid preview before purging undone desk");
-        assert!(!saved_under_preview.world().objects.contains_key(&desk_id2));
-        assert!(
-            !saved_under_preview
-                .world()
-                .objects
-                .contains_key(&lamp_preview.held)
-        );
-        assert!(
-            !saved_under_preview
-                .world()
-                .objects
-                .contains_key(&lamp_preview.cursor)
-        );
-        lot.buy_cancel(&lamp_preview).unwrap();
-    }
 
     // Wall-mounted auto-rotation (`0x48736b` + `0x43583e`): Narcisco Wall
     // Mirror fails at facing 2 at `[264, 504]` and auto-rotates to facing 4.
@@ -5798,6 +5698,113 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
     assert_eq!(lot.world().objects[&placed_lamp].registry_word, lamp_reg);
     assert_eq!(lot.world().objects[&placed_lamp].data[2], surface_id as i16);
     assert_eq!(lot.world().budget.funds, funds_before_lamp_undo);
+
+    // Refused Redo transfer (`0x48bdfe` line `0x48be72` -> `0x493353`):
+    // buying two Werkbunnst Chairs at `[552, 472]` and `[520, 472]`, undoing
+    // both, blocking the first chair's tile `[552, 472]` with a preview chair,
+    // and redoing must transfer the refused first chair to Undo without
+    // charging while keeping the second chair on Redo so the next Redo restores
+    // it and re-charges `$80`. Undoing `ch2` then leaves the refused `ch1`
+    // record on top of Undo, whose Undo must return `false` without
+    // double-refunding `ch1`.
+    {
+        let mut ch1 = lot.buy_start(0x26bf_bb29, 1, 2).unwrap().unwrap();
+        assert!(lot.buy_move(&mut ch1, [552, 472], 1).unwrap());
+        let ch1_id = lot.buy_commit(&ch1).unwrap();
+        let mut ch2 = lot.buy_start(0x26bf_bb29, 1, 2).unwrap().unwrap();
+        assert!(lot.buy_move(&mut ch2, [520, 472], 1).unwrap());
+        let ch2_id = lot.buy_commit(&ch2).unwrap();
+        assert!(lot.buy_undo().unwrap());
+        assert!(lot.buy_undo().unwrap());
+        let funds_after_undos = lot.world().budget.funds;
+        let mut blocker = lot.buy_start(0x26bf_bb29, 1, 2).unwrap().unwrap();
+        assert!(lot.buy_move(&mut blocker, [552, 472], 1).unwrap());
+        // First redo pops `ch1`: blocked, not charged, transferred to Undo,
+        // leaving `ch2` on Redo.
+        assert!(!lot.buy_redo().unwrap());
+        assert_eq!(lot.world().budget.funds, funds_after_undos);
+        assert!(lot.world().objects[&ch1_id].position[0] < 0);
+        assert!(lot.can_buy_redo());
+        // Second redo restores `ch2` and re-charges `$80`.
+        assert!(lot.buy_redo().unwrap());
+        assert_eq!(lot.world().budget.funds, funds_after_undos - 80);
+        assert!(lot.world().objects[&ch2_id].position[0] >= 0);
+        lot.buy_cancel(&blocker).unwrap();
+        assert!(lot.buy_undo().unwrap());
+        assert_eq!(lot.world().budget.funds, funds_after_undos);
+        // Next undo hits the refused `ch1` record and must NOT double-refund.
+        assert!(!lot.buy_undo().unwrap());
+        assert_eq!(lot.world().budget.funds, funds_after_undos);
+    }
+
+    // Blocked container Redo: buying a Mesquite Desk on the lawn and placing a
+    // Gloominator Desk Lamp on it, undoing both, blocking the desk's tile with
+    // a previewed chair, then redoing both must refuse BOTH the desk and the
+    // lamp (since the desk is still detached off-lot) without charging for the
+    // lamp, and undoing the refused records must NOT double-refund.
+    if let Some(desk) = catalog
+        .all()
+        .iter()
+        .find(|i| i.name.contains("Mesquite") && i.name.contains("Desk"))
+    {
+        let mut desk_cur = lot.buy_start(desk.guid, 1, 2).unwrap().unwrap();
+        assert!(lot.buy_move(&mut desk_cur, [520, 472], 1).unwrap());
+        let desk_id = lot.buy_commit(&desk_cur).unwrap();
+        let mut lamp_cur = lot.buy_start(lamp.guid, 1, 2).unwrap().unwrap();
+        assert!(lot.buy_move(&mut lamp_cur, [520, 472], 1).unwrap());
+        assert_eq!(lamp_cur.container.map(|(c, _)| c), Some(desk_id));
+        let desk_lamp_id = lot.buy_commit(&lamp_cur).unwrap();
+        assert!(lot.buy_undo().unwrap());
+        assert!(lot.buy_undo().unwrap());
+        assert!(lot.world().objects[&desk_id].position[0] < 0);
+        assert!(lot.world().objects[&desk_lamp_id].position[0] < 0);
+        let funds_before_blocked_redo = lot.world().budget.funds;
+        let mut blocker = lot.buy_start(0x26bf_bb29, 1, 2).unwrap().unwrap();
+        assert!(lot.buy_move(&mut blocker, [520, 472], 1).unwrap());
+        // Desk redo is refused because the preview chair occupies `[520, 472]`.
+        assert!(!lot.buy_redo().unwrap());
+        assert!(lot.world().objects[&desk_id].position[0] < 0);
+        assert_eq!(lot.world().budget.funds, funds_before_blocked_redo);
+        // Lamp redo must also be refused because its container desk is off-lot.
+        assert!(!lot.buy_redo().unwrap());
+        assert!(lot.world().objects[&desk_lamp_id].position[0] < 0);
+        assert_eq!(lot.world().budget.funds, funds_before_blocked_redo);
+        lot.buy_cancel(&blocker).unwrap();
+        // Undoing the refused Buy Redo record must NOT double-refund; it
+        // returns `false` and clears the undo stack (`0x48bd21` / `0x4932fa`).
+        assert!(!lot.buy_undo().unwrap());
+        assert_eq!(lot.world().budget.funds, funds_before_blocked_redo);
+
+        // Saving after undoing a desk beneath an unpaid preview lamp: Undo
+        // takes the desk (and unpaid preview lamp in its slot) off-lot;
+        // `save_without_buy_cursor` must strip the preview BEFORE purging
+        // history so it does not double-delete the lamp.
+        let mut desk_cur2 = lot.buy_start(desk.guid, 1, 2).unwrap().unwrap();
+        assert!(lot.buy_move(&mut desk_cur2, [520, 472], 1).unwrap());
+        let desk_id2 = lot.buy_commit(&desk_cur2).unwrap();
+        let mut lamp_preview = lot.buy_start(lamp.guid, 1, 2).unwrap().unwrap();
+        assert!(lot.buy_move(&mut lamp_preview, [520, 472], 1).unwrap());
+        assert_eq!(lamp_preview.container.map(|(c, _)| c), Some(desk_id2));
+        assert!(lot.buy_undo().unwrap());
+        assert!(lot.world().objects[&desk_id2].position[0] < 0);
+        let saved_under_preview = lot
+            .save_without_buy_cursor(&lamp_preview)
+            .expect("save strips unpaid preview before purging undone desk");
+        assert!(!saved_under_preview.world().objects.contains_key(&desk_id2));
+        assert!(
+            !saved_under_preview
+                .world()
+                .objects
+                .contains_key(&lamp_preview.held)
+        );
+        assert!(
+            !saved_under_preview
+                .world()
+                .objects
+                .contains_key(&lamp_preview.cursor)
+        );
+        lot.buy_cancel(&lamp_preview).unwrap();
+    }
 
     // Missing CTSS fallback (`0x457d3b`): lamps without CTSS 2008 take their
     // OBJD chunk label instead of sorting with an empty name.
@@ -5961,22 +5968,25 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
     assert_eq!(game.buy_selected(), Some(0x26bf_bb29));
     assert!(game.lot().world().objects[&first_chair].position[0] < 0);
     assert_eq!(game.lot().world().budget.funds, 2542);
-    // Step back the refused record to Redo: native `0x48bd21` -> `0x48c0ea` ->
-    // `0x48bd88` refunds `$80` whenever the retained instance still exists;
-    // cancelling the blocking preview and redoing then re-charges `$80`.
-    assert!(game.undo_buy());
-    assert_eq!(game.lot().world().budget.funds, 2542 + 80);
+    // Undoing a refused `Buy` Redo record must NOT double-refund `$80`: it
+    // returns `false`, clears Undo (`0x4932fa` -> `0x493376`), purges the
+    // detached `first_chair`, and leaves funds at `$2542`.
+    assert!(!game.undo_buy());
+    assert_eq!(game.lot().world().budget.funds, 2542);
+    assert!(!game.lot().world().objects.contains_key(&first_chair));
+    // Commit the armed `second` preview at `spot` (`$2542 -> $2462`) and
+    // cancel its repeat preview so the remaining assertions test `first_chair`
+    // Undo/Redo with exact accounting.
+    game.press(spot);
+    game.release(spot);
+    let first_chair = second.held;
+    let first_reg = game.lot().world().objects[&first_chair].registry_word;
     assert!(game.cancel_buy());
     assert!(game.buy_cursor().is_none());
-    assert!(game.redo_buy());
     assert!(game.lot().world().objects[&first_chair].position[0] >= 0);
-    assert_eq!(
-        game.lot().world().objects[&first_chair].registry_word,
-        first_reg
-    );
     assert_eq!(game.lot().world().objects.len(), objs_before + 1);
     let funds_after_buy = game.lot().world().budget.funds;
-    assert_eq!(funds_after_buy, 2542);
+    assert_eq!(funds_after_buy, 2542 - 80);
 
     // Unrelated Undo while holding a manually rotated surface item (`0x421e72`):
     // click Back (`[234, 550]`), Lighting (`[337, 570]`), and slot 0
@@ -6864,7 +6874,7 @@ fn buy_mode_hand_tool_guards_depreciation_undo_redo_and_followups() {
 
     // --- 2. Game-level drag-to-drop, Shift no-duplicate, catalog-drop sell,
     //        second Buy click sort toggle, and `x`/`z` catalog paging ---
-    let mut game = Game::open(&options(install)).expect("open Goth house");
+    let mut game = Game::open(&options(install.clone())).expect("open Goth house");
     game.resize([800, 600]);
     game.render();
     assert_eq!(game.run(60), 60);
@@ -7118,6 +7128,127 @@ fn buy_mode_hand_tool_guards_depreciation_undo_redo_and_followups() {
     assert!(game.sell_held()); // handled, refused with UI_error
     assert!(game.buy_cursor().is_some()); // still held
     game.cancel_buy();
+
+    // --- 3. Sol Round 2 regressions: refused snapback rollback, refused Buy
+    //        Redo no double-refund, same-minute comeandsee registration order,
+    //        and F1 preserving Redo until after update_comeandsee ---
+    {
+        let mut lot2 = Lot::load(&install, &goth_house(&install), &[3], Frames::default()).unwrap();
+        for _ in 0..60 {
+            lot2.step().unwrap();
+        }
+        lot2.set_mode(sims_vm::PanelMode::Buy).unwrap();
+        let chair_guid = 0x26bf_bb29u32;
+
+        // P2 #1: refused snapback rolls back instead of leaving paid chair off-lot.
+        let mut c = lot2.buy_start(chair_guid, 1, 2).unwrap().unwrap();
+        assert!(lot2.buy_move(&mut c, [584, 472], 1).unwrap());
+        let chair_id = lot2.buy_commit(&c).unwrap();
+        let mut held = lot2.buy_pick_up(chair_id).unwrap().unwrap();
+        assert!(lot2.buy_move(&mut held, [632, 440], 1).unwrap());
+        let mut blocker = lot2.buy_start(chair_guid, 1, 2).unwrap().unwrap();
+        assert!(lot2.buy_move(&mut blocker, [584, 472], 1).unwrap());
+        assert!(lot2.buy_snap_back(&held).is_err());
+        assert_eq!(lot2.world().objects[&chair_id].position, [632, 440, 1]);
+        assert!(lot2.world().objects.contains_key(&held.cursor));
+        lot2.buy_cancel(&blocker).unwrap();
+        lot2.buy_snap_back(&held).unwrap();
+        assert_eq!(lot2.world().objects[&chair_id].position, [584, 472, 1]);
+
+        // P2 #4: refused Buy Redo transferred to Undo must NOT double-refund.
+        let funds_before_undo = lot2.world().budget.funds;
+        assert!(lot2.buy_undo().unwrap());
+        assert_eq!(lot2.world().budget.funds, funds_before_undo + 80);
+        let mut blocker2 = lot2.buy_start(chair_guid, 1, 2).unwrap().unwrap();
+        assert!(lot2.buy_move(&mut blocker2, [584, 472], 1).unwrap());
+        assert!(!lot2.buy_redo().unwrap());
+        assert_eq!(lot2.world().budget.funds, funds_before_undo + 80);
+        assert!(!lot2.buy_undo().unwrap());
+        assert_eq!(lot2.world().budget.funds, funds_before_undo + 80);
+        lot2.buy_cancel(&blocker2).unwrap();
+
+        // P2 #3: two same-minute purchases receive `comeandsee` markers in
+        // `world.order` (newest-first) order (`0x40726a`).
+        let mut a = lot2.buy_start(chair_guid, 1, 2).unwrap().unwrap();
+        assert!(lot2.buy_move(&mut a, [584, 472], 1).unwrap());
+        let id_a = lot2.buy_commit(&a).unwrap();
+        let mut b = lot2.buy_start(chair_guid, 1, 2).unwrap().unwrap();
+        assert!(lot2.buy_move(&mut b, [632, 440], 1).unwrap());
+        let id_b = lot2.buy_commit(&b).unwrap();
+        assert!(id_b > id_a);
+        lot2.set_mode(sims_vm::PanelMode::Live).unwrap();
+        let marker_of = |id: u16| -> u16 {
+            lot2.world().objects[&id]
+                .relationships
+                .iter()
+                .find_map(|r| {
+                    let target = u16::try_from(r.target).ok()?;
+                    lot2.world()
+                        .objects
+                        .get(&target)
+                        .filter(|o| o.guid == sims_vm::COMEANDSEE_GUID)
+                        .map(|_| target)
+                })
+                .expect("comeandsee marker attached")
+        };
+        let marker_a = marker_of(id_a);
+        let marker_b = marker_of(id_b);
+        assert!(
+            marker_b < marker_a,
+            "newer chair {id_b} must receive lower comeandsee ID than older chair {id_a} (got {marker_b} vs {marker_a})"
+        );
+    }
+
+    // P2 #2: F1 while holding an existing object with an undone chair in Redo
+    // snaps the held object back WITHOUT purging Redo before `update_comeandsee`
+    // (`0x4cea5d` -> `0x40726a` -> `0x4933dc`), so the surviving chair's marker
+    // does NOT reuse the undone chair's ID.
+    {
+        let mut g2 = Game::open(&options(install)).expect("open Goth house");
+        g2.resize([800, 600]);
+        g2.render();
+        assert_eq!(g2.run(60), 60);
+        g2.set_mode(Mode::Buy);
+        g2.press([258, 524]); // Seating
+        g2.release([258, 524]);
+        g2.press([437, 523]); // Werkbunnst Chair
+        g2.release([437, 523]);
+        g2.hover([577, 432]);
+        let chair1 = g2.buy_cursor().unwrap().held;
+        g2.press([577, 432]);
+        g2.release([577, 432]);
+        g2.hover([555, 420]);
+        let chair2 = g2.buy_cursor().unwrap().held;
+        g2.press([555, 420]);
+        g2.release([555, 420]);
+        g2.cancel_buy();
+        assert!(g2.undo_buy()); // chair2 detached in Redo
+        assert!(g2.lot().world().objects[&chair2].position[0] < 0);
+        g2.render();
+        let bench_pt = recorded([432, 230]);
+        g2.press(bench_pt);
+        g2.release(bench_pt);
+        assert!(g2.buy_cursor().is_some_and(sims_vm::BuyCursor::is_existing));
+        g2.set_mode(Mode::Live);
+        assert!(!g2.lot().world().objects.contains_key(&chair2));
+        let marker = g2.lot().world().objects[&chair1]
+            .relationships
+            .iter()
+            .find_map(|r| {
+                let target = u16::try_from(r.target).ok()?;
+                g2.lot()
+                    .world()
+                    .objects
+                    .get(&target)
+                    .filter(|o| o.guid == sims_vm::COMEANDSEE_GUID)
+                    .map(|_| target)
+            })
+            .expect("comeandsee marker on chair1");
+        assert_ne!(
+            marker, chair2,
+            "comeandsee marker must not reuse undone chair {chair2}'s ID before 0x4933dc purge"
+        );
+    }
 }
 
 /// Opening a pie menu near the top edge of the expanded bottom control strip

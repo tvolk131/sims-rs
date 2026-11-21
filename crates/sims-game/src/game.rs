@@ -2080,9 +2080,40 @@ impl Game {
         if self.hud.controls.mode == mode {
             return;
         }
-        self.cancel_buy();
-        if self.buy_cursor.is_some() {
-            return;
+        // Native `0x4cea5d` runs `0x40726a` (`update_comeandsee`) BEFORE the
+        // Undo/Redo history purge (`0x4933dc`): snap back a held existing
+        // object via `buy_snap_back` so detached Redo records remain
+        // registered until `Lot::set_mode` purges them after `0x40726a`, while
+        // unpaid new catalog previews are deleted via `buy_cancel` (which does
+        // not touch Redo).
+        if let Some(cursor) = self.buy_cursor.take() {
+            let released = if cursor.is_existing() {
+                self.lot.buy_snap_back(&cursor)
+            } else {
+                self.lot.buy_cancel(&cursor)
+            };
+            match released {
+                Ok(()) => {
+                    self.buy_dragging = None;
+                    self.buy_grab_offset = [0, 0];
+                    self.buy_commit_on_release = false;
+                    self.buy_in_house = false;
+                    self.buy_selected = None;
+                    self.hud.buy_state.selected = None;
+                }
+                Err(e) => {
+                    self.buy_cursor = Some(cursor);
+                    self.note = Some(format!("The Buy cursor was not cancelled: {e}"));
+                    return;
+                }
+            }
+        } else {
+            self.buy_dragging = None;
+            self.buy_grab_offset = [0, 0];
+            self.buy_commit_on_release = false;
+            self.buy_in_house = false;
+            self.buy_selected = None;
+            self.hud.buy_state.selected = None;
         }
         self.close_menu();
         self.reached = None;
