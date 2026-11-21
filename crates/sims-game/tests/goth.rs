@@ -2597,11 +2597,11 @@ fn the_recorded_read_order_replayed_in_the_window_matches_the_recording() {
     run_to(&mut game, &schedule, 186);
     let person = |game: &Game, id: u16| game.lot().world().objects[&id].person.clone().unwrap();
     assert_eq!(person(&game, mortimer).active.uid, 0);
-    // The original most likely checked the entry again with the press
-    // (its mousedown ended at 163, its release at 187): the locals his
-    // new frames start with are what the check leaves with his frames as
-    // they are then. Ours checked it once, at 143 (unverified, not
-    // ported).
+    // The locals his new frames start with at 187 are what the entry's
+    // check leaves with his frames as they are from 150, so the original
+    // may have checked the entry again after 150. What made it run is
+    // not known (its mousedown ended at 163, its release at 187). Ours
+    // checked it once, at 143 (unverified, not ported).
     game.press(read);
     assert!(game.menu().is_none());
     game.hover(recorded([384, 324]));

@@ -1,4 +1,4 @@
-# The Read A Book order replays in the window; the original most likely checks the entry again with the press
+# The Read A Book order replays in the window; Mortimer's stale locals fit a second check of the entry
 
 *Decided 2026-11-20.*
 
@@ -79,7 +79,7 @@ The test pins:
 - everyone's Room motive at 606 and 607;
 - nothing caught to 900.
 
-## Open: the entry is most likely checked again with the press
+## Open: the entry may be checked a second time before the order starts
 
 This is **unverified** and not ported.
 
