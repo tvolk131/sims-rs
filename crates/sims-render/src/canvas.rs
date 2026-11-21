@@ -488,18 +488,22 @@ impl Canvas {
         let pat_rgba = &pattern.rgba;
         let mask_rgba = &mask.rgba;
         let table = blend_table();
-        let max_target = (y1 - 1) * width + x1;
-        let slice_ok = max_target <= self.color.len()
-            && max_target <= self.depth.len()
-            && max_target <= self.ids.len();
+        let slice_ok = (y1 - 1)
+            .checked_mul(width)
+            .and_then(|row| row.checked_add(x1))
+            .is_some_and(|max_target| {
+                max_target <= self.color.len()
+                    && max_target <= self.depth.len()
+                    && max_target <= self.ids.len()
+            });
         for py in y0..y1 {
             let sy = py as i32;
             let iy = (py as i64 - ay) as usize;
             let pat_row = iy * pat_w;
             let mask_row = iy * mask_w;
-            let dst_row = py * width;
             let ix_start = (x0 as i64 - ax) as usize + left_skip;
             if slice_ok {
+                let dst_row = py * width;
                 let dst_color = &mut self.color[dst_row + x0..dst_row + x1];
                 let dst_depth = &mut self.depth[dst_row + x0..dst_row + x1];
                 let dst_ids = &mut self.ids[dst_row + x0..dst_row + x1];
@@ -543,18 +547,19 @@ impl Canvas {
                         continue;
                     }
                     let d = depth(px as i32, sy);
-                    let target = dst_row + px;
+                    let target = py * width + px;
                     if d > self.depth[target].saturating_add(1) {
                         continue;
                     }
                     let rgb =
                         light(ix, iy).apply([pat_rgba[pi], pat_rgba[pi + 1], pat_rgba[pi + 2]]);
+                    let pixel = &mut self.color[target];
                     self.depth[target] = d.clamp(0, EMPTY);
                     self.ids[target] = pen;
                     if a == 255 {
-                        self.color[target] = rgb;
+                        *pixel = rgb;
                     } else {
-                        self.color[target] = blend565_with(table, rgb, self.color[target], a);
+                        *pixel = blend565_with(table, rgb, *pixel, a);
                     }
                 }
             }
@@ -610,17 +615,21 @@ impl Canvas {
         let rgba = &image.rgba;
         let depth_bytes = image.depth.as_deref();
         let table = blend_table();
-        let max_target = (y1 - 1) * width + x1;
-        let slice_ok = max_target <= self.color.len()
-            && max_target <= self.depth.len()
-            && max_target <= self.ids.len();
+        let slice_ok = (y1 - 1)
+            .checked_mul(width)
+            .and_then(|row| row.checked_add(x1))
+            .is_some_and(|max_target| {
+                max_target <= self.color.len()
+                    && max_target <= self.depth.len()
+                    && max_target <= self.ids.len()
+            });
         for py in y0..y1 {
             let sy = py as i32;
             let iy = (py as i64 - ay) as usize;
             let src_row = iy * img_w;
-            let dst_row = py * width;
             let ix_base = (x0 as i64 - ax) as usize + left_skip;
             if slice_ok {
+                let dst_row = py * width;
                 let dst_color = &mut self.color[dst_row + x0..dst_row + x1];
                 let dst_depth = &mut self.depth[dst_row + x0..dst_row + x1];
                 let dst_ids = &mut self.ids[dst_row + x0..dst_row + x1];
@@ -669,17 +678,18 @@ impl Canvas {
                     let Some(d) = depth(px as i32, sy, byte) else {
                         continue;
                     };
-                    let target = dst_row + px;
+                    let target = py * width + px;
                     if d > self.depth[target].saturating_add(slack) {
                         continue;
                     }
                     let rgb = light(ix, iy).apply([rgba[si], rgba[si + 1], rgba[si + 2]]);
+                    let pixel = &mut self.color[target];
                     self.depth[target] = d.clamp(0, EMPTY);
                     self.ids[target] = pen;
                     if a == 255 {
-                        self.color[target] = rgb;
+                        *pixel = rgb;
                     } else {
-                        self.color[target] = blend565_with(table, rgb, self.color[target], a);
+                        *pixel = blend565_with(table, rgb, *pixel, a);
                     }
                 }
             }
@@ -736,19 +746,23 @@ impl Canvas {
         let img_w = image.width;
         let rgba = &image.rgba;
         let table = blend_table();
-        let max_target = (y1 - 1) * width + x1;
-        let slice_ok = max_target <= self.color.len()
-            && max_target <= self.depth.len()
-            && max_target <= self.ids.len();
+        let slice_ok = (y1 - 1)
+            .checked_mul(width)
+            .and_then(|row| row.checked_add(x1))
+            .is_some_and(|max_target| {
+                max_target <= self.color.len()
+                    && max_target <= self.depth.len()
+                    && max_target <= self.ids.len()
+            });
         for py in y0..y1 {
             let sy = py as i32;
             let d = row_depth(sy);
             let d_clamped = d.clamp(0, EMPTY);
             let iy = (py as i64 - ay) as usize;
             let src_row = iy * img_w;
-            let dst_row = py * width;
             let ix_base = (x0 as i64 - ax) as usize + left_skip;
             if slice_ok {
+                let dst_row = py * width;
                 let dst_color = &mut self.color[dst_row + x0..dst_row + x1];
                 let dst_depth = &mut self.depth[dst_row + x0..dst_row + x1];
                 let dst_ids = &mut self.ids[dst_row + x0..dst_row + x1];
@@ -779,17 +793,18 @@ impl Canvas {
                     if a < FAINT {
                         continue;
                     }
-                    let target = dst_row + px;
+                    let target = py * width + px;
                     if d > self.depth[target] {
                         continue;
                     }
                     let rgb = light(ix, iy).apply([rgba[si], rgba[si + 1], rgba[si + 2]]);
+                    let pixel = &mut self.color[target];
                     self.depth[target] = d_clamped;
                     self.ids[target] = pen;
                     if a == 255 {
-                        self.color[target] = rgb;
+                        *pixel = rgb;
                     } else {
-                        self.color[target] = blend565_with(table, rgb, self.color[target], a);
+                        *pixel = blend565_with(table, rgb, *pixel, a);
                     }
                 }
             }
@@ -813,24 +828,28 @@ impl Canvas {
         if py >= self.height {
             return;
         }
-        let row = py * self.width;
         let pen = self.pen;
-        if x >= 0 && (x as usize).saturating_add(4) <= self.width {
-            let start = row + x as usize;
-            let end = start + 4;
-            if end <= self.depth.len() && end <= self.color.len() && end <= self.ids.len() {
-                let dst_depth = &mut self.depth[start..end];
-                let dst_color = &mut self.color[start..end];
-                let dst_ids = &mut self.ids[start..end];
-                for i in 0..4 {
-                    if depth <= dst_depth[i] {
-                        dst_depth[i] = depth_clamped;
-                        dst_color[i] = pixels[i];
-                        dst_ids[i] = pen;
-                    }
+        if x >= 0
+            && (x as usize).saturating_add(4) <= self.width
+            && let Some(start) = py
+                .checked_mul(self.width)
+                .and_then(|row| row.checked_add(x as usize))
+            && let Some(end) = start.checked_add(4)
+            && end <= self.depth.len()
+            && end <= self.color.len()
+            && end <= self.ids.len()
+        {
+            let dst_depth = &mut self.depth[start..end];
+            let dst_color = &mut self.color[start..end];
+            let dst_ids = &mut self.ids[start..end];
+            for i in 0..4 {
+                if depth <= dst_depth[i] {
+                    dst_depth[i] = depth_clamped;
+                    dst_color[i] = pixels[i];
+                    dst_ids[i] = pen;
                 }
-                return;
             }
+            return;
         }
         let w = self.width as i32;
         for (i, &rgb) in pixels.iter().enumerate() {
@@ -838,11 +857,12 @@ impl Canvas {
                 continue;
             };
             if px >= 0 && px < w {
-                let target = row + px as usize;
+                let target = py * self.width + px as usize;
                 if depth <= self.depth[target] {
+                    let pixel = &mut self.color[target];
                     self.depth[target] = depth_clamped;
-                    self.color[target] = rgb;
                     self.ids[target] = pen;
+                    *pixel = rgb;
                 }
             }
         }
@@ -879,9 +899,10 @@ impl Canvas {
         let mut idx = y0 * width + px;
         for _ in y0..=y1 {
             if depth <= self.depth[idx] {
+                let pixel = &mut self.color[idx];
                 self.depth[idx] = depth_clamped;
-                self.color[idx] = color;
                 self.ids[idx] = pen;
+                *pixel = color;
             }
             idx += width;
         }
@@ -905,14 +926,18 @@ impl Canvas {
             return;
         }
         let width = self.width;
-        let max_target = (y1 - 1) * width + x1;
-        let slice_ok = max_target <= self.color.len() && max_target <= self.depth.len();
+        let slice_ok = (y1 - 1)
+            .checked_mul(width)
+            .and_then(|row| row.checked_add(x1))
+            .is_some_and(|max_target| {
+                max_target <= self.color.len() && max_target <= self.depth.len()
+            });
         for py in y0..y1 {
             let my = (py as i64 - ay) as usize;
             let at_least = row_at_least(py as i32);
-            let dst_row = py * width;
             let mx_base = (x0 as i64 - ax) as usize;
             if slice_ok {
+                let dst_row = py * width;
                 let dst_depth = &self.depth[dst_row + x0..dst_row + x1];
                 let dst_color = &mut self.color[dst_row + x0..dst_row + x1];
                 for offset in 0..(x1 - x0) {
@@ -924,11 +949,11 @@ impl Canvas {
                 }
             } else {
                 for (offset, px) in (x0..x1).enumerate() {
-                    let target = dst_row + px;
-                    if let Some(s) = mask.shade(mx_base + offset, my, strength)
-                        && self.depth[target] >= at_least
-                    {
-                        self.color[target] = Light::from_sum(s).apply(self.color[target]);
+                    if let Some(s) = mask.shade(mx_base + offset, my, strength) {
+                        let target = py * width + px;
+                        if self.depth[target] >= at_least {
+                            self.color[target] = Light::from_sum(s).apply(self.color[target]);
+                        }
                     }
                 }
             }
@@ -1582,6 +1607,28 @@ mod tests {
         c.draw(&two, [0, 0], false, |_, _, _| 4);
         assert_eq!(c.color[0], [10, 20, 30]);
         assert_eq!(c.depth[0], 4);
+
+        // Wrapping `width = usize::MAX, height = 2` must skip transparent and
+        // `depth == None` pixels at `(0, 1)` without panicking in release mode.
+        let mut wide = Canvas::new(1, 1, [0, 0, 0]);
+        wide.width = usize::MAX;
+        wide.height = 2;
+        let transparent = image(1, 1, [1, 2, 3, 0], None);
+        wide.draw(&transparent, [0, 1], false, |_, _, _| 5);
+        wide.draw_lit(&one, [0, 1], false, Light::FULL, |_, _, _| None);
+
+        // Short `color` buffer checks `self.color[target]` before writing depth
+        // or pick ID, leaving both untouched when indexing panics.
+        let mut short_color = Canvas::new(2, 1, [0, 0, 0]);
+        short_color.color.truncate(1);
+        short_color.set_id(Some(11));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            short_color.draw(&one, [1, 0], false, |_, _, _| 5);
+        }))
+        .is_err();
+        assert!(panicked);
+        assert_eq!(short_color.depth[1], EMPTY);
+        assert_eq!(short_color.id_at(1, 0), None);
     }
 
     #[test]
