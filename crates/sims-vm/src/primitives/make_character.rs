@@ -248,6 +248,10 @@ impl Machine<'_, '_> {
             }
             self.world.dialogs.declined = -1;
             self.frame_mut()?.stack_object = record;
+            // 0x44b111..0x44b126: calls 0x4e8c5d(index, 0x1f, 1) unconditionally
+            // to build and save the new pet's portraits, regardless of whether
+            // the cloned template already carried BMP_ 2002.
+            self.build_pet_portraits(guid)?;
             Ok(true)
         }
     }
@@ -350,6 +354,7 @@ impl Machine<'_, '_> {
             return Ok(());
         }
         self.world.characters.made.remove(&guid);
+        self.world.saved_portraits.remove(&guid);
         self.world.neighbors.remove_record(record);
         Ok(())
     }
@@ -449,6 +454,7 @@ impl Machine<'_, '_> {
                  registers it over that type (0x43bda9), which is not ported"
             )));
         }
+        let template_has_saved_bitmap = self.file_has_saved_portrait(template);
         self.world.characters.made.insert(
             guid,
             Character {
@@ -457,6 +463,12 @@ impl Machine<'_, '_> {
                 strings: Default::default(),
             },
         );
+        // 0x472356..0x472519 enumerates and copies every resource currently in
+        // the template's file into `User%05d.iff`, including any BMP_ 2002
+        // written to the template during play.
+        if template_has_saved_bitmap {
+            self.world.saved_portraits.insert(guid);
+        }
         let record = self
             .world
             .neighbors

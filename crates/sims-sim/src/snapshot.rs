@@ -13,7 +13,7 @@ const LOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("lots");
 
 /// Bumped whenever [`World`]'s encoding changes, so an old snapshot is
 /// refused instead of misread.
-pub const FORMAT: u32 = 31;
+pub const FORMAT: u32 = 32;
 
 /// High bit set on [`FORMAT`] inside a `SNAPSHOTS` record when a 1-byte
 /// `HOUS 0` floor rotation (`0..=3`) immediately follows the 4-byte version

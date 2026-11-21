@@ -1120,3 +1120,52 @@ fn the_default_labels_hold_no_token_only_when_no_string_table_of_them_holds_a_do
     assert!(sims_vm::labels_hold_no_token(&install.root).unwrap());
     std::fs::remove_dir(dir.0.join("GameData/UIFAR")).unwrap();
 }
+
+#[test]
+fn characters_library_writability_checks_read_write_open() {
+    // 0x413094..0x4130dd: FlatFile::Open sets CanWrite() only when opening a
+    // loose Characters file read-write actually succeeds.
+    let dir = Dir::new("characters-writable");
+    let (_, _) = setup(&dir);
+    let mut person_a = objd(0x9001, 4096, 4096);
+    person_a[0x08..0x0a].copy_from_slice(&2i16.to_le_bytes());
+    let mut person_b = objd(0x9002, 4096, 4096);
+    person_b[0x08..0x0a].copy_from_slice(&2i16.to_le_bytes());
+    dir.file(
+        "UserData/Characters/Writable.iff",
+        &iff(&[(b"OBJD", 128, person_a), (b"BHAV", 4096, bhav(1, &[]))]),
+    )
+    .file(
+        "UserData/Characters/ReadOnly.iff",
+        &iff(&[(b"OBJD", 128, person_b), (b"BHAV", 4096, bhav(1, &[]))]),
+    );
+    let ro_path = dir.0.join("UserData/Characters/ReadOnly.iff");
+    let mut ro_perms = std::fs::metadata(&ro_path).unwrap().permissions();
+    ro_perms.set_readonly(true);
+    std::fs::set_permissions(&ro_path, ro_perms).unwrap();
+
+    let mut index = Index::build(&Install::detect(&dir.0).unwrap()).unwrap();
+    index
+        .add_characters(&dir.0.join("UserData/Characters"))
+        .unwrap();
+    let catalog = Catalog::build(&index).unwrap();
+    let program = Program::link(&index, &catalog, [0x1111, 0x9001, 0x9002]).unwrap();
+    let lamp = catalog.object(0x1111).unwrap().resource;
+    let writable = catalog.object(0x9001).unwrap().resource;
+    let read_only = catalog.object(0x9002).unwrap().resource;
+
+    assert!(!program.libraries[&lamp].writable);
+    assert!(program.libraries[&writable].writable);
+    assert!(!program.libraries[&read_only].writable);
+
+    // Restore write permission so Dir::drop can clean up on every platform.
+    let mut rw_perms = std::fs::metadata(&ro_path).unwrap().permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        rw_perms.set_mode(0o644);
+    }
+    #[cfg(not(unix))]
+    rw_perms.set_readonly(false);
+    std::fs::set_permissions(&ro_path, rw_perms).unwrap();
+}

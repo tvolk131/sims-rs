@@ -233,6 +233,10 @@ pub struct Lot {
     /// The tile at the house view's centre, if known
     /// ([`Lot::set_view_centre`]).
     view_centre: Option<[i8; 2]>,
+    /// The view rotation and centre frozen when a tick paused on an
+    /// unanswered dialog (`Stop::Asks`), so moving the camera while a
+    /// dialog is showing does not alter the tick's replay once answered.
+    replay_view: Option<(u8, Option<[i8; 2]>)>,
     /// The world's hash as the load left it, which a save carries so it
     /// goes back only into a lot loaded from the same files
     /// ([`save`]).
@@ -913,6 +917,7 @@ impl Lot {
             view_rotation,
             floor_rotation: view_rotation,
             view_centre,
+            replay_view: None,
             loaded,
         })
     }
@@ -967,6 +972,7 @@ impl Lot {
             // takes input again after this step, as the saved lot would.
             self.answered = false;
             let result = self.advance(play).map_err(Stop::into_step);
+            self.replay_view = None;
             if result.is_err() {
                 self.halted = true;
             }
@@ -978,7 +984,9 @@ impl Lot {
             });
         }
         // The tick may stop at a dialog the player has not answered; it
-        // then runs again from here once they have.
+        // then runs again from here once they have, using the original
+        // camera view (`replay_view`) even if the player moved the camera
+        // while the dialog was showing.
         let before = (
             self.world.clone(),
             self.play.clone(),
@@ -993,6 +1001,8 @@ impl Lot {
                 self.play = play;
                 self.ticks = ticks;
                 self.player = player;
+                self.replay_view
+                    .get_or_insert((self.view_rotation, self.view_centre));
                 self.asking = Some(Box::new(Asking {
                     shown,
                     world: partway,
@@ -1000,6 +1010,7 @@ impl Lot {
                 Err(StepError::Asking { tick })
             }
             result => {
+                self.replay_view = None;
                 let result = result.map_err(Stop::into_step);
                 if result.is_err() {
                     self.halted = true;
@@ -1015,11 +1026,14 @@ impl Lot {
         let asks = self.asks;
         let sounds = RefCell::new(Vec::new());
         let masks_rebuilt = Cell::new(0);
+        let (view_rotation, view_centre) = self
+            .replay_view
+            .unwrap_or((self.view_rotation, self.view_centre));
         let interpreter = Interpreter {
             sounds: Some(&sounds),
             masks_rebuilt: Some(&masks_rebuilt),
-            view_rotation: self.view_rotation,
-            view_centre: self.view_centre,
+            view_rotation,
+            view_centre,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut frame_errors = Vec::new();
@@ -1473,17 +1487,18 @@ impl Lot {
         self.view_centre
     }
 
-    /// Sets the tile at the house view's centre, `None` for not known: the
-    /// tile a dialog's portrait searches from for a tile to put a person on
-    /// (0x4e96dd, 0x4347f0, 0x4a677c, 0x4a7b58), after the interface's
-    /// work on the view's pick ([`crate::Interpreter::view_centre`]), so
-    /// the simulation reads it, and it is an input like [`Lot::set_view_rotation`]: the view
-    /// that shows the lot would set it whenever its camera moves, and a
-    /// recording of play must note each change. Where it is not known and
-    /// the tile searched from would change what the portrait does, the
-    /// step fails as an unported branch does.
-    /// [`Lot::load`] leaves it not known (which camera the original opens a
-    /// house with is not traced); [`Lot::load_viewed`] takes it.
+    /// Sets the view-rotated tile pick at the house view's centre, `None`
+    /// for not known: the pick a dialog's portrait resolves into its search
+    /// start (`0x4e96dd`, `0x4347f0`, `0x4a677c`, `0x4a7b58`, bounds-checked
+    /// at `0x434891` and un-rotated at `0x43491c`;
+    /// [`crate::Interpreter::view_centre`]). Because the simulation reads it,
+    /// it is an input like [`Lot::set_view_rotation`]: the view that shows
+    /// the lot sets it whenever its camera moves, and a recording of play
+    /// must note each change. Where it is not known and the tile searched
+    /// from would change what the portrait does, the step fails as an
+    /// unported branch does. [`Lot::load`] leaves it not known (which camera
+    /// the original opens a house with is not traced); [`Lot::load_viewed`]
+    /// takes it.
     pub fn set_view_centre(&mut self, centre: Option<[i8; 2]>) {
         self.view_centre = centre;
     }
@@ -1563,6 +1578,7 @@ mod tests {
             view_rotation: 0,
             floor_rotation: 0,
             view_centre: None,
+            replay_view: None,
             loaded,
         }
     }
@@ -1764,5 +1780,601 @@ mod tests {
             .unwrap();
         assert_eq!(matching.floor_rotation(), 0);
         assert_eq!(matching.view_rotation(), 1);
+    }
+
+    #[test]
+    fn a_dialog_tick_replays_with_its_frozen_view_even_when_the_view_affects_the_tick() {
+        use sims_formats::behavior::{Behavior, Instruction};
+        use sims_formats::saved_objects::{Frame, Interaction, Person, Slot};
+        use sims_sim::Object;
+
+        const GUID: u32 = 0x1111;
+        const SIM_GUID: u32 = 0x2222;
+        let mut def = [0i16; crate::DEFINITION_WORDS];
+        def[9] = 4; // non-person object
+        def[14] = GUID as u16 as i16;
+        def[15] = (GUID >> 16) as u16 as i16;
+
+        // Node 0: Generic Sims Call 12 (tile_depth: reads view_rotation into temp 0).
+        // Node 1: two-button Dialog (yields and asks the player on tick 1).
+        // Node 2: Generic Sims Call 12 again on tick 2 (reads the moved view_rotation).
+        let behavior = Behavior {
+            format: 0x8002,
+            kind: 0,
+            args: 0,
+            locals: 0,
+            revision: 0,
+            instructions: vec![
+                Instruction {
+                    opcode: 1,
+                    on_true: 1,
+                    on_false: 253,
+                    operands: [12, 0, 0, 0, 0, 0, 0, 0],
+                },
+                Instruction {
+                    opcode: 36,
+                    on_true: 2,
+                    on_false: 2,
+                    operands: [0, 0, 0, 0, 0, 1, 0, 0],
+                },
+                Instruction {
+                    opcode: 1,
+                    on_true: 3,
+                    on_false: 253,
+                    operands: [12, 0, 0, 0, 0, 0, 0, 0],
+                },
+                Instruction {
+                    opcode: 0,
+                    on_true: 3,
+                    on_false: 253,
+                    operands: [0; 8],
+                },
+            ],
+        };
+        let mut library = crate::Library::default();
+        library.definitions.insert(128, def);
+        library.definition_order.push(128);
+        library.behaviors.insert(4096, behavior);
+
+        let interaction = Interaction {
+            join: 0,
+            uid: 0,
+            caller: 0,
+            target: 0,
+            icon: 0,
+            table_index: 0,
+            args: [0; 4],
+            priority: 0,
+            action: 0,
+            attenuation: 0.0,
+            flags: 0,
+        };
+        let mut world = World::empty();
+        world.size = 64;
+        world.globals[3] = 2;
+        world.order = vec![1, 2];
+        world.people = vec![2];
+        world.types.insert(1, GUID);
+        world.types.insert(2, SIM_GUID);
+        world.objects.insert(
+            1,
+            Object {
+                id: 1,
+                guid: GUID,
+                footprint: [0; 4],
+                position: [10 << 4, 20 << 4, 0],
+                unknown_short: 0,
+                attributes: Vec::new(),
+                temps: vec![0; 8],
+                data: vec![0; 72],
+                obsolete_word: 0,
+                stack_capacity_bytes: 0,
+                stack: vec![Frame {
+                    stack_object: 1,
+                    tree: 4096,
+                    node: 0,
+                    parameters: vec![1, 0, 0, 0],
+                    locals: Vec::new(),
+                    primitive_state: 0,
+                    code_owner_type: 1,
+                }],
+                relationship_flag: -1,
+                relationships: Vec::new(),
+                slots: vec![Slot {
+                    unknown: 0,
+                    object: 0,
+                }],
+                dynamic_sprites: Vec::new(),
+                multipart: None,
+                portal: None,
+                person: None,
+                registry_word: Some((1 << 16) | 0xffff),
+                last_result: false,
+                removal_skips_resets: false,
+                selected: false,
+            },
+        );
+        world.objects.insert(
+            2,
+            Object {
+                id: 2,
+                guid: SIM_GUID,
+                footprint: [0; 4],
+                position: [0; 3],
+                unknown_short: 0,
+                attributes: Vec::new(),
+                temps: vec![0; 8],
+                data: vec![0; 72],
+                obsolete_word: 0,
+                stack_capacity_bytes: 0,
+                stack: Vec::new(),
+                relationship_flag: -1,
+                relationships: Vec::new(),
+                slots: vec![Slot {
+                    unknown: 0,
+                    object: 0,
+                }],
+                dynamic_sprites: Vec::new(),
+                multipart: None,
+                portal: None,
+                person: Some(Person {
+                    animation_events: 0,
+                    engaged: 0,
+                    appearance: Default::default(),
+                    accessories: Vec::new(),
+                    animations: Default::default(),
+                    routing_state: 0,
+                    floats: [0.0; 9],
+                    previous_motives: [0.0; 16],
+                    motives: [0.0; 16],
+                    data: vec![0; 256],
+                    routing_frames: 0,
+                    active: interaction.clone(),
+                    last: interaction,
+                    queue: Vec::new(),
+                    object_uses: Vec::new(),
+                    motive_deltas: Vec::new(),
+                }),
+                registry_word: None,
+                last_result: false,
+                removal_skips_resets: false,
+                selected: true,
+            },
+        );
+        let make_lot = || {
+            let mut l = lot(world.clone(), true, Frames::parse("none").unwrap());
+            l.tuning = Some(tuning());
+            l.program.labels_hold_no_token = true;
+            l.program.libraries.insert(0, crate::Library::default());
+            l.program.libraries.insert(1, library.clone());
+            l.program.semi_globals.insert(1, None);
+            l.catalog.objects.push(sims_content::Object {
+                guid: GUID,
+                resource: 1,
+                chunk: 128,
+                kind: 4,
+                master: 0,
+            });
+            l.catalog.by_guid.insert(GUID, 0);
+            l.catalog.semi_globals.insert(1, None);
+            l
+        };
+
+        let mut asked = make_lot();
+        asked.wait_for_answers();
+        asked.set_view_rotation(0);
+        asked.set_view_centre(Some([10, 12]));
+        // Tick 1 pauses on the dialog and freezes (0, Some([10, 12])).
+        assert_eq!(asked.step().unwrap_err(), StepError::Asking { tick: 1 });
+        // Moving the camera while waiting updates the live view, not the frozen replay view.
+        asked.set_view_rotation(2);
+        asked.set_view_centre(Some([40, 42]));
+        asked.answer(2).unwrap();
+        let bytes = asked.save().unwrap().encode();
+
+        let mut restored = make_lot();
+        restored.wait_for_answers();
+        restored
+            .restore(super::save::Saved::decode(&bytes).unwrap())
+            .unwrap();
+        assert_eq!(restored.view_rotation(), 2);
+        assert_eq!(restored.view_centre(), Some([40, 42]));
+        // Replaying tick 1 must use rotation 0: -(10 + 20) = -30, not rotation 2: -(53 + 43) = -96.
+        restored.step().unwrap();
+        assert_eq!(restored.world().objects[&1].temps[0], -30);
+        // After the dialog tick finishes, tick 2 uses the moved rotation 2: -(53 + 43) = -96.
+        restored.step().unwrap();
+        assert_eq!(restored.world().objects[&1].temps[0], -96);
+    }
+
+    #[test]
+    fn a_dialog_tick_replays_with_its_frozen_view_centre_across_save_and_restore() {
+        use sims_content::{Profile, Skeleton};
+        use sims_formats::behavior::{Behavior, Instruction};
+        use sims_formats::execution::ObjectFunction;
+        use sims_formats::lot::Array;
+        use sims_formats::saved_objects::{Frame, Interaction, Person, Slot};
+        use sims_formats::tuning::{Constant, Constants};
+        use sims_sim::Object;
+        use sims_sim::neighbors::Neighbor;
+
+        const LAMP_GUID: u32 = 0x1111;
+        const SIM_GUID: u32 = 0x2222;
+        const PERSON_A: u32 = 0x3333_0001;
+        const PERSON_B: u32 = 0x3333_0002;
+
+        let array = |stride: usize, fill: u8| Array {
+            width: 64,
+            height: 64,
+            stride,
+            encoding: 0,
+            data: vec![fill; 64 * 64 * stride],
+        };
+        let assign = |left_scope: u8, left: i16, right_scope: u8, right: i16, next: u8| {
+            let [l0, l1] = left.to_le_bytes();
+            let [r0, r1] = right.to_le_bytes();
+            Instruction {
+                opcode: 2,
+                on_true: next,
+                on_false: next,
+                operands: [l0, l1, r0, r1, 0, 5, left_scope, right_scope],
+            }
+        };
+        let person_def = |guid: u32| {
+            let mut def = [0i16; crate::DEFINITION_WORDS];
+            def[9] = 2;
+            def[14] = guid as u16 as i16;
+            def[15] = (guid >> 16) as u16 as i16;
+            def
+        };
+        let mut lamp_def = [0i16; crate::DEFINITION_WORDS];
+        lamp_def[9] = 4;
+        lamp_def[14] = LAMP_GUID as u16 as i16;
+        lamp_def[15] = (LAMP_GUID >> 16) as u16 as i16;
+
+        // Object 1's script:
+        // Node 0..1: show two-button dialog with neighbor 1's portrait (PERSON_A).
+        // Node 2..3: on the next tick, show two-button dialog with neighbor 2's portrait (PERSON_B).
+        let lamp_bhav = Behavior {
+            format: 0x8002,
+            kind: 0,
+            args: 0,
+            locals: 0,
+            revision: 0,
+            instructions: vec![
+                assign(10, 0, 7, 1, 1), // Stack Object := 1 (neighbor 1 = PERSON_A)
+                Instruction {
+                    opcode: 36,
+                    on_true: 2,
+                    on_false: 2,
+                    operands: [0, 0, 0, 0, 0, 1, 0, 2 << 1],
+                },
+                assign(10, 0, 7, 2, 3), // Stack Object := 2 (neighbor 2 = PERSON_B)
+                Instruction {
+                    opcode: 36,
+                    on_true: 4,
+                    on_false: 4,
+                    operands: [0, 0, 0, 0, 0, 1, 0, 2 << 1],
+                },
+                Instruction {
+                    opcode: 0,
+                    on_true: 4,
+                    on_false: 253,
+                    operands: [0; 8],
+                },
+            ],
+        };
+        // Person Init: allow ground level (data[4] = 1) and no-floor placement (data[42] = 2).
+        let person_init = Behavior {
+            format: 0x8002,
+            kind: 0,
+            args: 0,
+            locals: 0,
+            revision: 0,
+            instructions: vec![assign(3, 4, 7, 1, 1), assign(3, 42, 7, 2, 254)],
+        };
+
+        let mut global = crate::Library::default();
+        for id in [1, 5, 6] {
+            global.tuning.insert(
+                id,
+                Constants {
+                    version: 0,
+                    entries: Vec::<Constant>::new(),
+                },
+            );
+        }
+        for id in [502, 504] {
+            global
+                .strings
+                .insert(id, vec!["(-100;1)(100;1)".to_owned(); 7]);
+        }
+
+        let mut lamp_lib = crate::Library::default();
+        lamp_lib.definitions.insert(128, lamp_def);
+        lamp_lib.definition_order.push(128);
+        lamp_lib.behaviors.insert(4096, lamp_bhav);
+
+        let make_person_lib = |guid: u32| {
+            let mut lib = crate::Library {
+                writable: true,
+                ..Default::default()
+            };
+            lib.definitions.insert(128, person_def(guid));
+            lib.definition_order.push(128);
+            lib.behaviors.insert(4096, person_init.clone());
+            lib.behaviors.insert(
+                4097,
+                Behavior {
+                    format: 0x8002,
+                    kind: 0,
+                    args: 1,
+                    locals: 0,
+                    revision: 0,
+                    instructions: vec![
+                        assign(9, 0, 7, 10, 1),
+                        Instruction {
+                            opcode: 0,
+                            on_true: 0,
+                            on_false: 253,
+                            operands: [0; 8],
+                        },
+                    ],
+                },
+            );
+            lib.callbacks.insert(
+                128,
+                vec![
+                    ObjectFunction {
+                        condition: 0,
+                        action: 4096,
+                    },
+                    ObjectFunction {
+                        condition: 0,
+                        action: 4097,
+                    },
+                ],
+            );
+            lib
+        };
+
+        let interaction = Interaction {
+            join: 0,
+            uid: 0,
+            caller: 0,
+            target: 0,
+            icon: 0,
+            table_index: 0,
+            args: [0; 4],
+            priority: 0,
+            action: 0,
+            attenuation: 0.0,
+            flags: 0,
+        };
+        let mut world = World::empty();
+        world.size = 6;
+        world.globals[3] = 2;
+        world.globals[9] = 1;
+        world.families.push(sims_sim::neighbors::Family {
+            id: 1,
+            house: 0,
+            members: vec![SIM_GUID],
+            friends: 0,
+            stale: false,
+        });
+        world.indicators = [1, 2];
+        world.order = vec![1, 2];
+        world.people = vec![2];
+        world.types.insert(1, LAMP_GUID);
+        world.types.insert(2, SIM_GUID);
+        world.types.insert(3, PERSON_A);
+        world.types.insert(4, PERSON_B);
+        world.arrays.insert(0, array(4, 0));
+        for (floors, walls, flags) in [(1, 2, 8), (101, 102, 108)] {
+            world.arrays.insert(floors, array(2, 0));
+            world.arrays.insert(walls, array(14, 0));
+            world.arrays.insert(flags, array(1, 0));
+        }
+        world.arrays.insert(3, array(2, 0));
+        world.arrays.insert(103, array(2, 0));
+        world.arrays.insert(9, array(1, 0xff));
+        world.arrays.insert(10, array(1, 0xff));
+        // Room 1 everywhere, except tile (2, 2) is isolated in room 9 and occupied by object 1.
+        // Searching from [1, 1] succeeds in room 1; searching from [2, 2] finds no tile in room 9.
+        world.rooms.map[0] = vec![1; 64 * 64];
+        world.rooms.map[1] = vec![1024; 64 * 64];
+        world.rooms.map[0][2 * 64 + 2] = 9;
+        let grid = &mut world.arrays.get_mut(&3).unwrap().data;
+        grid[(2 * 64 + 2) * 2..(2 * 64 + 2) * 2 + 2].copy_from_slice(&1i16.to_le_bytes());
+
+        world.neighbors.slots = vec![
+            Some(Neighbor {
+                id: 1,
+                guid: PERSON_A,
+                revision: 7,
+                data: vec![12; 256],
+                relationships: Vec::new(),
+                friends: 0,
+                stale: false,
+            }),
+            Some(Neighbor {
+                id: 2,
+                guid: PERSON_B,
+                revision: 7,
+                data: vec![12; 256],
+                relationships: Vec::new(),
+                friends: 0,
+                stale: false,
+            }),
+        ];
+        world.objects.insert(
+            1,
+            Object {
+                id: 1,
+                guid: LAMP_GUID,
+                footprint: [0; 4],
+                position: [2 << 4, 2 << 4, 0],
+                unknown_short: 0,
+                attributes: Vec::new(),
+                temps: vec![0; 8],
+                data: vec![0; 72],
+                obsolete_word: 0,
+                stack_capacity_bytes: 0,
+                stack: vec![Frame {
+                    stack_object: 1,
+                    tree: 4096,
+                    node: 0,
+                    parameters: vec![1, 0, 0, 0],
+                    locals: Vec::new(),
+                    primitive_state: 0,
+                    code_owner_type: 1,
+                }],
+                relationship_flag: -1,
+                relationships: Vec::new(),
+                slots: vec![Slot {
+                    unknown: 0,
+                    object: 0,
+                }],
+                dynamic_sprites: Vec::new(),
+                multipart: None,
+                portal: None,
+                person: None,
+                registry_word: Some((1 << 16) | 0xffff),
+                last_result: false,
+                removal_skips_resets: false,
+                selected: false,
+            },
+        );
+        world.objects.insert(
+            2,
+            Object {
+                id: 2,
+                guid: SIM_GUID,
+                footprint: [0; 4],
+                position: [0; 3],
+                unknown_short: 0,
+                attributes: Vec::new(),
+                temps: vec![0; 8],
+                data: vec![0; 72],
+                obsolete_word: 0,
+                stack_capacity_bytes: 0,
+                stack: Vec::new(),
+                relationship_flag: -1,
+                relationships: Vec::new(),
+                slots: vec![Slot {
+                    unknown: 0,
+                    object: 0,
+                }],
+                dynamic_sprites: Vec::new(),
+                multipart: None,
+                portal: None,
+                person: Some(Person {
+                    animation_events: 0,
+                    engaged: 0,
+                    appearance: Default::default(),
+                    accessories: Vec::new(),
+                    animations: Default::default(),
+                    routing_state: 0,
+                    floats: [0.0; 9],
+                    previous_motives: [0.0; 16],
+                    motives: [0.0; 16],
+                    data: vec![0; 256],
+                    routing_frames: 0,
+                    active: interaction.clone(),
+                    last: interaction,
+                    queue: Vec::new(),
+                    object_uses: Vec::new(),
+                    motive_deltas: Vec::new(),
+                }),
+                registry_word: None,
+                last_result: false,
+                removal_skips_resets: false,
+                selected: true,
+            },
+        );
+
+        let make_lot = || {
+            let mut l = lot(world.clone(), true, Frames::parse("none").unwrap());
+            l.tuning = Some(tuning());
+            l.program.labels_hold_no_token = true;
+            l.program.libraries.insert(0, global.clone());
+            l.program.libraries.insert(1, lamp_lib.clone());
+            l.program.libraries.insert(2, make_person_lib(PERSON_A));
+            l.program.libraries.insert(3, make_person_lib(PERSON_B));
+            for res in [1, 2, 3] {
+                l.program.semi_globals.insert(res, None);
+                l.catalog.semi_globals.insert(res, None);
+            }
+            for (idx, (guid, res, kind)) in [(LAMP_GUID, 1, 4), (PERSON_A, 2, 2), (PERSON_B, 3, 2)]
+                .into_iter()
+                .enumerate()
+            {
+                l.catalog.objects.push(sims_content::Object {
+                    guid,
+                    resource: res,
+                    chunk: 128,
+                    kind,
+                    master: 0,
+                });
+                l.catalog.by_guid.insert(guid, idx);
+            }
+            for (guid, name) in [(PERSON_A, "person_a"), (PERSON_B, "person_b")] {
+                l.program.people.skeletons.insert(
+                    guid,
+                    Skeleton {
+                        name: name.into(),
+                        file: format!("{name}.bcf"),
+                        place: 0,
+                        scales: vec![vec![1]],
+                        bones: Vec::new(),
+                    },
+                );
+                l.program.people.profiles.insert(
+                    guid,
+                    Profile {
+                        gender: None,
+                        age: None,
+                        skin: None,
+                        tones: Vec::new(),
+                        rig: Default::default(),
+                    },
+                );
+            }
+            l
+        };
+
+        let mut asked = make_lot();
+        asked.wait_for_answers();
+        asked.set_view_rotation(0);
+        // Start with [1, 1] (free room 1): PERSON_A's portrait search succeeds and
+        // tick 1 pauses on the dialog, freezing replay_view = Some((0, Some([1, 1]))).
+        asked.set_view_centre(Some([1, 1]));
+        assert_eq!(asked.step().unwrap_err(), StepError::Asking { tick: 1 });
+
+        // Move the camera to [2, 2] (blocked room 9) while the dialog waits, then
+        // answer and round-trip through save/restore.
+        asked.set_view_centre(Some([2, 2]));
+        asked.answer(2).unwrap();
+        let bytes = asked.save().unwrap().encode();
+
+        let mut restored = make_lot();
+        restored.wait_for_answers();
+        restored
+            .restore(super::save::Saved::decode(&bytes).unwrap())
+            .unwrap();
+        assert_eq!(restored.view_centre(), Some([2, 2]));
+        // Tick 1 replay MUST use frozen [1, 1] so PERSON_A's portrait succeeds
+        // (using the moved [2, 2] would hit the no-tile trap).
+        restored.step().unwrap();
+        assert!(restored.world().portraits.contains(&PERSON_A));
+        assert!(restored.world().saved_portraits.contains(&PERSON_A));
+
+        // Tick 2 runs after replay_view is cleared, so PERSON_B's portrait search
+        // MUST use the moved live [2, 2] and hit the no-tile trap (0x4e9706 / 0x4e938c).
+        let err = restored.step().unwrap_err().to_string();
+        assert!(
+            err.contains("0x4e9706") && err.contains("0x4e938c"),
+            "{err}"
+        );
     }
 }

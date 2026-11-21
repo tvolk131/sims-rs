@@ -354,9 +354,29 @@ fn a_template_byte_past_two_with_non_negative_age_fails_loudly_after_the_clone()
 }
 
 fn add_pet_templates(fx: &mut Fixture) {
-    for (template, gender) in [(TEMPLATE_DOG, "dogmale"), (TEMPLATE_CAT, "catmale")] {
-        fx.add_type(template, 2, 0, 0);
-        fx.world.neighbors.make_record(template).unwrap();
+    fx.program.expansions |= 0x20;
+    crate::rooms::build(fx);
+    fx.world.arrays.insert(3, crate::rooms::array(2, 0));
+    fx.world.arrays.insert(103, crate::rooms::array(2, 0));
+    fx.world.arrays.insert(9, crate::rooms::array(1, 0xff));
+    fx.world.arrays.insert(10, crate::rooms::array(1, 0xff));
+    fx.world.indicators = [LAMP, SIM];
+    let init = tree(vec![
+        assign(scope::MY_DATA, 4, scope::LITERAL, 1, 1),
+        assign(scope::MY_DATA, 42, scope::LITERAL, 2, RETURN_TRUE),
+    ]);
+    let main = tree(vec![
+        assign(scope::PARAMETERS, 0, scope::LITERAL, 100, 1),
+        ins(0, 0, 0, [0; 8]),
+    ]);
+    for (template, skeleton, gender) in [
+        (TEMPLATE_DOG, "dog", "dogmale"),
+        (TEMPLATE_CAT, "kat", "catmale"),
+    ] {
+        let file = fx.add_type(template, 2, 4096, 4097);
+        fx.add(file, 4096, init.clone());
+        fx.add(file, 4097, main.clone());
+        crate::person_factory::equip(fx, template, skeleton, 12);
         fx.program.people.profiles.insert(
             template,
             Profile {
@@ -382,10 +402,14 @@ fn pets_force_adult_age_set_pet_strings_and_use_declined_or_draw() {
         (2, TEMPLATE_CAT, 0, "kat", "catmale"),
         (2, TEMPLATE_CAT, 1, "kat", "catfemale"),
     ] {
-        // Default registry word 0x100 is -1 (0x43f72d): draws 1 game RNG.
+        // Default registry word 0x100 is -1 (0x43f72d): draws 1 game RNG,
+        // then runs 0x44b126 → 0x4e8c5d(index, 0x1f, 1) populating slot 1
+        // and saving BMP_ 2002 without leaving the temporary pet behind.
         let mut fx = fixture(0, 5, sex, species, &TONES);
         add_pet_templates(&mut fx);
         assert_eq!(fx.world.dialogs.declined, -1);
+        let people_before = fx.world.people.clone();
+        let objects_before = fx.world.objects.len();
         let mut lot = fx.world.lot_rng;
         assert_eq!(fx.run(), Ok(true));
         let guid = expected_guid();
@@ -403,6 +427,11 @@ fn pets_force_adult_age_set_pet_strings_and_use_declined_or_draw() {
         lot.next_u32();
         assert_eq!(fx.world.lot_rng, lot);
         assert_eq!(fx.world.dialogs.declined, -1);
+        assert_eq!(fx.world.portraits, [guid].into());
+        assert_eq!(fx.world.saved_portraits, [guid].into());
+        assert!(fx.world.dirty_portraits.is_empty());
+        assert_eq!(fx.world.people, people_before);
+        assert_eq!(fx.world.objects.len(), objects_before);
         let record = fx.world.neighbors.first_of(guid).unwrap();
         assert_eq!(fx.world.globals[34], record.id);
 
@@ -415,6 +444,8 @@ fn pets_force_adult_age_set_pet_strings_and_use_declined_or_draw() {
         assert_eq!(fx.run(), Ok(true));
         assert_eq!(fx.world.lot_rng, lot_before);
         assert_eq!(fx.world.dialogs.declined, -1);
+        assert_eq!(fx.world.portraits, [guid].into());
+        assert_eq!(fx.world.saved_portraits, [guid].into());
     }
 }
 
@@ -637,4 +668,149 @@ fn a_new_guid_another_type_has_fails_loudly() {
     let mut fx = fixture(0, 30, 0, 0, &TONES);
     fx.add_type(expected_guid(), 7, 0, 0);
     unsupported(trap(fx.run()), "0x43bda9");
+}
+
+#[test]
+fn pet_creation_runs_0x4e8c5d_portrait_build_even_when_template_has_bmp_2002() {
+    // 0x44b126 → 0x4e8c5d(index, 0x1f, 1) creates a temporary pet and runs
+    // Init unconditionally even when the cloned template already carries
+    // BMP_ 2002 (as shipped TemplateCat.iff / TemplateDog.iff do).
+    let setup = |has_bmp: bool, size: i16| {
+        let mut fx = fixture(0, 5, 0, 2, &TONES);
+        add_pet_templates(&mut fx);
+        fx.world.size = size;
+        let cat_file = fx.catalog.object(TEMPLATE_CAT).unwrap().resource;
+        let lib = fx.program.libraries.get_mut(&cat_file).unwrap();
+        lib.has_portrait_bitmap = has_bmp;
+        lib.sounds.insert(5, "pet_init_ping".into());
+        fx.add(
+            cat_file,
+            4096,
+            tree(vec![
+                assign(scope::MY_DATA, 4, scope::LITERAL, 1, 1),
+                assign(scope::MY_DATA, 42, scope::LITERAL, 2, 2),
+                ins(23, RETURN_TRUE, ERROR, [5, 0, 0, 0, 0, 0, 0, 0]),
+            ]),
+        );
+        fx
+    };
+    let count_pings = |events: &[sims_vm::SoundEvent]| {
+        events
+            .iter()
+            .filter(
+                |e| matches!(e, sims_vm::SoundEvent::Play { name, .. } if name == "pet_init_ping"),
+            )
+            .count()
+    };
+
+    // 1. Placeable lot with template carrying BMP_ 2002: still runs Init
+    //    (create + remove's reset = 2 pings) and populates slot 1 + saved.
+    let mut fx = setup(true, 6);
+    let sounds = std::cell::RefCell::new(Vec::new());
+    let mut interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    interpreter.sounds = Some(&sounds);
+    let res = interpreter.run_tree(&mut fx.world, LAMP, 4096, 0, &[], 1000);
+    assert_eq!(res, Ok(true));
+    assert_eq!(count_pings(&sounds.borrow()), 2);
+    let guid = expected_guid();
+    assert_eq!(fx.world.portraits, [guid].into());
+    assert_eq!(fx.world.saved_portraits, [guid].into());
+
+    // 2. Blocked lot (size = 2, no free tile): 0x4e9706 removes unput and
+    //    returns NULL → 0x4e8c5d returns false (ignored by 0x44b126), so
+    //    Make New Character still succeeds with 2 Init pings, leaving slot 1
+    //    empty and saved_portraits untouched.
+    let mut fx_blocked = setup(false, 2);
+    let sounds = std::cell::RefCell::new(Vec::new());
+    let mut interpreter =
+        sims_vm::Interpreter::new(&fx_blocked.program, &fx_blocked.catalog, fx_blocked.stream);
+    interpreter.sounds = Some(&sounds);
+    let res = interpreter.run_tree(&mut fx_blocked.world, LAMP, 4096, 0, &[], 1000);
+    assert_eq!(res, Ok(true));
+    assert_eq!(count_pings(&sounds.borrow()), 2);
+    assert!(fx_blocked.world.portraits.is_empty());
+    assert!(fx_blocked.world.saved_portraits.is_empty());
+
+    // 3. Mixed starts with view_centre = None: placing populates slot 1 and
+    //    saves BMP_ 2002 while removing unput does neither, so fail loudly.
+    let mut fx_mixed = setup(false, 6);
+    fx_mixed.world.rooms.map[0][64 + 1] = 9;
+    let grid = &mut fx_mixed.world.arrays.get_mut(&3).unwrap().data;
+    grid[(64 + 1) * 2..((64 + 1) * 2 + 2)].copy_from_slice(&(LAMP as i16).to_le_bytes());
+    unsupported(trap(fx_mixed.run()), "0x44b126");
+
+    // 4. Reset writing person data word 68 runs at 0x4e8fdb AFTER 0x4e8d2e
+    //    (save BMP_ 2002) and 0x4e8d6d (populate slot 1), leaving slot 1 empty
+    //    and dirty while keeping BMP_ 2002 saved.
+    let mut fx_reset = setup(false, 6);
+    let cat_file = fx_reset.catalog.object(TEMPLATE_CAT).unwrap().resource;
+    // Register Reset callback (OBJf entry 3, tree 4100) writing My Person
+    // Data 68 := 1 when remove_now runs Reset at 0x4e8fdb.
+    crate::visits::function(&mut fx_reset, cat_file, 3, 4100);
+    fx_reset.add(
+        cat_file,
+        4100,
+        tree(vec![assign(
+            scope::MY_PERSON,
+            68,
+            scope::LITERAL,
+            1,
+            RETURN_TRUE,
+        )]),
+    );
+    assert_eq!(fx_reset.run(), Ok(true));
+    let guid = expected_guid();
+    assert_eq!(fx_reset.world.saved_portraits, [guid].into());
+    assert!(!fx_reset.world.portraits.contains(&guid));
+    assert!(fx_reset.world.dirty_portraits.contains(&guid));
+}
+
+#[test]
+fn cloning_a_template_inherits_bmp_2002_saved_during_play() {
+    // 0x472356..0x472519 copies every resource currently in the template's
+    // file into the new `User%05d.iff`, including any BMP_ 2002 saved during
+    // play. A clone inherits a bitmap saved into its template BEFORE cloning,
+    // does NOT retroactively inherit one saved AFTER cloning, and failed
+    // wardrobe cleanup drops the discarded clone's entry from saved_portraits.
+    let mut fx = fixture(0, 30, 0, 0, &TONES);
+    fx.world.saved_portraits.insert(TEMPLATE_PERSON);
+    assert_eq!(fx.run(), Ok(true));
+    let guid = expected_guid();
+    assert!(
+        fx.world.saved_portraits.contains(&guid),
+        "clone inherits BMP_ 2002 saved into template before cloning"
+    );
+
+    // Failed wardrobe cleanup (bodies == 0) clears saved_portraits for the
+    // discarded clone while leaving the template's saved_portraits intact.
+    let mut fx_fail = fixture(1, 10, 0, 0, &TONES);
+    fx_fail.world.saved_portraits.insert(TEMPLATE_PERSON);
+    assert_eq!(fx_fail.run(), Ok(false));
+    assert!(fx_fail.world.saved_portraits.contains(&TEMPLATE_PERSON));
+    assert!(!fx_fail.world.saved_portraits.contains(&expected_guid()));
+
+    // Saving BMP_ 2002 into the template AFTER cloning does not affect an
+    // already-cloned character's separate User%05d.iff.
+    let mut fx_after = fixture(0, 30, 0, 0, &TONES);
+    assert_eq!(fx_after.run(), Ok(true));
+    let guid_after = expected_guid();
+    assert!(!fx_after.world.saved_portraits.contains(&guid_after));
+    fx_after.world.saved_portraits.insert(TEMPLATE_PERSON);
+    assert!(!fx_after.world.saved_portraits.contains(&guid_after));
+}
+
+#[test]
+fn pet_creation_without_pet_expansions_skips_temporary_portrait_pet_and_keeps_character() {
+    // With pet resources present and both Unleashed (0x20) and Makin' Magic
+    // (0x80) flags clear, native 0x440dd5 returns NULL -> 0x4e8c5d returns
+    // false (ignored by 0x44b126), so Make New Character still succeeds and
+    // keeps the newly cloned character without populating slot 1 or saving.
+    let mut fx = fixture(0, 5, 0, 2, &TONES);
+    add_pet_templates(&mut fx);
+    fx.program.expansions = 0;
+    assert_eq!(fx.run(), Ok(true));
+    let guid = expected_guid();
+    assert!(fx.world.characters.made.contains_key(&guid));
+    assert!(fx.world.portraits.is_empty());
+    assert!(fx.world.saved_portraits.is_empty());
 }
