@@ -239,11 +239,33 @@ impl<'a> Machine<'a, '_> {
         self.build(guid, false, Some(lead))
     }
 
+    /// Constructs a `"Tile Cursor"` object (type 9, `0x4215e6` / `0x421afb`
+    /// -> `0x4227b3` -> `0x43189d`) registered at `id` without stamping the
+    /// lot's date (so its subsequent `0x431be1` reset computes age from year
+    /// 0, month 0, matching `0x4215e6`, which skips `0x431df3`).
+    pub(crate) fn construct_tile_cursor(
+        &mut self,
+        guid: u32,
+        tile: Option<Option<u16>>,
+    ) -> Result<&'a [i16; DEFINITION_WORDS], Trap> {
+        self.build_inner(guid, false, tile, true)
+    }
+
     fn build(
         &mut self,
         guid: u32,
         person: bool,
         tile: Option<Option<u16>>,
+    ) -> Result<&'a [i16; DEFINITION_WORDS], Trap> {
+        self.build_inner(guid, person, tile, false)
+    }
+
+    fn build_inner(
+        &mut self,
+        guid: u32,
+        person: bool,
+        tile: Option<Option<u16>>,
+        tile_cursor: bool,
     ) -> Result<&'a [i16; DEFINITION_WORDS], Trap> {
         let id = self.me;
         let definition = self.definition(guid)?;
@@ -254,7 +276,14 @@ impl<'a> Machine<'a, '_> {
                 words[word::TYPE]
             )));
         }
-        if tile.is_some() {
+        if tile_cursor {
+            if words[word::TYPE] != 9 {
+                return Err(Trap::Invalid(format!(
+                    "0x{guid:08X} is not a tile cursor type (type {})",
+                    words[word::TYPE]
+                )));
+            }
+        } else if tile.is_some() {
             if words[word::GROUP] == 0 || words[word::SUB_INDEX] == -1 {
                 return Err(Trap::Invalid(format!(
                     "0x{guid:08X} is not a tile of a multi-tile object"
@@ -300,16 +329,18 @@ impl<'a> Machine<'a, '_> {
         data[14] = -1;
         data[29] = -5;
         data[67] = (slots - 1) as i16;
-        // The date stamp: year, month, day, then hour and minute.
-        let globals = &self.world.globals;
-        if globals.len() < 9 {
-            return Err(Trap::Invalid(format!(
-                "the lot has {} globals; the factory reads its clock from them",
-                globals.len()
-            )));
+        if !tile_cursor {
+            // The date stamp: year, month, day, then hour and minute.
+            let globals = &self.world.globals;
+            if globals.len() < 9 {
+                return Err(Trap::Invalid(format!(
+                    "the lot has {} globals; the factory reads its clock from them",
+                    globals.len()
+                )));
+            }
+            (data[45], data[46], data[47]) = (globals[8], globals[7], globals[1]);
+            (data[24], data[21]) = (globals[0], globals[5]);
         }
-        (data[45], data[46], data[47]) = (globals[8], globals[7], globals[1]);
-        (data[24], data[21]) = (globals[0], globals[5]);
         let object = Object {
             id,
             guid,
