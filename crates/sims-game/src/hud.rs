@@ -431,7 +431,7 @@ impl Hud {
         }
         if let Some(menu) = &mut self.menu {
             menu.layout(&self.art, view.size);
-            menu.draw(&mut frame, &self.art, self.controls.pointer);
+            menu.draw_labels(&mut frame, &self.art, self.controls.pointer);
         }
         self.band = status.and_then(|status| self.status(&mut frame, status));
         canvas.color = frame.into_rgb();

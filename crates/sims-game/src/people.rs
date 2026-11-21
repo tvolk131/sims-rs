@@ -65,7 +65,13 @@ pub fn shade_pie_face(canvas: &mut Canvas, center: [i32; 2], viewport: (u32, u32
             if d2 >= r2 {
                 continue;
             }
-            let pixel = &mut canvas.color[row + x as usize];
+            let idx = row + x as usize;
+            // 0x4ac8e7 passes threshold 0; 0x4aca76..0x4aca7a skips pixels
+            // whose 16-bit depth is <= 0 (empty sky is EMPTY = 65535 > 0).
+            if canvas.depth[idx] <= 0 {
+                continue;
+            }
+            let pixel = &mut canvas.color[idx];
             // 0x438ef6 unpacks 5-6-5 pixels with zero-filled low bits.
             let r = i32::from(pixel[0] & 0xf8);
             let g = i32::from(pixel[1] & 0xfc);
@@ -92,6 +98,63 @@ pub fn shade_pie_face(canvas: &mut Canvas, center: [i32; 2], viewport: (u32, u32
                 (g6 << 2) | (g6 >> 4),
                 (b5 << 3) | (b5 >> 2),
             ];
+        }
+    }
+}
+
+/// Composites a rendered pie-menu 3D `head` into `canvas` at `face_origin`,
+/// clipped to the active 3D house `viewport` (`0x4a953e` → `0x587cf1` →
+/// `0x462290`). Running this in the house pass before the 2D HUD ensures the
+/// bottom control strip hides any part of the head below `viewport.1`, while
+/// pie labels drawn later still appear on top of the head.
+pub fn composite_pie_head(
+    canvas: &mut Canvas,
+    face_origin: [i32; 2],
+    head: &Image,
+    viewport: (u32, u32),
+) {
+    let vp_w = i32::try_from(viewport.0)
+        .unwrap_or(i32::MAX)
+        .min(canvas.width as i32);
+    let vp_h = i32::try_from(viewport.1)
+        .unwrap_or(i32::MAX)
+        .min(canvas.height as i32);
+    let hw = i32::try_from(head.width).unwrap_or(0);
+    let hh = i32::try_from(head.height).unwrap_or(0);
+    if vp_w <= 0 || vp_h <= 0 || hw <= 0 || hh <= 0 {
+        return;
+    }
+    let sx0 = (-face_origin[0]).max(0);
+    let sy0 = (-face_origin[1]).max(0);
+    let sx1 = (vp_w - face_origin[0]).min(hw);
+    let sy1 = (vp_h - face_origin[1]).min(hh);
+    if sx0 >= sx1 || sy0 >= sy1 {
+        return;
+    }
+    let head_w = head.width as usize;
+    let canvas_w = canvas.width;
+    for sy in sy0..sy1 {
+        let dy = (face_origin[1] + sy) as usize;
+        let dst_row = dy * canvas_w;
+        let src_row = sy as usize * head_w;
+        for sx in sx0..sx1 {
+            let p = (src_row + sx as usize) * 4;
+            let a = head.rgba[p + 3];
+            if a == 0 {
+                continue;
+            }
+            let dx = (face_origin[0] + sx) as usize;
+            let dst = &mut canvas.color[dst_row + dx];
+            if a == 255 {
+                *dst = [head.rgba[p], head.rgba[p + 1], head.rgba[p + 2]];
+            } else {
+                let alpha = u16::from(a);
+                let inv = 255 - alpha;
+                for (channel, &src) in dst.iter_mut().zip(&head.rgba[p..p + 3]) {
+                    *channel =
+                        ((u16::from(src) * alpha + u16::from(*channel) * inv + 127) / 255) as u8;
+                }
+            }
         }
     }
 }
@@ -201,12 +264,23 @@ mod tests {
     #[test]
     fn shade_pie_face_desaturates_inner_disk_fades_outer_ring_and_clips_to_viewport() {
         let mut canvas = Canvas::new(260, 260, [200, 120, 40]);
+        // Drawn scene pixel (depth > 0), empty sky pixel (EMPTY = 65535 > 0),
+        // and native threshold pixel (depth <= 0, skipped by 0x4aca76..0x4aca7a).
+        canvas.depth[130 * 260 + 130] = 1000;
+        canvas.depth[130 * 260 + 131] = sims_render::depth::EMPTY;
+        canvas.depth[130 * 260 + 132] = 0;
+        canvas.depth[130 * 260 + 133] = -5;
         shade_pie_face(&mut canvas, [130, 130], (260, 200));
 
-        // Inside inner radius 67: desaturated to grey = (200 + 120 + 40) / 6 + 8 = 68,
-        // quantized to 5-6-5 with MSB bit-replication:
+        // Inside inner radius 67 with depth > 0 (both drawn depth and EMPTY):
+        // desaturated to grey = (200 + 120 + 40) / 6 + 8 = 68, quantized to
+        // 5-6-5 with MSB bit-replication:
         // r5 = 68 >> 3 = 8 -> 66, g6 = 68 >> 2 = 17 -> 69, b5 = 8 -> 66.
         assert_eq!(canvas.color[130 * 260 + 130], [66, 69, 66]);
+        assert_eq!(canvas.color[130 * 260 + 131], [66, 69, 66]);
+        // Pixels with depth <= 0 are skipped.
+        assert_eq!(canvas.color[130 * 260 + 132], [200, 120, 40]);
+        assert_eq!(canvas.color[130 * 260 + 133], [200, 120, 40]);
         // Outer ring (d = 85): partway between desaturated grey and original.
         let ring = canvas.color[130 * 260 + (130 + 85)];
         assert!(ring[0] > 66 && ring[0] < 200, "ring red {ring:?}");
@@ -215,5 +289,46 @@ mod tests {
         assert_eq!(canvas.color[130 * 260 + (130 + 100)], [200, 120, 40]);
         // Below viewport height 200 (even inside circle radius 100): untouched.
         assert_eq!(canvas.color[205 * 260 + 130], [200, 120, 40]);
+    }
+
+    #[test]
+    fn composite_pie_head_clips_to_house_viewport_and_handles_negative_origins() {
+        let mut canvas = Canvas::new(20, 20, [10, 20, 30]);
+        let mut head = Image {
+            width: 6,
+            height: 6,
+            rgba: vec![0; 6 * 6 * 4],
+        };
+        // Fill head with opaque red, except (0, 0) transparent and (2, 2) half-alpha green.
+        for y in 0..6usize {
+            for x in 0..6usize {
+                let p = (y * 6 + x) * 4;
+                head.rgba[p..p + 4].copy_from_slice(&[200, 40, 20, 255]);
+            }
+        }
+        head.rgba[0..4].copy_from_slice(&[0, 0, 0, 0]);
+        let mid = (2 * 6 + 2) * 4;
+        head.rgba[mid..mid + 4].copy_from_slice(&[0, 200, 0, 128]);
+
+        // Place across the bottom of a 20×12 house viewport.
+        composite_pie_head(&mut canvas, [4, 9], &head, (20, 12));
+        // Transparent pixel at (4, 9) leaves canvas untouched.
+        assert_eq!(canvas.color[9 * 20 + 4], [10, 20, 30]);
+        // Opaque pixels inside y < 12 are written.
+        assert_eq!(canvas.color[9 * 20 + 5], [200, 40, 20]);
+        assert_eq!(canvas.color[11 * 20 + 6], [5, 110, 15]);
+        // Rows y >= 12 are clipped out of the house viewport.
+        for y in 12..20 {
+            for x in 0..20 {
+                assert_eq!(canvas.color[y * 20 + x], [10, 20, 30], "({x}, {y})");
+            }
+        }
+
+        // Negative origin clips cleanly to x >= 0, y >= 0 without panicking.
+        let mut edge = Canvas::new(10, 10, [10, 20, 30]);
+        composite_pie_head(&mut edge, [-2, -2], &head, (10, 10));
+        assert_eq!(edge.color[0], [5, 110, 15]);
+        assert_eq!(edge.color[3 * 10 + 3], [200, 40, 20]);
+        assert_eq!(edge.color[4 * 10 + 4], [10, 20, 30]);
     }
 }

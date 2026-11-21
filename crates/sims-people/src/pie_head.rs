@@ -86,6 +86,10 @@ pub const AMBIENT_IDLE: f32 = 0.8;
 /// `0x5eb8a7`).
 pub const DEAD_ZONE: f32 = 35.0;
 
+/// Largest face side accepted by [`draw_body`], matching `sims_ui::pie`'s
+/// face-bitmap cap and preventing `u32` area overflow in [`Canvas::new`].
+pub const MAX_SIDE: u32 = 4096;
+
 /// Where the pie-menu head is looking and how brightly it is lit.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Look {
@@ -132,7 +136,9 @@ impl Look {
         let dx = f64::from(point[0]) - f64::from(center[0]);
         let dy = f64::from(point[1]) - f64::from(center[1]);
         let distance = (dx * dx + dy * dy).sqrt() as f32;
-        // 0x5eb833: distance < 1 returns before updating angle (leaves 0).
+        // 0x5eb833: when distance < 1, the original returns early and leaves
+        // the previous angle untouched (at the exact center distance == 0 so
+        // r == 0 and any angle yields the same pose).
         // 0x5eb8a7..0x5eb8c7: inside the dead zone, angle is cleared to 0
         // unless the pointer hit a label's own box (highlighted.is_some()).
         let angle = if distance < 1.0 || (highlighted.is_none() && distance <= DEAD_ZONE) {
@@ -284,9 +290,15 @@ impl Target for PieTarget<'_> {
 /// Draws `body`'s pie-menu 3D head into an RGBA [`Canvas`] of `size` pixels
 /// (typically `[201, 201]`), clear (`[0, 0, 0, 0]`) outside the head.
 ///
-/// Returns an error if `body`'s skeleton has no `HEAD` bone or no visible
-/// parts are bound to it.
+/// Returns an error if `size` exceeds [`MAX_SIDE`] on either axis, or if
+/// `body`'s skeleton has no `HEAD` bone or no visible parts are bound to it.
 pub fn draw_body(body: &Body, size: [u32; 2], look: Look) -> Result<Canvas, String> {
+    let [width, height] = size;
+    if width > MAX_SIDE || height > MAX_SIDE || width.checked_mul(height).is_none() {
+        return Err(format!(
+            "pie head size {width}x{height} exceeds {MAX_SIDE}x{MAX_SIDE}"
+        ));
+    }
     let head_bone = rig::bone(&body.skeleton, HEAD_BONE)
         .ok_or_else(|| "skeleton has no HEAD bone".to_owned())?;
     let identity = vec![Transform::IDENTITY; body.skeleton.bones.len()];
@@ -300,7 +312,6 @@ pub fn draw_body(body: &Body, size: [u32; 2], look: Look) -> Result<Canvas, Stri
     if count == 0 {
         return Err("body has no head to draw".to_owned());
     }
-    let [width, height] = size;
     let mut canvas = Canvas::new(width, height, [0; 4]);
     let [pitch, yaw] = look.angles();
     // 0x4625ae + 0x462621: bone origin sits 14 px below the face center

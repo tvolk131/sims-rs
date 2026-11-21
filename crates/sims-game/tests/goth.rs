@@ -4653,3 +4653,233 @@ fn the_recorded_sit_and_read_orders_with_shots_replayed_in_the_window_matches_th
     );
     assert_eq!(game.caught(), 0, "{:?}", game.errors());
 }
+
+/// Opening a pie menu near the top edge of the expanded bottom control strip
+/// (starting at `y = 500` in an 800×600 window) clips the 3D pie head to the
+/// 800×500 house viewport so zero opaque head pixels draw over the bottom
+/// strip, while the upper half of the head still draws inside the house view.
+#[test]
+fn pie_head_is_clipped_to_house_viewport_above_the_bottom_strip() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    assert_eq!(game.run(100), 100);
+    game.resize([800, 600]);
+    game.render();
+
+    // Pan the camera so the porch bench (173, single-entry "Sit" pie with no
+    // bottom label) sits right at y = 487, near the top of the expanded bottom
+    // control strip (y = 500), so its 3D pie head extends well across y = 500.
+    let bench_at = recorded([432, 230]);
+    assert_eq!(game.under(bench_at), Some(173));
+    let target_y = 487;
+    game.view.camera.origin[1] += target_y - bench_at[1];
+    let baseline = game.render().color.clone();
+    let point = [bench_at[0], target_y];
+    assert_eq!(game.under(point), Some(173));
+    assert!(!game.over_panel(point));
+    game.leave();
+    game.hover(point);
+    game.press(point);
+    game.render();
+    let menu = game.menu().expect("bench pie opened near bottom strip");
+    let origin = menu.face_origin().expect("face origin");
+    let head = menu.head.as_ref().expect("head rendered");
+    let mut head_pixels_below_500 = 0usize;
+    for sy in 0..head.height {
+        let dy = origin[1] + sy as i32;
+        if dy < 500 {
+            continue;
+        }
+        for sx in 0..head.width {
+            let p = (sy * head.width + sx) as usize * 4;
+            if head.rgba[p + 3] == 255 {
+                head_pixels_below_500 += 1;
+            }
+        }
+    }
+    assert!(
+        head_pixels_below_500 > 200,
+        "expected >200 head pixels extending past y=500, got {head_pixels_below_500}"
+    );
+    let frame = game.canvas().color.clone();
+    let menu = game.menu().expect("pie still open");
+    let origin = menu.face_origin().expect("face origin");
+    let head = menu.head.as_ref().expect("head rendered");
+    let label_rects: Vec<Rect> = menu.labels().into_iter().map(|(_, r)| r).collect();
+    let in_label = |x: i32, y: i32| label_rects.iter().any(|r| r.contains(x, y));
+
+    let mut checked_below = 0usize;
+    let mut drawn_above = 0usize;
+    for sy in 0..head.height {
+        let dy = origin[1] + sy as i32;
+        if !(0..600).contains(&dy) {
+            continue;
+        }
+        for sx in 0..head.width {
+            let dx = origin[0] + sx as i32;
+            if !(0..800).contains(&dx) {
+                continue;
+            }
+            let p = (sy * head.width + sx) as usize * 4;
+            if head.rgba[p + 3] != 255 || in_label(dx, dy) {
+                continue;
+            }
+            let idx = dy as usize * 800 + dx as usize;
+            let expected_head = [head.rgba[p], head.rgba[p + 1], head.rgba[p + 2]];
+            if dy >= 500 {
+                checked_below += 1;
+                assert_eq!(
+                    frame[idx], baseline[idx],
+                    "pie opened at {point:?} bled head pixel onto bottom strip at ({dx}, {dy})"
+                );
+            } else if frame[idx] == expected_head {
+                drawn_above += 1;
+            }
+        }
+    }
+    assert!(
+        checked_below > 50,
+        "expected >50 head pixels checked below y=500 (total below={head_pixels_below_500}, checked={checked_below})"
+    );
+    assert!(
+        drawn_above > 100,
+        "expected >100 head pixels drawn inside house viewport above y=500, got {drawn_above}"
+    );
+}
+
+/// Composed submenu rendering matches Complete Collection (`social-queued.png`):
+/// opening Bella's `Talk...` submenu keeps Mortimer's 3D head frozen at the
+/// parent menu's center looking down toward `Talk...`, draws the submenu's top
+/// label (`About Interests`) over the upper head while leaving the lower face
+/// visible below the label, and centers the dark circular backdrop on the
+/// submenu.
+#[test]
+fn pie_submenu_keeps_parent_head_frozen_and_draws_submenu_labels_above_it() {
+    let Some(install) = install() else {
+        return;
+    };
+    let frames = Frames::parse("0,1,2,3,33,63,93,123,153,190+30").expect("a schedule");
+    let schedule = frames.clone();
+    let mut game = Game::open(&Options {
+        frames,
+        ..options(install)
+    })
+    .expect("the Goth house opens");
+    game.resize([800, 600]);
+    let bella = 18u16;
+
+    run_to(&mut game, &schedule, 93);
+    let on_bella = match game.under(recorded([400, 274])) {
+        Some(id) if id == bella => recorded([400, 274]),
+        _ => [499, 317],
+    };
+    game.hover(on_bella);
+    run_to(&mut game, &schedule, 123);
+    let bare_lot = game.render().color.clone();
+
+    game.press(on_bella);
+    game.release(on_bella);
+    game.render();
+    let talk = pie_entry(&game, "Talk...");
+    game.hover(talk);
+    game.render();
+
+    let (parent_center, parent_origin, parent_head) = {
+        let menu = game.menu().expect("parent menu open");
+        (
+            menu.active_center().expect("parent center"),
+            menu.face_origin().expect("parent face origin"),
+            menu.head.as_ref().expect("parent head").clone(),
+        )
+    };
+
+    // Open the Talk... submenu.
+    game.press(talk);
+    game.release(talk);
+    let sub_frame = game.render().color.clone();
+    let menu = game.menu().expect("submenu open");
+    let sub_center = menu.active_center().expect("submenu center");
+    let sub_origin = menu.face_origin().expect("submenu face origin");
+    let sub_head = menu.head.as_ref().expect("submenu head");
+
+    // 1. Head stays frozen at the parent menu's origin and pose.
+    assert_eq!(sub_origin, parent_origin);
+    assert_eq!(sub_head.rgba, parent_head.rgba);
+    // 2. Active backdrop center moves down to the submenu.
+    assert_ne!(sub_center, parent_center);
+    assert!(
+        sub_center[1] > parent_center[1],
+        "Talk... submenu center {sub_center:?} should be below parent {parent_center:?}"
+    );
+
+    // 3. The submenu's top label ("About Interests") overlaps the upper head
+    //    and draws on top of it, while the lower face remains visible outside
+    //    label rects.
+    let label_rects: Vec<Rect> = menu.labels().into_iter().map(|(_, r)| r).collect();
+    let about = menu
+        .labels()
+        .into_iter()
+        .find(|(text, _)| *text == "About Interests")
+        .expect("About Interests label")
+        .1;
+    let in_any_label = |x: i32, y: i32| label_rects.iter().any(|r| r.contains(x, y));
+
+    let mut head_under_about = 0usize;
+    let mut head_occluded_by_about = 0usize;
+    let mut head_visible_outside_labels = 0usize;
+    for sy in 0..sub_head.height {
+        let dy = sub_origin[1] + sy as i32;
+        if !(0..500).contains(&dy) {
+            continue;
+        }
+        for sx in 0..sub_head.width {
+            let dx = sub_origin[0] + sx as i32;
+            if !(0..800).contains(&dx) {
+                continue;
+            }
+            let p = (sy * sub_head.width + sx) as usize * 4;
+            if sub_head.rgba[p + 3] != 255 {
+                continue;
+            }
+            let head_rgb = [sub_head.rgba[p], sub_head.rgba[p + 1], sub_head.rgba[p + 2]];
+            let actual = sub_frame[dy as usize * 800 + dx as usize];
+            if about.contains(dx, dy) {
+                head_under_about += 1;
+                if actual != head_rgb {
+                    head_occluded_by_about += 1;
+                }
+            } else if !in_any_label(dx, dy) && actual == head_rgb {
+                head_visible_outside_labels += 1;
+            }
+        }
+    }
+    assert!(
+        head_under_about > 50 && head_occluded_by_about * 2 > head_under_about,
+        "expected About Interests to draw over the upper head: under={head_under_about}, occluded={head_occluded_by_about}"
+    );
+    assert!(
+        head_visible_outside_labels > 400,
+        "expected lower frozen head to stay visible outside labels, got {head_visible_outside_labels}"
+    );
+
+    // 4. Pixels inside the submenu's radial backdrop (away from labels and the
+    //    parent head) are darkened relative to the bare lot.
+    let mut shaded_pixels = 0usize;
+    for dy in (sub_center[1] + 20)..(sub_center[1] + 60).min(500) {
+        for dx in (sub_center[0] - 20)..(sub_center[0] + 20) {
+            if in_any_label(dx, dy) {
+                continue;
+            }
+            let idx = dy as usize * 800 + dx as usize;
+            if sub_frame[idx] != bare_lot[idx] {
+                shaded_pixels += 1;
+            }
+        }
+    }
+    assert!(
+        shaded_pixels > 200,
+        "expected submenu backdrop to shade the house viewport around {sub_center:?}, got {shaded_pixels}"
+    );
+}

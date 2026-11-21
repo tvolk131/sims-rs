@@ -635,6 +635,12 @@ impl Menu {
         face.map(|n| u32::try_from(n).unwrap_or(0))
     }
 
+    /// The top-left screen position of the first menu's face rectangle, where
+    /// the 3D pie head is composited in the house viewport pass (`0x462290`).
+    pub fn face_origin(&self) -> Option<[i32; 2]> {
+        self.layouts.first().map(|l| [l.face.x, l.face.y])
+    }
+
     /// The center of the currently active menu (the submenu if one is open,
     /// otherwise the main menu), where the dark radial backdrop sits
     /// (`0x46216e` → `0x4ac8ff`).
@@ -670,6 +676,14 @@ impl Menu {
             pointer,
             self.held,
         );
+    }
+
+    /// Draws only the pie menu's 2D UI layer (face bitmap, title, and labels),
+    /// leaving out [`Menu::head`] because `Game::draw` already composited it
+    /// in the house viewport pass before the bottom HUD panel (`0x4a953e` →
+    /// `0x5eb04c`).
+    pub fn draw_labels(&self, frame: &mut Frame, art: &Art, pointer: Option<[i32; 2]>) {
+        Pie::draw(frame, art, &self.layouts, None, pointer, self.held);
     }
 }
 

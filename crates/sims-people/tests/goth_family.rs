@@ -348,27 +348,110 @@ fn mortimers_pie_head_matches_recorded_menu_poses() {
     let mortimer = people.iter().find(|r| r.id == 21).unwrap();
     let body = Body::load(&assets, &mortimer.skeleton, &mortimer.outfit).unwrap();
 
+    // Oversized canvases return an error cleanly instead of panicking; zero-sized
+    // canvases succeed with an empty buffer.
+    assert!(
+        sims_people::pie_head::draw_body(
+            &body,
+            [65_536, 65_536],
+            sims_people::pie_head::Look::neutral(),
+        )
+        .is_err()
+    );
+    let empty =
+        sims_people::pie_head::draw_body(&body, [0, 0], sims_people::pie_head::Look::neutral())
+            .unwrap();
+    assert_eq!((empty.width, empty.height, empty.rgba.len()), (0, 0, 0));
+
+    let choice2_look =
+        sims_people::pie_head::Look::from_menu([200, 198], Some([200, 123]), Some(0), 4);
+    let choice2 = sims_people::pie_head::draw_body(&body, [201, 201], choice2_look).unwrap();
+    let talk_look =
+        sims_people::pie_head::Look::from_menu([400, 274], Some([400, 348]), Some(4), 6);
+    let talk = sims_people::pie_head::draw_body(&body, [201, 201], talk_look).unwrap();
+    let read = sims_people::pie_head::draw_body(
+        &body,
+        [201, 201],
+        sims_people::pie_head::Look::from_menu([384, 250], Some([384, 324]), Some(2), 3),
+    )
+    .unwrap();
+    let idle_look = sims_people::pie_head::Look::neutral();
+    let idle = sims_people::pie_head::draw_body(&body, [201, 201], idle_look).unwrap();
+
+    assert_eq!(
+        choice2_look.ambient(),
+        sims_people::pie_head::AMBIENT_HIGHLIGHTED
+    );
+    assert_eq!(
+        talk_look.ambient(),
+        sims_people::pie_head::AMBIENT_HIGHLIGHTED
+    );
+    assert_eq!(idle_look.ambient(), sims_people::pie_head::AMBIENT_IDLE);
+
+    let stats = |c: &Canvas| -> (usize, f64, f64) {
+        let mut count = 0usize;
+        let mut y_sum = 0f64;
+        let mut lum_sum = 0f64;
+        for (i, p) in c.rgba.as_chunks::<4>().0.iter().enumerate() {
+            if p[3] == 255 {
+                count += 1;
+                y_sum += (i / c.width as usize) as f64;
+                lum_sum += f64::from(p[0]) + f64::from(p[1]) + f64::from(p[2]);
+            }
+        }
+        (count, y_sum / count as f64, lum_sum / (count as f64 * 3.0))
+    };
+
+    let (choice2_n, choice2_y, choice2_lum) = stats(&choice2);
+    let (talk_n, talk_y, _) = stats(&talk);
+    let (read_n, _, _) = stats(&read);
+    let (idle_n, _, idle_lum) = stats(&idle);
+
+    assert_eq!(choice2_n, 1750);
+    assert_eq!(talk_n, 1830);
+    assert_eq!(read_n, 1830);
+    assert_eq!(idle_n, 1940);
+    assert_eq!(talk.rgba, read.rgba, "both look straight down at dy=+74");
+    assert_ne!(choice2.rgba, talk.rgba);
+    // Looking up (`Have A Snack`) shifts the projected head silhouette upward
+    // relative to looking down (`Talk...`).
+    assert!(
+        choice2_y < talk_y,
+        "expected choice2 centroid ({choice2_y:.2}) above talk ({talk_y:.2})"
+    );
+    // Idle lighting (0.8 ambient) is dimmer than highlighted upward pose (1.0 ambient).
+    assert!(
+        idle_lum < choice2_lum * 0.9,
+        "idle_lum={idle_lum:.2}, choice2_lum={choice2_lum:.2}"
+    );
+
     let cases = [
         (
             "choice2-a",
-            sims_people::pie_head::Look::from_menu([200, 198], Some([200, 123]), Some(0), 4),
+            &choice2,
+            "823e32ce6c88d6619f158cb9889c9669487513f9c46cc2b1d2240f37d971321a",
         ),
         (
             "talk-submenu",
-            sims_people::pie_head::Look::from_menu([400, 274], Some([400, 348]), Some(4), 6),
+            &talk,
+            "2a6d0c2c8b4e06ae601b5218e40635bc3c56f7344d0513748bf3cfc7269953e8",
         ),
         (
             "read-queued",
-            sims_people::pie_head::Look::from_menu([384, 250], Some([384, 324]), Some(2), 3),
+            &read,
+            "2a6d0c2c8b4e06ae601b5218e40635bc3c56f7344d0513748bf3cfc7269953e8",
         ),
-        ("idle", sims_people::pie_head::Look::neutral()),
+        (
+            "idle",
+            &idle,
+            "a1669c1efa3e673eb8dec1a3d4907f1c4ab3c4f6600f7343e40458b6ccad7ffa",
+        ),
     ];
-    for (name, look) in cases {
-        let canvas = sims_people::pie_head::draw_body(&body, [201, 201], look).unwrap();
-        let opaque = canvas.rgba.chunks(4).filter(|p| p[3] == 255).count();
-        assert!(
-            (1000..=4000).contains(&opaque),
-            "{name}: unexpected opaque pixel count {opaque}"
+    for (name, canvas, expected_sha) in cases {
+        assert_eq!(
+            hex(&canvas.rgba),
+            expected_sha,
+            "{name} rendered pie head changed"
         );
         if let Some(out) = std::env::var_os("SIMS_PEOPLE_OUT") {
             let path = PathBuf::from(out).join(format!("our-{name}.png"));

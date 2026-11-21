@@ -5,10 +5,11 @@
 Supersedes the placeholder pie-head camera, scale, and lighting in
 `20261115-pie-menu-shows-sims-head-drawn-front.md`.
 
-`Sims.exe` draws the pie menu's 3D head and circular backdrop directly in the
-house viewport's Direct3D 6 pass (`0x4a94ec` → `0x4ac8c1` → `0x4ac8ff` for the
-backdrop, then `0x4a953e` / `0x4ab77d` → `0x587cf1` → `0x462290` for the 3D
-head), before the 2D UI draws the bottom panel and pie labels (`0x5eb04c`).
+`Sims.exe` draws the pie menu's circular backdrop and 3D head directly in the
+house viewport's pass (`0x4a94ec` → `0x4ac8c1` → `0x4ac8ff` for the backdrop,
+then `0x4a953e` / `0x4ab77d` → `0x587cf1` → `0x462290` for the 3D head),
+clipped to the house viewport before the 2D UI draws the bottom control panel
+and pie labels (`0x5eb04c`).
 
 ## Verified native behavior (`Sims.exe` Complete Collection 1.91)
 
@@ -29,7 +30,8 @@ head), before the 2D UI draws the bottom panel and pie labels (`0x5eb04c`).
   (`0x46234d`–`0x462428`, `0x462688`–`0x462778`, `0x462822`–`0x46292d`):**
   `cTSPieMenu::HitTest` (`0x5eb7c9`–`0x5eb8c9`) stores pointer `distance`
   (`+0x164`) and `angle = atan2(dx, -dy)` (`+0x168`, zeroed inside the 35 px
-  dead zone when no label box is hit). `0x462290` computes
+  dead zone when no label box is hit; when `distance < 1`, `0x5eb833` returns
+  early without modifying the previous angle). `0x462290` computes
   `r = sqrt(distance * 0.0005)`, `pitch = cos(angle) * r + 0.3/60`,
   `yaw = -sin(angle) * r + 0.3/60`, and adds the 8-way compass offset of the
   highlighted entry (`±0.6` cardinals, `±0.4` diagonals, jump table
@@ -44,36 +46,56 @@ head), before the 2D UI draws the bottom panel and pie labels (`0x5eb04c`).
   when an option is highlighted and `0.8` (`[0x667454]`) when idle, using the
   same 5-6-5 texel expansion (`Packed565`) and Direct3D 6 integer pixel-centre
   offset `(+0.5, +0.5)` as lot people.
-- **Submenus (`0x462106`, `0x4622b6`–`0x46234a`):**
+- **Submenus (`0x462106`, `0x46213e`, `0x4622b6`–`0x46234a`):**
   Opening a submenu moves the dark radial backdrop's target center to the
   submenu (`[esi + 4]`), while the 3D head stays at the parent menu's center
   (`[esi]`) and keeps reading the parent menu's frozen look vector.
 - **Dark radial backdrop (`0x4ac8c1` → `0x4ac8ff`):**
-  Draws a 100 px radius (`[0x6c4708]`) circular halo in the house viewport:
-  inside radius `67` (`radius - radius / 3`), pixels desaturate to
+  Draws a 100 px radius (`[0x6c4708]`) circular halo in the house viewport over
+  every pixel with 16-bit depth `> 0` (`0x4ac8e7` threshold `0`, `0x4aca76`–
+  `0x4aca7a`, including empty-depth pixels at `EMPTY = 65535`): inside radius
+  `67` (`radius - radius / 3`), pixels desaturate to
   `grey = (r + g + b) / 6 + 8` (reading 5-6-5 zero-filled channels via
   `0x438ef6`); between `67` and `100`, they blend linearly in squared distance
   back to the lot colour and quantize to 5-6-5 (`0x49f0ae`).
 
-## Implementation & verification
+## Implementation & deferred animations
 
 - `sims_people::pie_head` implements `Look`, `compass_direction`, `project`,
-  and `draw_body`, exposed on `sims_people::People::pie_head`.
+  and `draw_body` (with `MAX_SIDE = 4096` bounds validation), exposed on
+  `sims_people::People::pie_head`.
 - `sims_ui::pie::Pie::draw` draws `head` only once on `layouts[0]` so submenus
   do not duplicate the head.
 - `sims_game::menu::Menu` tracks `head_look` (freezing the parent look while a
-  submenu is open) and `active_center`; `Hud::hover` requests a redraw on
-  pointer motion while a pie menu is open; `Game::draw` applies
-  `shade_pie_face` inside the house viewport and renders `menu.head` via
-  `People::head_looking`.
-- The 400 ms pop-in scale/offset animation (`[0x6c4700]`) and 400 ms direction
-  change ease-out (`[0x6c4704]`, `sqrt(0.1 + 0.9 * t)`) are **not** ported yet;
-  the head renders in steady state.
-- Verified pixel-for-pixel against Complete Collection 1.91 captures of
-  Mortimer Goth:
-  - `choice2-a.png` (up / `Have A Snack`): 1,749 / 1,750 pixels 5-6-5 exact
-    (99.94%, MAE 0.51).
-  - `talk-submenu.png` (down / `Talk...`): 1,828 / 1,830 pixels 5-6-5 exact
-    (99.89%, MAE 0.47).
-  - `read-queued.png` (down / `Read a Book`): 1,826 / 1,830 pixels 5-6-5 exact
-    (99.78%, MAE 0.43).
+  submenu is open), `face_origin`, and `active_center`; `Hud::hover` requests a
+  redraw on pointer motion while a pie menu is open; `Game::draw` applies
+  `shade_pie_face` and `composite_pie_head` inside the house viewport before
+  `Hud::draw` draws the bottom control strip and `Menu::draw_labels` draws the
+  2D pie labels on top.
+- **Deferred animations (steady-state rendered):** the three 400 ms transition
+  animations are not ported yet:
+  1. Backdrop pop-in and submenu/back center-and-radius linear interpolation
+     (`0x462106`, `0x46213e`, `0x46216e`, `[0x6c4700] = 400 ms`, interpolating
+     from radius `0` on initial open and between parent/submenu centers).
+  2. Head pop-in scale and `Y_OFFSET` linear ramp (`0x4625e1`–`0x46260d`,
+     `[0x6c4700] = 400 ms`).
+  3. Direction-change ease-out (`0x46277a`–`0x4627d2`, `[0x6c4704] = 400 ms`,
+     `sqrt(0.1 + 0.9 * t)`).
+
+## Verification against Complete Collection 1.91 captures
+
+Measured over our rendered Mortimer Goth head's opaque pixel mask against real
+`Sims.exe` captures:
+
+- `choice2-a.png` (main menu, `Have A Snack` up): **1,749 / 1,750** opaque
+  head pixels 5-6-5 exact (**99.94%**, MAE 0.51).
+- `talk-submenu.png` (parent menu just before the `Talk...` submenu draws,
+  `Talk...` down): **1,828 / 1,830** opaque head pixels 5-6-5 exact
+  (**99.89%**, MAE 0.47).
+- `read-queued.png` (main menu, `Read a Book` down): **1,826 / 1,830** opaque
+  head pixels 5-6-5 exact (**99.78%**, MAE 0.43).
+- `social-queued.png` (composed `Talk...` submenu, with `About Interests`
+  overlapping the top of the frozen parent head): **806 / 807** opaque head
+  pixels outside the overlapping label 5-6-5 exact (**99.88%**).
+- Steady-state circular backdrop (`0x4ac8ff`): **9,308 / 9,308** sampled
+  static shaded pixels in the paired captures matched exact in 5-6-5.

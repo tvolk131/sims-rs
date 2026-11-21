@@ -622,8 +622,11 @@ impl Game {
         self.hud.read_dialog(dialogs, &self.assets);
         // The pie menu shades the house viewport behind it (0x4a94ec →
         // 0x4ac8ff) and renders the Sim's 3D head tracking the pointer
-        // (0x4a953e → 0x462290).
+        // (0x4a953e → 0x462290) into the house viewport before the 2D HUD
+        // draws, so the bottom control strip clips the head while pie labels
+        // still draw over it.
         if !self.hud.will_show_dialog(self.view.size) {
+            self.hud.resize_menu(self.view.size);
             let pointer = self.hud.pointer();
             if let Some(menu) = &mut self.hud.menu {
                 if let Some(center) = menu.active_center() {
@@ -642,6 +645,9 @@ impl Game {
                             None
                         }
                     };
+                if let (Some(origin), Some(head)) = (menu.face_origin(), menu.head.as_ref()) {
+                    crate::people::composite_pie_head(&mut self.canvas, origin, head, viewport);
+                }
             }
         }
         self.hud.sync_clock_blink(world, self.clock_us);
