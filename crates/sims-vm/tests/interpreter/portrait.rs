@@ -139,81 +139,103 @@ fn a_portrait_the_port_cannot_tell_was_built_fails_loudly() {
 #[test]
 fn a_portrait_whose_person_runs_code_when_put_down_fails_loudly() {
     // The person made is put on a tile (0x45e4e9, 0x433340), which asks
-    // it its function 9 (0x433580), and its function 6 when the walls
-    // beside the tile differ from its own (0x434fac, 0x435110). The tile
-    // is not modeled.
-    for (function, at) in [
-        (9, "0x433580"),
-        (6, "0x435110"),
-        (26, "0x433612"),
-        (25, "0x433612"),
-        (10, "0x433148"),
-    ] {
-        let (mut fx, file, record) = visitors();
-        let objects: Vec<u16> = fx.world.objects.keys().copied().collect();
-        let library = fx.program.libraries.get_mut(&file).unwrap();
-        for table in library.callbacks.values_mut() {
-            table.resize(
-                27,
-                sims_formats::execution::ObjectFunction {
-                    condition: 0,
-                    action: 0,
-                },
-            );
-            table[function].action = 4200;
-        }
-        let fault = inform(&mut fx, 2, record).unwrap_err().to_string();
-        assert!(fault.contains(at) && fault.contains("tree 4200"), "{fault}");
-        assert!(fx.world.portraits.is_empty());
-        // The build ran on a copy of the lot: the person made is not left
-        // behind.
-        assert_eq!(
-            fx.world.objects.keys().copied().collect::<Vec<_>>(),
-            objects
+    // it its function 9 (0x433580) on placement and function 10 (0x433148)
+    // before removal. When a tile-independent PLACED callback runs, its
+    // side effects are kept; when a callback fails (missing tree 4200) or
+    // depends on which tile an unknown view centre picks, the build fails
+    // loudly and leaves no temporary person behind.
+    let (mut fx, file, record) = visitors();
+    fx.add(
+        file,
+        4200,
+        tree(vec![assign(
+            scope::GLOBAL,
+            36,
+            scope::LITERAL,
+            55,
+            RETURN_TRUE,
+        )]),
+    );
+    let library = fx.program.libraries.get_mut(&file).unwrap();
+    for table in library.callbacks.values_mut() {
+        table.resize(
+            27,
+            sims_formats::execution::ObjectFunction {
+                condition: 0,
+                action: 0,
+            },
         );
+        table[9].action = 4200;
     }
+    assert_eq!(inform(&mut fx, 2, record), Ok(true));
+    assert_eq!(fx.world.globals[36], 55);
+    assert_eq!(fx.world.portraits, [WIDGET].into());
+
+    // A PLACED callback whose effect depends on the room (writing `my room`
+    // into global 36) fails loudly when no view centre is given across two
+    // rooms, and leaves no temporary person behind.
+    let (mut fx, file, record) = visitors();
+    indoors_and_out(&mut fx);
+    let objects: Vec<u16> = fx.world.objects.keys().copied().collect();
+    fx.add(
+        file,
+        4200,
+        tree(vec![assign(
+            scope::GLOBAL,
+            36,
+            scope::MY_DATA,
+            29,
+            RETURN_TRUE,
+        )]),
+    );
+    let library = fx.program.libraries.get_mut(&file).unwrap();
+    for table in library.callbacks.values_mut() {
+        table.resize(
+            27,
+            sims_formats::execution::ObjectFunction {
+                condition: 0,
+                action: 0,
+            },
+        );
+        table[9].action = 4200;
+    }
+    let fault = inform(&mut fx, 2, record).unwrap_err().to_string();
+    assert!(fault.contains("0x4e96dd"), "{fault}");
+    assert!(fx.world.portraits.is_empty());
+    assert_eq!(
+        fx.world.objects.keys().copied().collect::<Vec<_>>(),
+        objects
+    );
 }
 
 #[test]
 fn a_portrait_whose_put_depends_on_its_tile_fails_loudly() {
-    // Data word 40 bit 0x400 marks the room the person lands in as not
-    // counted (0x433340).
-    let (mut fx, file, record) = visitors();
-    // The widget's Init (tree 4096, `crate::find_location::placeable`),
-    // with the bit set.
-    fx.add(
-        file,
-        4096,
-        tree(vec![
-            assign(scope::MY_DATA, 4, scope::LITERAL, 1, 1),
-            assign(scope::MY_DATA, 42, scope::LITERAL, 2, 2),
-            assign(scope::MY_DATA, 40, scope::LITERAL, 0x400, RETURN_TRUE),
-        ]),
-    );
-    let fault = inform(&mut fx, 2, record).unwrap_err().to_string();
-    assert!(fault.contains("bit 0x400"), "{fault}");
-    assert!(fx.world.portraits.is_empty());
-    // Data word 7 marks the room it is put in and taken from as not
-    // counted for its light (0x433ed8, 0x4412c6).
-    let (mut fx, file, record) = visitors();
-    fx.add(
-        file,
-        4096,
-        tree(vec![
-            assign(scope::MY_DATA, 4, scope::LITERAL, 1, 1),
-            assign(scope::MY_DATA, 42, scope::LITERAL, 2, 2),
-            assign(scope::MY_DATA, 7, scope::LITERAL, 1, RETURN_TRUE),
-        ]),
-    );
-    let fault = inform(&mut fx, 2, record).unwrap_err().to_string();
-    assert!(fault.contains("data word 7"), "{fault}");
-    assert!(fx.world.portraits.is_empty());
+    // Across two rooms with no view centre given, data word 40 bit 0x400
+    // (`0x433340`) and data word 7 (`0x433ed8`) mark whichever room the
+    // unknown camera centre selects, so the build fails loudly.
+    for (word, value) in [(40, 0x400), (7, 1)] {
+        let (mut fx, file, record) = visitors();
+        indoors_and_out(&mut fx);
+        fx.world.rooms.rooms.get_mut(&1).unwrap().occupied = true;
+        fx.add(
+            file,
+            4096,
+            tree(vec![
+                assign(scope::MY_DATA, 4, scope::LITERAL, 1, 1),
+                assign(scope::MY_DATA, 42, scope::LITERAL, 2, 2),
+                assign(scope::MY_DATA, word, scope::LITERAL, value, RETURN_TRUE),
+            ]),
+        );
+        let fault = inform(&mut fx, 2, record).unwrap_err().to_string();
+        assert!(fault.contains("0x4e96dd"), "{word}: {fault}");
+        assert!(fx.world.portraits.is_empty());
+    }
     // A person of kind 0 or 1 marks the indoor room it lands in as
-    // occupied (0x45e43d), which its removal leaves: it fails while an
-    // indoor room that is not a pool is not marked. One already marked,
-    // one outdoors and a pool are left as they are, and so is any room by
-    // a pet (kind above 1). The person's words come from its neighbor
-    // record (`crate::person_factory::equip`).
+    // occupied (0x45e43d), which its removal leaves: on `visitors()`, which
+    // has both room 0 (outside) and room 1 (inside), leaving `view_centre`
+    // unset fails loudly when landing in room 1 would flip `occupied` while
+    // landing in room 0 would not; passing `view_centre = Some([2, 2])`
+    // (inside room 1) succeeds natively and sets `occupied = true`.
     for (kind, outdoors, pool, occupied, fails) in [
         (0, false, false, false, true),
         (1, false, false, false, true),
@@ -240,7 +262,9 @@ fn a_portrait_whose_put_depends_on_its_tile_fails_loudly() {
         let ran = inform(&mut fx, 2, record);
         if fails {
             let fault = ran.unwrap_err().to_string();
-            assert!(fault.contains("0x468802"), "{kind}: {fault}");
+            assert!(fault.contains("0x4e96dd"), "{kind}: {fault}");
+            assert_eq!(inform_from(&mut fx, 2, record, Some([2, 2])), Ok(true));
+            assert!(fx.world.rooms.rooms[&1].occupied);
         } else {
             assert_eq!(ran, Ok(true), "{kind} {outdoors} {pool} {occupied}");
         }
@@ -346,13 +370,13 @@ fn a_portrait_searches_from_the_view_centre_when_it_is_given() {
     // marks the room as occupied (0x45e43d), which its removal leaves. The
     // person's kind comes from its neighbor record (word 65).
     let rooms = indoors_and_out;
-    // With no centre, some start ends indoors.
+    // With no centre, some start ends indoors and others outdoors.
     let (mut fx, _, record) = visitors();
     rooms(&mut fx);
     let fault = inform_from(&mut fx, 2, record, None)
         .unwrap_err()
         .to_string();
-    assert!(fault.contains("0x468802"), "{fault}");
+    assert!(fault.contains("0x4e96dd"), "{fault}");
     // From a centre outdoors the search ends outdoors, in the start's
     // room, wherever outdoors it starts (a start outside the border is
     // taken inside it), and the lot ends the same.
@@ -365,13 +389,12 @@ fn a_portrait_searches_from_the_view_centre_when_it_is_given() {
         ends.push(hash_without_frames(&fx.world));
     }
     assert!(ends.windows(2).all(|w| w[0] == w[1]));
-    // From a centre indoors it ends indoors.
+    // From a centre indoors it ends indoors and marks room 1 occupied natively.
     let (mut fx, _, record) = visitors();
     rooms(&mut fx);
-    let fault = inform_from(&mut fx, 2, record, Some([4, 2]))
-        .unwrap_err()
-        .to_string();
-    assert!(fault.contains("0x468802"), "{fault}");
+    assert_eq!(inform_from(&mut fx, 2, record, Some([4, 2])), Ok(true));
+    assert_eq!(fx.world.portraits, [WIDGET].into());
+    assert!(fx.world.rooms.rooms[&1].occupied);
     // From a centre no tile is found from, the original removes the temporary
     // person unput (0x4e9706), leaves the portrait uncached, keeps Init/RNG
     // side effects, and completes the dialog nonfatally.
@@ -583,9 +606,10 @@ fn with_a_view_centre_the_persons_own_function_5_runs_and_its_words_are_read_aft
     assert_eq!(inform_from(&mut fx, 2, record, Some([3, 4])), Ok(true));
     assert_eq!(fx.world.objects[&id].data[50], 1);
     assert_eq!(fx.world.portraits, [WIDGET].into());
-    // What it does is read after the search: data word 7 (0x433ed8) and
-    // data word 40 bit 0x400 (0x433340), set by it, fail the put.
-    for (word, value, said) in [(7, 1, "data word 7"), (40, 0x400, "bit 0x400")] {
+    // What it does is read after the search: with a view centre given,
+    // `put_person` runs natively and marks the room via `move_tree` (word 7)
+    // and `put_one` (word 40 bit 0x400).
+    for (word, value) in [(7, 1), (40, 0x400)] {
         let (mut fx, widget, record, _) = obstacle(Callback::Writes);
         fx.add(
             widget,
@@ -599,11 +623,8 @@ fn with_a_view_centre_the_persons_own_function_5_runs_and_its_words_are_read_aft
             )]),
         );
         widget_function(&mut fx, widget, 5, 4200);
-        let fault = inform_from(&mut fx, 2, record, Some([3, 4]))
-            .unwrap_err()
-            .to_string();
-        assert!(fault.contains(said), "{word}: {fault}");
-        assert!(fx.world.portraits.is_empty());
+        assert_eq!(inform_from(&mut fx, 2, record, Some([3, 4])), Ok(true));
+        assert_eq!(fx.world.portraits, [WIDGET].into());
     }
 }
 
@@ -611,9 +632,11 @@ fn with_a_view_centre_the_persons_own_function_5_runs_and_its_words_are_read_aft
 fn a_portrait_put_that_takes_the_mark_off_the_room_it_was_last_seen_in_fails_loudly() {
     // The person's Init names room 1 in its data word 29, and its first
     // tick, which the factory runs, notes that as the room it was last
-    // seen in (0x45e43d). Put outdoors, it then takes room 1's mark off
-    // when nobody else was last seen there (0x46886c, 0x468802), and the
-    // removal leaves it so.
+    // seen in (0x45e43d). Put outdoors with a view centre, `put_person` runs
+    // `note_room` natively and clears room 1's occupied mark when nobody else
+    // was last seen there (0x46886c, 0x468802). With no view centre across
+    // indoors and outdoors, the outcome depends on the unknown centre and
+    // fails loudly.
     let setup = |others: bool| {
         let (mut fx, file, record) = visitors();
         indoors_and_out(&mut fx);
@@ -639,21 +662,16 @@ fn a_portrait_put_that_takes_the_mark_off_the_room_it_was_last_seen_in_fails_lou
         (fx, record)
     };
     let (mut fx, record) = setup(false);
-    let rooms = fx.world.rooms.clone();
-    let fault = inform_from(&mut fx, 2, record, Some([1, 1]))
-        .unwrap_err()
-        .to_string();
-    assert!(
-        fault.contains("room 2") && fault.contains("0x468802"),
-        "{fault}"
-    );
-    assert_eq!(fx.world.rooms, rooms);
-    // With no centre, the same from every start outdoors.
+    assert_eq!(inform_from(&mut fx, 2, record, Some([1, 1])), Ok(true));
+    assert!(!fx.world.rooms.rooms[&1].occupied);
+    // With no centre, indoors keeps room 1 occupied while outdoors clears it.
     let (mut fx, record) = setup(false);
+    let rooms = fx.world.rooms.clone();
     let fault = inform_from(&mut fx, 2, record, None)
         .unwrap_err()
         .to_string();
-    assert!(fault.contains("0x468802"), "{fault}");
+    assert!(fault.contains("0x4e96dd"), "{fault}");
+    assert_eq!(fx.world.rooms, rooms);
     // Someone else last seen in room 1 keeps its mark.
     let (mut fx, record) = setup(true);
     assert_eq!(inform_from(&mut fx, 2, record, Some([1, 1])), Ok(true));
@@ -662,28 +680,41 @@ fn a_portrait_put_that_takes_the_mark_off_the_room_it_was_last_seen_in_fails_lou
 
 #[test]
 fn a_portrait_put_on_a_lot_with_no_indicators_fails_loudly() {
-    // The interface's work for an object come from outside (0x44752e)
-    // makes the lot's indicators when it has none (0x445e4a). Their Init
-    // runs while the original's person stands on its tile, in its room;
-    // here it does not, so the put fails.
+    // With a view centre (or invariant across tiles), `put_person` creates
+    // the lot's indicators natively (`0x445e4a`) while the temporary person
+    // stands on its tile.
     let (mut fx, _, record) = visitors();
+    for guid in [0x2f72_6fff, 0x0baa_71c5] {
+        let file = fx.add_type(guid, 4, 4096, 4097);
+        fx.add(
+            file,
+            4096,
+            tree(vec![ins(0, RETURN_TRUE, RETURN_TRUE, [0; 8])]),
+        );
+        fx.add(
+            file,
+            4097,
+            tree(vec![ins(0, RETURN_TRUE, RETURN_TRUE, [0; 8])]),
+        );
+    }
     assert_ne!(fx.world.indicators[0], 0);
     fx.world.indicators = [0, 0];
-    let objects: Vec<u16> = fx.world.objects.keys().copied().collect();
-    let fault = inform(&mut fx, 2, record).unwrap_err().to_string();
-    assert!(fault.contains("0x445e4a"), "{fault}");
-    assert!(fx.world.portraits.is_empty());
-    assert!(fx.world.objects.keys().copied().eq(objects));
-    assert_eq!(fx.world.indicators, [0, 0]);
+    assert_eq!(inform_from(&mut fx, 2, record, Some([2, 2])), Ok(true));
+    assert_eq!(fx.world.portraits, [WIDGET].into());
+    assert_ne!(fx.world.indicators[0], 0);
+    assert_ne!(fx.world.indicators[1], 0);
 }
 
 #[test]
 fn a_portrait_build_that_fails_leaves_the_machines_cells_as_they_were() {
-    // The person's Init plays a sound, and the put then fails (data word
-    // 40 bit 0x400, 0x433340): the sound is not kept, as the person is
-    // not. Without the bit the build is kept, the sound with it.
+    // The person's Init plays a sound, and the put then fails across two
+    // rooms when no view centre is given (data word 40 bit 0x400, 0x433340):
+    // the sound is not kept, as the person is not. Without the bit the build
+    // is kept, the sound with it.
     for bit in [0x400, 0] {
         let (mut fx, file, record) = visitors();
+        indoors_and_out(&mut fx);
+        fx.world.rooms.rooms.get_mut(&1).unwrap().occupied = true;
         fx.program
             .libraries
             .get_mut(&file)
@@ -701,11 +732,11 @@ fn a_portrait_build_that_fails_leaves_the_machines_cells_as_they_were() {
             ]),
         );
         let heard = Default::default();
-        let ran = inform_hearing(&mut fx, 2, record, Some([1, 1]), &heard);
+        let ran = inform_hearing(&mut fx, 2, record, None, &heard);
         let heard = heard.into_inner();
         if bit != 0 {
             let fault = ran.unwrap_err().to_string();
-            assert!(fault.contains("bit 0x400"), "{fault}");
+            assert!(fault.contains("0x4e96dd"), "{fault}");
             assert!(heard.is_empty(), "{heard:?}");
         } else {
             assert_eq!(ran, Ok(true));

@@ -209,6 +209,51 @@ impl Cells {
     }
 }
 
+/// Pre-encoded snapshot of a [`World`] for repeated [`same_lot`] comparisons
+/// without re-encoding the reference world on every candidate.
+#[derive(PartialEq, Eq)]
+pub(crate) struct LotSnapshot {
+    encoded: Vec<u8>,
+    restarts: Vec<(u16, u32)>,
+    dirty_portraits: BTreeSet<u32>,
+    generated_portrait_2002: BTreeSet<sims_sim::PortraitFile>,
+    made_portrait_head: BTreeMap<u32, Option<bool>>,
+    ambiguous_portraits: BTreeSet<u32>,
+    loaded_indexed_skeletons: BTreeMap<String, Option<String>>,
+    loaded_indexed_suits: BTreeMap<String, Option<bool>>,
+    made_outfits: BTreeMap<u32, BTreeMap<usize, String>>,
+    person_outfits: BTreeMap<u16, sims_sim::PersonOutfit>,
+    scratch_ptr_set: BTreeSet<u16>,
+    scratch_ptr_set_to_next: BTreeSet<u16>,
+    runtime_added_suits: Vec<String>,
+    suit_scan_cache: Option<Vec<String>>,
+}
+
+impl LotSnapshot {
+    pub(crate) fn of(w: &World) -> Self {
+        Self {
+            encoded: w.encode(),
+            restarts: w
+                .frame_storage
+                .iter()
+                .map(|(id, s)| (*id, s.restarts))
+                .collect(),
+            dirty_portraits: w.dirty_portraits.clone(),
+            generated_portrait_2002: w.generated_portrait_2002.clone(),
+            made_portrait_head: w.made_portrait_head.clone(),
+            ambiguous_portraits: w.ambiguous_portraits.clone(),
+            loaded_indexed_skeletons: w.loaded_indexed_skeletons.clone(),
+            loaded_indexed_suits: w.loaded_indexed_suits.clone(),
+            made_outfits: w.made_outfits.clone(),
+            person_outfits: w.person_outfits.clone(),
+            scratch_ptr_set: w.scratch_ptr_set.clone(),
+            scratch_ptr_set_to_next: w.scratch_ptr_set_to_next.clone(),
+            runtime_added_suits: w.runtime_added_suits.clone(),
+            suit_scan_cache: w.suit_scan_cache.clone(),
+        }
+    }
+}
+
 /// Whether two lots are the same: their encodings, each object's count of
 /// its thread's restarts (`FrameStorage::restarts`), and the unencoded
 /// portrait dirty/writeback sets (`World::dirty_portraits`,
@@ -232,6 +277,7 @@ pub(crate) fn same_lot(a: &World, b: &World) -> bool {
         && a.made_outfits == b.made_outfits
         && a.person_outfits == b.person_outfits
         && a.scratch_ptr_set == b.scratch_ptr_set
+        && a.scratch_ptr_set_to_next == b.scratch_ptr_set_to_next
         && a.runtime_added_suits == b.runtime_added_suits
         && a.suit_scan_cache == b.suit_scan_cache
 }

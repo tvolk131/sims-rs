@@ -110,8 +110,11 @@ impl Machine<'_, '_> {
     pub(crate) fn set_to_next(&mut self, operands: &[u8; 8]) -> Result<bool, Trap> {
         // 0x44eb9d: binds `[edi + 0x128]` to `[ebp - 0x18]`, which overlaps
         // the return address of `UI Effect`'s variable read (`0x44ad70`) at
-        // the same dispatcher depth and faults at `&globals[34]`.
+        // the same dispatcher depth and faults at `&globals[34]`, while still
+        // addressing an allocated local inside a subsequent `Expression`'s
+        // right-hand Global 34 read (`0x452c76` → `0x4541db`).
         self.world.scratch_ptr_set.remove(&self.me);
+        self.world.scratch_ptr_set_to_next.insert(self.me);
         let (scope, index) = if operands[4] & 0x80 == 0 {
             (10, 0)
         } else {

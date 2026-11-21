@@ -5022,6 +5022,14 @@ fn round_19_global34_stale_refresh_mummy_hashtable_textures_clothing_workwear_np
     // "a dialog's portrait" instead of "UI Effect's portrait".
     {
         let (mut fx, file, record) = visitors();
+        // Two rooms so `data[40] = 0x400` marks a different room depending on
+        // which tile the missing `view_centre` selects.
+        fx.world.rooms.rooms.insert(2, Default::default());
+        for a in 3..6 {
+            for b in 1..5 {
+                fx.world.rooms.map[0][a * 64 + b] = 2;
+            }
+        }
         fx.add(
             file,
             4096,
@@ -6545,5 +6553,258 @@ fn round_22_clothing_commit_pet_fallback_placed_callback_and_global_34() {
             matches!(err.trap, Trap::Unsupported(_)),
             "expected Unsupported trap, got {err}"
         );
+    }
+}
+
+#[test]
+fn round_23_dialog_placed_large_lot_strcmp_and_set_to_next_expression() {
+    use sims_content::{Profile, SuitTable};
+
+    // 1. P2 #1: Dialog off-lot portrait executes `function::PLACED` (`0x4363d1` ->
+    // `0x4e96fe` -> `0x45e4e9` -> `0x433580`), both with explicit `view_centre`
+    // and when invariant across all reachable tiles with `view_centre == None`.
+    for centre in [Some([2i8, 2i8]), None] {
+        let (mut fx, file, record) = visitors();
+        fx.add(
+            file,
+            4200,
+            tree(vec![assign(
+                scope::GLOBAL,
+                36,
+                scope::LITERAL,
+                88,
+                RETURN_TRUE,
+            )]),
+        );
+        let library = fx.program.libraries.get_mut(&file).unwrap();
+        for table in library.callbacks.values_mut() {
+            table.resize(
+                27,
+                sims_formats::execution::ObjectFunction {
+                    condition: 0,
+                    action: 0,
+                },
+            );
+            table[9].action = 4200; // function::PLACED
+        }
+        // Dialog (opcode 36): icon mode 2 (neighbor in stack object), wait=0.
+        fx.add(
+            LAMP_FILE,
+            4096,
+            tree(vec![ins(
+                36,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [0, 0, 0, 0, 0, 0, 0, 1 | (2 << 1)],
+            )]),
+        );
+        let mut interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        interpreter.view_centre = centre;
+        assert_eq!(
+            interpreter.run_tree(&mut fx.world, LAMP, 4096, record, &[], 1000),
+            Ok(true),
+            "Dialog with Placed callback must succeed for view_centre={centre:?}"
+        );
+        assert_eq!(fx.world.globals[36], 88);
+        assert!(fx.world.portraits.contains(&WIDGET));
+    }
+
+    // 2. P2 #2: UI Effect on a 19x19 lot (289 interior tiles > 256) with
+    // `function::PLACED` and `view_centre == None` succeeds instead of trapping
+    // on an artificial candidate cap.
+    {
+        let (mut fx, file, record) = visitors();
+        fx.world.size = 19;
+        fx.add(
+            file,
+            4200,
+            tree(vec![assign(
+                scope::GLOBAL,
+                36,
+                scope::LITERAL,
+                91,
+                RETURN_TRUE,
+            )]),
+        );
+        let library = fx.program.libraries.get_mut(&file).unwrap();
+        for table in library.callbacks.values_mut() {
+            table.resize(
+                27,
+                sims_formats::execution::ObjectFunction {
+                    condition: 0,
+                    action: 0,
+                },
+            );
+            table[9].action = 4200;
+        }
+        let [lo, hi] = record.to_le_bytes();
+        fx.add(
+            LAMP_FILE,
+            4096,
+            tree(vec![ins(
+                UI_EFFECT,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [1, scope::LITERAL, lo, hi, 1, 0, 0, 0],
+            )]),
+        );
+        let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        assert_eq!(
+            interpreter.run_tree(&mut fx.world, LAMP, 4096, 0, &[], 1000),
+            Ok(true),
+            "UI Effect with 289 invariant candidate tiles and view_centre=None must succeed"
+        );
+        assert_eq!(fx.world.globals[36], 91);
+        assert!(fx.world.portraits.contains(&WIDGET));
+    }
+
+    // 3. P3 #1: Clothing body-type validation uses case-sensitive bytewise `strcmp`
+    // (`0x40a91b -> 0x634d50`), so an inherited formal row with `FIT` fails against
+    // a lowercase `fit` everyday body and enters fallback.
+    {
+        let (mut fx, _, _) = visitors();
+        const TEMPLATE_PERSON: u32 = 0x7FD9_6B54;
+        let tpl_file = fx.add_type(TEMPLATE_PERSON, 2, 4096, 4097);
+        let id = fx.world.neighbors.slots.len() as i16 + 1;
+        fx.world.neighbors.slots.push(Some(Neighbor {
+            guid: TEMPLATE_PERSON,
+            id,
+            data: vec![0; 88],
+            relationships: Vec::new(),
+            friends: 0,
+            revision: 0,
+            stale: false,
+        }));
+        fx.add(
+            tpl_file,
+            4096,
+            tree(vec![assign(
+                scope::MY_DATA,
+                4,
+                scope::LITERAL,
+                1,
+                RETURN_TRUE,
+            )]),
+        );
+        fx.add(
+            tpl_file,
+            4097,
+            tree(vec![
+                assign(scope::PARAMETERS, 0, scope::LITERAL, 10, 1),
+                ins(0, 0, 0, [0; 8]),
+            ]),
+        );
+        equip(&mut fx, TEMPLATE_PERSON, "adult", 12);
+        fx.program.people.profiles.insert(
+            TEMPLATE_PERSON,
+            Profile {
+                body: Some("b001mafit_01,BODY=b001mafitlgt_01".into()),
+                head: Some("c001ma_01,HEAD-HEAD=c001malgt_01".into()),
+                gender: Some("male".into()),
+                age: Some("27".into()),
+                skin: Some("lgt".into()),
+                tones: vec!["lgt".into()],
+                suit_rows: BTreeMap::from([
+                    // Uppercase `FIT` matches wardrobe case-insensitively, but fails
+                    // bytewise `strcmp` against lowercase `fit` at `0x40a91b..0x40a968`!
+                    (30, "f200maFIT_01,BODY=f200maFITlgt_01".into()),
+                    (31, "s200maFIT_01,BODY=s200maFITlgt_01".into()),
+                    (32, "l200maFIT_01,BODY=l200maFITlgt_01".into()),
+                ]),
+                ..Default::default()
+            },
+        );
+        let mut table = SuitTable::default();
+        for name in [
+            "b001mafit_01",
+            "c001ma_01",
+            "f100mafit_01",
+            "f200maFIT_01",
+            "s100mafit_01",
+            "s200maFIT_01",
+            "l100mafit_01",
+            "l200maFIT_01",
+        ] {
+            table.insert_name(name.into());
+        }
+        fx.program.people.suit_table = table;
+        fx.program.people.textures = vec![
+            "b001mafitlgt_01".into(),
+            "c001malgt_01".into(),
+            "f100mafitlgt_01".into(),
+            "f200maFITlgt_01".into(),
+            "s100mafitlgt_01".into(),
+            "s200maFITlgt_01".into(),
+            "l100mafitlgt_01".into(),
+            "l200maFITlgt_01".into(),
+        ];
+        fx.program.wardrobe = Some(Wardrobe {
+            suits: vec!["b001mafit_01".into(), "c001ma_01".into()]
+                .into_iter()
+                .collect(),
+            textures: vec!["b001mafitlgt_01.bmp".into(), "c001malgt_01.bmp".into()]
+                .into_iter()
+                .collect(),
+            errors: Default::default(),
+        });
+        let mut t = tree(vec![
+            assign(scope::LOCALS, 0, scope::LITERAL, 0, 1),
+            assign(scope::LOCALS, 1, scope::LITERAL, 27, 2),
+            assign(scope::LOCALS, 2, scope::LITERAL, 0, 3),
+            ins(19, RETURN_TRUE, RETURN_FALSE, [0, 1, 2, 0, 0, 0, 0, 0]),
+        ]);
+        t.locals = 3;
+        fx.add(LAMP_FILE, 4096, t);
+        assert_eq!(fx.run_with(LAMP, 4096, 0, &[], 1000), Ok(true));
+        let made_guid = *fx.world.characters.made.keys().next().unwrap();
+        let outfits = &fx.world.made_outfits[&made_guid];
+        // Because `FIT` != `fit` in `strcmp`, all three indices were invalidated to None
+        // and `0x40b7ed` regenerated `f100`/`s100`/`l100`!
+        assert_eq!(
+            outfits.get(&30).map(String::as_str),
+            Some("f100mafit_01,BODY=f100mafitlgt_01"),
+            "case-sensitive strcmp at 0x40a91b must reject FIT against fit and regenerate f100"
+        );
+        assert_eq!(
+            outfits.get(&31).map(String::as_str),
+            Some("s100mafit_01,BODY=s100mafitlgt_01"),
+            "case-sensitive strcmp at 0x40a93c must reject FIT against fit and regenerate s100"
+        );
+        assert_eq!(
+            outfits.get(&32).map(String::as_str),
+            Some("l100mafit_01,BODY=l100mafitlgt_01"),
+            "case-sensitive strcmp at 0x40a95d must reject FIT against fit and regenerate l100"
+        );
+    }
+
+    // 4. P3 #2: `Set To Next` followed by `Expression` reading Global 34 on the RHS
+    // succeeds (`0x44eb9d` points inside `Expression`'s 0x58-byte local frame),
+    // and `0x452c85` subsequently makes Global 34 safe for `UI Effect` too, whereas
+    // `Set To Next` directly before `UI Effect` still traps.
+    {
+        let (mut fx, _, record) = visitors();
+        fx.world.globals[34] = record;
+        // Node 0: Set To Next (op 31, mode 0 = all objects, dest = stack object).
+        // Node 1: Expression `temp[0] = global[34]` (succeeds!).
+        // Node 2: UI Effect mode 1 reading global[34] (succeeds after Expression!).
+        fx.add(
+            LAMP_FILE,
+            4096,
+            tree(vec![
+                ins(31, 1, 1, [0; 8]),
+                assign(scope::TEMPS, 0, scope::GLOBAL, 34, 2),
+                ins(
+                    UI_EFFECT,
+                    RETURN_TRUE,
+                    RETURN_FALSE,
+                    [1, scope::GLOBAL, 34, 0, 1, 0, 0, 0],
+                ),
+            ]),
+        );
+        assert_eq!(fx.run_with(LAMP, 4096, 0, &[], 1000), Ok(true));
+        assert_eq!(fx.world.objects[&LAMP].temps[0], record);
+        assert!(fx.world.portraits.contains(&WIDGET));
+        assert!(fx.world.scratch_ptr_set.contains(&LAMP));
+        assert!(!fx.world.scratch_ptr_set_to_next.contains(&LAMP));
     }
 }

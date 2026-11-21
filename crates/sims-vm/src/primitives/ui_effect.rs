@@ -676,21 +676,12 @@ impl Machine<'_, '_> {
                 finish_at(Some(pos), true, copy, cells)?
             }
             crate::placement::PortraitPutPlan::Candidates(positions) => {
-                const MAX_CANDIDATES: usize = 256;
-                if positions.len() > MAX_CANDIDATES {
-                    return Err(Trap::Unsupported(format!(
-                        "{caller} puts a person on a tile searched for from the house view's \
-                         centre (0x4e96dd, 0x4347f0, 0x4a677c; `Lot::set_view_centre`), and with \
-                         no view centre given {} candidate tiles have tile-sensitive placement \
-                         hooks",
-                        positions.len()
-                    )));
-                }
                 let first = finish_at(Some(positions[0]), true, copy.clone(), cells.copy())?;
+                let first_lot = crate::both_ways::LotSnapshot::of(&first.1);
                 for &pos in &positions[1..] {
                     let next = finish_at(Some(pos), true, copy.clone(), cells.copy())?;
                     if next.0 != first.0
-                        || !crate::both_ways::same_lot(&first.1, &next.1)
+                        || crate::both_ways::LotSnapshot::of(&next.1) != first_lot
                         || !first.2.same(&next.2)
                     {
                         return Err(Trap::Unsupported(format!(

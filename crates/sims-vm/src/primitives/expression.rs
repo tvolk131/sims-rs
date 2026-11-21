@@ -27,9 +27,14 @@ impl Machine<'_, '_> {
         let (operator, left_scope, right_scope) = (operands[5], operands[6], operands[7]);
         // The original resolves the right operand (`0x452c76`) BEFORE binding
         // `[edi + 0x128]` at `0x452c85`. On a fresh object whose scratch
-        // pointer is still null, reading global 34 dereferences null at
-        // `0x4541db`.
-        if right_scope == 6 && right_index == 34 && !self.world.scratch_ptr_set.contains(&self.me) {
+        // pointer is still null (neither safe nor left by `Set To Next`, whose
+        // `[ebp - 0x18]` slot lands inside `Expression`'s 0x58-byte local
+        // frame), reading global 34 dereferences null at `0x4541db`.
+        if right_scope == 6
+            && right_index == 34
+            && !self.world.scratch_ptr_set.contains(&self.me)
+            && !self.world.scratch_ptr_set_to_next.contains(&self.me)
+        {
             return Err(Trap::Unsupported(
                 "Expression reading global 34 before [object + 0x128] is initialized \
                  (0x452c76 -> 0x4541db) dereferences null"
@@ -41,6 +46,7 @@ impl Machine<'_, '_> {
         // dispatcher pushes 1 argument for Expression (`0x45237d`) and 2 for
         // UI Effect (`0x45226e`), this targets UI Effect's saved `ebp` slot,
         // which the dispatcher restores at `0x452273` without faulting.
+        self.world.scratch_ptr_set_to_next.remove(&self.me);
         self.world.scratch_ptr_set.insert(self.me);
         let write = matches!(operator, 3..=7 | 9..=13 | 17..=20);
         let (destination, writable) = self.resolve(left_scope, left_index, write)?;

@@ -281,6 +281,15 @@ pub struct World {
     /// `sims_vm::boot::save::Saved` preserves it across save/restore.
     #[serde(skip)]
     pub scratch_ptr_set: BTreeSet<u16>,
+    /// Live objects whose last `[object + 0x128]` write was `Set To Next`
+    /// (`0x44eb9d`). That pointer addresses an allocated local inside a
+    /// subsequent `Expression`'s right-hand Global 34 read (`0x452c76` →
+    /// `0x4541db`, which therefore succeeds), while still overlapping
+    /// `UI Effect`'s return address (`0x44ad70`, which traps). Kept out of
+    /// [`World::encode`] to preserve snapshot format 31;
+    /// `sims_vm::boot::save::Saved` preserves it across save/restore.
+    #[serde(skip)]
+    pub scratch_ptr_set_to_next: BTreeSet<u16>,
     /// Appearance names newly inserted into `AvatarRegistry`'s hash table by
     /// runtime `.bcf` catalog loads (`0x59f320` → `0x5a1fb1`) that were not
     /// already present in startup eager or `.ndx` registrations, in exact
@@ -743,6 +752,7 @@ impl World {
             made_outfits: BTreeMap::new(),
             person_outfits: BTreeMap::new(),
             scratch_ptr_set: BTreeSet::new(),
+            scratch_ptr_set_to_next: BTreeSet::new(),
             runtime_added_suits: Vec::new(),
             suit_scan_cache: None,
         }

@@ -381,18 +381,23 @@ fn texture_list(program: &Program) -> Vec<String> {
     Vec::new()
 }
 
+/// Extracts up to 3 raw Windows-1252 bytes starting at byte offset 6
+/// (`0x40a727`, `0x40a840`, `0x40a880`, `0x40a8c0`, `0x40a900`, `0x40aa20`,
+/// `0x40aa60`, `0x40ab55`), preserving case for bytewise `strcmp` (`0x634d50`).
+fn cp1252_body_type_raw(row: &str) -> Vec<u8> {
+    let bytes = encode_cp1252(row);
+    bytes
+        .get(6..)
+        .map(|rest| rest[..rest.len().min(3)].to_vec())
+        .unwrap_or_default()
+}
+
 /// Extracts up to 3 bytes of body type starting at Windows-1252 byte offset 6
 /// (`0x40b84a`, `0x40e59f` → `0x46f775`, `0x40afeb`), stopping at the end of
 /// the string and lowercased in ASCII.
 fn cp1252_body_type(suit: &str) -> String {
-    let bytes = encode_cp1252(suit);
-    bytes
-        .get(6..)
-        .map(|rest| {
-            let end = rest.len().min(3);
-            sims_formats::strings::decode(&rest[..end], 1).to_ascii_lowercase()
-        })
-        .unwrap_or_default()
+    let raw = cp1252_body_type_raw(suit);
+    sims_formats::strings::decode(&raw, 1).to_ascii_lowercase()
 }
 
 /// Expands a `$g`/`$b`/`$c` template (`0x40e477`) into a [`Pattern`].
@@ -942,47 +947,52 @@ pub(crate) fn commit_character_clothing(
     };
 
     // 0x40a6a6..0x40ab7b: when `body_idx != -1`, compare each matched clothing
-    // row's body type (offset 6, up to 3 bytes) against row 1's body type.
-    // When `body_idx == -1` and replaced with index 0 (`0x40abf9..0x40ac34`),
+    // row's raw body type (offset 6, up to 3 bytes) against row 1's raw body
+    // type using bytewise `strcmp` (`0x634d50`, case-sensitive). When
+    // `body_idx == -1` and replaced with index 0 (`0x40abf9..0x40ac34`),
     // invalidate all relevant clothing indices instead.
     match body_state {
         BodyCommitState::Matched => {
             let validation_body_row = pre_clear_body_row.unwrap_or(&body_row);
-            let body_bt = cp1252_body_type(validation_body_row);
+            let body_bt = cp1252_body_type_raw(validation_body_row);
             if !is_child {
-                if matches!(body_bt.as_str(), "skn" | "fit" | "fat") {
+                if matches!(body_bt.as_slice(), b"skn" | b"fit" | b"fat") {
                     if f_idx.is_some()
-                        && cp1252_body_type(row_30.as_deref().unwrap_or("")) != body_bt
+                        && cp1252_body_type_raw(row_30.as_deref().unwrap_or("")) != body_bt
                     {
                         f_idx = None;
                     }
                     if s_idx.is_some()
-                        && cp1252_body_type(row_31.as_deref().unwrap_or("")) != body_bt
+                        && cp1252_body_type_raw(row_31.as_deref().unwrap_or("")) != body_bt
                     {
                         s_idx = None;
                     }
                     if l_idx.is_some()
-                        && cp1252_body_type(row_32.as_deref().unwrap_or("")) != body_bt
+                        && cp1252_body_type_raw(row_32.as_deref().unwrap_or("")) != body_bt
                     {
                         l_idx = None;
                     }
                     if h_idx.is_some()
-                        && cp1252_body_type(row_34.as_deref().unwrap_or("")) != body_bt
+                        && cp1252_body_type_raw(row_34.as_deref().unwrap_or("")) != body_bt
                     {
                         h_idx = None;
                     }
                 }
-            } else if body_bt == "chd" {
-                if s_idx.is_some() && cp1252_body_type(row_31.as_deref().unwrap_or("")) != body_bt {
+            } else if body_bt.as_slice() == b"chd" {
+                if s_idx.is_some()
+                    && cp1252_body_type_raw(row_31.as_deref().unwrap_or("")) != body_bt
+                {
                     s_idx = None;
                 }
-                if l_idx.is_some() && cp1252_body_type(row_32.as_deref().unwrap_or("")) != body_bt {
+                if l_idx.is_some()
+                    && cp1252_body_type_raw(row_32.as_deref().unwrap_or("")) != body_bt
+                {
                     l_idx = None;
                 }
             }
-            if matches!(body_bt.as_str(), "skn" | "fit" | "fat" | "chd")
+            if matches!(body_bt.as_slice(), b"skn" | b"fit" | b"fat" | b"chd")
                 && w_idx.is_some()
-                && cp1252_body_type(row_33.as_deref().unwrap_or("")) != body_bt
+                && cp1252_body_type_raw(row_33.as_deref().unwrap_or("")) != body_bt
             {
                 w_idx = None;
             }

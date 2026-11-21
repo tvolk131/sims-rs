@@ -19,6 +19,7 @@ impl Machine<'_, '_> {
         };
         // 0x451e8d: binds `[esi + 0x128]` to the local scratch slot before
         // resolving the destination operand and never clears it.
+        self.world.scratch_ptr_set_to_next.remove(&self.me);
         self.world.scratch_ptr_set.insert(self.me);
         let (destination, writable) = self.resolve(scope(2)?, word(operands, 0), true)?;
         // Resolution also reads the old value, so an unreadable destination

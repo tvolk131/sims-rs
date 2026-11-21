@@ -46,6 +46,7 @@ impl Machine<'_, '_> {
             .map_err(|_| Trap::native(9, "invalid memory scope"))?;
         // 0x45202b: binds `[esi + 0x128]` to the local scratch slot before
         // resolving the destination operand and never clears it.
+        self.world.scratch_ptr_set_to_next.remove(&self.me);
         self.world.scratch_ptr_set.insert(self.me);
         let (destination, writable) = self.resolve(scope, word(operands, 0), true)?;
         self.probe(destination)?;
