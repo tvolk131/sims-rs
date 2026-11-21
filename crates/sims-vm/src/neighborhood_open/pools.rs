@@ -472,10 +472,7 @@ impl<'a, 'b> Fills<'a, 'b> {
             let scales = match skeletons.scales.get(name) {
                 Some(Ok(scales)) => scales.as_slice(),
                 Some(Err(reason)) => {
-                    return Err(format!(
-                        "the skeleton {name:?} for User{file:05}: {reason}"
-                    )
-                    .into());
+                    return Err(format!("the skeleton {name:?} for User{file:05}: {reason}").into());
                 }
                 None => {
                     return Err(format!(
