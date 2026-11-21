@@ -17,6 +17,7 @@ pub mod save;
 use crate::play::Play;
 use crate::{Answers, Callback, Interpreter, Program, Stream, TickError, Update};
 use sims_content::{Animations, Catalog, House, Index, Install, Neighborhood, People, Surfaces};
+use sims_core::CrtRng;
 use sims_sim::World;
 use sims_sim::load::{Context, Household};
 use sims_sim::motives::Tuning;
@@ -415,18 +416,42 @@ impl Lot {
     /// the dialogs that offer a choice; a dialog with one button takes
     /// none. The frame before the first tick is not drawn yet; the first
     /// [`Lot::step`] draws it when `frames` asks for one.
+    ///
+    /// The game is taken to have just started: nothing has drawn from the
+    /// C runtime's generator, which is at state 1, as no recording has
+    /// seen it seeded. [`Lot::load_with`] takes it as earlier play left it.
     pub fn load(
         root: &Path,
         house: &Path,
         answers: &[u8],
         frames: Frames,
     ) -> Result<Self, BootError> {
+        Self::load_with(root, house, answers, frames, CrtRng::from_state(1))
+    }
+
+    /// [`Lot::load`] with the C runtime's generator (`World::crt_rng`)
+    /// starting at `crt`: after a neighborhood's first open, for one,
+    /// whose import and pools draw from it.
+    ///
+    /// `crt` is the state from which this load's own draws reach the
+    /// original's entry state. Those include the 64 draws of making the
+    /// two indicator objects (`Interpreter::create_indicators`), which the
+    /// original may already have made before its lot load starts. So
+    /// `crt` need not be the original's state at any one point before its
+    /// load, and passing that state instead would replay those draws.
+    pub fn load_with(
+        root: &Path,
+        house: &Path,
+        answers: &[u8],
+        frames: Frames,
+        crt: CrtRng,
+    ) -> Result<Self, BootError> {
         let directory = house
             .parent()
             .and_then(Path::parent)
             .ok_or("the house file must be inside a neighborhood's Houses directory")?;
         let neighborhood = Neighborhood::open(directory)?;
-        Self::load_in(root, neighborhood, house, answers, frames)
+        Self::load_in_with(root, neighborhood, house, answers, frames, crt)
     }
 
     /// [`Lot::load`] with the neighborhood already open, as opening it
@@ -439,6 +464,26 @@ impl Lot {
         house: &Path,
         answers: &[u8],
         frames: Frames,
+    ) -> Result<Self, BootError> {
+        Self::load_in_with(
+            root,
+            neighborhood,
+            house,
+            answers,
+            frames,
+            CrtRng::from_state(1),
+        )
+    }
+
+    /// [`Lot::load_in`] with the C runtime's generator starting at `crt`,
+    /// as [`Lot::load_with`] takes it.
+    pub fn load_in_with(
+        root: &Path,
+        neighborhood: Neighborhood,
+        house: &Path,
+        answers: &[u8],
+        frames: Frames,
+        crt: CrtRng,
     ) -> Result<Self, BootError> {
         let install = Install::detect(root)?;
         let mut index = Index::build(&install)?;
@@ -490,6 +535,7 @@ impl Lot {
             program.character_files = crate::program::character_files(&index, characters);
         }
         let mut world = World::empty();
+        world.crt_rng = crt;
         let mut load = LoadReport::default();
         let surfaces;
         {
