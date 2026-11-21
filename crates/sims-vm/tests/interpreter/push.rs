@@ -1824,7 +1824,8 @@ fn a_visitor_on_category_4_or_7_checks_the_hotel_key_inventory_token() {
         assert_eq!(listed_menus(&mut fx), Vec::<u32>::new());
     }
 
-    // Multiple type-0xd definitions: 0x43e21a keeps the last registered.
+    // Multiple type-0xd definitions: 0x43e21a keeps the last registered,
+    // with `Characters` definitions reregistered after the rest (0x43c228).
     let mut fx = setup(4, 0, &[OLD_KEY, KEY]);
     fx.world.neighbors.inventories.push(Inventory {
         neighbor: NEIGHBOR,
@@ -1835,6 +1836,10 @@ fn a_visitor_on_category_4_or_7_checks_the_hotel_key_inventory_token() {
         }],
     });
     assert_eq!(listed_menus(&mut fx), Vec::<u32>::new());
+    // When OLD_KEY comes from `Characters`, reload places it after KEY.
+    fx.program.characters.insert(OLD_KEY);
+    assert_eq!(listed_menus(&mut fx), vec![3]);
+    fx.program.characters.clear();
     fx.world.neighbors.inventories[0].items.push(Item {
         kind: 0,
         guid: KEY,

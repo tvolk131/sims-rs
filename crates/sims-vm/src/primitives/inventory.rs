@@ -105,8 +105,8 @@ impl Machine<'_, '_> {
                 })?
                 .guid;
         }
-        let place = self.inventory_slot(neighbor);
         if operation == 0 {
+            let place = self.inventory_slot(neighbor);
             let temps = &self
                 .world
                 .objects
@@ -140,6 +140,28 @@ impl Machine<'_, '_> {
             }
             return Ok(true);
         }
+        // The place is the token's index cut to a word, with no check
+        // (0x41f677 to 0x41f684, 0x41f6d5 to 0x41f6e1).
+        let place_word = |index: usize| index as i16;
+        if operation == 3 {
+            let Some((index, count)) = self
+                .find_inventory_token(neighbor, kind, guid)
+                .filter(|&(_, count)| count != 0)
+            else {
+                return Ok(false);
+            };
+            let temps = &mut self
+                .world
+                .objects
+                .get_mut(&self.me)
+                .ok_or(Trap::native(10, "missing object"))?
+                .temps;
+            temps[usize::from((flags >> 5) & 3)] = count as i16;
+            temps[usize::from((flags >> 11) & 3)] = place_word(index);
+            return Ok(true);
+        }
+        // Operation 4: the next token after the place in a temp.
+        let place = self.inventory_slot(neighbor);
         let items = &self.world.neighbors.inventories[place].items;
         let temps = &mut self
             .world
@@ -147,24 +169,6 @@ impl Machine<'_, '_> {
             .get_mut(&self.me)
             .ok_or(Trap::native(10, "missing object"))?
             .temps;
-        // The place is the token's index cut to a word, with no check
-        // (0x41f677 to 0x41f684, 0x41f6d5 to 0x41f6e1).
-        let place_word = |index: usize| index as i16;
-        if operation == 3 {
-            let found = items
-                .iter()
-                .enumerate()
-                .find(|(_, item)| item.kind == kind && item.guid == guid)
-                .map(|(index, item)| (index, item.count));
-            let Some((index, count)) = found.filter(|&(_, count)| count != 0) else {
-                return Ok(false);
-            };
-            let index = place_word(index);
-            temps[usize::from((flags >> 5) & 3)] = count as i16;
-            temps[usize::from((flags >> 11) & 3)] = index;
-            return Ok(true);
-        }
-        // Operation 4: the next token after the place in a temp.
         let guid = if flags & MATCH_GUID != 0 { guid } else { 0 };
         let after = temps[usize::from((flags >> 8) & 3)];
         let start = after.wrapping_add(1);

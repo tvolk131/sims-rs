@@ -873,8 +873,9 @@ fn the_pie_menu_on_another_goth_offers_to_join_what_i_run() {
 /// lot. Listing their pie menus on category 4 and 7 objects (objects 112,
 /// 113, 124–129 and 211–213) checks for `Token - Hotel Key` (type 0xd,
 /// 0x3ac022d6) in their neighbor-ID inventory (0x42a8a1, 0x43e21a,
-/// 0x41f660) instead of failing loudly, creating empty inventories if
-/// absent.
+/// 0x41f660) instead of failing loudly. (In `UserData/Neighborhood.iff`
+/// both visitors already carry empty inventories, so missing-inventory
+/// creation is covered by the synthetic fixture tests.)
 #[test]
 fn a_goth_visitor_lists_category_4_and_7_objects_via_the_hotel_key_check() {
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
@@ -907,21 +908,23 @@ fn a_goth_visitor_lists_category_4_and_7_objects_via_the_hotel_key_check() {
         );
     }
 
+    let inventories_before = lot.world().neighbors.inventories.len();
     for &visitor in &[24u16, 26] {
         let neighbor = lot.world().objects[&visitor].person.as_ref().unwrap().data[31];
-        for &target in &targets {
-            lot.pie_menu(visitor, target)
-                .unwrap_or_else(|e| panic!("visitor {visitor} on {target}: {e}"));
-        }
         assert!(
             lot.world()
                 .neighbors
                 .inventories
                 .iter()
                 .any(|inv| inv.neighbor == neighbor),
-            "visitor {visitor} (neighbor {neighbor}) should have an inventory created by 0x42a8a1"
+            "visitor {visitor} (neighbor {neighbor}) already has a saved inventory"
         );
+        for &target in &targets {
+            lot.pie_menu(visitor, target)
+                .unwrap_or_else(|e| panic!("visitor {visitor} on {target}: {e}"));
+        }
     }
+    assert_eq!(lot.world().neighbors.inventories.len(), inventories_before);
 }
 
 #[test]

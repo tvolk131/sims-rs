@@ -833,6 +833,7 @@ impl Machine<'_, '_> {
         let record = record.clone();
         let me = chooser.me;
         self.checked_person_mut(me)?.data[data::CHECKED] = 0;
+        let (visitor, age, kind) = self.checked_person_traits(me)?;
         let target = &self.world.objects[&entry.target];
         let target_data = |index: usize| target.data.get(index).copied().unwrap_or(0);
         let (target_flags, target_in_use, target_category) = (
@@ -843,23 +844,13 @@ impl Machine<'_, '_> {
         let mut allowed = true;
         if target_flags & 0x200 != 0 || target_in_use > 0 {
             allowed = false;
-        } else if record.flags & entry::VISITORS == 0 && chooser.visitor {
+        } else if record.flags & entry::VISITORS == 0 && visitor {
             let community = !chooser.residential && record.flags & entry::COMMUNITY != 0;
             if !community {
                 allowed = matches!(target_category, 4 | 7) && self.visitor_has_hotel_key(me)?;
             }
         }
-        let flags = record.flags;
-        let fits = if chooser.child {
-            flags & entry::NOT_CHILD == 0
-        } else if chooser.dog {
-            flags & entry::DOGS != 0
-        } else if chooser.cat {
-            flags & entry::CATS != 0
-        } else {
-            flags & entry::NOT_ADULT == 0
-        };
-        if !fits || !allowed {
+        if !fits_person(age, kind, record.flags) || !allowed {
             return Ok(None);
         }
         // 0x4763c5 copies as many as both have (the record always has
@@ -1048,6 +1039,20 @@ pub(crate) fn attenuation(constants: &Constants, visitor: bool, record: &Interac
     }
 }
 
+/// Whether a person of `age` (person data word 58) and `kind` (word 65)
+/// fits an interaction table entry's `flags` (0x458443 to 0x45848a).
+fn fits_person(age: i16, kind: i16, flags: u32) -> bool {
+    if age != 0 && age < 18 {
+        flags & entry::NOT_CHILD == 0
+    } else if kind & 2 != 0 {
+        flags & entry::DOGS != 0
+    } else if kind & 4 != 0 {
+        flags & entry::CATS != 0
+    } else {
+        flags & entry::NOT_ADULT == 0
+    }
+}
+
 /// The first entry of a table with a menu number (0x41f12c).
 pub(crate) fn find(table: &InteractionTable, menu: u32) -> Option<&Interaction> {
     table
@@ -1084,22 +1089,50 @@ impl Machine<'_, '_> {
             .ok_or(Trap::native(10, "missing object"))
     }
 
+    /// Reads `(visitor, age, kind)` live from `caller`'s person data
+    /// (words 32, 58 and 65), as 0x458319 reads them on every action check.
+    fn checked_person_traits(&self, caller: u16) -> Result<(bool, i16, i16), Trap> {
+        let person = self
+            .checked_person(caller)?
+            .person
+            .as_ref()
+            .ok_or(Trap::native(0x1c, "object is not a person"))?;
+        let word = |index: usize| person.data.get(index).copied().unwrap_or(0);
+        Ok((
+            word(person::VISITOR) != 0,
+            word(person::AGE),
+            word(person::KIND),
+        ))
+    }
+
     /// The GUID of the last registered object definition of type 0xd
     /// (0x43e21a), or 0 when the catalog has none.
     ///
     /// The original walks the definition registry's vector (+0x20,
     /// 0x43ac3a) and keeps the last matching definition's GUID in a static
-    /// cache (0x6e4f5c, filled once while 0). Complete Collection registers
-    /// one such definition (`Token - Hotel Key`, 0x3ac022d6, in
-    /// `ExpansionPack4.far::Tokens.iff`); dynamically created characters
-    /// are people (type 2), so the catalog's order gives the same GUID.
+    /// cache (0x6e4f5c, filled once while 0). Because neighborhood reload
+    /// reregisters `Characters` definitions after the rest (0x43c228;
+    /// [`crate::Program::characters`]), any type-0xd definition in
+    /// `Characters` comes after non-`Characters` definitions. Complete
+    /// Collection registers one such definition (`Token - Hotel Key`,
+    /// 0x3ac022d6, in `ExpansionPack4.far::Tokens.iff`); dynamically
+    /// created characters are people (type 2).
     fn hotel_key_guid(&self) -> u32 {
+        let character =
+            |object: &&sims_content::Object| self.program.characters.contains(&object.guid);
         self.catalog
             .objects
             .iter()
             .rev()
-            .find(|object| object.kind == HOTEL_KEY_TYPE)
-            .map_or(0, |object| object.guid)
+            .find(|o| o.kind == HOTEL_KEY_TYPE && character(o))
+            .or_else(|| {
+                self.catalog
+                    .objects
+                    .iter()
+                    .rev()
+                    .find(|o| o.kind == HOTEL_KEY_TYPE && !character(o))
+            })
+            .map_or(0, |o| o.guid)
     }
 
     /// Whether visitor `caller` holds a hotel-key token (kind 0, GUID from
@@ -1237,18 +1270,9 @@ impl Machine<'_, '_> {
         let record = record.clone();
         let caller = self.caller(action)?;
         self.checked_person_mut(caller)?.data[data::CHECKED] = 0;
-        let word = |object: &sims_sim::Object, index: usize| object.data.get(index).copied();
-        let person = self
-            .checked_person(caller)?
-            .person
-            .as_ref()
-            .ok_or(Trap::native(0x1c, "object is not a person"))?;
-        let personal = |index: usize| person.data.get(index).copied().unwrap_or(0);
-        let visitor = personal(person::VISITOR) != 0;
-        let age = personal(person::AGE);
-        let kind = personal(person::KIND);
+        let (visitor, age, kind) = self.checked_person_traits(caller)?;
         let target_object = &self.world.objects[&target];
-        let target_data = |index: usize| word(target_object, index).unwrap_or(0);
+        let target_data = |index: usize| target_object.data.get(index).copied().unwrap_or(0);
         let (target_flags, target_category) =
             (target_data(data::FLAGS), target_data(data::CATEGORY));
         let lot = self.world.globals.get(LOT).copied().unwrap_or(0);
@@ -1259,16 +1283,7 @@ impl Machine<'_, '_> {
                 allowed = matches!(target_category, 4 | 7) && self.visitor_has_hotel_key(caller)?;
             }
         }
-        let flags = record.flags;
-        let fits = if age != 0 && age < 18 {
-            flags & entry::NOT_CHILD == 0
-        } else if kind & 2 != 0 {
-            flags & entry::DOGS != 0
-        } else if kind & 4 != 0 {
-            flags & entry::CATS != 0
-        } else {
-            flags & entry::NOT_ADULT == 0
-        };
+        let fits = fits_person(age, kind, record.flags);
         let passed = if !allowed || !fits {
             false
         } else if record.test == 0 {

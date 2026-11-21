@@ -729,4 +729,39 @@ fn autonomy_allows_a_visitor_join_on_category_4_only_with_the_hotel_key() {
     let mut fx = setup(true);
     assert_eq!(turn(&mut fx), Status::Yielded);
     assert_eq!(fx.sim().data[20], 5);
+
+    // 0x458319 reads person word 32 live for each action check: if an
+    // earlier check tree in the scan clears the visitor flag, the later
+    // category-4 join is allowed without touching or creating inventories.
+    let mut fx = setup(false);
+    // Give OTHER a visitor-allowed entry checked before the join entry;
+    // its check tree clears SIM's person data word 32 and returns false.
+    fx.add(
+        SIM_FILE,
+        4305,
+        tree(vec![assign(
+            18, // My Person Data
+            32,
+            scope::LITERAL,
+            0,
+            RETURN_FALSE,
+        )]),
+    );
+    let sim_table = fx.words(SIM_FILE)[7] as u16;
+    let mut clear_visitor = entry(1, 0, 1); // VISITORS
+    clear_visitor.test = 4305;
+    fx.program
+        .libraries
+        .get_mut(&SIM_FILE)
+        .unwrap()
+        .interactions
+        .get_mut(&sim_table)
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .interactions
+        .push(clear_visitor);
+    assert_eq!(turn(&mut fx), Status::Yielded);
+    assert_eq!(fx.sim().data[20], 5);
+    assert!(fx.world.neighbors.inventories.is_empty());
 }

@@ -46,23 +46,33 @@ the Vacation hotel-key inventory token lookup.
 
 - `Machine::inventory_slot` (`0x42a8a1`) and `Machine::find_inventory_token`
   (`0x41f660`, `0x41f721`) are shared helpers in
-  `crates/sims-vm/src/primitives/inventory.rs`.
-- `Machine::hotel_key_guid` (`0x43e21a`) scans `self.catalog.objects` in
-  reverse for the last definition with `kind == 0xd`, returning `0` when
-  none exists. Dynamically created characters are people (type 2), so the
-  catalog gives the same GUID as the runtime registry.
+  `crates/sims-vm/src/primitives/inventory.rs`, reused by both Manage
+  Inventory operation 3 (testing `count != 0`) and `0x458319` (testing
+  `(count as i16) > 0`).
+- `Machine::hotel_key_guid` (`0x43e21a`) scans the reloaded registry order
+  (`Characters` definitions in `Program::characters` after the rest, as
+  `0x43c228` reregisters them) in reverse for the last definition with
+  `kind == 0xd`, returning `0` when none exists. Dynamically created
+  characters are people (type 2).
 - `Machine::visitor_has_hotel_key` reads `caller`'s person data word 31,
   calls `find_inventory_token(neighbor, 0, guid)`, and tests
   `(count as i16) > 0`.
 - Both `autonomy_allows` and `check_chosen` in
-  `crates/sims-vm/src/autonomy.rs` call `visitor_has_hotel_key` on category
-  4 or 7 targets instead of returning `Trap::Unsupported`.
+  `crates/sims-vm/src/autonomy.rs` read the caller's live visitor, age and
+  kind words on every check (as `0x458319` does) and call
+  `visitor_has_hotel_key` on category 4 or 7 targets instead of returning
+  `Trap::Unsupported`.
 
 ## Not verified
 
 - No emulator recording exercises a visitor holding `Token - Hotel Key` on a
   category 4 or 7 object; that branch is verified from the disassembly and
   synthetic fixture tests only.
+- In the original executable, `0x43e21a`'s static cache (`0x6e4f5c`) keeps a
+  nonzero GUID for the lifetime of the process across later neighborhood
+  reloads; here each `Lot` derives the GUID from the current neighborhood's
+  reloaded registry order. Complete Collection has one matching definition
+  outside `Characters`.
 - `0x458826` (`autonomy_entries`) has a separate hotel-key check gated on
   Vacation lots 40 to 49 (`0x4074c8`), which `Find Best Interaction` still
   refuses earlier as unported.
