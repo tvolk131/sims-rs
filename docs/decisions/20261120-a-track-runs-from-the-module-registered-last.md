@@ -69,9 +69,16 @@ port now does the same.
   `call`, led to. A `call` returns into the caller's program.
 - The stations' hit lists are added between the base game's lists and
   the expansions'.
-- Stations added after sound has played destroy what they replace: the
-  old object's threads, notes and cached samples. (The original builds
-  them before any sound plays.)
+- Stations added after sound has played destroy what they replace. (The
+  original builds them before any sound plays.)
+  - Each station patch is a new object (0x5750a0 to 0x5750c5), even
+    with the same sample as the one it replaces.
+  - The old object's threads, its notes and its cached samples go.
+  - A note playing another patch, with the destroyed one queued after
+    it, plays on without it (0x57e09e to 0x57e0b6, 0x57fd25).
+  - The manager's instance records stay (0x57442d to 0x574473).
+  - A kind 30 event records its instance even when its number is a
+    patch object (0x573d36, 0x573d5a).
 - Events still come from the first module that defines them. This
   change does not touch event lookup.
 
@@ -99,6 +106,9 @@ port now does the same.
 
 - The order of the downloads among themselves. It decides track 6403
   and patch 6400. Here it is by name.
+- Whether a voice still plays a patch that was destroyed while queued
+  on it, from the path it copied (0x57ff7e to 0x57ff9a). Here it does
+  not.
 - No station patch number collides with a table's ID in the install, so
   the station rules above change nothing there.
 

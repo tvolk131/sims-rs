@@ -3143,6 +3143,46 @@ fn stations_added_after_playing_destroy_the_objects_they_replace() {
 }
 
 #[test]
+fn a_station_patch_with_the_same_sample_is_still_a_new_object() {
+    // Station patch 1 names the same sample as the base game's patch 1,
+    // but it is a new object (0x5750a0 to 0x5750c5), and registering it
+    // destroys the old one, whose note stops.
+    let mut base = module_with(&[&GENERIC], 1, 10, "");
+    base.name = "sounddata\\base".to_owned();
+    let mut player = Player::new(vec![base], samples(), 1);
+    play(&mut player, "e0");
+    assert_eq!(player.render(3, &NoSources), [1, 2, 3]);
+    player.add_stations(&StationLists {
+        hit_lists: BTreeMap::new(),
+        patches: BTreeMap::from([(1, "one.xa".to_owned())]),
+    });
+    assert_eq!(player.render(3, &NoSources), [0, 0, 0]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn destroying_a_queued_patch_leaves_the_note_it_was_queued_on() {
+    // Kind 53 starts patch 1 on idle track 10, then queues patch 2 after
+    // it. A station patch 2 destroys the queued patch's object, which
+    // lets go of its samples (0x57fd25) but not of the voice playing
+    // patch 1 (0x57e09e to 0x57e0b6): patch 1 plays to its end.
+    let events = "[GlobalHitList]\n7=1\n[EventMapping]\nseqa=53,10,0,7\nseqb=53,10,0,6\n";
+    let mut base = module_with(&[&GENERIC], 1, 10, events);
+    base.name = "sounddata\\base".to_owned();
+    let mut player = Player::new(vec![base], samples(), 1);
+    play(&mut player, "seqa");
+    play(&mut player, "seqb");
+    assert_eq!(player.render(3, &NoSources), [1, 2, 3]);
+    player.add_stations(&StationLists {
+        hit_lists: BTreeMap::new(),
+        patches: BTreeMap::from([(2, "two.xa".to_owned())]),
+    });
+    let rest: Vec<i16> = (4..=100).chain([0]).collect();
+    assert_eq!(player.render(98, &NoSources), rest);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
 fn a_play_of_a_running_track_takes_its_own_argument_kind() {
     // One module's track 10 takes no levels from its arguments; it asks
     // once and waits, with interrupt 1. Another's, listed first, is

@@ -642,15 +642,15 @@ fn registration_order(modules: &[Module]) -> Vec<usize> {
 fn owners(
     modules: &[Module],
     station_patches: &[(u32, String)],
-) -> (BTreeMap<u32, usize>, BTreeMap<u32, (usize, String)>) {
+) -> (BTreeMap<u32, usize>, BTreeMap<u32, (Registrant, String)>) {
     let mut tracks = BTreeMap::new();
     let mut patches = BTreeMap::new();
     let mut stations = Some(station_patches);
     let add_stations = |tracks: &mut BTreeMap<u32, usize>,
-                        patches: &mut BTreeMap<u32, (usize, String)>,
+                        patches: &mut BTreeMap<u32, (Registrant, String)>,
                         stations: &mut Option<&[(u32, String)]>| {
-        for (id, path) in stations.take().into_iter().flatten() {
-            patches.insert(*id, (0, path.clone()));
+        for (at, (id, path)) in stations.take().into_iter().flatten().enumerate() {
+            patches.insert(*id, (Registrant::Station(at), path.clone()));
             tracks.remove(id);
         }
     };
@@ -666,7 +666,7 @@ fn owners(
                     patches.remove(&id);
                 }
                 Object::Patch => {
-                    patches.insert(id, (m, hot.patches[&id].path.clone()));
+                    patches.insert(id, (Registrant::Module(m), hot.patches[&id].path.clone()));
                     tracks.remove(&id);
                 }
             }
@@ -674,6 +674,16 @@ fn owners(
     }
     add_stations(&mut tracks, &mut patches, &mut stations);
     (tracks, patches)
+}
+
+/// Whose line registered a patch: a module's, by index, or the station
+/// patch made `n`th ([`Player::add_stations`]). Each registration makes a
+/// new object (0x5750a0 to 0x5750c5), so two are never the same object,
+/// whatever their samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Registrant {
+    Module(usize),
+    Station(usize),
 }
 
 /// A place in a module's program: the module and the address.
@@ -755,10 +765,10 @@ enum Flow {
 pub struct Player<S> {
     modules: Vec<Module>,
     samples: S,
-    /// Patch ID to (module, path): the module whose line registered it
-    /// last ([`owners`]), or 0 for a station's. An ID whose last line is
+    /// Patch ID to (registrant, path): whose line registered it last
+    /// ([`owners`]). An ID whose last line is
     /// a track's is not here.
-    patches: BTreeMap<u32, (usize, String)>,
+    patches: BTreeMap<u32, (Registrant, String)>,
     /// Track ID to the module whose line registered it last
     /// ([`owners`]): the module every start of the track runs from. An ID
     /// whose last line is a patch's is not here.
@@ -1673,18 +1683,24 @@ impl<S: Samples> Player<S> {
     }
 
     /// Forgets everything the object of this ID was doing, as a track and
-    /// as a patch: its threads and notes, any note of it as a patch, and
-    /// its cached samples.
+    /// as a patch: its threads and notes, any note playing it as a patch,
+    /// and its cached samples. A note playing another patch with this one
+    /// queued plays on without it: releasing a patch releases its samples
+    /// (0x57fd25), not the voice it is queued on (0x57e09e to 0x57e0b6).
+    /// **Unverified:** whether that voice still plays it, from the path it
+    /// copied (0x57ff7e to 0x57ff9a). The manager's instance records stay
+    /// (0x57442d to 0x574473).
     fn destroy(&mut self, id: u32) {
         self.kill_track(id);
         self.held.remove(&id);
         self.idle.remove(&id);
         self.ended.retain(|_, t| t.track != id);
-        self.instances.retain(|&(t, _)| t != id);
         self.track_objects.remove(&id);
         self.last_start.remove(&id);
-        self.notes
-            .retain(|n| n.track != id && n.patch != id && !n.chain.contains(&id));
+        self.notes.retain(|n| n.patch != id);
+        for note in &mut self.notes {
+            note.chain.retain(|&patch| patch != id);
+        }
         self.cache.remove(&id);
     }
 
@@ -2015,11 +2031,16 @@ impl<S: Samples> Player<S> {
     /// television turned on during a pause is silent until the unpause.
     fn turn_on_tv(&mut self, track: u32, args: [u32; 3], sources: &dyn Sources) {
         self.kill_instance(args[0], sources);
-        if self.owner(track).is_none() {
+        if !self.registered(track) {
             self.no_track(track);
             return;
         }
+        // The instance is recorded before the object's start (0x573d36,
+        // 0x573d5a), which for a patch object does nothing.
         self.record(track, args[0]);
+        if self.owner(track).is_none() {
+            return;
+        }
         let placed = self.placed(track, sources);
         let started = self.start(args, track);
         if started.fresh && self.paused {
