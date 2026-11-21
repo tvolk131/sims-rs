@@ -2373,3 +2373,38 @@ fn a_dirty_build_whose_reset_saves_a_siblings_bmp_2002_loads_it_at_0x4e9338() {
     assert!(fx.world.portraits.contains(&WIDGET));
     assert!(!fx.world.dirty_portraits.contains(&WIDGET));
 }
+
+#[test]
+fn a_dirty_no_tile_build_succeeds_when_reset_populates_slot_1() {
+    // 0x4e9706 removes the temporary person unput, running Reset while the
+    // person is still registered. If Reset requests a portrait of that same
+    // person (populating slot 1 from the on-lot temporary person), 0x4e9315
+    // sees slot 1 non-null and succeeds with no BMP_ 2002 on disk.
+    let (mut fx, widget_file, widget_record) = visitors();
+    fx.world.size = 2; // no free tile -> NotFound -> 0x4e9706
+    fx.world.dirty_portraits.insert(WIDGET);
+    // Reset callback (OBJf entry 3, tree 4100): show a mode-2 informing dialog
+    // naming WIDGET's own neighbor record while the temporary person is still
+    // registered in `world.people`, populating slot 1 via the on-lot path.
+    crate::visits::function(&mut fx, widget_file, 3, 4100);
+    fx.add(
+        widget_file,
+        4100,
+        tree(vec![
+            assign(scope::STACK_OBJECT, 0, scope::LITERAL, widget_record, 1),
+            ins(
+                DIALOG,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [0, 0, 0, 0, 0, 0, 0, 1 | (2 << 1)],
+            ),
+        ]),
+    );
+    assert_eq!(
+        inform_from(&mut fx, 2, widget_record, Some([1, 1])),
+        Ok(true)
+    );
+    assert!(fx.world.portraits.contains(&WIDGET));
+    assert!(!fx.world.dirty_portraits.contains(&WIDGET));
+    assert!(fx.world.saved_portraits.is_empty());
+}

@@ -4317,7 +4317,15 @@ fn camera_moves_sync_the_lots_view_centre_pick() {
     assert_eq!(game.lot().view_centre(), expected(&game, true));
 
     // Collapsing and re-expanding the control panel changes the active house
-    // viewport height (0x4a7b58) and must re-sync `view_centre`.
+    // viewport height (0x4a7b58) and must re-sync `view_centre`; `centre_on`
+    // also uses the active viewport, shifting `origin[1]` down 50 pixels when
+    // re-centring the same Sim with the panel collapsed.
+    game.apply(Move::ZoomIn); // Medium -> Near on 1024x768 so origin isn't clamped
+    game.centre_on(mortimer);
+    let expanded_origin = game.view.camera.origin;
+    let expanded_centre = game.lot().view_centre();
+    assert_eq!(expanded_centre, expected(&game, true));
+
     game.render();
     let toggle_point = |game: &Game| {
         game.panel()
@@ -4337,12 +4345,20 @@ fn camera_moves_sync_the_lots_view_centre_pick() {
     game.release(p);
     assert_eq!(game.lot().view_centre(), expected(&game, false));
     assert_ne!(game.lot().view_centre(), before_collapse);
+
+    game.centre_on(mortimer);
+    assert_eq!(game.view.camera.origin[1], expanded_origin[1] + 50);
+    assert_eq!(game.lot().view_centre(), expected(&game, false));
+    assert_eq!(game.lot().view_centre(), expanded_centre);
+
     game.render();
     let p = toggle_point(&game);
     game.press(p);
     game.release(p);
     assert_eq!(game.lot().view_centre(), expected(&game, true));
-    assert_eq!(game.lot().view_centre(), before_collapse);
+    game.centre_on(mortimer);
+    assert_eq!(game.view.camera.origin, expanded_origin);
+    assert_eq!(game.lot().view_centre(), expanded_centre);
 
     // Restoring a saved game keeps its saved view_centre; no-op and wall-mode
     // camera commands do not overwrite it until camera geometry actually moves.

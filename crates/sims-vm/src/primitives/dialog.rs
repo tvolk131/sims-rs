@@ -577,20 +577,23 @@ impl Machine<'_, '_> {
                     }
                 }
                 crate::placement::PortraitSearch::NotFound { description } => {
-                    if !dirty {
-                        // A clean build already passed 0x4e9338 before entering
-                        // 0x4e938c; removing unput leaves slot 1 empty.
-                        return Err(no_tile_without_bitmap(&description));
-                    }
-                    // Dirty build at 0x4e92f2: 0x4e9706 removes unput first
-                    // (skipping virtual function 0x88), then 0x4e9338 checks
-                    // the resource file AFTER cleanup for BMP_ 2002.
+                    // 0x4e9706 removes unput first (skipping virtual function
+                    // 0x88). If Reset itself populated slot 1 (for example via
+                    // a nested dialog while the temporary person was still
+                    // registered), 0x4e9315 sees slot 1 non-null and returns
+                    // cleanly without needing a disk bitmap. Otherwise a dirty
+                    // build at 0x4e92f2 checks 0x4e9338 for BMP_ 2002 AFTER
+                    // cleanup; a clean build already passed 0x4e9338 before
+                    // entering 0x4e938c.
                     built.remove_now(&mut copy, id).map_err(unsupported)?;
-                    if !has_bitmap_in(&copy) {
-                        return Err(no_tile_without_bitmap(&description));
+                    if !copy.portraits.contains(&guid) {
+                        if dirty && has_bitmap_in(&copy) {
+                            copy.portraits.insert(guid);
+                            copy.dirty_portraits.remove(&guid);
+                        } else {
+                            return Err(no_tile_without_bitmap(&description));
+                        }
                     }
-                    copy.portraits.insert(guid);
-                    copy.dirty_portraits.remove(&guid);
                 }
                 crate::placement::PortraitSearch::Mixed {
                     found,
@@ -599,22 +602,24 @@ impl Machine<'_, '_> {
                     if !dirty {
                         return Err(no_tile_without_bitmap(&no_tile_description));
                     }
-                    // Dirty slot + BMP_ 2002: `portrait_place` borrows `&World`
-                    // immutably and touches no interpreter cells; under the
-                    // unverified assumption that native put+remove undoes room
-                    // and tile placement, both placing (even if Reset dirties
-                    // slot 1, since 0x4e9338 then reloads BMP_ 2002) and
-                    // removing unput (0x4e9706) + loading BMP_ 2002 leave the
-                    // same modeled state.
+                    // Dirty slot: `portrait_place` borrows `&World` immutably
+                    // and touches no interpreter cells; under the unverified
+                    // assumption that native put+remove undoes room and tile
+                    // placement, both placing and removing unput (0x4e9706)
+                    // leave slot 1 populated and clean whenever either Reset
+                    // populated slot 1 or `0x4e9338` can load BMP_ 2002 after
+                    // cleanup.
                     built
                         .portrait_place(&copy, id, &found)
                         .map_err(|fault| fault.trap)?;
                     built.remove_now(&mut copy, id).map_err(unsupported)?;
-                    if !has_bitmap_in(&copy) {
-                        return Err(no_tile_without_bitmap(&no_tile_description));
+                    if !copy.portraits.contains(&guid) {
+                        if !has_bitmap_in(&copy) {
+                            return Err(no_tile_without_bitmap(&no_tile_description));
+                        }
+                        copy.portraits.insert(guid);
+                        copy.dirty_portraits.remove(&guid);
                     }
-                    copy.portraits.insert(guid);
-                    copy.dirty_portraits.remove(&guid);
                 }
             }
         }

@@ -1188,7 +1188,9 @@ impl Game {
     /// `y` positions before rotating and projecting. The original's house
     /// view sits above the 100-pixel live-mode strip
     /// (`0x49ae5e` → `0x5cf1b6`, `0x4b136b`), so its middle is
-    /// `[width / 2, (height - 100) / 2]`. A person on the floor shown is
+    /// `[width / 2, height / 2]` over [`Game::house_viewport_size`] (full
+    /// canvas while the strip is collapsed, `height - 100` while expanded).
+    /// A person on the floor shown is
     /// centred a little above its feet: its screen point on the lot's
     /// terrain ([`sound::object_point_on_lot`]) raised by half of 2 √6
     /// times 2.0 times 2 to the power of the zoom plus one, cut to a whole
@@ -1213,7 +1215,8 @@ impl Game {
             return;
         };
         let level = position[2];
-        let view_size = self.house_view_size();
+        let (w, h) = self.house_viewport_size();
+        let view_size = [w as i32, h as i32];
         if is_person && level == self.view.camera.level {
             let mut at = lot_point(&self.view.camera, &self.lot_shape, position);
             at[1] -= person_rise(self.view.camera.zoom.level());
@@ -1230,15 +1233,6 @@ impl Game {
         self.centre_screen_point(at, view_size);
     }
 
-    /// The house view's viewport size above the live-mode strip
-    /// (`0x49ae5e` → `0x5cf1b6`: `(width, height - 100)`).
-    fn house_view_size(&self) -> [i32; 2] {
-        [
-            self.view.size[0],
-            (self.view.size[1] - sims_ui::hud::STRIP).max(1),
-        ]
-    }
-
     /// The active 3D house viewport size (`0x49ae5e`, `0x4f4b43`, `0x4d363b`,
     /// `0x53b2eb` → `0x4b136b` → `0x49b0bf` → `0x5cf1b6`): full canvas
     /// `(width, height)` while the bottom strip is closed, and
@@ -1250,15 +1244,15 @@ impl Game {
     }
 
     /// Whether `position` lies on the active lot's rotated tile bounds
-    /// (`0x4a7af0`: rotated fine position shifted right by 4, checked
-    /// against `lot + 0x70..+0x7c`).
+    /// (`0x4a7af0`: rotated fine position shifted right by 4, narrowed to
+    /// signed bytes, checked against `lot + 0x70..+0x7c`).
     fn on_lot(&self, position: [i32; 3]) -> bool {
         if self.lot_shape.size == 0 {
             return false;
         }
         let rotated = sound::rotate_object_fine(&self.view.camera, [position[0], position[1]]);
-        let tx = rotated[0] >> 4;
-        let ty = rotated[1] >> 4;
+        let tx = i32::from((rotated[0] >> 4) as i8);
+        let ty = i32::from((rotated[1] >> 4) as i8);
         let b = sound::lot_bounds(&self.lot_shape, &self.view.camera);
         tx >= b[0] && tx <= b[1] && ty >= b[2] && ty <= b[3]
     }
@@ -1854,16 +1848,23 @@ fn native_zoom_or_rotate(
         fine = rotate_fine_1023(unrotated, native.rotation);
     }
 
+    // 0x4a7af0 narrows the rotated tile coordinates to signed bytes (`movsx al/dl`)
+    // before checking lot bounds, and 0x4a9dc7 → 0x4a9c50 projects the narrowed tile
+    // plus the low 4-bit fractional offset.
     let b = sound::lot_bounds(lot, &native);
-    let [rx, ry] = [fine[0] >> 4, fine[1] >> 4];
+    let [rx, ry] = [
+        i32::from((fine[0] >> 4) as i8),
+        i32::from((fine[1] >> 4) as i8),
+    ];
     if rx >= b[0] && rx <= b[1] && ry >= b[2] && ry <= b[3] {
+        let narrowed_fine = [(rx << 4) | (fine[0] & 15), (ry << 4) | (fine[1] & 15)];
         let corners = sound::tile_corners(lot, &native, [rx, ry]);
         let at = sound::fine_point_with_heights(
             &Camera {
                 origin: [0, 0],
                 ..native
             },
-            fine,
+            narrowed_fine,
             native.level,
             corners,
         );
@@ -2380,5 +2381,28 @@ mod tests {
             Move::Rotate(true)
         ));
         assert_eq!(pick_unrotated(floor2), Some([19, 19]));
+
+        // Off-lot wrapped pick: on a flat 64x64 lot at 800x600 (collapsed),
+        // Far -> Medium from native origin [381, -3997] (game [380, -3997])
+        // wraps tile [269, 268] to signed bytes [13, 12] at 0x4a7af0 and
+        // recenters to native origin [392, -117] (game [391, -117]).
+        let mut wrapped = Camera {
+            origin: [380, -3997],
+            zoom: Zoom::Far,
+            rotation: 0,
+            level: 1,
+            walls: Walls::Cutaway,
+            focus: sims_render::Focus::default(),
+        };
+        assert!(native_zoom_or_rotate(
+            &lot,
+            &mut wrapped,
+            [800, 600],
+            Move::ZoomIn
+        ));
+        assert_eq!(
+            [wrapped.origin[0] + pick::ORIGIN_COLUMN, wrapped.origin[1]],
+            [392, -117]
+        );
     }
 }
