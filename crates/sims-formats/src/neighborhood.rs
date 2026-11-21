@@ -5,7 +5,7 @@ use crate::lot::{header, padded_string};
 use crate::reader::Reader;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Family {
     pub version: u32,
     pub house: i32,
@@ -66,12 +66,12 @@ impl Family {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Relationship {
     pub target: i32,
     pub values: Vec<i32>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Neighbor {
     pub version: u32,
     pub version_extra: Option<i32>,

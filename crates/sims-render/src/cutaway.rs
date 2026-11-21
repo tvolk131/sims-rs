@@ -24,13 +24,24 @@
 //! (0x4ac07b) but keeps the list: the pointer's rooms count again once it
 //! is back over the lot.
 //!
+//! A room's part is kept, not built afresh for each mask: each room holds
+//! its own (0x468203, at the room's +0x80), and the view's mask only
+//! combines them (0x4ab992, at 0x4abafe). A room's part is built at the
+//! zoom of the moment, for every room on the level shown when the view
+//! turns (0x4a7f28, 0x4a8006) or the floor changes (0x4a8116), and for
+//! the rooms of each level a room update counts, at its end (0x466c3c,
+//! 0x466f0c). A change of zoom (0x4a7c9f) builds none, so until one of
+//! those, the rooms keep the zoom they were built at
+//! ([`Focus::masks_built_at`]). The squares are worked out at the zoom
+//! shown.
+//!
 //! The old prototype ported these in
 //! `legacy/crates/sims-sim/src/lot_presenter/{room_masks,visibility,hover,
 //! inverse_projection}.rs` and `walls/cutaway.rs`; this follows them.
 //! Where the pointer and the selected Sim are is input, given in
 //! [`Focus`]: the renderer only reads the world.
 
-use crate::camera::{ARRAY_SIZE, Camera};
+use crate::camera::{ARRAY_SIZE, Camera, Zoom};
 use crate::lot::{self, Lot};
 
 /// How many pointer rooms the original remembers (the list's capacity, set
@@ -48,6 +59,15 @@ pub struct Focus {
     pub pointer: Option<[i32; 2]>,
     /// The selected Sim, in live mode.
     pub selected: Option<Selected>,
+    /// The zoom the rooms' parts of the mask were last built at, if not
+    /// the zoom shown: a change of zoom keeps them, and turning the view,
+    /// changing the floor or a room update builds them again at the zoom
+    /// shown. None for the zoom shown. Built at another zoom, a room's
+    /// part can differ by a row of tiles: the overlap test takes 2 pixels
+    /// off the room tile's lower edge at every zoom (0x46831c), so the next
+    /// row down the screen just touches it at far zoom and overlaps it by 2
+    /// pixels at medium and 6 at near.
+    pub masks_built_at: Option<Zoom>,
 }
 
 /// Where the selected Sim is, as the simulation keeps it.
@@ -468,6 +488,12 @@ impl Mask {
         let mut rows = [0u64; ARRAY_SIZE as usize];
         let view = View::new(lot, camera);
         let focus = camera.focus;
+        // The rooms' parts as they were last built (see the module docs).
+        let built = Camera {
+            zoom: focus.masks_built_at.unwrap_or(camera.zoom),
+            ..*camera
+        };
+        let rooms = View::new(lot, &built);
         let mut outdoors = false;
         let looked_at = if focus.away {
             &[][..]
@@ -475,7 +501,7 @@ impl Mask {
             &focus.rooms[..]
         };
         for &room in looked_at.iter().flatten() {
-            view.room(room, &mut rows);
+            rooms.room(room, &mut rows);
             outdoors |= lot.outdoor_rooms.contains(&room);
         }
         // The original skips the room numbers that mark split tiles.
@@ -483,7 +509,7 @@ impl Mask {
             .selected
             .filter(|s| s.level == view.storey() && s.room >= 0)
         {
-            view.room(s.room, &mut rows);
+            rooms.room(s.room, &mut rows);
             let size = lot.size as i32;
             let [x, y] = s.tile;
             if lot.outdoor_rooms.contains(&s.room) {
@@ -718,6 +744,110 @@ mod tests {
                     "rotation {rotation}, wall {cell:?} {bit}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_change_of_zoom_keeps_the_rooms_parts_as_built() {
+        let lot = house();
+        let count = |rows: &[u64]| rows.iter().map(|r| r.count_ones()).sum::<u32>();
+        for rotation in 0..4 {
+            let mut far = camera(rotation);
+            far.focus.visit(ROOM);
+            let built_far = Mask::new(&lot, &far).rows;
+            for zoom in [Zoom::Medium, Zoom::Near] {
+                let shown = Camera { zoom, ..far };
+                let kept = Camera {
+                    focus: Focus {
+                        masks_built_at: Some(Zoom::Far),
+                        ..far.focus
+                    },
+                    ..shown
+                };
+                assert_eq!(
+                    Mask::new(&lot, &kept).rows,
+                    built_far,
+                    "{rotation} {zoom:?}"
+                );
+                // Built at the zoom shown, the room's part also takes the
+                // next row of tiles down the screen, which overlaps the
+                // room's tiles there (0x46831c).
+                let fresh = Mask::new(&lot, &shown).rows;
+                assert!(
+                    fresh.iter().zip(&built_far).all(|(f, b)| f & b == *b),
+                    "{rotation} {zoom:?}"
+                );
+                assert!(count(&fresh) > count(&built_far), "{rotation} {zoom:?}");
+            }
+        }
+    }
+
+    /// The selected Sim's room is a room's part like the looked-at ones:
+    /// kept from the zoom it was built at.
+    #[test]
+    fn a_change_of_zoom_keeps_the_selected_sims_room_as_built() {
+        let lot = house();
+        for rotation in 0..4 {
+            let mut far = camera(rotation);
+            far.focus.selected = Some(Selected {
+                tile: [9, 9],
+                level: 1,
+                room: ROOM,
+            });
+            let built_far = Mask::new(&lot, &far).rows;
+            for zoom in [Zoom::Medium, Zoom::Near] {
+                let shown = Camera { zoom, ..far };
+                let kept = Camera {
+                    focus: Focus {
+                        masks_built_at: Some(Zoom::Far),
+                        ..far.focus
+                    },
+                    ..shown
+                };
+                assert_eq!(
+                    Mask::new(&lot, &kept).rows,
+                    built_far,
+                    "{rotation} {zoom:?}"
+                );
+                assert_ne!(
+                    Mask::new(&lot, &shown).rows,
+                    built_far,
+                    "{rotation} {zoom:?}"
+                );
+            }
+        }
+    }
+
+    /// The pointer's square is worked out at the zoom shown, whatever zoom
+    /// the rooms' parts were built at.
+    #[test]
+    fn the_pointers_square_is_at_the_zoom_shown_with_the_parts_kept() {
+        let lot = house();
+        for zoom in [Zoom::Medium, Zoom::Near] {
+            let mut far = camera(0);
+            far.focus.visit(OUTSIDE);
+            let shown = Camera {
+                zoom,
+                focus: Focus {
+                    masks_built_at: Some(Zoom::Far),
+                    ..far.focus
+                },
+                ..far
+            };
+            // Without the pointer, the outdoor room's part is as built.
+            assert_eq!(Mask::new(&lot, &shown), Mask::new(&lot, &far), "{zoom:?}");
+            let [x, y] = middle(&shown, [15, 15], 0);
+            let mut c = shown;
+            c.focus.pointer = Some([x, y - 4 * zoom.tile_height()]);
+            let mask = Mask::new(&lot, &c);
+            assert!(
+                mask.contains([11, 11]) && mask.contains([14, 14]),
+                "{zoom:?}"
+            );
+            assert!(
+                !mask.contains([15, 15]) && !mask.contains([10, 10]),
+                "{zoom:?}"
+            );
         }
     }
 

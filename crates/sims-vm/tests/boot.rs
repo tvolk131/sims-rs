@@ -3,9 +3,12 @@
 //! reaches.
 
 use sims_core::CrtRng;
+use sims_formats::behavior::ObjectDefinition;
+use sims_formats::iff::Iff;
 use sims_sim::{Headline, World};
 use sims_vm::Answer;
-use sims_vm::boot::{Frames, Lot, StepError};
+use sims_vm::boot::{Frames, Handoff, Lot, StepError};
+use sims_vm::neighborhood_open::{LotTransition, PoolInput, PoolPerson, open_neighborhood};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -343,7 +346,7 @@ fn an_imported_home_loads_from_the_originals_files_and_steps() {
     };
     let house = directory.join("Houses/House69.iff");
     let mut crt = CrtRng::from_state(1);
-    for _ in 0..OPEN_DRAWS {
+    for _ in 0..FILE_BOOT_DRAWS {
         crt.next_u15();
     }
     let frames = Frames::parse(RECORDED_FRAMES).unwrap();
@@ -376,7 +379,7 @@ fn an_imported_home_loads_from_the_originals_files_and_steps() {
 
 /// The families the open's five pools fill after `Patch`: the Townies
 /// (2000), the ten tourist families (3000 to 3009), the celebrities
-/// (5000), the fans (5500) and Magic Town (6000). Not ported yet (6b E).
+/// (5000), the fans (5500) and Magic Town (6000).
 const POOLS: [u16; 14] = [
     2000, 3000, 3001, 3002, 3003, 3004, 3005, 3006, 3007, 3008, 3009, 5000, 5500, 6000,
 ];
@@ -408,14 +411,61 @@ fn user_files(characters: &Path) -> Vec<(u32, PathBuf)> {
         .collect()
 }
 
+fn recorded_character(path: &Path) -> (Iff, u32) {
+    let iff = Iff::parse(std::fs::read(path).unwrap()).unwrap();
+    let objd = iff.data(iff.all(b"OBJD").next().unwrap());
+    let guid = ObjectDefinition::parse(objd).unwrap().guid;
+    (iff, guid)
+}
+
+/// Read only the pool outcomes the port needs from the capture. The
+/// FAMI member GUIDs identify each file's pool; the files give its
+/// template, clock word and profile. NBRS supplies the non-CRT editor
+/// outcomes. The open creates its own families and neighbors.
+fn recorded_pools(original: &sims_content::Neighborhood, files: &[(u32, PathBuf)]) -> PoolInput {
+    let mut people = BTreeMap::<u16, Vec<PoolPerson>>::new();
+    for (_, path) in files
+        .iter()
+        .filter(|(number, _)| *number >= FIRST_POOL_FILE)
+    {
+        let (character, guid) = recorded_character(path);
+        let family = POOLS
+            .into_iter()
+            .find(|id| original.families[id].members.contains(&guid))
+            .expect("every recorded pool file belongs to a pool");
+        let record = original
+            .neighbors
+            .iter()
+            .flatten()
+            .find(|record| record.guid == guid)
+            .unwrap();
+        let words: &[usize] = match (family, record.person_data[58]) {
+            (5000, _) => &[10, 11, 12, 15, 17, 18, 80, 81, 82],
+            (3000..=3009, 9) => &[9, 10, 11, 12, 15, 17, 18, 56, 57],
+            _ => &[],
+        };
+        people.entry(family).or_default().push(PoolPerson {
+            character,
+            editor_words: words
+                .iter()
+                .map(|&word| (word, record.person_data[word]))
+                .collect(),
+        });
+    }
+    PoolInput {
+        people,
+        loaded_skeletons: ["adult".to_owned(), "child".to_owned()].into(),
+        transition: Some(LotTransition {
+            reload: true,
+            crt_draws: 64,
+        }),
+    }
+}
+
 #[test]
 fn an_opened_neighborhood_matches_the_originals_import() {
-    // Our open of the install's UserData2 (house 0's reload, then the six
-    // Patch families' import) against the original's in track 2's second
-    // run (`SIMS_UD2_AFTER`), with its GUIDs. The pools are not ported, so
-    // they come from the original's files, and the C runtime starts where
-    // the House 69 test starts it (`OPEN_DRAWS`). The result must be the
-    // state the original's own files load to.
+    // Our open of the install's UserData2, from house 0 through Patch
+    // and the five pools, against track 2's second run (SIMS_UD2_AFTER).
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
         return;
@@ -436,24 +486,34 @@ fn an_opened_neighborhood_matches_the_originals_import() {
     // The GUIDs the original drew, in file order: each made type's file
     // number follows its draw.
     let theirs: Vec<(u32, PathBuf)> = user_files(&after.join("Characters"));
+    let original = sims_content::Neighborhood::open(&after).unwrap();
+    let pools = recorded_pools(&original, &theirs);
     let mut guids = theirs
         .iter()
         .filter(|(number, _)| (2..FIRST_POOL_FILE).contains(number))
-        .map(|(_, path)| {
-            let iff = sims_formats::iff::Iff::parse(std::fs::read(path).unwrap()).unwrap();
-            let objd = iff.data(iff.all(b"OBJD").next().unwrap());
-            u32::from_le_bytes(objd[0x1c..0x20].try_into().unwrap())
-        });
-    let (mut neighborhood, opened) = sims_vm::neighborhood_open::open_neighborhood(
+        .map(|(_, path)| recorded_character(path).1);
+    let mut crt = CrtRng::from_state(1);
+    for _ in 0..OPEN_DRAWS {
+        crt.next_u15();
+    }
+    let (neighborhood, opened) = open_neighborhood(
         &root,
         &root.join("UserData2"),
         &output,
         &mut || guids.next().expect("the original drew no more GUIDs"),
         &|house| std::fs::read(after.join(format!("Houses/House{house:02}.iff"))).ok(),
+        &pools,
+        &mut crt,
     )
     .unwrap();
     assert!(guids.next().is_none(), "the import drew fewer GUIDs");
-    assert_eq!(opened.imports.len(), 6);
+    assert_eq!(opened.patch.imports.len(), 6);
+    assert_eq!(opened.patch.next_file, 30);
+    assert_eq!(opened.pools.next_file, 153);
+    assert_eq!(opened.pools.update_draws, 176_444);
+    assert_eq!(opened.pools.townie_draws, 44_096);
+    assert_eq!(opened.pools.tourist_draws, 97_027);
+    assert_eq!(crt.state(), 0x0d1a_a553);
 
     // The five house files, byte for byte, given the original's leftover
     // heap bytes.
@@ -466,44 +526,41 @@ fn an_opened_neighborhood_matches_the_originals_import() {
     }
     // The inventories the view's set-up and each housed import made, which
     // the pools leave alone.
-    let original = sims_content::Neighborhood::open(&after).unwrap();
     assert_eq!(
         format!("{:?}", neighborhood.inventories),
         format!("{:?}", original.inventories)
     );
 
-    // The pools, from the original: their families, records, files and
-    // done flags.
-    for (number, path) in &theirs {
-        if *number >= FIRST_POOL_FILE {
-            std::fs::copy(
-                path,
-                output.join("Characters").join(path.file_name().unwrap()),
-            )
-            .unwrap();
-        }
-    }
+    assert_eq!(neighborhood.families.len(), original.families.len());
     for id in POOLS {
-        neighborhood
-            .families
-            .insert(id, original.families[&id].clone());
+        assert_eq!(
+            neighborhood.families[&id], original.families[&id],
+            "family {id}"
+        );
     }
-    let ours = neighborhood.neighbors.len();
-    // 444 less the pools' 123 people.
-    assert_eq!(ours, 321);
-    neighborhood
-        .neighbors
-        .extend(original.neighbors[ours..].iter().cloned());
-    neighborhood.options = original.options;
+    assert_eq!(neighborhood.options, original.options);
+    assert_eq!(neighborhood.neighbors.len(), 444);
+    assert_eq!(neighborhood.neighbors.len(), original.neighbors.len());
+    for (slot, (ours, theirs)) in neighborhood.neighbors[321..]
+        .iter()
+        .zip(&original.neighbors[321..])
+        .enumerate()
+    {
+        assert_eq!(ours, theirs, "pool record {}", 322 + slot);
+    }
 
     let house = output.join("Houses/House69.iff");
-    let mut crt = CrtRng::from_state(1);
-    for _ in 0..OPEN_DRAWS {
-        crt.next_u15();
-    }
     let frames = Frames::parse(RECORDED_FRAMES).unwrap();
-    let lot = Lot::load_in_with(&root, neighborhood, &house, &[2; 8], frames, crt).unwrap();
+    // Run 2's handoff, as fitted: the adult skeleton read and the
+    // indicators made before the lot load.
+    let handoff = Handoff {
+        skeletons_read: ["adult".to_owned()].into(),
+        indicators_made: true,
+    };
+    let lot =
+        Lot::load_after_pools(&root, neighborhood, &house, &[2; 8], frames, crt, &handoff).unwrap();
     assert!(lot.load_report().finished.is_some());
+    assert_eq!(lot.world().crt_rng.state(), 3_739_951_803);
     assert_eq!(lot.world().hash_hex(), IMPORTED_69);
     std::fs::remove_dir_all(&output).unwrap();
 }
@@ -810,6 +867,64 @@ fn the_pie_menu_on_another_goth_offers_to_join_what_i_run() {
         (joined.uid, joined.join, joined.target, joined.table_index),
         (uid, 1, 217, 2)
     );
+}
+
+/// At tick 6000 of the Goth house, visitors (persons 24 and 26) are on the
+/// lot. Listing their pie menus on category 4 and 7 objects (objects 112,
+/// 113, 124–129 and 211–213) checks for `Token - Hotel Key` (type 0xd,
+/// 0x3ac022d6) in their neighbor-ID inventory (0x42a8a1, 0x43e21a,
+/// 0x41f660) instead of failing loudly. (In `UserData/Neighborhood.iff`
+/// both visitors already carry empty inventories, so missing-inventory
+/// creation is covered by the synthetic fixture tests.)
+#[test]
+fn a_goth_visitor_lists_category_4_and_7_objects_via_the_hotel_key_check() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut lot = Lot::load(&root, &house, &[3, 3], Frames::default()).unwrap();
+    while lot.ticks() < 6000 {
+        lot.step().unwrap_or_else(|e| panic!("{e}"));
+    }
+    let visitors: Vec<u16> = lot
+        .world()
+        .objects
+        .values()
+        .filter(|o| o.person.as_ref().is_some_and(|p| p.data[32] != 0))
+        .map(|o| o.id)
+        .collect();
+    assert!(
+        visitors.contains(&24) && visitors.contains(&26),
+        "visitors at 6000: {visitors:?}"
+    );
+    let targets = [112u16, 113, 124, 125, 126, 127, 128, 129, 211, 212, 213];
+    for &target in &targets {
+        assert!(
+            matches!(lot.world().objects[&target].data[59], 4 | 7),
+            "object {target} category {}",
+            lot.world().objects[&target].data[59]
+        );
+    }
+
+    let inventories_before = lot.world().neighbors.inventories.len();
+    for &visitor in &[24u16, 26] {
+        let neighbor = lot.world().objects[&visitor].person.as_ref().unwrap().data[31];
+        assert!(
+            lot.world()
+                .neighbors
+                .inventories
+                .iter()
+                .any(|inv| inv.neighbor == neighbor),
+            "visitor {visitor} (neighbor {neighbor}) already has a saved inventory"
+        );
+        for &target in &targets {
+            lot.pie_menu(visitor, target)
+                .unwrap_or_else(|e| panic!("visitor {visitor} on {target}: {e}"));
+        }
+    }
+    assert_eq!(lot.world().neighbors.inventories.len(), inventories_before);
 }
 
 #[test]
@@ -1143,11 +1258,18 @@ const TICK_31478_29: &str = "8b7ae0ca751002b0ee36bd32ba0f921c494bebf77fba4a27f50
 /// Where to start the C runtime's generator for House 69's load in track
 /// 2's second run: state 1 after this many draws, fitted so that our
 /// load's own 4,730 draws reach the recording's entry state (state 1 after
-/// 405,850 draws). It stands for the draws of the open's import and pools,
-/// which are not ported (6b E), and for any of our load's draws the
-/// original makes earlier ([`Lot::load_with`]). That the generator ran on
-/// from state 1 with no reseed is assumed, not observed.
-const OPEN_DRAWS: u32 = 401_120;
+/// 405,850 draws). It is the offset for booting from the original's own
+/// files with [`Lot::load_with`], so it stands for the open's import and
+/// pools and for any of our load's draws the original makes earlier
+/// (the indicators, the adult skeleton). That the generator ran on from
+/// state 1 with no reseed is assumed, not observed.
+const FILE_BOOT_DRAWS: u32 = 401_120;
+/// Where our open of run 2 starts the C runtime: state 1 after this many
+/// draws, fitted so that the first pool person's GUID low word and traits
+/// are the original's. It stands for startup, the neighborhood view and
+/// the `Patch` import, which our open does not draw for. That the
+/// generator ran on from state 1 with no reseed is assumed, not observed.
+const OPEN_DRAWS: u32 = 84_947;
 /// The frames track 2's House 69 recordings drew: after updates 0 to 2,
 /// 29, 59, 89, 101 and 102, then every 30th from 123
 /// (`house69-ud2-ticks-20261120/watch.jsonl`, the frame watch outside

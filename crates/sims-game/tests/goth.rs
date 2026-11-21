@@ -3185,3 +3185,27 @@ fn the_pointer_notes_a_sim_behind_the_bench_they_sit_on() {
         rest.len()
     );
 }
+
+/// Zoomed in, the rooms keep the cutaway masks built at far zoom until
+/// a room update on the floor shown builds them again at the zoom shown
+/// (0x4a7c9f; 0x466c3c at 0x466ef6): the lot's steps hand the game the
+/// levels their room updates ran for.
+#[test]
+fn a_room_update_builds_the_masks_kept_from_another_zoom() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    assert_eq!(game.view.camera.focus.masks_built_at, None);
+    game.apply(sims_game::view::Move::ZoomIn);
+    assert_eq!(
+        game.view.camera.focus.masks_built_at,
+        Some(sims_render::Zoom::Far)
+    );
+    let mut ticks = 0;
+    while game.view.camera.focus.masks_built_at.is_some() && ticks < 2000 {
+        assert_eq!(game.run(1), 1);
+        ticks += 1;
+    }
+    assert_eq!(game.view.camera.focus.masks_built_at, None, "{ticks} ticks");
+}
