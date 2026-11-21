@@ -16,8 +16,9 @@ everyone on the lot is asleep at idle speed (`globals[16] = 1000`,
 `globals[18] = 760`). At update 39,609 it runs Special Effect (`0x1007` node
 19) state 0, and at update 39,610 state 1 with operand flag `0x40` clear;
 native drops `globals[16]` from `1000` to `760` (`NORMAL`) at update 39,610
-while keeping `globals[18] = 760` (so `World::idle_speed` at `0x46d9d6` does
-not return to `1000` until Mortimer wakes at 40,495).
+while keeping `globals[18] = 760` (so `World::idle_speed` at `0x46d9d6` leaves
+the lot at `760` while everyone sleeps, then after Mortimer wakes it restores
+the saved `760` and clears `globals[18]` to `-1` at update 40,496).
 
 ## Evidence in the original binary
 
@@ -46,7 +47,7 @@ In `Machine::special_effect` (`crates/sims-vm/src/primitives/special_effect.rs`)
 when state 1 shows the effect and operand flag `0x40` is clear, check
 `self.world.speed() != NORMAL` and call `self.world.set_speed(i32::from(NORMAL))`.
 In `Game::run_while` (`crates/sims-game/src/game.rs`), when a tick changes the
-simulation's speed, sync `pace.speed` from `pace::shown(world)` and (in
-`advance`) restart the owed time and end the call so the panel and pacing follow
-the reset. STR# `0x131` formatting (`0x44bf1a`) and effect rendering
-(`0x4a6950`) remain unmodeled presentation.
+simulation's speed, sync `pace.speed` from `pace::shown(world)`, restart the
+owed time, and (in `advance`) end the batch so the panel and pacing follow the
+reset. STR# `0x131` formatting (`0x44bf1a`) and effect rendering (`0x4a6950`)
+remain unmodeled presentation.
