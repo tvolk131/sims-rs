@@ -426,8 +426,9 @@ impl App {
         let ran = self.game.advance(micros);
         // A dialog shown at the first tick due is drawn though none ran.
         let mut redraw = ran > 0 || (!waited && self.game.asking().is_some());
-        // The plumb bob spins by the time passed, ticks or not.
-        redraw |= self.game.spin_due();
+        // The plumb bob spins and the Live-mode pause button blinks by the
+        // time passed, ticks or not.
+        redraw |= self.game.spin_due() || self.game.blink_due();
         self.sound_feed
             .update(&mut self.game, |input| self.sound.send(input));
         for error in &self.game.errors()[self.printed..] {

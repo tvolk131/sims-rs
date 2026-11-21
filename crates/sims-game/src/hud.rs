@@ -19,7 +19,7 @@ use sims_ui::dialog::{self, Labels, Message};
 use sims_ui::frame::{Frame, Rect};
 use sims_ui::house;
 use sims_ui::household::{Acquaintances, Careers, Faces, Snapshot};
-use sims_ui::hud::{self, Controls, Item};
+use sims_ui::hud::{self, Controls, Item, Selected};
 use sims_ui::pie;
 use sims_ui::queue::Queue;
 use sims_ui::thumbnail::{self, Thumbnails};
@@ -82,6 +82,8 @@ pub struct Hud {
     queue: Queue,
     /// The actions whose icons were pressed while they show.
     pressed: Pressed,
+    /// The Live-mode pause button's 500 ms blink timer (`0x53b4b0..0x53b7e7`).
+    pause_blink: PauseBlink,
     /// The interface's sounds, until the game takes them.
     sounds: Vec<SoundEvent>,
 }
@@ -171,18 +173,32 @@ impl Hud {
             band: None,
             queue: Queue::default(),
             pressed: Pressed::default(),
+            pause_blink: PauseBlink::default(),
             sounds: Vec::new(),
         })
     }
 
     /// Forgets what the panel kept of the lot it showed, for a lot put
-    /// back to a save: the pie menu, the dialog read and the icons
-    /// pressed. The rest is read from the lot at the next frame.
+    /// back to a save: the pie menu, the dialog read, the icons pressed,
+    /// and the pause button's blink timer. The rest is read from the lot
+    /// at the next frame.
     pub fn forget(&mut self) {
         self.menu = None;
         self.message = None;
         self.dialog = None;
         self.pressed = Pressed::default();
+        self.pause_blink.reset();
+        self.controls.pause_lit = false;
+    }
+
+    /// Syncs the pause button's 500 ms blink timer (`0x53b4b0..0x53b7e7`)
+    /// with `paused` (state 2 blinks whenever paused, including outside Live
+    /// mode via `0x53b58a -> 0x53b5d5 -> 0x53b5e8`) and the monotonic
+    /// `clock_us`. Returns true if the lit phase changed.
+    pub fn sync_pause_blink(&mut self, paused: bool, clock_us: u64) -> bool {
+        let changed = self.pause_blink.sync(paused, clock_us);
+        self.controls.pause_lit = self.pause_blink.lit();
+        changed
     }
 
     /// Reads the dialog `world` waits on, if it changed. The lot's world,
@@ -210,25 +226,46 @@ impl Hud {
     }
 
     /// What the panel shows of `world`: the household with what the next
-    /// level of each one's career needs, and, while the relationship
-    /// panel is open, the people the selected Sim knows (read only then:
-    /// the lookup goes through every neighborhood record), or while the
-    /// house panel shows (the strip open on it), the house's ratings.
-    pub fn snapshot(&self, world: &World) -> Snapshot {
-        self.for_panel(self.household(world), world)
+    /// level of each one's career needs, zoning-aware family friends
+    /// (`0x4cfcdb`), and, while the relationship panel is open, the people
+    /// the selected Sim knows (read only then: the lookup goes through
+    /// every neighborhood record), or while the house panel shows (the
+    /// strip open on it), the house's ratings.
+    pub fn snapshot(&self, world: &World, residential: bool) -> Snapshot {
+        self.for_panel(self.household(world, residential), world)
     }
 
-    /// The household with what the next level of each one's career
-    /// needs.
-    fn household(&self, world: &World) -> Snapshot {
-        Snapshot::read(world, &self.members).with_careers(&self.careers)
+    /// The active household's live member roster (`0x4e97dc`): reads the
+    /// family named by global 9 from `world.families` when families are
+    /// loaded, falling back to the neighborhood roster opened from disk.
+    fn members<'a>(&'a self, world: &'a World) -> &'a [u32] {
+        if world.families.is_empty() {
+            return &self.members;
+        }
+        let id = i32::from(world.globals.get(9).copied().unwrap_or(0));
+        if id == 0 {
+            return &[];
+        }
+        world
+            .families
+            .iter()
+            .find(|f| f.id == id)
+            .map_or(&[], |f| f.members.as_slice())
+    }
+
+    /// The household with zoning-aware family friends and what the next
+    /// level of each one's career needs.
+    fn household(&self, world: &World, residential: bool) -> Snapshot {
+        Snapshot::read(world, self.members(world))
+            .with_zoning(world, residential, self.known.friendship)
+            .with_careers(&self.careers)
     }
 
     /// `snapshot` with what the open panel reads besides.
     fn for_panel(&self, snapshot: Snapshot, world: &World) -> Snapshot {
         match self.controls.panel {
             Some(UiPanel::Relationships) => {
-                snapshot.with_relations(world, &self.members, &self.known)
+                snapshot.with_relations(world, self.members(world), &self.known)
             }
             Some(UiPanel::House) if self.controls.expanded => {
                 snapshot.with_house(world, &self.house, &self.kinds)
@@ -239,13 +276,15 @@ impl Hud {
 
     /// Draws the panel over the lot in `canvas`, from `world` as it is
     /// now (reading the highlighted speed button directly from `world` via
-    /// [`hud::speed_for`]), and `status` (a line across the top) if there
-    /// is one; the dialog is the one [`Hud::read_dialog`] last read. The
-    /// catalog pictures the queue shows are read from `assets` the first
-    /// time each type shows.
+    /// [`hud::speed_for`]), `residential` (`sims_vm::Lot::residential`),
+    /// and `status` (a line across the top) if there is one; the dialog is
+    /// the one [`Hud::read_dialog`] last read. The catalog pictures the
+    /// queue shows are read from `assets` the first time each type shows.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &mut self,
         world: &World,
+        residential: bool,
         assets: &Assets,
         view: &View,
         _pace: &Pace,
@@ -267,11 +306,8 @@ impl Hud {
         self.controls.speed = hud::speed_for(world);
         // The panel follows the selection first, so that the snapshot
         // reads what the open panel needs.
-        let household = self.household(world);
-        if self
-            .controls
-            .follow(household.selected_resident().is_some())
-        {
+        let household = self.household(world, residential);
+        if self.controls.follow(Selected::of(&household)) {
             self.play(WHOOSH);
         }
         if self.controls.expanded && self.controls.panel == Some(UiPanel::House) {
@@ -506,12 +542,25 @@ impl Hud {
         if let Some(command) = self.press_queue(point) {
             return command;
         }
-        let command = hud::press(&self.items, point)?;
+        let command = match hud::press(&self.items, point) {
+            Some(command) => command,
+            None => {
+                // If Interests/Gifts was laid out disabled (e.g. while a pet
+                // was selected) and selection switched to a human before
+                // redraw, the press still opens the panel (0x51c5a6).
+                let panel = hud::disabled_panel(&self.items, point)?;
+                let snapshot = Snapshot::read(world, self.members(world));
+                if Selected::of(&snapshot) == Selected::Human {
+                    Command::OpenPanel(panel)
+                } else {
+                    return None;
+                }
+            }
+        };
         let command = match command {
             Command::OpenPanel(_) => {
-                let selected = Snapshot::read(world, &self.members)
-                    .selected_resident()
-                    .is_some();
+                let snapshot = Snapshot::read(world, self.members(world));
+                let selected = Selected::of(&snapshot);
                 hud::check_press(command, selected, residential)
             }
             other => other,
@@ -593,11 +642,89 @@ impl Pressed {
     }
 }
 
+/// The Live-mode pause button's 500 ms blink timer (`0x53b4b0..0x53b7e7`):
+/// starts unlit (cyan row 0, `0x53b707..0x53b74d`) on entry and toggles row
+/// every [`hud::PAUSE_BLINK_US`] (`0x53b500..0x53b528`).
+#[derive(Debug, Default)]
+struct PauseBlink {
+    since: Option<u64>,
+    lit: bool,
+}
+
+impl PauseBlink {
+    fn lit(&self) -> bool {
+        self.lit
+    }
+
+    fn reset(&mut self) {
+        self.since = None;
+        self.lit = false;
+    }
+
+    fn sync(&mut self, blinking: bool, clock_us: u64) -> bool {
+        let before = self.lit;
+        if !blinking {
+            self.reset();
+            return self.lit != before;
+        }
+        match self.since {
+            None => {
+                self.since = Some(clock_us);
+                self.lit = false;
+            }
+            Some(since) if clock_us.saturating_sub(since) >= hud::PAUSE_BLINK_US => {
+                // 0x53b500..0x53b52e -> 0x5daf1c..0x5daf31: a single timer
+                // callback toggles the row once and re-arms 500 ms from the
+                // current clock, even after a long stall.
+                self.lit = !self.lit;
+                self.since = Some(clock_us);
+            }
+            Some(_) => {}
+        }
+        self.lit != before
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use sims_ui::frame::Rect;
     use sims_ui::queue::{Icon, Picture};
+
+    #[test]
+    fn pause_blink_toggles_every_500ms_and_resets_unlit() {
+        let mut blink = PauseBlink::default();
+        assert!(!blink.lit());
+        // Entering Live-mode pause starts unlit (cyan row 0, 0x53b707..0x53b74d).
+        assert!(!blink.sync(true, 100_000));
+        assert!(!blink.lit());
+        // 499.999 ms later: still unlit.
+        assert!(!blink.sync(true, 599_999));
+        assert!(!blink.lit());
+        // At 500 ms: flips to lit (red row 1, 0x53b500..0x53b528).
+        assert!(blink.sync(true, 600_000));
+        assert!(blink.lit());
+        // At 1000 ms: flips back to unlit.
+        assert!(blink.sync(true, 1_100_000));
+        assert!(!blink.lit());
+        // A 1-second stall (2x 500 ms) toggles once and re-arms 500 ms from
+        // the current clock (0x53b500..0x53b52e -> 0x5daf1c..0x5daf31).
+        assert!(blink.sync(true, 2_100_000));
+        assert!(blink.lit());
+        assert!(!blink.sync(true, 2_599_999));
+        assert!(blink.sync(true, 2_600_000));
+        assert!(!blink.lit());
+        // Unpausing clears lit and kills the timer; re-pausing starts fresh unlit.
+        assert!(blink.sync(true, 3_100_000));
+        assert!(blink.lit());
+        assert!(blink.sync(false, 3_200_000));
+        assert!(!blink.lit());
+        assert!(!blink.sync(true, 3_400_000));
+        assert!(!blink.lit());
+        assert!(!blink.sync(true, 3_899_999));
+        assert!(blink.sync(true, 3_900_000));
+        assert!(blink.lit());
+    }
 
     #[test]
     fn an_icon_takes_one_press_until_released_or_gone() {

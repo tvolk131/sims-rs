@@ -17,6 +17,10 @@ const HOURS: usize = 0;
 const MINUTES: usize = 5;
 /// The global that pauses the lot (`crates/sims-vm/src/tick.rs`).
 const PAUSED: usize = 17;
+/// The budget-mode global (`[sim + 0x50]`, `0x4f24fa`): when equal to 1,
+/// the control panel hides both the funds box and the family-friends
+/// counter (`0x4cfe0a`, `0x4cfe18`, `0x53b2a4..0x53b2e1`).
+const BUDGET_MODE: usize = 32;
 
 /// A person of the household, as the panel shows them.
 #[derive(Debug, Clone, PartialEq)]
@@ -49,6 +53,11 @@ pub struct Resident {
     /// Whether the low bit of person data 65 is set, as the job panel
     /// tells a woman (0x4eaa75).
     pub female: bool,
+    /// Whether the person is a pet: person data 65 above 1 (`0x51c61f`,
+    /// `0x51ce13`, `0x51cd11`). Pets have no zodiac sign, disable the
+    /// Interests and Gifts gadget buttons, and return from those panels
+    /// to Needs when selected.
+    pub pet: bool,
     /// The job panel's performance: person data 63, or a child's data 57
     /// (0x4ea88c).
     pub performance: i16,
@@ -190,18 +199,30 @@ pub struct Snapshot {
     pub hour: i16,
     pub minute: i16,
     pub funds: i32,
+    /// Whether the cluster shows the funds and family-friends counters:
+    /// false when global 32 (budget mode, `[sim + 0x50]`) is 1
+    /// (`0x4f24fa` → `0x4cfe0a` / `0x4cfe18` → `0x53b2a4..0x53b2e1`).
+    pub show_money: bool,
     pub paused: bool,
+    /// Whether the lot is residential (`0x40745f`), used to pick which
+    /// family supplies [`Snapshot::family_friends`] (`0x4cfcdb`).
+    /// Defaults to `true` until [`Snapshot::with_zoning`] sets it.
+    pub residential: bool,
     /// The household's people on the lot, in the family's member order.
     pub residents: Vec<Resident>,
     /// The selected Sim's object ID.
     pub selected: Option<u16>,
-    /// How many friends the family has, as the job panel compares it
-    /// (0x410260): the count the lot's family (global 9) keeps
-    /// ([`sims_sim::neighbors::Family::friends`]), which the lot works
-    /// out again after each update (`refresh_family_panel` in sims-vm),
-    /// or 0 with no such family. [`Snapshot::with_relations`] works it
+    /// How many friends the lot's family (global 9) has, as the job panel
+    /// compares it (`0x4ea8ed..0x4ea8f7`, `0x531095..0x5310a4`, `0x410260`):
+    /// [`sims_sim::neighbors::Family::friends`], or 0 with no such family.
+    /// [`Snapshot::with_zoning`] and [`Snapshot::with_relations`] work it
     /// out if it is out of date.
     pub family_friends: i32,
+    /// How many friends the control-panel cluster displays (`[esi + 0x1d0]`,
+    /// `0x4cfcdb`): the lot's family (global 9) on residential lots, or the
+    /// selected Sim's family (`person.data[61]`, `0x425d69`) on
+    /// non-residential lots, or 0 with no such family.
+    pub cluster_friends: i32,
     /// The people the selected Sim has a relationship with, in the
     /// relationship panel's order ([`Relation`]): none until
     /// [`Snapshot::with_relations`] reads them.
@@ -319,27 +340,59 @@ impl Snapshot {
                     needs: [0; 6],
                     child,
                     female: data(sims_sim::neighbors::KIND) & 1 == 1,
+                    pet: data(sims_sim::neighbors::KIND) > 1,
                     performance: data(if child { JOB[1] } else { PERFORMANCE }),
                     work: Work::default(),
                 });
             }
         }
+        let selected = world
+            .objects
+            .values()
+            .find(|o| o.selected && o.person.is_some())
+            .map(|o| o.id);
+        let lot_friends = lot_family(world).map_or(0, |f| f.friends);
         Self {
             hour: global(HOURS),
             minute: global(MINUTES),
             funds: world.budget.funds,
+            show_money: global(BUDGET_MODE) != 1,
             paused: global(PAUSED) != 0,
+            residential: true,
             residents,
-            selected: world
-                .objects
-                .values()
-                .find(|o| o.selected && o.person.is_some())
-                .map(|o| o.id),
-            family_friends: lot_family(world).map_or(0, |f| f.friends),
+            selected,
+            family_friends: lot_friends,
+            cluster_friends: lot_friends,
             relations: Vec::new(),
             superstar: false,
             house: House::default(),
         }
+    }
+
+    /// Sets whether the lot is residential (`0x40745f`) and reads both
+    /// family-friends counts (`0x410260` → `0x427219`):
+    /// - [`Snapshot::family_friends`] (Job panel, `0x4ea8ed`, `0x531095`)
+    ///   from the lot's family (global 9);
+    /// - [`Snapshot::cluster_friends`] (cluster counter, `0x4cfcdb`) from
+    ///   the lot's family on residential lots or the selected Sim's family
+    ///   (`person.data[61]`, `0x425d69`) on non-residential lots.
+    ///
+    /// Either count is recomputed with `friendship` if its family is stale.
+    #[must_use]
+    pub fn with_zoning(mut self, world: &World, residential: bool, friendship: i32) -> Self {
+        self.residential = residential;
+        let count = |family: Option<&sims_sim::neighbors::Family>| {
+            family.map_or(0, |f| {
+                if f.stale {
+                    world.count_family_friends(f, friendship)
+                } else {
+                    f.friends
+                }
+            })
+        };
+        self.family_friends = count(lot_family(world));
+        self.cluster_friends = count(friends_family(world, self.selected, residential));
+        self
     }
 
     /// Fills in each resident's [`Resident::needs`] from `careers`, as
@@ -407,6 +460,11 @@ impl Snapshot {
     pub fn with_relations(mut self, world: &World, members: &[u32], known: &Acquaintances) -> Self {
         if let Some(family) = lot_family(world).filter(|f| f.stale) {
             self.family_friends = world.count_family_friends(family, known.friendship);
+        }
+        if let Some(family) =
+            friends_family(world, self.selected, self.residential).filter(|f| f.stale)
+        {
+            self.cluster_friends = world.count_family_friends(family, known.friendship);
         }
         let selected = self.selected.and_then(|id| world.objects.get(&id));
         self.relations = selected
@@ -564,6 +622,40 @@ impl Careers {
 fn lot_family(world: &World) -> Option<&sims_sim::neighbors::Family> {
     let id = i32::from(world.globals.get(9).copied().unwrap_or(0));
     (id != 0).then(|| world.families.iter().find(|f| f.id == id))?
+}
+
+/// The family whose friends count the control panel displays (`0x4cfcdb`):
+/// on residential lots (`0x40745f`), the lot's family (global 9); on
+/// non-residential lots, the family named by the selected Sim's person
+/// data word 61 (`sims_sim::neighbors::FAMILY`, `[person + 0x606]`),
+/// matched linearly against `world.families` (`0x425d69`).
+fn friends_family(
+    world: &World,
+    selected: Option<u16>,
+    residential: bool,
+) -> Option<&sims_sim::neighbors::Family> {
+    if residential {
+        return lot_family(world);
+    }
+    let person = selected.and_then(|id| {
+        let obj = world.objects.get(&id)?;
+        world
+            .people
+            .iter()
+            .filter_map(|pid| world.objects.get(pid))
+            .find(|o| o.guid == obj.guid && o.person.is_some())
+            .unwrap_or(obj)
+            .person
+            .as_ref()
+    })?;
+    let family_id = i32::from(
+        person
+            .data
+            .get(sims_sim::neighbors::FAMILY)
+            .copied()
+            .unwrap_or(0),
+    );
+    world.families.iter().find(|f| f.id == family_id)
 }
 
 /// The people `guid`'s Sim has a relationship with, in the relationship
@@ -813,10 +905,13 @@ mod tests {
             hour,
             minute,
             funds,
+            show_money: true,
             paused: false,
+            residential: true,
             residents: Vec::new(),
             selected: None,
             family_friends: 0,
+            cluster_friends: 0,
             relations: Vec::new(),
             superstar: false,
             house: House::default(),
@@ -1038,6 +1133,7 @@ mod tests {
             needs: [7; 6],
             child: false,
             female: false,
+            pet: false,
             performance: 0,
             work: Work::default(),
         };
@@ -1098,6 +1194,7 @@ mod tests {
             needs: [0; 6],
             child,
             female,
+            pet: false,
             performance: 0,
             work: Work::default(),
         };
@@ -1148,5 +1245,146 @@ mod tests {
                 shown(9, at("", 0), 2),
             ]
         );
+    }
+
+    #[test]
+    fn budget_mode_pet_flag_and_non_residential_family_friends() {
+        use sims_formats::saved_objects::{Interaction, Person};
+        let idle = Interaction {
+            join: 0,
+            uid: 0,
+            caller: 0,
+            target: 0,
+            icon: 0,
+            table_index: -1,
+            args: [0; 4],
+            priority: 0,
+            action: 0,
+            attenuation: 0.0,
+            flags: 0,
+        };
+        let make_sim = |id: u16, guid: u32, family: i16, kind: i16, selected: bool| {
+            let mut data = vec![0; sims_sim::neighbors::PERSON_WORDS];
+            data[sims_sim::neighbors::FAMILY] = family;
+            data[sims_sim::neighbors::KIND] = kind;
+            let person = Person {
+                animation_events: 0,
+                engaged: 0,
+                appearance: Default::default(),
+                accessories: Vec::new(),
+                animations: Default::default(),
+                routing_state: 0,
+                floats: [0.0; 9],
+                previous_motives: [0.0; 16],
+                motives: [0.0; 16],
+                data,
+                routing_frames: 0,
+                active: idle.clone(),
+                last: idle.clone(),
+                queue: Vec::new(),
+                object_uses: Vec::new(),
+                motive_deltas: Vec::new(),
+            };
+            sims_sim::Object {
+                id,
+                guid,
+                footprint: [0; 4],
+                position: [0; 3],
+                unknown_short: 0,
+                attributes: Vec::new(),
+                temps: Vec::new(),
+                data: vec![0; 128],
+                obsolete_word: 0,
+                stack_capacity_bytes: 0,
+                stack: Vec::new(),
+                relationship_flag: 0,
+                relationships: Vec::new(),
+                slots: Vec::new(),
+                dynamic_sprites: Vec::new(),
+                multipart: None,
+                portal: None,
+                person: Some(person),
+                registry_word: None,
+                last_result: false,
+                removal_skips_resets: false,
+                selected,
+            }
+        };
+
+        let mut world = World::empty();
+        world.globals.resize(33, 0);
+        world.globals[9] = 1; // lot family = 1
+        world.families.push(sims_sim::neighbors::Family {
+            id: 1,
+            house: 5,
+            members: vec![100],
+            friends: 4,
+            stale: false,
+        });
+        world.families.push(sims_sim::neighbors::Family {
+            id: 2,
+            house: 7,
+            members: vec![200],
+            friends: 9,
+            stale: false,
+        });
+        // Sim 10 (human, family 2, selected) and Sim 11 (pet, family 1).
+        world.objects.insert(10, make_sim(10, 200, 2, 1, true));
+        world.objects.insert(11, make_sim(11, 100, 1, 2, false));
+        world.people = vec![10, 11];
+
+        let members = [200, 100];
+        // Global 32 == 0 -> show_money true; pet flag reads data[KIND] > 1.
+        let s = Snapshot::read(&world, &members);
+        assert!(s.show_money);
+        assert!(!s.residents[0].pet);
+        assert!(s.residents[1].pet);
+        assert_eq!(s.family_friends, 4);
+
+        // Global 32 == 1 -> show_money false (0x4f24fa -> 0x4cfe0a -> 0x53b2a4).
+        // Global 32 == 2 -> show_money true (exact equality with 1).
+        world.globals[32] = 1;
+        assert!(!Snapshot::read(&world, &members).show_money);
+        world.globals[32] = 2;
+        assert!(Snapshot::read(&world, &members).show_money);
+        world.globals[32] = 0;
+
+        // Residential lot reads global 9's family (4) for both cluster and job;
+        // non-residential reads selected Sim's person.data[FAMILY] (family 2 -> 9)
+        // for cluster_friends (0x4cfcdb), while family_friends stays global 9 (4)
+        // for the Job panel (0x4ea8ed, 0x531095).
+        let res = Snapshot::read(&world, &members).with_zoning(&world, true, 50);
+        assert_eq!((res.family_friends, res.cluster_friends), (4, 4));
+        let non_res = Snapshot::read(&world, &members).with_zoning(&world, false, 50);
+        assert_eq!((non_res.family_friends, non_res.cluster_friends), (4, 9));
+
+        // Stale non-residential family recomputes cluster_friends via
+        // count_family_friends (0x427219), keeping family_friends on global 9.
+        world.neighbors.slots = vec![
+            Some(record(1, 200, &[(2, 60)])),
+            Some(record(2, 300, &[(1, 60)])),
+        ];
+        world.neighbors.slots[0].as_mut().unwrap().data[sims_sim::neighbors::FAMILY] = 2;
+        world.neighbors.slots[1].as_mut().unwrap().data[sims_sim::neighbors::FAMILY] = 3;
+        world.families[1].friends = 0;
+        world.families[1].stale = true;
+        let stale_non_res = Snapshot::read(&world, &members).with_zoning(&world, false, 50);
+        assert_eq!(
+            (stale_non_res.family_friends, stale_non_res.cluster_friends),
+            (4, 1)
+        );
+        // with_relations also respects residential=false for stale recomputation.
+        let mut stale_rel = Snapshot::read(&world, &members);
+        stale_rel.residential = false;
+        let stale_rel = stale_rel.with_relations(&world, &members, &known());
+        assert_eq!(
+            (stale_rel.family_friends, stale_rel.cluster_friends),
+            (4, 1)
+        );
+
+        // Non-residential with nobody selected -> cluster_friends 0, family_friends 4.
+        world.objects.get_mut(&10).unwrap().selected = false;
+        let nobody = Snapshot::read(&world, &members).with_zoning(&world, false, 50);
+        assert_eq!((nobody.family_friends, nobody.cluster_friends), (4, 0));
     }
 }

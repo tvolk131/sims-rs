@@ -21,7 +21,8 @@ use sims_ui::dialog::{self, Labels, Message};
 use sims_ui::frame::Frame;
 use sims_ui::house;
 use sims_ui::household::{Acquaintances, Careers, Faces, Snapshot};
-use sims_ui::hud::{self, Controls, Item};
+use sims_ui::hud::{self, Controls, Item, Selected};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 pub struct Hud {
@@ -39,6 +40,8 @@ pub struct Hud {
     kinds: Option<house::Kinds>,
     /// The household's member GUIDs, in the neighborhood's order.
     members: Vec<u32>,
+    /// Each lot's zoning from the neighborhood (`0x42b9e3`: 1 residential).
+    zoning: BTreeMap<i16, i32>,
     /// What the relationship panel needs from outside the world.
     known: Acquaintances,
     /// The help balloons' texts.
@@ -95,6 +98,9 @@ impl Hud {
             .and_then(|n| neighborhood.family_in(n))
             .map(|(_, f)| f.members.clone())
             .unwrap_or_default();
+        let zoning = neighborhood
+            .zoning(u16::from(install.expansions.0))
+            .map_err(|e| e.to_string())?;
         let mut people = members.clone();
         for record in world.neighbors.slots.iter().flatten() {
             if !people.contains(&record.guid) {
@@ -122,6 +128,7 @@ impl Hud {
             house,
             kinds: None,
             members,
+            zoning,
             known,
             texts,
             // The strip opens as if Live had been pressed.
@@ -135,6 +142,24 @@ impl Hud {
         })
     }
 
+    /// The active household's live member roster (`0x4e97dc`): reads the
+    /// family named by global 9 from `world.families` when families are
+    /// loaded, falling back to the neighborhood roster opened from disk.
+    fn members<'a>(&'a self, world: &'a sims_sim::World) -> &'a [u32] {
+        if world.families.is_empty() {
+            return &self.members;
+        }
+        let id = i32::from(world.globals.get(9).copied().unwrap_or(0));
+        if id == 0 {
+            return &[];
+        }
+        world
+            .families
+            .iter()
+            .find(|f| f.id == id)
+            .map_or(&[], |f| f.members.as_slice())
+    }
+
     /// Draws the panel over the lot in `canvas`.
     pub fn draw(
         &mut self,
@@ -144,14 +169,17 @@ impl Hud {
         canvas: &mut Canvas,
     ) {
         sync_controls(&mut self.controls, world, &view.camera);
-        let mut snapshot = Snapshot::read(world, &self.members).with_careers(&self.careers);
+        let residential = is_residential(world, &self.zoning);
+        let mut snapshot = Snapshot::read(world, self.members(world))
+            .with_zoning(world, residential, self.known.friendship)
+            .with_careers(&self.careers);
         // The viewer plays no sounds, so a balloon this closes closes
         // silently.
-        self.controls.follow(snapshot.selected_resident().is_some());
+        self.controls.follow(Selected::of(&snapshot));
         // The lookup goes through every neighborhood record, so only
         // while the panel shows it.
         if self.controls.panel == Some(Panel::Relationships) {
-            snapshot = snapshot.with_relations(world, &self.members, &self.known);
+            snapshot = snapshot.with_relations(world, self.members(world), &self.known);
         }
         // The house's ratings only while its panel shows.
         if self.controls.expanded && self.controls.panel == Some(Panel::House) {
@@ -227,9 +255,9 @@ impl Hud {
 
     /// A press at `point`: the view command to carry out, if any, and
     /// whether the panel changed. A gadget button's press is checked
-    /// against `world` as it is at the press ([`hud::check_press`]). The
-    /// viewer does not read the lot's zoning, so the lot counts as
-    /// residential, and a refusal is silent: the viewer plays no sounds.
+    /// against `world` and the neighborhood's zoning (`0x40745f`) as they
+    /// are at the press ([`hud::check_press`]). A refusal is silent: the
+    /// viewer plays no sounds.
     pub fn press(
         &mut self,
         point: [i32; 2],
@@ -244,13 +272,24 @@ impl Hud {
             self.dialog = None;
             return (None, true);
         }
-        let Some(command) = hud::press(&self.items, point) else {
-            return (None, false);
+        let command = match hud::press(&self.items, point) {
+            Some(command) => command,
+            None => {
+                let Some(panel) = hud::disabled_panel(&self.items, point) else {
+                    return (None, false);
+                };
+                let snapshot = Snapshot::read(world, self.members(world));
+                if Selected::of(&snapshot) == Selected::Human {
+                    Command::OpenPanel(panel)
+                } else {
+                    return (None, false);
+                }
+            }
         };
-        let selected = Snapshot::read(world, &self.members)
-            .selected_resident()
-            .is_some();
-        let command = hud::check_press(command, selected, true);
+        let snapshot = Snapshot::read(world, self.members(world));
+        let selected = Selected::of(&snapshot);
+        let residential = is_residential(world, &self.zoning);
+        let command = hud::check_press(command, selected, residential);
         if command.changes_simulation() {
             eprintln!("not carried out, the simulation takes no commands yet: {command:?}");
             return (None, false);
@@ -273,12 +312,23 @@ impl Hud {
                 eprintln!("the viewer draws no roofs yet");
                 None
             }
+            Command::OpenHelp => {
+                eprintln!("the viewer shows no Help System dialog yet");
+                None
+            }
             _ => None,
         };
         let before = self.controls;
         self.controls.apply(&command);
         (view, self.controls != before)
     }
+}
+
+/// Whether `world`'s lot (global 10) is residential (`0x40745f`): lot 0
+/// counts as residential, otherwise its zoning in `zoning` (`0x42b9e3`) is 1.
+fn is_residential(world: &sims_sim::World, zoning: &BTreeMap<i16, i32>) -> bool {
+    let lot = world.globals.get(10).copied().unwrap_or(0);
+    lot == 0 || zoning.get(&lot) == Some(&1)
 }
 
 /// Syncs the viewer's HUD camera and speed controls from `world` and `camera`.
@@ -353,5 +403,21 @@ mod tests {
         world.globals[18] = -1;
         sync_controls(&mut controls, &world, &camera);
         assert_eq!(controls.speed, None);
+    }
+
+    #[test]
+    fn viewer_zoning_distinguishes_residential_and_community_lots() {
+        let zoning = BTreeMap::from([(5, 1), (7, 2)]);
+        let mut world = sims_sim::World::empty();
+        world.globals.resize(11, 0);
+        // Lot 0 counts as residential (0x40745f).
+        assert!(is_residential(&world, &zoning));
+        world.globals[10] = 5;
+        assert!(is_residential(&world, &zoning));
+        // Community lot 7 and unzoned lot 99 are non-residential.
+        world.globals[10] = 7;
+        assert!(!is_residential(&world, &zoning));
+        world.globals[10] = 99;
+        assert!(!is_residential(&world, &zoning));
     }
 }

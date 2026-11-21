@@ -121,10 +121,13 @@ pub struct Game {
     /// ([`Game::highlight`]).
     highlighted: Option<usize>,
     /// The time the window has passed in, in microseconds: the clock
-    /// that spins the plumb bob.
+    /// that spins the plumb bob and drives the pause button's 500 ms blink.
     clock_us: u64,
     /// `clock_us` when the frame was last drawn.
     drawn_us: u64,
+    /// Whether the Live-mode pause button's blink phase flipped since the
+    /// last frame was drawn.
+    blink_dirty: bool,
     canvas: Canvas,
     /// The camera the frame last drawn was drawn through, the depth its
     /// lot left before anything else was drawn, and its IDs once its
@@ -157,13 +160,14 @@ impl Game {
         // The booted world, not the file as read: some objects (doors,
         // windows) set how they are drawn in their own init scripts.
         let lot_shape = sims_render::Lot::from_world(lot.world()).map_err(|e| e.to_string())?;
-        let hud = Hud::open(
+        let mut hud = Hud::open(
             &options.install,
             house,
             &opened.assets,
             lot.world(),
             lot.program().autonomy_constants().friendship_threshold,
         )?;
+        hud.sync_pause_blink(lot.world().paused(), 0);
         let mut people = People::open(&options.install, house)?;
         people.refresh(lot.world());
         let view = View::new([800, 600], lot_shape.built_center(), opened.rotation);
@@ -187,6 +191,7 @@ impl Game {
             note: None,
             clock_us: 0,
             drawn_us: 0,
+            blink_dirty: false,
             canvas: Canvas::new(1, 1, [0, 0, 0]),
             drawn_camera,
             lot_depth: Vec::new(),
@@ -299,6 +304,9 @@ impl Game {
         if let Err(e) = result {
             self.note = Some(format!("The speed was not changed: {e}"));
         }
+        if self.hud.sync_pause_blink(self.paused(), self.clock_us) {
+            self.blink_dirty = true;
+        }
     }
 
     /// Whether the game is paused (global 17).
@@ -318,6 +326,15 @@ impl Game {
         if let Err(e) = result {
             self.note = Some(format!("The pause was not changed: {e}"));
         }
+        if self.hud.sync_pause_blink(self.paused(), self.clock_us) {
+            self.blink_dirty = true;
+        }
+    }
+
+    /// Whether the pause button's 500 ms blink phase changed since the
+    /// frame was last drawn.
+    pub fn blink_due(&self) -> bool {
+        self.blink_dirty
     }
 
     /// Whether the plumb bob has spun enough since the frame was drawn to
@@ -353,6 +370,9 @@ impl Game {
     /// (**unverified**, and the window's timing, not the simulation's).
     pub fn advance(&mut self, elapsed_us: u64) -> u32 {
         self.clock_us = self.clock_us.saturating_add(elapsed_us);
+        if self.hud.sync_pause_blink(self.paused(), self.clock_us) {
+            self.blink_dirty = true;
+        }
         if self.lot.asking().is_some() {
             self.pace.restart();
             return 0;
@@ -361,7 +381,11 @@ impl Game {
             return 0;
         }
         let due = self.pace.due(elapsed_us, self.lot.world().speed());
-        self.run_while(due, true)
+        let ran = self.run_while(due, true);
+        if self.hud.sync_pause_blink(self.paused(), self.clock_us) {
+            self.blink_dirty = true;
+        }
+        ran
     }
 
     /// Sets the idle loop's own speed between ticks ([`Lot::idle_speed`]).
@@ -570,8 +594,11 @@ impl Game {
         // it was shown.
         let dialogs = self.lot.asking().map_or(world, |a| &a.world);
         self.hud.read_dialog(dialogs, &self.assets);
+        self.hud.sync_pause_blink(world.paused(), self.clock_us);
+        self.blink_dirty = false;
         self.hud.draw(
             world,
+            self.lot.residential(),
             &self.assets,
             &self.view,
             &self.pace,
@@ -947,7 +974,7 @@ impl Game {
     /// What the control panel shows of `world`: [`Game::render`] lays
     /// the panel out from this for the lot's world.
     pub fn snapshot(&self, world: &sims_sim::World) -> sims_ui::household::Snapshot {
-        self.hud.snapshot(world)
+        self.hud.snapshot(world, self.lot.residential())
     }
 
     /// The first name the panel shows for people of type `guid`.
@@ -1175,6 +1202,14 @@ impl Game {
     /// Moves the camera origin so screen point `at` comes to the middle
     /// of `view_size`, clamped to the original's scroll limits
     /// (`0x4a9fa9`) and x-aligned via `(x + 1) & !3` (`0x4a81cc`).
+    ///
+    /// `sims-render` draws walls and floors at `camera.origin[0]` and
+    /// objects/people at `camera.origin[0] + 1`, whereas the original
+    /// draws walls and floors one column left of `DAT_006f00d0`
+    /// (`0x4ac14b`, `0x4ac25d`) and objects/people at it. So `0x4a9fa9`
+    /// and `0x4a81cc` compute the original's `origin_x`, and we store
+    /// `origin_x - pick::ORIGIN_COLUMN` so both walls and objects land on
+    /// the original's exact screen columns.
     fn centre_screen_point(&mut self, at: [i32; 2], view_size: [i32; 2]) {
         let middle = [view_size[0] / 2, view_size[1] / 2];
         let origin = self.view.camera.origin;
@@ -1184,7 +1219,8 @@ impl Game {
         ];
         let ([min_x, max_x], [min_y, max_y]) =
             scroll_limits(&self.lot_shape, &self.view.camera, view_size);
-        let clamped_x = target[0].max(min_x).min(max_x).wrapping_add(1) & !3;
+        let native_x = target[0].max(min_x).min(max_x).wrapping_add(1) & !3;
+        let clamped_x = native_x.saturating_sub(pick::ORIGIN_COLUMN);
         let clamped_y = target[1].max(min_y).min(max_y);
         self.view.set_origin([clamped_x, clamped_y]);
     }
@@ -1244,7 +1280,9 @@ impl Game {
         self.listed = None;
         self.highlighted = None;
         self.hud.forget();
+        self.blink_dirty = false;
         let world = self.lot.world();
+        self.hud.sync_pause_blink(world.paused(), self.clock_us);
         if let Some(speed) = pace::shown(world) {
             self.pace.speed = speed;
         }
@@ -1337,6 +1375,10 @@ impl Game {
             }
             Command::AnswerDialog { caller, button } => {
                 self.answer(caller, button);
+                Outcome::redraw()
+            }
+            Command::OpenHelp => {
+                self.note = Some("The Help System dialog is not ported yet.".into());
                 Outcome::redraw()
             }
             Command::TogglePanel
