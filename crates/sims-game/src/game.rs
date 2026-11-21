@@ -609,6 +609,14 @@ impl Game {
     pub fn press(&mut self, point: [i32; 2]) -> Outcome {
         let cleared = self.note.take().is_some();
         if self.hud.covers(point) {
+            // Choosing an entry checks it again first: the pie's
+            // button-up handler (0x5eb433) tells the house view about the
+            // entry under the pointer as chosen (0x1ac with 1), and the
+            // house view runs its check (0x48df28) as it does when the
+            // pointer reaches the entry.
+            if let Some(entry) = self.hud.menu.as_ref().and_then(|m| m.highlighted(point)) {
+                self.check_entry(entry);
+            }
             // The menu, whose entries a choice is an index into.
             let menu = self.hud.menu.clone();
             let outcome = match self.hud.press(point) {
@@ -681,7 +689,17 @@ impl Game {
             return false;
         }
         self.highlighted = entry;
-        let Some((i, Some(action))) = entry.map(|i| (i, menu.entries[i].action.clone())) else {
+        entry.is_some_and(|i| self.check_entry(i))
+    }
+
+    /// Checks again the action of the open pie menu's entry `i`
+    /// (0x48df28, `Lot::highlight`), keeping the action the check leaves
+    /// for choosing it. True if the check ran.
+    fn check_entry(&mut self, i: usize) -> bool {
+        let Some(menu) = &self.hud.menu else {
+            return false;
+        };
+        let Some(action) = menu.entries.get(i).and_then(|e| e.action.clone()) else {
             return false;
         };
         if self.stopped.is_some() {
