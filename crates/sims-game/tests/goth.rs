@@ -2755,14 +2755,14 @@ fn the_recorded_snack_order_with_bob_shots_replayed_in_the_window_matches_the_re
 
 /// Track 2's second recording of the two-snack cancel order
 /// (`goth-cancel-pick-20261120`), replayed through the window's input
-/// layer. It watches the original's listed object, which the pointer pick
-/// writes only when a frame is drawn: every frame shows in the watch, and
-/// each pointer move is given before the frame that listed what it found.
-/// Mortimer's state bounds the rest: the entry is reached before his last
-/// result goes to 1, the choice and the cancels are given at the update
-/// before their effect. A scratch comparison found the lot equal to the
-/// recording's after every update from 1 to 845 except for Bella's local
-/// from 203 to 227, as in the other replays
+/// layer. Its watches give the frames the original drew and the object
+/// its pointer listed, each write at a frame's update; each pointer move
+/// is given at the update of the listing it made. Mortimer's state bounds
+/// the rest: the entry is reached before his last result goes to 1, the
+/// choice and the cancels are given at the update before their effect. A
+/// scratch comparison found the lot equal to the recording's after every
+/// update from 1 to 845, in every word it compares, except for Bella's
+/// local from 203 to 227, as in the other replays
 /// (`docs/decisions/20261120-cancel-order-replayed-with-the-pick-watched.md`);
 /// this test checks the states below.
 #[test]
@@ -2813,8 +2813,9 @@ fn the_recorded_cancel_order_with_the_pick_watched_replayed_in_the_window_matche
     run_to(&mut game, &schedule, 94);
     assert_eq!(game.listed(), None);
     assert!(last_result(&game));
-    // The fridge is listed at the frame after 123, and again by the press
-    // at the frame after 153.
+    // The move onto the fridge ended at 122; it is given at 123, the
+    // update of the original's listing, and his last result goes to 0 at
+    // 124. The press lists the fridge again at 153.
     run_to(&mut game, &schedule, 123);
     game.hover(recorded([176, 198]));
     assert_eq!(game.listed(), Some((mortimer, fridge)));
@@ -2834,10 +2835,12 @@ fn the_recorded_cancel_order_with_the_pick_watched_replayed_in_the_window_matche
     let p = person(&game);
     assert_eq!(action(&p.active), snack(1));
     assert!(p.queue.is_empty());
-    // The second order's moves: the counter at the frame after 300,
-    // nothing after 330, the fridge after 360, as the original listed
-    // them. The original listed nothing under the still pointer after
-    // either choice (at the frames after 240 and 476).
+    // Under the still pointer the original listed nothing (240).
+    run_to(&mut game, &schedule, 240);
+    assert_eq!(game.listed(), None);
+    // The second order's moves, each given at the update of the
+    // original's listing: the counter at 300, nothing at 330, the fridge
+    // at 360; the press lists it again at 390.
     run_to(&mut game, &schedule, 300);
     game.hover(recorded([176, 222]));
     assert_eq!(game.listed(), Some((mortimer, counter)));
@@ -2857,14 +2860,20 @@ fn the_recorded_cancel_order_with_the_pick_watched_replayed_in_the_window_matche
     assert_eq!(action(&p.active), snack(1));
     assert_eq!(p.queue.iter().map(action).collect::<Vec<_>>(), [snack(5)]);
     run_to(&mut game, &schedule, 476);
+    assert_eq!(game.listed(), None);
     assert_eq!(room(&game, bella), 0x4225_ac1d);
     run_to(&mut game, &schedule, 477);
     assert_eq!(room(&game, bella), 0x4277_073c);
     // Both presses on the icons act at their release's end: the queued
-    // snack is taken off at 537, the running one cancelled at 627.
+    // snack is taken off at 537, the running one cancelled at 627, and
+    // neither earlier.
     run_to(&mut game, &schedule, 506);
     game.hover([104, 54]);
     run_to(&mut game, &schedule, 536);
+    assert_eq!(
+        person(&game).queue.iter().map(action).collect::<Vec<_>>(),
+        [snack(5)]
+    );
     game.press([104, 54]);
     run_to(&mut game, &schedule, 537);
     let p = person(&game);
@@ -2873,6 +2882,10 @@ fn the_recorded_cancel_order_with_the_pick_watched_replayed_in_the_window_matche
     run_to(&mut game, &schedule, 596);
     game.hover([54, 54]);
     run_to(&mut game, &schedule, 626);
+    let p = person(&game);
+    assert_eq!(action(&p.active), snack(1));
+    assert!(p.queue.is_empty());
+    assert_eq!(p.data[33], 50);
     game.press([54, 54]);
     run_to(&mut game, &schedule, 627);
     let p = person(&game);

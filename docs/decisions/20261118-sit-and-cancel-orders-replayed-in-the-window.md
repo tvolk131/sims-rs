@@ -103,7 +103,8 @@ one.
   same way at 88, but its test gives its hovers by object, not by
   point.
 - **Under the still pointer.** After a choice the pointer stays on the
-  pie entry, and the original lists pies there while the lot runs:
+  pie entry, and these differences were taken for pies the original
+  listed there while the lot ran:
   - in cancel, after 256: for 257–259 the original's word 50 is 0
     where ours was 1 before the check below was ported, and its last
     result 1 where ours was 0. Ours now matches. The release's second

@@ -59,7 +59,8 @@ Read note left this open
   order recorded again with the listed object watched, the original
   listed nothing under the still pointer after either choice
   (`20261120-cancel-order-replayed-with-the-pick-watched.md`). The
-  cancel replay now equals the recording in every word the comparison
+  replay of the older cancel recording (`goth-cancel-order-20261116`)
+  now equals that recording in every word the comparison
   checks, after every update from 1 to 1300 (scratch tool). The cancel
   test pins word 50 and the last result at 257.
 - **Scripted snack.** The scripted snack order no longer checks its
