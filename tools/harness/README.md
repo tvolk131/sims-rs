@@ -160,8 +160,9 @@ Things to know:
   (`took_over_at_dialog_show`); its presses go on from
   `resume_open_dialogs`. A run killed after logging the show and before
   keeping `show_stop` has its show logged twice. A row cut short by the
-  kill at the end of `events.jsonl`, `updates.jsonl` or `watch.jsonl` is
-  taken off, or ended with a newline if it is whole. Both are logged in one
+  kill at the end of `events.jsonl`, `updates.jsonl`, `watch.jsonl` or
+  `input.jsonl` is taken off, or ended with a newline if it is whole. Both
+  are logged in one
   `resume_torn` event: `rows`, the cut rows by log, and `ended`, the logs
   ended. They are kept in `resume-torn.json` with a `mark` until then, so a
   takeover killed first hands them on. Each cut row is kept with where it
