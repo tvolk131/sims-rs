@@ -495,6 +495,21 @@ impl Game {
                     self.stop(&error);
                 }
             }
+            // `Lot::step` runs `World::idle_speed` before the tick (0x46d9d6).
+            // Detect `0x109(1)` / `0x109(0)` transitions directly from
+            // `return_speed`'s sign change so even a same-tick Special Effect
+            // `0x10c` reset (`(NORMAL, -1) -> (IDLE, NORMAL) -> (NORMAL, NORMAL)`)
+            // arms `[control_panel + 0x1ec]` under both `Game::run` and
+            // `Game::advance`.
+            let return_after = self.lot.world().return_speed();
+            if speed_before.1 < 0 && return_after >= 0 {
+                self.hud.set_idle_speed(true);
+            } else if speed_before.1 >= 0 && return_after < 0 {
+                self.hud.set_idle_speed(false);
+            }
+            if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
+                self.blink_dirty = true;
+            }
             if sync_speed_after_step(&mut self.pace, speed_before, self.lot.world()) && idle {
                 break;
             }

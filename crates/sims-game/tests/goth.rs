@@ -3844,24 +3844,28 @@ fn pet_subpanels_ultra_speed_blink_and_duplicate_instance_selection() {
 
     // Scripted Special Effect `0x10c` speed reset (`0x4f6856..0x4f687a`):
     // changes speed & return_speed from (IDLE, FAST) -> (NORMAL, NORMAL)
-    // WITHOUT clearing `[control_panel + 0x1ec]`, so Ultra keeps blinking.
-    // A manual Live-mode speed click (`0x53a5e3`) clears `[+0x1ec]`, stopping
-    // the blink even though the speed globals are identical.
+    // WITHOUT clearing `[control_panel + 0x1ec]`: `0x53b0d3` preserves state 3
+    // and its running 500 ms timer (`since = 2_600_000`), `0x53b121..0x53b128`
+    // immediately clears Ultra's selected bit, and the next scheduled callback
+    // at 3_100_000 turns Ultra back on. A manual Live-mode speed click
+    // (`0x53a5e3`) clears `[+0x1ec]`, stopping the blink even though the speed
+    // globals are identical.
     let mut scripted_world = idle_world.clone();
     scripted_world.globals[18] = sims_sim::speed::FAST;
     assert!(!hud.sync_clock_blink(&scripted_world, 2_100_000));
     assert!(hud.sync_clock_blink(&scripted_world, 2_600_000));
+    assert!(hud.controls.ultra_lit);
     scripted_world.set_speed(i32::from(sims_sim::speed::NORMAL));
     assert_eq!(
         (scripted_world.speed(), scripted_world.return_speed()),
         (sims_sim::speed::NORMAL, sims_sim::speed::NORMAL)
     );
-    // Still lit after scripted reset, and toggles at 500 ms.
-    assert!(!hud.sync_clock_blink(&scripted_world, 2_800_000));
-    assert!(hud.controls.ultra_lit);
-    assert!(hud.sync_clock_blink(&scripted_world, 3_100_000));
+    // Speed refresh clears Ultra's selected bit (`0x53b121..0x53b128`) while
+    // keeping state 3's scheduled 500 ms timer (`since = 2_600_000`).
+    assert!(hud.sync_clock_blink(&scripted_world, 2_800_000));
     assert!(!hud.controls.ultra_lit);
-    assert!(hud.sync_clock_blink(&scripted_world, 3_600_000));
+    // Next scheduled callback at 3_100_000 turns Ultra back on.
+    assert!(hud.sync_clock_blink(&scripted_world, 3_100_000));
     assert!(hud.controls.ultra_lit);
     hud.draw(
         &scripted_world,
@@ -3876,9 +3880,9 @@ fn pet_subpanels_ultra_speed_blink_and_duplicate_instance_selection() {
     assert!(speed_btn(&hud, id::ULTRA));
     // Manual Live-mode speed click clears `[control_panel + 0x1ec]`.
     hud.set_idle_speed(false);
-    assert!(hud.sync_clock_blink(&scripted_world, 3_700_000));
+    assert!(hud.sync_clock_blink(&scripted_world, 3_200_000));
     assert!(!hud.controls.ultra_lit);
-    assert!(!hud.sync_clock_blink(&scripted_world, 4_200_000));
+    assert!(!hud.sync_clock_blink(&scripted_world, 3_700_000));
     assert!(!hud.controls.ultra_lit);
 
     // 2. Dog (`KIND = 2`) and Cat (`KIND = 4`) Personality and Pet Skills panels

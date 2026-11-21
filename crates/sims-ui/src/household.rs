@@ -356,20 +356,21 @@ pub struct Relation {
 }
 
 /// Finds the first live person of type `guid` in person-registry order
-/// (`0x4e9608`: scans `[registry + 0x84]` = `world.people`), falling back
-/// to `world.objects` for synthetic worlds that leave `world.people` empty.
+/// (`0x4e9608`: scans `[registry + 0x84]` = `world.people` and returns `None`
+/// on a miss). Falls back to `world.objects` only when `world.people` is empty
+/// (for synthetic worlds that never populate the person registry).
 pub fn first_person_for_guid(world: &World, guid: u32) -> Option<&sims_sim::Object> {
+    if !world.people.is_empty() {
+        return world
+            .people
+            .iter()
+            .filter_map(|id| world.objects.get(id))
+            .find(|o| o.guid == guid && o.person.is_some());
+    }
     world
-        .people
-        .iter()
-        .filter_map(|id| world.objects.get(id))
+        .objects
+        .values()
         .find(|o| o.guid == guid && o.person.is_some())
-        .or_else(|| {
-            world
-                .objects
-                .values()
-                .find(|o| o.guid == guid && o.person.is_some())
-        })
 }
 
 impl Snapshot {
@@ -1495,5 +1496,10 @@ mod tests {
         assert_eq!(dup_snap.selected, Some(1));
         assert_eq!(dup_snap.selected_guid, Some(200));
         assert_eq!(dup_snap.selected_resident().map(|r| r.object), Some(10));
+
+        // When `world.people` is populated, an unregistered person in
+        // `world.objects` is NOT surfaced (`0x4e9625..0x4e964c` returns null).
+        world.objects.insert(99, make_sim(99, 300, 1, 1, false));
+        assert!(first_person_for_guid(&world, 300).is_none());
     }
 }

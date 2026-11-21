@@ -68,23 +68,33 @@ panel suppression).
     (`0x53a5e3..0x53a6e1`), whereas scripted Special Effect `0x10c` speed
     resets (`0x4f6856..0x4f687a`) change global 16/18 to `NORMAL` while
     leaving `[control_panel + 0x1ec]` set so state 3 stays armed
-    (`0x53b663..0x53b6ac`). `sims_game::hud::Hud` tracks `[+0x1ec]` directly
-    (`Hud::idle_speed`), updated by `Game::idle_speed`, cleared by manual
-    Live-mode `Game::set_speed`, and forwarded into `Snapshot::with_idle_speed`.
-  - When unpaused in Live mode with `idle_speed` active and saved return
-    speed != `ULTRA` (`0x4b4513 != 0x46d26a`), the clock blink state
-    machine enters `state 3` (`ClockBlinkMode::Ultra`), arming the shared
-    500 ms (`0x1f4` ms) timer (`0x53b6e0..0x53b705`). Each callback
-    (`0x53b4c9..0x53b4fe`) toggles `id::ULTRA`'s `selected` flag
-    (`[ultra + 0xe0]` via `0x5e480a`) while the saved return speed button
-    (Normal or Fast) remains highlighted (`0x53b0d8..0x53b16b`). Leaving
-    state 3 cancels the timer and clears `ultra_lit` (`0x53b76d..0x53b7aa`).
+    (`0x53b663..0x53b6ac`), clearing `id::ULTRA`'s selected bit
+    (`0x53b121..0x53b128`) without resetting the running 500 ms timer.
+    `sims_game::hud::Hud` tracks `[+0x1ec]` directly (`Hud::idle_speed`),
+    updated by `Game::idle_speed` and `Game::run_while` (detecting
+    `return_speed`'s sign change across `Lot::step` so same-tick idle entry
+    + `0x10c` reset is never missed), cleared by manual Live-mode
+    `Game::set_speed`, and forwarded into `Snapshot::with_idle_speed`.
+  - From state 0 (`Live`), `0x109(1)` enters `state 3` (`ClockState::IdleUltra`)
+    unconditionally (`0x53b56f..0x53b57b`, even when saved return speed is
+    `ULTRA`), arming the shared 500 ms (`0x1f4` ms) timer (`0x53b6e0..0x53b705`).
+    Returning from `Paused` or non-Live enters `state 3` only when saved return
+    speed != `ULTRA` (`0x53b627..0x53b645`). Each callback (`0x53b4c9..0x53b52e`)
+    toggles `id::ULTRA`'s `selected` flag (`[ultra + 0xe0]` via `0x5e480a`) when
+    saved return speed != `ULTRA` (or skips toggling and still re-arms when
+    `ULTRA`, preserving the 500 ms cadence across a later `0x10c` reset), while
+    the saved return speed button (Normal or Fast) remains highlighted
+    (`0x53b0d8..0x53b16b`). Leaving state 3 cancels the timer and clears
+    `ultra_lit` (`0x53b76d..0x53b7aa`).
 - **Neighbor/GUID selection matching (`0x51c5ef -> 0x4e97dc`, `0x4e986d`,
   `0x4e9608`, `0x4cf9ea..0x4cfa0d`) & non-residential House suppression
   (`0x51d3f9..0x51d412`):**
   - `first_person_for_guid` scans `world.people` in person-registry order
-    (`0x4e9608`: `[registry + 0x84]`) rather than ascending object ID so a
-    lower-ID duplicate appended later never shadows the primary live Sim.
+    (`0x4e9608`: `[registry + 0x84]`) and returns `None` on a miss whenever
+    `world.people` is populated (falling back to `world.objects` only for
+    synthetic worlds with an empty `world.people`), so a lower-ID duplicate
+    appended later never shadows the primary live Sim and unregistered objects
+    are never surfaced.
   - `Snapshot::selected_guid` records the selected person's type GUID so
     `Snapshot::selected_resident` matches the household roster by GUID
     (matching the executable's neighbor-index comparison) even when a

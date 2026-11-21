@@ -227,19 +227,28 @@ impl Hud {
 
     /// Syncs the clock controls' shared 500 ms blink timer (`0x53b4b0..0x53b7e7`)
     /// with `world` and the monotonic `clock_us`:
-    /// - state 2 (`ClockBlinkMode::Pause`): blinks `id::PAUSE` row 0 <-> row 1
-    ///   whenever paused (including outside Live mode, `0x53b58a -> 0x53b5e8`);
-    /// - state 3 (`ClockBlinkMode::Ultra`): blinks `id::ULTRA` selected state
-    ///   while unpaused in Live mode with `[control_panel + 0x1ec]` set
-    ///   and saved return speed != Ultra (`0x53b4c9..0x53b4fe`).
+    /// - state 2 (`Paused`): blinks `id::PAUSE` row 0 <-> row 1 whenever
+    ///   paused (including outside Live mode, `0x53b58a -> 0x53b5e8`);
+    /// - state 3 (`IdleUltra`): armed on `0x109(1)` from Live (`0x53b56f..0x53b57b`,
+    ///   even when `return_speed == ULTRA`) or when returning from Pause/non-Live
+    ///   with `return_speed != ULTRA` (`0x53b627..0x53b645`); toggles `id::ULTRA`
+    ///   selected state every 500 ms when `speed != Ultra` (`0x53b4c9..0x53b4fe`),
+    ///   and clears `ultra_lit` (without resetting the timer) on a speed refresh
+    ///   such as Special Effect `0x10c` (`0x53b0d3`, `0x53b121..0x53b128`).
     ///
     /// Returns true if either `controls.pause_lit` or `controls.ultra_lit` changed.
     pub fn sync_clock_blink(&mut self, world: &World, clock_us: u64) -> bool {
         self.idle_speed = self.effective_idle_speed(world);
         let speed = hud::speed_for(world);
-        let mode =
-            hud::clock_blink_mode(world.paused(), self.controls.mode, self.idle_speed, speed);
-        let changed = self.clock_blink.sync(mode, clock_us);
+        let speed_pair = (world.speed(), world.return_speed());
+        let changed = self.clock_blink.sync(
+            world.paused(),
+            self.controls.mode,
+            self.idle_speed,
+            speed,
+            speed_pair,
+            clock_us,
+        );
         self.controls.pause_lit = self.clock_blink.pause_lit();
         self.controls.ultra_lit = self.clock_blink.ultra_lit();
         changed
@@ -707,116 +716,395 @@ impl Pressed {
     }
 }
 
-/// The clock controls' shared 500 ms blink timer (`0x53b4b0..0x53b7e7`):
-/// state 2 (`Pause`) starts unlit (cyan row 0, `0x53b707..0x53b74d`) and
-/// toggles row every [`hud::PAUSE_BLINK_US`] (`0x53b500..0x53b528`);
-/// state 3 (`Ultra`) starts unlit (`selected = false`, `0x53b6e0..0x53b705`)
-/// and toggles `id::ULTRA` selected every [`hud::PAUSE_BLINK_US`]
-/// (`0x53b4c9..0x53b4fe`). Transitioning between modes cancels the old timer,
-/// clears the previous lit flag, and starts fresh (`0x53b6bc -> 0x53b757`).
+/// Native clock-control blink state (`[control_panel + 0x1e4]`,
+/// `0x53b4b0..0x53b7e7`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ClockState {
+    /// State 0: unpaused in Live mode, no 500 ms timer running.
+    #[default]
+    Live,
+    /// State 1: unpaused outside Live mode (steady red Pause button).
+    OtherMode,
+    /// State 2: paused; toggles Pause row 0 <-> row 1 every 500 ms.
+    Paused,
+    /// State 3: unpaused in Live mode with `[control_panel + 0x1ec]` set;
+    /// toggles Ultra selected every 500 ms whenever `speed != Some(Speed::Ultra)`
+    /// (and re-arms without toggling while `speed == Some(Speed::Ultra)`).
+    IdleUltra,
+}
+
+/// Shared 500 ms clock blink timer (`0x53b4b0..0x53b7e7`, `0x53b0d3..0x53b16b`).
 #[derive(Debug, Default)]
 struct ClockBlink {
-    mode: hud::ClockBlinkMode,
+    state: ClockState,
     since: Option<u64>,
     lit: bool,
+    was_idle_speed: bool,
+    last_speed_pair: Option<(i16, i16)>,
+    ultra_lit: bool,
 }
 
 impl ClockBlink {
     fn pause_lit(&self) -> bool {
-        self.mode == hud::ClockBlinkMode::Pause && self.lit
+        self.state == ClockState::Paused && self.lit
     }
 
     fn ultra_lit(&self) -> bool {
-        self.mode == hud::ClockBlinkMode::Ultra && self.lit
+        self.ultra_lit
     }
 
     fn reset(&mut self) {
-        self.mode = hud::ClockBlinkMode::Off;
+        self.state = ClockState::Live;
         self.since = None;
         self.lit = false;
+        self.was_idle_speed = false;
+        self.last_speed_pair = None;
+        self.ultra_lit = false;
     }
 
-    fn sync(&mut self, mode: hud::ClockBlinkMode, clock_us: u64) -> bool {
-        let before = (self.pause_lit(), self.ultra_lit());
-        if mode == hud::ClockBlinkMode::Off {
-            self.reset();
-            return (self.pause_lit(), self.ultra_lit()) != before;
-        }
-        if self.mode != mode {
-            self.mode = mode;
-            self.since = Some(clock_us);
+    fn sync(
+        &mut self,
+        paused: bool,
+        mode: sims_ui::command::Mode,
+        idle_speed: bool,
+        speed: Option<sims_ui::command::Speed>,
+        speed_pair: (i16, i16),
+        clock_us: u64,
+    ) -> bool {
+        let before = (self.pause_lit(), self.ultra_lit);
+        let entered_idle = !self.was_idle_speed && idle_speed;
+        self.was_idle_speed = idle_speed;
+        let speed_changed = self.last_speed_pair.is_some_and(|prev| prev != speed_pair);
+        self.last_speed_pair = Some(speed_pair);
+
+        let next = if paused {
+            ClockState::Paused
+        } else if mode != sims_ui::command::Mode::Live {
+            ClockState::OtherMode
+        } else if !idle_speed {
+            ClockState::Live
+        } else {
+            match self.state {
+                // 0x53b6a6..0x53b6ac: stay in state 3 while `[+0x1ec] != 0`.
+                ClockState::IdleUltra => ClockState::IdleUltra,
+                // 0x53b56f..0x53b57b: `0x109(1)` from state 0 enters state 3
+                // unconditionally (even if return speed is already Ultra);
+                // a speed-only refresh in state 0 (`0x53b547`) stays in state 0.
+                ClockState::Live => {
+                    if entered_idle {
+                        ClockState::IdleUltra
+                    } else {
+                        ClockState::Live
+                    }
+                }
+                // 0x53b5ce -> 0x53b627..0x53b645: returning from Pause or
+                // non-Live enters state 3 only when return speed != Ultra.
+                ClockState::Paused | ClockState::OtherMode => {
+                    if speed != Some(sims_ui::command::Speed::Ultra) {
+                        ClockState::IdleUltra
+                    } else {
+                        ClockState::Live
+                    }
+                }
+            }
+        };
+
+        if self.state != next {
+            self.state = next;
             self.lit = false;
-            return (self.pause_lit(), self.ultra_lit()) != before;
+            self.since =
+                matches!(next, ClockState::Paused | ClockState::IdleUltra).then_some(clock_us);
+            self.ultra_lit = false;
+            return (self.pause_lit(), self.ultra_lit) != before;
         }
-        match self.since {
-            None => {
-                self.since = Some(clock_us);
-                self.lit = false;
-            }
-            Some(since) if clock_us.saturating_sub(since) >= hud::PAUSE_BLINK_US => {
-                // 0x53b4c9..0x53b52e -> 0x5daf1c..0x5daf31: a single timer
-                // callback toggles once and re-arms 500 ms from the current
-                // clock, even after a long stall.
-                self.lit = !self.lit;
-                self.since = Some(clock_us);
-            }
-            Some(_) => {}
+
+        // 0x53b0d3 -> 0x53b121..0x53b128: a speed refresh (such as Special
+        // Effect `0x10c`) preserves state 3 and its running 500 ms timer,
+        // while clearing Ultra's selected bit before the next callback.
+        if self.state == ClockState::IdleUltra && speed_changed {
+            self.lit = false;
         }
-        (self.pause_lit(), self.ultra_lit()) != before
+
+        if matches!(self.state, ClockState::Paused | ClockState::IdleUltra) {
+            match self.since {
+                None => {
+                    self.since = Some(clock_us);
+                    self.lit = false;
+                }
+                Some(since) if clock_us.saturating_sub(since) >= hud::PAUSE_BLINK_US => {
+                    // 0x53b4c9..0x53b52e -> 0x5daf1c..0x5daf31: a single timer
+                    // callback toggles once (skipping toggle while state 3 has
+                    // Ultra selected, 0x53b4e4 -> 0x53b521) and re-arms 500 ms
+                    // from the current clock, even after a long stall.
+                    if self.state == ClockState::Paused
+                        || speed != Some(sims_ui::command::Speed::Ultra)
+                    {
+                        self.lit = !self.lit;
+                    } else {
+                        self.lit = false;
+                    }
+                    self.since = Some(clock_us);
+                }
+                Some(_) => {}
+            }
+        }
+        self.ultra_lit = self.state == ClockState::IdleUltra
+            && speed != Some(sims_ui::command::Speed::Ultra)
+            && self.lit;
+        (self.pause_lit(), self.ultra_lit) != before
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sims_ui::command::{Mode, Speed};
     use sims_ui::frame::Rect;
     use sims_ui::queue::{Icon, Picture};
 
     #[test]
     fn pause_blink_toggles_every_500ms_and_resets_unlit() {
         let mut blink = ClockBlink::default();
+        let normal = (sims_sim::speed::NORMAL, -1);
+        let idle_normal = (sims_sim::speed::IDLE, sims_sim::speed::NORMAL);
+        let idle_ultra = (sims_sim::speed::IDLE, sims_sim::speed::ULTRA);
+        let reset_normal = (sims_sim::speed::NORMAL, sims_sim::speed::NORMAL);
         assert!(!blink.pause_lit());
         // Entering Live-mode pause starts unlit (cyan row 0, 0x53b707..0x53b74d).
-        assert!(!blink.sync(hud::ClockBlinkMode::Pause, 100_000));
+        assert!(!blink.sync(
+            true,
+            Mode::Live,
+            false,
+            Some(Speed::Normal),
+            normal,
+            100_000
+        ));
         assert!(!blink.pause_lit());
         // 499.999 ms later: still unlit.
-        assert!(!blink.sync(hud::ClockBlinkMode::Pause, 599_999));
+        assert!(!blink.sync(
+            true,
+            Mode::Live,
+            false,
+            Some(Speed::Normal),
+            normal,
+            599_999
+        ));
         assert!(!blink.pause_lit());
         // At 500 ms: flips to lit (red row 1, 0x53b500..0x53b528).
-        assert!(blink.sync(hud::ClockBlinkMode::Pause, 600_000));
+        assert!(blink.sync(
+            true,
+            Mode::Live,
+            false,
+            Some(Speed::Normal),
+            normal,
+            600_000
+        ));
         assert!(blink.pause_lit());
         // At 1000 ms: flips back to unlit.
-        assert!(blink.sync(hud::ClockBlinkMode::Pause, 1_100_000));
+        assert!(blink.sync(
+            true,
+            Mode::Live,
+            false,
+            Some(Speed::Normal),
+            normal,
+            1_100_000
+        ));
         assert!(!blink.pause_lit());
         // A 1-second stall (2x 500 ms) toggles once and re-arms 500 ms from
         // the current clock (0x53b500..0x53b52e -> 0x5daf1c..0x5daf31).
-        assert!(blink.sync(hud::ClockBlinkMode::Pause, 2_100_000));
+        assert!(blink.sync(
+            true,
+            Mode::Live,
+            false,
+            Some(Speed::Normal),
+            normal,
+            2_100_000
+        ));
         assert!(blink.pause_lit());
-        assert!(!blink.sync(hud::ClockBlinkMode::Pause, 2_599_999));
-        assert!(blink.sync(hud::ClockBlinkMode::Pause, 2_600_000));
+        assert!(!blink.sync(
+            true,
+            Mode::Live,
+            false,
+            Some(Speed::Normal),
+            normal,
+            2_599_999
+        ));
+        assert!(blink.sync(
+            true,
+            Mode::Live,
+            false,
+            Some(Speed::Normal),
+            normal,
+            2_600_000
+        ));
         assert!(!blink.pause_lit());
         // Unpausing clears lit and kills the timer; re-pausing starts fresh unlit.
-        assert!(blink.sync(hud::ClockBlinkMode::Pause, 3_100_000));
+        assert!(blink.sync(
+            true,
+            Mode::Live,
+            false,
+            Some(Speed::Normal),
+            normal,
+            3_100_000
+        ));
         assert!(blink.pause_lit());
-        assert!(blink.sync(hud::ClockBlinkMode::Off, 3_200_000));
+        assert!(blink.sync(
+            false,
+            Mode::Live,
+            false,
+            Some(Speed::Normal),
+            normal,
+            3_200_000
+        ));
         assert!(!blink.pause_lit());
-        assert!(!blink.sync(hud::ClockBlinkMode::Pause, 3_400_000));
+        assert!(!blink.sync(
+            true,
+            Mode::Live,
+            false,
+            Some(Speed::Normal),
+            normal,
+            3_400_000
+        ));
         assert!(!blink.pause_lit());
-        assert!(!blink.sync(hud::ClockBlinkMode::Pause, 3_899_999));
-        assert!(blink.sync(hud::ClockBlinkMode::Pause, 3_900_000));
+        assert!(!blink.sync(
+            true,
+            Mode::Live,
+            false,
+            Some(Speed::Normal),
+            normal,
+            3_899_999
+        ));
+        assert!(blink.sync(
+            true,
+            Mode::Live,
+            false,
+            Some(Speed::Normal),
+            normal,
+            3_900_000
+        ));
         assert!(blink.pause_lit());
 
         // Switching directly from lit Pause (state 2) to Ultra (state 3)
         // clears pause_lit, starts ultra_lit unlit, and toggles ultra_lit at
         // 500 ms (`0x53b6bc -> 0x53b757`, `0x53b4c9..0x53b4fe`).
-        assert!(blink.sync(hud::ClockBlinkMode::Ultra, 4_000_000));
+        assert!(blink.sync(
+            false,
+            Mode::Live,
+            true,
+            Some(Speed::Normal),
+            idle_normal,
+            4_000_000
+        ));
         assert!(!blink.pause_lit());
         assert!(!blink.ultra_lit());
-        assert!(!blink.sync(hud::ClockBlinkMode::Ultra, 4_499_999));
-        assert!(blink.sync(hud::ClockBlinkMode::Ultra, 4_500_000));
+        assert!(!blink.sync(
+            false,
+            Mode::Live,
+            true,
+            Some(Speed::Normal),
+            idle_normal,
+            4_499_999
+        ));
+        assert!(blink.sync(
+            false,
+            Mode::Live,
+            true,
+            Some(Speed::Normal),
+            idle_normal,
+            4_500_000
+        ));
         assert!(blink.ultra_lit());
-        assert!(blink.sync(hud::ClockBlinkMode::Off, 4_600_000));
+
+        // Scripted `0x10c` speed refresh at 4_700_000 clears Ultra's selected
+        // bit (`0x53b121..0x53b128`) without resetting the running 500 ms
+        // timer (`since = 4_500_000`), so the next callback at 5_000_000 turns
+        // Ultra back on.
+        assert!(blink.sync(
+            false,
+            Mode::Live,
+            true,
+            Some(Speed::Normal),
+            reset_normal,
+            4_700_000
+        ));
         assert!(!blink.ultra_lit());
+        assert!(!blink.sync(
+            false,
+            Mode::Live,
+            true,
+            Some(Speed::Normal),
+            reset_normal,
+            4_999_999
+        ));
+        assert!(blink.sync(
+            false,
+            Mode::Live,
+            true,
+            Some(Speed::Normal),
+            reset_normal,
+            5_000_000
+        ));
+        assert!(blink.ultra_lit());
+        // Leaving idle speed clears state 3.
+        assert!(blink.sync(
+            false,
+            Mode::Live,
+            false,
+            Some(Speed::Normal),
+            normal,
+            5_100_000
+        ));
+        assert!(!blink.ultra_lit());
+
+        // Entering idle speed from state 0 with Ultra selected arms state 3
+        // (`0x53b56f..0x53b57b`); callback at 5_700_000 skips toggle and
+        // re-arms (`0x53b4e4 -> 0x53b521`). A scripted reset to Normal at
+        // 5_900_000 then flips Ultra on at 6_200_000 (existing cadence, not
+        // delayed by a fresh 500 ms).
+        assert!(!blink.sync(
+            false,
+            Mode::Live,
+            true,
+            Some(Speed::Ultra),
+            idle_ultra,
+            5_200_000
+        ));
+        assert!(!blink.ultra_lit());
+        assert!(!blink.sync(
+            false,
+            Mode::Live,
+            true,
+            Some(Speed::Ultra),
+            idle_ultra,
+            5_700_000
+        ));
+        assert!(!blink.ultra_lit());
+        assert!(!blink.sync(
+            false,
+            Mode::Live,
+            true,
+            Some(Speed::Normal),
+            reset_normal,
+            5_900_000
+        ));
+        assert!(!blink.ultra_lit());
+        assert!(!blink.sync(
+            false,
+            Mode::Live,
+            true,
+            Some(Speed::Normal),
+            reset_normal,
+            6_199_999
+        ));
+        assert!(blink.sync(
+            false,
+            Mode::Live,
+            true,
+            Some(Speed::Normal),
+            reset_normal,
+            6_200_000
+        ));
+        assert!(blink.ultra_lit());
     }
 
     #[test]
