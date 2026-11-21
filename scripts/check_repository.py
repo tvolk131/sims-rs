@@ -55,18 +55,19 @@ FORBIDDEN_SUFFIXES = {
     ".jsonl", ".mp4", ".ogg", ".otf", ".pdf", ".png", ".qcow2",
     ".ttf", ".vdi", ".webm", ".webp",
 }
-# Screenshots and other pictures never go in a test or fixture path: the
-# screenshot ratchet keeps its references, and its difference images, under
-# cache/. Image formats by name, and by their first bytes whatever the name
-# (an ASCII PPM or an SVG is text, so the binary check alone would not
-# catch it). A netpbm header may put a comment between any two fields.
-TEST_DIRECTORIES = {"tests", "test", "fixtures", "testdata", "test-data", "test_data"}
+# Screenshots and other pictures never go in the repository: the screenshot
+# ratchet keeps its references, and its difference images, under cache/.
+# Image formats by name, and by their first bytes whatever the name (an
+# ASCII PPM or an SVG is text, so the binary check alone would not catch
+# it). A netpbm header may put a comment, ended by a line feed or a
+# carriage return, between any two fields; an SVG is found by its root
+# element's local name, whatever its namespace prefix.
 IMAGE_SUFFIXES = {
     ".avif", ".bmp", ".dds", ".exr", ".gif", ".heic", ".heif", ".ico", ".jpeg",
     ".jpg", ".jxl", ".pam", ".pbm", ".pgm", ".png", ".pnm", ".ppm", ".psd",
     ".qoi", ".svg", ".svgz", ".tga", ".tif", ".tiff", ".webp", ".xcf",
 }
-NETPBM_GAP = rb"(?:\s|#[^\n]*(?:\n|\Z))+"
+NETPBM_GAP = rb"(?:\s|#[^\r\n]*(?:\r\n|\r|\n|\Z))+"
 IMAGE_MAGIC = re.compile(
     rb"\A(?:\x89PNG\r\n\x1a\n|GIF8[79]a|\xff\xd8\xff"
     rb"|P[1-6]" + NETPBM_GAP + rb"\d+" + NETPBM_GAP + rb"\d+"
@@ -74,10 +75,21 @@ IMAGE_MAGIC = re.compile(
     rb"|II\*\0|MM\0\*|qoif|RIFF....WEBP|8BPS|gimp xcf)",
     re.DOTALL,
 )
-SVG_MAGIC = re.compile(
-    rb"\A(?:\xef\xbb\xbf)?\s*(?:<\?xml.*?\?>\s*)?(?:(?:<!--.*?-->|<!DOCTYPE[^>]*>)\s*)*<svg[\s>]",
+# What may come before an XML document's root element: a byte-order mark,
+# white space, processing instructions (the XML declaration among them),
+# comments, and a document type with its internal subset.
+XML_PROLOG = re.compile(
+    rb"\A(?:\xef\xbb\xbf)?(?:\s+|<\?.*?\?>|<!--.*?-->|<!DOCTYPE[^>\[]*(?:\[.*?\])?\s*>)*",
     re.DOTALL | re.IGNORECASE,
 )
+XML_ROOT = re.compile(rb"<([^\s/>!?]+)")
+
+
+def is_svg(content):
+    root = XML_ROOT.match(content, XML_PROLOG.match(content).end())
+    return bool(root) and root.group(1).split(b":")[-1].lower() == b"svg"
+
+
 HEX_RUN = re.compile(rb"(?<![0-9a-fA-F])[0-9a-fA-F]{16,}(?![0-9a-fA-F])")
 BYTE_ARRAY = re.compile(rb"\[\s*(?:0x[0-9a-fA-F]{1,2}|\d{1,3})(?:\s*,\s*(?:0x[0-9a-fA-F]{1,2}|\d{1,3})){2,}\s*,?\s*\]")
 HEX_STRING = re.compile(rb'''["']([0-9a-fA-F]{2,})["']''')
@@ -101,14 +113,10 @@ def git(root, *arguments, input_bytes=None):
     )
 
 
-def in_test_directory(name):
-    return bool(TEST_DIRECTORIES.intersection(PurePosixPath(name.lower()).parts[:-1]))
-
-
 def path_violation(name):
     path = PurePosixPath(name.lower())
-    if in_test_directory(name) and path.suffix in IMAGE_SUFFIXES:
-        return "image file in a test or fixture path (screenshots stay under cache/)"
+    if path.suffix in IMAGE_SUFFIXES:
+        return "image file (screenshots stay under cache/)"
     if path.parts[0] in PRIVATE_ROOTS or PRIVATE_COMPONENTS.intersection(path.parts):
         return "local/private directory"
     if path.parts[:2] == ("fixtures", "private"):
@@ -198,10 +206,8 @@ def check_blob(root, policy, name, content, object_id=None, history=False):
             content.decode("utf-8")
         except UnicodeDecodeError:
             violations.append(f"{name}: non-UTF-8 binary content is not admitted by the source-only policy")
-    if in_test_directory(name) and (IMAGE_MAGIC.match(content) or SVG_MAGIC.match(content)):
-        violations.append(
-            f"{name}: image content in a test or fixture path (screenshots stay under cache/)"
-        )
+    if IMAGE_MAGIC.match(content) or is_svg(content):
+        violations.append(f"{name}: image content (screenshots stay under cache/)")
     if PurePosixPath(name).suffix.lower() == ".json" and name != POLICY_PATH:
         # In the tree being published, a review names the exact path. In
         # history, provenance follows the bytes: a reviewed file that was

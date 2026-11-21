@@ -39,8 +39,14 @@ dialog's No click also opened a "Go Here" pie menu on the lot. It stayed
 listed from 6:54 until a click on the lot dismissed it at about 8:16, and
 the run's notices were answered by hand (two about going downtown and a
 skill point, among others). So where a Sim is, and what it does, can
-differ from ours for reasons other than drawing, and the people class of
-the 8:16 scenes measures that as well as the drawing.
+differ from ours for reasons other than drawing.
+
+The people floors of the 8:16 scenes (0.74% to 1.60%) are agreement
+between two different runs, driven mostly by where each Sim stands and
+how it is posed; they say little about how people are drawn. Judging the
+drawing of people needs a capture of the original synchronised with our
+run. The 7:12 and 8:05 people floors (17.16% and 14.13%) come from the
+#282 comparison, where the Sims stand where ours do.
 
 By 9:53 PM the live run had had a kitchen fire that ours does not have.
 The night scene leaves the house out and measures the terrain, trees,
@@ -84,42 +90,63 @@ Each scene names its rectangles and why:
 
 - A screenshot whose SHA-256 differs from the manifest stops the run. A
   new capture needs a new hash and the reason in its PR.
-- Our frame's SHA-256 is pinned. Any drawing change re-pins it with
+- Our frame's SHA-256 is pinned over the whole frame, the regions left
+  out included. That is deliberate: our drawing is deterministic, so the
+  pin is the check that nothing we draw changed, a fish in our tank
+  included. The regions left out hide only the original's animations, and
+  only from the shares. Any drawing change re-pins it with
   `SIMS_RATCHET_UPDATE=1`, and the PR body gives the new shares.
-- A share below its floor fails. Floors are kept in hundredths of a
-  percent and compared as whole numbers. Update mode raises floors to the
-  share reached and never lowers or removes one, and when any check fails
-  it writes nothing. Lowering or removing a floor is a hand edit, with the
-  reason in the PR body.
-- A class with pixels must have a floor, and a class with none must not.
-  A new scene starts with `floors = none`, and its first update sets them.
+- A share below its floor fails. Floors are written with exactly two
+  decimals, at most 100.00 (at most three whole digits, read before any
+  arithmetic), and compared as whole hundredths of a percent.
+- A class with pixels must have a floor, a class with none must not, and a
+  scene that leaves every pixel out fails.
+- Update mode (`SIMS_RATCHET_UPDATE=1`) re-pins hashes and raises floors
+  to the share reached. It never adds, lowers or removes a floor. A new
+  scene is written with `floors = none`, and `SIMS_RATCHET_NEW=<name>`
+  sets its hash and first floors; that is the only way a floor is added.
+  Lowering or removing a floor is a hand edit, with the reason in the PR
+  body.
+- A run that fails writes nothing. A write replaces the manifest whole (a
+  new file, then a rename), and only if the manifest's SHA-256 is still
+  the one the run read; there is no lock between processes.
 - The manifest is strict: an unknown or repeated setting, a setting
-  before the first scene, no scenes at all, a floor without exactly two
-  decimals, or a rectangle that is not inside the frame stops the run.
+  before the first scene, a missing baseline scene (the eight above, named
+  in the test), a bad floor, or a rectangle that is not inside the frame
+  stops the run.
 - `SIMS_RATCHET_DIFF=<folder>` writes difference images (pixels that
-  differ in magenta, the rest ours in grey). The folder must exist under a
-  folder named `cache`, outside the checkout's files or in its own
-  `cache/`.
-- The test follows libtest's filters, `--exact`, `--skip` and `--ignored`,
-  and skips flag values such as `--test-threads 1`, so a cargo flag cannot
-  filter it out by accident.
-- `scripts/check_repository.py` now rejects image files, by suffix or by
-  content (raster formats, netpbm headers with comments, SVG), in any
-  `tests`, `test`, `fixtures`, `testdata`, `test-data` or `test_data`
-  folder.
+  differ in magenta, the rest ours in grey) into a new folder the run
+  makes inside it, each image a new file. The folder, with links
+  resolved, must be under a folder named `cache` and outside the checkout,
+  its own `cache/` included.
+- The test reads its arguments once, as libtest does: a flag that takes a
+  value takes the next word (`--skip --list` skips `--list`), and every
+  word after `--` is a filter. Filters, `--exact`, `--skip`, `--ignored`
+  and `--include-ignored` select as libtest's do.
+- Before anything else the test checks its own floor and argument
+  parsing, so the release run in the merge gate covers them.
+- `scripts/check_repository.py` now rejects image files anywhere in the
+  repository: by suffix, or by content (raster formats; netpbm headers,
+  comments ended by a line feed or a carriage return; an SVG root element
+  under any namespace prefix).
 
 ## Running it
 
-Without `SIMS_INSTALL` and `SIMS_RATCHET` the test prints `ratchet:
-skipped: no assets` and passes, which is what CI sees. With them:
+Without `SIMS_RATCHET` the test prints `ratchet: skipped: no assets` and
+passes. That is what CI sees, and what a track's workspace gate sees: it
+sets only `SIMS_INSTALL`, for the other tests. Every other partial
+setting fails: `SIMS_RATCHET` without `SIMS_INSTALL`, either variable set
+but empty or not a folder with files in it, or an update, new-scene or
+difference setting without `SIMS_RATCHET`. With both:
 
 ```
 SIMS_INSTALL=<install> SIMS_RATCHET=<sims-rs>/cache/ratchet \
   cargo test --release -p sims-game --test ratchet
 ```
 
-The coordinator's merge gate runs it beside the whole-day boot. A track
-runs it before handing off any PR that touches drawing or people.
+The coordinator's merge gate runs this command beside the whole-day boot
+and fails unless it prints `ratchet: ok`. A track runs it before handing
+off any PR that touches drawing or people.
 
 ## What would reopen this
 

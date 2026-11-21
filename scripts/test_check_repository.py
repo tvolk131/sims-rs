@@ -324,33 +324,47 @@ class RepositoryHygieneTests(unittest.TestCase):
                 result = self.assert_fails("known private game payload")
                 self.assertNotIn(payload.decode(), result.stdout + result.stderr)
 
-    def test_images_are_rejected_in_test_and_fixture_paths(self):
+    def test_image_files_are_rejected_anywhere(self):
         for name in [
             "crates/sims-game/tests/scene.ppm", "crates/sims-game/tests/data/scene.tiff",
-            "fixtures/shot.png", "crates/x/testdata/shot.qoi", "tests/scene.svg",
+            "crates/x/testdata/shot.qoi", "tests/scene.svg", "misc/scene.svg",
+            "docs/diagram.SVG", "scene.pgm",
         ]:
             with self.subTest(name=name):
                 path = self.write(name, "small")
-                self.assert_fails("image file in a test or fixture path")
+                self.assert_fails("image file")
                 path.unlink()
 
-    def test_image_content_is_rejected_in_test_paths_whatever_the_name(self):
-        for content in [
-            "P3\n2 1\n255\n0 0 0 255 255 255\n", "P6 # comment\n800 600\n255\n",
-            "P3\n2\n# a comment between the width and the height\n1\n255\n0 0 0 1 1 1\n",
-            "P6#comment\n800 600 255\n", "P7\nWIDTH 2\nHEIGHT 1\nENDHDR\n",
-            '<?xml version="1.0"?>\n<!-- drawn -->\n<svg xmlns="http://www.w3.org/2000/svg"/>\n',
-            "<SVG width='1'></SVG>", b"\x89PNG\r\n\x1a\nrest", b"GIF89a....",
+    def test_image_content_is_rejected_anywhere_whatever_the_name(self):
+        for name, content in [
+            ("crates/sims-game/tests/scene.txt", "P3\n2 1\n255\n0 0 0 255 255 255\n"),
+            ("crates/sims-game/tests/scene.txt", "P6 # comment\n800 600\n255\n"),
+            ("tests/scene.txt", "P3\n2\n# between the width and the height\n1\n255\n0 0 0 1 1 1\n"),
+            ("tests/scene.txt", "P3 # a comment ended by a carriage return\r2 1\r255\r0 0 0 1 1 1\r"),
+            ("tests/scene.txt", "P3\r\n# crlf\r\n2 1\r\n255\r\n0 0 0 1 1 1\r\n"),
+            ("tests/scene.txt", "P6#comment\n800 600 255\n"),
+            ("tests/scene.txt", "P7\nWIDTH 2\nHEIGHT 1\nENDHDR\n"),
+            ("tests/scene.txt",
+             '<?xml version="1.0"?>\n<!-- drawn -->\n<svg xmlns="http://www.w3.org/2000/svg"/>\n'),
+            ("tests/scene.txt", '<s:svg xmlns:s="http://www.w3.org/2000/svg" width="1"/>'),
+            ("tests/scene.txt",
+             '<!DOCTYPE svg [ <!ENTITY a "b"> ]>\n<?pi x?>\n<SVG:SVG xmlns:SVG="x"></SVG:SVG>'),
+            ("misc/notes.txt", "<svg width='1'></svg>"),
+            ("docs/picture.md", "P6\n800 600\n255\n"),
+            ("tests/scene.txt", b"\x89PNG\r\n\x1a\nrest"),
+            ("tests/scene.txt", b"GIF89a...."),
         ]:
-            with self.subTest(content=content):
-                path = self.write("crates/sims-game/tests/scene.txt", content)
-                self.assert_fails("image content in a test or fixture path")
+            with self.subTest(name=name, content=content):
+                path = self.write(name, content)
+                self.assert_fails("image content")
                 path.unlink()
 
-    def test_text_that_is_not_an_image_passes_in_test_paths(self):
+    def test_text_that_is_not_an_image_passes(self):
         self.write("crates/sims-game/tests/ratchet.txt", "[scene]\ntick = 1260\nP6 is a word\n")
         self.write("crates/sims-game/tests/words.txt", "P6 is a word, not a header\n")
         self.write("crates/sims-game/tests/render.rs", 'const SVG: &str = "<svg>";\n')
+        self.write("web/page.html", "<!-- a page -->\n<html><body><svg></svg></body></html>\n")
+        self.write("web/notes.md", "<!-- notes -->\n# Notes about svg\n")
         self.write("src/picture.ppm.rs", "// a source file\n")
         self.assert_passes()
 
