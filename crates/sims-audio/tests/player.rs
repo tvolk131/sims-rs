@@ -4,6 +4,7 @@ use sims_audio::module::Module;
 use sims_audio::placement::Projection;
 use sims_audio::player::{BLOCK, MIDDLE, NoSources, Player, RATE, Sources};
 use sims_audio::sources::Snapshot;
+use sims_audio::stations::{FIRST_ID, StationLists};
 use sims_audio::{Pcm, SoundEvent};
 use std::collections::BTreeMap;
 
@@ -2922,7 +2923,8 @@ fn seqgroup_kill_ends_a_holder_started_again_in_the_block() {
 #[test]
 fn an_unpause_runs_the_tracks_in_the_order_of_their_numbers() {
     // Track 11 started first, then 10; the unpause lets go of each, in
-    // the order of the original's registry (here, of their numbers).
+    // the order of the original's registry (with so few IDs, of their
+    // numbers).
     let module = module_of_tracks(&[(10, &asks(10, true)), (11, &asks(11, true))], "");
     let mut player = Player::new(vec![module], samples(), 1);
     play(&mut player, "e11");
@@ -2930,4 +2932,68 @@ fn an_unpause_runs_the_tracks_in_the_order_of_their_numbers() {
     assert_eq!(fields_asked_in_order(&mut player), [11, 10]);
     player.handle(&SoundEvent::Unpause, &NoSources);
     assert_eq!(fields_asked_in_order(&mut player), [10, 11]);
+}
+
+#[test]
+fn an_unpause_runs_the_tracks_bucket_by_bucket() {
+    // With three IDs registered the registry has 193 buckets: track 1005
+    // is in bucket 40 and track 719 in 140, so 1005 goes first.
+    let module = module_of_tracks(&[(719, &asks(719, true)), (1005, &asks(1005, true))], "");
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "e719");
+    play(&mut player, "e1005");
+    assert_eq!(fields_asked_in_order(&mut player), [719, 1005]);
+    player.handle(&SoundEvent::Unpause, &NoSources);
+    assert_eq!(fields_asked_in_order(&mut player), [1005, 719]);
+}
+
+#[test]
+fn the_stations_register_between_the_base_tables_and_the_expansions() {
+    // The base game's tables register 192 IDs (track 190, patch 1 and
+    // 190 more patches), then the one station patch, the 193rd. The
+    // expansion's track 579 then grows the map to 389 buckets before it
+    // goes in, at the head of bucket 190, ahead of track 190. Had the
+    // station come last, 579 would have gone into bucket 0 of 193 first,
+    // and growing would have put 190 ahead of it.
+    let fillers: String = (2000..2190)
+        .map(|id| format!("{id}=0,f,\"one.xa\"\n"))
+        .collect();
+    let mut base = module_of_tracks(&[(190, &asks(190, true))], &format!("[Patch]\n{fillers}"));
+    base.name = "sounddata\\base".to_owned();
+    let mut expansion = module_of_tracks(&[(579, &asks(579, true))], "");
+    expansion.name = "expansionpack\\more".to_owned();
+    let mut player = Player::new(vec![expansion, base], samples(), 1);
+    player.add_stations(&StationLists {
+        hit_lists: BTreeMap::new(),
+        patches: BTreeMap::from([(FIRST_ID, "one.xa".to_owned())]),
+    });
+    assert_eq!(
+        (player.registry().len(), player.registry().buckets()),
+        (194, 389)
+    );
+    play(&mut player, "e190");
+    play(&mut player, "e579");
+    assert_eq!(fields_asked_in_order(&mut player), [190, 579]);
+    player.handle(&SoundEvent::Unpause, &NoSources);
+    assert_eq!(fields_asked_in_order(&mut player), [579, 190]);
+}
+
+#[test]
+fn an_unpause_runs_a_buckets_tracks_newest_registered_first() {
+    // Tracks 5 and 198 share bucket 5; 198, listed after 5, is at its
+    // head. Track 5 started last, so it ran last before the unpause too.
+    let module = module_of_tracks(&[(5, &asks(5, true)), (198, &asks(198, true))], "");
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "e198");
+    play(&mut player, "e5");
+    assert_eq!(fields_asked_in_order(&mut player), [198, 5]);
+    player.handle(&SoundEvent::Unpause, &NoSources);
+    assert_eq!(fields_asked_in_order(&mut player), [198, 5]);
+    // Listed the other way round, 5 goes first.
+    let module = module_of_tracks(&[(198, &asks(198, true)), (5, &asks(5, true))], "");
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "e198");
+    play(&mut player, "e5");
+    player.handle(&SoundEvent::Unpause, &NoSources);
+    assert_eq!(fields_asked_in_order(&mut player), [5, 198]);
 }

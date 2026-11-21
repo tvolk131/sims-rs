@@ -134,6 +134,11 @@ pub struct Hot {
     pub tracks: BTreeMap<u32, Track>,
     /// Event names as written, in file order; lookups ignore case.
     pub events: Vec<(String, Event)>,
+    /// The IDs of the `[Patch]` and `[Track]` lines, in file order, but
+    /// for ID 0, which the original's handlers skip (0x57b377,
+    /// 0x57b6b2): the order it registers their objects in (see
+    /// [`crate::registry`]).
+    pub registered: Vec<u32>,
 }
 
 impl Hot {
@@ -185,8 +190,12 @@ impl Hot {
                     let Some(path) = fields.iter().find(|f| f.starts_with('"')) else {
                         return fail(number_of, "patch without a quoted path");
                     };
+                    let id = id()?;
+                    if id != 0 {
+                        hot.registered.push(id);
+                    }
                     hot.patches.insert(
-                        id()?,
+                        id,
                         Patch {
                             name: fields.get(1).unwrap_or(&"").to_string(),
                             path: path.trim_matches('"').to_owned(),
@@ -230,8 +239,12 @@ impl Hot {
                     let name = value.split(',').nth(1).unwrap_or_default().to_owned();
                     let mut fields = fields.into_iter().skip(2);
                     let mut next = || fields.next().expect("nine fields");
+                    let id = id()?;
+                    if id != 0 {
+                        hot.registered.push(id);
+                    }
                     hot.tracks.insert(
-                        id()?,
+                        id,
                         Track {
                             name,
                             volume: next(),
