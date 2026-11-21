@@ -338,3 +338,41 @@ fn a_person_with_no_chosen_clothes_still_wears_their_suit() {
     assert_eq!(outfit.parts[0], clothes.body);
     assert_eq!(&outfit.parts[1..], &defaults.parts[1..]);
 }
+
+#[test]
+fn mortimers_pie_head_matches_recorded_menu_poses() {
+    let Some(root) = install() else { return };
+    let house = root.join("UserData/Houses/House05.iff");
+    let assets = Assets::scan(&root).unwrap();
+    let people = residents(&root, &house).unwrap();
+    let mortimer = people.iter().find(|r| r.id == 21).unwrap();
+    let body = Body::load(&assets, &mortimer.skeleton, &mortimer.outfit).unwrap();
+
+    let cases = [
+        (
+            "choice2-a",
+            sims_people::pie_head::Look::from_menu([200, 198], Some([200, 123]), Some(0), 4),
+        ),
+        (
+            "talk-submenu",
+            sims_people::pie_head::Look::from_menu([400, 274], Some([400, 348]), Some(4), 6),
+        ),
+        (
+            "read-queued",
+            sims_people::pie_head::Look::from_menu([384, 250], Some([384, 324]), Some(2), 3),
+        ),
+        ("idle", sims_people::pie_head::Look::neutral()),
+    ];
+    for (name, look) in cases {
+        let canvas = sims_people::pie_head::draw_body(&body, [201, 201], look).unwrap();
+        let opaque = canvas.rgba.chunks(4).filter(|p| p[3] == 255).count();
+        assert!(
+            (1000..=4000).contains(&opaque),
+            "{name}: unexpected opaque pixel count {opaque}"
+        );
+        if let Some(out) = std::env::var_os("SIMS_PEOPLE_OUT") {
+            let path = PathBuf::from(out).join(format!("our-{name}.png"));
+            std::fs::write(path, canvas.png()).unwrap();
+        }
+    }
+}

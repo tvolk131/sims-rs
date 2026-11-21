@@ -1542,16 +1542,27 @@ fn the_pie_shows_the_selected_goths_head() {
     game.render();
     let menu = game.menu().expect("the menu stays open");
     assert_eq!(menu.person, selected);
-    let head = menu.head.as_ref().expect("the head is drawn");
-    assert_eq!([head.width, head.height], menu.face_size());
-    // The head fills much of the face, and is clear around it.
-    let opaque = head.rgba.chunks(4).filter(|p| p[3] == 255).count();
-    let area = (head.width * head.height) as usize;
-    assert!(
-        opaque > area / 5 && opaque < area * 4 / 5,
-        "{opaque} of {area}"
-    );
-    assert_eq!(head.rgba[3], 0);
+    let head_idle = menu.head.as_ref().expect("the head is drawn").clone();
+    assert_eq!([head_idle.width, head_idle.height], menu.face_size());
+    // Native pie head size (~1,750–2,000 opaque pixels in the 201×201 face),
+    // clear around the corners.
+    let opaque = head_idle.rgba.chunks(4).filter(|p| p[3] == 255).count();
+    assert!((1000..=4000).contains(&opaque), "opaque={opaque}");
+    assert_eq!(head_idle.rgba[3], 0);
+    // Moving the pointer onto a pie label turns and brightens the head.
+    let labels = menu.labels();
+    let first = labels[0].1;
+    let on_label = [first.x + first.width / 2, first.y + first.height / 2];
+    assert!(game.hover(on_label));
+    game.render();
+    let head_lit = game
+        .menu()
+        .expect("menu still open")
+        .head
+        .as_ref()
+        .expect("head re-rendered")
+        .clone();
+    assert_ne!(head_lit.rgba, head_idle.rgba);
     assert!(game.problems().is_empty(), "{:?}", game.problems());
 }
 

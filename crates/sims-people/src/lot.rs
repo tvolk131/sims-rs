@@ -502,7 +502,7 @@ fn expand_565([r, g, b, a]: [u8; 4]) -> [u8; 4] {
 /// [`People::posed`] shares with offscreen callers like the pie-menu
 /// portrait renderer) and without affecting untextured meshes such as the
 /// plumb bob.
-struct Packed565<'a, T: ?Sized>(&'a mut T);
+pub(crate) struct Packed565<'a, T: ?Sized>(pub(crate) &'a mut T);
 
 impl<T: Target + ?Sized> Target for Packed565<'_, T> {
     fn size(&self) -> (u32, u32) {
@@ -802,6 +802,24 @@ impl People {
         }
         self.clips = player.into_clips();
         (posed, problems)
+    }
+
+    /// Renders `person`'s pie-menu 3D head ([`crate::pie_head::draw_body`])
+    /// into an RGBA [`crate::raster::Canvas`] of `size` pixels looking as
+    /// `look` specifies. Call [`People::update`] first so the person's body
+    /// is loaded.
+    pub fn pie_head(
+        &self,
+        person: u16,
+        size: [u32; 2],
+        look: crate::pie_head::Look,
+    ) -> Result<crate::raster::Canvas, String> {
+        let loaded = self
+            .people
+            .get(&person)
+            .ok_or_else(|| format!("person {person} is not loaded"))?;
+        let (body, _) = loaded.body.as_ref().map_err(Clone::clone)?;
+        crate::pie_head::draw_body(body, size, look).map_err(|e| format!("person {person}: {e}"))
     }
 
     /// Draws every placed person on the camera's levels over a lot the lot

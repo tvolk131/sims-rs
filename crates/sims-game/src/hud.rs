@@ -534,8 +534,25 @@ impl Hud {
         self.pressed.release(uid);
     }
 
-    /// Moves the pointer; true if what it hovers changed.
+    /// The pointer's current position in canvas pixels, if inside the window.
+    pub fn pointer(&self) -> Option<[i32; 2]> {
+        self.controls.pointer
+    }
+
+    /// Whether a dialog message is loaded and will cover/close any open pie
+    /// menu on this frame (`Hud::draw`).
+    pub fn will_show_dialog(&self, size: [i32; 2]) -> bool {
+        self.message
+            .as_ref()
+            .and_then(|(m, _)| dialog::layout(size, m, &self.art))
+            .is_some()
+    }
+
+    /// Moves the pointer; true if what it hovers changed (or moved while a
+    /// pie menu is open so the Sim's 3D head follows the pointer).
     pub fn hover(&mut self, point: [i32; 2]) -> bool {
+        let moved_for_pie =
+            self.menu.is_some() && self.dialog.is_none() && self.controls.pointer != Some(point);
         let button = |pointer: Option<[i32; 2]>| {
             let layout = self.dialog.as_ref()?;
             let [x, y] = pointer?;
@@ -552,12 +569,13 @@ impl Hud {
             entry(self.controls.pointer),
         );
         self.controls.pointer = Some(point);
-        (
-            hud::hovered(&self.items, self.controls.pointer),
-            hud::lit_relation(&self.items, self.controls.pointer),
-            button(self.controls.pointer),
-            entry(self.controls.pointer),
-        ) != before
+        moved_for_pie
+            || (
+                hud::hovered(&self.items, self.controls.pointer),
+                hud::lit_relation(&self.items, self.controls.pointer),
+                button(self.controls.pointer),
+                entry(self.controls.pointer),
+            ) != before
     }
 
     /// The pointer left the window: no button is hovered and no name

@@ -546,8 +546,10 @@ impl Pie {
         }
     }
 
-    /// Draws the menus of `layouts` with the head in each middle, the
-    /// pointer at `pointer` and a mouse button held when `pressed`.
+    /// Draws the menus of `layouts` with the head in the first menu's middle
+    /// (matching `0x462290`: while a submenu is open the 3D head stays at the
+    /// parent menu's center and is not duplicated onto the submenu), the
+    /// pointer at `pointer`, and a mouse button held when `pressed`.
     pub fn draw(
         frame: &mut Frame,
         art: &Art,
@@ -562,7 +564,14 @@ impl Pie {
             } else {
                 None
             };
-            draw(frame, art, layout, head, highlighted, pressed);
+            draw(
+                frame,
+                art,
+                layout,
+                head.filter(|_| n == 0),
+                highlighted,
+                pressed,
+            );
         }
     }
 }
@@ -741,6 +750,43 @@ mod tests {
         assert_eq!(pie.clone().press(&layouts, [0, 0]), Pressed::Closed);
         assert_eq!(pie.press(&layouts, layouts[1].center), Pressed::Back);
         assert_eq!(pie.submenu, None);
+    }
+
+    #[test]
+    fn submenu_draws_the_head_only_once_on_the_parent_menu() {
+        let art = art();
+        // Four entries put "Ask" to the right so the submenu's labels do not
+        // cover the parent's center.
+        let mut pie = Pie::new(&["Talk", "Ask/Dance", "Ask/Out", "Hug"], [400, 300]);
+        let layouts = pie.layout([800, 600], &art).unwrap();
+        let ask = layouts[0].labels[1].rect;
+        assert!(matches!(
+            pie.press(&layouts, [ask.x + 1, ask.y + 1]),
+            Pressed::Opened { .. }
+        ));
+        let layouts = pie.layout([800, 600], &art).unwrap();
+        assert_eq!(layouts.len(), 2);
+        // A 201x201 head with a single opaque red marker pixel at (100, 120),
+        // below the submenu's title box.
+        let mut rgba = vec![0u8; 201 * 201 * 4];
+        let mark = (120 * 201 + 100) * 4;
+        rgba[mark..mark + 4].copy_from_slice(&[255, 0, 0, 255]);
+        let head = Image {
+            width: 201,
+            height: 201,
+            rgba,
+        };
+        let mut frame = Frame::new(800, 600, [0; 3]);
+        Pie::draw(&mut frame, &art, &layouts, Some(&head), None, false);
+        assert_eq!(
+            frame.pixel(layouts[0].face.x + 100, layouts[0].face.y + 120),
+            Some([255, 0, 0])
+        );
+        // The submenu's own face is NOT stamped with a second copy of the head.
+        assert_eq!(
+            frame.pixel(layouts[1].face.x + 100, layouts[1].face.y + 120),
+            Some([0, 0, 0])
+        );
     }
 
     #[test]

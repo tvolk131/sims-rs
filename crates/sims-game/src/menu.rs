@@ -413,9 +413,13 @@ pub struct Menu {
     /// Whether the left mouse button is held down over the pie, which
     /// draws the highlighted label in cyan (0x5eb04c).
     held: bool,
-    /// The head of the Sim the menu is for, drawn in each menu's middle
-    /// (`People::head`), if it was rendered.
+    /// The head of the Sim the menu is for, drawn in the first menu's middle
+    /// (`People::head_looking`), if it was rendered.
     pub head: Option<Image>,
+    /// The main menu's pie-head look frozen when a submenu opened (`0x462106`,
+    /// `0x462290` reads highlighted/angle/distance from the parent menu while
+    /// a submenu is active).
+    submenu_look: Option<sims_people::pie_head::Look>,
 }
 
 /// What a left release on an open [`Menu`] did (0x5eb433).
@@ -478,6 +482,7 @@ impl Menu {
             moved: false,
             held: true,
             head: None,
+            submenu_look: None,
         };
         menu.layout(art, size);
         menu.moved = menu.layouts.first().is_some_and(|l| l.moved);
@@ -558,6 +563,7 @@ impl Menu {
             self.sticky = true;
             return Release::Settled;
         }
+        let opening_look = (self.layouts.len() == 1).then(|| self.head_look(Some(point)));
         match self.pie.press(&self.layouts, point) {
             Pressed::Chose(choice) => Release::Chose(choice),
             pressed @ (Pressed::Opened { .. } | Pressed::Back) => {
@@ -565,9 +571,11 @@ impl Menu {
                 self.layout(art, self.size);
                 match pressed {
                     Pressed::Opened { .. } => {
+                        self.submenu_look = opening_look;
                         self.pointer = self.layouts.last().map(|l| l.center);
                     }
                     Pressed::Back => {
+                        self.submenu_look = None;
                         // Backing out restores the parent at its requested
                         // position (0x48db38) and re-runs placement
                         // (0x5ebab2), which warps the pointer back to the
@@ -625,6 +633,30 @@ impl Menu {
             .first()
             .map_or(pie::FACE_SIZE, |l| [l.face.width, l.face.height]);
         face.map(|n| u32::try_from(n).unwrap_or(0))
+    }
+
+    /// The center of the currently active menu (the submenu if one is open,
+    /// otherwise the main menu), where the dark radial backdrop sits
+    /// (`0x46216e` → `0x4ac8ff`).
+    pub fn active_center(&self) -> Option<[i32; 2]> {
+        self.layouts.last().map(|l| l.center)
+    }
+
+    /// The pie head's [`sims_people::pie_head::Look`] for `pointer`
+    /// (`0x462290`). While a submenu is open, the original keeps reading the
+    /// frozen parent menu's highlighted entry and pointer vector; otherwise it
+    /// tracks `pointer` live against the main menu.
+    pub fn head_look(&self, pointer: Option<[i32; 2]>) -> sims_people::pie_head::Look {
+        if self.layouts.len() > 1 {
+            return self
+                .submenu_look
+                .unwrap_or_else(sims_people::pie_head::Look::neutral);
+        }
+        let Some(main) = self.layouts.first() else {
+            return sims_people::pie_head::Look::neutral();
+        };
+        let highlighted = pointer.and_then(|p| pie::hit(main, p));
+        sims_people::pie_head::Look::from_menu(main.center, pointer, highlighted, main.labels.len())
     }
 
     /// Draws the menus as last laid out, with [`Menu::head`] over the face
@@ -888,6 +920,38 @@ mod tests {
         assert!(!menu.will_choose([260, 204]));
         assert_eq!(menu.release(&art, [260, 204]), Release::Settled);
         assert_eq!(menu.layouts.len(), 1);
+    }
+
+    #[test]
+    fn head_look_tracks_pointer_and_freezes_parent_direction_in_submenu() {
+        let art = art();
+        let mut menu = Menu::new(1, 2, named(&STUDIES), [400, 300], &art, [800, 600]);
+        assert_eq!(menu.release(&art, [400, 300]), Release::Settled);
+        // Inside the dead zone: idle ambient (0.8), no compass direction.
+        let idle = menu.head_look(Some([400, 300]));
+        assert_eq!(idle.direction, None);
+        assert_eq!(idle.ambient(), sims_people::pie_head::AMBIENT_IDLE);
+
+        // Hovering "Study" (bottom entry of 2 -> compass direction 4):
+        let study = centre(menu.layouts[0].labels[1].rect);
+        let on_study = menu.head_look(Some(study));
+        assert_eq!(on_study.direction, Some(4));
+        assert_eq!(
+            on_study.ambient(),
+            sims_people::pie_head::AMBIENT_HIGHLIGHTED
+        );
+
+        // Opening the submenu freezes the parent look even as pointer moves to submenu center.
+        assert_eq!(menu.release(&art, study), Release::Stays);
+        assert_eq!(menu.layouts.len(), 2);
+        let sub_center = menu.layouts[1].center;
+        assert_eq!(menu.active_center(), Some(sub_center));
+        assert_eq!(menu.head_look(Some(sub_center)), on_study);
+
+        // Going back resumes live tracking on the parent menu.
+        assert_eq!(menu.release(&art, sub_center), Release::Stays);
+        assert_eq!(menu.layouts.len(), 1);
+        assert_eq!(menu.head_look(Some([400, 300])).direction, None);
     }
 
     #[test]

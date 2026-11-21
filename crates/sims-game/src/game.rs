@@ -613,22 +613,37 @@ impl Game {
             &self.view.camera,
             &mut self.canvas,
         );
-        // The pie menu shows the head of the Sim it is for, as posed now.
-        if let Some(menu) = &mut self.hud.menu {
-            menu.head = match self.people.head(world, menu.person, menu.face_size()) {
-                Ok(head) => Some(head),
-                Err(e) => {
-                    self.people
-                        .note(vec![format!("the pie menu has no head: {e}")]);
-                    None
-                }
-            };
-        }
         let status = self.status();
         // A dialog the lot waits on is in the lot as the tick left it when
-        // it was shown.
+        // it was shown. Read it before the pie menu so a newly opened dialog
+        // suppresses the pie's dark backdrop and head on the frame it closes
+        // the menu.
         let dialogs = self.lot.asking().map_or(world, |a| &a.world);
         self.hud.read_dialog(dialogs, &self.assets);
+        // The pie menu shades the house viewport behind it (0x4a94ec →
+        // 0x4ac8ff) and renders the Sim's 3D head tracking the pointer
+        // (0x4a953e → 0x462290).
+        if !self.hud.will_show_dialog(self.view.size) {
+            let pointer = self.hud.pointer();
+            if let Some(menu) = &mut self.hud.menu {
+                if let Some(center) = menu.active_center() {
+                    crate::people::shade_pie_face(&mut self.canvas, center, viewport);
+                }
+                let look = menu.head_look(pointer);
+                menu.head =
+                    match self
+                        .people
+                        .head_looking(world, menu.person, menu.face_size(), look)
+                    {
+                        Ok(head) => Some(head),
+                        Err(e) => {
+                            self.people
+                                .note(vec![format!("the pie menu has no head: {e}")]);
+                            None
+                        }
+                    };
+            }
+        }
         self.hud.sync_clock_blink(world, self.clock_us);
         self.blink_dirty = false;
         self.hud.draw(
