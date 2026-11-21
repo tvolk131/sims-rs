@@ -2678,7 +2678,8 @@ fn the_recorded_snack_order_with_bob_shots_replayed_in_the_window_matches_the_re
     let last_result = |game: &Game| game.lot().world().objects[&mortimer].last_result;
     // The first two pointer moves list nothing. The second move's command
     // ran from 90 to 93, and the original listed nothing at the frame
-    // after 92, so the replay moves the pointer before that frame.
+    // after 92. The replay moves the pointer at 91, before that frame;
+    // the recording does not say at which of those updates it moved.
     run_to(&mut game, &schedule, 85);
     game.hover(recorded([176, 222]));
     assert_eq!(game.listed(), None);
@@ -2726,10 +2727,9 @@ fn the_recorded_snack_order_with_bob_shots_replayed_in_the_window_matches_the_re
     run_to(&mut game, &schedule, 173);
     assert!(last_result(&game));
     run_to(&mut game, &schedule, 223);
-    let hash = |game: &Game| game.lot().world().hash();
-    let before = hash(&game);
+    // The check's effects here are not told apart from the order's; the
+    // Read and cancel tests pin them.
     game.press(snack);
-    assert_ne!(hash(&game), before, "choosing the entry checked it again");
     assert!(game.menu().is_none());
     game.hover(recorded([200, 123]));
     // Taken at once, as recorded at 224.

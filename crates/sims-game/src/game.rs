@@ -613,16 +613,27 @@ impl Game {
             // button-up handler (0x5eb433) tells the house view about the
             // entry under the pointer as chosen (0x1ac with 1), and the
             // house view runs its check (0x48df28) as it does when the
-            // pointer reaches the entry.
+            // pointer reaches the entry. The original chooses at the
+            // button's release; the window chooses at the press, as it
+            // did before this check was ported.
             if let Some(entry) = self.hud.menu.as_ref().and_then(|m| m.highlighted(point)) {
                 self.check_entry(entry);
             }
+            // A failed check's note stays in front of what the choice
+            // says.
+            let failed = self.note.take();
             // The menu, whose entries a choice is an index into.
             let menu = self.hud.menu.clone();
             let outcome = match self.hud.press(point) {
                 Some(command) => self.command(command, menu.as_ref()),
                 None => Outcome::redraw(),
             };
+            if let Some(failed) = failed {
+                self.note = Some(match self.note.take() {
+                    Some(note) => format!("{failed} {note}"),
+                    None => failed,
+                });
+            }
             let sounds = self.hud.take_sounds();
             self.keep_sounds(sounds);
             return outcome;

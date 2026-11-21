@@ -98,9 +98,11 @@ one.
 - **Under the still pointer.** After a choice the pointer stays on the
   pie entry, and the original lists pies there while the lot runs:
   - in cancel, after 256: for 257–259 the original's word 50 is 0
-    where ours is 1, and its last result 1 where ours is 0. Settled:
-    this was the release's second check of the entry, not a listing
-    (`20261120-choosing-a-pie-entry-checks-it-again.md`);
+    where ours is 1, and its last result 1 where ours is 0. The
+    release's second check of the entry accounts for these
+    (`20261120-choosing-a-pie-entry-checks-it-again.md`, from the
+    snack-bob recording's watch); a listing at the same updates is not
+    ruled out;
   - in Sit/Read, at 261 (a failed check) and at 291 (word 50 goes to 1
     until 560);
   - in the snack order, at 622, which the write watch shows was the
@@ -109,7 +111,7 @@ one.
   Ours lists nothing. Our bob is drawn 10 to 30 pixels below and right
   of the pointer in the snack order and in Sit/Read. In cancel at 257
   it is about 190 pixels away, so the bob's geometry could not explain
-  that difference, and it turned out not to be a listing. Track 2's queued snack recording (screenshots during
+  that difference, which the release's check accounts for. Track 2's queued snack recording (screenshots during
   the wait) will also keep the word-50 write watch. The watch's saved
   arguments name the object listed, and the screenshot shows where it
   is drawn.

@@ -31,7 +31,16 @@ Read note left this open
 - **Ported.** `Game::press` on an open pie checks the entry under the
   point (`Game::check_entry`, the same check the hover runs) before it
   chooses it. The check's sounds are kept, and the action it leaves is
-  the one chosen.
+  the one chosen. If our check stops with an error, its note is kept in
+  front of what the choice says.
+- **Open: press or release.** The original chooses an entry, and checks
+  it, at the button's release; nothing ran at the mousedown. The window
+  chooses at the press, as it did before this change, so a press on an
+  entry followed by a drag off the pie and a release chooses the entry
+  in ours and not, most likely, in the original. The replays give the
+  press at the update the release ended in, so they do not show this.
+  Choosing at the release would change how the window takes clicks for
+  every pie, and is left for a later change.
 
 ## What it changes
 
@@ -40,8 +49,11 @@ Read note left this open
   second check leaves in his frame storage with his frames ending at
   word 68. The Read test pins them. The Read note's open item is
   settled.
-- **Cancel.** The differences at 257–259 (his word 50 and last result)
-  were the release's check, not a listing under the still pointer. The
+- **Cancel.** The release's check accounts for the differences at
+  257–259 (his word 50 and last result), which were taken for a listing
+  under the still pointer. The write watch that shows the release check
+  is the snack-bob recording's; the cancel recording does not rule out
+  a listing at the same updates whose effects the check covers. The
   cancel replay now equals the recording in every word the comparison
   checks, after every update from 1 to 1300 (scratch tool). The cancel
   test pins word 50 and the last result at 257.
@@ -60,8 +72,9 @@ test is
 - **When.** Each input is given at the update the watches show it acted
   in:
   - pointer moves at 85 and 91 list nothing. The second move's command
-    ran from 90 to 93; the original listed nothing at the frame after
-    92, so the replay moves before it;
+    ran from 90 to 93, and the original listed nothing at the frame
+    after 92; the replay moves at 91, before that frame, which the
+    recording does not pin to one update;
   - the move onto the fridge at 122 lists its pie (Mortimer's last
     result goes to 0 at 123);
   - the press at 152 lists it again: Have A Snack, Have Quick
