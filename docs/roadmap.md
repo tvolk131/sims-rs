@@ -44,12 +44,31 @@ events, and what it asks for after them) come first.
    pie listing (#258; the write was never captured). All three random
    streams match through update 4154 (#258). A replay with a frame
    schedule fitted to the recording matches the lot's and the C runtime's streams at sampled updates
-   through 24715 (#264, #263, #273) and stops at update 24716, when
-   person 12 runs Go To Routing Slot after taking itself off the lot;
-   the default strict
-   boot still runs all 43,200 ticks.
-   Checking the rest against the recording is what remains. See
-   Progress.
+   through 24715 (#264, #263, #273). #304
+   (`docs/decisions/20261120-a-step-runs-both-ways-while-a-refresh-is-pending.md`)
+   takes the fitted-frame run through the whole 43,200-tick day (running
+   primitives both ways while an animator refresh is pending, porting
+   dialog portrait builds with `World::portraits` at snapshot format 31,
+   strict dialog formatter passes `0x44bf1a`, `0x46feac` string-table
+   loading, and `--view-centre` / save format 3): the C runtime stream
+   matches at every update through 43,200 and the lot stream through
+   36,717. #310 (`docs/decisions/20261121-special-effect-message-0x10c-resets-speed.md`)
+   ports Special Effect message `0x10c` resetting speed to `NORMAL` (760),
+   closing the `globals[16]` divergence across updates 39,610–40,494.
+   #317 (`docs/decisions/20261121-find-location-mode-5-uses-the-first-coordinate-first.md`)
+   fixes the swapped `x`/`y` axes in Find Location For mode 5, pinning
+   the raccoon wander target (`obj 37`) at `[648, 312, 1]` at fitted
+   replay update 41,446 (matching the recording's update 41,445
+   coordinates) and moving the default-frames 43,200 pin (`--answers 3,3
+   --view-centre 32,32`) to
+   `c3b7a6b9a8180d9e5e6463ba4e3638313cdec8d52bdaae28918bb05ce987e915`
+   (was `00fbe950` in #304). Open: screen-centre pick (`0x4a7b58`,
+   `0x434891`, `0x43491c`), no-tile portrait branch (`0x4e9706`,
+   `0x4e938c`), full-state comparison of the Goth day past 3350 against
+   a frame-watched recording (#304), and verifying the inferred
+   `cTSLiveModePIP` paint refresh (`Refresh(0)`) near update 40,317 as
+   the cause of that 1-update lag.
+   See Progress.
 3. **1000 ticks on three more base-game houses**, picked for code the
    Goths do not reach (for example the Newbies and a family with
    children). Done (#221, #223, 2026-11-16): the Newbies, the Pleasants and the
@@ -61,12 +80,14 @@ events, and what it asks for after them) come first.
    `Interpreter::pie_menu`, `Interpreter::pick` and `Interpreter::order`.
    These also check the integration track's game.
 5. **All 49 primitives**: port the remaining ones as recordings reach
-   them, or with targeted scenarios. Make New Character (19), the last
-   one the base game's trees use outside the tutorial, is ported for a
-   person (#243). UI Effect (34) is used only by the Tutorial and the
-   Help System and is not ported. Also open: Make New Character's
-   remaining modes and the failing modes of the ported primitives. See
-   Progress.
+   them, or with targeted scenarios. Make New Character (19) now covers
+   all remaining executable-defined modes (#243, #308: negative age,
+   zero-count cleanup, and pet modes); Manage Inventory (51) covers all
+   operations (#302); Find Location For (16) covers all modes (#313,
+   #317); Create New Object Instance (42) covers all 15 modes and flags
+   (#315). UI Effect (34) is used only by the Tutorial and the Help
+   System and is not ported. Also open: remaining failing modes of the
+   other ported primitives. See Progress.
 6. **One expansion-pack lot**, after steps 1 to 5. The plan (track 4, 2026-11-18): House 69 (Unleashed, the
    Charming family: one adult and one dog). The reference for the first
    6a comparison is House 69 in the shipped `UserData`; the
@@ -148,32 +169,52 @@ events, and what it asks for after them) come first.
    object now erases the other objects' first relationship row toward
    it (0x441223 → 0x464fa2); Sol reports that the Goth recordings show
    the original erasing the same rows for objects 26, 24 and 262. That
-   moved the strict pins: `TICK_43200` is now
-   b67d0c13 (was d26a6a16), and `TICK_9906`, `TICK_20186`,
+   moved the strict pins at #287: `TICK_43200` moved from d26a6a16 to
+   b67d0c13 (later `00fbe950` at format 31 in #304, and `c3b7a6b9` in
+   #317), and `TICK_9906`, `TICK_20186`,
    `TICK_31478`, `NEWBIE_1802` and `NEWBIE_4052` moved with it. The
    coordinator's gate now boots UD2 from run 2
    (`SIMS_UD2_AFTER=cache/ud2-import-20261119/after-run2`).
-   Next (track 4): task 2, UD1 House 69 to update 1,000, is open as
-   #291. Track 4 reported these open at update 402: the 0x8000 bit on
-   the frame tree of GUID 0x2c555ea3 objects, global 12 = 17 at
-   update 3 during the Help dialog, object 2's last result, and object
-   274's never-written word (a heap leftover). At the time of #287,
-   track 4 had ported locally the frame arena's leftover tree bit
-   0x8000 (0x4746e4, read by dispatch at 0x474b99); the fix for global
-   12 taking the clicked dialog button's bitmap (0x4764fe) was in
-   progress. Then 6b part E, the five
-   pools, as a Sol port (open as #293).
+   Done for 6a, task 2 (#291): UserData1's House 69 runs 1,000 updates
+   against the original's recording (`house69-ud1-ticks-20261120`),
+   replaying the frame-arena `0x8000` tree bits (`0x4746e4`) and dialog
+   buttons (`0x46d9c4`, global 12).
+   Done for 6b part E (#293,
+   `docs/decisions/20261120-neighborhood-open-replays-five-pools.md`):
+   opening a neighborhood fills its five houseless pools in memory
+   (`0x42c1ea`, `0x42d193`, `0x42d5f2`, `0x42a98f`, `0x42b0fd`), and
+   House 69 then boots to `IMPORTED_69` matching entry CRT
+   `3,739,951,803`. #305
+   (`docs/decisions/20261121-avatar-search-paths-and-animation-ndx.md`)
+   closes #293's follow-up by aligning `People::load` and `pool_skeletons`
+   with the original's startup avatar search paths (`GameData/Skins`
+   eager `.cmx`/`.bcf` and `Animation.ndx`, lenient FAR mounting) and
+   preserving leading BOM bytes in `sims_formats::strings::decode`.
+   #308 initialized `Dialogs::default().declined = -1` (`0x43f72d`),
+   updating the House 69 format-31 pins (`OLD_TOWN_69*`, `IMPORTED_69*`).
+   Open for 6a/6b: writing `Neighborhood.iff`, removing imported `.FAM`
+   files, pool people's exact files/looks/portraits, import preview
+   guard, unwritten frame words read as 0 rather than unknown, object
+   385's footprint, dialog release latch (`0x5e45e1`–`0x5e45ed`) and
+   live-window single-button dialog auto-answer (`0x436c76`) (#291),
+   loading `adult`/`child` skeletons on first use (`0x5a03cd`) and
+   checking celebrity sex by ordinal (`0x42c6d7`) / Townie specialty
+   order (`0x42ac96`–`0x42acc1`) (#293), and the remaining unverified
+   items below.
    **Unverified:** the fitted 401,120 draws and the absence of a
-   reseed (#287); which callback runs pools 4 and 5, when the rebuild
+   reseed (#287); the fitted CRT offsets and lot handoff (adult skeleton
+   warmth, indicator draws, and no cache clear in between), which
+   callback runs pools 4 and 5, when the rebuild
    before them runs, the 64 C runtime draws before the Townies whose
    caller is unknown, and the template scripts' draws on the game
-   stream (the pools decision); the lot information read's failure
+   stream (#293); the lot information read's failure
    branch (0x4e261f), taken to succeed (#281); the FAMh record fields' meanings; how the original
-   handles a truncated `Gtab`; the pet modes of Make New Character
-   (BHAV 4113); the writer's compaction and replacement against a
+   handles a truncated `Gtab`; the writer's compaction and replacement against a
    native save; the records the reload makes in a template
    neighborhood; the source of eight files in User00012–00047 with no
-   GUID mapping; when the scan reads the dog skeleton.
+   GUID mapping; the per-update global-12 poll given batched idle
+   updates (`0x46da70`–`0x46dac7`), the frame-arena `0x8000` tree bits
+   (recorded residue, not ported), and object 2's last result (#291).
 
 ### Progress
 
@@ -231,10 +272,15 @@ events, and what it asks for after them) come first.
   203–227 and Mortimer's word 50 at 644–800. A listing after update
   643, under a still pointer, sets that word (0x452382); which object was listed remains
   unverified (trial listings of the bob or the salesman close it).
-  New open item (#290): the window chooses a pie entry at the press,
-  the original at the release, so a press on an entry followed by a
-  drag off the pie orders the entry in ours and most likely not in
-  the original.
+  Done (#311,
+  `docs/decisions/20261121-pie-menu-chooses-on-release.md`): the window
+  now chooses pie entries on left-button release (`0x5eb3d1`,
+  `0x5eb433`), so pressing an entry and dragging off the pie (or out of
+  the window) before releasing orders nothing. (Left out: right-button
+  pie release `0x5eb4c0`, which remains camera drag, and pie window UI
+  sound cues.)
+  Track 2's harness also recognizes converted social interactions by
+  action UID in `expect-queued` (#256).
   Pick reach (track 1, in progress, #290): the original's sprite pick
   also tests a 3D rectangle (+0x170) for people and the bob. That
   rectangle is Direct3D's `GetClipStatus` result, which Wine 8.0 (the
@@ -291,10 +337,24 @@ events, and what it asks for after them) come first.
   unset native words. **Unverified:** whether the Roomies' recording reaches a water tile under an object with flag
   0x1000; it matches either way.
 - Step 5: Drop Onto (opcode 43, 0x44e96a, #212), Snap modes 0, 1 and 2
-  (0x454a4b, 0x454a1d, 0x4549d1, #214) and Find Location For mode 5,
-  which starts each search from a random walk (0x44b5a5, #218), are
-  ported. **Unverified:** no recording covers a Drop Onto, Snap modes 1
-  or 2, or Find Location For mode 5.
+  (0x454a4b, 0x454a1d, 0x4549d1, #214), Find Location For mode 5
+  (0x44b5a5, #218; swapped `x`/`y` axes fixed in #317, with fitted
+  replay update 41,446 matching `goth-day-20261115`'s update 41,445
+  wander target `[648, 312, 1]`), Find Location For mode 2
+  (0x44b484, #313, completing all modes of opcode 16 plus multi-tile
+  `Fits` refusal precedence `0x422ba9` and zero-inset footprint fast
+  path `0x433d8e`), Manage Inventory operations 1, 2, 5, 6 and 7+
+  (opcode 51, 0x4552f8, #302, including inventory-creation-before-zero-GUID
+  order `0x455386`; the interface inventory dirty flag `0x4ceceb` with
+  `0x4000000` remains unmodeled presentation), Make New Character negative age,
+  zero-count cleanup and pet modes (opcode 19, 0x44ae08, #308, plus
+  `0x43f72d` `Dialogs::default().declined = -1`), and Create New Object
+  Instance remaining modes `1`, `7`, `10..=14`, `>14` and flags
+  `0x02`/`0x40`/`0x08`/`0x20`/`0x80` plus factory-zero false branch
+  (opcode 42, 0x44e0c8, #315) are ported. **Unverified:** no recording
+  covers Drop Onto, Snap modes 1 or 2, Manage Inventory ops 1/2/5/6/7+,
+  Make New Character's negative age/cleanup/pet modes, Find Location For
+  mode 2, or Create New Object Instance's newly ported modes yet.
 - Step 5: Reach (opcode 47, #229, 0x45c9ba) plays a clip picked by the
   slot's height. When the operands request a move, Reach attempts it at
   event 0 or, if that event never arrives, at the end of the clip. Burn
@@ -318,7 +378,8 @@ events, and what it asks for after them) come first.
   unsupported until a native trace and a model of that access exist
   (#249). Next: Make New Character's suit order and body strings 1 and
   2 (which head and body the draws pick), its name (Dialog kind 3),
-  pets and a negative age, then House09's coverage; UI Effect (34,
+  and House09's coverage (negative age, zero-count cleanup, and pet
+  modes are now ported in #308); UI Effect (34,
   Tutorial and Help System only); removing an ordinary one-tile object
   that holds another, removed at once or reset as it is deleted with
   no Reset tree, before the load has worked out the lot's rooms
@@ -420,12 +481,23 @@ events, and what it asks for after them) come first.
   #263), so the replay passes 16112; Generic Sims Call routine 6's family-removal effects are ported (its
   Escape-key side effect in the original is unverified), and Remove
   Object Instance saves a removed person into its word-31 record
-  (#273). Next: update 24716, where the fitted-frame replay stops when
-  person 12 runs Go To Routing Slot after taking itself off the lot;
-  the draw-dependent take-off refresh (0x58da12) is still open (the
-  default strict boot runs all 43,200 ticks) (track 3), then keep
-  verifying the day against track 2's Goth day recording; checking the
-  night needs more recording.
+  (#273). #304
+  (`docs/decisions/20261120-a-step-runs-both-ways-while-a-refresh-is-pending.md`)
+  takes the fitted-frame replay past 24716 and through the full 43,200
+  updates (running primitives both ways while an animator refresh is
+  pending, porting dialog portrait builds at snapshot format 31, and
+  adding `--view-centre`): CRT matches at every update through 43,200
+  and the lot stream matches through 36,717 (with ±1-update frame-drift
+  shifts at 11 later updates, matching again at 43,200). #310 closes
+  the `globals[16]` speed divergence at updates 39,610–40,494
+  (`0x10c`), and #317 fixes Find Location For mode 5's swapped axes,
+  asserting `obj 37`'s wander target `[648, 312, 1]` at fitted replay
+  update 41,446 (matching the recording's update 41,445) and moving the
+  default-frames 43,200 pin to `c3b7a6b9`. Next (track 3): screen-centre
+  pick (`0x4a7b58`, `0x434891`, `0x43491c`), no-tile portrait branch
+  (`0x4e9706`, `0x4e938c`), full-state comparison past 3350 against a
+  frame-watched recording, and verifying the inferred `cTSLiveModePIP`
+  paint refresh near 40,317 as the explanation for the 1-update lag.
   `placement::on_lot` still uses a
   fixed 64-tile bound where the original tests the lot's size
   (0x422632). Also open: the
@@ -2356,9 +2428,9 @@ Progress:
   whole-frame score stays around 1,400 for every shift). Next, test
   signed shifts in more frames, including two scrolls at one tick, or
   read where the original rasterizes a person's mesh.
-- Next: the edge-on diagonal strip; also a few cut-wall trims near the
-  stairs that still differ in the night shot, and the light level's
-  fade.
+- Next: a few cut-wall trims near the stairs that still differ in the
+  night shot, and the light level's fade. (The marked edge-on diagonal
+  strip is now ported in #297.)
 - **Done: the screenshot ratchet** (#289, approved by the maintainer
   2026-11-20, `docs/decisions/20261120-screenshot-ratchet.md`).
   `crates/sims-game/tests/ratchet.rs` boots the Goth house once, draws
@@ -2390,10 +2462,12 @@ Progress:
     The three 8:16 scenes with people pixels agree at 0.74% to 1.60%,
     largely because the Sims stand and pose differently. The night
     scene leaves the house out and has no people score.
-  - Differences the ratchet records, none fixed: tree, bush and hedge
-    edges at far zoom; the road's dashes at rotation 1; the wall stubs
-    and a counter at near zoom, walls down; and at night the original
-    draws the void off the lot black where ours stays grey.
+  - Differences the ratchet originally recorded: tree, bush and hedge
+    edges at far zoom (fixed in #309), cut doorway wall stubs (fixed in
+    #314), night off-lot void colour (fixed in #306 — `0x1a1a1a`
+    charcoal, not pure black), and the panel clock/friends items (fixed
+    in #312); still open: the road's dashes at rotation 1 and a counter
+    at near zoom, walls down.
   - Next: split `surface` by recording which pass drew each pixel
     (`id_at` cannot tell walls from floors or grass, or separate
     lighting); and a capture of the original that replays our run, so
@@ -2471,8 +2545,8 @@ Progress:
   56.2% to 90.4% exact. Most misses are one room the original lit
   brighter (the shots are from later in the morning) and the Sims; an
   edge-on diagonal wall's texels also differ.
-- Read, not ported: the original's strip on a marked edge-on diagonal;
-  no screenshot shows one.
+- Done (was read, not ported): the original's strip on a marked edge-on
+  diagonal (ported in #297; see below).
 - Done: depth in the original's own values for grass, floors, walls,
   trims and objects, checked against the game's depth buffer in the tested views (99.1%
   medium, 99.7% far, 97.2% at rotation 3; cut-wall trims since #262
@@ -2529,8 +2603,38 @@ Progress:
 - Done: a split floor's halves are cut straight along the corners' row
   or half a tile in, as the original's clip rectangle cuts them; the
   dashed row along a porch's diagonal edge is gone.
-- Next: a screenshot with a marked edge-on diagonal (a House02 capture
-  is in progress).
+- Done: marked edge-on diagonal strip (#297,
+  `docs/decisions/20261120-edge-on-strip-ported.md`): pattern 252 in
+  shape 9, lined up top-left and lifted as the original offsets it
+  (`0x53eb6d`, `0x4c7fdb`).
+- Done: cutaway masks kept from the zoom they were built at (#301,
+  `docs/decisions/20261120-kept-cutaway-masks.md`, `0x468203`,
+  `0x4ab992`), forwarded into `sims-game`'s `View` via
+  `Update::masks_rebuilt`.
+- Done: off-lot void colour follows live globals 4 (`time_of_day`) and
+  10 (`house`, with `0x14148c` for house 99 and `0x1a1a1a` at night,
+  #306, `docs/decisions/20261121-off-lot-void-colour.md`, `0x4aa9bd`,
+  `0x4aaa26`), lifting `night-far-r0-cut-2153` `frame` 88.48% → 98.00%
+  and `surface` 88.41% → 99.78%.
+- Done: SPR2 sprite alpha blending uses the original's 32×32×32 5-5-5
+  lookup table (`0x6e5eac`, `0x49a315..0x49a41c`, `0x4bbab8`, #309,
+  `docs/decisions/20261121-alpha-blend-table.md`), lifting `objects`
+  across all 8 ratchet scenes to 94.39%–99.97%.
+- Done: cut doorway wall stubs skipped (`0x53e9ce..0x53ea2b`) and
+  mid-run wall ends capped (`0x53de05..0x53e77c`, #314,
+  `docs/decisions/20261121-cut-door-walls-and-mid-run-caps.md`),
+  lifting `surface` across all 8 ratchet scenes to 99.32%–99.78% (and
+  combined with #312's panel fixes, 6 of 8 scenes are now 99.00%–99.54%
+  `frame`, with the remaining two at 98.37% and 98.32%).
+- Next: 3D people rendering fidelity (`people` 0.74%–17.16% in the
+  ratchet); corner kitchen counter at near zoom walls down
+  (`near-r3-down-0816`, `objects` 94.46%); road dashes at rotation 1
+  (`far-r1-cut-0816`); House02 flower beds drawing as grass; far rows
+  101–111 strip colour; pie-head camera/light/size comparison;
+  unmodeled cutaway mask triggers (`0x85` message senders; rooms with
+  `+0x34 == 0`, #301); unmodeled off-screen clear override
+  (`view+0x17c`/`+0x182`) and 15-bit 5-5-5 display path (`0x49f087`,
+  #306).
 
 ## Track: sound (`crates/sims-audio`)
 
@@ -2597,11 +2701,10 @@ stop-sounds events.
   track's `args` field says (0x57db01). 2 events of kinds not ported
   remain, 103 and 104, which are debug commands.
 - **Done: the camera move** (33). A camera move places every sound
-  track again (0x574157, #245). **Unverified:** which view moves send
-  kind 33 in the original (five senders, not all read); whether
-  anything sends it when the hour changes; whether the original's older
-  notes follow its one track object (here each keeps its own thread's
-  levels).
+  track again (0x574157, #245). Hour-change kind 33 (`0x46d4d3` →
+  `0x4f66bc`) is now ported in #307 and single-voice track-object
+  routing in #318. **Unverified:** which other view moves send kind 33
+  in the original (five senders, not all read).
 - **Done: a running track played again** (#280,
   `docs/decisions/20261120-a-running-track-played-again-is-refreshed.md`).
   As in the original, a track runs one thread at most. A replay
@@ -2614,12 +2717,12 @@ stop-sounds events.
   track's wait deadline to now and puts it last for the next update
   (0x57dc63, 0x57dc9a); `Player::run` snapshots the tracks not held
   when a block starts (0x57cf8f to 0x57cfda); an object going places a
-  track others still play again (0x574688 → 0x5746d9). Not ported:
-  the group-off return (0x57d969 to 0x57d9a5), and `target` across a
-  kill and a start, which names the thread here and the track object
-  in the original (0x57e023 to 0x57e028). **Unverified:** the run-on
-  past `end`; ducking across a restart; the same-update timing of a
-  self-restart by `play_trk`.
+  track others still play again (0x574688 → 0x5746d9). (Group-off
+  start rejection `0x57d969..0x57d9a5` is now ported in #307, and
+  track-object `target` across a kill and a start `0x57e023..0x57e028`
+  in #318.) **Unverified:** live verification of run-on past `end`;
+  ducking across a restart; the same-update timing of a self-restart by
+  `play_trk`.
 - **Done: two of #280's three review follow-ups.** A camera move
   forgets what killed tracks kept once, not once per track it places
   (0x5746d9, #292; same sounds, same order). The unpause lets go of
@@ -2637,20 +2740,41 @@ stop-sounds events.
   files within one directory, and of the download directories (here,
   by name); the station patch numbers (the original takes descending
   256-ID batches from 0x400000ff).
+- **Done: third #280 follow-up (#299).** Tracks, patches, track data
+  and hit lists take the last registration across modules in one
+  registry (`0x573312`, `0x57ce70`, `0x57d261`); a kill and replay from
+  another module keeps the track object's own descriptor (track 6403).
+  **Unverified:** download ordering among themselves, whether a voice
+  still plays a patch destroyed while queued (`0x57ff7e`), and station
+  patch ID collisions (none exist in the install). **Not ported:**
+  kind 53's patch slot (`0x57fcd2`), and kind 1 cleanup / kind 30
+  placement for patch objects.
+- **Done: kind 25, volume-nudge countdown, and day/night loop (#307,**
+  `docs/decisions/20261121-kind-25-volume-nudge-and-day-night-loop.md`
+  **).** Kind 25 (`SET_ACTIVE`, `0x573c64`, confirmed not sent at
+  startup — only on `WM_ACTIVATEAPP` via `0x4f7608`), the `+0x114`
+  100-update volume-nudge countdown (`0x573019`, `0x574701`), the day
+  and night loop (`0x57492a`, `0x574978`: `nite_loop` / `BeachLoop` /
+  Downtown skip), `0x575155` (`MainMusicLoop` let-go), group-off start
+  rejection (`0x57d969..0x57d9a5`), hour-change kind 33 (`0x46d4d3` →
+  `0x4f66bc`), and `sims-game` live-mode entry and pause/unpause
+  forwarding (`0x4ce6d2`, `0x4ce5c5`, `0x4ce5d9`).
+- **Done: `end` / `return` while a note plays fades out and runs on
+  (#318,**
+  `docs/decisions/20261121-end-while-a-note-plays-fades-and-runs-on.md`
+  **).** `0x57e3ee` → `0x57edc8` → `0x57dca3` fades `EXTVOL` to 0 at
+  speed 100, sets `kill_after_fade`, and continues at `next` in the same
+  update (`0x57d8b3`, run-on still awaits live verification against a
+  recording). Removed `Player::ended`, added persistent stopped-track
+  register banks (`Player::stopped`) and single-voice `Target::Track`
+  routing.
 - **Next:**
-  - The third #280 follow-up, in progress: a kill and replay from
-    another module before the track's turn keeps the track object's
-    own descriptor (0x573312, 0x57db7a). The install has a real
-    collision at track 6403.
-  - The original's `end` while a note plays: fade, keep running, and
-    the run-on past `end` once it is confirmed at run time (#280).
-  - Kind 25, which sets the sound-on flag; with it set, kind 33 writes
-    the volume minus one, or 1 when the volume is zero (and whether
-    kind 25 is sent at startup), and the day and night loop
-    that kind 33 picks (0x574978).
   - Tracks and fades step once a block (64 frames, about 2.9 ms); the
-    original's sound manager steps them once a millisecond (0x57cf37).
-  - Checking any of it against the original.
+    original sound manager's periodic update timer is **20 ms (50 Hz)**
+    (`0x572fc3` → `0x5edc57` → `0x6073f8`, firing `0x57cf37`).
+  - Kind 37 (effects volume slider) running `0x574978`, and `sims-game`
+    sending kind 25 on window focus changes.
+  - Checking rendered audio against the running original.
 
 ## Track: recording tool input (`tools/harness`)
 
@@ -2800,6 +2924,19 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   panels: Size, Yard, square feet, bedrooms, bathrooms and lot size.
   **Unverified:** the panel against a screenshot of the original; the
   labels' color, and how the labels sit in their boxes.
+- **Done: control-panel cluster layout, friends count, and 565 blend
+  (#312,**
+  `docs/decisions/20261121-control-panel-cluster-and-565-blend.md`
+  **).** Closes the two screenshot-ratchet panel items from #289
+  (explained `8:17` vs `8:16` as `House05.iff`'s `6:30:44` start time +
+  `tick = 3189` landing at `8:17:02`, and ported the `"0"` family-friends
+  counter `[esi + 0x1d0]` at `0x539219`/`0x4cfcdb`), plus exact cluster
+  clock formatting/centering (`0x5fe51e`, `0x539ede`), paused/idle-return
+  speed button highlight in `sims-game` and `sims-viewer` (`0x53b0d8`),
+  `kHelpBtn` (`4993`, `0x538f41`), exact 16-bit 565 alpha blending
+  (`0x49a315`, `0x4986c6`, `0x4999ea`), and 24-bit wrapping TGA
+  un-premultiplication (`0x4deb3d`, `0x4fad5c`, `0x5dff82`). Panel match
+  rates across all 8 ratchet scenes rise to **98.97%–99.88%**.
 - **Next:** a screenshot of an open pie menu; the dialog's corners,
   which the original blends; whether frames should be cut to 16-bit
   color as the original's screen is; the simulation side of text entry
@@ -2810,10 +2947,12 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   balloons with their pictures, and the balloon's 250 ms fade; the
   selection refresh's turn of the interests and gifts into the needs
   when the selected object's +0x60e is above 1 (0x51ce13, #283); the
-  viewer's zoning (#283); two panel differences the screenshot
-  ratchet shows (#289): at 8:16:18 the original's clock reads 8:16
-  and ours 8:17, and ours has no "0" before the money; the other live
-  panels.
+  viewer's zoning (#283); clicking `kHelpBtn` (`0x53aaad` → `0x50e8d3`)
+  and its hover state, hiding money/friends when `[ecx + 4] == 1`
+  (`0x53b2a4`, `0x4cfe18`), non-residential selected-Sim family lookup
+  in `0x4cfcdb`, pause button blink, 15-bit 5-5-5 panel blend path, and
+  skipping TGA un-premultiplication for Magicland mist overlays
+  (`0x1655`..`0x1657`) (#312); the other live panels.
 - **Done: the gadget buttons' checks** (#283,
   `docs/decisions/20261120-gadget-buttons-need-selected-sim-house-residential-lot.md`).
   As the original's press handler checks (0x51bbe6 to 0x51be75), all
@@ -3054,19 +3193,19 @@ through their public interfaces only; the simulation never depends on it.
   playing when its object is gone after a restore. Next,
   if wanted: a save/load panel with named slots.
 - **Needs from other crates:**
-  - `sims-vm`: the three pie listings that fail on the Goth house
-    today (#296; Manage Inventory operation 4 and scope 12 already
-    list, #45, #146, #173):
-    - Call Cab's entry name, whose `$$Local:1` tokens go through the
-      formatter, which is not ported (0x44bf1a; object 10's tree
-      0x2074);
-    - the offer to join the listing person's running interaction,
-      from 1500 ticks, on another person's pie menu, including when
-      an empty menu falls back to a person on the same tile
-      (0x45866d, 0x41ee99);
-    - a visitor's chosen action on category 4 or 7 objects, which asks
-      the relationship (0x41f660, trees 0x2025 and 0x103e), from 6000
-      ticks.
+  - `sims-vm`: Done — all three failing Goth pie listings (#296) are
+    now closed, and every person's pie menu on every object of the Goth
+    house lists cleanly at ticks 0, 1500 and 6000 (3,834 pairs):
+    - offer to join the listing person's running interaction (#300,
+      `0x45866d`, `0x41ee99`,
+      `docs/decisions/20261120-the-offer-to-join-a-running-interaction.md`);
+    - visitor actions on category 4 and 7 objects checking the Vacation
+      hotel-key token (#303, `0x458319`, `0x41f660`,
+      `docs/decisions/20261121-visitor-category-4-and-7-hotel-key-check.md`);
+    - Call Cab's `Add/Change Action String` wired onto the shared
+      `0x44bf1a` formatter (`0x44cc07`, `0x4061e3` CTSS slot-1 lookup,
+      `0x5fe51e` `$TimeLocal`, #316,
+      `docs/decisions/20261121-action-string-uses-dialog-formatter.md`).
   - Done (#296,
     `docs/decisions/20261120-check-tree-faults-and-failed-play-steps.md`):
     a check tree's fault keeps its trap (`Trap::CheckTree`, and
@@ -3078,6 +3217,10 @@ through their public interfaces only; the simulation never depends on it.
     records the tick it follows, with 0 for the frame before the first
     tick. `StepError::Asking` still rolls back the tick. Strict-mode
     results are unchanged.
+  - Done (#310, #311): `Game::run_while` syncs `pace.speed` and drops
+    stale timing credit on mid-tick speed changes (`0x10c` Special
+    Effect reset and wake-up), and pie menu entries choose on left
+    release (`0x5eb3d1`, `0x5eb433`).
   - `sims-people`: the pie head's camera, light and size compared with
     the original's.
 
