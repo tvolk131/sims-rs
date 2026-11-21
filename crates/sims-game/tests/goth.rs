@@ -3520,15 +3520,22 @@ fn pressing_a_pie_entry_and_dragging_off_orders_nothing() {
 /// a second time before update 900.
 ///
 /// Replayed offline in strict mode on the recording's frame schedule with
-/// the raw, unshifted recording coordinates, every compared simulation
-/// field (globals, all three RNGs, scheduler cursor, and all objects'
-/// data/temps/attributes/last_result/frames/person data/motives/active/
-/// previous/queue across 377 objects at update 1 down to 347 at update 900)
-/// matched updates 1..=900 except for UI global 12, Bella's uninitialized
-/// frame-arena locals (updates 203..=227 and unknown updates 368..=408),
-/// and the salesman's (object 259) unknown person word 37 and tree 4099
-/// local 7 from update 14. This test pins selected checkpoints through
-/// update 900.
+/// the raw, unshifted recording coordinates, an unmasked comparison of
+/// globals, all three RNGs, scheduler cursor, and every object's selected
+/// flag, data, temps, attributes, `last_result`, frames, person data,
+/// motives, active, previous, and queue (377 objects at update 1 down to
+/// 347 at update 900) matched updates 1..=900 except for:
+/// - UI global 12 (updates 214..=900);
+/// - routing `person.data[37]` marked unknown in `routing.unknown_words`
+///   for objects 16, 18, 21, and 259;
+/// - frame locals marked unknown in `frame_storage` for object 21
+///   (frame 8, tree 8301, local 0 at updates 675..=715) and object 259
+///   (frame 2, tree 4099, local 7 at updates 14..=596);
+/// - unmarked uninitialized frame locals for object 18 (frame 6, tree
+///   8292, local 0 at updates 203..=227; frame 9, tree 8229, locals 2–3
+///   at updates 368..=408).
+///
+/// This test pins selected checkpoints through update 900.
 #[test]
 fn the_recorded_switch_order_replayed_in_the_window_matches_the_recording() {
     let Some(install) = install() else {

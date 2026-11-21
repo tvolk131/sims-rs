@@ -61,20 +61,28 @@ part averaging.
 - An offline comparison (scratch tools, not in the repository) replayed
   `goth-switch-cancel-order-20261115` in strict mode on the recording's
   frame schedule through update 900, comparing all three RNGs, the
-  scheduler cursor, globals, and every object's `data`, `temps`,
-  `attributes`, `last_result`, `frames`, `person.data`, `motives`,
-  `active`, `previous`, and `queue` (377 objects at update 1, 347 at
-  update 900). Every compared field matched at updates 1–900 except for
-  four known excluded/uninitialized items:
-  - UI global 12 (`2010` at updates 214–393, `-1` at 394–900 vs `0`);
-  - Bella's (object 18) uninitialized frame-arena local at updates
-    203–227 (frame 6, tree 8292, node 17, local 0: `16104` vs `0`) and
-    unknown frame 9 locals 2–3 at updates 368–408 (marked unknown in
-    `frame_storage`);
-  - The salesman's (object 259) two unknown words from update 14, also
-    excluded in prior Goth replays: person word 37 (`3287` recorded vs
-    `0`) and frame 3 tree `4099` (`0x1003`) local 7 (`2623` recorded vs
-    `0`).
+  scheduler cursor, globals, and every object's `selected` flag, `data`,
+  `temps`, `attributes`, `last_result`, `frames`, `person.data`,
+  `motives`, `active`, `previous`, and `queue` (377 objects at update 1,
+  347 at update 900). Running the comparison with no masks produced
+  exactly ten raw difference categories across updates 1–900, all known:
+  - **UI global 12**: `2010` at updates 214–393 and `-1` at 394–900 vs
+    `0`.
+  - **Routing `person.data[37]` (marked unknown in `routing.unknown_words`)**:
+    object 16 (`3097` vs `0`, 532 updates across 351–900), object 18
+    (`3121` vs `0`, 524 updates across 311–900), object 21 (`3104` vs
+    `0`, 85 updates across 233–502), and object 259 (`3287` vs `0`, 887
+    updates across 14–900).
+  - **Frame locals marked unknown in `frame_storage`**:
+    object 21 (Mortimer) frame 8 (0-based), tree `8301`, node `0`, local
+    `0` (`6448` vs `0`, updates 675–715); object 259 (salesman) frame 2
+    (0-based; 3rd frame), tree `4099` (`0x1003`), node `48`, local `7`
+    (`2623` vs `0`, updates 14–596).
+  - **Unmarked uninitialized frame-arena locals**:
+    object 18 (Bella) frame 6 (0-based), tree `8292`, node `17`, local
+    `0` (`16104` vs `0`, updates 203–227), and frame 9 (0-based), tree
+    `8229`, node `51`, locals `2` and `3` (`-9320` and `16069` vs `0`,
+    updates 368–408; neither is marked by `frame_storage`).
 - After centring on Bella at update 543 (`origin = [472, -117]`,
   matching `after-centre.png` to `-1` pixel in x and `0` in y), the
   recording's raw unshifted hover and click points hit the exact same
