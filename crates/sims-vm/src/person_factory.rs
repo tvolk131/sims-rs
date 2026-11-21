@@ -197,6 +197,21 @@ impl Interpreter<'_> {
             .map(|s| s.name.as_str())
     }
 
+    /// Whether the native person factory refuses `guid` before constructing a
+    /// person (`0x440d63` → `0x440dd5` returning null): body string 0 (or
+    /// fallback skeleton name) is `"dog"` or `"kat"` and neither Unleashed
+    /// (`0x20`) nor Makin' Magic (`0x80`) is installed.
+    pub(crate) fn is_refused_pet(&self, world: &World, guid: u32) -> bool {
+        if pets_allowed(self.program.expansions) {
+            return false;
+        }
+        self.early_skeleton_name(world, guid).is_some_and(|name| {
+            ["dog", "kat"]
+                .iter()
+                .any(|pet| name.eq_ignore_ascii_case(pet))
+        })
+    }
+
     /// Like [`Self::create_person`], but returns `Ok(None)` when the native
     /// factory refuses a pet because neither Unleashed nor Makin' Magic is
     /// installed (`0x440dd5`).
@@ -280,37 +295,6 @@ impl Interpreter<'_> {
         };
         build_skeleton(skeleton, &mut draws, &mut world.skeleton_files)
             .map_err(|trap| fail(id, trap))?;
-        // 0x588dcb -> 0x58a178 -> 0x58d606 (head row 2) -> 0x58d67e (body row 1)
-        // -> 0x5a044d -> 0x5a38da -> 0x59e60e -> 0x59f087: dressing the new
-        // person's initial head and body loads any `.ndx`-indexed `.bcf`
-        // catalog and fills unloaded sibling skeletons & appearances in order.
-        if !self.program.people.indexed_suits.is_empty() {
-            let template = world.characters.definition(guid);
-            let profile = self.program.people.profiles.get(&template);
-            let made = world.characters.made.get(&guid);
-            let made_outfit = world.made_outfits.get(&guid);
-            let rows = [
-                made.and_then(|m| m.strings.get(&2).cloned())
-                    .or_else(|| made_outfit.and_then(|o| o.get(&2).cloned()))
-                    .or_else(|| profile.and_then(|p| p.head.clone())),
-                made.and_then(|m| m.strings.get(&1).cloned())
-                    .or_else(|| made_outfit.and_then(|o| o.get(&1).cloned()))
-                    .or_else(|| profile.and_then(|p| p.body.clone())),
-            ];
-            for row in rows.into_iter().flatten() {
-                let suit = row
-                    .split(';')
-                    .next()
-                    .unwrap_or(&row)
-                    .split(',')
-                    .next()
-                    .unwrap_or(&row)
-                    .to_ascii_lowercase();
-                if !suit.is_empty() && suit != "none" {
-                    let _ = crate::people::resolve_suit_head(&self.program.people, world, &suit);
-                }
-            }
-        }
         factory
             .attach_neighbor(world, id)
             .map_err(|trap| fail(id, trap))?;
@@ -425,20 +409,84 @@ impl Interpreter<'_> {
             .get(&id)
             .ok_or_else(|| fail(Trap::native(10, "missing object")))?
             .guid;
+        {
+            let person = world
+                .objects
+                .get_mut(&id)
+                .and_then(|object| object.person.as_mut())
+                .ok_or_else(|| fail(Trap::native(0x1c, "object is not a person")))?;
+            let kept = person::KEPT.map(|word| person.data[word]);
+            person.data.fill(0);
+            for (word, value) in person::KEPT.into_iter().zip(kept) {
+                person.data[word] = value;
+            }
+        }
+        // 0x5888d3 -> 0x588914..0x588930 -> 0x58a178(0): non-NPC definitions
+        // (`(words[102] & 8) == 0`) run initial everyday dressing with
+        // `data[22] = 0, data[23] = 0` AFTER `default_traits_if_low` and BEFORE
+        // `reload_profile` (`0x588935`). Because the newly created person's
+        // head slot `[ebx + 0x258]` is null, `0x58d4e1 -> 0x4eb0cc -> 0x4e897e`
+        // clears cached bitmaps and dirty flags for `guid`, and `0x58d606`
+        // (row 2) -> `0x58d67e` (row 1) -> `0x58d742`/`0x58d759` (paired rows
+        // 17 & 18) open any `.ndx`-indexed `.bcf` catalogs in order (drawing
+        // any catalog skeletons' CRT RNG via `0x59f107 -> 0x598af7`).
+        if (words[102] & 8) == 0 {
+            world.portraits.remove(&guid);
+            world.dirty_portraits.remove(&guid);
+            if !self.program.people.indexed_suits.is_empty() {
+                let template = world.characters.definition(guid);
+                let prof = self.program.people.profiles.get(&template);
+                let made = world.characters.made.get(&guid).cloned();
+                let made_outfit = world.made_outfits.get(&guid).cloned();
+                let row = |idx: usize| -> Option<String> {
+                    made.as_ref()
+                        .and_then(|m| m.strings.get(&idx).cloned())
+                        .or_else(|| made_outfit.as_ref().and_then(|o| o.get(&idx).cloned()))
+                        .or_else(|| match idx {
+                            1 => prof.and_then(|p| p.body.clone()),
+                            2 => prof.and_then(|p| p.head.clone()),
+                            n => prof.and_then(|p| p.suit_rows.get(&n).cloned()),
+                        })
+                };
+                let suit_of = |s: &str| {
+                    s.split(';')
+                        .next()
+                        .unwrap_or(s)
+                        .split(',')
+                        .next()
+                        .unwrap_or(s)
+                        .to_ascii_lowercase()
+                };
+                for idx in [2usize, 1] {
+                    if let Some(r) = row(idx) {
+                        let suit = suit_of(&r);
+                        if !suit.is_empty() && suit != "none" {
+                            let _ = crate::people::resolve_suit(&self.program.people, world, &suit);
+                        }
+                    }
+                }
+                if let (Some(l), Some(r)) = (row(17), row(18)) {
+                    let sl = suit_of(&l);
+                    let sr = suit_of(&r);
+                    if !sl.is_empty() && !sr.is_empty() {
+                        if sl != "none" {
+                            let _ = crate::people::resolve_suit(&self.program.people, world, &sl);
+                        }
+                        if sr != "none" {
+                            let _ = crate::people::resolve_suit(&self.program.people, world, &sr);
+                        }
+                    }
+                }
+            }
+        }
         // Looked up before the person is borrowed; a missing profile still
         // fails where it is read.
-        let profile = crate::people::profile(&self.program.people, world, guid);
+        let profile = crate::people::profile(&self.program.people, world, guid).map_err(fail)?;
         let person = world
             .objects
             .get_mut(&id)
             .and_then(|object| object.person.as_mut())
             .ok_or_else(|| fail(Trap::native(0x1c, "object is not a person")))?;
-        let kept = person::KEPT.map(|word| person.data[word]);
-        person.data.fill(0);
-        for (word, value) in person::KEPT.into_iter().zip(kept) {
-            person.data[word] = value;
-        }
-        let profile = profile.map_err(fail)?;
         reload_profile(&mut person.data, &profile).map_err(fail)?;
         let low = interests_low(&person.data);
         self.attach_neighbor(world, id).map_err(fail)?;

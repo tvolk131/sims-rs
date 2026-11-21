@@ -407,9 +407,11 @@ fn writeback_shares_iff_reloads_in_dialog_honors_reset_and_head_binding() {
     );
 
     // 4. Renderer failure (0x4e8d02 -> 0x4e725f -> 0x4e7824 missing HEAD
-    // binding): neither on-lot nor off-lot caches the portrait, clears dirty,
-    // or records generated_portrait_2002, while off-lot still creates and
-    // removes the temporary Sim and UI Effect returns true.
+    // binding): neither on-lot nor off-lot caches the portrait or records
+    // generated_portrait_2002, while off-lot creates and removes the temporary
+    // Sim, runs 0x588930/0x58d4e1 -> 0x4eb0cc (clearing dirty_portraits even
+    // on render failure so a follow-up query runs only 1 factory pass instead
+    // of 2), and UI Effect returns true.
     let (mut fx, file, record) = visitors();
     fx.program.people.portrait_head.insert(WIDGET, false);
     fx.world.dirty_portraits.insert(WIDGET);
@@ -420,7 +422,7 @@ fn writeback_shares_iff_reloads_in_dialog_honors_reset_and_head_binding() {
     );
     assert_ne!(fx.world.crt_rng, crt_before);
     assert!(fx.world.portraits.is_empty());
-    assert!(fx.world.dirty_portraits.contains(&WIDGET));
+    assert!(!fx.world.dirty_portraits.contains(&WIDGET));
     assert!(
         !fx.world
             .generated_portrait_2002
@@ -784,8 +786,11 @@ fn mode_1_handles_off_lot_failures_and_duplicate_catalog_guids() {
     assert_eq!(fx.world.portraits, [WIDGET].into());
     assert!(!fx.world.dirty_portraits.contains(&WIDGET));
 
-    // 4. Dirty slot with no tile and NO BMP_ 2002: 0x4e92f2 tries once,
-    // 0x4e9338 misses, and 0x4e938c retries a second time!
+    // 4. Dirty slot with no tile and NO BMP_ 2002: 0x4e92f2 tries once (where
+    // construction reset `0x588930 -> 0x58d4e1 -> 0x4eb0cc` clears dirty even
+    // though `0x4e9706` finds no tile), 0x4e9338 misses, and 0x4e938c retries
+    // a second time! A follow-up query runs only 1 attempt (+2 Inits) because
+    // dirty was cleared.
     let (mut fx, file, record) = visitors();
     fx.world.dirty_portraits.insert(WIDGET);
     count_init_unplaceable(&mut fx, file);
@@ -798,7 +803,15 @@ fn mode_1_handles_off_lot_failures_and_duplicate_catalog_guids() {
         "dirty no-tile without BMP_ 2002 builds twice (0x4e92f2 + 0x4e938c = 4 Inits)"
     );
     assert!(fx.world.portraits.is_empty());
-    assert!(fx.world.dirty_portraits.contains(&WIDGET));
+    assert!(!fx.world.dirty_portraits.contains(&WIDGET));
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
+        Ok(true)
+    );
+    assert_eq!(
+        fx.world.globals[36], 6,
+        "follow-up query runs only 0x4e938c (1 attempt = +2 Inits) after 0x4eb0cc cleared dirty"
+    );
 
     // 5. Duplicate catalog GUID (0x4e8b3d): an earlier person definition puts
     // WIDGET in 0x6f2698, while a later non-person definition overwrites
@@ -2123,6 +2136,7 @@ fn live_appearance_and_runtime_indexed_skeleton_load_order() {
         .people
         .head_suits
         .insert("b_everyday_head".into());
+    fx.program.people.suits.insert("s_swim_nohead".into());
     fx.program.people.head_suits.insert("f_formal_head".into());
     // Put on HEAD accessory -> renders!
     fx.world
@@ -3362,5 +3376,434 @@ fn round_16_unified_bcf_lazy_loads_dress_time_accessories_pet_reset_formal_extra
         );
         assert_eq!(fx.run_with(SIM, 4098, 0, &[], 100), Ok(true));
         assert!(fx.world.dirty_portraits.contains(&SIM_GUID));
+    }
+}
+
+#[test]
+fn round_17_appearance_bcf_rng_missing_outfit_retention_hand_extras_dirty_clear_and_household_pet()
+{
+    use sims_content::{Profile, Skeleton};
+    let mk_skel = |name: &str, file: &str, place: usize, scales: Vec<Vec<i32>>| Skeleton {
+        name: name.to_owned(),
+        file: file.to_owned(),
+        place,
+        scales,
+        bones: Vec::new(),
+    };
+
+    // 1. P2 #1: Appearance-triggered `.bcf` load draws CRT RNG for every
+    // skeleton in that `.bcf` (`0x59f107` -> `0x598af7`) and records its file
+    // in `world.skeleton_files` so later person construction draws only its own
+    // copy (`0x598da3`).
+    {
+        let (mut fx, _, _) = visitors();
+        fx.program
+            .people
+            .indexed_suits
+            .insert("rng_acc".into(), Ok("rng_mixed.bcf".into()));
+        fx.program.people.indexed_catalogs.insert(
+            "rng_mixed.bcf".into(),
+            (
+                vec![mk_skel("rng_skel", "rng_mixed.bcf", 0, vec![vec![5]])],
+                None,
+            ),
+        );
+        fx.program.people.indexed_suit_catalogs.insert(
+            "rng_mixed.bcf".into(),
+            (BTreeMap::from([("rng_acc".into(), true)]), None),
+        );
+        fx.program
+            .libraries
+            .get_mut(&SIM_FILE)
+            .unwrap()
+            .strings
+            .insert(304, vec!["rng_acc".into()]);
+        fx.add(
+            SIM_FILE,
+            4098,
+            tree(vec![ins(
+                6,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [0, 2, 0, 0, 0, 0, 0, 0],
+            )]),
+        );
+        let before_rng = fx.world.crt_rng.state();
+        assert_eq!(fx.run_with(SIM, 4098, 0, &[], 100), Ok(true));
+        assert!(
+            fx.world.skeleton_files.contains("rng_mixed.bcf"),
+            "0x59f107 must mark the mixed `.bcf` read when opened by an appearance"
+        );
+        assert_ne!(
+            fx.world.crt_rng.state(),
+            before_rng,
+            "0x59f107 -> 0x598af7 must advance CRT RNG for the `.bcf`'s skeletons"
+        );
+    }
+
+    // 2. P2 #3: Failed outfit lookup (`0x583576`) keeps the existing everyday
+    // body attachment; NPC flag 0x08 with suit <= 0 (`0x58a1f8`) skips new
+    // `.ndx` loads.
+    {
+        let (mut fx, _, _) = visitors();
+        fx.words(SIM_FILE)[102] = 0;
+        fx.world.neighbors.slots.push(Some(Neighbor {
+            guid: SIM_GUID,
+            id: 2,
+            data: vec![0; 88],
+            relationships: Vec::new(),
+            friends: 0,
+            revision: 0,
+            stale: false,
+        }));
+        let sim_record = fx.world.neighbors.slots.len() as i16;
+        fx.program
+            .people
+            .eager_suits
+            .insert("everyday_head_body".into());
+        fx.program
+            .people
+            .head_suits
+            .insert("everyday_head_body".into());
+        fx.program.people.profiles.insert(
+            SIM_GUID,
+            Profile {
+                body: Some("everyday_head_body,BODY=b".into()),
+                head: None,
+                suit_rows: BTreeMap::from([(16, "missing_swim_suit,BODY=s".into())]),
+                ..Default::default()
+            },
+        );
+        let person = fx
+            .world
+            .objects
+            .get_mut(&SIM)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap();
+        person.data[65] = 0;
+        person.data[8] = 2; // swim suit -> missing_swim_suit misses at 0x583576
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
+            Ok(true)
+        );
+        assert!(
+            fx.world.portraits.contains(&SIM_GUID),
+            "0x583576 miss must keep everyday_head_body attached"
+        );
+
+        // NPC flag 0x08 with suit <= 0 must NOT trigger lazy `.ndx` loads.
+        fx.world.portraits.remove(&SIM_GUID);
+        fx.world.generated_portrait_2002.clear();
+        fx.words(SIM_FILE)[102] = 8;
+        fx.program
+            .people
+            .indexed_suits
+            .insert("lazy_npc_body".into(), Ok("lazy_npc.bcf".into()));
+        fx.program.people.indexed_suit_catalogs.insert(
+            "lazy_npc.bcf".into(),
+            (BTreeMap::from([("lazy_npc_body".into(), true)]), None),
+        );
+        fx.program.people.profiles.insert(
+            SIM_GUID,
+            Profile {
+                body: Some("lazy_npc_body,BODY=b".into()),
+                head: None,
+                ..Default::default()
+            },
+        );
+        fx.world
+            .objects
+            .get_mut(&SIM)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap()
+            .data[8] = 0;
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
+            Ok(true)
+        );
+        assert!(
+            !fx.world.loaded_indexed_suits.contains_key("lazy_npc_body"),
+            "0x58a1f8 must not trigger `.ndx` lookup when def_flags & 8 != 0 and suit <= 0"
+        );
+    }
+
+    // 3. P2 #4: Extra pieces from person data words 22 & 23 (`0x58a453..0x58a675`)
+    // bind even on everyday suit 0, and generated workwear/pajamas trap when
+    // `.ndx` suits exist so sibling loads cannot be skipped.
+    {
+        let (mut fx, _, _) = visitors();
+        fx.words(SIM_FILE)[102] = 0;
+        fx.world.neighbors.slots.push(Some(Neighbor {
+            guid: SIM_GUID,
+            id: 2,
+            data: vec![0; 88],
+            relationships: Vec::new(),
+            friends: 0,
+            revision: 0,
+            stale: false,
+        }));
+        let sim_record = fx.world.neighbors.slots.len() as i16;
+        fx.program.people.head_suits.insert("hand_left_head".into());
+        fx.program.people.profiles.insert(
+            SIM_GUID,
+            Profile {
+                body: Some("plain_body,BODY=b".into()),
+                head: None,
+                suit_rows: BTreeMap::from([
+                    (19, "hand_left_head,HAND=l".into()),
+                    (20, "hand_right_plain,HAND=r".into()),
+                ]),
+                ..Default::default()
+            },
+        );
+        let person = fx
+            .world
+            .objects
+            .get_mut(&SIM)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap();
+        person.data[65] = 0;
+        person.data[8] = 0;
+        person.data[22] = 1; // row 19
+        person.data[23] = 1; // row 20
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
+            Ok(true)
+        );
+        assert!(
+            fx.world.portraits.contains(&SIM_GUID),
+            "0x58a453..0x58a675 must bind words 22/23 hand rows even on everyday suit 0"
+        );
+
+        // Workwear (suit 3) traps when `.ndx` suits exist even with HEAD on head row.
+        fx.world.portraits.remove(&SIM_GUID);
+        fx.world.generated_portrait_2002.clear();
+        fx.program
+            .people
+            .indexed_suits
+            .insert("some_ndx".into(), Ok("x.bcf".into()));
+        fx.program
+            .people
+            .eager_suits
+            .insert("hand_left_head".into());
+        fx.program.people.profiles.get_mut(&SIM_GUID).unwrap().head =
+            Some("hand_left_head,HEAD-HEAD=h".into());
+        fx.world
+            .objects
+            .get_mut(&SIM)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap()
+            .data[8] = 3;
+        assert!(run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1).is_err());
+    }
+
+    // 4. P2 #5: Dressing an unbound head slot (`0x58d4e1` -> `0x4eb0cc` ->
+    // `0x4e897e`) clears `dirty_portraits` even when rendering fails, so a
+    // second off-lot query runs only one factory attempt (`0x4e938c`) instead
+    // of two (`0x4e92f2` + `0x4e938c`).
+    {
+        let (mut fx, _, record) = visitors();
+        fx.world.rooms.rooms.get_mut(&1).unwrap().occupied = true;
+        fx.program.people.portrait_head.insert(WIDGET, false);
+        fx.world.dirty_portraits.insert(WIDGET);
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
+            Ok(true)
+        );
+        assert!(!fx.world.portraits.contains(&WIDGET));
+        assert!(
+            !fx.world.dirty_portraits.contains(&WIDGET),
+            "0x58d4e1 -> 0x4eb0cc must clear dirty_portraits even when render fails"
+        );
+    }
+
+    // 5. P2 #6: Initial dressing in `person_factory` does NOT erase indexed
+    // decode uncertainty: a suit whose catalog stopped decoding with an error
+    // still traps on portrait query instead of silently returning Missing.
+    {
+        let (mut fx, _, record) = visitors();
+        fx.world.rooms.rooms.get_mut(&1).unwrap().occupied = true;
+        fx.program.people.portrait_head.remove(&WIDGET);
+        fx.program.people.profiles.insert(
+            WIDGET,
+            Profile {
+                body: Some("corrupt_indexed_suit,BODY=b".into()),
+                head: None,
+                ..Default::default()
+            },
+        );
+        fx.program
+            .people
+            .indexed_suits
+            .insert("corrupt_indexed_suit".into(), Ok("corrupt.bcf".into()));
+        fx.program.people.indexed_suit_catalogs.insert(
+            "corrupt.bcf".into(),
+            (BTreeMap::new(), Some("corrupt".into())),
+        );
+        fx.program
+            .people
+            .suit_errors
+            .insert("corrupt.bcf".into(), "corrupt".into());
+        assert!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1).is_err(),
+            "decode uncertainty must survive initial dressing in person_factory"
+        );
+    }
+
+    // 6. P2 #7: Catalog Dialog checks disallowed pet (`0x440d63` -> `0x4e969d`)
+    // BEFORE the household guard so an off-lot household pet with a disallowed
+    // expansion mask continues nonfatally instead of trapping.
+    {
+        let (mut fx, _, record) = visitors();
+        fx.program.expansions = 0;
+        fx.program
+            .people
+            .skeleton_names
+            .insert(WIDGET, "kat".into());
+        fx.world.globals[9] = 109;
+        fx.world.families[0].members.push(WIDGET);
+        fx.add(
+            LAMP_FILE,
+            4098,
+            tree(vec![
+                assign(scope::STACK_OBJECT, 0, scope::LITERAL, record, 1),
+                ins(36, RETURN_TRUE, RETURN_FALSE, [0, 0, 0, 0, 0, 0, 0, 5]),
+            ]),
+        );
+        assert_eq!(fx.run_with(LAMP, 4098, 0, &[], 100), Ok(true));
+        assert!(!fx.world.portraits.contains(&WIDGET));
+    }
+
+    // 7. P2 #2: Saved-house object loading (`0x58838b -> 0x5a073b -> 0x5a0384`)
+    // resolves each saved person's skeleton through runtime `.ndx` order,
+    // populating sibling skeletons from the first person's `.bcf` so a later
+    // saved person binds that sibling instead of opening its own `.bcf`.
+    {
+        let (mut fx, _, _) = visitors();
+        fx.words(SIM_FILE)[102] = 0;
+        let alpha_skel = sims_content::Skeleton {
+            name: "alpha".into(),
+            file: "alpha.bcf".into(),
+            place: 0,
+            scales: vec![vec![1], vec![1, 1]],
+            bones: Vec::new(),
+        };
+        let beta_from_alpha = sims_content::Skeleton {
+            name: "beta".into(),
+            file: "alpha.bcf".into(),
+            place: 1,
+            scales: vec![vec![1], vec![1, 1]],
+            bones: Vec::new(),
+        };
+        let beta_from_beta = sims_content::Skeleton {
+            name: "beta".into(),
+            file: "beta.bcf".into(),
+            place: 0,
+            scales: vec![vec![1, 1, 1, 1, 1]],
+            bones: Vec::new(),
+        };
+        fx.program
+            .people
+            .skeleton_names
+            .insert(SIM_GUID, "alpha".into());
+        fx.program
+            .people
+            .skeleton_names
+            .insert(WIDGET, "beta".into());
+        fx.program
+            .people
+            .indexed_skeletons
+            .insert("alpha".into(), Ok("alpha.bcf".into()));
+        fx.program
+            .people
+            .indexed_skeletons
+            .insert("beta".into(), Ok("beta.bcf".into()));
+        fx.program.people.indexed_catalogs.insert(
+            "alpha.bcf".into(),
+            (vec![alpha_skel, beta_from_alpha], None),
+        );
+        fx.program
+            .people
+            .indexed_catalogs
+            .insert("beta.bcf".into(), (vec![beta_from_beta], None));
+
+        let mut world = sims_sim::World::empty();
+        world.neighbors.slots.push(Some(Neighbor {
+            guid: SIM_GUID,
+            id: 1,
+            data: vec![20; 88],
+            relationships: Vec::new(),
+            friends: 0,
+            revision: 1,
+            stale: false,
+        }));
+        world.neighbors.slots.push(Some(Neighbor {
+            guid: WIDGET,
+            id: 2,
+            data: vec![20; 88],
+            relationships: Vec::new(),
+            friends: 0,
+            revision: 1,
+            stale: false,
+        }));
+        let mk_inst = |id: u16, guid: u32| sims_formats::saved_objects::Instance {
+            id,
+            type_id: 0,
+            guid,
+            footprint: [0; 4],
+            position: [0; 3],
+            unknown_short: 0,
+            attributes: Vec::new(),
+            temps: vec![0; 8],
+            data: vec![0; 72],
+            obsolete_word: 0,
+            stack_capacity_bytes: 0,
+            stack: Vec::new(),
+            relationship_flag: 0,
+            relationships: Vec::new(),
+            slots: vec![sims_formats::saved_objects::Slot {
+                unknown: 0,
+                object: 0,
+            }],
+            dynamic_sprites: Vec::new(),
+            multipart: None,
+            portal: None,
+            person: Some(person()),
+            registry_word: Some(0),
+            consumed_bits: 0,
+            record: Vec::new(),
+        };
+        let saved = sims_formats::saved_objects::Objects {
+            version: 0x47,
+            order: vec![1, 2],
+            types_by_id: BTreeMap::new(),
+            instances: BTreeMap::from([(1, mk_inst(1, SIM_GUID)), (2, mk_inst(2, WIDGET))]),
+            tail: Vec::new(),
+        };
+        let read = fx
+            .interpreter()
+            .read_objects(&mut world, &saved, &fx.program.people)
+            .expect("saved-house read must succeed");
+        assert_eq!(read.objects, vec![1, 2]);
+        assert_eq!(
+            world.loaded_indexed_skeletons.get("beta"),
+            Some(&Some("alpha.bcf".into())),
+            "first saved person's alpha.bcf must claim sibling beta"
+        );
+        assert!(
+            !world.skeleton_files.contains("beta.bcf"),
+            "second saved person must reuse alpha.bcf's beta instead of opening beta.bcf"
+        );
+        // Draws (32 per wiggle scale): alpha.bcf file skeletons (1 + 2 = 3) +
+        // person 1 own alpha (1) + person 2 own beta from alpha.bcf (2) = 6 * 32 = 192.
+        assert_eq!(read.draws, 192);
     }
 }

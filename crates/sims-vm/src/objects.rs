@@ -258,11 +258,15 @@ impl Interpreter<'_> {
             ));
         }
         let mut crt = world.crt_rng;
-        let mut draws = Draws {
-            stream: &mut crt,
-            count: 0,
+        let mut registry = SavedPersonRegistry {
+            draws: Draws {
+                stream: &mut crt,
+                count: 0,
+            },
+            files: world.skeleton_files.clone(),
+            loaded_skeletons: world.loaded_indexed_skeletons.clone(),
+            loaded_suits: world.loaded_indexed_suits.clone(),
         };
-        let mut files = world.skeleton_files.clone();
         let expansions = world.globals.get(20).copied().unwrap_or(0);
         let mut objects = BTreeMap::new();
         let mut order = Vec::new();
@@ -278,8 +282,7 @@ impl Interpreter<'_> {
                     instance,
                     people,
                     &world.neighbors,
-                    &mut draws,
-                    &mut files,
+                    &mut registry,
                     expansions,
                 )
                 .map_err(|trap| fail(id, trap))?;
@@ -354,9 +357,17 @@ impl Interpreter<'_> {
                 contexts.insert(id, vec![crate::routing::slot::loaded_context(); frames]);
             }
         }
+        let SavedPersonRegistry {
+            draws,
+            files,
+            loaded_skeletons,
+            loaded_suits,
+        } = registry;
         let count = draws.count;
         world.crt_rng = crt;
         world.skeleton_files = files;
+        world.loaded_indexed_skeletons = loaded_skeletons;
+        world.loaded_indexed_suits = loaded_suits;
         for &id in &order {
             if let Some(instances) = world.instances.get_mut(&objects[&id].guid) {
                 instances.push(id);
@@ -404,8 +415,7 @@ impl Interpreter<'_> {
         saved: &Instance,
         people: &People,
         neighbors: &Neighbors,
-        draws: &mut Draws<'_>,
-        files: &mut BTreeSet<String>,
+        registry: &mut SavedPersonRegistry<'_>,
         expansions: i16,
     ) -> Result<Object, Trap> {
         let definition = self
@@ -447,7 +457,7 @@ impl Interpreter<'_> {
             .containers(definition.resource, definition.chunk);
         let slots = 1 + containers + if person { PERSON_SLOTS } else { 0 };
         if person {
-            construct_person(saved.guid, people, neighbors, draws, files)?;
+            construct_person(saved.guid, people, neighbors, registry)?;
         }
         // The read (the object's function at vtable offset 0x7c, 0x4342ae).
         // From version 0x18 the saved attribute count comes first; when it
@@ -514,22 +524,34 @@ impl Interpreter<'_> {
     }
 }
 
+/// Mutable avatar-registry and CRT-RNG state threaded through saved-object
+/// construction so saved-house loads fail transactionally on error.
+struct SavedPersonRegistry<'a> {
+    draws: Draws<'a>,
+    files: BTreeSet<String>,
+    loaded_skeletons: BTreeMap<String, Option<String>>,
+    loaded_suits: BTreeMap<String, Option<bool>>,
+}
+
 /// A person's constructor, as far as it draws random numbers (0x45962b).
 fn construct_person(
     guid: u32,
     people: &People,
     neighbors: &Neighbors,
-    draws: &mut Draws<'_>,
-    files: &mut BTreeSet<String>,
+    registry: &mut SavedPersonRegistry<'_>,
 ) -> Result<(), Trap> {
-    // The house's people are of the types the catalog registered, never
-    // of one made while the game ran.
-    let skeleton = people.skeletons.get(&guid).ok_or_else(|| {
-        Trap::Unsupported(format!(
-            "no skeleton was supplied for the person type 0x{guid:08X}"
-        ))
-    })?;
-    build_skeleton(skeleton, draws, files)?;
+    // 0x58838b -> 0x5a073b -> 0x5a0384: saved-house people resolve through the
+    // avatar registry in load order, populating sibling skeletons & appearances
+    // from any lazy `.ndx` `.bcf` catalog they open.
+    let skeleton = crate::people::resolve_skeleton_for_saved(
+        people,
+        guid,
+        &mut registry.loaded_skeletons,
+        &mut registry.loaded_suits,
+        &mut registry.draws,
+        &mut registry.files,
+    )?;
+    build_skeleton(skeleton, &mut registry.draws, &mut registry.files)?;
     // The first record of the person's type, in slot order.
     let record = neighbors.first_of(guid).ok_or_else(|| {
         Trap::Unsupported(format!(
@@ -552,7 +574,7 @@ fn construct_person(
         }
     }
     if defaults {
-        draws.default_traits();
+        registry.draws.default_traits();
     }
     Ok(())
 }

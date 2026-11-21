@@ -188,9 +188,15 @@ fn flag_0x4_runs_a_new_visitors_init_visitor_tree_at_once() {
 fn a_person_made_with_person_word_68_74_or_84_set_resets_its_types_portrait() {
     // The person test (0x44e6b6 to 0x44e727) sends a person with bit 0 of
     // word 68 or 84, or bit 0 or 1 of word 74, through 0x45810c, which
-    // resets its type's entry in the interface's table (0x4eb0eb,
-    // 0x4e895e): the next dialog's portrait of the type is built again
-    // (0x4e92a8). Other bits leave it.
+    // marks its type's portrait dirty (0x4eb0eb -> 0x4e895e): the next
+    // dialog's portrait of the type is rebuilt (0x4e92e5 -> 0x4e92f2) even
+    // when BMP_ 2002 is on disk. For a normal non-NPC person (`words[102] & 8
+    // == 0`), construction reset (`0x45993c -> 0x5888d3 -> 0x588930 ->
+    // 0x58a178(0) -> 0x58d4e1 -> 0x4eb0cc -> 0x4e897e`) clears the cached
+    // bitmap and dirty flag first, so `dirty_portraits` distinguishes the
+    // watched bits (`reset == true`). With flag `0x08` (`words[102] & 8 != 0`),
+    // `0x58a1f8` skips `0x4eb0cc`, so `portraits` itself stays cached unless
+    // a watched bit ran `0x4eb0eb`.
     for (word, value, reset) in [
         (68, 1, true),
         (68, 2, false),
@@ -217,15 +223,39 @@ fn a_person_made_with_person_word_68_74_or_84_set_resets_its_types_portrait() {
             fx.world.objects[&id].person.as_ref().unwrap().data[word],
             value
         );
-        assert_eq!(
-            fx.world.portraits.contains(&WIDGET),
-            !reset,
-            "word {word} = {value}"
+        assert!(
+            !fx.world.portraits.contains(&WIDGET),
+            "0x588930 -> 0x4eb0cc clears cached bitmap for non-NPC word {word} = {value}"
         );
         assert_eq!(
             fx.world.dirty_portraits.contains(&WIDGET),
             reset,
             "dirty flag word {word} = {value}"
+        );
+
+        // NPC flag (`words[102] & 8 != 0`): `0x58a1f8` skips `0x4eb0cc`, so
+        // only `0x44e6b6 -> 0x4eb0eb` clears `portraits` and sets dirty.
+        let (mut fx, file, record) = visitors();
+        fx.words(file)[102] |= 8;
+        fx.world.portraits.insert(WIDGET);
+        let slot = fx.world.neighbors.slots.last_mut().unwrap();
+        let slot = slot.as_mut().unwrap();
+        slot.revision = 10;
+        slot.data[word] = value;
+        assert_eq!(
+            create(&mut fx, 0, 6, FROM_RECORD, record),
+            Ok(true),
+            "npc word {word}"
+        );
+        assert_eq!(
+            fx.world.portraits.contains(&WIDGET),
+            !reset,
+            "npc portraits word {word} = {value}"
+        );
+        assert_eq!(
+            fx.world.dirty_portraits.contains(&WIDGET),
+            reset,
+            "npc dirty flag word {word} = {value}"
         );
     }
 }

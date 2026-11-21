@@ -1307,10 +1307,11 @@ impl Interpreter<'_> {
     ///    0x4412c6);
     /// 4. after the search, data word 40 has bit 0x400: the room it is put
     ///    in is marked as not counted (0x433340);
-    /// 5. no tile is found (from the view centre, or with none given from
-    ///    some start): the original then removes it unput (0x4e9706), and
-    ///    builds again in the same dialog (0x4e938c) unless the type has
-    ///    image 2002; neither is ported;
+    /// 5. no view centre is given and SOME starts find a tile while others
+    ///    find none (removing the temporary person unput at `0x4e9706`), so
+    ///    the outcome depends on the unknown view centre. When a view centre is
+    ///    given (or when every interior start finds no tile), `Ok(false)` lets
+    ///    the caller perform the `0x4e9706` removal nonfatally;
     /// 6. noting the room of the tile the search ends on (with no view
     ///    centre given, any it may end on) changes a room's mark of who is
     ///    in it ([`World::note_occupant`] through [`Self::note_room`],
@@ -1382,7 +1383,8 @@ impl Interpreter<'_> {
                         .collect();
                     return Err(fail(format!(
                         "no view centre is given, and from {} of the starts ({}{}) no tile is \
-                         found: the original removes it unput (0x4e9706), which is not ported",
+                         found while other starts find one: the outcome (placed vs unput removal \
+                         at 0x4e9706) depends on the missing view centre",
                         starts.len(),
                         listed.join("; "),
                         if starts.len() > 8 { "; ..." } else { "" },

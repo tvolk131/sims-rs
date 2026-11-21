@@ -358,12 +358,14 @@ impl Machine<'_, '_> {
     /// / [`sims_sim::World::generated_portrait_2002`]) or the character was
     /// made during the session (`Make New Character`), `dialog_portrait`
     /// delegates directly to the full `0x4e92a8` path
-    /// ([`Machine::ui_effect_portrait_for_guid`]). Otherwise it fails loudly
-    /// where the tile would matter, including when no tile is found: the
-    /// original then removes the person without drawing it (`0x4e9706`) and
-    /// leaves the entry without its image. The rest of the put (the rooms,
-    /// `0x440385`, and the tiles, `0x4330d7`) is taken to be undone by the
-    /// removal: **unverified**.
+    /// ([`Machine::ui_effect_portrait_for_guid`]). When no tile is found from
+    /// the given view centre (or from every interior start when no view centre
+    /// is given), the temporary person is removed unput (`0x4e9706`) with its
+    /// Init/RNG side effects kept and the portrait left uncached; it fails
+    /// loudly only when placement depends on an unmodeled detail or an unknown
+    /// view centre where some starts find a tile and others do not. The rest
+    /// of the put (the rooms, `0x440385`, and the tiles, `0x4330d7`) is taken
+    /// to be undone by the removal: **unverified**.
     pub(crate) fn dialog_portrait(&mut self, operands: &[u8; 8]) -> Result<(), Trap> {
         let stack_object = self.frame()?.stack_object;
         let mode = (operands[7] >> 1) & 7;
@@ -465,6 +467,12 @@ impl Machine<'_, '_> {
         // 0x4e8cc6 -> 0x4067b3 -> 0x4174dc: off-lot rendering only calls
         // 0x4e9652 when the winning definition's file is writable.
         if !self.is_portrait_file_writable(guid) {
+            return Ok(false);
+        }
+        // 0x440d63 -> 0x440dd5 -> 0x4e969d: a pet disallowed by the installed
+        // expansions mask is refused before any construction (and could not
+        // have been built by the household panel either).
+        if self.interpreter().is_refused_pet(self.world, guid) {
             return Ok(false);
         }
         let family = i32::from(self.world.globals.get(9).copied().unwrap_or(0));
