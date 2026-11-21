@@ -1040,6 +1040,7 @@ fn every_person_lists_every_object_on_the_goth_house_at_0_1500_and_6000() {
         assert!(!people.is_empty(), "tick {target_tick}");
         for &person in &people {
             for &object in &objects {
+                lot.restore(saved.clone()).unwrap();
                 lot.pie_menu(person, object).unwrap_or_else(|e| {
                     panic!("tick {target_tick}: person {person} on object {object} failed: {e}")
                 });

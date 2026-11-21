@@ -1168,9 +1168,14 @@ fn a_check_tree_adds_named_entries_in_place_of_its_action() {
 
 #[test]
 fn an_entrys_string_with_a_token_or_missing_fails_loudly() {
-    // Index 2 has a token the formatter would replace; 0 and 3 are not in
-    // the table.
-    for (index, address) in [(2, "0x44bf1a"), (0, "0x4704fa"), (3, "0x4704fa")] {
+    // Index 2 has `$Object` whose catalog name is not known (unported);
+    // 0 and 3 are not in the table (`0x4704fa` returns null, passed to
+    // `strlen` at `0x5b882d`: a script fault, not unported).
+    for (index, address, unported) in [
+        (2, "0x44bf1a", true),
+        (0, "0x4704fa", false),
+        (3, "0x4704fa", false),
+    ] {
         let mut fx = named_menu_lot(vec![with_test(4, 0, 4302)], &["Eat", "Eat $Object"]);
         fx.add(
             LAMP_FILE,
@@ -1184,30 +1189,52 @@ fn an_entrys_string_with_a_token_or_missing_fails_loudly() {
         );
         let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
         let fault = interpreter.pie_menu(&mut fx.world, SIM, LAMP).unwrap_err();
-        // The check tree's fault keeps the formatter's trap.
-        assert!(
-            matches!(&fault.trap, Trap::CheckTree { fault: inner, .. }
-                if matches!(&inner.trap, Trap::Unsupported(m) if m.contains(address))),
-            "{index}: {fault}"
-        );
-        assert!(fault.trap.unported(), "{index}: {fault}");
+        let matched = match &fault.trap {
+            Trap::CheckTree { fault: inner, .. } => match (&inner.trap, unported) {
+                (Trap::Unsupported(m), true) | (Trap::Invalid(m), false) => m.contains(address),
+                _ => false,
+            },
+            _ => false,
+        };
+        assert!(matched, "{index}: {fault}");
+        assert_eq!(fault.trap.unported(), unported, "{index}: {fault}");
     }
 }
 
 #[test]
-fn an_entrys_string_formats_locals_and_single_catalog_names() {
+fn an_entrys_string_formats_locals_and_catalog_names() {
     let mut fx = named_menu_lot(
         vec![with_test(4, 0, 4302)],
         &[
             "Call Cab.../Go to Magic Town - $$Local:1",
             "$Local:0/$Local:1:99 ($Local:99 $Local)",
             "$Me uses $Object",
+            "$TimeLocal:99 $TimeLocal:2 $TimeLocal:3",
+            "",
         ],
     );
-    // Give SIM and LAMP single-entry catalog names (CTSS table 100).
-    for (file, guid, label) in [
-        (SIM_FILE, SIM_GUID, "Mortimer"),
-        (LAMP_FILE, LAMP_GUID, "Lamp"),
+    // Give SIM and LAMP ordinary multi-row, multi-language CTSS tables
+    // (slot 1 = name, slot 2 = description, plus another language): `0x4061e3`
+    // picks slot 1 in US English.
+    for (file, guid, entries) in [
+        (
+            SIM_FILE,
+            SIM_GUID,
+            vec![
+                (1, "Mortimer".to_owned()),
+                (1, "Mortimer Goth".to_owned()),
+                (2, "Morten".to_owned()),
+            ],
+        ),
+        (
+            LAMP_FILE,
+            LAMP_GUID,
+            vec![
+                (1, "Lamp".to_owned()),
+                (1, "A nice lamp".to_owned()),
+                (2, "Lampe".to_owned()),
+            ],
+        ),
     ] {
         let def = fx.catalog.object(guid).unwrap();
         fx.program
@@ -1222,7 +1249,7 @@ fn an_entrys_string_formats_locals_and_single_catalog_names() {
             .get_mut(&file)
             .unwrap()
             .catalog_strings
-            .insert(100, vec![(1, label.to_owned())]);
+            .insert(100, entries);
     }
     fx.add(
         LAMP_FILE,
@@ -1230,9 +1257,13 @@ fn an_entrys_string_formats_locals_and_single_catalog_names() {
         tree(vec![
             assign(scope::LOCALS, 0, scope::LITERAL, -5, 1),
             assign(scope::LOCALS, 1, scope::LITERAL, 50, 2),
-            ins(50, 3, RETURN_FALSE, action_string(1)),
-            ins(50, 4, RETURN_FALSE, action_string(2)),
-            ins(50, RETURN_TRUE, RETURN_FALSE, action_string(3)),
+            assign(scope::LOCALS, 2, scope::LITERAL, 24, 3),
+            assign(scope::LOCALS, 3, scope::LITERAL, -1, 4),
+            ins(50, 5, RETURN_FALSE, action_string(1)),
+            ins(50, 6, RETURN_FALSE, action_string(2)),
+            ins(50, 7, RETURN_FALSE, action_string(3)),
+            ins(50, 8, RETURN_FALSE, action_string(4)),
+            ins(50, RETURN_TRUE, RETURN_FALSE, action_string(5)),
         ]),
     );
     let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
@@ -1246,6 +1277,8 @@ fn an_entrys_string_formats_locals_and_single_catalog_names() {
             Some("Call Cab.../Go to Magic Town - $50"),
             Some("-5/50 ($Local:99 $Local)"),
             Some("Mortimer uses Lamp"),
+            Some("$TimeLocal:99 $TimeLocal:2 $TimeLocal:3"),
+            Some(""),
         ]
     );
     assert!(
@@ -1256,28 +1289,10 @@ fn an_entrys_string_formats_locals_and_single_catalog_names() {
 }
 
 #[test]
-fn an_entrys_string_fails_loudly_on_ambiguous_names_unported_tokens_and_tables() {
-    // Multiple distinct catalog names cannot determine a pie label (0x4061e3).
-    let mut fx = named_menu_lot(vec![with_test(4, 0, 4302)], &["Use $Object"]);
-    let def = fx.catalog.object(LAMP_GUID).unwrap();
-    let lib = fx.program.libraries.get_mut(&LAMP_FILE).unwrap();
-    lib.definitions.get_mut(&def.chunk).unwrap()[41] = 100;
-    lib.catalog_strings.insert(
-        100,
-        vec![(1, "Lamp".to_owned()), (1, "A nice lamp".to_owned())],
-    );
-    fx.add(
-        LAMP_FILE,
-        4302,
-        tree(vec![ins(50, RETURN_TRUE, RETURN_FALSE, action_string(1))]),
-    );
-    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
-    let fault = interpreter.pie_menu(&mut fx.world, SIM, LAMP).unwrap_err();
-    assert!(fault.to_string().contains("0x4061e3"), "{fault}");
-    assert!(fault.trap.unported());
-
-    // Exact-text pie labels reject `$TimeLocal`, career tokens, and other
-    // unported passes (`$Family`, `$Attrib`, `$CatalogLocal`, `$Grade`).
+fn an_entrys_string_fails_loudly_on_unported_tokens_and_tables() {
+    // Exact-text pie labels reject in-range `$TimeLocal` (hour in [0, 24)),
+    // career tokens on a person, and other unported passes (`$Family`,
+    // `$Attrib`, `$CatalogLocal`, `$Grade`).
     for (text, needle) in [
         ("$TimeLocal:0", "0x4a6ab1"),
         ("$Job", "0x44c966"),
@@ -1301,8 +1316,8 @@ fn an_entrys_string_fails_loudly_on_ambiguous_names_unported_tokens_and_tables()
         assert!(fault.trap.unported(), "{text}: {fault}");
     }
 
-    // `loaded_strings` order is used when present (0x47028b); `unported_strings`
-    // and `legacy_strings` fail loudly.
+    // `loaded_strings` order is used when present (0x47028b); `unported_strings`,
+    // `legacy_strings`, and `unported_catalog_strings` fail loudly.
     let mut fx = named_menu_lot(vec![with_test(4, 0, 4302)], &["Raw"]);
     fx.program
         .libraries
@@ -1348,6 +1363,26 @@ fn an_entrys_string_fails_loudly_on_ambiguous_names_unported_tokens_and_tables()
     let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
     let fault = interpreter.pie_menu(&mut fx.world, SIM, LAMP).unwrap_err();
     assert!(fault.to_string().contains("0x4702c7"), "{fault}");
+    assert!(fault.trap.unported());
+
+    let mut fx = named_menu_lot(vec![with_test(4, 0, 4302)], &["Use $Object"]);
+    let def = fx.catalog.object(LAMP_GUID).unwrap();
+    let lib = fx.program.libraries.get_mut(&LAMP_FILE).unwrap();
+    lib.definitions.get_mut(&def.chunk).unwrap()[41] = 100;
+    lib.unported_catalog_strings
+        .insert(100, "has an unported CTSS header");
+    fx.add(
+        LAMP_FILE,
+        4302,
+        tree(vec![ins(50, RETURN_TRUE, RETURN_FALSE, action_string(1))]),
+    );
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let fault = interpreter.pie_menu(&mut fx.world, SIM, LAMP).unwrap_err();
+    assert!(
+        fault.to_string().contains("unported CTSS header")
+            && fault.to_string().contains("0x4061e3"),
+        "{fault}"
+    );
     assert!(fault.trap.unported());
 }
 

@@ -36,25 +36,33 @@ tree `0x2074` on phones 4, 10, and 253 formatting `$$Local:1` fares).
 ## What changes here
 
 - Extracted `Machine::string_table` (`0x47028b`) and `Machine::format_text`
-  (`0x44bf1a`, returning `Formatted { texts, types }`) in
+  (`0x44bf1a`, returning `Formatted { text, portrait }`) in
   `crates/sims-vm/src/primitives/dialog.rs` and wired both
   `dialog_strings` / `dialog_text_type` and `action_string` onto them
   without duplicating pass logic.
-- `Machine::action_string` now loads strings via `Machine::string_table`
+- Ported `0x4061e3` / `0x470ca7(0, 0)` / `0x471411(1, -1)` catalog name
+  selection (`Machine::catalog_name`): loads the `CTSS` resource found by
+  `Iff::get` (guarding `CATS` of the same ID and `unported_strings` headers
+  in `Library::unported_catalog_strings`), reads US English (language 1)
+  entries using `0x470ca7` + `0x471343` run rules, and selects slot 1 as
+  the object's name (ignoring slot 2's description and other languages).
+  Missing tables, empty slot 1, `CATS`, and unported `CTSS` headers still
+  fail loudly.
+- `Machine::action_string` loads strings via `Machine::string_table`
   (respecting `loaded_strings`, `unported_strings`, and `legacy_strings`)
   and formats via `Machine::format_text(..., exact_text = self.menu.is_some())`.
-- When `exact_text` is true (building a pie menu label):
-  - `$Local` replaces `$Local[:N[:M]]` with `locals[N]` in decimal while
-    leaving literal `$` characters intact (`$$Local:1` with `local[1] = 50`
-    formats to `$50`).
-  - Single-name `$Me`, `$Object`, and `$Neighbor` substitute cleanly;
-    multi-entry catalog tables where `0x4061e3` could pick among distinct
-    names fail loudly.
-  - Tokens whose output text is not substituted (`$TimeLocal`, `$JobOffer`,
-    `$JobDesc`, `$Job`) fail loudly instead of returning unformatted text.
-- When `exact_text` is false (thread run or check outside a listing, where
-  the text is dropped), `format_text` enforces the same fault/termination
-  checks as dialogs (`dialog.rs`).
+- Both `$TimeLocal` (`0x44c8c4`, `0x44c90b`) and `$Job*` (`0x44c966`,
+  `0x44c9fc`, `0x44ca0b`) parse both `:N[:M]` numbers via `0x44caf6` and
+  validate in-range local reads (`check_local`) regardless of `exact_text`.
+  Out-of-range `$TimeLocal` indices or hours outside `[0, 24)` stay
+  literal even when `exact_text` is true; in-range hours in `[0, 24)`
+  (`0x4a6ab1`) and `$Job*` on a person fail loudly when `exact_text` is
+  true.
+- Classified genuine script null-dereference faults as `Trap::Invalid`
+  (rather than `Trap::Unsupported`, so `sims-game`'s menu UI does not
+  fall back to unchecked entries): missing string indices in
+  `Add/Change Action String` (`0x4704fa` returns null, passed to `strlen`
+  at `0x5b882d`) and non-person `$Job*` (`0x44ca27` reads `person + 0x60e`).
 - Verified on `House05.iff`:
   - Phone object 10 (and phones 4 and 253) now list Call Cab and Services
     cleanly (`"Call Cab.../Go to Magic Town - $50"`,
@@ -63,15 +71,18 @@ tree `0x2074` on phones 4, 10, and 253 formatting `$$Local:1` fares).
     `"Call Cab.../Go On Vacation - $500"`,
     `"Call Cab.../Go Downtown - $50"`, `"Services.../Caterer"`).
   - Every person's pie menu on every object of the Goth house now lists
-    with zero failures at ticks 0, 1500, and 6000
+    with zero failures at ticks 0, 1500, and 6000, restoring the tick
+    snapshot before each `(person, object)` pair
     (`every_person_lists_every_object_on_the_goth_house_at_0_1500_and_6000`).
 
 ## Left out / not verified
 
 - Unported `0x44bf1a` passes (`$FamilyAssets`, `$Family`, `$Attrib`,
   `$NameAttrib`, `$NameLocal`, `$TokenNameLocal`, listed `$NeighborLocal`,
-  `$CatalogLocal`, `$FameTitleLocal`, `$Grade`) and exact-text formatting
-  for `$TimeLocal`, `$Job*`, and multi-entry CTSS lookup (`0x4061e3`)
-  continue to fail loudly.
+  `$CatalogLocal`, `$FameTitleLocal`, `$Grade`), exact-text formatting
+  for in-range `$TimeLocal` (`0x4a6ab1`) and `$Job*`, and `0x4061e3` /
+  `0x457d3b` fallbacks when US English CTSS slot 1 is empty or absent
+  (`CATS`, all-language person fallback `0x470ca7(1, 0)`, OBJD name
+  fallback `0x457db4`) continue to fail loudly.
 - `Special Effect` (`0x44aaa6`, STR# `0x131`) still treats its formatted
   text as presentation and does not call `format_text`.

@@ -71,15 +71,18 @@ fn another_objects_thread_changes_nothing() {
 
 #[test]
 fn a_missing_string_or_a_run_at_once_fails_loudly() {
-    // A string the file lacks: what the original makes of it is not read.
+    // A string the file lacks faults (`0x4704fa` returns null, passed to
+    // `strlen` at `0x5b882d`): a script fault, not something unported.
     let mut fx = named(SIM, SIM_FILE, 2);
     let fault = turn(&mut fx, SIM).unwrap_err();
     assert!(fault.to_string().contains("0x4704fa"), "{fault}");
+    assert!(!fault.trap.unported(), "{fault}");
     assert_eq!(active_flags(&fx), 0x41);
     // A tree run at once that is not a check tree.
     let mut fx = named(SIM, LAMP_FILE, 1);
     let fault = fx.run_with(LAMP, TREE, SIM as i16, &[], 100).unwrap_err();
     assert!(fault.to_string().contains("0x474a37"), "{fault}");
+    assert!(fault.trap.unported(), "{fault}");
     assert_eq!(active_flags(&fx), 0x41);
 }
 
@@ -104,7 +107,8 @@ fn a_string_with_tokens_fails_loudly_before_anything_changes() {
         assert_eq!(active_flags(&fx), 0x41);
     }
 
-    // A non-person running `$Job` faults in the career pass (0x44ca27).
+    // A non-person running `$Job` faults in the career pass (0x44ca27):
+    // a genuine script fault (`!unported()`), not an unported feature.
     let mut fx = named(LAMP, LAMP_FILE, 1);
     fx.program
         .libraries
@@ -114,19 +118,60 @@ fn a_string_with_tokens_fails_loudly_before_anything_changes() {
         .insert(300, vec!["$Job".to_owned()]);
     let fault = turn(&mut fx, LAMP).unwrap_err();
     assert!(fault.to_string().contains("0x44ca27"), "{fault}");
+    assert!(!fault.trap.unported(), "{fault}");
 
-    // In a thread's run (text dropped), `$Local` and multi-entry `$Me`
-    // succeed and set `NAMED` on a person's active interaction.
+    // Even when the formatted text is discarded (thread run), `$TimeLocal`
+    // (0x44c90b) and `$Job*` (0x44c9fc, 0x44ca0b) still read in-range
+    // locals, so a local left as half of a pointer traps before `NAMED` is
+    // set.
+    for (text, unknown_local, addr) in [
+        ("$TimeLocal:0", 0u32, "0x44c90b"),
+        ("$Job:0:1", 0u32, "0x44c9fc"),
+        ("$Job:0:1", 1u32, "0x44ca0b"),
+        ("$JobOffer:0:1", 1u32, "0x44ca0b"),
+        ("$JobDesc:0:1", 0u32, "0x44c9fc"),
+    ] {
+        let mut fx = named(SIM, SIM_FILE, 1);
+        fx.sim_mut().stack[0].locals = vec![0; 4];
+        fx.program.career_texts_end = true;
+        fx.program
+            .libraries
+            .get_mut(&SIM_FILE)
+            .unwrap()
+            .strings
+            .insert(300, vec![text.to_owned()]);
+        fx.world.frame_storage.insert(
+            SIM,
+            sims_sim::FrameStorage {
+                offsets: vec![0],
+                unknown: [(0, unknown_local)].into(),
+                ..Default::default()
+            },
+        );
+        let fault = turn(&mut fx, SIM).unwrap_err();
+        assert!(
+            fault.to_string().contains(addr) && fault.to_string().contains("half of a pointer"),
+            "{text} local {unknown_local}: {fault}"
+        );
+        assert_eq!(active_flags(&fx), 0x41, "{text}");
+    }
+
+    // In a thread's run (text dropped), `$Local`, `$Me` (CTSS slot 1), and
+    // valid `$TimeLocal` / `$Job` (with `career_texts_end`) succeed and set
+    // `NAMED` on a person's active interaction.
     let mut fx = named(SIM, SIM_FILE, 1);
+    fx.program.career_texts_end = true;
     let def = fx.catalog.object(SIM_GUID).unwrap();
     let lib = fx.program.libraries.get_mut(&SIM_FILE).unwrap();
     lib.definitions.get_mut(&def.chunk).unwrap()[41] = 100;
     lib.catalog_strings.insert(
         100,
-        vec![(1, "Mortimer".to_owned()), (1, "Goth".to_owned())],
+        vec![(1, "Mortimer".to_owned()), (1, "Description".to_owned())],
     );
-    lib.strings
-        .insert(300, vec!["$Me pays $$Local:0 at $TimeLocal:0".to_owned()]);
+    lib.strings.insert(
+        300,
+        vec!["$Me pays $$Local:0 at $TimeLocal:0 ($Job:0:1)".to_owned()],
+    );
     assert_eq!(turn(&mut fx, SIM), Ok(Status::Returned(true)));
     assert_eq!(active_flags(&fx), 0xc1);
 }

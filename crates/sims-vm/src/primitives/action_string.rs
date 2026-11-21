@@ -29,13 +29,13 @@
 //! [`Machine::format_text`] in [`crate::primitives::dialog`]) in every run
 //! before `0x44cc9a` asks where the string goes, so any unported token,
 //! invalid local, or non-person career fault fails before state changes.
-//! Passes that substitute into the label (`$Local`, and single-name
-//! `$Me`/`$Object`/`$Neighbor`) produce the formatted menu entry text;
-//! literal `$` signs such as currency prefixes (`$$Local:1` -> `$50`) are
-//! left intact. When adding a pie menu entry, `$Neighbor` writes
-//! `frame.stack_object` into `args[0]` (`0x44c6c7`), and `0x44cca3` sets
-//! `args[0] = frame.stack_object` whenever it is still 0; `$Family` (which
-//! writes `args[1]` at `0x44c0e3`) fails loudly in `format_text`.
+//! Passes that substitute into the label (`$Local`, `$Me`, `$Object`, and
+//! `$Neighbor`) produce the formatted menu entry text; literal `$` signs
+//! such as currency prefixes (`$$Local:1` -> `$50`) are left intact. When
+//! adding a pie menu entry, `$Neighbor` writes `frame.stack_object` into
+//! `args[0]` (`0x44c6c7`), and `0x44cca3` sets `args[0] = frame.stack_object`
+//! whenever it is still 0; `$Family` (which writes `args[1]` at `0x44c0e3`)
+//! fails loudly in `format_text`.
 //!
 //! The string table is loaded with `0x47028b` (argument 3 zero,
 //! [`Machine::string_table`]), the same loader `dialog.rs` uses.
@@ -60,10 +60,10 @@
 //! Any other tree run at once fails loudly: the original drops the string
 //! there too, but which of the port's runs at once are the original's
 //! synchronous run has not been checked one by one. A string the file
-//! lacks fails loudly: what the original makes of the empty string pointer
-//! 0x4704fa returns for it is not read. The old prototype's
-//! `change_action_string` (legacy/crates/sims-vm/src/person.rs) reads the
-//! code the same way.
+//! lacks faults as [`Trap::Invalid`]: `0x4704fa` returns null, which
+//! `0x44cc07` passes to `0x5b882d` (`strlen`), whereas a present empty
+//! string is valid. The old prototype's `change_action_string`
+//! (legacy/crates/sims-vm/src/person.rs) reads the code the same way.
 
 use crate::autonomy::checked;
 use crate::fault::Trap;
@@ -84,15 +84,7 @@ impl Machine<'_, '_> {
         let exact = self.menu.is_some();
         let formatted = self.format_text(raw, "Add/Change Action String's", exact)?;
         if let Some(menu) = self.menu {
-            if formatted.texts.len() != 1 {
-                return Err(Trap::Unsupported(
-                    "Add/Change Action String's `$Me`, `$Object` or `$Neighbor` is replaced by \
-                     one of a type's catalog names (0x44bf1a, 0x4573d9, 0x4061e3, which picks \
-                     one, is not ported)"
-                        .into(),
-                ));
-            }
-            let name = formatted.texts.into_iter().next().unwrap();
+            let name = formatted.text;
             let frame = self.frame()?;
             // `$Neighbor` writes `stack_object` to `args[0]` (0x44c6c7),
             // and otherwise `0x44cca3` sets `args[0] = stack_object` when
@@ -138,9 +130,10 @@ impl Machine<'_, '_> {
             .and_then(|strings| strings.get(usize::from(index).checked_sub(1)?))
             .cloned()
             .ok_or_else(|| {
-                Trap::Unsupported(format!(
+                Trap::Invalid(format!(
                     "Add/Change Action String names string {index} of table {table}, which the \
-                     running code's file lacks (0x4704fa)"
+                     running code's file lacks (0x4704fa returns null, passed to strlen at \
+                     0x5b882d)"
                 ))
             })
     }
