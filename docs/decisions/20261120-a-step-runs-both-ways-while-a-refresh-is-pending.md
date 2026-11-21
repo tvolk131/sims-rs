@@ -212,8 +212,10 @@ What is not ported:
   (0x4a677c, 0x4a7b58). The camera is the player's, so the tile at the
   view's centre is an input, as the view's rotation is
   (`Interpreter::view_centre`, `Lot::set_view_centre`, `sims boot
-  --view-centre X,Y`, saved with a lot from save format 2). The pick
-  itself is not ported, so the input is the tile it gives. When the tile
+  --view-centre X,Y`, `Lot::load_viewed`, saved with a lot from save
+  format 2). The interface's work on the pick is not ported, so the input
+  is the tile the search starts from (see "The view's centre at 24719"
+  below). When the tile
   is given, the search runs from it as in the original, its place tests'
   callbacks included. When it is not, the search runs from every tile it
   may start from (`Interpreter::search_from_anywhere`), on a copy of the
@@ -237,26 +239,33 @@ What is not ported:
     25 or 26 names a tree. A person with function 25 or 26 is a seat:
     the objects on the tiles beside it are told, and may be asked their
     function 9 (0x43355d, 0x433612). So does its function 10 (before the
-    removal, 0x433148, which sees the room it was put in) or 5 (0x4337f6,
-    which the search asks). Its Init (function 0) runs when it is made,
-    as for any person;
-  - its data word 7 is not 0, which marks the room it is put in and taken
-    from as not counted for its light (0x433ed8, 0x4412c6);
-  - its data word 40 has bit 0x400, which marks the room it lands in as
-    not counted (0x433340);
-  - it is a person of kind 0 or 1 (person word 65; a pet is above 1) and
-    the tile the search ends on (with no view centre, any it may end on)
-    is in an indoor room that is not a pool and not marked as occupied.
-    The put marks the room (0x45e43d, 0x468802), and its removal leaves
-    the mark;
+    removal, 0x433148, which sees the room it was put in). Its function 5
+    (0x4337f6) is the search's to ask: run as in the original with a view
+    centre, held to change nothing without one. Its Init (function 0) runs
+    when it is made, as for any person;
+  - after the search (whose callbacks may set them), its data word 7 is
+    not 0, which marks the room it is put in and taken from as not
+    counted for its light (0x433ed8, 0x4412c6);
+  - after the search, its data word 40 has bit 0x400, which marks the
+    room it lands in as not counted (0x433340);
+  - noting the room the search ends in (with no view centre, any it may
+    end in) changes a room's mark of who is in it (0x45e43d, 0x468802),
+    for a person of kind 0 or 1 (person word 65; a pet is above 1). The
+    put marks an indoor room that is not a pool and not marked. It also
+    takes the mark off the room the person was last seen in (data word 29
+    as its first tick noted it) when nobody else was last seen there. Its
+    removal leaves the marks. This is tried on a copy of the lot for each
+    room (`note_room`);
   - no tile is found (from the view centre given, or with none from some
     start). The original then removes it without drawing it (0x4e9706),
     and 0x4e938c builds again in the same dialog unless the type has
     image 2002. That is not ported.
 
-  The build runs on a copy of the lot, which is kept only when it is
-  done, so a build that fails leaves no person behind (the original
-  removes it on every path, 0x4e8fdb, 0x4e9706). Tests:
+  The build runs on a copy of the lot and of the machine's cells (the
+  sounds its Init plays, the objects it deletes), which are kept only
+  when it is done, so a build that fails leaves nothing behind (the
+  original removes the person on every path, 0x4e8fdb, 0x4e9706). A
+  build that changes the refresh pending fails loudly. Tests:
   `a_portrait_whose_person_runs_code_when_put_down_fails_loudly`,
   `a_portrait_whose_put_depends_on_its_tile_fails_loudly`,
   `a_portrait_searches_from_the_view_centre_when_it_is_given`,
@@ -265,11 +274,15 @@ What is not ported:
   catalog name (0x44c1ca, 0x4573d9 to 0x457d3b): an entry of the CTSS
   table definition word 41 names, read through 0x4061e3, or the
   definition's own name when that entry is empty (0x457db4). The
-  `$Neighbor` pass after it reads the name too, so a name that holds
-  `$Neighbor` shows the neighbor's type. Which entry 0x4061e3 picks is
-  not ported, so a name is taken to be plain only when its table has an
-  entry in language 1 and no entry is empty or holds `$Neighbor`. Where
-  the name would decide the type, the dialog fails loudly. On the Goth
+  `$NeighborLocal` and `$Neighbor` passes after it read the text with the
+  name in it, so a name that holds `$Neighbor`, or that makes it with the
+  text around it (`$$Object` and a name `Neighbor`), shows the neighbor's
+  type. Which entry 0x4061e3 picks is not ported, so every entry is tried
+  in the token's place, and the passes after it must agree on all of
+  them. The names are known only when the table has an entry in language
+  1, no entry is empty, and the object's file has no legacy CATS table,
+  which 0x4061e3 checks first (Sol's reading, **unverified** here).
+  Where the name would decide the type, the dialog fails loudly. On the Goth
   house this matters at update 901. Test:
   `an_object_name_that_may_hold_a_neighbor_token_fails_loudly`.
 - **Other builders.** Only the dialog's builds are counted. The household
@@ -292,17 +305,37 @@ the original would build again, and all the others reach one state hash.
 So the start does not matter outside those four cells.
 
 The recording's state shows a single 1,920-draw build at 24719 and no
-second one. So the real camera was not on one of the four cells, and
-every other start gives the state the recording implies. Without the
-input, a boot of the Goths stops at 24719, as the adoption dialog at
-17707 does without `--answers`. The Goth day's tests give the lot's
-middle tile, 32,32 (`GOTH_VIEW_CENTRE`). It is labelled in the code, the
-tests and here as **a stand-in start tile, not the original's camera**.
+second one. That does not rule out the four cells. The cat's type
+(Waggles, neighbor 328, 0xDC7419A2) has image 2002 (`BMP_` 2002, "faces",
+in `User00036.iff`; checked in the guest's and the install's copies). So
+from a start that finds no tile the original makes the cat once (1,920
+draws), removes it unput (0x4e9706), and does not build again (0x4e938c).
+The recording's draws are the same either way, so it does not say where
+the camera was. A start on one of the four cells takes that branch, which
+is not ported, and stops loudly.
+
+Without the input, a boot of the Goths stops at 24719, as the adoption
+dialog at 17707 does without `--answers`. The Goth day's tests give the
+lot's middle tile, 32,32 (`GOTH_VIEW_CENTRE`). It is labelled in the code,
+the tests and here as **a stand-in start tile, not the original's
+camera**. (An earlier draft of the label said the recording showed the
+camera was not on a no-room cell. That was wrong, for the reason above.)
+
+The input is the tile the search starts from, not the view's pick. By a
+reading of the disassembly (Sol's, **unverified** here), the interface
+checks the pick against the view's bounds with a fallback (0x434891),
+undoes the view's rotation (0x43491c) and clamps it before the spiral.
+None of that is ported, so `--view-centre` and `Lot::set_view_centre`
+take the tile after it. `Lot::load_viewed` takes it before the load, so
+the load's own steps see it too.
 
 Open items:
 
 - read the house view's centre from a capture (scroll, zoom, rotation);
-- port the screen-centre pick (0x4a7b58);
+- port the screen-centre pick (0x4a7b58), with its bounds check and
+  fallback (0x434891), the rotation undone (0x43491c) and the clamp;
+- port the no-tile branch (0x4e9706, 0x4e938c: no second build for a type
+  with image 2002);
 - both tie to the open question of which camera the original opens the
   Goths' house with.
 

@@ -152,7 +152,6 @@ fn a_portrait_whose_person_runs_code_when_put_down_fails_loudly() {
         (26, "0x433612"),
         (25, "0x433612"),
         (10, "0x433148"),
-        (5, "0x4337f6"),
     ] {
         let (mut fx, file, record) = visitors();
         let objects: Vec<u16> = fx.world.objects.keys().copied().collect();
@@ -303,6 +302,32 @@ fn inform_hearing(
     interpreter.run_tree(&mut fx.world, LAMP, 4096, stack_object, &[], 1000)
 }
 
+/// The fixture's lot, 6 tiles wide, with the tiles whose first
+/// coordinate is below 3 outdoors (room 2) and the rest an indoor room
+/// nobody is in (1); the last neighbor record's person is of kind 0
+/// (word 65).
+fn indoors_and_out(fx: &mut Fixture) {
+    let record = fx.world.neighbors.slots.len();
+    fx.world.neighbors.slots[record - 1].as_mut().unwrap().data[65] = 0;
+    fx.world.rooms.rooms.clear();
+    fx.world
+        .rooms
+        .rooms
+        .insert(1, sims_sim::rooms::Room::default());
+    fx.world.rooms.rooms.insert(
+        2,
+        sims_sim::rooms::Room {
+            outdoors: true,
+            ..Default::default()
+        },
+    );
+    for a in 0..64 {
+        for b in 0..64 {
+            fx.world.rooms.map[0][a * 64 + b] = if a < 3 { 2 } else { 1 };
+        }
+    }
+}
+
 #[test]
 fn a_portrait_searches_from_the_view_centre_when_it_is_given() {
     // On the fixture's lot, 6 tiles wide, tiles with a first coordinate
@@ -310,27 +335,7 @@ fn a_portrait_searches_from_the_view_centre_when_it_is_given() {
     // (1). A person of kind 0 put indoors
     // marks the room as occupied (0x45e43d), which its removal leaves. The
     // person's kind comes from its neighbor record (word 65).
-    let rooms = |fx: &mut Fixture| {
-        let record = fx.world.neighbors.slots.len();
-        fx.world.neighbors.slots[record - 1].as_mut().unwrap().data[65] = 0;
-        fx.world.rooms.rooms.clear();
-        fx.world
-            .rooms
-            .rooms
-            .insert(1, sims_sim::rooms::Room::default());
-        fx.world.rooms.rooms.insert(
-            2,
-            sims_sim::rooms::Room {
-                outdoors: true,
-                ..Default::default()
-            },
-        );
-        for a in 0..64 {
-            for b in 0..64 {
-                fx.world.rooms.map[0][a * 64 + b] = if a < 3 { 2 } else { 1 };
-            }
-        }
-    };
+    let rooms = indoors_and_out;
     // With no centre, some start ends indoors.
     let (mut fx, _, record) = visitors();
     rooms(&mut fx);
@@ -380,6 +385,50 @@ enum Callback {
     Silent,
 }
 
+/// The visitors' lot ([`visitors`]) with an [`OBSTACLE`] at 3,3 whose
+/// function 5 does `callback`: the lot, the widget's file, the neighbor
+/// record and the obstacle.
+fn obstacle(callback: Callback) -> (Fixture, usize, i16, u16) {
+    let (mut fx, widget, record) = visitors();
+    let file = fx.add_type(OBSTACLE, 4, 4096, 4097);
+    fx.add(
+        file,
+        4096,
+        tree(vec![
+            assign(scope::MY_DATA, 4, scope::LITERAL, 1, 1),
+            assign(scope::MY_DATA, 42, scope::LITERAL, 2, RETURN_TRUE),
+        ]),
+    );
+    fx.add(file, 4097, sleeper());
+    crate::visits::function(&mut fx, file, 5, 4300);
+    fx.program
+        .libraries
+        .get_mut(&file)
+        .unwrap()
+        .sounds
+        .insert(5, "bump".into());
+    fx.add(
+        file,
+        4300,
+        tree(vec![match callback {
+            Callback::Writes => assign(scope::MY_DATA, 50, scope::LITERAL, 1, RETURN_FALSE),
+            Callback::Plays => ins(23, RETURN_TRUE, ERROR, [5, 0, 0, 0, 0, 0, 0, 0]),
+            Callback::Silent => ins(23, RETURN_TRUE, ERROR, [6, 0, 0, 0, 0, 0, 0, 0]),
+        }]),
+    );
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let id = interpreter.create(&mut fx.world, OBSTACLE).unwrap();
+    let cell = (3 * 64 + 3) * 2;
+    let grid = &mut fx.world.arrays.get_mut(&3).unwrap().data;
+    grid[cell..cell + 2].copy_from_slice(&id.to_le_bytes());
+    let position = [3 * 16 + 8, 3 * 16 + 8, 1];
+    let room = fx.world.room_at(position).unwrap();
+    let obstacle = fx.world.objects.get_mut(&id).unwrap();
+    obstacle.position = position;
+    obstacle.data[29] = room;
+    (fx, widget, record, id)
+}
+
 #[test]
 fn a_callback_the_search_runs_must_change_nothing_when_no_centre_is_given() {
     // The obstacle stands at 3,3; the search's place test beside it asks
@@ -395,43 +444,7 @@ fn a_callback_the_search_runs_must_change_nothing_when_no_centre_is_given() {
     // the storage held the same words already (when only the cells, such
     // as a sound, can show it).
     let setup = |callback: Callback| {
-        let (mut fx, _, record) = visitors();
-        let file = fx.add_type(OBSTACLE, 4, 4096, 4097);
-        fx.add(
-            file,
-            4096,
-            tree(vec![
-                assign(scope::MY_DATA, 4, scope::LITERAL, 1, 1),
-                assign(scope::MY_DATA, 42, scope::LITERAL, 2, RETURN_TRUE),
-            ]),
-        );
-        fx.add(file, 4097, sleeper());
-        crate::visits::function(&mut fx, file, 5, 4300);
-        fx.program
-            .libraries
-            .get_mut(&file)
-            .unwrap()
-            .sounds
-            .insert(5, "bump".into());
-        fx.add(
-            file,
-            4300,
-            tree(vec![match callback {
-                Callback::Writes => assign(scope::MY_DATA, 50, scope::LITERAL, 1, RETURN_FALSE),
-                Callback::Plays => ins(23, RETURN_TRUE, ERROR, [5, 0, 0, 0, 0, 0, 0, 0]),
-                Callback::Silent => ins(23, RETURN_TRUE, ERROR, [6, 0, 0, 0, 0, 0, 0, 0]),
-            }]),
-        );
-        let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
-        let id = interpreter.create(&mut fx.world, OBSTACLE).unwrap();
-        let cell = (3 * 64 + 3) * 2;
-        let grid = &mut fx.world.arrays.get_mut(&3).unwrap().data;
-        grid[cell..cell + 2].copy_from_slice(&id.to_le_bytes());
-        let position = [3 * 16 + 8, 3 * 16 + 8, 1];
-        let room = fx.world.room_at(position).unwrap();
-        let obstacle = fx.world.objects.get_mut(&id).unwrap();
-        obstacle.position = position;
-        obstacle.data[29] = room;
+        let (fx, _, record, id) = obstacle(callback);
         (fx, record, id)
     };
     let (mut fx, record, id) = setup(Callback::Writes);
@@ -522,8 +535,173 @@ fn a_callback_the_search_runs_must_change_nothing_when_no_centre_is_given() {
     );
 }
 
+/// Gives the person's function `function` tree `tree`, in every callback
+/// table of the widget's file.
+fn widget_function(fx: &mut Fixture, file: usize, function: usize, tree: u16) {
+    let library = fx.program.libraries.get_mut(&file).unwrap();
+    for table in library.callbacks.values_mut() {
+        if table.len() <= function {
+            table.resize(
+                27,
+                sims_formats::execution::ObjectFunction {
+                    condition: 0,
+                    action: 0,
+                },
+            );
+        }
+        table[function].action = tree;
+    }
+}
+
+#[test]
+fn with_a_view_centre_the_persons_own_function_5_runs_and_its_words_are_read_after() {
+    // The person's function 5 is the search's to ask, with the object in
+    // its way as the stack object (0x433a1a): from a centre beside the
+    // obstacle it runs as in the original, then the obstacle's.
+    let (mut fx, widget, record, id) = obstacle(Callback::Writes);
+    fx.add(
+        widget,
+        4200,
+        tree(vec![assign(
+            scope::MY_DATA,
+            50,
+            scope::LITERAL,
+            1,
+            RETURN_FALSE,
+        )]),
+    );
+    widget_function(&mut fx, widget, 5, 4200);
+    assert_eq!(inform_from(&mut fx, 2, record, Some([3, 4])), Ok(true));
+    assert_eq!(fx.world.objects[&id].data[50], 1);
+    assert_eq!(fx.world.portraits, [WIDGET].into());
+    // What it does is read after the search: data word 7 (0x433ed8) and
+    // data word 40 bit 0x400 (0x433340), set by it, fail the put.
+    for (word, value, said) in [(7, 1, "data word 7"), (40, 0x400, "bit 0x400")] {
+        let (mut fx, widget, record, _) = obstacle(Callback::Writes);
+        fx.add(
+            widget,
+            4200,
+            tree(vec![assign(
+                scope::MY_DATA,
+                word,
+                scope::LITERAL,
+                value,
+                RETURN_FALSE,
+            )]),
+        );
+        widget_function(&mut fx, widget, 5, 4200);
+        let fault = inform_from(&mut fx, 2, record, Some([3, 4]))
+            .unwrap_err()
+            .to_string();
+        assert!(fault.contains(said), "{word}: {fault}");
+        assert!(fx.world.portraits.is_empty());
+    }
+}
+
+#[test]
+fn a_portrait_put_that_takes_the_mark_off_the_room_it_was_last_seen_in_fails_loudly() {
+    // The person's Init names room 1 in its data word 29, and its first
+    // tick, which the factory runs, notes that as the room it was last
+    // seen in (0x45e43d). Put outdoors, it then takes room 1's mark off
+    // when nobody else was last seen there (0x46886c, 0x468802), and the
+    // removal leaves it so.
+    let setup = |others: bool| {
+        let (mut fx, file, record) = visitors();
+        indoors_and_out(&mut fx);
+        fx.world.rooms.rooms.get_mut(&1).unwrap().occupied = true;
+        fx.add(
+            file,
+            4096,
+            tree(vec![
+                assign(scope::MY_DATA, 4, scope::LITERAL, 1, 1),
+                assign(scope::MY_DATA, 42, scope::LITERAL, 2, 2),
+                assign(scope::MY_DATA, 29, scope::LITERAL, 1, RETURN_TRUE),
+            ]),
+        );
+        if others {
+            fx.world.person_ticks.insert(
+                SIM,
+                sims_sim::PersonTick {
+                    room: 1,
+                    ..sims_sim::PersonTick::CONSTRUCTED
+                },
+            );
+        }
+        (fx, record)
+    };
+    let (mut fx, record) = setup(false);
+    let rooms = fx.world.rooms.clone();
+    let fault = inform_from(&mut fx, 2, record, Some([1, 1]))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        fault.contains("room 2") && fault.contains("0x468802"),
+        "{fault}"
+    );
+    assert_eq!(fx.world.rooms, rooms);
+    // With no centre, the same from every start outdoors.
+    let (mut fx, record) = setup(false);
+    let fault = inform_from(&mut fx, 2, record, None)
+        .unwrap_err()
+        .to_string();
+    assert!(fault.contains("0x468802"), "{fault}");
+    // Someone else last seen in room 1 keeps its mark.
+    let (mut fx, record) = setup(true);
+    assert_eq!(inform_from(&mut fx, 2, record, Some([1, 1])), Ok(true));
+    assert!(fx.world.rooms.rooms[&1].occupied);
+}
+
+#[test]
+fn a_portrait_build_that_fails_leaves_the_machines_cells_as_they_were() {
+    // The person's Init plays a sound, and the put then fails (data word
+    // 40 bit 0x400, 0x433340): the sound is not kept, as the person is
+    // not. Without the bit the build is kept, the sound with it.
+    for bit in [0x400, 0] {
+        let (mut fx, file, record) = visitors();
+        fx.program
+            .libraries
+            .get_mut(&file)
+            .unwrap()
+            .sounds
+            .insert(5, "hello".into());
+        fx.add(
+            file,
+            4096,
+            tree(vec![
+                assign(scope::MY_DATA, 4, scope::LITERAL, 1, 1),
+                assign(scope::MY_DATA, 42, scope::LITERAL, 2, 2),
+                ins(23, 3, ERROR, [5, 0, 0, 0, 0, 0, 0, 0]),
+                assign(scope::MY_DATA, 40, scope::LITERAL, bit, RETURN_TRUE),
+            ]),
+        );
+        let heard = Default::default();
+        let ran = inform_hearing(&mut fx, 2, record, Some([1, 1]), &heard);
+        let heard = heard.into_inner();
+        if bit != 0 {
+            let fault = ran.unwrap_err().to_string();
+            assert!(fault.contains("bit 0x400"), "{fault}");
+            assert!(heard.is_empty(), "{heard:?}");
+        } else {
+            assert_eq!(ran, Ok(true));
+            assert!(
+                heard.iter().any(|event| matches!(
+                    event,
+                    sims_vm::SoundEvent::Play { name, .. } if name == "hello"
+                )),
+                "{heard:?}"
+            );
+        }
+    }
+}
+
 /// The strings of the dialogs in [`text_dialog`]: STR# 301, from 1.
-const TEXT_STRINGS: [&str; 4] = ["Hello", "$Neighbor", "$Object", "$Object then $Neighbor"];
+const TEXT_STRINGS: [&str; 5] = [
+    "Hello",
+    "$Neighbor",
+    "$Object",
+    "$Object then $Neighbor",
+    "$$Object",
+];
 
 /// The catalog string table the person's definition names (word 41).
 const SIM_NAMES: u16 = 2000;
@@ -596,20 +774,22 @@ fn a_dialogs_text_can_show_the_stack_objects_neighbor_instead() {
 #[test]
 fn an_object_name_that_may_hold_a_neighbor_token_fails_loudly() {
     // `$Object` is replaced by the stack object's catalog name (0x44c1ca,
-    // 0x457d3b), and the `$Neighbor` pass after it reads the name too: a
-    // name holding `$Neighbor` shows the neighbor's type. The entry
-    // 0x4061e3 picks is not ported, so a name is plain only when its table
-    // has an entry in language 1 and no entry is empty (which falls back
-    // to the definition's own name, 0x457db4) or holds `$Neighbor`. Where
-    // that decides the portrait, the dialog fails.
-    for names in [
-        None,
-        Some(vec![(1, "Grim $Neighbor")]),
-        Some(vec![(1, "Grim"), (2, "$Neighbor")]),
-        Some(vec![(1, "")]),
-        Some(vec![(2, "Grim")]),
+    // 0x457d3b), and the `$Neighbor` pass after it reads the text with the
+    // name in it: a name holding `$Neighbor`, or making it with the text
+    // around it, shows the neighbor's type. The entry 0x4061e3 picks is not
+    // ported, so every entry is tried; the names are not known when the
+    // table has no entry in language 1, an entry is empty (which falls
+    // back to the definition's own name, 0x457db4), or there is no table.
+    // Where the names do not agree on the portrait, the dialog fails.
+    for (names, message) in [
+        (None, 3),
+        (Some(vec![(1, "Grim"), (2, "$Neighbor")]), 3),
+        (Some(vec![(1, "")]), 3),
+        (Some(vec![(2, "Grim")]), 3),
+        (Some(vec![(1, "Neighbor"), (2, "Grim")]), 5),
+        (None, 5),
     ] {
-        for strings in [(2, 3, 0), (0, 0, 3)] {
+        for strings in [(2, message, 0), (0, 0, message)] {
             let mut fx = text_dialog(strings, names.clone());
             let fault = fx
                 .run_with(LAMP, 4096, SIM as i16, &[], 1000)
@@ -620,10 +800,35 @@ fn an_object_name_that_may_hold_a_neighbor_token_fails_loudly() {
         }
         // Where the neighbor is found after the name, the name does not
         // matter.
-        let mut fx = text_dialog((3, 0, 2), names.clone());
+        let mut fx = text_dialog((message, 0, 2), names.clone());
         assert_eq!(fx.run_with(LAMP, 4096, SIM as i16, &[], 1000), Ok(true));
         assert_eq!(fx.world.portraits, [WIDGET].into(), "{names:?}");
     }
+    // Where every name gives the same, it is used: each holds `$Neighbor`,
+    // or makes it with the `$` before the token, or none does.
+    for (names, message, shown) in [
+        (vec![(1, "Grim $Neighbor")], 3, WIDGET),
+        (vec![(1, "Neighbor"), (2, "Neighbors")], 5, WIDGET),
+        (vec![(1, "Grim"), (2, "Grimm")], 5, SIM_GUID),
+    ] {
+        let mut fx = text_dialog((0, 0, message), Some(names.clone()));
+        assert_eq!(fx.run_with(LAMP, 4096, SIM as i16, &[], 1000), Ok(true));
+        assert_eq!(fx.world.portraits, [shown].into(), "{names:?}");
+    }
+    // A legacy catalog string table (CATS) in the object's file, which
+    // 0x4061e3 checks first, leaves the name not known.
+    let mut fx = text_dialog((0, 0, 3), Some(vec![(1, "Grim")]));
+    fx.program
+        .libraries
+        .get_mut(&SIM_FILE)
+        .unwrap()
+        .legacy_catalog_strings
+        .insert(SIM_NAMES);
+    let fault = fx
+        .run_with(LAMP, 4096, SIM as i16, &[], 1000)
+        .unwrap_err()
+        .to_string();
+    assert!(fault.contains("0x44c1ca"), "{fault}");
 }
 
 #[test]

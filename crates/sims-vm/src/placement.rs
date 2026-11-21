@@ -253,11 +253,6 @@ mod word {
 
 /// Callbacks placement asks about without running them here.
 pub(crate) const SEAT: usize = 26;
-/// Person data word 65, the person's kind: one of 0 or 1 notes the room
-/// it is in (0x45e43d).
-const PERSON_KIND: usize = 65;
-/// The callback the place test asks of the objects in the way (0x4337f6).
-const ALLOW_OVERLAP: usize = 5;
 /// The callback the removal asks before it takes an object off (0x433148).
 const BEFORE_REMOVAL: usize = 10;
 const SEAT_CHANGED: usize = 25;
@@ -1269,8 +1264,12 @@ impl Interpreter<'_> {
     /// view's centre (0x4a677c), and puts the person there (virtual
     /// function 0x88, 0x45e4e9: [`Self::put_person`]); with no tile it
     /// removes the person unput (0x4e9706). The view is presentation, so
-    /// the tile at its centre is an input ([`Interpreter::view_centre`]):
-    /// when it is given the search is made from it, and when it is not the
+    /// the tile the search starts from is an input
+    /// ([`Interpreter::view_centre`]): the tile after the interface's work
+    /// on the view's pick, which is not ported (by a reading of the
+    /// disassembly, **unverified**: a bounds check with a fallback,
+    /// 0x434891, then the view's rotation undone, 0x43491c, and a clamp).
+    /// When it is given the search is made from it, and when it is not the
     /// search is made from every tile it may start from. The put is done
     /// only as far as it is the same on every tile the search may end on:
     /// the interface's work for an object come from outside
@@ -1280,33 +1279,37 @@ impl Interpreter<'_> {
     ///
     /// It fails loudly where the tile would matter:
     ///
-    /// 1. the person's definition names a tree for a function the put, the
-    ///    search or the removal asks: 9 (placed, 0x433580), 6 (walls
-    ///    changed, 0x435110), 25 and 26 (a seat: the objects beside it may
-    ///    be asked their function 9, 0x433612), 10 (before the removal,
-    ///    0x433148, which sees the room it was put in) and 5 (0x4337f6).
-    ///    Its Init (function 0) runs when it is made, as for any person;
+    /// 1. the person's definition names a tree for a function the put or
+    ///    the removal asks: 9 (placed, 0x433580), 6 (walls changed,
+    ///    0x435110), 25 and 26 (a seat: the objects beside it may be asked
+    ///    their function 9, 0x433612) and 10 (before the removal,
+    ///    0x433148, which sees the room it was put in). Its Init (function
+    ///    0) runs when it is made, as for any person;
     /// 2. with no view centre given, a callback tree the search's place
     ///    tests run changes the lot or the machine's cells (function 5 of
     ///    the person and of the objects in its way beside a tile it tries,
-    ///    0x434b94, 0x433a1a, 0x433a35): which tiles the original tries
-    ///    depends on the start. One that changes nothing may run, and its
-    ///    answer is used. The calls are not noted in the trace of calls
+    ///    0x4337f6, 0x434b94, 0x433a1a, 0x433a35): which tiles the original
+    ///    tries depends on the start. One that changes nothing may run, and
+    ///    its answer is used. The calls are not noted in the trace of calls
     ///    (`Interpreter::asked`). With a view centre given, the search's
     ///    callbacks run as they do in the original;
-    /// 3. data word 7 is not 0: the room it is put in and taken from is
-    ///    marked as not counted for its light (0x433ed8, 0x4412c6);
-    /// 4. data word 40 has bit 0x400: the room it is put in is marked as
-    ///    not counted (0x433340);
+    /// 3. after the search, data word 7 is not 0: the room it is put in and
+    ///    taken from is marked as not counted for its light (0x433ed8,
+    ///    0x4412c6);
+    /// 4. after the search, data word 40 has bit 0x400: the room it is put
+    ///    in is marked as not counted (0x433340);
     /// 5. no tile is found (from the view centre, or with none given from
     ///    some start): the original then removes it unput and builds again
-    ///    in the same dialog (0x4e9706, 0x4e938c), which is not ported;
-    /// 6. it is a person of kind 0 or 1 (person word 65; a pet is above 1)
-    ///    and the tile the search ends on (with no view centre given, any
-    ///    it may end on) is in an indoor room that is not a pool and not
-    ///    marked as occupied: the put marks it ([`World::note_occupant`]
-    ///    through [`Self::note_room`], 0x45e43d, 0x468802), and the
-    ///    removal leaves the mark.
+    ///    in the same dialog unless the type has image 2002 (0x4e9706,
+    ///    0x4e938c), which is not ported;
+    /// 6. noting the room of the tile the search ends on (with no view
+    ///    centre given, any it may end on) changes a room's mark of who is
+    ///    in it ([`World::note_occupant`] through [`Self::note_room`],
+    ///    0x45e43d, 0x468802), for a person of kind 0 or 1 (person word
+    ///    65; a pet is above 1): an indoor room that is not a pool and not
+    ///    marked is marked, and the room the person was last seen in (as
+    ///    its first tick may have noted it) loses its mark when nobody else
+    ///    was last seen there. The removal leaves the marks.
     pub(crate) fn portrait_put(&self, world: &mut World, id: u16) -> Result<(), Fault> {
         let fail = |what: String| Fault {
             object: id,
@@ -1324,7 +1327,6 @@ impl Interpreter<'_> {
             })
         };
         for (function, at) in [
-            (ALLOW_OVERLAP, "0x4337f6"),
             (WALLS_CHANGED, "0x435110"),
             (function::PLACED, "0x433580"),
             (BEFORE_REMOVAL, "0x433148"),
@@ -1337,19 +1339,6 @@ impl Interpreter<'_> {
                     "the person's function {function} names tree {tree} ({at})"
                 )));
             }
-        }
-        if datum(world, data::LIGHTS_ROOM)? != 0 {
-            return Err(fail(
-                "data word 7 marks the room it is put in as not counted for its light (0x433ed8, \
-                 0x4412c6)"
-                    .into(),
-            ));
-        }
-        if datum(world, data::FLAGS_2)? as u16 & 0x400 != 0 {
-            return Err(fail(
-                "data word 40 bit 0x400 marks the room it lands in as not counted (0x433340)"
-                    .into(),
-            ));
         }
         let rules = Rules {
             same_room: true,
@@ -1397,30 +1386,50 @@ impl Interpreter<'_> {
                 ends.into_keys().collect()
             }
         };
-        let kind = world
-            .objects
-            .get(&id)
-            .and_then(|o| o.person.as_ref())
-            .and_then(|p| p.data.get(PERSON_KIND).copied())
-            .unwrap_or(0);
-        if kind <= 1 {
-            for [a, b] in ends.into_iter().flatten() {
-                let room = find::room(world, a, b, 1).map_err(|trap| Fault {
-                    object: id,
-                    at: None,
-                    trap,
-                })?;
-                if world
-                    .rooms
-                    .rooms
-                    .get(&room)
-                    .is_some_and(|r| !r.outdoors && !r.pool && !r.occupied)
-                {
-                    return Err(fail(format!(
-                        "it may land in room {room}, which it marks as occupied (0x45e43d, \
-                         0x468802) and its removal leaves marked"
-                    )));
-                }
+        // The words are read after the search, whose callbacks may set
+        // them when a view centre is given.
+        if datum(world, data::LIGHTS_ROOM)? != 0 {
+            return Err(fail(
+                "data word 7 marks the room it is put in as not counted for its light (0x433ed8, \
+                 0x4412c6)"
+                    .into(),
+            ));
+        }
+        if datum(world, data::FLAGS_2)? as u16 & 0x400 != 0 {
+            return Err(fail(
+                "data word 40 bit 0x400 marks the room it lands in as not counted (0x433340)"
+                    .into(),
+            ));
+        }
+        // The rooms the put notes ([`Self::note_room`]) for each room the
+        // search may end in, on a copy: it must change no room's mark.
+        let mut rooms = BTreeSet::new();
+        for [a, b] in ends.into_iter().flatten() {
+            rooms.insert(find::room(world, a, b, 1).map_err(|trap| Fault {
+                object: id,
+                at: None,
+                trap,
+            })?);
+        }
+        for room in rooms {
+            let mut copy = world.clone();
+            if let Some(word) = copy
+                .objects
+                .get_mut(&id)
+                .and_then(|o| o.data.get_mut(data::ROOM))
+            {
+                *word = room;
+            }
+            self.note_room(&mut copy, id).map_err(|trap| Fault {
+                object: id,
+                at: None,
+                trap,
+            })?;
+            if copy.rooms != world.rooms {
+                return Err(fail(format!(
+                    "it may land in room {room}, and noting that changes the rooms' marks of who \
+                     is in them (0x45e43d, 0x468802), which its removal leaves"
+                )));
             }
         }
         self.placed_from_outside(world, id)

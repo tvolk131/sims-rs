@@ -24,11 +24,12 @@ const USAGE: &str = "usage: sims census <path>...
   boot     Run a house's lot load as far as it is implemented, then N ticks,
            and print the hash of the state it reaches. A dialog with a
            choice takes the next of --answers (2 for the first button, 3
-           the second, 4 the third). --view-centre is the tile at the
-           centre of the house view, which a dialog's portrait searches
-           from for a tile; without it a boot stops where that tile would
-           matter. --frames says after which ticks the
-           house view draws a frame: tick numbers (0 for before the first
+           the second, 4 the third). --view-centre is the tile a dialog's
+           portrait searches from for a tile, from the centre of the house
+           view after the interface's work on it (its bounds check and
+           un-rotation are not ported, so give the tile they lead to);
+           without it a boot stops where that tile would matter. --frames
+           says after which ticks the house view draws a frame: tick numbers (0 for before the first
            tick), N+ for every tick from N on, N+S for N and every S-th
            tick from there, or none; the default is 0,1,2,3,33+30.
            --snapshot saves that state to a REDB file as \"boot\". --play

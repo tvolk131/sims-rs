@@ -54,6 +54,11 @@ pub struct Library {
     /// language. A definition's word 41 names its table, whose name the
     /// dialog formatter writes for `$Object` (0x44c1ca, 0x457d3b).
     pub catalog_strings: BTreeMap<u16, Vec<(u8, String)>>,
+    /// The IDs of the file's legacy catalog string tables (CATS), which
+    /// are not read: the catalog's name lookup (0x4061e3) checks for one
+    /// before the CTSS table (**unverified**, from a reading of the
+    /// disassembly not checked here).
+    pub legacy_catalog_strings: BTreeSet<u16>,
     /// The sound event each FWAV chunk names, by chunk ID: what Play
     /// Sound Event plays (0x582c57). The name is the chunk's bytes up to
     /// the first zero, read as Latin-1.
@@ -253,6 +258,9 @@ impl Program {
                         .map(|entry| (entry.language, entry.text.clone()))
                         .collect();
                     library.catalog_strings.insert(chunk.id, entries);
+                }
+                b"CATS" => {
+                    library.legacy_catalog_strings.insert(chunk.id);
                 }
                 b"FWAV" => {
                     let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());

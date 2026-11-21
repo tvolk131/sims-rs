@@ -255,18 +255,28 @@ impl Machine<'_, '_> {
                      {fault}"
                 ))
             };
-            // On a copy of the lot, kept only when the whole build is done:
-            // a build that fails leaves no person behind (the original
-            // removes it on every path, 0x4e8fdb, 0x4e9706).
+            // On a copy of the lot and of the machine's cells (the sounds
+            // the person's Init plays, the objects deleted), kept only when
+            // the whole build is done: a build that fails leaves nothing
+            // behind (the original removes the person on every path,
+            // 0x4e8fdb, 0x4e9706).
             let mut copy = self.world.clone();
-            let id = interpreter
-                .create_person(&mut copy, guid)
-                .map_err(unsupported)?;
-            interpreter
+            let cells = crate::both_ways::Cells::of(&interpreter);
+            let built = cells.on(&interpreter);
+            let id = built.create_person(&mut copy, guid).map_err(unsupported)?;
+            built
                 .portrait_put(&mut copy, id)
                 .map_err(|fault| fault.trap)?;
-            interpreter.remove_now(&mut copy, id).map_err(unsupported)?;
-            *self.world = copy;
+            built.remove_now(&mut copy, id).map_err(unsupported)?;
+            // The refresh pending is the caller's to keep, and a build
+            // that changed it is not ported.
+            if !cells.same_refresh(&crate::both_ways::Cells::of(&interpreter)) {
+                return Err(Trap::Unsupported(format!(
+                    "making a person of type 0x{guid:08X} for a dialog's portrait (0x4e9652) \
+                     changed the refresh pending, which is not ported"
+                )));
+            }
+            cells.keep(&interpreter, self.world, copy);
         }
         self.world.portraits.insert(guid);
         Ok(())
@@ -347,30 +357,58 @@ impl Machine<'_, '_> {
             .and_then(|id| self.world.objects.get(&id))
             .map(|object| object.guid);
         let neighbor = self.world.neighbors.get(stack_object).map(|r| r.guid);
-        let object_name_plain = match object {
-            Some(guid) => self.catalog_name_is_plain(guid)?,
-            None => true,
+        // The names the formatter may write for `$Object`; none when they
+        // are not known.
+        let object_names = match object {
+            Some(guid) => self.catalog_names(guid)?,
+            None => Some(Vec::new()),
         };
         // What may have been found so far: more than one where a type's
         // name, which is not known, took the place of a `$NeighborLocal`
-        // token and the `$Neighbor` pass depends on whether it holds
-        // `$Neighbor`.
+        // or `$Object` token and the `$Neighbor` pass depends on whether
+        // the text then holds `$Neighbor`.
         let mut found = BTreeSet::from([None]);
         for text in self.dialog_strings(operands)? {
-            // `$Object` is replaced by the object's name (0x44c1ca), which
-            // is not known either.
+            // `$Object` is replaced by the object's name (0x44c1ca). The
+            // text each name may leave, and whether the name stands there
+            // unknown. With no object the token stays as `(name)`, as
+            // before.
             let object_named = text.contains("$Object") && object.is_some();
             if object_named {
                 found = BTreeSet::from([object]);
             }
-            let text = text.replace("$Object", "(name)");
-            let (text, named) = self.neighbor_locals_named(&text)?;
-            if neighbor.is_some() {
-                if text.contains("$Neighbor") {
-                    found = BTreeSet::from([neighbor]);
-                } else if named || (object_named && !object_name_plain) {
-                    found.insert(neighbor);
+            let texts: Vec<(String, bool)> = match &object_names {
+                Some(names) if object_named => names
+                    .iter()
+                    .map(|name| (text.replace("$Object", name), false))
+                    .collect(),
+                None if object_named => vec![(text.replace("$Object", "(name)"), true)],
+                _ => vec![(text.replace("$Object", "(name)"), false)],
+            };
+            let Some(neighbor) = neighbor else {
+                for (text, _) in &texts {
+                    self.neighbor_locals_named(text)?;
                 }
+                continue;
+            };
+            // Whether the `$Neighbor` pass finds the token, for each text:
+            // Some(true) or Some(false), or None where a name that is not
+            // known stands in it.
+            let mut finds = BTreeSet::new();
+            for (text, unknown) in &texts {
+                let (text, named) = self.neighbor_locals_named(text)?;
+                finds.insert(if text.contains("$Neighbor") {
+                    Some(true)
+                } else if named || *unknown {
+                    None
+                } else {
+                    Some(false)
+                });
+            }
+            if finds == BTreeSet::from([Some(true)]) {
+                found = BTreeSet::from([Some(neighbor)]);
+            } else if finds != BTreeSet::from([Some(false)]) {
+                found.insert(Some(neighbor));
             }
         }
         // Mode 0 shows the stack object's own type when nothing was found.
@@ -379,36 +417,38 @@ impl Machine<'_, '_> {
             return Err(Trap::Unsupported(
                 "a dialog's text has a name in place of `$Object` (0x44c1ca) or \
                  `$NeighborLocal` (0x4e9c46, from the interface's table, 0x4e893e), and whether \
-                 that name holds `$Neighbor` decides the portrait (0x44c65f): the names are not \
-                 ported"
+                 the text then holds `$Neighbor` decides the portrait (0x44c65f): the names are \
+                 not ported"
                     .into(),
             ));
         }
         Ok(found.into_iter().next().flatten())
     }
 
-    /// Whether the name the formatter writes for `$Object` of type `guid`
-    /// (0x44c1ca) is sure to hold no `$Neighbor`. The name is an entry of
-    /// the catalog string table definition word 41 names (0x457d3b,
+    /// The names the formatter may write for `$Object` of type `guid`
+    /// (0x44c1ca), or none when they are not known. The name is an entry
+    /// of the catalog string table definition word 41 names (0x457d3b,
     /// 0x4061e3), or the definition's own name if that entry is empty
-    /// (0x457db4). Which entry 0x4061e3 picks is not ported, so the name is
-    /// taken to be plain only when the table is there, has an entry in the
-    /// first language (the one every string table is read in), and every
-    /// entry is not empty and holds no `$Neighbor`.
-    fn catalog_name_is_plain(&self, guid: u32) -> Result<bool, Trap> {
+    /// (0x457db4). Which entry 0x4061e3 picks is not ported, so every
+    /// entry may be the one; they are known only when the table is there,
+    /// has an entry in the first language (the one every string table is
+    /// read in), and every entry is not empty, and when the file has no
+    /// legacy catalog string table (CATS), which 0x4061e3 checks for first
+    /// ([`crate::program::Library::legacy_catalog_strings`]).
+    fn catalog_names(&self, guid: u32) -> Result<Option<Vec<String>>, Trap> {
         let table = self.definition_words(guid)?[CATALOG_STRINGS] as u16;
         let definition = self.definition(guid)?;
-        Ok(self
-            .program
-            .libraries
-            .get(&definition.resource)
-            .and_then(|library| library.catalog_strings.get(&table))
-            .is_some_and(|entries| {
-                entries.iter().any(|(language, _)| *language == 1)
-                    && entries
-                        .iter()
-                        .all(|(_, text)| !text.is_empty() && !text.contains("$Neighbor"))
-            }))
+        let Some(library) = self.program.libraries.get(&definition.resource) else {
+            return Ok(None);
+        };
+        if !library.legacy_catalog_strings.is_empty() {
+            return Ok(None);
+        }
+        Ok(library.catalog_strings.get(&table).and_then(|entries| {
+            (entries.iter().any(|(language, _)| *language == 1)
+                && entries.iter().all(|(_, text)| !text.is_empty()))
+            .then(|| entries.iter().map(|(_, text)| text.clone()).collect())
+        }))
     }
 
     /// `text` after the formatter's `$NeighborLocal` pass (0x44c590 to

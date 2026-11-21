@@ -71,13 +71,15 @@ const TICK_1103_25: &str = "e6694cc922b8164e7ef3c8b690ca9cf67a1037b21568fa7bc944
 /// The same state's hash under snapshot format 24.
 const TICK_1103_24: &str = "29bcebd6b87a9b15b737861bf8b4f7ebe13a6f2307607f4b18930f6002653f03";
 
-/// The tile at the house view's centre the Goth day's boots give
-/// ([`Lot::set_view_centre`]): the lot's middle tile. It is a stand-in
-/// start tile, not the original's camera; the recording's single
-/// 1,920-draw build at 24719 shows the real camera was not on a no-room
-/// cell, and from every start that finds a tile the day goes on the same
-/// ([`every_start_gives_one_state`]). Which camera the original opens the
-/// Goths' house with is not traced.
+/// The tile the Goth day's boots give for the house view's centre
+/// ([`Lot::load_viewed`], [`Lot::set_view_centre`]): the lot's middle tile. It is a stand-in
+/// start tile, not the original's camera. From every start that finds a
+/// tile the day goes on the same ([`every_start_gives_one_state`]); four
+/// starts find none, and the recording does not rule them out: the cat's
+/// type has image 2002 (`BMP_` 2002 in `User00036.iff`), so a start that
+/// finds no tile also makes the cat once (1,920 draws) and does not build
+/// again (0x4e9706, 0x4e938c). That branch is not ported and stops loudly.
+/// Which camera the original opens the Goths' house with is not traced.
 const GOTH_VIEW_CENTRE: [i8; 2] = [32, 32];
 
 /// Steps `lot` once from every tile the portrait's search may start from
@@ -882,8 +884,15 @@ fn strict_mode_runs_the_goth_houses_whole_day() {
     let root = PathBuf::from(root);
     let house = root.join("UserData/Houses/House05.iff");
     // The second answer is the adoption call's at tick 17707 (see below).
-    let mut lot = Lot::load(&root, &house, &[3, 3], Frames::default()).unwrap();
-    lot.set_view_centre(Some(GOTH_VIEW_CENTRE));
+    let mut lot = Lot::load_viewed(
+        &root,
+        &house,
+        &[3, 3],
+        Frames::default(),
+        Some(GOTH_VIEW_CENTRE),
+    )
+    .unwrap();
+    assert_eq!(lot.view_centre(), Some(GOTH_VIEW_CENTRE));
     // The clock: globals 0, 5 and 6 are the hour, minute and second.
     let clock = |lot: &Lot| {
         let globals = &lot.world().globals;
@@ -1051,8 +1060,7 @@ fn the_goth_day_under_the_recordings_frames_keeps_its_streams() {
         after,
         every: vec![(4154, 30)],
     };
-    let mut lot = Lot::load(&root, &house, &[3, 3], frames).unwrap();
-    lot.set_view_centre(Some(GOTH_VIEW_CENTRE));
+    let mut lot = Lot::load_viewed(&root, &house, &[3, 3], frames, Some(GOTH_VIEW_CENTRE)).unwrap();
     let streams = |lot: &Lot| {
         let world = lot.world();
         (

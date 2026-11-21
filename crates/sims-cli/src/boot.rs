@@ -33,14 +33,14 @@ pub struct Options<'a> {
 }
 
 pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
-    let mut lot = Lot::load(
+    let mut lot = Lot::load_viewed(
         options.root,
         options.house,
         &options.answers,
         options.frames.clone(),
+        options.view_centre,
     )
     .map_err(|error| -> Box<dyn Error> { error })?;
-    lot.set_view_centre(options.view_centre);
     // The ticks: one lot update each, with the house view's frames
     // between them.
     let mut ticked = Vec::new();

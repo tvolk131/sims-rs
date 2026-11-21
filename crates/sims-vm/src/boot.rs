@@ -421,6 +421,20 @@ impl Lot {
         answers: &[u8],
         frames: Frames,
     ) -> Result<Self, BootError> {
+        Self::load_viewed(root, house, answers, frames, None)
+    }
+
+    /// [`Lot::load`] with the tile at the house view's centre known from
+    /// the start ([`Lot::set_view_centre`]): the load's own steps (the
+    /// objects' visits, the selection, the frame before the first tick)
+    /// see it too.
+    pub fn load_viewed(
+        root: &Path,
+        house: &Path,
+        answers: &[u8],
+        frames: Frames,
+        view_centre: Option<[i8; 2]>,
+    ) -> Result<Self, BootError> {
         let install = Install::detect(root)?;
         let directory = house
             .parent()
@@ -480,6 +494,7 @@ impl Lot {
         {
             let interpreter = Interpreter {
                 view_rotation,
+                view_centre,
                 ..Interpreter::new(&program, &catalog, Stream::Global)
             };
             // The lot the game holds before the load: empty, with the
@@ -675,7 +690,7 @@ impl Lot {
             asking: None,
 
             view_rotation,
-            view_centre: None,
+            view_centre,
             loaded,
         })
     }
@@ -1156,16 +1171,17 @@ impl Lot {
         self.view_centre
     }
 
-    /// Sets the tile at the house view's centre, `None` for not known. A
-    /// dialog's portrait searches from it for a tile to put a person on
-    /// (0x4e96dd, 0x4347f0, 0x4a677c, 0x4a7b58), so the simulation reads
-    /// it, and it is an input like [`Lot::set_view_rotation`]: the view
+    /// Sets the tile at the house view's centre, `None` for not known: the
+    /// tile a dialog's portrait searches from for a tile to put a person on
+    /// (0x4e96dd, 0x4347f0, 0x4a677c, 0x4a7b58), after the interface's
+    /// work on the view's pick ([`crate::Interpreter::view_centre`]), so
+    /// the simulation reads it, and it is an input like [`Lot::set_view_rotation`]: the view
     /// that shows the lot would set it whenever its camera moves, and a
     /// recording of play must note each change. Where it is not known and
     /// the tile searched from would change what the portrait does, the
     /// step fails as an unported branch does.
-    /// The load leaves it not known: which camera the original opens a
-    /// house with is not traced.
+    /// [`Lot::load`] leaves it not known (which camera the original opens a
+    /// house with is not traced); [`Lot::load_viewed`] takes it.
     pub fn set_view_centre(&mut self, centre: Option<[i8; 2]>) {
         self.view_centre = centre;
     }

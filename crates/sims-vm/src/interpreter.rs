@@ -140,8 +140,12 @@ pub struct Interpreter<'a> {
     /// 0x4a7b58). It is where the player's camera is, not the lot's, so it
     /// is an input like [`Interpreter::view_rotation`]: None (not known)
     /// from [`Interpreter::new`], and a booted lot passes its own
-    /// ([`crate::boot::Lot::set_view_centre`]). The pick itself is not
-    /// ported, so the input is the tile it gives.
+    /// ([`crate::boot::Lot::set_view_centre`]). The interface's work on
+    /// the pick is not ported (by a reading of the disassembly,
+    /// **unverified**: a bounds check with a fallback, 0x434891, the
+    /// view's rotation undone, 0x43491c, and a clamp), so the input is the
+    /// tile the search starts from, after all of it: not the pick, and
+    /// not turned by [`Interpreter::view_rotation`].
     pub view_centre: Option<[i8; 2]>,
     /// While a person's own tick runs its thread, the person and the
     /// animator refresh pending from its taking itself off the lot
