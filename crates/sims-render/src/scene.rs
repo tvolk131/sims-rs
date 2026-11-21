@@ -810,6 +810,13 @@ impl<'a> Painter<'a> {
                     let n = self.rotate_direction(s.normal);
                     let front = shown_side(n);
                     let cut = cut.cuts(self.camera, [x, y], s.bit, style);
+                    // In live and buy modes (`0x416920 != 0`), a cut door-like
+                    // wall (styles 3, 5, 6, 15 and 23) zeroes its pass count
+                    // (`0x53e9ce` to `0x53ea2b`) and draws no wall stub across
+                    // the doorway.
+                    if cut && caps::door_like(style) {
+                        continue;
+                    }
                     let key = edge(s.from, s.to);
                     let opening = openings.get(&key);
                     let pattern = patterns[front];
@@ -1023,10 +1030,17 @@ impl<'a> Painter<'a> {
             let at = self.corner_screen(corner, level);
             let view = self.rotate_corner(corner);
             let ground = self.corner_elevation(corner) / 16;
-            for (bits, is_cut, height) in [
-                (c.cut, true, cut_height),
-                (c.standing, false, zoom.floor_height()),
-            ] {
+            let trims: Vec<(u8, bool)> = if c.record {
+                vec![(c.cut, true), (c.standing, false)]
+            } else {
+                c.run_trims.clone()
+            };
+            for (bits, is_cut) in trims {
+                let height = if is_cut {
+                    cut_height
+                } else {
+                    zoom.floor_height()
+                };
                 let Some(frame) = trim_frame(bits) else {
                     continue;
                 };
@@ -1110,16 +1124,32 @@ impl<'a> Painter<'a> {
                         });
                 }
             }
-            if let Some((cap, low)) = c.cap {
-                self.cap(level, corners, faces, corner, c, cap, low);
+            if c.record {
+                if let Some((cap, low)) = c.cap {
+                    self.cap(level, corners, faces, corner, c, cap, low, None);
+                }
+            } else {
+                for &(cap, low, owner, light_wall) in &c.run_caps {
+                    self.cap(
+                        level,
+                        corners,
+                        faces,
+                        corner,
+                        c,
+                        cap,
+                        low,
+                        Some((owner, light_wall)),
+                    );
+                }
             }
         }
     }
 
-    /// Draws a corner's cap (0x53c6b7): a narrow upright slice of a wall
-    /// face on the cap's line, in the plain wall shape and the pattern of
-    /// the wall in the cap's slot, standing in the tile the cap names and
-    /// cut to a column beside the corner.
+    /// Draws a corner's cap (0x53c6b7 for corner records, 0x53e3c0 for
+    /// mid-run caps): a narrow upright slice of a wall face on the cap's
+    /// line, in the plain wall shape and the pattern of the wall in the
+    /// cap's slot, standing in the tile the cap names and cut to a column
+    /// beside the corner.
     #[allow(clippy::too_many_arguments)]
     fn cap(
         &mut self,
@@ -1130,9 +1160,16 @@ impl<'a> Painter<'a> {
         c: &caps::Corner,
         cap: Cap,
         low: bool,
+        mid_run: Option<(usize, usize)>,
     ) {
-        let Some(owner) = c.slots[cap.slot] else {
-            return;
+        let owner = match mid_run {
+            Some((owner, _)) => owner,
+            None => {
+                let Some(owner) = c.slots[cap.slot] else {
+                    return;
+                };
+                owner
+            }
         };
         let index = (level - 1) as usize;
         let face = |i: usize| {
@@ -1145,20 +1182,32 @@ impl<'a> Painter<'a> {
             return;
         };
         let pattern = self.sides(index, x, y, s.bit)[front];
-        // The light of the first wall at the corner on the cap's line,
-        // else of the slot's wall (0x53c97f).
-        let lit = c
-            .slots
-            .iter()
-            .flatten()
-            .copied()
-            .find(|&i| corners.walls[i].line() == cap.line)
-            .unwrap_or(owner);
-        // In the light its room shows, through the setter (0x53c9df), or
-        // without a room there in full light (0x53c9e9).
+        // At a corner record, the light of the first wall at the corner on
+        // the cap's line, else of the slot's wall (0x53c97f). Along a run
+        // (`mid_run`), the run's seen-side room stored at `0x53f95b..0x53fac7`
+        // and read once at `0x53dc6d` / reused at `0x53e701`.
+        let lit = match mid_run {
+            Some((_, light_wall)) => light_wall,
+            None => c
+                .slots
+                .iter()
+                .flatten()
+                .copied()
+                .find(|&i| corners.walls[i].line() == cap.line)
+                .unwrap_or(owner),
+        };
+        // At a corner record, in the light its room shows through the setter
+        // (0x53c9df), or without a room there in full light (0x53c9e9). Along
+        // a run (`mid_run`, 0x53e701), without a room the run's light stays
+        // at 1 through the setter (`0x53dbb4`), so after dark it is capped.
         let fraction = match face(lit) {
             Some((_, s, front)) => self.lot.room_fraction_at(index, wall_side(&s, front)),
             None => return,
+        };
+        let fraction = if mid_run.is_some() {
+            Some(fraction.unwrap_or(1.0))
+        } else {
+            fraction
         };
         let [tx, ty] = [c.view[0] + cap.offset[0], c.view[1] + cap.offset[1]];
         let ends = match cap.line {
@@ -1178,9 +1227,9 @@ impl<'a> Painter<'a> {
         let ends = ends.map(|[x, y]| self.camera.project_fine([x * 16, y * 16], level, ground));
         let zoom = self.camera.zoom.index();
         let frame = wall_frame(ends);
-        // The plain wall's shape, or style 255's for a wall of that style
-        // (0x53c8c1).
-        let style = if corners.walls[owner].style == 255 {
+        // The plain wall's shape, or style 255's for a corner-record wall of
+        // that style (0x53c8c1); mid-run caps always use style 1 (0x53e652).
+        let style = if mid_run.is_none() && corners.walls[owner].style == 255 {
             255
         } else {
             PLAIN_STYLE
@@ -1629,18 +1678,16 @@ fn object_edge(position: [i32; 3], data: &[i16]) -> Option<Edge> {
     Some(edge(a, b))
 }
 
-/// The wall style whose cut-down shape a cut wall with a door or window in
-/// it takes.
+/// The wall style whose cut-down shape a cut window wall (style 22) and wall
+/// caps take (`0x53ead5`, `0x53e652`).
 const PLAIN_STYLE: u16 = 1;
 
 /// A wall face: the pattern's frame cut to the shape's frame. A wall with
 /// style 22 or 23 takes its shape from the door or window in it when it is
-/// up. Cut down, a wall of style 3, 5, 6, 15, 22 or 23 (the styles the
-/// original marks with bit 8 when it cuts them, 0x54059a; doors stand in
-/// style 3) is a plain wall's stub: the openings' own cut sprites are one
-/// small outline, and the original shows the same stub under a window or
-/// door as beside it (screenshot comparison, 2026-11-14; which style's
-/// stub it takes is unverified).
+/// up (`0x53d525`). Cut down, a window wall (style 22) takes a plain wall's
+/// stub (`0x53ead5` to `0x53eadc` replaces style `0x16` with style 1);
+/// door-like walls (styles 3, 5, 6, 15 and 23) are skipped before this in
+/// live mode (`0x53e9ce` to `0x53ea2b`).
 fn wall_image(
     assets: &mut Assets,
     pattern: u16,
@@ -1651,9 +1698,7 @@ fn wall_image(
     frame: usize,
 ) -> Option<Image> {
     let shape = match opening {
-        _ if cut && matches!(style, 3 | 5 | 6 | 15 | 22 | 23) => {
-            assets.shape(PLAIN_STYLE, true, zoom)?[frame].clone()
-        }
+        _ if cut && style == 22 => assets.shape(PLAIN_STYLE, true, zoom)?[frame].clone(),
         Some(definition) if matches!(style, 22 | 23) => {
             assets.object_shape(definition, false, zoom)?[frame].clone()
         }

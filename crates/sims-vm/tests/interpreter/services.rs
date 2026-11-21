@@ -179,9 +179,10 @@ fn generic_call_15_needs_a_person_and_a_footprint_it_can_work_out() {
     // A facing the footprint does not handle fails before anything
     // changes.
     let mut fx = standing_sim();
-    fx.sim_mut().data[1] = 9;
+    fx.words(SIM_FILE)[0x9a / 2] = 0x1111;
+    fx.sim_mut().data[1] = 10;
     let text = trap(generic_15(&mut fx, 0)).to_string();
-    assert!(text.contains("facing 9"), "{text}");
+    assert!(text.contains("facing 10"), "{text}");
     let sim = fx.sim();
     assert_eq!(sim.person.as_ref().unwrap().data[72..74], [216, 0x0102]);
     assert_eq!(sim.footprint, [1, 2, 3, 4]);

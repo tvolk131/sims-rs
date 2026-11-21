@@ -1399,7 +1399,16 @@ fn a_new_object_can_be_created_off_the_lot_and_run_a_tree_by_name() {
     // stack object and the lamp's temps as its arguments.
     assert_eq!(widget.attributes[2], 4);
     assert!(fx.lamp().stack.is_empty());
-    // Mode 1 is not ported.
+    // Mode 1 targets my container slot 0; build the lot and place the lamp
+    // on tile (2, 2) so it passes the off-lot test (0x44e557) and reaches
+    // fits_in (0x44e784), where the lamp's missing container slot refuses
+    // and removes the new object, taking the false branch.
+    build(&mut fx);
+    fx.world.arrays.insert(9, crate::rooms::array(1, 0xff));
+    fx.world.arrays.insert(10, crate::rooms::array(1, 0xff));
+    fx.lamp_mut().position = [40, 40, 1];
+    fx.lamp_mut().slots.truncate(1);
+    let count_before = fx.world.objects.len();
     fx.add(
         LAMP_FILE,
         4096,
@@ -1410,8 +1419,8 @@ fn a_new_object_can_be_created_off_the_lot_and_run_a_tree_by_name() {
             [guid[0], guid[1], guid[2], guid[3], 1, 0, 0, 0],
         )]),
     );
-    let text = trap(fx.run()).to_string();
-    assert!(text.contains("Create New Object Instance mode 1"), "{text}");
+    assert_eq!(fx.run(), Ok(false));
+    assert_eq!(fx.world.objects.len(), count_before);
 }
 
 /// A route context of `person` to slot 0 of the lamp.
