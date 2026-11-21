@@ -764,12 +764,13 @@ impl<'a> Painter<'a> {
                         continue;
                     };
                     let at = [p[0] - image.width as i32 / 2, p[1]];
-                    let img_w = i32::try_from(image.width).unwrap_or(i32::MAX);
-                    let img_h = i32::try_from(image.height).unwrap_or(i32::MAX);
-                    if at[0].saturating_add(img_w) <= 0
-                        || at[0] >= self.canvas.width as i32
-                        || at[1].saturating_add(img_h) <= 0
-                        || at[1] >= self.canvas.height as i32
+                    let wide = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
+                    let ax = i64::from(at[0]);
+                    let ay = i64::from(at[1]);
+                    if ax.saturating_add(wide(image.width)) <= 0
+                        || ax >= wide(self.canvas.width)
+                        || ay.saturating_add(wide(image.height)) <= 0
+                        || ay >= wide(self.canvas.height)
                     {
                         self.stats.floors += 1;
                         continue;
@@ -2025,7 +2026,7 @@ fn draw_grass_tile(
     let depth = depth_table.grass(view, i32::from(heights[1]));
     let depth_clamped = depth.clamp(0, crate::depth::EMPTY);
     let left = corner[0] + GRASS_COLUMN;
-    let canvas_w = canvas.width as i32;
+    let canvas_w = i64::try_from(canvas.width).unwrap_or(i64::MAX);
     grass::for_each_column(
         left,
         corner[1] + GRASS_ROW,
@@ -2034,7 +2035,7 @@ fn draw_grass_tile(
         colors,
         zoom,
         |column| {
-            if column.x + 4 <= 0 || column.x >= canvas_w {
+            if i64::from(column.x) + 4 <= 0 || i64::from(column.x) >= canvas_w {
                 return;
             }
             for (row, pixels) in column.clipped(0, clip_bottom).rows_rgb() {
