@@ -67,6 +67,15 @@ pub fn noted(world: &World, camera: &Camera, people: &Ids, [x, y]: [i32; 2]) -> 
     (three_d && object.position[2] == camera.level).then_some(id)
 }
 
+/// The original places walls and floors one column left of its corner
+/// projection (0x4ac14b, 0x4ac25d) and objects and people at it. Our
+/// camera origin sits on the tile art, so the original's origin column
+/// is `camera.origin[0] + 1` (`OBJECT_COLUMN` in `sims-render` and
+/// `sims-people`, and the corner cap's `cx + 1`). Unprojection
+/// (0x4a97c3), drawn-rectangle widening (0x438f71), and centring
+/// alignment (0x4a81cc) use that origin.
+pub(crate) const ORIGIN_COLUMN: i32 = 1;
+
 /// The sprite pick's object at `point` ([`Lot::sprite_pick`]). Nothing
 /// before the first frame is drawn, or off the canvas.
 fn sprite(
@@ -81,13 +90,18 @@ fn sprite(
     let row = usize::try_from(y).ok().filter(|&y| y < canvas.height)?;
     let depth = *lot_depth.get(row * canvas.width + column)?;
     let world = lot.world();
-    let depth = (depth != EMPTY).then(|| place(world, camera, point, depth));
+    let origin_x = camera.origin[0].saturating_add(ORIGIN_COLUMN);
+    let projected = [x.saturating_sub(ORIGIN_COLUMN), y];
+    let depth = (depth != EMPTY).then(|| place(world, camera, projected, depth));
     let level = camera.level;
-    let lifted = [x, y + camera.zoom.floor_height() * (level - 1)];
+    let lifted = [
+        x.saturating_sub(ORIGIN_COLUMN),
+        y + camera.zoom.floor_height() * (level - 1),
+    ];
     let ground = camera.unproject_fine(lifted);
     let level = i8::try_from(level).ok()?;
     lot.sprite_pick(depth, ground, level, camera.rotation, point, |id| {
-        canvas.drawn(id).map(widen)
+        canvas.drawn(id).map(|rect| widen(rect, origin_x))
     })
 }
 
@@ -174,12 +188,20 @@ fn round(v: f64) -> i32 {
 }
 
 /// A drawn rectangle as the original keeps an object's (0x438f71): its
-/// left edge moved left and its right edge right to a multiple of four.
-fn widen([left, top, right, bottom]: [i32; 4]) -> [i32; 4] {
+/// left edge moved left and its right edge right to a multiple of four
+/// columns from `origin_x` (the original's draw-context origin, where
+/// 0x438f71 widens `+0x160` and `+0x170` in lot-relative coordinates).
+fn widen([left, top, right, bottom]: [i32; 4], origin_x: i32) -> [i32; 4] {
+    if left >= right {
+        return [left, top, right, bottom];
+    }
+    let origin = i64::from(origin_x);
+    let rel_left = i64::from(left) - origin;
+    let rel_right = i64::from(right) - origin;
     [
-        left.saturating_sub(left.rem_euclid(4)),
+        left.saturating_sub(rel_left.rem_euclid(4) as i32),
         top,
-        right.saturating_add((4 - right.rem_euclid(4)) % 4),
+        right.saturating_add(((4 - rel_right.rem_euclid(4)) % 4) as i32),
         bottom,
     ]
 }
@@ -206,13 +228,20 @@ mod tests {
     }
 
     #[test]
-    fn a_rectangle_widens_to_groups_of_four_columns() {
-        assert_eq!(widen([465, 250, 482, 308]), [464, 250, 484, 308]);
-        assert_eq!(widen([464, 1, 484, 2]), [464, 1, 484, 2]);
-        assert_eq!(widen([-3, 0, -1, 0]), [-4, 0, 0, 0]);
+    fn a_rectangle_widens_to_groups_of_four_columns_from_the_origin() {
+        assert_eq!(widen([465, 250, 482, 308], 0), [464, 250, 484, 308]);
+        assert_eq!(widen([464, 1, 484, 2], 0), [464, 1, 484, 2]);
+        assert_eq!(widen([-3, 0, -1, 0], 0), [-4, 0, 0, 0]);
         assert_eq!(
-            widen([i32::MIN, 0, i32::MAX, 0]),
+            widen([i32::MIN, 0, i32::MAX, 0], 0),
             [i32::MIN, 0, i32::MAX, 0]
         );
+        // With an origin not on a multiple of four, widening stays
+        // invariant in lot-relative columns (`x - origin_x`).
+        assert_eq!(widen([469, 250, 497, 308], 465), [469, 250, 497, 308]);
+        assert_eq!(widen([470, 250, 495, 308], 465), [469, 250, 497, 308]);
+        assert_eq!(widen([463, 0, 466, 1], 465), [461, 0, 469, 1]);
+        // Empty rectangles are left alone, as in 0x438f71.
+        assert_eq!(widen([467, 0, 467, 1], 465), [467, 0, 467, 1]);
     }
 }
