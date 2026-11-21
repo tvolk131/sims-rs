@@ -26,13 +26,13 @@
 
 pub use crate::depth::EMPTY;
 use crate::light::Light;
+use std::sync::OnceLock;
 
 /// The faintest alpha drawn: 8 of the files' 31 steps (8 * 255 / 31,
-/// rounded down). The original leaves out a sprite's fainter edge pixels,
-/// colour and depth both; the threshold is fitted to its frame buffer and
-/// depth buffer at three cameras, where it lifts the depth
-/// match from 98.0% to 99.1% (medium zoom) and 98.9% to 99.7% (far zoom),
-/// and puts the door's left jamb back. Not read from the code.
+/// rounded down). The original's SPR2 object blitters (`0x4bbab8` at
+/// `0x4bbbe4`, `0x4bc080` at `0x4bc13f`, and their clipped/flipped
+/// variants) skip pixels whose 5-bit alpha is `<= 7`, leaving both colour
+/// and depth untouched.
 pub const FAINT: u8 = 65;
 
 /// A decoded sprite frame: straight-alpha RGBA and, if it has one, a depth
@@ -395,13 +395,29 @@ impl Canvas {
                 }
                 let s = &image.rgba[source * 4..source * 4 + 3];
                 let rgb = light(ix, iy).apply([s[0], s[1], s[2]]);
-                self.write(target, rgb, a, d);
+                self.write_sprite(target, rgb, a, d);
             }
         }
     }
 
+    /// Writes a sprite pixel that passed its depth test: its depth, and its
+    /// colour, blended by `a` through the original's 5-5-5 lookup table
+    /// ([`blend565`]) if it is not opaque.
+    fn write_sprite(&mut self, target: usize, rgb: [u8; 3], a: u8, d: i32) {
+        let pixel = &mut self.color[target];
+        self.depth[target] = d.clamp(0, EMPTY);
+        self.ids[target] = self.pen;
+        if a == 255 {
+            *pixel = rgb;
+        } else {
+            *pixel = blend565(rgb, *pixel, a);
+        }
+    }
+
     /// Writes a pixel that passed its depth test: its depth, and its
-    /// colour, blended by `a` if it is not opaque.
+    /// colour, straight-alpha blended by `a` if it is not opaque. Used for
+    /// 3D mesh pixels ([`Canvas::put`]), which do not go through the SPR2
+    /// 5-5-5 lookup table.
     fn write(&mut self, target: usize, rgb: [u8; 3], a: u8, d: i32) {
         let pixel = &mut self.color[target];
         self.depth[target] = d.clamp(0, EMPTY);
@@ -490,6 +506,71 @@ pub fn quantize565([r, g, b]: [u8; 3]) -> [u8; 3] {
         (r << 3) | (r >> 2),
         (g << 2) | (g >> 4),
         (b << 3) | (b >> 2),
+    ]
+}
+
+/// The original's 32 × 32 × 32 5-bit alpha-blend table (`0x6e5eac`),
+/// filled once at start-up by `0x49a315..0x49a41c`.
+///
+/// For each 5-bit `(alpha5, src5, dst5)`, it averages over the 8 × 8 × 8
+/// 8-bit triples in `[dst5<<3..+8) × [src5<<3..+8) × [alpha5<<3..+8)`:
+/// `blended = (d + (s - d) * (a * (1.0f32 / 255.0f32)) + 0.5) as u8`,
+/// sums the 512 bytes, multiplies by `1/512`, adds `0.5`, truncates and
+/// shifts right by 3.
+fn blend_table() -> &'static [u8; 32 * 32 * 32] {
+    static TABLE: OnceLock<Box<[u8; 32 * 32 * 32]>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let inv255 = f64::from(f32::from_bits(0x3b80_8081));
+        let mut table = Box::new([0u8; 32 * 32 * 32]);
+        for dst5 in 0..32usize {
+            let dst_base = dst5 << 3;
+            for src5 in 0..32usize {
+                let src_base = src5 << 3;
+                for alpha5 in 0..32usize {
+                    let alpha_base = alpha5 << 3;
+                    let mut sum = 0.0f64;
+                    for i in 0..8 {
+                        let d = (dst_base + i) as f64;
+                        for j in 0..8 {
+                            let s = (src_base + j) as f64;
+                            let diff = s - d;
+                            for k in 0..8 {
+                                let a = (alpha_base + k) as f64;
+                                let blended = (d + diff * (a * inv255) + 0.5) as i32;
+                                sum += f64::from(blended as u8);
+                            }
+                        }
+                    }
+                    let avg = (sum * (1.0 / 512.0) + 0.5) as i32;
+                    table[(alpha5 << 10) | (src5 << 5) | dst5] = (avg >> 3) as u8;
+                }
+            }
+        }
+        table
+    })
+}
+
+/// Blends `src` over `dst` at 8-bit alpha `a` as the original's 16-bit
+/// 5-6-5 blitters do (`0x4bbab8` at `0x4bbc04..0x4bbc7d`, `0x4bc2eb`,
+/// `0x49a60b`): each channel takes its top 5 bits (green drops its lowest
+/// 6th bit: `g6 >> 1`), looks up `0x6e5eac[a >> 3][src5][dst5]`, and packs
+/// `(r5, g5 << 1, b5)` back into 5-6-5 (green's low bit is always 0),
+/// widened to 8 bits a channel.
+///
+/// For every SPR2 5-bit alpha `k` in `0..=31`, `((k * 255) / 31) >> 3 == k`,
+/// so `a >> 3` recovers the original's exact 5-bit alpha.
+pub fn blend565(src: [u8; 3], dst: [u8; 3], a: u8) -> [u8; 3] {
+    let table = blend_table();
+    let row = usize::from(a >> 3) << 10;
+    let look = |s: u8, d: u8| table[row | (usize::from(s >> 3) << 5) | usize::from(d >> 3)];
+    let r5 = look(src[0], dst[0]);
+    let g5 = look(src[1], dst[1]);
+    let b5 = look(src[2], dst[2]);
+    let g6 = g5 << 1;
+    [
+        (r5 << 3) | (r5 >> 2),
+        (g6 << 2) | (g6 >> 4),
+        (b5 << 3) | (b5 >> 2),
     ]
 }
 
@@ -592,7 +673,8 @@ mod tests {
             false,
             |_, _, _| 5,
         );
-        assert_eq!(c.color[0], [128, 128, 128]);
+        assert_eq!(c.color[0], blend565([255, 255, 255], [0, 0, 0], 128));
+        assert_eq!(c.color[0], [132, 130, 132]);
         assert_eq!(c.depth[0], 5);
         // Farther and opaque, drawn later: hidden by the soft edge.
         c.draw(
@@ -601,7 +683,7 @@ mod tests {
             false,
             |_, _, _| 10,
         );
-        assert_eq!(c.color[0], [128, 128, 128]);
+        assert_eq!(c.color[0], [132, 130, 132]);
         // Nearer: drawn over it.
         c.draw(
             &image(1, 1, [0, 255, 0, 255], None),
@@ -722,12 +804,18 @@ mod tests {
         }
         assert_eq!(c.color, vec![[0, 0, 0], [10, 20, 30], [0, 0, 0], [0, 0, 0]]);
         assert_eq!(c.depth, vec![EMPTY, 100, EMPTY, EMPTY]);
-        // A tie wins; a soft pixel blends and writes its depth.
+        // A tie wins; a soft pixel straight-alpha blends and writes its depth
+        // without passing through the SPR2 5-5-5 lookup table.
         assert!(c.passes(1, 0, 100) && !c.passes(1, 0, 101));
         assert!(c.put(1, 0, [255, 255, 255, 255], 100));
         assert!(c.put(0, 1, [255, 255, 255, 128], -7));
         assert_eq!(c.color[1], [255, 255, 255]);
         assert_eq!((c.color[2], c.depth[2]), ([128, 128, 128], 0));
+        // Odd 6-bit green is preserved on mesh pixels (whereas sprite blits
+        // drop green's low bit through `blend565`).
+        let mut g = Canvas::new(1, 1, [0, 4, 0]);
+        assert!(g.put(0, 0, [0, 4, 0, 128], 10));
+        assert_eq!(g.color[0], [0, 4, 0]);
     }
 
     #[test]
@@ -825,5 +913,52 @@ mod tests {
         assert_eq!(quantize565([255, 255, 255]), [255, 255, 255]);
         assert_eq!(quantize565([0, 0, 0]), [0, 0, 0]);
         assert_eq!(quantize565([0x84, 0x82, 0x84]), [0x84, 0x82, 0x84]);
+    }
+
+    #[test]
+    fn blend565_matches_the_originals_table_and_drops_greens_low_bit() {
+        // Every 5-bit SPR2 alpha round-trips through `((k * 255) / 31) >> 3`,
+        // and the `<= 7` cutoff (`0x4bbbe4`) aligns with `FAINT`.
+        for k in 0..=31u16 {
+            let a = ((k * 255) / 31) as u8;
+            assert_eq!(u16::from(a >> 3), k, "k={k} a={a}");
+            assert_eq!(a >= FAINT, k >= 8, "k={k} a={a}");
+        }
+        // Endpoints, midpoint, and a rounding-sensitive interior point from
+        // `0x49a315..0x49a41c` (`[0; 3]` over `[104; 3]` at alpha 65 pins
+        // both `+ 0.5` rounding steps in `blend_table`).
+        assert_eq!(blend565([255, 255, 255], [0, 0, 0], 0), [0, 0, 0]);
+        assert_eq!(blend565([255, 255, 255], [0, 0, 0], 65), [66, 65, 66]);
+        assert_eq!(blend565([255, 255, 255], [0, 0, 0], 131), [132, 130, 132]);
+        assert_eq!(blend565([255, 255, 255], [0, 0, 0], 255), [255, 251, 255]);
+        assert_eq!(blend565([0, 0, 0], [104, 104, 104], 65), [82, 81, 82]);
+        // Blended pixels always clear bit 0 of 6-bit green (`g5 << 1`) and
+        // are already 5-6-5 quantized.
+        for a in [65u8, 128, 197, 246] {
+            for src in [[41, 77, 24], [100, 142, 60], [255, 255, 255]] {
+                for dst in [[0, 4, 0], [57, 89, 32], [115, 113, 115]] {
+                    let out = blend565(src, dst, a);
+                    assert_eq!(quantize565(out), out, "src={src:?} dst={dst:?} a={a}");
+                    assert_eq!((out[1] >> 2) & 1, 0, "src={src:?} dst={dst:?} a={a}");
+                }
+            }
+        }
+        // An opaque draw (`a == 255`) preserves odd 6-bit green, whereas a
+        // blended draw (`a == 246`, SPR2 alpha 30) drops green's low bit.
+        let mut c = Canvas::new(2, 1, [0, 0, 0]);
+        c.draw(
+            &image(1, 1, [0, 4, 0, 255], None),
+            [0, 0],
+            false,
+            |_, _, _| 5,
+        );
+        c.draw(
+            &image(1, 1, [0, 4, 0, 246], None),
+            [1, 0],
+            false,
+            |_, _, _| 5,
+        );
+        assert_eq!(c.color[0][1] >> 2, 1);
+        assert_eq!(c.color[1][1] >> 2, 0);
     }
 }

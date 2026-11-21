@@ -96,18 +96,18 @@ panel differences before applying the mask).
 
 ## Ratchet impact
 
-Every scene in `crates/sims-game/tests/ratchet.txt` (relative to `origin/main` `a3e1c9bc`) improves by +2.22% to +2.54% on `panel` and +0.21% to +0.24% on `frame`, with zero regressions in any class:
+Every scene in `crates/sims-game/tests/ratchet.txt` (relative to `origin/main` `bf3f5cab`) improves by +2.22% to +2.54% on `panel` and +0.21% to +0.24% on `frame`, with zero regressions in any class:
 
 | Scene | `frame` before | `frame` after | `panel` before | `panel` after |
 | --- | ---: | ---: | ---: | ---: |
-| `near-r2-0712-bench` | 96.51% | 96.73% | 97.33% | 99.76% |
-| `near-r2-0805` | 95.39% | 95.63% | 96.79% | 99.33% |
-| `far-r0-cut-0816` | 97.48% | 97.70% | 97.50% | 99.88% |
-| `far-r1-cut-0816` | 97.49% | 97.70% | 96.40% | 98.75% |
-| `medium-r1-cut-0816` | 97.87% | 98.08% | 97.50% | 99.87% |
-| `near-r3-down-0816` | 96.60% | 96.82% | 97.50% | 99.88% |
-| `near-r0-up-0816` | 97.67% | 97.89% | 95.80% | 98.15% |
-| `night-far-r0-cut-2153` | 98.00% | 98.23% | 96.97% | 99.19% |
+| `near-r2-0712-bench` | 98.06% | 98.29% | 97.33% | 99.76% |
+| `near-r2-0805` | 97.22% | 97.45% | 97.28% | 99.82% |
+| `far-r0-cut-0816` | 99.30% | 99.52% | 97.50% | 99.88% |
+| `far-r1-cut-0816` | 99.01% | 99.22% | 96.62% | 98.97% |
+| `medium-r1-cut-0816` | 99.27% | 99.48% | 97.50% | 99.87% |
+| `near-r3-down-0816` | 97.43% | 97.65% | 97.50% | 99.88% |
+| `near-r0-up-0816` | 99.29% | 99.51% | 97.50% | 99.88% |
+| `night-far-r0-cut-2153` | 99.30% | 99.54% | 96.97% | 99.19% |
 
 ## Not ported / what would reopen this
 
