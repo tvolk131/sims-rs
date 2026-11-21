@@ -206,6 +206,12 @@ pub struct World {
     /// encodings of the states before it was kept stay a prefix of the new
     /// ones.
     pub portraits: BTreeSet<u32>,
+    /// Person types whose portrait entry (`0x6f2698`) has been marked to
+    /// rebuild (`[entry + 0x18] != 0`, set by `0x4e895e` / `0x4eb0eb` and
+    /// cleared by `0x4e899e` when an image is stored). Kept unencoded so
+    /// snapshot format 31's wire bytes stay unchanged.
+    #[serde(skip)]
+    pub dirty_portraits: BTreeSet<u32>,
 }
 
 /// How many advertisements the record of [`World::advertisement_record`]
@@ -567,6 +573,7 @@ impl World {
             stops_asked: BTreeSet::new(),
             characters: Characters::default(),
             portraits: BTreeSet::new(),
+            dirty_portraits: BTreeSet::new(),
         }
     }
 

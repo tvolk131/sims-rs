@@ -84,6 +84,10 @@ pub struct Library {
     /// Sound Event plays (0x582c57). The name is the chunk's bytes up to
     /// the first zero, read as Latin-1.
     pub sounds: BTreeMap<u16, String>,
+    /// Whether the file holds a decodable `BMP_` 2002 (`0x7d2`) portrait
+    /// image that `0x4e92a8` → `0x4e9260` → `0x4dece6` can load without
+    /// calling `0x4e8c5d`.
+    pub has_portrait_2002: bool,
 }
 
 /// The string table Run Tree By Name instructions name their trees in.
@@ -374,6 +378,14 @@ impl Program {
                 library.loaded_strings.insert(id, Some(loaded));
             }
         }
+        // Portrait bitmap 2002 (0x7d2) read by 0x4e92a8 -> 0x4e9260 -> 0x4dece6
+        // in US English (language 1) with fallback to language-neutral (0).
+        let portrait_2002 = iff
+            .all(b"BMP_")
+            .find(|chunk| chunk.id == 2002 && (chunk.flags >> 8) == 1)
+            .or_else(|| iff.get(b"BMP_", 2002));
+        library.has_portrait_2002 =
+            portrait_2002.is_some_and(|chunk| sims_formats::bitmap::bmp(iff.data(chunk)).is_ok());
         // The native resource order (the rsmp map when there is one), as the
         // catalog registers definitions. The old prototype kept physical
         // file order instead (legacy/crates/sims-content/src/vm.rs:187).

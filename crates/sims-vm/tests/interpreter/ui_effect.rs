@@ -1,11 +1,17 @@
 //! UI Effect (opcode 34, 0x44acff): interface highlight control for the
 //! Tutorial and Help System, including mode 0's fallthrough into mode 1
-//! (`0x47689c` → `0x4e92a8` portrait build) and mode 2's read-only
-//! relationship highlight (`0x476984`). Synthetic; no game data.
+//! (`0x47689c` → `0x4e92a8`), `BMP_` 2002 vs dirty rebuild (`0x4e92e5`,
+//! `0x4e9338`, `0x4e938c`), `0x4e9652` off-lot failures, duplicate catalog
+//! GUIDs (`0x4e8b3d`), runtime-made characters (`0x4e8add`), mode 2's
+//! read-only relationship highlight (`0x476984`), and global 34's
+//! uninitialized `[object + 0x128]` write (`0x45412b`). Synthetic; no game
+//! data.
 
 use crate::create_person::visitors;
 use crate::factory::WIDGET;
+use crate::person_factory::equip;
 use crate::support::*;
+use sims_content::Object as CatalogObject;
 use sims_sim::neighbors::{Family, Neighbor};
 use sims_vm::Trap;
 
@@ -40,7 +46,8 @@ fn run_ui_effect(
 fn mode_0_falls_through_to_mode_1_and_builds_neighbors_portrait_once() {
     // Both mode 0 (0x44ad3f -> fallthrough to 0x44ad61) and mode 1 (0x44ad61)
     // run 0x47689c -> 0x4e92a8, regardless of whether flag bit 0 is 0 or 1,
-    // and on both non-person (LAMP) and person (SIM) callers.
+    // and on both non-person (LAMP) and person (SIM) callers. Without BMP_
+    // 2002 on the widget's file, 0x4e92a8 falls through to 0x4e938c (0x4e8c5d).
     for (mode, flags, caller, file) in [
         (0u8, 1u8, LAMP, LAMP_FILE),
         (0, 0, SIM, SIM_FILE),
@@ -82,6 +89,47 @@ fn mode_0_falls_through_to_mode_1_and_builds_neighbors_portrait_once() {
 }
 
 #[test]
+fn clean_slot_with_bmp_2002_caches_without_creating_a_sim_while_dirty_slot_renders_first() {
+    // Clean, empty slot (0x4e88fa) with BMP_ 2002 present (0x4e9338 -> 0x4e9260):
+    // caches the portrait with zero Sim creation, zero skeleton read, zero CRT RNG
+    // draw, and zero Init execution.
+    let (mut fx, file, record) = visitors();
+    fx.program
+        .libraries
+        .get_mut(&file)
+        .unwrap()
+        .has_portrait_2002 = true;
+    let crt_before = fx.world.crt_rng;
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
+        Ok(true)
+    );
+    assert_eq!(fx.world.portraits, [WIDGET].into());
+    assert!(fx.world.skeleton_files.is_empty());
+    assert_eq!(fx.world.crt_rng, crt_before);
+
+    // Dirty slot (0x4e895e, e.g. after Create New Object Instance with person
+    // word 84/68/74 set) with BMP_ 2002 present: 0x4e92e5 calls 0x4e8c5d FIRST
+    // (0x4e92f2), creating and removing the temporary person and clearing dirty.
+    let (mut fx, file, record) = visitors();
+    fx.program
+        .libraries
+        .get_mut(&file)
+        .unwrap()
+        .has_portrait_2002 = true;
+    fx.world.dirty_portraits.insert(WIDGET);
+    let crt_before = fx.world.crt_rng;
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
+        Ok(true)
+    );
+    assert_eq!(fx.world.portraits, [WIDGET].into());
+    assert!(!fx.world.dirty_portraits.contains(&WIDGET));
+    assert!(fx.world.skeleton_files.contains("widget.bcf"));
+    assert_ne!(fx.world.crt_rng, crt_before);
+}
+
+#[test]
 fn mode_1_reads_any_variable_scope_and_skips_missing_or_non_person_neighbors() {
     // Reading neighbor ID from temp 0 (scope 0x08).
     let (mut fx, _, record) = visitors();
@@ -106,38 +154,45 @@ fn mode_1_reads_any_variable_scope_and_skips_missing_or_non_person_neighbors() {
         assert_eq!(hash_without_frames(&fx.world), expected.hash());
     }
 
-    // A neighbor record whose GUID is not a person type (or has no definition)
-    // is not in the portrait table (0x4e9753 returns -1) -> no-op, true.
-    let (mut fx, _, _) = visitors();
-    fx.world.neighbors.slots.push(Some(Neighbor {
-        guid: 0xDEAD_BEEF,
-        id: 50,
-        data: vec![0; 88],
-        relationships: Vec::new(),
-        friends: 0,
-        revision: 0,
-        stale: false,
-    }));
-    let unknown_record = fx.world.neighbors.slots.len() as i16;
-    assert_eq!(
-        run_ui_effect(
-            &mut fx,
-            LAMP,
-            LAMP_FILE,
-            1,
-            scope::LITERAL,
-            unknown_record,
-            1
-        ),
-        Ok(true)
-    );
-    assert!(fx.world.portraits.is_empty());
+    // Both a missing GUID (0xDEAD_BEEF) and a registered non-person GUID
+    // (LAMP_GUID) are absent from the portrait table (0x4e9753 returns -1)
+    // -> no-op, true.
+    for non_person_guid in [0xDEAD_BEEF, LAMP_GUID] {
+        let (mut fx, _, _) = visitors();
+        fx.world.neighbors.slots.push(Some(Neighbor {
+            guid: non_person_guid,
+            id: 50,
+            data: vec![0; 88],
+            relationships: Vec::new(),
+            friends: 0,
+            revision: 0,
+            stale: false,
+        }));
+        let non_person_record = fx.world.neighbors.slots.len() as i16;
+        let mut expected = fx.world.clone();
+        expected.objects.get_mut(&LAMP).unwrap().last_result = true;
+        assert_eq!(
+            run_ui_effect(
+                &mut fx,
+                LAMP,
+                LAMP_FILE,
+                1,
+                scope::LITERAL,
+                non_person_record,
+                1
+            ),
+            Ok(true),
+            "non_person_guid 0x{non_person_guid:08X}"
+        );
+        assert!(fx.world.portraits.is_empty());
+        assert_eq!(hash_without_frames(&fx.world), expected.hash());
+    }
 }
 
 #[test]
-fn mode_1_uses_on_lot_person_and_guards_household_or_runtime_made_characters() {
-    // When a person of that type is already on the lot, no temporary person is
-    // constructed (skeleton_files stays empty), and the portrait is marked.
+fn mode_1_handles_on_lot_household_and_runtime_made_characters_without_trapping() {
+    // When a person of that type is already on the lot (0x4e9608), no
+    // temporary person is constructed and the portrait is cached.
     let (mut fx, _, _) = visitors();
     fx.world.neighbors.slots.push(Some(Neighbor {
         guid: SIM_GUID,
@@ -157,8 +212,8 @@ fn mode_1_uses_on_lot_person_and_guards_household_or_runtime_made_characters() {
     assert_eq!(fx.world.portraits, [SIM_GUID].into());
     assert!(fx.world.skeleton_files.is_empty());
 
-    // An off-lot member of the active household fails loudly (same 0x4e9652
-    // guard as Dialog's portrait).
+    // 0x4e9652 has no household-membership guard: an off-lot member of the
+    // active household follows the ordinary 0x4e92a8 path and returns true.
     let (mut fx, _, record) = visitors();
     fx.world.globals[9] = 4;
     fx.world.families.push(Family {
@@ -168,21 +223,219 @@ fn mode_1_uses_on_lot_person_and_guards_household_or_runtime_made_characters() {
         friends: 0,
         stale: false,
     });
-    let result = run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1);
-    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x4e9652")));
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
+        Ok(true)
+    );
+    assert_eq!(fx.world.portraits, [WIDGET].into());
+    assert!(fx.world.skeleton_files.contains("widget.bcf"));
 
-    // A runtime-made character (world.characters.made) fails loudly.
-    let (mut fx, _, record) = visitors();
+    // Runtime-made character (world.characters.made): Make New Character
+    // broadcasts 0xe0 -> 0x4f6727 -> 0x4e8a44 -> 0x4e8add, adding the person
+    // GUID to 0x6f2698. UI Effect follows the ordinary 0x4e92a8 path (no trap).
+    let (mut fx, file, _) = visitors();
+    let made_guid = 0x5555_0001u32;
     fx.world.characters.made.insert(
-        WIDGET,
+        made_guid,
         sims_sim::characters::Character {
             template: WIDGET,
-            file: 0,
+            file: 7,
             strings: Default::default(),
         },
     );
-    let result = run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1);
-    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x6f2698")));
+    fx.program
+        .libraries
+        .get_mut(&file)
+        .unwrap()
+        .has_portrait_2002 = true;
+    fx.world.neighbors.slots.push(Some(Neighbor {
+        guid: made_guid,
+        id: 51,
+        data: vec![0; 88],
+        relationships: Vec::new(),
+        friends: 0,
+        revision: 0,
+        stale: false,
+    }));
+    let made_record = fx.world.neighbors.slots.len() as i16;
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, made_record, 1),
+        Ok(true)
+    );
+    assert_eq!(fx.world.portraits, [made_guid].into());
+    assert!(fx.world.skeleton_files.is_empty());
+}
+
+#[test]
+fn mode_1_handles_off_lot_failures_and_duplicate_catalog_guids() {
+    // 1. Factory returns 0 (0x4e969d, e.g. refused pet when Unleashed is not
+    // installed): UI Effect returns true and leaves the portrait uncached.
+    let (mut fx, _, _) = visitors();
+    fx.program.expansions = 0; // Unleashed not installed
+    fx.world.neighbors.slots.clear();
+    equip(&mut fx, WIDGET, "kat", 12);
+    let pet_record = fx.world.neighbors.slots.len() as i16;
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, pet_record, 1),
+        Ok(true)
+    );
+    assert!(fx.world.portraits.is_empty());
+
+    // Helper: make WIDGET's Init (tree 4096) increment global 36 and leave
+    // data word 42 (allowed surfaces) at 0 so placement finds no tile from any
+    // start (0x4e9706). Note that `create_person` runs Init twice per creation
+    // (0x422d46), so each render attempt adds 2 to global 36.
+    let count_init_unplaceable = |fx: &mut Fixture, file: usize| {
+        fx.add(
+            file,
+            4096,
+            tree(vec![
+                ins(2, 1, 1, expr(scope::GLOBAL, 36, op::ADD, scope::LITERAL, 1)),
+                assign(scope::MY_DATA, 4, scope::LITERAL, 1, 2),
+                assign(scope::MY_DATA, 42, scope::LITERAL, 0, RETURN_TRUE),
+            ]),
+        );
+    };
+
+    // 2. Placement finds no tile (0x4e9706): on a clean slot without BMP_
+    // 2002, 0x4e938c runs once, Init & CRT RNG side effects are kept, the
+    // temporary person is removed, portrait stays uncached, and UI Effect
+    // returns true.
+    let (mut fx, file, record) = visitors();
+    count_init_unplaceable(&mut fx, file);
+    let crt_before = fx.world.crt_rng;
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
+        Ok(true)
+    );
+    assert_eq!(
+        fx.world.globals[36], 2,
+        "clean no-tile runs 0x4e938c once (2 Inits)"
+    );
+    assert_ne!(fx.world.crt_rng, crt_before);
+    assert!(fx.world.portraits.is_empty());
+
+    // 3. Dirty slot with no tile and BMP_ 2002 present: 0x4e92f2 tries once
+    // (0x4e9706 keeps Init/RNG), then falls through to 0x4e9338 (BMP_ 2002),
+    // caching the portrait without a second render!
+    let (mut fx, file, record) = visitors();
+    fx.world.dirty_portraits.insert(WIDGET);
+    fx.program
+        .libraries
+        .get_mut(&file)
+        .unwrap()
+        .has_portrait_2002 = true;
+    count_init_unplaceable(&mut fx, file);
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
+        Ok(true)
+    );
+    assert_eq!(
+        fx.world.globals[36], 2,
+        "dirty no-tile + BMP_ 2002 builds once (2 Inits)"
+    );
+    assert_eq!(fx.world.portraits, [WIDGET].into());
+    assert!(!fx.world.dirty_portraits.contains(&WIDGET));
+
+    // 4. Dirty slot with no tile and NO BMP_ 2002: 0x4e92f2 tries once,
+    // 0x4e9338 misses, and 0x4e938c retries a second time!
+    let (mut fx, file, record) = visitors();
+    fx.world.dirty_portraits.insert(WIDGET);
+    count_init_unplaceable(&mut fx, file);
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
+        Ok(true)
+    );
+    assert_eq!(
+        fx.world.globals[36], 4,
+        "dirty no-tile without BMP_ 2002 builds twice (0x4e92f2 + 0x4e938c = 4 Inits)"
+    );
+    assert!(fx.world.portraits.is_empty());
+    assert!(fx.world.dirty_portraits.contains(&WIDGET));
+
+    // 5. Duplicate catalog GUID (0x4e8b3d): an earlier person definition puts
+    // WIDGET in 0x6f2698, while a later non-person definition overwrites
+    // by_guid (0x43ac10). UI Effect finds WIDGET in 0x6f2698 and resolves the
+    // winning non-person definition (0x4e9260 uses its BMP_ 2002 when present;
+    // without BMP_ 2002, 0x4e9692 creates the non-person and 0x4e96b7 fails
+    // dynamic_cast<cXPerson*>, leaving it uncached and returning true).
+    let (mut fx, _, record) = visitors();
+    let winner_index = fx.catalog.objects.len();
+    fx.catalog.objects.push(CatalogObject {
+        guid: WIDGET,
+        resource: LAMP_FILE,
+        chunk: 128,
+        kind: 4, // normal non-person object
+        master: 0,
+    });
+    fx.catalog.by_guid.insert(WIDGET, winner_index);
+    fx.program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .has_portrait_2002 = true;
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
+        Ok(true)
+    );
+    assert_eq!(fx.world.portraits, [WIDGET].into());
+
+    // Duplicate catalog GUID without BMP_ 2002: 0x4e9652 creates the winning
+    // non-person object, fails dynamic_cast<cXPerson*>, leaves portrait
+    // uncached, and returns true.
+    let (mut fx, _, record) = visitors();
+    // Give LAMP_FILE chunk 128 a valid Init (4098) and Main (4097) so
+    // `try_create` can instantiate it cleanly.
+    fx.add(
+        LAMP_FILE,
+        4098,
+        tree(vec![assign(
+            scope::MY_DATA,
+            0,
+            scope::LITERAL,
+            0,
+            RETURN_TRUE,
+        )]),
+    );
+    fx.add(
+        LAMP_FILE,
+        4097,
+        tree(vec![assign(
+            scope::MY_DATA,
+            0,
+            scope::LITERAL,
+            0,
+            RETURN_TRUE,
+        )]),
+    );
+    {
+        let cb = fx
+            .program
+            .libraries
+            .get_mut(&LAMP_FILE)
+            .unwrap()
+            .callbacks
+            .get_mut(&128)
+            .unwrap();
+        cb[0].action = 4098;
+        cb[1].action = 4097;
+    }
+    let winner_index = fx.catalog.objects.len();
+    fx.catalog.objects.push(CatalogObject {
+        guid: WIDGET,
+        resource: LAMP_FILE,
+        chunk: 128,
+        kind: 4,
+        master: 0,
+    });
+    fx.catalog.by_guid.insert(WIDGET, winner_index);
+    let before_count = fx.world.objects.len();
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
+        Ok(true)
+    );
+    assert!(fx.world.portraits.is_empty());
+    assert_eq!(fx.world.objects.len(), before_count + 1);
 }
 
 #[test]
@@ -203,9 +456,12 @@ fn mode_2_reads_the_variable_without_building_any_portrait() {
 }
 
 #[test]
-fn modes_0_to_2_validate_variable_reads_while_modes_3_and_up_skip_them() {
-    // Modes 0, 1, and 2 call 0x453141, raising native error 9 on an invalid
-    // scope (> 38) and native error 8 on a missing local.
+fn modes_0_to_2_validate_variable_reads_and_guard_global_34_while_modes_3_and_up_skip_them() {
+    // Modes 0, 1, and 2 call 0x453141:
+    // - invalid scope (> 38) raises native error 9;
+    // - missing local raises native error 8;
+    // - global 34 (scope 6, index 34) fails loudly because 0x45412b ->
+    //   0x4541d5 writes through uninitialized [object + 0x128].
     for mode in [0u8, 1, 2] {
         let mut fx = Fixture::new();
         assert_eq!(
@@ -227,16 +483,28 @@ fn modes_0_to_2_validate_variable_reads_while_modes_3_and_up_skip_them() {
             Some(8),
             "missing local mode {mode}"
         );
+        let mut fx = Fixture::new();
+        let res = run_ui_effect(&mut fx, LAMP, LAMP_FILE, mode, scope::GLOBAL, 34, 1);
+        assert!(
+            matches!(trap(res), Trap::Unsupported(ref m) if m.contains("0x45412b")),
+            "global 34 mode {mode}"
+        );
     }
 
     // Modes 3 and up (0x44ad1d jne 0x44ad83) skip 0x453141 completely and
-    // return true even with an invalid scope.
+    // return true even with an invalid scope or global 34.
     for mode in [3u8, 4, 128, 255] {
         let mut fx = Fixture::new();
         assert_eq!(
             run_ui_effect(&mut fx, LAMP, LAMP_FILE, mode, 99, 0, 1),
             Ok(true),
-            "mode {mode}"
+            "mode {mode} invalid scope"
+        );
+        let mut fx = Fixture::new();
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, mode, scope::GLOBAL, 34, 1),
+            Ok(true),
+            "mode {mode} global 34"
         );
     }
 }

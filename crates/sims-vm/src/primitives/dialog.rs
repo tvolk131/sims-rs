@@ -376,18 +376,10 @@ impl Machine<'_, '_> {
             },
             _ => return Ok(()),
         };
-        self.ensure_portrait(guid, "a dialog's portrait")
-    }
-
-    /// Runs the simulation side of `0x4e92a8` for person type `guid`: looks
-    /// up `guid` in the interface's person portrait table (`0x4e9753`), and
-    /// when it is listed and has no cached portrait in
-    /// [`sims_sim::World::portraits`], builds one (`0x4e8c5d`, `0x4e9652`).
-    pub(crate) fn ensure_portrait(&mut self, guid: u32, what: &str) -> Result<(), Trap> {
         if self.world.portraits.contains(&guid) {
             return Ok(());
         }
-        if !self.listed_person_type(guid, what)? {
+        if !self.listed_person_type(guid, "a dialog's portrait")? {
             return Ok(());
         }
         let on_lot = self.world.people.iter().any(|id| {
@@ -405,7 +397,7 @@ impl Machine<'_, '_> {
                 .any(|f| f.id == family && f.members.contains(&guid))
             {
                 return Err(Trap::Unsupported(format!(
-                    "{what} of the household's type 0x{guid:08X} with nobody of \
+                    "a dialog's portrait of the household's type 0x{guid:08X} with nobody of \
                      it on the lot (0x4e9652): whether the household's panel built it before \
                      is not kept"
                 )));
@@ -413,7 +405,7 @@ impl Machine<'_, '_> {
             let interpreter = self.interpreter();
             let unsupported = |fault| {
                 Trap::Unsupported(format!(
-                    "making a person of type 0x{guid:08X} for {what} (0x4e9652): \
+                    "making a person of type 0x{guid:08X} for a dialog's portrait (0x4e9652): \
                      {fault}"
                 ))
             };
@@ -434,13 +426,14 @@ impl Machine<'_, '_> {
             // that changed it is not ported.
             if !cells.same_refresh(&crate::both_ways::Cells::of(&interpreter)) {
                 return Err(Trap::Unsupported(format!(
-                    "making a person of type 0x{guid:08X} for {what} (0x4e9652) \
+                    "making a person of type 0x{guid:08X} for a dialog's portrait (0x4e9652) \
                      changed the refresh pending, which is not ported"
                 )));
             }
             cells.keep(&interpreter, self.world, copy);
         }
         self.world.portraits.insert(guid);
+        self.world.dirty_portraits.remove(&guid);
         Ok(())
     }
 
