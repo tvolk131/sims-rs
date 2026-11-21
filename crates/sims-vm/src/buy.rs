@@ -299,8 +299,8 @@ impl Interpreter<'_> {
                 if self.try_place_buy_at(world, cursor, fine, level, None)? {
                     return Ok(cursor.valid);
                 }
-            } else if self.user_tiles_unblocked(world, cursor.held, fine)? {
-                let _ = self.place_test(world, cursor.held, fine, level)?;
+            } else {
+                self.run_unsnapped_user_test_place(world, cursor.held, fine, level)?;
             }
             let cursor_place = Place {
                 on_lot: true,
@@ -318,8 +318,10 @@ impl Interpreter<'_> {
     }
 
     /// Tries placing `cursor.held` (and `cursor.cursor`) at `[at, level]`.
-    /// Returns `Ok(true)` if the held object fit and was placed (setting
-    /// `cursor.valid` based on affordability).
+    /// Callers must verify `self.fits(world, cursor.cursor, at, level)` first
+    /// (`0x485ced`, `0x485f2f`, `0x422752`). Returns `Ok(true)` if the held
+    /// object fit and was placed (setting `cursor.valid` based on
+    /// affordability).
     fn try_place_buy_at(
         &self,
         world: &mut World,
@@ -328,9 +330,6 @@ impl Interpreter<'_> {
         level: i32,
         retained: Option<(u16, i16)>,
     ) -> Result<bool, Fault> {
-        if !self.fits(world, cursor.cursor, at, level)? {
-            return Ok(false);
-        }
         let affordable = cursor.price <= 0 || cursor.price <= available_funds(world);
         let Some(container) =
             self.test_buy_placement(world, cursor.cursor, cursor.held, at, level, retained)?
@@ -393,7 +392,9 @@ impl Interpreter<'_> {
         for k in 1..count {
             let dir = (orig_facing + k * step).rem_euclid(8);
             self.rotate_held_to(world, cursor.cursor, cursor.held, dir)?;
-            if self.try_place_buy_at(world, cursor, pos, level, None)? {
+            if self.fits(world, cursor.cursor, pos, level)?
+                && self.try_place_buy_at(world, cursor, pos, level, None)?
+            {
                 return Ok(true);
             }
         }
@@ -473,12 +474,10 @@ impl Interpreter<'_> {
         }
         // Native `0x42276d` re-enters `0x421e72` -> `0x422050` -> `0x4355b5`
         // at saved unsnapped coordinates, running the base placement test
-        // (including OBJf 5 overlap callbacks) before rejecting unsnapped
-        // coordinates at `0x4355bc..0x4355cd`.
-        if ((x & 0x0f) != 8 || (y & 0x0f) != 8)
-            && self.user_tiles_unblocked(world, cursor.held, [x, y])?
-        {
-            let _ = self.place_test(world, cursor.held, [x, y], level)?;
+        // (including OBJf 5 overlap callbacks) on the first part before
+        // rejecting unsnapped coordinates at `0x4355bc..0x4355cd`.
+        if (x & 0x0f) != 8 || (y & 0x0f) != 8 {
+            self.run_unsnapped_user_test_place(world, cursor.held, [x, y], level)?;
         }
         cursor.position = [x, y, level];
         cursor.valid = false;
@@ -993,6 +992,67 @@ impl Interpreter<'_> {
             }
         }
         Ok(true)
+    }
+
+    /// Runs the base single-tile placement test (`0x4355b5`) for an unsnapped
+    /// `UserTestPlace` call (`0x435522` / multi-tile `0x422de4`) on only the
+    /// first tile, matching `0x422de4` stopping at the first part's centring
+    /// rejection (`0x4355bc..0x4355cd`) without running overlap callbacks on
+    /// remaining parts.
+    fn run_unsnapped_user_test_place(
+        &self,
+        world: &mut World,
+        id: u16,
+        pos: [i32; 2],
+        level: i32,
+    ) -> Result<(), Fault> {
+        let fail = |trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        };
+        let (part, at, part_level) = if let Some(selected) = world
+            .objects
+            .get(&id)
+            .and_then(|o| o.multipart.as_ref())
+            .map(|m| m.offset)
+        {
+            let parts = self.parts(world, id).map_err(fail)?;
+            let Some(&first) = parts.first() else {
+                return Ok(());
+            };
+            let first_offset = world
+                .objects
+                .get(&first)
+                .and_then(|o| o.multipart.as_ref())
+                .map(|m| m.offset)
+                .ok_or_else(|| fail(Trap::native(10, "missing multipart part")))?;
+            let origin = [
+                pos[0].wrapping_sub(selected[0].wrapping_mul(16)),
+                pos[1].wrapping_sub(selected[1].wrapping_mul(16)),
+            ];
+            let origin_level = level.wrapping_sub(selected[2]);
+            (
+                first,
+                [
+                    origin[0].wrapping_add(first_offset[0].wrapping_mul(16)),
+                    origin[1].wrapping_add(first_offset[1].wrapping_mul(16)),
+                ],
+                origin_level.wrapping_add(first_offset[2]),
+            )
+        } else {
+            (id, pos, level)
+        };
+        if !inside_placement_bounds(world, at) {
+            return Ok(());
+        }
+        let a = i8::try_from(at[0] >> 4).unwrap_or(-1);
+        let b = i8::try_from(at[1] >> 4).unwrap_or(-1);
+        let flags = crate::placement::tile_flags(world, a, b, 1).map_err(fail)?;
+        if (flags & 0x20) == 0 {
+            let _ = self.test_tile(world, part, at, part_level, None)?;
+        }
+        Ok(())
     }
 
     /// Checks `user_tiles_unblocked` plus native `UserTestPlace`'s

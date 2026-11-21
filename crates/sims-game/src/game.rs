@@ -1918,11 +1918,27 @@ impl Game {
             let dx = point[0] - anchor[0];
             let dy = point[1] - anchor[1];
             if dx * dx + dy * dy > 36 {
+                // Native `0x485bda`: re-evaluate placement at the saved tile
+                // FIRST (so a restored surface snaps the held item and updates
+                // its container/facing, or a freed tile makes it valid) BEFORE
+                // reading `current` facing at `0x485da9`.
+                let before = self
+                    .lot
+                    .world()
+                    .objects
+                    .get(&cursor.held)
+                    .and_then(|o| o.data.get(1).copied())
+                    .unwrap_or(0)
+                    .rem_euclid(8);
+                if let Err(e) = self.lot.buy_rotate(&mut cursor, before) {
+                    self.note = Some(format!("Could not recheck Buy placement: {e}"));
+                }
                 // Native `0x485d5d..0x485dad`: `iVar6 = dy`, `iVar8 = dx`.
                 // Upper-left -> 6, upper-right -> 4, lower-left -> 0,
-                // lower-right -> 2. Compare `desired` against current facing
-                // FIRST (`0x485da9`), and only if they differ subtract the
-                // OBJD `+0x7a` facing offset (`0x434f8d`) before turning.
+                // lower-right -> 2. Compare `desired` against post-`0x485bda`
+                // current facing FIRST (`0x485da9`), and only if they differ
+                // subtract the OBJD `+0x7a` facing offset (`0x434f8d`) before
+                // turning.
                 let quad = if dy < 0 {
                     if dx < 0 { 6 } else { 4 }
                 } else if dx < 0 {
@@ -1939,18 +1955,11 @@ impl Game {
                     .and_then(|o| o.data.get(1).copied())
                     .unwrap_or(0)
                     .rem_euclid(8);
-                // Native `0x485bda` / `0x485da9` / `0x485e6a`: re-evaluate
-                // placement at the saved tile even when `current == desired`
-                // (so an Undo that freed the tile mid-drag makes placement
-                // valid), subtracting the OBJD `+0x7a` facing offset only when
-                // `current != desired`.
-                let target = if current != desired {
-                    (desired - cursor.facing_offset).rem_euclid(8)
-                } else {
-                    current
-                };
-                if let Err(e) = self.lot.buy_rotate(&mut cursor, target) {
-                    self.note = Some(format!("The object was not rotated: {e}"));
+                if current != desired {
+                    let target = (desired - cursor.facing_offset).rem_euclid(8);
+                    if let Err(e) = self.lot.buy_rotate(&mut cursor, target) {
+                        self.note = Some(format!("The object was not rotated: {e}"));
+                    }
                 }
                 true
             } else {

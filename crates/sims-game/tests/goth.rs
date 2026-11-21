@@ -6066,4 +6066,40 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
     game.release([589, 444]);
     assert!(game.lot().world().objects[&repeat_chair].position[0] >= 0);
     assert_eq!(game.lot().world().budget.funds, drag_funds_after_first);
+    game.cancel_buy();
+    assert!(game.undo_buy());
+
+    // Mid-drag Redo of a surface (`0x485bda` before `0x485da9`): buy an End
+    // Table at `[577, 432]`, cancel its repeat preview, Undo, select Table
+    // Lamps, press at `[577, 432]`, drag to `[589, 420]` (facing 4), Redo the
+    // table while holding the mouse button, and release at `[589, 420]`. The
+    // lamp snaps onto the restored table in `0x485bda` and then rotates back
+    // to facing 4 in `0x485da9` before committing.
+    game.press([234, 550]); // Back from Seating to top-level categories
+    game.release([234, 550]);
+    game.press([295, 524]); // Surfaces -> End Tables
+    game.release([295, 524]);
+    game.press([437, 523]); // Slot 0 End Table
+    game.release([437, 523]);
+    game.hover(centred_spot);
+    game.press(centred_spot);
+    game.release(centred_spot);
+    game.cancel_buy();
+    assert!(game.undo_buy());
+    game.press([234, 550]); // Back from Surfaces to top-level categories
+    game.release([234, 550]);
+    game.press([337, 570]); // Lighting -> Table Lamps
+    game.release([337, 570]);
+    game.press([437, 523]); // Slot 0 Table Lamp
+    game.release([437, 523]);
+    game.hover(centred_spot);
+    let drag_lamp = game.buy_cursor().expect("lamp armed").held;
+    game.press(centred_spot);
+    game.hover([589, 420]);
+    assert_eq!(game.lot().world().objects[&drag_lamp].data[1], 4);
+    assert!(game.redo_buy());
+    game.release([589, 420]);
+    assert!(game.lot().world().objects[&drag_lamp].position[0] >= 0);
+    assert_ne!(game.lot().world().objects[&drag_lamp].data[2], 0);
+    assert_eq!(game.lot().world().objects[&drag_lamp].data[1], 4);
 }

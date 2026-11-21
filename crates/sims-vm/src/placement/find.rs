@@ -981,7 +981,7 @@ impl Interpreter<'_> {
     }
 
     /// The ordinary place test of one object (0x433311 and 0x4329c1).
-    fn test_tile(
+    pub(crate) fn test_tile(
         &self,
         world: &mut World,
         id: u16,
