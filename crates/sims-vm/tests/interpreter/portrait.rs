@@ -2254,3 +2254,69 @@ fn a_saved_bmp_2002_applies_to_every_definition_in_the_same_file() {
     assert!(fx.world.portraits.contains(&SIBLING));
     assert!(!fx.world.dirty_portraits.contains(&SIBLING));
 }
+
+#[test]
+fn a_temporary_persons_reset_invalidating_pd_68_leaves_slot_1_empty_and_dirty() {
+    // 0x4e8d2e (save BMP_ 2002) and 0x4e8d6d (populate slot 1, clearing dirty)
+    // run BEFORE 0x4e8fdb removes the temporary person. If Reset writes person
+    // data word 68, 74, or 84, it invalidates the freshly populated slot.
+    let setup = |has_bmp: bool, dirty: bool| {
+        let (mut fx, widget_file, record) = visitors();
+        // Register a Reset callback (OBJf entry 3, tree 4100) that writes
+        // My Person Data 68 := 1. remove_now runs Reset at 0x4e8fdb AFTER
+        // 0x4e8d2e (save BMP_ 2002) and 0x4e8d6d (populate slot 1).
+        crate::visits::function(&mut fx, widget_file, 3, 4100);
+        fx.add(
+            widget_file,
+            4100,
+            tree(vec![assign(
+                scope::MY_PERSON,
+                68,
+                scope::LITERAL,
+                1,
+                RETURN_TRUE,
+            )]),
+        );
+        fx.program
+            .libraries
+            .get_mut(&widget_file)
+            .unwrap()
+            .has_portrait_bitmap = has_bmp;
+        if dirty {
+            fx.world.dirty_portraits.insert(WIDGET);
+        }
+        (fx, record)
+    };
+
+    // 1. Clean slot without BMP_ 2002 (0x4e938c -> 0x4e8c5d(index, 1, 1)):
+    //    BMP_ 2002 is saved before remove_now, then Reset invalidates slot 1,
+    //    leaving slot 1 empty and dirty.
+    let (mut fx_clean, record) = setup(false, false);
+    assert_eq!(
+        inform_from(&mut fx_clean, 2, record, Some([1, 1])),
+        Ok(true)
+    );
+    assert_eq!(fx_clean.world.saved_portraits, [WIDGET].into());
+    assert!(!fx_clean.world.portraits.contains(&WIDGET));
+    assert!(fx_clean.world.dirty_portraits.contains(&WIDGET));
+
+    // 2. Dirty slot WITH BMP_ 2002 (0x4e92f2 -> Reset invalidates slot 1 ->
+    //    0x4e9315 sees empty slot 1 -> 0x4e9338 reloads BMP_ 2002, clearing
+    //    dirty).
+    let (mut fx_dirty_bmp, record) = setup(true, true);
+    assert_eq!(
+        inform_from(&mut fx_dirty_bmp, 2, record, Some([1, 1])),
+        Ok(true)
+    );
+    assert!(fx_dirty_bmp.world.portraits.contains(&WIDGET));
+    assert!(!fx_dirty_bmp.world.dirty_portraits.contains(&WIDGET));
+
+    // 3. Dirty slot WITHOUT BMP_ 2002 (0x4e92f2 -> Reset invalidates slot 1 ->
+    //    0x4e9315 sees empty slot 1 -> 0x4e938c would run a second build, so
+    //    fail loudly).
+    let (mut fx_dirty_nobmp, record) = setup(false, true);
+    let fault = inform_from(&mut fx_dirty_nobmp, 2, record, Some([1, 1]))
+        .unwrap_err()
+        .to_string();
+    assert!(fault.contains("0x4e938c"), "{fault}");
+}

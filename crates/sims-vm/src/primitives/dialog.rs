@@ -531,12 +531,31 @@ impl Machine<'_, '_> {
                     built
                         .portrait_place(&copy, id, &tiles)
                         .map_err(|fault| fault.trap)?;
-                    built.remove_now(&mut copy, id).map_err(unsupported)?;
-                    // 0x4e938c passes save = 1 on a clean missing-bitmap build,
-                    // writing BMP_ 2002 at 0x4e8d2e → 0x4e9000. A dirty build
-                    // at 0x4e92f2 passes save = 0 and does not save BMP_ 2002.
+                    // 0x4e8d2e (save = 1 on !dirty) and 0x4e8d6d (store slot 1,
+                    // clearing dirty) run BEFORE 0x4e8fdb removes the temporary
+                    // person: if Reset writes person data 68, 74, or 84, it
+                    // invalidates the freshly populated slot.
                     if !dirty {
                         copy.saved_portraits.insert(guid);
+                    }
+                    copy.portraits.insert(guid);
+                    copy.dirty_portraits.remove(&guid);
+                    built.remove_now(&mut copy, id).map_err(unsupported)?;
+                    // Back in 0x4e92a8 after a dirty build at 0x4e92f2, if
+                    // Reset invalidated slot 1, 0x4e9315 sees slot 1 empty:
+                    // 0x4e9338 loads BMP_ 2002 when present, otherwise 0x4e938c
+                    // calls 0x4e8c5d a second time.
+                    if dirty && !copy.portraits.contains(&guid) {
+                        if has_bitmap {
+                            copy.portraits.insert(guid);
+                            copy.dirty_portraits.remove(&guid);
+                        } else {
+                            return Err(Trap::Unsupported(format!(
+                                "a dialog's portrait build for dirty type 0x{guid:08X} had Reset \
+                                 invalidate slot 1 (0x4e8fdb) with no BMP_ 2002, so 0x4e938c \
+                                 calls 0x4e8c5d a second time, which is not ported"
+                            )));
+                        }
                     }
                 }
                 crate::placement::PortraitSearch::NotFound { description } => {
@@ -547,6 +566,8 @@ impl Machine<'_, '_> {
                     // (skipping virtual function 0x88), then 0x4e9338
                     // loads BMP_ 2002 into slot 1 so 0x4e938c does not run.
                     built.remove_now(&mut copy, id).map_err(unsupported)?;
+                    copy.portraits.insert(guid);
+                    copy.dirty_portraits.remove(&guid);
                 }
                 crate::placement::PortraitSearch::Mixed {
                     found,
@@ -558,12 +579,16 @@ impl Machine<'_, '_> {
                     // Dirty slot + BMP_ 2002: `portrait_place` borrows `&World`
                     // immutably and touches no interpreter cells; under the
                     // unverified assumption that native put+remove undoes room
-                    // and tile placement, placing and removing unput (0x4e9706)
-                    // + loading BMP_ 2002 leave the same modeled state.
+                    // and tile placement, both placing (even if Reset dirties
+                    // slot 1, since 0x4e9338 then reloads BMP_ 2002) and
+                    // removing unput (0x4e9706) + loading BMP_ 2002 leave the
+                    // same modeled state.
                     built
                         .portrait_place(&copy, id, &found)
                         .map_err(|fault| fault.trap)?;
                     built.remove_now(&mut copy, id).map_err(unsupported)?;
+                    copy.portraits.insert(guid);
+                    copy.dirty_portraits.remove(&guid);
                 }
             }
         }
@@ -576,8 +601,6 @@ impl Machine<'_, '_> {
             )));
         }
         cells.keep(&interpreter, self.world, copy);
-        self.world.portraits.insert(guid);
-        self.world.dirty_portraits.remove(&guid);
         Ok(())
     }
 
@@ -667,10 +690,14 @@ impl Machine<'_, '_> {
                     built
                         .portrait_place(&copy, id, &tiles)
                         .map_err(|fault| fault.trap)?;
-                    built.remove_now(&mut copy, id).map_err(unsupported)?;
+                    // 0x4e8d2e (save = 1) and 0x4e8d6d (store slot 1, clearing
+                    // dirty) run BEFORE 0x4e8fdb removes the temporary pet: if
+                    // Reset writes person data 68, 74, or 84, slot 1 stays
+                    // empty and dirty (0x44b126 does not call 0x4e9338).
                     copy.saved_portraits.insert(guid);
                     copy.portraits.insert(guid);
                     copy.dirty_portraits.remove(&guid);
+                    built.remove_now(&mut copy, id).map_err(unsupported)?;
                 }
                 crate::placement::PortraitSearch::NotFound { .. } => {
                     // 0x4e9706 removes unput and returns NULL → 0x4e8c5d

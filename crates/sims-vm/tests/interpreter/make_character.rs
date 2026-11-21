@@ -738,6 +738,31 @@ fn pet_creation_runs_0x4e8c5d_portrait_build_even_when_template_has_bmp_2002() {
     let grid = &mut fx_mixed.world.arrays.get_mut(&3).unwrap().data;
     grid[(64 + 1) * 2..((64 + 1) * 2 + 2)].copy_from_slice(&(LAMP as i16).to_le_bytes());
     unsupported(trap(fx_mixed.run()), "0x44b126");
+
+    // 4. Reset writing person data word 68 runs at 0x4e8fdb AFTER 0x4e8d2e
+    //    (save BMP_ 2002) and 0x4e8d6d (populate slot 1), leaving slot 1 empty
+    //    and dirty while keeping BMP_ 2002 saved.
+    let mut fx_reset = setup(false, 6);
+    let cat_file = fx_reset.catalog.object(TEMPLATE_CAT).unwrap().resource;
+    // Register Reset callback (OBJf entry 3, tree 4100) writing My Person
+    // Data 68 := 1 when remove_now runs Reset at 0x4e8fdb.
+    crate::visits::function(&mut fx_reset, cat_file, 3, 4100);
+    fx_reset.add(
+        cat_file,
+        4100,
+        tree(vec![assign(
+            scope::MY_PERSON,
+            68,
+            scope::LITERAL,
+            1,
+            RETURN_TRUE,
+        )]),
+    );
+    assert_eq!(fx_reset.run(), Ok(true));
+    let guid = expected_guid();
+    assert_eq!(fx_reset.world.saved_portraits, [guid].into());
+    assert!(!fx_reset.world.portraits.contains(&guid));
+    assert!(fx_reset.world.dirty_portraits.contains(&guid));
 }
 
 #[test]

@@ -661,7 +661,10 @@ impl Game {
     /// no-op or wall-mode commands preserve a restored pick.
     pub fn apply(&mut self, command: Move) -> bool {
         let before = self.view.camera;
-        let moved = self.view.apply(command);
+        let (w, h) = self.house_viewport_size();
+        let moved = self
+            .view
+            .apply_in(command, [w as i32, h as i32], pick::ORIGIN_COLUMN);
         let after = self.view.camera;
         if after.origin != before.origin
             || after.zoom != before.zoom
@@ -1340,12 +1343,17 @@ impl Game {
         }
         // The view turns as the turn keys do, keeping the middle of the
         // screen, until it shows the lot as the saved lot was turned.
+        let (w, h) = self.house_viewport_size();
         let rotation = self.lot.view_rotation();
         for _ in 0..4 {
             if self.view.camera.rotation == rotation {
                 break;
             }
-            self.view.apply(Move::Rotate(true));
+            self.view.apply_in(
+                Move::Rotate(true),
+                [w as i32, h as i32],
+                pick::ORIGIN_COLUMN,
+            );
         }
         self.pace.restart();
         self.people.refresh(world);
@@ -2173,5 +2181,22 @@ mod tests {
         // [16, 15], while game origin [399, -6] (native [400, -6]) picks [16, 16].
         assert_eq!(pick_tile([398, -6], true), Some([16, 15]));
         assert_eq!(pick_tile([399, -6], true), Some([16, 16]));
+
+        // Zooming from Far to Medium with the panel expanded (800x500 active
+        // viewport) anchors at the active viewport midpoint and native origin
+        // column, keeping the screen-centre pick at [16, 16].
+        let mut view = View::new([800, 600], [0, 0], 0);
+        view.camera.origin = [399, -6];
+        let controls = Controls {
+            expanded: true,
+            ..Controls::default()
+        };
+        let (w, h) = viewport_for_controls(view.size, &controls);
+        assert!(view.apply_in(Move::ZoomIn, [w as i32, h as i32], pick::ORIGIN_COLUMN));
+        let mut native = view.camera;
+        native.origin[0] = native.origin[0].saturating_add(pick::ORIGIN_COLUMN);
+        let picked = sims_render::screen_centre_pick(&lot, &native, [w as i32, h as i32])
+            .map(|[x, y]| [(x >> 4) as i8, (y >> 4) as i8]);
+        assert_eq!(picked, Some([16, 16]));
     }
 }

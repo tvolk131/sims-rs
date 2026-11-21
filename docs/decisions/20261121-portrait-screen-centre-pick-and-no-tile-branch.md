@@ -142,12 +142,14 @@ items in the dialog portrait path (`0x4e92a8` → `0x4e8c5d` → `0x4e9652`):
      `restore` so moving the camera while a dialog waits does not alter the
      tick's replay once answered. Bump `sims_vm::boot::save::FORMAT` from 4
      (keeping `floor_rotation`) to 5.
-   - Wire `sims_game::Game::sync_view` (passing `self.house_viewport_size()`,
-     reflecting the active expanded vs collapsed control-panel strip, and the
-     native origin column `camera.origin[0] + pick::ORIGIN_COLUMN`) in `open`,
-     `resize`, `centre_on`, `command` (including `Command::TogglePanel`), and
-     in `apply` only when camera geometry (`origin`, `zoom`, `rotation`, or
-     `level`) changes so no-op or wall-mode commands preserve a restored pick.
+   - Wire `sims_game::Game::sync_view_centre` / `Game::sync_view` (passing
+     `self.house_viewport_size()`, reflecting the active expanded vs collapsed
+     control-panel strip, and the native origin column `camera.origin[0] +
+     pick::ORIGIN_COLUMN`) in `open`, `resize`, `centre_on`, `command`
+     (including `Command::TogglePanel`), and in `apply` (anchoring zoom and
+     rotation in `View::apply_in` at the active viewport midpoint and native
+     origin column, and syncing only when camera geometry changes so no-op or
+     wall-mode commands preserve a restored pick).
 2. **Dirty-slot gate, writability, saved bitmaps, and no-tile branch (`sims-sim`, `sims-vm`):**
    - Append `World::dirty_portraits: BTreeSet<u32>` and
      `World::saved_portraits: BTreeSet<u32>` (bumping `sims_sim::SNAPSHOT_FORMAT`

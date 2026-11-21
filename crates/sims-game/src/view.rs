@@ -87,13 +87,50 @@ impl View {
 
     /// Applies a move. Returns whether the picture changes.
     pub fn apply(&mut self, command: Move) -> bool {
+        self.apply_in(command, self.size, 0)
+    }
+
+    /// Applies a move using `viewport` as the active house viewport for
+    /// midpoint-anchored moves (`ZoomIn`, `ZoomOut`, `Rotate`, `Centre`),
+    /// shifting `camera.origin[0]` by `origin_column` around zoom/rotate so
+    /// the native screen-centre pick (`0x4a7b58`) stays anchored on the same
+    /// lot point.
+    pub(crate) fn apply_in(
+        &mut self,
+        command: Move,
+        viewport: [i32; 2],
+        origin_column: i32,
+    ) -> bool {
         let before = self.camera;
-        let middle = self.middle();
+        let middle = [viewport[0] / 2, viewport[1] / 2];
+        let with_native_origin = |camera: Camera, f: fn(Camera, [i32; 2]) -> Camera| {
+            let mut native = camera;
+            native.origin[0] = native.origin[0].saturating_add(origin_column);
+            let mut moved = f(native, middle);
+            moved.origin[0] = moved.origin[0].saturating_sub(origin_column);
+            moved
+        };
         match command {
-            Move::ZoomIn => self.camera = self.camera.zoomed(self.camera.zoom.zoom_in(), middle),
-            Move::ZoomOut => self.camera = self.camera.zoomed(self.camera.zoom.zoom_out(), middle),
+            Move::ZoomIn => {
+                let next = self.camera.zoom.zoom_in();
+                if next != self.camera.zoom {
+                    self.camera =
+                        with_native_origin(self.camera, |c, m| c.zoomed(c.zoom.zoom_in(), m));
+                }
+            }
+            Move::ZoomOut => {
+                let next = self.camera.zoom.zoom_out();
+                if next != self.camera.zoom {
+                    self.camera =
+                        with_native_origin(self.camera, |c, m| c.zoomed(c.zoom.zoom_out(), m));
+                }
+            }
             Move::Rotate(clockwise) => {
-                self.camera = self.camera.rotated(if clockwise { 1 } else { 3 }, middle)
+                self.camera = if clockwise {
+                    with_native_origin(self.camera, |c, m| c.rotated(1, m))
+                } else {
+                    with_native_origin(self.camera, |c, m| c.rotated(3, m))
+                };
             }
             Move::LevelUp => self.camera.level = (self.camera.level + 1).min(2),
             Move::LevelDown => self.camera.level = (self.camera.level - 1).max(1),
