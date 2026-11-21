@@ -594,6 +594,13 @@ class TornSidecarError(Exception):
     """resume-torn.json is not one this revision wrote."""
 
 
+def cut_entry(c):
+    """Whether this is a cut row as resume-torn.json keeps it: [start, text, taken off, the bytes in hex]."""
+    return (isinstance(c, list) and len(c) == 4 and type(c[0]) is int and c[0] >= 0 and isinstance(c[1], str)
+            and type(c[2]) is bool and isinstance(c[3], str) and all(ch in '0123456789abcdef' for ch in c[3])
+            and len(c[3]) % 2 == 0)
+
+
 def torn_logged(path, mark):
     """Whether these events hold the resume_torn event of this mark. Rows that are not JSON are passed."""
     try:
@@ -610,12 +617,12 @@ def torn_logged(path, mark):
 def repair_tails(out, names):
     """Before a resume: a row cut short at the end of each log is taken off, or ended with a newline if
     it is a whole JSON object (read as the resume reads it, json_object). What is done is kept in
-    resume-torn.json first, with a mark (each cut row with where it starts and whether it is taken off
-    yet, and the logs ended), so a takeover killed before it logs it (resume_torn, with the mark) hands it
+    resume-torn.json first, with a mark (each cut row with where it starts, its bytes, and whether it is
+    taken off yet, and the logs ended), so a takeover killed before it logs it (resume_torn, with the mark) hands it
     on. A cut not yet taken off whose row is no longer at the end of its log was taken off by a takeover
     killed before it noted so, and is noted now. One killed before the cut finds the same row where it
-    was and notes it once; a row cut short at the same place after the cut was made is another, and
-    noted too. One killed after logging it and before taking off resume-torn.json has its mark in the
+    was (the same bytes) and notes it once; a row cut short at the same place after the cut was made is
+    another, and noted too. One killed after logging it and before taking off resume-torn.json has its mark in the
     events, and the file is not used again. A resume-torn.json of another form (an earlier revision's)
     raises TornSidecarError before anything is changed. Returns dict(mark, rows, ended), rows the cut
     rows' text by log."""
@@ -627,8 +634,10 @@ def repair_tails(out, names):
         saved = fresh
     else:
         saved = json_object(text)
-        if not (saved is not None and saved.keys() == {'mark', 'cuts', 'ended'}
-                and isinstance(saved['cuts'], dict) and isinstance(saved['ended'], list)):
+        if not (saved is not None and saved.keys() == {'mark', 'cuts', 'ended'} and isinstance(saved['mark'], str)
+                and isinstance(saved['cuts'], dict) and isinstance(saved['ended'], list)
+                and all(isinstance(name, str) for name in saved['ended'])
+                and all(isinstance(cuts, list) and all(cut_entry(c) for c in cuts) for cuts in saved['cuts'].values())):
             raise TornSidecarError(sidecar)
         if torn_logged(out / 'events.jsonl', saved['mark']):
             saved = fresh
@@ -643,7 +652,7 @@ def repair_tails(out, names):
     for name, cuts in saved['cuts'].items():
         if cuts and not cuts[-1][2]:
             now = found.get(name)
-            if now is None or now[0] != cuts[-1][0] or now[1].decode(errors='replace') != cuts[-1][1]:
+            if now is None or [now[0], now[1].hex()] != [cuts[-1][0], cuts[-1][3]]:
                 cuts[-1][2] = changed = True
     fixes = []
     for name in names:
@@ -655,10 +664,10 @@ def repair_tails(out, names):
             if name not in saved['ended']:
                 saved['ended'].append(name)
         else:
-            text = tail.decode(errors='replace')
+            cut = [start, tail.decode(errors='replace'), False, tail.hex()]
             cuts = saved['cuts'].setdefault(name, [])
-            if not (cuts and cuts[-1] == [start, text, False]):
-                cuts.append([start, text, False])
+            if not (cuts and cuts[-1] == cut):
+                cuts.append(cut)
             fixes.append((name, start))
     if fixes or changed:
         keep()
@@ -672,7 +681,7 @@ def repair_tails(out, names):
             saved['cuts'][name][-1][2] = True
     if fixes:
         keep()
-    rows = {name: [text for _, text, _ in cuts] for name, cuts in saved['cuts'].items() if cuts}
+    rows = {name: [text for _, text, _, _ in cuts] for name, cuts in saved['cuts'].items() if cuts}
     return dict(mark=saved['mark'], rows=rows, ended=saved['ended'])
 
 

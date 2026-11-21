@@ -1462,7 +1462,7 @@ class SparseTest(CaptureTest):
         def kept(output, taken_off=False):
             torn(output)
             start = (output / 'events.jsonl').stat().st_size - len(cut)
-            sidecar(output, {'events.jsonl': [[start, cut, taken_off]]})
+            sidecar(output, {'events.jsonl': [[start, cut, taken_off, cut.encode().hex()]]})
         _, output, _ = self.run_capture([dict(pc=capture.RETURN)], ['--updates', '2', '--resume'], prepare=kept)
         [logged] = self.events(output, 'resume_torn')
         self.assertEqual((logged['mark'], logged['rows']), ('m1', {'events.jsonl': [cut]}))
@@ -1476,12 +1476,15 @@ class SparseTest(CaptureTest):
             self.resumed_after({})(output)
             with open(output / 'events.jsonl', 'a') as f:
                 f.write(json.dumps(dict(kind='resume_torn', mark='m1', rows={'events.jsonl': [cut]}, ended=[])) + '\n')
-            sidecar(output, {'events.jsonl': [[9, cut, True]]})
+            sidecar(output, {'events.jsonl': [[9, cut, True, cut.encode().hex()]]})
         _, output, _ = self.run_capture([dict(pc=capture.RETURN)], ['--updates', '2', '--resume'], prepare=logged_already)
         self.assertEqual([r['mark'] for r in self.events(output, 'resume_torn')], ['m1'])
         self.assertFalse((output / 'resume-torn.json').exists())
         # A file of another form (an earlier revision's) refuses the takeover before anything is changed.
-        for other in ({'events.jsonl': [cut]}, dict(mark='m0', rows={'events.jsonl': [cut]}, ended=[]), [1]):
+        for other in ({'events.jsonl': [cut]}, dict(mark='m0', rows={'events.jsonl': [cut]}, ended=[]), [1],
+                      dict(mark='m0', cuts={'watch.jsonl': [[0, 'old', True, '6f6c64', 'extra']]}, ended=[]),
+                      dict(mark='m0', cuts={'watch.jsonl': [[0, 'old', 1, '6f6c64']]}, ended=[]),
+                      dict(mark='m0', cuts={'watch.jsonl': [[0, 'old', True, 'xyz']]}, ended=[])):
             def earlier(output, other=other):
                 torn(output)
                 (output / 'resume-torn.json').write_text(json.dumps(other))
@@ -1500,14 +1503,26 @@ class SparseTest(CaptureTest):
             out = Path(d)
             (out / 'events.jsonl').write_text('{"kind": "baseline"}\n')
             start = (out / 'events.jsonl').stat().st_size
-            (out / 'resume-torn.json').write_text(json.dumps(dict(mark='m1', cuts={'events.jsonl': [[start, cut, False]]}, ended=[])))
+            (out / 'resume-torn.json').write_text(json.dumps(dict(mark='m1', cuts={'events.jsonl': [[start, cut, False, cut.encode().hex()]]}, ended=[])))
             self.assertEqual(capture.repair_tails(out, ['events.jsonl'])['rows'], {'events.jsonl': [cut]})
             self.assertEqual(json.loads((out / 'resume-torn.json').read_text())['cuts'],
-                             {'events.jsonl': [[start, cut, True]]})
+                             {'events.jsonl': [[start, cut, True, cut.encode().hex()]]})
             with open(out / 'events.jsonl', 'a') as f:
                 f.write(cut)
             self.assertEqual(capture.repair_tails(out, ['events.jsonl'])['rows'], {'events.jsonl': [cut, cut]})
             self.assertEqual((out / 'events.jsonl').stat().st_size, start)
+            # Two rows whose bytes differ but read alike (both not UTF-8) are two cuts: the bytes are kept.
+            (out / 'resume-torn.json').unlink()
+            for end in (b'\xff', b'\xfe'):
+                with open(out / 'events.jsonl', 'ab') as f:
+                    f.write(b'{"kind": "' + end)
+                saved = json.loads((out / 'resume-torn.json').read_text()) if (out / 'resume-torn.json').exists() else None
+                if saved:
+                    # Killed after the truncate and before noting it.
+                    saved['cuts']['events.jsonl'][-1][2] = False
+                    (out / 'resume-torn.json').write_text(json.dumps(saved))
+                rows = capture.repair_tails(out, ['events.jsonl'])['rows']
+            self.assertEqual(rows, {'events.jsonl': ['{"kind": "\ufffd', '{"kind": "\ufffd']})
 
     def test_the_baseline_check_reads_rows_as_the_resume_does(self):
         # Two objects split by a bare CR in a row the kill cut short: the tail repair takes both off, so
