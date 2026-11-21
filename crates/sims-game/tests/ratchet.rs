@@ -473,9 +473,14 @@ fn run(install: &Path, references: &Path) -> Result<(), Vec<String>> {
                 }
             }
         }
+        // A class with no pixels in the frame shows as `-` and keeps no
+        // floor: there is nothing to match.
         let row: Vec<String> = CLASSES
             .iter()
-            .map(|c| format!("{:>7.2}%", percent(shares[c])))
+            .map(|c| match shares[c] {
+                (_, 0) => format!("{:>8}", "-"),
+                share => format!("{:>7.2}%", percent(share)),
+            })
             .collect();
         println!("ratchet: {name:<24} {}", row.join(" "));
 
@@ -493,8 +498,20 @@ fn run(install: &Path, references: &Path) -> Result<(), Vec<String>> {
         }
         let mut floors = Vec::new();
         for c in CLASSES {
+            let floor = scene.floors.get(c).copied();
+            if shares[c].1 == 0 {
+                // A floor on a class the frame no longer has fails: the
+                // frame lost what the floor was kept for.
+                if let Some(floor) = floor.filter(|&f| f > 0.0) {
+                    failures.push(format!(
+                        "{name}: {c} has no pixels, but its floor is {floor:.2}%"
+                    ));
+                    floors.push(format!("{c} {floor:.2}"));
+                }
+                continue;
+            }
+            let floor = floor.unwrap_or(0.0);
             let share = percent(shares[c]);
-            let floor = scene.floors.get(c).copied().unwrap_or(0.0);
             if share < floor {
                 failures.push(format!(
                     "{name}: {c} matches {share:.2}%, below its floor {floor:.2}%"
