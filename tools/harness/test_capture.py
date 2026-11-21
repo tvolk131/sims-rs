@@ -24,6 +24,8 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import capture  # noqa: E402
 import guest  # noqa: E402
+import input as scenario_input  # noqa: E402
+import manifest  # noqa: E402
 import rsp  # noqa: E402
 
 GAME_CR3, OTHER_CR3 = 0x111000, 0x222000
@@ -84,8 +86,11 @@ class FakeRemote:
         return self.current.get('pending_reply', 'T05')
 
     def registers(self):
-        regs = dict(eip=self.current['pc'], ecx=self.current.get('ecx', 0x20000), ebx=0x20000, ebp=0x90000,
-                    esp=self.current.get('esp', 0x90010))
+        regs = dict(eip=self.current['pc'], ecx=self.current.get('ecx', 0x20000), ebx=0x20000,
+                    ebp=self.current.get('ebp', 0x90000), esp=self.current.get('esp', 0x90010))
+        for k in ('eax', 'edi', 'esi'):
+            if k in self.current:
+                regs[k] = self.current[k]
         raw = bytearray(88)
         struct.pack_into('<I', raw, 64, 0xa0000)
         struct.pack_into('<I', raw, 84, self.current.get('cr3', GAME_CR3))
@@ -124,7 +129,12 @@ class FakeMemory:
         words = {0x20000 + 0xb0: 0x30000, 0x30000 + 0x18: 0x40000, 0x30000 + 0x1c: 0x40004, 0x40000: 0x50000,
                  0x50000 + 0x118: 0x60000, 0x50000 + 0xadc: self.remote.current.get('animator', 0x70000),
                  0x20000 + 0x98: 100, 0x90010 + 4: self.remote.current.get('result', 0)}
+        words.update(self.remote.current.get('words', {}))
         return words.get(p, 0)
+
+    def action(self, p):
+        return dict(uid=0, caller=259, target=10, icon=10, menu=1, args=[0, 0, 0, 0],
+                    priority=50, routine=4100, attenuation_bits=0, flags=0)
 
     def words(self, p, n, width=4):
         return [self.word(p + 4 * i) for i in range(n)]
@@ -1605,6 +1615,56 @@ class SparseTest(CaptureTest):
     def test_negative_windows_are_refused(self):
         with self.assertRaises(SystemExit), patch.object(sys, 'stderr', io.StringIO()):
             self.run_capture([dict(pc=0)], ['--around', '-1'])
+
+    def test_an_unreadable_lot_still_records_a_pending_queue_result(self):
+        temporary = tempfile.TemporaryDirectory(prefix='sims-scenario-test-')
+        self.addCleanup(temporary.cleanup)
+        guest_dir = Path(temporary.name) / 'guest'
+        (guest_dir / 'share' / 'cmd').mkdir(parents=True)
+        scenario = Path(temporary.name) / 's.txt'
+        scenario.write_text('wait 10\n')
+        action = 0x80000
+        stops = [
+            dict(pc=0),  # attach stop before the first resume
+            dict(pc=capture.ENTRY),  # baseline
+            dict(pc=capture.RETURN),  # update 1: arms the late watch for update 2
+            dict(pc=scenario_input.QUEUE_PUSH, edi=0x50000, esi=action, ebp=0x90000),
+            # Unreadable lot in the game's process with a matching pending push: result still logged,
+            # while the moving late watch is taken off by tend_watches.
+            dict(pc=scenario_input.QUEUE_RESULT, eax=0x100, ebp=0x90000, lot_unreadable=True,
+                 words={action + scenario_input.ACTION_UID: 7}),
+            # Unreadable lot with no matching pending frame is still foreign.
+            dict(pc=scenario_input.QUEUE_RESULT, eax=1, ebp=0x90100, lot_unreadable=True),
+            # Another process with a matching ebp is still foreign.
+            dict(pc=scenario_input.QUEUE_RESULT, cr3=OTHER_CR3, eax=1, ebp=0x90000),
+            dict(pc=capture.ENTRY),
+            dict(pc=capture.RETURN),  # update 2
+        ]
+        _, output, _ = self.run_capture(
+            stops,
+            ['--updates', '2', '--guest-dir', str(guest_dir), '--scenario', str(scenario),
+             '--window', '0xe00013', '--late-watch', '2-2,anim=person:259@0xadc+0x88:4'],
+        )
+        rows = [json.loads(line) for line in (output / 'input.jsonl').read_text().splitlines() if line.strip()]
+        results = [r for r in rows if r.get('kind') == 'queue_result']
+        self.assertEqual(len(results), 1)
+        self.assertEqual((results[0]['push'], results[0]['accepted'], results[0]['uid']), (1, False, 7))
+        self.assertEqual(len(self.events(output, 'foreign_stop')), 2)
+        self.assertTrue(any(e.get('name') == 'anim' and e.get('elsewhere')
+                            for e in self.events(output, 'watch_lost')))
+
+    def test_resume_repairs_a_torn_input_log(self):
+        queued = dict(kind='queued', update=1, in_update=False, push=1, person=259, action_pointer=0x80000, step=0)
+        cut = '{"kind": "queue_result", "push": 1'
+        def prepare(output):
+            self.resumed_after({})(output)
+            (output / 'events.jsonl').write_text(json.dumps(dict(kind='baseline', cr3=GAME_CR3, tick=100, lot=5)) + '\n')
+            (output / 'input.jsonl').write_text(json.dumps(queued) + '\n' + cut)
+        _, output, _ = self.run_capture([dict(pc=capture.RETURN)], ['--updates', '2', '--resume'], prepare=prepare)
+        self.assertEqual(self.events(output, 'resume_torn')[0]['rows'], {'input.jsonl': [cut]})
+        m = manifest.build(output)
+        self.assertEqual(len(m['queued']), 1)
+        self.assertNotIn('accepted', m['queued'][0])
 
 
 class DialogAnswererTest(unittest.TestCase):
