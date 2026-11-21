@@ -235,6 +235,56 @@ impl People {
     }
 }
 
+/// The skeleton the definition `guid` names: the first of its body
+/// strings (the string table its word 19 names, 0x457f60). Unlike
+/// [`People::load`], this reads any definition, such as the pools'
+/// person templates, whose OBJD types are not 2.
+pub fn skeleton_name(index: &Index, catalog: &Catalog, guid: u32) -> Result<String> {
+    let object = catalog
+        .object(guid)
+        .ok_or_else(|| Error::Unsupported(format!("no definition has the GUID {guid:#010x}")))?;
+    let resource = &index.resources[object.resource];
+    let body = body_strings(index, resource, object.chunk)?;
+    body.get(0, 1)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            Error::Unsupported(format!(
+                "{}: the definition's body strings name no skeleton",
+                resource.location(&index.root)
+            ))
+        })
+}
+
+/// The bone scales of the skeleton named `name` (looked up by name, as
+/// 0x5a0384 does), found as [`People::load`] finds a person's skeleton:
+/// among the skeleton files of `GameData/Animation` and of the indexed
+/// object directories. No file defining it, or two files defining it,
+/// fails, naming them, since the original's avatar registry, which would
+/// choose, is not ported.
+pub fn skeleton_scales(install: &Install, index: &Index, name: &str) -> Result<Vec<i32>> {
+    let avatar_files = avatar_files(install, index)?;
+    let files = skeleton_files(install, &avatar_files)?;
+    let mut found = files.iter().flat_map(|(file, skeletons)| {
+        skeletons
+            .iter()
+            .filter(|(n, ..)| n.eq_ignore_ascii_case(name))
+            .map(move |(_, scales, _)| (file, scales))
+    });
+    let Some((file, scales)) = found.next() else {
+        return Err(Error::Unsupported(format!(
+            "no skeleton file defines the skeleton {name:?}"
+        )));
+    };
+    if let Some((other, _)) = found.next() {
+        return Err(Error::Unsupported(format!(
+            "the skeleton {name:?} is defined by {file} and by {other}; choosing between \
+             them needs the original's avatar registry, which is not ported"
+        )));
+    }
+    Ok(scales.clone())
+}
+
 /// The body strings of the person definition `chunk` of a character
 /// file.
 fn body_strings(index: &Index, resource: &Resource, chunk: u16) -> Result<StringTable> {

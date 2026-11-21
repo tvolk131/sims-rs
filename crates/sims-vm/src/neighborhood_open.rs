@@ -23,7 +23,9 @@ pub use pools::{LotTransition, OpenedPools, PoolInput, PoolPerson};
 
 use crate::boot::BootError;
 use sims_content::family_import::{clone_character, refresh_outfits};
-use sims_content::{Catalog, ImportWardrobe, Index, Install, Neighborhood, People};
+use sims_content::{
+    Catalog, ImportWardrobe, Index, Install, Neighborhood, skeleton_name, skeleton_scales,
+};
 use sims_core::CrtRng;
 use sims_formats::family_file::FamilyFile;
 use sims_formats::iff::{Iff, write};
@@ -133,9 +135,9 @@ pub fn open_neighborhood(
     let patch = open(&mut neighborhood, &patches, &context, new_guid)?;
     let mut pool_crt = *crt;
     let skeletons = if pools.people.is_empty() {
-        BTreeMap::new()
+        pools::Skeletons::default()
     } else {
-        human_skeletons(&install, &index, &catalog)?
+        pool_skeletons(&install, &index, &catalog, &registry)?
     };
     let filled = pools::fill(
         &mut neighborhood,
@@ -158,10 +160,13 @@ pub fn open_neighborhood(
             file.write_all(&iff.bytes)
         });
         if let Err(error) = result {
+            let mut message = format!("0x4722b8: {}: {error}", path.display());
             for path in &written {
-                let _ = std::fs::remove_file(path);
+                if let Err(error) = std::fs::remove_file(path) {
+                    message += &format!("; and removing {} failed: {error}", path.display());
+                }
             }
-            return Err(format!("0x4722b8: {}: {error}", path.display()).into());
+            return Err(message.into());
         }
     }
     neighborhood.directory = output.to_path_buf();
@@ -236,39 +241,41 @@ fn write_imports(
     Ok(())
 }
 
-/// Each person type's skeleton's own bone scales, by lowercase skeleton
-/// name, as the installed skeleton files give them. A pool person's actor
-/// copies the skeleton its profile names (0x598da3), which draws by
-/// these scales. A name two files define with different scales fails.
-fn human_skeletons(
+/// The bone scales a pool person's temporary actors copy (0x598da3).
+/// The first actor is made from the pool's template, so it takes the
+/// template's skeleton (0x426e8e). A second actor, made after the age is
+/// set (0x426e97, 0x40cc2a), takes the one its profile names, `adult` or
+/// `child`. The templates are the resolved definitions the pools can
+/// pick (kinds 0x800, 0x200, 0x1000 and 0x400). Each skeleton is looked
+/// up by name (0x5a0384) in the installed avatar files. A lookup that
+/// fails is kept and reported only if a pool person needs it, so an
+/// unrelated definition cannot stop the open.
+fn pool_skeletons(
     install: &Install,
     index: &Index,
     catalog: &Catalog,
-) -> Result<BTreeMap<String, Vec<i32>>, BootError> {
-    let person_types = catalog
-        .objects
-        .iter()
-        .filter(|object| object.kind == 2)
-        .map(|object| object.guid);
-    let (people, _) = People::load_each(install, index, catalog, person_types)?;
-    let mut skeletons = BTreeMap::new();
-    for skeleton in people.skeletons.values() {
-        let own = skeleton.scales.get(skeleton.place).ok_or_else(|| {
-            format!(
-                "0x598da3: the skeleton {:?} is not in its file",
-                skeleton.name
-            )
-        })?;
-        let name = skeleton.name.to_ascii_lowercase();
-        if let Some(other) = skeletons.insert(name, own.clone())
-            && &other != own
-        {
-            return Err(format!(
-                "0x598da3: two skeletons named {:?} have different scales",
-                skeleton.name
-            )
-            .into());
+    registered: &[sims_sim::neighbors::Registered],
+) -> Result<pools::Skeletons, BootError> {
+    let mut by_name = BTreeMap::new();
+    let mut scales = |name: &str| -> Result<Vec<i32>, String> {
+        by_name
+            .entry(name.to_ascii_lowercase())
+            .or_insert_with(|| {
+                skeleton_scales(install, index, name).map_err(|error| error.to_string())
+            })
+            .clone()
+    };
+    let mut skeletons = pools::Skeletons::default();
+    for entry in registered {
+        if matches!(entry.kind, 0x800 | 0x200 | 0x1000 | 0x400) && entry.resolves {
+            let found = skeleton_name(index, catalog, entry.guid)
+                .map_err(|error| error.to_string())
+                .and_then(|name| scales(&name));
+            skeletons.templates.insert(entry.guid, found);
         }
+    }
+    for name in ["adult", "child"] {
+        skeletons.profiles.insert(name, scales(name));
     }
     Ok(skeletons)
 }

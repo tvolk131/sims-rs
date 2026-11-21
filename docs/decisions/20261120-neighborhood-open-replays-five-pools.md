@@ -55,9 +55,15 @@ Patch still takes its recorded GUIDs from `User00002.iff` through
 `User00029.iff`.
 
 The port draws each GUID's low word from the CRT (0x4725ff) and checks
-it against the OBJD. A temporary person copies the skeleton its profile
-names (0x4596f6, 0x598da3, 0x598a6e, 0x595d65), whose file is taken as
-already read. The copy draws by the installed skeleton's own bone
+it against the OBJD. Each temporary person copies a skeleton (0x4596f6,
+0x598da3, 0x598a6e, 0x595d65), whose file is taken as already read. The
+first is made from the pool's template and copies the template's
+skeleton (0x426e8e): a tourist child's first actor is an adult. A
+second is made after the age and skeleton are set (0x426e97 via
+0x40cc2a) and copies the one the profile names. Each skeleton is looked
+up by name (0x5a0384) in the installed avatar files; a name no file
+defines, or two files define, fails, and a template the pools cannot
+use does not stop the open. The copy draws by the skeleton's own bone
 scales (1,392 draws for the Complete Collection's adult and child).
 Each copy is followed by two default-trait passes (0x4598d4 and
 0x459a6d into 0x459a9c). Both are conditional; the replay takes both as
@@ -99,9 +105,15 @@ gives the handoff that fits: the adult skeleton read and the indicators
 made. House 69 adds 3,272 draws on that path and reaches CRT state
 3,739,951,803 and the `IMPORTED_69` pin, a regression pin of our run
 (`20261120-ud2-house-69-boots-from-the-originals-import.md`). The
-handoff is fitted, not traced. The 64 draws the transition charges
-before the Townies are a separate input (`LotTransition`), recorded
-whether or not they are the indicators'.
+handoff is fitted, not traced. Its skeletons are added to those our
+load already counts as read before the first lot (the startup cache);
+that the original's cache still held them is assumed, since the
+registry can clear what it has read (0x5a38b3). The 64 draws the
+transition charges before the Townies are a separate input
+(`LotTransition`), whether or not they are the indicators'. Their
+number is inferred from the fitted schedule, the gap between Magic
+Town's last draw and the Townies' first in both captures. Their source
+is untraced.
 `FILE_BOOT_DRAWS = 401_120` remains the fitted offset for the separate
 standalone test from the original's files. Its boot builds the
 indicators and reads the adult skeleton file as part of its setup.

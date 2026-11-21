@@ -179,6 +179,8 @@ pub struct Finished {
 #[derive(Debug, Clone, Default)]
 pub struct Handoff {
     /// The skeletons, by name, whose files the game has already read.
+    /// They are added to the files our load counts as read before the
+    /// first lot.
     pub skeletons_read: BTreeSet<String>,
     /// Whether the two indicators' graphics roots already exist.
     pub indicators_made: bool,
@@ -503,7 +505,8 @@ impl Lot {
     /// ([`crate::neighborhood_open::open_neighborhood`]), from the C
     /// runtime state they leave. What the game already holds then is
     /// given as `handoff`, not assumed: which skeleton files it has read
-    /// (0x598af7 reads a file only once), and whether the two indicators
+    /// (0x598af7 skips a file already read; that none was cleared, as
+    /// 0x5a38b3 can, is assumed), and whether the two indicators
     /// exist, whose graphics roots draw 64 numbers when made (0x445e4a,
     /// 0x595d65). The lot still makes its indicator objects; with
     /// `indicators_made`, their draws are not charged again.

@@ -140,6 +140,16 @@ const TOURISTS: Pool = Pool {
     collision: "0x42b975",
 };
 
+/// The bone scales the pool people's temporary actors copy, or why a
+/// lookup failed (reported only when a person needs it).
+#[derive(Debug, Default)]
+pub(super) struct Skeletons {
+    /// The first actor's: each template's skeleton, by template GUID.
+    pub templates: BTreeMap<u32, Result<Vec<i32>, String>>,
+    /// A second actor's: the skeleton its profile names, by name.
+    pub profiles: BTreeMap<&'static str, Result<Vec<i32>, String>>,
+}
+
 pub(super) struct FilledPools<'a> {
     pub report: OpenedPools,
     pub files: Vec<(i32, &'a Iff)>,
@@ -150,7 +160,7 @@ pub(super) fn fill<'a>(
     context: &Context<'_>,
     imported: &patch_import::Opened,
     input: &'a PoolInput,
-    skeletons: &BTreeMap<String, Vec<i32>>,
+    skeletons: &Skeletons,
     crt: &mut CrtRng,
 ) -> Result<FilledPools<'a>, BootError> {
     let mut files = context.character_files.clone();
@@ -217,13 +227,12 @@ struct Fills<'a, 'b> {
     people: BTreeMap<u16, &'a [PoolPerson]>,
     draws: Draws<'b>,
     next_file: i32,
-    /// Each installed skeleton's own bone scales, by lowercase name.
-    skeletons: &'b BTreeMap<String, Vec<i32>>,
+    skeletons: &'b Skeletons,
     files: BTreeSet<i32>,
     made: Vec<(i32, &'a Iff)>,
 }
 
-impl<'a> Fills<'a, '_> {
+impl<'a, 'b> Fills<'a, 'b> {
     fn run(&mut self, pool: Pool) -> Result<(), BootError> {
         if self.context.expansions & pool.expansion == 0 {
             return Ok(());
@@ -423,9 +432,24 @@ impl<'a> Fills<'a, '_> {
 
         let mut data = vec![0; PERSON_WORDS];
         let skeleton = read_profile(iff, objd, self.context.language, &mut data)?;
-        let scales = self.skeletons.get(skeleton).ok_or_else(|| {
-            format!("0x598da3: no installed skeleton {skeleton:?} for User{file:05}")
-        })?;
+        let lookup = |scales: Option<&'b Result<Vec<i32>, String>>, what: &str| match scales {
+            Some(Ok(scales)) => Ok(scales.as_slice()),
+            Some(Err(reason)) => Err(format!("0x5a0384: {what} for User{file:05}: {reason}")),
+            None => Err(format!(
+                "0x5a0384: no skeleton looked up for {what} of User{file:05}"
+            )),
+        };
+        // The first actor is made from the template (0x426e8e), a second
+        // after the age is set (0x426e97 via 0x40cc2a).
+        let skeletons: &'b Skeletons = self.skeletons;
+        let first = lookup(
+            skeletons.templates.get(&source),
+            &format!("template {source:#010x}'s skeleton"),
+        )?;
+        let second = lookup(
+            skeletons.profiles.get(skeleton),
+            &format!("the profile's skeleton {skeleton:?}"),
+        )?;
         let (age, gender) = (data[field::AGE], data[field::GENDER]);
         let editor_words = match pool.done {
             done if done == CELEBRITIES.done => CELEBRITY_WORDS,
@@ -446,7 +470,7 @@ impl<'a> Fills<'a, '_> {
         // The skeleton's file is taken as already read (0x598af7), so
         // only the actor's own copy draws (0x598da3). The final pass
         // survives 0x4ea538 → 0x425a69.
-        for _ in 0..pool.actors {
+        for scales in [first, second].into_iter().take(pool.actors) {
             self.draws.skeleton(scales);
             self.draws.default_traits();
             for (word, value) in self.draws.default_traits() {
