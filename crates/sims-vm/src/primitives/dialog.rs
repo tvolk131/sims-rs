@@ -189,20 +189,15 @@ impl Machine<'_, '_> {
     /// the family's portraits too, so a family member's type with nobody
     /// on the lot fails loudly.
     ///
-    /// The person made is not put on a tile: the house view's centre is
-    /// presentation. The put (virtual function 0x88, 0x45e4e9) is the
-    /// placement 0x433340, which runs code of the simulation's: it asks the
-    /// person its function 9 (placed, 0x433580), and works out the walls
-    /// beside its tile (0x434fac), which asks it its function 6 when they
-    /// differ from the ones it had (0x435110). A type whose callback table
-    /// names a tree for either fails loudly. The rest of the put (the
-    /// rooms, 0x440385, and the tiles, 0x4330d7) is taken to be undone by
-    /// the removal: **unverified**. If no tile is found, the original
-    /// removes the person without drawing it (0x4e9706), and the entry
-    /// stays without its image; 0x4e938c then builds it again in the same
-    /// dialog unless the type has image 2002, and the next dialog builds it
-    /// again (0x4e92a8). Here a tile is taken to be found, so the person is
-    /// made once and the image kept (**unverified**).
+    /// The put is [`crate::Interpreter::portrait_put`]: the search from the
+    /// house view's centre (an input, [`crate::Interpreter::view_centre`])
+    /// and as much of the put as is the same on every tile it may end on.
+    /// It fails loudly where the tile would matter, including when no tile
+    /// is found: the original then removes the person without drawing it
+    /// (0x4e9706), the entry stays without its image, and 0x4e938c builds
+    /// it again in the same dialog unless the type has image 2002, which is
+    /// not ported. The rest of the put (the rooms, 0x440385, and the tiles,
+    /// 0x4330d7) is taken to be undone by the removal: **unverified**.
     pub(crate) fn dialog_portrait(&mut self, operands: &[u8; 8]) -> Result<(), Trap> {
         let stack_object = self.frame()?.stack_object;
         let guid = match (operands[7] >> 1) & 7 {
