@@ -93,8 +93,13 @@ events, and what it asks for after them) come first.
    objects and object 2's last result), global 12 at update 3 and the
    dog's frame-arena word (#275); the original's exact read timing is
    unverified. #276 extends the comparison to update 490, where
-   the capture ends, and its UD2 test boots House 69 from the
-   original's after-import snapshot and runs 1,000 ticks.
+   the capture ends, with the same four differences (global 12 at
+   update 3 also differs between the original's own runs), and its UD2
+   test boots House 69 from the original's after-import snapshot and
+   runs 1,000 ticks. That test's two pins (`IMPORTED_69` at entry and
+   `IMPORTED_69_1000`) hold only this port's own state and are
+   unverified
+   (`docs/decisions/20261120-ud2-house-69-boots-from-the-originals-import.md`).
    Done for 6b: the family-file (.FAM) reader (#252; the original's
    per-file loader is 0x428f05 and its `Patch/` directory lookup
    0x42bd13); the import's data step (#257); the shared `Gtab` reader,
@@ -105,23 +110,45 @@ events, and what it asks for after them) come first.
    allocation residue; the outfit refresh and the in-memory import at
    neighborhood open after house 0's reload (#272) both landed in
    #268. Portrait rendering is open.
+   Done for 6b part D: the import is wired into boot (#281,
+   `docs/decisions/20261120-opened-neighborhood-boots-in-memory.md`).
+   `sims_vm::neighborhood_open::open_neighborhood` opens UserData2 as
+   the original does (house 0's reload, then the `Patch` import),
+   writes the files the import makes into an output copy, and hands
+   the neighborhood, kept in memory, to `Lot::load_in` (there is no
+   `Neighborhood.iff` writer yet). Given the original's GUIDs and
+   pools, the open gives the original's five house files byte for
+   byte and its inventories, and House 69 boots to `IMPORTED_69`, the
+   hash the original's own files boot to. Not ported: removing the
+   imported `.FAM` files and the portraits (neither changes the loaded
+   state), and the import preview, which fails loudly.
    In the original, the first three houseless pools fill during
    neighborhood setup after `Patch`; the other two fill from lot or
    toolbar callbacks. Track 4's replay matches the pool members' GUID
    low words and saved traits. Details are in the pools decision
    (`docs/decisions/20261120-neighborhood-open-fills-five-pools.md`,
-   #276).
+   #276). Sol estimates the pools' port (6b part E) at 735–1,250
+   lines; the pool people's exact files and looks are deferred.
    Decided 2026-11-20 (coordinator): 6a comes first; the pools follow
    as 6b part E, which uses recorded inputs; exact files and looks are
    deferred.
-   Next: 6a, record and compare UD1 House 69 through 1000, and move
-   the UD2 test to the fresh rerun's own after-import files, comparing
-   the entry C runtime and each update's lot state against that
-   recording;
-   6b, wire the import into boot and compare its strict state with a
-   boot from the original's imported files using the same GUIDs; then
-   6b part E.
-   **Unverified:** the FAMh record fields' meanings; how the original
+   Next (track 4): task 1's PR, ready locally and not yet merged, moves
+   the UD2 test (and #281's) to track 2's fresh UD2 House 69
+   recording (1,000 updates, `ud2-import-20261119/after-run2`). A new
+   `Lot::load_with` starts the C runtime where the open left it, and
+   the run matches the recording at entry and at every update through
+   1,000, apart from object 2's last result and object 274's
+   frame-local word 77, which is heap residue. Task 2, UD1 House 69 to
+   update 1,000, is in progress: at update 402 the relationships
+   match. Open there: the 0x8000 bit on the frame tree of GUID
+   0x2c555ea3 objects, global 12 = 17 at update 3 during the Help
+   dialog, object 2's last result, and object 274's never-written word
+   (a heap leftover). Then 6b part E, the five pools, as a Sol port.
+   **Unverified:** which callback runs pools 4 and 5, when the rebuild
+   before them runs, the 64 C runtime draws before the Townies whose
+   caller is unknown, and the template scripts' draws on the game
+   stream (the pools decision); the lot information read's failure
+   branch (0x4e261f), taken to succeed (#281); the FAMh record fields' meanings; how the original
    handles a truncated `Gtab`; the pet modes of Make New Character
    (BHAV 4113); the writer's compaction and replacement against a
    native save; the records the reload makes in a template
@@ -144,8 +171,9 @@ events, and what it asks for after them) come first.
   confirms it. The writer of Mortimer's data word 50 at update 622 is
   found: with the pointer on the plumb bob (object 383), the house view
   lists the bob's pie for the selected Sim, and a check in it sets the
-  word (0x48ca2c → 0x48c834, then 0x452e8e). The bob's pixels now carry its own ID, though our picker still gives
-  a person within reach priority (#260). The replay still leaves the word at 0 until update 872:
+  word (0x48ca2c → 0x48c834, then 0x452e8e). The bob's pixels now carry its own ID (#260), and since #278
+  the pick notes the bob or a person only at the pointer's own pixel,
+  with no reach around it. The replay still leaves the word at 0 until update 872:
   our bob passes about 26 pixels below the recording's parked pointer
   during the walk to the fridge, and where the original draws the bob
   at 622 is unverified (it needs a recording with screenshots at updates 560 to 700). The Sit order and the two-snack cancel order
@@ -154,10 +182,17 @@ events, and what it asks for after them) come first.
   from two pointer listings, and Sit matches through 260 apart from
   Bella's local at updates 203–227; both comparisons skip two unknown
   salesman fields. Which button event triggered the second cancel is
-  open. Also open: what the pointer picks
-  differs in three ways (through a wall, under the still pointer after
-  a choice, and the salesman against the bookcase at Sit update 590);
-  track 1 is on it.
+  open. The pointer pick is now the original's (0x48c9be, #278):
+  people and the bob are noted as they are drawn, with the ids taken
+  after the people pass and before `draw_held` (#279), so a Sim behind
+  the backrest of the bench they sit on is still picked; anything else
+  goes to the sprite pick (0x4aa713) on the lot-only depth. The replays
+  draw the house view only after the updates the recording's frame
+  schedule draws after. Of the three pointer differences, "through a
+  wall" (cancel update 90) is settled; "under the still pointer" and
+  "salesman vs bookcase" (Sit update 590) stay open, waiting on track
+  2's pick-watch recording and screenshots
+  (`docs/decisions/20261119-pointer-pick-is-the-originals-sprite-pick.md`).
   **Unverified:** when the original draws frames before update 171, and
   which camera the original opens the Goths' house with.
   Track 2's harness now opens pie submenus such as Talk and picks
@@ -167,8 +202,30 @@ events, and what it asks for after them) come first.
   work) need. The held press opened the pie in the finished write-watch recording
   (`goth-snack-d50-watch-20261115`) and in track 2's finished Talk and
   Read A Book recordings (`goth-talk-order-20261118`,
-  `goth-read-order-20261118`); replaying those two in the window is
-  still to do, as are buy mode and work.
+  `goth-read-order-20261118`); both are now replayed in the window
+  (below), and buy mode and work are still to do.
+  The Talk order replays in the window (#284,
+  `docs/decisions/20261120-talk-order-replayed-in-the-window.md`). In
+  the checked words it equals the recording after every update from 1
+  to 1000 except three listings the original most likely made under
+  the still pointer: Mortimer's word 50 at 521–810 and 881–925, and a
+  local of tree 8333 at 568–588. Trial listings (the salesman after
+  520 and 550, Bella after 880) close every difference but do not
+  show that the original made them; that needs track 2's pick-watch.
+  The original's press found Bella three rows below her drawn feet,
+  an open case of the person pick's reach; the replay presses at her
+  lowest drawn pixel.
+  The Read A Book order replays too (#286,
+  `docs/decisions/20261120-read-order-replayed-in-the-window.md`). It
+  equals the recording through updates 1–900 except Mortimer's two
+  frame locals from 187, which fit a second check of the pie entry
+  before the order starts (cause unknown; the next step is an execute
+  watch on 0x51bb9e during updates 140–190); Mortimer's word 50 from
+  727, another still-pointer listing; and Bella's three stale locals.
+  New open case: which input makes the original check a pie entry
+  again. The bookcase press uses a stand-in point 7 pixels right of
+  the recording's, because our pick finds the door there (the
+  "salesman vs bookcase" case).
 - Step 3: three houses the Goths don't reach match their recordings through 1000 updates (the Newbies compared again through 1000 on
   #223's branch; #273 compared updates 1–1000 for all three after #258 and #264 moved
   the strict pins: the Roomies match in every compared field, the
@@ -323,8 +380,15 @@ events, and what it asks for after them) come first.
   (0x422632). Also open: the
   Newbies in strict mode from tick 4052; the Pleasants and the Roomies
   beyond their first 1,000 updates when longer track 2 recordings are
-  available. Known gap: the architecture's value
-  (0x47b006's prices) is not ported.
+  available. Known gap: the lot statistics' sums, architecture
+  prices (0x47b006) included, are ported in the interface (#271), but
+  the simulation does not store them as the original does:
+  `architecture_value` at the day's turn, and both values on entering
+  Live mode (0x4cea9e → 0x416534), using `Values::read`'s sums. Also
+  from #271: the `sims-vm` linker keys `STR#` and `OBJD` by ID alone
+  (the original by ID plus high byte 0, 0x41bab1), and its
+  `group_master` lacks the word-16 registration filter (0x43baba); the
+  install has one such master.
 - Of the base neighborhood's houses only the Goths' and the Newbies'
   (`House07.iff`) hold a family. Strict mode on the Newbie house runs to
   tick 4052; a route that gives up on a slot it may end near runs the
@@ -2211,10 +2275,60 @@ Progress:
   dawn); the pool fixtures'
   override at night; the 0.8 cap against a native screenshot of a room
   brighter than 0.8.
-- Next: a few cut-wall trims near the stairs that still differ in the
-  night shot; compare a person behind furniture with the original;
-  the light level's fade; compare Mortimer standing without his
-  book; the edge-on diagonal strip.
+- Done: a person behind furniture, for objects that hold a person
+  (#279, 0x4aacb9, 0x4aa1d7,
+  `docs/decisions/20261120-objects-holding-a-person-draw-after-the-people.md`).
+  As in the original, objects holding a person draw after the people:
+  a frame draws the lot without them (`sims_render::draw_lot`), then
+  the people, then those objects (`draw_held`) against the depth the
+  people wrote, so the in-use bench's backrest blends over Mortimer at
+  7:12 AM. Left over: about 5 pixels where our Mortimer mesh reaches
+  slightly further behind the backrest than the original's; the
+  time-out for recently changed objects is not ported. Open, cause
+  unknown: at tick 1260 person 16 stands by the other bench in a
+  different pose from the 7:12 AM screenshot, with either draw order.
+  A native capture at that tick agrees with ours on that animator's
+  position and phases, so this needs a frame of the original captured
+  at the same tick.
+- Done: Mortimer standing without his book (#282,
+  `docs/decisions/20261120-mortimer-standing-without-his-book-matches-the-original.md`).
+  At 8:05 AM (our tick 2854) the compared animator fields equal the
+  original's, all five sampled interior colours are within 12 per
+  channel, and neither game draws a book. Open, cause unknown:
+  (+0.5, +0.5) was the best tested shift for Mortimer at 7:12 and 8:05
+  and for Bella at 8:05, scored in each Sim's box (the 7:12
+  whole-frame score stays around 1,400 for every shift). Next step:
+  two scrolls at one tick, or read where the original rasterizes a
+  person's mesh.
+- Next: the screenshot ratchet (below), then the edge-on diagonal
+  strip; also a few cut-wall trims near the stairs that still differ
+  in the night shot, and the light level's fade. Done from this list:
+  compare a person behind furniture with the original (for objects
+  holding a person, #279) and compare Mortimer standing without his
+  book (#282).
+- Next (approved by the maintainer 2026-11-20; not built yet): **the
+  screenshot ratchet.**
+  - Frozen private reference screenshots of the original live in
+    `cache/`, never in the repository: the Goth house at near and far
+    zoom, at other rotations, by day and by night, indoors, and with a
+    Sim mid-action. Re-capturing one needs a new hash and a stated
+    reason.
+  - A manifest in the repository records the settings, each
+    reference's SHA-256 (the test refuses to run on a mismatch),
+    per-class exact-match floors, and our render's hash.
+  - Pixel classes come from `Canvas::id_at`. Sprites, walls, floors,
+    road and projection stay at 100% where they are already exact;
+    grass, lighting, shadows and people get floors; animated and
+    frame-drift regions are left out.
+  - Without the references, CI reports "skipped: no assets" loudly.
+    The coordinator's merge gate runs it beside the 43,200-tick boot,
+    and tracks run it before drawing or people PRs (see Working
+    rules).
+  - A drop below a floor fails unless the PR body explains it and
+    lowers the floor.
+  - The hygiene check rejects images in test and fixture paths
+    (`scripts/check_repository.py` already refuses image suffixes such
+    as `.png` and `.bmp` in every path).
 - Done: a person's base layer is the simulation's (`World::base_layers`):
   the posture's loop or a script's clip, at the phase the simulation
   advanced it to. Over the Goths' first 3,400 ticks a person is seated
@@ -2318,8 +2432,9 @@ Progress:
 - Done: which object or person drew each pixel, for clicks:
   `Canvas::id_at` after `sims_render::draw` and `People::draw_on_lot`.
   Objects name themselves, people their object ID, and terrain, floors
-  and walls nobody. The game window picks by it. The original's rule for 3D graphics is
-  read (see the click-pick entry further down, #260).
+  and walls nobody. The game window notes people and the bob by it;
+  anything else goes to the sprite pick on the lot's depth (see the
+  pointer-pick entry under integration, #278).
 - Done: the pools of light lit lamps throw on the floor, from the
   game's `lightMap.dat`, and lit lamps drawn in full light, as the
   original does. With the world at the screenshots' time, near zoom
@@ -2445,6 +2560,16 @@ Progress:
   read at update 174), took the $80 chair from Seating, put it on the lawn,
   and went back to live mode (mode 0 at update 1078). The new object (ID
   262) and the budget's fall from 2542 to 2462 were read at update 878.
+- Done: `capture.py --late-watch FROM[-TO],NAME=EXPR` sets a write
+  watch for some lot updates only (from the end of update FROM−1 to
+  the end of TO), for watches such as the RNG watch late in the Goth
+  day (#285). Each watch row's `match` (`named`, `one_of`, `changed`,
+  `at`) says only what QEMU's stop shows. The pending trap after a
+  stepped watch is journalled in `status.json`, and `--resume` is
+  harder: it refuses a run with no baseline, does not show a dialog
+  twice, and trims rows a kill cut short. **Unverified:** a live QEMU
+  takeover; the takeover paths were tested only against a fake
+  gdbstub.
 - Next: build mode (its mode number), and a replay of the recorded push and
   the purchase in our simulation. The replay needs a way to queue an
   action on a person, and to place a bought object, before a tick.
@@ -2564,8 +2689,7 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   color as the original's screen is; the simulation side of text entry
   dialogs (dialog kind 3 in `sims-vm`, not ported) and where the
   original stores the entered text; the job panel's blinking
-  performance and its tooltips; the house panel's Furnishings (the
-  object scan 0x444cb9 plus the architecture value 0x47b006) and Layout
+  performance and its tooltips; the house panel's Layout
   (the routing history at lot +0x3c..+0x64); the needs panel's help
   balloons with their pictures, and the balloon's 250 ms fade; the
   residential-lot check on the House button (0x40745f); the other live
@@ -2579,6 +2703,22 @@ Drawing goes into a CPU frame, so `cargo test` needs no window.
   original, as it does here. Not ported: the original closes the
   balloon on a press outside its rectangle (0x51f3e5) and on certain
   focus changes (0x51d312, 0x51d354).
+- **Done: the house panel's Furnishings rating** (0x416851, #271,
+  `docs/decisions/20261118-house-panel-furnishings.md`): the budget's
+  architecture value over its objects' value, through the curve in
+  `STR#` 505. The lot statistics' object and architecture sums
+  (0x416085) are ported in `sims_ui::house::Values::read`, for the
+  simulation to store (see step 2's known gap); the panel reads the
+  world's budget. For the Goths both values equal track 2's capture
+  of update 1 (14,660 and 15,277), and their Furnishings is 58. Next
+  (content): the shared catalog registers high-byte variants and
+  word-16 definitions, and its `ObjectDefinition::parse` refuses
+  version 137 (0x43ba84, 0x43bd90); none of these occur in the
+  install. **Unverified:** the panel against a screenshot of the
+  original; a resource map entry whose ID or high byte differs from
+  its chunk (none in the install); US English prices only (0x47028b);
+  the `CST` fallback; curve points that are not well formed, and the
+  single-precision span (`Curve::parse`).
 - **Needs from `sims-sim` and `sims-vm`** (this track does not add them):
   - A command intake, for example `World::apply(&mut self, command:
     sims_sim::Command) -> Result<(), CommandError>`, run between ticks,
@@ -2708,17 +2848,22 @@ through their public interfaces only; the simulation never depends on it.
   test runs through tick 540. The switch is recorded in
   `goth-switch-cancel-order-20261115`; comparing against that recording
   is open.
-- Done: a click picks what the frame shows at the pixel
-  (`Canvas::id_at`, `sims_game::pick`): the person shown there or
-  nearest within two pixels, else the object shown there. A tile of a
+- Done: the pointer pick is the original's (0x48c9be, #278,
+  `docs/decisions/20261119-pointer-pick-is-the-originals-sprite-pick.md`;
+  it replaces #260's two-pixel reach). A person or the bob is noted
+  when the frame shows their pixel at the pointer (`pick::noted`), as
+  the original notes the last 3D graphic whose draw changed the depth
+  there (0x5863eb, 0x590ebd). The ids are taken after the people pass
+  and before `draw_held` (#279), so a Sim behind the backrest of the
+  bench they sit on is still picked. Anything else uses the sprite
+  pick (`Lot::sprite_pick`, 0x4aa713): the start tile unprojected from
+  the lot-only depth under the pointer, then up to 21 tiles toward the
+  viewer, each object tested by its drawn rectangle. A tile of a
   multi-tile object is picked as itself; the simulation sends its
-  interactions on (0x435286). How the original finds what the pointer is on is read for 3D
-  graphics: the bob and a person each read the depth buffer at the
-  pointer before and after drawing, and the last to change it is under
-  the pointer; the bob draws after the person, so where it covers them
-  the bob wins (0x5863eb, 0x590ebd, 0x48c9be; #260). Since #260
-  the bob's pixels name the bob; our picker still prefers a person
-  within two pixels, which is unverified against that rule.
+  interactions on (0x435286). **Unverified:** the view's tile bounds;
+  which level the original's single 3D position takes where several
+  fit; the flat ground-plane fallback on a sloped lot; whether the
+  original's people have rectangles the sprite pick tests.
 - **Done: answering a dialog from the window.** A dialog with a choice
   waits for the player: the lot stops before the tick that shows it,
   the dialog is drawn from the world as that tick left it, and a press
@@ -2779,6 +2924,11 @@ through their public interfaces only; the simulation never depends on it.
 - Work in branches, open PRs, and merge when CI is green on both platforms.
   Squash merges only, no force-pushes, and run
   `scripts/check_repository.py --history HEAD` before every push.
+- The screenshot ratchet (approved 2026-11-20, not built yet; see the
+  drawing-people track): the coordinator's merge gate runs it beside
+  the 43,200-tick boot, and tracks run it before opening a drawing or
+  people PR. A drop below a class's floor fails unless the PR body
+  explains it and lowers the floor.
 - Nothing from the original game is committed. Fixtures that need game data
   stay private and are skipped when the data is absent.
 - Choices about format details, unverified guesses, and the order of work
