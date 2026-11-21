@@ -410,6 +410,7 @@ impl Game {
                     for line in in_order(at, &update.errors, &update.frame_errors) {
                         self.errors.push(at, line);
                     }
+                    self.view.masks_rebuilt(update.masks_rebuilt);
                     self.keep_sounds(update.sounds);
                 }
                 // The tick shows a dialog: it runs once it is answered,
@@ -425,7 +426,10 @@ impl Game {
                         StepError::Frame {
                             update: Some(update),
                             ..
-                        } => self.keep_sounds(update.sounds.clone()),
+                        } => {
+                            self.view.masks_rebuilt(update.masks_rebuilt);
+                            self.keep_sounds(update.sounds.clone());
+                        }
                         // A play step whose tick failed hands back what
                         // it caught and made before the failure.
                         StepError::Tick {
@@ -436,6 +440,7 @@ impl Game {
                             for line in in_order(*tick, &update.errors, &update.frame_errors) {
                                 self.errors.push(*tick, line);
                             }
+                            self.view.masks_rebuilt(update.masks_rebuilt);
                             self.keep_sounds(update.sounds.clone());
                         }
                         _ => {}

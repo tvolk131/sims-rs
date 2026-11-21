@@ -8,7 +8,7 @@ use sims_core::F32;
 use sims_formats::saved_objects::Slot;
 use sims_formats::tuning::{Constant, Constants};
 use sims_vm::{Asked, INDICATORS, Interpreter, Trap, selected};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 /// The person the tests add, and the tile it stands on, inside the
 /// walls: room 1.
@@ -471,6 +471,43 @@ fn going_live_marks_the_rooms_and_the_frame_counts_them() {
     interpreter.update_pending_rooms(world).unwrap();
     let room = &world.rooms.rooms[&1];
     assert_eq!((room.objects, room.lights, room.lamp_light), (2, 0, 0));
+}
+
+/// A room update builds the cutaway masks of its level's rooms at its
+/// end, whether or not it counted any (0x466c3c, at 0x466ef6), and the
+/// interpreter notes the levels for the view.
+#[test]
+fn a_room_update_notes_the_levels_whose_masks_it_built() {
+    let mut fx = lot_with_person();
+    let rebuilt = Cell::new(0);
+    let mut interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    interpreter.masks_rebuilt = Some(&rebuilt);
+    let world = &mut fx.world;
+    assert!(!interpreter.update_rooms(world, 1).unwrap().is_empty());
+    assert_eq!(rebuilt.take(), 1);
+    // With no room marked none is counted, and the masks are built all
+    // the same.
+    for room in world.rooms.rooms.values_mut() {
+        room.dirty = false;
+    }
+    assert_eq!(interpreter.update_rooms(world, 2).unwrap(), []);
+    assert_eq!(rebuilt.take(), 2);
+    // With nothing waiting there is no update.
+    world.rooms.pending = 0;
+    assert_eq!(interpreter.update_pending_rooms(world).unwrap(), []);
+    assert_eq!(rebuilt.get(), 0);
+    world.note_occupant(1, true);
+    assert_eq!(world.rooms.pending, 1);
+    interpreter.update_pending_rooms(world).unwrap();
+    assert_eq!(rebuilt.take(), 1);
+    world.mark_all_rooms();
+    interpreter.update_pending_rooms(world).unwrap();
+    assert_eq!(rebuilt.take(), 3);
+    // A frame counts the rooms that wait first (0x4a8895), so it notes
+    // them too.
+    world.mark_all_rooms();
+    let _ = interpreter.draw_frame(world, 1);
+    assert_eq!(rebuilt.take(), 3);
 }
 
 #[test]
