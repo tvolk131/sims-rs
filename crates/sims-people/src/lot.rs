@@ -824,10 +824,9 @@ impl People {
 
     /// Like [`People::draw_on_lot`], using `viewport` `(width, height)` as
     /// the active 3D house viewport passed to [`View::eye`] (`0x49ae5e`,
-    /// `0x4d363b`, `0x53b2eb` → `0x4b136b` → `0x49b0bf` → `0x5cf1b6`:
-    /// `(width, height)` with the bottom strip closed, `(width, height - 100)`
-    /// with the live-mode strip open, `(width, height - 150)` with the tall
-    /// buy-mode strip open).
+    /// `0x4f4b43`, `0x4d363b`, `0x53b2eb` → `0x4b136b` → `0x49b0bf` →
+    /// `0x5cf1b6`: `(width, height)` with the bottom strip closed,
+    /// `(width, height - 100)` with the strip open).
     pub fn draw_on_lot_in_viewport(
         &mut self,
         world: &World,

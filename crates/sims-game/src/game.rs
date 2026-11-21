@@ -1189,11 +1189,12 @@ impl Game {
         ]
     }
 
-    /// The active 3D house viewport size (`0x49ae5e`, `0x4d363b`, `0x53b2eb` →
-    /// `0x4b136b` → `0x49b0bf` → `0x5cf1b6`): full canvas `(width, height)`
-    /// while the bottom strip is closed, `(width, height - STRIP)` while the
-    /// live/build/options strip is open, and `(width, height - TALL_STRIP)`
-    /// while the tall buy-mode strip is open.
+    /// The active 3D house viewport size (`0x49ae5e`, `0x4f4b43`, `0x4d363b`,
+    /// `0x53b2eb` → `0x4b136b` → `0x49b0bf` → `0x5cf1b6`): full canvas
+    /// `(width, height)` while the bottom strip is closed, and
+    /// `(width, height - STRIP)` (`height - 150 + 50` from the shared
+    /// 150-pixel panel container at `0x4f4b43`) while the strip is open in
+    /// Live, Build, Buy, or Options mode.
     fn house_viewport_size(&self) -> (u32, u32) {
         viewport_for_controls(self.view.size, &self.hud.controls)
     }
@@ -1698,18 +1699,15 @@ fn sync_speed_after_step(
     true
 }
 
-/// The active 3D house viewport size (`0x49ae5e`, `0x4d363b`, `0x53b2eb` →
-/// `0x4b136b` → `0x49b0bf` → `0x5cf1b6`): full canvas when the bottom strip
-/// is closed, `height - STRIP` when the live/build/options strip is open, and
-/// `height - TALL_STRIP` when the tall buy-mode strip is open.
+/// The active 3D house viewport size (`0x49ae5e`, `0x4f4b43`, `0x4d363b`,
+/// `0x53b2eb` → `0x4b136b` → `0x49b0bf` → `0x5cf1b6`): full canvas when the
+/// bottom strip is closed, and `height - STRIP` (`height - 150 + 50` from the
+/// shared 150-pixel panel container at `0x4f4b43`) when the strip is open in
+/// Live, Build, Buy, or Options mode.
 fn viewport_for_controls(size: [i32; 2], controls: &sims_ui::hud::Controls) -> (u32, u32) {
     let [w, h] = size.map(|n| n.max(1));
     let strip = if controls.expanded {
-        if controls.mode == sims_ui::command::Mode::Buy {
-            sims_ui::hud::TALL_STRIP
-        } else {
-            sims_ui::hud::STRIP
-        }
+        sims_ui::hud::STRIP
     } else {
         0
     };
@@ -2071,9 +2069,9 @@ mod tests {
         assert_eq!(viewport_for_controls([800, 600], &controls), (800, 500));
 
         controls.mode = Mode::Buy;
-        assert_eq!(viewport_for_controls([800, 600], &controls), (800, 450));
+        assert_eq!(viewport_for_controls([800, 600], &controls), (800, 500));
 
         // Short windows clamp to at least 1 pixel rather than wrapping.
-        assert_eq!(viewport_for_controls([800, 120], &controls), (800, 1));
+        assert_eq!(viewport_for_controls([800, 80], &controls), (800, 1));
     }
 }

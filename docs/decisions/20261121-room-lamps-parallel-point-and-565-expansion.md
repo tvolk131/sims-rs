@@ -2,11 +2,11 @@
 
 *Decided 2026-11-21.*
 
-Closes the remaining unverified lighting and 5-6-5 texel expansion assumptions from
+Closes the unverified room-lamp light type from
 `20261118-standard-light-shines-from-viewers-side-lamps-light-people.md` ("That the
-lamps' lights are directional, not point lights") and
-`20261121-people-d3d6-pixel-centers-and-565-modulation.md` ("Direct3D 6's internal
-5-6-5 texel expansion and modulation rounding live inside Direct3D's rasterizer").
+lamps' lights are directional, not point lights") and replaces the zero-filled 5-6-5
+texel masking from `20261121-people-d3d6-pixel-centers-and-565-modulation.md` with
+MSB bit-replicated 5-6-5-to-8-bit expansion before modulation.
 
 ## Disassembly & Direct3D 6 findings (`Sims.exe`)
 
@@ -44,14 +44,14 @@ lamps' lights are directional, not point lights") and
   `lamp_pos - camera_eye` points away from the viewer, Mortimer's viewer-facing back
   receives no lamp contribution while sides facing away from the viewer receive warm
   fill light.
-- **Active house viewport height (`0x49ae5e`, `0x4d363b`, `0x53b2eb` → `0x4b136b` → `0x49b0bf` → `0x5cf1b6`).**
+- **Active house viewport height (`0x49ae5e`, `0x4f4b43`, `0x4d363b`, `0x53b2eb` → `0x4b136b` → `0x49b0bf` → `0x5cf1b6`).**
   `0x49b0de` reads the active viewport rectangle (`[viewport + 0x68..+0x74]`).
-  `0x49ae5e` initializes it to `(width, height - 100)` (`0x49aed6`); collapsing
-  the bottom strip (`0x53b2eb`, `[panel + 0x230] == 1`) restores the full
-  framebuffer `(width, height)` (`0x53b3a4`), while expanding the strip resizes
-  it to `height - 100` in live/build/options mode (`0x53b38b`, `0x4d363b`) and
-  `height - 150` in buy mode (`TALL_STRIP`). All eight ratchet scenes have the
-  strip closed (`800×600`).
+  `0x49ae5e` initializes it to `(width, height - 100)` (`0x49aed6`); `0x4f4b43`
+  creates a shared 150-pixel panel container, so `0x4d3662` and `0x53b39d`
+  compute `height - 150 + 50 = height - 100` whenever the strip is expanded
+  (Live, Build, Buy, and Options modes), while collapsing the strip (`0x53b3a4`,
+  `[panel + 0x230] == 1`) restores the full framebuffer `(width, height)`. All
+  eight ratchet scenes have the strip closed (`800×600`).
 - **5-6-5 texel expansion by MSB bit-replication before `D3DTOP_MODULATE`.**
   `Sims.exe` verifies truncation of uploaded skin BMPs into 16-bit 5-6-5 textures
   (`0x5ca0d3`, `0x5ca1f8`, `0x5ca55f` → `0x5ca635` → `0x49f0ae`: `r5 = r >> 3`,
@@ -77,9 +77,8 @@ lamps' lights are directional, not point lights") and
   room lamp's direction to `(light - eye).normalize()` while keeping strength
   computed from the squared distance between the person's root `at` and `light`.
   `Game::draw` passes the active house viewport (`(w, h)` when the strip is
-  closed, `(w, h - 100)` with the live/build/options strip open, `(w, h - 150)`
-  with the tall buy-mode strip open) so `View::eye` matches the original's active
-  viewport height.
+  closed, `(w, h - 100)` when the strip is open across Live, Build, Buy, and
+  Options modes) so `View::eye` matches the original's active viewport height.
 - **`Packed565` / `expand_565` (`crates/sims-people/src/lot.rs`):** Replaces
   zero-filled `mask_565` with MSB bit-replicated `expand_565` on textured lot draws
   while keeping the shared `Body` cache (used by `People::posed`) and untextured
