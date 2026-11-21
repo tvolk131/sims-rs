@@ -24,16 +24,18 @@
 //! which is not ported.
 
 use super::Lot;
+use crate::Answers;
 use serde::{Deserialize, Serialize};
 use sims_sim::World;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 
 /// The version of [`Saved::encode`]'s layout: the fields of [`Saved`],
 /// their order and their types (postcard is not self-describing). Bump it
 /// in the commit that changes any of them. The world inside is versioned
 /// by [`sims_sim::SNAPSHOT_FORMAT`], which is written too. A save of
-/// another version is refused, not migrated.
-pub const FORMAT: u32 = 1;
+/// another version is refused, not migrated. Layout 2 keeps each pending
+/// dialog answer's bitmap ID ([`crate::Answer`]).
+pub const FORMAT: u32 = 2;
 
 /// A lot as it stood between two steps ([`Lot::save`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,7 +43,7 @@ pub struct Saved {
     world: World,
     ticks: u32,
     start: u32,
-    answers: VecDeque<u8>,
+    answers: Answers,
     fresh: BTreeSet<u16>,
     view_rotation: u8,
     answered: bool,
@@ -147,7 +149,7 @@ impl Lot {
             world: self.world.clone(),
             ticks: self.ticks,
             start: self.start,
-            answers: self.player.queue.clone(),
+            answers: self.player.clone(),
             fresh: self.play.fresh.clone(),
             view_rotation: self.view_rotation,
             answered: self.answered,
@@ -181,7 +183,7 @@ impl Lot {
         self.world = saved.world;
         self.ticks = saved.ticks;
         self.start = saved.start;
-        self.player.queue = saved.answers;
+        self.player = saved.answers;
         self.play.fresh = saved.fresh;
         self.view_rotation = saved.view_rotation;
         self.halted = false;

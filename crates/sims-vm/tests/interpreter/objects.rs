@@ -4,10 +4,10 @@ use crate::support::*;
 use sims_content::{Clip, Event, People, Skeleton, Track};
 use sims_core::CrtRng;
 use sims_core::F32;
-use sims_formats::saved_objects::{Instance, Multipart, Objects, Slot};
+use sims_formats::saved_objects::{Frame, Instance, Multipart, Objects, Slot};
 use sims_sim::animator::{Base, LOADED};
 use sims_sim::neighbors::{Neighbor, Neighbors};
-use sims_vm::{Fault, SavedRead, Trap};
+use sims_vm::{Fault, Interpreter, SavedRead, Status, Trap, Update};
 use std::collections::BTreeMap;
 
 const CHAIR: u32 = 0x5001;
@@ -104,6 +104,78 @@ fn read(fx: &mut Fixture, saved: &Objects, people: &People) -> Result<SavedRead,
 fn trap(result: Result<SavedRead, Fault>) -> (u16, Trap) {
     let fault = result.unwrap_err();
     (fault.object, fault.trap)
+}
+
+#[test]
+fn an_inherited_tree_bit_survives_a_saved_sleep_until_dispatch() {
+    let mut fx = lot();
+    fx.world.globals.fill(0);
+    let owner = fx.catalog.object(CHAIR).unwrap().resource;
+    fx.add(
+        owner,
+        4096,
+        tree(vec![
+            ins(280, 1, RETURN_FALSE, [0; 8]),
+            assign(scope::TEMPS, 0, scope::LITERAL, 42, RETURN_TRUE),
+        ]),
+    );
+    fx.add(GLOBAL, 280, sleeper());
+
+    let id = 9;
+    let mut instance = saved(id, CHAIR);
+    fx.world.types.insert(instance.type_id, CHAIR);
+    instance.registry_word = Some(0x0001_0001);
+    let caller = Frame {
+        tree: 4096,
+        node: 0,
+        parameters: Vec::new(),
+        locals: Vec::new(),
+        stack_object: 0,
+        primitive_state: 0,
+        code_owner_type: instance.type_id as i16,
+    };
+    instance.stack = vec![
+        caller.clone(),
+        Frame {
+            tree: 280,
+            parameters: vec![20_000],
+            ..caller
+        },
+    ];
+    let saved = file(vec![instance]);
+    let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    interpreter
+        .read_objects_with_frame_tree_bits(
+            &mut fx.world,
+            &saved,
+            &People::default(),
+            &[(id, 1)].into(),
+        )
+        .unwrap();
+    assert_eq!(saved.instances[&id].stack[1].tree, 280);
+    assert_eq!(fx.world.objects[&id].stack[0].tree, 4096);
+    assert_eq!(fx.world.objects[&id].stack[1].tree, 0x8118);
+
+    let mut world = sims_sim::World::decode(&fx.world.encode()).unwrap();
+    let mut update = Update::default();
+    interpreter
+        .scheduler_pass(&mut world, &crate::tick::tuning(), &mut update)
+        .unwrap();
+    assert_eq!(update.counted, [id]);
+    assert_eq!(world.objects[&id].stack[1].tree, 0x8118);
+
+    // Returning through a flagged caller masks its tree only for lookup.
+    let object = world.objects.get_mut(&id).unwrap();
+    object.stack[0].tree |= Frame::TREE_FLAG;
+    assert_eq!(interpreter.step(&mut world, id), Ok(Status::Running));
+    assert_eq!(world.objects[&id].stack.len(), 1);
+    assert_eq!(world.objects[&id].stack[0].tree, 0x9000);
+    assert_eq!(world.objects[&id].stack[0].node, 1);
+    // The popped Sleep leaves the cleared tree word in the arena.
+    assert_eq!(world.frame_storage[&id].words[8], Some(280));
+    assert_eq!(interpreter.step(&mut world, id), Ok(Status::Returned(true)));
+    assert_eq!(world.objects[&id].temps[0], 42);
+    assert_eq!(world.frame_storage[&id].words[0], Some(4096));
 }
 
 #[test]
