@@ -224,8 +224,9 @@ impl Machine<'_, '_> {
     ///    path and then takes its record's interests and personality
     ///    ([`Machine::make_person`], 0x44e608).
     /// 4. Flag 0x20 turns it ([`Machine::face_as_stack_object`]).
-    /// 5. A new person's person test (see the module's note) touches only the
-    ///    screen, and is left out.
+    /// 5. A new person's person test (see the module's note): its portrait
+    ///    entry's reset is done in [`Machine::make_person`]; the redraw is
+    ///    presentation, and is left out.
     /// 6. The place test and the put are skipped (0x44e72c): the object
     ///    stays off the lot where it was made.
     /// 7. Flag 0x4 runs a visitor's "init visitor" tree
@@ -571,8 +572,9 @@ impl Machine<'_, '_> {
     ///    0x4c, one step each. Nothing turns when the stack object names no
     ///    object. A group turns by 0x422937, a one-tile object by 0x433f75
     ///    ([`crate::Interpreter::turn_one`]).
-    /// 6. A new person's person test (see the module's note) touches only the
-    ///    screen, and is left out.
+    /// 6. A new person's person test (see the module's note): its portrait
+    ///    entry's reset is done in [`Machine::make_person`]; the redraw is
+    ///    presentation, and is left out.
     /// 7. The place test (virtual function 0x54, with no container) at the
     ///    exact position. If it refuses, the new object is removed at once
     ///    (0x44123f) and the false branch is taken. Removing a person is

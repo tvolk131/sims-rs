@@ -177,11 +177,20 @@ What is not ported:
   STR# 301 of the running code's file (0x4360b8, 0x47028b):
   - the buttons' labels its kind loads (0x436175);
   - the title (operand 6);
-  - the message (operand 2).
+  - the message (operand 2);
+  - in icon mode 4, operand 1's string (0x436297 to 0x4362c0), with no
+    place for a type.
 
   Each string is formatted in that order (0x44bf1a, from 0x436219 to
-  0x436265), with one place for a type, cleared first (0x43620d). Only
-  two tokens write that place:
+  0x436265) in every icon mode, before the mode is read (0x436279), so
+  the checks below that do not concern the portrait run in every mode
+  (Sol's eighth check). The table is read in the application's language
+  (the table's language byte is interface +0x64 less one, 0x4702b1 to
+  0x4702bb; 0x4704fa reads that language's strings and falls back on no
+  other). The port reads US English (language 1), the recorded install's,
+  and supports no other: another language's strings may hold other
+  tokens. The strings share one place for a type, cleared first
+  (0x43620d), which only mode 0 reads. Only two tokens write that place:
   - `$Object` (0x44c1af) gives the stack object's type;
   - `$Neighbor` (0x44c69f) gives the type of the neighbor record that
     the stack object names (0x425afe). Its pass comes after `$Object`'s.
@@ -302,9 +311,13 @@ What is not ported:
   1, no entry is empty, and the object's file has no legacy CATS table,
   which 0x4061e3 checks first (Sol's reading, **unverified** here).
   As with `$Me` below, each token is replaced from the start of the
-  text, then from one past each place replaced (0x4558a0, 0x455750), so
-  a name that holds `$Object` is found again and is taken as not known
-  (Sol's seventh check).
+  text, then from one past each place replaced (0x4558a0, 0x455750). A
+  name that holds `$Object` past its first character puts it back past
+  each place the search goes on from, so the pass never ends; one that
+  makes it with the text after it uses that text up. The dialog fails
+  loudly where a name never ends, or where the names are not known and
+  the text may hold the token, whatever the portrait (Sol's seventh and
+  eighth checks).
   Where the name would decide the type, the dialog fails loudly. On the Goth
   house this matters at update 901. Test:
   `an_object_name_that_may_hold_a_neighbor_token_fails_loudly`.
@@ -321,9 +334,14 @@ What is not ported:
     the object running the tree. Its definition (+0x11c) is named by
     0x4573d9, as for `$Object`, so every entry is tried in the token's
     place. Each token is replaced from the start of the text, then from
-    one past each place replaced (0x4558a0, 0x455750). A name that holds
-    `$Me` would be found again, and is taken as not known.
-  - The rest are not ported. They matter only when the stack object
+    one past each place replaced (0x4558a0, 0x455750). A name that never
+    ends, or names not known, fail loudly, as for `$Object`.
+  - `$Family` (0x44c034) writes the name of the family of the neighbor
+    record the stack object names (0x4256f4, record +0xee, 0x425d69),
+    which is not ported, so it may hold any token. With no such record it
+    writes nothing (Sol's eighth check). `$FamilyAssets` writes a number.
+  - The rest are not ported. Apart from `$TokenNameLocal`, they matter
+    only when the stack object
     names a neighbor record. A pass that writes a name may write
     `$Neighbor`, and one before `$Object`'s may write `$Object`.
     `$Local` and `$Attrib` write a number (0x46f941, 0x4557c0). A number
@@ -333,15 +351,19 @@ What is not ported:
     check). So a text that holds a name token, or a number token together
     with `$Neighbor`, leaves what is found unknown. The dialog fails
     loudly where that decides the portrait.
-  - `$TokenNameLocal`'s pass (0x44c490) throws when it finds its token,
-    the tree has a frame and the local's index is in range, and the
-    object running the tree is not a person: it casts the formatter's
-    `this` to a person (0x44c4f6), and a failed cast throws (0x44c57b).
-    `$Family`, `$NameAttrib` and `$NameLocal` read the person too, and a
-    name not known may write the token. Where the running object is not
-    a person and the text holds one of these tokens, or a name not
-    known, the dialog fails loudly after the portrait checks (Sol's
-    seventh check). Test:
+  - `$TokenNameLocal`'s pass (0x44c490) reads each token as
+    `$NeighborLocal`'s pass does (0x44caf6). One whose number is not one
+    of the tree's locals (0x44c4b5 to 0x44c4d3) is skipped. For one that
+    is, the pass casts the running object to a person (0x44c4f6), and a
+    failed cast throws (0x44c57b). For a person it looks up the inventory
+    of the neighbor the person's +0x5ca names, adding an empty one when
+    there is none (0x42a8a1, 0x42a8e1 to 0x42a91a), and replaces the token
+    with a name (0x41f6fb, 0x43ac10). None of that is ported, so the
+    dialog fails loudly, in every mode and after the portrait checks,
+    where a token's number is a local, or where a pass before may have
+    made one: a name not known, `$NameAttrib` or `$NameLocal`, or a
+    number pass with the token (`$TokenNameLocal:$Local:0`). A tree with
+    no locals has none (Sol's seventh and eighth checks). Test:
     `token_name_local_with_a_running_object_that_is_not_a_person_fails_loudly`.
 
   Tests:
