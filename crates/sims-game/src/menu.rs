@@ -56,6 +56,10 @@ use std::collections::BTreeMap;
 /// The language the labels are read in (US English).
 const LANGUAGE: u8 = 1;
 
+/// The join word (+0) of the offer to join a running interaction
+/// (0x41ee99).
+const JOINS: i32 = 1;
+
 /// The entry flag that puts "*" before the entry's name.
 const DEBUG: u32 = 0x80;
 
@@ -174,18 +178,18 @@ fn named(lot: &Lot, assets: &Assets, offered: Vec<MenuEntry>) -> Result<Vec<Entr
         });
         // The name a check tree gave is shown as it is; an entry without
         // one, or with an empty one, is named by the TTAs strings, with
-        // "*" before a debug entry (0x41f167).
+        // "*" before a debug entry (0x41f167). The offer to join already
+        // has its entry's label as its name (0x41efc1), so the getter
+        // puts no "*" before it (0x41f174).
         let label = match name.filter(|n| !n.is_empty()) {
             Some(name) => name,
             None => {
-                let name = labels
+                let label = labels
                     .entry(target)
                     .or_insert_with(|| found.and_then(|f| self::labels(assets, f.resource, f.id)))
                     .as_ref()
-                    .and_then(|l| l.get(menu as usize, LANGUAGE))
-                    .filter(|l| !l.trim().is_empty())
-                    .map_or_else(|| format!("Interaction {menu}"), str::to_owned);
-                if debug { format!("*{name}") } else { name }
+                    .and_then(|l| l.get(menu as usize, LANGUAGE));
+                entry_label(label, menu, debug, action.join == JOINS)
             }
         };
         out.push(Entry {
@@ -195,6 +199,22 @@ fn named(lot: &Lot, assets: &Assets, offered: Vec<MenuEntry>) -> Result<Vec<Entr
         });
     }
     Ok(out)
+}
+
+/// The name of an offered entry without one of its own: its TTAs
+/// `label`, or else its menu number, with "*" before it for a `debug`
+/// entry (0x41f167), except for the offer to join (`joins`) when it has
+/// a label, which the offer already carries as its name (0x41efc1,
+/// 0x41f174).
+fn entry_label(label: Option<&str>, menu: u32, debug: bool, joins: bool) -> String {
+    let label = label.filter(|l| !l.trim().is_empty());
+    let named = label.is_some() && joins;
+    let name = label.map_or_else(|| format!("Interaction {menu}"), str::to_owned);
+    if debug && !named {
+        format!("*{name}")
+    } else {
+        name
+    }
 }
 
 /// The fallback when the simulation cannot list the menu: every entry of
@@ -695,5 +715,14 @@ mod tests {
         // There a press goes back, as it does in the original.
         assert_eq!(menu.press(&art, submenu.center), Press::Stays);
         assert_eq!(menu.layouts.len(), 1);
+    }
+
+    #[test]
+    fn a_debug_entry_is_starred_but_for_a_labelled_offer_to_join() {
+        assert_eq!(entry_label(Some("Eat"), 3, false, false), "Eat");
+        assert_eq!(entry_label(Some("Eat"), 3, true, false), "*Eat");
+        assert_eq!(entry_label(Some("Eat"), 3, true, true), "Eat");
+        assert_eq!(entry_label(Some(" "), 3, true, true), "*Interaction 3");
+        assert_eq!(entry_label(None, 3, false, true), "Interaction 3");
     }
 }

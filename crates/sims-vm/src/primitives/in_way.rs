@@ -763,6 +763,9 @@ impl Machine<'_, '_> {
                     }),
                     ..self.interpreter()
                 };
+                // The tree runs through the synchronous run (0x45d2d3,
+                // 0x474afb, 0x4749b5), which clears 0x6c4d6c (0x474a37):
+                // Add/Change Action String names nothing there.
                 interpreter
                     .call_as(
                         self.world,
@@ -773,7 +776,7 @@ impl Machine<'_, '_> {
                         &args,
                         args.len(),
                         crate::TURN_BUDGET,
-                        false,
+                        true,
                     )
                     .map_err(|fault| {
                         Trap::Unsupported(format!(

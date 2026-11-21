@@ -82,7 +82,9 @@ Picking an entry queues its action on the action's caller (0x48ddbe,
   a listing, Add/Change Action String names nothing and takes the true
   branch, as it already did in autonomy's checks. Before, a picked entry
   that runs at once, or a queued action Idle For Input checks, failed
-  loudly there.
+  loudly there. The same holds for an action's tree run at once, which
+  goes through the same run (0x45d2d3, 0x474afb, 0x4749b5); it failed
+  loudly before this branch too.
 - **Picking and pointing clear flag 0x80.** The menu's window works out
   each shown entry's name when it is built (0x48d5ce, 0x41f167), and
   that always clears the action's flag 0x80 (0x41f1a4). The listing
@@ -106,12 +108,12 @@ Picking an entry queues its action on the action's caller (0x48ddbe,
   - So every pinned hash stands and the snapshot format stays 30. A
     format-30 snapshot reads the same. Only a world holding a join
     differs.
-  - **Why the format isn't bumped.** Bumping it would change every
-    pinned hash, since the world's hash is that of its encoding, and it
-    buys nothing: every snapshot written before reads the same. An older
-    build reading a world that holds a join gets a flags value too wide
-    for its 32-bit field, so it fails to read the snapshot rather than
-    misreading it.
+  - **Why the format isn't bumped.** Nothing needs telling apart: every
+    snapshot written before reads the same. An older build reading a
+    world that holds a join gets a flags value too wide for its 32-bit
+    field, so it fails to read the snapshot rather than misreading it.
+    (The number is in the snapshot's header, which the world's hash does
+    not cover, so a bump would not move the pinned hashes either.)
 - **The word is kept as it is.** The check passes the join's arguments
   for exactly 1, as the original does (0x458372). The menu's other
   listing (mode 2 or 3, 0x48d4b7) makes actions with 2 there (0x41ee2f);
@@ -128,6 +130,7 @@ Picking an entry queues its action on the action's caller (0x48ddbe,
   without a name shows its entry's name, which is the same. The window's
   getter puts "*" before the name of an entry with flag 0x80 only when
   the action's name is still empty (0x41f174); whether the stored name
-  can be empty there is not read, so the "*" the game's menu adds to such
-  an entry is unverified for the offer.
+  can be empty there is not read. The game's menu leaves the "*" off an
+  offer whose entry has a TTAs label, since 0x475c77 loads that label
+  into the entry.
 - Other readers of word +0 were not searched for.

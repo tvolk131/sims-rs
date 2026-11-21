@@ -869,7 +869,9 @@ impl Game {
         };
         self.note = Some(match queued {
             Ok(Some(_)) => format!("Queued \"{label}\" for person {on}."),
-            Ok(None) => format!("Person {on}'s queue is full; \"{label}\" was not queued."),
+            // A full queue, an entry gone from the table, or a check
+            // that refused an action run at once.
+            Ok(None) => format!("\"{label}\" was not queued for person {on}."),
             Err(e) => format!("\"{label}\" was not queued: {e}"),
         });
     }

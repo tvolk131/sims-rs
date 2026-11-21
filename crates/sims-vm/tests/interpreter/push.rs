@@ -1673,3 +1673,36 @@ fn idle_for_input_checks_a_queued_join_with_its_arguments() {
         }
     }
 }
+
+/// An action's tree run at once goes through the synchronous run too
+/// (0x45d2d3, 0x474afb, 0x4749b5), so Add/Change Action String in it
+/// names nothing and takes the true branch.
+#[test]
+fn an_action_tree_run_at_once_names_nothing() {
+    let mut fx = menu_lot(vec![entry(3, 0x100), entry(4, 4)]);
+    fx.program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .strings
+        .insert(300, vec!["Eat".to_owned()]);
+    let mut operands = [0; 8];
+    operands[..2].copy_from_slice(&300u16.to_le_bytes());
+    operands[4] = 1;
+    fx.add(
+        LAMP_FILE,
+        ACTION,
+        tree(vec![
+            ins(50, 1, RETURN_FALSE, operands),
+            assign(scope::STACK_DATA, 20, scope::LITERAL, 1, RETURN_TRUE),
+        ]),
+    );
+    let active = format!("{:?}", fx.sim().person.as_ref().unwrap().active);
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    assert_eq!(interpreter.order(&mut fx.world, SIM, LAMP, 4), Ok(Some(1)));
+    assert_eq!(fx.world.objects[&LAMP].data[20], 1);
+    assert_eq!(
+        format!("{:?}", fx.sim().person.as_ref().unwrap().active),
+        active
+    );
+}
