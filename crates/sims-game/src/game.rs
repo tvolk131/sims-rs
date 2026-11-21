@@ -1640,19 +1640,29 @@ fn centre_position(world: &sims_sim::World, id: u16) -> Option<[i32; 3]> {
     Some([(sum_x / count) as i32, (sum_y / count) as i32, level])
 }
 
-/// The screen point of a fine lot position ([`sound::object_point_on_lot`]),
-/// worked out from the lot's own corner and then moved by the origin:
-/// the original cuts the point to 16 bits, and its scroll limits
-/// (0x4a9fa9) keep its origin small enough for that, where the window's
-/// origin may go much further.
+/// The screen point of a fine lot position (`0x4a9dc7` → `0x4a9c50`),
+/// narrowing rotated tile coordinates to signed bytes (`0x4a9c5c..0x4a9c71`)
+/// while preserving the low 4-bit sub-tile offset, worked out from the lot's
+/// own corner and then moved by the origin.
 fn lot_point(camera: &Camera, lot: &sims_render::Lot, position: [i32; 3]) -> [i32; 2] {
-    let at = sound::object_point_on_lot(
+    let rotated = sound::rotate_object_fine(camera, [position[0], position[1]]);
+    let tile = [
+        i32::from((rotated[0] >> 4) as i8),
+        i32::from((rotated[1] >> 4) as i8),
+    ];
+    let narrowed = [
+        (tile[0] << 4) | (rotated[0] & 15),
+        (tile[1] << 4) | (rotated[1] & 15),
+    ];
+    let corners = sound::tile_corners(lot, camera, tile);
+    let at = sound::fine_point_with_heights(
         &Camera {
             origin: [0, 0],
             ..*camera
         },
-        lot,
-        position,
+        narrowed,
+        position[2],
+        corners,
     );
     [
         at[0].saturating_add(camera.origin[0]),
@@ -1859,19 +1869,14 @@ fn native_zoom_or_rotate(
     if rx >= b[0] && rx <= b[1] && ry >= b[2] && ry <= b[3] {
         let narrowed_fine = [(rx << 4) | (fine[0] & 15), (ry << 4) | (fine[1] & 15)];
         let corners = sound::tile_corners(lot, &native, [rx, ry]);
-        let at = sound::fine_point_with_heights(
-            &Camera {
-                origin: [0, 0],
-                ..native
-            },
-            narrowed_fine,
-            native.level,
-            corners,
-        );
+        // 0x4a79fd projects using the current native origin and sign-extends the
+        // 16-bit screen coordinates before `0x4a7a23..0x4a7a47` computes
+        // `current_origin + (middle - screen_point)`.
+        let at = sound::fine_point_with_heights(&native, narrowed_fine, native.level, corners);
         let middle = [viewport[0] / 2, viewport[1] / 2];
         let target = [
-            middle[0].saturating_sub(at[0]),
-            middle[1].saturating_sub(at[1]),
+            native.origin[0].saturating_add(middle[0].saturating_sub(at[0])),
+            native.origin[1].saturating_add(middle[1].saturating_sub(at[1])),
         ];
         let ([min_x, max_x], [min_y, max_y]) = scroll_limits(lot, &native, viewport);
         let native_x = target[0].max(min_x).min(max_x).wrapping_add(1) & !3;
@@ -2403,6 +2408,41 @@ mod tests {
         assert_eq!(
             [wrapped.origin[0] + pick::ORIGIN_COLUMN, wrapped.origin[1]],
             [392, -117]
+        );
+
+        // 16-bit screen wrap during zoom recentring (0x4a79fd..0x4a7a47): from
+        // game origin [380, 61539] (whose low 16 bits wrap to -3997), Far ->
+        // Medium projects with the current origin and clamps to [391, 232].
+        let mut wrapped_high = Camera {
+            origin: [380, 61539],
+            zoom: Zoom::Far,
+            rotation: 0,
+            level: 1,
+            walls: Walls::Cutaway,
+            focus: sims_render::Focus::default(),
+        };
+        assert!(native_zoom_or_rotate(
+            &lot,
+            &mut wrapped_high,
+            [800, 600],
+            Move::ZoomIn
+        ));
+        assert_eq!(wrapped_high.origin, [391, 232]);
+
+        // Wrapped lot position projection in `lot_point`: [424, 392, 1] and
+        // [4520, 392, 1] (differing by 256 tiles = 4096 fine units) project
+        // identically after signed-byte tile narrowing (0x4a9c5c..0x4a9c71).
+        let near = Camera {
+            origin: [0, 0],
+            zoom: Zoom::Near,
+            rotation: 0,
+            level: 1,
+            walls: Walls::Cutaway,
+            focus: sims_render::Focus::default(),
+        };
+        assert_eq!(
+            lot_point(&near, &lot, [424, 392, 1]),
+            lot_point(&near, &lot, [4520, 392, 1])
         );
     }
 }
