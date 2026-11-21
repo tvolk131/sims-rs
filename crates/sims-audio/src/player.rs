@@ -49,8 +49,11 @@
 //!   block and on placement or volume changes (the original updates them
 //!   as registers change). A sample plays at the rate
 //!   its pitch sets, whatever its own rate.
-//! - `note_on` starts the patch in register 50 and writes the note's ID
-//!   to its operand; `wait_samp` waits until the thread's last note ends.
+//! - *(code)* `note_on` (0x57e17f → 0x57f595 → 0x58015a) starts the patch
+//!   in register 50 on the track's single active voice without writing
+//!   back to its operand register; `note_off` (0x57e192 → 0x5801a0) stops
+//!   that voice unconditionally; `wait_samp` waits until the track's
+//!   active note ends.
 //! - *(code)* `end` (and `return`, 0x57e3ee) returns from a `call`, or
 //!   with an empty call stack calls fade-out-and-kill (0x57edc8 → vtable
 //!   +0x34, 0x57dca3): with no note playing it kills the track at once
@@ -559,15 +562,6 @@ enum Destination {
     Stopped(u32),
 }
 
-/// Default value of a track register when read on a stopped track object
-/// (`0x5802cf`).
-fn default_register(register: u8) -> i32 {
-    DEFAULTS
-        .iter()
-        .find(|&&(r, _)| r == register)
-        .map_or(0, |&(_, v)| v)
-}
-
 #[derive(Debug, Clone)]
 struct Note {
     id: u32,
@@ -870,6 +864,13 @@ pub struct Player<S> {
     /// that note (thread 0) plays: the original's idle track object, for
     /// a camera move to place.
     idle: BTreeMap<u32, Thread>,
+    /// *(code)* Persistent register banks for stopped registered tracks
+    /// written through `target` (`0x57e023` → `0x57de57`) or muted
+    /// `play_trk` (`0x57f261`), so reads see earlier writes (e.g.
+    /// `SetMainMusicSongAndHitList` writing `v1` on stopped
+    /// `MainMusicLoop`) and fresh starts keep registers outside
+    /// [`BANKS`] (`0x57da3a`..`0x57da87`).
+    stopped: BTreeMap<u32, [i32; GLOBALS as usize]>,
     /// The thread each track's last start made or let go, by track: the
     /// one whose `target` the original's track object still has
     /// ([`Player::camera_moved`]). Every start sets that `target` back
@@ -958,6 +959,7 @@ impl<S: Samples> Player<S> {
             master: 1024,
             notes: Vec::new(),
             idle: BTreeMap::new(),
+            stopped: BTreeMap::new(),
             last_start: BTreeMap::new(),
             instances: Vec::new(),
             track_objects: BTreeMap::new(),
@@ -1177,26 +1179,9 @@ impl<S: Samples> Player<S> {
                 note.gains = levels.gains;
                 note.step = step(levels.rate);
             }
-        }
-        self.place_idle(track, vol, pan);
-    }
-
-    /// Places a track's idle kind-53 thread (`self.idle`), updating its
-    /// playing note immediately.
-    fn place_idle(&mut self, track: u32, vol: i32, pan: i32) {
-        if let Some(mut idle) = self.idle.remove(&track) {
-            self.write(&mut idle, i64::from(EXTVOL), vol);
-            self.write(&mut idle, i64::from(PAN), pan);
-            let levels = self.levels(&idle);
-            for note in self
-                .notes
-                .iter_mut()
-                .filter(|n| n.thread == 0 && n.track == track)
-            {
-                note.gains = levels.gains;
-                note.step = step(levels.rate);
-            }
-            self.idle.insert(track, idle);
+        } else if self.idle.contains_key(&track) {
+            self.write_stopped(track, EXTVOL, vol);
+            self.write_stopped(track, PAN, pan);
         }
     }
 
@@ -1420,13 +1405,17 @@ impl<S: Samples> Player<S> {
     /// ends it on its own).
     fn end_track(&mut self, track: u32, running: Option<u32>) {
         let spared = |id: u32| running == Some(id);
-        let ended: Vec<u32> = self
+        let ended: Vec<Thread> = self
             .threads
             .iter()
             .filter(|t| t.track == track && !spared(t.id))
-            .map(|t| t.id)
+            .cloned()
             .collect();
-        self.threads.retain(|t| !ended.contains(&t.id));
+        for thread in &ended {
+            self.save_stopped(thread);
+        }
+        let ended_ids: Vec<u32> = ended.iter().map(|t| t.id).collect();
+        self.threads.retain(|t| !ended_ids.contains(&t.id));
         self.notes
             .retain(|n| !(n.track == track && !spared(n.thread)));
         self.forget_ended();
@@ -1684,7 +1673,13 @@ impl<S: Samples> Player<S> {
                             .iter()
                             .any(|n| n.thread == 0 && n.track == stopped_track)
                     })
-                    .map_or(SPL_NORMAL, |idle| idle.registers[usize::from(SPL)]),
+                    .map(|idle| idle.registers[usize::from(SPL)])
+                    .or_else(|| {
+                        self.stopped
+                            .get(&stopped_track)
+                            .map(|regs| regs[usize::from(SPL)])
+                    })
+                    .unwrap_or(SPL_NORMAL),
             }
         };
         if let Some(thread) = last.and_then(running) {
@@ -1700,10 +1695,13 @@ impl<S: Samples> Player<S> {
     }
 
     /// A track's `Spl`, read from its live thread (running or idle)
-    /// through its `target`; [`SPL_NORMAL`] when none exists (see
+    /// through its `target`, or from its persistent stopped register
+    /// bank (`0x57314b`); [`SPL_NORMAL`] when none exists (see
     /// [`Player::placed`]).
     fn spl(&self, track: u32) -> i32 {
-        self.track_spl(track).unwrap_or(SPL_NORMAL)
+        self.track_spl(track)
+            .or_else(|| self.stopped.get(&track).map(|r| r[usize::from(SPL)]))
+            .unwrap_or(SPL_NORMAL)
     }
 
     /// *(code)* Writes a placement's `extvol` (0x57d57a) then `pan`
@@ -1727,7 +1725,10 @@ impl<S: Samples> Player<S> {
             return;
         }
         self.forget_silent();
-        self.place_idle(track, vol, pan);
+        if self.owner(track).is_some() {
+            self.write_stopped(track, EXTVOL, vol);
+            self.write_stopped(track, PAN, pan);
+        }
     }
 
     /// Records an object instance, unless it is already (0x57442d) or
@@ -1786,6 +1787,7 @@ impl<S: Samples> Player<S> {
         self.kill_track(id);
         self.held.remove(&id);
         self.idle.remove(&id);
+        self.stopped.remove(&id);
         self.track_objects.remove(&id);
         self.last_start.remove(&id);
         self.notes.retain(|n| n.patch != id);
@@ -1826,7 +1828,8 @@ impl<S: Samples> Player<S> {
             Destination::Own => id,
             Destination::Running(dest_id) => dest_id,
             Destination::Stopped(stopped_track) => {
-                self.place_idle(stopped_track, vol, pan);
+                self.write_stopped(stopped_track, EXTVOL, vol);
+                self.write_stopped(stopped_track, PAN, pan);
                 return;
             }
         };
@@ -2165,6 +2168,7 @@ impl<S: Samples> Player<S> {
         self.threads.clear();
         self.notes.clear();
         self.idle.clear();
+        self.stopped.clear();
         self.last_start.clear();
         self.held.clear();
         self.seqgroups.clear();
@@ -2377,9 +2381,26 @@ impl<S: Samples> Player<S> {
                     .rposition(|n| n.thread == 0 && n.track == track);
                 if let Some(note) = idle {
                     self.chain(note, track, patch);
-                } else if let Some(mut thread) = self.thread([0; 3], owner, track) {
-                    thread.id = 0;
-                    thread.registers[usize::from(PATCH)] = patch as i32;
+                } else if let Some((place, fresh, group)) = self.template(owner, track) {
+                    let mut registers = self.stopped.get(&track).copied().unwrap_or(fresh);
+                    registers[usize::from(PATCH)] = patch as i32;
+                    let thread = Thread {
+                        id: 0,
+                        module: place.0,
+                        track,
+                        pc: place.1,
+                        registers,
+                        stack: Vec::new(),
+                        loop_point: place,
+                        kept: 0,
+                        hit_list: Vec::new(),
+                        last_note: 0,
+                        wake: 0,
+                        group,
+                        target: Target::Own,
+                        kill_after_fade: false,
+                        order: 0,
+                    };
                     self.note_on(&thread);
                     self.idle.insert(track, thread);
                 }
@@ -2631,12 +2652,24 @@ impl<S: Samples> Player<S> {
     /// A new thread of a track the module defines, with its starting
     /// registers, or `None` (reported) when the track has no entry point.
     ///
-    /// **Unverified** gap: the original's track object outlives its
-    /// script, so a start after the track ended keeps its registers 1 to
-    /// 16 from the run before ([`Player::restart`]); a new thread here
-    /// starts them at 0 (but for the arguments).
+    /// *(code)* The original's track object outlives its script: a fresh
+    /// start resets only [`BANKS`] (`0x57da3a`..`0x57da87`), preserving
+    /// registers outside those banks from any prior run or stopped-target
+    /// write (except the arguments written below).
     fn thread(&mut self, args: [u32; 3], module: usize, track: u32) -> Option<Thread> {
-        let (place, registers, group) = self.template(module, track)?;
+        let (place, fresh, group) = self.template(module, track)?;
+        // *(code)* A fresh start resets only the two default banks
+        // (`BANKS`, 0x57da3a..0x57da87), keeping registers outside them
+        // (1..16, 48..49, 63..99) from any writes made while the track
+        // was stopped.
+        let mut registers = fresh;
+        if let Some(saved) = self.stopped.remove(&track) {
+            registers = saved;
+            for (first, last) in BANKS {
+                let bank = usize::from(first)..=usize::from(last);
+                registers[bank.clone()].copy_from_slice(&fresh[bank]);
+            }
+        }
         let id = self.id();
         let mut thread = Thread {
             id,
@@ -2683,20 +2716,85 @@ impl<S: Samples> Player<S> {
             return None;
         };
         let fields = &owner.hot.tracks[&track];
-        let patch = owner.number(&fields.patch).unwrap_or(0);
+        let registers = self.default_registers(track);
+        let group = owner.number(&fields.group).unwrap_or(0);
+        Some((pc, registers, group))
+    }
+
+    /// The starting register bank of a track object (constructor defaults
+    /// plus its HOT volume, duck priority, and patch).
+    fn default_registers(&self, track: u32) -> [i32; GLOBALS as usize] {
         let mut registers = [0; GLOBALS as usize];
         for (register, value) in DEFAULTS {
             registers[usize::from(register)] = value;
         }
-        // The original's track constructor writes the HOT track's volume
-        // and duck priority.
-        if let Some(volume) = owner.number(&fields.volume) {
-            registers[usize::from(VOL)] = volume as i32;
+        if let Some(module) = self.owner(track) {
+            let owner = &self.modules[module];
+            let fields = &owner.hot.tracks[&track];
+            if let Some(volume) = owner.number(&fields.volume) {
+                registers[usize::from(VOL)] = volume as i32;
+            }
+            registers[usize::from(DUCKPRI)] =
+                owner.number(&fields.duck_priority).unwrap_or(0) as i32;
+            registers[usize::from(PATCH)] = owner.number(&fields.patch).unwrap_or(0) as i32;
         }
-        registers[usize::from(DUCKPRI)] = owner.number(&fields.duck_priority).unwrap_or(0) as i32;
-        let group = owner.number(&fields.group).unwrap_or(0);
-        registers[usize::from(PATCH)] = patch as i32;
-        Some((pc, registers, group))
+        registers
+    }
+
+    /// *(code)* Saves a killed/stopped track's register bank into
+    /// `self.stopped` with `FADE_ON`, `ISPLAYING`, and `TARGET` cleared
+    /// (`0x57dd3e`), matching the persistent track object in 1.91.
+    fn save_stopped(&mut self, thread: &Thread) {
+        let mut registers = thread.registers;
+        registers[usize::from(FADE_ON)] = 0;
+        registers[usize::from(ISPLAYING)] = 0;
+        registers[usize::from(TARGET)] = 0;
+        self.stopped.insert(thread.track, registers);
+    }
+
+    /// *(code)* Writes a local register (`r < GLOBALS`) on a stopped
+    /// registered track object (`0x57de98` when `is_running == 0`): forces
+    /// `FADE_ON` to 0 (`0x57e059..0x57e064`), persists the register in
+    /// `self.stopped`, and if the track has an active idle kind-53 voice
+    /// in `self.idle`, updates it and refreshes its voice gains/step at
+    /// once (`0x57df13 → 0x57f759`, `0x57f71d`).
+    fn write_stopped(&mut self, track: u32, r: u8, value: i32) {
+        if r >= GLOBALS {
+            return;
+        }
+        let stored = if r == FADE_ON { 0 } else { value };
+        if !self.stopped.contains_key(&track) {
+            let defaults = self.default_registers(track);
+            self.stopped.insert(track, defaults);
+        }
+        if let Some(regs) = self.stopped.get_mut(&track) {
+            regs[usize::from(r)] = stored;
+        }
+        if let Some(mut idle) = self.idle.remove(&track) {
+            idle.kept = i64::from(value);
+            idle.registers[usize::from(r)] = stored;
+            // *(code)* 0x57def1..0x57e057: only level/pan registers call
+            // 0x57f759 and only `pitch` calls 0x57f71d; unrelated writes
+            // (such as `SOURCE` or locals) leave the voice's gain/rate alone.
+            let update_gains = matches!(r, VOL | EXTVOL | PAN | THREE_D | 30..=32 | 56..=57);
+            let update_pitch = r == PITCH;
+            if update_gains || update_pitch {
+                let levels = self.levels(&idle);
+                for note in self
+                    .notes
+                    .iter_mut()
+                    .filter(|n| n.thread == 0 && n.track == track)
+                {
+                    if update_gains {
+                        note.gains = levels.gains;
+                    }
+                    if update_pitch {
+                        note.step = step(levels.rate);
+                    }
+                }
+            }
+            self.idle.insert(track, idle);
+        }
     }
 
     /// Records a fault, up to [`FAULTS`] of them; later ones are dropped,
@@ -2903,6 +3001,7 @@ impl<S: Samples> Player<S> {
             if !self.threads.iter().any(|t| t.id == id) {
                 continue;
             }
+            self.save_stopped(&thread);
             self.threads.retain(|t| t.id != id);
             // Its ducking request goes now, before the threads after it
             // run.
@@ -2935,6 +3034,7 @@ impl<S: Samples> Player<S> {
             };
             let id = thread.id;
             if !self.fade_or_end(&mut thread) {
+                self.save_stopped(&thread);
                 ended.push(id);
                 continue;
             }
@@ -3148,10 +3248,12 @@ impl<S: Samples> Player<S> {
                     .unwrap_or(thread)
                     .registers[usize::from(r)]
             }
-            Destination::Stopped(track) => self.idle.get(&track).map_or_else(
-                || default_register(r),
-                |idle| idle.registers[usize::from(r)],
-            ),
+            Destination::Stopped(track) => self
+                .idle
+                .get(&track)
+                .map(|idle| idle.registers[usize::from(r)])
+                .or_else(|| self.stopped.get(&track).map(|regs| regs[usize::from(r)]))
+                .unwrap_or_else(|| self.default_registers(track)[usize::from(r)]),
         }
     }
 
@@ -3195,12 +3297,7 @@ impl<S: Samples> Player<S> {
             },
             Destination::Stopped(stopped_track) => {
                 if r < GLOBALS {
-                    if let Some(idle) = self.idle.get_mut(&stopped_track) {
-                        idle.kept = i64::from(value);
-                        // *(code)* 0x57e059..0x57e064: writing `fade_on`
-                        // to a non-running track clears it back to 0.
-                        idle.registers[usize::from(r)] = if r == FADE_ON { 0 } else { value };
-                    }
+                    self.write_stopped(stopped_track, r, value);
                 } else if r != MAIN_DUCKPRI {
                     self.globals[usize::from(r - GLOBALS)] = value;
                 }
@@ -3341,9 +3438,11 @@ impl<S: Samples> Player<S> {
         };
         let flow = match instruction.name() {
             "note_on" => {
+                // *(code)* 0x57e17f → 0x57f595: passes the raw operand
+                // byte to the voice start helper without writing back to
+                // the operand register or touching comparison flags.
                 let id = self.note_on(thread);
                 thread.last_note = id;
-                self.write(thread, arg(0), id as i32);
                 Flow::Next
             }
             "note_off" => {
@@ -3465,15 +3564,20 @@ impl<S: Samples> Player<S> {
                 // `source` is read after the start (0x57f256), through the
                 // caller's `target` as the start left it, and written to
                 // the started track through its own `target` (vtable +0x84,
-                // 0x57f261).
+                // 0x57f261) — even if the start returned early on a muted,
+                // stopped track.
                 let source = self.read(thread, i64::from(SOURCE));
                 if let Some(stored) = self.threads.iter_mut().find(|t| t.id == thread.id) {
                     *stored = thread.clone();
                 }
-                for &started_id in &started.threads {
-                    if let Some(at) = self.threads.iter().position(|t| t.id == started_id) {
-                        self.write_at(at, SOURCE, source);
+                if !started.threads.is_empty() {
+                    for &started_id in &started.threads {
+                        if let Some(at) = self.threads.iter().position(|t| t.id == started_id) {
+                            self.write_at(at, SOURCE, source);
+                        }
                     }
+                } else if self.owner(track).is_some() {
+                    self.write_stopped(track, SOURCE, source);
                 }
                 if let Some(stored) = self.threads.iter().find(|t| t.id == thread.id) {
                     *thread = stored.clone();

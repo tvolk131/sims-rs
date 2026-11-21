@@ -60,13 +60,20 @@ and caused a replay of the track to start a second overlapping note.
   - **`target` (`0x57e018`..`0x57e036`, `0x57de57`, `0x57e059`..`0x57e064`):**
     stores the registry object pointer from `0x573312` regardless of whether
     the destination track is running. When the destination has stopped, writes
-    still route there rather than falling back to the caller, and writing
-    `FADE_ON` (`0x2d`) clears `[dest + 0xa8]` back to `0` because
-    `is_running` is false.
-  - **Single active voice (`0x57f595` → `0x58015a`..`0x58018d`) and `note_off`
-    (`0x57e192`..`0x57e1a9` → `0x5801a0`):** each track owns one active voice;
-    `note_on` restarts it and `note_off` stops it unconditionally (ignoring
-    the raw operand byte).
+    still route to that track object's persistent register bank (so e.g.
+    `SetMainMusicSongAndHitList` can write `v1 = 515` on stopped
+    `MainMusicLoop` and read it back for `play_trk`) rather than falling back
+    to the caller, writing `FADE_ON` (`0x2d`) clears `[dest + 0xa8]` back to
+    `0` because `is_running` is false, and volume/pan/pitch writes refresh any
+    voice still on `[dest + 0x1d0]` at once (`0x57df13 → 0x57f759`,
+    `0x57f71d`).
+  - **Single active voice (`0x57f595` → `0x58015a`..`0x58018d`), `note_on`
+    (`0x57e17f`), and `note_off` (`0x57e192`..`0x57e1a9` → `0x5801a0`):** each
+    track owns one active voice; `note_on` passes the raw operand byte without
+    overwriting the operand register or changing comparison flags (relied on by
+    install scripts such as `simsgeneratedhitsource.hit @0x18b1`), restarts
+    the voice, and `note_off` stops it unconditionally (ignoring the raw
+    operand byte).
   - **Pause (`0x574869`..`0x5748c9`, `0x57dc3d`):** snapshots only the
     running-track list (`[0x6f6ac8 + 0x2c]`), and hold checks `is_running`
     before pausing the voice, so idle kind-53 voices are not silenced.
@@ -74,7 +81,8 @@ and caused a replay of the track to start a second overlapping note.
     the error and returns to the instruction loop with the active voice intact.
   - **`play_trk` `SOURCE` write (`0x57f261`):** writes `SOURCE` (`0x2f`) to the
     started track through vtable `+0x84` (following its `target`, which matters
-    on a muted start that leaves `target` unchanged).
+    on a muted start that leaves `target` unchanged, and still writing to the
+    persistent track object even when a muted destination was stopped).
 
 ## What changes here
 
@@ -94,25 +102,34 @@ and caused a replay of the track to start a second overlapping note.
   `track_spl`, `apply_levels`, `day_night_playing`, `fade_and_kill`, and
   `pause` operate strictly on running threads (`self.threads`) and idle
   kind-53 voices (`self.idle`).
-- **Track-object `target` (`Target::Track` / `Destination`):** `target` now
-  stores the registered track ID (`0x57e023`), routing reads, writes, fades,
-  placements, and `Spl` lookups through the destination track even when it is
-  stopped (forcing `FADE_ON = 0` on stopped destinations at `0x57e059`) and
-  reaching it again if it restarts.
-- **Single voice per thread and `note_off`:** `note_on` replaces any prior
-  note of the same thread (`0x58015a`) and `note_off` stops that voice
-  unconditionally (`0x5801a0`).
+- **Track-object `target` (`Target::Track` / `Destination`) and persistent
+  stopped register banks (`Player::stopped`):** `target` now stores the
+  registered track ID (`0x57e023`), routing reads, writes, fades, placements,
+  and `Spl` lookups through the destination track even when it is stopped.
+  Stopped track register banks persist in `Player::stopped` (and refresh any
+  idle kind-53 voice immediately on write, `0x57df13 → 0x57f759`), force
+  `FADE_ON = 0` when not running (`0x57e059`), and retain registers outside
+  `BANKS` across fresh starts (`0x57da3a`..`0x57da87`).
+- **Single voice per thread, `note_on`, and `note_off`:** `note_on` replaces
+  any prior note of the same thread (`0x58015a`) without overwriting its
+  operand register or comparison flags (`0x57e17f`), and `note_off` stops that
+  voice unconditionally (`0x5801a0`).
 - **Pause and `fade_and_kill` on idle kind-53 voices:** neither holds nor
   stops non-running idle kind-53 voices (`0x574869`, `0x57dc3d`, `0x57dca8`).
 - **`play_trk` `SOURCE` write:** routes through `write_at` (`vtable +0x84`,
-  `0x57f261`) so a muted start preserves the destination's `target`.
+  `0x57f261`) for running starts and `write_stopped` when a muted start leaves
+  a registered track stopped.
 
 ## Install check and remaining gaps
 
 - A CFG scan of all 27 HIT files in the Complete Collection install (4,166
   `end` instructions, 1,305 `note_on` instructions) confirmed that zero
   routines in the install can reach `end` while a note is still playing. All 9
-  install-backed `sims-audio` tests pass unchanged.
+  install-backed `sims-audio` tests pass, with the expected `still_running`
+  count in `every_event_definition_runs_without_a_bad_instruction` dropping
+  from `186` to `184` because `Grimreaper_loop_kill` and `bkground_fade`
+  target stopped tracks whose `FADE_ON` is now forced to `0` (`0x57e059`),
+  letting those two killer scripts finish immediately instead of self-fading.
 - **Unverified at run time:** running past `end` into trailing bytes is
   verified from the 1.91 disassembly (`0x57d8b3`, `0x57e3ee`, `0x57edc8`,
   `0x57dca3`), not captured in a live game run.

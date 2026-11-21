@@ -4722,3 +4722,172 @@ fn muted_play_trk_writes_source_through_the_started_track_s_target() {
     assert_eq!(*probe.asked.borrow(), [(8, 77)]);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
+
+#[test]
+fn stopped_target_persists_registers_and_clears_fade_on() {
+    // Matches `SetMainMusicSongAndHitList`: targets stopped track 11,
+    // writes `v1 = 11` and `FADE_ON = 1` (0x57e059 forces FADE_ON back
+    // to 0 on a stopped track), reads both back, then runs `play_trk v1`.
+    // Track 11 starts cleanly and still sees `v1 == 11` (outside BANKS,
+    // 0x57da3a..0x57da87).
+    let mut t10 = loadl(53, 11);
+    t10.extend(loadl(5, 11));
+    t10.extend(loadl(45, 1));
+    t10.extend([72, 6, 1, 45]); // query FADE_ON on stopped target -> 0
+    t10.extend([72, 6, 1, 5]); // query v1 on stopped target -> 11
+    t10.extend([PLAY_TRK, 5, END]);
+    let t11: &[u8] = &[72, 6, 1, 5, END]; // query own v1 -> 11
+    let probe = Probe {
+        lot: on_lot(&[(8, 400)]),
+        asked: Default::default(),
+    };
+    let mut player = Player::new(vec![module(&[&t10, t11], 1)], samples(), 1);
+    play_on(&mut player, 8, &probe.lot);
+    player.render(4 * BLOCK, &probe);
+    // Both reads in track 10 go through `target = 11` (so stopped track 11's
+    // `arg1` is 0); track 11's own read receives `arg1 = 8` from `play_trk`.
+    assert_eq!(*probe.asked.borrow(), [(0, 0), (0, 11), (8, 11)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn routed_volume_write_to_idle_kind_53_voice_updates_level_immediately() {
+    // Track 10 ends immediately and kind 53 starts an idle voice on it.
+    // Track 11 targets stopped track 10 and writes EXTVOL = 0, then
+    // waits and restores EXTVOL = 1024. The idle voice updates at once
+    // (0x57df13 -> 0x57f759).
+    let mut t11 = loadl(53, 10);
+    t11.extend(loadl(19, 0));
+    t11.extend(loadl(5, 20));
+    t11.extend([WAIT, 5]);
+    t11.extend(loadl(19, 1024));
+    t11.push(END);
+    let (hit, addresses) = assemble(&[&[END], &t11]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         2=0,two,\"two.xa\"\n\
+         [GlobalHitList]\n\
+         6=2\n\
+         [Track]\n\
+         10=0,idle_trk,1024,0,0,0,0,0x100,1\n\
+         11=0,writer_trk,1024,0,0,0,0,0x101,1\n\
+         [EventMapping]\n\
+         e0=1,10\n\
+         e1=1,11\n\
+         seq=53,10,0,6\n",
+        addresses[0], addresses[1]
+    );
+    let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+    let mut player = Player::new(vec![module], long_sample("two.xa"), 1);
+    let lot = on_lot(&[(9, 400)]);
+    play_on(&mut player, 9, &lot);
+    player.render(BLOCK, &lot);
+    player.handle(
+        &SoundEvent::Play {
+            object: 9,
+            name: "seq".into(),
+        },
+        &lot,
+    );
+    assert_eq!(player.render(BLOCK, &lot)[0], 10_000);
+
+    // Track 11 silences the idle voice on block 0 of its run.
+    play(&mut player, "e1");
+    let silenced = player.render(BLOCK, &lot);
+    assert!(silenced.iter().all(|&s| s == 0), "{silenced:?}");
+    // After the 20 ms wait, track 11 restores EXTVOL = 1024.
+    let _ = player.render(10 * BLOCK, &lot);
+    assert_eq!(player.render(BLOCK, &lot)[0], 10_000);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn muted_play_trk_writes_source_to_stopped_track_and_spares_idle_voice() {
+    // `0x57f261` writes `SOURCE` (47) to a muted, stopped destination
+    // (including one with an idle kind-53 voice) without changing that
+    // idle voice's gain when its group is muted.
+    let mut t11 = loadl(47, 77);
+    t11.extend(loadl(5, 10));
+    t11.extend([PLAY_TRK, 5]);
+    t11.extend(loadl(53, 10));
+    t11.extend([72, 6, 1, 47, END]);
+    let (hit, addresses) = assemble(&[&[END], &t11]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         2=0,two,\"two.xa\"\n\
+         [GlobalHitList]\n\
+         6=2\n\
+         [Track]\n\
+         10=0,muted_stopped,1024,0,0,1,0,0x100,1\n\
+         11=0,caller,1024,0,0,0,0,0x101,1\n\
+         [EventMapping]\n\
+         e0=1,10\n\
+         e1=1,11\n\
+         seq=53,10,0,6\n",
+        addresses[0], addresses[1]
+    );
+    let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+    let mut player = Player::new(vec![module], long_sample("two.xa"), 1);
+    let probe = Probe {
+        lot: on_lot(&[(8, 400)]),
+        asked: Default::default(),
+    };
+    // Start an idle kind-53 voice on stopped track 10 while group 1 is unmuted,
+    // then mute group 1 before track 11 runs `play_trk 10`.
+    player.handle(
+        &SoundEvent::Play {
+            object: 8,
+            name: "seq".into(),
+        },
+        &probe,
+    );
+    assert_eq!(player.render(BLOCK, &probe)[0], 10_000);
+    player.set_group_volume(1, 0);
+    player.handle(
+        &SoundEvent::Play {
+            object: 8,
+            name: "e1".into(),
+        },
+        &probe,
+    );
+    let out = player.render(2 * BLOCK, &probe);
+    assert_eq!(out[out.len() - 1], 10_000);
+    // Both `arg1` (0) and `SOURCE` (77) are read through `target = 10`.
+    assert_eq!(*probe.asked.borrow(), [(0, 77)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn note_on_preserves_its_operand_register_and_flags() {
+    // `0x57e17f -> 0x57f595` passes the raw operand byte without writing
+    // back a note ID or changing comparison flags (relied on by install
+    // scripts such as `simsgeneratedhitsource.hit @0x18b1`).
+    const IFLT: u8 = 65;
+    let mut r0 = loadl(5, 42);
+    r0.extend(loadl(6, -5)); // comparison flags < 0
+    r0.extend(NOTE_ON_V1); // must preserve v1 == 42 and flags < 0
+    r0.push(IFLT);
+    r0.extend(long(0x101));
+    r0.extend([3, 5, END]); // unreachable if flags stayed < 0
+    let mut r1 = vec![72, 6, 1, 5]; // query v1 -> 42
+    r1.extend([3, 5, END]); // note_off; end
+    let probe = Probe {
+        lot: on_lot(&[(8, 400)]),
+        asked: Default::default(),
+    };
+    let mut player = Player::new(vec![module(&[&r0, &r1], 1)], long_sample("one.xa"), 1);
+    play_on(&mut player, 8, &probe.lot);
+    player.render(2 * BLOCK, &probe);
+    assert_eq!(*probe.asked.borrow(), [(8, 42)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
