@@ -540,9 +540,12 @@ pub struct MapLot {
     /// Occupancy / destination status from `Neighborhood.iff` and `LotZoning.iff`.
     pub status: LotStatus,
     /// Whether any family in `Neighborhood.iff` has `primary_house == id` and
-    /// a non-zero secondary vacation house (`0x54f20e`), tracked independently
-    /// of [`Self::zoning`] / [`Self::status`].
+    /// any nonzero 32-bit secondary house (`0x54f20e`), tracked across all
+    /// `FAMI` records independently of [`Self::zoning`] / [`Self::status`].
     pub has_primary_vacation_stay: bool,
+    /// Whether any family in `Neighborhood.iff` references `id` as its primary
+    /// or secondary house (`0x54f24f`), used for Vacation Island badges.
+    pub has_vacation_occupancy: bool,
     /// Community amenity filter bitmask from `SIMI` `globals[37]` (`0x427f46`).
     pub filter_mask: u16,
     /// Normal idle thumbnail cell (`BMP_ 512/1024` composited under `BMP_ 513/1025`).
@@ -808,10 +811,9 @@ impl NeighborhoodMap {
                     NeighborhoodKind::Unleashed => LotZoning::Unknown,
                 });
             let status = resolve_lot_status(lot_id, kind, zoning, &occupancy);
-            let has_primary_vacation_stay = occupancy
-                .primary_lot
-                .get(&lot_id)
-                .is_some_and(|&(_, vac)| vac.is_some());
+            let lot_i32 = i32::from(lot_id);
+            let has_primary_vacation_stay = occupancy.primary_vacation_stays.contains(&lot_i32);
+            let has_vacation_occupancy = occupancy.any_house_matches.contains(&lot_i32);
             let cell_origin = compute_cell_origin(anchor, metrics, [normal.width, normal.height]);
 
             lots.push(MapLot {
@@ -822,6 +824,7 @@ impl NeighborhoodMap {
                 zoning,
                 status,
                 has_primary_vacation_stay,
+                has_vacation_occupancy,
                 filter_mask,
                 normal,
                 roofs_off,
@@ -1099,12 +1102,13 @@ impl NeighborhoodMap {
                 }
             )
             || (self.kind == NeighborhoodKind::Vacation
-                && matches!(
-                    lot.status,
-                    LotStatus::Community {
-                        occupied_by_family: Some(_),
-                    } | LotStatus::Occupied { .. }
-                ))
+                && (lot.has_vacation_occupancy
+                    || matches!(
+                        lot.status,
+                        LotStatus::Community {
+                            occupied_by_family: Some(_),
+                        } | LotStatus::Occupied { .. }
+                    )))
     }
 
     /// Returns the unhighlighted `[esi + 0x264]` vacation-badged surface when
@@ -1710,6 +1714,39 @@ fn read_lot_filter_mask(iff: &Iff) -> u16 {
 struct FamilyOccupancy {
     primary_lot: BTreeMap<u16, (i32, Option<u16>)>,
     vacation_lot: BTreeMap<u16, i32>,
+    /// Primary houses with at least one `FAMI` record whose 32-bit secondary
+    /// house is nonzero (`0x54f20e`), accumulated across every `FAMI` chunk.
+    primary_vacation_stays: BTreeSet<i32>,
+    /// Every house ID referenced as primary or secondary by any `FAMI` record
+    /// (`0x54f24f`), accumulated across every `FAMI` chunk.
+    any_house_matches: BTreeSet<i32>,
+}
+
+impl FamilyOccupancy {
+    fn record_family(&mut self, family_id: i32, family: &Family) {
+        // 0x410602..0x410613: secondary/vacation house is serialized starting at version 8.
+        let secondary_raw = if family.version >= 8 && family.tail.len() >= 4 {
+            i32::from_le_bytes(family.tail[0..4].try_into().unwrap())
+        } else {
+            0
+        };
+        if family.house != 0 {
+            self.any_house_matches.insert(family.house);
+            if secondary_raw != 0 {
+                self.primary_vacation_stays.insert(family.house);
+            }
+        }
+        if secondary_raw != 0 {
+            self.any_house_matches.insert(secondary_raw);
+        }
+        let secondary_u16 = u16::try_from(secondary_raw).ok().filter(|&lot| lot > 0);
+        if let Some(house) = u16::try_from(family.house).ok().filter(|&lot| lot > 0) {
+            self.primary_lot.insert(house, (family_id, secondary_u16));
+        }
+        if let Some(vac_lot) = secondary_u16 {
+            self.vacation_lot.insert(vac_lot, family_id);
+        }
+    }
 }
 
 fn load_family_occupancy(install: &Install, user_dir: &Path) -> Result<FamilyOccupancy> {
@@ -1725,20 +1762,7 @@ fn load_family_occupancy(install: &Install, user_dir: &Path) -> Result<FamilyOcc
             continue;
         };
         // 0x410673 / 0x4e1e73: native family ID is the FAMI chunk ID, not payload `number`.
-        let family_id = i32::from(chunk.id);
-        // 0x410602..0x410613: secondary/vacation house is serialized starting at version 8.
-        let secondary = if family.version >= 8 && family.tail.len() >= 4 {
-            let v = i32::from_le_bytes(family.tail[0..4].try_into().unwrap());
-            u16::try_from(v).ok().filter(|&lot| lot > 0)
-        } else {
-            None
-        };
-        if let Some(house) = u16::try_from(family.house).ok().filter(|&lot| lot > 0) {
-            occ.primary_lot.insert(house, (family_id, secondary));
-        }
-        if let Some(vac_lot) = secondary {
-            occ.vacation_lot.insert(vac_lot, family_id);
-        }
+        occ.record_family(i32::from(chunk.id), &family);
     }
     Ok(occ)
 }
@@ -1835,29 +1859,43 @@ fn load_lot_zoning(install: &Install, user_dir: &Path) -> Result<LotZoningTable>
 
 /// Parses a `LotZoning.iff` `STR# 1` table (`"lot_id, residential|community"`),
 /// matching `0x424fb9..0x425064` verbatim:
+/// - truncates each row at the first NUL byte and to at most 99 bytes
+///   (`strncpy(buf, s, 0x63)` at `0x424fb9..0x424fcb`),
 /// - splits at the first `,` (rows without a comma are skipped),
 /// - parses the signed 32-bit decimal prefix before the comma via C `atoi`
 ///   (`0x636029`),
-/// - searches the lowercased text after the comma for `"residential"` first
-///   (`0x6c25a4`), then `"community"` (`0x6c2598`), defaulting to
+/// - searches the ASCII-lowercased bytes after the comma for `"residential"`
+///   first (`0x6c25a4`), then `"community"` (`0x6c2598`), defaulting to
 ///   [`LotZoning::Residential`] (`0x425052..0x42505e`),
 /// - preserves every row in file order (`0x425064`) and records the first
 ///   matching zone per lot ID (`0x42b9fc..0x42ba09`).
 pub fn parse_lot_zoning_table(table: &StringTable) -> LotZoningTable {
+    const NATIVE_BUF_LIMIT: usize = 99;
     let mut rows = Vec::new();
     let mut first_zone = BTreeMap::new();
     for entry in &table.entries {
         if entry.language != US_ENGLISH {
             continue;
         }
-        let Some((before_comma, after_comma)) = entry.text.split_once(',') else {
+        let raw = if !entry.raw_text.is_empty() {
+            entry.raw_text.as_slice()
+        } else {
+            entry.text.as_bytes()
+        };
+        // Stop at the first NUL byte and at 99 bytes (0x424fb9: push 0x63).
+        let nul_end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+        let cstr = &raw[..nul_end.min(NATIVE_BUF_LIMIT)];
+        let Some(comma) = cstr.iter().position(|&b| b == b',') else {
             continue;
         };
-        let id = sims_content::atoi(before_comma.as_bytes());
-        let lower = after_comma.to_ascii_lowercase();
-        let zoning = if lower.contains("residential") {
+        let id = sims_content::atoi(&cstr[..comma]);
+        let after_lower: Vec<u8> = cstr[comma + 1..]
+            .iter()
+            .map(u8::to_ascii_lowercase)
+            .collect();
+        let zoning = if after_lower.windows(11).any(|w| w == b"residential") {
             LotZoning::Residential
-        } else if lower.contains("community") {
+        } else if after_lower.windows(9).any(|w| w == b"community") {
             LotZoning::Community
         } else {
             LotZoning::Residential
@@ -2072,6 +2110,7 @@ mod tests {
             zoning: LotZoning::Residential,
             status: LotStatus::Vacant,
             has_primary_vacation_stay: false,
+            has_vacation_occupancy: false,
             filter_mask: 0,
             normal: surface,
             roofs_off: None,
@@ -2376,6 +2415,26 @@ mod tests {
             .collect();
         // C atoi parses "65536 # stop" as 65536 and stops before lot 2 (0x557125).
         assert_eq!(unleashed, vec![1, 1, 3, 4, 5]);
+
+        // NUL termination and 99-byte native buffer limit (0x424fb9..0x424fcb).
+        let nul_entry = entry("6, neutral\0community");
+        let mut long_text = String::from("7, ");
+        long_text.push_str(&"x".repeat(96)); // 3 + 96 = 99 bytes before "community"
+        long_text.push_str("community");
+        let long_entry = entry(&long_text);
+        let cstr_table = StringTable {
+            format: Format::Pascal,
+            entries: vec![nul_entry, long_entry],
+        };
+        let cstr_parsed = parse_lot_zoning_table(&cstr_table);
+        assert_eq!(
+            cstr_parsed.first_zone.get(&6),
+            Some(&LotZoning::Residential)
+        );
+        assert_eq!(
+            cstr_parsed.first_zone.get(&7),
+            Some(&LotZoning::Residential)
+        );
     }
 
     #[test]
@@ -2500,5 +2559,27 @@ mod tests {
         assert_eq!(canvas.id_at(10, 10), Some(90));
         assert_eq!(magic_map.hit_test_with_options(&hover_opts, [18, 14]), None);
         assert_eq!(canvas.id_at(18, 14), None);
+
+        // Multiple FAMI records sharing lot 5 (secondary 41 followed by 0) and
+        // a single record with negative nonzero secondary (-1) both preserve
+        // primary vacation stay eligibility (0x54f20e).
+        let make_fam = |house: i32, secondary: i32| Family {
+            version: 8,
+            house,
+            number: 1,
+            budget: 0,
+            architecture_value: 0,
+            friends: 0,
+            flags: 0,
+            members: Vec::new(),
+            tail: secondary.to_le_bytes().to_vec(),
+        };
+        let mut multi_occ = FamilyOccupancy::default();
+        multi_occ.record_family(1, &make_fam(5, 41));
+        multi_occ.record_family(2, &make_fam(5, 0));
+        multi_occ.record_family(3, &make_fam(6, -1));
+        assert!(multi_occ.primary_vacation_stays.contains(&5));
+        assert!(multi_occ.primary_vacation_stays.contains(&6));
+        assert!(multi_occ.any_house_matches.contains(&41));
     }
 }
