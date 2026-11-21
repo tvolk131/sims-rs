@@ -204,6 +204,10 @@ pub struct Program {
     /// they were not read: making a character then fails.
     /// [`Program::link`] leaves it None for the caller to fill.
     pub wardrobe: Option<sims_content::Wardrobe>,
+    /// Native-ordered suit and texture lists (`0x409255`, `0x40895a`) for
+    /// exact index selection in Make New Character (`0x44b151`, `0x44b167`,
+    /// `0x44b07e`). [`Program::link`] leaves it None for the caller to fill.
+    pub ordered_wardrobe: Option<sims_content::ImportWardrobe>,
     /// The numbers of the `User%05d.iff` files in the neighborhood's
     /// `Characters` folder: the file numbers Make New Character's copy
     /// finds taken (0x4722b8), besides those of the types it makes.
@@ -243,6 +247,7 @@ impl Program {
             people: People::default(),
             icon_frames: None,
             wardrobe: None,
+            ordered_wardrobe: None,
             character_files: Default::default(),
             expansions: 0,
             characters: BTreeSet::new(),

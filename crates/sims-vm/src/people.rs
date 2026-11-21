@@ -217,11 +217,11 @@ pub(crate) fn profile<'p>(
     Ok(Cow::Owned(profile))
 }
 
-/// A person type's skeleton: the one its body string 0 names. A type made
-/// while the game ran names the skeleton Make New Character wrote, or its
-/// template's; a skeleton named so is the one any person type of that
-/// name resolved to, as the name alone chooses the file. A type with no
-/// skeleton in `people` fails.
+/// A person type's skeleton (read-only lookup): the one its body string 0
+/// names. A type made while the game ran names the skeleton Make New
+/// Character wrote, or its template's; lazy `.ndx` catalogs already loaded at
+/// runtime (`World::loaded_indexed_skeletons`) take precedence over unopened
+/// catalog entries. A type with no skeleton in `people` fails.
 pub(crate) fn skeleton<'p>(
     people: &'p People,
     world: &World,
@@ -233,16 +233,158 @@ pub(crate) fn skeleton<'p>(
         if let Some(skeleton) = people.skeletons.get(&template).filter(|s| s.name == *name) {
             return Ok(skeleton);
         }
-        return people
-            .skeletons_by_name
-            .get(name)
-            .or_else(|| people.skeletons.values().find(|s| s.name == *name))
-            .ok_or_else(|| {
-                Trap::Unsupported(format!(
-                    "no person type's skeleton is named {name:?}, which the made person type \
-                     0x{guid:08X} names"
-                ))
-            });
+        return lookup_loaded_skeleton_by_name(people, world, name).ok_or_else(|| {
+            Trap::Unsupported(format!(
+                "no person type's skeleton is named {name:?}, which the made person type \
+                 0x{guid:08X} names"
+            ))
+        });
+    }
+    people.skeletons.get(&template).ok_or_else(|| {
+        Trap::Unsupported(format!(
+            "no skeleton was supplied for the person type 0x{guid:08X}"
+        ))
+    })
+}
+
+/// Read-only lookup of a skeleton by exact name (`0x5a280f`), checking:
+/// 1. startup-loaded skeletons (`people.skeletons_by_name`);
+/// 2. runtime-loaded `.ndx` skeletons and filled siblings
+///    (`world.loaded_indexed_skeletons` → `people.indexed_catalogs`);
+/// 3. still-unloaded `.ndx` entry's own catalog (for read-only callers that
+///    inspect a person whose skeleton was not resolved via the factory);
+/// 4. fallback over `people.skeletons.values()` for synthetic fixtures.
+fn lookup_loaded_skeleton_by_name<'p>(
+    people: &'p People,
+    world: &World,
+    name: &str,
+) -> Option<&'p Skeleton> {
+    if let Some(skeleton) = people.skeletons_by_name.get(name) {
+        return Some(skeleton);
+    }
+    if let Some(slot) = world.loaded_indexed_skeletons.get(name) {
+        return slot.as_deref().and_then(|loc| {
+            people
+                .indexed_catalogs
+                .get(loc)
+                .and_then(|(items, _)| items.iter().find(|s| s.name == name))
+        });
+    }
+    if let Some(Ok(loc)) = people.indexed_skeletons.get(name)
+        && let Some((items, _)) = people.indexed_catalogs.get(loc)
+        && let Some(skeleton) = items.iter().find(|s| s.name == name)
+    {
+        return Some(skeleton);
+    }
+    people.skeletons.values().find(|s| s.name == name)
+}
+
+/// Resolves a skeleton by exact byte-for-byte name (`0x5a0384`, `0x5a280f`),
+/// executing lazy `.ndx` catalog loads in runtime call order: loading a
+/// catalog populates every decoded skeleton in that `.bcf` into
+/// `world.loaded_indexed_skeletons` for any name not already loaded or
+/// previously attempted (`0x59f18c`–`0x59f19f`), and marks a missed lazy entry
+/// failed (`0x5a389b`) so later catalog loads cannot overwrite it.
+pub(crate) fn resolve_skeleton_by_name<'p>(
+    people: &'p People,
+    world: &mut World,
+    guid: u32,
+    name: &str,
+) -> Result<&'p Skeleton, Trap> {
+    if let Some(skeleton) = people.skeletons_by_name.get(name) {
+        return Ok(skeleton);
+    }
+    if let Some(slot) = world.loaded_indexed_skeletons.get(name) {
+        return match slot.as_deref() {
+            Some(loc) => people
+                .indexed_catalogs
+                .get(loc)
+                .and_then(|(items, _)| items.iter().find(|s| s.name == name))
+                .ok_or_else(|| {
+                    Trap::Unsupported(format!(
+                        "0x5a03c0: loaded catalog {loc} does not define skeleton {name:?}"
+                    ))
+                }),
+            None => Err(Trap::Unsupported(format!(
+                "0x5a389b: earlier lazy lookup for skeleton {name:?} failed"
+            ))),
+        };
+    }
+    if let Some(entry) = people.indexed_skeletons.get(name) {
+        let loc = match entry {
+            Ok(loc) => loc,
+            Err(reason) => return Err(Trap::Unsupported(reason.clone())),
+        };
+        let (items, decode_error) = people.indexed_catalogs.get(loc).ok_or_else(|| {
+            Trap::Unsupported(format!(
+                "0x5a3810: indexed catalog {loc} for skeleton {name:?} is unavailable"
+            ))
+        })?;
+        // 0x59f18c..0x59f19f: every skeleton decoded from this catalog fills
+        // any unloaded (and not previously attempted) entry in the registry.
+        for item in items {
+            if !people.skeletons_by_name.contains_key(&item.name)
+                && !world.loaded_indexed_skeletons.contains_key(&item.name)
+            {
+                world
+                    .loaded_indexed_skeletons
+                    .insert(item.name.clone(), Some(loc.clone()));
+            }
+        }
+        if let Some(Some(filled_loc)) = world.loaded_indexed_skeletons.get(name)
+            && let Some(skeleton) = people
+                .indexed_catalogs
+                .get(filled_loc)
+                .and_then(|(catalog, _)| catalog.iter().find(|s| s.name == name))
+        {
+            return Ok(skeleton);
+        }
+        // 0x5a389b: mark failed so later catalog loads cannot overwrite it.
+        world.loaded_indexed_skeletons.insert(name.to_owned(), None);
+        let reason = if let Some(error) = decode_error {
+            format!("0x5a3810: the skeletons of {loc} do not decode ({error})")
+        } else {
+            format!("0x5a03c0: {loc} does not define skeleton {name:?}")
+        };
+        return Err(Trap::Unsupported(reason));
+    }
+    people
+        .skeletons
+        .values()
+        .find(|s| s.name == name)
+        .ok_or_else(|| {
+            Trap::Unsupported(format!(
+                "no person type's skeleton is named {name:?}, which the person type \
+                 0x{guid:08X} names"
+            ))
+        })
+}
+
+/// Resolves the skeleton for constructing a person of `guid` (`0x58833c` →
+/// `0x5a0384`), honoring runtime-made overrides, `early_name` (loader-ordered
+/// body string 0), and runtime `.ndx` load order.
+pub(crate) fn resolve_skeleton<'p>(
+    people: &'p People,
+    world: &mut World,
+    guid: u32,
+    early_name: Option<&str>,
+) -> Result<&'p Skeleton, Trap> {
+    let made = world.characters.made.get(&guid);
+    let template = made.map_or(guid, |made| made.template);
+    if let Some(name) = early_name {
+        if let Some(skeleton) = people.skeletons.get(&template).filter(|s| s.name == name) {
+            return Ok(skeleton);
+        }
+        return resolve_skeleton_by_name(people, world, guid, name);
+    }
+    if let Some(name) = made
+        .and_then(|made| made.strings.get(&characters::SKELETON))
+        .cloned()
+    {
+        if let Some(skeleton) = people.skeletons.get(&template).filter(|s| s.name == name) {
+            return Ok(skeleton);
+        }
+        return resolve_skeleton_by_name(people, world, guid, &name);
     }
     people.skeletons.get(&template).ok_or_else(|| {
         Trap::Unsupported(format!(

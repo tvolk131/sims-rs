@@ -4,9 +4,10 @@
 
 use crate::import_wardrobe::{AvatarPaths, mount_avatar_paths, resources_with_dir};
 use crate::{Catalog, Error, Index, Install, Resource, Result};
-use sims_formats::avatar::Cmx;
 use sims_formats::avatar::catalog::{Asset, Binary};
 use sims_formats::avatar::index::{IndexReader, Kind};
+use sims_formats::avatar::{Cmx, read_bmf, read_skn};
+use sims_formats::far::encode_name;
 use sims_formats::iff::Iff;
 use sims_formats::strings::{StringTable, decode};
 use std::collections::{BTreeMap, BTreeSet};
@@ -72,18 +73,37 @@ pub struct Profile {
     /// holds the hand's ("R_HAND") and that point's name ("Palm"). None
     /// is a string the table does not have.
     pub rig: [Option<String>; 4],
+    /// Non-empty body string rows beyond the default body/head rows (row index
+    /// -> raw string), for outfit changes (`0x58a178`: naked row 15, swim
+    /// rows 16/31, formal rows 27/30, pajamas row 32, winter row 33, high
+    /// fashion row 34, and special NPC suit rows).
+    pub suit_rows: BTreeMap<usize, String>,
 }
+
+/// Decoded contents of one `.ndx`-referenced `.bcf` skeleton catalog: its
+/// skeletons in file order plus any decode error encountered partway through.
+pub type IndexedCatalog = (Vec<Skeleton>, Option<String>);
 
 /// The skeletons and profiles of a set of person types.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct People {
     /// Each person type's skeleton, by the type's GUID.
     pub skeletons: BTreeMap<u32, Skeleton>,
-    /// Every skeleton registered in the avatar registry, keyed byte-for-byte
-    /// by skeleton name (`0x5a0384`, `0x5a280f`), so runtime-made or
-    /// loader-reordered skeleton names resolve even when no catalog person
-    /// referenced them directly.
+    /// Skeletons already loaded at startup (eager `.bcf` catalogs plus any
+    /// `.ndx` catalogs and their siblings loaded while resolving the requested
+    /// person GUIDs), keyed byte-for-byte by skeleton name (`0x5a0384`,
+    /// `0x5a280f`).
     pub skeletons_by_name: BTreeMap<String, Skeleton>,
+    /// Still-unloaded `.ndx`-indexed skeletons (`0x584562` → `0x59fc48`),
+    /// keyed byte-for-byte by skeleton name: `Ok(catalog_location)` pointing
+    /// into [`People::indexed_catalogs`], or `Err(reason)` if blocked by an
+    /// earlier decode error or missing catalog.
+    pub indexed_skeletons: BTreeMap<String, std::result::Result<String, String>>,
+    /// Decoded skeletons for each catalog referenced by
+    /// [`People::indexed_skeletons`], keyed by catalog location, so runtime
+    /// lookups (`0x5a0384` → `0x59f18c`–`0x59f19f`) can populate unloaded
+    /// sibling entries in exact runtime call order.
+    pub indexed_catalogs: BTreeMap<String, IndexedCatalog>,
     /// Each person type's body string 0 (skeleton name, `STR#` word 19 row 0),
     /// kept even when the `.bcf` skeleton itself is unavailable (for the early
     /// pet guard at `0x440d63`).
@@ -100,15 +120,17 @@ pub struct People {
     /// skeletons or suits stopped decoding, by location, with the error:
     /// its suits after that point are missing from `suits`.
     pub suit_errors: BTreeMap<String, String>,
-    /// Every suit name (`.cmx` / `.bcf` appearance) whose bindings include
-    /// an exact byte-for-byte `"HEAD"` bone (`0x4e810d` → `0x4e81a4` →
-    /// `0x431726`), as checked by the portrait renderer at `0x4e7824`.
+    /// Every winning suit name (`.cmx` / `.bcf` appearance, first registration
+    /// wins per `0x59ea68`/`0x59f34c`) that has at least one exact byte-for-byte
+    /// `"HEAD"` bone binding (`0x4e810d` → `0x4e81a4` → `0x431726`) whose
+    /// `.bmf` or `.skn` mesh exists and decodes (`0x595629` → `0x59e1b6` →
+    /// `0x59e32a`).
     pub head_suits: BTreeSet<String>,
     /// Whether each loaded person type's initial body/head suits (body
-    /// strings 1 and 2) bind `"HEAD"` byte-for-byte (`0x4e725f` → `0x4e7817`
-    /// → `0x4e810d` → `0x4e81a4` → `0x431726` → `0x4e7824`). Absent when a
-    /// suit catalog failed to decode before confirming a binding or in
-    /// synthetic fixtures that do not populate it.
+    /// strings 1 and 2) bind `"HEAD"` byte-for-byte with a valid mesh
+    /// (`0x4e725f` → `0x4e7817` → `0x4e810d` → `0x4e81a4` → `0x431726` →
+    /// `0x4e7824`). Absent when a suit catalog failed to decode before
+    /// confirming a binding or in synthetic fixtures that do not populate it.
     pub portrait_head: BTreeMap<u32, bool>,
 }
 
@@ -193,6 +215,13 @@ pub struct AvatarRegistry {
     suit_errors: BTreeMap<String, String>,
 }
 
+/// Exported startup skeleton state from [`AvatarRegistry::export_skeletons`].
+struct ExportedSkeletons {
+    loaded: BTreeMap<String, Skeleton>,
+    indexed: BTreeMap<String, std::result::Result<String, String>>,
+    catalogs: BTreeMap<String, IndexedCatalog>,
+}
+
 impl AvatarRegistry {
     /// Builds the startup avatar registry for `install`.
     pub fn load(install: &Install) -> Result<Self> {
@@ -200,7 +229,7 @@ impl AvatarRegistry {
         let mut skeletons: BTreeMap<String, (usize, SkeletonEntry)> = BTreeMap::new();
         let mut first_skeleton_error: Option<(usize, String)> = None;
         let mut suits = BTreeSet::new();
-        let mut head_suits = BTreeSet::new();
+        let mut head_bindings: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut suit_errors = BTreeMap::new();
         let mut step = 0usize;
 
@@ -209,7 +238,7 @@ impl AvatarRegistry {
             let location = source.location(&install.root);
             let bytes = source.read()?;
             if let Err((blocks_skeletons, error)) =
-                read_cmx_catalog(&bytes, &mut suits, &mut head_suits)
+                read_cmx_catalog(&bytes, &mut suits, &mut head_bindings)
             {
                 suit_errors.insert(location.clone(), error.to_string());
                 if blocks_skeletons && first_skeleton_error.is_none() {
@@ -256,7 +285,7 @@ impl AvatarRegistry {
                 }
                 continue;
             }
-            if let Err(error) = read_bcf_appearances(&mut binary, &mut suits, &mut head_suits) {
+            if let Err(error) = read_bcf_appearances(&mut binary, &mut suits, &mut head_bindings) {
                 suit_errors.insert(location, error.to_string());
             }
         }
@@ -358,19 +387,33 @@ impl AvatarRegistry {
                 continue;
             }
             let mut catalog_suits = BTreeSet::new();
-            let mut catalog_head_suits = BTreeSet::new();
+            let mut catalog_head_bindings: BTreeMap<String, Vec<String>> = BTreeMap::new();
             if let Err(error) =
-                read_bcf_appearances(&mut binary, &mut catalog_suits, &mut catalog_head_suits)
+                read_bcf_appearances(&mut binary, &mut catalog_suits, &mut catalog_head_bindings)
             {
                 suit_errors.insert(location, error.to_string());
             }
             for name in names {
-                if catalog_suits.contains(&name) {
-                    if catalog_head_suits.contains(&name) {
-                        head_suits.insert(name.clone());
-                    }
-                    suits.insert(name);
+                if catalog_suits.contains(&name)
+                    && suits.insert(name.clone())
+                    && let Some(meshes) = catalog_head_bindings.remove(&name)
+                {
+                    head_bindings.insert(name, meshes);
                 }
+            }
+        }
+
+        // 0x595629 -> 0x59e1b6 -> 0x59e32a: a "HEAD" binding attaches only
+        // when its mesh exists and decodes as `<mesh>.bmf` (0x59a932) or falls
+        // back to `<mesh>.skn` (0x59a629) in the avatar search paths.
+        let mut head_suits = BTreeSet::new();
+        let mut mesh_cache: BTreeMap<String, bool> = BTreeMap::new();
+        for (suit_name, meshes) in head_bindings {
+            if meshes
+                .iter()
+                .any(|mesh| has_valid_mesh(&paths, mesh, &mut mesh_cache))
+            {
+                head_suits.insert(suit_name);
             }
         }
 
@@ -509,22 +552,30 @@ impl AvatarRegistry {
         Ok(skeleton.scales[skeleton.place].clone())
     }
 
-    /// Snapshots every skeleton registered in the avatar registry keyed
-    /// byte-for-byte by skeleton name (`0x5a280f`) without mutating lazy `.ndx`
-    /// state across entries:
-    /// - every already-`Loaded` skeleton (eager `.bcf` catalogs plus any `.ndx`
-    ///   catalogs and their siblings already loaded for the requested person
-    ///   GUIDs) is included as-is;
-    /// - each still-unloaded `Indexed` entry is resolved from its own
-    ///   `catalog_bcf` in isolation so alphabetically earlier `.ndx` catalogs
-    ///   cannot shadow another entry's own catalog (`0x5a03c2`–`0x5a03cd`).
-    fn snapshot_skeletons(&self) -> BTreeMap<String, Skeleton> {
-        let mut out = BTreeMap::new();
-        let mut catalog_cache: BTreeMap<String, Vec<Skeleton>> = BTreeMap::new();
+    /// Exports the startup registry's skeleton state for runtime lookup
+    /// (`0x5a0384`, `0x59f18c`–`0x59f19f`, `0x5a389b`):
+    /// - `loaded`: every already-`Loaded` skeleton (eager `.bcf` catalogs plus
+    ///   any `.ndx` catalogs and their siblings already loaded for the
+    ///   requested person GUIDs);
+    /// - `indexed`: each still-unloaded `.ndx` entry mapped to its catalog
+    ///   location (`Ok(loc)`) or blocking error (`Err(reason)`);
+    /// - `catalogs`: decoded skeletons (and optional error) for each catalog
+    ///   referenced by `indexed`, so runtime lookups fill unloaded sibling
+    ///   entries in exact runtime call order.
+    fn export_skeletons(&self) -> ExportedSkeletons {
+        let mut loaded = BTreeMap::new();
+        let mut indexed = BTreeMap::new();
+        let mut catalogs: BTreeMap<String, IndexedCatalog> = BTreeMap::new();
         for (name, (reg_step, entry)) in &self.skeletons {
-            if let Some((err_step, _)) = &self.first_skeleton_error
+            if let Some((err_step, reason)) = &self.first_skeleton_error
                 && *reg_step >= *err_step
             {
+                indexed.insert(
+                    name.clone(),
+                    Err(format!(
+                        "0x5a0384: {reason}, so whether it overrides {name:?} is unknown"
+                    )),
+                );
                 continue;
             }
             match entry {
@@ -534,7 +585,7 @@ impl AvatarRegistry {
                     scales,
                     bones,
                 } => {
-                    out.insert(
+                    loaded.insert(
                         name.clone(),
                         Skeleton {
                             name: name.clone(),
@@ -545,43 +596,61 @@ impl AvatarRegistry {
                         },
                     );
                 }
-                SkeletonEntry::Failed(_) => {}
+                SkeletonEntry::Failed(reason) => {
+                    indexed.insert(name.clone(), Err(reason.clone()));
+                }
                 SkeletonEntry::Indexed {
+                    ndx_location,
                     directory,
                     catalog_bcf,
-                    ..
-                } => {
-                    let Ok(Some(resource)) = self.paths.files.lookup(directory, catalog_bcf) else {
-                        continue;
-                    };
-                    let location = resource.location(&self.root);
-                    let decoded = catalog_cache.entry(location.clone()).or_insert_with(|| {
-                        let Ok(bytes) = resource.read() else {
-                            return Vec::new();
-                        };
-                        let mut binary = Binary::new(&bytes);
-                        let (items, _) = read_bcf_skeletons(&mut binary);
-                        let all_scales: Vec<Vec<i32>> =
-                            items.iter().map(|(_, s, _)| s.clone()).collect();
-                        items
-                            .into_iter()
-                            .enumerate()
-                            .map(|(place, (skel_name, _, bones))| Skeleton {
-                                name: skel_name,
-                                file: location.clone(),
-                                place,
-                                scales: all_scales.clone(),
-                                bones,
-                            })
-                            .collect()
-                    });
-                    if let Some(skeleton) = decoded.iter().find(|s| s.name == *name) {
-                        out.insert(name.clone(), skeleton.clone());
+                } => match self.paths.files.lookup(directory, catalog_bcf) {
+                    Ok(Some(resource)) => {
+                        let location = resource.location(&self.root);
+                        catalogs.entry(location.clone()).or_insert_with(|| {
+                            let bytes = match resource.read() {
+                                Ok(bytes) => bytes,
+                                Err(error) => return (Vec::new(), Some(error.to_string())),
+                            };
+                            let mut binary = Binary::new(&bytes);
+                            let (items, error) = read_bcf_skeletons(&mut binary);
+                            let all_scales: Vec<Vec<i32>> =
+                                items.iter().map(|(_, s, _)| s.clone()).collect();
+                            let skeletons = items
+                                .into_iter()
+                                .enumerate()
+                                .map(|(place, (skel_name, _, bones))| Skeleton {
+                                    name: skel_name,
+                                    file: location.clone(),
+                                    place,
+                                    scales: all_scales.clone(),
+                                    bones,
+                                })
+                                .collect();
+                            (skeletons, error.map(|e| e.to_string()))
+                        });
+                        indexed.insert(name.clone(), Ok(location));
                     }
-                }
+                    Ok(None) => {
+                        let catalog_name = decode(catalog_bcf, 1);
+                        indexed.insert(
+                            name.clone(),
+                            Err(format!(
+                                "0x5a3810: {ndx_location} points skeleton {name:?} to \
+                                 {directory}/{catalog_name}, which is missing"
+                            )),
+                        );
+                    }
+                    Err(error) => {
+                        indexed.insert(name.clone(), Err(error.to_string()));
+                    }
+                },
             }
         }
-        out
+        ExportedSkeletons {
+            loaded,
+            indexed,
+            catalogs,
+        }
     }
 }
 
@@ -609,10 +678,12 @@ impl People {
         }
     }
 
-    /// As [`People::load`], but a person type whose skeleton cannot be
-    /// resolved is left out of both maps instead of failing the whole load.
-    /// Returns the types left out, by GUID, with the reason. Making a person
-    /// of a type left out fails, as it would with no entry at all.
+    /// As [`People::load`], but a person type whose skeleton name is missing
+    /// or whose skeleton cannot be resolved is left out of `skeletons` instead
+    /// of failing the whole load, while its [`Profile`] and `portrait_head`
+    /// metadata are retained so runtime-made clones with a valid skeleton
+    /// override can still be constructed and rendered. Returns the types left
+    /// out of `skeletons`, by GUID, with the reason.
     pub fn load_each(
         install: &Install,
         index: &Index,
@@ -627,7 +698,7 @@ impl People {
             let Some(object) = catalog.object(guid) else {
                 continue;
             };
-            if object.kind != 2 || names.contains_key(&guid) {
+            if object.kind != 2 || profiles.contains_key(&guid) {
                 continue;
             }
             let resource = &index.resources[object.resource];
@@ -655,6 +726,13 @@ impl People {
                 Some(&Some(semi_global)) => skin_tones(index, &index.resources[semi_global])?,
                 _ => Vec::new(),
             };
+            let suit_rows: BTreeMap<usize, String> = body
+                .iter()
+                .enumerate()
+                .skip(3)
+                .filter(|(_, text)| !text.is_empty())
+                .map(|(i, text)| (i, text.clone()))
+                .collect();
             profiles.insert(
                 guid,
                 Profile {
@@ -665,19 +743,18 @@ impl People {
                     skin: row(SKIN),
                     tones,
                     rig: std::array::from_fn(|i| row(RIG + i)),
+                    suit_rows,
                 },
             );
             let location = resource.location(&index.root);
-            let name = body
-                .first()
-                .filter(|name| !name.is_empty())
-                .cloned()
-                .ok_or_else(|| {
-                    Error::Unsupported(format!(
-                        "{location}: the person's body strings name no skeleton"
-                    ))
-                })?;
-            names.insert(guid, name);
+            if let Some(name) = body.first().filter(|name| !name.is_empty()).cloned() {
+                names.insert(guid, name);
+            } else {
+                unresolved.insert(
+                    guid,
+                    format!("{location}: the person's body strings name no skeleton"),
+                );
+            }
         }
         let mut registry = AvatarRegistry::load(install)?;
         let mut skeletons = BTreeMap::new();
@@ -692,12 +769,13 @@ impl People {
                 Err(error) => return Err(error),
             }
         }
-        let skeletons_by_name = registry.snapshot_skeletons();
+        let ExportedSkeletons {
+            loaded: skeletons_by_name,
+            indexed: indexed_skeletons,
+            catalogs: indexed_catalogs,
+        } = registry.export_skeletons();
         let mut portrait_head = BTreeMap::new();
         for (guid, suits) in default_suits {
-            if unresolved.contains_key(&guid) {
-                continue;
-            }
             if suits.iter().any(|s| registry.head_suits.contains(s)) {
                 portrait_head.insert(guid, true);
             } else if registry.suit_errors.is_empty() {
@@ -708,6 +786,8 @@ impl People {
             Self {
                 skeletons,
                 skeletons_by_name,
+                indexed_skeletons,
+                indexed_catalogs,
                 skeleton_names: names,
                 profiles,
                 suits: registry.suits,
@@ -889,14 +969,55 @@ fn skin_tones(index: &Index, resource: &Resource) -> Result<Vec<String>> {
 /// A skeleton file's skeletons: each one's name, bone scales and bones.
 type DecodedSkeletons = Vec<(String, Vec<i32>, Vec<Bone>)>;
 
+/// Whether `mesh` exists and decodes as `<mesh>.bmf` (`0x59e36d` → `0x59a932`)
+/// or falls back to `<mesh>.skn` (`0x59e403` → `0x59a629`) across the avatar
+/// search paths (`0x59e10b`–`0x59e134`).
+fn has_valid_mesh(paths: &AvatarPaths, mesh: &str, cache: &mut BTreeMap<String, bool>) -> bool {
+    if mesh.is_empty() {
+        return false;
+    }
+    let key = mesh.to_ascii_lowercase();
+    if let Some(&ok) = cache.get(&key) {
+        return ok;
+    }
+    let base = encode_name(&key).unwrap_or_else(|| key.as_bytes().to_vec());
+    let mut bmf_name = base.clone();
+    bmf_name.extend_from_slice(b".bmf");
+    let mut ok = false;
+    for dir in paths.appearance.iter().chain(&paths.indexed) {
+        if let Ok(Some(resource)) = paths.files.lookup(dir, &bmf_name) {
+            if resource.read().is_ok_and(|bytes| read_bmf(&bytes).is_ok()) {
+                ok = true;
+            }
+            break;
+        }
+    }
+    if !ok {
+        let mut skn_name = base;
+        skn_name.extend_from_slice(b".skn");
+        for dir in paths.appearance.iter().chain(&paths.indexed) {
+            if let Ok(Some(resource)) = paths.files.lookup(dir, &skn_name) {
+                if resource.read().is_ok_and(|bytes| read_skn(&bytes).is_ok()) {
+                    ok = true;
+                }
+                break;
+            }
+        }
+    }
+    cache.insert(key, ok);
+    ok
+}
+
 /// Reads a text `.cmx` catalog's skeleton count and appearances (`0x59e746`,
-/// `0x594d73`). Returns `Err((true, e))` if the header, skeleton count or a
-/// non-empty skeleton section fails (so skeleton lookup must fail loudly),
-/// and `Err((false, e))` if an appearance record fails after 0 skeletons.
+/// `0x594d73`). First registration wins for duplicate appearance names
+/// (`0x59ea68`/`0x59eb11`). Returns `Err((true, e))` if the header, skeleton
+/// count or a non-empty skeleton section fails (so skeleton lookup must fail
+/// loudly), and `Err((false, e))` if an appearance record fails after 0
+/// skeletons.
 fn read_cmx_catalog(
     bytes: &[u8],
     suits: &mut BTreeSet<String>,
-    head_suits: &mut BTreeSet<String>,
+    head_bindings: &mut BTreeMap<String, Vec<String>>,
 ) -> std::result::Result<(), (bool, sims_formats::Error)> {
     let mut cmx = Cmx::new(bytes).map_err(|e| (true, e))?;
     let Some(skel_count) = cmx.count(Kind::Skeleton).map_err(|e| (true, e))? else {
@@ -912,11 +1033,18 @@ fn read_cmx_catalog(
         return Ok(());
     };
     for _ in 0..app_count {
-        if let Asset::Appearance(appearance) = cmx.read(Kind::Appearance).map_err(|e| (false, e))? {
-            if appearance.bindings.iter().any(|b| b.bone == "HEAD") {
-                head_suits.insert(appearance.name.clone());
+        if let Asset::Appearance(appearance) = cmx.read(Kind::Appearance).map_err(|e| (false, e))?
+            && suits.insert(appearance.name.clone())
+        {
+            let meshes: Vec<String> = appearance
+                .bindings
+                .into_iter()
+                .filter(|b| b.bone == "HEAD")
+                .map(|b| b.mesh)
+                .collect();
+            if !meshes.is_empty() {
+                head_bindings.insert(appearance.name, meshes);
             }
-            suits.insert(appearance.name);
         }
     }
     Ok(())
@@ -968,12 +1096,14 @@ fn read_bcf_skeletons(binary: &mut Binary<'_>) -> (DecodedSkeletons, Option<sims
 }
 
 /// Reads the `Kind::Appearance` group of a binary `.bcf` catalog record by
-/// record (`0x595140`, `0x5950f5` lowercasing each suit name). A short
-/// appearance count (`Ok(None)`) is treated as a read failure (`0x59f1c1`).
+/// record (`0x595140`, `0x5950f5` lowercasing each suit name). First
+/// registration wins for duplicate appearance names (`0x59f2e6`/`0x59f34c`).
+/// A short appearance count (`Ok(None)`) is treated as a read failure
+/// (`0x59f1c1`).
 fn read_bcf_appearances(
     binary: &mut Binary<'_>,
     suits: &mut BTreeSet<String>,
-    head_suits: &mut BTreeSet<String>,
+    head_bindings: &mut BTreeMap<String, Vec<String>>,
 ) -> sims_formats::Result<()> {
     let Some(count) = binary.count(Kind::Appearance)? else {
         return Err(sims_formats::Error::new(
@@ -982,11 +1112,18 @@ fn read_bcf_appearances(
         ));
     };
     for _ in 0..count {
-        if let Asset::Appearance(appearance) = binary.read(Kind::Appearance)? {
-            if appearance.bindings.iter().any(|b| b.bone == "HEAD") {
-                head_suits.insert(appearance.name.clone());
+        if let Asset::Appearance(appearance) = binary.read(Kind::Appearance)?
+            && suits.insert(appearance.name.clone())
+        {
+            let meshes: Vec<String> = appearance
+                .bindings
+                .into_iter()
+                .filter(|b| b.bone == "HEAD")
+                .map(|b| b.mesh)
+                .collect();
+            if !meshes.is_empty() {
+                head_bindings.insert(appearance.name, meshes);
             }
-            suits.insert(appearance.name);
         }
     }
     Ok(())
@@ -1575,15 +1712,211 @@ xskin-b001-PELVIS-BODY\r\n\
 0\r\n\
 0\r\n";
         let mut suits = BTreeSet::new();
-        let mut head_suits = BTreeSet::new();
-        read_cmx_catalog(cmx, &mut suits, &mut head_suits).unwrap();
+        let mut head_bindings = BTreeMap::new();
+        read_cmx_catalog(cmx, &mut suits, &mut head_bindings).unwrap();
         assert_eq!(
             suits,
             ["b001_body", "c001_exact", "c002_lower"]
                 .map(String::from)
                 .into()
         );
-        assert_eq!(head_suits, ["c001_exact".to_string()].into());
+        assert_eq!(
+            head_bindings,
+            BTreeMap::from([(
+                "c001_exact".to_string(),
+                vec!["xskin-c001-HEAD-HEAD".to_string()]
+            )])
+        );
+    }
+
+    #[test]
+    fn duplicate_appearances_missing_meshes_empty_rig_and_indexed_catalogs() {
+        let dir = ScratchDir::new("round14-people");
+        let bcf_with_apps = |skels: &[(&str, i32)], apps: &[(&str, &str, &str)]| {
+            let push_str = |out: &mut Vec<u8>, s: &str| {
+                out.push(s.len() as u8);
+                out.extend_from_slice(s.as_bytes());
+            };
+            let mut bytes = (skels.len() as u32).to_le_bytes().to_vec();
+            for &(name, scale) in skels {
+                push_str(&mut bytes, name);
+                bytes.extend(1u32.to_le_bytes());
+                push_str(&mut bytes, "HEAD");
+                push_str(&mut bytes, "NULL");
+                bytes.extend(0u32.to_le_bytes());
+                for value in [0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0] {
+                    bytes.extend(value.to_le_bytes());
+                }
+                bytes.extend([0u8; 12]);
+                bytes.extend(scale.to_le_bytes());
+                bytes.extend(0.0f32.to_le_bytes());
+            }
+            bytes.extend((apps.len() as u32).to_le_bytes());
+            for &(name, bone, mesh) in apps {
+                push_str(&mut bytes, name);
+                bytes.extend([0u8; 8]);
+                bytes.extend(1u32.to_le_bytes());
+                push_str(&mut bytes, bone);
+                push_str(&mut bytes, mesh);
+                bytes.extend([0u8; 8]);
+            }
+            bytes
+        };
+        let valid_skn = b"xskin-valid\r\n\
+            tex\r\n\
+            1\r\n\
+            HEAD\r\n\
+            1\r\n\
+            0 1 2\r\n\
+            1\r\n\
+            0 0 3 0 0\r\n\
+            3\r\n\
+            0 0\r\n\
+            1 0\r\n\
+            0 1\r\n\
+            0\r\n\
+            3\r\n\
+            0 0 0 0 0 1\r\n\
+            1 0 0 0 0 1\r\n\
+            0 1 0 0 0 1\r\n";
+        dir.write(
+            "GameData/Skins/test.bcf",
+            &bcf_with_apps(
+                &[("adult", 1)],
+                &[
+                    ("dup_pelvis_first", "PELVIS", "xskin-valid"),
+                    ("dup_pelvis_first", "HEAD", "xskin-valid"),
+                    ("missing_mesh_head", "HEAD", "xskin-absent"),
+                    ("corrupt_bmf_fallback", "HEAD", "xskin-fallback"),
+                    ("good_head", "HEAD", "xskin-valid"),
+                ],
+            ),
+        );
+        dir.write("GameData/Skins/xskin-valid.skn", valid_skn);
+        dir.write("GameData/Skins/xskin-fallback.bmf", b"not-a-valid-bmf");
+        dir.write("GameData/Skins/xskin-fallback.skn", valid_skn);
+        // Indexed alpha.bcf also defines sibling beta(scale 3) vs beta.bcf beta(scale 4).
+        dir.write(
+            "GameData/Animation/Animation.ndx",
+            &ndx(&[("alpha", "alpha"), ("beta", "beta")], &[]),
+        );
+        dir.write(
+            "GameData/Animation/alpha.bcf",
+            &bcf_with_apps(&[("alpha", 2), ("beta", 3)], &[]),
+        );
+        dir.write(
+            "GameData/Animation/beta.bcf",
+            &bcf_with_apps(&[("beta", 4)], &[]),
+        );
+
+        let iff_person = |guid: u32, rows: &[&[u8]]| {
+            let mut def = vec![0u8; 216];
+            def[..4].copy_from_slice(&138u32.to_le_bytes());
+            def[18..20].copy_from_slice(&2u16.to_le_bytes());
+            def[28..32].copy_from_slice(&guid.to_le_bytes());
+            def[38..40].copy_from_slice(&200u16.to_le_bytes());
+            let mut data = (rows.len() as u16).to_le_bytes().to_vec();
+            for row in rows {
+                data.push(row.len() as u8);
+                data.extend_from_slice(row);
+            }
+            sims_formats::iff::write(&[
+                sims_formats::iff::ChunkData {
+                    tag: *b"OBJD",
+                    id: 128,
+                    flags: 0,
+                    label: String::new(),
+                    data: def,
+                },
+                sims_formats::iff::ChunkData {
+                    tag: *b"STR#",
+                    id: 200,
+                    flags: 0x10,
+                    label: String::new(),
+                    data,
+                },
+            ])
+            .unwrap()
+        };
+        dir.write(
+            "GameData/Objects/missing.iff",
+            &iff_person(1, &[b"missing", b"", b"good_head,HEAD-HEAD=tex"]),
+        );
+        dir.write(
+            "GameData/Objects/empty.iff",
+            &iff_person(2, &[b"", b"", b"good_head,HEAD-HEAD=tex"]),
+        );
+
+        let install = dir.install();
+        let resources = vec![
+            Resource {
+                mount: 0,
+                path: dir.0.join("GameData/Objects/missing.iff"),
+                member: None,
+            },
+            Resource {
+                mount: 0,
+                path: dir.0.join("GameData/Objects/empty.iff"),
+                member: None,
+            },
+        ];
+        let index = Index {
+            root: dir.0.clone(),
+            mounts: vec![],
+            resources,
+            diagnostics: vec![],
+        };
+        let catalog = Catalog {
+            global: 0,
+            objects: vec![
+                crate::Object {
+                    guid: 1,
+                    resource: 0,
+                    chunk: 128,
+                    kind: 2,
+                    master: 0,
+                },
+                crate::Object {
+                    guid: 2,
+                    resource: 1,
+                    chunk: 128,
+                    kind: 2,
+                    master: 0,
+                },
+            ],
+            by_guid: BTreeMap::from([(1, 0), (2, 1)]),
+            semi_globals: BTreeMap::new(),
+            diagnostics: vec![],
+        };
+
+        // People::load_each succeeds for both missing-rig and empty-row-0 types,
+        // retaining Profile and portrait_head for both!
+        let (people, unresolved) = People::load_each(&install, &index, &catalog, [1, 2]).unwrap();
+        assert!(unresolved.contains_key(&1));
+        assert!(unresolved.contains_key(&2));
+        assert!(people.profiles.contains_key(&1));
+        assert!(people.profiles.contains_key(&2));
+        assert_eq!(people.portrait_head.get(&1), Some(&true));
+        assert_eq!(people.portrait_head.get(&2), Some(&true));
+
+        // Duplicate appearance (first PELVIS wins) and missing mesh are excluded;
+        // corrupt BMF with valid SKN fallback and valid SKN are included.
+        assert!(!people.head_suits.contains("dup_pelvis_first"));
+        assert!(!people.head_suits.contains("missing_mesh_head"));
+        assert!(people.head_suits.contains("corrupt_bmf_fallback"));
+        assert!(people.head_suits.contains("good_head"));
+
+        // Indexed alpha and beta stay unloaded in indexed_skeletons / indexed_catalogs,
+        // preserving alpha.bcf's sibling beta(scale 3) for runtime load order.
+        assert!(!people.skeletons_by_name.contains_key("alpha"));
+        assert!(!people.skeletons_by_name.contains_key("beta"));
+        let alpha_loc = people.indexed_skeletons["alpha"].as_ref().unwrap();
+        assert!(
+            people.indexed_catalogs[alpha_loc]
+                .0
+                .iter()
+                .any(|s| s.name == "beta" && s.scales[s.place] == vec![3])
+        );
     }
 
     #[test]

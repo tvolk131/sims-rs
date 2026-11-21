@@ -227,6 +227,8 @@ pub(crate) fn same_lot(a: &World, b: &World) -> bool {
         && a.generated_portrait_2002 == b.generated_portrait_2002
         && a.made_portrait_head == b.made_portrait_head
         && a.ambiguous_portraits == b.ambiguous_portraits
+        && a.loaded_indexed_skeletons == b.loaded_indexed_skeletons
+        && a.made_outfits == b.made_outfits
 }
 
 impl<'a> Machine<'a, '_> {
@@ -394,6 +396,7 @@ mod tests {
             people: Default::default(),
             icon_frames: None,
             wardrobe: None,
+            ordered_wardrobe: None,
             character_files: Default::default(),
             expansions: 0,
             characters: Default::default(),
@@ -449,6 +452,7 @@ mod tests {
             people: Default::default(),
             icon_frames: None,
             wardrobe: None,
+            ordered_wardrobe: None,
             character_files: Default::default(),
             expansions: 0,
             characters: Default::default(),

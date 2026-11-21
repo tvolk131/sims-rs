@@ -673,6 +673,10 @@ impl Lot {
             Ok(assets) => sims_content::Wardrobe::load(&assets),
             Err(error) => sims_content::Wardrobe::unread(error),
         });
+        program.ordered_wardrobe = match sims_content::ImportWardrobe::load_lenient(&install) {
+            Ok((ordered, errors)) if errors.is_empty() => Some(ordered),
+            _ => None,
+        };
         if let Some(characters) = &characters {
             program.character_files = crate::program::character_files(&index, characters);
         }
@@ -1515,6 +1519,7 @@ mod tests {
                 people: Default::default(),
                 icon_frames: None,
                 wardrobe: None,
+                ordered_wardrobe: None,
                 character_files: Default::default(),
                 expansions: 0,
                 characters: Default::default(),

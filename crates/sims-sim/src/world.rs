@@ -240,6 +240,20 @@ pub struct World {
     /// unchanged; `sims_vm::boot::save::Saved` preserves it across save/restore.
     #[serde(skip)]
     pub ambiguous_portraits: BTreeSet<u32>,
+    /// Lazy `.ndx`-indexed skeletons populated at runtime (`0x5a0384` →
+    /// `0x59f18c`–`0x59f19f` / `0x5a389b`): maps skeleton name to
+    /// `Some(catalog_location)` when loaded directly or filled as a sibling by
+    /// another catalog's load, or `None` when a lazy lookup failed so later
+    /// catalog loads cannot overwrite it. Kept out of [`World::encode`] to
+    /// preserve snapshot format 31; `sims_vm::boot::save::Saved` preserves it.
+    #[serde(skip)]
+    pub loaded_indexed_skeletons: BTreeMap<String, Option<String>>,
+    /// The exact `(body_row, head_row)` strings chosen by `Make New Character`
+    /// (`0x40d183`, `0x40d4e7`, `0x40a5e2`) for runtime-made characters, kept
+    /// out of [`World::characters`] / [`World::encode`] to preserve snapshot
+    /// format 31; `sims_vm::boot::save::Saved` preserves it.
+    #[serde(skip)]
+    pub made_outfits: BTreeMap<u32, (Option<String>, Option<String>)>,
 }
 
 /// Which IFF file holds a portrait bitmap persisted by `0x4e9000`.
@@ -615,6 +629,8 @@ impl World {
             generated_portrait_2002: BTreeSet::new(),
             made_portrait_head: BTreeMap::new(),
             ambiguous_portraits: BTreeSet::new(),
+            loaded_indexed_skeletons: BTreeMap::new(),
+            made_outfits: BTreeMap::new(),
         }
     }
 

@@ -640,6 +640,7 @@ fn mode_1_handles_on_lot_household_and_runtime_made_characters_without_trapping(
     // When a person of that type is already on the lot (0x4e9608), no
     // temporary person is constructed and the portrait is cached.
     let (mut fx, _, _) = visitors();
+    fx.words(SIM_FILE)[102] = 0; // clear synthetic Fixture dummy flags
     fx.world.neighbors.slots.push(Some(Neighbor {
         guid: SIM_GUID,
         id: 2,
@@ -1059,9 +1060,10 @@ fn make_new_character_wardrobe_head_binding_drives_ui_effect_render_and_writebac
     assert!(fx.world.generated_portrait_2002.is_empty());
 
     // 3. Human with mixed head suits (one binds "HEAD", one does not) and
-    // non-HEAD body: UI Effect fails loudly because the pick depends on
-    // unmodeled wardrobe order.
-    let (mut fx, record, _) = setup(
+    // non-HEAD body: Make New Character records the exact picked head/body
+    // entry from the RNG draws (0x44b151, 0x44b167), so UI Effect reflects
+    // whether THAT chosen suit binds "HEAD" instead of trapping.
+    let (mut fx, record, guid) = setup(
         0,
         TEMPLATE_PERSON,
         &["b001mafit_01", "c001ma_bob", "c002ma_nohead"],
@@ -1072,10 +1074,21 @@ fn make_new_character_wardrobe_head_binding_drives_ui_effect_render_and_writebac
         ],
         &["c001ma_bob"],
     );
-    let res = run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1);
-    assert!(
-        matches!(trap(res), Trap::Unsupported(ref m) if m.contains("0x4e7824")),
-        "mixed wardrobe should fail loudly in UI Effect"
+    let picked_head_is_bob = fx.world.made_outfits[&guid]
+        .1
+        .as_deref()
+        .is_some_and(|r| r.starts_with("c001ma_bob,"));
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
+        Ok(true)
+    );
+    assert_eq!(fx.world.portraits.contains(&guid), picked_head_is_bob);
+    let made_file = fx.world.characters.made[&guid].file;
+    assert_eq!(
+        fx.world
+            .generated_portrait_2002
+            .contains(&PortraitFile::Made(made_file)),
+        picked_head_is_bob
     );
 
     // 4. Pet (species 1, TemplateDog) with all matching dog bodies binding
@@ -1121,23 +1134,78 @@ fn make_new_character_wardrobe_head_binding_drives_ui_effect_render_and_writebac
         "evicted pet portrait should reload BMP_ 2002 written at 0x44b126"
     );
 
-    // 4b. Pet with a MIXED custom pet wardrobe (one HEAD dog body, one
-    // non-HEAD dog body): Make New Character (0x44b126) still succeeds and
-    // returns true (preserving Init/CRT RNG side effects without turning
-    // opcode 19 into a VM fault); only a subsequent UI Effect query that would
-    // observe whether 0x44b126 cached the portrait fails loudly.
-    let (mut fx, record, _) = setup(
-        1,
-        TEMPLATE_DOG,
-        &["b001dog_01", "b002dog_nohead"],
-        &["b001dog_01.bmp", "b002dog_nohead.bmp"],
-        &["b001dog_01"],
-    );
-    let res = run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1);
-    assert!(
-        matches!(trap(res), Trap::Unsupported(ref m) if m.contains("0x4e7824")),
-        "mixed pet wardrobe should defer the trap until UI Effect queries the portrait"
-    );
+    // 4b. Pet with a MIXED custom pet wardrobe and explicit picker index
+    // (`0x44b07e`): index 0 (`b001dog_01`, binds HEAD) caches and persists
+    // BMP_ 2002 immediately at `0x44b126`, while index 1 (`b002dog_nohead`,
+    // no HEAD) leaves portrait uncached and UI Effect succeeds without trapping.
+    for (picker_idx, expect_portrait) in [(0i16, true), (1i16, false)] {
+        let (mut fx, _, _) = visitors();
+        fx.program.expansions = 0xffff;
+        fx.world.rooms.rooms.get_mut(&1).unwrap().occupied = true;
+        let tpl_file = fx.add_type(TEMPLATE_DOG, 2, 4096, 4097);
+        fx.add(
+            tpl_file,
+            4096,
+            tree(vec![
+                assign(scope::MY_DATA, 4, scope::LITERAL, 1, 1),
+                assign(scope::MY_DATA, 42, scope::LITERAL, 2, RETURN_TRUE),
+            ]),
+        );
+        fx.add(
+            tpl_file,
+            4097,
+            tree(vec![
+                assign(scope::PARAMETERS, 0, scope::LITERAL, 10, 1),
+                ins(0, 0, 0, [0; 8]),
+            ]),
+        );
+        equip(&mut fx, TEMPLATE_DOG, "dog", 12);
+        fx.program.people.portrait_head.remove(&TEMPLATE_DOG);
+        fx.program
+            .people
+            .profiles
+            .get_mut(&TEMPLATE_DOG)
+            .unwrap()
+            .tones = vec!["lgt".into()];
+        fx.program.people.head_suits = ["b001dog_01".to_string()].into();
+        fx.program.wardrobe = Some(Wardrobe {
+            suits: ["b001dog_01".to_string(), "b002dog_nohead".to_string()].into(),
+            textures: [
+                "b001dog_01.bmp".to_string(),
+                "b002dog_nohead.bmp".to_string(),
+            ]
+            .into(),
+            errors: BTreeMap::new(),
+        });
+        fx.world.dialogs.declined = picker_idx;
+        fx.add(
+            LAMP_FILE,
+            4098,
+            tree(vec![
+                assign(scope::LOCALS, 0, scope::LITERAL, 0, 1),
+                assign(scope::LOCALS, 1, scope::LITERAL, 27, 2),
+                assign(scope::LOCALS, 2, scope::LITERAL, 0, 3),
+                ins(19, 4, RETURN_FALSE, [0, 1, 2, 1, 0, 0, 0, 0]),
+                assign(scope::GLOBAL, 34, scope::STACK_OBJECT, 0, RETURN_TRUE),
+            ]),
+        );
+        assert_eq!(fx.run_with(LAMP, 4098, 0, &[], 1000), Ok(true));
+        let pet_rec = fx.world.globals[34];
+        let pet_guid = fx.world.neighbors.get(pet_rec).unwrap().guid;
+        let pet_file = fx.world.characters.made[&pet_guid].file;
+        assert_eq!(fx.world.portraits.contains(&pet_guid), expect_portrait);
+        assert_eq!(
+            fx.world
+                .generated_portrait_2002
+                .contains(&PortraitFile::Made(pet_file)),
+            expect_portrait
+        );
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, pet_rec, 1),
+            Ok(true)
+        );
+        assert_eq!(fx.world.portraits.contains(&pet_guid), expect_portrait);
+    }
 
     // 4c. Mixed-wardrobe pet whose placement ALWAYS fails (no valid tile):
     // 0x44b126 removes the pet at 0x4e9706 before reaching 0x4e7824, so
@@ -1854,5 +1922,394 @@ fn dialog_does_not_reload_shared_writeback_when_winning_definition_is_not_a_pers
     assert!(
         !fx.world.portraits.contains(&shared_guid),
         "Dialog must skip 0x4e92a8 when the winning definition is a non-person (0x43639e)"
+    );
+}
+
+#[test]
+fn dialog_reloads_embedded_bmp_2002_and_clones_inherit_session_writeback() {
+    // 1. Clean catalog slot with embedded BMP_ 2002 (library.has_portrait_2002):
+    // Dialog (0x4363d1 -> 0x4e92a8 -> 0x4e9338) caches the portrait directly
+    // without calling the factory, reading a skeleton, or advancing CRT RNG.
+    let (mut fx, file, record) = visitors();
+    fx.program
+        .libraries
+        .get_mut(&file)
+        .unwrap()
+        .has_portrait_2002 = true;
+    fx.add(
+        LAMP_FILE,
+        4096,
+        tree(vec![ins(
+            36,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [0, 0, 0, 0, 0, 0, 0, 5],
+        )]),
+    );
+    let before = fx.world.crt_rng;
+    assert_eq!(fx.run_with(LAMP, 4096, record, &[], 1000), Ok(true));
+    assert!(fx.world.portraits.contains(&WIDGET));
+    assert_eq!(fx.world.crt_rng, before);
+    assert!(fx.world.skeleton_files.is_empty());
+
+    // 2. Writable template acquires BMP_ 2002 via UI Effect earlier in the
+    // session; cloning it with Make New Character (0x42629e) copies that
+    // resource into User%05d.iff, so UI Effect on the clone hits 0x4e9338
+    // without creating a Sim or advancing CRT RNG.
+    const TEMPLATE_PERSON: u32 = 0x7fd9_6b54;
+    let (mut fx, _, _) = visitors();
+    fx.world.rooms.rooms.get_mut(&1).unwrap().occupied = true;
+    let tpl_file = fx.add_type(TEMPLATE_PERSON, 2, 4096, 4097);
+    fx.add(
+        tpl_file,
+        4096,
+        tree(vec![
+            assign(scope::MY_DATA, 4, scope::LITERAL, 1, 1),
+            assign(scope::MY_DATA, 42, scope::LITERAL, 2, RETURN_TRUE),
+        ]),
+    );
+    fx.add(
+        tpl_file,
+        4097,
+        tree(vec![
+            assign(scope::PARAMETERS, 0, scope::LITERAL, 10, 1),
+            ins(0, 0, 0, [0; 8]),
+        ]),
+    );
+    equip(&mut fx, TEMPLATE_PERSON, "adult", 12);
+    let tpl_rec = fx.world.neighbors.slots.len() as i16;
+    fx.program
+        .people
+        .profiles
+        .get_mut(&TEMPLATE_PERSON)
+        .unwrap()
+        .tones = vec!["lgt".into()];
+    fx.program.wardrobe = Some(Wardrobe {
+        suits: ["b001mafit_01".to_string(), "c001ma_bob".to_string()].into(),
+        textures: [
+            "b001mafitlgt_01.bmp".to_string(),
+            "c001malgt_bob.bmp".to_string(),
+        ]
+        .into(),
+        errors: BTreeMap::new(),
+    });
+    // First persist BMP_ 2002 on the writable template via UI Effect.
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, tpl_rec, 1),
+        Ok(true)
+    );
+    assert!(
+        fx.world
+            .generated_portrait_2002
+            .contains(&PortraitFile::Resource(tpl_file))
+    );
+    // Now clone the template via Make New Character.
+    fx.add(
+        LAMP_FILE,
+        4098,
+        tree(vec![
+            assign(scope::LOCALS, 0, scope::LITERAL, 0, 1),
+            assign(scope::LOCALS, 1, scope::LITERAL, 27, 2),
+            assign(scope::LOCALS, 2, scope::LITERAL, 0, 3),
+            ins(19, 4, RETURN_FALSE, [0, 1, 2, 0, 0, 0, 0, 0]),
+            assign(scope::GLOBAL, 34, scope::STACK_OBJECT, 0, RETURN_TRUE),
+        ]),
+    );
+    assert_eq!(fx.run_with(LAMP, 4098, 0, &[], 1000), Ok(true));
+    let clone_rec = fx.world.globals[34];
+    let clone_guid = fx.world.neighbors.get(clone_rec).unwrap().guid;
+    let clone_file = fx.world.characters.made[&clone_guid].file;
+    assert!(
+        fx.world
+            .generated_portrait_2002
+            .contains(&PortraitFile::Made(clone_file))
+    );
+    let crt_before_clone_ui = fx.world.crt_rng;
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, clone_rec, 1),
+        Ok(true)
+    );
+    assert!(fx.world.portraits.contains(&clone_guid));
+    assert_eq!(
+        fx.world.crt_rng, crt_before_clone_ui,
+        "clone should load inherited BMP_ 2002 at 0x4e9338 without rendering"
+    );
+}
+
+#[test]
+fn live_appearance_and_runtime_indexed_skeleton_load_order() {
+    // 1. Runtime-made override whose template had portrait_head removed still
+    // resolves HEAD from the template's retained Profile::head + head_suits.
+    let (mut fx, _, record) = visitors();
+    let mut rig = fx.program.people.skeletons.remove(&WIDGET).unwrap();
+    rig.name = "adult".to_owned();
+    rig.file = "override.bcf".to_owned();
+    fx.program
+        .people
+        .skeletons_by_name
+        .insert("adult".to_owned(), rig);
+    fx.program.people.portrait_head.remove(&WIDGET);
+    fx.program.people.profiles.get_mut(&WIDGET).unwrap().head =
+        Some("c001_head,HEAD-HEAD=texture".into());
+    fx.program.people.head_suits.insert("c001_head".to_owned());
+    let guid = 0x5555_999au32;
+    fx.world.characters.made.insert(
+        guid,
+        sims_sim::characters::Character {
+            template: WIDGET,
+            file: 100,
+            strings: [(sims_sim::characters::SKELETON, "adult".to_owned())].into(),
+        },
+    );
+    fx.world.neighbors.get_mut(record).unwrap().guid = guid;
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
+        Ok(true)
+    );
+    assert!(fx.world.portraits.contains(&guid));
+    assert!(
+        fx.world
+            .generated_portrait_2002
+            .contains(&PortraitFile::Made(100))
+    );
+
+    // 2. Live on-lot appearance (`0x4e7801` -> `0x58a178` -> `0x4e810d`):
+    // - A HEAD accessory makes a non-HEAD Sim renderable.
+    // - Changing outfit to swim (suit 2, row 31 non-HEAD) removes an everyday
+    //   body-only HEAD binding; changing to formal (suit 4, row 30 HEAD) adds one.
+    // - A skeleton with non-empty bones lacking "HEAD" cannot render (`0x595699`).
+    let (mut fx, _, _) = visitors();
+    fx.words(SIM_FILE)[102] = 0; // clear synthetic Fixture dummy flags
+    fx.world.neighbors.slots.push(Some(Neighbor {
+        guid: SIM_GUID,
+        id: 2,
+        data: vec![0; 88],
+        relationships: Vec::new(),
+        friends: 0,
+        revision: 0,
+        stale: false,
+    }));
+    let sim_rec = fx.world.neighbors.slots.len() as i16;
+    fx.program.people.portrait_head.insert(SIM_GUID, false);
+    fx.program.people.head_suits.insert("acc_hat".into());
+    fx.program
+        .people
+        .head_suits
+        .insert("b_everyday_head".into());
+    fx.program.people.head_suits.insert("f_formal_head".into());
+    // Put on HEAD accessory -> renders!
+    fx.world
+        .objects
+        .get_mut(&SIM)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap()
+        .accessories
+        .push(sims_formats::saved_objects::Accessory {
+            name: "acc_hat".into(),
+            binding: String::new(),
+        });
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_rec, 1),
+        Ok(true)
+    );
+    assert!(fx.world.portraits.contains(&SIM_GUID));
+
+    // Take off accessory, configure everyday body=HEAD, head=NONE, swim=nohead, formal=HEAD.
+    fx.world.portraits.remove(&SIM_GUID);
+    fx.world.generated_portrait_2002.clear();
+    fx.world
+        .objects
+        .get_mut(&SIM)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap()
+        .accessories
+        .clear();
+    fx.program.people.profiles.insert(
+        SIM_GUID,
+        sims_content::Profile {
+            body: Some("b_everyday_head,BODY=x".into()),
+            head: Some("NONE".into()),
+            suit_rows: BTreeMap::from([
+                (31, "s_swim_nohead,BODY=x".into()),
+                (30, "f_formal_head,BODY=x".into()),
+            ]),
+            ..Default::default()
+        },
+    );
+    // Swim suit (data[8] = 2) replaces body with s_swim_nohead -> does NOT render!
+    {
+        let p = fx
+            .world
+            .objects
+            .get_mut(&SIM)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap();
+        p.data[65] = 0; // adult human (clear synthetic Fixture dummy gender bits)
+        p.data[58] = 27;
+        p.data[8] = 2;
+    }
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_rec, 1),
+        Ok(true)
+    );
+    assert!(!fx.world.portraits.contains(&SIM_GUID));
+
+    // Formal suit (data[8] = 4) wears f_formal_head -> DOES render!
+    fx.world
+        .objects
+        .get_mut(&SIM)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap()
+        .data[8] = 4;
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_rec, 1),
+        Ok(true)
+    );
+    assert!(fx.world.portraits.contains(&SIM_GUID));
+
+    // Unmodeled costume (data[8] = 10) fails loudly instead of silently diverging.
+    fx.world.portraits.remove(&SIM_GUID);
+    fx.world.generated_portrait_2002.clear();
+    fx.world
+        .objects
+        .get_mut(&SIM)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap()
+        .data[8] = 10;
+    let res = run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_rec, 1);
+    assert!(matches!(trap(res), Trap::Unsupported(ref m) if m.contains("0x58a178")));
+
+    // Skeleton lacking a "HEAD" bone cannot render (`0x595699`).
+    fx.world
+        .objects
+        .get_mut(&SIM)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap()
+        .data[8] = 0;
+    fx.program.people.skeletons.insert(
+        SIM_GUID,
+        sims_content::Skeleton {
+            name: "nohead".into(),
+            file: "nohead.bcf".into(),
+            place: 0,
+            scales: vec![vec![1]],
+            bones: vec![sims_content::Bone {
+                name: "ROOT".into(),
+                parent: None,
+                translation: [0; 3],
+                rotation: [0, 0, 0, 1.0f32.to_bits()],
+                blends: false,
+            }],
+        },
+    );
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_rec, 1),
+        Ok(true)
+    );
+    assert!(!fx.world.portraits.contains(&SIM_GUID));
+
+    // 3. Runtime-ordered lazy `.ndx` skeleton loading (`0x5a0384`, `0x59f19f`):
+    // alpha.bcf defines [alpha(scale 2), beta(scale 3)], beta.bcf defines [beta(scale 4)].
+    // Creating alpha before beta fills beta from alpha.bcf (different file + CRT draws);
+    // creating beta first loads beta.bcf.
+    let setup_indexed = || {
+        let (mut fx, _, _) = visitors();
+        fx.world.rooms.rooms.get_mut(&1).unwrap().occupied = true;
+        fx.program.people.skeletons.remove(&WIDGET);
+        let mk_skel =
+            |name: &str, file: &str, place: usize, scales: Vec<Vec<i32>>| sims_content::Skeleton {
+                name: name.into(),
+                file: file.into(),
+                place,
+                scales,
+                bones: Vec::new(),
+            };
+        fx.program
+            .people
+            .indexed_skeletons
+            .insert("alpha".into(), Ok("alpha.bcf".into()));
+        fx.program
+            .people
+            .indexed_skeletons
+            .insert("beta".into(), Ok("beta.bcf".into()));
+        fx.program.people.indexed_catalogs.insert(
+            "alpha.bcf".into(),
+            (
+                vec![
+                    mk_skel("alpha", "alpha.bcf", 0, vec![vec![2], vec![3]]),
+                    mk_skel("beta", "alpha.bcf", 1, vec![vec![2], vec![3]]),
+                ],
+                None,
+            ),
+        );
+        fx.program.people.indexed_catalogs.insert(
+            "beta.bcf".into(),
+            (vec![mk_skel("beta", "beta.bcf", 0, vec![vec![4]])], None),
+        );
+        for (guid, file, skel_name) in [
+            (0x5555_a001u32, 101, "alpha"),
+            (0x5555_a002u32, 102, "beta"),
+        ] {
+            fx.world.characters.made.insert(
+                guid,
+                sims_sim::characters::Character {
+                    template: WIDGET,
+                    file,
+                    strings: [(sims_sim::characters::SKELETON, skel_name.to_owned())].into(),
+                },
+            );
+            fx.world.neighbors.slots.push(Some(Neighbor {
+                guid,
+                id: file as i16,
+                data: vec![12; 88],
+                relationships: Vec::new(),
+                friends: 0,
+                revision: 1,
+                stale: false,
+            }));
+        }
+        fx
+    };
+    // Order A: alpha then beta -> beta uses alpha.bcf (never reads beta.bcf!).
+    let mut fx_a = setup_indexed();
+    let interp_a = sims_vm::Interpreter::new(&fx_a.program, &fx_a.catalog, fx_a.stream);
+    interp_a
+        .create_person(&mut fx_a.world, 0x5555_a001)
+        .unwrap();
+    interp_a
+        .create_person(&mut fx_a.world, 0x5555_a002)
+        .unwrap();
+    assert!(fx_a.world.skeleton_files.contains("alpha.bcf"));
+    assert!(!fx_a.world.skeleton_files.contains("beta.bcf"));
+    assert_eq!(
+        fx_a.world.loaded_indexed_skeletons.get("beta"),
+        Some(&Some("alpha.bcf".to_owned()))
+    );
+    // Order B: beta then alpha -> beta uses beta.bcf!
+    let mut fx_b = setup_indexed();
+    let interp_b = sims_vm::Interpreter::new(&fx_b.program, &fx_b.catalog, fx_b.stream);
+    interp_b
+        .create_person(&mut fx_b.world, 0x5555_a002)
+        .unwrap();
+    interp_b
+        .create_person(&mut fx_b.world, 0x5555_a001)
+        .unwrap();
+    assert!(fx_b.world.skeleton_files.contains("beta.bcf"));
+    assert!(fx_b.world.skeleton_files.contains("alpha.bcf"));
+    assert_eq!(
+        fx_b.world.loaded_indexed_skeletons.get("beta"),
+        Some(&Some("beta.bcf".to_owned()))
     );
 }

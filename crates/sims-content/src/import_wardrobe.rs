@@ -7,7 +7,8 @@ use sims_formats::avatar::index::{IndexReader, Kind};
 use sims_formats::avatar::read_cmx;
 use sims_formats::far::encode_name;
 use sims_formats::iff::Iff;
-use std::collections::BTreeSet;
+use sims_formats::strings::decode;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Appearance inputs at startup for the Windows CD installation. Load once
@@ -144,6 +145,244 @@ impl ImportWardrobe {
             );
         }
         Ok(Self { suits, textures })
+    }
+
+    /// As [`ImportWardrobe::load`], but skips unreadable FAR archives
+    /// (`0x5ba8d6`) and records corrupt `.cmx`/`.bcf`/`.ndx` catalogs into the
+    /// returned error map instead of failing boot.
+    pub fn load_lenient(install: &Install) -> Result<(Self, BTreeMap<String, String>)> {
+        let AvatarPaths {
+            files,
+            appearance,
+            indexed,
+            texture_paths,
+        } = mount_avatar_paths(install, false)?;
+
+        let mut registry = Table::default();
+        let mut errors = BTreeMap::new();
+        for extension in [b".cmx", b".bcf"] {
+            for (_, source) in resources(&files, &appearance, extension)? {
+                let location = source.location(&install.root);
+                let bytes = match source.read() {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        errors.insert(location, error.to_string());
+                        continue;
+                    }
+                };
+                if extension == b".cmx" {
+                    match read_cmx(&bytes) {
+                        Ok(catalog) => {
+                            for suit in catalog.appearances {
+                                if let Some(name) = encode_name(&suit.name) {
+                                    registry.insert_name(name);
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            errors.insert(location, error.to_string());
+                        }
+                    }
+                } else {
+                    let mut binary = Binary::new(&bytes);
+                    for kind in [Kind::Skeleton, Kind::Appearance] {
+                        let count = match binary.count(kind) {
+                            Ok(Some(count)) => count,
+                            Ok(None) => break,
+                            Err(error) => {
+                                errors.insert(location.clone(), error.to_string());
+                                break;
+                            }
+                        };
+                        let mut failed = false;
+                        for _ in 0..count {
+                            match binary.read(kind) {
+                                Ok(record) => {
+                                    if kind == Kind::Appearance
+                                        && let Some(name) = encode_name(record.name())
+                                    {
+                                        registry.insert_name(name);
+                                    }
+                                }
+                                Err(error) => {
+                                    errors.insert(location.clone(), error.to_string());
+                                    failed = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if failed {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        for (_, source) in resources(&files, &indexed, b".ndx")? {
+            let location = source.location(&install.root);
+            let bytes = match source.read() {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    errors.insert(location, error.to_string());
+                    continue;
+                }
+            };
+            for entry in IndexReader::new(&bytes) {
+                match entry {
+                    Ok(entry) if entry.kind == Kind::Appearance => {
+                        registry.insert_name(entry.name);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        errors.insert(location.clone(), error.to_string());
+                    }
+                }
+            }
+        }
+        let suits = registry
+            .iter()
+            .filter(|name| !name.starts_with(b"suit-"))
+            .map(|name| name[..name.len().min(63)].to_vec())
+            .collect();
+
+        let mut textures = Vec::new();
+        for extension in [b".bmp", b".tga"] {
+            textures.extend(
+                resources(&files, &texture_paths, extension)?
+                    .into_iter()
+                    .map(|(mut name, _)| {
+                        name.truncate(63);
+                        name
+                    }),
+            );
+        }
+        Ok((Self { suits, textures }, errors))
+    }
+
+    /// Number of human body (`head == false`, `0x409663`) or head
+    /// (`head == true`, `0x40a364`) entries in native wardrobe order.
+    pub fn count(&self, head: bool, female: bool, child: bool, skin: &str) -> usize {
+        let Some(skin_bytes) = encode_name(&skin.to_ascii_lowercase()) else {
+            return 0;
+        };
+        let (first, length) = if head { (b'c', 6usize) } else { (b'b', 9usize) };
+        let sex = if female { b'f' } else { b'm' };
+        let age = if child { b'c' } else { b'a' };
+        let mut total = 0usize;
+        for suit in &self.suits {
+            if suit.len() < length
+                || !suit[0].eq_ignore_ascii_case(&first)
+                || !(suit[4].eq_ignore_ascii_case(&sex) || suit[4].eq_ignore_ascii_case(&b'u'))
+                || !suit[5].eq_ignore_ascii_case(&age)
+                || (head && suit[1].eq_ignore_ascii_case(&b't'))
+            {
+                continue;
+            }
+            let mut prefix = suit[..length].to_ascii_lowercase();
+            prefix.extend_from_slice(&skin_bytes);
+            total += self
+                .textures
+                .iter()
+                .filter(|t| {
+                    t.len() >= prefix.len() && t[..prefix.len()].eq_ignore_ascii_case(&prefix)
+                })
+                .count();
+        }
+        total
+    }
+
+    /// Picks the `index`-th human body (`head == false`) or head (`head == true`)
+    /// entry in native `0x409255`/`0x40895a` order, returning
+    /// `(suit_name_63_lower, formatted_row)`.
+    pub fn pick(
+        &self,
+        head: bool,
+        female: bool,
+        child: bool,
+        skin: &str,
+        mut index: usize,
+    ) -> Option<(String, String)> {
+        let skin_bytes = encode_name(&skin.to_ascii_lowercase())?;
+        let (first, length, tag) = if head {
+            (b'c', 6usize, "HEAD-HEAD")
+        } else {
+            (b'b', 9usize, "BODY")
+        };
+        let sex = if female { b'f' } else { b'm' };
+        let age = if child { b'c' } else { b'a' };
+        for suit in &self.suits {
+            if suit.len() < length
+                || !suit[0].eq_ignore_ascii_case(&first)
+                || !(suit[4].eq_ignore_ascii_case(&sex) || suit[4].eq_ignore_ascii_case(&b'u'))
+                || !suit[5].eq_ignore_ascii_case(&age)
+                || (head && suit[1].eq_ignore_ascii_case(&b't'))
+            {
+                continue;
+            }
+            let mut prefix = suit[..length].to_ascii_lowercase();
+            prefix.extend_from_slice(&skin_bytes);
+            for tex in &self.textures {
+                if tex.len() >= prefix.len() && tex[..prefix.len()].eq_ignore_ascii_case(&prefix) {
+                    if index == 0 {
+                        let suit_str = decode(suit, 1).to_ascii_lowercase();
+                        let tex_str = decode(tex, 1);
+                        let row = format!("{suit_str},{tag}={tex_str}");
+                        return Some((suit_str, row));
+                    }
+                    index -= 1;
+                }
+            }
+        }
+        None
+    }
+
+    /// Number of pet body entries (`0x409663`) in native wardrobe order.
+    pub fn count_pet(&self, cat: bool) -> usize {
+        let species = if cat { b"cat" } else { b"dog" };
+        let mut total = 0usize;
+        for suit in &self.suits {
+            if suit.len() < 7
+                || !suit[0].eq_ignore_ascii_case(&b'b')
+                || !suit[4..7].eq_ignore_ascii_case(species)
+            {
+                continue;
+            }
+            let prefix = &suit[..7];
+            total += self
+                .textures
+                .iter()
+                .filter(|t| t.len() >= 7 && t[..7].eq_ignore_ascii_case(prefix))
+                .count();
+        }
+        total
+    }
+
+    /// Picks the `index`-th pet body entry (`0x409663`) in native
+    /// `0x409255`/`0x40895a` order, returning
+    /// `(suit_name_63_lower, formatted_row)`.
+    pub fn pick_pet(&self, cat: bool, mut index: usize) -> Option<(String, String)> {
+        let species = if cat { b"cat" } else { b"dog" };
+        for suit in &self.suits {
+            if suit.len() < 7
+                || !suit[0].eq_ignore_ascii_case(&b'b')
+                || !suit[4..7].eq_ignore_ascii_case(species)
+            {
+                continue;
+            }
+            let prefix = &suit[..7];
+            for tex in &self.textures {
+                if tex.len() >= 7 && tex[..7].eq_ignore_ascii_case(prefix) {
+                    if index == 0 {
+                        let suit_str = decode(suit, 1).to_ascii_lowercase();
+                        let tex_str = decode(tex, 1);
+                        let row = format!("{suit_str},BODY={tex_str}");
+                        return Some((suit_str, row));
+                    }
+                    index -= 1;
+                }
+            }
+        }
+        None
     }
 }
 

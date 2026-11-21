@@ -35,11 +35,12 @@ use std::collections::{BTreeMap, BTreeSet};
 /// by [`sims_sim::SNAPSHOT_FORMAT`], which is written too. A save of
 /// another version is refused, not migrated. Layout 2 keeps each pending
 /// dialog answer's bitmap ID ([`crate::Answer`]); layout 3 keeps the
-/// house view's centre; layout 7 keeps [`World::dirty_portraits`],
+/// house view's centre; layout 8 keeps [`World::dirty_portraits`],
 /// [`World::generated_portrait_2002`] keyed by [`PortraitFile`],
-/// [`World::made_portrait_head`], and [`World::ambiguous_portraits`]
-/// (superseding pre-merge layouts 4–6).
-pub const FORMAT: u32 = 7;
+/// [`World::made_portrait_head`], [`World::ambiguous_portraits`],
+/// [`World::loaded_indexed_skeletons`], and [`World::made_outfits`]
+/// (superseding pre-merge layouts 4–7).
+pub const FORMAT: u32 = 8;
 
 /// A lot as it stood between two steps ([`Lot::save`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,15 +57,18 @@ pub struct Saved {
     loaded: [u8; 32],
     /// Format 3 on.
     view_centre: Option<[i8; 2]>,
-    /// Format 7 on: portrait dirty flags (`0x4e895e`), generated `BMP_` 2002
+    /// Format 8 on: portrait dirty flags (`0x4e895e`), generated `BMP_` 2002
     /// writebacks (`0x4e9000`), runtime-made character `"HEAD"` binding
-    /// outcomes (`0x4e7824`), and ambiguous `0x44b126` pet renders, which
-    /// [`World::encode`] omits to keep snapshot format 31's wire bytes
+    /// outcomes (`0x4e7824`), ambiguous `0x44b126` pet renders, runtime-loaded
+    /// `.ndx` skeletons (`0x5a0384`), and picked Make New Character outfits,
+    /// which [`World::encode`] omits to keep snapshot format 31's wire bytes
     /// unchanged.
     dirty_portraits: BTreeSet<u32>,
     generated_portrait_2002: BTreeSet<PortraitFile>,
     made_portrait_head: BTreeMap<u32, Option<bool>>,
     ambiguous_portraits: BTreeSet<u32>,
+    loaded_indexed_skeletons: BTreeMap<String, Option<String>>,
+    made_outfits: BTreeMap<u32, (Option<String>, Option<String>)>,
 }
 
 /// Why a lot could not be saved or restored.
@@ -147,6 +151,8 @@ impl Saved {
         saved.world.generated_portrait_2002 = saved.generated_portrait_2002.clone();
         saved.world.made_portrait_head = saved.made_portrait_head.clone();
         saved.world.ambiguous_portraits = saved.ambiguous_portraits.clone();
+        saved.world.loaded_indexed_skeletons = saved.loaded_indexed_skeletons.clone();
+        saved.world.made_outfits = saved.made_outfits.clone();
         Ok(saved)
     }
 }
@@ -181,6 +187,8 @@ impl Lot {
             generated_portrait_2002: self.world.generated_portrait_2002.clone(),
             made_portrait_head: self.world.made_portrait_head.clone(),
             ambiguous_portraits: self.world.ambiguous_portraits.clone(),
+            loaded_indexed_skeletons: self.world.loaded_indexed_skeletons.clone(),
+            made_outfits: self.world.made_outfits.clone(),
         })
     }
 
@@ -233,11 +241,23 @@ mod tests {
         world.generated_portrait_2002.insert(PortraitFile::Made(3));
         world.made_portrait_head.insert(0x5555_6666, Some(true));
         world.ambiguous_portraits.insert(0x7777_8888);
+        world
+            .loaded_indexed_skeletons
+            .insert("beta".into(), Some("alpha.bcf".into()));
+        world.made_outfits.insert(
+            0x5555_6666,
+            (
+                Some("b001,BODY=b001".into()),
+                Some("c001,HEAD-HEAD=c001".into()),
+            ),
+        );
         let saved = Saved {
             dirty_portraits: world.dirty_portraits.clone(),
             generated_portrait_2002: world.generated_portrait_2002.clone(),
             made_portrait_head: world.made_portrait_head.clone(),
             ambiguous_portraits: world.ambiguous_portraits.clone(),
+            loaded_indexed_skeletons: world.loaded_indexed_skeletons.clone(),
+            made_outfits: world.made_outfits.clone(),
             world,
             ticks: 1,
             start: 0,
@@ -267,6 +287,20 @@ mod tests {
         assert_eq!(
             decoded.world().ambiguous_portraits,
             BTreeSet::from([0x7777_8888])
+        );
+        assert_eq!(
+            decoded.world().loaded_indexed_skeletons,
+            BTreeMap::from([("beta".to_owned(), Some("alpha.bcf".to_owned()))])
+        );
+        assert_eq!(
+            decoded.world().made_outfits,
+            BTreeMap::from([(
+                0x5555_6666,
+                (
+                    Some("b001,BODY=b001".to_owned()),
+                    Some("c001,HEAD-HEAD=c001".to_owned())
+                )
+            )])
         );
     }
 }

@@ -216,6 +216,89 @@ impl Wardrobe {
             .collect()
     }
 
+    /// Picks the `index`-th human body (`head == false`) or head (`head == true`)
+    /// entry matching [`Wardrobe::count`], returning
+    /// `(suit_name_63, formatted_row)`.
+    pub fn pick(
+        &self,
+        head: bool,
+        female: bool,
+        child: bool,
+        skin: &str,
+        mut index: usize,
+    ) -> Option<(String, String)> {
+        let (first, length, tag) = if head {
+            ('c', 6, "HEAD-HEAD")
+        } else {
+            ('b', 9, "BODY")
+        };
+        let sex = if female { 'f' } else { 'm' };
+        let age = if child { 'c' } else { 'a' };
+        let skin = skin.to_ascii_lowercase();
+        for suit in &self.suits {
+            let chars: Vec<char> = suit.chars().take(length).collect();
+            let matches = chars.len() == length
+                && chars[0] == first
+                && (chars[4] == sex || chars[4] == 'u')
+                && chars[5] == age
+                && !(head && chars[1] == 't');
+            if !matches {
+                continue;
+            }
+            let part: String = chars.into_iter().collect();
+            let prefix = format!("{part}{skin}");
+            for tex in &self.textures {
+                if tex.starts_with(&prefix) {
+                    if index == 0 {
+                        let suit_63: String = suit.chars().take(63).collect();
+                        let stem = tex
+                            .strip_suffix(".bmp")
+                            .or_else(|| tex.strip_suffix(".tga"))
+                            .unwrap_or(tex);
+                        let stem_63: String = stem.chars().take(63).collect();
+                        let row = format!("{suit_63},{tag}={stem_63}");
+                        return Some((suit_63, row));
+                    }
+                    index -= 1;
+                }
+            }
+        }
+        None
+    }
+
+    /// Picks the `index`-th pet body entry matching [`Wardrobe::count_pet`],
+    /// returning `(suit_name_63, formatted_row)`.
+    pub fn pick_pet(&self, cat: bool, mut index: usize) -> Option<(String, String)> {
+        let species = if cat {
+            ['c', 'a', 't']
+        } else {
+            ['d', 'o', 'g']
+        };
+        for suit in &self.suits {
+            let chars: Vec<char> = suit.chars().take(7).collect();
+            if !(chars.len() == 7 && chars[0] == 'b' && chars[4..7] == species) {
+                continue;
+            }
+            let prefix: String = chars.into_iter().collect();
+            for tex in &self.textures {
+                if tex.starts_with(&prefix) {
+                    if index == 0 {
+                        let suit_63: String = suit.chars().take(63).collect();
+                        let stem = tex
+                            .strip_suffix(".bmp")
+                            .or_else(|| tex.strip_suffix(".tga"))
+                            .unwrap_or(tex);
+                        let stem_63: String = stem.chars().take(63).collect();
+                        let row = format!("{suit_63},BODY={stem_63}");
+                        return Some((suit_63, row));
+                    }
+                    index -= 1;
+                }
+            }
+        }
+        None
+    }
+
     /// Parses a `STR# 200` body (`head == false`, `0x40d0a4`) or head
     /// (`head == true`, `0x40d408`) outfit row under `0x472ec4` → `0x5874ca`
     /// (255-char row buffer at `0x587511`–`0x58752c`, strip `;...`, split on

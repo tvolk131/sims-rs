@@ -104,8 +104,33 @@ impl Interpreter<'_> {
             at: None,
             trap,
         };
-        let skeleton =
-            crate::people::skeleton(&self.program.people, world, guid).map_err(|t| fail(0, t))?;
+        let early_name = self.early_skeleton_name(world, guid).map(str::to_owned);
+        if !pets_allowed(self.program.expansions)
+            && early_name.as_deref().is_some_and(|name| {
+                ["dog", "kat"]
+                    .iter()
+                    .any(|pet| name.eq_ignore_ascii_case(pet))
+            })
+        {
+            return Err(fail(
+                0,
+                Trap::Unsupported(format!(
+                    "0x440dd5: the person type 0x{guid:08X} is a pet ({:?}) and the \
+                     installed-expansions mask 0x{:04X} has neither Unleashed (0x20) nor \
+                     Makin' Magic (0x80), so the factory makes no person; what its caller does \
+                     then is not ported",
+                    early_name.as_deref().unwrap_or(""),
+                    self.program.expansions
+                )),
+            ));
+        }
+        let skeleton = crate::people::resolve_skeleton(
+            &self.program.people,
+            world,
+            guid,
+            early_name.as_deref(),
+        )
+        .map_err(|t| fail(0, t))?;
         if !pets_allowed(self.program.expansions)
             && ["dog", "kat"]
                 .iter()
@@ -189,9 +214,9 @@ impl Interpreter<'_> {
         // runtime-made and catalog pets before constructing cXPerson or
         // loading the skeleton, and 0x58833c binds that same loader-ordered
         // skeleton name.
-        let early_name = self.early_skeleton_name(world, guid);
+        let early_name = self.early_skeleton_name(world, guid).map(str::to_owned);
         if !pets_allowed(self.program.expansions)
-            && early_name.is_some_and(|name| {
+            && early_name.as_deref().is_some_and(|name| {
                 ["dog", "kat"]
                     .iter()
                     .any(|pet| name.eq_ignore_ascii_case(pet))
@@ -199,43 +224,15 @@ impl Interpreter<'_> {
         {
             return Ok(None);
         }
-        let template = world.characters.definition(guid);
         // 0x58833c -> 0x5a0384 -> 0x5a280f resolves skeleton names with
-        // byte-exact comparison (distinct "adult" and "Adult" rigs do not
-        // alias).
-        let skeleton = match early_name {
-            Some(name)
-                if self
-                    .program
-                    .people
-                    .skeletons
-                    .get(&template)
-                    .is_none_or(|s| s.name != name) =>
-            {
-                self.program
-                    .people
-                    .skeletons_by_name
-                    .get(name)
-                    .or_else(|| {
-                        self.program
-                            .people
-                            .skeletons
-                            .values()
-                            .find(|s| s.name == name)
-                    })
-                    .ok_or_else(|| {
-                        fail(
-                            0,
-                            Trap::Unsupported(format!(
-                                "no person type's skeleton is named {name:?}, which the person \
-                                 type 0x{guid:08X} names"
-                            )),
-                        )
-                    })?
-            }
-            _ => crate::people::skeleton(&self.program.people, world, guid)
-                .map_err(|t| fail(0, t))?,
-        };
+        // byte-exact comparison and runtime-ordered lazy `.ndx` catalog loads.
+        let skeleton = crate::people::resolve_skeleton(
+            &self.program.people,
+            world,
+            guid,
+            early_name.as_deref(),
+        )
+        .map_err(|t| fail(0, t))?;
         if early_name.is_none()
             && !pets_allowed(self.program.expansions)
             && ["dog", "kat"]
