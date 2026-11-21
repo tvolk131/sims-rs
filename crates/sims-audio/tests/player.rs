@@ -6149,3 +6149,85 @@ fn kill_trk_sees_caller_same_block_duckpri_update_during_refresh() {
     );
     assert!(player2.faults.is_empty(), "{:?}", player2.faults);
 }
+
+#[test]
+fn non_streamed_note_on_keeps_latched_gain_across_target_while_streamed_refreshes() {
+    // `0x57f601..0x57f618`: `note_on` refreshes gains/pitch through `target`
+    // only when the patch's `IsStreamed` flag (register 38) is set; a
+    // non-streamed patch keeps the voice's latched gains from fresh start.
+    let mut zero_11 = loadl(53, 11);
+    zero_11.extend(loadl(19, 0));
+    zero_11.push(END);
+
+    let mut target_then_note = loadl(53, 11); // target stopped 11 (EXTVOL=0)
+    target_then_note.extend(NOTE_ON_V1);
+    target_then_note.extend([SET_LOOP, LOOP]);
+
+    let (hit, addresses) = assemble(&[&target_then_note, &[END], &zero_11]);
+    // Patch 1: IsStreamed = 0; Patch 2: IsStreamed = 1 (second flag after path);
+    // Patch 3: IsStreamed = 1 in HOT, but path contains "sounddata\\" so 0x57b5d1 clears it.
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         0x102={:#x}\n\
+         [Patch]\n\
+         1=0,mem,\"one.xa\",0,0,0,0,0\n\
+         2=0,stream,\"stream.xa\",0,1,0,0,0\n\
+         3=0,sd,\"SoundData\\sd.xa\",0,1,0,0,0\n\
+         [Track]\n\
+         10=0,mem_trk,1024,0,0,1,0,0x100,1\n\
+         11=0,stopped,1024,0,0,1,0,0x101,1\n\
+         12=0,zero,1024,0,0,0,0,0x102,1\n\
+         13=0,stream_trk,1024,0,0,1,0,0x100,2\n\
+         14=0,sd_trk,1024,0,0,1,0,0x100,3\n\
+         [EventMapping]\n\
+         mem=1,10\n\
+         zero=1,12\n\
+         stream=1,13\n\
+         sd=1,14\n",
+        addresses[0], addresses[1], addresses[2]
+    );
+    let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+    let mut map = long_sample("one.xa");
+    map.insert(
+        "stream.xa".to_owned(),
+        Pcm {
+            rate: RATE,
+            channels: 1,
+            samples: vec![10_000; 20 * BLOCK],
+        },
+    );
+    map.insert(
+        "SoundData\\sd.xa".to_owned(),
+        Pcm {
+            rate: RATE,
+            channels: 1,
+            samples: vec![10_000; 20 * BLOCK],
+        },
+    );
+    let mut player = Player::new(vec![module], map, 1);
+
+    play(&mut player, "zero");
+    player.render(BLOCK, &NoSources);
+
+    // Non-streamed patch 1 keeps its fresh-start latched gain (10_000).
+    play(&mut player, "mem");
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    player.handle(&SoundEvent::StopAll, &NoSources);
+
+    // Streamed patch 2 refreshes through target 11 (EXTVOL=0) -> silent.
+    play(&mut player, "zero");
+    player.render(BLOCK, &NoSources);
+    play(&mut player, "stream");
+    assert!(player.render(BLOCK, &NoSources).iter().all(|&s| s == 0));
+    player.handle(&SoundEvent::StopAll, &NoSources);
+
+    // Patch 3 has "SoundData\\" in its path, so 0x57b5d1 clears IsStreamed -> 10_000.
+    play(&mut player, "zero");
+    player.render(BLOCK, &NoSources);
+    play(&mut player, "sd");
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}

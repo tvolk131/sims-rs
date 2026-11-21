@@ -558,6 +558,12 @@ struct Thread {
     /// threads run in this order, from the next block. A fresh start and
     /// a let-go put it last (0x57dc9a, 0x57d017).
     order: i64,
+    /// *(code)* The voice's latched stereo gains (`0x57f759`) and pitch step
+    /// (`0x57f71d`), initialized on fresh start / `PATCH` write and updated
+    /// on level/pan/pitch/group/ducking refreshes. Non-streamed `note_on`
+    /// (`0x57f601..0x57f60d`) reuses these without re-reading through `target`.
+    latched_gains: [i32; 2],
+    latched_step: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -714,18 +720,33 @@ fn registration_order(modules: &[Module]) -> Vec<usize> {
 /// expansions', with numbers their allocator hands out without looking
 /// at the registry (0x57d386): one replaces a base game object of its
 /// number, and an expansion's or a download's replaces it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PatchMeta {
+    registrant: Registrant,
+    path: String,
+    is_streamed: bool,
+}
+
 fn owners(
     modules: &[Module],
     station_patches: &[(u32, String)],
-) -> (BTreeMap<u32, usize>, BTreeMap<u32, (Registrant, String)>) {
+) -> (BTreeMap<u32, usize>, BTreeMap<u32, PatchMeta>) {
     let mut tracks = BTreeMap::new();
     let mut patches = BTreeMap::new();
     let mut stations = Some(station_patches);
     let add_stations = |tracks: &mut BTreeMap<u32, usize>,
-                        patches: &mut BTreeMap<u32, (Registrant, String)>,
+                        patches: &mut BTreeMap<u32, PatchMeta>,
                         stations: &mut Option<&[(u32, String)]>| {
         for (at, (id, path)) in stations.take().into_iter().flatten().enumerate() {
-            patches.insert(*id, (Registrant::Station(at), path.clone()));
+            // *(code)* 0x5750b8..0x5750c5: station patches pass IsStreamed = 0.
+            patches.insert(
+                *id,
+                PatchMeta {
+                    registrant: Registrant::Station(at),
+                    path: path.clone(),
+                    is_streamed: false,
+                },
+            );
             tracks.remove(id);
         }
     };
@@ -741,7 +762,15 @@ fn owners(
                     patches.remove(&id);
                 }
                 Object::Patch => {
-                    patches.insert(id, (Registrant::Module(m), hot.patches[&id].path.clone()));
+                    let patch = &hot.patches[&id];
+                    patches.insert(
+                        id,
+                        PatchMeta {
+                            registrant: Registrant::Module(m),
+                            path: patch.path.clone(),
+                            is_streamed: patch.is_streamed,
+                        },
+                    );
                     tracks.remove(&id);
                 }
             }
@@ -840,10 +869,10 @@ enum Flow {
 pub struct Player<S> {
     modules: Vec<Module>,
     samples: S,
-    /// Patch ID to (registrant, path): whose line registered it last
-    /// ([`owners`]). An ID whose last line is
-    /// a track's is not here.
-    patches: BTreeMap<u32, (Registrant, String)>,
+    /// Patch ID to metadata: whose line registered it last ([`owners`]), its
+    /// sample path, and its `IsStreamed` flag. An ID whose last line is a
+    /// track's is not here.
+    patches: BTreeMap<u32, PatchMeta>,
     /// Track ID to the module whose line registered it last
     /// ([`owners`]): the module every start of the track runs from. An ID
     /// whose last line is a patch's is not here.
@@ -1099,6 +1128,11 @@ impl<S: Samples> Player<S> {
             .iter()
             .map(|t| (t.id, self.levels(t).gains))
             .collect();
+        for thread in &mut self.threads {
+            if let Some(&gains) = gains.get(&thread.id) {
+                thread.latched_gains = gains;
+            }
+        }
         for note in &mut self.notes {
             if let Some(&gains) = gains.get(&note.thread) {
                 note.gains = gains;
@@ -1266,9 +1300,12 @@ impl<S: Samples> Player<S> {
             place_itself(&mut self.threads[at], vol, pan);
             let thread = self.threads[at].clone();
             let levels = self.levels(&thread);
+            let rate_step = step(levels.rate);
+            self.threads[at].latched_gains = levels.gains;
+            self.threads[at].latched_step = rate_step;
             for note in self.notes.iter_mut().filter(|n| n.thread == thread.id) {
                 note.gains = levels.gains;
-                note.step = step(levels.rate);
+                note.step = rate_step;
             }
         } else {
             self.write_stopped(track, EXTVOL, vol);
@@ -1957,11 +1994,16 @@ impl<S: Samples> Player<S> {
         };
         if let Some(thread) = self.threads.iter_mut().find(|t| t.id == target_id) {
             place_itself(thread, vol, pan);
-            let thread = thread.clone();
-            let levels = self.levels(&thread);
+            let snapshot = thread.clone();
+            let levels = self.levels(&snapshot);
+            let rate_step = step(levels.rate);
+            if let Some(slot) = self.threads.iter_mut().find(|t| t.id == target_id) {
+                slot.latched_gains = levels.gains;
+                slot.latched_step = rate_step;
+            }
             for note in self.notes.iter_mut().filter(|n| n.thread == target_id) {
                 note.gains = levels.gains;
-                note.step = step(levels.rate);
+                note.step = rate_step;
             }
         }
     }
@@ -2517,9 +2559,12 @@ impl<S: Samples> Player<S> {
                     self.chain(note, track, patch);
                 } else {
                     self.write_at(at, PATCH, patch as i32);
-                    let thread = self.threads[at].clone();
-                    let id = self.note_on(&thread);
-                    self.threads[at].last_note = id;
+                    let mut thread = self.threads[at].clone();
+                    let id = self.note_on(&mut thread);
+                    thread.last_note = id;
+                    if let Some(slot) = self.threads.iter_mut().find(|t| t.id == thread.id) {
+                        *slot = thread;
+                    }
                 }
             }
             None => {
@@ -2537,7 +2582,7 @@ impl<S: Samples> Player<S> {
                     // keeps `patch` even after the sample finishes.
                     self.write_stopped(track, PATCH, patch as i32);
                     let registers = self.stopped.get(&track).copied().unwrap_or(fresh);
-                    let thread = Thread {
+                    let mut thread = Thread {
                         id: 0,
                         module: place.0,
                         track,
@@ -2553,8 +2598,10 @@ impl<S: Samples> Player<S> {
                         target: Target::Own,
                         kill_after_fade: false,
                         order: 0,
+                        latched_gains: [0; 2],
+                        latched_step: step(RATE),
                     };
-                    self.note_on(&thread);
+                    self.note_on(&mut thread);
                     self.idle.insert(track, thread);
                 }
             }
@@ -2710,7 +2757,8 @@ impl<S: Samples> Player<S> {
         true
     }
 
-    /// The levels a fresh start sets on thread `id` (see below).
+    /// The levels a fresh start sets on thread `id` (see below), plus the
+    /// initial voice gain/pitch latch (`0x57db6e`..`0x57db75`).
     fn set_levels(&mut self, id: u32, args: [u32; 3], track: u32) {
         // *(code)* A fresh start sets the levels from the arguments as the
         // track's `args` field says (0x57db01): `kArgsVolPan` has `extvol`
@@ -2727,12 +2775,18 @@ impl<S: Samples> Player<S> {
             }
             _ => None,
         };
-        let Some((vol, pan)) = levels else {
-            return;
-        };
-        if let Some(thread) = self.threads.iter_mut().find(|t| t.id == id) {
+        if let Some((vol, pan)) = levels
+            && let Some(thread) = self.threads.iter_mut().find(|t| t.id == id)
+        {
             thread.registers[usize::from(EXTVOL)] = vol as i32;
             thread.registers[usize::from(PAN)] = pan as i32;
+        }
+        if let Some(snapshot) = self.threads.iter().find(|t| t.id == id).cloned() {
+            let latched = self.levels(&snapshot);
+            if let Some(thread) = self.threads.iter_mut().find(|t| t.id == id) {
+                thread.latched_gains = latched.gains;
+                thread.latched_step = step(latched.rate);
+            }
         }
     }
 
@@ -2840,6 +2894,8 @@ impl<S: Samples> Player<S> {
             target: Target::Own,
             kill_after_fade: false,
             order: self.last_in_order(),
+            latched_gains: [0; 2],
+            latched_step: step(RATE),
         };
         set_arguments(&mut thread, args);
         // *(code)* A fresh start then writes `isplaying` 1 (0x57dbc5),
@@ -2979,6 +3035,13 @@ impl<S: Samples> Player<S> {
             let update_pitch = r == PITCH;
             if update_gains || update_pitch {
                 let levels = self.levels(&idle);
+                let rate_step = step(levels.rate);
+                if update_gains {
+                    idle.latched_gains = levels.gains;
+                }
+                if update_pitch {
+                    idle.latched_step = rate_step;
+                }
                 for note in self
                     .notes
                     .iter_mut()
@@ -2988,7 +3051,7 @@ impl<S: Samples> Player<S> {
                         note.gains = levels.gains;
                     }
                     if update_pitch {
-                        note.step = step(levels.rate);
+                        note.step = rate_step;
                     }
                 }
             }
@@ -3158,6 +3221,11 @@ impl<S: Samples> Player<S> {
             .filter(|t| group.is_none_or(|g| t.group == g))
             .map(|t| (t.id, self.levels(t).gains))
             .collect();
+        for thread in &mut self.threads {
+            if let Some(&gains) = gains.get(&thread.id) {
+                thread.latched_gains = gains;
+            }
+        }
         for note in &mut self.notes {
             if let Some(&gains) = gains.get(&note.thread) {
                 note.gains = gains;
@@ -3554,8 +3622,19 @@ impl<S: Samples> Player<S> {
             written.registers[usize::from(r)] = value;
             if r == PATCH {
                 // *(code)* 0x57dfe8 → 0x57e040 → 0x57f625: writing `patch`
-                // tears down the track's active voice immediately.
+                // tears down the track's active voice and recreates it with
+                // freshly latched gains and pitch (0x57f6d7..0x57f6de).
+                let snapshot = written.clone();
                 self.notes.retain(|n| n.thread != written_id);
+                let levels = self.levels(&snapshot);
+                let rate_step = step(levels.rate);
+                if dest == Destination::Own {
+                    thread.latched_gains = levels.gains;
+                    thread.latched_step = rate_step;
+                } else if let Some(slot) = self.threads.iter_mut().find(|t| t.id == written_id) {
+                    slot.latched_gains = levels.gains;
+                    slot.latched_step = rate_step;
+                }
                 return;
             }
             // *(code)* 0x57def1..0x57e057: only level/pan registers (`vol`,
@@ -3568,12 +3647,28 @@ impl<S: Samples> Player<S> {
             if update_gains || update_pitch {
                 let snapshot = written.clone();
                 let levels = self.levels(&snapshot);
+                let rate_step = step(levels.rate);
+                if dest == Destination::Own {
+                    if update_gains {
+                        thread.latched_gains = levels.gains;
+                    }
+                    if update_pitch {
+                        thread.latched_step = rate_step;
+                    }
+                } else if let Some(slot) = self.threads.iter_mut().find(|t| t.id == written_id) {
+                    if update_gains {
+                        slot.latched_gains = levels.gains;
+                    }
+                    if update_pitch {
+                        slot.latched_step = rate_step;
+                    }
+                }
                 for note in self.notes.iter_mut().filter(|n| n.thread == written_id) {
                     if update_gains {
                         note.gains = levels.gains;
                     }
                     if update_pitch {
-                        note.step = step(levels.rate);
+                        note.step = rate_step;
                     }
                 }
             }
@@ -3606,7 +3701,7 @@ impl<S: Samples> Player<S> {
     /// (see the module notes).
     fn load_patch(&mut self, patch: u32) -> bool {
         if !self.cache.contains_key(&patch) {
-            let pcm = match self.patches.get(&patch).map(|(_, path)| path.clone()) {
+            let pcm = match self.patches.get(&patch).map(|p| p.path.clone()) {
                 Some(path) => {
                     let pcm = self.samples.load(&path);
                     if pcm.is_none() {
@@ -3641,7 +3736,7 @@ impl<S: Samples> Player<S> {
         matches!(self.cache.get(&patch), Some(Some(_)))
     }
 
-    fn note_on(&mut self, thread: &Thread) -> u32 {
+    fn note_on(&mut self, thread: &mut Thread) -> u32 {
         let patch = thread.registers[usize::from(PATCH)] as u32;
         if !self.load_patch(patch) {
             return 0;
@@ -3659,7 +3754,21 @@ impl<S: Samples> Player<S> {
             self.report(format!("patch {patch}: more than {NOTES} notes"));
             return 0;
         }
-        let levels = self.levels(thread);
+        // *(code)* 0x57f601..0x57f618: non-streamed patches play with the
+        // voice's already-latched gains and pitch (set at fresh start /
+        // `PATCH` write / level refreshes), whereas streamed patches
+        // (`IsStreamed != 0`) refresh both through `0x57f759` and `0x57f71d`.
+        // Idle kind-53 voices (`thread.id == 0`) just wrote `PATCH` (0x57e0cc).
+        let is_streamed = self.patches.get(&patch).is_some_and(|p| p.is_streamed);
+        let (gains, rate_step) = if thread.id == 0 || is_streamed {
+            let levels = self.levels(thread);
+            let rate_step = step(levels.rate);
+            thread.latched_gains = levels.gains;
+            thread.latched_step = rate_step;
+            (levels.gains, rate_step)
+        } else {
+            (thread.latched_gains, thread.latched_step)
+        };
         let id = self.id();
         self.notes.push(Note {
             id,
@@ -3667,8 +3776,8 @@ impl<S: Samples> Player<S> {
             track: thread.track,
             patch,
             position: 0,
-            step: step(levels.rate),
-            gains: levels.gains,
+            step: rate_step,
+            gains,
             chain: Vec::new(),
             looping: false,
         });
