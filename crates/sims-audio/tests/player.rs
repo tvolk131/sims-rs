@@ -2922,7 +2922,8 @@ fn seqgroup_kill_ends_a_holder_started_again_in_the_block() {
 #[test]
 fn an_unpause_runs_the_tracks_in_the_order_of_their_numbers() {
     // Track 11 started first, then 10; the unpause lets go of each, in
-    // the order of the original's registry (here, of their numbers).
+    // the order of the original's registry (with so few IDs, of their
+    // numbers).
     let module = module_of_tracks(&[(10, &asks(10, true)), (11, &asks(11, true))], "");
     let mut player = Player::new(vec![module], samples(), 1);
     play(&mut player, "e11");
@@ -2930,4 +2931,37 @@ fn an_unpause_runs_the_tracks_in_the_order_of_their_numbers() {
     assert_eq!(fields_asked_in_order(&mut player), [11, 10]);
     player.handle(&SoundEvent::Unpause, &NoSources);
     assert_eq!(fields_asked_in_order(&mut player), [10, 11]);
+}
+
+#[test]
+fn an_unpause_runs_the_tracks_bucket_by_bucket() {
+    // With three IDs registered the registry has 193 buckets: track 1005
+    // is in bucket 40 and track 719 in 140, so 1005 goes first.
+    let module = module_of_tracks(&[(719, &asks(719, true)), (1005, &asks(1005, true))], "");
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "e719");
+    play(&mut player, "e1005");
+    assert_eq!(fields_asked_in_order(&mut player), [719, 1005]);
+    player.handle(&SoundEvent::Unpause, &NoSources);
+    assert_eq!(fields_asked_in_order(&mut player), [1005, 719]);
+}
+
+#[test]
+fn an_unpause_runs_a_buckets_tracks_newest_registered_first() {
+    // Tracks 5 and 198 share bucket 5; 198, listed after 5, is at its
+    // head. Track 5 started last, so it ran last before the unpause too.
+    let module = module_of_tracks(&[(5, &asks(5, true)), (198, &asks(198, true))], "");
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "e198");
+    play(&mut player, "e5");
+    assert_eq!(fields_asked_in_order(&mut player), [198, 5]);
+    player.handle(&SoundEvent::Unpause, &NoSources);
+    assert_eq!(fields_asked_in_order(&mut player), [198, 5]);
+    // Listed the other way round, 5 goes first.
+    let module = module_of_tracks(&[(198, &asks(198, true)), (5, &asks(5, true))], "");
+    let mut player = Player::new(vec![module], samples(), 1);
+    play(&mut player, "e198");
+    play(&mut player, "e5");
+    player.handle(&SoundEvent::Unpause, &NoSources);
+    assert_eq!(fields_asked_in_order(&mut player), [5, 198]);
 }
