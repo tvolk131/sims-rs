@@ -212,7 +212,7 @@ impl Viewer {
         if let Some(hud) = &mut self.hud
             && hud.covers(point)
         {
-            let (command, changed) = hud.press(point);
+            let (command, changed) = hud.press(point, &self.world);
             if changed {
                 self.dirty = true;
                 if let Some(w) = &self.window {
