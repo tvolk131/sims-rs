@@ -11,7 +11,21 @@ never enter the repository.
 
 ## Scenes
 
-SCENES
+Eight scenes, all with the original paused and the panel's strip closed:
+
+| Scene | Time | Zoom | Rotation | Walls | Shows |
+|---|---|---|---|---|---|
+| `near-r2-0712-bench` | 7:12 AM | near | 2 | down | Mortimer reading on the bench |
+| `near-r2-0805` | 8:05 AM | near | 2 | down | Mortimer by the stairs, Bella on the sofa |
+| `far-r0-cut-0816` | 8:16 AM | far | 0 | cutaway | the whole lot, the school bus and the carpool |
+| `far-r1-cut-0816` | 8:16 AM | far | 1 | cutaway | the whole lot, turned once |
+| `medium-r1-cut-0816` | 8:16 AM | medium | 1 | cutaway | the porch and a Sim on the lawn |
+| `near-r3-down-0816` | 8:16 AM | near | 3 | down | indoors: the kitchen and the bathroom |
+| `near-r0-up-0816` | 8:16 AM | near | 0 | up | the house's side, windows and the stairs |
+| `night-far-r0-cut-2153` | 9:53 PM | far | 0 | cutaway | the lot at night, the house left out |
+
+Each camera origin is the original's scroll position less one in x; every
+8:16 render aligned with its screenshot at a shift of (0, 0).
 
 The 7:12 and 8:05 screenshots are the ones the people comparison already
 used (#282). The others were taken for the ratchet from one run of the
@@ -21,10 +35,15 @@ night scene.
 The live run is not the run our game replays. On the original, the Help
 dialog's No click also opened a "Go Here" pie menu on the lot. It stayed
 listed from 6:54 until a click on the lot dismissed it at about 8:16, and
-the run answered three later notices (two about going downtown, one skill
-point). So where a Sim is, and what it does, can differ from ours for
-reasons other than drawing. The people class of the 8:16 and night scenes
-measures that as well as the drawing.
+the run's notices were answered by hand (two about going downtown and a
+skill point, among others). So where a Sim is, and what it does, can
+differ from ours for reasons other than drawing, and the people class of
+the 8:16 scenes measures that as well as the drawing.
+
+By 9:53 PM the live run had had a kitchen fire that ours does not have.
+The night scene leaves the house out and measures the terrain, trees,
+hedges, gravestones and road under the night's light. A near night scene
+was taken and dropped: the fire filled most of it.
 
 ## Classes
 
@@ -55,7 +74,9 @@ Each scene names its rectangles and why:
 - the panel's pause button, which blinks while paused;
 - the plumb bob, which spins;
 - the fish tank, whose fish swim;
-- the fountain, whose water runs.
+- the fountain, whose water runs;
+- in the night scene, the house (the fire) and the tab over the lot,
+  which shows what the run's selected Sim is doing.
 
 ## Rules
 
