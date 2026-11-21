@@ -64,15 +64,16 @@ pub fn container() -> (Fixture, usize) {
 }
 
 /// Runs the lamp's tree 4096, whose one instruction is Create New Object
-/// Instance of the widget in mode `mode` with `flags`, with the stack
-/// object `stack_object`.
-fn create(
+/// Instance of `guid` in mode `mode` with `flags`, with the stack object
+/// `stack_object`.
+fn create_guid(
     fx: &mut Fixture,
+    guid: u32,
     mode: u8,
     flags: u8,
     stack_object: i16,
 ) -> Result<bool, sims_vm::Fault> {
-    let [g0, g1, g2, g3] = WIDGET.to_le_bytes();
+    let [g0, g1, g2, g3] = guid.to_le_bytes();
     fx.add(
         LAMP_FILE,
         4096,
@@ -84,6 +85,18 @@ fn create(
         )]),
     );
     fx.run_with(LAMP, 4096, stack_object, &[], 1000)
+}
+
+/// Runs the lamp's tree 4096, whose one instruction is Create New Object
+/// Instance of the widget in mode `mode` with `flags`, with the stack
+/// object `stack_object`.
+fn create(
+    fx: &mut Fixture,
+    mode: u8,
+    flags: u8,
+    stack_object: i16,
+) -> Result<bool, sims_vm::Fault> {
+    create_guid(fx, WIDGET, mode, flags, stack_object)
 }
 
 /// The objects there are, in ID order.
@@ -587,47 +600,690 @@ fn flag_0x10_with_no_argument_writes_the_first_local_or_fails_loudly() {
     assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x44e90c")),);
 }
 
+/// Gives the lamp `count` empty container slots at its centre, height 1.
+fn five_slot_container() -> (Fixture, usize) {
+    let (mut fx, file) = container();
+    fx.program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .slots
+        .insert(SLOTS, vec![container_slot(); 5]);
+    let lamp = fx.lamp_mut();
+    let tile = lamp.slots[0].clone();
+    lamp.slots.resize(6, tile);
+    for held in &mut lamp.slots[1..] {
+        held.object = 0;
+    }
+    (fx, file)
+}
+
 #[test]
-fn what_mode_4_does_not_port_fails_loudly() {
-    // Flags other than 0x1, 0x4 and 0x10.
-    for flags in [0x2, 0x8, 0x20, 0x40, 0x21] {
+fn mode_1_puts_the_new_object_in_my_slot_0_like_mode_2() {
+    // 0x44e215: mode 1 sets container = me and leaves slot at its initial 0,
+    // with room filter -5.
+    for room in [1, 0] {
         let (mut fx, _) = container();
-        let result = create(&mut fx, 4, flags, LAMP as i16);
-        assert!(
-            matches!(trap(result), Trap::Unsupported(ref m) if m.contains("mode 4")),
-            "flags {flags:#x}"
-        );
-    }
-    // A person type, and a type that belongs to a group: nothing is made.
-    for (word, value, text) in [(9, 2, "making a person"), (10, 1, "group")] {
-        let (mut fx, file) = container();
-        fx.words(file)[word] = value;
+        fx.lamp_mut().data[29] = room;
         let before = ids(&fx);
-        let result = create(&mut fx, 4, 0, LAMP as i16);
-        assert!(
-            matches!(trap(result), Trap::Unsupported(ref m) if m.contains(text)),
-            "word {word}"
-        );
-        assert_eq!(ids(&fx), before, "word {word}");
+        assert_eq!(create(&mut fx, 1, 0, 0), Ok(true), "room {room}");
+        let id = new_object(&fx, &before);
+        let widget = &fx.world.objects[&id];
+        assert_eq!(widget.position, [40, 40, 1]);
+        assert_eq!((widget.data[2], widget.data[3]), (LAMP as i16, 0));
+        assert_eq!(fx.lamp().slots[1].object, id as i16);
     }
-    // Mode 3 with flag 0x2 or 0x40.
-    for flags in [0x2, 0x40] {
-        let (mut fx, _) = container();
-        let result = create(&mut fx, 3, flags, LAMP as i16);
-        assert!(
-            matches!(trap(result), Trap::Unsupported(ref m) if m.contains("mode 3")),
-            "flags {flags:#x}"
-        );
+}
+
+#[test]
+fn modes_10_and_11_put_the_new_object_in_my_slots_2_and_3() {
+    // 0x44e24d (mode 10 -> slot 2) and 0x44e26e (mode 11 -> slot 3), keeping
+    // room filter -5.
+    for (mode, slot) in [(10u8, 2i16), (11, 3)] {
+        let (mut fx, _) = five_slot_container();
+        fx.lamp_mut().data[29] = 0; // mismatches tile room 1, still ignored
+        let before = ids(&fx);
+        assert_eq!(create(&mut fx, mode, 0, 0), Ok(true), "mode {mode}");
+        let id = new_object(&fx, &before);
+        let widget = &fx.world.objects[&id];
+        assert_eq!(widget.position, [40, 40, 1]);
+        assert_eq!((widget.data[2], widget.data[3]), (LAMP as i16, slot));
+        assert_eq!(fx.lamp().slots[slot as usize + 1].object, id as i16);
     }
-    // The modes not ported.
-    for mode in [1, 7, 10, 15] {
+}
+
+/// A distinct non-person container object ID (`LAMP` = 1 is `self.me`).
+const TABLE: u16 = 3;
+
+/// Gives `TABLE` (a distinct non-person object from `LAMP`) five empty
+/// container slots at tile `(3, 2)` in room 1, while `LAMP` stays at
+/// `(2, 2)` with its own slots untouched.
+fn five_slot_stack_container() -> (Fixture, usize) {
+    let (mut fx, file) = five_slot_container();
+    let mut table = fx.lamp().clone();
+    table.id = TABLE;
+    table.position = [56, 40, 1];
+    table.data[29] = 1;
+    table.slots[0].object = 0;
+    for held in &mut table.slots[1..] {
+        held.object = 0;
+    }
+    fx.world.objects.insert(TABLE, table);
+    fx.world.order.push(TABLE);
+    (fx, file)
+}
+
+#[test]
+fn modes_12_13_and_14_put_the_new_object_in_stack_objects_slots_2_3_and_4() {
+    // 0x44e28f (mode 12 -> slot 2), 0x44e2ce (mode 13 -> slot 3), 0x44e30d
+    // (mode 14 -> slot 4), targeting the stack object (`TABLE`, distinct from
+    // `LAMP` = self.me) and filtered to its room (0x44e3d9).
+    for (mode, slot) in [(12u8, 2i16), (13, 3), (14, 4)] {
+        let (mut fx, _) = five_slot_stack_container();
+        let before = ids(&fx);
+        assert_eq!(
+            create(&mut fx, mode, 0, TABLE as i16),
+            Ok(true),
+            "mode {mode}"
+        );
+        let id = new_object(&fx, &before);
+        let widget = &fx.world.objects[&id];
+        assert_eq!(widget.position, [56, 40, 1]);
+        assert_eq!((widget.data[2], widget.data[3]), (TABLE as i16, slot));
+        assert_eq!(
+            fx.world.objects[&TABLE].slots[slot as usize + 1].object,
+            id as i16
+        );
+        assert!(fx.lamp().slots[1..].iter().all(|s| s.object == 0));
+
+        // Room mismatch on the stack object refuses before creating.
+        let (mut fx, _) = five_slot_stack_container();
+        fx.world.objects.get_mut(&TABLE).unwrap().data[29] = 0;
+        let before = ids(&fx);
+        assert_eq!(
+            create(&mut fx, mode, 0, TABLE as i16),
+            Ok(false),
+            "mode {mode} room mismatch"
+        );
+        assert_eq!(ids(&fx), before);
+
+        // Missing stack object returns false.
+        let (mut fx, _) = five_slot_stack_container();
+        let before = ids(&fx);
+        assert_eq!(create(&mut fx, mode, 0, 77), Ok(false), "mode {mode}");
+        assert_eq!(ids(&fx), before);
+    }
+}
+
+#[test]
+fn mode_7_puts_the_new_object_where_parameter_0_stands() {
+    // 0x44e3fd: reads parameter 0 (native error 8 if frame has 0 params),
+    // ignores operand 6 (local), returns false if parameter 0 names no object.
+    let [g0, g1, g2, g3] = WIDGET.to_le_bytes();
+    let run_mode_7 = |fx: &mut Fixture, arg_count: u8, args: &[i16]| {
+        fx.add(
+            LAMP_FILE,
+            4096,
+            shaped(
+                0x8002,
+                0,
+                arg_count,
+                0,
+                vec![ins(
+                    CREATE,
+                    RETURN_TRUE,
+                    RETURN_FALSE,
+                    [g0, g1, g2, g3, 7, 0, 99, 0],
+                )],
+            ),
+        );
+        fx.run_with(LAMP, 4096, 0, args, 1000)
+    };
+
+    // Valid object in parameter 0: placed at its position and level.
+    let (mut fx, _) = container();
+    fx.sim_mut().position = [56, 40, 1];
+    let before = ids(&fx);
+    assert_eq!(run_mode_7(&mut fx, 1, &[SIM as i16]), Ok(true));
+    let id = new_object(&fx, &before);
+    assert_eq!(fx.world.objects[&id].position, [56, 40, 1]);
+
+    // Missing or zero object ID in parameter 0 returns false, creates nothing.
+    for bad in [0i16, -1, 77] {
         let (mut fx, _) = container();
-        let result = create(&mut fx, mode, 0, LAMP as i16);
+        let before = ids(&fx);
+        assert_eq!(run_mode_7(&mut fx, 1, &[bad]), Ok(false));
+        assert_eq!(ids(&fx), before);
+    }
+
+    // Frame with 0 parameters raises native error 8.
+    let (mut fx, _) = container();
+    assert_eq!(code(run_mode_7(&mut fx, 0, &[])), Some(8));
+}
+
+#[test]
+fn modes_above_14_fall_through_to_origin_and_return_false() {
+    // 0x44e147: unsigned compare > 14 jumps to 0x44e4c5 with pos = [0, 0]
+    // and place_on_lot = true, failing the off-lot check without creating.
+    for mode in [15u8, 16, 128, 255] {
+        let (mut fx, _) = container();
+        let before = ids(&fx);
+        assert_eq!(
+            create(&mut fx, mode, 0, LAMP as i16),
+            Ok(false),
+            "mode {mode}"
+        );
+        assert_eq!(ids(&fx), before, "mode {mode}");
+    }
+}
+
+#[test]
+fn flag_0x40_skips_room_and_wall_checks() {
+    // 0x44e564..0x44e577: flag 0x40 clears both the room filter and the
+    // wall-check facing.
+    // 1. Mode 3 ahead into another room succeeds with 0x40.
+    let (mut fx, _) = container();
+    fx.lamp_mut().data[1] = 6; // tile (1, 2) is in room 0, lamp is in room 1
+    assert_eq!(create(&mut fx, 3, 0, LAMP as i16), Ok(false));
+    let before = ids(&fx);
+    assert_eq!(create(&mut fx, 3, 0x40, LAMP as i16), Ok(true));
+    let id = new_object(&fx, &before);
+    assert_eq!(fx.world.objects[&id].position, [24, 40, 1]);
+
+    // 2. Mode 4 container whose room mismatches its tile succeeds with 0x40.
+    let (mut fx, _) = container();
+    fx.lamp_mut().data[29] = 0; // tile (2, 2) is in room 1
+    assert_eq!(create(&mut fx, 4, 0, LAMP as i16), Ok(false));
+    assert_eq!(create(&mut fx, 4, 0x40, LAMP as i16), Ok(true));
+
+    // 3. Mode 9 onto a tile walled off from me succeeds with 0x40.
+    let (mut fx, _) = container();
+    fx.lamp_mut().data[1] = 0; // tile (2, 1) is walled off from (2, 2)
+    let [g0, g1, g2, g3] = WIDGET.to_le_bytes();
+    fx.add(
+        LAMP_FILE,
+        4096,
+        tree(vec![
+            assign(scope::LOCALS, 0, scope::LITERAL, 0, 1),
+            ins(
+                CREATE,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [g0, g1, g2, g3, 9, 0x40, 0, 0],
+            ),
+        ]),
+    );
+    let before = ids(&fx);
+    assert_eq!(fx.run_with(LAMP, 4096, 0, &[], 1000), Ok(true));
+    let id = new_object(&fx, &before);
+    assert_eq!(fx.world.objects[&id].position, [40, 24, 1]);
+}
+
+#[test]
+fn flag_0x02_passes_me_and_caller_stack_object_to_new_bottom_frame() {
+    // 0x44e87c..0x44e8df: flag 0x02 writes self.me to bottom frame data[0]
+    // and copies the caller's stack_object (before it becomes `created`) into
+    // bottom.stack_object.
+    let (mut fx, _) = container();
+    let before = ids(&fx);
+    assert_eq!(create(&mut fx, 6, 0x02, SIM as i16), Ok(true));
+    let id = new_object(&fx, &before);
+    let bottom = &fx.world.objects[&id].stack[0];
+    assert_eq!(bottom.parameters[0], LAMP as i16);
+    assert_eq!(bottom.stack_object, SIM as i16);
+
+    // With 0 parameters and >= 1 local, writes locals[0] and stack_object.
+    let (mut fx, file) = container();
+    fx.add(
+        file,
+        MAIN,
+        shaped(
+            0x8002,
+            0,
+            0,
+            2,
+            vec![ins(SLEEP, 0, ERROR, [20, 0, 0, 0, 0, 0, 0, 0])],
+        ),
+    );
+    let before = ids(&fx);
+    assert_eq!(create(&mut fx, 6, 0x02, SIM as i16), Ok(true));
+    let id = new_object(&fx, &before);
+    let bottom = &fx.world.objects[&id].stack[0];
+    assert_eq!(bottom.locals, [LAMP as i16, 0]);
+    assert_eq!(bottom.stack_object, SIM as i16);
+
+    // With 0 parameters and 0 locals, fails loudly at 0x44e8d1.
+    let (mut fx, file) = container();
+    fx.add(
+        file,
+        MAIN,
+        shaped(
+            0x8002,
+            0,
+            0,
+            0,
+            vec![ins(SLEEP, 0, ERROR, [20, 0, 0, 0, 0, 0, 0, 0])],
+        ),
+    );
+    let result = create(&mut fx, 6, 0x02, SIM as i16);
+    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x44e8d1")));
+
+    // Combined with flag 0x10: raises native error 0x36 (0x44e88c) AFTER
+    // creation and placement without overwriting the caller's stack object,
+    // and NOT when placement fails early.
+    let (mut fx, _) = container();
+    let before = ids(&fx);
+    assert_eq!(
+        code(create(&mut fx, 5, 0x02 | 0x10, SIM as i16)),
+        Some(0x36)
+    );
+    let id = new_object(&fx, &before);
+    assert_eq!(fx.world.objects[&id].position, [40, 40, 1]);
+    assert_eq!(fx.lamp().stack[0].stack_object, SIM as i16);
+
+    // Combined with 0x04 on a visitor: "init visitor" runs before 0x36, and
+    // if "init visitor" yields (0x44f) or takes an explicit error branch
+    // (0xfd / 0x44c), 0x474aae records CHECK_ERROR (flag 4) on the visitor
+    // and returns to 0x44e87c, so the caller still receives 0x36 (0x44e89c)
+    // and later turns never resume "init visitor".
+    let (mut fx, _, record) = crate::create_person::visitors();
+    let before = ids(&fx);
+    assert_eq!(
+        code(create_guid(&mut fx, 0, 5, 0x04 | 0x02 | 0x10, record)),
+        Some(0x36)
+    );
+    let id = new_object(&fx, &before);
+    assert_eq!(fx.world.objects[&id].position, [40, 40, 1]);
+    assert_eq!(fx.world.globals[36], id as i16);
+    assert_eq!(fx.lamp().stack[0].stack_object, record);
+
+    // Genuine Sleep yield (0x44f): parameter 0 holds 10 ticks, node 2 sleeps
+    // on parameter 0, and node 3 (unreachable after the fault) would write
+    // global 37.
+    let yielding_init_visitor = || {
+        shaped(
+            0x8002,
+            0,
+            1,
+            0,
+            vec![
+                assign(scope::GLOBAL, 36, scope::STACK_OBJECT, 0, 1),
+                assign(scope::PARAMETERS, 0, scope::LITERAL, 10, 2),
+                ins(0, 3, ERROR, [0, 0, 0, 0, 0, 0, 0, 0]),
+                assign(scope::GLOBAL, 37, scope::LITERAL, 99, RETURN_TRUE),
+            ],
+        )
+    };
+    // Confirm the fixture genuinely raises 0x44f (not 0x08) without 0x12.
+    let (mut fx, file, record) = crate::create_person::visitors();
+    fx.add(file, 4099, yielding_init_visitor());
+    let fault = create_guid(&mut fx, 0, 5, 0x04, record).unwrap_err();
+    assert!(
+        matches!(&fault.trap, Trap::Unsupported(m) if m.contains("0x44f")),
+        "{fault}"
+    );
+    // With 0x16, caller receives 0x36 and the visitor is marked CHECK_ERROR
+    // with an empty stack so subsequent turns never execute node 3.
+    let (mut fx, file, record) = crate::create_person::visitors();
+    fx.add(file, 4099, yielding_init_visitor());
+    fx.world.globals[37] = 0;
+    let before = ids(&fx);
+    assert_eq!(
+        code(create_guid(&mut fx, 0, 5, 0x04 | 0x02 | 0x10, record)),
+        Some(0x36)
+    );
+    let id = new_object(&fx, &before);
+    assert_eq!(fx.world.objects[&id].position, [40, 40, 1]);
+    assert_eq!(fx.world.globals[36], id as i16);
+    assert_eq!(fx.lamp().stack[0].stack_object, record);
+    assert_ne!(fx.world.objects[&id].flags() & 4, 0);
+    assert!(fx.world.objects[&id].stack.is_empty());
+    let vm = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    assert!(vm.turn(&mut fx.world, id, 1000).is_err());
+    fx.world.scheduler_cursor = id as i16;
+    let pass = vm.scheduler_pass(
+        &mut fx.world,
+        &crate::tick::tuning(),
+        &mut sims_vm::Update::default(),
+    );
+    assert!(
+        matches!(pass, Err(sims_vm::TickError::Fault(ref f)) if f.object == id && f.to_string().contains("0x46d5da")),
+        "{pass:?}"
+    );
+    assert_ne!(fx.world.objects[&id].flags() & 4, 0);
+    assert_eq!(fx.world.globals[37], 0);
+    // In play mode, the scheduler stops the pass and cleanly resets the
+    // visitor (Recovery::Reset, not Parked) without executing node 3.
+    fx.world.objects.get_mut(&SIM).unwrap().selected = true;
+    fx.world.scheduler_cursor = id as i16;
+    let mut play = sims_vm::play::Play::default();
+    let mut player = sims_vm::Answers::choices(&[]);
+    let (update, result) = vm.lot_update_kept(
+        &mut fx.world,
+        &crate::tick::tuning(),
+        &mut player,
+        Some(&mut play),
+    );
+    assert_eq!(result, Ok(()));
+    assert!(!update.full);
+    assert_eq!(update.errors.len(), 1);
+    assert_eq!(update.errors[0].object, id);
+    assert_eq!(update.errors[0].recovery, sims_vm::play::Recovery::Reset);
+    assert_eq!(fx.world.objects[&id].stack.len(), 1);
+    assert_eq!(fx.world.globals[37], 0);
+
+    // Explicit error branch (0xfd -> native 0x44c) in "init visitor" under
+    // 0x16 also delivers 0x36 to the caller and leaves the visitor unable to
+    // resume node 2.
+    let (mut fx, file, record) = crate::create_person::visitors();
+    fx.add(
+        file,
+        4099,
+        tree(vec![
+            assign(scope::GLOBAL, 36, scope::STACK_OBJECT, 0, 1),
+            ins(
+                2,
+                ERROR,
+                ERROR,
+                expr(scope::LITERAL, 0, op::EQUAL, scope::LITERAL, 0),
+            ),
+            assign(scope::GLOBAL, 37, scope::LITERAL, 99, RETURN_TRUE),
+        ]),
+    );
+    fx.world.globals[37] = 0;
+    let before = ids(&fx);
+    assert_eq!(
+        code(create_guid(&mut fx, 0, 5, 0x04 | 0x02 | 0x10, record)),
+        Some(0x36)
+    );
+    let id = new_object(&fx, &before);
+    assert_eq!(fx.world.objects[&id].position, [40, 40, 1]);
+    assert_eq!(fx.world.globals[36], id as i16);
+    assert_eq!(fx.lamp().stack[0].stack_object, record);
+    assert_ne!(fx.world.objects[&id].flags() & 4, 0);
+    assert!(fx.world.objects[&id].stack.is_empty());
+    let vm = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    assert!(vm.turn(&mut fx.world, id, 1000).is_err());
+    fx.world.scheduler_cursor = id as i16;
+    let pass = vm.scheduler_pass(
+        &mut fx.world,
+        &crate::tick::tuning(),
+        &mut sims_vm::Update::default(),
+    );
+    assert!(
+        matches!(pass, Err(sims_vm::TickError::Fault(ref f)) if f.object == id && f.to_string().contains("0x46d5da")),
+        "{pass:?}"
+    );
+    assert_ne!(fx.world.objects[&id].flags() & 4, 0);
+    assert_eq!(fx.world.globals[37], 0);
+    // In play mode, the scheduler stops the pass and cleanly resets the
+    // visitor (Recovery::Reset, not Parked) without executing node 3.
+    fx.world.objects.get_mut(&SIM).unwrap().selected = true;
+    fx.world.scheduler_cursor = id as i16;
+    let mut play = sims_vm::play::Play::default();
+    let mut player = sims_vm::Answers::choices(&[]);
+    let (update, result) = vm.lot_update_kept(
+        &mut fx.world,
+        &crate::tick::tuning(),
+        &mut player,
+        Some(&mut play),
+    );
+    assert_eq!(result, Ok(()));
+    assert!(!update.full);
+    assert_eq!(update.errors.len(), 1);
+    assert_eq!(update.errors[0].object, id);
+    assert_eq!(update.errors[0].recovery, sims_vm::play::Recovery::Reset);
+    assert_eq!(fx.world.objects[&id].stack.len(), 1);
+    assert_eq!(fx.world.globals[37], 0);
+
+    let (mut fx, _) = container();
+    fx.lamp_mut().position = [-16, -16, 1];
+    assert_eq!(create(&mut fx, 5, 0x02 | 0x10, SIM as i16), Ok(false));
+}
+
+#[test]
+fn container_and_off_lot_modes_honor_flags_0x08_0x20_and_ignore_0x80() {
+    // 0x44e51e: flag 0x08 checks anything_on_tile in every mode (passes off
+    // the lot for mode 6, blocks container mode 4 when the tile is occupied).
+    let (mut fx, _) = container();
+    let before = ids(&fx);
+    assert_eq!(create(&mut fx, 6, 0x08 | 0x80, 0), Ok(true));
+    assert_eq!(ids(&fx).len(), before.len() + 1);
+
+    let (mut fx, _) = container();
+    let before = ids(&fx);
+    assert_eq!(create(&mut fx, 5, 0, 0), Ok(true)); // put a widget on (2, 2)
+    let after_first = ids(&fx);
+    assert_eq!(after_first.len(), before.len() + 1);
+    assert_eq!(create(&mut fx, 4, 0x08, LAMP as i16), Ok(false));
+    assert_eq!(ids(&fx), after_first);
+
+    // 0x44e640: flag 0x20 turns the new object in container modes too.
+    let (mut fx, file) = container();
+    fx.add(
+        file,
+        4096,
+        tree(vec![
+            assign(scope::MY_DATA, 4, scope::LITERAL, 1, 1),
+            assign(scope::MY_DATA, 42, scope::LITERAL, 2, 2),
+            assign(scope::MY_DATA, 23, scope::LITERAL, 2, RETURN_TRUE),
+        ]),
+    );
+    fx.lamp_mut().data[1] = 4;
+    let before = ids(&fx);
+    assert_eq!(create(&mut fx, 4, 0x20 | 0x80, LAMP as i16), Ok(true));
+    let id = new_object(&fx, &before);
+    assert_eq!(fx.world.objects[&id].data[1], 4);
+    assert_eq!(fx.world.objects[&id].data[2], LAMP as i16);
+}
+
+#[test]
+fn mode_4_with_person_or_multitile_group_follows_common_tail() {
+    // A person created in a container slot goes through make_person -> fits_in
+    // -> put (or remove_now if refused).
+    let (mut fx, file) = container();
+    fx.words(file)[9] = 2;
+    crate::person_factory::equip(&mut fx, WIDGET, "widget", 12);
+    let before = ids(&fx);
+    assert_eq!(create(&mut fx, 4, 0, LAMP as i16), Ok(true));
+    let id = new_object(&fx, &before);
+    assert!(fx.world.objects[&id].person.is_some());
+    assert_eq!(fx.world.objects[&id].data[2], LAMP as i16);
+    assert_eq!(fx.lamp().slots[1].object, id as i16);
+
+    // A person without a skeleton still fails cleanly before placement.
+    let (mut fx, file) = container();
+    fx.words(file)[9] = 2;
+    let before = ids(&fx);
+    let result = create(&mut fx, 4, 0, LAMP as i16);
+    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("skeleton")));
+    assert_eq!(ids(&fx), before);
+
+    // A multi-tile group master created in a container slot is refused by
+    // fits_in (0x422ac8) and its whole group is removed, returning false.
+    let (mut fx, _) = container();
+    let _group_file = crate::group_factory::group(&mut fx);
+    let before = ids(&fx);
+    assert_eq!(
+        create_guid(&mut fx, crate::group_factory::MASTER, 4, 0, LAMP as i16),
+        Ok(false)
+    );
+    assert_eq!(ids(&fx), before);
+    assert_eq!(fx.lamp().slots[1].object, 0);
+}
+
+#[test]
+fn container_mode_rereads_container_coordinates_after_init() {
+    // 0x43268c: fits_in rereads the container's current X/Y coordinates after
+    // Init runs. If Init moves the container off the lot (via Find Location
+    // For mode 1), placement is refused and the new object is removed.
+    for (mode, stack_object, container_id) in [
+        (1u8, 0i16, LAMP),
+        (2, 0, LAMP),
+        (4, LAMP as i16, LAMP),
+        (10, 0, LAMP),
+        (12, TABLE as i16, TABLE),
+    ] {
+        let (mut fx, file) = if container_id == TABLE {
+            five_slot_stack_container()
+        } else {
+            five_slot_container()
+        };
+        // Widget Init (tree 4096): set stack_object = container_id and run
+        // Find Location For (opcode 16) mode 1 (take off the lot).
+        fx.add(
+            file,
+            4096,
+            tree(vec![
+                assign(
+                    scope::STACK_OBJECT,
+                    0,
+                    scope::LITERAL,
+                    container_id as i16,
+                    1,
+                ),
+                ins(16, RETURN_TRUE, ERROR, [1, 0, 0, 0, 0, 0, 0, 0]),
+            ]),
+        );
+        let before = ids(&fx);
+        assert_eq!(
+            create(&mut fx, mode, 0, stack_object),
+            Ok(false),
+            "mode {mode}"
+        );
+        assert_eq!(ids(&fx), before, "mode {mode}");
+        assert_eq!(
+            fx.world.objects[&container_id].position,
+            [-16, -16, 1],
+            "mode {mode}"
+        );
         assert!(
-            matches!(trap(result), Trap::Unsupported(ref m) if m.contains(&format!("mode {mode} "))),
+            fx.world.objects[&container_id].slots[1..]
+                .iter()
+                .all(|s| s.object == 0),
             "mode {mode}"
         );
     }
+}
+
+#[test]
+fn native_factory_zero_returns_false_without_creating() {
+    // 0x44e5d8: when the factory makes nothing and returns 0 (0x440b90
+    // non-master group member, 0x440c9b group master with no lead tile,
+    // 0x440dd5 pet without Unleashed/Makin' Magic, or 0x4409f2 ungrouped
+    // types 8 and 9), opcode 42 takes the false branch cleanly.
+    for mode in [5u8, 6] {
+        let (mut fx, _) = container();
+        crate::group_factory::group(&mut fx);
+        let before = ids(&fx);
+        assert_eq!(
+            create_guid(&mut fx, crate::group_factory::ALONG, mode, 0, 0),
+            Ok(false),
+            "0x440b90 mode {mode}"
+        );
+        assert_eq!(ids(&fx), before, "0x440b90 mode {mode}");
+
+        let (mut fx, _) = container();
+        let group_file = crate::group_factory::group(&mut fx);
+        fx.program
+            .libraries
+            .get_mut(&group_file)
+            .unwrap()
+            .definitions
+            .get_mut(&130)
+            .unwrap()[11] = 0x0101;
+        let before = ids(&fx);
+        assert_eq!(
+            create_guid(&mut fx, crate::group_factory::MASTER, mode, 0, 0),
+            Ok(false),
+            "0x440c9b mode {mode}"
+        );
+        assert_eq!(ids(&fx), before, "0x440c9b mode {mode}");
+
+        // 0x440dd5: pet person refused when expansions lack Unleashed (0x20)
+        // and Makin' Magic (0x80).
+        let (mut fx, file) = container();
+        fx.program.expansions = 0;
+        fx.words(file)[9] = 2;
+        crate::person_factory::equip(&mut fx, WIDGET, "dog", 12);
+        let before = ids(&fx);
+        assert_eq!(
+            create(&mut fx, mode, 0, 0),
+            Ok(false),
+            "0x440dd5 mode {mode}"
+        );
+        assert_eq!(ids(&fx), before, "0x440dd5 mode {mode}");
+
+        // 0x4409f2 -> 0x440df3: ungrouped definition types 8 and 9 return 0.
+        for kind in [8i16, 9] {
+            let (mut fx, file) = container();
+            fx.words(file)[9] = kind;
+            let before = ids(&fx);
+            assert_eq!(
+                create(&mut fx, mode, 0, 0),
+                Ok(false),
+                "0x4409f2 kind {kind} mode {mode}"
+            );
+            assert_eq!(ids(&fx), before, "0x4409f2 kind {kind} mode {mode}");
+        }
+    }
+}
+
+#[test]
+fn mode_9_facing_minus_one_skips_wall_check() {
+    // 0x44e1dc -> 0x44e5ae: facing 0 + turn -5 yields (0 - 5 + 4) % 8 == -1,
+    // the wall-check skip sentinel.
+    let (mut fx, _) = container();
+    fx.lamp_mut().data[1] = 0;
+    let before = ids(&fx);
+    assert_eq!(create_in_front(&mut fx, -5), Ok(true));
+    let id = new_object(&fx, &before);
+    assert_eq!(fx.world.objects[&id].position, [40, 40, 1]);
+
+    // On level 3 (which has no wall map), calling closed_directions traps
+    // with Unsupported. Using ALONG (factory returns 0 -> Ok(false)) isolates
+    // the wall check: turn -4 (facing 0) traps, while turn -5 (facing -1)
+    // skips closed_directions and returns Ok(false).
+    let run_level_3 = |turn: i16| {
+        let (mut fx, _) = container();
+        crate::group_factory::group(&mut fx);
+        fx.lamp_mut().position = [40, 40, 3];
+        fx.lamp_mut().data[1] = 0;
+        let [g0, g1, g2, g3] = crate::group_factory::ALONG.to_le_bytes();
+        fx.add(
+            LAMP_FILE,
+            4096,
+            tree(vec![
+                assign(scope::LOCALS, 0, scope::LITERAL, turn, 1),
+                ins(
+                    CREATE,
+                    RETURN_TRUE,
+                    RETURN_FALSE,
+                    [g0, g1, g2, g3, 9, 0, 0, 0],
+                ),
+            ]),
+        );
+        fx.run_with(LAMP, 4096, 0, &[], 1000)
+    };
+    assert!(matches!(trap(run_level_3(-4)), Trap::Unsupported(_)));
+    assert_eq!(run_level_3(-5), Ok(false));
+}
+
+#[test]
+fn flag_0x01_stops_at_first_matching_object_before_malformed_links() {
+    // 0x44e508..0x44e50e: flag 0x01 returns false as soon as it sees an
+    // object of the same type on the tile, without walking past it.
+    let (mut fx, _) = container();
+    let before = ids(&fx);
+    assert_eq!(create(&mut fx, 5, 0, 0), Ok(true));
+    let first = new_object(&fx, &before);
+    // Corrupt the link chain *after* `first` so walking past `first` would
+    // fail with Trap::Invalid (a slot-0 child with no back-link).
+    fx.world.objects.get_mut(&first).unwrap().slots[0].object = SIM as i16;
+    fx.sim_mut().data[26] = 0;
+    let after_first = ids(&fx);
+    assert_eq!(create(&mut fx, 5, NOT_BESIDE_ITS_TYPE, 0), Ok(false));
+    assert_eq!(ids(&fx), after_first);
 }
 
 #[test]
@@ -655,16 +1311,26 @@ fn mode_6_with_flag_0x20_keeps_a_new_object_that_already_faces_right() {
 }
 
 #[test]
-fn what_mode_6_does_not_port_fails_loudly() {
-    // Other flags. (A person, and flag 0x4: `create_person`.)
-    for flags in [0x2, 0x8, 0x40] {
-        let (mut fx, _) = container();
-        let result = create(&mut fx, 6, flags, LAMP as i16);
-        assert!(
-            matches!(trap(result), Trap::Unsupported(ref m) if m.contains("mode 6")),
-            "flags {flags:#x}"
-        );
-    }
+fn mode_6_with_flag_0x02_and_empty_stack_skips_frame_write() {
+    // 0x44e8b2: when the created object has no frames, flag 0x02 skips the
+    // bottom-frame write and still sets the caller's stack_object.
+    let (mut fx, file) = container();
+    // Main returns immediately so the new object's stack is empty after its
+    // first turn!
+    fx.add(
+        file,
+        MAIN,
+        tree(vec![ins(
+            2,
+            RETURN_TRUE,
+            RETURN_TRUE,
+            expr(scope::LITERAL, 0, op::EQUAL, scope::LITERAL, 0),
+        )]),
+    );
+    let before = ids(&fx);
+    assert_eq!(create(&mut fx, 6, 0x02, SIM as i16), Ok(true));
+    let id = new_object(&fx, &before);
+    assert!(fx.world.objects[&id].stack.is_empty());
 }
 
 #[test]
