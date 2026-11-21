@@ -392,13 +392,7 @@ impl Machine<'_, '_> {
             .is_some_and(|file| self.world.generated_portrait_2002.contains(&file));
         if is_person
             && self.in_portrait_table(guid)?
-            && self.portrait_head_status(guid).is_none()
-            && self
-                .world
-                .characters
-                .string(guid, sims_sim::characters::SKELETON)
-                .is_some_and(|s| s.eq_ignore_ascii_case("dog") || s.eq_ignore_ascii_case("kat"))
-            && (self.program.expansions & (0x20 | 0x80) != 0)
+            && self.world.ambiguous_portraits.contains(&guid)
         {
             let _ = self.can_render_portrait(guid)?;
         }

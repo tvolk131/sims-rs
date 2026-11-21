@@ -232,6 +232,14 @@ pub struct World {
     /// across lot save/restore.
     #[serde(skip)]
     pub made_portrait_head: BTreeMap<u32, Option<bool>>,
+    /// Runtime-made pet GUIDs whose immediate `0x44b126` (`0x4e8c5d`) render
+    /// placed the pet and reached `0x4e7824` while [`World::made_portrait_head`]
+    /// was `None`, leaving whether `0x44b126` cached the portrait or wrote
+    /// `BMP_` 2002 unknown until a later `UI Effect` or `Dialog` queries it.
+    /// Kept out of [`World::encode`] so snapshot format 31's wire bytes stay
+    /// unchanged; `sims_vm::boot::save::Saved` preserves it across save/restore.
+    #[serde(skip)]
+    pub ambiguous_portraits: BTreeSet<u32>,
 }
 
 /// Which IFF file holds a portrait bitmap persisted by `0x4e9000`.
@@ -606,6 +614,7 @@ impl World {
             dirty_portraits: BTreeSet::new(),
             generated_portrait_2002: BTreeSet::new(),
             made_portrait_head: BTreeMap::new(),
+            ambiguous_portraits: BTreeSet::new(),
         }
     }
 

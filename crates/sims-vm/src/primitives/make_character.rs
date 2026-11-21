@@ -417,6 +417,7 @@ impl Machine<'_, '_> {
         }
         self.world.characters.made.remove(&guid);
         self.world.made_portrait_head.remove(&guid);
+        self.world.ambiguous_portraits.remove(&guid);
         self.world.neighbors.remove_record(record);
         Ok(())
     }
@@ -644,8 +645,9 @@ impl Machine<'_, '_> {
 
     /// Whether copying `raw` via `0x40d0a4`/`0x40d10b` (body) or
     /// `0x40d408`/`0x40d46f` (head) produces a `"HEAD"`-binding suit on the
-    /// clone: returns `Some(false)` whenever the source suit has no `"HEAD"`
-    /// binding or fails the `0x472f92` wardrobe lookup (writing `""`).
+    /// clone: looks up the matching wardrobe entry first (`0x472f92`) and
+    /// classifies the matched wardrobe suit (`0x40d4d7` → `0x472f41`), NOT the
+    /// raw source suit name (which can carry an extra suffix past byte 63).
     fn copied_outfit_head_status(
         &self,
         raw: Option<&str>,
@@ -654,19 +656,38 @@ impl Machine<'_, '_> {
         child: bool,
         skin: &str,
     ) -> Option<bool> {
-        let suit_status = self.suit_row_head_status(raw);
-        if suit_status == Some(false) {
+        let Some(raw) = raw else {
             return Some(false);
-        }
-        let raw = raw?;
-        let wardrobe = self.program.wardrobe.as_ref()?;
+        };
+        let Some(wardrobe) = self.program.wardrobe.as_ref() else {
+            // Without a wardrobe we can still tell when the row has no valid
+            // `BODY=` / `HEAD-HEAD=` descriptor and could never match.
+            let before_semi = raw.split(';').next().unwrap_or(raw);
+            let tag = if is_head { "head-head=" } else { "body=" };
+            let can_match = before_semi
+                .split_once(',')
+                .is_some_and(|(_, tex)| tex.to_ascii_lowercase().starts_with(tag));
+            return (!can_match).then_some(false);
+        };
         if !wardrobe.errors.is_empty() {
             return None;
         }
-        if wardrobe.contains_outfit(is_head, female, child, skin, raw) {
-            suit_status
-        } else {
+        let matched = wardrobe.matching_outfits(is_head, female, child, skin, raw);
+        if matched.is_empty() {
+            return Some(false);
+        }
+        if matched
+            .iter()
+            .all(|s| self.classify_suit_head(s) == Some(true))
+        {
+            Some(true)
+        } else if matched
+            .iter()
+            .all(|s| self.classify_suit_head(s) == Some(false))
+        {
             Some(false)
+        } else {
+            None
         }
     }
 

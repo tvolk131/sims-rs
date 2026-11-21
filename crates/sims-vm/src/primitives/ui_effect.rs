@@ -157,18 +157,11 @@ impl Machine<'_, '_> {
             self.world.dirty_portraits.remove(&guid);
             return Ok(());
         }
-        // If an earlier Make New Character pet render (0x44b126) ran with an
-        // unknown HEAD binding, whether it already cached the portrait or wrote
-        // BMP_ 2002 depends on unmodeled wardrobe order; fail loudly before
-        // running a second 0x4e8c5d.
-        if self.portrait_head_status(guid).is_none()
-            && self
-                .world
-                .characters
-                .string(guid, sims_sim::characters::SKELETON)
-                .is_some_and(|s| s.eq_ignore_ascii_case("dog") || s.eq_ignore_ascii_case("kat"))
-            && (self.program.expansions & (0x20 | 0x80) != 0)
-        {
+        // If an earlier Make New Character pet render (0x44b126) placed the
+        // pet and reached 0x4e7824 with an unknown HEAD binding, whether it
+        // already cached the portrait or wrote BMP_ 2002 depends on unmodeled
+        // wardrobe order; fail loudly before running a second 0x4e8c5d.
+        if self.world.ambiguous_portraits.contains(&guid) {
             let _ = self.can_render_portrait(guid)?;
         }
         // 0x4e938c: BMP_ 2002 absent or invalid -> call 0x4e8c5d(index, 1, 1)
@@ -367,7 +360,13 @@ impl Machine<'_, '_> {
         });
         if on_lot {
             let can_render = if defer_unknown_head {
-                self.portrait_head_status(guid).unwrap_or(false)
+                match self.portrait_head_status(guid) {
+                    Some(ok) => ok,
+                    None => {
+                        self.world.ambiguous_portraits.insert(guid);
+                        false
+                    }
+                }
             } else {
                 self.can_render_portrait(guid)?
             };
@@ -435,7 +434,13 @@ impl Machine<'_, '_> {
         let can_render = if !placed {
             false
         } else if defer_unknown_head {
-            self.portrait_head_status(guid).unwrap_or(false)
+            match self.portrait_head_status(guid) {
+                Some(ok) => ok,
+                None => {
+                    copy.ambiguous_portraits.insert(guid);
+                    false
+                }
+            }
         } else {
             self.can_render_portrait(guid)?
         };

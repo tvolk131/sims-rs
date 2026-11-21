@@ -62,6 +62,7 @@ pub struct Saved {
     dirty_portraits: BTreeSet<u32>,
     generated_portrait_2002: BTreeSet<PortraitFile>,
     made_portrait_head: BTreeMap<u32, Option<bool>>,
+    ambiguous_portraits: BTreeSet<u32>,
 }
 
 /// Why a lot could not be saved or restored.
@@ -143,6 +144,7 @@ impl Saved {
         saved.world.dirty_portraits = saved.dirty_portraits.clone();
         saved.world.generated_portrait_2002 = saved.generated_portrait_2002.clone();
         saved.world.made_portrait_head = saved.made_portrait_head.clone();
+        saved.world.ambiguous_portraits = saved.ambiguous_portraits.clone();
         Ok(saved)
     }
 }
@@ -176,6 +178,7 @@ impl Lot {
             dirty_portraits: self.world.dirty_portraits.clone(),
             generated_portrait_2002: self.world.generated_portrait_2002.clone(),
             made_portrait_head: self.world.made_portrait_head.clone(),
+            ambiguous_portraits: self.world.ambiguous_portraits.clone(),
         })
     }
 
@@ -227,10 +230,12 @@ mod tests {
             .insert(PortraitFile::Resource(7));
         world.generated_portrait_2002.insert(PortraitFile::Made(3));
         world.made_portrait_head.insert(0x5555_6666, Some(true));
+        world.ambiguous_portraits.insert(0x7777_8888);
         let saved = Saved {
             dirty_portraits: world.dirty_portraits.clone(),
             generated_portrait_2002: world.generated_portrait_2002.clone(),
             made_portrait_head: world.made_portrait_head.clone(),
+            ambiguous_portraits: world.ambiguous_portraits.clone(),
             world,
             ticks: 1,
             start: 0,
@@ -256,6 +261,10 @@ mod tests {
         assert_eq!(
             decoded.world().made_portrait_head,
             BTreeMap::from([(0x5555_6666, Some(true))])
+        );
+        assert_eq!(
+            decoded.world().ambiguous_portraits,
+            BTreeSet::from([0x7777_8888])
         );
     }
 }

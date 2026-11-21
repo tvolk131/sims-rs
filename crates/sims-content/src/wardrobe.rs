@@ -216,40 +216,39 @@ impl Wardrobe {
             .collect()
     }
 
-    /// Whether a `STR# 200` body (`head == false`, `0x40d0a4`) or head
-    /// (`head == true`, `0x40d408`) outfit row matches an entry in the human
-    /// wardrobe list built by `0x409663` / `0x40a364`.
-    ///
-    /// Follows `0x472ec4` → `0x5874ca` (strip `;...`, split on `,`) and
-    /// `0x472f92` → `0x46f874` (ASCII case-insensitive match against
+    /// The distinct suit names from [`Wardrobe::suits`] whose human wardrobe
+    /// entry (`0x409663` body / `0x40a364` head) matches a `STR# 200` outfit
+    /// row (`raw_row`) under `0x472ec4` → `0x5874ca` (strip `;...`, split on
+    /// `,`) and `0x472f92` → `0x46f874` (ASCII case-insensitive match against
     /// `(suit, "BODY=" + stem)` or `(suit, "HEAD-HEAD=" + stem)`), including
     /// the native 64-byte fixed buffers (63 text characters + NUL at
     /// `0x472e7e`, `0x472ed2`, `0x472ee2`, `0x46f79a`).
-    pub fn contains_outfit(
+    pub fn matching_outfits(
         &self,
         head: bool,
         female: bool,
         child: bool,
         skin: &str,
         raw_row: &str,
-    ) -> bool {
+    ) -> Vec<&str> {
         fn trunc63(s: &str) -> String {
             s.chars().take(63).collect()
         }
         let before_semi = raw_row.split(';').next().unwrap_or(raw_row);
         let Some((raw_suit, raw_tex)) = before_semi.split_once(',') else {
-            return false;
+            return Vec::new();
         };
         let row_suit = trunc63(&raw_suit.to_ascii_lowercase());
         let row_tex = trunc63(&raw_tex.to_ascii_lowercase());
         let tag = if head { "head-head=" } else { "body=" };
         if !row_tex.starts_with(tag) {
-            return false;
+            return Vec::new();
         }
         let (first, length) = if head { ('c', 6) } else { ('b', 9) };
         let sex = if female { 'f' } else { 'm' };
         let age = if child { 'c' } else { 'a' };
         let skin = skin.to_ascii_lowercase();
+        let mut matched = Vec::new();
         for suit in &self.suits {
             if trunc63(suit) != row_suit {
                 continue;
@@ -265,22 +264,33 @@ impl Wardrobe {
             }
             let part: String = chars.into_iter().collect();
             let prefix = format!("{part}{skin}");
-            for tex in &self.textures {
-                if !tex.starts_with(&prefix) {
-                    continue;
-                }
-                let Some(stem) = tex
-                    .strip_suffix(".bmp")
-                    .or_else(|| tex.strip_suffix(".tga"))
-                else {
-                    continue;
-                };
-                if trunc63(&format!("{tag}{stem}")) == row_tex {
-                    return true;
-                }
+            if self.textures.iter().any(|tex| {
+                tex.starts_with(&prefix)
+                    && tex
+                        .strip_suffix(".bmp")
+                        .or_else(|| tex.strip_suffix(".tga"))
+                        .is_some_and(|stem| trunc63(&format!("{tag}{stem}")) == row_tex)
+            }) {
+                matched.push(suit.as_str());
             }
         }
-        false
+        matched
+    }
+
+    /// Whether a `STR# 200` body (`head == false`, `0x40d0a4`) or head
+    /// (`head == true`, `0x40d408`) outfit row matches any entry in the human
+    /// wardrobe list built by `0x409663` / `0x40a364`.
+    pub fn contains_outfit(
+        &self,
+        head: bool,
+        female: bool,
+        child: bool,
+        skin: &str,
+        raw_row: &str,
+    ) -> bool {
+        !self
+            .matching_outfits(head, female, child, skin, raw_row)
+            .is_empty()
     }
 }
 

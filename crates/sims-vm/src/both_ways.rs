@@ -226,6 +226,7 @@ pub(crate) fn same_lot(a: &World, b: &World) -> bool {
         && a.dirty_portraits == b.dirty_portraits
         && a.generated_portrait_2002 == b.generated_portrait_2002
         && a.made_portrait_head == b.made_portrait_head
+        && a.ambiguous_portraits == b.ambiguous_portraits
 }
 
 impl<'a> Machine<'a, '_> {
@@ -518,5 +519,10 @@ mod tests {
         d.made_portrait_head.insert(0x1234_5678, Some(true));
         assert_eq!(a.encode(), d.encode(), "made_portrait_head is not encoded");
         assert!(!same_lot(&a, &d));
+
+        let mut e = a.clone();
+        e.ambiguous_portraits.insert(0x1234_5678);
+        assert_eq!(a.encode(), e.encode(), "ambiguous_portraits is not encoded");
+        assert!(!same_lot(&a, &e));
     }
 }
