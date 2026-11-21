@@ -21,7 +21,7 @@ use sims_ui::dialog::{self, Labels, Message};
 use sims_ui::frame::Frame;
 use sims_ui::house;
 use sims_ui::household::{Acquaintances, Careers, Faces, Snapshot};
-use sims_ui::hud::{self, Controls, Item};
+use sims_ui::hud::{self, Controls, Item, Selected};
 use std::path::Path;
 
 pub struct Hud {
@@ -144,10 +144,13 @@ impl Hud {
         canvas: &mut Canvas,
     ) {
         sync_controls(&mut self.controls, world, &view.camera);
-        let mut snapshot = Snapshot::read(world, &self.members).with_careers(&self.careers);
+        let mut snapshot = Snapshot::read(world, &self.members)
+            .with_zoning(world, true, self.known.friendship)
+            .with_careers(&self.careers);
         // The viewer plays no sounds, so a balloon this closes closes
         // silently.
-        self.controls.follow(snapshot.selected_resident().is_some());
+        self.controls
+            .follow(Selected::of(snapshot.selected_resident()));
         // The lookup goes through every neighborhood record, so only
         // while the panel shows it.
         if self.controls.panel == Some(Panel::Relationships) {
@@ -247,9 +250,8 @@ impl Hud {
         let Some(command) = hud::press(&self.items, point) else {
             return (None, false);
         };
-        let selected = Snapshot::read(world, &self.members)
-            .selected_resident()
-            .is_some();
+        let snapshot = Snapshot::read(world, &self.members);
+        let selected = Selected::of(snapshot.selected_resident());
         let command = hud::check_press(command, selected, true);
         if command.changes_simulation() {
             eprintln!("not carried out, the simulation takes no commands yet: {command:?}");
@@ -271,6 +273,10 @@ impl Hud {
             Command::Camera(Camera::Photo) => Some(ViewCommand::Save),
             Command::Camera(Camera::Roof) => {
                 eprintln!("the viewer draws no roofs yet");
+                None
+            }
+            Command::OpenHelp => {
+                eprintln!("the viewer shows no Help System dialog yet");
                 None
             }
             _ => None,

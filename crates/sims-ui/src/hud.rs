@@ -161,6 +161,30 @@ pub const RESOURCES: [i32; 56] = [
     4918,
 ];
 
+/// Half-period of the Live-mode pause button blink in microseconds:
+/// 500 ms (`0x1f4` ms, `0x53b528`, `0x53b71e`).
+pub const PAUSE_BLINK_US: u64 = 500_000;
+
+/// Who of the household is selected, for [`Controls::follow`] and
+/// [`check_press`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Selected {
+    None,
+    Human,
+    Pet,
+}
+
+impl Selected {
+    /// Classifies `resident` as returned by [`Snapshot::selected_resident`].
+    pub fn of(resident: Option<&crate::household::Resident>) -> Self {
+        match resident {
+            None => Self::None,
+            Some(r) if r.pet => Self::Pet,
+            Some(_) => Self::Human,
+        }
+    }
+}
+
 /// What the player has open: state of the presentation, not of the
 /// simulation. The host keeps it and applies the presentation-only
 /// commands to it ([`Controls::apply`]).
@@ -177,6 +201,10 @@ pub struct Controls {
     /// Which speed button is selected (`0x53b0d8..0x53b16b`), or `None` when
     /// the simulation holds an unrecognized speed.
     pub speed: Option<Speed>,
+    /// Whether the Live-mode paused blink is currently on its lit red row
+    /// (row 1 of `id::PAUSE`, toggled every [`PAUSE_BLINK_US`] at
+    /// `0x53b500..0x53b528`; starts `false` on entry at `0x53b707..0x53b74d`).
+    pub pause_lit: bool,
     pub camera: CameraState,
     /// The pointer's position, for the buttons' hover cells.
     pub pointer: Option<[i32; 2]>,
@@ -223,6 +251,7 @@ impl Default for Controls {
             expanded: false,
             panel: Some(Panel::Needs),
             speed: Some(Speed::Normal),
+            pause_lit: false,
             camera: CameraState::default(),
             pointer: None,
             relations: Relations::default(),
@@ -263,21 +292,34 @@ impl Controls {
         }
     }
 
-    /// Follows the selection, as the panel's household notification does
-    /// (0x51ce79): with nobody selected no panel is open (0x51d06e), and
-    /// with someone selected and no panel open the needs open
-    /// (0x51d082). True if that closed the help balloon, which the
-    /// original plays `UI_whoosh` for (0x50fb7f).
+    /// Follows the selection, as the panel's household notification and
+    /// selection refresh do (`0x51ce79`, `0x51c5a6`): with nobody selected
+    /// no panel is open (`0x51d06e`), with someone selected and no panel
+    /// open the needs open (`0x51d082`), and with a pet selected
+    /// (`person.data[65] > 1`, `0x51ce13..0x51ce36`) an open Interests or
+    /// Gifts panel switches to Needs (`0x51d375(1)`). True if that closed
+    /// the help balloon, which the original plays `UI_whoosh` for
+    /// (`0x50fb7f`).
     ///
     /// The original follows the notification. The host calls this before
     /// each layout; that a selection change always sends the
     /// notification is **unverified**.
-    pub fn follow(&mut self, selected: bool) -> bool {
+    pub fn follow(&mut self, selected: Selected) -> bool {
         let help = self.help.is_some();
-        if !selected {
-            self.open(None);
-        } else if self.panel.is_none() {
-            self.open(Some(Panel::Needs));
+        match selected {
+            Selected::None => self.open(None),
+            Selected::Human => {
+                if self.panel.is_none() {
+                    self.open(Some(Panel::Needs));
+                }
+            }
+            Selected::Pet => {
+                if self.panel.is_none()
+                    || matches!(self.panel, Some(Panel::Interests | Panel::Gifts))
+                {
+                    self.open(Some(Panel::Needs));
+                }
+            }
         }
         help && self.help.is_none()
     }
@@ -320,16 +362,18 @@ pub enum Kind {
     /// A cell of a button strip of `cells` cells. A disabled button has
     /// no command.
     Button { id: i32, cells: u32, selected: bool },
-    /// A fixed cell of a button strip of `cells` cells (such as the
-    /// cluster's `?` help button at `0x538f41`, whose click action is not
-    /// yet ported).
+    /// A fixed cell of a button strip of `cells` cells.
     Cell { id: i32, cells: u32, cell: u32 },
     /// The cluster's family-friends count (`[esi + 0x1d0]`, `0x539219`,
     /// `0x4cfcdb`), right-aligned immediately to the left of the
     /// `$9,999,999`-wide funds box ending at `rect.x + rect.width`.
     Friends(i32),
-    /// The pause button: row 1 of its bitmap when paused.
-    Pause { paused: bool },
+    /// The pause button (`id::PAUSE`, 4 columns by 2 rows, `0x538cd8`,
+    /// `0x5e4b0f`): column 0 normal, 1 selected (`paused`), 2 hover,
+    /// 3 disabled (`0x5e3b40`); row 1 when `lit` (toggled every 500 ms
+    /// while paused in live mode at `0x53b500..0x53b528`, or steady row 1
+    /// while paused in non-live modes at `0x53b736..0x53b74d`).
+    Pause { paused: bool, lit: bool },
     /// A resident's portrait.
     Portrait { guid: u32, selected: bool },
     /// Part of a mood bar bitmap.
@@ -603,6 +647,7 @@ pub fn layout(size: [i32; 2], snapshot: &Snapshot, controls: &Controls) -> Vec<I
         rect: at(85, 135, 15, 15),
         kind: Kind::Pause {
             paused: snapshot.paused,
+            lit: snapshot.paused && (controls.mode != Mode::Live || controls.pause_lit),
         },
         command: Some(Command::TogglePause),
     });
@@ -624,17 +669,15 @@ pub fn layout(size: [i32; 2], snapshot: &Snapshot, controls: &Controls) -> Vec<I
         ));
     }
     // 0x538f41..0x538fe6, 0x6f4530: kHelpBtn (4993) at (5, 164), 40x15
-    // four-cell strip (10x15 per cell), enabled (normal cell 0). Clicking
-    // it to open the Help dialog (0x53aaad -> 0x50e8d3) is not yet ported.
-    items.push(Item {
-        rect: at(5, 164, 10, 15),
-        kind: Kind::Cell {
-            id: id::HELP,
-            cells: 4,
-            cell: 0,
-        },
-        command: None,
-    });
+    // four-cell strip (10x15 per cell), enabled; hover draws cell 2 and
+    // click opens the Help System dialog (0x53aaad -> 0x50e8d3).
+    items.push(button(
+        id::HELP,
+        4,
+        at(5, 164, 10, 15),
+        false,
+        Command::OpenHelp,
+    ));
     let text = |rect: Rect, text: String, size: u8, align: Align| Item {
         rect,
         kind: Kind::Text {
@@ -653,22 +696,27 @@ pub fn layout(size: [i32; 2], snapshot: &Snapshot, controls: &Controls) -> Vec<I
         8,
         Align::CenterTrunc,
     ));
-    // Money box ([esi + 0x108], 0x539071..0x53908f): font [0x6f2aec] (10 pt),
-    // right-aligned to 0x6f4590 = 178 at y = 0x6f459c = 158.
-    items.push(text(
-        at(70, 158, 108, 16),
-        snapshot.money(),
-        10,
-        Align::Right,
-    ));
-    // Family friends count ([esi + 0x1d0], 0x539219..0x539346, 0x4cfcdb):
-    // font [0x6f2aec] (10 pt), right-aligned immediately left of the
-    // `$9,999,999`-wide money box ending at x = 178, y = 158.
-    items.push(Item {
-        rect: at(0, 158, 178, 16),
-        kind: Kind::Friends(snapshot.family_friends),
-        command: None,
-    });
+    // 0x4f24fa -> 0x4cfe0a/0x4cfe18 -> 0x53b2a4..0x53b2e1: when global 32
+    // (budget mode) is 1, both the funds box ([esi + 0x108]) and the
+    // family-friends counter ([esi + 0x1d0]) are hidden.
+    if snapshot.show_money {
+        // Money box ([esi + 0x108], 0x539071..0x53908f): font [0x6f2aec] (10 pt),
+        // right-aligned to 0x6f4590 = 178 at y = 0x6f459c = 158.
+        items.push(text(
+            at(70, 158, 108, 16),
+            snapshot.money(),
+            10,
+            Align::Right,
+        ));
+        // Family friends count ([esi + 0x1d0], 0x539219..0x539346, 0x4cfcdb):
+        // font [0x6f2aec] (10 pt), right-aligned immediately left of the
+        // `$9,999,999`-wide money box ending at x = 178, y = 158.
+        items.push(Item {
+            rect: at(0, 158, 178, 16),
+            kind: Kind::Friends(snapshot.family_friends),
+            command: None,
+        });
+    }
     // The help balloon, over everything, while its panel shows.
     if let Some(help @ Help::Sign(_)) = controls.help {
         let owner = items.iter().find_map(|i| match i.kind {
@@ -766,6 +814,7 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
     // Measured on the original's screen; the old prototype had the needs
     // button at (4, 33) and the first two rows two and one pixels higher.
     let g = |x: i32, y: i32, w: i32, h: i32| gadget.offset(x, y).with_size(w, h);
+    let pet_selected = selected.is_some_and(|r| r.pet);
     for (id, panel, x, y, w, h) in [
         (id::NEEDS, Panel::Needs, 9, 31, 32, 39),
         (id::INTERESTS, Panel::Interests, 44, 4, 27, 30),
@@ -775,16 +824,19 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
         (id::GIFTS, Panel::Gifts, 44, 66, 27, 30),
         (id::HOUSE, Panel::House, 76, 66, 27, 30),
     ] {
-        // Whether the panel opens is for the host to check at the press
-        // ([`check_press`]), as the original does.
+        // 0x51c61f..0x51c9e5: selecting a pet (`person.data[65] > 1`)
+        // disables the Interests ([esi + 0x170]) and Gifts ([esi + 0x174])
+        // gadget buttons (`byte [btn + 0x168] = 0`). Whether another panel
+        // opens is for the host to check at the press ([`check_press`]).
+        let disabled = pet_selected && matches!(panel, Panel::Interests | Panel::Gifts);
         items.push(Item {
             rect: g(x, y, w, h),
             kind: Kind::Button {
                 id,
                 cells: 4,
-                selected: controls.panel == Some(panel),
+                selected: !disabled && controls.panel == Some(panel),
             },
-            command: Some(Command::OpenPanel(panel)),
+            command: (!disabled).then_some(Command::OpenPanel(panel)),
         });
     }
     // The original shows no needs without a selected Sim.
@@ -1766,10 +1818,24 @@ pub fn draw(frame: &mut Frame, art: &Art, faces: &Faces, items: &[Item], control
                     font.draw(frame, &text, [x, r.y], GREEN);
                 }
             }
-            Kind::Pause { paused } => {
+            Kind::Pause { paused, lit } => {
                 if let Some(image) = art.image(id::PAUSE) {
-                    let row = if *paused { 15 } else { 0 };
-                    frame.draw(image, Rect::new(0, row, 15, 15), [r.x, r.y]);
+                    // 0x5e3b40..0x5e3c3e (4-column cGZWinBtn): disabled -> 3,
+                    // selected -> 1, hovered -> 2, normal -> 0.
+                    // 0x5e4b0f draws src_x = col * 15, src_y = row * 15.
+                    let hover = controls.pointer.is_some_and(|[x, y]| r.contains(x, y));
+                    let cell = if item.command.is_none() {
+                        Cell::Disabled
+                    } else if *paused {
+                        Cell::Selected
+                    } else if hover {
+                        Cell::Hover
+                    } else {
+                        Cell::Normal
+                    };
+                    let col = (cell as i32) * 15;
+                    let row = if *lit { 15 } else { 0 };
+                    frame.draw(image, Rect::new(col, row, 15, 15), [r.x, r.y]);
                 }
             }
             Kind::Portrait { guid, selected } => {
@@ -1911,18 +1977,22 @@ pub fn press(items: &[Item], point: [i32; 2]) -> Option<Command> {
 }
 
 /// What a press that asks for `command` does, by the state at the press,
-/// as the original's press handler checks it then (0x51bbe6 to
-/// 0x51be75). Each gadget button needs a selected Sim (`selected`: one of
-/// the household's, the panel's +0xe8), and the House button a
-/// residential lot too (`residential`, 0x40745f). A refused House press
-/// sounds (0x51be1a); another refused press does nothing (0x51be6e).
-/// Other commands pass through.
-pub fn check_press(command: Command, selected: bool, residential: bool) -> Command {
+/// as the original's press handler checks it then (`0x51bbe6..0x51be75`,
+/// `0x51c61f..0x51c9e5`). Each gadget button needs a selected Sim
+/// (`selected`: one of the household's, the panel's `+0xe8`), the House
+/// button needs a residential lot too (`residential`, `0x40745f`), and
+/// Interests/Gifts are disabled while a pet is selected (`0x51c982`,
+/// `0x51c9da`). A refused House press sounds (`0x51be1a`); another refused
+/// press does nothing (`0x51be6e`). Other commands pass through.
+pub fn check_press(command: Command, selected: Selected, residential: bool) -> Command {
     match command {
-        Command::OpenPanel(Panel::House) if !selected || !residential => {
+        Command::OpenPanel(Panel::House) if selected == Selected::None || !residential => {
             Command::Refused { error: true }
         }
-        Command::OpenPanel(_) if !selected => Command::Refused { error: false },
+        Command::OpenPanel(_) if selected == Selected::None => Command::Refused { error: false },
+        Command::OpenPanel(Panel::Interests | Panel::Gifts) if selected == Selected::Pet => {
+            Command::Refused { error: false }
+        }
         other => other,
     }
 }
@@ -1962,7 +2032,9 @@ mod tests {
             hour: 6,
             minute: 30,
             funds: 2542,
+            show_money: true,
             paused: false,
+            residential: true,
             residents: [21, 18, 16]
                 .into_iter()
                 .map(|object| Resident {
@@ -1976,6 +2048,7 @@ mod tests {
                     needs: [0; 6],
                     child: false,
                     female: false,
+                    pet: false,
                     performance: 0,
                     work: Work::default(),
                 })
@@ -2074,6 +2147,7 @@ mod tests {
                 needs: [0; 6],
                 child: false,
                 female: false,
+                pet: false,
                 performance: 0,
                 work: Work::default(),
             })
@@ -2845,7 +2919,7 @@ mod tests {
         // The House button, at (76, 66) in the gadget.
         let house = press(&layout([800, 600], &s, &controls), [413 + 80, 500 + 70]);
         assert_eq!(house, Some(Command::OpenPanel(Panel::House)));
-        let check = |panel: Panel, selected: bool, residential: bool| {
+        let check = |panel: Panel, selected: Selected, residential: bool| {
             check_press(Command::OpenPanel(panel), selected, residential)
         };
         for panel in [
@@ -2856,23 +2930,46 @@ mod tests {
             Panel::Job,
             Panel::Gifts,
         ] {
-            // Selected: it opens, on any lot.
-            assert_eq!(check(panel, true, true), Command::OpenPanel(panel));
-            assert_eq!(check(panel, true, false), Command::OpenPanel(panel));
+            // Human selected: it opens, on any lot.
+            assert_eq!(
+                check(panel, Selected::Human, true),
+                Command::OpenPanel(panel)
+            );
+            assert_eq!(
+                check(panel, Selected::Human, false),
+                Command::OpenPanel(panel)
+            );
+            // Pet selected: Interests and Gifts are refused silently; the rest open.
+            let pet_expected = if matches!(panel, Panel::Interests | Panel::Gifts) {
+                Command::Refused { error: false }
+            } else {
+                Command::OpenPanel(panel)
+            };
+            assert_eq!(check(panel, Selected::Pet, true), pet_expected);
+            assert_eq!(check(panel, Selected::Pet, false), pet_expected);
             // Nobody selected: refused, silently (0x51be6e).
             for residential in [true, false] {
                 assert_eq!(
-                    check(panel, false, residential),
+                    check(panel, Selected::None, residential),
                     Command::Refused { error: false }
                 );
             }
         }
-        // House needs both, and its refusal sounds (0x51be1a).
+        // House needs someone selected and a residential lot, and its refusal sounds (0x51be1a).
         assert_eq!(
-            check(Panel::House, true, true),
+            check(Panel::House, Selected::Human, true),
             Command::OpenPanel(Panel::House)
         );
-        for (selected, residential) in [(true, false), (false, true), (false, false)] {
+        assert_eq!(
+            check(Panel::House, Selected::Pet, true),
+            Command::OpenPanel(Panel::House)
+        );
+        for (selected, residential) in [
+            (Selected::Human, false),
+            (Selected::Pet, false),
+            (Selected::None, true),
+            (Selected::None, false),
+        ] {
             assert_eq!(
                 check(Panel::House, selected, residential),
                 Command::Refused { error: true }
@@ -2880,7 +2977,7 @@ mod tests {
         }
         // Other commands pass through.
         for command in [Command::TogglePanel, Command::Select { sim: 21 }] {
-            assert_eq!(check_press(command.clone(), false, false), command);
+            assert_eq!(check_press(command.clone(), Selected::None, false), command);
         }
         // A selected person who is not one of the household's counts as
         // nobody.
@@ -2908,14 +3005,14 @@ mod tests {
             ..Controls::default()
         };
         // Someone selected: the panel stays, and so does its balloon.
-        assert!(!controls.follow(true));
+        assert!(!controls.follow(Selected::Human));
         assert_eq!(controls.panel, Some(Panel::Personality));
         assert_eq!(controls.help, Some(Help::Sign(3)));
         // Nobody: no panel (0x51d06e), and the balloon closes with it.
-        assert!(controls.follow(false));
+        assert!(controls.follow(Selected::None));
         assert_eq!(controls.panel, None);
         assert_eq!(controls.help, None);
-        assert!(!controls.follow(false));
+        assert!(!controls.follow(Selected::None));
         // With no panel open nothing is laid out beside the gadget.
         let mut s = snapshot();
         s.house = House {
@@ -2926,12 +3023,41 @@ mod tests {
         assert!(!items.iter().any(|i| i.rect.x >= 521 && i.rect.y >= 500));
         // Someone selected again: the needs open (0x51d082), whichever
         // panel was open before.
-        assert!(!controls.follow(true));
+        assert!(!controls.follow(Selected::Human));
         assert_eq!(controls.panel, Some(Panel::Needs));
         // The house panel closes too.
         controls.panel = Some(Panel::House);
-        controls.follow(false);
+        controls.follow(Selected::None);
         assert_eq!(controls.panel, None);
+        // Pet selected (0x51ce13..0x51ce36): Interests and Gifts switch to
+        // Needs (closing any open balloon with a whoosh); other panels stay.
+        for disallowed in [Panel::Interests, Panel::Gifts] {
+            controls.panel = Some(disallowed);
+            controls.help = Some(Help::Sign(3));
+            assert!(controls.follow(Selected::Pet));
+            assert_eq!(controls.panel, Some(Panel::Needs));
+            assert_eq!(controls.help, None);
+        }
+        controls.panel = Some(Panel::Personality);
+        assert!(!controls.follow(Selected::Pet));
+        assert_eq!(controls.panel, Some(Panel::Personality));
+        // Selecting a pet also disables the Interests and Gifts gadget buttons
+        // in the layout (0x51c61f..0x51c9e5).
+        let mut pet_snap = snapshot();
+        pet_snap.residents[0].pet = true;
+        let pet_items = layout([800, 600], &pet_snap, &controls);
+        for (id, want_disabled) in [
+            (id::INTERESTS, true),
+            (id::GIFTS, true),
+            (id::NEEDS, false),
+            (id::PERSONALITY, false),
+        ] {
+            let btn = pet_items
+                .iter()
+                .find(|i| matches!(i.kind, Kind::Button { id: bid, .. } if bid == id))
+                .expect("gadget button");
+            assert_eq!(btn.command.is_none(), want_disabled);
+        }
     }
 
     #[test]
@@ -3311,22 +3437,24 @@ mod tests {
             }
         ));
 
-        // Help button at (5, 164, 10, 15) uses enabled cell 0 and does not click.
+        // Help button at (5, 164, 10, 15) is an enabled 4-cell button that
+        // hovers (cell 2) and emits Command::OpenHelp (0x538f41, 0x53aaad).
         let help = items
             .iter()
-            .find(|i| matches!(i.kind, Kind::Cell { id: id::HELP, .. }))
+            .find(|i| matches!(i.kind, Kind::Button { id: id::HELP, .. }))
             .expect("the help button");
         assert_eq!(help.rect, Rect::new(5, cy + 164, 10, 15));
         assert_eq!(
             help.kind,
-            Kind::Cell {
+            Kind::Button {
                 id: id::HELP,
                 cells: 4,
-                cell: 0
+                selected: false,
             }
         );
-        assert_eq!(help.command, None);
-        assert_eq!(press(&items, [8, cy + 170]), None);
+        assert_eq!(help.command, Some(Command::OpenHelp));
+        assert_eq!(press(&items, [8, cy + 170]), Some(Command::OpenHelp));
+        assert!(hovered(&items, Some([8, cy + 170])).is_some());
 
         // Speed button stays selected while paused (0x53b0d8..0x53b16b).
         let fast = items
@@ -3338,7 +3466,61 @@ mod tests {
             .iter()
             .find(|i| matches!(i.kind, Kind::Pause { .. }))
             .expect("the pause button");
-        assert_eq!(pause.kind, Kind::Pause { paused: true });
+        assert_eq!(
+            pause.kind,
+            Kind::Pause {
+                paused: true,
+                lit: false
+            }
+        );
+        // When pause_lit is true in Live mode (or paused in non-Live mode),
+        // Pause draws lit row 1 (0x53b500..0x53b528, 0x53b736..0x53b74d).
+        let lit_controls = Controls {
+            pause_lit: true,
+            ..controls
+        };
+        let lit_pause = layout([800, 600], &s, &lit_controls)
+            .into_iter()
+            .find(|i| matches!(i.kind, Kind::Pause { .. }))
+            .expect("lit pause");
+        assert_eq!(
+            lit_pause.kind,
+            Kind::Pause {
+                paused: true,
+                lit: true
+            }
+        );
+        let buy_controls = Controls {
+            mode: Mode::Buy,
+            pause_lit: false,
+            ..controls
+        };
+        let buy_pause = layout([800, 600], &s, &buy_controls)
+            .into_iter()
+            .find(|i| matches!(i.kind, Kind::Pause { .. }))
+            .expect("buy pause");
+        assert_eq!(
+            buy_pause.kind,
+            Kind::Pause {
+                paused: true,
+                lit: true
+            }
+        );
+
+        // When show_money is false (global 32 == 1, 0x4f24fa -> 0x53b2a4),
+        // both the money box and the family-friends counter are omitted.
+        let mut hidden_money = s.clone();
+        hidden_money.show_money = false;
+        let hidden_items = layout([800, 600], &hidden_money, &controls);
+        assert!(
+            !hidden_items
+                .iter()
+                .any(|i| matches!(i.kind, Kind::Friends(_)))
+        );
+        assert!(!hidden_items.iter().any(|i| matches!(
+            &i.kind,
+            Kind::Text { text, .. } if text == "$2,542"
+        )));
 
         // speed_for reads idle return speed (global 18 >= 0) first, else active
         // speed (global 16), ignoring pause (global 17); unknown speed -> None.
@@ -3407,6 +3589,25 @@ mod tests {
         }
         art.insert(id::HELP, help_strip);
 
+        // Help button draws cell 0 unhovered and cell 2 hovered; Pause draws
+        // (col, row) from its 4x2 sheet: unpaused normal (0,0), unpaused hover
+        // (2,0), paused unlit (1,0), paused lit (1,1), disabled (3,0).
+        let mut pause_sheet = Image {
+            width: 60,
+            height: 30,
+            rgba: Vec::new(),
+        };
+        for y in 0..30u32 {
+            for x in 0..60u32 {
+                let col = (x / 15) as u8;
+                let row = (y / 15) as u8;
+                pause_sheet
+                    .rgba
+                    .extend_from_slice(&[col + 1, row + 1, 7, 255]);
+            }
+        }
+        art.insert(id::PAUSE, pause_sheet);
+
         let mut frame = Frame::new(220, 183, [0; 3]);
         // CenterTrunc on width 56 with width-1 "B": (56 - 1) / 2 = 27 (vs 28 for Center).
         let synthetic = [
@@ -3422,21 +3623,66 @@ mod tests {
             },
             Item {
                 rect: Rect::new(5, 164, 10, 15),
-                kind: Kind::Cell {
+                kind: Kind::Button {
                     id: id::HELP,
                     cells: 4,
-                    cell: 0,
+                    selected: false,
                 },
-                command: None,
+                command: Some(Command::OpenHelp),
+            },
+            Item {
+                rect: Rect::new(85, 135, 15, 15),
+                kind: Kind::Pause {
+                    paused: false,
+                    lit: false,
+                },
+                command: Some(Command::TogglePause),
             },
         ];
         draw(&mut frame, &art, &Faces::default(), &synthetic, &controls);
         // `B` lands at x = 95 + 27 = 122, y = 118 + 1 (shifted down by A's -1 bearing).
         assert_eq!(frame.pixel(122, 119), Some(GREEN));
         assert_eq!(frame.pixel(123, 119), Some([0; 3]));
-        // Help cell 0 is [1, 9, 9], not disabled cell 3 [4, 9, 9].
+        // Help cell 0 is [1, 9, 9]; unpaused Pause is col 0 row 0 -> [1, 1, 7].
         assert_eq!(frame.pixel(5, 164), Some([1, 9, 9]));
         assert_eq!(frame.pixel(14, 178), Some([1, 9, 9]));
+        assert_eq!(frame.pixel(85, 135), Some([1, 1, 7]));
+
+        // Hovering Help draws cell 2 [3, 9, 9]; hovering unpaused Pause draws col 2 row 0 [3, 1, 7].
+        let hover_help = Controls {
+            pointer: Some([8, 170]),
+            ..controls
+        };
+        draw(&mut frame, &art, &Faces::default(), &synthetic, &hover_help);
+        assert_eq!(frame.pixel(5, 164), Some([3, 9, 9]));
+        let hover_pause = Controls {
+            pointer: Some([90, 140]),
+            ..controls
+        };
+        draw(
+            &mut frame,
+            &art,
+            &Faces::default(),
+            &synthetic,
+            &hover_pause,
+        );
+        assert_eq!(frame.pixel(85, 135), Some([3, 1, 7]));
+
+        // Paused unlit -> col 1 row 0 [2, 1, 7] (even when hovered, 0x5e3bea);
+        // paused lit -> col 1 row 1 [2, 2, 7]; disabled -> col 3 row 0 [4, 1, 7].
+        for (paused, lit, command, want) in [
+            (true, false, Some(Command::TogglePause), [2, 1, 7]),
+            (true, true, Some(Command::TogglePause), [2, 2, 7]),
+            (true, false, None, [4, 1, 7]),
+        ] {
+            let item = [Item {
+                rect: Rect::new(85, 135, 15, 15),
+                kind: Kind::Pause { paused, lit },
+                command,
+            }];
+            draw(&mut frame, &art, &Faces::default(), &item, &hover_pause);
+            assert_eq!(frame.pixel(85, 135), Some(want));
+        }
 
         // Friends with a font that has digits and `$` / `,` (each 5px wide):
         // "$9,999,999" is 10 * 5 = 50px, so right edge is 178 - 50 = 128;

@@ -1648,6 +1648,7 @@ fn the_house_button_is_checked_at_the_press() {
     let mut draw = |hud: &mut Hud, world: &sims_sim::World| {
         hud.draw(
             world,
+            lot.residential(),
             &opened.assets,
             &view,
             &Pace::default(),
@@ -3499,4 +3500,156 @@ fn pressing_a_pie_entry_and_dragging_off_orders_nothing() {
             .table_index,
         snack_menu as i32
     );
+}
+
+/// Control-panel fidelity integration test against the Goth house:
+/// 1. Live-mode pause starts unlit (cyan row 0, `0x53b707..0x53b74d`) and
+///    toggles lit (red row 1) every 500 ms (`0x53b500..0x53b528`), setting
+///    `blink_due()`.
+/// 2. Pressing `?` (`id::HELP`) hovers and dispatches `Command::OpenHelp`.
+/// 3. Budget mode (`globals[32] == 1`) hides both money and family friends.
+/// 4. Selecting a pet (`person.data[KIND] > 1`) switches open Interests/Gifts
+///    to Needs (playing `UI_whoosh` when a balloon closes) and disables those
+///    buttons.
+#[test]
+fn the_control_panel_pause_blink_help_budget_mode_and_pet_refresh() {
+    use sims_game::hud::{Hud, INTERFACE, WHOOSH};
+    use sims_game::pace::Pace;
+    use sims_ui::balloon::Help;
+    use sims_ui::command::{Command, Panel};
+    use sims_ui::hud::{self, Kind, id};
+    let Some(install) = install() else {
+        return;
+    };
+    let house = goth_house(&install);
+    let mut game = Game::open(&Options {
+        install: install.clone(),
+        house: house.clone(),
+        answers: vec![3],
+        play: false,
+        frames: Frames::default(),
+    })
+    .expect("the Goth house opens");
+    game.render();
+
+    let pause_kind = |game: &Game| {
+        game.panel()
+            .iter()
+            .find_map(|i| match i.kind {
+                Kind::Pause { paused, lit } => Some((paused, lit)),
+                _ => None,
+            })
+            .expect("pause button")
+    };
+    assert_eq!(pause_kind(&game), (false, false));
+
+    // Pause in Live mode: starts selected unlit (cyan row 0), blinks every 500 ms.
+    game.toggle_pause();
+    game.render();
+    assert_eq!(pause_kind(&game), (true, false));
+    assert!(!game.blink_due());
+    game.advance(499_999);
+    assert!(!game.blink_due());
+    game.advance(1);
+    assert!(game.blink_due());
+    game.render();
+    assert!(!game.blink_due());
+    assert_eq!(pause_kind(&game), (true, true));
+    game.advance(hud::PAUSE_BLINK_US);
+    assert!(game.blink_due());
+    game.render();
+    assert_eq!(pause_kind(&game), (true, false));
+    game.toggle_pause();
+    game.render();
+    assert_eq!(pause_kind(&game), (false, false));
+
+    // Help button hovers and accepts clicks (`Command::OpenHelp`).
+    let help = game
+        .panel()
+        .iter()
+        .find(|i| i.command == Some(Command::OpenHelp))
+        .expect("help button")
+        .rect;
+    let help_center = [help.x + help.width / 2, help.y + help.height / 2];
+    assert!(game.hover(help_center));
+    assert!(game.press(help_center).redraw);
+
+    // Budget mode (`globals[32] == 1`) and pet selection (`person.data[KIND] > 1`)
+    // exercised directly on `Hud`.
+    let opened = open_house(&install, &house).expect("the house opens");
+    let lot = game.lot();
+    let mut hud = Hud::open(
+        &install,
+        &house,
+        &opened.assets,
+        lot.world(),
+        lot.program().autonomy_constants().friendship_threshold,
+    )
+    .expect("the panel opens");
+    let view = View::new([800, 600], [0, 0], opened.rotation);
+    let mut canvas = Canvas::new(800, 600, [0; 3]);
+
+    let mut budget = lot.world().clone();
+    if budget.globals.len() <= 32 {
+        budget.globals.resize(33, 0);
+    }
+    budget.globals[32] = 1;
+    hud.draw(
+        &budget,
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    assert!(
+        !hud.items()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::Friends(_)))
+    );
+    assert!(
+        !hud.items()
+            .iter()
+            .any(|i| matches!(&i.kind, Kind::Text { text, .. } if text.starts_with('$')))
+    );
+
+    let mut pet_world = lot.world().clone();
+    let selected_id = pet_world.selected().expect("Mortimer selected");
+    pet_world
+        .objects
+        .get_mut(&selected_id)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap()
+        .data[sims_sim::neighbors::KIND] = 2;
+    hud.controls.panel = Some(Panel::Interests);
+    hud.controls.help = Some(Help::Sign(2));
+    hud.draw(
+        &pet_world,
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    assert_eq!(hud.controls.panel, Some(Panel::Needs));
+    assert_eq!(hud.controls.help, None);
+    assert_eq!(
+        hud.take_sounds(),
+        [SoundEvent::Play {
+            object: INTERFACE,
+            name: WHOOSH.into(),
+        }]
+    );
+    for id in [id::INTERESTS, id::GIFTS] {
+        let btn = hud
+            .items()
+            .iter()
+            .find(|i| matches!(i.kind, Kind::Button { id: bid, .. } if bid == id))
+            .expect("gadget button");
+        assert_eq!(btn.command, None);
+    }
 }

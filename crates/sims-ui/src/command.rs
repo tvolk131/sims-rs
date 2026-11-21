@@ -135,6 +135,9 @@ pub enum Command {
     /// Open the help balloon `help`, or close it if it is the one open
     /// (presentation only).
     Help(crate::balloon::Help),
+    /// Open the Help System dialog from the cluster's `?` button
+    /// (`0x53aaad -> 0x50e8d3`, presentation only).
+    OpenHelp,
 }
 
 impl Command {
@@ -169,5 +172,6 @@ mod tests {
         assert!(!Command::ShowRelations(Relations::Family).changes_simulation());
         assert!(!Command::RelationsPage(1).changes_simulation());
         assert!(!Command::Help(crate::balloon::Help::Sign(2)).changes_simulation());
+        assert!(!Command::OpenHelp.changes_simulation());
     }
 }
