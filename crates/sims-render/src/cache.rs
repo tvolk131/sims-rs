@@ -16,14 +16,15 @@ use crate::canvas::Canvas;
 use crate::cutaway::Mask;
 use crate::grass::Grass;
 use crate::lot::{Lot, WallCell};
-use crate::scene::{Stats, holds_person, paint_lot_precomputed, shadow_of_chain};
+use crate::scene::{Stats, background, holds_person, paint_lot_precomputed, shadow_of_chain};
 use sims_sim::{Object, World};
 use std::collections::BTreeSet;
 
 /// Caches the static `Pass::Lot` surface and per-zoom/rotation grass tables.
 ///
-/// Assumes callers pass the same [`Assets`] install across calls; call
-/// [`LotCache::clear`] if switching installs.
+/// Surface entries are bound to the [`Assets`] instance so switching installs
+/// or catalogs invalidates automatically; call [`LotCache::clear`] to drop
+/// cached memory immediately.
 #[derive(Default)]
 pub struct LotCache {
     entry: Option<Entry>,
@@ -83,6 +84,7 @@ impl GrassKey {
 struct ObjectVisual {
     id: u16,
     guid: u32,
+    is_person: bool,
     position: [i32; 3],
     /// Data words `[0, 1, 2, 3, 4, 8, 13, 34, 51]` (word 3 defaults to `-1`,
     /// all others default to `0`).
@@ -117,6 +119,7 @@ impl ObjectVisual {
         Self {
             id,
             guid: o.guid,
+            is_person: o.person.is_some(),
             position: o.position,
             words: Self::words_of(o),
             dynamic_sprites: o.dynamic_sprites.clone(),
@@ -128,6 +131,7 @@ impl ObjectVisual {
     fn matches(&self, id: u16, o: &Object) -> bool {
         self.id == id
             && self.guid == o.guid
+            && self.is_person == o.person.is_some()
             && self.position == o.position
             && self.words == Self::words_of(o)
             && self.dynamic_sprites == o.dynamic_sprites
@@ -137,6 +141,7 @@ impl ObjectVisual {
 
 /// Complete visual key covering every input read by `paint(..., Pass::Lot)`.
 struct LotKey {
+    assets_id: u64,
     width: usize,
     height: usize,
     clip_bottom: i32,
@@ -304,6 +309,7 @@ impl LotCache {
         preview: Option<(u16, u16)>,
         canvas: &mut Canvas,
     ) -> Stats {
+        let assets_id = assets.instance_id();
         let width = canvas.width;
         let height = canvas.height;
         let clip_bottom = (viewport.1 as usize).min(height) as i32;
@@ -311,6 +317,7 @@ impl LotCache {
         let house = world.globals.get(10).copied().unwrap_or(0);
         let show_grid = matches!(world.globals.get(19).copied().unwrap_or(0), 1 | 2);
         let top = camera.level.clamp(1, 2) as usize;
+        let can_cache = canvas.has_pixel_storage();
 
         // Compute `holds_person` once (cheap: only climbs from the few Sims) so
         // both the cache check and any miss reuse it.
@@ -319,9 +326,10 @@ impl LotCache {
         // Track an already-computed cutaway mask so a miss never builds it twice.
         let mut computed_mask: Option<Mask> = None;
 
-        if let Some(entry) = &mut self.entry {
+        if can_cache && let Some(entry) = &mut self.entry {
             let k = &entry.key;
-            let base_match = k.width == width
+            let base_match = k.assets_id == assets_id
+                && k.width == width
                 && k.height == height
                 && k.clip_bottom == clip_bottom
                 && k.camera.zoom == camera.zoom
@@ -369,7 +377,7 @@ impl LotCache {
                         // identical cutaway mask so subsequent frames skip
                         // `Mask::new` too.
                         entry.key.camera.focus = camera.focus;
-                        canvas.copy_from(&entry.canvas);
+                        canvas.restore_pixels_from(&entry.canvas, background(time_of_day, house));
                         return entry.stats;
                     }
                 }
@@ -408,6 +416,10 @@ impl LotCache {
             cut_mask.as_ref(),
         );
 
+        if !can_cache {
+            return stats;
+        }
+
         let shadows = [
             collect_level_shadows(world, assets, camera.rotation, lot.size, 0),
             if top >= 2 {
@@ -417,6 +429,7 @@ impl LotCache {
             },
         ];
         let key = LotKey {
+            assets_id,
             width,
             height,
             clip_bottom,
@@ -438,13 +451,15 @@ impl LotCache {
         match &mut self.entry {
             Some(entry) => {
                 entry.key = key;
-                entry.canvas.copy_from(canvas);
+                entry.canvas.snapshot_pixels_from(canvas);
                 entry.stats = stats;
             }
             None => {
+                let mut snapshot = Canvas::new(0, 0, [0, 0, 0]);
+                snapshot.snapshot_pixels_from(canvas);
                 self.entry = Some(Entry {
                     key,
-                    canvas: canvas.clone(),
+                    canvas: snapshot,
                     stats,
                 });
             }

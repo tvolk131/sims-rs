@@ -203,16 +203,81 @@ impl Canvas {
         self.rects.clear();
     }
 
-    /// Replaces this canvas's contents with `other`'s, reusing its backing
-    /// buffers when sizes match.
-    pub(crate) fn copy_from(&mut self, other: &Canvas) {
+    /// Whether `color`, `depth`, and `ids` each hold at least `width * height`
+    /// entries.
+    pub(crate) fn has_pixel_storage(&self) -> bool {
+        self.width.checked_mul(self.height).is_some_and(|pixels| {
+            self.color.len() >= pixels && self.depth.len() >= pixels && self.ids.len() >= pixels
+        })
+    }
+
+    /// Snapshots `other`'s logical `width * height` surface (`color`, `depth`,
+    /// `ids`, `pen`, `rects`) into `self`, reusing backing allocations when
+    /// possible. Caller must ensure `other.has_pixel_storage()`.
+    pub(crate) fn snapshot_pixels_from(&mut self, other: &Canvas) {
+        let pixels = other.width * other.height;
         self.width = other.width;
         self.height = other.height;
-        self.color.clone_from(&other.color);
-        self.depth.clone_from(&other.depth);
-        self.ids.clone_from(&other.ids);
+        self.color.clear();
+        self.color.extend_from_slice(&other.color[..pixels]);
+        self.depth.clear();
+        self.depth.extend_from_slice(&other.depth[..pixels]);
+        self.ids.clear();
+        self.ids.extend_from_slice(&other.ids[..pixels]);
         self.pen = other.pen;
         self.rects.clone_from(&other.rects);
+    }
+
+    /// Restores a cached `width * height` snapshot from `other` into `self`,
+    /// preserving any caller-supplied extra trailing elements in `color`,
+    /// `depth`, and `ids` and clearing them identically to [`Canvas::clear`].
+    /// Caller must ensure `self.width == other.width`,
+    /// `self.height == other.height`, and `self.has_pixel_storage()`.
+    pub(crate) fn restore_pixels_from(&mut self, other: &Canvas, background: [u8; 3]) {
+        let pixels = other.width * other.height;
+        debug_assert_eq!(self.width, other.width);
+        debug_assert_eq!(self.height, other.height);
+        debug_assert_eq!(other.color.len(), pixels);
+        debug_assert_eq!(other.depth.len(), pixels);
+        debug_assert_eq!(other.ids.len(), pixels);
+        self.color[..pixels].copy_from_slice(&other.color);
+        if self.color.len() > pixels {
+            self.color[pixels..].fill(background);
+        }
+        self.depth[..pixels].copy_from_slice(&other.depth);
+        if self.depth.len() > pixels {
+            self.depth[pixels..].fill(EMPTY);
+        }
+        self.ids[..pixels].copy_from_slice(&other.ids);
+        if self.ids.len() > pixels {
+            self.ids[pixels..].fill(None);
+        }
+        self.pen = other.pen;
+        self.rects.clone_from(&other.rects);
+    }
+
+    #[inline]
+    fn record_rect(&mut self, x: i32, y: i32, width: usize, height: usize) {
+        if let Some(id) = self.pen {
+            let side = |n: usize| i32::try_from(n).unwrap_or(i32::MAX);
+            let rect = [
+                x,
+                y,
+                x.saturating_add(side(width)),
+                y.saturating_add(side(height)),
+            ];
+            self.rects
+                .entry(id)
+                .and_modify(|r| {
+                    *r = [
+                        r[0].min(rect[0]),
+                        r[1].min(rect[1]),
+                        r[2].max(rect[2]),
+                        r[3].max(rect[3]),
+                    ]
+                })
+                .or_insert(rect);
+        }
     }
 
     /// Sets the ID the pixels drawn from now on take, until it is set
@@ -406,10 +471,12 @@ impl Canvas {
         if pattern.is_empty() || self.color.is_empty() {
             return true;
         }
-        let (x0, x1, ax, left_skip) = match clip_x(at[0], pattern.width, self.width, columns) {
-            Some(span) => span,
-            None => return true,
-        };
+        let (x0, x1, ax, left_skip, rect_x, rect_w) =
+            match clip_x(at[0], pattern.width, self.width, columns) {
+                Some(span) => span,
+                None => return true,
+            };
+        self.record_rect(rect_x, at[1], rect_w, pattern.height);
         let (y0, y1, ay) = clip_span(at[1], pattern.height, self.height);
         if x0 >= x1 || y0 >= y1 {
             return true;
@@ -492,29 +559,12 @@ impl Canvas {
         {
             return;
         }
-        if let Some(id) = self.pen {
-            let side = |n: usize| i32::try_from(n).unwrap_or(i32::MAX);
-            let rect = [
-                at[0],
-                at[1],
-                at[0].saturating_add(side(image.width)),
-                at[1].saturating_add(side(image.height)),
-            ];
-            self.rects
-                .entry(id)
-                .and_modify(|r| {
-                    *r = [
-                        r[0].min(rect[0]),
-                        r[1].min(rect[1]),
-                        r[2].max(rect[2]),
-                        r[3].max(rect[3]),
-                    ]
-                })
-                .or_insert(rect);
-        }
-        let Some((x0, x1, ax, left_skip)) = clip_x(at[0], image.width, self.width, columns) else {
+        let Some((x0, x1, ax, left_skip, rect_x, rect_w)) =
+            clip_x(at[0], image.width, self.width, columns)
+        else {
             return;
         };
+        self.record_rect(rect_x, at[1], rect_w, image.height);
         let (y0, y1, ay) = clip_span(at[1], image.height, self.height);
         if x0 >= x1 || y0 >= y1 {
             return;
@@ -582,10 +632,25 @@ impl Canvas {
         {
             return;
         }
-        let Some((mut x0, mut x1, ax, left_skip)) = clip_x(at[0], image.width, self.width, columns)
+        let Some((mut x0, mut x1, ax, left_skip, rect_x, rect_w)) =
+            clip_x(at[0], image.width, self.width, columns)
         else {
             return;
         };
+        if let Some([ix0, iy0, ix1, iy1]) = sub_rect {
+            if ix0 >= ix1 || iy0 >= iy1 {
+                return;
+            }
+            let side = |n: usize| i32::try_from(n).unwrap_or(i32::MAX);
+            self.record_rect(
+                at[0].saturating_add(side(ix0)),
+                at[1].saturating_add(side(iy0)),
+                ix1 - ix0,
+                iy1 - iy0,
+            );
+        } else {
+            self.record_rect(rect_x, at[1], rect_w, image.height);
+        }
         let (mut y0, mut y1, ay) = clip_span(at[1], image.height, self.height);
         if let Some([ix0, iy0, ix1, iy1]) = sub_rect {
             let sub_x0 = ax.saturating_add(ix0 as i64).clamp(0, self.width as i64) as usize;
@@ -921,18 +986,19 @@ fn clip_span(at: i32, size: usize, limit: usize) -> (usize, usize, i64) {
 
 /// Clips a horizontal image span `[at, at + size)` to `[0, limit)` and
 /// optional screen column bounds `[from, to)`, matching `scene::within`
-/// without allocating a cropped image. Returns `(x0, x1, ax, left_skip)`.
+/// without allocating a cropped image. Returns
+/// `(x0, x1, ax, left_skip, rect_x, rect_w)`.
 #[inline]
 fn clip_x(
     at: i32,
     size: usize,
     limit: usize,
     columns: Option<[i32; 2]>,
-) -> Option<(usize, usize, i64, usize)> {
+) -> Option<(usize, usize, i64, usize, i32, usize)> {
     match columns {
         None => {
             let (x0, x1, ax) = clip_span(at, size, limit);
-            Some((x0, x1, ax, 0))
+            Some((x0, x1, ax, 0, at, size))
         }
         Some([from, to]) => {
             let width = i64::try_from(size).ok()?;
@@ -945,7 +1011,7 @@ fn clip_x(
             let w = usize::try_from(right - left).ok()?;
             let shifted = at.saturating_add(i32::try_from(left).ok()?);
             let (x0, x1, ax) = clip_span(shifted, w, limit);
-            Some((x0, x1, ax, left_usize))
+            Some((x0, x1, ax, left_usize, shifted, w))
         }
     }
 }
@@ -1364,5 +1430,22 @@ mod tests {
         );
         assert_eq!(c.color[0][1] >> 2, 1);
         assert_eq!(c.color[1][1] >> 2, 0);
+    }
+
+    #[test]
+    fn draw_layered_clipped_records_only_the_clipped_rect_and_skips_empty_spans() {
+        let sprite = image(10, 4, [200, 100, 50, 255], Some(10));
+        let mut c = Canvas::new(20, 10, [0, 0, 0]);
+        c.set_id(Some(7));
+        // Empty column intersection records no rectangle.
+        c.draw_layered_clipped(&sprite, [2, 3], Light::FULL, Some([12, 18]), |_, _, _| {
+            Some(5)
+        });
+        assert_eq!(c.drawn(7), None);
+        // Partial intersection records only the clipped horizontal span.
+        c.draw_layered_clipped(&sprite, [2, 3], Light::FULL, Some([5, 9]), |_, _, _| {
+            Some(5)
+        });
+        assert_eq!(c.drawn(7), Some([5, 3, 9, 7]));
     }
 }

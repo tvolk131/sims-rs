@@ -342,37 +342,6 @@ const LAMP_HEIGHT: f32 = 5.0;
 /// The most lamp lights the original keeps for a room (0x467eff).
 const ROOM_LAMPS: usize = 6;
 
-/// The lamps' lights on a person on `level` whose skeleton's root is at
-/// `at`, viewed from house camera position `eye` ([`View::eye`]), both in
-/// the drawing frame (`at` is the ground's height under the person, moved
-/// by [`View::level_lift`] on a level above the first, as the original's
-/// model root is). The original sets them with the standard light
-/// (0x4b4b04 to 0x4b4c95), from its lighting record of the person: their
-/// level and their root, rounded back to fine position (0x4b4987 through
-/// 0x454fb9, half away from zero).
-///
-/// The tile of that fine position (a sixteenth of it, rounded down) must
-/// be inside the lot's outer ring of tiles. The room is the word the
-/// level's room map holds there; a negative word (a tile a diagonal wall
-/// splits) takes no lamps. The room's lights are those its count leaves
-/// (0x467ed7): it visits the room's listed tiles in order, repeats
-/// included, and each lit lamp ([`sims_render::lot::gives_light`])
-/// standing on a tile it visits adds a light, at most [`ROOM_LAMPS`]. So a
-/// lamp on a tile listed twice lights twice.
-///
-/// A light is placed at the lamp's fine position, [`LAMP_HEIGHT`] above
-/// the ground there, with [`lamp_strength`] computed from its squared
-/// distance to `at` (0x4b4ba6..0x4b4c37). Because `Sims.exe` creates room
-/// lamps as `D3DLIGHT_PARALLELPOINT` (`dltType = 4`, `0x4673d0` →
-/// `0x5d009a` → `0x5d0d0b` → `0x5d09a0(4)`), Direct3D 6 ignores
-/// `dvDirection`, transforms `dvPosition` into camera space
-/// (`M_view * [dvPosition, 1]`), and lights with the unit vector from the
-/// camera-space origin towards that transformed position—i.e.,
-/// `(light - eye).normalize()` in the drawing frame.
-///
-/// The objects on a tile are taken in ID order. The original takes them
-/// in the order the lot links them; the two differ only for a tile with
-/// two lit lamps in a room past six lights.
 const FULL_SIDE: usize = sims_sim::FULL_SIZE as usize;
 
 /// Indexed view of every lit lamp (`sims_render::lot::gives_light`) in a
@@ -479,6 +448,37 @@ impl<'a> LitLamps<'a> {
     }
 }
 
+/// The lamps' lights on a person on `level` whose skeleton's root is at
+/// `at`, viewed from house camera position `eye` ([`View::eye`]), both in
+/// the drawing frame (`at` is the ground's height under the person, moved
+/// by [`View::level_lift`] on a level above the first, as the original's
+/// model root is). The original sets them with the standard light
+/// (0x4b4b04 to 0x4b4c95), from its lighting record of the person: their
+/// level and their root, rounded back to fine position (0x4b4987 through
+/// 0x454fb9, half away from zero).
+///
+/// The tile of that fine position (a sixteenth of it, rounded down) must
+/// be inside the lot's outer ring of tiles. The room is the word the
+/// level's room map holds there; a negative word (a tile a diagonal wall
+/// splits) takes no lamps. The room's lights are those its count leaves
+/// (0x467ed7): it visits the room's listed tiles in order, repeats
+/// included, and each lit lamp ([`sims_render::lot::gives_light`])
+/// standing on a tile it visits adds a light, at most [`ROOM_LAMPS`]. So a
+/// lamp on a tile listed twice lights twice.
+///
+/// A light is placed at the lamp's fine position, [`LAMP_HEIGHT`] above
+/// the ground there, with [`lamp_strength`] computed from its squared
+/// distance to `at` (0x4b4ba6..0x4b4c37). Because `Sims.exe` creates room
+/// lamps as `D3DLIGHT_PARALLELPOINT` (`dltType = 4`, `0x4673d0` →
+/// `0x5d009a` → `0x5d0d0b` → `0x5d09a0(4)`), Direct3D 6 ignores
+/// `dvDirection`, transforms `dvPosition` into camera space
+/// (`M_view * [dvPosition, 1]`), and lights with the unit vector from the
+/// camera-space origin towards that transformed position—i.e.,
+/// `(light - eye).normalize()` in the drawing frame.
+///
+/// The objects on a tile are taken in ID order. The original takes them
+/// in the order the lot links them; the two differ only for a tile with
+/// two lit lamps in a room past six lights.
 pub fn lamps(world: &World, level: i32, at: Vec3, eye: Vec3) -> Vec<Lamp> {
     LitLamps::from_world(world).lamps_for(world, level, at, eye)
 }
@@ -1723,14 +1723,14 @@ mod tests {
                 ..Default::default()
             },
         );
-        let mk_lamp = |id: u16, tx: i32, ty: i32| {
+        let mk_lamp = |id: u16, fx: i32, fy: i32| {
             let mut data = vec![0i16; 64];
             (data[16], data[40], data[51]) = (1, 0x400, 25);
             sims_sim::Object {
                 id,
                 guid: 0,
                 footprint: [0; 4],
-                position: [tx * 16 + 8, ty * 16 + 8, 1],
+                position: [fx, fy, 1],
                 unknown_short: 0,
                 attributes: Vec::new(),
                 temps: Vec::new(),
@@ -1751,14 +1751,89 @@ mod tests {
                 selected: false,
             }
         };
-        world.objects.insert(10, mk_lamp(10, 12, 12));
-        world.objects.insert(20, mk_lamp(20, 12, 12));
-        world.objects.insert(30, mk_lamp(30, 50, 50));
-        world.objects.insert(40, mk_lamp(40, 13, 12));
+        // Two lit lamps on the same tile with distinct fine coordinates so
+        // ID ordering produces distinct direction and strength bits.
+        world
+            .objects
+            .insert(10, mk_lamp(10, 12 * 16 + 2, 12 * 16 + 3));
+        world
+            .objects
+            .insert(20, mk_lamp(20, 12 * 16 + 14, 12 * 16 + 13));
+        // Out-of-range lamp listed twice before tile (13, 12): must consume
+        // slots 5 and 6 of ROOM_LAMPS before distance filtering.
+        world
+            .objects
+            .insert(30, mk_lamp(30, 50 * 16 + 7, 50 * 16 + 9));
+        // Nearby lamp on tile (13, 12) that would be #7 and must be dropped.
+        world
+            .objects
+            .insert(40, mk_lamp(40, 13 * 16 + 6, 12 * 16 + 11));
 
         let at = Vec3::new(-(12.5 * 3.0), 0.0, -(12.5 * 3.0));
         let eye = Vec3::new(100.0, 100.0, 100.0);
+
+        let reference_lamps = |world: &World, level: i32, at: Vec3, eye: Vec3| -> Vec<Lamp> {
+            let fine = [-at.z, -at.x].map(|u| (u * FINE_PER_UNIT).round() as i32);
+            let [x, y] = fine.map(|f| f.div_euclid(16));
+            let full = sims_sim::FULL_SIZE as i32;
+            let room = world.rooms.map[(level - 1) as usize][(x * full + y) as usize];
+            let room = &world.rooms.rooms[&room];
+            let mut selected = Vec::new();
+            'tiles: for &tile in &room.tiles {
+                let tile = tile.map(i32::from);
+                for o in world.objects.values() {
+                    if sims_render::lot::gives_light(o)
+                        && World::tile(o.position).map(i32::from) == tile
+                    {
+                        selected.push(o);
+                        if selected.len() == ROOM_LAMPS {
+                            break 'tiles;
+                        }
+                    }
+                }
+            }
+            selected
+                .into_iter()
+                .filter_map(|lamp| {
+                    let [fx, fy, _] = lamp.position;
+                    let ground = sims_sim::head::ground_height(
+                        world,
+                        [F32::from_f32(fx as f32), F32::from_f32(fy as f32)],
+                    )
+                    .map_or(0.0, F32::to_f32);
+                    let light = Vec3::new(
+                        -(fy as f32) / FINE_PER_UNIT,
+                        ground + LAMP_HEIGHT,
+                        -(fx as f32) / FINE_PER_UNIT,
+                    );
+                    let from = at - light;
+                    Some(Lamp {
+                        towards: (light - eye).normalize(),
+                        strength: lamp_strength(from.dot(from))?,
+                    })
+                })
+                .collect()
+        };
+
+        let bits = |ls: &[Lamp]| -> Vec<([u32; 3], u32)> {
+            ls.iter()
+                .map(|l| {
+                    (
+                        [l.towards.x, l.towards.y, l.towards.z].map(f32::to_bits),
+                        l.strength.to_bits(),
+                    )
+                })
+                .collect()
+        };
+
         let got = lamps(&world, 1, at, eye);
+        let want = reference_lamps(&world, 1, at, eye);
         assert_eq!(got.len(), 4);
+        assert_ne!(
+            bits(&got[0..1]),
+            bits(&got[1..2]),
+            "same-tile lamps must have distinct light vectors to pin ordering"
+        );
+        assert_eq!(bits(&got), bits(&want));
     }
 }

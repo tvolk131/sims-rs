@@ -571,5 +571,206 @@ fn lot_cache_matches_uncached_across_house05_states_and_mutations() {
             size,
             "holds_person tree added",
         );
+
+        // 10. Toggling `Object::person` on an already-tracked preview
+        //     participant must invalidate the cache (objects pass skips
+        //     objects with `person.is_some()`).
+        let sample_person = world
+            .objects
+            .get(&person_id)
+            .and_then(|o| o.person.clone())
+            .expect("person data");
+        assert_parity(
+            &mut cache,
+            &world,
+            &lot,
+            assets,
+            &camera,
+            (400, 300),
+            Some((target_id, second_id)),
+            size,
+            "preview participant before person flag toggle",
+        );
+        world.objects.get_mut(&target_id).unwrap().person = Some(sample_person.clone());
+        assert_parity(
+            &mut cache,
+            &world,
+            &lot,
+            assets,
+            &camera,
+            (400, 300),
+            Some((target_id, second_id)),
+            size,
+            "preview participant gained person flag",
+        );
+        world.objects.get_mut(&target_id).unwrap().person = None;
+        assert_parity(
+            &mut cache,
+            &world,
+            &lot,
+            assets,
+            &camera,
+            (400, 300),
+            Some((target_id, second_id)),
+            size,
+            "preview participant cleared person flag",
+        );
+
+        // Also test toggling `Object::person` on a wall-shaping object.
+        if let Some(&wall_shaper_id) = world
+            .objects
+            .iter()
+            .find(|(_, o)| {
+                o.person.is_none() && assets.definition(o.guid).is_some_and(|d| d.shapes_wall())
+            })
+            .map(|(id, _)| id)
+        {
+            assert_parity(
+                &mut cache,
+                &world,
+                &lot,
+                assets,
+                &camera,
+                (400, 300),
+                None,
+                size,
+                "wall shaper before person flag toggle",
+            );
+            world.objects.get_mut(&wall_shaper_id).unwrap().person = Some(sample_person);
+            assert_parity(
+                &mut cache,
+                &world,
+                &lot,
+                assets,
+                &camera,
+                (400, 300),
+                None,
+                size,
+                "wall shaper gained person flag",
+            );
+            world.objects.get_mut(&wall_shaper_id).unwrap().person = None;
+            assert_parity(
+                &mut cache,
+                &world,
+                &lot,
+                assets,
+                &camera,
+                (400, 300),
+                None,
+                size,
+                "wall shaper cleared person flag",
+            );
+        }
     }
+
+    // 11. Padded canvas storage (`color`/`depth` longer than `width * height`)
+    //     must be cleared and preserved on a cache hit identically to uncached
+    //     `draw_lot_with_preview`, and must not leak padding to subsequent
+    //     standard-sized canvases.
+    assert_parity(
+        &mut cache,
+        &world,
+        &lot,
+        assets,
+        &camera,
+        (400, 300),
+        None,
+        size,
+        "prime cache before padded canvas hit",
+    );
+    {
+        let mut padded_cached = Canvas::new(size[0], size[1], [0xaa, 0xbb, 0xcc]);
+        padded_cached.color.push([0x11, 0x22, 0x33]);
+        padded_cached.depth.push(42);
+        let mut padded_uncached = Canvas::new(size[0], size[1], [0xaa, 0xbb, 0xcc]);
+        padded_uncached.color.push([0x11, 0x22, 0x33]);
+        padded_uncached.depth.push(42);
+        let s_cached = cache.draw_lot_with_preview(
+            &world,
+            &lot,
+            assets,
+            &camera,
+            (400, 300),
+            None,
+            &mut padded_cached,
+        );
+        let s_uncached = draw_lot_with_preview(
+            &world,
+            &lot,
+            assets,
+            &camera,
+            (400, 300),
+            None,
+            &mut padded_uncached,
+        );
+        assert_eq!(s_cached, s_uncached, "padded canvas hit stats mismatch");
+        assert_eq!(
+            padded_cached, padded_uncached,
+            "padded canvas hit storage mismatch"
+        );
+        assert_eq!(padded_cached.color.len(), size[0] * size[1] + 1);
+        assert_eq!(padded_cached.depth.len(), size[0] * size[1] + 1);
+    }
+    // Populate from a padded canvas on a miss, then verify a normal-sized hit
+    // keeps its exact length.
+    cache.clear();
+    {
+        let mut padded_miss = Canvas::new(size[0], size[1], [0xaa, 0xbb, 0xcc]);
+        padded_miss.color.push([0x44, 0x55, 0x66]);
+        padded_miss.depth.push(99);
+        let mut uncached_miss = Canvas::new(size[0], size[1], [0xaa, 0xbb, 0xcc]);
+        uncached_miss.color.push([0x44, 0x55, 0x66]);
+        uncached_miss.depth.push(99);
+        let s_cached = cache.draw_lot_with_preview(
+            &world,
+            &lot,
+            assets,
+            &camera,
+            (400, 300),
+            None,
+            &mut padded_miss,
+        );
+        let s_uncached = draw_lot_with_preview(
+            &world,
+            &lot,
+            assets,
+            &camera,
+            (400, 300),
+            None,
+            &mut uncached_miss,
+        );
+        assert_eq!(s_cached, s_uncached);
+        assert_eq!(padded_miss, uncached_miss);
+    }
+    assert_parity(
+        &mut cache,
+        &world,
+        &lot,
+        assets,
+        &camera,
+        (400, 300),
+        None,
+        size,
+        "standard canvas hit after padded miss",
+    );
+
+    // 12. Swapping to a different `Assets` instance / catalog from the same
+    //     install must not share a cache entry.
+    let install = sims_content::Install::detect(&root).expect("detect install");
+    let mut trimmed_catalog = assets.catalog().clone();
+    trimmed_catalog.by_guid.clear();
+    let mut other_assets =
+        sims_render::Assets::new(&install, assets.index().clone(), trimmed_catalog)
+            .expect("construct alternate Assets");
+    assert_parity(
+        &mut cache,
+        &world,
+        &lot,
+        &mut other_assets,
+        &camera,
+        (400, 300),
+        None,
+        size,
+        "alternate Assets catalog from same install",
+    );
 }

@@ -27,6 +27,9 @@ use sims_formats::execution::Slots;
 use sims_formats::iff::Iff;
 use sims_formats::sprite::{DrawGroup, LegacySpriteSet, Palette, SpriteSet};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_ASSETS_ID: AtomicU64 = AtomicU64::new(1);
 
 /// One sprite of an object's draw group, ready to place.
 #[derive(Debug, Clone)]
@@ -99,6 +102,7 @@ impl Definition {
 }
 
 pub struct Assets {
+    id: u64,
     index: Index,
     catalog: Catalog,
     floors: Iff,
@@ -124,6 +128,7 @@ impl Assets {
             Ok(Iff::parse(bytes)?)
         };
         Ok(Self {
+            id: NEXT_ASSETS_ID.fetch_add(1, Ordering::Relaxed),
             floors: read("GameData/floors.iff")?,
             walls: read("GameData/walls.iff")?,
             index,
@@ -139,6 +144,13 @@ impl Assets {
             pools: read_pools(install),
             shadow_masks: BTreeMap::new(),
         })
+    }
+
+    /// Unique identity of this immutable `Assets` instance (install + index +
+    /// catalog), used by [`crate::LotCache`] to prevent sharing entries across
+    /// distinct catalogs or installs.
+    pub(crate) fn instance_id(&self) -> u64 {
+        self.id
     }
 
     /// The lamps' pools of light, if the game's `lightMap.dat` is there

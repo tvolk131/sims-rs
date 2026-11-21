@@ -31,7 +31,7 @@ all 8 SHA-256 hashes in `crates/sims-game/tests/ratchet.txt` remain unchanged):
      into `Game::draw` with minimal changes in `crates/sims-game/src/game.rs`.
      It caches the completed `Pass::Lot` `Canvas` (`color`, `depth`, `ids`,
      `pen`, `rects`) and `Stats`, validating every input `Pass::Lot` reads:
-     canvas size, `clip_bottom`, camera (`zoom`, `rotation`, `level`, `origin`,
+     `Assets` instance identity, canvas size, `clip_bottom`, camera (`zoom`, `rotation`, `level`, `origin`,
      `walls`, and resolved 512-byte cutaway `Mask`), `preview`, `time_of_day`,
      `house`, Buy/Build grid flag + array `8`, exact `Lot` equality (with
      `f32::to_bits`), `holds_person(world)`, resolved tile shadows per active
