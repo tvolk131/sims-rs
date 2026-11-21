@@ -65,7 +65,10 @@ coordinate (`position[0]`, `x`) at `+4` (`[ebp - 0x44]`), whereas a tile
 Fix the coordinate axis swap in `crates/sims-vm/src/primitives/find_location.rs`:
 
 - In `Machine::random_start`, apply the first draw to `x` and the second to
-  `y` in both the `[1, 1]` branch and the random-walk loop.
+  `y` in both the `[1, 1]` branch and the random-walk loop, and keep the
+  `size < 3` guard on the walk branch while guarding `size <= 0` on the
+  `[1, 1]` branch (matching `0x434ab3`, where a 1- or 2-tile lot skips the
+  walk and lets the search return false normally).
 - In `interior(size, rotation)`, return `[far, near]` for rotation 1 and
   `[near, far]` for rotation 3.
 - In `turn([x, y], rotation)`, call `turn_in_square([x, y], (4 - i32::from(rotation & 3)) & 3)`.

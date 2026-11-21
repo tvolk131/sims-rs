@@ -7,21 +7,20 @@
 //!
 //! Operands: the mode (byte 0), a local (byte 1) and flags (byte 2). The
 //! object placed is the stack object (native error 0x15 if it names no
-//! object). The search starts from the middle of tile (1, 1) on level 1,
-//! or, with flag bit 0, from the position and level of the object the
-//! local names (native error 0x33 for a local the frame does not have,
-//! 0x17 if it names no object). Flag bit 1 lets the tile hold other
-//! objects; without it the tile must be empty. Flag bit 2 refuses tiles
-//! with ground flag 0x20.
+//! object). The search starts from `[16, 16]` (the corner of tile (1, 1),
+//! 0x422022) on level 1, or, with flag bit 0, from the position and level
+//! of the object the local names (native error 0x33 for a local the frame
+//! does not have, 0x17 if it names no object). Flag bit 1 lets the tile
+//! hold other objects; without it the tile must be empty. Flag bit 2
+//! refuses tiles with ground flag 0x20.
 //!
-//! Only mode 0 is ported, along with modes 6 and up, which the original
-//! treats the same: the lot's search ([`crate::Interpreter::search`])
-//! looks for a tile in the start tile's room, then anywhere. It draws no
-//! random numbers. A tile found is tested once more with the place test,
-//! the object is put there with the lot told (virtual function 0x58,
-//! 0x433340), and virtual function 0x74 runs. The true branch is taken;
-//! if no tile is found or the second test fails nothing moves and the
-//! false branch is taken.
+//! Mode 0, along with modes 6 and up, which the original treats the same:
+//! the lot's search ([`crate::Interpreter::search`]) looks for a tile in
+//! the start tile's room, then anywhere. It draws no random numbers. A
+//! tile found is tested once more with the place test, the object is put
+//! there with the lot told (virtual function 0x58, 0x433340), and virtual
+//! function 0x74 runs. The true branch is taken; if no tile is found or
+//! the second test fails nothing moves and the false branch is taken.
 //!
 //! Mode 1 takes the object off the lot (0x44b519 to 0x44b565): its virtual
 //! function 0x50 runs, asked to tell the registry (as Remove Object
@@ -208,29 +207,38 @@ impl Machine<'_, '_> {
     ///    inverse of the view's rotation (the world's +0x84, negated modulo
     ///    4; [`crate::Interpreter::view_rotation`]).
     ///
-    /// A lot smaller than three tiles has no tile inside its bounds, so
-    /// the original's loop never ends, and a lot of size 0 divides by zero:
-    /// both fail. So does a turned lot wider than 64 tiles, whose corners
-    /// the original would look up past its table of turns.
+    /// From `(1, 1)`, a non-positive lot size divides by zero (or wraps)
+    /// and fails, whereas a 1- or 2-tile lot skips the walk, takes its two
+    /// draws modulo `size`, and lets the search return false normally. From
+    /// any other start, a lot smaller than three tiles has no tile inside
+    /// its bounds, so the original's loop never ends, and a turned lot
+    /// wider than 64 tiles would look its corners up past the table of
+    /// turns: both fail.
     fn random_start(&mut self, from: [i32; 2]) -> Result<[i32; 2], Trap> {
         let size = i32::from(self.world.size);
-        if size < 3 {
-            return Err(Trap::Unsupported(format!(
-                "Find Location For mode 5 on a lot {size} tiles wide: no tile is inside its \
-                 bounds, so the random start never ends (0x434951)"
-            )));
-        }
-        if size > 64 && self.view_rotation & 3 != 0 {
-            return Err(Trap::Unsupported(format!(
-                "Find Location For mode 5 on a lot {size} tiles wide, turned: its corners are \
-                 past the table of turns (0x434f58)"
-            )));
-        }
         let [mut x, mut y] = from;
         if [x, y] == [1, 1] {
+            if size <= 0 {
+                return Err(Trap::Unsupported(format!(
+                    "Find Location For mode 5 on a lot {size} tiles wide: the random start \
+                     from (1, 1) divides by {size} (0x434ab3)"
+                )));
+            }
             x = (self.draw() % size as u32) as i32;
             y = (self.draw() % size as u32) as i32;
         } else {
+            if size < 3 {
+                return Err(Trap::Unsupported(format!(
+                    "Find Location For mode 5 on a lot {size} tiles wide: no tile is inside its \
+                     bounds, so the random start never ends (0x434951)"
+                )));
+            }
+            if size > 64 && self.view_rotation & 3 != 0 {
+                return Err(Trap::Unsupported(format!(
+                    "Find Location For mode 5 on a lot {size} tiles wide, turned: its corners are \
+                     past the table of turns (0x434f58)"
+                )));
+            }
             let [across, down] = interior(size, self.view_rotation);
             let tile = |n: i32| i32::from((n >> 4) as i8);
             loop {

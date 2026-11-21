@@ -845,6 +845,35 @@ fn mode_5_from_exactly_1_1_draws_a_point_modulo_the_lots_size() {
 }
 
 #[test]
+fn mode_5_on_a_two_tile_lot_returns_false_from_1_1_and_fails_otherwise() {
+    // Native 0x434ab3 takes two modulo-size draws from (1, 1) without
+    // entering the walk loop, so on a 2-tile lot both searches draw twice
+    // and return false normally; a non-(1, 1) start on size 2 or a size-0
+    // lot from (1, 1) still fails loudly.
+    let (mut fx, _) = placeable();
+    fx.world.size = 2;
+    fx.lamp_mut().position = [1, 1, 1];
+    let id = widget(&mut fx);
+    let mut expected = fx.world.lot_rng;
+    for _ in 0..4 {
+        expected.next_u32();
+    }
+    assert_eq!(find_random(&mut fx, LAMP as i16, id, 1, 0), Ok(false));
+    assert_eq!(fx.world.lot_rng, expected);
+
+    assert!(matches!(
+        find_random(&mut fx, 0, id, 0, 0),
+        Err(fault) if matches!(fault.trap, Trap::Unsupported(_))
+    ));
+
+    fx.world.size = 0;
+    assert!(matches!(
+        find_random(&mut fx, LAMP as i16, id, 1, 0),
+        Err(fault) if matches!(fault.trap, Trap::Unsupported(_))
+    ));
+}
+
+#[test]
 fn mode_5_turns_its_start_by_the_inverse_of_the_view() {
     // From state 8 on the six-tile lot. Unturned, the walk ends at once on
     // (40, 40). Turned, the bounds are on the 64-tile square's far side

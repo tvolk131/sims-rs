@@ -1674,10 +1674,11 @@ fn the_goth_day_under_the_recordings_frames_keeps_its_streams() {
     // From 36718 the lot stream moves one update before or after the
     // recording's at a few updates: 36718, 36929, 37058, 37126, and 37215
     // from the fitted frame schedule's drift against the recording's frames,
-    // and after 40317 by one update on the raccoon's draws because the
-    // unmodeled Special Effect PIP paint (0x4b3489 → 0x58da12) does not
-    // refresh its animator; it is the recording's again at the next update.
-    // The C runtime stream matches the recording's at every update of the day.
+    // and after 40317 by one update on the raccoon's draws — inferred from
+    // the binary's unmodeled Special Effect PIP paint (0x4b3489 → 0x58da12)
+    // refreshing the raccoon's animator (`goth-day-20261115` watched no
+    // frames) — before matching again at the next update. The C runtime
+    // stream matches the recording's at every update of the day.
     //
     // At tick 39610 the raccoon (object 10) runs Special Effect with flag
     // 0x40 clear while everyone sleeps at idle speed 1000; message 0x10c
@@ -1708,12 +1709,13 @@ fn the_goth_day_under_the_recordings_frames_keeps_its_streams() {
     lot.step().unwrap();
     tick += 1;
     assert_eq!((lot.world().speed(), lot.world().return_speed()), (760, -1));
-    // At tick 41446 (one update after the recording's 41445 because the
-    // unmodeled Special Effect PIP paint at 40317 refreshes the raccoon's
-    // animator once via 0x4b3489 → 0x58da12), the raccoon (object 10)
-    // runs Wander (tree 419 node 8: Find Location For mode 5) and places
-    // its wander target (object 37, GUID 0x000007C4) at [648, 312, 1]
-    // (tile (40, 19)), matching `goth-day-20261115`'s update 41445.
+    // At tick 41446 (one update after the recording's 41445 — inferred to
+    // follow an unmodeled Special Effect PIP paint refreshing the raccoon's
+    // animator via 0x4b3489 → 0x58da12 around update 40317; the recording
+    // watched no frames), the raccoon (object 10) runs Wander (tree 419
+    // node 8: Find Location For mode 5) and places its wander target
+    // (object 37, GUID 0x000007C4) at [648, 312, 1] (tile (40, 19)),
+    // matching `goth-day-20261115`'s update 41445.
     while tick < 41_446 {
         lot.step().unwrap();
         tick += 1;
