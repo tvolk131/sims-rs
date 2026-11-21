@@ -324,6 +324,31 @@ class RepositoryHygieneTests(unittest.TestCase):
                 result = self.assert_fails("known private game payload")
                 self.assertNotIn(payload.decode(), result.stdout + result.stderr)
 
+    def test_images_are_rejected_in_test_and_fixture_paths(self):
+        for name in [
+            "crates/sims-game/tests/scene.ppm", "crates/sims-game/tests/data/scene.tiff",
+            "fixtures/shot.png", "crates/x/testdata/shot.qoi",
+        ]:
+            with self.subTest(name=name):
+                path = self.write(name, "small")
+                self.assert_fails("image file in a test or fixture path")
+                path.unlink()
+
+    def test_image_content_is_rejected_in_test_paths_whatever_the_name(self):
+        for content in [
+            "P3\n2 1\n255\n0 0 0 255 255 255\n", "P6 # comment\n800 600\n255\n",
+            b"\x89PNG\r\n\x1a\nrest", b"GIF89a....",
+        ]:
+            with self.subTest(content=content):
+                path = self.write("crates/sims-game/tests/scene.txt", content)
+                self.assert_fails("image content in a test or fixture path")
+                path.unlink()
+
+    def test_text_that_is_not_an_image_passes_in_test_paths(self):
+        self.write("crates/sims-game/tests/ratchet.txt", "[scene]\ntick = 1260\nP6 is a word\n")
+        self.write("src/picture.ppm.rs", "// a source file\n")
+        self.assert_passes()
+
     def test_binary_content_cannot_hide_under_a_source_extension(self):
         self.write("source.rs", b"synthetic\0binary")
         self.assert_fails("binary content")

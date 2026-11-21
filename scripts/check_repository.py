@@ -55,6 +55,21 @@ FORBIDDEN_SUFFIXES = {
     ".jsonl", ".mp4", ".ogg", ".otf", ".pdf", ".png", ".qcow2",
     ".ttf", ".vdi", ".webm", ".webp",
 }
+# Screenshots and other pictures never go in a test or fixture path: the
+# screenshot ratchet keeps its references, and its difference images, under
+# cache/. Raster formats by name, and by their first bytes whatever the name
+# (an ASCII PPM is text, so the binary check alone would not catch it).
+TEST_DIRECTORIES = {"tests", "test", "fixtures", "testdata", "test-data", "test_data"}
+IMAGE_SUFFIXES = {
+    ".avif", ".bmp", ".dds", ".exr", ".gif", ".heic", ".ico", ".jpeg", ".jpg",
+    ".pam", ".pbm", ".pgm", ".png", ".pnm", ".ppm", ".qoi", ".tga", ".tif",
+    ".tiff", ".webp",
+}
+IMAGE_MAGIC = re.compile(
+    rb"\A(?:\x89PNG\r\n\x1a\n|GIF8[79]a|\xff\xd8\xff|P[1-7]\s+(?:#[^\n]*\n\s*)*\d+\s+\d+"
+    rb"|II\*\0|MM\0\*|qoif|RIFF....WEBP)",
+    re.DOTALL,
+)
 HEX_RUN = re.compile(rb"(?<![0-9a-fA-F])[0-9a-fA-F]{16,}(?![0-9a-fA-F])")
 BYTE_ARRAY = re.compile(rb"\[\s*(?:0x[0-9a-fA-F]{1,2}|\d{1,3})(?:\s*,\s*(?:0x[0-9a-fA-F]{1,2}|\d{1,3})){2,}\s*,?\s*\]")
 HEX_STRING = re.compile(rb'''["']([0-9a-fA-F]{2,})["']''')
@@ -78,8 +93,14 @@ def git(root, *arguments, input_bytes=None):
     )
 
 
+def in_test_directory(name):
+    return bool(TEST_DIRECTORIES.intersection(PurePosixPath(name.lower()).parts[:-1]))
+
+
 def path_violation(name):
     path = PurePosixPath(name.lower())
+    if in_test_directory(name) and path.suffix in IMAGE_SUFFIXES:
+        return "image file in a test or fixture path (screenshots stay under cache/)"
     if path.parts[0] in PRIVATE_ROOTS or PRIVATE_COMPONENTS.intersection(path.parts):
         return "local/private directory"
     if path.parts[:2] == ("fixtures", "private"):
@@ -169,6 +190,10 @@ def check_blob(root, policy, name, content, object_id=None, history=False):
             content.decode("utf-8")
         except UnicodeDecodeError:
             violations.append(f"{name}: non-UTF-8 binary content is not admitted by the source-only policy")
+    if in_test_directory(name) and IMAGE_MAGIC.match(content):
+        violations.append(
+            f"{name}: image content in a test or fixture path (screenshots stay under cache/)"
+        )
     if PurePosixPath(name).suffix.lower() == ".json" and name != POLICY_PATH:
         # In the tree being published, a review names the exact path. In
         # history, provenance follows the bytes: a reviewed file that was
