@@ -5704,19 +5704,45 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
             .iter()
             .any(|s| matches!(s, SoundEvent::Play { name, .. } if name == "UI_error"))
     );
+    // Available Undo / Redo (`0x4a8545`, `0x4a856a`) must keep the repeat
+    // preview cursor, held chair, and catalog selection armed, while updating
+    // preview validity as the tile frees and re-occupies.
+    assert!(game.can_undo());
+    assert!(game.undo_buy());
+    assert_eq!(game.buy_selected(), Some(0x26bf_bb29));
+    let armed_after_undo = game
+        .buy_cursor()
+        .expect("repeat preview stays armed after Undo")
+        .clone();
+    assert_eq!(armed_after_undo.held, second.held);
+    assert_eq!(armed_after_undo.cursor, second.cursor);
+    assert!(armed_after_undo.valid);
+    assert!(game.lot().world().objects[&first_chair].position[0] < 0);
+    assert_eq!(game.lot().world().budget.funds, 2542);
+    assert!(game.redo_buy());
+    assert_eq!(game.buy_selected(), Some(0x26bf_bb29));
+    let armed_after_redo = game
+        .buy_cursor()
+        .expect("repeat preview stays armed after Redo")
+        .clone();
+    assert_eq!(armed_after_redo.held, second.held);
+    assert_eq!(armed_after_redo.cursor, second.cursor);
+    assert!(!armed_after_redo.valid);
+    assert!(game.lot().world().objects[&first_chair].position[0] >= 0);
+    assert_eq!(
+        game.lot().world().objects[&first_chair].registry_word,
+        first_reg
+    );
+    assert_eq!(game.lot().world().budget.funds, 2542 - 80);
+
     assert!(game.cancel_buy());
     assert!(game.buy_cursor().is_none());
     assert_eq!(game.lot().world().objects.len(), objs_before + 1);
     let funds_after_buy = game.lot().world().budget.funds;
     assert_eq!(funds_after_buy, 2542 - 80);
 
-    // Undo / Redo through `Game` (`0x4a8545`/`0x4932fa` -> `0x48bd21`,
-    // `0x4a856a`/`0x493338` -> `0x48bdfe`): after Escape/cancel drops the
-    // repeat preview, Undo detaches the paid $80 Werkbunnst Chair off-lot
-    // (keeping it registered for Redo) and refunds $80; Redo reuses that
-    // exact instance and re-charges $80; undoing again then leaving Buy Mode
-    // clears both stacks and deletes the detached instance (`0x4cea5d` ->
-    // `0x4933dc` -> `0x48c20e`).
+    // Undo / Redo after cancelling the repeat preview, plus leaving Buy Mode
+    // deleting the detached instance (`0x4cea5d` -> `0x4933dc` -> `0x48c20e`).
     assert!(game.can_undo());
     assert!(!game.can_redo());
     assert!(game.undo_buy());

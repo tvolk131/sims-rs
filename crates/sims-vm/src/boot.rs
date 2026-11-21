@@ -1558,6 +1558,28 @@ impl Lot {
         !self.buy_redo.is_empty()
     }
 
+    /// Deletes any detached (off-lot) instances referenced by `dropped` from
+    /// `self.world` one by one (`0x48c20e` / `0x48c258`), so clearing history
+    /// on failure or error never leaves orphaned off-lot objects behind.
+    fn purge_buy_history(&mut self, dropped: &[crate::BuyPurchase]) {
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        for purchase in dropped {
+            let mut next = self.world.clone();
+            if interpreter
+                .buy_purge_detached(&mut next, std::slice::from_ref(purchase))
+                .is_ok()
+            {
+                self.world = next;
+            }
+        }
+    }
+
     /// Undoes the most recent committed Buy Mode purchase (`0x4cf2e0` / event
     /// `0xec` → `0x4932fa` → `0x48bd21`): runs OBJf 12 (`USER_PICKUP`), takes
     /// the purchased object off-lot while keeping it registered for Redo
@@ -1585,21 +1607,15 @@ impl Lot {
                 Ok(true)
             }
             Ok(false) => {
-                let mut cleared = self.world.clone();
-                if interpreter
-                    .buy_purge_detached(&mut cleared, std::slice::from_ref(&purchase))
-                    .is_ok()
-                    && interpreter
-                        .buy_purge_detached(&mut cleared, &self.buy_undo)
-                        .is_ok()
-                {
-                    self.world = cleared;
-                }
-                self.buy_undo.clear();
+                let mut dropped = std::mem::take(&mut self.buy_undo);
+                dropped.push(purchase);
+                self.purge_buy_history(&dropped);
                 Ok(false)
             }
             Err(fault) => {
-                self.buy_undo.clear();
+                let mut dropped = std::mem::take(&mut self.buy_undo);
+                dropped.push(purchase);
+                self.purge_buy_history(&dropped);
                 Err(OrderError::Refused(fault))
             }
         }
@@ -1607,11 +1623,12 @@ impl Lot {
 
     /// Redoes the most recently undone Buy Mode purchase (`0x4cf317` / event
     /// `0xed` → `0x493338` → `0x48bdfe`): reuses the detached registered
-    /// instance (`0x48c07b..0x48c082`), places it, runs `USER_PLACEMENT`,
-    /// re-deducts its price, and pushes it back onto the undo stack. Returns
-    /// `Ok(false)` when nothing can be redone (clearing the redo stack and
-    /// deleting detached redo instances if the top record could not be
-    /// applied, matching `0x493338` → `0x4933a9` → `0x48c20e`).
+    /// instance (`0x48c07b..0x48c082`), runs `USER_PICKUP` (`0x48bfcb`),
+    /// places it, runs `USER_PLACEMENT`, re-deducts its price, and pushes it
+    /// back onto the undo stack. Returns `Ok(false)` when nothing can be
+    /// redone (clearing the redo stack and deleting detached redo instances if
+    /// the top record could not be applied or errored, matching `0x493338` →
+    /// `0x4933a9` → `0x48c20e`).
     pub fn buy_redo(&mut self) -> Result<bool, OrderError> {
         self.ready()?;
         let Some(mut purchase) = self.buy_redo.pop() else {
@@ -1632,21 +1649,15 @@ impl Lot {
                 Ok(true)
             }
             Ok(false) => {
-                let mut cleared = self.world.clone();
-                if interpreter
-                    .buy_purge_detached(&mut cleared, std::slice::from_ref(&purchase))
-                    .is_ok()
-                    && interpreter
-                        .buy_purge_detached(&mut cleared, &self.buy_redo)
-                        .is_ok()
-                {
-                    self.world = cleared;
-                }
-                self.buy_redo.clear();
+                let mut dropped = std::mem::take(&mut self.buy_redo);
+                dropped.push(purchase);
+                self.purge_buy_history(&dropped);
                 Ok(false)
             }
             Err(fault) => {
-                self.buy_redo.clear();
+                let mut dropped = std::mem::take(&mut self.buy_redo);
+                dropped.push(purchase);
+                self.purge_buy_history(&dropped);
                 Err(OrderError::Refused(fault))
             }
         }

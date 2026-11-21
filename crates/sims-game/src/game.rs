@@ -1664,58 +1664,82 @@ impl Game {
         self.hud.controls.mode == Mode::Buy && self.lot.can_buy_redo()
     }
 
-    /// Undoes the most recent committed Buy Mode purchase (`0x4cf2e0` / event
-    /// `0xec` → `0x4932fa` → `0x48bd21`), cancelling any active unplaced
-    /// preview first only when an undoable purchase exists. Returns `true` if
-    /// a purchase was undone.
-    pub fn undo_buy(&mut self) -> bool {
-        if !self.can_undo() || self.stopped.is_some() {
+    /// Runs a Buy Mode Undo (`undo = true`) or Redo (`undo = false`) while
+    /// keeping any active placement preview and catalog selection armed
+    /// (`0x4a8545`, `0x4a856a`). Temporarily lifts an on-lot preview cursor
+    /// off-lot during the history step so it cannot collide with a redone
+    /// object, then re-evaluates its placement and affordability at its saved
+    /// position.
+    fn apply_buy_history(&mut self, undo: bool) -> bool {
+        let allowed = if undo {
+            self.can_undo()
+        } else {
+            self.can_redo()
+        };
+        if !allowed || self.stopped.is_some() {
             return false;
         }
-        self.cancel_buy();
-        if self.buy_cursor.is_some() {
-            return false;
+        self.buy_dragging = None;
+        let saved_cursor = if let Some(mut cursor) = self.buy_cursor.take() {
+            let saved_pos = (cursor.position[0] >= 0).then_some(cursor.position);
+            if saved_pos.is_some()
+                && let Err(e) = self.lot.buy_hide(&mut cursor)
+            {
+                self.buy_cursor = Some(cursor);
+                self.note = Some(format!("Could not lift Buy preview for history: {e}"));
+                return false;
+            }
+            Some((cursor, saved_pos))
+        } else {
+            None
+        };
+        let result = if undo {
+            self.lot.buy_undo()
+        } else {
+            self.lot.buy_redo()
+        };
+        if let Some((mut cursor, saved_pos)) = saved_cursor {
+            if let Some([x, y, level]) = saved_pos
+                && let Err(e) = self.lot.buy_move(&mut cursor, [x, y], level)
+            {
+                self.note = Some(format!("Could not restore Buy preview: {e}"));
+            }
+            self.buy_cursor = Some(cursor);
         }
-        match self.lot.buy_undo() {
+        match result {
             Ok(true) => {
                 self.refresh_world();
                 self.hud
                     .layout_buy(self.view.size, self.lot.world(), &self.assets);
                 true
             }
-            Ok(false) => false,
+            Ok(false) => {
+                self.refresh_world();
+                false
+            }
             Err(e) => {
-                self.note = Some(format!("The purchase was not undone: {e}"));
+                let verb = if undo { "undone" } else { "redone" };
+                self.note = Some(format!("The purchase was not {verb}: {e}"));
+                self.refresh_world();
                 false
             }
         }
     }
 
+    /// Undoes the most recent committed Buy Mode purchase (`0x4cf2e0` / event
+    /// `0xec` → `0x4932fa` → `0x48bd21`), keeping any active placement preview
+    /// and catalog selection armed (`0x4a8545`). Returns `true` if a purchase
+    /// was undone.
+    pub fn undo_buy(&mut self) -> bool {
+        self.apply_buy_history(true)
+    }
+
     /// Redoes the most recently undone Buy Mode purchase (`0x4cf317` / event
-    /// `0xed` → `0x493338` → `0x48bdfe`), cancelling any active unplaced
-    /// preview first only when a redoable purchase exists. Returns `true` if a
-    /// purchase was redone.
+    /// `0xed` → `0x493338` → `0x48bdfe`), keeping any active placement preview
+    /// and catalog selection armed (`0x4a856a`). Returns `true` if a purchase
+    /// was redone.
     pub fn redo_buy(&mut self) -> bool {
-        if !self.can_redo() || self.stopped.is_some() {
-            return false;
-        }
-        self.cancel_buy();
-        if self.buy_cursor.is_some() {
-            return false;
-        }
-        match self.lot.buy_redo() {
-            Ok(true) => {
-                self.refresh_world();
-                self.hud
-                    .layout_buy(self.view.size, self.lot.world(), &self.assets);
-                true
-            }
-            Ok(false) => false,
-            Err(e) => {
-                self.note = Some(format!("The purchase was not redone: {e}"));
-                false
-            }
-        }
+        self.apply_buy_history(false)
     }
 
     /// Sets whether the Shift modifier is held (`VK_SHIFT`, `0x4864f9`),

@@ -600,6 +600,9 @@ impl Interpreter<'_> {
             at: None,
             trap,
         };
+        // Native `0x48bfab` line `0x48bfcb`: invoke `UserPickup(0)` (OBJf 12)
+        // on the instance before rotating or testing placement.
+        self.run_user_pickup(world, id)?;
         self.rotate_object_to(world, id, purchase.facing)?;
         let fits = match purchase.container {
             Some((cid, slot)) => self.fits_in(world, id, cid, i32::from(slot), [x, y], level)?,

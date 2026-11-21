@@ -104,10 +104,12 @@ panel, and `sims-vm` had no `"Tile Cursor"` creation or Buy placement tool.
     (`USER_PICKUP`, `0x435751` / `0x422ff5`), detaches the purchased object
     off-lot while keeping it registered, and refunds its price (`0x48bdbd`);
     Redo (keyboard event `0xed` at `0x4a856a` → `0x493338` → `0x48bdfe`) reuses
-    that detached instance (`0x48c07b..0x48c082`), places it, runs
-    `USER_PLACEMENT`, and re-charges it; leaving a non-Live mode clears both
-    stacks and deletes detached off-lot instances (`0x4cea5d` → `0x4933dc` →
-    `0x48c20e`). Note that on-screen Undo/Redo buttons (`kToolBtnUndo = 64` at
+    that detached instance (`0x48c07b..0x48c082`), invokes `USER_PICKUP`
+    (`0x48bfcb`), places it, runs `USER_PLACEMENT`, and re-charges it; both
+    keyboard handlers keep any armed placement preview and catalog selection
+    intact while refreshing preview validity. Leaving a non-Live mode or
+    discarding history on a failed/errored Undo/Redo clears the stack and
+    deletes detached off-lot instances (`0x4cea5d` → `0x4933dc` → `0x48c20e`). Note that on-screen Undo/Redo buttons (`kToolBtnUndo = 64` at
     `(231, 21)`, `kToolBtnRedo = 65` at `(231, 53)`, `0x5004f5` / `0x500f87` /
     `0x501197`) belong exclusively to Build Mode (`mode == 0` in `0x50a8ec`);
     Buy Mode (`cWinCatalog`, `mode == 1`, `0x5050e4` / `0x507288`) has no
