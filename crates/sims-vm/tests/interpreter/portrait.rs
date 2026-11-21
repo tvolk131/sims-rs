@@ -724,13 +724,17 @@ const TEXT_STRINGS: [&str; 5] = [
 /// The catalog string table the person's definition names (word 41).
 const SIM_NAMES: u16 = 2000;
 
+/// The catalog string table the widget's definition names (word 41).
+const WIDGET_NAMES: u16 = 2002;
+
 /// The person (2) as the stack object of a dialog whose message, label
 /// and title are entries of [`TEXT_STRINGS`] (0 for none). Neighbor record
-/// 2 is of the widget's type, with nobody of it on the lot. The person's
-/// catalog name, which `$Object` is replaced by, is `names` (CTSS entries
-/// with their language), or no table at all.
+/// 2 is of the widget's type, with nobody of it on the lot; the widget's
+/// catalog name, which `$Neighbor` is replaced by, is `Widget`. The
+/// person's catalog name, which `$Object` is replaced by, is `names`
+/// (CTSS entries with their language), or no table at all.
 fn text_dialog((label, title, message): (u8, u8, u8), names: Option<Vec<(u8, &str)>>) -> Fixture {
-    let (mut fx, _, record) = visitors();
+    let (mut fx, widget, record) = visitors();
     let neighbor = fx.world.neighbors.slots[record as usize - 1].clone();
     let slots = &mut fx.world.neighbors.slots;
     slots.resize(slots.len().max(2), None);
@@ -744,16 +748,10 @@ fn text_dialog((label, title, message): (u8, u8, u8), names: Option<Vec<(u8, &st
         .insert(301, TEXT_STRINGS.map(str::to_owned).to_vec());
     fx.words(SIM_FILE)[41] = SIM_NAMES as i16;
     if let Some(names) = names {
-        fx.program
-            .libraries
-            .get_mut(&SIM_FILE)
-            .unwrap()
-            .catalog_strings
-            .insert(
-                SIM_NAMES,
-                names.into_iter().map(|(l, t)| (l, t.to_owned())).collect(),
-            );
+        name(&mut fx, SIM_FILE, SIM_NAMES, names);
     }
+    fx.words(widget)[41] = WIDGET_NAMES as i16;
+    name(&mut fx, widget, WIDGET_NAMES, vec![(1, "Widget")]);
     fx.add(
         LAMP_FILE,
         4096,
@@ -765,6 +763,42 @@ fn text_dialog((label, title, message): (u8, u8, u8), names: Option<Vec<(u8, &st
         )]),
     );
     fx
+}
+
+/// Puts catalog string table `table` in file `file`, with `names` (CTSS
+/// entries with their language).
+fn name(fx: &mut Fixture, file: usize, table: u16, names: Vec<(u8, &str)>) {
+    fx.program
+        .libraries
+        .get_mut(&file)
+        .unwrap()
+        .catalog_strings
+        .insert(
+            table,
+            names.into_iter().map(|(l, t)| (l, t.to_owned())).collect(),
+        );
+}
+
+/// Gives the widget of a [`text_dialog`] the catalog names `$Neighbor` is
+/// replaced by, or none.
+fn name_widget(fx: &mut Fixture, names: Option<Vec<(u8, &str)>>) {
+    // The widget's file is the one with the "init visitor" tree.
+    let widget = *fx
+        .program
+        .libraries
+        .iter()
+        .find(|(_, library)| library.names.values().any(|n| n == "init visitor"))
+        .unwrap()
+        .0;
+    fx.program
+        .libraries
+        .get_mut(&widget)
+        .unwrap()
+        .catalog_strings
+        .remove(&WIDGET_NAMES);
+    if let Some(names) = names {
+        name(fx, widget, WIDGET_NAMES, names);
+    }
 }
 
 /// Sets string 1 of the lamp's STR# 301, the message in most dialogs here.
@@ -785,15 +819,22 @@ const LAMP_NAMES: u16 = 2001;
 /// is replaced by.
 fn name_lamp(fx: &mut Fixture, names: Vec<(u8, &str)>) {
     fx.words(LAMP_FILE)[41] = LAMP_NAMES as i16;
-    fx.program
-        .libraries
-        .get_mut(&LAMP_FILE)
-        .unwrap()
-        .catalog_strings
-        .insert(
-            LAMP_NAMES,
-            names.into_iter().map(|(l, t)| (l, t.to_owned())).collect(),
-        );
+    name(fx, LAMP_FILE, LAMP_NAMES, names);
+}
+
+/// Makes the lamp's tree 4096 the dialog of a [`text_dialog`] with icon
+/// mode `mode` (operand 7 bits 1 to 3), message 1 and operand 1 `extra`.
+fn in_mode(fx: &mut Fixture, mode: u8, extra: u8) {
+    fx.add(
+        LAMP_FILE,
+        4096,
+        tree(vec![ins(
+            DIALOG,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [0, extra, 1, 0, 0, 0, 0, 1 | mode << 1],
+        )]),
+    );
 }
 
 #[test]
@@ -803,7 +844,7 @@ fn a_dialogs_text_can_show_the_stack_objects_neighbor_instead() {
     // (operand 6), message (operand 2): `$Neighbor` gives the stack
     // object's neighbor record's type, `$Object` the stack object's, and
     // the last found is kept. With neither, the stack object's (0x436308).
-    // The person's name is plain.
+    // The names are plain.
     for (strings, shown) in [
         ((0, 0, 1), SIM_GUID),
         ((0, 0, 2), WIDGET),
@@ -816,12 +857,19 @@ fn a_dialogs_text_can_show_the_stack_objects_neighbor_instead() {
         assert_eq!(ran, Ok(true), "{strings:?}");
         assert_eq!(fx.world.portraits, [shown].into(), "{strings:?}");
     }
+    // With no stack object the tokens stay (0x44c183 to 0x44c1a6), and
+    // nothing is shown.
+    for strings in [(0, 0, 4), (0, 0, 5)] {
+        let mut fx = text_dialog(strings, Some(vec![(1, "Grim")]));
+        assert_eq!(fx.run_with(LAMP, 4096, 0, &[], 1000), Ok(true));
+        assert!(fx.world.portraits.is_empty());
+    }
 }
 
 #[test]
 fn an_object_name_that_may_hold_a_neighbor_token_fails_loudly() {
     // `$Object` is replaced by the stack object's catalog name (0x44c1ca,
-    // 0x457d3b), and the `$Neighbor` pass after it reads the text with the
+    // 0x4573d9), and the `$Neighbor` pass after it reads the text with the
     // name in it: a name holding `$Neighbor`, or making it with the text
     // around it, shows the neighbor's type. The entry 0x4061e3 picks is not
     // ported, so every entry is tried; the names are not known when the
@@ -829,13 +877,13 @@ fn an_object_name_that_may_hold_a_neighbor_token_fails_loudly() {
     // back to the definition's own name, 0x457db4), or there is no table.
     // Where the names do not agree on the portrait, the dialog fails; names
     // not known fail too, since one may never end (0x4558a0).
-    for (names, message) in [
-        (None, 3),
-        (Some(vec![(1, "Grim"), (2, "$Neighbor")]), 3),
-        (Some(vec![(1, "")]), 3),
-        (Some(vec![(2, "Grim")]), 3),
-        (Some(vec![(1, "Neighbor"), (2, "Grim")]), 5),
-        (None, 5),
+    for (names, message, fault_at) in [
+        (None, 3, "not known"),
+        (Some(vec![(1, "Grim"), (2, "$Neighbor")]), 3, "0x4061e3"),
+        (Some(vec![(1, "")]), 3, "not known"),
+        (Some(vec![(2, "Grim")]), 3, "not known"),
+        (Some(vec![(1, "Neighbor"), (2, "Grim")]), 5, "0x4061e3"),
+        (None, 5, "not known"),
     ] {
         for strings in [(2, message, 0), (0, 0, message)] {
             let mut fx = text_dialog(strings, names.clone());
@@ -843,27 +891,23 @@ fn an_object_name_that_may_hold_a_neighbor_token_fails_loudly() {
                 .run_with(LAMP, 4096, SIM as i16, &[], 1000)
                 .unwrap_err()
                 .to_string();
-            assert!(fault.contains("0x44c1ca"), "{names:?} {strings:?}: {fault}");
+            assert!(fault.contains(fault_at), "{names:?} {strings:?}: {fault}");
             assert!(fx.world.portraits.is_empty());
         }
         // Where the neighbor is found after the name, the name does not
         // matter to the portrait. A name not known may hold `$Object` past
         // its first character, which never ends.
-        let known = names.as_ref().is_some_and(|names| {
-            names.iter().any(|(language, _)| *language == 1)
-                && names.iter().all(|(_, name)| !name.is_empty())
-        });
         let mut fx = text_dialog((message, 0, 2), names.clone());
         let ran = fx.run_with(LAMP, 4096, SIM as i16, &[], 1000);
-        if known {
-            assert_eq!(ran, Ok(true));
-            assert_eq!(fx.world.portraits, [WIDGET].into(), "{names:?}");
-        } else {
+        if fault_at == "not known" {
             let fault = ran.unwrap_err().to_string();
             assert!(
                 fault.contains("0x44c1ca") && fault.contains("not known"),
                 "{names:?}: {fault}"
             );
+        } else {
+            assert_eq!(ran, Ok(true));
+            assert_eq!(fx.world.portraits, [WIDGET].into(), "{names:?}");
         }
     }
     // Where every name gives the same, it is used: each holds `$Neighbor`,
@@ -894,63 +938,294 @@ fn an_object_name_that_may_hold_a_neighbor_token_fails_loudly() {
 }
 
 #[test]
-fn a_token_of_a_pass_before_the_neighbors_that_may_decide_the_portrait_fails_loudly() {
-    // The formatter's passes before `$Neighbor`'s (0x44bf1a) that are not
-    // ported: `$FamilyAssets` and `$Family` before `$Object`'s; `$Local`,
-    // `$Attrib`, `$NameAttrib`, `$NameLocal` and `$TokenNameLocal` between
-    // it and `$NeighborLocal`'s. A name one writes may hold `$Neighbor`
-    // (or, before `$Object`'s, `$Object`); `$Family` writes one when the
-    // stack object names a neighbor record, as here. A number cannot, but `$Local` in `$NeighborLocal:$Local:0` makes a
-    // `$NeighborLocal` token whose pass may take `$Neighbor` out (0x44c257,
-    // 0x44c590). The person's own name is plain.
-    let message = |fx: &mut Fixture, text: &str| {
-        set_message(fx, text);
-        name_lamp(fx, vec![(1, "Lamp")]);
-    };
-    for text in [
-        "$NeighborLocal:$Local:0",
-        "$Neighbor, $Attrib:0",
-        "$FamilyAssets",
-        "$Family",
-        "$Object and $NameAttrib:0",
-        "$NameLocal:0",
-        "$TokenNameLocal:0",
-    ] {
+fn neighbor_is_replaced_by_the_neighbors_name_and_may_never_end() {
+    // `$Neighbor` (0x44c65f) is replaced by the name of the neighbor
+    // record's type (0x4573d9, 0x44c6ba), and the search goes on from one
+    // past it (0x44c6d7 to 0x44c6e8): a name that holds the token past its
+    // first character never ends, in every mode and with no locals; names
+    // not known may be one.
+    for names in [Some(vec![(1, "my $Neighbor")]), None] {
+        for mode in [0, 1] {
+            let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
+            set_message(&mut fx, "$Neighbor");
+            name_widget(&mut fx, names.clone());
+            in_mode(&mut fx, mode, 0);
+            let fault = fx
+                .run_with(LAMP, 4096, SIM as i16, &[], 1000)
+                .unwrap_err()
+                .to_string();
+            assert!(fault.contains("0x44c6ba"), "{names:?} {mode}: {fault}");
+            assert!(fx.world.portraits.is_empty());
+        }
+    }
+    // One that holds it at its start is replaced once; with no neighbor
+    // record the token stays.
+    let mut fx = text_dialog((0, 0, 2), Some(vec![(1, "Grim")]));
+    name_widget(&mut fx, Some(vec![(1, "$Neighbors")]));
+    assert_eq!(fx.run_with(LAMP, 4096, SIM as i16, &[], 1000), Ok(true));
+    assert_eq!(fx.world.portraits, [WIDGET].into());
+    let mut fx = text_dialog((0, 0, 2), Some(vec![(1, "Grim")]));
+    name_widget(&mut fx, None);
+    assert_eq!(fx.run_with(LAMP, 4096, 0, &[], 1000), Ok(true));
+    assert!(fx.world.portraits.is_empty());
+}
+
+#[test]
+fn a_token_of_a_pass_not_ported_fails_loudly() {
+    // The formatter's passes that are not ported (0x44bf1a): `$FamilyAssets`
+    // and `$Family` (0x44bf66, 0x44c034) before `$Me`'s; `$Local`, `$Attrib`,
+    // `$NameAttrib`, `$NameLocal` and `$TokenNameLocal` between `$Object`'s
+    // and `$NeighborLocal`'s after `$Local`'s (they read locals and the
+    // stack object's attributes, and may fault, throw or add an inventory:
+    // 0x44c2dd, 0x44c381, 0x44c57b, 0x42a8a1). A text that holds one of
+    // their tokens when they run fails loudly, whatever the token's number,
+    // the stack object, the mode, the locals or the object running. So does
+    // one with a career token after `$Neighbor`'s (0x44c966) when the object
+    // running is not a person, which the pass casts it to (0x44c9bc) and
+    // reads (0x44ca27).
+    let tokens = [
+        ("$FamilyAssets", "0x44c034"),
+        ("$Family", "0x44c034"),
+        ("$Attrib", "`$Attrib`"),
+        ("$NameAttrib:0", "`$NameAttrib`"),
+        ("$NameLocal:9", "`$NameLocal`"),
+        ("$TokenNameLocal", "`$TokenNameLocal`"),
+        ("$TokenNameLocal:0000000000000001", "`$TokenNameLocal`"),
+        ("$Local:0 $Attrib", "`$Attrib`"),
+        ("$Job", "0x44ca27"),
+        ("$JobOffer:0:1", "0x44ca27"),
+        ("$JobDesc:9", "0x44ca27"),
+    ];
+    for (text, said) in tokens {
+        for (mode, stack_object) in [(0, SIM as i16), (0, 0), (1, SIM as i16), (1, 0)] {
+            let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
+            set_message(&mut fx, text);
+            in_mode(&mut fx, mode, 0);
+            let fault = fx
+                .run_with(LAMP, 4096, stack_object, &[], 1000)
+                .unwrap_err()
+                .to_string();
+            assert!(fault.contains(said), "{text} {mode}: {fault}");
+            assert!(fx.world.portraits.is_empty(), "{text}");
+        }
+    }
+    // In every icon mode (0x436219 to 0x436265), and in mode 4's operand 1
+    // string (0x4362c0).
+    for (mode, extra) in [(2, 0), (4, 0), (4, 2), (5, 0)] {
         let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
-        message(&mut fx, text);
+        let message = if extra == 0 { "$Job" } else { "Hello" };
+        set_message(&mut fx, message);
+        fx.program
+            .libraries
+            .get_mut(&LAMP_FILE)
+            .unwrap()
+            .strings
+            .get_mut(&301)
+            .unwrap()[1] = "$Job".to_owned();
+        in_mode(&mut fx, mode, extra);
         let fault = fx
             .run_with(LAMP, 4096, SIM as i16, &[], 1000)
             .unwrap_err()
             .to_string();
-        assert!(fault.contains("0x44c4a2"), "{text}: {fault}");
-        assert!(fx.world.portraits.is_empty(), "{text}");
+        assert!(fault.contains("0x44ca27"), "mode {mode}: {fault}");
     }
-    // A number with no `$Neighbor` in the text cannot change what is found.
-    for (text, shown) in [
-        ("$Local:0 and $Attrib:1", SIM_GUID),
-        ("$Object at $Local:0", SIM_GUID),
+    // A tree with no locals.
+    let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
+    set_message(&mut fx, "$Job $TokenNameLocal:0");
+    fx.add(
+        LAMP_FILE,
+        4096,
+        shaped(
+            0x8002,
+            0,
+            4,
+            0,
+            vec![ins(
+                DIALOG,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [0, 0, 1, 0, 0, 0, 0, 1 | 1 << 1],
+            )],
+        ),
+    );
+    let fault = fx
+        .run_with(LAMP, 4096, 0, &[], 1000)
+        .unwrap_err()
+        .to_string();
+    assert!(fault.contains("`$TokenNameLocal`"), "{fault}");
+    // A person running it: the inventories are as they were.
+    let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
+    fx.program
+        .libraries
+        .get_mut(&SIM_FILE)
+        .unwrap()
+        .strings
+        .insert(301, vec!["$TokenNameLocal:0".to_owned()]);
+    fx.add(
+        SIM_FILE,
+        4096,
+        tree(vec![ins(
+            DIALOG,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [0, 0, 1, 0, 0, 0, 0, 1],
+        )]),
+    );
+    let inventories = fx.world.neighbors.inventories.clone();
+    let fault = fx
+        .run_with(SIM, 4096, 0, &[], 1000)
+        .unwrap_err()
+        .to_string();
+    assert!(fault.contains("`$TokenNameLocal`"), "{fault}");
+    assert_eq!(fx.world.neighbors.inventories, inventories);
+    // A name a ported pass writes is read by the passes after it: the
+    // lamp's (`$Me`), the stack object's (`$Object`), the neighbor's
+    // (`$Neighbor`).
+    for (message, lamp, sim, widget, said) in [
+        ("$Me", "my $Attrib", "Grim", "Widget", "`$Attrib`"),
+        (
+            "$Object",
+            "Lamp",
+            "Grim $NameLocal",
+            "Widget",
+            "`$NameLocal`",
+        ),
+        ("$Neighbor", "Lamp", "Grim", "a $Job", "0x44ca27"),
+        ("$Object", "Lamp", "Grim $Job", "Widget", "0x44ca27"),
+    ] {
+        let mut fx = text_dialog((0, 0, 1), Some(vec![(1, sim)]));
+        set_message(&mut fx, message);
+        name_lamp(&mut fx, vec![(1, lamp)]);
+        name_widget(&mut fx, Some(vec![(1, widget)]));
+        in_mode(&mut fx, 1, 0);
+        let fault = fx
+            .run_with(LAMP, 4096, SIM as i16, &[], 1000)
+            .unwrap_err()
+            .to_string();
+        assert!(fault.contains(said), "{message}: {fault}");
+    }
+    // Tokens a pass's name puts in after that pass has run are left: a
+    // `$Family` from `$Me`, a `$Local` or `$Attrib` from `$Neighbor`.
+    for (message, lamp, widget) in [
+        ("$Me", "a $Family", "Widget"),
+        ("$Neighbor", "Lamp", "a $Local:0 $Attrib"),
     ] {
         let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
-        message(&mut fx, text);
-        assert_eq!(fx.run_with(LAMP, 4096, SIM as i16, &[], 1000), Ok(true));
-        assert_eq!(fx.world.portraits, [shown].into(), "{text}");
+        set_message(&mut fx, message);
+        name_lamp(&mut fx, vec![(1, lamp)]);
+        name_widget(&mut fx, Some(vec![(1, widget)]));
+        assert_eq!(
+            fx.run_with(LAMP, 4096, SIM as i16, &[], 1000),
+            Ok(true),
+            "{message}"
+        );
     }
-    // A name written before `$Object`'s pass may hold `$Object`, which
-    // would take the place of the neighbor found in an earlier string (the
-    // button's label comes first).
-    let mut fx = text_dialog((2, 0, 1), Some(vec![(1, "Grim")]));
-    message(&mut fx, "$Family");
+}
+
+#[test]
+fn the_passes_after_neighbors_are_presentation_for_a_person() {
+    // `$CatalogLocal`, `$FameTitleLocal`, `$Grade` and `$TimeLocal`
+    // (0x44c6ea to 0x44c961) write text, in any mode and for any object
+    // running; the career's (0x44c966) for a person. Not worked out.
+    for text in [
+        "$TimeLocal:0",
+        "$Grade",
+        "$CatalogLocal:0",
+        "$FameTitleLocal:0",
+        "$TimeLocal:2 to $TimeLocal:3",
+    ] {
+        for mode in [0, 1] {
+            let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
+            set_message(&mut fx, text);
+            in_mode(&mut fx, mode, 0);
+            assert_eq!(fx.run_with(LAMP, 4096, SIM as i16, &[], 1000), Ok(true));
+        }
+    }
+    let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
+    fx.program
+        .libraries
+        .get_mut(&SIM_FILE)
+        .unwrap()
+        .strings
+        .insert(
+            301,
+            vec!["Promoted (to $Job:0:1)! $JobDesc:0:1 $JobOffer".to_owned()],
+        );
+    fx.add(
+        SIM_FILE,
+        4096,
+        tree(vec![ins(
+            DIALOG,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [0, 0, 1, 0, 0, 0, 0, 1 | 1 << 1],
+        )]),
+    );
+    assert_eq!(fx.run_with(SIM, 4096, 0, &[], 1000), Ok(true));
+}
+
+#[test]
+fn local_is_replaced_by_the_locals_value() {
+    // `$Local` (0x44c1f2) is replaced, with its `:` and numbers, by the
+    // value of the local its first number names, in decimal (0x46f941),
+    // before `$NeighborLocal`'s pass reads the text. The number is its
+    // first 15 digits (0x44cb52). A number that is not a local leaves the
+    // token. Here local 0 is 3, local 1 is -7, local 2 is 0 and local 3
+    // names neighbor record 2, of the widget's type, a person's: a
+    // `$NeighborLocal` token naming it fails loudly (its name is not
+    // ported).
+    for (text, shown) in [
+        ("$NeighborLocal:$Local:0000000000000003", None),
+        ("$NeighborLocal:$Local:000000000000003", Some(WIDGET)),
+        ("$NeighborLocal:$Local:1", Some(WIDGET)),
+        ("$NeighborLocal:$Local:2:5", Some(WIDGET)),
+        ("$NeighborLocal:$Local:0", None),
+        ("$Local:9 $Local $Neighbor", Some(WIDGET)),
+        ("Hello $Local:3", Some(SIM_GUID)),
+    ] {
+        let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
+        set_message(&mut fx, text);
+        fx.add(
+            LAMP_FILE,
+            4096,
+            tree(vec![
+                assign(scope::LOCALS, 0, scope::LITERAL, 3, 1),
+                assign(scope::LOCALS, 1, scope::LITERAL, -7, 2),
+                assign(scope::LOCALS, 2, scope::LITERAL, 0, 3),
+                assign(scope::LOCALS, 3, scope::LITERAL, SIM as i16, 4),
+                ins(DIALOG, RETURN_TRUE, RETURN_FALSE, [0, 0, 1, 0, 0, 0, 0, 1]),
+            ]),
+        );
+        let ran = fx.run_with(LAMP, 4096, SIM as i16, &[], 1000);
+        match shown {
+            Some(shown) => {
+                assert_eq!(ran, Ok(true), "{text}");
+                assert_eq!(fx.world.portraits, [shown].into(), "{text}");
+            }
+            None => {
+                let fault = ran.unwrap_err().to_string();
+                assert!(fault.contains("0x4e893e"), "{text}: {fault}");
+            }
+        }
+    }
+    // A local that starts as half of a pointer fails, as any read does.
+    let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
+    set_message(&mut fx, "$Local:1");
+    fx.world.frame_storage.insert(
+        LAMP,
+        sims_sim::FrameStorage {
+            unknown: [(0, 1)].into(),
+            ..Default::default()
+        },
+    );
     let fault = fx
         .run_with(LAMP, 4096, SIM as i16, &[], 1000)
         .unwrap_err()
         .to_string();
-    assert!(fault.contains("0x44c4a2"), "{fault}");
-    // Where `$Neighbor` is found in a later string, the earlier one's
-    // tokens do not matter.
-    let mut fx = text_dialog((1, 0, 2), Some(vec![(1, "Grim")]));
-    message(&mut fx, "$NeighborLocal:$Local:0");
-    assert_eq!(fx.run_with(LAMP, 4096, SIM as i16, &[], 1000), Ok(true));
-    assert_eq!(fx.world.portraits, [WIDGET].into());
+    assert!(
+        fault.contains("0x44c240") && fault.contains("half of a pointer"),
+        "{fault}"
+    );
 }
 
 #[test]
@@ -962,24 +1237,10 @@ fn me_is_replaced_by_the_running_objects_name_before_object_is() {
     // before the message.
     let with_lamp_names = |names: Option<Vec<(u8, &str)>>| {
         let mut fx = text_dialog((2, 0, 1), Some(vec![(1, "Grim")]));
-        fx.program
-            .libraries
-            .get_mut(&LAMP_FILE)
-            .unwrap()
-            .strings
-            .get_mut(&301)
-            .unwrap()[0] = "$Me is here".to_owned();
+        set_message(&mut fx, "$Me is here");
         fx.words(LAMP_FILE)[41] = LAMP_NAMES as i16;
         if let Some(names) = names {
-            fx.program
-                .libraries
-                .get_mut(&LAMP_FILE)
-                .unwrap()
-                .catalog_strings
-                .insert(
-                    LAMP_NAMES,
-                    names.into_iter().map(|(l, t)| (l, t.to_owned())).collect(),
-                );
+            name(&mut fx, LAMP_FILE, LAMP_NAMES, names);
         }
         fx
     };
@@ -996,13 +1257,7 @@ fn me_is_replaced_by_the_running_objects_name_before_object_is() {
     // a name `x$` before `Me` makes `$Me` again, and that one's name then
     // makes `$Object`.
     let mut fx = with_lamp_names(Some(vec![(1, "x$")]));
-    fx.program
-        .libraries
-        .get_mut(&LAMP_FILE)
-        .unwrap()
-        .strings
-        .get_mut(&301)
-        .unwrap()[0] = "$MeMeObject".to_owned();
+    set_message(&mut fx, "$MeMeObject");
     assert_eq!(fx.run_with(LAMP, 4096, SIM as i16, &[], 1000), Ok(true));
     assert_eq!(fx.world.portraits, [SIM_GUID].into());
     // A name that holds `$Me` at its start is replaced once: the search
@@ -1015,7 +1270,7 @@ fn me_is_replaced_by_the_running_objects_name_before_object_is() {
     // the search goes on from, so the pass never ends; names not known may
     // be one. Both fail whatever the portrait.
     for (names, fault_at) in [
-        (Some(vec![(1, "Lamp"), (2, "$Object")]), "0x44c65f"),
+        (Some(vec![(1, "Lamp"), (2, "$Object")]), "0x4061e3"),
         (Some(vec![(1, "my $Me")]), "never ends"),
         (Some(vec![(1, "Lamp"), (2, "$$Me")]), "never ends"),
         (None, "not known"),
@@ -1047,13 +1302,7 @@ fn object_is_replaced_again_from_one_past_each_place() {
     // it replaced (0x44c1e3): a name `x$` before `Object` makes `$Object`
     // again, and its name then makes `$Neighbor`.
     let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "x$")]));
-    fx.program
-        .libraries
-        .get_mut(&LAMP_FILE)
-        .unwrap()
-        .strings
-        .get_mut(&301)
-        .unwrap()[0] = "$ObjectObjectNeighbor".to_owned();
+    set_message(&mut fx, "$ObjectObjectNeighbor");
     assert_eq!(fx.run_with(LAMP, 4096, SIM as i16, &[], 1000), Ok(true));
     assert_eq!(fx.world.portraits, [WIDGET].into());
     // A name that holds `$Object` at its start is replaced once.
@@ -1078,177 +1327,16 @@ fn object_is_replaced_again_from_one_past_each_place() {
 }
 
 #[test]
-fn a_name_not_known_may_take_neighbor_out_with_neighbor_local() {
-    // `$NeighborLocal:$Family` with a family named `0` is
-    // `$NeighborLocal:0`, which its pass replaces when local 0 names a
-    // listed person's record, so `$Neighbor` is gone. The family's name is
-    // not known (0x44c034), so the `$Neighbor` left in the text is not
-    // certain.
-    let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
-    set_message(&mut fx, "$NeighborLocal:$Family");
-    name_lamp(&mut fx, vec![(1, "Lamp")]);
-    let fault = fx
-        .run_with(LAMP, 4096, SIM as i16, &[], 1000)
-        .unwrap_err()
-        .to_string();
-    assert!(fault.contains("0x44c65f"), "{fault}");
-    assert!(fx.world.portraits.is_empty());
-}
-
-#[test]
-fn token_name_local_with_a_running_object_that_is_not_a_person_fails_loudly() {
-    // `$TokenNameLocal` (0x44c490), for a token whose number is one of the
-    // tree's locals (0x44c4b5 to 0x44c4d3; the trees here have 4), casts
-    // the running object to a person (0x44c4f6) and throws when it is not
-    // one (0x44c57b): with the lamp running the dialog, a text that holds
-    // such a token, or where a pass before it may make one, fails loudly.
-    // No stack object here: no neighbor record, so the portrait does not
-    // depend on the text.
-    for text in [
-        "$TokenNameLocal:0",
-        "$TokenNameLocal:3:9",
-        "$TokenNameLocal:4294967296",
-        "$TokenNameLocal:9 $TokenNameLocal:1",
-        "$NameLocal:0",
-        "$NameAttrib:0",
-        "$TokenNameLocal:$Local:0",
-        "$TokenNameLocal:$FamilyAssets:0",
-    ] {
-        let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
-        set_message(&mut fx, text);
-        let fault = fx
-            .run_with(LAMP, 4096, 0, &[], 1000)
-            .unwrap_err()
-            .to_string();
-        assert!(fault.contains("0x44c57b"), "{text}: {fault}");
-    }
-    // The number wraps as the C runtime's conversion does (0x636029):
-    // 4294967296 is local 0. A token with no number, or one that is not a
-    // local (4294967295 is -1), is skipped; a
-    // number pass with no token, and `$Family` with no neighbor record
-    // (0x44c064), make none.
-    for text in [
-        "$TokenNameLocal",
-        "$TokenNameLocal:9",
-        "$TokenNameLocal:4",
-        "$TokenNameLocal:-1",
-        "$TokenNameLocal:4294967295",
-        "$Local:0",
-        "$Family",
-    ] {
-        let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
-        set_message(&mut fx, text);
-        assert_eq!(fx.run_with(LAMP, 4096, 0, &[], 1000), Ok(true), "{text}");
-        assert!(fx.world.portraits.is_empty(), "{text}");
-    }
-    // The strings are formatted in every icon mode (0x436219 to 0x436265),
-    // and mode 4 formats operand 1's string too (0x4362c0).
-    for (mode, message, extra) in [(1u8, 1u8, 0u8), (2, 1, 0), (4, 1, 0), (4, 0, 1)] {
-        let mut fx = text_dialog((0, 0, message), Some(vec![(1, "Grim")]));
-        set_message(&mut fx, "$TokenNameLocal:0");
-        fx.add(
-            LAMP_FILE,
-            4096,
-            tree(vec![ins(
-                DIALOG,
-                RETURN_TRUE,
-                RETURN_FALSE,
-                [0, extra, message, 0, 0, 0, 0, 1 | mode << 1],
-            )]),
-        );
-        let fault = fx
-            .run_with(LAMP, 4096, 0, &[], 1000)
-            .unwrap_err()
-            .to_string();
-        assert!(fault.contains("0x44c57b"), "mode {mode}: {fault}");
-    }
-    // A family's name, not known, may make a token: `$Family` with the
-    // stack object naming a neighbor record, in a mode with no portrait.
-    let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
-    set_message(&mut fx, "$Family");
-    name_lamp(&mut fx, vec![(1, "Lamp")]);
-    fx.add(
-        LAMP_FILE,
-        4096,
-        tree(vec![ins(
-            DIALOG,
-            RETURN_TRUE,
-            RETURN_FALSE,
-            [0, 0, 1, 0, 0, 0, 0, 1 | 1 << 1],
-        )]),
-    );
-    let fault = fx
-        .run_with(LAMP, 4096, SIM as i16, &[], 1000)
-        .unwrap_err()
-        .to_string();
-    assert!(fault.contains("0x44c57b"), "{fault}");
-    // A tree with no locals has none for a token to name (frame +6).
-    let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
-    set_message(&mut fx, "$TokenNameLocal:0 $NameLocal:0");
-    fx.add(
-        LAMP_FILE,
-        4096,
-        shaped(
-            0x8002,
-            0,
-            4,
-            0,
-            vec![ins(
-                DIALOG,
-                RETURN_TRUE,
-                RETURN_FALSE,
-                [0, 0, 1, 0, 0, 0, 0, 1],
-            )],
-        ),
-    );
-    assert_eq!(fx.run_with(LAMP, 4096, 0, &[], 1000), Ok(true));
-    // With a person running it, the pass looks up the inventory of the
-    // person's neighbor, and adds one when there is none (0x42a8a1); then
-    // names the token (0x41f6fb). Not ported: fails loudly, with no
-    // portrait involved.
-    let with_sim = |text: &str| {
-        let mut fx = text_dialog((0, 0, 1), Some(vec![(1, "Grim")]));
-        fx.program
-            .libraries
-            .get_mut(&SIM_FILE)
-            .unwrap()
-            .strings
-            .insert(301, vec![text.to_owned()]);
-        fx.add(
-            SIM_FILE,
-            4096,
-            tree(vec![ins(
-                DIALOG,
-                RETURN_TRUE,
-                RETURN_FALSE,
-                [0, 0, 1, 0, 0, 0, 0, 1],
-            )]),
-        );
-        fx
-    };
-    let mut fx = with_sim("$TokenNameLocal:0");
-    let inventories = fx.world.neighbors.inventories.clone();
-    let fault = fx
-        .run_with(SIM, 4096, 0, &[], 1000)
-        .unwrap_err()
-        .to_string();
-    assert!(fault.contains("0x42a8a1"), "{fault}");
-    assert_eq!(fx.world.neighbors.inventories, inventories);
-    let mut fx = with_sim("$TokenNameLocal:9");
-    assert_eq!(fx.run_with(SIM, 4096, 0, &[], 1000), Ok(true));
-    assert!(fx.world.portraits.is_empty());
-}
-
-#[test]
-fn a_neighbor_local_named_in_a_dialogs_text_is_not_its_neighbor() {
+fn a_neighbor_local_named_in_a_dialogs_text_fails_loudly() {
     // The formatter's `$NeighborLocal` pass (0x44c590 to 0x44c65a) comes
     // before the `$Neighbor` pass, which finds `$Neighbor` anywhere in the
     // text as it is left. A token whose local names a record of a person
-    // type is replaced by that type's name, so `$Neighbor` is not found and
-    // mode 0 shows the stack object's type. One whose local names no record,
-    // or is past the tree's locals, stays, and `$Neighbor` is found in it.
-    // A record of a type not in the person types' table ends the pass
-    // (0x44c616), leaving the tokens after it too.
+    // type is replaced by that type's name from the interface's table,
+    // which is not ported, and fails loudly. One whose local names no
+    // record, or is past the tree's locals, stays, and `$Neighbor` is found
+    // in it. A record of a type not in the person types' table ends the
+    // pass (0x44c616), leaving the tokens after it too. The number is its
+    // first 15 digits (0x44cb52, 0x46f78d), wrapping (0x636029).
     let strings = [
         "Hi $NeighborLocal:0",
         "$NeighborLocal:9",
@@ -1256,16 +1344,22 @@ fn a_neighbor_local_named_in_a_dialogs_text_is_not_its_neighbor() {
         "$NeighborLocal:0 and $Neighbor",
         "$NeighborLocal:4294967297",
         "$NeighborLocal:4294967296",
+        "$NeighborLocal:0000000000000001",
+        "$NeighborLocal:000000000000001",
     ];
     for (message, locals, shown) in [
         (1, [0, 0], Some(WIDGET)),
         (2, [-1, -1], Some(WIDGET)),
         (3, [-1, -2], Some(WIDGET)),
-        (4, [-1, 0], Some(WIDGET)),
+        (4, [0, 0], Some(WIDGET)),
+        (4, [-1, 0], None),
         (5, [-1, 0], Some(WIDGET)),
+        (8, [-1, 0], Some(WIDGET)),
         (1, [-1, 0], None),
         (3, [-1, -1], None),
         (6, [-1, 0], None),
+        (7, [-1, 0], None),
+        (8, [0, -1], None),
     ] {
         // The person (2) is the stack object, and neighbor record 2 is of
         // the widget's type, with nobody of it on the lot. Local `n` holds
@@ -1287,6 +1381,15 @@ fn a_neighbor_local_named_in_a_dialogs_text_is_not_its_neighbor() {
             .unwrap()
             .strings
             .insert(301, strings.map(str::to_owned).to_vec());
+        name_widget(&mut fx, Some(vec![(1, "Widget")]));
+        let widget_file = *fx
+            .program
+            .libraries
+            .iter()
+            .find(|(_, library)| library.catalog_strings.contains_key(&WIDGET_NAMES))
+            .unwrap()
+            .0;
+        fx.words(widget_file)[41] = WIDGET_NAMES as i16;
         let local = |value: i16| match value {
             -1 => record,
             -2 => lamp_record,
@@ -1314,10 +1417,7 @@ fn a_neighbor_local_named_in_a_dialogs_text_is_not_its_neighbor() {
             }
             None => {
                 let fault = ran.unwrap_err().to_string();
-                assert!(
-                    fault.contains("0x4e893e") && fault.contains("0x44c65f"),
-                    "{message} {locals:?}: {fault}"
-                );
+                assert!(fault.contains("0x4e893e"), "{message} {locals:?}: {fault}");
                 assert!(fx.world.portraits.is_empty());
             }
         }

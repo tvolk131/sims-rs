@@ -1558,3 +1558,29 @@ fn a_lot_that_does_not_wait_halts_at_an_unanswered_dialog() {
     assert!(lot.asking().is_none());
     assert_eq!(lot.step().unwrap_err(), StepError::Halted);
 }
+
+#[test]
+fn the_default_button_labels_hold_no_token() {
+    // A dialog's string that is number 0, missing or empty is the default
+    // its caller gives, a button's label from STR# 142 of
+    // `GameData/UIText.iff` (0x435fee, 0x43600a, 0x436a21), and the
+    // formatter (0x44bf1a) reads it as it reads the others. The port
+    // leaves those strings out of the formatter's work
+    // (`Machine::dialog_strings`): the install's labels, in US English
+    // (language 1), hold no `$`, so no token.
+    let Some(root) = std::env::var_os("SIMS_INSTALL") else {
+        eprintln!("SIMS_INSTALL not set; skipping");
+        return;
+    };
+    let path = PathBuf::from(root).join("GameData/UIText.iff");
+    let iff = sims_formats::iff::Iff::parse(std::fs::read(path).unwrap()).unwrap();
+    let chunk = iff.get(b"STR#", 142).unwrap();
+    let table = sims_formats::strings::StringTable::parse(iff.data(chunk)).unwrap();
+    let labels: Vec<&str> = (0..table.entries.len())
+        .filter_map(|i| table.get(i, 1))
+        .collect();
+    assert_eq!(labels[..4], ["OK", "Cancel", "Yes", "No"]);
+    for label in labels {
+        assert!(!label.contains('$'), "{label:?}");
+    }
+}

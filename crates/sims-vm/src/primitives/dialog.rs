@@ -53,23 +53,15 @@ const PERSON_TYPE: i16 = 2;
 /// Definition word 41 (+0x52): the catalog string table (0x457d5f).
 const CATALOG_STRINGS: usize = 41;
 
-/// The tokens of the formatter's passes between `$Object`'s and
-/// `$NeighborLocal`'s (0x44bf1a) that write a name, in the order they run:
-/// `$NameAttrib` (0x44c330), `$NameLocal` (0x44c3ff) and `$TokenNameLocal`
-/// (0x44c490). They are not ported, and the names are not known.
-const LATER_NAMES: [&str; 3] = ["$NameAttrib", "$NameLocal", "$TokenNameLocal"];
-
-/// The tokens of the passes between `$Object`'s and `$NeighborLocal`'s
-/// that write a number (a data word through 0x46f941, put in by
-/// 0x4557c0): `$Local` (0x44c1f2) and `$Attrib` (0x44c280). A number has
-/// no `$` and no letter, so it cannot write `$Neighbor` or `$Object`.
-const LATER_NUMBERS: [&str; 2] = ["$Local", "$Attrib"];
-
-/// The tokens of the passes before `$TokenNameLocal`'s that write a
-/// number (0x46f941, put in by 0x4557c0): `$FamilyAssets` (0x44bf66),
-/// `$Local` and `$Attrib`. One after `$TokenNameLocal:` gives that token
-/// its local.
-const NUMBERS: [&str; 3] = ["$FamilyAssets", "$Local", "$Attrib"];
+/// The tokens of the formatter's passes between `$Local`'s and
+/// `$NeighborLocal`'s (0x44bf1a), in the order they run: `$Attrib`
+/// (0x44c280), `$NameAttrib` (0x44c330), `$NameLocal` (0x44c3ff) and
+/// `$TokenNameLocal` (0x44c490). None is ported, and a text that holds one
+/// when they run fails loudly: they read the running tree's locals and
+/// the stack object's attributes, and fault or throw for some (0x44c2dd,
+/// 0x44c381, 0x44c4f6), and `$TokenNameLocal`'s may add an inventory
+/// (0x42a8a1).
+const BETWEEN: [&str; 4] = ["$Attrib", "$NameAttrib", "$NameLocal", "$TokenNameLocal"];
 
 /// `text` with each `token` replaced by `name` as the formatter's passes
 /// do it (0x4558a0, 0x455750): from the start, then from one past each
@@ -99,11 +91,64 @@ fn never_ends(token: &str, name: &str) -> bool {
         .any(|(i, _)| name[i..].starts_with(token))
 }
 
-/// The number of a `$NeighborLocal` or `$TokenNameLocal` token and where
-/// it ends, read as 0x44caf6 reads it from `end`, just after the token's
-/// name: a `:` and digits, and an optional second `:` and digits. The
-/// number is the first one, by the C runtime's 32-bit conversion
-/// (0x636029), which wraps; -1 when there is none.
+/// The texts a pass that replaces `token` with a name (`$Me`'s,
+/// `$Object`'s, `$Neighbor`'s, at `at`) may leave from each of `texts`
+/// that holds it: one for each of the `names` it may write. Each token is
+/// replaced from the start, then from one past each place replaced
+/// ([`replace_each`]). The pass fails loudly when the names are not known
+/// (none), and when one holds the token past its first character, so the
+/// pass would never end ([`never_ends`]).
+fn name_pass(
+    texts: BTreeSet<String>,
+    token: &str,
+    names: Option<&[String]>,
+    at: &str,
+) -> Result<BTreeSet<String>, Trap> {
+    let mut out = BTreeSet::new();
+    for text in texts {
+        if !text.contains(token) {
+            out.insert(text);
+            continue;
+        }
+        let Some(names) = names else {
+            return Err(Trap::Unsupported(format!(
+                "a dialog's `{token}` is replaced by a name that is not known (0x4573d9, {at}), \
+                 and a name that holds `{token}` past its first character would never end \
+                 (0x4558a0, 0x455750): not ported"
+            )));
+        };
+        if let Some(name) = names.iter().find(|name| never_ends(token, name)) {
+            return Err(Trap::Unsupported(format!(
+                "a dialog's `{token}` is replaced by the name {name:?}, which holds it past its \
+                 first character, so the pass never ends ({at}, 0x4558a0, 0x455750)"
+            )));
+        }
+        out.extend(names.iter().map(|name| replace_each(&text, token, name)));
+    }
+    Ok(out)
+}
+
+/// Fails loudly, naming `token` and its pass, when one of `texts` holds
+/// one of `tokens`, whose passes are not ported.
+fn not_ported(texts: &BTreeSet<String>, tokens: &[&str], passes: &str) -> Result<(), Trap> {
+    for token in tokens {
+        if let Some(text) = texts.iter().find(|text| text.contains(*token)) {
+            return Err(Trap::Unsupported(format!(
+                "a dialog's text holds `{token}` when its pass runs ({passes}): not ported \
+                 ({text:?})"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The number of a `$Local` or `$NeighborLocal` token and where it ends, read as
+/// 0x44caf6 reads it from `end`, just after the token's name: a `:` and
+/// digits, and an optional second `:` and digits. The number is the first
+/// one's first 15 digits (0x44cb52 makes a string of 16 bytes for them,
+/// and 0x46f925 adds no more than fit, 0x46f78d to 0x46f79d), by the C
+/// runtime's 32-bit conversion (0x636029), which wraps; -1 when there is
+/// none (0x44cb34).
 fn local_token(bytes: &[u8], mut end: usize) -> (i32, usize) {
     let mut number = -1i32;
     for part in 0..2 {
@@ -116,21 +161,13 @@ fn local_token(bytes: &[u8], mut end: usize) -> (i32, usize) {
             .take_while(|b| b.is_ascii_digit())
             .count();
         if part == 0 && digits > 0 {
-            number = bytes[end..end + digits].iter().fold(0i32, |n, d| {
+            number = bytes[end..end + digits].iter().take(15).fold(0i32, |n, d| {
                 n.wrapping_mul(10).wrapping_add(i32::from(d - b'0'))
             });
         }
         end += digits;
     }
     (number, end)
-}
-
-/// One text a dialog's string may be after the passes so far.
-#[derive(Clone)]
-struct Text {
-    text: String,
-    /// Whether a name not known stands in it: it may hold any token.
-    unknown: bool,
 }
 
 /// Record status: made and not shown yet.
@@ -386,17 +423,25 @@ impl Machine<'_, '_> {
     /// and 4 operand 3, kind 1 operands 4 and 3, kind 2 operands 0, 4 and
     /// 3), formatted in the order operand 3, 4, 0; then the title
     /// (operand 6) and the message (operand 2). A string is named by its
-    /// number from 1. One the file lacks, and a button's default label
-    /// (number 0, 0x435f4e), are left out: taken to hold no token
-    /// (**unverified**). In mode 4, operand 1's string comes last.
+    /// number from 1. In mode 4, operand 1's string comes last.
+    ///
+    /// A string that is number 0, that the file lacks or that is empty is
+    /// left out: 0x4369de puts in its place the default the caller gives
+    /// (0x436a21 to 0x436a35), a button's label from STR# 142 of
+    /// `GameData/UIText.iff` (0x435fee, 0x43600a), or else "Missing
+    /// string!!!" (0x6c29bc). None of them holds a `$`, so the formatter
+    /// leaves them as they are (the install's labels are checked by
+    /// `tests/boot.rs`).
     ///
     /// The table is read in the application's language: the table's
     /// language byte is the interface's +0x64 less one (0x4702b1 to
     /// 0x4702bb), and 0x4704fa reads that language's strings, with no
     /// other to fall back on. The port reads US English (language 1,
-    /// [`crate::program::Library::strings`]), the recorded install's. An
-    /// install in another language is not supported: its strings may hold
-    /// other tokens.
+    /// [`crate::program::Library::strings`]), the recorded install's (its
+    /// registry has `SIMS_LANGUAGE` USEnglish, which 0x4f2ddc to 0x4f2df8
+    /// read after `SIMS_OTHERLANGUAGE`; the interface's +0x64 for it is
+    /// **unverified**). An install in another language is not supported:
+    /// its strings may hold other tokens.
     pub(crate) fn dialog_strings(&self, operands: &[u8; 8]) -> Result<Vec<String>, Trap> {
         let owner = self.owner(self.frame()?)?;
         let strings = self
@@ -423,7 +468,7 @@ impl Machine<'_, '_> {
             .chain(mode_4)
             .filter_map(|&operand| {
                 let index = usize::from(operands[operand]).checked_sub(1)?;
-                strings?.get(index).cloned()
+                strings?.get(index).filter(|text| !text.is_empty()).cloned()
             })
             .collect())
     }
@@ -431,35 +476,45 @@ impl Machine<'_, '_> {
     /// The type the formatter (0x44bf1a) finds in a dialog record's
     /// strings ([`Machine::dialog_strings`]), each formatted in turn with
     /// the same place for it (`[ebp-0x24]`, cleared at 0x43620d), so the
-    /// last one found is kept. Only two tokens write it:
+    /// last one found is kept; returned for mode 0 only. The passes run
+    /// in this order:
     ///
-    /// - `$Object` (0x6e5050, from 0x6c407c; 0x44c155 to 0x44c1af): the
-    ///   type of the object the stack object names (frame +4), when there
-    ///   is one;
-    /// - `$Neighbor` (0x6e5090, from 0x6c4054; 0x44c65f to 0x44c69f): the
-    ///   type of the neighbor record the stack object names (0x425afe),
-    ///   when there is one. Its pass comes after `$Object`'s, so it wins
-    ///   in a string that holds both. It finds `$Neighbor` anywhere in the
-    ///   text as the passes before it left it, so only after the
-    ///   `$NeighborLocal` pass ([`Machine::neighbor_locals_named`]), which
-    ///   may have put a name in place of a `$NeighborLocal` token.
+    /// 1. `$FamilyAssets` (0x44bf66) and `$Family` (0x44c034): not ported,
+    ///    and a text that holds `$Family` fails loudly;
+    /// 2. `$Me` (0x6e5060; 0x44c0fc): the running object's name (the
+    ///    formatter's `this` is the record's object, 0x436200);
+    /// 3. `$Object` (0x6e5050, from 0x6c407c; 0x44c155 to 0x44c1af): the
+    ///    name and type of the object the stack object names (frame +4),
+    ///    when there is one; otherwise the token stays (0x44c183 to
+    ///    0x44c1a6);
+    /// 4. `$Local` ([`Machine::locals_written`]);
+    /// 5. the passes of [`BETWEEN`]: not ported, and a text that holds one
+    ///    of their tokens fails loudly;
+    /// 6. `$NeighborLocal` ([`Machine::neighbor_locals`]);
+    /// 7. `$Neighbor` (0x6e5090, from 0x6c4054; 0x44c65f to 0x44c6e8): the
+    ///    name and type of the neighbor record the stack object names
+    ///    (0x425afe), when there is one; otherwise the token stays. It
+    ///    comes after `$Object`'s, so it wins in a string that holds both;
+    /// 8. the passes after it (0x44c6ea on): one for a token whose name
+    ///    is at 0x6e4fa0 (0x44c6ea), one for 0x6e4f90 (0x44c797; the two
+    ///    are `$CatalogLocal` and `$FameTitleLocal`, 0x6c40f0, 0x6c4100),
+    ///    `$Grade` (0x6e5000, 0x44c861), `$TimeLocal` (0x6e5020, 0x44c8c4),
+    ///    then the career's: `$JobOffer`, `$JobDesc` and `$Job` (0x6e5010,
+    ///    0x6e4ff0, 0x6e5040; 0x44c966). They write text and read the
+    ///    running object, the locals and the career tables, and are taken
+    ///    to change nothing else (**unverified**), and the text they write
+    ///    to hold no token of their own or a later one, which would never
+    ///    end or be read again (**unverified**). Each career token found
+    ///    casts the running object to a person (0x44c9bc) and reads it
+    ///    (0x44ca27, also with the numbers not locals), which faults for an
+    ///    object that is not one: that fails loudly.
     ///
-    /// The passes before them may put a name or a number in the text, and
-    /// so decide what they find. The passes run in this order (0x44bf1a):
-    /// `$FamilyAssets`, `$Family`, `$Me`, `$Object`, `$Local`, `$Attrib`,
-    /// `$NameAttrib`, `$NameLocal`, `$TokenNameLocal`, `$NeighborLocal`,
-    /// `$Neighbor`. `$Me` and `$Object` are ported ([`Machine::name_pass`]).
-    /// `$Family` writes a name not known when the stack object names a
-    /// neighbor record (0x44c064; the family, 0x425d69, is not looked up).
-    /// The others are not ported, and a text where they may change what
-    /// is found leaves it unknown (see [`LATER_NAMES`], [`LATER_NUMBERS`]);
-    /// in mode 0 the dialog fails loudly where that decides the portrait.
-    /// In every mode the passes that would never end, and the
-    /// `$TokenNameLocal` pass's work ([`Machine::token_name_locals`]), fail
-    /// loudly, after the portrait.
-    ///
-    /// The other tokens' text is presentation, and is not worked out. The
-    /// type is returned for mode 0 only.
+    /// The names are the type's catalog names (0x4573d9,
+    /// [`Machine::catalog_names`]), each replaced as [`name_pass`] does
+    /// it. Which catalog entry is the name is not ported, so the text is
+    /// worked out for each; mode 0 fails loudly where that decides the
+    /// portrait. The checks run in every mode: the strings are formatted
+    /// before the mode is read.
     pub(crate) fn dialog_text_type(
         &self,
         operands: &[u8; 8],
@@ -471,242 +526,91 @@ impl Machine<'_, '_> {
             .and_then(|id| self.world.objects.get(&id))
             .map(|object| object.guid);
         let neighbor = self.world.neighbors.get(stack_object).map(|r| r.guid);
-        let strings = self.dialog_strings(operands)?;
         // Mode 4's last string is formatted with no place for a type
         // (0x4362ba pushes 0), but only mode 0 reads the place.
-        // The names `$Object` may be replaced by; none when not known.
-        // With no object the token stays as `(name)`.
-        let object_names = match object {
-            Some(guid) => self.catalog_names(guid)?,
-            None => Some(vec!["(name)".to_owned()]),
-        };
-        // The running object's names, for `$Me` (the formatter's `this`
-        // is the record's object, 0x436200, the object running the tree);
-        // read only when a text may hold the token.
-        let me_names = if strings
-            .iter()
-            .any(|text| text.contains("$Me") || text.contains("$Family"))
-        {
-            self.catalog_names(self.me()?.guid)?
-        } else {
-            Some(Vec::new())
-        };
-        // What may have been found so far: more than one where a name not
-        // known, or a pass not ported, may decide it.
+        // What may have been found so far: more than one where the name a
+        // pass writes may be one of several.
         let mut found = BTreeSet::from([None]);
-        // The `$TokenNameLocal` pass's fault: kept until the portrait is
-        // worked out, so a portrait that is not known names that first.
-        let mut deferred = None;
-        for text in strings {
-            // `$FamilyAssets` (0x44bf66) writes a number. `$Family`
-            // (0x44c034) writes the name of the family of the neighbor
-            // record the stack object names (0x4256f4, record +0xee,
-            // 0x425d69): not known. It finds `$Family` in a
-            // `$FamilyAssets` token left too.
-            let family = text.contains("$Family") && neighbor.is_some();
-            let texts = vec![Text {
-                text,
-                unknown: family,
-            }];
-            let texts = self.name_pass(texts, "$Me", me_names.as_deref(), "0x44c13e")?;
+        for text in self.dialog_strings(operands)? {
+            if text.contains("$Family") {
+                return Err(Trap::Unsupported(
+                    "a dialog's text holds `$FamilyAssets` or `$Family`, whose passes (0x44bf66, \
+                     0x44c034) are not ported"
+                        .into(),
+                ));
+            }
+            let mut texts = BTreeSet::from([text]);
+            if texts.iter().any(|text| text.contains("$Me")) {
+                let names = self.catalog_names(self.me()?.guid)?;
+                texts = name_pass(texts, "$Me", names.as_deref(), "0x44c13e")?;
+            }
             // What this string may do to what was found: None keeps it,
             // Some(type) puts that in its place.
             let mut outcomes = BTreeSet::new();
             for text in texts {
-                // `$Object`'s pass writes the stack object's type when it
-                // finds the token (0x44c1af); a name not known written
-                // before it may hold one.
-                let mut kept = BTreeSet::new();
-                if object.is_some() && text.text.contains("$Object") {
-                    kept.insert(Some(object));
-                } else {
-                    kept.insert(None);
-                    if object.is_some() && text.unknown {
-                        kept.insert(Some(object));
-                    }
+                let mut texts = BTreeSet::from([text]);
+                let mut written = None;
+                if let Some(guid) = object.filter(|_| texts.iter().any(|t| t.contains("$Object"))) {
+                    written = Some(guid);
+                    let names = self.catalog_names(guid)?;
+                    texts = name_pass(texts, "$Object", names.as_deref(), "0x44c1ca")?;
                 }
-                let texts =
-                    self.name_pass(vec![text], "$Object", object_names.as_deref(), "0x44c1ca")?;
-                for text in &texts {
-                    if deferred.is_none() {
-                        deferred = self.token_name_locals(&text.text, text.unknown)?;
+                let texts = texts
+                    .iter()
+                    .map(|text| self.locals_written(text))
+                    .collect::<Result<BTreeSet<_>, _>>()?;
+                not_ported(&texts, &BETWEEN, "0x44c280 to 0x44c590")?;
+                for text in texts {
+                    self.neighbor_locals(&text)?;
+                    let mut texts = BTreeSet::from([text]);
+                    let mut written = written;
+                    if let Some(guid) =
+                        neighbor.filter(|_| texts.iter().any(|t| t.contains("$Neighbor")))
+                    {
+                        written = Some(guid);
+                        let names = self.catalog_names(guid)?;
+                        texts = name_pass(texts, "$Neighbor", names.as_deref(), "0x44c6ba")?;
                     }
-                    outcomes.extend(self.text_outcomes(text, &kept, neighbor)?);
+                    if self.me()?.person.is_none()
+                        && let Some(text) = texts.iter().find(|text| text.contains("$Job"))
+                    {
+                        return Err(Trap::Unsupported(format!(
+                            "a dialog's text holds a career token (`$JobOffer`, `$JobDesc`, \
+                             `$Job`), whose pass casts the object running the tree to a person \
+                             (0x44c9bc) and reads it (0x44ca27): it is not one, so the original \
+                             faults ({text:?})"
+                        )));
+                    }
+                    outcomes.insert(written);
                 }
             }
             found = outcomes
                 .into_iter()
                 .flat_map(|outcome| match outcome {
                     None => found.clone(),
-                    Some(set) => BTreeSet::from([set]),
+                    Some(guid) => BTreeSet::from([Some(guid)]),
                 })
                 .collect();
         }
         if mode != 0 {
-            return deferred.map_or(Ok(None), Err);
+            return Ok(None);
         }
         // Mode 0 shows the stack object's own type when nothing was found.
         let shown: BTreeSet<_> = found.iter().map(|f| f.or(object)).collect();
         if shown.len() > 1 {
             return Err(Trap::Unsupported(
-                "a dialog's text has a name in place of `$Me` (0x44c13e), `$Object` (0x44c1ca), \
-                 `$Family` (0x44c0cf) or `$NeighborLocal` (0x4e9c46, from the interface's \
-                 table, 0x4e893e), or a token of a pass before `$Neighbor`'s that is not ported \
-                 (0x44bf66 to 0x44c4a2), and whether the text then holds `$Neighbor` or \
-                 `$Object` decides the portrait (0x44c65f): the names are not ported"
+                "a dialog's `$Me`, `$Object` or `$Neighbor` is replaced by one of a type's \
+                 catalog names (0x4573d9, 0x4061e3, which picks one, is not ported), and which \
+                 one decides whether a later pass finds `$Object` or `$Neighbor` (0x44c1af, \
+                 0x44c69f), so the portrait"
                     .into(),
             ));
-        }
-        if let Some(trap) = deferred {
-            return Err(trap);
         }
         Ok(found.into_iter().next().flatten())
     }
 
-    /// The texts a pass that replaces `token` with a name (`$Me`'s,
-    /// `$Object`'s, at `at`) may leave from each of `texts`: one for each
-    /// of the `names` it may write (none when they are not known). Each
-    /// token is replaced from the start, then from one past each place
-    /// replaced ([`replace_each`]). A name that holds the token past its
-    /// first character never ends ([`never_ends`]), and fails loudly
-    /// where the text holds the token, or a name not known that may hold
-    /// it; so do names not known there.
-    fn name_pass(
-        &self,
-        texts: Vec<Text>,
-        token: &str,
-        names: Option<&[String]>,
-        at: &str,
-    ) -> Result<Vec<Text>, Trap> {
-        let mut out = Vec::new();
-        for text in texts {
-            if !text.text.contains(token) && !text.unknown {
-                out.push(text);
-                continue;
-            }
-            let Some(names) = names else {
-                return Err(Trap::Unsupported(format!(
-                    "a dialog's `{token}` is replaced by a name that is not known (0x4061e3, \
-                     {at}), and a name that holds `{token}` past its first character would \
-                     never end (0x4558a0, 0x455750): not ported"
-                )));
-            };
-            if let Some(name) = names.iter().find(|name| never_ends(token, name)) {
-                return Err(Trap::Unsupported(format!(
-                    "a dialog's `{token}` is replaced by the name {name:?}, which holds it past \
-                     its first character, so the pass never ends ({at}, 0x4558a0, 0x455750)"
-                )));
-            }
-            out.extend(names.iter().map(|name| Text {
-                text: replace_each(&text.text, token, name),
-                unknown: text.unknown,
-            }));
-        }
-        Ok(out)
-    }
-
-    /// What one string, as the passes up to `$Object`'s left it, may do
-    /// to the type the formatter has found: None keeps it, Some(type) puts
-    /// that in its place. `kept` is what `$Object`'s pass may have done.
-    fn text_outcomes(
-        &self,
-        text: &Text,
-        kept: &BTreeSet<Option<Option<u32>>>,
-        neighbor: Option<u32>,
-    ) -> Result<BTreeSet<Option<Option<u32>>>, Trap> {
-        let Some(neighbor) = neighbor else {
-            self.neighbor_locals_named(&text.text)?;
-            return Ok(kept.clone());
-        };
-        let mut outcomes = kept.clone();
-        // The passes between `$Object`'s and `$NeighborLocal`'s (0x44c1f2
-        // to 0x44c4a2) are not ported. One that writes a name may write
-        // `$Neighbor`; one that writes a number may make a `$NeighborLocal`
-        // token out of one that already holds `$Neighbor`
-        // (`$NeighborLocal:$Local:0`), and that token's pass may then take
-        // `$Neighbor` out. Either way what the `$Neighbor` pass finds is
-        // not known.
-        if LATER_NAMES.iter().any(|token| text.text.contains(token))
-            || (text.text.contains("$Neighbor")
-                && LATER_NUMBERS.iter().any(|token| text.text.contains(token)))
-        {
-            outcomes.insert(Some(Some(neighbor)));
-            return Ok(outcomes);
-        }
-        // A name not known may also finish a `$NeighborLocal` token
-        // (`$NeighborLocal:$Object` and a name `0`), whose pass may then
-        // take `$Neighbor` out, so what is found is not known.
-        let (named_text, named) = self.neighbor_locals_named(&text.text)?;
-        if named_text.contains("$Neighbor") && !text.unknown {
-            return Ok(BTreeSet::from([Some(Some(neighbor))]));
-        }
-        if named || text.unknown {
-            outcomes.insert(Some(Some(neighbor)));
-        }
-        Ok(outcomes)
-    }
-
-    /// The `$TokenNameLocal` pass (0x44c490 to 0x44c590), none of whose
-    /// work is ported, or the fault it gives. Each token (0x6e4f80) is
-    /// read as `$NeighborLocal`'s are ([`local_token`]); one whose number
-    /// is not one of the running tree's locals (from 0, below frame +6,
-    /// 0x44c4b5 to 0x44c4d3) is skipped, and the search goes on from one
-    /// past it. For one that is, the pass casts the running object to a
-    /// person (0x44c4f6) and throws when it is not one (0x44c57b,
-    /// 0x634e08); for a person it looks up the inventory of the neighbor
-    /// its +0x5ca names, adding an empty one when there is none (0x42a8a1,
-    /// 0x42a8e1 to 0x42a91a), and replaces the token with the name of the
-    /// token the local picks in it (0x41f6fb, 0x43ac10, 0x4573d9). That
-    /// fails loudly. So does a text where a pass before it may have made
-    /// such a token: `unknown` (a name not known stands in it),
-    /// `$NameAttrib` or `$NameLocal`, or a number pass ([`NUMBERS`]) with
-    /// `$TokenNameLocal` (`$TokenNameLocal:$Local`). With no locals no
-    /// token is one of them.
-    fn token_name_locals(&self, text: &str, unknown: bool) -> Result<Option<Trap>, Trap> {
-        const TOKEN: &str = "$TokenNameLocal";
-        let count = self.frame()?.locals.len();
-        if count == 0 {
-            return Ok(None);
-        }
-        let mut certain = false;
-        let mut from = 0;
-        while let Some(at) = text
-            .get(from..)
-            .and_then(|t| t.find(TOKEN))
-            .map(|i| i + from)
-        {
-            let (number, _) = local_token(text.as_bytes(), at + TOKEN.len());
-            if usize::try_from(number).is_ok_and(|n| n < count) {
-                certain = true;
-                break;
-            }
-            from = at + 1;
-        }
-        let may = unknown
-            || ["$NameAttrib", "$NameLocal"]
-                .iter()
-                .any(|token| text.contains(token))
-            || (text.contains(TOKEN) && NUMBERS.iter().any(|token| text.contains(token)));
-        if !certain && !may {
-            return Ok(None);
-        }
-        let has = if certain { "has" } else { "may have" };
-        let work = if self.me()?.person.is_none() {
-            "the object running the tree is not a person: the pass casts it to one (0x44c4f6) \
-             and throws (0x44c57b, 0x634e08)"
-        } else {
-            "the pass looks up the inventory of the neighbor the person's +0x5ca names, adding \
-             an empty one when there is none (0x42a8a1, 0x42a8e1), and names the token the \
-             local picks in it (0x41f6fb, 0x43ac10)"
-        };
-        Ok(Some(Trap::Unsupported(format!(
-            "a dialog's text {has} a `$TokenNameLocal` token whose number is one of the tree's \
-             locals (0x44c4b5 to 0x44c4d3), and {work}: not ported"
-        ))))
-    }
-
-    /// The names the formatter may write for `$Object` of type `guid`
-    /// (0x44c1ca), or none when they are not known. The name is an entry
+    /// The names the formatter may write for a token of type `guid`
+    /// (0x4573d9), or none when they are not known. The name is an entry
     /// of the catalog string table definition word 41 names (0x457d3b,
     /// 0x4061e3), or the definition's own name if that entry is empty
     /// (0x457db4). Which entry 0x4061e3 picks is not ported, so every
@@ -731,27 +635,18 @@ impl Machine<'_, '_> {
         }))
     }
 
-    /// `text` after the formatter's `$NeighborLocal` pass (0x44c590 to
-    /// 0x44c65a), as far as it matters to the `$Neighbor` pass after it,
-    /// and whether a type's name took the place of a token. Each token
-    /// (0x6e4fc0), searched for from one past the last (0x44c643), is read
-    /// with its `:` and number, and an optional second `:` and number
-    /// (0x44caf6; the number is the C runtime's 32-bit conversion,
-    /// 0x636029, which wraps). When the number is one of the running
-    /// tree's locals (from 0, below the count the tree has, frame +6,
-    /// compared signed), the local names a neighbor record (0x44c5f4,
-    /// 0x4256f4) and the record's type is in the interface's table of
-    /// person types (0x4572af, 0x4e9753), the token is replaced by the
-    /// type's name (0x4e9c46, 0x455750); a record whose type is not in the
-    /// table ends the pass (0x44c616 to 0x44c653). Otherwise the token
-    /// stays, and the `$Neighbor` pass finds it. The name is not known: it
-    /// stands here as text without a token, and
-    /// [`Machine::dialog_text_type`] fails where that could matter.
-    pub(crate) fn neighbor_locals_named(&self, text: &str) -> Result<(String, bool), Trap> {
-        const TOKEN: &str = "$NeighborLocal";
+    /// `text` after the formatter's `$Local` pass (0x44c1f2 to 0x44c27d).
+    /// Each token (0x6e5030), searched for from one past the last
+    /// (0x44c25f), is read with its `:` and number, and an optional second
+    /// `:` and number ([`local_token`], 0x44caf6). When the number is one
+    /// of the running tree's locals (from 0, below the count the tree has,
+    /// frame +6, compared signed), the token and what was read with it are
+    /// replaced (0x4557c0) by the local's value in decimal (0x46f941,
+    /// `%d` of the word sign-extended). Otherwise the token stays.
+    fn locals_written(&self, text: &str) -> Result<String, Trap> {
+        const TOKEN: &str = "$Local";
         let locals = &self.frame()?.locals;
         let mut text = text.to_owned();
-        let mut named = false;
         let mut from = 0;
         while let Some(at) = text
             .get(from..)
@@ -759,27 +654,63 @@ impl Machine<'_, '_> {
             .map(|i| i + from)
         {
             let (number, end) = local_token(text.as_bytes(), at + TOKEN.len());
-            let record = match usize::try_from(number) {
-                Ok(n) if n < locals.len() => {
-                    self.check_local(n).map_err(|trap| {
-                        Trap::Unsupported(format!(
-                            "a dialog's `$NeighborLocal:{n}` (0x44c5f4): {trap}"
-                        ))
-                    })?;
-                    self.world.neighbors.get(locals[n])
-                }
-                _ => None,
-            };
-            if let Some(record) = record {
-                if !self.listed_person_type(record.guid, "a dialog's $NeighborLocal")? {
-                    break;
-                }
-                text.replace_range(at..end, "(name)");
-                named = true;
+            if let Ok(n) = usize::try_from(number)
+                && n < locals.len()
+            {
+                self.check_local(n).map_err(|trap| {
+                    Trap::Unsupported(format!("a dialog's `$Local:{n}` (0x44c240): {trap}"))
+                })?;
+                text.replace_range(at..end, &locals[n].to_string());
             }
             from = at + 1;
         }
-        Ok((text, named))
+        Ok(text)
+    }
+
+    /// The formatter's `$NeighborLocal` pass (0x44c590 to 0x44c65a) on
+    /// `text`. Each token (0x6e4fc0), searched for from one past the last
+    /// (0x44c643), is read with its `:` and number, and an optional second
+    /// `:` and number ([`local_token`]). When the number is one of the
+    /// running tree's locals (from 0, below the count the tree has, frame
+    /// +6, compared signed), the local names a neighbor record (0x44c5f4,
+    /// 0x4256f4) and the record's type is in the interface's table of
+    /// person types (0x4572af, 0x4e9753), the token is replaced by the
+    /// type's name from the interface's table (0x4e9c46, 0x4e893e, 0x455750),
+    /// which is not ported, and fails loudly; a record whose type is not
+    /// in the table ends the pass (0x44c616 to 0x44c653). Otherwise the
+    /// token stays, and the `$Neighbor` pass finds it.
+    pub(crate) fn neighbor_locals(&self, text: &str) -> Result<(), Trap> {
+        const TOKEN: &str = "$NeighborLocal";
+        let locals = &self.frame()?.locals;
+        let mut from = 0;
+        while let Some(at) = text
+            .get(from..)
+            .and_then(|t| t.find(TOKEN))
+            .map(|i| i + from)
+        {
+            let (number, _) = local_token(text.as_bytes(), at + TOKEN.len());
+            if let Ok(n) = usize::try_from(number)
+                && n < locals.len()
+            {
+                self.check_local(n).map_err(|trap| {
+                    Trap::Unsupported(format!(
+                        "a dialog's `$NeighborLocal:{n}` (0x44c5f4): {trap}"
+                    ))
+                })?;
+                if let Some(record) = self.world.neighbors.get(locals[n]) {
+                    if !self.listed_person_type(record.guid, "a dialog's $NeighborLocal")? {
+                        break;
+                    }
+                    return Err(Trap::Unsupported(format!(
+                        "a dialog's `$NeighborLocal:{n}` is replaced by the name of type \
+                         0x{:08X} from the interface's table (0x4e9c46, 0x4e893e): not ported",
+                        record.guid
+                    )));
+                }
+            }
+            from = at + 1;
+        }
+        Ok(())
     }
 
     fn set_temp(&mut self, temp: usize, value: i16) -> Result<(), Trap> {
