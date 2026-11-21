@@ -238,19 +238,20 @@ fn every_event_definition_runs_without_a_bad_instruction() {
     // events with an empty track field (the original's lookup of track 0
     // finds nothing, as here) and the 2 events of kinds not ported:
     // pausing (103) and reloading (104). The 5 ambience modes (52) start
-    // and stop scores, none of which this test loads. Of the 186 events
-    // still running after 20 blocks, 5 change the music mode (36) and
-    // start music or a river loop, or a slow fade of the music, that runs
-    // on; the piano (43) plays notes for ever; the 60 that turn on a
-    // television or radio play their station for ever; 119 more loop
-    // (fires, appliances, voices that loop) and one,
-    // `Grimreaper_loop_kill`, fades its own vol for 21 blocks: the loop
-    // track it targets is not running, so `target` is itself.
+    // and stop scores, none of which this test loads. Of the 184 events
+    // still running after 20 blocks, 4 change the music mode (36) and
+    // start music or a river loop that runs on (`bkground_fade` targets
+    // stopped `MainMusicLoop`, where 0x57e059 forces `fade_on` back to 0
+    // so its `waiteq` finishes immediately, as does `Grimreaper_loop_kill`
+    // targeting stopped `Grimreaper_loop`); the piano (43) plays notes
+    // for ever; the 60 that turn on a television or radio play their
+    // station for ever; and 119 more loop (fires, appliances, voices
+    // that loop).
     // (`shoo_tub_inside_vox` waits a random time, which the station
     // scripts' draws make short here. `ltub_running` starts nothing: a
     // later `[Patch]` line registers its track 68262 again as a patch.)
     assert_eq!(definitions.len(), 4494);
-    assert_eq!((still_running, format!("{unported:?}")), (186, "{}".into()));
+    assert_eq!((still_running, format!("{unported:?}")), (184, "{}".into()));
     assert_eq!(format!("{kinds:?}"), "{103: 1, 104: 1}");
     assert_eq!(
         format!("{faults:?}"),

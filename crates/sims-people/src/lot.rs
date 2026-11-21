@@ -20,7 +20,32 @@
 //! near-zoom pixels. [`View::screen`] then projects as the lot renderer's
 //! `project_fine` does, with a level's floor height per level above the
 //! first, and one column right as the lot renderer draws objects (its
-//! `OBJECT_COLUMN`; unchecked for people).
+//! `OBJECT_COLUMN`).
+//!
+//! **Direct3D 6 rasterization.** The original submits person and plumb-bob
+//! meshes to Direct3D 6 (`IDirect3DDevice3::DrawIndexedPrimitive` at
+//! 0x5d3b44 and `DrawIndexedPrimitiveVB` at 0x5d36c6) through the house
+//! camera (0x49b0de, viewport matrix at 0x5cf263 mapping NDC (0, 0) to
+//! `(vp.dwX + width/2, vp.dwY + height/2)` with no half-pixel offset —
+//! integer for even dimensions such as 800×600). Under Direct3D 6
+//! rasterization rules, pixel `(x, y)` has its sample centre at integer
+//! `(x, y)`, whereas [`crate::raster`] samples at `(x + 0.5, y + 0.5)`.
+//! [`People::draw`] therefore adds `(+0.5, +0.5)` to each projected vertex
+//! via `project_lot_vertex` so triangles sample at integer pixel centres.
+//! Skin bitmaps are packed into 16-bit 5-6-5 textures on upload (0x5ca0d3 /
+//! 0x5ca1f8 for indexed 8-bit skins, 0x5ca55f for 24-bit → 0x5ca635 →
+//! 0x49f0ae, truncating `r >> 3`, `g >> 2`, `b >> 3`) with white materials
+//! (0x5d452b, 0x5a1b5c), default point filtering (0x49b090, 0x5d3a65),
+//! Gouraud shading (0x5ce935), `D3DTOP_MODULATE` (0x5d3a30), and dithering
+//! off (0x5ce99e). [`People::draw`] wraps textured parts' writes in
+//! `Packed565` to mask texels to 5-6-5 on the lot draw path—preserving the
+//! original 8-bit bitmaps in the shared `Body` cache read by
+//! [`People::posed`] (such as the pie-menu portrait renderer) and leaving
+//! untextured meshes (such as the plumb bob's `white` material at 0x5d452b,
+//! texture handle 0 at 0x5d48ce) at full 8-bit white—and
+//! `sims_render::Canvas`'s [`Target`] implementation modulates with half-up
+//! 8-bit rounding (an approximation that avoids truncating 1-ULP barycentric
+//! shortfalls below 1.0 by a full 5-6-5 step).
 //!
 //! A person stands on the terrain under it (`sims_sim::head::ground_height`:
 //! the tile's altitude where its position falls, as the original finds it,
@@ -337,7 +362,8 @@ pub fn lamp_strength(squared: f32) -> Option<f32> {
 /// rule: a depth no farther than what is there wins (ties too), a pixel
 /// fainter than its `FAINT` is left out, a soft one blends, and every
 /// pixel drawn writes its depth. Depths are cut to whole units toward
-/// zero.
+/// zero. Channels are modulated with half-up 8-bit rounding before
+/// `Canvas::put` stores 8-bit RGB (quantized to 5-6-5 by `rgb565()`).
 impl Target for sims_render::Canvas {
     fn size(&self) -> (u32, u32) {
         (self.width as u32, self.height as u32)
@@ -348,14 +374,102 @@ impl Target for sims_render::Canvas {
     }
 
     fn write(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], shade: f32) {
-        let lit = |c: u8| (f32::from(c) * shade).min(255.0) as u8;
+        self.write_coloured(x, y, z, texel, [shade; 3]);
+    }
+
+    fn write_coloured(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], shade: [f32; 3]) {
+        // Half-up 8-bit rounding approximates Direct3D 6 modulation without
+        // truncating a 1-ULP barycentric shortfall below 1.0 down by a full
+        // 5-6-5 step. Textured lot parts are wrapped in `Packed565` by
+        // `People::draw`, while untextured meshes (the plumb bob's `white`
+        // material at 0x5d452b) stay full 8-bit white.
+        let lit = |c: u8, s: f32| (f32::from(c) * s + 0.5).clamp(0.0, 255.0) as u8;
         let [r, g, b, a] = texel;
-        self.put(x as i32, y as i32, [lit(r), lit(g), lit(b), a], z as i32);
+        self.put(
+            x as i32,
+            y as i32,
+            [lit(r, shade[0]), lit(g, shade[1]), lit(b, shade[2]), a],
+            z as i32,
+        );
     }
 
     fn set_id(&mut self, id: Option<u16>) {
         sims_render::Canvas::set_id(self, id);
     }
+}
+
+/// Masks a texel's RGB channels to 16-bit 5-6-5 (`r & 0xf8`, `g & 0xfc`,
+/// `b & 0xf8`), matching the original's texture surface upload
+/// (`0x5ca0d3` / `0x5ca1f8` for indexed 8-bit skins and `0x5ca55f` for
+/// 24-bit BMPs → `0x5ca635` → `0x49f0ae`).
+fn mask_565([r, g, b, a]: [u8; 4]) -> [u8; 4] {
+    [r & 0xf8, g & 0xfc, b & 0xf8, a]
+}
+
+/// Target adapter used by [`People::draw`] for textured parts: masks each
+/// sampled texel to 5-6-5 on the lot draw path without mutating the cached
+/// `Body` textures (which [`People::posed`] shares with offscreen callers
+/// like the pie-menu portrait renderer) and without masking untextured
+/// meshes such as the plumb bob.
+struct Packed565<'a, T: ?Sized>(&'a mut T);
+
+impl<T: Target + ?Sized> Target for Packed565<'_, T> {
+    fn size(&self) -> (u32, u32) {
+        self.0.size()
+    }
+
+    fn passes(&self, x: u32, y: u32, z: f32) -> bool {
+        self.0.passes(x, y, z)
+    }
+
+    fn write(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], shade: f32) {
+        self.0.write(x, y, z, mask_565(texel), shade);
+    }
+
+    fn write_coloured(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], shade: [f32; 3]) {
+        self.0.write_coloured(x, y, z, mask_565(texel), shade);
+    }
+
+    fn set_id(&mut self, id: Option<u16>) {
+        self.0.set_id(id);
+    }
+}
+
+/// Draws one skinned part of a person on the lot into `target`, with or
+/// without room lamps.
+fn draw_lot_part<T: Target + ?Sized>(
+    target: &mut T,
+    part: &crate::appearance::Part,
+    skinned: &crate::skin::Skinned,
+    lighting: Lighting,
+    lamps: &[Lamp],
+    project: impl Fn(Vec3) -> Vec3,
+) {
+    if lamps.is_empty() {
+        draw_part(target, part, skinned, lighting, project);
+    } else {
+        let shade: Vec<Shade> = skinned
+            .normals
+            .iter()
+            .map(|&n| lighting.shade_with(n, lamps))
+            .collect();
+        draw_shaded(target, part, skinned, &shade, project);
+    }
+}
+
+/// Projects a world point for lot rasterization: [`View::place_on`] and
+/// [`View::screen`], shifted by `(+0.5, +0.5)` so [`crate::raster`]'s
+/// half-integer pixel-centre sampler matches Direct3D 6's integer pixel
+/// centres (`0x49b0de`, `0x5cf263`, `0x5d3b44`).
+fn project_lot_vertex(
+    view: &View,
+    p: Vec3,
+    level: i32,
+    depth: &impl Fn([f32; 2], f32, i32) -> f32,
+) -> Vec3 {
+    let (fine, elevation) = view.place_on(p, level);
+    let [x, y] = view.screen(fine, elevation, level);
+    Vec3::new(x + 0.5, y + 0.5, depth(fine, elevation, level))
 }
 
 /// Turns a fine position (or, with `size` 0, a direction) by `rotation`
@@ -648,11 +762,7 @@ impl People {
         };
         posed.sort_by(|a, b| far(b).total_cmp(&far(a)).then(a.id.cmp(&b.id)));
         for person in &posed {
-            let project = |p| {
-                let (fine, elevation) = view.place_on(p, person.level);
-                let [x, y] = view.screen(fine, elevation, person.level);
-                Vec3::new(x, y, depth(fine, elevation, person.level))
-            };
+            let project = |p| project_lot_vertex(&view, p, person.level, &depth);
             // Each pixel the person draws names them, for a click.
             target.set_id(Some(person.id));
             let lighting = Lighting::standard(light, level(world, person.id));
@@ -663,16 +773,12 @@ impl People {
             );
             for part in person.body.parts.iter().filter(|p| p.censor == 0) {
                 let skinned = skin(part, &person.bones);
-                if lamps.is_empty() {
-                    draw_part(target, part, &skinned, lighting, project);
-                    continue;
+                if part.texture_name.is_some() {
+                    let mut packed = Packed565(target);
+                    draw_lot_part(&mut packed, part, &skinned, lighting, &lamps, project);
+                } else {
+                    draw_lot_part(target, part, &skinned, lighting, &lamps, project);
                 }
-                let shade: Vec<Shade> = skinned
-                    .normals
-                    .iter()
-                    .map(|&n| lighting.shade_with(n, &lamps))
-                    .collect();
-                draw_shaded(target, part, &skinned, &shade, project);
             }
             // The plumb bob over their head, if they hold it. Its pixels
             // name the bob itself, so the pointer on it finds the bob, not
@@ -853,6 +959,141 @@ mod tests {
         assert_eq!(canvas.depth, vec![100, sims_render::depth::EMPTY]);
         // The pixel taken names the person; the one left out names nobody.
         assert_eq!([canvas.id_at(0, 0), canvas.id_at(1, 0)], [Some(5), None]);
+    }
+
+    /// `Packed565` truncates textured lot draws to 5-6-5 (0x49f0ae) without
+    /// modifying cached `Body` textures, while direct writes (untextured
+    /// meshes such as the plumb bob's `white` material at 0x5d452b) keep full
+    /// 8-bit channels, and the lot canvas rounds modulation so a 1-ULP
+    /// barycentric shortfall below 1.0 never loses a 5-6-5 step.
+    #[test]
+    fn the_lot_canvas_packs_textured_parts_to_565_and_rounds_modulation() {
+        use sims_render::Canvas as LotCanvas;
+
+        let mut canvas = LotCanvas::new(4, 1, [0, 0, 0]);
+        // Textured grey write masks RGB to 5-6-5 before modulation.
+        {
+            let mut packed = Packed565(&mut canvas);
+            packed.write(0, 0, 0.0, [207, 199, 55, 255], 1.0);
+            // Textured coloured (lamp-lit) write masks per channel and rounds.
+            packed.write_coloured(1, 0, 0.0, [207, 199, 55, 255], [1.0, 0.5, 0.5]);
+        }
+        // 1 ULP below 1.0 (as barycentric weights w0 + w1 + w2 can give)
+        // must round back to [40, 136, 40], not truncate to [39, 135, 39].
+        let target: &mut dyn Target = &mut canvas;
+        target.write(2, 0, 0.0, [40, 136, 40, 255], 0.999_999_94);
+        // Untextured plumb bob modulated at full 255 without 5-6-5 masking.
+        target.write_coloured(3, 0, 0.0, [255, 255, 255, 255], [0.5, 1.0, 0.25]);
+        assert_eq!(
+            canvas.color,
+            vec![[200, 196, 48], [200, 98, 24], [40, 136, 40], [128, 255, 64]]
+        );
+    }
+
+    /// `project_lot_vertex` (used by `People::draw`) adds `(+0.5, +0.5)` to
+    /// `View::screen` so `raster`'s half-integer pixel-centre sampler matches
+    /// Direct3D 6's integer pixel centres (0x49b0de, 0x5cf263, 0x5d3b44).
+    #[test]
+    fn direct3d_integer_pixel_centers_shift_projected_triangles_half_a_pixel() {
+        use crate::appearance::Part;
+        use crate::skin::Skinned;
+        use crate::texture::Texture;
+        use sims_formats::avatar::{Mesh, MeshBinding, Vertex};
+        use sims_render::Canvas as LotCanvas;
+
+        let c = Camera {
+            zoom: Zoom::Near,
+            rotation: 0,
+            level: 1,
+            origin: [0, 0],
+            walls: Walls::Up,
+            focus: Default::default(),
+        };
+        let view = View::new(&c);
+        // A world point whose `View::screen` lands on integer (sx, sy).
+        let world_p = Vec3::new(0.0, 0.0, 0.0);
+        let (fine, elev) = view.place_on(world_p, 1);
+        let [sx, sy] = view.screen(fine, elev, 1);
+        let projected = project_lot_vertex(&view, world_p, 1, &|_, _, _| 0.0);
+        assert_eq!(projected.x, sx + 0.5);
+        assert_eq!(projected.y, sy + 0.5);
+
+        // Place a tiny world-space quad whose `View::screen` spans
+        // [cx - 0.2, cx + 0.2] x [cy - 0.2, cy + 0.2] around an integer
+        // pixel (cx, cy). Only `project_lot_vertex` hits pixel (cx, cy).
+        let (cx, cy) = (sx.round() as i32, sy.round() as i32);
+        let c = Camera {
+            origin: [3 - cx, 3 - cy],
+            ..c
+        };
+        let view = View::new(&c);
+        let [sx, sy] = view.screen(fine, elev, 1);
+        assert!((sx - 3.0).abs() < 1e-4 && (sy - 3.0).abs() < 1e-4);
+
+        let vertex = |p: Vec3| Vertex {
+            position: [p.x, p.y, p.z],
+            normal: [0.0, 0.0, 1.0],
+            uv: [0.5, 0.5],
+            bone: 0,
+        };
+        // Along world (x - z), screen x moves; along world y, screen y moves.
+        let dx = Vec3::new(0.005, 0.0, -0.005);
+        let dy = Vec3::new(0.0, 0.008, 0.0);
+        let corners = [
+            world_p - dx - dy,
+            world_p + dx - dy,
+            world_p + dx + dy,
+            world_p - dx + dy,
+        ];
+        let part = Part {
+            appearance: "quad".into(),
+            bone: 0,
+            bones: vec![0],
+            mesh: Mesh {
+                name: "quad".into(),
+                texture: String::new(),
+                bones: vec!["ROOT".into()],
+                bindings: vec![MeshBinding {
+                    bone: 0,
+                    first_vertex: 0,
+                    vertex_count: 4,
+                    first_blend: 0,
+                    blend_count: 0,
+                }],
+                triangles: vec![[0, 1, 2], [0, 2, 3]],
+                vertices: corners.into_iter().map(vertex).collect(),
+                blends: Vec::new(),
+            },
+            texture_name: None,
+            texture: Texture::solid([248, 252, 248, 255]),
+            censor: 0,
+        };
+        let skinned = Skinned {
+            positions: corners.to_vec(),
+            normals: vec![Vec3::new(0.0, 0.0, 1.0); 4],
+        };
+        let mut unshifted = LotCanvas::new(6, 6, [0, 0, 0]);
+        draw_part(
+            &mut unshifted,
+            &part,
+            &skinned,
+            Lighting::standard(Vec3::new(0.0, 0.0, 1.0), 1.0),
+            |p| {
+                let (f, e) = view.place_on(p, 1);
+                let [x, y] = view.screen(f, e, 1);
+                Vec3::new(x, y, 0.0)
+            },
+        );
+        let mut d3d6 = LotCanvas::new(6, 6, [0, 0, 0]);
+        draw_part(
+            &mut d3d6,
+            &part,
+            &skinned,
+            Lighting::standard(Vec3::new(0.0, 0.0, 1.0), 1.0),
+            |p| project_lot_vertex(&view, p, 1, &|_, _, _| 0.0),
+        );
+        assert_eq!(unshifted.color[3 * 6 + 3], [0, 0, 0]);
+        assert_eq!(d3d6.color[3 * 6 + 3], [248, 252, 248]);
     }
 
     /// The light keeps its place relative to the viewer as the view

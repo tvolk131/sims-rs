@@ -41,7 +41,8 @@
 //! zoom (7:38 AM, Mortimer on the porch bench) is brightest on the
 //! viewer's left and lit on its lower half, as it is with `l` that
 //! vector, and dark on the left with `l` its opposite. With it, ours
-//! spans the same box on screen, each edge within a pixel (the pixels
+//! spans the same box on screen (within a pixel in x and two pixels in y,
+//! as the needle-sharp tips depend on pixel-column alignment; the pixels
 //! inside it are not compared one by one). The turn is in
 //! the lot's terms, not the view's, so the light falls from another side
 //! at each rotation of the view; only rotation 0 was compared.

@@ -230,6 +230,13 @@ pub trait Target {
     /// Writes a texel that passed: its colour times `shade` (0 to 1, see
     /// [`Lighting`]). Its alpha is never 0.
     fn write(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], shade: f32);
+    /// Writes a texel that passed, lit channel by channel by `shade`.
+    /// Defaults to multiplying each channel by `shade` and calling
+    /// [`Target::write`] with shade 1.
+    fn write_coloured(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], shade: [f32; 3]) {
+        let lit = |k: usize| (f32::from(texel[k]) * shade[k]).clamp(0.0, 255.0) as u8;
+        self.write(x, y, z, [lit(0), lit(1), lit(2), texel[3]], 1.0);
+    }
     /// Says whose pixels are written from now on: a person's object ID,
     /// or None once they are drawn. A target that keeps, per pixel, what
     /// drew it (the lot renderer's canvas, `sims_render::Canvas::id_at`)
@@ -310,9 +317,10 @@ impl Shade {
 }
 
 /// Draws one skinned part into `target` with each vertex's [`Shade`]
-/// given (one per vertex of the part's mesh). A grey shade goes to the
-/// target as it is; a coloured one lights each channel of the texel
-/// before it is written, with the target's own factor 1.
+/// given (one per vertex of the part's mesh). A grey shade goes to
+/// [`Target::write`]; a coloured shade goes to [`Target::write_coloured`]
+/// (whose default pre-lights each channel of the texel and calls
+/// [`Target::write`] with shade 1).
 pub fn draw_shaded<T: Target + ?Sized>(
     target: &mut T,
     part: &Part,
@@ -359,8 +367,6 @@ fn triangle<T: Target + ?Sized>(
     if area.abs() < 1e-8 || !area.is_finite() {
         return;
     }
-    // Wind every triangle the same way, so the fill rule below can
-    // tell which side of each edge is inside.
     if area < 0.0 {
         p.swap(1, 2);
         uv.swap(1, 2);
@@ -435,8 +441,7 @@ fn triangle<T: Target + ?Sized>(
             if grey {
                 target.write(x, y, z, texel, s[0]);
             } else {
-                let lit = |k: usize| (f32::from(texel[k]) * s[k]).clamp(0.0, 255.0) as u8;
-                target.write(x, y, z, [lit(0), lit(1), lit(2), texel[3]], 1.0);
+                target.write_coloured(x, y, z, texel, s);
             }
         }
     }
