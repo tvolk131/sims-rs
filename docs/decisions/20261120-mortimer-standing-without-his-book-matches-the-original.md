@@ -105,8 +105,10 @@ ours with ours. Scored against the screenshot, the whole-frame mask that
 gave those numbers counts about 1,400 for every shift: it takes in other
 differences in that frame and does not separate the shifts.
 
-So two frames, at different scrolls, ticks and poses, both fit best with
-our people moved half a pixel right and down. That is consistent with a
+So in two frames, at different scrolls, ticks and poses, (+0.5, +0.5)
+was the best tested shift for Mortimer at both times and for Bella at
+8:05, each scored in that Sim's box (the 7:12 whole-frame score stays
+around 1,400 across the grid). That is consistent with a
 fixed offset in how one of the two programs places or rasterizes a
 person, but these two frames do not show that it is fixed.
 
