@@ -582,7 +582,15 @@ impl<'a> Painter<'a> {
                 let halves = if floor == lot::SPLIT_FLOOR {
                     wall.split_floors().map(Some)
                 } else {
-                    [Some(floor), None]
+                    [
+                        Some(floor_for_rotation(
+                            floor,
+                            level,
+                            self.camera.rotation,
+                            self.lot.floor_rotation,
+                        )),
+                        None,
+                    ]
                 };
                 for (half, id) in halves.into_iter().enumerate() {
                     let Some(id) = id.filter(|&id| id != 0) else {
@@ -1828,6 +1836,26 @@ fn split_half(camera: &Camera, image: &Image, segments: u8, half: usize) -> Imag
     out
 }
 
+/// Floor sprite ID for a non-split tile storing `id` on `level` (`1` or `2`),
+/// drawn at camera rotation `camera` when the lot's level-1 floor array was
+/// saved at `stored` ([`Lot::floor_rotation`]).
+///
+/// Floor IDs `10` and `11` are the road's centre-line dashes, one running
+/// along each horizontal axis. The original has no rotated floor sprites: on
+/// each odd-parity camera turn (`abs(old - new) & 1 != 0`), `0x4a7dfe`
+/// (`0x4a8042` to `0x4a80b1`) swaps `10` and `11` (`id ^ 1`) in place across
+/// `0..lot.size` of level 1's floor array (`[lot + 0x24]`), leaving level 2
+/// (`[lot + 0x28]`) and split-tile wall floors alone. Loading passes
+/// `force_no_swap = 1` (`0x4a861f`), so saved arrays keep the orientation of
+/// their saved `camera_direction` (`HOUS 0`).
+fn floor_for_rotation(id: u16, level: i32, camera: u8, stored: u8) -> u16 {
+    if level == 1 && (camera ^ stored) & 1 != 0 && matches!(id, 10 | 11) {
+        id ^ 1
+    } else {
+        id
+    }
+}
+
 /// A position inside a tile (sixteenths), from view to lot axes.
 fn unrotate_local(camera: &Camera, [x, y]: [i32; 2]) -> [i32; 2] {
     match camera.rotation & 3 {
@@ -2427,6 +2455,34 @@ mod tests {
         // House 99 overrides every time of day with 0x14148c (5-6-5: 2, 5, 17).
         for time_of_day in [-1, 0, 1, 2, 3, 4] {
             assert_eq!(background(time_of_day, 99), [16, 20, 140], "{time_of_day}");
+        }
+    }
+
+    #[test]
+    fn road_dashes_swap_only_on_level_1_at_odd_parity_from_saved_rotation() {
+        for stored in 0..4u8 {
+            for camera in 0..4u8 {
+                let odd = (camera ^ stored) & 1 != 0;
+                // Level 1 swaps 10 <-> 11 when parity differs from stored.
+                assert_eq!(
+                    floor_for_rotation(10, 1, camera, stored),
+                    if odd { 11 } else { 10 },
+                    "stored={stored} camera={camera}"
+                );
+                assert_eq!(
+                    floor_for_rotation(11, 1, camera, stored),
+                    if odd { 10 } else { 11 },
+                    "stored={stored} camera={camera}"
+                );
+                // Level 2 never swaps (0x4a8080 reads [lot + 0x24] only).
+                assert_eq!(floor_for_rotation(10, 2, camera, stored), 10);
+                assert_eq!(floor_for_rotation(11, 2, camera, stored), 11);
+                // Other floor IDs never swap.
+                for other in [0u16, 1, 9, 12, lot::SPLIT_FLOOR, 256] {
+                    assert_eq!(floor_for_rotation(other, 1, camera, stored), other);
+                    assert_eq!(floor_for_rotation(other, 2, camera, stored), other);
+                }
+            }
         }
     }
 }

@@ -10,7 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("usage: render_house <install> <house> <out dir>".into());
     };
     let mut opened = open_house(Path::new(install), Path::new(house))?;
-    let lot = Lot::from_world(&opened.world)?;
+    let lot = Lot::from_world(&opened.world)?.with_floor_rotation(opened.rotation);
     let (width, height) = (1024, 768);
     for zoom in Zoom::ALL {
         for rotation in 0..4u8 {

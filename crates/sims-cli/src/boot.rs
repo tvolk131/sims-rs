@@ -85,7 +85,11 @@ pub fn run(options: &Options<'_>) -> Result<String, Box<dyn Error>> {
     if let Some(path) = options.snapshot
         && failed.is_none()
     {
-        Snapshots::open(path)?.save("boot", lot.world())?;
+        Snapshots::open(path)?.save_with_floor_rotation(
+            "boot",
+            lot.world(),
+            lot.floor_rotation(),
+        )?;
     }
     let world = lot.world();
     let load = lot.load_report();

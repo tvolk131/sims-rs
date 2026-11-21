@@ -80,12 +80,12 @@ walls = cutaway
 paused = yes
 strip = no
 original = far-r1-cut-0816.ppm 14bab6892f135bae298bb9580fb9d281c4e19e093c9cb3200fe25c8e8cf33ad0
-ours = f74d9ea16009dcf650a1c2aed5d2c0baaf5f3c7115d71f172599e18f5d12601b
+ours = 3f4a375334ae442c6f68f7052700f7fe214dd716eb9e36a34a7da53044029362
 leave_out = 302 19 501 79 the original's pause notice, drawn for the screenshot; ours draws none
 leave_out = 86 554 98 565 the panel's pause button, which blinks while paused
 leave_out = 228 254 246 276 the plumb bob, which spins
 leave_out = 260 254 278 276 the plumb bob, which spins
-floors = frame 99.23 surface 99.32 objects 99.20 people 5.61 panel 98.97
+floors = frame 99.46 surface 99.51 objects 99.20 people 5.61 panel 99.88
 
 [medium-r1-cut-0816]
 about = 8:16 AM, paused. The front porch and a Sim walking on the lawn; cutaway walls. Scroll (168, -706).

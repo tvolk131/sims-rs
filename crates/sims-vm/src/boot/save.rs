@@ -35,8 +35,9 @@ use std::collections::BTreeSet;
 /// by [`sims_sim::SNAPSHOT_FORMAT`], which is written too. A save of
 /// another version is refused, not migrated. Layout 2 keeps each pending
 /// dialog answer's bitmap ID ([`crate::Answer`]); layout 3 keeps the
-/// house view's centre.
-pub const FORMAT: u32 = 3;
+/// house view's centre; layout 4 keeps the house file's saved floor
+/// rotation baseline (`HOUS 0` `camera_direction & 3`).
+pub const FORMAT: u32 = 4;
 
 /// A lot as it stood between two steps ([`Lot::save`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +54,9 @@ pub struct Saved {
     loaded: [u8; 32],
     /// Format 3 on.
     view_centre: Option<[i8; 2]>,
+    /// Format 4 on: the saved house's opening camera rotation (`0..=3`)
+    /// paired with its level-1 road-dash floor IDs (`0x4a87b1`–`0x4a87dc`).
+    floor_rotation: u8,
 }
 
 /// Why a lot could not be saved or restored.
@@ -160,6 +164,7 @@ impl Lot {
             family: self.load.family,
             loaded: self.loaded,
             view_centre: self.view_centre,
+            floor_rotation: self.floor_rotation,
         })
     }
 
@@ -181,7 +186,7 @@ impl Lot {
                 loaded,
             });
         }
-        if saved.loaded != self.loaded {
+        if saved.loaded != self.loaded || saved.floor_rotation != self.floor_rotation {
             return Err(SaveError::OtherLoad);
         }
         self.world = saved.world;
