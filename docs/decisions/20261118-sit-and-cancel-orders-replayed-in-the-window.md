@@ -37,7 +37,10 @@ and `the_recorded_cancel_order_replayed_in_the_window_matches_the_recording`.
   ended at 593 and its release command ran from 595 to 625, yet update
   595's state, saved before the release was sent, already shows the
   cancel. Which of the two button events acted is not known; the replay
-  presses before 595, where the effect shows.
+  presses before 595, where the effect shows. The order recorded again
+  with the pick watched does not repeat this: both its cancels act at
+  their release's end
+  (`20261120-cancel-order-replayed-with-the-pick-watched.md`).
 - **A press acted on its release where the timing shows it.** The
   cancel recording sends the button down and up as separate commands:
   - The choice of Have A Snack took effect at the release's end (257
@@ -60,8 +63,12 @@ and `the_recorded_cancel_order_replayed_in_the_window_matches_the_recording`.
 
 - **Cancel.** With the animator reset that removes a playing clip
   (#263), the lot equals the recording's after every update from 1 to
-  1300, except for two listings the original's pointer made and ours
-  did not (below). That covers:
+  1300, except for two differences taken for listings the original's
+  pointer made and ours did not (below). Since then, the one at 90 is
+  settled by drawing on the recording's frames, and the one at 257–259
+  by the second check of a chosen entry
+  (`20261120-choosing-a-pie-entry-checks-it-again.md`): the cancel
+  replay now equals the recording at every update to 1300. That covers:
   - the second order queued behind the first;
   - the press on its icon taking it off;
   - the press on the running snack's icon setting its flag 0x100,
@@ -81,8 +88,9 @@ recorded, 0 ours).
 ## Differences: what the pointer finds
 
 These are all **unverified** and not ported. The lot's state shows only
-that the original listed a pie where ours did not, or listed another
-one.
+that its words differ where a listing would change them; each
+difference below was taken for the original listing a pie where ours
+did not, or listing another one.
 
 - **Through a wall.** At update 90 the pointer at the recording's
   (176, 222) makes the original list a pie: Mortimer's last result
@@ -96,9 +104,18 @@ one.
   same way at 88, but its test gives its hovers by object, not by
   point.
 - **Under the still pointer.** After a choice the pointer stays on the
-  pie entry, and the original lists pies there while the lot runs:
+  pie entry, and these differences were taken for pies the original
+  listed there while the lot ran:
   - in cancel, after 256: for 257–259 the original's word 50 is 0
-    where ours is 1, and its last result 1 where ours is 0;
+    where ours was 1 before the check below was ported, and its last
+    result 1 where ours was 0. Ours now matches. The release's second
+    check of the entry accounts for these
+    (`20261120-choosing-a-pie-entry-checks-it-again.md`, from the
+    snack-bob recording's watch). A listing at the same updates is not
+    ruled out for this run; in the order recorded again with the
+    listed object watched, the original listed nothing under the still
+    pointer after either choice
+    (`20261120-cancel-order-replayed-with-the-pick-watched.md`);
   - in Sit/Read, at 261 (a failed check) and at 291 (word 50 goes to 1
     until 560);
   - in the snack order, at 622, which the write watch shows was the
@@ -106,8 +123,8 @@ one.
 
   Ours lists nothing. Our bob is drawn 10 to 30 pixels below and right
   of the pointer in the snack order and in Sit/Read. In cancel at 257
-  it is about 190 pixels away, so the bob's geometry cannot explain
-  that listing. Track 2's queued snack recording (screenshots during
+  it is about 190 pixels away, so the bob's geometry could not explain
+  that difference, which the release's check accounts for. Track 2's queued snack recording (screenshots during
   the wait) will also keep the word-50 write watch. The watch's saved
   arguments name the object listed, and the screenshot shows where it
   is drawn.

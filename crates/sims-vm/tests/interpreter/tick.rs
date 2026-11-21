@@ -7,7 +7,7 @@ use sims_core::F32;
 use sims_sim::motives::{Curve, Rates, Tuning};
 use sims_sim::{Dialog, HouseUsage, PersonTick, Usage};
 use sims_vm::play::{Play, Recovery};
-use sims_vm::{Answers, Player, Shown, SoundEvent, TickError, Trap, Update};
+use sims_vm::{Answer, Answers, Interpreter, Player, Shown, SoundEvent, TickError, Trap, Update};
 use std::collections::BTreeMap;
 
 /// Dialog (opcode 36) operands of `kind`, waiting for an answer, with the
@@ -58,14 +58,12 @@ fn lot(tree: sims_formats::behavior::Behavior) -> Fixture {
 
 fn update(fx: &mut Fixture, player: &mut dyn Player) -> Result<Update, TickError> {
     let tuning = tuning();
-    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
     interpreter.lot_update(&mut fx.world, &tuning, player)
 }
 
 fn answers(list: &[u8]) -> Answers {
-    Answers {
-        queue: list.iter().copied().collect(),
-    }
+    Answers::choices(list)
 }
 
 /// A lamp that asks a dialog of `kind` and stores 1 in data word 0 on the
@@ -115,6 +113,23 @@ fn the_second_button_takes_the_false_branch_and_marks_the_registry() {
     update(&mut fx, &mut player).unwrap();
     assert_eq!(fx.lamp().data[0], 2);
     assert_eq!(fx.world.dialogs.declined, -1);
+}
+
+#[test]
+fn a_dialog_click_publishes_its_bitmap_until_the_next_poll() {
+    for (bitmap_id, expected) in [(Some(17), 17), (None, 42), (Some(0), 0)] {
+        let mut fx = lot(asking(1, 0));
+        fx.world.globals[12] = 42;
+        let mut player = Answers::replay(&[Answer {
+            status: 2,
+            bitmap_id,
+        }]);
+        assert_eq!(update(&mut fx, &mut player).unwrap().answered, [(LAMP, 2)]);
+        assert_eq!(fx.world.globals[12], expected);
+        let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        interpreter.before_frame(&mut fx.world).unwrap();
+        assert_eq!(fx.world.globals[12], 0);
+    }
 }
 
 #[test]
@@ -1086,6 +1101,37 @@ fn play_mode_catches_a_fault_in_the_rest_of_a_persons_tick() {
     };
     assert_eq!((error.object, error.in_thread), (SIM, false));
     assert!(error.fault.to_string().contains("0x4a69aa"));
+}
+
+/// An update that fails after play mode caught an object's error still
+/// hands back the error caught ([`sims_vm::Interpreter::lot_update_kept`]):
+/// here the lamp's error is caught, and then a dialog no one answers stops
+/// the update at its end.
+#[test]
+fn a_play_update_that_fails_keeps_the_errors_caught_before() {
+    let mut fx = returning_lamp();
+    fx.world.dialogs.records.push(Dialog {
+        caller: SIM,
+        operands: dialog(1, 0),
+        status: 0,
+    });
+    let mut play = Play::default();
+    let tuning = tuning();
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let (update, result) =
+        interpreter.lot_update_kept(&mut fx.world, &tuning, &mut answers(&[]), Some(&mut play));
+    assert!(
+        matches!(result, Err(TickError::Unanswered { given: None, .. })),
+        "{result:?}"
+    );
+    assert_eq!(update.ticked, vec![LAMP]);
+    let [error] = update.errors.as_slice() else {
+        panic!("{:?}", update.errors);
+    };
+    assert_eq!(
+        (error.object, error.recovery.clone()),
+        (LAMP, Recovery::Reset)
+    );
 }
 
 /// An object deleted after play mode reset it is no longer the fresh one,

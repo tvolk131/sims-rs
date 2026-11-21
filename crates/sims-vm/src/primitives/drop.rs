@@ -56,8 +56,9 @@ impl Machine<'_, '_> {
         let [first, second] = step(i32::from(facing));
         let position = [p0.wrapping_add(second), p1.wrapping_add(first)];
         let interpreter = self.interpreter();
-        let unsupported =
-            |fault| Trap::Unsupported(format!("Drop of object {held} by object {me}: {fault}"));
+        let unsupported = |fault: crate::fault::Fault| {
+            fault.unsupported_in(format!("Drop of object {held} by object {me}"))
+        };
         if !interpreter
             .fits(self.world, held, position, level)
             .map_err(unsupported)?

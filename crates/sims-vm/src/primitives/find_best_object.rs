@@ -341,11 +341,11 @@ impl Machine<'_, '_> {
                 TURN_BUDGET,
                 false,
             )
-            .map_err(|fault| {
-                Trap::Unsupported(format!(
-                    "Find Best Object for Function: check tree {tree:#06x} of object {object}: \
-                     {fault}"
-                ))
+            .map_err(|fault| Trap::CheckTree {
+                routine: Some("Find Best Object for Function"),
+                tree,
+                object,
+                fault: Box::new(fault),
             })
     }
 }

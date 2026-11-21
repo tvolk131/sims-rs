@@ -6,6 +6,7 @@ use sims_core::CrtRng;
 use sims_formats::behavior::ObjectDefinition;
 use sims_formats::iff::Iff;
 use sims_sim::{Headline, World};
+use sims_vm::Answer;
 use sims_vm::boot::{Frames, Handoff, Lot, StepError};
 use sims_vm::neighborhood_open::{LotTransition, PoolInput, PoolPerson, open_neighborhood};
 use std::collections::BTreeMap;
@@ -211,26 +212,71 @@ fn the_goth_house_steps_to_tick_33() {
 fn an_old_town_home_loads_through_its_guid_table_and_steps() {
     // House 69 of the first neighborhood was saved under its family's
     // exported GUIDs; its GUID table (0x43a6fb) names the imported types.
-    // The dialogs at ticks 1 and 3 take their first buttons.
+    // Track 2 recorded it for 1,000 updates (`house69-ud1-ticks-20261120`).
     let Some(root) = std::env::var_os("SIMS_INSTALL") else {
         eprintln!("SIMS_INSTALL not set; skipping");
         return;
     };
     let root = PathBuf::from(root);
     let house = root.join("UserData/Houses/House69.iff");
-    let mut lot = Lot::load(&root, &house, &[2; 8], Frames::default()).unwrap();
-    // The C runtime's stream as the original entered the lot
-    // (`house69-ud1-ticks-20261119`): the dog file was read before the
-    // load (`sims_vm::READ_BEFORE_THE_FIRST_LOAD`).
+    let frames = Frames::parse(UD1_RECORDED_FRAMES).unwrap();
+    let bits = UD1_FRAME_TREE_BITS.into_iter().collect();
+    let mut lot = Lot::load_with_frame_tree_bits(
+        &root,
+        &house,
+        &[2; 8],
+        frames,
+        CrtRng::from_state(1),
+        &bits,
+    )
+    .unwrap();
+    lot.replay_dialogs(&UD1_DIALOGS.map(|(status, bitmap_id)| Answer { status, bitmap_id }))
+        .unwrap();
+    // The C runtime's stream as the original entered the lot: the dog file
+    // was read before the load (`sims_vm::READ_BEFORE_THE_FIRST_LOAD`).
     assert_eq!(lot.world().crt_rng.state(), 2_984_970_331);
     let report = lot.load_report();
     assert!(report.stopped.is_none(), "{:?}", report.stopped);
     assert!(report.finished.is_some());
-    for _ in 0..5 {
+    assert_eq!(lot.world().hash_hex(), OLD_TOWN_69);
+    for _ in 0..1000 {
         lot.step().unwrap();
     }
-    assert_eq!(lot.ticks(), 5);
+    assert_eq!(lot.ticks(), 1000);
+    assert_eq!(lot.world().hash_hex(), OLD_TOWN_69_1000);
 }
+
+/// The frames track 2's UserData1 House 69 recording drew
+/// (`house69-ud1-ticks-20261120/watch.jsonl`, the frame watch outside an
+/// update).
+const UD1_RECORDED_FRAMES: &str = "0,1,2,3,4,32,62,92,101,102,128+30";
+/// The saved frames whose arena words had bit 15 set when the original
+/// read them (0x4746e4), as track 2's recording shows them at entry:
+/// frame 1 of objects 263, 264, 265 and 268. The bit is what the arena
+/// held before, not what the house file stores
+/// (`20261115-household-selection-works-out-again-who-visitor.md`).
+const UD1_FRAME_TREE_BITS: [(u16, usize); 4] = [(263, 1), (264, 1), (265, 1), (268, 1)];
+/// The recording's dialogs after the load, in order. Each closed with
+/// result 2. While the fourth was open, the wait check published 17
+/// (`WinBtn.bmp`, 0x46d9c4), the bitmap of the button that closed it,
+/// which global 12 holds until the next update. While the others were
+/// open, global 12 did not change in the recording, so they publish
+/// nothing.
+const UD1_DIALOGS: [(u8, Option<i16>); 6] = [
+    (2, None),
+    (2, None),
+    (2, None),
+    (2, Some(17)),
+    (2, None),
+    (2, None),
+];
+/// UserData1's House 69 at entry (format 30), a regression pin of our
+/// run. It differs from track 2's recording only in object 2's last
+/// result; see `20261120-ud1-house-69-matches-the-recording.md`.
+const OLD_TOWN_69: &str = "c5e13dcc25bd62e07d7b456bf47eddfc1837434ace4575048d445e113cce67d3";
+/// The same after 1000 ticks, a regression pin, which differs from the
+/// recording's update 1000 only in object 2's last result.
+const OLD_TOWN_69_1000: &str = "5d8b7386fad6b71f7117c4a241853992dfe39f853033336022d74b8fed95ece1";
 
 /// UserData2 as the original left it after opening it for the first time,
 /// in a fresh directory: the install's UserData2, with the `Characters`
@@ -558,9 +604,21 @@ fn the_selected_goth_lists_pie_menus_and_picks_from_them() {
     // action string with a token, whose formatter is not ported. The lot
     // is as it was.
     let before = lot.world().hash();
-    let refused = lot.pie_menu(sim, 10).unwrap_err().to_string();
-    assert!(refused.contains("0x44bf1a"), "{refused}");
+    let refused = lot.pie_menu(sim, 10).unwrap_err();
+    assert!(refused.to_string().contains("0x44bf1a"), "{refused}");
     assert_eq!(lot.world().hash(), before);
+    // The check tree's fault keeps its trap, here something not ported.
+    let sims_vm::boot::OrderError::Refused(fault) = &refused else {
+        panic!("{refused:?}");
+    };
+    let sims_vm::Trap::CheckTree { fault: inner, .. } = &fault.trap else {
+        panic!("{fault:?}");
+    };
+    assert!(
+        matches!(&inner.trap, sims_vm::Trap::Unsupported(m) if m.contains("0x44bf1a")),
+        "{fault}"
+    );
+    assert!(fault.trap.unported());
     // Object 18's check tree reads the advertisement record (scope 12)
     // before Find Best Interaction first copies into it: the game's start
     // left it zeroed.
