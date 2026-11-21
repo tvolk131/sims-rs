@@ -251,11 +251,11 @@ pub fn tile_corners(lot: &sims_render::Lot, camera: &Camera, view_tile: [i32; 2]
 /// Rotates a fine lot position into view coordinates about 1023, as
 /// `0x47bc1f` does with `param_4 = 0x400`.
 pub(crate) fn rotate_object_fine(camera: &Camera, [x, y]: [i32; 2]) -> [i32; 2] {
-    let m = 1023;
+    let m: i32 = 1023;
     match camera.rotation & 3 {
-        1 => [m - y, x],
-        2 => [m - x, m - y],
-        3 => [y, m - x],
+        1 => [m.wrapping_sub(y), x],
+        2 => [m.wrapping_sub(x), m.wrapping_sub(y)],
+        3 => [y, m.wrapping_sub(x)],
         _ => [x, y],
     }
 }

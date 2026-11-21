@@ -3519,10 +3519,16 @@ fn pressing_a_pie_entry_and_dragging_off_orders_nothing() {
 /// using the pointer, then opens the fridge's pie and hovers `Have A Snack`
 /// a second time before update 900.
 ///
-/// Replayed in strict mode on the recording's frame schedule with the raw,
-/// unshifted recording coordinates, the lot matches the recording's full
-/// state at every update 1..=900 (aside from UI global 12 and Bella's
-/// uninitialized frame-arena local at updates 203..=227).
+/// Replayed offline in strict mode on the recording's frame schedule with
+/// the raw, unshifted recording coordinates, every compared simulation
+/// field (globals, all three RNGs, scheduler cursor, and all objects'
+/// data/temps/attributes/last_result/frames/person data/motives/active/
+/// previous/queue across 377 objects at update 1 down to 347 at update 900)
+/// matched updates 1..=900 except for UI global 12, Bella's uninitialized
+/// frame-arena locals (updates 203..=227 and unknown updates 368..=408),
+/// and the salesman's (object 259) unknown person word 37 and tree 4099
+/// local 7 from update 14. This test pins selected checkpoints through
+/// update 900.
 #[test]
 fn the_recorded_switch_order_replayed_in_the_window_matches_the_recording() {
     let Some(install) = install() else {
@@ -3682,4 +3688,36 @@ fn the_recorded_switch_order_replayed_in_the_window_matches_the_recording() {
 
     run_to(&mut game, &schedule, 900);
     assert_eq!(game.caught(), 0, "{:?}", game.errors());
+}
+
+/// Centring on any tile of a multi-tile object averages its linked parts'
+/// positions (`0x4071a3`) before rotating and projecting (`0x434ced` →
+/// `0x4a7996`). On the Goth lot, object 25 is a 4-tile object whose parts
+/// average to `[400, 432, 1]`, yielding origin `[432, -142]` (instead of
+/// `[448, -142]` from part 25 alone).
+#[test]
+fn centring_a_multi_tile_object_averages_its_parts() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    game.resize([800, 600]);
+    let lead = 25u16;
+    let mut parts = vec![lead];
+    while let Some(&next) = parts
+        .last()
+        .and_then(|id| game.lot().world().next_parts.get(id))
+    {
+        parts.push(next);
+    }
+    assert_eq!(parts.len(), 4, "object 25 is a 4-tile object");
+    for part in parts {
+        game.view.camera.origin = [0, 0];
+        game.centre_on(part);
+        assert_eq!(
+            game.view.camera.origin,
+            [432, -142],
+            "centring part {part} of object 25"
+        );
+    }
 }

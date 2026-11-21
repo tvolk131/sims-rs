@@ -1,14 +1,21 @@
-# Portrait centring uses terrain heights and the 500-pixel house view; the switch order replays to update 900
+# Portrait centring uses terrain heights, multi-tile averaging, and the 500-pixel house view; the switch order replays to update 900
 
 *Decided 2026-11-21.*
 
 Replaying track 2's switch-and-order recording of the Goth house
 (`goth-switch-cancel-order-20261115`, 900 updates) through the window's
 input layer uncovered two differences in how `Game::centre_on` and
-`sound::fine_point` placed a centred Sim compared to `Sims.exe`.
+`sound::fine_point` placed a centred Sim compared to `Sims.exe`. Review
+also identified that `Game::centre_on` omitted `0x4071a3`'s multi-tile
+part averaging.
 
 ## What the original does
 
+- **Multi-tile object position averaging** (`0x4071a3`, called by
+  `0x434ced`). For a multi-tile object (`cXObjectMultiTile`), `0x4071a3`
+  steps to the lead tile (`+0x190`, or the object itself if null), walks
+  the linked parts via `+0x18c` (`next_parts`), and averages their `x`
+  and `y` positions by signed integer division toward zero.
 - **The house view sits above the 100-pixel live-mode strip**
   (`0x49ae5e` → `0x5cf1b6`, `0x4a70ba`, `0x4b136b`, `0x53b2eb`). At
   800×600 `0x49ae5e` sizes the house view's viewport to `(800, 600 - 100)`
@@ -39,10 +46,11 @@ input layer uncovered two differences in how `Game::centre_on` and
   `sound::object_point_on_lot` port `0x4a9dc7` / `0x4a9c50` / `0x479567`
   with terrain heights; `sound::screen` (`0x570e09`) now uses
   `object_point_on_lot`.
-- `Game::centre_on` (`0x434ced`) centres on `[width / 2, (height - 100) / 2]`,
-  projects with terrain heights, checks `0x4a7af0`'s rotated active lot
-  bounds on the `0x4a7996` path, clamps to `0x4a9fa9`'s scroll limits,
-  and applies `0x4a81cc`'s `(x + 1) & !3` alignment.
+- `Game::centre_on` (`0x434ced`) averages multi-tile parts' positions
+  (`0x4071a3`), centres on `[width / 2, (height - 100) / 2]`, projects
+  with terrain heights, checks `0x4a7af0`'s rotated active lot bounds on
+  the `0x4a7996` path, clamps to `0x4a9fa9`'s scroll limits, and applies
+  `0x4a81cc`'s `(x + 1) & !3` alignment.
 - `View::apply(Move::Scroll)` and the initial `View::new` camera are
   unchanged (scroll limits apply to `Game::centre_on` here; porting
   scroll clamping to manual scrolling and loading the saved `HOUS`
@@ -50,22 +58,34 @@ input layer uncovered two differences in how `Game::centre_on` and
 
 ## Verified
 
-- Replaying `goth-switch-cancel-order-20261115` in strict mode on the
-  recording's frame schedule matches the original's full state at every
-  update from 1 to 900 (all 347 objects, all three RNGs, scheduler
-  cursor, motives, stacks, queues, and `last_result`), aside from UI
-  global 12 (`2010` at 214–393, `-1` at 394–900) and Bella's known
-  uninitialized frame-arena local at updates 203–227 (tree 8292, node
-  17).
+- An offline comparison (scratch tools, not in the repository) replayed
+  `goth-switch-cancel-order-20261115` in strict mode on the recording's
+  frame schedule through update 900, comparing all three RNGs, the
+  scheduler cursor, globals, and every object's `data`, `temps`,
+  `attributes`, `last_result`, `frames`, `person.data`, `motives`,
+  `active`, `previous`, and `queue` (377 objects at update 1, 347 at
+  update 900). Every compared field matched at updates 1–900 except for
+  four known excluded/uninitialized items:
+  - UI global 12 (`2010` at updates 214–393, `-1` at 394–900 vs `0`);
+  - Bella's (object 18) uninitialized frame-arena local at updates
+    203–227 (frame 6, tree 8292, node 17, local 0: `16104` vs `0`) and
+    unknown frame 9 locals 2–3 at updates 368–408 (marked unknown in
+    `frame_storage`);
+  - The salesman's (object 259) two unknown words from update 14, also
+    excluded in prior Goth replays: person word 37 (`3287` recorded vs
+    `0`) and frame 3 tree `4099` (`0x1003`) local 7 (`2623` recorded vs
+    `0`).
 - After centring on Bella at update 543 (`origin = [472, -117]`,
   matching `after-centre.png` to `-1` pixel in x and `0` in y), the
   recording's raw unshifted hover and click points hit the exact same
   objects (`None`, `None`, fridge `118`, then counter `119`, `None`,
   fridge `118`) and open the fridge's pie at the recording's exact label
   rectangles.
-- Pinned by
+- Selected checkpoints of the 900-update replay are pinned by
   `the_recorded_switch_order_replayed_in_the_window_matches_the_recording`
-  in `crates/sims-game/tests/goth.rs`, along with unit tests for
+  in `crates/sims-game/tests/goth.rs`, along with
+  `centring_a_multi_tile_object_averages_its_parts` (pinning object 25's
+  4 parts to `[432, -142]`) and unit tests for
   `fine_point_with_heights`, `tile_corners`, and `scroll_limits`.
 
 ## Unverified
