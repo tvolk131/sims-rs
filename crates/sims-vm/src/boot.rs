@@ -22,6 +22,7 @@ use sims_sim::World;
 use sims_sim::load::{Context, Household};
 use sims_sim::motives::Tuning;
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 /// Anything that stops a boot, with a message that says where.
@@ -443,6 +444,21 @@ impl Lot {
         frames: Frames,
         crt: CrtRng,
     ) -> Result<Self, BootError> {
+        Self::load_with_frame_tree_bits(root, house, answers, frames, crt, &BTreeSet::new())
+    }
+
+    /// Boots a lot with its observed set of inherited frame tree bits
+    /// (0x4746e4). Pass saved object IDs and zero-based frame indices.
+    /// ObjM alone does not carry these bits. See
+    /// [`Interpreter::read_objects_with_frame_tree_bits`].
+    pub fn load_with_frame_tree_bits(
+        root: &Path,
+        house: &Path,
+        answers: &[u8],
+        frames: Frames,
+        crt: CrtRng,
+        frame_tree_bits: &BTreeSet<(u16, usize)>,
+    ) -> Result<Self, BootError> {
         let install = Install::detect(root)?;
         let directory = house
             .parent()
@@ -585,7 +601,12 @@ impl Lot {
                 &catalog,
                 file.objects.instances.values().map(|o| o.guid),
             )?;
-            let read = interpreter.read_objects(&mut world, &file.objects, &people)?;
+            let read = interpreter.read_objects_with_frame_tree_bits(
+                &mut world,
+                &file.objects,
+                &people,
+                frame_tree_bits,
+            )?;
             load.read = read.objects.len();
             load.draws = read.draws;
             // 8: the lot-wide controllers, now among the saved objects. 9:

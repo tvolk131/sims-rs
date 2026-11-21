@@ -152,6 +152,8 @@ impl Machine<'_, '_> {
     ///
     /// While the object runs a callback, the frame looked at is the one
     /// below the callback, which is where its own thread stopped.
+    /// It resolves the tree with the flag masked (0x44577e -> 0x47536b)
+    /// without dispatching the frame.
     pub(crate) fn wake(&mut self, id: u16) -> Result<(), Trap> {
         let object = self
             .world
@@ -169,7 +171,8 @@ impl Machine<'_, '_> {
         let sleeping = match depth.checked_sub(1).and_then(|i| object.stack.get(i)) {
             Some(frame) => {
                 let owner = self.owner(frame)?;
-                match self.program.tree(owner, frame.tree) {
+                let tree = frame.tree_id();
+                match self.program.tree(owner, tree) {
                     Tree::Behavior(_, behavior) => {
                         let instruction = behavior
                             .instructions
@@ -177,7 +180,7 @@ impl Machine<'_, '_> {
                             .ok_or_else(|| Trap::Invalid("woken frame is past its tree".into()))?;
                         instruction.opcode & 0x7fff == 0
                     }
-                    _ => return Err(Trap::MissingTree { id: frame.tree }),
+                    _ => return Err(Trap::MissingTree { id: tree }),
                 }
             }
             None => false,

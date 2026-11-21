@@ -12,6 +12,8 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Frame {
     pub stack_object: i16,
+    /// The raw tree word. In memory, bit 15 selects the dispatch hook
+    /// (0x474b99). The native ObjM writer masks it off (0x4746c0).
     pub tree: u16,
     pub node: u16,
     pub parameters: Vec<i16>,
@@ -19,6 +21,20 @@ pub struct Frame {
     pub primitive_state: i32,
     pub code_owner_type: i16,
 }
+
+impl Frame {
+    pub const TREE_FLAG: u16 = 0x8000;
+
+    /// The tree ID used for lookup (0x47536b), preserving the 0xffff mark.
+    pub fn tree_id(&self) -> u16 {
+        if self.tree == u16::MAX {
+            self.tree
+        } else {
+            self.tree & !Self::TREE_FLAG
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Relationship {
     pub present: i32,
