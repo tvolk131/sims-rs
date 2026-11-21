@@ -19,8 +19,9 @@ The test is `the_recorded_talk_order_replayed_in_the_window_matches_the_recordin
   the lot has run the update before the one its command ended in.
   - The hover that lists Bella's pie ended at 94, and Mortimer's last
     result changes at 94.
-  - The top pie's press is given once the lot has run update 123:
-    the pie first shows in update 124's state. Its button went down in
+  - The top pie's press is given once the lot has run update 123.
+    The harness's input log first reports the pie at 124, and the
+    saved state shows Mortimer's last result changing at 124. Its button went down in
     a command that ended at 122 and came up in one that ended at 139,
     so this press does not follow the rule above.
   - The Talk... entry is pressed at 176 (its release ended at 177).
@@ -43,7 +44,8 @@ The test is `the_recorded_talk_order_replayed_in_the_window_matches_the_recordin
 
 ## Verified
 
-The lot equals the recording's after every update from 1 to 1000 except:
+In every word the comparison checks, the lot equals the recording's
+after every update from 1 to 1000 except:
 
 - Mortimer's word 50 at 521–810 (recorded 1, ours 0) and 881–925
   (recorded 0, ours 1);
@@ -51,11 +53,17 @@ The lot equals the recording's after every update from 1 to 1000 except:
 
 These most likely come from listings the original made under the still
 pointer and ours did not. Which objects it listed is **unverified**
-(below). As in the Sit and cancel notes, the comparison leaves out two of
-the salesman's words that our state marks as unknown from update 14:
+(below).
+
+The comparison skips every word our state marks as unknown. As in the
+Sit and cancel notes, these include two of the salesman's from update
+14:
 
 - his person word 37 (3289 recorded, 0 ours);
 - local 7 of his third frame, tree 0x1003 (2625 recorded, 0 ours).
+
+Others' person word 37 is skipped the same way: Alexander's at 588
+(3092 recorded, 0 ours) and Bella's at 1000 (2876 recorded, 0 ours).
 
 The test pins:
 
@@ -119,8 +127,9 @@ These are **unverified** and not ported.
   after 880, Bella is drawn 2 columns right and 2 rows up of the
   pointer.
 - **Together.** With three trial listings, the replay equals the
-  recording after every update from 1 to 1000, with none of the
-  differences above left (scratch tool):
+  recording in every word the comparison checks, after every update
+  from 1 to 1000, with none of the differences above left (scratch
+  tool):
   - the salesman after 520;
   - the salesman again after 550;
   - Bella after 880.

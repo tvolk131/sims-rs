@@ -2417,9 +2417,9 @@ fn the_recorded_cancel_order_replayed_in_the_window_matches_the_recording() {
 /// lowest pixel our frame draws her at; while ours finds nothing there,
 /// the replay points at that pixel (`docs/decisions/`). With the frames
 /// its Room motives show (after every 30th update from 190), the lot
-/// equals the recording's after every update to 1000 but for the listings
-/// the original most likely made under the still pointer, which ours does
-/// not make, and two of the salesman's words our state marks as unknown.
+/// equals the recording's after every update to 1000, in every word our
+/// state does not mark as unknown, but for the listings the original most
+/// likely made under the still pointer, which ours does not make.
 #[test]
 fn the_recorded_talk_order_replayed_in_the_window_matches_the_recording() {
     let Some(install) = install() else {
