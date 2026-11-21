@@ -169,7 +169,7 @@ impl Game {
             lot.world(),
             lot.program().autonomy_constants().friendship_threshold,
         )?;
-        hud.sync_pause_blink(lot.world().paused(), 0);
+        hud.sync_clock_blink(lot.world(), 0);
         let mut people = People::open(&options.install, house)?;
         people.refresh(lot.world());
         let view = View::new([800, 600], lot_shape.built_center(), lot.view_rotation());
@@ -303,10 +303,19 @@ impl Game {
                 .set_speed(i32::from(level))
                 .map(|_| self.pace.set_speed(speed))
         });
-        if let Err(e) = result {
-            self.note = Some(format!("The speed was not changed: {e}"));
+        match result {
+            Ok(()) => {
+                // 0x53a5e3, 0x53a661..0x53a666, 0x53a6dc..0x53a6e1: manual
+                // speed presses in Live mode clear `[control_panel + 0x1ec]`.
+                if self.hud.controls.mode == sims_ui::command::Mode::Live {
+                    self.hud.set_idle_speed(false);
+                }
+            }
+            Err(e) => {
+                self.note = Some(format!("The speed was not changed: {e}"));
+            }
         }
-        if self.hud.sync_pause_blink(self.paused(), self.clock_us) {
+        if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
             self.blink_dirty = true;
         }
     }
@@ -328,7 +337,7 @@ impl Game {
         if let Err(e) = result {
             self.note = Some(format!("The pause was not changed: {e}"));
         }
-        if self.hud.sync_pause_blink(self.paused(), self.clock_us) {
+        if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
             self.blink_dirty = true;
         }
     }
@@ -372,7 +381,7 @@ impl Game {
     /// (**unverified**, and the window's timing, not the simulation's).
     pub fn advance(&mut self, elapsed_us: u64) -> u32 {
         self.clock_us = self.clock_us.saturating_add(elapsed_us);
-        if self.hud.sync_pause_blink(self.paused(), self.clock_us) {
+        if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
             self.blink_dirty = true;
         }
         if self.lot.asking().is_some() {
@@ -384,7 +393,7 @@ impl Game {
         }
         let due = self.pace.due(elapsed_us, self.lot.world().speed());
         let ran = self.run_while(due, true);
-        if self.hud.sync_pause_blink(self.paused(), self.clock_us) {
+        if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
             self.blink_dirty = true;
         }
         ran
@@ -398,6 +407,13 @@ impl Game {
         let set = self.lot.idle_speed().unwrap_or(false);
         if set {
             self.pace.restart();
+            // 0x46d7b5 -> 0x109(1) when entering idle speed, 0x46d803 ->
+            // 0x109(0) when leaving (`return_speed` reset to -1).
+            self.hud
+                .set_idle_speed(self.lot.world().return_speed() >= 0);
+            if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
+                self.blink_dirty = true;
+            }
         }
         set
     }
@@ -478,6 +494,21 @@ impl Game {
                     }
                     self.stop(&error);
                 }
+            }
+            // `Lot::step` runs `World::idle_speed` before the tick (0x46d9d6).
+            // Detect `0x109(1)` / `0x109(0)` transitions directly from
+            // `return_speed`'s sign change so even a same-tick Special Effect
+            // `0x10c` reset (`(NORMAL, -1) -> (IDLE, NORMAL) -> (NORMAL, NORMAL)`)
+            // arms `[control_panel + 0x1ec]` under both `Game::run` and
+            // `Game::advance`.
+            let return_after = self.lot.world().return_speed();
+            if speed_before.1 < 0 && return_after >= 0 {
+                self.hud.set_idle_speed(true);
+            } else if speed_before.1 >= 0 && return_after < 0 {
+                self.hud.set_idle_speed(false);
+            }
+            if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
+                self.blink_dirty = true;
             }
             if sync_speed_after_step(&mut self.pace, speed_before, self.lot.world()) && idle {
                 break;
@@ -598,7 +629,7 @@ impl Game {
         // it was shown.
         let dialogs = self.lot.asking().map_or(world, |a| &a.world);
         self.hud.read_dialog(dialogs, &self.assets);
-        self.hud.sync_pause_blink(world.paused(), self.clock_us);
+        self.hud.sync_clock_blink(world, self.clock_us);
         self.blink_dirty = false;
         self.hud.draw(
             world,
@@ -707,6 +738,9 @@ impl Game {
                 Some(command) => self.command(command, menu.as_ref()),
                 None => Outcome::redraw(),
             };
+            if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
+                self.blink_dirty = true;
+            }
             let sounds = self.hud.take_sounds();
             self.keep_sounds(sounds);
             return outcome;
@@ -1114,8 +1148,22 @@ impl Game {
     /// on a press on the selected Sim's portrait (0x51ea7a, behind a
     /// check of global 0x6f6bac) whose effect has not been read.
     pub fn select(&mut self, sim: u16) {
-        if self.lot.world().selected() == Some(sim) {
-            self.centre_on(sim);
+        let world = self.lot.world();
+        let same_neighbor = world.selected() == Some(sim)
+            || world
+                .selected()
+                .and_then(|id| world.objects.get(&id))
+                .zip(world.objects.get(&sim))
+                .is_some_and(|(selected, target)| selected.guid == target.guid);
+        if same_neighbor {
+            // 0x4cfa0d..0x4cfa47: centres on the first live person of that
+            // neighbor in person-registry order (`0x4e9608`).
+            let target = world
+                .objects
+                .get(&sim)
+                .and_then(|o| sims_ui::household::first_person_for_guid(world, o.guid))
+                .map_or(sim, |o| o.id);
+            self.centre_on(target);
             self.hud.play(crate::hud::CLICK);
             return;
         }
@@ -1296,7 +1344,7 @@ impl Game {
         self.hud.forget();
         self.blink_dirty = false;
         let world = self.lot.world();
-        self.hud.sync_pause_blink(world.paused(), self.clock_us);
+        self.hud.sync_clock_blink(world, self.clock_us);
         if let Some(speed) = pace::shown(world) {
             self.pace.speed = speed;
         }

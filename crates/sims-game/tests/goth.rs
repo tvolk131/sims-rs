@@ -3739,6 +3739,374 @@ fn the_control_panel_pause_blink_help_budget_mode_and_pet_refresh() {
     assert_eq!(hud.press(interests_center, &removed, true), None);
 }
 
+/// Install-backed verification of pet Personality/Skills subpanels, state-3
+/// ultra-speed blinking, duplicate live household instance selection, and
+/// non-residential House panel suppression on the Complete Collection install.
+#[test]
+fn pet_subpanels_ultra_speed_blink_and_duplicate_instance_selection() {
+    use sims_game::hud::Hud;
+    use sims_game::pace::Pace;
+    use sims_ui::command::{Command, Panel};
+    use sims_ui::hud::{Kind, id};
+    let Some(install) = install() else {
+        return;
+    };
+    let house = goth_house(&install);
+    let mut game = Game::open(&Options {
+        install: install.clone(),
+        house: house.clone(),
+        answers: vec![3],
+        play: false,
+        frames: Frames::default(),
+    })
+    .expect("the Goth house opens");
+    assert_eq!(game.run(2), 2);
+    let opened = open_house(&install, &house).expect("the Goth house opens");
+    let lot = game.lot();
+    let mut hud = Hud::open(
+        &install,
+        &house,
+        &opened.assets,
+        lot.world(),
+        lot.program().autonomy_constants().friendship_threshold,
+    )
+    .expect("HUD opens");
+    let view = View::new([800, 600], [0, 0], opened.rotation);
+    let mut canvas = Canvas::new(800, 600, [0; 3]);
+
+    // 1. State-3 ultra-speed blink (`0x53b4c9..0x53b7e7`): put the lot into
+    //    idle speed (`return_speed = NORMAL`, `speed = IDLE`), verify Normal
+    //    stays selected while Ultra blinks unselected -> selected at 500 ms
+    //    and back at 1000 ms, and stays steady when return_speed == ULTRA.
+    let mut idle_world = lot.world().clone();
+    idle_world.globals[16] = sims_sim::speed::IDLE;
+    idle_world.globals[18] = sims_sim::speed::NORMAL;
+    let speed_btn = |hud: &Hud, target: i32| {
+        hud.items()
+            .iter()
+            .find_map(|i| match i.kind {
+                Kind::Button { id, selected, .. } if id == target => Some(selected),
+                _ => None,
+            })
+            .expect("speed button")
+    };
+    assert!(!hud.sync_clock_blink(&idle_world, 0));
+    hud.draw(
+        &idle_world,
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    assert!(speed_btn(&hud, id::NORMAL));
+    assert!(!speed_btn(&hud, id::ULTRA));
+    assert!(!hud.sync_clock_blink(&idle_world, 499_999));
+    assert!(hud.sync_clock_blink(&idle_world, 500_000));
+    hud.draw(
+        &idle_world,
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    assert!(speed_btn(&hud, id::NORMAL));
+    assert!(speed_btn(&hud, id::ULTRA));
+    assert!(hud.sync_clock_blink(&idle_world, 1_000_000));
+    hud.draw(
+        &idle_world,
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    assert!(!speed_btn(&hud, id::ULTRA));
+    // When return_speed is already ULTRA, Ultra stays steady selected (no blink).
+    let mut ultra_idle = idle_world.clone();
+    ultra_idle.globals[18] = sims_sim::speed::ULTRA;
+    assert!(!hud.sync_clock_blink(&ultra_idle, 1_500_000));
+    assert!(!hud.sync_clock_blink(&ultra_idle, 2_000_000));
+    hud.draw(
+        &ultra_idle,
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    assert!(speed_btn(&hud, id::ULTRA));
+
+    // Scripted Special Effect `0x10c` speed reset (`0x4f6856..0x4f687a`):
+    // changes speed & return_speed from (IDLE, FAST) -> (NORMAL, NORMAL)
+    // WITHOUT clearing `[control_panel + 0x1ec]`: `0x53b0d3` preserves state 3
+    // and its running 500 ms timer (`since = 2_600_000`), `0x53b121..0x53b128`
+    // immediately clears Ultra's selected bit, and the next scheduled callback
+    // at 3_100_000 turns Ultra back on. A manual Live-mode speed click
+    // (`0x53a5e3`) clears `[+0x1ec]`, stopping the blink even though the speed
+    // globals are identical.
+    let mut scripted_world = idle_world.clone();
+    scripted_world.globals[18] = sims_sim::speed::FAST;
+    assert!(!hud.sync_clock_blink(&scripted_world, 2_100_000));
+    assert!(hud.sync_clock_blink(&scripted_world, 2_600_000));
+    assert!(hud.controls.ultra_lit);
+    scripted_world.set_speed(i32::from(sims_sim::speed::NORMAL));
+    assert_eq!(
+        (scripted_world.speed(), scripted_world.return_speed()),
+        (sims_sim::speed::NORMAL, sims_sim::speed::NORMAL)
+    );
+    // Speed refresh clears Ultra's selected bit (`0x53b121..0x53b128`) while
+    // keeping state 3's scheduled 500 ms timer (`since = 2_600_000`).
+    assert!(hud.sync_clock_blink(&scripted_world, 2_800_000));
+    assert!(!hud.controls.ultra_lit);
+    // Next scheduled callback at 3_100_000 turns Ultra back on.
+    assert!(hud.sync_clock_blink(&scripted_world, 3_100_000));
+    assert!(hud.controls.ultra_lit);
+    hud.draw(
+        &scripted_world,
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    assert!(speed_btn(&hud, id::NORMAL));
+    assert!(speed_btn(&hud, id::ULTRA));
+    // Manual Live-mode speed click clears `[control_panel + 0x1ec]`.
+    hud.set_idle_speed(false);
+    assert!(hud.sync_clock_blink(&scripted_world, 3_200_000));
+    assert!(!hud.controls.ultra_lit);
+    assert!(!hud.sync_clock_blink(&scripted_world, 3_700_000));
+    assert!(!hud.controls.ultra_lit);
+
+    // 2. Dog (`KIND = 2`) and Cat (`KIND = 4`) Personality and Pet Skills panels
+    //    drawn with real UIGraphics art and fonts.
+    let mut dog_world = lot.world().clone();
+    let selected_id = dog_world.selected().expect("Mortimer selected");
+    {
+        let p = dog_world
+            .objects
+            .get_mut(&selected_id)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap();
+        p.data[sims_sim::neighbors::KIND] = 2;
+        p.data[10] = 500; // House Breaking / Hunting
+        p.data[12] = 800; // Tricks
+        p.data[11] = 300; // Obedience
+    }
+    let mut cat_world = dog_world.clone();
+    cat_world
+        .objects
+        .get_mut(&selected_id)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap()
+        .data[sims_sim::neighbors::KIND] = 4;
+
+    // Personality panel: pet traits differ from human traits, and no zodiac sign.
+    hud.controls.panel = Some(Panel::Personality);
+    let mut human_canvas = Canvas::new(800, 600, [0; 3]);
+    hud.draw(
+        lot.world(),
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut human_canvas,
+    );
+    let mut dog_pers_canvas = Canvas::new(800, 600, [0; 3]);
+    hud.draw(
+        &dog_world,
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut dog_pers_canvas,
+    );
+    assert!(hud.items().iter().any(|i| matches!(
+        i.kind,
+        Kind::Personality {
+            pet: true,
+            zodiac: None,
+            ..
+        }
+    )));
+    assert!(
+        !hud.items()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::Sign { .. }))
+    );
+    assert_ne!(human_canvas.color, dog_pers_canvas.color);
+
+    // Job panel: Dog shows Dog Pet Skills, Cat shows Cat Pet Skills, distinct pixels.
+    hud.controls.panel = Some(Panel::Job);
+    let mut dog_skills_canvas = Canvas::new(800, 600, [0; 3]);
+    hud.draw(
+        &dog_world,
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut dog_skills_canvas,
+    );
+    assert!(hud.items().iter().any(|i| matches!(
+        i.kind,
+        Kind::PetSkills {
+            kind: sims_ui::household::PetKind::Dog,
+            skills: [500, 800, 300],
+        }
+    )));
+    assert!(
+        !hud.items()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::Skills { .. } | Kind::Work { .. }))
+    );
+
+    let mut cat_skills_canvas = Canvas::new(800, 600, [0; 3]);
+    hud.draw(
+        &cat_world,
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut cat_skills_canvas,
+    );
+    assert!(hud.items().iter().any(|i| matches!(
+        i.kind,
+        Kind::PetSkills {
+            kind: sims_ui::household::PetKind::Cat,
+            skills: [500, 800, 300],
+        }
+    )));
+    assert_ne!(dog_skills_canvas.color, cat_skills_canvas.color);
+
+    // 3. Stale Sign press guard (`0x51cd17 -> 0x51ce05`, `0x51d1cc..0x51d1ee`):
+    //    draw human Personality so `Kind::Sign` is in `hud.items()`, then click
+    //    that stale Sign rect against `dog_world` before redraw — must return
+    //    None and emit no `UI_whoosh`.
+    hud.controls.panel = Some(Panel::Personality);
+    hud.draw(
+        lot.world(),
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    let _ = hud.take_sounds();
+    let sign_rect = hud
+        .items()
+        .iter()
+        .find(|i| matches!(i.kind, Kind::Sign { .. }))
+        .expect("human zodiac sign")
+        .rect;
+    let sign_center = [
+        sign_rect.x + sign_rect.width / 2,
+        sign_rect.y + sign_rect.height / 2,
+    ];
+    assert_eq!(hud.press(sign_center, &dog_world, true), None);
+    assert!(hud.controls.help.is_none());
+    assert!(hud.take_sounds().is_empty());
+
+    // 4. Duplicate live household Sim instance (`0x51c5ef -> 0x4e97dc`,
+    //    `0x4e9608`): a clone with a LOWER object ID appended later in
+    //    `world.people` still resolves Mortimer's resident slot to the first
+    //    person in `world.people`, highlights their portrait, and keeps
+    //    Interests enabled.
+    let mut dup_world = lot.world().clone();
+    let clone_id = (1..selected_id)
+        .find(|id| dup_world.objects.get(id).is_none_or(|o| o.person.is_none()))
+        .expect("lower non-person object ID");
+    let mut clone = dup_world.objects[&selected_id].clone();
+    clone.id = clone_id;
+    clone.selected = true;
+    dup_world.objects.get_mut(&selected_id).unwrap().selected = false;
+    dup_world.objects.insert(clone_id, clone);
+    dup_world.people.push(clone_id);
+    hud.controls.panel = Some(Panel::Needs);
+    hud.draw(
+        &dup_world,
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    let interests = hud
+        .items()
+        .iter()
+        .find(|i| {
+            matches!(
+                i.kind,
+                Kind::Button {
+                    id: id::INTERESTS,
+                    ..
+                }
+            )
+        })
+        .expect("interests button");
+    assert_eq!(
+        interests.command,
+        Some(Command::OpenPanel(Panel::Interests))
+    );
+    assert!(
+        hud.items()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::Portrait { selected: true, .. })
+                && i.command == Some(Command::Select { sim: selected_id })),
+        "duplicate household instance must highlight the resident's portrait"
+    );
+
+    // 5. Non-residential House panel suppression (`0x51d3f9..0x51d412`): clears
+    //    stored `controls.panel` to `None` so reusing the HUD on a residential
+    //    lot does not reopen House.
+    hud.controls.panel = Some(Panel::House);
+    hud.draw(
+        lot.world(),
+        false,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    assert!(
+        !hud.items()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::House { .. }))
+    );
+    assert_eq!(hud.controls.panel, None);
+    hud.draw(
+        lot.world(),
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    assert!(
+        !hud.items()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::House { .. }))
+    );
+}
+
 /// Track 2's switch-and-order recording (`goth-switch-cancel-order-20261115`)
 /// opens the live-mode panel, clicks Bella's portrait to select her (taking
 /// effect between updates 423 and 424), clicks her portrait again to centre
