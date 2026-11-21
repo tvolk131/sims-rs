@@ -724,15 +724,14 @@ impl Canvas {
             if ix0 >= ix1 || iy0 >= iy1 {
                 return;
             }
+            let wide = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
             let base_x = i64::from(at[0]);
-            let sub_x0 = base_x
-                .saturating_add(ix0 as i64)
-                .clamp(0, self.width as i64) as usize;
-            let sub_x1 = base_x
-                .saturating_add(ix1 as i64)
-                .clamp(0, self.width as i64) as usize;
-            let sub_y0 = ay.saturating_add(iy0 as i64).clamp(0, self.height as i64) as usize;
-            let sub_y1 = ay.saturating_add(iy1 as i64).clamp(0, self.height as i64) as usize;
+            let lim_x = wide(self.width);
+            let lim_y = wide(self.height);
+            let sub_x0 = base_x.saturating_add(wide(ix0)).clamp(0, lim_x) as usize;
+            let sub_x1 = base_x.saturating_add(wide(ix1)).clamp(0, lim_x) as usize;
+            let sub_y0 = ay.saturating_add(wide(iy0)).clamp(0, lim_y) as usize;
+            let sub_y1 = ay.saturating_add(wide(iy1)).clamp(0, lim_y) as usize;
             x0 = x0.max(sub_x0);
             x1 = x1.min(sub_x1);
             y0 = y0.max(sub_y0);
@@ -851,13 +850,15 @@ impl Canvas {
             }
             return;
         }
-        let w = self.width as i32;
         for (i, &rgb) in pixels.iter().enumerate() {
-            let Some(px) = x.checked_add(i as i32) else {
+            let Some(px) = x
+                .checked_add(i as i32)
+                .and_then(|v| usize::try_from(v).ok())
+            else {
                 continue;
             };
-            if px >= 0 && px < w {
-                let target = py * self.width + px as usize;
+            if px < self.width {
+                let target = py * self.width + px;
                 if depth <= self.depth[target] {
                     let pixel = &mut self.color[target];
                     self.depth[target] = depth_clamped;
@@ -889,22 +890,24 @@ impl Canvas {
         if px >= self.width {
             return;
         }
+        let Ok(bottom_usize) = usize::try_from(bottom) else {
+            return;
+        };
         let y0 = top.max(0) as usize;
-        let y1 = (bottom as usize).min(self.height - 1);
+        let y1 = bottom_usize.min(self.height - 1);
         if y0 > y1 {
             return;
         }
         let width = self.width;
         let pen = self.pen;
-        let mut idx = y0 * width + px;
-        for _ in y0..=y1 {
+        for py in y0..=y1 {
+            let idx = py * width + px;
             if depth <= self.depth[idx] {
                 let pixel = &mut self.color[idx];
                 self.depth[idx] = depth_clamped;
                 self.ids[idx] = pen;
                 *pixel = color;
             }
-            idx += width;
         }
     }
 
@@ -1629,6 +1632,24 @@ mod tests {
         assert!(panicked);
         assert_eq!(short_color.depth[1], EMPTY);
         assert_eq!(short_color.id_at(1, 0), None);
+
+        // `width = usize::MAX, height = 2` with 2 backing pixels must draw
+        // split floors at (0, 0), grass spans clipped across x = 0, and
+        // single-row grass blades at (1, 0) without panicking or overflowing.
+        let mut huge = Canvas::new(2, 1, [0, 0, 0]);
+        huge.width = usize::MAX;
+        huge.height = 2;
+        huge.draw_floor_shaded(&one, [0, 0], Some([0, 0, 1, 1]), |_, _| Light::FULL, |_| 10);
+        assert_eq!(huge.color[0], [200, 100, 50]);
+        assert_eq!(huge.depth[0], 10);
+        huge.plot_grass_span(-3, 0, 8, 8, [[1, 1, 1], [2, 2, 2], [3, 3, 3], [40, 50, 60]]);
+        assert_eq!(huge.color[0], [40, 50, 60]);
+        assert_eq!(huge.depth[0], 8);
+        huge.plot_grass_blade(1, 0, 0, 7, 7, [70, 80, 90]);
+        assert_eq!(huge.color[1], [70, 80, 90]);
+        assert_eq!(huge.depth[1], 7);
+        huge.plot_grass_blade(0, -3, -1, 1, 1, [9, 9, 9]);
+        assert_eq!(huge.color[0], [40, 50, 60]);
     }
 
     #[test]
