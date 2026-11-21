@@ -63,6 +63,15 @@ impl View {
             .map(|n| n.clamp(-ORIGIN_LIMIT, ORIGIN_LIMIT));
     }
 
+    /// Sets the camera origin directly, clamped to [`ORIGIN_LIMIT`].
+    /// Returns whether the camera changed.
+    pub(crate) fn set_origin(&mut self, origin: [i32; 2]) -> bool {
+        let before = self.camera;
+        self.camera.origin = origin;
+        self.bound();
+        self.camera != before
+    }
+
     fn middle(&self) -> [i32; 2] {
         [self.size[0] / 2, self.size[1] / 2]
     }

@@ -239,7 +239,7 @@ impl Game {
     pub fn sound_sources(&self) -> sims_audio::sources::Snapshot {
         let world = self.lot.world();
         let mut snapshot = sound::sources(world);
-        snapshot.screen = sound::screen(world, &self.view.camera, self.view.size);
+        snapshot.screen = sound::screen(world, &self.lot_shape, &self.view.camera, self.view.size);
         snapshot
     }
 
@@ -1104,40 +1104,89 @@ impl Game {
     /// (0x4c9a27, the time at 0x6c7788), which is left out.
     ///
     /// Nothing happens unless object data word 34 is 0 and word 29 is not
-    /// negative. A person on the floor shown is centred a little above
-    /// its feet: its screen point ([`sound::object_point`]) raised by
-    /// half of 2 √6 times 2.0 times 2 to the power of the zoom plus one,
-    /// cut to a whole number (19, 39 and 78 pixels from far to near),
-    /// comes to the middle of the screen (0x4a7777). The original then
-    /// holds the view inside its scroll limits (0x4a9fa9), which the
-    /// window does not have. Anything else, or a person on another floor,
-    /// shows its floor (0x4a80c7) and, unless it stands off the lot
-    /// (0x4a7af0), its screen point on that floor comes to the middle
-    /// (0x4a7996).
+    /// negative. For a multi-tile object, `0x4071a3` walks the group from
+    /// its lead tile through `next_parts` and averages the parts' `x` and
+    /// `y` positions before rotating and projecting. The original's house
+    /// view sits above the 100-pixel live-mode strip
+    /// (`0x49ae5e` → `0x5cf1b6`, `0x4b136b`), so its middle is
+    /// `[width / 2, (height - 100) / 2]`. A person on the floor shown is
+    /// centred a little above its feet: its screen point on the lot's
+    /// terrain ([`sound::object_point_on_lot`]) raised by half of 2 √6
+    /// times 2.0 times 2 to the power of the zoom plus one, cut to a whole
+    /// number (19, 39 and 78 pixels from far to near), comes to the house
+    /// view's middle (0x4a7777). Anything else, or a person on another
+    /// floor, shows its floor (0x4a80c7) and, unless it stands off the
+    /// lot's rotated tile bounds (0x4a7af0), its screen point on that
+    /// floor comes to the middle (0x4a7996). Both paths then clamp the
+    /// origin to the scroll limits (0x4a9fa9) and align its x coordinate
+    /// with `(x + 1) & !3` (0x4a81cc).
     pub fn centre_on(&mut self, id: u16) {
-        let Some(object) = self.lot.world().objects.get(&id) else {
+        let world = self.lot.world();
+        let Some(object) = world.objects.get(&id) else {
             return;
         };
         let word = |i: usize| object.data.get(i).copied().unwrap_or(0);
         if word(34) != 0 || word(29) < 0 {
             return;
         }
-        let position = object.position;
+        let is_person = object.person.is_some();
+        let Some(position) = centre_position(world, id) else {
+            return;
+        };
         let level = position[2];
-        if object.person.is_some() && level == self.view.camera.level {
-            let mut at = lot_point(&self.view.camera, position);
+        let view_size = self.house_view_size();
+        if is_person && level == self.view.camera.level {
+            let mut at = lot_point(&self.view.camera, &self.lot_shape, position);
             at[1] -= person_rise(self.view.camera.zoom.level());
-            self.view.apply(Move::Centre(at));
+            self.centre_screen_point(at, view_size);
             return;
         }
         self.view.apply(Move::Floor(level));
-        // The lot's bounds (0x4a7af0 reads them from the scene) are taken
-        // as its tiles, which is **unverified** at the edges.
-        if position[..2].iter().any(|&n| !(0..64 * 16).contains(&n)) {
+        if !self.on_lot(position) {
             return;
         }
-        let at = lot_point(&self.view.camera, position);
-        self.view.apply(Move::Centre(at));
+        let at = lot_point(&self.view.camera, &self.lot_shape, position);
+        self.centre_screen_point(at, view_size);
+    }
+
+    /// The house view's viewport size above the live-mode strip
+    /// (`0x49ae5e` → `0x5cf1b6`: `(width, height - 100)`).
+    fn house_view_size(&self) -> [i32; 2] {
+        [
+            self.view.size[0],
+            (self.view.size[1] - sims_ui::hud::STRIP).max(1),
+        ]
+    }
+
+    /// Whether `position` lies on the active lot's rotated tile bounds
+    /// (`0x4a7af0`: rotated fine position shifted right by 4, checked
+    /// against `lot + 0x70..+0x7c`).
+    fn on_lot(&self, position: [i32; 3]) -> bool {
+        if self.lot_shape.size == 0 {
+            return false;
+        }
+        let rotated = sound::rotate_object_fine(&self.view.camera, [position[0], position[1]]);
+        let tx = rotated[0] >> 4;
+        let ty = rotated[1] >> 4;
+        let b = sound::lot_bounds(&self.lot_shape, &self.view.camera);
+        tx >= b[0] && tx <= b[1] && ty >= b[2] && ty <= b[3]
+    }
+
+    /// Moves the camera origin so screen point `at` comes to the middle
+    /// of `view_size`, clamped to the original's scroll limits
+    /// (`0x4a9fa9`) and x-aligned via `(x + 1) & !3` (`0x4a81cc`).
+    fn centre_screen_point(&mut self, at: [i32; 2], view_size: [i32; 2]) {
+        let middle = [view_size[0] / 2, view_size[1] / 2];
+        let origin = self.view.camera.origin;
+        let target = [
+            origin[0].saturating_add(middle[0].saturating_sub(at[0])),
+            origin[1].saturating_add(middle[1].saturating_sub(at[1])),
+        ];
+        let ([min_x, max_x], [min_y, max_y]) =
+            scroll_limits(&self.lot_shape, &self.view.camera, view_size);
+        let clamped_x = target[0].max(min_x).min(max_x).wrapping_add(1) & !3;
+        let clamped_y = target[1].max(min_y).min(max_y);
+        self.view.set_origin([clamped_x, clamped_y]);
     }
 
     /// The lot as it stands, to go back to later ([`Game::restore`]).
@@ -1426,25 +1475,149 @@ pub fn goth_house(root: &Path) -> PathBuf {
     root.join("UserData/Houses/House05.iff")
 }
 
-/// How far above its feet a centred person is (0x434d64 to 0x434da7):
-/// 2 √6 (single precision, 0x434df6) times 2.0 (1/3 times 6, single)
-/// times 2 to the power of the zoom plus one, cut toward zero, halved.
-/// The screen point of a fine lot position ([`sound::object_point`]),
+/// The fine `[x, y, level]` position `0x434ced` centres on: for a
+/// multi-tile object (`0x4071a3`), starts at the lead tile (`parent`, or
+/// `id` itself when `parent == 0`), walks `world.next_parts`, and averages
+/// the parts' `x` and `y` coordinates by signed integer division toward
+/// zero while keeping `object.position[2]` as the level.
+fn centre_position(world: &sims_sim::World, id: u16) -> Option<[i32; 3]> {
+    let object = world.objects.get(&id)?;
+    let level = object.position[2];
+    let Some(part) = &object.multipart else {
+        return Some(object.position);
+    };
+    let lead = u16::try_from(part.parent)
+        .ok()
+        .filter(|&p| p != 0 && world.objects.contains_key(&p))
+        .unwrap_or(id);
+    let mut sum_x = 0i64;
+    let mut sum_y = 0i64;
+    let mut count = 0i64;
+    let mut visited = Vec::new();
+    let mut current = Some(lead);
+    while let Some(part_id) = current {
+        if visited.contains(&part_id) {
+            break;
+        }
+        let Some(tile) = world.objects.get(&part_id) else {
+            break;
+        };
+        visited.push(part_id);
+        sum_x += i64::from(tile.position[0]);
+        sum_y += i64::from(tile.position[1]);
+        count += 1;
+        current = world.next_parts.get(&part_id).copied();
+    }
+    if count == 0 {
+        return Some(object.position);
+    }
+    Some([(sum_x / count) as i32, (sum_y / count) as i32, level])
+}
+
+/// The screen point of a fine lot position ([`sound::object_point_on_lot`]),
 /// worked out from the lot's own corner and then moved by the origin:
 /// the original cuts the point to 16 bits, and its scroll limits
 /// (0x4a9fa9) keep its origin small enough for that, where the window's
 /// origin may go much further.
-fn lot_point(camera: &Camera, position: [i32; 3]) -> [i32; 2] {
-    let at = sound::object_point(
+fn lot_point(camera: &Camera, lot: &sims_render::Lot, position: [i32; 3]) -> [i32; 2] {
+    let at = sound::object_point_on_lot(
         &Camera {
             origin: [0, 0],
             ..*camera
         },
+        lot,
         position,
     );
-    [at[0] + camera.origin[0], at[1] + camera.origin[1]]
+    [
+        at[0].saturating_add(camera.origin[0]),
+        at[1].saturating_add(camera.origin[1]),
+    ]
 }
 
+/// The house view's camera origin scroll limits `([min_x, max_x], [min_y, max_y])`
+/// for `lot`, `camera`, and viewport `view_size` (`0x4a9fa9`, using the
+/// diagonal height extrema `0x4b0615` and rotated lot bounds `0x4791a6`).
+pub(crate) fn scroll_limits(
+    lot: &sims_render::Lot,
+    camera: &Camera,
+    view_size: [i32; 2],
+) -> ([i32; 2], [i32; 2]) {
+    let size = lot.size as i32;
+    let zoom = camera.zoom.level();
+    let tile_w = camera.zoom.tile_width();
+    let half_w = tile_w / 2;
+    let tile_h = camera.zoom.tile_height();
+    let half_h = tile_h / 2;
+    let floor_h = camera.zoom.floor_height();
+    let [view_w, view_h] = view_size;
+
+    let inner_tiles = (size - 2).max(0);
+    let span_x = inner_tiles * tile_w;
+    let (mut min_x, mut max_x) = if view_w < span_x {
+        ((span_x / -2 - half_w) + view_w, span_x / 2 + tile_w)
+    } else {
+        (view_w / 2, view_w / 2)
+    };
+
+    // Diagonal height extrema across the active lot (0x4b0615): indexed by
+    // rotated `rx + ry` in `0..128`.
+    let b = sound::lot_bounds(lot, camera);
+    let (min_rx, min_ry) = (b[0], b[2]);
+    let mut max_h = [0u8; 128];
+    let mut min_h = [0x40u8; 128];
+    for y in 0..size {
+        for x in 0..size {
+            let rx = x + min_rx;
+            let ry = y + min_ry;
+            let diag = (rx + ry) as usize;
+            if diag < 128 {
+                for h in sound::raw_tile_corners(lot, camera, [rx, ry]) {
+                    max_h[diag] = max_h[diag].max(h);
+                    min_h[diag] = min_h[diag].min(h);
+                }
+            }
+        }
+    }
+
+    let mut top_adjust = 0i32;
+    if size > 2 {
+        let (mut rx, mut ry) = (1 + min_rx, 1 + min_ry);
+        for step in 1..(size - 1) {
+            let diag = (rx + ry) as usize;
+            let val = (i32::from(max_h[diag]) << (zoom + 1)) - half_h * step;
+            top_adjust = top_adjust.max(val);
+            rx += 1;
+            ry += 1;
+        }
+    }
+    let mut max_y = top_adjust + floor_h * 2;
+
+    let mut min_y = (view_h - tile_h * 2) - inner_tiles * tile_h;
+    if size > 2 {
+        let mut bottom_adjust = i32::MAX;
+        let (mut rx, mut ry) = (size - 2 + min_rx, size - 2 + min_ry);
+        for step in 1..(size - 1) {
+            let diag = (rx + ry) as usize;
+            let val = half_h * step - (i32::from(min_h[diag]) << (zoom + 1));
+            bottom_adjust = bottom_adjust.min(val);
+            rx -= 1;
+            ry -= 1;
+        }
+        min_y -= bottom_adjust;
+    }
+
+    let shift_x = (min_rx - min_ry) * half_w;
+    let shift_y = (min_ry + min_rx) * half_h;
+    min_x -= shift_x;
+    max_x -= shift_x;
+    min_y -= shift_y;
+    max_y -= shift_y;
+    ([min_x, max_x], [min_y, max_y])
+}
+
+/// How far above its feet a centred person is (0x434d64 to 0x434da7):
+/// 2 √6 (single precision, 0x434df6) times 2.0 (1/3 times 6, single)
+/// times 2 to the power of the zoom plus one, cut toward zero, halved.
 fn person_rise(zoom: u32) -> i32 {
     let rise = (2.0 * 6f64.sqrt()) as f32 * 2.0 * (1u32 << (zoom + 1)) as f32;
     rise as i32 / 2
@@ -1490,6 +1663,114 @@ mod tests {
     fn a_centred_person_is_raised_by_half_its_zooms_height() {
         // trunc(2 sqrt 6 * 2.0 * 2^(zoom + 1)) / 2 for far, medium, near.
         assert_eq!([1, 2, 3].map(super::person_rise), [19, 39, 78]);
+    }
+
+    #[test]
+    fn scroll_limits_match_0x4a9fa9_across_rotations_view_widths_and_terrain() {
+        use sims_render::camera::{Walls, Zoom};
+        let mut world = sims_sim::World::empty();
+        world.size = 52;
+        let full = sims_render::lot::FULL * sims_render::lot::FULL;
+        for (id, stride) in [(0, 4), (1, 1), (2, 8), (101, 1), (102, 8)] {
+            world.arrays.insert(
+                id,
+                sims_formats::lot::Array {
+                    width: sims_render::lot::FULL,
+                    height: sims_render::lot::FULL,
+                    stride,
+                    encoding: 0,
+                    data: vec![0; full * stride],
+                },
+            );
+        }
+        let flat = sims_render::Lot::from_world(&world).unwrap();
+        let cam = |zoom: Zoom, rotation: u8| Camera {
+            zoom,
+            rotation,
+            level: 1,
+            origin: [0, 0],
+            walls: Walls::Up,
+            focus: sims_render::Focus::default(),
+        };
+
+        // 52x52 flat lot at far zoom, 800x500 house view:
+        // span_x = 50 * 32 = 1600, min_x = (-800 - 16) + 800 = -16,
+        // max_x = 800 + 32 = 832;
+        // max_y = 0 + 58 * 2 = 116;
+        // min_y = (500 - 32) - 50 * 16 - 8 = -340.
+        assert_eq!(
+            scroll_limits(&flat, &cam(Zoom::Far, 0), [800, 500]),
+            ([-16, 832], [-340, 116])
+        );
+        // Rotation 1 on a 52x52 lot shifts min_rx = 12, min_ry = 0:
+        // shift_x = 12 * 16 = 192, shift_y = 12 * 8 = 96.
+        assert_eq!(
+            scroll_limits(&flat, &cam(Zoom::Far, 1), [800, 500]),
+            ([-16 - 192, 832 - 192], [-340 - 96, 116 - 96])
+        );
+        // Rotation 2 shifts min_rx = 12, min_ry = 12:
+        // shift_x = 0, shift_y = 24 * 8 = 192.
+        assert_eq!(
+            scroll_limits(&flat, &cam(Zoom::Far, 2), [800, 500]),
+            ([-16, 832], [-340 - 192, 116 - 192])
+        );
+        // Viewport wider than span_x (1600) centres x at view_w / 2.
+        let ([min_x, max_x], _) = scroll_limits(&flat, &cam(Zoom::Far, 0), [2000, 500]);
+        assert_eq!((min_x, max_x), (1000, 1000));
+
+        // Raising the top corner tile (1, 1) to height 10 raises max_y by
+        // max(0, (10 << 2) - 8 * 1) = 32 -> 116 + 32 = 148.
+        let cell = |x: usize, y: usize| (x * sims_render::lot::FULL + y) * 4;
+        world.arrays.get_mut(&0).unwrap().data[cell(1, 1)..cell(1, 1) + 4]
+            .copy_from_slice(&[10, 10, 10, 10]);
+        let raised = sims_render::Lot::from_world(&world).unwrap();
+        let (_, [min_y, max_y]) = scroll_limits(&raised, &cam(Zoom::Far, 0), [800, 500]);
+        assert_eq!((min_y, max_y), (-340, 148));
+    }
+
+    #[test]
+    fn centre_position_averages_linked_multipart_tiles() {
+        let mut world = sims_sim::World::empty();
+        let make = |id: u16, position: [i32; 3], parent: Option<i16>| sims_sim::Object {
+            id,
+            guid: 0,
+            footprint: [0; 4],
+            position,
+            unknown_short: 0,
+            attributes: Vec::new(),
+            temps: Vec::new(),
+            data: Vec::new(),
+            obsolete_word: 0,
+            stack_capacity_bytes: 0,
+            stack: Vec::new(),
+            relationship_flag: 0,
+            relationships: Vec::new(),
+            slots: Vec::new(),
+            dynamic_sprites: Vec::new(),
+            multipart: parent.map(|p| sims_formats::saved_objects::Multipart {
+                offset: [0; 3],
+                group: [0; 3],
+                parent: p,
+            }),
+            portal: None,
+            person: None,
+            registry_word: None,
+            last_result: false,
+            removal_skips_resets: false,
+            selected: false,
+        };
+        world.objects.insert(1, make(1, [100, 200, 1], None));
+        world.objects.insert(10, make(10, [384, 416, 1], Some(0)));
+        world.objects.insert(11, make(11, [400, 416, 1], Some(10)));
+        world.objects.insert(12, make(12, [416, 449, 2], Some(10)));
+        world.next_parts.insert(10, 11);
+        world.next_parts.insert(11, 12);
+        assert_eq!(centre_position(&world, 1), Some([100, 200, 1]));
+        // (384+400+416)/3 = 400, (416+416+449)/3 = 1281/3 = 427; level comes
+        // from the queried object (0x434ced reads param_1 + 0x110).
+        assert_eq!(centre_position(&world, 10), Some([400, 427, 1]));
+        assert_eq!(centre_position(&world, 11), Some([400, 427, 1]));
+        assert_eq!(centre_position(&world, 12), Some([400, 427, 2]));
     }
     #[test]
     fn an_error_says_what_failed_and_what_was_done() {

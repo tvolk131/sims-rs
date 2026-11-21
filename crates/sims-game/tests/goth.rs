@@ -1351,22 +1351,27 @@ fn the_sound_scripts_see_the_goths_where_the_camera_shows_them() {
         .collect();
     assert_eq!(snapshot.screen.len(), objects.len());
     // Unturned, the sound's projection is the original view's for the
-    // object's place on the floor, which is the drawing's or a pixel off
-    // it.
+    // object's place on the lot's terrain, which is the drawing's at
+    // that terrain elevation or a pixel off it on flat tiles.
+    let lot_shape = sims_render::Lot::from_world(world).expect("lot shape");
     for &(id, object) in &objects {
         let [x, y, level] = object.position.map(i32::from);
         let view = snapshot.projection(i32::from(id)).unwrap();
         assert_eq!(
             view.at,
-            sims_game::sound::fine_point(&camera, [x, y], level),
+            sims_game::sound::object_point_on_lot(&camera, &lot_shape, [x, y, level]),
             "object {id}"
         );
-        let drawn = camera.project_fine([x, y], level, 0);
-        assert!(
-            (0..2).all(|i| (view.at[i] - drawn[i]).abs() <= 1),
-            "object {id}: {:?} {drawn:?}",
-            view.at
-        );
+        let corners = sims_game::sound::tile_corners(&lot_shape, &camera, [x >> 4, y >> 4]);
+        if corners.iter().all(|&h| h == corners[0]) {
+            let elevation = corners[1] * 16;
+            let drawn = camera.project_fine([x, y], level, elevation);
+            assert!(
+                (0..2).all(|i| (view.at[i] - drawn[i]).abs() <= 1),
+                "object {id}: {:?} {drawn:?}",
+                view.at
+            );
+        }
         assert_eq!(view.screen, [800, 600]);
         assert_eq!(view.zoom, camera.zoom.level() as i32);
         assert_eq!(view.shown_level, camera.level);
@@ -1448,10 +1453,16 @@ fn a_press_on_a_portrait_selects_that_goth_who_then_takes_the_order() {
     assert_eq!(game.take_sounds(), [click]);
     let camera = game.view.camera;
     let position = game.lot().world().objects[&other].position;
+    let lot_shape = sims_render::Lot::from_world(game.lot().world()).expect("lot shape");
     assert_eq!(position[2], camera.level);
-    let at = sims_game::sound::object_point(&camera, position);
+    let at = sims_game::sound::object_point_on_lot(&camera, &lot_shape, position);
     let rise = [19, 39, 78][camera.zoom.level() as usize - 1];
-    assert_eq!([at[0], at[1] - rise], [400, 300]);
+    // The house view sits above the 100-pixel live-mode strip (0x49ae5e,
+    // middle [400, 250]), and 0x4a81cc aligns origin.x via `(x + 1) & !3`.
+    assert!(
+        (at[0] - 400).abs() <= 2 && at[1] - rise == 250,
+        "centred at {at:?} (rise {rise})"
+    );
     // An order from the fridge's pie goes to her.
     let fridge = 118;
     let before = game.lot().world().objects[&mortimer]
@@ -2144,14 +2155,14 @@ fn a_press_on_the_selected_goths_portrait_centres_him_after_a_long_scroll() {
         game.press(press);
         let camera = game.view.camera;
         let position = game.lot().world().objects[&mortimer].position;
-        let drawn = camera.project_fine(
-            camera.rotate_fine([position[0], position[1]]),
-            position[2],
-            0,
-        );
+        let lot_shape = sims_render::Lot::from_world(game.lot().world()).expect("lot shape");
+        let rotated = camera.rotate_fine([position[0], position[1]]);
+        let corners =
+            sims_game::sound::tile_corners(&lot_shape, &camera, [rotated[0] >> 4, rotated[1] >> 4]);
+        let drawn = camera.project_fine(rotated, position[2], corners[1] * 16);
         let rise = [19, 39, 78][camera.zoom.level() as usize - 1];
         assert!(
-            (drawn[0] - 400).abs() <= 1 && (drawn[1] - rise - 300).abs() <= 1,
+            (drawn[0] - 400).abs() <= 2 && (drawn[1] - rise - 250).abs() <= 1,
             "{scroll:?}: drawn at {drawn:?}"
         );
     }
@@ -3499,4 +3510,221 @@ fn pressing_a_pie_entry_and_dragging_off_orders_nothing() {
             .table_index,
         snack_menu as i32
     );
+}
+
+/// Track 2's switch-and-order recording (`goth-switch-cancel-order-20261115`)
+/// opens the live-mode panel, clicks Bella's portrait to select her (taking
+/// effect between updates 423 and 424), clicks her portrait again to centre
+/// the view on her (after update 543), orders `Have A Snack` from the fridge
+/// using the pointer, then opens the fridge's pie and hovers `Have A Snack`
+/// a second time before update 900.
+///
+/// Replayed offline in strict mode on the recording's frame schedule with
+/// the raw, unshifted recording coordinates, an unmasked comparison of
+/// globals, all three RNGs, scheduler cursor, and every object's selected
+/// flag, data, temps, attributes, `last_result`, frames, person data,
+/// motives, active, previous, and queue (377 objects at update 1 down to
+/// 347 at update 900) matched updates 1..=900 except for:
+/// - UI global 12 (updates 214..=900);
+/// - routing `person.data[37]` marked unknown in `routing.unknown_words`
+///   for objects 16, 18, 21, and 259;
+/// - frame locals marked unknown in `frame_storage` for object 21
+///   (frame 8, tree 8301, local 0 at updates 675..=715) and object 259
+///   (frame 2, tree 4099, local 7 at updates 14..=596);
+/// - unmarked uninitialized frame locals for object 18 (frame 6, tree
+///   8292, local 0 at updates 203..=227; frame 9, tree 8229, locals 2–3
+///   at updates 368..=408).
+///
+/// This test pins selected checkpoints through update 900.
+#[test]
+fn the_recorded_switch_order_replayed_in_the_window_matches_the_recording() {
+    let Some(install) = install() else {
+        return;
+    };
+    let frames = Frames::parse(
+        "0,1,2,3,33,63,93,123,153,183,213,243,273,303,333,363,393,423,453,483,513,543,573,603,633,663,693,715,738,768,798,828,858,883",
+    )
+    .expect("a schedule");
+    let schedule = frames.clone();
+    let mut game = Game::open(&Options {
+        frames,
+        ..options(install)
+    })
+    .expect("the Goth house opens");
+    game.resize([800, 600]);
+    game.render();
+
+    let mortimer = 21u16;
+    let bella = 18u16;
+    let fridge = 118u16;
+    let counter = 119u16;
+    let bob = 383u16;
+    let portrait = [296, 527];
+    let last = |game: &Game| game.lot().world().objects[&bella].last_result;
+    let person = |game: &Game| {
+        game.lot().world().objects[&bella]
+            .person
+            .as_ref()
+            .expect("Bella is a person")
+            .clone()
+    };
+
+    // First press on Bella's portrait switches selection from Mortimer to
+    // Bella, refreshes Mortimer's animator, and moves the plumb bob at 424.
+    run_to(&mut game, &schedule, 423);
+    assert_eq!(game.lot().world().selected(), Some(mortimer));
+    game.press(portrait);
+    game.release(portrait);
+    let world = game.lot().world();
+    assert_eq!(world.selected(), Some(bella));
+    assert_eq!(world.globals[3], bella as i16);
+    assert!(!world.objects[&mortimer].selected);
+    let anim = &world.animators[&mortimer];
+    assert_eq!(anim.clock, anim.clock_at(world.ticks as i32));
+    run_to(&mut game, &schedule, 424);
+    assert_eq!(game.lot().world().objects[&bob].data[2], bella as i16);
+
+    // Second press on Bella's portrait centres the 800x500 house view on
+    // Bella (standing on House 05's height-6 plateau at [374, 446, 1]),
+    // landing at origin [472, -117] so the raw recording coordinates match.
+    run_to(&mut game, &schedule, 543);
+    game.press(portrait);
+    game.release(portrait);
+    assert_eq!(game.view.camera.origin, [472, -117]);
+    game.render();
+
+    // First approach to the fridge: raw recording hover coordinates match
+    // the original's exact picks (None, None, fridge 118).
+    run_to(&mut game, &schedule, 603);
+    game.hover([280, 235]);
+    assert_eq!(game.under([280, 235]), None);
+    assert_eq!(game.listed(), None);
+    run_to(&mut game, &schedule, 633);
+    game.hover([280, 223]);
+    assert_eq!(game.under([280, 223]), None);
+    assert_eq!(game.listed(), None);
+    run_to(&mut game, &schedule, 663);
+    game.hover([280, 211]);
+    assert_eq!(game.under([280, 211]), Some(fridge));
+    assert_eq!(game.listed(), Some((bella, fridge)));
+
+    // Pressing the fridge opens the pie with the recording's exact label
+    // rectangles; hovering and choosing Have A Snack at [280, 136] checks
+    // it (last_result true at 716), queues uid 6 at 739, and starts it at 742.
+    run_to(&mut game, &schedule, 693);
+    game.press([280, 211]);
+    game.release([280, 211]);
+    game.render();
+    let rects: Vec<(&str, [i32; 4])> = game
+        .menu()
+        .expect("the fridge's pie is open")
+        .labels()
+        .into_iter()
+        .map(|(text, r)| (text, [r.x, r.y, r.width, r.height]))
+        .collect();
+    assert_eq!(
+        rects,
+        [
+            ("Have A Snack", [224, 122, 113, 29]),
+            ("Have Quick Breakfast", [340, 197, 180, 29]),
+            ("Have Breakfast", [215, 271, 130, 29]),
+            ("Serve Breakfast", [84, 197, 136, 29]),
+        ]
+    );
+    run_to(&mut game, &schedule, 715);
+    assert!(!last(&game));
+    game.hover([280, 136]);
+    run_to(&mut game, &schedule, 716);
+    assert!(last(&game));
+
+    run_to(&mut game, &schedule, 738);
+    game.press([280, 136]);
+    game.release([280, 136]);
+    assert!(game.menu().is_none());
+    run_to(&mut game, &schedule, 739);
+    let queued = person(&game).queue;
+    assert_eq!(queued.len(), 1);
+    assert_eq!(
+        (
+            queued[0].uid,
+            queued[0].target,
+            queued[0].table_index,
+            queued[0].action,
+            queued[0].priority,
+            queued[0].flags,
+        ),
+        (6, fridge as i16, 1, 4103, 50, 12)
+    );
+    run_to(&mut game, &schedule, 742);
+    assert_eq!(
+        (person(&game).active.uid, person(&game).active.target),
+        (6, fridge as i16)
+    );
+
+    // Second approach to the fridge: with Bella in the kitchen cutting away
+    // the front wall, [280, 235] picks counter 119 (last_result false at
+    // 769), [280, 223] picks None, and [280, 211] re-lists fridge 118
+    // (last_result false at 829).
+    run_to(&mut game, &schedule, 768);
+    game.hover([280, 235]);
+    assert_eq!(game.under([280, 235]), Some(counter));
+    assert_eq!(game.listed(), Some((bella, counter)));
+    run_to(&mut game, &schedule, 769);
+    assert!(!last(&game));
+
+    run_to(&mut game, &schedule, 798);
+    game.hover([280, 223]);
+    assert_eq!(game.under([280, 223]), None);
+    run_to(&mut game, &schedule, 828);
+    assert!(last(&game));
+    game.hover([280, 211]);
+    assert_eq!(game.under([280, 211]), Some(fridge));
+    assert_eq!(game.listed(), Some((bella, fridge)));
+    run_to(&mut game, &schedule, 829);
+    assert!(!last(&game));
+
+    run_to(&mut game, &schedule, 858);
+    game.press([280, 211]);
+    game.release([280, 211]);
+    game.render();
+    assert!(game.menu().is_some());
+    run_to(&mut game, &schedule, 883);
+    game.hover([280, 136]);
+    run_to(&mut game, &schedule, 884);
+    assert!(last(&game));
+
+    run_to(&mut game, &schedule, 900);
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
+}
+
+/// Centring on any tile of a multi-tile object averages its linked parts'
+/// positions (`0x4071a3`) before rotating and projecting (`0x434ced` →
+/// `0x4a7996`). On the Goth lot, object 25 is a 4-tile object whose parts
+/// average to `[400, 432, 1]`, yielding origin `[432, -142]` (instead of
+/// `[448, -142]` from part 25 alone).
+#[test]
+fn centring_a_multi_tile_object_averages_its_parts() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    game.resize([800, 600]);
+    let lead = 25u16;
+    let mut parts = vec![lead];
+    while let Some(&next) = parts
+        .last()
+        .and_then(|id| game.lot().world().next_parts.get(id))
+    {
+        parts.push(next);
+    }
+    assert_eq!(parts.len(), 4, "object 25 is a 4-tile object");
+    for part in parts {
+        game.view.camera.origin = [0, 0];
+        game.centre_on(part);
+        assert_eq!(
+            game.view.camera.origin,
+            [432, -142],
+            "centring part {part} of object 25"
+        );
+    }
 }
