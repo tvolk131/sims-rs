@@ -313,7 +313,7 @@ impl Machine<'_, '_> {
     /// cached, `false` when `0x4e8cc6` skipped a read-only off-lot definition,
     /// `0x4e9652` returned null, or `0x4e725f` failed (`0x4e8d08`, e.g.
     /// missing `"HEAD"` binding at `0x4e7824`).
-    fn try_render_ui_effect_portrait(
+    pub(crate) fn try_render_ui_effect_portrait(
         &mut self,
         guid: u32,
         save_bitmap: bool,

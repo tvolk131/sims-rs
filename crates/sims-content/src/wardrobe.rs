@@ -215,6 +215,55 @@ impl Wardrobe {
             .map(String::as_str)
             .collect()
     }
+
+    /// Whether a `STR# 200` body (`head == false`, `0x40d0a4`) or head
+    /// (`head == true`, `0x40d408`) outfit row matches an entry in the human
+    /// wardrobe list built by `0x409663` / `0x40a364`.
+    ///
+    /// Follows `0x472ec4` → `0x5874ca` (strip `;...`, split on `,`) and
+    /// `0x472f92` → `0x46f874` (ASCII case-insensitive match against
+    /// `(suit, "BODY=" + stem)` or `(suit, "HEAD-HEAD=" + stem)`).
+    pub fn contains_outfit(
+        &self,
+        head: bool,
+        female: bool,
+        child: bool,
+        skin: &str,
+        raw_row: &str,
+    ) -> bool {
+        let before_semi = raw_row.split(';').next().unwrap_or(raw_row);
+        let Some((raw_suit, raw_tex)) = before_semi.split_once(',') else {
+            return false;
+        };
+        let suit = raw_suit.to_ascii_lowercase();
+        if !self.suits.contains(&suit) {
+            return false;
+        }
+        let tex = raw_tex.to_ascii_lowercase();
+        let tag = if head { "head-head=" } else { "body=" };
+        let Some(stem) = tex.strip_prefix(tag) else {
+            return false;
+        };
+        let (first, length) = if head { ('c', 6) } else { ('b', 9) };
+        let sex = if female { 'f' } else { 'm' };
+        let age = if child { 'c' } else { 'a' };
+        let chars: Vec<char> = suit.chars().take(length).collect();
+        let matches = chars.len() == length
+            && chars[0] == first
+            && (chars[4] == sex || chars[4] == 'u')
+            && chars[5] == age
+            && !(head && chars[1] == 't');
+        if !matches {
+            return false;
+        }
+        let part: String = chars.into_iter().collect();
+        let prefix = format!("{part}{}", skin.to_ascii_lowercase());
+        if !stem.starts_with(&prefix) {
+            return false;
+        }
+        self.textures.contains(&format!("{stem}.bmp"))
+            || self.textures.contains(&format!("{stem}.tga"))
+    }
 }
 
 #[cfg(test)]
@@ -300,5 +349,50 @@ mod tests {
         );
         assert_eq!(w.count_pet(false), 3);
         assert_eq!(w.count_pet(true), 1);
+    }
+
+    #[test]
+    fn contains_outfit_matches_body_and_head_rows_like_0x472f92() {
+        let w = wardrobe(
+            &["b006fafat_01", "c001fa_mercedes"],
+            &["b006fafatlgt_tt1.bmp", "c001falgt_shannon01.tga"],
+        );
+        assert!(w.contains_outfit(
+            false,
+            true,
+            false,
+            "lgt",
+            "b006fafat_01,BODY=B006FAFatlgt_TT1"
+        ));
+        assert!(w.contains_outfit(
+            true,
+            true,
+            false,
+            "LGT",
+            "c001fa_mercedes,HEAD-HEAD=C001FAlgt_Shannon01;extra"
+        ));
+        // Wrong tag, wrong skin tone, missing comma, or NPC suit not in wardrobe.
+        assert!(!w.contains_outfit(
+            true,
+            true,
+            false,
+            "lgt",
+            "c001fa_mercedes,BODY=C001FAlgt_Shannon01"
+        ));
+        assert!(!w.contains_outfit(
+            true,
+            true,
+            false,
+            "drk",
+            "c001fa_mercedes,HEAD-HEAD=C001FAlgt_Shannon01"
+        ));
+        assert!(!w.contains_outfit(true, true, false, "lgt", "c001fa_mercedes"));
+        assert!(!w.contains_outfit(
+            true,
+            true,
+            false,
+            "lgt",
+            "c999fa_masseuse,HEAD-HEAD=c999falgt_masseuse"
+        ));
     }
 }

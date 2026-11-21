@@ -204,6 +204,8 @@ pub(crate) fn profile<'p>(
     };
     let mut profile = profile.clone();
     for (index, string) in [
+        (characters::BODY, &mut profile.body),
+        (characters::HEAD, &mut profile.head),
         (characters::GENDER, &mut profile.gender),
         (characters::AGE, &mut profile.age),
         (characters::SKIN, &mut profile.skin),

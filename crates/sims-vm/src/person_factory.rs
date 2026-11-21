@@ -138,6 +138,20 @@ impl Interpreter<'_> {
             at: None,
             trap,
         };
+        // 0x440d63 checks body string 0 ("dog" / "kat") before constructing
+        // cXPerson or loading the skeleton.
+        if !pets_allowed(self.program.expansions)
+            && world
+                .characters
+                .string(guid, sims_sim::characters::SKELETON)
+                .is_some_and(|name| {
+                    ["dog", "kat"]
+                        .iter()
+                        .any(|pet| name.eq_ignore_ascii_case(pet))
+                })
+        {
+            return Ok(None);
+        }
         let skeleton =
             crate::people::skeleton(&self.program.people, world, guid).map_err(|t| fail(0, t))?;
         if !pets_allowed(self.program.expansions)

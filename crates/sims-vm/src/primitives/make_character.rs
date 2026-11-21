@@ -255,17 +255,26 @@ impl Machine<'_, '_> {
             let head_status = if pet_idx == -1 || (pet_idx >= 0 && (pet_idx as u32) < bodies) {
                 self.pet_wardrobe_head_status(species == 2)
             } else {
-                Some(
+                // 0x40d14d / 0x40d162 leaves body row 1 at the template's
+                // value, while 0x44b0a3 -> 0x40a5e2 writes "NONE" into head
+                // row 2. Only the template's body row 1 can supply a HEAD
+                // binding.
+                self.suit_row_head_status(
                     self.program
                         .people
-                        .portrait_head
+                        .profiles
                         .get(&template)
-                        .copied()
-                        .unwrap_or(false),
+                        .and_then(|p| p.body.as_deref()),
                 )
             };
             self.world.made_portrait_head.insert(guid, head_status);
             self.frame_mut()?.stack_object = record;
+            // 0x44b111..0x44b12b: pet creation immediately calls
+            // 0x4e8c5d(index, 0x1f, 1), rendering and caching the portrait
+            // and persisting BMP_ 2002 before opcode 19 returns.
+            if self.in_portrait_table(guid)? {
+                let _ = self.try_render_ui_effect_portrait(guid, true)?;
+            }
             Ok(true)
         }
     }
@@ -328,21 +337,45 @@ impl Machine<'_, '_> {
                 if src_child { "child" } else { "adult" }.to_owned(),
             );
         }
-        made.strings.insert(characters::SKIN, src_skin);
+        made.strings.insert(characters::SKIN, src_skin.clone());
         made.strings
             .insert(characters::GENDER, src_gender.to_owned());
         // 0x44b2d7 -> 0x40d0a4 -> 0x40d10b and 0x44b2ef -> 0x40d408 ->
-        // 0x40d46f copy the running person's body and head by wardrobe index
-        // (writing "" on -1). Preserve a known made status or definite false;
-        // a catalog source with a HEAD binding may or may not match the
-        // wardrobe list, so leave it unknown (None) to fail loudly if UI
-        // Effect renders it.
-        let head_status = if let Some(&status) = self.world.made_portrait_head.get(&self_guid) {
+        // 0x40d46f look up the running person's body and head rows in the
+        // human wardrobe list via 0x472f92, writing "" on a miss (-1).
+        let src_female = src_gender == "female";
+        let has_manual_made_suit = self.world.characters.made.get(&self_guid).is_some_and(|m| {
+            m.strings.contains_key(&characters::BODY) || m.strings.contains_key(&characters::HEAD)
+        });
+        let head_status = if !has_manual_made_suit
+            && let Some(&status) = self.world.made_portrait_head.get(&self_guid)
+        {
             status
-        } else if self.portrait_head_status(self_guid) == Some(false) {
-            Some(false)
-        } else {
+        } else if src.body.is_none()
+            && src.head.is_none()
+            && self.program.people.portrait_head.get(&self_guid) == Some(&true)
+        {
             None
+        } else {
+            let body = self.copied_outfit_head_status(
+                src.body.as_deref(),
+                false,
+                src_female,
+                src_child,
+                &src_skin,
+            );
+            let head = self.copied_outfit_head_status(
+                src.head.as_deref(),
+                true,
+                src_female,
+                src_child,
+                &src_skin,
+            );
+            match (body, head) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (Some(false), Some(false)) => Some(false),
+                _ => None,
+            }
         };
         self.world.made_portrait_head.insert(guid, head_status);
         self.frame_mut()?.stack_object = record;
@@ -586,6 +619,55 @@ impl Machine<'_, '_> {
             return Some(false);
         }
         None
+    }
+
+    /// Classifies a single `STR# 200` outfit row string (`"suit,..."`) by
+    /// whether its suit binds `"HEAD"`.
+    fn suit_row_head_status(&self, raw: Option<&str>) -> Option<bool> {
+        let Some(raw) = raw else {
+            return Some(false);
+        };
+        let suit = raw
+            .split(';')
+            .next()
+            .unwrap_or(raw)
+            .split(',')
+            .next()
+            .unwrap_or(raw)
+            .trim()
+            .to_ascii_lowercase();
+        if suit.is_empty() || suit == "none" {
+            return Some(false);
+        }
+        self.classify_suit_head(&suit)
+    }
+
+    /// Whether copying `raw` via `0x40d0a4`/`0x40d10b` (body) or
+    /// `0x40d408`/`0x40d46f` (head) produces a `"HEAD"`-binding suit on the
+    /// clone: returns `Some(false)` whenever the source suit has no `"HEAD"`
+    /// binding or fails the `0x472f92` wardrobe lookup (writing `""`).
+    fn copied_outfit_head_status(
+        &self,
+        raw: Option<&str>,
+        is_head: bool,
+        female: bool,
+        child: bool,
+        skin: &str,
+    ) -> Option<bool> {
+        let suit_status = self.suit_row_head_status(raw);
+        if suit_status == Some(false) {
+            return Some(false);
+        }
+        let raw = raw?;
+        let wardrobe = self.program.wardrobe.as_ref()?;
+        if !wardrobe.errors.is_empty() {
+            return None;
+        }
+        if wardrobe.contains_outfit(is_head, female, child, skin, raw) {
+            suit_status
+        } else {
+            Some(false)
+        }
     }
 
     /// Whether every possible pet body selection (`0x44b064..0x44b09b`) binds

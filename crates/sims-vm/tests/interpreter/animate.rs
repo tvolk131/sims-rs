@@ -70,16 +70,10 @@ fn sim_animates(operands: [u8; 8]) -> Fixture {
     // The animator the load leaves is to read the person's appearance
     // again, which the first clip does. This profile changes only person
     // words 22 and 23.
-    fx.program.people.profiles.insert(
-        SIM_GUID,
-        Profile {
-            gender: None,
-            age: None,
-            skin: None,
-            tones: Vec::new(),
-            rig: Default::default(),
-        },
-    );
+    fx.program
+        .people
+        .profiles
+        .insert(SIM_GUID, Profile::default());
     fx.thread(SIM, 4096, &[-7]);
     fx.sim_mut().stack[0].locals = vec![0, 0];
     fx

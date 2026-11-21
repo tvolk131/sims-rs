@@ -52,6 +52,11 @@ pub struct Bone {
 /// reloads the person's appearance (0x5888d3).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Profile {
+    /// Strings 1 and 2 of the type's body strings, counting from 0: the
+    /// initial body and head outfit strings (`"suit,BODY=..."` /
+    /// `"suit,HEAD-HEAD=..."`). None is a string the table does not have.
+    pub body: Option<String>,
+    pub head: Option<String>,
     /// Strings 12, 13 and 14 of the type's body strings, counting from 0:
     /// the gender, the age and the skin tone. None is a string the table
     /// does not have; an empty string is still a string.
@@ -567,6 +572,8 @@ impl People {
             profiles.insert(
                 guid,
                 Profile {
+                    body: row(BODY_SUIT),
+                    head: row(HEAD_SUIT),
                     gender: row(GENDER),
                     age: row(AGE),
                     skin: row(SKIN),

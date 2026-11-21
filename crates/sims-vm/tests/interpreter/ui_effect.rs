@@ -1079,7 +1079,9 @@ fn make_new_character_wardrobe_head_binding_drives_ui_effect_render_and_writebac
     );
 
     // 4. Pet (species 1, TemplateDog) with all matching dog bodies binding
-    // "HEAD": UI Effect renders, caches, and writes BMP_ 2002.
+    // "HEAD": opcode 19 calls 0x4e8c5d(index, 0x1f, 1) immediately at 0x44b126,
+    // caching the portrait and writing BMP_ 2002 BEFORE returning. A following
+    // UI Effect call (and a reload after cache eviction) consumes zero CRT RNG.
     let (mut fx, record, guid) = setup(
         1,
         TEMPLATE_DOG,
@@ -1089,15 +1091,184 @@ fn make_new_character_wardrobe_head_binding_drives_ui_effect_render_and_writebac
     );
     let made_file = fx.world.characters.made[&guid].file;
     assert_eq!(
+        fx.world.portraits,
+        [guid].into(),
+        "0x44b126 should cache the pet portrait during Make New Character"
+    );
+    assert!(
+        fx.world
+            .generated_portrait_2002
+            .contains(&PortraitFile::Made(made_file)),
+        "0x44b126 should persist BMP_ 2002 during Make New Character"
+    );
+    let crt_after_make = fx.world.crt_rng;
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
+        Ok(true)
+    );
+    assert_eq!(
+        fx.world.crt_rng, crt_after_make,
+        "UI Effect should hit the portrait cached by 0x44b126 without re-rendering"
+    );
+    fx.world.portraits.remove(&guid);
+    assert_eq!(
         run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
         Ok(true)
     );
     assert_eq!(fx.world.portraits, [guid].into());
-    assert!(
-        fx.world
-            .generated_portrait_2002
-            .contains(&PortraitFile::Made(made_file))
+    assert_eq!(
+        fx.world.crt_rng, crt_after_make,
+        "evicted pet portrait should reload BMP_ 2002 written at 0x44b126"
     );
+
+    // 5. Invalid pet-picker index (>= bodies) on a template whose ONLY HEAD
+    // binding is in row 2 (head): 0x40d162 leaves body row 1 at the template's
+    // non-HEAD body while 0x44b0a3 -> 0x40a5e2 overwrites head row 2 with
+    // "NONE", so neither 0x44b126 nor UI Effect caches or persists BMP_ 2002.
+    let (mut fx, _, _) = visitors();
+    fx.program.expansions = 0xffff;
+    fx.world.rooms.rooms.get_mut(&1).unwrap().occupied = true;
+    let tpl_file = fx.add_type(TEMPLATE_DOG, 2, 4096, 4097);
+    fx.add(
+        tpl_file,
+        4096,
+        tree(vec![
+            assign(scope::MY_DATA, 4, scope::LITERAL, 1, 1),
+            assign(scope::MY_DATA, 42, scope::LITERAL, 2, RETURN_TRUE),
+        ]),
+    );
+    fx.add(
+        tpl_file,
+        4097,
+        tree(vec![
+            assign(scope::PARAMETERS, 0, scope::LITERAL, 10, 1),
+            ins(0, 0, 0, [0; 8]),
+        ]),
+    );
+    equip(&mut fx, TEMPLATE_DOG, "dog", 12);
+    {
+        let prof = fx.program.people.profiles.get_mut(&TEMPLATE_DOG).unwrap();
+        prof.body = Some("b001dog_nohead,BODY=b001dog_nohead".into());
+        prof.head = Some("c001ma_bob,HEAD-HEAD=c001malgt_bob".into());
+        prof.tones = vec!["lgt".into()];
+    }
+    fx.program.people.portrait_head.insert(TEMPLATE_DOG, true);
+    fx.program.people.head_suits = ["c001ma_bob".to_string(), "b001dog_01".to_string()].into();
+    fx.program.wardrobe = Some(Wardrobe {
+        suits: ["b001dog_01".to_string()].into(),
+        textures: ["b001dog_01.bmp".to_string()].into(),
+        errors: BTreeMap::new(),
+    });
+    fx.world.dialogs.declined = 99; // invalid index >= bodies (1)
+    fx.add(
+        LAMP_FILE,
+        4098,
+        tree(vec![
+            assign(scope::LOCALS, 0, scope::LITERAL, 0, 1),
+            assign(scope::LOCALS, 1, scope::LITERAL, 27, 2),
+            assign(scope::LOCALS, 2, scope::LITERAL, 0, 3),
+            ins(19, 4, RETURN_FALSE, [0, 1, 2, 1, 0, 0, 0, 0]),
+            assign(scope::GLOBAL, 36, scope::STACK_OBJECT, 0, RETURN_TRUE),
+        ]),
+    );
+    assert_eq!(fx.run_with(LAMP, 4098, 0, &[], 1000), Ok(true));
+    let pet_record = fx.world.globals[36];
+    let pet_guid = fx.world.neighbors.get(pet_record).unwrap().guid;
+    assert!(!fx.world.portraits.contains(&pet_guid));
+    assert!(fx.world.generated_portrait_2002.is_empty());
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, pet_record, 1),
+        Ok(true)
+    );
+    assert!(!fx.world.portraits.contains(&pet_guid));
+    assert!(fx.world.generated_portrait_2002.is_empty());
+
+    // 6. Negative-age copy (0x44b23c): 0x44b2d7 / 0x44b2ef compare the source's
+    // body and head rows against the wardrobe via 0x472f92, clearing misses to
+    // "". A catalog source with a HEAD-bearing NPC suit outside the wardrobe
+    // (like the Masseuse) deterministically produces no HEAD binding (no trap),
+    // whereas a matching wardrobe outfit preserves HEAD and writes BMP_ 2002.
+    for (head_row, expect_render) in [
+        ("c999fa_masseuse,HEAD-HEAD=c999falgt_masseuse", false),
+        ("c001fa_alice,HEAD-HEAD=C001FAlgt_Alice01", true),
+    ] {
+        let (mut fx, _, _) = visitors();
+        fx.world.rooms.rooms.get_mut(&1).unwrap().occupied = true;
+        let tpl_file = fx.add_type(TEMPLATE_PERSON, 2, 4096, 4097);
+        fx.add(
+            tpl_file,
+            4096,
+            tree(vec![
+                assign(scope::MY_DATA, 4, scope::LITERAL, 1, 1),
+                assign(scope::MY_DATA, 42, scope::LITERAL, 2, RETURN_TRUE),
+            ]),
+        );
+        fx.add(
+            tpl_file,
+            4097,
+            tree(vec![
+                assign(scope::PARAMETERS, 0, scope::LITERAL, 10, 1),
+                ins(0, 0, 0, [0; 8]),
+            ]),
+        );
+        equip(&mut fx, TEMPLATE_PERSON, "adult", 12);
+        fx.program.people.portrait_head.remove(&TEMPLATE_PERSON);
+        fx.program.people.profiles.insert(
+            SIM_GUID,
+            sims_content::Profile {
+                body: Some("b999fafit_npc,BODY=b999fafitlgt_npc".into()),
+                head: Some(head_row.into()),
+                gender: Some("female".into()),
+                age: Some("27".into()),
+                skin: Some("lgt".into()),
+                ..Default::default()
+            },
+        );
+        fx.program.people.portrait_head.insert(SIM_GUID, true);
+        fx.program.people.head_suits =
+            ["c999fa_masseuse".to_string(), "c001fa_alice".to_string()].into();
+        fx.program.wardrobe = Some(Wardrobe {
+            suits: ["b001fafit_01".to_string(), "c001fa_alice".to_string()].into(),
+            textures: [
+                "b001fafitlgt_01.bmp".to_string(),
+                "c001falgt_alice01.bmp".to_string(),
+            ]
+            .into(),
+            errors: BTreeMap::new(),
+        });
+        fx.add(
+            SIM_FILE,
+            4098,
+            tree(vec![
+                assign(scope::LOCALS, 0, scope::LITERAL, 0, 1),
+                assign(scope::LOCALS, 1, scope::LITERAL, -1, 2),
+                assign(scope::LOCALS, 2, scope::LITERAL, 0, 3),
+                ins(19, 4, RETURN_FALSE, [0, 1, 2, 0, 0, 0, 0, 0]),
+                assign(scope::GLOBAL, 36, scope::STACK_OBJECT, 0, RETURN_TRUE),
+            ]),
+        );
+        assert_eq!(fx.run_with(SIM, 4098, 0, &[], 1000), Ok(true));
+        let copy_record = fx.world.globals[36];
+        let copy_guid = fx.world.neighbors.get(copy_record).unwrap().guid;
+        let copy_file = fx.world.characters.made[&copy_guid].file;
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, copy_record, 1),
+            Ok(true),
+            "head_row={head_row}"
+        );
+        assert_eq!(
+            fx.world.portraits.contains(&copy_guid),
+            expect_render,
+            "head_row={head_row}"
+        );
+        assert_eq!(
+            fx.world
+                .generated_portrait_2002
+                .contains(&PortraitFile::Made(copy_file)),
+            expect_render,
+            "head_row={head_row}"
+        );
+    }
 }
 
 #[test]

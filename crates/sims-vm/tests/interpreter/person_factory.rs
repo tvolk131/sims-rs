@@ -77,16 +77,7 @@ pub fn equip(fx: &mut Fixture, guid: u32, name: &str, record_word: i16) {
             bones: Vec::new(),
         },
     );
-    fx.program.people.profiles.insert(
-        guid,
-        Profile {
-            gender: None,
-            age: None,
-            skin: None,
-            tones: Vec::new(),
-            rig: Default::default(),
-        },
-    );
+    fx.program.people.profiles.insert(guid, Profile::default());
     fx.program.people.portrait_head.insert(guid, true);
     let global = fx.program.libraries.get_mut(&GLOBAL).unwrap();
     for id in [1, 5, 6] {
