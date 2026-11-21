@@ -2756,8 +2756,9 @@ fn the_recorded_snack_order_with_bob_shots_replayed_in_the_window_matches_the_re
 /// Track 2's second recording of the two-snack cancel order
 /// (`goth-cancel-pick-20261120`), replayed through the window's input
 /// layer. Its watches give the frames the original drew and the object
-/// its pointer listed, each write at a frame's update; each pointer move
-/// is given at the update of the listing it made. Mortimer's state bounds
+/// its pointer listed, each write at a frame's update. The first two
+/// pointer moves are given within their commands; each later move is
+/// given at the update of the listing it made. Mortimer's state bounds
 /// the rest: the entry is reached before his last result goes to 1, the
 /// choice and the cancels are given at the update before their effect. A
 /// scratch comparison found the lot equal to the recording's after every
@@ -2802,9 +2803,10 @@ fn the_recorded_cancel_order_with_the_pick_watched_replayed_in_the_window_matche
         assert!(game.menu().is_none());
         game.hover(recorded([200, 123]));
     };
-    // The second move's command ran from 88 to 94, and the original listed
-    // nothing at the frame after 93: the pointer had left the point where
-    // that frame shows the kitchen counter. The replay moves it at 91.
+    // The second move's command ran from 88 to 94, and the original wrote
+    // no listing at 93, where our frame shows the kitchen counter at the
+    // first move's point. Where its pointer was at that frame is not
+    // known; the replay moves it at 91, before the frame.
     run_to(&mut game, &schedule, 84);
     game.hover(recorded([176, 222]));
     assert_eq!(game.listed(), None);

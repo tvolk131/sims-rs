@@ -88,8 +88,9 @@ recorded, 0 ours).
 ## Differences: what the pointer finds
 
 These are all **unverified** and not ported. The lot's state shows only
-that the original listed a pie where ours did not, or listed another
-one.
+that its words differ where a listing would change them; each
+difference below was taken for the original listing a pie where ours
+did not, or listing another one.
 
 - **Through a wall.** At update 90 the pointer at the recording's
   (176, 222) makes the original list a pie: Mortimer's last result

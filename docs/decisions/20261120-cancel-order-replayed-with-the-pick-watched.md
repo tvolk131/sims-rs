@@ -61,9 +61,10 @@ Window points are the recording's moved 97 right and 46 down; the panel's
 icons are at the recording's own points.
 
 - **Pointer moves.** The first is given at 84, where its command ended.
-  The second is given at 91, within its command's 88–94: the frame after
-  93 shows the counter at the first move's point, and the original wrote
-  no listing at 93. Each later move is given at the update of the listing
+  The second is given at 91, within its command's 88–94 and before the
+  frame after 93: our frame there shows the counter at the first move's
+  point, and the original wrote no listing at 93. Where the original's
+  pointer was at that frame is not known. Each later move is given at the update of the listing
   it made: 123, 300, 330 and 360. The window draws that update's frame
   first, then takes the move. The move onto the fridge ended at 122; his
   last result goes to 0 at 124.
@@ -95,7 +96,8 @@ cut the kitchen wall away, as in the old cancel replay.
 The test checks:
 
 - the listings;
-- Mortimer's last result around each listing and entry;
+- Mortimer's last result around the first order's listings and both
+  entries;
 - the two snacks (uids 1 and 5);
 - the queued one taken off;
 - the running one's flag 0x100;
