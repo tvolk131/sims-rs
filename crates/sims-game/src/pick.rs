@@ -1,143 +1,218 @@
-//! Which person or object a click on the lot lands on: what the frame
-//! last drawn shows there.
+//! Which person or object the pointer is on: the original's pointer pick
+//! (0x48c9be) on the frame last drawn.
 //!
-//! The lot and its people are drawn into one canvas, which notes for
-//! each pixel the object or person whose pixel it took last
-//! ([`Canvas::id_at`]; `sims_render::draw_lot` and `draw_held` name
-//! object sprites,
-//! `sims_people::People::draw_on_lot` names people, and terrain, floors
-//! and walls name nobody). So a person or object hidden behind a wall or
-//! a bookcase is shown nowhere and takes no click meant for what hides
-//! it.
+//! 1. **A person or the plumb bob drawn at the pixel.** The original's
+//!    3D graphics note themselves while they are drawn: a person's draw
+//!    (0x590ebd to 0x590f84) and the bob's (0x5863eb to 0x586455) read the
+//!    depth buffer at the pointer before and after drawing the mesh, and
+//!    the one that changed it is the graphic under the pointer, the last
+//!    drawn winning. The pick takes it when it stands on the floor shown
+//!    (+0x110 against 0x49295d). Here, the person or bob whose pixel the
+//!    frame showed there once the people were drawn (`sims_people` names
+//!    each person's pixels and the bob's): the pixel itself, with no reach
+//!    around it. The objects that hold a person draw after the people
+//!    (`sims_render::draw_held`, as the original's moving pass does), so a
+//!    bench's backrest may cover a pixel of the Sim on it; the Sim's draw
+//!    still changed the depth there, so the Sim is noted.
+//! 2. **Otherwise the sprite pick** (0x4aa713, [`Lot::sprite_pick`]):
+//!    from the tile the lot's depth at the pixel stands for, the tiles
+//!    toward the viewer, and the first whose objects' screen rectangles
+//!    hold the point ([`Canvas::drawn`], widened to whole groups of four
+//!    columns as the original keeps them, 0x438f71). An object drawn after
+//!    the people has its rectangle there too.
 //!
-//! People are thin, so a click finds the person shown at the pixel or
-//! nearest to it within [`REACH`] first; only then the object shown at
-//! the pixel itself. Each tile of a multi-tile object is its own object
-//! and is picked as itself, not as its group's lead: that is the object
-//! the pie menu is listed on, and the simulation sends the interactions
-//! of a tile on to the tile that takes them, as the original does
-//! (`crate::menu::target`, 0x435286). How the original resolves a click
-//! to an object or a Sim is **unverified** (see `docs/decisions/`, "A
-//! click picks what the frame shows at the pixel").
+//! The original's depth buffer holds the lot alone: dumps with Sims on
+//! screen show them, and the porch bench two of them sat on, in the
+//! colour buffer only
+//! (`20261115-people-are-drawn-over-finished-lot-against-depth.md`). So
+//! the sprite pick unprojects the depth `sims_render::draw_lot` left,
+//! before the people and the objects that hold one were drawn
+//! ([`Depth::unproject`]). That the dumped buffer is the one the pick
+//! reads at the pointer (0x4a97c3 locks the view's depth surface), at the
+//! time it reads it, is **unverified**. Each tile of a multi-tile object is its
+//! own object and is picked as itself, not as its group's lead: that is
+//! the object the pie menu is listed on, and the simulation sends the
+//! interactions of a tile on to the tile that takes them, as the
+//! original does (`crate::menu::target`, 0x435286).
 
-use sims_render::Canvas;
+use sims_render::depth::{Depth, EMPTY};
+use sims_render::{Camera, Canvas, Ids};
 use sims_sim::World;
+use sims_vm::boot::Lot;
 
-/// How far from a pixel a person is shown in a click still finds them,
-/// in pixels.
-pub const REACH: i32 = 2;
-
-/// The person or object a press at `point` (canvas pixels) lands on in
-/// `canvas`, the frame last drawn of `world`: the person shown nearest
-/// within [`REACH`] ([`person`]), else the object shown there
-/// ([`object`]).
-pub fn at(world: &World, canvas: &Canvas, point: [i32; 2]) -> Option<u16> {
-    choose(canvas, point, |id| kind(world, id))
+/// The person or object the pointer at `point` (canvas pixels) is on in
+/// `canvas`, the frame last drawn of `lot` through `camera`. Its lot left
+/// `lot_depth` (a depth per pixel, in rows of the canvas's width) before
+/// anything else was drawn, and `people` are its IDs once the people were
+/// drawn. The answer is the person or bob drawn at the pixel ([`noted`]),
+/// else the sprite pick's object.
+pub fn at(
+    lot: &Lot,
+    camera: &Camera,
+    canvas: &Canvas,
+    lot_depth: &[i32],
+    people: &Ids,
+    point: [i32; 2],
+) -> Option<u16> {
+    noted(lot.world(), camera, people, point)
+        .or_else(|| sprite(lot, camera, canvas, lot_depth, point))
 }
 
-/// The person shown at `point` in `canvas`, or else the one shown nearest
-/// to it within [`REACH`] (the first in row order among the nearest), if
-/// `world` holds them as a person.
-pub fn person(world: &World, canvas: &Canvas, point: [i32; 2]) -> Option<u16> {
-    nearest(canvas, point, |id| kind(world, id) == Some(Kind::Person))
+/// The person or plumb bob drawn at `point`, by `people`, a frame's IDs
+/// once its people were drawn, if it stands on the floor `camera` shows.
+pub fn noted(world: &World, camera: &Camera, people: &Ids, [x, y]: [i32; 2]) -> Option<u16> {
+    let id = people.id_at(x, y)?;
+    let object = world.objects.get(&id)?;
+    let three_d = object.person.is_some() || object.guid == sims_people::bob::STANDARD;
+    (three_d && object.position[2] == camera.level).then_some(id)
 }
 
-/// The object, not a person, shown at `point` in `canvas`, if `world`
-/// still holds it.
-pub fn object(world: &World, canvas: &Canvas, [x, y]: [i32; 2]) -> Option<u16> {
-    canvas
-        .id_at(x, y)
-        .filter(|&id| kind(world, id) == Some(Kind::Object))
-}
-
-/// What an ID a pixel names is in the world.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
-    Person,
-    Object,
-}
-
-/// What `world` holds as `id`, if anything.
-fn kind(world: &World, id: u16) -> Option<Kind> {
-    world.objects.get(&id).map(|o| match o.person {
-        Some(_) => Kind::Person,
-        None => Kind::Object,
+/// The sprite pick's object at `point` ([`Lot::sprite_pick`]). Nothing
+/// before the first frame is drawn, or off the canvas.
+fn sprite(
+    lot: &Lot,
+    camera: &Camera,
+    canvas: &Canvas,
+    lot_depth: &[i32],
+    point: [i32; 2],
+) -> Option<u16> {
+    let [x, y] = point;
+    let column = usize::try_from(x).ok().filter(|&x| x < canvas.width)?;
+    let row = usize::try_from(y).ok().filter(|&y| y < canvas.height)?;
+    let depth = *lot_depth.get(row * canvas.width + column)?;
+    let world = lot.world();
+    let depth = (depth != EMPTY).then(|| place(world, camera, point, depth));
+    let level = camera.level;
+    let lifted = [x, y + camera.zoom.floor_height() * (level - 1)];
+    let ground = camera.unproject_fine(lifted);
+    let level = i8::try_from(level).ok()?;
+    lot.sprite_pick(depth, ground, level, camera.rotation, point, |id| {
+        canvas.drawn(id).map(widen)
     })
 }
 
-/// [`at`], with `kind` saying what each ID is.
-fn choose(canvas: &Canvas, [x, y]: [i32; 2], kind: impl Fn(u16) -> Option<Kind>) -> Option<u16> {
-    nearest(canvas, [x, y], |id| kind(id) == Some(Kind::Person)).or_else(|| {
-        canvas
-            .id_at(x, y)
-            .filter(|&id| kind(id) == Some(Kind::Object))
-    })
+/// Where a pixel of depth `depth` at `point` is: its lot position
+/// (sixteenths of a tile, rounded half away from zero as 0x454fb9 rounds)
+/// and the level it is on. The original's 0x4b07b3 classifies a point by
+/// its height above the terrain under it (the mean of its tile's four
+/// corners): two floors' height or more is level 3, one or more level 2,
+/// anything lower level 1. Our depth gives a position only for a level
+/// taken, so each level is tried, and the answer is the highest whose
+/// position and height classify as that level (only an upper floor's
+/// depth carries its level's offset). With none, it is the level the
+/// first level's position classifies as, at that level's position.
+fn place(world: &World, camera: &Camera, point: [i32; 2], depth: i32) -> ([i32; 2], i32) {
+    let depths = Depth::new(camera);
+    let floor = f64::from(camera.zoom.floor_height());
+    let step = f64::from(2i32 << camera.zoom.level());
+    let on = |level: i32| {
+        let (view, height) = depths.unproject(camera, point, depth, level);
+        let fine = to_lot(camera, view).map(round);
+        let above = floor * f64::from(level - 1) + height - terrain(world, fine) * step;
+        (fine, classify(above, floor))
+    };
+    (1..=3)
+        .rev()
+        .map(|level| (level, on(level)))
+        .find(|&(level, (_, classified))| level == classified)
+        .map_or_else(
+            || {
+                let (_, level) = on(1);
+                (on(level).0, level)
+            },
+            |(_, place)| place,
+        )
 }
 
-/// The ID `keep` takes shown nearest to `point` within [`REACH`], the
-/// first in row order among the nearest.
-fn nearest(canvas: &Canvas, [x, y]: [i32; 2], keep: impl Fn(u16) -> bool) -> Option<u16> {
-    let mut best: Option<(i32, u16)> = None;
-    for py in y - REACH..=y + REACH {
-        for px in x - REACH..=x + REACH {
-            let Some(id) = canvas.id_at(px, py).filter(|&id| keep(id)) else {
-                continue;
-            };
-            let distance = (px - x).pow(2) + (py - y).pow(2);
-            if best.is_none_or(|(d, _)| distance < d) {
-                best = Some((distance, id));
-            }
-        }
+/// The level of a point `above` pixels above the terrain, with floors
+/// `floor` pixels high (0x4b07b3).
+fn classify(above: f64, floor: f64) -> i32 {
+    if above >= 2.0 * floor {
+        3
+    } else if above >= floor {
+        2
+    } else {
+        1
     }
-    best.map(|(_, id)| id)
+}
+
+/// A fine view position turned back to the lot's, as the camera turns it.
+fn to_lot(camera: &Camera, [x, y]: [f64; 2]) -> [f64; 2] {
+    let span = f64::from(sims_render::camera::ARRAY_SIZE * 16);
+    match camera.rotation & 3 {
+        1 => [y, span - x],
+        2 => [span - x, span - y],
+        3 => [span - y, x],
+        _ => [x, y],
+    }
+}
+
+/// The terrain's height under lot position `fine`, in terrain steps: the
+/// mean of its tile's four corner heights (the lot's array 0), 0 off it.
+fn terrain(world: &World, fine: [i32; 2]) -> f64 {
+    let full = sims_render::lot::FULL;
+    let tile = fine.map(|n| usize::try_from(n >> 4).ok().filter(|&n| n < full));
+    let ([Some(x), Some(y)], Some(heights)) = (tile, world.arrays.get(&0)) else {
+        return 0.0;
+    };
+    let at = sims_render::Lot::cell(x, y) * 4;
+    heights
+        .data
+        .get(at..at + 4)
+        .filter(|_| heights.stride == 4)
+        .map_or(0.0, |c| c.iter().map(|&h| f64::from(h)).sum::<f64>() / 4.0)
+}
+
+/// Rounds half away from zero (0x636ac9, 0x636b98).
+fn round(v: f64) -> i32 {
+    let whole = if v >= 0.0 {
+        (v + 0.5).floor()
+    } else {
+        -(-v + 0.5).floor()
+    };
+    whole as i32
+}
+
+/// A drawn rectangle as the original keeps an object's (0x438f71): its
+/// left edge moved left and its right edge right to a multiple of four.
+fn widen([left, top, right, bottom]: [i32; 4]) -> [i32; 4] {
+    [
+        left.saturating_sub(left.rem_euclid(4)),
+        top,
+        right.saturating_add((4 - right.rem_euclid(4)) % 4),
+        bottom,
+    ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// People 3, 4 and 5 and objects 7 and 8; nothing else.
-    fn kind(id: u16) -> Option<Kind> {
-        match id {
-            3..=5 => Some(Kind::Person),
-            7 | 8 => Some(Kind::Object),
-            _ => None,
-        }
-    }
-
-    /// A 10 by 10 canvas with `pixels` drawn as `(x, y, id)`.
-    fn canvas(pixels: &[(i32, i32, u16)]) -> Canvas {
-        let mut canvas = Canvas::new(10, 10, [0, 0, 0]);
-        for &(x, y, id) in pixels {
-            canvas.set_id(Some(id));
-            assert!(canvas.put(x, y, [9, 9, 9, 255], 0));
-        }
-        canvas
+    #[test]
+    fn rounding_is_half_away_from_zero() {
+        assert_eq!(round(415.5), 416);
+        assert_eq!(round(415.49), 415);
+        assert_eq!(round(-0.5), -1);
+        assert_eq!(round(-0.49), 0);
     }
 
     #[test]
-    fn a_click_finds_the_person_shown_there_or_nearest() {
-        let canvas = canvas(&[(5, 5, 3), (6, 5, 4), (8, 5, 5), (5, 6, 7)]);
-        let person = |point| nearest(&canvas, point, |id| kind(id) == Some(Kind::Person));
-        assert_eq!(person([5, 5]), Some(3));
-        assert_eq!(person([6, 5]), Some(4));
-        assert_eq!(person([8, 7]), Some(5));
-        // Object 7's pixel is nearer, but is nobody's.
-        assert_eq!(person([5, 7]), Some(3));
-        // Beyond REACH of every shown pixel, or off the frame.
-        assert_eq!(person([1, 1]), None);
-        assert_eq!(person([-50, 5]), None);
+    fn a_point_below_the_first_floor_height_is_on_level_one() {
+        assert_eq!(classify(-9.6, 58.0), 1);
+        assert_eq!(classify(57.9, 58.0), 1);
+        assert_eq!(classify(58.0, 58.0), 2);
+        assert_eq!(classify(116.0, 58.0), 3);
+        assert_eq!(classify(400.0, 58.0), 3);
     }
 
     #[test]
-    fn a_click_finds_a_person_near_before_the_object_shown_there() {
-        // Object 7 at (2, 2) beside person 3; object 8 alone at (8, 8);
-        // object 9, which the world does not hold, at (0, 9).
-        let canvas = canvas(&[(2, 2, 7), (3, 2, 3), (8, 8, 8), (0, 9, 9)]);
-        assert_eq!(choose(&canvas, [2, 2], kind), Some(3));
-        assert_eq!(choose(&canvas, [8, 8], kind), Some(8));
-        // Off the object by a pixel, nobody's pixel names nothing.
-        assert_eq!(choose(&canvas, [8, 7], kind), None);
-        assert_eq!(choose(&canvas, [0, 9], kind), None);
+    fn a_rectangle_widens_to_groups_of_four_columns() {
+        assert_eq!(widen([465, 250, 482, 308]), [464, 250, 484, 308]);
+        assert_eq!(widen([464, 1, 484, 2]), [464, 1, 484, 2]);
+        assert_eq!(widen([-3, 0, -1, 0]), [-4, 0, 0, 0]);
+        assert_eq!(
+            widen([i32::MIN, 0, i32::MAX, 0]),
+            [i32::MIN, 0, i32::MAX, 0]
+        );
     }
 }

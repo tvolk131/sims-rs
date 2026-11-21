@@ -55,6 +55,7 @@ mod objects;
 pub mod orders;
 mod people;
 mod person_factory;
+mod pick;
 mod placement;
 pub mod play;
 mod primitives;

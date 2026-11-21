@@ -126,6 +126,13 @@ pub struct Game {
     /// `clock_us` when the frame was last drawn.
     drawn_us: u64,
     canvas: Canvas,
+    /// The camera the frame last drawn was drawn through, the depth its
+    /// lot left before anything else was drawn, and its IDs once its
+    /// people were drawn, before the objects holding them: what the
+    /// pointer picks from ([`Game::under`]).
+    drawn_camera: Camera,
+    lot_depth: Vec<i32>,
+    people_ids: sims_render::Ids,
 }
 
 impl Game {
@@ -160,6 +167,7 @@ impl Game {
         let mut people = People::open(&options.install, house)?;
         people.refresh(lot.world());
         let view = View::new([800, 600], lot_shape.built_center(), opened.rotation);
+        let drawn_camera = view.camera;
         Ok(Self {
             lot,
             lot_shape,
@@ -180,6 +188,9 @@ impl Game {
             clock_us: 0,
             drawn_us: 0,
             canvas: Canvas::new(1, 1, [0, 0, 0]),
+            drawn_camera,
+            lot_depth: Vec::new(),
+            people_ids: sims_render::Ids::default(),
         })
     }
 
@@ -498,6 +509,8 @@ impl Game {
             &self.view.camera,
             &mut self.canvas,
         );
+        self.drawn_camera = self.view.camera;
+        self.lot_depth.clone_from(&self.canvas.depth);
         // The plumb bob spins by the game's clock in milliseconds (the
         // original's 0x6e54e0); here the time passed in, which runs on
         // while the lot is paused or a dialog waits (**unverified**
@@ -506,6 +519,9 @@ impl Game {
         let milliseconds = (self.clock_us / 1000) as u32;
         self.people.set_clock(milliseconds);
         self.people.draw(world, &self.view.camera, &mut self.canvas);
+        // Who the pick notes: the people as drawn, before a bench they sit
+        // on draws over them.
+        self.people_ids.take(&self.canvas);
         sims_render::draw_held(
             world,
             &self.lot_shape,
@@ -684,10 +700,17 @@ impl Game {
         true
     }
 
-    /// The person or object shown at `point` on the lot in the frame last
-    /// drawn.
+    /// The person or object the pointer at `point` is on in the frame
+    /// last drawn, by the original's pointer pick ([`pick::at`]).
     pub fn under(&self, point: [i32; 2]) -> Option<u16> {
-        pick::at(self.lot.world(), &self.canvas, point)
+        pick::at(
+            &self.lot,
+            &self.drawn_camera,
+            &self.canvas,
+            &self.lot_depth,
+            &self.people_ids,
+            point,
+        )
     }
 
     /// Lists the selected Sim's pie menu on `object` (`Lot::pie_menu`,

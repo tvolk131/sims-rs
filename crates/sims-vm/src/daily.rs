@@ -329,15 +329,19 @@ impl Interpreter<'_> {
     /// The objects' value becomes the budget's
     /// ([`sims_sim::Budget::objects_value`], simulator +0xa0, 0x416118).
     ///
-    /// **Not ported: the architecture's value** (+0xa4, 0x416126), the
-    /// objects' sum above plus what 0x47b006 returns: half the prices of
+    /// **Not ported: the architecture's value** (+0xa4, 0x416126): the
+    /// pass's other subtotal, of the objects that add to the
+    /// architecture's (0x445223), plus what 0x47b006 returns (added at
+    /// 0x416121): half the prices of
     /// the walls' styles (0x6e5838), the wall patterns' prices (0x4c63cf),
     /// the floors' prices (0x4a1439, half for a diagonal half floor) and
-    /// the pool's (0x6c5ff8). The pattern catalogs here hold no prices, so
+    /// the pool's (0x6c5ff8). `sims_ui::house::Values::read` has that sum,
+    /// but the simulation does not store it, so
     /// [`sims_sim::Budget::architecture_value`] keeps the value the house
-    /// was saved with. Nothing ported reads it; a save written after a day
-    /// turns would hold a stale value. This is a known gap, not the
-    /// original's behaviour.
+    /// was saved with. The house panel's Furnishings rating reads it, so
+    /// after a day turns it weighs the new objects' value against the
+    /// saved architecture's, and a save written then would hold a stale
+    /// value. This is a known gap, not the original's behaviour.
     ///
     /// Two flags of the selected family (+0x138: bit 1 when an object of
     /// category 1 stands on the lot, bit 2 when there is one of category
