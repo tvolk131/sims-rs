@@ -41,7 +41,8 @@
 //!
 //! Mode 5 is mode 0 with the search's random start (search record byte
 //! 0x17, set at 0x44b5a5; see `Machine::random_start`): each of the two
-//! searches first moves its start by a random number of tiles.
+//! searches first replaces a `(1, 1)` start with a random fine point or
+//! moves any other start by random tile offsets.
 //!
 //! Mode 2 (in front of the object) fails loudly.
 
@@ -207,12 +208,14 @@ impl Machine<'_, '_> {
     ///    inverse of the view's rotation (the world's +0x84, negated modulo
     ///    4; [`crate::Interpreter::view_rotation`]).
     ///
-    /// From `(1, 1)`, a non-positive lot size divides by zero (or wraps)
-    /// and fails, whereas a 1- or 2-tile lot skips the walk, takes its two
-    /// draws modulo `size`, and lets the search return false normally. From
-    /// any other start, a lot smaller than three tiles has no tile inside
-    /// its bounds, so the original's loop never ends, and a turned lot
-    /// wider than 64 tiles would look its corners up past the table of
+    /// From `(1, 1)`, native 0x434ab3 uses unsigned division: size 0 faults
+    /// after the first draw, and a negative size is taken as a large
+    /// unsigned divisor. As a port guard, this rejects any `size <= 0`
+    /// before drawing, whereas a 1- or 2-tile lot skips the walk, takes its
+    /// two draws modulo `size`, and lets the search return false normally.
+    /// From any other start, a lot smaller than three tiles has no tile
+    /// inside its bounds, so the original's loop never ends, and a turned
+    /// lot wider than 64 tiles would look its corners up past the table of
     /// turns: both fail.
     fn random_start(&mut self, from: [i32; 2]) -> Result<[i32; 2], Trap> {
         let size = i32::from(self.world.size);
