@@ -167,14 +167,17 @@
 //! sequence groups, [`INSTANCES`] instances, and [`CHAIN`] patches
 //! chained to one note exist at once; calls nest at most [`CALL_DEPTH`] deep;
 //! a thread started by `play_trk` first runs in the next block; a patch
-//! that does not exist is not cached. How the original picks among
-//! duplicate events, patches and hit lists across modules is unknown;
-//! here the module whose name sorts first wins.
+//! that does not exist is not cached. A track, patch, hit list or track
+//! data ID that several modules define is the last one registered
+//! ([`owners`], [`hit_lists`], [`entry_points`]). How the original picks
+//! among duplicate events is unknown; here the module whose name sorts
+//! first wins.
 
 use crate::ambience::{self, Fresh, Host, Key, Voice};
 use crate::files::SoundFiles;
 use crate::fsc::Score;
 use crate::hit::{Instruction, Operand};
+use crate::hot::Object;
 use crate::levels::{self, Inputs, Levels};
 use crate::module::Module;
 use crate::placement::{self, Projection};
@@ -470,12 +473,14 @@ impl Sources for NoSources {
 #[derive(Debug, Clone)]
 struct Thread {
     id: u32,
+    /// The module whose program the thread is running: where its track's
+    /// entry point, or the last `jump` or `call`, led ([`entry_points`]).
     module: usize,
     track: u32,
     pc: u32,
     registers: [i32; GLOBALS as usize],
-    stack: Vec<u32>,
-    loop_point: u32,
+    stack: Vec<Place>,
+    loop_point: Place,
     kept: i64,
     hit_list: Vec<u32>,
     last_note: u32,
@@ -588,29 +593,150 @@ fn xorshift(state: &mut u64, below: u32) -> u32 {
 /// startup: the base game's tables, then the station patches, then the
 /// expansions' and the downloads' tables ([`Registry::rank`]), each
 /// module's in file order. Modules of one rank keep their order here.
-fn registry(modules: &[Module], station_patches: &[u32]) -> Registry {
-    let mut ranked: Vec<(usize, &Module)> = modules
-        .iter()
-        .map(|m| (Registry::rank(&m.name), m))
-        .collect();
-    ranked.sort_by_key(|&(rank, _)| rank);
+fn registry(modules: &[Module], station_patches: &[(u32, String)]) -> Registry {
     let mut registry = Registry::new();
-    for &(_, module) in ranked.iter().filter(|&&(rank, _)| rank == 0) {
-        module
-            .hot
-            .registered
-            .iter()
-            .for_each(|&id| registry.insert(id));
+    let mut stations = Some(station_patches);
+    for m in registration_order(modules) {
+        if Registry::rank(&modules[m].name) > 0
+            && let Some(ids) = stations.take()
+        {
+            ids.iter().for_each(|(id, _)| registry.insert(*id));
+        }
+        for &(id, _) in &modules[m].hot.registered {
+            registry.insert(id);
+        }
     }
-    station_patches.iter().for_each(|&id| registry.insert(id));
-    for &(_, module) in ranked.iter().filter(|&&(rank, _)| rank > 0) {
-        module
-            .hot
-            .registered
-            .iter()
-            .for_each(|&id| registry.insert(id));
+    if let Some(ids) = stations {
+        ids.iter().for_each(|(id, _)| registry.insert(*id));
     }
     registry
+}
+
+/// The modules in the original's order of registration
+/// ([`Registry::rank`]), as indices.
+fn registration_order(modules: &[Module]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..modules.len()).collect();
+    order.sort_by_key(|&m| Registry::rank(&modules[m].name));
+    order
+}
+
+/// *(code)* Each track's and each patch's module: the one whose line
+/// registered it last. The registry holds one object per ID, and an ID
+/// registered again replaces its object (0x57ce04 to 0x57ce32), so every
+/// start of a track looks up that object (0x573312) and runs from its
+/// descriptor (0x57db7a to 0x57db91), whichever module asked.
+///
+/// Patches and tracks share the registry, so an ID registered again as
+/// the other kind is that kind only: it is left out of the other map. In
+/// the install, track 68262's `[Track]` line comes before a `[Patch]` line
+/// of the same ID in its file, and patches 6401 and 6402 are replaced by
+/// tracks of a download registered later. A start that finds a patch
+/// object starts nothing (its slot returns at once, 0x57bf80), and a note
+/// whose patch is a track object fails (0x57f6ac to 0x57f703).
+///
+/// The station patches ([`Registrant::Station`]) register through the same routine
+/// (0x5750dc calls 0x57cdd5), after the base game's tables and before the
+/// expansions', with numbers their allocator hands out without looking
+/// at the registry (0x57d386): one replaces a base game object of its
+/// number, and an expansion's or a download's replaces it.
+fn owners(
+    modules: &[Module],
+    station_patches: &[(u32, String)],
+) -> (BTreeMap<u32, usize>, BTreeMap<u32, (Registrant, String)>) {
+    let mut tracks = BTreeMap::new();
+    let mut patches = BTreeMap::new();
+    let mut stations = Some(station_patches);
+    let add_stations = |tracks: &mut BTreeMap<u32, usize>,
+                        patches: &mut BTreeMap<u32, (Registrant, String)>,
+                        stations: &mut Option<&[(u32, String)]>| {
+        for (at, (id, path)) in stations.take().into_iter().flatten().enumerate() {
+            patches.insert(*id, (Registrant::Station(at), path.clone()));
+            tracks.remove(id);
+        }
+    };
+    for m in registration_order(modules) {
+        if Registry::rank(&modules[m].name) > 0 {
+            add_stations(&mut tracks, &mut patches, &mut stations);
+        }
+        let hot = &modules[m].hot;
+        for &(id, object) in &hot.registered {
+            match object {
+                Object::Track => {
+                    tracks.insert(id, m);
+                    patches.remove(&id);
+                }
+                Object::Patch => {
+                    patches.insert(id, (Registrant::Module(m), hot.patches[&id].path.clone()));
+                    tracks.remove(&id);
+                }
+            }
+        }
+    }
+    add_stations(&mut tracks, &mut patches, &mut stations);
+    (tracks, patches)
+}
+
+/// Whose line registered a patch: a module's, by index, or the station
+/// patch made `n`th ([`Player::add_stations`]). Each registration makes a
+/// new object (0x5750a0 to 0x5750c5), so two are never the same object,
+/// whatever their samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Registrant {
+    Module(usize),
+    Station(usize),
+}
+
+/// A place in a module's program: the module and the address.
+type Place = (usize, u32);
+
+/// *(code)* Each track data ID's place: the module whose `[TrackData]`
+/// line registered it last, and the address there. The original keeps one
+/// table of them for every module (manager +0x168): each line stores the
+/// address in the program being loaded (0x57ce70 to 0x57ce98), so an ID
+/// registered again points into the later module's program. A track's
+/// entry point (0x57dd8d, 0x57dbe2), and every `jump`, `call` and `if`
+/// (0x57e3b5, 0x57e3d4), look an ID up in it, whichever module's program
+/// is running, so a thread can go on in another module's program.
+fn entry_points(modules: &[Module]) -> BTreeMap<u32, Place> {
+    let mut places = BTreeMap::new();
+    for m in registration_order(modules) {
+        for (&id, &address) in &modules[m].hot.track_data {
+            places.insert(id, (m, address));
+        }
+    }
+    places
+}
+
+/// *(code)* The hit lists, each from the module whose line registered it
+/// last: the HOT reader makes a new list for each `[GlobalHitList]` line
+/// (0x57ba20) and the table keeps the newest for its ID (0x57d261). The
+/// stations add to the lists there are when they are built (0x574c9e to
+/// 0x574cb7, 0x574e74), after the base game's tables and before the
+/// expansions', so an expansion's list of the same ID replaces what they
+/// added.
+fn hit_lists(modules: &[Module], stations: &BTreeMap<u32, Vec<u32>>) -> BTreeMap<u32, Vec<u32>> {
+    let mut lists: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    let mut pending = Some(stations);
+    for m in registration_order(modules) {
+        if Registry::rank(&modules[m].name) > 0
+            && let Some(stations) = pending.take()
+        {
+            add_station_lists(&mut lists, stations);
+        }
+        for (&id, list) in &modules[m].hot.hit_lists {
+            lists.insert(id, list.clone());
+        }
+    }
+    if let Some(stations) = pending {
+        add_station_lists(&mut lists, stations);
+    }
+    lists
+}
+
+fn add_station_lists(lists: &mut BTreeMap<u32, Vec<u32>>, stations: &BTreeMap<u32, Vec<u32>>) {
+    for (&id, list) in stations {
+        lists.entry(id).or_default().extend(list);
+    }
 }
 
 fn splitmix(seed: u64) -> u64 {
@@ -623,13 +749,13 @@ fn splitmix(seed: u64) -> u64 {
 /// What one instruction did to its thread.
 enum Flow {
     Next,
-    Jump(u32),
+    Jump(Place),
     /// Stay on this instruction and run it again next block.
     Block,
     /// Go on to the next instruction next block.
     Yield,
     /// Go to this address next block.
-    JumpYield(u32),
+    JumpYield(Place),
     End,
     /// End the thread, whatever called it, and stop its notes.
     Kill,
@@ -639,14 +765,26 @@ enum Flow {
 pub struct Player<S> {
     modules: Vec<Module>,
     samples: S,
-    /// Patch ID to (module, path), the first module's winning.
-    patches: BTreeMap<u32, (usize, String)>,
+    /// Patch ID to (registrant, path): whose line registered it last
+    /// ([`owners`]). An ID whose last line is
+    /// a track's is not here.
+    patches: BTreeMap<u32, (Registrant, String)>,
+    /// Track ID to the module whose line registered it last
+    /// ([`owners`]): the module every start of the track runs from. An ID
+    /// whose last line is a patch's is not here.
+    tracks: BTreeMap<u32, usize>,
+    /// Track data ID to its place ([`entry_points`]).
+    track_data: BTreeMap<u32, Place>,
+    /// Hit list ID to its entries ([`hit_lists`]).
     hit_lists: BTreeMap<u32, Vec<u32>>,
+    /// The stations' hit lists added, merged.
+    station_lists: BTreeMap<u32, Vec<u32>>,
     /// *(code)* The registry of patch and track objects (manager +0x80),
     /// for the order the unpause goes through them.
     registry: Registry,
-    /// The station patches added, in the order they were made.
-    station_patches: Vec<u32>,
+    /// The station patches added, in the order they were made, with their
+    /// samples' paths.
+    station_patches: Vec<(u32, String)>,
     cache: BTreeMap<u32, Option<Pcm>>,
     globals: [i32; 256 - GLOBALS as usize],
     threads: Vec<Thread>,
@@ -727,24 +865,18 @@ impl<S: Samples> Player<S> {
     /// [`Module::load_all`] returns them). `seed` starts its random
     /// numbers.
     pub fn new(modules: Vec<Module>, samples: S, seed: u64) -> Self {
-        let mut patches = BTreeMap::new();
-        let mut hit_lists = BTreeMap::new();
-        for (index, module) in modules.iter().enumerate() {
-            for (&id, patch) in &module.hot.patches {
-                patches
-                    .entry(id)
-                    .or_insert_with(|| (index, patch.path.clone()));
-            }
-            for (&id, list) in &module.hot.hit_lists {
-                hit_lists.entry(id).or_insert_with(|| list.clone());
-            }
-        }
+        let (tracks, patches) = owners(&modules, &[]);
+        let track_data = entry_points(&modules);
+        let hit_lists = hit_lists(&modules, &BTreeMap::new());
         let registry = registry(&modules, &[]);
         Self {
             modules,
             samples,
             patches,
+            tracks,
+            track_data,
             hit_lists,
+            station_lists: BTreeMap::new(),
             registry,
             station_patches: Vec::new(),
             cache: BTreeMap::new(),
@@ -1112,14 +1244,14 @@ impl<S: Samples> Player<S> {
     /// neighbourhood) the backyard score becomes current and starts, its
     /// cursor first set to (1000, 500) per mille, which starting resets
     /// when it was stopped; in any other mode the current ambience stops.
-    fn set_music_mode(&mut self, module: usize, mode: i64) {
+    fn set_music_mode(&mut self, mode: i64) {
         if mode != self.music_mode {
             if mode == 3 {
                 self.music_started = true;
             }
             if self.music_started {
                 let previous = std::mem::replace(&mut self.music_mode, mode);
-                self.change_music(module, mode, previous);
+                self.change_music(mode, previous);
             }
         }
         let frame = self.frame;
@@ -1183,7 +1315,7 @@ impl<S: Samples> Player<S> {
     /// its own thread around most of these starts (`Sleep`), so its
     /// sound thread runs between; here the events are acted on at once,
     /// in order, with nothing between.
-    fn change_music(&mut self, module: usize, mode: i64, previous: i64) {
+    fn change_music(&mut self, mode: i64, previous: i64) {
         use music::*;
         if mode == 3 {
             if EXPANSIONS & 1 != 0 {
@@ -1197,7 +1329,7 @@ impl<S: Samples> Player<S> {
         }
         // *(code)* Each start lets the track go (vtable +0x2c, 0x57523f).
         let start = |player: &mut Self, track: u32, list: u32| {
-            let started = player.start([list, 0, 0], module, track);
+            let started = player.start([list, 0, 0], track);
             player.let_go(&started.threads);
         };
         let switch = |player: &mut Self, list: u32| {
@@ -1291,16 +1423,37 @@ impl<S: Samples> Player<S> {
     /// Adds the stations' hit lists and patches (see
     /// [`crate::stations`]), which the original builds from directories
     /// when it starts. A hit list the sound tables already list is added
-    /// to; a patch number already taken is left alone.
+    /// to, as [`hit_lists`] says; a patch replaces a base game object of
+    /// its number, and an expansion's or a download's replaces it, as
+    /// [`owners`] says.
     pub fn add_stations(&mut self, lists: &StationLists) {
-        for (&id, list) in &lists.hit_lists {
-            self.hit_lists.entry(id).or_default().extend(list);
-        }
+        add_station_lists(&mut self.station_lists, &lists.hit_lists);
+        self.hit_lists = hit_lists(&self.modules, &self.station_lists);
         for (&id, path) in &lists.patches {
-            self.patches.entry(id).or_insert_with(|| (0, path.clone()));
             // Numbered in the order they are made, each registered then
             // (0x574f0e).
-            self.station_patches.push(id);
+            self.station_patches.push((id, path.clone()));
+        }
+        let (tracks, patches) = owners(&self.modules, &self.station_patches);
+        // An object replaced goes, with what it was doing (0x5750dc calls
+        // 0x57cdd5, which destroys it, 0x57ce04 to 0x57ce32). The original
+        // builds the stations before any sound plays; here they may come
+        // later.
+        let replaced: BTreeSet<u32> = self
+            .tracks
+            .iter()
+            .filter(|&(id, owner)| tracks.get(id) != Some(owner))
+            .map(|(&id, _)| id)
+            .chain(
+                self.patches
+                    .iter()
+                    .filter(|&(id, owner)| patches.get(id) != Some(owner))
+                    .map(|(&id, _)| id),
+            )
+            .collect();
+        (self.tracks, self.patches) = (tracks, patches);
+        for id in replaced {
+            self.destroy(id);
         }
         // The original builds the stations between the base game's
         // tables and the expansions' ([`crate::registry`]).
@@ -1376,7 +1529,7 @@ impl<S: Samples> Player<S> {
         let args = [given(0, object), given(1, 0), given(2, 0)];
         let track = track as u32;
         match kind {
-            kind::PLAY => self.play_track(module, track, args, sources),
+            kind::PLAY => self.play_track(track, args, sources),
             kind::FADE => self.fade_track(track, args),
             kind::CANCEL_NOTE => self.cancel_radio_notes(),
             kind::KILL_ALL => self.kill_all(),
@@ -1384,9 +1537,9 @@ impl<S: Samples> Player<S> {
             kind::UNPAUSE => self.unpause(),
             kind::KILL_INSTANCE => self.kill_instance(track, sources),
             kind::SET_AMBIENCE_MODE => self.set_ambience_mode(track),
-            kind::SET_MUSIC_MODE => self.set_music_mode(module, i64::from(track as i32)),
-            kind::TURN_ON_TV => self.turn_on_tv(module, track, args, sources),
-            kind::PLAY_PIANO => self.play_piano(module, args, sources),
+            kind::SET_MUSIC_MODE => self.set_music_mode(i64::from(track as i32)),
+            kind::TURN_ON_TV => self.turn_on_tv(track, args, sources),
+            kind::PLAY_PIANO => self.play_piano(args, sources),
             kind::SEQUENCE_TRACK_HIT_LIST => self.sequence(track, args[1]),
             kind::KILL_OBJECT_SOUNDS => self.kill_object_sounds(),
             kind if kind::NOTHING_FOR_SOUND.contains(&kind) => {}
@@ -1404,9 +1557,9 @@ impl<S: Samples> Player<S> {
     /// first argument of 0 starts nothing; any other is recorded as an
     /// instance of the track, and the track's `extvol` and `pan` are set
     /// from where its objects are ([`crate::placement`]).
-    fn play_track(&mut self, module: usize, track: u32, args: [u32; 3], sources: &dyn Sources) {
-        if self.owner(module, track).is_none() {
-            self.report(format!("no track {track}"));
+    fn play_track(&mut self, track: u32, args: [u32; 3], sources: &dyn Sources) {
+        if self.owner(track).is_none() {
+            self.no_track(track);
             return;
         }
         let alive = self.threads.iter().any(|t| t.track == track)
@@ -1415,15 +1568,9 @@ impl<S: Samples> Player<S> {
             self.instances.retain(|&(t, _)| t != track);
         }
         // *(code)* The argument kind is the track object's own (+0x28 on
-        // the object looked up, 0x573748 to 0x573756): a running track's
-        // is that of the module its thread came from.
-        let module = self
-            .threads
-            .iter()
-            .find(|t| t.track == track)
-            .map_or(module, |t| t.module);
-        if self.track_args(module, track) != Some(ARGS_ID_VOL_PAN) {
-            let started = self.start(args, module, track);
+        // the object looked up, 0x573748 to 0x573756).
+        if self.track_args(track) != Some(ARGS_ID_VOL_PAN) {
+            let started = self.start(args, track);
             self.let_go(&started.threads);
             return;
         }
@@ -1432,7 +1579,7 @@ impl<S: Samples> Player<S> {
         }
         self.record(track, args[0]);
         let placed = self.placed(track, sources);
-        let started = self.start(args, module, track);
+        let started = self.start(args, track);
         self.place(&started.threads, placed);
         self.let_go(&started.threads);
     }
@@ -1512,23 +1659,55 @@ impl<S: Samples> Player<S> {
         }
     }
 
-    /// The `args` field of the track a module (or the first other)
-    /// defines.
-    fn track_args(&self, module: usize, track: u32) -> Option<i64> {
-        let owner = self.owner(module, track)?;
+    /// The `args` field of a track, as the module it runs from defines
+    /// it.
+    fn track_args(&self, track: u32) -> Option<i64> {
+        let owner = self.owner(track)?;
         let owner = &self.modules[owner];
         owner.number(&owner.hot.tracks[&track].args)
     }
 
-    /// The module that defines a track: the one given, or else the first.
-    fn owner(&self, module: usize, track: u32) -> Option<usize> {
-        std::iter::once(module)
-            .chain(0..self.modules.len())
-            .find(|&m| {
-                self.modules
-                    .get(m)
-                    .is_some_and(|m| m.hot.tracks.contains_key(&track))
-            })
+    /// The module a track runs from, whichever module asks for it: the
+    /// one whose line registered it last ([`owners`]). `None` when no
+    /// module lists it.
+    fn owner(&self, track: u32) -> Option<usize> {
+        self.tracks.get(&track).copied()
+    }
+
+    /// Reports a start of a track no module lists. A patch object of that
+    /// ID is no fault: its start slot returns at once (0x57bf80).
+    fn no_track(&mut self, track: u32) {
+        if !self.patches.contains_key(&track) {
+            self.report(format!("no track {track}"));
+        }
+    }
+
+    /// Forgets everything the object of this ID was doing, as a track and
+    /// as a patch: its threads and notes, any note playing it as a patch,
+    /// and its cached samples. A note playing another patch with this one
+    /// queued plays on without it: releasing a patch releases its samples
+    /// (0x57fd25), not the voice it is queued on (0x57e09e to 0x57e0b6).
+    /// **Unverified:** whether that voice still plays it, from the path it
+    /// copied (0x57ff7e to 0x57ff9a). The manager's instance records stay
+    /// (0x57442d to 0x574473).
+    fn destroy(&mut self, id: u32) {
+        self.kill_track(id);
+        self.held.remove(&id);
+        self.idle.remove(&id);
+        self.ended.retain(|_, t| t.track != id);
+        self.track_objects.remove(&id);
+        self.last_start.remove(&id);
+        self.notes.retain(|n| n.patch != id);
+        for note in &mut self.notes {
+            note.chain.retain(|&patch| patch != id);
+        }
+        self.cache.remove(&id);
+    }
+
+    /// Whether the registry has an object of this ID (0x573312), a track
+    /// or a patch.
+    fn registered(&self, id: u32) -> bool {
+        self.tracks.contains_key(&id) || self.patches.contains_key(&id)
     }
 
     /// The newest running thread of a track, as an index.
@@ -1635,7 +1814,9 @@ impl<S: Samples> Player<S> {
     /// not exist.
     fn cancel_radio_notes(&mut self) {
         for track in RADIO_TRACKS {
-            if self.owner(0, track).is_none() {
+            // A patch object of the number is no track, but it exists
+            // (0x573a29 to 0x573a5c).
+            if !self.registered(track) {
                 return;
             }
             if let Some(at) = self.newest(track) {
@@ -1848,15 +2029,20 @@ impl<S: Samples> Player<S> {
     /// started anew is left held (the start ends by holding it, 0x57dbd6)
     /// and let go only when the sound is not paused (0x573d71), so a
     /// television turned on during a pause is silent until the unpause.
-    fn turn_on_tv(&mut self, module: usize, track: u32, args: [u32; 3], sources: &dyn Sources) {
+    fn turn_on_tv(&mut self, track: u32, args: [u32; 3], sources: &dyn Sources) {
         self.kill_instance(args[0], sources);
-        if self.owner(module, track).is_none() {
-            self.report(format!("no track {track}"));
+        if !self.registered(track) {
+            self.no_track(track);
             return;
         }
+        // The instance is recorded before the object's start (0x573d36,
+        // 0x573d5a), which for a patch object does nothing.
         self.record(track, args[0]);
+        if self.owner(track).is_none() {
+            return;
+        }
         let placed = self.placed(track, sources);
-        let started = self.start(args, module, track);
+        let started = self.start(args, track);
         if started.fresh && self.paused {
             self.held.insert(track);
         }
@@ -1878,8 +2064,13 @@ impl<S: Samples> Player<S> {
     /// before any. Last, the object's source field 5 is asked for, and
     /// [`PIANO_SKILL`] starts, when it exists, with it as its first
     /// argument.
-    fn play_piano(&mut self, module: usize, args: [u32; 3], sources: &dyn Sources) {
-        if self.owner(module, PIANO).is_none() {
+    fn play_piano(&mut self, args: [u32; 3], sources: &dyn Sources) {
+        // A patch object of the number goes on: its start does nothing
+        // (0x573e95, 0x57bf80), its object is 0x80000000 (0x573e9c calls
+        // 0x57bf4e, which reads +0xb0; the patch's constructor sets it,
+        // 0x57bf0e to 0x57bf19), and the skill track is still started
+        // (0x573ec3 to 0x573ef2).
+        if !self.registered(PIANO) {
             return;
         }
         let mut args = args;
@@ -1891,15 +2082,18 @@ impl<S: Samples> Player<S> {
             Ok(None) => {}
             Err(fault) => self.report(fault),
         }
-        let started = self.start(args, module, PIANO);
+        let started = self.start(args, PIANO);
         self.let_go(&started.threads);
-        let object = self.track_objects.get(&PIANO).copied().unwrap_or(0);
+        let object = match self.owner(PIANO) {
+            Some(_) => self.track_objects.get(&PIANO).copied().unwrap_or(0),
+            None => 0x8000_0000,
+        };
         self.instances.retain(|&(t, _)| t != PIANO);
         self.record(PIANO, object);
         // The skill is asked for before the skill track is looked up.
         let skill = sources.field(args[0] as i32, 5).unwrap_or(0);
-        if self.owner(module, PIANO_SKILL).is_some() {
-            let started = self.start([skill as u32, 0, 0], module, PIANO_SKILL);
+        if self.owner(PIANO_SKILL).is_some() {
+            let started = self.start([skill as u32, 0, 0], PIANO_SKILL);
             self.let_go(&started.threads);
         }
     }
@@ -1913,9 +2107,9 @@ impl<S: Samples> Player<S> {
     /// idle track object does, chained to the patch an earlier such event
     /// started if that still plays.
     fn sequence(&mut self, track: u32, hit_list: u32) {
-        let Some(owner) = self.owner(0, track) else {
+        if !self.registered(track) {
             return;
-        };
+        }
         let Some(list) = self.hit_lists.get(&hit_list).cloned() else {
             self.report(format!("no hit list {hit_list}"));
             return;
@@ -1923,6 +2117,13 @@ impl<S: Samples> Player<S> {
         let patch = match list.len() {
             0 => 0,
             n => list[self.random(n as u32) as usize],
+        };
+        // A patch object of the number still picks from the list. **Not
+        // ported:** its slot (0x573f2b, 0x57fcd2) can then stop the
+        // patch's playback and let go of its samples; no kind 53 event
+        // in the install names a patch.
+        let Some(owner) = self.owner(track) else {
+            return;
         };
         match self.newest(track) {
             Some(at) => {
@@ -1987,9 +2188,9 @@ impl<S: Samples> Player<S> {
     /// Not ported: when the track's group is off (manager lookup 0x57bde7,
     /// its +0xc0 is 0), the original's start returns before all of this
     /// (0x57d969 to 0x57d9a5). This player has no group that can be off.
-    fn start(&mut self, args: [u32; 3], module: usize, track: u32) -> Started {
-        let Some(module) = self.owner(module, track) else {
-            self.report(format!("no track {track}"));
+    fn start(&mut self, args: [u32; 3], track: u32) -> Started {
+        let Some(module) = self.owner(track) else {
+            self.no_track(track);
             return Started::default();
         };
         if self.held.remove(&track) {
@@ -2015,17 +2216,11 @@ impl<S: Samples> Player<S> {
                     fresh: false,
                 };
             }
-            // The track object's own descriptor (0x57db7a to 0x57db91):
-            // the module the running thread came from.
-            let module = self
-                .threads
-                .iter()
-                .find(|t| t.id == newest)
-                .map_or(module, |t| t.module);
+            // The track object's own descriptor (0x57db7a to 0x57db91).
             if !self.restart(newest, module, track) {
                 return Started::default();
             }
-            self.set_levels(newest, args, module, track);
+            self.set_levels(newest, args, track);
             return Started {
                 threads: vec![newest],
                 fresh: true,
@@ -2046,7 +2241,7 @@ impl<S: Samples> Player<S> {
         let id = thread.id;
         self.last_start.insert(track, id);
         self.threads.push(thread);
-        self.set_levels(id, args, module, track);
+        self.set_levels(id, args, track);
         Started {
             threads: vec![id],
             fresh: true,
@@ -2067,7 +2262,7 @@ impl<S: Samples> Player<S> {
     /// `isplaying` is 1. False (reported) when the track has no entry
     /// point; the thread is then left alone.
     fn restart(&mut self, id: u32, module: usize, track: u32) -> bool {
-        let Some((pc, fresh, _)) = self.template(module, track) else {
+        let Some((place, fresh, _)) = self.template(module, track) else {
             return false;
         };
         // A track has one thread; its notes, and those of its scripts
@@ -2082,8 +2277,8 @@ impl<S: Samples> Player<S> {
                 let bank = usize::from(first)..=usize::from(last);
                 thread.registers[bank.clone()].copy_from_slice(&fresh[bank]);
             }
-            thread.pc = pc;
-            thread.loop_point = pc;
+            (thread.module, thread.pc) = place;
+            thread.loop_point = place;
             thread.hit_list.clear();
             thread.last_note = 0;
             thread.wake = now;
@@ -2095,7 +2290,7 @@ impl<S: Samples> Player<S> {
     }
 
     /// The levels a fresh start sets on thread `id` (see below).
-    fn set_levels(&mut self, id: u32, args: [u32; 3], module: usize, track: u32) {
+    fn set_levels(&mut self, id: u32, args: [u32; 3], track: u32) {
         // *(code)* A fresh start sets the levels from the arguments as the
         // track's `args` field says (0x57db01): `kArgsVolPan` has `extvol`
         // and `pan` in the first two, `kArgsIdVolPan` in the last two
@@ -2103,7 +2298,7 @@ impl<S: Samples> Player<S> {
         // never started, as kind 53 plays on, keeps its defaults.)
         // A `kArgsIdVolPan` start also makes the object the track
         // object's own (vtable +0x20).
-        let levels = match self.track_args(module, track) {
+        let levels = match self.track_args(track) {
             Some(ARGS_VOL_PAN) => Some((args[0], args[1])),
             Some(ARGS_ID_VOL_PAN) => {
                 self.track_objects.insert(track, args[0]);
@@ -2184,16 +2379,16 @@ impl<S: Samples> Player<S> {
     /// 16 from the run before ([`Player::restart`]); a new thread here
     /// starts them at 0 (but for the arguments).
     fn thread(&mut self, args: [u32; 3], module: usize, track: u32) -> Option<Thread> {
-        let (pc, registers, group) = self.template(module, track)?;
+        let (place, registers, group) = self.template(module, track)?;
         let id = self.id();
         let mut thread = Thread {
             id,
-            module,
+            module: place.0,
             track,
-            pc,
+            pc: place.1,
             registers,
             stack: Vec::new(),
-            loop_point: pc,
+            loop_point: place,
             kept: 0,
             hit_list: Vec::new(),
             last_note: 0,
@@ -2214,14 +2409,19 @@ impl<S: Samples> Player<S> {
     }
 
     /// A track's entry point, starting registers and group, or `None`
-    /// (reported) when it has no entry point.
+    /// (reported) when it has no entry point. `module` is the track's
+    /// own: its descriptor names the entry point's track data ID, which
+    /// may lead into another module's program ([`entry_points`]).
     fn template(
         &mut self,
         module: usize,
         track: u32,
-    ) -> Option<(u32, [i32; GLOBALS as usize], i64)> {
+    ) -> Option<(Place, [i32; GLOBALS as usize], i64)> {
         let owner = &self.modules[module];
-        let Some(pc) = owner.entry(track).and_then(|entry| owner.address(entry)) else {
+        let Some(pc) = owner
+            .entry(track)
+            .and_then(|entry| self.track_data.get(&entry).copied())
+        else {
             self.report(format!("track {track}: entry point not found"));
             return None;
         };
@@ -2503,26 +2703,27 @@ impl<S: Samples> Player<S> {
                 return true;
             }
             *budget -= 1;
-            let module = &self.modules[thread.module];
-            let instruction = match module.program.decode(thread.pc, &|id| module.is_target(id)) {
+            let program = &self.modules[thread.module].program;
+            let track_data = &self.track_data;
+            let instruction = match program.decode(thread.pc, &|id| track_data.contains_key(&id)) {
                 Ok(instruction) => instruction,
                 Err(error) => return self.fault(thread, &error.to_string()),
             };
             let next = thread.pc + instruction.length;
             match self.execute(thread, &instruction, next, sources) {
                 Ok(Flow::Next) => thread.pc = next,
-                Ok(Flow::Jump(pc)) => thread.pc = pc,
+                Ok(Flow::Jump(place)) => (thread.module, thread.pc) = place,
                 Ok(Flow::Block) => return true,
                 Ok(Flow::Yield) => {
                     thread.pc = next;
                     return true;
                 }
-                Ok(Flow::JumpYield(pc)) => {
-                    thread.pc = pc;
+                Ok(Flow::JumpYield(place)) => {
+                    (thread.module, thread.pc) = place;
                     return true;
                 }
                 Ok(Flow::End) => match thread.stack.pop() {
-                    Some(pc) => thread.pc = pc,
+                    Some(place) => (thread.module, thread.pc) = place,
                     None => return false,
                 },
                 Ok(Flow::Kill) => {
@@ -2707,9 +2908,12 @@ impl<S: Samples> Player<S> {
         }
     }
 
-    fn target(&self, thread: &Thread, id: u32) -> Result<u32, String> {
-        self.modules[thread.module]
-            .address(id)
+    /// Where a track data ID leads, whichever module's program is
+    /// running ([`entry_points`]).
+    fn target(&self, id: u32) -> Result<Place, String> {
+        self.track_data
+            .get(&id)
+            .copied()
             .ok_or_else(|| format!("no track data {id:#x}"))
     }
 
@@ -2738,8 +2942,13 @@ impl<S: Samples> Player<S> {
                 }
                 None => {
                     // Not cached: any number may name a missing patch,
-                    // so caching them would grow without bound.
-                    self.report(format!("no patch {patch}"));
+                    // so caching them would grow without bound. (A track
+                    // object fails too, 0x57f703.)
+                    if self.tracks.contains_key(&patch) {
+                        self.report(format!("patch {patch} is a track"));
+                    } else {
+                        self.report(format!("no patch {patch}"));
+                    }
                     return false;
                 }
             };
@@ -2785,7 +2994,7 @@ impl<S: Samples> Player<S> {
         let kept = thread.kept;
         let branch = |taken: bool| -> Result<Flow, String> {
             if taken {
-                Ok(Flow::Jump(self.target(thread, arg(0) as u32)?))
+                Ok(Flow::Jump(self.target(arg(0) as u32)?))
             } else {
                 Ok(Flow::Next)
             }
@@ -2831,8 +3040,8 @@ impl<S: Samples> Player<S> {
                 if thread.stack.len() >= CALL_DEPTH {
                     return Err(format!("calls nested deeper than {CALL_DEPTH}"));
                 }
-                thread.stack.push(next);
-                Flow::Jump(self.target(thread, arg(0) as u32)?)
+                thread.stack.push((thread.module, next));
+                Flow::Jump(self.target(arg(0) as u32)?)
             }
             "return" | "end" => Flow::End,
             "wait" => {
@@ -2852,7 +3061,7 @@ impl<S: Samples> Player<S> {
                     Operand::Register => self.read(thread, arg(0)) as u32,
                     _ => arg(0) as u32,
                 };
-                Flow::Jump(self.target(thread, id)?)
+                Flow::Jump(self.target(id)?)
             }
             "test" => {
                 thread.kept = i64::from(self.read(thread, arg(0)));
@@ -2885,7 +3094,7 @@ impl<S: Samples> Player<S> {
                 Flow::Next
             }
             "set_loop" => {
-                thread.loop_point = next;
+                thread.loop_point = (thread.module, next);
                 Flow::Next
             }
             "loop" => Flow::JumpYield(thread.loop_point),
@@ -2920,7 +3129,7 @@ impl<S: Samples> Player<S> {
                 if own && let Some(stored) = self.threads.iter_mut().find(|t| t.id == thread.id) {
                     *stored = thread.clone();
                 }
-                let started = self.start(args, thread.module, track);
+                let started = self.start(args, track);
                 self.let_go(&started.threads);
                 if own && let Some(stored) = self.threads.iter().find(|t| t.id == thread.id) {
                     *thread = stored.clone();
@@ -2943,7 +3152,7 @@ impl<S: Samples> Player<S> {
                 // Started anew, it runs from the top, from the next block
                 // (the original goes on in the same update).
                 if own && started.fresh {
-                    return Ok(Flow::JumpYield(thread.pc));
+                    return Ok(Flow::JumpYield((thread.module, thread.pc)));
                 }
                 Flow::Next
             }
