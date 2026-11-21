@@ -229,7 +229,7 @@ events, and what it asks for after them) come first.
   (`goth-snack-bob-20261120`) replays in the window (#290). It agrees
   in the compared words at updates 1–800 except for Bella's local at
   203–227 and Mortimer's word 50 at 644–800. A listing after update
-  643 sets that word (0x452382); which object was listed remains
+  643, under a still pointer, sets that word (0x452382); which object was listed remains
   unverified (trial listings of the bob or the salesman close it).
   New open item (#290): the window chooses a pie entry at the press,
   the original at the release, so a press on an entry followed by a
@@ -2632,7 +2632,8 @@ stop-sounds events.
   their bucket, and the map grows from 193 buckets through the prime
   table (0x5813bd, 0x5823a5). With the install, 21,809 table IDs and
   366 station patches give 24,593 buckets. The unpause walks by ID
-  modulo 24,593, then by chain order (0x57cd56). **Unverified:** the order of the
+  modulo the current bucket count (24,593 with this install), then by
+  chain order (0x57cd56). **Unverified:** the order of the
   files within one directory, and of the download directories (here,
   by name); the station patch numbers (the original takes descending
   256-ID batches from 0x400000ff).
@@ -3071,8 +3072,9 @@ through their public interfaces only; the simulation never depends on it.
     a check tree's fault keeps its trap (`Trap::CheckTree`, and
     `Trap::Within` through other work), and `sims-game` reads
     `Trap::unported()` rather than parsing the text. In play mode,
-    `StepError::Tick` hands back caught errors, sounds and the frame
-    before the first tick if it was skipped. Each `SkippedFrame`
+    `StepError::Tick` carries in its `update` field (None in strict
+    mode) the caught errors, the sounds and, if the frame before the
+    first tick was skipped, its `SkippedFrame` error. Each `SkippedFrame`
     records the tick it follows, with 0 for the frame before the first
     tick. `StepError::Asking` still rolls back the tick. Strict-mode
     results are unchanged.
