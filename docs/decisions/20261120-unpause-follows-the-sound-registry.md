@@ -12,27 +12,42 @@ follows the original's registry of patch and track objects.
   `hash_map` at manager +0x80, keyed by ID (0x57cdd5):
   - every `[Patch]` and `[Track]` line of a HOT file registers one, as
     the HOT reader reads it (0x57b33b and 0x57b676, the handlers named
-    "Patch" and "Track" at 0x57affb and 0x57b02c);
-  - so does every station patch, when the stations are built after the
-    sound tables (0x574f0e);
+    "Patch" and "Track" at 0x57affb and 0x57b02c). Both skip ID 0
+    (0x57b377, 0x57b6b2);
+  - so does every station patch (0x574f0e);
   - an ID registered again replaces the object in its node, which keeps
-    its place.
-- The map starts with 193 buckets. Before each insert it grows for one
+    its place. That path does not insert, so the map does not grow for
+    it (0x57cdf8 to 0x57ce32).
+- The order of registration at startup (0x41437f):
+  1. the base game's tables, in `SoundData` (0x5715fa);
+  2. the station patches (from 0x57183b);
+  3. the expansions' tables, from `ExpansionPack\`, then the `sound\`
+     directories of `ExpansionPack2` to `ExpansionPack4`, `Deluxe`,
+     `ExpansionPack5` to `ExpansionPack7` and `ExpansionShared`
+     (0x414392 to 0x414458);
+  4. the downloaded objects' tables (0x414477).
+- The map starts with 193 buckets. Before each new ID it grows for one
   more entry (0x5813bd calls 0x5823a5). When that is more than the
   bucket count, the count becomes the first prime of the table at
   0x666474 not below it.
 - A new node goes at the head of its bucket, the ID modulo the bucket
   count. Growing takes each old bucket in turn and its nodes from the
-  head, and puts each at the head of its new bucket.
+  head, and puts each at the head of its new bucket, so a chain is not
+  simply newest first.
 - The unpause walks the map bucket by bucket, each from its head
   (0x57cd56, 0x5807c2, 0x576be5), and lets each object go.
+- The map is cleared only when the sound is torn down (0x57ca76, also
+  reached by kind 104) and destroyed (0x57c712), not on a lot load.
 
 ## What changes here
 
 - `sims_audio::registry::Registry` replays those inserts. `Hot` keeps
-  the IDs of its `[Patch]` and `[Track]` lines in file order. The player
-  registers each module's in turn, then the station patches as
-  `Player::add_stations` adds them.
+  the IDs of its `[Patch]` and `[Track]` lines in file order, but for
+  ID 0.
+- The player registers the modules directly in `SoundData`, then the
+  station patches when `Player::add_stations` adds them, then the
+  expansions' modules by directory (`Registry::rank`), then the others.
+  Its own module order, which picks events and patches, is unchanged.
 - The install registers 21,809 IDs from the tables and 366 station
   patches: 24,593 buckets. Tracks run up to 114,390, so the order is not
   their numbers.
@@ -41,10 +56,12 @@ follows the original's registry of patch and track objects.
 
 ## Unverified
 
-- **Unverified:** the order the original loads its modules in. Here it
-  is `Module::load_all`'s, by name. It only matters for tracks that
-  share a bucket, and for the three IDs both a patch and a track use.
-- **Unverified:** that the original's station patch numbers stay clear
-  of the tables' IDs. Here they count up from `stations::FIRST_ID`. The
-  count alone sets the bucket count, and 22,175 is below the next
-  growth.
+- **Unverified:** the order the original takes the files of one
+  directory in, and the downloads' directories in. Here they go by name.
+  It only matters for tracks that share a bucket, and for the three IDs
+  both a patch and a track use.
+- **Unverified:** the original numbers station patches from 256-ID
+  batches starting at 0x400000ff (0x57d386); here they count up from
+  `stations::FIRST_ID`, shared with their sub lists. Only how many there
+  are, and when, moves the tracks: both number ranges stay clear of the
+  tables' IDs.

@@ -2,11 +2,24 @@
 //!
 //! *(code)* The sound manager keeps every patch and track object in one
 //! hash map at manager +0x80, keyed by ID (0x57cdd5). Each `[Patch]` and
-//! `[Track]` line of a module's HOT file registers one (0x57b33b and
-//! 0x57b676, the handlers the HOT reader calls for those sections at
-//! 0x57affb and 0x57b02c). So does each station patch, when the stations
-//! are built after the sound tables (0x574f0e). An ID registered again
-//! replaces the object in its node, which stays where it was.
+//! `[Track]` line of a module's HOT file with an ID other than 0
+//! registers one, as the HOT reader reads it (0x57b33b and 0x57b676, the
+//! handlers it calls for those sections, named at 0x57affb and 0x57b02c;
+//! both skip ID 0, 0x57b377 and 0x57b6b2). So does each station patch
+//! (0x574f0e). An ID registered again replaces the object in its node,
+//! which stays where it was.
+//!
+//! The order of registration, at startup (0x41437f):
+//! 1. the base game's tables, in `SoundData` (0x5715fa);
+//! 2. the station patches (from 0x57183b);
+//! 3. each expansion's tables, from directories in this order (0x414392
+//!    to 0x414458): see [`EXPANSION_DIRECTORIES`];
+//! 4. the tables of downloaded objects (0x414477).
+//!
+//! [`Registry::rank`] gives a module's place in that order. Within a
+//! directory, and among the downloads, the original takes the files in
+//! the order the file system lists them, which is **unverified**; here
+//! they go by name.
 //!
 //! The map is the SGI `hash_map` the original was built with:
 //! - It starts with 193 buckets (0x57c3ff, 0x580a08).
@@ -15,13 +28,35 @@
 //!   the bucket count: to the first of [`PRIMES`] (0x666474) not below it
 //!   (0x402a88).
 //! - A new node goes at the head of its bucket, the ID modulo the bucket
-//!   count.
+//!   count. An ID already there keeps its node, and the map does not
+//!   grow for it (0x57cdf8 to 0x57ce32).
 //! - Growing takes the old buckets in order and each one's nodes from the
 //!   head, and puts each at the head of its new bucket (0x582423 to
 //!   0x582456).
 //!
 //! The unpause walks the map bucket by bucket, each from its head
-//! (0x57cd56, 0x5807c2, 0x576be5). That is [`Registry::order`].
+//! (0x57cd56, 0x5807c2, 0x576be5). That is [`Registry::order`]. A chain
+//! is not simply newest first: growing turns the nodes that stay
+//! together around.
+
+/// The directories the original loads expansion tables from after the
+/// stations, in order (0x414392 to 0x414458), as module name prefixes
+/// (lowercased, as [`crate::module::Module::name`] is).
+pub const EXPANSION_DIRECTORIES: [&str; 9] = [
+    "expansionpack\\",
+    "expansionpack2\\sound\\",
+    "expansionpack3\\sound\\",
+    "expansionpack4\\sound\\",
+    "deluxe\\sound\\",
+    "expansionpack5\\sound\\",
+    "expansionpack6\\sound\\",
+    "expansionpack7\\sound\\",
+    "expansionshared\\sound\\",
+];
+
+/// The directory of the base game's tables, registered before the
+/// stations (0x5715fa).
+pub const BASE_DIRECTORY: &str = "sounddata\\";
 
 /// The bucket counts the map grows through (0x666474).
 pub const PRIMES: [u32; 28] = [
@@ -74,6 +109,26 @@ impl Default for Registry {
 }
 
 impl Registry {
+    /// Where a module's IDs come in the original's order of
+    /// registration: 0 for the base game's, which come before the
+    /// stations; then 1 to 9 for [`EXPANSION_DIRECTORIES`]; then 10 for
+    /// any other (the downloads). A module counts as in a directory when
+    /// its file is directly in it.
+    pub fn rank(module: &str) -> usize {
+        let directly_in = |directory: &str| {
+            module
+                .strip_prefix(directory)
+                .is_some_and(|rest| !rest.contains('\\'))
+        };
+        if directly_in(BASE_DIRECTORY) {
+            return 0;
+        }
+        EXPANSION_DIRECTORIES
+            .iter()
+            .position(|d| directly_in(d))
+            .map_or(EXPANSION_DIRECTORIES.len() + 1, |at| at + 1)
+    }
+
     /// An empty registry of [`FIRST_BUCKETS`] buckets.
     pub fn new() -> Self {
         Self {
@@ -82,19 +137,30 @@ impl Registry {
         }
     }
 
-    /// Registers an ID. An ID already registered keeps its place.
+    /// Registers an ID. An ID already registered keeps its place, and
+    /// the map does not grow for it: 0x57cdd5 looks the ID up first
+    /// (0x57cdf8) and only inserts, growing, when it is not there
+    /// (0x57ce4a).
     pub fn insert(&mut self, id: u32) {
+        if self.contains(id) {
+            return;
+        }
         self.grow(self.nodes.len() + 1);
         let bucket = self.bucket(id);
-        let mut node = self.heads[bucket];
+        self.nodes.push((id, self.heads[bucket]));
+        self.heads[bucket] = Some(self.nodes.len() - 1);
+    }
+
+    /// Whether an ID is registered (0x4c93ac).
+    pub fn contains(&self, id: u32) -> bool {
+        let mut node = self.heads[self.bucket(id)];
         while let Some(at) = node {
             if self.nodes[at].0 == id {
-                return;
+                return true;
             }
             node = self.nodes[at].1;
         }
-        self.nodes.push((id, self.heads[bucket]));
-        self.heads[bucket] = Some(self.nodes.len() - 1);
+        false
     }
 
     /// How many IDs are registered.
@@ -178,6 +244,38 @@ mod tests {
         }
         assert_eq!(registry.len(), 2);
         assert_eq!(registry.order().collect::<Vec<_>>(), [198, 5]);
+    }
+
+    #[test]
+    fn an_id_registered_again_at_capacity_does_not_grow_the_map() {
+        let mut registry = Registry::new();
+        // 5 and 75,082 share bucket 5 of 193 and of 389; 193 IDs fill
+        // the map to its bucket count.
+        registry.insert(5);
+        registry.insert(75_082);
+        for id in 6..=196 {
+            registry.insert(id);
+        }
+        assert_eq!((registry.len(), registry.buckets()), (193, 193));
+        registry.insert(5);
+        assert_eq!((registry.len(), registry.buckets()), (193, 193));
+        let order: Vec<u32> = registry
+            .order()
+            .filter(|&id| id == 5 || id == 75_082)
+            .collect();
+        assert_eq!(order, [75_082, 5]);
+    }
+
+    #[test]
+    fn modules_rank_by_their_directory() {
+        assert_eq!(Registry::rank("sounddata\\simssound"), 0);
+        assert_eq!(Registry::rank("expansionpack\\xpack"), 1);
+        assert_eq!(Registry::rank("deluxe\\sound\\any"), 5);
+        assert_eq!(Registry::rank("expansionshared\\sound\\hotdate"), 9);
+        assert_eq!(Registry::rank("downloads\\moose\\moose"), 10);
+        // Only files directly in a directory belong to it.
+        assert_eq!(Registry::rank("expansionpack\\sound\\deeper"), 10);
+        assert_eq!(Registry::rank("test"), 10);
     }
 
     #[test]
