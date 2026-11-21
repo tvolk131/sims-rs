@@ -569,7 +569,9 @@ impl Game {
         self.drawn_us = self.clock_us;
         let milliseconds = (self.clock_us / 1000) as u32;
         self.people.set_clock(milliseconds);
-        self.people.draw(world, &self.view.camera, &mut self.canvas);
+        let viewport = self.house_viewport_size();
+        self.people
+            .draw_in_viewport(world, &self.view.camera, viewport, &mut self.canvas);
         // Who the pick notes: the people as drawn, before a bench they sit
         // on draws over them.
         self.people_ids.take(&self.canvas);
@@ -1187,6 +1189,16 @@ impl Game {
         ]
     }
 
+    /// The active 3D house viewport size (`0x49ae5e`, `0x4f4b43`, `0x4d363b`,
+    /// `0x53b2eb` → `0x4b136b` → `0x49b0bf` → `0x5cf1b6`): full canvas
+    /// `(width, height)` while the bottom strip is closed, and
+    /// `(width, height - STRIP)` (`height - 150 + 50` from the shared
+    /// 150-pixel panel container at `0x4f4b43`) while the strip is open in
+    /// Live, Build, Buy, or Options mode.
+    fn house_viewport_size(&self) -> (u32, u32) {
+        viewport_for_controls(self.view.size, &self.hud.controls)
+    }
+
     /// Whether `position` lies on the active lot's rotated tile bounds
     /// (`0x4a7af0`: rotated fine position shifted right by 4, checked
     /// against `lot + 0x70..+0x7c`).
@@ -1687,6 +1699,21 @@ fn sync_speed_after_step(
     true
 }
 
+/// The active 3D house viewport size (`0x49ae5e`, `0x4f4b43`, `0x4d363b`,
+/// `0x53b2eb` → `0x4b136b` → `0x49b0bf` → `0x5cf1b6`): full canvas when the
+/// bottom strip is closed, and `height - STRIP` (`height - 150 + 50` from the
+/// shared 150-pixel panel container at `0x4f4b43`) when the strip is open in
+/// Live, Build, Buy, or Options mode.
+fn viewport_for_controls(size: [i32; 2], controls: &sims_ui::hud::Controls) -> (u32, u32) {
+    let [w, h] = size.map(|n| n.max(1));
+    let strip = if controls.expanded {
+        sims_ui::hud::STRIP
+    } else {
+        0
+    };
+    (w as u32, (h - strip).max(1) as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2020,5 +2047,31 @@ mod tests {
         assert_eq!(pace.due(1_000, NORMAL), 0);
         assert_eq!(pace.due(40_999, NORMAL), 0);
         assert_eq!(pace.due(1, NORMAL), 1);
+    }
+
+    #[test]
+    fn house_viewport_size_follows_the_control_panel_strip() {
+        use sims_ui::command::Mode;
+        use sims_ui::hud::Controls;
+
+        let mut controls = Controls::default();
+        assert!(!controls.expanded);
+        assert_eq!(viewport_for_controls([800, 600], &controls), (800, 600));
+
+        controls.expanded = true;
+        controls.mode = Mode::Live;
+        assert_eq!(viewport_for_controls([800, 600], &controls), (800, 500));
+
+        controls.mode = Mode::Build;
+        assert_eq!(viewport_for_controls([800, 600], &controls), (800, 500));
+
+        controls.mode = Mode::Options;
+        assert_eq!(viewport_for_controls([800, 600], &controls), (800, 500));
+
+        controls.mode = Mode::Buy;
+        assert_eq!(viewport_for_controls([800, 600], &controls), (800, 500));
+
+        // Short windows clamp to at least 1 pixel rather than wrapping.
+        assert_eq!(viewport_for_controls([800, 80], &controls), (800, 1));
     }
 }

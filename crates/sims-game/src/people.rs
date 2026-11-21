@@ -132,7 +132,23 @@ impl People {
     /// same camera, each pixel naming the person drawn in it. The objects
     /// that hold a person go in after (`sims_render::draw_held`).
     pub fn draw(&mut self, world: &World, camera: &Camera, canvas: &mut Canvas) {
-        let drawn = self.people.draw_on_lot(world, camera, canvas);
+        let viewport = (canvas.width as u32, canvas.height as u32);
+        self.draw_in_viewport(world, camera, viewport, canvas);
+    }
+
+    /// Like [`People::draw`], passing the active 3D house `viewport` size
+    /// (`0x49ae5e`, `0x4d363b`, `0x53b2eb` → `0x4b136b` → `0x49b0bf`) for
+    /// the house camera's eye (`sims_people::lot::View::eye`).
+    pub fn draw_in_viewport(
+        &mut self,
+        world: &World,
+        camera: &Camera,
+        viewport: (u32, u32),
+        canvas: &mut Canvas,
+    ) {
+        let drawn = self
+            .people
+            .draw_on_lot_in_viewport(world, camera, viewport, canvas);
         self.note(drawn.problems);
     }
 

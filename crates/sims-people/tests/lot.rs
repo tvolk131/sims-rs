@@ -716,7 +716,16 @@ fn the_lamps_of_a_persons_room_light_them() {
         .map(|(&id, _)| id)
         .collect();
     assert_eq!(lit, [71, 194]);
-    let lamps = sims_people::lot::lamps(world, 1, at(21));
+    let camera = LotCamera {
+        zoom: Zoom::Medium,
+        rotation: 0,
+        level: 1,
+        origin: [335, -560],
+        walls: Walls::Cutaway,
+        focus: Default::default(),
+    };
+    let eye = sims_people::lot::View::new(&camera).eye((800, 600));
+    let lamps = sims_people::lot::lamps(world, 1, at(21), eye);
     // The farther lamp's tile is listed twice in room 4, so it lights
     // twice.
     assert_eq!(lamps.len(), 3, "{lamps:?}");
@@ -726,26 +735,20 @@ fn the_lamps_of_a_persons_room_light_them() {
         "{lamps:?}"
     );
     assert_eq!(lamps[1], lamps[2]);
-    // From the lamp's side: towards larger fine y, which is the drawing
-    // frame's smaller x, and from above.
+    // Direct3D 6's `D3DLIGHT_PARALLELPOINT` computes the parallel light
+    // direction from the view-space origin (the house camera's eye) towards
+    // the lamp's `dvPosition`, which at rotation 0 points away from the
+    // viewer (+x, -y, +z in our drawing frame).
     assert!(
-        lamps[0].towards.x < -0.5 && lamps[0].towards.y > 0.0,
+        lamps[0].towards.x > 0.5 && lamps[0].towards.y < 0.0 && lamps[0].towards.z > 0.5,
         "{lamps:?}"
     );
     assert_ne!(room(16), 4);
-    assert!(sims_people::lot::lamps(world, 1, at(16)).is_empty());
+    assert!(sims_people::lot::lamps(world, 1, at(16), eye).is_empty());
     // And the drawing takes them: with both lamps off, Mortimer is drawn
     // darker, and nobody else changes.
     let mut people = People::open(&root, &house).unwrap();
     assert_eq!(people.update(world), Vec::<String>::new());
-    let camera = LotCamera {
-        zoom: Zoom::Medium,
-        rotation: 0,
-        level: 1,
-        origin: [335, -560],
-        walls: Walls::Cutaway,
-        focus: Default::default(),
-    };
     let base = sims_render::Canvas::new(800, 600, [0, 0, 0]);
     let mut draw = |world: &World| {
         let mut canvas = base.clone();
@@ -758,7 +761,7 @@ fn the_lamps_of_a_persons_room_light_them() {
     for lamp in [71, 194] {
         dark.objects.get_mut(&lamp).unwrap().data[16] = 0;
     }
-    assert!(sims_people::lot::lamps(&dark, 1, at(21)).is_empty());
+    assert!(sims_people::lot::lamps(&dark, 1, at(21), eye).is_empty());
     let unlit = draw(&dark);
     let changed: Vec<usize> = (0..lit.color.len())
         .filter(|&i| lit.color[i] != unlit.color[i])
