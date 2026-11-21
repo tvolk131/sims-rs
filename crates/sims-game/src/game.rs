@@ -1914,18 +1914,19 @@ impl Game {
         let Some(mut cursor) = self.buy_cursor.take() else {
             return false;
         };
+        // Native `0x485b4c` → `0x485bda`: ALWAYS recheck the cursor's previous
+        // on-lot position BEFORE checking the drag threshold (so ordinary
+        // hovers, short drags, and long drags all run the `LEAVING`/`PLACED`
+        // pass at the previous position and snap onto any restored surface).
+        if cursor.position[0] >= 0
+            && let Err(e) = self.lot.buy_recheck(&mut cursor)
+        {
+            self.note = Some(format!("Could not recheck Buy placement: {e}"));
+        }
         let rotated = if let Some(anchor) = self.buy_dragging {
             let dx = point[0] - anchor[0];
             let dy = point[1] - anchor[1];
             if dx * dx + dy * dy > 36 {
-                // Native `0x485bda`: re-evaluate placement directly at the
-                // saved tile FIRST (without gating on Tile Cursor fit) so a
-                // restored surface snaps the held item and updates its
-                // container/facing BEFORE `0x485da9` compares `current`
-                // against `desired`.
-                if let Err(e) = self.lot.buy_recheck(&mut cursor) {
-                    self.note = Some(format!("Could not recheck Buy placement: {e}"));
-                }
                 // Native `0x485d5d..0x485dad`: `iVar6 = dy`, `iVar8 = dx`.
                 // Upper-left -> 6, upper-right -> 4, lower-left -> 0,
                 // lower-right -> 2. Compare `desired` against post-`0x485bda`
@@ -1954,18 +1955,10 @@ impl Game {
                         self.note = Some(format!("The object was not rotated: {e}"));
                     }
                 }
-                // Native `0x485e59` → `0x485e72`: run the final Tile-Cursor-
-                // gated placement pass at the saved tile, including when the
-                // facing was unchanged.
-                let post_facing = self
-                    .lot
-                    .world()
-                    .objects
-                    .get(&cursor.held)
-                    .and_then(|o| o.data.get(1).copied())
-                    .unwrap_or(0)
-                    .rem_euclid(8);
-                if let Err(e) = self.lot.buy_rotate(&mut cursor, post_facing) {
+                // Native `0x485e59` → `0x485e72`: test Tile Cursor fit on the
+                // existing preview in place (without an extra TakeOff) and
+                // place if it fits, including when the facing was unchanged.
+                if let Err(e) = self.lot.buy_put_if_fits(&mut cursor) {
                     self.note = Some(format!("Could not finalize Buy placement: {e}"));
                 }
                 true

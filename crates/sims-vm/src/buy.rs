@@ -219,8 +219,7 @@ impl Interpreter<'_> {
         }
         let held = self.create(world, guid)?;
         let cursor = self.create_tile_cursor(world, held)?;
-        self.rotate_held_to(world, cursor, held, direction)?;
-        Ok(Some(BuyCursor {
+        let mut out = BuyCursor {
             cursor,
             held,
             guid,
@@ -231,7 +230,9 @@ impl Interpreter<'_> {
             valid: false,
             position: [-16, -16, level],
             container: None,
-        }))
+        };
+        self.buy_rotate(world, &mut out, direction)?;
+        Ok(Some(out))
     }
 
     /// Moves a Buy Mode cursor and its held object to the tile containing
@@ -314,11 +315,13 @@ impl Interpreter<'_> {
         Ok(false)
     }
 
-    /// Tries placing `cursor.held` (and `cursor.cursor`) at `[at, level]`.
-    /// Callers must verify `self.fits(world, cursor.cursor, at, level)` first
-    /// (`0x485ced`, `0x485f2f`, `0x422752`). Returns `Ok(true)` if the held
-    /// object fit and was placed (setting `cursor.valid` based on
-    /// affordability).
+    /// Tries placing `cursor.held` (and `cursor.cursor`) at `[at, level]`
+    /// (`0x421e72` → `0x422050`). Callers on the cursor-gated paths
+    /// (`0x485ced`, `0x485f2f`, `0x422752`, `0x485e59`) check
+    /// `self.fits(world, cursor.cursor, at, level)` first, while `buy_recheck`
+    /// (`0x485bda`) calls `0x421e72` directly without a prior fit check.
+    /// Returns `Ok(true)` if the held object fit and was placed (setting
+    /// `cursor.valid` based on affordability).
     fn try_place_buy_at(
         &self,
         world: &mut World,
@@ -436,36 +439,100 @@ impl Interpreter<'_> {
         Ok(any_pool && any_non_pool)
     }
 
-    /// Rotates the held object to `direction` (`0x4226bc` → `0x421be4`) and
-    /// re-evaluates placement at its saved coordinates without running
-    /// pointer-move wall auto-rotation (`0x48736b`). When the object is
-    /// already snapped to a surface container slot at that tile, retains that
-    /// container without re-running automatic surface-facing alignment
-    /// (`0x422050` line `0x422078`). If the requested facing does not fit,
-    /// leaves the held object off the lot at that facing with `cursor.valid =
-    /// false`.
+    /// Rotates the held object to `direction` (`0x4226bc` → `0x421be4`),
+    /// stepping one `DATA_TURN_STEP` at a time: takes the preview off-lot once
+    /// at `0x42271d`, then for each step invokes `0x421be4(1)` (off-lot
+    /// `TakeOff(1)` at `0x421bff`, one turn step, and in-place fit+placement
+    /// check at `0x421db6`), and finishes with the in-place `0x422752`
+    /// fit+placement check at the saved coordinates without running
+    /// pointer-move wall auto-rotation (`0x48736b`). When already snapped to a
+    /// surface container slot at that tile, retains that container without
+    /// re-running automatic surface-facing alignment (`0x422050` line
+    /// `0x422078`).
     pub fn buy_rotate(
         &self,
         world: &mut World,
         cursor: &mut BuyCursor,
         direction: i16,
     ) -> Result<bool, Fault> {
+        let target = direction.rem_euclid(8);
+        let (mut current, step) = world
+            .objects
+            .get(&cursor.held)
+            .map(|o| {
+                (
+                    o.data.get(DATA_FACING).copied().unwrap_or(0).rem_euclid(8),
+                    o.data.get(DATA_TURN_STEP).copied().unwrap_or(0),
+                )
+            })
+            .unwrap_or((0, 0));
+        if current == target || step <= 0 || (target - current).rem_euclid(8) % step != 0 {
+            return Ok(cursor.valid);
+        }
         let [x, y, level] = cursor.position;
         let retained = cursor.container;
-        self.remove_cursor_and_held(world, cursor)?;
-        self.rotate_held_to(world, cursor.cursor, cursor.held, direction)?;
+        // Native `0x42271d`: take the cursor and held object off-lot once
+        // before stepping through `0x421be4(1)`.
+        self.take_off_cursor_and_held_unconditional(world, cursor)?;
         cursor.valid = false;
         cursor.container = None;
-        if !on_lot([x, y]) || !inside_placement_bounds(world, [x, y]) {
-            return Ok(false);
-        }
-        // Native `0x422752`: gate manual rotation re-placement (including
-        // unsnapped overlap callbacks at `0x42276d` → `0x421e72` → `0x4355b5`)
-        // on `"Tile Cursor"` fitting at `[x, y, level]` first.
-        if !self.fits(world, cursor.cursor, [x, y], level)? {
+        for _ in 0..8 {
+            if current == target {
+                break;
+            }
+            // Native `0x422737` → `0x421be4(1)`: per-step take-off (`0x421bff`),
+            // one rotation step, and per-step fit+placement check (`0x421db6`).
+            self.take_off_cursor_and_held_unconditional(world, cursor)?;
+            let next_dir = (current + step).rem_euclid(8);
+            self.rotate_held_to(world, cursor.cursor, cursor.held, next_dir)?;
             cursor.position = [x, y, level];
+            self.put_if_cursor_fits(world, cursor, retained)?;
+            current = world
+                .objects
+                .get(&cursor.held)
+                .and_then(|o| o.data.get(DATA_FACING).copied())
+                .unwrap_or(0)
+                .rem_euclid(8);
+        }
+        // Native `0x422752` → `0x42276d`: final in-place Tile Cursor fit check
+        // and placement at saved coordinates (without an extra TakeOff).
+        cursor.position = [x, y, level];
+        let final_retained = cursor.container.or(retained);
+        self.put_if_cursor_fits(world, cursor, final_retained)
+    }
+
+    /// Native `0x421db6` / `0x422752` / `0x485e59`: tests `Tile Cursor` fit in
+    /// place (without taking the preview off-lot first) and, if it fits, calls
+    /// `0x421e72` (`try_place_buy_at`, falling back to `"Tile Cursor"` alone
+    /// at the saved coordinates).
+    pub fn buy_put_if_fits(
+        &self,
+        world: &mut World,
+        cursor: &mut BuyCursor,
+    ) -> Result<bool, Fault> {
+        let retained = cursor.container;
+        self.put_if_cursor_fits(world, cursor, retained)
+    }
+
+    fn put_if_cursor_fits(
+        &self,
+        world: &mut World,
+        cursor: &mut BuyCursor,
+        retained: Option<(u16, i16)>,
+    ) -> Result<bool, Fault> {
+        let [x, y, level] = cursor.position;
+        if !on_lot([x, y]) || !inside_placement_bounds(world, [x, y]) {
+            cursor.valid = false;
+            cursor.container = None;
             return Ok(false);
         }
+        if !self.fits(world, cursor.cursor, [x, y], level)? {
+            cursor.valid = false;
+            cursor.container = None;
+            return Ok(false);
+        }
+        cursor.valid = false;
+        cursor.container = None;
         if self.try_place_buy_at(world, cursor, [x, y], level, retained)? {
             return Ok(cursor.valid);
         }
@@ -485,17 +552,18 @@ impl Interpreter<'_> {
 
     /// Re-evaluates Buy Mode placement directly at the cursor's saved
     /// coordinates without gating on `"Tile Cursor"` fitting first
-    /// (`0x485bda` → `0x421e72`), retaining any existing surface container
+    /// (`0x485bda` → `0x421e72`), taking an on-lot preview off-lot first
+    /// (`0x485b4c` → `0x421963`) and retaining any existing surface container
     /// (`0x422050` line `0x422078`).
     pub fn buy_recheck(&self, world: &mut World, cursor: &mut BuyCursor) -> Result<bool, Fault> {
         let [x, y, level] = cursor.position;
+        if !on_lot([x, y]) || !inside_placement_bounds(world, [x, y]) {
+            return Ok(false);
+        }
         let retained = cursor.container;
         self.remove_cursor_and_held(world, cursor)?;
         cursor.valid = false;
         cursor.container = None;
-        if !on_lot([x, y]) || !inside_placement_bounds(world, [x, y]) {
-            return Ok(false);
-        }
         if self.try_place_buy_at(world, cursor, [x, y], level, retained)? {
             return Ok(cursor.valid);
         }
@@ -840,10 +908,10 @@ impl Interpreter<'_> {
         Ok(())
     }
 
-    /// Rotates `held` toward `target_dir` in steps of its `DATA_TURN_STEP`
-    /// (`0x4226bc` → `0x421be4`), updating multipart offsets on both `held`
-    /// and `cursor` when multi-tile while leaving `cursor`'s own `data[1]`
-    /// unchanged (matching `0x421be4` when `param_1[0x6b] != 0`).
+    /// Rotates `held` toward `target_dir` in steps of its `DATA_TURN_STEP`,
+    /// updating multipart offsets on both `held` and `cursor` when multi-tile
+    /// while leaving `cursor`'s own `data[1]` unchanged (matching `0x421be4`
+    /// when `param_1[0x6b] != 0`).
     fn rotate_held_to(
         &self,
         world: &mut World,
@@ -856,24 +924,13 @@ impl Interpreter<'_> {
             at: None,
             trap,
         };
-        let (current, is_group) = {
-            let h = world
-                .objects
-                .get(&held)
-                .ok_or_else(|| fail(held, Trap::native(10, "missing held object")))?;
-            (
-                h.data.get(DATA_FACING).copied().unwrap_or(0).rem_euclid(8),
-                h.multipart.is_some(),
-            )
-        };
-        let target = target_dir.rem_euclid(8);
-        if current != target {
-            // Native `0x42271d` / `0x421bff` invokes `TakeOff(1)` (`0x433148`,
-            // running OBJf 10 `LEAVING`) on `held` before turning even while
-            // off-lot.
-            self.take_off(world, held, true)?;
-        }
-        self.rotate_object_to(world, held, target)?;
+        let is_group = world
+            .objects
+            .get(&held)
+            .ok_or_else(|| fail(held, Trap::native(10, "missing held object")))?
+            .multipart
+            .is_some();
+        self.rotate_object_to(world, held, target_dir)?;
         if is_group {
             let parts = self.parts(world, held).map_err(|t| fail(held, t))?;
             // Sync cursor parts' offsets from held parts (`0x42238d`).
@@ -894,6 +951,23 @@ impl Interpreter<'_> {
                     cm.offset = offset;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Invokes `TakeOff(1)` (`0x421963` → `0x433148`, running OBJf 10
+    /// `LEAVING`) unconditionally on `cursor` and `held`, even while off-lot
+    /// (`0x42271d`, `0x421bff`).
+    fn take_off_cursor_and_held_unconditional(
+        &self,
+        world: &mut World,
+        cursor: &BuyCursor,
+    ) -> Result<(), Fault> {
+        if world.objects.contains_key(&cursor.cursor) {
+            self.take_off(world, cursor.cursor, true)?;
+        }
+        if world.objects.contains_key(&cursor.held) {
+            self.take_off(world, cursor.held, true)?;
         }
         Ok(())
     }

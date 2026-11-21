@@ -1547,6 +1547,27 @@ impl Lot {
         Ok(valid)
     }
 
+    /// Checks `Tile Cursor` fit in place and, if it fits, places at the saved
+    /// coordinates without an extra take-off (`0x485e59` → `0x485e72`).
+    pub fn buy_put_if_fits(&mut self, cursor: &mut BuyCursor) -> Result<bool, OrderError> {
+        self.ready()?;
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let mut next = cursor.clone();
+        let valid = interpreter
+            .buy_put_if_fits(&mut world, &mut next)
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        *cursor = next;
+        Ok(valid)
+    }
+
     /// Commits a valid Buy Mode placement (`0x486ada` → `0x421a0e`, `0x46d91c`):
     /// deletes the `"Tile Cursor"`, places the held object permanently, runs
     /// OBJf function 11 (`USER_PLACEMENT`), deducts its price from household
@@ -1663,10 +1684,10 @@ impl Lot {
     /// `0xed` → `0x493338` → `0x48bdfe`): reuses the detached registered
     /// instance (`0x48c07b..0x48c082`), runs `USER_PICKUP` (`0x48bfcb`),
     /// places it, runs `USER_PLACEMENT`, re-deducts its price, and pushes it
-    /// back onto the undo stack. Returns `Ok(false)` when nothing can be
-    /// redone (clearing the redo stack and deleting detached redo instances if
-    /// the top record could not be applied or errored, matching `0x493338` →
-    /// `0x4933a9` → `0x48c20e`).
+    /// back onto the undo stack. When placement is refused (`Ok(false)`),
+    /// transfers the refused record to Undo while preserving remaining Redo
+    /// entries (`0x48be72` → `0x493353`); on a VM fault (`Err`), clears the
+    /// redo stack and deletes detached redo instances (`0x4933a9` → `0x48c20e`).
     pub fn buy_redo(&mut self) -> Result<bool, OrderError> {
         self.ready()?;
         let Some(mut purchase) = self.buy_redo.pop() else {
