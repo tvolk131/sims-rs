@@ -214,9 +214,15 @@ impl Interpreter<'_> {
             {
                 self.program
                     .people
-                    .skeletons
-                    .values()
-                    .find(|s| s.name == name)
+                    .skeletons_by_name
+                    .get(name)
+                    .or_else(|| {
+                        self.program
+                            .people
+                            .skeletons
+                            .values()
+                            .find(|s| s.name == name)
+                    })
                     .ok_or_else(|| {
                         fail(
                             0,

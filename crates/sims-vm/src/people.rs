@@ -236,10 +236,10 @@ pub(crate) fn skeleton<'p>(
     };
     let skeleton = people.skeletons.get(&template).ok_or_else(none)?;
     match made.and_then(|made| made.strings.get(&characters::SKELETON)) {
-        Some(name) if !name.eq_ignore_ascii_case(&skeleton.name) => people
-            .skeletons
-            .values()
-            .find(|s| s.name.eq_ignore_ascii_case(name))
+        Some(name) if name != &skeleton.name => people
+            .skeletons_by_name
+            .get(name)
+            .or_else(|| people.skeletons.values().find(|s| s.name == *name))
             .ok_or_else(|| {
                 Trap::Unsupported(format!(
                     "no person type's skeleton is named {name:?}, which the made person type \

@@ -79,6 +79,11 @@ pub struct Profile {
 pub struct People {
     /// Each person type's skeleton, by the type's GUID.
     pub skeletons: BTreeMap<u32, Skeleton>,
+    /// Every skeleton registered in the avatar registry, keyed byte-for-byte
+    /// by skeleton name (`0x5a0384`, `0x5a280f`), so runtime-made or
+    /// loader-reordered skeleton names resolve even when no catalog person
+    /// referenced them directly.
+    pub skeletons_by_name: BTreeMap<String, Skeleton>,
     /// Each person type's body string 0 (skeleton name, `STR#` word 19 row 0),
     /// kept even when the `.bcf` skeleton itself is unavailable (for the early
     /// pet guard at `0x440d63`).
@@ -503,6 +508,20 @@ impl AvatarRegistry {
         let skeleton = self.skeleton(name)?;
         Ok(skeleton.scales[skeleton.place].clone())
     }
+
+    /// Resolves every skeleton currently registered in the avatar registry
+    /// (both eagerly loaded `.bcf` skeletons and `.ndx`-indexed catalogs that
+    /// resolve cleanly), keyed byte-for-byte by skeleton name (`0x5a280f`).
+    pub fn all_skeletons(&mut self) -> BTreeMap<String, Skeleton> {
+        let names: Vec<String> = self.skeletons.keys().cloned().collect();
+        let mut out = BTreeMap::new();
+        for name in names {
+            if let Ok(skeleton) = self.skeleton(&name) {
+                out.insert(name, skeleton);
+            }
+        }
+        out
+    }
 }
 
 impl People {
@@ -612,6 +631,7 @@ impl People {
                 Err(error) => return Err(error),
             }
         }
+        let skeletons_by_name = registry.all_skeletons();
         profiles.retain(|guid, _| !unresolved.contains_key(guid));
         let mut portrait_head = BTreeMap::new();
         for (guid, suits) in default_suits {
@@ -627,6 +647,7 @@ impl People {
         Ok((
             Self {
                 skeletons,
+                skeletons_by_name,
                 skeleton_names: names,
                 profiles,
                 suits: registry.suits,
@@ -687,8 +708,72 @@ fn loaded_english_rows(entries: &[sims_formats::strings::TextEntry]) -> Vec<Stri
     loaded
 }
 
+/// Decodes a body `STR#` chunk as the native body loader (`0x587b65` →
+/// `0x46feac(0, 1)`) does:
+/// - uses [`StringTable::parse_chunk`] with `flags` (honoring flag `0x10` for
+///   little-endian length-prefixed tables at `0x4700d7`–`0x47014c`);
+/// - applies the length-prefixed `0xa1 -> 'o'` / `0xd5 -> '\''` byte mapping
+///   (`0x4700f5`–`0x47010f`);
+/// - orders version `-3` US-English entries with later runs inserted first
+///   (`0x470002`–`0x470049`);
+/// - when a version `-3` table has entries (`count > 0`) and none matched US
+///   English (`0x46fae6 == 0`), runs the native byte-by-byte English rescan
+///   (`0x47006b`–`0x4700d0`).
+fn decode_body_string_table(data: &[u8], flags: u16, label: &str) -> Result<Vec<String>> {
+    let parsed = StringTable::parse_chunk(data, flags).map_err(|e| Error::format(label, e))?;
+    if parsed.format == sims_formats::strings::Format::MacResource {
+        return Ok(parsed
+            .entries
+            .iter()
+            .map(|entry| {
+                let mapped: Vec<u8> = entry
+                    .raw_text
+                    .iter()
+                    .map(|&b| match b {
+                        0xa1 => b'o',
+                        0xd5 => b'\'',
+                        _ => b,
+                    })
+                    .collect();
+                decode(&mapped, 1)
+            })
+            .collect());
+    }
+    let mut loaded = loaded_english_rows(&parsed.entries);
+    if parsed.format == sims_formats::strings::Format::Localized
+        && loaded.is_empty()
+        && !parsed.entries.is_empty()
+    {
+        let mut pos = 4usize;
+        for _ in 0..parsed.entries.len() {
+            let Some(&b) = data.get(pos) else {
+                return Err(Error::Unsupported(format!(
+                    "{label}: English rescan (0x47006b..0x4700d0) reads past chunk end"
+                )));
+            };
+            pos += 1;
+            if b == 1 {
+                let Some(end1) = data[pos..].iter().position(|&c| c == 0) else {
+                    return Err(Error::Unsupported(format!(
+                        "{label}: unterminated string in English rescan (0x4700a3)"
+                    )));
+                };
+                loaded.push(decode(&data[pos..pos + end1], 1));
+                pos += end1 + 1;
+                let Some(end2) = data[pos..].iter().position(|&c| c == 0) else {
+                    return Err(Error::Unsupported(format!(
+                        "{label}: unterminated comment in English rescan (0x4700bf)"
+                    )));
+                };
+                pos += end2 + 1;
+            }
+        }
+    }
+    Ok(loaded)
+}
+
 /// The body strings of the person definition `chunk` of a character
-/// file, in the native loader's US-English order (`0x470002`–`0x470049`).
+/// file, decoded as `0x587b65` → `0x46feac(0, 1)`.
 fn body_strings(index: &Index, resource: &Resource, chunk: u16) -> Result<Vec<String>> {
     let location = resource.location(&index.root);
     let iff = Iff::parse(resource.read()?).map_err(|e| Error::format(&location, e))?;
@@ -704,9 +789,11 @@ fn body_strings(index: &Index, resource: &Resource, chunk: u16) -> Result<Vec<St
     let strings = iff
         .get(b"STR#", table)
         .ok_or_else(|| missing("the person's body strings are missing"))?;
-    let parsed = StringTable::parse(iff.data(strings))
-        .map_err(|e| Error::format(&format!("{location} STR# #{table}"), e))?;
-    Ok(loaded_english_rows(&parsed.entries))
+    decode_body_string_table(
+        iff.data(strings),
+        iff.resource_flags(strings),
+        &format!("{location} STR# #{table}"),
+    )
 }
 
 /// The skin tone names of a semi-global file: its string table 8192.
@@ -1442,5 +1529,38 @@ xskin-b001-PELVIS-BODY\r\n\
             entry(1, "human-custom"),
         ]);
         assert_eq!(rows, vec!["human-custom", "kat", "old_body"]);
+    }
+
+    #[test]
+    fn decode_body_string_table_supports_le_length_prefixed_and_english_rescan() {
+        // 35-row little-endian length-prefixed STR# with flag 0x10
+        // (0x4700d7..0x47014c): header `23 00` is 35 rows, not 8960.
+        let mut le_pascal = Vec::from(35u16.to_le_bytes());
+        for i in 0..35usize {
+            let s = if i == 0 {
+                "adult".to_string()
+            } else {
+                format!("row{i}")
+            };
+            le_pascal.push(s.len() as u8);
+            le_pascal.extend_from_slice(s.as_bytes());
+        }
+        let rows = decode_body_string_table(&le_pascal, 0x10, "test").unwrap();
+        assert_eq!(rows.len(), 35);
+        assert_eq!(rows[0], "adult");
+        assert_eq!(rows[34], "row34");
+
+        // Version -3 table with no US-English entries (language 3 only) whose
+        // bytes include an embedded 0x01 byte: 0x587b65 -> 0x47006b..0x4700d0
+        // rescans byte-by-byte and extracts the string following 0x01.
+        let mut rescan = Vec::new();
+        rescan.extend_from_slice(&(-3i16).to_le_bytes());
+        rescan.extend_from_slice(&2u16.to_le_bytes());
+        rescan.push(3); // non-US-English language byte
+        rescan.extend_from_slice(b"\x01adult\0\0");
+        rescan.push(3);
+        rescan.extend_from_slice(b"unused\0\0");
+        let rows = decode_body_string_table(&rescan, 0x10, "rescan").unwrap();
+        assert_eq!(rows, vec!["adult"]);
     }
 }

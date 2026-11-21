@@ -1611,6 +1611,49 @@ fn make_new_character_wardrobe_head_binding_drives_ui_effect_render_and_writebac
     assert!(fx.world.skeleton_files.contains("upper-adult.bcf"));
     assert!(!fx.world.skeleton_files.contains("lower-adult.bcf"));
 
+    // 7e2. Runtime-made character naming "adult" resolves via
+    // `people.skeletons_by_name` (`0x5a0384`/`0x5a280f`) even when only
+    // "Adult" is referenced by a catalog person in `people.skeletons`.
+    let (mut fx, _, _) = visitors();
+    fx.world.rooms.rooms.get_mut(&1).unwrap().occupied = true;
+    let base_skel = fx.program.people.skeletons[&WIDGET].clone();
+    let mut upper_adult = base_skel.clone();
+    upper_adult.name = "Adult".into();
+    upper_adult.file = "upper-adult.bcf".into();
+    let mut lower_adult = base_skel;
+    lower_adult.name = "adult".into();
+    lower_adult.file = "lower-adult.bcf".into();
+    fx.program.people.skeletons.insert(WIDGET, upper_adult);
+    fx.program
+        .people
+        .skeletons_by_name
+        .insert("adult".into(), lower_adult);
+    let made_guid = 0x5555_9999u32;
+    fx.world.characters.made.insert(
+        made_guid,
+        sims_sim::characters::Character {
+            template: WIDGET,
+            file: 99,
+            strings: [(sims_sim::characters::SKELETON, "adult".to_owned())].into(),
+        },
+    );
+    fx.world.neighbors.slots.push(Some(Neighbor {
+        guid: made_guid,
+        id: 99,
+        data: vec![12; 88],
+        relationships: Vec::new(),
+        friends: 0,
+        revision: 1,
+        stale: false,
+    }));
+    let made_rec = fx.world.neighbors.slots.len() as i16;
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, made_rec, 1),
+        Ok(true)
+    );
+    assert!(fx.world.skeleton_files.contains("lower-adult.bcf"));
+    assert!(!fx.world.skeleton_files.contains("upper-adult.bcf"));
+
     // 7f. Negative-age copy prefers loader-ordered `loaded_strings` head row
     // (`0x470049`) over physically ordered `Profile::head`: when the first run
     // had a matching HEAD suit and the later run placed a comma-past-255 row
