@@ -5402,3 +5402,32 @@ fn kind_18_writes_fade_registers_and_clears_fade_on_for_stopped_track() {
     assert_eq!(*probe.asked.borrow(), [(0, 0), (0, 19), (0, 75), (0, 0)]);
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }
+
+#[test]
+fn never_started_track_reads_zero_patch_after_kill_trk_and_stop_all() {
+    // In 1.91 (`0x57db54..0x57db67`), the HOT patch ID is loaded into live
+    // register `PATCH` (50) only on a fresh start; a never-started track
+    // reads `PATCH == 0`, including after `kill_trk` or `StopAll`.
+    let mut kill_10 = loadl(5, 10);
+    kill_10.extend([KILL_TRK, 5, END]);
+    let mut read_patch = loadl(53, 10);
+    read_patch.extend([GETSRCDATAFIELD, 6, 1, 50, END]);
+    let probe = Probe {
+        lot: on_lot(&[(8, 400)]),
+        asked: Default::default(),
+    };
+    let mut player = Player::new(
+        vec![module(&[&[END], &kill_10, &read_patch], 1)],
+        samples(),
+        1,
+    );
+    play(&mut player, "e1"); // kill_trk 10 (never started)
+    player.render(BLOCK, &probe);
+    play(&mut player, "e2"); // read track 10's PATCH -> 0
+    player.render(BLOCK, &probe);
+    player.handle(&SoundEvent::StopAll, &probe);
+    play(&mut player, "e2"); // read track 10's PATCH -> 0
+    player.render(BLOCK, &probe);
+    assert_eq!(*probe.asked.borrow(), [(0, 0), (0, 0)]);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}

@@ -2746,13 +2746,20 @@ impl<S: Samples> Player<S> {
             return None;
         };
         let fields = &owner.hot.tracks[&track];
-        let registers = self.default_registers(track);
+        let patch = owner.number(&fields.patch).unwrap_or(0) as i32;
         let group = owner.number(&fields.group).unwrap_or(0);
+        let mut registers = self.default_registers(track);
+        // *(code)* 0x57db54..0x57db67: a fresh start loads the HOT patch ID
+        // into live register `PATCH` (50); before its first start (or after
+        // any kill, 0x57dd62 → 0x57f682), `PATCH` is 0.
+        registers[usize::from(PATCH)] = patch;
         Some((pc, registers, group))
     }
 
-    /// The starting register bank of a track object (constructor defaults
-    /// plus its HOT volume, duck priority, and patch).
+    /// The starting register bank of an unstarted track object
+    /// (constructor defaults plus its HOT volume and duck priority;
+    /// live `PATCH` starts at 0 and is loaded from HOT only on a fresh
+    /// start, `0x57db54..0x57db67`).
     fn default_registers(&self, track: u32) -> [i32; GLOBALS as usize] {
         let mut registers = [0; GLOBALS as usize];
         for (register, value) in DEFAULTS {
@@ -2766,7 +2773,6 @@ impl<S: Samples> Player<S> {
             }
             registers[usize::from(DUCKPRI)] =
                 owner.number(&fields.duck_priority).unwrap_or(0) as i32;
-            registers[usize::from(PATCH)] = owner.number(&fields.patch).unwrap_or(0) as i32;
         }
         registers
     }
