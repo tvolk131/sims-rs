@@ -29,6 +29,17 @@ pub enum Trap {
     /// State the interpreter cannot make sense of, such as a frame whose
     /// code owner is not in the lot's type table.
     Invalid(String),
+    /// A check tree failed: an entry's check, run while a pie menu is
+    /// listed or an advertisement weighed, or the check Find Best Object
+    /// for Function runs (`routine` names it then). The fault keeps its
+    /// own trap, so a check that failed is told apart from one that met
+    /// something not ported ([`Trap::unported`]).
+    CheckTree {
+        routine: Option<&'static str>,
+        tree: u16,
+        object: u16,
+        fault: Box<Fault>,
+    },
 }
 
 impl Trap {
@@ -41,6 +52,20 @@ impl Trap {
         match self {
             Self::Native { code, .. } => Some(*code),
             _ => None,
+        }
+    }
+
+    /// Whether this is something the simulation has not ported (a scope,
+    /// a primitive, or anything else it reports as unsupported), rather
+    /// than a failure of the script or a wrong caller. A check tree's
+    /// fault is what its own trap is.
+    pub fn unported(&self) -> bool {
+        match self {
+            Self::UnsupportedScope { .. } | Self::Unimplemented { .. } | Self::Unsupported(_) => {
+                true
+            }
+            Self::CheckTree { fault, .. } => fault.trap.unported(),
+            _ => false,
         }
     }
 }
@@ -68,6 +93,17 @@ impl fmt::Display for Trap {
             }
             Self::Unsupported(message) => write!(f, "unsupported: {message}"),
             Self::Invalid(message) => f.write_str(message),
+            Self::CheckTree {
+                routine,
+                tree,
+                object,
+                fault,
+            } => {
+                if let Some(routine) = routine {
+                    write!(f, "{routine}: ")?;
+                }
+                write!(f, "check tree {tree:#06x} of object {object}: {fault}")
+            }
         }
     }
 }
@@ -107,10 +143,11 @@ impl Fault {
     /// such as another object's callback: the trap itself when the fault
     /// names only `me` and no frame, and otherwise one that keeps the
     /// object, tree and node the fault happened at. An unsupported trap
-    /// stays unsupported; any other becomes invalid state with the whole
-    /// fault as its message.
+    /// stays unsupported, and a check tree's fault stays one (it names
+    /// where the check failed); any other becomes invalid state with the
+    /// whole fault as its message.
     pub(crate) fn nested(self, me: u16) -> Trap {
-        if self.object == me && self.at.is_none() {
+        if (self.object == me && self.at.is_none()) || matches!(self.trap, Trap::CheckTree { .. }) {
             return self.trap;
         }
         let mut place = format!("object {}", self.object);

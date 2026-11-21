@@ -1088,6 +1088,37 @@ fn play_mode_catches_a_fault_in_the_rest_of_a_persons_tick() {
     assert!(error.fault.to_string().contains("0x4a69aa"));
 }
 
+/// An update that fails after play mode caught an object's error still
+/// hands back the error caught ([`sims_vm::Interpreter::lot_update_kept`]):
+/// here the lamp's error is caught, and then a dialog no one answers stops
+/// the update at its end.
+#[test]
+fn a_play_update_that_fails_keeps_the_errors_caught_before() {
+    let mut fx = returning_lamp();
+    fx.world.dialogs.records.push(Dialog {
+        caller: SIM,
+        operands: dialog(1, 0),
+        status: 0,
+    });
+    let mut play = Play::default();
+    let tuning = tuning();
+    let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    let (update, result) =
+        interpreter.lot_update_kept(&mut fx.world, &tuning, &mut answers(&[]), Some(&mut play));
+    assert!(
+        matches!(result, Err(TickError::Unanswered { given: None, .. })),
+        "{result:?}"
+    );
+    assert_eq!(update.ticked, vec![LAMP]);
+    let [error] = update.errors.as_slice() else {
+        panic!("{:?}", update.errors);
+    };
+    assert_eq!(
+        (error.object, error.recovery.clone()),
+        (LAMP, Recovery::Reset)
+    );
+}
+
 /// An object deleted after play mode reset it is no longer the fresh one,
 /// so a later object given its ID is not parked for its first error.
 #[test]
