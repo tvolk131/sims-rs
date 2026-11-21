@@ -63,11 +63,14 @@ fn neighborhood_1_unleashed_renders_800x600_and_1024x768_and_hits_all_41_lots() 
     for id in 50..=80u16 {
         assert!(map.lot(id).is_some(), "Unleashed lot {id} present");
     }
-    // Goth family occupies lot 5; Old Town community lots 58, 61, 70..=75 are Community.
-    assert!(matches!(
+    // Goth family occupies lot 5 with FAMI chunk ID 5 (0x410673 / 0x4e1e73).
+    assert_eq!(
         map.lot(5).unwrap().status,
-        LotStatus::Occupied { .. }
-    ));
+        LotStatus::Occupied {
+            family_id: 5,
+            vacation_lot: None,
+        }
+    );
     assert!(matches!(
         map.lot(58).unwrap().status,
         LotStatus::Community { .. }
@@ -97,7 +100,6 @@ fn neighborhood_1_unleashed_renders_800x600_and_1024x768_and_hits_all_41_lots() 
         ..RenderOptions::default()
     });
     assert_eq!((c1024.width, c1024.height), (1024, 768));
-    // Outer frame area should be non-black (LargeBack.bmp drawn around map).
     assert!(
         c1024.color[0..1024 * 80].iter().any(|&c| c != [0, 0, 0]),
         "1024×768 outer frame should be drawn"
@@ -123,7 +125,9 @@ fn neighborhood_1_unleashed_renders_800x600_and_1024x768_and_hits_all_41_lots() 
         assert_eq!(map.hit_test([1024, 768], p1024), Some(lot.id));
         assert_eq!(c1024.id_at(p1024[0], p1024[1]), Some(lot.id));
     }
-    // Outer border outside map clip never hits a lot.
+    // Native unclipped silhouette check: at 1024×768, lot 2 has an opaque pixel
+    // at screen (914, 150) beyond the 912 map draw clip (0x5e4071..0x5e40da).
+    assert_eq!(map.hit_test([1024, 768], [914, 150]), Some(2));
     assert_eq!(map.hit_test([1024, 768], [10, 10]), None);
     assert_eq!(c1024.id_at(10, 10), None);
 }
@@ -188,6 +192,21 @@ fn hover_cutaway_highlight_and_community_filter_badges_modify_expected_pixels() 
     });
     assert_ne!(selected.color, base.color);
 
+    // Community filter (Lodging = 0x01) on Unleashed applies native blue
+    // highlight (0x54f520) to ALL Community lots (including House74 whose mask
+    // is 0x0002, not Lodging) even when no badge is drawn on House74.
+    let lodging = map.render(&RenderOptions {
+        active_filter: Some(CommunityFilter::Lodging),
+        filter_frame: 0,
+        ..RenderOptions::default()
+    });
+    let p74 = opaque_screen_point(&map, 74, [800, 600]);
+    let idx74 = p74[1] as usize * 800 + p74[0] as usize;
+    assert_ne!(
+        lodging.color[idx74], base.color[idx74],
+        "Unleashed community lot 74 must receive blue community highlight"
+    );
+
     // Community filter badge (Food = 0x02) draws over matching community lots
     // (such as Old Town lot 70) and animates across frames 0..3.
     let filtered_0 = map.render(&RenderOptions {
@@ -217,7 +236,6 @@ fn all_eight_neighborhoods_and_all_sub_neighborhood_maps_load_and_render() {
         return;
     };
 
-    // Neighborhoods 1..=8 Unleashed maps all load and render cleanly.
     for n in 1..=8u8 {
         let map = NeighborhoodMap::load(&install, n, NeighborhoodKind::Unleashed, false)
             .unwrap_or_else(|e| panic!("Neighborhood {n} failed to load: {e}"));
@@ -226,7 +244,6 @@ fn all_eight_neighborhoods_and_all_sub_neighborhood_maps_load_and_render() {
         assert_eq!((canvas.width, canvas.height), (800, 600));
     }
 
-    // All 5 other map kinds load from Neighborhood 1 with exact native lot counts.
     let cases = [
         (NeighborhoodKind::Classic, 10usize),
         (NeighborhoodKind::Downtown, 10),
@@ -250,7 +267,6 @@ fn all_eight_neighborhoods_and_all_sub_neighborhood_maps_load_and_render() {
             ..RenderOptions::default()
         });
         assert_eq!((canvas_1024.width, canvas_1024.height), (1024, 768));
-        // Spot-check first and last lot hit-testing on every sub-neighborhood.
         let first_id = map.lots.first().unwrap().id;
         let last_id = map.lots.last().unwrap().id;
         let p_first = opaque_screen_point(&map, first_id, [800, 600]);
@@ -258,6 +274,35 @@ fn all_eight_neighborhoods_and_all_sub_neighborhood_maps_load_and_render() {
         assert_eq!(canvas_800.id_at(p_first[0], p_first[1]), Some(first_id));
         assert_eq!(canvas_800.id_at(p_last[0], p_last[1]), Some(last_id));
     }
+
+    // Verify Vacation post-lot wave order (0x56baeb..0x56bbb7): at (179, 559),
+    // wave frame 4 (5414) draws over port & trees yielding 5-6-5 0x3a4d.
+    let vac = NeighborhoodMap::load(&install, 1, NeighborhoodKind::Vacation, false).unwrap();
+    let vac_c = vac.render(&RenderOptions {
+        viewport: [800, 600],
+        water_frame: Some(4),
+        ..RenderOptions::default()
+    });
+    assert_eq!(
+        sims_render::neighborhood::pack_565(vac_c.color[559 * 800 + 179]),
+        0x3a4d,
+        "Vacation wave frame 5414 should draw after port and trees"
+    );
+
+    // Verify Magic Town waves draw at y + 62 (0x542560), so top 62 rows stay
+    // identical to the no-wave render.
+    let magic = NeighborhoodMap::load(&install, 1, NeighborhoodKind::MagicTown, false).unwrap();
+    let magic_no_wave = magic.render(&RenderOptions::default());
+    let magic_wave = magic.render(&RenderOptions {
+        water_frame: Some(0),
+        ..RenderOptions::default()
+    });
+    assert_eq!(
+        &magic_no_wave.color[..62 * 800],
+        &magic_wave.color[..62 * 800],
+        "Magic Town wave offset (0, 62) must leave rows 0..62 untouched"
+    );
+    assert_ne!(magic_no_wave.color, magic_wave.color);
 
     // Non-US Unleashed backdrop loads and differs from US backdrop.
     let us = NeighborhoodMap::load(&install, 1, NeighborhoodKind::Unleashed, false).unwrap();
@@ -283,7 +328,7 @@ fn neighborhood_1_matches_live_oracle_capture_if_provided() {
         ..RenderOptions::default()
     });
     let oracle_bytes = std::fs::read(&oracle_path).expect("read SIMS_HOOD_ORACLE PNG");
-    let (ow, oh, oracle_rgb) = decode_png_rgb(&oracle_bytes);
+    let (ow, oh, oracle_rgb) = decode_png_rgb(&oracle_bytes).expect("valid oracle PNG");
     assert_eq!((ow, oh), (800, 600));
 
     let mut lot_total = 0usize;
@@ -312,6 +357,9 @@ fn neighborhood_1_matches_live_oracle_capture_if_provided() {
         100.0 * all_exact as f64 / all_total as f64,
         100.0 * lot_exact as f64 / lot_total as f64,
     );
+    // Pin the exact observed lot-pixel denominator so a dropped silhouette
+    // pixel cannot shrink the denominator and slip past the 100% check.
+    assert_eq!(lot_total, 178_134, "unexpected lot-pixel count");
     assert_eq!(
         lot_exact, lot_total,
         "lot pixel accuracy {lot_exact}/{lot_total} must be 100% exact"
@@ -322,33 +370,95 @@ fn neighborhood_1_matches_live_oracle_capture_if_provided() {
     );
 }
 
-fn decode_png_rgb(data: &[u8]) -> (usize, usize, Vec<[u8; 3]>) {
-    assert_eq!(&data[0..8], b"\x89PNG\r\n\x1a\n");
+#[test]
+fn test_png_decoder_rejects_short_and_corrupted_inputs() {
+    assert!(decode_png_rgb(&[0; 7]).is_err());
+    assert!(decode_png_rgb(b"\x89PNG\r\n\x1a\n").is_err());
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for &b in bytes {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+fn decode_png_rgb(data: &[u8]) -> Result<(usize, usize, Vec<[u8; 3]>), String> {
+    if data.len() < 8 || &data[0..8] != b"\x89PNG\r\n\x1a\n" {
+        return Err("invalid PNG signature".into());
+    }
     let mut pos = 8usize;
     let (mut w, mut h, mut color_type) = (0usize, 0usize, 0u8);
+    let mut saw_ihdr = false;
+    let mut saw_iend = false;
     let mut idat = Vec::new();
     while pos + 12 <= data.len() {
         let len = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        let end = pos
+            .checked_add(12)
+            .and_then(|n| n.checked_add(len))
+            .ok_or_else(|| "PNG chunk length overflow".to_string())?;
+        if end > data.len() {
+            return Err("truncated PNG chunk".into());
+        }
+        let tag_and_body = &data[pos + 4..pos + 8 + len];
+        let want_crc = u32::from_be_bytes(data[pos + 8 + len..end].try_into().unwrap());
+        if crc32(tag_and_body) != want_crc {
+            return Err("PNG chunk CRC mismatch".into());
+        }
         let tag = &data[pos + 4..pos + 8];
         let body = &data[pos + 8..pos + 8 + len];
-        pos += 12 + len;
+        pos = end;
         if tag == b"IHDR" {
+            if body.len() != 13 {
+                return Err("bad IHDR length".into());
+            }
             w = u32::from_be_bytes(body[0..4].try_into().unwrap()) as usize;
             h = u32::from_be_bytes(body[4..8].try_into().unwrap()) as usize;
+            let bit_depth = body[8];
             color_type = body[9];
+            if w == 0
+                || h == 0
+                || w.checked_mul(h).is_none_or(|n| n > 4096 * 4096)
+                || bit_depth != 8
+            {
+                return Err(format!("unsupported IHDR {w}×{h} depth={bit_depth}"));
+            }
+            saw_ihdr = true;
         } else if tag == b"IDAT" {
             idat.extend_from_slice(body);
         } else if tag == b"IEND" {
+            saw_iend = true;
             break;
         }
     }
-    let raw = inflate_zlib(&idat);
+    if !saw_ihdr || !saw_iend {
+        return Err("missing IHDR or IEND".into());
+    }
     let bpp = match color_type {
         2 => 3usize,
         6 => 4usize,
-        other => panic!("unsupported PNG color type {other}"),
+        other => return Err(format!("unsupported PNG color type {other}")),
     };
-    let stride = w * bpp;
+    let stride = w
+        .checked_mul(bpp)
+        .ok_or_else(|| "PNG stride overflow".to_string())?;
+    let expected_raw = h
+        .checked_mul(stride + 1)
+        .ok_or_else(|| "PNG buffer overflow".to_string())?;
+    let raw = inflate_zlib(&idat, expected_raw)?;
+    if raw.len() != expected_raw {
+        return Err(format!(
+            "inflated PNG size {} != expected {}",
+            raw.len(),
+            expected_raw
+        ));
+    }
     let mut recon = vec![0u8; h * stride];
     for y in 0..h {
         let flt = raw[y * (stride + 1)];
@@ -384,7 +494,7 @@ fn decode_png_rgb(data: &[u8]) -> (usize, usize, Vec<[u8; 3]>) {
                         c
                     }
                 }
-                other => panic!("unsupported PNG filter {other}"),
+                other => return Err(format!("unsupported PNG filter {other}")),
             };
             cur[i] = src[i].wrapping_add(pred);
         }
@@ -394,29 +504,35 @@ fn decode_png_rgb(data: &[u8]) -> (usize, usize, Vec<[u8; 3]>) {
         .chunks_exact(bpp)
         .map(|p| [p[0], p[1], p[2]])
         .collect();
-    (w, h, rgb)
+    Ok((w, h, rgb))
 }
 
-fn inflate_zlib(data: &[u8]) -> Vec<u8> {
-    // Minimal RFC 1950 + RFC 1951 inflate using python3? No, pure Rust!
-    // Wait: let's implement a tiny RFC 1951 fixed/dynamic Huffman inflater right here.
-    assert!(data.len() >= 6);
-    assert_eq!(data[0] & 0x0f, 8, "deflate method");
+fn inflate_zlib(data: &[u8], max_out: usize) -> Result<Vec<u8>, String> {
+    if data.len() < 6 || data[0] & 0x0f != 8 {
+        return Err("invalid zlib stream".into());
+    }
     let mut r = BitReader {
         bytes: &data[2..data.len() - 4],
         bit_pos: 0,
     };
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(max_out.min(1 << 20));
     loop {
-        let bfinal = r.bits(1);
-        let btype = r.bits(2);
+        let bfinal = r.bits(1)?;
+        let btype = r.bits(2)?;
         match btype {
             0 => {
                 r.align_byte();
-                let len = r.bits(16) as usize;
-                let _nlen = r.bits(16);
+                let len = r.bits(16)? as usize;
+                let _nlen = r.bits(16)?;
                 let byte_pos = r.bit_pos / 8;
-                out.extend_from_slice(&r.bytes[byte_pos..byte_pos + len]);
+                let slice = r
+                    .bytes
+                    .get(byte_pos..byte_pos + len)
+                    .ok_or_else(|| "truncated stored block".to_string())?;
+                if out.len() + slice.len() > max_out {
+                    return Err("zlib output exceeds expected PNG size".into());
+                }
+                out.extend_from_slice(slice);
                 r.bit_pos += len * 8;
             }
             1 | 2 => {
@@ -428,36 +544,38 @@ fn inflate_zlib(data: &[u8]) -> Vec<u8> {
                     ll[280..288].fill(8);
                     (Huff::build(&ll), Huff::build(&[5u8; 32]))
                 } else {
-                    let hlit = r.bits(5) as usize + 257;
-                    let hdist = r.bits(5) as usize + 1;
-                    let hclen = r.bits(4) as usize + 4;
+                    let hlit = r.bits(5)? as usize + 257;
+                    let hdist = r.bits(5)? as usize + 1;
+                    let hclen = r.bits(4)? as usize + 4;
                     let order = [
                         16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
                     ];
                     let mut cl = [0u8; 19];
                     for i in 0..hclen {
-                        cl[order[i]] = r.bits(3) as u8;
+                        cl[order[i]] = r.bits(3)? as u8;
                     }
                     let cl_tree = Huff::build(&cl);
                     let mut lengths = Vec::with_capacity(hlit + hdist);
                     while lengths.len() < hlit + hdist {
-                        let sym = cl_tree.decode(&mut r);
+                        let sym = cl_tree.decode(&mut r)?;
                         match sym {
                             0..=15 => lengths.push(sym as u8),
                             16 => {
-                                let rep = r.bits(2) as usize + 3;
-                                let prev = *lengths.last().unwrap();
+                                let rep = r.bits(2)? as usize + 3;
+                                let prev = *lengths
+                                    .last()
+                                    .ok_or_else(|| "repeat with empty lengths".to_string())?;
                                 lengths.resize(lengths.len() + rep, prev);
                             }
                             17 => {
-                                let rep = r.bits(3) as usize + 3;
+                                let rep = r.bits(3)? as usize + 3;
                                 lengths.resize(lengths.len() + rep, 0);
                             }
                             18 => {
-                                let rep = r.bits(7) as usize + 11;
+                                let rep = r.bits(7)? as usize + 11;
                                 lengths.resize(lengths.len() + rep, 0);
                             }
-                            _ => unreachable!(),
+                            _ => return Err("invalid code-length symbol".into()),
                         }
                     }
                     (
@@ -482,16 +600,28 @@ fn inflate_zlib(data: &[u8]) -> Vec<u8> {
                     11, 12, 12, 13, 13,
                 ];
                 loop {
-                    let sym = lit_tree.decode(&mut r);
+                    let sym = lit_tree.decode(&mut r)?;
                     if sym < 256 {
+                        if out.len() >= max_out {
+                            return Err("zlib output exceeds expected PNG size".into());
+                        }
                         out.push(sym as u8);
                     } else if sym == 256 {
                         break;
                     } else {
                         let li = sym - 257;
-                        let length = LEN_BASE[li] + r.bits(LEN_EX[li]) as usize;
-                        let di = dist_tree.decode(&mut r);
-                        let dist = DIST_BASE[di] + r.bits(DIST_EX[di]) as usize;
+                        if li >= LEN_BASE.len() {
+                            return Err("invalid deflate length symbol".into());
+                        }
+                        let length = LEN_BASE[li] + r.bits(LEN_EX[li])? as usize;
+                        let di = dist_tree.decode(&mut r)?;
+                        if di >= DIST_BASE.len() {
+                            return Err("invalid deflate distance symbol".into());
+                        }
+                        let dist = DIST_BASE[di] + r.bits(DIST_EX[di])? as usize;
+                        if dist == 0 || dist > out.len() || out.len() + length > max_out {
+                            return Err("invalid deflate back-reference".into());
+                        }
                         for _ in 0..length {
                             let b = out[out.len() - dist];
                             out.push(b);
@@ -499,13 +629,13 @@ fn inflate_zlib(data: &[u8]) -> Vec<u8> {
                     }
                 }
             }
-            _ => panic!("invalid deflate block type"),
+            _ => return Err("invalid deflate block type".into()),
         }
         if bfinal == 1 {
             break;
         }
     }
-    out
+    Ok(out)
 }
 
 struct BitReader<'a> {
@@ -514,15 +644,18 @@ struct BitReader<'a> {
 }
 
 impl BitReader<'_> {
-    fn bits(&mut self, n: u8) -> u32 {
+    fn bits(&mut self, n: u8) -> Result<u32, String> {
         let mut v = 0u32;
         for i in 0..n {
-            let byte = self.bytes[self.bit_pos / 8];
+            let byte = *self
+                .bytes
+                .get(self.bit_pos / 8)
+                .ok_or_else(|| "truncated deflate stream".to_string())?;
             let bit = (byte >> (self.bit_pos % 8)) & 1;
             v |= u32::from(bit) << i;
             self.bit_pos += 1;
         }
-        v
+        Ok(v)
     }
     fn align_byte(&mut self) {
         let rem = self.bit_pos % 8;
@@ -562,20 +695,24 @@ impl Huff {
         Self { counts, symbols }
     }
 
-    fn decode(&self, r: &mut BitReader<'_>) -> usize {
+    fn decode(&self, r: &mut BitReader<'_>) -> Result<usize, String> {
         let mut code = 0i32;
         let mut first = 0i32;
         let mut index = 0i32;
         for len in 1..16 {
-            code |= r.bits(1) as i32;
+            code |= r.bits(1)? as i32;
             let count = i32::from(self.counts[len]);
             if code - count < first {
-                return usize::from(self.symbols[(index + (code - first)) as usize]);
+                return self
+                    .symbols
+                    .get((index + (code - first)) as usize)
+                    .map(|&s| usize::from(s))
+                    .ok_or_else(|| "invalid Huffman symbol index".to_string());
             }
             index += count;
             first = (first + count) << 1;
             code <<= 1;
         }
-        panic!("invalid Huffman code");
+        Err("invalid Huffman code".into())
     }
 }
