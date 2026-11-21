@@ -37,6 +37,9 @@
 //!   wall trims and the road;
 //! - `frame`: every pixel not left out.
 //!
+//! A class with no pixels in a frame shows as `-` and keeps no floor; a
+//! floor kept on a class that then has no pixels fails.
+//!
 //! A pixel matches when both colours are the same in 16-bit colour (5, 6
 //! and 5 bits), which is what the original draws in.
 //!

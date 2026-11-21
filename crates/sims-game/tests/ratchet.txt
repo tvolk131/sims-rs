@@ -134,3 +134,22 @@ leave_out = 302 19 501 79 the original's pause notice, drawn for the screenshot;
 leave_out = 86 554 98 565 the panel's pause button, which blinks while paused
 leave_out = 490 0 576 106 the fountain, whose water runs
 floors = frame 97.67 surface 99.34 objects 92.87 panel 95.80
+
+[night-far-r0-cut-2153]
+about = 9:53 PM, paused. The whole lot at night; cutaway walls. Scroll (528, -16).
+tick = 27717
+zoom = far
+rotation = 0
+level = 1
+origin = 527 -16
+walls = cutaway
+paused = yes
+strip = no
+original = night-far-r0-cut-2153.ppm 38a2f43c0e0c41e118ad39e6d5e2ca4becd590d57ef09fce5622f37957b26458
+ours = 99c52a673cf955325b935660eb5b4078922cda335a9c9c0f9f1889d710622483
+leave_out = 302 19 501 79 the original's pause notice, drawn for the screenshot; ours draws none
+leave_out = 86 554 98 565 the panel's pause button, which blinks while paused
+leave_out = 442 306 458 332 the plumb bob, which spins
+leave_out = 272 228 662 442 the house: the live run had a kitchen fire that ours does not (the run, not the drawing)
+leave_out = 32 30 80 80 the tab over the lot, which shows what the run's Sim is doing
+floors = frame 88.48 surface 88.41 objects 74.18 panel 96.97
