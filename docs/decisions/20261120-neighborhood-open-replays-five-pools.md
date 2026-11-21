@@ -62,12 +62,13 @@ skeleton (0x426e8e): a tourist child's first actor is an adult. A
 second is made after the age and skeleton are set (0x426e97 via
 0x40cc2a) and copies the one the profile's age sets. A Townie makes
 only the first (0x426646, 0x4269c5). Each skeleton is looked up as
-0x5a0384 does, by its name compared byte for byte (0x5a280f), in the
-installed avatar files read record by record. These fail, and only when
-a pool person needs that skeleton:
-- a name no file defines, or two files define;
-- a name defined in another case, since whether the registry folds case
-  is not traced;
+0x5a0384 does, by its name compared byte for byte (0x5a280f;
+registration keeps the case, 0x59f163, 0x59e899, 0x59fd58), in the
+avatar files `People::load` searches, read record by record. Those files
+are not the original's search: it registers `GameData/Skins` eagerly
+and loads through `Animation.ndx`. That predates the pools and is a
+follow-up. These fail, and only when a pool person needs that skeleton:
+- a name no file defines, or two files define (the miss, 0x5a03c0);
 - a file whose skeletons do not decode;
 - a template GUID with two definitions, since the registry and the
   catalog order them differently.

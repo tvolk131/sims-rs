@@ -467,6 +467,23 @@ impl<'a, 'b> Fills<'a, 'b> {
         // Townie makes only the first (0x426646, 0x4269c5).
         let mut copies = Vec::with_capacity(pool.actors);
         for name in [template, skeleton].into_iter().take(pool.actors) {
+            // A name the registry lacks takes the miss branch (0x5a03c0);
+            // one it holds but has not loaded is loaded now (0x5a03cd).
+            let scales = match skeletons.scales.get(name) {
+                Some(Ok(scales)) => scales.as_slice(),
+                Some(Err(reason)) => {
+                    return Err(format!(
+                        "0x5a03c0: the skeleton {name:?} for User{file:05}: {reason}"
+                    )
+                    .into());
+                }
+                None => {
+                    return Err(format!(
+                        "0x5a03c0: no skeleton {name:?} looked up for User{file:05}"
+                    )
+                    .into());
+                }
+            };
             if !self.loaded_skeletons.contains(name) {
                 return Err(format!(
                     "0x5a03cd: the skeleton {name:?} for User{file:05} is not loaded yet; \
@@ -474,21 +491,7 @@ impl<'a, 'b> Fills<'a, 'b> {
                 )
                 .into());
             }
-            match skeletons.scales.get(name) {
-                Some(Ok(scales)) => copies.push(scales.as_slice()),
-                Some(Err(reason)) => {
-                    return Err(format!(
-                        "0x5a0384: the skeleton {name:?} for User{file:05}: {reason}"
-                    )
-                    .into());
-                }
-                None => {
-                    return Err(format!(
-                        "0x5a0384: no skeleton {name:?} looked up for User{file:05}"
-                    )
-                    .into());
-                }
-            }
+            copies.push(scales);
         }
         let (age, gender) = (data[field::AGE], data[field::GENDER]);
         let editor_words = match pool.done {

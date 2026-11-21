@@ -258,7 +258,8 @@ pub fn skeleton_name(index: &Index, catalog: &Catalog, guid: u32) -> Result<Stri
 
 /// The bone scales of the skeleton named `name`, looked up as 0x5a0384
 /// does: by the name as given (0x5a2099), compared byte for byte
-/// (0x5a280f). The skeletons are those of the avatar files `People::load`
+/// (0x5a280f). Registration keeps each name's case (0x59f163, 0x59e899,
+/// 0x59fd58), so `Adult` and `adult` are two skeletons. The skeletons are those of the avatar files `People::load`
 /// searches (`GameData/Animation`, then the indexed object directories),
 /// each file read record by record through its skeleton group, so a file
 /// that also holds suits or animations still counts.
@@ -266,8 +267,6 @@ pub fn skeleton_name(index: &Index, catalog: &Catalog, guid: u32) -> Result<Stri
 /// Fails, naming the files, when:
 /// - no file defines the name, or two do (the original's avatar registry,
 ///   which would choose, is not ported);
-/// - a skeleton's name differs from `name` only in case, since whether
-///   the registry folds case when it registers a skeleton is not traced;
 /// - a file's skeleton group does not decode, since it could hold the
 ///   name.
 pub fn skeleton_scales(install: &Install, index: &Index, name: &str) -> Result<Vec<i32>> {
@@ -298,12 +297,6 @@ pub fn skeleton_scales(install: &Install, index: &Index, name: &str) -> Result<V
                     .map(|b| b.wiggle.gradient_scale)
                     .collect();
                 found.push((location.clone(), scales));
-            } else if skeleton.name.eq_ignore_ascii_case(name) {
-                return Err(Error::Unsupported(format!(
-                    "0x5a280f: {location} defines the skeleton {:?}, which differs from \
-                     {name:?} only in case; whether the avatar registry folds case is not traced",
-                    skeleton.name
-                )));
             }
         }
     }
