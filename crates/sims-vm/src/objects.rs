@@ -89,7 +89,7 @@ pub(crate) struct Draws<'a> {
 }
 
 impl Draws<'_> {
-    fn next(&mut self) -> u16 {
+    pub(crate) fn next(&mut self) -> u16 {
         self.count += 1;
         self.stream.next_u15()
     }
@@ -100,7 +100,7 @@ impl Draws<'_> {
     /// bone whose wiggle scale is not 1 then has its four gradients made
     /// again at that scale: 16 more. The records are for animation, which
     /// is not modeled, so only the draws are kept.
-    fn skeleton(&mut self, scales: &[i32]) {
+    pub(crate) fn skeleton(&mut self, scales: &[i32]) {
         for &scale in scales {
             for _ in 0..if scale == 1 { 32 } else { 48 } {
                 self.next();

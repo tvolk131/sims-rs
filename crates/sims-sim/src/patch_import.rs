@@ -396,7 +396,19 @@ fn reload(neighborhood: &mut Neighborhood, registry: &[Registered]) -> Result<Ve
     for definition in registry {
         let linked = definition.resolves && first.contains_key(&definition.guid);
         if RECORDED_KINDS.contains(&definition.kind) && !linked {
-            made.push(make_record(&mut neighborhood.neighbors, definition.guid)?);
+            let record = Neighbor {
+                version: 4,
+                version_extra: None,
+                name: String::new(),
+                unknown_zero: 0,
+                person_mode: 0,
+                person_data: Vec::new(),
+                id: 0,
+                guid: definition.guid,
+                unknown_negative: -1,
+                relationships: Vec::new(),
+            };
+            made.push(allocate_record(&mut neighborhood.neighbors, record)?);
         }
     }
     Ok(made)
@@ -411,7 +423,7 @@ fn reload(neighborhood: &mut Neighborhood, registry: &[Registered]) -> Result<Ve
 /// person data stops before word 61 (a record the reload made, or one
 /// saved without person data) has it as 0, and a member's such record
 /// fails loudly.
-fn rebuild_family_words(neighborhood: &mut Neighborhood) -> Result<(), LoadError> {
+pub fn rebuild_family_words(neighborhood: &mut Neighborhood) -> Result<(), LoadError> {
     let mut family_of = BTreeMap::new();
     for (&id, family) in &neighborhood.families {
         for &guid in &family.members {
@@ -449,30 +461,27 @@ fn rebuild_family_words(neighborhood: &mut Neighborhood) -> Result<(), LoadError
     Ok(())
 }
 
-/// [`crate::neighbors::Neighbors::make_record`] on the file's records.
-fn make_record(slots: &mut Vec<Option<Neighbor>>, guid: u32) -> Result<i16, LoadError> {
-    let place = match slots.iter().rposition(Option::is_none) {
-        Some(place) => place,
-        None => {
-            slots.push(None);
-            slots.len() - 1
-        }
-    };
+/// 0x4257a5 with requested ID -1 on the file's records. Take the last
+/// empty slot or append, and give the record its slot index plus one.
+pub fn allocate_record(
+    slots: &mut Vec<Option<Neighbor>>,
+    mut record: Neighbor,
+) -> Result<i16, LoadError> {
+    let place = slots
+        .iter()
+        .rposition(Option::is_none)
+        .unwrap_or(slots.len());
     let id = i16::try_from(place + 1).map_err(|_| {
-        LoadError::Neighborhood("the neighborhood holds more records than a word counts".into())
+        LoadError::Neighborhood(
+            "0x425884: neighbor slot exceeds the positive signed ID range".into(),
+        )
     })?;
-    slots[place] = Some(Neighbor {
-        version: 4,
-        version_extra: None,
-        name: String::new(),
-        unknown_zero: 0,
-        person_mode: 0,
-        person_data: Vec::new(),
-        id,
-        guid,
-        unknown_negative: -1,
-        relationships: Vec::new(),
-    });
+    record.id = id;
+    if place == slots.len() {
+        slots.push(Some(record));
+    } else {
+        slots[place] = Some(record);
+    }
     Ok(id)
 }
 

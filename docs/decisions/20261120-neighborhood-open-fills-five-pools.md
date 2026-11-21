@@ -42,7 +42,7 @@ source here. Its notes and probes are kept outside the repository (track
 1. **A pool generator** (0x5bc82b, draws at 0x5bc882), seeded from `timeGetTime`. It picks templates, tone, body, head, names, the celebrities' rank and words, and the tourists' family make-up.
 2. **The C runtime stream.** Each person draws one GUID low word (0x4725ff). Then each of its temporary people takes a skeleton copy (1,392 draws, adult or child) and two default-trait passes (0x459a9c). Sol's replay of this schedule fits every pool person in both neighborhoods: every GUID low word and all 15 saved trait words.
 
-   | UserData2 pool | Draws |
+   | UserData2 pool in the first capture (`after-with-lot-load`) | Draws |
    |---|---:|
    | Celebrities, fans and Magic Town | 176,409 |
    | 64 draws whose caller is unknown; then the Townies | 44,096 |
@@ -71,12 +71,11 @@ The first neighborhood (UserData) holds the same five pools, already full, as it
 ## What is ported, and when
 
 - **Now (6a).** `an_imported_home_loads_from_the_originals_files_and_steps` boots UserData2's House 69 from the original's own after-import files (`20261120-ud2-house-69-boots-from-the-originals-import.md`).
-- **6b part E.** A port of the five pools in memory, after 6a. It covers the families, records, GUIDs and the C runtime schedule, fed with the recorded clock and pool-generator inputs. Its check is an equal strict-boot state against the original's after-import files. Sol estimates 735–1,250 lines.
+- **6b part E.** The five pools now run in memory. The port covers families, records, GUIDs and the C runtime schedule with recorded inputs. The strict-boot test uses the second capture (`after-run2`), which has 33 tourists. See `20261120-neighborhood-open-replays-five-pools.md` for its draw totals and comparisons.
 - **Deferred, open.** The pool people's exact files and looks: the appearance picks, the scripts' draws on the game stream, the portraits and the names. These need an instrumented recording. Sol estimates 600–1,200 more lines.
 
 **Unverified:**
 - the callback that ran the Townie and tourist pools in the recorded open, when the rebuild before them ran (a reload also resets the file counter), and the 64 C runtime draws between the Magic Town pool and the first Townie;
 - the C runtime state before the `Patch` import;
 - the game stream's draws inside the templates' scripts;
-- the pool generator's state across its reseeds;
-- the one-time wrappers' path when a family with a reserved ID already exists.
+- the pool generator's state across its reseeds.

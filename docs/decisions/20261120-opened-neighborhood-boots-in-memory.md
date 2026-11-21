@@ -24,11 +24,11 @@ and neither changes the state a lot loads:
 - removing the imported `*.FAM` files (0x429a75 to 0x429a82);
 - the portraits (BMP_ 2002 to 2007, 0x4e8c5d).
 
-The pools (`20261120-neighborhood-open-fills-five-pools.md`, 6b E) are
-not ported either, and they do change it: their families, records and
-person files enter the loaded world. They also set the neighborhood's
-option bytes, which the lot load does not read (`World::read_neighbors`
-ignores them), so the boot's hash does not check them.
+The pools follow this import
+(`20261120-neighborhood-open-replays-five-pools.md`, 6b E). Their
+families, records and person files enter the loaded world. The test
+checks the option bytes separately since `World::read_neighbors` does
+not read them.
 
 **The converted flag.** The resource writer sets a resource's flags
 word to 0x10 when it marks it converted (0x419f80), and to 0 otherwise.
@@ -80,13 +80,8 @@ It checks:
 - the five house files, byte for byte;
 - the inventories, against the original's `Neighborhood.iff`.
 
-It then takes the pools from the original:
-- families 2000, 3000 to 3009, 5000, 5500 and 6000;
-- records 322 to 444;
-- files from `User00030.iff` on;
-- the option bytes.
-
-It loads House 69 with the C runtime where the House 69 test starts it
-(`OPEN_DRAWS`, `20261120-ud2-house-69-boots-from-the-originals-import.md`)
-and checks the hash against `IMPORTED_69`, the hash the original's own
-files boot to. It skips without `SIMS_INSTALL` or `SIMS_UD2_AFTER`.
+It also checks the pool families, records 322 to 444 and the option
+bytes against the recording. It loads House 69 with the C runtime state
+the pools leave and checks the entry state and `IMPORTED_69`, the hash
+the original's own files boot to. It skips without `SIMS_INSTALL` or
+`SIMS_UD2_AFTER`.

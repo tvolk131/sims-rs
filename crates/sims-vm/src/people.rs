@@ -28,7 +28,7 @@ const RESET: usize = 3;
 const CANCELLED: usize = 4;
 
 /// Person data words.
-mod field {
+pub(crate) mod field {
     /// The ID of the person's neighborhood record.
     pub const NEIGHBOR: usize = 31;
     pub const AGE: usize = 58;

@@ -455,9 +455,9 @@ impl Lot {
     }
 
     /// [`Lot::load`] with the neighborhood already open, as opening it
-    /// left it ([`sims_sim::patch_import::open`]): its records and
-    /// families come from `neighborhood`, its people's files from its
-    /// directory's `Characters`.
+    /// left it ([`crate::neighborhood_open::open_neighborhood`]). Its
+    /// records and families come from `neighborhood` and its people's
+    /// files from that neighborhood's `Characters` directory.
     pub fn load_in(
         root: &Path,
         neighborhood: Neighborhood,
@@ -484,6 +484,35 @@ impl Lot {
         answers: &[u8],
         frames: Frames,
         crt: CrtRng,
+    ) -> Result<Self, BootError> {
+        Self::load_in_state(root, neighborhood, house, answers, frames, crt, false)
+    }
+
+    /// Continues a recorded neighborhood open with the CRT state after
+    /// the pools. The adult skeleton is warm (0x598af7), and the game
+    /// already holds the two indicators from its previous lot. Recreate
+    /// those objects for the lot state without charging their 64 draws
+    /// again (0x445e4a, 0x595d65). This start models the warm human
+    /// skeleton House 69 uses in the recorded transition.
+    pub fn load_after_pools(
+        root: &Path,
+        neighborhood: Neighborhood,
+        house: &Path,
+        answers: &[u8],
+        frames: Frames,
+        crt: CrtRng,
+    ) -> Result<Self, BootError> {
+        Self::load_in_state(root, neighborhood, house, answers, frames, crt, true)
+    }
+
+    fn load_in_state(
+        root: &Path,
+        neighborhood: Neighborhood,
+        house: &Path,
+        answers: &[u8],
+        frames: Frames,
+        crt: CrtRng,
+        after_pools: bool,
     ) -> Result<Self, BootError> {
         let install = Install::detect(root)?;
         let mut index = Index::build(&install)?;
@@ -550,6 +579,16 @@ impl Lot {
             world
                 .skeleton_files
                 .extend(crate::objects::read_before_the_first_load(&program.people));
+            if after_pools {
+                world.skeleton_files.extend(
+                    program
+                        .people
+                        .skeletons
+                        .values()
+                        .filter(|skeleton| skeleton.name.eq_ignore_ascii_case("adult"))
+                        .map(|skeleton| skeleton.file.clone()),
+                );
+            }
             world.read_neighbors(
                 &neighborhood,
                 &sims_sim::neighbors::registry(&index, &catalog),
@@ -559,7 +598,13 @@ impl Lot {
             if let Some(saved) = &neighborhood.type_attributes {
                 world.read_type_attributes(saved);
             }
+            let before_indicators = world.crt_rng;
             interpreter.create_indicators(&mut world)?;
+            if after_pools {
+                // The factory called above builds both graphics roots
+                // (0x595d65); that happened before the recorded start.
+                world.crt_rng = before_indicators;
+            }
             // The load steps, in the original's order.
             world.read_simulator(&file.simulator);
             // With the simulator state, the house file's model gives the

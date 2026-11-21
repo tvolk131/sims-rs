@@ -1,32 +1,36 @@
-//! Opening a neighborhood before one of its lots loads: house 0's reload
-//! and the import of its `Patch` families
-//! ([`sims_sim::patch_import::open`]), with the files the import writes.
+//! Opening a neighborhood before one of its lots loads. House 0's
+//! reload and the `Patch` import ([`sims_sim::patch_import::open`])
+//! precede the five houseless pools.
 //!
 //! **What is written.** The original writes into the neighborhood's own
 //! folder. Each made person type becomes `Characters/User%05d.iff`
 //! (0x4722b8, then the import's resource edits and the outfit refresh,
 //! 0x4293ae to 0x4295f7). A housed family's `*.FAM` file, with its GUID
 //! table (Gtab #1) rewritten in place (pairs appended at 0x429754, the
-//! write from 0x4297f7), becomes its `HouseNN.iff`. Here those files go into `output`, which the caller
-//! makes as a copy of the neighborhood; the neighborhood's own folder is
-//! not touched.
+//! write from 0x4297f7), becomes its `HouseNN.iff`. Here those files and
+//! the recorded pool characters go into `output`, the caller's copy
+//! of the neighborhood.
 //!
 //! **Not ported:**
 //! - the save of `Neighborhood.iff` (0x4252cc), so the opened neighborhood
 //!   is returned in memory, for [`crate::boot::Lot::load_in`];
 //! - removing the imported `*.FAM` files (0x429a75 to 0x429a82);
-//! - the portraits (BMP_ 2002 to 2007, 0x4e8c5d);
-//! - the pools the open fills after the import
-//!   (`docs/decisions/20261120-neighborhood-open-fills-five-pools.md`).
+//! - the portraits (BMP_ 2002 to 2007, 0x4e8c5d).
+
+mod pools;
+
+pub use pools::{LotTransition, OpenedPools, PoolInput, PoolPerson};
 
 use crate::boot::BootError;
 use sims_content::family_import::{clone_character, refresh_outfits};
 use sims_content::{Catalog, ImportWardrobe, Index, Install, Neighborhood};
+use sims_core::CrtRng;
 use sims_formats::family_file::FamilyFile;
 use sims_formats::iff::{Iff, write};
 use sims_formats::iff_write::{ChunkWrite, write_chunk_with_residue};
 use sims_sim::neighbors::registry;
-use sims_sim::patch_import::{Context, Opened, Patch, open, pending};
+use sims_sim::patch_import::{self, Context, Patch, open, pending};
+use std::io::Write;
 use std::path::Path;
 
 /// The context the import runs in: the complete collection's
@@ -42,11 +46,22 @@ const CONVERTED: u16 = 0x10;
 /// captured file gives them. A longer run fails, naming the address.
 static ZEROS: [u8; 4096] = [0; 4096];
 
+/// The Patch imports and the pool conversions performed by this open.
+#[derive(Debug)]
+pub struct Opened {
+    pub patch: patch_import::Opened,
+    pub pools: OpenedPools,
+}
+
 /// Opens the neighborhood at `directory` of the install at `root`, as the
-/// original does before its view first shows, and writes the files the
-/// import makes into `output` (its `Characters` and `Houses` folders,
-/// which must exist). `new_guid` gives each made type's GUID, in the order
-/// the original draws them (0x4725ff).
+/// original does before its view first shows and, if `pools.transition`
+/// is supplied, before entering a lot. Writes new characters and houses
+/// into `output` (its `Characters` and `Houses` folders must exist).
+/// `new_guid` supplies the Patch import's GUIDs in draw order (0x4725ff).
+/// `crt` starts at the first pool boundary, after any draws made by the
+/// original's startup, navigation and Patch import. The open advances
+/// it through the pools. The caller supplies their recorded inputs
+/// explicitly, including which files to write.
 ///
 /// The in-place write of a house's GUID table leaves some bytes as the
 /// original's heap held them ([`sims_formats::iff_write`]). `captured`
@@ -58,6 +73,8 @@ pub fn open_neighborhood(
     output: &Path,
     new_guid: &mut dyn FnMut() -> u32,
     captured: &dyn Fn(u32) -> Option<Vec<u8>>,
+    pools: &PoolInput,
+    crt: &mut CrtRng,
 ) -> Result<(Neighborhood, Opened), BootError> {
     let install = Install::detect(root)?;
     let mut neighborhood = Neighborhood::open(directory)?;
@@ -112,13 +129,42 @@ pub fn open_neighborhood(
             file: FamilyFile::parse(&bytes)?,
         });
     }
-    let opened = open(&mut neighborhood, &patches, &context, new_guid)?;
-
-    if opened.imports.is_empty() {
-        neighborhood.directory = output.to_path_buf();
-        return Ok((neighborhood, opened));
+    let patch = open(&mut neighborhood, &patches, &context, new_guid)?;
+    let mut pool_crt = *crt;
+    let filled = pools::fill(&mut neighborhood, &context, &patch, pools, &mut pool_crt)?;
+    write_imports(
+        &install, &index, &catalog, &patches, &patch, output, captured,
+    )?;
+    for (number, iff) in filled.files {
+        let path = output.join(format!("Characters/User{number:05}.iff"));
+        std::fs::File::create_new(&path)
+            .and_then(|mut file| file.write_all(&iff.bytes))
+            .map_err(|error| format!("0x4722b8: {}: {error}", path.display()))?;
     }
-    let wardrobe = ImportWardrobe::load(&install)?;
+    neighborhood.directory = output.to_path_buf();
+    *crt = pool_crt;
+    Ok((
+        neighborhood,
+        Opened {
+            patch,
+            pools: filled.report,
+        },
+    ))
+}
+
+fn write_imports(
+    install: &Install,
+    index: &Index,
+    catalog: &Catalog,
+    patches: &[Patch],
+    opened: &patch_import::Opened,
+    output: &Path,
+    captured: &dyn Fn(u32) -> Option<Vec<u8>>,
+) -> Result<(), BootError> {
+    if opened.imports.is_empty() {
+        return Ok(());
+    }
+    let wardrobe = ImportWardrobe::load(install)?;
     for (name, import) in &opened.imports {
         let patch = patches
             .iter()
@@ -164,6 +210,5 @@ pub fn open_neighborhood(
             std::fs::write(&path, bytes).map_err(|error| format!("{}: {error}", path.display()))?;
         }
     }
-    neighborhood.directory = output.to_path_buf();
-    Ok((neighborhood, opened))
+    Ok(())
 }

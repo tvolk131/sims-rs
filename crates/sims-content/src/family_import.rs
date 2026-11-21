@@ -189,9 +189,8 @@ pub fn import(
         check_template(input, template)?;
         let [name, description] = character_text(file, member, id, options.language)?
             .map(|text| decode(&text, options.language));
-        let number = reserve_file(&mut next_file, &mut character_files)?;
+        let number = reserve_character_file(&mut next_file, &mut character_files)?;
         let guid = new_guid();
-        next_file = (number + 1) % FILE_LIMIT;
         if guid == 0
             || input.catalog.object(guid).is_some()
             || made.contains_key(&guid)
@@ -706,24 +705,30 @@ fn check_template(input: &ImportInput<'_>, guid: u32) -> Result<()> {
     Ok(())
 }
 
-fn reserve_file(next_file: &mut i32, files: &mut BTreeSet<i32>) -> Result<i32> {
-    if *next_file < 0 {
+/// Tries the neighborhood's file counter (+0x160), advancing on every
+/// attempt. An occupied file (0x4722b8 returning -0x2b) retries without
+/// cloning an OBJD or drawing its GUID. The attempt at 31999 resets the
+/// counter to zero and ends the loop, even if the file was occupied.
+pub fn reserve_character_file(next_file: &mut i32, files: &mut BTreeSet<i32>) -> Result<i32> {
+    if !(0..FILE_LIMIT).contains(next_file) {
         return Err(unsupported(
             "0x4261a2",
-            "negative character file counter is not ported",
+            "character file counter outside 0..32000 is not ported",
         ));
     }
-    while *next_file < FILE_LIMIT {
+    loop {
         let candidate = *next_file;
+        *next_file = (candidate + 1) % FILE_LIMIT;
         if files.insert(candidate) {
             return Ok(candidate);
         }
-        *next_file += 1;
+        if *next_file == 0 {
+            return Err(unsupported(
+                "0x4262c0",
+                "no character file number available before the counter wraps",
+            ));
+        }
     }
-    Err(unsupported(
-        "0x4262c0",
-        "no character file number available before the counter wraps",
-    ))
 }
 
 fn allocate_neighbor(id: u16, vacancies: &mut Vec<usize>, slots: &mut usize) -> Result<i16> {

@@ -1,0 +1,109 @@
+# Neighborhood open replays the five houseless pools in memory
+
+*Decided 2026-11-20.*
+
+Step 6b E extends `sims_vm::neighborhood_open::open_neighborhood`. After
+house 0's reload and Patch, the neighborhood update fills celebrities
+(5000), fans (5500) and Magic Town residents (6000), in that order
+(0x5580a2–0x5580e9). A supplied lot or toolbar transition then fills
+Townies (2000) and tourists (3000–3009), in order
+(for example 0x55855d–0x558588). A view-only open ends after Magic Town.
+
+## Families, records and files
+
+- The option pairs are the native offsets 0x1a0–0x1a9 decoded from
+  NGBH #1 by 0x4254f6. The first three wrappers test done (0x42c548,
+  0x42d4f1, 0x42d941). The last two test pending (0x42b007, 0x42b8d7).
+  Each wrapper clears pending and sets done after filling. The direct
+  worker call after each wrapper also runs when conversion is complete.
+- The first four workers refill to 12, 18, 30 and 30 people, respectively
+  (0x42c1ea, 0x42d193, 0x42d5f2, 0x42a98f). The tourist worker (0x42b0fd)
+  creates only missing families, in ascending ID order. Its two
+  composition rolls choose one or two adults and one or two children
+  (0x42b4fe, 0x42b53c). The replay takes the recorded outcome as an ordered
+  group of people and checks that its composition is possible. The
+  pending Townie and tourist wrappers move preexisting reserved IDs to
+  the largest ID plus one (0x42b09f, 0x42b975). In the other wrappers,
+  a collision indexes past the family vector (0x42c5e9, 0x42d592,
+  0x42d9e2) and the port reports the address.
+- A missing family starts at its reserved ID with house, budget and
+  flags zero (0x41003c). The new member GUIDs append in creation order
+  (0x410849). Character file numbers share Patch's counter at +0x160
+  (0x42ce3b, 0x4264f6, 0x426d6e). Occupied filenames advance the counter
+  without drawing a GUID. The counter wraps at 32000.
+- A person takes the last empty neighbor slot or appends a slot
+  (0x4257a5 with ID -1). The editor saves mode 9 (0x425a69). The saved
+  form is NBRS version 10, extra 9, with 256 words and empty
+  relationships. Word 61 is zero until the family-word rebuild
+  (0x425244). The two UD2 files show a rebuild after Magic Town and
+  before Townies. `LotTransition` records that boundary explicitly,
+  resetting the counter as reload does at 0x424e8e.
+
+## Recorded inputs and CRT
+
+The caller loads the capture and supplies `PoolInput` explicitly. In
+the run-2 test, `SIMS_UD2_AFTER/Characters/User00030.iff`
+through `User00152.iff` supply the OBJD template and GUID high word
+(0x4725e4, 0x4725ff), and the body strings used to derive age, sex and
+tone (0x5888d3). The replay writes these files at the allocated numbers.
+They carry names and appearance. FAMI in the captured `Neighborhood.iff`
+identifies the people in each group, including the tourists'
+composition. NBRS supplies the celebrity editor words 10–12, 15,
+17–18, 80–82 and the tourist child editor words 9–12, 15, 17–18,
+56–57. The test uses the rest of NBRS, FAMI and NGBH for comparison.
+Patch still takes its recorded GUIDs from `User00002.iff` through
+`User00029.iff`.
+
+The port draws each GUID's low word from the CRT (0x4725ff) and checks
+it against the OBJD. A temporary person copies its warm skeleton
+(0x4596f6, 0x598da3, 0x598a6e, 0x595d65) and consumes 1,392 draws.
+Each copy is followed by two default-trait passes (0x4598d4 and
+0x459a6d into 0x459a9c). Townies construct one temporary person at
+0x426646 or 0x4269c5. The other pools construct two
+(0x42cf4b/0x42cf54, 0x426e8e/0x426e97). The last pass supplies the 15
+saved trait words. The run-2 test compares all 256 words of every new
+record, along with its metadata and all 14 pool FAMI payloads.
+
+| Capture | First three pools | Transition | Townies | Tourists |
+|---|---:|---:|---:|---:|
+| `after-with-lot-load` | 176,409 | 64 | 44,096 | 102,893 |
+| `after-run2` | 176,444 | 64 | 44,096 | 97,027 |
+
+Both captures match the replay's pool families, records and flags. Run
+2 made 33 tourists, and the earlier run made 35. In run 2,
+`OPEN_DRAWS = 84_947` advances CRT state 1 to the first pool boundary,
+covering startup, neighborhood navigation and Patch. The offset is
+fitted from the first pool's GUID and trait sequence and assumes no
+reseed from state 1. Replay ends at draw 402,578, state 219,850,067.
+
+`Lot::load_after_pools` uses the post-pool CRT state directly. It starts
+with the adult skeleton file already read and reconstructs the existing
+indicators without charging their 64 graphic-root draws again
+(0x445e4a, 0x595d65). House 69 adds 3,272 draws on that path and
+reaches CRT state 3,739,951,803 and the existing `IMPORTED_69` pin.
+`FILE_BOOT_DRAWS = 401_120` remains the fitted offset for the separate
+standalone test from the original's files. Its boot builds the
+indicators and reads the adult skeleton file as part of its setup.
+
+## Evidence still needed
+
+The run-2 capture notes and House 69 manifest record the occupied-lot
+click that started the last two pools and then loaded the lot. This
+points to the normal Unleashed lot callback at 0x5584e8, selected at
+0x55ba31 and called at 0x557f63. The family-placement callback
+(0x5585ee) bypasses the fills for an occupied lot (0x55869d, 0x558712),
+and the toolbar has a separate dispatch at 0x5591e3. The run has no
+instruction trace of the callback. The extra 64 draws could be two
+indicator roots (0x445e4a, 0x595d65), but the caller and the exact
+reload site remain untraced. The handoff models the adult cache
+House 69 uses. Carrying other skeleton caches across loads needs
+separate evidence.
+
+The native pool seeding and bounded choices (0x5bc82b, 0x5bc882), the
+game stream inside template scripts, names, looks and portrait writes
+remain deferred. FAMs display names and Neighborhood.iff serialization
+are outside the in-memory model. The two preexisting v7 FAMI records
+still have their install encoding in memory. The original writer
+resaves them as v9. Writing exact pool character files from native
+choices still needs an instrumented recording and an estimated
+600–1,200 lines.
