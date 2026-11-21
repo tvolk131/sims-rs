@@ -14,7 +14,7 @@ use sims_render::{Assets, Canvas, Walls, Zoom};
 use sims_sim::World;
 use sims_ui::art::Art;
 use sims_ui::balloon::Texts;
-use sims_ui::buy::{self, BuyCatalog, BuyLayout, BuyState, BuyWidgetKind};
+use sims_ui::buy::{self, BuyCatalog, BuyLayout, BuyState, BuyWidgetKind, RatingLabels};
 use sims_ui::command::{Command, Mode, Panel as UiPanel, Walls as UiWalls};
 use sims_ui::dialog::{self, Labels, Message};
 use sims_ui::frame::{Frame, Rect};
@@ -97,6 +97,8 @@ pub struct Hud {
     idle_speed: bool,
     /// The Buy Mode residential catalog, loaded lazily on first Buy Mode entry.
     buy_catalog: Option<BuyCatalog>,
+    /// Buy Mode popup rating labels (`GameData/UIText.iff STR# 160`, `0x508168`).
+    rating_labels: RatingLabels,
     /// The Buy Mode catalog strip state (sort, category, subcategory, page,
     /// selected GUID).
     pub buy_state: BuyState,
@@ -137,6 +139,7 @@ impl Hud {
             art.load_optional(&ui, US_ENGLISH, id);
         }
         let labels = Labels::load(&install).map_err(|e| e.to_string())?;
+        let rating_labels = RatingLabels::load(&install);
         // Without the balloons' strings the HUD still opens; the balloons
         // show what text they have.
         let texts = Texts::load(&install).unwrap_or_default();
@@ -201,6 +204,7 @@ impl Hud {
             clock_blink: ClockBlink::default(),
             idle_speed: false,
             buy_catalog: None,
+            rating_labels,
             buy_state: BuyState::default(),
             buy_layout: BuyLayout::default(),
             sounds: Vec::new(),
@@ -226,8 +230,10 @@ impl Hud {
 
     /// Loads the residential Buy Mode catalog on first use and returns it.
     pub fn ensure_buy_catalog(&mut self, assets: &Assets) -> &BuyCatalog {
-        self.buy_catalog
-            .get_or_insert_with(|| BuyCatalog::load(assets.index(), assets.catalog()))
+        let rating_labels = self.rating_labels.clone();
+        self.buy_catalog.get_or_insert_with(|| {
+            BuyCatalog::load(assets.index(), assets.catalog()).with_rating_labels(rating_labels)
+        })
     }
 
     /// The residential Buy Mode catalog, once loaded.
@@ -240,6 +246,18 @@ impl Hud {
         &self.buy_layout
     }
 
+    /// Whether `point` lies over the expanded Buy Mode catalog strip
+    /// (`cWinCatalog`, `x >= CLUSTER[0]` and `y >= height - TALL_STRIP`), where
+    /// clicking or dropping a held object sells it (`0x50d04d` → `0x4cf97a` →
+    /// `0x487e18`).
+    pub fn over_buy_catalog(&self, size: [i32; 2], point: [i32; 2]) -> bool {
+        if self.controls.mode != Mode::Buy || !self.controls.expanded {
+            return false;
+        }
+        let top = size[1] - hud::TALL_STRIP;
+        point[0] >= hud::CLUSTER[0] && point[0] < size[0] && point[1] >= top && point[1] < size[1]
+    }
+
     /// Lays out the Buy Mode catalog strip for `size` and `world` (or clears
     /// it outside expanded Buy Mode), syncing `self.buy_state.page` to the
     /// clamped page number.
@@ -248,9 +266,10 @@ impl Hud {
             self.buy_layout = BuyLayout::default();
             return;
         }
-        let catalog = self
-            .buy_catalog
-            .get_or_insert_with(|| BuyCatalog::load(assets.index(), assets.catalog()));
+        let rating_labels = self.rating_labels.clone();
+        let catalog = self.buy_catalog.get_or_insert_with(|| {
+            BuyCatalog::load(assets.index(), assets.catalog()).with_rating_labels(rating_labels)
+        });
         let funds = sims_vm::available_funds(world);
         let layout = buy::layout(size, catalog, &self.buy_state, &self.art, funds);
         self.buy_state.page = layout.page;

@@ -1641,11 +1641,11 @@ impl<'a> Painter<'a> {
                 };
                 (pose, screen, anchor)
             };
-            list.push((anchor, screen, id, pose, [x, y]));
+            list.push((anchor, screen, id, pose, [x, y], preview_at.is_some()));
         }
         // Far objects first, so soft edges blend over what is behind them.
         list.sort_by_key(|&(a, _, id, ..)| (std::cmp::Reverse(a.depth), id));
-        for (base_anchor, base_screen, id, pose, pos) in list {
+        for (base_anchor, base_screen, id, pose, pos, blocked_preview) in list {
             let o = &self.world.objects[&id];
             let Some(definition) = self.assets.definition_ref(o.guid) else {
                 self.stats.missing_objects += 1;
@@ -1744,14 +1744,20 @@ impl<'a> Painter<'a> {
                 // and this is not read from the original: it keeps such a
                 // frame drawn rather than lost to byte 255.
                 let flat = part.image.depth.is_none();
-                self.canvas
-                    .draw_lit(&part.image, at, part.flip, light, |_, _, byte| {
-                        if flat {
-                            Some(anchor.depth)
-                        } else {
-                            depth.sprite(anchor, byte)
-                        }
-                    });
+                let depth_fn = |_: i32, _: i32, byte: u8| {
+                    if flat {
+                        Some(anchor.depth)
+                    } else {
+                        depth.sprite(anchor, byte)
+                    }
+                };
+                if blocked_preview {
+                    self.canvas
+                        .draw_tinted(&part.image, at, part.flip, depth_fn);
+                } else {
+                    self.canvas
+                        .draw_lit(&part.image, at, part.flip, light, depth_fn);
+                }
             }
             self.canvas.set_id(None);
             self.stats.objects += 1;

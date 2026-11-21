@@ -6240,14 +6240,34 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
     );
     assert!(game.lot().world().objects[&blocked_cur.cursor].position[0] >= 0);
     let canvas = game.render();
-    let drew_held = (0..canvas.height as i32)
-        .any(|y| (0..canvas.width as i32).any(|x| canvas.id_at(x, y) == Some(blocked_cur.held)));
+    let mut drew_held = 0usize;
+    let mut exact_red_gray = 0usize;
+    let mut red_dominant = 0usize;
+    for y in 0..canvas.height as i32 {
+        for x in 0..canvas.width as i32 {
+            if canvas.id_at(x, y) == Some(blocked_cur.held) {
+                drew_held += 1;
+                let [r, g, b] = canvas.color[y as usize * canvas.width + x as usize];
+                if r > g && g == b {
+                    exact_red_gray += 1;
+                }
+                if r > b {
+                    red_dominant += 1;
+                }
+            }
+        }
+    }
     assert!(
-        drew_held,
+        drew_held > 0,
         "blocked held chair must still draw at the on-lot Tile Cursor position (0x42242f)"
     );
+    assert!(
+        exact_red_gray > 50 && red_dominant * 10 >= drew_held * 9,
+        "blocked held chair must use red-tinted 0x49bd78 palette (exact_red_gray={exact_red_gray}, red_dominant={red_dominant}/{drew_held})"
+    );
 
-    // Entering Buy Mode from a collapsed Live panel refreshes `view_centre`.
+    // Entering Buy Mode from a collapsed Live panel refreshes `view_centre`,
+    // and returning to Live restores the collapsed Live panel (`0x4cea5d`).
     game.set_mode(Mode::Live);
     game.render();
     let toggle = game
@@ -6266,6 +6286,487 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
     let collapsed_centre = game.lot().view_centre();
     game.set_mode(Mode::Buy);
     assert_ne!(game.lot().view_centre(), collapsed_centre);
+    game.set_mode(Mode::Live);
+    assert_eq!(game.lot().view_centre(), collapsed_centre);
+}
+
+/// Strict replay of Track 2's Complete Collection 1.91 `goth-buy-move-sell`
+/// recording: enter Buy Mode (`F2`), buy Werkbunnst Chair ($80) on lawn,
+/// cancel repeat preview (`Escape`), pick up existing chair `260` by its
+/// sprite (`(480, 365)`), move with native grab offset to `(550, 380)` ->
+/// `[632, 440, 1]`, rotate with `.` to facing 4, drop, pick up 2-tile porch
+/// bench `173`/`174` at `(432, 230)`, sell with `Delete` for `$250` (`2462 ->
+/// 2712`), and return to Live Mode (`F1`) purging detached `173`/`174` before
+/// stepping 200 Live ticks.
+#[test]
+fn buy_mode_move_and_sell_replays_recorded_goth_session() {
+    use sims_ui::command::Mode;
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    game.resize([800, 600]);
+    game.render();
+    assert_eq!(game.run(60), 60);
+    assert_eq!(game.lot().world().budget.funds, 2542);
+    let orig_count = game.lot().world().objects.len();
+    assert!(game.lot().world().objects.contains_key(&173));
+    assert!(game.lot().world().objects.contains_key(&174));
+
+    // F2 -> Buy Mode, Seating (258, 524), Werkbunnst Chair (437, 523).
+    game.set_mode(Mode::Buy);
+    assert_eq!(game.lot().world().globals[19], 2);
+    game.press([258, 524]);
+    game.release([258, 524]);
+    game.press([437, 523]);
+    game.release([437, 523]);
+    assert_eq!(game.buy_selected(), Some(0x26bf_bb29));
+
+    // Popup card carries formatted STR# 160 ratings (`Comfort: 2`).
+    let popup = game
+        .buy_layout()
+        .popup
+        .as_ref()
+        .expect("selected chair popup");
+    assert!(
+        popup.ratings.iter().any(|r| r == "Comfort: 2"),
+        "expected Comfort: 2 on Werkbunnst Chair popup, got {:?}",
+        popup.ratings
+    );
+
+    // Place chair 260 at recorded (480, 380) -> [584, 472, 1], facing 2, funds 2462.
+    let buy_spot = recorded([480, 380]);
+    game.hover(buy_spot);
+    let chair_id = game.buy_cursor().expect("chair cursor").held;
+    assert_eq!(
+        game.lot().world().objects[&chair_id].position,
+        [584, 472, 1]
+    );
+    assert_eq!(game.lot().world().objects[&chair_id].data[1], 2);
+    game.press(buy_spot);
+    game.release(buy_spot);
+    assert_eq!(game.lot().world().budget.funds, 2462);
+    assert_eq!(game.lot().world().globals[13], 2462);
+
+    // Escape cancels repeat preview; chair 260 stands alone on [584, 472, 1].
+    assert!(game.cancel_buy());
+    assert!(game.buy_cursor().is_none());
+    assert_eq!(game.lot().world().objects.len(), orig_count + 1);
+    assert_eq!(game.lot().world().objects[&chair_id].data[26], 0);
+    game.render();
+
+    // Click (480, 365) (backrest of chair 260): Hand Tool picks up chair 260
+    // with click-to-pick-up (stays attached on release), cursor facing == 2,
+    // chair.before == cursor.
+    let pickup_chair = recorded([480, 365]);
+    assert_eq!(game.under(pickup_chair), Some(chair_id));
+    game.press(pickup_chair);
+    game.release(pickup_chair);
+    let picked = game
+        .buy_cursor()
+        .expect("chair stays attached after click-to-pick-up")
+        .clone();
+    assert!(picked.is_existing());
+    assert_eq!(picked.held, chair_id);
+    assert_eq!(
+        game.lot().world().objects[&chair_id].position,
+        [584, 472, 1]
+    );
+    assert_eq!(
+        game.lot().world().objects[&picked.cursor].position,
+        [584, 472, 1]
+    );
+    assert_eq!(game.lot().world().objects[&picked.cursor].data[1], 2);
+    assert_eq!(
+        game.lot().world().objects[&chair_id].data[26],
+        picked.cursor as i16
+    );
+    assert_eq!(game.lot().world().budget.funds, 2462);
+
+    // Move to recorded (550, 380): grab offset places chair 260 & cursor at
+    // exact recorded tile [632, 440, 1] (`u=574`).
+    let drop_chair = recorded([550, 380]);
+    game.hover(drop_chair);
+    assert_eq!(
+        game.lot().world().objects[&chair_id].position,
+        [632, 440, 1]
+    );
+    assert_eq!(
+        game.lot().world().objects[&picked.cursor].position,
+        [632, 440, 1]
+    );
+
+    // `.` rotates held chair to facing 4 while Tile Cursor keeps facing 2 (`u=604`).
+    assert!(game.rotate_held(true));
+    assert_eq!(game.lot().world().objects[&chair_id].data[1], 4);
+    assert_eq!(game.lot().world().objects[&picked.cursor].data[1], 2);
+
+    // Click (550, 380) drops chair 260 at [632, 440, 1] facing 4 (`u=694`).
+    game.press(drop_chair);
+    game.release(drop_chair);
+    assert!(game.buy_cursor().is_none());
+    assert!(!game.lot().world().objects.contains_key(&picked.cursor));
+    assert_eq!(
+        game.lot().world().objects[&chair_id].position,
+        [632, 440, 1]
+    );
+    assert_eq!(game.lot().world().objects[&chair_id].data[1], 4);
+    assert_eq!(game.lot().world().objects[&chair_id].data[26], 0);
+    assert_eq!(game.lot().world().budget.funds, 2462);
+    game.render();
+
+    // Click (432, 230) picks up 2-tile porch bench 173/174 (`u=784`).
+    let pickup_bench = recorded([432, 230]);
+    let bench_hit = game.under(pickup_bench);
+    assert!(
+        matches!(bench_hit, Some(173 | 174)),
+        "expected porch bench 173/174 at {pickup_bench:?}, got {bench_hit:?}"
+    );
+    game.press(pickup_bench);
+    game.release(pickup_bench);
+    let bench_cur = game
+        .buy_cursor()
+        .expect("bench stays attached after click-to-pick-up")
+        .clone();
+    assert!(bench_cur.is_existing());
+    assert_eq!(bench_cur.held, 173);
+    assert_eq!(game.lot().world().objects[&173].position, [424, 360, 1]);
+    assert_eq!(game.lot().world().objects[&174].position, [424, 376, 1]);
+    assert_eq!(game.lot().world().objects[&bench_cur.cursor].data[1], 2);
+    assert_eq!(game.lot().world().objects[&173].data[41], 250);
+    assert_eq!(game.lot().world().objects.len(), orig_count + 3);
+
+    // Delete sells porch bench 173/174: refunds $250 (2462 -> 2712), deletes
+    // 2-tile Tile Cursor, detaches 173/174 to [-16, -16, 1] for Undo (`u=844`).
+    assert!(game.sell_held());
+    assert!(game.buy_cursor().is_none());
+    assert!(!game.lot().world().objects.contains_key(&bench_cur.cursor));
+    assert_eq!(game.lot().world().budget.funds, 2712);
+    assert_eq!(game.lot().world().globals[13], 2712);
+    assert_eq!(game.lot().world().objects[&173].position, [-16, -16, 1]);
+    assert_eq!(game.lot().world().objects[&174].position, [-16, -16, 1]);
+    assert_eq!(game.lot().world().objects.len(), orig_count + 1);
+
+    // F1 -> Live Mode: purges detached 173 & 174 (`0x48c20e`), sets g[19]=0,
+    // and runs 200 Live ticks cleanly (`u=904..1144`).
+    game.set_mode(Mode::Live);
+    assert_eq!(game.lot().world().globals[19], 0);
+    assert!(!game.lot().world().objects.contains_key(&173));
+    assert!(!game.lot().world().objects.contains_key(&174));
+    assert!(game.lot().world().objects.contains_key(&chair_id));
+    assert_eq!(
+        game.lot().world().objects[&chair_id].position,
+        [632, 440, 1]
+    );
+    assert_eq!(game.lot().world().objects[&chair_id].data[1], 4);
+    assert_eq!(game.lot().world().budget.funds, 2712);
+    assert_eq!(game.run(200), 200);
+    assert_eq!(
+        game.lot().world().objects[&chair_id].position,
+        [632, 440, 1]
+    );
+    assert_eq!(game.lot().world().objects[&chair_id].data[1], 4);
+    assert!(game.problems().is_empty(), "{:?}", game.problems());
+    assert!(game.stopped().is_none(), "{:?}", game.stopped());
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
+}
+
+/// Hand Tool guards (`CanPickUp`, `CanDelete`), cancel-move snapback & save,
+/// surface-container move/Undo/Redo with children, depreciation (`0x43219a`),
+/// catalog-strip sell, drag-to-drop vs click-to-pick-up, Shift no-duplicate on
+/// existing move, multipart `0x485f49` saved coordinates, Buy sort toggle, and
+/// `x`/`z` catalog paging.
+#[test]
+fn buy_mode_hand_tool_guards_depreciation_undo_redo_and_followups() {
+    use sims_ui::buy::{BuyCatalog, BuySort};
+    use sims_ui::command::Mode;
+    let Some(install) = install() else {
+        return;
+    };
+    let opened = sims_render::open_house(&install, &goth_house(&install)).expect("open Goth house");
+    let catalog = BuyCatalog::load(opened.assets.index(), opened.assets.catalog());
+
+    // --- 1. VM-level guards, depreciation, container+child move & Undo/Redo ---
+    let mut lot = Lot::load(&install, &goth_house(&install), &[3], Frames::default()).unwrap();
+    for _ in 0..60 {
+        lot.step().unwrap();
+    }
+    lot.set_mode(sims_vm::PanelMode::Buy).unwrap();
+
+    // Persons cannot be picked up or deleted.
+    let mortimer = lot
+        .world()
+        .objects
+        .values()
+        .find(|o| o.person.is_some())
+        .expect("Mortimer on lot")
+        .id;
+    assert!(!lot.can_pick_up(mortimer).unwrap());
+    assert!(!lot.can_delete(mortimer).unwrap());
+    assert!(lot.buy_pick_up(mortimer).unwrap().is_none());
+
+    // Place a Mesquite Desk on the lawn and a Gloominator Desk Lamp on top of it.
+    let desk = catalog
+        .all()
+        .iter()
+        .find(|i| i.name.contains("Mesquite") && i.name.contains("Desk"))
+        .expect("Mesquite Desk");
+    let lamp = catalog
+        .all()
+        .iter()
+        .find(|i| i.name.contains("Gloominator Desk Lamp"))
+        .expect("Gloominator Desk Lamp");
+    let mut desk_cur = lot.buy_start(desk.guid, 1, 2).unwrap().unwrap();
+    assert!(lot.buy_move(&mut desk_cur, [584, 472], 1).unwrap());
+    let desk_id = lot.buy_commit(&desk_cur).unwrap();
+    let mut lamp_cur = lot.buy_start(lamp.guid, 1, 2).unwrap().unwrap();
+    assert!(lot.buy_move(&mut lamp_cur, [584, 472], 1).unwrap());
+    assert_eq!(lamp_cur.container.map(|(c, _)| c), Some(desk_id));
+    let lamp_id = lot.buy_commit(&lamp_cur).unwrap();
+
+    // Desk with a lamp on top CAN be picked up, CANNOT be deleted (`0x435440`).
+    assert!(lot.can_pick_up(desk_id).unwrap());
+    assert!(!lot.can_delete(desk_id).unwrap());
+
+    // Pick up the desk (with lamp), move it to [600, 440], rotate to facing 4,
+    // then cancel (`0x487191`): desk and lamp must snap back to [584, 472] dir 2!
+    let mut held_desk = lot.buy_pick_up(desk_id).unwrap().expect("desk picked up");
+    assert!(held_desk.is_existing());
+    assert!(!lot.buy_sell(&held_desk).unwrap()); // refused while lamp is on top
+    assert!(lot.buy_move(&mut held_desk, [600, 440], 1).unwrap());
+    assert!(lot.buy_rotate(&mut held_desk, 4).unwrap());
+    assert_eq!(lot.world().objects[&desk_id].position, [600, 440, 1]);
+    assert_eq!(lot.world().objects[&lamp_id].position, [600, 440, 1]);
+    // Mid-pickup save (`save_without_buy_cursor`) must snap desk & lamp back to
+    // origin [584, 472] without deleting them or leaking Tile Cursor.
+    let saved_mid_move = lot
+        .save_without_buy_cursor(&held_desk)
+        .expect("save during move");
+    assert!(saved_mid_move.world().objects.contains_key(&desk_id));
+    assert!(
+        !saved_mid_move
+            .world()
+            .objects
+            .contains_key(&held_desk.cursor)
+    );
+    assert_eq!(
+        saved_mid_move.world().objects[&desk_id].position,
+        [584, 472, 1]
+    );
+    assert_eq!(saved_mid_move.world().objects[&desk_id].data[1], 2);
+    assert_eq!(
+        saved_mid_move.world().objects[&lamp_id].position,
+        [584, 472, 1]
+    );
+    // Cancel snapback restores desk & lamp to [584, 472] dir 2 with 0 funds change.
+    let funds_before_cancel = lot.world().budget.funds;
+    lot.buy_cancel(&held_desk).unwrap();
+    assert!(!lot.world().objects.contains_key(&held_desk.cursor));
+    assert_eq!(lot.world().objects[&desk_id].position, [584, 472, 1]);
+    assert_eq!(lot.world().objects[&desk_id].data[1], 2);
+    assert_eq!(lot.world().objects[&lamp_id].position, [584, 472, 1]);
+    assert_eq!(lot.world().objects[&lamp_id].data[2], desk_id as i16);
+    assert_eq!(lot.world().budget.funds, funds_before_cancel);
+
+    // Commit moving the desk + lamp to [600, 440] facing 4, then Undo & Redo Move!
+    let mut held_desk2 = lot.buy_pick_up(desk_id).unwrap().unwrap();
+    assert!(lot.buy_move(&mut held_desk2, [600, 440], 1).unwrap());
+    assert!(lot.buy_rotate(&mut held_desk2, 4).unwrap());
+    assert_eq!(lot.buy_commit(&held_desk2).unwrap(), desk_id);
+    assert_eq!(lot.world().budget.funds, funds_before_cancel);
+    assert_eq!(lot.world().objects[&desk_id].position, [600, 440, 1]);
+    assert_eq!(lot.world().objects[&desk_id].data[1], 4);
+    assert_eq!(lot.world().objects[&lamp_id].position, [600, 440, 1]);
+    assert_eq!(lot.world().objects[&lamp_id].data[2], desk_id as i16);
+    assert!(lot.buy_undo().unwrap());
+    assert_eq!(lot.world().budget.funds, funds_before_cancel);
+    assert_eq!(lot.world().objects[&desk_id].position, [584, 472, 1]);
+    assert_eq!(lot.world().objects[&desk_id].data[1], 2);
+    assert_eq!(lot.world().objects[&lamp_id].position, [584, 472, 1]);
+    assert_eq!(lot.world().objects[&lamp_id].data[2], desk_id as i16);
+    assert!(lot.buy_redo().unwrap());
+    assert_eq!(lot.world().budget.funds, funds_before_cancel);
+    assert_eq!(lot.world().objects[&desk_id].position, [600, 440, 1]);
+    assert_eq!(lot.world().objects[&desk_id].data[1], 4);
+    assert_eq!(lot.world().objects[&lamp_id].position, [600, 440, 1]);
+
+    // Pick up the lamp off the desk, sell it, then Undo & Redo Sell!
+    let lamp_val = lot.resale_value(lamp_id).unwrap();
+    assert_eq!(lamp_val, lamp.price);
+    let funds_before_sell = lot.world().budget.funds;
+    let held_lamp = lot.buy_pick_up(lamp_id).unwrap().unwrap();
+    assert!(lot.buy_sell(&held_lamp).unwrap());
+    assert_eq!(lot.world().budget.funds, funds_before_sell + lamp_val);
+    assert!(lot.world().objects[&lamp_id].position[0] < 0);
+    // Undo Sell: restores lamp onto desk slot and re-deducts `lamp_val`.
+    assert!(lot.buy_undo().unwrap());
+    assert_eq!(lot.world().budget.funds, funds_before_sell);
+    assert_eq!(lot.world().objects[&lamp_id].position, [600, 440, 1]);
+    assert_eq!(lot.world().objects[&lamp_id].data[2], desk_id as i16);
+    // Redo Sell: detaches lamp again and re-credits `lamp_val`.
+    assert!(lot.buy_redo().unwrap());
+    assert_eq!(lot.world().budget.funds, funds_before_sell + lamp_val);
+    assert!(lot.world().objects[&lamp_id].position[0] < 0);
+
+    // Depreciation (`0x43219a`) + CanPickUp / CanDelete flag guards on a
+    // synthetic world mutation via `Interpreter` directly.
+    {
+        let mut world = lot.world().clone();
+        let interp =
+            sims_vm::Interpreter::new(lot.program(), lot.catalog(), sims_vm::Stream::Global);
+        // Porch bench 173/174: intact value == 250; broken part 174 (`data[15]=1`)
+        // halves resale value to 125 (`0x43219a`).
+        assert_eq!(interp.resale_value(&world, 173).unwrap(), 250);
+        world.objects.get_mut(&174).unwrap().data[15] = 1;
+        assert_eq!(interp.resale_value(&world, 173).unwrap(), 125);
+        world.objects.get_mut(&174).unwrap().data[15] = 0;
+
+        // `data[43] & 0x02 == 0` refuses CanPickUp and CanDelete.
+        let orig_flags = world.objects[&desk_id].data[43];
+        world.objects.get_mut(&desk_id).unwrap().data[43] = orig_flags & !0x02;
+        assert!(!interp.can_pick_up(&world, desk_id).unwrap());
+        assert!(!interp.can_delete(&world, desk_id).unwrap());
+        // `data[43] & 0x08 == 0` allows CanPickUp, refuses CanDelete.
+        world.objects.get_mut(&desk_id).unwrap().data[43] = (orig_flags | 0x02) & !0x08;
+        assert!(interp.can_pick_up(&world, desk_id).unwrap());
+        assert!(!interp.can_delete(&world, desk_id).unwrap());
+        world.objects.get_mut(&desk_id).unwrap().data[43] = orig_flags;
+
+        // In-use guards (`data[62] > 0` or `data[8] & 0x20 != 0`) refuse CanPickUp.
+        world.objects.get_mut(&desk_id).unwrap().data[62] = 1;
+        assert!(!interp.can_pick_up(&world, desk_id).unwrap());
+        world.objects.get_mut(&desk_id).unwrap().data[62] = 0;
+        let orig_d8 = world.objects[&desk_id].data[8];
+        world.objects.get_mut(&desk_id).unwrap().data[8] = orig_d8 | 0x20;
+        assert!(!interp.can_pick_up(&world, desk_id).unwrap());
+        world.objects.get_mut(&desk_id).unwrap().data[8] = orig_d8;
+    }
+
+    // Multipart `0x485f49` fit refusal preserves saved `cursor.position`:
+    // move a 2-tile bed onto a tile where fallback `fits(fine)` fails near the
+    // lot border; physical cursor is off-lot `[-16, -16]`, while saved
+    // `cursor.position` stays at the snapped tile rather than `[-16, -16]`.
+    let spartan = catalog
+        .all()
+        .iter()
+        .find(|i| i.name.contains("Spartan Special"))
+        .expect("Spartan Special bed");
+    let mut bed_cur = lot.buy_start(spartan.guid, 1, 2).unwrap().unwrap();
+    // Place lead tile on the last interior row/column (`size - 2`) so
+    // `inside_placement_bounds` passes while the bed's other tiles extend out
+    // of bounds, hitting `0x485f49` fallback fit refusal: physical cursor is
+    // off-lot `[-16, -16]`, while saved `cursor.position` stays `[edge, edge, 1]`.
+    let edge = (i32::from(lot.world().size) - 2) * 16 + 8;
+    assert!(!lot.buy_move(&mut bed_cur, [edge, edge], 1).unwrap());
+    assert!(lot.world().objects[&bed_cur.cursor].position[0] < 0);
+    assert_eq!(bed_cur.position, [edge, edge, 1]);
+    lot.buy_cancel(&bed_cur).unwrap();
+
+    // --- 2. Game-level drag-to-drop, Shift no-duplicate, catalog-drop sell,
+    //        second Buy click sort toggle, and `x`/`z` catalog paging ---
+    let mut game = Game::open(&options(install)).expect("open Goth house");
+    game.resize([800, 600]);
+    game.render();
+    assert_eq!(game.run(60), 60);
+    game.set_mode(Mode::Buy);
+    assert_eq!(game.buy_state().sort, BuySort::ByFunction);
+
+    // Second Buy button click (`[93, 458]`) toggles sort ByFunction <-> ByRoom
+    // instead of collapsing the panel (`0x53a2c3` / `0x4cf3af`).
+    game.press([93, 458]);
+    game.release([93, 458]);
+    assert_eq!(game.mode(), Mode::Buy);
+    assert_eq!(game.buy_state().sort, BuySort::ByRoom);
+    game.press([93, 458]);
+    game.release([93, 458]);
+    assert_eq!(game.buy_state().sort, BuySort::ByFunction);
+
+    // Open Seating -> All (subcat 7 at `[383, 576]`): test `x`/`z` paging.
+    game.press([258, 524]);
+    game.release([258, 524]);
+    game.press([383, 576]);
+    game.release([383, 576]);
+    assert_eq!(game.buy_state().page, 0);
+    assert!(game.buy_layout().total_pages > 1);
+    assert!(game.page_buy(1)); // `x`
+    assert_eq!(game.buy_state().page, 1);
+    assert!(game.page_buy(-1)); // `z`
+    assert_eq!(game.buy_state().page, 0);
+    assert!(!game.page_buy(-1)); // clamped at 0
+
+    // Buy a chair on the lawn, cancel repeat preview, render so `under` sees it.
+    game.press([269, 528]); // Dining Chairs subcat 0
+    game.release([269, 528]);
+    game.press([437, 523]); // Werkbunnst Chair ($80)
+    game.release([437, 523]);
+    let lawn = recorded([480, 380]);
+    game.hover(lawn);
+    let chair = game.buy_cursor().unwrap().held;
+    game.press(lawn);
+    game.release(lawn);
+    game.cancel_buy();
+    game.render();
+
+    // Press-and-drag (> 6 px) directly on an existing object with Shift held:
+    // native `0x485f98` sets `+0x7b = 1` so dragging > 6 px rotates in place
+    // (`0x485a2e`), `0x4864d0` commits on release (`dx^2 + dy^2 >= 4`), and
+    // Shift does NOT buy a duplicate copy (`0x4864d0` checks `+0x75 != 0`).
+    let funds_after_chair = game.lot().world().budget.funds;
+    let obj_count = game.lot().world().objects.len();
+    game.set_shift(true);
+    let grab = recorded([480, 365]);
+    let drag_rotate_target = [grab[0] + 20, grab[1] - 20]; // upper-right -> facing 4
+    game.press(grab);
+    game.hover(drag_rotate_target);
+    game.release(drag_rotate_target);
+    game.set_shift(false);
+    assert!(game.buy_cursor().is_none());
+    assert!(game.buy_selected().is_none());
+    assert_eq!(game.lot().world().budget.funds, funds_after_chair);
+    assert_eq!(game.lot().world().objects.len(), obj_count);
+    assert_eq!(game.lot().world().objects[&chair].position, [584, 472, 1]);
+    assert_eq!(game.lot().world().objects[&chair].data[1], 4);
+    game.render();
+
+    // Selling by clicking the Buy catalog strip (`0x50d04d` -> `0x4cf97a` ->
+    // `0x487e18`): click-to-pick-up the chair, then click on the catalog strip (300, 520).
+    let chair_grab = grab;
+    assert_eq!(game.under(chair_grab), Some(chair));
+    game.press(chair_grab);
+    game.release(chair_grab);
+    assert!(
+        game.buy_cursor()
+            .is_some_and(sims_vm::BuyCursor::is_existing)
+    );
+    game.press([300, 520]);
+    game.release([300, 520]);
+    assert!(game.buy_cursor().is_none());
+    assert_eq!(game.lot().world().budget.funds, funds_after_chair + 80);
+    assert!(game.lot().world().objects[&chair].position[0] < 0);
+
+    // Undo Sell, then test dragging & dropping onto the catalog strip (`release`).
+    assert!(game.undo_buy());
+    assert_eq!(game.lot().world().budget.funds, funds_after_chair);
+    assert_eq!(game.lot().world().objects[&chair].position, [584, 472, 1]);
+    game.render();
+    game.press(chair_grab);
+    game.hover([350, 540]);
+    game.release([350, 540]);
+    assert!(game.buy_cursor().is_none());
+    assert_eq!(game.lot().world().budget.funds, funds_after_chair + 80);
+    assert!(game.lot().world().objects[&chair].position[0] < 0);
+
+    // Selling an unpaid new catalog preview cancels it with 0 refund and no
+    // Undo entry.
+    let funds_before_unpaid_sell = game.lot().world().budget.funds;
+    game.press([437, 523]);
+    game.release([437, 523]);
+    game.hover(lawn);
+    let unpaid = game.buy_cursor().unwrap().held;
+    assert!(game.sell_held());
+    assert!(game.buy_cursor().is_none());
+    assert!(!game.lot().world().objects.contains_key(&unpaid));
+    assert_eq!(game.lot().world().budget.funds, funds_before_unpaid_sell);
 }
 
 /// Opening a pie menu near the top edge of the expanded bottom control strip

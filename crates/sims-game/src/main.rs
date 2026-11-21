@@ -404,8 +404,24 @@ impl App {
                 self.changed(true);
                 return;
             }
+            Key::Named(NamedKey::F1) => {
+                self.game.set_mode(sims_ui::command::Mode::Live);
+                self.changed(true);
+                return;
+            }
+            Key::Named(NamedKey::F2) => {
+                self.game.set_mode(sims_ui::command::Mode::Buy);
+                self.changed(true);
+                return;
+            }
             Key::Named(NamedKey::F5) => return self.save(false),
             Key::Named(NamedKey::F9) => return self.save(true),
+            Key::Named(NamedKey::Delete | NamedKey::Backspace) => {
+                if self.game.sell_held() {
+                    self.changed(true);
+                }
+                return;
+            }
             Key::Character(c) => {
                 if self.ctrl_or_cmd_held {
                     match c.as_str() {
@@ -442,6 +458,18 @@ impl App {
                             return;
                         }
                         Move::Rotate(true)
+                    }
+                    "x" | "X" => {
+                        if self.game.page_buy(1) {
+                            self.changed(true);
+                        }
+                        return;
+                    }
+                    "z" | "Z" => {
+                        if self.game.page_buy(-1) {
+                            self.changed(true);
+                        }
+                        return;
                     }
                     "1" => Move::Walls(Walls::Up),
                     "2" => Move::Walls(Walls::Cutaway),

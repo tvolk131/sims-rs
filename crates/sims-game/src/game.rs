@@ -139,6 +139,19 @@ pub struct Game {
     /// (`0x485f98`), for drag-to-rotate (`dx^2 + dy^2 > 36`, `0x485a2e`) and
     /// commit on release (`0x4864d0`).
     buy_dragging: Option<[i32; 2]>,
+    /// Screen-pixel offset from the picked-up object's projected origin to the
+    /// pickup click point (`[tool + 0x50]`, `[tool + 0x54]`, `0x486960`),
+    /// subtracted before terrain unprojection in `0x485a2e`. Zero for new
+    /// catalog purchases (`0x486f5a`).
+    buy_grab_offset: [i32; 2],
+    /// Native `[tool + 0x81]`: whether releasing the left mouse button commits
+    /// the held Buy Mode object (`true` when pressing with an already-active
+    /// cursor; `false` on initial Hand Tool pickup until dragged ≥ 2 px,
+    /// `0x485f98` / `0x4864d0`).
+    buy_commit_on_release: bool,
+    /// Saved Live-mode control panel expanded state (`0x4cea5d`), restored
+    /// when returning from Buy/Build/Options back to Live Mode.
+    live_panel_expanded: bool,
     /// Whether Shift is currently held (`VK_SHIFT`, `0x4864f9`), which rearms
     /// any Buy Mode item for repeat purchase on placement (`0x48680f`).
     shift_held: bool,
@@ -219,6 +232,9 @@ impl Game {
             buy_last_guid: None,
             buy_facing: None,
             buy_dragging: None,
+            buy_grab_offset: [0, 0],
+            buy_commit_on_release: false,
+            live_panel_expanded: true,
             shift_held: false,
             note: None,
             clock_us: 0,
@@ -865,6 +881,19 @@ impl Game {
         }
         let cleared = self.note.take().is_some();
         if self.hud.covers(point) {
+            // Native `0x50d04d` → `0x4cf97a` → `0x487e18`: clicking the Buy
+            // catalog strip while holding a picked-up existing object sells
+            // it; clicking empty strip background while holding an unpaid
+            // preview cancels it.
+            if self.hud.controls.mode == Mode::Buy
+                && self.hud.over_buy_catalog(self.view.size, point)
+                && self.buy_cursor.is_some()
+                && (self.buy_cursor.as_ref().is_some_and(BuyCursor::is_existing)
+                    || self.hud.buy_layout().press(point).is_none())
+            {
+                self.sell_held();
+                return Outcome::redraw();
+            }
             // The menu, whose entries a choice is an index into.
             let menu = self.hud.menu.clone();
             let outcome = match self
@@ -895,7 +924,52 @@ impl Game {
                 self.pointer = Some(point);
                 self.hover_buy(point);
                 self.buy_dragging = Some(point);
+                self.buy_commit_on_release = true;
+                let valid = self.buy_cursor.as_ref().is_some_and(|c| c.valid);
+                self.hud.play(if valid {
+                    "UI_object_move_place"
+                } else {
+                    crate::hud::ERROR
+                });
+                let sounds = self.hud.take_sounds();
+                self.keep_sounds(sounds);
                 return Outcome::redraw();
+            }
+            // Hand Tool pickup of an existing lot object (`0x485f98` →
+            // `0x486960` → `0x4215e6`).
+            if let Some(target) = self.under(point) {
+                match self.lot.buy_pick_up(target) {
+                    Ok(Some(cursor)) => {
+                        let screen = lot_point(&self.view.camera, &self.lot_shape, cursor.position);
+                        self.buy_grab_offset = [
+                            point[0] - (screen[0] + pick::ORIGIN_COLUMN),
+                            point[1] - screen[1],
+                        ];
+                        self.buy_cursor = Some(cursor);
+                        self.buy_in_house = true;
+                        self.buy_dragging = Some(point);
+                        self.buy_commit_on_release = false;
+                        self.pointer = Some(point);
+                        self.hud.play("UI_object_move");
+                        let sounds = self.hud.take_sounds();
+                        self.keep_sounds(sounds);
+                        self.refresh_world();
+                        return Outcome::redraw();
+                    }
+                    Ok(None) => {
+                        self.hud.play(crate::hud::ERROR);
+                        let sounds = self.hud.take_sounds();
+                        self.keep_sounds(sounds);
+                        return Outcome::redraw();
+                    }
+                    Err(e) => {
+                        self.note = Some(format!("Object {target} was not picked up: {e}"));
+                        self.hud.play(crate::hud::ERROR);
+                        let sounds = self.hud.take_sounds();
+                        self.keep_sounds(sounds);
+                        return Outcome::redraw();
+                    }
+                }
             }
             return Outcome {
                 redraw: cleared || dismissed,
@@ -924,13 +998,32 @@ impl Game {
         if !self.in_view(point) {
             return self.release_outside();
         }
-        if self.hud.controls.mode == Mode::Buy && self.buy_dragging.is_some() {
+        if self.hud.controls.mode == Mode::Buy
+            && let Some(anchor) = self.buy_dragging
+        {
+            // Dropping a held object onto the Buy catalog strip sells it
+            // (`0x50d04d` → `0x4cf97a` → `0x487e18`).
+            if self.hud.over_buy_catalog(self.view.size, point) && self.buy_cursor.is_some() {
+                self.buy_dragging = None;
+                self.buy_commit_on_release = false;
+                self.sell_held();
+                return Outcome::redraw();
+            }
             // Native `0x4864f0` invokes `OnMouseMove` with the release
-            // coordinates before committing placement.
+            // coordinates before evaluating the drag threshold (`dx^2 + dy^2
+            // >= 4`) and `[tool + 0x81]` commit flag.
             self.pointer = Some(point);
             self.hover_buy(point);
             self.buy_dragging = None;
-            return self.commit_buy(point);
+            let dx = point[0] - anchor[0];
+            let dy = point[1] - anchor[1];
+            let dragged = dx * dx + dy * dy >= 4;
+            let should_commit = self.buy_commit_on_release || dragged;
+            self.buy_commit_on_release = false;
+            if should_commit {
+                return self.commit_buy(point);
+            }
+            return Outcome::redraw();
         }
         if self.hud.dialog().is_some() || self.hud.menu.is_none() {
             return Outcome {
@@ -990,6 +1083,7 @@ impl Game {
     /// drag.
     pub fn release_outside(&mut self) -> Outcome {
         if self.buy_dragging.take().is_some() {
+            self.buy_commit_on_release = false;
             let redraw = self.hide_buy_cursor();
             return Outcome {
                 redraw,
@@ -1552,6 +1646,9 @@ impl Game {
         self.buy_last_guid = None;
         self.buy_facing = None;
         self.buy_dragging = None;
+        self.buy_grab_offset = [0, 0];
+        self.buy_commit_on_release = false;
+        self.live_panel_expanded = true;
         self.hud.forget();
         self.hud.controls.mode = ui_mode(self.lot.mode());
         self.blink_dirty = false;
@@ -1686,6 +1783,10 @@ impl Game {
                     .layout_buy(self.view.size, self.lot.world(), &self.assets);
                 Outcome::redraw()
             }
+            Command::BuyToggleSort => {
+                self.toggle_buy_sort();
+                Outcome::redraw()
+            }
             Command::BuyPage(_) => {
                 self.hud
                     .layout_buy(self.view.size, self.lot.world(), &self.assets);
@@ -1704,6 +1805,9 @@ impl Game {
                 Outcome::redraw()
             }
             Command::TogglePanel => {
+                if self.hud.controls.mode == Mode::Live {
+                    self.live_panel_expanded = self.hud.controls.expanded;
+                }
                 self.sync_view_centre();
                 if self.hud.controls.mode == Mode::Buy {
                     self.hud
@@ -1730,9 +1834,93 @@ impl Game {
     }
 
     /// The active Buy Mode placement cursor (once the pointer has entered
-    /// the house view), if any.
+    /// the house view or picked up an existing object), if any.
     pub fn buy_cursor(&self) -> Option<&BuyCursor> {
         self.buy_cursor.as_ref()
+    }
+
+    /// The Buy Mode catalog strip state (sort, category, subcategory, page,
+    /// selected GUID).
+    pub fn buy_state(&self) -> sims_ui::buy::BuyState {
+        self.hud.buy_state
+    }
+
+    /// The Buy Mode catalog strip layout as last built.
+    pub fn buy_layout(&self) -> &sims_ui::buy::BuyLayout {
+        self.hud.buy_layout()
+    }
+
+    /// Toggles the Buy Mode catalog sort order between `ByFunction` and
+    /// `ByRoom` (`0x53a2c3` → `0x4cf3af`), cancelling any active cursor and
+    /// returning to the top-level categories.
+    pub fn toggle_buy_sort(&mut self) -> bool {
+        if self.hud.controls.mode != Mode::Buy {
+            return false;
+        }
+        self.cancel_buy();
+        if self.buy_cursor.is_some() {
+            return false;
+        }
+        let changed = self.hud.buy_state.apply(&Command::BuyToggleSort);
+        self.hud
+            .layout_buy(self.view.size, self.lot.world(), &self.assets);
+        changed
+    }
+
+    /// Steps the Buy Mode catalog grid page by `delta` (`+1` for `x`, `-1` for
+    /// `z`, `0x4d0ef0`). Returns `true` if the displayed page changed.
+    pub fn page_buy(&mut self, delta: i32) -> bool {
+        if self.hud.controls.mode != Mode::Buy
+            || !self.hud.controls.expanded
+            || self.hud.buy_state.category.is_none()
+        {
+            return false;
+        }
+        let before = self.hud.buy_state.page;
+        if !self.hud.buy_state.apply(&Command::BuyPage(delta)) {
+            return false;
+        }
+        self.hud
+            .layout_buy(self.view.size, self.lot.world(), &self.assets);
+        self.hud.buy_state.page != before
+    }
+
+    /// Sells or deletes the currently held Buy Mode object (`Delete` /
+    /// `Backspace` key `0x486b5b` or clicking/dropping onto the catalog strip
+    /// `0x50d04d` → `0x4cf97a` → `0x487e18`). Returns `true` if a Buy cursor
+    /// was active and handled.
+    pub fn sell_held(&mut self) -> bool {
+        if self.hud.controls.mode != Mode::Buy || self.stopped.is_some() {
+            return false;
+        }
+        let Some(cursor) = self.buy_cursor.take() else {
+            return false;
+        };
+        match self.lot.buy_sell(&cursor) {
+            Ok(true) => {
+                self.buy_dragging = None;
+                self.buy_grab_offset = [0, 0];
+                self.buy_commit_on_release = false;
+                self.buy_in_house = false;
+                self.buy_selected = None;
+                self.hud.buy_state.selected = None;
+                self.refresh_world();
+                self.hud
+                    .layout_buy(self.view.size, self.lot.world(), &self.assets);
+            }
+            Ok(false) => {
+                self.buy_cursor = Some(cursor);
+                self.hud.play(crate::hud::ERROR);
+            }
+            Err(e) => {
+                self.buy_cursor = Some(cursor);
+                self.note = Some(format!("The object was not sold: {e}"));
+                self.hud.play(crate::hud::ERROR);
+            }
+        }
+        let sounds = self.hud.take_sounds();
+        self.keep_sounds(sounds);
+        true
     }
 
     /// Whether a committed Buy Mode purchase can be undone (`0x4cf074`).
@@ -1838,10 +2026,18 @@ impl Game {
             self.note = Some(format!("The mode was not changed: {e}"));
             return;
         }
+        if self.hud.controls.mode == Mode::Live && mode != Mode::Live {
+            self.live_panel_expanded = self.hud.controls.expanded;
+        }
         let was_expanded = self.hud.controls.expanded;
+        let next_expanded = if mode == Mode::Live {
+            self.live_panel_expanded
+        } else {
+            true
+        };
         self.hud.controls.mode = mode;
-        self.hud.controls.expanded = true;
-        if !was_expanded {
+        self.hud.controls.expanded = next_expanded;
+        if was_expanded != next_expanded {
             self.sync_view_centre();
         }
         self.hud.controls.help = None;
@@ -1900,6 +2096,8 @@ impl Game {
     /// the preview fails, the cursor handle is kept so it can be retried.
     pub fn cancel_buy(&mut self) -> bool {
         self.buy_dragging = None;
+        self.buy_grab_offset = [0, 0];
+        self.buy_commit_on_release = false;
         self.buy_in_house = false;
         let had_cursor = if let Some(cursor) = self.buy_cursor.take() {
             match self.lot.buy_cancel(&cursor) {
@@ -2053,7 +2251,12 @@ impl Game {
             false
         };
         if !rotated {
-            let at = [point[0] - pick::ORIGIN_COLUMN, point[1]];
+            let grab = if cursor.is_existing() {
+                self.buy_grab_offset
+            } else {
+                [0, 0]
+            };
+            let at = [point[0] - grab[0] - pick::ORIGIN_COLUMN, point[1] - grab[1]];
             let fine = sims_render::unproject_terrain(&self.lot_shape, &self.view.camera, at)
                 .unwrap_or_else(|| self.view.camera.unproject_fine(at));
             if let Err(e) = self.lot.buy_move(&mut cursor, fine, self.view.camera.level) {
@@ -2106,11 +2309,16 @@ impl Game {
             .unwrap_or_else(|| sims_vm::default_buy_direction(self.view.camera.rotation));
         match self.lot.buy_commit(&cursor) {
             Ok(_) => {
+                self.buy_grab_offset = [0, 0];
+                self.buy_commit_on_release = false;
                 // Native `0x486ada` line `0x486af6`: remember the committed
                 // facing on the tool (`tool[0x10]`).
                 self.buy_facing = Some(last_facing);
                 self.buy_last_guid = Some(cursor.guid);
-                if cursor.keep_buying || self.shift_held {
+                // Native `0x4864d0` line `0x4867e8`: repeat-buy (`keep_buying`
+                // or `VK_SHIFT`) runs only for newly bought catalog objects
+                // (`+0x75 != 0`), never when dropping a moved existing object.
+                if !cursor.is_existing() && (cursor.keep_buying || self.shift_held) {
                     let funds = sims_vm::available_funds(self.lot.world());
                     if cursor.price <= 0 || cursor.price <= funds {
                         self.buy_selected = Some(cursor.guid);

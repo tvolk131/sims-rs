@@ -1406,14 +1406,15 @@ impl Lot {
         };
         let mut world = self.world.clone();
         if clearing {
+            let empty = BTreeSet::new();
             interpreter
-                .buy_purge_detached(&mut world, &self.buy_redo)
+                .buy_purge_detached(&mut world, &self.buy_redo, &empty)
                 .map_err(OrderError::Refused)?;
             interpreter
-                .buy_purge_detached(&mut world, &self.buy_undo)
+                .buy_purge_detached(&mut world, &self.buy_undo, &empty)
                 .map_err(OrderError::Refused)?;
             interpreter
-                .buy_purge_detached(&mut world, &self.buy_orphans)
+                .buy_purge_detached(&mut world, &self.buy_orphans, &empty)
                 .map_err(OrderError::Refused)?;
         }
         interpreter
@@ -1452,6 +1453,106 @@ impl Lot {
             .map_err(OrderError::Refused)?;
         self.world = world;
         Ok(cursor)
+    }
+
+    /// Whether existing lot object `id` (or its multi-tile group) can be
+    /// picked up with the Buy Mode Hand Tool (`0x4352e8` / `0x422fdc`).
+    pub fn can_pick_up(&self, id: u16) -> Result<bool, OrderError> {
+        self.ready()?;
+        let interpreter = Interpreter {
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        interpreter
+            .can_pick_up(&self.world, id)
+            .map_err(OrderError::Refused)
+    }
+
+    /// Whether existing lot object `id` (or its multi-tile group) can be sold
+    /// or deleted in Buy Mode (`0x435440` / `0x423135`).
+    pub fn can_delete(&self, id: u16) -> Result<bool, OrderError> {
+        self.ready()?;
+        let interpreter = Interpreter {
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        interpreter
+            .can_delete(&self.world, id)
+            .map_err(OrderError::Refused)
+    }
+
+    /// Resale/depreciation value of `id` (`0x43219a`: lead `data[41]`, halved
+    /// if any part has `data[15] != 0`).
+    pub fn resale_value(&self, id: u16) -> Result<i32, OrderError> {
+        self.ready()?;
+        let interpreter = Interpreter {
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        interpreter
+            .resale_value(&self.world, id)
+            .map_err(OrderError::Refused)
+    }
+
+    /// Picks up an existing lot object with the Buy Mode Hand Tool
+    /// (`0x485f98` → `0x486960` → `0x4215e6` → `0x48ba19`). Returns `Ok(None)`
+    /// without changing the lot if `can_pick_up` refuses `id`.
+    pub fn buy_pick_up(&mut self, id: u16) -> Result<Option<BuyCursor>, OrderError> {
+        self.ready()?;
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let cursor = interpreter
+            .buy_pick_up(&mut world, id)
+            .map_err(OrderError::Refused)?;
+        if cursor.is_some() {
+            self.world = world;
+        }
+        Ok(cursor)
+    }
+
+    /// Sells or deletes the held Buy Mode object (`0x487e18`): returns
+    /// `Ok(false)` without changing the lot if `can_delete` refuses it, or
+    /// `Ok(true)` once sold (pushing a `Sell` record onto Undo and clearing
+    /// Redo) or cancelled (for an unpaid catalog preview).
+    pub fn buy_sell(&mut self, cursor: &BuyCursor) -> Result<bool, OrderError> {
+        self.ready()?;
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let Some(record) = interpreter
+            .buy_sell(&mut world, cursor)
+            .map_err(OrderError::Refused)?
+        else {
+            return Ok(false);
+        };
+        if let Some(sell_record) = record {
+            let mut keep = BTreeSet::new();
+            crate::buy::collect_buy_ids(&self.buy_undo, &mut keep);
+            crate::buy::collect_buy_ids(std::slice::from_ref(&sell_record), &mut keep);
+            interpreter
+                .buy_purge_detached(&mut world, &self.buy_redo, &keep)
+                .map_err(OrderError::Refused)?;
+            self.world = world;
+            self.buy_undo.push(sell_record);
+            self.buy_redo.clear();
+        } else {
+            self.world = world;
+        }
+        Ok(true)
     }
 
     /// Moves an active Buy Mode cursor and its held object to fine lot
@@ -1614,8 +1715,11 @@ impl Lot {
         let purchase = interpreter
             .buy_commit_record(&mut world, cursor)
             .map_err(OrderError::Refused)?;
+        let mut keep = BTreeSet::new();
+        crate::buy::collect_buy_ids(&self.buy_undo, &mut keep);
+        crate::buy::collect_buy_ids(std::slice::from_ref(&purchase), &mut keep);
         interpreter
-            .buy_purge_detached(&mut world, &self.buy_redo)
+            .buy_purge_detached(&mut world, &self.buy_redo, &keep)
             .map_err(OrderError::Refused)?;
         let id = purchase.object;
         self.world = world;
@@ -1638,7 +1742,7 @@ impl Lot {
     /// `self.world` one by one (`0x48c20e` / `0x48c258`). Any still-registered
     /// off-lot instance whose deletion faults is retained in `self.buy_orphans`
     /// so [`Lot::save`] never silently serializes a detached object.
-    fn purge_buy_history(&mut self, dropped: &[crate::BuyPurchase]) {
+    fn purge_buy_history(&mut self, dropped: &[crate::BuyPurchase], keep: &BTreeSet<u16>) {
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
             sounds: Some(&sounds),
@@ -1648,7 +1752,7 @@ impl Lot {
         };
         for purchase in dropped {
             let mut next = self.world.clone();
-            match interpreter.buy_purge_detached(&mut next, std::slice::from_ref(purchase)) {
+            match interpreter.buy_purge_detached(&mut next, std::slice::from_ref(purchase), keep) {
                 Ok(()) => self.world = next,
                 Err(_) => {
                     if self
@@ -1694,13 +1798,17 @@ impl Lot {
             Ok(false) => {
                 let mut dropped = std::mem::take(&mut self.buy_undo);
                 dropped.push(purchase);
-                self.purge_buy_history(&dropped);
+                let mut keep = BTreeSet::new();
+                crate::buy::collect_buy_ids(&self.buy_redo, &mut keep);
+                self.purge_buy_history(&dropped, &keep);
                 Ok(false)
             }
             Err(fault) => {
                 let mut dropped = std::mem::take(&mut self.buy_undo);
                 dropped.push(purchase);
-                self.purge_buy_history(&dropped);
+                let mut keep = BTreeSet::new();
+                crate::buy::collect_buy_ids(&self.buy_redo, &mut keep);
+                self.purge_buy_history(&dropped, &keep);
                 Err(OrderError::Refused(fault))
             }
         }
@@ -1746,14 +1854,18 @@ impl Lot {
             Err(fault) => {
                 let mut dropped = std::mem::take(&mut self.buy_redo);
                 dropped.push(purchase);
-                self.purge_buy_history(&dropped);
+                let mut keep = BTreeSet::new();
+                crate::buy::collect_buy_ids(&self.buy_undo, &mut keep);
+                self.purge_buy_history(&dropped, &keep);
                 Err(OrderError::Refused(fault))
             }
         }
     }
 
-    /// Cancels an active Buy Mode purchase (`0x487105`), deleting both the
-    /// `"Tile Cursor"` and the unplaced object without charging funds. On
+    /// Cancels an active Buy Mode cursor (`0x487191` / `0x487105`): deletes
+    /// both `"Tile Cursor"` and an unpaid catalog object, or deletes `"Tile
+    /// Cursor"` and snaps a picked-up existing object back to its pre-pickup
+    /// placement (clearing the redo stack per `0x487191` → `0x4933a9`). On
     /// error, the lot is left unchanged so the caller still owns `cursor`.
     pub fn buy_cancel(&mut self, cursor: &BuyCursor) -> Result<(), OrderError> {
         self.ready()?;
@@ -1768,7 +1880,18 @@ impl Lot {
         interpreter
             .buy_cancel(&mut world, cursor)
             .map_err(OrderError::Refused)?;
+        if cursor.is_existing() {
+            let mut keep = BTreeSet::new();
+            crate::buy::collect_buy_ids(&self.buy_undo, &mut keep);
+            keep.insert(cursor.held);
+            interpreter
+                .buy_purge_detached(&mut world, &self.buy_redo, &keep)
+                .map_err(OrderError::Refused)?;
+        }
         self.world = world;
+        if cursor.is_existing() {
+            self.buy_redo.clear();
+        }
         Ok(())
     }
 

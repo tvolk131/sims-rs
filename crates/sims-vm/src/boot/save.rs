@@ -194,10 +194,15 @@ impl Lot {
                 })?;
             }
             if has_history {
+                let empty = std::collections::BTreeSet::new();
                 interpreter
-                    .buy_purge_detached(&mut world, &self.buy_redo)
-                    .and_then(|()| interpreter.buy_purge_detached(&mut world, &self.buy_undo))
-                    .and_then(|()| interpreter.buy_purge_detached(&mut world, &self.buy_orphans))
+                    .buy_purge_detached(&mut world, &self.buy_redo, &empty)
+                    .and_then(|()| {
+                        interpreter.buy_purge_detached(&mut world, &self.buy_undo, &empty)
+                    })
+                    .and_then(|()| {
+                        interpreter.buy_purge_detached(&mut world, &self.buy_orphans, &empty)
+                    })
                     .map_err(|e| {
                         SaveError::Format(format!("clearing detached Buy Mode redo objects: {e}"))
                     })?;
