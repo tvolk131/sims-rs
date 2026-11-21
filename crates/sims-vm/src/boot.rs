@@ -912,6 +912,10 @@ impl Lot {
         self.world.idle_speed(residential);
         // The application's poll (0x4d1a8b → 0x4764fe) before the next
         // update sees 0 once the clicked dialog's button is destroyed.
+        // The poll runs once per pass of the application's loop, whose
+        // idle call can run several updates (0x46da70 to 0x46dac7); here
+        // every update is taken to follow a poll (unverified). Inside such
+        // a batch, the original would still show a clicked bitmap.
         let update = publish_waited_for(&mut self.world, 0)
             .map_err(TickError::from)
             .and_then(|()| {

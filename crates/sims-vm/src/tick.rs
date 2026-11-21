@@ -165,9 +165,13 @@ pub struct Answer {
     /// The status the button gives (0x4370be): 2 for the first button,
     /// 3 for the second, 4 for the third.
     pub status: u8,
-    /// The activated button's bitmap resource ID, as sampled by 0x476548.
-    /// The window supplies the ID and a headless replay records it here.
-    /// None leaves global 12 alone, as for a dialog that closed itself.
+    /// What the wait check (0x476548) last published to global 12 while
+    /// the dialog was open: the activated button's bitmap resource ID, or
+    /// 0 from an idle poll (0x5dac77, 0x47653d) after an earlier button
+    /// was destroyed (0x5e39cf). None means no poll changed it, so global
+    /// 12 is left alone; it does not mean the dialog closed itself. The
+    /// window supplies the ID and a headless replay records what was
+    /// observed.
     pub bitmap_id: Option<i16>,
 }
 

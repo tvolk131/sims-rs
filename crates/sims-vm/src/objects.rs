@@ -234,7 +234,11 @@ impl Interpreter<'_> {
     /// 0x4746e4/0x4746e8 ORs the old high bit into the word read from ObjM.
     /// `frame_tree_bits` supplies the set bits from such an arena as
     /// (saved object ID, zero-based frame index). Other arena bits are
-    /// taken as zero. The first frame's arena bit is always zero.
+    /// taken as zero. The first frame's arena bit is always zero, so a
+    /// captured bit on frame 0 fails. That rule is for captured residue
+    /// only: a saved tree word that itself has bit 15 set is read as it
+    /// is (0x4746e8), as the native reader does. The native writer masks
+    /// the bit (0x4746c0), so a save the original wrote has none.
     pub fn read_objects_with_frame_tree_bits(
         &self,
         world: &mut World,

@@ -254,9 +254,11 @@ const UD1_RECORDED_FRAMES: &str = "0,1,2,3,4,32,62,92,101,102,128+30";
 /// (`20261115-household-selection-works-out-again-who-visitor.md`).
 const UD1_FRAME_TREE_BITS: [(u16, usize); 4] = [(263, 1), (264, 1), (265, 1), (268, 1)];
 /// The recording's dialogs after the load, in order. Each closed with
-/// result 2. The fourth was closed by a button whose bitmap is 17
-/// (`WinBtn.bmp`), which global 12 then names until the next update
-/// (0x46d9c4); the others closed themselves and left global 12 alone.
+/// result 2. While the fourth was open, the wait check published 17
+/// (`WinBtn.bmp`, 0x46d9c4), the bitmap of the button that closed it,
+/// which global 12 holds until the next update. While the others were
+/// open, global 12 did not change in the recording, so they publish
+/// nothing.
 const UD1_DIALOGS: [(u8, Option<i16>); 6] = [
     (2, None),
     (2, None),
