@@ -35,8 +35,8 @@ use std::collections::{BTreeMap, BTreeSet};
 /// by [`sims_sim::SNAPSHOT_FORMAT`], which is written too. A save of
 /// another version is refused, not migrated. Layout 2 keeps each pending
 /// dialog answer's bitmap ID ([`crate::Answer`]); layout 3 keeps the
-/// house view's centre; layout 6 keeps [`World::dirty_portraits`],
-/// [`World::generated_portrait_2002`] keyed by [`PortraitFile`], and
+/// house view's centre; layout 7 keeps [`World::dirty_portraits`],
+/// [`World::generated_portrait_2002`] keyed by [`PortraitFile`],
 /// [`World::made_portrait_head`], and [`World::ambiguous_portraits`]
 /// (superseding pre-merge layouts 4–6).
 pub const FORMAT: u32 = 7;

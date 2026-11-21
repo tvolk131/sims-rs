@@ -656,9 +656,10 @@ impl Machine<'_, '_> {
 
     /// Whether copying `raw` via `0x40d0a4`/`0x40d10b` (body) or
     /// `0x40d408`/`0x40d46f` (head) produces a `"HEAD"`-binding suit on the
-    /// clone: rules out rows that cannot match any wardrobe entry before
-    /// inspecting `wardrobe.errors`, then looks up the matching wardrobe entry
-    /// (`0x472f92`) and classifies the 63-byte suit name serialized by
+    /// clone: rules out rows that cannot match any wardrobe entry (including
+    /// the 255-byte row cap at `0x587511`–`0x58752c` and missing textures when
+    /// texture enumeration succeeded) before inspecting suit catalog errors,
+    /// then classifies the 63-byte suit name serialized by
     /// `0x4092c5`–`0x4092e1` → `0x40d4d7` → `0x472f41`.
     fn copied_outfit_head_status(
         &self,
@@ -671,37 +672,19 @@ impl Machine<'_, '_> {
         let Some(raw) = raw else {
             return Some(false);
         };
-        let before_semi = raw.split(';').next().unwrap_or(raw);
-        let Some((raw_suit, raw_tex)) = before_semi.split_once(',') else {
-            return Some(false);
-        };
-        let tag = if is_head { "head-head=" } else { "body=" };
-        let row_tex: String = raw_tex.to_ascii_lowercase().chars().take(63).collect();
-        if !row_tex.starts_with(tag) {
-            return Some(false);
-        }
-        let row_suit: String = raw_suit.to_ascii_lowercase().chars().take(63).collect();
-        let (first, length) = if is_head { ('c', 6) } else { ('b', 9) };
-        let sex = if female { 'f' } else { 'm' };
-        let age = if child { 'c' } else { 'a' };
-        let chars: Vec<char> = row_suit.chars().take(length).collect();
-        let suit_matches = chars.len() == length
-            && chars[0] == first
-            && (chars[4] == sex || chars[4] == 'u')
-            && chars[5] == age
-            && !(is_head && chars[1] == 't');
-        if !suit_matches {
-            return Some(false);
-        }
-        let part: String = chars.into_iter().collect();
-        let expected_tex_prefix: String = format!("{tag}{part}{}", skin.to_ascii_lowercase())
-            .chars()
-            .take(63)
-            .collect();
-        if !row_tex.starts_with(&expected_tex_prefix) {
+        if !sims_content::Wardrobe::can_match_outfit_row(is_head, female, child, skin, raw) {
             return Some(false);
         }
         let wardrobe = self.program.wardrobe.as_ref()?;
+        // `.cmx`/`.bcf` suit decode errors can hide suits, never add a missing
+        // texture filename; if texture enumeration succeeded (no unread-files
+        // sentinel) and no texture matches, 0x40982d/0x40a502 cannot build a
+        // matching entry.
+        if !wardrobe.errors.contains_key("the install's person files")
+            && !wardrobe.has_outfit_texture(is_head, female, child, skin, raw)
+        {
+            return Some(false);
+        }
         if !wardrobe.errors.is_empty() {
             return None;
         }

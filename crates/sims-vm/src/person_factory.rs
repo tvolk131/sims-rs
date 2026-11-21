@@ -187,9 +187,11 @@ impl Interpreter<'_> {
         };
         // 0x440d63..0x440dd8 checks body string 0 ("dog" / "kat") for both
         // runtime-made and catalog pets before constructing cXPerson or
-        // loading the skeleton.
+        // loading the skeleton, and 0x58833c binds that same loader-ordered
+        // skeleton name.
+        let early_name = self.early_skeleton_name(world, guid);
         if !pets_allowed(self.program.expansions)
-            && self.early_skeleton_name(world, guid).is_some_and(|name| {
+            && early_name.is_some_and(|name| {
                 ["dog", "kat"]
                     .iter()
                     .any(|pet| name.eq_ignore_ascii_case(pet))
@@ -197,9 +199,36 @@ impl Interpreter<'_> {
         {
             return Ok(None);
         }
-        let skeleton =
-            crate::people::skeleton(&self.program.people, world, guid).map_err(|t| fail(0, t))?;
-        if !pets_allowed(self.program.expansions)
+        let template = world.characters.definition(guid);
+        let skeleton = match early_name {
+            Some(name)
+                if self
+                    .program
+                    .people
+                    .skeletons
+                    .get(&template)
+                    .is_none_or(|s| !s.name.eq_ignore_ascii_case(name)) =>
+            {
+                self.program
+                    .people
+                    .skeletons
+                    .values()
+                    .find(|s| s.name.eq_ignore_ascii_case(name))
+                    .ok_or_else(|| {
+                        fail(
+                            0,
+                            Trap::Unsupported(format!(
+                                "no person type's skeleton is named {name:?}, which the person \
+                                 type 0x{guid:08X} names"
+                            )),
+                        )
+                    })?
+            }
+            _ => crate::people::skeleton(&self.program.people, world, guid)
+                .map_err(|t| fail(0, t))?,
+        };
+        if early_name.is_none()
+            && !pets_allowed(self.program.expansions)
             && ["dog", "kat"]
                 .iter()
                 .any(|pet| skeleton.name.eq_ignore_ascii_case(pet))

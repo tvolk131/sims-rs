@@ -1328,6 +1328,8 @@ fn make_new_character_wardrobe_head_binding_drives_ui_effect_render_and_writebac
     let suit_64 = format!("c001fa_{}", "b".repeat(57));
     assert_eq!(suit_64.len(), 64);
     let long_suit_row = format!("{suit_63}_extra,HEAD-HEAD=c001falgt_alice01");
+    let comma_past_255_row = format!("{suit_63}{},HEAD-HEAD=c001falgt_alice01", "x".repeat(194));
+    assert_eq!(comma_past_255_row.find(','), Some(257));
     let overlong_64_row = format!("{suit_64},HEAD-HEAD=c001falgt_alice01");
     let long_head_tex = format!("c001falgt_{}_aaa.bmp", "z".repeat(50));
     let long_head_row = format!("c001fa_alice,HEAD-HEAD=c001falgt_{}_bbb", "z".repeat(50));
@@ -1355,6 +1357,28 @@ fn make_new_character_wardrobe_head_binding_drives_ui_effect_render_and_writebac
             long_suit_row.as_str(),
             false,
             true,
+        ),
+        // Comma past byte 255 (0x587511..0x58752c caps row at 255 bytes):
+        // definite miss with or without a wardrobe catalog error.
+        (
+            "b999fafit_npc,BODY=b999fafitlgt_npc",
+            comma_past_255_row.as_str(),
+            false,
+            false,
+        ),
+        (
+            "b999fafit_npc,BODY=b999fafitlgt_npc",
+            comma_past_255_row.as_str(),
+            true,
+            false,
+        ),
+        // Valid head descriptor whose texture is missing from wardrobe.textures
+        // with an unrelated .cmx error: definite miss at 0x40a502 without trap.
+        (
+            "NONE",
+            "c001fa_alice,HEAD-HEAD=c001falgt_missing",
+            true,
+            false,
         ),
         // 64-byte registered suit whose 63-byte prefix is NOT registered:
         // 0x4092c5..0x4092e1 writes the 63-byte prefix and 0x5a27f9 misses.
@@ -1526,6 +1550,39 @@ fn make_new_character_wardrobe_head_binding_drives_ui_effect_render_and_writebac
     );
     assert!(fx.world.portraits.is_empty());
     assert_eq!(fx.world.crt_rng, crt_before);
+
+    // 7d. Reverse split US-English runs (`0x470002`–`0x470049`): physical row 0
+    // is "kat" (leaving a stale cached "kat" skeleton on WIDGET), while a later
+    // US-English run names the human skeleton "adult" (present in
+    // `people.skeletons`). With pet expansions absent, the factory passes
+    // 0x440d7d, binds "adult" (0x58833c), advances CRT RNG, and caches WIDGET.
+    let (mut fx, file, record) = visitors();
+    fx.program.expansions = 0;
+    let adult_skel = fx.program.people.skeletons[&WIDGET].clone();
+    let mut kat_skel = adult_skel.clone();
+    kat_skel.name = "kat".into();
+    let mut named_adult = adult_skel;
+    named_adult.name = "adult".into();
+    fx.program.people.skeletons.insert(WIDGET, kat_skel);
+    fx.program.people.skeletons.insert(SIM_GUID, named_adult);
+    fx.program
+        .people
+        .skeleton_names
+        .insert(WIDGET, "kat".into());
+    fx.words(file)[19] = 200;
+    {
+        let lib = fx.program.libraries.get_mut(&file).unwrap();
+        lib.strings.insert(200, vec!["kat".into(), "adult".into()]);
+        lib.loaded_strings
+            .insert(200, Some(vec!["adult".into(), "kat".into()]));
+    }
+    let crt_before = fx.world.crt_rng;
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
+        Ok(true)
+    );
+    assert_eq!(fx.world.portraits, [WIDGET].into());
+    assert_ne!(fx.world.crt_rng, crt_before);
 }
 
 #[test]
