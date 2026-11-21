@@ -28,9 +28,11 @@ When a human's body or head count is 0 (`0x44b13f`), or a pet's body count is
 For `species == 1` (`TemplateDog`, `0x4a70df92`) and `species == 2`
 (`TemplateCat`, `0x7bea0977`) with `age >= 0`:
 
-- After `clone_template` and the skin tone lookup (`STR# 0x2000`, native error
-  `0x3b` on missing/empty), `0x44af89` forces `child = 0` regardless of `age`,
-  writing `AGE = "27"`, `SKIN = tone`, `SKELETON = "dog"` or `"kat"`, and
+- After `clone_template` and the skin tone lookup (`STR# 0x2000`, truncated
+  into the native 3-byte fixed buffer at `0x40bf8b` before the `0x3b`
+  emptiness check — so e.g. the shipped `"unknown"` pet tone becomes `"unk"`),
+  `0x44af89` forces `child = 0` regardless of `age`, writing `AGE = "27"`,
+  `SKIN = tone`, `SKELETON = "dog"` or `"kat"`, and
   `GENDER = "dogmale" | "dogfemale" | "catmale" | "catfemale"` (`0x40cc2a`,
   `0x40d02f`, `0x40ce41`).
 - `Wardrobe::count_pet` implements `0x408bf5(0)` → `0x409663` for gender codes
@@ -71,10 +73,11 @@ from the running object's definition (`0x44b267`):
   returns null, dereferenced at `0x40934b`) or has a pet/unknown gender
   (`0x40d408` → `0x408bf5(1)` returns null, dereferenced at `0x40d42e`).
 - For a human running object (`"male"` or `"female"`), copies age (`"9"` if
-  `atoi(age) <= 17`, else `"27"`, `0x40cbdd` → `0x40cc2a`), skeleton
-  (`"child"` / `"adult"`, skipped if the cloned template already has a pet
-  gender per `0x40cee4`), skin tone (`0x40d007`, defaulting a missing string
-  to `"???"`), and gender (`0x40ccac` → `0x40ce41`), with 0 game RNG draws,
+  `atoi` of the first 15 bytes of `age` is `<= 17`, else `"27"`, `0x40cbdd` →
+  `0x40cc2a`), skeleton (`"child"` / `"adult"`, skipped if the cloned
+  template already has a pet gender per `0x40cee4`), skin tone (`0x40d007`,
+  defaulting a missing string to `"???"` and truncating to 3 bytes via
+  `0x40bf8b`), and gender (`0x40ccac` → `0x40ce41`), with 0 game RNG draws,
   sets `stack_object = record`, and returns `true`.
 
 ## Unverified

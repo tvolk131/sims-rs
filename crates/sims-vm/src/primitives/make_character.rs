@@ -94,9 +94,17 @@ fn is_pet_gender(gender: Option<&str>) -> bool {
     })
 }
 
-/// C-locale `atoi` <= 17 check (`0x40cbdd` → `0x636029`).
+/// Truncates a skin tone string to the native 3-byte fixed buffer (`0x40bf8b`,
+/// capacity 4 including NUL, single-byte Windows-1252 code page).
+fn truncate_skin_tone(text: &str) -> String {
+    text.chars().take(3).collect()
+}
+
+/// C-locale `atoi` <= 17 check on the native 15-byte fixed buffer (`0x40cbdd`,
+/// capacity 16 including NUL, → `0x636029`).
 fn is_child_age(text: &str) -> bool {
-    let text = text.trim_start_matches([' ', '\t', '\n', '\r', '\x0b', '\x0c']);
+    let bounded: String = text.chars().take(15).collect();
+    let text = bounded.trim_start_matches([' ', '\t', '\n', '\r', '\x0b', '\x0c']);
     let (negative, digits) = match text.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, text.strip_prefix('+').unwrap_or(text)),
@@ -146,12 +154,13 @@ impl Machine<'_, '_> {
         }
         // The skin tone's name: string local + 1 of STR# 0x2000 in the
         // type's semi-global file, counting from 1 (0x47028b, 0x4704fa),
-        // which is the template's.
+        // truncated into the native 3-byte fixed buffer (0x40bf8b) before the
+        // emptiness check (0x44af49).
         let tone = crate::people::profile(&self.program.people, self.world, guid)?
             .tones
             .get(usize::try_from(skin).unwrap_or(usize::MAX))
+            .map(|tone| truncate_skin_tone(tone))
             .filter(|tone| !tone.is_empty())
-            .cloned()
             .ok_or(Trap::native(
                 0x3b,
                 "Make New Character skin tone has no name",
@@ -277,8 +286,9 @@ impl Machine<'_, '_> {
             }
         };
         let src_child = src.age.as_deref().map(is_child_age).unwrap_or(true);
-        // 0x40d007 returns "???" when STR# 200 string 14 is absent (null).
-        let src_skin = src.skin.as_deref().unwrap_or("???");
+        // 0x40d007 returns "???" when STR# 200 string 14 is absent (null),
+        // and copies into the native 3-byte fixed buffer (0x40bf8b).
+        let src_skin = truncate_skin_tone(src.skin.as_deref().unwrap_or("???"));
         let dst_is_pet = is_pet_gender(
             crate::people::profile(&self.program.people, self.world, guid)?
                 .gender
@@ -300,7 +310,7 @@ impl Machine<'_, '_> {
                 if src_child { "child" } else { "adult" }.to_owned(),
             );
         }
-        made.strings.insert(characters::SKIN, src_skin.to_owned());
+        made.strings.insert(characters::SKIN, src_skin);
         made.strings
             .insert(characters::GENDER, src_gender.to_owned());
         self.frame_mut()?.stack_object = record;
@@ -308,9 +318,16 @@ impl Machine<'_, '_> {
     }
 
     /// Cleans up a newly cloned character whose wardrobe count was 0
-    /// (`0x44b203` → `0x426fcd` → `0x4259a2`): unregisters the made type and
-    /// deletes its neighborhood record.
+    /// (`0x44b203` → `0x409492(0)` → `0x426fcd` → `0x4259a2`): discards
+    /// uncommitted body-string edits, unregisters the made type, and deletes
+    /// its neighborhood record.
     fn cleanup_failed_character(&mut self, guid: u32, record: i16) -> Result<(), Trap> {
+        // 0x44b20a: 0x409492(0) discards uncommitted body-string edits before
+        // calling 0x426fcd, so even if a family protects the GUID, the clone
+        // keeps its template strings.
+        if let Some(made) = self.world.characters.made.get_mut(&guid) {
+            made.strings.clear();
+        }
         if self
             .world
             .objects

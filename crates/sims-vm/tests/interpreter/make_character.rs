@@ -14,11 +14,9 @@ const TEMPLATE_DOG: u32 = 0x4a70_df92;
 const TEMPLATE_CAT: u32 = 0x7bea_0977;
 
 /// A fixture whose lamp's tree 4096 sets its locals 0 to 2 to `skin`,
-/// `age` and `sex`, then makes a new character from them with template
-/// byte `species`, and on true puts the stack object's ID in global 34.
-/// TemplatePerson is registered, with a neighbour record and skin tones
-/// `tones`, and the wardrobe gives an adult male of tone "lgt" two bodies
-/// and one head ([`wardrobe`]).
+/// `age` and `sex` and `stack_object` to 77, then makes a new character
+/// from them with template byte `species`. On true it puts `stack_object`
+/// in global 34; on false it puts `stack_object` in temp 0.
 fn fixture(skin: i16, age: i16, sex: i16, species: u8, tones: &[&str]) -> Fixture {
     let mut fx = Fixture::new();
     fx.add(
@@ -28,8 +26,10 @@ fn fixture(skin: i16, age: i16, sex: i16, species: u8, tones: &[&str]) -> Fixtur
             assign(scope::LOCALS, 0, scope::LITERAL, skin, 1),
             assign(scope::LOCALS, 1, scope::LITERAL, age, 2),
             assign(scope::LOCALS, 2, scope::LITERAL, sex, 3),
-            ins(19, 4, RETURN_FALSE, [0, 1, 2, species, 0, 0, 0, 0]),
+            assign(scope::STACK_OBJECT, 0, scope::LITERAL, 77, 4),
+            ins(19, 5, 6, [0, 1, 2, species, 0, 0, 0, 0]),
             assign(scope::GLOBAL, 34, scope::STACK_OBJECT, 0, RETURN_TRUE),
+            assign(scope::TEMPS, 0, scope::STACK_OBJECT, 0, RETURN_FALSE),
         ]),
     );
     fx.add_type(TEMPLATE_PERSON, 2, 0, 0);
@@ -158,10 +158,18 @@ fn a_child_gets_a_type_cloned_from_the_template_with_a_record_and_its_body_strin
 
 #[test]
 fn with_no_body_or_no_head_for_the_tone_it_cleans_up_and_returns_false() {
-    // No child body or head in "med", and no adult female body in "med".
-    for (age, sex) in [(10, 0), (30, 1)] {
-        let mut fx = fixture(1, age, sex, 0, &TONES);
+    // Test body-only miss (bodies == 0, heads > 0) AND head-only miss
+    // (bodies > 0, heads == 0) separately so neither check can be dropped.
+    for remove_head in [false, true] {
+        let mut fx = fixture(0, 30, 0, 0, &TONES);
         fx.world.globals[34] = 99;
+        let w = fx.program.wardrobe.as_mut().unwrap();
+        if remove_head {
+            w.textures.remove("c001malgt_bob.bmp");
+        } else {
+            w.textures.remove("b001mafitlgt_01.bmp");
+            w.textures.remove("b001mafitlgt_02.bmp");
+        }
         let slots = fx.world.neighbors.slots.len();
         let lot_before = fx.world.lot_rng;
         // Pre-populate a relationship row targeting the soon-to-be-allocated
@@ -197,7 +205,7 @@ fn with_no_body_or_no_head_for_the_tone_it_cleans_up_and_returns_false() {
         assert_eq!(fx.run(), Ok(false));
         // Type is unregistered (file number 0 is free again), counter stayed
         // advanced, 1 CRT draw happened, 0 game draws happened, stack object
-        // was not updated (global 34 untouched).
+        // stayed at 77 (written to global 35 on false branch).
         assert!(fx.world.characters.made.is_empty());
         assert_eq!(fx.world.characters.next_file, 1);
         assert_eq!(fx.world.lot_rng, lot_before);
@@ -205,6 +213,7 @@ fn with_no_body_or_no_head_for_the_tone_it_cleans_up_and_returns_false() {
         crt.next_u15();
         assert_eq!(fx.world.crt_rng, crt);
         assert_eq!(fx.world.globals[34], 99);
+        assert_eq!(fx.world.objects[&LAMP].temps[0], 77);
         // Slot was vacated in place (len stays slots + 1, slot is None).
         assert_eq!(fx.world.neighbors.slots.len(), slots + 1);
         assert!(fx.world.neighbors.slots[slots].is_none());
@@ -228,6 +237,23 @@ fn with_no_body_or_no_head_for_the_tone_it_cleans_up_and_returns_false() {
             neighbor: (slots + 1) as i16,
             items: Vec::new(),
         }]
+    );
+
+    // If a family protects the cloned GUID, 0x409492(0) still discards the
+    // uncommitted body-string edits before 0x426fcd returns early.
+    let mut fx = fixture(1, 10, 0, 0, &TONES);
+    fx.world.families.push(sims_sim::neighbors::Family {
+        id: 1,
+        house: 0,
+        members: vec![expected_guid()],
+        friends: 0,
+        stale: true,
+    });
+    assert_eq!(fx.run(), Ok(false));
+    assert!(
+        fx.world.characters.made[&expected_guid()]
+            .strings
+            .is_empty()
     );
 }
 
@@ -506,6 +532,54 @@ fn negative_age_fails_loudly_for_non_person_or_pet_running_object() {
         unsupported(trap(fx.run()), "0x40d42e");
         assert!(fx.world.characters.made.contains_key(&expected_guid()));
     }
+}
+
+#[test]
+fn skin_tone_truncates_to_three_bytes_and_negative_age_truncates_to_fifteen_bytes() {
+    // Non-negative human: "lgtExtra" truncates to "lgt" (0x40bf8b) before
+    // wardrobe lookup and writing body string 14.
+    let mut fx = fixture(0, 30, 0, 0, &["lgtExtra"]);
+    assert_eq!(fx.run(), Ok(true));
+    assert_eq!(
+        fx.world.characters.made[&expected_guid()].strings[&characters::SKIN],
+        "lgt"
+    );
+
+    // Non-negative pet: shipped "unknown" tone truncates to "unk" (0x40bf8b).
+    let mut fx = fixture(0, 5, 0, 1, &TONES);
+    add_pet_templates(&mut fx);
+    fx.program
+        .people
+        .profiles
+        .get_mut(&TEMPLATE_DOG)
+        .unwrap()
+        .tones = vec!["unknown".into()];
+    assert_eq!(fx.run(), Ok(true));
+    assert_eq!(
+        fx.world.characters.made[&expected_guid()].strings[&characters::SKIN],
+        "unk"
+    );
+
+    // Negative age: "0000000000000018" truncates to 15 bytes ("000000000000001")
+    // at 0x40cbdd -> atoi == 1 <= 17 (child "9"), and "drkExtra" truncates to
+    // "drk" at 0x40bf8b.
+    let mut fx = fixture(0, -1, 0, 0, &TONES);
+    fx.catalog.objects[0].kind = 2;
+    let lamp_guid = fx.world.objects[&LAMP].guid;
+    fx.program.people.profiles.insert(
+        lamp_guid,
+        Profile {
+            gender: Some("male".into()),
+            age: Some("0000000000000018".into()),
+            skin: Some("drkExtra".into()),
+            ..Profile::default()
+        },
+    );
+    assert_eq!(fx.run(), Ok(true));
+    let strings = &fx.world.characters.made[&expected_guid()].strings;
+    assert_eq!(strings[&characters::AGE], "9");
+    assert_eq!(strings[&characters::SKELETON], "child");
+    assert_eq!(strings[&characters::SKIN], "drk");
 }
 
 #[test]
