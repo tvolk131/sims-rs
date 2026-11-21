@@ -6118,4 +6118,24 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
     assert!(game.lot().world().objects[&drag_lamp].position[0] >= 0);
     assert_ne!(game.lot().world().objects[&drag_lamp].data[2], 0);
     assert_eq!(game.lot().world().objects[&drag_lamp].data[1], 4);
+
+    // Changing floors during a drag (`0x485ba2` -> `0x485bda` / `0x485e72`):
+    // start dragging a Werkbunnst Chair on the ground-floor lawn, move up to
+    // floor 2, drag >6 px, and release. Placement re-evaluates on floor 2
+    // (no floor above the lawn) and must NOT buy the chair downstairs.
+    game.press([234, 550]); // Back to top-level categories
+    game.release([234, 550]);
+    game.press([258, 524]); // Seating -> Chairs
+    game.release([258, 524]);
+    game.press([437, 523]); // Werkbunnst Chair
+    game.release([437, 523]);
+    let floor_spot = [577, 432];
+    game.hover(floor_spot);
+    let funds_before_floor_drag = game.lot().world().budget.funds;
+    game.press(floor_spot);
+    game.view.camera.level = 2;
+    game.hover([589, 444]);
+    game.release([589, 444]);
+    assert_eq!(game.lot().world().budget.funds, funds_before_floor_drag);
+    assert!(game.buy_cursor().is_some_and(|c| !c.valid));
 }

@@ -1526,9 +1526,9 @@ impl Lot {
         Ok(())
     }
 
-    /// Re-evaluates Buy Mode placement directly at the cursor's saved
-    /// coordinates (`0x485bda` → `0x421e72`).
-    pub fn buy_recheck(&mut self, cursor: &mut BuyCursor) -> Result<bool, OrderError> {
+    /// Re-evaluates Buy Mode placement directly at the `"Tile Cursor"`'s
+    /// physical `(x, y)` on `level` (`0x485b62..0x485bda` → `0x421e72`).
+    pub fn buy_recheck(&mut self, cursor: &mut BuyCursor, level: i32) -> Result<bool, OrderError> {
         self.ready()?;
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
@@ -1540,16 +1540,21 @@ impl Lot {
         let mut world = self.world.clone();
         let mut next = cursor.clone();
         let valid = interpreter
-            .buy_recheck(&mut world, &mut next)
+            .buy_recheck(&mut world, &mut next, level)
             .map_err(OrderError::Refused)?;
         self.world = world;
         *cursor = next;
         Ok(valid)
     }
 
-    /// Checks `Tile Cursor` fit in place and, if it fits, places at the saved
-    /// coordinates without an extra take-off (`0x485e59` → `0x485e72`).
-    pub fn buy_put_if_fits(&mut self, cursor: &mut BuyCursor) -> Result<bool, OrderError> {
+    /// Checks `Tile Cursor` fit in place on `level` and, if it fits, places at
+    /// the cursor's physical `(x, y)` without an extra take-off (`0x485e59` →
+    /// `0x485e72`).
+    pub fn buy_put_if_fits(
+        &mut self,
+        cursor: &mut BuyCursor,
+        level: i32,
+    ) -> Result<bool, OrderError> {
         self.ready()?;
         let sounds = RefCell::new(Vec::new());
         let interpreter = Interpreter {
@@ -1561,7 +1566,7 @@ impl Lot {
         let mut world = self.world.clone();
         let mut next = cursor.clone();
         let valid = interpreter
-            .buy_put_if_fits(&mut world, &mut next)
+            .buy_put_if_fits(&mut world, &mut next, level)
             .map_err(OrderError::Refused)?;
         self.world = world;
         *cursor = next;

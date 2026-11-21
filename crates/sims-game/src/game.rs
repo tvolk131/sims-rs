@@ -1914,13 +1914,11 @@ impl Game {
         let Some(mut cursor) = self.buy_cursor.take() else {
             return false;
         };
-        // Native `0x485b4c` → `0x485bda`: ALWAYS recheck the cursor's previous
-        // on-lot position BEFORE checking the drag threshold (so ordinary
-        // hovers, short drags, and long drags all run the `LEAVING`/`PLACED`
-        // pass at the previous position and snap onto any restored surface).
-        if cursor.position[0] >= 0
-            && let Err(e) = self.lot.buy_recheck(&mut cursor)
-        {
+        // Native `0x485b4c..0x485bda`: ALWAYS recheck the `"Tile Cursor"`'s
+        // physical on-lot position on the currently displayed floor
+        // (`0x485ba2`) BEFORE checking the drag threshold.
+        let level = self.view.camera.level;
+        if let Err(e) = self.lot.buy_recheck(&mut cursor, level) {
             self.note = Some(format!("Could not recheck Buy placement: {e}"));
         }
         let rotated = if let Some(anchor) = self.buy_dragging {
@@ -1956,9 +1954,10 @@ impl Game {
                     }
                 }
                 // Native `0x485e59` → `0x485e72`: test Tile Cursor fit on the
-                // existing preview in place (without an extra TakeOff) and
-                // place if it fits, including when the facing was unchanged.
-                if let Err(e) = self.lot.buy_put_if_fits(&mut cursor) {
+                // existing preview in place on the displayed floor (without an
+                // extra TakeOff) and place if it fits, including when the
+                // facing was unchanged.
+                if let Err(e) = self.lot.buy_put_if_fits(&mut cursor, level) {
                     self.note = Some(format!("Could not finalize Buy placement: {e}"));
                 }
                 true
