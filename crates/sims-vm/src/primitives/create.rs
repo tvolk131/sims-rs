@@ -629,6 +629,7 @@ impl Machine<'_, '_> {
         };
         if word(84) & 1 != 0 || word(68) & 1 != 0 || word(74) & 3 != 0 {
             self.world.portraits.remove(&guid);
+            self.world.dirty_portraits.insert(guid);
         }
         Ok(Some(id))
     }

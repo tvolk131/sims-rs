@@ -191,3 +191,40 @@ fn bytes_of_another_layout_are_refused() {
     let refused = Saved::decode(&header).unwrap_err().to_string();
     assert!(refused.contains("world format"), "{refused}");
 }
+
+#[test]
+fn moving_the_camera_while_a_dialog_waits_replays_with_the_original_view() {
+    let Some((root, house)) = goth_house() else {
+        return;
+    };
+    let mut baseline = Lot::load(&root, &house, &[3], Frames::default()).unwrap();
+    baseline.set_view_rotation(1);
+    baseline.set_view_centre(Some([10, 12]));
+    baseline.step().unwrap();
+    baseline.step().unwrap();
+
+    let mut asked = Lot::load(&root, &house, &[], Frames::default()).unwrap();
+    asked.wait_for_answers();
+    asked.set_view_rotation(1);
+    asked.set_view_centre(Some([10, 12]));
+    asked.step().unwrap();
+    // Tick 2 pauses on the Help System dialog and freezes (1, Some([10, 12])).
+    assert_eq!(asked.step().unwrap_err(), StepError::Asking { tick: 2 });
+    // Moving the camera while the dialog shows updates the live camera state,
+    // but must not change the dialog tick's replay — even across save/restore.
+    asked.set_view_rotation(3);
+    asked.set_view_centre(Some([40, 42]));
+    asked.answer(3).unwrap();
+    let bytes = asked.save().unwrap().encode();
+
+    let mut restored = Lot::load(&root, &house, &[], Frames::default()).unwrap();
+    restored.wait_for_answers();
+    restored.restore(Saved::decode(&bytes).unwrap()).unwrap();
+    assert_eq!(restored.view_rotation(), 3);
+    assert_eq!(restored.view_centre(), Some([40, 42]));
+    restored.step().unwrap();
+    assert_eq!(restored.world().hash(), baseline.world().hash());
+    // After the replayed tick completes, the moved camera applies to later ticks.
+    assert_eq!(restored.view_rotation(), 3);
+    assert_eq!(restored.view_centre(), Some([40, 42]));
+}

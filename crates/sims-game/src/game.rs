@@ -624,12 +624,16 @@ impl Game {
     }
 
     /// Passes the house view's rotation and screen-centre pick (`0x4a7b58`
-    /// cut to a tile via `0x433067`) into the simulation.
+    /// over the house view above the 100-pixel live-mode strip, cut to a
+    /// tile via `0x433067`) into the simulation.
     fn sync_view(&mut self) {
         self.lot.set_view_rotation(self.view.camera.rotation);
-        let centre =
-            sims_render::screen_centre_pick(&self.lot_shape, &self.view.camera, self.view.size)
-                .map(|[x, y]| [(x >> 4) as i8, (y >> 4) as i8]);
+        let centre = sims_render::screen_centre_pick(
+            &self.lot_shape,
+            &self.view.camera,
+            self.house_view_size(),
+        )
+        .map(|[x, y]| [(x >> 4) as i8, (y >> 4) as i8]);
         self.lot.set_view_centre(centre);
     }
 
@@ -645,10 +649,20 @@ impl Game {
     }
 
     /// Moves the camera. The view's rotation and screen-centre pick are the
-    /// lot's inputs too ([`Lot::set_view_rotation`], [`Lot::set_view_centre`]).
+    /// lot's inputs too ([`Lot::set_view_rotation`], [`Lot::set_view_centre`]),
+    /// synced only when the picker's camera geometry actually changes so
+    /// no-op or wall-mode commands preserve a restored pick.
     pub fn apply(&mut self, command: Move) -> bool {
+        let before = self.view.camera;
         let moved = self.view.apply(command);
-        self.sync_view();
+        let after = self.view.camera;
+        if after.origin != before.origin
+            || after.zoom != before.zoom
+            || after.rotation != before.rotation
+            || after.level != before.level
+        {
+            self.sync_view();
+        }
         moved
     }
 

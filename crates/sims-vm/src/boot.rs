@@ -233,6 +233,10 @@ pub struct Lot {
     /// The tile at the house view's centre, if known
     /// ([`Lot::set_view_centre`]).
     view_centre: Option<[i8; 2]>,
+    /// The view rotation and centre frozen when a tick paused on an
+    /// unanswered dialog (`Stop::Asks`), so moving the camera while a
+    /// dialog is showing does not alter the tick's replay once answered.
+    replay_view: Option<(u8, Option<[i8; 2]>)>,
     /// The world's hash as the load left it, which a save carries so it
     /// goes back only into a lot loaded from the same files
     /// ([`save`]).
@@ -913,6 +917,7 @@ impl Lot {
             view_rotation,
             floor_rotation: view_rotation,
             view_centre,
+            replay_view: None,
             loaded,
         })
     }
@@ -967,6 +972,7 @@ impl Lot {
             // takes input again after this step, as the saved lot would.
             self.answered = false;
             let result = self.advance(play).map_err(Stop::into_step);
+            self.replay_view = None;
             if result.is_err() {
                 self.halted = true;
             }
@@ -978,7 +984,9 @@ impl Lot {
             });
         }
         // The tick may stop at a dialog the player has not answered; it
-        // then runs again from here once they have.
+        // then runs again from here once they have, using the original
+        // camera view (`replay_view`) even if the player moved the camera
+        // while the dialog was showing.
         let before = (
             self.world.clone(),
             self.play.clone(),
@@ -993,6 +1001,8 @@ impl Lot {
                 self.play = play;
                 self.ticks = ticks;
                 self.player = player;
+                self.replay_view
+                    .get_or_insert((self.view_rotation, self.view_centre));
                 self.asking = Some(Box::new(Asking {
                     shown,
                     world: partway,
@@ -1000,6 +1010,7 @@ impl Lot {
                 Err(StepError::Asking { tick })
             }
             result => {
+                self.replay_view = None;
                 let result = result.map_err(Stop::into_step);
                 if result.is_err() {
                     self.halted = true;
@@ -1015,11 +1026,14 @@ impl Lot {
         let asks = self.asks;
         let sounds = RefCell::new(Vec::new());
         let masks_rebuilt = Cell::new(0);
+        let (view_rotation, view_centre) = self
+            .replay_view
+            .unwrap_or((self.view_rotation, self.view_centre));
         let interpreter = Interpreter {
             sounds: Some(&sounds),
             masks_rebuilt: Some(&masks_rebuilt),
-            view_rotation: self.view_rotation,
-            view_centre: self.view_centre,
+            view_rotation,
+            view_centre,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut frame_errors = Vec::new();
@@ -1564,6 +1578,7 @@ mod tests {
             view_rotation: 0,
             floor_rotation: 0,
             view_centre: None,
+            replay_view: None,
             loaded,
         }
     }
@@ -1765,5 +1780,204 @@ mod tests {
             .unwrap();
         assert_eq!(matching.floor_rotation(), 0);
         assert_eq!(matching.view_rotation(), 1);
+    }
+
+    #[test]
+    fn a_dialog_tick_replays_with_its_frozen_view_even_when_the_view_affects_the_tick() {
+        use sims_formats::behavior::{Behavior, Instruction};
+        use sims_formats::saved_objects::{Frame, Interaction, Person};
+        use sims_sim::Object;
+
+        const GUID: u32 = 0x1111;
+        const SIM_GUID: u32 = 0x2222;
+        let mut def = [0i16; crate::DEFINITION_WORDS];
+        def[9] = 4; // non-person object
+        def[14] = GUID as u16 as i16;
+        def[15] = (GUID >> 16) as u16 as i16;
+
+        // Node 0: Generic Sims Call 12 (tile_depth: reads view_rotation into temp 0).
+        // Node 1: two-button Dialog (yields and asks the player on tick 1).
+        // Node 2: Generic Sims Call 12 again on tick 2 (reads the moved view_rotation).
+        let behavior = Behavior {
+            format: 0x8002,
+            kind: 0,
+            args: 0,
+            locals: 0,
+            revision: 0,
+            instructions: vec![
+                Instruction {
+                    opcode: 1,
+                    on_true: 1,
+                    on_false: 253,
+                    operands: [12, 0, 0, 0, 0, 0, 0, 0],
+                },
+                Instruction {
+                    opcode: 36,
+                    on_true: 2,
+                    on_false: 2,
+                    operands: [0, 0, 0, 0, 0, 1, 0, 0],
+                },
+                Instruction {
+                    opcode: 1,
+                    on_true: 3,
+                    on_false: 253,
+                    operands: [12, 0, 0, 0, 0, 0, 0, 0],
+                },
+                Instruction {
+                    opcode: 0,
+                    on_true: 3,
+                    on_false: 253,
+                    operands: [0; 8],
+                },
+            ],
+        };
+        let mut library = crate::Library::default();
+        library.definitions.insert(128, def);
+        library.definition_order.push(128);
+        library.behaviors.insert(4096, behavior);
+
+        let interaction = Interaction {
+            join: 0,
+            uid: 0,
+            caller: 0,
+            target: 0,
+            icon: 0,
+            table_index: 0,
+            args: [0; 4],
+            priority: 0,
+            action: 0,
+            attenuation: 0.0,
+            flags: 0,
+        };
+        let mut world = World::empty();
+        world.size = 64;
+        world.globals[3] = 2;
+        world.order = vec![1, 2];
+        world.people = vec![2];
+        world.types.insert(1, GUID);
+        world.types.insert(2, SIM_GUID);
+        world.objects.insert(
+            1,
+            Object {
+                id: 1,
+                guid: GUID,
+                footprint: [0; 4],
+                position: [10 << 4, 20 << 4, 0],
+                unknown_short: 0,
+                attributes: Vec::new(),
+                temps: vec![0; 8],
+                data: vec![0; 72],
+                obsolete_word: 0,
+                stack_capacity_bytes: 0,
+                stack: vec![Frame {
+                    stack_object: 1,
+                    tree: 4096,
+                    node: 0,
+                    parameters: vec![1, 0, 0, 0],
+                    locals: Vec::new(),
+                    primitive_state: 0,
+                    code_owner_type: 1,
+                }],
+                relationship_flag: -1,
+                relationships: Vec::new(),
+                slots: Vec::new(),
+                dynamic_sprites: Vec::new(),
+                multipart: None,
+                portal: None,
+                person: None,
+                registry_word: Some((1 << 16) | 0xffff),
+                last_result: false,
+                removal_skips_resets: false,
+                selected: false,
+            },
+        );
+        world.objects.insert(
+            2,
+            Object {
+                id: 2,
+                guid: SIM_GUID,
+                footprint: [0; 4],
+                position: [0; 3],
+                unknown_short: 0,
+                attributes: Vec::new(),
+                temps: vec![0; 8],
+                data: vec![0; 72],
+                obsolete_word: 0,
+                stack_capacity_bytes: 0,
+                stack: Vec::new(),
+                relationship_flag: -1,
+                relationships: Vec::new(),
+                slots: Vec::new(),
+                dynamic_sprites: Vec::new(),
+                multipart: None,
+                portal: None,
+                person: Some(Person {
+                    animation_events: 0,
+                    engaged: 0,
+                    appearance: Default::default(),
+                    accessories: Vec::new(),
+                    animations: Default::default(),
+                    routing_state: 0,
+                    floats: [0.0; 9],
+                    previous_motives: [0.0; 16],
+                    motives: [0.0; 16],
+                    data: vec![0; 256],
+                    routing_frames: 0,
+                    active: interaction.clone(),
+                    last: interaction,
+                    queue: Vec::new(),
+                    object_uses: Vec::new(),
+                    motive_deltas: Vec::new(),
+                }),
+                registry_word: None,
+                last_result: false,
+                removal_skips_resets: false,
+                selected: true,
+            },
+        );
+        let make_lot = || {
+            let mut l = lot(world.clone(), true, Frames::parse("none").unwrap());
+            l.tuning = Some(tuning());
+            l.program.labels_hold_no_token = true;
+            l.program.libraries.insert(0, crate::Library::default());
+            l.program.libraries.insert(1, library.clone());
+            l.program.semi_globals.insert(1, None);
+            l.catalog.objects.push(sims_content::Object {
+                guid: GUID,
+                resource: 1,
+                chunk: 128,
+                kind: 4,
+                master: 0,
+            });
+            l.catalog.by_guid.insert(GUID, 0);
+            l.catalog.semi_globals.insert(1, None);
+            l
+        };
+
+        let mut asked = make_lot();
+        asked.wait_for_answers();
+        asked.set_view_rotation(0);
+        asked.set_view_centre(Some([10, 12]));
+        // Tick 1 pauses on the dialog and freezes (0, Some([10, 12])).
+        assert_eq!(asked.step().unwrap_err(), StepError::Asking { tick: 1 });
+        // Moving the camera while waiting updates the live view, not the frozen replay view.
+        asked.set_view_rotation(2);
+        asked.set_view_centre(Some([40, 42]));
+        asked.answer(2).unwrap();
+        let bytes = asked.save().unwrap().encode();
+
+        let mut restored = make_lot();
+        restored.wait_for_answers();
+        restored
+            .restore(super::save::Saved::decode(&bytes).unwrap())
+            .unwrap();
+        assert_eq!(restored.view_rotation(), 2);
+        assert_eq!(restored.view_centre(), Some([40, 42]));
+        // Replaying tick 1 must use rotation 0: -(10 + 20) = -30, not rotation 2: -(53 + 43) = -96.
+        restored.step().unwrap();
+        assert_eq!(restored.world().objects[&1].temps[0], -30);
+        // After the dialog tick finishes, tick 2 uses the moved rotation 2: -(53 + 43) = -96.
+        restored.step().unwrap();
+        assert_eq!(restored.world().objects[&1].temps[0], -96);
     }
 }

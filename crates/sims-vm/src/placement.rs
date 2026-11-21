@@ -1458,10 +1458,17 @@ impl Interpreter<'_> {
     /// 5. the lot has no indicators yet: the interface's work for an object
     ///    come from outside makes them (0x445e4a, from 0x44752e), and their
     ///    Init runs while the original's person stands on its tile, in its
-    ///    room, which here it does not.
+    ///    room, which here it does not;
+    /// 6. the person is selected (0x4475d2 would move the first indicator
+    ///    into its head slot), person word 77 > 0 (0x4477fb), or person
+    ///    word 81 >= 10 (0x447a82).
+    ///
+    /// Takes `&World` so `Ok(())` statically proves that placing the
+    /// temporary person leaves the exact same world and cells as removing
+    /// it unput (`0x4e9706`).
     pub(crate) fn portrait_place(
         &self,
-        world: &mut World,
+        world: &World,
         id: u16,
         tiles: &BTreeSet<[i8; 2]>,
     ) -> Result<(), Fault> {
@@ -1547,7 +1554,43 @@ impl Interpreter<'_> {
                     .into(),
             ));
         }
-        self.placed_from_outside(world, id)
+        let Some(object) = world.objects.get(&id) else {
+            return Ok(());
+        };
+        let Some(person) = object.person.as_ref() else {
+            return Ok(());
+        };
+        if object.selected {
+            return Err(fail(
+                "the temporary person is selected, which would move the first indicator into its \
+                 head slot (0x4475d2)"
+                    .into(),
+            ));
+        }
+        let word = |index: usize| person.data.get(index).copied().unwrap_or(0);
+        if word(77) > 0 {
+            return Err(Fault {
+                object: id,
+                at: None,
+                trap: Trap::Unsupported(
+                    "a person whose person word 77 names an object moves the second indicator \
+                     there (0x4477fb); not ported"
+                        .into(),
+                ),
+            });
+        }
+        if word(81) >= 10 {
+            return Err(Fault {
+                object: id,
+                at: None,
+                trap: Trap::Unsupported(
+                    "a person whose person word 81 is 10 or more takes a pooled object \
+                     (0x447a82); not ported"
+                        .into(),
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// What the interface does when an object comes onto the lot from

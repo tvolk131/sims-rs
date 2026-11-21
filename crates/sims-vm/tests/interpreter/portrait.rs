@@ -34,6 +34,7 @@ fn rest(fx: &Fixture) -> [u8; 32] {
     let mut world = fx.world.clone();
     world.dialogs.records.clear();
     world.portraits.clear();
+    world.dirty_portraits.clear();
     hash_without_frames(&world)
 }
 
@@ -1738,13 +1739,82 @@ fn a_portrait_view_centre_pick_is_bounds_checked_and_unrotated() {
 }
 
 #[test]
-fn a_portrait_with_bmp_2002_removes_unput_when_no_tile_is_found() {
-    // When no tile is found (0x4e9706) and the type has BMP_ 2002 (0x4e9260),
-    // the original removes the person unput (skipping virtual function 0x88
-    // and placed_from_outside), loads BMP_ 2002 into slot 1, and does not
-    // call 0x4e8c5d again (0x4e938c) or on later dialogs.
+fn a_clean_portrait_with_bmp_2002_loads_without_creating_a_person() {
+    // 0x4e92e5 → 0x4e9338: a clean, empty slot with BMP_ 2002 loads the
+    // bitmap straight into slot 1 and never calls 0x4e8c5d (0 builds: no
+    // temporary person, no Init sounds, no skeleton read, no RNG draws).
+    let (mut fx, widget_file, record) = visitors();
+    fx.program
+        .libraries
+        .get_mut(&widget_file)
+        .unwrap()
+        .sounds
+        .insert(5, "init_ping".into());
+    fx.add(
+        widget_file,
+        4096,
+        tree(vec![ins(23, RETURN_TRUE, ERROR, [5, 0, 0, 0, 0, 0, 0, 0])]),
+    );
+    fx.program
+        .libraries
+        .get_mut(&widget_file)
+        .unwrap()
+        .has_portrait_bitmap = true;
+
+    let before = as_with_no_portrait(&fx, record);
+    let sounds = std::cell::RefCell::new(Vec::new());
+    assert_eq!(
+        inform_hearing(&mut fx, 2, record, Some([1, 1]), &sounds),
+        Ok(true)
+    );
+    assert_eq!(fx.world.portraits, [WIDGET].into());
+    assert!(fx.world.dirty_portraits.is_empty());
+    assert!(
+        !fx.world.skeleton_files.contains("widget.bcf"),
+        "clean slot with BMP_ 2002 never creates a temporary person"
+    );
+    assert!(sounds.borrow().is_empty(), "{:?}", sounds.borrow());
+    assert_eq!(rest(&fx), before);
+
+    // Writing person data words 68, 74, or 84 on a person (0x4538fd..0x4539cf)
+    // releases its cached portrait and marks slot 1 dirty (0x4eb0eb → 0x4e895e),
+    // so a later off-lot dialog runs one build at 0x4e92f2 and clears dirty.
+    for word in [68i16, 74, 84] {
+        let mut fx = Fixture::new();
+        fx.world.people = vec![SIM];
+        fx.world.portraits.insert(SIM_GUID);
+        fx.add(
+            LAMP_FILE,
+            4096,
+            tree(vec![assign(
+                scope::STACK_PERSON,
+                word,
+                scope::LITERAL,
+                0,
+                RETURN_TRUE,
+            )]),
+        );
+        assert_eq!(fx.run_with(LAMP, 4096, SIM as i16, &[], 1000), Ok(true));
+        assert!(
+            !fx.world.portraits.contains(&SIM_GUID),
+            "writing pd[{word}] releases cached portrait"
+        );
+        assert!(
+            fx.world.dirty_portraits.contains(&SIM_GUID),
+            "writing pd[{word}] marks slot 1 dirty"
+        );
+    }
+}
+
+#[test]
+fn a_dirty_portrait_with_bmp_2002_removes_unput_when_no_tile_is_found() {
+    // When slot 1 is dirty (0x4e92e5), no tile is found (0x4e9706), and the
+    // type has BMP_ 2002 (0x4e9260), the original runs 0x4e92f2 once, removes
+    // the person unput (skipping virtual function 0x88 and placed_from_outside),
+    // loads BMP_ 2002 into slot 1 (clearing dirty), and skips 0x4e938c.
     let (mut fx, widget_file, record) = visitors();
     fx.world.size = 2;
+    fx.world.dirty_portraits.insert(WIDGET);
     // Even without indicators and with function 9 set to trap, the unput path
     // never calls virtual function 0x88, so it succeeds when BMP_ 2002 is present.
     fx.world.indicators = [0, 0];
@@ -1779,6 +1849,7 @@ fn a_portrait_with_bmp_2002_removes_unput_when_no_tile_is_found() {
         Ok(true)
     );
     assert_eq!(fx.world.portraits, [WIDGET].into());
+    assert!(fx.world.dirty_portraits.is_empty());
     assert_eq!(fx.world.people, people_before);
     assert_eq!(fx.world.objects.len(), objects_before);
     let pings = || {
@@ -1800,15 +1871,17 @@ fn a_portrait_with_bmp_2002_removes_unput_when_no_tile_is_found() {
 }
 
 #[test]
-fn a_portrait_with_mixed_starts_and_bmp_2002_succeeds_only_when_branches_agree() {
+fn a_dirty_portrait_with_mixed_starts_and_bmp_2002_checks_placement_on_found_tiles() {
     // Make tile (1, 1) its own unreachable room (room 9) full of a solid
     // object so starting at (1, 1) finds no tile while all other starts
-    // land in room 1. With BMP_ 2002 and no difference between placing and
-    // removing unput, view_centre = None succeeds; when indicators are
-    // missing (so placing fails / diverges), it fails loudly.
+    // land in room 1. With slot 1 dirty and BMP_ 2002, view_centre = None
+    // succeeds whenever `portrait_place(&World)` passes on the found tiles
+    // (statically proving placing and removing unput leave identical state)
+    // and fails loudly if placement would have side effects.
     let setup = |indicators: [u16; 2]| {
         let (mut fx, widget_file, record) = visitors();
         fx.world.indicators = indicators;
+        fx.world.dirty_portraits.insert(WIDGET);
         fx.program
             .libraries
             .get_mut(&widget_file)
@@ -1823,6 +1896,7 @@ fn a_portrait_with_mixed_starts_and_bmp_2002_succeeds_only_when_branches_agree()
     let (mut fx_ok, record) = setup([99, 0]);
     assert_eq!(inform_from(&mut fx_ok, 2, record, None), Ok(true));
     assert_eq!(fx_ok.world.portraits, [WIDGET].into());
+    assert!(fx_ok.world.dirty_portraits.is_empty());
 
     // Without indicators, the placed branch fails loudly on missing indicators.
     let (mut fx_no_ind, record) = setup([0, 0]);
@@ -1831,12 +1905,28 @@ fn a_portrait_with_mixed_starts_and_bmp_2002_succeeds_only_when_branches_agree()
         .to_string();
     assert!(fault.contains("0x445e4a"), "{fault}");
 
+    // When a room's occupant mark would change on the found tiles, placement
+    // fails loudly rather than silently taking the unput branch.
+    let (mut fx_room, record) = setup([99, 0]);
+    fx_room.world.neighbors.slots[record as usize - 1]
+        .as_mut()
+        .unwrap()
+        .data[65] = 0;
+    fx_room
+        .world
+        .rooms
+        .rooms
+        .insert(1, sims_sim::rooms::Room::default());
+    let fault = inform_from(&mut fx_room, 2, record, None)
+        .unwrap_err()
+        .to_string();
+    assert!(fault.contains("0x468802"), "{fault}");
+
     // Without BMP_ 2002, mixed starts fail loudly on 0x4e9706 / 0x4e938c.
-    let (mut fx_no_bmp, widget_file, record) = visitors();
+    let (mut fx_no_bmp, _widget_file, record) = visitors();
     fx_no_bmp.world.rooms.map[0][64 + 1] = 9;
     let grid = &mut fx_no_bmp.world.arrays.get_mut(&3).unwrap().data;
     grid[(64 + 1) * 2..((64 + 1) * 2 + 2)].copy_from_slice(&(LAMP as i16).to_le_bytes());
-    let _ = widget_file;
     let fault = inform_from(&mut fx_no_bmp, 2, record, None)
         .unwrap_err()
         .to_string();

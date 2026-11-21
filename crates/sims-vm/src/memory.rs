@@ -770,9 +770,10 @@ impl Machine<'_, '_> {
             }
             Cell::Attribute(id, i) => object_mut(world, id)?.attributes.get_mut(i),
             Cell::Data(id, i) => object_mut(world, id)?.data.get_mut(i),
-            // Writes to person data words 68, 74 and 84 invalidate cached
-            // portraits, and 77 and 81 notify indicators (legacy
-            // memory.rs:634-654). Both are presentation only.
+            // Writes to person data words 68, 74 and 84 release cached
+            // portraits and mark their slots dirty (0x4538fd..0x4539cf →
+            // 0x45810c → 0x4eb0eb → 0x4e895e); 77 and 81 notify indicators
+            // (presentation only).
             Cell::Person(id, i) => {
                 world.routing.unknown_words.remove(&(id, i));
                 object_mut(world, id)?
@@ -794,6 +795,12 @@ impl Machine<'_, '_> {
             Cell::StackObject => Some(&mut top_mut(world, me)?.stack_object),
         };
         *target.ok_or_else(|| Trap::Invalid("word out of range".into()))? = value;
+        if let Cell::Person(id, 68 | 74 | 84) = cell
+            && let Some(guid) = world.objects.get(&id).map(|object| object.guid)
+        {
+            world.portraits.remove(&guid);
+            world.dirty_portraits.insert(guid);
+        }
         Ok(true)
     }
 

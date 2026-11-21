@@ -4315,4 +4315,19 @@ fn camera_moves_sync_the_lots_view_centre_pick() {
     let mortimer = game.lot().world().selected().expect("a Sim is selected");
     game.centre_on(mortimer);
     assert_eq!(game.lot().view_centre(), expected(&game));
+
+    // Restoring a saved game keeps its saved view_centre; no-op and wall-mode
+    // camera commands do not overwrite it until camera geometry actually moves.
+    let saved_centre = game.lot().view_centre();
+    let saved = game.save().unwrap();
+    game.apply(Move::Scroll([320, 160]));
+    assert_ne!(game.lot().view_centre(), saved_centre);
+    game.restore(saved).unwrap();
+    assert_eq!(game.lot().view_centre(), saved_centre);
+    assert!(!game.apply(Move::Scroll([0, 0])));
+    assert_eq!(game.lot().view_centre(), saved_centre);
+    game.apply(Move::Walls(sims_render::Walls::Down));
+    assert_eq!(game.lot().view_centre(), saved_centre);
+    assert!(game.apply(Move::Scroll([160, 80])));
+    assert_eq!(game.lot().view_centre(), expected(&game));
 }

@@ -180,7 +180,9 @@ fn room_of(lot: &Lot, level: usize, [x, y]: [i32; 2]) -> Option<i16> {
 /// The slope from screen point `b` to `a`, rise over run in 16.16, as the
 /// original divides (0x4a955d). None where the run is zero.
 fn ratio(a: [i32; 2], b: [i32; 2]) -> Option<i32> {
-    (a[1] - b[1]).wrapping_shl(16).checked_div(a[0] - b[0])
+    a[1].wrapping_sub(b[1])
+        .wrapping_shl(16)
+        .checked_div(a[0].wrapping_sub(b[0]))
 }
 
 /// The view tiles the cutaway may cut walls between.
@@ -262,25 +264,37 @@ impl View<'_> {
 
     /// The view tile under screen point `at` on the level shown, by the
     /// original's search over the tiles' raised corners (0x4a955d). None
-    /// far off the lot, where the search would not end.
+    /// only when coordinates overflow 32-bit projection arithmetic or the
+    /// refinement budget runs out.
     fn coarse(&self, at: [i32; 2]) -> Option<[i32; 2]> {
         let camera = self.camera;
         let level = self.storey();
-        let x = (at[0] - camera.origin[0]) / 2;
-        let y = at[1] - camera.origin[1];
+        let dx = (i64::from(at[0]) - i64::from(camera.origin[0])) / 2;
+        let dy = i64::from(at[1]) - i64::from(camera.origin[1]);
         let shift = camera.zoom.level() + 3;
-        let mut best = [(y + x) >> shift, (y - x) >> shift];
-        // The first guess ignores height, which can lift a tile by up to
-        // 255 quarter tiles plus a storey: allow for that much.
-        if best
-            .iter()
-            .any(|v| !(-2 * ARRAY_SIZE..3 * ARRAY_SIZE).contains(v))
-        {
-            return None;
-        }
-        let project = |p: [i32; 2]| self.corner(p, level);
-        let mut parity = usize::from(project(best)[0] >= at[0]);
+        let mut best = [
+            i32::try_from((dy + dx) >> shift).ok()?,
+            i32::try_from((dy - dx) >> shift).ok()?,
+        ];
+        let project = |p: [i32; 2]| -> Option<[i32; 2]> {
+            let height = if self.interior(p) { self.top(p) } else { 0 };
+            let z = camera.zoom.level();
+            let x = (i64::from(p[0]) - i64::from(p[1])) * (8i64 << z) + i64::from(camera.origin[0]);
+            let y = (i64::from(p[0]) + i64::from(p[1])) * (4i64 << z) + i64::from(camera.origin[1])
+                - i64::from(camera.zoom.floor_height()) * i64::from(level - 1)
+                - (i64::from(height) << (z + 1));
+            Some([i32::try_from(x).ok()?, i32::try_from(y).ok()?])
+        };
+        let mut parity = usize::from(project(best)?[0] >= at[0]);
         let mut scan = best;
+        // Fast-forward pairs of alternating steps while scan[0] < 0 || scan[1] < 0:
+        // every two iterations add (+1, +1) to `scan` and preserve `parity & 1`.
+        let deficit = (-i64::from(scan[0])).max(-i64::from(scan[1]));
+        if deficit > 1 {
+            let pairs = i32::try_from(deficit - 1).ok()?;
+            scan[0] = scan[0].checked_add(pairs)?;
+            scan[1] = scan[1].checked_add(pairs)?;
+        }
         let mut budget = 4096;
         let mut spend = || {
             budget -= 1;
@@ -288,7 +302,7 @@ impl View<'_> {
         };
         while scan[0] < 0 || scan[1] < 0 {
             spend()?;
-            scan[parity & 1] += 1;
+            scan[parity & 1] = scan[parity & 1].checked_add(1)?;
             parity += 1;
         }
         let upper = [self.bounds[1] + 1, self.bounds[3] + 1];
@@ -297,32 +311,34 @@ impl View<'_> {
                 spend()?;
                 let axis = parity & 1;
                 parity += 1;
-                scan[axis] += 1;
+                scan[axis] = scan[axis].checked_add(1)?;
                 if scan[axis] >= upper[axis] {
                     break;
                 }
-                if project(scan)[1] < at[1] {
+                if project(scan)?[1] < at[1] {
                     best = scan;
                 }
             }
         }
         loop {
             spend()?;
-            let p = project(best);
+            let p = project(best)?;
             if at[0] < p[0] {
-                let edge = ratio(p, project([best[0], best[1] + 1]))?;
+                let next = [best[0], best[1].checked_add(1)?];
+                let edge = ratio(p, project(next)?)?;
                 if ratio(p, at)? <= edge {
                     break;
                 }
-                best[0] -= 1;
+                best[0] = best[0].checked_sub(1)?;
             } else if at[0] == p[0] {
                 break;
             } else {
-                let edge = ratio(p, project([best[0] + 1, best[1]]))?;
+                let next = [best[0].checked_add(1)?, best[1]];
+                let edge = ratio(p, project(next)?)?;
                 if edge <= ratio(p, at)? {
                     break;
                 }
-                best[1] -= 1;
+                best[1] = best[1].checked_sub(1)?;
             }
         }
         Some(best)
@@ -333,7 +349,7 @@ impl View<'_> {
     /// spot within it on the terrain's slope (0x4a97c3 with flag one).
     fn fine(&self, at: [i32; 2]) -> Option<[i32; 2]> {
         let tile = self.coarse(at)?;
-        let whole = tile.map(|t| t << 4);
+        let whole = [tile[0].checked_mul(16)?, tile[1].checked_mul(16)?];
         if !self.interior(tile) {
             return Some(whole);
         }
@@ -1088,5 +1104,40 @@ mod tests {
         c.origin[1] += size[1] / 2 - (raised[1] + c.zoom.tile_height() / 2);
         let picked = screen_centre_pick(&lot, &c, size).expect("raised tile");
         assert_eq!(picked.map(|n| n >> 4), [10, 12]);
+    }
+
+    #[test]
+    fn screen_centre_pick_keeps_off_lot_picks_without_panicking() {
+        let lot = house();
+        // Far zoom, 800×600 view, origin [400, -2900]: 0x4a955d returns [200, 200],
+        // so 0x4a97c3(1) returns [200 << 4, 200 << 4] (which 0x433067 cuts to
+        // signed byte [-56, -56], triggering the rotated midpoint fallback).
+        let c = Camera {
+            zoom: Zoom::Far,
+            rotation: 0,
+            level: 1,
+            origin: [400, -2900],
+            walls: Walls::Cutaway,
+            focus: Focus::default(),
+        };
+        let picked = screen_centre_pick(&lot, &c, [800, 600]).expect("off-lot far pick");
+        assert_eq!(picked, [200 << 4, 200 << 4]);
+        assert_eq!(picked.map(|n| (n >> 4) as i8), [-56, -56]);
+
+        // Negative off-lot origin: fast-forwards Loop 1 without exhausting the
+        // budget and returns the exact flat off-lot tile.
+        let neg = Camera {
+            origin: [400, 5000],
+            ..c
+        };
+        let picked_neg = screen_centre_pick(&lot, &neg, [800, 600]).expect("negative off-lot pick");
+        assert_eq!(picked_neg.map(|n| n >> 4), [-294, -294]);
+
+        // Extreme coordinates that overflow 32-bit projection return None cleanly.
+        let extreme = Camera {
+            origin: [i32::MAX, i32::MIN],
+            ..c
+        };
+        assert_eq!(screen_centre_pick(&lot, &extreme, [800, 600]), None);
     }
 }

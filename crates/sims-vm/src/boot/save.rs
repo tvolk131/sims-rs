@@ -38,7 +38,7 @@ use std::collections::BTreeSet;
 /// pre-resolved house view centre; layout 4 keeps the house file's saved
 /// floor rotation baseline (`HOUS 0` `camera_direction & 3`); layout 5
 /// keeps the view-rotated screen-centre tile pick (`0x4a7b58` cut via
-/// `0x433067`).
+/// `0x433067`) and any frozen dialog-replay view.
 pub const FORMAT: u32 = 5;
 
 /// A lot as it stood between two steps ([`Lot::save`]).
@@ -54,11 +54,14 @@ pub struct Saved {
     house: u32,
     family: u16,
     loaded: [u8; 32],
-    /// Format 3 on.
+    /// Format 3 on (view-rotated screen-centre tile pick from format 5).
     view_centre: Option<[i8; 2]>,
     /// Format 4 on: the saved house's opening camera rotation (`0..=3`)
     /// paired with its level-1 road-dash floor IDs (`0x4a87b1`–`0x4a87dc`).
     floor_rotation: u8,
+    /// Format 5 on: frozen `(view_rotation, view_centre)` while a dialog tick
+    /// awaits replay.
+    replay_view: Option<(u8, Option<[i8; 2]>)>,
 }
 
 /// Why a lot could not be saved or restored.
@@ -167,6 +170,7 @@ impl Lot {
             loaded: self.loaded,
             view_centre: self.view_centre,
             floor_rotation: self.floor_rotation,
+            replay_view: self.replay_view,
         })
     }
 
@@ -198,6 +202,7 @@ impl Lot {
         self.play.fresh = saved.fresh;
         self.view_rotation = saved.view_rotation;
         self.view_centre = saved.view_centre;
+        self.replay_view = saved.replay_view;
         self.halted = false;
         self.asking = None;
         self.answered = saved.answered;
