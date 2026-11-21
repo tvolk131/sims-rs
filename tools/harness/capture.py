@@ -544,27 +544,78 @@ def torn_tail(path, chunk=1 << 16):
         f.seek(end - 1)
         if f.read(1) == b'\n':
             return None
-        tail, at = b'', end
+        # Each chunk is searched once, and the chunks after it joined only at the end.
+        later, at = [], end
         while at > 0:
             step = min(chunk, at)
             at -= step
             f.seek(at)
-            tail = f.read(step) + tail
-            cut = tail.rfind(b'\n')
+            data = f.read(step)
+            cut = data.rfind(b'\n')
             if cut >= 0:
-                return at + cut + 1, tail[cut + 1:]
-        return 0, tail
+                return at + cut + 1, data[cut + 1:] + b''.join(reversed(later))
+            later.append(data)
+        return 0, b''.join(reversed(later))
+
+
+def jsonl_rows(path):
+    """The rows of a log, split at newlines only (str.splitlines also splits at other line breaks, such as
+    a vertical tab, which would make one row two). A missing file has none. Raises ValueError for text
+    that is not UTF-8."""
+    try:
+        text = path.read_bytes()
+    except FileNotFoundError:
+        return []
+    rows = text.decode().split('\n')
+    if rows[-1] == '':
+        rows.pop()
+    return rows
+
+
+def bad_row(rows):
+    """The number (from 1) of the first row that is not a JSON object (a blank one included), or None."""
+    for n, line in enumerate(rows, 1):
+        try:
+            if not isinstance(json.loads(line), dict):
+                return n
+        except ValueError:
+            return n
+    return None
+
+
+def torn_logged(path, mark):
+    """Whether these events hold the resume_torn event of this mark. Rows that are not JSON are passed."""
+    try:
+        with open(path, 'rb') as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(r, dict) and r.get('kind') == 'resume_torn' and r.get('mark') == mark:
+                    return True
+    except OSError:
+        pass
+    return False
 
 
 def repair_tails(out, names):
     """Before a resume: a row cut short at the end of each log is taken off, or ended with a newline if
-    it is whole JSON. The cut rows are kept in resume-torn.json first (with any an interrupted takeover
-    left there), so a takeover killed before it logs them (resume_torn) hands them on. Returns them."""
+    it is whole JSON. What is done is kept in resume-torn.json first, with a mark (the cut rows, and the
+    logs ended), so a takeover killed before it logs it (resume_torn, with the mark) hands it on. One
+    killed before the cut hands on the same row, which is noted once; one killed after logging it and
+    before taking off resume-torn.json has its mark in the events, and the file is not used again.
+    Returns dict(mark, rows, ended)."""
     sidecar = out / 'resume-torn.json'
+    fresh = lambda: dict(mark=f'{time.time_ns():x}', rows={}, ended=[])
     try:
-        cuts = json.loads(sidecar.read_text())
+        saved = json.loads(sidecar.read_text())
+        if not (isinstance(saved, dict) and {'mark', 'rows', 'ended'} <= saved.keys()):
+            saved = fresh()
     except (OSError, ValueError):
-        cuts = {}
+        saved = fresh()
+    if torn_logged(out / 'events.jsonl', saved['mark']):
+        saved = fresh()
     fixes = []
     for name in names:
         found = torn_tail(out / name)
@@ -574,12 +625,17 @@ def repair_tails(out, names):
         try:
             json.loads(tail)
             fixes.append((name, None))
+            if name not in saved['ended']:
+                saved['ended'].append(name)
         except ValueError:
-            cuts.setdefault(name, []).append(tail.decode(errors='replace'))
+            text = tail.decode(errors='replace')
+            cut = saved['rows'].setdefault(name, [])
+            if not cut or cut[-1] != text:
+                cut.append(text)
             fixes.append((name, start))
-    if cuts:
+    if fixes:
         tmp = out / 'resume-torn.json.tmp'
-        tmp.write_text(json.dumps(cuts))
+        tmp.write_text(json.dumps(saved))
         tmp.rename(sidecar)
     for name, start in fixes:
         if start is None:
@@ -588,7 +644,7 @@ def repair_tails(out, names):
         else:
             with open(out / name, 'r+b') as f:
                 f.truncate(start)
-    return cuts
+    return saved
 
 
 def has_baseline(path):
@@ -622,9 +678,7 @@ def drop_redone_events(path, updates, kinds):
     if not path.exists():
         return []
     keep, dropped = [], []
-    for line in path.read_text().splitlines():
-        if not line.strip():
-            continue
+    for line in jsonl_rows(path):
         r = json.loads(line)
         (dropped if r['kind'] in kinds and r.get('update', 0) > updates else keep).append(line)
     if dropped:
@@ -756,21 +810,25 @@ def main():
         ap.error(f'{out} has no baseline event: --resume takes over only a run that reached its '
                  'baseline; start a new capture')
     out.mkdir(parents=True, exist_ok=args.resume)
-    prior_status, dropped, torn = {}, [], {}
+    prior_status, dropped, torn = {}, [], dict(rows={}, ended=[])
     if args.resume:
         torn = repair_tails(out, ('events.jsonl', 'updates.jsonl', 'watch.jsonl'))
         try:
             prior_status = json.loads((out / 'status.json').read_text())
         except (OSError, ValueError):
             pass
-        lines = (out / 'updates.jsonl').read_text().splitlines() if (out / 'updates.jsonl').exists() else []
-        # A row of them that is not whole JSON (not at the end, so not cut by the kill) would make the
-        # count wrong. watch.jsonl is only appended to by a takeover, and not checked.
-        for n, line in enumerate(lines, 1):
+        # A row of the events or the updates that is not a JSON object (not at the end, so not cut by
+        # the kill; a blank one included) would make the count or the events read wrong. Checked before
+        # anything is changed but the tails, or the guest is attached. watch.jsonl is only appended to by
+        # a takeover, and not checked.
+        for name, what in (('updates.jsonl', 'count the updates'), ('events.jsonl', 'read the events')):
             try:
-                json.loads(line)
+                n = bad_row(jsonl_rows(out / name))
             except ValueError:
-                ap.error(f'{out / "updates.jsonl"} row {n} is not JSON: --resume cannot count the updates')
+                ap.error(f'{out / name} is not UTF-8: --resume cannot {what}')
+            if n is not None:
+                ap.error(f'{out / name} row {n} is not JSON: --resume cannot {what}')
+        lines = jsonl_rows(out / 'updates.jsonl')
         # Only what the redone return can write again: an hour turn needs the last row's clock, an object
         # change the registry saved with the last row.
         kinds = []
@@ -1014,11 +1072,11 @@ def main():
     last_objects = None  # {pointer: id} of the registry at the last return (None: not known)
     dialog_pending = False  # a dialog was shown since the last return
     if args.resume:
-        rows = [json.loads(line) for line in open(out / 'events.jsonl')]
+        rows = [json.loads(line) for line in jsonl_rows(out / 'events.jsonl')]
         first_baseline = next(i for i, r in enumerate(rows) if r['kind'] == 'baseline')
         sims_cr3 = rows[first_baseline]['cr3']
         baseline = True
-        lines = open(out / 'updates.jsonl').read().splitlines()
+        lines = jsonl_rows(out / 'updates.jsonl')
         updates = len(lines)
         if lines:
             last = json.loads(lines[-1])
@@ -1032,9 +1090,9 @@ def main():
                 status.update(registry=prior_status['registry'], registry_update=updates)
             else:
                 event(kind='registry_unknown', updates=updates, registry_update=prior_status.get('registry_update'))
-        if torn:
-            event(kind='resume_torn', rows=torn)
-            (out / 'resume-torn.json').unlink(missing_ok=True)
+        if torn['rows'] or torn['ended']:
+            event(kind='resume_torn', mark=torn['mark'], rows=torn['rows'], ended=torn['ended'])
+        (out / 'resume-torn.json').unlink(missing_ok=True)
         if dropped:
             event(kind='resume_dropped', events=[dict(kind=r['kind'], update=r['update']) for r in dropped])
         # A late watch an earlier run set counts as set (watch_ended's set covers its whole window).
@@ -1202,7 +1260,7 @@ def main():
                     ours = False
                 if ours:
                     recorded = out / 'updates.jsonl'
-                    lines = recorded.read_text().splitlines() if recorded.exists() else []
+                    lines = jsonl_rows(recorded)
                     last = json.loads(lines[-1]) if lines else None
                     now = m.summary(regs['ebx'], fs_base)
                     event(kind='took_over_at_return', last=last, now=now)

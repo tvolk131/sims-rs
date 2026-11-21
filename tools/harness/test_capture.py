@@ -1445,6 +1445,34 @@ class SparseTest(CaptureTest):
         self.assertEqual(self.events(output, 'resume_torn')[0]['rows'],
                          {'events.jsonl': ['{"kind": "hour_tur'], 'updates.jsonl': ['{"update": 2, "ti']})
 
+    def test_a_cut_row_is_logged_once_across_killed_takeovers(self):
+        cut = '{"kind": "hour_tur'
+        def torn(output):
+            self.resumed_after({})(output)
+            with open(output / 'events.jsonl', 'a') as f:
+                f.write(cut)
+            (output / 'watch.jsonl').write_text(json.dumps(dict(name='a')))
+        # The first: the whole row that lacks its newline is ended, and that is logged too.
+        _, output, _ = self.run_capture([dict(pc=capture.RETURN)], ['--updates', '2', '--resume'], prepare=torn)
+        [logged] = self.events(output, 'resume_torn')
+        self.assertEqual((logged['rows'], logged['ended']), ({'events.jsonl': [cut]}, ['watch.jsonl']))
+        # Killed after keeping the cut and before taking it off: the same row is noted once.
+        def kept(output):
+            torn(output)
+            (output / 'resume-torn.json').write_text(json.dumps(dict(mark='m1', rows={'events.jsonl': [cut]}, ended=[])))
+        _, output, _ = self.run_capture([dict(pc=capture.RETURN)], ['--updates', '2', '--resume'], prepare=kept)
+        [logged] = self.events(output, 'resume_torn')
+        self.assertEqual((logged['mark'], logged['rows']), ('m1', {'events.jsonl': [cut]}))
+        # Killed after logging it and before taking off resume-torn.json: not logged again.
+        def logged_already(output):
+            self.resumed_after({})(output)
+            with open(output / 'events.jsonl', 'a') as f:
+                f.write(json.dumps(dict(kind='resume_torn', mark='m1', rows={'events.jsonl': [cut]}, ended=[])) + '\n')
+            (output / 'resume-torn.json').write_text(json.dumps(dict(mark='m1', rows={'events.jsonl': [cut]}, ended=[])))
+        _, output, _ = self.run_capture([dict(pc=capture.RETURN)], ['--updates', '2', '--resume'], prepare=logged_already)
+        self.assertEqual([r['mark'] for r in self.events(output, 'resume_torn')], ['m1'])
+        self.assertFalse((output / 'resume-torn.json').exists())
+
     def test_the_cut_row_is_found_from_the_end(self):
         with tempfile.TemporaryDirectory(prefix='sims-torn-test-') as d:
             path = Path(d) / 'log'
@@ -1463,6 +1491,29 @@ class SparseTest(CaptureTest):
             self.run_capture([dict(pc=capture.RETURN)], ['--updates', '3', '--resume'], prepare=prepare)
         self.assertIn('row 1 is not JSON', stderr.getvalue())
         self.last_remote_class.assert_not_called()
+
+    def test_a_row_split_only_by_another_line_break_refuses_the_takeover(self):
+        # A vertical tab between two objects: str.splitlines would make them two rows.
+        def prepare(output):
+            self.resumed_after({})(output)
+            rows = (output / 'updates.jsonl').read_text()
+            (output / 'updates.jsonl').write_text(rows.rstrip('\n') + '\x0b' + json.dumps(dict(update=2)) + '\n')
+        with self.assertRaises(SystemExit), patch.object(sys, 'stderr', io.StringIO()) as stderr:
+            self.run_capture([dict(pc=capture.RETURN)], ['--updates', '3', '--resume'], prepare=prepare)
+        self.assertIn('updates.jsonl row 1 is not JSON', stderr.getvalue())
+        self.last_remote_class.assert_not_called()
+
+    def test_a_blank_or_broken_event_row_refuses_the_takeover(self):
+        for bad in ('\n', '{"kind": \n', '[1]\n'):
+            def prepare(output, bad=bad):
+                self.resumed_after({})(output)
+                rows = (output / 'events.jsonl').read_text()
+                (output / 'events.jsonl').write_text(rows + bad + json.dumps(dict(kind='note')) + '\n')
+            with self.assertRaises(SystemExit), patch.object(sys, 'stderr', io.StringIO()) as stderr:
+                self.run_capture([dict(pc=capture.RETURN)], ['--updates', '3', '--resume'], prepare=prepare)
+            self.assertIn('events.jsonl row', stderr.getvalue())
+            self.assertIn('is not JSON', stderr.getvalue())
+            self.last_remote_class.assert_not_called()
 
     def test_negative_windows_are_refused(self):
         with self.assertRaises(SystemExit), patch.object(sys, 'stderr', io.StringIO()):
