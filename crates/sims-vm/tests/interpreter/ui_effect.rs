@@ -5033,3 +5033,483 @@ fn round_19_global34_stale_refresh_mummy_hashtable_textures_clothing_workwear_np
         );
     }
 }
+
+#[test]
+fn round_20_global34_grown_saved_shared_scan_empty_retry_mnc_init_leading_g_workwear_case_and_cp1252()
+ {
+    use sims_content::{ImportWardrobe, Profile, SuitTable};
+    use sims_formats::career::Level;
+    use sims_formats::saved_objects::Accessory;
+
+    // 1. P2 #1: Set To Next (`0x44eb9d`, ebp-0x18) and Expression (`0x452c85`,
+    // ebp-0x04) overwrite `scratch_ptr_set` so UI Effect Global 34 traps even
+    // after Random Number previously set a safe slot.
+    {
+        let (mut fx, _, record) = visitors();
+        fx.world.globals[34] = record;
+        fx.add(
+            LAMP_FILE,
+            4099,
+            tree(vec![
+                ins(8, 1, RETURN_FALSE, [0, 0, 8, 0, 1, 0, 7, 0]),
+                ins(31, 2, 2, [0, 0, 0, 0, 0x83, 8, 0, 0]),
+                ins(
+                    34,
+                    RETURN_TRUE,
+                    RETURN_FALSE,
+                    [1, scope::GLOBAL, 34, 0, 1, 0, 0, 0],
+                ),
+            ]),
+        );
+        assert!(
+            fx.run_with(LAMP, 4099, 0, &[], 100).is_err(),
+            "Set To Next must make subsequent UI Effect Global 34 trap"
+        );
+        assert!(!fx.world.scratch_ptr_set.contains(&LAMP));
+
+        fx.add(
+            LAMP_FILE,
+            4100,
+            tree(vec![
+                ins(8, 1, RETURN_FALSE, [0, 0, 8, 0, 1, 0, 7, 0]),
+                assign(scope::TEMPS, 0, scope::LITERAL, 1, 2),
+                ins(
+                    34,
+                    RETURN_TRUE,
+                    RETURN_FALSE,
+                    [1, scope::GLOBAL, 34, 0, 1, 0, 0, 0],
+                ),
+            ]),
+        );
+        assert!(
+            fx.run_with(LAMP, 4100, 0, &[], 100).is_err(),
+            "Expression must make subsequent UI Effect Global 34 trap"
+        );
+    }
+
+    // 2. P2 #2: Saved-house loading skips saved appearances & accessories for
+    // `GROWN` types (`0x4400ef` -> `0x45cf79` -> `0x591ae2`/`0x591bdc`),
+    // opening no indexed `.bcf`, drawing no extra CRT RNG, and not dirtying portraits.
+    {
+        const GROWN_GUID: u32 = 0x3C08_965F;
+        let (mut fx, _, _) = visitors();
+        let grown_file = fx.add_type(GROWN_GUID, 2, 4096, 4097);
+        fx.words(grown_file)[102] = 0;
+        let skel = sims_content::Skeleton {
+            name: "adult".into(),
+            file: "adult.bcf".into(),
+            place: 0,
+            scales: vec![vec![1]],
+            bones: Vec::new(),
+        };
+        let app_skel = sims_content::Skeleton {
+            name: "lazy_s".into(),
+            file: "grown_lazy.bcf".into(),
+            place: 0,
+            scales: vec![vec![1]],
+            bones: Vec::new(),
+        };
+        fx.program
+            .people
+            .skeletons_by_name
+            .insert("adult".into(), skel);
+        fx.program
+            .people
+            .skeleton_names
+            .insert(GROWN_GUID, "adult".into());
+        fx.program
+            .people
+            .indexed_catalogs
+            .insert("grown_lazy.bcf".into(), (vec![app_skel], None));
+        fx.program.people.indexed_suit_catalogs.insert(
+            "grown_lazy.bcf".into(),
+            (vec![("grown_body".into(), true)], None),
+        );
+        fx.program
+            .people
+            .indexed_suits
+            .insert("grown_body".into(), Ok("grown_lazy.bcf".into()));
+        fx.program.people.eager_suits.insert("grown_head".into());
+        fx.program.people.head_suits.insert("grown_head".into());
+        let mut p = person();
+        p.appearance[0] = "grown_body".into();
+        p.appearance[8] = "grown_head".into();
+        p.accessories.push(Accessory {
+            name: "grown_head".into(),
+            binding: String::new(),
+        });
+        let inst = sims_formats::saved_objects::Instance {
+            id: 1,
+            type_id: 0,
+            guid: GROWN_GUID,
+            footprint: [0; 4],
+            position: [0; 3],
+            unknown_short: 0,
+            attributes: Vec::new(),
+            temps: vec![0; 8],
+            data: vec![0; 72],
+            obsolete_word: 0,
+            stack_capacity_bytes: 0,
+            stack: Vec::new(),
+            relationship_flag: 0,
+            relationships: Vec::new(),
+            slots: vec![sims_formats::saved_objects::Slot {
+                unknown: 0,
+                object: 0,
+            }],
+            dynamic_sprites: Vec::new(),
+            multipart: None,
+            portal: None,
+            person: Some(p),
+            registry_word: Some(0),
+            consumed_bits: 0,
+            record: Vec::new(),
+        };
+        let saved = sims_formats::saved_objects::Objects {
+            version: 0x47,
+            order: vec![1],
+            types_by_id: BTreeMap::new(),
+            instances: BTreeMap::from([(1, inst)]),
+            tail: Vec::new(),
+        };
+        let mut world = sims_sim::World::empty();
+        world.neighbors.slots.push(Some(Neighbor {
+            guid: GROWN_GUID,
+            id: 1,
+            data: vec![20; 88],
+            relationships: Vec::new(),
+            friends: 0,
+            revision: 1,
+            stale: false,
+        }));
+        let read = fx
+            .interpreter()
+            .read_objects(&mut world, &saved, &fx.program.people)
+            .expect("saved read");
+        assert_eq!(read.draws, 64);
+        assert!(!world.loaded_indexed_suits.contains_key("grown_body"));
+        assert!(world.person_outfits[&1].body.is_none());
+        assert!(world.person_outfits[&1].head.is_none());
+        assert!(world.person_outfits[&1].accessories.is_empty());
+        assert!(!world.dirty_portraits.contains(&GROWN_GUID));
+    }
+
+    // 3. P2 #3 & #5: Make New Character shares the lazy `0x409255` suit scan
+    // with generated dressing (seeing `.bcf` siblings opened before first scan)
+    // AND runs `0x409315` (`0x44afc0`) before editing the clone to initialize
+    // derived clothing rows (30..=34).
+    {
+        const TEMPLATE_PERSON: u32 = 0x7fd9_6b54;
+        let (mut fx, _, _) = visitors();
+        let tpl_file = fx.add_type(TEMPLATE_PERSON, 2, 4096, 4097);
+        fx.world.neighbors.slots.push(Some(Neighbor {
+            guid: TEMPLATE_PERSON,
+            id: 2,
+            data: vec![0; 88],
+            relationships: Vec::new(),
+            friends: 0,
+            revision: 0,
+            stale: false,
+        }));
+        fx.add(
+            tpl_file,
+            4096,
+            tree(vec![assign(
+                scope::MY_DATA,
+                4,
+                scope::LITERAL,
+                1,
+                RETURN_TRUE,
+            )]),
+        );
+        fx.add(
+            tpl_file,
+            4097,
+            tree(vec![
+                assign(scope::PARAMETERS, 0, scope::LITERAL, 10, 1),
+                ins(0, 0, 0, [0; 8]),
+            ]),
+        );
+        equip(&mut fx, TEMPLATE_PERSON, "adult", 12);
+        fx.program.people.profiles.insert(
+            TEMPLATE_PERSON,
+            Profile {
+                body: Some("b001mafit_01,BODY=b001mafitlgt_01".into()),
+                head: Some("c001ma_01,HEAD-HEAD=c001malgt_01".into()),
+                gender: Some("male".into()),
+                age: Some("27".into()),
+                skin: Some("lgt".into()),
+                tones: vec!["lgt".into()],
+                ..Default::default()
+            },
+        );
+        let mut table = SuitTable::default();
+        for name in [
+            "c001ma_01",
+            "f100mafit_01",
+            "s100mafit_01",
+            "l100mafit_01",
+            "w100mafit_01",
+            "h501mafit_01",
+        ] {
+            table.insert_name(name.into());
+        }
+        fx.program.people.suit_table = table;
+        fx.program.people.textures = vec![
+            "b002mafitlgt_late".into(),
+            "c001malgt_01".into(),
+            "f100mafitlgt_01".into(),
+        ];
+        fx.program.ordered_wardrobe = Some(Ok(ImportWardrobe::from_ordered_names(
+            vec![b"c001ma_01".to_vec()],
+            vec![b"b002mafitlgt_late".to_vec(), b"c001malgt_01".to_vec()],
+        )));
+        fx.world.runtime_added_suits.push("b002mafit_late".into());
+        fx.add(
+            SIM_FILE,
+            4098,
+            tree(vec![
+                assign(scope::LOCALS, 0, scope::LITERAL, 0, 1),
+                assign(scope::LOCALS, 1, scope::LITERAL, 27, 2),
+                assign(scope::LOCALS, 2, scope::LITERAL, 0, 3),
+                ins(19, 4, RETURN_FALSE, [0, 1, 2, 0, 0, 0, 0, 0]),
+                assign(scope::GLOBAL, 36, scope::STACK_OBJECT, 0, RETURN_TRUE),
+            ]),
+        );
+        assert_eq!(fx.run_with(SIM, 4098, 0, &[], 1000), Ok(true));
+        let made_guid = fx.world.neighbors.get(fx.world.globals[36]).unwrap().guid;
+        let rows = &fx.world.made_outfits[&made_guid];
+        assert!(
+            rows.get(&1)
+                .is_some_and(|s| s.starts_with("b002mafit_late,")),
+            "Make New Character must share the live 0x409255 scan including runtime_added_suits, got: {rows:?}"
+        );
+        assert!(
+            rows.get(&30)
+                .is_some_and(|s| s.starts_with("f100mafit_01,BODY=f100mafitlgt_01")),
+            "0x44afc0 -> 0x409315 must initialize derived formal row 30 on clone, got: {rows:?}"
+        );
+        assert!(rows.get(&33).is_some_and(|s| s.starts_with("w100mafit_01")));
+    }
+
+    // 4. P2 #4: Empty suit scan (only filtered `suit-` entries) is NOT cached
+    // permanently (`0x40922f`), so a later `.bcf` load adding a real costume is found.
+    {
+        let (mut fx, _, _) = visitors();
+        fx.words(SIM_FILE)[102] = 0;
+        fx.world.neighbors.slots.push(Some(Neighbor {
+            guid: SIM_GUID,
+            id: 2,
+            data: vec![0; 88],
+            relationships: Vec::new(),
+            friends: 0,
+            revision: 0,
+            stale: false,
+        }));
+        let sim_record = fx.world.neighbors.slots.len() as i16;
+        let mut table = SuitTable::default();
+        table.insert_name(b"suit-filtered".to_vec());
+        fx.program.people.suit_table = table;
+        fx.program.people.profiles.insert(
+            SIM_GUID,
+            Profile {
+                body: Some("b001fafit_01,BODY=b".into()),
+                head: None,
+                gender: Some("female".into()),
+                age: Some("27".into()),
+                ..Default::default()
+            },
+        );
+        {
+            let p = fx
+                .world
+                .objects
+                .get_mut(&SIM)
+                .unwrap()
+                .person
+                .as_mut()
+                .unwrap();
+            p.data[65] = 1;
+            p.data[58] = 27;
+            p.data[8] = 39;
+        }
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
+            Ok(true)
+        );
+        assert!(
+            fx.world.suit_scan_cache.is_none(),
+            "0x40922f must not cache an empty scan permanently"
+        );
+        fx.world
+            .runtime_added_suits
+            .push("magicfafit_bluegenie".into());
+        fx.program
+            .people
+            .eager_suits
+            .insert("magicfafit_bluegenie".into());
+        fx.program
+            .people
+            .head_suits
+            .insert("magicfafit_bluegenie".into());
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
+            Ok(true)
+        );
+        assert_eq!(
+            fx.world.person_outfits[&SIM]
+                .body
+                .as_ref()
+                .map(|b| b.suit.as_str()),
+            Some("magicfafit_bluegenie")
+        );
+        assert!(fx.world.portraits.contains(&SIM_GUID));
+    }
+
+    // 5. P2 #6 & #7 & P3 #1..#4:
+    // - Leading `$g` (`$gwork`) rejects `uwork` on male profile (`0x4726c5 -> 0x4727f1`);
+    // - Workwear literal secondary suit (`CARR strings[4]`, `"HEAD_HAT"`) is byte-exact;
+    // - Empty texture template matches `base_tex[17..]` (`"BODY=fresh"`);
+    // - Generated body texture descriptor is capped at 63 bytes (`0x40e760`);
+    // - `parse_row_descriptor` caps raw row at 255 bytes (`0x5874fa`);
+    // - Windows-1252 scoring picks `f100mafit_€` (11 bytes) over `f100mafit_ab` (12 bytes).
+    {
+        let (mut fx, _, _) = visitors();
+        fx.words(SIM_FILE)[102] = 0;
+        fx.world.neighbors.slots.push(Some(Neighbor {
+            guid: SIM_GUID,
+            id: 2,
+            data: vec![0; 88],
+            relationships: Vec::new(),
+            friends: 0,
+            revision: 0,
+            stale: false,
+        }));
+        let sim_record = fx.world.neighbors.slots.len() as i16;
+        let mut table = SuitTable::default();
+        for name in ["uwork", "tuwork", "f100mafit_\u{20ac}", "f100mafit_ab"] {
+            table.insert_name(sims_formats::far::encode_name(name).unwrap());
+        }
+        fx.program.people.suit_table = table;
+        for name in ["uwork", "tuwork", "head_hat"] {
+            fx.program.people.eager_suits.insert(name.into());
+            fx.program.people.head_suits.insert(name.into());
+        }
+        let long_tex = format!("t{}", "x".repeat(62));
+        fx.program.people.textures = vec!["fresh".into(), long_tex];
+        fx.program.careers = Some(vec![sims_vm::Career {
+            id: 1,
+            levels: vec![
+                Level {
+                    values: [0; 21],
+                    strings: [
+                        "L0".into(),
+                        "$gwork".into(),
+                        String::new(),
+                        String::new(),
+                        "HEAD_HAT".into(),
+                    ],
+                },
+                Level {
+                    values: [0; 21],
+                    strings: [
+                        "L1".into(),
+                        "t$gwork".into(),
+                        String::new(),
+                        "t".into(),
+                        String::new(),
+                    ],
+                },
+            ],
+        }]);
+        let long_row1 = format!("plain,BODY={}", "x".repeat(300));
+        fx.program.people.profiles.insert(
+            SIM_GUID,
+            Profile {
+                body: Some("b001mafit_01,BODY=b001mafitlgtfresh".into()),
+                head: None,
+                gender: Some("male".into()),
+                age: Some("27".into()),
+                skin: Some("lgt".into()),
+                suit_rows: BTreeMap::from([(15, long_row1)]),
+                ..Default::default()
+            },
+        );
+        {
+            let p = fx
+                .world
+                .objects
+                .get_mut(&SIM)
+                .unwrap()
+                .person
+                .as_mut()
+                .unwrap();
+            p.data[65] = 0;
+            p.data[58] = 27;
+            p.data[56] = 1;
+            p.data[57] = 0;
+            p.data[8] = 3;
+        }
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
+            Ok(true)
+        );
+        assert!(
+            !fx.world.portraits.contains(&SIM_GUID),
+            "leading $gwork must reject uwork and HEAD_HAT must not fold to head_hat"
+        );
+        assert!(fx.world.person_outfits[&SIM].body_alt.is_none());
+        assert_eq!(
+            fx.world.person_outfits[&SIM]
+                .workwear_cache
+                .as_ref()
+                .map(|c| c.body_tex.as_str()),
+            Some("BODY=fresh"),
+            "0x40e6dc must still match base-texture suffix when template is empty"
+        );
+        assert!(
+            fx.world.made_outfits[&SIM_GUID]
+                .get(&30)
+                .is_some_and(|s| s.starts_with("f100mafit_\u{20ac},BODY=")),
+            "0x472a25 must score by Windows-1252 byte length, got: {:?}",
+            fx.world.made_outfits[&SIM_GUID].get(&30)
+        );
+
+        fx.world
+            .objects
+            .get_mut(&SIM)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap()
+            .data[57] = 1;
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
+            Ok(true)
+        );
+        let body = fx.world.person_outfits[&SIM].body.as_ref().unwrap();
+        assert_eq!(body.suit, "tuwork");
+        assert_eq!(body.texture.len(), 63);
+        assert!(body.texture.starts_with("BODY=tx"));
+        assert!(fx.world.portraits.contains(&SIM_GUID));
+
+        fx.program.people.eager_suits.insert("plain".into());
+        fx.world.portraits.remove(&SIM_GUID);
+        fx.world.generated_portrait_2002.clear();
+        fx.world
+            .objects
+            .get_mut(&SIM)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap()
+            .data[8] = 1;
+        assert_eq!(
+            run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, sim_record, 1),
+            Ok(true)
+        );
+        let body = fx.world.person_outfits[&SIM].body.as_ref().unwrap();
+        assert_eq!(body.suit, "plain");
+        assert_eq!(body.texture.len(), 249);
+    }
+}

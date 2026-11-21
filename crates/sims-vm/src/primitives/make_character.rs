@@ -179,11 +179,18 @@ impl Machine<'_, '_> {
         };
         // 0x44af66..0x44af89: pets always pass child = 0 to 0x40cc2a.
         let child = species == 0 && age < ADULT_AGE;
-        let dst_is_pet = is_pet_gender(
-            crate::people::profile(&self.program.people, self.world, guid)?
-                .gender
-                .as_deref(),
+        // 0x44afc0 -> 0x409315: initialize derived clothing rows (30..=34) on
+        // the newly cloned character before editing its age, skin, or gender.
+        let tpl_profile = crate::people::profile(&self.program.people, self.world, guid)
+            .ok()
+            .map(std::borrow::Cow::into_owned);
+        crate::outfits::init_clothing_rows(
+            &self.program.people,
+            self.world,
+            guid,
+            tpl_profile.as_ref(),
         );
+        let dst_is_pet = is_pet_gender(tpl_profile.as_ref().and_then(|p| p.gender.as_deref()));
         let made = self
             .world
             .characters
@@ -261,7 +268,11 @@ impl Machine<'_, '_> {
                 outfit_rows.insert(30, "ADDED".to_owned());
                 outfit_rows.insert(34, "ADDED".to_owned());
             }
-            self.world.made_outfits.insert(guid, outfit_rows);
+            self.world
+                .made_outfits
+                .entry(guid)
+                .or_default()
+                .extend(outfit_rows);
             self.world.made_portrait_head.insert(guid, head_status);
             self.frame_mut()?.stack_object = record;
             Ok(true)
@@ -312,7 +323,11 @@ impl Machine<'_, '_> {
             for row in [2usize, 30, 31, 32, 33, 34] {
                 outfit_rows.insert(row, "NONE".to_owned());
             }
-            self.world.made_outfits.insert(guid, outfit_rows);
+            self.world
+                .made_outfits
+                .entry(guid)
+                .or_default()
+                .extend(outfit_rows);
             self.world.made_portrait_head.insert(guid, head_status);
             self.frame_mut()?.stack_object = record;
             // 0x44b111..0x44b12b: pet creation immediately calls
@@ -344,6 +359,18 @@ impl Machine<'_, '_> {
             )));
         }
         let src = crate::people::profile(&self.program.people, self.world, self_guid)?.into_owned();
+        // 0x44b26e -> 0x409315 on source, then 0x44b27b -> 0x409315 on clone,
+        // before editing the clone's age, skin, or gender.
+        crate::outfits::init_clothing_rows(&self.program.people, self.world, self_guid, Some(&src));
+        let dst_profile = crate::people::profile(&self.program.people, self.world, guid)
+            .ok()
+            .map(std::borrow::Cow::into_owned);
+        crate::outfits::init_clothing_rows(
+            &self.program.people,
+            self.world,
+            guid,
+            dst_profile.as_ref(),
+        );
         // 0x40ccac maps "male" -> 0, "female" -> 1, and every pet or unknown
         // gender string to 2..=5. At 0x44b2ef, 0x40d408 -> 0x40d3db ->
         // 0x408bf5(1) returns null for codes 2..=5 and 0x40d42e dereferences it.
@@ -363,11 +390,7 @@ impl Machine<'_, '_> {
         // 0x40d007 returns "???" when STR# 200 string 14 is absent (null),
         // and copies into the native 3-byte fixed buffer (0x40bf8b).
         let src_skin = truncate_skin_tone(src.skin.as_deref().unwrap_or("???"));
-        let dst_is_pet = is_pet_gender(
-            crate::people::profile(&self.program.people, self.world, guid)?
-                .gender
-                .as_deref(),
-        );
+        let dst_is_pet = is_pet_gender(dst_profile.as_ref().and_then(|p| p.gender.as_deref()));
         let made = self
             .world
             .characters
@@ -470,14 +493,9 @@ impl Machine<'_, '_> {
             }
             rows
         };
-        let (copied_outfits, head_status) = match &self.program.ordered_wardrobe {
-            Some(Err(reason)) => {
-                return Err(Trap::Unsupported(format!(
-                    "Make New Character with negative age needs the install's native-ordered \
-                     wardrobe ({reason})"
-                )));
-            }
-            Some(Ok(ordered)) => {
+        let live_ordered = self.live_ordered_wardrobe()?;
+        let (copied_outfits, head_status) = match &live_ordered {
+            Some(ordered) => {
                 let mut body_hit = src_body.and_then(|raw| {
                     ordered.find_outfit(false, src_female, src_child, &src_skin, raw)
                 });
@@ -522,7 +540,11 @@ impl Machine<'_, '_> {
                 (Some(rows), combined)
             }
             None => {
-                let has_made_outfit = self.world.made_outfits.contains_key(&self_guid);
+                let has_made_outfit = self
+                    .world
+                    .made_outfits
+                    .get(&self_guid)
+                    .is_some_and(|m| m.contains_key(&1) || m.contains_key(&2));
                 match self.program.wardrobe.as_ref() {
                     None => {
                         let status = if !has_manual_made_suit
@@ -644,7 +666,11 @@ impl Machine<'_, '_> {
             }
         };
         if let Some(rows) = copied_outfits {
-            self.world.made_outfits.insert(guid, rows);
+            self.world
+                .made_outfits
+                .entry(guid)
+                .or_default()
+                .extend(rows);
         }
         self.world.made_portrait_head.insert(guid, head_status);
         self.frame_mut()?.stack_object = record;
@@ -815,27 +841,84 @@ impl Machine<'_, '_> {
         Ok((guid, record))
     }
 
-    /// The number of bodies and heads a person of skin tone `tone` can
-    /// wear (0x40d077, 0x40d3db): the length of the lists 0x408bf5 builds
-    /// ([`sims_content::Wardrobe::count`]). The original keeps each list
-    /// by skin tone, sex and age for the rest of the game (the cache at
-    /// 0x6e4890); the names it is built from do not change while the game
-    /// runs, so counting again gives the same length.
-    fn suit_counts(&self, tone: &str, female: bool, child: bool) -> Result<(u32, u32), Trap> {
-        match &self.program.ordered_wardrobe {
-            Some(Ok(ordered)) => {
-                let count = |head| {
-                    u32::try_from(ordered.count(head, female, child, tone))
-                        .map_err(|_| Trap::Invalid("more suits than a count holds".into()))
-                };
-                return Ok((count(false)?, count(true)?));
-            }
+    /// Returns the native-ordered wardrobe sharing the lazy `0x409255`
+    /// (`0x6e48a0`) suit scan cache (`World::suit_scan_cache`) with generated
+    /// outfit dressing (`0x40e622`). Any `.bcf` sibling appearances registered
+    /// before the first non-empty scan are included in both paths.
+    fn live_ordered_wardrobe(&mut self) -> Result<Option<sims_content::ImportWardrobe>, Trap> {
+        let ordered = match &self.program.ordered_wardrobe {
+            Some(Ok(ordered)) => ordered.clone(),
             Some(Err(reason)) => {
                 return Err(Trap::Unsupported(format!(
                     "Make New Character needs the install's native-ordered wardrobe ({reason})"
                 )));
             }
-            None => {}
+            None => return Ok(None),
+        };
+        if self
+            .world
+            .suit_scan_cache
+            .as_ref()
+            .is_some_and(|v| !v.is_empty())
+            || !self.program.people.suit_table.is_empty()
+            || !self.world.runtime_added_suits.is_empty()
+        {
+            let scan = if self.program.people.suit_table.is_empty()
+                && self
+                    .world
+                    .suit_scan_cache
+                    .as_ref()
+                    .is_none_or(Vec::is_empty)
+            {
+                let mut table = sims_content::SuitTable::default();
+                for name in ordered.suits() {
+                    if !table.contains(name) {
+                        table.insert_name(name.clone());
+                    }
+                }
+                for name in &self.world.runtime_added_suits {
+                    let key = crate::outfits::encode_cp1252(name);
+                    if !table.contains(&key) {
+                        table.insert_name(key);
+                    }
+                }
+                let scan = table.scan_names();
+                if !scan.is_empty() {
+                    self.world.suit_scan_cache = Some(scan.clone());
+                }
+                scan
+            } else {
+                crate::outfits::suit_scan_order(&self.program.people, self.world)
+            };
+            let bytes = scan
+                .iter()
+                .map(|s| crate::outfits::encode_cp1252(s))
+                .collect();
+            return Ok(Some(ordered.with_suits(bytes)));
+        }
+        if !ordered.suits().is_empty() {
+            self.world.suit_scan_cache = Some(
+                ordered
+                    .suits()
+                    .iter()
+                    .map(|b| sims_formats::strings::decode(b, 1))
+                    .collect(),
+            );
+        }
+        Ok(Some(ordered))
+    }
+
+    /// The number of bodies and heads a person of skin tone `tone` can
+    /// wear (0x40d077, 0x40d3db): the length of the lists 0x408bf5 builds
+    /// ([`sims_content::Wardrobe::count`]), sharing `0x409255` (`0x6e48a0`)
+    /// with generated dressing.
+    fn suit_counts(&mut self, tone: &str, female: bool, child: bool) -> Result<(u32, u32), Trap> {
+        if let Some(ordered) = self.live_ordered_wardrobe()? {
+            let count = |head| {
+                u32::try_from(ordered.count(head, female, child, tone))
+                    .map_err(|_| Trap::Invalid("more suits than a count holds".into()))
+            };
+            return Ok((count(false)?, count(true)?));
         }
         let wardrobe = self.program.wardrobe.as_ref().ok_or_else(|| {
             Trap::Unsupported(
@@ -859,18 +942,10 @@ impl Machine<'_, '_> {
 
     /// The number of bodies a dog (`cat` false) or cat can wear (0x40d077 →
     /// 0x408bf5 → 0x409663, [`sims_content::Wardrobe::count_pet`]).
-    fn pet_body_count(&self, cat: bool) -> Result<u32, Trap> {
-        match &self.program.ordered_wardrobe {
-            Some(Ok(ordered)) => {
-                return u32::try_from(ordered.count_pet(cat))
-                    .map_err(|_| Trap::Invalid("more suits than a count holds".into()));
-            }
-            Some(Err(reason)) => {
-                return Err(Trap::Unsupported(format!(
-                    "Make New Character needs the install's native-ordered wardrobe ({reason})"
-                )));
-            }
-            None => {}
+    fn pet_body_count(&mut self, cat: bool) -> Result<u32, Trap> {
+        if let Some(ordered) = self.live_ordered_wardrobe()? {
+            return u32::try_from(ordered.count_pet(cat))
+                .map_err(|_| Trap::Invalid("more suits than a count holds".into()));
         }
         let wardrobe = self.program.wardrobe.as_ref().ok_or_else(|| {
             Trap::Unsupported(
@@ -893,14 +968,14 @@ impl Machine<'_, '_> {
     /// using exact native `0x409255`/`0x40895a` order when `ordered_wardrobe`
     /// is loaded, or `wardrobe`'s order in synthetic fixtures.
     fn pick_human_suit(
-        &self,
+        &mut self,
         head: bool,
         female: bool,
         child: bool,
         tone: &str,
         index: usize,
     ) -> Option<(String, String)> {
-        if let Some(Ok(ordered)) = &self.program.ordered_wardrobe {
+        if let Ok(Some(ordered)) = self.live_ordered_wardrobe() {
             ordered.pick(head, female, child, tone, index)
         } else {
             self.program
@@ -913,8 +988,8 @@ impl Machine<'_, '_> {
     /// Picks the `index`-th pet wardrobe entry (`0x44b071`/`0x44b07e`),
     /// using exact native `0x409255`/`0x40895a` order when `ordered_wardrobe`
     /// is loaded, or `wardrobe`'s order in synthetic fixtures.
-    fn pick_pet_suit(&self, cat: bool, index: usize) -> Option<(String, String)> {
-        if let Some(Ok(ordered)) = &self.program.ordered_wardrobe {
+    fn pick_pet_suit(&mut self, cat: bool, index: usize) -> Option<(String, String)> {
+        if let Ok(Some(ordered)) = self.live_ordered_wardrobe() {
             ordered.pick_pet(cat, index)
         } else {
             self.program.wardrobe.as_ref()?.pick_pet(cat, index)

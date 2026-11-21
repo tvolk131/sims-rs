@@ -303,6 +303,15 @@ impl Interpreter<'_> {
                 continue;
             };
             let mut outfit = sims_sim::PersonOutfit::new();
+            // 0x4400ef -> 0x45cf79 -> 0x591ae2 / 0x591bdc: for the special
+            // types in `GROWN`, native loading sets the flag passed into
+            // `cTSPerson::Read`, skipping saved appearance and accessory
+            // attachment (leaving the head slot empty so `0x591b53` skips
+            // `0x4eb0eb` as well).
+            if grows(object.guid, expansions) {
+                person_outfits.insert(id, outfit);
+                continue;
+            }
             let mut bind = |suit: &str, texture: &str| -> Option<sims_sim::BoundSlot> {
                 if suit.is_empty() {
                     return None;
@@ -337,10 +346,10 @@ impl Interpreter<'_> {
             outfit.extra_left = bind(&person.appearance[4], &person.appearance[5]);
             outfit.extra_right = bind(&person.appearance[6], &person.appearance[7]);
             outfit.head = bind(&person.appearance[8], &person.appearance[9]);
-            // 0x591b01..0x591b58: compare saved head suit/texture against the
-            // freshly constructed empty head slot (`""`, `""`); if either is
+            // 0x591b01..0x591b58: compare the live head slot (`[esi + 0x258]`)
+            // against the freshly constructed empty head slot (`""`, `""`); if
             // non-empty, `0x4eb0eb` invalidates and marks the portrait dirty.
-            if !person.appearance[8].is_empty() || !person.appearance[9].is_empty() {
+            if outfit.head.is_some() {
                 dirtied_portraits.push(object.guid);
             }
             // 0x591b66..0x591bf8: bind each serialized accessory via 0x583541

@@ -27,15 +27,88 @@ const JOB_LEVEL: usize = 57;
 const AGE: usize = 58;
 const GENDER: usize = 65;
 
+/// Encodes a single character into its Windows-1252 byte, preserving ASCII case.
+fn cp1252_byte(ch: char) -> Option<u8> {
+    let code = ch as u32;
+    if code <= 0x7f || (0xa0..=0xff).contains(&code) {
+        return Some(code as u8);
+    }
+    match ch {
+        '\u{20ac}' => Some(0x80),
+        '\u{201a}' => Some(0x82),
+        '\u{0192}' => Some(0x83),
+        '\u{201e}' => Some(0x84),
+        '\u{2026}' => Some(0x85),
+        '\u{2020}' => Some(0x86),
+        '\u{2021}' => Some(0x87),
+        '\u{02c6}' => Some(0x88),
+        '\u{2030}' => Some(0x89),
+        '\u{0160}' => Some(0x8a),
+        '\u{2039}' => Some(0x8b),
+        '\u{0152}' => Some(0x8c),
+        '\u{017d}' => Some(0x8e),
+        '\u{2018}' => Some(0x91),
+        '\u{2019}' => Some(0x92),
+        '\u{201c}' => Some(0x93),
+        '\u{201d}' => Some(0x94),
+        '\u{2022}' => Some(0x95),
+        '\u{2013}' => Some(0x96),
+        '\u{2014}' => Some(0x97),
+        '\u{02dc}' => Some(0x98),
+        '\u{2122}' => Some(0x99),
+        '\u{0161}' => Some(0x9a),
+        '\u{203a}' => Some(0x9b),
+        '\u{0153}' => Some(0x9c),
+        '\u{017e}' => Some(0x9e),
+        '\u{0178}' => Some(0x9f),
+        _ => None,
+    }
+}
+
+/// Encodes `s` into Windows-1252 bytes (falling back to UTF-8 for characters
+/// outside Windows-1252), preserving case.
+pub(crate) fn encode_cp1252(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    for ch in s.chars() {
+        if let Some(b) = cp1252_byte(ch) {
+            out.push(b);
+        } else {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        }
+    }
+    out
+}
+
+/// Returns the longest prefix of `s` whose Windows-1252 byte encoding fits
+/// within `max_bytes`.
+fn truncate_cp1252(s: &str, max_bytes: usize) -> &str {
+    let mut used = 0usize;
+    for (idx, ch) in s.char_indices() {
+        let len = if cp1252_byte(ch).is_some() {
+            1
+        } else {
+            ch.len_utf8()
+        };
+        if used + len > max_bytes {
+            return &s[..idx];
+        }
+        used += len;
+    }
+    s
+}
+
 /// Parses a `STR# 200` outfit descriptor (`0x5874ca`) into `(suit, texture)`.
 ///
-/// Splits on `;` (`second_half == false` takes the first half, `true` takes
+/// Copies at most 255 Windows-1252 bytes (`0x5874fa`–`0x58752c`) before
+/// splitting on `;` (`second_half == false` takes the first half, `true` takes
 /// the second half when `;` is present), then splits on `,`:
 /// - `suit` (before `,`) is lowercased in ASCII (`0x46f8f7`);
 /// - `texture` (after `,`): when it contains `=`, the prefix through `=` keeps
 ///   its original case while the value after `=` is lowercased (`0x587612`–
 ///   `0x58765c`); otherwise the whole texture is lowercased (`0x587670`).
 pub(crate) fn parse_row_descriptor(row: &str, second_half: bool) -> (String, String) {
+    let row = truncate_cp1252(row, 255);
     let half = if second_half {
         match row.find(';') {
             Some(pos) => &row[pos + 1..],
@@ -113,41 +186,49 @@ fn profile_gender_code(gender: Option<&str>) -> i32 {
         .map_or(-1, |idx| idx as i32)
 }
 
-/// One node of the native pattern matcher (`0x472657`, `0x4726c5`, `0x47275d`).
+/// One node of the native pattern matcher (`0x472657`, `0x4726c5`, `0x47275d`),
+/// stored as Windows-1252 bytes.
 #[derive(Debug, Clone)]
 enum PatternStep {
-    Literal(String),
-    Choice(String, String),
+    Literal(Vec<u8>),
+    Choice(Vec<u8>, Vec<u8>),
     Skip(usize),
 }
 
 /// Prefix pattern automaton (`0x472657`–`0x4729b2`), returning the maximum
-/// matched prefix byte length on ASCII case-insensitive comparison.
+/// matched prefix byte length on Windows-1252 ASCII-case-insensitive comparison.
 #[derive(Debug, Clone, Default)]
 struct Pattern {
     steps: Vec<PatternStep>,
 }
 
 impl Pattern {
-    fn push_literal(&mut self, s: impl Into<String>) {
-        self.steps.push(PatternStep::Literal(s.into()));
+    fn push_literal(&mut self, s: &str) {
+        self.steps.push(PatternStep::Literal(encode_cp1252(s)));
     }
 
-    fn push_choice(&mut self, a: impl Into<String>, b: impl Into<String>) {
-        self.steps.push(PatternStep::Choice(a.into(), b.into()));
+    fn push_choice(&mut self, a: &str, b: &str) {
+        // 0x4726c5 -> 0x4727f1: the NFA always starts at node 0, so a choice
+        // appended to an empty pattern can only enter its first branch `a`;
+        // `b` is unreachable without a preceding node.
+        if self.steps.is_empty() {
+            self.steps.push(PatternStep::Literal(encode_cp1252(a)));
+        } else {
+            self.steps
+                .push(PatternStep::Choice(encode_cp1252(a), encode_cp1252(b)));
+        }
     }
 
     fn push_skip(&mut self, count: usize) {
         self.steps.push(PatternStep::Skip(count));
     }
 
-    /// `0x4727f1`: returns the longest matched prefix length across all paths,
-    /// or `0` if no path completes all steps.
-    fn match_len(&self, candidate: &str) -> usize {
+    /// `0x4727f1`: returns the longest matched prefix length (in Windows-1252
+    /// bytes) across all paths, or `0` if no path completes all steps.
+    fn match_len(&self, cand: &[u8]) -> usize {
         if self.steps.is_empty() {
             return 0;
         }
-        let cand = candidate.as_bytes();
         let mut best = 0usize;
         self.walk(0, 0, cand, &mut best);
         best
@@ -160,8 +241,7 @@ impl Pattern {
             }
             return;
         };
-        let try_lit = |lit: &str, best: &mut usize| {
-            let bytes = lit.as_bytes();
+        let try_lit = |bytes: &[u8], best: &mut usize| {
             if pos + bytes.len() <= cand.len()
                 && cand[pos..pos + bytes.len()].eq_ignore_ascii_case(bytes)
             {
@@ -183,8 +263,8 @@ impl Pattern {
     }
 }
 
-/// Fuzzy best-ratio selector (`0x472a25`), comparing `matched / len` in double
-/// precision against the stored `f32` score with the native epsilon at
+/// Fuzzy best-ratio selector (`0x472a25`), comparing `matched / cp1252_len` in
+/// double precision against the stored `f32` score with the native epsilon at
 /// `0x667878` (`0.0001_f32`).
 #[derive(Default)]
 struct BestMatch<'a> {
@@ -194,11 +274,11 @@ struct BestMatch<'a> {
 }
 
 impl<'a> BestMatch<'a> {
-    fn consider(&mut self, candidate: &'a str, matched: usize) {
-        if matched == 0 || candidate.is_empty() {
+    fn consider(&mut self, candidate: &'a str, cand_len: usize, matched: usize) {
+        if matched == 0 || cand_len == 0 {
             return;
         }
-        let fraction = matched as f64 / candidate.len() as f64;
+        let fraction = matched as f64 / cand_len as f64;
         let old = f64::from(self.score);
         if fraction > old
             || ((fraction - old).abs() <= f64::from(0.0001_f32) && matched > self.matched)
@@ -211,11 +291,14 @@ impl<'a> BestMatch<'a> {
 }
 
 /// Returns the cached `0x409255` (`0x6e48a0`) walk of `AvatarRegistry`'s
-/// appearance hash table, building and caching it on first use from
+/// appearance hash table, building and caching it on first non-empty use
+/// (`0x40922f` retries whenever the cached vector is empty) from
 /// `people.suit_table` plus any runtime-added `.bcf` sibling appearances
 /// (`World::runtime_added_suits`).
-fn suit_scan_order(people: &People, world: &mut World) -> Vec<String> {
-    if let Some(cached) = &world.suit_scan_cache {
+pub(crate) fn suit_scan_order(people: &People, world: &mut World) -> Vec<String> {
+    if let Some(cached) = &world.suit_scan_cache
+        && !cached.is_empty()
+    {
         return cached.clone();
     }
     let mut table: SuitTable = if !people.suit_table.is_empty() {
@@ -231,8 +314,7 @@ fn suit_scan_order(people: &People, world: &mut World) -> Vec<String> {
             .chain(people.suits.iter())
             .chain(people.head_suits.iter())
         {
-            let key =
-                sims_formats::far::encode_name(name).unwrap_or_else(|| name.as_bytes().to_vec());
+            let key = encode_cp1252(name);
             if !t.contains(&key) {
                 t.insert_name(key);
             }
@@ -240,13 +322,15 @@ fn suit_scan_order(people: &People, world: &mut World) -> Vec<String> {
         t
     };
     for name in &world.runtime_added_suits {
-        let key = sims_formats::far::encode_name(name).unwrap_or_else(|| name.as_bytes().to_vec());
+        let key = encode_cp1252(name);
         if !table.contains(&key) {
             table.insert_name(key);
         }
     }
     let scan = table.scan_names();
-    world.suit_scan_cache = Some(scan.clone());
+    if !scan.is_empty() {
+        world.suit_scan_cache = Some(scan.clone());
+    }
     scan
 }
 
@@ -258,39 +342,35 @@ fn expand_template_pattern(
     skin_3: &str,
 ) -> Pattern {
     let mut pattern = Pattern::default();
-    let bytes = template.as_bytes();
-    let mut i = 0;
+    let mut chars = template.chars().peekable();
     let mut lit = String::new();
-    while i < bytes.len() {
-        if bytes[i] == b'$' {
+    while let Some(ch) = chars.next() {
+        if ch == '$' {
             if !lit.is_empty() {
-                pattern.push_literal(std::mem::take(&mut lit));
+                pattern.push_literal(&lit);
+                lit.clear();
             }
-            if i + 1 < bytes.len() {
-                match bytes[i + 1] {
-                    b'g' | b'G' => {
+            if let Some(next) = chars.next() {
+                match next {
+                    'g' | 'G' => {
                         let g = if gender_code == 1 { "f" } else { "m" };
                         pattern.push_choice(g, "u");
                     }
-                    b'b' | b'B' => {
+                    'b' | 'B' => {
                         pattern.push_literal(body_type);
                     }
-                    b'c' | b'C' => {
+                    'c' | 'C' => {
                         pattern.push_literal(skin_3);
                     }
                     _ => {}
                 }
-                i += 2;
-            } else {
-                i += 1;
             }
             continue;
         }
-        lit.push(bytes[i] as char);
-        i += 1;
+        lit.push(ch);
     }
     if !lit.is_empty() {
-        pattern.push_literal(lit);
+        pattern.push_literal(&lit);
     }
     pattern
 }
@@ -311,7 +391,8 @@ fn match_registered_suit(
     let pattern = expand_template_pattern(template, gender_code, body_type, skin_3);
     let scan = suit_scan_order(people, world);
     for name in &scan {
-        if pattern.match_len(name) > 0 {
+        let bytes = encode_cp1252(name);
+        if pattern.match_len(&bytes) > 0 {
             return name.clone();
         }
     }
@@ -320,7 +401,10 @@ fn match_registered_suit(
 
 /// Matches a texture template against `People::textures` (`0x40e674` for body,
 /// `0x40e891` for head), appending the optional `0x40b75a` suffix
-/// (`base_tex[17..]`) and scoring via `0x472a25`.
+/// (`base_tex[17..]`) even when `template` is empty (`0x40e6dc`–`0x40e6f1`,
+/// `0x40e8f9`–`0x40e90e`), scoring via `0x472a25`, and capping the formatted
+/// descriptor to the 63-byte `StackString<64>` destination (`0x40e760`,
+/// `0x40e960`).
 fn match_registered_texture(
     people: &People,
     template: &str,
@@ -330,22 +414,26 @@ fn match_registered_texture(
     base_tex: &str,
     prefix: &str,
 ) -> String {
-    if template.is_empty() {
-        return String::new();
-    }
     let mut pattern = expand_template_pattern(template, gender_code, body_type, skin_3);
     // 0x40b75a: `strlen("BODY=") + 12 = 17` (used by BOTH 0x40e674 and 0x40e891).
-    let suffix = base_tex.get(17..).unwrap_or("");
-    pattern.push_choice(suffix, "");
+    let base_bytes = encode_cp1252(base_tex);
+    let suffix = if base_bytes.len() > 17 {
+        sims_formats::strings::decode(&base_bytes[17..], 1)
+    } else {
+        String::new()
+    };
+    pattern.push_choice(&suffix, "");
     let mut best = BestMatch::default();
     for tex in &people.textures {
-        let matched = pattern.match_len(tex);
-        best.consider(tex, matched);
+        let bytes = encode_cp1252(tex);
+        let matched = pattern.match_len(&bytes);
+        best.consider(tex, bytes.len(), matched);
     }
     if best.name.is_empty() {
         String::new()
     } else {
-        format!("{prefix}{}", best.name)
+        let out = format!("{prefix}{}", best.name);
+        truncate_cp1252(&out, 63).to_owned()
     }
 }
 
@@ -384,26 +472,20 @@ fn expand_hand_template(template: &str, gesture: i16, gender_code: i32) -> Strin
     out
 }
 
-/// Formats `"{suit},BODY={tex}"` truncated to the 63-byte `StackString<64>`
-/// capacity (`0x40be06`, `0x40c2ef`, `0x40c74a`, `0x40cb56`).
+/// Formats `"{suit},BODY={tex}"` truncated to the 63-byte Windows-1252
+/// `StackString<64>` capacity (`0x40be06`, `0x40c2ef`, `0x40c74a`, `0x40cb56`).
 fn format_generated_body_row(suit: &str, tex: &str) -> String {
-    let mut out = format!("{suit},BODY={tex}");
-    if out.len() > 63 {
-        let mut cut = 63;
-        while !out.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        out.truncate(cut);
-    }
-    out
+    let out = format!("{suit},BODY={tex}");
+    truncate_cp1252(&out, 63).to_owned()
 }
 
 /// Runs `0x409315` (deterministic clothing-row initialization: `0x40b7ed`,
-/// `0x40bfeb`, `0x40c376`, `0x40c855`) before generated-outfit matching,
+/// `0x40bfeb`, `0x40c376`, `0x40c855`) before generated-outfit matching and
+/// before `Make New Character` edits (`0x44afc0`, `0x44b26e`, `0x44b27b`),
 /// populating missing formal (30), swim (31), pajama (32), winter (33), and
 /// high-fashion (34) rows into `World::made_outfits` for human profiles with a
 /// non-empty body row 1.
-fn init_clothing_rows(
+pub(crate) fn init_clothing_rows(
     people: &People,
     world: &mut World,
     guid: u32,
@@ -463,11 +545,13 @@ fn init_clothing_rows(
         |suit_pat: &Pattern, tex_pat: &Pattern, scan: &[String], textures: &[String]| -> String {
             let mut best_suit = BestMatch::default();
             for name in scan {
-                best_suit.consider(name, suit_pat.match_len(name));
+                let bytes = encode_cp1252(name);
+                best_suit.consider(name, bytes.len(), suit_pat.match_len(&bytes));
             }
             let mut best_tex = BestMatch::default();
             for tex in textures {
-                best_tex.consider(tex, tex_pat.match_len(tex));
+                let bytes = encode_cp1252(tex);
+                best_tex.consider(tex, bytes.len(), tex_pat.match_len(&bytes));
             }
             format_generated_body_row(best_suit.name, best_tex.name)
         };
@@ -852,8 +936,8 @@ fn costume_spec(suit: i16, variant: i16) -> Option<CostumeSpec> {
 
 /// Binds `(suit, texture)` onto `slot` following `0x583559`:
 /// - empty `suit` returns immediately without modifying `slot` (`0x583569`);
-/// - non-empty `suit` (including literal `"none"`) is lowercased and resolved
-///   via `0x5a044d` (`resolve_suit`);
+/// - non-empty `suit` (including literal `"none"`) is passed byte-for-byte to
+///   `0x5a044d` (`resolve_suit`, `0x58356f`);
 /// - `Found(has_head)` replaces `slot`;
 /// - `Missing` returns before `0x58359c` detaches the previous attachment;
 /// - `Unknown` (decode error prevented knowing whether `suit` exists/binds
@@ -868,11 +952,10 @@ fn bind_slot(
     if suit.is_empty() {
         return;
     }
-    let lower = suit.to_ascii_lowercase();
-    match resolve_suit(people, world, &lower) {
+    match resolve_suit(people, world, suit) {
         ResolvedSuit::Found(has_head) => {
             *slot = Some(BoundSlot {
-                suit: lower,
+                suit: suit.to_owned(),
                 texture: texture.to_owned(),
                 has_head: Some(has_head),
             });
@@ -882,7 +965,7 @@ fn bind_slot(
         }
         ResolvedSuit::Unknown => {
             *slot = Some(BoundSlot {
-                suit: lower,
+                suit: suit.to_owned(),
                 texture: texture.to_owned(),
                 has_head: None,
             });

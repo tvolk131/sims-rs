@@ -108,9 +108,10 @@ const FAMILY: usize = 61;
 
 impl Machine<'_, '_> {
     pub(crate) fn set_to_next(&mut self, operands: &[u8; 8]) -> Result<bool, Trap> {
-        // 0x44eb9d: binds `[edi + 0x128]` to the local scratch slot right at
-        // entry and never clears it.
-        self.world.scratch_ptr_set.insert(self.me);
+        // 0x44eb9d: binds `[edi + 0x128]` to `[ebp - 0x18]`, which overlaps
+        // the return address of `UI Effect`'s variable read (`0x44ad70`) at
+        // the same dispatcher depth and faults at `&globals[34]`.
+        self.world.scratch_ptr_set.remove(&self.me);
         let (scope, index) = if operands[4] & 0x80 == 0 {
             (10, 0)
         } else {

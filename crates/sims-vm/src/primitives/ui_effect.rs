@@ -280,18 +280,22 @@ impl Machine<'_, '_> {
 
     /// Reads the operand variable (`0x453141` with `write == 0`). On global 34,
     /// `0x45412b` → `0x4541d5` writes `&globals[34]` through `[object + 0x128]`
-    /// without a null check: if an earlier `Expression`, `Random Number`,
-    /// `Get Direction To`, `Relationship`, or `Set To Next` on this object
-    /// already populated `[object + 0x128]` (`World::scratch_ptr_set`), the
-    /// read succeeds and returns `globals[34]`; otherwise it traps.
+    /// without a null check: `Random Number` (`0x451e8d`, `ebp + 0xc`),
+    /// `Get Direction To` (`0x45202b`, `ebp + 0xc`), and `Relationship`
+    /// (`0x44d513`, `ebp - 0xc`) leave `[object + 0x128]` on a harmless arg
+    /// slot (`World::scratch_ptr_set`), whereas an initial null pointer
+    /// (`0x431a77`), `Set To Next` (`0x44eb9d`, `ebp - 0x18` → overwrites
+    /// `0x44ad70`'s return address and faults), or `Expression` (`0x452c85`,
+    /// `ebp - 0x04` → overwrites saved `esi`) corrupts/crashes native state and
+    /// traps loudly.
     fn read_ui_effect_var(&mut self, scope: u8, index: i16) -> Result<i16, Trap> {
         if scope == GLOBAL_SCOPE
             && index == GLOBAL_34
             && !self.world.scratch_ptr_set.contains(&self.me)
         {
             return Err(Trap::Unsupported(
-                "UI Effect reading global 34 (0x45412b -> 0x4541d5 writes through uninitialized \
-                 object +0x128)"
+                "UI Effect reading global 34 (0x45412b -> 0x4541d5 writes through null or \
+                 stack-corrupting object +0x128)"
                     .into(),
             ));
         }

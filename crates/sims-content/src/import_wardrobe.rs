@@ -74,6 +74,20 @@ impl ImportWardrobe {
         Self { suits, textures }
     }
 
+    /// The cached suit names (`0x6e48a0`), in Windows-1252 bytes.
+    pub fn suits(&self) -> &[Vec<u8>] {
+        &self.suits
+    }
+
+    /// Returns a copy of this wardrobe with its suit list replaced by the
+    /// shared live `0x409255` (`0x6e48a0`) scan snapshot.
+    pub fn with_suits(&self, suits: Vec<Vec<u8>>) -> Self {
+        Self {
+            suits,
+            textures: self.textures.clone(),
+        }
+    }
+
     /// Replays the startup file tables (0x43ae81), avatar catalogs (0x5835ed)
     /// and texture cache (0x414633, 0x40895a).
     pub fn load(install: &Install) -> Result<Self> {
