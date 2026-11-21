@@ -215,6 +215,8 @@ struct App {
     game: Game,
     window: Option<Rc<Window>>,
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
+    surface_size: Option<(NonZeroU32, NonZeroU32)>,
+    last_title: String,
     scale: u32,
     cursor: Option<PhysicalPosition<f64>>,
     drag: Option<PhysicalPosition<f64>>,
@@ -503,7 +505,7 @@ impl App {
             self.game.render();
             self.dirty = false;
             let lot = self.game.lot();
-            window.set_title(&format!(
+            let title = format!(
                 "sims-game: tick {}{}",
                 lot.ticks(),
                 if self.game.stopped().is_some() {
@@ -513,30 +515,136 @@ impl App {
                 } else {
                     ""
                 }
-            ));
+            );
+            if title != self.last_title {
+                window.set_title(&title);
+                self.last_title = title;
+            }
         }
         let Some(surface) = &mut self.surface else {
             return;
         };
-        if surface.resize(w, h).is_err() {
-            return;
+        if self.surface_size != Some((w, h)) {
+            if surface.resize(w, h).is_err() {
+                return;
+            }
+            self.surface_size = Some((w, h));
         }
         let Ok(mut buffer) = surface.buffer_mut() else {
+            self.surface_size = None;
             return;
         };
         let canvas = self.game.canvas();
         let (bw, bh) = (size.width as usize, size.height as usize);
-        let scale = scale as usize;
-        for y in 0..bh {
-            let cy = (y / scale).min(canvas.height.saturating_sub(1));
-            let row = &canvas.color[cy * canvas.width..(cy + 1) * canvas.width];
-            for x in 0..bw {
-                let cx = (x / scale).min(canvas.width.saturating_sub(1));
-                let [r, g, b] = row.get(cx).copied().unwrap_or([0, 0, 0]);
-                buffer[y * bw + x] = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+        blit_canvas(canvas, &mut buffer, bw, bh, scale as usize);
+        let _ = buffer.present();
+    }
+}
+
+#[inline(always)]
+fn pack_rgb([r, g, b]: [u8; 3]) -> u32 {
+    (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
+}
+
+#[inline]
+fn blit_row_1x(src_row: &[[u8; 3]], dst_row: &mut [u32]) {
+    let copy_w = dst_row.len().min(src_row.len());
+    for (d, &rgb) in dst_row[..copy_w].iter_mut().zip(&src_row[..copy_w]) {
+        *d = pack_rgb(rgb);
+    }
+    if dst_row.len() > copy_w {
+        let last = pack_rgb(src_row[copy_w - 1]);
+        dst_row[copy_w..].fill(last);
+    }
+}
+
+#[inline]
+fn blit_row_2x(src_row: &[[u8; 3]], dst_row: &mut [u32]) {
+    let pairs = (dst_row.len() / 2).min(src_row.len());
+    let (head, tail) = dst_row.split_at_mut(pairs * 2);
+    for (pair, &rgb) in head
+        .as_chunks_mut::<2>()
+        .0
+        .iter_mut()
+        .zip(&src_row[..pairs])
+    {
+        let px = pack_rgb(rgb);
+        *pair = [px, px];
+    }
+    if !tail.is_empty() {
+        let cx = pairs.min(src_row.len() - 1);
+        tail.fill(pack_rgb(src_row[cx]));
+    }
+}
+
+/// Blits `canvas` into the `bw × bh` `softbuffer` pixel buffer scaled up by
+/// integer `scale`, matching `(y / scale).min(h - 1)` / `(x / scale).min(w - 1)`
+/// bit-for-bit, with specialized zero-division paths for `scale == 1` and
+/// `scale == 2`.
+fn blit_canvas(
+    canvas: &sims_render::Canvas,
+    buffer: &mut [u32],
+    bw: usize,
+    bh: usize,
+    scale: usize,
+) {
+    let scale = scale.max(1);
+    let Some(total) = bw.checked_mul(bh) else {
+        return;
+    };
+    if total == 0 || buffer.len() < total {
+        return;
+    }
+    if canvas.width == 0
+        || canvas.height == 0
+        || canvas.color.len() < canvas.width.saturating_mul(canvas.height)
+    {
+        buffer[..total].fill(0);
+        return;
+    }
+    let max_cy = canvas.height - 1;
+    let max_cx = canvas.width - 1;
+    match scale {
+        1 => {
+            for y in 0..bh {
+                let cy = y.min(max_cy);
+                if y > 0 && cy == (y - 1).min(max_cy) {
+                    let prev = (y - 1) * bw;
+                    buffer.copy_within(prev..prev + bw, y * bw);
+                } else {
+                    let src_row = &canvas.color[cy * canvas.width..(cy + 1) * canvas.width];
+                    blit_row_1x(src_row, &mut buffer[y * bw..(y + 1) * bw]);
+                }
             }
         }
-        let _ = buffer.present();
+        2 => {
+            for y in 0..bh {
+                let cy = (y >> 1).min(max_cy);
+                if y > 0 && cy == ((y - 1) >> 1).min(max_cy) {
+                    let prev = (y - 1) * bw;
+                    buffer.copy_within(prev..prev + bw, y * bw);
+                } else {
+                    let src_row = &canvas.color[cy * canvas.width..(cy + 1) * canvas.width];
+                    blit_row_2x(src_row, &mut buffer[y * bw..(y + 1) * bw]);
+                }
+            }
+        }
+        _ => {
+            for y in 0..bh {
+                let cy = (y / scale).min(max_cy);
+                if y > 0 && cy == ((y - 1) / scale).min(max_cy) {
+                    let prev = (y - 1) * bw;
+                    buffer.copy_within(prev..prev + bw, y * bw);
+                } else {
+                    let src_row = &canvas.color[cy * canvas.width..(cy + 1) * canvas.width];
+                    let dst_row = &mut buffer[y * bw..(y + 1) * bw];
+                    for (x, dst) in dst_row.iter_mut().enumerate() {
+                        let cx = (x / scale).min(max_cx);
+                        *dst = pack_rgb(src_row[cx]);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -559,7 +667,10 @@ impl ApplicationHandler for App {
         let surface =
             Context::new(window.clone()).and_then(|context| Surface::new(&context, window.clone()));
         match surface {
-            Ok(s) => self.surface = Some(s),
+            Ok(s) => {
+                self.surface = Some(s);
+                self.surface_size = None;
+            }
             Err(e) => {
                 eprintln!("sims-game: could not draw into the window: {e}");
                 event_loop.exit();
@@ -600,6 +711,7 @@ impl ApplicationHandler for App {
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.scale = scale_factor.round().max(1.0) as u32;
+                self.surface_size = None;
                 if let Some(size) = self.window.as_ref().map(|w| w.inner_size()) {
                     self.sync_size(size);
                 }
@@ -757,6 +869,8 @@ fn run() -> Result<(), String> {
         game,
         window: None,
         surface: None,
+        surface_size: None,
+        last_title: String::new(),
         scale: 1,
         cursor: None,
         drag: None,
@@ -836,5 +950,58 @@ mod tests {
         let mut direct = FocusFilter::default();
         assert_eq!(direct.filter(true), None);
         assert_eq!(direct.filter(false), Some(false));
+    }
+
+    fn blit_reference(
+        canvas: &sims_render::Canvas,
+        buffer: &mut [u32],
+        bw: usize,
+        bh: usize,
+        scale: usize,
+    ) {
+        for y in 0..bh {
+            let cy = (y / scale).min(canvas.height.saturating_sub(1));
+            let row = &canvas.color[cy * canvas.width..(cy + 1) * canvas.width];
+            for x in 0..bw {
+                let cx = (x / scale).min(canvas.width.saturating_sub(1));
+                let [r, g, b] = row.get(cx).copied().unwrap_or([0, 0, 0]);
+                buffer[y * bw + x] = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+            }
+        }
+    }
+
+    #[test]
+    fn blit_canvas_matches_reference_across_scales_and_odd_sizes() {
+        let mut canvas = sims_render::Canvas::new(11, 7, [0, 0, 0]);
+        for y in 0..canvas.height {
+            for x in 0..canvas.width {
+                canvas.color[y * canvas.width + x] = [
+                    ((x * 23 + y * 7) & 0xff) as u8,
+                    ((x * 11 + y * 31) & 0xff) as u8,
+                    ((x * 5 + y * 19 + 42) & 0xff) as u8,
+                ];
+            }
+        }
+        let sizes = [
+            (11, 7),
+            (22, 14),
+            (23, 15),
+            (21, 13),
+            (25, 17),
+            (33, 21),
+            (35, 22),
+            (1, 1),
+            (7, 5),
+            (15, 10),
+        ];
+        for scale in [1usize, 2, 3, 4] {
+            for (bw, bh) in sizes {
+                let mut got = vec![0xDEAD_BEEF; bw * bh];
+                let mut want = vec![0xDEAD_BEEF; bw * bh];
+                blit_canvas(&canvas, &mut got, bw, bh, scale);
+                blit_reference(&canvas, &mut want, bw, bh, scale);
+                assert_eq!(got, want, "scale={scale} bw={bw} bh={bh}");
+            }
+        }
     }
 }

@@ -151,6 +151,7 @@ pub struct Game {
     /// last frame was drawn.
     blink_dirty: bool,
     canvas: Canvas,
+    lot_cache: sims_render::LotCache,
     /// The camera the frame last drawn was drawn through, the depth its
     /// lot left before anything else was drawn, and its IDs once its
     /// people were drawn, before the objects holding them: what the
@@ -224,6 +225,7 @@ impl Game {
             drawn_us: 0,
             blink_dirty: false,
             canvas: Canvas::new(1, 1, [0, 0, 0]),
+            lot_cache: sims_render::LotCache::new(),
             drawn_camera,
             lot_depth: Vec::new(),
             people_ids: sims_render::Ids::default(),
@@ -617,7 +619,7 @@ impl Game {
         // The lot, then the people, then the objects that hold someone
         // (a bench a Sim sits on), as the original's frame does.
         let preview = self.buy_cursor.as_ref().map(|c| (c.cursor, c.held));
-        sims_render::draw_lot_with_preview(
+        self.lot_cache.draw_lot_with_preview(
             world,
             &self.lot_shape,
             &mut self.assets,

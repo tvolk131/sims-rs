@@ -160,8 +160,20 @@ impl Assets {
     /// The floor's image at a zoom (0 far to 2 near), or None if the game
     /// has no such floor.
     pub fn floor(&mut self, id: u16, zoom: usize) -> Option<&Image> {
+        self.floor_with_pools(id, zoom).map(|(img, _)| img)
+    }
+
+    /// Like [`Assets::floor`], also borrowing [`Assets::pools`] simultaneously
+    /// so callers can shade floors without cloning the floor [`Image`].
+    pub(crate) fn floor_with_pools(
+        &mut self,
+        id: u16,
+        zoom: usize,
+    ) -> Option<(&Image, Option<&Pools>)> {
         let floors = &self.floors;
-        self.floor_images
+        let pools = self.pools.as_ref();
+        let img = self
+            .floor_images
             .entry((id, zoom))
             .or_insert_with(|| {
                 let sprite = id.checked_add([0, 256, 512][zoom])?;
@@ -170,7 +182,8 @@ impl Assets {
                 let frame = SpriteSet::parse(data).ok()?.decode(data, 0, floors).ok()?;
                 Some(frame.into())
             })
-            .as_ref()
+            .as_ref()?;
+        Some((img, pools))
     }
 
     /// The floor shadow mask of a shadow code at a zoom (0 far to 2 near),
@@ -293,12 +306,100 @@ impl Assets {
 
     /// The parts of an object's definition the renderer uses.
     pub fn definition(&mut self, guid: u32) -> Option<Definition> {
-        if let Some(found) = self.definitions.get(&guid) {
-            return found.clone();
+        self.definition_ref(guid).cloned()
+    }
+
+    /// Borrowed view of an object's [`Definition`], avoiding per-call clones
+    /// of its `slots` vector on the render hot path.
+    pub(crate) fn definition_ref(&mut self, guid: u32) -> Option<&Definition> {
+        if !self.definitions.contains_key(&guid) {
+            let found = self.load_definition(guid);
+            self.definitions.insert(guid, found);
         }
-        let found = self.load_definition(guid);
-        self.definitions.insert(guid, found.clone());
-        found
+        self.definitions.get(&guid).and_then(Option::as_ref)
+    }
+
+    /// Borrowed `(pattern, shape, pools)` for a wall face without cloning
+    /// either sprite image. `opening` is `(resource, wall_shape)` for a wall
+    /// opening object when `style` is 22 or 23 and not cut.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn wall_parts(
+        &mut self,
+        pattern: u16,
+        style: u16,
+        opening: Option<(usize, u16)>,
+        cut: bool,
+        zoom: usize,
+        frame: usize,
+    ) -> Option<(&Image, &Image, Option<&Pools>)> {
+        // Ensure both caches are populated before taking shared references.
+        self.pattern(pattern, zoom)?;
+        let use_plain_cut = cut && style == 22;
+        let use_object = !use_plain_cut && matches!(style, 22 | 23) && opening.is_some();
+        if use_object {
+            let (resource, wall_shape) = opening?;
+            self.ensure_object_shape(resource, wall_shape, false, zoom)?;
+        } else {
+            let (s_style, s_cut) = if use_plain_cut {
+                (1, true)
+            } else {
+                (style, cut)
+            };
+            self.shape(s_style, s_cut, zoom)?;
+        }
+        let pat = &self.patterns.get(&(pattern, zoom))?.as_ref()?[frame];
+        let shp = if use_object {
+            let (resource, wall_shape) = opening?;
+            &self
+                .object_shapes
+                .get(&(resource, wall_shape, false, zoom))?
+                .as_ref()?[frame]
+        } else {
+            let (s_style, s_cut) = if use_plain_cut {
+                (1, true)
+            } else {
+                (style, cut)
+            };
+            &self.shapes.get(&(s_style, s_cut, zoom))?.as_ref()?[frame]
+        };
+        Some((pat, shp, self.pools.as_ref()))
+    }
+
+    /// Borrowed `(pattern, shape)` for an edge-on diagonal cap strip
+    /// (pattern 252, shape 9, frame 3) without cloning either sprite.
+    pub(crate) fn edge_on_strip_parts(&mut self, zoom: usize) -> Option<(&Image, &Image)> {
+        self.pattern(252, zoom)?;
+        self.shape(9, false, zoom)?;
+        let pat = &self.patterns.get(&(252, zoom))?.as_ref()?[3];
+        let shp = &self.shapes.get(&(9, false, zoom))?.as_ref()?[3];
+        Some((pat, shp))
+    }
+
+    fn ensure_object_shape(
+        &mut self,
+        resource: usize,
+        wall_shape: u16,
+        cut: bool,
+        zoom: usize,
+    ) -> Option<&[Image; 4]> {
+        let key = (resource, wall_shape, cut, zoom);
+        if !self.object_shapes.contains_key(&key) {
+            let id = wall_shape.checked_add(u16::from(cut) * 3 + zoom as u16);
+            let shape = id.and_then(|id| {
+                let iff = self.file(resource)?;
+                let chunk = iff.get(b"SPR#", id)?;
+                let data = iff.data(chunk);
+                let set = LegacySpriteSet::parse(data).ok()?;
+                let gray = Palette(vec![[255, 255, 255]; 256]);
+                four(|i| {
+                    set.decode_with_palette(data, i, &gray)
+                        .ok()
+                        .map(Image::from)
+                })
+            });
+            self.object_shapes.insert(key, shape);
+        }
+        self.object_shapes[&key].as_ref()
     }
 
     fn load_definition(&mut self, guid: u32) -> Option<Definition> {
@@ -346,6 +447,26 @@ impl Assets {
         self.files.get(&resource)
     }
 
+    /// Like [`Assets::group`], keyed by `resource` directly so callers don't
+    /// need to clone [`Definition`].
+    pub(crate) fn group_by_resource(
+        &mut self,
+        resource: usize,
+        group: u16,
+        direction: u32,
+        zoom: usize,
+    ) -> &[Part] {
+        let key = (resource, group, direction, zoom);
+        if !self.groups.contains_key(&key) {
+            let parts = self
+                .file(resource)
+                .map(|iff| load_group(iff, group, direction, zoom as u32 + 1))
+                .unwrap_or_default();
+            self.groups.insert(key, parts);
+        }
+        &self.groups[&key]
+    }
+
     /// The sprites of draw group `group` of an object's file, for a view
     /// direction (one bit of 1, 4, 16 and 64) and zoom (0 far to 2 near).
     /// Empty if the group or the view is missing.
@@ -356,15 +477,13 @@ impl Assets {
         direction: u32,
         zoom: usize,
     ) -> &[Part] {
-        let key = (definition.resource, group, direction, zoom);
-        if !self.groups.contains_key(&key) {
-            let parts = self
-                .file(definition.resource)
-                .map(|iff| load_group(iff, group, direction, zoom as u32 + 1))
-                .unwrap_or_default();
-            self.groups.insert(key, parts);
-        }
-        &self.groups[&key]
+        self.group_by_resource(definition.resource, group, direction, zoom)
+    }
+
+    /// The resource index of a definition (for `group_by_resource` /
+    /// `wall_parts`).
+    pub(crate) fn resource_of(definition: &Definition) -> usize {
+        definition.resource
     }
 }
 
@@ -378,26 +497,7 @@ impl Assets {
         cut: bool,
         zoom: usize,
     ) -> Option<&[Image; 4]> {
-        let key = (definition.resource, definition.wall_shape, cut, zoom);
-        if !self.object_shapes.contains_key(&key) {
-            let id = definition
-                .wall_shape
-                .checked_add(u16::from(cut) * 3 + zoom as u16);
-            let shape = id.and_then(|id| {
-                let iff = self.file(definition.resource)?;
-                let chunk = iff.get(b"SPR#", id)?;
-                let data = iff.data(chunk);
-                let set = LegacySpriteSet::parse(data).ok()?;
-                let gray = Palette(vec![[255, 255, 255]; 256]);
-                four(|i| {
-                    set.decode_with_palette(data, i, &gray)
-                        .ok()
-                        .map(Image::from)
-                })
-            });
-            self.object_shapes.insert(key, shape);
-        }
-        self.object_shapes[&key].as_ref()
+        self.ensure_object_shape(definition.resource, definition.wall_shape, cut, zoom)
     }
 }
 

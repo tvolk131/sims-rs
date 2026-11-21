@@ -52,7 +52,7 @@ impl WallCell {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Level {
     pub floors: Vec<u16>,
     pub walls: Vec<WallCell>,
@@ -261,6 +261,28 @@ impl Lot {
             lamps,
             floor_rotation: 0,
         })
+    }
+
+    /// Bit-exact structural equality across all fields of [`Lot`] (comparing
+    /// `f32` room/outdoor light fractions by `.to_bits()`).
+    pub(crate) fn exact_eq(&self, other: &Self) -> bool {
+        self.size == other.size
+            && self.time_of_day == other.time_of_day
+            && self.floor_rotation == other.floor_rotation
+            && self.outdoor_light.map(f32::to_bits) == other.outdoor_light.map(f32::to_bits)
+            && self.room_lights == other.room_lights
+            && self.room_fractions.len() == other.room_fractions.len()
+            && self
+                .room_fractions
+                .iter()
+                .zip(other.room_fractions.iter())
+                .all(|((k1, v1), (k2, v2))| k1 == k2 && v1.to_bits() == v2.to_bits())
+            && self.outdoor_rooms == other.outdoor_rooms
+            && self.halves == other.halves
+            && self.heights == other.heights
+            && self.grass == other.grass
+            && self.levels == other.levels
+            && self.lamps == other.lamps
     }
 
     /// Sets [`Lot::floor_rotation`] to `rotation & 3`, matching a house

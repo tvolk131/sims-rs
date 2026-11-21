@@ -259,7 +259,14 @@ pub struct Grass {
     /// Tiles brown enough that their blades are a pixel shorter.
     short: Vec<bool>,
     /// The blades of each column of a tile at this zoom, by rank.
-    scatter: Vec<Vec<Blade>>,
+    scatter: &'static [Vec<Blade>],
+}
+
+/// Cached blade scatters for zooms 1 (far), 2 (medium), and 3 (near).
+fn cached_scatter(zoom: u32) -> &'static [Vec<Blade>] {
+    static SCATTERS: OnceLock<[Vec<Vec<Blade>>; 3]> = OnceLock::new();
+    let all = SCATTERS.get_or_init(|| [scatter(1), scatter(2), scatter(3)]);
+    &all[(zoom.clamp(1, 3) - 1) as usize]
 }
 
 /// One blade of the scatter: its rank, height, column offset (0 to 3),
@@ -492,7 +499,7 @@ impl Grass {
             colors,
             blades,
             short,
-            scatter: scatter(zoom),
+            scatter: cached_scatter(zoom),
         }
     }
 
@@ -504,6 +511,45 @@ impl Grass {
     /// The shades and grass colors of a view tile.
     pub fn tile(&self, view: [i32; 2]) -> Option<([u8; 4], [u8; 4])> {
         Self::index(view).map(|i| (self.shades[i], self.colors[i]))
+    }
+
+    /// Zero-allocation visitor for the blades of one column (`index` 0 at
+    /// the left), passing `(x, foot, height, color_rgb)` to `visit`.
+    pub(crate) fn for_each_blade(
+        &self,
+        view: [i32; 2],
+        column: &Column,
+        index: usize,
+        mut visit: impl FnMut(i32, i32, i32, [u8; 3]),
+    ) {
+        let Some(i) = Self::index(view) else {
+            return;
+        };
+        let (count, start) = self.blades[i];
+        let Some(list) = self.scatter.get(index) else {
+            return;
+        };
+        if column.height < 1 || count == 0 || list.is_empty() {
+            return;
+        }
+        let lo = select(list, start, 0);
+        let hi = select(list, start + count, lo);
+        let palette = widened_palette();
+        let is_short = self.short[i];
+        let col_h = f64::from(column.height);
+        for b in &list[lo..hi] {
+            let dy = (col_h * f64::from(b.down)).trunc() as i32;
+            let mut height = b.height;
+            if is_short {
+                height = (height - 1).max(1);
+            }
+            let t = (step(column.shade, dy) >> 8) + i64::from(b.shade);
+            let s = step(column.color, dy) >> 8;
+            let t = t.clamp(0, i64::from(MAX_SHADE)) as usize;
+            let s = s.clamp(0, COLORS as i64 - 1) as usize;
+            let (x, foot) = (column.x.saturating_add(b.dx), column.y.saturating_add(dy));
+            visit(x, foot, height, palette[s][t][0]);
+        }
     }
 
     /// The blades a view tile draws in one of its columns (`index` 0 at
@@ -547,6 +593,27 @@ impl Grass {
     }
 }
 
+type WidenedBlock = [[u8; 3]; 8];
+type WidenedPalette = [[WidenedBlock; SHADES]; COLORS];
+
+/// Pre-widened 8-bit RGB copy of [`palette`] so grass drawing avoids
+/// per-pixel 5-6-5 unpacking.
+pub(crate) fn widened_palette() -> &'static WidenedPalette {
+    static WIDENED: OnceLock<Box<WidenedPalette>> = OnceLock::new();
+    WIDENED.get_or_init(|| {
+        let src = palette();
+        let mut out = Box::new([[[[0u8; 3]; 8]; SHADES]; COLORS]);
+        for (dst_c, src_c) in out.iter_mut().zip(src.iter()) {
+            for (dst_s, src_s) in dst_c.iter_mut().zip(src_c.iter()) {
+                for (dst_p, &src_p) in dst_s.iter_mut().zip(src_s.iter()) {
+                    *dst_p = widen(src_p);
+                }
+            }
+        }
+        out
+    })
+}
+
 /// Wall bits as the view sees them (the original's table at 0x6f4670):
 /// the four edges turn with the camera; the diagonals swap on odd turns.
 fn rotate_bits(bits: u8, rotation: u8) -> u8 {
@@ -574,23 +641,22 @@ pub struct Column {
     pub color: [i32; 2],
 }
 
-/// The columns of a tile (0x49dacd, without clipping). `left` is the
-/// screen x of its left corner and `bottom` the row its columns start
-/// from at height 0; `heights` are its corners' terrain heights, `shades`
-/// and `colors` its corner values, all in the view corner order.
-pub fn columns(
+/// Zero-allocation visitor producing the exact same columns in the exact same
+/// order as [`columns`].
+pub(crate) fn for_each_column(
     left: i32,
     bottom: i32,
     heights: [u8; 4],
     shades: [u8; 4],
     colors: [u8; 4],
     zoom: u32,
-) -> Vec<Column> {
+    mut visit: impl FnMut(Column),
+) {
     // Nothing this far off any screen is drawn; skipping it keeps the
     // arithmetic below in range.
     const FAR: i32 = 1 << 24;
     if !(-FAR..FAR).contains(&left) || !(-FAR..FAR).contains(&bottom) {
-        return Vec::new();
+        return;
     }
     let zoom = zoom.clamp(1, 3);
     let h = heights.map(i32::from);
@@ -601,7 +667,6 @@ pub fn columns(
     let shift = zoom + 1;
     let step = |x: i32, z: i32| ((x - z) * 256) >> shift;
     let gradient = |top: i32, bottom: i32, n: i32| [top, (bottom - top) / n];
-    let mut out = Vec::with_capacity((width / 4) as usize);
     let (mut shade, mut color) = ([0, 0], [0, 0]);
     // Left half, from the left corner toward the top and bottom ones.
     let slope = h[1] - h[3] + 4;
@@ -622,7 +687,7 @@ pub fn columns(
             shade = gradient(tv[0], tv[1], height);
             color = gradient(av[0], av[1], height);
         }
-        out.push(Column {
+        visit(Column {
             x: left + x,
             y,
             height,
@@ -655,7 +720,7 @@ pub fn columns(
             shade = gradient(tv[0], tv[1], height);
             color = gradient(av[0], av[1], height);
         }
-        out.push(Column {
+        visit(Column {
             x: left + x,
             y,
             height,
@@ -666,6 +731,22 @@ pub fn columns(
         y -= dy;
         height += slope;
     }
+}
+
+/// The columns of a tile (0x49dacd, without clipping). `left` is the
+/// screen x of its left corner and `bottom` the row its columns start
+/// from at height 0; `heights` are its corners' terrain heights, `shades`
+/// and `colors` its corner values, all in the view corner order.
+pub fn columns(
+    left: i32,
+    bottom: i32,
+    heights: [u8; 4],
+    shades: [u8; 4],
+    colors: [u8; 4],
+    zoom: u32,
+) -> Vec<Column> {
+    let mut out = Vec::with_capacity(((16i32 << zoom.clamp(1, 3)) / 4) as usize);
+    for_each_column(left, bottom, heights, shades, colors, zoom, |c| out.push(c));
     out
 }
 
@@ -702,6 +783,30 @@ impl Column {
             shade,
             color,
         }
+    }
+
+    /// The column's widened 8-bit RGB pixels, top to bottom.
+    pub(crate) fn rows_rgb(&self) -> impl Iterator<Item = (i32, [[u8; 3]; 4])> + '_ {
+        let palette = widened_palette();
+        let end = i64::from(self.y) + i64::from(self.height);
+        (0..self.height.max(0)).map(move |row| {
+            let t = step(self.shade, row) >> 8;
+            let s = step(self.color, row) >> 8;
+            let t = t.clamp(0, i64::from(MAX_SHADE)) as usize;
+            let s = s.clamp(0, COLORS as i64 - 1) as usize;
+            let parity = ((end + i64::from(row)) & 1) as usize;
+            let block = &palette[s][t];
+            let base = parity * 4;
+            (
+                self.y.saturating_add(row),
+                [
+                    block[base],
+                    block[base + 1],
+                    block[base + 2],
+                    block[base + 3],
+                ],
+            )
+        })
     }
 
     /// The column's pixels, top to bottom: each row's screen y and its

@@ -57,10 +57,33 @@ impl Lighting {
         }
     }
 
+    /// A vertex's shade, for its unit normal, given `towards` already normalized.
+    #[inline]
+    pub(crate) fn shade_unit(&self, normal: Vec3, towards: Vec3) -> f32 {
+        let shade = self.ambient + self.diffuse * normal.dot(towards).max(0.0);
+        if self.held { shade.min(1.0) } else { shade }
+    }
+
     /// A vertex's shade, for its unit normal.
     pub fn shade(&self, normal: Vec3) -> f32 {
-        let shade = self.ambient + self.diffuse * normal.dot(self.towards.normalize()).max(0.0);
-        if self.held { shade.min(1.0) } else { shade }
+        self.shade_unit(normal, self.towards.normalize())
+    }
+
+    /// Like [`Lighting::shade_with`] with `towards` already normalized.
+    #[inline]
+    pub(crate) fn shade_with_unit(&self, normal: Vec3, towards: Vec3, lamps: &[Lamp]) -> Shade {
+        if lamps.is_empty() {
+            return Shade::Grey(self.shade_unit(normal, towards));
+        }
+        let base = self.ambient + self.diffuse * normal.dot(towards).max(0.0);
+        let mut channels = [base; 3];
+        for lamp in lamps {
+            let cosine = normal.dot(lamp.towards).max(0.0);
+            for (channel, colour) in channels.iter_mut().zip(LAMP_COLOUR) {
+                *channel += lamp.strength * colour * cosine;
+            }
+        }
+        Shade::Colour(channels.map(|c| if self.held { c.min(1.0) } else { c }))
     }
 
     /// A vertex's shade with lamps besides: each adds its strength times
@@ -70,18 +93,7 @@ impl Lighting {
     /// 1, as [`Lighting::shade`] may. With no lamps it is the grey
     /// [`Lighting::shade`], to the bit.
     pub fn shade_with(&self, normal: Vec3, lamps: &[Lamp]) -> Shade {
-        if lamps.is_empty() {
-            return Shade::Grey(self.shade(normal));
-        }
-        let base = self.ambient + self.diffuse * normal.dot(self.towards.normalize()).max(0.0);
-        let mut channels = [base; 3];
-        for lamp in lamps {
-            let cosine = normal.dot(lamp.towards).max(0.0);
-            for (channel, colour) in channels.iter_mut().zip(LAMP_COLOUR) {
-                *channel += lamp.strength * colour * cosine;
-            }
-        }
-        Shade::Colour(channels.map(|c| if self.held { c.min(1.0) } else { c }))
+        self.shade_with_unit(normal, self.towards.normalize(), lamps)
     }
 }
 
@@ -291,10 +303,11 @@ pub fn draw_part<T: Target + ?Sized>(
     lighting: Lighting,
     project: impl Fn(Vec3) -> Vec3,
 ) {
+    let towards = lighting.towards.normalize();
     let shade: Vec<Shade> = skinned
         .normals
         .iter()
-        .map(|&n| Shade::Grey(lighting.shade(n)))
+        .map(|&n| Shade::Grey(lighting.shade_unit(n, towards)))
         .collect();
     draw_shaded(target, part, skinned, &shade, project);
 }
@@ -439,28 +452,43 @@ fn triangle<T: Target + ?Sized>(
         .fold(f32::NEG_INFINITY, f32::max)
         .ceil()
         .min(height as f32 - 1.0) as i64;
+    if min_x > max_x || min_y > max_y {
+        return;
+    }
+    let e0 = Edge::new(p[1], p[2]);
+    let e1 = Edge::new(p[2], p[0]);
+    let e2 = Edge::new(p[0], p[1]);
+    let outside = |w: f32, owned: bool| w < 0.0 || (w == 0.0 && !owned);
     for y in min_y..=max_y {
+        let qy = y as f32 + 0.5;
+        let r0 = e0.row(qy);
+        let r1 = e1.row(qy);
+        let r2 = e2.row(qy);
+        let yu = y as u32;
         for x in min_x..=max_x {
-            let q = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, 0.0);
-            let e = [
-                side(p[1], p[2], q),
-                side(p[2], p[0], q),
-                side(p[0], p[1], q),
-            ];
-            let outside = |w: f32, owned: bool| w < 0.0 || (w == 0.0 && !owned);
-            if outside(e[0], owns[0]) || outside(e[1], owns[1]) || outside(e[2], owns[2]) {
+            let qx = x as f32 + 0.5;
+            let v0 = e0.eval(r0, qx);
+            if outside(v0, owns[0]) {
                 continue;
             }
-            let [w0, w1, w2] = e.map(|e| e / area);
+            let v1 = e1.eval(r1, qx);
+            if outside(v1, owns[1]) {
+                continue;
+            }
+            let v2 = e2.eval(r2, qx);
+            if outside(v2, owns[2]) {
+                continue;
+            }
+            let w0 = v0 / area;
+            let w1 = v1 / area;
+            let w2 = v2 / area;
             let z = w0 * p[0].z + w1 * p[1].z + w2 * p[2].z;
-            let (x, y) = (x as u32, y as u32);
-            if !target.passes(x, y, z) {
+            let xu = x as u32;
+            if !target.passes(xu, yu, z) {
                 continue;
             }
             let u = w0 * uv[0][0] + w1 * uv[1][0] + w2 * uv[2][0];
             let v = w0 * uv[0][1] + w1 * uv[1][1] + w2 * uv[2][1];
-            let s =
-                [0, 1, 2].map(|k| w0 * channels[0][k] + w1 * channels[1][k] + w2 * channels[2][k]);
             let texel = part.texture.sample(u, v);
             // A transparent texel (such as one a run-length bitmap skips)
             // draws nothing and hides nothing.
@@ -468,23 +496,58 @@ fn triangle<T: Target + ?Sized>(
                 continue;
             }
             if grey {
-                target.write(x, y, z, texel, s[0]);
+                let s0 = w0 * channels[0][0] + w1 * channels[1][0] + w2 * channels[2][0];
+                target.write(xu, yu, z, texel, s0);
             } else {
-                target.write_coloured(x, y, z, texel, s);
+                let s = [0, 1, 2]
+                    .map(|k| w0 * channels[0][k] + w1 * channels[1][k] + w2 * channels[2][k]);
+                target.write_coloured(xu, yu, z, texel, s);
             }
         }
     }
 }
 
-/// Which side of the edge from `a` to `b` the point `q` is on: [`edge`],
-/// always worked out from the same end of the edge, so the edge taken the
-/// other way gives exactly the negated value. Two triangles that share an
-/// edge then never both take, or both leave, a point on or near it.
-fn side(a: Vec3, b: Vec3, q: Vec3) -> f32 {
-    if (a.x, a.y) <= (b.x, b.y) {
-        edge(a, b, q)
-    } else {
-        -edge(b, a, q)
+/// Precomputed directed edge matching [`edge`] with canonical endpoint
+/// ordering (always evaluated from the lexicographically smaller endpoint so
+/// shared edges produce exact negated values).
+struct Edge {
+    ax: f32,
+    ay: f32,
+    dx: f32,
+    dy: f32,
+    negate: bool,
+}
+
+impl Edge {
+    fn new(a: Vec3, b: Vec3) -> Self {
+        if (a.x, a.y) <= (b.x, b.y) {
+            Self {
+                ax: a.x,
+                ay: a.y,
+                dx: b.x - a.x,
+                dy: b.y - a.y,
+                negate: false,
+            }
+        } else {
+            Self {
+                ax: b.x,
+                ay: b.y,
+                dx: a.x - b.x,
+                dy: a.y - b.y,
+                negate: true,
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn row(&self, qy: f32) -> f32 {
+        self.dx * (qy - self.ay)
+    }
+
+    #[inline(always)]
+    fn eval(&self, row_term: f32, qx: f32) -> f32 {
+        let v = row_term - self.dy * (qx - self.ax);
+        if self.negate { -v } else { v }
     }
 }
 

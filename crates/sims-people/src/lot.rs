@@ -373,51 +373,114 @@ const ROOM_LAMPS: usize = 6;
 /// The objects on a tile are taken in ID order. The original takes them
 /// in the order the lot links them; the two differ only for a tile with
 /// two lit lamps in a room past six lights.
-pub fn lamps(world: &World, level: i32, at: Vec3, eye: Vec3) -> Vec<Lamp> {
-    let fine = [-at.z, -at.x].map(|u| (u * FINE_PER_UNIT).round() as i32);
-    let [x, y] = fine.map(|f| f.div_euclid(16));
-    let full = sims_sim::FULL_SIZE as i32;
-    let inner = |n: i32| n >= 1 && n < full - 1;
-    if !inner(x) || !inner(y) {
-        return Vec::new();
+const FULL_SIDE: usize = sims_sim::FULL_SIZE as usize;
+
+/// Indexed view of every lit lamp (`sims_render::lot::gives_light`) in a
+/// [`World`], built once per frame so [`lamps`] never rescans `world.objects`
+/// for each tile in a room.
+struct LitLamps<'a> {
+    by_tile: BTreeMap<[i32; 3], Vec<&'a sims_sim::Object>>,
+    mask: [[u64; FULL_SIDE]; 2],
+    has_other: bool,
+}
+
+impl<'a> LitLamps<'a> {
+    fn from_world(world: &'a World) -> Self {
+        let mut by_tile: BTreeMap<[i32; 3], Vec<&'a sims_sim::Object>> = BTreeMap::new();
+        let mut mask = [[0u64; FULL_SIDE]; 2];
+        let mut has_other = false;
+        let full = sims_sim::FULL_SIZE as i32;
+        for o in world.objects.values() {
+            if !sims_render::lot::gives_light(o) {
+                continue;
+            }
+            let tile = World::tile(o.position).map(i32::from);
+            if (1..=2).contains(&tile[2])
+                && (0..full).contains(&tile[0])
+                && (0..full).contains(&tile[1])
+            {
+                mask[(tile[2] - 1) as usize][tile[0] as usize] |= 1u64 << tile[1];
+            } else {
+                has_other = true;
+            }
+            by_tile.entry(tile).or_default().push(o);
+        }
+        Self {
+            by_tile,
+            mask,
+            has_other,
+        }
     }
-    let room = usize::try_from(level - 1)
-        .ok()
-        .and_then(|index| world.rooms.map.get(index))
-        .and_then(|map| map.get((x * full + y) as usize).copied())
-        .filter(|&room| room >= 0);
-    let Some(room) = room.and_then(|room| world.rooms.rooms.get(&room)) else {
-        return Vec::new();
-    };
-    room.tiles
-        .iter()
-        .flat_map(|&tile| {
-            world.objects.values().filter(move |o| {
-                World::tile(o.position).map(i32::from) == tile.map(i32::from)
-                    && sims_render::lot::gives_light(o)
+
+    fn lamps_for(&self, world: &World, level: i32, at: Vec3, eye: Vec3) -> Vec<Lamp> {
+        if self.by_tile.is_empty() {
+            return Vec::new();
+        }
+        let fine = [-at.z, -at.x].map(|u| (u * FINE_PER_UNIT).round() as i32);
+        let [x, y] = fine.map(|f| f.div_euclid(16));
+        let full = sims_sim::FULL_SIZE as i32;
+        let inner = |n: i32| n >= 1 && n < full - 1;
+        if !inner(x) || !inner(y) {
+            return Vec::new();
+        }
+        let room = usize::try_from(level - 1)
+            .ok()
+            .and_then(|index| world.rooms.map.get(index))
+            .and_then(|map| map.get((x * full + y) as usize).copied())
+            .filter(|&room| room >= 0);
+        let Some(room) = room.and_then(|room| world.rooms.rooms.get(&room)) else {
+            return Vec::new();
+        };
+        let mut selected: Vec<&sims_sim::Object> = Vec::with_capacity(ROOM_LAMPS);
+        'tiles: for &tile in &room.tiles {
+            let tile = tile.map(i32::from);
+            let present = if (1..=2).contains(&tile[2])
+                && (0..full).contains(&tile[0])
+                && (0..full).contains(&tile[1])
+            {
+                (self.mask[(tile[2] - 1) as usize][tile[0] as usize] >> tile[1]) & 1 != 0
+            } else {
+                self.has_other
+            };
+            if !present {
+                continue;
+            }
+            if let Some(objects) = self.by_tile.get(&tile) {
+                for &lamp in objects {
+                    selected.push(lamp);
+                    if selected.len() == ROOM_LAMPS {
+                        break 'tiles;
+                    }
+                }
+            }
+        }
+        selected
+            .into_iter()
+            .filter_map(|lamp| {
+                let [fx, fy, _] = lamp.position;
+                let ground = sims_sim::head::ground_height(
+                    world,
+                    [F32::from_f32(fx as f32), F32::from_f32(fy as f32)],
+                )
+                .map_or(0.0, F32::to_f32);
+                // The drawing frame: fine (x, y) at (−3y/16, height, −3x/16).
+                let light = Vec3::new(
+                    -(fy as f32) / FINE_PER_UNIT,
+                    ground + LAMP_HEIGHT,
+                    -(fx as f32) / FINE_PER_UNIT,
+                );
+                let from = at - light;
+                Some(Lamp {
+                    towards: (light - eye).normalize(),
+                    strength: lamp_strength(from.dot(from))?,
+                })
             })
-        })
-        .take(ROOM_LAMPS)
-        .filter_map(|lamp| {
-            let [fx, fy, _] = lamp.position;
-            let ground = sims_sim::head::ground_height(
-                world,
-                [F32::from_f32(fx as f32), F32::from_f32(fy as f32)],
-            )
-            .map_or(0.0, F32::to_f32);
-            // The drawing frame: fine (x, y) at (−3y/16, height, −3x/16).
-            let light = Vec3::new(
-                -(fy as f32) / FINE_PER_UNIT,
-                ground + LAMP_HEIGHT,
-                -(fx as f32) / FINE_PER_UNIT,
-            );
-            let from = at - light;
-            Some(Lamp {
-                towards: (light - eye).normalize(),
-                strength: lamp_strength(from.dot(from))?,
-            })
-        })
-        .collect()
+            .collect()
+    }
+}
+
+pub fn lamps(world: &World, level: i32, at: Vec3, eye: Vec3) -> Vec<Lamp> {
+    LitLamps::from_world(world).lamps_for(world, level, at, eye)
 }
 
 /// A lamp's strength on a person at squared distance `squared` (model
@@ -539,10 +602,11 @@ fn draw_lot_part<T: Target + ?Sized>(
     if lamps.is_empty() {
         draw_part(target, part, skinned, lighting, project);
     } else {
+        let towards = lighting.towards.normalize();
         let shade: Vec<Shade> = skinned
             .normals
             .iter()
-            .map(|&n| lighting.shade_with(n, lamps))
+            .map(|&n| lighting.shade_with_unit(n, towards, lamps))
             .collect();
         draw_shaded(target, part, skinned, &shade, project);
     }
@@ -925,17 +989,20 @@ impl People {
             depth(fine, elevation, p.level)
         };
         posed.sort_by(|a, b| far(b).total_cmp(&far(a)).then(a.id.cmp(&b.id)));
+        let lit_lamps = (!posed.is_empty()).then(|| LitLamps::from_world(world));
         for person in &posed {
             let project = |p| project_lot_vertex(&view, p, person.level, &depth);
             // Each pixel the person draws names them, for a click.
             target.set_id(Some(person.id));
             let lighting = Lighting::standard(light, level(world, person.id));
-            let lamps = lamps(
-                world,
-                person.level,
-                person.root.translation + view.level_lift(person.level),
-                eye,
-            );
+            let lamps = lit_lamps.as_ref().map_or_else(Vec::new, |lit| {
+                lit.lamps_for(
+                    world,
+                    person.level,
+                    person.root.translation + view.level_lift(person.level),
+                    eye,
+                )
+            });
             for part in person.body.parts.iter().filter(|p| p.censor == 0) {
                 let skinned = skin(part, &person.bones);
                 if part.texture_name.is_some() {
@@ -1629,5 +1696,69 @@ mod tests {
         let tilted = (towards * 0.5 + side * (3.0f32.sqrt() / 2.0)).normalize();
         assert!((tilted.dot(towards) - 0.5).abs() < 1e-6);
         assert!((half.shade(tilted) - (128.0 / 255.0 + 0.25)).abs() < 1e-6);
+    }
+
+    /// `LitLamps` preserves every detail of the reference room-tile scan:
+    /// duplicate entries in `room.tiles`, multiple lit lamps on the same tile
+    /// in ascending ID order, and enforcing the `ROOM_LAMPS` (6) cap *before*
+    /// filtering by distance (`lamp_strength`).
+    #[test]
+    fn indexed_lit_lamps_match_reference_scan_with_duplicates_and_cap() {
+        let mut world = World::empty();
+        world.size = 64;
+        let full = FULL_SIDE;
+        let mut map = vec![0i16; full * full];
+        map[12 * full + 12] = 7;
+        world.rooms.map = [map, Vec::new()];
+        world.rooms.rooms.insert(
+            7,
+            sims_sim::rooms::Room {
+                tiles: vec![
+                    [12, 12, 1],
+                    [12, 12, 1],
+                    [50, 50, 1],
+                    [50, 50, 1],
+                    [13, 12, 1],
+                ],
+                ..Default::default()
+            },
+        );
+        let mk_lamp = |id: u16, tx: i32, ty: i32| {
+            let mut data = vec![0i16; 64];
+            (data[16], data[40], data[51]) = (1, 0x400, 25);
+            sims_sim::Object {
+                id,
+                guid: 0,
+                footprint: [0; 4],
+                position: [tx * 16 + 8, ty * 16 + 8, 1],
+                unknown_short: 0,
+                attributes: Vec::new(),
+                temps: Vec::new(),
+                data,
+                obsolete_word: 0,
+                stack_capacity_bytes: 0,
+                stack: Vec::new(),
+                relationship_flag: 0,
+                relationships: Vec::new(),
+                slots: Vec::new(),
+                dynamic_sprites: Vec::new(),
+                multipart: None,
+                portal: None,
+                person: None,
+                registry_word: None,
+                last_result: false,
+                removal_skips_resets: false,
+                selected: false,
+            }
+        };
+        world.objects.insert(10, mk_lamp(10, 12, 12));
+        world.objects.insert(20, mk_lamp(20, 12, 12));
+        world.objects.insert(30, mk_lamp(30, 50, 50));
+        world.objects.insert(40, mk_lamp(40, 13, 12));
+
+        let at = Vec3::new(-(12.5 * 3.0), 0.0, -(12.5 * 3.0));
+        let eye = Vec3::new(100.0, 100.0, 100.0);
+        let got = lamps(&world, 1, at, eye);
+        assert_eq!(got.len(), 4);
     }
 }

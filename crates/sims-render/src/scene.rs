@@ -1,8 +1,10 @@
 //! Draws a lot: terrain, floors, walls and objects, level by level.
 
-use crate::assets::{Assets, Definition};
+use crate::assets::Assets;
 use crate::camera::{self, Camera, Walls, Zoom};
-use crate::canvas::{Canvas, Image};
+use crate::canvas::Canvas;
+#[cfg(test)]
+use crate::canvas::Image;
 use crate::caps::{self, Cap, Corners, Line, solid};
 use crate::cutaway::{self, Mask};
 use crate::depth::{Anchor, Depth};
@@ -173,6 +175,10 @@ pub fn draw_held(
     camera: &Camera,
     canvas: &mut Canvas,
 ) -> Stats {
+    let held = holds_person(world);
+    if held.is_empty() {
+        return Stats::default();
+    }
     let viewport = (canvas.width as u32, canvas.height as u32);
     let mut painter = Painter::new(
         world,
@@ -183,10 +189,12 @@ pub fn draw_held(
         None,
         canvas,
         Pass::Held,
+        None,
+        held,
     );
     let top = camera.level.clamp(1, 2);
     for level in 1..=top {
-        let cut = cut(lot, camera, level, top);
+        let cut = cut(lot, camera, level, top, None);
         painter.objects(level, &cut);
     }
     painter.stats
@@ -214,14 +222,78 @@ fn paint(
     canvas: &mut Canvas,
     pass: Pass,
 ) -> Stats {
+    let grass = Grass::new(lot, camera);
+    let held = if pass == Pass::All {
+        BTreeSet::new()
+    } else {
+        holds_person(world)
+    };
+    paint_with_precomputed(
+        world, lot, assets, camera, viewport, preview, canvas, pass, &grass, held, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn paint_lot_precomputed(
+    world: &World,
+    lot: &Lot,
+    assets: &mut Assets,
+    camera: &Camera,
+    viewport: (u32, u32),
+    preview: Option<(u16, u16)>,
+    canvas: &mut Canvas,
+    grass: &Grass,
+    held: BTreeSet<u16>,
+    cut_mask: Option<&Mask>,
+) -> Stats {
+    paint_with_precomputed(
+        world,
+        lot,
+        assets,
+        camera,
+        viewport,
+        preview,
+        canvas,
+        Pass::Lot,
+        grass,
+        held,
+        cut_mask,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_with_precomputed(
+    world: &World,
+    lot: &Lot,
+    assets: &mut Assets,
+    camera: &Camera,
+    viewport: (u32, u32),
+    preview: Option<(u16, u16)>,
+    canvas: &mut Canvas,
+    pass: Pass,
+    grass: &Grass,
+    held: BTreeSet<u16>,
+    cut_mask: Option<&Mask>,
+) -> Stats {
     let time_of_day = world.globals.get(4).copied().unwrap_or(lot.time_of_day);
     let house = world.globals.get(10).copied().unwrap_or(0);
     canvas.clear(background(time_of_day, house));
-    let mut painter = Painter::new(world, lot, assets, camera, viewport, preview, canvas, pass);
+    let mut painter = Painter::new(
+        world,
+        lot,
+        assets,
+        camera,
+        viewport,
+        preview,
+        canvas,
+        pass,
+        Some(grass),
+        held,
+    );
     let top = camera.level.clamp(1, 2);
     for level in 1..=top {
         painter.floors(level);
-        let cut = cut(lot, camera, level, top);
+        let cut = cut(lot, camera, level, top, cut_mask);
         let corners = painter.corners(level, &cut);
         painter.walls(level, &cut, &corners);
         painter.trims(level, &corners);
@@ -232,14 +304,23 @@ fn paint(
 
 /// How a level's walls are cut. Only the top floor shown is cut away; the
 /// floors below it stand (0x4a8895, the old prototype's `wall_view.rs`).
-fn cut(lot: &Lot, camera: &Camera, level: i32, top: i32) -> Cut {
+fn cut<'a>(
+    lot: &Lot,
+    camera: &Camera,
+    level: i32,
+    top: i32,
+    precomputed: Option<&'a Mask>,
+) -> Cut<'a> {
     if level < top {
         Cut::None
     } else {
         match camera.walls {
             Walls::Up => Cut::None,
             Walls::Down => Cut::All,
-            Walls::Cutaway => Cut::Mask(Box::new(Mask::new(lot, camera))),
+            Walls::Cutaway => match precomputed {
+                Some(mask) => Cut::Borrowed(mask),
+                None => Cut::Mask(Box::new(Mask::new(lot, camera))),
+            },
         }
     }
 }
@@ -328,13 +409,14 @@ fn held_trees(objects: &BTreeMap<u16, Object>, people: &BTreeSet<u16>) -> BTreeS
 }
 
 /// Which walls of a level are cut down, and which objects hide with them.
-enum Cut {
+enum Cut<'a> {
     None,
     All,
     Mask(Box<Mask>),
+    Borrowed(&'a Mask),
 }
 
-impl Cut {
+impl Cut<'_> {
     /// Whether the wall with segment bit `bit` and style `style` of lot
     /// cell `cell` is cut down. Fences never are.
     fn cuts(&self, camera: &Camera, cell: [i32; 2], bit: u8, style: u16) -> bool {
@@ -343,6 +425,7 @@ impl Cut {
                 Cut::None => false,
                 Cut::All => true,
                 Cut::Mask(mask) => mask.cuts(camera, cell, bit),
+                Cut::Borrowed(mask) => mask.cuts(camera, cell, bit),
             }
     }
 }
@@ -477,7 +560,7 @@ struct Painter<'a> {
     camera: &'a Camera,
     assets: &'a mut Assets,
     canvas: &'a mut Canvas,
-    grass: Grass,
+    grass: Option<&'a Grass>,
     depth: Depth,
     stats: Stats,
 }
@@ -493,15 +576,13 @@ impl<'a> Painter<'a> {
         preview: Option<(u16, u16)>,
         canvas: &'a mut Canvas,
         pass: Pass,
+        grass: Option<&'a Grass>,
+        held: BTreeSet<u16>,
     ) -> Self {
         let clip_bottom = (viewport.1 as usize).min(canvas.height) as i32;
         Painter {
             pass,
-            held: if pass == Pass::All {
-                BTreeSet::new()
-            } else {
-                holds_person(world)
-            },
+            held,
             preview_overrides: buy_preview_overrides(world, preview),
             clip_bottom,
             world,
@@ -509,7 +590,7 @@ impl<'a> Painter<'a> {
             camera,
             assets,
             canvas,
-            grass: Grass::new(lot, camera),
+            grass,
             depth: Depth::new(camera),
             stats: Stats::default(),
         }
@@ -535,80 +616,60 @@ impl<'a> Painter<'a> {
     /// The lamps whose pools reach tile (`x`, `y`) of a level, as view
     /// offsets from the lamp to the tile: those of the tile's record
     /// within the pool map's reach each way (0x4c8049).
-    fn lamps(&self, level: usize, [x, y]: [i32; 2]) -> [Option<[i32; 2]>; 2] {
+    fn lamps_at(
+        lot: &Lot,
+        camera: &Camera,
+        level: usize,
+        [x, y]: [i32; 2],
+    ) -> [Option<[i32; 2]>; 2] {
         let record = usize::try_from(x)
             .ok()
             .zip(usize::try_from(y).ok())
-            .and_then(|(x, y)| self.lot.lamps[level].get(Lot::cell(x, y)).copied())
+            .and_then(|(x, y)| lot.lamps[level].get(Lot::cell(x, y)).copied())
             .unwrap_or_default();
         record.0.map(|lamp| {
             let offset = lamp?.map(i32::from);
             offset
                 .iter()
                 .all(|n| n.abs() <= pools::REACH)
-                .then(|| self.rotate_direction(offset))
+                .then(|| rotate_direction(camera.rotation, offset))
         })
-    }
-
-    /// How a wall face whose seen side's room shows light `light` (a
-    /// fraction) is lit, pixel by pixel: in that light, through the
-    /// drawing's light setter (0x4b4525), plus the pools of the lamps
-    /// marked on lot tile `seen`, for a straight face along view y
-    /// (`along_y`) or x; `seen` None for a diagonal, which takes no pools
-    /// (0x4c78c5). The original passes the room's float, not its tile
-    /// byte (0x53ea46, 0x53c9df), so a light just short of 1 is shaded. A
-    /// light in full light shows no pools (0x4c7c59). `light` None draws in
-    /// full light whatever the time of day, as the original's reset to 1
-    /// does (0x4b455f). See [`crate::pools`], "Walls".
-    fn wall_light(
-        &self,
-        level: usize,
-        light: Option<f32>,
-        seen: Option<(bool, [i32; 2])>,
-    ) -> impl Fn(usize, usize) -> Light + use<> {
-        let brightest = self.lot.brightest();
-        let plain = light.map_or(Light::FULL, |light| Light::from_fraction(light, brightest));
-        let pools = light
-            .and_then(|light| Light::drawn_fraction(light, brightest))
-            .zip(seen.and_then(|(along_y, tile)| self.wall_pools(level, along_y, tile)));
-        let rise = pools::wall_rise(self.camera.zoom.index()) as i64;
-        move |x: usize, y: usize| match &pools {
-            Some((base, pools)) => Light::from_sum(
-                base + pools
-                    .iter()
-                    .map(|p| u32::from(p.at(x as i64, y as i64 - rise)))
-                    .sum::<u32>(),
-            ),
-            None => plain,
-        }
     }
 
     /// The pools of light on a straight wall face along view y
     /// (`along_y`) or x from the lamps marked on lot tile `[x, y]`, the
-    /// one on its seen side, or None if no lamp lights it.
-    fn wall_pools(
-        &self,
+    /// one on its seen side, borrowed directly from `pools` without copying.
+    fn wall_pools_ref<'p>(
+        lot: &Lot,
+        camera: &Camera,
+        pools: Option<&'p Pools>,
         level: usize,
         along_y: bool,
         [x, y]: [i32; 2],
-    ) -> Option<Vec<pools::WallPool>> {
-        let pools = self.assets.pools()?;
-        let record = usize::try_from(x)
+    ) -> [Option<pools::WallPoolRef<'p>>; 2] {
+        let Some(pools) = pools else {
+            return [None, None];
+        };
+        let Some(record) = usize::try_from(x)
             .ok()
             .zip(usize::try_from(y).ok())
-            .and_then(|(x, y)| self.lot.lamps[level].get(Lot::cell(x, y)).copied())?;
-        let zoom = self.camera.zoom.index();
-        let found: Vec<_> = record
-            .0
-            .iter()
-            .flatten()
-            .filter_map(|&lamp| {
-                let offset = self.rotate_direction(lamp.map(i32::from));
-                let (along, out) = pools::wall_lamp(along_y, offset)?;
-                pools.wall(along_y, zoom, along, out)
-            })
-            .collect();
-        (!found.is_empty()).then_some(found)
+            .and_then(|(x, y)| lot.lamps[level].get(Lot::cell(x, y)).copied())
+        else {
+            return [None, None];
+        };
+        let zoom = camera.zoom.index();
+        let mut out = [None, None];
+        let mut count = 0;
+        for lamp in record.0.into_iter().flatten() {
+            let offset = rotate_direction(camera.rotation, lamp.map(i32::from));
+            if let Some((along, dist)) = pools::wall_lamp(along_y, offset)
+                && let Some(pool) = pools.wall_ref(along_y, zoom, along, dist)
+            {
+                out[count] = Some(pool);
+                count += 1;
+            }
+        }
+        out
     }
 
     /// Rotates a lot corner (0 to 64) into the view.
@@ -699,15 +760,23 @@ impl<'a> Painter<'a> {
                     let Some(id) = id.filter(|&id| id != 0) else {
                         continue;
                     };
-                    let Some(image) = self.assets.floor(id, zoom) else {
+                    let Some((image, pools)) = self.assets.floor_with_pools(id, zoom) else {
                         continue;
                     };
                     let at = [p[0] - image.width as i32 / 2, p[1]];
-                    let image = if floor == lot::SPLIT_FLOOR {
-                        split_half(self.camera, image, wall.segments, half)
-                    } else {
-                        image.clone()
-                    };
+                    let img_w = i32::try_from(image.width).unwrap_or(i32::MAX);
+                    let img_h = i32::try_from(image.height).unwrap_or(i32::MAX);
+                    if at[0].saturating_add(img_w) <= 0
+                        || at[0] >= self.canvas.width as i32
+                        || at[1].saturating_add(img_h) <= 0
+                        || at[1] >= self.canvas.height as i32
+                    {
+                        self.stats.floors += 1;
+                        continue;
+                    }
+                    let sub_rect = (floor == lot::SPLIT_FLOOR).then(|| {
+                        split_half_rect(self.camera, image.width, image.height, wall.segments, half)
+                    });
                     // A point inside the half, for its room's light.
                     let inside = match (floor == lot::SPLIT_FLOOR, wall.segments, half) {
                         (false, _, _) => [8, 8],
@@ -719,34 +788,39 @@ impl<'a> Painter<'a> {
                     let byte = self
                         .lot
                         .light_at(index, [x * 16 + inside[0], y * 16 + inside[1]]);
-                    let lamps = self.lamps(index, [x, y]);
+                    let lamps = Self::lamps_at(self.lot, self.camera, index, [x, y]);
                     let depth = &self.depth;
-                    let depth = |_, y, _| Some(depth.floor(view, height, level, at[1], y));
-                    match (
-                        Light::drawn_byte(byte, self.lot.brightest()),
-                        self.assets.pools(),
-                    ) {
+                    let (base_d, first_row) = depth.floor_base(view, height, level, at[1]);
+                    let row_depth = |y| depth.floor_row(base_d, first_row, y);
+                    match (Light::drawn_byte(byte, self.lot.brightest()), pools) {
                         // A room in full light shows no pools (0x4c83d4).
                         (Some(base), Some(pools)) if lamps.iter().any(Option::is_some) => {
                             let tile = self.camera.zoom.tile_width();
                             let origins = lamps.map(|lamp| lamp.map(|a| Pools::origin(tile, a)));
                             let light = |ix: usize, iy: usize| {
-                                let pool = |o: [i32; 2]| {
-                                    u32::from(pools.at(zoom, o[0] + ix as i32, o[1] + iy as i32))
-                                };
-                                Light::from_sum(
-                                    base + origins.iter().flatten().map(|&o| pool(o)).sum::<u32>(),
-                                )
+                                let mut sum = base;
+                                for o in origins.into_iter().flatten() {
+                                    sum += u32::from(pools.at(
+                                        zoom,
+                                        o[0] + ix as i32,
+                                        o[1] + iy as i32,
+                                    ));
+                                }
+                                Light::from_sum(sum)
                             };
-                            self.canvas.draw_shaded(&image, at, light, depth);
+                            self.canvas
+                                .draw_floor_shaded(image, at, sub_rect, light, row_depth);
                         }
-                        _ => self.canvas.draw_lit(
-                            &image,
-                            at,
-                            false,
-                            Light::from_byte(byte, self.lot.brightest()),
-                            depth,
-                        ),
+                        _ => {
+                            let flat_light = Light::from_byte(byte, self.lot.brightest());
+                            self.canvas.draw_floor_shaded(
+                                image,
+                                at,
+                                sub_rect,
+                                |_, _| flat_light,
+                                row_depth,
+                            );
+                        }
                     }
                     self.stats.floors += 1;
                 }
@@ -760,7 +834,9 @@ impl<'a> Painter<'a> {
     /// height `height`: that of the first object on the tile that has one
     /// (see [`crate::shadows`]).
     fn shadow(&mut self, level: i32, [x, y]: [i32; 2], p: [i32; 2], view: [i32; 2], height: i32) {
-        let Some((code, strength)) = self.shadow_of(level, [x, y]) else {
+        let Some((code, strength)) =
+            shadow_of_tile(self.world, self.assets, self.camera.rotation, level, [x, y])
+        else {
             return;
         };
         let index = (level - 1) as usize;
@@ -775,57 +851,23 @@ impl<'a> Painter<'a> {
             return;
         };
         let at = [p[0] - tile.unwrap_or(mask.width) as i32 / 2, p[1]];
-        for my in 0..mask.height {
-            let row = at[1] + my as i32;
-            let at_least = self.depth.shadow(view, height, level, at[1], row);
-            for mx in 0..mask.width {
-                if let Some(s) = mask.shade(mx, my, strength) {
-                    self.canvas
-                        .shade(at[0] + mx as i32, row, at_least, Light::from_sum(s));
-                }
-            }
-        }
-    }
-
-    /// The shadow code, turned into the view, and strength of the first
-    /// object on a tile that casts a shadow (0x4ae844, 0x434e23).
-    fn shadow_of(&mut self, level: i32, [x, y]: [i32; 2]) -> Option<(u8, i16)> {
-        let grid = self
-            .world
-            .arrays
-            .get(&[3, 103][usize::try_from(level - 1).ok()?])?;
-        let cell = Lot::cell(usize::try_from(x).ok()?, usize::try_from(y).ok()?) * 2;
-        let word = grid.data.get(cell..cell + 2)?;
-        let mut next = i16::from_le_bytes([word[0], word[1]]);
-        // A chain longer than the lot's objects has looped.
-        for _ in 0..self.world.objects.len() {
-            let o = u16::try_from(next)
-                .ok()
-                .and_then(|id| self.world.objects.get(&id))?;
-            let visible = o.data.get(HIDDEN).is_none_or(|&w| w == 0)
-                && o.data.get(FLAGS).is_none_or(|&w| w & ZERO_EXTENT == 0);
-            if visible
-                && let Some(definition) = self.assets.definition(o.guid)
-                && !matches!(definition.kind, 2 | 9)
-                && let Some(code) = definition.shadow
-            {
-                let facing = o.data.get(FACING).copied().unwrap_or(0) / 2;
-                let code = shadows::rotate(code, facing.max(0) as u8);
-                let code = shadows::rotate(code, self.camera.rotation);
-                return Some((code, definition.shadow_strength));
-            }
-            next = o.slots.first()?.object;
-        }
-        None
+        let depth = &self.depth;
+        let (base_d, first_row) = depth.floor_base(view, height, level, at[1]);
+        self.canvas.shade_mask(mask, at, strength, |row| {
+            depth.floor_row(base_d, first_row, row).saturating_sub(65)
+        });
     }
 
     /// Draws a grass tile in the original's four-pixel columns (see
     /// [`crate::grass`]), straight from the palette: no room's light falls
     /// on it (0x49da21).
     fn terrain(&mut self, tile: [i32; 2]) {
+        let Some(grass) = self.grass else {
+            return;
+        };
         draw_grass_tile(
             self.lot,
-            &self.grass,
+            grass,
             &self.depth,
             self.camera,
             tile,
@@ -947,18 +989,21 @@ impl<'a> Painter<'a> {
 
     /// The objects that cut their own shape into a wall on a level, by the
     /// wall they stand in (the old prototype's `object_apertures` in
-    /// `legacy/crates/sims-render/src/walls.rs`).
-    fn wall_objects(&mut self, level: i32) -> BTreeMap<Edge, Definition> {
+    /// `legacy/crates/sims-render/src/walls.rs`), stored as `(resource, wall_shape)`.
+    fn wall_objects(&mut self, level: i32) -> BTreeMap<Edge, (usize, u16)> {
         let mut found = BTreeMap::new();
         for o in self.world.objects.values() {
             if o.position[2] != level || o.position[0] < 0 || o.position[1] < 0 {
                 continue;
             }
-            let Some(definition) = self.assets.definition(o.guid) else {
+            let Some(definition) = self.assets.definition_ref(o.guid) else {
                 continue;
             };
-            if let Some(e) = object_edge(o.position, &o.data).filter(|_| definition.shapes_wall()) {
-                found.insert(e, definition);
+            if definition.shapes_wall() {
+                let info = (Assets::resource_of(definition), definition.wall_shape);
+                if let Some(e) = object_edge(o.position, &o.data) {
+                    found.insert(e, info);
+                }
             }
         }
         found
@@ -993,7 +1038,7 @@ impl<'a> Painter<'a> {
                         continue;
                     }
                     let key = edge(s.from, s.to);
-                    let opening = openings.get(&key);
+                    let opening = openings.get(&key).copied();
                     let pattern = patterns[front];
                     let ends = [s.from, s.to].map(|c| self.corner_screen(c, level));
                     let heights = [s.from, s.to].map(|c| self.corner_elevation(c) / 16);
@@ -1006,20 +1051,6 @@ impl<'a> Painter<'a> {
                     let flags = corners.flags(([x, y], s.bit));
                     let capped = (flags & 6 != 0 && !caps::door_like(style))
                         .then_some(if flags & 2 != 0 { 8 } else { 7 });
-                    // Fences have no cut shape and stay up.
-                    let image = match capped {
-                        Some(shape) => {
-                            wall_image(self.assets, pattern, shape, None, false, zoom, frame)
-                        }
-                        None => wall_image(self.assets, pattern, style, opening, cut, zoom, frame)
-                            .or_else(|| {
-                                wall_image(self.assets, pattern, style, opening, false, zoom, frame)
-                            }),
-                    };
-                    let Some(image) = image else {
-                        self.stats.missing_walls += 1;
-                        continue;
-                    };
                     // The side that shows takes the light of the room on
                     // that side: sampled just beside the wall's middle, so
                     // a split tile gives the triangle touching the wall.
@@ -1030,35 +1061,87 @@ impl<'a> Painter<'a> {
                         .room_fraction_at(index, wall_side(&s, front))
                         .unwrap_or(1.0);
                     let seen = seen_tile(self.camera, s.from, s.to);
-                    let light = self.wall_light(index, Some(fraction), seen);
-                    self.place_wall(&image, frame, ends, heights, level, &light, None, 0);
+                    // Fences have no cut shape and stay up.
+                    let drew = match capped {
+                        Some(shape) => self.place_wall_parts(
+                            pattern,
+                            shape,
+                            None,
+                            false,
+                            zoom,
+                            frame,
+                            ends,
+                            heights,
+                            level,
+                            Some(fraction),
+                            seen,
+                            None,
+                            0,
+                        ),
+                        None => {
+                            self.place_wall_parts(
+                                pattern,
+                                style,
+                                opening,
+                                cut,
+                                zoom,
+                                frame,
+                                ends,
+                                heights,
+                                level,
+                                Some(fraction),
+                                seen,
+                                None,
+                                0,
+                            ) || (cut
+                                && self.place_wall_parts(
+                                    pattern,
+                                    style,
+                                    opening,
+                                    false,
+                                    zoom,
+                                    frame,
+                                    ends,
+                                    heights,
+                                    level,
+                                    Some(fraction),
+                                    seen,
+                                    None,
+                                    0,
+                                ))
+                        }
+                    };
+                    if !drew {
+                        self.stats.missing_walls += 1;
+                        continue;
+                    }
                     if let Some(shape) = capped {
-                        // On an edge-on diagonal the strip is always
-                        // pattern 252 in shape 9, whichever end is marked
-                        // (0x53eb6d to 0x53ebf5).
-                        let strip = if frame == 3 {
-                            edge_on_strip(self.assets, zoom)
+                        // In room 0's light, or 1 without one, held by the time
+                        // of day's cap, and no pools (0x53eba8 to 0x53ebb5).
+                        let outdoor = self.lot.outdoor_light.unwrap_or(1.0);
+                        // On an edge-on diagonal the strip is always pattern 252
+                        // in shape 9, whichever end is marked (0x53eb6d to
+                        // 0x53ebf5), moved up before drawing.
+                        if frame == 3 {
+                            let lift = edge_on_strip_lift(self.camera.zoom);
+                            self.place_edge_on_strip(zoom, ends, heights, level, outdoor, lift);
                         } else {
                             let (trim, mask) = if shape == 7 { (252, 9) } else { (253, 10) };
-                            wall_image(self.assets, trim, mask, None, false, zoom, frame)
-                        };
-                        if let Some(strip) = strip {
-                            // In room 0's light, or 1 without one, held
-                            // by the time of day's cap, and no pools
-                            // (0x53eba8 to 0x53ebb5).
-                            let light = Light::from_fraction(
-                                self.lot.outdoor_light.unwrap_or(1.0),
-                                self.lot.brightest(),
+                            self.place_wall_parts(
+                                trim,
+                                mask,
+                                None,
+                                false,
+                                zoom,
+                                frame,
+                                ends,
+                                heights,
+                                level,
+                                Some(outdoor),
+                                None,
+                                None,
+                                0,
                             );
-                            let lit = |_, _| light;
-                            // On an edge-on diagonal the original moves
-                            // the strip up before drawing it (0x53ebf5).
-                            let lift = if frame == 3 {
-                                edge_on_strip_lift(self.camera.zoom)
-                            } else {
-                                0
-                            };
-                            self.place_wall(&strip, frame, ends, heights, level, &lit, None, lift);
                         }
                     }
                     self.stats.walls += 1;
@@ -1067,87 +1150,131 @@ impl<'a> Painter<'a> {
         }
     }
 
-    /// Draws a wall face on `level` standing between the screen points
-    /// `a` and `b` of its ends, on terrain `heights` steps up at each,
-    /// only within screen columns `columns` (from, to) when given, and
-    /// `raise` pixels higher than its place. Depth is still read at the
-    /// row drawn, from the same anchor, as the original's wall depth
-    /// lookup is (0x49a5d3).
-    ///
-    /// The wall is placed at its end lower on the screen (the left one of
-    /// a wall level on screen), and a straight wall's columns run up or
-    /// down its column table from there; both were fitted to the
-    /// original's depth buffer at medium zoom (2026-11-14).
+    /// Places a wall face from borrowed `(pattern, shape)` sprites in `assets`,
+    /// without cloning or pre-allocating a masked image. Returns `false` if the
+    /// pattern/shape sprites are missing or incompatible in size.
     #[allow(clippy::too_many_arguments)]
-    fn place_wall(
+    fn place_wall_parts(
         &mut self,
-        image: &Image,
+        pattern: u16,
+        style: u16,
+        opening: Option<(usize, u16)>,
+        cut: bool,
+        zoom: usize,
         frame: usize,
-        [a, b]: [[i32; 2]; 2],
+        ends: [[i32; 2]; 2],
         heights: [i32; 2],
         level: i32,
-        light: &dyn Fn(usize, usize) -> Light,
+        light: Option<f32>,
+        seen: Option<(bool, [i32; 2])>,
         columns: Option<[i32; 2]>,
         raise: i32,
-    ) {
-        let rise = 4 << self.camera.zoom.level();
-        let left = if a[0] <= b[0] { a } else { b };
-        let (w, h) = (image.width as i32, image.height as i32);
-        // The sprite's bottom row sits one pixel above the corner's
-        // projected point (matched against the original's screen,
-        // 2026-11-14).
-        let at = match frame {
-            0 | 2 => [left[0], left[1] - h],
-            1 => [left[0], left[1] - (h - rise)],
-            // An edge-on diagonal stands centred on its column, a pixel
-            // higher at far zoom, two at medium and four at near than the
-            // other frames (fitted to the original's screen: its column
-            // shows the pattern's first texel column from these rows,
-            // 2026-11-15).
-            _ => {
-                let bottom = if a[1] > b[1] { a } else { b };
-                let lift = 1 << self.camera.zoom.index();
-                [bottom[0] - w / 2, bottom[1] - h - lift]
-            }
+    ) -> bool {
+        let Some((pat, shp, pools)) = self
+            .assets
+            .wall_parts(pattern, style, opening, cut, zoom, frame)
+        else {
+            return false;
         };
-        let anchor = match (frame, a[1].cmp(&b[1])) {
-            (2, _) if a[0] <= b[0] => self.depth.anchor(a[1], heights[0] as f32, level),
-            (2, _) => self.depth.anchor(b[1], heights[1] as f32, level),
-            // An edge-on diagonal is anchored halfway between its ends:
-            // with the original's bias (see `Depth::diagonal`) that gives
-            // its depth on every row compared (2026-11-15). Its height
-            // there, the ends' mean, is unverified.
-            (3, _) => {
-                let height = (heights[0] + heights[1]) as f32 / 2.0;
-                self.depth.anchor((a[1] + b[1]) / 2, height, level)
-            }
-            (_, std::cmp::Ordering::Less) => self.depth.anchor(b[1], heights[1] as f32, level),
-            _ => self.depth.anchor(a[1], heights[0] as f32, level),
-        };
-        let at = [at[0], at[1] - raise];
+        let (at, anchor) = wall_placement(
+            self.camera,
+            &self.depth,
+            pat.width,
+            pat.height,
+            frame,
+            ends,
+            heights,
+            level,
+            raise,
+        );
         let sprite_left = at[0];
-        let clipped;
-        let (image, at, skip) = match columns {
-            Some(columns) => {
-                let Some((part, skip)) = within(image, at[0], columns) else {
-                    return;
-                };
-                clipped = part;
-                (&clipped, [at[0].saturating_add(skip), at[1]], skip)
-            }
-            None => (image, at, 0),
-        };
-        let skip = usize::try_from(skip).unwrap_or(0);
         let depth = &self.depth;
         let first = depth.wall_start(frame == 0);
-        self.canvas.draw_wall_shaded(
-            image,
+        let brightest = self.lot.brightest();
+        let plain = light.map_or(Light::FULL, |f| Light::from_fraction(f, brightest));
+        let index = (level - 1) as usize;
+        let drawn_base = light.and_then(|f| Light::drawn_fraction(f, brightest));
+        let wall_pools = match (drawn_base, seen) {
+            (Some(_), Some((along_y, tile))) => {
+                Self::wall_pools_ref(self.lot, self.camera, pools, index, along_y, tile)
+            }
+            _ => [None, None],
+        };
+        let has_pools = wall_pools[0].is_some();
+        let rise = pools::wall_rise(zoom) as i64;
+        if let Some(base) = drawn_base
+            && has_pools
+        {
+            self.canvas.draw_wall_masked(
+                pat,
+                shp,
+                false,
+                at,
+                columns,
+                |x, y| {
+                    let mut sum = base;
+                    let py = y as i64 - rise;
+                    for p in wall_pools.into_iter().flatten() {
+                        sum += u32::from(p.at(x as i64, py));
+                    }
+                    Light::from_sum(sum)
+                },
+                |sx, sy| match frame {
+                    0 | 1 => depth.wall(anchor, sy, first, sx.saturating_sub(sprite_left)),
+                    _ => depth.diagonal(anchor, sy, frame == 3),
+                },
+            )
+        } else {
+            self.canvas.draw_wall_masked(
+                pat,
+                shp,
+                false,
+                at,
+                columns,
+                |_, _| plain,
+                |sx, sy| match frame {
+                    0 | 1 => depth.wall(anchor, sy, first, sx.saturating_sub(sprite_left)),
+                    _ => depth.diagonal(anchor, sy, frame == 3),
+                },
+            )
+        }
+    }
+
+    /// Places the edge-on diagonal cap strip (pattern 252 masked top-left by
+    /// shape 9, frame 3) without cloning either sprite.
+    fn place_edge_on_strip(
+        &mut self,
+        zoom: usize,
+        ends: [[i32; 2]; 2],
+        heights: [i32; 2],
+        level: i32,
+        outdoor_light: f32,
+        raise: i32,
+    ) {
+        let Some((pat, shp)) = self.assets.edge_on_strip_parts(zoom) else {
+            return;
+        };
+        let (at, anchor) = wall_placement(
+            self.camera,
+            &self.depth,
+            pat.width,
+            pat.height,
+            3,
+            ends,
+            heights,
+            level,
+            raise,
+        );
+        let depth = &self.depth;
+        let light = Light::from_fraction(outdoor_light, self.lot.brightest());
+        self.canvas.draw_wall_masked(
+            pat,
+            shp,
+            true,
             at,
-            |x, y| light(x + skip, y),
-            |sx, sy| match frame {
-                0 | 1 => depth.wall(anchor, sy, first, sx.saturating_sub(sprite_left)),
-                _ => depth.diagonal(anchor, sy, frame == 3),
-            },
+            None,
+            |_, _| light,
+            |_, sy| depth.diagonal(anchor, sy, true),
         );
     }
 
@@ -1205,12 +1332,13 @@ impl<'a> Painter<'a> {
             let at = self.corner_screen(corner, level);
             let view = self.rotate_corner(corner);
             let ground = self.corner_elevation(corner) / 16;
-            let trims: Vec<(u8, bool)> = if c.record {
-                vec![(c.cut, true), (c.standing, false)]
+            let record_trims = [(c.cut, true), (c.standing, false)];
+            let trims: &[(u8, bool)] = if c.record {
+                &record_trims
             } else {
-                c.run_trims.clone()
+                &c.run_trims
             };
-            for (bits, is_cut) in trims {
+            for &(bits, is_cut) in trims {
                 let height = if is_cut {
                     cut_height
                 } else {
@@ -1236,7 +1364,9 @@ impl<'a> Painter<'a> {
                 let Some(x) = at[0].checked_sub(half) else {
                     continue;
                 };
-                let mut pieces = vec![(set, lift, None)];
+                let mut pieces: [(bool, i32, Option<[i32; 2]>); 3] =
+                    [(set, lift, None), (false, 0, None), (false, 0, None)];
+                let mut piece_count = 1usize;
                 // With 0x10, the cut set's frame is laid again over the
                 // part of the corner where a wall leaves along +x (bit 8,
                 // right of a point just past the corner) or +y (bit 4,
@@ -1246,10 +1376,12 @@ impl<'a> Painter<'a> {
                     let z = zoom.index() as i32 + 1;
                     let (step, nudge) = (8 << z, 8 >> (3 - z));
                     if bits & 8 != 0 {
-                        pieces.push((true, 0, Some([x + step + nudge, i32::MAX])));
+                        pieces[piece_count] = (true, 0, Some([x + step + nudge, i32::MAX]));
+                        piece_count += 1;
                     }
                     if bits & 4 != 0 {
-                        pieces.push((true, 0, Some([i32::MIN, x + step - nudge])));
+                        pieces[piece_count] = (true, 0, Some([i32::MIN, x + step - nudge]));
+                        piece_count += 1;
                     }
                 }
                 // A cut trim is placed as an object would be at the
@@ -1262,19 +1394,12 @@ impl<'a> Painter<'a> {
                     self.lot.heights[Lot::cell(x as usize, y as usize)]
                 });
                 let left = x;
-                for (set, lift, columns) in pieces {
-                    let Some(image) = self.assets.trim(set, zoom).get(frame).cloned() else {
-                        continue;
-                    };
-                    let (image, x) = match columns {
-                        Some(columns) => match within(&image, x, columns) {
-                            Some((part, skip)) => (part, x.saturating_add(skip)),
-                            None => continue,
-                        },
-                        None => (image, x),
-                    };
+                for &(set, lift, columns) in &pieces[..piece_count] {
                     let rise = zoom.tile_height() / 2 + height + lift;
                     let Some(y) = at[1].checked_sub(rise) else {
+                        continue;
+                    };
+                    let Some(image) = self.assets.trim(set, zoom).get(frame) else {
                         continue;
                     };
                     let depth = &self.depth;
@@ -1285,17 +1410,20 @@ impl<'a> Painter<'a> {
                         if image.depth.is_none() {
                             continue;
                         }
-                        self.canvas
-                            .draw_layered(&image, [x, y], light, |sx, sy, byte| {
-                                depth.trim(anchor, sy, sx.saturating_sub(left), byte)
-                            });
+                        self.canvas.draw_layered_clipped(
+                            image,
+                            [x, y],
+                            light,
+                            columns,
+                            |sx, sy, byte| depth.trim(anchor, sy, sx.saturating_sub(left), byte),
+                        );
                         continue;
                     }
                     // The trim lies on the wall tops, one depth a row
                     // (0x4c8849, with `flat_offset` for diagonal trims).
                     self.canvas
-                        .draw_lit(&image, [x, y], false, light, |_, sy, _| {
-                            Some(depth.flat(view, ground, level, flat_offset, y, sy))
+                        .draw_flat_clipped(image, [x, y], light, columns, |sy| {
+                            depth.flat(view, ground, level, flat_offset, y, sy)
                         });
                 }
             }
@@ -1409,9 +1537,6 @@ impl<'a> Painter<'a> {
         } else {
             PLAIN_STYLE
         };
-        let Some(image) = wall_image(self.assets, pattern, style, None, low, zoom, frame) else {
-            return;
-        };
         // The column beside the corner, in the original's corner point
         // (one pixel right of ours).
         let cx = self.corner_screen(corner, level)[0].saturating_add(1);
@@ -1434,14 +1559,18 @@ impl<'a> Painter<'a> {
             Line::X => Some((false, self.camera.unrotate_tile([tx, ty]))),
             Line::Rising | Line::Falling => None,
         };
-        let light = self.wall_light(index, fraction, seen);
-        self.place_wall(
-            &image,
+        self.place_wall_parts(
+            pattern,
+            style,
+            None,
+            low,
+            zoom,
             frame,
             ends,
             [step; 2],
             level,
-            &light,
+            fraction,
+            seen,
             Some(columns),
             0,
         );
@@ -1475,7 +1604,7 @@ impl<'a> Painter<'a> {
                 continue;
             }
             let assets = &mut *self.assets;
-            let slot = |guid, i: usize| assets.definition(guid)?.slots.get(i).copied();
+            let slot = |guid, i: usize| assets.definition_ref(guid)?.slots.get(i).copied();
             // The object's base altitude comes from `0x478dfe` (`0x4b9613`),
             // and its base screen position and depth anchor from `0x4b97ea`
             // (unheld) or `0x4b9991` (held in a slot, `0x437fdd`, or an
@@ -1517,34 +1646,44 @@ impl<'a> Painter<'a> {
         list.sort_by_key(|&(a, _, id, ..)| (std::cmp::Reverse(a.depth), id));
         for (base_anchor, base_screen, id, pose, pos) in list {
             let o = &self.world.objects[&id];
-            let Some(definition) = self.assets.definition(o.guid) else {
+            let Some(definition) = self.assets.definition_ref(o.guid) else {
                 self.stats.missing_objects += 1;
                 continue;
             };
+            let resource = Assets::resource_of(definition);
+            let def_graphic = definition.graphic;
+            let def_graphics = definition.graphics;
+            let def_kind = definition.kind;
+            let def_dynamic_base = definition.dynamic_base;
+            let def_shapes_wall = definition.shapes_wall();
+            let def_lit_at_brightest = definition.lit_at_brightest();
             // Doors, windows and the like hide where the walls are cut
             // (0x4aa446). Their scripts mark them when the lot loads; in a
             // house read without running those, the objects that shape a
             // wall still hide.
             let tile = [pos[0] >> 4, pos[1] >> 4];
-            let walled = cutaway::hides_with_walls(&o.data) || definition.shapes_wall();
+            let walled = cutaway::hides_with_walls(&o.data) || def_shapes_wall;
             let hidden = walled
                 && match cut {
                     Cut::None => false,
                     Cut::All => true,
                     Cut::Mask(mask) => mask.hides(self.camera, tile, &o.data),
+                    Cut::Borrowed(mask) => mask.hides(self.camera, tile, &o.data),
                 };
             if hidden {
                 continue;
             }
             let Some(group) = u16::try_from(o.data.first().copied().unwrap_or(0))
                 .ok()
-                .filter(|&g| g < definition.graphics)
-                .and_then(|g| definition.graphic.checked_add(g))
+                .filter(|&g| g < def_graphics)
+                .and_then(|g| def_graphic.checked_add(g))
             else {
                 continue;
             };
             let direction = view_direction(o.data.get(1).copied().unwrap_or(0), self.camera);
-            let parts = self.assets.group(&definition, group, direction, zoom);
+            let parts = self
+                .assets
+                .group_by_resource(resource, group, direction, zoom);
             if parts.is_empty() {
                 self.stats.missing_objects += 1;
                 continue;
@@ -1556,8 +1695,8 @@ impl<'a> Painter<'a> {
             // in full light (0x437f7d, 0x4b455f). Then one whose master's
             // word 69 is 7 takes a light of 1 through the setter, held by
             // the time of day's cap (0x437adb to 0x437aed).
-            let glows = o.data.get(LIGHT).is_some_and(|&w| w != 0) && definition.kind != WINDOW;
-            let light = if definition.lit_at_brightest() {
+            let glows = o.data.get(LIGHT).is_some_and(|&w| w != 0) && def_kind != WINDOW;
+            let light = if def_lit_at_brightest {
                 Light::from_fraction(1.0, self.lot.brightest())
             } else if glows {
                 Light::FULL
@@ -1571,7 +1710,7 @@ impl<'a> Painter<'a> {
             // (`Canvas::id_at`).
             self.canvas.set_id(Some(id));
             for part in parts {
-                if !sprite_visible(part.sprite, definition.dynamic_base, &o.dynamic_sprites) {
+                if !sprite_visible(part.sprite, def_dynamic_base, &o.dynamic_sprites) {
                     continue;
                 }
                 // Offsets come from the files and may be anything; the
@@ -1763,6 +1902,17 @@ fn held(
     let Some(mut cursor) = objects.get(&id) else {
         return (false, base);
     };
+    // Fast path: the vast majority of objects are not contained in any slot,
+    // so check the immediate container word before allocating `seen`/`steps`.
+    let first_container = cursor.data.get(CONTAINER).copied().unwrap_or(0);
+    if u16::try_from(first_container)
+        .ok()
+        .filter(|&c| c != 0)
+        .and_then(|c| objects.get(&c))
+        .is_none_or(|h| h.person.is_some())
+    {
+        return (false, base);
+    }
     let mut seen = BTreeSet::from([id]);
     let mut steps = Vec::new();
     loop {
@@ -1873,23 +2023,31 @@ fn draw_grass_tile(
     }
     // The whole tile takes one depth, from its top corner.
     let depth = depth_table.grass(view, i32::from(heights[1]));
+    let depth_clamped = depth.clamp(0, crate::depth::EMPTY);
     let left = corner[0] + GRASS_COLUMN;
-    for column in grass::columns(left, corner[1] + GRASS_ROW, heights, shades, colors, zoom) {
-        for (row, pixels) in column.clipped(0, clip_bottom).rows() {
-            for (i, &p) in pixels.iter().enumerate() {
-                canvas.plot(column.x + i as i32, row, depth, grass::widen(p));
+    let canvas_w = canvas.width as i32;
+    grass::for_each_column(
+        left,
+        corner[1] + GRASS_ROW,
+        heights,
+        shades,
+        colors,
+        zoom,
+        |column| {
+            if column.x + 4 <= 0 || column.x >= canvas_w {
+                return;
             }
-        }
-        let index = ((column.x - left) / 4) as usize;
-        for (bx, foot, height, p) in grass.blades(view, &column, index) {
-            let color = grass::widen(p);
-            let top = foot.saturating_sub(height - 1).max(0);
-            let bottom = foot.min(clip_bottom - 1);
-            for row in top..=bottom {
-                canvas.plot(bx, row, depth, color);
+            for (row, pixels) in column.clipped(0, clip_bottom).rows_rgb() {
+                canvas.plot_grass_span(column.x, row, depth, depth_clamped, pixels);
             }
-        }
-    }
+            let index = ((column.x - left) / 4) as usize;
+            grass.for_each_blade(view, &column, index, |bx, foot, height, color| {
+                let top = foot.saturating_sub(height - 1).max(0);
+                let bottom = foot.min(clip_bottom - 1);
+                canvas.plot_grass_blade(bx, top, bottom, depth, depth_clamped, color);
+            });
+        },
+    );
 }
 
 /// Extra upward screen lift in pixels for diagonal cut wall trims:
@@ -2156,37 +2314,96 @@ fn object_edge(position: [i32; 3], data: &[i16]) -> Option<Edge> {
 /// caps take (`0x53ead5`, `0x53e652`).
 const PLAIN_STYLE: u16 = 1;
 
-/// A wall face: the pattern's frame cut to the shape's frame. A wall with
-/// style 22 or 23 takes its shape from the door or window in it when it is
-/// up (`0x53d525`). Cut down, a window wall (style 22) takes a plain wall's
-/// stub (`0x53ead5` to `0x53eadc` replaces style `0x16` with style 1);
-/// door-like walls (styles 3, 5, 6, 15 and 23) are skipped before this in
-/// live mode (`0x53e9ce` to `0x53ea2b`).
-fn wall_image(
+/// The shadow code, turned into the view by `rotation`, and strength of the
+/// first object on tile `[x, y]` of `level` that casts a shadow (`0x4ae844`,
+/// `0x434e23`).
+pub(crate) fn shadow_of_tile(
+    world: &World,
     assets: &mut Assets,
-    pattern: u16,
-    style: u16,
-    opening: Option<&Definition>,
-    cut: bool,
-    zoom: usize,
-    frame: usize,
-) -> Option<Image> {
-    let shape = match opening {
-        _ if cut && style == 22 => assets.shape(PLAIN_STYLE, true, zoom)?[frame].clone(),
-        Some(definition) if matches!(style, 22 | 23) => {
-            assets.object_shape(definition, false, zoom)?[frame].clone()
-        }
-        _ => assets.shape(style, cut, zoom)?[frame].clone(),
-    };
-    assets.pattern(pattern, zoom)?[frame].masked(&shape)
+    rotation: u8,
+    level: i32,
+    [x, y]: [i32; 2],
+) -> Option<(u8, i16)> {
+    let grid = world
+        .arrays
+        .get(&[3, 103][usize::try_from(level - 1).ok()?])?;
+    let cell = Lot::cell(usize::try_from(x).ok()?, usize::try_from(y).ok()?) * 2;
+    let word = grid.data.get(cell..cell + 2)?;
+    let head = i16::from_le_bytes([word[0], word[1]]);
+    shadow_of_chain(world, assets, rotation, head)
 }
 
-/// The strip on a marked edge-on diagonal: pattern 252 in shape 9, whose
-/// edge-on frame is taller than the pattern's, lined up at the top-left
-/// (see [`Image::masked_top_left`]).
-fn edge_on_strip(assets: &mut Assets, zoom: usize) -> Option<Image> {
-    let shape = assets.shape(9, false, zoom)?[3].clone();
-    assets.pattern(252, zoom)?[3].masked_top_left(&shape)
+/// Walks an object-grid linked list head `next` and returns the shadow code
+/// (turned by `rotation`) and strength of the first visible shadow caster.
+pub(crate) fn shadow_of_chain(
+    world: &World,
+    assets: &mut Assets,
+    rotation: u8,
+    mut next: i16,
+) -> Option<(u8, i16)> {
+    // A chain longer than the lot's objects has looped.
+    for _ in 0..world.objects.len() {
+        let o = u16::try_from(next)
+            .ok()
+            .and_then(|id| world.objects.get(&id))?;
+        let visible = o.data.get(HIDDEN).is_none_or(|&w| w == 0)
+            && o.data.get(FLAGS).is_none_or(|&w| w & ZERO_EXTENT == 0);
+        if visible
+            && let Some(definition) = assets.definition_ref(o.guid)
+            && !matches!(definition.kind, 2 | 9)
+            && let Some(code) = definition.shadow
+        {
+            let facing = o.data.get(FACING).copied().unwrap_or(0) / 2;
+            let code = shadows::rotate(code, facing.max(0) as u8);
+            let code = shadows::rotate(code, rotation);
+            return Some((code, definition.shadow_strength));
+        }
+        next = o.slots.first()?.object;
+    }
+    None
+}
+
+/// Computes `(at, anchor)` for a wall face of dimensions `(width, height)`
+/// standing between projected ends `[a, b]` on `level` with terrain `heights`.
+#[allow(clippy::too_many_arguments)]
+fn wall_placement(
+    camera: &Camera,
+    depth: &Depth,
+    width: usize,
+    height: usize,
+    frame: usize,
+    [a, b]: [[i32; 2]; 2],
+    heights: [i32; 2],
+    level: i32,
+    raise: i32,
+) -> ([i32; 2], Anchor) {
+    let rise = 4 << camera.zoom.level();
+    let left = if a[0] <= b[0] { a } else { b };
+    let (w, h) = (width as i32, height as i32);
+    // The sprite's bottom row sits one pixel above the corner's projected point
+    // (matched against the original's screen, 2026-11-14).
+    let at = match frame {
+        0 | 2 => [left[0], left[1] - h],
+        1 => [left[0], left[1] - (h - rise)],
+        // An edge-on diagonal stands centred on its column, a pixel higher at
+        // far zoom, two at medium and four at near than the other frames.
+        _ => {
+            let bottom = if a[1] > b[1] { a } else { b };
+            let lift = 1 << camera.zoom.index();
+            [bottom[0] - w / 2, bottom[1] - h - lift]
+        }
+    };
+    let anchor = match (frame, a[1].cmp(&b[1])) {
+        (2, _) if a[0] <= b[0] => depth.anchor(a[1], heights[0] as f32, level),
+        (2, _) => depth.anchor(b[1], heights[1] as f32, level),
+        (3, _) => {
+            let mean = (heights[0] + heights[1]) as f32 / 2.0;
+            depth.anchor((a[1] + b[1]) / 2, mean, level)
+        }
+        (_, std::cmp::Ordering::Less) => depth.anchor(b[1], heights[1] as f32, level),
+        _ => depth.anchor(a[1], heights[0] as f32, level),
+    };
+    ([at[0], at[1] - raise], anchor)
 }
 
 /// How far up the original moves the strip on a marked edge-on diagonal:
@@ -2230,6 +2447,7 @@ fn wall_frame([a, b]: [[i32; 2]; 2]) -> usize {
 /// that falls within screen columns `from` (inclusive) to `to`
 /// (exclusive), and how many columns were cut off its left; None if
 /// nothing is left.
+#[cfg(test)]
 fn within(image: &Image, x: i32, [from, to]: [i32; 2]) -> Option<(Image, i32)> {
     let width = i64::try_from(image.width).ok()?;
     let left = (i64::from(from) - i64::from(x)).clamp(0, width);
@@ -2260,29 +2478,18 @@ fn within(image: &Image, x: i32, [from, to]: [i32; 2]) -> Option<(Image, i32)> {
     Some((part, i32::try_from(left).ok()?))
 }
 
-/// One half of a floor image for a tile a diagonal wall splits: half 0
-/// holds corner (0, 0) under a descending wall, or corner (0, 1) under an
-/// ascending one.
-///
-/// On screen a tile's diagonal runs level (through its left and right
-/// corners) or upright (through its top and bottom ones), so the original
-/// cuts no triangle: it draws each half's whole floor sprite with the
-/// screen's clip rectangle narrowed to that half's side of the cut
-/// (0x4af70a and 0x4af924 for a level cut, 0x4afcf5 and 0x4afef6 for an
-/// upright one). The upper half ends above the corners' row and the lower
-/// half starts on it. The original places the sprite at the cut's column
-/// less half a tile (`8 << zoom`, the view's field +0x5c set at 0x4a6cfa),
-/// so the left half ends before column `8 << zoom` of the image and the
-/// right half starts on it. The sprites are a pixel narrower than the tile
-/// (31, 63 and 127 wide) with their top and bottom corners on the middle
-/// column, one left of the cut, so that column goes to the left half.
-fn split_half(camera: &Camera, image: &Image, segments: u8, half: usize) -> Image {
-    let half_h = (4 << camera.zoom.level()) as usize;
-    let corner = (8 << camera.zoom.level()) as usize;
-    // In the view the cut is level when the wall descends there.
+/// Image sub-rectangle `[ix0, iy0, ix1, iy1]` kept for one half of a split
+/// floor tile (identical to `split_half` without cloning the image).
+fn split_half_rect(
+    camera: &Camera,
+    width: usize,
+    height: usize,
+    segments: u8,
+    half: usize,
+) -> [usize; 4] {
+    let half_h = ((4 << camera.zoom.level()) as usize).min(height);
+    let corner = ((8 << camera.zoom.level()) as usize).min(width);
     let level = (segments & lot::DESCENDING != 0) != (camera.rotation & 1 == 1);
-    // Whether half 0 is the upper (or left) one: test a point well inside
-    // that side, in sixteenths of the tile in the view.
     let [x, y] = unrotate_local(camera, if level { [4, 4] } else { [4, 12] });
     let first = if segments & lot::DESCENDING != 0 {
         x + y < 16
@@ -2290,11 +2497,24 @@ fn split_half(camera: &Camera, image: &Image, segments: u8, half: usize) -> Imag
         x < y
     };
     let upper = first == (half == 0);
+    match (level, upper) {
+        (true, true) => [0, 0, width, half_h],
+        (true, false) => [0, half_h, width, height],
+        (false, true) => [0, 0, corner, height],
+        (false, false) => [corner, 0, width, height],
+    }
+}
+
+/// One half of a floor image for a tile a diagonal wall splits: half 0
+/// holds corner (0, 0) under a descending wall, or corner (0, 1) under an
+/// ascending one.
+#[cfg(test)]
+fn split_half(camera: &Camera, image: &Image, segments: u8, half: usize) -> Image {
+    let [ix0, iy0, ix1, iy1] = split_half_rect(camera, image.width, image.height, segments, half);
     let mut out = image.clone();
     for py in 0..image.height {
         for px in 0..image.width {
-            let before = if level { py < half_h } else { px < corner };
-            if before != upper {
+            if !(ix0..ix1).contains(&px) || !(iy0..iy1).contains(&py) {
                 out.rgba[(py * image.width + px) * 4 + 3] = 0;
             }
         }
