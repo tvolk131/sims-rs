@@ -527,7 +527,7 @@ impl Machine<'_, '_> {
             if fault.object == me {
                 fault.trap
             } else {
-                Trap::Unsupported(format!("Go To Routing Slot: {fault}"))
+                fault.unsupported_in("Go To Routing Slot")
             }
         };
         loop {
@@ -1012,7 +1012,7 @@ impl Machine<'_, '_> {
             if fault.object == me {
                 fault.trap
             } else {
-                Trap::Unsupported(format!("the end of a route: {fault}"))
+                fault.unsupported_in("the end of a route")
             }
         };
         if state == SUCCEEDED {

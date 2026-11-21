@@ -767,8 +767,9 @@ impl Lot {
     /// the original does on a SimAntics error, and the lot goes on. The
     /// errors caught are in [`Update::errors`]. A frame that fails is
     /// skipped and noted in [`Update::frame_errors`]. Any other failure
-    /// halts the lot as [`Lot::step`] does; the [`StepError::Tick`] then
-    /// carries what the step did before it failed.
+    /// ends the step as in [`Lot::step`]. A lot update that fails
+    /// ([`StepError::Tick`]) halts the lot, and carries what the step did
+    /// before it failed.
     ///
     /// Play mode is not the original's behaviour wherever a caught error
     /// comes from something not ported, so a lot stepped this way is not

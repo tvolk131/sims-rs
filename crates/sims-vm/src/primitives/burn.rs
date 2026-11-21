@@ -354,6 +354,17 @@ impl Machine<'_, '_> {
             match fault.nested(me) {
                 Trap::Unsupported(message) => Trap::Unsupported(format!("{context}: {message}")),
                 Trap::Invalid(message) => Trap::Invalid(format!("{context}: {message}")),
+                Trap::Within {
+                    context: inner,
+                    fault,
+                } => Trap::Within {
+                    context: if inner.is_empty() {
+                        context
+                    } else {
+                        format!("{context}: {inner}")
+                    },
+                    fault,
+                },
                 trap => trap,
             }
         };
@@ -385,7 +396,7 @@ impl Machine<'_, '_> {
     fn make_fire(&mut self) -> Result<u16, Trap> {
         self.interpreter()
             .create(self.world, FIRE)
-            .map_err(|fault| Trap::Unsupported(format!("Burn making a fire: {fault}")))
+            .map_err(|fault: crate::fault::Fault| fault.unsupported_in("Burn making a fire"))
     }
 
     /// The place test, then the put with the lot told, or the fire's
@@ -399,7 +410,8 @@ impl Machine<'_, '_> {
         under: Option<u16>,
     ) -> Result<bool, Trap> {
         let interpreter = self.interpreter();
-        let unsupported = |fault| Trap::Unsupported(format!("Burn placing fire {fire}: {fault}"));
+        let unsupported =
+            |fault: crate::fault::Fault| fault.unsupported_in(format!("Burn placing fire {fire}"));
         if !interpreter
             .fits(self.world, fire, position, level)
             .map_err(unsupported)?

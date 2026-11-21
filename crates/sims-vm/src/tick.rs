@@ -265,8 +265,9 @@ pub struct Update {
 /// ([`Update::frame_errors`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkippedFrame {
-    /// The tick the frame was drawn after; 0 for the frame drawn before
-    /// the first tick.
+    /// The tick the frame was drawn after, counted as
+    /// [`crate::boot::Lot::ticks`] counts them, from the load; 0 for the
+    /// frame drawn before the first tick.
     pub after: u32,
     /// Why it failed.
     pub error: String,

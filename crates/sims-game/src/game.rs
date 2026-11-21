@@ -1204,18 +1204,20 @@ fn keep(queue: &mut VecDeque<SoundEvent>, sounds: Vec<SoundEvent>, kept: usize) 
     queue.drain(..over);
 }
 
-/// The lines for one step's caught errors, the step of tick `tick`, in
-/// the order they happened: the frame drawn before the lot's first tick,
-/// the objects' errors in the tick, then the frame drawn after it. A
-/// frame's line starts with its tick, as an object's does, so that the
-/// same failure at other ticks is taken for a repeat ([`Errors::push`]).
+/// The lines for the caught errors of the step that runs the lot's tick
+/// `tick` ([`Lot::ticks`]), in the order they happened: the frame drawn
+/// before the lot's first tick, the objects' errors in the tick, then the
+/// frame drawn after it. A frame's line says which of the two it was,
+/// and not the tick: an object's line starts with the clock's tick count,
+/// which is another count, and the error log takes the same failure at
+/// later ticks for a repeat ([`Errors::push`]).
 fn in_order(tick: u32, errors: &[ScriptError], frames: &[SkippedFrame]) -> Vec<String> {
     let frame = |frame: &SkippedFrame| match frame.after {
-        0 => format!("tick 1, the frame before it was skipped: {}", frame.error),
-        after => format!(
-            "tick {after}, the frame after it was skipped: {}",
+        0 => format!(
+            "the frame before the first tick was skipped: {}",
             frame.error
         ),
+        _ => format!("the frame after the tick was skipped: {}", frame.error),
     };
     let before = frames.iter().filter(|frame| frame.after < tick);
     let after = frames.iter().filter(|frame| frame.after >= tick);
@@ -1372,28 +1374,28 @@ mod tests {
         let first = in_order(1, errors, &frames(&[(1, "a"), (0, "b")]));
         assert_eq!(
             starts(first.clone()),
-            ["tick 1, the f", "tick 1, objec", "tick 1, the f"]
+            ["the frame bef", "tick 1, objec", "the frame aft"]
         );
-        assert_eq!(first[0], "tick 1, the frame before it was skipped: b");
-        assert_eq!(first[2], "tick 1, the frame after it was skipped: a");
+        assert_eq!(first[0], "the frame before the first tick was skipped: b");
+        assert_eq!(first[2], "the frame after the tick was skipped: a");
         // A single frame on the first step says which one it was.
         assert_eq!(
             starts(in_order(1, errors, &frames(&[(1, "a")]))),
-            ["tick 1, objec", "tick 1, the f"]
+            ["tick 1, objec", "the frame aft"]
         );
         assert_eq!(
             starts(in_order(1, errors, &frames(&[(0, "b")]))),
-            ["tick 1, the f", "tick 1, objec"]
+            ["the frame bef", "tick 1, objec"]
         );
         // A step that failed hands back the frame before its tick only.
         assert_eq!(
             in_order(1, &[], &frames(&[(0, "b")])),
-            ["tick 1, the frame before it was skipped: b"]
+            ["the frame before the first tick was skipped: b"]
         );
         // Later steps draw only after the tick.
         assert_eq!(
             in_order(34, &[], &frames(&[(34, "a")])),
-            ["tick 34, the frame after it was skipped: a"]
+            ["the frame after the tick was skipped: a"]
         );
         assert!(in_order(2, &[], &[]).is_empty());
     }
