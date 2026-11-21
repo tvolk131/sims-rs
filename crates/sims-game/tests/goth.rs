@@ -1113,11 +1113,12 @@ fn panel(game: &Game, person: u16) -> Shown {
 /// steps). The pointer moves onto the fridge, which lists its pie; a
 /// press opens it, and a press on Have A Snack queues the action the
 /// listing offered (`Lot::pick`). The action queued is the scripted one.
-/// The lots differ until Mortimer takes the order at step 150: the
-/// listing's check trees ran as him, and left his last result and his
-/// stack frame's words. From then on they are the same lot, step for
-/// step, through the snack's end at step 1136, and play mode catches no
-/// error on the way.
+/// The lots differ until step 205: the listing's check trees and the
+/// entry's check when it is chosen ran as him, and left his last result
+/// and words in his frame storage, which the snack's frames start with
+/// from step 150. From then on they are the same lot, step for step,
+/// through the snack's end at step 1136, and play mode catches no error
+/// on the way.
 #[test]
 fn the_snack_ordered_in_the_window_is_the_scripted_order() {
     let Some(install) = install() else {
@@ -1177,8 +1178,9 @@ fn the_snack_ordered_in_the_window_is_the_scripted_order() {
         )
     };
     assert_eq!(queue(game.lot()), queue(&scripted));
-    // The listing ran the check trees on the window's lot, which left
-    // Mortimer's last result and frame storage changed until step 150.
+    // The listing and the entry's check ran the check trees on the
+    // window's lot, which left Mortimer's last result and frame storage
+    // changed until step 205.
     assert_ne!(game.lot().world().hash(), scripted.world().hash());
     let doing = |lot: &Lot| {
         lot.world().objects[&sim]
@@ -1193,7 +1195,7 @@ fn the_snack_ordered_in_the_window_is_the_scripted_order() {
         let update = scripted.step_play().unwrap();
         assert!(update.errors.is_empty(), "step {step}: {:?}", update.errors);
         let same = game.lot().world().hash() == scripted.world().hash();
-        assert_eq!(same, step >= 150, "step {step}");
+        assert_eq!(same, step >= 205, "step {step}");
         match step {
             150 => assert_eq!(doing(game.lot()), 1),
             // He pays for the snack, whose action is his fifth.
@@ -1551,6 +1553,141 @@ fn the_job_panel_shows_what_the_next_level_needs() {
     data[57] = 2;
     data[18] = 200;
     assert_eq!(needs(&world), [0, 0, 100, 0, 300, 0]);
+}
+
+/// The Goth house is residential, so with Mortimer selected the House
+/// button opens the house panel, silently (0x51bdf2 to 0x51be0c).
+#[test]
+fn the_house_button_opens_the_house_panel_on_the_goths_lot() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&Options {
+        play: true,
+        ..options(install)
+    })
+    .expect("the Goth house opens");
+    assert_eq!(game.run(20), 20);
+    assert!(game.lot().residential());
+    game.resize([800, 600]);
+    game.render();
+    assert!(game.lot().world().selected().is_some());
+    let house = |game: &Game| {
+        game.panel()
+            .iter()
+            .any(|item| matches!(item.kind, Kind::House { .. }))
+    };
+    assert!(!house(&game), "the needs show first");
+    let button = game
+        .panel()
+        .iter()
+        .find(|item| {
+            item.command
+                == Some(sims_ui::command::Command::OpenPanel(
+                    sims_ui::command::Panel::House,
+                ))
+        })
+        .expect("the House button opens its panel")
+        .rect;
+    game.take_sounds();
+    game.press([button.x + button.width / 2, button.y + button.height / 2]);
+    assert!(game.take_sounds().is_empty());
+    game.render();
+    assert!(house(&game));
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
+}
+
+/// The House button's press is checked as the lot is at the press, not
+/// as the frame drew it (0x51bdf2, 0x51be03). With nobody selected, or on
+/// a lot that is not residential, it is refused with `UI_error` for the
+/// interface (0x51be1a) and the panel stays as it was. The panel follows
+/// the selection at the next frame. A help balloon that closes then
+/// whooshes once (0x50fb7f).
+#[test]
+fn the_house_button_is_checked_at_the_press() {
+    use sims_game::hud::{ERROR, Hud, INTERFACE, WHOOSH};
+    use sims_game::pace::Pace;
+    use sims_ui::balloon::Help;
+    use sims_ui::command::{Command, Panel};
+    let Some(install) = install() else {
+        return;
+    };
+    let house = goth_house(&install);
+    let lot = Lot::load(&install, &house, &[3], Frames::default()).expect("the Goth house boots");
+    let opened = open_house(&install, &house).expect("the house opens");
+    let mut hud = Hud::open(
+        &install,
+        &house,
+        &opened.assets,
+        lot.world(),
+        lot.program().autonomy_constants().friendship_threshold,
+    )
+    .expect("the panel opens");
+    let view = View::new([800, 600], [0, 0], opened.rotation);
+    let mut canvas = Canvas::new(800, 600, [0; 3]);
+    let mut draw = |hud: &mut Hud, world: &sims_sim::World| {
+        hud.draw(
+            world,
+            &opened.assets,
+            &view,
+            &Pace::default(),
+            None,
+            &mut canvas,
+        );
+        hud.take_sounds()
+    };
+    let selected = lot.world().clone();
+    assert!(selected.selected().is_some());
+    let mut nobody = selected.clone();
+    for object in nobody.objects.values_mut() {
+        object.selected = false;
+    }
+    let sound = |name: &str| SoundEvent::Play {
+        object: INTERFACE,
+        name: name.into(),
+    };
+
+    assert!(draw(&mut hud, &selected).is_empty());
+    assert_eq!(hud.controls.panel, Some(Panel::Needs));
+    let button = hud
+        .items()
+        .iter()
+        .find(|i| i.command == Some(Command::OpenPanel(Panel::House)))
+        .expect("the House button")
+        .rect;
+    let centre = [button.x + button.width / 2, button.y + button.height / 2];
+    // Drawn with Mortimer selected; nobody is by the press.
+    let refused = Some(Command::Refused { error: true });
+    assert_eq!(hud.press(centre, &nobody, true), refused);
+    assert_eq!(hud.take_sounds(), [sound(ERROR)]);
+    assert_eq!(hud.controls.panel, Some(Panel::Needs));
+    // Selected, on a lot that is not residential.
+    assert_eq!(hud.press(centre, &selected, false), refused);
+    assert_eq!(hud.take_sounds(), [sound(ERROR)]);
+    assert_eq!(hud.controls.panel, Some(Panel::Needs));
+
+    // A balloon open when the selection goes closes at the next frame,
+    // with one whoosh, and no panel is open then.
+    hud.controls.panel = Some(Panel::Personality);
+    hud.controls.help = Some(Help::Sign(1));
+    assert_eq!(draw(&mut hud, &nobody), [sound(WHOOSH)]);
+    assert_eq!((hud.controls.panel, hud.controls.help), (None, None));
+    assert!(draw(&mut hud, &nobody).is_empty());
+    // Drawn with nobody selected; Mortimer is by the press, on the
+    // residential Goth lot, so the house panel opens, silently.
+    assert!(lot.residential());
+    assert_eq!(
+        hud.press(centre, &selected, lot.residential()),
+        Some(Command::OpenPanel(Panel::House))
+    );
+    assert!(hud.take_sounds().is_empty());
+    assert_eq!(hud.controls.panel, Some(Panel::House));
+    assert!(draw(&mut hud, &selected).is_empty());
+    assert!(
+        hud.items()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::House { .. }))
+    );
 }
 
 /// The live panel's Personality button shows the selected Sim's
@@ -2089,7 +2226,8 @@ fn the_recorded_snack_order_replayed_in_the_window_matches_the_recording() {
     run_to(&mut game, 202);
     // The snack's frames hold what the checks left in his stack: the
     // last check tree run there was Have A Snack's (0x1008), when the
-    // pointer reached its entry, not the listing's last (0x1030).
+    // pointer reached its entry and again when it was chosen, not the
+    // listing's last (0x1030).
     let stack = &game.lot().world().objects[&mortimer].stack;
     let locals = |tree: u16| {
         stack
@@ -2343,6 +2481,10 @@ fn the_recorded_cancel_order_replayed_in_the_window_matches_the_recording() {
     let p = person(&game);
     assert_eq!(action(&p.active), (1, bookcase as i16, 4110, 6, 2, 0));
     assert_eq!(p.queue.iter().map(action).collect::<Vec<_>>(), [snack(2)]);
+    // Choosing the entry checked it again (0x5eb433), which leaves his
+    // word 50 at 0 and his last result 1, as recorded.
+    let him = &game.lot().world().objects[&mortimer];
+    assert_eq!((him.data[50], him.last_result), (0, true));
     // The second order's first two pointer moves; his room is counted
     // again in the frame after 316, the update the second one reached.
     run_to(&mut game, &schedule, 310);
@@ -2597,11 +2739,8 @@ fn the_recorded_read_order_replayed_in_the_window_matches_the_recording() {
     run_to(&mut game, &schedule, 186);
     let person = |game: &Game, id: u16| game.lot().world().objects[&id].person.clone().unwrap();
     assert_eq!(person(&game, mortimer).active.uid, 0);
-    // The locals his new frames start with at 187 are what the entry's
-    // check leaves with his frames as they are from 150, so the original
-    // may have checked the entry again after 150. What made it run is
-    // not known (its mousedown ended at 163, its release at 187). Ours
-    // checked it once, at 143 (unverified, not ported).
+    // Choosing the entry checks it again (0x5eb433): the release ended
+    // at 187.
     game.press(read);
     assert!(game.menu().is_none());
     game.hover(recorded([384, 324]));
@@ -2611,6 +2750,18 @@ fn the_recorded_read_order_replayed_in_the_window_matches_the_recording() {
     assert_eq!(action(&p.active), (1, bookcase as i16, 4110, 6, 50, 12));
     assert!(p.queue.is_empty());
     assert!(!last_result(&game));
+    // His new frames start with what that check left in his frame
+    // storage, as recorded.
+    let stack = &game.lot().world().objects[&mortimer].stack;
+    let locals = |tree: u16| {
+        stack
+            .iter()
+            .find(|f| f.tree == tree)
+            .map(|f| f.locals.clone())
+            .unwrap_or_else(|| panic!("a frame of tree {tree}"))
+    };
+    assert_eq!(locals(4116)[1], 254);
+    assert_eq!(locals(4114)[0], 285);
     // Everyone's room is counted again in the frame after 606.
     run_to(&mut game, &schedule, 606);
     for (id, before) in [
@@ -2631,6 +2782,109 @@ fn the_recorded_read_order_replayed_in_the_window_matches_the_recording() {
         assert_eq!(room(&game, id), after, "{id}");
     }
     run_to(&mut game, &schedule, 900);
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
+}
+
+/// Track 2's snack recording with plumb-bob screenshots
+/// (`goth-snack-bob-20261120`) replayed through the window's input layer:
+/// a press on the fridge, then Have A Snack. Its frame watch gives the
+/// frames the original drew, and its write watch on Mortimer's word 50
+/// shows when the original listed a pie and checked an entry, so each
+/// input is given at an update the watches bound (the second pointer
+/// move's, 91, is a choice within its command's 90–93). A scratch
+/// comparison found the lot equal to the recording's after every update
+/// from 1 to 800 except for what
+/// `docs/decisions/20261120-choosing-a-pie-entry-checks-it-again.md`
+/// lists; this test checks the states below.
+#[test]
+fn the_recorded_snack_order_with_bob_shots_replayed_in_the_window_matches_the_recording() {
+    let Some(install) = install() else {
+        return;
+    };
+    let frames = Frames::parse("0,1,2,3,32,62,92,122,152,172,201,223,253+30").expect("a schedule");
+    let schedule = frames.clone();
+    let mut game = Game::open(&Options {
+        frames,
+        ..options(install)
+    })
+    .expect("the Goth house opens");
+    game.resize([800, 600]);
+    let (mortimer, fridge) = (21, 118);
+    assert_eq!(game.lot().world().selected(), Some(mortimer));
+    let last_result = |game: &Game| game.lot().world().objects[&mortimer].last_result;
+    // The first two pointer moves list nothing. The second move's command
+    // ran from 90 to 93, and the original listed nothing at the frame
+    // after 92. The replay moves the pointer at 91, before that frame;
+    // the recording does not say at which of those updates it moved.
+    run_to(&mut game, &schedule, 85);
+    game.hover(recorded([176, 222]));
+    assert_eq!(game.listed(), None);
+    run_to(&mut game, &schedule, 91);
+    game.hover(recorded([176, 210]));
+    run_to(&mut game, &schedule, 93);
+    assert_eq!(game.listed(), None);
+    assert!(last_result(&game));
+    // The third move ended at 120; the original listed the fridge's pie
+    // after 122, and Mortimer's last result goes to 0 at 123.
+    run_to(&mut game, &schedule, 122);
+    game.hover(recorded([176, 198]));
+    assert_eq!(game.listed(), Some((mortimer, fridge)));
+    run_to(&mut game, &schedule, 123);
+    assert!(!last_result(&game));
+    // The press listed the pie again after 152; the harness saw the same
+    // four entries.
+    run_to(&mut game, &schedule, 152);
+    assert!(last_result(&game));
+    game.press(recorded([176, 198]));
+    game.render();
+    let pie: Vec<String> = game
+        .menu()
+        .expect("the fridge's pie is open")
+        .labels()
+        .into_iter()
+        .map(|(text, _)| text.to_string())
+        .collect();
+    assert_eq!(
+        pie,
+        [
+            "Have A Snack",
+            "Have Quick Breakfast",
+            "Have Breakfast",
+            "Serve Breakfast"
+        ]
+    );
+    run_to(&mut game, &schedule, 153);
+    assert!(!last_result(&game));
+    // The original checked Have A Snack when the pointer reached it,
+    // after 172, and again when the release chose it, after 223.
+    run_to(&mut game, &schedule, 172);
+    let snack = pie_entry(&game, "Have A Snack");
+    game.hover(snack);
+    run_to(&mut game, &schedule, 173);
+    assert!(last_result(&game));
+    run_to(&mut game, &schedule, 223);
+    // The check's effects here are not told apart from the order's; the
+    // Read and cancel tests pin them.
+    game.press(snack);
+    assert!(game.menu().is_none());
+    game.hover(recorded([200, 123]));
+    // Taken at once, as recorded at 224.
+    run_to(&mut game, &schedule, 224);
+    let p = game.lot().world().objects[&mortimer]
+        .person
+        .clone()
+        .unwrap();
+    assert_eq!(action(&p.active), (1, fridge as i16, 4103, 1, 50, 12));
+    assert!(p.queue.is_empty());
+    // His room is counted again in the frame after 523.
+    run_to(&mut game, &schedule, 523);
+    assert_eq!(room(&game, mortimer), 0x429a_aaab);
+    run_to(&mut game, &schedule, 524);
+    assert_eq!(room(&game, mortimer), 0x4234_0000);
+    // After 643 the original listed a pie under the still pointer, most
+    // likely the plumb bob's (unverified): Mortimer's word 50 goes to 1
+    // at 644. Ours lists nothing.
+    run_to(&mut game, &schedule, 800);
     assert_eq!(game.caught(), 0, "{:?}", game.errors());
 }
 
