@@ -431,13 +431,10 @@ fn load_snapshot(
         return Err(format!("no snapshot file at {}", path.display()).into());
     }
     let store = sims_sim::Snapshots::open(path)?;
-    let world = store
-        .load(name)?
+    let (world, floor_rotation) = store
+        .load_with_floor_rotation(name)?
         .ok_or_else(|| format!("{} holds no world named {name}", path.display()))?;
-    let floor_rotation = store
-        .load_floor_rotation(name)?
-        .unwrap_or(fallback_rotation);
-    Ok((world, floor_rotation))
+    Ok((world, floor_rotation.unwrap_or(fallback_rotation)))
 }
 
 /// Builds the viewer's render [`Lot`] with the house file's saved `HOUS 0`
