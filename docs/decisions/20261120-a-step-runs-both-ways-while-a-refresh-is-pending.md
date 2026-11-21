@@ -296,18 +296,30 @@ What is not ported:
   `$Local`, `$Attrib`, `$NameAttrib`, `$NameLocal` and `$TokenNameLocal`
   run between it and `$NeighborLocal`'s (0x44c1f2 to 0x44c4a2). The
   tokens were matched to their strings through the static constructors
-  (0x44bc00 to 0x44bf1a) in the memory capture. None of these passes is
-  ported, but they matter only when the stack object names a neighbor
-  record. A pass that writes a name may write `$Neighbor`, and one before
-  `$Object`'s may write `$Object`. `$Local` and `$Attrib` write a number
-  (0x46f941, 0x4557c0). A number cannot write either token, but it can
-  make a `$NeighborLocal` token out of text that already holds
-  `$Neighbor` (`$NeighborLocal:$Local:0`), and that token's pass may then
-  take `$Neighbor` out (Sol's sixth check). So a text that holds a name
-  token, or a number token together with `$Neighbor`, leaves what is
-  found unknown. The dialog fails loudly where that decides the
-  portrait. Test:
-  `a_token_of_a_pass_before_the_neighbors_that_may_decide_the_portrait_fails_loudly`.
+  (0x44bc00 to 0x44bf1a) in the memory capture.
+  - `$Me` is ported, because the Goth day needs it: at 7321 the message
+    is "What vision, what talent! $Me received one Creativity Skill
+    Point.", with Bella both running the tree and as the stack object.
+    The formatter's `this` is the record's object (0x436200), which is
+    the object running the tree. Its definition (+0x11c) is named by
+    0x4573d9, as for `$Object`, so every entry is tried in the token's
+    place. Each token is replaced from the start of the text, then from
+    one past each place replaced (0x4558a0, 0x455750). A name that holds
+    `$Me` would be found again, and is taken as not known.
+  - The rest are not ported. They matter only when the stack object
+    names a neighbor record. A pass that writes a name may write
+    `$Neighbor`, and one before `$Object`'s may write `$Object`.
+    `$Local` and `$Attrib` write a number (0x46f941, 0x4557c0). A number
+    cannot write either token, but it can make a `$NeighborLocal` token
+    out of text that already holds `$Neighbor` (`$NeighborLocal:$Local:0`),
+    and that token's pass may then take `$Neighbor` out (Sol's sixth
+    check). So a text that holds a name token, or a number token together
+    with `$Neighbor`, leaves what is found unknown. The dialog fails
+    loudly where that decides the portrait.
+
+  Tests:
+  `a_token_of_a_pass_before_the_neighbors_that_may_decide_the_portrait_fails_loudly`,
+  `me_is_replaced_by_the_running_objects_name_before_object_is`.
 - **Other builders.** Only the dialog's builds are counted. The household
   panel draws the family's portraits, so a portrait of a family member's
   type with nobody of it on the lot fails loudly. A type made while the

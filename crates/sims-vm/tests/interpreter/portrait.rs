@@ -852,10 +852,11 @@ fn an_object_name_that_may_hold_a_neighbor_token_fails_loudly() {
 #[test]
 fn a_token_of_a_pass_before_the_neighbors_that_may_decide_the_portrait_fails_loudly() {
     // The formatter's passes before `$Neighbor`'s (0x44bf1a) that are not
-    // ported: `$FamilyAssets`, `$Family` and `$Me` before `$Object`'s;
-    // `$Local`, `$Attrib`, `$NameAttrib`, `$NameLocal` and
-    // `$TokenNameLocal` between it and `$NeighborLocal`'s. A name one
-    // writes may hold `$Neighbor` (or, before `$Object`'s, `$Object`).
+    // ported: `$FamilyAssets` and `$Family` before `$Object`'s; `$Local`,
+    // `$Attrib`, `$NameAttrib`, `$NameLocal` and `$TokenNameLocal` between
+    // it and `$NeighborLocal`'s. A name one writes may hold `$Neighbor`
+    // (or, before `$Object`'s, `$Object`). `$Me` is ported, but the lamp
+    // running the tree here has no names, so it stands for one not known.
     // A number cannot, but `$Local` in `$NeighborLocal:$Local:0` makes a
     // `$NeighborLocal` token whose pass may take `$Neighbor` out (0x44c257,
     // 0x44c590). The person's own name is plain.
@@ -913,6 +914,76 @@ fn a_token_of_a_pass_before_the_neighbors_that_may_decide_the_portrait_fails_lou
     message(&mut fx, "$Me");
     assert_eq!(fx.run_with(LAMP, 4096, SIM as i16, &[], 1000), Ok(true));
     assert_eq!(fx.world.portraits, [WIDGET].into());
+}
+
+#[test]
+fn me_is_replaced_by_the_running_objects_name_before_object_is() {
+    // `$Me` (0x44c0fc) is replaced by the name of the object running the
+    // tree (the formatter's `this`, 0x436200), here the lamp, before
+    // `$Object`'s pass: a name holding `$Object` or `$Neighbor` is found
+    // by the passes after it. The label (string 2, `$Neighbor`) comes
+    // before the message.
+    const LAMP_NAMES: u16 = 2001;
+    let with_lamp_names = |names: Option<Vec<(u8, &str)>>| {
+        let mut fx = text_dialog((2, 0, 1), Some(vec![(1, "Grim")]));
+        fx.program
+            .libraries
+            .get_mut(&LAMP_FILE)
+            .unwrap()
+            .strings
+            .get_mut(&301)
+            .unwrap()[0] = "$Me is here".to_owned();
+        fx.words(LAMP_FILE)[41] = LAMP_NAMES as i16;
+        if let Some(names) = names {
+            fx.program
+                .libraries
+                .get_mut(&LAMP_FILE)
+                .unwrap()
+                .catalog_strings
+                .insert(
+                    LAMP_NAMES,
+                    names.into_iter().map(|(l, t)| (l, t.to_owned())).collect(),
+                );
+        }
+        fx
+    };
+    for (names, shown) in [
+        (vec![(1, "Lamp"), (2, "Lampe")], WIDGET),
+        (vec![(1, "the $Object")], SIM_GUID),
+        (vec![(1, "the $Object $Neighbor")], WIDGET),
+    ] {
+        let mut fx = with_lamp_names(Some(names.clone()));
+        assert_eq!(fx.run_with(LAMP, 4096, SIM as i16, &[], 1000), Ok(true));
+        assert_eq!(fx.world.portraits, [shown].into(), "{names:?}");
+    }
+    // Each token is replaced from one past the place before (0x44c150):
+    // a name `x$` before `Me` makes `$Me` again, and that one's name then
+    // makes `$Object`.
+    let mut fx = with_lamp_names(Some(vec![(1, "x$")]));
+    fx.program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .strings
+        .get_mut(&301)
+        .unwrap()[0] = "$MeMeObject".to_owned();
+    assert_eq!(fx.run_with(LAMP, 4096, SIM as i16, &[], 1000), Ok(true));
+    assert_eq!(fx.world.portraits, [SIM_GUID].into());
+    // Names that disagree, a name that holds `$Me` (found again), and
+    // names that are not known fail where they decide the portrait.
+    for names in [
+        Some(vec![(1, "Lamp"), (2, "$Object")]),
+        Some(vec![(1, "my $Me")]),
+        None,
+    ] {
+        let mut fx = with_lamp_names(names.clone());
+        let fault = fx
+            .run_with(LAMP, 4096, SIM as i16, &[], 1000)
+            .unwrap_err()
+            .to_string();
+        assert!(fault.contains("0x44c65f"), "{names:?}: {fault}");
+        assert!(fx.world.portraits.is_empty());
+    }
 }
 
 #[test]
