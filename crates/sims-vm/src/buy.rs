@@ -275,6 +275,18 @@ impl Interpreter<'_> {
             if self.try_place_buy_at(world, cursor, pos, level, retained)? {
                 return Ok(cursor.valid);
             }
+            // Native `0x485cee` → `0x421e72` → `0x421fc3` (`0x422c2f`): even
+            // when the held object fails snapped placement, `"Tile Cursor"` is
+            // still placed at `pos` before `try_wall_auto_rotate` (`0x48736b`)
+            // runs its first turn.
+            let cursor_place = Place {
+                on_lot: true,
+                position: pos,
+                container: None,
+                slot: -1,
+                level,
+            };
+            self.put(world, cursor.cursor, cursor_place, true)?;
             if self.try_wall_auto_rotate(world, cursor, pos, level)? {
                 return Ok(cursor.valid);
             }
@@ -669,10 +681,10 @@ impl Interpreter<'_> {
 
     /// Hides the cursor and held object off the lot while the pointer leaves
     /// the house view (`0x487d4e` → `0x487d60` → `0x421963`, calling
-    /// `TakeOff(1)` unconditionally whenever a cursor exists).
+    /// `TakeOff(1)` unconditionally whenever a cursor exists while preserving
+    /// the saved coordinates read by `Turn` `0x421be4`).
     pub fn buy_hide(&self, world: &mut World, cursor: &mut BuyCursor) -> Result<(), Fault> {
         self.take_off_cursor_and_held_unconditional(world, cursor)?;
-        cursor.position = [-16, -16, cursor.position[2]];
         cursor.valid = false;
         cursor.container = None;
         Ok(())
@@ -868,10 +880,11 @@ impl Interpreter<'_> {
         Ok(())
     }
 
-    /// Cancels an active Buy Mode purchase (`0x487105`): deletes both the
-    /// `"Tile Cursor"` and the unplaced catalog object without charging funds.
+    /// Cancels an active Buy Mode purchase (`0x487105` → `0x487138`): runs
+    /// unconditional `TakeOff(1)` on both the `"Tile Cursor"` and the unplaced
+    /// catalog object before deleting them without charging funds.
     pub fn buy_cancel(&self, world: &mut World, cursor: &BuyCursor) -> Result<(), Fault> {
-        self.remove_cursor_and_held(world, cursor)?;
+        self.take_off_cursor_and_held_unconditional(world, cursor)?;
         self.remove_now(world, cursor.cursor)?;
         self.remove_now(world, cursor.held)?;
         Ok(())

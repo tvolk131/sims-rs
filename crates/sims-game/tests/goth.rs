@@ -5339,13 +5339,22 @@ fn buy_mode_places_rotates_cancels_and_returns_to_live_mode() {
 
     game.hover([300, 520]);
     assert!(!game.buy_cursor().expect("cursor kept while hidden").valid);
-    assert_eq!(game.buy_cursor().unwrap().position[0], -16);
-    assert_eq!(game.lot().world().objects[&held_first].position[0], -16);
-    // Rotating while hidden must keep both objects off the lot.
-    assert!(game.rotate_held(true));
-    assert!(!game.buy_cursor().unwrap().valid);
+    assert_eq!(game.buy_cursor().unwrap().position, [584, 472, 1]);
     assert_eq!(game.lot().world().objects[&held_first].position[0], -16);
     assert_eq!(game.lot().world().objects[&cursor_first].position[0], -16);
+    // Native `0x487d4e` preserves the saved coordinates on the hidden cursor
+    // and `0x486b9e` consumes `.`/`,` whenever the cursor exists, turning at
+    // those saved coordinates (`0x421be4`).
+    assert!(game.rotate_held(true));
+    assert_eq!(game.lot().world().objects[&held_first].data[1], 4);
+    assert_eq!(
+        game.lot().world().objects[&held_first].position,
+        [584, 472, 1]
+    );
+    assert_eq!(
+        game.lot().world().objects[&cursor_first].position,
+        [584, 472, 1]
+    );
 
     assert!(game.cancel_buy());
     assert!(game.buy_cursor().is_none());
@@ -6162,13 +6171,40 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
         game.lot().world().objects[&game.buy_cursor().unwrap().held].data[1],
         4
     );
-    // Move onto the catalog panel (`0x487d4e`), then return to the lawn
-    // (`0x487d3d` -> `0x486f5a`): preview resets to stored facing `2`.
+    // Move onto the catalog panel (`0x487d4e`): saved coordinates remain intact
+    // for `rotate_held` (`0x486b9e`), then returning to the lawn
+    // (`0x487d3d` -> `0x486f5a`) recreates the preview at stored facing `2`.
+    let saved_pos = game.buy_cursor().unwrap().position;
     game.hover([300, 520]);
+    assert_eq!(game.buy_cursor().unwrap().position, saved_pos);
+    assert!(game.rotate_held(true));
     game.hover(floor_spot);
     let reentered_chair = game.buy_cursor().unwrap().held;
     assert_eq!(game.lot().world().objects[&reentered_chair].data[1], 2);
     game.press(floor_spot);
     game.release(floor_spot);
     assert_eq!(game.lot().world().objects[&reentered_chair].data[1], 2);
+
+    // Committed facing persists across switching to Live and back to Buy
+    // (`0x487191` retains `tool[0x12]` and `tool[0x10]` for `0x486f5a`).
+    game.press([437, 523]);
+    game.release([437, 523]);
+    game.hover([555, 420]);
+    assert!(game.rotate_held(true)); // 2 -> 4
+    let persisted_chair = game.buy_cursor().unwrap().held;
+    assert_eq!(game.lot().world().objects[&persisted_chair].data[1], 4);
+    game.press([555, 420]);
+    game.release([555, 420]);
+    assert_eq!(game.lot().world().objects[&persisted_chair].data[1], 4);
+    game.set_mode(Mode::Live);
+    game.set_mode(Mode::Buy);
+    game.press([258, 524]); // Seating
+    game.release([258, 524]);
+    game.press([437, 523]); // Werkbunnst Chair
+    game.release([437, 523]);
+    game.hover([535, 410]);
+    assert_eq!(
+        game.lot().world().objects[&game.buy_cursor().unwrap().held].data[1],
+        4
+    );
 }

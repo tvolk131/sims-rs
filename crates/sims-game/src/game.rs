@@ -1788,9 +1788,9 @@ impl Game {
         self.hud.controls.expanded = true;
         self.hud.controls.help = None;
         self.hud.buy_state.reset();
+        // Native `0x487191` clears the active selection/cursor while retaining
+        // `buy_last_guid` (`tool[0x12]`) and `buy_facing` (`tool[0x10]`).
         self.buy_in_house = false;
-        self.buy_last_guid = None;
-        self.buy_facing = None;
         if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
             self.blink_dirty = true;
         }
