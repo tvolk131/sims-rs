@@ -384,10 +384,13 @@ impl Machine<'_, '_> {
         // reloads (including runtime-made characters registered via 0x4e8add)
         // and dirty rebuilds whose 0x4e9706 no-tile failure falls back to
         // 0x4e9338.
+        let is_person = crate::interpreter::object_definition(self.catalog, self.world, guid)
+            .is_some()
+            && self.definition_words(guid)?[TYPE] == PERSON_TYPE;
         let has_generated_2002 = self
             .portrait_file(guid)
             .is_some_and(|file| self.world.generated_portrait_2002.contains(&file));
-        if has_generated_2002 && self.in_portrait_table(guid)? {
+        if is_person && has_generated_2002 && self.in_portrait_table(guid)? {
             if !self.world.dirty_portraits.contains(&guid) {
                 self.world.portraits.insert(guid);
                 return Ok(());

@@ -11,10 +11,11 @@ use crate::create_person::visitors;
 use crate::factory::WIDGET;
 use crate::person_factory::equip;
 use crate::support::*;
-use sims_content::Object as CatalogObject;
+use sims_content::{Object as CatalogObject, Wardrobe};
 use sims_sim::PortraitFile;
 use sims_sim::neighbors::{Family, Neighbor};
 use sims_vm::Trap;
+use std::collections::BTreeMap;
 
 /// UI Effect (opcode 34).
 const UI_EFFECT: u16 = 34;
@@ -952,4 +953,230 @@ fn modes_0_to_2_validate_variable_reads_and_guard_global_34_while_modes_3_and_up
             "mode {mode} global 34"
         );
     }
+}
+
+#[test]
+fn make_new_character_wardrobe_head_binding_drives_ui_effect_render_and_writeback() {
+    const TEMPLATE_PERSON: u32 = 0x7fd9_6b54;
+    const TEMPLATE_DOG: u32 = 0x4a70_df92;
+
+    let setup = |species: u8,
+                 template: u32,
+                 suits: &[&str],
+                 textures: &[&str],
+                 head_suits: &[&str]|
+     -> (Fixture, i16, u32) {
+        let (mut fx, _, _) = visitors();
+        fx.program.expansions = 0xffff;
+        fx.world.rooms.rooms.get_mut(&1).unwrap().occupied = true;
+        let tpl_file = fx.add_type(template, 2, 4096, 4097);
+        fx.add(
+            tpl_file,
+            4096,
+            tree(vec![
+                assign(scope::MY_DATA, 4, scope::LITERAL, 1, 1),
+                assign(scope::MY_DATA, 42, scope::LITERAL, 2, RETURN_TRUE),
+            ]),
+        );
+        fx.add(
+            tpl_file,
+            4097,
+            tree(vec![
+                assign(scope::PARAMETERS, 0, scope::LITERAL, 10, 1),
+                ins(0, 0, 0, [0; 8]),
+            ]),
+        );
+        let skel_name = if species == 1 { "dog" } else { "adult" };
+        equip(&mut fx, template, skel_name, 12);
+        // TemplatePerson.iff / TemplateDog.iff have empty suit rows (no HEAD
+        // binding on the template itself).
+        fx.program.people.portrait_head.remove(&template);
+        fx.program.people.profiles.get_mut(&template).unwrap().tones = vec!["lgt".into()];
+        fx.program.people.head_suits = head_suits.iter().map(|s| s.to_string()).collect();
+        fx.program.wardrobe = Some(Wardrobe {
+            suits: suits.iter().map(|s| s.to_string()).collect(),
+            textures: textures.iter().map(|s| s.to_string()).collect(),
+            errors: BTreeMap::new(),
+        });
+
+        // Execute opcode 19 (Make New Character): skin=0 ("lgt"), age=27, sex=0 (male),
+        // storing the resulting neighbor record (stack object) in global 36.
+        fx.add(
+            LAMP_FILE,
+            4098,
+            tree(vec![
+                assign(scope::LOCALS, 0, scope::LITERAL, 0, 1),
+                assign(scope::LOCALS, 1, scope::LITERAL, 27, 2),
+                assign(scope::LOCALS, 2, scope::LITERAL, 0, 3),
+                ins(19, 4, RETURN_FALSE, [0, 1, 2, species, 0, 0, 0, 0]),
+                assign(scope::GLOBAL, 36, scope::STACK_OBJECT, 0, RETURN_TRUE),
+            ]),
+        );
+        assert_eq!(fx.run_with(LAMP, 4098, 0, &[], 1000), Ok(true));
+        let record = fx.world.globals[36];
+        let guid = fx.world.neighbors.get(record).unwrap().guid;
+        (fx, record, guid)
+    };
+
+    // 1. Human with all matching head suits binding "HEAD": UI Effect renders,
+    // caches the portrait, and persists BMP_ 2002 to the made character's file.
+    let (mut fx, record, guid) = setup(
+        0,
+        TEMPLATE_PERSON,
+        &["b001mafit_01", "c001ma_bob"],
+        &["b001mafitlgt_01.bmp", "c001malgt_bob.bmp"],
+        &["c001ma_bob"],
+    );
+    let made_file = fx.world.characters.made[&guid].file;
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
+        Ok(true)
+    );
+    assert_eq!(fx.world.portraits, [guid].into());
+    assert!(
+        fx.world
+            .generated_portrait_2002
+            .contains(&PortraitFile::Made(made_file))
+    );
+
+    // 2. Human with NO matching head or body suit binding "HEAD": UI Effect
+    // creates and removes the temporary Sim (advancing CRT RNG) and returns
+    // true without caching or writing BMP_ 2002.
+    let (mut fx, record, guid) = setup(
+        0,
+        TEMPLATE_PERSON,
+        &["b001mafit_01", "c001ma_bob"],
+        &["b001mafitlgt_01.bmp", "c001malgt_bob.bmp"],
+        &[],
+    );
+    let crt_before = fx.world.crt_rng;
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
+        Ok(true)
+    );
+    assert_ne!(fx.world.crt_rng, crt_before);
+    assert!(!fx.world.portraits.contains(&guid));
+    assert!(fx.world.generated_portrait_2002.is_empty());
+
+    // 3. Human with mixed head suits (one binds "HEAD", one does not) and
+    // non-HEAD body: UI Effect fails loudly because the pick depends on
+    // unmodeled wardrobe order.
+    let (mut fx, record, _) = setup(
+        0,
+        TEMPLATE_PERSON,
+        &["b001mafit_01", "c001ma_bob", "c002ma_nohead"],
+        &[
+            "b001mafitlgt_01.bmp",
+            "c001malgt_bob.bmp",
+            "c002malgt_nohead.bmp",
+        ],
+        &["c001ma_bob"],
+    );
+    let res = run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1);
+    assert!(
+        matches!(trap(res), Trap::Unsupported(ref m) if m.contains("0x4e7824")),
+        "mixed wardrobe should fail loudly in UI Effect"
+    );
+
+    // 4. Pet (species 1, TemplateDog) with all matching dog bodies binding
+    // "HEAD": UI Effect renders, caches, and writes BMP_ 2002.
+    let (mut fx, record, guid) = setup(
+        1,
+        TEMPLATE_DOG,
+        &["b001dog_01"],
+        &["b001dog_01.bmp"],
+        &["b001dog_01"],
+    );
+    let made_file = fx.world.characters.made[&guid].file;
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record, 1),
+        Ok(true)
+    );
+    assert_eq!(fx.world.portraits, [guid].into());
+    assert!(
+        fx.world
+            .generated_portrait_2002
+            .contains(&PortraitFile::Made(made_file))
+    );
+}
+
+#[test]
+fn dialog_does_not_reload_shared_writeback_when_winning_definition_is_not_a_person() {
+    // 0x43639e -> 0x4575d2: Dialog checks that the winning definition is a
+    // person BEFORE calling 0x4e9753 / 0x4e92a8. Even if an earlier person
+    // definition put `shared_guid` in 0x6f2698 and another person in the same
+    // IFF persisted BMP_ 2002, Dialog skips the reload when the winning
+    // definition for `shared_guid` is a non-person.
+    let (mut fx, file, record1) = visitors();
+    let shared_guid = 0x0000_5556u32;
+
+    // Earlier person definition (puts shared_guid in 0x6f2698 via 0x4e8b3d).
+    let mut person_words = *fx.words(file);
+    person_words[14] = shared_guid as u16 as i16;
+    person_words[15] = (shared_guid >> 16) as u16 as i16;
+    // Later non-person definition in the same IFF (overwrites by_guid).
+    let mut obj_words = person_words;
+    obj_words[9] = 4; // normal object, not person (2)
+    {
+        let lib = fx.program.libraries.get_mut(&file).unwrap();
+        lib.definitions.insert(129, person_words);
+        lib.definitions.insert(130, obj_words);
+        lib.definition_order.extend([129, 130]);
+    }
+    fx.catalog.objects.push(CatalogObject {
+        guid: shared_guid,
+        resource: file,
+        chunk: 129,
+        kind: 2,
+        master: 0,
+    });
+    let winner_idx = fx.catalog.objects.len();
+    fx.catalog.objects.push(CatalogObject {
+        guid: shared_guid,
+        resource: file,
+        chunk: 130,
+        kind: 4,
+        master: 0,
+    });
+    fx.catalog.by_guid.insert(shared_guid, winner_idx);
+    fx.world.neighbors.slots.push(Some(Neighbor {
+        guid: shared_guid,
+        id: 60,
+        data: vec![0; 88],
+        relationships: Vec::new(),
+        friends: 0,
+        revision: 0,
+        stale: false,
+    }));
+    let shared_record = fx.world.neighbors.slots.len() as i16;
+
+    // UI Effect on WIDGET persists BMP_ 2002 into `file`.
+    assert_eq!(
+        run_ui_effect(&mut fx, LAMP, LAMP_FILE, 1, scope::LITERAL, record1, 1),
+        Ok(true)
+    );
+    assert!(
+        fx.world
+            .generated_portrait_2002
+            .contains(&PortraitFile::Resource(file))
+    );
+
+    // Dialog (opcode 36, non-blocking inform, icon mode 2 = neighbor in stack
+    // object) on `shared_record` must NOT reload `file`'s BMP_ 2002 because
+    // the winning definition for `shared_guid` has type 4 != 2.
+    fx.add(
+        LAMP_FILE,
+        4099,
+        tree(vec![ins(
+            36,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [0, 0, 0, 0, 0, 0, 0, 5],
+        )]),
+    );
+    assert_eq!(fx.run_with(LAMP, 4099, shared_record, &[], 1000), Ok(true));
+    assert!(
+        !fx.world.portraits.contains(&shared_guid),
+        "Dialog must skip 0x4e92a8 when the winning definition is a non-person (0x43639e)"
+    );
 }

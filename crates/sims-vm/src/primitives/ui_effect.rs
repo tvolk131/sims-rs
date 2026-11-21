@@ -220,16 +220,16 @@ impl Machine<'_, '_> {
 
     /// Whether the renderer (`0x4e725f` → `0x4e7817` → `0x4e810d` →
     /// `0x4e81a4` → `0x431726` → `0x4e7824`) finds a case-sensitive `"HEAD"`
-    /// binding for `guid`. Never defaults missing metadata to `true`:
-    /// - checks `People::portrait_head[guid]` first;
+    /// binding for `guid`. Returns `Some(true)` / `Some(false)` when known,
+    /// or `None` when a `Make New Character` wardrobe pick could go either way
+    /// depending on unmodeled wardrobe order. Never defaults missing metadata
+    /// to `true`:
     /// - for runtime-made characters (`World::characters.made`), checks body
     ///   strings 1 and 2 in `Character::strings` against `People::head_suits`
-    ///   when present, otherwise falls back to `People::portrait_head[template]`;
-    /// - returns `false` when no `"HEAD"` binding is confirmed.
-    fn can_render_portrait(&self, guid: u32) -> bool {
-        if let Some(&has_head) = self.program.people.portrait_head.get(&guid) {
-            return has_head;
-        }
+    ///   first, then `World::made_portrait_head`, then `People::portrait_head`
+    ///   for `guid` or `made.template`;
+    /// - for catalog types, checks `People::portrait_head[guid]`.
+    pub(crate) fn portrait_head_status(&self, guid: u32) -> Option<bool> {
         if let Some(made) = self.world.characters.made.get(&guid) {
             let mut has_suit_override = false;
             for row in [1usize, 2] {
@@ -245,22 +245,48 @@ impl Machine<'_, '_> {
                         && suit != "none"
                         && self.program.people.head_suits.contains(&suit)
                     {
-                        return true;
+                        return Some(true);
                     }
                 }
             }
             if has_suit_override {
-                return false;
+                return Some(false);
             }
-            return self
-                .program
+            if let Some(&status) = self.world.made_portrait_head.get(&guid) {
+                return status;
+            }
+            if let Some(&has_head) = self.program.people.portrait_head.get(&guid) {
+                return Some(has_head);
+            }
+            return Some(
+                self.program
+                    .people
+                    .portrait_head
+                    .get(&made.template)
+                    .copied()
+                    .unwrap_or(false),
+            );
+        }
+        Some(
+            self.program
                 .people
                 .portrait_head
-                .get(&made.template)
+                .get(&guid)
                 .copied()
-                .unwrap_or(false);
-        }
-        false
+                .unwrap_or(false),
+        )
+    }
+
+    /// Resolves [`Machine::portrait_head_status`] for portrait rendering,
+    /// failing loudly if a `Make New Character` pick has an unknown `"HEAD"`
+    /// binding.
+    fn can_render_portrait(&self, guid: u32) -> Result<bool, Trap> {
+        self.portrait_head_status(guid).ok_or_else(|| {
+            Trap::Unsupported(format!(
+                "UI Effect's portrait of runtime-made type 0x{guid:08X} (0x4e7824): whether the \
+                 wardrobe pick binds HEAD depends on unmodeled wardrobe order"
+            ))
+        })
     }
 
     /// Whether the winning definition's file for `guid` is writable
@@ -306,7 +332,7 @@ impl Machine<'_, '_> {
                 .is_some_and(|object| object.guid == guid)
         });
         if on_lot {
-            if !self.can_render_portrait(guid) {
+            if !self.can_render_portrait(guid)? {
                 return Ok(false);
             }
             self.world.portraits.insert(guid);
@@ -367,7 +393,7 @@ impl Machine<'_, '_> {
         let placed = built
             .portrait_put_outcome(&mut copy, id)
             .map_err(|fault| fault.trap)?;
-        let rendered = placed && self.can_render_portrait(guid);
+        let rendered = placed && self.can_render_portrait(guid)?;
         if rendered {
             // 0x4e8d14 -> 0x4e899e caches the portrait and clears dirty, and
             // 0x4e8d2e -> 0x4e9000 stages BMP_ 2002 BEFORE removing the

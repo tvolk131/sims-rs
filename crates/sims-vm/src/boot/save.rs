@@ -27,7 +27,7 @@ use super::Lot;
 use crate::Answers;
 use serde::{Deserialize, Serialize};
 use sims_sim::{PortraitFile, World};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The version of [`Saved::encode`]'s layout: the fields of [`Saved`],
 /// their order and their types (postcard is not self-describing). Bump it
@@ -35,10 +35,10 @@ use std::collections::BTreeSet;
 /// by [`sims_sim::SNAPSHOT_FORMAT`], which is written too. A save of
 /// another version is refused, not migrated. Layout 2 keeps each pending
 /// dialog answer's bitmap ID ([`crate::Answer`]); layout 3 keeps the
-/// house view's centre; layout 5 keeps [`World::dirty_portraits`] and
-/// [`World::generated_portrait_2002`] keyed by [`PortraitFile`]
-/// (superseding pre-merge layout 4).
-pub const FORMAT: u32 = 5;
+/// house view's centre; layout 6 keeps [`World::dirty_portraits`],
+/// [`World::generated_portrait_2002`] keyed by [`PortraitFile`], and
+/// [`World::made_portrait_head`] (superseding pre-merge layouts 4 and 5).
+pub const FORMAT: u32 = 6;
 
 /// A lot as it stood between two steps ([`Lot::save`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,11 +55,13 @@ pub struct Saved {
     loaded: [u8; 32],
     /// Format 3 on.
     view_centre: Option<[i8; 2]>,
-    /// Format 4 on: portrait dirty flags (`0x4e895e`) and generated `BMP_`
-    /// 2002 writebacks (`0x4e9000`), which [`World::encode`] omits to keep
-    /// snapshot format 31's wire bytes unchanged.
+    /// Format 6 on: portrait dirty flags (`0x4e895e`), generated `BMP_` 2002
+    /// writebacks (`0x4e9000`), and runtime-made character `"HEAD"` binding
+    /// outcomes (`0x4e7824`), which [`World::encode`] omits to keep snapshot
+    /// format 31's wire bytes unchanged.
     dirty_portraits: BTreeSet<u32>,
     generated_portrait_2002: BTreeSet<PortraitFile>,
+    made_portrait_head: BTreeMap<u32, Option<bool>>,
 }
 
 /// Why a lot could not be saved or restored.
@@ -140,6 +142,7 @@ impl Saved {
         let mut saved: Self = postcard::from_bytes(body).map_err(|e| format(e.to_string()))?;
         saved.world.dirty_portraits = saved.dirty_portraits.clone();
         saved.world.generated_portrait_2002 = saved.generated_portrait_2002.clone();
+        saved.world.made_portrait_head = saved.made_portrait_head.clone();
         Ok(saved)
     }
 }
@@ -172,6 +175,7 @@ impl Lot {
             view_centre: self.view_centre,
             dirty_portraits: self.world.dirty_portraits.clone(),
             generated_portrait_2002: self.world.generated_portrait_2002.clone(),
+            made_portrait_head: self.world.made_portrait_head.clone(),
         })
     }
 
@@ -222,9 +226,11 @@ mod tests {
             .generated_portrait_2002
             .insert(PortraitFile::Resource(7));
         world.generated_portrait_2002.insert(PortraitFile::Made(3));
+        world.made_portrait_head.insert(0x5555_6666, Some(true));
         let saved = Saved {
             dirty_portraits: world.dirty_portraits.clone(),
             generated_portrait_2002: world.generated_portrait_2002.clone(),
+            made_portrait_head: world.made_portrait_head.clone(),
             world,
             ticks: 1,
             start: 0,
@@ -246,6 +252,10 @@ mod tests {
         assert_eq!(
             decoded.world().generated_portrait_2002,
             BTreeSet::from([PortraitFile::Resource(7), PortraitFile::Made(3)])
+        );
+        assert_eq!(
+            decoded.world().made_portrait_head,
+            BTreeMap::from([(0x5555_6666, Some(true))])
         );
     }
 }

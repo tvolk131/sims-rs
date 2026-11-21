@@ -166,6 +166,55 @@ impl Wardrobe {
             })
             .sum()
     }
+
+    /// The distinct suit names that contribute at least one entry to
+    /// [`Wardrobe::count`].
+    pub fn matching_suits(&self, head: bool, female: bool, child: bool, skin: &str) -> Vec<&str> {
+        let (first, length) = if head { ('c', 6) } else { ('b', 9) };
+        let sex = if female { 'f' } else { 'm' };
+        let age = if child { 'c' } else { 'a' };
+        let skin = skin.to_ascii_lowercase();
+        self.suits
+            .iter()
+            .filter(|suit| {
+                let chars: Vec<char> = suit.chars().take(length).collect();
+                let matches = chars.len() == length
+                    && chars[0] == first
+                    && (chars[4] == sex || chars[4] == 'u')
+                    && chars[5] == age
+                    && !(head && chars[1] == 't');
+                if !matches {
+                    return false;
+                }
+                let part: String = chars.into_iter().collect();
+                let prefix = format!("{part}{skin}");
+                self.textures.iter().any(|t| t.starts_with(&prefix))
+            })
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// The distinct pet suit names that contribute at least one entry to
+    /// [`Wardrobe::count_pet`].
+    pub fn matching_pet_suits(&self, cat: bool) -> Vec<&str> {
+        let species = if cat {
+            ['c', 'a', 't']
+        } else {
+            ['d', 'o', 'g']
+        };
+        self.suits
+            .iter()
+            .filter(|suit| {
+                let chars: Vec<char> = suit.chars().take(7).collect();
+                if !(chars.len() == 7 && chars[0] == 'b' && chars[4..7] == species) {
+                    return false;
+                }
+                let prefix: String = chars.into_iter().collect();
+                self.textures.iter().any(|t| t.starts_with(&prefix))
+            })
+            .map(String::as_str)
+            .collect()
+    }
 }
 
 #[cfg(test)]

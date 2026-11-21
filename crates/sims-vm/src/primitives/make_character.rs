@@ -229,9 +229,13 @@ impl Machine<'_, '_> {
                 return Ok(false);
             }
             // The head, then the body (0x44b151, 0x44b167). Which they pick
-            // is presentation (body strings 2 and 1, 0x40d46f, 0x40d10b).
+            // is presentation (body strings 2 and 1, 0x40d46f, 0x40d10b),
+            // except that portrait rendering (0x4e7824) checks whether the
+            // chosen suits bind "HEAD".
             let _head = self.draw() % heads;
             let _body = self.draw() % bodies;
+            let head_status = self.wardrobe_head_status(female, child, &tone);
+            self.world.made_portrait_head.insert(guid, head_status);
             self.frame_mut()?.stack_object = record;
             Ok(true)
         } else {
@@ -243,10 +247,24 @@ impl Machine<'_, '_> {
             // 0x44b064..0x44b09b: if registry word 0x100 is -1, draw one game
             // RNG for the pet body; otherwise use the dialog's answer without
             // drawing, then reset word 0x100 to -1.
-            if self.world.dialogs.declined == -1 {
+            let pet_idx = self.world.dialogs.declined;
+            if pet_idx == -1 {
                 let _body = self.draw() % bodies;
             }
             self.world.dialogs.declined = -1;
+            let head_status = if pet_idx == -1 || (pet_idx >= 0 && (pet_idx as u32) < bodies) {
+                self.pet_wardrobe_head_status(species == 2)
+            } else {
+                Some(
+                    self.program
+                        .people
+                        .portrait_head
+                        .get(&template)
+                        .copied()
+                        .unwrap_or(false),
+                )
+            };
+            self.world.made_portrait_head.insert(guid, head_status);
             self.frame_mut()?.stack_object = record;
             Ok(true)
         }
@@ -313,6 +331,20 @@ impl Machine<'_, '_> {
         made.strings.insert(characters::SKIN, src_skin);
         made.strings
             .insert(characters::GENDER, src_gender.to_owned());
+        // 0x44b2d7 -> 0x40d0a4 -> 0x40d10b and 0x44b2ef -> 0x40d408 ->
+        // 0x40d46f copy the running person's body and head by wardrobe index
+        // (writing "" on -1). Preserve a known made status or definite false;
+        // a catalog source with a HEAD binding may or may not match the
+        // wardrobe list, so leave it unknown (None) to fail loudly if UI
+        // Effect renders it.
+        let head_status = if let Some(&status) = self.world.made_portrait_head.get(&self_guid) {
+            status
+        } else if self.portrait_head_status(self_guid) == Some(false) {
+            Some(false)
+        } else {
+            None
+        };
+        self.world.made_portrait_head.insert(guid, head_status);
         self.frame_mut()?.stack_object = record;
         Ok(true)
     }
@@ -350,6 +382,7 @@ impl Machine<'_, '_> {
             return Ok(());
         }
         self.world.characters.made.remove(&guid);
+        self.world.made_portrait_head.remove(&guid);
         self.world.neighbors.remove_record(record);
         Ok(())
     }
@@ -510,5 +543,69 @@ impl Machine<'_, '_> {
         }
         u32::try_from(wardrobe.count_pet(cat))
             .map_err(|_| Trap::Invalid("more suits than a count holds".into()))
+    }
+
+    /// Classifies one wardrobe suit name: `Some(true)` if it binds `"HEAD"`,
+    /// `Some(false)` if confirmed not to, or `None` if an earlier suit decode
+    /// error left it unknown.
+    fn classify_suit_head(&self, suit: &str) -> Option<bool> {
+        if self.program.people.head_suits.contains(suit) {
+            Some(true)
+        } else if !self.program.people.suit_errors.is_empty()
+            && !self.program.people.suits.contains(suit)
+        {
+            None
+        } else {
+            Some(false)
+        }
+    }
+
+    /// Whether every possible `(head, body)` selection (`0x44b151`, `0x44b167`)
+    /// binds `"HEAD"` (`Some(true)`), none does (`Some(false)`), or it depends
+    /// on the unmodeled wardrobe order (`None`).
+    fn wardrobe_head_status(&self, female: bool, child: bool, tone: &str) -> Option<bool> {
+        let wardrobe = self.program.wardrobe.as_ref()?;
+        let heads = wardrobe.matching_suits(true, female, child, tone);
+        let bodies = wardrobe.matching_suits(false, female, child, tone);
+        let all_heads = heads
+            .iter()
+            .all(|s| self.classify_suit_head(s) == Some(true));
+        let all_bodies = bodies
+            .iter()
+            .all(|s| self.classify_suit_head(s) == Some(true));
+        if all_heads || all_bodies {
+            return Some(true);
+        }
+        let none_heads = heads
+            .iter()
+            .all(|s| self.classify_suit_head(s) == Some(false));
+        let none_bodies = bodies
+            .iter()
+            .all(|s| self.classify_suit_head(s) == Some(false));
+        if none_heads && none_bodies {
+            return Some(false);
+        }
+        None
+    }
+
+    /// Whether every possible pet body selection (`0x44b064..0x44b09b`) binds
+    /// `"HEAD"` (`Some(true)`), none does (`Some(false)`), or it depends on
+    /// the unmodeled wardrobe order (`None`).
+    fn pet_wardrobe_head_status(&self, cat: bool) -> Option<bool> {
+        let wardrobe = self.program.wardrobe.as_ref()?;
+        let bodies = wardrobe.matching_pet_suits(cat);
+        if bodies
+            .iter()
+            .all(|s| self.classify_suit_head(s) == Some(true))
+        {
+            Some(true)
+        } else if bodies
+            .iter()
+            .all(|s| self.classify_suit_head(s) == Some(false))
+        {
+            Some(false)
+        } else {
+            None
+        }
     }
 }

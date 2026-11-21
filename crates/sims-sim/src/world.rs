@@ -223,6 +223,15 @@ pub struct World {
     /// save/restore.
     #[serde(skip)]
     pub generated_portrait_2002: BTreeSet<PortraitFile>,
+    /// Whether each runtime-made character (`Make New Character`, opcode 19)
+    /// has an exact `"HEAD"` bone binding (`0x4e7824`): `Some(true)` when
+    /// every candidate wardrobe pick binds `"HEAD"`, `Some(false)` when none
+    /// does, or `None` when the wardrobe mixes both (depends on unmodeled
+    /// wardrobe order). Kept out of [`World::encode`] so snapshot format 31's
+    /// wire bytes stay unchanged; `sims_vm::boot::save::Saved` preserves it
+    /// across lot save/restore.
+    #[serde(skip)]
+    pub made_portrait_head: BTreeMap<u32, Option<bool>>,
 }
 
 /// Which IFF file holds a portrait bitmap persisted by `0x4e9000`.
@@ -596,6 +605,7 @@ impl World {
             portraits: BTreeSet::new(),
             dirty_portraits: BTreeSet::new(),
             generated_portrait_2002: BTreeSet::new(),
+            made_portrait_head: BTreeMap::new(),
         }
     }
 
