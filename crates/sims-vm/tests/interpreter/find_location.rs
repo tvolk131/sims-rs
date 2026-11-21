@@ -731,7 +731,7 @@ fn mode_2_reads_reference_level_again_after_fits_and_preserves_callback_error_ki
         "callback script error marked unported: {err}"
     );
     for (label, node) in [
-        ("unimplemented", ins(34, RETURN_TRUE, RETURN_FALSE, [0; 8])),
+        ("unimplemented", ins(38, RETURN_TRUE, RETURN_FALSE, [0; 8])),
         (
             "unsupported scope",
             ins(
