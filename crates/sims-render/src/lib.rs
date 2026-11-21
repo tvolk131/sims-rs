@@ -27,11 +27,13 @@ pub mod shadows;
 pub use assets::Assets;
 pub use camera::{Camera, Walls, Zoom};
 pub use canvas::{Canvas, Ids, Image};
-pub use cutaway::{Focus, Selected};
+pub use cutaway::{Focus, Selected, screen_centre_pick, unproject_terrain};
 pub use light::Light;
 pub use lot::Lot;
 pub use open::{Opened, open_house};
-pub use scene::{Stats, draw, draw_held, draw_lot, holds_person};
+pub use scene::{
+    Stats, draw, draw_held, draw_lot, draw_lot_in_viewport, draw_lot_with_preview, holds_person,
+};
 
 /// An error with a message saying what failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
