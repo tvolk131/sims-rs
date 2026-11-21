@@ -1030,10 +1030,17 @@ impl<'a> Painter<'a> {
             let at = self.corner_screen(corner, level);
             let view = self.rotate_corner(corner);
             let ground = self.corner_elevation(corner) / 16;
-            for (bits, is_cut, height) in [
-                (c.cut, true, cut_height),
-                (c.standing, false, zoom.floor_height()),
-            ] {
+            let trims: Vec<(u8, bool)> = if c.record {
+                vec![(c.cut, true), (c.standing, false)]
+            } else {
+                c.run_trims.clone()
+            };
+            for (bits, is_cut) in trims {
+                let height = if is_cut {
+                    cut_height
+                } else {
+                    zoom.floor_height()
+                };
                 let Some(frame) = trim_frame(bits) else {
                     continue;
                 };
@@ -1117,16 +1124,32 @@ impl<'a> Painter<'a> {
                         });
                 }
             }
-            if let Some((cap, low)) = c.cap {
-                self.cap(level, corners, faces, corner, c, cap, low);
+            if c.record {
+                if let Some((cap, low)) = c.cap {
+                    self.cap(level, corners, faces, corner, c, cap, low, None);
+                }
+            } else {
+                for &(cap, low, owner, light_wall) in &c.run_caps {
+                    self.cap(
+                        level,
+                        corners,
+                        faces,
+                        corner,
+                        c,
+                        cap,
+                        low,
+                        Some((owner, light_wall)),
+                    );
+                }
             }
         }
     }
 
-    /// Draws a corner's cap (0x53c6b7): a narrow upright slice of a wall
-    /// face on the cap's line, in the plain wall shape and the pattern of
-    /// the wall in the cap's slot, standing in the tile the cap names and
-    /// cut to a column beside the corner.
+    /// Draws a corner's cap (0x53c6b7 for corner records, 0x53e3c0 for
+    /// mid-run caps): a narrow upright slice of a wall face on the cap's
+    /// line, in the plain wall shape and the pattern of the wall in the
+    /// cap's slot, standing in the tile the cap names and cut to a column
+    /// beside the corner.
     #[allow(clippy::too_many_arguments)]
     fn cap(
         &mut self,
@@ -1137,9 +1160,16 @@ impl<'a> Painter<'a> {
         c: &caps::Corner,
         cap: Cap,
         low: bool,
+        mid_run: Option<(usize, usize)>,
     ) {
-        let Some(owner) = c.slots[cap.slot] else {
-            return;
+        let owner = match mid_run {
+            Some((owner, _)) => owner,
+            None => {
+                let Some(owner) = c.slots[cap.slot] else {
+                    return;
+                };
+                owner
+            }
         };
         let index = (level - 1) as usize;
         let face = |i: usize| {
@@ -1154,30 +1184,30 @@ impl<'a> Painter<'a> {
         let pattern = self.sides(index, x, y, s.bit)[front];
         // At a corner record, the light of the first wall at the corner on
         // the cap's line, else of the slot's wall (0x53c97f). Along a run
-        // (`!c.record`), the run's seen-side room stored at `0x53f95b..0x53fac7`
+        // (`mid_run`), the run's seen-side room stored at `0x53f95b..0x53fac7`
         // and read once at `0x53dc6d` / reused at `0x53e701`.
-        let lit = if c.record {
-            c.slots
+        let lit = match mid_run {
+            Some((_, light_wall)) => light_wall,
+            None => c
+                .slots
                 .iter()
                 .flatten()
                 .copied()
                 .find(|&i| corners.walls[i].line() == cap.line)
-                .unwrap_or(owner)
-        } else {
-            c.cap_light.unwrap_or(owner)
+                .unwrap_or(owner),
         };
         // At a corner record, in the light its room shows through the setter
         // (0x53c9df), or without a room there in full light (0x53c9e9). Along
-        // a run (`!c.record`, 0x53e701), without a room the run's light stays
+        // a run (`mid_run`, 0x53e701), without a room the run's light stays
         // at 1 through the setter (`0x53dbb4`), so after dark it is capped.
         let fraction = match face(lit) {
             Some((_, s, front)) => self.lot.room_fraction_at(index, wall_side(&s, front)),
             None => return,
         };
-        let fraction = if c.record {
-            fraction
-        } else {
+        let fraction = if mid_run.is_some() {
             Some(fraction.unwrap_or(1.0))
+        } else {
+            fraction
         };
         let [tx, ty] = [c.view[0] + cap.offset[0], c.view[1] + cap.offset[1]];
         let ends = match cap.line {
@@ -1199,7 +1229,7 @@ impl<'a> Painter<'a> {
         let frame = wall_frame(ends);
         // The plain wall's shape, or style 255's for a corner-record wall of
         // that style (0x53c8c1); mid-run caps always use style 1 (0x53e652).
-        let style = if c.record && corners.walls[owner].style == 255 {
+        let style = if mid_run.is_none() && corners.walls[owner].style == 255 {
             255
         } else {
             PLAIN_STYLE

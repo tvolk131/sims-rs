@@ -59,13 +59,14 @@ drawing code was read from `Sims.exe` rather than fitted.
 - `Corners::new` in `crates/sims-render/src/caps.rs` populates `c.slots`
   for all corners, runs the exact `0x53de05..0x53e4ca` logic on each
   straight X/Y pair at non-record corners (independently of any crossing
-  diagonal), sets `c.standing` / `c.cut` and `c.cap` via
-  `caps::cap(mask, 0, 0)`, and records the run's lot-order final segment
-  (`cap_light`, matching `[esi + side*4 + 0x28]` from `0x53f95b..0x53fac7`).
-- `Painter::cap` in `crates/sims-render/src/scene.rs` uses plain style 1
-  (`0x53e652`), reads the run's stored room (`cap_light`, `0x53dc6d`),
-  and caps room-less light through the setter (`0x53e701`) when
-  `!c.record`.
+  diagonal or perpendicular run), stores each run's trim separately in
+  `run_trims` (matching `0x53e335`'s per-run lookup), and stores each
+  mid-run cap with its owner wall and lot-order run-end segment in
+  `run_caps` (matching `[esi + side*4 + 0x28]` from `0x53f95b..0x53fac7`).
+- `Painter::trims` and `Painter::cap` in `crates/sims-render/src/scene.rs`
+  draw each non-record corner's `run_trims` and `run_caps`, using plain
+  style 1 (`0x53e652`), the run's stored room (`0x53dc6d`), and capped
+  room-less light through the setter (`0x53e701`).
 
 ## Measured
 

@@ -80,10 +80,15 @@ pub struct Corner {
     pub cut: u8,
     /// The cap, and whether it takes the cut wall shape.
     pub cap: Option<(Cap, bool)>,
-    /// For a mid-run cap (`!record`), the run's last segment in unrotated
-    /// lot order, whose seen-side room the original stores on the run at
-    /// `0x53f95b..0x53fac7` and reuses at `0x53dc6d` / `0x53e701`.
-    pub(crate) cap_light: Option<usize>,
+    /// For a non-record corner (`!record`), each crossing run's own
+    /// `(bits, is_cut)` trim mask (`0x53e335` looks up each run separately,
+    /// so crossing cut runs never merge into a mask with no frame).
+    pub(crate) run_trims: Vec<(u8, bool)>,
+    /// For a non-record corner (`!record`), each straight run's own mid-run
+    /// cap: `(cap, low, owner_wall, light_wall)`, where `light_wall` is the
+    /// run's last segment in unrotated lot order (`0x53f95b..0x53fac7`,
+    /// `0x53dc6d`, `0x53e701`).
+    pub(crate) run_caps: Vec<(Cap, bool, usize, usize)>,
 }
 
 /// The walls and corners of one level.
@@ -422,6 +427,7 @@ impl Corners {
                 // `curr` is marked at its near end.
                 let trim_cut = is_cut && cf & curr_mark == 0;
                 if mask != 0 {
+                    c.run_trims.push((mask, trim_cut));
                     if trim_cut {
                         c.cut |= mask;
                     } else {
@@ -439,32 +445,41 @@ impl Corners {
                     } else {
                         is_cut
                     };
-                    c.cap = Some((desc, cap_low));
-                    c.cap_light = Some(light_wall);
+                    let owner_wall = if mask == prev_bit { prev } else { curr };
+                    c.run_caps.push((desc, cap_low, owner_wall, light_wall));
+                    c.cap.get_or_insert((desc, cap_low));
                 }
             }
-            let (mut other_standing, mut other_cut) = (0u8, 0u8);
-            for &i in list {
-                if handled.contains(&i) {
-                    continue;
+            // Group remaining (diagonal or non-paired) walls by line so
+            // crossing rising and falling diagonals also keep separate trim
+            // lookups (0x53df39, 0x53df61).
+            for diag_line in [Line::Rising, Line::Falling, Line::X, Line::Y] {
+                let (mut other_standing, mut other_cut) = (0u8, 0u8);
+                for &i in list {
+                    if handled.contains(&i) || walls[i].line() != diag_line {
+                        continue;
+                    }
+                    let w = &walls[i];
+                    let d = w.other(c.view);
+                    let b = bit([d[0] - c.view[0], d[1] - c.view[1]]);
+                    if !solid(w.style) {
+                        continue;
+                    }
+                    if !w.cut {
+                        other_standing |= b;
+                    } else if !door_like(w.style) {
+                        other_cut |= b;
+                    }
                 }
-                let w = &walls[i];
-                let d = w.other(c.view);
-                let b = bit([d[0] - c.view[0], d[1] - c.view[1]]);
-                if !solid(w.style) {
-                    continue;
+                if other_standing != 0 {
+                    other_cut = 0;
+                    c.run_trims.push((other_standing, false));
+                } else if other_cut != 0 {
+                    c.run_trims.push((other_cut, true));
                 }
-                if !w.cut {
-                    other_standing |= b;
-                } else if !door_like(w.style) {
-                    other_cut |= b;
-                }
+                c.standing |= other_standing;
+                c.cut |= other_cut;
             }
-            if other_standing != 0 {
-                other_cut = 0;
-            }
-            c.standing |= other_standing;
-            c.cut |= other_cut;
         }
         let mut order: Vec<[i32; 2]> = corners
             .iter()
@@ -777,8 +792,44 @@ mod tests {
         assert_eq!(cross.cap.map(|(d, low)| (d.slot, low)), Some((1, true)));
         // Both mid-run caps along the 3-segment run take room light from
         // the run's last segment in unrotated lot order (index 3).
-        assert_eq!(cross.cap_light, Some(3));
-        assert_eq!(c.corners[&[7, 5]].cap_light, Some(3));
+        assert_eq!(cross.run_caps.len(), 1);
+        assert_eq!(cross.run_caps[0].2, 1);
+        assert_eq!(cross.run_caps[0].3, 3);
+        assert_eq!(c.corners[&[7, 5]].run_caps[0].3, 3);
+    }
+
+    #[test]
+    fn crossing_cut_runs_keep_separate_trims_and_perpendicular_caps() {
+        // Both crossing runs cut: straight X run with cut doorway (`0x02`)
+        // crossed by a cut falling diagonal (`0x20 | 0x80 = 0xa0`), plus a
+        // perpendicular straight Y run with its own cut doorway (`0x01`).
+        let c = Corners::new(vec![
+            // X run (indices 0, 1, 2): cut wall, cut door, cut wall
+            styled_wall([5, 5], [6, 5], 1, true),
+            styled_wall([6, 5], [7, 5], 23, true),
+            styled_wall([7, 5], [8, 5], 1, true),
+            // Y run (indices 3, 4, 5): cut wall, cut door, cut wall
+            styled_wall([6, 4], [6, 5], 1, true),
+            styled_wall([6, 5], [6, 6], 23, true),
+            styled_wall([6, 6], [6, 7], 1, true),
+            // Cut falling diagonal through (6, 5) (indices 6, 7)
+            styled_wall([5, 6], [6, 5], 1, true),
+            styled_wall([6, 5], [7, 4], 1, true),
+        ]);
+        let cross = &c.corners[&[6, 5]];
+        assert!(!cross.record);
+        // Each run keeps its own trim entry rather than merging into 0xa3
+        // (which has no trim frame).
+        assert!(cross.run_trims.contains(&(0x02, true)));
+        assert!(cross.run_trims.contains(&(0x01, true)));
+        assert!(cross.run_trims.contains(&(0xa0, true)));
+        // Both perpendicular straight runs keep their own mid-run cap,
+        // owner wall, and lot-order run-end light wall.
+        assert_eq!(cross.run_caps.len(), 2);
+        let x_cap = cross.run_caps.iter().find(|r| r.0.slot == 1).unwrap();
+        assert_eq!((x_cap.1, x_cap.2, x_cap.3), (true, 0, 2));
+        let y_cap = cross.run_caps.iter().find(|r| r.0.slot == 0).unwrap();
+        assert_eq!((y_cap.1, y_cap.2, y_cap.3), (true, 3, 5));
     }
 
     #[test]
@@ -797,7 +848,7 @@ mod tests {
             wall_r2([6, 5], [7, 5], 23, true),
             wall_r2([7, 5], [8, 5], 1, true),
         ]);
-        assert_eq!(c.corners[&[6, 5]].cap_light, Some(2));
-        assert_eq!(c.corners[&[7, 5]].cap_light, Some(2));
+        assert_eq!(c.corners[&[6, 5]].run_caps[0].3, 2);
+        assert_eq!(c.corners[&[7, 5]].run_caps[0].3, 2);
     }
 }

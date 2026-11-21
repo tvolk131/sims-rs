@@ -302,11 +302,12 @@ fn cut_doorways_draw_no_wall_stub_and_cap_both_flanking_ends() {
         .walls
         .iter()
         .map(|cell| {
+            use sims_render::lot::{ASCENDING, DESCENDING, NORTH, WEST};
             let mut count = 0usize;
-            if cell.segments & 1 != 0 && matches!(cell.styles[0], 3 | 5 | 6 | 15 | 23) {
+            if cell.segments & WEST != 0 && matches!(cell.styles[0], 3 | 5 | 6 | 15 | 23) {
                 count += 1;
             }
-            for bit in [2u8, 4, 8] {
+            for bit in [NORTH, DESCENDING, ASCENDING] {
                 if cell.segments & bit != 0 && matches!(cell.styles[1], 3 | 5 | 6 | 15 | 23) {
                     count += 1;
                 }
