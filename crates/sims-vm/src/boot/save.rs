@@ -229,6 +229,8 @@ impl Lot {
         self.halted = false;
         self.asking = None;
         self.answered = saved.answered;
+        self.buy_undo.clear();
+        self.buy_redo.clear();
         Ok(())
     }
 }

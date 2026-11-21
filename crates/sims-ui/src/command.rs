@@ -151,6 +151,10 @@ pub enum Command {
     /// Select catalog master GUID `u32` in the Buy Mode catalog grid
     /// (`0x5065c8`).
     BuyItem(u32),
+    /// Undo the most recent Buy/Build action (`0x4cf2e0` → `0x4932fa`).
+    Undo,
+    /// Redo the most recently undone Buy/Build action (`0x4cf317` → `0x493338`).
+    Redo,
 }
 
 impl Command {
@@ -166,6 +170,8 @@ impl Command {
                 | Self::AnswerDialog { .. }
                 | Self::ChooseInteraction { .. }
                 | Self::CancelAction { .. }
+                | Self::Undo
+                | Self::Redo
         )
     }
 }

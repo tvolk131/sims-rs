@@ -739,7 +739,23 @@ fn read_ctss(iff: &Iff, ctss_id: i16) -> (String, String, Vec<u8>) {
     let Ok(id) = u16::try_from(ctss_id) else {
         return (String::new(), String::new(), Vec::new());
     };
-    let Some(chunk) = iff.get(b"CTSS", id).or_else(|| iff.get(b"CATS", id)) else {
+    // 0x40621d..0x40635e: look up legacy `CATS` first (raw NUL-terminated name
+    // followed by optional NUL-terminated description), then `CTSS`.
+    if let Some(chunk) = iff.get(b"CATS", id) {
+        let data = iff.data(chunk);
+        let name_end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+        let raw_name = data[..name_end].to_vec();
+        let name = sims_formats::strings::decode(&raw_name, US_ENGLISH);
+        let description = if name_end + 1 < data.len() {
+            let rest = &data[name_end + 1..];
+            let desc_end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+            sims_formats::strings::decode(&rest[..desc_end], US_ENGLISH)
+        } else {
+            String::new()
+        };
+        return (name, description, raw_name);
+    }
+    let Some(chunk) = iff.get(b"CTSS", id) else {
         return (String::new(), String::new(), Vec::new());
     };
     let Ok(table) = StringTable::parse(iff.data(chunk)) else {
@@ -928,5 +944,58 @@ mod tests {
             seating.press([437, 523]),
             Some(Command::BuyItem(0x26bf_bb29))
         );
+    }
+
+    /// Builds a minimal IFF 2.5 buffer from `(type_code, id, payload)` chunks.
+    fn build_iff(chunks: &[(&[u8; 4], u16, &[u8])]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"IFF FILE 2.5:TYPE FOLLOWED BY SIZE\0 JAMIE DOORNBOS & MAXIS 1");
+        buf.resize(64, 0);
+        for &(tag, id, payload) in chunks {
+            let size = (76 + payload.len()) as u32;
+            buf.extend_from_slice(tag);
+            buf.extend_from_slice(&size.to_be_bytes());
+            buf.extend_from_slice(&id.to_be_bytes());
+            buf.extend_from_slice(&0u16.to_be_bytes()); // flags
+            buf.extend_from_slice(&[0u8; 64]); // label
+            buf.extend_from_slice(payload);
+        }
+        buf
+    }
+
+    #[test]
+    fn legacy_cats_is_parsed_as_nul_strings_before_ctss() {
+        // Legacy `CATS` only (`0x40621d` -> `0x40631f`): raw NUL-terminated
+        // name + description in Windows-1252.
+        let cats_payload = b"Legacy Lamp\x99\0Legacy description\0";
+        let iff = Iff::parse(build_iff(&[(b"CATS", 2008, cats_payload)])).unwrap();
+        let (name, desc, raw) = read_ctss(&iff, 2008);
+        assert_eq!(name, "Legacy Lamp™");
+        assert_eq!(desc, "Legacy description");
+        assert_eq!(raw, b"Legacy Lamp\x99");
+
+        // When both `CATS` and `CTSS` share the same ID, native `0x40621d`
+        // uses `CATS` first.
+        let mut ctss_payload = Vec::new();
+        ctss_payload.extend_from_slice(&(-3i16).to_le_bytes()); // format -3
+        ctss_payload.extend_from_slice(&2u16.to_le_bytes()); // 2 entries
+        ctss_payload.push(US_ENGLISH);
+        ctss_payload.extend_from_slice(b"CTSS Lamp\0\0");
+        ctss_payload.push(US_ENGLISH);
+        ctss_payload.extend_from_slice(b"CTSS description\0\0");
+        let both = Iff::parse(build_iff(&[
+            (b"CTSS", 2008, &ctss_payload),
+            (b"CATS", 2008, cats_payload),
+        ]))
+        .unwrap();
+        let (name, desc, _) = read_ctss(&both, 2008);
+        assert_eq!(name, "Legacy Lamp™");
+        assert_eq!(desc, "Legacy description");
+
+        // With `CTSS` alone, `read_ctss` falls through to `StringTable::parse`.
+        let ctss_only = Iff::parse(build_iff(&[(b"CTSS", 2008, &ctss_payload)])).unwrap();
+        let (name, desc, _) = read_ctss(&ctss_only, 2008);
+        assert_eq!(name, "CTSS Lamp");
+        assert_eq!(desc, "CTSS description");
     }
 }

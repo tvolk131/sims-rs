@@ -235,6 +235,10 @@ struct App {
     /// The REDB file of saves, and this house's name in it.
     saves: PathBuf,
     slot: String,
+    /// Modifier keys tracked from `WindowEvent::ModifiersChanged` for Buy Mode
+    /// shortcuts (`Ctrl/Cmd+Z` Undo, `Ctrl+Y`/`Ctrl/Cmd+Shift+Z` Redo).
+    ctrl_or_cmd_held: bool,
+    shift_held: bool,
 }
 
 /// Filters startup `WindowEvent::Focused` notifications so ordinary window
@@ -400,34 +404,53 @@ impl App {
             }
             Key::Named(NamedKey::F5) => return self.save(false),
             Key::Named(NamedKey::F9) => return self.save(true),
-            Key::Character(c) => match c.as_str() {
-                "+" | "=" => Move::ZoomIn,
-                "-" | "_" => Move::ZoomOut,
-                "[" => Move::Rotate(false),
-                "]" => Move::Rotate(true),
-                "," => {
-                    if self.game.buy_cursor().is_some_and(|c| c.position[0] >= 0)
-                        && self.game.rotate_held(false)
-                    {
-                        self.changed(true);
-                        return;
+            Key::Character(c) => {
+                if self.ctrl_or_cmd_held {
+                    match c.as_str() {
+                        "z" | "Z" if !self.shift_held => {
+                            if self.game.undo_buy() {
+                                self.changed(true);
+                            }
+                            return;
+                        }
+                        "z" | "Z" | "y" | "Y" => {
+                            if self.game.redo_buy() {
+                                self.changed(true);
+                            }
+                            return;
+                        }
+                        _ => {}
                     }
-                    Move::Rotate(false)
                 }
-                "." => {
-                    if self.game.buy_cursor().is_some_and(|c| c.position[0] >= 0)
-                        && self.game.rotate_held(true)
-                    {
-                        self.changed(true);
-                        return;
+                match c.as_str() {
+                    "+" | "=" => Move::ZoomIn,
+                    "-" | "_" => Move::ZoomOut,
+                    "[" => Move::Rotate(false),
+                    "]" => Move::Rotate(true),
+                    "," => {
+                        if self.game.buy_cursor().is_some_and(|c| c.position[0] >= 0)
+                            && self.game.rotate_held(false)
+                        {
+                            self.changed(true);
+                            return;
+                        }
+                        Move::Rotate(false)
                     }
-                    Move::Rotate(true)
+                    "." => {
+                        if self.game.buy_cursor().is_some_and(|c| c.position[0] >= 0)
+                            && self.game.rotate_held(true)
+                        {
+                            self.changed(true);
+                            return;
+                        }
+                        Move::Rotate(true)
+                    }
+                    "1" => Move::Walls(Walls::Up),
+                    "2" => Move::Walls(Walls::Cutaway),
+                    "3" => Move::Walls(Walls::Down),
+                    _ => return,
                 }
-                "1" => Move::Walls(Walls::Up),
-                "2" => Move::Walls(Walls::Cutaway),
-                "3" => Move::Walls(Walls::Down),
-                _ => return,
-            },
+            }
             _ => return,
         };
         let redraw = self.game.apply(command);
@@ -587,7 +610,10 @@ impl ApplicationHandler for App {
                 self.changed(true);
             }
             WindowEvent::ModifiersChanged(modifiers) => {
-                self.game.set_shift(modifiers.state().shift_key());
+                let state = modifiers.state();
+                self.shift_held = state.shift_key();
+                self.ctrl_or_cmd_held = state.control_key() || state.super_key();
+                self.game.set_shift(self.shift_held);
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if event.logical_key == Key::Named(NamedKey::Escape) {
@@ -748,6 +774,8 @@ fn run() -> Result<(), String> {
         focus_filter: FocusFilter::default(),
         saves,
         slot: slot(&options.house),
+        ctrl_or_cmd_held: false,
+        shift_held: false,
     };
     let event_loop = EventLoop::new().map_err(|e| e.to_string())?;
     event_loop.run_app(&mut app).map_err(|e| e.to_string())

@@ -85,6 +85,26 @@ pub struct BuyCursor {
     pub container: Option<(u16, i16)>,
 }
 
+/// One committed Buy Mode purchase recorded for Undo / Redo (`0x48ba19` /
+/// `0x48beb5` / `0x493259`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuyPurchase {
+    /// Lead object ID of the placed catalog object.
+    pub object: u16,
+    /// Catalog master GUID of the purchased object.
+    pub guid: u32,
+    /// Committed fine lot coordinates `[x, y, level]`.
+    pub position: [i32; 3],
+    /// Committed facing direction (`data[1]`, `0..7`).
+    pub facing: i16,
+    /// Surface container `(id, slot)` if placed on a surface slot.
+    pub container: Option<(u16, i16)>,
+    /// Purchase price charged on commit (`0x421e42`).
+    pub price: i32,
+    /// Budget category charged/refunded (`6` Buy, `7` Build, `0x48bdbd`).
+    pub budget_category: u8,
+}
+
 /// Default facing direction for a newly purchased object at camera rotation
 /// `rotation` (`0x422776`: `[2, 0, 6, 4][rotation & 3]`).
 pub fn default_buy_direction(rotation: u8) -> i16 {
@@ -393,10 +413,13 @@ impl Interpreter<'_> {
     }
 
     /// Rotates the held object to `direction` (`0x4226bc` → `0x421be4`) and
-    /// re-evaluates placement at its current tile if it is on the lot. When
-    /// the object is already snapped to a surface container slot at that tile,
-    /// [`Self::buy_move`] retains that container without re-running automatic
-    /// surface-facing alignment (`0x422050` line `0x422078`).
+    /// re-evaluates placement at its saved coordinates without running
+    /// pointer-move wall auto-rotation (`0x48736b`). When the object is
+    /// already snapped to a surface container slot at that tile, retains that
+    /// container without re-running automatic surface-facing alignment
+    /// (`0x422050` line `0x422078`). If the requested facing does not fit,
+    /// leaves the held object off the lot at that facing with `cursor.valid =
+    /// false`.
     pub fn buy_rotate(
         &self,
         world: &mut World,
@@ -404,13 +427,31 @@ impl Interpreter<'_> {
         direction: i16,
     ) -> Result<bool, Fault> {
         let [x, y, level] = cursor.position;
+        let retained = cursor.container;
         self.remove_cursor_and_held(world, cursor)?;
         self.rotate_held_to(world, cursor.cursor, cursor.held, direction)?;
-        if on_lot([x, y]) {
-            self.buy_move(world, cursor, [x, y], level)
-        } else {
-            Ok(false)
+        cursor.valid = false;
+        cursor.container = None;
+        if !on_lot([x, y]) || !inside_placement_bounds(world, [x, y]) {
+            return Ok(false);
         }
+        if self.try_place_buy_at(world, cursor, [x, y], level, retained)? {
+            return Ok(cursor.valid);
+        }
+        cursor.position = [x, y, level];
+        cursor.valid = false;
+        cursor.container = None;
+        if self.fits(world, cursor.cursor, [x, y], level)? {
+            let cursor_place = Place {
+                on_lot: true,
+                position: [x, y],
+                container: None,
+                slot: -1,
+                level,
+            };
+            self.put(world, cursor.cursor, cursor_place, true)?;
+        }
+        Ok(false)
     }
 
     /// Hides the cursor and held object off the lot while the pointer leaves
@@ -427,9 +468,14 @@ impl Interpreter<'_> {
     /// `0x43562f` / `0x422e99`, `0x4929fb` → `0x46d91c`): removes and deletes
     /// the `"Tile Cursor"`, places the held object permanently at its
     /// validated tile/container, runs OBJf function 11 (`USER_PLACEMENT`) on
-    /// the object (and every group tile / held child), and deducts its price
-    /// from household funds. Returns the placed object's ID.
-    pub fn buy_commit(&self, world: &mut World, cursor: &BuyCursor) -> Result<u16, Fault> {
+    /// the object (and every group tile / held child), deducts its price
+    /// from household funds, and returns the recorded [`BuyPurchase`] for
+    /// Undo/Redo (`0x48ba19` / `0x48beb5`).
+    pub fn buy_commit_record(
+        &self,
+        world: &mut World,
+        cursor: &BuyCursor,
+    ) -> Result<BuyPurchase, Fault> {
         let held = cursor.held;
         let fail = |trap| Fault {
             object: held,
@@ -459,7 +505,103 @@ impl Interpreter<'_> {
         self.put(world, cursor.held, place, true)?;
         self.run_user_placement(world, cursor.held)?;
         spend(world, cursor.budget_category, cursor.price).map_err(fail)?;
-        Ok(cursor.held)
+        let facing = world
+            .objects
+            .get(&cursor.held)
+            .and_then(|o| o.data.get(DATA_FACING).copied())
+            .unwrap_or(0)
+            .rem_euclid(8);
+        Ok(BuyPurchase {
+            object: cursor.held,
+            guid: cursor.guid,
+            position: cursor.position,
+            facing,
+            container: cursor.container,
+            price: cursor.price,
+            budget_category: cursor.budget_category,
+        })
+    }
+
+    /// Commits a valid Buy Mode placement and returns the placed object's ID.
+    pub fn buy_commit(&self, world: &mut World, cursor: &BuyCursor) -> Result<u16, Fault> {
+        self.buy_commit_record(world, cursor).map(|p| p.object)
+    }
+
+    /// Undoes a committed Buy Mode purchase (`0x48bd21` → `0x48c0ea` +
+    /// `0x48bdbd`): removes and deletes the purchased object (and its group
+    /// tiles, if multi-tile) and refunds `purchase.price` to household funds
+    /// and today's budget category. Returns `Ok(false)` if the purchased
+    /// object is no longer on the lot.
+    pub fn buy_undo_purchase(
+        &self,
+        world: &mut World,
+        purchase: &BuyPurchase,
+    ) -> Result<bool, Fault> {
+        let fail = |trap| Fault {
+            object: purchase.object,
+            at: None,
+            trap,
+        };
+        if !world.objects.contains_key(&purchase.object) {
+            return Ok(false);
+        }
+        self.remove_now(world, purchase.object)?;
+        spend(world, purchase.budget_category, -purchase.price).map_err(fail)?;
+        Ok(true)
+    }
+
+    /// Redoes a previously undone Buy Mode purchase (`0x48bdfe` → `0x48c053`
+    /// → `0x440b2d` + `0x48bfab` + `0x48bdbd`): recreates the catalog object,
+    /// rotates it to `purchase.facing`, validates and places it at
+    /// `purchase.position`/`purchase.container`, runs OBJf function 11
+    /// (`USER_PLACEMENT`, `*piVar2 + 0x64`), and re-deducts `purchase.price`.
+    /// Updates `purchase.object` to the recreated ID and returns `Ok(true)`,
+    /// or cleans up and returns `Ok(false)` if it can no longer be placed or
+    /// afforded.
+    pub fn buy_redo_purchase(
+        &self,
+        world: &mut World,
+        purchase: &mut BuyPurchase,
+    ) -> Result<bool, Fault> {
+        let [x, y, level] = purchase.position;
+        if purchase.price > 0 && purchase.price > available_funds(world) {
+            return Ok(false);
+        }
+        if let Some((cid, _)) = purchase.container
+            && !world.objects.contains_key(&cid)
+        {
+            return Ok(false);
+        }
+        if !on_lot([x, y]) || !inside_placement_bounds(world, [x, y]) {
+            return Ok(false);
+        }
+        let id = self.create(world, purchase.guid)?;
+        let fail = |trap| Fault {
+            object: id,
+            at: None,
+            trap,
+        };
+        self.rotate_object_to(world, id, purchase.facing)?;
+        let fits = match purchase.container {
+            Some((cid, slot)) => self.fits_in(world, id, cid, i32::from(slot), [x, y], level)?,
+            None => self.place_test(world, id, [x, y], level)?.is_ok(),
+        };
+        if !fits {
+            self.remove_now(world, id)?;
+            return Ok(false);
+        }
+        let place = Place {
+            on_lot: true,
+            position: [x, y],
+            container: purchase.container.map(|(cid, _)| cid),
+            slot: purchase.container.map_or(-1, |(_, slot)| i32::from(slot)),
+            level,
+        };
+        self.put(world, id, place, true)?;
+        self.run_user_placement(world, id)?;
+        spend(world, purchase.budget_category, purchase.price).map_err(fail)?;
+        purchase.object = id;
+        Ok(true)
     }
 
     /// Cancels an active Buy Mode purchase (`0x487105`): deletes both the
@@ -544,6 +686,51 @@ impl Interpreter<'_> {
         cursor_lead.ok_or_else(|| fail(held, Trap::Invalid("no tile cursor created".into())))
     }
 
+    /// Rotates `id` (or its whole multi-tile group) toward `target_dir` in
+    /// steps of its `DATA_TURN_STEP`, updating multipart offsets when
+    /// multi-tile.
+    fn rotate_object_to(&self, world: &mut World, id: u16, target_dir: i16) -> Result<(), Fault> {
+        let fail = |object, trap| Fault {
+            object,
+            at: None,
+            trap,
+        };
+        let target = target_dir.rem_euclid(8);
+        let (current, step, is_group) = {
+            let h = world
+                .objects
+                .get(&id)
+                .ok_or_else(|| fail(id, Trap::native(10, "missing object")))?;
+            (
+                h.data.get(DATA_FACING).copied().unwrap_or(0).rem_euclid(8),
+                h.data.get(DATA_TURN_STEP).copied().unwrap_or(0),
+                h.multipart.is_some(),
+            )
+        };
+        if current == target || step <= 0 {
+            return Ok(());
+        }
+        let delta = (target - current).rem_euclid(8);
+        if delta % step != 0 {
+            return Ok(());
+        }
+        let steps = i32::from(delta / step);
+        if is_group {
+            let parts = self.parts(world, id).map_err(|t| fail(id, t))?;
+            for &part in &parts {
+                if let Some(obj) = world.objects.get_mut(&part)
+                    && let Some(dir) = obj.data.get_mut(DATA_FACING)
+                {
+                    *dir = dir.wrapping_add(delta) & 7;
+                }
+            }
+            self.update_offsets(world, id).map_err(|t| fail(id, t))?;
+        } else {
+            self.turn_one(world, id, steps)?;
+        }
+        Ok(())
+    }
+
     /// Rotates `held` toward `target_dir` in steps of its `DATA_TURN_STEP`
     /// (`0x4226bc` → `0x421be4`), updating multipart offsets on both `held`
     /// and `cursor` when multi-tile while leaving `cursor`'s own `data[1]`
@@ -560,37 +747,15 @@ impl Interpreter<'_> {
             at: None,
             trap,
         };
-        let target = target_dir.rem_euclid(8);
-        let (current, step, is_group) = {
-            let h = world
-                .objects
-                .get(&held)
-                .ok_or_else(|| fail(held, Trap::native(10, "missing held object")))?;
-            (
-                h.data.get(DATA_FACING).copied().unwrap_or(0).rem_euclid(8),
-                h.data.get(DATA_TURN_STEP).copied().unwrap_or(0),
-                h.multipart.is_some(),
-            )
-        };
-        if current == target || step <= 0 {
-            return Ok(());
-        }
-        let delta = (target - current).rem_euclid(8);
-        if delta % step != 0 {
-            return Ok(());
-        }
-        let steps = i32::from(delta / step);
+        let is_group = world
+            .objects
+            .get(&held)
+            .ok_or_else(|| fail(held, Trap::native(10, "missing held object")))?
+            .multipart
+            .is_some();
+        self.rotate_object_to(world, held, target_dir)?;
         if is_group {
             let parts = self.parts(world, held).map_err(|t| fail(held, t))?;
-            for &part in &parts {
-                if let Some(obj) = world.objects.get_mut(&part)
-                    && let Some(dir) = obj.data.get_mut(DATA_FACING)
-                {
-                    *dir = dir.wrapping_add(delta) & 7;
-                }
-            }
-            self.update_offsets(world, held)
-                .map_err(|t| fail(held, t))?;
             // Sync cursor parts' offsets from held parts (`0x42238d`).
             let cursor_parts = self.parts(world, cursor).map_err(|t| fail(cursor, t))?;
             for (&hp, &cp) in parts.iter().zip(cursor_parts.iter()) {
@@ -609,8 +774,6 @@ impl Interpreter<'_> {
                     cm.offset = offset;
                 }
             }
-        } else {
-            self.turn_one(world, held, steps)?;
         }
         Ok(())
     }

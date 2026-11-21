@@ -30,10 +30,11 @@ panel, and `sims-vm` had no `"Tile Cursor"` creation or Buy placement tool.
   `0x506765`, `0x507288`, `0x508342`):**
   - Residential Buy Mode includes non-person catalog masters (`sub_index == -1`
     or `master == 0`) with nonzero `OBJD +0x4e` (`room_sort`) and graphics or a
-    `TTAB`, reading `CTSS`/`CATS` and falling back to the `OBJD` chunk label
-    when empty (`0x457d3b`), sorted by price ascending then raw Windows-1252
-    catalog name bytes ascending (`0x4cd9a5` → `0x430100` → `memcmp` at
-    `0x6363e0`).
+    `TTAB`, reading legacy `CATS` (raw NUL-terminated name and optional
+    description, `0x40621d` / `0x40631f`) before `CTSS` and falling back to the
+    `OBJD` chunk label when empty (`0x457d3b`), sorted by price ascending then
+    raw Windows-1252 catalog name bytes ascending (`0x4cd9a5` → `0x430100` →
+    `memcmp` at `0x6363e0`).
   - Function-sort category masks in UI order `0..8` are
     `[0x01, 0x02, 0x20, 0x08, 0x04, 0x10, 0x80, 0x40]`; function-subsort masks
     are `[0x01, 0x02, 0x04, 0x08, 0x20, 0x40, 0x90, 0xff]`; room-sort masks are
@@ -91,13 +92,22 @@ panel, and `sims-vm` had no `"Tile Cursor"` creation or Buy placement tool.
     `0x43562f` / `0x422e99`, `0x4929fb` → `0x46d91c`), deleting the
     `"Tile Cursor"`, placing the held object permanently, running OBJf function
     11 (`USER_PLACEMENT`) on the object (and every group tile / held child),
-    and deducting its price in budget category `6` (Buy) or `7` (Build). When
-    Shift is held (`VK_SHIFT`, `0x4864f9`) or for repeat-buy objects
-    (`OBJD word 96 == 1` outside tutorial `global[26] == 0`, `0x4878f3`), a
-    successful commit immediately arms another copy with the placed facing
-    (`0x4864d0` → `0x486f5a`) if affordable. Cancel (`0x487105`) deletes both
-    without charging funds; saving mid-preview strips the unpaid preview from
-    the snapshot (`Lot::save_without_buy_cursor`).
+    deducting its price in budget category `6` (Buy) or `7` (Build), and
+    registering a purchase undo record (`0x486f5a` → `0x48ba19` → `0x48beb5`,
+    `0x486ada` → `0x493259`, clearing the redo stack). Manual rotation
+    (`0x4226bc` → `0x421be4`) rechecks placement at the saved coordinates
+    without running pointer-move wall auto-rotation (`0x48736b`), keeping the
+    requested facing and leaving the preview invalid if it cannot fit. Undo
+    (`0x4cf2e0` / event `0xec` → `0x4932fa` → `0x48bd21`) deletes the purchased
+    object and refunds its price (`0x48bdbd`); Redo (`0x4cf317` / event `0xed`
+    → `0x493338` → `0x48bdfe`) recreates, places, runs `USER_PLACEMENT`, and
+    re-charges it; leaving a non-Live mode clears both stacks (`0x4cea5d` →
+    `0x4933dc`). When Shift is held (`VK_SHIFT`, `0x4864f9`) or for repeat-buy
+    objects (`OBJD word 96 == 1` outside tutorial `global[26] == 0`,
+    `0x4878f3`), a successful commit immediately arms another copy with the
+    placed facing (`0x4864d0` → `0x486f5a`) if affordable. Cancel (`0x487105`)
+    deletes both without charging funds; saving mid-preview strips the unpaid
+    preview from the snapshot (`Lot::save_without_buy_cursor`).
 
 ## Decision
 
@@ -106,19 +116,21 @@ panel, and `sims-vm` had no `"Tile Cursor"` creation or Buy placement tool.
    `0x47bc1f` unrotation about `1024`.
 2. **VM (`crates/sims-vm/src/buy.rs`, `factory.rs`, `boot.rs`):** Add
    `Machine::construct_tile_cursor` (type `9` without date stamp), `BuyCursor`,
-   `default_buy_direction`, `snap_to_tile_centre`, `panel_mode`,
+   `BuyPurchase`, `default_buy_direction`, `snap_to_tile_centre`, `panel_mode`,
    `available_funds`, and `Interpreter`/`Lot` methods (`set_mode`, `buy_start`,
-   `buy_move`, `buy_rotate`, `buy_hide`, `buy_commit`, `buy_cancel`). Pass
-   `panel_mode(&self.world)` into `draw_frame_in` during `Lot::advance`.
+   `buy_move`, `buy_rotate`, `buy_hide`, `buy_commit`, `buy_cancel`,
+   `buy_undo`, `buy_redo`). Pass `panel_mode(&self.world)` into `draw_frame_in`
+   during `Lot::advance`.
 3. **UI (`crates/sims-ui/src/buy.rs`, `command.rs`, `hud.rs`):** Add
-   `Command::{BuyCategory, BuySubcategory, BuyBack, BuyPage, BuyItem}`,
-   `BuyCatalog`, `BuyState`, `BuyLayout`, `PopupCard`, and Buy Mode strip
-   layout/drawing/hit-testing; exclude the transparent top 50 px of `4918` from
-   `hud::covers`.
+   `Command::{BuyCategory, BuySubcategory, BuyBack, BuyPage, BuyItem, Undo,
+   Redo}`, `BuyCatalog`, `BuyState`, `BuyLayout`, `PopupCard`, and Buy Mode
+   strip layout/drawing/hit-testing; exclude the transparent top 50 px of
+   `4918` from `hud::covers`.
 4. **Game (`crates/sims-game/src/hud.rs`, `game.rs`, `main.rs`):** Lazy-load
-   `BuyCatalog` on Buy Mode entry, wire `Command::SetMode` and Buy catalog/tool
-   hover, drag-rotate, placement commit, cancel (`Escape`), keyboard rotation
-   (`,`/`.`), and return to Live mode.
+   `BuyCatalog` on Buy Mode entry, wire `Command::SetMode`, `Command::{Undo,
+   Redo}`, and Buy catalog/tool hover, drag-rotate, placement commit, cancel
+   (`Escape`), keyboard rotation (`,`/`.`), Undo/Redo (`Ctrl/Cmd+Z`,
+   `Ctrl+Y`/`Ctrl/Cmd+Shift+Z`), and return to Live mode.
 
 ## Verification
 

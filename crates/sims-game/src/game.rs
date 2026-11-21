@@ -1614,6 +1614,14 @@ impl Game {
                 self.select_buy_item(guid);
                 Outcome::redraw()
             }
+            Command::Undo => {
+                self.undo_buy();
+                Outcome::redraw()
+            }
+            Command::Redo => {
+                self.redo_buy();
+                Outcome::redraw()
+            }
             Command::TogglePanel => {
                 self.sync_view_centre();
                 if self.hud.controls.mode == Mode::Buy {
@@ -1644,6 +1652,68 @@ impl Game {
     /// the house view), if any.
     pub fn buy_cursor(&self) -> Option<&BuyCursor> {
         self.buy_cursor.as_ref()
+    }
+
+    /// Whether a committed Buy Mode purchase can be undone (`0x4cf074`).
+    pub fn can_undo(&self) -> bool {
+        self.hud.controls.mode == Mode::Buy && self.lot.can_buy_undo()
+    }
+
+    /// Whether an undone Buy Mode purchase can be redone (`0x4cf08c`).
+    pub fn can_redo(&self) -> bool {
+        self.hud.controls.mode == Mode::Buy && self.lot.can_buy_redo()
+    }
+
+    /// Undoes the most recent committed Buy Mode purchase (`0x4cf2e0` →
+    /// `0x4932fa` → `0x48bd21`), cancelling any active unplaced preview first.
+    /// Returns `true` if a purchase was undone.
+    pub fn undo_buy(&mut self) -> bool {
+        if self.hud.controls.mode != Mode::Buy || self.stopped.is_some() {
+            return false;
+        }
+        self.cancel_buy();
+        if self.buy_cursor.is_some() {
+            return false;
+        }
+        match self.lot.buy_undo() {
+            Ok(true) => {
+                self.refresh_world();
+                self.hud
+                    .layout_buy(self.view.size, self.lot.world(), &self.assets);
+                true
+            }
+            Ok(false) => false,
+            Err(e) => {
+                self.note = Some(format!("The purchase was not undone: {e}"));
+                false
+            }
+        }
+    }
+
+    /// Redoes the most recently undone Buy Mode purchase (`0x4cf317` →
+    /// `0x493338` → `0x48bdfe`), cancelling any active unplaced preview first.
+    /// Returns `true` if a purchase was redone.
+    pub fn redo_buy(&mut self) -> bool {
+        if self.hud.controls.mode != Mode::Buy || self.stopped.is_some() {
+            return false;
+        }
+        self.cancel_buy();
+        if self.buy_cursor.is_some() {
+            return false;
+        }
+        match self.lot.buy_redo() {
+            Ok(true) => {
+                self.refresh_world();
+                self.hud
+                    .layout_buy(self.view.size, self.lot.world(), &self.assets);
+                true
+            }
+            Ok(false) => false,
+            Err(e) => {
+                self.note = Some(format!("The purchase was not redone: {e}"));
+                false
+            }
+        }
     }
 
     /// Sets whether the Shift modifier is held (`VK_SHIFT`, `0x4864f9`),

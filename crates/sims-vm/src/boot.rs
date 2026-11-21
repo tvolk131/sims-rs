@@ -242,6 +242,12 @@ pub struct Lot {
     /// goes back only into a lot loaded from the same files
     /// ([`save`]).
     loaded: [u8; 32],
+    /// Committed Buy Mode purchases available for Undo (`0x493259`, `0x4932fa`).
+    /// Cleared when leaving a non-Live mode (`0x4cea5d` → `0x4933dc`) or
+    /// restoring a save.
+    buy_undo: Vec<crate::BuyPurchase>,
+    /// Undone Buy Mode purchases available for Redo (`0x493338`).
+    buy_redo: Vec<crate::BuyPurchase>,
 }
 
 /// A dialog the lot waits on ([`Lot::asking`]). The tick that showed it
@@ -920,6 +926,8 @@ impl Lot {
             view_centre,
             replay_view: None,
             loaded,
+            buy_undo: Vec::new(),
+            buy_redo: Vec::new(),
         })
     }
 
@@ -1378,9 +1386,11 @@ impl Lot {
     /// Switches the simulation's active panel mode between ticks
     /// (`0x4cea5d` + `0x4ce44f`). Leaving a non-Live mode back to
     /// [`PanelMode::Live`] marks all rooms uncounted, updates lot
-    /// statistics, and clears global 19 (`0x416534`).
+    /// statistics, and clears global 19 (`0x416534`). Leaving any non-Live
+    /// mode clears the Buy Mode Undo/Redo stacks (`0x4cea5d` → `0x4933dc`).
     pub fn set_mode(&mut self, mode: PanelMode) -> Result<(), OrderError> {
         self.ready()?;
+        let previous = self.mode();
         let interpreter = Interpreter {
             view_rotation: self.view_rotation,
             view_centre: self.view_centre,
@@ -1391,6 +1401,10 @@ impl Lot {
             .set_mode(&mut world, mode)
             .map_err(OrderError::Refused)?;
         self.world = world;
+        if previous != PanelMode::Live && mode != previous {
+            self.buy_undo.clear();
+            self.buy_redo.clear();
+        }
         Ok(())
     }
 
@@ -1494,9 +1508,10 @@ impl Lot {
 
     /// Commits a valid Buy Mode placement (`0x486ada` → `0x421a0e`, `0x46d91c`):
     /// deletes the `"Tile Cursor"`, places the held object permanently, runs
-    /// OBJf function 11 (`USER_PLACEMENT`), and deducts its price from
-    /// household funds. Returns the placed object's ID. On error, the lot is
-    /// left unchanged so the caller still owns `cursor`.
+    /// OBJf function 11 (`USER_PLACEMENT`), deducts its price from household
+    /// funds, and pushes an undo record (`0x486ada` → `0x493259`, clearing the
+    /// redo stack). Returns the placed object's ID. On error, the lot is left
+    /// unchanged so the caller still owns `cursor`.
     pub fn buy_commit(&mut self, cursor: &BuyCursor) -> Result<u16, OrderError> {
         self.ready()?;
         let sounds = RefCell::new(Vec::new());
@@ -1507,11 +1522,96 @@ impl Lot {
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
-        let id = interpreter
-            .buy_commit(&mut world, cursor)
+        let purchase = interpreter
+            .buy_commit_record(&mut world, cursor)
             .map_err(OrderError::Refused)?;
+        let id = purchase.object;
         self.world = world;
+        self.buy_undo.push(purchase);
+        self.buy_redo.clear();
         Ok(id)
+    }
+
+    /// Whether there is a committed Buy Mode purchase to undo (`0x4cf074`).
+    pub fn can_buy_undo(&self) -> bool {
+        !self.buy_undo.is_empty()
+    }
+
+    /// Whether there is an undone Buy Mode purchase to redo (`0x4cf08c`).
+    pub fn can_buy_redo(&self) -> bool {
+        !self.buy_redo.is_empty()
+    }
+
+    /// Undoes the most recent committed Buy Mode purchase (`0x4cf2e0` →
+    /// `0x4932fa` → `0x48bd21`): removes the purchased object, refunds its
+    /// price to household funds and today's budget category, and pushes it onto
+    /// the redo stack. Returns `Ok(false)` when nothing can be undone (clearing
+    /// the undo stack if the top record could not be applied, matching
+    /// `0x4932fa` → `0x493376`).
+    pub fn buy_undo(&mut self) -> Result<bool, OrderError> {
+        self.ready()?;
+        let Some(purchase) = self.buy_undo.pop() else {
+            return Ok(false);
+        };
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        match interpreter.buy_undo_purchase(&mut world, &purchase) {
+            Ok(true) => {
+                self.world = world;
+                self.buy_redo.push(purchase);
+                Ok(true)
+            }
+            Ok(false) => {
+                self.buy_undo.clear();
+                Ok(false)
+            }
+            Err(fault) => {
+                self.buy_undo.clear();
+                Err(OrderError::Refused(fault))
+            }
+        }
+    }
+
+    /// Redoes the most recently undone Buy Mode purchase (`0x4cf317` →
+    /// `0x493338` → `0x48bdfe`): recreates and places the purchased object,
+    /// runs `USER_PLACEMENT`, re-deducts its price, and pushes it back onto the
+    /// undo stack. Returns `Ok(false)` when nothing can be redone (clearing the
+    /// redo stack if the top record could not be applied, matching `0x493338` →
+    /// `0x4933a9`).
+    pub fn buy_redo(&mut self) -> Result<bool, OrderError> {
+        self.ready()?;
+        let Some(mut purchase) = self.buy_redo.pop() else {
+            return Ok(false);
+        };
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        match interpreter.buy_redo_purchase(&mut world, &mut purchase) {
+            Ok(true) => {
+                self.world = world;
+                self.buy_undo.push(purchase);
+                Ok(true)
+            }
+            Ok(false) => {
+                self.buy_redo.clear();
+                Ok(false)
+            }
+            Err(fault) => {
+                self.buy_redo.clear();
+                Err(OrderError::Refused(fault))
+            }
+        }
     }
 
     /// Cancels an active Buy Mode purchase (`0x487105`), deleting both the
@@ -1749,6 +1849,8 @@ mod tests {
             view_centre: None,
             replay_view: None,
             loaded,
+            buy_undo: Vec::new(),
+            buy_redo: Vec::new(),
         }
     }
 

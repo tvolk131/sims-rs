@@ -5563,6 +5563,9 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
 
     // Wall-mounted auto-rotation (`0x48736b` + `0x43583e`): Narcisco Wall
     // Mirror fails at facing 2 at `[264, 504]` and auto-rotates to facing 4.
+    // Manual rotation (`0x4226bc` / `0x421be4`) back to facing 2 must NOT
+    // re-run pointer-move auto-rotation: it returns `Ok(false)`, keeps facing
+    // 2 with `cursor.valid == false`, and refuses commit until rotated back.
     let mirror = catalog
         .all()
         .iter()
@@ -5571,7 +5574,29 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
     let mut mirror_cur = lot.buy_start(mirror.guid, 1, 2).unwrap().unwrap();
     assert!(lot.buy_move(&mut mirror_cur, [264, 504], 1).unwrap());
     assert_eq!(lot.world().objects[&mirror_cur.held].data[1], 4);
+    assert!(!lot.buy_rotate(&mut mirror_cur, 2).unwrap());
+    assert!(!mirror_cur.valid);
+    assert_eq!(lot.world().objects[&mirror_cur.held].data[1], 2);
+    assert!(lot.buy_commit(&mirror_cur).is_err());
+    assert!(lot.buy_rotate(&mut mirror_cur, 4).unwrap());
+    assert!(mirror_cur.valid);
+    assert_eq!(lot.world().objects[&mirror_cur.held].data[1], 4);
     lot.buy_cancel(&mirror_cur).unwrap();
+
+    // Undo / Redo for surface purchase (`0x48ba19`, `0x4932fa`, `0x493338`):
+    // undo removes the pumpkin (if placed) then the desk lamp, refunding
+    // funds and clearing the desk slot; redo restores the lamp onto the desk.
+    assert!(lot.can_buy_undo());
+    while lot.world().objects.contains_key(&placed_lamp) {
+        assert!(lot.buy_undo().unwrap());
+    }
+    assert!(!lot.world().objects.contains_key(&placed_lamp));
+    assert_eq!(lot.world().budget.funds, funds_before);
+    assert!(lot.can_buy_redo());
+    assert!(lot.buy_redo().unwrap());
+    assert!(lot.world().objects.contains_key(&placed_lamp));
+    assert_eq!(lot.world().objects[&placed_lamp].data[2], surface_id as i16);
+    assert_eq!(lot.world().budget.funds, funds_before - lamp.price);
 
     // Missing CTSS fallback (`0x457d3b`): lamps without CTSS 2008 take their
     // OBJD chunk label instead of sorting with an empty name.
@@ -5652,4 +5677,27 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
     assert!(game.cancel_buy());
     assert!(game.buy_cursor().is_none());
     assert_eq!(game.lot().world().objects.len(), objs_before + 1);
+    let funds_after_buy = game.lot().world().budget.funds;
+    assert_eq!(funds_after_buy, 2542 - 80);
+
+    // Undo / Redo through `Game` (`0x4cf2e0` -> `0x4932fa`, `0x4cf317` ->
+    // `0x493338`): after Escape/cancel drops the repeat preview, Undo removes
+    // the paid $80 Werkbunnst Chair and refunds $80; Redo puts it back and
+    // re-charges $80; leaving Buy Mode clears both stacks (`0x4cea5d` ->
+    // `0x4933dc`).
+    assert!(game.can_undo());
+    assert!(!game.can_redo());
+    assert!(game.undo_buy());
+    assert_eq!(game.lot().world().objects.len(), objs_before);
+    assert_eq!(game.lot().world().budget.funds, 2542);
+    assert!(!game.can_undo());
+    assert!(game.can_redo());
+    assert!(game.redo_buy());
+    assert_eq!(game.lot().world().objects.len(), objs_before + 1);
+    assert_eq!(game.lot().world().budget.funds, 2542 - 80);
+    assert!(game.can_undo());
+    assert!(!game.can_redo());
+    game.set_mode(Mode::Live);
+    assert!(!game.lot().can_buy_undo());
+    assert!(!game.lot().can_buy_redo());
 }
