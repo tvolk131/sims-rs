@@ -24,6 +24,21 @@ def rows(path):
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
+def queued_actions(input_rows):
+    """The scenario's readable pushes (queued rows), each with its queue
+    call's result (accepted, uid) joined by the push id when there is one:
+    replay every push (refused ones included, since they may advance the UID
+    counter); only pushes with accepted true should end up held."""
+    results = {r['push']: r for r in input_rows if r.get('kind') == 'queue_result' and 'push' in r}
+    out = []
+    for r in input_rows:
+        if r.get('kind') != 'queued':
+            continue
+        res = results.get(r.get('push'))
+        out.append(dict(r, accepted=res['accepted'], uid=res['uid']) if res else r)
+    return out
+
+
 def ranges(numbers):
     """[1, 2, 3, 5, 10, 20, 30] -> '1-3,5,10-30/10'. A run of three or more with one step is a range."""
     numbers = sorted(set(numbers))
@@ -153,7 +168,7 @@ def build(capture, notes=(), house=None):
                          for e in events if e['kind'] == 'objects_changed'],
         dialogs=dialogs,
         presses=presses((capture / 'input-log.txt').read_text()) if (capture / 'input-log.txt').exists() else [],
-        queued=[r for r in rows(capture / 'input.jsonl') if r.get('kind') == 'queued'],
+        queued=queued_actions(rows(capture / 'input.jsonl')),
         errors=[e for e in events if e['kind'] in ('error', 'unexpected_stop')],
         dumps=[e['update'] for e in events if e['kind'] == 'dump'],
     )
