@@ -1394,6 +1394,26 @@ impl Lot {
     /// mode clears the Buy Mode Undo/Redo stacks and deletes any detached
     /// off-lot redo instances (`0x4cea5d` → `0x4933dc` → `0x48c20e`).
     pub fn set_mode(&mut self, mode: PanelMode) -> Result<(), OrderError> {
+        self.set_mode_releasing_buy_cursor(mode, None)
+    }
+
+    /// Switches the simulation's active panel mode while tearing down an
+    /// active Buy Mode `cursor` in exact native `0x4cea5d` order:
+    /// 1. `0x4cea9e` → `0x416534` (`go_live` / `set_mode`),
+    /// 2. `0x4ceac2` → `0x40726a` (`update_comeandsee`, while detached
+    ///    history objects and the active Buy cursor/preview are still
+    ///    registered so marker IDs and positions match native),
+    /// 3. `0x4ceaf5` → `0x4933dc` → `0x48c20e` (`buy_purge_detached`,
+    ///    keeping objects owned by `cursor` alive for step 4),
+    /// 4. `0x4cec3a` → `0x4cef9b` → `0x487191` / `0x487105` (`buy_cancel` on
+    ///    `cursor`, deleting unpaid previews or snapping back held existing
+    ///    objects). If snapback is refused, the entire mode switch rolls back
+    ///    atomically.
+    pub fn set_mode_releasing_buy_cursor(
+        &mut self,
+        mode: PanelMode,
+        cursor: Option<&BuyCursor>,
+    ) -> Result<(), OrderError> {
         self.ready()?;
         let previous = self.mode();
         let clearing = previous != PanelMode::Live && mode != previous;
@@ -1405,12 +1425,6 @@ impl Lot {
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
-        // Native `0x4cea5d` order when returning to Live Mode:
-        // 1. `0x4cea9e` -> `0x416534` (`go_live` / `set_mode`),
-        // 2. `0x4ceac2` -> `0x40726a` (`update_comeandsee`, while detached
-        //    sold/undone objects are still registered off-lot so new marker IDs
-        //    match native allocation),
-        // 3. `0x4ceaf5` -> `0x4933dc` -> `0x48c20e` (`buy_purge_detached`).
         interpreter
             .set_mode(&mut world, mode)
             .map_err(OrderError::Refused)?;
@@ -1420,15 +1434,25 @@ impl Lot {
                 .map_err(OrderError::Refused)?;
         }
         if clearing {
-            let empty = BTreeSet::new();
+            let mut keep = BTreeSet::new();
+            if let Some(cur) = cursor {
+                crate::buy::collect_cursor_ids(cur, &mut keep);
+                keep.insert(interpreter.lead_object(&world, cur.cursor));
+                keep.insert(interpreter.lead_object(&world, cur.held));
+            }
             interpreter
-                .buy_purge_detached(&mut world, &self.buy_redo, &empty)
+                .buy_purge_detached(&mut world, &self.buy_redo, &keep)
                 .map_err(OrderError::Refused)?;
             interpreter
-                .buy_purge_detached(&mut world, &self.buy_undo, &empty)
+                .buy_purge_detached(&mut world, &self.buy_undo, &keep)
                 .map_err(OrderError::Refused)?;
             interpreter
-                .buy_purge_detached(&mut world, &self.buy_orphans, &empty)
+                .buy_purge_detached(&mut world, &self.buy_orphans, &keep)
+                .map_err(OrderError::Refused)?;
+        }
+        if let Some(cur) = cursor {
+            interpreter
+                .buy_cancel(&mut world, cur)
                 .map_err(OrderError::Refused)?;
         }
         self.world = world;

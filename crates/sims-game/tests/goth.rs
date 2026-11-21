@@ -6548,16 +6548,49 @@ fn buy_mode_move_and_sell_replays_recorded_goth_session() {
         prompt.lines
     );
     let canvas = game.render();
-    let prompt_text_pixels = (500..600)
-        .flat_map(|y| (420..780).map(move |x| (x, y)))
-        .filter(|&(x, y)| {
+    // Native `after-sell.png` draws the bench isometric preview (`0x4384c8`)
+    // at x=264..343, y=509..590 (centered at 304, 550) and text starting at
+    // (399, 517).
+    let mut portrait_min_x = i32::MAX;
+    let mut portrait_max_x = 0;
+    let mut portrait_pixels = 0usize;
+    for y in 505..597 {
+        let bg = canvas.color[y as usize * canvas.width + 245];
+        for x in 252..390 {
             let [r, g, b] = canvas.color[y as usize * canvas.width + x as usize];
-            r > 180 && g > 180 && b > 200
-        })
-        .count();
+            let diff =
+                r.abs_diff(bg[0]) as u32 + g.abs_diff(bg[1]) as u32 + b.abs_diff(bg[2]) as u32;
+            if diff > 45 {
+                portrait_pixels += 1;
+                portrait_min_x = portrait_min_x.min(x);
+                portrait_max_x = portrait_max_x.max(x);
+            }
+        }
+    }
     assert!(
-        prompt_text_pixels > 80,
-        "expected drawn sell prompt text in strip, got {prompt_text_pixels} bright pixels"
+        portrait_pixels > 1500
+            && (260..=268).contains(&portrait_min_x)
+            && (339..=347).contains(&portrait_max_x),
+        "expected bench portrait near x=264..343, got {portrait_pixels} px at x={portrait_min_x}..{portrait_max_x}"
+    );
+    let mut text_min_x = i32::MAX;
+    let mut text_min_y = i32::MAX;
+    let mut prompt_text_pixels = 0usize;
+    for y in 505..595 {
+        for x in 395..780 {
+            let [r, g, b] = canvas.color[y as usize * canvas.width + x as usize];
+            if r > 180 && g > 180 && b > 200 {
+                prompt_text_pixels += 1;
+                text_min_x = text_min_x.min(x);
+                text_min_y = text_min_y.min(y);
+            }
+        }
+    }
+    assert!(
+        prompt_text_pixels > 80
+            && (397..=406).contains(&text_min_x)
+            && (515..=525).contains(&text_min_y),
+        "expected sell prompt text starting near (399, 517), got {prompt_text_pixels} bright px starting at ({text_min_x}, {text_min_y})"
     );
 
     // Delete sells porch bench 173/174 before u=844: refunds $250 (2462 -> 2712),
@@ -7204,7 +7237,7 @@ fn buy_mode_hand_tool_guards_depreciation_undo_redo_and_followups() {
     // (`0x4cea5d` -> `0x40726a` -> `0x4933dc`), so the surviving chair's marker
     // does NOT reuse the undone chair's ID.
     {
-        let mut g2 = Game::open(&options(install)).expect("open Goth house");
+        let mut g2 = Game::open(&options(install.clone())).expect("open Goth house");
         g2.resize([800, 600]);
         g2.render();
         assert_eq!(g2.run(60), 60);
@@ -7248,6 +7281,177 @@ fn buy_mode_hand_tool_guards_depreciation_undo_redo_and_followups() {
             marker, chair2,
             "comeandsee marker must not reuse undone chair {chair2}'s ID before 0x4933dc purge"
         );
+    }
+
+    // --- 4. Sol Round 3 regressions: refused Buy->Move->Sell Redo chain,
+    //        child-only snapback rollback + save refusal, and F1 unpaid preview
+    //        teardown AFTER `update_comeandsee` ---
+    {
+        // P2 #1: Buy -> Move -> Sell -> Undo x3 -> block origin with unpaid
+        // preview -> Redo x3 must refuse Buy, Move, AND Sell without creating
+        // free furniture or issuing an extra refund.
+        let mut g3 = Game::open(&options(install.clone())).expect("open Goth house");
+        g3.resize([800, 600]);
+        g3.render();
+        assert_eq!(g3.run(60), 60);
+        g3.set_mode(Mode::Buy);
+        let start_funds = g3.lot().world().budget.funds;
+        g3.press([258, 524]); // Seating
+        g3.release([258, 524]);
+        g3.press([437, 523]); // Werkbunnst Chair ($80)
+        g3.release([437, 523]);
+        g3.hover([577, 432]);
+        let chair = g3.buy_cursor().unwrap().held;
+        g3.press([577, 432]);
+        g3.release([577, 432]);
+        assert_eq!(g3.lot().world().budget.funds, start_funds - 80);
+        g3.cancel_buy();
+        g3.render();
+        // Pick up chair and move it to [555, 420].
+        g3.press([577, 432]);
+        g3.release([577, 432]);
+        assert_eq!(g3.buy_cursor().unwrap().held, chair);
+        g3.hover([555, 420]);
+        g3.press([555, 420]);
+        g3.release([555, 420]);
+        assert!(g3.buy_cursor().is_none());
+        g3.render();
+        // Pick up chair and sell it.
+        g3.press([555, 420]);
+        g3.release([555, 420]);
+        assert_eq!(g3.buy_cursor().unwrap().held, chair);
+        assert!(g3.sell_held());
+        assert_eq!(g3.lot().world().budget.funds, start_funds);
+        // Undo Sell, Undo Move, Undo Buy.
+        assert!(g3.undo_buy());
+        assert_eq!(g3.lot().world().budget.funds, start_funds - 80);
+        assert!(g3.undo_buy());
+        assert!(g3.undo_buy());
+        assert_eq!(g3.lot().world().budget.funds, start_funds);
+        assert!(g3.lot().world().objects[&chair].position[0] < 0);
+        // Hover unpaid chair preview over original tile [577, 432], then Redo x3.
+        g3.press([437, 523]);
+        g3.release([437, 523]);
+        g3.hover([577, 432]);
+        assert!(g3.buy_cursor().unwrap().valid);
+        assert!(!g3.redo_buy()); // Buy Redo refused
+        assert!(g3.lot().world().objects[&chair].position[0] < 0);
+        assert_eq!(g3.lot().world().budget.funds, start_funds);
+        assert!(!g3.redo_buy()); // Move Redo must NOT resurrect detached chair
+        assert!(g3.lot().world().objects[&chair].position[0] < 0);
+        assert_eq!(g3.lot().world().budget.funds, start_funds);
+        assert!(!g3.redo_buy()); // Sell Redo must NOT credit extra $80
+        assert!(g3.lot().world().objects[&chair].position[0] < 0);
+        assert_eq!(g3.lot().world().budget.funds, start_funds);
+        g3.cancel_buy();
+        assert!(!g3.undo_buy());
+        assert_eq!(g3.lot().world().budget.funds, start_funds);
+    }
+
+    {
+        // P2 #2: Child-only refusal during snapback must fail atomically and
+        // leave the paid surface child on-lot (never detached off-lot or
+        // omitted on save).
+        let mut lot3 = Lot::load(&install, &goth_house(&install), &[3], Frames::default()).unwrap();
+        for _ in 0..60 {
+            lot3.step().unwrap();
+        }
+        lot3.set_mode(sims_vm::PanelMode::Buy).unwrap();
+        let desk = catalog
+            .all()
+            .iter()
+            .find(|i| i.name.contains("Mesquite") && i.name.contains("Desk"))
+            .expect("Mesquite Desk");
+        let lamp = catalog
+            .all()
+            .iter()
+            .find(|i| i.name.contains("Gloominator"))
+            .expect("Gloominator Desk Lamp");
+        let mut d1 = lot3.buy_start(desk.guid, 1, 2).unwrap().unwrap();
+        assert!(lot3.buy_move(&mut d1, [584, 472], 1).unwrap());
+        let desk1 = lot3.buy_commit(&d1).unwrap();
+        let mut d2 = lot3.buy_start(desk.guid, 1, 2).unwrap().unwrap();
+        assert!(lot3.buy_move(&mut d2, [552, 472], 1).unwrap());
+        let desk2 = lot3.buy_commit(&d2).unwrap();
+        let mut l1 = lot3.buy_start(lamp.guid, 1, 2).unwrap().unwrap();
+        assert!(lot3.buy_move(&mut l1, [584, 472], 1).unwrap());
+        assert_eq!(l1.container.map(|(c, _)| c), Some(desk1));
+        let paid_lamp = lot3.buy_commit(&l1).unwrap();
+        // Pick up desk1 (origin captures paid_lamp in (desk1, 0)) and move to [600, 440].
+        let mut held_desk = lot3.buy_pick_up(desk1).unwrap().unwrap();
+        assert!(lot3.buy_move(&mut held_desk, [600, 440], 1).unwrap());
+        // Move paid_lamp onto desk2, then occupy (desk1, 0) with an unpaid preview lamp.
+        let mut moved_lamp = lot3.buy_pick_up(paid_lamp).unwrap().unwrap();
+        assert!(lot3.buy_move(&mut moved_lamp, [552, 472], 1).unwrap());
+        assert_eq!(moved_lamp.container.map(|(c, _)| c), Some(desk2));
+        lot3.buy_commit(&moved_lamp).unwrap();
+        let mut slot_blocker = lot3.buy_start(lamp.guid, 1, 2).unwrap().unwrap();
+        assert!(lot3.buy_move(&mut slot_blocker, [600, 440], 1).unwrap());
+        assert_eq!(slot_blocker.container.map(|(c, _)| c), Some(desk1));
+        // Now snapback of held_desk fits desk1 at [584, 472], but child
+        // paid_lamp cannot fit into occupied (desk1, 0): both buy_snap_back
+        // and save_without_buy_cursor MUST fail and keep paid_lamp on-lot.
+        assert!(lot3.buy_snap_back(&held_desk).is_err());
+        assert!(lot3.world().objects[&paid_lamp].position[0] >= 0);
+        assert!(lot3.world().objects.contains_key(&held_desk.cursor));
+        assert!(lot3.save_without_buy_cursor(&held_desk).is_err());
+        lot3.buy_cancel(&slot_blocker).unwrap();
+        lot3.buy_snap_back(&held_desk).unwrap();
+        assert_eq!(lot3.world().objects[&desk1].position, [584, 472, 1]);
+        assert_eq!(lot3.world().objects[&paid_lamp].position, [584, 472, 1]);
+    }
+
+    {
+        // P2 #3: F1 while an unpaid repeat preview is hovered over an undone
+        // chair's tile runs `go_live` -> `update_comeandsee` -> `0x4933dc`
+        // BEFORE tearing down the Buy tool (`0x4cea5d`), so chair1's marker
+        // does NOT reuse either the undone chair's ID or the preview's IDs.
+        let mut g4 = Game::open(&options(install)).expect("open Goth house");
+        g4.resize([800, 600]);
+        g4.render();
+        assert_eq!(g4.run(60), 60);
+        g4.set_mode(Mode::Buy);
+        g4.press([258, 524]); // Seating
+        g4.release([258, 524]);
+        g4.press([437, 523]); // Werkbunnst Chair
+        g4.release([437, 523]);
+        g4.hover([577, 432]);
+        let chair1 = g4.buy_cursor().unwrap().held;
+        g4.press([577, 432]);
+        g4.release([577, 432]);
+        g4.hover([555, 420]);
+        let chair2 = g4.buy_cursor().unwrap().held;
+        g4.press([555, 420]);
+        g4.release([555, 420]);
+        assert!(g4.undo_buy()); // chair2 detached in Redo; repeat preview stays armed
+        g4.hover([555, 420]);
+        let preview = g4
+            .buy_cursor()
+            .expect("unpaid repeat preview active")
+            .clone();
+        assert!(!preview.is_existing());
+        assert!(preview.valid);
+        g4.set_mode(Mode::Live);
+        assert!(g4.buy_cursor().is_none());
+        assert!(!g4.lot().world().objects.contains_key(&chair2));
+        assert!(!g4.lot().world().objects.contains_key(&preview.held));
+        assert!(!g4.lot().world().objects.contains_key(&preview.cursor));
+        let marker = g4.lot().world().objects[&chair1]
+            .relationships
+            .iter()
+            .find_map(|r| {
+                let target = u16::try_from(r.target).ok()?;
+                g4.lot()
+                    .world()
+                    .objects
+                    .get(&target)
+                    .filter(|o| o.guid == sims_vm::COMEANDSEE_GUID)
+                    .map(|_| target)
+            })
+            .expect("comeandsee marker on chair1");
+        assert_ne!(marker, chair2);
+        assert_ne!(marker, preview.held);
+        assert_ne!(marker, preview.cursor);
     }
 }
 

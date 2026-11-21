@@ -225,21 +225,30 @@ fn mode_global(mode: PanelMode) -> i16 {
 /// Collects every object ID (root + recursive surface children) referenced by
 /// `purchases` into `out`, so purging discarded history never deletes an
 /// off-lot object still owned by a surviving Undo/Redo entry (`0x48c20e`).
-pub(crate) fn collect_buy_ids(purchases: &[BuyPurchase], out: &mut BTreeSet<u16>) {
-    fn visit(placement: &BuyPlacement, out: &mut BTreeSet<u16>) {
-        out.insert(placement.object);
-        for child in &placement.children {
-            visit(child, out);
-        }
+pub(crate) fn collect_placement_ids(placement: &BuyPlacement, out: &mut BTreeSet<u16>) {
+    out.insert(placement.object);
+    for child in &placement.children {
+        collect_placement_ids(child, out);
     }
+}
+
+pub(crate) fn collect_buy_ids(purchases: &[BuyPurchase], out: &mut BTreeSet<u16>) {
     for purchase in purchases {
         out.insert(purchase.object);
         if let Some(before) = &purchase.before {
-            visit(before, out);
+            collect_placement_ids(before, out);
         }
         if let Some(after) = &purchase.after {
-            visit(after, out);
+            collect_placement_ids(after, out);
         }
+    }
+}
+
+pub(crate) fn collect_cursor_ids(cursor: &BuyCursor, out: &mut BTreeSet<u16>) {
+    out.insert(cursor.cursor);
+    out.insert(cursor.held);
+    if let Some(origin) = &cursor.origin {
+        collect_placement_ids(origin, out);
     }
 }
 
@@ -1462,7 +1471,12 @@ impl Interpreter<'_> {
         self.put(world, id, place, true)?;
         self.run_user_placement(world, id)?;
         for child in &target.children {
-            let _ = self.restore_placement(world, child, allow_create)?;
+            if self
+                .restore_placement(world, child, allow_create)?
+                .is_none()
+            {
+                return Ok(None);
+            }
         }
         Ok(Some(id))
     }
@@ -1471,7 +1485,7 @@ impl Interpreter<'_> {
     ///
     /// - **Buy (`kind == Buy`):** runs `USER_PICKUP` + `take_off` (detaching
     ///   off-lot for Redo) and refunds `price`.
-    /// - **Move (`kind == Move`):** restores the object (and any surface
+    /// - **Move (`kind == Move`):** restores the on-lot object (and any surface
     ///   children) to `before` via `0x48bfab` with no funds change.
     /// - **Sell (`kind == Sell`):** restores the detached object to `before`
     ///   via `0x48c053` → `0x48bfab` and re-deducts the refunded `price`.
@@ -1505,6 +1519,13 @@ impl Interpreter<'_> {
                 let Some(before) = purchase.before.clone() else {
                     return Ok(false);
                 };
+                if !world
+                    .objects
+                    .get(&before.object)
+                    .is_some_and(|o| on_lot([o.position[0], o.position[1]]))
+                {
+                    return Ok(false);
+                }
                 let Some(id) = self.restore_placement(world, &before, false)? else {
                     return Ok(false);
                 };
@@ -1516,6 +1537,9 @@ impl Interpreter<'_> {
                 Ok(true)
             }
             BuyActionKind::Sell => {
+                if purchase.placed {
+                    return Ok(false);
+                }
                 let target = purchase.before.clone().unwrap_or(BuyPlacement {
                     object: purchase.object,
                     guid: purchase.guid,
@@ -1545,7 +1569,7 @@ impl Interpreter<'_> {
     ///
     /// - **Buy (`kind == Buy`):** reuses the detached instance (or creates a
     ///   fallback), places it via `0x48bfab`, and re-deducts `price`.
-    /// - **Move (`kind == Move`):** restores the object (and any surface
+    /// - **Move (`kind == Move`):** restores the on-lot object (and any surface
     ///   children) to `after` via `0x48bfab` with no funds change.
     /// - **Sell (`kind == Sell`):** detaches the object off-lot (`USER_PICKUP`
     ///   + `take_off`) and refunds `price`.
@@ -1561,6 +1585,9 @@ impl Interpreter<'_> {
         };
         match purchase.kind {
             BuyActionKind::Buy => {
+                if purchase.placed {
+                    return Ok(false);
+                }
                 let target = purchase.after.clone().unwrap_or(BuyPlacement {
                     object: purchase.object,
                     guid: purchase.guid,
@@ -1586,6 +1613,13 @@ impl Interpreter<'_> {
                 let Some(after) = purchase.after.clone() else {
                     return Ok(false);
                 };
+                if !world
+                    .objects
+                    .get(&after.object)
+                    .is_some_and(|o| on_lot([o.position[0], o.position[1]]))
+                {
+                    return Ok(false);
+                }
                 let Some(id) = self.restore_placement(world, &after, false)? else {
                     return Ok(false);
                 };

@@ -1007,19 +1007,20 @@ pub fn draw(
     pointer: Option<[i32; 2]>,
 ) {
     if let Some(prompt) = &layout.sell_prompt {
-        // Native `0x50a343`: draw the object's isometric preview inside the
-        // left portrait box of the sell strip (`after-sell.png`), falling back
-        // to the catalog icon/thumbnail when no isometric sprite is cached.
-        let box_x = prompt.rect.x + 12;
-        let box_w = 152;
-        let box_h = (prompt.rect.height - 8).max(1);
+        // Native `0x50a343`: draw the object's isometric preview (`0x4384c8`)
+        // centered in the left portrait box (`after-sell.png`: bench spans
+        // x=264..343, y=509..590 centered at (304, 550); text at x=399, y=517),
+        // falling back to the catalog icon/thumbnail when absent.
+        let box_x = prompt.rect.x + 8;
+        let box_w = 112;
+        let box_h = prompt.rect.height.max(1);
         if let Some(pic) = thumbnails.balloon_picture(prompt.guid, None, box_w, box_h) {
             let draw_w = (pic.width as i32).min(box_w);
             let draw_h = (pic.height as i32).min(box_h);
             let src_x = ((pic.width as i32 - draw_w) / 2).max(0);
             let src_y = ((pic.height as i32 - draw_h) / 2).max(0);
             let dst_x = box_x + (box_w - draw_w) / 2;
-            let dst_y = prompt.rect.y + (prompt.rect.height - draw_h) / 2;
+            let dst_y = prompt.rect.y + (box_h - draw_h) / 2;
             frame.draw(pic, Rect::new(src_x, src_y, draw_w, draw_h), [dst_x, dst_y]);
         } else if let Some(icon) = thumbnails.icon(art, prompt.guid) {
             let draw_h = (icon.height as i32).min(prompt.rect.height);
@@ -1028,7 +1029,7 @@ pub fn draw(
             frame.draw(
                 &icon,
                 Rect::new(0, src_y, icon.width as i32, draw_h),
-                [prompt.rect.x + 28, dst_y],
+                [box_x + (box_w - icon.width as i32) / 2, dst_y],
             );
         } else if let Some(thumb) = thumbnails
             .item(prompt.guid)
@@ -1043,19 +1044,18 @@ pub fn draw(
             frame.draw(
                 thumb,
                 Rect::new(0, 0, half as i32, thumb.height as i32),
-                [prompt.rect.x + 28, dst_y],
+                [box_x + (box_w - half as i32) / 2, dst_y],
             );
         }
         if let Some(font) = art.font(12) {
-            let text_x = prompt.rect.x + 180;
-            let max_w = (prompt.rect.width - 192).max(40);
+            let text_x = prompt.rect.x + 159;
+            let max_w = (prompt.rect.width - 171).max(40);
             let mut wrapped = Vec::new();
             for line in &prompt.lines {
                 wrapped.extend(font.wrap(line, max_w));
             }
             let line_step = font.line_height + 2;
-            let total_h = (wrapped.len() as i32 * line_step).saturating_sub(2).max(0);
-            let mut y = prompt.rect.y + ((prompt.rect.height - total_h) / 2).max(4);
+            let mut y = prompt.rect.y + 17;
             for line in wrapped {
                 if y + font.line_height <= prompt.rect.y + prompt.rect.height {
                     font.draw(frame, &line, [text_x, y], [235, 240, 255]);
