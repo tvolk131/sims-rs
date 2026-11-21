@@ -71,6 +71,49 @@ const TICK_1103_25: &str = "e6694cc922b8164e7ef3c8b690ca9cf67a1037b21568fa7bc944
 /// The same state's hash under snapshot format 24.
 const TICK_1103_24: &str = "29bcebd6b87a9b15b737861bf8b4f7ebe13a6f2307607f4b18930f6002653f03";
 
+/// The tile at the house view's centre the Goth day's boots give
+/// ([`Lot::set_view_centre`]): the lot's middle tile. It is a stand-in
+/// start tile, not the original's camera; the recording's single
+/// 1,920-draw build at 24719 shows the real camera was not on a no-room
+/// cell, and from every start that finds a tile the day goes on the same
+/// ([`every_start_gives_one_state`]). Which camera the original opens the
+/// Goths' house with is not traced.
+const GOTH_VIEW_CENTRE: [i8; 2] = [32, 32];
+
+/// Steps `lot` once from every tile the portrait's search may start from
+/// (inside the lot's border), each from the same save, and checks that
+/// the starts that find a tile all reach one state and that the rest are
+/// exactly `no_tile`, each stopping where the original would build the
+/// portrait again. The lot is left as it was, with its view centre.
+fn every_start_gives_one_state(lot: &mut Lot, no_tile: &[[i8; 2]]) {
+    let saved = lot.save().unwrap();
+    let centre = lot.view_centre();
+    let size = lot.world().size as i8;
+    let mut states = BTreeMap::new();
+    let mut stopped = Vec::new();
+    for x in 1..size - 1 {
+        for y in 1..size - 1 {
+            lot.restore(saved.clone()).unwrap();
+            lot.set_view_centre(Some([x, y]));
+            match lot.step() {
+                Ok(_) => *states.entry(lot.world().hash_hex()).or_insert(0) += 1,
+                Err(error) => {
+                    let error = error.to_string();
+                    assert!(
+                        error.contains(&format!("from the view centre {x},{y} no tile is found")),
+                        "{x},{y}: {error}"
+                    );
+                    stopped.push([x, y]);
+                }
+            }
+        }
+    }
+    assert_eq!(stopped, no_tile);
+    assert_eq!(states.len(), 1, "{states:?}");
+    lot.restore(saved).unwrap();
+    lot.set_view_centre(centre);
+}
+
 fn digest(bytes: &[u8]) -> String {
     use sha2::Digest;
     sha2::Sha256::digest(bytes)
@@ -840,6 +883,7 @@ fn strict_mode_runs_the_goth_houses_whole_day() {
     let house = root.join("UserData/Houses/House05.iff");
     // The second answer is the adoption call's at tick 17707 (see below).
     let mut lot = Lot::load(&root, &house, &[3, 3], Frames::default()).unwrap();
+    lot.set_view_centre(Some(GOTH_VIEW_CENTRE));
     // The clock: globals 0, 5 and 6 are the hour, minute and second.
     let clock = |lot: &Lot| {
         let globals = &lot.world().globals;
@@ -1008,6 +1052,7 @@ fn the_goth_day_under_the_recordings_frames_keeps_its_streams() {
         every: vec![(4154, 30)],
     };
     let mut lot = Lot::load(&root, &house, &[3, 3], frames).unwrap();
+    lot.set_view_centre(Some(GOTH_VIEW_CENTRE));
     let streams = |lot: &Lot| {
         let world = lot.world();
         (
@@ -1068,6 +1113,12 @@ fn the_goth_day_under_the_recordings_frames_keeps_its_streams() {
     let mut tick = 0;
     for (at, lot_rng, crt) in recorded {
         while tick < at {
+            if tick == 24718 {
+                // The portrait's search at 24719 finds no tile from these
+                // four starts, each in room -5 (none), and from every other
+                // the day goes on the same.
+                every_start_gives_one_state(&mut lot, &[[19, 24], [23, 31], [26, 28], [26, 31]]);
+            }
             lot.step().unwrap();
             tick += 1;
         }

@@ -33,7 +33,7 @@ use std::collections::{BTreeSet, VecDeque};
 /// in the commit that changes any of them. The world inside is versioned
 /// by [`sims_sim::SNAPSHOT_FORMAT`], which is written too. A save of
 /// another version is refused, not migrated.
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 2;
 
 /// A lot as it stood between two steps ([`Lot::save`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +48,8 @@ pub struct Saved {
     house: u32,
     family: u16,
     loaded: [u8; 32],
+    /// Format 2 on.
+    view_centre: Option<[i8; 2]>,
 }
 
 /// Why a lot could not be saved or restored.
@@ -154,6 +156,7 @@ impl Lot {
             house: self.load.house,
             family: self.load.family,
             loaded: self.loaded,
+            view_centre: self.view_centre,
         })
     }
 
@@ -184,6 +187,7 @@ impl Lot {
         self.player.queue = saved.answers;
         self.play.fresh = saved.fresh;
         self.view_rotation = saved.view_rotation;
+        self.view_centre = saved.view_centre;
         self.halted = false;
         self.asking = None;
         self.answered = saved.answered;

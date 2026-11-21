@@ -146,8 +146,16 @@ fn a_portrait_whose_person_runs_code_when_put_down_fails_loudly() {
     // it its function 9 (0x433580), and its function 6 when the walls
     // beside the tile differ from its own (0x434fac, 0x435110). The tile
     // is not modeled.
-    for (function, at) in [(9, "0x433580"), (6, "0x435110"), (26, "0x433612")] {
+    for (function, at) in [
+        (9, "0x433580"),
+        (6, "0x435110"),
+        (26, "0x433612"),
+        (25, "0x433612"),
+        (10, "0x433148"),
+        (5, "0x4337f6"),
+    ] {
         let (mut fx, file, record) = visitors();
+        let objects: Vec<u16> = fx.world.objects.keys().copied().collect();
         let library = fx.program.libraries.get_mut(&file).unwrap();
         for table in library.callbacks.values_mut() {
             table.resize(
@@ -162,6 +170,12 @@ fn a_portrait_whose_person_runs_code_when_put_down_fails_loudly() {
         let fault = inform(&mut fx, 2, record).unwrap_err().to_string();
         assert!(fault.contains(at) && fault.contains("tree 4200"), "{fault}");
         assert!(fx.world.portraits.is_empty());
+        // The build ran on a copy of the lot: the person made is not left
+        // behind.
+        assert_eq!(
+            fx.world.objects.keys().copied().collect::<Vec<_>>(),
+            objects
+        );
     }
 }
 
@@ -183,6 +197,21 @@ fn a_portrait_whose_put_depends_on_its_tile_fails_loudly() {
     );
     let fault = inform(&mut fx, 2, record).unwrap_err().to_string();
     assert!(fault.contains("bit 0x400"), "{fault}");
+    assert!(fx.world.portraits.is_empty());
+    // Data word 7 marks the room it is put in and taken from as not
+    // counted for its light (0x433ed8, 0x4412c6).
+    let (mut fx, file, record) = visitors();
+    fx.add(
+        file,
+        4096,
+        tree(vec![
+            assign(scope::MY_DATA, 4, scope::LITERAL, 1, 1),
+            assign(scope::MY_DATA, 42, scope::LITERAL, 2, 2),
+            assign(scope::MY_DATA, 7, scope::LITERAL, 1, RETURN_TRUE),
+        ]),
+    );
+    let fault = inform(&mut fx, 2, record).unwrap_err().to_string();
+    assert!(fault.contains("data word 7"), "{fault}");
     assert!(fx.world.portraits.is_empty());
     // A person of kind 0 or 1 marks the indoor room it lands in as
     // occupied (0x45e43d), which its removal leaves: it fails while an
@@ -221,12 +250,325 @@ fn a_portrait_whose_put_depends_on_its_tile_fails_loudly() {
             assert_eq!(ran, Ok(true), "{kind} {outdoors} {pool} {occupied}");
         }
     }
+    // The rooms upstairs are not the search's: it is on the ground level.
+    let (mut fx, _, record) = visitors();
+    fx.world
+        .rooms
+        .rooms
+        .insert(9, sims_sim::rooms::Room::default());
+    fx.world.rooms.map[1].fill(9);
+    assert_eq!(inform(&mut fx, 2, record), Ok(true));
     // No tile takes it: the original removes it unput and builds again
-    // (0x4e9706, 0x4e938c).
+    // (0x4e9706, 0x4e938c). On a lot with no inside the start is 1,1.
     let (mut fx, _, record) = visitors();
     fx.world.size = 2;
     let fault = inform(&mut fx, 2, record).unwrap_err().to_string();
-    assert!(fault.contains("0x4e9706"), "{fault}");
+    assert!(
+        fault.contains("0x4e9706") && fault.contains("from 1 of the starts (1,1)"),
+        "{fault}"
+    );
+}
+
+/// [`inform`] with the house view's centre at `centre`.
+fn inform_from(
+    fx: &mut Fixture,
+    mode: u8,
+    stack_object: i16,
+    centre: Option<[i8; 2]>,
+) -> Result<bool, sims_vm::Fault> {
+    inform_hearing(fx, mode, stack_object, centre, &Default::default())
+}
+
+/// [`inform_from`], with the sounds played going to `sounds`.
+fn inform_hearing(
+    fx: &mut Fixture,
+    mode: u8,
+    stack_object: i16,
+    centre: Option<[i8; 2]>,
+    sounds: &std::cell::RefCell<Vec<sims_vm::SoundEvent>>,
+) -> Result<bool, sims_vm::Fault> {
+    fx.add(
+        LAMP_FILE,
+        4096,
+        tree(vec![ins(
+            DIALOG,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [0, 0, 0, 0, 0, 0, 0, 1 | mode << 1],
+        )]),
+    );
+    let mut interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+    interpreter.view_centre = centre;
+    interpreter.sounds = Some(sounds);
+    interpreter.run_tree(&mut fx.world, LAMP, 4096, stack_object, &[], 1000)
+}
+
+#[test]
+fn a_portrait_searches_from_the_view_centre_when_it_is_given() {
+    // On the fixture's lot, 6 tiles wide, tiles with a first coordinate
+    // below 3 are outdoors (room 2), the rest an indoor room nobody is in
+    // (1). A person of kind 0 put indoors
+    // marks the room as occupied (0x45e43d), which its removal leaves. The
+    // person's kind comes from its neighbor record (word 65).
+    let rooms = |fx: &mut Fixture| {
+        let record = fx.world.neighbors.slots.len();
+        fx.world.neighbors.slots[record - 1].as_mut().unwrap().data[65] = 0;
+        fx.world.rooms.rooms.clear();
+        fx.world
+            .rooms
+            .rooms
+            .insert(1, sims_sim::rooms::Room::default());
+        fx.world.rooms.rooms.insert(
+            2,
+            sims_sim::rooms::Room {
+                outdoors: true,
+                ..Default::default()
+            },
+        );
+        for a in 0..64 {
+            for b in 0..64 {
+                fx.world.rooms.map[0][a * 64 + b] = if a < 3 { 2 } else { 1 };
+            }
+        }
+    };
+    // With no centre, some start ends indoors.
+    let (mut fx, _, record) = visitors();
+    rooms(&mut fx);
+    let fault = inform_from(&mut fx, 2, record, None)
+        .unwrap_err()
+        .to_string();
+    assert!(fault.contains("0x468802"), "{fault}");
+    // From a centre outdoors the search ends outdoors, in the start's
+    // room, wherever outdoors it starts (a start outside the border is
+    // taken inside it), and the lot ends the same.
+    let mut ends = Vec::new();
+    for centre in [[1, 1], [2, 4], [0, 0], [2, 60]] {
+        let (mut fx, _, record) = visitors();
+        rooms(&mut fx);
+        assert_eq!(inform_from(&mut fx, 2, record, Some(centre)), Ok(true));
+        assert_eq!(fx.world.portraits, [WIDGET].into());
+        ends.push(hash_without_frames(&fx.world));
+    }
+    assert!(ends.windows(2).all(|w| w[0] == w[1]));
+    // From a centre indoors it ends indoors.
+    let (mut fx, _, record) = visitors();
+    rooms(&mut fx);
+    let fault = inform_from(&mut fx, 2, record, Some([4, 2]))
+        .unwrap_err()
+        .to_string();
+    assert!(fault.contains("0x468802"), "{fault}");
+    // From a centre no tile is found from, it fails.
+    let (mut fx, _, record) = visitors();
+    fx.world.size = 2;
+    let fault = inform_from(&mut fx, 2, record, Some([7, 7]))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        fault.contains("from the view centre 7,7 no tile is found") && fault.contains("0x4e938c"),
+        "{fault}"
+    );
+}
+
+/// An object type with a function 5 (may overlap, 0x4337f6), tree 4300.
+const OBSTACLE: u32 = 0x7777;
+
+/// What the obstacle's function 5 does.
+#[derive(Clone, Copy)]
+enum Callback {
+    Writes,
+    Plays,
+    Silent,
+}
+
+#[test]
+fn a_callback_the_search_runs_must_change_nothing_when_no_centre_is_given() {
+    // The obstacle stands at 3,3; the search's place test beside it asks
+    // its function 5 (0x433a1a), which changes the lot. Which tiles the
+    // original tries depends on the start, so with no view centre the
+    // portrait fails, and leaves the lot as it was.
+    // Its function 5 sets its data word 50 (and returns false, which the
+    // object keeps as its last result), or plays a sound and returns true
+    // as its last result was, or plays one its library does not have and
+    // returns true. Even that last one changes the lot: a run leaves its
+    // frame's words in the object's stack storage (`FrameStorage`), so
+    // with no view centre any callback the search runs stops it, unless
+    // the storage held the same words already (when only the cells, such
+    // as a sound, can show it).
+    let setup = |callback: Callback| {
+        let (mut fx, _, record) = visitors();
+        let file = fx.add_type(OBSTACLE, 4, 4096, 4097);
+        fx.add(
+            file,
+            4096,
+            tree(vec![
+                assign(scope::MY_DATA, 4, scope::LITERAL, 1, 1),
+                assign(scope::MY_DATA, 42, scope::LITERAL, 2, RETURN_TRUE),
+            ]),
+        );
+        fx.add(file, 4097, sleeper());
+        crate::visits::function(&mut fx, file, 5, 4300);
+        fx.program
+            .libraries
+            .get_mut(&file)
+            .unwrap()
+            .sounds
+            .insert(5, "bump".into());
+        fx.add(
+            file,
+            4300,
+            tree(vec![match callback {
+                Callback::Writes => assign(scope::MY_DATA, 50, scope::LITERAL, 1, RETURN_FALSE),
+                Callback::Plays => ins(23, RETURN_TRUE, ERROR, [5, 0, 0, 0, 0, 0, 0, 0]),
+                Callback::Silent => ins(23, RETURN_TRUE, ERROR, [6, 0, 0, 0, 0, 0, 0, 0]),
+            }]),
+        );
+        let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        let id = interpreter.create(&mut fx.world, OBSTACLE).unwrap();
+        let cell = (3 * 64 + 3) * 2;
+        let grid = &mut fx.world.arrays.get_mut(&3).unwrap().data;
+        grid[cell..cell + 2].copy_from_slice(&id.to_le_bytes());
+        let position = [3 * 16 + 8, 3 * 16 + 8, 1];
+        let room = fx.world.room_at(position).unwrap();
+        let obstacle = fx.world.objects.get_mut(&id).unwrap();
+        obstacle.position = position;
+        obstacle.data[29] = room;
+        (fx, record, id)
+    };
+    let (mut fx, record, id) = setup(Callback::Writes);
+    let objects: Vec<u16> = fx.world.objects.keys().copied().collect();
+    let fault = inform_from(&mut fx, 2, record, None)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        fault.contains(&format!("object {id}'s function 5 (tree 4300)")),
+        "{fault}"
+    );
+    assert_eq!(
+        fx.world.objects.keys().copied().collect::<Vec<_>>(),
+        objects
+    );
+    assert_eq!(fx.world.objects[&id].data[50], 0);
+    // From a centre beside it, the search asks it as the original does,
+    // and what it does stays.
+    let (mut fx, record, id) = setup(Callback::Writes);
+    assert_eq!(inform_from(&mut fx, 2, record, Some([3, 4])), Ok(true));
+    assert_eq!(fx.world.objects[&id].data[50], 1);
+    // A sound is a change to the machine's cells: the same.
+    let (mut fx, record, id) = setup(Callback::Plays);
+    let heard = Default::default();
+    let fault = inform_hearing(&mut fx, 2, record, None, &heard)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        fault.contains(&format!("object {id}'s function 5 (tree 4300)")),
+        "{fault}"
+    );
+    assert!(heard.borrow().is_empty());
+    let (mut fx, record, id) = setup(Callback::Plays);
+    let heard = Default::default();
+    assert_eq!(
+        inform_hearing(&mut fx, 2, record, Some([3, 4]), &heard),
+        Ok(true)
+    );
+    // (Other sounds the inform makes, such as a stop, come after it.)
+    assert_eq!(
+        heard.into_inner().first(),
+        Some(&sims_vm::SoundEvent::Play {
+            object: id as i16,
+            name: "bump".into()
+        })
+    );
+    // A callback that plays nothing and returns its last result still
+    // leaves its frame in the obstacle's stack storage.
+    let (mut fx, record, id) = setup(Callback::Silent);
+    assert!(fx.world.objects[&id].last_result);
+    let storage = fx.world.frame_storage[&id].clone();
+    let fault = inform_from(&mut fx, 2, record, None)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        fault.contains(&format!("object {id}'s function 5 (tree 4300)")),
+        "{fault}"
+    );
+    assert_eq!(
+        format!("{:?}", fx.world.frame_storage[&id]),
+        format!("{storage:?}")
+    );
+    // With the storage holding the words its run leaves already, only the
+    // sound it plays shows the change.
+    let (mut fx, record, id) = setup(Callback::Plays);
+    let heard = Default::default();
+    assert_eq!(
+        inform_hearing(&mut fx, 2, record, Some([3, 4]), &heard),
+        Ok(true)
+    );
+    let used = fx.world.frame_storage[&id].clone();
+    let (mut fx, record, id) = setup(Callback::Plays);
+    fx.world.frame_storage.insert(id, used);
+    let heard = Default::default();
+    let fault = inform_hearing(&mut fx, 2, record, None, &heard)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        fault.contains(&format!("object {id}'s function 5 (tree 4300)")),
+        "{fault}"
+    );
+    assert!(heard.borrow().is_empty());
+    let (mut fx, record, id) = setup(Callback::Silent);
+    assert_eq!(inform_from(&mut fx, 2, record, Some([3, 4])), Ok(true));
+    assert_ne!(
+        format!("{:?}", fx.world.frame_storage[&id]),
+        format!("{storage:?}")
+    );
+}
+
+/// The strings of the dialogs in [`text_dialog`]: STR# 301, from 1.
+const TEXT_STRINGS: [&str; 4] = ["Hello", "$Neighbor", "$Object", "$Object then $Neighbor"];
+
+/// The catalog string table the person's definition names (word 41).
+const SIM_NAMES: u16 = 2000;
+
+/// The person (2) as the stack object of a dialog whose message, label
+/// and title are entries of [`TEXT_STRINGS`] (0 for none). Neighbor record
+/// 2 is of the widget's type, with nobody of it on the lot. The person's
+/// catalog name, which `$Object` is replaced by, is `names` (CTSS entries
+/// with their language), or no table at all.
+fn text_dialog((label, title, message): (u8, u8, u8), names: Option<Vec<(u8, &str)>>) -> Fixture {
+    let (mut fx, _, record) = visitors();
+    let neighbor = fx.world.neighbors.slots[record as usize - 1].clone();
+    let slots = &mut fx.world.neighbors.slots;
+    slots.resize(slots.len().max(2), None);
+    slots[usize::from(SIM) - 1] = neighbor;
+    fx.world.people = vec![SIM];
+    fx.program
+        .libraries
+        .get_mut(&LAMP_FILE)
+        .unwrap()
+        .strings
+        .insert(301, TEXT_STRINGS.map(str::to_owned).to_vec());
+    fx.words(SIM_FILE)[41] = SIM_NAMES as i16;
+    if let Some(names) = names {
+        fx.program
+            .libraries
+            .get_mut(&SIM_FILE)
+            .unwrap()
+            .catalog_strings
+            .insert(
+                SIM_NAMES,
+                names.into_iter().map(|(l, t)| (l, t.to_owned())).collect(),
+            );
+    }
+    fx.add(
+        LAMP_FILE,
+        4096,
+        tree(vec![ins(
+            DIALOG,
+            RETURN_TRUE,
+            RETURN_FALSE,
+            [0, 0, message, label, 0, 0, title, 1],
+        )]),
+    );
+    fx
 }
 
 #[test]
@@ -236,45 +578,51 @@ fn a_dialogs_text_can_show_the_stack_objects_neighbor_instead() {
     // (operand 6), message (operand 2): `$Neighbor` gives the stack
     // object's neighbor record's type, `$Object` the stack object's, and
     // the last found is kept. With neither, the stack object's (0x436308).
-    let strings = ["Hello", "$Neighbor", "$Object", "$Object then $Neighbor"];
-    for ((label, title, message), shown) in [
+    // The person's name is plain.
+    for (strings, shown) in [
         ((0, 0, 1), SIM_GUID),
         ((0, 0, 2), WIDGET),
         ((2, 3, 0), SIM_GUID),
         ((3, 0, 2), WIDGET),
         ((0, 0, 4), WIDGET),
     ] {
-        // The person (2) is the stack object, and neighbor record 2 is of
-        // the widget's type, with nobody of it on the lot.
-        let (mut fx, _, record) = visitors();
-        let neighbor = fx.world.neighbors.slots[record as usize - 1].clone();
-        let slots = &mut fx.world.neighbors.slots;
-        slots.resize(slots.len().max(2), None);
-        slots[usize::from(SIM) - 1] = neighbor;
-        fx.world.people = vec![SIM];
-        fx.program
-            .libraries
-            .get_mut(&LAMP_FILE)
-            .unwrap()
-            .strings
-            .insert(301, strings.map(str::to_owned).to_vec());
-        fx.add(
-            LAMP_FILE,
-            4096,
-            tree(vec![ins(
-                DIALOG,
-                RETURN_TRUE,
-                RETURN_FALSE,
-                [0, 0, message, label, 0, 0, title, 1],
-            )]),
-        );
+        let mut fx = text_dialog(strings, Some(vec![(1, "Grim")]));
         let ran = fx.run_with(LAMP, 4096, SIM as i16, &[], 1000);
-        assert_eq!(ran, Ok(true), "{label} {title} {message}");
-        assert_eq!(
-            fx.world.portraits,
-            [shown].into(),
-            "{label} {title} {message}"
-        );
+        assert_eq!(ran, Ok(true), "{strings:?}");
+        assert_eq!(fx.world.portraits, [shown].into(), "{strings:?}");
+    }
+}
+
+#[test]
+fn an_object_name_that_may_hold_a_neighbor_token_fails_loudly() {
+    // `$Object` is replaced by the stack object's catalog name (0x44c1ca,
+    // 0x457d3b), and the `$Neighbor` pass after it reads the name too: a
+    // name holding `$Neighbor` shows the neighbor's type. The entry
+    // 0x4061e3 picks is not ported, so a name is plain only when its table
+    // has an entry in language 1 and no entry is empty (which falls back
+    // to the definition's own name, 0x457db4) or holds `$Neighbor`. Where
+    // that decides the portrait, the dialog fails.
+    for names in [
+        None,
+        Some(vec![(1, "Grim $Neighbor")]),
+        Some(vec![(1, "Grim"), (2, "$Neighbor")]),
+        Some(vec![(1, "")]),
+        Some(vec![(2, "Grim")]),
+    ] {
+        for strings in [(2, 3, 0), (0, 0, 3)] {
+            let mut fx = text_dialog(strings, names.clone());
+            let fault = fx
+                .run_with(LAMP, 4096, SIM as i16, &[], 1000)
+                .unwrap_err()
+                .to_string();
+            assert!(fault.contains("0x44c1ca"), "{names:?} {strings:?}: {fault}");
+            assert!(fx.world.portraits.is_empty());
+        }
+        // Where the neighbor is found after the name, the name does not
+        // matter.
+        let mut fx = text_dialog((3, 0, 2), names.clone());
+        assert_eq!(fx.run_with(LAMP, 4096, SIM as i16, &[], 1000), Ok(true));
+        assert_eq!(fx.world.portraits, [WIDGET].into(), "{names:?}");
     }
 }
 

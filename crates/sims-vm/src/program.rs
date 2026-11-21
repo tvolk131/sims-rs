@@ -50,6 +50,10 @@ pub struct Library {
     /// Each string table (STR#) by chunk ID: its entries in the first
     /// language, in order.
     pub strings: BTreeMap<u16, Vec<String>>,
+    /// Each catalog string table (CTSS) by chunk ID: every entry, with its
+    /// language. A definition's word 41 names its table, whose name the
+    /// dialog formatter writes for `$Object` (0x44c1ca, 0x457d3b).
+    pub catalog_strings: BTreeMap<u16, Vec<(u8, String)>>,
     /// The sound event each FWAV chunk names, by chunk ID: what Play
     /// Sound Event plays (0x582c57). The name is the chunk's bytes up to
     /// the first zero, read as Latin-1.
@@ -239,6 +243,16 @@ impl Program {
                         library.tree_names.clone_from(&entries);
                     }
                     library.strings.insert(chunk.id, entries);
+                }
+                b"CTSS" => {
+                    let table = sims_formats::strings::StringTable::parse(data)
+                        .map_err(|e| format("CTSS", chunk.id, e))?;
+                    let entries = table
+                        .entries
+                        .iter()
+                        .map(|entry| (entry.language, entry.text.clone()))
+                        .collect();
+                    library.catalog_strings.insert(chunk.id, entries);
                 }
                 b"FWAV" => {
                     let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());

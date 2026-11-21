@@ -50,6 +50,8 @@ use std::collections::BTreeSet;
 /// A definition's type word (+0x12), and its value for a person.
 const TYPE: usize = 9;
 const PERSON_TYPE: i16 = 2;
+/// Definition word 41 (+0x52): the catalog string table (0x457d5f).
+const CATALOG_STRINGS: usize = 41;
 
 /// Record status: made and not shown yet.
 pub const NEW: u8 = 0;
@@ -253,15 +255,18 @@ impl Machine<'_, '_> {
                      {fault}"
                 ))
             };
+            // On a copy of the lot, kept only when the whole build is done:
+            // a build that fails leaves no person behind (the original
+            // removes it on every path, 0x4e8fdb, 0x4e9706).
+            let mut copy = self.world.clone();
             let id = interpreter
-                .create_person(self.world, guid)
+                .create_person(&mut copy, guid)
                 .map_err(unsupported)?;
             interpreter
-                .portrait_put(self.world, id)
+                .portrait_put(&mut copy, id)
                 .map_err(|fault| fault.trap)?;
-            interpreter
-                .remove_now(self.world, id)
-                .map_err(unsupported)?;
+            interpreter.remove_now(&mut copy, id).map_err(unsupported)?;
+            *self.world = copy;
         }
         self.world.portraits.insert(guid);
         Ok(())
@@ -342,20 +347,28 @@ impl Machine<'_, '_> {
             .and_then(|id| self.world.objects.get(&id))
             .map(|object| object.guid);
         let neighbor = self.world.neighbors.get(stack_object).map(|r| r.guid);
+        let object_name_plain = match object {
+            Some(guid) => self.catalog_name_is_plain(guid)?,
+            None => true,
+        };
         // What may have been found so far: more than one where a type's
         // name, which is not known, took the place of a `$NeighborLocal`
         // token and the `$Neighbor` pass depends on whether it holds
         // `$Neighbor`.
         let mut found = BTreeSet::from([None]);
         for text in self.dialog_strings(operands)? {
-            if text.contains("$Object") && object.is_some() {
+            // `$Object` is replaced by the object's name (0x44c1ca), which
+            // is not known either.
+            let object_named = text.contains("$Object") && object.is_some();
+            if object_named {
                 found = BTreeSet::from([object]);
             }
+            let text = text.replace("$Object", "(name)");
             let (text, named) = self.neighbor_locals_named(&text)?;
             if neighbor.is_some() {
                 if text.contains("$Neighbor") {
                     found = BTreeSet::from([neighbor]);
-                } else if named {
+                } else if named || (object_named && !object_name_plain) {
                     found.insert(neighbor);
                 }
             }
@@ -364,13 +377,38 @@ impl Machine<'_, '_> {
         let shown: BTreeSet<_> = found.iter().map(|f| f.or(object)).collect();
         if shown.len() > 1 {
             return Err(Trap::Unsupported(
-                "a dialog's text names a person type for `$NeighborLocal`, and whether that \
-                 type's name (0x4e9c46, from the interface's table, 0x4e893e) holds `$Neighbor` \
-                 decides the portrait (0x44c65f): the names are not ported"
+                "a dialog's text has a name in place of `$Object` (0x44c1ca) or \
+                 `$NeighborLocal` (0x4e9c46, from the interface's table, 0x4e893e), and whether \
+                 that name holds `$Neighbor` decides the portrait (0x44c65f): the names are not \
+                 ported"
                     .into(),
             ));
         }
         Ok(found.into_iter().next().flatten())
+    }
+
+    /// Whether the name the formatter writes for `$Object` of type `guid`
+    /// (0x44c1ca) is sure to hold no `$Neighbor`. The name is an entry of
+    /// the catalog string table definition word 41 names (0x457d3b,
+    /// 0x4061e3), or the definition's own name if that entry is empty
+    /// (0x457db4). Which entry 0x4061e3 picks is not ported, so the name is
+    /// taken to be plain only when the table is there, has an entry in the
+    /// first language (the one every string table is read in), and every
+    /// entry is not empty and holds no `$Neighbor`.
+    fn catalog_name_is_plain(&self, guid: u32) -> Result<bool, Trap> {
+        let table = self.definition_words(guid)?[CATALOG_STRINGS] as u16;
+        let definition = self.definition(guid)?;
+        Ok(self
+            .program
+            .libraries
+            .get(&definition.resource)
+            .and_then(|library| library.catalog_strings.get(&table))
+            .is_some_and(|entries| {
+                entries.iter().any(|(language, _)| *language == 1)
+                    && entries
+                        .iter()
+                        .all(|(_, text)| !text.is_empty() && !text.contains("$Neighbor"))
+            }))
     }
 
     /// `text` after the formatter's `$NeighborLocal` pass (0x44c590 to

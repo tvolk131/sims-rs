@@ -161,10 +161,15 @@ fn a_halted_lot_is_not_saved() {
 #[test]
 fn bytes_of_another_layout_are_refused() {
     assert!(matches!(Saved::decode(&[1, 0]), Err(SaveError::Format(_))));
-    let mut header = 2u32.to_le_bytes().to_vec();
+    // A save of the layout before this one (format 1 had no view centre).
+    let older = sims_vm::boot::save::FORMAT - 1;
+    let mut header = older.to_le_bytes().to_vec();
     header.extend(sims_sim::SNAPSHOT_FORMAT.to_le_bytes());
     let refused = Saved::decode(&header).unwrap_err().to_string();
-    assert!(refused.contains("save format 2"), "{refused}");
+    assert!(
+        refused.contains(&format!("save format {older}")),
+        "{refused}"
+    );
     // The world's encoding is checked as well.
     let mut header = sims_vm::boot::save::FORMAT.to_le_bytes().to_vec();
     header.extend((sims_sim::SNAPSHOT_FORMAT - 1).to_le_bytes());

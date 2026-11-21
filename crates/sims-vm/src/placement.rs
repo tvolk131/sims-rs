@@ -256,6 +256,10 @@ pub(crate) const SEAT: usize = 26;
 /// Person data word 65, the person's kind: one of 0 or 1 notes the room
 /// it is in (0x45e43d).
 const PERSON_KIND: usize = 65;
+/// The callback the place test asks of the objects in the way (0x4337f6).
+const ALLOW_OVERLAP: usize = 5;
+/// The callback the removal asks before it takes an object off (0x433148).
+const BEFORE_REMOVAL: usize = 10;
 const SEAT_CHANGED: usize = 25;
 pub(crate) const WALLS_CHANGED: usize = 6;
 
@@ -1258,96 +1262,166 @@ impl Interpreter<'_> {
         Ok(())
     }
 
-    /// The put of a person made for a dialog's portrait (virtual function
-    /// 0x88, 0x45e4e9: [`Self::put_person`]), on a tile the interface finds
-    /// from the house view's centre (0x4347f0), which is presentation and
-    /// not modeled. What the put does that does not depend on the tile is
-    /// done: the interface's work for an object come from outside
-    /// ([`Self::placed_from_outside`]). What depends on the tile fails
-    /// loudly where it could leave the lot otherwise than the person's
-    /// removal finds it, which the caller then makes:
+    /// The put of a person made for a dialog's portrait (0x4e96c5 to
+    /// 0x4e9704). The interface searches for a tile ([`Self::search`],
+    /// 0x4347f0, with the defaults of 0x4347d1: a spiral on the ground
+    /// level, in the start tile's room, on an empty tile) from the house
+    /// view's centre (0x4a677c), and puts the person there (virtual
+    /// function 0x88, 0x45e4e9: [`Self::put_person`]); with no tile it
+    /// removes the person unput (0x4e9706). The view is presentation, so
+    /// the tile at its centre is an input ([`Interpreter::view_centre`]):
+    /// when it is given the search is made from it, and when it is not the
+    /// search is made from every tile it may start from. The put is done
+    /// only as far as it is the same on every tile the search may end on:
+    /// the interface's work for an object come from outside
+    /// ([`Self::placed_from_outside`], 0x44752e). The person's removal,
+    /// which the caller then makes, is taken to undo the rest of the put
+    /// (the rooms, 0x440385; the tiles, 0x4330d7; **unverified**).
     ///
-    /// 1. its function 9 (placed), 6 (walls changed, 0x435110) or 26 (a
-    ///    seat: the objects on the tile ahead are told, and may be asked
-    ///    their function 9, 0x433612) names a tree;
-    /// 2. data word 40 has bit 0x400: the room it lands in is marked as not
-    ///    counted;
-    /// 3. it is a person of kind 0 or 1 and an indoor room that is not a
-    ///    pool is not marked as occupied: the room it lands in is marked
-    ///    ([`World::note_occupant`] through [`Self::note_room`]), and the
-    ///    removal leaves the mark;
-    /// 4. no tile on the ground level takes it ([`Self::fits`]): the
-    ///    original then removes it unput and builds again (0x4e9706,
-    ///    0x4e938c).
+    /// It fails loudly where the tile would matter:
     ///
-    /// Where some tile takes it, the search is taken to find one
-    /// (**unverified**: its reach from the view's centre is not ported).
+    /// 1. the person's definition names a tree for a function the put, the
+    ///    search or the removal asks: 9 (placed, 0x433580), 6 (walls
+    ///    changed, 0x435110), 25 and 26 (a seat: the objects beside it may
+    ///    be asked their function 9, 0x433612), 10 (before the removal,
+    ///    0x433148, which sees the room it was put in) and 5 (0x4337f6).
+    ///    Its Init (function 0) runs when it is made, as for any person;
+    /// 2. with no view centre given, a callback tree the search's place
+    ///    tests run changes the lot or the machine's cells (function 5 of
+    ///    the person and of the objects in its way beside a tile it tries,
+    ///    0x434b94, 0x433a1a, 0x433a35): which tiles the original tries
+    ///    depends on the start. One that changes nothing may run, and its
+    ///    answer is used. The calls are not noted in the trace of calls
+    ///    (`Interpreter::asked`). With a view centre given, the search's
+    ///    callbacks run as they do in the original;
+    /// 3. data word 7 is not 0: the room it is put in and taken from is
+    ///    marked as not counted for its light (0x433ed8, 0x4412c6);
+    /// 4. data word 40 has bit 0x400: the room it is put in is marked as
+    ///    not counted (0x433340);
+    /// 5. no tile is found (from the view centre, or with none given from
+    ///    some start): the original then removes it unput and builds again
+    ///    in the same dialog (0x4e9706, 0x4e938c), which is not ported;
+    /// 6. it is a person of kind 0 or 1 (person word 65; a pet is above 1)
+    ///    and the tile the search ends on (with no view centre given, any
+    ///    it may end on) is in an indoor room that is not a pool and not
+    ///    marked as occupied: the put marks it ([`World::note_occupant`]
+    ///    through [`Self::note_room`], 0x45e43d, 0x468802), and the
+    ///    removal leaves the mark.
     pub(crate) fn portrait_put(&self, world: &mut World, id: u16) -> Result<(), Fault> {
         let fail = |what: String| Fault {
             object: id,
             at: None,
             trap: Trap::Unsupported(format!(
-                "a dialog's portrait puts a person on a tile found from the house view's centre \
-                 (0x45e4e9, 0x433340, 0x4347f0), which is not modeled, and {what}"
+                "a dialog's portrait puts a person on a tile searched for from the house view's \
+                 centre (0x4e96dd, 0x4347f0, 0x4a677c; `Lot::set_view_centre`), and {what}"
             )),
         };
+        let datum = |world: &World, index: usize| {
+            datum(world, id, index).map_err(|trap| Fault {
+                object: id,
+                at: None,
+                trap,
+            })
+        };
         for (function, at) in [
-            (function::PLACED, "0x433580"),
+            (ALLOW_OVERLAP, "0x4337f6"),
             (WALLS_CHANGED, "0x435110"),
+            (function::PLACED, "0x433580"),
+            (BEFORE_REMOVAL, "0x433148"),
+            (SEAT_CHANGED, "0x433612"),
             (SEAT, "0x433612"),
         ] {
             let tree = self.function_tree(world, id, function);
             if tree != 0 {
                 return Err(fail(format!(
-                    "the person's function {function} (tree {tree}, {at}) depends on the tile"
+                    "the person's function {function} names tree {tree} ({at})"
                 )));
             }
         }
-        let flags = datum(world, id, data::FLAGS_2).map_err(|trap| Fault {
-            object: id,
-            at: None,
-            trap,
-        })?;
-        if flags as u16 & 0x400 != 0 {
+        if datum(world, data::LIGHTS_ROOM)? != 0 {
             return Err(fail(
-                "data word 40 bit 0x400 marks the room it lands in as not counted".into(),
+                "data word 7 marks the room it is put in as not counted for its light (0x433ed8, \
+                 0x4412c6)"
+                    .into(),
             ));
         }
+        if datum(world, data::FLAGS_2)? as u16 & 0x400 != 0 {
+            return Err(fail(
+                "data word 40 bit 0x400 marks the room it lands in as not counted (0x433340)"
+                    .into(),
+            ));
+        }
+        let rules = Rules {
+            same_room: true,
+            empty: true,
+            unmarked: false,
+        };
+        let ends = match self.view_centre {
+            Some([x, y]) => {
+                let from = [(i32::from(x) << 4) | 8, (i32::from(y) << 4) | 8];
+                let Some([a, b]) = self.search(world, id, from, 1, rules)? else {
+                    return Err(fail(format!(
+                        "from the view centre {x},{y} no tile is found: the original removes it \
+                         unput and builds the portrait again (0x4e9706, 0x4e938c)"
+                    )));
+                };
+                BTreeSet::from([Some([(a >> 4) as i8, (b >> 4) as i8])])
+            }
+            None => {
+                // On a copy of the lot and of the machine's cells, with
+                // every callback tree the search's place tests run held to
+                // leave both as they were.
+                let mut copy = world.clone();
+                let cells = crate::both_ways::Cells::of(self);
+                let probe = Interpreter {
+                    asked: None,
+                    callbacks_must_be_pure: true,
+                    ..cells.on(self)
+                };
+                let mut ends = probe.search_from_anywhere(&mut copy, id, 1, rules)?;
+                if let Some(starts) = ends.remove(&None) {
+                    let listed: Vec<String> = starts
+                        .iter()
+                        .take(8)
+                        .map(|[x, y]| format!("{x},{y}"))
+                        .collect();
+                    return Err(fail(format!(
+                        "no view centre is given, and from {} of the starts ({}{}) no tile is \
+                         found: the original removes it unput and builds the portrait again \
+                         (0x4e9706, 0x4e938c)",
+                        starts.len(),
+                        listed.join("; "),
+                        if starts.len() > 8 { "; ..." } else { "" },
+                    )));
+                }
+                ends.into_keys().collect()
+            }
+        };
         let kind = world
             .objects
             .get(&id)
             .and_then(|o| o.person.as_ref())
             .and_then(|p| p.data.get(PERSON_KIND).copied())
             .unwrap_or(0);
-        if kind <= 1
-            && world
-                .rooms
-                .rooms
-                .values()
-                .any(|r| !r.outdoors && !r.pool && !r.occupied)
-        {
-            return Err(fail(
-                "it marks the room it lands in as occupied (0x45e43d, 0x468802), and an indoor \
-                 room is not"
-                    .into(),
-            ));
-        }
-        let mut copy = world.clone();
-        let mut fits = false;
-        'tiles: for x in 1..i32::from(world.size) - 1 {
-            for y in 1..i32::from(world.size) - 1 {
-                if self.fits(&mut copy, id, [x * 16 + 8, y * 16 + 8], 1)? {
-                    fits = true;
-                    break 'tiles;
+        if kind <= 1 {
+            for [a, b] in ends.into_iter().flatten() {
+                let room = find::room(world, a, b, 1).map_err(|trap| Fault {
+                    object: id,
+                    at: None,
+                    trap,
+                })?;
+                if world
+                    .rooms
+                    .rooms
+                    .get(&room)
+                    .is_some_and(|r| !r.outdoors && !r.pool && !r.occupied)
+                {
+                    return Err(fail(format!(
+                        "it may land in room {room}, which it marks as occupied (0x45e43d, \
+                         0x468802) and its removal leaves marked"
+                    )));
                 }
             }
-        }
-        if !fits {
-            return Err(fail(
-                "no tile on the ground level takes it: the original removes it unput and builds \
-                 the portrait again (0x4e9706, 0x4e938c)"
-                    .into(),
-            ));
         }
         self.placed_from_outside(world, id)
     }

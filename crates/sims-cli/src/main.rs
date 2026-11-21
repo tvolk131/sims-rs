@@ -12,7 +12,8 @@ const USAGE: &str = "usage: sims census <path>...
        sims install <install-root>
        sims houses <install-root> <neighborhood-dir>
        sims boot <install-root> <house-file> [--ticks N] [--answers A,B,...]
-                 [--frames LIST] [--snapshot FILE] [--play]
+                 [--view-centre X,Y] [--frames LIST] [--snapshot FILE]
+                 [--play]
 
   census   Decode every resource under the given files or directories and
            report failures and resource types that have no reader yet.
@@ -23,7 +24,10 @@ const USAGE: &str = "usage: sims census <path>...
   boot     Run a house's lot load as far as it is implemented, then N ticks,
            and print the hash of the state it reaches. A dialog with a
            choice takes the next of --answers (2 for the first button, 3
-           the second, 4 the third). --frames says after which ticks the
+           the second, 4 the third). --view-centre is the tile at the
+           centre of the house view, which a dialog's portrait searches
+           from for a tile; without it a boot stops where that tile would
+           matter. --frames says after which ticks the
            house view draws a frame: tick numbers (0 for before the first
            tick), N+ for every tick from N on, N+S for N and every S-th
            tick from there, or none; the default is 0,1,2,3,33+30.
@@ -77,6 +81,7 @@ fn main() -> ExitCode {
                 house: house.as_ref(),
                 ticks: 0,
                 answers: Vec::new(),
+                view_centre: None,
                 snapshot: None,
                 frames: boot::Frames::default(),
                 play: false,
@@ -95,6 +100,16 @@ fn main() -> ExitCode {
                         match list.split(',').map(str::parse::<u8>).collect() {
                             Ok(answers) => options.answers = answers,
                             Err(_) => {
+                                eprintln!("{USAGE}");
+                                return ExitCode::from(2);
+                            }
+                        }
+                    }
+                    ("--view-centre", Some(tile)) => {
+                        let parsed: Result<Vec<i8>, _> = tile.split(',').map(str::parse).collect();
+                        match parsed.as_deref() {
+                            Ok(&[x, y]) => options.view_centre = Some([x, y]),
+                            _ => {
                                 eprintln!("{USAGE}");
                                 return ExitCode::from(2);
                             }

@@ -205,6 +205,9 @@ pub struct Lot {
 
     /// The house view's rotation, 0 to 3 ([`Lot::set_view_rotation`]).
     view_rotation: u8,
+    /// The tile at the house view's centre, if known
+    /// ([`Lot::set_view_centre`]).
+    view_centre: Option<[i8; 2]>,
     /// The world's hash as the load left it, which a save carries so it
     /// goes back only into a lot loaded from the same files
     /// ([`save`]).
@@ -672,6 +675,7 @@ impl Lot {
             asking: None,
 
             view_rotation,
+            view_centre: None,
             loaded,
         })
     }
@@ -773,6 +777,7 @@ impl Lot {
         let interpreter = Interpreter {
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut first_frame = None;
@@ -876,6 +881,7 @@ impl Lot {
         self.ready()?;
         let interpreter = Interpreter {
             view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -901,6 +907,7 @@ impl Lot {
         let interpreter = Interpreter {
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -931,6 +938,7 @@ impl Lot {
         let interpreter = Interpreter {
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -957,6 +965,7 @@ impl Lot {
         self.ready()?;
         let interpreter = Interpreter {
             view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -979,6 +988,7 @@ impl Lot {
         let interpreter = Interpreter {
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -1011,6 +1021,7 @@ impl Lot {
         let interpreter = Interpreter {
             sounds: Some(&sounds),
             view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut world = self.world.clone();
@@ -1139,6 +1150,26 @@ impl Lot {
         self.view_rotation = rotation & 3;
     }
 
+    /// The tile at the house view's centre, if known
+    /// ([`Lot::set_view_centre`]).
+    pub fn view_centre(&self) -> Option<[i8; 2]> {
+        self.view_centre
+    }
+
+    /// Sets the tile at the house view's centre, `None` for not known. A
+    /// dialog's portrait searches from it for a tile to put a person on
+    /// (0x4e96dd, 0x4347f0, 0x4a677c, 0x4a7b58), so the simulation reads
+    /// it, and it is an input like [`Lot::set_view_rotation`]: the view
+    /// that shows the lot would set it whenever its camera moves, and a
+    /// recording of play must note each change. Where it is not known and
+    /// the tile searched from would change what the portrait does, the
+    /// step fails as an unported branch does.
+    /// The load leaves it not known: which camera the original opens a
+    /// house with is not traced.
+    pub fn set_view_centre(&mut self, centre: Option<[i8; 2]>) {
+        self.view_centre = centre;
+    }
+
     /// What the load did.
     pub fn load_report(&self) -> &LoadReport {
         &self.load
@@ -1209,6 +1240,7 @@ mod tests {
             asking: None,
 
             view_rotation: 0,
+            view_centre: None,
             loaded,
         }
     }

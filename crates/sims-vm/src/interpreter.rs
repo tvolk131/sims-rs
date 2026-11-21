@@ -134,6 +134,15 @@ pub struct Interpreter<'a> {
     /// gives 0, and a booted lot passes its own
     /// ([`crate::boot::Lot::set_view_rotation`]).
     pub view_rotation: u8,
+    /// The tile at the centre of the house view, which a dialog's portrait
+    /// searches from for a tile to put a person on (0x4e96dd, 0x4347f0:
+    /// the view's pick at the centre of its rectangle, 0x4a677c,
+    /// 0x4a7b58). It is where the player's camera is, not the lot's, so it
+    /// is an input like [`Interpreter::view_rotation`]: None (not known)
+    /// from [`Interpreter::new`], and a booted lot passes its own
+    /// ([`crate::boot::Lot::set_view_centre`]). The pick itself is not
+    /// ported, so the input is the tile it gives.
+    pub view_centre: Option<[i8; 2]>,
     /// While a person's own tick runs its thread, the person and the
     /// animator refresh pending from its taking itself off the lot
     /// ([`crate::placement::Refreshing`]). None otherwise.
@@ -148,6 +157,11 @@ pub struct Interpreter<'a> {
     /// off the lot (`Interpreter::refresh_at_take_off`), where a timed
     /// event that would play a sound fails ([`crate::clip_events`]).
     pub(crate) take_off_refresh: bool,
+    /// While a dialog's portrait searches for a tile from every start
+    /// (`Interpreter::portrait_put`): a callback tree that runs must leave
+    /// the lot and every cell as it found them, or it fails, since which
+    /// callbacks the original runs depends on the start.
+    pub(crate) callbacks_must_be_pure: bool,
 }
 
 /// One call of the original's "run this object's function" (0x422d46):
@@ -175,9 +189,11 @@ impl<'a> Interpreter<'a> {
             letting_go: None,
             deleting: None,
             view_rotation: 0,
+            view_centre: None,
             refreshing: None,
             taken_off: None,
             take_off_refresh: false,
+            callbacks_must_be_pure: false,
         }
     }
 
@@ -319,6 +335,7 @@ impl<'a> Interpreter<'a> {
             letting_go: self.letting_go,
             deleting: self.deleting,
             view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
             refreshing: self.refreshing,
             taken_off: self.taken_off,
             checking: false,
@@ -418,6 +435,8 @@ pub(crate) struct Machine<'a, 'w> {
     pub(crate) deleting: Option<&'a RefCell<std::collections::BTreeSet<u16>>>,
     /// See [`Interpreter::view_rotation`].
     pub view_rotation: u8,
+    /// See [`Interpreter::view_centre`].
+    pub view_centre: Option<[i8; 2]>,
     /// See [`Interpreter::refreshing`].
     pub(crate) refreshing: Option<&'a RefCell<crate::placement::Refreshing>>,
     /// See [`Interpreter::taken_off`].
@@ -442,9 +461,11 @@ impl<'a> Machine<'a, '_> {
             letting_go: self.letting_go,
             deleting: self.deleting,
             view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
             refreshing: self.refreshing,
             taken_off: self.taken_off,
             take_off_refresh: false,
+            callbacks_must_be_pure: false,
         }
     }
 

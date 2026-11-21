@@ -237,6 +237,7 @@ impl<'a> Machine<'a, '_> {
             letting_go: interpreter.letting_go,
             deleting: interpreter.deleting,
             view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
             refreshing: interpreter.refreshing,
             taken_off: interpreter.taken_off,
         }
