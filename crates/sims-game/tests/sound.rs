@@ -133,8 +133,10 @@ fn pausing_the_lot_pauses_live_ambience_and_night_loop() {
         "pausing the lot should silence live ambience and nite_loop"
     );
 
-    // Unpausing via toggle_pause queues SoundEvent::Unpause (0x4ce5d9) and
-    // resumes playback.
+    // Unpausing via toggle_pause queues SoundEvent::Unpause (0x4ce5d9),
+    // resuming live ambience immediately. (`nite_loop` was faded and then
+    // held by Pause, so Unpause lets its fade finish as 0x574a00 still
+    // sees it running; a subsequent camera move then restarts it.)
     game.toggle_pause();
     assert!(!game.paused());
     sent.clear();
@@ -145,7 +147,17 @@ fn pausing_the_lot_pauses_live_ambience_and_night_loop() {
     assert!(sent.contains(&Input::Events(vec![SoundEvent::Unpause])));
     assert!(
         mixer.render(RATE as usize).iter().any(|&s| s != 0),
-        "unpausing should resume live ambience and nite_loop"
+        "unpausing should resume live ambience"
+    );
+
+    // After the held pause fade finishes, stopping ambience isolates
+    // `nite_loop` so we can verify that kind 33 (Camera) restarts it.
+    mixer.input(Input::Events(vec![SoundEvent::StopAll]));
+    assert!(mixer.render(RATE as usize).iter().all(|&s| s == 0));
+    mixer.input(Input::Camera);
+    assert!(
+        mixer.render(RATE as usize).iter().any(|&s| s != 0),
+        "kind 33 after unpause should restart nite_loop"
     );
 
     // Pausing and then picking a speed (which unpauses the lot) also

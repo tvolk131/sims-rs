@@ -125,22 +125,31 @@ the "Not ported" note in
   gains (`0x57df13` → `0x57f759`).
 - `Player::start` rejects starts whose nonzero group has volume `0`
   (`0x57d969`..`0x57d9a5`), returning any already-running thread so
-  callers still apply placement (following `target`, and covering ended
-  or idle notes when no script thread runs) and `let_go_track`
-  unconditionally clears the track's hold (`0x57dc68`). `apply_levels`
-  (also run on `set_group_volume` and `set_master_volume`) updates
-  playing notes of ended and idle threads too so unmuting restores them.
+  callers still apply placement (reading `Spl` from `track_spl` across
+  running, ended-while-playing, and idle threads as `0x57314b` does,
+  following `target`, and covering ended or idle notes when no script
+  thread runs) and `let_go_track` unconditionally clears the track's
+  hold (`0x57dc68`), including music-mode starts (`change_music`,
+  `0x57523f`). `apply_levels` (also run on `set_group_volume` and
+  `set_master_volume`) updates running and ended-while-playing notes
+  (matching `0x57c0ea`'s running-track walk) without touching idle
+  kind-53 voices.
 - `Player::update_day_night` (`0x574978`, counting ended notes as still
   playing until gone) and `Player::unpause_music` (`0x575155`) run from
   the exact call sites above (`camera_moved`, `set_music_mode`, `pause`,
-  `unpause`, `set_active`).
+  `unpause`, `set_active`). Note that `pause` schedules the loop's
+  fade-out (`0x574844`) before holding all running tracks (`0x574863`),
+  so on `unpause` (`0x574904`) `0x574a00` still sees the fading loop as
+  running and lets its fade finish; the next kind 33 (camera move or
+  hour change) restarts it, while backyard ambience resumes immediately.
 - `sims_game::sound::Feed` (used by `sims-game`'s window loop) sends
   `enter_live()` (`bkground_nhood1`, `setambience_backyard`,
   `bkground_live`, `0x4ce6d2`) when opening a residential lot directly
   into live mode, and forwards `SoundEvent::Pause` / `SoundEvent::Unpause`
   (`0x4ce5c5` / `0x4ce5d9`) whenever the lot's pause state changes, so
   backyard ambience and the day and night loop run in normal launches
-  and pause/resume with the lot.
+  and pause with the lot (resuming backyard ambience on unpause and
+  restarting the night loop on the next kind 33, as in the original).
 - `sims_game::sound::Mixer::input(Input::Hour)` runs `camera_moved` when
   the hour changes after its initial value (`0x46d4d3` →
   `0x4f66bc`..`0x4f66c6`), and `sims-game`'s main loop sends

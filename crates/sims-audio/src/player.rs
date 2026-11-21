@@ -1150,44 +1150,17 @@ impl<S: Samples> Player<S> {
     /// tracks kept first ([`Player::forget_silent`]): a placement changes
     /// no note's life, so a camera move does it once for all its tracks.
     fn place_track(&mut self, track: u32, sources: &dyn Sources) {
+        let Some(spl) = self.track_spl(track) else {
+            return;
+        };
         let ended: Vec<u32> = self
             .ended
             .values()
             .filter(|t| t.track == track)
             .map(|t| t.id)
             .collect();
-        // Only the thread of the track's last start has the `target`
-        // the original's track object has: a later start set it back
-        // to itself, so an older thread, running or ended, is written
-        // and read itself.
         let last = self.last_start.get(&track).copied();
-        let newest = self.newest(track).map(|at| self.threads[at].id);
-        let running = |id: u32| self.threads.iter().find(|t| t.id == id);
-        // The last start's thread reads through the chain its write
-        // goes through.
-        let spl_of = |thread: &Thread| {
-            let source = if Some(thread.id) == last {
-                self.kept_thread(self.camera_destination(thread.id))
-                    .unwrap_or(thread)
-            } else {
-                thread
-            };
-            source.registers[usize::from(SPL)]
-        };
-        let spl = if let Some(thread) = last.and_then(running) {
-            spl_of(thread)
-        } else if let Some(thread) = last.and_then(|id| self.ended.get(&id)) {
-            spl_of(thread)
-        } else if let Some(thread) = newest.and_then(running) {
-            spl_of(thread)
-        } else if let Some(thread) = ended.last().and_then(|id| self.ended.get(id)) {
-            spl_of(thread)
-        } else if let Some(idle) = self.idle.get(&track) {
-            self.read(idle, i64::from(SPL))
-        } else {
-            return;
-        };
-        let last_running = last.filter(|&id| running(id).is_some());
+        let last_running = last.filter(|&id| self.threads.iter().any(|t| t.id == id));
         let Some((vol, pan)) = self.placed_with(track, spl, sources) else {
             return;
         };
@@ -1429,7 +1402,7 @@ impl<S: Samples> Player<S> {
         // *(code)* Each start lets the track go (vtable +0x2c, 0x57523f).
         let start = |player: &mut Self, track: u32, list: u32| {
             let started = player.start([list, 0, 0], track);
-            player.let_go(&started.threads);
+            player.let_go_track(track, &started.threads);
         };
         let switch = |player: &mut Self, list: u32| {
             player.kill_track(FADE_AND_KILL_SLOW);
@@ -1716,14 +1689,58 @@ impl<S: Samples> Player<S> {
         }
     }
 
-    /// A track's `Spl`, read from its newest thread through its `target`;
-    /// [`SPL_NORMAL`] when none runs (see [`Player::placed`]).
-    fn spl(&self, track: u32) -> i32 {
-        self.threads
-            .iter()
-            .filter(|t| t.track == track)
+    /// A track's `Spl` (`0x57314b`, register 57), read through its
+    /// `target` from its last start (running or ended while its note
+    /// still plays), else its newest running or ended thread, else its
+    /// idle thread. `None` when the track has no live state.
+    fn track_spl(&self, track: u32) -> Option<i32> {
+        // Only the thread of the track's last start has the `target`
+        // the original's track object has: a later start set it back
+        // to itself, so an older thread, running or ended, is written
+        // and read itself.
+        let last = self.last_start.get(&track).copied();
+        let newest = self.newest(track).map(|at| self.threads[at].id);
+        let running = |id: u32| self.threads.iter().find(|t| t.id == id);
+        let ended = |id: u32| {
+            self.ended
+                .get(&id)
+                .filter(|_| self.notes.iter().any(|n| n.thread == id))
+        };
+        let spl_of = |thread: &Thread| {
+            let source = if Some(thread.id) == last {
+                self.kept_thread(self.camera_destination(thread.id))
+                    .unwrap_or(thread)
+            } else {
+                thread
+            };
+            source.registers[usize::from(SPL)]
+        };
+        if let Some(thread) = last.and_then(running) {
+            Some(spl_of(thread))
+        } else if let Some(thread) = last.and_then(ended) {
+            Some(spl_of(thread))
+        } else if let Some(thread) = newest.and_then(running) {
+            Some(spl_of(thread))
+        } else if let Some(thread) = self
+            .ended
+            .values()
+            .filter(|t| t.track == track && self.notes.iter().any(|n| n.thread == t.id))
             .max_by_key(|t| t.id)
-            .map_or(SPL_NORMAL, |t| self.read(t, i64::from(SPL)))
+        {
+            Some(spl_of(thread))
+        } else {
+            self.idle
+                .get(&track)
+                .filter(|_| self.notes.iter().any(|n| n.thread == 0 && n.track == track))
+                .map(|idle| self.read(idle, i64::from(SPL)))
+        }
+    }
+
+    /// A track's `Spl`, read from its live thread (running, ended while
+    /// playing, or idle) through its `target`; [`SPL_NORMAL`] when none
+    /// exists (see [`Player::placed`]).
+    fn spl(&self, track: u32) -> i32 {
+        self.track_spl(track).unwrap_or(SPL_NORMAL)
     }
 
     /// *(code)* Writes a placement's `extvol` (0x57d57a) then `pan`
@@ -2902,10 +2919,12 @@ impl<S: Samples> Player<S> {
         })
     }
 
-    /// Gives every playing note its thread's levels (running, ended, or
-    /// idle). (The original sets them as registers change; here once per
-    /// block, after the threads run, and on group or master volume
-    /// changes.)
+    /// Gives every note of a running or ended-while-playing track its
+    /// thread's levels (`0x57c0ea` walks the running-track list, which
+    /// keeps tracks whose script reached `end` while a note plays, and
+    /// does not include idle kind-53 voices). (The original sets them as
+    /// registers change; here once per block, after the threads run, and
+    /// on group or master volume changes.)
     fn apply_levels(&mut self) {
         let levels: BTreeMap<u32, Levels> = self
             .threads
@@ -2913,18 +2932,8 @@ impl<S: Samples> Player<S> {
             .chain(self.ended.values())
             .map(|t| (t.id, self.levels(t)))
             .collect();
-        let idle: BTreeMap<u32, Levels> = self
-            .idle
-            .iter()
-            .map(|(&track, t)| (track, self.levels(t)))
-            .collect();
         for note in &mut self.notes {
-            let found = if note.thread == 0 {
-                idle.get(&note.track)
-            } else {
-                levels.get(&note.thread)
-            };
-            if let Some(levels) = found {
+            if let Some(levels) = levels.get(&note.thread) {
                 note.gains = levels.gains;
                 note.step = step(levels.rate);
             }

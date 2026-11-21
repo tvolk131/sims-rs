@@ -4092,6 +4092,113 @@ fn muted_replay_places_and_releases_a_held_note_whose_script_ended() {
 }
 
 #[test]
+fn muted_replay_keeps_ended_spl_releases_music_and_leaves_idle_group_levels() {
+    // 1) Ended track with high `Spl` (10001): muted replay keeps that `Spl`
+    //    (0x57314b) instead of falling back to 20, so an off-screen object
+    //    stays audible after unmuting without needing a camera update.
+    let mut map = BTreeMap::new();
+    map.insert(
+        "one.xa".to_owned(),
+        Pcm {
+            rate: RATE,
+            channels: 1,
+            samples: vec![4000; RATE as usize],
+        },
+    );
+    // `loadl 57 10001; note_on v1; end`: register 57 is `Spl` (opcode 5 = loadl).
+    let mut spl_script = vec![5, 57];
+    spl_script.extend_from_slice(&10001i32.to_le_bytes());
+    spl_script.extend_from_slice(&[2, 5, END]);
+    // Replacement `river_loop` (track 2957, group 1): `note_on v1; end`.
+    let one_shot: &[u8] = &[2, 5, END];
+    let (hit, addresses) = assemble(&[&spl_script, one_shot]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x200={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         [GlobalHitList]\n\
+         20=1\n\
+         [Track]\n\
+         10=0,sfx_spl,1024,2,0,1,0,0x100,1\n\
+         2957=0,river_loop,1024,0,0,1,0,0x200,1\n\
+         [EventMapping]\n\
+         e0=1,10\n\
+         r=1,2957\n\
+         m3=36,3\n\
+         seq=53,2957,0,20\n",
+        addresses[0], addresses[1]
+    );
+    let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+    let mut player = Player::new(vec![module.clone()], map.clone(), 1);
+    let center = on_lot(&[(9, 400)]);
+    let far = on_lot(&[(9, 5000)]);
+
+    play_on(&mut player, 9, &center);
+    assert!(
+        player
+            .render_stereo(BLOCK * 2, &center)
+            .iter()
+            .any(|&s| s > 3500)
+    );
+    player.handle(&SoundEvent::Pause, &center);
+    player.set_group_volume(1, 0);
+    play_on(&mut player, 9, &far);
+    player.set_group_volume(1, 1024);
+    assert!(
+        player.render_stereo(BLOCK * 2, &far).iter().any(|&s| s > 0),
+        "ended track's Spl (10001) should survive muted replay"
+    );
+
+    // 2) Music-mode start (`change_music`) unconditionally clears hold on a
+    //    muted `river_loop` (2957) whose script ended (`0x57523f -> 0x57dc68`).
+    let mut music = Player::new(vec![module.clone()], map.clone(), 1);
+    play(&mut music, "r");
+    assert!(
+        music
+            .render_stereo(BLOCK * 2, &NoSources)
+            .iter()
+            .any(|&s| s > 3500)
+    );
+    music.handle(&SoundEvent::Pause, &NoSources);
+    assert!(
+        music
+            .render_stereo(BLOCK * 2, &NoSources)
+            .iter()
+            .all(|&s| s == 0)
+    );
+    music.set_group_volume(1, 0);
+    play(&mut music, "m3");
+    music.set_group_volume(1, 1024);
+    assert!(
+        music
+            .render_stereo(BLOCK * 2, &NoSources)
+            .iter()
+            .any(|&s| s > 3500),
+        "muted music-mode start should still clear river_loop's hold"
+    );
+
+    // 3) Group volume change (`0x57c0ea`) walks the running-track list and
+    //    does not refresh idle kind-53 notes.
+    let mut idle = Player::new(vec![module], map, 1);
+    play(&mut idle, "seq");
+    assert!(
+        idle.render_stereo(BLOCK * 2, &NoSources)
+            .iter()
+            .any(|&s| s > 3500)
+    );
+    idle.set_group_volume(1, 0);
+    assert!(
+        idle.render_stereo(BLOCK * 2, &NoSources)
+            .iter()
+            .any(|&s| s > 3500),
+        "group volume change should leave an idle kind-53 voice at its started gain"
+    );
+}
+
+#[test]
 fn repeated_kind_30_updates_running_note_gain_immediately() {
     let mut map = samples();
     map.insert(
