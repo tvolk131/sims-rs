@@ -45,14 +45,20 @@
 //!   holds the largest, and a thread's request goes as soon as it ends.
 //! - *(code)* Volume, pan and pitch: see [`crate::levels`]. Each note
 //!   plays at its thread's levels, updated after the threads run in each
-//!   block and when the thread ends (the original updates them as
-//!   registers change). A note whose thread has ended keeps its last
-//!   levels. A sample plays at the rate
+//!   block and on placement or volume changes (the original updates them
+//!   as registers change). A sample plays at the rate
 //!   its pitch sets, whatever its own rate.
 //! - `note_on` starts the patch in register 50 and writes the note's ID
 //!   to its operand; `wait_samp` waits until the thread's last note ends.
-//! - `end` returns from a `call`, or ends the thread when nothing called
-//!   it. (No program in the install has a `return`, against 2,504 calls.)
+//! - *(code)* `end` (and `return`, 0x57e3ee) returns from a `call`, or
+//!   with an empty call stack calls fade-out-and-kill (0x57edc8 → vtable
+//!   +0x34, 0x57dca3): with no note playing it kills the track at once
+//!   (0x57dd3e); with a note still playing it fades `extvol` to 0 at
+//!   speed 100 and keeps the track running until the fade ends, while the
+//!   run loop (0x57d8b3) goes on at the next byte because nothing moves
+//!   the wait deadline. (No program in the install has a `return`,
+//!   against 2,504 calls, and no routine in the install reaches `end`
+//!   with a note still playing.)
 //! - `set_loop` marks the next instruction; `loop` goes back to it, or to
 //!   the routine's start when nothing was marked (the looping generic
 //!   routine is `note_on v1; wait_samp; loop`). The thread then waits for
@@ -148,15 +154,16 @@
 //! that one, and starts it anew only when its `interrupt` is set (see
 //! `Player::start`). An object letting go of a track that others still
 //! have leaves it playing, placed again from where they are (0x5746d9).
-//! The model differs once a script ends with its note still playing:
-//! here the thread ends and the note plays on, so the track counts as
-//! not running and a start makes a new thread beside that note. The
-//! original's `end` with nothing to return to (0x57e3ee to 0x57edc8,
-//! vtable +0x34, 0x57dca3) instead fades a playing note out at speed 100
-//! and keeps the track running until the fade ends; by the code, its run
-//! loop (0x57d8b3) then goes on to the bytes after the `end`, since
-//! nothing moves the wait deadline. A start during that fade still reads
-//! `interrupt`, and clears the fade. That path is not ported.
+//! When a script reaches `end` (or `return`) with nothing to return to
+//! while a note is still playing (0x57e3ee → 0x57edc8, vtable +0x34,
+//! 0x57dca3), the track stays running, fades `extvol` to 0 at speed 100
+//! (writing the fade registers through `target` and setting its own
+//! kill-after-fade flag at +0x1cf), and continues executing at the next
+//! byte in the run loop (0x57d8b3) because nothing moves the wait
+//! deadline. A start during that fade still sees the track running,
+//! clears the fade, and reads `interrupt`. If execution runs past the
+//! end of the program buffer (where the original would read past its
+//! heap buffer), this player faults and stops the thread and its notes.
 //! Kinds not ported (pausing, reloading, and the sound object calls only
 //! the game's code makes) are reported as faults; kinds whose case does
 //! nothing for sound are ignored.
@@ -834,11 +841,6 @@ pub struct Player<S> {
     /// The master volume, 0 to 1024.
     master: i32,
     notes: Vec<Note>,
-    /// The registers of threads that ended while their notes play on, by
-    /// thread ID, kept while those notes play: what the original's track
-    /// object keeps after its script ends, for a camera move to set
-    /// again ([`Player::camera_moved`]).
-    ended: BTreeMap<u32, Thread>,
     /// The registers kind 53 played a track's own note with when no
     /// thread of it ran ([`Player::sequence`]), by track, kept while
     /// that note (thread 0) plays: the original's idle track object, for
@@ -931,7 +933,6 @@ impl<S: Samples> Player<S> {
             group_volumes: BTreeMap::new(),
             master: 1024,
             notes: Vec::new(),
-            ended: BTreeMap::new(),
             idle: BTreeMap::new(),
             last_start: BTreeMap::new(),
             instances: Vec::new(),
@@ -1064,47 +1065,23 @@ impl<S: Samples> Player<S> {
     /// the track's `Spl`, and are written as the track writes them,
     /// `extvol` then `pan` (vtable +0x40 and +0x48, 0x57d57a and
     /// 0x57d5a0). The write goes through the track's `target`
-    /// (0x57de57). Here it goes to the thread the track's last start
-    /// made, which stands for the original's one track object, and on
-    /// through its `target` ([`Player::place_through`]): into a thread
-    /// whose script has ended while its notes play, as the original's
-    /// pointer reaches a track object that outlives its script, and not
-    /// past a thread that is not its track's last start. A fade on the
-    /// `extvol` the write lands in is undone by it and goes on from the
-    /// new volume; a running thread's fade on its own `extvol`, while
-    /// its `target` names an ended thread, is left as it was.
+    /// (0x57de57). Here it goes to the running thread the track's last
+    /// start made, which stands for the original's one track object, and
+    /// on through its `target` ([`Player::place_through`]), not past a
+    /// thread that is not its track's last start. A fade on the `extvol`
+    /// the write lands in is undone by it and goes on from the new
+    /// volume.
     ///
-    /// The original's track object outlives its script, and so does a
-    /// note it started (`note_on` then `end`): there it fades out (see
-    /// the module doc), here it plays on. The write reaches that note
-    /// too. Here a thread that ends with
-    /// notes playing keeps its registers while they play, and the write
-    /// goes to every such thread of the track as well, whose notes take
-    /// their new levels at once, except the last start's thread when it
-    /// passes the write on through its `target`.
-    ///
-    /// Only the thread of the track's last start, running or ended,
-    /// writes and reads through its `target` (a held track let go by a
-    /// start counts: the newest thread let go). A later start set the
-    /// original's track object's `target` back to itself, so an older
-    /// thread takes the write itself, ended or the newest still running
-    /// once the last start's script has ended, whether or not its notes
-    /// still play. While a note of the last start's ended thread plays,
-    /// that thread also writes its own placement through its `target`;
-    /// once its last note is gone it writes nothing. Each write changes
-    /// the notes of the thread it lands in and no other's. That holds
-    /// after the last start's thread has gone with nothing left playing.
-    /// A note kind 53 played
-    /// with no thread running (thread 0) is placed too, from the
-    /// registers it started with. `Spl` is that of the thread the last
-    /// start's write lands in ([`Player::place_through`]), or else of the
-    /// newest running thread, the newest ended one or the kind 53 note,
-    /// in that order. A thread that passes the write on keeps its notes'
-    /// levels. A track with none of
-    /// these gets nothing: the original writes to its idle track object,
-    /// whose registers the next start sets again.
-    /// **Unverified:** the original's older notes follow the one track
-    /// object, so they would take its levels, not their own thread's.
+    /// A script that reached `end` while its note plays stays running
+    /// while that note fades out (0x57dca3), so the write reaches it
+    /// through its running thread too. A note kind 53 played with no
+    /// thread running (thread 0) is placed from the registers it started
+    /// with. `Spl` is that of the thread the last start's write lands in
+    /// ([`Player::place_through`]), or else of the newest running thread
+    /// or the kind 53 note, in that order. A thread that passes the
+    /// write on keeps its notes' levels. A track with none of these gets
+    /// nothing: the original writes to its idle track object, whose
+    /// registers the next start sets again.
     ///
     /// While the kind 25 volume-nudge countdown (`+0x114`, set to 100
     /// by [`Player::set_active`]`(true)` and counted down once per
@@ -1132,12 +1109,9 @@ impl<S: Samples> Player<S> {
         }
     }
 
-    /// A track that was killed lets its notes go at once; what it kept
-    /// for them goes with them.
+    /// Drops idle kind-53 register state once its note has stopped.
     fn forget_silent(&mut self) {
         let notes = &self.notes;
-        self.ended
-            .retain(|id, _| notes.iter().any(|note| note.thread == *id));
         self.idle.retain(|&track, _| {
             notes
                 .iter()
@@ -1146,19 +1120,13 @@ impl<S: Samples> Player<S> {
     }
 
     /// Places a track again from where its objects are (0x5746d9), as
-    /// [`Player::camera_moved`] describes. The caller forgets what killed
-    /// tracks kept first ([`Player::forget_silent`]): a placement changes
+    /// [`Player::camera_moved`] describes. The caller forgets silent
+    /// idle tracks first ([`Player::forget_silent`]): a placement changes
     /// no note's life, so a camera move does it once for all its tracks.
     fn place_track(&mut self, track: u32, sources: &dyn Sources) {
         let Some(spl) = self.track_spl(track) else {
             return;
         };
-        let ended: Vec<u32> = self
-            .ended
-            .values()
-            .filter(|t| t.track == track)
-            .map(|t| t.id)
-            .collect();
         let last = self.last_start.get(&track).copied();
         let last_running = last.filter(|&id| self.threads.iter().any(|t| t.id == id));
         let Some((vol, pan)) = self.placed_with(track, spl, sources) else {
@@ -1186,37 +1154,12 @@ impl<S: Samples> Player<S> {
                 note.step = step(levels.rate);
             }
         }
-        self.place_ended_and_idle(track, &ended, last, vol, pan);
+        self.place_idle(track, vol, pan);
     }
 
-    /// Places a track's ended threads (`self.ended`) and idle kind-53
-    /// thread (`self.idle`), updating their playing notes immediately.
-    fn place_ended_and_idle(
-        &mut self,
-        track: u32,
-        ended: &[u32],
-        last: Option<u32>,
-        vol: i32,
-        pan: i32,
-    ) {
-        for &id in ended {
-            // The last start's thread writes through its `target`; only
-            // the thread written takes new levels.
-            if last == Some(id) {
-                self.place_through(id, vol, pan);
-                continue;
-            }
-            let Some(mut thread) = self.ended.remove(&id) else {
-                continue;
-            };
-            place_itself(&mut thread, vol, pan);
-            let levels = self.levels(&thread);
-            for note in self.notes.iter_mut().filter(|n| n.thread == id) {
-                note.gains = levels.gains;
-                note.step = step(levels.rate);
-            }
-            self.ended.insert(id, thread);
-        }
+    /// Places a track's idle kind-53 thread (`self.idle`), updating its
+    /// playing note immediately.
+    fn place_idle(&mut self, track: u32, vol: i32, pan: i32) {
         if let Some(mut idle) = self.idle.remove(&track) {
             self.write(&mut idle, i64::from(EXTVOL), vol);
             self.write(&mut idle, i64::from(PAN), pan);
@@ -1690,25 +1633,18 @@ impl<S: Samples> Player<S> {
     }
 
     /// A track's `Spl` (`0x57314b`, register 57), read through its
-    /// `target` from its last start (running or ended while its note
-    /// still plays), else its newest running or ended thread, else its
-    /// idle thread. `None` when the track has no live state.
+    /// `target` from its last running start, else its newest running
+    /// thread, else its idle kind-53 thread. `None` when the track has
+    /// no live state.
     fn track_spl(&self, track: u32) -> Option<i32> {
-        // Only the thread of the track's last start has the `target`
-        // the original's track object has: a later start set it back
-        // to itself, so an older thread, running or ended, is written
-        // and read itself.
         let last = self.last_start.get(&track).copied();
         let newest = self.newest(track).map(|at| self.threads[at].id);
         let running = |id: u32| self.threads.iter().find(|t| t.id == id);
-        let ended = |id: u32| {
-            self.ended
-                .get(&id)
-                .filter(|_| self.notes.iter().any(|n| n.thread == id))
-        };
         let spl_of = |thread: &Thread| {
             let source = if Some(thread.id) == last {
-                self.kept_thread(self.camera_destination(thread.id))
+                self.threads
+                    .iter()
+                    .find(|t| t.id == self.camera_destination(thread.id))
                     .unwrap_or(thread)
             } else {
                 thread
@@ -1717,16 +1653,7 @@ impl<S: Samples> Player<S> {
         };
         if let Some(thread) = last.and_then(running) {
             Some(spl_of(thread))
-        } else if let Some(thread) = last.and_then(ended) {
-            Some(spl_of(thread))
         } else if let Some(thread) = newest.and_then(running) {
-            Some(spl_of(thread))
-        } else if let Some(thread) = self
-            .ended
-            .values()
-            .filter(|t| t.track == track && self.notes.iter().any(|n| n.thread == t.id))
-            .max_by_key(|t| t.id)
-        {
             Some(spl_of(thread))
         } else {
             self.idle
@@ -1736,9 +1663,9 @@ impl<S: Samples> Player<S> {
         }
     }
 
-    /// A track's `Spl`, read from its live thread (running, ended while
-    /// playing, or idle) through its `target`; [`SPL_NORMAL`] when none
-    /// exists (see [`Player::placed`]).
+    /// A track's `Spl`, read from its live thread (running or idle)
+    /// through its `target`; [`SPL_NORMAL`] when none exists (see
+    /// [`Player::placed`]).
     fn spl(&self, track: u32) -> i32 {
         self.track_spl(track).unwrap_or(SPL_NORMAL)
     }
@@ -1749,12 +1676,10 @@ impl<S: Samples> Player<S> {
     /// was not reset, so the write still follows `target` as `0x57de57`
     /// does; otherwise the start pointed `target` back at itself). When
     /// no script thread is running (for instance, a muted start on a
-    /// track whose note outlived its script in `self.ended` or `self.idle`),
-    /// places those ended and idle threads too, matching the original's
-    /// persistent track object. Also updates any playing notes of the
-    /// written thread at once, matching the original's immediate voice
-    /// update (0x57df13 → 0x57f759). With no placement both stay as they
-    /// were.
+    /// track with an idle kind-53 note in `self.idle`), places that idle
+    /// thread too. Also updates any playing notes of the written thread
+    /// at once, matching the original's immediate voice update
+    /// (0x57df13 → 0x57f759). With no placement both stay as they were.
     fn place(&mut self, track: u32, threads: &[u32], placed: Option<(i32, i32)>) {
         let Some((vol, pan)) = placed else {
             return;
@@ -1766,14 +1691,7 @@ impl<S: Samples> Player<S> {
             return;
         }
         self.forget_silent();
-        let ended: Vec<u32> = self
-            .ended
-            .values()
-            .filter(|t| t.track == track)
-            .map(|t| t.id)
-            .collect();
-        let last = self.last_start.get(&track).copied();
-        self.place_ended_and_idle(track, &ended, last, vol, pan);
+        self.place_idle(track, vol, pan);
     }
 
     /// Records an object instance, unless it is already (0x57442d) or
@@ -1832,7 +1750,6 @@ impl<S: Samples> Player<S> {
         self.kill_track(id);
         self.held.remove(&id);
         self.idle.remove(&id);
-        self.ended.retain(|_, t| t.track != id);
         self.track_objects.remove(&id);
         self.last_start.remove(&id);
         self.notes.retain(|n| n.patch != id);
@@ -1860,15 +1777,11 @@ impl<S: Samples> Player<S> {
 
     /// Writes a camera placement as the thread `id`, the track's last
     /// start, writes it: `extvol`, then `pan`, through its `target`
-    /// (0x57de57). The original's pointer reaches a track object that
-    /// outlives its script, so the chain goes on into a thread whose
-    /// script has ended while its notes play. Only the thread the chain
-    /// ends at takes the placement, and if it has ended its notes take
-    /// it at once; a thread that passes it on keeps its levels. A thread
-    /// on the way that is not its track's last start takes the placement
-    /// itself: a later start set the
-    /// original's track object's `target` back to itself. Script reads
-    /// and writes do not follow ended threads ([`Player::resolve`]).
+    /// (0x57de57). Only the running thread the chain ends at takes the
+    /// placement, and its notes take the new levels at once; a thread
+    /// that passes it on keeps its levels. A thread on the way that is
+    /// not its track's last start takes the placement itself: a later
+    /// start set the original's track object's `target` back to itself.
     fn place_through(&mut self, id: u32, vol: i32, pan: i32) {
         let at = self.camera_destination(id);
         if let Some(thread) = self.threads.iter_mut().find(|t| t.id == at) {
@@ -1879,46 +1792,27 @@ impl<S: Samples> Player<S> {
                 note.gains = levels.gains;
                 note.step = step(levels.rate);
             }
-        } else if let Some(mut thread) = self.ended.remove(&at) {
-            place_itself(&mut thread, vol, pan);
-            let levels = self.levels(&thread);
-            for note in self.notes.iter_mut().filter(|n| n.thread == at) {
-                note.gains = levels.gains;
-                note.step = step(levels.rate);
-            }
-            self.ended.insert(at, thread);
         }
     }
 
-    /// The thread a camera placement written by thread `id` lands in, and
-    /// whose `Spl` it reads ([`Player::place_through`]): `id`, or on
-    /// through `target` from each thread that is its track's last start,
-    /// into running threads, playing or not, or ended threads
-    /// whose notes still play. A link to anything else, or back to a
-    /// thread already passed, stops the chain where it is.
+    /// The running thread a camera placement written by thread `id`
+    /// lands in, and whose `Spl` it reads ([`Player::place_through`]):
+    /// `id`, or on through `target` from each thread that is its track's
+    /// last start. A link to a stopped thread, or back to a thread
+    /// already passed, stops the chain where it is.
     fn camera_destination(&self, id: u32) -> u32 {
         let mut at = id;
         let mut passed = vec![id];
-        while let Some(thread) = self.kept_thread(at)
+        while let Some(thread) = self.threads.iter().find(|t| t.id == at)
             && self.last_start.get(&thread.track) == Some(&thread.id)
             && let Target::Thread(next) = thread.target
             && !passed.contains(&next)
-            && self.kept_thread(next).is_some()
+            && self.threads.iter().any(|t| t.id == next)
         {
             passed.push(next);
             at = next;
         }
         at
-    }
-
-    /// The running thread `id`, or the ended one if its notes
-    /// still play.
-    fn kept_thread(&self, id: u32) -> Option<&Thread> {
-        self.threads.iter().find(|t| t.id == id).or_else(|| {
-            self.ended
-                .get(&id)
-                .filter(|_| self.notes.iter().any(|n| n.thread == id))
-        })
     }
 
     /// Writes a register of the thread at `at` as that thread would.
@@ -2212,16 +2106,10 @@ impl<S: Samples> Player<S> {
         self.let_go_track(track, &started.threads);
     }
 
-    /// Whether a day and night loop track is still active: a running
-    /// thread, or a note from a script that reached `end` while its note
-    /// played (which the original keeps marked running until faded out,
-    /// `0x57edcc`). Excludes idle kind-53 notes (`thread == 0`).
+    /// *(code)* Whether a day and night loop track is running (vtable
+    /// +0x70, `0x574a00`). Excludes idle kind-53 notes (`thread == 0`).
     fn day_night_playing(&self, track: u32) -> bool {
         self.threads.iter().any(|t| t.track == track)
-            || self
-                .notes
-                .iter()
-                .any(|n| n.track == track && self.ended.contains_key(&n.thread))
     }
 
     /// Fades out and ends a day and night loop track if it is a running
@@ -2250,7 +2138,6 @@ impl<S: Samples> Player<S> {
     fn kill_all(&mut self) {
         self.threads.clear();
         self.notes.clear();
-        self.ended.clear();
         self.idle.clear();
         self.last_start.clear();
         self.held.clear();
@@ -2308,11 +2195,13 @@ impl<S: Samples> Player<S> {
         self.place_all(sources);
     }
 
-    /// The original's fade-out-and-kill (0x57dca3) on a track's threads:
-    /// a thread with a note playing fades
-    /// its `extvol` to 0 at speed 100 and then ends; one without ends
-    /// now. The track's notes whose thread has ended stop now (the
-    /// original would fade them; here they have no registers).
+    /// *(code)* The original's fade-out-and-kill (vtable +0x34, 0x57dca3)
+    /// on a track's running threads: a track that is not running returns
+    /// at once (0x57dca8..0x57dcaf); a running thread with a note playing
+    /// writes `fade_dest = 0`, `fade_var = extvol`, `fade_speed = 100`
+    /// through `target`, sets `kill_after_fade` (+0x1cf) on itself, and
+    /// writes `fade_on = 1` through `target`; one without a playing note
+    /// ends at once (vtable +0x38, 0x57dd3e).
     fn fade_and_kill(&mut self, track: u32) {
         let ids: Vec<u32> = self
             .threads
@@ -2336,11 +2225,6 @@ impl<S: Samples> Player<S> {
                 self.threads.remove(at);
             }
         }
-        // Notes that outlived their thread have no registers to fade, and
-        // end at once.
-        let running: BTreeSet<u32> = self.threads.iter().map(|t| t.id).collect();
-        self.notes
-            .retain(|n| running.contains(&n.thread) || n.track != track);
         self.forget_ended();
     }
 
@@ -2603,11 +2487,10 @@ impl<S: Samples> Player<S> {
         let Some((place, fresh, _)) = self.template(module, track) else {
             return false;
         };
-        // A track has one thread; its notes, and those of its scripts
-        // that ended, are the one voice the original destroys.
+        // A track has one thread; its notes are the one voice the
+        // original destroys (0x57f625).
         self.threads.retain(|t| t.track != track || t.id == id);
         self.notes.retain(|n| n.track != track);
-        self.ended.retain(|_, t| t.track != track);
         self.idle.remove(&track);
         let now = self.frame;
         if let Some(thread) = self.threads.iter_mut().find(|t| t.id == id) {
@@ -2667,7 +2550,7 @@ impl<S: Samples> Player<S> {
 
     /// Lets go of a track unconditionally (`0x57dc68` clears the track's
     /// hold even when no script thread is running, such as a muted replay
-    /// of a track whose note outlived its script), then lets go of any
+    /// of a track with an idle kind-53 note), then lets go of any
     /// running `threads`.
     fn let_go_track(&mut self, track: u32, threads: &[u32]) {
         self.held.remove(&track);
@@ -2886,8 +2769,6 @@ impl<S: Samples> Player<S> {
         self.notes
             .retain_mut(|note| held.contains(&note.track) || mix_note(note, cache, &mut sums));
         let notes = &self.notes;
-        self.ended
-            .retain(|id, _| notes.iter().any(|note| note.thread == *id));
         self.idle.retain(|track, _| {
             notes
                 .iter()
@@ -2919,17 +2800,15 @@ impl<S: Samples> Player<S> {
         })
     }
 
-    /// Gives every note of a running or ended-while-playing track its
-    /// thread's levels (`0x57c0ea` walks the running-track list, which
-    /// keeps tracks whose script reached `end` while a note plays, and
-    /// does not include idle kind-53 voices). (The original sets them as
-    /// registers change; here once per block, after the threads run, and
-    /// on group or master volume changes.)
+    /// Gives every note of a running track its thread's levels
+    /// (`0x57c0ea` walks the running-track list and does not include
+    /// idle kind-53 voices). (The original sets them as registers
+    /// change; here once per block, after the threads run, and on group
+    /// or master volume changes.)
     fn apply_levels(&mut self) {
         let levels: BTreeMap<u32, Levels> = self
             .threads
             .iter()
-            .chain(self.ended.values())
             .map(|t| (t.id, self.levels(t)))
             .collect();
         for note in &mut self.notes {
@@ -2997,16 +2876,6 @@ impl<S: Samples> Player<S> {
             }
             if !self.threads.iter().any(|t| t.id == id) {
                 continue;
-            }
-            // Its last register writes still reach its notes, as they
-            // would have when written.
-            let levels = self.levels(&thread);
-            for note in self.notes.iter_mut().filter(|n| n.thread == id) {
-                note.gains = levels.gains;
-                note.step = step(levels.rate);
-            }
-            if self.notes.iter().any(|n| n.thread == id) {
-                self.ended.insert(id, thread);
             }
             self.threads.retain(|t| t.id != id);
             // Its ducking request goes now, before the threads after it
@@ -3086,7 +2955,27 @@ impl<S: Samples> Player<S> {
                 }
                 Ok(Flow::End) => match thread.stack.pop() {
                     Some(place) => (thread.module, thread.pc) = place,
-                    None => return false,
+                    None => {
+                        // *(code)* 0x57e3ee → 0x57edc8 → vtable +0x34 (0x57dca3):
+                        // with nothing to return to, `end` (and `return`) calls
+                        // fade-out-and-kill. With a note still playing, the track
+                        // writes FADE_DEST=0, FADE_VAR=EXTVOL, FADE_SPEED=100
+                        // through `target`, sets its own `kill_after_fade` (+0x1cf),
+                        // writes FADE_ON=1 through `target`, and stays running with
+                        // its wait deadline (+0x198) untouched, so the run loop
+                        // (0x57d8b3) continues at `next`. With no note playing, it
+                        // kills the track at once (vtable +0x38, 0x57dd3e).
+                        if self.notes.iter().any(|n| n.thread == thread.id) {
+                            self.write(thread, i64::from(FADE_DEST), 0);
+                            self.write(thread, i64::from(FADE_VAR), i32::from(EXTVOL));
+                            self.write(thread, i64::from(FADE_SPEED), 100);
+                            thread.kill_after_fade = true;
+                            self.write(thread, i64::from(FADE_ON), 1);
+                            thread.pc = next;
+                        } else {
+                            return false;
+                        }
+                    }
                 },
                 Ok(Flow::Kill) => {
                     let id = thread.id;
@@ -3171,6 +3060,8 @@ impl<S: Samples> Player<S> {
             "track {} ({name}) at {:#x}: {message}",
             thread.track, thread.pc
         ));
+        let id = thread.id;
+        self.notes.retain(|n| n.thread != id);
         false
     }
 
@@ -3224,10 +3115,9 @@ impl<S: Samples> Player<S> {
     /// Not ported: the original's `target` holds the track object
     /// (0x57e023 to 0x57e028), which outlives a kill and a fresh start
     /// (0x57dd4c, 0x57dbcf), so it still reaches the track started again.
-    /// Here it names the thread, which a kill ends, so it then reaches
-    /// that thread only while its notes play, or else falls back to this
-    /// one. `main_duckpri` (123) records the written thread's request and
-    /// holds the largest.
+    /// Here it names the thread, which a kill ends, so once killed it
+    /// falls back to this one. `main_duckpri` (123) records the written
+    /// thread's request and holds the largest.
     fn write(&mut self, thread: &mut Thread, register: i64, value: i32) {
         let Ok(r) = u8::try_from(register) else {
             return;
