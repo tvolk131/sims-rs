@@ -403,8 +403,20 @@ impl App {
             Key::Character(c) => match c.as_str() {
                 "+" | "=" => Move::ZoomIn,
                 "-" | "_" => Move::ZoomOut,
-                "[" | "," => Move::Rotate(false),
-                "]" | "." => Move::Rotate(true),
+                "[" | "," => {
+                    if self.game.rotate_held(false) {
+                        self.changed(true);
+                        return;
+                    }
+                    Move::Rotate(false)
+                }
+                "]" | "." => {
+                    if self.game.rotate_held(true) {
+                        self.changed(true);
+                        return;
+                    }
+                    Move::Rotate(true)
+                }
                 "1" => Move::Walls(Walls::Up),
                 "2" => Move::Walls(Walls::Cutaway),
                 "3" => Move::Walls(Walls::Down),
@@ -574,7 +586,7 @@ impl ApplicationHandler for App {
                     // does neither, so holding Escape to close a menu does
                     // not quit.
                     if event.repeat {
-                    } else if self.game.close_menu() {
+                    } else if self.game.close_menu() || self.game.cancel_buy() {
                         self.changed(true);
                     } else {
                         event_loop.exit();

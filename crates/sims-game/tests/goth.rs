@@ -5140,3 +5140,239 @@ fn camera_moves_sync_the_lots_view_centre_pick() {
     assert!(game.apply(Move::Scroll([160, 80])));
     assert_eq!(game.lot().view_centre(), expected(&game, true));
 }
+
+/// Track 2's Buy Mode recording (`goth-buy-chair-order-20261116`) runs in Live
+/// mode through update 183, clicks the Buy Mode button `(93, 458)` so update
+/// 184 enters mode 2 (partial pass), clicks Seating `(258, 524)`, clicks slot
+/// 0 `(437, 523)` (Werkbunnst All Purpose Chair, `0x26bfbb29`, `$80`), and
+/// moves the pointer onto the house view at `recorded([480, 380])` before
+/// update 1110, creating the chair (object 260) and its `"Tile Cursor"`
+/// (object 261, `0x00000437`) at `[584, 472, 1]` without yet committing the
+/// placement before update 1200.
+///
+/// Replayed offline in strict mode on the recording's frame schedule, an
+/// unmasked comparison of tick, scheduler cursor, lot/global RNGs, all 64
+/// globals, and every object's position, `last_result`, `data`, `temps`,
+/// `attributes`, frames, person `data`, `motives_bits`, `active`, and `queue`
+/// (377 objects at update 1, 345 at 6..=1109, 347 at 1110..=1200) matched
+/// updates 1..=1200 with only three known differences:
+/// - UI global 12 (updates 184..=1200: `2008` Buy -> `150` Seating -> `1500`
+///   Dining Chairs -> `4300` thumbnail template);
+/// - routing `person.data[37]` marked unknown in `routing.unknown_words` for
+///   object 259 (updates 14..=1200: `0` vs `3287`);
+/// - uninitialized frame local marked unknown in `frame_storage` for object
+///   259 (frame 2, tree 4099, local 7 at updates 14..=1200: `0` vs `2623`).
+///
+/// This test pins selected checkpoints through update 1200.
+#[test]
+fn the_recorded_buy_chair_order_replayed_in_the_window_matches_the_recording() {
+    use sims_ui::command::Mode;
+    let Some(install) = install() else {
+        return;
+    };
+    let frames = Frames::parse(
+        "0,1,2,3,33,63,93,123,153,183,213,243,273,303,330,347,367,397,419,446,467,491,518,539,569,599,627,657,687,713,731,757,787,812,842,872,893,923,953,983,1013,1042,1069,1087,1109,1137,1160,1179",
+    )
+    .expect("a schedule");
+    let schedule = frames.clone();
+    let mut game = Game::open(&Options {
+        frames,
+        ..options(install)
+    })
+    .expect("the Goth house opens");
+    game.resize([800, 600]);
+    game.render();
+
+    // Run in Live mode through update 183, then click Buy Mode at (93, 458).
+    run_to(&mut game, &schedule, 183);
+    assert_eq!(game.mode(), Mode::Live);
+    assert_eq!(game.lot().world().globals[19], 0);
+    assert_eq!(game.lot().world().ticks, 88_627);
+    assert_eq!(game.lot().world().budget.funds, 2542);
+    assert_eq!(game.lot().world().objects.len(), 345);
+
+    game.press([93, 458]);
+    game.release([93, 458]);
+    assert_eq!(game.mode(), Mode::Buy);
+    assert_eq!(game.lot().world().globals[19], 2);
+    game.render();
+
+    // Update 184 is a partial pass: world.ticks stays at 88627.
+    run_to(&mut game, &schedule, 184);
+    assert_eq!(game.lot().world().ticks, 88_627);
+    assert_eq!(game.lot().world().globals[19], 2);
+
+    // Click Seating at (258, 524), then slot 0 (Werkbunnst Chair, $80) at (437, 523).
+    run_to(&mut game, &schedule, 518);
+    game.press([258, 524]);
+    game.release([258, 524]);
+    game.render();
+
+    run_to(&mut game, &schedule, 872);
+    game.press([437, 523]);
+    game.release([437, 523]);
+    assert_eq!(game.buy_selected(), Some(0x26bf_bb29));
+    // No objects are created while the pointer remains over the HUD.
+    assert!(game.buy_cursor().is_none());
+    assert_eq!(game.lot().world().objects.len(), 345);
+    game.render();
+
+    // Moving into the house view at recorded([480, 380]) before update 1110
+    // creates the chair (260) and its Tile Cursor (261) at [584, 472, 1].
+    run_to(&mut game, &schedule, 1109);
+    assert_eq!(game.lot().world().objects.len(), 345);
+    let lot_point = recorded([480, 380]);
+    assert!(!game.over_panel(lot_point));
+    game.hover(lot_point);
+    let cursor = game.buy_cursor().expect("Buy cursor active on house view");
+    assert_eq!(cursor.held, 260);
+    assert_eq!(cursor.cursor, 261);
+    assert_eq!(cursor.guid, 0x26bf_bb29);
+    assert_eq!(cursor.price, 80);
+    assert!(cursor.valid);
+    assert_eq!(cursor.position, [584, 472, 1]);
+    game.render();
+
+    // Run through update 1200 in strict mode (partial passes only).
+    run_to(&mut game, &schedule, 1200);
+    let world = game.lot().world();
+    assert_eq!(world.ticks, 88_627);
+    assert_eq!(world.globals[19], 2);
+    assert_eq!(world.budget.funds, 2542);
+    assert_eq!(world.lot_rng.state(), 890_318_272);
+    assert_eq!(world.global_rng.state(), 270_289_136);
+    assert_eq!(world.objects.len(), 347);
+
+    let chair = &world.objects[&260];
+    assert_eq!(chair.guid, 0x26bf_bb29);
+    assert_eq!(chair.position, [584, 472, 1]);
+    assert_eq!(chair.flags(), 9);
+    assert_eq!(chair.countdown(), Some(19_999));
+    assert!(chair.last_result);
+    assert_eq!(chair.data[1], 2);
+    assert_eq!(chair.data[26], 261);
+    assert_eq!(chair.data[41], 80);
+    assert_eq!(chair.data[45], 1997);
+    assert_eq!(chair.data[46], 6);
+    assert_eq!(chair.data[47], 16);
+    assert_eq!(
+        chair
+            .stack
+            .iter()
+            .map(|f| (f.tree, f.node, f.parameters.clone()))
+            .collect::<Vec<_>>(),
+        vec![(4096, 0, vec![0, 0, 0, 0]), (280, 0, vec![20000])]
+    );
+
+    let tile_cursor = &world.objects[&261];
+    assert_eq!(tile_cursor.guid, sims_vm::TILE_CURSOR_GUID);
+    assert_eq!(tile_cursor.position, [584, 472, 1]);
+    assert_eq!(tile_cursor.flags(), 0);
+    assert_eq!(tile_cursor.countdown(), Some(-1));
+    assert!(tile_cursor.last_result);
+    assert_eq!(tile_cursor.data[1], 0);
+    assert_eq!(tile_cursor.data[18], 1997);
+    assert_eq!(tile_cursor.data[23], 2);
+    assert_eq!(tile_cursor.data[48], 23970);
+    assert_eq!(
+        tile_cursor
+            .stack
+            .iter()
+            .map(|f| (f.tree, f.node, f.parameters.clone()))
+            .collect::<Vec<_>>(),
+        vec![(4096, 0, vec![0, 0, 0, 0])]
+    );
+
+    assert!(game.problems().is_empty(), "{:?}", game.problems());
+    assert!(game.stopped().is_none(), "{:?}", game.stopped());
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
+}
+
+/// End-to-end Buy Mode placement, rotation (keyboard and mouse drag),
+/// cancellation, funds deduction, and return to Live mode through the window
+/// input layer.
+#[test]
+fn buy_mode_places_rotates_cancels_and_returns_to_live_mode() {
+    use sims_ui::command::Mode;
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    game.resize([800, 600]);
+    game.render();
+    assert_eq!(game.run(60), 60);
+
+    // Enter Buy Mode, open Seating, select Werkbunnst All Purpose Chair ($80).
+    game.press([93, 458]);
+    game.release([93, 458]);
+    assert_eq!(game.mode(), Mode::Buy);
+    assert_eq!(game.lot().world().globals[19], 2);
+
+    game.press([258, 524]);
+    game.release([258, 524]);
+    game.press([437, 523]);
+    game.release([437, 523]);
+    assert_eq!(game.buy_selected(), Some(0x26bf_bb29));
+
+    // Hover onto the lawn, move onto the HUD to hide the cursor, then cancel:
+    // both objects are deleted and funds stay 2542.
+    let spot = recorded([480, 380]);
+    let count_before = game.lot().world().objects.len();
+    game.hover(spot);
+    let held_first = game.buy_cursor().expect("cursor active").held;
+    let cursor_first = game.buy_cursor().expect("cursor active").cursor;
+    assert_eq!(game.lot().world().objects.len(), count_before + 2);
+    game.hover([300, 520]);
+    assert!(!game.buy_cursor().expect("cursor kept while hidden").valid);
+    assert_eq!(game.lot().world().objects[&held_first].position[0], -16);
+    assert!(game.cancel_buy());
+    assert!(game.buy_cursor().is_none());
+    assert!(game.buy_selected().is_none());
+    assert!(!game.lot().world().objects.contains_key(&held_first));
+    assert!(!game.lot().world().objects.contains_key(&cursor_first));
+    assert_eq!(game.lot().world().budget.funds, 2542);
+
+    // Re-select the chair, hover onto the lawn, rotate clockwise by keyboard,
+    // then press and drag-rotate past the 6 px threshold (`dx^2 + dy^2 > 36`)
+    // toward lower-left (`dir = 4` at rotation 0), and release to commit.
+    let spend_before = game.lot().world().budget.days[0].expect("today")[6];
+    game.press([437, 523]);
+    game.release([437, 523]);
+    game.hover(spot);
+    assert_eq!(game.lot().world().objects[&held_first].data[1], 2);
+    assert!(game.rotate_held(true));
+    assert_eq!(game.lot().world().objects[&held_first].data[1], 4);
+    game.press(spot);
+    game.hover([spot[0] - 20, spot[1] - 20]);
+    assert_eq!(game.lot().world().objects[&held_first].data[1], 6);
+    game.release([spot[0] - 20, spot[1] - 20]);
+
+    assert!(game.buy_cursor().is_none());
+    assert!(game.buy_selected().is_none());
+    let world = game.lot().world();
+    assert!(!world.objects.contains_key(&cursor_first));
+    assert_eq!(world.objects.len(), count_before + 1);
+    let chair = &world.objects[&held_first];
+    assert_eq!(chair.guid, 0x26bf_bb29);
+    assert_eq!(chair.position, [584, 472, 1]);
+    assert_eq!(chair.data[1], 6);
+    assert_eq!(chair.data[26], 0);
+    assert_eq!(world.budget.funds, 2462);
+    assert_eq!(world.globals[13], 2462);
+    assert_eq!(world.globals[14], 0);
+    assert_eq!(world.budget.days[0].expect("today")[6], spend_before + 80);
+
+    // Switch back to Live mode by clicking the Live button `(35, 448)`:
+    // global[19] returns to 0 (via `go_live`) and simulation ticks resume.
+    let ticks_before = game.lot().world().ticks;
+    game.press([35, 448]);
+    game.release([35, 448]);
+    assert_eq!(game.mode(), Mode::Live);
+    assert_eq!(game.lot().world().globals[19], 0);
+    game.render();
+    assert_eq!(game.run(30), 30);
+    assert_eq!(game.lot().world().ticks, ticks_before + 30);
+    assert!(game.problems().is_empty(), "{:?}", game.problems());
+    assert!(game.stopped().is_none(), "{:?}", game.stopped());
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
+}

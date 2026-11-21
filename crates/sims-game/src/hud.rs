@@ -14,7 +14,8 @@ use sims_render::{Assets, Canvas, Walls, Zoom};
 use sims_sim::World;
 use sims_ui::art::Art;
 use sims_ui::balloon::Texts;
-use sims_ui::command::{Command, Panel as UiPanel, Walls as UiWalls};
+use sims_ui::buy::{self, BuyCatalog, BuyLayout, BuyState, BuyWidgetKind};
+use sims_ui::command::{Command, Mode, Panel as UiPanel, Walls as UiWalls};
 use sims_ui::dialog::{self, Labels, Message};
 use sims_ui::frame::{Frame, Rect};
 use sims_ui::house;
@@ -94,6 +95,13 @@ pub struct Hud {
     /// across scripted Special Effect `0x10c` speed resets
     /// (`0x4f6856..0x4f687a` -> `0x53b663..0x53b6ac`).
     idle_speed: bool,
+    /// The Buy Mode residential catalog, loaded lazily on first Buy Mode entry.
+    buy_catalog: Option<BuyCatalog>,
+    /// The Buy Mode catalog strip state (sort, category, subcategory, page,
+    /// selected GUID).
+    pub buy_state: BuyState,
+    /// The Buy Mode strip widgets and popup card as last laid out.
+    buy_layout: BuyLayout,
     /// The interface's sounds, until the game takes them.
     sounds: Vec<SoundEvent>,
 }
@@ -123,6 +131,9 @@ impl Hud {
             .collect();
         let mut art = Art::load(&ui, US_ENGLISH, &resources).map_err(|e| e.to_string())?;
         for id in hud::OPTIONAL_RESOURCES {
+            art.load_optional(&ui, US_ENGLISH, id);
+        }
+        for id in buy::resource_ids() {
             art.load_optional(&ui, US_ENGLISH, id);
         }
         let labels = Labels::load(&install).map_err(|e| e.to_string())?;
@@ -189,14 +200,17 @@ impl Hud {
             pressed: Pressed::default(),
             clock_blink: ClockBlink::default(),
             idle_speed: false,
+            buy_catalog: None,
+            buy_state: BuyState::default(),
+            buy_layout: BuyLayout::default(),
             sounds: Vec::new(),
         })
     }
 
     /// Forgets what the panel kept of the lot it showed, for a lot put
     /// back to a save: the pie menu, the dialog read, the icons pressed,
-    /// and the pause button's blink timer. The rest is read from the lot
-    /// at the next frame.
+    /// the Buy Mode catalog state, and the pause button's blink timer. The
+    /// rest is read from the lot at the next frame.
     pub fn forget(&mut self) {
         self.menu = None;
         self.message = None;
@@ -206,6 +220,62 @@ impl Hud {
         self.idle_speed = false;
         self.controls.pause_lit = false;
         self.controls.ultra_lit = false;
+        self.buy_state.reset();
+        self.buy_layout = BuyLayout::default();
+    }
+
+    /// Loads the residential Buy Mode catalog on first use and returns it.
+    pub fn ensure_buy_catalog(&mut self, assets: &Assets) -> &BuyCatalog {
+        self.buy_catalog
+            .get_or_insert_with(|| BuyCatalog::load(assets.index(), assets.catalog()))
+    }
+
+    /// The residential Buy Mode catalog, once loaded.
+    pub fn buy_catalog(&self) -> Option<&BuyCatalog> {
+        self.buy_catalog.as_ref()
+    }
+
+    /// The Buy Mode catalog strip layout as last built.
+    pub fn buy_layout(&self) -> &BuyLayout {
+        &self.buy_layout
+    }
+
+    /// Lays out the Buy Mode catalog strip for `size` and `world` (or clears
+    /// it outside expanded Buy Mode), syncing `self.buy_state.page` to the
+    /// clamped page number.
+    pub fn layout_buy(&mut self, size: [i32; 2], world: &World, assets: &Assets) {
+        if self.controls.mode != Mode::Buy || !self.controls.expanded {
+            self.buy_layout = BuyLayout::default();
+            return;
+        }
+        let catalog = self
+            .buy_catalog
+            .get_or_insert_with(|| BuyCatalog::load(assets.index(), assets.catalog()));
+        let funds = sims_vm::available_funds(world);
+        let layout = buy::layout(size, catalog, &self.buy_state, &self.art, funds);
+        self.buy_state.page = layout.page;
+        self.buy_layout = layout;
+    }
+
+    /// Clears the cached Buy Mode strip layout (e.g. when leaving Buy Mode).
+    pub fn clear_buy_layout(&mut self) {
+        self.buy_layout = BuyLayout::default();
+    }
+
+    /// Re-lays out the control panel items and Buy Mode strip for `size`
+    /// after a mode or panel toggle, so consecutive clicks work even before
+    /// the next [`Hud::draw`].
+    pub fn relayout_panel(
+        &mut self,
+        size: [i32; 2],
+        world: &World,
+        residential: bool,
+        assets: &Assets,
+    ) {
+        let snapshot = self.snapshot(world, residential);
+        self.items = hud::layout(size, &snapshot, &self.controls);
+        hud::fit(&mut self.items, &self.art, &self.texts);
+        self.layout_buy(size, world, assets);
     }
 
     /// Updates the native `[control_panel + 0x1ec]` idle-blink flag
@@ -433,8 +503,37 @@ impl Hud {
             &self.items,
             &self.controls,
         );
-        self.queue
-            .draw(&mut frame, &self.art, &self.faces, &self.thumbnails);
+        if self.controls.mode == Mode::Buy && self.controls.expanded {
+            self.layout_buy(view.size, world, assets);
+            let mut guids: Vec<u32> = self
+                .buy_layout
+                .widgets
+                .iter()
+                .filter_map(|w| match w.kind {
+                    BuyWidgetKind::Slot { guid, .. } => Some(guid),
+                    BuyWidgetKind::Button { .. } => None,
+                })
+                .collect();
+            if let Some(card) = &self.buy_layout.popup {
+                guids.push(card.guid);
+            }
+            for guid in guids {
+                let _ = self.thumbnails.read(assets.index(), assets.catalog(), guid);
+            }
+            buy::draw(
+                &mut frame,
+                &self.art,
+                &self.thumbnails,
+                &self.buy_layout,
+                self.controls.pointer,
+            );
+        } else {
+            self.buy_layout = BuyLayout::default();
+        }
+        if self.controls.mode == Mode::Live {
+            self.queue
+                .draw(&mut frame, &self.art, &self.faces, &self.thumbnails);
+        }
         self.dialog = self
             .message
             .as_ref()
@@ -499,7 +598,10 @@ impl Hud {
             || self.menu.is_some()
             || self.band.is_some_and(|b| b.contains(point[0], point[1]))
             || hud::covers(&self.items, point)
-            || self.queue.at(point).is_some()
+            || (self.controls.mode == Mode::Buy
+                && self.controls.expanded
+                && self.buy_layout.covers(point))
+            || (self.controls.mode == Mode::Live && self.queue.at(point).is_some())
     }
 
     /// The selected Sim's actions as last drawn.
@@ -572,11 +674,19 @@ impl Hud {
             let menu = self.menu.as_ref()?;
             Some(menu.hovered(pointer?))
         };
+        let buy_widget = |pointer: Option<[i32; 2]>| {
+            let [x, y] = pointer?;
+            self.buy_layout
+                .widgets
+                .iter()
+                .rposition(|w| w.rect.contains(x, y))
+        };
         let before = (
             hud::hovered(&self.items, self.controls.pointer),
             hud::lit_relation(&self.items, self.controls.pointer),
             button(self.controls.pointer),
             entry(self.controls.pointer),
+            buy_widget(self.controls.pointer),
         );
         self.controls.pointer = Some(point);
         let hovered_changed = (
@@ -584,6 +694,7 @@ impl Hud {
             hud::lit_relation(&self.items, self.controls.pointer),
             button(self.controls.pointer),
             entry(self.controls.pointer),
+            buy_widget(self.controls.pointer),
         ) != before;
         let dismissed = self.controls.help.is_some()
             && !hud::in_subpanel(&self.items, point)
@@ -648,9 +759,18 @@ impl Hud {
             self.dismiss_help();
             return None;
         }
-        if let Some(command) = self.press_queue(point) {
+        if self.controls.mode == Mode::Live
+            && let Some(command) = self.press_queue(point)
+        {
             self.dismiss_help();
             return command;
+        }
+        if self.controls.mode == Mode::Buy
+            && self.controls.expanded
+            && let Some(command) = self.buy_layout.press(point)
+        {
+            self.buy_state.apply(&command);
+            return Some(command);
         }
         let command = match hud::press(&self.items, point) {
             Some(command) => command,

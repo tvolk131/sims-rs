@@ -17,7 +17,8 @@ pub mod save;
 use crate::play::Play;
 use crate::selection::publish_waited_for;
 use crate::{
-    Answer, Answers, Callback, Interpreter, Program, SkippedFrame, Stream, TickError, Update,
+    Answer, Answers, BuyCursor, Callback, Interpreter, PanelMode, Program, SkippedFrame, Stream,
+    TickError, Update,
 };
 use sims_content::{Animations, Catalog, House, Index, Install, Neighborhood, People, Surfaces};
 use sims_core::CrtRng;
@@ -1037,9 +1038,10 @@ impl Lot {
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };
         let mut frame_errors = Vec::new();
+        let mode = crate::panel_mode(&self.world);
         if self.ticks == 0
             && self.frames.after(0)
-            && let Err(error) = interpreter.draw_frame(&mut self.world, VIEW_LEVEL)
+            && let Err(error) = interpreter.draw_frame_in(&mut self.world, VIEW_LEVEL, mode)
         {
             if !play {
                 return Err(StepError::Frame {
@@ -1123,7 +1125,10 @@ impl Lot {
         // redraws the family panel.
         interpreter.refresh_family_panel(&mut self.world);
         let frame = if self.frames.after(tick) {
-            interpreter.draw_frame(&mut self.world, VIEW_LEVEL).err()
+            let mode = crate::panel_mode(&self.world);
+            interpreter
+                .draw_frame_in(&mut self.world, VIEW_LEVEL, mode)
+                .err()
         } else {
             None
         };
@@ -1363,6 +1368,167 @@ impl Lot {
     pub fn unpause(&mut self) -> Result<bool, OrderError> {
         self.ready()?;
         Ok(self.world.unpause())
+    }
+
+    /// The simulation's active panel mode from global 19 (`0x4ce44f`).
+    pub fn mode(&self) -> PanelMode {
+        crate::panel_mode(&self.world)
+    }
+
+    /// Switches the simulation's active panel mode between ticks
+    /// (`0x4cea5d` + `0x4ce44f`). Leaving a non-Live mode back to
+    /// [`PanelMode::Live`] marks all rooms uncounted, updates lot
+    /// statistics, and clears global 19 (`0x416534`).
+    pub fn set_mode(&mut self, mode: PanelMode) -> Result<(), OrderError> {
+        self.ready()?;
+        let interpreter = Interpreter {
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        interpreter
+            .set_mode(&mut world, mode)
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        Ok(())
+    }
+
+    /// Starts placing a newly purchased catalog object of catalog master GUID
+    /// `guid` (`0x486f5a` → `0x421986` → `0x4215e6` → `0x4226bc`), wrapped
+    /// in a `"Tile Cursor"` (`0x00000437`). Returns `Ok(None)` if the
+    /// household cannot afford it.
+    pub fn buy_start(
+        &mut self,
+        guid: u32,
+        level: i32,
+        direction: i16,
+    ) -> Result<Option<BuyCursor>, OrderError> {
+        self.ready()?;
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let cursor = interpreter
+            .buy_start(&mut world, guid, level, direction)
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        Ok(cursor)
+    }
+
+    /// Moves an active Buy Mode cursor and its held object to fine lot
+    /// coordinates `fine` on `level` (`0x485a2e` → `0x421e72`).
+    pub fn buy_move(
+        &mut self,
+        cursor: &mut BuyCursor,
+        fine: [i32; 2],
+        level: i32,
+    ) -> Result<bool, OrderError> {
+        self.ready()?;
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let mut next = cursor.clone();
+        let valid = interpreter
+            .buy_move(&mut world, &mut next, fine, level)
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        *cursor = next;
+        Ok(valid)
+    }
+
+    /// Rotates an active Buy Mode cursor's held object to `direction`
+    /// (`0x4226bc` → `0x421be4`) and re-evaluates placement.
+    pub fn buy_rotate(
+        &mut self,
+        cursor: &mut BuyCursor,
+        direction: i16,
+    ) -> Result<bool, OrderError> {
+        self.ready()?;
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let mut next = cursor.clone();
+        let valid = interpreter
+            .buy_rotate(&mut world, &mut next, direction)
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        *cursor = next;
+        Ok(valid)
+    }
+
+    /// Hides an active Buy Mode cursor off the lot when the pointer leaves
+    /// the house view (`0x487d4e`).
+    pub fn buy_hide(&mut self, cursor: &mut BuyCursor) -> Result<(), OrderError> {
+        self.ready()?;
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let mut next = cursor.clone();
+        interpreter
+            .buy_hide(&mut world, &mut next)
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        *cursor = next;
+        Ok(())
+    }
+
+    /// Commits a valid Buy Mode placement (`0x486ada` → `0x421a0e`, `0x46d91c`):
+    /// deletes the `"Tile Cursor"`, places the held object permanently, and
+    /// deducts its price from household funds. Returns the placed object's ID.
+    pub fn buy_commit(&mut self, cursor: BuyCursor) -> Result<u16, OrderError> {
+        self.ready()?;
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let id = interpreter
+            .buy_commit(&mut world, cursor)
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        Ok(id)
+    }
+
+    /// Cancels an active Buy Mode purchase (`0x487105`), deleting both the
+    /// `"Tile Cursor"` and the unplaced object without charging funds.
+    pub fn buy_cancel(&mut self, cursor: BuyCursor) -> Result<(), OrderError> {
+        self.ready()?;
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        interpreter
+            .buy_cancel(&mut world, cursor)
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        Ok(())
     }
 
     /// Replace the pending answers with an explicit replay, one entry

@@ -18,6 +18,7 @@
 
 pub mod art;
 pub mod balloon;
+pub mod buy;
 pub mod command;
 pub mod dialog;
 pub mod font;

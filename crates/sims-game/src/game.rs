@@ -20,11 +20,11 @@ use crate::pick;
 use crate::sound;
 use crate::view::{Move, View};
 use sims_render::{Camera, Canvas, Selected, Walls, open_house};
-use sims_ui::command::{Camera as UiCamera, Command, Speed, Walls as UiWalls};
+use sims_ui::command::{Camera as UiCamera, Command, Mode, Speed, Walls as UiWalls};
 use sims_vm::boot::save::Saved;
 use sims_vm::boot::{Frames, Lot, StepError};
 use sims_vm::play::{Recovery, ScriptError};
-use sims_vm::{SkippedFrame, SoundEvent};
+use sims_vm::{BuyCursor, PanelMode, SkippedFrame, SoundEvent};
 use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
@@ -120,6 +120,15 @@ pub struct Game {
     /// The entry of the open pie menu the pointer last highlighted
     /// ([`Game::highlight`]).
     highlighted: Option<usize>,
+    /// The Buy Mode catalog item currently armed for placement (`0x486f5a`).
+    buy_selected: Option<u32>,
+    /// The active Buy Mode `"Tile Cursor"` and held catalog object, once the
+    /// pointer has entered the house view (`0x487d3d`).
+    buy_cursor: Option<BuyCursor>,
+    /// The screen anchor of an active Buy Mode left-button press over the lot
+    /// (`0x485f98`), for drag-to-rotate (`dx^2 + dy^2 > 36`, `0x485a2e`) and
+    /// commit on release (`0x4864d0`).
+    buy_dragging: Option<[i32; 2]>,
     /// The time the window has passed in, in microseconds: the clock
     /// that spins the plumb bob and drives the pause button's 500 ms blink.
     clock_us: u64,
@@ -190,6 +199,9 @@ impl Game {
             reached: None,
             listed: None,
             highlighted: None,
+            buy_selected: None,
+            buy_cursor: None,
+            buy_dragging: None,
             note: None,
             clock_us: 0,
             drawn_us: 0,
@@ -684,6 +696,10 @@ impl Game {
         self.view.resize(size);
         self.sync_view_centre();
         self.hud.resize_menu(size);
+        if self.hud.controls.mode == Mode::Buy {
+            self.hud
+                .relayout_panel(size, self.lot.world(), self.lot.residential(), &self.assets);
+        }
         true
     }
 
@@ -733,9 +749,12 @@ impl Game {
     }
 
     /// Moves the pointer to `point`. When it first reaches an object on
-    /// the lot, the selected Sim's pie menu on it is listed, as the
-    /// original lists it then (0x48c834); listing changes the lot.
-    /// A point outside the canvas is treated as [`Game::leave`].
+    /// the lot in Live mode, the selected Sim's pie menu on it is listed, as
+    /// the original lists it then (0x48c834); listing changes the lot. In Buy
+    /// mode, hovering over the house view activates and moves (or drag-rotates)
+    /// the placement cursor (`0x487d3d`, `0x485a2e`), while moving onto the
+    /// panel hides it (`0x487d4e`). A point outside the canvas is treated as
+    /// [`Game::leave`].
     pub fn hover(&mut self, point: [i32; 2]) -> bool {
         if !self.in_view(point) {
             return self.leave();
@@ -745,7 +764,15 @@ impl Game {
         let sounds = self.hud.take_sounds();
         self.keep_sounds(sounds);
         redraw |= self.highlight(point);
-        redraw |= self.follow();
+        if self.hud.controls.mode == Mode::Buy {
+            if !self.hud.covers(point) || self.buy_dragging.is_some() {
+                redraw |= self.hover_buy(point);
+            } else {
+                redraw |= self.hide_buy_cursor();
+            }
+        } else {
+            redraw |= self.follow();
+        }
         // The cutaway follows the rooms the pointer passes over, while
         // the cutaway is on and the pointer is over the lot.
         if !self.hud.covers(point) && self.view.camera.walls == Walls::Cutaway {
@@ -801,6 +828,22 @@ impl Game {
         let dismissed = self.hud.dismiss_help();
         let sounds = self.hud.take_sounds();
         self.keep_sounds(sounds);
+        if self.hud.controls.mode == Mode::Buy {
+            if self.stopped.is_some() {
+                self.note = Some("The lot has stopped, so it takes no orders.".into());
+                return Outcome::redraw();
+            }
+            if self.buy_selected.is_some() || self.buy_cursor.is_some() {
+                self.pointer = Some(point);
+                self.hover_buy(point);
+                self.buy_dragging = Some(point);
+                return Outcome::redraw();
+            }
+            return Outcome {
+                redraw: cleared || dismissed,
+                photo: false,
+            };
+        }
         let Some(target) = self.under(point) else {
             return Outcome {
                 redraw: cleared || dismissed,
@@ -811,20 +854,15 @@ impl Game {
         Outcome::redraw()
     }
 
-    /// A left release at `point` (0x5eb433).
-    ///
-    /// Acts only while a pie menu is open with no dialog over it:
-    /// - updates which entry is under `point` as mouse-move does
-    ///   (`+0xfc`, 0x5eb4d7);
-    /// - for the opening press's release, settles the menu into
-    ///   click-to-choose mode unless the pointer moved past the dead zone
-    ///   without the menu having moved on screen;
-    /// - otherwise checks the entry under `point` again (`0x5eb62a` ->
-    ///   event `0xe` -> `0x48df28`) and chooses it, opens or leaves a
-    ///   submenu, or closes the menu.
+    /// A left release at `point` (0x5eb433 in Live mode; `0x4864d0` in Buy
+    /// mode).
     pub fn release(&mut self, point: [i32; 2]) -> Outcome {
         if !self.in_view(point) {
             return self.release_outside();
+        }
+        if self.hud.controls.mode == Mode::Buy && self.buy_dragging.is_some() {
+            self.buy_dragging = None;
+            return self.commit_buy();
         }
         if self.hud.dialog().is_some() || self.hud.menu.is_none() {
             return Outcome {
@@ -874,9 +912,17 @@ impl Game {
     }
 
     /// A left release while the pointer is outside the window (after
-    /// [`Game::leave`]): settles an opening press on a moved menu, or
-    /// closes the pie without checking or choosing any entry.
+    /// [`Game::leave`]): settles an opening press on a moved menu, closes
+    /// the pie without checking or choosing any entry, or cancels a Buy Mode
+    /// drag.
     pub fn release_outside(&mut self) -> Outcome {
+        if self.buy_dragging.take().is_some() {
+            let redraw = self.hide_buy_cursor();
+            return Outcome {
+                redraw,
+                photo: false,
+            };
+        }
         if self.hud.dialog().is_some() || self.hud.menu.is_none() {
             return Outcome {
                 redraw: false,
@@ -906,10 +952,17 @@ impl Game {
     pub fn leave(&mut self) -> bool {
         self.pointer = None;
         self.highlighted = None;
-        let redraw = self.hud.leave();
+        let mut redraw = self.hud.leave();
         let sounds = self.hud.take_sounds();
         self.keep_sounds(sounds);
-        self.follow() || redraw
+        if self.hud.controls.mode == Mode::Buy {
+            if self.buy_dragging.is_none() {
+                redraw |= self.hide_buy_cursor();
+            }
+            redraw
+        } else {
+            self.follow() || redraw
+        }
     }
 
     /// Follows the object under the pointer in the frame last drawn: when
@@ -1399,7 +1452,11 @@ impl Game {
         self.reached = None;
         self.listed = None;
         self.highlighted = None;
+        self.buy_selected = None;
+        self.buy_cursor = None;
+        self.buy_dragging = None;
         self.hud.forget();
+        self.hud.controls.mode = ui_mode(self.lot.mode());
         self.blink_dirty = false;
         let world = self.lot.world();
         self.hud.sync_clock_blink(world, self.clock_us);
@@ -1522,8 +1579,31 @@ impl Game {
                 self.note = Some("The Help System dialog is not ported yet.".into());
                 Outcome::redraw()
             }
+            Command::SetMode(mode) => {
+                self.set_mode(mode);
+                Outcome::redraw()
+            }
+            Command::BuyCategory(_) | Command::BuySubcategory(_) | Command::BuyBack => {
+                self.cancel_buy();
+                self.hud
+                    .layout_buy(self.view.size, self.lot.world(), &self.assets);
+                Outcome::redraw()
+            }
+            Command::BuyPage(_) => {
+                self.hud
+                    .layout_buy(self.view.size, self.lot.world(), &self.assets);
+                Outcome::redraw()
+            }
+            Command::BuyItem(guid) => {
+                self.select_buy_item(guid);
+                Outcome::redraw()
+            }
             Command::TogglePanel => {
                 self.sync_view_centre();
+                if self.hud.controls.mode == Mode::Buy {
+                    self.hud
+                        .layout_buy(self.view.size, self.lot.world(), &self.assets);
+                }
                 Outcome::redraw()
             }
             Command::OpenPanel(_)
@@ -1531,11 +1611,274 @@ impl Game {
             | Command::ShowRelations(_)
             | Command::RelationsPage(_)
             | Command::Help(_) => Outcome::redraw(),
-            other => {
-                self.note = Some(format!("Not carried out yet: {other:?}"));
-                Outcome::redraw()
+        }
+    }
+
+    /// The active control-panel mode (`Mode::Live`, `Mode::Buy`, etc.).
+    pub fn mode(&self) -> Mode {
+        self.hud.controls.mode
+    }
+
+    /// The Buy Mode catalog master GUID currently armed for placement, if any.
+    pub fn buy_selected(&self) -> Option<u32> {
+        self.buy_selected
+    }
+
+    /// The active Buy Mode placement cursor (once the pointer has entered
+    /// the house view), if any.
+    pub fn buy_cursor(&self) -> Option<&BuyCursor> {
+        self.buy_cursor.as_ref()
+    }
+
+    /// Switches between Live, Buy, Build, and Options modes (`0x4cea5d`,
+    /// `0x4ce44f`). Cancels any unplaced Buy Mode item, closes open pie menus,
+    /// updates `global[19]` (calling `go_live` `0x416534` when returning to
+    /// Live mode), and refreshes the control panel and Buy catalog strip.
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.cancel_buy();
+        self.close_menu();
+        self.reached = None;
+        self.listed = None;
+        self.highlighted = None;
+        if let Err(e) = self.lot.set_mode(panel_mode_for(mode)) {
+            self.note = Some(format!("The mode was not changed: {e}"));
+            return;
+        }
+        self.hud.controls.mode = mode;
+        self.hud.controls.expanded = true;
+        self.hud.controls.help = None;
+        self.hud.buy_state.reset();
+        if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
+            self.blink_dirty = true;
+        }
+        self.refresh_world();
+        self.hud.relayout_panel(
+            self.view.size,
+            self.lot.world(),
+            self.lot.residential(),
+            &self.assets,
+        );
+    }
+
+    /// Arms catalog master `guid` on the Buy Mode placement tool (`0x5065c8`).
+    /// Does not create the object until the pointer enters the house view
+    /// (`0x487d3d`). Plays `UI_error` if the household cannot afford it.
+    fn select_buy_item(&mut self, guid: u32) {
+        self.cancel_buy();
+        let price = self
+            .hud
+            .ensure_buy_catalog(&self.assets)
+            .get(guid)
+            .map(|item| item.price);
+        let funds = sims_vm::available_funds(self.lot.world());
+        match price {
+            Some(price) if price <= 0 || price <= funds => {
+                self.buy_selected = Some(guid);
+                self.hud.buy_state.selected = Some(guid);
+            }
+            Some(_) => {
+                self.hud.play(crate::hud::ERROR);
+                self.buy_selected = None;
+                self.hud.buy_state.selected = None;
+            }
+            None => {
+                self.buy_selected = None;
+                self.hud.buy_state.selected = None;
             }
         }
+        self.hud
+            .layout_buy(self.view.size, self.lot.world(), &self.assets);
+    }
+
+    /// Cancels any active Buy Mode cursor or armed catalog selection
+    /// (`0x487105`), deleting the unplaced object and `"Tile Cursor"` without
+    /// charging funds. Returns `true` if anything was cancelled.
+    pub fn cancel_buy(&mut self) -> bool {
+        self.buy_dragging = None;
+        let had_selection = self.buy_selected.take().is_some();
+        let had_hud = self.hud.buy_state.selected.take().is_some();
+        let had_cursor = if let Some(cursor) = self.buy_cursor.take() {
+            if let Err(e) = self.lot.buy_cancel(cursor) {
+                self.note = Some(format!("The Buy cursor was not cancelled: {e}"));
+            }
+            self.refresh_world();
+            true
+        } else {
+            false
+        };
+        if had_selection || had_hud || had_cursor {
+            if self.hud.controls.mode == Mode::Buy {
+                self.hud
+                    .layout_buy(self.view.size, self.lot.world(), &self.assets);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Rotates the held Buy Mode object by one turn step (`0x4226bc` →
+    /// `0x421be4`), returning `true` if a Buy cursor was active.
+    pub fn rotate_held(&mut self, clockwise: bool) -> bool {
+        let Some(mut cursor) = self.buy_cursor.take() else {
+            return false;
+        };
+        let (facing, step) = self
+            .lot
+            .world()
+            .objects
+            .get(&cursor.held)
+            .map(|o| {
+                (
+                    o.data.get(1).copied().unwrap_or(0),
+                    o.data.get(23).copied().unwrap_or(0),
+                )
+            })
+            .unwrap_or((0, 0));
+        if step > 0 {
+            let delta = if clockwise { step } else { -step };
+            let next = (facing + delta).rem_euclid(8);
+            if let Err(e) = self.lot.buy_rotate(&mut cursor, next) {
+                self.note = Some(format!("The object was not rotated: {e}"));
+            } else {
+                self.refresh_world();
+            }
+        }
+        self.buy_cursor = Some(cursor);
+        true
+    }
+
+    /// Handles pointer movement over the house view in Buy Mode (`0x487d3d`,
+    /// `0x485a2e`): instantiates the armed catalog object + `"Tile Cursor"`
+    /// on first entry, moves them to the terrain-unprojected tile, or rotates
+    /// the held object while dragging past the 6 px threshold (`0x24`).
+    fn hover_buy(&mut self, point: [i32; 2]) -> bool {
+        if self.stopped.is_some() {
+            return false;
+        }
+        if self.buy_cursor.is_none()
+            && let Some(guid) = self.buy_selected
+        {
+            let dir = sims_vm::default_buy_direction(self.view.camera.rotation);
+            match self.lot.buy_start(guid, self.view.camera.level, dir) {
+                Ok(Some(cursor)) => self.buy_cursor = Some(cursor),
+                Ok(None) => {
+                    self.hud.play(crate::hud::ERROR);
+                    self.buy_selected = None;
+                    self.hud.buy_state.selected = None;
+                    self.hud
+                        .layout_buy(self.view.size, self.lot.world(), &self.assets);
+                    return true;
+                }
+                Err(e) => {
+                    self.note = Some(format!("Could not start placing 0x{guid:08X}: {e}"));
+                    return true;
+                }
+            }
+        }
+        let Some(mut cursor) = self.buy_cursor.take() else {
+            return false;
+        };
+        if let Some(anchor) = self.buy_dragging {
+            let dx = point[0] - anchor[0];
+            let dy = point[1] - anchor[1];
+            if dx * dx + dy * dy > 36 {
+                let quad = match (dx >= 0, dy >= 0) {
+                    (true, false) => 0,
+                    (true, true) => 2,
+                    (false, true) => 4,
+                    (false, false) => 6,
+                };
+                let dir = (quad - 2 * i16::from(self.view.camera.rotation & 3)).rem_euclid(8);
+                if let Err(e) = self.lot.buy_rotate(&mut cursor, dir) {
+                    self.note = Some(format!("The object was not rotated: {e}"));
+                }
+            }
+        } else {
+            let at = [point[0] - pick::ORIGIN_COLUMN, point[1]];
+            let fine = sims_render::unproject_terrain(&self.lot_shape, &self.view.camera, at)
+                .unwrap_or_else(|| self.view.camera.unproject_fine(at));
+            if let Err(e) = self.lot.buy_move(&mut cursor, fine, self.view.camera.level) {
+                self.note = Some(format!("Could not move Buy cursor: {e}"));
+            }
+        }
+        self.buy_cursor = Some(cursor);
+        self.refresh_world();
+        true
+    }
+
+    /// Hides the active Buy Mode cursor off the lot (`0x487d4e`).
+    fn hide_buy_cursor(&mut self) -> bool {
+        let Some(mut cursor) = self.buy_cursor.take() else {
+            return false;
+        };
+        if let Err(e) = self.lot.buy_hide(&mut cursor) {
+            self.note = Some(format!("Could not hide Buy cursor: {e}"));
+        }
+        self.buy_cursor = Some(cursor);
+        self.refresh_world();
+        true
+    }
+
+    /// Commits a Buy Mode placement on mouse release (`0x4864d0` → `0x486ada`
+    /// → `0x421a0e`, `0x4929fb`).
+    fn commit_buy(&mut self) -> Outcome {
+        let Some(cursor) = self.buy_cursor.take() else {
+            return Outcome::default();
+        };
+        if !cursor.valid {
+            self.buy_cursor = Some(cursor);
+            self.hud.play(crate::hud::ERROR);
+            let sounds = self.hud.take_sounds();
+            self.keep_sounds(sounds);
+            return Outcome::redraw();
+        }
+        match self.lot.buy_commit(cursor) {
+            Ok(_) => {
+                self.buy_selected = None;
+                self.hud.buy_state.selected = None;
+                self.refresh_world();
+                self.hud
+                    .layout_buy(self.view.size, self.lot.world(), &self.assets);
+            }
+            Err(e) => {
+                self.note = Some(format!("The item was not placed: {e}"));
+                self.hud.play(crate::hud::ERROR);
+            }
+        }
+        let sounds = self.hud.take_sounds();
+        self.keep_sounds(sounds);
+        Outcome::redraw()
+    }
+
+    /// Refreshes the cached render lot shape and people from `self.lot.world()`.
+    fn refresh_world(&mut self) {
+        let world = self.lot.world();
+        self.people.refresh(world);
+        match sims_render::Lot::from_world(world) {
+            Ok(shape) => self.lot_shape = shape,
+            Err(e) => self
+                .people
+                .note(vec![format!("the lot is not redrawn: {e}")]),
+        }
+    }
+}
+
+fn panel_mode_for(mode: Mode) -> PanelMode {
+    match mode {
+        Mode::Live => PanelMode::Live,
+        Mode::Buy => PanelMode::Buy,
+        Mode::Build => PanelMode::Build,
+        Mode::Options => PanelMode::Options,
+    }
+}
+
+fn ui_mode(mode: PanelMode) -> Mode {
+    match mode {
+        PanelMode::Live => Mode::Live,
+        PanelMode::Build => Mode::Build,
+        PanelMode::Buy => Mode::Buy,
+        PanelMode::Options | PanelMode::Camera => Mode::Options,
     }
 }
 

@@ -37,6 +37,7 @@ mod animator;
 mod autonomy;
 pub mod boot;
 mod both_ways;
+mod buy;
 mod cancel;
 mod clip_events;
 mod daily;
@@ -71,6 +72,10 @@ mod tick;
 mod visits;
 
 pub use animator::snap_to_path;
+pub use buy::{
+    BuyCursor, TILE_CURSOR_GUID, available_funds, default_buy_direction, panel_mode,
+    snap_to_tile_centre,
+};
 pub use error::Error;
 pub use factory::TURN_BUDGET;
 pub use fault::{Fault, Location, Trap};
