@@ -103,14 +103,17 @@ pub fn shade_pie_face(canvas: &mut Canvas, center: [i32; 2], viewport: (u32, u32
 }
 
 /// Composites a rendered pie-menu 3D `head` into `canvas` at `face_origin`,
-/// clipped to the active 3D house `viewport` (`0x4a953e` → `0x587cf1` →
-/// `0x462290`). Running this in the house pass before the 2D HUD ensures the
-/// bottom control strip hides any part of the head below `viewport.1`, while
-/// pie labels drawn later still appear on top of the head.
+/// clipped to the active 3D house `viewport` and depth-tested (`LESSEQUAL`)
+/// against `canvas.depth` using each pixel's native 16-bit depth in
+/// `head_depth` (`0x4a9500`, `0x5ce959`–`0x5ce977`, `0x4a953e` → `0x587cf1` →
+/// `0x462290`). Running this in the house pass before the 2D HUD ensures
+/// nearer scene geometry occludes the head, the bottom control strip hides any
+/// part below `viewport.1`, and pie labels drawn later still appear on top.
 pub fn composite_pie_head(
     canvas: &mut Canvas,
     face_origin: [i32; 2],
     head: &Image,
+    head_depth: &[i32],
     viewport: (u32, u32),
 ) {
     let vp_w = i32::try_from(viewport.0)
@@ -138,13 +141,22 @@ pub fn composite_pie_head(
         let dst_row = dy * canvas_w;
         let src_row = sy as usize * head_w;
         for sx in sx0..sx1 {
-            let p = (src_row + sx as usize) * 4;
+            let src_idx = src_row + sx as usize;
+            let p = src_idx * 4;
             let a = head.rgba[p + 3];
             if a == 0 {
                 continue;
             }
+            let Some(&z) = head_depth.get(src_idx) else {
+                continue;
+            };
             let dx = (face_origin[0] + sx) as usize;
-            let dst = &mut canvas.color[dst_row + dx];
+            let dst_idx = dst_row + dx;
+            if z > canvas.depth[dst_idx] {
+                continue;
+            }
+            canvas.depth[dst_idx] = z;
+            let dst = &mut canvas.color[dst_idx];
             if a == 255 {
                 *dst = [head.rgba[p], head.rgba[p + 1], head.rgba[p + 2]];
             } else {
@@ -249,9 +261,9 @@ impl People {
 
     /// Renders `person`'s pie-menu 3D head positioned at `center` inside the
     /// active house `viewport` (`0x462621` → `0x462985`), returning its
-    /// top-left viewport origin and tightly bounded RGBA image clipped to the
-    /// house viewport and native near/far frustum for `zoom` (never cropped by
-    /// the 201×201 face bitmap).
+    /// top-left viewport origin, tightly bounded RGBA image, and per-pixel
+    /// native 16-bit screen depths clipped to the house viewport and native
+    /// near/far frustum for `zoom` (never cropped by the 201×201 face bitmap).
     pub fn head_in_viewport(
         &mut self,
         world: &World,
@@ -260,7 +272,7 @@ impl People {
         center: [i32; 2],
         zoom: sims_render::Zoom,
         look: Look,
-    ) -> Result<([i32; 2], Image), String> {
+    ) -> Result<([i32; 2], Image, Vec<i32>), String> {
         self.refresh(world);
         let drawn = self.people.pie_head_in_viewport(
             person,
@@ -276,6 +288,7 @@ impl People {
                 height: drawn.canvas.height,
                 rgba: drawn.canvas.rgba,
             },
+            drawn.depth,
         ))
     }
 
@@ -342,12 +355,23 @@ mod tests {
         let mid = (2 * 6 + 2) * 4;
         head.rgba[mid..mid + 4].copy_from_slice(&[0, 200, 0, 128]);
 
+        let depth = vec![12_000; 6 * 6];
         // Place across the bottom of a 20×12 house viewport.
-        composite_pie_head(&mut canvas, [4, 9], &head, (20, 12));
+        // Put a nearer foreground pixel at (6, 9) (depth 8,000 < 12,000) and a
+        // tie at (7, 9) (depth 12,000 == 12,000, LESSEQUAL passes).
+        canvas.depth[9 * 20 + 6] = 8_000;
+        canvas.depth[9 * 20 + 7] = 12_000;
+        composite_pie_head(&mut canvas, [4, 9], &head, &depth, (20, 12));
         // Transparent pixel at (4, 9) leaves canvas untouched.
         assert_eq!(canvas.color[9 * 20 + 4], [10, 20, 30]);
-        // Opaque pixels inside y < 12 are written.
+        // Opaque pixels inside y < 12 with depth <= scene depth are written and
+        // update the scene depth buffer.
         assert_eq!(canvas.color[9 * 20 + 5], [200, 40, 20]);
+        assert_eq!(canvas.depth[9 * 20 + 5], 12_000);
+        // Nearer foreground at (6, 9) rejects the head pixel; equal depth at (7, 9) passes.
+        assert_eq!(canvas.color[9 * 20 + 6], [10, 20, 30]);
+        assert_eq!(canvas.depth[9 * 20 + 6], 8_000);
+        assert_eq!(canvas.color[9 * 20 + 7], [200, 40, 20]);
         assert_eq!(canvas.color[11 * 20 + 6], [5, 110, 15]);
         // Rows y >= 12 are clipped out of the house viewport.
         for y in 12..20 {
@@ -358,7 +382,7 @@ mod tests {
 
         // Negative origin clips cleanly to x >= 0, y >= 0 without panicking.
         let mut edge = Canvas::new(10, 10, [10, 20, 30]);
-        composite_pie_head(&mut edge, [-2, -2], &head, (10, 10));
+        composite_pie_head(&mut edge, [-2, -2], &head, &depth, (10, 10));
         assert_eq!(edge.color[0], [5, 110, 15]);
         assert_eq!(edge.color[3 * 10 + 3], [200, 40, 20]);
         assert_eq!(edge.color[4 * 10 + 4], [10, 20, 30]);

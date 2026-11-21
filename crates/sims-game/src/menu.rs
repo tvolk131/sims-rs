@@ -418,6 +418,10 @@ pub struct Menu {
     pub head: Option<Image>,
     /// Top-left house-viewport pixel where [`Menu::head`] sits.
     pub head_origin: [i32; 2],
+    /// Native 16-bit house z-buffer depth per pixel of [`Menu::head`]
+    /// (`sims_render::depth::EMPTY` where transparent), for `D3DCMP_LESSEQUAL`
+    /// depth testing against the house scene (`0x4a9500`, `0x5ce959`–`0x5ce977`).
+    pub head_depth: Vec<i32>,
     /// The main menu's pie-head look frozen when a submenu opened (`0x462106`,
     /// `0x462290` reads highlighted/angle/distance from the parent menu while
     /// a submenu is active).
@@ -485,6 +489,7 @@ impl Menu {
             held: true,
             head: None,
             head_origin: [0, 0],
+            head_depth: Vec::new(),
             submenu_look: None,
         };
         menu.layout(art, size);

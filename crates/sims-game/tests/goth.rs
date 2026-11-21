@@ -5039,3 +5039,79 @@ fn pie_submenu_keeps_parent_head_frozen_and_draws_submenu_labels_above_it() {
         "expected parent-only inner disk outside submenu disk to be unshaded: {parent_only_unshaded}/{parent_only_checked}"
     );
 }
+
+/// The pie head submits into the house's final 3D pass with `D3DCMP_LESSEQUAL`
+/// depth testing (`0x4a9500`, `0x5ce959`–`0x5ce977`, `0x4623f5`–`0x462414`
+/// placing the head origin at `z_screen = 0.5 * ((3000 + 10) << zoom)`). At
+/// Near zoom, Mortimer's neutral head spans depths ~11,833–12,147, so nearer
+/// foreground scene geometry (e.g. grass at depth 8,703) occludes the head,
+/// mid-head depth (12,040) clips only the farther half, and deeper/empty
+/// geometry lets the entire head draw and write its depths.
+#[test]
+fn pie_head_respects_house_depth_buffer_lessequal() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    assert_eq!(game.run(100), 100);
+    game.resize([800, 600]);
+    game.render();
+
+    let bench = recorded([432, 230]);
+    assert_eq!(game.under(bench), Some(173));
+    game.press(bench);
+    game.view.camera.zoom = sims_render::Zoom::Near;
+    game.render();
+
+    let menu = game.menu().expect("bench pie open");
+    let head = menu.head.as_ref().expect("Near-zoom head rendered");
+    let origin = menu.head_origin;
+    let head_depth = &menu.head_depth;
+    let opaque_depths: Vec<i32> = head
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(head_depth.iter().copied())
+        .filter(|(p, _)| p[3] == 255)
+        .map(|(_, d)| d)
+        .collect();
+    assert_eq!(opaque_depths.len(), 1_940);
+    let min_d = *opaque_depths.iter().min().unwrap();
+    let max_d = *opaque_depths.iter().max().unwrap();
+    assert!(
+        (11_800..=11_860).contains(&min_d) && (12_020..=12_080).contains(&max_d),
+        "expected Near-zoom Mortimer visible head depth ~11,833..12,049, got {min_d}..{max_d}"
+    );
+
+    // 1. Foreground scene nearer than every head vertex rejects all 1,940 pixels.
+    let fg_depth = sims_render::depth::Depth::new(&game.view.camera).grass([62, 62], 200);
+    assert!(fg_depth < min_d, "fg_depth={fg_depth} min_d={min_d}");
+    let mut fg_canvas = Canvas::new(800, 500, [1, 2, 3]);
+    fg_canvas.depth.fill(fg_depth);
+    sims_game::people::composite_pie_head(&mut fg_canvas, origin, head, head_depth, (800, 500));
+    let fg_written = fg_canvas.color.iter().filter(|p| **p != [1, 2, 3]).count();
+    assert_eq!(fg_written, 0, "nearer foreground must occlude the pie head");
+
+    // 2. Mid-head depth draws only the nearer half of visible pixels (z <= mid_d).
+    let mid_d = (min_d + max_d) / 2;
+    let mut mid_canvas = Canvas::new(800, 500, [1, 2, 3]);
+    mid_canvas.depth.fill(mid_d);
+    sims_game::people::composite_pie_head(&mut mid_canvas, origin, head, head_depth, (800, 500));
+    let mid_written = mid_canvas.color.iter().filter(|p| **p != [1, 2, 3]).count();
+    let expected_mid = opaque_depths.iter().filter(|&&d| d <= mid_d).count();
+    assert!(expected_mid > 500 && expected_mid < 1_940);
+    assert_eq!(mid_written, expected_mid);
+
+    // 3. Empty/far scene depth draws all 1,940 pixels and updates canvas.depth.
+    let mut far_canvas = Canvas::new(800, 500, [1, 2, 3]);
+    sims_game::people::composite_pie_head(&mut far_canvas, origin, head, head_depth, (800, 500));
+    let far_written = far_canvas.color.iter().filter(|p| **p != [1, 2, 3]).count();
+    assert_eq!(far_written, 1_940);
+    let updated_depths = far_canvas
+        .depth
+        .iter()
+        .filter(|&&d| d != sims_render::depth::EMPTY)
+        .count();
+    assert_eq!(updated_depths, 1_940);
+}

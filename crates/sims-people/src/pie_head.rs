@@ -288,27 +288,34 @@ impl Target for PieTarget<'_> {
 }
 
 /// A pie-menu 3D head rasterized at exact house-viewport coordinates and
-/// clipped only by the active house viewport (`0x462621` → `0x462985`),
-/// avoiding any crop at the 201×201 face bitmap for tall or wide headwear.
+/// clipped to the active house viewport and the native Direct3D 6 orthographic
+/// near/far planes (`0x49b506`–`0x49b50b`, `0x462621` → `0x462985`), avoiding
+/// any crop at the 201×201 face bitmap for tall or wide headwear.
 #[derive(Debug, Clone)]
 pub struct DrawnHead {
     /// Top-left screen pixel of [`DrawnHead::canvas`] in house-viewport
     /// coordinates.
     pub origin: [i32; 2],
-    /// Tightly bounded RGBA pixels clipped to the house viewport.
+    /// Tightly bounded RGBA pixels clipped to the house viewport and native
+    /// near/far frustum.
     pub canvas: Canvas,
+    /// Native 16-bit house z-buffer depth for each pixel of
+    /// [`DrawnHead::canvas`] (`sims_render::depth::EMPTY` where transparent),
+    /// for `D3DCMP_LESSEQUAL` depth testing against the house scene
+    /// (`0x4a9500`, `0x5ce959`–`0x5ce977`).
+    pub depth: Vec<i32>,
 }
 
 /// Target that rasterizes directly in full house-viewport coordinates while
-/// storing only the tight bounding rectangle clamped to the viewport, and
-/// applying the house camera's native Direct3D 6 orthographic near/far clip
-/// planes (`0x49b506`, `0x4623f5`–`0x462414`).
+/// storing only the tight bounding rectangle clamped to the viewport, applying
+/// the house camera's native Direct3D 6 orthographic near/far clip planes
+/// (`0x49b506`, `0x4623f5`–`0x462414`) and recording each winning pixel's
+/// 16-bit screen depth (`0.0..=65535.0`).
 struct ViewportPieTarget<'a> {
     viewport: (u32, u32),
     origin: (u32, u32),
-    near_z: f32,
-    far_z: f32,
     canvas: &'a mut Canvas,
+    depth: &'a mut [i32],
 }
 
 impl Target for ViewportPieTarget<'_> {
@@ -317,7 +324,7 @@ impl Target for ViewportPieTarget<'_> {
     }
 
     fn passes(&self, x: u32, y: u32, z: f32) -> bool {
-        if !(self.near_z..=self.far_z).contains(&z) {
+        if !(0.0..=65_535.0).contains(&z) {
             return false;
         }
         let Some(lx) = x.checked_sub(self.origin.0) else {
@@ -330,7 +337,7 @@ impl Target for ViewportPieTarget<'_> {
     }
 
     fn write(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], s: f32) {
-        if !(self.near_z..=self.far_z).contains(&z) {
+        if !(0.0..=65_535.0).contains(&z) {
             return;
         }
         let Some(lx) = x.checked_sub(self.origin.0) else {
@@ -339,6 +346,11 @@ impl Target for ViewportPieTarget<'_> {
         let Some(ly) = y.checked_sub(self.origin.1) else {
             return;
         };
+        if !self.canvas.passes(lx, ly, z) {
+            return;
+        }
+        let idx = ly as usize * self.canvas.width as usize + lx as usize;
+        self.depth[idx] = z as i32;
         let lit = |c: u8| (f32::from(c) * s + 0.5).clamp(0.0, 255.0) as u8;
         let [r, g, b, a] = texel;
         self.canvas
@@ -346,30 +358,33 @@ impl Target for ViewportPieTarget<'_> {
     }
 }
 
-/// Native Direct3D 6 orthographic near/far frustum depth bounds `(near_z, far_z)`
-/// in unscaled HEAD-bone units for the active house camera `zoom`.
-///
-/// `0x49b506` sets `near = 0.0`, `0x49b124`–`0x49b187` computes `far`,
-/// `0x49b56d` scales NDC depth by `65535.0`, `0x4623f5`–`0x462414` places the
-/// head origin at `z_screen = 0.5 * ((3000 + 10) << zoom)` (with `zoom` 1/2/3
-/// for Far/Medium/Near), and `0x4625d9`–`0x46260d` scales the mesh by
-/// `(12.0 / (1 << zoom)) * 1.75`. Because [`project`] uses smaller (more
-/// negative) `z` for points closer to the camera, pixels outside
-/// `near_z..=far_z` are clipped by Direct3D 6 (notably oversized headwear
-/// pitched down toward the viewer at far zoom).
-pub fn depth_clip_bounds(zoom: sims_render::Zoom) -> (f32, f32) {
+/// Native 16-bit screen-depth mapping `(z_origin, z_per_unit)` for the active
+/// house camera `zoom`, converting unscaled HEAD-bone `v.z` from [`project`]
+/// into Direct3D 6's 16-bit z-buffer space `[0.0, 65535.0]` (`0x49b506`
+/// `near = 0.0`, `0x49b124`–`0x49b187` `far`, `0x49b56d` `65535.0`,
+/// `0x4623f5`–`0x462414` `z_screen = 0.5 * ((3000 + 10) << zoom)`,
+/// `0x4625d9`–`0x46260d` `head_scale = (12.0 / (1 << zoom)) * 1.75`).
+pub fn screen_depth_scale(zoom: sims_render::Zoom) -> (f32, f32) {
     const UNITS_PER_TILE: f32 = 3.0;
     let span = sims_render::camera::ARRAY_SIZE as f32 * UNITS_PER_TILE;
     let h = (255.0 / (2.0 * 6.0f32.sqrt())) * UNITS_PER_TILE + 68.0;
     let far = 3.0f32.sqrt() * (2.0f32.sqrt() * span) * 0.5 + h * 0.5;
     let zoom_factor = (zoom.tile_width() / 16) as f32;
-    let z_screen_origin = 0.5 * (3010.0 * zoom_factor);
-    let z_view_origin = (z_screen_origin / 65_535.0) * far;
+    let z_origin = 0.5 * (3010.0 * zoom_factor);
     let head_scale = (12.0 / zoom_factor) * 1.75;
-    (
-        -z_view_origin / head_scale,
-        (far - z_view_origin) / head_scale,
-    )
+    (z_origin, (head_scale / far) * 65_535.0)
+}
+
+/// Native Direct3D 6 orthographic near/far frustum depth bounds `(near_z, far_z)`
+/// in unscaled HEAD-bone units for the active house camera `zoom`
+/// ([`screen_depth_scale`]).
+///
+/// Because [`project`] uses smaller (more negative) `z` for points closer to
+/// the camera, pixels outside `near_z..=far_z` are clipped by Direct3D 6
+/// (notably oversized headwear pitched down toward the viewer at far zoom).
+pub fn depth_clip_bounds(zoom: sims_render::Zoom) -> (f32, f32) {
+    let (z_origin, z_per_unit) = screen_depth_scale(zoom);
+    (-z_origin / z_per_unit, (65_535.0 - z_origin) / z_per_unit)
 }
 
 fn skinned_head_parts(
@@ -446,6 +461,7 @@ pub fn draw_body_in_viewport(
         return Ok(DrawnHead {
             origin: [0, 0],
             canvas: Canvas::new(0, 0, [0; 4]),
+            depth: Vec::new(),
         });
     }
     let [pitch, yaw] = look.angles();
@@ -469,6 +485,7 @@ pub fn draw_body_in_viewport(
         return Ok(DrawnHead {
             origin: [0, 0],
             canvas: Canvas::new(0, 0, [0; 4]),
+            depth: Vec::new(),
         });
     }
     let rx0 = (min_x.floor() as i64)
@@ -487,6 +504,7 @@ pub fn draw_body_in_viewport(
         return Ok(DrawnHead {
             origin: [0, 0],
             canvas: Canvas::new(0, 0, [0; 4]),
+            depth: Vec::new(),
         });
     }
     let rw = rx1 - rx0;
@@ -496,19 +514,22 @@ pub fn draw_body_in_viewport(
             "pie head bounds {rw}x{rh} exceed {MAX_SIDE}x{MAX_SIDE}"
         ));
     }
-    let (near_z, far_z) = depth_clip_bounds(zoom);
+    let (z_origin, z_per_unit) = screen_depth_scale(zoom);
     let mut canvas = Canvas::new(rw, rh, [0; 4]);
+    let mut depth = vec![sims_render::depth::EMPTY; (rw * rh) as usize];
     let ambient = Shade::Grey(look.ambient());
     let mut target = ViewportPieTarget {
         viewport: (vp_w, vp_h),
         origin: (rx0, ry0),
-        near_z,
-        far_z,
         canvas: &mut canvas,
+        depth: &mut depth,
     };
     for (part, skinned) in &parts {
         let shade = vec![ambient; skinned.positions.len()];
-        let proj = |p| project(p, origin, pitch, yaw);
+        let proj = |p| {
+            let v = project(p, origin, pitch, yaw);
+            Vec3::new(v.x, v.y, z_origin + v.z * z_per_unit)
+        };
         if part.texture_name.is_some() {
             let mut packed = Packed565(&mut target);
             draw_shaded(&mut packed, part, skinned, &shade, proj);
@@ -522,6 +543,7 @@ pub fn draw_body_in_viewport(
             i32::try_from(ry0).unwrap_or(i32::MAX),
         ],
         canvas,
+        depth,
     })
 }
 

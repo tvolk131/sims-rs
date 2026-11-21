@@ -643,21 +643,24 @@ impl Game {
                         self.view.camera.zoom,
                         look,
                     ) {
-                        Ok((origin, head)) => {
+                        Ok((origin, head, depth)) => {
                             crate::people::composite_pie_head(
                                 &mut self.canvas,
                                 origin,
                                 &head,
+                                &depth,
                                 viewport,
                             );
                             menu.head_origin = origin;
                             menu.head = Some(head);
+                            menu.head_depth = depth;
                         }
                         Err(e) => {
                             self.people
                                 .note(vec![format!("the pie menu has no head: {e}")]);
                             menu.head_origin = [0, 0];
                             menu.head = None;
+                            menu.head_depth.clear();
                         }
                     }
                 }
