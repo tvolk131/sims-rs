@@ -421,12 +421,26 @@ impl Lot {
         answers: &[u8],
         frames: Frames,
     ) -> Result<Self, BootError> {
-        let install = Install::detect(root)?;
         let directory = house
             .parent()
             .and_then(Path::parent)
             .ok_or("the house file must be inside a neighborhood's Houses directory")?;
         let neighborhood = Neighborhood::open(directory)?;
+        Self::load_in(root, neighborhood, house, answers, frames)
+    }
+
+    /// [`Lot::load`] with the neighborhood already open, as opening it
+    /// left it ([`sims_sim::patch_import::open`]): its records and
+    /// families come from `neighborhood`, its people's files from its
+    /// directory's `Characters`.
+    pub fn load_in(
+        root: &Path,
+        neighborhood: Neighborhood,
+        house: &Path,
+        answers: &[u8],
+        frames: Frames,
+    ) -> Result<Self, BootError> {
+        let install = Install::detect(root)?;
         let mut index = Index::build(&install)?;
         let characters = neighborhood.characters()?;
         if let Some(characters) = &characters {
