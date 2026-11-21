@@ -74,7 +74,10 @@ Ghidra on the decrypted image and checked in the running game):
   (without advancing time), so the runner goes on there.
 - 0x48ddcb is the call in the pie menu's select handler (0x48dd67) that
   pushes the chosen action onto the person's queue (0x45d20b): edi (= ecx)
-  is the person, esi the action. capture.py stops there to record it.
+  is the person, esi the pushed record. At 0x45d30d (0x45d2f6 in the
+  social path), the call to 0x41f158 increments the counter at 0x6e4904
+  and writes the uid to the pushed record itself at +0x3c. At the queue
+  call's return (0x48ddd0), al says whether the push was accepted.
 """
 import json
 import re
@@ -87,7 +90,9 @@ GAME = 0x6e48bc
 PEOPLE_PANEL = 0x6f3b2c
 VIEW_ZOOM, VIEW_X0, VIEW_Y0 = 0x6f00d8, 0x6f00d0, 0x6f00d4
 QUEUE_PUSH = 0x48ddcb
+QUEUE_RESULT = 0x48ddd0
 ACTIVE_ACTION = 0xa48  # a person's running action (0x44 bytes); the queue is at +0x820
+ACTION_UID = 0x3c
 PICKER_TOOL = 6
 PICKER_ACTIVE_PIE = 0xe4  # the pie window the picker's menu is in (a submenu's, once one opens)
 WINDOW = '0xe00013'
@@ -376,18 +381,11 @@ def selected_person(m, sim):
     return None
 
 
-def read_queue(m, person):
+def queue_slots(m, person):
     first, end = m.word(person + 0xa40), m.word(person + 0xa44)
     if (end - first) & 0xffffffff > 8:
         return []
-    return [m.action(person + 0x820 + (i & 7) * 0x44) for i in range(first, end)]
-
-
-def same_action(a, b):
-    """The same interaction: the fields the pie menu's entry sets. The uid is
-    given only when the queue takes the action, and the flags and the
-    attenuation change as it runs."""
-    return all(a.get(k) == b.get(k) for k in ('caller', 'target', 'routine', 'menu', 'args'))
+    return [person + 0x820 + (i & 7) * 0x44 for i in range(first, end)]
 
 
 def check_window(window):
@@ -518,8 +516,9 @@ class Runner:
     capture.py calls on_update(update, m, sim) at the return of every lot
     update on the lot (update is the number of updates returned so far),
     on_queue_push(update, in_update, m, regs) at QUEUE_PUSH (update is the
-    number of the lot update that comes next), and on_dialog(kind, update)
-    for the dialog stops. m reads guest memory.
+    number of the lot update that comes next), on_queue_result(m, regs) at
+    QUEUE_RESULT, and on_dialog(kind, update) for the dialog stops. m reads
+    guest memory.
 
     input.jsonl rows (each has `kind`, `update` and `time`):
       step     a step started, ended (`status` done) or failed (`error`).
@@ -533,15 +532,22 @@ class Runner:
                and the picker's entries (label, submenu, action).
       queued   the action the pie menu pushed on a person, read at the push.
                `update` N means before lot update N (`in_update` false) or
-               inside it (true). This is the record to replay: give the
-               action to the person before update N.
+               inside it (true). Replay every push (refused ones included,
+               since they may advance the UID counter) before update N; only
+               pushes whose `queue_result` has `accepted` true should end up
+               held.
+      queued_unread  a push whose person or action could not be read.
+      queue_result  the return of the queue call, with `accepted` and the
+               assigned `uid` if readable. `push` pairs this row with its
+               `queued` or `queued_unread` row, starting at 1 per scenario.
       mode     expect-mode saw the mode.
       placed   expect-new-object's new objects (ID, pointer, type, position,
                level, the definition's 0xa6 bytes and the 72 data words)
                with the budget before and after and the cost.
       taken    expect-queued found the pushed action on the person: `where`
-               is queue or active (the queue had already started it), with
-               the person's active action and queue at that update return.
+               is queue or active, including for converted socials. The
+               row holds its `uid` and the person's active action and queue
+               at that update return, or an error if decoding failed.
       scenario `status` done (every step and command ended) or unfinished
                (the capture ended first, with the commands still unchecked).
     """
@@ -558,6 +564,8 @@ class Runner:
         #                      ('fresh',), ('push', pushes) or ('drain',)
         self.pushes = []
         self.push_cursor = 0  # pushes before it were matched by an expect-queued
+        self.pending_pushes = {}  # pie menu stack frame -> push waiting for its result
+        self.taken_uids = set()  # a queued or running action can confirm only one push
         self.fresh = False  # self.m was read at this update return (not at a dialog stop)
         self.unchecked = []  # (n, row): commands whose exit code is still to be checked
         self.held = None  # the info of a held press whose release is not yet submitted
@@ -589,17 +597,29 @@ class Runner:
 
     def on_queue_push(self, update, in_update, m, regs):
         person, action = regs['edi'], regs['esi']
+        row = dict(kind='queued', update=update, in_update=in_update, push=len(self.pushes) + 1,
+                   person=None, action_pointer=action, step=self.index)
         try:
-            row = dict(kind='queued', update=update, in_update=in_update, person=m.object_id(person),
-                       action=m.action(action), action_pointer=action, step=self.index)
+            row['person'] = m.object_id(person)
+            row['action'] = m.action(action)
         except Exception as e:  # reading the push must never end the capture
-            row = dict(kind='queued_unread', update=update, in_update=in_update, person=None,
-                       person_pointer=person, action_pointer=action, error=f'{type(e).__name__}: {e}')
-            self.pushes.append(row)  # still a push: a choice that waits on one goes on (a dialog may follow)
-            self.write(**row)
-            return
-        self.pushes.append(row)
+            row.update(kind='queued_unread', person_pointer=person, error=f'{type(e).__name__}: {e}')
+        self.pending_pushes[regs['ebp']] = row
+        self.pushes.append(row)  # a choice goes on even if the push was unreadable
         self.write(**row)
+
+    def on_queue_result(self, m, regs):
+        push = self.pending_pushes.pop(regs['ebp'], None)
+        if push is None:
+            return
+        push['accepted'] = bool(regs['eax'] & 0xff)
+        push['uid'] = None
+        try:  # read even when refused: the game may give the uid before it finds the queue full
+            push['uid'] = m.word(push['action_pointer'] + ACTION_UID) or None
+        except Exception:  # the return may be readable even when the uid is not
+            pass
+        self.write(kind='queue_result', push=push['push'], person=push['person'],
+                   accepted=push['accepted'], uid=push['uid'], pushed_update=push['update'])
 
     def on_dialog(self, kind, update):
         """A dialog stop. A modal dialog holds the lot update it shows in, so
@@ -1011,8 +1031,8 @@ class Runner:
         raise StepFailed(f'choosing {label!r} did not open its submenu')
 
     def step_expect_queued(self, person, target, within):
-        """Wait for a push on person (aimed at target), then for the person to
-        hold that action, queued or already running."""
+        """Check the first push on person, then wait for the person to hold
+        that action, queued or already running."""
         yield Fresh()
         start = self.update
         push = None
@@ -1020,22 +1040,49 @@ class Runner:
             if push is None:
                 for i in range(self.push_cursor, len(self.pushes)):
                     r = self.pushes[i]
-                    if r['kind'] == 'queued' and r['person'] == person and (
-                            target is None or r['action']['target'] == target):
+                    # Only pie choices are logged, so a push whose person could not be read
+                    # may be this one: it is checked (and fails) rather than passed over.
+                    if r['person'] in (person, None):
                         push, self.push_cursor = r, i + 1
                         break
-            p = push and find_object(self.m, self.sim, person)
+            uid = push.get('uid') if push else None
+            if push:
+                accepted = push.get('accepted')
+                if accepted is False:
+                    raise StepFailed(f'the game did not queue the action pushed on {person} (its queue call returned 0)')
+                if push['kind'] == 'queued_unread':
+                    on = person if push['person'] is not None else f'{person} (or another person)'
+                    raise StepFailed(f'the action pushed on {on} could not be read ({push["error"]})')
+                pushed_target = push['action']['target']
+                if target is not None and pushed_target != target:
+                    raise StepFailed(f'the action pushed on {person} aimed at {pushed_target} (expected {target})')
+                if accepted and not uid:
+                    raise StepFailed(f'the uid the game gave the action pushed on {person} could not be read')
+                if uid and uid == push['action']['uid']:
+                    raise StepFailed(f'the action pushed on {person} returned with the uid it had before the call ({uid})')
+                if uid and uid in self.taken_uids:
+                    raise StepFailed(f'uid {uid}, given to the action pushed on {person}, already confirmed an earlier push')
+            p = uid and find_object(self.m, self.sim, person)
             if p:
-                queue, active = read_queue(self.m, p), self.m.action(p + ACTIVE_ACTION)
-                where = ('active' if same_action(active, push['action']) else
-                         'queue' if any(same_action(a, push['action']) for a in queue) else None)
-                if where:
-                    self.write(kind='taken', person=person, where=where, pushed_update=push['update'],
-                               active=active, queue=queue)
+                active, queue = p + ACTIVE_ACTION, queue_slots(self.m, p)
+                for where, addr in [('active', active)] + [('queue', q) for q in queue]:
+                    if self.m.word(addr + ACTION_UID) != uid:
+                        continue
+                    self.taken_uids.add(uid)
+                    row = dict(kind='taken', person=person, where=where, uid=uid, pushed_update=push['update'])
+                    try:
+                        row['active'] = self.m.action(active)
+                        row['queue'] = [self.m.action(q) for q in queue]
+                    except Exception as e:
+                        row['error'] = f'{type(e).__name__}: {e}'
+                    self.write(**row)
                     return
             if self.update - start >= within:
+                if push and 'accepted' not in push:
+                    raise StepFailed(f'the queue call for the action pushed on {person} was never seen to return '
+                                     f'within {within} updates')
                 if push:
-                    raise StepFailed(f'the action pushed on {person} was in neither its queue nor its active '
-                                     f'action within {within} updates')
+                    raise StepFailed(f'the action pushed on {person} (uid {push["uid"]}) was in neither its queue '
+                                     f'nor its active action within {within} updates')
                 raise StepFailed(f'no action was queued on {person} within {within} updates')
             yield Updates(1)

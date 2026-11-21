@@ -160,8 +160,9 @@ Things to know:
   (`took_over_at_dialog_show`); its presses go on from
   `resume_open_dialogs`. A run killed after logging the show and before
   keeping `show_stop` has its show logged twice. A row cut short by the
-  kill at the end of `events.jsonl`, `updates.jsonl` or `watch.jsonl` is
-  taken off, or ended with a newline if it is whole. Both are logged in one
+  kill at the end of `events.jsonl`, `updates.jsonl`, `watch.jsonl` or
+  `input.jsonl` is taken off, or ended with a newline if it is whole. Both
+  are logged in one
   `resume_torn` event: `rows`, the cut rows by log, and `ended`, the logs
   ended. They are kept in `resume-torn.json` with a `mark` until then, so a
   takeover killed first hands them on. Each cut row is kept with where it
@@ -351,11 +352,17 @@ How the checks work (the addresses are in `input.py`):
   entries to change, logs that `pie`, and the next `choose` picks from it.
   `choose @N` picks the N-th item (from 0), for a submenu whose labels are
   not known ahead; the logged pie names it.
-- **Confirming.** capture.py stops at `0x48ddcb`, where the pie menu pushes
-  the chosen action on the person's queue, and logs the person and the
-  action. `expect-queued` waits for that record, then for the person to hold
-  the action, in its queue (`+0x820`) or as its running action (`+0xa48`),
-  and logs where it found it.
+- **Confirming.** capture.py logs the chosen action at the pie menu's queue
+  call (`0x48ddcb`) and reads the result and the assigned UID at its return
+  (`0x48ddd0`). `expect-queued` checks the first push on the requested
+  person after the choice (a push whose person could not be read counts
+  as that push). A refused push, an unreadable pushed action, an
+  unexpected target, a UID that is zero or cannot be read, a UID equal to
+  the one the action held before the call, or a UID that already
+  confirmed an earlier push fails the step at once. The step looks for the assigned UID in the person's
+  queue (`+0x820`) and running action (`+0xa48`). The UID also identifies
+  a social whose target, routine, and menu changed. `taken.where` is
+  `queue` or `active`.
 - **Dialogs.** A modal dialog holds the update it shows in, so
   `answer-dialog` runs on the dialog stops. It presses once, like
   `answer.sh`. If the game misses the press, the step waits until the dialog
@@ -389,8 +396,20 @@ scenario cannot be resumed: `--scenario` with `--resume` is refused.
 falls in: `update` N with `in_update` false means the push came before lot
 update N, after update N-1 returned. Its `action` holds the caller, the
 target, the routine, the priority, the menu number, the arguments and the
-flags. The other rows log the steps, each guest command and when it ended,
-the hover readings and the pie menus.
+flags. Each `queued` or `queued_unread` row has a `push` ID, starting at 1
+and increasing for each push. The same ID appears on its `queue_result`
+row, even when several pushes occur in one update. The result's `uid` is
+the record's `+0x3c` after the call, read whether or not the call
+accepted the push (a refused call may still have used a uid from the
+counter). A replay must make every push, refused ones included, so the
+counter and the queues come out as in the original; only pushes whose
+`queue_result` has `accepted` true should end up held. `manifest.json`'s
+`queued` list carries each push's `accepted` and `uid` when its return was
+captured; a push with no `accepted` (the capture ended before the call
+returned, or a capture made before results were logged) has an unknown
+outcome. The other
+rows log the steps, each guest command and when it ended, the hover
+readings and the pie menus.
 
 **Unverified.** The projection was checked only in the house's starting
 view (zoom 1, no rotation). Submenus and build mode are not driven yet;
