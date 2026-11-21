@@ -1307,10 +1307,11 @@ fn resource_set(directory: &Path, stem: &str) -> Result<Option<Vec<String>>> {
         // The original takes an entry that is not a directory (0x5ba7d4
         // to 0x5ba7d9) whose name ends in the letters `far`, with or
         // without a dot, as an archive (0x5ba86d to 0x5ba8a7), as the
-        // index does, and tries to mount it (0x5ba8d6). One this cannot
-        // read (a dangling link, say) or that is not a regular file (a
-        // named pipe, whose open would block) fails closed without
-        // opening it.
+        // index does, and tries to mount it (0x5ba8d6). A metadata failure
+        // (a dangling link, say) or a non-regular entry (a named pipe,
+        // whose open would block) fails closed without opening it; a
+        // regular file that `far_members` cannot open, read, or parse
+        // fails closed too.
         let archive = name.len() >= 3
             && name.is_char_boundary(name.len() - 3)
             && name[name.len() - 3..].eq_ignore_ascii_case("far");

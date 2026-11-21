@@ -773,8 +773,78 @@ fn a_string_table_is_read_as_the_loader_finds_it() {
     }
 }
 
+// Test-only subprocess deadline to fail loudly if a FIFO open blocks.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)]
+fn run_fifo_probe(test_name: &str, env_var: &str, root: &std::path::Path) -> Result<(), String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let mut child = Command::new(exe)
+        .args(["--exact", test_name, "--test-threads=1", "--nocapture"])
+        .env(env_var, root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn {test_name}: {e}"))?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        match child.try_wait().map_err(|e| format!("try_wait: {e}"))? {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "FIFO probe {test_name} timed out after 5s (likely blocked opening FIFO)"
+                ));
+            }
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut stdout);
+    }
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_string(&mut stderr);
+    }
+    if !status.success() {
+        return Err(format!(
+            "FIFO probe {test_name} failed ({status}):\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        ));
+    }
+    if !stdout.contains("1 passed") {
+        return Err(format!(
+            "FIFO probe {test_name} did not run expected test:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        ));
+    }
+    Ok(())
+}
+
 #[test]
 fn career_texts_end_only_when_work_holds_no_career_token() {
+    #[cfg(unix)]
+    if let Some(root) = std::env::var_os("SIMS_FIFO_PROBE_WORK") {
+        let root = PathBuf::from(root);
+        let index = Index::build(&Install::detect(&root).unwrap()).unwrap();
+        let catalog = Catalog::build(&index).unwrap();
+        let fifo = root.join("ExpansionShared/ExtrasFAR");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(
+            !Program::link(&index, &catalog, [])
+                .unwrap()
+                .career_texts_end
+        );
+        return;
+    }
     let dir = Dir::new("career-texts");
     let (index, catalog) = setup(&dir);
     // An install with Hot Date, which mounts `ExpansionShared` (an
@@ -862,20 +932,13 @@ fn career_texts_end_only_when_work_holds_no_career_token() {
         std::fs::remove_file(dir.0.join("ExpansionShared/ExtrasFAR")).unwrap();
         assert!(link(&dir));
 
-        let index = Index::build(&Install::detect(&dir.0).unwrap()).unwrap();
-        let catalog = Catalog::build(&index).unwrap();
-        let fifo = dir.0.join("ExpansionShared/ExtrasFAR");
-        let status = std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .unwrap();
-        assert!(status.success());
-        assert!(
-            !Program::link(&index, &catalog, [])
-                .unwrap()
-                .career_texts_end
+        let probe = run_fifo_probe(
+            "career_texts_end_only_when_work_holds_no_career_token",
+            "SIMS_FIFO_PROBE_WORK",
+            &dir.0,
         );
-        std::fs::remove_file(&fifo).unwrap();
+        let _ = std::fs::remove_file(dir.0.join("ExpansionShared/ExtrasFAR"));
+        probe.unwrap();
         assert!(link(&dir));
     }
     std::fs::create_dir(dir.0.join("ExpansionShared/ExtrasFAR")).unwrap();
@@ -951,6 +1014,12 @@ fn career_texts_end_only_when_work_holds_no_career_token() {
 
 #[test]
 fn the_default_labels_hold_no_token_only_when_no_string_table_of_them_holds_a_dollar() {
+    #[cfg(unix)]
+    if let Some(root) = std::env::var_os("SIMS_FIFO_PROBE_LABELS") {
+        let root = PathBuf::from(root);
+        assert!(!sims_vm::labels_hold_no_token(&root).unwrap());
+        return;
+    }
     let dir = Dir::new("labels");
     let (_, _) = setup(&dir);
     let install = Install::detect(&dir.0).unwrap();
@@ -1038,8 +1107,13 @@ fn the_default_labels_hold_no_token_only_when_no_string_table_of_them_holds_a_do
             .status()
             .unwrap();
         assert!(status.success());
-        assert!(!sims_vm::labels_hold_no_token(&install.root).unwrap());
-        std::fs::remove_file(&fifo).unwrap();
+        let probe = run_fifo_probe(
+            "the_default_labels_hold_no_token_only_when_no_string_table_of_them_holds_a_dollar",
+            "SIMS_FIFO_PROBE_LABELS",
+            &install.root,
+        );
+        let _ = std::fs::remove_file(&fifo);
+        probe.unwrap();
         assert!(sims_vm::labels_hold_no_token(&install.root).unwrap());
     }
     std::fs::create_dir(dir.0.join("GameData/UIFAR")).unwrap();
