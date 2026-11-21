@@ -1184,10 +1184,13 @@ fn an_entrys_string_with_a_token_or_missing_fails_loudly() {
         );
         let interpreter = sims_vm::Interpreter::new(&fx.program, &fx.catalog, fx.stream);
         let fault = interpreter.pie_menu(&mut fx.world, SIM, LAMP).unwrap_err();
+        // The check tree's fault keeps the formatter's trap.
         assert!(
-            matches!(&fault.trap, Trap::Unsupported(m) if m.contains(address)),
+            matches!(&fault.trap, Trap::CheckTree { fault: inner, .. }
+                if matches!(&inner.trap, Trap::Unsupported(m) if m.contains(address))),
             "{index}: {fault}"
         );
+        assert!(fault.trap.unported(), "{index}: {fault}");
     }
 }
 

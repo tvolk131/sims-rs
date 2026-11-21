@@ -60,11 +60,14 @@
 //!   for its first fault ([`crate::Interpreter::deleted`]). Deletions
 //!   made outside a play-mode update are not tracked.
 //! - A frame of the house view that fails is skipped, and noted in
-//!   [`crate::Update::frame_errors`].
+//!   [`crate::Update::frame_errors`] with the tick it was drawn before or
+//!   after.
 //!
 //! Only an object's tick and the frames are caught. A fault anywhere else
 //! in the update (the registry's dialogs and removals, the clock) still
-//! halts the lot, as in strict mode.
+//! halts the lot, as in strict mode. The failure then carries what the
+//! step did before it: the errors caught, a skipped frame before the
+//! first tick, and the sounds ([`crate::boot::StepError::Tick`]).
 
 use crate::fault::Fault;
 use std::collections::BTreeSet;

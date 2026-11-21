@@ -21,10 +21,10 @@ use crate::sound;
 use crate::view::{Move, View};
 use sims_render::{Camera, Canvas, Selected, Walls, open_house};
 use sims_ui::command::{Camera as UiCamera, Command, Speed, Walls as UiWalls};
-use sims_vm::SoundEvent;
 use sims_vm::boot::save::Saved;
 use sims_vm::boot::{Frames, Lot, StepError};
 use sims_vm::play::{Recovery, ScriptError};
+use sims_vm::{SkippedFrame, SoundEvent};
 use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
@@ -407,7 +407,7 @@ impl Game {
                 Ok(update) => {
                     ran += 1;
                     let at = self.lot.ticks();
-                    for line in in_order(at == 1, &update.errors, &update.frame_errors) {
+                    for line in in_order(at, &update.errors, &update.frame_errors) {
                         self.errors.push(at, line);
                     }
                     self.keep_sounds(update.sounds);
@@ -419,14 +419,26 @@ impl Game {
                     break;
                 }
                 Err(error) => {
-                    // A strict step whose frame failed after its tick ran
-                    // still made that tick's sounds.
-                    if let StepError::Frame {
-                        update: Some(update),
-                        ..
-                    } = &error
-                    {
-                        self.keep_sounds(update.sounds.clone());
+                    match &error {
+                        // A strict step whose frame failed after its tick
+                        // ran still made that tick's sounds.
+                        StepError::Frame {
+                            update: Some(update),
+                            ..
+                        } => self.keep_sounds(update.sounds.clone()),
+                        // A play step whose tick failed hands back what
+                        // it caught and made before the failure.
+                        StepError::Tick {
+                            tick,
+                            update: Some(update),
+                            ..
+                        } => {
+                            for line in in_order(*tick, &update.errors, &update.frame_errors) {
+                                self.errors.push(*tick, line);
+                            }
+                            self.keep_sounds(update.sounds.clone());
+                        }
+                        _ => {}
                     }
                     self.stop(&error);
                 }
@@ -928,7 +940,10 @@ impl Game {
             self.note = Some(format!("The dialog has no button {button}."));
             return;
         };
-        if let Err(e) = self.lot.answer(answer) {
+        if let Err(e) = self.lot.answer(sims_vm::Answer {
+            status: answer,
+            bitmap_id: Some(sims_ui::dialog::BUTTON as i16),
+        }) {
             self.note = Some(format!("The answer was not taken: {e}"));
             return;
         }
@@ -1237,20 +1252,27 @@ fn keep(queue: &mut VecDeque<SoundEvent>, sounds: Vec<SoundEvent>, kept: usize) 
     queue.drain(..over);
 }
 
-/// The lines for one update's caught errors, in the order they happened.
-/// An update lists the frame drawn before the lot's first tick (only on
-/// the `first` step) ahead of the one drawn after its tick, and the
-/// objects' errors happen between the two. On the first step a single
-/// skipped frame could be either; it is taken to be the one before the
-/// tick (the update does not say).
-fn in_order(first: bool, errors: &[ScriptError], frames: &[String]) -> Vec<String> {
-    let before = if first { frames.len().min(1) } else { 0 };
-    let frame = |error: &String| format!("a frame was skipped: {error}");
-    frames[..before]
-        .iter()
+/// The lines for the caught errors of the step that runs the lot's tick
+/// `tick` ([`Lot::ticks`]), in the order they happened: the frame drawn
+/// before the lot's first tick, the objects' errors in the tick, then the
+/// frame drawn after it. A frame's line says which of the two it was,
+/// and not the tick: an object's line starts with the clock's tick count,
+/// which is another count, and the error log takes the same failure at
+/// later ticks for a repeat ([`Errors::push`]).
+fn in_order(tick: u32, errors: &[ScriptError], frames: &[SkippedFrame]) -> Vec<String> {
+    let frame = |frame: &SkippedFrame| match frame.after {
+        0 => format!(
+            "the frame before the first tick was skipped: {}",
+            frame.error
+        ),
+        _ => format!("the frame after the tick was skipped: {}", frame.error),
+    };
+    let before = frames.iter().filter(|frame| frame.after < tick);
+    let after = frames.iter().filter(|frame| frame.after >= tick);
+    before
         .map(frame)
         .chain(errors.iter().map(describe))
-        .chain(frames[before..].iter().map(frame))
+        .chain(after.map(frame))
         .collect()
 }
 
@@ -1382,29 +1404,48 @@ mod tests {
             then: None,
             recovery: Recovery::Reset,
         };
-        let frames =
-            |names: &[&str]| -> Vec<String> { names.iter().map(|n| (*n).to_string()).collect() };
+        let frames = |skipped: &[(u32, &str)]| -> Vec<SkippedFrame> {
+            skipped
+                .iter()
+                .map(|&(after, error)| SkippedFrame {
+                    after,
+                    error: error.to_string(),
+                })
+                .collect()
+        };
         let starts = |lines: Vec<String>| -> Vec<String> {
-            lines.into_iter().map(|l| l[..9].to_string()).collect()
+            lines.into_iter().map(|l| l[..13].to_string()).collect()
         };
         let errors = std::slice::from_ref(&error);
         // The first step: the frame before the tick, the tick, the frame
         // after it.
+        let first = in_order(1, errors, &frames(&[(1, "a"), (0, "b")]));
         assert_eq!(
-            starts(in_order(true, errors, &frames(&["b", "a"]))),
-            ["a frame w", "tick 1, o", "a frame w"]
+            starts(first.clone()),
+            ["the frame bef", "tick 1, objec", "the frame aft"]
         );
-        assert!(in_order(true, errors, &frames(&["b", "a"]))[2].ends_with(": a"));
+        assert_eq!(first[0], "the frame before the first tick was skipped: b");
+        assert_eq!(first[2], "the frame after the tick was skipped: a");
+        // A single frame on the first step says which one it was.
         assert_eq!(
-            starts(in_order(true, errors, &frames(&["b"]))),
-            ["a frame w", "tick 1, o"]
+            starts(in_order(1, errors, &frames(&[(1, "a")]))),
+            ["tick 1, objec", "the frame aft"]
+        );
+        assert_eq!(
+            starts(in_order(1, errors, &frames(&[(0, "b")]))),
+            ["the frame bef", "tick 1, objec"]
+        );
+        // A step that failed hands back the frame before its tick only.
+        assert_eq!(
+            in_order(1, &[], &frames(&[(0, "b")])),
+            ["the frame before the first tick was skipped: b"]
         );
         // Later steps draw only after the tick.
         assert_eq!(
-            starts(in_order(false, errors, &frames(&["a"]))),
-            ["tick 1, o", "a frame w"]
+            in_order(34, &[], &frames(&[(34, "a")])),
+            ["the frame after the tick was skipped: a"]
         );
-        assert!(in_order(false, &[], &[]).is_empty());
+        assert!(in_order(2, &[], &[]).is_empty());
     }
 
     #[test]

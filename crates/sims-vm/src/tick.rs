@@ -71,7 +71,7 @@ use crate::interpreter::{Interpreter, Status, Stream};
 use crate::placement::Refreshing;
 use crate::play::{Play, Recovery, ScriptError};
 use crate::primitives::dialog::{self, DONE, NEW, SHOWN};
-use crate::selection::selected;
+use crate::selection::{publish_waited_for, selected};
 use crate::sounds::SoundEvent;
 use crate::visits::function;
 use sims_sim::motives::{self, Tuning};
@@ -155,9 +155,33 @@ const ALERTNESS: usize = 11;
 /// (a modal one) is shown during the registry's pass, and the game waits
 /// there for the answer (0x436da0).
 pub trait Player {
-    /// The answer to a dialog, as the status its button gives (2 for the
-    /// first button, 3 the second, 4 the third), or None to give none.
-    fn answer(&mut self, shown: &Shown) -> Option<u8>;
+    /// The answer to a dialog, or None to give none.
+    fn answer(&mut self, shown: &Shown) -> Option<Answer>;
+}
+
+/// The result of a modal dialog and the UI sample taken while it was open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Answer {
+    /// The status the button gives (0x4370be): 2 for the first button,
+    /// 3 for the second, 4 for the third.
+    pub status: u8,
+    /// What the wait check (0x476548) last published to global 12 while
+    /// the dialog was open: the activated button's bitmap resource ID, or
+    /// 0 from an idle poll (0x5dac77, 0x47653d) after an earlier button
+    /// was destroyed (0x5e39cf). None means no poll changed it, so global
+    /// 12 is left alone; it does not mean the dialog closed itself. The
+    /// window supplies the ID and a headless replay records what was
+    /// observed.
+    pub bitmap_id: Option<i16>,
+}
+
+impl From<u8> for Answer {
+    fn from(status: u8) -> Self {
+        Self {
+            status,
+            bitmap_id: None,
+        }
+    }
 }
 
 /// A dialog the registry shows.
@@ -171,17 +195,36 @@ pub struct Shown {
     pub answers: &'static [u8],
 }
 
-/// A player who answers from a list, in order. A dialog with one button
-/// can only be answered with it, so it takes nothing from the list.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// A player who answers from a list, in order.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Answers {
-    pub queue: VecDeque<u8>,
+    pub(crate) queue: VecDeque<Answer>,
+    include_single_button: bool,
+}
+
+impl Answers {
+    /// A list of statuses for dialogs that offer a choice. A one-button
+    /// dialog gives its only answer without consuming a list entry.
+    pub fn choices(list: &[u8]) -> Self {
+        Self {
+            queue: list.iter().copied().map(Answer::from).collect(),
+            include_single_button: false,
+        }
+    }
+
+    /// One answer for each dialog shown, including one-button notices.
+    pub fn replay(list: &[Answer]) -> Self {
+        Self {
+            queue: list.iter().copied().collect(),
+            include_single_button: true,
+        }
+    }
 }
 
 impl Player for Answers {
-    fn answer(&mut self, shown: &Shown) -> Option<u8> {
+    fn answer(&mut self, shown: &Shown) -> Option<Answer> {
         match shown.answers {
-            [only] => Some(*only),
+            [only] if !self.include_single_button => Some((*only).into()),
             _ => self.queue.pop_front(),
         }
     }
@@ -254,11 +297,32 @@ pub struct Update {
     /// In play mode, the frames of the house view drawn with this step
     /// that failed, and were skipped ([`crate::boot::Lot::step_play`]), in
     /// the order they were drawn. Always empty in strict mode.
-    pub frame_errors: Vec<String>,
+    pub frame_errors: Vec<SkippedFrame>,
     /// The requests to the sound system made during the update, in order
     /// ([`crate::sounds`]). Empty when the interpreter carries its own
     /// sink ([`Interpreter::sounds`]), which then has them.
     pub sounds: Vec<SoundEvent>,
+}
+
+/// A frame of the house view that failed in play mode and was skipped
+/// ([`Update::frame_errors`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedFrame {
+    /// The tick the frame was drawn after, counted as
+    /// [`crate::boot::Lot::ticks`] counts them, from the load; 0 for the
+    /// frame drawn before the first tick.
+    pub after: u32,
+    /// Why it failed.
+    pub error: String,
+}
+
+impl std::fmt::Display for SkippedFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.after {
+            0 => write!(f, "the frame before tick 1: {}", self.error),
+            tick => write!(f, "the frame after tick {tick}: {}", self.error),
+        }
+    }
 }
 
 impl Interpreter<'_> {
@@ -284,6 +348,21 @@ impl Interpreter<'_> {
         player: &mut dyn Player,
         play: Option<&mut Play>,
     ) -> Result<Update, TickError> {
+        let (update, result) = self.lot_update_kept(world, tuning, player, play);
+        result.map(|()| update)
+    }
+
+    /// One lot update as [`Interpreter::lot_update_with`] runs it, with
+    /// what it did whether or not it failed: on an error the update holds
+    /// what came before it, such as, in play mode, the errors caught in
+    /// the objects' ticks, and the sounds.
+    pub fn lot_update_kept(
+        &self,
+        world: &mut World,
+        tuning: &Tuning,
+        player: &mut dyn Player,
+        play: Option<&mut Play>,
+    ) -> (Update, Result<(), TickError>) {
         let mut update = Update::default();
         // In play mode the deletions are noted, so that an object reset
         // and a later one given its ID are told apart (Interpreter::recover).
@@ -297,15 +376,30 @@ impl Interpreter<'_> {
             },
             ..*self
         };
+        let result = this.run_update(world, tuning, player, play, &deleted, &mut update);
+        update.sounds = sink.into_inner();
+        (update, result)
+    }
+
+    /// The lot update's work, for [`Interpreter::lot_update_kept`].
+    fn run_update(
+        &self,
+        world: &mut World,
+        tuning: &Tuning,
+        player: &mut dyn Player,
+        play: Option<&mut Play>,
+        deleted: &RefCell<Vec<u16>>,
+        update: &mut Update,
+    ) -> Result<(), TickError> {
         let mut play = play;
         let lot = Interpreter {
             stream: Stream::Lot,
-            ..this
+            ..*self
         };
-        update.full = lot.pass(world, tuning, &mut update, play.as_deref_mut())?;
+        update.full = lot.pass(world, tuning, update, play.as_deref_mut())?;
         let game = Interpreter {
             stream: Stream::Global,
-            ..this
+            ..*self
         };
         let mut signal = None;
         let mut hour_turned = false;
@@ -331,7 +425,7 @@ impl Interpreter<'_> {
                 }
             }
         }
-        game.end_of_update(world, !update.full, player, &mut update)?;
+        game.end_of_update(world, !update.full, player, update)?;
         if let Some(play) = play {
             for gone in deleted.take() {
                 play.fresh.remove(&gone);
@@ -363,8 +457,7 @@ impl Interpreter<'_> {
                 world.mark_all_rooms();
             }
         }
-        update.sounds = sink.into_inner();
-        Ok(update)
+        Ok(())
     }
 
     /// The scheduler's pass over the objects (0x46d553). Returns whether
@@ -877,8 +970,9 @@ impl Interpreter<'_> {
     ///    one it acts on: a new record is shown (0x436da0: status 1) and,
     ///    if it stops the game, answered by the player then and there; a
     ///    finished one (status 5) is destroyed (0x448663). While a dialog
-    ///    waits, the family panel is redrawn
-    ///    ([`Interpreter::refresh_family_panel`]).
+    ///    waits, the family panel is redrawn and the modal message loop
+    ///    (0x5dab4b) lets the application poll the wait check (0x4d1a8b).
+    ///    The answer can carry the bitmap ID that poll writes to global 12.
     /// 2. After a full pass, the queued removals, oldest first: each ID is
     ///    taken off the queue and, if it still names an object, the
     ///    object is removed at once ([`Interpreter::remove_now`],
@@ -919,14 +1013,14 @@ impl Interpreter<'_> {
             record.status = SHOWN;
             let answers = dialog::answers(record.operands[5]).ok_or_else(|| {
                 TickError::Unsupported(format!(
-                    "object {}'s dialog is of a kind that is not ported",
+                    "object {}'s dialog is of a kind that is not ported (0x436da0)",
                     record.caller
                 ))
             })?;
             if !dialog::modal(&record.operands) {
                 return Err(TickError::Unsupported(format!(
                     "object {} shows a dialog that does not stop the game; answering one \
-                     while the game runs is not ported",
+                     while the game runs is not ported (0x436da0)",
                     record.caller
                 )));
             }
@@ -939,18 +1033,24 @@ impl Interpreter<'_> {
             // redraws the family panel.
             self.refresh_family_panel(world);
             let given = player.answer(&shown);
-            let Some(answer) = given.filter(|answer| answers.contains(answer)) else {
-                return Err(TickError::Unanswered { shown, given });
+            let Some(answer) = given.filter(|answer| answers.contains(&answer.status)) else {
+                return Err(TickError::Unanswered {
+                    shown,
+                    given: given.map(|answer| answer.status),
+                });
             };
+            if let Some(bitmap_id) = answer.bitmap_id {
+                publish_waited_for(world, bitmap_id)?;
+            }
             let record = &mut world.dialogs.records[index];
             // 0x4370be: the button's result, or done at once for a dialog
             // that only informs.
             record.status = if dialog::informs(&record.operands) {
                 DONE
             } else {
-                answer
+                answer.status
             };
-            update.answered.push((record.caller, answer));
+            update.answered.push((record.caller, answer.status));
         }
         if partial
             && let Some(&id) = world.removals.iter().find(|id| {

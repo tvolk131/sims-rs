@@ -911,11 +911,11 @@ impl Machine<'_, '_> {
                     TURN_BUDGET,
                     true,
                 )
-                .map_err(|fault| {
-                    Trap::Unsupported(format!(
-                        "check tree {tree:#06x} of object {}: {fault}",
-                        entry.target
-                    ))
+                .map_err(|fault| Trap::CheckTree {
+                    routine: None,
+                    tree,
+                    object: entry.target,
+                    fault: Box::new(fault),
                 })?
         } else {
             true
@@ -1288,10 +1288,11 @@ impl Machine<'_, '_> {
                             TURN_BUDGET,
                             true,
                         )
-                        .map_err(|fault| {
-                            Trap::Unsupported(format!(
-                                "check tree {tree:#06x} of object {target}: {fault}"
-                            ))
+                        .map_err(|fault| Trap::CheckTree {
+                            routine: None,
+                            tree,
+                            object: target,
+                            fault: Box::new(fault),
                         })?;
                     if let (Some(menu), Some(checking)) = (menu, checking) {
                         menu.extend(checking.into_inner().added);
