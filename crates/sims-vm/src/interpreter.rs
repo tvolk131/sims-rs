@@ -140,18 +140,16 @@ pub struct Interpreter<'a> {
     /// gives 0, and a booted lot passes its own
     /// ([`crate::boot::Lot::set_view_rotation`]).
     pub view_rotation: u8,
-    /// The tile at the centre of the house view, which a dialog's portrait
-    /// searches from for a tile to put a person on (0x4e96dd, 0x4347f0:
-    /// the view's pick at the centre of its rectangle, 0x4a677c,
-    /// 0x4a7b58). It is where the player's camera is, not the lot's, so it
-    /// is an input like [`Interpreter::view_rotation`]: None (not known)
-    /// from [`Interpreter::new`], and a booted lot passes its own
-    /// ([`crate::boot::Lot::set_view_centre`]). The interface's work on
-    /// the pick is not ported (by a reading of the disassembly,
-    /// **unverified**: a bounds check with a fallback, 0x434891, the
-    /// view's rotation undone, 0x43491c, and a clamp), so the input is the
-    /// tile the search starts from, after all of it: not the pick, and
-    /// not turned by [`Interpreter::view_rotation`].
+    /// The view-rotated tile at the centre of the house view (`0x4a7b58`
+    /// cut to a tile by `0x433067`), which a dialog's portrait searches from
+    /// for a tile to put a person on (`0x4e96dd`, `0x4347f0`). It is where
+    /// the player's camera is, not the lot's, so it is an input like
+    /// [`Interpreter::view_rotation`]: None (not known) from
+    /// [`Interpreter::new`], and a booted lot passes its own
+    /// ([`crate::boot::Lot::set_view_centre`]). The search checks the pick
+    /// against the rotated lot's interior bounds with the midpoint fallback
+    /// (`0x434891` to `0x4348fa`), undoes [`Interpreter::view_rotation`]
+    /// (`0x43491c`), and clamps it (`0x4349e5`).
     pub view_centre: Option<[i8; 2]>,
     /// While a person's own tick runs its thread, the person and the
     /// animator refresh pending from its taking itself off the lot
