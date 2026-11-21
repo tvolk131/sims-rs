@@ -508,6 +508,10 @@ fn a_room_update_notes_the_levels_whose_masks_it_built() {
     world.mark_all_rooms();
     let _ = interpreter.draw_frame(world, 1);
     assert_eq!(rebuilt.take(), 3);
+    // Updates of each level in one step add up.
+    interpreter.update_rooms(world, 1).unwrap();
+    interpreter.update_rooms(world, 2).unwrap();
+    assert_eq!(rebuilt.take(), 3);
 }
 
 #[test]

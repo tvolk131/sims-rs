@@ -782,6 +782,75 @@ mod tests {
         }
     }
 
+    /// The selected Sim's room is a room's part like the looked-at ones:
+    /// kept from the zoom it was built at.
+    #[test]
+    fn a_change_of_zoom_keeps_the_selected_sims_room_as_built() {
+        let lot = house();
+        for rotation in 0..4 {
+            let mut far = camera(rotation);
+            far.focus.selected = Some(Selected {
+                tile: [9, 9],
+                level: 1,
+                room: ROOM,
+            });
+            let built_far = Mask::new(&lot, &far).rows;
+            for zoom in [Zoom::Medium, Zoom::Near] {
+                let shown = Camera { zoom, ..far };
+                let kept = Camera {
+                    focus: Focus {
+                        masks_built_at: Some(Zoom::Far),
+                        ..far.focus
+                    },
+                    ..shown
+                };
+                assert_eq!(
+                    Mask::new(&lot, &kept).rows,
+                    built_far,
+                    "{rotation} {zoom:?}"
+                );
+                assert_ne!(
+                    Mask::new(&lot, &shown).rows,
+                    built_far,
+                    "{rotation} {zoom:?}"
+                );
+            }
+        }
+    }
+
+    /// The pointer's square is worked out at the zoom shown, whatever zoom
+    /// the rooms' parts were built at.
+    #[test]
+    fn the_pointers_square_is_at_the_zoom_shown_with_the_parts_kept() {
+        let lot = house();
+        for zoom in [Zoom::Medium, Zoom::Near] {
+            let mut far = camera(0);
+            far.focus.visit(OUTSIDE);
+            let shown = Camera {
+                zoom,
+                focus: Focus {
+                    masks_built_at: Some(Zoom::Far),
+                    ..far.focus
+                },
+                ..far
+            };
+            // Without the pointer, the outdoor room's part is as built.
+            assert_eq!(Mask::new(&lot, &shown), Mask::new(&lot, &far), "{zoom:?}");
+            let [x, y] = middle(&shown, [15, 15], 0);
+            let mut c = shown;
+            c.focus.pointer = Some([x, y - 4 * zoom.tile_height()]);
+            let mask = Mask::new(&lot, &c);
+            assert!(
+                mask.contains([11, 11]) && mask.contains([14, 14]),
+                "{zoom:?}"
+            );
+            assert!(
+                !mask.contains([15, 15]) && !mask.contains([10, 10]),
+                "{zoom:?}"
+            );
+        }
+    }
+
     /// The screen point at the middle of a tile raised `height` steps.
     fn middle(c: &Camera, tile: [i32; 2], height: i32) -> [i32; 2] {
         let [x, y] = c.project(tile, 1, height);
