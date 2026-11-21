@@ -301,13 +301,16 @@ impl Lot {
     }
 
     /// The terrain altitude at unrotated fine position `fine` (sixteenths of
-    /// a tile), in terrain steps (`0x478dfe`, off-lot returns `0.0` as
-    /// `0x45ee1d`). The tile is divided along its diagonal into two flat
-    /// triangles (`sims_sim::head::altitude_at`), with the second coordinate
-    /// (`y & 15`) passed first as `0x478dfe` reads `{ y, x }`.
+    /// a tile), in terrain steps (`0x478dfe`). `0x478e2a`–`0x478e4e` indexes
+    /// the raw 64×64 altitude array directly without checking the active lot
+    /// size (`0x45ee1d` is not called on the object-draw path); coordinates
+    /// outside `0..FULL` return `0.0`. The tile is divided along its diagonal
+    /// into two flat triangles (`sims_sim::head::altitude_at`), with the
+    /// second coordinate (`y & 15`) passed first as `0x478dfe` reads `{ y, x }`.
     pub fn altitude_at(&self, fine: [i32; 2]) -> f32 {
         let [tx, ty] = [fine[0] >> 4, fine[1] >> 4];
-        if !self.contains(tx, ty) {
+        let bounds = 0..FULL as i32;
+        if !bounds.contains(&tx) || !bounds.contains(&ty) {
             return 0.0;
         }
         let corners = self.heights[Self::cell(tx as usize, ty as usize)];
