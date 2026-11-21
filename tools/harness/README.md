@@ -166,11 +166,15 @@ Things to know:
   ended. They are kept in `resume-torn.json` with a `mark` until then, so a
   takeover killed first hands them on. Each cut row is kept with where it
   starts and whether it has been taken off: a takeover killed before it
-  cut the row finds it where it was and notes it once, and a row cut short
-  at the same place after the cut is another and noted too. One killed
-  after logging them finds the event's `mark` and does not log them again.
-  The check for a baseline reads rows as the takeover does (split at
-  newlines only; a cut row is not one). A row of `events.jsonl` or
+  cut the row finds it where it was and notes it once; one killed after
+  the cut and before noting it has the cut noted by the next; and a row
+  cut short at the same place after the cut is another and noted too. One
+  killed after logging them finds the event's `mark` and does not log them
+  again. A `resume-torn.json` of another form (left by an earlier revision
+  of the script) refuses the takeover: read it, note its rows by hand, and
+  remove it. Every check reads rows as the takeover does: split at
+  newlines only, strict UTF-8, a JSON object (a cut row is not one, and a
+  last row that is not one is cut, not ended). A row of `events.jsonl` or
   `updates.jsonl` anywhere else that is not a JSON object (a blank one, or
   two objects split by a line break other than a newline, included)
   refuses the takeover before it attaches. Rows are split at newlines

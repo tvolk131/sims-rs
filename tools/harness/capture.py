@@ -572,15 +572,26 @@ def jsonl_rows(path):
     return rows
 
 
+def json_object(row):
+    """A row (bytes or text) read as the resume reads it: strict UTF-8, then JSON. The object, or None
+    when it is not one (json.loads alone would also take bytes in UTF-16 or UTF-32, and surrogates)."""
+    try:
+        r = json.loads(row.decode('utf-8') if isinstance(row, bytes) else row)
+    except ValueError:
+        return None
+    return r if isinstance(r, dict) else None
+
+
 def bad_row(rows):
     """The number (from 1) of the first row that is not a JSON object (a blank one included), or None."""
     for n, line in enumerate(rows, 1):
-        try:
-            if not isinstance(json.loads(line), dict):
-                return n
-        except ValueError:
+        if json_object(line) is None:
             return n
     return None
+
+
+class TornSidecarError(Exception):
+    """resume-torn.json is not one this revision wrote."""
 
 
 def torn_logged(path, mark):
@@ -588,11 +599,8 @@ def torn_logged(path, mark):
     try:
         with open(path, 'rb') as f:
             for line in f:
-                try:
-                    r = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(r, dict) and r.get('kind') == 'resume_torn' and r.get('mark') == mark:
+                r = json_object(line)
+                if r is not None and r.get('kind') == 'resume_torn' and r.get('mark') == mark:
                     return True
     except OSError:
         pass
@@ -601,52 +609,58 @@ def torn_logged(path, mark):
 
 def repair_tails(out, names):
     """Before a resume: a row cut short at the end of each log is taken off, or ended with a newline if
-    it is whole JSON. What is done is kept in resume-torn.json first, with a mark (each cut row with where
-    it starts and whether it is taken off yet, and the logs ended), so a takeover killed before it logs it
-    (resume_torn, with the mark) hands it on. One killed before the cut finds the same row where it was
-    and notes it once; a row cut short at the same place after the cut was made is another, and noted
-    too. One killed after logging it and before taking off resume-torn.json has its mark in the events,
-    and the file is not used again. The file an earlier revision wrote (the cut rows by log, already
-    taken off) is taken up. Returns dict(mark, rows, ended), rows the cut rows' text by log."""
+    it is a whole JSON object (read as the resume reads it, json_object). What is done is kept in
+    resume-torn.json first, with a mark (each cut row with where it starts and whether it is taken off
+    yet, and the logs ended), so a takeover killed before it logs it (resume_torn, with the mark) hands it
+    on. A cut not yet taken off whose row is no longer at the end of its log was taken off by a takeover
+    killed before it noted so, and is noted now. One killed before the cut finds the same row where it
+    was and notes it once; a row cut short at the same place after the cut was made is another, and
+    noted too. One killed after logging it and before taking off resume-torn.json has its mark in the
+    events, and the file is not used again. A resume-torn.json of another form (an earlier revision's)
+    raises TornSidecarError before anything is changed. Returns dict(mark, rows, ended), rows the cut
+    rows' text by log."""
     sidecar = out / 'resume-torn.json'
-    fresh = lambda: dict(mark=f'{time.time_ns():x}', cuts={}, ended=[])
+    fresh = dict(mark=f'{time.time_ns():x}', cuts={}, ended=[])
     try:
-        saved = json.loads(sidecar.read_text())
-    except (OSError, ValueError):
-        saved = None
-    if isinstance(saved, dict) and {'mark', 'cuts', 'ended'} <= saved.keys():
-        pass
-    elif isinstance(saved, dict) and all(isinstance(v, list) and all(isinstance(t, str) for t in v)
-                                         for v in saved.values()):
-        saved = dict(fresh(), cuts={name: [[None, text, True] for text in texts] for name, texts in saved.items()})
+        text = sidecar.read_bytes()
+    except FileNotFoundError:
+        saved = fresh
     else:
-        saved = fresh()
-    if torn_logged(out / 'events.jsonl', saved['mark']):
-        saved = fresh()
+        saved = json_object(text)
+        if not (saved is not None and saved.keys() == {'mark', 'cuts', 'ended'}
+                and isinstance(saved['cuts'], dict) and isinstance(saved['ended'], list)):
+            raise TornSidecarError(sidecar)
+        if torn_logged(out / 'events.jsonl', saved['mark']):
+            saved = fresh
 
     def keep():
         tmp = out / 'resume-torn.json.tmp'
         tmp.write_text(json.dumps(saved))
         tmp.rename(sidecar)
 
+    found = {name: torn_tail(out / name) for name in names}
+    changed = False
+    for name, cuts in saved['cuts'].items():
+        if cuts and not cuts[-1][2]:
+            now = found.get(name)
+            if now is None or now[0] != cuts[-1][0] or now[1].decode(errors='replace') != cuts[-1][1]:
+                cuts[-1][2] = changed = True
     fixes = []
     for name in names:
-        found = torn_tail(out / name)
-        if found is None:
+        if found[name] is None:
             continue
-        start, tail = found
-        try:
-            json.loads(tail)
+        start, tail = found[name]
+        if json_object(tail) is not None:
             fixes.append((name, None))
             if name not in saved['ended']:
                 saved['ended'].append(name)
-        except ValueError:
+        else:
             text = tail.decode(errors='replace')
             cuts = saved['cuts'].setdefault(name, [])
             if not (cuts and cuts[-1] == [start, text, False]):
                 cuts.append([start, text, False])
             fixes.append((name, start))
-    if fixes:
+    if fixes or changed:
         keep()
     for name, start in fixes:
         if start is None:
@@ -663,17 +677,14 @@ def repair_tails(out, names):
 
 
 def has_baseline(path):
-    """Whether these events have a baseline row, read up to the first one. Rows are split at newlines only,
-    as the resume reads them; a row that is not a JSON object (one cut short by a kill, which the tail
-    repair takes off, or one not UTF-8) is not one."""
+    """Whether these events have a baseline row, read up to the first one. Rows are split at newlines only
+    and read as the resume reads them (json_object); one that is not an object (one cut short by a kill,
+    which the tail repair takes off) is not one."""
     try:
         with open(path, 'rb') as f:
             for line in f:
-                try:
-                    r = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(r, dict) and r.get('kind') == 'baseline':
+                r = json_object(line)
+                if r is not None and r.get('kind') == 'baseline':
                     return True
     except OSError:
         pass
@@ -829,7 +840,11 @@ def main():
     out.mkdir(parents=True, exist_ok=args.resume)
     prior_status, dropped, torn = {}, [], dict(rows={}, ended=[])
     if args.resume:
-        torn = repair_tails(out, ('events.jsonl', 'updates.jsonl', 'watch.jsonl'))
+        try:
+            torn = repair_tails(out, ('events.jsonl', 'updates.jsonl', 'watch.jsonl'))
+        except TornSidecarError:
+            ap.error(f'{out / "resume-torn.json"} is not of the form this revision writes (an earlier '
+                     'revision left it): read it, note its cut rows by hand, remove it, and resume again')
         try:
             prior_status = json.loads((out / 'status.json').read_text())
         except (OSError, ValueError):

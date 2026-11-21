@@ -1480,13 +1480,34 @@ class SparseTest(CaptureTest):
         _, output, _ = self.run_capture([dict(pc=capture.RETURN)], ['--updates', '2', '--resume'], prepare=logged_already)
         self.assertEqual([r['mark'] for r in self.events(output, 'resume_torn')], ['m1'])
         self.assertFalse((output / 'resume-torn.json').exists())
-        # The file an earlier revision left (the cut rows by log, already taken off) is taken up.
-        def earlier(output):
-            self.resumed_after({})(output)
-            (output / 'resume-torn.json').write_text(json.dumps({'events.jsonl': [cut]}))
-        _, output, _ = self.run_capture([dict(pc=capture.RETURN)], ['--updates', '2', '--resume'], prepare=earlier)
-        [logged] = self.events(output, 'resume_torn')
-        self.assertEqual(logged['rows'], {'events.jsonl': [cut]})
+        # A file of another form (an earlier revision's) refuses the takeover before anything is changed.
+        for other in ({'events.jsonl': [cut]}, dict(mark='m0', rows={'events.jsonl': [cut]}, ended=[]), [1]):
+            def earlier(output, other=other):
+                torn(output)
+                (output / 'resume-torn.json').write_text(json.dumps(other))
+            with self.assertRaises(SystemExit), patch.object(sys, 'stderr', io.StringIO()) as stderr:
+                self.run_capture([dict(pc=capture.RETURN)], ['--updates', '2', '--resume'], prepare=earlier)
+            self.assertIn('earlier revision', stderr.getvalue())
+            self.last_remote_class.assert_not_called()
+            self.assertTrue((self.last_output / 'events.jsonl').read_text().endswith(cut))
+            self.assertEqual(json.loads((self.last_output / 'resume-torn.json').read_text()), other)
+
+    def test_a_cut_taken_off_by_a_killed_takeover_is_noted_as_taken_off(self):
+        # Killed after the truncate and before noting it: the next takeover finds the row gone and notes it
+        # taken off, so a row cut short later at the same place is another.
+        cut = '{"kind": "'
+        with tempfile.TemporaryDirectory(prefix='sims-torn-test-') as d:
+            out = Path(d)
+            (out / 'events.jsonl').write_text('{"kind": "baseline"}\n')
+            start = (out / 'events.jsonl').stat().st_size
+            (out / 'resume-torn.json').write_text(json.dumps(dict(mark='m1', cuts={'events.jsonl': [[start, cut, False]]}, ended=[])))
+            self.assertEqual(capture.repair_tails(out, ['events.jsonl'])['rows'], {'events.jsonl': [cut]})
+            self.assertEqual(json.loads((out / 'resume-torn.json').read_text())['cuts'],
+                             {'events.jsonl': [[start, cut, True]]})
+            with open(out / 'events.jsonl', 'a') as f:
+                f.write(cut)
+            self.assertEqual(capture.repair_tails(out, ['events.jsonl'])['rows'], {'events.jsonl': [cut, cut]})
+            self.assertEqual((out / 'events.jsonl').stat().st_size, start)
 
     def test_the_baseline_check_reads_rows_as_the_resume_does(self):
         # Two objects split by a bare CR in a row the kill cut short: the tail repair takes both off, so
@@ -1507,6 +1528,22 @@ class SparseTest(CaptureTest):
                 f.write(b'{"kind": "\xff')
         _, output, _ = self.run_capture([dict(pc=capture.RETURN)], ['--updates', '2', '--resume'], prepare=binary)
         self.assertEqual(self.events(output, 'resume_torn')[0]['rows'], {'events.jsonl': ['{"kind": "\ufffd']})
+        # A baseline in UTF-16 is not one: the resume reads strict UTF-8.
+        def utf16(output):
+            self.resumed_after({})(output)
+            (output / 'events.jsonl').write_bytes(json.dumps(dict(kind='baseline', cr3=GAME_CR3)).encode('utf-16-le'))
+        with self.assertRaises(SystemExit), patch.object(sys, 'stderr', io.StringIO()) as stderr:
+            self.run_capture([dict(pc=capture.RETURN)], ['--updates', '2', '--resume'], prepare=utf16)
+        self.assertIn('has no baseline event', stderr.getvalue())
+        # A whole row at the end with a surrogate in its bytes is not whole to the resume: it is cut, not ended.
+        surrogate = b'{"kind": "note", "text": "\xed\xa0\x80"}'
+        def surrogates(output):
+            self.resumed_after({})(output)
+            with open(output / 'events.jsonl', 'ab') as f:
+                f.write(surrogate)
+        _, output, _ = self.run_capture([dict(pc=capture.RETURN)], ['--updates', '2', '--resume'], prepare=surrogates)
+        [logged] = self.events(output, 'resume_torn')
+        self.assertEqual((list(logged['rows']), logged['ended']), (['events.jsonl'], []))
 
     def test_the_cut_row_is_found_from_the_end(self):
         with tempfile.TemporaryDirectory(prefix='sims-torn-test-') as d:
