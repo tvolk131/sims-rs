@@ -978,6 +978,7 @@ impl<S: Samples> Player<S> {
                 self.with_score(mode, |score, host| score.set_volume(volume, host));
             }
         }
+        self.apply_levels();
     }
 
     /// Sets the master volume, 0 to 1024.
@@ -986,6 +987,7 @@ impl<S: Samples> Player<S> {
         for voice in &mut self.voices {
             voice.note.gains = ambient_gains(voice.volume, voice.pan, self.master);
         }
+        self.apply_levels();
     }
 
     /// Adds an ambience score for a mode (see [`ambience::SCORES`]), its
@@ -1211,7 +1213,20 @@ impl<S: Samples> Player<S> {
                 note.step = step(levels.rate);
             }
         }
-        for id in ended {
+        self.place_ended_and_idle(track, &ended, last, vol, pan);
+    }
+
+    /// Places a track's ended threads (`self.ended`) and idle kind-53
+    /// thread (`self.idle`), updating their playing notes immediately.
+    fn place_ended_and_idle(
+        &mut self,
+        track: u32,
+        ended: &[u32],
+        last: Option<u32>,
+        vol: i32,
+        pan: i32,
+    ) {
+        for &id in ended {
             // The last start's thread writes through its `target`; only
             // the thread written takes new levels.
             if last == Some(id) {
@@ -1659,7 +1674,7 @@ impl<S: Samples> Player<S> {
         // the object looked up, 0x573748 to 0x573756).
         if self.track_args(track) != Some(ARGS_ID_VOL_PAN) {
             let started = self.start(args, track);
-            self.let_go(&started.threads);
+            self.let_go_track(track, &started.threads);
             return;
         }
         if args[0] == 0 {
@@ -1668,8 +1683,8 @@ impl<S: Samples> Player<S> {
         self.record(track, args[0]);
         let placed = self.placed(track, sources);
         let started = self.start(args, track);
-        self.place(&started.threads, placed);
-        self.let_go(&started.threads);
+        self.place(track, &started.threads, placed);
+        self.let_go_track(track, &started.threads);
     }
 
     /// A track's volume and pan from where its objects are, as the sum
@@ -1715,17 +1730,33 @@ impl<S: Samples> Player<S> {
     /// (0x57d5a0) to the threads a start started, refreshed or left
     /// running (when a muted group returned early at `0x57d9a5`, `target`
     /// was not reset, so the write still follows `target` as `0x57de57`
-    /// does; otherwise the start pointed `target` back at itself). Also
-    /// updates any playing notes of the written thread at once, matching
-    /// the original's immediate voice update (0x57df13 → 0x57f759). With
-    /// no placement both stay as they were.
-    fn place(&mut self, threads: &[u32], placed: Option<(i32, i32)>) {
+    /// does; otherwise the start pointed `target` back at itself). When
+    /// no script thread is running (for instance, a muted start on a
+    /// track whose note outlived its script in `self.ended` or `self.idle`),
+    /// places those ended and idle threads too, matching the original's
+    /// persistent track object. Also updates any playing notes of the
+    /// written thread at once, matching the original's immediate voice
+    /// update (0x57df13 → 0x57f759). With no placement both stay as they
+    /// were.
+    fn place(&mut self, track: u32, threads: &[u32], placed: Option<(i32, i32)>) {
         let Some((vol, pan)) = placed else {
             return;
         };
-        for &id in threads {
-            self.place_through(id, vol, pan);
+        if !threads.is_empty() {
+            for &id in threads {
+                self.place_through(id, vol, pan);
+            }
+            return;
         }
+        self.forget_silent();
+        let ended: Vec<u32> = self
+            .ended
+            .values()
+            .filter(|t| t.track == track)
+            .map(|t| t.id)
+            .collect();
+        let last = self.last_start.get(&track).copied();
+        self.place_ended_and_idle(track, &ended, last, vol, pan);
     }
 
     /// Records an object instance, unless it is already (0x57442d) or
@@ -2161,7 +2192,7 @@ impl<S: Samples> Player<S> {
             self.write_at(at, FADE_SPEED, DAY_NIGHT_FADE_SPEED);
             self.write_at(at, FADE_ON, 1);
         }
-        self.let_go(&started.threads);
+        self.let_go_track(track, &started.threads);
     }
 
     /// Whether a day and night loop track is still active: a running
@@ -2319,9 +2350,9 @@ impl<S: Samples> Player<S> {
         if started.fresh && (self.paused || !self.active) {
             self.held.insert(track);
         }
-        self.place(&started.threads, placed);
+        self.place(track, &started.threads, placed);
         if !self.paused && self.active {
-            self.let_go(&started.threads);
+            self.let_go_track(track, &started.threads);
         }
     }
 
@@ -2356,7 +2387,7 @@ impl<S: Samples> Player<S> {
             Err(fault) => self.report(fault),
         }
         let started = self.start(args, PIANO);
-        self.let_go(&started.threads);
+        self.let_go_track(PIANO, &started.threads);
         let object = match self.owner(PIANO) {
             Some(_) => self.track_objects.get(&PIANO).copied().unwrap_or(0),
             None => 0x8000_0000,
@@ -2367,7 +2398,7 @@ impl<S: Samples> Player<S> {
         let skill = sources.field(args[0] as i32, 5).unwrap_or(0);
         if self.owner(PIANO_SKILL).is_some() {
             let started = self.start([skill as u32, 0, 0], PIANO_SKILL);
-            self.let_go(&started.threads);
+            self.let_go_track(PIANO_SKILL, &started.threads);
         }
     }
 
@@ -2617,6 +2648,15 @@ impl<S: Samples> Player<S> {
         running
     }
 
+    /// Lets go of a track unconditionally (`0x57dc68` clears the track's
+    /// hold even when no script thread is running, such as a muted replay
+    /// of a track whose note outlived its script), then lets go of any
+    /// running `threads`.
+    fn let_go_track(&mut self, track: u32, threads: &[u32]) {
+        self.held.remove(&track);
+        self.let_go(threads);
+    }
+
     /// Lets go of a started track (vtable +0x5c, 0x57dc63): *(code)* its
     /// wait deadline moves to now (0x57dc8e), so a running script's `wait`
     /// ends at the next update. (Its hold ends too; [`Player::start`]
@@ -2862,17 +2902,29 @@ impl<S: Samples> Player<S> {
         })
     }
 
-    /// Gives every note of a running thread that thread's levels. (The
-    /// original sets them as registers change; here once per block, after
-    /// the threads run.) A note whose thread has ended keeps its last.
+    /// Gives every playing note its thread's levels (running, ended, or
+    /// idle). (The original sets them as registers change; here once per
+    /// block, after the threads run, and on group or master volume
+    /// changes.)
     fn apply_levels(&mut self) {
         let levels: BTreeMap<u32, Levels> = self
             .threads
             .iter()
+            .chain(self.ended.values())
             .map(|t| (t.id, self.levels(t)))
             .collect();
+        let idle: BTreeMap<u32, Levels> = self
+            .idle
+            .iter()
+            .map(|(&track, t)| (track, self.levels(t)))
+            .collect();
         for note in &mut self.notes {
-            if let Some(levels) = levels.get(&note.thread) {
+            let found = if note.thread == 0 {
+                idle.get(&note.track)
+            } else {
+                levels.get(&note.thread)
+            };
+            if let Some(levels) = found {
                 note.gains = levels.gains;
                 note.step = step(levels.rate);
             }
@@ -3431,7 +3483,7 @@ impl<S: Samples> Player<S> {
                     *stored = thread.clone();
                 }
                 let started = self.start(args, track);
-                self.let_go(&started.threads);
+                self.let_go_track(track, &started.threads);
                 if own && let Some(stored) = self.threads.iter().find(|t| t.id == thread.id) {
                     *thread = stored.clone();
                 }

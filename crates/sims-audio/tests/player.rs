@@ -4024,6 +4024,74 @@ fn muted_kind_1_still_places_and_releases_an_already_held_track() {
 }
 
 #[test]
+fn muted_replay_places_and_releases_a_held_note_whose_script_ended() {
+    let mut map = BTreeMap::new();
+    map.insert(
+        "one.xa".to_owned(),
+        Pcm {
+            rate: RATE,
+            channels: 1,
+            samples: vec![4000; RATE as usize],
+        },
+    );
+    // Replacement script whose note outlives its script (`note_on v1; end`).
+    let one_shot: &[u8] = &[2, 5, END];
+    let (hit, addresses) = assemble(&[one_shot]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         [Track]\n\
+         10=0,sfx_oneshot,1024,2,0,1,0,0x100,1\n\
+         [EventMapping]\n\
+         e0=1,10\n",
+        addresses[0]
+    );
+    let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+    let mut player = Player::new(vec![module], map, 1);
+    let center = on_lot(&[(9, 400)]);
+    let right = on_lot(&[(9, 800)]);
+
+    // Start track 10 (group 1) at center; its script ends while the 1-second
+    // note plays on in `ended`, then pause holds it.
+    play_on(&mut player, 9, &center);
+    assert!(
+        player
+            .render_stereo(BLOCK * 2, &center)
+            .iter()
+            .any(|&s| s > 3500)
+    );
+    player.handle(&SoundEvent::Pause, &center);
+    assert!(
+        player
+            .render_stereo(BLOCK * 2, &center)
+            .iter()
+            .all(|&s| s == 0)
+    );
+
+    // Mute group 1, then replay track 10 at the right edge while paused:
+    // start() returns early at 0x57d9a5 with no running thread, yet kind 1
+    // still places the lingering ended note and clears the hold at 0x57dc68.
+    player.set_group_volume(1, 0);
+    play_on(&mut player, 9, &right);
+    assert!(
+        player
+            .render_stereo(BLOCK * 2, &right)
+            .iter()
+            .all(|&s| s == 0)
+    );
+
+    // Unmuting group 1 (without global unpause) makes the held note resume
+    // immediately at its updated right-edge placement (right > left).
+    player.set_group_volume(1, 1024);
+    let out = player.render_stereo(BLOCK * 2, &right);
+    let [left, right_ch] = [out[out.len() - 2], out[out.len() - 1]];
+    assert!(left > 0 && right_ch > left, "{left} {right_ch}");
+}
+
+#[test]
 fn repeated_kind_30_updates_running_note_gain_immediately() {
     let mut map = samples();
     map.insert(

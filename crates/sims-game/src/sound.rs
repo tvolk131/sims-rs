@@ -270,6 +270,73 @@ pub fn enter_live() -> Vec<SoundEvent> {
         .collect()
 }
 
+/// The sound event for a live-mode pause change (`0x4ce5c5` for pause,
+/// `0x4ce5d9` for unpause).
+pub fn pause_event(paused: bool) -> SoundEvent {
+    if paused {
+        SoundEvent::Pause
+    } else {
+        SoundEvent::Unpause
+    }
+}
+
+/// Bridges a [`crate::Game`] into a [`Mixer`] (or [`crate::output::Output`]):
+/// sends object sources, live-mode entry ([`enter_live`]), live-mode
+/// pause/unpause ([`pause_event`], `0x4ce5c5` / `0x4ce5d9`), the
+/// simulation's sound events, the ambience view/hour/speed, and kind 33
+/// camera moves in the order the window uses.
+#[derive(Default)]
+pub struct Feed {
+    /// The hour, speed and ambience view the sound was last told.
+    heard: Option<(u32, Speed, i32)>,
+    /// The object answers the sound was last told.
+    told: Option<Snapshot>,
+    /// The camera the sound last heard move.
+    shot: Option<Shot>,
+    /// Whether the sound was last told the lot is paused.
+    paused: bool,
+}
+
+impl Feed {
+    /// Sends every sound input that changed on `game` since the last call.
+    pub fn update(&mut self, game: &mut crate::Game, mut send: impl FnMut(Input)) {
+        // What the tick's sounds may ask about their objects, before the
+        // sounds themselves. Read on every call, not only after a step
+        // that succeeded: a failed step may still have changed the lot.
+        let first = self.told.is_none();
+        let sources = game.sound_sources();
+        if self.told.as_ref() != Some(&sources) {
+            send(Input::Sources(sources.clone()));
+            self.told = Some(sources);
+        }
+        if first {
+            send(Input::Events(enter_live()));
+        }
+        let paused = game.paused();
+        if paused != self.paused {
+            send(Input::Events(vec![pause_event(paused)]));
+            self.paused = paused;
+        }
+        let sounds = game.take_sounds();
+        if !sounds.is_empty() {
+            send(Input::Events(sounds.into_iter().map(event).collect()));
+        }
+        let now = (game.hour(), game.pace.speed, game.ambience_view());
+        if self.heard != Some(now) {
+            send(Input::View(now.2));
+            send(Input::Hour(now.0));
+            send(Input::Speed(now.1));
+            self.heard = Some(now);
+        }
+        // Kind 33, after the sources and the view the moved camera shows.
+        let shot = game.shot();
+        if self.shot != Some(shot) {
+            send(Input::Camera);
+            self.shot = Some(shot);
+        }
+    }
+}
+
 /// The sound player's event for one of the simulation's. The
 /// simulation's object ID is 16 bits, as the script named it; it is
 /// widened without its sign, so -1 is 65535 (which the original passes is
