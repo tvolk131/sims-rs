@@ -513,6 +513,10 @@ impl Machine<'_, '_> {
                 }
             ))
         };
+        let has_bitmap_in = |world: &sims_sim::World| {
+            self.file_has_saved_portrait_in(world, guid)
+                || library.is_some_and(|library| library.has_portrait_bitmap)
+        };
         // On a copy of the lot and of the machine's cells (the sounds
         // the person's Init plays, the objects deleted), kept only when
         // the whole build is done: a build that fails leaves nothing
@@ -522,7 +526,20 @@ impl Machine<'_, '_> {
         let cells = crate::both_ways::Cells::of(&interpreter);
         {
             let built = cells.on(&interpreter);
-            let id = built.create_person(&mut copy, guid).map_err(unsupported)?;
+            let Some(id) = built
+                .try_create_person(&mut copy, guid)
+                .map_err(unsupported)?
+            else {
+                // 0x440dd5 declined the temporary pet (neither Unleashed nor
+                // Makin' Magic): 0x4e9652 returns NULL -> 0x4e8c5d returns
+                // false, and 0x4e9338 loads BMP_ 2002 if present (on a dirty
+                // slot) or leaves slot 1 empty.
+                if dirty && has_bitmap {
+                    self.world.portraits.insert(guid);
+                    self.world.dirty_portraits.remove(&guid);
+                }
+                return Ok(());
+            };
             let found = built
                 .portrait_search(&mut copy, id)
                 .map_err(|fault| fault.trap)?;
@@ -543,10 +560,11 @@ impl Machine<'_, '_> {
                     built.remove_now(&mut copy, id).map_err(unsupported)?;
                     // Back in 0x4e92a8 after a dirty build at 0x4e92f2, if
                     // Reset invalidated slot 1, 0x4e9315 sees slot 1 empty:
-                    // 0x4e9338 loads BMP_ 2002 when present, otherwise 0x4e938c
-                    // calls 0x4e8c5d a second time.
+                    // 0x4e9338 checks the resource file AFTER cleanup (so any
+                    // BMP_ 2002 saved by Reset into the same file is visible)
+                    // and loads it; otherwise 0x4e938c calls 0x4e8c5d again.
                     if dirty && !copy.portraits.contains(&guid) {
-                        if has_bitmap {
+                        if has_bitmap_in(&copy) {
                             copy.portraits.insert(guid);
                             copy.dirty_portraits.remove(&guid);
                         } else {
@@ -559,13 +577,18 @@ impl Machine<'_, '_> {
                     }
                 }
                 crate::placement::PortraitSearch::NotFound { description } => {
-                    if !has_bitmap {
+                    if !dirty {
+                        // A clean build already passed 0x4e9338 before entering
+                        // 0x4e938c; removing unput leaves slot 1 empty.
                         return Err(no_tile_without_bitmap(&description));
                     }
-                    // Dirty slot + BMP_ 2002: 0x4e9706 removes unput
-                    // (skipping virtual function 0x88), then 0x4e9338
-                    // loads BMP_ 2002 into slot 1 so 0x4e938c does not run.
+                    // Dirty build at 0x4e92f2: 0x4e9706 removes unput first
+                    // (skipping virtual function 0x88), then 0x4e9338 checks
+                    // the resource file AFTER cleanup for BMP_ 2002.
                     built.remove_now(&mut copy, id).map_err(unsupported)?;
+                    if !has_bitmap_in(&copy) {
+                        return Err(no_tile_without_bitmap(&description));
+                    }
                     copy.portraits.insert(guid);
                     copy.dirty_portraits.remove(&guid);
                 }
@@ -573,7 +596,7 @@ impl Machine<'_, '_> {
                     found,
                     no_tile_description,
                 } => {
-                    if !has_bitmap {
+                    if !dirty {
                         return Err(no_tile_without_bitmap(&no_tile_description));
                     }
                     // Dirty slot + BMP_ 2002: `portrait_place` borrows `&World`
@@ -587,6 +610,9 @@ impl Machine<'_, '_> {
                         .portrait_place(&copy, id, &found)
                         .map_err(|fault| fault.trap)?;
                     built.remove_now(&mut copy, id).map_err(unsupported)?;
+                    if !has_bitmap_in(&copy) {
+                        return Err(no_tile_without_bitmap(&no_tile_description));
+                    }
                     copy.portraits.insert(guid);
                     copy.dirty_portraits.remove(&guid);
                 }
@@ -609,12 +635,16 @@ impl Machine<'_, '_> {
     /// runtime-made character has its own dedicated `User%05d.iff`, while
     /// catalog definitions sharing a file share any `BMP_` 2002 written to it.
     pub(crate) fn file_has_saved_portrait(&self, guid: u32) -> bool {
-        if self.world.characters.made.contains_key(&guid) {
-            return self.world.saved_portraits.contains(&guid);
+        self.file_has_saved_portrait_in(self.world, guid)
+    }
+
+    fn file_has_saved_portrait_in(&self, world: &sims_sim::World, guid: u32) -> bool {
+        if world.characters.made.contains_key(&guid) {
+            return world.saved_portraits.contains(&guid);
         }
         self.catalog.object(guid).is_some_and(|entry| {
-            self.world.saved_portraits.iter().any(|&saved| {
-                !self.world.characters.made.contains_key(&saved)
+            world.saved_portraits.iter().any(|&saved| {
+                !world.characters.made.contains_key(&saved)
                     && self
                         .catalog
                         .object(saved)
@@ -681,7 +711,15 @@ impl Machine<'_, '_> {
         let cells = crate::both_ways::Cells::of(&interpreter);
         {
             let built = cells.on(&interpreter);
-            let id = built.create_person(&mut copy, guid).map_err(unsupported)?;
+            let Some(id) = built
+                .try_create_person(&mut copy, guid)
+                .map_err(unsupported)?
+            else {
+                // 0x440dd5 declined the temporary pet (neither Unleashed nor
+                // Makin' Magic): 0x4e9652 returns NULL -> 0x4e8c5d returns
+                // false (ignored by 0x44b126), keeping the cloned character.
+                return Ok(());
+            };
             let found = built
                 .portrait_search(&mut copy, id)
                 .map_err(|fault| fault.trap)?;

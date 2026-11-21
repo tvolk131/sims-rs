@@ -662,9 +662,20 @@ impl Game {
     pub fn apply(&mut self, command: Move) -> bool {
         let before = self.view.camera;
         let (w, h) = self.house_viewport_size();
-        let moved = self
-            .view
-            .apply_in(command, [w as i32, h as i32], pick::ORIGIN_COLUMN);
+        let viewport = [w as i32, h as i32];
+        let moved = match command {
+            Move::ZoomIn | Move::ZoomOut | Move::Rotate(_) if self.lot_shape.size > 0 => {
+                let changed = native_zoom_or_rotate(
+                    &self.lot_shape,
+                    &mut self.view.camera,
+                    viewport,
+                    command,
+                );
+                self.view.bound();
+                changed || self.view.camera != before
+            }
+            _ => self.view.apply_in(command, viewport, pick::ORIGIN_COLUMN),
+        };
         let after = self.view.camera;
         if after.origin != before.origin
             || after.zoom != before.zoom
@@ -1344,16 +1355,24 @@ impl Game {
         // The view turns as the turn keys do, keeping the middle of the
         // screen, until it shows the lot as the saved lot was turned.
         let (w, h) = self.house_viewport_size();
+        let viewport = [w as i32, h as i32];
         let rotation = self.lot.view_rotation();
         for _ in 0..4 {
             if self.view.camera.rotation == rotation {
                 break;
             }
-            self.view.apply_in(
-                Move::Rotate(true),
-                [w as i32, h as i32],
-                pick::ORIGIN_COLUMN,
-            );
+            if self.lot_shape.size > 0 {
+                native_zoom_or_rotate(
+                    &self.lot_shape,
+                    &mut self.view.camera,
+                    viewport,
+                    Move::Rotate(true),
+                );
+                self.view.bound();
+            } else {
+                self.view
+                    .apply_in(Move::Rotate(true), viewport, pick::ORIGIN_COLUMN);
+            }
         }
         self.pace.restart();
         self.people.refresh(world);
@@ -1754,6 +1773,125 @@ fn sync_speed_after_step(
     }
     pace.restart();
     true
+}
+
+/// Rotates a fine lot/view coordinate about `1023` (`0x47bc1f` with `0x400`).
+fn rotate_fine_1023([x, y]: [i32; 2], turns: u8) -> [i32; 2] {
+    let m: i32 = 1023;
+    match turns & 3 {
+        1 => [m.wrapping_sub(y), x],
+        2 => [m.wrapping_sub(x), m.wrapping_sub(y)],
+        3 => [y, m.wrapping_sub(x)],
+        _ => [x, y],
+    }
+}
+
+/// Applies `Move::ZoomIn`, `Move::ZoomOut`, or `Move::Rotate` using the
+/// original's terrain-aware screen-centre anchor on the displayed floor
+/// (`0x4a7c1f..0x4a7d2e` for zoom, `0x4a7e89..0x4a7f94` for rotation):
+///
+/// 1. Picks the view-rotated fine ground point at the active house viewport's
+///    midpoint (`0x4a7b58`) using the native origin column (`origin[0] + 1`).
+/// 2. Cuts it to a signed-byte tile (`0x433067`) and checks the rotated lot's
+///    interior bounds (`0x434cb7`); if outside, falls back to the tile
+///    `[(size / 4) + min_x, (size / 4) + min_y]` converted to its fine centre
+///    `((t << 4) | 8)` (`0x4a7dec`, `0x434c98`).
+/// 3. Updates zoom (or un-rotates by `(-old) & 3`, updates rotation, and
+///    re-rotates by `new` via `0x47bc1f` about `1023`).
+/// 4. Recenters via `0x4a7996` (`on_lot` check `0x4a7af0`, terrain-aware
+///    projection on `camera.level` via `fine_point_with_heights`, clamping to
+///    `scroll_limits` and `(x + 1) & !3` alignment at `0x4a81cc`).
+fn native_zoom_or_rotate(
+    lot: &sims_render::Lot,
+    camera: &mut Camera,
+    viewport: [i32; 2],
+    command: Move,
+) -> bool {
+    let before = *camera;
+    let next_zoom = match command {
+        Move::ZoomIn => {
+            let next = camera.zoom.zoom_in();
+            if next == camera.zoom {
+                return false;
+            }
+            Some(next)
+        }
+        Move::ZoomOut => {
+            let next = camera.zoom.zoom_out();
+            if next == camera.zoom {
+                return false;
+            }
+            Some(next)
+        }
+        Move::Rotate(_) => None,
+        _ => return false,
+    };
+
+    let mut native = *camera;
+    native.origin[0] = native.origin[0].saturating_add(pick::ORIGIN_COLUMN);
+    let mut fine = match sims_render::screen_centre_pick(lot, &native, viewport) {
+        Some(fine) => fine,
+        None => return false,
+    };
+    let [tx, ty] = [
+        i32::from((fine[0] >> 4) as i8),
+        i32::from((fine[1] >> 4) as i8),
+    ];
+    let b = sound::lot_bounds(lot, &native);
+    let inside = tx > b[0] && tx < b[1] && ty > b[2] && ty < b[3];
+    if !inside {
+        let quarter = (lot.size as i32 / 4) as i8;
+        let fx = i32::from(quarter.wrapping_add(b[0] as i8));
+        let fy = i32::from(quarter.wrapping_add(b[2] as i8));
+        fine = [(fx << 4) | 8, (fy << 4) | 8];
+    }
+
+    if let Some(zoom) = next_zoom {
+        native.zoom = zoom;
+    } else if let Move::Rotate(clockwise) = command {
+        let unrotated = rotate_fine_1023(fine, (4 - (native.rotation & 3)) & 3);
+        native.rotation = (native.rotation + if clockwise { 1 } else { 3 }) & 3;
+        fine = rotate_fine_1023(unrotated, native.rotation);
+    }
+
+    let b = sound::lot_bounds(lot, &native);
+    let [rx, ry] = [fine[0] >> 4, fine[1] >> 4];
+    if rx >= b[0] && rx <= b[1] && ry >= b[2] && ry <= b[3] {
+        let corners = sound::tile_corners(lot, &native, [rx, ry]);
+        let at = sound::fine_point_with_heights(
+            &Camera {
+                origin: [0, 0],
+                ..native
+            },
+            fine,
+            native.level,
+            corners,
+        );
+        let middle = [viewport[0] / 2, viewport[1] / 2];
+        let target = [
+            middle[0].saturating_sub(at[0]),
+            middle[1].saturating_sub(at[1]),
+        ];
+        let ([min_x, max_x], [min_y, max_y]) = scroll_limits(lot, &native, viewport);
+        let native_x = target[0].max(min_x).min(max_x).wrapping_add(1) & !3;
+        let clamped_y = target[1].max(min_y).min(max_y);
+        native.origin = [native_x, clamped_y];
+    }
+
+    camera.zoom = native.zoom;
+    camera.rotation = native.rotation;
+    camera.origin = [
+        native.origin[0].saturating_sub(pick::ORIGIN_COLUMN),
+        native.origin[1],
+    ];
+    if camera.zoom != before.zoom {
+        let built = before.focus.masks_built_at.unwrap_or(before.zoom);
+        camera.focus.masks_built_at = (built != camera.zoom).then_some(built);
+    }
+    if camera.rotation != before.rotation {
+        camera.focus.masks_built_at = None;
+    }
+    *camera != before
 }
 
 /// The active 3D house viewport size (`0x49ae5e`, `0x4f4b43`, `0x4d363b`,
@@ -2183,20 +2321,64 @@ mod tests {
         assert_eq!(pick_tile([399, -6], true), Some([16, 16]));
 
         // Zooming from Far to Medium with the panel expanded (800x500 active
-        // viewport) anchors at the active viewport midpoint and native origin
-        // column, keeping the screen-centre pick at [16, 16].
-        let mut view = View::new([800, 600], [0, 0], 0);
-        view.camera.origin = [399, -6];
+        // viewport) uses native 0x4a7b58 + 0x434cb7 + 0x4a7996 anchoring:
+        // - from native [400, -6] (inside lot): stays on [16, 16];
+        // - from native [400, 240] (tile [0, 0], outside interior): falls back
+        //   to quarter-lot tile [16, 16] (0x4a7c56..0x4a7c96) instead of [32, 32].
         let controls = Controls {
             expanded: true,
             ..Controls::default()
         };
-        let (w, h) = viewport_for_controls(view.size, &controls);
-        assert!(view.apply_in(Move::ZoomIn, [w as i32, h as i32], pick::ORIGIN_COLUMN));
-        let mut native = view.camera;
-        native.origin[0] = native.origin[0].saturating_add(pick::ORIGIN_COLUMN);
-        let picked = sims_render::screen_centre_pick(&lot, &native, [w as i32, h as i32])
-            .map(|[x, y]| [(x >> 4) as i8, (y >> 4) as i8]);
-        assert_eq!(picked, Some([16, 16]));
+        let (w, h) = viewport_for_controls([800, 600], &controls);
+        let viewport = [w as i32, h as i32];
+        let pick_unrotated = |camera: Camera| {
+            let mut native = camera;
+            native.origin[0] = native.origin[0].saturating_add(pick::ORIGIN_COLUMN);
+            let tile = sims_render::screen_centre_pick(&lot, &native, viewport)
+                .map(|[x, y]| [i32::from((x >> 4) as i8), i32::from((y >> 4) as i8)])?;
+            Some(native.unrotate_tile(tile))
+        };
+
+        for start_origin in [[399, -6], [399, 240]] {
+            let mut cam = Camera {
+                origin: start_origin,
+                zoom: Zoom::Far,
+                rotation: 0,
+                level: 1,
+                walls: Walls::Cutaway,
+                focus: sims_render::Focus::default(),
+            };
+            assert!(native_zoom_or_rotate(
+                &lot,
+                &mut cam,
+                viewport,
+                Move::ZoomIn
+            ));
+            assert_eq!(
+                pick_unrotated(cam),
+                Some([16, 16]),
+                "zoom from game origin {start_origin:?}"
+            );
+        }
+
+        // On floor 2 at native origin [400, -6] (game [399, -6]), clockwise
+        // rotation anchors on the displayed floor's pick ([19, 19]) and keeps
+        // the unrotated search start at [19, 19].
+        let mut floor2 = Camera {
+            origin: [399, -6],
+            zoom: Zoom::Far,
+            rotation: 0,
+            level: 2,
+            walls: Walls::Cutaway,
+            focus: sims_render::Focus::default(),
+        };
+        assert_eq!(pick_unrotated(floor2), Some([19, 19]));
+        assert!(native_zoom_or_rotate(
+            &lot,
+            &mut floor2,
+            viewport,
+            Move::Rotate(true)
+        ));
+        assert_eq!(pick_unrotated(floor2), Some([19, 19]));
     }
 }

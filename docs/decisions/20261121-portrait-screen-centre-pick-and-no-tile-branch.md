@@ -147,9 +147,11 @@ items in the dialog portrait path (`0x4e92a8` → `0x4e8c5d` → `0x4e9652`):
      control-panel strip, and the native origin column `camera.origin[0] +
      pick::ORIGIN_COLUMN`) in `open`, `resize`, `centre_on`, `command`
      (including `Command::TogglePanel`), and in `apply` (anchoring zoom and
-     rotation in `View::apply_in` at the active viewport midpoint and native
-     origin column, and syncing only when camera geometry changes so no-op or
-     wall-mode commands preserve a restored pick).
+     rotation via `native_zoom_or_rotate` using `0x4a7b58` on the displayed
+     floor, `0x434cb7` + `(size / 4) + min` fallback, `0x47bc1f` about `1023`,
+     and `0x4a7996`/`0x4a81cc` terrain-aware recentering, syncing only when
+     camera geometry changes so no-op or wall-mode commands preserve a restored
+     pick).
 2. **Dirty-slot gate, writability, saved bitmaps, and no-tile branch (`sims-sim`, `sims-vm`):**
    - Append `World::dirty_portraits: BTreeSet<u32>` and
      `World::saved_portraits: BTreeSet<u32>` (bumping `sims_sim::SNAPSHOT_FORMAT`

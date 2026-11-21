@@ -56,7 +56,7 @@ impl View {
         view
     }
 
-    fn bound(&mut self) {
+    pub(crate) fn bound(&mut self) {
         self.camera.origin = self
             .camera
             .origin

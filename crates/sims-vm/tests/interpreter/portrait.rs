@@ -2320,3 +2320,56 @@ fn a_temporary_persons_reset_invalidating_pd_68_leaves_slot_1_empty_and_dirty() 
         .to_string();
     assert!(fault.contains("0x4e938c"), "{fault}");
 }
+
+#[test]
+fn a_dirty_build_whose_reset_saves_a_siblings_bmp_2002_loads_it_at_0x4e9338() {
+    // 0x4e9338 looks up BMP_ 2002 in the resource file AFTER 0x4e92f2 returns:
+    // if WIDGET's Reset invalidates slot 1 AND triggers a clean dialog for a
+    // sibling person definition in the same writable IFF (saving BMP_ 2002 into
+    // that file), 0x4e9338 loads that newly saved bitmap cleanly.
+    const SIBLING: u32 = 0x5555_0003;
+    let (mut fx, widget_file, widget_record) = visitors();
+    let index = fx.catalog.objects.len();
+    fx.catalog.objects.push(sims_content::Object {
+        guid: SIBLING,
+        resource: widget_file,
+        chunk: 129,
+        kind: 2,
+        master: 0,
+    });
+    fx.catalog.by_guid.insert(SIBLING, index);
+    let lib = fx.program.libraries.get_mut(&widget_file).unwrap();
+    let words = *lib.definitions.get(&128).unwrap();
+    lib.definitions.insert(129, words);
+    let callbacks = lib.callbacks.get(&128).unwrap().clone();
+    lib.callbacks.insert(129, callbacks);
+    crate::person_factory::equip(&mut fx, SIBLING, "sibling", 12);
+    let sibling_record = fx.world.neighbors.slots.len() as i16;
+
+    // Give WIDGET a Reset callback (OBJf entry 3, tree 4100) that writes
+    // pd[68] := 1 (invalidating WIDGET's freshly built slot 1) and runs an
+    // informing dialog for SIBLING (saving BMP_ 2002 into `widget_file`).
+    crate::visits::function(&mut fx, widget_file, 3, 4100);
+    fx.add(
+        widget_file,
+        4100,
+        tree(vec![
+            assign(scope::MY_PERSON, 68, scope::LITERAL, 1, 1),
+            assign(scope::STACK_OBJECT, 0, scope::LITERAL, sibling_record, 2),
+            ins(
+                DIALOG,
+                RETURN_TRUE,
+                RETURN_FALSE,
+                [0, 0, 0, 0, 0, 0, 0, 1 | (2 << 1)],
+            ),
+        ]),
+    );
+    fx.world.dirty_portraits.insert(WIDGET);
+    assert_eq!(
+        inform_from(&mut fx, 2, widget_record, Some([1, 1])),
+        Ok(true)
+    );
+    assert!(fx.world.saved_portraits.contains(&SIBLING));
+    assert!(fx.world.portraits.contains(&WIDGET));
+    assert!(!fx.world.dirty_portraits.contains(&WIDGET));
+}

@@ -798,3 +798,19 @@ fn cloning_a_template_inherits_bmp_2002_saved_during_play() {
     fx_after.world.saved_portraits.insert(TEMPLATE_PERSON);
     assert!(!fx_after.world.saved_portraits.contains(&guid_after));
 }
+
+#[test]
+fn pet_creation_without_pet_expansions_skips_temporary_portrait_pet_and_keeps_character() {
+    // With pet resources present and both Unleashed (0x20) and Makin' Magic
+    // (0x80) flags clear, native 0x440dd5 returns NULL -> 0x4e8c5d returns
+    // false (ignored by 0x44b126), so Make New Character still succeeds and
+    // keeps the newly cloned character without populating slot 1 or saving.
+    let mut fx = fixture(0, 5, 0, 2, &TONES);
+    add_pet_templates(&mut fx);
+    fx.program.expansions = 0;
+    assert_eq!(fx.run(), Ok(true));
+    let guid = expected_guid();
+    assert!(fx.world.characters.made.contains_key(&guid));
+    assert!(fx.world.portraits.is_empty());
+    assert!(fx.world.saved_portraits.is_empty());
+}
