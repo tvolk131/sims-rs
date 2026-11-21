@@ -26,7 +26,9 @@ and neither changes the state a lot loads:
 
 The pools (`20261120-neighborhood-open-fills-five-pools.md`, 6b E) are
 not ported either, and they do change it: their families, records and
-person files, and the option bytes, all enter the loaded world.
+person files enter the loaded world. They also set the neighborhood's
+option bytes, which the lot load does not read (`World::read_neighbors`
+ignores them), so the boot's hash does not check them.
 
 **The converted flag.** The resource writer sets a resource's flags
 word to 0x10 when it marks it converted (0x419f80), and to 0 otherwise.
@@ -70,7 +72,9 @@ The scan reads the `Patch` files only when an import is pending
 
 `an_opened_neighborhood_matches_the_originals_import` (in
 `crates/sims-vm/tests/boot.rs`) opens the install's UserData2 with the
-GUIDs the original drew, read from its `User00002.iff` to `User00029.iff`.
+GUIDs the original drew in track 2's second run (`SIMS_UD2_AFTER`,
+`ud2-import-20261119/after-run2`), read from its `User00002.iff` to
+`User00029.iff`.
 It checks:
 - the six imports;
 - the five house files, byte for byte;
@@ -78,10 +82,11 @@ It checks:
 
 It then takes the pools from the original:
 - families 2000, 3000 to 3009, 5000, 5500 and 6000;
-- records 322 to 446;
+- records 322 to 444;
 - files from `User00030.iff` on;
 - the option bytes.
 
-It loads House 69 and checks the hash against `IMPORTED_69`, the hash the
-original's own files boot to. It skips without `SIMS_INSTALL` or
-`SIMS_UD2_AFTER`.
+It loads House 69 with the C runtime where the House 69 test starts it
+(`OPEN_DRAWS`, `20261120-ud2-house-69-boots-from-the-originals-import.md`)
+and checks the hash against `IMPORTED_69`, the hash the original's own
+files boot to. It skips without `SIMS_INSTALL` or `SIMS_UD2_AFTER`.
