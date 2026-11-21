@@ -553,6 +553,9 @@ impl Game {
             status.as_deref(),
             &mut self.canvas,
         );
+        // The help balloon closed by the selection's going.
+        let sounds = self.hud.take_sounds();
+        self.keep_sounds(sounds);
         let problems = self.hud.take_problems();
         self.people.note(problems);
     }
@@ -611,7 +614,10 @@ impl Game {
         if self.hud.covers(point) {
             // The menu, whose entries a choice is an index into.
             let menu = self.hud.menu.clone();
-            let outcome = match self.hud.press(point) {
+            let outcome = match self
+                .hud
+                .press(point, self.lot.world(), self.lot.residential())
+            {
                 Some(command) => self.command(command, menu.as_ref()),
                 None => Outcome::redraw(),
             };
@@ -1118,6 +1124,7 @@ impl Game {
             }
             Command::TogglePanel
             | Command::OpenPanel(_)
+            | Command::Refused { .. }
             | Command::ShowRelations(_)
             | Command::RelationsPage(_)
             | Command::Help(_) => Outcome::redraw(),
