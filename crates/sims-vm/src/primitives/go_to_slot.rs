@@ -523,8 +523,10 @@ impl Machine<'_, '_> {
             .get(&me)
             .map(|r| r.path.clone())
             .unwrap_or_default();
+        // A check tree's fault keeps where it happened, on this person's
+        // thread too.
         let inner = |fault: Fault| {
-            if fault.object == me {
+            if fault.object == me && !fault.holds_check() {
                 fault.trap
             } else {
                 fault.unsupported_in("Go To Routing Slot")
@@ -1008,8 +1010,10 @@ impl Machine<'_, '_> {
     ) -> Result<Flow, Trap> {
         let me = self.me;
         let interpreter = self.interpreter();
+        // A check tree's fault keeps where it happened, on this person's
+        // thread too.
         let inner = |fault: Fault| {
-            if fault.object == me {
+            if fault.object == me && !fault.holds_check() {
                 fault.trap
             } else {
                 fault.unsupported_in("the end of a route")

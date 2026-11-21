@@ -25,9 +25,10 @@ two fails any more. The listings that fail today are these:
 - **Joining a running interaction (0x45866d, 0x41ee99).** From 1500
   ticks. Listing a pie menu offers to join the interaction the listing
   person is running, when it can be joined, and that offer is not ported
-  (`orders.rs`, after the entries are listed). So a person running a
-  joinable interaction meets it when listing any object, an idle person
-  included.
+  (`orders.rs`, after the entries are listed). The offer is made on
+  another person's pie menu. So a person running a joinable interaction
+  meets it when listing any other person, an idle one included, and not
+  when listing an object or itself.
 - **A visitor's chosen action on a category 4 or 7 object (0x41f660).**
   From 6000 ticks, check trees 0x2025 and 0x103e ask the relationship
   between the visitor and the person ordered, which is not ported.
@@ -75,6 +76,11 @@ What changes:
     Object for Function.
 - An `Unsupported` trap whose own text happens to start with "check
   tree" is now unported. The old parser took it for a failure.
+- A check tree's fault met in a route's callbacks on the routing
+  person's own thread now keeps the callback's place, in
+  `Trap::Within`. Before, only its trap was kept.
+- `sims boot --play` counts the errors, skipped frames and sounds a
+  failed tick hands back with the rest.
 - A check tree's fault met while a tree is pushed (Gosub Found Action,
   Idle For Input, a door's tree) is still turned into text. Pushing a
   tree runs no check, so none is expected there.

@@ -43,9 +43,9 @@ pub enum Trap {
     },
     /// Work an instruction started, such as another object's callback or
     /// the Init of an object it made, failed on a check tree's fault,
-    /// which `fault` holds whole rather than as unsupported text
-    /// ([`Fault::unsupported_in`], [`Fault::nested`]). `context` says what
-    /// the work was, when there is more to say than where `fault` is.
+    /// which `fault` holds whole rather than as unsupported text.
+    /// `context` says what the work was, when there is more to say than
+    /// where `fault` is.
     Within { context: String, fault: Box<Fault> },
 }
 
@@ -150,7 +150,7 @@ impl std::error::Error for Fault {}
 impl Fault {
     /// Whether the fault is a check tree's, held as it is
     /// ([`Trap::CheckTree`], [`Trap::Within`]).
-    fn holds_check(&self) -> bool {
+    pub(crate) fn holds_check(&self) -> bool {
         matches!(self.trap, Trap::CheckTree { .. } | Trap::Within { .. })
     }
 
