@@ -1306,8 +1306,11 @@ fn a_dialogs_strings_are_read_in_the_order_the_loader_gives() {
         .libraries
         .get_mut(&LAMP_FILE)
         .unwrap()
-        .english_fallback
-        .insert(301);
+        .unported_strings
+        .insert(
+            301,
+            "has entries with a language and none in US English (0x47006b)",
+        );
     let fault = fx
         .run_with(LAMP, 4096, SIM as i16, &[], 1000)
         .unwrap_err()

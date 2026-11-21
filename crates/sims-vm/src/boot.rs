@@ -480,7 +480,6 @@ impl Lot {
         // out; making a person of it fails.
         program.people = People::load_each(&install, &index, &catalog, person_types())?.0;
         program.icon_frames = crate::program::icon_frames(&install)?;
-        program.labels_hold_no_token = crate::program::labels_hold_no_token(&install)?;
         // A person file that cannot be listed fails Make New Character,
         // not the boot, which never reads the names otherwise.
         program.wardrobe = Some(match sims_content::Assets::scan(&install.root) {

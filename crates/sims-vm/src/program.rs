@@ -64,11 +64,10 @@ pub struct Library {
     /// dialog's strings read it; whether the other readers of
     /// [`Library::strings`] load through the same loader is **unverified**.
     pub loaded_strings: BTreeMap<u16, Option<Vec<String>>>,
-    /// The IDs of the string tables (STR#) whose resource has entries with
-    /// a language and none in the first. The loader then reads the table
-    /// again for English (0x47006b to 0x4700d0), stepping through it in a
-    /// way that may read a string's bytes as entries; that is not ported.
-    pub english_fallback: BTreeSet<u16>,
+    /// The string tables (STR#) whose resource the loader (0x46feac, the
+    /// dialog's call with argument 3 zero) reads in a way not ported, by
+    /// ID, each with why ([`unported_strings`]). Only the dialog reads it.
+    pub unported_strings: BTreeMap<u16, &'static str>,
     /// The IDs of the file's legacy string tables (CST resources), which
     /// are not read: the original's string loader falls back to one when
     /// the file has no STR# of the ID (0x4702c7, 0x47018e to 0x4701e6).
@@ -166,8 +165,7 @@ pub struct Program {
     /// does not name (STR# 142 of `GameData/UIText.iff`, 0x435fee,
     /// 0x43600a) are known to hold no `$`, so no token
     /// ([`labels_hold_no_token`]). When they are not, a dialog with a
-    /// default string fails loudly. [`Program::link`] leaves it false for
-    /// the caller to fill.
+    /// default string fails loudly.
     pub labels_hold_no_token: bool,
     /// Each lot's zoning, by lot number: 1 residential, 2 community. It
     /// comes from the neighborhood ([`sims_content::Neighborhood::zoning`]),
@@ -228,7 +226,7 @@ impl Program {
             semi_globals: BTreeMap::new(),
             careers: careers(index)?,
             career_texts_end: career_texts_end(index)?,
-            labels_hold_no_token: false,
+            labels_hold_no_token: labels_hold_no_token(&index.root)?,
             zoning: BTreeMap::new(),
             animations: Animations::default(),
             people: People::default(),
@@ -277,8 +275,13 @@ impl Program {
                     library.names.insert(chunk.id, chunk.label.clone());
                 }
                 b"STR#" => {
-                    let table = sims_formats::strings::StringTable::parse(data)
-                        .map_err(|e| format("STR#", chunk.id, e))?;
+                    let table = match sims_formats::strings::StringTable::parse(data) {
+                        Ok(table) => table,
+                        // The loader skips a deleted chunk (0x41c542), so
+                        // one that does not parse does not stop the link.
+                        Err(_) if chunk.flags & sims_formats::iff::DELETED != 0 => continue,
+                        Err(e) => return Err(format("STR#", chunk.id, e).into()),
+                    };
                     let entries: Vec<String> = table
                         .entries
                         .iter()
@@ -348,13 +351,20 @@ impl Program {
                 library.loaded_strings.insert(id, None);
                 continue;
             };
-            let table = sims_formats::strings::StringTable::parse(iff.data(chunk))
+            let data = iff.data(chunk);
+            if let Some(why) = unported_strings(chunk.flags, data) {
+                library.unported_strings.insert(id, why);
+                continue;
+            }
+            let table = sims_formats::strings::StringTable::parse(data)
                 .map_err(|e| format("STR#", id, e))?;
-            if table.format == sims_formats::strings::Format::Localized
-                && !table.entries.is_empty()
-                && table.entries.iter().all(|entry| entry.language != 1)
-            {
-                library.english_fallback.insert(id);
+            if !table.entries.is_empty() && table.entries.iter().all(|entry| entry.language != 1) {
+                library.unported_strings.insert(
+                    id,
+                    "has entries with a language and none in US English, which the loader \
+                     reads again for English (0x47006b to 0x4700d0)",
+                );
+                continue;
             }
             let loaded = loaded_order(&table.entries);
             if library.strings.get(&id) != Some(&loaded) {
@@ -1008,6 +1018,41 @@ fn careers(index: &Index) -> Result<Option<Vec<Career>>> {
         .map(Some)
 }
 
+/// Why the string loader (0x46feac, called with argument 3 zero) reads a
+/// STR# resource with chunk flags `flags` and bytes `data` in a way not
+/// ported, or None when it reads it as [`loaded_order`] does: a table of
+/// format -1, -2 or -3 (0x46ff37, 0x46ff7f, 0x46ffcc) with a count read
+/// as a signed word (`jle` at 0x46ff50, 0x46ff92) up to 0x7fff, whose
+/// header the resource reader leaves as it is. It byte-swaps the header of
+/// a chunk without flag 0x10 (0x41d3a7 to 0x41d3d4, through 0x470351; Sol's
+/// reading of which field it tests, **unverified**; every STR# 301 of the
+/// recorded install has the flag), and reads any other format with its
+/// leading word as the count and bytes 0xa1 and 0xd5 rewritten
+/// (0x4700d7 to 0x47014c), so a version-0 table has no entries.
+pub fn unported_strings(flags: u16, data: &[u8]) -> Option<&'static str> {
+    if flags & 0x10 == 0 {
+        return Some("is a chunk without flag 0x10, whose header the loader byte-swaps (0x41d3a7)");
+    }
+    let word = |at: usize| {
+        data.get(at..at + 2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]))
+    };
+    match word(0) {
+        Some(-3..=-1) => {}
+        _ => {
+            return Some(
+                "has a format other than -1, -2 and -3, which the loader reads with its leading \
+                 word as the count (0x4700d7 to 0x47014c)",
+            );
+        }
+    }
+    match word(2) {
+        Some(count) if count >= 0 => None,
+        Some(_) => Some("has a count above 0x7fff, which the loader reads as none (0x46ff50)"),
+        None => Some("has no count, and the loader reads one past its end (0x46ff42)"),
+    }
+}
+
 /// The first-language entries of a string table, in the order the
 /// original's loader (0x46feac, for a table of entries with a language,
 /// 0x46ffcc to 0x470069) puts them in: it counts the entries of each run of
@@ -1039,23 +1084,41 @@ pub fn loaded_order(entries: &[sims_formats::strings::TextEntry]) -> Vec<String>
 
 /// Whether no text the career passes may write holds a career token past
 /// its first character ([`Program::career_texts_end`]). The careers'
-/// strings come from the `Work` resource set (0x403dd9): `work.iff`, and a
-/// `work.fam` beside it would be searched too (0x46f539, 0x46b627,
-/// 0x406a29), which is not ported, so one makes this false. So do no
-/// `work.iff` and a `Careers.txt`. Of `work.iff`, every string table
-/// (STR#, and CST, which the loader falls back to, 0x4702c7) must hold no
-/// `$` byte at all, deleted chunks included: the loader's English fallback
-/// may read a string's bytes as entries (0x47006b), so only the raw bytes
-/// are sure. Every career's name and level strings must hold no career
-/// token ([`crate::primitives::dialog::may_hold_career_token`]): its suit
-/// names hold `$`.
+/// strings come from the `Work` resource set of `ExpansionShared`
+/// (0x403da2 to 0x403dd9, the directory found at 0x415336), which the
+/// composite opener makes of every component it finds: `.iff`, `.fam`,
+/// `.dir`, `.wll`, `.flr` (0x46f50f to 0x46f542, opened at 0x46b627 to
+/// 0x46b699, searched at 0x406a29). Only one component is ported, so this
+/// is false unless that directory holds exactly one entry or archive
+/// member named `work` with any extension ([`resource_set`]), `work.iff`,
+/// and it is the index's only `work.iff`, which [`careers`] reads. So do
+/// a `Careers.txt` (0x403e31). Every string table of it (STR#, and CST,
+/// which the loader falls back to, 0x4702c7) must hold no `$` byte at all,
+/// deleted chunks included: the loader's ways not ported
+/// ([`unported_strings`]) may read a string's bytes as entries. Every
+/// career's name and level strings must hold no career token
+/// ([`crate::primitives::dialog::may_hold_career_token`]): its suit names
+/// hold `$`. A career that does not parse makes it false here, though
+/// [`careers`] fails the link first.
 fn career_texts_end(index: &Index) -> Result<bool> {
-    if index.named("Careers.txt").next().is_some() || index.named("work.fam").next().is_some() {
+    if index.named("Careers.txt").next().is_some() {
         return Ok(false);
     }
-    let Some((_, file)) = index.named("work.iff").next() else {
+    let Some(directory) = find(&index.root, "ExpansionShared") else {
         return Ok(false);
     };
+    match resource_set(&directory, "work")? {
+        Some(set) if set.len() == 1 && set[0].eq_ignore_ascii_case("work.iff") => {}
+        _ => return Ok(false),
+    }
+    let mut works = index.named("work.iff");
+    let (Some((_, file)), None) = (works.next(), works.next()) else {
+        return Ok(false);
+    };
+    let parent = file.path.parent().map(|parent| parent.to_string_lossy());
+    if !parent.is_some_and(|parent| parent.eq_ignore_ascii_case(&directory.to_string_lossy())) {
+        return Ok(false);
+    }
     let location = file.location(&index.root);
     let iff = Iff::parse(file.read()?).map_err(|e| sims_content::Error::format(&location, e))?;
     let token = crate::primitives::dialog::may_hold_career_token;
@@ -1091,23 +1154,25 @@ fn career_texts_end(index: &Index) -> Result<bool> {
 pub const LABEL_FILE: &str = "GameData/UIText.iff";
 
 /// Whether the default button labels a dialog may show hold no `$`
-/// ([`Program::labels_hold_no_token`]): every string table of ID 142 of
-/// [`LABEL_FILE`] (STR#, and CST, which the loader falls back to,
-/// 0x4702c7) holds no `$` byte, deleted chunks included, and there is no
-/// `UIText.fam` beside it, whose resources would be searched too
-/// (0x46f539, 0x46b627), which is not ported. False when there is no such
-/// file.
-pub fn labels_hold_no_token(install: &sims_content::Install) -> Result<bool> {
+/// ([`Program::labels_hold_no_token`]), for the install at `root`. They
+/// come from the `UIText` resource set of `GameData`, which the composite
+/// opener makes as it makes `Work`'s ([`career_texts_end`]), so this is
+/// false unless that directory holds exactly one entry or archive member
+/// named `UIText` with any extension, the file [`LABEL_FILE`], and every
+/// string table of ID 142 in it (STR#, and CST, which the loader falls
+/// back to, 0x4702c7) holds no `$` byte, deleted chunks included.
+pub fn labels_hold_no_token(root: &Path) -> Result<bool> {
     const LABELS: u16 = 142;
-    match install.file("GameData/UIText.fam") {
-        Ok(_) => return Ok(false),
-        Err(sims_content::Error::Missing { .. }) => {}
-        Err(e) => return Err(e.into()),
+    let Some(directory) = find(root, "GameData") else {
+        return Ok(false);
+    };
+    match resource_set(&directory, "UIText")? {
+        Some(set) if set.len() == 1 => {}
+        _ => return Ok(false),
     }
-    let path = match install.file(LABEL_FILE) {
-        Ok(path) => path,
-        Err(sims_content::Error::Missing { .. }) => return Ok(false),
-        Err(e) => return Err(e.into()),
+    let path = match find(root, LABEL_FILE) {
+        Some(path) if path.is_file() => path,
+        _ => return Ok(false),
     };
     let bytes = std::fs::read(&path).map_err(|source| sims_content::Error::Io {
         path: path.clone(),
@@ -1120,6 +1185,84 @@ pub fn labels_hold_no_token(install: &sims_content::Install) -> Result<bool> {
             && chunk.id == LABELS
             && iff.data(chunk).contains(&b'$')
     }))
+}
+
+/// `relative` (`/`-separated) under `root`, each component matched
+/// exactly or else ignoring ASCII case, as Windows does (the first match in
+/// name order); None when one is absent.
+fn find(root: &Path, relative: &str) -> Option<std::path::PathBuf> {
+    let mut path = root.to_path_buf();
+    for component in relative.split('/') {
+        let exact = path.join(component);
+        if exact.symlink_metadata().is_ok() {
+            path = exact;
+            continue;
+        }
+        // Sorted below.
+        #[allow(clippy::disallowed_methods)]
+        let mut names: Vec<_> = std::fs::read_dir(&path)
+            .ok()?
+            .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+            .collect();
+        names.sort();
+        let name = names.into_iter().find(|name| {
+            name.to_str()
+                .is_some_and(|name| name.eq_ignore_ascii_case(component))
+        })?;
+        path.push(name);
+    }
+    Some(path)
+}
+
+/// The names of the entries of `directory`, and of the members of the
+/// archives (FAR) in it, whose name up to its first `.` is `stem`, ignoring
+/// ASCII case: whatever a resource set of that name there could be made
+/// of. None when an archive there has members the index leaves out
+/// ([`sims_content::far_members`]), which may be any.
+fn resource_set(directory: &Path, stem: &str) -> Result<Option<Vec<String>>> {
+    let named = |name: &str| {
+        name.split('.')
+            .next()
+            .is_some_and(|first| first.eq_ignore_ascii_case(stem))
+    };
+    let io = |source| sims_content::Error::Io {
+        path: directory.to_path_buf(),
+        source,
+    };
+    // Sorted below.
+    #[allow(clippy::disallowed_methods)]
+    let mut entries: Vec<_> = std::fs::read_dir(directory)
+        .map_err(io)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<_>>()
+        .map_err(io)?;
+    entries.sort();
+    let mut set = Vec::new();
+    for path in entries {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if named(&name) {
+            set.push(name.clone());
+        }
+        let archive = name
+            .rsplit_once('.')
+            .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("far"));
+        if archive && path.is_file() {
+            let (members, skipped) = sims_content::far_members(&path)?;
+            if !skipped.is_empty() {
+                return Ok(None);
+            }
+            for member in members {
+                let name = member.name.rsplit(['\\', '/']).next().unwrap_or_default();
+                if named(name) {
+                    set.push(name.to_owned());
+                }
+            }
+        }
+    }
+    Ok(Some(set))
 }
 
 /// An OBJD's words as the original holds them. Registration (0x43ba52)

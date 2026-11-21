@@ -193,11 +193,14 @@ What is not ported:
     replaced by the default its caller gives (0x4369de, 0x436a21 to
     0x436a35): a button's label from STR# 142 of `GameData/UIText.iff`
     (0x435fee, 0x43600a), or else "Missing string!!!" (0x6c29bc). The
-    port leaves such strings out only when the boot finds every string
+    port leaves such strings out only when the link finds every string
     table of ID 142 in that file (STR# and CST, deleted chunks included)
-    free of any `$` byte, with no `UIText.fam` beside it
-    (`Program::labels_hold_no_token`, Sol's eleventh check); otherwise a
-    dialog with a default string fails loudly. The install's labels (OK,
+    free of any `$` byte, and the file is the only component of the
+    `UIText` resource set: the composite opener also opens a `.fam`,
+    `.dir`, `.wll` or `.flr` of the name (0x46f50f to 0x46f542, 0x46b627
+    to 0x46b699, searched at 0x406a29), which is not ported
+    (`Program::labels_hold_no_token`, Sol's eleventh and twelfth checks).
+    Otherwise a dialog with a default string fails loudly. The install's labels (OK,
     Cancel, Yes, No) hold no `$`. Tests:
     `the_default_button_labels_hold_no_token` (`tests/boot.rs`),
     `a_default_string_fails_loudly_unless_the_labels_hold_no_token`,
@@ -224,18 +227,37 @@ What is not ported:
     so an entry starting `ff fe` is not a byte order mark (Sol's eleventh
     check). `Library::loaded_strings` keeps the loader's view where it
     differs from `Library::strings`'s (None for a file whose chunks of
-    the ID are all deleted), and only the dialog reads it. A table whose
-    entries have a language and none in US English is read again for
-    English (0x47006b to 0x4700d0), stepping through it one byte at a
-    time in a way that may read a string's bytes as entries: that is not
-    ported, and fails loudly when the dialog names a string
-    (`Library::english_fallback`).
-    Whether the other readers of `Library::strings` (animations, action
-    strings, suits) load through the same loader is **unverified**. In
-    the recorded install it makes no difference: a scan of its 2,407
-    multilingual STR# tables found each with one run of US English, so the
-    loader's order is the file's for all of them. Test:
-    `a_later_run_of_the_language_goes_in_front` (`program.rs`).
+    the ID are all deleted), and only the dialog reads it. A deleted
+    chunk that does not parse no longer stops the link. Whether the other
+    readers of `Library::strings` (animations, action strings, suits)
+    load through the same loader is **unverified**. In the recorded
+    install it makes no difference: a scan of its loose IFFs and
+    uncompressed archive members found 2,407 multilingual STR# tables
+    (Sol's wider scan 3,661; which files each counted is
+    **unverified**), each with one run of US English, so the loader's
+    order is the file's for all of them. Tests:
+    `a_later_run_of_the_language_goes_in_front` (`program.rs`),
+    `a_string_table_is_read_as_the_loader_finds_it` (`tests/program.rs`).
+
+    The loader's other ways are not ported, and fail loudly when the
+    dialog names a string (`Library::unported_strings`,
+    `program::unported_strings`, Sol's eleventh and twelfth checks):
+    - a table whose entries have a language and none in US English is
+      read again for English (0x47006b to 0x4700d0), stepping through it
+      one byte at a time in a way that may read a string's bytes as
+      entries;
+    - a chunk without flag 0x10 has its header byte-swapped first
+      (0x41d3a7 to 0x41d3d4, through 0x470351; which field the test reads
+      is Sol's reading, **unverified**);
+    - a format other than -1, -2 and -3 (version 0 and the classic Mac
+      layout) is read with its leading word as the count, so a version-0
+      table has no entries, and with bytes 0xa1 and 0xd5 rewritten as `o`
+      and `'` (0x4700d7 to 0x47014c);
+    - a count is a signed word (0x46ff50, 0x46ff92), so one above 0x7fff
+      is none, and a table with no count is read past its end.
+
+    Every STR# 301 of the recorded install is of format -3 or -2 with
+    flag 0x10.
   - A file with no STR# 301 but a legacy CST 301, which the loader reads
     instead (0x4702c7, 0x47018e to 0x4701e6), is not ported, and fails
     loudly when the dialog names a string. The loader compares the tag
@@ -394,17 +416,22 @@ What is not ported:
      tenth check: STR# 4 entry 15 of `work.iff`, loaded by 0x404328, set
      to `x$JobDesc:0`). `Program::career_texts_end` is whether no text
      the passes may write does. The careers' strings come from the `Work`
-     resource set (0x403dd9): `work.iff`, and a `work.fam` beside it would
-     be searched too (0x46f539, 0x46b627, 0x406a29), which is not ported.
-     Every string table of `work.iff` (STR#, and CST, which the loader
+     resource set of `ExpansionShared` (0x403da2 to 0x403dd9, the
+     directory found at 0x415336), which the composite opener makes of a
+     `.iff`, `.fam`, `.dir`, `.wll` and `.flr` of the name (0x46f50f to
+     0x46f542, 0x46b627 to 0x46b699, 0x406a29). Only a set of one
+     `work.iff` there is ported, and it must be the index's only
+     `work.iff`, which `careers` reads (Sol's eleventh and twelfth
+     checks). Every string table of it (STR#, and CST, which the loader
      falls back to), deleted chunks included, must hold no `$` byte at
-     all, since the English fallback may read a string's bytes as entries
-     (Sol's eleventh check), and every career's name and level strings no
-     career token. The install's STR# tables hold no `$`; its level
-     strings hold one (in suit names such as `B004MA$b_01`) but no career
-     token. When it is false (no `work.iff`, a `work.fam`, a
-     `Careers.txt`, a career that does not parse, or a string that holds
-     one) a person's career token fails loudly. That the career texts all
+     all, since the loader's ways not ported may read a string's bytes as
+     entries, and every career's name and level strings no career token.
+     The install's STR# tables hold no `$`; its level strings hold one (in
+     suit names such as `B004MA$b_01`) but no career token. When it is
+     false (any other `Work` set, another `work.iff`, a `Careers.txt`, or
+     a string that holds one) a person's career token fails loudly. A
+     career that does not parse fails the link first (`careers`; the
+     original loads them at 0x403e3f to 0x403f1f). That the career texts all
      come from the `Work` set is **unverified**. On the Goth day the
      promotion at 15298 ("You have been promoted! (to $Job:4:5)",
      `$JobDesc:4:5`, `$TimeLocal:2`) is a person's. Tests:

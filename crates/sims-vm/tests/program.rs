@@ -549,6 +549,26 @@ fn iff_with_flags(chunks: &[(&[u8; 4], u16, u16, Vec<u8>)]) -> Vec<u8> {
     bytes
 }
 
+/// A FAR archive (version 1a) of members `(name, unpacked size, bytes)`.
+fn far(members: &[(&str, u32, &[u8])]) -> Vec<u8> {
+    let mut data: Vec<u8> = Vec::new();
+    let mut directory = (members.len() as u32).to_le_bytes().to_vec();
+    for (name, unpacked, bytes) in members {
+        directory.extend(unpacked.to_le_bytes());
+        directory.extend((bytes.len() as u32).to_le_bytes());
+        directory.extend((16 + data.len() as u32).to_le_bytes());
+        directory.extend((name.len() as u32).to_le_bytes());
+        directory.extend(name.as_bytes());
+        data.extend(*bytes);
+    }
+    let mut far = b"FAR!byAZ".to_vec();
+    far.extend(1u32.to_le_bytes());
+    far.extend((16 + data.len() as u32).to_le_bytes());
+    far.extend(data);
+    far.extend(directory);
+    far
+}
+
 /// A string table of NUL-terminated strings (version -1).
 fn terminated(texts: &[&str]) -> Vec<u8> {
     let mut bytes = (-1i16).to_le_bytes().to_vec();
@@ -576,7 +596,9 @@ fn localized(entries: &[(u8, &str)]) -> Vec<u8> {
 fn a_string_table_is_read_as_the_loader_finds_it() {
     let dir = Dir::new("loaded-strings");
     let (_, _) = setup(&dir);
-    const DELETED: u16 = sims_formats::iff::DELETED;
+    // Flag 0x10: the header is as the loader reads it (0x41d3a7).
+    const LE: u16 = 0x10;
+    const DELETED: u16 = sims_formats::iff::DELETED | LE;
     dir.file(
         "GameData/Objects/Lamp.iff",
         &iff_with_flags(&[
@@ -586,7 +608,7 @@ fn a_string_table_is_read_as_the_loader_finds_it() {
             (b"BHAV", 4097, 0, bhav(3, &[])),
             (b"BCON", 4096, 0, bcon(&[99])),
             // A live table, then a deleted one of the ID (0x41c542).
-            (b"STR#", 301, 0, terminated(&["$Job"])),
+            (b"STR#", 301, LE, terminated(&["$Job"])),
             (b"STR#", 301, DELETED, localized(&[(1, "Plain"), (2, "x")])),
             // Only a deleted table.
             (b"STR#", 302, DELETED, terminated(&["Gone"])),
@@ -594,13 +616,29 @@ fn a_string_table_is_read_as_the_loader_finds_it() {
             (
                 b"STR#",
                 303,
-                0,
+                LE,
                 localized(&[(1, "a"), (2, "x"), (1, "b"), (0, "c")]),
             ),
             // Entries with a language, none in US English (0x47006b).
-            (b"STR#", 304, 0, localized(&[(3, "\x01$Job"), (3, "x")])),
+            (b"STR#", 304, LE, localized(&[(3, "\x01$Job"), (3, "x")])),
             // One run: as the file has it.
-            (b"STR#", 305, 0, localized(&[(2, "x"), (1, "a"), (1, "b")])),
+            (b"STR#", 305, LE, localized(&[(2, "x"), (1, "a"), (1, "b")])),
+            // A header the loader byte-swaps first (0x41d3a7).
+            (b"STR#", 309, 0, terminated(&["a"])),
+            // Version 0: the leading word is the count (0x4700d7).
+            (b"STR#", 310, LE, b"\0\0\x01\0\x04$Job".to_vec()),
+            // A count above 0x7fff is none (0x46ff50).
+            (
+                b"STR#",
+                311,
+                LE,
+                [&b"\xff\xff\0\x80"[..], &[0; 0x8000]].concat(),
+            ),
+            // No count.
+            (b"STR#", 312, LE, b"\xfd\xff".to_vec()),
+            // A deleted table that does not parse does not stop the link.
+            (b"STR#", 313, LE, terminated(&["live"])),
+            (b"STR#", 313, DELETED, Vec::new()),
             // A legacy table, live and deleted.
             (b"\0CST", 306, 0, b"^a^".to_vec()),
             (b"\0CST", 307, DELETED, b"^a^".to_vec()),
@@ -618,10 +656,21 @@ fn a_string_table_is_read_as_the_loader_finds_it() {
     assert_eq!(lamp.loaded_strings[&303], strings(&["b", "c", "a"]));
     assert_eq!(lamp.loaded_strings.get(&305), None);
     assert_eq!(lamp.strings[&305], ["a", "b"]);
+    assert_eq!(lamp.strings[&313], ["live"]);
+    assert_eq!(lamp.loaded_strings.get(&313), None);
+    let unported: Vec<(u16, &str)> = lamp
+        .unported_strings
+        .iter()
+        .map(|(&id, why)| (id, *why))
+        .collect();
+    let at = ["0x47006b", "0x41d3a7", "0x4700d7", "0x46ff50", "0x46ff42"];
     assert_eq!(
-        lamp.english_fallback,
-        std::collections::BTreeSet::from([304])
+        unported.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        [304, 309, 310, 311, 312]
     );
+    for ((_, why), at) in unported.iter().zip(at) {
+        assert!(why.contains(at), "{why}");
+    }
     assert_eq!(lamp.legacy_strings, std::collections::BTreeSet::from([306]));
 }
 
@@ -629,6 +678,9 @@ fn a_string_table_is_read_as_the_loader_finds_it() {
 fn career_texts_end_only_when_work_holds_no_career_token() {
     let dir = Dir::new("career-texts");
     let (index, catalog) = setup(&dir);
+    // An install with Hot Date, which mounts `ExpansionShared` (an
+    // archive with no members).
+    dir.file("ExpansionPack3/ExpansionPack3.far", &far(&[]));
     let link = |dir: &Dir| {
         let index = Index::build(&Install::detect(&dir.0).unwrap()).unwrap();
         let catalog = Catalog::build(&index).unwrap();
@@ -647,10 +699,7 @@ fn career_texts_end_only_when_work_holds_no_career_token() {
     let work = |table: Vec<u8>, flags: u16| {
         iff_with_flags(&[(b"CARR", 1, 0, carr(2)), (b"STR#", 4, flags, table)])
     };
-    dir.file(
-        "GameData/Objects/work.iff",
-        &work(terminated(&["Clerk"]), 0),
-    );
+    dir.file("ExpansionShared/work.iff", &work(terminated(&["Clerk"]), 0));
     assert!(link(&dir));
     for (table, flags) in [
         (terminated(&["x$JobDesc:0"]), 0),
@@ -658,12 +707,12 @@ fn career_texts_end_only_when_work_holds_no_career_token() {
         (terminated(&["x$JobDesc:0"]), sims_formats::iff::DELETED),
         (localized(&[(3, "\x01$Job")]), 0),
     ] {
-        dir.file("GameData/Objects/work.iff", &work(table, flags));
+        dir.file("ExpansionShared/work.iff", &work(table, flags));
         assert!(!link(&dir));
     }
     // A legacy table that holds a `$`.
     dir.file(
-        "GameData/Objects/work.iff",
+        "ExpansionShared/work.iff",
         &iff_with_flags(&[
             (b"CARR", 1, 0, carr(2)),
             (b"\0CST", 4, 0, b"^$Job^".to_vec()),
@@ -671,11 +720,46 @@ fn career_texts_end_only_when_work_holds_no_career_token() {
     );
     assert!(!link(&dir));
     // A `work.fam` beside it, whose resources are searched too (0x46f539).
+    dir.file("ExpansionShared/work.iff", &work(terminated(&["Clerk"]), 0));
+    // Any other component of the `Work` set beside it, whose resources
+    // are searched too (0x46f539, 0x46b627, 0x406a29).
+    for companion in ["work.fam", "Work.wll", "work.flr", "work.dir"] {
+        let path = format!("ExpansionShared/{companion}");
+        dir.file(&path, b"");
+        assert!(!link(&dir), "{companion}");
+        std::fs::remove_file(dir.0.join(&path)).unwrap();
+    }
+    assert!(link(&dir));
+    // So does one in an archive there, and an archive there with a member
+    // the index leaves out (compressed), which may be one.
+    for archive in [far(&[("work.wll", 0, b"")]), far(&[("other.iff", 9, b"x")])] {
+        dir.file("ExpansionShared/ExpansionShared.far", &archive);
+        assert!(!link(&dir));
+    }
+    dir.file(
+        "ExpansionShared/ExpansionShared.far",
+        &far(&[("other.iff", 0, b"")]),
+    );
+    assert!(link(&dir));
+    // Another `work.iff` elsewhere, which the original does not open as
+    // `Work` but the index finds too, before it or after it.
+    for other in ["GameData/Objects/work.iff", "TemplateNPCs/work.iff"] {
+        dir.file(other, &work(terminated(&["Clerk"]), 0));
+        assert!(!link(&dir), "{other}");
+        std::fs::remove_file(dir.0.join(other)).unwrap();
+    }
+    assert!(link(&dir));
+    // With no pack that mounts `ExpansionShared`, the index finds only
+    // another `work.iff`, which `careers` reads, while the original opens
+    // `Work` there still.
+    std::fs::remove_file(dir.0.join("ExpansionPack3/ExpansionPack3.far")).unwrap();
     dir.file(
         "GameData/Objects/work.iff",
         &work(terminated(&["Clerk"]), 0),
     );
-    dir.file("GameData/Objects/work.fam", b"");
+    assert!(!link(&dir));
+    // Only one, but not where the original opens `Work`.
+    std::fs::remove_file(dir.0.join("ExpansionShared/work.iff")).unwrap();
     assert!(!link(&dir));
 }
 
@@ -684,19 +768,19 @@ fn the_default_labels_hold_no_token_only_when_no_string_table_of_them_holds_a_do
     let dir = Dir::new("labels");
     let (_, _) = setup(&dir);
     let install = Install::detect(&dir.0).unwrap();
-    assert!(!sims_vm::labels_hold_no_token(&install).unwrap());
+    assert!(!sims_vm::labels_hold_no_token(&install.root).unwrap());
     let labels = |table: Vec<u8>, flags: u16| iff_with_flags(&[(b"STR#", 142, flags, table)]);
     dir.file(
         sims_vm::LABEL_FILE,
         &labels(terminated(&["OK", "Cancel"]), 0),
     );
-    assert!(sims_vm::labels_hold_no_token(&install).unwrap());
+    assert!(sims_vm::labels_hold_no_token(&install.root).unwrap());
     for (table, flags) in [
         (terminated(&["OK", "$Job"]), 0),
         (terminated(&["$Job"]), sims_formats::iff::DELETED),
     ] {
         dir.file(sims_vm::LABEL_FILE, &labels(table, flags));
-        assert!(!sims_vm::labels_hold_no_token(&install).unwrap());
+        assert!(!sims_vm::labels_hold_no_token(&install.root).unwrap());
     }
     // A legacy CST table of the ID, which the loader falls back to
     // (0x4702c7), counts too; one of another ID does not.
@@ -708,9 +792,18 @@ fn the_default_labels_hold_no_token_only_when_no_string_table_of_them_holds_a_do
                 (b"\0CST", id, 0, b"$Job".to_vec()),
             ]),
         );
-        assert_eq!(sims_vm::labels_hold_no_token(&install).unwrap(), holds);
+        assert_eq!(sims_vm::labels_hold_no_token(&install.root).unwrap(), holds);
     }
     dir.file(sims_vm::LABEL_FILE, &labels(terminated(&["OK"]), 0));
-    dir.file("GameData/UIText.fam", b"");
-    assert!(!sims_vm::labels_hold_no_token(&install).unwrap());
+    assert!(sims_vm::labels_hold_no_token(&install.root).unwrap());
+    // Any other component of the `UIText` set beside it.
+    for companion in ["UIText.fam", "uitext.wll", "UIText.flr", "UIText.dir"] {
+        let path = format!("GameData/{companion}");
+        dir.file(&path, b"");
+        assert!(
+            !sims_vm::labels_hold_no_token(&install.root).unwrap(),
+            "{companion}"
+        );
+        std::fs::remove_file(dir.0.join(&path)).unwrap();
+    }
 }

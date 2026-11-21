@@ -484,13 +484,13 @@ impl Machine<'_, '_> {
     ///
     /// The table is the one the original's loader finds
     /// ([`crate::program::Library::loaded_strings`]): the resource of the
-    /// ID, its entries in the loader's order. Two of the loader's ways are
+    /// ID, its entries in the loader's order. The loader's other ways are
     /// not ported, and fail loudly when the dialog names a string: a
-    /// table whose entries have a language and none is US English, which
-    /// it reads again for English (0x47006b to 0x4700d0;
-    /// [`crate::program::Library::english_fallback`]), and a file with no
-    /// STR# 301 but a legacy CST 301, which it reads instead (0x4702c7;
-    /// [`crate::program::Library::legacy_strings`]).
+    /// table it reads otherwise, such as one whose entries have a language
+    /// and none is US English, which it reads again for English (0x47006b
+    /// to 0x4700d0; [`crate::program::Library::unported_strings`]), and a
+    /// file with no STR# 301 but a legacy CST 301, which it reads instead
+    /// (0x4702c7; [`crate::program::Library::legacy_strings`]).
     pub(crate) fn dialog_strings(&self, operands: &[u8; 8]) -> Result<Vec<String>, Trap> {
         const TABLE: u16 = 301;
         let owner = self.owner(self.frame()?)?;
@@ -518,13 +518,10 @@ impl Machine<'_, '_> {
             .chain(mode_4)
             .any(|&operand| operands[operand] != 0);
         if named && let Some(library) = library {
-            if library.english_fallback.contains(&TABLE) {
-                return Err(Trap::Unsupported(
-                    "a dialog's STR# 301 has entries with a language and none in US English, \
-                     which the original's loader reads again for English (0x47006b to \
-                     0x4700d0): not ported"
-                        .into(),
-                ));
+            if let Some(why) = library.unported_strings.get(&TABLE) {
+                return Err(Trap::Unsupported(format!(
+                    "a dialog's STR# 301 {why}: not ported"
+                )));
             }
             if strings.is_none() && library.legacy_strings.contains(&TABLE) {
                 return Err(Trap::Unsupported(

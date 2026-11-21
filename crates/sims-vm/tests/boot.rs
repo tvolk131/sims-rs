@@ -1566,7 +1566,7 @@ fn the_default_button_labels_hold_no_token() {
     // `GameData/UIText.iff` (0x435fee, 0x43600a, 0x436a21), and the
     // formatter (0x44bf1a) reads it as it reads the others. The port
     // leaves those strings out of the formatter's work
-    // (`Machine::dialog_strings`) only when the boot finds no table of
+    // (`Machine::dialog_strings`) only when the link finds no table of
     // them holding a `$` (`Program::labels_hold_no_token`), and fails
     // loudly otherwise. The install's labels, in US English (language 1),
     // hold no `$`, so no token.
