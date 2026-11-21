@@ -178,6 +178,7 @@ use crate::hit::{Instruction, Operand};
 use crate::levels::{self, Inputs, Levels};
 use crate::module::Module;
 use crate::placement::{self, Projection};
+use crate::registry::Registry;
 use crate::stations::StationLists;
 use crate::{Pcm, SoundEvent};
 use std::collections::{BTreeMap, BTreeSet};
@@ -583,6 +584,35 @@ fn xorshift(state: &mut u64, below: u32) -> u32 {
 
 /// Spreads a seed over all 64 bits (splitmix64), so nearby seeds start
 /// far apart. Never 0, which xorshift cannot leave.
+/// The registry of patch and track objects as the original fills it at
+/// startup: the base game's tables, then the station patches, then the
+/// expansions' and the downloads' tables ([`Registry::rank`]), each
+/// module's in file order. Modules of one rank keep their order here.
+fn registry(modules: &[Module], station_patches: &[u32]) -> Registry {
+    let mut ranked: Vec<(usize, &Module)> = modules
+        .iter()
+        .map(|m| (Registry::rank(&m.name), m))
+        .collect();
+    ranked.sort_by_key(|&(rank, _)| rank);
+    let mut registry = Registry::new();
+    for &(_, module) in ranked.iter().filter(|&&(rank, _)| rank == 0) {
+        module
+            .hot
+            .registered
+            .iter()
+            .for_each(|&id| registry.insert(id));
+    }
+    station_patches.iter().for_each(|&id| registry.insert(id));
+    for &(_, module) in ranked.iter().filter(|&&(rank, _)| rank > 0) {
+        module
+            .hot
+            .registered
+            .iter()
+            .for_each(|&id| registry.insert(id));
+    }
+    registry
+}
+
 fn splitmix(seed: u64) -> u64 {
     let mut z = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -612,6 +642,11 @@ pub struct Player<S> {
     /// Patch ID to (module, path), the first module's winning.
     patches: BTreeMap<u32, (usize, String)>,
     hit_lists: BTreeMap<u32, Vec<u32>>,
+    /// *(code)* The registry of patch and track objects (manager +0x80),
+    /// for the order the unpause goes through them.
+    registry: Registry,
+    /// The station patches added, in the order they were made.
+    station_patches: Vec<u32>,
     cache: BTreeMap<u32, Option<Pcm>>,
     globals: [i32; 256 - GLOBALS as usize],
     threads: Vec<Thread>,
@@ -704,11 +739,14 @@ impl<S: Samples> Player<S> {
                 hit_lists.entry(id).or_insert_with(|| list.clone());
             }
         }
+        let registry = registry(&modules, &[]);
         Self {
             modules,
             samples,
             patches,
             hit_lists,
+            registry,
+            station_patches: Vec::new(),
             cache: BTreeMap::new(),
             globals: [0; 256 - GLOBALS as usize],
             threads: Vec::new(),
@@ -1260,7 +1298,13 @@ impl<S: Samples> Player<S> {
         }
         for (&id, path) in &lists.patches {
             self.patches.entry(id).or_insert_with(|| (0, path.clone()));
+            // Numbered in the order they are made, each registered then
+            // (0x574f0e).
+            self.station_patches.push(id);
         }
+        // The original builds the stations between the base game's
+        // tables and the expansions' ([`crate::registry`]).
+        self.registry = registry(&self.modules, &self.station_patches);
     }
 
     /// Acts on one event from the simulation. `sources` is where the
@@ -1644,19 +1688,44 @@ impl<S: Samples> Player<S> {
     /// left it until a thread asks again.
     ///
     /// The original lets go of the tracks in the order of its registry of
-    /// track objects (0x57cd56 to 0x57cd82), a hash table walked bucket
-    /// by bucket (0x5807c2, 0x576be5; a track's bucket is its number
-    /// modulo their count, 0x4c93ac). Each let go is put last in the list
-    /// of running tracks, so from the next block the tracks run in that
-    /// order. Here it is the order of their numbers, which is the
-    /// registry's while it has more buckets than the largest number; the
-    /// count of buckets is **unverified**.
+    /// patch and track objects (0x57cd56 to 0x57cd82): bucket by bucket,
+    /// a track's bucket being its number modulo their count, and each
+    /// bucket from its head, as [`crate::registry`] replays them. With
+    /// the whole install registered there are 24,593 buckets, so the
+    /// order is not the tracks' numbers. Each let go is put last in the list of
+    /// running tracks, so from the next block the tracks run in that
+    /// order.
+    ///
+    /// A track no module lists has no place in the registry; such
+    /// tracks go last, by number. **Unverified:** the order the original
+    /// takes the files of one directory in, and the downloads' order
+    /// (here, by name).
     pub fn unpause(&mut self) {
         self.paused = false;
         self.held.clear();
-        let mut running: Vec<(u32, u32)> = self.threads.iter().map(|t| (t.track, t.id)).collect();
+        let running: BTreeSet<u32> = self.threads.iter().map(|t| t.track).collect();
+        let mut place: BTreeMap<u32, usize> = BTreeMap::new();
+        for (at, id) in self.registry.order().enumerate() {
+            if running.contains(&id) {
+                place.insert(id, at);
+            }
+            if place.len() == running.len() {
+                break;
+            }
+        }
+        let mut running: Vec<(usize, u32, u32)> = self
+            .threads
+            .iter()
+            .map(|t| {
+                (
+                    place.get(&t.track).copied().unwrap_or(usize::MAX),
+                    t.track,
+                    t.id,
+                )
+            })
+            .collect();
         running.sort_unstable();
-        let ids: Vec<u32> = running.into_iter().map(|(_, id)| id).collect();
+        let ids: Vec<u32> = running.into_iter().map(|(_, _, id)| id).collect();
         self.let_go(&ids);
         if let Some(current) = self.ambience {
             self.with_score(current, |score, _| score.set_paused(false));
@@ -1666,6 +1735,12 @@ impl<S: Samples> Player<S> {
     /// Whether the sound is paused (kind 21 since the last 22).
     pub fn is_paused(&self) -> bool {
         self.paused
+    }
+
+    /// The registry of patch and track objects, which orders the
+    /// unpause ([`Player::unpause`]).
+    pub fn registry(&self) -> &Registry {
+        &self.registry
     }
 
     /// Kind 20: *(code)* ends every track at once, forgets every object

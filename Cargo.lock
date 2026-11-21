@@ -1621,6 +1621,7 @@ name = "sims-game"
 version = "0.1.0"
 dependencies = [
  "cpal",
+ "sha2",
  "sims-audio",
  "sims-content",
  "sims-core",
