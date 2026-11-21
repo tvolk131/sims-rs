@@ -5,9 +5,11 @@
 The test `crates/sims-game/tests/ratchet.rs` boots the Goth house once,
 runs it to each scene's tick, draws the frame at the scene's camera and
 compares it pixel for pixel with a frozen screenshot of the original. The
-scenes are in `crates/sims-game/tests/ratchet.txt`, which holds numbers and
-hashes only. The screenshots are private, stay under `cache/ratchet/` and
-never enter the repository.
+scenes are in `crates/sims-game/tests/ratchet.txt`: each scene's settings,
+a line about what it shows, the screenshot's file name and SHA-256, our
+frame's SHA-256, the rectangles left out with their reasons, and the
+floors. No pixels are in it. The screenshots are private, stay under
+`cache/ratchet/` and never enter the repository.
 
 ## Scenes
 
@@ -84,15 +86,27 @@ Each scene names its rectangles and why:
   new capture needs a new hash and the reason in its PR.
 - Our frame's SHA-256 is pinned. Any drawing change re-pins it with
   `SIMS_RATCHET_UPDATE=1`, and the PR body gives the new shares.
-- A share below its floor fails. Update mode raises floors to the share
-  reached and never lowers one; lowering a floor is a hand edit, with the
+- A share below its floor fails. Floors are kept in hundredths of a
+  percent and compared as whole numbers. Update mode raises floors to the
+  share reached and never lowers or removes one, and when any check fails
+  it writes nothing. Lowering or removing a floor is a hand edit, with the
   reason in the PR body.
+- A class with pixels must have a floor, and a class with none must not.
+  A new scene starts with `floors = none`, and its first update sets them.
+- The manifest is strict: an unknown or repeated setting, a setting
+  before the first scene, no scenes at all, a floor without exactly two
+  decimals, or a rectangle that is not inside the frame stops the run.
 - `SIMS_RATCHET_DIFF=<folder>` writes difference images (pixels that
-  differ in magenta, the rest ours in grey). The folder must be under
+  differ in magenta, the rest ours in grey). The folder must exist under a
+  folder named `cache`, outside the checkout's files or in its own
   `cache/`.
+- The test follows libtest's filters, `--exact`, `--skip` and `--ignored`,
+  and skips flag values such as `--test-threads 1`, so a cargo flag cannot
+  filter it out by accident.
 - `scripts/check_repository.py` now rejects image files, by suffix or by
-  content, in any `tests`, `test`, `fixtures`, `testdata`, `test-data` or
-  `test_data` folder.
+  content (raster formats, netpbm headers with comments, SVG), in any
+  `tests`, `test`, `fixtures`, `testdata`, `test-data` or `test_data`
+  folder.
 
 ## Running it
 

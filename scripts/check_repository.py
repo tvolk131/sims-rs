@@ -57,18 +57,26 @@ FORBIDDEN_SUFFIXES = {
 }
 # Screenshots and other pictures never go in a test or fixture path: the
 # screenshot ratchet keeps its references, and its difference images, under
-# cache/. Raster formats by name, and by their first bytes whatever the name
-# (an ASCII PPM is text, so the binary check alone would not catch it).
+# cache/. Image formats by name, and by their first bytes whatever the name
+# (an ASCII PPM or an SVG is text, so the binary check alone would not
+# catch it). A netpbm header may put a comment between any two fields.
 TEST_DIRECTORIES = {"tests", "test", "fixtures", "testdata", "test-data", "test_data"}
 IMAGE_SUFFIXES = {
-    ".avif", ".bmp", ".dds", ".exr", ".gif", ".heic", ".ico", ".jpeg", ".jpg",
-    ".pam", ".pbm", ".pgm", ".png", ".pnm", ".ppm", ".qoi", ".tga", ".tif",
-    ".tiff", ".webp",
+    ".avif", ".bmp", ".dds", ".exr", ".gif", ".heic", ".heif", ".ico", ".jpeg",
+    ".jpg", ".jxl", ".pam", ".pbm", ".pgm", ".png", ".pnm", ".ppm", ".psd",
+    ".qoi", ".svg", ".svgz", ".tga", ".tif", ".tiff", ".webp", ".xcf",
 }
+NETPBM_GAP = rb"(?:\s|#[^\n]*(?:\n|\Z))+"
 IMAGE_MAGIC = re.compile(
-    rb"\A(?:\x89PNG\r\n\x1a\n|GIF8[79]a|\xff\xd8\xff|P[1-7]\s+(?:#[^\n]*\n\s*)*\d+\s+\d+"
-    rb"|II\*\0|MM\0\*|qoif|RIFF....WEBP)",
+    rb"\A(?:\x89PNG\r\n\x1a\n|GIF8[79]a|\xff\xd8\xff"
+    rb"|P[1-6]" + NETPBM_GAP + rb"\d+" + NETPBM_GAP + rb"\d+"
+    rb"|P7" + NETPBM_GAP + rb"(?:WIDTH|HEIGHT|DEPTH|MAXVAL|TUPLTYPE|ENDHDR)"
+    rb"|II\*\0|MM\0\*|qoif|RIFF....WEBP|8BPS|gimp xcf)",
     re.DOTALL,
+)
+SVG_MAGIC = re.compile(
+    rb"\A(?:\xef\xbb\xbf)?\s*(?:<\?xml.*?\?>\s*)?(?:(?:<!--.*?-->|<!DOCTYPE[^>]*>)\s*)*<svg[\s>]",
+    re.DOTALL | re.IGNORECASE,
 )
 HEX_RUN = re.compile(rb"(?<![0-9a-fA-F])[0-9a-fA-F]{16,}(?![0-9a-fA-F])")
 BYTE_ARRAY = re.compile(rb"\[\s*(?:0x[0-9a-fA-F]{1,2}|\d{1,3})(?:\s*,\s*(?:0x[0-9a-fA-F]{1,2}|\d{1,3})){2,}\s*,?\s*\]")
@@ -190,7 +198,7 @@ def check_blob(root, policy, name, content, object_id=None, history=False):
             content.decode("utf-8")
         except UnicodeDecodeError:
             violations.append(f"{name}: non-UTF-8 binary content is not admitted by the source-only policy")
-    if in_test_directory(name) and IMAGE_MAGIC.match(content):
+    if in_test_directory(name) and (IMAGE_MAGIC.match(content) or SVG_MAGIC.match(content)):
         violations.append(
             f"{name}: image content in a test or fixture path (screenshots stay under cache/)"
         )

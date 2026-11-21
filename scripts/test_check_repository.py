@@ -327,7 +327,7 @@ class RepositoryHygieneTests(unittest.TestCase):
     def test_images_are_rejected_in_test_and_fixture_paths(self):
         for name in [
             "crates/sims-game/tests/scene.ppm", "crates/sims-game/tests/data/scene.tiff",
-            "fixtures/shot.png", "crates/x/testdata/shot.qoi",
+            "fixtures/shot.png", "crates/x/testdata/shot.qoi", "tests/scene.svg",
         ]:
             with self.subTest(name=name):
                 path = self.write(name, "small")
@@ -337,7 +337,10 @@ class RepositoryHygieneTests(unittest.TestCase):
     def test_image_content_is_rejected_in_test_paths_whatever_the_name(self):
         for content in [
             "P3\n2 1\n255\n0 0 0 255 255 255\n", "P6 # comment\n800 600\n255\n",
-            b"\x89PNG\r\n\x1a\nrest", b"GIF89a....",
+            "P3\n2\n# a comment between the width and the height\n1\n255\n0 0 0 1 1 1\n",
+            "P6#comment\n800 600 255\n", "P7\nWIDTH 2\nHEIGHT 1\nENDHDR\n",
+            '<?xml version="1.0"?>\n<!-- drawn -->\n<svg xmlns="http://www.w3.org/2000/svg"/>\n',
+            "<SVG width='1'></SVG>", b"\x89PNG\r\n\x1a\nrest", b"GIF89a....",
         ]:
             with self.subTest(content=content):
                 path = self.write("crates/sims-game/tests/scene.txt", content)
@@ -346,6 +349,8 @@ class RepositoryHygieneTests(unittest.TestCase):
 
     def test_text_that_is_not_an_image_passes_in_test_paths(self):
         self.write("crates/sims-game/tests/ratchet.txt", "[scene]\ntick = 1260\nP6 is a word\n")
+        self.write("crates/sims-game/tests/words.txt", "P6 is a word, not a header\n")
+        self.write("crates/sims-game/tests/render.rs", 'const SVG: &str = "<svg>";\n')
         self.write("src/picture.ppm.rs", "// a source file\n")
         self.assert_passes()
 
