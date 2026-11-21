@@ -13,7 +13,7 @@ use sims_vm::lifecycle::{
     LifecycleError, bulldoze, enter_lot, evict, lot_price, move_in, move_in_with_multiplier,
     save_and_leave_lot,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -128,6 +128,8 @@ fn move_in_unit_validation_and_accounting() {
         zoning,
         lot_rows: vec![4, 5, 8, 21],
         made_characters: Characters::default(),
+        deleted_characters: BTreeSet::new(),
+        instance_id: 1,
         revision: 0,
     };
     store.save_neighborhood("TestNH", &nh).unwrap();
@@ -339,9 +341,9 @@ fn move_in_enter_save_and_evict_family_bin_household_on_empty_lot() {
     assert_eq!(moved.budget_after, 14_500);
     assert_eq!(moved.architecture_value, 5_500);
 
-    // First entry runs flag-4 move-in reset (0x42848d..0x4284f9).
-    let no_frames = Frames::parse("none").unwrap();
-    let mut lot4 = enter_lot(&root, &store, "UserData", 4, &[3], no_frames).unwrap();
+    // First entry runs flag-4 move-in reset (0x42848d..0x4284f9) and steps
+    // cleanly with `Frames::default()`.
+    let mut lot4 = enter_lot(&root, &store, "UserData", 4, &[3], Frames::default()).unwrap();
     assert_eq!(lot4.world().globals[0], 7, "new family start hour = 7:00");
     assert_eq!(lot4.world().globals[5], 0, "minutes = 0");
     assert_eq!(lot4.world().globals[17], 0, "unpaused");
@@ -418,11 +420,10 @@ fn evict_then_bulldoze_goth_house_5_and_re_move_in() {
     );
 
     // 1b. Move Goths back onto the EVICTED saved lot and verify all 3 family
-    //     members actually arrive via `visit_objects` (`Portal - Pedestrian`)!
+    //     members arrive, one is selected, and strict `Frames::default()` steps cleanly!
     let moved_shell = move_in(&root, &store, "UserData", 5, 5).unwrap();
     assert_eq!(moved_shell.lot_price, shell_price);
-    let no_frames = Frames::parse("none").unwrap();
-    let mut shell_lot = enter_lot(&root, &store, "UserData", 5, &[3], no_frames.clone()).unwrap();
+    let mut shell_lot = enter_lot(&root, &store, "UserData", 5, &[3], Frames::default()).unwrap();
     assert_eq!(
         shell_lot.world().people.len(),
         3,
@@ -456,7 +457,7 @@ fn evict_then_bulldoze_goth_house_5_and_re_move_in() {
     );
     // Deleted tombstone GUID (0x7757D9EE) must stay gone when entering another lot.
     let newbie_after_doze =
-        enter_lot(&root, &store, "UserData", 7, &[3], no_frames.clone()).unwrap();
+        enter_lot(&root, &store, "UserData", 7, &[3], Frames::default()).unwrap();
     assert!(
         newbie_after_doze
             .world()
@@ -467,13 +468,13 @@ fn evict_then_bulldoze_goth_house_5_and_re_move_in() {
     );
 
     // 3. Move the Goths back onto their freshly bulldozed lot and verify all 3
-    //    Goth members arrive and one is selected!
+    //    Goth members arrive, one is selected, and `Frames::default()` steps cleanly!
     let nh_after_doze = store.load_neighborhood("UserData").unwrap().unwrap();
     let goth_budget_after_doze = nh_after_doze.families[&5].budget;
     let moved_back = move_in(&root, &store, "UserData", 5, 5).unwrap();
     assert_eq!(moved_back.lot_price, 7_000);
     assert_eq!(moved_back.budget_after, goth_budget_after_doze - 7_000);
-    let mut lot5 = enter_lot(&root, &store, "UserData", 5, &[3], no_frames).unwrap();
+    let mut lot5 = enter_lot(&root, &store, "UserData", 5, &[3], Frames::default()).unwrap();
     assert_eq!(lot5.world().budget.funds, goth_budget_after_doze - 7_000);
     assert_eq!(lot5.world().globals[0], 7);
     assert_eq!(
@@ -646,6 +647,251 @@ fn userdata2_v7_family_upgrades_to_v9_and_persists_magic_history() {
             "all families upgrade to v9 on save (0x410696)"
         );
     }
+}
+
+#[test]
+fn concurrent_move_in_only_allows_one_winner() {
+    let db = TempDb::new("concurrent-move-in");
+    let store = std::sync::Arc::new(NeighborhoodStore::open(&db.0).unwrap());
+
+    let mut families = BTreeMap::new();
+    families.insert(2, synthetic_family(0, 20_000, 0, vec![0xAAA1], 0));
+    families.insert(5, synthetic_family(0, 20_000, 0, vec![0xBBB1], 0));
+    let mut zoning = BTreeMap::new();
+    zoning.insert(4, 1);
+    let nh = StoredNeighborhood {
+        name: "Race".into(),
+        families,
+        neighbors: Vec::new(),
+        inventories: Vec::new(),
+        data: [0; 16],
+        options: None,
+        type_attributes: None,
+        zoning,
+        lot_rows: vec![4],
+        made_characters: Characters::default(),
+        deleted_characters: BTreeSet::new(),
+        instance_id: 77,
+        revision: 0,
+    };
+    store.save_neighborhood("Race", &nh).unwrap();
+    store
+        .save_base_house("Race", 4, &synthetic_house_iff(5_500, 0, 0))
+        .unwrap();
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let s1 = std::sync::Arc::clone(&store);
+    let b1 = std::sync::Arc::clone(&barrier);
+    let t1 = std::thread::spawn(move || {
+        b1.wait();
+        move_in_with_multiplier(&s1, "Race", 2, 4, DEFAULT_ARCH_VALUE_MULTIPLIER)
+    });
+    let s2 = std::sync::Arc::clone(&store);
+    let b2 = std::sync::Arc::clone(&barrier);
+    let t2 = std::thread::spawn(move || {
+        b2.wait();
+        move_in_with_multiplier(&s2, "Race", 5, 4, DEFAULT_ARCH_VALUE_MULTIPLIER)
+    });
+    let r1 = t1.join().unwrap();
+    let r2 = t2.join().unwrap();
+    assert_eq!(
+        usize::from(r1.is_ok()) + usize::from(r2.is_ok()),
+        1,
+        "concurrent move_in into the same house must yield exactly one winner: r1={r1:?} r2={r2:?}"
+    );
+    let after = store.load_neighborhood("Race").unwrap().unwrap();
+    assert_eq!(after.revision, 1);
+    let winner = if r1.is_ok() { 2 } else { 5 };
+    let loser = if r1.is_ok() { 5 } else { 2 };
+    assert_eq!(after.families[&winner].house, 4);
+    assert_eq!(after.families[&loser].house, 0);
+}
+
+#[test]
+fn reimport_cross_store_and_restore_cannot_bypass_save_guards() {
+    let Some(root) = install() else {
+        return;
+    };
+    let db_a = TempDb::new("guard-store-a");
+    let db_b = TempDb::new("guard-store-b");
+    let store_a = NeighborhoodStore::open(&db_a.0).unwrap();
+    let store_b = NeighborhoodStore::open(&db_b.0).unwrap();
+    store_a
+        .import_directory("same_id", &root.join("UserData"), 0xff)
+        .unwrap();
+    store_b
+        .import_directory("same_id", &root.join("UserData"), 0xff)
+        .unwrap();
+    let no_frames = Frames::parse("none").unwrap();
+
+    // 1. Cross-store save with the SAME neighborhood ID and revision 0 is rejected.
+    let mut goth_a = enter_lot(&root, &store_a, "same_id", 5, &[3], no_frames.clone()).unwrap();
+    let b_before = store_b.load_neighborhood("same_id").unwrap().unwrap();
+    assert!(matches!(
+        save_and_leave_lot(&root, &store_b, "same_id", &mut goth_a),
+        Err(LifecycleError::NeighborhoodMismatch { .. })
+    ));
+    assert_eq!(
+        store_b.load_neighborhood("same_id").unwrap().unwrap(),
+        b_before
+    );
+    assert!(store_b.load_saved_lot("same_id", 5).unwrap().is_none());
+
+    // 2. Re-importing a different neighborhood (`UserData2`) under the SAME ID
+    //    and revision 0 invalidates the previously opened lot.
+    store_a
+        .import_directory("same_id", &root.join("UserData2"), 0xff)
+        .unwrap();
+    let ud2_before = store_a.load_neighborhood("same_id").unwrap().unwrap();
+    assert!(matches!(
+        save_and_leave_lot(&root, &store_a, "same_id", &mut goth_a),
+        Err(LifecycleError::NeighborhoodMismatch { .. })
+    ));
+    assert_eq!(
+        store_a.load_neighborhood("same_id").unwrap().unwrap(),
+        ud2_before
+    );
+
+    // 3. Restoring an older lot snapshot via `Lot::restore` clears store origin
+    //    so Save & Leave cannot overwrite a newer committed `move_in`.
+    let db_c = TempDb::new("guard-restore");
+    let store_c = NeighborhoodStore::open(&db_c.0).unwrap();
+    store_c
+        .import_directory("UserData", &root.join("UserData"), 0xff)
+        .unwrap();
+    let mut goth_v0 = enter_lot(&root, &store_c, "UserData", 5, &[3], no_frames.clone()).unwrap();
+    save_and_leave_lot(&root, &store_c, "UserData", &mut goth_v0).unwrap();
+    let old_snapshot = goth_v0.save().unwrap();
+    move_in(&root, &store_c, "UserData", 2, 4).unwrap();
+    let mut goth_v1 = enter_lot(&root, &store_c, "UserData", 5, &[3], no_frames).unwrap();
+    goth_v1.restore(old_snapshot).unwrap();
+    assert!(
+        matches!(
+            save_and_leave_lot(&root, &store_c, "UserData", &mut goth_v1),
+            Err(LifecycleError::Lot(_))
+        ),
+        "saving a lot after Lot::restore must be rejected"
+    );
+    let after_c = store_c.load_neighborhood("UserData").unwrap().unwrap();
+    assert_eq!(after_c.families[&2].house, 4);
+}
+
+#[test]
+fn bulldozed_made_and_far_tombstones_never_reappear_and_inline_chars_are_writable() {
+    let Some(root) = install() else {
+        return;
+    };
+    let db = TempDb::new("bulldoze-tombstone-persistence");
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    store
+        .import_directory("UserData", &root.join("UserData"), 0xff)
+        .unwrap();
+    let no_frames = Frames::parse("none").unwrap();
+
+    // 1. Add a runtime-made tombstone bound to House 5, save House 7 so the
+    //    saved House 7 snapshot contains `0xDEADBEEF` in its world.characters.
+    let mut nh = store.load_neighborhood("UserData").unwrap().unwrap();
+    let template_guid = nh.families[&5].members[0];
+    let made_guid = 0xDEAD_BEEFu32;
+    let next_id = nh
+        .neighbors
+        .iter()
+        .flatten()
+        .map(|n| n.id)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    nh.made_characters.made.insert(
+        made_guid,
+        sims_sim::characters::Character {
+            template: template_guid,
+            file: 999,
+            strings: BTreeMap::new(),
+        },
+    );
+    nh.made_characters.next_file = 1000;
+    let mut pdata = vec![0i16; sims_sim::neighbors::PERSON_WORDS];
+    pdata[67] = 5; // PERSON_HOME = House 5
+    nh.neighbors
+        .push(Some(sims_formats::neighborhood::Neighbor {
+            version: 10,
+            version_extra: Some(1),
+            name: "MadeTombstone".into(),
+            unknown_zero: 0,
+            person_mode: 9,
+            person_data: pdata,
+            id: next_id,
+            guid: made_guid,
+            unknown_negative: -1,
+            relationships: Vec::new(),
+        }));
+    store.save_neighborhood("UserData", &nh).unwrap();
+
+    let mut house7 = enter_lot(&root, &store, "UserData", 7, &[3], no_frames.clone()).unwrap();
+    // Verify inline loose character libraries are writable regardless of CWD.
+    let loose_char_guid = nh.families[&5].members[0];
+    let loose_char_res = house7.catalog().object(loose_char_guid).unwrap().resource;
+    assert!(
+        house7.program().libraries[&loose_char_res].writable,
+        "inline loose character files must always have Library::writable == true"
+    );
+    save_and_leave_lot(&root, &store, "UserData", &mut house7).unwrap();
+
+    // 2. Also pack Goth tombstone `0x7757D9EE` inside a FAR archive so its bytes
+    //    stay in `NEIGHBORHOOD_CHARACTERS` even after bulldoze!
+    let chars = store.load_character_files("UserData").unwrap();
+    let (tomb_key, tomb_bytes) = chars
+        .iter()
+        .find(|(_, b)| {
+            sims_formats::iff::Iff::parse((*b).clone()).is_ok_and(|iff| {
+                iff.chunks.iter().any(|c| {
+                    &c.tag == b"OBJD"
+                        && iff.data(c).len() >= 32
+                        && u32::from_le_bytes(iff.data(c)[28..32].try_into().unwrap())
+                            == 0x7757_D9EE
+                })
+            })
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .expect("found Goth tombstone IFF");
+    let member_name = tomb_key.as_bytes();
+    let data_offset = 16u32;
+    let manifest_offset = data_offset + tomb_bytes.len() as u32;
+    let mut far = Vec::new();
+    far.extend_from_slice(b"FAR!byAZ");
+    far.extend_from_slice(&1u32.to_le_bytes());
+    far.extend_from_slice(&manifest_offset.to_le_bytes());
+    far.extend_from_slice(&tomb_bytes);
+    far.extend_from_slice(&1u32.to_le_bytes());
+    far.extend_from_slice(&(tomb_bytes.len() as u32).to_le_bytes());
+    far.extend_from_slice(&(tomb_bytes.len() as u32).to_le_bytes());
+    far.extend_from_slice(&data_offset.to_le_bytes());
+    far.extend_from_slice(&(member_name.len() as u32).to_le_bytes());
+    far.extend_from_slice(member_name);
+    store
+        .save_character_file("UserData", "tombstone_pack.far", &far)
+        .unwrap();
+
+    // 3. Bulldoze House 5: removes BOTH `0xDEADBEEF` and `0x7757D9EE`.
+    bulldoze(&root, &store, "UserData", 5).unwrap();
+
+    // 4. Re-enter & re-save the pre-existing saved House 7, then re-enter again:
+    //    neither `0xDEADBEEF` nor FAR-archived `0x7757D9EE` may reappear!
+    let mut house7_re = enter_lot(&root, &store, "UserData", 7, &[3], no_frames.clone()).unwrap();
+    assert!(house7_re.world().neighbors.first_of(made_guid).is_none());
+    assert!(!house7_re.world().characters.made.contains_key(&made_guid));
+    assert!(house7_re.world().neighbors.first_of(0x7757_D9EE).is_none());
+    save_and_leave_lot(&root, &store, "UserData", &mut house7_re).unwrap();
+
+    let house7_again = enter_lot(&root, &store, "UserData", 7, &[3], no_frames).unwrap();
+    assert!(house7_again.world().neighbors.first_of(made_guid).is_none());
+    assert!(
+        house7_again
+            .world()
+            .neighbors
+            .first_of(0x7757_D9EE)
+            .is_none()
+    );
 }
 
 #[test]

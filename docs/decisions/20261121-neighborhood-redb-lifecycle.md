@@ -43,10 +43,12 @@ recursive directory / inline `.far` mounting, Windows-1252 key encoding, and
 
 - Total lot value (used for `FAMI.architecture_value` on save, lot purchase
   price on Move-In, and net worth during play):
-  `lot_value + objects_value + trunc(((architecture_value as f64) * (mult as f64)) as f32)`,
+  `lot_value + objects_value + trunc((Ext::from_i32(architecture_value) * F32(mult).ext()).single())`,
   where `mult` is `Global.far` `FCNS #4` `"architecture value multiplier"`
-  (`0x6e4a88` = `0.7f`, `0x3f333333`) matching x87 `fild` (exact integer load)
-  followed by `fmul dword ptr` rounded to 24-bit `f32` precision and `__ftol`.
+  (`0x6e4a88` = `0.7f`, `0x3f333333`) using exact 64-bit-significand x87
+  extended multiplication (`31 + 24 = 55 <= 64` bits, zero double-rounding)
+  followed by a single round-to-nearest-even to 24-bit `f32` and `__ftol`
+  truncation toward zero.
 - Pool pricing (`0x47b1cc`): `pool[cell] < 0x10` adds `prices.pool` and sets
   built (`globals[22] = 1`); `pool[cell] == 0x10` marks the lot built at zero
   cost.
@@ -58,11 +60,15 @@ recursive directory / inline `.far` mounting, Windows-1252 key encoding, and
 
 ### Save & Leave Writeback (`0x428687` → `0x41615d` → `0x43fb1b` → `0x4252cc`)
 
-1. Verify `lot.neighborhood_origin` matches `neighborhood_id`
-   (`LifecycleError::NeighborhoodMismatch`) and matches the store's current
+1. Verify `lot.neighborhood_origin` matches the store's persistent 128-bit
+   `store_id`, `neighborhood_id`, and `instance_id`
+   (`LifecycleError::NeighborhoodMismatch`), and matches the store's current
    `revision` both before serialization and inside the REDB write transaction
-   (`LifecycleError::StaleNeighborhood`), preventing cross-neighborhood
-   corruption or silent lost updates from stale open lots.
+   (`LifecycleError::StaleNeighborhood`), preventing cross-store writes,
+   same-ID re-import overwrites, or silent lost updates from stale open lots.
+   `Lot::restore` clears `neighborhood_origin` so restoring an older snapshot
+   cannot bypass the revision guard. `move_in` likewise commits via an
+   in-transaction `(instance_id, revision)` check.
 2. Flush every live person on the lot into its neighborhood record via
    `people::save_to_record` (`0x459d8b` → `0x425a69`, revision 9 persistent
    fields).
@@ -114,7 +120,10 @@ error if `visit_objects` stops before finishing (`load.stopped`).
   `0x4165f3`), broadcasts `"reset lot"` (`0x444741`), refreshes visitors
   (`0x42a2b4`), and goes live.
 - Ported `0x445501` (`Interpreter::select_next_resident`) in `end_of_update` so
-  newly moved-in lots tick cleanly before and as household members arrive.
+  newly moved-in lots tick cleanly before and as household members arrive, and
+  ported the first-draw skin update (`0x5893a9` → `0x589361` at `0x58939e` →
+  `0x590d26` → `0x5992b3`) in `frame.rs` so newly arrived residents draw and
+  step cleanly with `Frames::default()`.
 
 ### Evict & Bulldoze (`0x42737e`, `0x4354d5`, `0x461a34`, `0x426fcd`)
 
@@ -143,10 +152,6 @@ error if `visit_objects` stops before finishing (`load.stopped`).
 
 ## Known Boundaries
 
-- On newly moved-in empty lots (`House04`) where load/reset creates a person
-  whose skin still awaits its first update (`0x590d26`), drawing a tick-0 frame
-  hits `frame.rs`'s existing unported `0x590d26` guard; stepping with
-  `Frames::parse("none")` or `Lot::step_play` steps cleanly.
 - `Bulldoze` resets lots in place per `0x42737e` (preserving terrain elevation
   and locked road/sidewalk tiles) rather than copying `TemplateUserData` files.
 - `cTSNeighborhood::Save` stray un-homed character deletion (`0x4287b9`) and

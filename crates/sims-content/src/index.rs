@@ -66,6 +66,14 @@ impl Resource {
         }
     }
 
+    /// Whether this resource's bytes are held in memory rather than read from a
+    /// path on disk (for example, neighborhood character files loaded from a
+    /// persistence store).
+    #[must_use]
+    pub fn is_inline(&self) -> bool {
+        self.inline.is_some()
+    }
+
     /// Reads the resource. A resource larger than [`far::MAX_MEMBER`] and a
     /// member that no longer lies inside
     /// its archive (the file changed since it was indexed) fail.
@@ -229,10 +237,18 @@ impl Index {
         }
         let mut root_node = InlineNode::default();
         for (rel_path, bytes) in files {
+            let is_dir = rel_path.ends_with('/') || rel_path.ends_with('\\');
             let parts: Vec<&str> = rel_path
                 .split(['/', '\\'])
                 .filter(|s| !s.is_empty())
                 .collect();
+            if is_dir {
+                let mut node = &mut root_node;
+                for &dir in &parts {
+                    node = node.subdirs.entry(dir).or_default();
+                }
+                continue;
+            }
             let Some((&file_name, dirs)) = parts.split_last() else {
                 continue;
             };

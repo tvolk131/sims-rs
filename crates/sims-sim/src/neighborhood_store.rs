@@ -23,15 +23,56 @@ use crate::characters::Characters;
 use crate::{Error, Result, World};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sims_content::Neighborhood;
+use sims_core::{Ext, F32};
 use sims_formats::iff::Iff;
 use sims_formats::lot::Simulator;
 use sims_formats::neighborhood::{
     Family, Inventory, InventoryItem, Neighbor, Relationship as SavedRelationship,
 };
 use sims_formats::tatt::{Entry as TattEntry, Tatt};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Key inside [`NEIGHBORHOOD_META`] holding this REDB store's persistent
+/// 128-bit identity (little-endian bytes).
+const STORE_ID_KEY: &str = "store_id";
+
+static NEXT_UNIQUE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Generates a fresh 128-bit identity unique across re-imports and separate
+/// store files without touching the wall clock.
+fn fresh_unique_id(tag: &str, previous: u128, seed: &[u8]) -> u128 {
+    let seq = NEXT_UNIQUE_ID.fetch_add(1, Ordering::Relaxed);
+    let mut hasher = Sha256::new();
+    hasher.update(tag.as_bytes());
+    hasher.update(std::process::id().to_le_bytes());
+    hasher.update(previous.to_le_bytes());
+    hasher.update(seq.to_le_bytes());
+    hasher.update(seed);
+    let digest = hasher.finalize();
+    let bytes: [u8; 16] = digest[..16].try_into().expect("sha256 is 32 bytes");
+    let mut id = u128::from_le_bytes(bytes);
+    if id == 0 || id == previous {
+        id = previous.wrapping_add(1);
+        if id == 0 {
+            id = 1;
+        }
+    }
+    id
+}
+
+/// Reason a checked neighborhood write was rejected inside its REDB write
+/// transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckedCommitError {
+    /// The neighborhood ID was re-imported or replaced by a different instance.
+    InstanceMismatch { expected: u128, current: u128 },
+    /// Another operation committed a newer revision to the same instance.
+    RevisionMismatch { expected: u64, current: u64 },
+}
 
 /// Versioned `StoredNeighborhood` metadata keyed by neighborhood ID.
 const NEIGHBORHOODS: TableDefinition<&str, &[u8]> = TableDefinition::new("neighborhoods");
@@ -91,10 +132,9 @@ pub const FAMILY_FLAG_BIT_3: u32 = 1 << 3;
 /// `0x4272c5`, `0x427f78`, `0x4282bc`):
 /// `fild architecture_value; fmul dword ptr [0x6e4a88]; call __ftol`.
 ///
-/// `fild` loads the 32-bit integer into x87 exactly without pre-rounding to
-/// 24-bit `f32`; the product with the `f32` multiplier is rounded to single
-/// precision (the original's x87 24-bit precision mode) and then truncated
-/// toward zero.
+/// Uses exact 64-bit-significand x87 extended multiplication (`31 + 24 = 55 <=
+/// 64` bits, zero intermediate rounding) followed by a single round-to-nearest-
+/// even to 24-bit `f32` and truncation toward zero.
 #[must_use]
 pub fn lot_total_value(
     lot_value: i32,
@@ -102,7 +142,10 @@ pub fn lot_total_value(
     architecture_value: i32,
     arch_multiplier: f32,
 ) -> i32 {
-    let scaled_arch = ((f64::from(architecture_value) * f64::from(arch_multiplier)) as f32) as i32;
+    let scaled_arch = (Ext::from_i32(architecture_value)
+        * F32::from_bits(arch_multiplier.to_bits()).ext())
+    .single()
+    .to_i32_truncate();
     lot_value
         .wrapping_add(objects_value)
         .wrapping_add(scaled_arch)
@@ -148,6 +191,16 @@ pub struct StoredNeighborhood {
     /// Runtime-created characters (`Make New Character`, primitive 19) persisted
     /// across lot switches.
     pub made_characters: Characters,
+    /// Character GUIDs permanently deleted via Bulldoze (`0x426fcd`) so even
+    /// characters residing inside read-only `.far` archives or multi-OBJD files
+    /// are never re-registered into `NBRS` on subsequent lot loads.
+    #[serde(default)]
+    pub deleted_characters: BTreeSet<u32>,
+    /// Unique 128-bit identity assigned on each import/creation so re-importing
+    /// a different neighborhood under the same ID invalidates previously opened
+    /// lots even when both are at revision 0.
+    #[serde(default)]
+    pub instance_id: u128,
     /// Monotonic revision bumped on each save writeback.
     pub revision: u64,
 }
@@ -200,13 +253,18 @@ impl StoredNeighborhood {
             .map(|(&id, family)| (id, family))
     }
 
-    /// Playable Family Bin households (`id != 0`, `house == 0`, non-empty
-    /// member list), in FAMI chunk ID order.
+    /// Playable Family Bin households (`id != 0`, `house == 0`,
+    /// `secondary_house() == 0`, non-empty member list), in FAMI chunk ID order.
     #[must_use]
     pub fn family_bin(&self) -> Vec<(u16, &Family)> {
         self.families
             .iter()
-            .filter(|&(&id, family)| id != 0 && family.house == 0 && !family.members.is_empty())
+            .filter(|&(&id, family)| {
+                id != 0
+                    && family.house == 0
+                    && family.secondary_house() == 0
+                    && !family.members.is_empty()
+            })
             .map(|(&id, family)| (id, family))
             .collect()
     }
@@ -445,14 +503,9 @@ impl StoredNeighborhood {
             });
         }
 
-        // 5. Runtime-made characters: merge so characters made on other lots
-        // stay intact.
-        for (&guid, character) in &world.characters.made {
-            self.made_characters.made.insert(guid, character.clone());
-        }
-        if world.characters.next_file > self.made_characters.next_file {
-            self.made_characters.next_file = world.characters.next_file;
-        }
+        // 5. Runtime-made characters: replace from the authoritative live world
+        // so bulldozed deletions are never resurrected by older lot saves.
+        self.made_characters = world.characters.clone();
 
         self.revision = self.revision.saturating_add(1);
     }
@@ -461,6 +514,7 @@ impl StoredNeighborhood {
 /// A REDB-backed multi-neighborhood and multi-lot persistence store.
 pub struct NeighborhoodStore {
     db: Database,
+    store_id: u128,
 }
 
 fn store(error: impl std::fmt::Display) -> Error {
@@ -468,11 +522,56 @@ fn store(error: impl std::fmt::Display) -> Error {
 }
 
 impl NeighborhoodStore {
-    /// Opens an existing REDB neighborhood store or creates a new one.
+    /// Opens an existing REDB neighborhood store or creates a new one,
+    /// ensuring a persistent 128-bit store identity exists in
+    /// [`NEIGHBORHOOD_META`].
     pub fn open(path: &Path) -> Result<Self> {
-        Ok(Self {
-            db: Database::create(path).map_err(store)?,
-        })
+        let db = Database::create(path).map_err(store)?;
+        let existing = {
+            let txn = db.begin_read().map_err(store)?;
+            match txn.open_table(NEIGHBORHOOD_META) {
+                Ok(table) => table
+                    .get(STORE_ID_KEY)
+                    .map_err(store)?
+                    .and_then(|v| v.value().try_into().ok())
+                    .map(u128::from_le_bytes),
+                Err(redb::TableError::TableDoesNotExist(_)) => None,
+                Err(error) => return Err(store(error)),
+            }
+        };
+        let store_id = match existing {
+            Some(id) => id,
+            None => {
+                let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+                let candidate = fresh_unique_id("store", 0, canon.to_string_lossy().as_bytes());
+                let txn = db.begin_write().map_err(store)?;
+                let committed_id = {
+                    let mut table = txn.open_table(NEIGHBORHOOD_META).map_err(store)?;
+                    if let Some(found) = table
+                        .get(STORE_ID_KEY)
+                        .map_err(store)?
+                        .and_then(|v| v.value().try_into().ok())
+                        .map(u128::from_le_bytes)
+                    {
+                        found
+                    } else {
+                        table
+                            .insert(STORE_ID_KEY, candidate.to_le_bytes().as_slice())
+                            .map_err(store)?;
+                        candidate
+                    }
+                };
+                txn.commit().map_err(store)?;
+                committed_id
+            }
+        };
+        Ok(Self { db, store_id })
+    }
+
+    /// Persistent 128-bit identity of this REDB store file.
+    #[must_use]
+    pub fn store_id(&self) -> u128 {
+        self.store_id
     }
 
     /// Imports a neighborhood directory (`UserData`, `UserData2`..`UserData8`)
@@ -495,9 +594,15 @@ impl NeighborhoodStore {
         let lot_rows = neighborhood.lot_rows().map_err(store)?;
 
         let mut characters: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        let mut character_file_count = 0usize;
         for (rel_path, path) in neighborhood.character_tree().map_err(store)? {
-            let bytes = std::fs::read(&path).map_err(store)?;
-            characters.insert(rel_path, bytes);
+            if rel_path.ends_with('/') {
+                characters.insert(rel_path, Vec::new());
+            } else {
+                let bytes = std::fs::read(&path).map_err(store)?;
+                characters.insert(rel_path, bytes);
+                character_file_count += 1;
+            }
         }
 
         let mut houses: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
@@ -506,7 +611,7 @@ impl NeighborhoodStore {
             houses.insert(number, bytes);
         }
 
-        let stored = StoredNeighborhood {
+        let mut stored = StoredNeighborhood {
             name: id.to_owned(),
             families: neighborhood.families,
             neighbors: neighborhood.neighbors,
@@ -517,20 +622,31 @@ impl NeighborhoodStore {
             zoning,
             lot_rows,
             made_characters: Characters::default(),
+            deleted_characters: BTreeSet::new(),
+            instance_id: 0,
             revision: 0,
         };
-        let encoded = stored.encode();
         let summary = ImportSummary {
             id: id.to_owned(),
             families: stored.families.len(),
             neighbors: stored.neighbors.iter().flatten().count(),
-            characters: characters.len(),
+            characters: character_file_count,
             houses: houses.len(),
         };
 
         let txn = self.db.begin_write().map_err(store)?;
         {
             let mut nh_table = txn.open_table(NEIGHBORHOODS).map_err(store)?;
+            let prev_instance = nh_table
+                .get(id)
+                .map_err(store)?
+                .and_then(|v| StoredNeighborhood::decode(id, v.value()).ok())
+                .map_or(0, |prev| prev.instance_id);
+            let mut seed = self.store_id.to_le_bytes().to_vec();
+            seed.extend_from_slice(id.as_bytes());
+            seed.extend_from_slice(directory.to_string_lossy().as_bytes());
+            stored.instance_id = fresh_unique_id("neighborhood", prev_instance, &seed);
+            let encoded = stored.encode();
             let mut char_table = txn.open_table(NEIGHBORHOOD_CHARACTERS).map_err(store)?;
             let mut house_table = txn.open_table(NEIGHBORHOOD_HOUSES).map_err(store)?;
             let mut lot_table = txn.open_table(NEIGHBORHOOD_LOTS).map_err(store)?;
@@ -714,6 +830,44 @@ impl NeighborhoodStore {
         txn.commit().map_err(store)
     }
 
+    /// Atomically saves `state` for neighborhood `id` only if the committed
+    /// neighborhood's `(instance_id, revision)` still matches
+    /// `(expected_instance_id, expected_revision)`.
+    pub fn save_neighborhood_checked(
+        &self,
+        id: &str,
+        expected_instance_id: u128,
+        expected_revision: u64,
+        state: &StoredNeighborhood,
+    ) -> Result<std::result::Result<(), CheckedCommitError>> {
+        let encoded = state.encode();
+        let txn = self.db.begin_write().map_err(store)?;
+        {
+            let mut table = txn.open_table(NEIGHBORHOODS).map_err(store)?;
+            let current = {
+                let Some(existing) = table.get(id).map_err(store)? else {
+                    return Err(Error::Store(format!("neighborhood {id:?} does not exist")));
+                };
+                StoredNeighborhood::decode(id, existing.value())?
+            };
+            if current.instance_id != expected_instance_id {
+                return Ok(Err(CheckedCommitError::InstanceMismatch {
+                    expected: expected_instance_id,
+                    current: current.instance_id,
+                }));
+            }
+            if current.revision != expected_revision {
+                return Ok(Err(CheckedCommitError::RevisionMismatch {
+                    expected: expected_revision,
+                    current: current.revision,
+                }));
+            }
+            table.insert(id, encoded.as_slice()).map_err(store)?;
+        }
+        txn.commit().map_err(store)?;
+        Ok(Ok(()))
+    }
+
     /// Loads all character `.iff` files stored for neighborhood `id`.
     pub fn load_character_files(&self, id: &str) -> Result<BTreeMap<String, Vec<u8>>> {
         let txn = self.db.begin_read().map_err(store)?;
@@ -827,31 +981,41 @@ impl NeighborhoodStore {
     /// and any character-file deletions (e.g. bulldozed tombstones per
     /// `0x426fcd`) in a single REDB write transaction.
     ///
-    /// When `expected_revision` is `Some(expected)`, verifies inside the write
-    /// transaction that the currently committed neighborhood revision still
-    /// equals `expected`; if another operation committed a newer revision
-    /// meanwhile, aborts the transaction cleanly and returns
-    /// `Ok(Err(current_revision))`.
+    /// When `expected` is `Some((expected_instance_id, expected_revision))`,
+    /// verifies inside the write transaction that both the committed
+    /// neighborhood's `instance_id` and `revision` still match; if the
+    /// neighborhood was re-imported or another operation committed a newer
+    /// revision meanwhile, aborts the transaction cleanly and returns
+    /// `Ok(Err(CheckedCommitError))`.
     pub fn save_lot_and_neighborhood_checked(
         &self,
         id: &str,
         house: u32,
-        expected_revision: Option<u64>,
+        expected: Option<(u128, u64)>,
         lot_bytes: &[u8],
         state: &StoredNeighborhood,
         remove_character_files: &[String],
-    ) -> Result<std::result::Result<(), u64>> {
+    ) -> Result<std::result::Result<(), CheckedCommitError>> {
         let encoded = state.encode();
         let txn = self.db.begin_write().map_err(store)?;
         {
             let mut nh_table = txn.open_table(NEIGHBORHOODS).map_err(store)?;
-            if let Some(expected) = expected_revision {
+            if let Some((expected_instance_id, expected_revision)) = expected {
                 let Some(existing) = nh_table.get(id).map_err(store)? else {
                     return Err(Error::Store(format!("neighborhood {id:?} does not exist")));
                 };
                 let current = StoredNeighborhood::decode(id, existing.value())?;
-                if current.revision != expected {
-                    return Ok(Err(current.revision));
+                if current.instance_id != expected_instance_id {
+                    return Ok(Err(CheckedCommitError::InstanceMismatch {
+                        expected: expected_instance_id,
+                        current: current.instance_id,
+                    }));
+                }
+                if current.revision != expected_revision {
+                    return Ok(Err(CheckedCommitError::RevisionMismatch {
+                        expected: expected_revision,
+                        current: current.revision,
+                    }));
                 }
             }
             let mut lot_table = txn.open_table(NEIGHBORHOOD_LOTS).map_err(store)?;

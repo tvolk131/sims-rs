@@ -251,10 +251,21 @@ pub struct Lot {
     /// Detached Buy Mode objects whose history cleanup (`0x48c20e`) faulted,
     /// tracked so [`Lot::save`] and mode switches never leak them silently.
     pub(crate) buy_orphans: Vec<crate::BuyPurchase>,
-    /// When opened via [`crate::lifecycle::enter_lot`], records the
-    /// `(neighborhood_id, revision)` this lot was loaded from so Save & Leave
-    /// rejects cross-neighborhood saves and stale-revision overwrites.
-    pub(crate) neighborhood_origin: Option<(String, u64)>,
+    /// When opened via [`crate::lifecycle::enter_lot`], records the store,
+    /// neighborhood ID, neighborhood instance identity, and revision this lot
+    /// was loaded from so Save & Leave rejects cross-store saves,
+    /// cross-neighborhood saves, re-imported same-ID overwrites, and
+    /// stale-revision overwrites. Cleared by [`Lot::restore`].
+    pub(crate) neighborhood_origin: Option<NeighborhoodOrigin>,
+}
+
+/// Store-backed origin of a live [`Lot`] opened via [`crate::lifecycle::enter_lot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NeighborhoodOrigin {
+    pub store_id: u128,
+    pub neighborhood_id: String,
+    pub instance_id: u128,
+    pub revision: u64,
 }
 
 /// A dialog the lot waits on ([`Lot::asking`]). The tick that showed it

@@ -10,7 +10,7 @@ use sims_sim::{
     NeighborhoodStore, StoredNeighborhood, TypeAttributes, World, family_net_worth,
     lot_total_value,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -83,6 +83,8 @@ fn sample_neighborhood(name: &str) -> StoredNeighborhood {
         zoning,
         lot_rows: vec![4, 5, 21],
         made_characters: Characters::default(),
+        deleted_characters: BTreeSet::new(),
+        instance_id: 1,
         revision: 0,
     }
 }
@@ -111,10 +113,16 @@ fn lot_total_value_and_net_worth_match_sims_exe_191_formula() {
         50777
     );
     // Exact x87 fild + fmul f32 rounding (0x425408): 16_777_217 loses its LSB
-    // if prematurely narrowed to f32 before multiplying by 0.7f.
+    // if prematurely narrowed to f32 before multiplying by 0.7f, and
+    // 830_472_197 * 0.7f double-rounds to 581_330_560 via f64 instead of the
+    // single-rounded exact product 581_330_496.
     assert_eq!(
         lot_total_value(0, 0, 16_777_217, DEFAULT_ARCH_VALUE_MULTIPLIER),
         11_744_052
+    );
+    assert_eq!(
+        lot_total_value(0, 0, 830_472_197, DEFAULT_ARCH_VALUE_MULTIPLIER),
+        581_330_496
     );
     let fam = sample_family(5, 2542, 33116, vec![0x1111]);
     assert_eq!(family_net_worth(&fam), 35658);
@@ -427,10 +435,16 @@ fn write_back_world_upgrades_v7_family_and_merges_magic_controller_attributes() 
         Some([100, 500, 300, 40, 500, 600]),
         "signed max of retained history and Magic Controller attributes 0..6 (0x410a87)"
     );
-    // Secondary house occupancy check (0x425d95):
+    // Secondary house occupancy check (0x425d95): a family with house == 0 and
+    // secondary_house != 0 occupies that house AND is excluded from family_bin().
+    assert!(stored.family_bin().iter().any(|&(id, _)| id == 2));
     let fam2 = stored.families.get_mut(&2).unwrap();
     fam2.set_secondary_house(4);
     assert_eq!(stored.family_in(4).map(|(id, _)| id), Some(2));
+    assert!(
+        stored.family_bin().iter().all(|&(id, _)| id != 2),
+        "secondary-only occupants must not appear in family_bin()"
+    );
 }
 
 #[test]
@@ -499,6 +513,9 @@ fn add_character_files_matches_disk_for_subdirs_far_and_win1252_names() {
     far.extend_from_slice(&(member_name.len() as u32).to_le_bytes());
     far.extend_from_slice(member_name);
     std::fs::write(dir.join("pack.far"), &far).unwrap();
+    // An empty directory with the same name as a FAR member must hide that
+    // member in both the disk index and the inline index.
+    std::fs::create_dir_all(dir.join("archived.iff")).unwrap();
 
     let install = Install::detect(&root).unwrap();
     let mut disk_index = Index::build(&install).unwrap();
@@ -509,6 +526,7 @@ fn add_character_files_matches_disk_for_subdirs_far_and_win1252_names() {
     files.insert("caf\u{00e9}.iff".to_owned(), bytes_a);
     files.insert("SubDir/nested.iff".to_owned(), bytes_b);
     files.insert("pack.far".to_owned(), far);
+    files.insert("archived.iff/".to_owned(), Vec::new());
     let mut inline_index = Index::build(&install).unwrap();
     inline_index.add_character_files(&files).unwrap();
     let inline_catalog = Catalog::build(&inline_index).unwrap();

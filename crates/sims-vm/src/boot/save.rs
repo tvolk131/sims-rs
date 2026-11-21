@@ -255,6 +255,10 @@ impl Lot {
         self.buy_undo.clear();
         self.buy_redo.clear();
         self.buy_orphans.clear();
+        // Restoring an external snapshot replaces `self.world` (including its
+        // cached `families` and `neighbors`), so it is no longer a live
+        // continuation of the store revision this `Lot` was opened from.
+        self.neighborhood_origin = None;
         Ok(())
     }
 }

@@ -37,7 +37,7 @@
 //!     commits both lot and neighborhood atomically to REDB.
 
 use crate::boot::save::Saved;
-use crate::boot::{Finished, Frames, LoadReport, Lot, opening_rotation};
+use crate::boot::{Finished, Frames, LoadReport, Lot, NeighborhoodOrigin, opening_rotation};
 use crate::daily::value as object_value;
 use crate::factory::word;
 use crate::fault::Fault;
@@ -53,9 +53,9 @@ use sims_formats::iff::Iff;
 use sims_formats::strings::StringTable;
 use sims_sim::load::{Context, ExpandedWall, FLOORS, WALLS, visitor_again};
 use sims_sim::neighborhood_store::{
-    DEFAULT_ARCH_VALUE_MULTIPLIER, DEFAULT_LAYOUT_HISTORY_FILL, DEFAULT_NEW_FAMILY_START_HOUR,
-    FAMILY_FLAG_BIT_3, FAMILY_FLAG_NEW_MOVE_IN, NeighborhoodStore, StoredNeighborhood,
-    lot_total_value,
+    CheckedCommitError, DEFAULT_ARCH_VALUE_MULTIPLIER, DEFAULT_LAYOUT_HISTORY_FILL,
+    DEFAULT_NEW_FAMILY_START_HOUR, FAMILY_FLAG_BIT_3, FAMILY_FLAG_NEW_MOVE_IN, NeighborhoodStore,
+    StoredNeighborhood, lot_total_value,
 };
 use sims_sim::neighbors::registry;
 use sims_sim::{FULL_SIZE, HouseUsage, Usage, World};
@@ -954,6 +954,8 @@ pub fn move_in_with_multiplier(
     let mut stored = store
         .load_neighborhood(neighborhood_id)?
         .ok_or_else(|| LifecycleError::NeighborhoodNotFound(neighborhood_id.to_owned()))?;
+    let origin_instance_id = stored.instance_id;
+    let origin_revision = stored.revision;
     if family_id == 0 {
         return Err(LifecycleError::FamilyEmpty { family: family_id });
     }
@@ -1011,7 +1013,27 @@ pub fn move_in_with_multiplier(
     let budget_after = family.budget;
     stored.revision = stored.revision.saturating_add(1);
 
-    store.save_neighborhood(neighborhood_id, &stored)?;
+    match store.save_neighborhood_checked(
+        neighborhood_id,
+        origin_instance_id,
+        origin_revision,
+        &stored,
+    )? {
+        Ok(()) => {}
+        Err(CheckedCommitError::InstanceMismatch { expected, current }) => {
+            return Err(LifecycleError::NeighborhoodMismatch {
+                expected: format!("{neighborhood_id}#{expected:032x}"),
+                actual: format!("{neighborhood_id}#{current:032x}"),
+            });
+        }
+        Err(CheckedCommitError::RevisionMismatch { expected, current }) => {
+            return Err(LifecycleError::StaleNeighborhood {
+                neighborhood: neighborhood_id.to_owned(),
+                expected_revision: expected,
+                current_revision: current,
+            });
+        }
+    }
     Ok(MoveInReport {
         family: family_id,
         house,
@@ -1091,6 +1113,9 @@ impl StoreRuntime {
             .characters
             .extend(stored.made_characters.made.keys().copied());
         program
+            .characters
+            .retain(|guid| !stored.deleted_characters.contains(guid));
+        program
             .character_files
             .extend(stored.made_characters.made.values().map(|c| c.file));
         let surfaces = Surfaces::build(&install).map_err(|e| LifecycleError::Lot(e.to_string()))?;
@@ -1107,18 +1132,21 @@ impl StoreRuntime {
     }
 }
 
-/// Builds the definition registry for `World::read_neighbors`, including any
-/// runtime-created character definitions persisted in `made_characters`
-/// (`Make New Character`, primitive 19 / `0x43c3b2`).
+/// Builds the definition registry for `World::read_neighbors`, excluding any
+/// character definitions permanently deleted via Bulldoze (`0x426fcd`) and
+/// including runtime-created character definitions persisted in
+/// `made_characters` (`Make New Character`, primitive 19 / `0x43c3b2`).
 fn neighborhood_registry(
     index: &Index,
     catalog: &Catalog,
     made: &sims_sim::characters::Characters,
+    deleted: &BTreeSet<u32>,
 ) -> Vec<sims_sim::neighbors::Registered> {
     let mut reg = registry(index, catalog);
+    reg.retain(|entry| !deleted.contains(&entry.guid));
     let existing: BTreeSet<u32> = reg.iter().map(|entry| entry.guid).collect();
     for (&guid, character) in &made.made {
-        if existing.contains(&guid) {
+        if existing.contains(&guid) || deleted.contains(&guid) {
             continue;
         }
         let kind = catalog
@@ -1185,6 +1213,7 @@ pub fn enter_lot_with(
     if let Some(saved_bytes) = saved_lot {
         boot_from_saved_lot(
             runtime,
+            store.store_id(),
             neighborhood_id,
             house,
             &saved_bytes,
@@ -1195,6 +1224,7 @@ pub fn enter_lot_with(
     } else {
         boot_from_base_house(
             runtime,
+            store.store_id(),
             neighborhood_id,
             house,
             base_house.expect("checked above"),
@@ -1210,8 +1240,10 @@ pub fn enter_lot_with(
 /// Re-enters a previously saved lot from REDB, reconciling all neighborhood-wide
 /// state (`NBRS`, `FAMI`, `NGBH`, `TATT`, `made_characters`) with the latest
 /// [`StoredNeighborhood`].
+#[allow(clippy::too_many_arguments)]
 fn boot_from_saved_lot(
     runtime: StoreRuntime,
+    store_id: u128,
     neighborhood_id: &str,
     house: u32,
     saved_bytes: &[u8],
@@ -1236,10 +1268,16 @@ fn boot_from_saved_lot(
         stored,
         ..
     } = runtime;
+    let origin_instance_id = stored.instance_id;
     let origin_revision = stored.revision;
 
     let mut world = saved.world;
-    let reg = neighborhood_registry(&index, &catalog, &stored.made_characters);
+    let reg = neighborhood_registry(
+        &index,
+        &catalog,
+        &stored.made_characters,
+        &stored.deleted_characters,
+    );
     let content_nh = stored.to_content_neighborhood();
     world
         .read_neighbors(&content_nh, &reg)
@@ -1250,16 +1288,10 @@ fn boot_from_saved_lot(
     if let Some(saved_tatt) = &stored.type_attributes {
         world.read_type_attributes(saved_tatt);
     }
-    for (&guid, character) in &stored.made_characters.made {
-        world
-            .characters
-            .made
-            .entry(guid)
-            .or_insert_with(|| character.clone());
-    }
-    if stored.made_characters.next_file > world.characters.next_file {
-        world.characters.next_file = stored.made_characters.next_file;
-    }
+    // `made_characters` is neighborhood-wide state: replace from the latest
+    // `StoredNeighborhood` so characters deleted via Bulldoze never reappear
+    // from an older saved lot.
+    world.characters = stored.made_characters.clone();
 
     let (family_id, family_budget, family_flags, family_members, family_magic) =
         match stored.family_in(house) {
@@ -1428,7 +1460,12 @@ fn boot_from_saved_lot(
         buy_undo: Vec::new(),
         buy_redo: Vec::new(),
         buy_orphans: Vec::new(),
-        neighborhood_origin: Some((neighborhood_id.to_owned(), origin_revision)),
+        neighborhood_origin: Some(NeighborhoodOrigin {
+            store_id,
+            neighborhood_id: neighborhood_id.to_owned(),
+            instance_id: origin_instance_id,
+            revision: origin_revision,
+        }),
     })
 }
 
@@ -1437,6 +1474,7 @@ fn boot_from_saved_lot(
 #[allow(clippy::too_many_arguments)]
 fn boot_from_base_house(
     runtime: StoreRuntime,
+    store_id: u128,
     neighborhood_id: &str,
     house: u32,
     bytes: Vec<u8>,
@@ -1455,6 +1493,7 @@ fn boot_from_base_house(
         tuning,
         stored,
     } = runtime;
+    let origin_instance_id = stored.instance_id;
     let origin_revision = stored.revision;
 
     let virtual_path = PathBuf::from(format!("{neighborhood_id}/Houses/House{house:02}.iff"));
@@ -1476,7 +1515,12 @@ fn boot_from_base_house(
             .skeleton_files
             .extend(crate::objects::read_before_the_first_load(&program.people));
         let content_nh = stored.to_content_neighborhood();
-        let reg = neighborhood_registry(&index, &catalog, &stored.made_characters);
+        let reg = neighborhood_registry(
+            &index,
+            &catalog,
+            &stored.made_characters,
+            &stored.deleted_characters,
+        );
         world
             .read_neighbors(&content_nh, &reg)
             .map_err(|e| LifecycleError::Lot(e.to_string()))?;
@@ -1712,7 +1756,12 @@ fn boot_from_base_house(
         buy_undo: Vec::new(),
         buy_redo: Vec::new(),
         buy_orphans: Vec::new(),
-        neighborhood_origin: Some((neighborhood_id.to_owned(), origin_revision)),
+        neighborhood_origin: Some(NeighborhoodOrigin {
+            store_id,
+            neighborhood_id: neighborhood_id.to_owned(),
+            instance_id: origin_instance_id,
+            revision: origin_revision,
+        }),
     })
 }
 
@@ -1722,10 +1771,11 @@ fn boot_from_base_house(
 /// (`0x41615d`) → `cXObjectManager::Save` (`0x43fb1b`) → `cTSNeighborhood::Save`
 /// (`0x4252cc`).
 ///
-/// Rejects lots opened from a different neighborhood
-/// ([`LifecycleError::NeighborhoodMismatch`]) or whose neighborhood revision
-/// changed since the lot was opened ([`LifecycleError::StaleNeighborhood`]),
-/// and advances the lot's tracked revision after a successful save so repeated
+/// Rejects lots opened from a different store, neighborhood ID, or re-imported
+/// neighborhood instance ([`LifecycleError::NeighborhoodMismatch`]), lots
+/// replaced via [`Lot::restore`], or lots whose neighborhood revision changed
+/// since they were opened ([`LifecycleError::StaleNeighborhood`]), and
+/// advances the lot's tracked revision after a successful save so repeated
 /// saves from the same live lot continue to succeed.
 pub fn save_and_leave_lot(
     install_root: &Path,
@@ -1755,25 +1805,31 @@ fn save_and_leave_lot_inner(
     lot: &mut Lot,
     cursor: Option<&BuyCursor>,
 ) -> Result<SaveReport, LifecycleError> {
-    let Some((ref origin_neighborhood, expected_revision)) = lot.neighborhood_origin else {
+    let Some(origin) = lot.neighborhood_origin.clone() else {
         return Err(LifecycleError::Lot(
-            "lot was not opened from a NeighborhoodStore".into(),
+            "lot was not opened from a NeighborhoodStore (or was replaced via restore)".into(),
         ));
     };
-    if origin_neighborhood != neighborhood_id {
+    if origin.store_id != store.store_id() || origin.neighborhood_id != neighborhood_id {
         return Err(LifecycleError::NeighborhoodMismatch {
-            expected: origin_neighborhood.clone(),
-            actual: neighborhood_id.to_owned(),
+            expected: format!("{}@store:{:032x}", origin.neighborhood_id, origin.store_id),
+            actual: format!("{neighborhood_id}@store:{:032x}", store.store_id()),
         });
     }
 
     let mut stored = store
         .load_neighborhood(neighborhood_id)?
         .ok_or_else(|| LifecycleError::NeighborhoodNotFound(neighborhood_id.to_owned()))?;
-    if stored.revision != expected_revision {
+    if stored.instance_id != origin.instance_id {
+        return Err(LifecycleError::NeighborhoodMismatch {
+            expected: format!("{neighborhood_id}#{:032x}", origin.instance_id),
+            actual: format!("{neighborhood_id}#{:032x}", stored.instance_id),
+        });
+    }
+    if stored.revision != origin.revision {
         return Err(LifecycleError::StaleNeighborhood {
             neighborhood: neighborhood_id.to_owned(),
-            expected_revision,
+            expected_revision: origin.revision,
             current_revision: stored.revision,
         });
     }
@@ -1837,21 +1893,32 @@ fn save_and_leave_lot_inner(
     match store.save_lot_and_neighborhood_checked(
         neighborhood_id,
         house,
-        Some(expected_revision),
+        Some((origin.instance_id, origin.revision)),
         &lot_bytes,
         &stored,
         &[],
     )? {
         Ok(()) => {}
-        Err(current) => {
+        Err(CheckedCommitError::InstanceMismatch { expected, current }) => {
+            return Err(LifecycleError::NeighborhoodMismatch {
+                expected: format!("{neighborhood_id}#{expected:032x}"),
+                actual: format!("{neighborhood_id}#{current:032x}"),
+            });
+        }
+        Err(CheckedCommitError::RevisionMismatch { expected, current }) => {
             return Err(LifecycleError::StaleNeighborhood {
                 neighborhood: neighborhood_id.to_owned(),
-                expected_revision,
+                expected_revision: expected,
                 current_revision: current,
             });
         }
     }
-    lot.neighborhood_origin = Some((neighborhood_id.to_owned(), stored.revision));
+    lot.neighborhood_origin = Some(NeighborhoodOrigin {
+        store_id: store.store_id(),
+        neighborhood_id: neighborhood_id.to_owned(),
+        instance_id: stored.instance_id,
+        revision: stored.revision,
+    });
 
     Ok(SaveReport {
         neighborhood: neighborhood_id.to_owned(),
@@ -1917,6 +1984,7 @@ fn evict_or_bulldoze(
     bulldoze: bool,
 ) -> Result<BulldozeReport, LifecycleError> {
     let mut runtime = StoreRuntime::build(install_root, store, neighborhood_id)?;
+    let origin_instance_id = runtime.stored.instance_id;
     let origin_revision = runtime.stored.revision;
     let evicted = runtime
         .stored
@@ -1992,6 +2060,7 @@ fn evict_or_bulldoze(
     let mut lot = if let Some(saved_bytes) = saved_lot {
         boot_from_saved_lot(
             runtime,
+            store.store_id(),
             neighborhood_id,
             house,
             &saved_bytes,
@@ -2002,6 +2071,7 @@ fn evict_or_bulldoze(
     } else {
         boot_from_base_house(
             runtime,
+            store.store_id(),
             neighborhood_id,
             house,
             base_house.expect("checked above"),
@@ -2170,6 +2240,7 @@ fn evict_or_bulldoze(
             lot.world.neighbors.remove_record(id);
             lot.world.characters.made.remove(&guid);
             stored.made_characters.made.remove(&guid);
+            stored.deleted_characters.insert(guid);
             deleted_guids.insert(guid);
             deleted_tombstones += 1;
         }
@@ -2228,16 +2299,22 @@ fn evict_or_bulldoze(
     match store.save_lot_and_neighborhood_checked(
         neighborhood_id,
         house,
-        Some(origin_revision),
+        Some((origin_instance_id, origin_revision)),
         &lot_bytes,
         &stored,
         &removed_character_files,
     )? {
         Ok(()) => {}
-        Err(current) => {
+        Err(CheckedCommitError::InstanceMismatch { expected, current }) => {
+            return Err(LifecycleError::NeighborhoodMismatch {
+                expected: format!("{neighborhood_id}#{expected:032x}"),
+                actual: format!("{neighborhood_id}#{current:032x}"),
+            });
+        }
+        Err(CheckedCommitError::RevisionMismatch { expected, current }) => {
             return Err(LifecycleError::StaleNeighborhood {
                 neighborhood: neighborhood_id.to_owned(),
-                expected_revision: origin_revision,
+                expected_revision: expected,
                 current_revision: current,
             });
         }
