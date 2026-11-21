@@ -1103,10 +1103,13 @@ impl Lot {
         })
     }
 
-    /// Queues on `person` the action of an entry [`Lot::pie_menu`] listed,
-    /// as picking it does ([`Interpreter::pick`]). Returns the action's number, or None
-    /// when the queue took nothing (it is full, or the action's entry is
-    /// gone). An order that fails changes nothing, as for
+    /// Queues the action of an entry [`Lot::pie_menu`] listed for
+    /// `person` on the action's caller, as picking it does
+    /// ([`Interpreter::pick`]): `person`, but for the offer to join
+    /// `person`'s running interaction, which is queued on the person the
+    /// menu was listed on. Returns the action's number, or None when the
+    /// queue took nothing (it is full, the action's entry is gone, or the
+    /// action has no caller). An order that fails changes nothing, as for
     /// [`Lot::queue_interaction`].
     pub fn pick(
         &mut self,

@@ -39,10 +39,16 @@
 //! lacks; a pass can raise an error (one raises native error 0x1c for a
 //! non-person, 0x44c57b).
 //!
-//! In a check tree that Find Best Interaction runs, no menu is being built
-//! (the three pointers were 0 in a memory image of the original at its
-//! first call), and the synchronous run (0x4749b5) clears 0x6c4d6c, so the
-//! formatted string is dropped.
+//! In an entry's check tree run outside a listing (one Find Best
+//! Interaction runs, or 0x458319's check of a queued or picked action),
+//! and in an action's tree run at once (0x45d2d3 calls 0x474afb, which
+//! runs it through 0x4749b5), no menu is being built (the three pointers
+//! were 0 in a memory image of the original at Find Best Interaction's
+//! first call), and the synchronous run (0x4749b5) clears 0x6c4d6c, so
+//! the formatted string is dropped. A tree run at once from inside a
+//! listing's check (Push Interaction on an entry that runs at once) still
+//! has the listing's menu, which is asked about first, so there the
+//! string adds a menu entry as in the check itself.
 //!
 //! In a thread's run the person's running action ([`sims_sim::Object`]'s
 //! `person.active`) takes flag 0x80. Its name is not kept, as no action's
@@ -99,8 +105,8 @@ impl Machine<'_, '_> {
         }
         if self.synchronous {
             return Err(Trap::Unsupported(
-                "Add/Change Action String in a tree run at once other than autonomy's check \
-                 trees; the synchronous run clears 0x6c4d6c (0x474a37), but which of these \
+                "Add/Change Action String in a tree run at once other than an entry's check \
+                 tree or an action run at once; the synchronous run clears 0x6c4d6c (0x474a37), but which of these \
                  runs are the original's 0x4749b5 is not checked"
                     .into(),
             ));

@@ -138,7 +138,14 @@ pub struct Hot {
     /// for ID 0, which the original's handlers skip (0x57b377,
     /// 0x57b6b2): the order it registers their objects in (see
     /// [`crate::registry`]).
-    pub registered: Vec<u32>,
+    pub registered: Vec<(u32, Object)>,
+}
+
+/// What a `[Patch]` or `[Track]` line registers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Object {
+    Patch,
+    Track,
 }
 
 impl Hot {
@@ -192,7 +199,7 @@ impl Hot {
                     };
                     let id = id()?;
                     if id != 0 {
-                        hot.registered.push(id);
+                        hot.registered.push((id, Object::Patch));
                     }
                     hot.patches.insert(
                         id,
@@ -241,7 +248,7 @@ impl Hot {
                     let mut next = || fields.next().expect("nine fields");
                     let id = id()?;
                     if id != 0 {
-                        hot.registered.push(id);
+                        hot.registered.push((id, Object::Track));
                     }
                     hot.tracks.insert(
                         id,

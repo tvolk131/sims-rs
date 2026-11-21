@@ -412,9 +412,12 @@ pub(crate) struct Machine<'a, 'w> {
     pub base: usize,
     /// Whether the run must finish without yielding, as a callback does.
     pub synchronous: bool,
-    /// Whether the run is a check tree Find Best Interaction runs (or a
-    /// tree such a check runs by name), where Add/Change Action String
-    /// names the interaction being checked (0x41f1ae).
+    /// Whether the run is one the original makes through its synchronous
+    /// run (0x4749b5), which clears 0x6c4d6c (0x474a37), so Add/Change
+    /// Action String outside a listing names nothing and takes the true
+    /// branch: an entry's check tree (one Find Best Interaction runs, or
+    /// 0x458319 for a queued or picked action), an action's tree run at
+    /// once (0x45d2d3, 0x474afb), and any tree these run by name.
     pub checking: bool,
     /// See [`Interpreter::making_person`].
     pub making_person: Option<u16>,

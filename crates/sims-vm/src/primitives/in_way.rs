@@ -433,6 +433,7 @@ impl Machine<'_, '_> {
         let entry = self.table(marker)?.and_then(|t| find(t, MOVE as u32));
         let constants = self.program.autonomy_constants();
         let action = Interaction {
+            join: 0,
             uid: 0,
             caller: asked as i16,
             target: marker as i16,
@@ -682,9 +683,7 @@ impl Machine<'_, '_> {
         }
         let mut saved = None;
         let result = self.check_and_run_at_once(id, &mut action, &mut saved);
-        if let Some(temps) = saved {
-            self.me_mut()?.temps = temps;
-        }
+        self.put_back_temps(saved)?;
         result
     }
 
@@ -693,7 +692,7 @@ impl Machine<'_, '_> {
         &mut self,
         id: u16,
         action: &mut Interaction,
-        saved: &mut Option<Vec<i16>>,
+        saved: &mut crate::autonomy::SavedTemps,
     ) -> Result<Option<i32>, Trap> {
         self.check_chosen(action, saved, None)?;
         if action.flags & crate::autonomy::checked::PASSED == 0 || self.running_at_once.is_some() {
@@ -762,6 +761,9 @@ impl Machine<'_, '_> {
                     }),
                     ..self.interpreter()
                 };
+                // The tree runs through the synchronous run (0x45d2d3,
+                // 0x474afb, 0x4749b5), which clears 0x6c4d6c (0x474a37):
+                // Add/Change Action String names nothing there.
                 interpreter
                     .call_as(
                         self.world,
@@ -772,7 +774,7 @@ impl Machine<'_, '_> {
                         &args,
                         args.len(),
                         crate::TURN_BUDGET,
-                        false,
+                        true,
                     )
                     .map_err(|fault: crate::fault::Fault| {
                         fault.unsupported_in(format!(

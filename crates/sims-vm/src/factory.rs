@@ -533,6 +533,7 @@ fn new_person() -> Person {
     let mut previous_motives = [0.0; 16];
     (motives[5], motives[7], previous_motives[5]) = (70.0, -40.0, 70.0);
     let idle = Interaction {
+        join: 0,
         uid: 0,
         caller: 0,
         target: 0,
