@@ -244,10 +244,10 @@ impl Interpreter<'_> {
     /// overwritten. If snapped placement fails:
     /// 1. For wall- or pool-edge-attached objects (`0x43583e`), tries alternate
     ///    rotations in steps of `data[23]` at the snapped tile (`0x48736b`).
-    /// 2. Otherwise retries full placement of the held object (and cursor) at
-    ///    the unsnapped `fine` coordinates (`0x485f23` → `0x421e72`).
-    /// 3. If still invalid, leaves the held object off the lot and places the
-    ///    `"Tile Cursor"` alone at `fine` when it fits.
+    /// 2. Otherwise runs the unsnapped fallback (`0x485f23` → `0x421e72`),
+    ///    where `UserTestPlace` (`0x4355bc..0x4355cd`) rejects unsnapped
+    ///    coordinates for the held object, leaving the held object off the lot
+    ///    and placing the `"Tile Cursor"` alone at `fine` when it fits.
     pub fn buy_move(
         &self,
         world: &mut World,
@@ -272,17 +272,14 @@ impl Interpreter<'_> {
         if self.try_wall_auto_rotate(world, cursor, pos, level)? {
             return Ok(cursor.valid);
         }
-        if fine != pos
-            && inside_placement_bounds(world, fine)
-            && self.try_place_buy_at(world, cursor, fine, level, None)?
-        {
-            return Ok(cursor.valid);
-        }
-        // Both snapped and unsnapped placement failed: leave held off-lot and
-        // place the `"Tile Cursor"` alone at unsnapped `fine` (`0x485f23`).
-        // Native `0x421fcf..0x421fed` saves the cursor's actual coordinates so
-        // manual rotation (`0x422705..0x422716`) rechecks at `fine` instead of
-        // jumping to the tile centre.
+        // Snapped placement (and any wall/pool auto-rotation) failed: native
+        // `0x485f23` → `0x421e72` retries at unsnapped `fine`, where
+        // `UserTestPlace` (`0x4355bc..0x4355cd`) requires low nibbles == 8 for
+        // the held object, so held stays off-lot and `"Tile Cursor"` is placed
+        // alone at unsnapped `fine` when it fits. Native `0x421fcf..0x421fed`
+        // saves the cursor's actual coordinates so manual rotation
+        // (`0x422705..0x422716`) rechecks at `fine` instead of jumping to the
+        // tile centre.
         cursor.valid = false;
         cursor.container = None;
         if self.fits(world, cursor.cursor, fine, level)? {
@@ -619,8 +616,8 @@ impl Interpreter<'_> {
         // Native `UserTestPlace` (`0x435522` / `0x422de4`): requires
         // tile-centred coordinates (`(x & 0xf) == 8 && (y & 0xf) == 8`),
         // lot-interior tiles without ground flag `0x20`, and (for surface
-        // placements) an existing on-lot container.
-        let tile_centred = (x & 0x0f) == 8 && (y & 0x0f) == 8;
+        // placements) an existing on-lot container whose slot height is not
+        // in `5..=7` (`0x43560c..0x435623`).
         let container_on_lot = match purchase.container {
             Some((cid, _)) => world
                 .objects
@@ -628,12 +625,11 @@ impl Interpreter<'_> {
                 .is_some_and(|c| on_lot([c.position[0], c.position[1]])),
             None => true,
         };
-        let fits = tile_centred
-            && container_on_lot
+        let fits = container_on_lot
             && self.user_tiles_allowed(world, id, [x, y])?
             && match purchase.container {
                 Some((cid, slot)) => {
-                    self.fits_in(world, id, cid, i32::from(slot), [x, y], level)?
+                    self.user_fits_in(world, id, cid, i32::from(slot), [x, y], level)?
                 }
                 None => self.place_test(world, id, [x, y], level)?.is_ok(),
             };
@@ -931,16 +927,21 @@ impl Interpreter<'_> {
         self.run_user_callback(world, held, function::USER_PICKUP)
     }
 
-    /// Checks the lot-border and ground-tile-flag `0x20` guard from native
-    /// `UserTestPlace` (`0x435522` / multi-tile `0x422de4`), which rejects any
-    /// tile outside `1..size - 1` or with bit `0x20` set in level-1 tile flags
-    /// (array `8`) when `move_objects` is off.
+    /// Checks the lot-border, ground-tile-flag `0x20`, and tile-centring
+    /// (`(x & 0xf) == 8 && (y & 0xf) == 8`) guards from native `UserTestPlace`
+    /// (`0x435522` lines `0x43553e..0x4355cd`, multi-tile `0x422de4`), which
+    /// reject unsnapped coordinates and any tile outside `1..size - 1` or with
+    /// bit `0x20` set in level-1 tile flags (array `8`) when `move_objects` is
+    /// off.
     fn user_tiles_allowed(&self, world: &World, id: u16, pos: [i32; 2]) -> Result<bool, Fault> {
         let fail = |trap| Fault {
             object: id,
             at: None,
             trap,
         };
+        if (pos[0] & 0x0f) != 8 || (pos[1] & 0x0f) != 8 {
+            return Ok(false);
+        }
         let check = |at: [i32; 2]| -> Result<bool, Fault> {
             if !inside_placement_bounds(world, at) {
                 return Ok(false);
@@ -980,13 +981,39 @@ impl Interpreter<'_> {
         Ok(true)
     }
 
+    /// Native `UserTestPlace` (`0x435522` lines `0x43560c..0x435623`) for
+    /// container placements: requires `fits_in` and rejects containment slots
+    /// with height `5..=7` (`4 < height < 8`) when `move_objects` is off.
+    fn user_fits_in(
+        &self,
+        world: &mut World,
+        id: u16,
+        container: u16,
+        slot: i32,
+        pos: [i32; 2],
+        level: i32,
+    ) -> Result<bool, Fault> {
+        if !self.fits_in(world, id, container, slot, pos, level)? {
+            return Ok(false);
+        }
+        let height = self
+            .container_slot_height(world, container, slot)
+            .map_err(|trap| Fault {
+                object: id,
+                at: None,
+                trap,
+            })?;
+        Ok(!matches!(height, Some(5..=7)))
+    }
+
     /// Tests whether `held` fits at `[pos, level]`: first rejects tiles
-    /// forbidden by `UserTestPlace` (`0x435522` ground flag `0x20`), then tries
-    /// any `retained` surface container at the same tile without re-aligning
-    /// facing (`0x422050` line `0x422078`), then tries direct tile placement
-    /// (`Some(None)`), and — after a collision refusal (`0x0b`) on a
-    /// single-tile object — searches compatible surface slots on that tile
-    /// (`Some(Some((container_id, slot)))`), aligning facing via
+    /// forbidden by `UserTestPlace` (`0x435522` tile-centring + ground flag
+    /// `0x20`), then tries any `retained` surface container at the same tile
+    /// without re-aligning facing (`0x422050` line `0x422078`), then tries
+    /// direct tile placement (`Some(None)`), and — after a collision refusal
+    /// (`0x0b`) on a single-tile object — searches compatible surface slots on
+    /// that tile (`Some(Some((container_id, slot)))`), rejecting slot heights
+    /// `5..=7` (`0x43560c..0x435623`) and aligning facing via
     /// `0x4221e4..0x422280` + `0x43244d`.
     fn test_buy_placement(
         &self,
@@ -1001,7 +1028,7 @@ impl Interpreter<'_> {
             return Ok(None);
         }
         if let Some((container, slot)) = retained
-            && self.fits_in(world, held, container, i32::from(slot), pos, level)?
+            && self.user_fits_in(world, held, container, i32::from(slot), pos, level)?
         {
             return Ok(Some(Some((container, slot))));
         }
@@ -1042,7 +1069,7 @@ impl Interpreter<'_> {
                 .get(&container)
                 .map_or(0, |o| o.slots.len().saturating_sub(1));
             for slot in 0..slot_count {
-                if self.fits_in(world, held, container, slot as i32, pos, level)? {
+                if self.user_fits_in(world, held, container, slot as i32, pos, level)? {
                     let target_dir =
                         surface_aligned_direction(world, container, current_facing, level)?;
                     self.rotate_held_to(world, cursor, held, target_dir)?;

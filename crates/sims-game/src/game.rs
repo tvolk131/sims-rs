@@ -848,6 +848,12 @@ impl Game {
                 photo: false,
             };
         }
+        if self.hud.controls.mode != Mode::Live {
+            return Outcome {
+                redraw: cleared,
+                photo: false,
+            };
+        }
         let Some(target) = self.under(point) else {
             return Outcome {
                 redraw: cleared || dismissed,
@@ -1671,10 +1677,11 @@ impl Game {
 
     /// Runs a Buy Mode Undo (`undo = true`) or Redo (`undo = false`) while
     /// keeping any active placement preview and catalog selection armed
-    /// (`0x4a8545`, `0x4a856a`). Temporarily lifts an on-lot preview cursor
-    /// off-lot during the history step so it cannot collide with a redone
-    /// object, then re-evaluates its placement and affordability at its saved
-    /// position.
+    /// (`0x4a8545`, `0x4a856a`). Dispatches directly to the lot's purchase
+    /// history without lifting the preview first so an on-lot preview still
+    /// collides with Redo (`0x4337f6`), then refreshes preview validity and
+    /// affordability at its saved position while retaining any on-lot surface
+    /// container.
     fn apply_buy_history(&mut self, undo: bool) -> bool {
         let allowed = if undo {
             self.can_undo()
@@ -1685,32 +1692,17 @@ impl Game {
             return false;
         }
         self.buy_dragging = None;
-        let saved_cursor = if let Some(mut cursor) = self.buy_cursor.take() {
-            let saved_pos =
-                (cursor.position[0] >= 0).then_some((cursor.position, cursor.container));
-            if saved_pos.is_some()
-                && let Err(e) = self.lot.buy_hide(&mut cursor)
-            {
-                self.buy_cursor = Some(cursor);
-                self.note = Some(format!("Could not lift Buy preview for history: {e}"));
-                return false;
-            }
-            Some((cursor, saved_pos))
-        } else {
-            None
-        };
         let result = if undo {
             self.lot.buy_undo()
         } else {
             self.lot.buy_redo()
         };
-        if let Some((mut cursor, saved_pos)) = saved_cursor {
-            if let Some(([x, y, level], saved_container)) = saved_pos {
-                // Preserve the surface container (if still on-lot) before
-                // re-running `buy_move` so unrelated Undo/Redo does not
-                // discard a manual rotation on a surface (`0x421e72`).
-                cursor.position = [x, y, level];
-                cursor.container = saved_container.filter(|(cid, _)| {
+        if let Some(mut cursor) = self.buy_cursor.take() {
+            if cursor.position[0] >= 0 {
+                let [x, y, level] = cursor.position;
+                // Keep any surface container that is still on-lot so unrelated
+                // Undo/Redo preserves manual surface rotation (`0x421e72`).
+                cursor.container = cursor.container.filter(|(cid, _)| {
                     self.lot
                         .world()
                         .objects
@@ -1718,7 +1710,7 @@ impl Game {
                         .is_some_and(|o| o.position[0] >= 0)
                 });
                 if let Err(e) = self.lot.buy_move(&mut cursor, [x, y], level) {
-                    self.note = Some(format!("Could not restore Buy preview: {e}"));
+                    self.note = Some(format!("Could not refresh Buy preview: {e}"));
                 }
             }
             self.buy_cursor = Some(cursor);

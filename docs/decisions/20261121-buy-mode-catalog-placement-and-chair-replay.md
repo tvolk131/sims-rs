@@ -68,28 +68,30 @@ panel, and `sims-vm` had no `"Tile Cursor"` creation or Buy placement tool.
     snaps to tile centre `(v & !15) | 8` (`0x485f6d`), retains any existing
     surface container when staying on the same snapped tile (`0x421e72` /
     `0x422050`, even while temporarily unaffordable, so clicks and Undo/Redo
-    preserve manual surface rotations), rejects lot-border and ground-flag
-    `0x20` tiles (`UserTestPlace`, `0x435522` / multi-tile `0x422de4`), then
-    tests direct tile placement and — on collision refusal `0x0b` for a
-    single-tile object with nonzero `data[4]` (`+0x52`, allowed surface
-    heights, `0x4220a5`) — searches surface container slots (`0x422050`),
-    aligning the placed item's facing to the container (or first unblocked
-    cardinal side of a multi-tile container via `0x4221e4..0x422280` +
-    `0x43244d` walking the tile chain slot `0`). When valid at the snapped
+    preserve manual surface rotations), rejects unsnapped coordinates,
+    lot-border tiles, ground-flag `0x20` tiles, and containment slot heights
+    `5..=7` (`UserTestPlace`, `0x435522` / `0x4355bc..0x435623` / multi-tile
+    `0x422de4`), then tests direct tile placement and — on collision refusal
+    `0x0b` for a single-tile object with nonzero `data[4]` (`+0x52`, allowed
+    surface heights, `0x4220a5`) — searches surface container slots
+    (`0x422050`), aligning the placed item's facing to the container (or first
+    unblocked cardinal side of a multi-tile container via `0x4221e4..0x422280`
+    + `0x43244d` walking the tile chain slot `0`). When valid at the snapped
     tile, it places the held object first and `"Tile Cursor"` second
     (`0x421e72`), which automatically links `held.data[26] = cursor`. When
     snapped placement fails, wall-attached (`data[13] & 0x0f != 0`) and
     pool-edge (`data[42] & 0x800`) objects automatically try alternate facings
-    (`0x48736b` + `0x43583e`); if still invalid, placement retries the held
-    object (and cursor) at the unsnapped pointer coordinates (`0x485f23` →
-    `0x421e72`), leaving only the cursor at the unsnapped position when that
-    also fails. Dragging past the 6 px radius (`dx^2 + dy^2 > 0x24`) rotates
-    the held object using `0x485d5d..0x485dad` (upper-left `6`, upper-right
-    `4`, lower-left `0`, lower-right `2`, minus `2 * camera_rotation`; compared
-    against current facing at `0x485da9` before subtracting the OBJD `+0x7a`
-    facing offset `0x434f8d`), while movement within 6 px continues normal tile
-    placement. Rendering in Buy Mode skips Live Mode hover interaction listing
-    (`Game::follow`).
+    (`0x48736b` + `0x43583e`); if still invalid, the unsnapped fallback
+    (`0x485f23` → `0x421e72`) leaves the held object off-lot (since
+    `UserTestPlace` requires low nibbles `== 8`) and places only `"Tile Cursor"`
+    at the unsnapped pointer coordinates when it fits. Dragging past the 6 px
+    radius (`dx^2 + dy^2 > 0x24`) rotates the held object using
+    `0x485d5d..0x485dad` (upper-left `6`, upper-right `4`, lower-left `0`,
+    lower-right `2`, minus `2 * camera_rotation`; compared against current
+    facing at `0x485da9` before subtracting the OBJD `+0x7a` facing offset
+    `0x434f8d`), while movement within 6 px continues normal tile placement.
+    Live Mode hover listing (`Game::follow`) and lot-click pie menus
+    (`Game::press`) run only in `Mode::Live` (`0x4cea5d`).
   - `OnMouseLeave` (`0x487d4e` → `0x421963`) takes both off the lot and resets
     cursor position off-lot; `OnMouseUp` (`0x4864d0`) first invokes move at the
     release coordinates (`0x4864f0`), then commits (`0x486ada` → `0x421a0e` →
@@ -118,8 +120,9 @@ panel, and `sims-vm` had no `"Tile Cursor"` creation or Buy placement tool.
     `0x48c053` invokes `0x48c0ea` (`USER_PICKUP` + `LEAVING`) on the retained
     instance and `0x48bdfe` line `0x48be72` skips the charge and returns `0`,
     so `0x493353` transfers the refused entry to Undo while preserving
-    remaining Redo entries. Both
-    keyboard handlers keep any armed placement preview, manual surface
+    remaining Redo entries. Both keyboard handlers dispatch directly to history
+    without lifting any active preview (so an on-lot preview still collides with
+    Redo via `0x4337f6`), keeping any armed placement preview, manual surface
     rotation, and catalog selection intact while refreshing preview validity.
     Leaving a non-Live mode or discarding history on an Undo/Redo fault clears
     the stack and deletes detached off-lot instances (`0x4cea5d` → `0x4933dc` →

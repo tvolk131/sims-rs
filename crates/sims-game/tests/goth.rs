@@ -5566,23 +5566,22 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
         assert!(!lot.world().objects.contains_key(&cursor.cursor));
     }
 
-    // Unsnapped retry (`0x485f23` -> `0x421e72`): Werkbunnst Chair collides
-    // with object 121 at snapped `[296, 424]` but fits at unsnapped `[292, 431]`.
-    // Committing, undoing, and redoing at unsnapped `[292, 431]` must reject
-    // Redo (`0x4355bc..0x4355cd` requires low nibbles == 8) without charging.
+    // Unsnapped fallback (`0x485f23` -> `0x421e72` -> `0x4355bc..0x4355cd`):
+    // Werkbunnst Chair collides with object 121 at snapped `[296, 424]`. Native
+    // `UserTestPlace` requires tile-centred coordinates (`low nibbles == 8`),
+    // so retrying at unsnapped `[292, 431]` leaves the held chair off-lot,
+    // places only `"Tile Cursor"` at `[292, 431, 1]`, and refuses commit.
     let mut unsnapped = lot.buy_start(0x26bf_bb29, 1, 2).unwrap().unwrap();
-    assert!(lot.buy_move(&mut unsnapped, [292, 431], 1).unwrap());
+    assert!(!lot.buy_move(&mut unsnapped, [292, 431], 1).unwrap());
+    assert!(!unsnapped.valid);
     assert_eq!(unsnapped.position, [292, 431, 1]);
-    assert_eq!(lot.world().objects[&unsnapped.held].position, [292, 431, 1]);
-    let funds_before_unsnapped = lot.world().budget.funds;
-    let unsnapped_id = lot.buy_commit(&unsnapped).unwrap();
-    assert_eq!(lot.world().budget.funds, funds_before_unsnapped - 80);
-    assert!(lot.buy_undo().unwrap());
-    assert_eq!(lot.world().budget.funds, funds_before_unsnapped);
-    assert!(lot.world().objects[&unsnapped_id].position[0] < 0);
-    assert!(!lot.buy_redo().unwrap());
-    assert_eq!(lot.world().budget.funds, funds_before_unsnapped);
-    assert!(lot.world().objects[&unsnapped_id].position[0] < 0);
+    assert!(lot.world().objects[&unsnapped.held].position[0] < 0);
+    assert_eq!(
+        lot.world().objects[&unsnapped.cursor].position,
+        [292, 431, 1]
+    );
+    assert!(lot.buy_commit(&unsnapped).is_err());
+    lot.buy_cancel(&unsnapped).unwrap();
 
     // Awning placement refusal (`0x48bdfe` line `0x48be72` -> `0x493353`):
     // buying Scrimpon Crimson Awnings (`0xefba77ca`) on open lawn `[584, 472]`
@@ -5766,6 +5765,20 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
     game.resize([800, 600]);
     game.render();
     assert_eq!(game.run(60), 60);
+    // Clicking the lot in Build or Options mode (`0x4cea5d`) must NOT open a
+    // Live Mode pie menu or mutate simulation state.
+    for non_live in [Mode::Build, Mode::Options] {
+        game.set_mode(non_live);
+        let hash_before = game.lot().world().hash();
+        game.press([266, 190]);
+        game.release([266, 190]);
+        assert!(game.menu().is_none(), "{non_live:?} opened a Live pie menu");
+        assert_eq!(
+            game.lot().world().hash(),
+            hash_before,
+            "{non_live:?} click mutated world state"
+        );
+    }
     game.set_mode(Mode::Buy);
     // Hovering and rendering in Buy Mode with no item armed must NOT run Live
     // Mode interaction checks (`Game::follow`) or mutate simulation state.
@@ -5809,9 +5822,12 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
             .iter()
             .any(|s| matches!(s, SoundEvent::Play { name, .. } if name == "UI_error"))
     );
-    // Available Undo / Redo (`0x4a8545`, `0x4a856a`) must keep the repeat
-    // preview cursor, held chair, and catalog selection armed, while updating
-    // preview validity as the tile frees and re-occupies.
+    // Available Undo (`0x4a8545`) keeps the repeat preview cursor, held chair,
+    // and catalog selection armed, moving the repeat preview onto the newly
+    // freed tile. Native Redo (`0x4a856a`) dispatches directly to history
+    // without lifting the preview, so the occupying preview chair refuses Redo
+    // (`0x4337f6`) without charging `$80`; once the preview leaves that tile,
+    // Undo + Redo restores the original chair and re-charges `$80`.
     assert!(game.can_undo());
     assert!(game.undo_buy());
     assert_eq!(game.buy_selected(), Some(0x26bf_bb29));
@@ -5824,24 +5840,31 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
     assert!(armed_after_undo.valid);
     assert!(game.lot().world().objects[&first_chair].position[0] < 0);
     assert_eq!(game.lot().world().budget.funds, 2542);
-    assert!(game.redo_buy());
+    // Blocked Redo: the active repeat preview occupies `spot`, so Redo must be
+    // refused without charging and transfer the refused record to Undo.
+    assert!(!game.redo_buy());
     assert_eq!(game.buy_selected(), Some(0x26bf_bb29));
-    let armed_after_redo = game
+    let armed_after_blocked_redo = game
         .buy_cursor()
-        .expect("repeat preview stays armed after Redo")
+        .expect("repeat preview stays armed after refused Redo")
         .clone();
-    assert_eq!(armed_after_redo.held, second.held);
-    assert_eq!(armed_after_redo.cursor, second.cursor);
-    assert!(!armed_after_redo.valid);
+    assert_eq!(armed_after_blocked_redo.held, second.held);
+    assert_eq!(armed_after_blocked_redo.cursor, second.cursor);
+    assert!(armed_after_blocked_redo.valid);
+    assert!(game.lot().world().objects[&first_chair].position[0] < 0);
+    assert_eq!(game.lot().world().budget.funds, 2542);
+    // Step back the refused record to Redo and cancel the blocking preview so
+    // Redo restores `first_chair` cleanly.
+    assert!(game.undo_buy());
+    assert_eq!(game.lot().world().budget.funds, 2542);
+    assert!(game.cancel_buy());
+    assert!(game.buy_cursor().is_none());
+    assert!(game.redo_buy());
     assert!(game.lot().world().objects[&first_chair].position[0] >= 0);
     assert_eq!(
         game.lot().world().objects[&first_chair].registry_word,
         first_reg
     );
-    assert_eq!(game.lot().world().budget.funds, 2542 - 80);
-
-    assert!(game.cancel_buy());
-    assert!(game.buy_cursor().is_none());
     assert_eq!(game.lot().world().objects.len(), objs_before + 1);
     let funds_after_buy = game.lot().world().budget.funds;
     assert_eq!(funds_after_buy, 2542 - 80);
