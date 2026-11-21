@@ -324,6 +324,62 @@ class RepositoryHygieneTests(unittest.TestCase):
                 result = self.assert_fails("known private game payload")
                 self.assertNotIn(payload.decode(), result.stdout + result.stderr)
 
+    def test_image_files_are_rejected_anywhere(self):
+        for name in [
+            "crates/sims-game/tests/scene.ppm", "crates/sims-game/tests/data/scene.tiff",
+            "crates/x/testdata/shot.qoi", "tests/scene.svg", "misc/scene.svg",
+            "docs/diagram.SVG", "scene.pgm",
+        ]:
+            with self.subTest(name=name):
+                path = self.write(name, "small")
+                self.assert_fails("image file")
+                path.unlink()
+
+    def test_image_content_is_rejected_anywhere_whatever_the_name(self):
+        for name, content in [
+            ("crates/sims-game/tests/scene.txt", "P3\n2 1\n255\n0 0 0 255 255 255\n"),
+            ("crates/sims-game/tests/scene.txt", "P6 # comment\n800 600\n255\n"),
+            ("tests/scene.txt", "P3\n2\n# between the width and the height\n1\n255\n0 0 0 1 1 1\n"),
+            ("tests/scene.txt", "P3 # a comment ended by a carriage return\r2 1\r255\r0 0 0 1 1 1\r"),
+            ("tests/scene.txt", "P3\r\n# crlf\r\n2 1\r\n255\r\n0 0 0 1 1 1\r\n"),
+            ("tests/scene.txt", "P6#comment\n800 600 255\n"),
+            ("tests/scene.txt", "P7\nWIDTH 2\nHEIGHT 1\nENDHDR\n"),
+            ("tests/scene.txt",
+             '<?xml version="1.0"?>\n<!-- drawn -->\n<svg xmlns="http://www.w3.org/2000/svg"/>\n'),
+            ("tests/scene.txt", '<s:svg xmlns:s="http://www.w3.org/2000/svg" width="1"/>'),
+            ("tests/scene.txt",
+             '<!DOCTYPE svg [ <!ENTITY a "b"> ]>\n<?pi x?>\n<SVG:SVG xmlns:SVG="x"></SVG:SVG>'),
+            ("misc/notes.txt", "<svg width='1'></svg>"),
+            ("misc/notes.txt",
+             '<!DOCTYPE x [ <!ENTITY e "]>"> <!ENTITY f \'"]>\'> ]>\n<s:svg xmlns:s="x"/>'),
+            ("misc/notes.txt", '\ufeff  \n<?xml version="1.0"?><svg/>'),
+            ("misc/notes.txt", '<?xml version="1.0" encoding="Shift_JIS"?><svg/>'),
+            ("misc/notes.txt", '<?xml version="1.0" encoding="no-such-encoding"?><svg/>'),
+            ("misc/notes.txt",
+             b'<?xml version="1.0" encoding="ISO-8859-1"?>'
+             b'<\xc2\xb7:svg xmlns:\xc2\xb7="http://www.w3.org/2000/svg"/>'),
+            ("misc/notes.txt", "\ufeff<svg/>".encode("utf-16")),
+            ("docs/picture.md", "P6\n800 600\n255\n"),
+            ("tests/scene.txt", b"\x89PNG\r\n\x1a\nrest"),
+            ("tests/scene.txt", b"GIF89a...."),
+        ]:
+            with self.subTest(name=name, content=content):
+                path = self.write(name, content)
+                self.assert_fails("image content")
+                path.unlink()
+
+    def test_text_that_is_not_an_image_passes(self):
+        self.write("crates/sims-game/tests/ratchet.txt", "[scene]\ntick = 1260\nP6 is a word\n")
+        self.write("crates/sims-game/tests/words.txt", "P6 is a word, not a header\n")
+        self.write("crates/sims-game/tests/render.rs", 'const SVG: &str = "<svg>";\n')
+        self.write("web/page.html", "<!-- a page -->\n<html><body><svg></svg></body></html>\n")
+        self.write("web/notes.md", "<!-- notes -->\n# Notes about svg\n")
+        self.write("web/feed.xml",
+                   '<!DOCTYPE x SYSTEM "http://example.invalid/x.dtd" [ <!ENTITY e "<svg>]>"> ]>'
+                   '<feed>&e;</feed>')
+        self.write("src/picture.ppm.rs", "// a source file\n")
+        self.assert_passes()
+
     def test_binary_content_cannot_hide_under_a_source_extension(self):
         self.write("source.rs", b"synthetic\0binary")
         self.assert_fails("binary content")
