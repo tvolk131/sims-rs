@@ -177,6 +177,18 @@ pub struct Finished {
     pub counted: usize,
 }
 
+/// What the game holds when a lot loads straight after an open's pools
+/// ([`Lot::load_after_pools`]).
+#[derive(Debug, Clone, Default)]
+pub struct Handoff {
+    /// The skeletons, by name, whose files the game has already read.
+    /// They are added to the files our load counts as read before the
+    /// first lot.
+    pub skeletons_read: BTreeSet<String>,
+    /// Whether the two indicators' graphics roots already exist.
+    pub indicators_made: bool,
+}
+
 /// A booted house: its linked code, its catalog and its lot.
 pub struct Lot {
     program: Program,
@@ -485,13 +497,14 @@ impl Lot {
             frames,
             crt,
             frame_tree_bits,
+            None,
         )
     }
 
     /// [`Lot::load`] with the neighborhood already open, as opening it
-    /// left it ([`sims_sim::patch_import::open`]): its records and
-    /// families come from `neighborhood`, its people's files from its
-    /// directory's `Characters`.
+    /// left it ([`crate::neighborhood_open::open_neighborhood`]). Its
+    /// records and families come from `neighborhood` and its people's
+    /// files from that neighborhood's `Characters` directory.
     pub fn load_in(
         root: &Path,
         neighborhood: Neighborhood,
@@ -527,10 +540,47 @@ impl Lot {
             frames,
             crt,
             &BTreeSet::new(),
+            None,
+        )
+    }
+
+    /// [`Lot::load_in_with`] straight after an open's pools
+    /// ([`crate::neighborhood_open::open_neighborhood`]), from the C
+    /// runtime state they leave. What the game already holds then is
+    /// given as `handoff`, not assumed: which skeleton files it has read
+    /// (0x598af7 skips a file already read; that none was cleared, as
+    /// 0x5a38b3 can, is assumed), and whether the two indicators
+    /// exist, whose graphics roots draw 64 numbers when made (0x445e4a,
+    /// 0x595d65). The lot still makes its indicator objects; with
+    /// `indicators_made`, their draws are not charged again.
+    ///
+    /// Both are inputs from a recording, not ported: which callback ran
+    /// the Townies and tourists, and what it did before them, is not
+    /// traced. Track 2's run 2 fits an adult skeleton read and the
+    /// indicators made (`20261120-neighborhood-open-replays-five-pools.md`).
+    pub fn load_after_pools(
+        root: &Path,
+        neighborhood: Neighborhood,
+        house: &Path,
+        answers: &[u8],
+        frames: Frames,
+        crt: CrtRng,
+        handoff: &Handoff,
+    ) -> Result<Self, BootError> {
+        Self::boot(
+            root,
+            neighborhood,
+            house,
+            answers,
+            frames,
+            crt,
+            &BTreeSet::new(),
+            Some(handoff),
         )
     }
 
     /// The load itself, with every input the loaders above take.
+    #[allow(clippy::too_many_arguments)]
     fn boot(
         root: &Path,
         neighborhood: Neighborhood,
@@ -539,6 +589,7 @@ impl Lot {
         frames: Frames,
         crt: CrtRng,
         frame_tree_bits: &BTreeSet<(u16, usize)>,
+        handoff: Option<&Handoff>,
     ) -> Result<Self, BootError> {
         let install = Install::detect(root)?;
         let mut index = Index::build(&install)?;
@@ -605,6 +656,22 @@ impl Lot {
             world
                 .skeleton_files
                 .extend(crate::objects::read_before_the_first_load(&program.people));
+            for name in handoff.iter().flat_map(|handoff| &handoff.skeletons_read) {
+                let files: BTreeSet<&String> = program
+                    .people
+                    .skeletons
+                    .values()
+                    .filter(|skeleton| skeleton.name.eq_ignore_ascii_case(name))
+                    .map(|skeleton| &skeleton.file)
+                    .collect();
+                let [file] = files.into_iter().collect::<Vec<_>>()[..] else {
+                    return Err(format!(
+                        "0x598af7: the handoff's skeleton {name:?} is not in exactly one file"
+                    )
+                    .into());
+                };
+                world.skeleton_files.insert(file.clone());
+            }
             world.read_neighbors(
                 &neighborhood,
                 &sims_sim::neighbors::registry(&index, &catalog),
@@ -614,7 +681,13 @@ impl Lot {
             if let Some(saved) = &neighborhood.type_attributes {
                 world.read_type_attributes(saved);
             }
+            let before_indicators = world.crt_rng;
             interpreter.create_indicators(&mut world)?;
+            if handoff.is_some_and(|handoff| handoff.indicators_made) {
+                // The factory called above builds both graphics roots
+                // (0x595d65); the handoff says that happened before.
+                world.crt_rng = before_indicators;
+            }
             // The load steps, in the original's order.
             world.read_simulator(&file.simulator);
             // With the simulator state, the house file's model gives the
