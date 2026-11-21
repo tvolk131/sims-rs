@@ -1424,7 +1424,27 @@ impl<S: Samples> Player<S> {
             // (0x574f0e).
             self.station_patches.push((id, path.clone()));
         }
-        (self.tracks, self.patches) = owners(&self.modules, &self.station_patches);
+        let (tracks, patches) = owners(&self.modules, &self.station_patches);
+        // An object replaced goes, with what it was doing (0x5750dc calls
+        // 0x57cdd5, which destroys it, 0x57ce04 to 0x57ce32). The original
+        // builds the stations before any sound plays; here they may come
+        // later.
+        let replaced: BTreeSet<u32> = self
+            .tracks
+            .iter()
+            .filter(|&(id, owner)| tracks.get(id) != Some(owner))
+            .map(|(&id, _)| id)
+            .chain(
+                self.patches
+                    .iter()
+                    .filter(|&(id, owner)| patches.get(id) != Some(owner))
+                    .map(|(&id, _)| id),
+            )
+            .collect();
+        (self.tracks, self.patches) = (tracks, patches);
+        for id in replaced {
+            self.destroy(id);
+        }
         // The original builds the stations between the base game's
         // tables and the expansions' ([`crate::registry`]).
         self.registry = registry(&self.modules, &self.station_patches);
@@ -1650,6 +1670,22 @@ impl<S: Samples> Player<S> {
         if !self.patches.contains_key(&track) {
             self.report(format!("no track {track}"));
         }
+    }
+
+    /// Forgets everything the object of this ID was doing, as a track and
+    /// as a patch: its threads and notes, any note of it as a patch, and
+    /// its cached samples.
+    fn destroy(&mut self, id: u32) {
+        self.kill_track(id);
+        self.held.remove(&id);
+        self.idle.remove(&id);
+        self.ended.retain(|_, t| t.track != id);
+        self.instances.retain(|&(t, _)| t != id);
+        self.track_objects.remove(&id);
+        self.last_start.remove(&id);
+        self.notes
+            .retain(|n| n.track != id && n.patch != id && !n.chain.contains(&id));
+        self.cache.remove(&id);
     }
 
     /// Whether the registry has an object of this ID (0x573312), a track
@@ -2009,9 +2045,10 @@ impl<S: Samples> Player<S> {
     /// argument.
     fn play_piano(&mut self, args: [u32; 3], sources: &dyn Sources) {
         // A patch object of the number goes on: its start does nothing
-        // (0x573e95, 0x57bf80), and the skill track is still started
-        // (0x573ec3 to 0x573ef2). **Unverified:** what instance it
-        // records (its slot +0x24, 0x573e9c).
+        // (0x573e95, 0x57bf80), its object is 0x80000000 (0x573e9c calls
+        // 0x57bf4e, which reads +0xb0; the patch's constructor sets it,
+        // 0x57bf0e to 0x57bf19), and the skill track is still started
+        // (0x573ec3 to 0x573ef2).
         if !self.registered(PIANO) {
             return;
         }
@@ -2026,7 +2063,10 @@ impl<S: Samples> Player<S> {
         }
         let started = self.start(args, PIANO);
         self.let_go(&started.threads);
-        let object = self.track_objects.get(&PIANO).copied().unwrap_or(0);
+        let object = match self.owner(PIANO) {
+            Some(_) => self.track_objects.get(&PIANO).copied().unwrap_or(0),
+            None => 0x8000_0000,
+        };
         self.instances.retain(|&(t, _)| t != PIANO);
         self.record(PIANO, object);
         // The skill is asked for before the skill track is looked up.
@@ -2057,8 +2097,10 @@ impl<S: Samples> Player<S> {
             0 => 0,
             n => list[self.random(n as u32) as usize],
         };
-        // A patch object of the number still picks from the list; its
-        // slot then does nothing (0x573f1b to 0x573f2b, 0x57fcd2).
+        // A patch object of the number still picks from the list. **Not
+        // ported:** its slot (0x573f2b, 0x57fcd2) can then stop the
+        // patch's playback and let go of its samples; no kind 53 event
+        // in the install names a patch.
         let Some(owner) = self.owner(track) else {
             return;
         };

@@ -27,14 +27,16 @@ port now does the same.
   - Elsewhere a patch object still counts as an object of that number.
     The radio's note cancelling goes on past it (0x573a29 to 0x573a5c).
     The piano still asks for the skill and starts the skill track
-    (0x573e66 to 0x573ef2). Kind 53 still picks from its hit list, then
-    calls the patch's slot, which does nothing (0x573f1b to 0x573f2b,
-    0x57fcd2).
+    (0x573e66 to 0x573ef2); the instance it records is the patch's
+    0x80000000 (0x573e9c calls 0x57bf4e, which reads +0xb0, set at
+    0x57bf0e to 0x57bf19). Kind 53 still picks from its hit list, then
+    calls the patch's slot (0x573f1b to 0x573f2b, 0x57fcd2).
   - The station patches register through the same routine (0x5750dc),
     after the base game's tables and before the expansions'. Their
     allocator does not look at the registry (0x57d386). So a station
     patch replaces a base game object of its number, and an expansion's
-    or a download's object replaces a station patch.
+    or a download's object replaces a station patch. Replacing an
+    object destroys it, with what it was doing.
 - **Track data.** Each `[TrackData]` line stores its address in the
   program being loaded into one table for every module (manager +0x168,
   0x57ce70 to 0x57ce98). A later line with the same ID points into the
@@ -67,6 +69,9 @@ port now does the same.
   `call`, led to. A `call` returns into the caller's program.
 - The stations' hit lists are added between the base game's lists and
   the expansions'.
+- Stations added after sound has played destroy what they replace: the
+  old object's threads, notes and cached samples. (The original builds
+  them before any sound plays.)
 - Events still come from the first module that defines them. This
   change does not touch event lookup.
 
@@ -94,15 +99,23 @@ port now does the same.
 
 - The order of the downloads among themselves. It decides track 6403
   and patch 6400. Here it is by name.
-- What instance the piano records when its number is a patch object
-  (the patch's slot +0x24, 0x573e9c). Here it records the piano's object
-  as it would for a track.
 - No station patch number collides with a table's ID in the install, so
   the station rules above change nothing there.
+
+## Not ported
+
+- Kind 53's patch slot (0x57fcd2) can stop the patch's playback and let
+  go of its samples. Here a kind 53 event that names a patch object
+  picks from its hit list and does nothing more. No kind 53 event in the
+  install names a patch.
 
 ## Left as it was
 
 - A `jump` (opcode 13) in the original always reads a four-byte operand
   (0x57e3ae). This player still reads a register operand when the four
-  bytes are not a track data ID. All 401 jumps in the install decode the
-  same either way.
+  bytes are not a track data ID.
+  - All 401 jumps in the install decode the same whether that check
+    uses the jump's own module's track data or the shared table, which
+    is what this change could affect.
+  - Two of them still take the register form. Reading four bytes there
+    instead breaks one program's disassembly, so that form stays.

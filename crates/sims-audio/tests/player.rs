@@ -3107,6 +3107,42 @@ fn a_station_patch_replaces_a_base_game_object_and_an_expansion_replaces_it() {
 }
 
 #[test]
+fn stations_added_after_playing_destroy_the_objects_they_replace() {
+    // Registering an ID again destroys its object (0x57ce04 to 0x57ce32).
+    // Track 10 plays patch 1, `one.xa`, which is cached; station patch 1,
+    // `two.xa`, replaces it while it plays, so the note stops and the
+    // next start plays `two.xa`.
+    let mut base = module_with(&[&GENERIC], 1, 10, "");
+    base.name = "sounddata\\base".to_owned();
+    let mut player = Player::new(vec![base], samples(), 1);
+    play(&mut player, "e0");
+    assert_eq!(player.render(BLOCK, &NoSources)[..3], [1, 2, 3]);
+    player.add_stations(&StationLists {
+        hit_lists: BTreeMap::new(),
+        patches: BTreeMap::from([(1, "two.xa".to_owned())]),
+    });
+    // The note of the patch went with it; its thread, waiting for it,
+    // ends in the next block.
+    assert!(player.render(BLOCK, &NoSources).iter().all(|&s| s == 0));
+    assert!(player.is_idle());
+    play(&mut player, "e0");
+    assert_eq!(player.render(BLOCK, &NoSources)[..3], [2000, 4000, -2000]);
+    // A running track whose number a station patch takes ends with it.
+    let mut base = module_of_tracks(&[(10, &asks(7, true))], "");
+    base.name = "sounddata\\base".to_owned();
+    let mut player = Player::new(vec![base], samples(), 1);
+    play(&mut player, "e10");
+    assert_eq!(fields_asked_in_order(&mut player), [7]);
+    player.add_stations(&StationLists {
+        hit_lists: BTreeMap::new(),
+        patches: BTreeMap::from([(10, "two.xa".to_owned())]),
+    });
+    assert!(player.is_idle());
+    assert_eq!(fields_asked_in_order(&mut player), []);
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
 fn a_play_of_a_running_track_takes_its_own_argument_kind() {
     // One module's track 10 takes no levels from its arguments; it asks
     // once and waits, with interrupt 1. Another's, listed first, is
