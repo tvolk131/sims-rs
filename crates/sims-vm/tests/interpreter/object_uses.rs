@@ -289,10 +289,10 @@ fn a_new_action_works_the_footprint_out_again_while_person_word_73_is_set() {
     // A facing the footprint does not handle fails before the action
     // changes.
     let mut fx = wide();
-    fx.sim_mut().data[1] = 9;
+    fx.sim_mut().data[1] = 10;
     let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
     let fault = interpreter.turn(&mut fx.world, SIM, 100).unwrap_err();
-    assert!(fault.to_string().contains("facing 9"), "{fault}");
+    assert!(fault.to_string().contains("facing 10"), "{fault}");
     let sim = fx.sim();
     assert_eq!(sim.footprint, [1, 2, 3, 4]);
     let person = sim.person.as_ref().unwrap();

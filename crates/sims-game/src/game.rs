@@ -596,6 +596,7 @@ impl Game {
             return false;
         }
         self.view.resize(size);
+        self.hud.resize_menu(size);
         true
     }
 
@@ -612,10 +613,22 @@ impl Game {
         self.hud.covers(point)
     }
 
+    /// Whether `point` lies inside the canvas (`[0..width, 0..height)`).
+    fn in_view(&self, point: [i32; 2]) -> bool {
+        point[0] >= 0
+            && point[1] >= 0
+            && point[0] < self.view.size[0]
+            && point[1] < self.view.size[1]
+    }
+
     /// Moves the pointer to `point`. When it first reaches an object on
     /// the lot, the selected Sim's pie menu on it is listed, as the
     /// original lists it then (0x48c834); listing changes the lot.
+    /// A point outside the canvas is treated as [`Game::leave`].
     pub fn hover(&mut self, point: [i32; 2]) -> bool {
+        if !self.in_view(point) {
+            return self.leave();
+        }
         self.pointer = Some(point);
         let mut redraw = self.hud.hover(point);
         redraw |= self.highlight(point);
@@ -634,22 +647,26 @@ impl Game {
     }
 
     /// A left press at `point`, which is over the panel or the lot.
+    ///
+    /// While a pie menu is open (with no dialog over it), a press only
+    /// updates which entry is under `point` and marks the button held
+    /// (0x5eb3d1 with `+0x170` clear); the entry is chosen, or the menu
+    /// closed, on the matching [`Game::release`] (0x5eb433).
     pub fn press(&mut self, point: [i32; 2]) -> Outcome {
+        if self.hud.dialog().is_none() && self.hud.menu.is_some() {
+            self.pointer = Some(point);
+            let mut redraw = self.hud.hover(point);
+            redraw |= self.highlight(point);
+            if let Some(menu) = &mut self.hud.menu {
+                redraw |= menu.press();
+            }
+            return Outcome {
+                redraw,
+                photo: false,
+            };
+        }
         let cleared = self.note.take().is_some();
         if self.hud.covers(point) {
-            // Choosing an entry checks it again first: the pie's
-            // button-up handler (0x5eb433) tells the house view about the
-            // entry under the pointer as chosen (0x1ac with 1), and the
-            // house view runs its check (0x48df28) as it does when the
-            // pointer reaches the entry. The original chooses at the
-            // button's release; the window chooses at the press, as it
-            // did before this check was ported.
-            if let Some(entry) = self.hud.menu.as_ref().and_then(|m| m.highlighted(point)) {
-                self.check_entry(entry);
-            }
-            // A failed check's note stays in front of what the choice
-            // says.
-            let failed = self.note.take();
             // The menu, whose entries a choice is an index into.
             let menu = self.hud.menu.clone();
             let outcome = match self
@@ -659,12 +676,6 @@ impl Game {
                 Some(command) => self.command(command, menu.as_ref()),
                 None => Outcome::redraw(),
             };
-            if let Some(failed) = failed {
-                self.note = Some(match self.note.take() {
-                    Some(note) => format!("{failed} {note}"),
-                    None => failed,
-                });
-            }
             let sounds = self.hud.take_sounds();
             self.keep_sounds(sounds);
             return outcome;
@@ -677,6 +688,93 @@ impl Game {
         };
         self.open_menu(target, point);
         Outcome::redraw()
+    }
+
+    /// A left release at `point` (0x5eb433).
+    ///
+    /// Acts only while a pie menu is open with no dialog over it:
+    /// - updates which entry is under `point` as mouse-move does
+    ///   (`+0xfc`, 0x5eb4d7);
+    /// - for the opening press's release, settles the menu into
+    ///   click-to-choose mode unless the pointer moved past the dead zone
+    ///   without the menu having moved on screen;
+    /// - otherwise checks the entry under `point` again (`0x5eb62a` ->
+    ///   event `0xe` -> `0x48df28`) and chooses it, opens or leaves a
+    ///   submenu, or closes the menu.
+    pub fn release(&mut self, point: [i32; 2]) -> Outcome {
+        if !self.in_view(point) {
+            return self.release_outside();
+        }
+        if self.hud.dialog().is_some() || self.hud.menu.is_none() {
+            return Outcome {
+                redraw: false,
+                photo: false,
+            };
+        }
+        self.pointer = Some(point);
+        let mut redraw = self.hud.hover(point);
+        redraw |= self.highlight(point);
+        let will_choose = self.hud.menu.as_ref().is_some_and(|m| m.will_choose(point));
+        if !will_choose {
+            let was_held = self.hud.menu.as_ref().is_some_and(|m| m.held());
+            let (release, command) = self.hud.release_menu(point);
+            debug_assert_eq!((release, command), (menu::Release::Settled, None));
+            return Outcome {
+                redraw: redraw || was_held,
+                photo: false,
+            };
+        }
+        let _ = self.note.take();
+        // Choosing an entry checks it again first (0x5eb433 -> 0x5eb62a
+        // -> event 0xe -> 0x48df28).
+        if let Some(entry) = self.hud.menu.as_ref().and_then(|m| m.highlighted(point)) {
+            self.check_entry(entry);
+        }
+        // A failed check's note stays in front of what the choice says.
+        let failed = self.note.take();
+        let menu = self.hud.menu.clone();
+        let (_, command) = self.hud.release_menu(point);
+        self.highlighted = None;
+        let outcome = match command {
+            Some(command) => self.command(command, menu.as_ref()),
+            None => Outcome::redraw(),
+        };
+        if let Some(failed) = failed {
+            self.note = Some(match self.note.take() {
+                Some(note) => format!("{failed} {note}"),
+                None => failed,
+            });
+        }
+        let sounds = self.hud.take_sounds();
+        self.keep_sounds(sounds);
+        outcome
+    }
+
+    /// A left release while the pointer is outside the window (after
+    /// [`Game::leave`]): settles an opening press on a moved menu, or
+    /// closes the pie without checking or choosing any entry.
+    pub fn release_outside(&mut self) -> Outcome {
+        if self.hud.dialog().is_some() || self.hud.menu.is_none() {
+            return Outcome {
+                redraw: false,
+                photo: false,
+            };
+        }
+        self.pointer = None;
+        self.highlighted = None;
+        let redraw = self.hud.leave();
+        let was_held = self.hud.menu.as_ref().is_some_and(|m| m.held());
+        match self.hud.release_menu_outside() {
+            menu::Release::Settled => Outcome {
+                redraw: redraw || was_held,
+                photo: false,
+            },
+            menu::Release::Closed => {
+                let _ = self.note.take();
+                Outcome::redraw()
+            }
+            menu::Release::Chose(_) | menu::Release::Stays => unreachable!(),
+        }
     }
 
     /// The pointer left the window: it is on no object, button, portrait
@@ -872,7 +970,11 @@ impl Game {
 
     /// Closes the pie menu; false if none was open.
     pub fn close_menu(&mut self) -> bool {
-        self.hud.menu.take().is_some()
+        let closed = self.hud.menu.take().is_some();
+        if closed {
+            self.highlighted = None;
+        }
+        closed
     }
 
     /// Queues `entry` of the pie menu on `object` for `person`, as

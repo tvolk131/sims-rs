@@ -231,13 +231,19 @@ fn a_tile_of_a_group_is_never_grabbed() {
 }
 
 /// A put that fails partway, on what the port does not model (here an
-/// object facing 8, whose footprint is not worked out), leaves the lot as
-/// it was: the widget stays in the lamp.
+/// object with insets facing 10, whose footprint is not worked out), leaves
+/// the lot as it was: the widget stays in the lamp.
 #[test]
 fn a_grab_whose_put_fails_leaves_the_lot_as_it_was() {
     let (mut fx, id) = lot(true);
     assert_eq!(grab(&mut fx, LAMP, id as i16), Ok(true));
-    fx.world.objects.get_mut(&id).unwrap().data[1] = 8;
+    let file = fx
+        .catalog
+        .object(fx.world.objects[&id].guid)
+        .unwrap()
+        .resource;
+    fx.words(file)[0x9a / 2] = 0x1111;
+    fx.world.objects.get_mut(&id).unwrap().data[1] = 10;
     // The failed run leaves its own frame on my stack.
     let lot_hash = |world: &sims_sim::World| {
         let mut world = world.clone();
@@ -248,7 +254,7 @@ fn a_grab_whose_put_fails_leaves_the_lot_as_it_was() {
     };
     let before = lot_hash(&fx.world);
     let result = grab(&mut fx, SIM, id as i16);
-    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("facing 8")));
+    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("facing 10")));
     assert_eq!(lot_hash(&fx.world), before);
 }
 
