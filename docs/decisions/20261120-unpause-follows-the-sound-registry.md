@@ -36,8 +36,17 @@ follows the original's registry of patch and track objects.
   simply newest first.
 - The unpause walks the map bucket by bucket, each from its head
   (0x57cd56, 0x5807c2, 0x576be5), and lets each object go.
-- The map is cleared only when the sound is torn down (0x57ca76, also
-  reached by kind 104) and destroyed (0x57c712), not on a lot load.
+- The base load (0x5715fa) takes the files directly in `SoundData`,
+  not its subdirectories (0x5d8729). The expansions' calls each test
+  that expansion's bit; the full install takes all nine.
+- The downloads' directories are the parent directories of the
+  download objects the catalog registered, each once, in the order the
+  catalog met them (0x43bdc5).
+- The map is cleared only when the sound is torn down (0x57ca76) and
+  destroyed (0x57c712), not on a lot load. Kind 104 tears the sound
+  down and builds it again from the base tables and the stations
+  (0x5742a3, 0x5742b6), so an unpause after it walks that new map. This
+  player does not port kind 104.
 
 ## What changes here
 
@@ -54,7 +63,14 @@ follows the original's registry of patch and track objects.
 - `Player::unpause` lets go of the running tracks in the registry's
   order. A track no module lists goes last, by number.
 
-## Unverified
+## Unverified, and not ported
+
+- **Not ported:** the player registers every module outside the base
+  and expansion directories last, not only those in the directories of
+  download objects the catalog registered. With the stock install they
+  are the same. An install with sound tables in a directory no
+  registered object uses would register more IDs here, which can move
+  the map's growth.
 
 - **Unverified:** the order the original takes the files of one
   directory in, and the downloads' directories in. Here they go by name.
