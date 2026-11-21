@@ -218,6 +218,9 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const RATE: u32 = 22_050;
 /// Frames mixed between two runs of the threads (about 2.9 ms).
 pub const BLOCK: usize = 64;
+/// *(code)* Frames per 20 ms (50 Hz) periodic sound-manager timer tick
+/// (`0x572fc3`: `push 0x14` → `0x572fd6` → `0x573019`), exact at [`RATE`].
+pub const TIMER_FRAMES: usize = (RATE as usize * 20) / 1000;
 /// Instructions one thread may run in one block before the player calls
 /// it stuck and ends it.
 pub const STEPS: usize = 10_000;
@@ -940,6 +943,8 @@ pub struct Player<S> {
     frame: u64,
     /// The frame at which the threads last ran.
     ran_at: Option<u64>,
+    /// The frame at which the 20 ms volume-nudge timer last stepped (`0x573019`).
+    nudged_at: Option<u64>,
     next_id: u32,
     /// The next [`Thread::order`].
     next_order: i64,
@@ -997,6 +1002,7 @@ impl<S: Samples> Player<S> {
             ambient_cache: BTreeMap::new(),
             frame: 0,
             ran_at: None,
+            nudged_at: None,
             next_id: 1,
             next_order: 0,
             random: splitmix(seed),
@@ -1007,15 +1013,23 @@ impl<S: Samples> Player<S> {
     /// Sets a global register (100 to 255), such as `SimSpeed`.
     pub fn set_global(&mut self, register: u8, value: i32) {
         assert!(register >= GLOBALS, "register {register} is not global");
-        self.globals[usize::from(register - GLOBALS)] = value;
+        let slot = &mut self.globals[usize::from(register - GLOBALS)];
+        let changed = *slot != value;
+        *slot = value;
+        if register == MAIN_DUCKPRI && changed {
+            self.apply_running_gains(None);
+        }
     }
 
     /// Sets a track group's volume, 0 to 1024 (the options' sliders):
     /// `kGroupSfx` 1, `kGroupMusic` 2, `kGroupVox` 3.
     ///
-    /// *(code)* The effects group's volume is also every ambience
-    /// player's volume, as kind 37 sets both (to its slider's step,
-    /// table 0x67156c).
+    /// *(code)* Refreshes gains only on running tracks in `group` through
+    /// `0x57c0ea` → `0x57f759` (reading `vol`, `extvol`, `3D` and
+    /// `duckpri` through `target` via `0x57de16`, leaving idle kind-53
+    /// voices and other groups untouched). The effects group's volume is
+    /// also every ambience player's volume, as kind 37 sets both (to its
+    /// slider's step, table 0x67156c).
     pub fn set_group_volume(&mut self, group: i64, volume: i32) {
         let volume = volume.clamp(0, 1024);
         self.group_volumes.insert(group, volume);
@@ -1025,7 +1039,7 @@ impl<S: Samples> Player<S> {
                 self.with_score(mode, |score, host| score.set_volume(volume, host));
             }
         }
-        self.apply_levels();
+        self.apply_running_gains(Some(group));
     }
 
     /// *(code)* Kind 37 (`0x57408f`): sets the effects volume slider step
@@ -1081,7 +1095,7 @@ impl<S: Samples> Player<S> {
         for voice in &mut self.voices {
             voice.note.gains = ambient_gains(voice.volume, voice.pan, self.master);
         }
-        self.apply_levels();
+        self.apply_running_gains(None);
     }
 
     /// Adds an ambience score for a mode (see [`ambience::SCORES`]), its
@@ -2219,7 +2233,9 @@ impl<S: Samples> Player<S> {
         if self.owner(track).is_none() || self.day_night_playing(track) {
             return;
         }
-        let target_vol = self.group_volumes.get(&1).copied().unwrap_or(1024);
+        // *(code)* 0x574a07..0x574a10: reads manager `+0xf0` (`fx_volume_step`)
+        // through `0x67156c` (`VOLUME_STEPS`), independent of raw group 1 volume.
+        let target_vol = VOLUME_STEPS[usize::from(self.volume_steps[0])];
         let started = self.start([0; 3], track);
         if let Some(&id) = started.threads.last()
             && let Some(at) = self.threads.iter().position(|t| t.id == id)
@@ -3004,9 +3020,14 @@ impl<S: Samples> Player<S> {
         };
         let mut out = Vec::with_capacity(samples.min(2 * RATE as usize));
         while out.len() < samples {
+            self.step_nudge_timer(sources);
             self.run_at_block_start(sources);
             let until_block = BLOCK - (self.frame % BLOCK as u64) as usize;
-            let count = until_block.min(frames - out.len() / 2);
+            let mut count = until_block.min(frames - out.len() / 2);
+            if self.nudge != 0 {
+                let until_timer = TIMER_FRAMES - (self.frame % TIMER_FRAMES as u64) as usize;
+                count = count.min(until_timer);
+            }
             self.mix(count, &mut out);
             self.frame += count as u64;
         }
@@ -3020,30 +3041,45 @@ impl<S: Samples> Player<S> {
         let limit = limit.min(RENDER_LIMIT);
         let mut out = Vec::new();
         while out.len() < limit {
+            self.step_nudge_timer(sources);
             self.run_at_block_start(sources);
             if self.is_idle() {
                 break;
             }
             let until_block = BLOCK - (self.frame % BLOCK as u64) as usize;
-            out.extend(self.render(until_block.min(limit - out.len()), sources));
+            let mut count = until_block.min(limit - out.len());
+            if self.nudge != 0 {
+                let until_timer = TIMER_FRAMES - (self.frame % TIMER_FRAMES as u64) as usize;
+                count = count.min(until_timer);
+            }
+            out.extend(self.render(count, sources));
         }
         out
+    }
+
+    /// *(code)* `0x572fc3` → `0x572fd6` → `0x573019`: every 20 ms
+    /// ([`TIMER_FRAMES`] = 441 frames at 22,050 Hz), while `+0x114`
+    /// (`self.nudge`) is nonzero, places every track nudged then normal
+    /// and decrements the countdown (100 updates = 2.00 s).
+    fn step_nudge_timer(&mut self, sources: &dyn Sources) {
+        if self.nudge != 0
+            && self.frame > 0
+            && self.frame.is_multiple_of(TIMER_FRAMES as u64)
+            && self.nudged_at != Some(self.frame)
+        {
+            self.nudged_at = Some(self.frame);
+            let remaining = self.nudge;
+            self.place_all(sources);
+            self.nudge = 0;
+            self.place_all(sources);
+            self.nudge = remaining - 1;
+        }
     }
 
     /// Runs the threads once at the start of each block.
     fn run_at_block_start(&mut self, sources: &dyn Sources) {
         if self.frame.is_multiple_of(BLOCK as u64) && self.ran_at != Some(self.frame) {
             self.ran_at = Some(self.frame);
-            // *(code)* 0x573019: before stepping the HIT tracks, while
-            // `+0x114` is nonzero, place every track nudged then normal
-            // and decrement the countdown.
-            if self.nudge != 0 {
-                let remaining = self.nudge;
-                self.place_all(sources);
-                self.nudge = 0;
-                self.place_all(sources);
-                self.nudge = remaining - 1;
-            }
             self.run(sources);
             self.update_ambience();
         }
@@ -3074,16 +3110,20 @@ impl<S: Samples> Player<S> {
         debug_assert_eq!(out.len(), start + 2 * frames);
     }
 
-    /// A thread's levels from its registers and the player's settings.
+    /// *(code)* A thread's levels from its registers and the player's
+    /// settings (`0x57f759` for volume/pan/ducking and `0x57f71d` for
+    /// pitch): `vol`, `extvol`, `duckpri`, and `Is3d` are read through
+    /// `target` (`vtable[+0x88]` → `0x57de16`), while `pan` (`[esi + 0x44]`,
+    /// `0x57f85f`), `pitch` (`[esi + 0x48]`, `0x57f734`), and the track's
+    /// HOT group (`[esi + 0xc4]`, `0x57f867`) come from the thread itself.
     fn levels(&self, thread: &Thread) -> Levels {
-        let register = |r: u8| thread.registers[usize::from(r)];
         levels::levels(&Inputs {
-            vol: register(VOL),
-            extvol: register(EXTVOL),
-            pan: register(PAN),
-            pitch: register(PITCH),
-            duck_priority: register(DUCKPRI),
-            three_d: register(THREE_D) != 0,
+            vol: self.read(thread, i64::from(VOL)),
+            extvol: self.read(thread, i64::from(EXTVOL)),
+            pan: thread.registers[usize::from(PAN)],
+            pitch: thread.registers[usize::from(PITCH)],
+            duck_priority: self.read(thread, i64::from(DUCKPRI)),
+            three_d: self.read(thread, i64::from(THREE_D)) != 0,
             group_volume: self
                 .group_volumes
                 .get(&thread.group)
@@ -3094,21 +3134,20 @@ impl<S: Samples> Player<S> {
         })
     }
 
-    /// Gives every note of a running track its thread's levels
-    /// (`0x57c0ea` walks the running-track list and does not include
-    /// idle kind-53 voices). (The original sets them as registers
-    /// change; here once per block, after the threads run, and on group
-    /// or master volume changes.)
-    fn apply_levels(&mut self) {
-        let levels: BTreeMap<u32, Levels> = self
+    /// *(code)* Refreshes gains (only, not pitch) on running tracks' notes
+    /// (`0x57c0ea` → `0x57f759`, `0x57cc74` → `0x57f759`), skipping idle
+    /// kind-53 voices (`thread == 0`). When `group` is `Some(g)`, only
+    /// running tracks in group `g` are refreshed (`0x57c18b..0x57c197`).
+    fn apply_running_gains(&mut self, group: Option<i64>) {
+        let gains: BTreeMap<u32, [i32; 2]> = self
             .threads
             .iter()
-            .map(|t| (t.id, self.levels(t)))
+            .filter(|t| group.is_none_or(|g| t.group == g))
+            .map(|t| (t.id, self.levels(t).gains))
             .collect();
         for note in &mut self.notes {
-            if let Some(levels) = levels.get(&note.thread) {
-                note.gains = levels.gains;
-                note.step = step(levels.rate);
+            if let Some(&gains) = gains.get(&note.thread) {
+                note.gains = gains;
             }
         }
     }
@@ -3122,7 +3161,11 @@ impl<S: Samples> Player<S> {
 
     fn update_main_duckpri(&mut self) {
         let largest = self.duck.values().copied().fold(0, i32::max);
-        self.globals[usize::from(MAIN_DUCKPRI - GLOBALS)] = largest;
+        let slot = &mut self.globals[usize::from(MAIN_DUCKPRI - GLOBALS)];
+        if *slot != largest {
+            *slot = largest;
+            self.apply_running_gains(None);
+        }
     }
 
     /// Runs every track once, in the order of the list of running tracks
@@ -3176,7 +3219,6 @@ impl<S: Samples> Player<S> {
             self.forget_ended();
         }
         self.forget_ended();
-        self.apply_levels();
     }
 
     /// The block has run out of instructions before the tracks `rest`
@@ -3458,10 +3500,10 @@ impl<S: Samples> Player<S> {
         }
         let dest = self.resolve_target(thread);
         let written = match dest {
-            Destination::Own => thread,
+            Destination::Own => &mut *thread,
             Destination::Running(id) => match self.threads.iter_mut().find(|t| t.id == id) {
                 Some(other) => other,
-                None => thread,
+                None => &mut *thread,
             },
             Destination::Stopped(stopped_track) => {
                 if r < GLOBALS {
@@ -3490,8 +3532,30 @@ impl<S: Samples> Player<S> {
                 // *(code)* 0x57dfe8 → 0x57e040 → 0x57f625: writing `patch`
                 // tears down the track's active voice immediately.
                 self.notes.retain(|n| n.thread != written_id);
+                return;
+            }
+            // *(code)* 0x57def1..0x57e057: level/pan/duck/3D writes refresh
+            // the written track's voice gains (`0x57f759`) and `pitch`
+            // writes refresh its rate (`0x57f71d`) immediately.
+            let update_gains =
+                matches!(r, VOL | EXTVOL | PAN | DUCKPRI | THREE_D | 27 | 30..=32 | 56..=57);
+            let update_pitch = r == PITCH;
+            if update_gains || update_pitch {
+                let snapshot = written.clone();
+                let levels = self.levels(&snapshot);
+                for note in self.notes.iter_mut().filter(|n| n.thread == written_id) {
+                    if update_gains {
+                        note.gains = levels.gains;
+                    }
+                    if update_pitch {
+                        note.step = step(levels.rate);
+                    }
+                }
             }
         } else if r == MAIN_DUCKPRI {
+            if let Some(slot) = self.threads.iter_mut().find(|t| t.id == thread.id) {
+                *slot = thread.clone();
+            }
             if value == 0 {
                 self.duck.remove(&duck_track);
             } else {

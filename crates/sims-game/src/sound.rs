@@ -371,9 +371,10 @@ pub fn pause_event(paused: bool) -> SoundEvent {
 /// Bridges a [`crate::Game`] into a [`Mixer`] (or [`crate::output::Output`]):
 /// sends object sources, live-mode entry ([`enter_live`]), live-mode
 /// pause/unpause ([`pause_event`], `0x4ce5c5` / `0x4ce5d9`), window
-/// focus changes ([`Input::Active`], kind 25 at `0x4f7608` → `0x4f76d5`),
-/// the simulation's sound events, the ambience view/hour/speed, and kind
-/// 33 camera moves in the order the window uses.
+/// focus changes ([`Input::Active`], kind 25 at `0x4f7608` → `0x4f76d5`,
+/// with live-mode auto-pause matching `byte [0x6c9fa1] == 1` at
+/// `0x4f7635`..`0x4f7666`), the simulation's sound events, the ambience
+/// view/hour/speed, and kind 33 camera moves in the order the window uses.
 pub struct Feed {
     /// The hour, speed and ambience view the sound was last told.
     heard: Option<(u32, Speed, i32)>,
@@ -386,8 +387,9 @@ pub struct Feed {
     /// Whether the window is focused (`true` at startup, matching
     /// `0x4eee14` and `0x4f7610` deduplication).
     focused: bool,
-    /// Last focus state forwarded via [`Input::Active`].
-    active_sent: bool,
+    /// The lot's pause state saved on focus loss (`[esi + 0xbc]` at
+    /// `0x4f7645`..`0x4f764a`), restored on focus regain (`0x4f765c`..`0x4f7666`).
+    saved_paused: bool,
 }
 
 impl Default for Feed {
@@ -398,7 +400,7 @@ impl Default for Feed {
             shot: None,
             paused: false,
             focused: true,
-            active_sent: true,
+            saved_paused: false,
         }
     }
 }
@@ -409,17 +411,63 @@ impl Feed {
         self.focused
     }
 
-    /// Records a window focus change (`WM_ACTIVATEAPP`, `0x4f7608` →
-    /// `0x4f76d5`) and flushes it to the sound mixer as [`Input::Active`]
-    /// (kind 25). Repeated notifications with the same state are ignored,
-    /// including an initial `true` at window creation (`0x4eee14`,
-    /// `0x4f7610`).
-    pub fn set_focused(&mut self, focused: bool, game: &mut crate::Game, send: impl FnMut(Input)) {
+    /// Handles a window focus change (`WM_ACTIVATEAPP`, `0x4f7608`..`0x4f76dc`),
+    /// returning whether the lot's pause state changed (so the window should
+    /// redraw).
+    ///
+    /// Repeated notifications with the same state are ignored, including an
+    /// initial `true` at window creation (`0x4eee14`, `0x4f7610`).
+    ///
+    /// - On focus loss (`true -> false`): flushes any already-pending game
+    ///   sources, sounds, and camera moves first so kind 25 off does not
+    ///   overtake earlier events; saves the lot's pause state and requests
+    ///   pause (`0x4f7635`..`0x4f765a`, matching `byte [0x6c9fa1] == 1`);
+    ///   then sends [`Input::Active`]`(false)` (`0x4f76d5`). The pending
+    ///   pause reaches sound as [`SoundEvent::Pause`] on the next
+    ///   [`Feed::update`] (`0x4ce5c5`).
+    /// - On focus regain (`false -> true`): refreshes [`Input::Sources`]
+    ///   (and initial [`enter_live`] if needed) without flushing a stale
+    ///   pending focus-loss pause; restores the saved pause state
+    ///   (`0x4f765c`..`0x4f7666`); then sends [`Input::Active`]`(true)`
+    ///   (`0x4f76d5`). Any pause change reaches sound as
+    ///   [`SoundEvent::Unpause`] on the next [`Feed::update`] (`0x4ce5d9`).
+    pub fn set_focused(
+        &mut self,
+        focused: bool,
+        game: &mut crate::Game,
+        mut send: impl FnMut(Input),
+    ) -> bool {
         if self.focused == focused {
-            return;
+            return false;
         }
+        let pause_changed = if !focused {
+            // Flush prior clicks, sounds, and camera moves before focus loss
+            // so kind 25 off cannot drop or overtake earlier events.
+            self.update(game, &mut send);
+            self.saved_paused = game.paused();
+            if !self.saved_paused {
+                game.toggle_pause();
+            }
+            game.paused() != self.saved_paused
+        } else {
+            let first = self.told.is_none();
+            let sources = game.sound_sources();
+            if self.told.as_ref() != Some(&sources) {
+                send(Input::Sources(sources.clone()));
+                self.told = Some(sources);
+            }
+            if first {
+                send(Input::Events(enter_live()));
+            }
+            let before = game.paused();
+            if before != self.saved_paused {
+                game.toggle_pause();
+            }
+            game.paused() != before
+        };
         self.focused = focused;
-        self.update(game, send);
+        send(Input::Active(focused));
+        pause_changed
     }
 
     /// Sends every sound input that changed on `game` since the last call.
@@ -440,10 +488,6 @@ impl Feed {
         if paused != self.paused {
             send(Input::Events(vec![pause_event(paused)]));
             self.paused = paused;
-        }
-        if self.focused != self.active_sent {
-            send(Input::Active(self.focused));
-            self.active_sent = self.focused;
         }
         let sounds = game.take_sounds();
         if !sounds.is_empty() {

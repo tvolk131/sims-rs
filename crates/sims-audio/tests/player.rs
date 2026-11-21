@@ -3529,7 +3529,7 @@ fn kind_25_volume_nudge_adjusts_placement_for_100_updates_then_stops() {
         );
         m
     };
-    let looping: &[u8] = &[2, 5, WAIT_SAMP, 14];
+    let looping: &[u8] = &[2, 5, WAIT_SAMP, LOOP];
     let day_at = |x: i32| {
         let mut s = on_lot(&[(9, x)]);
         s.absent[4] = 12;
@@ -3591,14 +3591,17 @@ fn kind_25_volume_nudge_adjusts_placement_for_100_updates_then_stops() {
     p_one.camera_moved(0, 12, &barely);
     assert_eq!(p_one.render_stereo(1, &barely), [0, 0]);
 
-    // At each block boundary, 0x573019 restores vol and decrements
-    // +0x114. Advance 99 full block starts (1 remains -> still nudging),
-    // then 1 more block start (0 remains -> nudging stops).
-    let to_next = BLOCK - (p_zero.frame() as usize % BLOCK);
-    let _ = p_zero.render_stereo(to_next + 98 * BLOCK + 1, &offscreen);
+    // At each 20 ms timer boundary (`TIMER_FRAMES` = 441 frames at 22,050 Hz,
+    // `0x572fc3` -> `0x573019`), the countdown restores normal vol and
+    // decrements `+0x114` (100 updates = 2.00 s). Advance 99 timer ticks
+    // (1 remains -> still nudging), then 1 more timer tick (0 remains ->
+    // nudging stops).
+    let timer = sims_audio::player::TIMER_FRAMES;
+    let to_next = timer - (p_zero.frame() as usize % timer);
+    let _ = p_zero.render_stereo(to_next + 98 * timer + 1, &offscreen);
     p_zero.camera_moved(0, 12, &offscreen);
     assert!(p_zero.render_stereo(1, &offscreen)[0] > 0);
-    let to_next = BLOCK - (p_zero.frame() as usize % BLOCK);
+    let to_next = timer - (p_zero.frame() as usize % timer);
     let _ = p_zero.render_stereo(to_next + 1, &offscreen);
     p_zero.camera_moved(0, 12, &offscreen);
     assert_eq!(p_zero.render_stereo(1, &offscreen), [0, 0]);
@@ -3714,13 +3717,14 @@ fn day_and_night_loop_picks_nite_loop_beach_loop_and_skips_downtown() {
             .all(|&s| s == 0)
     );
 
-    // Hour 19 (> 18) on lot 1: nite_loop starts and fades to group 1 volume.
-    player.set_group_volume(1, 512);
+    // Hour 19 (> 18) on lot 1: nite_loop starts and fades to VOLUME_STEPS[fx_step]
+    // (0x574a07..0x574a10; step 3 -> 490).
+    player.set_fx_volume_step(3, &day18);
     let night19 = snap(19, 1);
     player.camera_moved(0, 19, &night19);
     let out_half = player.render_stereo(BLOCK * 4, &night19);
     assert!(out_half.iter().any(|&s| s > 0), "{out_half:?}");
-    // Fade target was 512 (and group 1 is 512, so logarithmic attenuation
+    // Fade target was 490 (and group 1 is 490, so logarithmic attenuation
     // scales 4000 far below full volume).
     let peak_half = *out_half.iter().max().unwrap();
     assert!(peak_half > 0 && peak_half < 400, "{peak_half}");
@@ -3737,7 +3741,7 @@ fn day_and_night_loop_picks_nite_loop_beach_loop_and_skips_downtown() {
         "lot 20 should silence nite_loop"
     );
     // Lot 19 and lot 30 are outside Downtown, so hour 5 plays nite_loop again.
-    player.set_group_volume(1, 1024);
+    player.set_fx_volume_step(10, &downtown20);
     let lot30 = snap(5, 30);
     player.camera_moved(0, 5, &lot30);
     let out_full = player.render_stereo(BLOCK * 4, &lot30);
@@ -5434,12 +5438,14 @@ fn never_started_track_reads_zero_patch_after_kill_trk_and_stop_all() {
 
 #[test]
 fn kinds_37_38_39_map_slider_steps_to_groups_and_ambience() {
+    use sims_audio::fsc::Score;
     use sims_audio::levels::{Inputs, levels};
     use sims_audio::player::VOLUME_STEPS;
 
     // Three tracks in groups 1 (Sfx), 2 (Music) and 3 (Vox), each looping a
-    // constant sample of 4000, plus an ambience score to verify kind 37
-    // updates ambience volume while kinds 38 and 39 leave it alone.
+    // constant sample of 4000, plus a 1-cell looping ambience score to verify
+    // kind 37 updates ambience volume (0x5740b4..0x5740f1) while kinds 38
+    // and 39 leave it alone.
     let loop_note: &[u8] = &[SET_LOOP, NOTE_ON_V1[0], NOTE_ON_V1[1], WAIT_SAMP, LOOP];
     let (hit, addresses) = assemble(&[loop_note]);
     let hot = format!(
@@ -5456,6 +5462,7 @@ fn kinds_37_38_39_map_slider_steps_to_groups_and_ambience() {
          sfx=1,10\n\
          mus=1,11\n\
          vox=1,12\n\
+         amb0=52,0\n\
          fx0=37,0\n\
          fx5=37,5\n\
          fx_bad=37,11\n\
@@ -5467,6 +5474,13 @@ fn kinds_37_38_39_map_slider_steps_to_groups_and_ambience() {
         addresses[0]
     );
     let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+    let score = Score::parse(
+        b"version 7\n#\tvol\tpri\n\
+          \t1024\t0\t1\t1\t1\t1\t600\t2\t1\t1\t0\t0\t0\t0\n\
+          #\tvol\n\
+          \t1024\t0\t512\t512\t0\t0\t0\t0\t0\t0\t1\t0\t20\t0\t0\t0\t0\t0\tamb.xa\n",
+    )
+    .unwrap();
     let mut map = BTreeMap::new();
     map.insert(
         "one.xa".to_owned(),
@@ -5476,7 +5490,16 @@ fn kinds_37_38_39_map_slider_steps_to_groups_and_ambience() {
             samples: vec![4000; RATE as usize],
         },
     );
+    map.insert(
+        "dir\\amb.xa".to_owned(),
+        Pcm {
+            rate: RATE,
+            channels: 1,
+            samples: vec![4000; RATE as usize],
+        },
+    );
     let mut player = Player::new(vec![module], map, 1);
+    assert!(player.add_score(0, &score, "dir"));
 
     // Sound manager constructor (0x5713ee..0x571409) starts all three
     // sliders at step 10 (1024).
@@ -5511,7 +5534,7 @@ fn kinds_37_38_39_map_slider_steps_to_groups_and_ambience() {
         ((l + r) / 2) as i16
     };
 
-    // Kind 37 (step 5 -> 590), kind 38 (step 3 -> 490), kind 39 (step 7 -> 840).
+    // Kind 37 (step 5 -> 690), kind 38 (step 3 -> 490), kind 39 (step 7 -> 840).
     for (event_name, track_event, step) in
         [("fx5", "sfx", 5), ("mus3", "mus", 3), ("vox7", "vox", 7)]
     {
@@ -5534,6 +5557,21 @@ fn kinds_37_38_39_map_slider_steps_to_groups_and_ambience() {
         (5, 3, 7)
     );
     assert!(player.faults.is_empty(), "{:?}", player.faults);
+
+    // Kind 37 updates ambience score volume (0x5740b4..0x5740f1), while
+    // kinds 38 and 39 leave ambience volume unchanged.
+    player.handle(&SoundEvent::StopAll, &NoSources);
+    play(&mut player, "amb0");
+    let amb_at_5 = player.render(RATE as usize / 2, &NoSources);
+    let sample_at_5 = *amb_at_5.last().unwrap();
+    assert_eq!(sample_at_5, expected_mono(VOLUME_STEPS[5]));
+    play(&mut player, "mus3");
+    play(&mut player, "vox7");
+    assert_eq!(player.render(BLOCK, &NoSources)[0], sample_at_5);
+    play(&mut player, "fx0");
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 0);
+    player.handle(&SoundEvent::StopAll, &NoSources);
+    play(&mut player, "fx5");
 
     // Out-of-range HOT event steps report faults without changing state.
     for bad in ["fx_bad", "fx_neg", "mus_bad", "vox_bad"] {
@@ -5674,9 +5712,9 @@ fn kind_37_reruns_day_night_loop_and_restarts_after_mute() {
             .all(|&s| s == 0)
     );
 
-    // Raising the effects slider via kind 37 (step 5 -> 590) with NO
+    // Raising the effects slider via kind 37 (step 5 -> 690) with NO
     // `camera_moved` runs 0x574978, starts `nite_loop`, and fades `extvol`
-    // up to 590 (at group 1 volume 590).
+    // up to 690 (at group 1 volume 690).
     player.handle(
         &SoundEvent::Play {
             object: 0,
@@ -5735,5 +5773,131 @@ fn kind_37_reruns_day_night_loop_and_restarts_after_mute() {
             .iter()
             .all(|&s| s == 0)
     );
+    assert!(player.faults.is_empty(), "{:?}", player.faults);
+}
+
+#[test]
+fn day_night_fade_target_reads_fx_slider_step_not_raw_group_volume() {
+    use sims_audio::player::NITE_LOOP;
+
+    // `0x574a07..0x574a10` reads `VOLUME_STEPS[+0xf0]` independently of raw
+    // `group_volumes[1]` (`0x57c102`). With fx slider at default step 10
+    // (1024) and raw `set_group_volume(1, 0)`, a muted start still writes
+    // `FADE_DEST = 1024`, and with `set_group_volume(1, 512)`, `nite_loop`
+    // starts with `FADE_DEST = 1024` (not 512).
+    let loop_note: &[u8] = &[SET_LOOP, NOTE_ON_V1[0], NOTE_ON_V1[1], WAIT_SAMP, LOOP];
+    let mut inspect = loadl(53, NITE_LOOP as i32);
+    inspect.extend([GETSRCDATAFIELD, 6, 1, 40, END]); // FADE_DEST
+    let (hit, addresses) = assemble(&[loop_note, &inspect]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         [Track]\n\
+         {NITE_LOOP}=0,nite_loop,1024,0,0,1,0,0x100,1\n\
+         20=0,inspect,1024,0,0,0,0,0x101,1\n\
+         [EventMapping]\n\
+         m3=36,3\n\
+         m0=36,0\n\
+         inspect=1,20\n",
+        addresses[0], addresses[1]
+    );
+    let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+    let mut player = Player::new(vec![module], long_sample("one.xa"), 1);
+    let mut night = Snapshot::default();
+    night.absent[4] = 22;
+    night.lot = 1;
+
+    // Slider stays at 10 (1024), raw group 1 volume set to 0 -> stopped
+    // track still receives FADE_DEST = 1024.
+    player.set_group_volume(1, 0);
+    for name in ["m3", "m0"] {
+        player.handle(
+            &SoundEvent::Play {
+                object: 0,
+                name: name.into(),
+            },
+            &night,
+        );
+    }
+    let probe = Probe {
+        lot: on_lot(&[(8, 400)]),
+        asked: Default::default(),
+    };
+    player.handle(
+        &SoundEvent::Play {
+            object: 0,
+            name: "inspect".into(),
+        },
+        &probe,
+    );
+    player.render(BLOCK, &probe);
+    assert_eq!(*probe.asked.borrow(), [(0, 1024)]);
+
+    // Raw group 1 volume set to 512 -> nite_loop starts with FADE_DEST = 1024.
+    player.set_group_volume(1, 512);
+    player.camera_moved(0, 22, &night);
+    probe.asked.borrow_mut().clear();
+    player.handle(
+        &SoundEvent::Play {
+            object: 0,
+            name: "inspect".into(),
+        },
+        &probe,
+    );
+    player.render(BLOCK, &probe);
+    assert_eq!(*probe.asked.borrow(), [(0, 1024)]);
+}
+
+#[test]
+fn group_volume_refresh_reads_voice_levels_through_target() {
+    // `0x57c197` -> `0x57f759` reads `VOL`, `EXTVOL`, `DUCKPRI`, and `Is3d`
+    // through `target` (`vtable[+0x88]` -> `0x57de16`), while keeping `PAN`
+    // local (`0x57f85f`). Track 10 (group 1) starts a note at local
+    // EXTVOL=1024, then targets stopped track 11 whose EXTVOL was set to 0.
+    // A kind 37 slider update refreshes track 10's voice through `0x57f759`,
+    // silencing it immediately and keeping it silent on later blocks.
+    let mut set_t11_zero = loadl(53, 11);
+    set_t11_zero.extend(loadl(19, 0));
+    set_t11_zero.push(END);
+
+    let mut targeter = NOTE_ON_V1.to_vec();
+    targeter.extend(loadl(53, 11));
+    targeter.extend([SET_LOOP, LOOP]);
+
+    let (hit, addresses) = assemble(&[&targeter, &[END], &set_t11_zero]);
+    let hot = format!(
+        "[EventMappingEquate]\n\
+         [TrackData]\n\
+         0x100={:#x}\n\
+         0x101={:#x}\n\
+         0x102={:#x}\n\
+         [Patch]\n\
+         1=0,one,\"one.xa\"\n\
+         [Track]\n\
+         10=0,t10,1024,0,0,1,0,0x100,1\n\
+         11=0,t11,1024,0,0,1,0,0x101,1\n\
+         12=0,t12,1024,0,0,0,0,0x102,1\n\
+         [EventMapping]\n\
+         e0=1,10\n\
+         e2=1,12\n\
+         fx8=37,8\n",
+        addresses[0], addresses[1], addresses[2]
+    );
+    let module = Module::parse("test", &hit, b"v1 5\n", hot.as_bytes()).unwrap();
+    let mut player = Player::new(vec![module], long_sample("one.xa"), 1);
+
+    play(&mut player, "e2"); // write EXTVOL = 0 on stopped track 11
+    player.render(BLOCK, &NoSources);
+    play(&mut player, "e0"); // starts note at local EXTVOL=1024, then sets target=11
+    assert_eq!(player.render(BLOCK, &NoSources)[0], 10_000);
+
+    // Slider change refreshes group 1 tracks via 0x57f759 -> reads EXTVOL=0
+    // through target 11 -> silent immediately and on subsequent blocks.
+    play(&mut player, "fx8");
+    assert!(player.render(BLOCK * 3, &NoSources).iter().all(|&s| s == 0));
     assert!(player.faults.is_empty(), "{:?}", player.faults);
 }

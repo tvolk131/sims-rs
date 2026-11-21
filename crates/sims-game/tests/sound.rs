@@ -197,10 +197,11 @@ fn window_focus_changes_forward_kind_25_and_deduplicate_initial_focus() {
     // initial `Focused(true)` from the windowing system sends no kind 25.
     assert!(feed.focused());
     let mut sent = Vec::new();
-    feed.set_focused(true, &mut game, |input| {
+    let changed = feed.set_focused(true, &mut game, |input| {
         sent.push(input.clone());
         mixer.input(input);
     });
+    assert!(!changed);
     assert!(sent.is_empty(), "initial Focused(true) must be a no-op");
 
     // First feed enters live mode and starts backyard ambience.
@@ -210,6 +211,7 @@ fn window_focus_changes_forward_kind_25_and_deduplicate_initial_focus() {
     });
     assert!(!sent.contains(&Input::Active(true)));
     assert!(!sent.contains(&Input::Active(false)));
+    assert!(!game.paused());
     // Set outdoor view and give the ambience score a few beats to start
     // playing cells at hour 12 (daytime, so audio comes purely from
     // backyard ambience, not `nite_loop`).
@@ -223,22 +225,44 @@ fn window_focus_changes_forward_kind_25_and_deduplicate_initial_focus() {
         "live ambience should play while focused"
     );
 
-    // Losing window focus sends Input::Active(false) (kind 25 off), pausing
-    // live ambience and skipping new kind 1 plays; a duplicate false is
-    // deduplicated.
+    // Queue a camera move right before losing focus: focus loss must flush
+    // the prior camera move BEFORE sending Input::Active(false), then
+    // auto-pause the lot (0x4f7635..0x4f765a, byte [0x6c9fa1] == 1) without
+    // sending SoundEvent::Pause yet (deferred to next update at 0x4ce5c5).
+    game.apply(Move::Scroll([8, 0]));
     sent.clear();
-    feed.set_focused(false, &mut game, |input| {
+    let changed = feed.set_focused(false, &mut game, |input| {
         sent.push(input.clone());
         mixer.input(input);
     });
+    assert!(changed, "unfocusing an unpaused live lot should pause it");
+    assert!(game.paused());
     assert!(!feed.focused());
-    assert_eq!(sent, [Input::Active(false)]);
+    assert_eq!(sent.last(), Some(&Input::Active(false)));
+    assert!(
+        sent.iter().position(|i| *i == Input::Camera) < Some(sent.len() - 1),
+        "prior camera move must flush before Input::Active(false): {sent:?}"
+    );
+    assert!(
+        !sent.contains(&Input::Events(vec![SoundEvent::Pause])),
+        "SoundEvent::Pause must wait for the next update (0x4ce5c5): {sent:?}"
+    );
+
+    // Duplicate Focused(false) is ignored.
     sent.clear();
-    feed.set_focused(false, &mut game, |input| {
+    assert!(!feed.set_focused(false, &mut game, |input| {
+        sent.push(input.clone());
+        mixer.input(input);
+    }));
+    assert!(sent.is_empty(), "duplicate Focused(false) must be ignored");
+
+    // Next update forwards the pending SoundEvent::Pause (0x4ce5c5).
+    sent.clear();
+    feed.update(&mut game, |input| {
         sent.push(input.clone());
         mixer.input(input);
     });
-    assert!(sent.is_empty(), "duplicate Focused(false) must be ignored");
+    assert!(sent.contains(&Input::Events(vec![SoundEvent::Pause])));
 
     // Let any already-started ambience cell samples finish, then confirm
     // no new ambience cells or kind 1 plays sound while unfocused.
@@ -252,32 +276,66 @@ fn window_focus_changes_forward_kind_25_and_deduplicate_initial_focus() {
         "unfocused sound should keep ambience paused and skip kind 1 plays"
     );
 
-    // Regaining focus sends Input::Active(true) (kind 25 on), resuming live
-    // ambience and allowing kind 1 plays again; duplicate true is ignored.
+    // Regaining focus restores the saved unpaused state (0x4f765c..0x4f7666)
+    // and sends Input::Active(true) immediately (0x4f76d5); duplicate true
+    // is ignored. SoundEvent::Unpause then arrives on the next update
+    // (0x4ce5d9), resuming live ambience.
     sent.clear();
-    feed.set_focused(true, &mut game, |input| {
+    let changed = feed.set_focused(true, &mut game, |input| {
         sent.push(input.clone());
         mixer.input(input);
     });
+    assert!(changed, "refocusing should restore unpaused state");
+    assert!(!game.paused());
     assert!(feed.focused());
-    assert_eq!(sent, [Input::Active(true)]);
+    assert_eq!(sent.last(), Some(&Input::Active(true)));
+    assert!(
+        !sent.contains(&Input::Events(vec![SoundEvent::Unpause])),
+        "SoundEvent::Unpause must wait for the next update (0x4ce5d9): {sent:?}"
+    );
     sent.clear();
-    feed.set_focused(true, &mut game, |input| {
+    assert!(!feed.set_focused(true, &mut game, |input| {
+        sent.push(input.clone());
+        mixer.input(input);
+    }));
+    assert!(sent.is_empty(), "duplicate Focused(true) must be ignored");
+
+    sent.clear();
+    feed.update(&mut game, |input| {
         sent.push(input.clone());
         mixer.input(input);
     });
-    assert!(sent.is_empty(), "duplicate Focused(true) must be ignored");
+    assert!(sent.contains(&Input::Events(vec![SoundEvent::Unpause])));
     assert!(
         mixer.render(4 * RATE as usize).iter().any(|&s| s != 0),
         "regaining focus should resume live ambience"
     );
 
-    // Focus cycling while the lot is paused does not unpause live ambience.
+    // Focus loss followed immediately by focus regain (with no tick in
+    // between) restores pause without sending Pause or Unpause on the next
+    // update (matching 0x4cee4a dirty flag resolution at 0x4ce5b0).
+    assert!(feed.set_focused(false, &mut game, |input| mixer.input(input)));
+    assert!(game.paused());
+    assert!(feed.set_focused(true, &mut game, |input| mixer.input(input)));
+    assert!(!game.paused());
+    sent.clear();
+    feed.update(&mut game, |input| {
+        sent.push(input.clone());
+        mixer.input(input);
+    });
+    assert!(!sent.contains(&Input::Events(vec![SoundEvent::Pause])));
+    assert!(!sent.contains(&Input::Events(vec![SoundEvent::Unpause])));
+
+    // Focus cycling while the lot is ALREADY paused saves saved_paused=true
+    // and keeps the lot and live ambience paused after refocusing.
     game.toggle_pause();
     feed.update(&mut game, |input| mixer.input(input));
     let _ = mixer.render(6 * RATE as usize);
-    feed.set_focused(false, &mut game, |input| mixer.input(input));
-    feed.set_focused(true, &mut game, |input| mixer.input(input));
+    assert!(!feed.set_focused(false, &mut game, |input| mixer.input(input)));
+    assert!(game.paused());
+    assert!(!feed.set_focused(true, &mut game, |input| mixer.input(input)));
+    assert!(game.paused());
+    feed.update(&mut game, |input| mixer.input(input));
     assert!(
         mixer.render(4 * RATE as usize).iter().all(|&s| s == 0),
         "regaining focus while paused must keep live ambience paused"
