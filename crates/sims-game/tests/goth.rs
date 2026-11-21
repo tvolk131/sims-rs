@@ -5553,6 +5553,70 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
         assert!(!lot.world().objects.contains_key(&cursor.cursor));
     }
 
+    // Unsnapped retry (`0x485f23` -> `0x421e72`): Werkbunnst Chair collides
+    // with object 121 at snapped `[296, 424]` but fits at unsnapped `[292, 431]`.
+    let mut unsnapped = lot.buy_start(0x26bf_bb29, 1, 2).unwrap().unwrap();
+    assert!(lot.buy_move(&mut unsnapped, [292, 431], 1).unwrap());
+    assert_eq!(unsnapped.position, [292, 431, 1]);
+    assert_eq!(lot.world().objects[&unsnapped.held].position, [292, 431, 1]);
+    lot.buy_cancel(&unsnapped).unwrap();
+
+    // Wall-mounted auto-rotation (`0x48736b` + `0x43583e`): Narcisco Wall
+    // Mirror fails at facing 2 at `[264, 504]` and auto-rotates to facing 4.
+    let mirror = catalog
+        .all()
+        .iter()
+        .find(|i| i.name.contains("Narcisco"))
+        .expect("Narcisco Wall Mirror");
+    let mut mirror_cur = lot.buy_start(mirror.guid, 1, 2).unwrap().unwrap();
+    assert!(lot.buy_move(&mut mirror_cur, [264, 504], 1).unwrap());
+    assert_eq!(lot.world().objects[&mirror_cur.held].data[1], 4);
+    lot.buy_cancel(&mirror_cur).unwrap();
+
+    // Missing CTSS fallback (`0x457d3b`): lamps without CTSS 2008 take their
+    // OBJD chunk label instead of sorting with an empty name.
+    for guid in [0x3db3_2c6cu32, 0x4eac_803au32] {
+        if let Some(item) = catalog.get(guid) {
+            assert!(
+                !item.name.is_empty(),
+                "0x{guid:08X} should fall back to OBJD chunk label"
+            );
+        }
+    }
+
+    // Drag rotation facing-offset timing (`0x485da9`): Spartan Special bed has
+    // a nonzero OBJD `+0x7a` facing offset, so dragging lower-right (`desired
+    // == current == 2`) at rotation 0 skips rotation and keeps facing 2.
+    let spartan = catalog
+        .all()
+        .iter()
+        .find(|i| i.name.contains("Spartan Special"))
+        .expect("Spartan Special bed");
+    let mut bed_game = Game::open(&options(install.clone())).expect("open Goth house");
+    bed_game.resize([800, 600]);
+    bed_game.render();
+    assert_eq!(bed_game.run(60), 60);
+    bed_game.set_mode(Mode::Buy);
+    // Open Seating -> Beds (subcat 3 at [383, 528]) and select slot 0 (Spartan
+    // Special bed, cheapest bed at $300).
+    bed_game.press([258, 524]);
+    bed_game.release([258, 524]);
+    bed_game.press([383, 528]);
+    bed_game.release([383, 528]);
+    bed_game.press([437, 523]);
+    bed_game.release([437, 523]);
+    assert_eq!(bed_game.buy_selected(), Some(spartan.guid));
+    let lawn = recorded([480, 380]);
+    bed_game.hover(lawn);
+    let bed_cur = bed_game.buy_cursor().expect("bed cursor active").clone();
+    assert_ne!(bed_cur.facing_offset, 0);
+    assert_eq!(bed_game.lot().world().objects[&bed_cur.held].data[1], 2);
+    // Lower-right drag (`desired == 2 == current`) must keep facing 2.
+    bed_game.press(lawn);
+    bed_game.hover([lawn[0] + 20, lawn[1] + 20]);
+    assert_eq!(bed_game.lot().world().objects[&bed_cur.held].data[1], 2);
+    bed_game.cancel_buy();
+
     // Refused commit on an invalid tile retains `buy_cursor` in `Game` so
     // cancellation still deletes both preview objects cleanly.
     let mut game = Game::open(&options(install)).expect("the Goth house opens");

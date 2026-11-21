@@ -49,8 +49,12 @@ const DATA_FACING: usize = 1;
 const DATA_ALLOWED_HEIGHTS: usize = 4;
 /// Object data word 8 (`+0x5a`): placement/intersection flags (`0x43244d`).
 const DATA_PLACEMENT_FLAGS: usize = 8;
+/// Object data word 13 (`+0x64`): wall-attachment rules (`0x43583e`).
+const DATA_WALL_RULES: usize = 13;
 /// Object data word 23: rotation step in eighths (`object + 0x78`).
 const DATA_TURN_STEP: usize = 23;
+/// Object data word 42 (`+0x9e`): placement flags (`0x800` = pool tile, `0x43583e`).
+const DATA_PLACEMENT: usize = 42;
 
 /// Active Buy Mode placement cursor wrapping a newly created catalog object
 /// and its `"Tile Cursor"` (`0x00000437`) helper (`cTSObjectTool` +
@@ -213,11 +217,13 @@ impl Interpreter<'_> {
     /// Returns whether the position is valid and affordable. When staying on
     /// the same snapped `[pos, level]`, retains any existing surface container
     /// (`0x421e72` / `0x422050`) so manual rotations on a surface are not
-    /// overwritten. When valid, both the held object and its `"Tile Cursor"`
-    /// stand on the snapped tile (with the cursor placed second so
-    /// `held.data[26]` links to `cursor`). When invalid, the held object stays
-    /// off the lot and the `"Tile Cursor"` retries at the unsnapped `fine`
-    /// coordinates (`0x485f23`).
+    /// overwritten. If snapped placement fails:
+    /// 1. For wall- or pool-edge-attached objects (`0x43583e`), tries alternate
+    ///    rotations in steps of `data[23]` at the snapped tile (`0x48736b`).
+    /// 2. Otherwise retries full placement of the held object (and cursor) at
+    ///    the unsnapped `fine` coordinates (`0x485f23` → `0x421e72`).
+    /// 3. If still invalid, leaves the held object off the lot and places the
+    ///    `"Tile Cursor"` alone at `fine` when it fits.
     pub fn buy_move(
         &self,
         world: &mut World,
@@ -236,35 +242,154 @@ impl Interpreter<'_> {
         if !inside_placement_bounds(world, pos) {
             return Ok(false);
         }
-        let affordable = cursor.price <= 0 || cursor.price <= available_funds(world);
-        let placement =
-            self.test_buy_placement(world, cursor.cursor, cursor.held, pos, level, retained)?;
-        if let Some(container) = placement {
-            if affordable {
-                cursor.valid = true;
-                cursor.container = container;
-            }
-            let held_place = Place {
-                on_lot: true,
-                position: pos,
-                container: container.map(|(id, _)| id),
-                slot: container.map_or(-1, |(_, slot)| i32::from(slot)),
-                level,
-            };
-            self.put(world, cursor.held, held_place, true)?;
+        if self.try_place_buy_at(world, cursor, pos, level, retained)? {
+            return Ok(cursor.valid);
         }
-        let cursor_pos = if placement.is_some() { pos } else { fine };
-        if self.fits(world, cursor.cursor, cursor_pos, level)? {
+        if self.try_wall_auto_rotate(world, cursor, pos, level)? {
+            return Ok(cursor.valid);
+        }
+        if fine != pos
+            && inside_placement_bounds(world, fine)
+            && self.try_place_buy_at(world, cursor, fine, level, None)?
+        {
+            return Ok(cursor.valid);
+        }
+        // Both snapped and unsnapped placement failed: leave held off-lot and
+        // place the `"Tile Cursor"` alone at unsnapped `fine` (`0x485f23`).
+        cursor.position = [pos[0], pos[1], level];
+        cursor.valid = false;
+        cursor.container = None;
+        if self.fits(world, cursor.cursor, fine, level)? {
             let cursor_place = Place {
                 on_lot: true,
-                position: cursor_pos,
+                position: fine,
                 container: None,
                 slot: -1,
                 level,
             };
             self.put(world, cursor.cursor, cursor_place, true)?;
         }
-        Ok(cursor.valid)
+        Ok(false)
+    }
+
+    /// Tries placing `cursor.held` (and `cursor.cursor`) at `[at, level]`.
+    /// Returns `Ok(true)` if the held object fit and was placed (setting
+    /// `cursor.valid` based on affordability).
+    fn try_place_buy_at(
+        &self,
+        world: &mut World,
+        cursor: &mut BuyCursor,
+        at: [i32; 2],
+        level: i32,
+        retained: Option<(u16, i16)>,
+    ) -> Result<bool, Fault> {
+        let affordable = cursor.price <= 0 || cursor.price <= available_funds(world);
+        let Some(container) =
+            self.test_buy_placement(world, cursor.cursor, cursor.held, at, level, retained)?
+        else {
+            return Ok(false);
+        };
+        cursor.position = [at[0], at[1], level];
+        if affordable {
+            cursor.valid = true;
+            cursor.container = container;
+        }
+        let held_place = Place {
+            on_lot: true,
+            position: at,
+            container: container.map(|(id, _)| id),
+            slot: container.map_or(-1, |(_, slot)| i32::from(slot)),
+            level,
+        };
+        self.put(world, cursor.held, held_place, true)?;
+        if self.fits(world, cursor.cursor, at, level)? {
+            let cursor_place = Place {
+                on_lot: true,
+                position: at,
+                container: None,
+                slot: -1,
+                level,
+            };
+            self.put(world, cursor.cursor, cursor_place, true)?;
+        }
+        Ok(true)
+    }
+
+    /// Native `0x48736b` + `0x43583e`: for wall-attached objects (`data[13] &
+    /// 0x0f != 0`) or mixed pool-edge multi-tile objects (some part has
+    /// `data[42] & 0x800 != 0` and another has it clear), tries each remaining
+    /// rotation step `1..(8 / step)` at `[pos, level]` and keeps the first
+    /// valid facing, restoring the original facing if none fit.
+    fn try_wall_auto_rotate(
+        &self,
+        world: &mut World,
+        cursor: &mut BuyCursor,
+        pos: [i32; 2],
+        level: i32,
+    ) -> Result<bool, Fault> {
+        if !self.needs_wall_auto_rotate(world, cursor.held)? {
+            return Ok(false);
+        }
+        let (orig_facing, step) = world
+            .objects
+            .get(&cursor.held)
+            .map(|o| {
+                (
+                    o.data.get(DATA_FACING).copied().unwrap_or(0).rem_euclid(8),
+                    o.data.get(DATA_TURN_STEP).copied().unwrap_or(0),
+                )
+            })
+            .unwrap_or((0, 0));
+        if step <= 0 {
+            return Ok(false);
+        }
+        let count = 8 / step;
+        for k in 1..count {
+            let dir = (orig_facing + k * step).rem_euclid(8);
+            self.rotate_held_to(world, cursor.cursor, cursor.held, dir)?;
+            if self.try_place_buy_at(world, cursor, pos, level, None)? {
+                return Ok(true);
+            }
+        }
+        self.rotate_held_to(world, cursor.cursor, cursor.held, orig_facing)?;
+        Ok(false)
+    }
+
+    /// Checks `0x43583e`: whether `held` (or any tile in its group) requires
+    /// an adjacent wall (`data[13] & 0x0f != 0`) or spans both pool and
+    /// non-pool tiles (`data[42] & 0x800`).
+    fn needs_wall_auto_rotate(&self, world: &World, held: u16) -> Result<bool, Fault> {
+        let fail = |trap| Fault {
+            object: held,
+            at: None,
+            trap,
+        };
+        let Some(obj) = world.objects.get(&held) else {
+            return Ok(false);
+        };
+        if (obj.data.get(DATA_WALL_RULES).copied().unwrap_or(0) & 0x0f) != 0 {
+            return Ok(true);
+        }
+        if obj.multipart.is_none() {
+            return Ok(false);
+        }
+        let parts = self.parts(world, held).map_err(fail)?;
+        let mut any_pool = false;
+        let mut any_non_pool = false;
+        for part in parts {
+            let Some(tile) = world.objects.get(&part) else {
+                continue;
+            };
+            if (tile.data.get(DATA_WALL_RULES).copied().unwrap_or(0) & 0x0f) != 0 {
+                return Ok(true);
+            }
+            if (tile.data.get(DATA_PLACEMENT).copied().unwrap_or(0) & 0x0800) != 0 {
+                any_pool = true;
+            } else {
+                any_non_pool = true;
+            }
+        }
+        Ok(any_pool && any_non_pool)
     }
 
     /// Rotates the held object to `direction` (`0x4226bc` → `0x421be4`) and

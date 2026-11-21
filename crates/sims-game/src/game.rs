@@ -1822,8 +1822,9 @@ impl Game {
             if dx * dx + dy * dy > 36 {
                 // Native `0x485d5d..0x485dad`: `iVar6 = dy`, `iVar8 = dx`.
                 // Upper-left -> 6, upper-right -> 4, lower-left -> 0,
-                // lower-right -> 2, minus 2*rotation and definition facing
-                // offset (`0x434f8d`, OBJD +0x7a).
+                // lower-right -> 2. Compare `desired` against current facing
+                // FIRST (`0x485da9`), and only if they differ subtract the
+                // OBJD `+0x7a` facing offset (`0x434f8d`) before turning.
                 let quad = if dy < 0 {
                     if dx < 0 { 6 } else { 4 }
                 } else if dx < 0 {
@@ -1831,11 +1832,20 @@ impl Game {
                 } else {
                     2
                 };
-                let dir =
-                    (quad - 2 * i16::from(self.view.camera.rotation & 3) - cursor.facing_offset)
-                        .rem_euclid(8);
-                if let Err(e) = self.lot.buy_rotate(&mut cursor, dir) {
-                    self.note = Some(format!("The object was not rotated: {e}"));
+                let desired = (quad - 2 * i16::from(self.view.camera.rotation & 3)).rem_euclid(8);
+                let current = self
+                    .lot
+                    .world()
+                    .objects
+                    .get(&cursor.held)
+                    .and_then(|o| o.data.get(1).copied())
+                    .unwrap_or(0)
+                    .rem_euclid(8);
+                if current != desired {
+                    let target = (desired - cursor.facing_offset).rem_euclid(8);
+                    if let Err(e) = self.lot.buy_rotate(&mut cursor, target) {
+                        self.note = Some(format!("The object was not rotated: {e}"));
+                    }
                 }
                 true
             } else {
@@ -1958,7 +1968,7 @@ impl Game {
         let world = self.lot.world();
         self.people.refresh(world);
         match sims_render::Lot::from_world(world) {
-            Ok(shape) => self.lot_shape = shape,
+            Ok(shape) => self.lot_shape = shape.with_floor_rotation(self.lot.floor_rotation()),
             Err(e) => self
                 .people
                 .note(vec![format!("the lot is not redrawn: {e}")]),

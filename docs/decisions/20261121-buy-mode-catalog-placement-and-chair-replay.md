@@ -30,8 +30,10 @@ panel, and `sims-vm` had no `"Tile Cursor"` creation or Buy placement tool.
   `0x506765`, `0x507288`, `0x508342`):**
   - Residential Buy Mode includes non-person catalog masters (`sub_index == -1`
     or `master == 0`) with nonzero `OBJD +0x4e` (`room_sort`) and graphics or a
-    `TTAB`, sorted by price ascending then raw catalog name bytes ascending
-    (`0x4cd9a5` → `0x430100` → `memcmp` at `0x6363e0`).
+    `TTAB`, reading `CTSS`/`CATS` and falling back to the `OBJD` chunk label
+    when empty (`0x457d3b`), sorted by price ascending then raw Windows-1252
+    catalog name bytes ascending (`0x4cd9a5` → `0x430100` → `memcmp` at
+    `0x6363e0`).
   - Function-sort category masks in UI order `0..8` are
     `[0x01, 0x02, 0x20, 0x08, 0x04, 0x10, 0x80, 0x40]`; function-subsort masks
     are `[0x01, 0x02, 0x04, 0x08, 0x20, 0x40, 0x90, 0xff]`; room-sort masks are
@@ -70,15 +72,19 @@ panel, and `sims-vm` had no `"Tile Cursor"` creation or Buy placement tool.
     searches surface container slots (`0x422050`), aligning the placed item's
     facing to the container (or first unblocked cardinal side of a multi-tile
     container via `0x4221e4..0x422280` + `0x43244d` walking the tile chain
-    slot `0`). When valid, it places the held object first and `"Tile Cursor"`
-    second at the snapped tile (`0x421e72`), which automatically links
-    `held.data[26] = cursor`; when invalid, the held object stays off-lot and
-    the `"Tile Cursor"` retries at the unsnapped pointer coordinates
-    (`0x485f23`). Dragging past the 6 px radius (`dx^2 + dy^2 > 0x24`) rotates
-    the held object using `0x485d5d..0x485dad` (upper-left `6`, upper-right
-    `4`, lower-left `0`, lower-right `2`, minus `2 * camera_rotation` and
-    OBJD `+0x7a` facing offset `0x434f8d`), while movement within 6 px
-    continues normal tile placement.
+    slot `0`). When valid at the snapped tile, it places the held object first
+    and `"Tile Cursor"` second (`0x421e72`), which automatically links
+    `held.data[26] = cursor`. When snapped placement fails, wall-attached
+    (`data[13] & 0x0f != 0`) and pool-edge (`data[42] & 0x800`) objects
+    automatically try alternate facings (`0x48736b` + `0x43583e`); if still
+    invalid, placement retries the held object (and cursor) at the unsnapped
+    pointer coordinates (`0x485f23` → `0x421e72`), leaving only the cursor at
+    the unsnapped position when that also fails. Dragging past the 6 px radius
+    (`dx^2 + dy^2 > 0x24`) rotates the held object using `0x485d5d..0x485dad`
+    (upper-left `6`, upper-right `4`, lower-left `0`, lower-right `2`, minus
+    `2 * camera_rotation`; compared against current facing at `0x485da9` before
+    subtracting the OBJD `+0x7a` facing offset `0x434f8d`), while movement
+    within 6 px continues normal tile placement.
   - `OnMouseLeave` (`0x487d4e` → `0x421963`) takes both off the lot and resets
     cursor position off-lot; `OnMouseUp` (`0x4864d0`) first invokes move at the
     release coordinates (`0x4864f0`), then commits (`0x486ada` → `0x421a0e` →

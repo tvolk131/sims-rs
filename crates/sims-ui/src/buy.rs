@@ -298,7 +298,13 @@ impl BuyCatalog {
                 let function_subsort = read_i16(data, OBJD_FUNC_SUBSORT) as u16;
                 let build_mode_type = read_i16(data, OBJD_BUILD_TYPE);
                 let ctss_id = read_i16(data, OBJD_CTSS);
-                let (name, description, raw_name) = read_ctss(&iff, ctss_id);
+                let (mut name, description, mut raw_name) = read_ctss(&iff, ctss_id);
+                // 0x457d3b: when the catalog string table is missing or its
+                // name entry is empty, fall back to the OBJD chunk label.
+                if name.is_empty() && !chunk.label.is_empty() {
+                    name = chunk.label.clone();
+                    raw_name = cp1252_bytes(&chunk.label);
+                }
                 items.push((
                     raw_name,
                     BuyItem {
@@ -733,7 +739,7 @@ fn read_ctss(iff: &Iff, ctss_id: i16) -> (String, String, Vec<u8>) {
     let Ok(id) = u16::try_from(ctss_id) else {
         return (String::new(), String::new(), Vec::new());
     };
-    let Some(chunk) = iff.get(b"CTSS", id) else {
+    let Some(chunk) = iff.get(b"CTSS", id).or_else(|| iff.get(b"CATS", id)) else {
         return (String::new(), String::new(), Vec::new());
     };
     let Ok(table) = StringTable::parse(iff.data(chunk)) else {
