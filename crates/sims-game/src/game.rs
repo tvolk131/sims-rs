@@ -632,7 +632,6 @@ impl Game {
     /// (0x5eb3d1 with `+0x170` clear); the entry is chosen, or the menu
     /// closed, on the matching [`Game::release`] (0x5eb433).
     pub fn press(&mut self, point: [i32; 2]) -> Outcome {
-        let cleared = self.note.take().is_some();
         if self.hud.dialog().is_none() && self.hud.menu.is_some() {
             self.pointer = Some(point);
             let mut redraw = self.hud.hover(point);
@@ -641,10 +640,11 @@ impl Game {
                 redraw |= menu.press();
             }
             return Outcome {
-                redraw: redraw || cleared,
+                redraw,
                 photo: false,
             };
         }
+        let cleared = self.note.take().is_some();
         if self.hud.covers(point) {
             // The menu, whose entries a choice is an index into.
             let menu = self.hud.menu.clone();
@@ -724,6 +724,33 @@ impl Game {
         let sounds = self.hud.take_sounds();
         self.keep_sounds(sounds);
         outcome
+    }
+
+    /// A left release while the pointer is outside the window (after
+    /// [`Game::leave`]): settles an opening press on a moved menu, or
+    /// closes the pie without checking or choosing any entry.
+    pub fn release_outside(&mut self) -> Outcome {
+        if self.hud.dialog().is_some() || self.hud.menu.is_none() {
+            return Outcome {
+                redraw: false,
+                photo: false,
+            };
+        }
+        self.pointer = None;
+        self.highlighted = None;
+        let redraw = self.hud.leave();
+        let was_held = self.hud.menu.as_ref().is_some_and(|m| m.held());
+        match self.hud.release_menu_outside() {
+            menu::Release::Settled => Outcome {
+                redraw: redraw || was_held,
+                photo: false,
+            },
+            menu::Release::Closed => {
+                let _ = self.note.take();
+                Outcome::redraw()
+            }
+            menu::Release::Chose(_) | menu::Release::Stays => unreachable!(),
+        }
     }
 
     /// The pointer left the window: it is on no object, button, portrait

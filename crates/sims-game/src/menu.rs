@@ -556,13 +556,38 @@ impl Menu {
             pressed @ (Pressed::Opened { .. } | Pressed::Back) => {
                 self.sticky = true;
                 self.layout(art, self.size);
-                if matches!(pressed, Pressed::Opened { .. }) {
-                    self.pointer = self.layouts.last().map(|l| l.center);
+                match pressed {
+                    Pressed::Opened { .. } => {
+                        self.pointer = self.layouts.last().map(|l| l.center);
+                    }
+                    Pressed::Back => {
+                        // Backing out restores the parent at its requested
+                        // position (0x48db38) and re-runs placement
+                        // (0x5ebab2), which warps the pointer back to the
+                        // parent's middle if the parent had to move to stay
+                        // on screen.
+                        self.pointer = self.layouts.first().filter(|l| l.moved).map(|l| l.center);
+                    }
+                    _ => unreachable!(),
                 }
                 Release::Stays
             }
             Pressed::Closed => Release::Closed,
         }
+    }
+
+    /// A left release while the pointer is outside the window (no entry
+    /// under the pointer and past the dead zone): settles an opening press
+    /// on a moved menu, otherwise closes the pie.
+    pub fn release_outside(&mut self) -> Release {
+        self.held = false;
+        let choose = self.sticky || !self.moved;
+        self.moved = false;
+        if !choose {
+            self.sticky = true;
+            return Release::Settled;
+        }
+        Release::Closed
     }
 
     /// Where the pointer is to be moved, once.
@@ -767,6 +792,23 @@ mod tests {
         // Press-drag-release past the dead zone into empty space closes.
         let mut menu = Menu::new(1, 2, named(&["Read a Book"]), [400, 300], &art, [800, 600]);
         assert_eq!(menu.release(&art, [5, 5]), Release::Closed);
+
+        // Releasing outside the window closes a settled or unmoved menu
+        // without choosing, and settles a moved opening menu (0x5eb433).
+        let mut menu = Menu::new(1, 2, named(&["Read a Book"]), [400, 300], &art, [800, 600]);
+        assert_eq!(menu.release(&art, [400, 300]), Release::Settled);
+        assert!(menu.press());
+        assert_eq!(menu.release_outside(), Release::Closed);
+        assert!(!menu.held());
+
+        let mut menu = Menu::new(1, 2, named(&["Read a Book"]), [400, 300], &art, [800, 600]);
+        assert_eq!(menu.release_outside(), Release::Closed);
+
+        let mut menu = Menu::new(1, 2, named(&STUDIES), [400, 20], &art, [800, 600]);
+        assert!(menu.layouts[0].moved);
+        assert_eq!(menu.release_outside(), Release::Settled);
+        assert!(!menu.held());
+        assert_eq!(menu.release_outside(), Release::Closed);
     }
 
     #[test]
@@ -800,6 +842,14 @@ mod tests {
         assert!(menu.will_choose(study));
         assert_eq!(menu.release(&art, study), Release::Stays);
         assert_eq!(menu.layouts.len(), 2);
+        let study_sub = menu.layouts[1].clone();
+        assert_eq!(menu.take_pointer(), Some(study_sub.center));
+        // Backing out of the submenu restores the clamped parent at its
+        // requested position and warps the pointer back to the parent's
+        // middle (0x48db38 -> 0x5ebab2), not leaving it on Study.
+        assert_eq!(menu.release(&art, study_sub.center), Release::Stays);
+        assert_eq!(menu.layouts.len(), 1);
+        assert_eq!(menu.take_pointer(), Some(first.center));
 
         // A submenu opened from the top entry, near the top, moves down;
         // the pointer goes to where it moved, not to the entry.
@@ -814,9 +864,11 @@ mod tests {
         assert_ne!(submenu.center, study);
         assert_eq!(menu.take_pointer(), Some(submenu.center));
         // There a release goes back, as it does in the original (a submenu
-        // opened by release starts settled).
+        // opened by release starts settled); the parent did not move, so
+        // the pointer is not moved again.
         assert_eq!(menu.release(&art, submenu.center), Release::Stays);
         assert_eq!(menu.layouts.len(), 1);
+        assert_eq!(menu.take_pointer(), None);
     }
 
     #[test]

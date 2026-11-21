@@ -217,7 +217,7 @@ struct App {
     window: Option<Rc<Window>>,
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
     scale: u32,
-    cursor: PhysicalPosition<f64>,
+    cursor: Option<PhysicalPosition<f64>>,
     drag: Option<PhysicalPosition<f64>>,
     last: Instant,
     dirty: bool,
@@ -258,11 +258,13 @@ impl App {
             // Not every platform lets a program move the pointer; the
             // menu still works where it is.
             if w.set_cursor_position(position).is_ok() {
-                self.cursor = position;
+                self.cursor = Some(position);
             }
         }
-        let redraw = self.game.hover(self.point(self.cursor));
-        self.changed(redraw);
+        if let Some(cursor) = self.cursor {
+            let redraw = self.game.hover(self.point(cursor));
+            self.changed(redraw);
+        }
     }
 
     fn changed(&mut self, redraw: bool) {
@@ -528,28 +530,34 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseInput { state, button, .. } => match (button, state) {
                 (MouseButton::Left, ElementState::Pressed) => {
-                    let outcome = self.game.press(self.point(self.cursor));
-                    self.changed(outcome.redraw);
-                    self.move_pointer();
-                    if outcome.photo {
-                        self.photo();
+                    if let Some(cursor) = self.cursor {
+                        let outcome = self.game.press(self.point(cursor));
+                        self.changed(outcome.redraw);
+                        self.move_pointer();
+                        if outcome.photo {
+                            self.photo();
+                        }
                     }
                 }
                 (MouseButton::Left, ElementState::Released) => {
-                    let outcome = self.game.release(self.point(self.cursor));
+                    let outcome = match self.cursor {
+                        Some(cursor) => self.game.release(self.point(cursor)),
+                        None => self.game.release_outside(),
+                    };
                     self.changed(outcome.redraw);
                     self.move_pointer();
                 }
-                (MouseButton::Right, ElementState::Pressed) => self.drag = Some(self.cursor),
+                (MouseButton::Right, ElementState::Pressed) => self.drag = self.cursor,
                 (MouseButton::Right, ElementState::Released) => self.drag = None,
                 _ => {}
             },
             WindowEvent::CursorLeft { .. } => {
+                self.cursor = None;
                 let redraw = self.game.leave();
                 self.changed(redraw);
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.cursor = position;
+                self.cursor = Some(position);
                 let point = self.point(position);
                 let redraw = self.drag.is_none() && self.game.hover(point);
                 self.changed(redraw);
@@ -623,7 +631,7 @@ fn run() -> Result<(), String> {
         window: None,
         surface: None,
         scale: 1,
-        cursor: PhysicalPosition::new(0.0, 0.0),
+        cursor: None,
         drag: None,
         last: Instant::now(),
         dirty: true,

@@ -2862,12 +2862,12 @@ fn the_recorded_snack_order_with_bob_shots_replayed_in_the_window_matches_the_re
     run_to(&mut game, &schedule, 123);
     assert!(!last_result(&game));
     // The press listed the pie again after 152; the harness saw the same
-    // four entries.
+    // four entries, and the opening release ran from update 154.
     run_to(&mut game, &schedule, 152);
     assert!(last_result(&game));
     game.press(recorded([176, 198]));
-    game.release(recorded([176, 198]));
     game.render();
+    assert!(game.menu().is_some_and(|m| m.held()));
     let pie: Vec<String> = game
         .menu()
         .expect("the fridge's pie is open")
@@ -2886,6 +2886,9 @@ fn the_recorded_snack_order_with_bob_shots_replayed_in_the_window_matches_the_re
     );
     run_to(&mut game, &schedule, 153);
     assert!(!last_result(&game));
+    run_to(&mut game, &schedule, 154);
+    game.release(recorded([176, 198]));
+    assert!(game.menu().is_some_and(|m| !m.held()));
     // The original checked Have A Snack when the pointer reached it,
     // after 172, did nothing at the mousedown (ended 202), and checked
     // and chose it at the release, after 223.
@@ -2895,14 +2898,17 @@ fn the_recorded_snack_order_with_bob_shots_replayed_in_the_window_matches_the_re
     run_to(&mut game, &schedule, 173);
     assert!(last_result(&game));
     run_to(&mut game, &schedule, 201);
-    let before_press = game.lot().world().hash();
     game.press(snack);
-    assert_eq!(
-        game.lot().world().hash(),
-        before_press,
-        "pressing an already-hovered entry runs no check"
-    );
     assert!(game.menu().is_some_and(|m| m.held()));
+    assert!(
+        game.lot().world().objects[&mortimer]
+            .person
+            .as_ref()
+            .unwrap()
+            .queue
+            .is_empty(),
+        "pressing an entry does not order it before release"
+    );
     run_to(&mut game, &schedule, 223);
     // The check's effects here are not told apart from the order's; the
     // Read and cancel tests pin them.
@@ -3289,27 +3295,71 @@ fn pressing_a_pie_entry_and_dragging_off_orders_nothing() {
         [r.x + r.width / 2, r.y + r.height / 2]
     };
 
-    // 1. Open and settle, hover Have A Snack, press it (no check, stays
-    // open), drag off the pie, release: closes without checking or ordering.
+    let hash = |game: &Game| game.lot().world().hash();
+
+    // 1. Open and settle, hover Have A Snack, advance 60 ticks so a repeat
+    // check would change the lot (as `coming_back_onto_a_pie_entry_checks_it_again`
+    // pins). Pressing Have A Snack runs no check and orders nothing; leaving
+    // and re-hovering proves a check at this tick changes the world hash;
+    // advancing again, pressing, dragging off the pie, and releasing closes
+    // with no check and no order.
     game.hover(on_fridge);
     game.press(on_fridge);
     game.release(on_fridge);
     game.render();
     let snack = label_center(&game, "Have A Snack");
     game.hover(snack);
-    let after_hover = game.lot().world().hash();
+    assert_eq!(game.run(60), 60);
+    game.render();
+    let later = hash(&game);
     game.press(snack);
     assert!(game.menu().is_some_and(|m| m.held()));
-    assert_eq!(game.lot().world().hash(), after_hover);
+    assert_eq!(hash(&game), later, "pressing a hovered entry runs no check");
     assert_eq!(queue_len(&game), 0);
+    // Confirm the hash check above is sensitive to a real re-check here.
+    game.leave();
+    assert_eq!(hash(&game), later);
+    game.hover(snack);
+    assert_ne!(
+        hash(&game),
+        later,
+        "a re-check at this tick mutates the lot"
+    );
+    assert_eq!(game.run(60), 60);
+    game.render();
+    let later = hash(&game);
+    game.press(snack);
+    assert_eq!(hash(&game), later);
     game.hover([5, 5]);
-    assert_eq!(game.lot().world().hash(), after_hover);
+    assert_eq!(hash(&game), later);
     game.release([5, 5]);
     assert!(game.menu().is_none());
-    assert_eq!(game.lot().world().hash(), after_hover);
+    assert_eq!(hash(&game), later);
     assert_eq!(queue_len(&game), 0);
 
-    // 2. Press on Have A Snack, drag onto Have Quick Breakfast, release:
+    // 2. Pressing an entry, dragging outside the window (`leave`), and
+    // releasing outside (`release_outside`, matching winit on macOS when no
+    // `CursorMoved` follows `CursorLeft`) closes with no check and no order.
+    game.hover(on_fridge);
+    game.press(on_fridge);
+    game.release(on_fridge);
+    game.render();
+    let snack = label_center(&game, "Have A Snack");
+    game.hover(snack);
+    assert_eq!(game.run(60), 60);
+    game.render();
+    let later = hash(&game);
+    game.press(snack);
+    assert!(game.menu().is_some_and(|m| m.held()));
+    assert_eq!(hash(&game), later);
+    game.leave();
+    assert_eq!(hash(&game), later);
+    game.release_outside();
+    assert!(game.menu().is_none());
+    assert_eq!(hash(&game), later);
+    assert_eq!(queue_len(&game), 0);
+
+    // 3. Press on Have A Snack, drag onto Have Quick Breakfast, release:
     // orders Have Quick Breakfast (not Have A Snack).
     game.hover(on_fridge);
     game.press(on_fridge);
@@ -3341,7 +3391,7 @@ fn pressing_a_pie_entry_and_dragging_off_orders_nothing() {
         quick_menu as i32
     );
 
-    // 3. Single-gesture press-drag-release from an unmoved menu chooses
+    // 4. Single-gesture press-drag-release from an unmoved menu chooses
     // immediately on the opening press's release (0x5eb433).
     game.hover(on_fridge);
     game.press(on_fridge);

@@ -546,6 +546,19 @@ impl Hud {
             Release::Closed => (release, None),
         }
     }
+
+    /// A left release on an open pie menu while the pointer is outside the
+    /// window: settles a moved opening menu or closes the pie.
+    pub fn release_menu_outside(&mut self) -> Release {
+        let Some(mut menu) = self.menu.take() else {
+            return Release::Closed;
+        };
+        let release = menu.release_outside();
+        if release == Release::Settled {
+            self.menu = Some(menu);
+        }
+        release
+    }
 }
 
 /// The actions whose icons were pressed while they show: a second press

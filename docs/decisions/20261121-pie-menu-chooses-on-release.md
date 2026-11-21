@@ -45,26 +45,40 @@ vtable `+0x24c` (`0x5ea7e2(0)`).
 - `menu::Menu` tracks `sticky` (`+0x14e`), `moved` (`+0x154`), and `held`
   (passed to `Pie::draw` for the cyan pressed highlight, `0x5eb04c`).
   `Menu::press` only marks `held`; `Menu::release` implements `0x5eb433`
-  and returns `menu::Release::{Settled, Chose(usize), Stays, Closed}`.
+  and returns `menu::Release::{Settled, Chose(usize), Stays, Closed}`;
+  backing out of a submenu restores the parent's placement and warps the
+  pointer back to the parent's middle when the parent clamps (`0x48db38` ->
+  `0x5ebab2`); `Menu::release_outside` handles a release after the pointer
+  leaves the window.
 - `Game::press` on an open pie menu (with no dialog over it) updates hover
   and highlight as mouse-move does and marks the button held without
-  choosing or re-checking an already-hovered entry.
+  choosing, re-checking an already-hovered entry, or clearing the pie's
+  status/diagnostic note.
 - `Game::release` runs mouse-move at the release point, settles an opening
   release inside the dead zone or on a moved menu (preserving any fallback
   status note), or else runs the second check (`Game::check_entry`) on the
   entry under the release point and carries out the choice, submenu
-  transition, or close. Pressing on an entry and dragging off the pie
-  before releasing now closes the menu without re-checking or ordering it.
-- `sims-game`'s window shell (`main.rs`) forwards left-button releases to
-  `Game::release` and moves the pointer when a submenu opens.
+  transition, or close. `Game::release_outside` settles a moved opening
+  menu or closes the pie without checking or choosing any entry. Pressing
+  on an entry and dragging off the pie (or outside the window) before
+  releasing now closes the menu without re-checking or ordering it.
+- `sims-game`'s window shell (`main.rs`) clears its tracked cursor on
+  `CursorLeft`, forwards left-button releases to `Game::release` (or
+  `Game::release_outside` after `CursorLeft`), and moves the pointer when
+  a submenu opens or backs out into a clamped parent.
 - The `goth-snack-bob-20261120` window replay in `tests/goth.rs` now sends
-  the recorded press at update 201 (verifying no check runs and the pie
-  stays open) and the release at update 223 (verifying the choice and
-  order).
+  the opening press at update 152, the opening release at update 154, the
+  entry press at update 201 (pie stays open and held, nothing ordered),
+  and the entry release at update 223 (ordering Have A Snack).
 
-## Not verified
+## Not verified / left out
 
 - Right-button release (`0x5eb4c0`, which also forwards to `0x5eb433` in
-  the original) is left to camera drag in `main.rs`.
+  the original) and right-button cyan highlight remain routed to camera
+  drag in `main.rs`.
+- The pie window's own UI sound cues (`UI_piemenu_appear`,
+  `UI_piemenu_highlight`, `UI_piemenu_select`), gated by `+0x17c`
+  (initialized to `1` in `0x5ea303` at `0x5ea380`), remain unplayed here
+  as before; only check-tree sounds are forwarded.
 - Visual appearance of the cyan pressed highlight has not been compared
   against a screenshot of the original.
