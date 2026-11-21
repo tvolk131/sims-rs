@@ -774,19 +774,215 @@ fn manage_inventory_needs_a_person_and_fails_loudly_elsewhere() {
     fx.lamp_mut().temps[4] = SIM as i16;
     assert_eq!(fx.run_with(LAMP, 4096, 0, &[], BUDGET), Ok(true));
     assert_eq!(fx.lamp().temps[1..3], [5, 1]);
-    // Other operations are not ported.
-    let mut add = FIND;
-    add[0] = 1;
-    assert!(matches!(
-        trap(sim_runs(&mut fx, 51, add, 0)),
-        Trap::Unsupported(_)
-    ));
+    // Operations 5 and 6 fail loudly when temp 0 names no neighbor record.
+    for (op, addr) in [(5, "0x45544b"), (6, "0x4553fc")] {
+        let mut ops = FIND;
+        ops[0] = op;
+        fx.sim_mut().temps[0] = 2; // empty slot
+        assert!(
+            matches!(trap(sim_runs(&mut fx, 51, ops, 0)), Trap::Unsupported(m) if m.contains(addr))
+        );
+    }
+    // Operand GUID 0 reads the stack object's GUID before dispatch, even
+    // for operations 2, 5, 6 and 7+.
+    for op in [1, 2, 5, 6, 7] {
+        let mut no_guid = [op, 2, 0, 0, 0, 0, 0, 0];
+        no_guid[0] = op;
+        assert!(matches!(
+            trap(sim_runs(&mut fx, 51, no_guid, 0)),
+            Trap::Unsupported(_)
+        ));
+    }
     // A person type with no record.
     fx.world.neighbors.slots[0] = None;
     assert!(matches!(
         trap(sim_runs(&mut fx, 51, FIND, 0)),
         Trap::Unsupported(_)
     ));
+}
+
+#[test]
+fn manage_inventory_op_1_decrements_by_one_and_erases_at_zero_or_minus_one() {
+    // 0x45569d → 0x41f427: default count 1 subtracts 1 from the first
+    // matching (kind, guid).
+    let mut fx = inventories();
+    let remove = [1, 2, 0, 0, 0x11, 0x11, 0, 0];
+    assert_eq!(sim_runs(&mut fx, 51, remove, 0), Ok(true));
+    assert_eq!(tokens(&fx), [(1, 3), (2, 4), (2, 6)]);
+
+    // Flag 0x2 reads count from temp 3 ((0x0e >> 2) & 3). Even a count of
+    // 3 only subtracts 1 in the original (0x41f447 pushes 1 into 0x41f471).
+    let mut from_temp = remove;
+    from_temp[2] = 0x0e;
+    fx.sim_mut().temps[3] = 3;
+    assert_eq!(sim_runs(&mut fx, 51, from_temp, 0), Ok(true));
+    assert_eq!(tokens(&fx), [(1, 3), (2, 3), (2, 6)]);
+
+    // Any negative count other than -1 also subtracts 1 without erasing.
+    fx.sim_mut().temps[3] = -2;
+    assert_eq!(sim_runs(&mut fx, 51, from_temp, 0), Ok(true));
+    assert_eq!(tokens(&fx), [(1, 3), (2, 2), (2, 6)]);
+
+    // Count 0 returns true without searching or modifying anything, even
+    // for a kind that is not in the inventory.
+    let mut missing_kind = from_temp;
+    missing_kind[1] = 9;
+    fx.sim_mut().temps[3] = 0;
+    assert_eq!(sim_runs(&mut fx, 51, missing_kind, 0), Ok(true));
+    assert_eq!(tokens(&fx), [(1, 3), (2, 2), (2, 6)]);
+    // With nonzero count, a missing kind or GUID returns false.
+    fx.sim_mut().temps[3] = 1;
+    assert_eq!(sim_runs(&mut fx, 51, missing_kind, 0), Ok(false));
+
+    // Count -1 erases the first matching token even when its count > 1.
+    fx.sim_mut().temps[3] = -1;
+    assert_eq!(sim_runs(&mut fx, 51, from_temp, 0), Ok(true));
+    assert_eq!(tokens(&fx), [(1, 3), (2, 6)]);
+
+    // Reaching 0 erases the token; a token whose signed count is <= 1
+    // (including 0 or negative) is clamped to 0 and erased.
+    fx.world.neighbors.inventories[1].items[0].count = 1;
+    let mut kind1 = remove;
+    kind1[1] = 1;
+    assert_eq!(sim_runs(&mut fx, 51, kind1, 0), Ok(true));
+    assert_eq!(tokens(&fx), [(2, 6)]);
+
+    fx.world.neighbors.inventories[1].items[0].count = (-3i16) as u16;
+    assert_eq!(sim_runs(&mut fx, 51, remove, 0), Ok(true));
+    assert!(tokens(&fx).is_empty());
+}
+
+#[test]
+fn manage_inventory_op_2_removes_by_index() {
+    // 0x45560c → 0x41f56b: index in temp (flags >> 8) & 3 (temp 2 here),
+    // count in temp (flags >> 2) & 3 (temp 3 here) when flag 0x2 is set.
+    let mut fx = inventories();
+    let by_index = [2, 0, 0x0e, 0x02, 0x11, 0x11, 0, 0];
+
+    // Count 0 returns true without checking the index (even out of range).
+    fx.sim_mut().temps[2] = -1;
+    fx.sim_mut().temps[3] = 0;
+    assert_eq!(sim_runs(&mut fx, 51, by_index, 0), Ok(true));
+    assert_eq!(tokens(&fx), [(1, 3), (2, 5), (2, 6)]);
+
+    // Negative or past-the-end index returns false with nonzero count.
+    fx.sim_mut().temps[3] = 1;
+    assert_eq!(sim_runs(&mut fx, 51, by_index, 0), Ok(false));
+    fx.sim_mut().temps[2] = 3;
+    assert_eq!(sim_runs(&mut fx, 51, by_index, 0), Ok(false));
+
+    // Positive count subtracts that count from the indexed token.
+    fx.sim_mut().temps[2] = 1;
+    fx.sim_mut().temps[3] = 3;
+    assert_eq!(sim_runs(&mut fx, 51, by_index, 0), Ok(true));
+    assert_eq!(tokens(&fx), [(1, 3), (2, 2), (2, 6)]);
+
+    // Subtracting to 0 or below erases the token.
+    fx.sim_mut().temps[2] = 1;
+    fx.sim_mut().temps[3] = 2;
+    assert_eq!(sim_runs(&mut fx, 51, by_index, 0), Ok(true));
+    assert_eq!(tokens(&fx), [(1, 3), (2, 6)]);
+
+    // Any negative count (not just -1) erases the indexed token.
+    fx.sim_mut().temps[2] = 1;
+    fx.sim_mut().temps[3] = -5;
+    assert_eq!(sim_runs(&mut fx, 51, by_index, 0), Ok(true));
+    assert_eq!(tokens(&fx), [(1, 3)]);
+
+    // Without flag 0x2, default count is 1.
+    let default_one = [2, 0, 0, 0x02, 0x11, 0x11, 0, 0];
+    fx.sim_mut().temps[2] = 0;
+    assert_eq!(sim_runs(&mut fx, 51, default_one, 0), Ok(true));
+    assert_eq!(tokens(&fx), [(1, 2)]);
+}
+
+#[test]
+fn manage_inventory_ops_5_and_6_replace_kind_1_or_3_with_temp_0_neighbor_guid() {
+    let mut fx = inventories();
+    fx.world.neighbors.inventories[1].items.push(Item {
+        kind: 1,
+        guid: 0xdead,
+        count: 9,
+    });
+    fx.world.neighbors.inventories[1].items.push(Item {
+        kind: 3,
+        guid: 0xbeef,
+        count: 4,
+    });
+
+    // Op 5 (0x455437): clears all kind 1 tokens and adds (1, slot3.guid, 1).
+    // Slot 3 holds LAMP_GUID (record ID 7).
+    fx.sim_mut().temps[0] = 3;
+    let op5 = [5, 0, 0, 0, 0x11, 0x11, 0, 0];
+    assert_eq!(sim_runs(&mut fx, 51, op5, 0), Ok(true));
+    let items: Vec<_> = fx.world.neighbors.inventories[1]
+        .items
+        .iter()
+        .map(|i| (i.kind, i.guid, i.count))
+        .collect();
+    assert_eq!(
+        items,
+        [
+            (2, LAMP_GUID, 5),
+            (2, LAMP_GUID, 6),
+            (3, 0xbeef, 4),
+            (1, LAMP_GUID, 1),
+        ]
+    );
+
+    // Op 6 (0x4553e8): clears all kind 3 tokens and adds (3, slot1.guid, 1).
+    // Run from the lamp with OWNER_IN_TEMP_4 (0x2000) to confirm temp 0
+    // is read from the caller (the lamp), not the owner (the Sim).
+    let op6 = [6, 0, 0, 0x20, 0x11, 0x11, 0, 0];
+    fx.add(
+        LAMP_FILE,
+        4096,
+        tree(vec![ins(51, RETURN_TRUE, RETURN_FALSE, op6)]),
+    );
+    fx.lamp_mut().temps[0] = 1; // slot 1 holds SIM_GUID
+    fx.lamp_mut().temps[4] = SIM as i16;
+    fx.sim_mut().temps[0] = 99; // invalid slot on owner: must not be read
+    assert_eq!(fx.run_with(LAMP, 4096, 0, &[], BUDGET), Ok(true));
+    let items: Vec<_> = fx.world.neighbors.inventories[1]
+        .items
+        .iter()
+        .map(|i| (i.kind, i.guid, i.count))
+        .collect();
+    assert_eq!(
+        items,
+        [
+            (2, LAMP_GUID, 5),
+            (2, LAMP_GUID, 6),
+            (1, LAMP_GUID, 1),
+            (3, SIM_GUID, 1),
+        ]
+    );
+
+    // Full inventory (0x7fff tokens of another kind): op 5/6 still return
+    // true (0x455418 ignores 0x41f38d's false) without exceeding 0x7fff.
+    fx.world.neighbors.inventories[1].items = vec![
+        Item {
+            kind: 2,
+            guid: LAMP_GUID,
+            count: 1,
+        };
+        0x7fff
+    ];
+    fx.sim_mut().temps[0] = 1;
+    assert_eq!(sim_runs(&mut fx, 51, op5, 0), Ok(true));
+    assert_eq!(fx.world.neighbors.inventories[1].items.len(), 0x7fff);
+}
+
+#[test]
+fn manage_inventory_unknown_operations_return_true_after_setup() {
+    // 0x4553e6 → 0x455418: operations 7 and above still create the owner's
+    // inventory if missing and return true.
+    let mut fx = inventories();
+    fx.world.neighbors.inventories.remove(1);
+    let op7 = [7, 2, 0, 0, 0x11, 0x11, 0, 0];
+    assert_eq!(sim_runs(&mut fx, 51, op7, 0), Ok(true));
+    assert_eq!(fx.world.neighbors.inventories.len(), 2);
+    assert_eq!(fx.world.neighbors.inventories[1].neighbor, 1);
 }
 
 /// The Sim, on a residential lot, with a thread on Idle For Input whose
