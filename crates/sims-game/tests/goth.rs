@@ -4325,8 +4325,9 @@ fn report_card_superstar_panel_and_help_balloons() {
         &i.kind,
         Kind::Balloon(b) if b.title.starts_with("Studio Fly")
     )));
-    // Clicking the open balloon itself (outside LivePanel, 0x51f3c5..0x51f3e5)
-    // dismisses it and emits `UI_whoosh`.
+    // Pressing on the open balloon itself (`0x66bd78 -> 0x5dd8e6`) keeps it
+    // open without `UI_whoosh`, while hovering outside the subpanel & balloon
+    // (`0x51f1f2..0x51f3e5`, `0x51d2ee..0x51d329`) dismisses it with `UI_whoosh`.
     let balloon_rect = hud
         .items()
         .iter()
@@ -4335,6 +4336,9 @@ fn report_card_superstar_panel_and_help_balloons() {
         .rect;
     let _ = hud.take_sounds();
     assert_eq!(hud.press(center(balloon_rect), &fame_world, true), None);
+    assert_eq!(hud.controls.help, Some(Help::FameLevel(4)));
+    assert!(hud.take_sounds().is_empty());
+    assert!(hud.hover([10, 10]));
     assert_eq!(hud.controls.help, None);
     assert_eq!(
         hud.take_sounds(),
@@ -4344,8 +4348,10 @@ fn report_card_superstar_panel_and_help_balloons() {
         }]
     );
 
-    // 4. Clicking away on the lot in `Game::press` (both empty ground and an
-    //    object that opens a pie menu) dismisses an open help balloon with `UI_whoosh`.
+    // 4. Moving the pointer onto the lot (`Game::hover`), leaving the window
+    //    (`Game::leave`), or clicking directly on the lot (`Game::press`, both
+    //    empty ground and an object that opens a pie menu) dismisses an open
+    //    help balloon with `UI_whoosh`.
     game.resize([800, 600]);
     game.render();
     let find_hunger = |game: &Game| {
@@ -4380,7 +4386,39 @@ fn report_card_superstar_panel_and_help_balloons() {
             .any(|i| matches!(i.kind, Kind::Balloon(_)))
     );
     let _ = game.take_sounds();
-    // Press empty lot above the HUD: balloon closes + UI_whoosh + redraw.
+    // Moving the pointer from the help control onto the lot dismisses it + WHOOSH.
+    assert!(game.hover([10, 10]));
+    assert!(game.take_sounds().contains(&SoundEvent::Play {
+        object: INTERFACE,
+        name: WHOOSH.into(),
+    }));
+    game.render();
+    assert!(
+        !game
+            .panel()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::Balloon(_)))
+    );
+    // Reopen balloon and leave the window: dismisses + WHOOSH.
+    game.press(center(need_rect));
+    game.render();
+    let _ = game.take_sounds();
+    assert!(game.leave());
+    assert!(game.take_sounds().contains(&SoundEvent::Play {
+        object: INTERFACE,
+        name: WHOOSH.into(),
+    }));
+    game.render();
+    assert!(
+        !game
+            .panel()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::Balloon(_)))
+    );
+    // Reopen balloon and press empty lot directly: balloon closes + WHOOSH + redraw.
+    game.press(center(need_rect));
+    game.render();
+    let _ = game.take_sounds();
     let outcome = game.press([10, 10]);
     assert!(outcome.redraw);
     assert!(game.take_sounds().contains(&SoundEvent::Play {

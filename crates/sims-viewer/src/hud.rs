@@ -256,7 +256,9 @@ impl Hud {
         self.dialog.is_some() || hud::covers(&self.items, point)
     }
 
-    /// Moves the pointer; true if what it hovers changed.
+    /// Moves the pointer; true if what it hovers changed or an open help
+    /// balloon was dismissed by moving outside the subpanel and balloon
+    /// (`0x51f1f2..0x51f3e5`, `0x51d2ee..0x51d329`).
     pub fn hover(&mut self, point: [i32; 2]) -> bool {
         let button = |pointer: Option<[i32; 2]>| {
             let layout = self.dialog.as_ref()?;
@@ -269,11 +271,15 @@ impl Hud {
             button(self.controls.pointer),
         );
         self.controls.pointer = Some(point);
-        (
+        let hovered_changed = (
             hud::hovered(&self.items, self.controls.pointer),
             hud::lit_relation(&self.items, self.controls.pointer),
             button(self.controls.pointer),
-        ) != before
+        ) != before;
+        let dismissed = self.controls.help.is_some()
+            && !hud::keeps_help_open(&self.items, point)
+            && self.dismiss_help();
+        hovered_changed || dismissed
     }
 
     /// Dismisses any open help balloon (`0x50fb7f`). Returns true if one was open.
@@ -312,7 +318,7 @@ impl Hud {
                     }
                 } else {
                     let dismissed =
-                        hud::outside_live_panel(&self.items, point) && self.dismiss_help();
+                        !hud::keeps_help_open(&self.items, point) && self.dismiss_help();
                     return (None, dismissed);
                 }
             }

@@ -558,7 +558,9 @@ impl Hud {
         self.pressed.release(uid);
     }
 
-    /// Moves the pointer; true if what it hovers changed.
+    /// Moves the pointer; true if what it hovers changed or an open help
+    /// balloon was dismissed by moving outside the subpanel and balloon
+    /// (`0x51f1f2..0x51f3e5`, `0x51d2ee..0x51d329`).
     pub fn hover(&mut self, point: [i32; 2]) -> bool {
         let button = |pointer: Option<[i32; 2]>| {
             let layout = self.dialog.as_ref()?;
@@ -576,18 +578,25 @@ impl Hud {
             entry(self.controls.pointer),
         );
         self.controls.pointer = Some(point);
-        (
+        let hovered_changed = (
             hud::hovered(&self.items, self.controls.pointer),
             hud::lit_relation(&self.items, self.controls.pointer),
             button(self.controls.pointer),
             entry(self.controls.pointer),
-        ) != before
+        ) != before;
+        let dismissed = self.controls.help.is_some()
+            && !hud::keeps_help_open(&self.items, point)
+            && self.dismiss_help();
+        hovered_changed || dismissed
     }
 
-    /// The pointer left the window: no button is hovered and no name
-    /// shows. True if the pointer was in it, so the frame changes.
+    /// The pointer left the window: no button is hovered, no name shows, and
+    /// any open help balloon is dismissed (`0x51d2ee..0x51d317`). True if the
+    /// frame changes.
     pub fn leave(&mut self) -> bool {
-        self.controls.pointer.take().is_some()
+        let left = self.controls.pointer.take().is_some();
+        let dismissed = self.dismiss_help();
+        left || dismissed
     }
 
     /// Where the pointer is to be moved, as the original moves it when a
@@ -656,7 +665,7 @@ impl Hud {
                         return None;
                     }
                 } else {
-                    if hud::outside_live_panel(&self.items, point) {
+                    if !hud::keeps_help_open(&self.items, point) {
                         self.dismiss_help();
                     }
                     return None;

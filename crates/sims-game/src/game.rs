@@ -694,6 +694,8 @@ impl Game {
         }
         self.pointer = Some(point);
         let mut redraw = self.hud.hover(point);
+        let sounds = self.hud.take_sounds();
+        self.keep_sounds(sounds);
         redraw |= self.highlight(point);
         redraw |= self.follow();
         // The cutaway follows the rooms the pointer passes over, while
@@ -784,6 +786,8 @@ impl Game {
         }
         self.pointer = Some(point);
         let mut redraw = self.hud.hover(point);
+        let sounds = self.hud.take_sounds();
+        self.keep_sounds(sounds);
         redraw |= self.highlight(point);
         let will_choose = self.hud.menu.as_ref().is_some_and(|m| m.will_choose(point));
         if !will_choose {
@@ -855,6 +859,8 @@ impl Game {
         self.pointer = None;
         self.highlighted = None;
         let redraw = self.hud.leave();
+        let sounds = self.hud.take_sounds();
+        self.keep_sounds(sounds);
         self.follow() || redraw
     }
 

@@ -354,8 +354,8 @@ impl Controls {
     /// not the text), when another panel opens (`0x51d375`), when the strip
     /// closes, or when a control outside the live panel takes a press
     /// (`0x51d312`, `0x51d354`: portraits, cluster, speed, camera, mode,
-    /// help dialog, or action queue). Presses outside the live panel with
-    /// no command are dismissed by the host via [`outside_live_panel`].
+    /// help dialog, or action queue). Pointer exits and presses outside the
+    /// subpanel and balloon are dismissed by the host via [`keeps_help_open`].
     pub fn apply(&mut self, command: &Command) {
         match command {
             Command::TogglePanel => {
@@ -1624,7 +1624,7 @@ const FAME_TITLE_FONT: u8 = 11;
 const FAME_TITLE: &str = "Fame";
 const FAME_BAR_POS: [i32; 2] = [3, 30];
 const FAME_LEVEL_BUTTON: [i32; 4] = [3, 45, 102, 16];
-const FAME_FRIENDS_BUTTON: [i32; 4] = [3, 75, 120, 20];
+const FAME_FRIENDS_BUTTON: [i32; 4] = [3, 75, 120, 15];
 const FAME_SKILL_LABEL: [i32; 4] = [145, 6, 62, 16];
 const FAME_SKILL_BAR: [i32; 2] = [210, 7];
 
@@ -2695,15 +2695,24 @@ pub fn covers(items: &[Item], point: [i32; 2]) -> bool {
         .any(|i| !matches!(i.kind, Kind::Name { .. }) && i.rect.contains(point[0], point[1]))
 }
 
-/// Whether `point` lies outside the live-mode panel rect (`0x51f3c0..0x51f3de`:
-/// the gadget and subpanel area along the bottom right). Presses outside it
-/// (on the lot, on an open help balloon, on the cluster, on portraits, or on
-/// the action queue) dismiss an open help balloon with `UI_whoosh`.
-pub fn outside_live_panel(items: &[Item], [x, y]: [i32; 2]) -> bool {
-    let Some(gadget) = items.iter().find(|i| i.kind == Kind::Image(id::GAUGE)) else {
+/// Whether `point` stays inside a region that keeps an open help balloon alive:
+/// the active subpanel (`[gadget.x + 108.., gadget.y..]`, `0x51f22b..0x51f3e5`)
+/// or the open balloon itself (`Kind::Balloon`, whose `OnMouseDown` at `0x66bd78`
+/// forwards without closing it). Moving or pressing outside these regions (onto
+/// the lot, cluster, portraits, gadget left of the subpanel, status band, action
+/// queue, or out of the window) dismisses an open help balloon with `UI_whoosh`
+/// (`0x51f1f2..0x51f3e5`, `0x51d2ee..0x51d359`).
+pub fn keeps_help_open(items: &[Item], [x, y]: [i32; 2]) -> bool {
+    if items
+        .iter()
+        .any(|i| matches!(i.kind, Kind::Balloon(_)) && i.rect.contains(x, y))
+    {
         return true;
+    }
+    let Some(gadget) = items.iter().find(|i| i.kind == Kind::Image(id::GAUGE)) else {
+        return false;
     };
-    x < gadget.rect.x || y < gadget.rect.y
+    x >= gadget.rect.x.saturating_add(108) && y >= gadget.rect.y
 }
 
 /// The item under `point` that a press would act on, for hover changes.
@@ -4922,14 +4931,18 @@ mod tests {
                 index: 7,
             }))
         );
-        assert!(!outside_live_panel(
+        assert!(keeps_help_open(
             &need_items,
             [need_panel.x + 10, need_panel.y + 10]
         ));
-        assert!(outside_live_panel(&need_items, [10, 550]));
-        assert!(outside_live_panel(
+        assert!(!keeps_help_open(&need_items, [10, 550]));
+        assert!(!keeps_help_open(
             &need_items,
             [need_panel.x + 10, need_panel.y - 1]
+        ));
+        assert!(!keeps_help_open(
+            &need_items,
+            [need_panel.x - 10, need_panel.y + 10]
         ));
         controls.help = Some(Help::Need {
             pet: false,
