@@ -229,11 +229,17 @@ fn the_goths_sounds_play() {
     }
     assert!(played.iter().any(|n| n == "door_open"), "{played:?}");
     assert!(loud > 0, "the Goths' lot is silent");
-    // The route sounds have no event in the install's sound files.
+    // The route sounds have no event in the install's sound files, and
+    // SimsGeneratedHitSource.hot spells the rejected-tickler event
+    // `vox_ticklee_rejected` while the interaction's FWAV asks for
+    // `vox_tickler_rejected`.
     assert!(
-        faults
-            .iter()
-            .all(|f| f == "no event begin_route" || f == "no event end_route"),
+        faults.iter().all(|f| {
+            matches!(
+                f.as_str(),
+                "no event begin_route" | "no event end_route" | "no event vox_tickler_rejected"
+            )
+        }),
         "{faults:?}"
     );
 }
