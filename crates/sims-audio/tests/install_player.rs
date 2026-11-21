@@ -261,7 +261,7 @@ fn every_event_definition_runs_without_a_bad_instruction() {
         format!("{faults:?}"),
         "{\"event names no track\": 14, \"event of a kind not ported\": 2, \
          \"hit list not found\": 1, \"patch not found\": 3, \
-         \"track 3928 (sounddata\\\\simsgeneratedhitsource) at 0x24: ran too long without waiting\": 1, \
+         \"track 3928 (sounddata\\\\simsgeneratedhitsource) at 0x29: ran too long without waiting\": 1, \
          \"track entry point not found\": 10}"
     );
 }

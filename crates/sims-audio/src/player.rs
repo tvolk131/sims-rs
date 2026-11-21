@@ -196,18 +196,18 @@
 //! install uses them. The tests are debug routines.) `setll`, `setlt` and
 //! `settl` copy like `set`.
 //!
-//! Limits, so no script can hang or exhaust the host: one thread runs at
-//! most [`STEPS`] instructions per block and all threads together
-//! [`BLOCK_STEPS`] (threads a block does not reach run first in the
-//! next); at most [`THREADS`] threads, [`NOTES`] notes and [`SEQGROUPS`]
-//! sequence groups, [`INSTANCES`] instances, and [`CHAIN`] patches
-//! chained to one note exist at once; calls nest at most [`CALL_DEPTH`] deep;
-//! a thread started by `play_trk` first runs in the next block; a patch
-//! that does not exist is not cached. A track, patch, hit list or track
-//! data ID that several modules define is the last one registered
-//! ([`owners`], [`hit_lists`], [`entry_points`]). How the original picks
-//! among duplicate events is unknown; here the module whose name sorts
-//! first wins.
+//! Limits, so no script can hang or exhaust the host: *(code)* one thread runs
+//! at most [`STEPS`] (102) instructions per 20 ms timer tick before
+//! `0x57d909..0x57d91f` kills it as stuck; at most [`THREADS`] threads,
+//! [`NOTES`] notes and [`SEQGROUPS`] sequence groups, [`INSTANCES`] instances,
+//! and [`CHAIN`] patches chained to one note exist at once; calls nest at most
+//! [`CALL_DEPTH`] deep; a newly started other thread from `play_trk` first runs
+//! in the next tick (while a track restarting itself runs on in the same tick,
+//! `0x57dc0d` → `0x57dc8e`); a patch that does not exist is not cached. A
+//! track, patch, hit list or track data ID that several modules define is the
+//! last one registered ([`owners`], [`hit_lists`], [`entry_points`]). How the
+//! original picks among duplicate events is unknown; here the module whose name
+//! sorts first wins.
 
 use crate::ambience::{self, Fresh, Host, Key, Voice};
 use crate::files::SoundFiles;
@@ -229,13 +229,10 @@ pub const BLOCK: usize = 64;
 /// *(code)* Frames per 20 ms (50 Hz) periodic sound-manager timer tick
 /// (`0x572fc3`: `push 0x14` → `0x572fd6` → `0x573019`), exact at [`RATE`].
 pub const TIMER_FRAMES: usize = (RATE as usize * 20) / 1000;
-/// Instructions one thread may run in one block before the player calls
-/// it stuck and ends it.
-pub const STEPS: usize = 10_000;
-/// Instructions all threads together may run in one block. When they are
-/// spent, the running thread stops where it is and it and every thread
-/// not yet run go on in the next block.
-pub const BLOCK_STEPS: usize = 100_000;
+/// *(code)* Instructions one thread may execute in a single 20 ms HIT timer
+/// tick before `0x57d909..0x57d91f` (`cmp eax, 0x64; jle` after each
+/// instruction) kills it as an infinite loop (`0x57bd45` → `0x57bd91`).
+pub const STEPS: usize = 102;
 /// Threads that may exist at once, those waiting to start included. A
 /// thread started beyond it is a fault.
 pub const THREADS: usize = 256;
@@ -558,9 +555,6 @@ struct Thread {
     /// *(code)* HIT clock tick at which instructions may next run (`[esi + 0x198]`;
     /// `0` stops instruction execution, `0x57d8b3..0x57d8c0`).
     wake: u32,
-    /// *(code)* HIT clock tick at which a timed `note` stops its voice
-    /// (`[esi + 0x194]`; `0` for none, `0x57e177`, `0x57d929..0x57d951`).
-    note_off: u32,
     /// The track's HOT group (`kGroupSfx` 1, `kGroupMusic` 2, `kGroupVox`
     /// 3), whose volume scales its own.
     group: i64,
@@ -876,9 +870,6 @@ enum Flow {
     /// Stay on this instruction and sleep for [`POLL_TICKS`] timer ticks
     /// (`0x57e6bd..0x57e6c7`, `0x57efc8..0x57efd2`).
     Block,
-    /// Go to this address on the next timer tick (host safety yield on a
-    /// track restarting itself via `play_trk`).
-    JumpYield(Place),
     End,
     /// End the thread, whatever called it, and stop its notes.
     Kill,
@@ -911,8 +902,12 @@ pub struct Player<S> {
     cache: BTreeMap<u32, Option<Pcm>>,
     globals: [i32; 256 - GLOBALS as usize],
     threads: Vec<Thread>,
-    /// Whether a block has run out of instructions; reported once.
-    over_budget: bool,
+    /// *(code)* Per-track timed `note` auto-stop deadlines (`[track + 0x194]`,
+    /// initialized to `0` in constructor `0x57d6b6`, written by `note` at
+    /// `0x57e177`, cleared only when `0x57d929..0x57d951` fires or when the
+    /// track object is destroyed at `0x57ce04` — preserved across kill and
+    /// restart).
+    note_off: BTreeMap<u32, u32>,
     /// Sequence groups: the group a register names, to the ID of the
     /// thread that last claimed it with `seqgroup_kill` or
     /// `seqgroup_return`. A slot keeps its ID after that thread ends.
@@ -993,12 +988,11 @@ pub struct Player<S> {
     /// initialized to `1` at `0x57c9be`, incremented by `1` on each 20 ms
     /// timer tick at `0x57cf74` and on unpause at `0x57cd46`).
     hit_clock: u32,
-    /// The frame at which the 20 ms HIT timer tick last ran (`0x57cf37`).
-    ran_at: Option<u64>,
+    /// The frame at which the unified 20 ms timer callback (`0x572fd6`:
+    /// nudge `0x573019` then HIT `0x57cf37`) last ran.
+    ticked_at: Option<u64>,
     /// The frame at which ambience scores last updated.
     ambience_at: Option<u64>,
-    /// The frame at which the 20 ms volume-nudge timer last stepped (`0x573019`).
-    nudged_at: Option<u64>,
     next_id: u32,
     /// The next [`Thread::order`].
     next_order: i64,
@@ -1030,7 +1024,7 @@ impl<S: Samples> Player<S> {
             cache: BTreeMap::new(),
             globals: [0; 256 - GLOBALS as usize],
             threads: Vec::new(),
-            over_budget: false,
+            note_off: BTreeMap::new(),
             seqgroups: BTreeMap::new(),
             duck: BTreeMap::new(),
             group_volumes: BTreeMap::new(),
@@ -1056,9 +1050,8 @@ impl<S: Samples> Player<S> {
             ambient_cache: BTreeMap::new(),
             frame: 0,
             hit_clock: 1,
-            ran_at: None,
+            ticked_at: None,
             ambience_at: None,
-            nudged_at: None,
             next_id: 1,
             next_order: 0,
             random: splitmix(seed),
@@ -1972,6 +1965,7 @@ impl<S: Samples> Player<S> {
         self.held.remove(&id);
         self.idle.remove(&id);
         self.stopped.remove(&id);
+        self.note_off.remove(&id);
         self.duck.remove(&id);
         self.update_main_duckpri(true);
         self.track_objects.remove(&id);
@@ -2624,7 +2618,6 @@ impl<S: Samples> Player<S> {
                         hit_list: Vec::new(),
                         last_note: 0,
                         wake: 0,
-                        note_off: 0,
                         group,
                         target: Target::Own,
                         kill_after_fade: false,
@@ -2781,7 +2774,6 @@ impl<S: Samples> Player<S> {
             thread.hit_list.clear();
             thread.last_note = 0;
             thread.wake = now;
-            thread.note_off = 0;
             thread.registers[usize::from(ISPLAYING)] = 1;
             thread.kept = 1;
         }
@@ -2922,7 +2914,6 @@ impl<S: Samples> Player<S> {
             hit_list: Vec::new(),
             last_note: 0,
             wake: self.hit_clock,
-            note_off: 0,
             group,
             target: Target::Own,
             kill_after_fade: false,
@@ -3158,8 +3149,8 @@ impl<S: Samples> Player<S> {
     }
 
     /// Renders until nothing runs or plays, at most `limit` frames (and
-    /// at most [`RENDER_LIMIT`]). The output ends at the boundary where the
-    /// last thread or voice finishes.
+    /// at most [`RENDER_LIMIT`]). Stops at the first [`BLOCK`] or
+    /// [`TIMER_FRAMES`] boundary where the player is idle.
     pub fn render_until_idle(&mut self, limit: usize, sources: &dyn Sources) -> Vec<i16> {
         let limit = limit.min(RENDER_LIMIT);
         let mut out = Vec::new();
@@ -3177,30 +3168,33 @@ impl<S: Samples> Player<S> {
         out
     }
 
-    /// *(code)* `0x572fc3` (`push 0x14` = 20 ms) → `0x572fd6`: every
-    /// [`TIMER_FRAMES`] (441 frames at 22,050 Hz, 50 Hz):
-    /// 1. (`0x573019`) while `+0x114` (`self.nudge`) is nonzero (and after
-    ///    frame 0, since kind 25 on already nudged immediately at `0x573c71`),
-    ///    places every track nudged then normal and decrements the countdown;
+    /// *(code)* `0x572fc3` (`push 0x14` = 20 ms) → `0x572fd6`: unified 50 Hz
+    /// periodic timer callback (every [`TIMER_FRAMES`] = 441 frames at 22,050
+    /// Hz). Both phases run atomically under one `ticked_at` guard in native
+    /// order:
+    /// 1. (`0x573019`) while `+0x114` (`self.nudge`) is nonzero, places every
+    ///    track nudged then normal and decrements the countdown;
     /// 2. (`0x573046` → `0x57cf37`) increments `[hit + 0x58]` (`self.hit_clock`)
     ///    and runs every unheld running track once (`0x57d7cd`).
+    ///
+    /// A freshly constructed [`Player`] aligns its initial periodic tick to
+    /// phase `frame == 0` so queued events begin immediately without 20 ms of
+    /// startup silence (whereas 1.91 arms `0x572fc3` → `0x607461` at app boot
+    /// before gameplay events arrive).
     fn step_timer(&mut self, sources: &dyn Sources) {
-        if !self.frame.is_multiple_of(TIMER_FRAMES as u64) {
+        if !self.frame.is_multiple_of(TIMER_FRAMES as u64) || self.ticked_at == Some(self.frame) {
             return;
         }
-        if self.nudge != 0 && self.frame > 0 && self.nudged_at != Some(self.frame) {
-            self.nudged_at = Some(self.frame);
+        self.ticked_at = Some(self.frame);
+        if self.nudge != 0 {
             let remaining = self.nudge;
             self.place_all(sources);
             self.nudge = 0;
             self.place_all(sources);
             self.nudge = remaining - 1;
         }
-        if self.ran_at != Some(self.frame) {
-            self.ran_at = Some(self.frame);
-            self.hit_clock = self.hit_clock.wrapping_add(1);
-            self.run(sources);
-        }
+        self.hit_clock = self.hit_clock.wrapping_add(1);
+        self.run(sources);
     }
 
     /// Updates every started ambience player once per [`BLOCK`] (64 frames,
@@ -3318,7 +3312,6 @@ impl<S: Samples> Player<S> {
     /// list (a hold takes it out, 0x57dc53 to 0x57dc5a), so one let go on
     /// the way first runs in the next block too.
     fn run(&mut self, sources: &dyn Sources) {
-        let mut budget = BLOCK_STEPS;
         self.threads.sort_by_key(|t| t.order);
         let schedule: Vec<u32> = self
             .threads
@@ -3326,7 +3319,7 @@ impl<S: Samples> Player<S> {
             .map(|t| t.track)
             .filter(|t| !self.held.contains(t))
             .collect();
-        for (next, &track) in schedule.iter().enumerate() {
+        for &track in &schedule {
             // A track runs one thread at most.
             let Some(mut thread) = self.threads.iter().find(|t| t.track == track).cloned() else {
                 continue;
@@ -3335,11 +3328,7 @@ impl<S: Samples> Player<S> {
             if self.held.contains(&track) {
                 continue;
             }
-            if budget == 0 {
-                self.out_of_budget(&schedule[next..]);
-                break;
-            }
-            let alive = self.step(&mut thread, sources, &mut budget);
+            let alive = self.step(&mut thread, sources);
             // A thread may have stopped others (kill_trk) or started some
             // (play_trk); find this one again by ID.
             let id = thread.id;
@@ -3363,76 +3352,66 @@ impl<S: Samples> Player<S> {
         self.forget_ended();
     }
 
-    /// The block has run out of instructions before the tracks `rest`
-    /// had their turn. They still fade, and end when a fade that was to
-    /// end them does, as in their turn (see [`Player::fade_or_end`]); the
-    /// rest of their turn waits for the next block, where they run first,
-    /// so busy threads cannot starve them.
-    fn out_of_budget(&mut self, rest: &[u32]) {
-        if !self.over_budget {
-            self.over_budget = true;
-            self.report(format!(
-                "threads ran {BLOCK_STEPS} instructions in one block; the rest wait"
-            ));
-        }
-        let first = self.threads.iter().map(|t| t.order).min().unwrap_or(0);
-        for (place, &track) in rest.iter().enumerate() {
-            if self.held.contains(&track) {
-                continue;
-            }
-            let Some(mut thread) = self.threads.iter().find(|t| t.track == track).cloned() else {
-                continue;
-            };
+    /// *(code)* `0x57d929..0x57d951`: stops a track's active voice and clears
+    /// its persistent timed-`note` deadline (`[esi + 0x194]`) once
+    /// `saved_clock >= deadline` (unsigned).
+    fn expire_note_off(&mut self, thread: &mut Thread, saved_clock: u32) {
+        if let Some(&deadline) = self.note_off.get(&thread.track)
+            && deadline != 0
+            && saved_clock >= deadline
+        {
             let id = thread.id;
-            if !self.fade_or_end(&mut thread) {
-                self.threads.retain(|t| t.id != id);
-                self.save_stopped(&thread);
-                continue;
-            }
-            if thread.note_off != 0 && self.hit_clock >= thread.note_off {
-                self.notes.retain(|n| n.thread != id);
-                thread.last_note = 0;
-                thread.note_off = 0;
-            }
-            thread.order = first - (rest.len() - place) as i64;
-            if let Some(slot) = self.threads.iter_mut().find(|t| t.id == id) {
-                *slot = thread;
-            }
+            self.notes.retain(|n| n.thread != id);
+            thread.last_note = 0;
+            self.note_off.remove(&thread.track);
         }
     }
 
     /// Runs one thread on a 20 ms HIT timer tick (`0x57d7cd`):
     /// 1. (`0x57d7ff..0x57d88d`) steps any active fade once and kills the
-    ///    track if `kill_after_fade` is set and the fade finished;
-    /// 2. (`0x57d892..0x57d927`) runs instructions while `wake != 0 &&
-    ///    hit_clock >= wake` (unsigned comparison, `0x57d8c0`), up to
-    ///    [`STEPS`] and the shared `budget`;
-    /// 3. (`0x57d929..0x57d951`) stops the thread's active voice if a timed
-    ///    `note` deadline (`note_off != 0 && hit_clock >= note_off`) elapsed.
+    ///    track if `kill_after_fade` is set and the fade finished (skipping
+    ///    `0x57d929` on that early return);
+    /// 2. (`0x57d892..0x57d8a8`) snapshots `[hit + 0x58]` and kills the track
+    ///    if its sign bit is set;
+    /// 3. (`0x57d8b0..0x57d927`) runs instructions while `wake != 0 &&
+    ///    saved_clock >= wake` (unsigned comparison, `0x57d8c0`), killing the
+    ///    track if `wake` has its sign bit set (`0x57d8c2`) or after executing
+    ///    [`STEPS`] (102) instructions (`0x57d909..0x57d91f`);
+    /// 4. (`0x57d929..0x57d951`) stops the thread's active voice and clears
+    ///    `[esi + 0x194]` if a timed `note` deadline elapsed.
     ///
     /// False when the thread ended.
-    fn step(&mut self, thread: &mut Thread, sources: &dyn Sources, budget: &mut usize) -> bool {
+    fn step(&mut self, thread: &mut Thread, sources: &dyn Sources) -> bool {
         if !self.fade_or_end(thread) {
             return false;
         }
+        let saved_clock = self.hit_clock;
+        if (saved_clock as i32) < 0 {
+            let alive = self.fault(thread, "hit clock overflow");
+            self.expire_note_off(thread, saved_clock);
+            return alive;
+        }
         let mut ran = 0usize;
-        while thread.wake != 0 && self.hit_clock >= thread.wake {
-            if ran >= STEPS {
-                return self.fault(thread, "ran too long without waiting");
-            }
-            if *budget == 0 {
+        let mut alive = true;
+        while thread.wake != 0 && saved_clock >= thread.wake {
+            if (thread.wake as i32) < 0 {
+                alive = self.fault(thread, "wait time overflow");
                 break;
             }
-            *budget -= 1;
-            ran += 1;
             let program = &self.modules[thread.module].program;
             let track_data = &self.track_data;
             let instruction = match program.decode(thread.pc, &|id| track_data.contains_key(&id)) {
                 Ok(instruction) => instruction,
-                Err(error) => return self.fault(thread, &error.to_string()),
+                Err(error) => {
+                    alive = self.fault(thread, &error.to_string());
+                    break;
+                }
             };
             let next = thread.pc + instruction.length;
-            match self.execute(thread, &instruction, next, sources) {
+            let result = self.execute(thread, &instruction, next, sources);
+            ran += 1;
+            let mut yielded = false;
+            match result {
                 Ok(Flow::Next) => thread.pc = next,
                 Ok(Flow::Jump(place)) => (thread.module, thread.pc) = place,
                 Ok(Flow::Block) => {
@@ -3440,11 +3419,7 @@ impl<S: Samples> Player<S> {
                     // keeps `pc` on the polling instruction and sleeps for
                     // `POLL_TICKS` (2) timer ticks (40 ms).
                     thread.wake = self.hit_clock.wrapping_add(POLL_TICKS);
-                    break;
-                }
-                Ok(Flow::JumpYield(place)) => {
-                    (thread.module, thread.pc) = place;
-                    break;
+                    yielded = true;
                 }
                 Ok(Flow::End) => match thread.stack.pop() {
                     Some(place) => (thread.module, thread.pc) = place,
@@ -3466,26 +3441,34 @@ impl<S: Samples> Player<S> {
                             self.write(thread, i64::from(FADE_ON), 1);
                             thread.pc = next;
                         } else {
-                            return false;
+                            alive = false;
                         }
                     }
                 },
                 Ok(Flow::Kill) => {
                     let id = thread.id;
                     self.notes.retain(|n| n.thread != id);
-                    return false;
+                    alive = false;
                 }
-                Err(message) => return self.fault(thread, &message),
+                Err(message) => {
+                    alive = self.fault(thread, &message);
+                    break;
+                }
+            }
+            // *(code)* `0x57d909..0x57d91f`: post-instruction counter check;
+            // executing the 102nd instruction (`old == 101 > 0x64`) invokes
+            // `0x57bd45` -> `Track::Kill` (`0x57bd91`).
+            if ran >= STEPS {
+                alive = self.fault(thread, "ran too long without waiting");
+                break;
+            }
+            if !alive || yielded {
+                break;
             }
         }
         // *(code)* `0x57d929..0x57d951`: timed `note` auto-stop.
-        if thread.note_off != 0 && self.hit_clock >= thread.note_off {
-            let id = thread.id;
-            self.notes.retain(|n| n.thread != id);
-            thread.last_note = 0;
-            thread.note_off = 0;
-        }
-        true
+        self.expire_note_off(thread, saved_clock);
+        alive
     }
 
     /// Moves the thread's fade one step; false when that fade was to end
@@ -3929,32 +3912,42 @@ impl<S: Samples> Player<S> {
             "ifle" => return branch(kept <= 0),
             _ => {}
         }
-        let wait_until = |player: &Self, thread: &Thread, holds: fn(i32, i32) -> bool| {
-            if holds(player.read(thread, arg(0)), player.read(thread, arg(1))) {
-                Flow::Next
-            } else {
-                Flow::Block
+        let wait_until = |player: &Self,
+                          thread: &Thread,
+                          name: &str,
+                          holds: fn(i32, i32) -> bool|
+         -> Result<Flow, String> {
+            // *(code)* 0x57e48a..0x57e4e7: both register operands must lie in
+            // 1..=127 (`0x57f561` + zero check); invalid operands call
+            // `0x57bd45` -> `Track::Kill` (`0x57bd91`).
+            if !(1..=127).contains(&arg(0)) || !(1..=127).contains(&arg(1)) {
+                return Err(format!("{name}: bad register"));
             }
+            Ok(
+                if holds(player.read(thread, arg(0)), player.read(thread, arg(1))) {
+                    Flow::Next
+                } else {
+                    Flow::Block
+                },
+            )
         };
         let flow = match instruction.name() {
             "note" => {
                 // *(code)* 0x57e145..0x57e18d: reads note key and duration (in
-                // 20 ms HIT ticks; `0x57f561` clamps register > 127 to 1), arms
-                // `[esi + 0x194] = [hit + 0x58] + dur`, and starts the track's
-                // current `PATCH` voice.
-                let r_key = if (0..=127).contains(&arg(0)) {
-                    arg(0)
+                // 20 ms HIT ticks; `0x57f561` calls `0x57bd45` -> `Track::Kill`
+                // on register > 127), arms persistent `[esi + 0x194] =
+                // [hit + 0x58] + dur`, and starts the track's `PATCH` voice.
+                if !(0..=127).contains(&arg(0)) || !(0..=127).contains(&arg(1)) {
+                    return Err("note: bad register".into());
+                }
+                let _key = self.read(thread, arg(0));
+                let duration = self.read(thread, arg(1));
+                let deadline = self.hit_clock.wrapping_add(duration as u32);
+                if deadline == 0 {
+                    self.note_off.remove(&thread.track);
                 } else {
-                    1
-                };
-                let r_dur = if (0..=127).contains(&arg(1)) {
-                    arg(1)
-                } else {
-                    1
-                };
-                let _key = self.read(thread, r_key);
-                let duration = self.read(thread, r_dur);
-                thread.note_off = self.hit_clock.wrapping_add(duration as u32);
+                    self.note_off.insert(thread.track, deadline);
+                }
                 let id = self.note_on(thread);
                 thread.last_note = id;
                 Flow::Next
@@ -3994,20 +3987,17 @@ impl<S: Samples> Player<S> {
             }
             "return" | "end" => Flow::End,
             "wait" => {
-                // *(code)* 0x57e42d..0x57e459: validates register (`0x57f561`
-                // clamps > 127 to 1; register 0 logs a fault and leaves `wake`
-                // unchanged), adds the register value (in 20 ms HIT ticks)
-                // directly to `[hit + 0x58]`, and writes `[esi + 0x198]`.
+                // *(code)* 0x57e42d..0x57e463: validates register in 1..=127
+                // (`0x57f561` + zero check; invalid operands call `0x57bd45` ->
+                // `Track::Kill` at `0x57bd91`), adds the register value (in
+                // 20 ms HIT ticks) to `[hit + 0x58]`, and writes `[esi + 0x198]`.
                 // Values <= 0 that stay non-zero and `<= hit_clock` continue in
                 // the same tick without yielding (`0x57d8b3..0x57d8c0`).
-                let reg = arg(0);
-                if reg == 0 {
-                    self.report_fault(thread, "wait: bad register");
-                } else {
-                    let r = if (1..=127).contains(&reg) { reg } else { 1 };
-                    let ticks = self.read(thread, r);
-                    thread.wake = self.hit_clock.wrapping_add(ticks as u32);
+                if !(1..=127).contains(&arg(0)) {
+                    return Err("wait: bad register".into());
                 }
+                let ticks = self.read(thread, arg(0));
+                thread.wake = self.hit_clock.wrapping_add(ticks as u32);
                 Flow::Next
             }
             "wait_samp" => {
@@ -4109,10 +4099,11 @@ impl<S: Samples> Player<S> {
                     self.write_stopped(track, SOURCE, source);
                 }
                 self.sync_thread_from_store(thread);
-                // Started anew, it runs from the top, from the next block
-                // (the original goes on in the same update).
+                // *(code)* `0x57f1f2` -> `0x57dc0d` -> `0x57dc8e` -> `0x57f267`:
+                // a track restarting itself sets `wake = hit_clock` and continues
+                // in the same tick from its entry point (bounded by `STEPS = 102`).
                 if own && started.fresh {
-                    return Ok(Flow::JumpYield((thread.module, thread.pc)));
+                    return Ok(Flow::Jump((thread.module, thread.pc)));
                 }
                 Flow::Next
             }
@@ -4223,12 +4214,12 @@ impl<S: Samples> Player<S> {
                 }
                 Flow::Next
             }
-            "waiteq" => wait_until(self, thread, |a, b| a == b),
-            "waitne" => wait_until(self, thread, |a, b| a != b),
-            "waitgt" => wait_until(self, thread, |a, b| a > b),
-            "waitlt" => wait_until(self, thread, |a, b| a < b),
-            "waitge" => wait_until(self, thread, |a, b| a >= b),
-            "waitle" => wait_until(self, thread, |a, b| a <= b),
+            "waiteq" => wait_until(self, thread, "waiteq", |a, b| a == b)?,
+            "waitne" => wait_until(self, thread, "waitne", |a, b| a != b)?,
+            "waitgt" => wait_until(self, thread, "waitgt", |a, b| a > b)?,
+            "waitlt" => wait_until(self, thread, "waitlt", |a, b| a < b)?,
+            "waitge" => wait_until(self, thread, "waitge", |a, b| a >= b)?,
+            "waitle" => wait_until(self, thread, "waitle", |a, b| a <= b)?,
             other => return Err(format!("{other} is not supported")),
         };
         Ok(flow)
