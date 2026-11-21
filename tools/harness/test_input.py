@@ -1108,6 +1108,29 @@ class ReviewFindingsTest(RunnerBase):
         self.assertTrue(r.finished)
         self.assertIsNone(r.failed)
 
+    def test_drag_aborts_before_press_when_dialog_shows_during_initial_move(self):
+        r = self.runner('drag 100 200 300 400\nanswer-dialog 400 400')
+        self.tick(r, 1, finish=False)
+        r.on_dialog('dialog_show', self.update + 1)
+        cmds = self.rows('command')
+        self.assertEqual([c['what'] for c in cmds], ['move', 'press'])
+        self.assertIn('400 400', cmds[1]['command'])
+        self.agent.finish_all()
+        r.on_dialog('dialog_result', self.update + 1)
+        self.assertTrue(r.finished)
+        self.assertIsNone(r.failed)
+
+    def test_failed_release_is_retried_at_close(self):
+        r = self.runner('click 10 20')
+        self.tick_until(r, lambda: 'mouseup' in self.last_command())
+        self.agent.codes = {3: 1}
+        self.agent.finish_all()
+        r.close()
+        self.runners.remove(r)
+        releases = [c for c in self.rows('command') if c['what'] == 'release']
+        self.assertEqual(len(releases), 2)
+        self.assertEqual(releases[1]['reason'], 'capture ended')
+
     def test_failed_release_is_retried(self):
         r = self.runner('click 10 20')
         self.agent.codes = {3: 1}

@@ -591,6 +591,11 @@ class Runner:
         self.known = None
 
     def close(self):
+        if self.held is None and self.releasing is not None:
+            n, info = self.releasing
+            if self.agent.result(n):
+                self.held = info
+                self.releasing = None
         self.let_go('capture ended')
         if not self.finished:
             self.write(kind='scenario', status='unfinished', index=self.index,
@@ -835,8 +840,10 @@ class Runner:
         yield from self.held_press(x=x, y=y)
 
     def step_drag(self, x1, y1, x2, y2):
-        yield Job('move', move_command(x1, y1, self.agent.window), x=x1, y=y1)
         shows = self.count('dialog_show')
+        yield Job('move', move_command(x1, y1, self.agent.window), x=x1, y=y1)
+        if self.count('dialog_show') > shows:
+            return
         cur = (x1, y1)
         yield Job('press', press_down_command(), settle=HOLD_UPDATES, x=x1, y=y1)
         if (x2, y2) != (x1, y1) and self.count('dialog_show') == shows:
