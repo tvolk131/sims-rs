@@ -298,30 +298,35 @@ impl BuyCatalog {
                 let function_subsort = read_i16(data, OBJD_FUNC_SUBSORT) as u16;
                 let build_mode_type = read_i16(data, OBJD_BUILD_TYPE);
                 let ctss_id = read_i16(data, OBJD_CTSS);
-                let (name, description) = read_ctss(&iff, ctss_id);
-                items.push(BuyItem {
-                    guid,
-                    price,
-                    name,
-                    description,
-                    room_sort,
-                    function_sort,
-                    function_subsort,
-                    build_mode_type,
-                });
+                let (name, description, raw_name) = read_ctss(&iff, ctss_id);
+                items.push((
+                    raw_name,
+                    BuyItem {
+                        guid,
+                        price,
+                        name,
+                        description,
+                        room_sort,
+                        function_sort,
+                        function_subsort,
+                        build_mode_type,
+                    },
+                ));
             }
         }
 
         // 0x4cd9a5 -> 0x430100 -> memcmp (0x6363e0): sort by price ascending,
-        // then raw catalog name bytes ascending (then GUID for determinism).
-        items.sort_by(|a, b| {
+        // then raw CTSS catalog bytes (Windows-1252) ascending, then GUID.
+        items.sort_by(|(raw_a, a), (raw_b, b)| {
             a.price
                 .cmp(&b.price)
-                .then_with(|| a.name.as_bytes().cmp(b.name.as_bytes()))
+                .then_with(|| raw_a.cmp(raw_b))
                 .then_with(|| a.guid.cmp(&b.guid))
         });
 
-        Self { items }
+        Self {
+            items: items.into_iter().map(|(_, item)| item).collect(),
+        }
     }
 
     /// Constructs a catalog from explicit items (for unit tests).
@@ -329,7 +334,7 @@ impl BuyCatalog {
         items.sort_by(|a, b| {
             a.price
                 .cmp(&b.price)
-                .then_with(|| a.name.as_bytes().cmp(b.name.as_bytes()))
+                .then_with(|| cp1252_bytes(&a.name).cmp(&cp1252_bytes(&b.name)))
                 .then_with(|| a.guid.cmp(&b.guid))
         });
         Self { items }
@@ -724,15 +729,15 @@ fn read_i16(data: &[u8], offset: usize) -> i16 {
     i16::from_le_bytes([data[offset], data[offset + 1]])
 }
 
-fn read_ctss(iff: &Iff, ctss_id: i16) -> (String, String) {
+fn read_ctss(iff: &Iff, ctss_id: i16) -> (String, String, Vec<u8>) {
     let Ok(id) = u16::try_from(ctss_id) else {
-        return (String::new(), String::new());
+        return (String::new(), String::new(), Vec::new());
     };
     let Some(chunk) = iff.get(b"CTSS", id) else {
-        return (String::new(), String::new());
+        return (String::new(), String::new(), Vec::new());
     };
     let Ok(table) = StringTable::parse(iff.data(chunk)) else {
-        return (String::new(), String::new());
+        return (String::new(), String::new(), Vec::new());
     };
     let pick = |index: usize| {
         table
@@ -741,10 +746,60 @@ fn read_ctss(iff: &Iff, ctss_id: i16) -> (String, String) {
             .filter(|e| e.language == US_ENGLISH)
             .nth(index)
             .or_else(|| table.entries.get(index))
-            .map(|e| e.text.clone())
-            .unwrap_or_default()
     };
-    (pick(0), pick(1))
+    let (name, raw_name) = pick(0)
+        .map(|e| (e.text.clone(), e.raw_text.clone()))
+        .unwrap_or_default();
+    let description = pick(1).map(|e| e.text.clone()).unwrap_or_default();
+    (name, description, raw_name)
+}
+
+/// Encodes a Unicode string to Windows-1252 bytes for `BuyCatalog::from_items`
+/// so synthetic tests match native `0x430100` `memcmp` ordering on extended
+/// characters such as `™` (`0x99`) vs `©` (`0xA9`).
+fn cp1252_bytes(text: &str) -> Vec<u8> {
+    const HIGH: [(char, u8); 27] = [
+        ('\u{20AC}', 0x80),
+        ('\u{201A}', 0x82),
+        ('\u{0192}', 0x83),
+        ('\u{201E}', 0x84),
+        ('\u{2026}', 0x85),
+        ('\u{2020}', 0x86),
+        ('\u{2021}', 0x87),
+        ('\u{02C6}', 0x88),
+        ('\u{2030}', 0x89),
+        ('\u{0160}', 0x8A),
+        ('\u{2039}', 0x8B),
+        ('\u{0152}', 0x8C),
+        ('\u{017D}', 0x8E),
+        ('\u{2018}', 0x91),
+        ('\u{2019}', 0x92),
+        ('\u{201C}', 0x93),
+        ('\u{201D}', 0x94),
+        ('\u{2022}', 0x95),
+        ('\u{2013}', 0x96),
+        ('\u{2014}', 0x97),
+        ('\u{02DC}', 0x98),
+        ('\u{2122}', 0x99),
+        ('\u{0161}', 0x9A),
+        ('\u{203A}', 0x9B),
+        ('\u{0153}', 0x9C),
+        ('\u{017E}', 0x9E),
+        ('\u{0178}', 0x9F),
+    ];
+    let mut out = Vec::with_capacity(text.len());
+    for ch in text.chars() {
+        let code = ch as u32;
+        if code <= 0x7F || (0xA0..=0xFF).contains(&code) {
+            out.push(code as u8);
+        } else if let Some(&(_, byte)) = HIGH.iter().find(|&&(c, _)| c == ch) {
+            out.push(byte);
+        } else {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -802,8 +857,9 @@ mod tests {
         let all: Vec<u32> = cat.filtered(&state).iter().map(|i| i.guid).collect();
         assert_eq!(all, [0x26bf_bb29, 0x1111_1111, 0x2222_2222]);
 
-        // Equal-price items compare raw name bytes (`0x4cd9a5` -> `0x430100`
-        // -> `memcmp` at `0x6363e0`), so uppercase `Zoo` sorts before `apple`.
+        // Equal-price items compare raw Windows-1252 CTSS bytes (`0x4cd9a5`
+        // -> `0x430100` -> `memcmp` at `0x6363e0`), so `Zoo` precedes `apple`
+        // and `™` (`0x99`) precedes `©` (`0xA9`).
         let tied = BuyCatalog::from_items(vec![
             BuyItem {
                 guid: 1,
@@ -825,9 +881,29 @@ mod tests {
                 function_subsort: 1,
                 build_mode_type: 0,
             },
+            BuyItem {
+                guid: 3,
+                price: 100,
+                name: "Lamp©".into(),
+                description: String::new(),
+                room_sort: 1,
+                function_sort: 1,
+                function_subsort: 1,
+                build_mode_type: 0,
+            },
+            BuyItem {
+                guid: 4,
+                price: 100,
+                name: "Lamp™".into(),
+                description: String::new(),
+                room_sort: 1,
+                function_sort: 1,
+                function_subsort: 1,
+                build_mode_type: 0,
+            },
         ]);
         let names: Vec<&str> = tied.all().iter().map(|i| i.name.as_str()).collect();
-        assert_eq!(names, ["Zoo", "apple"]);
+        assert_eq!(names, ["Lamp™", "Lamp©", "Zoo", "apple"]);
     }
 
     #[test]

@@ -31,6 +31,10 @@ const BUDGET_MODE: usize = 32;
 /// Funds reported when budget mode is 1 (`0x46d8c9`).
 const UNLIMITED_FUNDS: i32 = 999_999;
 
+/// OBJD word 61 (`+0x7a`): catalog master facing offset (`0x434f8d`),
+/// subtracted from the drag quadrant direction in `0x485dad`.
+const FACING_OFFSET: usize = 0x7a / 2;
+
 /// OBJD word 69 (`+0x8a`): nonzero for Build-mode objects (budget category 7),
 /// zero for Buy-mode objects (budget category 6, `0x4878f3`).
 const BUILD_MODE_TYPE: usize = 69;
@@ -63,6 +67,8 @@ pub struct BuyCursor {
     pub price: i32,
     /// Budget category charged on commit (`6` Buy, `7` Build, `0x4878f3`).
     pub budget_category: u8,
+    /// Catalog master facing offset read from OBJD word 61 (`+0x7a`, `0x434f8d`).
+    pub facing_offset: i16,
     /// Whether committing this item automatically arms another copy when
     /// affordable (`0x4878f3`: OBJD word 96 == 1 and tutorial global 26 == 0).
     pub keep_buying: bool,
@@ -177,6 +183,7 @@ impl Interpreter<'_> {
             .map_err(|trap| fail(0, trap))?;
         let price = i32::from(words[word::PRICE]);
         let budget_category = if words[BUILD_MODE_TYPE] != 0 { 7 } else { 6 };
+        let facing_offset = words[FACING_OFFSET];
         let keep_buying = words[KEEP_BUYING] == 1
             && world.globals.get(TUTORIAL_GLOBAL).copied().unwrap_or(0) == 0;
         if price > 0 && price > available_funds(world) {
@@ -191,6 +198,7 @@ impl Interpreter<'_> {
             guid,
             price,
             budget_category,
+            facing_offset,
             keep_buying,
             valid: false,
             position: [-16, -16, level],
@@ -202,10 +210,14 @@ impl Interpreter<'_> {
     /// fine lot coordinates `fine` on `level` (`0x485a2e` → `0x421e72` →
     /// `0x422050` + `0x422c2f`).
     ///
-    /// Returns whether the position is valid and affordable. When valid, both
-    /// the held object and its `"Tile Cursor"` stand on the tile (with the
-    /// cursor placed second so `held.data[26]` links to `cursor`, matching
-    /// `0x421e72`). When invalid, the held object stays off the lot.
+    /// Returns whether the position is valid and affordable. When staying on
+    /// the same snapped `[pos, level]`, retains any existing surface container
+    /// (`0x421e72` / `0x422050`) so manual rotations on a surface are not
+    /// overwritten. When valid, both the held object and its `"Tile Cursor"`
+    /// stand on the snapped tile (with the cursor placed second so
+    /// `held.data[26]` links to `cursor`). When invalid, the held object stays
+    /// off the lot and the `"Tile Cursor"` retries at the unsnapped `fine`
+    /// coordinates (`0x485f23`).
     pub fn buy_move(
         &self,
         world: &mut World,
@@ -214,6 +226,9 @@ impl Interpreter<'_> {
         level: i32,
     ) -> Result<bool, Fault> {
         let pos = snap_to_tile_centre(fine);
+        let retained = (cursor.position == [pos[0], pos[1], level])
+            .then_some(cursor.container)
+            .flatten();
         self.remove_cursor_and_held(world, cursor)?;
         cursor.position = [pos[0], pos[1], level];
         cursor.valid = false;
@@ -222,7 +237,8 @@ impl Interpreter<'_> {
             return Ok(false);
         }
         let affordable = cursor.price <= 0 || cursor.price <= available_funds(world);
-        let placement = self.test_buy_placement(world, cursor.cursor, cursor.held, pos, level)?;
+        let placement =
+            self.test_buy_placement(world, cursor.cursor, cursor.held, pos, level, retained)?;
         if let Some(container) = placement {
             if affordable {
                 cursor.valid = true;
@@ -237,10 +253,11 @@ impl Interpreter<'_> {
             };
             self.put(world, cursor.held, held_place, true)?;
         }
-        if self.fits(world, cursor.cursor, pos, level)? {
+        let cursor_pos = if placement.is_some() { pos } else { fine };
+        if self.fits(world, cursor.cursor, cursor_pos, level)? {
             let cursor_place = Place {
                 on_lot: true,
-                position: pos,
+                position: cursor_pos,
                 container: None,
                 slot: -1,
                 level,
@@ -252,9 +269,9 @@ impl Interpreter<'_> {
 
     /// Rotates the held object to `direction` (`0x4226bc` → `0x421be4`) and
     /// re-evaluates placement at its current tile if it is on the lot. When
-    /// the object is already snapped to a surface container slot, keeps that
-    /// container without re-running automatic surface-facing alignment
-    /// (`0x422050` line `0x422078`).
+    /// the object is already snapped to a surface container slot at that tile,
+    /// [`Self::buy_move`] retains that container without re-running automatic
+    /// surface-facing alignment (`0x422050` line `0x422078`).
     pub fn buy_rotate(
         &self,
         world: &mut World,
@@ -262,43 +279,13 @@ impl Interpreter<'_> {
         direction: i16,
     ) -> Result<bool, Fault> {
         let [x, y, level] = cursor.position;
-        let prev_container = cursor.container;
         self.remove_cursor_and_held(world, cursor)?;
         self.rotate_held_to(world, cursor.cursor, cursor.held, direction)?;
-        if !on_lot([x, y]) {
-            return Ok(false);
+        if on_lot([x, y]) {
+            self.buy_move(world, cursor, [x, y], level)
+        } else {
+            Ok(false)
         }
-        if let Some((container, slot)) = prev_container {
-            let pos = snap_to_tile_centre([x, y]);
-            if inside_placement_bounds(world, pos)
-                && self.fits_in(world, cursor.held, container, i32::from(slot), pos, level)?
-            {
-                let affordable = cursor.price <= 0 || cursor.price <= available_funds(world);
-                cursor.position = [pos[0], pos[1], level];
-                cursor.valid = affordable;
-                cursor.container = Some((container, slot));
-                let held_place = Place {
-                    on_lot: true,
-                    position: pos,
-                    container: Some(container),
-                    slot: i32::from(slot),
-                    level,
-                };
-                self.put(world, cursor.held, held_place, true)?;
-                if self.fits(world, cursor.cursor, pos, level)? {
-                    let cursor_place = Place {
-                        on_lot: true,
-                        position: pos,
-                        container: None,
-                        slot: -1,
-                        level,
-                    };
-                    self.put(world, cursor.cursor, cursor_place, true)?;
-                }
-                return Ok(cursor.valid);
-            }
-        }
-        self.buy_move(world, cursor, [x, y], level)
     }
 
     /// Hides the cursor and held object off the lot while the pointer leaves
@@ -562,15 +549,13 @@ impl Interpreter<'_> {
         Ok(())
     }
 
-    /// Tests whether `held` fits at `[pos, level]`, either directly on the
-    /// tile (`Some(None)`) or — after a collision refusal (`0x0b`) on a
-    /// single-tile object — inside a compatible surface slot of an object
-    /// standing on that tile (`Some(Some((container_id, slot)))`, `0x422050`).
-    ///
-    /// When snapping into a surface slot, aligns `held`'s facing to the
-    /// container's facing (or, for a multi-tile container, the first of four
-    /// cardinal directions around the container whose adjacent tile is not
-    /// blocked by an object, `0x4221e4..0x422280` + `0x43244d`).
+    /// Tests whether `held` fits at `[pos, level]`: first tries any `retained`
+    /// surface container at the same tile without re-aligning facing
+    /// (`0x422050` line `0x422078`), then tries direct tile placement
+    /// (`Some(None)`), and — after a collision refusal (`0x0b`) on a
+    /// single-tile object — searches compatible surface slots on that tile
+    /// (`Some(Some((container_id, slot)))`), aligning facing via
+    /// `0x4221e4..0x422280` + `0x43244d`.
     fn test_buy_placement(
         &self,
         world: &mut World,
@@ -578,7 +563,13 @@ impl Interpreter<'_> {
         held: u16,
         pos: [i32; 2],
         level: i32,
+        retained: Option<(u16, i16)>,
     ) -> Result<Option<Option<(u16, i16)>>, Fault> {
+        if let Some((container, slot)) = retained
+            && self.fits_in(world, held, container, i32::from(slot), pos, level)?
+        {
+            return Ok(Some(Some((container, slot))));
+        }
         match self.place_test(world, held, pos, level)? {
             Ok(()) => return Ok(Some(None)),
             Err(Refusal::Collision(_)) => {}
@@ -665,8 +656,10 @@ fn surface_aligned_direction(
     Ok(fallback_facing)
 }
 
-/// Checks `0x43244d`: whether any object standing on `[pos, level]` blocks a
-/// person (when `data[8] & 4 == 0`: blocked if `data[8] & 0x10 == 0`; when
+/// Checks `0x43244d`: whether any object directly on the tile chain of
+/// `[pos, level]` (walking slot `0`, skipping objects held in container slots
+/// `1..`, matching `0x43248a` + `0x432823(0)`) blocks a person (when
+/// `data[8] & 4 == 0`: blocked if `data[8] & 0x10 == 0`; when
 /// `data[8] & 4 != 0`: blocked if `data[8] & 2 != 0`).
 fn tile_blocks_person(world: &World, pos: [i32; 2], level: i32) -> Result<bool, Trap> {
     let tx = pos[0] >> 4;
@@ -674,14 +667,17 @@ fn tile_blocks_person(world: &World, pos: [i32; 2], level: i32) -> Result<bool, 
     if !(0..64).contains(&tx) || !(0..64).contains(&ty) || !(1..=2).contains(&level) {
         return Ok(false);
     }
-    let tile = [tx as u8, ty as u8, level as u8];
-    for id in crate::placement::standing_on(world, tile)? {
-        let flags = world
-            .objects
-            .get(&id)
-            .and_then(|o| o.data.get(DATA_PLACEMENT_FLAGS))
-            .copied()
-            .unwrap_or(0) as u16;
+    let mut current = crate::placement::first_on(world, [tx, ty], level as i8);
+    let mut visited = 0usize;
+    while let Some(id) = current {
+        visited += 1;
+        if visited > world.objects.len() {
+            return Err(Trap::Invalid("the objects on a tile link in a loop".into()));
+        }
+        let Some(obj) = world.objects.get(&id) else {
+            break;
+        };
+        let flags = obj.data.get(DATA_PLACEMENT_FLAGS).copied().unwrap_or(0) as u16;
         let blocked = if (flags & 0x04) == 0 {
             (flags & 0x10) == 0
         } else {
@@ -690,6 +686,11 @@ fn tile_blocks_person(world: &World, pos: [i32; 2], level: i32) -> Result<bool, 
         if blocked {
             return Ok(true);
         }
+        current = obj
+            .slots
+            .first()
+            .and_then(|s| u16::try_from(s.object).ok())
+            .filter(|&next| next != 0);
     }
     Ok(false)
 }

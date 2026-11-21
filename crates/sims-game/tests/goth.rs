@@ -5355,8 +5355,10 @@ fn buy_mode_places_rotates_cancels_and_returns_to_live_mode() {
     assert_eq!(game.lot().world().budget.funds, 2542);
 
     // Re-select the chair, hover onto the lawn, rotate clockwise by keyboard,
-    // then press and release 20 px upper-left WITHOUT an intermediate hover
-    // event (`0x4864f0` runs move at release -> dir = 6 at rotation 0) to commit.
+    // then press and drag through all four quadrants (`0x485d5d..0x485dad`:
+    // upper-right -> 4, lower-left -> 0, lower-right -> 2, upper-left -> 6 at
+    // rotation 0), releasing 20 px upper-left without an extra hover to commit
+    // facing 6 (`0x4864f0`).
     let spend_before = game.lot().world().budget.days[0].expect("today")[6];
     game.press([437, 523]);
     game.release([437, 523]);
@@ -5365,6 +5367,12 @@ fn buy_mode_places_rotates_cancels_and_returns_to_live_mode() {
     assert!(game.rotate_held(true));
     assert_eq!(game.lot().world().objects[&held_first].data[1], 4);
     game.press(spot);
+    game.hover([spot[0] + 20, spot[1] - 20]);
+    assert_eq!(game.lot().world().objects[&held_first].data[1], 4);
+    game.hover([spot[0] - 20, spot[1] + 20]);
+    assert_eq!(game.lot().world().objects[&held_first].data[1], 0);
+    game.hover([spot[0] + 20, spot[1] + 20]);
+    assert_eq!(game.lot().world().objects[&held_first].data[1], 2);
     game.release([spot[0] - 20, spot[1] - 20]);
 
     // Werkbunnst Chair has OBJD word 96 == 1 (`keep_buying`), so committing it
@@ -5492,12 +5500,17 @@ fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_co
         }
         let surface_id = snapped.unwrap_or_else(|| panic!("{needle} did not snap to any surface"));
         // Manual rotation on the surface must keep the surface container and
-        // the user's chosen facing rather than snapping back to the desk's dir.
+        // the user's chosen facing even when `buy_move` runs again at the same
+        // tile (e.g., on mouse press/release, `0x421e72` / `0x422050`).
         let before_dir = lot.world().objects[&cursor.held].data[1];
         let step = lot.world().objects[&cursor.held].data[23];
         if step > 0 {
             let next_dir = (before_dir + step).rem_euclid(8);
             assert!(lot.buy_rotate(&mut cursor, next_dir).unwrap());
+            assert_eq!(cursor.container.map(|(c, _)| c), Some(surface_id));
+            assert_eq!(lot.world().objects[&cursor.held].data[1], next_dir);
+            let pos = cursor.position;
+            assert!(lot.buy_move(&mut cursor, [pos[0], pos[1]], pos[2]).unwrap());
             assert_eq!(cursor.container.map(|(c, _)| c), Some(surface_id));
             assert_eq!(lot.world().objects[&cursor.held].data[1], next_dir);
         }

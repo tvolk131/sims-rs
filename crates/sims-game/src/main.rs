@@ -586,6 +586,9 @@ impl ApplicationHandler for App {
                 }
                 self.changed(true);
             }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.game.set_shift(modifiers.state().shift_key());
+            }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if event.logical_key == Key::Named(NamedKey::Escape) {
                     // Escape closes the pie menu, else quits. A repeat

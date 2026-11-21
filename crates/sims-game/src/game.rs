@@ -129,6 +129,9 @@ pub struct Game {
     /// (`0x485f98`), for drag-to-rotate (`dx^2 + dy^2 > 36`, `0x485a2e`) and
     /// commit on release (`0x4864d0`).
     buy_dragging: Option<[i32; 2]>,
+    /// Whether Shift is currently held (`VK_SHIFT`, `0x4864f9`), which rearms
+    /// any Buy Mode item for repeat purchase on placement (`0x48680f`).
+    shift_held: bool,
     /// The time the window has passed in, in microseconds: the clock
     /// that spins the plumb bob and drives the pause button's 500 ms blink.
     clock_us: u64,
@@ -202,6 +205,7 @@ impl Game {
             buy_selected: None,
             buy_cursor: None,
             buy_dragging: None,
+            shift_held: false,
             note: None,
             clock_us: 0,
             drawn_us: 0,
@@ -1642,6 +1646,13 @@ impl Game {
         self.buy_cursor.as_ref()
     }
 
+    /// Sets whether the Shift modifier is held (`VK_SHIFT`, `0x4864f9`),
+    /// which keeps the Buy tool armed for repeat purchases after placing any
+    /// affordable item (`0x48680f`).
+    pub fn set_shift(&mut self, held: bool) {
+        self.shift_held = held;
+    }
+
     /// Switches between Live, Buy, Build, and Options modes (`0x4cea5d`,
     /// `0x4ce44f`). Cancels any unplaced Buy Mode item, closes open pie menus,
     /// updates `global[19]` (calling `go_live` `0x416534` when returning to
@@ -1809,13 +1820,20 @@ impl Game {
             let dx = point[0] - anchor[0];
             let dy = point[1] - anchor[1];
             if dx * dx + dy * dy > 36 {
-                let quad = match (dx >= 0, dy >= 0) {
-                    (true, false) => 0,
-                    (true, true) => 2,
-                    (false, true) => 4,
-                    (false, false) => 6,
+                // Native `0x485d5d..0x485dad`: `iVar6 = dy`, `iVar8 = dx`.
+                // Upper-left -> 6, upper-right -> 4, lower-left -> 0,
+                // lower-right -> 2, minus 2*rotation and definition facing
+                // offset (`0x434f8d`, OBJD +0x7a).
+                let quad = if dy < 0 {
+                    if dx < 0 { 6 } else { 4 }
+                } else if dx < 0 {
+                    0
+                } else {
+                    2
                 };
-                let dir = (quad - 2 * i16::from(self.view.camera.rotation & 3)).rem_euclid(8);
+                let dir =
+                    (quad - 2 * i16::from(self.view.camera.rotation & 3) - cursor.facing_offset)
+                        .rem_euclid(8);
                 if let Err(e) = self.lot.buy_rotate(&mut cursor, dir) {
                     self.note = Some(format!("The object was not rotated: {e}"));
                 }
@@ -1876,7 +1894,7 @@ impl Game {
             .unwrap_or_else(|| sims_vm::default_buy_direction(self.view.camera.rotation));
         match self.lot.buy_commit(&cursor) {
             Ok(_) => {
-                if cursor.keep_buying {
+                if cursor.keep_buying || self.shift_held {
                     let funds = sims_vm::available_funds(self.lot.world());
                     if cursor.price <= 0 || cursor.price <= funds {
                         self.buy_selected = Some(cursor.guid);

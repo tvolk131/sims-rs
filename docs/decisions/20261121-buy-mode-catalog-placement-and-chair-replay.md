@@ -62,28 +62,36 @@ panel, and `sims-vm` had no `"Tile Cursor"` creation or Buy placement tool.
     rotating the `"Tile Cursor"` itself (`260.data[1] = 2`, `261.data[1] = 0`).
   - `OnMouseMove` (`0x485a2e`) unprojects the pointer against terrain
     (`0x4a97c3` with flag 1 → `0x4a955d`, aligned to `pick::ORIGIN_COLUMN`),
-    snaps to tile centre `(v & !15) | 8` (`0x485f6d`), tests direct tile
-    placement and — on collision refusal `0x0b` for a single-tile object with
-    nonzero `data[4]` (`+0x52`, allowed surface heights, `0x4220a5`) — searches
-    surface container slots (`0x422050`), aligning the placed item's facing to
-    the container (or first unblocked cardinal side of a multi-tile container
-    via `0x4221e4..0x422280` + `0x43244d`). It places the held object first and
-    `"Tile Cursor"` second (`0x421e72`), which automatically links
-    `held.data[26] = cursor` on the tile chain. Dragging past the 6 px radius
-    (`dx^2 + dy^2 > 0x24`) rotates the held object in screen quadrants, while
-    movement within the 6 px radius continues normal tile placement.
+    snaps to tile centre `(v & !15) | 8` (`0x485f6d`), retains any existing
+    surface container when staying on the same snapped tile (`0x421e72` /
+    `0x422050` so clicks preserve manual surface rotations), then tests direct
+    tile placement and — on collision refusal `0x0b` for a single-tile object
+    with nonzero `data[4]` (`+0x52`, allowed surface heights, `0x4220a5`) —
+    searches surface container slots (`0x422050`), aligning the placed item's
+    facing to the container (or first unblocked cardinal side of a multi-tile
+    container via `0x4221e4..0x422280` + `0x43244d` walking the tile chain
+    slot `0`). When valid, it places the held object first and `"Tile Cursor"`
+    second at the snapped tile (`0x421e72`), which automatically links
+    `held.data[26] = cursor`; when invalid, the held object stays off-lot and
+    the `"Tile Cursor"` retries at the unsnapped pointer coordinates
+    (`0x485f23`). Dragging past the 6 px radius (`dx^2 + dy^2 > 0x24`) rotates
+    the held object using `0x485d5d..0x485dad` (upper-left `6`, upper-right
+    `4`, lower-left `0`, lower-right `2`, minus `2 * camera_rotation` and
+    OBJD `+0x7a` facing offset `0x434f8d`), while movement within 6 px
+    continues normal tile placement.
   - `OnMouseLeave` (`0x487d4e` → `0x421963`) takes both off the lot and resets
     cursor position off-lot; `OnMouseUp` (`0x4864d0`) first invokes move at the
     release coordinates (`0x4864f0`), then commits (`0x486ada` → `0x421a0e` →
     `0x43562f` / `0x422e99`, `0x4929fb` → `0x46d91c`), deleting the
     `"Tile Cursor"`, placing the held object permanently, running OBJf function
     11 (`USER_PLACEMENT`) on the object (and every group tile / held child),
-    and deducting its price in budget category `6` (Buy) or `7` (Build). For
-    repeat-buy objects (`OBJD word 96 == 1` outside tutorial `global[26] == 0`,
-    `0x4878f3`), a successful commit immediately arms another copy with the
-    placed facing (`0x4864d0` → `0x486f5a`) if affordable. Cancel (`0x487105`)
-    deletes both without charging funds; saving mid-preview strips the unpaid
-    preview from the snapshot (`Lot::save_without_buy_cursor`).
+    and deducting its price in budget category `6` (Buy) or `7` (Build). When
+    Shift is held (`VK_SHIFT`, `0x4864f9`) or for repeat-buy objects
+    (`OBJD word 96 == 1` outside tutorial `global[26] == 0`, `0x4878f3`), a
+    successful commit immediately arms another copy with the placed facing
+    (`0x4864d0` → `0x486f5a`) if affordable. Cancel (`0x487105`) deletes both
+    without charging funds; saving mid-preview strips the unpaid preview from
+    the snapshot (`Lot::save_without_buy_cursor`).
 
 ## Decision
 
