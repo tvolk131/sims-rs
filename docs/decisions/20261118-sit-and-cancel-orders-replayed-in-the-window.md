@@ -37,7 +37,10 @@ and `the_recorded_cancel_order_replayed_in_the_window_matches_the_recording`.
   ended at 593 and its release command ran from 595 to 625, yet update
   595's state, saved before the release was sent, already shows the
   cancel. Which of the two button events acted is not known; the replay
-  presses before 595, where the effect shows.
+  presses before 595, where the effect shows. The order recorded again
+  with the pick watched does not repeat this: both its cancels act at
+  their release's end
+  (`20261120-cancel-order-replayed-with-the-pick-watched.md`).
 - **A press acted on its release where the timing shows it.** The
   cancel recording sends the button down and up as separate commands:
   - The choice of Have A Snack took effect at the release's end (257
@@ -106,8 +109,11 @@ one.
     result 1 where ours was 0. Ours now matches. The release's second
     check of the entry accounts for these
     (`20261120-choosing-a-pie-entry-checks-it-again.md`, from the
-    snack-bob recording's watch); a listing at the same updates is not
-    ruled out;
+    snack-bob recording's watch). A listing at the same updates is not
+    ruled out for this run; in the order recorded again with the
+    listed object watched, the original listed nothing under the still
+    pointer after either choice
+    (`20261120-cancel-order-replayed-with-the-pick-watched.md`);
   - in Sit/Read, at 261 (a failed check) and at 291 (word 50 goes to 1
     until 560);
   - in the snack order, at 622, which the write watch shows was the
