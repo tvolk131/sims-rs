@@ -209,20 +209,26 @@ impl Viewer {
     /// A left press: the panel's if it covers the point, else a drag.
     fn left_press(&mut self) {
         let point = self.canvas_point(self.cursor);
-        if let Some(hud) = &mut self.hud
-            && hud.covers(point)
-        {
-            let (command, changed) = hud.press(point, &self.world);
-            if changed {
+        if let Some(hud) = &mut self.hud {
+            if hud.covers(point) {
+                let (command, changed) = hud.press(point, &self.world);
+                if changed {
+                    self.dirty = true;
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                }
+                if let Some(command) = command {
+                    self.command(command);
+                }
+                return;
+            }
+            if hud.dismiss_help() {
                 self.dirty = true;
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
             }
-            if let Some(command) = command {
-                self.command(command);
-            }
-            return;
         }
         self.drag = Some(self.cursor);
     }

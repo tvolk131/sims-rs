@@ -52,16 +52,32 @@ const MIN_HEIGHT: i32 = 127;
 /// What a balloon picture slot draws (`0x510547`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Picture {
-    /// An object definition's picture (`0x51035b`, `0x510547` type 1).
-    /// The original renders the object's isometric sprite via `0x4e5306`;
-    /// this port draws its catalog thumbnail icon via [`Thumbnails::icon`].
-    Object(u32),
+    /// An object definition's isometric picture (`0x51035b`, `0x510547` type 1,
+    /// `0x4e5306 -> 0x4384c8`), with optional zoom override `[edi + 0x4c]`
+    /// (`Some(2)` for Hunger right slots from `0x6f3994`/`0x6f3914`, `None`
+    /// for auto-fit `3 -> 2 -> 1`).
+    Object { guid: u32, zoom: Option<u32> },
     /// A whole UIGraphics bitmap (`0x5103fe`, `0x510547` type 2 without subrect).
     Image(i32),
     /// One row of a vertically stacked UIGraphics strip (`0x530a7b` ->
     /// `0x5104a1`, `0x510547` type 2 with subrect): height divided evenly
     /// into `rows`, taking `row` (0-based).
     Row { id: i32, rows: u32, row: u32 },
+}
+
+impl Picture {
+    /// An auto-fit isometric object picture (`zoom = None`).
+    pub const fn object(guid: u32) -> Self {
+        Self::Object { guid, zoom: None }
+    }
+
+    /// An isometric object picture forced to `zoom` (`1..=3`, `0x51073e`).
+    pub const fn object_zoom(guid: u32, zoom: u32) -> Self {
+        Self::Object {
+            guid,
+            zoom: Some(zoom),
+        }
+    }
 }
 
 /// What a balloon explains.
@@ -182,65 +198,67 @@ const LIVE_PET_NEEDS: u16 = 180;
 /// `fame.iff` panel & popup text table (`0x52bd10`).
 const FAME_PANEL_TEXT: u16 = 1;
 
-/// Human Needs picture slots (`0x6f39d0`/`0x6f39d4`, plus `0xea6` Social
-/// bitmap attached at `0x51974c`).
+/// Human Needs picture slots (`0x6f39d0`/`0x6f39d4`, view zoom overrides
+/// `0x6f3990`/`0x6f3994` setting zoom 2 on Hunger right slot `0xff9f_18e0`,
+/// plus `0xea6` Social bitmap attached at `0x51974c`).
 const NEED_PICTURES: [[Option<Picture>; 2]; 8] = [
     [
-        Some(Picture::Object(0xb947_55df)),
-        Some(Picture::Object(0xff9f_18e0)),
+        Some(Picture::object(0xb947_55df)),
+        Some(Picture::object_zoom(0xff9f_18e0, 2)),
     ],
     [
-        Some(Picture::Object(0x82e0_4c5b)),
-        Some(Picture::Object(0xbf13_7195)),
+        Some(Picture::object(0x82e0_4c5b)),
+        Some(Picture::object(0xbf13_7195)),
     ],
     [
-        Some(Picture::Object(0xd976_81db)),
-        Some(Picture::Object(0x7cb1_1019)),
+        Some(Picture::object(0xd976_81db)),
+        Some(Picture::object(0x7cb1_1019)),
     ],
     [
-        Some(Picture::Object(0x5cdc_712f)),
-        Some(Picture::Object(0x481a_74ec)),
+        Some(Picture::object(0x5cdc_712f)),
+        Some(Picture::object(0x481a_74ec)),
     ],
     [
-        Some(Picture::Object(0x85e0_0942)),
-        Some(Picture::Object(0x85e0_2a40)),
+        Some(Picture::object(0x85e0_0942)),
+        Some(Picture::object(0x85e0_2a40)),
     ],
     [Some(Picture::Image(id::SOCIAL_POPUP)), None],
-    [Some(Picture::Object(0x84e0_774c)), None],
+    [Some(Picture::object(0x84e0_774c)), None],
     [
-        Some(Picture::Object(0x7f90_7075)),
-        Some(Picture::Object(0xbc3b_a088)),
+        Some(Picture::object(0x7f90_7075)),
+        Some(Picture::object(0xbc3b_a088)),
     ],
 ];
 
-/// Pet Needs picture slots (`0x6f3950`/`0x6f3954`, plus `0xea6` Social
-/// bitmap attached at `0x51995d`).
+/// Pet Needs picture slots (`0x6f3950`/`0x6f3954`, view zoom overrides
+/// `0x6f3910`/`0x6f3914` setting zoom 2 on Pet Hunger right slot `0xffc0_ea58`,
+/// plus `0xea6` Social bitmap attached at `0x51995d`).
 const PET_NEED_PICTURES: [[Option<Picture>; 2]; 8] = [
     [
-        Some(Picture::Object(0x8eec_19f7)),
-        Some(Picture::Object(0xffc0_ea58)),
+        Some(Picture::object(0x8eec_19f7)),
+        Some(Picture::object_zoom(0xffc0_ea58, 2)),
     ],
     [
-        Some(Picture::Object(0xbc53_7c52)),
-        Some(Picture::Object(0x96cb_67ae)),
+        Some(Picture::object(0xbc53_7c52)),
+        Some(Picture::object(0x96cb_67ae)),
     ],
     [
-        Some(Picture::Object(0xe23f_9020)),
-        Some(Picture::Object(0x2b45_02a2)),
+        Some(Picture::object(0xe23f_9020)),
+        Some(Picture::object(0x2b45_02a2)),
     ],
     [
-        Some(Picture::Object(0x914e_5a74)),
-        Some(Picture::Object(0xb26a_b256)),
+        Some(Picture::object(0x914e_5a74)),
+        Some(Picture::object(0xb26a_b256)),
     ],
-    [Some(Picture::Object(0x2ecd_b068)), None],
+    [Some(Picture::object(0x2ecd_b068)), None],
     [Some(Picture::Image(id::SOCIAL_POPUP)), None],
     [
-        Some(Picture::Object(0x39cc_f441)),
-        Some(Picture::Object(0xbedd_7b26)),
+        Some(Picture::object(0x39cc_f441)),
+        Some(Picture::object(0xbedd_7b26)),
     ],
     [
-        Some(Picture::Object(0x7f90_7075)),
-        Some(Picture::Object(0xbc3b_a088)),
+        Some(Picture::object(0x7f90_7075)),
+        Some(Picture::object(0xbc3b_a088)),
     ],
 ];
 
@@ -257,14 +275,14 @@ const REPORT_CARD_PICTURES: [Option<Picture>; 2] = [
 
 /// Superstar skill popup picture slots (`0x6f3cb8[0..6]`).
 const FAME_SKILL_PICTURES: [[Option<Picture>; 2]; 6] = [
-    [Some(Picture::Object(0x5cdc_712f)), None],
-    [Some(Picture::Object(0x5cdc_712f)), None],
-    [Some(Picture::Object(0xc041_ed5b)), None],
-    [Some(Picture::Object(0xddec_d497)), None],
-    [Some(Picture::Object(0x94aa_32f4)), None],
+    [Some(Picture::object(0x5cdc_712f)), None],
+    [Some(Picture::object(0x5cdc_712f)), None],
+    [Some(Picture::object(0xc041_ed5b)), None],
+    [Some(Picture::object(0xddec_d497)), None],
+    [Some(Picture::object(0x94aa_32f4)), None],
     [
-        Some(Picture::Object(0x9fb2_23ce)),
-        Some(Picture::Object(0x1120_39a0)),
+        Some(Picture::object(0x9fb2_23ce)),
+        Some(Picture::object(0x1120_39a0)),
     ],
 ];
 
@@ -273,19 +291,19 @@ const FAME_SKILL_PICTURES: [[Option<Picture>; 2]; 6] = [
 /// `0x13 -> kFameMovieSet (279)` dispatched at `0x52cf01..0x52cf40`).
 const FAME_LEVEL_PICTURES: [[Option<Picture>; 2]; 11] = [
     [
-        Some(Picture::Object(0x6a85_94ad)),
-        Some(Picture::Object(0x5a91_cee0)),
+        Some(Picture::object(0x6a85_94ad)),
+        Some(Picture::object(0x5a91_cee0)),
     ],
-    [Some(Picture::Object(0x4450_e4e0)), None],
-    [Some(Picture::Object(0x1d77_2052)), None],
-    [Some(Picture::Object(0xf412_6cc4)), None],
-    [Some(Picture::Object(0x4450_e4e0)), None],
-    [Some(Picture::Object(0xf412_6cc4)), None],
-    [Some(Picture::Object(0x1d77_2052)), None],
+    [Some(Picture::object(0x4450_e4e0)), None],
+    [Some(Picture::object(0x1d77_2052)), None],
+    [Some(Picture::object(0xf412_6cc4)), None],
+    [Some(Picture::object(0x4450_e4e0)), None],
+    [Some(Picture::object(0xf412_6cc4)), None],
+    [Some(Picture::object(0x1d77_2052)), None],
     [Some(Picture::Image(id::FAME_RUNWAY)), None],
     [Some(Picture::Image(id::FAME_MUSIC_VIDEO)), None],
     [Some(Picture::Image(id::FAME_MOVIE_SET)), None],
-    [Some(Picture::Object(0x4b61_d53e)), None],
+    [Some(Picture::object(0x4b61_d53e)), None],
 ];
 
 /// The signs each sign gets on best and worst with, 1 to 12 (the tables
@@ -530,10 +548,10 @@ pub struct Balloon {
 
 impl Balloon {
     /// Object GUIDs referenced by this balloon's picture slots, for
-    /// pre-loading via [`Thumbnails::read`].
+    /// pre-loading via [`Thumbnails::read_balloon`].
     pub fn objects(&self) -> impl Iterator<Item = u32> + '_ {
         self.pictures.iter().filter_map(|slot| match slot {
-            Some(Picture::Object(guid)) => Some(*guid),
+            Some(Picture::Object { guid, .. }) => Some(*guid),
             _ => None,
         })
     }
@@ -590,13 +608,20 @@ pub fn lay_out(art: &Art, text: &Text, owner: Rect) -> Balloon {
     }
 }
 
-/// Computes the vertical span `(top, height)` of a picture slot inside a
-/// balloon of `height` (`0x50ff36..0x50ff91`).
-fn slot_vertical(balloon_height: i32) -> (i32, i32) {
+/// Computes the vertical span `(top, height)` of picture slot `slot_index`
+/// inside a balloon of `balloon_height` on a screen of `frame_width`
+/// (`0x50fef5..0x50ff91`): at width `1024`, slot 0 subtracts `50` from the
+/// effective layout height while still clamping `bottom` to `balloon_height`.
+fn slot_vertical(slot_index: usize, balloon_height: i32, frame_width: u32) -> (i32, i32) {
+    let effective = if slot_index == 0 && frame_width == 1024 {
+        balloon_height.saturating_sub(50)
+    } else {
+        balloon_height
+    };
     let mut top = 0;
     let mut bottom = SLOT_HEIGHT;
-    if balloon_height > bottom - top {
-        let dy = (balloon_height - (bottom - top)) / 2 - top;
+    if effective > bottom - top {
+        let dy = (effective - (bottom - top)) / 2 - top;
         top += dy;
         bottom += dy;
         if bottom > balloon_height {
@@ -604,14 +629,14 @@ fn slot_vertical(balloon_height: i32) -> (i32, i32) {
             top += shift;
             bottom += shift;
         }
-        let expand = (balloon_height - (bottom - top)) / 2 - 5;
+        let expand = (effective - (bottom - top)) / 2 - 5;
         top -= expand;
         bottom += expand;
     }
     (top, (bottom - top).max(0))
 }
 
-/// Draws `balloon` without object catalog thumbnails.
+/// Draws `balloon` without isometric object pictures.
 pub fn draw(frame: &mut Frame, art: &Art, balloon: &Balloon) {
     draw_with_thumbnails(frame, art, None, balloon);
 }
@@ -651,9 +676,10 @@ pub fn draw_with_thumbnails(
             }
         }
     }
-    let (slot_y, slot_h) = slot_vertical(r.height);
+    let frame_width = frame.width();
     for (slot_index, picture) in balloon.pictures.iter().enumerate() {
         let Some(picture) = picture else { continue };
+        let (slot_y, slot_h) = slot_vertical(slot_index, r.height, frame_width);
         let slot_x = if slot_index == 0 { 0 } else { RIGHT_SLOT_X };
         let slot = Rect::new(
             r.x.saturating_add(slot_x),
@@ -690,9 +716,9 @@ pub fn draw_with_thumbnails(
 /// Draws one picture slot centered inside `slot` (`0x510547`):
 /// - `Picture::Image` and `Picture::Row` follow `0x5105cb..0x51065d` (center
 ///   using truncation toward zero whenever the slot is larger than the image).
-/// - `Picture::Object` draws the object's catalog icon via [`Thumbnails::icon`]
-///   centered in `slot` (the original renders the isometric sprite via
-///   `0x4e5306`, which is not ported).
+/// - `Picture::Object` draws the object's rendered isometric sprite
+///   (`0x4e5306 -> 0x4384c8`) via [`Thumbnails::balloon_picture`], centered
+///   and clipped to `slot` (`0x4e5544`).
 fn draw_picture(
     frame: &mut Frame,
     art: &Art,
@@ -733,13 +759,29 @@ fn draw_picture(
             };
             frame.draw(image, Rect::new(0, sy, w, h), center(w, h));
         }
-        Picture::Object(guid) => {
-            let Some(icon) = thumbnails.and_then(|t| t.icon(art, guid)) else {
+        Picture::Object { guid, zoom } => {
+            let Some(image) =
+                thumbnails.and_then(|t| t.balloon_picture(guid, zoom, slot.width, slot.height))
+            else {
                 return;
             };
-            let w = i32::try_from(icon.width).unwrap_or(0);
-            let h = i32::try_from(icon.height).unwrap_or(0);
-            frame.draw_all(&icon, center(w, h));
+            let w = i32::try_from(image.width).unwrap_or(0);
+            let h = i32::try_from(image.height).unwrap_or(0);
+            let dx = (slot.width - w) / 2;
+            let dy = (slot.height - h) / 2;
+            let src_x = (-dx).max(0);
+            let src_y = (-dy).max(0);
+            let dst_x = slot.x.saturating_add(dx.max(0));
+            let dst_y = slot.y.saturating_add(dy.max(0));
+            let draw_w = (w - src_x).min(slot.width - dx.max(0));
+            let draw_h = (h - src_y).min(slot.height - dy.max(0));
+            if draw_w > 0 && draw_h > 0 {
+                frame.draw(
+                    image,
+                    Rect::new(src_x, src_y, draw_w, draw_h),
+                    [dst_x, dst_y],
+                );
+            }
         }
     }
 }
@@ -814,8 +856,8 @@ mod tests {
         assert_eq!(
             hunger.pictures,
             [
-                Some(Picture::Object(0xb947_55df)),
-                Some(Picture::Object(0xff9f_18e0))
+                Some(Picture::object(0xb947_55df)),
+                Some(Picture::object_zoom(0xff9f_18e0, 2))
             ]
         );
         // Social (index 5) uses UIGraphics bitmap 3750 in slot 0 and none in slot 1.
@@ -879,10 +921,27 @@ mod tests {
         assert_eq!(
             t.get(Help::FameSkill(5)).unwrap().pictures,
             [
-                Some(Picture::Object(0x9fb2_23ce)),
-                Some(Picture::Object(0x1120_39a0))
+                Some(Picture::object(0x9fb2_23ce)),
+                Some(Picture::object(0x1120_39a0))
             ]
         );
+        // Pet Hunger right slot also carries zoom 2 override (`0x6f3914`).
+        assert_eq!(
+            t.get(Help::Need {
+                pet: true,
+                index: 0,
+            })
+            .unwrap()
+            .pictures,
+            [
+                Some(Picture::object(0x8eec_19f7)),
+                Some(Picture::object_zoom(0xffc0_ea58, 2)),
+            ]
+        );
+        // 0x50ff18..0x50ff36: at width 1024, slot 0 subtracts 50 from effective height.
+        assert_eq!(slot_vertical(0, 200, 800), (5, 189));
+        assert_eq!(slot_vertical(0, 200, 1024), (5, 139));
+        assert_eq!(slot_vertical(1, 200, 1024), (5, 189));
     }
 
     #[test]
@@ -929,8 +988,8 @@ mod tests {
                 title: "T".into(),
                 body,
                 pictures: [
-                    Some(Picture::Object(0xb947_55df)),
-                    Some(Picture::Object(0xff9f_18e0)),
+                    Some(Picture::object(0xb947_55df)),
+                    Some(Picture::object_zoom(0xff9f_18e0, 2)),
                 ],
             },
             owner,

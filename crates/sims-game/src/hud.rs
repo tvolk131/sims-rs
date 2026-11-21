@@ -395,17 +395,23 @@ impl Hud {
         hud::fit(&mut self.items, &self.art, &self.texts);
         self.queue = Queue::read(world, snapshot.selected);
         self.pressed.keep(&self.queue);
-        let objects: Vec<u32> = self
-            .queue
-            .objects()
-            .chain(hud::balloon_objects(&self.items))
-            .collect();
-        for guid in objects {
+        let queue_objects: Vec<u32> = self.queue.objects().collect();
+        for guid in queue_objects {
             // A type whose picture fails is kept as the error left it
             // (`Thumbnails::read`), and not read again.
             if let Err(e) = self.thumbnails.read(assets.index(), assets.catalog(), guid) {
                 self.problems
                     .push(format!("the catalog picture of type 0x{guid:08X}: {e}"));
+            }
+        }
+        let balloon_objects: Vec<u32> = hud::balloon_objects(&self.items).collect();
+        for guid in balloon_objects {
+            if let Err(e) = self
+                .thumbnails
+                .read_balloon(assets.index(), assets.catalog(), guid)
+            {
+                self.problems
+                    .push(format!("the balloon picture of type 0x{guid:08X}: {e}"));
             }
         }
         let (width, height) = (
@@ -599,6 +605,17 @@ impl Hud {
         }
     }
 
+    /// Dismisses any open help balloon (`0x50fb7f`) and plays `UI_whoosh`.
+    /// Returns true if a balloon was open.
+    pub fn dismiss_help(&mut self) -> bool {
+        if self.controls.help.take().is_some() {
+            self.play(WHOOSH);
+            true
+        } else {
+            false
+        }
+    }
+
     /// A press at `point`: the command it asks for, if any. Commands that
     /// change only the panel are applied here too. A gadget button's
     /// press is checked against `world` and `residential` (whether the lot
@@ -618,9 +635,11 @@ impl Hud {
         // The status band is drawn over everything else on the lot,
         // the icons too, and takes the press.
         if self.band.is_some_and(|b| b.contains(point[0], point[1])) {
+            self.dismiss_help();
             return None;
         }
         if let Some(command) = self.press_queue(point) {
+            self.dismiss_help();
             return command;
         }
         let command = match hud::press(&self.items, point) {
@@ -629,11 +648,17 @@ impl Hud {
                 // If Interests/Gifts was laid out disabled (e.g. while a pet
                 // was selected) and selection switched to a human before
                 // redraw, the press still opens the panel (0x51c5a6).
-                let panel = hud::disabled_panel(&self.items, point)?;
-                let snapshot = Snapshot::read(world, self.members(world));
-                if Selected::of(&snapshot) == Selected::Human {
-                    Command::OpenPanel(panel)
+                if let Some(panel) = hud::disabled_panel(&self.items, point) {
+                    let snapshot = Snapshot::read(world, self.members(world));
+                    if Selected::of(&snapshot) == Selected::Human {
+                        Command::OpenPanel(panel)
+                    } else {
+                        return None;
+                    }
                 } else {
+                    if hud::outside_live_panel(&self.items, point) {
+                        self.dismiss_help();
+                    }
                     return None;
                 }
             }

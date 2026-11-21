@@ -210,7 +210,9 @@ impl Hud {
         hud::fit(&mut self.items, &self.art, &self.texts);
         let balloon_guids: Vec<u32> = hud::balloon_objects(&self.items).collect();
         for guid in balloon_guids {
-            let _ = self.thumbnails.read(assets.index(), assets.catalog(), guid);
+            let _ = self
+                .thumbnails
+                .read_balloon(assets.index(), assets.catalog(), guid);
         }
         let (width, height) = (
             u32::try_from(canvas.width).unwrap_or(u32::MAX),
@@ -274,6 +276,11 @@ impl Hud {
         ) != before
     }
 
+    /// Dismisses any open help balloon (`0x50fb7f`). Returns true if one was open.
+    pub fn dismiss_help(&mut self) -> bool {
+        self.controls.help.take().is_some()
+    }
+
     /// A press at `point`: the view command to carry out, if any, and
     /// whether the panel changed. A gadget button's press is checked
     /// against `world` and the neighborhood's zoning (`0x40745f`) as they
@@ -296,14 +303,17 @@ impl Hud {
         let command = match hud::press(&self.items, point) {
             Some(command) => command,
             None => {
-                let Some(panel) = hud::disabled_panel(&self.items, point) else {
-                    return (None, false);
-                };
-                let snapshot = Snapshot::read(world, self.members(world));
-                if Selected::of(&snapshot) == Selected::Human {
-                    Command::OpenPanel(panel)
+                if let Some(panel) = hud::disabled_panel(&self.items, point) {
+                    let snapshot = Snapshot::read(world, self.members(world));
+                    if Selected::of(&snapshot) == Selected::Human {
+                        Command::OpenPanel(panel)
+                    } else {
+                        return (None, false);
+                    }
                 } else {
-                    return (None, false);
+                    let dismissed =
+                        hud::outside_live_panel(&self.items, point) && self.dismiss_help();
+                    return (None, dismissed);
                 }
             }
         };
@@ -324,7 +334,9 @@ impl Hud {
         };
         if command.changes_simulation() {
             eprintln!("not carried out, the simulation takes no commands yet: {command:?}");
-            return (None, false);
+            let before = self.controls.help;
+            self.controls.apply(&command);
+            return (None, self.controls.help != before);
         }
         let view = match command {
             Command::Camera(Camera::ZoomIn) => Some(ViewCommand::ZoomIn),

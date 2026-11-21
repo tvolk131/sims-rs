@@ -552,11 +552,37 @@ fn report_card_superstar_and_needs_pet_balloons_from_install() {
     assert_eq!(dog0.title, "House Breaking Skill");
     assert_eq!(cat0.title, "Hunting Skill");
 
-    // Draw Hunger balloon with preloaded object catalog thumbnails.
+    // Draw Hunger balloon with preloaded native isometric object sprites (`0x4e5306 -> 0x4384c8`),
+    // including Hunger's right-slot zoom 2 override (`0xff9f_18e0`, `0x6f3994`), and verify
+    // representative multi-tile and Superstar object GUIDs render non-empty sprites.
     let mut thumbs = Thumbnails::default();
-    for guid in [0xb947_55df, 0xff9f_18e0] {
-        let _ = thumbs.read(&opened.index, &opened.catalog, guid);
+    for guid in [
+        0xb947_55df, // Hunger left (fridge)
+        0xff9f_18e0, // Hunger right (zoom 2 override)
+        0x82e0_4c5b, // Comfort (chair/sofa)
+        0x8eec_19f7, // Pet Hunger left
+        0xffc0_ea58, // Pet Hunger right (zoom 2 override)
+        0x4450_e4e0, // Superstar Fame level object
+        0x4b61_d53e, // Superstar level 10 object
+    ] {
+        thumbs
+            .read_balloon(&opened.index, &opened.catalog, guid)
+            .expect("isometric balloon picture loads");
+        let pic = thumbs
+            .balloon_picture(guid, None, 168, 127)
+            .unwrap_or_else(|| panic!("isometric sprite for 0x{guid:08X}"));
+        assert!(pic.rgba.as_chunks::<4>().0.iter().any(|p| p[3] > 0));
     }
+    let left_pic = thumbs
+        .balloon_picture(0xb947_55df, None, 168, 127)
+        .expect("fridge isometric sprite");
+    let right_pic = thumbs
+        .balloon_picture(0xff9f_18e0, Some(2), 168, 127)
+        .expect("food right-slot zoom-2 isometric sprite");
+    assert_ne!([left_pic.width, left_pic.height], [45, 45]);
+    assert!(left_pic.rgba.as_chunks::<4>().0.iter().any(|p| p[3] > 0));
+    assert!(right_pic.rgba.as_chunks::<4>().0.iter().any(|p| p[3] > 0));
+
     let need_controls = Controls {
         expanded: true,
         panel: Some(Panel::Needs),
@@ -568,6 +594,15 @@ fn report_card_superstar_and_needs_pet_balloons_from_install() {
     };
     let mut need_items = hud::layout([800, 600], &opened.snapshot, &need_controls);
     hud::fit(&mut need_items, &opened.art, &texts);
+    let mut frame_need_empty = Frame::new(800, 600, [0, 0, 0]);
+    hud::draw_with_thumbnails(
+        &mut frame_need_empty,
+        &opened.art,
+        &opened.faces,
+        None,
+        &need_items,
+        &need_controls,
+    );
     let mut frame_need = Frame::new(800, 600, [0, 0, 0]);
     hud::draw_with_thumbnails(
         &mut frame_need,
@@ -577,6 +612,7 @@ fn report_card_superstar_and_needs_pet_balloons_from_install() {
         &need_items,
         &need_controls,
     );
+    assert_ne!(frame_need.rgb(), frame_need_empty.rgb());
     assert!(need_items.iter().any(|i| matches!(
         &i.kind,
         hud::Kind::Balloon(b) if b.title == "Hunger" && b.text_left == 168

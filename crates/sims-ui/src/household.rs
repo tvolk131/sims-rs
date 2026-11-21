@@ -972,16 +972,17 @@ impl Fame {
     }
 }
 
-/// Sums the fame half-stars (`person.data[81]`, `word [neighbor + 0x116]`) of
-/// all neighborhood characters (`0x423f30`) in a different non-zero family who
-/// are mutual friends with `guid`'s Sim (`0x4ea6c4 -> 0x427237 -> 0x4271c5`).
+/// Sums the fame half-stars (`word [neighbor + 0x116]`, person data word 81) of
+/// all neighborhood characters (`0x423f30`: disk characters or runtime-created
+/// `world.characters.made`) in a different non-zero family (`word [neighbor + 0xee]`)
+/// who are mutual friends with `guid`'s Sim (`0x4ea6c4 -> 0x427237 -> 0x4271c5`).
 pub fn friend_star_power(world: &World, guid: u32, known: &Acquaintances) -> i32 {
     let neighbors = &world.neighbors;
     let Some(viewer) = neighbors.first_of(guid) else {
         return 0;
     };
-    let viewer_data = person_data(world, viewer.guid).unwrap_or(&viewer.data);
-    let viewer_family = viewer_data
+    let viewer_family = viewer
+        .data
         .get(sims_sim::neighbors::FAMILY)
         .copied()
         .unwrap_or(0);
@@ -990,16 +991,21 @@ pub fn friend_star_power(world: &World, guid: u32, known: &Acquaintances) -> i32
         if record.id == viewer.id {
             continue;
         }
-        if !known.characters.contains(&record.guid) {
+        if !known.characters.contains(&record.guid)
+            && !world.characters.made.contains_key(&record.guid)
+        {
             continue;
         }
-        let data = person_data(world, record.guid).unwrap_or(&record.data);
-        let family = data.get(sims_sim::neighbors::FAMILY).copied().unwrap_or(0);
+        let family = record
+            .data
+            .get(sims_sim::neighbors::FAMILY)
+            .copied()
+            .unwrap_or(0);
         if family == 0 || family == viewer_family {
             continue;
         }
         if sims_sim::neighbors::mutual_friends(viewer, record, known.friendship) {
-            total = total.saturating_add(i32::from(data.get(FAME).copied().unwrap_or(0)));
+            total = total.saturating_add(i32::from(record.data.get(FAME).copied().unwrap_or(0)));
         }
     }
     total
@@ -1902,6 +1908,111 @@ mod tests {
         };
         // Only `star_friend` (5 half-stars) qualifies.
         assert_eq!(friend_star_power(&world, 0x100, &known), 5);
+
+        // 0x427272..0x4272aa reads family and fame directly from each
+        // neighborhood record, NOT live person data, and handles duplicate GUIDs
+        // independently per record; 0x423f30 also counts runtime-created
+        // characters in `world.characters.made`.
+        let make_person_obj = |id: u16, guid: u32, family: i16, fame_lvl: i16| {
+            use sims_formats::saved_objects::{Interaction, Person};
+            let idle = Interaction {
+                join: 0,
+                uid: 0,
+                caller: 0,
+                target: 0,
+                icon: 0,
+                table_index: -1,
+                args: [0; 4],
+                priority: 0,
+                action: 0,
+                attenuation: 0.0,
+                flags: 0,
+            };
+            let mut data = vec![0; sims_sim::neighbors::PERSON_WORDS];
+            data[sims_sim::neighbors::FAMILY] = family;
+            data[FAME] = fame_lvl;
+            sims_sim::Object {
+                id,
+                guid,
+                footprint: [0; 4],
+                position: [0; 3],
+                unknown_short: 0,
+                attributes: Vec::new(),
+                temps: Vec::new(),
+                data: vec![0; 128],
+                obsolete_word: 0,
+                stack_capacity_bytes: 0,
+                stack: Vec::new(),
+                relationship_flag: 0,
+                relationships: Vec::new(),
+                slots: Vec::new(),
+                dynamic_sprites: Vec::new(),
+                multipart: None,
+                portal: None,
+                person: Some(Person {
+                    animation_events: 0,
+                    engaged: 0,
+                    appearance: Default::default(),
+                    accessories: Vec::new(),
+                    animations: Default::default(),
+                    routing_state: 0,
+                    floats: [0.0; 9],
+                    previous_motives: [0.0; 16],
+                    motives: [0.0; 16],
+                    data,
+                    routing_frames: 0,
+                    active: idle.clone(),
+                    last: idle,
+                    queue: Vec::new(),
+                    object_uses: Vec::new(),
+                    motive_deltas: Vec::new(),
+                }),
+                registry_word: None,
+                last_result: false,
+                removal_skips_resets: false,
+                selected: false,
+            }
+        };
+        world.objects.insert(10, make_person_obj(10, 0x100, 99, 99));
+        world.people.push(10);
+        world.objects.insert(11, make_person_obj(11, 0x200, 2, 99));
+        world.people.push(11);
+        // Add a second record with the same GUID `0x200` but its own fame (3),
+        // and a runtime-created character `0x700` present only in `world.characters.made` (4).
+        world.neighbors.slots[0]
+            .as_mut()
+            .unwrap()
+            .relationships
+            .push(sims_sim::neighbors::Row {
+                target: 7,
+                values: vec![80],
+            });
+        world.neighbors.slots[0]
+            .as_mut()
+            .unwrap()
+            .relationships
+            .push(sims_sim::neighbors::Row {
+                target: 8,
+                values: vec![80],
+            });
+        world
+            .neighbors
+            .slots
+            .push(Some(make_neighbor(7, 0x200, 3, 3, &[(1, 70)])));
+        world
+            .neighbors
+            .slots
+            .push(Some(make_neighbor(8, 0x700, 4, 4, &[(1, 70)])));
+        world.characters.made.insert(
+            0x700,
+            sims_sim::characters::Character {
+                template: 0x100,
+                file: 99,
+                strings: Default::default(),
+            },
+        );
+        // 5 (record 2) + 3 (duplicate-GUID record 7) + 4 (runtime record 8) = 12.
+        assert_eq!(friend_star_power(&world, 0x100, &known), 12);
     }
 
     #[test]

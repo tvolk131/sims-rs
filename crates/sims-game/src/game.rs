@@ -746,9 +746,14 @@ impl Game {
             self.keep_sounds(sounds);
             return outcome;
         }
+        // 0x51f3c5..0x51f3e5, 0x51d312, 0x51d354: pressing outside the live
+        // control panel dismisses any open help balloon with `UI_whoosh`.
+        let dismissed = self.hud.dismiss_help();
+        let sounds = self.hud.take_sounds();
+        self.keep_sounds(sounds);
         let Some(target) = self.under(point) else {
             return Outcome {
-                redraw: cleared,
+                redraw: cleared || dismissed,
                 photo: false,
             };
         };

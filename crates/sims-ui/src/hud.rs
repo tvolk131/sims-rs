@@ -350,11 +350,12 @@ impl Controls {
     /// the simulation and the camera are left to the host.
     ///
     /// A control's balloon closes when the control is pressed again, even
-    /// if it would now show other text (0x51c025 compares the balloon,
-    /// not the text), and when another panel opens (0x51d375); and here also when the strip closes
-    /// (**unverified**). The original also closes it on a press outside
-    /// it and on some focus changes (0x51f3e5, 0x51d312, 0x51d354), which
-    /// are not ported.
+    /// if it would now show other text (`0x51c025` compares the balloon,
+    /// not the text), when another panel opens (`0x51d375`), when the strip
+    /// closes, or when a control outside the live panel takes a press
+    /// (`0x51d312`, `0x51d354`: portraits, cluster, speed, camera, mode,
+    /// help dialog, or action queue). Presses outside the live panel with
+    /// no command are dismissed by the host via [`outside_live_panel`].
     pub fn apply(&mut self, command: &Command) {
         match command {
             Command::TogglePanel => {
@@ -372,6 +373,15 @@ impl Controls {
             }
             Command::ShowRelations(list) => self.relations = *list,
             Command::RelationsPage(page) => self.relations_page = *page,
+            Command::Select { .. }
+            | Command::SetSpeed(_)
+            | Command::TogglePause
+            | Command::Camera(_)
+            | Command::SetMode(_)
+            | Command::OpenHelp
+            | Command::CancelAction { .. } => {
+                self.help = None;
+            }
             _ => {}
         }
     }
@@ -1110,9 +1120,9 @@ fn live_strip(items: &mut Vec<Item>, strip: Rect, snapshot: &Snapshot, controls:
                 command: None,
             });
             // Clickable NeedMeter control (`0x513330`, `0x519a34..0x519a9e`:
-            // 100x20 grid with 19px vertical stride from (0, 21)).
+            // 100x20 controls placed at 19px vertical stride from (0, 21)).
             items.push(Item {
-                rect: Rect::new(panel.x + 100 * column, panel.y + 21 + 19 * row, 100, 19),
+                rect: Rect::new(panel.x + 100 * column, panel.y + 21 + 19 * row, 100, 20),
                 kind: Kind::Area,
                 command: Some(Command::Help(Help::Need {
                     pet: resident.pet,
@@ -1634,6 +1644,7 @@ fn draw_fame(
     frame: &mut Frame,
     art: &Art,
     panel: Rect,
+    pointer: Option<[i32; 2]>,
     fame_level: i16,
     fame_title: &str,
     skills: &[i16; 6],
@@ -1677,27 +1688,37 @@ fn draw_fame(
         }
     }
     if let Some(font) = art.font(SKILL_FONT) {
-        // Fame level title left-aligned at (3, 45, 102, 16) (0x52c026..0x52c05c).
-        let [tx, ty, _, th] = FAME_LEVEL_BUTTON;
+        // Fame level title top-aligned, left-aligned at (3, 45) (`0x52c026..0x52c05c`,
+        // `0x5e3f04..0x5e3f35`).
+        let [tx, ty, _, _] = FAME_LEVEL_BUTTON;
         font.draw(
             frame,
             fame_title,
-            [
-                panel.x.saturating_add(tx),
-                panel.y.saturating_add(ty + (th - font.line_height) / 2),
-            ],
+            [panel.x.saturating_add(tx), panel.y.saturating_add(ty)],
             LABEL,
         );
-        // Friends total starpower icon + text at (3, 75) (0x52c369..0x52c4a1).
-        let [fx, fy, _, _] = FAME_FRIENDS_BUTTON;
-        let icon_x = panel.x.saturating_add(fx);
-        let icon_y = panel.y.saturating_add(fy);
-        let mut text_x = icon_x;
-        if let Some((image, source)) = work_icon(art, id::FAME_FRIENDS, 1, 0) {
-            frame.draw(image, source, [icon_x, icon_y]);
-            text_x = icon_x.saturating_add(source.width + 3);
+        // Friends total starpower 4-cell button icon + text at (3, 75)
+        // (`0x52c369..0x52c4a1`, hover cell 2 via `0x5e3be6..0x5e3c11`).
+        let [fx, fy, fw, fh] = FAME_FRIENDS_BUTTON;
+        let button = Rect::new(
+            panel.x.saturating_add(fx),
+            panel.y.saturating_add(fy),
+            fw,
+            fh,
+        );
+        let mut text_x = button.x;
+        let cell = if pointer.is_some_and(|[px, py]| button.contains(px, py)) {
+            Cell::Hover
+        } else {
+            Cell::Normal
+        };
+        if let Some(icon) = art.cell(id::FAME_FRIENDS, 4, cell as u32) {
+            frame.draw_all(&icon, [button.x, button.y]);
+            text_x = button
+                .x
+                .saturating_add(i32::try_from(icon.width).unwrap_or(0) + 3);
         }
-        font.draw(frame, friends_text, [text_x, icon_y], LABEL);
+        font.draw(frame, friends_text, [text_x, button.y], LABEL);
     }
     // Six skills shifted to (145, 6) labels and (210, 7) bars (0x52ca13..0x52ccdf).
     let (Some(font), Some(empty), Some(full)) = (
@@ -1733,11 +1754,10 @@ fn draw_fame(
             w,
             h,
         );
+        // 0x52c026..0x52c0c8, 0x5e3f04..0x5e3f35: top-aligned, right-aligned.
         let at = [
             label.x.saturating_add(label.width - font.width(name)),
-            label
-                .y
-                .saturating_add((label.height - font.line_height) / 2),
+            label.y,
         ];
         if *need <= 0 {
             font.draw(frame, name, at, LABEL);
@@ -2520,6 +2540,7 @@ pub fn draw_with_thumbnails(
                 frame,
                 art,
                 r,
+                controls.pointer,
                 *fame_level,
                 fame_title,
                 skills,
@@ -2672,6 +2693,17 @@ pub fn covers(items: &[Item], point: [i32; 2]) -> bool {
     items
         .iter()
         .any(|i| !matches!(i.kind, Kind::Name { .. }) && i.rect.contains(point[0], point[1]))
+}
+
+/// Whether `point` lies outside the live-mode panel rect (`0x51f3c0..0x51f3de`:
+/// the gadget and subpanel area along the bottom right). Presses outside it
+/// (on the lot, on an open help balloon, on the cluster, on portraits, or on
+/// the action queue) dismiss an open help balloon with `UI_whoosh`.
+pub fn outside_live_panel(items: &[Item], [x, y]: [i32; 2]) -> bool {
+    let Some(gadget) = items.iter().find(|i| i.kind == Kind::Image(id::GAUGE)) else {
+        return true;
+    };
+    x < gadget.rect.x || y < gadget.rect.y
 }
 
 /// The item under `point` that a press would act on, for hover changes.
@@ -4799,13 +4831,36 @@ mod tests {
         controls.apply(&Command::Help(Help::FameFriends));
         assert_eq!(controls.help, None);
 
-        // Draw Superstar panel: verify 24px fame star fill at (3, 30) and skill
-        // target mark for Charisma (row 2, need = 3 -> mark at 210 + 12 - 1 = 221).
+        // Draw Superstar panel: verify 24px fame star fill at (3, 30), skill
+        // target mark for Charisma (row 2, need = 3 -> mark at 210 + 12 - 1 = 221),
+        // and 4-cell Fame friends smiley hover cell 2 (`0x52c369`, `0x5e3be6`).
+        let mut art_with_smiley = art.clone();
+        let mut smiley_rgba = Vec::with_capacity(88 * 20 * 4);
+        for _y in 0..20u32 {
+            for x in 0..88u32 {
+                let px: [u8; 4] = match x / 22 {
+                    0 => [10, 20, 30, 255],
+                    1 => [40, 50, 60, 255],
+                    2 => [200, 100, 50, 255],
+                    _ => [80, 80, 80, 255],
+                };
+                smiley_rgba.extend_from_slice(&px);
+            }
+        }
+        art_with_smiley.insert(
+            id::FAME_FRIENDS,
+            Image {
+                width: 88,
+                height: 20,
+                rgba: smiley_rgba,
+            },
+        );
         let mut fame_frame = Frame::new(279, 100, [0; 3]);
         draw_fame(
             &mut fame_frame,
-            &art,
+            &art_with_smiley,
             Rect::new(0, 0, 279, 100),
+            None,
             3,
             "A",
             &[0, 0, 100, 0, 0, 200],
@@ -4816,8 +4871,24 @@ mod tests {
         assert_eq!(fame_frame.pixel(3 + 24, 30), Some([30, 30, 30]));
         assert_eq!(fame_frame.pixel(221, 7 + 30), Some(LABEL));
         assert_eq!(fame_frame.pixel(210 - 16, 7 + 30 + 9), Some(LABEL));
+        assert_eq!(fame_frame.pixel(5, 77), Some([10, 20, 30]));
+        // Hovering the friends button selects cell 2.
+        let mut fame_hover = Frame::new(279, 100, [0; 3]);
+        draw_fame(
+            &mut fame_hover,
+            &art_with_smiley,
+            Rect::new(0, 0, 279, 100),
+            Some([10, 80]),
+            3,
+            "A",
+            &[0, 0, 100, 0, 0, 200],
+            &[0, 0, 3, 2, 0, 3],
+            "A",
+        );
+        assert_eq!(fame_hover.pixel(5, 77), Some([200, 100, 50]));
 
-        // 3. Needs & Pet Needs click hitboxes and balloon owner matching.
+        // 3. Needs & Pet Needs click hitboxes (`100x20` at 19px stride) and
+        //    balloon owner matching + outside-live-panel dismissal.
         controls.panel = Some(Panel::Needs);
         let need_items = layout([800, 600], &s, &controls);
         let need_panel = need_items
@@ -4825,7 +4896,8 @@ mod tests {
             .find(|i| matches!(i.kind, Kind::Needs { pet: false }))
             .unwrap()
             .rect;
-        // Index 0 (Hunger, col 0 row 0) and index 5 (Social, col 1 row 2).
+        // Index 0 (Hunger, col 0 row 0), index 5 (Social, col 1 row 2), and
+        // bottom-row scanline y=97 (`21 + 19*3 + 19 = 97`, `0x513330`).
         assert_eq!(
             press(&need_items, [need_panel.x + 25, need_panel.y + 30]),
             Some(Command::Help(Help::Need {
@@ -4843,6 +4915,28 @@ mod tests {
                 index: 5,
             }))
         );
+        assert_eq!(
+            press(&need_items, [need_panel.x + 125, need_panel.y + 97]),
+            Some(Command::Help(Help::Need {
+                pet: false,
+                index: 7,
+            }))
+        );
+        assert!(!outside_live_panel(
+            &need_items,
+            [need_panel.x + 10, need_panel.y + 10]
+        ));
+        assert!(outside_live_panel(&need_items, [10, 550]));
+        assert!(outside_live_panel(
+            &need_items,
+            [need_panel.x + 10, need_panel.y - 1]
+        ));
+        controls.help = Some(Help::Need {
+            pet: false,
+            index: 0,
+        });
+        controls.apply(&Command::SetSpeed(Speed::Fast));
+        assert_eq!(controls.help, None);
         assert!(help_matches_snapshot(
             Help::Need {
                 pet: false,

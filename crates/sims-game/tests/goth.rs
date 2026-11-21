@@ -4325,6 +4325,103 @@ fn report_card_superstar_panel_and_help_balloons() {
         &i.kind,
         Kind::Balloon(b) if b.title.starts_with("Studio Fly")
     )));
+    // Clicking the open balloon itself (outside LivePanel, 0x51f3c5..0x51f3e5)
+    // dismisses it and emits `UI_whoosh`.
+    let balloon_rect = hud
+        .items()
+        .iter()
+        .find(|i| matches!(i.kind, Kind::Balloon(_)))
+        .expect("Fame balloon")
+        .rect;
+    let _ = hud.take_sounds();
+    assert_eq!(hud.press(center(balloon_rect), &fame_world, true), None);
+    assert_eq!(hud.controls.help, None);
+    assert_eq!(
+        hud.take_sounds(),
+        [SoundEvent::Play {
+            object: INTERFACE,
+            name: WHOOSH.into(),
+        }]
+    );
+
+    // 4. Clicking away on the lot in `Game::press` (both empty ground and an
+    //    object that opens a pie menu) dismisses an open help balloon with `UI_whoosh`.
+    game.resize([800, 600]);
+    game.render();
+    let find_hunger = |game: &Game| {
+        game.panel().iter().find_map(|i| {
+            (i.command
+                == Some(Command::Help(Help::Need {
+                    pet: false,
+                    index: 0,
+                })))
+            .then_some(i.rect)
+        })
+    };
+    let need_rect = match find_hunger(&game) {
+        Some(rect) => rect,
+        None => {
+            let toggle_rect = game
+                .panel()
+                .iter()
+                .find(|i| i.command == Some(Command::TogglePanel))
+                .expect("TogglePanel button")
+                .rect;
+            game.press(center(toggle_rect));
+            game.render();
+            find_hunger(&game).expect("Hunger hitbox on live Game")
+        }
+    };
+    game.press(center(need_rect));
+    game.render();
+    assert!(
+        game.panel()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::Balloon(_)))
+    );
+    let _ = game.take_sounds();
+    // Press empty lot above the HUD: balloon closes + UI_whoosh + redraw.
+    let outcome = game.press([10, 10]);
+    assert!(outcome.redraw);
+    assert!(game.take_sounds().contains(&SoundEvent::Play {
+        object: INTERFACE,
+        name: WHOOSH.into(),
+    }));
+    game.render();
+    assert!(
+        !game
+            .panel()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::Balloon(_)))
+    );
+    // Reopen balloon and press a clickable lot object: balloon dismisses + WHOOSH
+    // and the object's pie menu opens.
+    game.press(center(need_rect));
+    game.render();
+    assert!(
+        game.panel()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::Balloon(_)))
+    );
+    let _ = game.take_sounds();
+    let object_pt = (100..700)
+        .step_by(12)
+        .flat_map(|x| (60..340).step_by(12).map(move |y| [x, y]))
+        .find(|&pt| game.under(pt).is_some())
+        .expect("a clickable object on the Goth lot");
+    let outcome = game.press(object_pt);
+    assert!(outcome.redraw);
+    assert!(game.take_sounds().contains(&SoundEvent::Play {
+        object: INTERFACE,
+        name: WHOOSH.into(),
+    }));
+    game.render();
+    assert!(
+        !game
+            .panel()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::Balloon(_)))
+    );
 }
 
 /// Track 2's switch-and-order recording (`goth-switch-cancel-order-20261115`)
