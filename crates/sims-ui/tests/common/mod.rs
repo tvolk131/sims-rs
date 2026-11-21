@@ -6,7 +6,7 @@ use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
 use sims_content::{Index, Install, Neighborhood};
 use sims_ui::art::Art;
 use sims_ui::house;
-use sims_ui::household::{Acquaintances, Careers, Faces, Snapshot};
+use sims_ui::household::{Acquaintances, Careers, Faces, Fame, Snapshot};
 use sims_vm::boot::{Frames, Lot};
 use std::path::{Path, PathBuf};
 
@@ -15,6 +15,7 @@ pub const GOTH_HOUSE: &str = "UserData/Houses/House05.iff";
 
 pub struct Opened {
     pub careers: Careers,
+    pub fame: Fame,
     pub house: house::Tuning,
     /// The architecture's prices, as the load's catalogs key them.
     pub prices: house::Prices,
@@ -78,10 +79,12 @@ pub fn open(root: &Path, house: &str) -> Opened {
         .unwrap();
     let (_, family) = neighborhood.family_in(number).unwrap();
     let careers = Careers::load(&index).unwrap();
+    let fame = Fame::load(&install).unwrap();
     // The friendship threshold the original's tuning gives (0x6c4398).
     let known = Acquaintances::read(&index, catalog, install.expansions, 50);
     let snapshot = Snapshot::read(world, &family.members)
         .with_careers(&careers)
+        .with_fame(world, &known, &fame)
         .with_relations(world, &family.members, &known);
     let house = house::Tuning::load(&index, catalog).unwrap();
     // The architecture's prices, by the pattern catalogs the load keyed
@@ -92,10 +95,13 @@ pub fn open(root: &Path, house: &str) -> Opened {
     let snapshot = snapshot.with_house(world, &house, &kinds);
     let ui = UiGraphics::open(&install).unwrap();
     let mut art = Art::load(&ui, US_ENGLISH, &sims_ui::hud::RESOURCES).unwrap();
-    art.load_optional(&ui, US_ENGLISH, sims_ui::balloon::BACKGROUND);
+    for id in sims_ui::hud::OPTIONAL_RESOURCES {
+        art.load_optional(&ui, US_ENGLISH, id);
+    }
     let faces = Faces::load(&index, catalog, &family.members).unwrap();
     Opened {
         careers,
+        fame,
         house,
         prices,
         kinds,

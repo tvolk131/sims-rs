@@ -328,6 +328,30 @@ pub fn draw_shaded<T: Target + ?Sized>(
     shade: &[Shade],
     project: impl Fn(Vec3) -> Vec3,
 ) {
+    draw_shaded_with_cull(target, part, skinned, shade, project, false);
+}
+
+/// Like [`draw_shaded`], culling counter-clockwise screen-space back faces
+/// (`edge(a, b, c) < 0.0`) as Direct3D 6 `D3DCULL_CCW` does (`0x49b097`,
+/// `0x5ce97d`–`0x5ce989`).
+pub fn draw_shaded_culled<T: Target + ?Sized>(
+    target: &mut T,
+    part: &Part,
+    skinned: &Skinned,
+    shade: &[Shade],
+    project: impl Fn(Vec3) -> Vec3,
+) {
+    draw_shaded_with_cull(target, part, skinned, shade, project, true);
+}
+
+fn draw_shaded_with_cull<T: Target + ?Sized>(
+    target: &mut T,
+    part: &Part,
+    skinned: &Skinned,
+    shade: &[Shade],
+    project: impl Fn(Vec3) -> Vec3,
+    cull_ccw: bool,
+) {
     let screen: Vec<Vec3> = skinned.positions.iter().map(|&p| project(p)).collect();
     for t in &part.mesh.triangles {
         let [a, b, c] = t.map(|i| i as usize);
@@ -350,6 +374,7 @@ pub fn draw_shaded<T: Target + ?Sized>(
             [va.uv, vb.uv, vc.uv],
             [a, b, c].map(|i| shade.get(i).copied().unwrap_or(Shade::Grey(1.0))),
             part,
+            cull_ccw,
         );
     }
 }
@@ -360,6 +385,7 @@ fn triangle<T: Target + ?Sized>(
     mut uv: [[f32; 2]; 3],
     mut shade: [Shade; 3],
     part: &Part,
+    cull_ccw: bool,
 ) {
     let grey = shade.iter().all(|s| matches!(s, Shade::Grey(_)));
     let (width, height) = target.size();
@@ -368,6 +394,9 @@ fn triangle<T: Target + ?Sized>(
         return;
     }
     if area < 0.0 {
+        if cull_ccw {
+            return;
+        }
         p.swap(1, 2);
         uv.swap(1, 2);
         shade.swap(1, 2);
@@ -685,6 +714,7 @@ mod tests {
                 [[0.5; 2]; 3],
                 [Shade::Grey(1.0); 3],
                 &glass.parts[0],
+                false,
             );
         }
         canvas

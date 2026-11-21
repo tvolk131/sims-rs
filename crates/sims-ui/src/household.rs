@@ -4,7 +4,7 @@
 use crate::art::Art;
 use crate::house::{self, House};
 use crate::{Error, Result};
-use sims_content::{Catalog, Expansions, Index};
+use sims_content::{Catalog, Expansions, Index, Install};
 use sims_formats::bitmap::{self, Image};
 use sims_formats::career::{Career, Level};
 use sims_formats::iff::Iff;
@@ -23,6 +23,48 @@ const PAUSED: usize = 17;
 const BUDGET_MODE: usize = 32;
 
 /// A person of the household, as the panel shows them.
+/// Which pet species panel (`[esi + 0x114]` dog vs `[esi + 0x118]` cat) the
+/// live-mode Job/Skills tab shows (`0x51d5ca`..`0x51d5f0`,
+/// `0x51cbf8`..`0x51cc5a`), from `person.data[65]` (`sims_sim::neighbors::KIND`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PetKind {
+    /// Bit 1 (`(kind >> 1) & 1 != 0`): House Breaking, Tricks, Obedience.
+    Dog,
+    /// Bit 2 (`(kind >> 2) & 1 != 0`, when bit 1 is clear): Hunting, Tricks, Obedience.
+    Cat,
+}
+
+impl PetKind {
+    /// Classifies `person.data[65]` (`word [person + 0x60e]`) in the exact bit
+    /// order of `0x51d5d3`..`0x51d5e7` and `0x51cc01`..`0x51cc2e`.
+    pub fn from_kind(kind: i16) -> Option<Self> {
+        let bits = i32::from(kind);
+        if (bits >> 1) & 1 != 0 {
+            Some(Self::Dog)
+        } else if (bits >> 2) & 1 != 0 {
+            Some(Self::Cat)
+        } else {
+            None
+        }
+    }
+}
+
+/// Which subpanel the live-mode Job tab (`Panel::Job`, panel 3) shows for a
+/// selected household Sim (`0x51d598..0x51d624`, `0x51cbf8..0x51ccf4`,
+/// `0x51d09a..0x51d149`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobPanel {
+    /// Child Report Card (`[esi + 0x124]`, `age != 0 && age < 18`).
+    ReportCard,
+    /// Dog (`[esi + 0x114]`) or Cat (`[esi + 0x118]`) Pet Skills.
+    PetSkills(PetKind),
+    /// Superstar / Fame (`[esi + 0x11c]`, `0x4cfe2c`).
+    Fame,
+    /// Adult Job (`[esi + 0x110]`).
+    Adult,
+}
+
+/// A household member on the lot, in the family's portrait order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Resident {
     /// The person's object ID.
@@ -37,11 +79,17 @@ pub struct Resident {
     /// the panel shows no sign for.
     pub zodiac: Option<u8>,
     /// The skills in the job panel's order ([`SKILLS`]), in hundredths
-    /// of a point (0 to 1000).
+    /// of a point (0 to 1000). For pets (`0x66e360`), the first three
+    /// words (`[10, 12, 11]`) are House Breaking/Hunting, Tricks, and
+    /// Obedience.
     pub skills: [i16; 6],
     /// The career (a `CARR` resource's ID; 0 for none) and the level in
     /// it, person data 56 and 57.
     pub job: [i16; 2],
+    /// Whether `person.data[56]` resolves to a career in `work.iff`
+    /// (`0x4ea701`), used by `0x4cfe2c` so Sims with a regular career stay
+    /// on the Adult Job panel even if they have a nonzero fame score.
+    pub has_career: bool,
     /// What the next level of the career needs of each skill, where the
     /// person has less: 0 elsewhere, and everywhere until
     /// [`Snapshot::with_careers`] fills it in.
@@ -50,20 +98,66 @@ pub struct Resident {
     /// (0x4ea908). The job panel shows a child at school, level 0
     /// (0x4ea722).
     pub child: bool,
+    /// Whether `0x51d5af`..`0x51d5bf` routes the Job tab to the child
+    /// Report Card panel before checking pet bits (`age != 0 && age < 18`).
+    pub school_age: bool,
     /// Whether the low bit of person data 65 is set, as the job panel
     /// tells a woman (0x4eaa75).
     pub female: bool,
     /// Whether the person is a pet: person data 65 above 1 (`0x51c61f`,
-    /// `0x51ce13`, `0x51cd11`). Pets have no zodiac sign, disable the
-    /// Interests and Gifts gadget buttons, and return from those panels
-    /// to Needs when selected.
+    /// `0x51ce13`, `0x51cd11`). Pets have no zodiac sign, use pet trait
+    /// labels (`Live.iff STR# 170`), disable the Interests and Gifts
+    /// gadget buttons, and return from those panels to Needs when selected.
     pub pet: bool,
+    /// Whether the person's `person.data[65]` selects the Dog (`[esi + 0x114]`)
+    /// or Cat (`[esi + 0x118]`) Pet Skills panel (`0x51d5ca`..`0x51d5f0`).
+    pub pet_kind: Option<PetKind>,
     /// The job panel's performance: person data 63, or a child's data 57
     /// (0x4ea88c).
     pub performance: i16,
+    /// Child Report Card grade text (`0x532dc0..0x532e0e`, `0x4034ce` reading
+    /// `work.iff STR# 4097` index `performance + 1`, or `"No cJob Object!"`
+    /// when `work.iff` lacks school career `-1`). Filled in by
+    /// [`Snapshot::with_careers`].
+    pub school_grade: String,
+    /// Whether the Superstar Fame panel applies: person data 80 (`+0xa0`,
+    /// fame score, `0x4cfe5c`) and person data 81 (`+0xa2`, fame level
+    /// `0..=10` half-stars, `0x4051ec`).
+    pub fame_score: i16,
+    pub fame_level: i16,
+    /// Superstar fame title (`fame.iff STR# 1[1 + fame_level]`, `0x52d3e6`),
+    /// skill point targets (`0..=10`, `0x405190`), and formatted friend star
+    /// power text (`0x52d1af`), filled in by [`Snapshot::with_fame`].
+    pub fame_title: String,
+    pub fame_needs: [i32; 6],
+    pub fame_friends_text: String,
     /// What the job panel's left column shows: the default until
     /// [`Snapshot::with_careers`] fills it in.
     pub work: Work,
+}
+
+impl Resident {
+    /// Whether `0x4cfe2c` routes this resident to the Superstar / Fame
+    /// subpanel (`[esi + 0x11c]`): Superstar pack installed (`0x40`),
+    /// `person.data[80] > 0` (`fame_score > 0`), and no active regular
+    /// career (`0x4ea701 == 0`).
+    pub fn is_superstar(&self, superstar_pack: bool) -> bool {
+        superstar_pack && self.fame_score > 0 && !self.has_career
+    }
+
+    /// Which Job-tab subpanel (`Panel::Job`) shows for this resident in the
+    /// exact priority order of `0x51d598..0x51d624`.
+    pub fn job_panel(&self, superstar_pack: bool) -> JobPanel {
+        if self.school_age {
+            JobPanel::ReportCard
+        } else if let Some(kind) = self.pet_kind {
+            JobPanel::PetSkills(kind)
+        } else if self.is_superstar(superstar_pack) {
+            JobPanel::Fame
+        } else {
+            JobPanel::Adult
+        }
+    }
 }
 
 /// What the job panel's left column shows of a person (0x530501).
@@ -176,8 +270,15 @@ const JOB: [usize; 2] = [56, 57];
 /// the low bit of the kind for a woman (0x4ea908, 0x4ea88c, 0x4eaa75).
 const AGE: usize = 58;
 const PERFORMANCE: usize = 63;
+/// Person data word 80 (`+0xa0`): Superstar fame score (`0x4cfe5c`).
+const FAME_SCORE: usize = 80;
 /// The age a person is a child under.
 const GROWN: i16 = 18;
+
+/// Fallback text when `0x4ea722` finds no school career object (`0x532dce`, `0x6ccde8`).
+pub const NO_JOB_OBJECT: &str = "No cJob Object!";
+/// `work.iff` string table holding school grades (`0x403f43 -> 0x6de7d8`).
+const GRADE_STRINGS: u16 = 4097;
 
 /// The career a child is in, and the level (0x4ea722): school, `CARR`
 /// 0xffff.
@@ -204,6 +305,12 @@ pub struct Snapshot {
     /// (`0x4f24fa` → `0x4cfe0a` / `0x4cfe18` → `0x53b2a4..0x53b2e1`).
     pub show_money: bool,
     pub paused: bool,
+    /// Whether the idle loop is currently holding the lot at
+    /// [`sims_sim::speed::IDLE`] (`[control_panel + 0x1ec]` set by `0x46d7b5`
+    /// → `0x4f688e`, cleared on `0x46d803` or speed click at
+    /// `0x53a5e3`..`0x53a6e1`): `world.return_speed() >= 0 && world.speed() ==
+    /// sims_sim::speed::IDLE`.
+    pub idle_speed: bool,
     /// Whether the lot is residential (`0x40745f`), used to pick which
     /// family supplies [`Snapshot::family_friends`] (`0x4cfcdb`).
     /// Defaults to `true` until [`Snapshot::with_zoning`] sets it.
@@ -212,6 +319,11 @@ pub struct Snapshot {
     pub residents: Vec<Resident>,
     /// The selected Sim's object ID.
     pub selected: Option<u16>,
+    /// The selected Sim's type GUID (`0x4e986d` → `0x4e9753`), used by
+    /// [`Snapshot::selected_resident`] to match the household roster by
+    /// neighbor/GUID (`0x51c5ef` → `0x4e97dc`) even if a second live
+    /// instance of a household Sim is selected.
+    pub selected_guid: Option<u32>,
     /// How many friends the lot's family (global 9) has, as the job panel
     /// compares it (`0x4ea8ed..0x4ea8f7`, `0x531095..0x5310a4`, `0x410260`):
     /// [`sims_sim::neighbors::Family::friends`], or 0 with no such family.
@@ -309,6 +421,24 @@ pub struct Relation {
     pub family: bool,
 }
 
+/// Finds the first live person of type `guid` in person-registry order
+/// (`0x4e9608`: scans `[registry + 0x84]` = `world.people` and returns `None`
+/// on a miss). Falls back to `world.objects` only when `world.people` is empty
+/// (for synthetic worlds that never populate the person registry).
+pub fn first_person_for_guid(world: &World, guid: u32) -> Option<&sims_sim::Object> {
+    if !world.people.is_empty() {
+        return world
+            .people
+            .iter()
+            .filter_map(|id| world.objects.get(id))
+            .find(|o| o.guid == guid && o.person.is_some());
+    }
+    world
+        .objects
+        .values()
+        .find(|o| o.guid == guid && o.person.is_some())
+}
+
 impl Snapshot {
     /// Reads the snapshot. `members` is the family's member GUIDs in the
     /// order the neighborhood keeps them (`Family::members`): the world
@@ -318,17 +448,16 @@ impl Snapshot {
         let global = |n: usize| world.globals.get(n).copied().unwrap_or(0);
         let mut residents = Vec::new();
         for &guid in members {
-            // The first person of the type, as the original's lookup by
-            // type does (crates/sims-vm/src/selection.rs).
-            if let Some(object) = world
-                .objects
-                .values()
-                .find(|o| o.guid == guid && o.person.is_some())
-            {
+            // The first person of the type in person-registry order
+            // (`0x4e9608` scanning `[registry + 0x84]`).
+            if let Some(object) = first_person_for_guid(world, guid) {
                 let person = object.person.as_ref();
                 let data =
                     |word: usize| person.and_then(|p| p.data.get(word).copied()).unwrap_or(0);
-                let child = data(AGE) < GROWN;
+                let age = data(AGE);
+                let child = age < GROWN;
+                let school_age = age != 0 && age < GROWN;
+                let kind = data(sims_sim::neighbors::KIND);
                 residents.push(Resident {
                     object: object.id,
                     guid,
@@ -337,20 +466,30 @@ impl Snapshot {
                     zodiac: zodiac(data),
                     skills: SKILLS.map(data),
                     job: JOB.map(data),
+                    has_career: false,
                     needs: [0; 6],
                     child,
-                    female: data(sims_sim::neighbors::KIND) & 1 == 1,
-                    pet: data(sims_sim::neighbors::KIND) > 1,
+                    school_age,
+                    female: kind & 1 == 1,
+                    pet: kind > 1,
+                    pet_kind: PetKind::from_kind(kind),
                     performance: data(if child { JOB[1] } else { PERFORMANCE }),
+                    school_grade: String::new(),
+                    fame_score: data(FAME_SCORE),
+                    fame_level: data(FAME),
+                    fame_title: String::new(),
+                    fame_needs: [0; 6],
+                    fame_friends_text: String::new(),
                     work: Work::default(),
                 });
             }
         }
-        let selected = world
+        let selected_obj = world
             .objects
             .values()
-            .find(|o| o.selected && o.person.is_some())
-            .map(|o| o.id);
+            .find(|o| o.selected && o.person.is_some());
+        let selected = selected_obj.map(|o| o.id);
+        let selected_guid = selected_obj.map(|o| o.guid);
         let lot_friends = lot_family(world).map_or(0, |f| f.friends);
         Self {
             hour: global(HOURS),
@@ -358,15 +497,28 @@ impl Snapshot {
             funds: world.budget.funds,
             show_money: global(BUDGET_MODE) != 1,
             paused: global(PAUSED) != 0,
+            idle_speed: world.return_speed() >= 0 && world.speed() == sims_sim::speed::IDLE,
             residential: true,
             residents,
             selected,
+            selected_guid,
             family_friends: lot_friends,
             cluster_friends: lot_friends,
             relations: Vec::new(),
             superstar: false,
             house: House::default(),
         }
+    }
+
+    /// Overrides [`Snapshot::idle_speed`] with the host control panel's
+    /// tracked idle-blink flag (`[control_panel + 0x1ec]`, set by `0x109(1)`,
+    /// cleared by `0x109(0)` or manual speed click `0x53a5e3..0x53a6e1`, and
+    /// preserved across Special Effect `0x10c` speed resets at
+    /// `0x4f6856..0x4f687a`).
+    #[must_use]
+    pub fn with_idle_speed(mut self, idle_speed: bool) -> Self {
+        self.idle_speed = idle_speed;
+        self
     }
 
     /// Sets whether the lot is residential (`0x40745f`) and reads both
@@ -413,9 +565,16 @@ impl Snapshot {
             } else {
                 (career, i32::from(level))
             };
+            resident.has_career = career != 0 && careers.has(career);
+            let shown_level = careers.level(shown, at);
+            resident.school_grade = if shown_level.is_some() {
+                careers.grade(resident.performance).to_owned()
+            } else {
+                NO_JOB_OBJECT.to_owned()
+            };
             resident.work = Work {
                 icon: if careers.has(career) { career } else { 0 },
-                level: careers.level(shown, at).map(|l| WorkLevel {
+                level: shown_level.map(|l| WorkLevel {
                     title: careers
                         .title(shown, at, resident.female)
                         .unwrap_or_default()
@@ -474,10 +633,31 @@ impl Snapshot {
         self
     }
 
+    /// Populates [`Snapshot::superstar`] and each resident's Superstar / Fame
+    /// subpanel fields (`fame_title`, `fame_needs`, `fame_friends_text`) from
+    /// `world`, `known`, and `fame` (`0x4cfe2c`, `0x405190`, `0x40520b`,
+    /// `0x427237`, `0x52d1af`, `0x52d3e6`).
+    #[must_use]
+    pub fn with_fame(mut self, world: &World, known: &Acquaintances, fame: &Fame) -> Self {
+        self.superstar = known.superstar;
+        for resident in &mut self.residents {
+            resident.fame_title = fame.level_title(resident.fame_level).to_owned();
+            resident.fame_needs = fame.skill_needs(resident.fame_level, &resident.skills);
+            let raw_half_stars = friend_star_power(world, resident.guid, known);
+            resident.fame_friends_text =
+                fame.format_friend_star_power(resident.fame_level, raw_half_stars);
+        }
+        self
+    }
+
     /// The selected Sim, if one of the household's: what the live panel
     /// counts as someone selected (the original's +0xe8, the selected
-    /// Sim's place among the members, set by 0x51c5b0).
+    /// Sim's place among the members, matched by neighbor/GUID at
+    /// `0x51c5ef` → `0x4e97dc`, `0x4e986d`, `0x4e9608`).
     pub fn selected_resident(&self) -> Option<&Resident> {
+        if let Some(guid) = self.selected_guid {
+            return self.residents.iter().find(|r| r.guid == guid);
+        }
         self.selected.and_then(|s| self.resident(s))
     }
 
@@ -522,12 +702,14 @@ pub fn money(amount: i32) -> String {
 
 /// The careers of `work.iff`, by the ID of their `CARR` resource, as
 /// the original looks a person's career up (0x404cb3), with the levels'
-/// titles.
+/// titles and the Child Report Card grade strings (`STR# 4097`, `0x403f43`).
 #[derive(Debug, Clone, Default)]
 pub struct Careers {
     careers: BTreeMap<i16, Vec<Level>>,
     /// Each career's levels' titles, a man's and a woman's.
     titles: BTreeMap<i16, Vec<[String; 2]>>,
+    /// School grade strings (`work.iff STR# 4097`, `"A+"` .. `"F (off to military school)"`).
+    grades: Vec<String>,
 }
 
 /// The career, in `work.iff`'s order, whose titles the original never
@@ -535,10 +717,11 @@ pub struct Careers {
 const UNTITLED: usize = 10;
 
 impl Careers {
-    /// Reads every `CARR` of the install's `work.iff`, and the levels'
-    /// titles from the `STR#` of the career's ID (0x403f26): for level
-    /// `k`, string `3 + 2k`, and a woman's, `23 + k`, in US English. An
-    /// install without the file has no careers.
+    /// Reads every `CARR` of the install's `work.iff`, the levels' titles
+    /// from the `STR#` of the career's ID (0x403f26: for level `k`, string
+    /// `3 + 2k`, and a woman's, `23 + k`, in US English), and the school
+    /// grade strings from `STR# 4097` (0x403f43). An install without the
+    /// file has no careers.
     ///
     /// The original reads the titles of only the first 11, 16 or 21
     /// careers, by the game's expansion level (0x403f53); here every
@@ -549,6 +732,16 @@ impl Careers {
             return Ok(out);
         };
         let iff = Iff::parse(file.read().map_err(Error::Content)?).map_err(Error::Format)?;
+        if let Some(chunk) = iff.get(b"STR#", GRADE_STRINGS) {
+            let table = StringTable::parse(iff.data(chunk)).map_err(Error::Format)?;
+            out.grades = (0..table.entries.len())
+                .map_while(|i| {
+                    table
+                        .get(i, sims_content::ui_graphics::US_ENGLISH)
+                        .map(str::to_owned)
+                })
+                .collect();
+        }
         for (n, chunk) in iff
             .resource_order(b"CARR")
             .map_err(Error::Format)?
@@ -588,6 +781,21 @@ impl Careers {
         self.titles.insert(id, titles);
     }
 
+    /// Sets the school grade strings (`work.iff STR# 4097`), as tests do.
+    pub fn insert_grades(&mut self, grades: Vec<String>) {
+        self.grades = grades;
+    }
+
+    /// The school grade label for `grade` (`person.data[57]`, `0x4034ce`
+    /// reading 1-based `grade + 1` from `work.iff STR# 4097`, returning `""`
+    /// when out of range).
+    pub fn grade(&self, grade: i16) -> &str {
+        usize::try_from(grade)
+            .ok()
+            .and_then(|i| self.grades.get(i))
+            .map_or("", String::as_str)
+    }
+
     /// Whether career `career` exists (0x404cb3).
     pub fn has(&self, career: i16) -> bool {
         self.careers.contains_key(&career)
@@ -615,6 +823,192 @@ impl Careers {
         }
         self.careers.get(&career)?.get(usize::try_from(level).ok()?)
     }
+}
+
+/// Superstar fame progression data read from `GameData/fame.iff`
+/// (`0x404e74`, `0x52bd10`): 11 levels (0 = 0.0 stars .. 10 = 5.0 stars).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Fame {
+    /// Panel title (`STR# 1[0]`, `"Fame"`).
+    pub title: String,
+    /// Level titles (`STR# 1[1..=11]`, `"Nobody"` .. `"Superstar"`).
+    pub level_titles: Vec<String>,
+    /// Format string when more friend star power is needed (`STR# 1[12]`,
+    /// `"%s (Need %d)"`).
+    pub need_friends_format: String,
+    /// Friend star power needed at each level (`STR# 4[0..11]`).
+    pub friend_star_power_needed: Vec<i32>,
+    /// Fame score needed at each level (`STR# 5[0..11]`).
+    pub score_needed: Vec<i32>,
+    /// Skill points (`0..=10`) needed in [`SKILLS`] order at each level
+    /// (`STR# 6[0..11]`).
+    pub skills_needed: Vec<[i32; 6]>,
+}
+
+impl Fame {
+    /// Reads `GameData/fame.iff` from `install`. Returns an empty [`Fame`]
+    /// on installs without the file (pre-Superstar).
+    pub fn load(install: &Install) -> Result<Self> {
+        let Ok(path) = install.file("GameData/fame.iff") else {
+            return Ok(Self::default());
+        };
+        let bytes = std::fs::read(&path).map_err(Error::Io)?;
+        let iff = Iff::parse(bytes).map_err(Error::Format)?;
+        let table = |id: u16| -> Result<Vec<String>> {
+            let Some(chunk) = iff.get(b"STR#", id) else {
+                return Ok(Vec::new());
+            };
+            let st = StringTable::parse(iff.data(chunk)).map_err(Error::Format)?;
+            Ok((0..st.entries.len())
+                .map_while(|i| {
+                    st.get(i, sims_content::ui_graphics::US_ENGLISH)
+                        .map(str::to_owned)
+                })
+                .collect())
+        };
+        let panel = table(1)?;
+        let friend_needed = table(4)?;
+        let score_needed = table(5)?;
+        let skills_needed = table(6)?;
+        Ok(Self::from_tables(
+            &panel,
+            &friend_needed,
+            &score_needed,
+            &skills_needed,
+        ))
+    }
+
+    /// Parses the four `fame.iff` `STR#` tables (`1`, `4`, `5`, `6`), matching
+    /// `0x404e74` and `0x52bd10`.
+    pub fn from_tables(
+        panel: &[String],
+        friend_needed: &[String],
+        score_needed: &[String],
+        skills_needed: &[String],
+    ) -> Self {
+        let parse_i32 = |s: &String| s.trim().parse::<i32>().unwrap_or(0);
+        let parse_skills = |s: &String| -> [i32; 6] {
+            let mut out = [0; 6];
+            for (slot, part) in out.iter_mut().zip(s.split(',')) {
+                *slot = part.trim().parse::<i32>().unwrap_or(0);
+            }
+            out
+        };
+        Self {
+            title: panel.first().cloned().unwrap_or_default(),
+            level_titles: panel.iter().skip(1).take(11).cloned().collect(),
+            need_friends_format: panel.get(12).cloned().unwrap_or_default(),
+            friend_star_power_needed: friend_needed.iter().take(11).map(parse_i32).collect(),
+            score_needed: score_needed.iter().take(11).map(parse_i32).collect(),
+            skills_needed: skills_needed.iter().take(11).map(parse_skills).collect(),
+        }
+    }
+
+    /// The fame rank title for `level` (`0..=10`), matching `0x52d3e6`
+    /// (`0x52c014` initializes the button to level 1 if out of range).
+    pub fn level_title(&self, level: i16) -> &str {
+        let idx = usize::try_from(level).ok().filter(|&i| i < 11);
+        idx.and_then(|i| self.level_titles.get(i))
+            .or_else(|| self.level_titles.get(1))
+            .map_or("", String::as_str)
+    }
+
+    /// Required skill points (`0..=10`) still missing for `level` (`0x405190`):
+    /// returns `req` in points where `skills[n] < req * 100`, else `0`.
+    pub fn skill_needs(&self, level: i16, skills: &[i16; 6]) -> [i32; 6] {
+        let Some(reqs) = usize::try_from(level)
+            .ok()
+            .filter(|&i| i < 11)
+            .and_then(|i| self.skills_needed.get(i))
+        else {
+            return [0; 6];
+        };
+        std::array::from_fn(|n| {
+            let req = reqs[n];
+            if i32::from(skills[n]) < req.saturating_mul(100) {
+                req
+            } else {
+                0
+            }
+        })
+    }
+
+    /// Friend star power needed for `level` (`0x40520b`).
+    pub fn friend_star_power_needed(&self, level: i16) -> i32 {
+        usize::try_from(level)
+            .ok()
+            .filter(|&i| i < 11)
+            .and_then(|i| self.friend_star_power_needed.get(i).copied())
+            .unwrap_or(0)
+    }
+
+    /// Formats the friend star power button label (`0x40529c`, `0x404dde`,
+    /// `0x52d1af`): `"X.0"` / `"X.5"`, or `"%s (Need %d)"` when below the
+    /// current level's required friend star power.
+    pub fn format_friend_star_power(&self, level: i16, raw_half_stars: i32) -> String {
+        let mut f = raw_half_stars as f32;
+        if raw_half_stars > 0 {
+            f *= 0.5f32;
+        }
+        let whole = f as i32;
+        let suffix = if (f - whole as f32) != 0.0f32 {
+            ".5"
+        } else {
+            ".0"
+        };
+        let current = format!("{whole}{suffix}");
+        let needed = self.friend_star_power_needed(level);
+        // 0x404dde: raw_half_stars * 0.5 >= needed (uses single-precision f32).
+        if (raw_half_stars as f32) * 0.5f32 >= needed as f32 {
+            current
+        } else if self.need_friends_format.contains("%s") && self.need_friends_format.contains("%d")
+        {
+            self.need_friends_format
+                .replacen("%s", &current, 1)
+                .replacen("%d", &needed.to_string(), 1)
+        } else {
+            format!("{current} (Need {needed})")
+        }
+    }
+}
+
+/// Sums the fame half-stars (`word [neighbor + 0x116]`, person data word 81) of
+/// all neighborhood characters (`0x423f30`: disk characters or runtime-created
+/// `world.characters.made`) in a different non-zero family (`word [neighbor + 0xee]`)
+/// who are mutual friends with `guid`'s Sim (`0x4ea6c4 -> 0x427237 -> 0x4271c5`).
+pub fn friend_star_power(world: &World, guid: u32, known: &Acquaintances) -> i32 {
+    let neighbors = &world.neighbors;
+    let Some(viewer) = neighbors.first_of(guid) else {
+        return 0;
+    };
+    let viewer_family = viewer
+        .data
+        .get(sims_sim::neighbors::FAMILY)
+        .copied()
+        .unwrap_or(0);
+    let mut total = 0i32;
+    for record in neighbors.slots.iter().flatten() {
+        if record.id == viewer.id {
+            continue;
+        }
+        if !known.characters.contains(&record.guid)
+            && !world.characters.made.contains_key(&record.guid)
+        {
+            continue;
+        }
+        let family = record
+            .data
+            .get(sims_sim::neighbors::FAMILY)
+            .copied()
+            .unwrap_or(0);
+        if family == 0 || family == viewer_family {
+            continue;
+        }
+        if sims_sim::neighbors::mutual_friends(viewer, record, known.friendship) {
+            total = total.saturating_add(i32::from(record.data.get(FAME).copied().unwrap_or(0)));
+        }
+    }
+    total
 }
 
 /// The lot's family: the first whose ID is global 9, as the lot's
@@ -907,9 +1301,11 @@ mod tests {
             funds,
             show_money: true,
             paused: false,
+            idle_speed: false,
             residential: true,
             residents: Vec::new(),
             selected: None,
+            selected_guid: None,
             family_friends: 0,
             cluster_friends: 0,
             relations: Vec::new(),
@@ -1130,11 +1526,20 @@ mod tests {
             zodiac: None,
             skills: [0, 0, 300, 1000, 199, 0],
             job,
+            has_career: false,
             needs: [7; 6],
             child: false,
+            school_age: false,
             female: false,
             pet: false,
+            pet_kind: None,
             performance: 0,
+            school_grade: String::new(),
+            fame_score: 0,
+            fame_level: 0,
+            fame_title: String::new(),
+            fame_needs: [0; 6],
+            fame_friends_text: String::new(),
             work: Work::default(),
         };
         let mut s = snapshot(0, 0, 0);
@@ -1191,11 +1596,20 @@ mod tests {
             zodiac: None,
             skills: [0; 6],
             job,
+            has_career: false,
             needs: [0; 6],
             child,
+            school_age: child,
             female,
             pet: false,
+            pet_kind: None,
             performance: 0,
+            school_grade: String::new(),
+            fame_score: 0,
+            fame_level: 0,
+            fame_title: String::new(),
+            fame_needs: [0; 6],
+            fame_friends_text: String::new(),
             work: Work::default(),
         };
         let mut s = snapshot(0, 0, 0);
@@ -1386,5 +1800,234 @@ mod tests {
         world.objects.get_mut(&10).unwrap().selected = false;
         let nobody = Snapshot::read(&world, &members).with_zoning(&world, false, 50);
         assert_eq!((nobody.family_friends, nobody.cluster_friends), (4, 0));
+
+        // Duplicate GUID with a LOWER object ID appended later in `world.people`
+        // (`0x4e9608`): registry scan order wins over ascending object ID.
+        let mut lower_dup = make_sim(1, 200, 2, 1, true);
+        lower_dup.person.as_mut().unwrap().data[10] = 900;
+        world
+            .objects
+            .get_mut(&10)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap()
+            .data[10] = 200;
+        world.objects.insert(1, lower_dup);
+        world.people.push(1);
+        let dup_snap = Snapshot::read(&world, &members);
+        assert_eq!(dup_snap.residents[0].object, 10);
+        assert_eq!(dup_snap.residents[0].skills[0], 200);
+        assert_eq!(dup_snap.selected, Some(1));
+        assert_eq!(dup_snap.selected_guid, Some(200));
+        assert_eq!(dup_snap.selected_resident().map(|r| r.object), Some(10));
+
+        // When `world.people` is populated, an unregistered person in
+        // `world.objects` is NOT surfaced (`0x4e9625..0x4e964c` returns null).
+        world.objects.insert(99, make_sim(99, 300, 1, 1, false));
+        assert!(first_person_for_guid(&world, 300).is_none());
+    }
+
+    #[test]
+    fn fame_progression_and_friend_star_power_follow_disassembly() {
+        let mut panel: Vec<String> = vec!["Fame".into()];
+        panel.extend((0..11).map(|i| format!("Rank{i}")));
+        panel.push("%s (Need %d)".into());
+        let friend_needed: Vec<String> = ["0", "0", "0", "0", "2", "4", "7", "11", "14", "18", "0"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let score_needed: Vec<String> = [
+            "2", "9", "21", "35", "52", "78", "156", "300", "550", "900", "0",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let skills_needed: Vec<String> = [
+            "0,0,0,0,0,0",
+            "0,0,1,0,0,1",
+            "0,0,2,1,0,2",
+            "0,0,3,2,0,3",
+            "0,0,4,3,0,4",
+            "0,0,6,4,0,4",
+            "0,0,6,5,0,6",
+            "0,0,7,6,0,7",
+            "0,0,8,7,0,8",
+            "0,0,10,8,0,9",
+            "0,0,0,0,0,0",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let fame = Fame::from_tables(&panel, &friend_needed, &score_needed, &skills_needed);
+        assert_eq!(fame.level_title(0), "Rank0");
+        assert_eq!(fame.level_title(10), "Rank10");
+        // Out of range falls back to initial level 1 title (0x52c014 / 0x52d402).
+        assert_eq!(fame.level_title(11), "Rank1");
+        assert_eq!(fame.level_title(-1), "Rank1");
+        // Skill needs (`0x405190`): compares person skill < req * 100.
+        assert_eq!(
+            fame.skill_needs(2, &[0, 0, 200, 99, 0, 150]),
+            [0, 0, 0, 1, 0, 2]
+        );
+        // Friend star power formatting (`0x40529c`, `0x404dde`, `0x52d1af`).
+        assert_eq!(fame.format_friend_star_power(0, 0), "0.0");
+        assert_eq!(fame.format_friend_star_power(4, 3), "1.5 (Need 2)");
+        assert_eq!(fame.format_friend_star_power(4, 4), "2.0");
+        assert_eq!(fame.format_friend_star_power(4, 5), "2.5");
+        assert_eq!(fame.format_friend_star_power(0, -1), "-1.0 (Need 0)");
+
+        // `friend_star_power` (`0x427237`): sums word 81 of mutual-friend
+        // neighborhood characters in a different non-zero family.
+        let mut world = World::empty();
+        let make_neighbor =
+            |id: i16, guid: u32, family: i16, fame_lvl: i16, rows: &[(i32, i32)]| {
+                let mut n = record(id, guid, rows);
+                n.data[sims_sim::neighbors::FAMILY] = family;
+                n.data[FAME] = fame_lvl;
+                n
+            };
+        world.neighbors.slots = vec![
+            Some(make_neighbor(
+                1,
+                0x100,
+                1,
+                2,
+                &[(2, 80), (3, 80), (4, 80), (5, 80), (6, 80)],
+            )),
+            Some(make_neighbor(2, 0x200, 2, 5, &[(1, 60)])),
+            Some(make_neighbor(3, 0x300, 1, 7, &[(1, 60)])), // same family
+            Some(make_neighbor(4, 0x400, 0, 9, &[(1, 60)])), // family 0
+            Some(make_neighbor(5, 0x500, 3, 6, &[(1, 20)])), // one-way (< 50)
+            Some(make_neighbor(6, 0x600, 4, 8, &[(1, 80)])), // non-character
+        ];
+        let known = Acquaintances {
+            friendship: 50,
+            characters: [0x100, 0x200, 0x300, 0x400, 0x500].into_iter().collect(),
+            superstar: true,
+        };
+        // Only `star_friend` (5 half-stars) qualifies.
+        assert_eq!(friend_star_power(&world, 0x100, &known), 5);
+
+        // 0x427272..0x4272aa reads family and fame directly from each
+        // neighborhood record, NOT live person data, and handles duplicate GUIDs
+        // independently per record; 0x423f30 also counts runtime-created
+        // characters in `world.characters.made`.
+        let make_person_obj = |id: u16, guid: u32, family: i16, fame_lvl: i16| {
+            use sims_formats::saved_objects::{Interaction, Person};
+            let idle = Interaction {
+                join: 0,
+                uid: 0,
+                caller: 0,
+                target: 0,
+                icon: 0,
+                table_index: -1,
+                args: [0; 4],
+                priority: 0,
+                action: 0,
+                attenuation: 0.0,
+                flags: 0,
+            };
+            let mut data = vec![0; sims_sim::neighbors::PERSON_WORDS];
+            data[sims_sim::neighbors::FAMILY] = family;
+            data[FAME] = fame_lvl;
+            sims_sim::Object {
+                id,
+                guid,
+                footprint: [0; 4],
+                position: [0; 3],
+                unknown_short: 0,
+                attributes: Vec::new(),
+                temps: Vec::new(),
+                data: vec![0; 128],
+                obsolete_word: 0,
+                stack_capacity_bytes: 0,
+                stack: Vec::new(),
+                relationship_flag: 0,
+                relationships: Vec::new(),
+                slots: Vec::new(),
+                dynamic_sprites: Vec::new(),
+                multipart: None,
+                portal: None,
+                person: Some(Person {
+                    animation_events: 0,
+                    engaged: 0,
+                    appearance: Default::default(),
+                    accessories: Vec::new(),
+                    animations: Default::default(),
+                    routing_state: 0,
+                    floats: [0.0; 9],
+                    previous_motives: [0.0; 16],
+                    motives: [0.0; 16],
+                    data,
+                    routing_frames: 0,
+                    active: idle.clone(),
+                    last: idle,
+                    queue: Vec::new(),
+                    object_uses: Vec::new(),
+                    motive_deltas: Vec::new(),
+                }),
+                registry_word: None,
+                last_result: false,
+                removal_skips_resets: false,
+                selected: false,
+            }
+        };
+        world.objects.insert(10, make_person_obj(10, 0x100, 99, 99));
+        world.people.push(10);
+        world.objects.insert(11, make_person_obj(11, 0x200, 2, 99));
+        world.people.push(11);
+        // Add a second record with the same GUID `0x200` but its own fame (3),
+        // and a runtime-created character `0x700` present only in `world.characters.made` (4).
+        world.neighbors.slots[0]
+            .as_mut()
+            .unwrap()
+            .relationships
+            .push(sims_sim::neighbors::Row {
+                target: 7,
+                values: vec![80],
+            });
+        world.neighbors.slots[0]
+            .as_mut()
+            .unwrap()
+            .relationships
+            .push(sims_sim::neighbors::Row {
+                target: 8,
+                values: vec![80],
+            });
+        world
+            .neighbors
+            .slots
+            .push(Some(make_neighbor(7, 0x200, 3, 3, &[(1, 70)])));
+        world
+            .neighbors
+            .slots
+            .push(Some(make_neighbor(8, 0x700, 4, 4, &[(1, 70)])));
+        world.characters.made.insert(
+            0x700,
+            sims_sim::characters::Character {
+                template: 0x100,
+                file: 99,
+                strings: Default::default(),
+            },
+        );
+        // 5 (record 2) + 3 (duplicate-GUID record 7) + 4 (runtime record 8) = 12.
+        assert_eq!(friend_star_power(&world, 0x100, &known), 12);
+    }
+
+    #[test]
+    fn career_grade_strings_map_index_zero_through_f_and_out_of_range() {
+        let mut careers = Careers::default();
+        careers.insert_grades(vec![
+            "A+".into(),
+            "A".into(),
+            "A-".into(),
+            "B+".into(),
+            "B".into(),
+        ]);
+        assert_eq!(careers.grade(0), "A+");
+        assert_eq!(careers.grade(4), "B");
+        assert_eq!(careers.grade(-1), "");
+        assert_eq!(careers.grade(5), "");
     }
 }

@@ -76,7 +76,17 @@ pub fn draw(
     camera: &Camera,
     canvas: &mut Canvas,
 ) -> Stats {
-    paint(world, lot, assets, camera, canvas, Pass::All)
+    let viewport = (canvas.width as u32, canvas.height as u32);
+    paint(
+        world,
+        lot,
+        assets,
+        camera,
+        viewport,
+        None,
+        canvas,
+        Pass::All,
+    )
 }
 
 /// Draws the lot as [`draw`] does, but leaves out the objects that hold a
@@ -89,7 +99,65 @@ pub fn draw_lot(
     camera: &Camera,
     canvas: &mut Canvas,
 ) -> Stats {
-    paint(world, lot, assets, camera, canvas, Pass::Lot)
+    let viewport = (canvas.width as u32, canvas.height as u32);
+    paint(
+        world,
+        lot,
+        assets,
+        camera,
+        viewport,
+        None,
+        canvas,
+        Pass::Lot,
+    )
+}
+
+/// Draws the lot as [`draw_lot`] does, clipping grass columns and blades to
+/// the active house `viewport` height (for example `800×500` when the live
+/// control strip is expanded, matching `0x49aed6`–`0x49aee2`, `0x4c44dd`–
+/// `0x4c4547`, and `0x49dd0a`/`0x49df19`).
+pub fn draw_lot_in_viewport(
+    world: &World,
+    lot: &Lot,
+    assets: &mut Assets,
+    camera: &Camera,
+    viewport: (u32, u32),
+    canvas: &mut Canvas,
+) -> Stats {
+    paint(
+        world,
+        lot,
+        assets,
+        camera,
+        viewport,
+        None,
+        canvas,
+        Pass::Lot,
+    )
+}
+
+/// Draws the lot as [`draw_lot_in_viewport`] does, also rendering an invalid
+/// Buy Mode preview's off-lot held object at its on-lot `"Tile Cursor"`
+/// position (`0x42242f`) when `preview = Some((cursor_lead, held_lead))`.
+pub fn draw_lot_with_preview(
+    world: &World,
+    lot: &Lot,
+    assets: &mut Assets,
+    camera: &Camera,
+    viewport: (u32, u32),
+    preview: Option<(u16, u16)>,
+    canvas: &mut Canvas,
+) -> Stats {
+    paint(
+        world,
+        lot,
+        assets,
+        camera,
+        viewport,
+        preview,
+        canvas,
+        Pass::Lot,
+    )
 }
 
 /// Draws the objects [`draw_lot`] left out, over a canvas that holds the
@@ -105,7 +173,17 @@ pub fn draw_held(
     camera: &Camera,
     canvas: &mut Canvas,
 ) -> Stats {
-    let mut painter = Painter::new(world, lot, assets, camera, canvas, Pass::Held);
+    let viewport = (canvas.width as u32, canvas.height as u32);
+    let mut painter = Painter::new(
+        world,
+        lot,
+        assets,
+        camera,
+        viewport,
+        None,
+        canvas,
+        Pass::Held,
+    );
     let top = camera.level.clamp(1, 2);
     for level in 1..=top {
         let cut = cut(lot, camera, level, top);
@@ -125,18 +203,21 @@ enum Pass {
     Held,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint(
     world: &World,
     lot: &Lot,
     assets: &mut Assets,
     camera: &Camera,
+    viewport: (u32, u32),
+    preview: Option<(u16, u16)>,
     canvas: &mut Canvas,
     pass: Pass,
 ) -> Stats {
     let time_of_day = world.globals.get(4).copied().unwrap_or(lot.time_of_day);
     let house = world.globals.get(10).copied().unwrap_or(0);
     canvas.clear(background(time_of_day, house));
-    let mut painter = Painter::new(world, lot, assets, camera, canvas, pass);
+    let mut painter = Painter::new(world, lot, assets, camera, viewport, preview, canvas, pass);
     let top = camera.level.clamp(1, 2);
     for level in 1..=top {
         painter.floors(level);
@@ -385,6 +466,12 @@ struct Painter<'a> {
     pass: Pass,
     /// The objects that hold a person, for passes other than `All`.
     held: BTreeSet<u16>,
+    /// Off-lot Buy Mode held preview parts rendered at their on-lot
+    /// `"Tile Cursor"` positions (`0x42242f`), mapped to `([x, y, level], lift)`.
+    preview_overrides: BTreeMap<u16, ([i32; 3], f32)>,
+    /// Active house viewport bottom (`word ptr [0x6f0c14]`), clamped to the
+    /// canvas height.
+    clip_bottom: i32,
     world: &'a World,
     lot: &'a Lot,
     camera: &'a Camera,
@@ -396,14 +483,18 @@ struct Painter<'a> {
 }
 
 impl<'a> Painter<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         world: &'a World,
         lot: &'a Lot,
         assets: &'a mut Assets,
         camera: &'a Camera,
+        viewport: (u32, u32),
+        preview: Option<(u16, u16)>,
         canvas: &'a mut Canvas,
         pass: Pass,
     ) -> Self {
+        let clip_bottom = (viewport.1 as usize).min(canvas.height) as i32;
         Painter {
             pass,
             held: if pass == Pass::All {
@@ -411,6 +502,8 @@ impl<'a> Painter<'a> {
             } else {
                 holds_person(world)
             },
+            preview_overrides: buy_preview_overrides(world, preview),
+            clip_bottom,
             world,
             lot,
             camera,
@@ -555,6 +648,16 @@ impl<'a> Painter<'a> {
             for x in inner.clone() {
                 for y in inner.clone() {
                     self.terrain([x, y]);
+                }
+            }
+            // Buy (`2`) and Build (`1`) modes draw the dotted black lot
+            // placement grid over unfloored buildable terrain (`0x4ce44f` →
+            // `0x4c4222`, `0x4c42f0`, `0x4c3ba4`, `0x4c3c23`, `0x4c37f2`).
+            if matches!(self.world.globals.get(19).copied().unwrap_or(0), 1 | 2) {
+                for x in inner.clone() {
+                    for y in inner.clone() {
+                        self.terrain_grid([x, y]);
+                    }
                 }
             }
         }
@@ -719,40 +822,104 @@ impl<'a> Painter<'a> {
     /// Draws a grass tile in the original's four-pixel columns (see
     /// [`crate::grass`]), straight from the palette: no room's light falls
     /// on it (0x49da21).
-    fn terrain(&mut self, [x, y]: [i32; 2]) {
-        let view = self.camera.rotate_tile([x, y]);
-        let Some((shades, colors)) = self.grass.tile(view) else {
-            return;
+    fn terrain(&mut self, tile: [i32; 2]) {
+        draw_grass_tile(
+            self.lot,
+            &self.grass,
+            &self.depth,
+            self.camera,
+            tile,
+            self.clip_bottom,
+            self.canvas,
+        );
+    }
+
+    /// Whether view tile `[vx, vy]` is buildable for the Buy/Build Mode lot
+    /// grid (`0x4c3c23`: lot tile inside `1..size - 1` with ground flag `0x20`
+    /// clear in array `8`).
+    fn tile_buildable(&self, [vx, vy]: [i32; 2]) -> bool {
+        let [lx, ly] = self.camera.unrotate_tile([vx, vy]);
+        let limit = self.lot.size as i32 - 1;
+        if lx < 1 || lx >= limit || ly < 1 || ly >= limit {
+            return false;
+        }
+        let Some(flags) = self.world.arrays.get(&8) else {
+            return true;
         };
+        let cell = Lot::cell(lx as usize, ly as usize);
+        flags.data.get(cell).is_none_or(|&byte| (byte & 0x20) == 0)
+    }
+
+    /// Draws the Buy/Build Mode dotted black lot placement grid on an
+    /// unfloored ground tile (`0x4c42f0`, `0x4c3ba4`, `0x4c37f2` / `0x4c391d`):
+    /// bit 1 is the tile's top-left edge and bit 2 its top-right edge, stepped
+    /// by 2 pixels on flat tiles and 4 pixels on sloped tiles (`0x4c3af9` /
+    /// `0x4c3c72`).
+    fn terrain_grid(&mut self, [x, y]: [i32; 2]) {
+        let cell = Lot::cell(x as usize, y as usize);
+        // Native `0x4c42f0` calls `0x4862ed` and skips tiles with a floor.
+        if self.lot.levels[0].floors[cell] != 0 {
+            return;
+        }
+        let view = self.camera.rotate_tile([x, y]);
+        let mask = if self.tile_buildable(view) {
+            3u8
+        } else {
+            let mut m = 0u8;
+            if view[0] > 0 && self.tile_buildable([view[0] - 1, view[1]]) {
+                m |= 1;
+            }
+            if view[1] > 0 && self.tile_buildable([view[0], view[1] - 1]) {
+                m |= 2;
+            }
+            m
+        };
+        if mask == 0 {
+            return;
+        }
         let rotation = usize::from(self.camera.rotation & 3);
-        let h = self.lot.heights[Lot::cell(x as usize, y as usize)];
+        let h = self.lot.heights[cell];
         let heights: [u8; 4] = std::array::from_fn(|n| h[(n + 4 - rotation) & 3]);
-        // The left corner, at height 0; columns start a row above it.
         let corner = self.camera.project([view[0], view[1] + 1], 1, 0);
         let zoom = self.camera.zoom.level();
-        let width = 16 << zoom;
-        // Skip a tile wholly off the canvas, even on the highest ground.
-        let reach = width + (255 << (zoom + 1));
+        let half_w = 8i32 << zoom;
+        let reach = (half_w * 2) + (255 << (zoom + 1));
         let size = [self.canvas.width, self.canvas.height].map(|n| n as i32);
         if (0..2).any(|i| corner[i] < -reach || corner[i] > size[i].saturating_add(reach)) {
             return;
         }
-        // The whole tile takes one depth, from its top corner.
-        let depth = self.depth.grass(view, i32::from(heights[1]));
         let left = corner[0] + GRASS_COLUMN;
-        for column in grass::columns(left, corner[1] + GRASS_ROW, heights, shades, colors, zoom) {
-            for (row, pixels) in column.rows() {
-                for (i, &p) in pixels.iter().enumerate() {
-                    self.canvas
-                        .plot(column.x + i as i32, row, depth, grass::widen(p));
+        let base_y = corner[1] + GRASS_ROW;
+        let shift = zoom + 1;
+        let y_left = base_y - (i32::from(heights[0]) << shift);
+        let y_top = base_y - ((i32::from(heights[1]) + 2) << shift);
+        let y_right = base_y - (i32::from(heights[2]) << shift);
+        let flat = heights[0] == heights[1] && heights[0] == heights[2] && heights[0] == heights[3];
+        let step = if flat { 2 } else { 4 };
+        if (mask & 1) != 0 {
+            let dy = ((y_top - y_left) << 16) / half_w;
+            let mut y_fp = y_left << 16;
+            let mut px = left;
+            while px < left + half_w {
+                let py = y_fp >> 16;
+                if py < self.clip_bottom {
+                    self.canvas.plot_color(px, py, [0, 0, 0]);
                 }
+                px += step;
+                y_fp += dy * step;
             }
-            let index = ((column.x - left) / 4) as usize;
-            for (bx, foot, height, p) in self.grass.blades(view, &column, index) {
-                let color = grass::widen(p);
-                for row in foot.saturating_sub(height - 1)..=foot {
-                    self.canvas.plot(bx, row, depth, color);
+        }
+        if (mask & 2) != 0 {
+            let dy = ((y_right - y_top) << 16) / half_w;
+            let mut y_fp = y_top << 16;
+            let mut px = left + half_w;
+            while px < left + half_w * 2 {
+                let py = y_fp >> 16;
+                if py < self.clip_bottom {
+                    self.canvas.plot_color(px, py, [0, 0, 0]);
                 }
+                px += step;
+                y_fp += dy * step;
             }
         }
     }
@@ -1052,17 +1219,17 @@ impl<'a> Painter<'a> {
                 let Some(frame) = trim_frame(bits) else {
                     continue;
                 };
-                // Cut trim running along a view diagonal through the
-                // corner's top or bottom (bits 0x10 and 0x40) comes from the
-                // standing walls' set; lone 0x10 sits a little higher when
-                // zoomed in.
-                let diagonal = is_cut && bits & 0x50 != 0;
-                let lift = if is_cut && bits == 0x10 {
-                    [0, 2, 5][zoom.index()]
-                } else {
-                    0
-                };
+                // Cut trim running along a view diagonal through a corner
+                // record's top or bottom (bits 0x10 and 0x40, `0x53c41d`–
+                // `0x53c4fa`) comes from the standing walls' set; lone 0x10
+                // sits a little higher when zoomed in. Non-record wall-run cut
+                // trims always take the depth-sprite cut set (`0x53e2fa`–
+                // `0x53e362`), with runs along view `(1, 1)` (`bits & 0x50`)
+                // lifted by `2 >> (3 - zoom)` (`0x53e300`–`0x53e313`).
+                let diagonal = is_cut && c.record && bits & 0x50 != 0;
+                let lift = trim_lift(is_cut, c.record, bits, zoom);
                 let set = is_cut && !diagonal;
+                let flat_offset = flat_trim_offset(is_cut, c.record, bits, level);
                 // The original subtracts one more pixel from x; its corner
                 // point sits one to the right of ours (fitted to the
                 // screenshot).
@@ -1125,10 +1292,10 @@ impl<'a> Painter<'a> {
                         continue;
                     }
                     // The trim lies on the wall tops, one depth a row
-                    // (fitted to the original's depth buffer, 2026-11-14).
+                    // (0x4c8849, with `flat_offset` for diagonal trims).
                     self.canvas
                         .draw_lit(&image, [x, y], false, light, |_, sy, _| {
-                            Some(depth.flat(view, ground, level, y, sy))
+                            Some(depth.flat(view, ground, level, flat_offset, y, sy))
                         });
                 }
             }
@@ -1284,7 +1451,8 @@ impl<'a> Painter<'a> {
         let zoom = self.camera.zoom.index();
         let mut list = Vec::new();
         for (&id, o) in &self.world.objects {
-            let [x, y, z] = o.position;
+            let preview_at = self.preview_overrides.get(&id).copied();
+            let [x, y, z] = preview_at.map_or(o.position, |(pos, _)| pos);
             if o.person.is_some() || z != level || x < 0 || y < 0 {
                 continue;
             }
@@ -1308,26 +1476,46 @@ impl<'a> Painter<'a> {
             }
             let assets = &mut *self.assets;
             let slot = |guid, i: usize| assets.definition(guid)?.slots.get(i).copied();
-            let Some(([dx, dy], lift)) = held(&self.world.objects, slot, id) else {
-                continue;
+            // The object's base altitude comes from `0x478dfe` (`0x4b9613`),
+            // and its base screen position and depth anchor from `0x4b97ea`
+            // (unheld) or `0x4b9991` (held in a slot, `0x437fdd`, or an
+            // invalid Buy preview drawn via `0x42242f`).
+            let base_altitude = self.lot.altitude_at([x, y]);
+            let (pose, screen, anchor) = if let Some((_, lift)) = preview_at {
+                let pose = [x as f32, y as f32, base_altitude + lift];
+                let (screen, anchor) =
+                    place_moved(&self.depth, self.camera, self.lot, [x, y], level, pose[2]);
+                (pose, screen, anchor)
+            } else {
+                let (is_held, pose) = held(
+                    &self.world.objects,
+                    slot,
+                    id,
+                    [x as f32, y as f32, base_altitude],
+                );
+                let (screen, anchor) = if is_held {
+                    let fine = [
+                        (pose[0] + 0.5).trunc() as i32,
+                        (pose[1] + 0.5).trunc() as i32,
+                    ];
+                    place_moved(&self.depth, self.camera, self.lot, fine, level, pose[2])
+                } else {
+                    place_base(
+                        &self.depth,
+                        self.camera,
+                        self.lot,
+                        [x, y],
+                        level,
+                        base_altitude,
+                    )
+                };
+                (pose, screen, anchor)
             };
-            // Its sprites are placed from the exact position; the tile,
-            // ground and sort anchor from the rounded one.
-            let exact = [x as f32 + dx, y as f32 + dy];
-            let [x, y] = [x + dx.round() as i32, y + dy.round() as i32];
-            let view = self.camera.rotate_fine([x, y]);
-            // The ground under the object: the mean of its tile's corners.
-            let ground = (0..4)
-                .map(|c| self.corner_elevation([tile[0] + (c & 1), tile[1] + (c >> 1)]))
-                .sum::<i32>()
-                / 4;
-            let height = ground as f32 / 16.0 + lift;
-            let anchor = place(&self.depth, self.camera, view, level, height);
-            list.push((anchor, id, ground, exact, lift));
+            list.push((anchor, screen, id, pose, [x, y]));
         }
         // Far objects first, so soft edges blend over what is behind them.
-        list.sort_by_key(|&(a, id, ..)| (std::cmp::Reverse(a.depth), id));
-        for (anchor, id, ground, spot, lift) in list {
+        list.sort_by_key(|&(a, _, id, ..)| (std::cmp::Reverse(a.depth), id));
+        for (base_anchor, base_screen, id, pose, pos) in list {
             let o = &self.world.objects[&id];
             let Some(definition) = self.assets.definition(o.guid) else {
                 self.stats.missing_objects += 1;
@@ -1337,7 +1525,7 @@ impl<'a> Painter<'a> {
             // (0x4aa446). Their scripts mark them when the lot loads; in a
             // house read without running those, the objects that shape a
             // wall still hide.
-            let tile = [o.position[0] >> 4, o.position[1] >> 4];
+            let tile = [pos[0] >> 4, pos[1] >> 4];
             let walled = cutaway::hides_with_walls(&o.data) || definition.shapes_wall();
             let hidden = walled
                 && match cut {
@@ -1362,7 +1550,6 @@ impl<'a> Painter<'a> {
                 continue;
             }
             let facing = o.data.get(1).copied().unwrap_or(0);
-            let base = ground as f32 / 16.0;
             // An object takes the light of the room at its position (the
             // original samples the tile light map there, 0x467482). One
             // that gives light (data word 51), other than a window, shows
@@ -1376,8 +1563,7 @@ impl<'a> Painter<'a> {
                 Light::FULL
             } else {
                 Light::from_byte(
-                    self.lot
-                        .light_at((level - 1) as usize, [o.position[0], o.position[1]]),
+                    self.lot.light_at((level - 1) as usize, pos),
                     self.lot.brightest(),
                 )
             };
@@ -1391,25 +1577,27 @@ impl<'a> Painter<'a> {
                 // Offsets come from the files and may be anything; the
                 // canvas clips whatever this gives.
                 let height = i32::try_from(part.image.height).unwrap_or(i32::MAX);
-                // A held object stands on its holder's slot: the slot's
-                // height adds to the sprite's own.
-                let object = [part.object[0], part.object[1], part.object[2] + lift];
-                let screen = part_screen(self.camera, spot, facing, object, level, ground);
+                // When the sprite has no world offset (`0x437af2`–`0x437b1a`:
+                // `fcomp 0.0; jne`, so both `0.0` and `NaN` stay on the base
+                // path), it uses the object's base screen position and depth
+                // anchor. Otherwise `0x437b7e` adds the rotated offset and
+                // calls `0x4b9991`, projecting onto the sloped terrain at the
+                // moved position and lifting by `(total_z - ground_here) * (2 << zoom)`.
+                let (screen, anchor) = if part.object.iter().all(|&v| v == 0.0 || v.is_nan()) {
+                    (base_screen, base_anchor)
+                } else {
+                    let fine = part_fine([pose[0], pose[1]], facing, part.object);
+                    let total_z = pose[2] + sprite_offset(part.object)[2];
+                    place_moved(&self.depth, self.camera, self.lot, fine, level, total_z)
+                };
                 let at = [
                     screen[0]
                         .saturating_add(part.offset[0])
                         .saturating_add(OBJECT_COLUMN),
                     screen[1]
                         .saturating_add(part.offset[1])
-                        .saturating_sub(height)
-                        .saturating_sub(sprite_rise(object, self.camera.zoom)),
+                        .saturating_sub(height),
                 ];
-                let anchor = if part.object == [0.0; 3] {
-                    anchor
-                } else {
-                    let depth = &self.depth;
-                    part_anchor(depth, self.camera, spot, facing, object, level, base)
-                };
                 let depth = &self.depth;
                 // A frame without a depth channel stands flat at its
                 // anchor's depth. None of the base game's objects has one,
@@ -1442,6 +1630,90 @@ fn rotate_direction(rotation: u8, [x, y]: [i32; 2]) -> [i32; 2] {
     }
 }
 
+/// Maps off-lot Buy Mode held preview parts to their on-lot `"Tile Cursor"`
+/// positions and surface lift (`0x42242f` + `0x46def8`), so blocked placements
+/// still draw the held object on top of the red cursor.
+fn buy_preview_overrides(
+    world: &World,
+    preview: Option<(u16, u16)>,
+) -> BTreeMap<u16, ([i32; 3], f32)> {
+    let mut out = BTreeMap::new();
+    let Some((cursor_lead, held_lead)) = preview else {
+        return out;
+    };
+    let (Some(cursor_obj), Some(held_obj)) = (
+        world.objects.get(&cursor_lead),
+        world.objects.get(&held_lead),
+    ) else {
+        return out;
+    };
+    let collect_group = |lead: u16, is_group: bool| -> Vec<u16> {
+        if !is_group {
+            return vec![lead];
+        }
+        let parent_id = lead as i16;
+        world
+            .objects
+            .iter()
+            .filter_map(|(&id, o)| {
+                let belongs =
+                    id == lead || o.multipart.as_ref().is_some_and(|m| m.parent == parent_id);
+                belongs.then_some(id)
+            })
+            .collect()
+    };
+    let cursor_parts = collect_group(cursor_lead, cursor_obj.multipart.is_some());
+    let held_parts = collect_group(held_lead, held_obj.multipart.is_some());
+    let mut pairs = Vec::with_capacity(held_parts.len());
+    if held_obj.multipart.is_some() && cursor_obj.multipart.is_some() {
+        for &hp in &held_parts {
+            let offset = world.objects[&hp].multipart.as_ref().map(|m| m.offset);
+            let matched = cursor_parts
+                .iter()
+                .copied()
+                .find(|&cp| world.objects[&cp].multipart.as_ref().map(|m| m.offset) == offset);
+            if let Some(cp) = matched {
+                pairs.push((cp, hp));
+            }
+        }
+    } else {
+        for (&cp, &hp) in cursor_parts.iter().zip(held_parts.iter()) {
+            pairs.push((cp, hp));
+        }
+    }
+    for (cp, hp) in pairs {
+        let (Some(c), Some(h)) = (world.objects.get(&cp), world.objects.get(&hp)) else {
+            continue;
+        };
+        if h.position[0] >= 0 && h.position[1] >= 0 {
+            continue;
+        }
+        if c.position[0] < 0 || c.position[1] < 0 {
+            continue;
+        }
+        if c.data.get(HIDDEN).is_some_and(|&w| w != 0) {
+            continue;
+        }
+        out.insert(hp, (c.position, preview_surface_lift(&h.data)));
+    }
+    out
+}
+
+/// Default surface-height lift for a non-floor Buy Mode preview drawn via
+/// `0x42242f` (`0x46def8`: height codes 2 = 2.5, 3 = 4.0, 4 = 4.05, 8 = 4.0).
+fn preview_surface_lift(data: &[i16]) -> f32 {
+    let allowed = data.get(4).copied().unwrap_or(0) as u16;
+    if allowed & 1 != 0 {
+        return 0.0;
+    }
+    for (code, height) in [(2u32, 2.5f32), (3, 4.0), (4, 4.05), (8, 4.0)] {
+        if allowed & (1u16 << (code - 1)) != 0 {
+            return height;
+        }
+    }
+    0.0
+}
+
 /// An object's data word that hides it when not zero (the simulation's
 /// `HIDDEN`).
 const HIDDEN: usize = 34;
@@ -1470,27 +1742,29 @@ const CONTAINER_SLOT: usize = 3;
 const LINK_SLOT: usize = 14;
 const BEFORE: usize = 26;
 
-/// How far a held object stands from its own position: a fine x and y
-/// offset and a lift in height units. An object another holds (a lamp on
-/// an end table, a sink in a counter) stands at its holder's place plus
-/// the slot's offset, turned by the holder's facing, and up by the slot's
-/// height; the original adds these while it draws the holder's contents
-/// (0x437fdd, read by the old prototype in
-/// `legacy/crates/sims-render/src/lib.rs`). The game stores a held object
-/// at its holder's place, so the offset is added to the object's own
-/// position and level, which the caller has checked. Objects a Sim holds
-/// get no offset. None when a holder is hidden. A chain of holders that
-/// loops gives no offset. Each part is clamped to a lot's width, so
-/// nonsense in a save cannot overflow anything. `slot` gives a holder's
-/// slot by its GUID and the slot's index.
+/// Computes a held object's floating-point pose `[x, y, z]` starting from
+/// `base = [x, y, base_altitude]`, and reports whether it is held by a
+/// non-person container (`0x437fdd`).
+///
+/// The original walks top-down from the root holder to each child (`0x437c56`
+/// -> `0x437fdd`): a hidden holder still traverses its slots (`0x4378fa` ->
+/// `0x437c56`), each slot's horizontal offset is turned by the holder's facing
+/// with odd facings clearing both `x` and `y` (`0x438044` -> `0x439109`), and
+/// each step adds `[dx, dy, dz]` sequentially onto the running `f32` pose
+/// (`0x438049`–`0x438090`). Objects a Sim holds get no offset, and a holder
+/// cycle returns `(false, base)`. Each accumulated coordinate stays within a
+/// lot's width of `base` so malformed slot data cannot overflow.
 fn held(
     objects: &BTreeMap<u16, Object>,
     mut slot: impl FnMut(u32, usize) -> Option<[f32; 3]>,
     id: u16,
-) -> Option<([f32; 2], f32)> {
-    let mut cursor = objects.get(&id)?;
+    base: [f32; 3],
+) -> (bool, [f32; 3]) {
+    let Some(mut cursor) = objects.get(&id) else {
+        return (false, base);
+    };
     let mut seen = BTreeSet::from([id]);
-    let mut offset = [0.0f32; 3];
+    let mut steps = Vec::new();
     loop {
         let container = cursor.data.get(CONTAINER).copied().unwrap_or(0);
         let Some((holder_id, holder)) = u16::try_from(container)
@@ -1502,23 +1776,41 @@ fn held(
             break;
         };
         if !seen.insert(holder_id) {
-            return Some(([0.0; 2], 0.0));
-        }
-        if holder.data.get(HIDDEN).is_some_and(|&w| w != 0) {
-            return None;
+            return (false, base);
         }
         let at = usize::try_from(cursor.data.get(CONTAINER_SLOT).copied().unwrap_or(-1))
             .ok()
             .and_then(|i| slot(holder.guid, i))
             .unwrap_or_default();
         let [mut x, mut y, z] = sprite_offset(at);
-        for _ in 0..(i32::from(holder.data.get(1).copied().unwrap_or(0)) / 2).rem_euclid(4) {
-            (x, y) = (-y, x);
+        let facing = holder.data.get(FACING).copied().unwrap_or(0);
+        if facing & 1 != 0 {
+            [x, y] = [0.0; 2];
+        } else {
+            for _ in 0..(i32::from(facing) / 2).rem_euclid(4) {
+                (x, y) = (-y, x);
+            }
         }
-        offset = sprite_offset([offset[0] + x, offset[1] + y, offset[2] + z]);
+        steps.push([x, y, z]);
         cursor = holder;
     }
-    Some(([offset[0], offset[1]], offset[2]))
+    if steps.is_empty() {
+        return (false, base);
+    }
+    let limit = (camera::ARRAY_SIZE * 16) as f32;
+    let mut pose = base;
+    for [dx, dy, dz] in steps.into_iter().rev() {
+        let delta = [dx, dy, dz];
+        for i in 0..3 {
+            let next = pose[i] + delta[i];
+            pose[i] = if next.is_finite() {
+                next.clamp(base[i] - limit, base[i] + limit)
+            } else {
+                base[i]
+            };
+        }
+    }
+    (true, pose)
 }
 
 /// A draw group sprite's world offset (`object`), made safe: x and y in
@@ -1541,12 +1833,110 @@ fn sprite_offset(object: [f32; 3]) -> [f32; 3] {
 /// preview (0x438ae4 to 0x438b58, read by the old prototype in
 /// `legacy/crates/sims-render/src/object_preview/software.rs`); that the
 /// lot view places sprites the same way is **unverified**.
+#[cfg(test)]
 fn sprite_rise(object: [f32; 3], zoom: Zoom) -> i32 {
     let z = sprite_offset(object)[2];
     if z == 0.0 {
         return 0;
     }
     (z * (2 << zoom.level()) as f32 + 0.5).trunc() as i32
+}
+
+/// Draws one grass tile (`0x49dacd`, `0x49da21`, `0x49d8fb`), clipping its
+/// columns and blades vertically to `[0, clip_bottom)` (the active house
+/// viewport bottom `word ptr [0x6f0c14]`).
+fn draw_grass_tile(
+    lot: &Lot,
+    grass: &Grass,
+    depth_table: &Depth,
+    camera: &Camera,
+    [x, y]: [i32; 2],
+    clip_bottom: i32,
+    canvas: &mut Canvas,
+) {
+    let view = camera.rotate_tile([x, y]);
+    let Some((shades, colors)) = grass.tile(view) else {
+        return;
+    };
+    let rotation = usize::from(camera.rotation & 3);
+    let h = lot.heights[Lot::cell(x as usize, y as usize)];
+    let heights: [u8; 4] = std::array::from_fn(|n| h[(n + 4 - rotation) & 3]);
+    // The left corner, at height 0; columns start a row above it.
+    let corner = camera.project([view[0], view[1] + 1], 1, 0);
+    let zoom = camera.zoom.level();
+    let width = 16 << zoom;
+    // Skip a tile wholly off the canvas, even on the highest ground.
+    let reach = width + (255 << (zoom + 1));
+    let size = [canvas.width, canvas.height].map(|n| n as i32);
+    if (0..2).any(|i| corner[i] < -reach || corner[i] > size[i].saturating_add(reach)) {
+        return;
+    }
+    // The whole tile takes one depth, from its top corner.
+    let depth = depth_table.grass(view, i32::from(heights[1]));
+    let left = corner[0] + GRASS_COLUMN;
+    for column in grass::columns(left, corner[1] + GRASS_ROW, heights, shades, colors, zoom) {
+        for (row, pixels) in column.clipped(0, clip_bottom).rows() {
+            for (i, &p) in pixels.iter().enumerate() {
+                canvas.plot(column.x + i as i32, row, depth, grass::widen(p));
+            }
+        }
+        let index = ((column.x - left) / 4) as usize;
+        for (bx, foot, height, p) in grass.blades(view, &column, index) {
+            let color = grass::widen(p);
+            let top = foot.saturating_sub(height - 1).max(0);
+            let bottom = foot.min(clip_bottom - 1);
+            for row in top..=bottom {
+                canvas.plot(bx, row, depth, color);
+            }
+        }
+    }
+}
+
+/// Extra upward screen lift in pixels for diagonal cut wall trims:
+/// - Corner records with lone bit `0x10` (`0x53c47a`–`0x53c496`): `[0, 2, 5]`
+///   at far, medium, and near zoom.
+/// - Non-record wall-run cut trims along view `(1, 1)` (`bits & 0x50 != 0`,
+///   `0x53e300`–`0x53e313`): `2 >> (3 - zoom)` = `[0, 1, 2]` before `0x4c8b1f`.
+/// - All other trims: `0`.
+fn trim_lift(is_cut: bool, is_record: bool, bits: u8, zoom: Zoom) -> i32 {
+    if !is_cut {
+        return 0;
+    }
+    if is_record {
+        if bits == 0x10 {
+            [0, 2, 5][zoom.index()]
+        } else {
+            0
+        }
+    } else if bits & 0x50 != 0 {
+        [0, 1, 2][zoom.index()]
+    } else {
+        0
+    }
+}
+
+/// Depth offset passed to `0x4c8849` for flat-depth wall trims:
+/// - Cut diagonal corner trims (`bits & 0x50 != 0`, `0x53c478`–`0x53c4af`):
+///   `900` (`0x384`) for `0x10`, `770` (`0x302`) for `0x40` on level 1, and
+///   `700` (`0x2bc`) for `0x40` on level 2 (`0x40` wins when both bits set).
+/// - Standing corner trims (`0x53c65f`–`0x53c675`): `-100` (`-0x64`) when
+///   `bits & 0x40 != 0` on level 2.
+/// - All other flat trims (including wall-run trims at `0x540473`): `0`.
+fn flat_trim_offset(is_cut: bool, is_record: bool, bits: u8, level: i32) -> i32 {
+    if !is_record {
+        return 0;
+    }
+    if is_cut && bits & 0x50 != 0 {
+        if bits & 0x40 != 0 {
+            if level == 2 { 700 } else { 770 }
+        } else {
+            900
+        }
+    } else if !is_cut && bits & 0x40 != 0 && level == 2 {
+        -100
+    } else {
+        0
+    }
 }
 
 /// The lights of a level's trims, in room 0's light (the outdoors') as a
@@ -1615,13 +2005,108 @@ fn part_fine(position: [f32; 2], facing: i16, object: [f32; 3]) -> [i32; 2] {
     ]
 }
 
+/// Projects rotated fine position `view_fine` on `level` using `0x4a9dc7`
+/// (and `0x4a9c50`). When `fixed_steps` is `Some(s)`, all four corners of
+/// the view tile take height `s` (`0x4a9e9b`, used by `0x4b97ea`). When
+/// `None`, the view tile's rotated terrain heights are interpolated across
+/// its two triangles (`0x4a9e22`–`0x4a9f90`, used by `0x4b9991`), falling
+/// back to `[0; 4]` on the lot's outermost ring or outside it.
+fn project_fine_terrain(
+    camera: &Camera,
+    lot: &Lot,
+    view_fine: [i32; 2],
+    level: i32,
+    fixed_steps: Option<u8>,
+) -> [i32; 2] {
+    let zoom = camera.zoom.level();
+    let [vx, vy] = view_fine;
+    let [bx, by] = [vx >> 4, vy >> 4];
+    let [sx, sy] = [vx & 15, vy & 15];
+    let heights = match fixed_steps {
+        Some(steps) => [steps; 4],
+        None => {
+            let tile = camera.unrotate_tile([bx, by]);
+            let inner = 1..(lot.size as i32 - 1);
+            if inner.contains(&tile[0]) && inner.contains(&tile[1]) {
+                let rotation = usize::from(camera.rotation & 3);
+                let h = lot.heights[Lot::cell(tile[0] as usize, tile[1] as usize)];
+                std::array::from_fn(|n| h[(n + 4 - rotation) & 3])
+            } else {
+                [0; 4]
+            }
+        }
+    };
+    let base = camera.project([bx, by], level, i32::from(heights[1]));
+    let shift = zoom + 1;
+    let half_w = 8i32 << zoom;
+    let h = heights.map(i32::from);
+    let (dx, dy) = if sx == sy {
+        let dy = (((h[1] - h[3] + 4) << shift) * sx) / 16;
+        (0, dy)
+    } else if sx > sy {
+        let y_edge = (((h[1] - h[2] + 2) << shift) * sx) / 16;
+        let y_diag = (((h[1] - h[3] + 4) << shift) * sx) / 16;
+        let dy = y_edge + ((y_diag - y_edge) * sy) / sx;
+        let x_edge = (half_w * sx) / 16;
+        let dx = x_edge - (x_edge * sy) / sx;
+        (dx, dy)
+    } else {
+        let y_edge = (((h[1] - h[0] + 2) << shift) * sy) / 16;
+        let y_diag = (((h[1] - h[3] + 4) << shift) * sy) / 16;
+        let dy = y_edge + ((y_diag - y_edge) * sx) / sy;
+        let x_edge = (half_w * sy) / -16;
+        let dx = x_edge - (x_edge * sx) / sy;
+        (dx, dy)
+    };
+    [base[0].saturating_add(dx), base[1].saturating_add(dy)]
+}
+
+/// Base screen position and depth anchor for an unheld object at unrotated
+/// fine position `fine` on `level` with terrain `altitude` (`0x4b9613` ->
+/// `0x4b97ea`): projects at the rounded whole terrain step `steps`, then
+/// anchors depth from that screen row and exact `altitude`.
+fn place_base(
+    depth: &Depth,
+    camera: &Camera,
+    lot: &Lot,
+    fine: [i32; 2],
+    level: i32,
+    altitude: f32,
+) -> ([i32; 2], Anchor) {
+    let steps = (altitude + 0.5).trunc().clamp(0.0, 255.0) as u8;
+    let screen = project_fine_terrain(camera, lot, camera.rotate_fine(fine), level, Some(steps));
+    let anchor = depth.anchor(screen[1], altitude, level);
+    (screen, anchor)
+}
+
+/// Screen position and depth anchor for a held object (`0x437fdd`) or an
+/// offset draw-group sprite (`0x437b7e`) via `0x4b9991`: projects onto the
+/// sloped terrain at `fine` (`0x4a9dc7` with no altitude override), lifts by
+/// `((total_z - ground_here) * (2 << zoom) + 0.5).trunc()`, and anchors
+/// depth from the resulting screen row and `total_z`.
+fn place_moved(
+    depth: &Depth,
+    camera: &Camera,
+    lot: &Lot,
+    fine: [i32; 2],
+    level: i32,
+    total_z: f32,
+) -> ([i32; 2], Anchor) {
+    let mut screen = project_fine_terrain(camera, lot, camera.rotate_fine(fine), level, None);
+    let ground_here = lot.altitude_at(fine);
+    let rise = ((total_z - ground_here) * (2 << camera.zoom.level()) as f32 + 0.5).trunc() as i32;
+    screen[1] = screen[1].saturating_sub(rise);
+    let anchor = depth.anchor(screen[1], total_z, level);
+    (screen, anchor)
+}
+
 /// Where on the screen a draw group sprite that sits `object` away from
 /// an object at `position` facing `facing` is placed, before its pixel
 /// offset and rise: the camera's projection of [`part_fine`], on `level`
 /// at `ground`. The sprite's x and y offset move it, as they move the
 /// object's position (0x437b7e: the original projects the moved
-/// position, 0x4b9991). Its depth ([`part_anchor`]) is taken at the same
-/// fine position.
+/// position, 0x4b9991).
+#[cfg(test)]
 fn part_screen(
     camera: &Camera,
     position: [f32; 2],
@@ -1632,25 +2117,6 @@ fn part_screen(
 ) -> [i32; 2] {
     let fine = part_fine(position, facing, object);
     camera.project_fine(camera.rotate_fine(fine), level, ground)
-}
-
-/// The depth anchor of a draw group sprite that sits `object` away from
-/// an object at fine position `position` facing `facing`, on `level`, on
-/// ground `base` terrain steps up: at [`part_fine`], raised by the
-/// offset's z, in height units of 16 near-zoom pixels (2 << 3, as
-/// [`sprite_rise`]), the same as a terrain step.
-fn part_anchor(
-    depth: &Depth,
-    camera: &Camera,
-    position: [f32; 2],
-    facing: i16,
-    object: [f32; 3],
-    level: i32,
-    base: f32,
-) -> Anchor {
-    let z = sprite_offset(object)[2];
-    let fine = part_fine(position, facing, object);
-    place(depth, camera, camera.rotate_fine(fine), level, base + z)
 }
 
 /// The draw group view (one bit of 1, 4, 16 and 64) for an object facing
@@ -2071,7 +2537,13 @@ mod tests {
     #[test]
     fn held_objects_stand_on_their_holders_slot() {
         const TABLE: u32 = 7;
-        let slot = |guid: u32, i: usize| (guid == TABLE && i == 1).then_some([4.0, 0.0, 4.0]);
+        const TRAY: u32 = 8;
+        let slot = |guid: u32, i: usize| match (guid, i) {
+            (TABLE, 1) => Some([4.0, 0.0, 4.0]),
+            (TABLE, 2) => Some([0.1, 0.0, 0.0]),
+            (TRAY, 0) => Some([-9.6, 0.0, 0.0]),
+            _ => None,
+        };
         let mut objects = BTreeMap::new();
         // A table facing 2 (one quarter turn) holds a lamp in its slot 1.
         objects.insert(1, object(1, TABLE, [100, 200, 1], &[(1, 2)]));
@@ -2079,26 +2551,51 @@ mod tests {
             2,
             object(2, 9, [100, 200, 1], &[(CONTAINER, 1), (CONTAINER_SLOT, 1)]),
         );
+        let base = [100.0, 200.0, 0.0];
         // The slot's x turns with the table into y; its height lifts.
-        assert_eq!(held(&objects, slot, 2), Some(([0.0, 4.0], 4.0)));
-        assert_eq!(held(&objects, slot, 1), Some(([0.0; 2], 0.0)));
+        assert_eq!(held(&objects, slot, 2, base), (true, [100.0, 204.0, 4.0]));
+        assert_eq!(held(&objects, slot, 1, base), (false, base));
+        // An odd holder facing clears both horizontal offsets (0x438044 -> 0x439109).
+        objects.get_mut(&1).unwrap().data[FACING] = 3;
+        assert_eq!(held(&objects, slot, 2, base), (true, [100.0, 200.0, 4.0]));
+        objects.get_mut(&1).unwrap().data[FACING] = 2;
         // A holder without that slot puts it at its own place.
         objects.get_mut(&2).unwrap().data[CONTAINER_SLOT] = 5;
-        assert_eq!(held(&objects, slot, 2), Some(([0.0; 2], 0.0)));
+        assert_eq!(held(&objects, slot, 2, base), (true, base));
         objects.get_mut(&2).unwrap().data[CONTAINER_SLOT] = 1;
-        // A hidden holder hides what it holds.
+        // A hidden holder still traverses its slots (0x4378fa -> 0x437c56).
         objects.get_mut(&1).unwrap().data[HIDDEN] = 1;
-        assert_eq!(held(&objects, slot, 2), None);
+        assert_eq!(held(&objects, slot, 2, base), (true, [100.0, 204.0, 4.0]));
         objects.get_mut(&1).unwrap().data[HIDDEN] = 0;
+        // Multi-level slots accumulate sequentially in root-to-child f32 order
+        // (0x438049–0x438090): ((32.0 + 0.1) + -9.6) + 0.5 truncates to 22,
+        // whereas summing offsets first gives 32.0 + -9.5 + 0.5 = 23.
+        objects.insert(4, object(4, TABLE, [32, 0, 1], &[(FACING, 0)]));
+        objects.insert(
+            5,
+            object(
+                5,
+                TRAY,
+                [32, 0, 1],
+                &[(FACING, 0), (CONTAINER, 4), (CONTAINER_SLOT, 2)],
+            ),
+        );
+        objects.insert(
+            6,
+            object(6, 9, [32, 0, 1], &[(CONTAINER, 5), (CONTAINER_SLOT, 0)]),
+        );
+        let (is_held, pose) = held(&objects, slot, 6, [32.0, 0.0, 0.0]);
+        assert!(is_held);
+        assert_eq!((pose[0] + 0.5).trunc() as i32, 22);
         // Holders that hold each other, or an object that holds itself,
         // give no offset, however many other objects there are.
         objects.get_mut(&1).unwrap().data[CONTAINER] = 2;
-        assert_eq!(held(&objects, slot, 2), Some(([0.0; 2], 0.0)));
+        assert_eq!(held(&objects, slot, 2, base), (false, base));
         objects.insert(
             3,
             object(3, TABLE, [0, 0, 1], &[(CONTAINER, 3), (CONTAINER_SLOT, 1)]),
         );
-        assert_eq!(held(&objects, slot, 3), Some(([0.0; 2], 0.0)));
+        assert_eq!(held(&objects, slot, 3, [0.0; 3]), (false, [0.0; 3]));
     }
 
     #[test]
@@ -2194,7 +2691,8 @@ mod tests {
             );
         }
         let limit = camera::ARRAY_SIZE * 16;
-        let ([x, y], lift) = held(&objects, huge, 199).unwrap();
+        let (is_held, [x, y, lift]) = held(&objects, huge, 199, [0.0; 3]);
+        assert!(is_held);
         assert!(x.abs() <= limit as f32 && y.abs() <= limit as f32);
         assert!(lift.abs() <= limit as f32);
     }
@@ -2211,15 +2709,45 @@ mod tests {
         assert_eq!(slot_height(5, 4.0), 4.0);
     }
 
+    fn flat_lot(height: u8) -> Lot {
+        let full = lot::FULL * lot::FULL;
+        let empty = || lot::Level {
+            floors: vec![0; full],
+            walls: vec![WallCell::default(); full],
+            rooms: None,
+        };
+        Lot {
+            size: 52,
+            heights: vec![[height; 4]; full],
+            grass: vec![0; full],
+            levels: [empty(), empty()],
+            outdoor_rooms: BTreeSet::new(),
+            room_lights: BTreeMap::new(),
+            room_fractions: BTreeMap::new(),
+            outdoor_light: None,
+            time_of_day: 0,
+            halves: BTreeMap::new(),
+            lamps: [
+                vec![Default::default(); full],
+                vec![Default::default(); full],
+            ],
+            floor_rotation: 0,
+        }
+    }
+
     #[test]
     fn sprite_world_offsets_move_depth_with_the_object_and_camera() {
         let position = [100.0, 200.0];
         let base = 2.0;
+        let lot = flat_lot(2);
         let d = Depth::new(&camera(0));
         let at =
             |c: u8, fine, height| place(&d, &camera(c), camera(c).rotate_fine(fine), 1, height);
-        let part =
-            |c: u8, facing, object| part_anchor(&d, &camera(c), position, facing, object, 1, base);
+        let part = |c: u8, facing, object: [f32; 3]| {
+            let fine = part_fine(position, facing, object);
+            let total_z = base + sprite_offset(object)[2];
+            place_moved(&d, &camera(c), &lot, fine, 1, total_z).1
+        };
         assert_eq!(part(0, 0, [0.0; 3]), at(0, [100, 200], base));
         // One height unit up is one terrain step, and nearer.
         assert_eq!(part(0, 0, [0.0, 0.0, 1.0]), at(0, [100, 200], base + 1.0));
@@ -2235,9 +2763,144 @@ mod tests {
         // Nonsense in a file stays bounded.
         for bad in [f32::NAN, f32::INFINITY, f32::MAX, f32::MIN] {
             let _ = part_fine(position, i16::MIN, [bad, bad, bad]);
-            let _ = part_anchor(&d, &camera(3), position, i16::MIN, [bad, bad, bad], 1, base);
+            let _ = part(3, i16::MIN, [bad, bad, bad]);
             let _ = sprite_rise([bad, bad, bad], Zoom::Near);
         }
+    }
+
+    #[test]
+    fn sloped_objects_round_base_altitude_and_interpolate_moved_sprites() {
+        let mut lot = flat_lot(0);
+        // Tile (10, 12) has corners (0,1)=0, (0,0)=0, (1,0)=0, (1,1)=1.
+        // At its center (8, 8), 0x478dfe returns 0.5 (halfway between (0,0)
+        // and (1,1)), whereas the four-corner mean is 0.25.
+        lot.heights[Lot::cell(10, 12)] = [0, 0, 0, 1];
+        let center = [10 * 16 + 8, 12 * 16 + 8];
+        assert_eq!(lot.altitude_at(center), 0.5);
+        // Off-diagonal point checks (y & 15, x & 15) argument order:
+        // tile (10, 13) has (0,1)=4, (0,0)=0, (1,0)=0, (1,1)=0.
+        lot.heights[Lot::cell(10, 13)] = [4, 0, 0, 0];
+        assert_eq!(lot.altitude_at([10 * 16 + 2, 13 * 16 + 8]), 1.5);
+        assert_eq!(lot.altitude_at([10 * 16 + 8, 13 * 16 + 2]), 0.0);
+        // Beyond active lot size (e.g. House 09 size 43, tile (1, 43)),
+        // 0x478e2a–0x478e4e still samples the raw 64×64 altitude array, while
+        // coordinates outside 0..64 return 0.0.
+        lot.size = 43;
+        lot.heights[Lot::cell(1, 43)] = [0, 0, 0, 2];
+        assert_eq!(lot.altitude_at([16 + 8, 43 * 16 + 8]), 1.0);
+        assert_eq!(lot.altitude_at([-1, 0]), 0.0);
+        assert_eq!(lot.altitude_at([lot::FULL as i32 * 16, 0]), 0.0);
+        lot.size = 52;
+
+        // At far zoom, 0x4b97ea rounds altitude 0.5 up to 1 whole step,
+        // lifting screen y by 1 << 2 = 4 px relative to flat ground.
+        let cam = Camera {
+            zoom: Zoom::Far,
+            ..camera(0)
+        };
+        let depth = Depth::new(&cam);
+        let flat = flat_lot(0);
+        let (sloped_screen, _) = place_base(&depth, &cam, &lot, center, 1, 0.5);
+        let (flat_screen, _) = place_base(&depth, &cam, &flat, center, 1, 0.0);
+        assert_eq!(sloped_screen[0], flat_screen[0]);
+        assert_eq!(flat_screen[1] - sloped_screen[1], 4);
+
+        // Moved sprite (0x4b9991 + 0x4a9dc7) on the sloped tile's center
+        // lifts by 0x4a9dc7's integer triangle slope (2 px at far zoom for
+        // h1=0, h3=1 at sx=sy=8: ((0 - 1 + 4) << 2) * 8 / 16 = 6 vs 8 flat).
+        let (moved_screen, _) = place_moved(&depth, &cam, &lot, center, 1, 0.5);
+        assert_eq!(moved_screen[0], flat_screen[0]);
+        assert_eq!(flat_screen[1] - moved_screen[1], 2);
+        // Adding 1.0 of lift above ground_here raises screen y by 4 more px.
+        let (lifted_screen, _) = place_moved(&depth, &cam, &lot, center, 1, 1.5);
+        assert_eq!(moved_screen[1] - lifted_screen[1], 4);
+    }
+
+    #[test]
+    fn flat_trim_depth_offsets_match_binary_table() {
+        assert_eq!(flat_trim_offset(true, true, 0x10, 1), 900);
+        assert_eq!(flat_trim_offset(true, true, 0x10, 2), 900);
+        assert_eq!(flat_trim_offset(true, true, 0x40, 1), 770);
+        assert_eq!(flat_trim_offset(true, true, 0x40, 2), 700);
+        // 0x40 overrides 0x10 when both diagonal bits are set (0x53c497).
+        assert_eq!(flat_trim_offset(true, true, 0x50, 1), 770);
+        assert_eq!(flat_trim_offset(true, true, 0x50, 2), 700);
+        // Standing corner trims only apply -100 for bit 0x40 on level 2.
+        assert_eq!(flat_trim_offset(false, true, 0x40, 2), -100);
+        assert_eq!(flat_trim_offset(false, true, 0x40, 1), 0);
+        assert_eq!(flat_trim_offset(false, true, 0x10, 2), 0);
+        // Non-record wall-run trims (standing or cut diagonal) always pass 0.
+        assert_eq!(flat_trim_offset(false, false, 0x40, 2), 0);
+        assert_eq!(flat_trim_offset(true, false, 0x50, 1), 0);
+        assert_eq!(flat_trim_offset(true, false, 0x50, 2), 0);
+        assert_eq!(flat_trim_offset(true, false, 0x10, 1), 0);
+    }
+
+    #[test]
+    fn diagonal_cut_trim_lift_matches_corner_and_run_tables() {
+        // Corner record with lone 0x10 lifts [0, 2, 5] (0x53c47a–0x53c496).
+        assert_eq!(Zoom::ALL.map(|z| trim_lift(true, true, 0x10, z)), [0, 2, 5]);
+        assert_eq!(Zoom::ALL.map(|z| trim_lift(true, true, 0x50, z)), [0, 0, 0]);
+        // Non-record cut run along view (1, 1) (bits 0x50 / 0x10 / 0x40) lifts
+        // 2 >> (3 - zoom) = [0, 1, 2] before 0x4c8b1f (0x53e300–0x53e313).
+        for bits in [0x50, 0x10, 0x40] {
+            assert_eq!(
+                Zoom::ALL.map(|z| trim_lift(true, false, bits, z)),
+                [0, 1, 2]
+            );
+            assert_eq!(
+                Zoom::ALL.map(|z| trim_lift(false, false, bits, z)),
+                [0, 0, 0]
+            );
+        }
+        // Runs along view (1, -1) (0xa0) or straight edges (0x05) get no lift.
+        assert_eq!(
+            Zoom::ALL.map(|z| trim_lift(true, false, 0xa0, z)),
+            [0, 0, 0]
+        );
+        assert_eq!(
+            Zoom::ALL.map(|z| trim_lift(true, false, 0x05, z)),
+            [0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn grass_clips_to_active_house_viewport_height() {
+        let lot = flat_lot(0);
+        // Place a flat near-zoom tile (10, 10) so its columns cross row 500
+        // with an odd unclipped end (row 505): clipping to an 800×500 house
+        // viewport flips dither parity above row 500 and draws no grass or
+        // blades in rows >= 500.
+        let cam = Camera {
+            zoom: Zoom::Near,
+            rotation: 0,
+            level: 1,
+            origin: [400, -199],
+            walls: Walls::Up,
+            focus: crate::cutaway::Focus::default(),
+        };
+        let grass = Grass::new(&lot, &cam);
+        let depth = Depth::new(&cam);
+        let bg = background(0, 0);
+        let mut full = Canvas::new(800, 600, bg);
+        draw_grass_tile(&lot, &grass, &depth, &cam, [10, 10], 600, &mut full);
+        let mut strip = Canvas::new(800, 600, bg);
+        draw_grass_tile(&lot, &grass, &depth, &cam, [10, 10], 500, &mut strip);
+        // Columns crossing row 500 clip to 500 (even) instead of 505 (odd),
+        // changing pixels just above row 500, and draw no grass at row >= 500.
+        let diff_above = (470..500)
+            .flat_map(|y| (336..464).map(move |x| (x, y)))
+            .any(|(x, y)| full.color[y * 800 + x] != strip.color[y * 800 + x]);
+        assert!(
+            diff_above,
+            "viewport clip at 500 should change grass dither parity above 500"
+        );
+        assert!(
+            (500..600)
+                .flat_map(|y| (0..800).map(move |x| (x, y)))
+                .all(|(x, y)| strip.color[y * 800 + x] == bg),
+            "viewport clip at 500 should draw no grass or blades in rows 500..600"
+        );
     }
 
     /// A dining chair scooted in to the table draws its graphic 5, whose

@@ -40,6 +40,7 @@ use crate::{Error, Result};
 use sims_content::{Catalog, Index};
 use sims_formats::bitmap::{self, Image};
 use sims_formats::iff::Iff;
+use sims_formats::sprite::{DrawGroup, LegacySpriteSet, SpriteSet};
 use std::collections::BTreeMap;
 
 /// `kCatalogTemplate` (`UIGraphics/Res_CPanel.h`).
@@ -55,14 +56,18 @@ pub const SIZE: u32 = 45;
 pub const THUMBNAIL: [u32; 2] = [74, 37];
 
 /// Definition words, by byte offset into an `OBJD`.
+const BASE_GRAPHIC: usize = 0x06;
 const GRAPHICS: usize = 0x08;
 const TABLE: usize = 0x0e;
 const KIND: usize = 0x12;
 const MASTER: usize = 0x14;
 const SUB_INDEX: usize = 0x16;
 const CATALOG_STRINGS: usize = 0x52;
+const DEFAULT_DIRECTION: usize = 0x7a;
 /// A person's type.
 const PERSON: i16 = 2;
+/// Maximum isometric balloon picture side to guard against malformed sprites.
+const MAX_PICTURE_SIDE: i64 = 2048;
 
 /// An object type's catalog item, as far as the queue uses it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,10 +76,14 @@ pub struct Item {
     pub thumbnail: Option<Image>,
 }
 
-/// The catalog items of object types, read once each, by GUID.
+/// The catalog items and rendered isometric help-balloon pictures of object
+/// types, read once each, by GUID.
 #[derive(Debug, Clone, Default)]
 pub struct Thumbnails {
     items: BTreeMap<u32, Option<Item>>,
+    /// Isometric sprites for help-balloon object slots (`0x4e5306 -> 0x4384c8`),
+    /// indexed `[zoom 1 (far), zoom 2 (medium), zoom 3 (near)]`.
+    balloon_pictures: BTreeMap<u32, Option<[Option<Image>; 3]>>,
 }
 
 impl Thumbnails {
@@ -100,14 +109,72 @@ impl Thumbnails {
         }
     }
 
+    /// Renders and caches the isometric balloon pictures (zooms 1..=3) for
+    /// `guid` (`0x4e5306 -> 0x4384c8`), if not already cached.
+    pub fn read_balloon(&mut self, index: &Index, catalog: &Catalog, guid: u32) -> Result<()> {
+        if self.balloon_pictures.contains_key(&guid) {
+            return Ok(());
+        }
+        match balloon_object_pictures(index, catalog, guid) {
+            Ok(pictures) => {
+                self.balloon_pictures.insert(guid, pictures);
+                Ok(())
+            }
+            Err(e) => {
+                self.balloon_pictures.insert(guid, None);
+                Err(e)
+            }
+        }
+    }
+
     /// Sets `guid`'s item, as tests and hosts with their own art do.
     pub fn insert(&mut self, guid: u32, item: Option<Item>) {
         self.items.insert(guid, item);
     }
 
+    /// Sets `guid`'s rendered isometric balloon pictures `[zoom 1, zoom 2, zoom 3]`,
+    /// for synthetic tests.
+    pub fn insert_balloon(&mut self, guid: u32, pictures: Option<[Option<Image>; 3]>) {
+        self.balloon_pictures.insert(guid, pictures);
+    }
+
     /// `guid`'s item, if it was read and there is one.
     pub fn item(&self, guid: u32) -> Option<&Item> {
         self.items.get(&guid)?.as_ref()
+    }
+
+    /// The isometric picture of `guid` chosen for a balloon slot of size
+    /// `(slot_width, slot_height)` (`0x4384c8`):
+    /// - when `zoom` is `Some(z)` (`1..=3`), uses zoom `z` directly
+    ///   (`0x4385cf..0x438659`, e.g. Hunger right-slot override `2` from
+    ///   `0x6f3994`/`0x6f3914`);
+    /// - otherwise tries zooms `3`, `2`, `1` in order and takes the first
+    ///   whose horizontal and vertical half-margins are each at least `3`
+    ///   pixels, falling back to zoom `1` (`0x438660..0x438702`).
+    pub fn balloon_picture(
+        &self,
+        guid: u32,
+        zoom: Option<u32>,
+        slot_width: i32,
+        slot_height: i32,
+    ) -> Option<&Image> {
+        let zooms = self.balloon_pictures.get(&guid)?.as_ref()?;
+        if let Some(z) = zoom {
+            return (1..=3)
+                .contains(&z)
+                .then(|| zooms[(z - 1) as usize].as_ref())
+                .flatten();
+        }
+        for z in [3usize, 2, 1] {
+            if let Some(image) = &zooms[z - 1] {
+                let w = i32::try_from(image.width).unwrap_or(0);
+                let h = i32::try_from(image.height).unwrap_or(0);
+                if (slot_width - w) / 2 >= 3 && (slot_height - h) / 2 >= 3 {
+                    return Some(image);
+                }
+            }
+        }
+        zooms[0].as_ref()
     }
 
     /// The 45 by 45 picture of `guid`'s objects (0x4ccaa0), or None when
@@ -267,6 +334,228 @@ fn word(definition: &[u8], at: usize) -> Option<i16> {
     ))
 }
 
+/// Renders the isometric balloon pictures for `guid` at zooms 1, 2, and 3
+/// (`0x4e5306 -> 0x4384c8 -> 0x43878f`, multi-tile `0x438bbc`).
+fn balloon_object_pictures(
+    index: &Index,
+    catalog: &Catalog,
+    guid: u32,
+) -> Result<Option<[Option<Image>; 3]>> {
+    let Some(object) = catalog.object(guid) else {
+        return Ok(None);
+    };
+    let Some(resource) = index.resources.get(object.resource) else {
+        return Ok(None);
+    };
+    let bytes = resource.read().map_err(Error::Content)?;
+    let iff = Iff::parse(bytes).map_err(Error::Format)?;
+    let Some(definition) = iff.get(b"OBJD", object.chunk).map(|c| iff.data(c)) else {
+        return Ok(None);
+    };
+    let zooms = [
+        render_object_zoom(&iff, definition, 1),
+        render_object_zoom(&iff, definition, 2),
+        render_object_zoom(&iff, definition, 3),
+    ];
+    if zooms.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    Ok(Some(zooms))
+}
+
+/// Renders `definition` (single-tile or multi-tile lead) at `zoom` (`1..=3`),
+/// matching `0x4385a2..0x438cc2`:
+/// - rejects non-lead sub-tiles (`master != 0 && sub_index != -1`);
+/// - chooses direction `(word(0x7a) + 4) mod 8` (`0x4385b7`);
+/// - enumerates multi-tile pieces (`0x438bbc`, `0x43183c`), rotates `(tx, ty)`,
+///   projects `tile_x = (rx - ry) * (8 << zoom)`, `tile_y = (rx + ry) * (4 << zoom)`,
+///   and sorts by `(tile_y, tile_x)` ascending (`0x438cc3`);
+/// - looks up each tile's base `DGRP` (`0x407847` bitmask `1 << dir` and `zoom`),
+///   decodes `SPR2` (falling back to `SPR#`), places each sprite at
+///   `(tile_x + sprite.x, tile_y + sprite.y - frame.height - rise)` (`0x438ae4`),
+///   and composites with straight alpha and the original's isometric depth space.
+fn render_object_zoom(iff: &Iff, definition: &[u8], zoom: u32) -> Option<Image> {
+    let master = word(definition, MASTER).unwrap_or(0);
+    let sub_index = word(definition, SUB_INDEX).unwrap_or(0);
+    if master != 0 && sub_index != -1 {
+        return None;
+    }
+    let dir = (i32::from(word(definition, DEFAULT_DIRECTION).unwrap_or(0)) + 4).rem_euclid(8);
+    let dir_bit = 1u32 << (dir as u32);
+    let mut tiles: Vec<(&[u8], i32, i32)> = if master == 0 {
+        vec![(definition, 0, 0)]
+    } else {
+        let mut collected = Vec::new();
+        for chunk in iff.all(b"OBJD") {
+            let d = iff.data(chunk);
+            if word(d, MASTER) != Some(master) {
+                continue;
+            }
+            let sub = word(d, SUB_INDEX).unwrap_or(-1);
+            if sub == -1 {
+                continue;
+            }
+            // 0x43183c: tx = (sub as i16) >> 8, ty = sub & 0xff.
+            let tx = i32::from(sub >> 8);
+            let ty = i32::from(sub & 0xff);
+            // 0x438c0b..0x438c49: rotate (tx, ty) by dir & 7.
+            let (rx, ry) = match dir & 7 {
+                0 => (tx, ty),
+                2 => (-ty, tx),
+                4 => (-tx, -ty),
+                6 => (ty, -tx),
+                _ => (0, 0),
+            };
+            let tile_x = (rx - ry).saturating_mul(8 << zoom);
+            let tile_y = (rx + ry).saturating_mul(4 << zoom);
+            collected.push((d, tile_x, tile_y));
+        }
+        // 0x438cc3: sort back-to-front by tile_y ascending, then tile_x ascending.
+        collected.sort_by_key(|&(_, tx, ty)| (ty, tx));
+        collected
+    };
+    if tiles.is_empty() {
+        return None;
+    }
+
+    // Original's sprite depth byte table (0x4ca5af) and ground row step (0x4ca2f8).
+    let scale = f32::from_bits(0x43AD_9D3F);
+    let r = 1.0 / f64::from(scale);
+    let a = f64::from((r * 12.0) as f32);
+    let root2 = f64::from(2f64.sqrt() as f32);
+    let root3 = f64::from(3f64.sqrt() as f32);
+    let d = (3.0 * root2 * r * root3 + a) * 16383.75;
+    let step = f64::from((d * f64::from((1.0f64 / 127.0) as f32)) as f32);
+    let base = a * -16383.75 - d;
+    let depth_bytes: [i32; 255] =
+        std::array::from_fn(|i| (step * (i as f64) + base + 0.5).trunc() as i32);
+    let row_step =
+        3f64.sqrt() * f64::from((2f64.sqrt() * 3.0 / f64::from(8i32 << zoom)) as f32) * 0.5;
+    let top_depth = f64::from(scale - 12.5);
+
+    let mut layers = Vec::new();
+    for (tile_def, tile_x, tile_y) in tiles.drain(..) {
+        if word(tile_def, GRAPHICS).unwrap_or(0) <= 0 {
+            continue;
+        }
+        let dgrp_id = word(tile_def, BASE_GRAPHIC).unwrap_or(0) as u16;
+        let Some(chunk) = iff.get(b"DGRP", dgrp_id) else {
+            continue;
+        };
+        let Ok(dgrp) = DrawGroup::parse(iff.data(chunk)) else {
+            continue;
+        };
+        let Some(view) = dgrp
+            .views
+            .iter()
+            .find(|v| (v.direction & dir_bit) != 0 && v.zoom == zoom)
+        else {
+            continue;
+        };
+        let anchor = ((top_depth - f64::from(tile_y) * row_step) * 65535.0 / f64::from(scale))
+            .trunc() as i32;
+        for sprite in &view.sprites {
+            let Ok(id) = u16::try_from(sprite.id) else {
+                continue;
+            };
+            let frame_index = sprite.frame as usize;
+            let frame = if let Some(c) = iff.get(b"SPR2", id) {
+                let raw = iff.data(c);
+                SpriteSet::parse(raw)
+                    .and_then(|set| set.decode(raw, frame_index, iff))
+                    .ok()
+            } else if let Some(c) = iff.get(b"SPR#", id) {
+                let raw = iff.data(c);
+                LegacySpriteSet::parse(raw)
+                    .and_then(|set| set.decode(raw, frame_index, iff))
+                    .ok()
+            } else {
+                None
+            };
+            let Some(frame) = frame else {
+                continue;
+            };
+            if frame.width == 0 || frame.height == 0 {
+                continue;
+            }
+            let z = sprite.object[2];
+            let rise = if z != 0.0 && z.is_finite() {
+                (z * (2i32 << zoom) as f32 + 0.5).trunc() as i32
+            } else {
+                0
+            };
+            let left = i64::from(tile_x) + i64::from(sprite.x);
+            let top =
+                i64::from(tile_y) + i64::from(sprite.y) - i64::from(frame.height) - i64::from(rise);
+            layers.push((sprite.flags & 1 != 0, frame, left, top, anchor));
+        }
+    }
+    if layers.is_empty() {
+        return None;
+    }
+    let min_x = layers.iter().map(|l| l.2).min()?;
+    let min_y = layers.iter().map(|l| l.3).min()?;
+    let max_x = layers.iter().map(|l| l.2 + i64::from(l.1.width)).max()?;
+    let max_y = layers.iter().map(|l| l.3 + i64::from(l.1.height)).max()?;
+    let w = max_x - min_x;
+    let h = max_y - min_y;
+    if w <= 0 || h <= 0 || w > MAX_PICTURE_SIDE || h > MAX_PICTURE_SIDE {
+        return None;
+    }
+    let width = w as usize;
+    let height = h as usize;
+    let mut rgba = vec![0u8; width * height * 4];
+    let mut depth = vec![i32::MAX; width * height];
+    for (flip, frame, left, top, anchor) in layers {
+        let ox = (left - min_x) as usize;
+        let oy = (top - min_y) as usize;
+        let fw = frame.width as usize;
+        let fh = frame.height as usize;
+        let has_depth = frame.flags & 2 != 0;
+        for fy in 0..fh {
+            for fx in 0..fw {
+                let sx = if flip { fw - 1 - fx } else { fx };
+                let src = fy * fw + sx;
+                let a = u32::from(frame.rgba[src * 4 + 3]);
+                if a == 0 {
+                    continue;
+                }
+                let dst = (oy + fy) * width + ox + fx;
+                let px_depth = if has_depth {
+                    let b = frame.depth[src];
+                    if b < 255 {
+                        anchor.saturating_add(depth_bytes[usize::from(b)])
+                    } else {
+                        i32::MAX - 1
+                    }
+                } else {
+                    anchor
+                };
+                if px_depth > depth[dst] {
+                    continue;
+                }
+                let da = u32::from(rgba[dst * 4 + 3]);
+                let alpha = a + da * (255 - a) / 255;
+                if alpha == 0 {
+                    continue;
+                }
+                for c in 0..3 {
+                    rgba[dst * 4 + c] = ((u32::from(frame.rgba[src * 4 + c]) * a
+                        + u32::from(rgba[dst * 4 + c]) * da * (255 - a) / 255)
+                        / alpha) as u8;
+                }
+                rgba[dst * 4 + 3] = alpha as u8;
+                depth[dst] = px_depth;
+            }
+        }
+    }
+    Some(Image {
+        width: width as u32,
+        height: height as u32,
+        rgba,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,5 +702,29 @@ mod tests {
         // No BMP_ of that ID is no thumbnail and no error.
         let (kept, problem) = thumbnail(&iff(&[]), &definition, true);
         assert!(kept.is_none() && problem.is_none());
+    }
+
+    #[test]
+    fn balloon_picture_picks_forced_zoom_or_largest_zoom_with_3px_margin() {
+        let mut thumbnails = Thumbnails::default();
+        let z1 = image(40, 30, |_, _| [10, 0, 0, 255]);
+        let z2 = image(100, 90, |_, _| [0, 20, 0, 255]);
+        let z3 = image(164, 120, |_, _| [0, 0, 30, 255]); // (168-164)/2 = 2 < 3
+        thumbnails.insert_balloon(
+            42,
+            Some([Some(z1.clone()), Some(z2.clone()), Some(z3.clone())]),
+        );
+
+        // Auto-fit in 168x127 rejects zoom 3 (margin 2 < 3) and selects zoom 2 (margin 34, 18 >= 3).
+        let auto = thumbnails.balloon_picture(42, None, 168, 127).unwrap();
+        assert_eq!([auto.width, auto.height], [100, 90]);
+        // Forced zoom 3 or zoom 1 overrides auto-fit (0x4385cf).
+        let forced3 = thumbnails.balloon_picture(42, Some(3), 168, 127).unwrap();
+        assert_eq!([forced3.width, forced3.height], [164, 120]);
+        let forced1 = thumbnails.balloon_picture(42, Some(1), 168, 127).unwrap();
+        assert_eq!([forced1.width, forced1.height], [40, 30]);
+        // If even zoom 1 does not have 3px margin, falls back to zoom 1 (0x4386fa).
+        let fallback = thumbnails.balloon_picture(42, None, 30, 20).unwrap();
+        assert_eq!([fallback.width, fallback.height], [40, 30]);
     }
 }

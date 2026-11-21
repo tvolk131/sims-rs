@@ -981,7 +981,7 @@ impl Interpreter<'_> {
     }
 
     /// The ordinary place test of one object (0x433311 and 0x4329c1).
-    fn test_tile(
+    pub(crate) fn test_tile(
         &self,
         world: &mut World,
         id: u16,
@@ -1218,6 +1218,21 @@ impl Interpreter<'_> {
         } else {
             Err(Refusal::Other)
         })
+    }
+
+    /// Returns the height of `container`'s container slot `slot` (as scripts
+    /// count it), or `None` if `slot` is out of range (`0x43560c`).
+    pub(crate) fn container_slot_height(
+        &self,
+        world: &World,
+        container: u16,
+        slot: i32,
+    ) -> Result<Option<i32>, Trap> {
+        let slots = self.container_slots(world, container)?;
+        Ok(usize::try_from(slot)
+            .ok()
+            .and_then(|i| slots.get(i))
+            .map(|s| s.height))
     }
 
     /// An object's container slots as scripts count them (object +0x130,

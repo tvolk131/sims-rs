@@ -338,3 +338,218 @@ fn a_person_with_no_chosen_clothes_still_wears_their_suit() {
     assert_eq!(outfit.parts[0], clothes.body);
     assert_eq!(&outfit.parts[1..], &defaults.parts[1..]);
 }
+
+#[test]
+fn mortimers_pie_head_matches_recorded_menu_poses() {
+    let Some(root) = install() else { return };
+    let house = root.join("UserData/Houses/House05.iff");
+    let assets = Assets::scan(&root).unwrap();
+    let people = residents(&root, &house).unwrap();
+    let mortimer = people.iter().find(|r| r.id == 21).unwrap();
+    let body = Body::load(&assets, &mortimer.skeleton, &mortimer.outfit).unwrap();
+
+    // Oversized canvases return an error cleanly instead of panicking; zero-sized
+    // canvases succeed with an empty buffer.
+    assert!(
+        sims_people::pie_head::draw_body(
+            &body,
+            [65_536, 65_536],
+            sims_people::pie_head::Look::neutral(),
+        )
+        .is_err()
+    );
+    let empty =
+        sims_people::pie_head::draw_body(&body, [0, 0], sims_people::pie_head::Look::neutral())
+            .unwrap();
+    assert_eq!((empty.width, empty.height, empty.rgba.len()), (0, 0, 0));
+
+    let choice2_look =
+        sims_people::pie_head::Look::from_menu([200, 198], Some([200, 123]), Some(0), 4);
+    let choice2 = sims_people::pie_head::draw_body(&body, [201, 201], choice2_look).unwrap();
+    let talk_look =
+        sims_people::pie_head::Look::from_menu([400, 274], Some([400, 348]), Some(4), 6);
+    let talk = sims_people::pie_head::draw_body(&body, [201, 201], talk_look).unwrap();
+    let read = sims_people::pie_head::draw_body(
+        &body,
+        [201, 201],
+        sims_people::pie_head::Look::from_menu([384, 250], Some([384, 324]), Some(2), 3),
+    )
+    .unwrap();
+    let idle_look = sims_people::pie_head::Look::neutral();
+    let idle = sims_people::pie_head::draw_body(&body, [201, 201], idle_look).unwrap();
+
+    assert_eq!(
+        choice2_look.ambient(),
+        sims_people::pie_head::AMBIENT_HIGHLIGHTED
+    );
+    assert_eq!(
+        talk_look.ambient(),
+        sims_people::pie_head::AMBIENT_HIGHLIGHTED
+    );
+    assert_eq!(idle_look.ambient(), sims_people::pie_head::AMBIENT_IDLE);
+
+    let stats = |c: &Canvas| -> (usize, f64, f64) {
+        let mut count = 0usize;
+        let mut y_sum = 0f64;
+        let mut lum_sum = 0f64;
+        for (i, p) in c.rgba.as_chunks::<4>().0.iter().enumerate() {
+            if p[3] == 255 {
+                count += 1;
+                y_sum += (i / c.width as usize) as f64;
+                lum_sum += f64::from(p[0]) + f64::from(p[1]) + f64::from(p[2]);
+            }
+        }
+        (count, y_sum / count as f64, lum_sum / (count as f64 * 3.0))
+    };
+
+    let (choice2_n, choice2_y, choice2_lum) = stats(&choice2);
+    let (talk_n, talk_y, _) = stats(&talk);
+    let (read_n, _, _) = stats(&read);
+    let (idle_n, _, idle_lum) = stats(&idle);
+
+    assert_eq!(choice2_n, 1750);
+    assert_eq!(talk_n, 1830);
+    assert_eq!(read_n, 1830);
+    assert_eq!(idle_n, 1940);
+    assert_eq!(talk.rgba, read.rgba, "both look straight down at dy=+74");
+    assert_ne!(choice2.rgba, talk.rgba);
+    // Looking up (`Have A Snack`) shifts the projected head silhouette upward
+    // relative to looking down (`Talk...`).
+    assert!(
+        choice2_y < talk_y,
+        "expected choice2 centroid ({choice2_y:.2}) above talk ({talk_y:.2})"
+    );
+    // Idle lighting (0.8 ambient) is dimmer than highlighted upward pose (1.0 ambient).
+    assert!(
+        idle_lum < choice2_lum * 0.9,
+        "idle_lum={idle_lum:.2}, choice2_lum={choice2_lum:.2}"
+    );
+
+    let cases = [
+        (
+            "choice2-a",
+            &choice2,
+            "823e32ce6c88d6619f158cb9889c9669487513f9c46cc2b1d2240f37d971321a",
+        ),
+        (
+            "talk-submenu",
+            &talk,
+            "2a6d0c2c8b4e06ae601b5218e40635bc3c56f7344d0513748bf3cfc7269953e8",
+        ),
+        (
+            "read-queued",
+            &read,
+            "2a6d0c2c8b4e06ae601b5218e40635bc3c56f7344d0513748bf3cfc7269953e8",
+        ),
+        (
+            "idle",
+            &idle,
+            "a1669c1efa3e673eb8dec1a3d4907f1c4ab3c4f6600f7343e40458b6ccad7ffa",
+        ),
+    ];
+    for (name, canvas, expected_sha) in cases {
+        assert_eq!(
+            hex(&canvas.rgba),
+            expected_sha,
+            "{name} rendered pie head changed"
+        );
+        if let Some(out) = std::env::var_os("SIMS_PEOPLE_OUT") {
+            let path = PathBuf::from(out).join(format!("our-{name}.png"));
+            std::fs::write(path, canvas.png()).unwrap();
+        }
+    }
+}
+
+/// Stock oversized headwear (`cspellboundfafit_flamingo` from Makin' Magic)
+/// overflows the 201×201 face bitmap. Rendering directly in house-viewport
+/// coordinates (`draw_body_in_viewport`, matching native `0x462621` →
+/// `0x462985`) preserves the full uncropped headwear up to the house viewport
+/// boundary while still clipping cleanly at the viewport edge.
+#[test]
+fn flamingo_pie_head_is_not_cropped_by_the_face_bitmap() {
+    let Some(root) = install() else { return };
+    let house = root.join("UserData/Houses/House05.iff");
+    let assets = Assets::scan(&root).unwrap();
+    let people = residents(&root, &house).unwrap();
+    let bella = people.iter().find(|r| r.id == 18).unwrap();
+    let mut outfit = bella.outfit.clone();
+    // Replace the head appearance with the stock Flamingo head.
+    let head_part = outfit
+        .parts
+        .iter_mut()
+        .find(|(mesh, _)| mesh.to_ascii_lowercase().starts_with('c'))
+        .expect("Bella has a head part");
+    head_part.0 = "cspellboundfafit_flamingo".into();
+    head_part.1 = String::new();
+    let body = Body::load(&assets, &bella.skeleton, &outfit).unwrap();
+
+    let look = sims_people::pie_head::Look::neutral();
+    let cropped = sims_people::pie_head::draw_body(&body, [201, 201], look).unwrap();
+    let full = sims_people::pie_head::draw_body_in_viewport(
+        &body,
+        [800, 500],
+        [400, 250],
+        sims_render::Zoom::Far,
+        look,
+    )
+    .unwrap();
+    let count_opaque = |rgba: &[u8]| {
+        rgba.as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[3] == 255)
+            .count()
+    };
+    let cropped_opaque = count_opaque(&cropped.rgba);
+    let full_opaque = count_opaque(&full.canvas.rgba);
+
+    assert_eq!(cropped_opaque, 11_628);
+    assert_eq!(full_opaque, 14_014);
+    assert!(
+        full.canvas.width > 201 || full.canvas.height > 201,
+        "expected flamingo bounds {}x{} to exceed 201x201",
+        full.canvas.width,
+        full.canvas.height
+    );
+
+    // Aiming the tall Flamingo hat straight down pitches its tip past the
+    // native Direct3D 6 near plane (`0x49b506`, `0x462414`) at far zoom,
+    // clipping pixels that remain visible at near zoom where the near plane is
+    // 16× farther away in HEAD-bone units.
+    let down = sims_people::pie_head::Look::from_menu([400, 250], Some([400, 324]), Some(4), 6);
+    let far_down = sims_people::pie_head::draw_body_in_viewport(
+        &body,
+        [800, 500],
+        [400, 250],
+        sims_render::Zoom::Far,
+        down,
+    )
+    .unwrap();
+    let near_down = sims_people::pie_head::draw_body_in_viewport(
+        &body,
+        [800, 500],
+        [400, 250],
+        sims_render::Zoom::Near,
+        down,
+    )
+    .unwrap();
+    let far_down_opaque = count_opaque(&far_down.canvas.rgba);
+    let near_down_opaque = count_opaque(&near_down.canvas.rgba);
+    assert_eq!(near_down_opaque, 9_381);
+    assert_eq!(far_down_opaque, 8_909);
+    assert_eq!(near_down_opaque - far_down_opaque, 472);
+
+    // Near the bottom of an 800×500 viewport, the viewport boundary clips the
+    // mesh cleanly instead of overflowing.
+    let edge = sims_people::pie_head::draw_body_in_viewport(
+        &body,
+        [800, 500],
+        [400, 487],
+        sims_render::Zoom::Far,
+        look,
+    )
+    .unwrap();
+    assert!(edge.origin[1] + edge.canvas.height as i32 <= 500);
+    let edge_opaque = count_opaque(&edge.canvas.rgba);
+    assert!(edge_opaque > 0 && edge_opaque < full_opaque);
+}

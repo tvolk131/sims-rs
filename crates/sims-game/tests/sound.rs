@@ -117,8 +117,11 @@ fn pausing_the_lot_pauses_live_ambience_and_night_loop() {
         "live ambience and nite_loop should play before pausing"
     );
 
-    // Pausing the lot queues SoundEvent::Pause (0x4ce5c5), stopping
-    // `nite_loop` and pausing backyard ambience.
+    // Pausing the lot queues SoundEvent::Pause (0x4ce5c5), holding
+    // `nite_loop` and pausing backyard ambience. `MainMusicLoop` is spared
+    // by Pause (`PAUSE_SPARES`), so drain the remainder of `bkground_live`'s
+    // slow fade-out (`fade_speed = 3` per 20 ms tick ≈ 6.84 s) before
+    // asserting silence.
     game.toggle_pause();
     assert!(game.paused());
     sent.clear();
@@ -127,7 +130,7 @@ fn pausing_the_lot_pauses_live_ambience_and_night_loop() {
         mixer.input(input);
     });
     assert!(sent.contains(&Input::Events(vec![SoundEvent::Pause])));
-    let _ = mixer.render(RATE as usize);
+    let _ = mixer.render(7 * RATE as usize);
     assert!(
         mixer.render(RATE as usize).iter().all(|&s| s == 0),
         "pausing the lot should silence live ambience and nite_loop"

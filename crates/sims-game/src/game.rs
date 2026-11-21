@@ -20,11 +20,11 @@ use crate::pick;
 use crate::sound;
 use crate::view::{Move, View};
 use sims_render::{Camera, Canvas, Selected, Walls, open_house};
-use sims_ui::command::{Camera as UiCamera, Command, Speed, Walls as UiWalls};
+use sims_ui::command::{Camera as UiCamera, Command, Mode, Speed, Walls as UiWalls};
 use sims_vm::boot::save::Saved;
 use sims_vm::boot::{Frames, Lot, StepError};
 use sims_vm::play::{Recovery, ScriptError};
-use sims_vm::{SkippedFrame, SoundEvent};
+use sims_vm::{BuyCursor, PanelMode, SkippedFrame, SoundEvent};
 use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
@@ -120,6 +120,28 @@ pub struct Game {
     /// The entry of the open pie menu the pointer last highlighted
     /// ([`Game::highlight`]).
     highlighted: Option<usize>,
+    /// The Buy Mode catalog item currently armed for placement (`0x486f5a`).
+    buy_selected: Option<u32>,
+    /// The active Buy Mode `"Tile Cursor"` and held catalog object, once the
+    /// pointer has entered the house view (`0x487d3d`).
+    buy_cursor: Option<BuyCursor>,
+    /// Whether the pointer is currently inside the house view in Buy Mode
+    /// (`[tool + 0x97]`, `0x487d3d` / `0x487d4e`), so re-entering after
+    /// leaving onto the catalog recreates the preview via `0x486f5a`.
+    buy_in_house: bool,
+    /// Last Buy Mode catalog GUID instantiated by `0x486f5a` (`tool[0x12]`).
+    buy_last_guid: Option<u32>,
+    /// Tool-stored Buy Mode facing (`tool[0x10]`, initialized by `0x486f5a`
+    /// when switching catalog GUIDs and updated on placement commit
+    /// `0x486ada`).
+    buy_facing: Option<i16>,
+    /// The screen anchor of an active Buy Mode left-button press over the lot
+    /// (`0x485f98`), for drag-to-rotate (`dx^2 + dy^2 > 36`, `0x485a2e`) and
+    /// commit on release (`0x4864d0`).
+    buy_dragging: Option<[i32; 2]>,
+    /// Whether Shift is currently held (`VK_SHIFT`, `0x4864f9`), which rearms
+    /// any Buy Mode item for repeat purchase on placement (`0x48680f`).
+    shift_held: bool,
     /// The time the window has passed in, in microseconds: the clock
     /// that spins the plumb bob and drives the pause button's 500 ms blink.
     clock_us: u64,
@@ -169,12 +191,12 @@ impl Game {
             lot.world(),
             lot.program().autonomy_constants().friendship_threshold,
         )?;
-        hud.sync_pause_blink(lot.world().paused(), 0);
+        hud.sync_clock_blink(lot.world(), 0);
         let mut people = People::open(&options.install, house)?;
         people.refresh(lot.world());
         let view = View::new([800, 600], lot_shape.built_center(), lot.view_rotation());
         let drawn_camera = view.camera;
-        Ok(Self {
+        let mut game = Self {
             lot,
             lot_shape,
             assets: opened.assets,
@@ -190,6 +212,13 @@ impl Game {
             reached: None,
             listed: None,
             highlighted: None,
+            buy_selected: None,
+            buy_cursor: None,
+            buy_in_house: false,
+            buy_last_guid: None,
+            buy_facing: None,
+            buy_dragging: None,
+            shift_held: false,
             note: None,
             clock_us: 0,
             drawn_us: 0,
@@ -198,7 +227,9 @@ impl Game {
             drawn_camera,
             lot_depth: Vec::new(),
             people_ids: sims_render::Ids::default(),
-        })
+        };
+        game.sync_view();
+        Ok(game)
     }
 
     /// The lot, for reading.
@@ -303,10 +334,19 @@ impl Game {
                 .set_speed(i32::from(level))
                 .map(|_| self.pace.set_speed(speed))
         });
-        if let Err(e) = result {
-            self.note = Some(format!("The speed was not changed: {e}"));
+        match result {
+            Ok(()) => {
+                // 0x53a5e3, 0x53a661..0x53a666, 0x53a6dc..0x53a6e1: manual
+                // speed presses in Live mode clear `[control_panel + 0x1ec]`.
+                if self.hud.controls.mode == sims_ui::command::Mode::Live {
+                    self.hud.set_idle_speed(false);
+                }
+            }
+            Err(e) => {
+                self.note = Some(format!("The speed was not changed: {e}"));
+            }
         }
-        if self.hud.sync_pause_blink(self.paused(), self.clock_us) {
+        if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
             self.blink_dirty = true;
         }
     }
@@ -328,7 +368,7 @@ impl Game {
         if let Err(e) = result {
             self.note = Some(format!("The pause was not changed: {e}"));
         }
-        if self.hud.sync_pause_blink(self.paused(), self.clock_us) {
+        if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
             self.blink_dirty = true;
         }
     }
@@ -372,7 +412,7 @@ impl Game {
     /// (**unverified**, and the window's timing, not the simulation's).
     pub fn advance(&mut self, elapsed_us: u64) -> u32 {
         self.clock_us = self.clock_us.saturating_add(elapsed_us);
-        if self.hud.sync_pause_blink(self.paused(), self.clock_us) {
+        if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
             self.blink_dirty = true;
         }
         if self.lot.asking().is_some() {
@@ -384,7 +424,7 @@ impl Game {
         }
         let due = self.pace.due(elapsed_us, self.lot.world().speed());
         let ran = self.run_while(due, true);
-        if self.hud.sync_pause_blink(self.paused(), self.clock_us) {
+        if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
             self.blink_dirty = true;
         }
         ran
@@ -398,6 +438,13 @@ impl Game {
         let set = self.lot.idle_speed().unwrap_or(false);
         if set {
             self.pace.restart();
+            // 0x46d7b5 -> 0x109(1) when entering idle speed, 0x46d803 ->
+            // 0x109(0) when leaving (`return_speed` reset to -1).
+            self.hud
+                .set_idle_speed(self.lot.world().return_speed() >= 0);
+            if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
+                self.blink_dirty = true;
+            }
         }
         set
     }
@@ -479,6 +526,21 @@ impl Game {
                     self.stop(&error);
                 }
             }
+            // `Lot::step` runs `World::idle_speed` before the tick (0x46d9d6).
+            // Detect `0x109(1)` / `0x109(0)` transitions directly from
+            // `return_speed`'s sign change so even a same-tick Special Effect
+            // `0x10c` reset (`(NORMAL, -1) -> (IDLE, NORMAL) -> (NORMAL, NORMAL)`)
+            // arms `[control_panel + 0x1ec]` under both `Game::run` and
+            // `Game::advance`.
+            let return_after = self.lot.world().return_speed();
+            if speed_before.1 < 0 && return_after >= 0 {
+                self.hud.set_idle_speed(true);
+            } else if speed_before.1 >= 0 && return_after < 0 {
+                self.hud.set_idle_speed(false);
+            }
+            if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
+                self.blink_dirty = true;
+            }
             if sync_speed_after_step(&mut self.pace, speed_before, self.lot.world()) && idle {
                 break;
             }
@@ -551,13 +613,17 @@ impl Game {
             level: w.level,
             room: w.room.unwrap_or(NO_ROOM),
         });
+        let viewport = self.house_viewport_size();
         // The lot, then the people, then the objects that hold someone
         // (a bench a Sim sits on), as the original's frame does.
-        sims_render::draw_lot(
+        let preview = self.buy_cursor.as_ref().map(|c| (c.cursor, c.held));
+        sims_render::draw_lot_with_preview(
             world,
             &self.lot_shape,
             &mut self.assets,
             &self.view.camera,
+            viewport,
+            preview,
             &mut self.canvas,
         );
         self.drawn_camera = self.view.camera;
@@ -569,7 +635,8 @@ impl Game {
         self.drawn_us = self.clock_us;
         let milliseconds = (self.clock_us / 1000) as u32;
         self.people.set_clock(milliseconds);
-        self.people.draw(world, &self.view.camera, &mut self.canvas);
+        self.people
+            .draw_in_viewport(world, &self.view.camera, viewport, &mut self.canvas);
         // Who the pick notes: the people as drawn, before a bench they sit
         // on draws over them.
         self.people_ids.take(&self.canvas);
@@ -580,23 +647,60 @@ impl Game {
             &self.view.camera,
             &mut self.canvas,
         );
-        // The pie menu shows the head of the Sim it is for, as posed now.
-        if let Some(menu) = &mut self.hud.menu {
-            menu.head = match self.people.head(world, menu.person, menu.face_size()) {
-                Ok(head) => Some(head),
-                Err(e) => {
-                    self.people
-                        .note(vec![format!("the pie menu has no head: {e}")]);
-                    None
-                }
-            };
-        }
         let status = self.status();
         // A dialog the lot waits on is in the lot as the tick left it when
-        // it was shown.
+        // it was shown. Read it before the pie menu so a newly opened dialog
+        // suppresses the pie's dark backdrop and head on the frame it closes
+        // the menu.
         let dialogs = self.lot.asking().map_or(world, |a| &a.world);
         self.hud.read_dialog(dialogs, &self.assets);
-        self.hud.sync_pause_blink(world.paused(), self.clock_us);
+        // The pie menu shades the house viewport behind it (0x4a94ec →
+        // 0x4ac8ff) and renders the Sim's 3D head tracking the pointer
+        // (0x4a953e → 0x462290 → 0x462985) directly into the house viewport
+        // before the 2D HUD draws, so oversized headwear is clipped only by
+        // the house viewport (not the 201×201 face bitmap), the bottom control
+        // strip hides anything below the viewport, and pie labels draw on top.
+        if !self.hud.will_show_dialog(self.view.size) {
+            self.hud.resize_menu(self.view.size);
+            let pointer = self.hud.pointer();
+            if let Some(menu) = &mut self.hud.menu {
+                if let Some(center) = menu.active_center() {
+                    crate::people::shade_pie_face(&mut self.canvas, center, viewport);
+                }
+                if let Some(center) = menu.main_center() {
+                    let look = menu.head_look(pointer);
+                    match self.people.head_in_viewport(
+                        world,
+                        menu.person,
+                        viewport,
+                        center,
+                        self.view.camera.zoom,
+                        look,
+                    ) {
+                        Ok((origin, head, depth)) => {
+                            crate::people::composite_pie_head(
+                                &mut self.canvas,
+                                origin,
+                                &head,
+                                &depth,
+                                viewport,
+                            );
+                            menu.head_origin = origin;
+                            menu.head = Some(head);
+                            menu.head_depth = depth;
+                        }
+                        Err(e) => {
+                            self.people
+                                .note(vec![format!("the pie menu has no head: {e}")]);
+                            menu.head_origin = [0, 0];
+                            menu.head = None;
+                            menu.head_depth.clear();
+                        }
+                    }
+                }
+            }
+        }
+        self.hud.sync_clock_blink(world, self.clock_us);
         self.blink_dirty = false;
         self.hud.draw(
             world,
@@ -619,21 +723,71 @@ impl Game {
         &self.canvas
     }
 
+    /// Passes the house view's screen-centre pick (`0x4a7b58` over the active
+    /// house viewport [`Game::house_viewport_size`], at the original's origin
+    /// column `camera.origin[0] + pick::ORIGIN_COLUMN`, cut to a tile via
+    /// `0x433067`) into the simulation.
+    fn sync_view_centre(&mut self) {
+        let (w, h) = self.house_viewport_size();
+        let mut camera = self.view.camera;
+        camera.origin[0] = camera.origin[0].saturating_add(pick::ORIGIN_COLUMN);
+        let centre =
+            sims_render::screen_centre_pick(&self.lot_shape, &camera, [w as i32, h as i32])
+                .map(|[x, y]| [(x >> 4) as i8, (y >> 4) as i8]);
+        self.lot.set_view_centre(centre);
+    }
+
+    /// Passes the house view's rotation and screen-centre pick into the
+    /// simulation.
+    fn sync_view(&mut self) {
+        self.lot.set_view_rotation(self.view.camera.rotation);
+        self.sync_view_centre();
+    }
+
     /// Resizes the canvas to `size` of the original's pixels.
     pub fn resize(&mut self, size: [i32; 2]) -> bool {
         if size == self.view.size {
             return false;
         }
         self.view.resize(size);
+        self.sync_view_centre();
         self.hud.resize_menu(size);
+        if self.hud.controls.mode == Mode::Buy {
+            self.hud
+                .relayout_panel(size, self.lot.world(), self.lot.residential(), &self.assets);
+        }
         true
     }
 
-    /// Moves the camera. A turn is the lot's input too: Generic Sims Call
-    /// 12 reads the view's rotation ([`Lot::set_view_rotation`]).
+    /// Moves the camera. The view's rotation and screen-centre pick are the
+    /// lot's inputs too ([`Lot::set_view_rotation`], [`Lot::set_view_centre`]),
+    /// synced only when the picker's camera geometry actually changes so
+    /// no-op or wall-mode commands preserve a restored pick.
     pub fn apply(&mut self, command: Move) -> bool {
-        let moved = self.view.apply(command);
-        self.lot.set_view_rotation(self.view.camera.rotation);
+        let before = self.view.camera;
+        let (w, h) = self.house_viewport_size();
+        let viewport = [w as i32, h as i32];
+        let moved = match command {
+            Move::ZoomIn | Move::ZoomOut | Move::Rotate(_) if self.lot_shape.size > 0 => {
+                let changed = native_zoom_or_rotate(
+                    &self.lot_shape,
+                    &mut self.view.camera,
+                    viewport,
+                    command,
+                );
+                self.view.bound();
+                changed || self.view.camera != before
+            }
+            _ => self.view.apply_in(command, viewport, pick::ORIGIN_COLUMN),
+        };
+        let after = self.view.camera;
+        if after.origin != before.origin
+            || after.zoom != before.zoom
+            || after.rotation != before.rotation
+            || after.level != before.level
+        {
+            self.sync_view();
+        }
         moved
     }
 
@@ -651,17 +805,30 @@ impl Game {
     }
 
     /// Moves the pointer to `point`. When it first reaches an object on
-    /// the lot, the selected Sim's pie menu on it is listed, as the
-    /// original lists it then (0x48c834); listing changes the lot.
-    /// A point outside the canvas is treated as [`Game::leave`].
+    /// the lot in Live mode, the selected Sim's pie menu on it is listed, as
+    /// the original lists it then (0x48c834); listing changes the lot. In Buy
+    /// mode, hovering over the house view activates and moves (or drag-rotates)
+    /// the placement cursor (`0x487d3d`, `0x485a2e`), while moving onto the
+    /// panel hides it (`0x487d4e`). A point outside the canvas is treated as
+    /// [`Game::leave`].
     pub fn hover(&mut self, point: [i32; 2]) -> bool {
         if !self.in_view(point) {
             return self.leave();
         }
         self.pointer = Some(point);
         let mut redraw = self.hud.hover(point);
+        let sounds = self.hud.take_sounds();
+        self.keep_sounds(sounds);
         redraw |= self.highlight(point);
-        redraw |= self.follow();
+        if self.hud.controls.mode == Mode::Buy {
+            if !self.hud.covers(point) || self.buy_dragging.is_some() {
+                redraw |= self.hover_buy(point);
+            } else {
+                redraw |= self.hide_buy_cursor();
+            }
+        } else {
+            redraw |= self.follow();
+        }
         // The cutaway follows the rooms the pointer passes over, while
         // the cutaway is on and the pointer is over the lot.
         if !self.hud.covers(point) && self.view.camera.walls == Walls::Cutaway {
@@ -705,13 +872,43 @@ impl Game {
                 Some(command) => self.command(command, menu.as_ref()),
                 None => Outcome::redraw(),
             };
+            if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
+                self.blink_dirty = true;
+            }
             let sounds = self.hud.take_sounds();
             self.keep_sounds(sounds);
             return outcome;
         }
-        let Some(target) = self.under(point) else {
+        // 0x51f3c5..0x51f3e5, 0x51d312, 0x51d354: pressing outside the live
+        // control panel dismisses any open help balloon with `UI_whoosh`.
+        let dismissed = self.hud.dismiss_help();
+        let sounds = self.hud.take_sounds();
+        self.keep_sounds(sounds);
+        if self.hud.controls.mode == Mode::Buy {
+            if self.stopped.is_some() {
+                self.note = Some("The lot has stopped, so it takes no orders.".into());
+                return Outcome::redraw();
+            }
+            if self.buy_selected.is_some() || self.buy_cursor.is_some() {
+                self.pointer = Some(point);
+                self.hover_buy(point);
+                self.buy_dragging = Some(point);
+                return Outcome::redraw();
+            }
+            return Outcome {
+                redraw: cleared || dismissed,
+                photo: false,
+            };
+        }
+        if self.hud.controls.mode != Mode::Live {
             return Outcome {
                 redraw: cleared,
+                photo: false,
+            };
+        }
+        let Some(target) = self.under(point) else {
+            return Outcome {
+                redraw: cleared || dismissed,
                 photo: false,
             };
         };
@@ -719,20 +916,19 @@ impl Game {
         Outcome::redraw()
     }
 
-    /// A left release at `point` (0x5eb433).
-    ///
-    /// Acts only while a pie menu is open with no dialog over it:
-    /// - updates which entry is under `point` as mouse-move does
-    ///   (`+0xfc`, 0x5eb4d7);
-    /// - for the opening press's release, settles the menu into
-    ///   click-to-choose mode unless the pointer moved past the dead zone
-    ///   without the menu having moved on screen;
-    /// - otherwise checks the entry under `point` again (`0x5eb62a` ->
-    ///   event `0xe` -> `0x48df28`) and chooses it, opens or leaves a
-    ///   submenu, or closes the menu.
+    /// A left release at `point` (0x5eb433 in Live mode; `0x4864d0` in Buy
+    /// mode).
     pub fn release(&mut self, point: [i32; 2]) -> Outcome {
         if !self.in_view(point) {
             return self.release_outside();
+        }
+        if self.hud.controls.mode == Mode::Buy && self.buy_dragging.is_some() {
+            // Native `0x4864f0` invokes `OnMouseMove` with the release
+            // coordinates before committing placement.
+            self.pointer = Some(point);
+            self.hover_buy(point);
+            self.buy_dragging = None;
+            return self.commit_buy(point);
         }
         if self.hud.dialog().is_some() || self.hud.menu.is_none() {
             return Outcome {
@@ -742,6 +938,8 @@ impl Game {
         }
         self.pointer = Some(point);
         let mut redraw = self.hud.hover(point);
+        let sounds = self.hud.take_sounds();
+        self.keep_sounds(sounds);
         redraw |= self.highlight(point);
         let will_choose = self.hud.menu.as_ref().is_some_and(|m| m.will_choose(point));
         if !will_choose {
@@ -762,7 +960,12 @@ impl Game {
         // A failed check's note stays in front of what the choice says.
         let failed = self.note.take();
         let menu = self.hud.menu.clone();
-        let (_, command) = self.hud.release_menu(point);
+        let (release, command) = self.hud.release_menu(point);
+        if release == menu::Release::Stays
+            && let Some(warped) = self.hud.menu.as_ref().and_then(Menu::pending_pointer)
+        {
+            self.pointer = Some(warped);
+        }
         self.highlighted = None;
         let outcome = match command {
             Some(command) => self.command(command, menu.as_ref()),
@@ -780,9 +983,17 @@ impl Game {
     }
 
     /// A left release while the pointer is outside the window (after
-    /// [`Game::leave`]): settles an opening press on a moved menu, or
-    /// closes the pie without checking or choosing any entry.
+    /// [`Game::leave`]): settles an opening press on a moved menu, closes
+    /// the pie without checking or choosing any entry, or cancels a Buy Mode
+    /// drag.
     pub fn release_outside(&mut self) -> Outcome {
+        if self.buy_dragging.take().is_some() {
+            let redraw = self.hide_buy_cursor();
+            return Outcome {
+                redraw,
+                photo: false,
+            };
+        }
         if self.hud.dialog().is_some() || self.hud.menu.is_none() {
             return Outcome {
                 redraw: false,
@@ -812,8 +1023,17 @@ impl Game {
     pub fn leave(&mut self) -> bool {
         self.pointer = None;
         self.highlighted = None;
-        let redraw = self.hud.leave();
-        self.follow() || redraw
+        let mut redraw = self.hud.leave();
+        let sounds = self.hud.take_sounds();
+        self.keep_sounds(sounds);
+        if self.hud.controls.mode == Mode::Buy {
+            if self.buy_dragging.is_none() {
+                redraw |= self.hide_buy_cursor();
+            }
+            redraw
+        } else {
+            self.follow() || redraw
+        }
     }
 
     /// Follows the object under the pointer in the frame last drawn: when
@@ -822,6 +1042,11 @@ impl Game {
     /// a menu, or once the lot has stopped. True if a listing may have
     /// changed the lot.
     fn follow(&mut self) -> bool {
+        if self.hud.controls.mode != Mode::Live {
+            self.reached = None;
+            self.listed = None;
+            return false;
+        }
         let under = match self.pointer {
             Some(point) if self.stopped.is_none() && !self.hud.covers(point) => self.under(point),
             _ => None,
@@ -953,14 +1178,22 @@ impl Game {
                 } else {
                     self.note = why.map(|why| format!("Every entry is shown, as {why}"));
                     self.highlighted = None;
-                    self.hud.menu = Some(Menu::new(
+                    let menu = Menu::new(
                         person,
                         object,
                         listing.entries,
                         point,
                         &self.hud.art,
                         self.view.size,
-                    ));
+                    );
+                    // Native menu setup reads the current cursor (0x5ebd05)
+                    // after any on-screen clamp warp (0x5ebab2) and updates
+                    // hit state (0x5ebd29), so the opening frame aims the head
+                    // at the press or warped center rather than a stale hover.
+                    let effective = menu.pending_pointer().unwrap_or(point);
+                    self.pointer = Some(effective);
+                    self.hud.set_pointer(effective);
+                    self.hud.menu = Some(menu);
                 }
             }
             Err(e) => self.note = Some(format!("Object {object}'s menu is not listed: {e}")),
@@ -1112,8 +1345,22 @@ impl Game {
     /// on a press on the selected Sim's portrait (0x51ea7a, behind a
     /// check of global 0x6f6bac) whose effect has not been read.
     pub fn select(&mut self, sim: u16) {
-        if self.lot.world().selected() == Some(sim) {
-            self.centre_on(sim);
+        let world = self.lot.world();
+        let same_neighbor = world.selected() == Some(sim)
+            || world
+                .selected()
+                .and_then(|id| world.objects.get(&id))
+                .zip(world.objects.get(&sim))
+                .is_some_and(|(selected, target)| selected.guid == target.guid);
+        if same_neighbor {
+            // 0x4cfa0d..0x4cfa47: centres on the first live person of that
+            // neighbor in person-registry order (`0x4e9608`).
+            let target = world
+                .objects
+                .get(&sim)
+                .and_then(|o| sims_ui::household::first_person_for_guid(world, o.guid))
+                .map_or(sim, |o| o.id);
+            self.centre_on(target);
             self.hud.play(crate::hud::CLICK);
             return;
         }
@@ -1138,7 +1385,9 @@ impl Game {
     /// `y` positions before rotating and projecting. The original's house
     /// view sits above the 100-pixel live-mode strip
     /// (`0x49ae5e` → `0x5cf1b6`, `0x4b136b`), so its middle is
-    /// `[width / 2, (height - 100) / 2]`. A person on the floor shown is
+    /// `[width / 2, height / 2]` over [`Game::house_viewport_size`] (full
+    /// canvas while the strip is collapsed, `height - 100` while expanded).
+    /// A person on the floor shown is
     /// centred a little above its feet: its screen point on the lot's
     /// terrain ([`sound::object_point_on_lot`]) raised by half of 2 √6
     /// times 2.0 times 2 to the power of the zoom plus one, cut to a whole
@@ -1163,14 +1412,17 @@ impl Game {
             return;
         };
         let level = position[2];
-        let view_size = self.house_view_size();
+        let (w, h) = self.house_viewport_size();
+        let view_size = [w as i32, h as i32];
         if is_person && level == self.view.camera.level {
             let mut at = lot_point(&self.view.camera, &self.lot_shape, position);
             at[1] -= person_rise(self.view.camera.zoom.level());
             self.centre_screen_point(at, view_size);
             return;
         }
-        self.view.apply(Move::Floor(level));
+        if self.view.apply(Move::Floor(level)) {
+            self.sync_view();
+        }
         if !self.on_lot(position) {
             return;
         }
@@ -1178,25 +1430,26 @@ impl Game {
         self.centre_screen_point(at, view_size);
     }
 
-    /// The house view's viewport size above the live-mode strip
-    /// (`0x49ae5e` → `0x5cf1b6`: `(width, height - 100)`).
-    fn house_view_size(&self) -> [i32; 2] {
-        [
-            self.view.size[0],
-            (self.view.size[1] - sims_ui::hud::STRIP).max(1),
-        ]
+    /// The active 3D house viewport size (`0x49ae5e`, `0x4f4b43`, `0x4d363b`,
+    /// `0x53b2eb` → `0x4b136b` → `0x49b0bf` → `0x5cf1b6`): full canvas
+    /// `(width, height)` while the bottom strip is closed, and
+    /// `(width, height - STRIP)` (`height - 150 + 50` from the shared
+    /// 150-pixel panel container at `0x4f4b43`) while the strip is open in
+    /// Live, Build, Buy, or Options mode.
+    fn house_viewport_size(&self) -> (u32, u32) {
+        viewport_for_controls(self.view.size, &self.hud.controls)
     }
 
     /// Whether `position` lies on the active lot's rotated tile bounds
-    /// (`0x4a7af0`: rotated fine position shifted right by 4, checked
-    /// against `lot + 0x70..+0x7c`).
+    /// (`0x4a7af0`: rotated fine position shifted right by 4, narrowed to
+    /// signed bytes, checked against `lot + 0x70..+0x7c`).
     fn on_lot(&self, position: [i32; 3]) -> bool {
         if self.lot_shape.size == 0 {
             return false;
         }
         let rotated = sound::rotate_object_fine(&self.view.camera, [position[0], position[1]]);
-        let tx = rotated[0] >> 4;
-        let ty = rotated[1] >> 4;
+        let tx = i32::from((rotated[0] >> 4) as i8);
+        let ty = i32::from((rotated[1] >> 4) as i8);
         let b = sound::lot_bounds(&self.lot_shape, &self.view.camera);
         tx >= b[0] && tx <= b[1] && ty >= b[2] && ty <= b[3]
     }
@@ -1224,14 +1477,24 @@ impl Game {
         let native_x = target[0].max(min_x).min(max_x).wrapping_add(1) & !3;
         let clamped_x = native_x.saturating_sub(pick::ORIGIN_COLUMN);
         let clamped_y = target[1].max(min_y).min(max_y);
-        self.view.set_origin([clamped_x, clamped_y]);
+        if self.view.set_origin([clamped_x, clamped_y]) {
+            self.sync_view();
+        }
     }
 
     /// The lot as it stands, to go back to later ([`Game::restore`]).
     /// While a dialog waits, the save is of the lot before the tick that
-    /// showed it, so the restored lot shows it again.
+    /// showed it, so the restored lot shows it again. While an unpaid Buy
+    /// Mode preview is held, the preview and its `"Tile Cursor"` are stripped
+    /// from the saved snapshot without disturbing the live placement.
     pub fn save(&self) -> Result<Saved, String> {
-        self.lot.save().map_err(|e| e.to_string())
+        match &self.buy_cursor {
+            Some(cursor) => self
+                .lot
+                .save_without_buy_cursor(cursor)
+                .map_err(|e| e.to_string()),
+            None => self.lot.save().map_err(|e| e.to_string()),
+        }
     }
 
     /// Keeps the lot in `store` under `slot`, saying across the top how
@@ -1281,21 +1544,41 @@ impl Game {
         self.reached = None;
         self.listed = None;
         self.highlighted = None;
+        self.buy_selected = None;
+        self.buy_cursor = None;
+        self.buy_in_house = false;
+        self.buy_last_guid = None;
+        self.buy_facing = None;
+        self.buy_dragging = None;
         self.hud.forget();
+        self.hud.controls.mode = ui_mode(self.lot.mode());
         self.blink_dirty = false;
         let world = self.lot.world();
-        self.hud.sync_pause_blink(world.paused(), self.clock_us);
+        self.hud.sync_clock_blink(world, self.clock_us);
         if let Some(speed) = pace::shown(world) {
             self.pace.speed = speed;
         }
         // The view turns as the turn keys do, keeping the middle of the
         // screen, until it shows the lot as the saved lot was turned.
+        let (w, h) = self.house_viewport_size();
+        let viewport = [w as i32, h as i32];
         let rotation = self.lot.view_rotation();
         for _ in 0..4 {
             if self.view.camera.rotation == rotation {
                 break;
             }
-            self.view.apply(Move::Rotate(true));
+            if self.lot_shape.size > 0 {
+                native_zoom_or_rotate(
+                    &self.lot_shape,
+                    &mut self.view.camera,
+                    viewport,
+                    Move::Rotate(true),
+                );
+                self.view.bound();
+            } else {
+                self.view
+                    .apply_in(Move::Rotate(true), viewport, pick::ORIGIN_COLUMN);
+            }
         }
         self.pace.restart();
         self.people.refresh(world);
@@ -1311,10 +1594,6 @@ impl Game {
     /// Carries out a panel command. `menu` is the pie menu that was open
     /// when it was pressed.
     fn command(&mut self, command: Command, menu: Option<&Menu>) -> Outcome {
-        let moved = |view: &mut View, m: Move| {
-            view.apply(m);
-            Outcome::redraw()
-        };
         match command {
             Command::SetSpeed(speed) => {
                 self.set_speed(speed);
@@ -1325,8 +1604,14 @@ impl Game {
                 Outcome::redraw()
             }
             Command::Camera(camera) => match camera {
-                UiCamera::ZoomIn => moved(&mut self.view, Move::ZoomIn),
-                UiCamera::ZoomOut => moved(&mut self.view, Move::ZoomOut),
+                UiCamera::ZoomIn => {
+                    self.apply(Move::ZoomIn);
+                    Outcome::redraw()
+                }
+                UiCamera::ZoomOut => {
+                    self.apply(Move::ZoomOut);
+                    Outcome::redraw()
+                }
                 // Which way the original turns for each is unverified.
                 UiCamera::RotateRight => {
                     self.apply(Move::Rotate(true));
@@ -1336,16 +1621,22 @@ impl Game {
                     self.apply(Move::Rotate(false));
                     Outcome::redraw()
                 }
-                UiCamera::FloorUp => moved(&mut self.view, Move::LevelUp),
-                UiCamera::FloorDown => moved(&mut self.view, Move::LevelDown),
-                UiCamera::Walls(w) => moved(
-                    &mut self.view,
-                    Move::Walls(match w {
+                UiCamera::FloorUp => {
+                    self.apply(Move::LevelUp);
+                    Outcome::redraw()
+                }
+                UiCamera::FloorDown => {
+                    self.apply(Move::LevelDown);
+                    Outcome::redraw()
+                }
+                UiCamera::Walls(w) => {
+                    self.apply(Move::Walls(match w {
                         UiWalls::Up => Walls::Up,
                         UiWalls::Cutaway => Walls::Cutaway,
                         UiWalls::Down => Walls::Down,
-                    }),
-                ),
+                    }));
+                    Outcome::redraw()
+                }
                 UiCamera::Photo => Outcome {
                     redraw: false,
                     photo: true,
@@ -1383,17 +1674,528 @@ impl Game {
                 self.note = Some("The Help System dialog is not ported yet.".into());
                 Outcome::redraw()
             }
-            Command::TogglePanel
-            | Command::OpenPanel(_)
+            Command::SetMode(mode) => {
+                self.set_mode(mode);
+                Outcome::redraw()
+            }
+            Command::BuyCategory(_) | Command::BuySubcategory(_) | Command::BuyBack => {
+                self.cancel_buy();
+                self.hud
+                    .layout_buy(self.view.size, self.lot.world(), &self.assets);
+                Outcome::redraw()
+            }
+            Command::BuyPage(_) => {
+                self.hud
+                    .layout_buy(self.view.size, self.lot.world(), &self.assets);
+                Outcome::redraw()
+            }
+            Command::BuyItem(guid) => {
+                self.select_buy_item(guid);
+                Outcome::redraw()
+            }
+            Command::Undo => {
+                self.undo_buy();
+                Outcome::redraw()
+            }
+            Command::Redo => {
+                self.redo_buy();
+                Outcome::redraw()
+            }
+            Command::TogglePanel => {
+                self.sync_view_centre();
+                if self.hud.controls.mode == Mode::Buy {
+                    self.hud
+                        .layout_buy(self.view.size, self.lot.world(), &self.assets);
+                }
+                Outcome::redraw()
+            }
+            Command::OpenPanel(_)
             | Command::Refused { .. }
             | Command::ShowRelations(_)
             | Command::RelationsPage(_)
             | Command::Help(_) => Outcome::redraw(),
-            other => {
-                self.note = Some(format!("Not carried out yet: {other:?}"));
-                Outcome::redraw()
+        }
+    }
+
+    /// The active control-panel mode (`Mode::Live`, `Mode::Buy`, etc.).
+    pub fn mode(&self) -> Mode {
+        self.hud.controls.mode
+    }
+
+    /// The Buy Mode catalog master GUID currently armed for placement, if any.
+    pub fn buy_selected(&self) -> Option<u32> {
+        self.buy_selected
+    }
+
+    /// The active Buy Mode placement cursor (once the pointer has entered
+    /// the house view), if any.
+    pub fn buy_cursor(&self) -> Option<&BuyCursor> {
+        self.buy_cursor.as_ref()
+    }
+
+    /// Whether a committed Buy Mode purchase can be undone (`0x4cf074`).
+    pub fn can_undo(&self) -> bool {
+        self.hud.controls.mode == Mode::Buy && self.lot.can_buy_undo()
+    }
+
+    /// Whether an undone Buy Mode purchase can be redone (`0x4cf08c`).
+    pub fn can_redo(&self) -> bool {
+        self.hud.controls.mode == Mode::Buy && self.lot.can_buy_redo()
+    }
+
+    /// Runs a Buy Mode Undo (`undo = true`) or Redo (`undo = false`) while
+    /// keeping any active placement preview and catalog selection armed
+    /// (`0x4a8545`, `0x4a856a`). Dispatches directly to the lot's purchase
+    /// history without moving or lifting the preview (matching `0x4a8545` /
+    /// `0x4a856a` + `0xee` panel dirtying at `0x4f66eb`), so an off-lot repeat
+    /// preview does not jump onto a freed tile and block immediate Redo, while
+    /// an already on-lot preview still collides with Redo (`0x4337f6`) and
+    /// preserves any manual surface rotation.
+    fn apply_buy_history(&mut self, undo: bool) -> bool {
+        let allowed = if undo {
+            self.can_undo()
+        } else {
+            self.can_redo()
+        };
+        if !allowed || self.stopped.is_some() {
+            return false;
+        }
+        let result = if undo {
+            self.lot.buy_undo()
+        } else {
+            self.lot.buy_redo()
+        };
+        if let Some(cursor) = self.buy_cursor.as_mut() {
+            let held_on_lot = self
+                .lot
+                .world()
+                .objects
+                .get(&cursor.held)
+                .is_some_and(|o| o.position[0] >= 0);
+            let affordable =
+                cursor.price <= 0 || cursor.price <= sims_vm::available_funds(self.lot.world());
+            cursor.valid = held_on_lot && affordable;
+        }
+        match result {
+            Ok(true) => {
+                self.refresh_world();
+                self.hud
+                    .layout_buy(self.view.size, self.lot.world(), &self.assets);
+                true
+            }
+            Ok(false) => {
+                self.refresh_world();
+                false
+            }
+            Err(e) => {
+                let verb = if undo { "undone" } else { "redone" };
+                self.note = Some(format!("The purchase was not {verb}: {e}"));
+                self.refresh_world();
+                false
             }
         }
+    }
+
+    /// Undoes the most recent committed Buy Mode purchase (`0x4cf2e0` / event
+    /// `0xec` → `0x4932fa` → `0x48bd21`), keeping any active placement preview
+    /// and catalog selection armed (`0x4a8545`). Returns `true` if a purchase
+    /// was undone.
+    pub fn undo_buy(&mut self) -> bool {
+        self.apply_buy_history(true)
+    }
+
+    /// Redoes the most recently undone Buy Mode purchase (`0x4cf317` / event
+    /// `0xed` → `0x493338` → `0x48bdfe`), keeping any active placement preview
+    /// and catalog selection armed (`0x4a856a`). Returns `true` if a purchase
+    /// was redone.
+    pub fn redo_buy(&mut self) -> bool {
+        self.apply_buy_history(false)
+    }
+
+    /// Sets whether the Shift modifier is held (`VK_SHIFT`, `0x4864f9`),
+    /// which keeps the Buy tool armed for repeat purchases after placing any
+    /// affordable item (`0x48680f`).
+    pub fn set_shift(&mut self, held: bool) {
+        self.shift_held = held;
+    }
+
+    /// Switches between Live, Buy, Build, and Options modes (`0x4cea5d`,
+    /// `0x4ce44f`). Cancels any unplaced Buy Mode item, closes open pie menus,
+    /// updates `global[19]` (calling `go_live` `0x416534` when returning to
+    /// Live mode), and refreshes the control panel and Buy catalog strip.
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.cancel_buy();
+        if self.buy_cursor.is_some() {
+            return;
+        }
+        self.close_menu();
+        self.reached = None;
+        self.listed = None;
+        self.highlighted = None;
+        if let Err(e) = self.lot.set_mode(panel_mode_for(mode)) {
+            self.note = Some(format!("The mode was not changed: {e}"));
+            return;
+        }
+        let was_expanded = self.hud.controls.expanded;
+        self.hud.controls.mode = mode;
+        self.hud.controls.expanded = true;
+        if !was_expanded {
+            self.sync_view_centre();
+        }
+        self.hud.controls.help = None;
+        self.hud.buy_state.reset();
+        // Native `0x487191` clears the active selection/cursor while retaining
+        // `buy_last_guid` (`tool[0x12]`) and `buy_facing` (`tool[0x10]`).
+        self.buy_in_house = false;
+        if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
+            self.blink_dirty = true;
+        }
+        self.refresh_world();
+        self.hud.relayout_panel(
+            self.view.size,
+            self.lot.world(),
+            self.lot.residential(),
+            &self.assets,
+        );
+    }
+
+    /// Arms catalog master `guid` on the Buy Mode placement tool (`0x5065c8`).
+    /// Does not create the object until the pointer enters the house view
+    /// (`0x487d3d`). Plays `UI_error` if the household cannot afford it.
+    fn select_buy_item(&mut self, guid: u32) {
+        self.cancel_buy();
+        if self.buy_cursor.is_some() {
+            return;
+        }
+        let price = self
+            .hud
+            .ensure_buy_catalog(&self.assets)
+            .get(guid)
+            .map(|item| item.price);
+        let funds = sims_vm::available_funds(self.lot.world());
+        match price {
+            Some(price) if price <= 0 || price <= funds => {
+                self.buy_selected = Some(guid);
+                self.hud.buy_state.selected = Some(guid);
+            }
+            Some(_) => {
+                self.hud.play(crate::hud::ERROR);
+                self.buy_selected = None;
+                self.hud.buy_state.selected = None;
+            }
+            None => {
+                self.buy_selected = None;
+                self.hud.buy_state.selected = None;
+            }
+        }
+        self.hud
+            .layout_buy(self.view.size, self.lot.world(), &self.assets);
+    }
+
+    /// Cancels any active Buy Mode cursor or armed catalog selection
+    /// (`0x487105`), deleting the unplaced object and `"Tile Cursor"` without
+    /// charging funds. Returns `true` if anything was cancelled. If deleting
+    /// the preview fails, the cursor handle is kept so it can be retried.
+    pub fn cancel_buy(&mut self) -> bool {
+        self.buy_dragging = None;
+        self.buy_in_house = false;
+        let had_cursor = if let Some(cursor) = self.buy_cursor.take() {
+            match self.lot.buy_cancel(&cursor) {
+                Ok(()) => {
+                    self.refresh_world();
+                    true
+                }
+                Err(e) => {
+                    self.buy_cursor = Some(cursor);
+                    self.note = Some(format!("The Buy cursor was not cancelled: {e}"));
+                    return false;
+                }
+            }
+        } else {
+            false
+        };
+        let had_selection = self.buy_selected.take().is_some();
+        let had_hud = self.hud.buy_state.selected.take().is_some();
+        if had_selection || had_hud || had_cursor {
+            if self.hud.controls.mode == Mode::Buy {
+                self.hud
+                    .layout_buy(self.view.size, self.lot.world(), &self.assets);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Rotates the held Buy Mode object by one signed turn step (`0x486cb8` →
+    /// `0x421be4(±1)`), returning `true` if a Buy cursor was active.
+    pub fn rotate_held(&mut self, clockwise: bool) -> bool {
+        let Some(mut cursor) = self.buy_cursor.take() else {
+            return false;
+        };
+        let steps = if clockwise { 1 } else { -1 };
+        if let Err(e) = self.lot.buy_turn(&mut cursor, steps) {
+            self.note = Some(format!("The object was not rotated: {e}"));
+        } else {
+            self.refresh_world();
+        }
+        self.buy_cursor = Some(cursor);
+        true
+    }
+
+    /// Handles pointer movement over the house view in Buy Mode (`0x487d3d`,
+    /// `0x485a2e`): on mouse entry (`!self.buy_in_house`), recreates the
+    /// armed catalog preview at the tool's stored facing (`0x487d3d` →
+    /// `0x486f5a`); then rechecks the previous cursor position (`0x485bda`),
+    /// rotates the held object in place while dragging past the 6 px
+    /// threshold (`dx^2 + dy^2 > 36`), and otherwise moves the cursor to the
+    /// terrain-unprojected tile (including within the 6 px drag radius).
+    fn hover_buy(&mut self, point: [i32; 2]) -> bool {
+        if self.stopped.is_some() {
+            return false;
+        }
+        if !self.buy_in_house {
+            self.buy_in_house = true;
+            if let Some(guid) = self.buy_selected {
+                // Native `0x487d3d` → `0x486f5a`: destroy any hidden previous
+                // preview (`0x487105`) and instantiate a fresh one using the
+                // tool's stored facing (`tool[0x10]`), resetting it to
+                // `default_buy_direction` only when switching catalog items.
+                if let Some(old) = self.buy_cursor.take()
+                    && let Err(e) = self.lot.buy_cancel(&old)
+                {
+                    self.buy_cursor = Some(old);
+                    self.buy_in_house = false;
+                    self.note = Some(format!("Could not reset Buy preview: {e}"));
+                    return true;
+                }
+                if self.buy_last_guid != Some(guid) {
+                    self.buy_facing =
+                        Some(sims_vm::default_buy_direction(self.view.camera.rotation));
+                    self.buy_last_guid = Some(guid);
+                }
+                let dir = self
+                    .buy_facing
+                    .unwrap_or_else(|| sims_vm::default_buy_direction(self.view.camera.rotation));
+                match self.lot.buy_start(guid, self.view.camera.level, dir) {
+                    Ok(Some(cursor)) => self.buy_cursor = Some(cursor),
+                    Ok(None) => {
+                        self.hud.play(crate::hud::ERROR);
+                        self.buy_selected = None;
+                        self.hud.buy_state.selected = None;
+                        self.hud
+                            .layout_buy(self.view.size, self.lot.world(), &self.assets);
+                        return true;
+                    }
+                    Err(e) => {
+                        self.note = Some(format!("Could not start placing 0x{guid:08X}: {e}"));
+                        return true;
+                    }
+                }
+            }
+        }
+        let Some(mut cursor) = self.buy_cursor.take() else {
+            return false;
+        };
+        // Native `0x485b4c..0x485bda`: ALWAYS recheck the `"Tile Cursor"`'s
+        // physical on-lot position on the currently displayed floor
+        // (`0x485ba2`) BEFORE checking the drag threshold.
+        let level = self.view.camera.level;
+        if let Err(e) = self.lot.buy_recheck(&mut cursor, level) {
+            self.note = Some(format!("Could not recheck Buy placement: {e}"));
+        }
+        let rotated = if let Some(anchor) = self.buy_dragging {
+            let dx = point[0] - anchor[0];
+            let dy = point[1] - anchor[1];
+            if dx * dx + dy * dy > 36 {
+                // Native `0x485d5d..0x485dad`: `iVar6 = dy`, `iVar8 = dx`.
+                // Upper-left -> 6, upper-right -> 4, lower-left -> 0,
+                // lower-right -> 2. Compare `desired` against post-`0x485bda`
+                // current facing FIRST (`0x485da9`), and only if they differ
+                // subtract the OBJD `+0x7a` facing offset (`0x434f8d`) before
+                // turning.
+                let quad = if dy < 0 {
+                    if dx < 0 { 6 } else { 4 }
+                } else if dx < 0 {
+                    0
+                } else {
+                    2
+                };
+                let desired = (quad - 2 * i16::from(self.view.camera.rotation & 3)).rem_euclid(8);
+                let current = self
+                    .lot
+                    .world()
+                    .objects
+                    .get(&cursor.held)
+                    .and_then(|o| o.data.get(1).copied())
+                    .unwrap_or(0)
+                    .rem_euclid(8);
+                if current != desired {
+                    let target = (desired - cursor.facing_offset).rem_euclid(8);
+                    if let Err(e) = self.lot.buy_rotate(&mut cursor, target) {
+                        self.note = Some(format!("The object was not rotated: {e}"));
+                    }
+                }
+                // Native `0x485e59` → `0x485e72`: test Tile Cursor fit on the
+                // existing preview in place on the displayed floor (without an
+                // extra TakeOff) and place if it fits, including when the
+                // facing was unchanged.
+                if let Err(e) = self.lot.buy_put_if_fits(&mut cursor, level) {
+                    self.note = Some(format!("Could not finalize Buy placement: {e}"));
+                }
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !rotated {
+            let at = [point[0] - pick::ORIGIN_COLUMN, point[1]];
+            let fine = sims_render::unproject_terrain(&self.lot_shape, &self.view.camera, at)
+                .unwrap_or_else(|| self.view.camera.unproject_fine(at));
+            if let Err(e) = self.lot.buy_move(&mut cursor, fine, self.view.camera.level) {
+                self.note = Some(format!("Could not move Buy cursor: {e}"));
+            }
+        }
+        self.buy_cursor = Some(cursor);
+        self.refresh_world();
+        true
+    }
+
+    /// Hides the active Buy Mode cursor off the lot on mouse exit (`0x487d4e`).
+    fn hide_buy_cursor(&mut self) -> bool {
+        let was_in = std::mem::replace(&mut self.buy_in_house, false);
+        if !was_in {
+            return false;
+        }
+        let Some(mut cursor) = self.buy_cursor.take() else {
+            return false;
+        };
+        if let Err(e) = self.lot.buy_hide(&mut cursor) {
+            self.note = Some(format!("Could not hide Buy cursor: {e}"));
+        }
+        self.buy_cursor = Some(cursor);
+        self.refresh_world();
+        true
+    }
+
+    /// Commits a Buy Mode placement on mouse release (`0x4864d0` → `0x486ada`
+    /// → `0x421a0e`, `0x4929fb`). For repeat-buy items (`cursor.keep_buying`,
+    /// OBJD word 96 == 1 outside tutorial), immediately starts another copy
+    /// with the placed item's facing (`0x4864d0` → `0x486f5a`) if affordable.
+    fn commit_buy(&mut self, point: [i32; 2]) -> Outcome {
+        let Some(cursor) = self.buy_cursor.take() else {
+            return Outcome::default();
+        };
+        if !cursor.valid {
+            self.buy_cursor = Some(cursor);
+            self.hud.play(crate::hud::ERROR);
+            let sounds = self.hud.take_sounds();
+            self.keep_sounds(sounds);
+            return Outcome::redraw();
+        }
+        let last_facing = self
+            .lot
+            .world()
+            .objects
+            .get(&cursor.held)
+            .and_then(|o| o.data.get(1).copied())
+            .unwrap_or_else(|| sims_vm::default_buy_direction(self.view.camera.rotation));
+        match self.lot.buy_commit(&cursor) {
+            Ok(_) => {
+                // Native `0x486ada` line `0x486af6`: remember the committed
+                // facing on the tool (`tool[0x10]`).
+                self.buy_facing = Some(last_facing);
+                self.buy_last_guid = Some(cursor.guid);
+                if cursor.keep_buying || self.shift_held {
+                    let funds = sims_vm::available_funds(self.lot.world());
+                    if cursor.price <= 0 || cursor.price <= funds {
+                        self.buy_selected = Some(cursor.guid);
+                        self.hud.buy_state.selected = Some(cursor.guid);
+                        match self
+                            .lot
+                            .buy_start(cursor.guid, self.view.camera.level, last_facing)
+                        {
+                            Ok(Some(next)) => {
+                                self.buy_cursor = Some(next);
+                                self.buy_in_house = !self.hud.covers(point);
+                                self.refresh_world();
+                                if !self.hud.covers(point) {
+                                    self.hover_buy(point);
+                                }
+                            }
+                            Ok(None) => {
+                                self.hud.play(crate::hud::ERROR);
+                                self.buy_selected = None;
+                                self.hud.buy_state.selected = None;
+                                self.refresh_world();
+                            }
+                            Err(e) => {
+                                self.note = Some(format!(
+                                    "Could not start repeat purchase 0x{:08X}: {e}",
+                                    cursor.guid
+                                ));
+                                self.buy_selected = None;
+                                self.hud.buy_state.selected = None;
+                                self.refresh_world();
+                            }
+                        }
+                    } else {
+                        self.hud.play(crate::hud::ERROR);
+                        self.buy_selected = None;
+                        self.hud.buy_state.selected = None;
+                        self.refresh_world();
+                    }
+                } else {
+                    self.buy_selected = None;
+                    self.hud.buy_state.selected = None;
+                    self.refresh_world();
+                }
+                self.hud
+                    .layout_buy(self.view.size, self.lot.world(), &self.assets);
+            }
+            Err(e) => {
+                // `Lot::buy_commit` rolled back the world; keep the cursor
+                // handle so the preview objects remain manageable.
+                self.buy_cursor = Some(cursor);
+                self.note = Some(format!("The item was not placed: {e}"));
+                self.hud.play(crate::hud::ERROR);
+            }
+        }
+        let sounds = self.hud.take_sounds();
+        self.keep_sounds(sounds);
+        Outcome::redraw()
+    }
+
+    /// Refreshes the cached render lot shape and people from `self.lot.world()`.
+    fn refresh_world(&mut self) {
+        let world = self.lot.world();
+        self.people.refresh(world);
+        match sims_render::Lot::from_world(world) {
+            Ok(shape) => self.lot_shape = shape.with_floor_rotation(self.lot.floor_rotation()),
+            Err(e) => self
+                .people
+                .note(vec![format!("the lot is not redrawn: {e}")]),
+        }
+    }
+}
+
+fn panel_mode_for(mode: Mode) -> PanelMode {
+    match mode {
+        Mode::Live => PanelMode::Live,
+        Mode::Buy => PanelMode::Buy,
+        Mode::Build => PanelMode::Build,
+        Mode::Options => PanelMode::Options,
+    }
+}
+
+fn ui_mode(mode: PanelMode) -> Mode {
+    match mode {
+        PanelMode::Live => Mode::Live,
+        PanelMode::Build => Mode::Build,
+        PanelMode::Buy => Mode::Buy,
+        PanelMode::Options | PanelMode::Camera => Mode::Options,
     }
 }
 
@@ -1558,19 +2360,29 @@ fn centre_position(world: &sims_sim::World, id: u16) -> Option<[i32; 3]> {
     Some([(sum_x / count) as i32, (sum_y / count) as i32, level])
 }
 
-/// The screen point of a fine lot position ([`sound::object_point_on_lot`]),
-/// worked out from the lot's own corner and then moved by the origin:
-/// the original cuts the point to 16 bits, and its scroll limits
-/// (0x4a9fa9) keep its origin small enough for that, where the window's
-/// origin may go much further.
+/// The screen point of a fine lot position (`0x4a9dc7` → `0x4a9c50`),
+/// narrowing rotated tile coordinates to signed bytes (`0x4a9c5c..0x4a9c71`)
+/// while preserving the low 4-bit sub-tile offset, worked out from the lot's
+/// own corner and then moved by the origin.
 fn lot_point(camera: &Camera, lot: &sims_render::Lot, position: [i32; 3]) -> [i32; 2] {
-    let at = sound::object_point_on_lot(
+    let rotated = sound::rotate_object_fine(camera, [position[0], position[1]]);
+    let tile = [
+        i32::from((rotated[0] >> 4) as i8),
+        i32::from((rotated[1] >> 4) as i8),
+    ];
+    let narrowed = [
+        (tile[0] << 4) | (rotated[0] & 15),
+        (tile[1] << 4) | (rotated[1] & 15),
+    ];
+    let corners = sound::tile_corners(lot, camera, tile);
+    let at = sound::fine_point_with_heights(
         &Camera {
             origin: [0, 0],
             ..*camera
         },
-        lot,
-        position,
+        narrowed,
+        position[2],
+        corners,
     );
     [
         at[0].saturating_add(camera.origin[0]),
@@ -1685,6 +2497,142 @@ fn sync_speed_after_step(
     }
     pace.restart();
     true
+}
+
+/// Rotates a fine lot/view coordinate about `1023` (`0x47bc1f` with `0x400`).
+fn rotate_fine_1023([x, y]: [i32; 2], turns: u8) -> [i32; 2] {
+    let m: i32 = 1023;
+    match turns & 3 {
+        1 => [m.wrapping_sub(y), x],
+        2 => [m.wrapping_sub(x), m.wrapping_sub(y)],
+        3 => [y, m.wrapping_sub(x)],
+        _ => [x, y],
+    }
+}
+
+/// Applies `Move::ZoomIn`, `Move::ZoomOut`, or `Move::Rotate` using the
+/// original's terrain-aware screen-centre anchor on the displayed floor
+/// (`0x4a7c1f..0x4a7d2e` for zoom, `0x4a7e89..0x4a7f94` for rotation):
+///
+/// 1. Picks the view-rotated fine ground point at the active house viewport's
+///    midpoint (`0x4a7b58`) using the native origin column (`origin[0] + 1`).
+/// 2. Cuts it to a signed-byte tile (`0x433067`) and checks the rotated lot's
+///    interior bounds (`0x434cb7`); if outside, falls back to the tile
+///    `[(size / 4) + min_x, (size / 4) + min_y]` converted to its fine centre
+///    `((t << 4) | 8)` (`0x4a7dec`, `0x434c98`).
+/// 3. Updates zoom (or un-rotates by `(-old) & 3`, updates rotation, and
+///    re-rotates by `new` via `0x47bc1f` about `1023`).
+/// 4. Recenters via `0x4a7996` (`on_lot` check `0x4a7af0`, terrain-aware
+///    projection on `camera.level` via `fine_point_with_heights`, clamping to
+///    `scroll_limits` and `(x + 1) & !3` alignment at `0x4a81cc`).
+fn native_zoom_or_rotate(
+    lot: &sims_render::Lot,
+    camera: &mut Camera,
+    viewport: [i32; 2],
+    command: Move,
+) -> bool {
+    let before = *camera;
+    let next_zoom = match command {
+        Move::ZoomIn => {
+            let next = camera.zoom.zoom_in();
+            if next == camera.zoom {
+                return false;
+            }
+            Some(next)
+        }
+        Move::ZoomOut => {
+            let next = camera.zoom.zoom_out();
+            if next == camera.zoom {
+                return false;
+            }
+            Some(next)
+        }
+        Move::Rotate(_) => None,
+        _ => return false,
+    };
+
+    let mut native = *camera;
+    native.origin[0] = native.origin[0].saturating_add(pick::ORIGIN_COLUMN);
+    let mut fine = match sims_render::screen_centre_pick(lot, &native, viewport) {
+        Some(fine) => fine,
+        None => return false,
+    };
+    let [tx, ty] = [
+        i32::from((fine[0] >> 4) as i8),
+        i32::from((fine[1] >> 4) as i8),
+    ];
+    let b = sound::lot_bounds(lot, &native);
+    let inside = tx > b[0] && tx < b[1] && ty > b[2] && ty < b[3];
+    if !inside {
+        let quarter = (lot.size as i32 / 4) as i8;
+        let fx = i32::from(quarter.wrapping_add(b[0] as i8));
+        let fy = i32::from(quarter.wrapping_add(b[2] as i8));
+        fine = [(fx << 4) | 8, (fy << 4) | 8];
+    }
+
+    if let Some(zoom) = next_zoom {
+        native.zoom = zoom;
+    } else if let Move::Rotate(clockwise) = command {
+        let unrotated = rotate_fine_1023(fine, (4 - (native.rotation & 3)) & 3);
+        native.rotation = (native.rotation + if clockwise { 1 } else { 3 }) & 3;
+        fine = rotate_fine_1023(unrotated, native.rotation);
+    }
+
+    // 0x4a7af0 narrows the rotated tile coordinates to signed bytes (`movsx al/dl`)
+    // before checking lot bounds, and 0x4a9dc7 → 0x4a9c50 projects the narrowed tile
+    // plus the low 4-bit fractional offset.
+    let b = sound::lot_bounds(lot, &native);
+    let [rx, ry] = [
+        i32::from((fine[0] >> 4) as i8),
+        i32::from((fine[1] >> 4) as i8),
+    ];
+    if rx >= b[0] && rx <= b[1] && ry >= b[2] && ry <= b[3] {
+        let narrowed_fine = [(rx << 4) | (fine[0] & 15), (ry << 4) | (fine[1] & 15)];
+        let corners = sound::tile_corners(lot, &native, [rx, ry]);
+        // 0x4a79fd projects using the current native origin and sign-extends the
+        // 16-bit screen coordinates before `0x4a7a23..0x4a7a47` computes
+        // `current_origin + (middle - screen_point)`.
+        let at = sound::fine_point_with_heights(&native, narrowed_fine, native.level, corners);
+        let middle = [viewport[0] / 2, viewport[1] / 2];
+        let target = [
+            native.origin[0].saturating_add(middle[0].saturating_sub(at[0])),
+            native.origin[1].saturating_add(middle[1].saturating_sub(at[1])),
+        ];
+        let ([min_x, max_x], [min_y, max_y]) = scroll_limits(lot, &native, viewport);
+        let native_x = target[0].max(min_x).min(max_x).wrapping_add(1) & !3;
+        let clamped_y = target[1].max(min_y).min(max_y);
+        native.origin = [native_x, clamped_y];
+    }
+
+    camera.zoom = native.zoom;
+    camera.rotation = native.rotation;
+    camera.origin = [
+        native.origin[0].saturating_sub(pick::ORIGIN_COLUMN),
+        native.origin[1],
+    ];
+    if camera.zoom != before.zoom {
+        let built = before.focus.masks_built_at.unwrap_or(before.zoom);
+        camera.focus.masks_built_at = (built != camera.zoom).then_some(built);
+    }
+    if camera.rotation != before.rotation {
+        camera.focus.masks_built_at = None;
+    }
+    *camera != before
+}
+
+/// The active 3D house viewport size (`0x49ae5e`, `0x4f4b43`, `0x4d363b`,
+/// `0x53b2eb` → `0x4b136b` → `0x49b0bf` → `0x5cf1b6`): full canvas when the
+/// bottom strip is closed, and `height - STRIP` (`height - 150 + 50` from the
+/// shared 150-pixel panel container at `0x4f4b43`) when the strip is open in
+/// Live, Build, Buy, or Options mode.
+fn viewport_for_controls(size: [i32; 2], controls: &sims_ui::hud::Controls) -> (u32, u32) {
+    let [w, h] = size.map(|n| n.max(1));
+    let strip = if controls.expanded {
+        sims_ui::hud::STRIP
+    } else {
+        0
+    };
+    (w as u32, (h - strip).max(1) as u32)
 }
 
 #[cfg(test)]
@@ -2020,5 +2968,201 @@ mod tests {
         assert_eq!(pace.due(1_000, NORMAL), 0);
         assert_eq!(pace.due(40_999, NORMAL), 0);
         assert_eq!(pace.due(1, NORMAL), 1);
+    }
+
+    #[test]
+    fn house_viewport_size_follows_the_control_panel_strip() {
+        use sims_ui::command::Mode;
+        use sims_ui::hud::Controls;
+
+        let mut controls = Controls::default();
+        assert!(!controls.expanded);
+        assert_eq!(viewport_for_controls([800, 600], &controls), (800, 600));
+
+        controls.expanded = true;
+        controls.mode = Mode::Live;
+        assert_eq!(viewport_for_controls([800, 600], &controls), (800, 500));
+
+        controls.mode = Mode::Build;
+        assert_eq!(viewport_for_controls([800, 600], &controls), (800, 500));
+
+        controls.mode = Mode::Options;
+        assert_eq!(viewport_for_controls([800, 600], &controls), (800, 500));
+
+        controls.mode = Mode::Buy;
+        assert_eq!(viewport_for_controls([800, 600], &controls), (800, 500));
+
+        // Short windows clamp to at least 1 pixel rather than wrapping.
+        assert_eq!(viewport_for_controls([800, 80], &controls), (800, 1));
+    }
+
+    #[test]
+    fn screen_centre_pick_uses_active_viewport_and_native_origin_column() {
+        use sims_render::camera::{Walls, Zoom};
+        use sims_ui::hud::Controls;
+
+        let mut world = sims_sim::World::empty();
+        world.size = 64;
+        let full = sims_render::lot::FULL * sims_render::lot::FULL;
+        for (id, stride) in [(0, 4), (1, 1), (2, 8), (101, 1), (102, 8)] {
+            world.arrays.insert(
+                id,
+                sims_formats::lot::Array {
+                    width: sims_render::lot::FULL,
+                    height: sims_render::lot::FULL,
+                    stride,
+                    encoding: 0,
+                    data: vec![0; full * stride],
+                },
+            );
+        }
+        let lot = sims_render::Lot::from_world(&world).unwrap();
+        let pick_tile = |game_origin: [i32; 2], expanded: bool| {
+            let controls = Controls {
+                expanded,
+                ..Controls::default()
+            };
+            let (w, h) = viewport_for_controls([800, 600], &controls);
+            let camera = Camera {
+                origin: [
+                    game_origin[0].saturating_add(pick::ORIGIN_COLUMN),
+                    game_origin[1],
+                ],
+                zoom: Zoom::Far,
+                rotation: 0,
+                level: 1,
+                walls: Walls::Cutaway,
+                focus: sims_render::Focus::default(),
+            };
+            sims_render::screen_centre_pick(&lot, &camera, [w as i32, h as i32])
+                .map(|[x, y]| [(x >> 4) as i8, (y >> 4) as i8])
+        };
+        // Native origin [400, 0] (game origin [399, 0]): expanded 800x500 picks
+        // [15, 15], collapsed 800x600 picks [18, 18].
+        assert_eq!(pick_tile([399, 0], true), Some([15, 15]));
+        assert_eq!(pick_tile([399, 0], false), Some([18, 18]));
+        // Expanded 800x500: game origin [398, -6] (native [399, -6]) picks
+        // [16, 15], while game origin [399, -6] (native [400, -6]) picks [16, 16].
+        assert_eq!(pick_tile([398, -6], true), Some([16, 15]));
+        assert_eq!(pick_tile([399, -6], true), Some([16, 16]));
+
+        // Zooming from Far to Medium with the panel expanded (800x500 active
+        // viewport) uses native 0x4a7b58 + 0x434cb7 + 0x4a7996 anchoring:
+        // - from native [400, -6] (inside lot): stays on [16, 16];
+        // - from native [400, 240] (tile [0, 0], outside interior): falls back
+        //   to quarter-lot tile [16, 16] (0x4a7c56..0x4a7c96) instead of [32, 32].
+        let controls = Controls {
+            expanded: true,
+            ..Controls::default()
+        };
+        let (w, h) = viewport_for_controls([800, 600], &controls);
+        let viewport = [w as i32, h as i32];
+        let pick_unrotated = |camera: Camera| {
+            let mut native = camera;
+            native.origin[0] = native.origin[0].saturating_add(pick::ORIGIN_COLUMN);
+            let tile = sims_render::screen_centre_pick(&lot, &native, viewport)
+                .map(|[x, y]| [i32::from((x >> 4) as i8), i32::from((y >> 4) as i8)])?;
+            Some(native.unrotate_tile(tile))
+        };
+
+        for start_origin in [[399, -6], [399, 240]] {
+            let mut cam = Camera {
+                origin: start_origin,
+                zoom: Zoom::Far,
+                rotation: 0,
+                level: 1,
+                walls: Walls::Cutaway,
+                focus: sims_render::Focus::default(),
+            };
+            assert!(native_zoom_or_rotate(
+                &lot,
+                &mut cam,
+                viewport,
+                Move::ZoomIn
+            ));
+            assert_eq!(
+                pick_unrotated(cam),
+                Some([16, 16]),
+                "zoom from game origin {start_origin:?}"
+            );
+        }
+
+        // On floor 2 at native origin [400, -6] (game [399, -6]), clockwise
+        // rotation anchors on the displayed floor's pick ([19, 19]) and keeps
+        // the unrotated search start at [19, 19].
+        let mut floor2 = Camera {
+            origin: [399, -6],
+            zoom: Zoom::Far,
+            rotation: 0,
+            level: 2,
+            walls: Walls::Cutaway,
+            focus: sims_render::Focus::default(),
+        };
+        assert_eq!(pick_unrotated(floor2), Some([19, 19]));
+        assert!(native_zoom_or_rotate(
+            &lot,
+            &mut floor2,
+            viewport,
+            Move::Rotate(true)
+        ));
+        assert_eq!(pick_unrotated(floor2), Some([19, 19]));
+
+        // Off-lot wrapped pick: on a flat 64x64 lot at 800x600 (collapsed),
+        // Far -> Medium from native origin [381, -3997] (game [380, -3997])
+        // wraps tile [269, 268] to signed bytes [13, 12] at 0x4a7af0 and
+        // recenters to native origin [392, -117] (game [391, -117]).
+        let mut wrapped = Camera {
+            origin: [380, -3997],
+            zoom: Zoom::Far,
+            rotation: 0,
+            level: 1,
+            walls: Walls::Cutaway,
+            focus: sims_render::Focus::default(),
+        };
+        assert!(native_zoom_or_rotate(
+            &lot,
+            &mut wrapped,
+            [800, 600],
+            Move::ZoomIn
+        ));
+        assert_eq!(
+            [wrapped.origin[0] + pick::ORIGIN_COLUMN, wrapped.origin[1]],
+            [392, -117]
+        );
+
+        // 16-bit screen wrap during zoom recentring (0x4a79fd..0x4a7a47): from
+        // game origin [380, 61539] (whose low 16 bits wrap to -3997), Far ->
+        // Medium projects with the current origin and clamps to [391, 232].
+        let mut wrapped_high = Camera {
+            origin: [380, 61539],
+            zoom: Zoom::Far,
+            rotation: 0,
+            level: 1,
+            walls: Walls::Cutaway,
+            focus: sims_render::Focus::default(),
+        };
+        assert!(native_zoom_or_rotate(
+            &lot,
+            &mut wrapped_high,
+            [800, 600],
+            Move::ZoomIn
+        ));
+        assert_eq!(wrapped_high.origin, [391, 232]);
+
+        // Wrapped lot position projection in `lot_point`: [424, 392, 1] and
+        // [4520, 392, 1] (differing by 256 tiles = 4096 fine units) project
+        // identically after signed-byte tile narrowing (0x4a9c5c..0x4a9c71).
+        let near = Camera {
+            origin: [0, 0],
+            zoom: Zoom::Near,
+            rotation: 0,
+            level: 1,
+            walls: Walls::Cutaway,
+            focus: sims_render::Focus::default(),
+        };
+        assert_eq!(
+            lot_point(&near, &lot, [424, 392, 1]),
+            lot_point(&near, &lot, [4520, 392, 1])
+        );
     }
 }

@@ -39,10 +39,9 @@ pub(crate) fn visitors() -> (Fixture, usize, i16) {
             RETURN_TRUE,
         )]),
     );
-    fx.program
-        .libraries
-        .get_mut(&file)
-        .unwrap()
+    let library = fx.program.libraries.get_mut(&file).unwrap();
+    library.writable = true;
+    library
         .names
         .insert(INIT_VISITOR, "init visitor".to_owned());
     fx.world.globals[SEEN] = 0;
@@ -220,6 +219,11 @@ fn a_person_made_with_person_word_68_74_or_84_set_resets_its_types_portrait() {
         assert_eq!(
             fx.world.portraits.contains(&WIDGET),
             !reset,
+            "word {word} = {value}"
+        );
+        assert_eq!(
+            fx.world.dirty_portraits.contains(&WIDGET),
+            reset,
             "word {word} = {value}"
         );
     }

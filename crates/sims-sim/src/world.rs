@@ -206,6 +206,22 @@ pub struct World {
     /// encodings of the states before it was kept stay a prefix of the new
     /// ones.
     pub portraits: BTreeSet<u32>,
+    /// The person types whose portrait slot 1 (entry +0x14) has its dirty
+    /// byte (+0x18) set (`0x4eb0eb` → `0x4e895e`), so `0x4e92a8` calls
+    /// `0x4e8c5d(index, 1, 0)` at `0x4e92e5` before falling back to `BMP_`
+    /// 2002 (`0x4e9338`). Always disjoint from [`World::portraits`]: every
+    /// `0x4eb0eb` releases all seven slots before marking them dirty, and
+    /// storing a non-null image (`0x4e899e`) clears the dirty byte. Kept
+    /// apart so that the encodings of the states before it was kept stay a
+    /// prefix of the new ones.
+    pub dirty_portraits: BTreeSet<u32>,
+    /// The person types whose `BMP_` 2002 portrait was written to a writable
+    /// character file during this run (`0x4e938c` → `0x4e8d2e` → `0x4e9000`),
+    /// so a later invalidation (`dirty_portraits`) and no-tile fallback
+    /// (`0x4e9706` → `0x4e9338`) can load the saved bitmap even when the file
+    /// had none at load. Kept apart so that the encodings of the states before
+    /// it was kept stay a prefix of the new ones.
+    pub saved_portraits: BTreeSet<u32>,
 }
 
 /// How many advertisements the record of [`World::advertisement_record`]
@@ -567,6 +583,8 @@ impl World {
             stops_asked: BTreeSet::new(),
             characters: Characters::default(),
             portraits: BTreeSet::new(),
+            dirty_portraits: BTreeSet::new(),
+            saved_portraits: BTreeSet::new(),
         }
     }
 

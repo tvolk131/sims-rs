@@ -14,11 +14,12 @@ use sims_render::{Assets, Canvas, Walls, Zoom};
 use sims_sim::World;
 use sims_ui::art::Art;
 use sims_ui::balloon::Texts;
-use sims_ui::command::{Command, Panel as UiPanel, Walls as UiWalls};
+use sims_ui::buy::{self, BuyCatalog, BuyLayout, BuyState, BuyWidgetKind};
+use sims_ui::command::{Command, Mode, Panel as UiPanel, Walls as UiWalls};
 use sims_ui::dialog::{self, Labels, Message};
 use sims_ui::frame::{Frame, Rect};
 use sims_ui::house;
-use sims_ui::household::{Acquaintances, Careers, Faces, Snapshot};
+use sims_ui::household::{Acquaintances, Careers, Faces, Fame, Snapshot};
 use sims_ui::hud::{self, Controls, Item, Selected};
 use sims_ui::pie;
 use sims_ui::queue::Queue;
@@ -51,8 +52,10 @@ pub struct Hud {
     /// What could not be read while drawing, until the game takes it.
     problems: Vec<String>,
     /// The careers of `work.iff`, for what the job panel shows the next
-    /// level needs.
+    /// level needs and for Child Report Card grade strings.
     careers: Careers,
+    /// Superstar fame progression data (`GameData/fame.iff`).
+    fame: Fame,
     /// The curves and constants the house panel's ratings are worked out
     /// with.
     house: house::Tuning,
@@ -82,8 +85,23 @@ pub struct Hud {
     queue: Queue,
     /// The actions whose icons were pressed while they show.
     pressed: Pressed,
-    /// The Live-mode pause button's 500 ms blink timer (`0x53b4b0..0x53b7e7`).
-    pause_blink: PauseBlink,
+    /// The clock controls' shared 500 ms blink timer (`0x53b4b0..0x53b7e7`):
+    /// state 2 blinks Pause (row 0 <-> row 1) and state 3 blinks Ultra
+    /// (`selected` false <-> true) during idle speed when return speed != Ultra.
+    clock_blink: ClockBlink,
+    /// Native `[control_panel + 0x1ec]` idle-blink flag: set on `0x109(1)`
+    /// (`0x46d7b5 -> 0x4f688e`), cleared on `0x109(0)` (`0x46d803`) or a
+    /// Live-mode manual speed press (`0x53a5e3..0x53a6e1`), and preserved
+    /// across scripted Special Effect `0x10c` speed resets
+    /// (`0x4f6856..0x4f687a` -> `0x53b663..0x53b6ac`).
+    idle_speed: bool,
+    /// The Buy Mode residential catalog, loaded lazily on first Buy Mode entry.
+    buy_catalog: Option<BuyCatalog>,
+    /// The Buy Mode catalog strip state (sort, category, subcategory, page,
+    /// selected GUID).
+    pub buy_state: BuyState,
+    /// The Buy Mode strip widgets and popup card as last laid out.
+    buy_layout: BuyLayout,
     /// The interface's sounds, until the game takes them.
     sounds: Vec<SoundEvent>,
 }
@@ -112,11 +130,17 @@ impl Hud {
             .copied()
             .collect();
         let mut art = Art::load(&ui, US_ENGLISH, &resources).map_err(|e| e.to_string())?;
-        art.load_optional(&ui, US_ENGLISH, sims_ui::balloon::BACKGROUND);
+        for id in hud::OPTIONAL_RESOURCES {
+            art.load_optional(&ui, US_ENGLISH, id);
+        }
+        for id in buy::resource_ids() {
+            art.load_optional(&ui, US_ENGLISH, id);
+        }
         let labels = Labels::load(&install).map_err(|e| e.to_string())?;
         // Without the balloons' strings the HUD still opens; the balloons
         // show what text they have.
         let texts = Texts::load(&install).unwrap_or_default();
+        let fame = Fame::load(&install).unwrap_or_default();
         let neighborhood = house
             .parent()
             .and_then(Path::parent)
@@ -155,6 +179,7 @@ impl Hud {
             thumbnails: Thumbnails::default(),
             problems: Vec::new(),
             careers,
+            fame,
             house,
             kinds: house::Kinds::default(),
             known,
@@ -173,31 +198,135 @@ impl Hud {
             band: None,
             queue: Queue::default(),
             pressed: Pressed::default(),
-            pause_blink: PauseBlink::default(),
+            clock_blink: ClockBlink::default(),
+            idle_speed: false,
+            buy_catalog: None,
+            buy_state: BuyState::default(),
+            buy_layout: BuyLayout::default(),
             sounds: Vec::new(),
         })
     }
 
     /// Forgets what the panel kept of the lot it showed, for a lot put
     /// back to a save: the pie menu, the dialog read, the icons pressed,
-    /// and the pause button's blink timer. The rest is read from the lot
-    /// at the next frame.
+    /// the Buy Mode catalog state, and the pause button's blink timer. The
+    /// rest is read from the lot at the next frame.
     pub fn forget(&mut self) {
         self.menu = None;
         self.message = None;
         self.dialog = None;
         self.pressed = Pressed::default();
-        self.pause_blink.reset();
+        self.clock_blink.reset();
+        self.idle_speed = false;
         self.controls.pause_lit = false;
+        self.controls.ultra_lit = false;
+        self.buy_state.reset();
+        self.buy_layout = BuyLayout::default();
     }
 
-    /// Syncs the pause button's 500 ms blink timer (`0x53b4b0..0x53b7e7`)
-    /// with `paused` (state 2 blinks whenever paused, including outside Live
-    /// mode via `0x53b58a -> 0x53b5d5 -> 0x53b5e8`) and the monotonic
-    /// `clock_us`. Returns true if the lit phase changed.
-    pub fn sync_pause_blink(&mut self, paused: bool, clock_us: u64) -> bool {
-        let changed = self.pause_blink.sync(paused, clock_us);
-        self.controls.pause_lit = self.pause_blink.lit();
+    /// Loads the residential Buy Mode catalog on first use and returns it.
+    pub fn ensure_buy_catalog(&mut self, assets: &Assets) -> &BuyCatalog {
+        self.buy_catalog
+            .get_or_insert_with(|| BuyCatalog::load(assets.index(), assets.catalog()))
+    }
+
+    /// The residential Buy Mode catalog, once loaded.
+    pub fn buy_catalog(&self) -> Option<&BuyCatalog> {
+        self.buy_catalog.as_ref()
+    }
+
+    /// The Buy Mode catalog strip layout as last built.
+    pub fn buy_layout(&self) -> &BuyLayout {
+        &self.buy_layout
+    }
+
+    /// Lays out the Buy Mode catalog strip for `size` and `world` (or clears
+    /// it outside expanded Buy Mode), syncing `self.buy_state.page` to the
+    /// clamped page number.
+    pub fn layout_buy(&mut self, size: [i32; 2], world: &World, assets: &Assets) {
+        if self.controls.mode != Mode::Buy || !self.controls.expanded {
+            self.buy_layout = BuyLayout::default();
+            return;
+        }
+        let catalog = self
+            .buy_catalog
+            .get_or_insert_with(|| BuyCatalog::load(assets.index(), assets.catalog()));
+        let funds = sims_vm::available_funds(world);
+        let layout = buy::layout(size, catalog, &self.buy_state, &self.art, funds);
+        self.buy_state.page = layout.page;
+        self.buy_layout = layout;
+    }
+
+    /// Clears the cached Buy Mode strip layout (e.g. when leaving Buy Mode).
+    pub fn clear_buy_layout(&mut self) {
+        self.buy_layout = BuyLayout::default();
+    }
+
+    /// Re-lays out the control panel items and Buy Mode strip for `size`
+    /// after a mode or panel toggle, so consecutive clicks work even before
+    /// the next [`Hud::draw`].
+    pub fn relayout_panel(
+        &mut self,
+        size: [i32; 2],
+        world: &World,
+        residential: bool,
+        assets: &Assets,
+    ) {
+        let snapshot = self.snapshot(world, residential);
+        self.items = hud::layout(size, &snapshot, &self.controls);
+        hud::fit(&mut self.items, &self.art, &self.texts);
+        self.layout_buy(size, world, assets);
+    }
+
+    /// Updates the native `[control_panel + 0x1ec]` idle-blink flag
+    /// (`0x109(1/0)` at `0x4f688e`, or cleared by manual Live-mode speed
+    /// clicks at `0x53a5e3..0x53a6e1`).
+    pub fn set_idle_speed(&mut self, active: bool) {
+        self.idle_speed = active;
+    }
+
+    /// Resolves `[control_panel + 0x1ec]` against `world`: `return_speed < 0`
+    /// means idle speed has exited (`0x109(0)`), `speed == IDLE` with
+    /// `return_speed >= 0` means idle speed is active (`0x109(1)`), and
+    /// `return_speed >= 0` with `speed != IDLE` preserves `self.idle_speed`
+    /// so scripted `0x10c` speed resets keep state 3 armed while manual
+    /// Live-mode speed clicks keep it cleared.
+    fn effective_idle_speed(&self, world: &World) -> bool {
+        if world.return_speed() < 0 {
+            false
+        } else if world.speed() == sims_sim::speed::IDLE {
+            true
+        } else {
+            self.idle_speed
+        }
+    }
+
+    /// Syncs the clock controls' shared 500 ms blink timer (`0x53b4b0..0x53b7e7`)
+    /// with `world` and the monotonic `clock_us`:
+    /// - state 2 (`Paused`): blinks `id::PAUSE` row 0 <-> row 1 whenever
+    ///   paused (including outside Live mode, `0x53b58a -> 0x53b5e8`);
+    /// - state 3 (`IdleUltra`): armed on `0x109(1)` from Live (`0x53b56f..0x53b57b`,
+    ///   even when `return_speed == ULTRA`) or when returning from Pause/non-Live
+    ///   with `return_speed != ULTRA` (`0x53b627..0x53b645`); toggles `id::ULTRA`
+    ///   selected state every 500 ms when `speed != Ultra` (`0x53b4c9..0x53b4fe`),
+    ///   and clears `ultra_lit` (without resetting the timer) on a speed refresh
+    ///   such as Special Effect `0x10c` (`0x53b0d3`, `0x53b121..0x53b128`).
+    ///
+    /// Returns true if either `controls.pause_lit` or `controls.ultra_lit` changed.
+    pub fn sync_clock_blink(&mut self, world: &World, clock_us: u64) -> bool {
+        self.idle_speed = self.effective_idle_speed(world);
+        let speed = hud::speed_for(world);
+        let speed_pair = (world.speed(), world.return_speed());
+        let changed = self.clock_blink.sync(
+            world.paused(),
+            self.controls.mode,
+            self.idle_speed,
+            speed,
+            speed_pair,
+            clock_us,
+        );
+        self.controls.pause_lit = self.clock_blink.pause_lit();
+        self.controls.ultra_lit = self.clock_blink.ultra_lit();
         changed
     }
 
@@ -253,12 +382,14 @@ impl Hud {
             .map_or(&[], |f| f.members.as_slice())
     }
 
-    /// The household with zoning-aware family friends and what the next
-    /// level of each one's career needs.
+    /// The household with zoning-aware family friends, career needs/grades,
+    /// and Superstar fame progression data.
     fn household(&self, world: &World, residential: bool) -> Snapshot {
         Snapshot::read(world, self.members(world))
+            .with_idle_speed(self.effective_idle_speed(world))
             .with_zoning(world, residential, self.known.friendship)
             .with_careers(&self.careers)
+            .with_fame(world, &self.known, &self.fame)
     }
 
     /// `snapshot` with what the open panel reads besides.
@@ -267,7 +398,7 @@ impl Hud {
             Some(UiPanel::Relationships) => {
                 snapshot.with_relations(world, self.members(world), &self.known)
             }
-            Some(UiPanel::House) if self.controls.expanded => {
+            Some(UiPanel::House) if self.controls.expanded && snapshot.residential => {
                 snapshot.with_house(world, &self.house, &self.kinds)
             }
             _ => snapshot,
@@ -310,22 +441,47 @@ impl Hud {
         if self.controls.follow(Selected::of(&household)) {
             self.play(WHOOSH);
         }
-        if self.controls.expanded && self.controls.panel == Some(UiPanel::House) {
+        // 0x51d3f9..0x51d412: rejecting House on a non-residential lot stores
+        // panel 0 (`None`) so a reused HUD does not reopen House on a later
+        // residential lot.
+        if !residential && self.controls.panel == Some(UiPanel::House) {
+            self.controls.panel = None;
+            if self.controls.help.take().is_some() {
+                self.play(WHOOSH);
+            }
+        }
+        if self.controls.expanded && residential && self.controls.panel == Some(UiPanel::House) {
             self.kinds.learn(world, assets.index(), assets.catalog());
         }
         // The pause button shows global 17, which the game's pause sets.
         let snapshot = self.for_panel(household, world);
+        if let Some(help) = self.controls.help
+            && !hud::help_matches_snapshot(help, &snapshot, self.controls.panel)
+        {
+            self.controls.help = None;
+            self.play(WHOOSH);
+        }
         self.items = hud::layout(view.size, &snapshot, &self.controls);
         hud::fit(&mut self.items, &self.art, &self.texts);
         self.queue = Queue::read(world, snapshot.selected);
         self.pressed.keep(&self.queue);
-        let objects: Vec<u32> = self.queue.objects().collect();
-        for guid in objects {
+        let queue_objects: Vec<u32> = self.queue.objects().collect();
+        for guid in queue_objects {
             // A type whose picture fails is kept as the error left it
             // (`Thumbnails::read`), and not read again.
             if let Err(e) = self.thumbnails.read(assets.index(), assets.catalog(), guid) {
                 self.problems
                     .push(format!("the catalog picture of type 0x{guid:08X}: {e}"));
+            }
+        }
+        let balloon_objects: Vec<u32> = hud::balloon_objects(&self.items).collect();
+        for guid in balloon_objects {
+            if let Err(e) = self
+                .thumbnails
+                .read_balloon(assets.index(), assets.catalog(), guid)
+            {
+                self.problems
+                    .push(format!("the balloon picture of type 0x{guid:08X}: {e}"));
             }
         }
         let (width, height) = (
@@ -339,15 +495,45 @@ impl Hud {
                 return;
             }
         };
-        hud::draw(
+        hud::draw_with_thumbnails(
             &mut frame,
             &self.art,
             &self.faces,
+            Some(&self.thumbnails),
             &self.items,
             &self.controls,
         );
-        self.queue
-            .draw(&mut frame, &self.art, &self.faces, &self.thumbnails);
+        if self.controls.mode == Mode::Buy && self.controls.expanded {
+            self.layout_buy(view.size, world, assets);
+            let mut guids: Vec<u32> = self
+                .buy_layout
+                .widgets
+                .iter()
+                .filter_map(|w| match w.kind {
+                    BuyWidgetKind::Slot { guid, .. } => Some(guid),
+                    BuyWidgetKind::Button { .. } => None,
+                })
+                .collect();
+            if let Some(card) = &self.buy_layout.popup {
+                guids.push(card.guid);
+            }
+            for guid in guids {
+                let _ = self.thumbnails.read(assets.index(), assets.catalog(), guid);
+            }
+            buy::draw(
+                &mut frame,
+                &self.art,
+                &self.thumbnails,
+                &self.buy_layout,
+                self.controls.pointer,
+            );
+        } else {
+            self.buy_layout = BuyLayout::default();
+        }
+        if self.controls.mode == Mode::Live {
+            self.queue
+                .draw(&mut frame, &self.art, &self.faces, &self.thumbnails);
+        }
         self.dialog = self
             .message
             .as_ref()
@@ -368,7 +554,7 @@ impl Hud {
         }
         if let Some(menu) = &mut self.menu {
             menu.layout(&self.art, view.size);
-            menu.draw(&mut frame, &self.art, self.controls.pointer);
+            menu.draw_labels(&mut frame, &self.art, self.controls.pointer);
         }
         self.band = status.and_then(|status| self.status(&mut frame, status));
         canvas.color = frame.into_rgb();
@@ -412,7 +598,10 @@ impl Hud {
             || self.menu.is_some()
             || self.band.is_some_and(|b| b.contains(point[0], point[1]))
             || hud::covers(&self.items, point)
-            || self.queue.at(point).is_some()
+            || (self.controls.mode == Mode::Buy
+                && self.controls.expanded
+                && self.buy_layout.covers(point))
+            || (self.controls.mode == Mode::Live && self.queue.at(point).is_some())
     }
 
     /// The selected Sim's actions as last drawn.
@@ -471,8 +660,35 @@ impl Hud {
         self.pressed.release(uid);
     }
 
-    /// Moves the pointer; true if what it hovers changed.
+    /// The pointer's current position in canvas pixels, if inside the window.
+    pub fn pointer(&self) -> Option<[i32; 2]> {
+        self.controls.pointer
+    }
+
+    /// Sets the pointer position directly (used when opening a pie menu so the
+    /// opening frame seeds its head pose and hit state from the press or
+    /// on-screen clamp warp rather than a stale hover, `0x5ebd05` / `0x5ebd29`).
+    pub fn set_pointer(&mut self, point: [i32; 2]) {
+        self.controls.pointer = Some(point);
+    }
+
+    /// Whether a dialog message is loaded and will cover/close any open pie
+    /// menu on this frame (`Hud::draw`).
+    pub fn will_show_dialog(&self, size: [i32; 2]) -> bool {
+        self.message
+            .as_ref()
+            .and_then(|(m, _)| dialog::layout(size, m, &self.art))
+            .is_some()
+    }
+
+    /// Moves the pointer; true if what it hovers changed, a pie menu is open
+    /// (so the Sim's 3D head follows the pointer), or an open help balloon was
+    /// dismissed by moving outside the subpanel (including onto the balloon
+    /// itself, which attaches outside `LivePanel` at `0x51a0a2..0x51a0b5`,
+    /// `0x51f1f2..0x51f3e5`, `0x51d2ee..0x51d359`).
     pub fn hover(&mut self, point: [i32; 2]) -> bool {
+        let moved_for_pie =
+            self.menu.is_some() && self.dialog.is_none() && self.controls.pointer != Some(point);
         let button = |pointer: Option<[i32; 2]>| {
             let layout = self.dialog.as_ref()?;
             let [x, y] = pointer?;
@@ -482,25 +698,41 @@ impl Hud {
             let menu = self.menu.as_ref()?;
             Some(menu.hovered(pointer?))
         };
+        let buy_widget = |pointer: Option<[i32; 2]>| {
+            let [x, y] = pointer?;
+            self.buy_layout
+                .widgets
+                .iter()
+                .rposition(|w| w.rect.contains(x, y))
+        };
         let before = (
             hud::hovered(&self.items, self.controls.pointer),
             hud::lit_relation(&self.items, self.controls.pointer),
             button(self.controls.pointer),
             entry(self.controls.pointer),
+            buy_widget(self.controls.pointer),
         );
         self.controls.pointer = Some(point);
-        (
+        let hovered_changed = (
             hud::hovered(&self.items, self.controls.pointer),
             hud::lit_relation(&self.items, self.controls.pointer),
             button(self.controls.pointer),
             entry(self.controls.pointer),
-        ) != before
+            buy_widget(self.controls.pointer),
+        ) != before;
+        let dismissed = self.controls.help.is_some()
+            && !hud::in_subpanel(&self.items, point)
+            && self.dismiss_help();
+        moved_for_pie || hovered_changed || dismissed
     }
 
-    /// The pointer left the window: no button is hovered and no name
-    /// shows. True if the pointer was in it, so the frame changes.
+    /// The pointer left the window: no button is hovered, no name shows, and
+    /// any open help balloon is dismissed (`0x51d2ee..0x51d317`). True if the
+    /// frame changes.
     pub fn leave(&mut self) -> bool {
-        self.controls.pointer.take().is_some()
+        let left = self.controls.pointer.take().is_some();
+        let dismissed = self.dismiss_help();
+        left || dismissed
     }
 
     /// Where the pointer is to be moved, as the original moves it when a
@@ -515,6 +747,17 @@ impl Hud {
     pub fn resize_menu(&mut self, size: [i32; 2]) {
         if let Some(menu) = &mut self.menu {
             menu.layout(&self.art, size);
+        }
+    }
+
+    /// Dismisses any open help balloon (`0x50fb7f`) and plays `UI_whoosh`.
+    /// Returns true if a balloon was open.
+    pub fn dismiss_help(&mut self) -> bool {
+        if self.controls.help.take().is_some() {
+            self.play(WHOOSH);
+            true
+        } else {
+            false
         }
     }
 
@@ -537,10 +780,21 @@ impl Hud {
         // The status band is drawn over everything else on the lot,
         // the icons too, and takes the press.
         if self.band.is_some_and(|b| b.contains(point[0], point[1])) {
+            self.dismiss_help();
             return None;
         }
-        if let Some(command) = self.press_queue(point) {
+        if self.controls.mode == Mode::Live
+            && let Some(command) = self.press_queue(point)
+        {
+            self.dismiss_help();
             return command;
+        }
+        if self.controls.mode == Mode::Buy
+            && self.controls.expanded
+            && let Some(command) = self.buy_layout.press(point)
+        {
+            self.buy_state.apply(&command);
+            return Some(command);
         }
         let command = match hud::press(&self.items, point) {
             Some(command) => command,
@@ -548,11 +802,18 @@ impl Hud {
                 // If Interests/Gifts was laid out disabled (e.g. while a pet
                 // was selected) and selection switched to a human before
                 // redraw, the press still opens the panel (0x51c5a6).
-                let panel = hud::disabled_panel(&self.items, point)?;
-                let snapshot = Snapshot::read(world, self.members(world));
-                if Selected::of(&snapshot) == Selected::Human {
-                    Command::OpenPanel(panel)
+                if let Some(panel) = hud::disabled_panel(&self.items, point) {
+                    let snapshot = Snapshot::read(world, self.members(world));
+                    if Selected::of(&snapshot) == Selected::Human {
+                        Command::OpenPanel(panel)
+                    } else {
+                        return None;
+                    }
                 } else {
+                    if !hud::in_subpanel(&self.items, point) && !hud::on_balloon(&self.items, point)
+                    {
+                        self.dismiss_help();
+                    }
                     return None;
                 }
             }
@@ -562,6 +823,16 @@ impl Hud {
                 let snapshot = Snapshot::read(world, self.members(world));
                 let selected = Selected::of(&snapshot);
                 hud::check_press(command, selected, residential)
+            }
+            // Guard stale subpanel hit rects before redraw so a hidden control
+            // (e.g. zodiac on a pet, Report Card on an adult, or Fame on a
+            // regular career) does not open a balloon or play `UI_whoosh`.
+            Command::Help(help) => {
+                let snapshot = self.household(world, residential);
+                if !hud::help_matches_snapshot(help, &snapshot, self.controls.panel) {
+                    return None;
+                }
+                command
             }
             other => other,
         };
@@ -596,7 +867,17 @@ impl Hud {
                         });
                 (release, command)
             }
-            Release::Settled | Release::Stays => {
+            Release::Settled => {
+                // Settling does not create a new cursor warp (`0x5eb53c`);
+                // leave the pointer at the release coordinate rather than
+                // re-applying an unconsumed opening warp.
+                self.menu = Some(menu);
+                (release, None)
+            }
+            Release::Stays => {
+                if let Some(point) = menu.pending_pointer() {
+                    self.controls.pointer = Some(point);
+                }
                 self.menu = Some(menu);
                 (release, None)
             }
@@ -642,88 +923,395 @@ impl Pressed {
     }
 }
 
-/// The Live-mode pause button's 500 ms blink timer (`0x53b4b0..0x53b7e7`):
-/// starts unlit (cyan row 0, `0x53b707..0x53b74d`) on entry and toggles row
-/// every [`hud::PAUSE_BLINK_US`] (`0x53b500..0x53b528`).
-#[derive(Debug, Default)]
-struct PauseBlink {
-    since: Option<u64>,
-    lit: bool,
+/// Native clock-control blink state (`[control_panel + 0x1e4]`,
+/// `0x53b4b0..0x53b7e7`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ClockState {
+    /// State 0: unpaused in Live mode, no 500 ms timer running.
+    #[default]
+    Live,
+    /// State 1: unpaused outside Live mode (steady red Pause button).
+    OtherMode,
+    /// State 2: paused; toggles Pause row 0 <-> row 1 every 500 ms.
+    Paused,
+    /// State 3: unpaused in Live mode with `[control_panel + 0x1ec]` set;
+    /// toggles Ultra selected every 500 ms whenever `speed != Some(Speed::Ultra)`
+    /// (and re-arms without toggling while `speed == Some(Speed::Ultra)`).
+    IdleUltra,
 }
 
-impl PauseBlink {
-    fn lit(&self) -> bool {
-        self.lit
+/// Shared 500 ms clock blink timer (`0x53b4b0..0x53b7e7`, `0x53b0d3..0x53b16b`).
+#[derive(Debug, Default)]
+struct ClockBlink {
+    state: ClockState,
+    since: Option<u64>,
+    lit: bool,
+    was_idle_speed: bool,
+    last_speed_pair: Option<(i16, i16)>,
+    ultra_lit: bool,
+}
+
+impl ClockBlink {
+    fn pause_lit(&self) -> bool {
+        self.state == ClockState::Paused && self.lit
+    }
+
+    fn ultra_lit(&self) -> bool {
+        self.ultra_lit
     }
 
     fn reset(&mut self) {
+        self.state = ClockState::Live;
         self.since = None;
         self.lit = false;
+        self.was_idle_speed = false;
+        self.last_speed_pair = None;
+        self.ultra_lit = false;
     }
 
-    fn sync(&mut self, blinking: bool, clock_us: u64) -> bool {
-        let before = self.lit;
-        if !blinking {
-            self.reset();
-            return self.lit != before;
-        }
-        match self.since {
-            None => {
-                self.since = Some(clock_us);
-                self.lit = false;
+    fn sync(
+        &mut self,
+        paused: bool,
+        mode: sims_ui::command::Mode,
+        idle_speed: bool,
+        speed: Option<sims_ui::command::Speed>,
+        speed_pair: (i16, i16),
+        clock_us: u64,
+    ) -> bool {
+        let before = (self.pause_lit(), self.ultra_lit);
+        let entered_idle = !self.was_idle_speed && idle_speed;
+        self.was_idle_speed = idle_speed;
+        let speed_changed = self.last_speed_pair.is_some_and(|prev| prev != speed_pair);
+        self.last_speed_pair = Some(speed_pair);
+
+        let next = if paused {
+            ClockState::Paused
+        } else if mode != sims_ui::command::Mode::Live {
+            ClockState::OtherMode
+        } else if !idle_speed {
+            ClockState::Live
+        } else {
+            match self.state {
+                // 0x53b6a6..0x53b6ac: stay in state 3 while `[+0x1ec] != 0`.
+                ClockState::IdleUltra => ClockState::IdleUltra,
+                // 0x53b56f..0x53b57b: `0x109(1)` from state 0 enters state 3
+                // unconditionally (even if return speed is already Ultra);
+                // a speed-only refresh in state 0 (`0x53b547`) stays in state 0.
+                ClockState::Live => {
+                    if entered_idle {
+                        ClockState::IdleUltra
+                    } else {
+                        ClockState::Live
+                    }
+                }
+                // 0x53b5ce -> 0x53b627..0x53b645: returning from Pause or
+                // non-Live enters state 3 only when return speed != Ultra.
+                ClockState::Paused | ClockState::OtherMode => {
+                    if speed != Some(sims_ui::command::Speed::Ultra) {
+                        ClockState::IdleUltra
+                    } else {
+                        ClockState::Live
+                    }
+                }
             }
-            Some(since) if clock_us.saturating_sub(since) >= hud::PAUSE_BLINK_US => {
-                // 0x53b500..0x53b52e -> 0x5daf1c..0x5daf31: a single timer
-                // callback toggles the row once and re-arms 500 ms from the
-                // current clock, even after a long stall.
-                self.lit = !self.lit;
-                self.since = Some(clock_us);
-            }
-            Some(_) => {}
+        };
+
+        if self.state != next {
+            self.state = next;
+            self.lit = false;
+            self.since =
+                matches!(next, ClockState::Paused | ClockState::IdleUltra).then_some(clock_us);
+            self.ultra_lit = false;
+            return (self.pause_lit(), self.ultra_lit) != before;
         }
-        self.lit != before
+
+        // 0x53b0d3 -> 0x53b121..0x53b128: a speed refresh (such as Special
+        // Effect `0x10c`) preserves state 3 and its running 500 ms timer,
+        // while clearing Ultra's selected bit before the next callback.
+        if self.state == ClockState::IdleUltra && speed_changed {
+            self.lit = false;
+        }
+
+        if matches!(self.state, ClockState::Paused | ClockState::IdleUltra) {
+            match self.since {
+                None => {
+                    self.since = Some(clock_us);
+                    self.lit = false;
+                }
+                Some(since) if clock_us.saturating_sub(since) >= hud::PAUSE_BLINK_US => {
+                    // 0x53b4c9..0x53b52e -> 0x5daf1c..0x5daf31: a single timer
+                    // callback toggles once (skipping toggle while state 3 has
+                    // Ultra selected, 0x53b4e4 -> 0x53b521) and re-arms 500 ms
+                    // from the current clock, even after a long stall.
+                    if self.state == ClockState::Paused
+                        || speed != Some(sims_ui::command::Speed::Ultra)
+                    {
+                        self.lit = !self.lit;
+                    } else {
+                        self.lit = false;
+                    }
+                    self.since = Some(clock_us);
+                }
+                Some(_) => {}
+            }
+        }
+        self.ultra_lit = self.state == ClockState::IdleUltra
+            && speed != Some(sims_ui::command::Speed::Ultra)
+            && self.lit;
+        (self.pause_lit(), self.ultra_lit) != before
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sims_ui::command::{Mode, Speed};
     use sims_ui::frame::Rect;
     use sims_ui::queue::{Icon, Picture};
 
     #[test]
     fn pause_blink_toggles_every_500ms_and_resets_unlit() {
-        let mut blink = PauseBlink::default();
-        assert!(!blink.lit());
+        let mut blink = ClockBlink::default();
+        let normal = (sims_sim::speed::NORMAL, -1);
+        let idle_normal = (sims_sim::speed::IDLE, sims_sim::speed::NORMAL);
+        let idle_ultra = (sims_sim::speed::IDLE, sims_sim::speed::ULTRA);
+        let reset_normal = (sims_sim::speed::NORMAL, sims_sim::speed::NORMAL);
+        assert!(!blink.pause_lit());
         // Entering Live-mode pause starts unlit (cyan row 0, 0x53b707..0x53b74d).
-        assert!(!blink.sync(true, 100_000));
-        assert!(!blink.lit());
+        assert!(!blink.sync(
+            true,
+            Mode::Live,
+            false,
+            Some(Speed::Normal),
+            normal,
+            100_000
+        ));
+        assert!(!blink.pause_lit());
         // 499.999 ms later: still unlit.
-        assert!(!blink.sync(true, 599_999));
-        assert!(!blink.lit());
+        assert!(!blink.sync(
+            true,
+            Mode::Live,
+            false,
+            Some(Speed::Normal),
+            normal,
+            599_999
+        ));
+        assert!(!blink.pause_lit());
         // At 500 ms: flips to lit (red row 1, 0x53b500..0x53b528).
-        assert!(blink.sync(true, 600_000));
-        assert!(blink.lit());
+        assert!(blink.sync(
+            true,
+            Mode::Live,
+            false,
+            Some(Speed::Normal),
+            normal,
+            600_000
+        ));
+        assert!(blink.pause_lit());
         // At 1000 ms: flips back to unlit.
-        assert!(blink.sync(true, 1_100_000));
-        assert!(!blink.lit());
+        assert!(blink.sync(
+            true,
+            Mode::Live,
+            false,
+            Some(Speed::Normal),
+            normal,
+            1_100_000
+        ));
+        assert!(!blink.pause_lit());
         // A 1-second stall (2x 500 ms) toggles once and re-arms 500 ms from
         // the current clock (0x53b500..0x53b52e -> 0x5daf1c..0x5daf31).
-        assert!(blink.sync(true, 2_100_000));
-        assert!(blink.lit());
-        assert!(!blink.sync(true, 2_599_999));
-        assert!(blink.sync(true, 2_600_000));
-        assert!(!blink.lit());
+        assert!(blink.sync(
+            true,
+            Mode::Live,
+            false,
+            Some(Speed::Normal),
+            normal,
+            2_100_000
+        ));
+        assert!(blink.pause_lit());
+        assert!(!blink.sync(
+            true,
+            Mode::Live,
+            false,
+            Some(Speed::Normal),
+            normal,
+            2_599_999
+        ));
+        assert!(blink.sync(
+            true,
+            Mode::Live,
+            false,
+            Some(Speed::Normal),
+            normal,
+            2_600_000
+        ));
+        assert!(!blink.pause_lit());
         // Unpausing clears lit and kills the timer; re-pausing starts fresh unlit.
-        assert!(blink.sync(true, 3_100_000));
-        assert!(blink.lit());
-        assert!(blink.sync(false, 3_200_000));
-        assert!(!blink.lit());
-        assert!(!blink.sync(true, 3_400_000));
-        assert!(!blink.lit());
-        assert!(!blink.sync(true, 3_899_999));
-        assert!(blink.sync(true, 3_900_000));
-        assert!(blink.lit());
+        assert!(blink.sync(
+            true,
+            Mode::Live,
+            false,
+            Some(Speed::Normal),
+            normal,
+            3_100_000
+        ));
+        assert!(blink.pause_lit());
+        assert!(blink.sync(
+            false,
+            Mode::Live,
+            false,
+            Some(Speed::Normal),
+            normal,
+            3_200_000
+        ));
+        assert!(!blink.pause_lit());
+        assert!(!blink.sync(
+            true,
+            Mode::Live,
+            false,
+            Some(Speed::Normal),
+            normal,
+            3_400_000
+        ));
+        assert!(!blink.pause_lit());
+        assert!(!blink.sync(
+            true,
+            Mode::Live,
+            false,
+            Some(Speed::Normal),
+            normal,
+            3_899_999
+        ));
+        assert!(blink.sync(
+            true,
+            Mode::Live,
+            false,
+            Some(Speed::Normal),
+            normal,
+            3_900_000
+        ));
+        assert!(blink.pause_lit());
+
+        // Switching directly from lit Pause (state 2) to Ultra (state 3)
+        // clears pause_lit, starts ultra_lit unlit, and toggles ultra_lit at
+        // 500 ms (`0x53b6bc -> 0x53b757`, `0x53b4c9..0x53b4fe`).
+        assert!(blink.sync(
+            false,
+            Mode::Live,
+            true,
+            Some(Speed::Normal),
+            idle_normal,
+            4_000_000
+        ));
+        assert!(!blink.pause_lit());
+        assert!(!blink.ultra_lit());
+        assert!(!blink.sync(
+            false,
+            Mode::Live,
+            true,
+            Some(Speed::Normal),
+            idle_normal,
+            4_499_999
+        ));
+        assert!(blink.sync(
+            false,
+            Mode::Live,
+            true,
+            Some(Speed::Normal),
+            idle_normal,
+            4_500_000
+        ));
+        assert!(blink.ultra_lit());
+
+        // Scripted `0x10c` speed refresh at 4_700_000 clears Ultra's selected
+        // bit (`0x53b121..0x53b128`) without resetting the running 500 ms
+        // timer (`since = 4_500_000`), so the next callback at 5_000_000 turns
+        // Ultra back on.
+        assert!(blink.sync(
+            false,
+            Mode::Live,
+            true,
+            Some(Speed::Normal),
+            reset_normal,
+            4_700_000
+        ));
+        assert!(!blink.ultra_lit());
+        assert!(!blink.sync(
+            false,
+            Mode::Live,
+            true,
+            Some(Speed::Normal),
+            reset_normal,
+            4_999_999
+        ));
+        assert!(blink.sync(
+            false,
+            Mode::Live,
+            true,
+            Some(Speed::Normal),
+            reset_normal,
+            5_000_000
+        ));
+        assert!(blink.ultra_lit());
+        // Leaving idle speed clears state 3.
+        assert!(blink.sync(
+            false,
+            Mode::Live,
+            false,
+            Some(Speed::Normal),
+            normal,
+            5_100_000
+        ));
+        assert!(!blink.ultra_lit());
+
+        // Entering idle speed from state 0 with Ultra selected arms state 3
+        // (`0x53b56f..0x53b57b`); callback at 5_700_000 skips toggle and
+        // re-arms (`0x53b4e4 -> 0x53b521`). A scripted reset to Normal at
+        // 5_900_000 then flips Ultra on at 6_200_000 (existing cadence, not
+        // delayed by a fresh 500 ms).
+        assert!(!blink.sync(
+            false,
+            Mode::Live,
+            true,
+            Some(Speed::Ultra),
+            idle_ultra,
+            5_200_000
+        ));
+        assert!(!blink.ultra_lit());
+        assert!(!blink.sync(
+            false,
+            Mode::Live,
+            true,
+            Some(Speed::Ultra),
+            idle_ultra,
+            5_700_000
+        ));
+        assert!(!blink.ultra_lit());
+        assert!(!blink.sync(
+            false,
+            Mode::Live,
+            true,
+            Some(Speed::Normal),
+            reset_normal,
+            5_900_000
+        ));
+        assert!(!blink.ultra_lit());
+        assert!(!blink.sync(
+            false,
+            Mode::Live,
+            true,
+            Some(Speed::Normal),
+            reset_normal,
+            6_199_999
+        ));
+        assert!(blink.sync(
+            false,
+            Mode::Live,
+            true,
+            Some(Speed::Normal),
+            reset_normal,
+            6_200_000
+        ));
+        assert!(blink.ultra_lit());
     }
 
     #[test]

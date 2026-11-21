@@ -1542,16 +1542,35 @@ fn the_pie_shows_the_selected_goths_head() {
     game.render();
     let menu = game.menu().expect("the menu stays open");
     assert_eq!(menu.person, selected);
-    let head = menu.head.as_ref().expect("the head is drawn");
-    assert_eq!([head.width, head.height], menu.face_size());
-    // The head fills much of the face, and is clear around it.
-    let opaque = head.rgba.chunks(4).filter(|p| p[3] == 255).count();
-    let area = (head.width * head.height) as usize;
+    let head_idle = menu.head.as_ref().expect("the head is drawn").clone();
     assert!(
-        opaque > area / 5 && opaque < area * 4 / 5,
-        "{opaque} of {area}"
+        head_idle.width > 0
+            && head_idle.height > 0
+            && head_idle.width <= 800
+            && head_idle.height <= 500,
+        "head bounds {}x{}",
+        head_idle.width,
+        head_idle.height
     );
-    assert_eq!(head.rgba[3], 0);
+    // Native pie head size (~1,750–2,000 opaque pixels in the house viewport),
+    // clear around the bounding-box corners.
+    let opaque = head_idle.rgba.chunks(4).filter(|p| p[3] == 255).count();
+    assert!((1000..=4000).contains(&opaque), "opaque={opaque}");
+    assert_eq!(head_idle.rgba[3], 0);
+    // Moving the pointer onto a pie label turns and brightens the head.
+    let labels = menu.labels();
+    let first = labels[0].1;
+    let on_label = [first.x + first.width / 2, first.y + first.height / 2];
+    assert!(game.hover(on_label));
+    game.render();
+    let head_lit = game
+        .menu()
+        .expect("menu still open")
+        .head
+        .as_ref()
+        .expect("head re-rendered")
+        .clone();
+    assert_ne!(head_lit.rgba, head_idle.rgba);
     assert!(game.problems().is_empty(), "{:?}", game.problems());
 }
 
@@ -3739,6 +3758,771 @@ fn the_control_panel_pause_blink_help_budget_mode_and_pet_refresh() {
     assert_eq!(hud.press(interests_center, &removed, true), None);
 }
 
+/// Install-backed verification of pet Personality/Skills subpanels, state-3
+/// ultra-speed blinking, duplicate live household instance selection, and
+/// non-residential House panel suppression on the Complete Collection install.
+#[test]
+fn pet_subpanels_ultra_speed_blink_and_duplicate_instance_selection() {
+    use sims_game::hud::Hud;
+    use sims_game::pace::Pace;
+    use sims_ui::command::{Command, Panel};
+    use sims_ui::hud::{Kind, id};
+    let Some(install) = install() else {
+        return;
+    };
+    let house = goth_house(&install);
+    let mut game = Game::open(&Options {
+        install: install.clone(),
+        house: house.clone(),
+        answers: vec![3],
+        play: false,
+        frames: Frames::default(),
+    })
+    .expect("the Goth house opens");
+    assert_eq!(game.run(2), 2);
+    let opened = open_house(&install, &house).expect("the Goth house opens");
+    let lot = game.lot();
+    let mut hud = Hud::open(
+        &install,
+        &house,
+        &opened.assets,
+        lot.world(),
+        lot.program().autonomy_constants().friendship_threshold,
+    )
+    .expect("HUD opens");
+    let view = View::new([800, 600], [0, 0], opened.rotation);
+    let mut canvas = Canvas::new(800, 600, [0; 3]);
+
+    // 1. State-3 ultra-speed blink (`0x53b4c9..0x53b7e7`): put the lot into
+    //    idle speed (`return_speed = NORMAL`, `speed = IDLE`), verify Normal
+    //    stays selected while Ultra blinks unselected -> selected at 500 ms
+    //    and back at 1000 ms, and stays steady when return_speed == ULTRA.
+    let mut idle_world = lot.world().clone();
+    idle_world.globals[16] = sims_sim::speed::IDLE;
+    idle_world.globals[18] = sims_sim::speed::NORMAL;
+    let speed_btn = |hud: &Hud, target: i32| {
+        hud.items()
+            .iter()
+            .find_map(|i| match i.kind {
+                Kind::Button { id, selected, .. } if id == target => Some(selected),
+                _ => None,
+            })
+            .expect("speed button")
+    };
+    assert!(!hud.sync_clock_blink(&idle_world, 0));
+    hud.draw(
+        &idle_world,
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    assert!(speed_btn(&hud, id::NORMAL));
+    assert!(!speed_btn(&hud, id::ULTRA));
+    assert!(!hud.sync_clock_blink(&idle_world, 499_999));
+    assert!(hud.sync_clock_blink(&idle_world, 500_000));
+    hud.draw(
+        &idle_world,
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    assert!(speed_btn(&hud, id::NORMAL));
+    assert!(speed_btn(&hud, id::ULTRA));
+    assert!(hud.sync_clock_blink(&idle_world, 1_000_000));
+    hud.draw(
+        &idle_world,
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    assert!(!speed_btn(&hud, id::ULTRA));
+    // When return_speed is already ULTRA, Ultra stays steady selected (no blink).
+    let mut ultra_idle = idle_world.clone();
+    ultra_idle.globals[18] = sims_sim::speed::ULTRA;
+    assert!(!hud.sync_clock_blink(&ultra_idle, 1_500_000));
+    assert!(!hud.sync_clock_blink(&ultra_idle, 2_000_000));
+    hud.draw(
+        &ultra_idle,
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    assert!(speed_btn(&hud, id::ULTRA));
+
+    // Scripted Special Effect `0x10c` speed reset (`0x4f6856..0x4f687a`):
+    // changes speed & return_speed from (IDLE, FAST) -> (NORMAL, NORMAL)
+    // WITHOUT clearing `[control_panel + 0x1ec]`: `0x53b0d3` preserves state 3
+    // and its running 500 ms timer (`since = 2_600_000`), `0x53b121..0x53b128`
+    // immediately clears Ultra's selected bit, and the next scheduled callback
+    // at 3_100_000 turns Ultra back on. A manual Live-mode speed click
+    // (`0x53a5e3`) clears `[+0x1ec]`, stopping the blink even though the speed
+    // globals are identical.
+    let mut scripted_world = idle_world.clone();
+    scripted_world.globals[18] = sims_sim::speed::FAST;
+    assert!(!hud.sync_clock_blink(&scripted_world, 2_100_000));
+    assert!(hud.sync_clock_blink(&scripted_world, 2_600_000));
+    assert!(hud.controls.ultra_lit);
+    scripted_world.set_speed(i32::from(sims_sim::speed::NORMAL));
+    assert_eq!(
+        (scripted_world.speed(), scripted_world.return_speed()),
+        (sims_sim::speed::NORMAL, sims_sim::speed::NORMAL)
+    );
+    // Speed refresh clears Ultra's selected bit (`0x53b121..0x53b128`) while
+    // keeping state 3's scheduled 500 ms timer (`since = 2_600_000`).
+    assert!(hud.sync_clock_blink(&scripted_world, 2_800_000));
+    assert!(!hud.controls.ultra_lit);
+    // Next scheduled callback at 3_100_000 turns Ultra back on.
+    assert!(hud.sync_clock_blink(&scripted_world, 3_100_000));
+    assert!(hud.controls.ultra_lit);
+    hud.draw(
+        &scripted_world,
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    assert!(speed_btn(&hud, id::NORMAL));
+    assert!(speed_btn(&hud, id::ULTRA));
+    // Manual Live-mode speed click clears `[control_panel + 0x1ec]`.
+    hud.set_idle_speed(false);
+    assert!(hud.sync_clock_blink(&scripted_world, 3_200_000));
+    assert!(!hud.controls.ultra_lit);
+    assert!(!hud.sync_clock_blink(&scripted_world, 3_700_000));
+    assert!(!hud.controls.ultra_lit);
+
+    // 2. Dog (`KIND = 2`) and Cat (`KIND = 4`) Personality and Pet Skills panels
+    //    drawn with real UIGraphics art and fonts.
+    let mut dog_world = lot.world().clone();
+    let selected_id = dog_world.selected().expect("Mortimer selected");
+    {
+        let p = dog_world
+            .objects
+            .get_mut(&selected_id)
+            .unwrap()
+            .person
+            .as_mut()
+            .unwrap();
+        p.data[sims_sim::neighbors::KIND] = 2;
+        p.data[10] = 500; // House Breaking / Hunting
+        p.data[12] = 800; // Tricks
+        p.data[11] = 300; // Obedience
+    }
+    let mut cat_world = dog_world.clone();
+    cat_world
+        .objects
+        .get_mut(&selected_id)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap()
+        .data[sims_sim::neighbors::KIND] = 4;
+
+    // Personality panel: pet traits differ from human traits, and no zodiac sign.
+    hud.controls.panel = Some(Panel::Personality);
+    let mut human_canvas = Canvas::new(800, 600, [0; 3]);
+    hud.draw(
+        lot.world(),
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut human_canvas,
+    );
+    let mut dog_pers_canvas = Canvas::new(800, 600, [0; 3]);
+    hud.draw(
+        &dog_world,
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut dog_pers_canvas,
+    );
+    assert!(hud.items().iter().any(|i| matches!(
+        i.kind,
+        Kind::Personality {
+            pet: true,
+            zodiac: None,
+            ..
+        }
+    )));
+    assert!(
+        !hud.items()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::Sign { .. }))
+    );
+    assert_ne!(human_canvas.color, dog_pers_canvas.color);
+
+    // Job panel: Dog shows Dog Pet Skills, Cat shows Cat Pet Skills, distinct pixels.
+    hud.controls.panel = Some(Panel::Job);
+    let mut dog_skills_canvas = Canvas::new(800, 600, [0; 3]);
+    hud.draw(
+        &dog_world,
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut dog_skills_canvas,
+    );
+    assert!(hud.items().iter().any(|i| matches!(
+        i.kind,
+        Kind::PetSkills {
+            kind: sims_ui::household::PetKind::Dog,
+            skills: [500, 800, 300],
+        }
+    )));
+    assert!(
+        !hud.items()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::Skills { .. } | Kind::Work { .. }))
+    );
+
+    let mut cat_skills_canvas = Canvas::new(800, 600, [0; 3]);
+    hud.draw(
+        &cat_world,
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut cat_skills_canvas,
+    );
+    assert!(hud.items().iter().any(|i| matches!(
+        i.kind,
+        Kind::PetSkills {
+            kind: sims_ui::household::PetKind::Cat,
+            skills: [500, 800, 300],
+        }
+    )));
+    assert_ne!(dog_skills_canvas.color, cat_skills_canvas.color);
+
+    // 3. Stale Sign press guard (`0x51cd17 -> 0x51ce05`, `0x51d1cc..0x51d1ee`):
+    //    draw human Personality so `Kind::Sign` is in `hud.items()`, then click
+    //    that stale Sign rect against `dog_world` before redraw — must return
+    //    None and emit no `UI_whoosh`.
+    hud.controls.panel = Some(Panel::Personality);
+    hud.draw(
+        lot.world(),
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    let _ = hud.take_sounds();
+    let sign_rect = hud
+        .items()
+        .iter()
+        .find(|i| matches!(i.kind, Kind::Sign { .. }))
+        .expect("human zodiac sign")
+        .rect;
+    let sign_center = [
+        sign_rect.x + sign_rect.width / 2,
+        sign_rect.y + sign_rect.height / 2,
+    ];
+    assert_eq!(hud.press(sign_center, &dog_world, true), None);
+    assert!(hud.controls.help.is_none());
+    assert!(hud.take_sounds().is_empty());
+
+    // 4. Duplicate live household Sim instance (`0x51c5ef -> 0x4e97dc`,
+    //    `0x4e9608`): a clone with a LOWER object ID appended later in
+    //    `world.people` still resolves Mortimer's resident slot to the first
+    //    person in `world.people`, highlights their portrait, and keeps
+    //    Interests enabled.
+    let mut dup_world = lot.world().clone();
+    let clone_id = (1..selected_id)
+        .find(|id| dup_world.objects.get(id).is_none_or(|o| o.person.is_none()))
+        .expect("lower non-person object ID");
+    let mut clone = dup_world.objects[&selected_id].clone();
+    clone.id = clone_id;
+    clone.selected = true;
+    dup_world.objects.get_mut(&selected_id).unwrap().selected = false;
+    dup_world.objects.insert(clone_id, clone);
+    dup_world.people.push(clone_id);
+    hud.controls.panel = Some(Panel::Needs);
+    hud.draw(
+        &dup_world,
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    let interests = hud
+        .items()
+        .iter()
+        .find(|i| {
+            matches!(
+                i.kind,
+                Kind::Button {
+                    id: id::INTERESTS,
+                    ..
+                }
+            )
+        })
+        .expect("interests button");
+    assert_eq!(
+        interests.command,
+        Some(Command::OpenPanel(Panel::Interests))
+    );
+    assert!(
+        hud.items()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::Portrait { selected: true, .. })
+                && i.command == Some(Command::Select { sim: selected_id })),
+        "duplicate household instance must highlight the resident's portrait"
+    );
+
+    // 5. Non-residential House panel suppression (`0x51d3f9..0x51d412`): clears
+    //    stored `controls.panel` to `None` so reusing the HUD on a residential
+    //    lot does not reopen House.
+    hud.controls.panel = Some(Panel::House);
+    hud.draw(
+        lot.world(),
+        false,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    assert!(
+        !hud.items()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::House { .. }))
+    );
+    assert_eq!(hud.controls.panel, None);
+    hud.draw(
+        lot.world(),
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    assert!(
+        !hud.items()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::House { .. }))
+    );
+}
+
+/// Install-backed verification of Child Report Card (`[esi + 0x124]`),
+/// Superstar / Fame (`[esi + 0x11c]`), and Needs / Pet Needs / Pet Skills /
+/// Report Card / Fame help balloons on the Complete Collection install.
+#[test]
+fn report_card_superstar_panel_and_help_balloons() {
+    use sims_game::hud::{Hud, INTERFACE, WHOOSH};
+    use sims_game::pace::Pace;
+    use sims_ui::balloon::Help;
+    use sims_ui::command::{Command, Panel};
+    use sims_ui::hud::Kind;
+    use sims_vm::SoundEvent;
+
+    let Some(install) = install() else {
+        return;
+    };
+    let house = goth_house(&install);
+    let mut game = Game::open(&Options {
+        install: install.clone(),
+        house: house.clone(),
+        answers: vec![3],
+        play: false,
+        frames: Frames::default(),
+    })
+    .expect("the Goth house opens");
+    assert_eq!(game.run(2), 2);
+    let opened = open_house(&install, &house).expect("the Goth house opens");
+    let lot = game.lot();
+    let mut hud = Hud::open(
+        &install,
+        &house,
+        &opened.assets,
+        lot.world(),
+        lot.program().autonomy_constants().friendship_threshold,
+    )
+    .expect("HUD opens");
+    let view = View::new([800, 600], [0, 0], opened.rotation);
+    let mut canvas = Canvas::new(800, 600, [0; 3]);
+
+    // 1. Human Needs help balloons: clicking Hunger opens balloon (+ UI_whoosh),
+    //    clicking Social replaces in-place (no extra UI_whoosh, 0x50fbdf), and
+    //    clicking Social again closes it (+ UI_whoosh, 0x50fb7f).
+    hud.controls.panel = Some(Panel::Needs);
+    hud.draw(
+        lot.world(),
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    let _ = hud.take_sounds();
+    let hunger_rect = hud
+        .items()
+        .iter()
+        .find(|i| {
+            i.command
+                == Some(Command::Help(Help::Need {
+                    pet: false,
+                    index: 0,
+                }))
+        })
+        .expect("Hunger hitbox")
+        .rect;
+    let social_rect = hud
+        .items()
+        .iter()
+        .find(|i| {
+            i.command
+                == Some(Command::Help(Help::Need {
+                    pet: false,
+                    index: 5,
+                }))
+        })
+        .expect("Social hitbox")
+        .rect;
+    let center = |r: sims_ui::frame::Rect| [r.x + r.width / 2, r.y + r.height / 2];
+
+    assert_eq!(
+        hud.press(center(hunger_rect), lot.world(), true),
+        Some(Command::Help(Help::Need {
+            pet: false,
+            index: 0
+        }))
+    );
+    assert_eq!(
+        hud.take_sounds(),
+        [SoundEvent::Play {
+            object: INTERFACE,
+            name: WHOOSH.into(),
+        }]
+    );
+    assert_eq!(
+        hud.press(center(social_rect), lot.world(), true),
+        Some(Command::Help(Help::Need {
+            pet: false,
+            index: 5
+        }))
+    );
+    assert!(
+        hud.take_sounds().is_empty(),
+        "switching between open balloons replaces in place without UI_whoosh"
+    );
+    assert_eq!(
+        hud.press(center(social_rect), lot.world(), true),
+        Some(Command::Help(Help::Need {
+            pet: false,
+            index: 5
+        }))
+    );
+    assert_eq!(hud.controls.help, None);
+    assert_eq!(
+        hud.take_sounds(),
+        [SoundEvent::Play {
+            object: INTERFACE,
+            name: WHOOSH.into(),
+        }]
+    );
+
+    // 2. Child Report Card on Cassandra (object 16): opens grade button ->
+    //    Report Card balloon; switching selection to Mortimer closes the
+    //    balloon on redraw and emits UI_whoosh; stale click rejected.
+    let mut cass_world = lot.world().clone();
+    let mortimer = cass_world.selected().expect("Mortimer selected");
+    cass_world.objects.get_mut(&mortimer).unwrap().selected = false;
+    cass_world.objects.get_mut(&16).unwrap().selected = true;
+    hud.controls.panel = Some(Panel::Job);
+    hud.draw(
+        &cass_world,
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    let _ = hud.take_sounds();
+    let rc_btn = hud
+        .items()
+        .iter()
+        .find(|i| matches!(i.kind, Kind::ReportCardButton { .. }))
+        .expect("Report Card grade button")
+        .rect;
+    // Stale press against Mortimer (Adult Job) must be ignored without WHOOSH.
+    assert_eq!(hud.press(center(rc_btn), lot.world(), true), None);
+    assert!(hud.take_sounds().is_empty());
+    // Press against Cassandra opens Report Card balloon + WHOOSH.
+    assert_eq!(
+        hud.press(center(rc_btn), &cass_world, true),
+        Some(Command::Help(Help::ReportCard))
+    );
+    assert_eq!(hud.controls.help, Some(Help::ReportCard));
+    assert_eq!(hud.take_sounds().len(), 1);
+    // Drawing with Mortimer selected closes Report Card balloon + WHOOSH.
+    hud.draw(
+        lot.world(),
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    assert_eq!(hud.controls.help, None);
+    assert_eq!(hud.take_sounds().len(), 1);
+
+    // 3. Superstar / Fame panel on Bella (object 18, unemployed): setting
+    //    person.data[80] > 0 routes Job tab to Fame and opens Fame balloons.
+    let mut fame_world = lot.world().clone();
+    fame_world.objects.get_mut(&mortimer).unwrap().selected = false;
+    let bella = fame_world.objects.get_mut(&18).unwrap();
+    bella.selected = true;
+    let bp = bella.person.as_mut().unwrap();
+    bp.data[80] = 50; // FameScore > 0
+    bp.data[81] = 4; // 2.0 stars ("Studio Fly")
+    hud.controls.panel = Some(Panel::Job);
+    hud.draw(
+        &fame_world,
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    assert!(hud.items().iter().any(|i| matches!(
+        &i.kind,
+        Kind::Fame {
+            fame_level: 4,
+            fame_title,
+            ..
+        } if fame_title == "Studio Fly"
+    )));
+    let fame_lvl_rect = hud
+        .items()
+        .iter()
+        .find(|i| i.command == Some(Command::Help(Help::FameLevel(4))))
+        .expect("Fame level button")
+        .rect;
+    let _ = hud.take_sounds();
+    assert_eq!(
+        hud.press(center(fame_lvl_rect), &fame_world, true),
+        Some(Command::Help(Help::FameLevel(4)))
+    );
+    assert_eq!(hud.take_sounds().len(), 1);
+    hud.draw(
+        &fame_world,
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    assert!(hud.items().iter().any(|i| matches!(
+        &i.kind,
+        Kind::Balloon(b) if b.title.starts_with("Studio Fly")
+    )));
+    // Pressing on the open balloon itself (`0x66bd68 -> 0x5dd85f`) keeps it
+    // open without `UI_whoosh`, while hovering onto the balloon itself
+    // (`0x51a0a2..0x51a0b5`, `0x51d312`) or outside the subpanel
+    // (`0x51f1f2..0x51f3e5`, `0x51d2ee..0x51d329`) dismisses it with `UI_whoosh`.
+    let balloon_rect = hud
+        .items()
+        .iter()
+        .find(|i| matches!(i.kind, Kind::Balloon(_)))
+        .expect("Fame balloon")
+        .rect;
+    let _ = hud.take_sounds();
+    assert_eq!(hud.press(center(balloon_rect), &fame_world, true), None);
+    assert_eq!(hud.controls.help, Some(Help::FameLevel(4)));
+    assert!(hud.take_sounds().is_empty());
+    assert!(hud.hover(center(balloon_rect)));
+    assert_eq!(hud.controls.help, None);
+    assert_eq!(
+        hud.take_sounds(),
+        [SoundEvent::Play {
+            object: INTERFACE,
+            name: WHOOSH.into(),
+        }]
+    );
+
+    // 4. Moving the pointer onto the lot (`Game::hover`), leaving the window
+    //    (`Game::leave`), or clicking directly on the lot (`Game::press`, both
+    //    empty ground and an object that opens a pie menu) dismisses an open
+    //    help balloon with `UI_whoosh`. At 1024x768 (`0x518f48`, `0x51f260`),
+    //    the western subpanel spans x=521..1024 so hovering (650, 700) keeps
+    //    Hunger open.
+    game.resize([1024, 768]);
+    game.render();
+    let hunger_1024 = game
+        .panel()
+        .iter()
+        .find_map(|i| {
+            (i.command
+                == Some(Command::Help(Help::Need {
+                    pet: false,
+                    index: 0,
+                })))
+            .then_some(i.rect)
+        })
+        .expect("Hunger hitbox at 1024x768");
+    assert_eq!(hunger_1024.x, 521);
+    game.press(center(hunger_1024));
+    game.render();
+    let _ = game.take_sounds();
+    let _ = game.hover([650, 700]);
+    assert!(game.take_sounds().is_empty());
+    game.render();
+    assert!(
+        game.panel()
+            .iter()
+            .any(|i| matches!(&i.kind, Kind::Balloon(b) if b.title == "Hunger"))
+    );
+    // Moving onto the balloon itself dismisses it + WHOOSH.
+    let balloon_1024 = game
+        .panel()
+        .iter()
+        .find(|i| matches!(i.kind, Kind::Balloon(_)))
+        .expect("Hunger balloon at 1024x768")
+        .rect;
+    assert!(game.hover(center(balloon_1024)));
+    assert!(game.take_sounds().contains(&SoundEvent::Play {
+        object: INTERFACE,
+        name: WHOOSH.into(),
+    }));
+
+    game.resize([800, 600]);
+    game.render();
+    let find_hunger = |game: &Game| {
+        game.panel().iter().find_map(|i| {
+            (i.command
+                == Some(Command::Help(Help::Need {
+                    pet: false,
+                    index: 0,
+                })))
+            .then_some(i.rect)
+        })
+    };
+    let need_rect = match find_hunger(&game) {
+        Some(rect) => rect,
+        None => {
+            let toggle_rect = game
+                .panel()
+                .iter()
+                .find(|i| i.command == Some(Command::TogglePanel))
+                .expect("TogglePanel button")
+                .rect;
+            game.press(center(toggle_rect));
+            game.render();
+            find_hunger(&game).expect("Hunger hitbox on live Game")
+        }
+    };
+    game.press(center(need_rect));
+    game.render();
+    assert!(
+        game.panel()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::Balloon(_)))
+    );
+    let _ = game.take_sounds();
+    // Moving the pointer from the help control onto the lot dismisses it + WHOOSH.
+    assert!(game.hover([10, 10]));
+    assert!(game.take_sounds().contains(&SoundEvent::Play {
+        object: INTERFACE,
+        name: WHOOSH.into(),
+    }));
+    game.render();
+    assert!(
+        !game
+            .panel()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::Balloon(_)))
+    );
+    // Reopen balloon and leave the window: dismisses + WHOOSH.
+    game.press(center(need_rect));
+    game.render();
+    let _ = game.take_sounds();
+    assert!(game.leave());
+    assert!(game.take_sounds().contains(&SoundEvent::Play {
+        object: INTERFACE,
+        name: WHOOSH.into(),
+    }));
+    game.render();
+    assert!(
+        !game
+            .panel()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::Balloon(_)))
+    );
+    // Reopen balloon and press empty lot directly: balloon closes + WHOOSH + redraw.
+    game.press(center(need_rect));
+    game.render();
+    let _ = game.take_sounds();
+    let outcome = game.press([10, 10]);
+    assert!(outcome.redraw);
+    assert!(game.take_sounds().contains(&SoundEvent::Play {
+        object: INTERFACE,
+        name: WHOOSH.into(),
+    }));
+    game.render();
+    assert!(
+        !game
+            .panel()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::Balloon(_)))
+    );
+    // Reopen balloon and press a clickable lot object: balloon dismisses + WHOOSH
+    // and the object's pie menu opens.
+    game.press(center(need_rect));
+    game.render();
+    assert!(
+        game.panel()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::Balloon(_)))
+    );
+    let _ = game.take_sounds();
+    let object_pt = (100..700)
+        .step_by(12)
+        .flat_map(|x| (60..340).step_by(12).map(move |y| [x, y]))
+        .find(|&pt| game.under(pt).is_some())
+        .expect("a clickable object on the Goth lot");
+    let outcome = game.press(object_pt);
+    assert!(outcome.redraw);
+    assert!(game.take_sounds().contains(&SoundEvent::Play {
+        object: INTERFACE,
+        name: WHOOSH.into(),
+    }));
+    game.render();
+    assert!(
+        !game
+            .panel()
+            .iter()
+            .any(|i| matches!(i.kind, Kind::Balloon(_)))
+    );
+}
+
 /// Track 2's switch-and-order recording (`goth-switch-cancel-order-20261115`)
 /// opens the live-mode panel, clicks Bella's portrait to select her (taking
 /// effect between updates 423 and 424), clicks her portrait again to centre
@@ -4273,4 +5057,1668 @@ fn the_recorded_sit_and_read_orders_with_shots_replayed_in_the_window_matches_th
         [(9, 259, 4107, 3, 2, 0)]
     );
     assert_eq!(game.caught(), 0, "{:?}", game.errors());
+}
+
+#[test]
+fn camera_moves_sync_the_lots_view_centre_pick() {
+    use sims_game::view::Move;
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    let expected = |game: &Game, expanded: bool| {
+        let shape = sims_render::Lot::from_world(game.lot().world()).unwrap();
+        let strip = if expanded { sims_ui::hud::STRIP } else { 0 };
+        let house_size = [game.view.size[0], (game.view.size[1] - strip).max(1)];
+        let mut camera = game.view.camera;
+        camera.origin[0] = camera.origin[0].saturating_add(1);
+        sims_render::screen_centre_pick(&shape, &camera, house_size)
+            .map(|[x, y]| [(x >> 4) as i8, (y >> 4) as i8])
+    };
+    let initial = game.lot().view_centre();
+    assert!(initial.is_some(), "opening the house sets view_centre");
+    assert_eq!(initial, expected(&game, true));
+
+    game.apply(Move::Scroll([160, 80]));
+    assert_eq!(game.lot().view_centre(), expected(&game, true));
+    assert_ne!(game.lot().view_centre(), initial);
+
+    game.apply(Move::Rotate(true));
+    assert_eq!(game.lot().view_rotation(), game.view.camera.rotation);
+    assert_eq!(game.lot().view_centre(), expected(&game, true));
+
+    game.apply(Move::ZoomIn);
+    assert_eq!(game.lot().view_centre(), expected(&game, true));
+
+    game.apply(Move::LevelUp);
+    assert_eq!(game.lot().view_centre(), expected(&game, true));
+
+    game.resize([1024, 768]);
+    assert_eq!(game.lot().view_centre(), expected(&game, true));
+
+    let mortimer = game.lot().world().selected().expect("a Sim is selected");
+    game.centre_on(mortimer);
+    assert_eq!(game.lot().view_centre(), expected(&game, true));
+
+    // Collapsing and re-expanding the control panel changes the active house
+    // viewport height (0x4a7b58) and must re-sync `view_centre`; `centre_on`
+    // also uses the active viewport, shifting `origin[1]` down 50 pixels when
+    // re-centring the same Sim with the panel collapsed.
+    game.apply(Move::ZoomIn); // Medium -> Near on 1024x768 so origin isn't clamped
+    game.centre_on(mortimer);
+    let expanded_origin = game.view.camera.origin;
+    let expanded_centre = game.lot().view_centre();
+    assert_eq!(expanded_centre, expected(&game, true));
+
+    game.render();
+    let toggle_point = |game: &Game| {
+        game.panel()
+            .iter()
+            .find(|item| item.command == Some(sims_ui::command::Command::TogglePanel))
+            .map(|item| {
+                [
+                    item.rect.x + item.rect.width / 2,
+                    item.rect.y + item.rect.height / 2,
+                ]
+            })
+            .expect("TogglePanel button is laid out")
+    };
+    let before_collapse = game.lot().view_centre();
+    let p = toggle_point(&game);
+    game.press(p);
+    game.release(p);
+    assert_eq!(game.lot().view_centre(), expected(&game, false));
+    assert_ne!(game.lot().view_centre(), before_collapse);
+
+    game.centre_on(mortimer);
+    assert_eq!(game.view.camera.origin[1], expanded_origin[1] + 50);
+    assert_eq!(game.lot().view_centre(), expected(&game, false));
+    assert_eq!(game.lot().view_centre(), expanded_centre);
+
+    game.render();
+    let p = toggle_point(&game);
+    game.press(p);
+    game.release(p);
+    assert_eq!(game.lot().view_centre(), expected(&game, true));
+    game.centre_on(mortimer);
+    assert_eq!(game.view.camera.origin, expanded_origin);
+    assert_eq!(game.lot().view_centre(), expanded_centre);
+
+    // Restoring a saved game keeps its saved view_centre; no-op and wall-mode
+    // camera commands do not overwrite it until camera geometry actually moves.
+    let saved_centre = game.lot().view_centre();
+    let saved = game.save().unwrap();
+    game.apply(Move::Scroll([320, 160]));
+    assert_ne!(game.lot().view_centre(), saved_centre);
+    game.restore(saved).unwrap();
+    assert_eq!(game.lot().view_centre(), saved_centre);
+    assert!(!game.apply(Move::Scroll([0, 0])));
+    assert_eq!(game.lot().view_centre(), saved_centre);
+    game.apply(Move::Walls(sims_render::Walls::Down));
+    assert_eq!(game.lot().view_centre(), saved_centre);
+    assert!(game.apply(Move::Scroll([160, 80])));
+    assert_eq!(game.lot().view_centre(), expected(&game, true));
+}
+
+/// Track 2's Buy Mode recording (`goth-buy-chair-order-20261116`) runs in Live
+/// mode through update 183, clicks the Buy Mode button `(93, 458)` so update
+/// 184 enters mode 2 (partial pass), clicks Seating `(258, 524)`, clicks slot
+/// 0 `(437, 523)` (Werkbunnst All Purpose Chair, `0x26bfbb29`, `$80`), and
+/// moves the pointer onto the house view at `recorded([480, 380])` before
+/// update 1110, creating the chair (object 260) and its `"Tile Cursor"`
+/// (object 261, `0x00000437`) at `[584, 472, 1]` without yet committing the
+/// placement before update 1200.
+///
+/// Replayed offline in strict mode on the recording's frame schedule, an
+/// unmasked comparison of tick, scheduler cursor, lot/global RNGs, all 64
+/// globals, and every object's position, `last_result`, `data`, `temps`,
+/// `attributes`, frames, person `data`, `motives_bits`, `active`, and `queue`
+/// (377 objects at update 1, 345 at 6..=1109, 347 at 1110..=1200) matched
+/// updates 1..=1200 with only three known differences:
+/// - UI global 12 (updates 184..=1200: `2008` Buy -> `150` Seating -> `1500`
+///   Dining Chairs -> `4300` thumbnail template);
+/// - routing `person.data[37]` marked unknown in `routing.unknown_words` for
+///   object 259 (updates 14..=1200: `0` vs `3287`);
+/// - uninitialized frame local marked unknown in `frame_storage` for object
+///   259 (frame 2, tree 4099, local 7 at updates 14..=1200: `0` vs `2623`).
+///
+/// This test pins selected checkpoints through update 1200.
+#[test]
+fn the_recorded_buy_chair_order_replayed_in_the_window_matches_the_recording() {
+    use sims_ui::command::Mode;
+    let Some(install) = install() else {
+        return;
+    };
+    let frames = Frames::parse(
+        "0,1,2,3,33,63,93,123,153,183,213,243,273,303,330,347,367,397,419,446,467,491,518,539,569,599,627,657,687,713,731,757,787,812,842,872,893,923,953,983,1013,1042,1069,1087,1109,1137,1160,1179",
+    )
+    .expect("a schedule");
+    let schedule = frames.clone();
+    let mut game = Game::open(&Options {
+        frames,
+        ..options(install)
+    })
+    .expect("the Goth house opens");
+    game.resize([800, 600]);
+    game.render();
+
+    // Run in Live mode through update 183, then click Buy Mode at (93, 458).
+    run_to(&mut game, &schedule, 183);
+    assert_eq!(game.mode(), Mode::Live);
+    assert_eq!(game.lot().world().globals[19], 0);
+    assert_eq!(game.lot().world().ticks, 88_627);
+    assert_eq!(game.lot().world().budget.funds, 2542);
+    assert_eq!(game.lot().world().objects.len(), 345);
+
+    game.press([93, 458]);
+    game.release([93, 458]);
+    assert_eq!(game.mode(), Mode::Buy);
+    assert_eq!(game.lot().world().globals[19], 2);
+    game.render();
+
+    // Update 184 is a partial pass: world.ticks stays at 88627.
+    run_to(&mut game, &schedule, 184);
+    assert_eq!(game.lot().world().ticks, 88_627);
+    assert_eq!(game.lot().world().globals[19], 2);
+
+    // Click Seating at (258, 524), then slot 0 (Werkbunnst Chair, $80) at (437, 523).
+    run_to(&mut game, &schedule, 518);
+    game.press([258, 524]);
+    game.release([258, 524]);
+    game.render();
+
+    run_to(&mut game, &schedule, 872);
+    game.press([437, 523]);
+    game.release([437, 523]);
+    assert_eq!(game.buy_selected(), Some(0x26bf_bb29));
+    // No objects are created while the pointer remains over the HUD.
+    assert!(game.buy_cursor().is_none());
+    assert_eq!(game.lot().world().objects.len(), 345);
+    game.render();
+
+    // Moving into the house view at recorded([480, 380]) before update 1110
+    // creates the chair (260) and its Tile Cursor (261) at [584, 472, 1].
+    run_to(&mut game, &schedule, 1109);
+    assert_eq!(game.lot().world().objects.len(), 345);
+    let lot_point = recorded([480, 380]);
+    assert!(!game.over_panel(lot_point));
+    game.hover(lot_point);
+    let cursor = game.buy_cursor().expect("Buy cursor active on house view");
+    assert_eq!(cursor.held, 260);
+    assert_eq!(cursor.cursor, 261);
+    assert_eq!(cursor.guid, 0x26bf_bb29);
+    assert_eq!(cursor.price, 80);
+    assert!(cursor.valid);
+    assert_eq!(cursor.position, [584, 472, 1]);
+    game.render();
+
+    // Run through update 1200 in strict mode (partial passes only).
+    run_to(&mut game, &schedule, 1200);
+    let world = game.lot().world();
+    assert_eq!(world.ticks, 88_627);
+    assert_eq!(world.globals[19], 2);
+    assert_eq!(world.budget.funds, 2542);
+    assert_eq!(world.lot_rng.state(), 890_318_272);
+    assert_eq!(world.global_rng.state(), 270_289_136);
+    assert_eq!(world.objects.len(), 347);
+
+    let chair = &world.objects[&260];
+    assert_eq!(chair.guid, 0x26bf_bb29);
+    assert_eq!(chair.position, [584, 472, 1]);
+    assert_eq!(chair.flags(), 9);
+    assert_eq!(chair.countdown(), Some(19_999));
+    assert!(chair.last_result);
+    assert_eq!(chair.data[1], 2);
+    assert_eq!(chair.data[26], 261);
+    assert_eq!(chair.data[41], 80);
+    assert_eq!(chair.data[45], 1997);
+    assert_eq!(chair.data[46], 6);
+    assert_eq!(chair.data[47], 16);
+    assert_eq!(
+        chair
+            .stack
+            .iter()
+            .map(|f| (f.tree, f.node, f.parameters.clone()))
+            .collect::<Vec<_>>(),
+        vec![(4096, 0, vec![0, 0, 0, 0]), (280, 0, vec![20000])]
+    );
+
+    let tile_cursor = &world.objects[&261];
+    assert_eq!(tile_cursor.guid, sims_vm::TILE_CURSOR_GUID);
+    assert_eq!(tile_cursor.position, [584, 472, 1]);
+    assert_eq!(tile_cursor.flags(), 0);
+    assert_eq!(tile_cursor.countdown(), Some(-1));
+    assert!(tile_cursor.last_result);
+    assert_eq!(tile_cursor.data[1], 0);
+    assert_eq!(tile_cursor.data[18], 1997);
+    assert_eq!(tile_cursor.data[23], 2);
+    assert_eq!(tile_cursor.data[48], 23970);
+    assert_eq!(
+        tile_cursor
+            .stack
+            .iter()
+            .map(|f| (f.tree, f.node, f.parameters.clone()))
+            .collect::<Vec<_>>(),
+        vec![(4096, 0, vec![0, 0, 0, 0])]
+    );
+
+    assert!(game.problems().is_empty(), "{:?}", game.problems());
+    assert!(game.stopped().is_none(), "{:?}", game.stopped());
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
+}
+
+/// End-to-end Buy Mode placement, rotation (keyboard and mouse drag),
+/// cancellation, funds deduction, and return to Live mode through the window
+/// input layer.
+#[test]
+fn buy_mode_places_rotates_cancels_and_returns_to_live_mode() {
+    use sims_ui::command::Mode;
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    game.resize([800, 600]);
+    game.render();
+    assert_eq!(game.run(60), 60);
+
+    // Enter Buy Mode, open Seating, select Werkbunnst All Purpose Chair ($80).
+    game.press([93, 458]);
+    game.release([93, 458]);
+    assert_eq!(game.mode(), Mode::Buy);
+    assert_eq!(game.lot().world().globals[19], 2);
+
+    game.press([258, 524]);
+    game.release([258, 524]);
+    game.press([437, 523]);
+    game.release([437, 523]);
+    assert_eq!(game.buy_selected(), Some(0x26bf_bb29));
+
+    // Hover onto the lawn, move onto the HUD to hide the cursor (verifying
+    // keyboard rotation while hidden does not bring it back onto the lot),
+    // save & restore mid-preview (verifying the save strips the unpaid preview
+    // and Tile Cursor), then cancel: both objects are deleted and funds stay 2542.
+    let spot = recorded([480, 380]);
+    let count_before = game.lot().world().objects.len();
+    game.hover(spot);
+    let held_first = game.buy_cursor().expect("cursor active").held;
+    let cursor_first = game.buy_cursor().expect("cursor active").cursor;
+    assert_eq!(game.lot().world().objects.len(), count_before + 2);
+
+    // Save while the preview stands on the lawn, then restore into a fresh
+    // game check later: the saved world must not contain the unpaid preview.
+    let saved_mid_preview = game.save().expect("saving during Buy preview succeeds");
+    assert!(!saved_mid_preview.world().objects.contains_key(&held_first));
+    assert!(
+        !saved_mid_preview
+            .world()
+            .objects
+            .contains_key(&cursor_first)
+    );
+    assert_eq!(saved_mid_preview.world().objects.len(), count_before);
+
+    game.hover([300, 520]);
+    assert!(!game.buy_cursor().expect("cursor kept while hidden").valid);
+    assert_eq!(game.buy_cursor().unwrap().position, [584, 472, 1]);
+    assert_eq!(game.lot().world().objects[&held_first].position[0], -16);
+    assert_eq!(game.lot().world().objects[&cursor_first].position[0], -16);
+    // Native `0x487d4e` preserves the saved coordinates on the hidden cursor
+    // and `0x486b9e` consumes `.`/`,` whenever the cursor exists, turning at
+    // those saved coordinates (`0x421be4`).
+    assert!(game.rotate_held(true));
+    assert_eq!(game.lot().world().objects[&held_first].data[1], 4);
+    assert_eq!(
+        game.lot().world().objects[&held_first].position,
+        [584, 472, 1]
+    );
+    assert_eq!(
+        game.lot().world().objects[&cursor_first].position,
+        [584, 472, 1]
+    );
+
+    assert!(game.cancel_buy());
+    assert!(game.buy_cursor().is_none());
+    assert!(game.buy_selected().is_none());
+    assert!(!game.lot().world().objects.contains_key(&held_first));
+    assert!(!game.lot().world().objects.contains_key(&cursor_first));
+    assert_eq!(game.lot().world().budget.funds, 2542);
+
+    // Re-select the chair, hover onto the lawn, rotate clockwise by keyboard,
+    // then press and drag through all four quadrants (`0x485d5d..0x485dad`:
+    // upper-right -> 4, lower-left -> 0, lower-right -> 2, upper-left -> 6 at
+    // rotation 0), releasing 20 px upper-left without an extra hover to commit
+    // facing 6 (`0x4864f0`).
+    let spend_before = game.lot().world().budget.days[0].expect("today")[6];
+    game.press([437, 523]);
+    game.release([437, 523]);
+    game.hover(spot);
+    assert_eq!(game.lot().world().objects[&held_first].data[1], 2);
+    assert!(game.rotate_held(true));
+    assert_eq!(game.lot().world().objects[&held_first].data[1], 4);
+    game.press(spot);
+    game.hover([spot[0] + 20, spot[1] - 20]);
+    assert_eq!(game.lot().world().objects[&held_first].data[1], 4);
+    game.hover([spot[0] - 20, spot[1] + 20]);
+    assert_eq!(game.lot().world().objects[&held_first].data[1], 0);
+    game.hover([spot[0] + 20, spot[1] + 20]);
+    assert_eq!(game.lot().world().objects[&held_first].data[1], 2);
+    game.release([spot[0] - 20, spot[1] - 20]);
+
+    // Werkbunnst Chair has OBJD word 96 == 1 (`keep_buying`), so committing it
+    // automatically arms a second copy (`0x4864d0` -> `0x486f5a`) with the
+    // placed chair's facing (`6`), tracking the release tile (empty lawn, so
+    // valid there); moving back onto the occupied `spot` moves the new chair
+    // off-lot while its Tile Cursor marks the occupied tile — matching
+    // `goth-buy-chair-order-20261118` u=880.
+    assert_eq!(game.buy_selected(), Some(0x26bf_bb29));
+    let next_cursor = game
+        .buy_cursor()
+        .expect("repeat purchase arms a second chair")
+        .clone();
+    assert_ne!(next_cursor.held, held_first);
+    assert!(next_cursor.valid);
+    assert_ne!(next_cursor.position, [584, 472, 1]);
+    game.hover(spot);
+    let next_on_occupied = game.buy_cursor().expect("cursor over occupied tile");
+    assert!(!next_on_occupied.valid);
+    let world = game.lot().world();
+    let chair = &world.objects[&held_first];
+    assert_eq!(chair.guid, 0x26bf_bb29);
+    assert_eq!(chair.position, [584, 472, 1]);
+    assert_eq!(chair.data[1], 6);
+    assert_eq!(world.objects[&next_cursor.held].position[0], -16);
+    assert_eq!(world.objects[&next_cursor.held].data[1], 6);
+    assert_eq!(world.budget.funds, 2462);
+    assert_eq!(world.globals[13], 2462);
+    assert_eq!(world.globals[14], 0);
+    assert_eq!(world.budget.days[0].expect("today")[6], spend_before + 80);
+
+    // Switch back to Live mode by clicking the Live button `(35, 448)`:
+    // cancels the armed second preview, returns global[19] to 0 (`go_live`),
+    // leaves only the one paid chair on the lot, and resumes simulation ticks.
+    let ticks_before = game.lot().world().ticks;
+    game.press([35, 448]);
+    game.release([35, 448]);
+    assert_eq!(game.mode(), Mode::Live);
+    assert!(game.buy_cursor().is_none());
+    assert!(game.buy_selected().is_none());
+    assert_eq!(game.lot().world().objects.len(), count_before + 1);
+    assert_eq!(game.lot().world().objects[&held_first].data[26], 0);
+    assert_eq!(game.lot().world().globals[19], 0);
+    game.render();
+    assert_eq!(game.run(30), 30);
+    assert_eq!(game.lot().world().ticks, ticks_before + 30);
+
+    // Restoring the mid-preview save and returning to Live leaves no leaked
+    // chair or Tile Cursor and keeps funds at 2542.
+    game.restore(saved_mid_preview)
+        .expect("mid-preview save restores");
+    assert_eq!(game.mode(), Mode::Buy);
+    assert!(game.buy_cursor().is_none());
+    assert_eq!(game.lot().world().objects.len(), count_before);
+    assert_eq!(game.lot().world().budget.funds, 2542);
+    game.set_mode(Mode::Live);
+    assert_eq!(game.lot().world().objects.len(), count_before);
+    assert_eq!(game.lot().world().budget.funds, 2542);
+
+    assert!(game.problems().is_empty(), "{:?}", game.problems());
+    assert!(game.stopped().is_none(), "{:?}", game.stopped());
+    assert_eq!(game.caught(), 0, "{:?}", game.errors());
+}
+
+/// Buy Mode surface placement (`0x422050` using `data[4]` allowed heights and
+/// `0x4221e4..0x422280` surface alignment), OBJf function 11 (`USER_PLACEMENT`,
+/// `0x43562f` / `0x422e99`), and preserving the cursor handle when a commit is
+/// refused.
+#[test]
+fn buy_mode_places_on_surfaces_runs_user_placement_and_keeps_cursor_on_failed_commit() {
+    use sims_ui::buy::BuyCatalog;
+    use sims_ui::command::Mode;
+    let Some(install) = install() else {
+        return;
+    };
+    let opened = sims_render::open_house(&install, &goth_house(&install)).expect("open Goth house");
+    let catalog = BuyCatalog::load(opened.assets.index(), opened.assets.catalog());
+
+    let mut lot = Lot::load(&install, &goth_house(&install), &[3], Frames::default()).unwrap();
+    for _ in 0..60 {
+        lot.step().unwrap();
+    }
+    lot.set_mode(sims_vm::PanelMode::Buy).unwrap();
+
+    // Find every empty surface slot on level 1 in the Goth house (such as the
+    // Mesquite Desk/Table) and verify all three stock desk items (Moneywell
+    // Computer, SCTC BR-8 Standard Telephone, Gloominator Desk Lamp) snap into
+    // a compatible empty surface slot with `data[4] != 0` and commit cleanly.
+    let empty_surfaces: Vec<(u16, [i32; 3])> = lot
+        .world()
+        .objects
+        .iter()
+        .filter_map(|(&id, obj)| {
+            (obj.person.is_none()
+                && obj.position[0] >= 0
+                && obj.position[2] == 1
+                && obj.slots.len() > 1
+                && obj.slots[1].object == 0)
+                .then_some((id, obj.position))
+        })
+        .collect();
+    assert!(!empty_surfaces.is_empty(), "Goth house has empty surfaces");
+
+    for needle in [
+        "Moneywell Computer",
+        "SCTC BR-8 Standard Telephone",
+        "Gloominator Desk Lamp",
+    ] {
+        let item = catalog
+            .all()
+            .iter()
+            .find(|i| i.name.contains(needle))
+            .unwrap_or_else(|| panic!("catalog item matching {needle:?}"));
+        let mut cursor = lot
+            .buy_start(item.guid, 1, 2)
+            .unwrap()
+            .unwrap_or_else(|| panic!("affordable {needle}"));
+        let mut snapped = None;
+        for &(surface_id, pos) in &empty_surfaces {
+            let valid = lot.buy_move(&mut cursor, [pos[0], pos[1]], pos[2]).unwrap();
+            if valid && cursor.container.is_some_and(|(c, _)| c == surface_id) {
+                snapped = Some(surface_id);
+                break;
+            }
+        }
+        let surface_id = snapped.unwrap_or_else(|| panic!("{needle} did not snap to any surface"));
+        // Manual rotation on the surface must keep the surface container and
+        // the user's chosen facing even when `buy_move` runs again at the same
+        // tile (e.g., on mouse press/release, `0x421e72` / `0x422050`).
+        let before_dir = lot.world().objects[&cursor.held].data[1];
+        let step = lot.world().objects[&cursor.held].data[23];
+        if step > 0 {
+            let next_dir = (before_dir + step).rem_euclid(8);
+            assert!(lot.buy_rotate(&mut cursor, next_dir).unwrap());
+            assert_eq!(cursor.container.map(|(c, _)| c), Some(surface_id));
+            assert_eq!(lot.world().objects[&cursor.held].data[1], next_dir);
+            let pos = cursor.position;
+            assert!(lot.buy_move(&mut cursor, [pos[0], pos[1]], pos[2]).unwrap());
+            assert_eq!(cursor.container.map(|(c, _)| c), Some(surface_id));
+            assert_eq!(lot.world().objects[&cursor.held].data[1], next_dir);
+            // Temporarily unaffordable preview must still retain its surface
+            // container so manual rotation survives when funds recover again.
+            let orig_price = cursor.price;
+            cursor.price = lot.world().budget.funds + 10;
+            assert!(!lot.buy_move(&mut cursor, [pos[0], pos[1]], pos[2]).unwrap());
+            assert!(!cursor.valid);
+            assert_eq!(cursor.container.map(|(c, _)| c), Some(surface_id));
+            assert_eq!(lot.world().objects[&cursor.held].data[1], next_dir);
+            cursor.price = orig_price;
+            assert!(lot.buy_move(&mut cursor, [pos[0], pos[1]], pos[2]).unwrap());
+            assert!(cursor.valid);
+            assert_eq!(cursor.container.map(|(c, _)| c), Some(surface_id));
+            assert_eq!(lot.world().objects[&cursor.held].data[1], next_dir);
+        }
+        // Cancel before testing the next item so the same surface slot stays free.
+        lot.buy_cancel(&cursor).unwrap();
+    }
+
+    // Commit the Gloominator Desk Lamp onto a surface and verify container link
+    // (`data[2]`), funds deduction, and cleanup of its Tile Cursor.
+    let lamp = catalog
+        .all()
+        .iter()
+        .find(|i| i.name.contains("Gloominator Desk Lamp"))
+        .expect("Gloominator Desk Lamp");
+    let mut cursor = lot.buy_start(lamp.guid, 1, 2).unwrap().unwrap();
+    let surface_id = empty_surfaces
+        .iter()
+        .find_map(|&(id, pos)| {
+            let valid = lot.buy_move(&mut cursor, [pos[0], pos[1]], pos[2]).unwrap();
+            (valid && cursor.container.is_some_and(|(c, _)| c == id)).then_some(id)
+        })
+        .expect("surface for lamp");
+    let funds_before = lot.world().budget.funds;
+    let placed_lamp = lot.buy_commit(&cursor).unwrap();
+    assert!(!lot.world().objects.contains_key(&cursor.cursor));
+    assert_eq!(lot.world().objects[&placed_lamp].data[2], surface_id as i16);
+    assert_eq!(lot.world().budget.funds, funds_before - lamp.price);
+
+    // OBJf function 11 (`USER_PLACEMENT`, `0x43562f` / `0x422e99`): committing
+    // the Jack-O'-Lantern runs its user-placement callback cleanly.
+    if let Some(pumpkin) = catalog
+        .all()
+        .iter()
+        .find(|i| i.name.contains("Jack-O") && i.price <= lot.world().budget.funds)
+    {
+        let mut cursor = lot.buy_start(pumpkin.guid, 1, 2).unwrap().unwrap();
+        assert!(lot.buy_move(&mut cursor, [584, 472], 1).unwrap());
+        let placed = lot.buy_commit(&cursor).unwrap();
+        assert!(lot.world().objects.contains_key(&placed));
+        assert!(!lot.world().objects.contains_key(&cursor.cursor));
+    }
+
+    // Unsnapped fallback (`0x485f23` -> `0x421e72` -> `0x4355bc..0x4355cd`):
+    // Werkbunnst Chair collides with object 121 at snapped `[296, 424]`. Native
+    // `UserTestPlace` requires tile-centred coordinates (`low nibbles == 8`),
+    // so retrying at unsnapped `[292, 431]` leaves the held chair off-lot,
+    // places only `"Tile Cursor"` at `[292, 431, 1]`, and refuses commit.
+    let mut unsnapped = lot.buy_start(0x26bf_bb29, 1, 2).unwrap().unwrap();
+    assert!(!lot.buy_move(&mut unsnapped, [292, 431], 1).unwrap());
+    assert!(!unsnapped.valid);
+    assert_eq!(unsnapped.position, [292, 431, 1]);
+    assert!(lot.world().objects[&unsnapped.held].position[0] < 0);
+    assert_eq!(
+        lot.world().objects[&unsnapped.cursor].position,
+        [292, 431, 1]
+    );
+    assert!(lot.buy_commit(&unsnapped).is_err());
+    lot.buy_cancel(&unsnapped).unwrap();
+
+    // Initial off-lot rotation runs `LEAVING` (`0x42271d` / `0x421bff` ->
+    // `0x433148`): starting Scrimpon Crimson Awnings (`0xefba77ca`) at facing 2
+    // runs its OBJf 10 `LEAVING` callback while off-lot, setting `data[13] = 4`
+    // so open-lawn placement at `[584, 472]` is refused immediately.
+    if catalog.get(0xefba_77ca).is_some() {
+        let mut awn = lot.buy_start(0xefba_77ca, 1, 2).unwrap().unwrap();
+        assert_eq!(lot.world().objects[&awn.held].data[13], 4);
+        assert!(!lot.buy_move(&mut awn, [584, 472], 1).unwrap());
+        assert!(!awn.valid);
+        assert!(lot.buy_commit(&awn).is_err());
+        lot.buy_cancel(&awn).unwrap();
+    }
+
+    // Refused Redo transfer (`0x48bdfe` line `0x48be72` -> `0x493353`):
+    // buying two Werkbunnst Chairs at `[552, 472]` and `[520, 472]`, undoing
+    // both, blocking the first chair's tile `[552, 472]` with a preview chair,
+    // and redoing must transfer the refused first chair to Undo without
+    // charging while keeping the second chair on Redo so the next Redo restores
+    // it and re-charges `$80`.
+    {
+        let mut ch1 = lot.buy_start(0x26bf_bb29, 1, 2).unwrap().unwrap();
+        assert!(lot.buy_move(&mut ch1, [552, 472], 1).unwrap());
+        let ch1_id = lot.buy_commit(&ch1).unwrap();
+        let mut ch2 = lot.buy_start(0x26bf_bb29, 1, 2).unwrap().unwrap();
+        assert!(lot.buy_move(&mut ch2, [520, 472], 1).unwrap());
+        let ch2_id = lot.buy_commit(&ch2).unwrap();
+        assert!(lot.buy_undo().unwrap());
+        assert!(lot.buy_undo().unwrap());
+        let funds_after_undos = lot.world().budget.funds;
+        let mut blocker = lot.buy_start(0x26bf_bb29, 1, 2).unwrap().unwrap();
+        assert!(lot.buy_move(&mut blocker, [552, 472], 1).unwrap());
+        // First redo pops `ch1`: blocked, not charged, transferred to Undo,
+        // leaving `ch2` on Redo.
+        assert!(!lot.buy_redo().unwrap());
+        assert_eq!(lot.world().budget.funds, funds_after_undos);
+        assert!(lot.world().objects[&ch1_id].position[0] < 0);
+        assert!(lot.can_buy_redo());
+        // Second redo restores `ch2` and re-charges `$80`.
+        assert!(lot.buy_redo().unwrap());
+        assert_eq!(lot.world().budget.funds, funds_after_undos - 80);
+        assert!(lot.world().objects[&ch2_id].position[0] >= 0);
+        lot.buy_cancel(&blocker).unwrap();
+        assert!(lot.buy_undo().unwrap());
+    }
+
+    // Ground flag `0x20` (`UserTestPlace`, `0x435522`): road/curb tile
+    // `[24, 328, 1]` has ground flags `0x27` (`& 0x20 != 0`) and must be
+    // refused by Buy placement.
+    let mut blocked_cur = lot.buy_start(0x26bf_bb29, 1, 2).unwrap().unwrap();
+    assert!(!lot.buy_move(&mut blocked_cur, [24, 328], 1).unwrap());
+    assert!(!blocked_cur.valid);
+    lot.buy_cancel(&blocked_cur).unwrap();
+
+    // Blocked container Redo: buying a Mesquite Desk on the lawn and placing a
+    // Gloominator Desk Lamp on it, undoing both, blocking the desk's tile with
+    // a previewed chair, then redoing both must refuse BOTH the desk and the
+    // lamp (since the desk is still detached off-lot) without charging for the
+    // lamp.
+    if let Some(desk) = catalog
+        .all()
+        .iter()
+        .find(|i| i.name.contains("Mesquite") && i.name.contains("Desk"))
+    {
+        let mut desk_cur = lot.buy_start(desk.guid, 1, 2).unwrap().unwrap();
+        assert!(lot.buy_move(&mut desk_cur, [520, 472], 1).unwrap());
+        let desk_id = lot.buy_commit(&desk_cur).unwrap();
+        let mut lamp_cur = lot.buy_start(lamp.guid, 1, 2).unwrap().unwrap();
+        assert!(lot.buy_move(&mut lamp_cur, [520, 472], 1).unwrap());
+        assert_eq!(lamp_cur.container.map(|(c, _)| c), Some(desk_id));
+        let desk_lamp_id = lot.buy_commit(&lamp_cur).unwrap();
+        assert!(lot.buy_undo().unwrap());
+        assert!(lot.buy_undo().unwrap());
+        assert!(lot.world().objects[&desk_id].position[0] < 0);
+        assert!(lot.world().objects[&desk_lamp_id].position[0] < 0);
+        let funds_before_blocked_redo = lot.world().budget.funds;
+        let mut blocker = lot.buy_start(0x26bf_bb29, 1, 2).unwrap().unwrap();
+        assert!(lot.buy_move(&mut blocker, [520, 472], 1).unwrap());
+        // Desk redo is refused because the preview chair occupies `[520, 472]`.
+        assert!(!lot.buy_redo().unwrap());
+        assert!(lot.world().objects[&desk_id].position[0] < 0);
+        assert_eq!(lot.world().budget.funds, funds_before_blocked_redo);
+        // Lamp redo must also be refused because its container desk is off-lot.
+        assert!(!lot.buy_redo().unwrap());
+        assert!(lot.world().objects[&desk_lamp_id].position[0] < 0);
+        assert_eq!(lot.world().budget.funds, funds_before_blocked_redo);
+        lot.buy_cancel(&blocker).unwrap();
+        // Undo the two refused records so later Undo assertions still reach `placed_lamp`.
+        assert!(lot.buy_undo().unwrap());
+        assert!(lot.buy_undo().unwrap());
+
+        // Saving after undoing a desk beneath an unpaid preview lamp: Undo
+        // takes the desk (and unpaid preview lamp in its slot) off-lot;
+        // `save_without_buy_cursor` must strip the preview BEFORE purging
+        // history so it does not double-delete the lamp.
+        let mut desk_cur2 = lot.buy_start(desk.guid, 1, 2).unwrap().unwrap();
+        assert!(lot.buy_move(&mut desk_cur2, [520, 472], 1).unwrap());
+        let desk_id2 = lot.buy_commit(&desk_cur2).unwrap();
+        let mut lamp_preview = lot.buy_start(lamp.guid, 1, 2).unwrap().unwrap();
+        assert!(lot.buy_move(&mut lamp_preview, [520, 472], 1).unwrap());
+        assert_eq!(lamp_preview.container.map(|(c, _)| c), Some(desk_id2));
+        assert!(lot.buy_undo().unwrap());
+        assert!(lot.world().objects[&desk_id2].position[0] < 0);
+        let saved_under_preview = lot
+            .save_without_buy_cursor(&lamp_preview)
+            .expect("save strips unpaid preview before purging undone desk");
+        assert!(!saved_under_preview.world().objects.contains_key(&desk_id2));
+        assert!(
+            !saved_under_preview
+                .world()
+                .objects
+                .contains_key(&lamp_preview.held)
+        );
+        assert!(
+            !saved_under_preview
+                .world()
+                .objects
+                .contains_key(&lamp_preview.cursor)
+        );
+        lot.buy_cancel(&lamp_preview).unwrap();
+    }
+
+    // Wall-mounted auto-rotation (`0x48736b` + `0x43583e`): Narcisco Wall
+    // Mirror fails at facing 2 at `[264, 504]` and auto-rotates to facing 4.
+    // Manual rotation (`0x4226bc` / `0x421be4`) back to facing 2 must NOT
+    // re-run pointer-move auto-rotation: it returns `Ok(false)`, keeps facing
+    // 2 with `cursor.valid == false`, and refuses commit until rotated back.
+    let mirror = catalog
+        .all()
+        .iter()
+        .find(|i| i.name.contains("Narcisco"))
+        .expect("Narcisco Wall Mirror");
+    let mut mirror_cur = lot.buy_start(mirror.guid, 1, 2).unwrap().unwrap();
+    assert!(lot.buy_move(&mut mirror_cur, [264, 504], 1).unwrap());
+    assert_eq!(lot.world().objects[&mirror_cur.held].data[1], 4);
+    assert!(!lot.buy_rotate(&mut mirror_cur, 2).unwrap());
+    assert!(!mirror_cur.valid);
+    assert_eq!(lot.world().objects[&mirror_cur.held].data[1], 2);
+    assert!(lot.buy_commit(&mirror_cur).is_err());
+    assert!(lot.buy_rotate(&mut mirror_cur, 4).unwrap());
+    assert!(mirror_cur.valid);
+    assert_eq!(lot.world().objects[&mirror_cur.held].data[1], 4);
+    // Failed unsnapped fallback (`0x421fcf..0x421fed`) saves the cursor's
+    // actual coordinates so manual rotation (`0x422705..0x422716`) keeps the
+    // cursor at `[581, 475, 1]` instead of jumping to tile centre `[584, 472, 1]`.
+    assert!(!lot.buy_move(&mut mirror_cur, [581, 475], 1).unwrap());
+    assert_eq!(mirror_cur.position, [581, 475, 1]);
+    assert_eq!(
+        lot.world().objects[&mirror_cur.cursor].position,
+        [581, 475, 1]
+    );
+    assert!(!lot.buy_rotate(&mut mirror_cur, 2).unwrap());
+    assert_eq!(mirror_cur.position, [581, 475, 1]);
+    assert_eq!(
+        lot.world().objects[&mirror_cur.cursor].position,
+        [581, 475, 1]
+    );
+    lot.buy_cancel(&mirror_cur).unwrap();
+
+    // Undo / Redo for surface purchase (`0x48ba19`, `0x435751`, `0x48c07b`,
+    // `0x48c20e`): undo runs OBJf 12 (`USER_PICKUP`) and detaches the lamp
+    // off-lot while keeping it registered; redo reuses the exact same
+    // registered instance and restores its desk slot and charge.
+    assert!(lot.can_buy_undo());
+    let lamp_reg = lot.world().objects[&placed_lamp].registry_word;
+    let mut funds_before_lamp_undo = lot.world().budget.funds;
+    while lot.world().objects[&placed_lamp].position[0] >= 0 {
+        funds_before_lamp_undo = lot.world().budget.funds;
+        assert!(lot.buy_undo().unwrap());
+    }
+    assert!(lot.world().objects.contains_key(&placed_lamp));
+    assert!(lot.world().objects[&placed_lamp].position[0] < 0);
+    assert_eq!(lot.world().objects[&placed_lamp].data[2], 0);
+    assert_eq!(
+        lot.world().budget.funds,
+        funds_before_lamp_undo + lamp.price
+    );
+    assert!(lot.can_buy_redo());
+    assert!(lot.buy_redo().unwrap());
+    assert!(lot.world().objects[&placed_lamp].position[0] >= 0);
+    assert_eq!(lot.world().objects[&placed_lamp].registry_word, lamp_reg);
+    assert_eq!(lot.world().objects[&placed_lamp].data[2], surface_id as i16);
+    assert_eq!(lot.world().budget.funds, funds_before_lamp_undo);
+
+    // Missing CTSS fallback (`0x457d3b`): lamps without CTSS 2008 take their
+    // OBJD chunk label instead of sorting with an empty name.
+    for guid in [0x3db3_2c6cu32, 0x4eac_803au32] {
+        if let Some(item) = catalog.get(guid) {
+            assert!(
+                !item.name.is_empty(),
+                "0x{guid:08X} should fall back to OBJD chunk label"
+            );
+        }
+    }
+
+    // Drag rotation facing-offset timing (`0x485da9`): Spartan Special bed has
+    // a nonzero OBJD `+0x7a` facing offset, so dragging lower-right (`desired
+    // == current == 2`) at rotation 0 skips rotation and keeps facing 2.
+    let spartan = catalog
+        .all()
+        .iter()
+        .find(|i| i.name.contains("Spartan Special"))
+        .expect("Spartan Special bed");
+    let mut bed_game = Game::open(&options(install.clone())).expect("open Goth house");
+    bed_game.resize([800, 600]);
+    bed_game.render();
+    assert_eq!(bed_game.run(60), 60);
+    bed_game.set_mode(Mode::Buy);
+    // Open Seating -> Beds (subcat 3 at [383, 528]) and select slot 0 (Spartan
+    // Special bed, cheapest bed at $300).
+    bed_game.press([258, 524]);
+    bed_game.release([258, 524]);
+    bed_game.press([383, 528]);
+    bed_game.release([383, 528]);
+    bed_game.press([437, 523]);
+    bed_game.release([437, 523]);
+    assert_eq!(bed_game.buy_selected(), Some(spartan.guid));
+    let lawn = recorded([480, 380]);
+    bed_game.hover(lawn);
+    let bed_cur = bed_game.buy_cursor().expect("bed cursor active").clone();
+    assert_ne!(bed_cur.facing_offset, 0);
+    assert_eq!(bed_game.lot().world().objects[&bed_cur.held].data[1], 2);
+    // Lower-right drag (`desired == 2 == current`) must keep facing 2.
+    bed_game.press(lawn);
+    bed_game.hover([lawn[0] + 20, lawn[1] + 20]);
+    assert_eq!(bed_game.lot().world().objects[&bed_cur.held].data[1], 2);
+    bed_game.cancel_buy();
+
+    // Refused commit on an invalid tile retains `buy_cursor` in `Game` so
+    // cancellation still deletes both preview objects cleanly.
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    game.resize([800, 600]);
+    game.render();
+    assert_eq!(game.run(60), 60);
+    game.render();
+    let live_top350: Vec<[u8; 3]> = game.canvas().color[..800 * 350].to_vec();
+    // Clicking the lot in Build or Options mode (`0x4cea5d`) must NOT open a
+    // Live Mode pie menu or mutate simulation state.
+    for non_live in [Mode::Build, Mode::Options] {
+        game.set_mode(non_live);
+        let hash_before = game.lot().world().hash();
+        game.press([266, 190]);
+        game.release([266, 190]);
+        assert!(game.menu().is_none(), "{non_live:?} opened a Live pie menu");
+        assert_eq!(
+            game.lot().world().hash(),
+            hash_before,
+            "{non_live:?} click mutated world state"
+        );
+    }
+    game.set_mode(Mode::Buy);
+    // Entering Buy Mode must draw the dotted black lot placement grid on
+    // unfloored buildable terrain immediately (`0x4ce44f` -> `0x4c4222`,
+    // `0x4c42f0`, `0x4c37f2`), even before selecting an item.
+    game.render();
+    let buy_top350: Vec<[u8; 3]> = game.canvas().color[..800 * 350].to_vec();
+    let added_grid_pixels = live_top350
+        .iter()
+        .zip(buy_top350.iter())
+        .filter(|&(before, after)| *before != [0, 0, 0] && *after == [0, 0, 0])
+        .count();
+    assert!(
+        added_grid_pixels > 500,
+        "expected Buy Mode lot placement grid in top 350 rows, got {added_grid_pixels} new black pixels"
+    );
+    // Hovering and rendering in Buy Mode with no item armed must NOT run Live
+    // Mode interaction checks (`Game::follow`) or mutate simulation state.
+    let hash_before_buy_hover = game.lot().world().hash();
+    game.hover([266, 190]);
+    game.render();
+    assert_eq!(game.listed(), None);
+    assert_eq!(game.lot().world().hash(), hash_before_buy_hover);
+    let objs_before = game.lot().world().objects.len();
+    game.press([258, 524]);
+    game.release([258, 524]);
+    game.press([437, 523]);
+    game.release([437, 523]);
+    // Place one chair on the lawn, leaving the repeat-purchase chair armed and
+    // invalid over the now-occupied tile; releasing there plays UI_error and
+    // keeps `buy_cursor` intact until `cancel_buy` deletes both objects.
+    let spot = recorded([480, 380]);
+    game.hover(spot);
+    let first_chair = game.buy_cursor().expect("first chair cursor").held;
+    let first_reg = game.lot().world().objects[&first_chair].registry_word;
+    // Unavailable Undo / Redo must not cancel the active preview or selection
+    // before any purchase has been committed.
+    assert!(!game.can_undo());
+    assert!(!game.can_redo());
+    assert!(!game.undo_buy());
+    assert!(!game.redo_buy());
+    assert!(game.buy_cursor().is_some());
+    assert!(game.buy_selected().is_some());
+    game.press(spot);
+    game.release(spot);
+    let second = game.buy_cursor().expect("repeat purchase armed").clone();
+    assert!(!second.valid);
+    game.take_sounds();
+    game.press(spot);
+    game.release(spot);
+    assert!(game.buy_cursor().is_some());
+    assert!(game.lot().world().objects.contains_key(&second.held));
+    assert!(game.lot().world().objects.contains_key(&second.cursor));
+    assert!(
+        game.take_sounds()
+            .iter()
+            .any(|s| matches!(s, SoundEvent::Play { name, .. } if name == "UI_error"))
+    );
+    // Stationary Undo / Redo (`0x4a8545`, `0x4a856a`): Undo keeps the repeat
+    // preview armed and off-lot without moving it onto the freed tile, so an
+    // immediate Redo without moving the pointer restores `first_chair` and
+    // re-charges `$80`. Explicitly hovering the repeat preview onto the freed
+    // tile after Undo places it on-lot and causes Redo to be refused via
+    // `0x4337f6` without charging `$80`.
+    assert!(game.can_undo());
+    assert!(game.undo_buy());
+    assert_eq!(game.buy_selected(), Some(0x26bf_bb29));
+    let armed_after_undo = game
+        .buy_cursor()
+        .expect("repeat preview stays armed after Undo")
+        .clone();
+    assert_eq!(armed_after_undo.held, second.held);
+    assert_eq!(armed_after_undo.cursor, second.cursor);
+    assert!(!armed_after_undo.valid);
+    assert!(game.lot().world().objects[&second.held].position[0] < 0);
+    assert!(game.lot().world().objects[&first_chair].position[0] < 0);
+    assert_eq!(game.lot().world().budget.funds, 2542);
+    // Stationary Redo succeeds immediately because `second.held` stayed off-lot.
+    assert!(game.redo_buy());
+    assert!(game.lot().world().objects[&first_chair].position[0] >= 0);
+    assert_eq!(
+        game.lot().world().objects[&first_chair].registry_word,
+        first_reg
+    );
+    assert_eq!(game.lot().world().budget.funds, 2542 - 80);
+    // Now Undo again and explicitly hover `spot`, moving `second.held` onto the
+    // freed tile so Redo collides (`0x4337f6`) and is refused without charging.
+    assert!(game.undo_buy());
+    assert_eq!(game.lot().world().budget.funds, 2542);
+    game.hover(spot);
+    let hovered_preview = game.buy_cursor().expect("preview moved onto tile").clone();
+    assert!(hovered_preview.valid);
+    assert!(game.lot().world().objects[&second.held].position[0] >= 0);
+    assert!(!game.redo_buy());
+    assert_eq!(game.buy_selected(), Some(0x26bf_bb29));
+    assert!(game.lot().world().objects[&first_chair].position[0] < 0);
+    assert_eq!(game.lot().world().budget.funds, 2542);
+    // Step back the refused record to Redo: native `0x48bd21` -> `0x48c0ea` ->
+    // `0x48bd88` refunds `$80` whenever the retained instance still exists;
+    // cancelling the blocking preview and redoing then re-charges `$80`.
+    assert!(game.undo_buy());
+    assert_eq!(game.lot().world().budget.funds, 2542 + 80);
+    assert!(game.cancel_buy());
+    assert!(game.buy_cursor().is_none());
+    assert!(game.redo_buy());
+    assert!(game.lot().world().objects[&first_chair].position[0] >= 0);
+    assert_eq!(
+        game.lot().world().objects[&first_chair].registry_word,
+        first_reg
+    );
+    assert_eq!(game.lot().world().objects.len(), objs_before + 1);
+    let funds_after_buy = game.lot().world().budget.funds;
+    assert_eq!(funds_after_buy, 2542);
+
+    // Unrelated Undo while holding a manually rotated surface item (`0x421e72`):
+    // click Back (`[234, 550]`), Lighting (`[337, 570]`), and slot 0
+    // (Gloominator Desk Lamp, $85), hover over the surface at `[381, 190]`,
+    // rotate manually, undo the lawn chair, and verify the lamp stays armed on
+    // the surface with its manual facing intact.
+    game.press([234, 550]); // Back from Seating to top-level categories
+    game.release([234, 550]);
+    game.press([337, 570]); // Lighting (cat 6 -> sub 0 Table Lamps)
+    game.release([337, 570]);
+    game.press([437, 523]); // Slot 0: Gloominator Desk Lamp ($85)
+    game.release([437, 523]);
+    assert_eq!(game.buy_selected(), Some(lamp.guid));
+    game.hover([381, 190]);
+    let lamp_cur = game.buy_cursor().expect("lamp cursor active").clone();
+    assert!(lamp_cur.valid && lamp_cur.container.is_some());
+    let before_dir = game.lot().world().objects[&lamp_cur.held].data[1];
+    assert!(game.rotate_held(true));
+    let manual_dir = game.lot().world().objects[&lamp_cur.held].data[1];
+    assert_ne!(manual_dir, before_dir);
+    // Undo the unrelated lawn chair purchase: lamp stays armed on the surface
+    // and keeps `manual_dir`.
+    assert!(game.undo_buy());
+    let after_undo = game.buy_cursor().expect("lamp stays armed").clone();
+    assert!(after_undo.valid);
+    assert_eq!(after_undo.container, lamp_cur.container);
+    assert_eq!(
+        game.lot().world().objects[&after_undo.held].data[1],
+        manual_dir
+    );
+    // Redo the lawn chair purchase: lamp still keeps `manual_dir`.
+    assert!(game.redo_buy());
+    let after_redo = game.buy_cursor().expect("lamp stays armed").clone();
+    assert!(after_redo.valid);
+    assert_eq!(after_redo.container, lamp_cur.container);
+    assert_eq!(
+        game.lot().world().objects[&after_redo.held].data[1],
+        manual_dir
+    );
+    game.cancel_buy();
+
+    // Undo / Redo of a surface beneath a manually rotated preview lamp must
+    // preserve `cursor.container` so the next hover at the same spot keeps the
+    // lamp's manual facing (`0x421e72`).
+    game.press([234, 550]); // Back from Lighting to top-level categories
+    game.release([234, 550]);
+    game.press([295, 524]); // Surfaces (cat 1 -> sub 0 End Tables)
+    game.release([295, 524]);
+    game.press([437, 523]); // Slot 0 surface item
+    game.release([437, 523]);
+    let surface_spot = recorded([440, 380]);
+    game.hover(surface_spot);
+    game.press(surface_spot);
+    game.release(surface_spot);
+    game.cancel_buy();
+    // Arm Gloominator Desk Lamp over the newly placed lawn surface, rotate it,
+    // undo and redo the surface without moving the pointer, then hover again.
+    game.press([234, 550]); // Back from Surfaces to top-level categories
+    game.release([234, 550]);
+    game.press([337, 570]); // Lighting -> Table Lamps
+    game.release([337, 570]);
+    game.press([437, 523]); // Slot 0: Gloominator Desk Lamp
+    game.release([437, 523]);
+    game.hover(surface_spot);
+    let surf_lamp = game.buy_cursor().expect("lamp over new surface").clone();
+    assert!(surf_lamp.valid && surf_lamp.container.is_some());
+    let surf_before_dir = game.lot().world().objects[&surf_lamp.held].data[1];
+    assert!(game.rotate_held(true));
+    let surf_manual_dir = game.lot().world().objects[&surf_lamp.held].data[1];
+    assert_ne!(surf_manual_dir, surf_before_dir);
+    assert!(game.undo_buy());
+    assert!(game.redo_buy());
+    game.hover(surface_spot);
+    let surf_lamp_after = game.buy_cursor().expect("lamp still armed").clone();
+    assert!(surf_lamp_after.valid);
+    assert_eq!(surf_lamp_after.container, surf_lamp.container);
+    assert_eq!(
+        game.lot().world().objects[&surf_lamp_after.held].data[1],
+        surf_manual_dir
+    );
+    game.cancel_buy();
+    // Undo the extra lawn surface so the remaining assertions check `first_chair`.
+    assert!(game.undo_buy());
+
+    // Undo / Redo after cancelling the repeat preview, plus leaving Buy Mode
+    // deleting the detached instance (`0x4cea5d` -> `0x4933dc` -> `0x48c20e`).
+    assert!(game.can_undo());
+    assert!(game.undo_buy());
+    assert!(game.lot().world().objects.contains_key(&first_chair));
+    assert!(game.lot().world().objects[&first_chair].position[0] < 0);
+    assert_eq!(game.lot().world().budget.funds, funds_after_buy + 80);
+    assert!(!game.can_undo());
+    assert!(game.can_redo());
+    assert!(game.redo_buy());
+    assert!(game.lot().world().objects[&first_chair].position[0] >= 0);
+    assert_eq!(
+        game.lot().world().objects[&first_chair].registry_word,
+        first_reg
+    );
+    assert_eq!(game.lot().world().budget.funds, funds_after_buy);
+    assert!(game.can_undo());
+    assert!(game.undo_buy());
+    assert!(game.lot().world().objects[&first_chair].position[0] < 0);
+    game.set_mode(Mode::Live);
+    assert!(!game.lot().world().objects.contains_key(&first_chair));
+    assert_eq!(game.lot().world().objects.len(), objs_before);
+    assert!(!game.lot().can_buy_undo());
+    assert!(!game.lot().can_buy_redo());
+    // Returning to Live Mode removes the Buy Mode lot placement grid.
+    game.render();
+    assert_eq!(&game.canvas().color[..800 * 350], live_top350.as_slice());
+
+    // Mid-drag Undo (`0x4a8545` + `0x485bda`): place a chair at tile-centred
+    // screen point `[577, 432]`, press again on the occupied tile with the
+    // repeat preview, undo the first chair while holding the mouse button,
+    // drag in the same facing quadrant to `[589, 444]`, and release. Native
+    // re-evaluates placement at the saved tile so the second chair commits.
+    game.set_mode(Mode::Buy);
+    game.press([258, 524]);
+    game.release([258, 524]);
+    game.press([437, 523]);
+    game.release([437, 523]);
+    let centred_spot = [577, 432];
+    game.hover(centred_spot);
+    game.press(centred_spot);
+    game.release(centred_spot);
+    let drag_funds_after_first = game.lot().world().budget.funds;
+    let repeat_chair = game.buy_cursor().expect("repeat preview armed").held;
+    game.press(centred_spot);
+    assert!(game.undo_buy());
+    assert_eq!(game.lot().world().budget.funds, drag_funds_after_first + 80);
+    game.hover([589, 444]);
+    let drag_cur = game.buy_cursor().expect("drag preview revalidated").clone();
+    assert!(drag_cur.valid);
+    assert_eq!(drag_cur.held, repeat_chair);
+    game.release([589, 444]);
+    assert!(game.lot().world().objects[&repeat_chair].position[0] >= 0);
+    assert_eq!(game.lot().world().budget.funds, drag_funds_after_first);
+    game.cancel_buy();
+    assert!(game.undo_buy());
+
+    // Mid-drag Redo of a surface (`0x485bda` before `0x485da9`): buy an End
+    // Table at `[577, 432]`, cancel its repeat preview, Undo, select Table
+    // Lamps, press at `[577, 432]`, drag to `[589, 420]` (facing 4), Redo the
+    // table while holding the mouse button, and release at `[589, 420]`. The
+    // lamp snaps onto the restored table in `0x485bda` and then rotates back
+    // to facing 4 in `0x485da9` before committing.
+    game.press([234, 550]); // Back from Seating to top-level categories
+    game.release([234, 550]);
+    game.press([295, 524]); // Surfaces -> End Tables
+    game.release([295, 524]);
+    game.press([437, 523]); // Slot 0 End Table
+    game.release([437, 523]);
+    game.hover(centred_spot);
+    game.press(centred_spot);
+    game.release(centred_spot);
+    game.cancel_buy();
+    assert!(game.undo_buy());
+    game.press([234, 550]); // Back from Surfaces to top-level categories
+    game.release([234, 550]);
+    game.press([337, 570]); // Lighting -> Table Lamps
+    game.release([337, 570]);
+    game.press([437, 523]); // Slot 0 Table Lamp
+    game.release([437, 523]);
+    game.hover(centred_spot);
+    let drag_lamp = game.buy_cursor().expect("lamp armed").held;
+    game.press(centred_spot);
+    game.hover([589, 420]);
+    assert_eq!(game.lot().world().objects[&drag_lamp].data[1], 4);
+    assert!(game.redo_buy());
+    game.release([589, 420]);
+    assert!(game.lot().world().objects[&drag_lamp].position[0] >= 0);
+    assert_ne!(game.lot().world().objects[&drag_lamp].data[2], 0);
+    assert_eq!(game.lot().world().objects[&drag_lamp].data[1], 4);
+
+    // Changing floors during a drag (`0x485ba2` -> `0x485bda` / `0x485e72`):
+    // start dragging a Werkbunnst Chair on the ground-floor lawn, move up to
+    // floor 2, drag >6 px, and release. Placement re-evaluates on floor 2
+    // (no floor above the lawn) and must NOT buy the chair downstairs.
+    game.press([234, 550]); // Back to top-level categories
+    game.release([234, 550]);
+    game.press([258, 524]); // Seating -> Chairs
+    game.release([258, 524]);
+    game.press([437, 523]); // Werkbunnst Chair
+    game.release([437, 523]);
+    let floor_spot = [577, 432];
+    game.hover(floor_spot);
+    let funds_before_floor_drag = game.lot().world().budget.funds;
+    game.press(floor_spot);
+    game.view.camera.level = 2;
+    game.hover([589, 444]);
+    game.release([589, 444]);
+    assert_eq!(game.lot().world().budget.funds, funds_before_floor_drag);
+    assert!(game.buy_cursor().is_some_and(|c| !c.valid));
+
+    // Leaving the house view onto the catalog and re-entering recreates the
+    // preview at the tool's stored facing (`0x487d3d` -> `0x486f5a`), discarding
+    // any uncommitted `.`/`,` rotation on the hidden preview.
+    game.view.camera.level = 1;
+    game.cancel_buy();
+    game.press([437, 523]); // Werkbunnst Chair
+    game.release([437, 523]);
+    game.hover(floor_spot);
+    assert_eq!(
+        game.lot().world().objects[&game.buy_cursor().unwrap().held].data[1],
+        2
+    );
+    assert!(game.rotate_held(false)); // `,` single counterclockwise turn -> 0
+    assert_eq!(
+        game.lot().world().objects[&game.buy_cursor().unwrap().held].data[1],
+        0
+    );
+    assert!(game.rotate_held(true)); // `.` -> 2
+    assert!(game.rotate_held(true)); // `.` -> 4
+    assert_eq!(
+        game.lot().world().objects[&game.buy_cursor().unwrap().held].data[1],
+        4
+    );
+    // Move onto the catalog panel (`0x487d4e`): saved coordinates remain intact
+    // for `rotate_held` (`0x486b9e`), then returning to the lawn
+    // (`0x487d3d` -> `0x486f5a`) recreates the preview at stored facing `2`.
+    let saved_pos = game.buy_cursor().unwrap().position;
+    game.hover([300, 520]);
+    assert_eq!(game.buy_cursor().unwrap().position, saved_pos);
+    assert!(game.rotate_held(true));
+    game.hover(floor_spot);
+    let reentered_chair = game.buy_cursor().unwrap().held;
+    assert_eq!(game.lot().world().objects[&reentered_chair].data[1], 2);
+    game.press(floor_spot);
+    game.release(floor_spot);
+    assert_eq!(game.lot().world().objects[&reentered_chair].data[1], 2);
+
+    // Committed facing persists across switching to Live and back to Buy
+    // (`0x487191` retains `tool[0x12]` and `tool[0x10]` for `0x486f5a`).
+    game.press([437, 523]);
+    game.release([437, 523]);
+    game.hover([555, 420]);
+    assert!(game.rotate_held(true)); // 2 -> 4
+    let persisted_chair = game.buy_cursor().unwrap().held;
+    assert_eq!(game.lot().world().objects[&persisted_chair].data[1], 4);
+    game.press([555, 420]);
+    game.release([555, 420]);
+    assert_eq!(game.lot().world().objects[&persisted_chair].data[1], 4);
+    game.set_mode(Mode::Live);
+    game.set_mode(Mode::Buy);
+    game.press([258, 524]); // Seating
+    game.release([258, 524]);
+    game.press([437, 523]); // Werkbunnst Chair
+    game.release([437, 523]);
+    game.hover([535, 410]);
+    assert_eq!(
+        game.lot().world().objects[&game.buy_cursor().unwrap().held].data[1],
+        4
+    );
+
+    // Blocked placement preview (`0x42242f`): hovering the chair onto a
+    // blocked spot leaves the chair off-lot and the Tile Cursor on-lot, yet
+    // rendering still draws the chair's sprites at the cursor's position.
+    let blocked_spot = [338, 276];
+    game.hover(blocked_spot);
+    let blocked_cur = game.buy_cursor().unwrap().clone();
+    assert!(!blocked_cur.valid);
+    assert_eq!(
+        game.lot().world().objects[&blocked_cur.held].position[0],
+        -16
+    );
+    assert!(game.lot().world().objects[&blocked_cur.cursor].position[0] >= 0);
+    let canvas = game.render();
+    let drew_held = (0..canvas.height as i32)
+        .any(|y| (0..canvas.width as i32).any(|x| canvas.id_at(x, y) == Some(blocked_cur.held)));
+    assert!(
+        drew_held,
+        "blocked held chair must still draw at the on-lot Tile Cursor position (0x42242f)"
+    );
+
+    // Entering Buy Mode from a collapsed Live panel refreshes `view_centre`.
+    game.set_mode(Mode::Live);
+    game.render();
+    let toggle = game
+        .panel()
+        .iter()
+        .find(|item| item.command == Some(sims_ui::command::Command::TogglePanel))
+        .map(|item| {
+            [
+                item.rect.x + item.rect.width / 2,
+                item.rect.y + item.rect.height / 2,
+            ]
+        })
+        .expect("TogglePanel button");
+    game.press(toggle);
+    game.release(toggle);
+    let collapsed_centre = game.lot().view_centre();
+    game.set_mode(Mode::Buy);
+    assert_ne!(game.lot().view_centre(), collapsed_centre);
+}
+
+/// Opening a pie menu near the top edge of the expanded bottom control strip
+/// (starting at `y = 500` in an 800×600 window) clips the 3D pie head to the
+/// 800×500 house viewport so zero opaque head pixels draw over the bottom
+/// strip, while the upper half of the head still draws inside the house view.
+#[test]
+fn pie_head_is_clipped_to_house_viewport_above_the_bottom_strip() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    assert_eq!(game.run(100), 100);
+    game.resize([800, 600]);
+    game.render();
+
+    // Pan the camera so the porch bench (173, single-entry "Sit" pie with no
+    // bottom label) sits right at y = 487, near the top of the expanded bottom
+    // control strip (y = 500), so its 3D pie head extends well across y = 500.
+    let bench_at = recorded([432, 230]);
+    assert_eq!(game.under(bench_at), Some(173));
+    let target_y = 487;
+    game.view.camera.origin[1] += target_y - bench_at[1];
+    let baseline = game.render().color.clone();
+    let point = [bench_at[0], target_y];
+    assert_eq!(game.under(point), Some(173));
+    assert!(!game.over_panel(point));
+    game.leave();
+    game.hover(point);
+    game.press(point);
+    game.render();
+    let menu = game.menu().expect("bench pie opened near bottom strip");
+    let origin = menu.head_origin;
+    let head = menu.head.as_ref().expect("head rendered");
+    // The head is clipped right at the bottom edge of the 800×500 house
+    // viewport (y = 500), so its bottom edge stops at 500 and its opaque count
+    // is strictly smaller than Mortimer's unclipped idle head (1,940 px).
+    assert_eq!(
+        origin[1] + head.height as i32,
+        500,
+        "expected head bottom to be clipped at y=500, origin={origin:?}, height={}",
+        head.height
+    );
+    let clipped_opaque = head.rgba.chunks(4).filter(|p| p[3] == 255).count();
+    assert!(
+        clipped_opaque > 500 && clipped_opaque < 1800,
+        "expected partial head clipped at y=500 (unclipped idle is 1940), got {clipped_opaque}"
+    );
+    let frame = game.canvas().color.clone();
+    let label_rects: Vec<Rect> = menu.labels().into_iter().map(|(_, r)| r).collect();
+    let in_label = |x: i32, y: i32| label_rects.iter().any(|r| r.contains(x, y));
+
+    // Zero pixels anywhere on the bottom control strip (y >= 500, outside pie
+    // labels) are modified by the pie head or circular backdrop.
+    for dy in 500..600 {
+        for dx in 0..800 {
+            if in_label(dx, dy) {
+                continue;
+            }
+            let idx = dy as usize * 800 + dx as usize;
+            assert_eq!(
+                frame[idx], baseline[idx],
+                "pie opened at {point:?} bled onto bottom strip at ({dx}, {dy})"
+            );
+        }
+    }
+
+    // The upper portion of the head still draws inside the 800×500 house view.
+    let mut drawn_above = 0usize;
+    for sy in 0..head.height {
+        let dy = origin[1] + sy as i32;
+        assert!(
+            (0..500).contains(&dy),
+            "head pixel outside viewport: y={dy}"
+        );
+        for sx in 0..head.width {
+            let dx = origin[0] + sx as i32;
+            let p = (sy * head.width + sx) as usize * 4;
+            if head.rgba[p + 3] != 255 || in_label(dx, dy) {
+                continue;
+            }
+            let idx = dy as usize * 800 + dx as usize;
+            let expected_head = [head.rgba[p], head.rgba[p + 1], head.rgba[p + 2]];
+            if frame[idx] == expected_head {
+                drawn_above += 1;
+            }
+        }
+    }
+    assert!(
+        drawn_above > 100,
+        "expected >100 head pixels drawn inside house viewport above y=500, got {drawn_above}"
+    );
+}
+
+/// Opening a pie menu seeds the pointer from the press (or the on-screen clamp
+/// warp when the menu shifts to stay on screen), matching native `0x5ebd05` /
+/// `0x5ebd29`, so the opening frame does not aim the head at a stale hover.
+#[test]
+fn pie_opening_frame_aims_head_at_press_not_stale_hover() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    assert_eq!(game.run(100), 100);
+    game.resize([800, 600]);
+    game.render();
+
+    // Hover above the porch bench (where its "Sit" label will appear), then
+    // press the bench center directly without sending another hover event.
+    let bench = recorded([432, 230]);
+    assert_eq!(game.under(bench), Some(173));
+    game.hover([bench[0], bench[1] - 75]);
+    game.press(bench);
+    game.render();
+    let opening_head = game
+        .menu()
+        .expect("bench pie opened")
+        .head
+        .as_ref()
+        .expect("opening head rendered")
+        .clone();
+    let opening_origin = game.menu().unwrap().head_origin;
+
+    // Hovering at the press coordinate must produce the exact same idle pose.
+    game.hover(bench);
+    game.render();
+    let settled_head = game
+        .menu()
+        .expect("bench pie still open")
+        .head
+        .as_ref()
+        .expect("settled head rendered")
+        .clone();
+    assert_eq!(opening_origin, game.menu().unwrap().head_origin);
+    assert_eq!(
+        opening_head.rgba, settled_head.rgba,
+        "opening frame aimed at stale hover instead of press coordinate"
+    );
+
+    // When a pie menu moves on screen to stay inside the window, the opening
+    // frame before `take_pointer()` must aim at the warped menu center rather
+    // than the pre-warp press point.
+    game.close_menu();
+    let edge_y = 25;
+    game.view.camera.origin[1] += edge_y - bench[1];
+    game.render();
+    let edge_bench = [bench[0], edge_y];
+    assert_eq!(game.under(edge_bench), Some(173));
+    game.hover([edge_bench[0], edge_bench[1] + 90]);
+    game.press(edge_bench);
+    let warped = game
+        .menu()
+        .expect("edge pie opened")
+        .pending_pointer()
+        .expect("edge pie moved on screen and scheduled cursor warp");
+    assert_ne!(warped, edge_bench);
+    // Render BEFORE calling take_pointer().
+    game.render();
+    let warped_opening = game
+        .menu()
+        .unwrap()
+        .head
+        .as_ref()
+        .expect("warped opening head")
+        .clone();
+    // Hovering onto "Sit" and releasing (settling the edge-clamped menu)
+    // WITHOUT consuming the pending opening warp must keep the head aimed at
+    // "Sit" rather than snapping back to `warped` (`0x5eb53c`).
+    let sit = pie_entry(&game, "Sit");
+    game.hover(sit);
+    game.render();
+    let sit_hover_head = game
+        .menu()
+        .unwrap()
+        .head
+        .as_ref()
+        .expect("Sit hover head")
+        .clone();
+    assert_ne!(sit_hover_head.rgba, warped_opening.rgba);
+    game.release(sit);
+    game.render();
+    let sit_settled_head = game
+        .menu()
+        .expect("edge pie settled and stays open")
+        .head
+        .as_ref()
+        .expect("Sit settled head")
+        .clone();
+    assert_eq!(
+        sit_settled_head.rgba, sit_hover_head.rgba,
+        "settling an edge-clamped menu snapped the head back to a stale opening warp"
+    );
+
+    assert_eq!(game.take_pointer(), Some(warped));
+    game.hover(warped);
+    game.render();
+    let warped_after = game
+        .menu()
+        .unwrap()
+        .head
+        .as_ref()
+        .expect("warped settled head")
+        .clone();
+    assert_eq!(
+        warped_opening.rgba, warped_after.rgba,
+        "edge-clamped pie aimed at pre-warp cursor instead of warped center"
+    );
+}
+
+/// Composed submenu rendering matches Complete Collection (`social-queued.png`):
+/// opening Bella's `Talk...` submenu keeps Mortimer's 3D head frozen at the
+/// parent menu's center looking down toward `Talk...`, draws the submenu's top
+/// label (`About Interests`) over the upper head while leaving the lower face
+/// visible below the label, and centers the dark circular backdrop on the
+/// submenu.
+#[test]
+fn pie_submenu_keeps_parent_head_frozen_and_draws_submenu_labels_above_it() {
+    let Some(install) = install() else {
+        return;
+    };
+    let frames = Frames::parse("0,1,2,3,33,63,93,123,153,190+30").expect("a schedule");
+    let schedule = frames.clone();
+    let mut game = Game::open(&Options {
+        frames,
+        ..options(install)
+    })
+    .expect("the Goth house opens");
+    game.resize([800, 600]);
+    let bella = 18u16;
+
+    run_to(&mut game, &schedule, 93);
+    let on_bella = match game.under(recorded([400, 274])) {
+        Some(id) if id == bella => recorded([400, 274]),
+        _ => [499, 317],
+    };
+    game.hover(on_bella);
+    run_to(&mut game, &schedule, 123);
+    let bare_lot = game.render().color.clone();
+
+    game.press(on_bella);
+    game.release(on_bella);
+    game.render();
+    let talk = pie_entry(&game, "Talk...");
+    game.hover(talk);
+    game.render();
+
+    let (parent_center, parent_origin, parent_head) = {
+        let menu = game.menu().expect("parent menu open");
+        (
+            menu.active_center().expect("parent center"),
+            menu.head_origin,
+            menu.head.as_ref().expect("parent head").clone(),
+        )
+    };
+
+    // Open the Talk... submenu.
+    game.press(talk);
+    game.release(talk);
+    let sub_frame = game.render().color.clone();
+    let menu = game.menu().expect("submenu open");
+    let sub_center = menu.active_center().expect("submenu center");
+    let sub_origin = menu.head_origin;
+    let sub_head = menu.head.as_ref().expect("submenu head");
+
+    // 1. Head stays frozen at the parent menu's origin and pose.
+    assert_eq!(sub_origin, parent_origin);
+    assert_eq!(sub_head.rgba, parent_head.rgba);
+    // 2. Active backdrop center moves down to the submenu.
+    assert_ne!(sub_center, parent_center);
+    assert!(
+        sub_center[1] > parent_center[1],
+        "Talk... submenu center {sub_center:?} should be below parent {parent_center:?}"
+    );
+
+    // 3. The submenu's top label ("About Interests") overlaps the upper head
+    //    and draws on top of it, while the lower face remains visible outside
+    //    label rects.
+    let label_rects: Vec<Rect> = menu.labels().into_iter().map(|(_, r)| r).collect();
+    let about = menu
+        .labels()
+        .into_iter()
+        .find(|(text, _)| *text == "About Interests")
+        .expect("About Interests label")
+        .1;
+    let in_any_label = |x: i32, y: i32| label_rects.iter().any(|r| r.contains(x, y));
+
+    let mut head_under_about = 0usize;
+    let mut head_occluded_by_about = 0usize;
+    let mut head_visible_outside_labels = 0usize;
+    for sy in 0..sub_head.height {
+        let dy = sub_origin[1] + sy as i32;
+        if !(0..500).contains(&dy) {
+            continue;
+        }
+        for sx in 0..sub_head.width {
+            let dx = sub_origin[0] + sx as i32;
+            if !(0..800).contains(&dx) {
+                continue;
+            }
+            let p = (sy * sub_head.width + sx) as usize * 4;
+            if sub_head.rgba[p + 3] != 255 {
+                continue;
+            }
+            let head_rgb = [sub_head.rgba[p], sub_head.rgba[p + 1], sub_head.rgba[p + 2]];
+            let actual = sub_frame[dy as usize * 800 + dx as usize];
+            if about.contains(dx, dy) {
+                head_under_about += 1;
+                if actual != head_rgb {
+                    head_occluded_by_about += 1;
+                }
+            } else if !in_any_label(dx, dy) && actual == head_rgb {
+                head_visible_outside_labels += 1;
+            }
+        }
+    }
+    assert!(
+        head_under_about > 50 && head_occluded_by_about * 2 > head_under_about,
+        "expected About Interests to draw over the upper head: under={head_under_about}, occluded={head_occluded_by_about}"
+    );
+    assert!(
+        head_visible_outside_labels > 400,
+        "expected lower frozen head to stay visible outside labels, got {head_visible_outside_labels}"
+    );
+
+    // 4. Verify the radial backdrop moved from `parent_center` to `sub_center`
+    //    (`0x462325` / `0x462342`):
+    //    - Pixels strictly inside the submenu's inner disk (r < 67) AND
+    //      strictly outside the parent's full disk (r >= 100) are shaded.
+    //    - Pixels strictly inside the parent's upper inner disk (r < 67) AND
+    //      strictly outside the submenu's full disk (r >= 100), outside labels
+    //      and the frozen head, remain unshaded (identical to `bare_lot`).
+    let dist2 = |a: [i32; 2], b: [i32; 2]| {
+        let dx = a[0] - b[0];
+        let dy = a[1] - b[1];
+        dx * dx + dy * dy
+    };
+    let in_head = |x: i32, y: i32| {
+        let sx = x - sub_origin[0];
+        let sy = y - sub_origin[1];
+        if sx < 0 || sy < 0 || sx >= sub_head.width as i32 || sy >= sub_head.height as i32 {
+            return false;
+        }
+        sub_head.rgba[(sy as usize * sub_head.width as usize + sx as usize) * 4 + 3] != 0
+    };
+
+    let mut sub_only_checked = 0usize;
+    let mut sub_only_shaded = 0usize;
+    let mut parent_only_checked = 0usize;
+    let mut parent_only_unshaded = 0usize;
+    for dy in 0..500 {
+        for dx in 0..800 {
+            if in_any_label(dx, dy) || in_head(dx, dy) {
+                continue;
+            }
+            let d_sub = dist2([dx, dy], sub_center);
+            let d_parent = dist2([dx, dy], parent_center);
+            let idx = dy as usize * 800 + dx as usize;
+            if d_sub < 67 * 67 && d_parent >= 100 * 100 {
+                sub_only_checked += 1;
+                if sub_frame[idx] != bare_lot[idx] {
+                    sub_only_shaded += 1;
+                }
+            } else if d_parent < 67 * 67 && d_sub >= 100 * 100 {
+                parent_only_checked += 1;
+                if sub_frame[idx] == bare_lot[idx] {
+                    parent_only_unshaded += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        sub_only_checked > 500 && sub_only_shaded * 10 > sub_only_checked * 9,
+        "expected submenu-only inner disk outside parent disk to be shaded: {sub_only_shaded}/{sub_only_checked}"
+    );
+    assert!(
+        parent_only_checked > 500 && parent_only_unshaded == parent_only_checked,
+        "expected parent-only inner disk outside submenu disk to be unshaded: {parent_only_unshaded}/{parent_only_checked}"
+    );
+}
+
+/// The pie head submits into the house's final 3D pass with `D3DCMP_LESSEQUAL`
+/// depth testing (`0x4a9500`, `0x5ce959`–`0x5ce977`, `0x4623f5`–`0x462414`
+/// placing the head origin at `z_screen = 0.5 * ((3000 + 10) << zoom)`). At
+/// Near zoom, Mortimer's neutral head's visible front-facing pixels span depths
+/// ~11,833–12,049, so nearer foreground scene geometry (e.g. grass at depth
+/// 8,703) occludes the head, the midpoint of those visible bounds clips only
+/// the farther half, and deeper/empty geometry lets the entire head draw and
+/// write its depths.
+#[test]
+fn pie_head_respects_house_depth_buffer_lessequal() {
+    let Some(install) = install() else {
+        return;
+    };
+    let mut game = Game::open(&options(install)).expect("the Goth house opens");
+    assert_eq!(game.run(100), 100);
+    game.resize([800, 600]);
+    game.render();
+
+    let bench = recorded([432, 230]);
+    assert_eq!(game.under(bench), Some(173));
+    game.press(bench);
+    game.view.camera.zoom = sims_render::Zoom::Near;
+    game.render();
+
+    let menu = game.menu().expect("bench pie open");
+    let head = menu.head.as_ref().expect("Near-zoom head rendered");
+    let origin = menu.head_origin;
+    let head_depth = &menu.head_depth;
+    let opaque_depths: Vec<i32> = head
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(head_depth.iter().copied())
+        .filter(|(p, _)| p[3] == 255)
+        .map(|(_, d)| d)
+        .collect();
+    assert_eq!(opaque_depths.len(), 1_940);
+    let min_d = *opaque_depths.iter().min().unwrap();
+    let max_d = *opaque_depths.iter().max().unwrap();
+    assert!(
+        (11_800..=11_860).contains(&min_d) && (12_020..=12_080).contains(&max_d),
+        "expected Near-zoom Mortimer visible head depth ~11,833..12,049, got {min_d}..{max_d}"
+    );
+
+    // 1. Foreground scene nearer than every head vertex rejects all 1,940 pixels.
+    let fg_depth = sims_render::depth::Depth::new(&game.view.camera).grass([62, 62], 200);
+    assert!(fg_depth < min_d, "fg_depth={fg_depth} min_d={min_d}");
+    let mut fg_canvas = Canvas::new(800, 500, [1, 2, 3]);
+    fg_canvas.depth.fill(fg_depth);
+    sims_game::people::composite_pie_head(&mut fg_canvas, origin, head, head_depth, (800, 500));
+    let fg_written = fg_canvas.color.iter().filter(|p| **p != [1, 2, 3]).count();
+    assert_eq!(fg_written, 0, "nearer foreground must occlude the pie head");
+
+    // 2. Mid-head depth draws only the nearer half of visible pixels (z <= mid_d).
+    let mid_d = (min_d + max_d) / 2;
+    let mut mid_canvas = Canvas::new(800, 500, [1, 2, 3]);
+    mid_canvas.depth.fill(mid_d);
+    sims_game::people::composite_pie_head(&mut mid_canvas, origin, head, head_depth, (800, 500));
+    let mid_written = mid_canvas.color.iter().filter(|p| **p != [1, 2, 3]).count();
+    let expected_mid = opaque_depths.iter().filter(|&&d| d <= mid_d).count();
+    assert!(expected_mid > 500 && expected_mid < 1_940);
+    assert_eq!(mid_written, expected_mid);
+
+    // 3. Empty/far scene depth draws all 1,940 pixels and updates canvas.depth.
+    let mut far_canvas = Canvas::new(800, 500, [1, 2, 3]);
+    sims_game::people::composite_pie_head(&mut far_canvas, origin, head, head_depth, (800, 500));
+    let far_written = far_canvas.color.iter().filter(|p| **p != [1, 2, 3]).count();
+    assert_eq!(far_written, 1_940);
+    let updated_depths = far_canvas
+        .depth
+        .iter()
+        .filter(|&&d| d != sims_render::depth::EMPTY)
+        .count();
+    assert_eq!(updated_depths, 1_940);
 }

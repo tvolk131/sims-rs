@@ -670,6 +670,40 @@ pub fn columns(
 }
 
 impl Column {
+    /// Clips this column vertically to `[top, bottom)`, as `0x49dacd` does
+    /// before calling `0x49da21` (`0x49dcd3`–`0x49dd1f` on the left half,
+    /// `0x49dee0`–`0x49df2e` on the right). Blades (`0x49d79d`) still use
+    /// the unclipped column; the column fill advances `shade` and `color`
+    /// across any rows cut off the top and takes `0x49da21`'s initial dither
+    /// parity from the clipped `(y + height) & 1` (`0x49da59`).
+    pub fn clipped(&self, top: i32, bottom: i32) -> Self {
+        let mut y = self.y;
+        let mut height = self.height;
+        let mut shade = self.shade;
+        let mut color = self.color;
+        if y < top {
+            let skip = i64::from(top) - i64::from(y);
+            height =
+                (i64::from(height) - skip).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+            shade[0] = (i64::from(shade[0]) + i64::from(shade[1]) * skip)
+                .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+            color[0] = (i64::from(color[0]) + i64::from(color[1]) * skip)
+                .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+            y = top;
+        }
+        if i64::from(y) + i64::from(height) > i64::from(bottom) {
+            height = (i64::from(bottom) - i64::from(y))
+                .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        }
+        Self {
+            x: self.x,
+            y,
+            height,
+            shade,
+            color,
+        }
+    }
+
     /// The column's pixels, top to bottom: each row's screen y and its
     /// four 5-6-5 pixels.
     pub fn rows(&self) -> impl Iterator<Item = (i32, [u16; 4])> + '_ {
@@ -944,6 +978,61 @@ mod tests {
         for (index, column) in [wild].iter().cycle().take(16).enumerate() {
             let _ = grass.blades([10, 10], column, index);
         }
+    }
+
+    #[test]
+    fn column_clipping_advances_gradients_and_updates_dither_parity() {
+        // A column starting at an odd negative y (-3) with height 10 has
+        // unclipped rows 0..10 and end = 7 (odd). Clipping to [0, 600)
+        // skips 3 rows: shade and color advance by 3 steps, and the first
+        // drawn row (y = 0) gets parity (0 + 7) & 1 = 1 (matching 0x49da59),
+        // not the unclipped row 3's parity (7 + 3) & 1 = 0.
+        let col = Column {
+            x: 16,
+            y: -3,
+            height: 10,
+            shade: [20 * 256, 256],
+            color: [10 * 256, 256],
+        };
+        let top_clipped = col.clipped(0, 600);
+        assert_eq!(top_clipped.y, 0);
+        assert_eq!(top_clipped.height, 7);
+        assert_eq!(top_clipped.shade, [23 * 256, 256]);
+        assert_eq!(top_clipped.color, [13 * 256, 256]);
+        let unclipped_at_0 = col.rows().find(|&(y, _)| y == 0).unwrap().1;
+        let clipped_at_0 = top_clipped.rows().next().unwrap().1;
+        // Same shade/color block, opposite dither row because skip (3) is odd.
+        let block = palette()[13][23];
+        assert_eq!(unclipped_at_0, block[0..4]);
+        assert_eq!(clipped_at_0, block[4..8]);
+
+        // Even top clip (-4) keeps the same dither row as the unclipped column.
+        let even = Column { y: -4, ..col };
+        let even_clipped = even.clipped(0, 600);
+        assert_eq!(
+            even_clipped.rows().next().unwrap().1,
+            even.rows().find(|&(y, _)| y == 0).unwrap().1
+        );
+
+        // Clipping at an even bottom (600) changes an odd unclipped end
+        // (595 + 10 = 605) to even (600), flipping parity at every row.
+        let bottom = Column {
+            x: 16,
+            y: 595,
+            height: 10,
+            shade: [20 * 256, 0],
+            color: [10 * 256, 0],
+        };
+        let bottom_clipped = bottom.clipped(0, 600);
+        assert_eq!(bottom_clipped.y, 595);
+        assert_eq!(bottom_clipped.height, 5);
+        let b = palette()[10][20];
+        assert_eq!(bottom.rows().next().unwrap().1, b[4..8]);
+        assert_eq!(bottom_clipped.rows().next().unwrap().1, b[0..4]);
+
+        // Wholly off-screen columns draw no rows.
+        assert_eq!(col.clipped(20, 600).rows().count(), 0);
+        assert_eq!(bottom.clipped(0, 590).rows().count(), 0);
     }
 
     #[test]
