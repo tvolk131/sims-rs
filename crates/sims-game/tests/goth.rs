@@ -245,9 +245,11 @@ fn the_player_answers_the_help_dialog_from_the_window() {
     // The answered tick ran at once, and the 49.999 ms owed when the
     // dialog came were dropped.
     assert_eq!(game.lot().ticks(), 2);
+    assert_eq!(game.lot().world().globals[12], 17);
     assert_eq!(game.advance(1), 0);
     // From there time is owed as before: with that 1 µs, a tick.
     assert_eq!(game.advance(49_999), 1);
+    assert_eq!(game.lot().world().globals[12], 0);
     assert_eq!(game.run(197), 197);
     assert_eq!(game.stopped(), None);
     let mut listed = Game::open(&options(install)).expect("the Goth house opens");

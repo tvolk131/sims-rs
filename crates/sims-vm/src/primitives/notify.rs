@@ -2,7 +2,7 @@
 //!
 //! Ported from the old prototype's `notify_idle`
 //! (legacy/crates/sims-vm/src/idle.rs), recovered from the original's
-//! 0x4521ba.
+//! 0x4521a0 (which masks the frame's flag via 0x47536b) and 0x4521bb.
 //!
 //! The stack object must exist (native error 0x15). The primitive looks at
 //! the instruction that object's thread is waiting on. If it is a Sleep
@@ -36,8 +36,9 @@ impl Machine<'_, '_> {
             return Ok(true);
         };
         let frame = &object.stack[index];
-        let Tree::Behavior(_, behavior) = self.program.tree(self.owner(frame)?, frame.tree) else {
-            return Err(Trap::MissingTree { id: frame.tree });
+        let tree = frame.tree_id();
+        let Tree::Behavior(_, behavior) = self.program.tree(self.owner(frame)?, tree) else {
+            return Err(Trap::MissingTree { id: tree });
         };
         let opcode = behavior
             .instructions

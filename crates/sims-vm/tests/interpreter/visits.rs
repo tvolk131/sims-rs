@@ -1189,6 +1189,9 @@ fn notify_ends_the_stack_objects_sleep() {
     let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
     let id = interpreter.create(&mut fx.world, WIDGET).unwrap();
     assert_eq!(fx.world.objects[&id].countdown(), Some(19));
+    let object = fx.world.objects.get_mut(&id).unwrap();
+    object.stack[1].tree |= 0x8000;
+    let flagged = object.stack[1].tree;
     fx.add(
         LAMP_FILE,
         4096,
@@ -1198,6 +1201,7 @@ fn notify_ends_the_stack_objects_sleep() {
     let widget = &fx.world.objects[&id];
     assert_eq!(widget.countdown(), Some(0));
     assert_eq!(widget.stack[1].parameters, [0]);
+    assert_eq!(widget.stack[1].tree, flagged);
     // Its next turn finishes the Sleep and starts the next one.
     let interpreter = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
     assert_eq!(
