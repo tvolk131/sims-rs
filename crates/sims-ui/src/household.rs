@@ -4,7 +4,7 @@
 use crate::art::Art;
 use crate::house::{self, House};
 use crate::{Error, Result};
-use sims_content::{Catalog, Expansions, Index};
+use sims_content::{Catalog, Expansions, Index, Install};
 use sims_formats::bitmap::{self, Image};
 use sims_formats::career::{Career, Level};
 use sims_formats::iff::Iff;
@@ -49,6 +49,21 @@ impl PetKind {
     }
 }
 
+/// Which subpanel the live-mode Job tab (`Panel::Job`, panel 3) shows for a
+/// selected household Sim (`0x51d598..0x51d624`, `0x51cbf8..0x51ccf4`,
+/// `0x51d09a..0x51d149`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobPanel {
+    /// Child Report Card (`[esi + 0x124]`, `age != 0 && age < 18`).
+    ReportCard,
+    /// Dog (`[esi + 0x114]`) or Cat (`[esi + 0x118]`) Pet Skills.
+    PetSkills(PetKind),
+    /// Superstar / Fame (`[esi + 0x11c]`, `0x4cfe2c`).
+    Fame,
+    /// Adult Job (`[esi + 0x110]`).
+    Adult,
+}
+
 /// A household member on the lot, in the family's portrait order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Resident {
@@ -71,6 +86,10 @@ pub struct Resident {
     /// The career (a `CARR` resource's ID; 0 for none) and the level in
     /// it, person data 56 and 57.
     pub job: [i16; 2],
+    /// Whether `person.data[56]` resolves to a career in `work.iff`
+    /// (`0x4ea701`), used by `0x4cfe2c` so Sims with a regular career stay
+    /// on the Adult Job panel even if they have a nonzero fame score.
+    pub has_career: bool,
     /// What the next level of the career needs of each skill, where the
     /// person has less: 0 elsewhere, and everywhere until
     /// [`Snapshot::with_careers`] fills it in.
@@ -96,9 +115,49 @@ pub struct Resident {
     /// The job panel's performance: person data 63, or a child's data 57
     /// (0x4ea88c).
     pub performance: i16,
+    /// Child Report Card grade text (`0x532dc0..0x532e0e`, `0x4034ce` reading
+    /// `work.iff STR# 4097` index `performance + 1`, or `"No cJob Object!"`
+    /// when `work.iff` lacks school career `-1`). Filled in by
+    /// [`Snapshot::with_careers`].
+    pub school_grade: String,
+    /// Whether the Superstar Fame panel applies: person data 80 (`+0xa0`,
+    /// fame score, `0x4cfe5c`) and person data 81 (`+0xa2`, fame level
+    /// `0..=10` half-stars, `0x4051ec`).
+    pub fame_score: i16,
+    pub fame_level: i16,
+    /// Superstar fame title (`fame.iff STR# 1[1 + fame_level]`, `0x52d3e6`),
+    /// skill point targets (`0..=10`, `0x405190`), and formatted friend star
+    /// power text (`0x52d1af`), filled in by [`Snapshot::with_fame`].
+    pub fame_title: String,
+    pub fame_needs: [i32; 6],
+    pub fame_friends_text: String,
     /// What the job panel's left column shows: the default until
     /// [`Snapshot::with_careers`] fills it in.
     pub work: Work,
+}
+
+impl Resident {
+    /// Whether `0x4cfe2c` routes this resident to the Superstar / Fame
+    /// subpanel (`[esi + 0x11c]`): Superstar pack installed (`0x40`),
+    /// `person.data[80] > 0` (`fame_score > 0`), and no active regular
+    /// career (`0x4ea701 == 0`).
+    pub fn is_superstar(&self, superstar_pack: bool) -> bool {
+        superstar_pack && self.fame_score > 0 && !self.has_career
+    }
+
+    /// Which Job-tab subpanel (`Panel::Job`) shows for this resident in the
+    /// exact priority order of `0x51d598..0x51d624`.
+    pub fn job_panel(&self, superstar_pack: bool) -> JobPanel {
+        if self.school_age {
+            JobPanel::ReportCard
+        } else if let Some(kind) = self.pet_kind {
+            JobPanel::PetSkills(kind)
+        } else if self.is_superstar(superstar_pack) {
+            JobPanel::Fame
+        } else {
+            JobPanel::Adult
+        }
+    }
 }
 
 /// What the job panel's left column shows of a person (0x530501).
@@ -211,8 +270,15 @@ const JOB: [usize; 2] = [56, 57];
 /// the low bit of the kind for a woman (0x4ea908, 0x4ea88c, 0x4eaa75).
 const AGE: usize = 58;
 const PERFORMANCE: usize = 63;
+/// Person data word 80 (`+0xa0`): Superstar fame score (`0x4cfe5c`).
+const FAME_SCORE: usize = 80;
 /// The age a person is a child under.
 const GROWN: i16 = 18;
+
+/// Fallback text when `0x4ea722` finds no school career object (`0x532dce`, `0x6ccde8`).
+pub const NO_JOB_OBJECT: &str = "No cJob Object!";
+/// `work.iff` string table holding school grades (`0x403f43 -> 0x6de7d8`).
+const GRADE_STRINGS: u16 = 4097;
 
 /// The career a child is in, and the level (0x4ea722): school, `CARR`
 /// 0xffff.
@@ -400,6 +466,7 @@ impl Snapshot {
                     zodiac: zodiac(data),
                     skills: SKILLS.map(data),
                     job: JOB.map(data),
+                    has_career: false,
                     needs: [0; 6],
                     child,
                     school_age,
@@ -407,6 +474,12 @@ impl Snapshot {
                     pet: kind > 1,
                     pet_kind: PetKind::from_kind(kind),
                     performance: data(if child { JOB[1] } else { PERFORMANCE }),
+                    school_grade: String::new(),
+                    fame_score: data(FAME_SCORE),
+                    fame_level: data(FAME),
+                    fame_title: String::new(),
+                    fame_needs: [0; 6],
+                    fame_friends_text: String::new(),
                     work: Work::default(),
                 });
             }
@@ -492,9 +565,16 @@ impl Snapshot {
             } else {
                 (career, i32::from(level))
             };
+            resident.has_career = career != 0 && careers.has(career);
+            let shown_level = careers.level(shown, at);
+            resident.school_grade = if shown_level.is_some() {
+                careers.grade(resident.performance).to_owned()
+            } else {
+                NO_JOB_OBJECT.to_owned()
+            };
             resident.work = Work {
                 icon: if careers.has(career) { career } else { 0 },
-                level: careers.level(shown, at).map(|l| WorkLevel {
+                level: shown_level.map(|l| WorkLevel {
                     title: careers
                         .title(shown, at, resident.female)
                         .unwrap_or_default()
@@ -553,6 +633,23 @@ impl Snapshot {
         self
     }
 
+    /// Populates [`Snapshot::superstar`] and each resident's Superstar / Fame
+    /// subpanel fields (`fame_title`, `fame_needs`, `fame_friends_text`) from
+    /// `world`, `known`, and `fame` (`0x4cfe2c`, `0x405190`, `0x40520b`,
+    /// `0x427237`, `0x52d1af`, `0x52d3e6`).
+    #[must_use]
+    pub fn with_fame(mut self, world: &World, known: &Acquaintances, fame: &Fame) -> Self {
+        self.superstar = known.superstar;
+        for resident in &mut self.residents {
+            resident.fame_title = fame.level_title(resident.fame_level).to_owned();
+            resident.fame_needs = fame.skill_needs(resident.fame_level, &resident.skills);
+            let raw_half_stars = friend_star_power(world, resident.guid, known);
+            resident.fame_friends_text =
+                fame.format_friend_star_power(resident.fame_level, raw_half_stars);
+        }
+        self
+    }
+
     /// The selected Sim, if one of the household's: what the live panel
     /// counts as someone selected (the original's +0xe8, the selected
     /// Sim's place among the members, matched by neighbor/GUID at
@@ -605,12 +702,14 @@ pub fn money(amount: i32) -> String {
 
 /// The careers of `work.iff`, by the ID of their `CARR` resource, as
 /// the original looks a person's career up (0x404cb3), with the levels'
-/// titles.
+/// titles and the Child Report Card grade strings (`STR# 4097`, `0x403f43`).
 #[derive(Debug, Clone, Default)]
 pub struct Careers {
     careers: BTreeMap<i16, Vec<Level>>,
     /// Each career's levels' titles, a man's and a woman's.
     titles: BTreeMap<i16, Vec<[String; 2]>>,
+    /// School grade strings (`work.iff STR# 4097`, `"A+"` .. `"F (off to military school)"`).
+    grades: Vec<String>,
 }
 
 /// The career, in `work.iff`'s order, whose titles the original never
@@ -618,10 +717,11 @@ pub struct Careers {
 const UNTITLED: usize = 10;
 
 impl Careers {
-    /// Reads every `CARR` of the install's `work.iff`, and the levels'
-    /// titles from the `STR#` of the career's ID (0x403f26): for level
-    /// `k`, string `3 + 2k`, and a woman's, `23 + k`, in US English. An
-    /// install without the file has no careers.
+    /// Reads every `CARR` of the install's `work.iff`, the levels' titles
+    /// from the `STR#` of the career's ID (0x403f26: for level `k`, string
+    /// `3 + 2k`, and a woman's, `23 + k`, in US English), and the school
+    /// grade strings from `STR# 4097` (0x403f43). An install without the
+    /// file has no careers.
     ///
     /// The original reads the titles of only the first 11, 16 or 21
     /// careers, by the game's expansion level (0x403f53); here every
@@ -632,6 +732,16 @@ impl Careers {
             return Ok(out);
         };
         let iff = Iff::parse(file.read().map_err(Error::Content)?).map_err(Error::Format)?;
+        if let Some(chunk) = iff.get(b"STR#", GRADE_STRINGS) {
+            let table = StringTable::parse(iff.data(chunk)).map_err(Error::Format)?;
+            out.grades = (0..table.entries.len())
+                .map_while(|i| {
+                    table
+                        .get(i, sims_content::ui_graphics::US_ENGLISH)
+                        .map(str::to_owned)
+                })
+                .collect();
+        }
         for (n, chunk) in iff
             .resource_order(b"CARR")
             .map_err(Error::Format)?
@@ -671,6 +781,21 @@ impl Careers {
         self.titles.insert(id, titles);
     }
 
+    /// Sets the school grade strings (`work.iff STR# 4097`), as tests do.
+    pub fn insert_grades(&mut self, grades: Vec<String>) {
+        self.grades = grades;
+    }
+
+    /// The school grade label for `grade` (`person.data[57]`, `0x4034ce`
+    /// reading 1-based `grade + 1` from `work.iff STR# 4097`, returning `""`
+    /// when out of range).
+    pub fn grade(&self, grade: i16) -> &str {
+        usize::try_from(grade)
+            .ok()
+            .and_then(|i| self.grades.get(i))
+            .map_or("", String::as_str)
+    }
+
     /// Whether career `career` exists (0x404cb3).
     pub fn has(&self, career: i16) -> bool {
         self.careers.contains_key(&career)
@@ -698,6 +823,186 @@ impl Careers {
         }
         self.careers.get(&career)?.get(usize::try_from(level).ok()?)
     }
+}
+
+/// Superstar fame progression data read from `GameData/fame.iff`
+/// (`0x404e74`, `0x52bd10`): 11 levels (0 = 0.0 stars .. 10 = 5.0 stars).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Fame {
+    /// Panel title (`STR# 1[0]`, `"Fame"`).
+    pub title: String,
+    /// Level titles (`STR# 1[1..=11]`, `"Nobody"` .. `"Superstar"`).
+    pub level_titles: Vec<String>,
+    /// Format string when more friend star power is needed (`STR# 1[12]`,
+    /// `"%s (Need %d)"`).
+    pub need_friends_format: String,
+    /// Friend star power needed at each level (`STR# 4[0..11]`).
+    pub friend_star_power_needed: Vec<i32>,
+    /// Fame score needed at each level (`STR# 5[0..11]`).
+    pub score_needed: Vec<i32>,
+    /// Skill points (`0..=10`) needed in [`SKILLS`] order at each level
+    /// (`STR# 6[0..11]`).
+    pub skills_needed: Vec<[i32; 6]>,
+}
+
+impl Fame {
+    /// Reads `GameData/fame.iff` from `install`. Returns an empty [`Fame`]
+    /// on installs without the file (pre-Superstar).
+    pub fn load(install: &Install) -> Result<Self> {
+        let Ok(path) = install.file("GameData/fame.iff") else {
+            return Ok(Self::default());
+        };
+        let bytes = std::fs::read(&path).map_err(Error::Io)?;
+        let iff = Iff::parse(bytes).map_err(Error::Format)?;
+        let table = |id: u16| -> Result<Vec<String>> {
+            let Some(chunk) = iff.get(b"STR#", id) else {
+                return Ok(Vec::new());
+            };
+            let st = StringTable::parse(iff.data(chunk)).map_err(Error::Format)?;
+            Ok((0..st.entries.len())
+                .map_while(|i| {
+                    st.get(i, sims_content::ui_graphics::US_ENGLISH)
+                        .map(str::to_owned)
+                })
+                .collect())
+        };
+        let panel = table(1)?;
+        let friend_needed = table(4)?;
+        let score_needed = table(5)?;
+        let skills_needed = table(6)?;
+        Ok(Self::from_tables(
+            &panel,
+            &friend_needed,
+            &score_needed,
+            &skills_needed,
+        ))
+    }
+
+    /// Parses the four `fame.iff` `STR#` tables (`1`, `4`, `5`, `6`), matching
+    /// `0x404e74` and `0x52bd10`.
+    pub fn from_tables(
+        panel: &[String],
+        friend_needed: &[String],
+        score_needed: &[String],
+        skills_needed: &[String],
+    ) -> Self {
+        let parse_i32 = |s: &String| s.trim().parse::<i32>().unwrap_or(0);
+        let parse_skills = |s: &String| -> [i32; 6] {
+            let mut out = [0; 6];
+            for (slot, part) in out.iter_mut().zip(s.split(',')) {
+                *slot = part.trim().parse::<i32>().unwrap_or(0);
+            }
+            out
+        };
+        Self {
+            title: panel.first().cloned().unwrap_or_default(),
+            level_titles: panel.iter().skip(1).take(11).cloned().collect(),
+            need_friends_format: panel.get(12).cloned().unwrap_or_default(),
+            friend_star_power_needed: friend_needed.iter().take(11).map(parse_i32).collect(),
+            score_needed: score_needed.iter().take(11).map(parse_i32).collect(),
+            skills_needed: skills_needed.iter().take(11).map(parse_skills).collect(),
+        }
+    }
+
+    /// The fame rank title for `level` (`0..=10`), matching `0x52d3e6`
+    /// (`0x52c014` initializes the button to level 1 if out of range).
+    pub fn level_title(&self, level: i16) -> &str {
+        let idx = usize::try_from(level).ok().filter(|&i| i < 11);
+        idx.and_then(|i| self.level_titles.get(i))
+            .or_else(|| self.level_titles.get(1))
+            .map_or("", String::as_str)
+    }
+
+    /// Required skill points (`0..=10`) still missing for `level` (`0x405190`):
+    /// returns `req` in points where `skills[n] < req * 100`, else `0`.
+    pub fn skill_needs(&self, level: i16, skills: &[i16; 6]) -> [i32; 6] {
+        let Some(reqs) = usize::try_from(level)
+            .ok()
+            .filter(|&i| i < 11)
+            .and_then(|i| self.skills_needed.get(i))
+        else {
+            return [0; 6];
+        };
+        std::array::from_fn(|n| {
+            let req = reqs[n];
+            if i32::from(skills[n]) < req.saturating_mul(100) {
+                req
+            } else {
+                0
+            }
+        })
+    }
+
+    /// Friend star power needed for `level` (`0x40520b`).
+    pub fn friend_star_power_needed(&self, level: i16) -> i32 {
+        usize::try_from(level)
+            .ok()
+            .filter(|&i| i < 11)
+            .and_then(|i| self.friend_star_power_needed.get(i).copied())
+            .unwrap_or(0)
+    }
+
+    /// Formats the friend star power button label (`0x40529c`, `0x404dde`,
+    /// `0x52d1af`): `"X.0"` / `"X.5"`, or `"%s (Need %d)"` when below the
+    /// current level's required friend star power.
+    pub fn format_friend_star_power(&self, level: i16, raw_half_stars: i32) -> String {
+        let mut f = raw_half_stars as f32;
+        if raw_half_stars > 0 {
+            f *= 0.5f32;
+        }
+        let whole = f as i32;
+        let suffix = if (f - whole as f32) != 0.0f32 {
+            ".5"
+        } else {
+            ".0"
+        };
+        let current = format!("{whole}{suffix}");
+        let needed = self.friend_star_power_needed(level);
+        // 0x404dde: raw_half_stars * 0.5 >= needed (uses single-precision f32).
+        if (raw_half_stars as f32) * 0.5f32 >= needed as f32 {
+            current
+        } else if self.need_friends_format.contains("%s") && self.need_friends_format.contains("%d")
+        {
+            self.need_friends_format
+                .replacen("%s", &current, 1)
+                .replacen("%d", &needed.to_string(), 1)
+        } else {
+            format!("{current} (Need {needed})")
+        }
+    }
+}
+
+/// Sums the fame half-stars (`person.data[81]`, `word [neighbor + 0x116]`) of
+/// all neighborhood characters (`0x423f30`) in a different non-zero family who
+/// are mutual friends with `guid`'s Sim (`0x4ea6c4 -> 0x427237 -> 0x4271c5`).
+pub fn friend_star_power(world: &World, guid: u32, known: &Acquaintances) -> i32 {
+    let neighbors = &world.neighbors;
+    let Some(viewer) = neighbors.first_of(guid) else {
+        return 0;
+    };
+    let viewer_data = person_data(world, viewer.guid).unwrap_or(&viewer.data);
+    let viewer_family = viewer_data
+        .get(sims_sim::neighbors::FAMILY)
+        .copied()
+        .unwrap_or(0);
+    let mut total = 0i32;
+    for record in neighbors.slots.iter().flatten() {
+        if record.id == viewer.id {
+            continue;
+        }
+        if !known.characters.contains(&record.guid) {
+            continue;
+        }
+        let data = person_data(world, record.guid).unwrap_or(&record.data);
+        let family = data.get(sims_sim::neighbors::FAMILY).copied().unwrap_or(0);
+        if family == 0 || family == viewer_family {
+            continue;
+        }
+        if sims_sim::neighbors::mutual_friends(viewer, record, known.friendship) {
+            total = total.saturating_add(i32::from(data.get(FAME).copied().unwrap_or(0)));
+        }
+    }
+    total
 }
 
 /// The lot's family: the first whose ID is global 9, as the lot's
@@ -1215,6 +1520,7 @@ mod tests {
             zodiac: None,
             skills: [0, 0, 300, 1000, 199, 0],
             job,
+            has_career: false,
             needs: [7; 6],
             child: false,
             school_age: false,
@@ -1222,6 +1528,12 @@ mod tests {
             pet: false,
             pet_kind: None,
             performance: 0,
+            school_grade: String::new(),
+            fame_score: 0,
+            fame_level: 0,
+            fame_title: String::new(),
+            fame_needs: [0; 6],
+            fame_friends_text: String::new(),
             work: Work::default(),
         };
         let mut s = snapshot(0, 0, 0);
@@ -1278,6 +1590,7 @@ mod tests {
             zodiac: None,
             skills: [0; 6],
             job,
+            has_career: false,
             needs: [0; 6],
             child,
             school_age: child,
@@ -1285,6 +1598,12 @@ mod tests {
             pet: false,
             pet_kind: None,
             performance: 0,
+            school_grade: String::new(),
+            fame_score: 0,
+            fame_level: 0,
+            fame_title: String::new(),
+            fame_needs: [0; 6],
+            fame_friends_text: String::new(),
             work: Work::default(),
         };
         let mut s = snapshot(0, 0, 0);
@@ -1501,5 +1820,103 @@ mod tests {
         // `world.objects` is NOT surfaced (`0x4e9625..0x4e964c` returns null).
         world.objects.insert(99, make_sim(99, 300, 1, 1, false));
         assert!(first_person_for_guid(&world, 300).is_none());
+    }
+
+    #[test]
+    fn fame_progression_and_friend_star_power_follow_disassembly() {
+        let mut panel: Vec<String> = vec!["Fame".into()];
+        panel.extend((0..11).map(|i| format!("Rank{i}")));
+        panel.push("%s (Need %d)".into());
+        let friend_needed: Vec<String> = ["0", "0", "0", "0", "2", "4", "7", "11", "14", "18", "0"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let score_needed: Vec<String> = [
+            "2", "9", "21", "35", "52", "78", "156", "300", "550", "900", "0",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let skills_needed: Vec<String> = [
+            "0,0,0,0,0,0",
+            "0,0,1,0,0,1",
+            "0,0,2,1,0,2",
+            "0,0,3,2,0,3",
+            "0,0,4,3,0,4",
+            "0,0,6,4,0,4",
+            "0,0,6,5,0,6",
+            "0,0,7,6,0,7",
+            "0,0,8,7,0,8",
+            "0,0,10,8,0,9",
+            "0,0,0,0,0,0",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let fame = Fame::from_tables(&panel, &friend_needed, &score_needed, &skills_needed);
+        assert_eq!(fame.level_title(0), "Rank0");
+        assert_eq!(fame.level_title(10), "Rank10");
+        // Out of range falls back to initial level 1 title (0x52c014 / 0x52d402).
+        assert_eq!(fame.level_title(11), "Rank1");
+        assert_eq!(fame.level_title(-1), "Rank1");
+        // Skill needs (`0x405190`): compares person skill < req * 100.
+        assert_eq!(
+            fame.skill_needs(2, &[0, 0, 200, 99, 0, 150]),
+            [0, 0, 0, 1, 0, 2]
+        );
+        // Friend star power formatting (`0x40529c`, `0x404dde`, `0x52d1af`).
+        assert_eq!(fame.format_friend_star_power(0, 0), "0.0");
+        assert_eq!(fame.format_friend_star_power(4, 3), "1.5 (Need 2)");
+        assert_eq!(fame.format_friend_star_power(4, 4), "2.0");
+        assert_eq!(fame.format_friend_star_power(4, 5), "2.5");
+        assert_eq!(fame.format_friend_star_power(0, -1), "-1.0 (Need 0)");
+
+        // `friend_star_power` (`0x427237`): sums word 81 of mutual-friend
+        // neighborhood characters in a different non-zero family.
+        let mut world = World::empty();
+        let make_neighbor =
+            |id: i16, guid: u32, family: i16, fame_lvl: i16, rows: &[(i32, i32)]| {
+                let mut n = record(id, guid, rows);
+                n.data[sims_sim::neighbors::FAMILY] = family;
+                n.data[FAME] = fame_lvl;
+                n
+            };
+        world.neighbors.slots = vec![
+            Some(make_neighbor(
+                1,
+                0x100,
+                1,
+                2,
+                &[(2, 80), (3, 80), (4, 80), (5, 80), (6, 80)],
+            )),
+            Some(make_neighbor(2, 0x200, 2, 5, &[(1, 60)])),
+            Some(make_neighbor(3, 0x300, 1, 7, &[(1, 60)])), // same family
+            Some(make_neighbor(4, 0x400, 0, 9, &[(1, 60)])), // family 0
+            Some(make_neighbor(5, 0x500, 3, 6, &[(1, 20)])), // one-way (< 50)
+            Some(make_neighbor(6, 0x600, 4, 8, &[(1, 80)])), // non-character
+        ];
+        let known = Acquaintances {
+            friendship: 50,
+            characters: [0x100, 0x200, 0x300, 0x400, 0x500].into_iter().collect(),
+            superstar: true,
+        };
+        // Only `star_friend` (5 half-stars) qualifies.
+        assert_eq!(friend_star_power(&world, 0x100, &known), 5);
+    }
+
+    #[test]
+    fn career_grade_strings_map_index_zero_through_f_and_out_of_range() {
+        let mut careers = Careers::default();
+        careers.insert_grades(vec![
+            "A+".into(),
+            "A".into(),
+            "A-".into(),
+            "B+".into(),
+            "B".into(),
+        ]);
+        assert_eq!(careers.grade(0), "A+");
+        assert_eq!(careers.grade(4), "B");
+        assert_eq!(careers.grade(-1), "");
+        assert_eq!(careers.grade(5), "");
     }
 }

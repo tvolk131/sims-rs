@@ -4107,6 +4107,226 @@ fn pet_subpanels_ultra_speed_blink_and_duplicate_instance_selection() {
     );
 }
 
+/// Install-backed verification of Child Report Card (`[esi + 0x124]`),
+/// Superstar / Fame (`[esi + 0x11c]`), and Needs / Pet Needs / Pet Skills /
+/// Report Card / Fame help balloons on the Complete Collection install.
+#[test]
+fn report_card_superstar_panel_and_help_balloons() {
+    use sims_game::hud::{Hud, INTERFACE, WHOOSH};
+    use sims_game::pace::Pace;
+    use sims_ui::balloon::Help;
+    use sims_ui::command::{Command, Panel};
+    use sims_ui::hud::Kind;
+    use sims_vm::SoundEvent;
+
+    let Some(install) = install() else {
+        return;
+    };
+    let house = goth_house(&install);
+    let mut game = Game::open(&Options {
+        install: install.clone(),
+        house: house.clone(),
+        answers: vec![3],
+        play: false,
+        frames: Frames::default(),
+    })
+    .expect("the Goth house opens");
+    assert_eq!(game.run(2), 2);
+    let opened = open_house(&install, &house).expect("the Goth house opens");
+    let lot = game.lot();
+    let mut hud = Hud::open(
+        &install,
+        &house,
+        &opened.assets,
+        lot.world(),
+        lot.program().autonomy_constants().friendship_threshold,
+    )
+    .expect("HUD opens");
+    let view = View::new([800, 600], [0, 0], opened.rotation);
+    let mut canvas = Canvas::new(800, 600, [0; 3]);
+
+    // 1. Human Needs help balloons: clicking Hunger opens balloon (+ UI_whoosh),
+    //    clicking Social replaces in-place (no extra UI_whoosh, 0x50fbdf), and
+    //    clicking Social again closes it (+ UI_whoosh, 0x50fb7f).
+    hud.controls.panel = Some(Panel::Needs);
+    hud.draw(
+        lot.world(),
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    let _ = hud.take_sounds();
+    let hunger_rect = hud
+        .items()
+        .iter()
+        .find(|i| {
+            i.command
+                == Some(Command::Help(Help::Need {
+                    pet: false,
+                    index: 0,
+                }))
+        })
+        .expect("Hunger hitbox")
+        .rect;
+    let social_rect = hud
+        .items()
+        .iter()
+        .find(|i| {
+            i.command
+                == Some(Command::Help(Help::Need {
+                    pet: false,
+                    index: 5,
+                }))
+        })
+        .expect("Social hitbox")
+        .rect;
+    let center = |r: sims_ui::frame::Rect| [r.x + r.width / 2, r.y + r.height / 2];
+
+    assert_eq!(
+        hud.press(center(hunger_rect), lot.world(), true),
+        Some(Command::Help(Help::Need {
+            pet: false,
+            index: 0
+        }))
+    );
+    assert_eq!(
+        hud.take_sounds(),
+        [SoundEvent::Play {
+            object: INTERFACE,
+            name: WHOOSH.into(),
+        }]
+    );
+    assert_eq!(
+        hud.press(center(social_rect), lot.world(), true),
+        Some(Command::Help(Help::Need {
+            pet: false,
+            index: 5
+        }))
+    );
+    assert!(
+        hud.take_sounds().is_empty(),
+        "switching between open balloons replaces in place without UI_whoosh"
+    );
+    assert_eq!(
+        hud.press(center(social_rect), lot.world(), true),
+        Some(Command::Help(Help::Need {
+            pet: false,
+            index: 5
+        }))
+    );
+    assert_eq!(hud.controls.help, None);
+    assert_eq!(
+        hud.take_sounds(),
+        [SoundEvent::Play {
+            object: INTERFACE,
+            name: WHOOSH.into(),
+        }]
+    );
+
+    // 2. Child Report Card on Cassandra (object 16): opens grade button ->
+    //    Report Card balloon; switching selection to Mortimer closes the
+    //    balloon on redraw and emits UI_whoosh; stale click rejected.
+    let mut cass_world = lot.world().clone();
+    let mortimer = cass_world.selected().expect("Mortimer selected");
+    cass_world.objects.get_mut(&mortimer).unwrap().selected = false;
+    cass_world.objects.get_mut(&16).unwrap().selected = true;
+    hud.controls.panel = Some(Panel::Job);
+    hud.draw(
+        &cass_world,
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    let _ = hud.take_sounds();
+    let rc_btn = hud
+        .items()
+        .iter()
+        .find(|i| matches!(i.kind, Kind::ReportCardButton { .. }))
+        .expect("Report Card grade button")
+        .rect;
+    // Stale press against Mortimer (Adult Job) must be ignored without WHOOSH.
+    assert_eq!(hud.press(center(rc_btn), lot.world(), true), None);
+    assert!(hud.take_sounds().is_empty());
+    // Press against Cassandra opens Report Card balloon + WHOOSH.
+    assert_eq!(
+        hud.press(center(rc_btn), &cass_world, true),
+        Some(Command::Help(Help::ReportCard))
+    );
+    assert_eq!(hud.controls.help, Some(Help::ReportCard));
+    assert_eq!(hud.take_sounds().len(), 1);
+    // Drawing with Mortimer selected closes Report Card balloon + WHOOSH.
+    hud.draw(
+        lot.world(),
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    assert_eq!(hud.controls.help, None);
+    assert_eq!(hud.take_sounds().len(), 1);
+
+    // 3. Superstar / Fame panel on Bella (object 18, unemployed): setting
+    //    person.data[80] > 0 routes Job tab to Fame and opens Fame balloons.
+    let mut fame_world = lot.world().clone();
+    fame_world.objects.get_mut(&mortimer).unwrap().selected = false;
+    let bella = fame_world.objects.get_mut(&18).unwrap();
+    bella.selected = true;
+    let bp = bella.person.as_mut().unwrap();
+    bp.data[80] = 50; // FameScore > 0
+    bp.data[81] = 4; // 2.0 stars ("Studio Fly")
+    hud.controls.panel = Some(Panel::Job);
+    hud.draw(
+        &fame_world,
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    assert!(hud.items().iter().any(|i| matches!(
+        &i.kind,
+        Kind::Fame {
+            fame_level: 4,
+            fame_title,
+            ..
+        } if fame_title == "Studio Fly"
+    )));
+    let fame_lvl_rect = hud
+        .items()
+        .iter()
+        .find(|i| i.command == Some(Command::Help(Help::FameLevel(4))))
+        .expect("Fame level button")
+        .rect;
+    let _ = hud.take_sounds();
+    assert_eq!(
+        hud.press(center(fame_lvl_rect), &fame_world, true),
+        Some(Command::Help(Help::FameLevel(4)))
+    );
+    assert_eq!(hud.take_sounds().len(), 1);
+    hud.draw(
+        &fame_world,
+        true,
+        &opened.assets,
+        &view,
+        &Pace::default(),
+        None,
+        &mut canvas,
+    );
+    assert!(hud.items().iter().any(|i| matches!(
+        &i.kind,
+        Kind::Balloon(b) if b.title.starts_with("Studio Fly")
+    )));
+}
+
 /// Track 2's switch-and-order recording (`goth-switch-cancel-order-20261115`)
 /// opens the live-mode panel, clicks Bella's portrait to select her (taking
 /// effect between updates 423 and 424), clicks her portrait again to centre

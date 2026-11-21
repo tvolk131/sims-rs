@@ -18,7 +18,7 @@ use sims_ui::command::{Command, Panel as UiPanel, Walls as UiWalls};
 use sims_ui::dialog::{self, Labels, Message};
 use sims_ui::frame::{Frame, Rect};
 use sims_ui::house;
-use sims_ui::household::{Acquaintances, Careers, Faces, Snapshot};
+use sims_ui::household::{Acquaintances, Careers, Faces, Fame, Snapshot};
 use sims_ui::hud::{self, Controls, Item, Selected};
 use sims_ui::pie;
 use sims_ui::queue::Queue;
@@ -51,8 +51,10 @@ pub struct Hud {
     /// What could not be read while drawing, until the game takes it.
     problems: Vec<String>,
     /// The careers of `work.iff`, for what the job panel shows the next
-    /// level needs.
+    /// level needs and for Child Report Card grade strings.
     careers: Careers,
+    /// Superstar fame progression data (`GameData/fame.iff`).
+    fame: Fame,
     /// The curves and constants the house panel's ratings are worked out
     /// with.
     house: house::Tuning,
@@ -120,11 +122,14 @@ impl Hud {
             .copied()
             .collect();
         let mut art = Art::load(&ui, US_ENGLISH, &resources).map_err(|e| e.to_string())?;
-        art.load_optional(&ui, US_ENGLISH, sims_ui::balloon::BACKGROUND);
+        for id in hud::OPTIONAL_RESOURCES {
+            art.load_optional(&ui, US_ENGLISH, id);
+        }
         let labels = Labels::load(&install).map_err(|e| e.to_string())?;
         // Without the balloons' strings the HUD still opens; the balloons
         // show what text they have.
         let texts = Texts::load(&install).unwrap_or_default();
+        let fame = Fame::load(&install).unwrap_or_default();
         let neighborhood = house
             .parent()
             .and_then(Path::parent)
@@ -163,6 +168,7 @@ impl Hud {
             thumbnails: Thumbnails::default(),
             problems: Vec::new(),
             careers,
+            fame,
             house,
             kinds: house::Kinds::default(),
             known,
@@ -306,13 +312,14 @@ impl Hud {
             .map_or(&[], |f| f.members.as_slice())
     }
 
-    /// The household with zoning-aware family friends and what the next
-    /// level of each one's career needs.
+    /// The household with zoning-aware family friends, career needs/grades,
+    /// and Superstar fame progression data.
     fn household(&self, world: &World, residential: bool) -> Snapshot {
         Snapshot::read(world, self.members(world))
             .with_idle_speed(self.effective_idle_speed(world))
             .with_zoning(world, residential, self.known.friendship)
             .with_careers(&self.careers)
+            .with_fame(world, &self.known, &self.fame)
     }
 
     /// `snapshot` with what the open panel reads besides.
@@ -378,11 +385,21 @@ impl Hud {
         }
         // The pause button shows global 17, which the game's pause sets.
         let snapshot = self.for_panel(household, world);
+        if let Some(help) = self.controls.help
+            && !hud::help_matches_snapshot(help, &snapshot, self.controls.panel)
+        {
+            self.controls.help = None;
+            self.play(WHOOSH);
+        }
         self.items = hud::layout(view.size, &snapshot, &self.controls);
         hud::fit(&mut self.items, &self.art, &self.texts);
         self.queue = Queue::read(world, snapshot.selected);
         self.pressed.keep(&self.queue);
-        let objects: Vec<u32> = self.queue.objects().collect();
+        let objects: Vec<u32> = self
+            .queue
+            .objects()
+            .chain(hud::balloon_objects(&self.items))
+            .collect();
         for guid in objects {
             // A type whose picture fails is kept as the error left it
             // (`Thumbnails::read`), and not read again.
@@ -402,10 +419,11 @@ impl Hud {
                 return;
             }
         };
-        hud::draw(
+        hud::draw_with_thumbnails(
             &mut frame,
             &self.art,
             &self.faces,
+            Some(&self.thumbnails),
             &self.items,
             &self.controls,
         );
@@ -626,13 +644,12 @@ impl Hud {
                 let selected = Selected::of(&snapshot);
                 hud::check_press(command, selected, residential)
             }
-            // 0x51cd17 -> 0x51ce05, 0x51d1cc..0x51d1ee: selection refresh hides
-            // the zodiac sign control when a pet (or non-human / nobody) is
-            // selected, so a stale Sign hit rect before redraw must not open
-            // the balloon or play `UI_whoosh`.
-            Command::Help(sims_ui::balloon::Help::Sign(_)) => {
-                let snapshot = Snapshot::read(world, self.members(world));
-                if Selected::of(&snapshot) != Selected::Human {
+            // Guard stale subpanel hit rects before redraw so a hidden control
+            // (e.g. zodiac on a pet, Report Card on an adult, or Fame on a
+            // regular career) does not open a balloon or play `UI_whoosh`.
+            Command::Help(help) => {
+                let snapshot = self.household(world, residential);
+                if !hud::help_matches_snapshot(help, &snapshot, self.controls.panel) {
                     return None;
                 }
                 command
