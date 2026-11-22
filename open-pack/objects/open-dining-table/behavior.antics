@@ -1,0 +1,61 @@
+// Open Dining Table (0x7F00_0060) — dining surface with container slot and
+// Room-boosting table setting / tidying state transitions.
+//
+// Attributes (`stack.attr`):
+//   attr[0] = occupancy lock (0 = free, 1 = busy)
+//   attr[1] = table set state (0 = bare, 1 = set)
+
+bcon 4096 "DiningTableTuning" {
+    action_ticks = 1,
+    room_gain = 25,
+}
+
+tree 4096 "Init" {
+    my.attr[0] := 0;
+    my.attr[1] := 0;
+    return true;
+}
+
+tree 4097 "Main" {
+    return true;
+}
+
+tree 4098 "CanSetTable" {
+    if stack.attr[0] != 0 {
+        return false;
+    }
+    if stack.attr[1] != 0 {
+        return false;
+    }
+    return true;
+}
+
+tree 4099 "CanTidyTable" {
+    if stack.attr[0] != 0 {
+        return false;
+    }
+    if stack.attr[1] == 0 {
+        return false;
+    }
+    return true;
+}
+
+interaction 4100 "SetTable" {
+    stack.attr[0] := 1;
+    play_sound(1, stack_obj);
+    idle(bcon.action_ticks);
+    stack.attr[1] := 1;
+    my.motive.room += bcon.room_gain;
+    stack.attr[0] := 0;
+    return true;
+}
+
+interaction 4101 "TidyTable" {
+    stack.attr[0] := 1;
+    play_sound(1, stack_obj);
+    idle(bcon.action_ticks);
+    stack.attr[1] := 0;
+    my.motive.room += bcon.room_gain;
+    stack.attr[0] := 0;
+    return true;
+}

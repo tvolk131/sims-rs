@@ -1,0 +1,93 @@
+// Open Retro Television (0x7F00_0052) — persistent power state (attr[1]) and
+// Fun-restoring watch loop with occupancy lock (attr[0]) and player cancel safety.
+//
+// Attributes (`stack.attr`):
+//   attr[0] = active viewer lock (0 = free, 1 = watching)
+//   attr[1] = power state (0 = off, 1 = on)
+//   attr[2] = total watch cycles completed
+
+bcon 4096 "TvTuning" {
+    watch_ticks = 2,
+    max_cycles = 4,
+    fun_step = 24,
+    max_entry_fun = 95,
+}
+
+tree 4096 "Init" {
+    my.attr[0] := 0;
+    my.attr[1] := 0;
+    my.attr[2] := 0;
+    return true;
+}
+
+tree 4097 "Main" {
+    return true;
+}
+
+tree 4098 "CanTurnOnTv" {
+    if stack.attr[1] != 0 {
+        return false;
+    }
+    return true;
+}
+
+tree 4099 "CanTurnOffTv" {
+    if stack.attr[1] == 0 {
+        return false;
+    }
+    if stack.attr[0] != 0 {
+        return false;
+    }
+    return true;
+}
+
+tree 4100 "CanWatchTv" {
+    if stack.attr[0] != 0 {
+        return false;
+    }
+    if my.motive.fun >= bcon.max_entry_fun {
+        return false;
+    }
+    return true;
+}
+
+interaction 4101 "TurnOnTv" {
+    stack.attr[1] := 1;
+    play_sound(1, stack_obj);
+    return true;
+}
+
+interaction 4102 "TurnOffTv" {
+    stack.attr[1] := 0;
+    play_sound(1, stack_obj);
+    return true;
+}
+
+interaction 4103 "WatchTv" {
+    stack.attr[0] := 1;
+    if stack.attr[1] == 0 {
+        stack.attr[1] := 1;
+        play_sound(1, stack_obj);
+    }
+    play_sound(2, stack_obj);
+
+    let cycles = 0;
+    while cycles < bcon.max_cycles {
+        if my.person.priority == 0 {
+            break;
+        }
+        idle(bcon.watch_ticks);
+        if my.person.priority == 0 {
+            break;
+        }
+        my.motive.fun += bcon.fun_step;
+        cycles += 1;
+        stack.attr[2] += 1;
+        if my.motive.fun >= 100 {
+            break;
+        }
+    }
+
+    stack.attr[0] := 0;
+    return true;
+}

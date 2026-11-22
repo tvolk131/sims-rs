@@ -1,0 +1,57 @@
+[object]
+name = "Open Dining Table"
+description = "A clean-room solid wood dining table with a serving surface and quick refreshment interaction."
+guid = 0x7F00_0060
+price = 260
+attributes = 8
+init = "Init"
+main = "Main"
+scripts = ["behavior.antics"]
+
+[sprite]
+shape = "table"
+primary_rgb = [166, 118, 72]
+accent_rgb = [204, 162, 114]
+trim_rgb = [88, 60, 36]
+
+[[interaction]]
+name = "Set Table"
+action = "SetTable"
+guard = "CanSetTable"
+autonomy = 30
+attenuation = 0.02
+motives = [
+    { motive = "room", min = -100, delta = 30, personality = 0 },
+]
+
+[[interaction]]
+name = "Tidy Table"
+action = "TidyTable"
+guard = "CanTidyTable"
+autonomy = 40
+attenuation = 0.02
+motives = [
+    { motive = "room", min = -100, delta = 35, personality = 0 },
+]
+
+[[slot]]
+kind = 0
+offset = [0.0, 0.0, 0.65]
+standing = 0
+sitting = 0
+ground = 0
+height = 5
+facing = 0
+
+[[slot]]
+kind = 3
+offset = [0.0, -0.75, 0.0]
+standing = 1
+sitting = 1
+ground = 1
+facing = 0
+
+[[sound]]
+id = 1
+name = "open_table_tap"
+preset = "wood_creak"

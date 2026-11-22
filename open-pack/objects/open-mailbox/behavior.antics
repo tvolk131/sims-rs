@@ -1,0 +1,81 @@
+// Open Street Mailbox (0x7F00_0090) — daily household bills with `alter_budget` debit,
+// insufficient-funds safety, and clean lock release on every exit path.
+//
+// Attributes (`stack.attr`):
+//   attr[0] = occupancy lock (0 = free, 1 = busy)
+//   attr[1] = unpaid bills count (starts at 1 for starter lot playability)
+//   attr[2] = total bills paid
+
+bcon 4096 "MailboxTuning" {
+    initial_bills = 1,
+    bill_amount = 75,
+    pay_ticks = 1,
+    paid_room_gain = 20,
+    check_fun_gain = 8,
+}
+
+tree 4096 "Init" {
+    my.attr[0] := 0;
+    my.attr[1] := bcon.initial_bills;
+    my.attr[2] := 0;
+    return true;
+}
+
+tree 4097 "Main" {
+    return true;
+}
+
+tree 4098 "CanPayBills" {
+    if stack.attr[0] != 0 {
+        return false;
+    }
+    if stack.attr[1] <= 0 {
+        return false;
+    }
+    if !alter_budget(bcon.bill_amount, category: 5, test_only: true) {
+        return false;
+    }
+    return true;
+}
+
+tree 4099 "CanCheckMail" {
+    if stack.attr[0] != 0 {
+        return false;
+    }
+    return true;
+}
+
+interaction 4100 "PayBills" {
+    stack.attr[0] := 1;
+    play_sound(1, stack_obj);
+
+    if stack.attr[1] <= 0 {
+        stack.attr[0] := 0;
+        return false;
+    }
+
+    idle(bcon.pay_ticks);
+
+    if !alter_budget(bcon.bill_amount, category: 5) {
+        stack.attr[0] := 0;
+        return false;
+    }
+
+    stack.attr[1] -= 1;
+    stack.attr[2] += 1;
+    my.motive.room += bcon.paid_room_gain;
+    play_sound(2, stack_obj);
+    stack.attr[0] := 0;
+    return true;
+}
+
+interaction 4101 "CheckMail" {
+    stack.attr[0] := 1;
+    play_sound(1, stack_obj);
+    if stack.attr[1] == 0 {
+        stack.attr[1] := 1;
+    }
+    my.motive.fun += bcon.check_fun_gain;
+    stack.attr[0] := 0;
+    return true;
+}

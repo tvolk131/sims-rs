@@ -1,0 +1,114 @@
+// Open Plush Sofa (0x7F00_0051) — Comfort, Energy nap, and Social chat interactions
+// with occupancy guard and native player cancel cleanup.
+//
+// Attributes (`stack.attr`):
+//   attr[0] = occupancy lock (0 = vacant, 1 = occupied)
+//   attr[1] = total completed relax/nap/chat sessions
+
+bcon 4096 "SofaTuning" {
+    tick_delay = 2,
+    relax_cycles = 3,
+    relax_comfort_step = 24,
+    nap_cycles = 3,
+    nap_energy_step = 18,
+    nap_comfort_step = 12,
+    max_nap_energy = 85,
+    chat_cycles = 2,
+    chat_social_step = 22,
+    chat_comfort_step = 14,
+}
+
+tree 4096 "Init" {
+    my.attr[0] := 0;
+    my.attr[1] := 0;
+    return true;
+}
+
+tree 4097 "Main" {
+    return true;
+}
+
+tree 4098 "CanUseSofa" {
+    if stack.attr[0] != 0 {
+        return false;
+    }
+    return true;
+}
+
+tree 4099 "CanNapSofa" {
+    if stack.attr[0] != 0 {
+        return false;
+    }
+    if my.motive.energy >= bcon.max_nap_energy {
+        return false;
+    }
+    return true;
+}
+
+interaction 4100 "RelaxSofa" {
+    stack.attr[0] := 1;
+    play_sound(1, stack_obj);
+    let cycles = 0;
+    while cycles < bcon.relax_cycles {
+        if my.person.priority == 0 {
+            break;
+        }
+        idle(bcon.tick_delay);
+        if my.person.priority == 0 {
+            break;
+        }
+        my.motive.comfort += bcon.relax_comfort_step;
+        cycles += 1;
+        if my.motive.comfort >= 100 {
+            break;
+        }
+    }
+    stack.attr[1] += 1;
+    stack.attr[0] := 0;
+    return true;
+}
+
+interaction 4101 "NapSofa" {
+    stack.attr[0] := 1;
+    play_sound(1, stack_obj);
+    let cycles = 0;
+    while cycles < bcon.nap_cycles {
+        if my.person.priority == 0 {
+            break;
+        }
+        idle(bcon.tick_delay);
+        if my.person.priority == 0 {
+            break;
+        }
+        my.motive.energy += bcon.nap_energy_step;
+        my.motive.comfort += bcon.nap_comfort_step;
+        cycles += 1;
+        if my.motive.energy >= 95 {
+            break;
+        }
+    }
+    stack.attr[1] += 1;
+    stack.attr[0] := 0;
+    return true;
+}
+
+interaction 4102 "ChatSofa" {
+    stack.attr[0] := 1;
+    play_sound(2, stack_obj);
+    let cycles = 0;
+    while cycles < bcon.chat_cycles {
+        if my.person.priority == 0 {
+            break;
+        }
+        idle(bcon.tick_delay);
+        if my.person.priority == 0 {
+            break;
+        }
+        my.motive.social += bcon.chat_social_step;
+        my.motive.comfort += bcon.chat_comfort_step;
+        cycles += 1;
+    }
+    stack.attr[1] += 1;
+    stack.attr[0] := 0;
+    return true;
+}

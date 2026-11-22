@@ -1,0 +1,235 @@
+# Clean-room starter cottage lot & 2-Sim household specification.
+
+[house]
+name = "Open Starter Cottage"
+family_name = "Sunvale Household"
+family_bio = "Two clean-room starter Sims settling into their sunlit cottage built entirely from open-pack sources."
+lot_number = 1
+funds = 20000
+camera_direction = 0
+roof = "open_shingle"
+
+# Living & Dining Room
+[[room]]
+name = "Living Room"
+x0 = 22
+y0 = 24
+x1 = 30
+y1 = 31
+floor_id = 30
+wall_pattern = 31
+wall_style = 1
+enclose_walls = true
+
+# Kitchen
+[[room]]
+name = "Kitchen"
+x0 = 30
+y0 = 24
+x1 = 35
+y1 = 30
+floor_id = 31
+wall_pattern = 34
+wall_style = 1
+enclose_walls = true
+
+# Bedroom
+[[room]]
+name = "Bedroom"
+x0 = 22
+y0 = 18
+x1 = 29
+y1 = 24
+floor_id = 32
+wall_pattern = 31
+wall_style = 1
+enclose_walls = true
+
+# Bathroom
+[[room]]
+name = "Bathroom"
+x0 = 29
+y0 = 18
+x1 = 35
+y1 = 24
+floor_id = 31
+wall_pattern = 33
+wall_style = 1
+enclose_walls = true
+
+# Front Porch (open outdoor paving)
+[[room]]
+name = "Front Porch"
+x0 = 25
+y0 = 31
+x1 = 29
+y1 = 34
+floor_id = 33
+wall_pattern = 32
+wall_style = 1
+enclose_walls = false
+
+# Starter Cottage Furniture Placements (all household essentials)
+[[placement]]
+object = "open-double-bed"
+x = 24
+y = 20
+level = 1
+direction = 0
+
+[[placement]]
+object = "open-cot"
+x = 27
+y = 20
+level = 1
+direction = 0
+
+[[placement]]
+object = "open-shower"
+x = 30
+y = 19
+level = 1
+direction = 0
+
+[[placement]]
+object = "open-toilet"
+x = 32
+y = 19
+level = 1
+direction = 0
+
+[[placement]]
+object = "open-basin"
+x = 33
+y = 21
+level = 1
+direction = 0
+
+[[placement]]
+object = "open-fridge"
+x = 31
+y = 25
+level = 1
+direction = 0
+
+[[placement]]
+object = "open-counter"
+x = 32
+y = 25
+level = 1
+direction = 0
+
+[[placement]]
+object = "open-stove"
+x = 33
+y = 25
+level = 1
+direction = 0
+
+[[placement]]
+object = "open-trash-can"
+x = 34
+y = 26
+level = 1
+direction = 0
+
+[[placement]]
+object = "open-dining-table"
+x = 28
+y = 26
+level = 1
+direction = 0
+
+[[placement]]
+object = "open-dining-chair"
+x = 28
+y = 27
+level = 1
+direction = 0
+
+[[placement]]
+object = "open-sofa"
+x = 24
+y = 27
+level = 1
+direction = 0
+
+[[placement]]
+object = "open-tv"
+x = 24
+y = 29
+level = 1
+direction = 2
+
+[[placement]]
+object = "open-bookshelf"
+x = 23
+y = 25
+level = 1
+direction = 0
+
+[[placement]]
+object = "open-floor-lamp"
+x = 26
+y = 25
+level = 1
+direction = 0
+
+[[placement]]
+object = "open-wall-phone"
+x = 29
+y = 25
+level = 1
+direction = 0
+
+[[placement]]
+object = "open-front-door"
+x = 26
+y = 31
+level = 1
+direction = 0
+
+[[placement]]
+object = "open-bench"
+x = 28
+y = 32
+level = 1
+direction = 0
+
+[[placement]]
+object = "open-mailbox"
+x = 27
+y = 35
+level = 1
+direction = 0
+
+# Starter 2-Sim Clean-Room Household
+[[sim]]
+name = "Alex Sunvale"
+guid = 0x7F00_0101
+neighbor_id = 1
+x = 26
+y = 27
+cooking = 240
+mechanical = 180
+charisma = 200
+neat = 600
+outgoing = 550
+active = 500
+playful = 600
+nice = 700
+
+[[sim]]
+name = "Sam Sunvale"
+guid = 0x7F00_0102
+neighbor_id = 2
+x = 27
+y = 28
+cooking = 140
+mechanical = 320
+charisma = 260
+neat = 500
+outgoing = 650
+active = 600
+playful = 550
+nice = 650
