@@ -1042,3 +1042,149 @@ fn mortimer_stands_without_his_book_as_the_original_draws_him() {
         assert_ne!(canvas.id_at(ox, oy), Some(21), "({ox}, {oy}) is not his");
     }
 }
+
+#[test]
+#[ignore]
+#[allow(clippy::disallowed_methods)]
+fn bench_people_draw() {
+    let Some(root) = install() else {
+        return;
+    };
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut sim_lot = Lot::load(&root, &house, &[3], Frames::default()).expect("load House05");
+    for _ in 0..250 {
+        let _ = sim_lot.step();
+    }
+    let world = sim_lot.world();
+    let mut people = People::open(&root, &house).expect("open People");
+    assert!(people.update(world).is_empty());
+
+    let mut opened = sims_render::open_house(&root, &house).expect("open House05 render");
+    let shape = sims_render::Lot::from_world(world).unwrap();
+    let mut camera = LotCamera {
+        zoom: Zoom::Near,
+        rotation: 0,
+        level: 2,
+        origin: [0, 0],
+        walls: Walls::Cutaway,
+        focus: Default::default(),
+    };
+    camera.center_on([22 * 16, 26 * 16], [512, 384]);
+    let mut base = sims_render::Canvas::new(1024, 768, [0, 0, 0]);
+    sims_render::draw_lot(world, &shape, &mut opened.assets, &camera, &mut base);
+
+    // Warm up clips, bodies, and CPU frequency
+    let mut canvas = base.clone();
+    let drawn = people.draw_on_lot(world, &camera, &mut canvas);
+    assert!(
+        drawn.people >= 3,
+        "expected >=3 placed Sims, got {}",
+        drawn.people
+    );
+    for _ in 0..20 {
+        canvas.color.copy_from_slice(&base.color);
+        canvas.depth.copy_from_slice(&base.depth);
+        let _ = people.update(world);
+        people.draw_on_lot(world, &camera, &mut canvas);
+    }
+
+    // Measure steady-state update + draw (e.g. 60-120 FPS between 24 Hz sim ticks)
+    let iters = 200usize;
+    let mut steady_dur = std::time::Duration::ZERO;
+    for i in 0..iters {
+        canvas.color.copy_from_slice(&base.color);
+        canvas.depth.copy_from_slice(&base.depth);
+        let t0 = std::time::Instant::now();
+        people.set_clock((i as u32) * 16);
+        let _ = people.update(world);
+        people.draw_on_lot(world, &camera, &mut canvas);
+        steady_dur += t0.elapsed();
+    }
+    let ms = steady_dur.as_secs_f64() * 1000.0 / iters as f64;
+    println!(
+        "BENCH_PEOPLE steady (update+draw, {} Sims, 1024x768 Near): {ms:.3} ms/frame ({iters} frames)",
+        drawn.people
+    );
+
+    // Measure draw with changing animator state every frame (forces re-pose + re-skin + raster)
+    let mut world2 = world.clone();
+    let mut dyn_dur = std::time::Duration::ZERO;
+    for i in 0..iters {
+        canvas.color.copy_from_slice(&base.color);
+        canvas.depth.copy_from_slice(&base.depth);
+        for layer in world2.base_layers.values_mut() {
+            let phase = (i as f32 * 0.01) % 1.0;
+            layer.phase = sims_core::F32::from_f32(phase);
+        }
+        let t0 = std::time::Instant::now();
+        people.set_clock((i as u32) * 16);
+        let _ = people.update(&world2);
+        people.draw_on_lot(&world2, &camera, &mut canvas);
+        dyn_dur += t0.elapsed();
+    }
+    let ms = dyn_dur.as_secs_f64() * 1000.0 / iters as f64;
+    println!(
+        "BENCH_PEOPLE dynamic (update+pose+skin+draw, {} Sims, 1024x768 Near): {ms:.3} ms/frame ({iters} frames)",
+        drawn.people
+    );
+}
+
+#[test]
+fn cached_pose_and_skinning_match_fresh_people_bit_for_bit() {
+    let Some(root) = install() else {
+        return;
+    };
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut sim_lot = Lot::load(&root, &house, &[3], Frames::default()).expect("load House05");
+    for _ in 0..250 {
+        let _ = sim_lot.step();
+    }
+    let mut world = sim_lot.world().clone();
+    let mut cached_people = People::open(&root, &house).expect("open cached People");
+    assert!(cached_people.update(&world).is_empty());
+
+    let mut opened = sims_render::open_house(&root, &house).expect("open House05 render");
+    let shape = sims_render::Lot::from_world(&world).unwrap();
+    let mut camera = LotCamera {
+        zoom: Zoom::Near,
+        rotation: 0,
+        level: 2,
+        origin: [0, 0],
+        walls: Walls::Cutaway,
+        focus: Default::default(),
+    };
+    camera.center_on([22 * 16, 26 * 16], [512, 384]);
+    let mut base = sims_render::Canvas::new(1024, 768, [0, 0, 0]);
+    sims_render::draw_lot(&world, &shape, &mut opened.assets, &camera, &mut base);
+
+    // 1. Prime cache, then render a steady-state frame and compare against a fresh People.
+    let mut c1 = base.clone();
+    cached_people.draw_on_lot(&world, &camera, &mut c1);
+    let mut c_steady = base.clone();
+    assert!(cached_people.update(&world).is_empty());
+    cached_people.draw_on_lot(&world, &camera, &mut c_steady);
+    assert_eq!(c1.color, c_steady.color);
+    assert_eq!(c1.depth, c_steady.depth);
+    assert_eq!(c1.ids(), c_steady.ids());
+
+    // 2. Mutate phase, head turn, and position; cached People must invalidate and match fresh People bit-for-bit.
+    for layer in world.base_layers.values_mut() {
+        layer.phase = sims_core::F32::from_f32((layer.phase.to_f32() + 0.37) % 1.0);
+    }
+    for anim in world.animators.values_mut() {
+        anim.head.turn = sims_core::F32::from_f32(0.5);
+        anim.position[0] = sims_core::F32::from_f32(anim.position[0].to_f32() + 2.0);
+    }
+    let mut c_cached_dyn = base.clone();
+    assert!(cached_people.update(&world).is_empty());
+    cached_people.draw_on_lot(&world, &camera, &mut c_cached_dyn);
+
+    let mut fresh_people = People::open(&root, &house).expect("open fresh People");
+    assert!(fresh_people.update(&world).is_empty());
+    let mut c_fresh_dyn = base.clone();
+    fresh_people.draw_on_lot(&world, &camera, &mut c_fresh_dyn);
+
+    assert_eq!(c_cached_dyn.color, c_fresh_dyn.color);
+    assert_eq!(c_cached_dyn.depth, c_fresh_dyn.depth);
+    assert_eq!(c_cached_dyn.ids(), c_fresh_dyn.ids());
+}

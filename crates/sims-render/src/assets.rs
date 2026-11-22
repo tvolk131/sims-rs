@@ -18,17 +18,23 @@
 //! `legacy/crates/sims-render/src/walls.rs` and `floors.rs`.
 
 use crate::camera::Zoom;
-use crate::canvas::Image;
+use crate::canvas::{Image, RowSpans};
 use crate::pools::Pools;
 use crate::shadows::{self, Mask};
 use crate::{Error, Result};
 use sims_content::{ArchivePool, Catalog, Index, Install, SurfacePlugin, Surfaces};
 use sims_formats::execution::Slots;
 use sims_formats::iff::Iff;
-use sims_formats::sprite::{DrawGroup, LegacySpriteSet, Palette, SpriteSet};
+use sims_formats::sprite::{DrawGroup, Frame as SpriteFrame, LegacySpriteSet, Palette, SpriteSet};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Maximum number of raw object `Iff` byte buffers retained simultaneously in
+/// [`Assets::files`]. Active lot objects typically span 30–60 IFFs, so a cap of
+/// 96 avoids evictions during pan/zoom/rotate while bounding resident RAM across
+/// multi-lot play or catalog browsing.
+const MAX_CACHED_FILES: usize = 96;
 
 static NEXT_ASSETS_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -127,9 +133,54 @@ impl BaseAssets {
     }
 }
 
+struct CachedImage {
+    image: Image,
+    spans: RowSpans,
+}
+
+impl CachedImage {
+    fn from_sprite(image: Image) -> Self {
+        let spans = RowSpans::for_sprite(&image);
+        Self { image, spans }
+    }
+
+    fn from_water(image: Image) -> Self {
+        let spans = RowSpans::for_water(&image);
+        Self { image, spans }
+    }
+}
+
+struct CachedQuad {
+    images: [Image; 4],
+    spans: [RowSpans; 4],
+}
+
+impl CachedQuad {
+    fn from_images(images: [Image; 4]) -> Self {
+        let spans = std::array::from_fn(|i| RowSpans::for_sprite(&images[i]));
+        Self { images, spans }
+    }
+}
+
+struct CachedTrimSet {
+    images: Vec<Image>,
+    spans: Vec<RowSpans>,
+}
+
+struct CachedGroup {
+    parts: Vec<Part>,
+    spans: Vec<RowSpans>,
+}
+
 struct PoolCorner {
     image: Image,
+    spans: RowSpans,
     offset: [i32; 2],
+}
+
+struct CachedFile {
+    iff: Iff,
+    last_used: u64,
 }
 
 pub struct Assets {
@@ -141,17 +192,22 @@ pub struct Assets {
     walls: Iff,
     floor_plugins: BTreeMap<u16, SurfacePlugin>,
     wall_plugins: BTreeMap<u16, SurfacePlugin>,
-    files: BTreeMap<usize, Iff>,
+    files: BTreeMap<usize, CachedFile>,
+    file_use_clock: u64,
+    floor_palettes: BTreeMap<u16, Option<Arc<Palette>>>,
+    wall_palettes: BTreeMap<u16, Option<Arc<Palette>>>,
+    file_palettes: BTreeMap<(usize, u16), Option<Arc<Palette>>>,
+    gray_palette: Palette,
     definitions: BTreeMap<u32, Option<Definition>>,
-    floor_images: BTreeMap<(u16, usize), Option<Image>>,
-    pool_images: BTreeMap<(u8, usize), Option<Image>>,
+    floor_images: BTreeMap<(u16, usize), Option<CachedImage>>,
+    pool_images: BTreeMap<(u8, usize), Option<CachedImage>>,
     pool_corners: BTreeMap<(u8, usize), Option<PoolCorner>>,
-    water_images: BTreeMap<(u8, usize), Option<Image>>,
-    patterns: BTreeMap<(u16, usize), Option<[Image; 4]>>,
-    shapes: BTreeMap<(u16, bool, usize), Option<[Image; 4]>>,
-    groups: BTreeMap<(usize, u16, u32, usize), Vec<Part>>,
-    object_shapes: BTreeMap<(usize, u16, bool, usize), Option<[Image; 4]>>,
-    trims: BTreeMap<(bool, usize), Vec<Image>>,
+    water_images: BTreeMap<(u8, usize), Option<CachedImage>>,
+    patterns: BTreeMap<(u16, usize), Option<CachedQuad>>,
+    shapes: BTreeMap<(u16, bool, usize), Option<CachedQuad>>,
+    groups: BTreeMap<(usize, u16, u32, usize), CachedGroup>,
+    object_shapes: BTreeMap<(usize, u16, bool, usize), Option<CachedQuad>>,
+    trims: BTreeMap<(bool, usize), CachedTrimSet>,
     pools: Option<Pools>,
     shadow_masks: BTreeMap<(usize, u8), Option<Mask>>,
 }
@@ -214,6 +270,11 @@ impl Assets {
             catalog,
             pool,
             files: BTreeMap::new(),
+            file_use_clock: 0,
+            floor_palettes: BTreeMap::new(),
+            wall_palettes: BTreeMap::new(),
+            file_palettes: BTreeMap::new(),
+            gray_palette: Palette(vec![[255, 255, 255]; 256]),
             definitions: BTreeMap::new(),
             floor_images: BTreeMap::new(),
             pool_images: BTreeMap::new(),
@@ -291,9 +352,10 @@ impl Assets {
     ) -> Option<(&Image, Option<&Pools>)> {
         let floors = &self.floors;
         let floor_plugins = &self.floor_plugins;
+        let floor_palettes = &mut self.floor_palettes;
         let pool = &self.pool;
         let pools = self.pools.as_ref();
-        let img = self
+        let entry = self
             .floor_images
             .entry((id, zoom))
             .or_insert_with(|| {
@@ -304,16 +366,25 @@ impl Assets {
                     let chunk = iff.get(b"SPR2", sprite)?;
                     let data = iff.data(chunk);
                     let frame = SpriteSet::parse(data).ok()?.decode(data, 0, &iff).ok()?;
-                    return Some(frame.into());
+                    return Some(CachedImage::from_sprite(frame.into()));
                 }
                 let sprite = id.checked_add([0, 256, 512][zoom])?;
                 let chunk = floors.get(b"SPR2", sprite)?;
                 let data = floors.data(chunk);
-                let frame = SpriteSet::parse(data).ok()?.decode(data, 0, floors).ok()?;
-                Some(frame.into())
+                let frame = decode_spr2_with_cache(data, 0, floors, floor_palettes)?;
+                Some(CachedImage::from_sprite(frame.into()))
             })
             .as_ref()?;
-        Some((img, pools))
+        Some((&entry.image, pools))
+    }
+
+    /// Returns whether floor `(id, zoom)` exists, using the cache without
+    /// duplicating work on offscreen culled tiles.
+    pub(crate) fn has_floor(&mut self, id: u16, zoom: usize) -> bool {
+        if let Some(entry) = self.floor_images.get(&(id, zoom)) {
+            return entry.is_some();
+        }
+        self.floor_with_pools(id, zoom).is_some()
     }
 
     /// A swimming pool water/coping sprite (`Arry 9`, `0x4ae68f`–`0x4ae6cc`)
@@ -333,19 +404,20 @@ impl Assets {
             return None;
         }
         let floors = &self.floors;
+        let floor_palettes = &mut self.floor_palettes;
         let pools = self.pools.as_ref();
-        let img = self
+        let entry = self
             .pool_images
             .entry((mask, zoom))
             .or_insert_with(|| {
                 let sprite = 0x400u16 + (zoom as u16) * 16 + u16::from(mask);
                 let chunk = floors.get(b"SPR2", sprite)?;
                 let data = floors.data(chunk);
-                let frame = SpriteSet::parse(data).ok()?.decode(data, 0, floors).ok()?;
-                Some(frame.into())
+                let frame = decode_spr2_with_cache(data, 0, floors, floor_palettes)?;
+                Some(CachedImage::from_sprite(frame.into()))
             })
             .as_ref()?;
-        Some((img, pools))
+        Some((&entry.image, pools))
     }
 
     /// One inner-corner swimming pool coping patch (`Arry 9`, `0x4ae736`–`0x4ae839`,
@@ -367,6 +439,7 @@ impl Assets {
             return None;
         }
         let floors = &self.floors;
+        let floor_palettes = &mut self.floor_palettes;
         let pools = self.pools.as_ref();
         let corner = self
             .pool_corners
@@ -375,10 +448,13 @@ impl Assets {
                 let sprite = 0x430u16 + (zoom as u16) * 4 + u16::from(corner);
                 let chunk = floors.get(b"SPR2", sprite)?;
                 let data = floors.data(chunk);
-                let frame = SpriteSet::parse(data).ok()?.decode(data, 0, floors).ok()?;
+                let frame = decode_spr2_with_cache(data, 0, floors, floor_palettes)?;
                 let offset = [frame.x, frame.y];
+                let image: Image = frame.into();
+                let spans = RowSpans::for_sprite(&image);
                 Some(PoolCorner {
-                    image: frame.into(),
+                    image,
+                    spans,
                     offset,
                 })
             })
@@ -402,6 +478,7 @@ impl Assets {
             return None;
         }
         let floors = &self.floors;
+        let floor_palettes = &mut self.floor_palettes;
         self.water_images
             .entry((mask, zoom))
             .or_insert_with(|| {
@@ -409,10 +486,7 @@ impl Assets {
                 let frame_index = 2 - zoom;
                 let chunk = floors.get(b"SPR2", sprite)?;
                 let data = floors.data(chunk);
-                let frame = SpriteSet::parse(data)
-                    .ok()?
-                    .decode(data, frame_index, floors)
-                    .ok()?;
+                let frame = decode_spr2_with_cache(data, frame_index, floors, floor_palettes)?;
                 let mut image: Image = frame.into();
                 if let Some(alpha) = image.depth.take() {
                     for (px, a) in image.rgba.as_chunks_mut::<4>().0.iter_mut().zip(alpha) {
@@ -421,9 +495,10 @@ impl Assets {
                         }
                     }
                 }
-                Some(image)
+                Some(CachedImage::from_water(image))
             })
             .as_ref()
+            .map(|c| &c.image)
     }
 
     /// The floor shadow mask of a shadow code at a zoom (0 far to 2 near),
@@ -449,6 +524,7 @@ impl Assets {
     pub fn pattern(&mut self, id: u16, zoom: usize) -> Option<&[Image; 4]> {
         let walls = &self.walls;
         let wall_plugins = &self.wall_plugins;
+        let wall_palettes = &mut self.wall_palettes;
         let pool = &self.pool;
         self.patterns
             .entry((id, zoom))
@@ -467,21 +543,38 @@ impl Assets {
                         .find_map(|sprite| iff.get(b"SPR#", sprite))?;
                     let data = iff.data(chunk);
                     let set = LegacySpriteSet::parse(data).ok()?;
-                    return four(|i| set.decode(data, i, &iff).ok().map(Image::from));
+                    let palt_id = set.palette_id()?;
+                    let palt_chunk = iff.get(b"PALT", palt_id)?;
+                    let palette = Palette::parse(iff.data(palt_chunk)).ok()?;
+                    let images = four(|i| {
+                        set.decode_with_palette(data, i, &palette)
+                            .ok()
+                            .map(Image::from)
+                    })?;
+                    return Some(CachedQuad::from_images(images));
                 }
                 let sprite = id.checked_add([1536, 1792, 2048][zoom])?;
                 let chunk = walls.get(b"SPR#", sprite)?;
                 let data = walls.data(chunk);
                 let set = LegacySpriteSet::parse(data).ok()?;
-                four(|i| set.decode(data, i, walls).ok().map(Image::from))
+                let palt_id = set.palette_id()?;
+                let palette = cached_iff_palette(walls, palt_id, wall_palettes)?;
+                let images = four(|i| {
+                    set.decode_with_palette(data, i, &palette)
+                        .ok()
+                        .map(Image::from)
+                })?;
+                Some(CachedQuad::from_images(images))
             })
             .as_ref()
+            .map(|q| &q.images)
     }
 
     /// The four frames of a wall shape at a zoom. Only their alpha means
     /// anything.
     pub fn shape(&mut self, style: u16, cut: bool, zoom: usize) -> Option<&[Image; 4]> {
         let walls = &self.walls;
+        let gray = &self.gray_palette;
         self.shapes
             .entry((style, cut, zoom))
             .or_insert_with(|| {
@@ -491,14 +584,12 @@ impl Assets {
                 let chunk = walls.get(b"SPR#", sprite)?;
                 let data = walls.data(chunk);
                 let set = LegacySpriteSet::parse(data).ok()?;
-                let gray = Palette(vec![[255, 255, 255]; 256]);
-                four(|i| {
-                    set.decode_with_palette(data, i, &gray)
-                        .ok()
-                        .map(Image::from)
-                })
+                let images =
+                    four(|i| set.decode_with_palette(data, i, gray).ok().map(Image::from))?;
+                Some(CachedQuad::from_images(images))
             })
             .as_ref()
+            .map(|q| &q.images)
     }
 
     /// The wall-top trim frames at a zoom, for standing or cut walls. Empty
@@ -513,14 +604,25 @@ impl Assets {
         /// The game's trims are a few thousand pixels at the near zoom.
         const BUDGET: usize = 1 << 20;
         let walls = &self.walls;
-        self.trims.entry((cut, zoom.index())).or_insert_with(|| {
+        let wall_palettes = &mut self.wall_palettes;
+        let entry = self.trims.entry((cut, zoom.index())).or_insert_with(|| {
+            let empty = || CachedTrimSet {
+                images: Vec::new(),
+                spans: Vec::new(),
+            };
             let id = if cut { 5120 } else { 4096 } + zoom.index() as u16;
             let Some(chunk) = walls.get(b"SPR#", id) else {
-                return Vec::new();
+                return empty();
             };
             let data = walls.data(chunk);
             let Ok(set) = LegacySpriteSet::parse(data) else {
-                return Vec::new();
+                return empty();
+            };
+            let Some(palt_id) = set.palette_id() else {
+                return empty();
+            };
+            let Some(palette) = cached_iff_palette(walls, palt_id, wall_palettes) else {
+                return empty();
             };
             // The depth sprite has no palette of its own: decode it with
             // one that maps each byte to itself.
@@ -531,14 +633,15 @@ impl Assets {
                 .map(|chunk| walls.data(chunk))
                 .and_then(|data| Some((data, LegacySpriteSet::parse(data).ok()?)));
             let mut images = Vec::new();
+            let mut spans = Vec::new();
             let mut pixels = 0usize;
             for i in 0..set.frames.len().min(FRAMES) {
-                let Ok(frame) = set.decode(data, i, walls) else {
-                    return Vec::new();
+                let Ok(frame) = set.decode_with_palette(data, i, &palette) else {
+                    return empty();
                 };
                 pixels = pixels.saturating_add(frame.rgba.len() / 4);
                 if pixels > BUDGET {
-                    return Vec::new();
+                    return empty();
                 }
                 let mut image = Image::from(frame);
                 let found = depth
@@ -556,10 +659,12 @@ impl Assets {
                         .collect();
                     image.depth = Some(raw);
                 }
+                spans.push(RowSpans::for_sprite(&image));
                 images.push(image);
             }
-            images
-        })
+            CachedTrimSet { images, spans }
+        });
+        &entry.images
     }
 
     /// The parts of an object's definition the renderer uses.
@@ -605,20 +710,21 @@ impl Assets {
             };
             self.shape(s_style, s_cut, zoom)?;
         }
-        let pat = &self.patterns.get(&(pattern, zoom))?.as_ref()?[frame];
+        let pat = &self.patterns.get(&(pattern, zoom))?.as_ref()?.images[frame];
         let shp = if use_object {
             let (resource, wall_shape) = opening?;
             &self
                 .object_shapes
                 .get(&(resource, wall_shape, false, zoom))?
-                .as_ref()?[frame]
+                .as_ref()?
+                .images[frame]
         } else {
             let (s_style, s_cut) = if use_plain_cut {
                 (1, true)
             } else {
                 (style, cut)
             };
-            &self.shapes.get(&(s_style, s_cut, zoom))?.as_ref()?[frame]
+            &self.shapes.get(&(s_style, s_cut, zoom))?.as_ref()?.images[frame]
         };
         Some((pat, shp, self.pools.as_ref()))
     }
@@ -628,8 +734,8 @@ impl Assets {
     pub(crate) fn edge_on_strip_parts(&mut self, zoom: usize) -> Option<(&Image, &Image)> {
         self.pattern(252, zoom)?;
         self.shape(9, false, zoom)?;
-        let pat = &self.patterns.get(&(252, zoom))?.as_ref()?[3];
-        let shp = &self.shapes.get(&(9, false, zoom))?.as_ref()?[3];
+        let pat = &self.patterns.get(&(252, zoom))?.as_ref()?.images[3];
+        let shp = &self.shapes.get(&(9, false, zoom))?.as_ref()?.images[3];
         Some((pat, shp))
     }
 
@@ -644,20 +750,21 @@ impl Assets {
         if !self.object_shapes.contains_key(&key) {
             let id = wall_shape.checked_add(u16::from(cut) * 3 + zoom as u16);
             let shape = id.and_then(|id| {
-                let iff = self.file(resource)?;
+                self.ensure_file(resource)?;
+                let iff = &self.files.get(&resource)?.iff;
                 let chunk = iff.get(b"SPR#", id)?;
                 let data = iff.data(chunk);
                 let set = LegacySpriteSet::parse(data).ok()?;
-                let gray = Palette(vec![[255, 255, 255]; 256]);
-                four(|i| {
-                    set.decode_with_palette(data, i, &gray)
+                let images = four(|i| {
+                    set.decode_with_palette(data, i, &self.gray_palette)
                         .ok()
                         .map(Image::from)
-                })
+                })?;
+                Some(CachedQuad::from_images(images))
             });
             self.object_shapes.insert(key, shape);
         }
-        self.object_shapes[&key].as_ref()
+        self.object_shapes[&key].as_ref().map(|q| &q.images)
     }
 
     fn load_definition(&mut self, guid: u32) -> Option<Definition> {
@@ -697,17 +804,38 @@ impl Assets {
         })
     }
 
-    fn file(&mut self, resource: usize) -> Option<&Iff> {
-        if !self.files.contains_key(&resource) {
-            let bytes = self
-                .index
-                .resources
-                .get(resource)?
-                .read_with(&self.pool)
-                .ok()?;
-            self.files.insert(resource, Iff::parse(bytes).ok()?);
+    fn ensure_file(&mut self, resource: usize) -> Option<()> {
+        self.file_use_clock = self.file_use_clock.wrapping_add(1);
+        let stamp = self.file_use_clock;
+        if let Some(entry) = self.files.get_mut(&resource) {
+            entry.last_used = stamp;
+            return Some(());
         }
-        self.files.get(&resource)
+        let bytes = self
+            .index
+            .resources
+            .get(resource)?
+            .read_with(&self.pool)
+            .ok()?;
+        let iff = Iff::parse(bytes).ok()?;
+        if self.files.len() >= MAX_CACHED_FILES
+            && let Some((&oldest_key, _)) = self.files.iter().min_by_key(|(_, v)| v.last_used)
+        {
+            self.files.remove(&oldest_key);
+        }
+        self.files.insert(
+            resource,
+            CachedFile {
+                iff,
+                last_used: stamp,
+            },
+        );
+        Some(())
+    }
+
+    fn file(&mut self, resource: usize) -> Option<&Iff> {
+        self.ensure_file(resource)?;
+        self.files.get(&resource).map(|e| &e.iff)
     }
 
     /// Like [`Assets::group`], keyed by `resource` directly so callers don't
@@ -721,13 +849,115 @@ impl Assets {
     ) -> &[Part] {
         let key = (resource, group, direction, zoom);
         if !self.groups.contains_key(&key) {
-            let parts = self
-                .file(resource)
-                .map(|iff| load_group(iff, group, direction, zoom as u32 + 1))
-                .unwrap_or_default();
-            self.groups.insert(key, parts);
+            let parts = if self.ensure_file(resource).is_some() {
+                let iff = &self.files[&resource].iff;
+                load_group_cached(
+                    resource,
+                    iff,
+                    group,
+                    direction,
+                    zoom as u32 + 1,
+                    &mut self.file_palettes,
+                )
+            } else {
+                Vec::new()
+            };
+            let spans = parts
+                .iter()
+                .map(|p| RowSpans::for_sprite(&p.image))
+                .collect();
+            self.groups.insert(key, CachedGroup { parts, spans });
         }
-        &self.groups[&key]
+        &self.groups[&key].parts
+    }
+
+    /// Read-only cached sprite accessors (called after main-thread warm-up so
+    /// parallel horizontal-band rasterization borrows `&Image` and `&RowSpans`
+    /// with zero locking or mutation).
+    pub(crate) fn floor_cached(&self, id: u16, zoom: usize) -> Option<(&Image, &RowSpans)> {
+        let c = self.floor_images.get(&(id, zoom))?.as_ref()?;
+        Some((&c.image, &c.spans))
+    }
+
+    pub(crate) fn pool_tile_cached(&self, mask: u8, zoom: usize) -> Option<(&Image, &RowSpans)> {
+        let c = self.pool_images.get(&(mask, zoom))?.as_ref()?;
+        Some((&c.image, &c.spans))
+    }
+
+    pub(crate) fn pool_corner_cached(
+        &self,
+        corner: u8,
+        zoom: usize,
+    ) -> Option<(&Image, &RowSpans)> {
+        let c = self.pool_corners.get(&(corner, zoom))?.as_ref()?;
+        Some((&c.image, &c.spans))
+    }
+
+    pub(crate) fn water_tile_cached(&self, mask: u8, zoom: usize) -> Option<(&Image, &RowSpans)> {
+        let c = self.water_images.get(&(mask, zoom))?.as_ref()?;
+        Some((&c.image, &c.spans))
+    }
+
+    pub(crate) fn pattern_cached(
+        &self,
+        id: u16,
+        zoom: usize,
+        frame: usize,
+    ) -> Option<(&Image, &RowSpans)> {
+        let q = self.patterns.get(&(id, zoom))?.as_ref()?;
+        Some((&q.images[frame], &q.spans[frame]))
+    }
+
+    pub(crate) fn shape_cached(
+        &self,
+        style: u16,
+        cut: bool,
+        zoom: usize,
+        frame: usize,
+    ) -> Option<(&Image, &RowSpans)> {
+        let q = self.shapes.get(&(style, cut, zoom))?.as_ref()?;
+        Some((&q.images[frame], &q.spans[frame]))
+    }
+
+    pub(crate) fn object_shape_cached(
+        &self,
+        resource: usize,
+        wall_shape: u16,
+        cut: bool,
+        zoom: usize,
+        frame: usize,
+    ) -> Option<(&Image, &RowSpans)> {
+        let q = self
+            .object_shapes
+            .get(&(resource, wall_shape, cut, zoom))?
+            .as_ref()?;
+        Some((&q.images[frame], &q.spans[frame]))
+    }
+
+    pub(crate) fn trim_cached(
+        &self,
+        cut: bool,
+        zoom: usize,
+        frame: usize,
+    ) -> Option<(&Image, &RowSpans)> {
+        let t = self.trims.get(&(cut, zoom))?;
+        Some((t.images.get(frame)?, t.spans.get(frame)?))
+    }
+
+    pub(crate) fn group_part_cached(
+        &self,
+        resource: usize,
+        group: u16,
+        direction: u32,
+        zoom: usize,
+        part_idx: usize,
+    ) -> Option<(&Image, &RowSpans)> {
+        let g = self.groups.get(&(resource, group, direction, zoom))?;
+        Some((&g.parts.get(part_idx)?.image, g.spans.get(part_idx)?))
+    }
+
+    pub(crate) fn shadow_mask_cached(&self, zoom: usize, code: u8) -> Option<&Mask> {
+        self.shadow_masks.get(&(zoom, code))?.as_ref()
     }
 
     /// The sprites of draw group `group` of an object's file, for a view
@@ -932,7 +1162,67 @@ fn four(mut frame: impl FnMut(usize) -> Option<Image>) -> Option<[Image; 4]> {
     Some([frame(0)?, frame(1)?, frame(2)?, frame(3)?])
 }
 
-fn load_group(iff: &Iff, group: u16, direction: u32, zoom: u32) -> Vec<Part> {
+fn cached_iff_palette(
+    iff: &Iff,
+    palt_id: u16,
+    cache: &mut BTreeMap<u16, Option<Arc<Palette>>>,
+) -> Option<Arc<Palette>> {
+    cache
+        .entry(palt_id)
+        .or_insert_with(|| {
+            let chunk = iff.get(b"PALT", palt_id)?;
+            Palette::parse(iff.data(chunk)).ok().map(Arc::new)
+        })
+        .clone()
+}
+
+fn cached_file_palette(
+    resource: usize,
+    iff: &Iff,
+    palt_id: u16,
+    cache: &mut BTreeMap<(usize, u16), Option<Arc<Palette>>>,
+) -> Option<Arc<Palette>> {
+    cache
+        .entry((resource, palt_id))
+        .or_insert_with(|| {
+            let chunk = iff.get(b"PALT", palt_id)?;
+            Palette::parse(iff.data(chunk)).ok().map(Arc::new)
+        })
+        .clone()
+}
+
+fn spr2_palette_id(set: &SpriteSet, frame: &[u8]) -> Option<u16> {
+    let stored = u16::from_le_bytes([*frame.get(8)?, *frame.get(9)?]);
+    let palette = if set.version == 1000 || stored == 0 || stored == 0xA3A3 {
+        set.default_palette
+    } else {
+        u32::from(stored)
+    };
+    u16::try_from(palette).ok()
+}
+
+fn decode_spr2_with_cache(
+    data: &[u8],
+    index: usize,
+    iff: &Iff,
+    cache: &mut BTreeMap<u16, Option<Arc<Palette>>>,
+) -> Option<SpriteFrame> {
+    let set = SpriteSet::parse(data).ok()?;
+    let range = set.frames.get(index)?;
+    let frame = data.get(range.clone())?;
+    let palt_id = spr2_palette_id(&set, frame)?;
+    let palette = cached_iff_palette(iff, palt_id, cache)?;
+    SpriteFrame::decode(frame, &palette).ok()
+}
+
+fn load_group_cached(
+    resource: usize,
+    iff: &Iff,
+    group: u16,
+    direction: u32,
+    zoom: u32,
+    palettes: &mut BTreeMap<(usize, u16), Option<Arc<Palette>>>,
+) -> Vec<Part> {
     let Some(chunk) = iff.get(b"DGRP", group) else {
         return Vec::new();
     };
@@ -955,9 +1245,22 @@ fn load_group(iff: &Iff, group: u16, direction: u32, zoom: u32) -> Vec<Part> {
             continue;
         };
         let data = iff.data(chunk);
-        let Ok(frame) =
-            SpriteSet::parse(data).and_then(|set| set.decode(data, s.frame as usize, iff))
-        else {
+        let Ok(set) = SpriteSet::parse(data) else {
+            continue;
+        };
+        let Some(range) = set.frames.get(s.frame as usize) else {
+            continue;
+        };
+        let Some(frame_bytes) = data.get(range.clone()) else {
+            continue;
+        };
+        let Some(palt_id) = spr2_palette_id(&set, frame_bytes) else {
+            continue;
+        };
+        let Some(palette) = cached_file_palette(resource, iff, palt_id, palettes) else {
+            continue;
+        };
+        let Ok(frame) = SpriteFrame::decode(frame_bytes, &palette) else {
             continue;
         };
         if frame.width == 0 || frame.height == 0 {

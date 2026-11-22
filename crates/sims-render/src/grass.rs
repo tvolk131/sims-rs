@@ -785,11 +785,21 @@ impl Column {
         }
     }
 
-    /// The column's widened 8-bit RGB pixels, top to bottom.
-    pub(crate) fn rows_rgb(&self) -> impl Iterator<Item = (i32, [[u8; 3]; 4])> + '_ {
+    /// The column's widened 8-bit RGB pixels restricted to screen rows
+    /// `[band_y0, band_y1)`, preserving the exact unbanded dither parity
+    /// `(self.y + self.height + row) & 1`.
+    pub(crate) fn rows_rgb_in_band(
+        &self,
+        band_y0: i32,
+        band_y1: i32,
+    ) -> impl Iterator<Item = (i32, [[u8; 3]; 4])> + '_ {
         let palette = widened_palette();
-        let end = i64::from(self.y) + i64::from(self.height);
-        (0..self.height.max(0)).map(move |row| {
+        let height = self.height.max(0);
+        let end = i64::from(self.y) + i64::from(height);
+        let start = (i64::from(band_y0) - i64::from(self.y)).clamp(0, i64::from(height)) as i32;
+        let stop = (i64::from(band_y1) - i64::from(self.y))
+            .clamp(i64::from(start), i64::from(height)) as i32;
+        (start..stop).map(move |row| {
             let t = step(self.shade, row) >> 8;
             let s = step(self.color, row) >> 8;
             let t = t.clamp(0, i64::from(MAX_SHADE)) as usize;

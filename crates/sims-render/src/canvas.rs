@@ -25,7 +25,7 @@
 //! multi-tile object is its own object and names itself.
 
 pub use crate::depth::EMPTY;
-use crate::light::Light;
+use crate::light::{self, Light};
 use std::sync::OnceLock;
 
 /// The faintest alpha drawn: 8 of the files' 31 steps (8 * 255 / 31,
@@ -34,6 +34,122 @@ use std::sync::OnceLock;
 /// variants) skip pixels whose 5-bit alpha is `<= 7`, leaving both colour
 /// and depth untouched.
 pub const FAINT: u8 = 65;
+
+/// A contiguous horizontal span of active (non-transparent) columns in one
+/// sprite row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RowSpan {
+    /// Inclusive start column in `0..width`.
+    pub start: u32,
+    /// Exclusive end column in `start..=width`.
+    pub end: u32,
+    /// True iff every pixel in `start..end` meets the opaque alpha threshold.
+    pub all_opaque: bool,
+}
+
+/// Precompiled active column spans per row for a decoded [`Image`], allowing
+/// blitters to skip transparent margins and interior cutouts (50–80% of
+/// isometric floor diamonds, wall masks, and furniture bounding boxes) and
+/// specialize opaque runs without per-pixel alpha checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RowSpans {
+    pub width: usize,
+    pub height: usize,
+    runs: Vec<RowSpan>,
+    row_offsets: Vec<u32>,
+}
+
+impl RowSpans {
+    /// Precomputes active runs where `alpha >= min_alpha`, marking runs where
+    /// every pixel has `alpha >= opaque_alpha` as `all_opaque`.
+    pub(crate) fn compute(image: &Image, min_alpha: u8, opaque_alpha: u8) -> Self {
+        let width = image.width;
+        let height = image.height;
+        let valid =
+            width.checked_mul(height).and_then(|n| n.checked_mul(4)) == Some(image.rgba.len());
+        if !valid || width == 0 || height == 0 || width > u32::MAX as usize {
+            return Self {
+                width,
+                height,
+                runs: Vec::new(),
+                row_offsets: vec![0; height.saturating_add(1)],
+            };
+        }
+        let mut runs = Vec::with_capacity(height);
+        let mut row_offsets = Vec::with_capacity(height + 1);
+        row_offsets.push(0);
+        for iy in 0..height {
+            let row = &image.rgba[iy * width * 4..(iy + 1) * width * 4];
+            let pixels = row.as_chunks::<4>().0;
+            let mut x = 0usize;
+            while x < width {
+                while x < width && pixels[x][3] < min_alpha {
+                    x += 1;
+                }
+                if x >= width {
+                    break;
+                }
+                let start = x;
+                let mut all_opaque = true;
+                while x < width && pixels[x][3] >= min_alpha {
+                    if pixels[x][3] < opaque_alpha {
+                        all_opaque = false;
+                    }
+                    x += 1;
+                }
+                runs.push(RowSpan {
+                    start: start as u32,
+                    end: x as u32,
+                    all_opaque,
+                });
+            }
+            row_offsets.push(runs.len() as u32);
+        }
+        Self {
+            width,
+            height,
+            runs,
+            row_offsets,
+        }
+    }
+
+    /// Active spans for standard sprites (`alpha >= FAINT`, opaque at `255`).
+    pub(crate) fn for_sprite(image: &Image) -> Self {
+        Self::compute(image, FAINT, 255)
+    }
+
+    /// Active spans for pond/water overlays (`alpha >= 8`, opaque at `248`).
+    pub(crate) fn for_water(image: &Image) -> Self {
+        Self::compute(image, 8, 248)
+    }
+
+    #[inline]
+    pub(crate) fn row(&self, iy: usize) -> &[RowSpan] {
+        let start = self.row_offsets[iy] as usize;
+        let end = self.row_offsets[iy + 1] as usize;
+        &self.runs[start..end]
+    }
+
+    #[inline]
+    pub(crate) fn row_bounds(&self, iy: usize) -> Option<(usize, usize)> {
+        let row = self.row(iy);
+        let first = row.first()?;
+        let last = row.last()?;
+        Some((first.start as usize, last.end as usize))
+    }
+}
+
+/// Disjoint horizontal row band of a [`Canvas`], enabling 100% safe parallel
+/// multi-threaded band rasterization (`std::thread::scope` + `chunks_mut`).
+pub(crate) struct CanvasBand<'a> {
+    pub width: usize,
+    pub height: usize,
+    pub y0: usize,
+    pub y1: usize,
+    pub color: &'a mut [[u8; 3]],
+    pub depth: &'a mut [i32],
+    pub ids: &'a mut [Option<u16>],
+}
 
 /// A decoded sprite frame: straight-alpha RGBA and, if it has one, a depth
 /// byte per pixel (255 where nothing is drawn).
@@ -259,25 +375,86 @@ impl Canvas {
     #[inline]
     fn record_rect(&mut self, x: i32, y: i32, width: usize, height: usize) {
         if let Some(id) = self.pen {
-            let side = |n: usize| i32::try_from(n).unwrap_or(i32::MAX);
-            let rect = [
-                x,
-                y,
-                x.saturating_add(side(width)),
-                y.saturating_add(side(height)),
-            ];
-            self.rects
-                .entry(id)
-                .and_modify(|r| {
-                    *r = [
-                        r[0].min(rect[0]),
-                        r[1].min(rect[1]),
-                        r[2].max(rect[2]),
-                        r[3].max(rect[3]),
-                    ]
-                })
-                .or_insert(rect);
+            self.record_rect_for(id, x, y, width, height);
         }
+    }
+
+    #[inline]
+    pub(crate) fn record_rect_for(&mut self, id: u16, x: i32, y: i32, width: usize, height: usize) {
+        let side = |n: usize| i32::try_from(n).unwrap_or(i32::MAX);
+        let rect = [
+            x,
+            y,
+            x.saturating_add(side(width)),
+            y.saturating_add(side(height)),
+        ];
+        self.rects
+            .entry(id)
+            .and_modify(|r| {
+                *r = [
+                    r[0].min(rect[0]),
+                    r[1].min(rect[1]),
+                    r[2].max(rect[2]),
+                    r[3].max(rect[3]),
+                ]
+            })
+            .or_insert(rect);
+    }
+
+    /// Splits this canvas into up to `num_bands` disjoint horizontal row bands
+    /// (`[y0, y1)` covering `0..self.height`) for safe parallel rasterization.
+    /// Caller must ensure `self.has_pixel_storage()`.
+    pub(crate) fn split_bands(&mut self, num_bands: usize) -> Vec<CanvasBand<'_>> {
+        if self.width == 0 || self.height == 0 {
+            return Vec::new();
+        }
+        let pixels = self.width * self.height;
+        let bands = num_bands.clamp(1, self.height);
+        let band_rows = self.height.div_ceil(bands);
+        let band_pixels = band_rows * self.width;
+        let width = self.width;
+        let height = self.height;
+        let color = &mut self.color[..pixels];
+        let depth = &mut self.depth[..pixels];
+        let ids = &mut self.ids[..pixels];
+        color
+            .chunks_mut(band_pixels)
+            .zip(depth.chunks_mut(band_pixels))
+            .zip(ids.chunks_mut(band_pixels))
+            .enumerate()
+            .map(|(i, ((c, d), id))| {
+                let y0 = i * band_rows;
+                let rows = c.len() / width;
+                CanvasBand {
+                    width,
+                    height,
+                    y0,
+                    y1: y0 + rows,
+                    color: c,
+                    depth: d,
+                    ids: id,
+                }
+            })
+            .collect()
+    }
+
+    /// Mutable row slices for `(color, depth, ids)` on row `y`, columns `x0..x1`.
+    /// Caller must ensure `y < self.height`, `x0 <= x1 <= self.width`, and
+    /// `self.has_pixel_storage()`.
+    #[inline]
+    pub(crate) fn row_slices_mut(
+        &mut self,
+        y: usize,
+        x0: usize,
+        x1: usize,
+    ) -> (&mut [[u8; 3]], &mut [i32], &mut [Option<u16>]) {
+        let start = y * self.width + x0;
+        let end = y * self.width + x1;
+        (
+            &mut self.color[start..end],
+            &mut self.depth[start..end],
+            &mut self.ids[start..end],
+        )
     }
 
     /// Sets the ID the pixels drawn from now on take, until it is set
@@ -343,7 +520,15 @@ impl Canvas {
         light: Light,
         depth: impl Fn(i32, i32, u8) -> Option<i32>,
     ) {
-        self.blit(image, at, flip, |_, _, rgb| light.apply(rgb), 0, depth);
+        let tables = light::tables();
+        self.blit(
+            image,
+            at,
+            flip,
+            |_, _, rgb| light.apply_with(tables, rgb),
+            0,
+            depth,
+        );
     }
 
     /// Draws an image through the original's red-tinted blocked-placement
@@ -369,11 +554,12 @@ impl Canvas {
         light: impl Fn(usize, usize) -> Light,
         depth: impl Fn(i32, i32, u8) -> Option<i32>,
     ) {
+        let tables = light::tables();
         self.blit(
             image,
             at,
             false,
-            |ix, iy, rgb| light(ix, iy).apply(rgb),
+            |ix, iy, rgb| light(ix, iy).apply_with(tables, rgb),
             0,
             depth,
         );
@@ -401,11 +587,12 @@ impl Canvas {
         light: impl Fn(usize, usize) -> Light,
         depth: impl Fn(i32, i32) -> i32,
     ) {
+        let tables = light::tables();
         self.blit(
             image,
             at,
             false,
-            |ix, iy, rgb| light(ix, iy).apply(rgb),
+            |ix, iy, rgb| light(ix, iy).apply_with(tables, rgb),
             1,
             |x, y, _| Some(depth(x, y)),
         );
@@ -422,11 +609,20 @@ impl Canvas {
         light: Light,
         depth: impl Fn(i32, i32, u8) -> Option<i32>,
     ) {
-        self.blit(image, at, false, |_, _, rgb| light.apply(rgb), 1, depth);
+        let tables = light::tables();
+        self.blit(
+            image,
+            at,
+            false,
+            |_, _, rgb| light.apply_with(tables, rgb),
+            1,
+            depth,
+        );
     }
 
     /// Like [`Canvas::draw_layered`], clipped horizontally to screen columns
     /// `columns` (`[from, to)`) without copying `image`.
+    #[cfg(test)]
     pub(crate) fn draw_layered_clipped(
         &mut self,
         image: &Image,
@@ -435,33 +631,22 @@ impl Canvas {
         columns: Option<[i32; 2]>,
         depth: impl Fn(i32, i32, u8) -> Option<i32>,
     ) {
+        let tables = light::tables();
         self.blit_clipped(
             image,
             at,
             false,
-            |_, _, rgb| light.apply(rgb),
+            |_, _, rgb| light.apply_with(tables, rgb),
             1,
             columns,
             depth,
         );
     }
 
-    /// Like [`Canvas::draw_lit`], clipped horizontally to screen columns
-    /// `columns` (`[from, to)`) with row-only depth computed once per row.
-    pub(crate) fn draw_flat_clipped(
-        &mut self,
-        image: &Image,
-        at: [i32; 2],
-        light: Light,
-        columns: Option<[i32; 2]>,
-        row_depth: impl Fn(i32) -> i32,
-    ) {
-        self.blit_row_depth(image, at, |_, _| light, columns, None, None, row_depth);
-    }
-
     /// Draws a floor tile (whole or split-tile sub-rectangle `sub_rect =
     /// Some([ix0, iy0, ix1, iy1])`) with row-only depth computed once per row,
     /// avoiding `Image::clone()` for both whole and split floors.
+    #[cfg(test)]
     pub(crate) fn draw_floor_shaded(
         &mut self,
         image: &Image,
@@ -476,6 +661,7 @@ impl Canvas {
     /// Like [`Canvas::draw_floor_shaded`], additionally clipping output rows to
     /// `[0, clip_bottom)` (matching `Sims.exe`'s active house viewport clip at
     /// `0x4c81b1`–`0x4c81c0`).
+    #[cfg(test)]
     pub(crate) fn draw_floor_shaded_clipped(
         &mut self,
         image: &Image,
@@ -506,6 +692,7 @@ impl Canvas {
     ///   row depth `row_depth(y)`.
     ///
     /// Output rows are clipped to `[0, clip_bottom)` (`0x4c1a4a`–`0x4c1a8c`).
+    #[cfg(test)]
     pub(crate) fn draw_water_overlay(
         &mut self,
         image: &Image,
@@ -531,6 +718,7 @@ impl Canvas {
         }
         self.record_rect(x0 as i32, y0 as i32, x1 - x0, y1 - y0);
         let table = blend_table();
+        let light_tables = light::tables();
         let pen = self.pen;
         let width = self.width;
         let img_w = image.width;
@@ -551,7 +739,7 @@ impl Canvas {
                 let target = dst_row + px;
                 self.depth[target] = d;
                 self.ids[target] = pen;
-                let rgb = light.apply([rgba[pi], rgba[pi + 1], rgba[pi + 2]]);
+                let rgb = light.apply_with(light_tables, [rgba[pi], rgba[pi + 1], rgba[pi + 2]]);
                 if a5 >= 31 {
                     self.color[target] = rgb;
                 } else {
@@ -559,135 +747,6 @@ impl Canvas {
                 }
             }
         }
-    }
-
-    /// Draws a wall pattern masked by `mask` (`top_left = false` requires exact
-    /// size match like [`Image::masked`]; `top_left = true` matches
-    /// [`Image::masked_top_left`]) without cloning or pre-allocating a masked
-    /// image. Returns `false` if the size preconditions fail.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn draw_wall_masked(
-        &mut self,
-        pattern: &Image,
-        mask: &Image,
-        top_left: bool,
-        at: [i32; 2],
-        columns: Option<[i32; 2]>,
-        light: impl Fn(usize, usize) -> Light,
-        depth: impl Fn(i32, i32) -> i32,
-    ) -> bool {
-        let fills = |image: &Image| {
-            image
-                .width
-                .checked_mul(image.height)
-                .and_then(|n| n.checked_mul(4))
-                == Some(image.rgba.len())
-        };
-        let sizes_ok = if top_left {
-            mask.width >= pattern.width && mask.height >= pattern.height
-        } else {
-            (pattern.width, pattern.height) == (mask.width, mask.height)
-        };
-        if !sizes_ok || !fills(pattern) || !fills(mask) {
-            return false;
-        }
-        if pattern.is_empty() || self.color.is_empty() {
-            return true;
-        }
-        let (x0, x1, ax, left_skip, rect_x, rect_w) =
-            match clip_x(at[0], pattern.width, self.width, columns) {
-                Some(span) => span,
-                None => return true,
-            };
-        self.record_rect(rect_x, at[1], rect_w, pattern.height);
-        let (y0, y1, ay) = clip_span(at[1], pattern.height, self.height);
-        if x0 >= x1 || y0 >= y1 {
-            return true;
-        }
-        let pen = self.pen;
-        let width = self.width;
-        let pat_w = pattern.width;
-        let mask_w = mask.width;
-        let pat_rgba = &pattern.rgba;
-        let mask_rgba = &mask.rgba;
-        let table = blend_table();
-        let slice_ok = (y1 - 1)
-            .checked_mul(width)
-            .and_then(|row| row.checked_add(x1))
-            .is_some_and(|max_target| {
-                max_target <= self.color.len()
-                    && max_target <= self.depth.len()
-                    && max_target <= self.ids.len()
-            });
-        for py in y0..y1 {
-            let sy = py as i32;
-            let iy = (py as i64 - ay) as usize;
-            let pat_row = iy * pat_w;
-            let mask_row = iy * mask_w;
-            let ix_start = (x0 as i64 - ax) as usize + left_skip;
-            if slice_ok {
-                let dst_row = py * width;
-                let dst_color = &mut self.color[dst_row + x0..dst_row + x1];
-                let dst_depth = &mut self.depth[dst_row + x0..dst_row + x1];
-                let dst_ids = &mut self.ids[dst_row + x0..dst_row + x1];
-                for (offset, px) in (x0..x1).enumerate() {
-                    let ix = ix_start + offset;
-                    let pi = (pat_row + ix) * 4;
-                    let pa = pat_rgba[pi + 3];
-                    if pa < FAINT {
-                        continue;
-                    }
-                    let ma = mask_rgba[(mask_row + ix) * 4 + 3];
-                    let a = ((u16::from(pa) * u16::from(ma)) / 255) as u8;
-                    if a < FAINT {
-                        continue;
-                    }
-                    let d = depth(px as i32, sy);
-                    if d > dst_depth[offset].saturating_add(1) {
-                        continue;
-                    }
-                    let rgb =
-                        light(ix, iy).apply([pat_rgba[pi], pat_rgba[pi + 1], pat_rgba[pi + 2]]);
-                    dst_depth[offset] = d.clamp(0, EMPTY);
-                    dst_ids[offset] = pen;
-                    if a == 255 {
-                        dst_color[offset] = rgb;
-                    } else {
-                        dst_color[offset] = blend565_with(table, rgb, dst_color[offset], a);
-                    }
-                }
-            } else {
-                for (offset, px) in (x0..x1).enumerate() {
-                    let ix = ix_start + offset;
-                    let pi = (pat_row + ix) * 4;
-                    let pa = pat_rgba[pi + 3];
-                    if pa < FAINT {
-                        continue;
-                    }
-                    let ma = mask_rgba[(mask_row + ix) * 4 + 3];
-                    let a = ((u16::from(pa) * u16::from(ma)) / 255) as u8;
-                    if a < FAINT {
-                        continue;
-                    }
-                    let d = depth(px as i32, sy);
-                    let target = py * width + px;
-                    if d > self.depth[target].saturating_add(1) {
-                        continue;
-                    }
-                    let rgb =
-                        light(ix, iy).apply([pat_rgba[pi], pat_rgba[pi + 1], pat_rgba[pi + 2]]);
-                    let pixel = &mut self.color[target];
-                    self.depth[target] = d.clamp(0, EMPTY);
-                    self.ids[target] = pen;
-                    if a == 255 {
-                        *pixel = rgb;
-                    } else {
-                        *pixel = blend565_with(table, rgb, *pixel, a);
-                    }
-                }
-            }
-        }
-        true
     }
 
     fn blit(
@@ -819,6 +878,7 @@ impl Canvas {
         }
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn blit_row_depth(
         &mut self,
@@ -880,6 +940,7 @@ impl Canvas {
         let img_w = image.width;
         let rgba = &image.rgba;
         let table = blend_table();
+        let light_tables = light::tables();
         let slice_ok = (y1 - 1)
             .checked_mul(width)
             .and_then(|row| row.checked_add(x1))
@@ -910,7 +971,8 @@ impl Canvas {
                     if d > dst_depth[offset] {
                         continue;
                     }
-                    let rgb = light(ix, iy).apply([rgba[si], rgba[si + 1], rgba[si + 2]]);
+                    let rgb = light(ix, iy)
+                        .apply_with(light_tables, [rgba[si], rgba[si + 1], rgba[si + 2]]);
                     dst_depth[offset] = d_clamped;
                     dst_ids[offset] = pen;
                     if a == 255 {
@@ -931,7 +993,8 @@ impl Canvas {
                     if d > self.depth[target] {
                         continue;
                     }
-                    let rgb = light(ix, iy).apply([rgba[si], rgba[si + 1], rgba[si + 2]]);
+                    let rgb = light(ix, iy)
+                        .apply_with(light_tables, [rgba[si], rgba[si + 1], rgba[si + 2]]);
                     let pixel = &mut self.color[target];
                     self.depth[target] = d_clamped;
                     self.ids[target] = pen;
@@ -947,6 +1010,7 @@ impl Canvas {
 
     /// Writes a 4-pixel horizontal grass span starting at `(x, y)` with
     /// constant `depth` (already clamped to `[0, EMPTY]` in `depth_clamped`).
+    #[cfg(test)]
     #[inline]
     pub(crate) fn plot_grass_span(
         &mut self,
@@ -1006,6 +1070,7 @@ impl Canvas {
 
     /// Plots a vertical grass blade at column `x` for rows `top..=bottom`
     /// (`top >= 0`, `bottom < height`), testing `depth` against each row.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn plot_grass_blade(
         &mut self,
@@ -1046,58 +1111,6 @@ impl Canvas {
         }
     }
 
-    /// Applies a floor shadow mask clipped to the canvas bounds, evaluating
-    /// `row_at_least(row)` once per visible row.
-    pub(crate) fn shade_mask(
-        &mut self,
-        mask: &crate::shadows::Mask,
-        at: [i32; 2],
-        strength: i32,
-        row_at_least: impl Fn(i32) -> i32,
-    ) {
-        if mask.width == 0 || mask.height == 0 || self.color.is_empty() {
-            return;
-        }
-        let (x0, x1, ax) = clip_span(at[0], mask.width, self.width);
-        let (y0, y1, ay) = clip_span(at[1], mask.height, self.height);
-        if x0 >= x1 || y0 >= y1 {
-            return;
-        }
-        let width = self.width;
-        let slice_ok = (y1 - 1)
-            .checked_mul(width)
-            .and_then(|row| row.checked_add(x1))
-            .is_some_and(|max_target| {
-                max_target <= self.color.len() && max_target <= self.depth.len()
-            });
-        for py in y0..y1 {
-            let my = (py as i64 - ay) as usize;
-            let at_least = row_at_least(py as i32);
-            let mx_base = (x0 as i64 - ax) as usize;
-            if slice_ok {
-                let dst_row = py * width;
-                let dst_depth = &self.depth[dst_row + x0..dst_row + x1];
-                let dst_color = &mut self.color[dst_row + x0..dst_row + x1];
-                for offset in 0..(x1 - x0) {
-                    if let Some(s) = mask.shade(mx_base + offset, my, strength)
-                        && dst_depth[offset] >= at_least
-                    {
-                        dst_color[offset] = Light::from_sum(s).apply(dst_color[offset]);
-                    }
-                }
-            } else {
-                for (offset, px) in (x0..x1).enumerate() {
-                    if let Some(s) = mask.shade(mx_base + offset, my, strength) {
-                        let target = py * width + px;
-                        if self.depth[target] >= at_least {
-                            self.color[target] = Light::from_sum(s).apply(self.color[target]);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     /// Writes a pixel that passed its depth test: its depth, and its
     /// colour, straight-alpha blended by `a` if it is not opaque. Used for
     /// 3D mesh pixels ([`Canvas::put`]), which do not go through the SPR2
@@ -1126,6 +1139,30 @@ impl Canvas {
     /// it is on the canvas and no farther than what is there.
     pub fn passes(&self, x: i32, y: i32, d: i32) -> bool {
         self.index(x, y).is_some_and(|i| d <= self.depth[i])
+    }
+
+    /// Row-indexed depth check for an in-bounds pixel at `row_start + x`,
+    /// avoiding repeated `i32 -> usize` conversions and row multiplies inside
+    /// scanline loops.
+    #[inline]
+    pub fn depth_passes_at(&self, row_start: usize, x: usize, d: i32) -> bool {
+        self.depth
+            .get(row_start.saturating_add(x))
+            .is_some_and(|&cur| d <= cur)
+    }
+
+    /// Writes a straight-alpha pixel at precomputed index `idx = y * width + x`
+    /// whose depth `d` already passed [`Canvas::depth_passes_at`]. Returns
+    /// `false` when fainter than [`FAINT`] or out of bounds.
+    #[inline]
+    pub fn put_passed_at(&mut self, idx: usize, rgba: [u8; 4], d: i32) -> bool {
+        let [r, g, b, a] = rgba;
+        if a < FAINT || idx >= self.color.len() || idx >= self.depth.len() || idx >= self.ids.len()
+        {
+            return false;
+        }
+        self.write(idx, [r, g, b], a, d);
+        true
     }
 
     /// Draws one straight-alpha pixel at depth `d` by the sprite rule, for
@@ -1224,7 +1261,7 @@ pub fn tint_blocked([r, g, b]: [u8; 3]) -> [u8; 3] {
 /// `blended = (d + (s - d) * (a * (1.0f32 / 255.0f32)) + 0.5) as u8`,
 /// sums the 512 bytes, multiplies by `1/512`, adds `0.5`, truncates and
 /// shifts right by 3.
-fn blend_table() -> &'static [u8; 32 * 32 * 32] {
+pub(crate) fn blend_table() -> &'static [u8; 32 * 32 * 32] {
     static TABLE: OnceLock<Box<[u8; 32 * 32 * 32]>> = OnceLock::new();
     TABLE.get_or_init(|| {
         let inv255 = f64::from(f32::from_bits(0x3b80_8081));
@@ -1259,7 +1296,7 @@ fn blend_table() -> &'static [u8; 32 * 32 * 32] {
 
 /// Clips a `[at, at + size)` span in `i64` to `[0, limit)`.
 #[inline]
-fn clip_span(at: i32, size: usize, limit: usize) -> (usize, usize, i64) {
+pub(crate) fn clip_span(at: i32, size: usize, limit: usize) -> (usize, usize, i64) {
     let wide = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
     let (at, limit) = (i64::from(at), wide(limit));
     let low = at.clamp(0, limit);
@@ -1272,7 +1309,7 @@ fn clip_span(at: i32, size: usize, limit: usize) -> (usize, usize, i64) {
 /// without allocating a cropped image. Returns
 /// `(x0, x1, ax, left_skip, rect_x, rect_w)`.
 #[inline]
-fn clip_x(
+pub(crate) fn clip_x(
     at: i32,
     size: usize,
     limit: usize,
@@ -1325,6 +1362,965 @@ fn blend565_with(table: &[u8; 32 * 32 * 32], src: [u8; 3], dst: [u8; 3], a: u8) 
 /// so `a >> 3` recovers the original's exact 5-bit alpha.
 pub fn blend565(src: [u8; 3], dst: [u8; 3], a: u8) -> [u8; 3] {
     blend565_with(blend_table(), src, dst, a)
+}
+
+impl CanvasBand<'_> {
+    #[inline]
+    pub(crate) fn plot_color(&mut self, x: i32, y: i32, rgb: [u8; 3]) {
+        let (Ok(px), Ok(py)) = (usize::try_from(x), usize::try_from(y)) else {
+            return;
+        };
+        if px < self.width && py >= self.y0 && py < self.y1 {
+            self.color[(py - self.y0) * self.width + px] = rgb;
+        }
+    }
+
+    #[inline]
+    pub(crate) fn plot_grass_span(
+        &mut self,
+        x: i32,
+        y: i32,
+        depth: i32,
+        depth_clamped: i32,
+        pixels: [[u8; 3]; 4],
+    ) {
+        let Ok(py) = usize::try_from(y) else {
+            return;
+        };
+        if py < self.y0 || py >= self.y1 {
+            return;
+        }
+        let local_row = (py - self.y0) * self.width;
+        if x >= 0 && (x as usize).saturating_add(4) <= self.width {
+            let start = local_row + x as usize;
+            let end = start + 4;
+            let dst_depth = &mut self.depth[start..end];
+            let dst_color = &mut self.color[start..end];
+            let dst_ids = &mut self.ids[start..end];
+            for i in 0..4 {
+                if depth <= dst_depth[i] {
+                    dst_depth[i] = depth_clamped;
+                    dst_color[i] = pixels[i];
+                    dst_ids[i] = None;
+                }
+            }
+            return;
+        }
+        for (i, &rgb) in pixels.iter().enumerate() {
+            let Some(px) = x
+                .checked_add(i as i32)
+                .and_then(|v| usize::try_from(v).ok())
+            else {
+                continue;
+            };
+            if px < self.width {
+                let target = local_row + px;
+                if depth <= self.depth[target] {
+                    self.depth[target] = depth_clamped;
+                    self.ids[target] = None;
+                    self.color[target] = rgb;
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn plot_grass_blade(
+        &mut self,
+        x: i32,
+        top: i32,
+        bottom: i32,
+        depth: i32,
+        depth_clamped: i32,
+        color: [u8; 3],
+    ) {
+        if top > bottom || self.y0 >= self.y1 {
+            return;
+        }
+        let Ok(px) = usize::try_from(x) else {
+            return;
+        };
+        if px >= self.width {
+            return;
+        }
+        let Ok(bottom_usize) = usize::try_from(bottom) else {
+            return;
+        };
+        let y0 = (top.max(0) as usize).max(self.y0);
+        let y1 = bottom_usize.min(self.y1 - 1);
+        if y0 > y1 {
+            return;
+        }
+        let width = self.width;
+        for py in y0..=y1 {
+            let idx = (py - self.y0) * width + px;
+            if depth <= self.depth[idx] {
+                self.depth[idx] = depth_clamped;
+                self.ids[idx] = None;
+                self.color[idx] = color;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn blit_row_depth_flat(
+        &mut self,
+        image: &Image,
+        spans: &RowSpans,
+        at: [i32; 2],
+        light: Light,
+        columns: Option<[i32; 2]>,
+        sub_rect: Option<[usize; 4]>,
+        clip_bottom: Option<i32>,
+        pen: Option<u16>,
+        row_depth: impl Fn(i32) -> i32,
+    ) {
+        let Some((mut x0, mut x1, ax, left_skip, _, _)) =
+            clip_x(at[0], image.width, self.width, columns)
+        else {
+            return;
+        };
+        let max_h = match clip_bottom {
+            Some(cb) => self.height.min(cb.max(0) as usize),
+            None => self.height,
+        };
+        let (mut y0, mut y1, ay) = clip_span(at[1], image.height, max_h);
+        if let Some([ix0, iy0, ix1, iy1]) = sub_rect {
+            if ix0 >= ix1 || iy0 >= iy1 {
+                return;
+            }
+            let wide = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
+            let base_x = i64::from(at[0]);
+            let lim_x = wide(self.width);
+            let lim_y = wide(max_h);
+            x0 = x0.max(base_x.saturating_add(wide(ix0)).clamp(0, lim_x) as usize);
+            x1 = x1.min(base_x.saturating_add(wide(ix1)).clamp(0, lim_x) as usize);
+            y0 = y0.max(ay.saturating_add(wide(iy0)).clamp(0, lim_y) as usize);
+            y1 = y1.min(ay.saturating_add(wide(iy1)).clamp(0, lim_y) as usize);
+        }
+        y0 = y0.max(self.y0);
+        y1 = y1.min(self.y1);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let width = self.width;
+        let img_w = image.width;
+        let rgba = image.rgba.as_chunks::<4>().0;
+        let table = blend_table();
+        let ix_min = (x0 as i64 - ax) as usize + left_skip;
+        let ix_max = ix_min + (x1 - x0);
+        match light.level() {
+            None => {
+                for py in y0..y1 {
+                    let iy = (py as i64 - ay) as usize;
+                    let row_spans = spans.row(iy);
+                    if row_spans.is_empty() {
+                        continue;
+                    }
+                    let d = row_depth(py as i32);
+                    let d_clamped = d.clamp(0, EMPTY);
+                    let src_row = iy * img_w;
+                    let dst_base = (py - self.y0) * width + x0;
+                    for span in row_spans {
+                        let s = (span.start as usize).max(ix_min);
+                        let e = (span.end as usize).min(ix_max);
+                        if s >= e {
+                            continue;
+                        }
+                        let dst_off = dst_base + (s - ix_min);
+                        let len = e - s;
+                        let src_px = &rgba[src_row + s..src_row + e];
+                        let dc = &mut self.color[dst_off..dst_off + len];
+                        let dd = &mut self.depth[dst_off..dst_off + len];
+                        let di = &mut self.ids[dst_off..dst_off + len];
+                        if span.all_opaque {
+                            for i in 0..len {
+                                if d <= dd[i] {
+                                    let px = src_px[i];
+                                    dd[i] = d_clamped;
+                                    di[i] = pen;
+                                    dc[i] = [px[0], px[1], px[2]];
+                                }
+                            }
+                        } else {
+                            for i in 0..len {
+                                let px = src_px[i];
+                                let a = px[3];
+                                if a < FAINT || d > dd[i] {
+                                    continue;
+                                }
+                                dd[i] = d_clamped;
+                                di[i] = pen;
+                                let rgb = [px[0], px[1], px[2]];
+                                if a == 255 {
+                                    dc[i] = rgb;
+                                } else {
+                                    dc[i] = blend565_with(table, rgb, dc[i], a);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Some(l) => {
+                let lt = light::tables();
+                let (tr, tg, tb) = (&lt.r[l], &lt.g[l], &lt.b[l]);
+                for py in y0..y1 {
+                    let iy = (py as i64 - ay) as usize;
+                    let row_spans = spans.row(iy);
+                    if row_spans.is_empty() {
+                        continue;
+                    }
+                    let d = row_depth(py as i32);
+                    let d_clamped = d.clamp(0, EMPTY);
+                    let src_row = iy * img_w;
+                    let dst_base = (py - self.y0) * width + x0;
+                    for span in row_spans {
+                        let s = (span.start as usize).max(ix_min);
+                        let e = (span.end as usize).min(ix_max);
+                        if s >= e {
+                            continue;
+                        }
+                        let dst_off = dst_base + (s - ix_min);
+                        let len = e - s;
+                        let src_px = &rgba[src_row + s..src_row + e];
+                        let dc = &mut self.color[dst_off..dst_off + len];
+                        let dd = &mut self.depth[dst_off..dst_off + len];
+                        let di = &mut self.ids[dst_off..dst_off + len];
+                        if span.all_opaque {
+                            for i in 0..len {
+                                if d <= dd[i] {
+                                    let px = src_px[i];
+                                    dd[i] = d_clamped;
+                                    di[i] = pen;
+                                    dc[i] = [
+                                        tr[usize::from(px[0] >> 3)],
+                                        tg[usize::from(px[1] >> 2)],
+                                        tb[usize::from(px[2] >> 3)],
+                                    ];
+                                }
+                            }
+                        } else {
+                            for i in 0..len {
+                                let px = src_px[i];
+                                let a = px[3];
+                                if a < FAINT || d > dd[i] {
+                                    continue;
+                                }
+                                dd[i] = d_clamped;
+                                di[i] = pen;
+                                let rgb = [
+                                    tr[usize::from(px[0] >> 3)],
+                                    tg[usize::from(px[1] >> 2)],
+                                    tb[usize::from(px[2] >> 3)],
+                                ];
+                                if a == 255 {
+                                    dc[i] = rgb;
+                                } else {
+                                    dc[i] = blend565_with(table, rgb, dc[i], a);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn blit_row_depth_shaded(
+        &mut self,
+        image: &Image,
+        spans: &RowSpans,
+        at: [i32; 2],
+        light: impl Fn(usize, usize) -> Light,
+        columns: Option<[i32; 2]>,
+        sub_rect: Option<[usize; 4]>,
+        clip_bottom: Option<i32>,
+        pen: Option<u16>,
+        row_depth: impl Fn(i32) -> i32,
+    ) {
+        let Some((mut x0, mut x1, ax, left_skip, _, _)) =
+            clip_x(at[0], image.width, self.width, columns)
+        else {
+            return;
+        };
+        let max_h = match clip_bottom {
+            Some(cb) => self.height.min(cb.max(0) as usize),
+            None => self.height,
+        };
+        let (mut y0, mut y1, ay) = clip_span(at[1], image.height, max_h);
+        if let Some([ix0, iy0, ix1, iy1]) = sub_rect {
+            if ix0 >= ix1 || iy0 >= iy1 {
+                return;
+            }
+            let wide = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
+            let base_x = i64::from(at[0]);
+            let lim_x = wide(self.width);
+            let lim_y = wide(max_h);
+            x0 = x0.max(base_x.saturating_add(wide(ix0)).clamp(0, lim_x) as usize);
+            x1 = x1.min(base_x.saturating_add(wide(ix1)).clamp(0, lim_x) as usize);
+            y0 = y0.max(ay.saturating_add(wide(iy0)).clamp(0, lim_y) as usize);
+            y1 = y1.min(ay.saturating_add(wide(iy1)).clamp(0, lim_y) as usize);
+        }
+        y0 = y0.max(self.y0);
+        y1 = y1.min(self.y1);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let width = self.width;
+        let img_w = image.width;
+        let rgba = image.rgba.as_chunks::<4>().0;
+        let table = blend_table();
+        let lt = light::tables();
+        let ix_min = (x0 as i64 - ax) as usize + left_skip;
+        let ix_max = ix_min + (x1 - x0);
+        for py in y0..y1 {
+            let iy = (py as i64 - ay) as usize;
+            let row_spans = spans.row(iy);
+            if row_spans.is_empty() {
+                continue;
+            }
+            let d = row_depth(py as i32);
+            let d_clamped = d.clamp(0, EMPTY);
+            let src_row = iy * img_w;
+            let dst_base = (py - self.y0) * width + x0;
+            for span in row_spans {
+                let s = (span.start as usize).max(ix_min);
+                let e = (span.end as usize).min(ix_max);
+                if s >= e {
+                    continue;
+                }
+                let dst_off = dst_base + (s - ix_min);
+                let len = e - s;
+                let src_px = &rgba[src_row + s..src_row + e];
+                let dc = &mut self.color[dst_off..dst_off + len];
+                let dd = &mut self.depth[dst_off..dst_off + len];
+                let di = &mut self.ids[dst_off..dst_off + len];
+                if span.all_opaque {
+                    for i in 0..len {
+                        if d <= dd[i] {
+                            let px = src_px[i];
+                            dd[i] = d_clamped;
+                            di[i] = pen;
+                            dc[i] = light(s + i, iy).apply_with(lt, [px[0], px[1], px[2]]);
+                        }
+                    }
+                } else {
+                    for i in 0..len {
+                        let px = src_px[i];
+                        let a = px[3];
+                        if a < FAINT || d > dd[i] {
+                            continue;
+                        }
+                        dd[i] = d_clamped;
+                        di[i] = pen;
+                        let rgb = light(s + i, iy).apply_with(lt, [px[0], px[1], px[2]]);
+                        if a == 255 {
+                            dc[i] = rgb;
+                        } else {
+                            dc[i] = blend565_with(table, rgb, dc[i], a);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn draw_water_overlay(
+        &mut self,
+        image: &Image,
+        spans: &RowSpans,
+        at: [i32; 2],
+        clip_bottom: i32,
+        light: Light,
+        pen: Option<u16>,
+        row_depth: impl Fn(i32) -> i32,
+    ) {
+        let max_h = self.height.min(clip_bottom.max(0) as usize);
+        let (x0, x1, ax) = clip_span(at[0], image.width, self.width);
+        let (mut y0, mut y1, ay) = clip_span(at[1], image.height, max_h);
+        y0 = y0.max(self.y0);
+        y1 = y1.min(self.y1);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let table = blend_table();
+        let lt = light::tables();
+        let width = self.width;
+        let img_w = image.width;
+        let rgba = image.rgba.as_chunks::<4>().0;
+        let ix_min = (x0 as i64 - ax) as usize;
+        let ix_max = ix_min + (x1 - x0);
+        let light_rows = light.level().map(|l| (&lt.r[l], &lt.g[l], &lt.b[l]));
+        for py in y0..y1 {
+            let iy = (py as i64 - ay) as usize;
+            let row_spans = spans.row(iy);
+            if row_spans.is_empty() {
+                continue;
+            }
+            let d = row_depth(py as i32).clamp(0, EMPTY);
+            let src_row = iy * img_w;
+            let dst_base = (py - self.y0) * width + x0;
+            for span in row_spans {
+                let s = (span.start as usize).max(ix_min);
+                let e = (span.end as usize).min(ix_max);
+                if s >= e {
+                    continue;
+                }
+                let dst_off = dst_base + (s - ix_min);
+                let len = e - s;
+                let src_px = &rgba[src_row + s..src_row + e];
+                let dc = &mut self.color[dst_off..dst_off + len];
+                let dd = &mut self.depth[dst_off..dst_off + len];
+                let di = &mut self.ids[dst_off..dst_off + len];
+                for i in 0..len {
+                    let px = src_px[i];
+                    let a = px[3];
+                    let a5 = a >> 3;
+                    if a5 == 0 {
+                        continue;
+                    }
+                    dd[i] = d;
+                    di[i] = pen;
+                    let rgb = match light_rows {
+                        None => [px[0], px[1], px[2]],
+                        Some((tr, tg, tb)) => [
+                            tr[usize::from(px[0] >> 3)],
+                            tg[usize::from(px[1] >> 2)],
+                            tb[usize::from(px[2] >> 3)],
+                        ],
+                    };
+                    if a5 >= 31 {
+                        dc[i] = rgb;
+                    } else {
+                        dc[i] = blend565_with(table, rgb, dc[i], a);
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn draw_wall_masked_flat(
+        &mut self,
+        pattern: &Image,
+        pat_spans: &RowSpans,
+        mask: &Image,
+        mask_spans: &RowSpans,
+        at: [i32; 2],
+        columns: Option<[i32; 2]>,
+        light: Light,
+        pen: Option<u16>,
+        depth: impl Fn(i32, i32) -> i32,
+    ) {
+        let Some((x0, x1, ax, left_skip, _, _)) = clip_x(at[0], pattern.width, self.width, columns)
+        else {
+            return;
+        };
+        let (mut y0, mut y1, ay) = clip_span(at[1], pattern.height, self.height);
+        y0 = y0.max(self.y0);
+        y1 = y1.min(self.y1);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let width = self.width;
+        let pat_w = pattern.width;
+        let mask_w = mask.width;
+        let pat_px = pattern.rgba.as_chunks::<4>().0;
+        let mask_px = mask.rgba.as_chunks::<4>().0;
+        let table = blend_table();
+        let lt = light::tables();
+        let light_rows = light.level().map(|l| (&lt.r[l], &lt.g[l], &lt.b[l]));
+        let ix_min = (x0 as i64 - ax) as usize + left_skip;
+        let ix_max = ix_min + (x1 - x0);
+        for py in y0..y1 {
+            let sy = py as i32;
+            let iy = (py as i64 - ay) as usize;
+            let Some((ps, pe)) = pat_spans.row_bounds(iy) else {
+                continue;
+            };
+            let p_lo = ps.max(ix_min);
+            let p_hi = pe.min(ix_max);
+            if p_lo >= p_hi {
+                continue;
+            }
+            let pat_row = iy * pat_w;
+            let mask_row = iy * mask_w;
+            let dst_base = (py - self.y0) * width + x0;
+            for span in mask_spans.row(iy) {
+                let s = (span.start as usize).max(p_lo);
+                let e = (span.end as usize).min(p_hi);
+                if s >= e {
+                    continue;
+                }
+                let dst_off = dst_base + (s - ix_min);
+                let len = e - s;
+                let px_start = (x0 + (s - ix_min)) as i32;
+                let pat_slice = &pat_px[pat_row + s..pat_row + e];
+                let dc = &mut self.color[dst_off..dst_off + len];
+                let dd = &mut self.depth[dst_off..dst_off + len];
+                let di = &mut self.ids[dst_off..dst_off + len];
+                if span.all_opaque {
+                    // ma == 255 for every pixel in this span => (pa * 255) / 255 == pa.
+                    for i in 0..len {
+                        let p = pat_slice[i];
+                        let a = p[3];
+                        if a < FAINT {
+                            continue;
+                        }
+                        let d = depth(px_start + i as i32, sy);
+                        if d > dd[i].saturating_add(1) {
+                            continue;
+                        }
+                        let rgb = match light_rows {
+                            None => [p[0], p[1], p[2]],
+                            Some((tr, tg, tb)) => [
+                                tr[usize::from(p[0] >> 3)],
+                                tg[usize::from(p[1] >> 2)],
+                                tb[usize::from(p[2] >> 3)],
+                            ],
+                        };
+                        dd[i] = d.clamp(0, EMPTY);
+                        di[i] = pen;
+                        if a == 255 {
+                            dc[i] = rgb;
+                        } else {
+                            dc[i] = blend565_with(table, rgb, dc[i], a);
+                        }
+                    }
+                } else {
+                    let mask_slice = &mask_px[mask_row + s..mask_row + e];
+                    for i in 0..len {
+                        let p = pat_slice[i];
+                        let pa = p[3];
+                        if pa < FAINT {
+                            continue;
+                        }
+                        let ma = mask_slice[i][3];
+                        let a = ((u16::from(pa) * u16::from(ma)) / 255) as u8;
+                        if a < FAINT {
+                            continue;
+                        }
+                        let d = depth(px_start + i as i32, sy);
+                        if d > dd[i].saturating_add(1) {
+                            continue;
+                        }
+                        let rgb = match light_rows {
+                            None => [p[0], p[1], p[2]],
+                            Some((tr, tg, tb)) => [
+                                tr[usize::from(p[0] >> 3)],
+                                tg[usize::from(p[1] >> 2)],
+                                tb[usize::from(p[2] >> 3)],
+                            ],
+                        };
+                        dd[i] = d.clamp(0, EMPTY);
+                        di[i] = pen;
+                        if a == 255 {
+                            dc[i] = rgb;
+                        } else {
+                            dc[i] = blend565_with(table, rgb, dc[i], a);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn draw_wall_masked_shaded(
+        &mut self,
+        pattern: &Image,
+        pat_spans: &RowSpans,
+        mask: &Image,
+        mask_spans: &RowSpans,
+        at: [i32; 2],
+        columns: Option<[i32; 2]>,
+        light: impl Fn(usize, usize) -> Light,
+        pen: Option<u16>,
+        depth: impl Fn(i32, i32) -> i32,
+    ) {
+        let Some((x0, x1, ax, left_skip, _, _)) = clip_x(at[0], pattern.width, self.width, columns)
+        else {
+            return;
+        };
+        let (mut y0, mut y1, ay) = clip_span(at[1], pattern.height, self.height);
+        y0 = y0.max(self.y0);
+        y1 = y1.min(self.y1);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let width = self.width;
+        let pat_w = pattern.width;
+        let mask_w = mask.width;
+        let pat_px = pattern.rgba.as_chunks::<4>().0;
+        let mask_px = mask.rgba.as_chunks::<4>().0;
+        let table = blend_table();
+        let lt = light::tables();
+        let ix_min = (x0 as i64 - ax) as usize + left_skip;
+        let ix_max = ix_min + (x1 - x0);
+        for py in y0..y1 {
+            let sy = py as i32;
+            let iy = (py as i64 - ay) as usize;
+            let Some((ps, pe)) = pat_spans.row_bounds(iy) else {
+                continue;
+            };
+            let p_lo = ps.max(ix_min);
+            let p_hi = pe.min(ix_max);
+            if p_lo >= p_hi {
+                continue;
+            }
+            let pat_row = iy * pat_w;
+            let mask_row = iy * mask_w;
+            let dst_base = (py - self.y0) * width + x0;
+            for span in mask_spans.row(iy) {
+                let s = (span.start as usize).max(p_lo);
+                let e = (span.end as usize).min(p_hi);
+                if s >= e {
+                    continue;
+                }
+                let dst_off = dst_base + (s - ix_min);
+                let len = e - s;
+                let px_start = (x0 + (s - ix_min)) as i32;
+                let pat_slice = &pat_px[pat_row + s..pat_row + e];
+                let mask_slice = &mask_px[mask_row + s..mask_row + e];
+                let dc = &mut self.color[dst_off..dst_off + len];
+                let dd = &mut self.depth[dst_off..dst_off + len];
+                let di = &mut self.ids[dst_off..dst_off + len];
+                for i in 0..len {
+                    let p = pat_slice[i];
+                    let pa = p[3];
+                    if pa < FAINT {
+                        continue;
+                    }
+                    let a = if span.all_opaque {
+                        pa
+                    } else {
+                        ((u16::from(pa) * u16::from(mask_slice[i][3])) / 255) as u8
+                    };
+                    if a < FAINT {
+                        continue;
+                    }
+                    let d = depth(px_start + i as i32, sy);
+                    if d > dd[i].saturating_add(1) {
+                        continue;
+                    }
+                    let rgb = light(s + i, iy).apply_with(lt, [p[0], p[1], p[2]]);
+                    dd[i] = d.clamp(0, EMPTY);
+                    di[i] = pen;
+                    if a == 255 {
+                        dc[i] = rgb;
+                    } else {
+                        dc[i] = blend565_with(table, rgb, dc[i], a);
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn blit_depth_sprite_flat(
+        &mut self,
+        image: &Image,
+        spans: &RowSpans,
+        at: [i32; 2],
+        flip: bool,
+        light: Light,
+        slack: i32,
+        columns: Option<[i32; 2]>,
+        pen: Option<u16>,
+        depth: impl Fn(i32, i32, u8) -> Option<i32>,
+    ) {
+        let Some((x0, x1, ax, left_skip, _, _)) = clip_x(at[0], image.width, self.width, columns)
+        else {
+            return;
+        };
+        let (mut y0, mut y1, ay) = clip_span(at[1], image.height, self.height);
+        y0 = y0.max(self.y0);
+        y1 = y1.min(self.y1);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let width = self.width;
+        let img_w = image.width;
+        let rgba = image.rgba.as_chunks::<4>().0;
+        let depth_bytes = image.depth.as_deref();
+        let table = blend_table();
+        let lt = light::tables();
+        let light_rows = light.level().map(|l| (&lt.r[l], &lt.g[l], &lt.b[l]));
+        let ix_base = (x0 as i64 - ax) as usize + left_skip;
+        let ix_end = ix_base + (x1 - x0);
+        for py in y0..y1 {
+            let sy = py as i32;
+            let iy = (py as i64 - ay) as usize;
+            let row_spans = spans.row(iy);
+            if row_spans.is_empty() {
+                continue;
+            }
+            let src_row = iy * img_w;
+            let dst_base = (py - self.y0) * width + x0;
+            if !flip {
+                for span in row_spans {
+                    let s = (span.start as usize).max(ix_base);
+                    let e = (span.end as usize).min(ix_end);
+                    if s >= e {
+                        continue;
+                    }
+                    let dst_off = dst_base + (s - ix_base);
+                    let px_start = (x0 + (s - ix_base)) as i32;
+                    let len = e - s;
+                    let src_px = &rgba[src_row + s..src_row + e];
+                    let dc = &mut self.color[dst_off..dst_off + len];
+                    let dd = &mut self.depth[dst_off..dst_off + len];
+                    let di = &mut self.ids[dst_off..dst_off + len];
+                    if span.all_opaque {
+                        match light_rows {
+                            None => {
+                                for i in 0..len {
+                                    let byte = depth_bytes.map_or(255, |db| {
+                                        db.get(src_row + s + i).copied().unwrap_or(255)
+                                    });
+                                    let Some(d) = depth(px_start + i as i32, sy, byte) else {
+                                        continue;
+                                    };
+                                    if d > dd[i].saturating_add(slack) {
+                                        continue;
+                                    }
+                                    let px = src_px[i];
+                                    dd[i] = d.clamp(0, EMPTY);
+                                    di[i] = pen;
+                                    dc[i] = [px[0], px[1], px[2]];
+                                }
+                            }
+                            Some((tr, tg, tb)) => {
+                                for i in 0..len {
+                                    let byte = depth_bytes.map_or(255, |db| {
+                                        db.get(src_row + s + i).copied().unwrap_or(255)
+                                    });
+                                    let Some(d) = depth(px_start + i as i32, sy, byte) else {
+                                        continue;
+                                    };
+                                    if d > dd[i].saturating_add(slack) {
+                                        continue;
+                                    }
+                                    let px = src_px[i];
+                                    dd[i] = d.clamp(0, EMPTY);
+                                    di[i] = pen;
+                                    dc[i] = [
+                                        tr[usize::from(px[0] >> 3)],
+                                        tg[usize::from(px[1] >> 2)],
+                                        tb[usize::from(px[2] >> 3)],
+                                    ];
+                                }
+                            }
+                        }
+                    } else {
+                        for i in 0..len {
+                            let px = src_px[i];
+                            let a = px[3];
+                            if a < FAINT {
+                                continue;
+                            }
+                            let byte = depth_bytes
+                                .map_or(255, |db| db.get(src_row + s + i).copied().unwrap_or(255));
+                            let Some(d) = depth(px_start + i as i32, sy, byte) else {
+                                continue;
+                            };
+                            if d > dd[i].saturating_add(slack) {
+                                continue;
+                            }
+                            let rgb = match light_rows {
+                                None => [px[0], px[1], px[2]],
+                                Some((tr, tg, tb)) => [
+                                    tr[usize::from(px[0] >> 3)],
+                                    tg[usize::from(px[1] >> 2)],
+                                    tb[usize::from(px[2] >> 3)],
+                                ],
+                            };
+                            dd[i] = d.clamp(0, EMPTY);
+                            di[i] = pen;
+                            if a == 255 {
+                                dc[i] = rgb;
+                            } else {
+                                dc[i] = blend565_with(table, rgb, dc[i], a);
+                            }
+                        }
+                    }
+                }
+            } else {
+                for span in row_spans.iter().rev() {
+                    let fs = (img_w - span.end as usize).max(ix_base);
+                    let fe = (img_w - span.start as usize).min(ix_end);
+                    if fs >= fe {
+                        continue;
+                    }
+                    let dst_off = dst_base + (fs - ix_base);
+                    let px_start = (x0 + (fs - ix_base)) as i32;
+                    let len = fe - fs;
+                    let dc = &mut self.color[dst_off..dst_off + len];
+                    let dd = &mut self.depth[dst_off..dst_off + len];
+                    let di = &mut self.ids[dst_off..dst_off + len];
+                    for i in 0..len {
+                        let ix = img_w - 1 - (fs + i);
+                        let source = src_row + ix;
+                        let px = rgba[source];
+                        let a = px[3];
+                        if !span.all_opaque && a < FAINT {
+                            continue;
+                        }
+                        let byte =
+                            depth_bytes.map_or(255, |db| db.get(source).copied().unwrap_or(255));
+                        let Some(d) = depth(px_start + i as i32, sy, byte) else {
+                            continue;
+                        };
+                        if d > dd[i].saturating_add(slack) {
+                            continue;
+                        }
+                        let rgb = match light_rows {
+                            None => [px[0], px[1], px[2]],
+                            Some((tr, tg, tb)) => [
+                                tr[usize::from(px[0] >> 3)],
+                                tg[usize::from(px[1] >> 2)],
+                                tb[usize::from(px[2] >> 3)],
+                            ],
+                        };
+                        dd[i] = d.clamp(0, EMPTY);
+                        di[i] = pen;
+                        if span.all_opaque || a == 255 {
+                            dc[i] = rgb;
+                        } else {
+                            dc[i] = blend565_with(table, rgb, dc[i], a);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn blit_depth_sprite_tinted(
+        &mut self,
+        image: &Image,
+        spans: &RowSpans,
+        at: [i32; 2],
+        flip: bool,
+        slack: i32,
+        columns: Option<[i32; 2]>,
+        pen: Option<u16>,
+        depth: impl Fn(i32, i32, u8) -> Option<i32>,
+    ) {
+        let Some((x0, x1, ax, left_skip, _, _)) = clip_x(at[0], image.width, self.width, columns)
+        else {
+            return;
+        };
+        let (mut y0, mut y1, ay) = clip_span(at[1], image.height, self.height);
+        y0 = y0.max(self.y0);
+        y1 = y1.min(self.y1);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let width = self.width;
+        let img_w = image.width;
+        let rgba = image.rgba.as_chunks::<4>().0;
+        let depth_bytes = image.depth.as_deref();
+        let table = blend_table();
+        let ix_base = (x0 as i64 - ax) as usize + left_skip;
+        let ix_end = ix_base + (x1 - x0);
+        for py in y0..y1 {
+            let sy = py as i32;
+            let iy = (py as i64 - ay) as usize;
+            let row_spans = spans.row(iy);
+            if row_spans.is_empty() {
+                continue;
+            }
+            let src_row = iy * img_w;
+            let dst_base = (py - self.y0) * width + x0;
+            for span in row_spans {
+                let (fs, fe) = if flip {
+                    (
+                        (img_w - span.end as usize).max(ix_base),
+                        (img_w - span.start as usize).min(ix_end),
+                    )
+                } else {
+                    (
+                        (span.start as usize).max(ix_base),
+                        (span.end as usize).min(ix_end),
+                    )
+                };
+                if fs >= fe {
+                    continue;
+                }
+                let dst_off = dst_base + (fs - ix_base);
+                let px_start = (x0 + (fs - ix_base)) as i32;
+                let len = fe - fs;
+                let dc = &mut self.color[dst_off..dst_off + len];
+                let dd = &mut self.depth[dst_off..dst_off + len];
+                let di = &mut self.ids[dst_off..dst_off + len];
+                for i in 0..len {
+                    let ix = if flip { img_w - 1 - (fs + i) } else { fs + i };
+                    let source = src_row + ix;
+                    let px = rgba[source];
+                    let a = px[3];
+                    if !span.all_opaque && a < FAINT {
+                        continue;
+                    }
+                    let byte = depth_bytes.map_or(255, |db| db.get(source).copied().unwrap_or(255));
+                    let Some(d) = depth(px_start + i as i32, sy, byte) else {
+                        continue;
+                    };
+                    if d > dd[i].saturating_add(slack) {
+                        continue;
+                    }
+                    let rgb = tint_blocked([px[0], px[1], px[2]]);
+                    dd[i] = d.clamp(0, EMPTY);
+                    di[i] = pen;
+                    if span.all_opaque || a == 255 {
+                        dc[i] = rgb;
+                    } else {
+                        dc[i] = blend565_with(table, rgb, dc[i], a);
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn shade_mask(
+        &mut self,
+        mask: &crate::shadows::Mask,
+        at: [i32; 2],
+        strength: i32,
+        row_at_least: impl Fn(i32) -> i32,
+    ) {
+        if mask.width == 0 || mask.height == 0 {
+            return;
+        }
+        let (x0, x1, ax) = clip_span(at[0], mask.width, self.width);
+        let (mut y0, mut y1, ay) = clip_span(at[1], mask.height, self.height);
+        y0 = y0.max(self.y0);
+        y1 = y1.min(self.y1);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let width = self.width;
+        let lt = light::tables();
+        let mx_base = (x0 as i64 - ax) as usize;
+        let len = x1 - x0;
+        for py in y0..y1 {
+            let my = (py as i64 - ay) as usize;
+            let at_least = row_at_least(py as i32);
+            let dst_off = (py - self.y0) * width + x0;
+            let dst_depth = &self.depth[dst_off..dst_off + len];
+            let dst_color = &mut self.color[dst_off..dst_off + len];
+            for i in 0..len {
+                if let Some(s) = mask.shade(mx_base + i, my, strength)
+                    && dst_depth[i] >= at_least
+                {
+                    dst_color[i] = Light::from_sum(s).apply_with(lt, dst_color[i]);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

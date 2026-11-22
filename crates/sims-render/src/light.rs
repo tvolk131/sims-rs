@@ -31,13 +31,13 @@ use std::sync::OnceLock;
 /// Precomputed 5-6-5 lighting lookup tables matching the original's startup
 /// tables (`0x49eea8`): 32 light levels × (32 red, 64 green, 32 blue) levels,
 /// widened back to 8-bit channels.
-struct Tables {
-    r: [[u8; 32]; 32],
-    g: [[u8; 64]; 32],
-    b: [[u8; 32]; 32],
+pub(crate) struct Tables {
+    pub(crate) r: [[u8; 32]; 32],
+    pub(crate) g: [[u8; 64]; 32],
+    pub(crate) b: [[u8; 32]; 32],
 }
 
-fn tables() -> &'static Tables {
+pub(crate) fn tables() -> &'static Tables {
     static TABLES: OnceLock<Tables> = OnceLock::new();
     TABLES.get_or_init(|| {
         let mut t = Tables {
@@ -136,6 +136,25 @@ impl Light {
 
     pub fn is_full(self) -> bool {
         self == Self::FULL
+    }
+
+    /// Returns the 5-bit light table level (`0..32`), or `None` for [`Light::FULL`].
+    #[inline]
+    pub(crate) fn level(self) -> Option<usize> {
+        self.0.map(|l| usize::from(l).min(31))
+    }
+
+    /// Like [`Light::apply`] using a hoisted [`Tables`] reference.
+    #[inline]
+    pub(crate) fn apply_with(self, t: &Tables, [r, g, b]: [u8; 3]) -> [u8; 3] {
+        let Some(l) = self.level() else {
+            return [r, g, b];
+        };
+        [
+            t.r[l][usize::from(r >> 3)],
+            t.g[l][usize::from(g >> 2)],
+            t.b[l][usize::from(b >> 3)],
+        ]
     }
 
     /// A color under this light. Full light leaves it as it is; any other

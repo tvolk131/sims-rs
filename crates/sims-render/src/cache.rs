@@ -366,6 +366,11 @@ impl LotCache {
         self.last_hit
     }
 
+    /// Read-only view of the Tier-2 cached lot depth buffer, if populated.
+    pub fn cached_depth(&self) -> Option<&[i32]> {
+        self.entry.as_ref().map(|e| e.canvas.depth.as_slice())
+    }
+
     /// Draws `Pass::Lot` into `canvas`, returning the exact [`Stats`] of
     /// [`crate::draw_lot_with_preview`]. On a Tier-2 hit, restores the full
     /// cached surface via fast slice copies; on a Tier-1 hit (only object state

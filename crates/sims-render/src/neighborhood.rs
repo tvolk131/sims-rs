@@ -29,17 +29,19 @@
 //! and color-key silhouette hit-testing (`0x5e4071` -> `0x5dd79a`) operate on
 //! CPU surfaces and write directly into [`Canvas`].
 
-use crate::canvas::{Canvas, blend565, quantize565};
+use crate::canvas::{Canvas, blend_table, quantize565};
 use crate::{Error, Result};
 use sims_content::Install;
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
 use sims_formats::bitmap::{self, Image as BitmapImage};
 use sims_formats::iff::DELETED as IFF_DELETED;
 use sims_formats::strings::{Format as StringTableFormat, StringTable, TextEntry};
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Native map backdrop width in pixels (`0x320`).
 pub const MAP_WIDTH: u32 = 800;
@@ -620,7 +622,7 @@ pub struct RenderOptions {
     /// Cross-fade factor in `0.0..=1.0` for [`Self::hovered_lot`]: `0.0` draws
     /// the roof-on `normal` cell, `1.0` draws the roofs-off cutaway (or
     /// vacation-badged) cell, and intermediate values blend in 5-6-5 via
-    /// [`blend565`] (`0x54ee52..0x54f120`). Defaults to `1.0` for backwards
+    /// [`crate::canvas::blend565`] (`0x54ee52..0x54f120`). Defaults to `1.0` for backwards
     /// compatibility with callers that toggle hover without animating.
     pub hover_roof_fade: f32,
     /// Per-lot roof fade overrides (`lot_id -> 0.0..=1.0`). Used by
@@ -871,6 +873,129 @@ fn effective_vacation_fade(lot_id: u16, options: &RenderOptions) -> f32 {
     }
 }
 
+const MAX_HIGHLIGHT_CACHE_ENTRIES: usize = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SurfaceFingerprint {
+    width: usize,
+    height: usize,
+    len: usize,
+    hash: u64,
+}
+
+fn fingerprint_surface(surface: &Surface565) -> SurfaceFingerprint {
+    const K: u64 = 0x517c_c1b7_2722_0a95;
+    let mut h0 = 0x9e37_79b9_7f4a_7c15u64 ^ (surface.width as u64);
+    let mut h1 = 0xbf58_476d_1ce4_e5b9u64 ^ (surface.height as u64);
+    let mut h2 = 0x94d0_49bb_1331_11ebu64 ^ (surface.pixels.len() as u64);
+    let mut h3 = 0xd6e8_feb8_6659_fd93u64;
+    let (chunks, rem) = surface.pixels.as_chunks::<16>();
+    for chunk in chunks {
+        let w0 = u64::from(chunk[0])
+            | (u64::from(chunk[1]) << 16)
+            | (u64::from(chunk[2]) << 32)
+            | (u64::from(chunk[3]) << 48);
+        let w1 = u64::from(chunk[4])
+            | (u64::from(chunk[5]) << 16)
+            | (u64::from(chunk[6]) << 32)
+            | (u64::from(chunk[7]) << 48);
+        let w2 = u64::from(chunk[8])
+            | (u64::from(chunk[9]) << 16)
+            | (u64::from(chunk[10]) << 32)
+            | (u64::from(chunk[11]) << 48);
+        let w3 = u64::from(chunk[12])
+            | (u64::from(chunk[13]) << 16)
+            | (u64::from(chunk[14]) << 32)
+            | (u64::from(chunk[15]) << 48);
+        h0 = (h0 ^ w0).wrapping_mul(K).rotate_left(27);
+        h1 = (h1 ^ w1).wrapping_mul(K).rotate_left(27);
+        h2 = (h2 ^ w2).wrapping_mul(K).rotate_left(27);
+        h3 = (h3 ^ w3).wrapping_mul(K).rotate_left(27);
+    }
+    let mut hash = h0 ^ h1.rotate_left(13) ^ h2.rotate_left(29) ^ h3.rotate_left(47);
+    for &p in rem {
+        hash = (hash ^ u64::from(p)).wrapping_mul(K).rotate_left(11);
+    }
+    SurfaceFingerprint {
+        width: surface.width,
+        height: surface.height,
+        len: surface.pixels.len(),
+        hash,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StaticLotKey {
+    index: usize,
+    id: u16,
+    cell_origin: [i32; 2],
+    highlight_565: Option<u16>,
+    normal_fp: SurfaceFingerprint,
+    cutaway_fp: Option<SurfaceFingerprint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BaseLayerKey {
+    viewport: [u32; 2],
+    kind: NeighborhoodKind,
+    opaque_overlays: bool,
+    large_frame_fp: Option<SurfaceFingerprint>,
+    backdrop_fp: SurfaceFingerprint,
+    pre_lot_wave_fp: Option<SurfaceFingerprint>,
+    static_lots: Vec<StaticLotKey>,
+}
+
+struct CachedBaseLayer {
+    key: BaseLayerKey,
+    canvas: Canvas,
+}
+
+struct CachedHighlight {
+    normal_fp: SurfaceFingerprint,
+    cutaway_fp: Option<SurfaceFingerprint>,
+    surface: Arc<Surface565>,
+}
+
+#[derive(Default)]
+struct NeighborhoodRenderCache {
+    base: Option<CachedBaseLayer>,
+    highlights: BTreeMap<(u16, bool, u16), CachedHighlight>,
+}
+
+/// Interior-mutable render cache slot for [`NeighborhoodMap`]. Cloning a map
+/// starts with an empty cache so clones never contend on a shared mutex.
+#[derive(Default)]
+struct RenderCacheSlot(Mutex<NeighborhoodRenderCache>);
+
+impl Clone for RenderCacheSlot {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl fmt::Debug for RenderCacheSlot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RenderCacheSlot(..)")
+    }
+}
+
+enum ResolvedSurface<'a> {
+    Borrowed(&'a Surface565),
+    Cached(Arc<Surface565>),
+}
+
+impl Deref for ResolvedSurface<'_> {
+    type Target = Surface565;
+
+    #[inline]
+    fn deref(&self) -> &Surface565 {
+        match self {
+            Self::Borrowed(s) => s,
+            Self::Cached(s) => s,
+        }
+    }
+}
+
 /// Loaded neighborhood map screen ready to render and hit-test.
 #[derive(Debug, Clone)]
 pub struct NeighborhoodMap {
@@ -892,6 +1017,7 @@ pub struct NeighborhoodMap {
     pub filter_badges: BTreeMap<CommunityFilter, Surface565>,
     /// Lots in exact back-to-front draw order (`hit_test` scans in reverse).
     pub lots: Vec<MapLot>,
+    render_cache: RenderCacheSlot,
 }
 
 impl NeighborhoodMap {
@@ -1105,6 +1231,7 @@ impl NeighborhoodMap {
             vacation_no_vacancy,
             filter_badges,
             lots,
+            render_cache: RenderCacheSlot::default(),
         })
     }
 
@@ -1235,6 +1362,192 @@ impl NeighborhoodMap {
     /// [`Canvas::id_at`] agrees with [`Self::hit_test_with_options`] inside
     /// the clipped `800×600` lot rectangle from the centered backdrop origin.
     pub fn render_into(&self, canvas: &mut Canvas, options: &RenderOptions) {
+        if canvas.width == 0 || canvas.height == 0 || !canvas.has_pixel_storage() {
+            self.render_into_uncached(canvas, options);
+            return;
+        }
+
+        let viewport = [canvas.width as u32, canvas.height as u32];
+        let origin = self.map_origin_for(viewport);
+        let full_clip = [0, 0, canvas.width as i32, canvas.height as i32];
+        let backdrop_clip = self.backdrop_clip_for(viewport);
+        let map_clip = self.lot_clip_for(viewport);
+        let overlay_keyed = !self.opaque_overlays;
+
+        // Partition lots into static base-layer lots and dynamic lots.
+        // Any lot that is hovered, fading, or badged is dynamic, AND any later
+        // lot in Z-order whose clipped screen bounds overlap an earlier dynamic
+        // lot is also marked dynamic so both Z-order and overhanging-roof
+        // backdrop cross-fading remain 100% bit-exact.
+        let mut excluded = vec![false; self.lots.len()];
+        let mut excluded_rects: Vec<[i64; 4]> = Vec::new();
+        let clip_x0 = i64::from(map_clip[0]).clamp(0, canvas.width as i64);
+        let clip_y0 = i64::from(map_clip[1]).clamp(0, canvas.height as i64);
+        let clip_x1 = i64::from(map_clip[2]).clamp(clip_x0, canvas.width as i64);
+        let clip_y1 = i64::from(map_clip[3]).clamp(clip_y0, canvas.height as i64);
+        for (i, lot) in self.lots.iter().enumerate() {
+            let max_w = lot
+                .normal
+                .width
+                .max(lot.roofs_off.as_ref().map_or(0, |s| s.width))
+                .max(lot.vacation_badged.as_ref().map_or(0, |s| s.width));
+            let max_h = lot
+                .normal
+                .height
+                .max(lot.roofs_off.as_ref().map_or(0, |s| s.height))
+                .max(lot.vacation_badged.as_ref().map_or(0, |s| s.height));
+            let ax = i64::from(origin[0].saturating_add(lot.cell_origin[0]));
+            let ay = i64::from(origin[1].saturating_add(lot.cell_origin[1]));
+            let rx0 = ax.clamp(clip_x0, clip_x1);
+            let ry0 = ay.clamp(clip_y0, clip_y1);
+            let rx1 = ax.saturating_add(max_w as i64).clamp(rx0, clip_x1);
+            let ry1 = ay.saturating_add(max_h as i64).clamp(ry0, clip_y1);
+            let non_empty = rx0 < rx1 && ry0 < ry1;
+
+            let inherently_dynamic = options.hovered_lot == Some(lot.id)
+                || options
+                    .lot_roof_fades
+                    .get(&lot.id)
+                    .is_some_and(|&f| (fade_to_alpha(f) >> 3) > 0)
+                || self.vacation_badged_for_draw(lot, options).is_some();
+
+            let overlaps_dynamic = non_empty
+                && excluded_rects
+                    .iter()
+                    .any(|r| rx0 < r[2] && r[0] < rx1 && ry0 < r[3] && r[1] < ry1);
+
+            if inherently_dynamic || overlaps_dynamic {
+                excluded[i] = true;
+                if non_empty {
+                    excluded_rects.push([rx0, ry0, rx1, ry1]);
+                }
+            }
+        }
+
+        let pre_lot_wave = if !self.kind.waves_draw_after_lots() {
+            options
+                .water_frame
+                .and_then(|frame_idx| self.wave_for_frame(frame_idx))
+        } else {
+            None
+        };
+
+        let mut static_lots = Vec::with_capacity(self.lots.len());
+        for (index, lot) in self.lots.iter().enumerate() {
+            if excluded[index] {
+                continue;
+            }
+            let highlight_565 = self.highlight_rgb_for(lot, options).map(pack_565);
+            static_lots.push(StaticLotKey {
+                index,
+                id: lot.id,
+                cell_origin: lot.cell_origin,
+                highlight_565,
+                normal_fp: fingerprint_surface(&lot.normal),
+                cutaway_fp: highlight_565
+                    .and_then(|_| lot.roofs_off.as_ref().map(fingerprint_surface)),
+            });
+        }
+
+        let base_key = BaseLayerKey {
+            viewport,
+            kind: self.kind,
+            opaque_overlays: self.opaque_overlays,
+            large_frame_fp: (viewport[0] > MAP_WIDTH)
+                .then(|| self.large_frame.as_ref().map(fingerprint_surface))
+                .flatten(),
+            backdrop_fp: fingerprint_surface(&self.backdrop),
+            pre_lot_wave_fp: pre_lot_wave.map(fingerprint_surface),
+            static_lots,
+        };
+
+        let mut hit = false;
+        {
+            let guard = self
+                .render_cache
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(cached) = &guard.base
+                && cached.key == base_key
+            {
+                canvas.restore_pixels_from(&cached.canvas, [0, 0, 0]);
+                hit = true;
+            }
+        }
+
+        if !hit {
+            canvas.clear([0, 0, 0]);
+            canvas.set_id(None);
+
+            // 1. 1024×768 outer frame only when viewport width exceeds 800
+            //    (`cmp eax, 0x320; jle` at 0x556d89, 0x569025).
+            if viewport[0] > MAP_WIDTH
+                && let Some(frame) = &self.large_frame
+            {
+                blit_surface_to_canvas(canvas, frame, [0, 0], full_clip, false, None);
+            }
+
+            // 2. Map backdrop at centered origin (0x556db7..0x556ddc, 0x568fa7..0x568fe6).
+            blit_surface_to_canvas(canvas, &self.backdrop, origin, backdrop_clip, false, None);
+
+            // 3. Pre-lot water wave overlay.
+            if let Some(wave) = pre_lot_wave {
+                if self.kind == NeighborhoodKind::Classic {
+                    blit_surface_stretched_to_canvas(
+                        canvas,
+                        wave,
+                        origin,
+                        [self.backdrop.width, self.backdrop.height],
+                        full_clip,
+                        overlay_keyed,
+                    );
+                } else {
+                    let [wx, wy] = self.kind.wave_offset();
+                    let at = [origin[0].saturating_add(wx), origin[1].saturating_add(wy)];
+                    blit_surface_to_canvas(canvas, wave, at, full_clip, overlay_keyed, None);
+                }
+            }
+
+            // 4a. Static lots baked into the reusable base layer.
+            for (i, lot) in self.lots.iter().enumerate() {
+                if excluded[i] {
+                    continue;
+                }
+                self.draw_lot_to_canvas(canvas, lot, options, origin, map_clip);
+            }
+
+            canvas.set_id(None);
+            let mut guard = self
+                .render_cache
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut snap = guard
+                .base
+                .take()
+                .map(|b| b.canvas)
+                .unwrap_or_else(|| Canvas::new(canvas.width, canvas.height, [0, 0, 0]));
+            snap.snapshot_pixels_from(canvas);
+            guard.base = Some(CachedBaseLayer {
+                key: base_key,
+                canvas: snap,
+            });
+        }
+
+        // 4b. Dynamic lots (hovered, fading, badged, and overlapping later Z-order lots).
+        for (i, lot) in self.lots.iter().enumerate() {
+            if !excluded[i] {
+                continue;
+            }
+            self.draw_lot_to_canvas(canvas, lot, options, origin, map_clip);
+        }
+
+        self.render_post_lot_overlays(canvas, options, origin, full_clip, map_clip, overlay_keyed);
+        canvas.set_id(None);
+    }
+
+    fn render_into_uncached(&self, canvas: &mut Canvas, options: &RenderOptions) {
         let viewport = [canvas.width as u32, canvas.height as u32];
         let origin = self.map_origin_for(viewport);
         let full_clip = [0, 0, canvas.width as i32, canvas.height as i32];
@@ -1245,23 +1558,14 @@ impl NeighborhoodMap {
         canvas.clear([0, 0, 0]);
         canvas.set_id(None);
 
-        // 1. 1024×768 outer frame only when viewport width exceeds 800
-        //    (`cmp eax, 0x320; jle` at 0x556d89, 0x569025).
         if viewport[0] > MAP_WIDTH
             && let Some(frame) = &self.large_frame
         {
             blit_surface_to_canvas(canvas, frame, [0, 0], full_clip, false, None);
         }
 
-        // 2. Map backdrop at centered origin (0x556db7..0x556ddc, 0x568fa7..0x568fe6).
         blit_surface_to_canvas(canvas, &self.backdrop, origin, backdrop_clip, false, None);
 
-        // 3. Pre-lot water wave overlay:
-        //    - Classic (0x55f95f..0x55f98a -> cRZGraphic::Blt 0x5def36 ->
-        //      DirectDraw Blt 0x605091) crops dst & src 1:1 against the canvas
-        //      and stretches the remaining source rect into the clipped backdrop rect.
-        //    - Unleashed (0x5570c1, 0x557e87) blits 1:1 at origin with a null clip,
-        //      retaining the last valid frame if a custom slot is absent.
         if !self.kind.waves_draw_after_lots()
             && let Some(frame_idx) = options.water_frame
             && let Some(wave) = self.wave_for_frame(frame_idx)
@@ -1282,51 +1586,73 @@ impl NeighborhoodMap {
             }
         }
 
-        // 4. Lots in back-to-front Z-order, clipped strictly to the 800×600 rect
-        //    at `origin` (cWinLot + 0x230..0x240, 0x5571e4..0x557201, 0x56928b..0x56929a).
         for lot in &self.lots {
-            let draw_at = [
-                origin[0].saturating_add(lot.cell_origin[0]),
-                origin[1].saturating_add(lot.cell_origin[1]),
-            ];
-            if let Some((badged, alpha)) = self.vacation_badged_for_draw(lot, options) {
-                // 0x54ec5a: native draws (or cross-fades) [esi + 0x264] directly
-                // without applying highlight; picking (0x5e40b4) still tests the
-                // regular thumbnail [esi + 0xd8], so record pick IDs from the
-                // regular pick surface(s).
-                if (alpha >> 3) >= 31 {
-                    blit_color_only(canvas, badged, draw_at, map_clip);
-                } else {
-                    let from = self.resolved_pick_surface_for(lot, options, false);
-                    blit_crossfade_to_canvas(canvas, &from, badged, draw_at, map_clip, alpha, None);
-                }
-                self.mark_lot_pick_ids(canvas, lot, options, draw_at, map_clip);
-            } else {
-                let fade = effective_roof_fade(lot.id, options);
-                let alpha = fade_to_alpha(fade);
-                let a5 = alpha >> 3;
-                if a5 == 0 || lot.roofs_off.is_none() {
-                    let surface = self.resolved_pick_surface_for(lot, options, false);
-                    blit_surface_to_canvas(canvas, &surface, draw_at, map_clip, true, Some(lot.id));
-                } else if a5 >= 31 {
-                    let surface = self.resolved_pick_surface_for(lot, options, true);
-                    blit_surface_to_canvas(canvas, &surface, draw_at, map_clip, true, Some(lot.id));
-                } else {
-                    let from = self.resolved_pick_surface_for(lot, options, false);
-                    let to = self.resolved_pick_surface_for(lot, options, true);
-                    blit_crossfade_to_canvas(
-                        canvas,
-                        &from,
-                        &to,
-                        draw_at,
-                        map_clip,
-                        alpha,
-                        Some(lot.id),
-                    );
-                }
-            }
+            self.draw_lot_to_canvas(canvas, lot, options, origin, map_clip);
         }
 
+        self.render_post_lot_overlays(canvas, options, origin, full_clip, map_clip, overlay_keyed);
+        canvas.set_id(None);
+    }
+
+    fn draw_lot_to_canvas(
+        &self,
+        canvas: &mut Canvas,
+        lot: &MapLot,
+        options: &RenderOptions,
+        origin: [i32; 2],
+        map_clip: [i32; 4],
+    ) {
+        let draw_at = [
+            origin[0].saturating_add(lot.cell_origin[0]),
+            origin[1].saturating_add(lot.cell_origin[1]),
+        ];
+        if let Some((badged, alpha)) = self.vacation_badged_for_draw(lot, options) {
+            // 0x54ec5a: native draws (or cross-fades) [esi + 0x264] directly
+            // without applying highlight; picking (0x5e40b4) still tests the
+            // regular thumbnail [esi + 0xd8], so record pick IDs from the
+            // regular pick surface(s).
+            if (alpha >> 3) >= 31 {
+                blit_color_only(canvas, badged, draw_at, map_clip);
+            } else {
+                let from = self.resolved_pick_surface_for(lot, options, false);
+                blit_crossfade_to_canvas(canvas, &from, badged, draw_at, map_clip, alpha, None);
+            }
+            self.mark_lot_pick_ids(canvas, lot, options, draw_at, map_clip);
+        } else {
+            let fade = effective_roof_fade(lot.id, options);
+            let alpha = fade_to_alpha(fade);
+            let a5 = alpha >> 3;
+            if a5 == 0 || lot.roofs_off.is_none() {
+                let surface = self.resolved_pick_surface_for(lot, options, false);
+                blit_surface_to_canvas(canvas, &surface, draw_at, map_clip, true, Some(lot.id));
+            } else if a5 >= 31 {
+                let surface = self.resolved_pick_surface_for(lot, options, true);
+                blit_surface_to_canvas(canvas, &surface, draw_at, map_clip, true, Some(lot.id));
+            } else {
+                let from = self.resolved_pick_surface_for(lot, options, false);
+                let to = self.resolved_pick_surface_for(lot, options, true);
+                blit_crossfade_to_canvas(
+                    canvas,
+                    &from,
+                    &to,
+                    draw_at,
+                    map_clip,
+                    alpha,
+                    Some(lot.id),
+                );
+            }
+        }
+    }
+
+    fn render_post_lot_overlays(
+        &self,
+        canvas: &mut Canvas,
+        options: &RenderOptions,
+        origin: [i32; 2],
+        full_clip: [i32; 4],
+        map_clip: [i32; 4],
+        overlay_keyed: bool,
+    ) {
         // 5. Vacation Island foreground port & trees overlays (5442, 5443)
         //    at 0x56bac8..0x56bb5d: drawn only when BOTH port and trees are
         //    present, using each overlay's own dimensions with a null clip
@@ -1404,8 +1730,6 @@ impl NeighborhoodMap {
                 }
             }
         }
-
-        canvas.set_id(None);
     }
 
     /// Exact native silhouette hit-test (`0x5e4071` -> `0x5dd79a`) at screen
@@ -1570,10 +1894,46 @@ impl NeighborhoodMap {
         lot: &'a MapLot,
         options: &RenderOptions,
         show_cutaway: bool,
-    ) -> Cow<'a, Surface565> {
+    ) -> ResolvedSurface<'a> {
         match self.highlight_rgb_for(lot, options) {
-            Some(rgb) => Cow::Owned(highlight_lot_cell(lot, show_cutaway, rgb)),
-            None => Cow::Borrowed(lot.active_surface(show_cutaway)),
+            Some(rgb) => {
+                let outline_565 = pack_565(rgb);
+                let normal_fp = fingerprint_surface(&lot.normal);
+                let cutaway_fp = lot.roofs_off.as_ref().map(fingerprint_surface);
+                let key = (lot.id, show_cutaway, outline_565);
+                {
+                    let guard = self
+                        .render_cache
+                        .0
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if let Some(entry) = guard.highlights.get(&key)
+                        && entry.normal_fp == normal_fp
+                        && entry.cutaway_fp == cutaway_fp
+                    {
+                        return ResolvedSurface::Cached(Arc::clone(&entry.surface));
+                    }
+                }
+                let built = Arc::new(highlight_lot_cell(lot, show_cutaway, rgb));
+                let mut guard = self
+                    .render_cache
+                    .0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if guard.highlights.len() >= MAX_HIGHLIGHT_CACHE_ENTRIES {
+                    guard.highlights.clear();
+                }
+                guard.highlights.insert(
+                    key,
+                    CachedHighlight {
+                        normal_fp,
+                        cutaway_fp,
+                        surface: Arc::clone(&built),
+                    },
+                );
+                ResolvedSurface::Cached(built)
+            }
+            None => ResolvedSurface::Borrowed(lot.active_surface(show_cutaway)),
         }
     }
 }
@@ -1818,9 +2178,21 @@ fn reflect_index(mut k: i32, len: usize) -> usize {
     k as usize
 }
 
-/// Native YIQ luminance adjustment (`0x49bbfe`) used by `cWinLot::Highlight`
-/// (`0x54f42d..0x54f456`).
-pub fn brighten_565(pixel: u16, y_scale: f32, y_offset: f32) -> u16 {
+static BRIGHTEN_HIGHLIGHT_LUT: OnceLock<Box<[u16; 65536]>> = OnceLock::new();
+
+fn brighten_highlight_lut() -> &'static [u16; 65536] {
+    BRIGHTEN_HIGHLIGHT_LUT.get_or_init(|| {
+        let mut table = vec![0u16; 65536].into_boxed_slice();
+        for (i, slot) in table.iter_mut().enumerate() {
+            *slot = brighten_565_uncached(i as u16, 1.0, HIGHLIGHT_Y_OFFSET);
+        }
+        table
+            .try_into()
+            .expect("brighten highlight LUT length is 65536")
+    })
+}
+
+fn brighten_565_uncached(pixel: u16, y_scale: f32, y_offset: f32) -> u16 {
     let [r8, g8, b8] = unpack_565_top(pixel);
     let inv255 = f32::from_bits(0x3b80_8081); // [0x667664] = 1.0 / 255.0
     let rf = f64::from(f32::from(r8) * inv255);
@@ -1852,12 +2224,23 @@ pub fn brighten_565(pixel: u16, y_scale: f32, y_offset: f32) -> u16 {
     ])
 }
 
+/// Native YIQ luminance adjustment (`0x49bbfe`) used by `cWinLot::Highlight`
+/// (`0x54f42d..0x54f456`).
+pub fn brighten_565(pixel: u16, y_scale: f32, y_offset: f32) -> u16 {
+    if y_scale.to_bits() == 1.0f32.to_bits() && y_offset.to_bits() == HIGHLIGHT_Y_OFFSET.to_bits() {
+        brighten_highlight_lut()[usize::from(pixel)]
+    } else {
+        brighten_565_uncached(pixel, y_scale, y_offset)
+    }
+}
+
 fn highlight_row_in_place(row: &mut [u16], outline_565: u16) {
+    let lut = brighten_highlight_lut();
     let w = row.len();
     for x in 0..w {
         let p = row[x];
         if p != COLOR_KEY_565 {
-            row[x] = brighten_565(p, 1.0, HIGHLIGHT_Y_OFFSET);
+            row[x] = lut[usize::from(p)];
         } else {
             if x + 1 < w && row[x + 1] != COLOR_KEY_565 {
                 row[x + 1] = outline_565;
@@ -3779,6 +4162,61 @@ fn jpeg_idct_8x8(block: &[i32; 64]) -> [u8; 64] {
     out
 }
 
+#[inline(always)]
+fn widen_blend5(r5: u8, g5: u8, b5: u8) -> [u8; 3] {
+    let g6 = g5 << 1;
+    [
+        (r5 << 3) | (r5 >> 2),
+        (g6 << 2) | (g6 >> 4),
+        (b5 << 3) | (b5 >> 2),
+    ]
+}
+
+#[inline(always)]
+fn blend_565_pair(table: &[u8; 32768], row_a5: usize, fg: u16, bg: u16) -> [u8; 3] {
+    let sr = usize::from((fg >> 11) & 0x1f);
+    let sg = usize::from((fg >> 6) & 0x1f);
+    let sb = usize::from(fg & 0x1f);
+    let dr = usize::from((bg >> 11) & 0x1f);
+    let dg = usize::from((bg >> 6) & 0x1f);
+    let db = usize::from(bg & 0x1f);
+    widen_blend5(
+        table[row_a5 | (sr << 5) | dr],
+        table[row_a5 | (sg << 5) | dg],
+        table[row_a5 | (sb << 5) | db],
+    )
+}
+
+#[inline(always)]
+fn blend_rgb_over_565(table: &[u8; 32768], row_a5: usize, fg: [u8; 3], bg: u16) -> [u8; 3] {
+    let sr = usize::from(fg[0] >> 3);
+    let sg = usize::from(fg[1] >> 3);
+    let sb = usize::from(fg[2] >> 3);
+    let dr = usize::from((bg >> 11) & 0x1f);
+    let dg = usize::from((bg >> 6) & 0x1f);
+    let db = usize::from(bg & 0x1f);
+    widen_blend5(
+        table[row_a5 | (sr << 5) | dr],
+        table[row_a5 | (sg << 5) | dg],
+        table[row_a5 | (sb << 5) | db],
+    )
+}
+
+#[inline(always)]
+fn blend_565_over_rgb(table: &[u8; 32768], row_a5: usize, fg: u16, bg: [u8; 3]) -> [u8; 3] {
+    let sr = usize::from((fg >> 11) & 0x1f);
+    let sg = usize::from((fg >> 6) & 0x1f);
+    let sb = usize::from(fg & 0x1f);
+    let dr = usize::from(bg[0] >> 3);
+    let dg = usize::from(bg[1] >> 3);
+    let db = usize::from(bg[2] >> 3);
+    widen_blend5(
+        table[row_a5 | (sr << 5) | dr],
+        table[row_a5 | (sg << 5) | dg],
+        table[row_a5 | (sb << 5) | db],
+    )
+}
+
 fn blit_surface_to_canvas(
     canvas: &mut Canvas,
     surface: &Surface565,
@@ -3805,24 +4243,55 @@ fn blit_surface_to_canvas(
     let y1 = ay.saturating_add(surface.height as i64).clamp(y0, clip_y1);
 
     canvas.set_id(lot_id);
-    for py in y0..y1 {
-        let sy = (py - ay) as usize;
-        let row = &surface.pixels[sy * surface.width..(sy + 1) * surface.width];
-        for px in x0..x1 {
-            let sx = (px - ax) as usize;
-            let pixel = row[sx];
-            if keyed && pixel == COLOR_KEY_565 {
-                continue;
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let sx0 = (x0 - ax) as usize;
+    let span = (x1 - x0) as usize;
+    if canvas.has_pixel_storage() {
+        let x0_u = x0 as usize;
+        let x1_u = x1 as usize;
+        for py in y0..y1 {
+            let sy = (py - ay) as usize;
+            let src_row =
+                &surface.pixels[sy * surface.width + sx0..sy * surface.width + sx0 + span];
+            let (dst_color, dst_depth, dst_ids) = canvas.row_slices_mut(py as usize, x0_u, x1_u);
+            if !keyed {
+                for (dst, &pixel) in dst_color.iter_mut().zip(src_row) {
+                    *dst = widen_565(pixel);
+                }
+                dst_depth.fill(0);
+                dst_ids.fill(lot_id);
+            } else {
+                for (i, &pixel) in src_row.iter().enumerate() {
+                    if pixel != COLOR_KEY_565 {
+                        dst_color[i] = widen_565(pixel);
+                        dst_depth[i] = 0;
+                        dst_ids[i] = lot_id;
+                    }
+                }
             }
-            let rgb = widen_565(pixel);
-            canvas.plot(px as i32, py as i32, 0, rgb);
+        }
+    } else {
+        for py in y0..y1 {
+            let sy = (py - ay) as usize;
+            let row = &surface.pixels[sy * surface.width..(sy + 1) * surface.width];
+            for px in x0..x1 {
+                let sx = (px - ax) as usize;
+                let pixel = row[sx];
+                if keyed && pixel == COLOR_KEY_565 {
+                    continue;
+                }
+                let rgb = widen_565(pixel);
+                canvas.plot(px as i32, py as i32, 0, rgb);
+            }
         }
     }
 }
 
 /// Cross-fades `from` (roof-on `normal`) toward `to` (`roofs_off` or
 /// `vacation_badged`) at 8-bit `alpha` (`0..=255`) using the original's 5-6-5
-/// blend LUT (`0x6e5eac` via [`blend565`]) and backdrop substitution when one
+/// blend LUT (`0x6e5eac` via [`crate::canvas::blend565`]) and backdrop substitution when one
 /// side is [`COLOR_KEY_565`] (`0x54ef8b..0x54f120`).
 fn blit_crossfade_to_canvas(
     canvas: &mut Canvas,
@@ -3880,41 +4349,111 @@ fn blit_crossfade_to_canvas(
     if lot_id.is_some() {
         canvas.set_id(lot_id);
     }
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let table = blend_table();
+    let row_a5 = usize::from(a5) << 10;
+    let sx0 = (x0 - ax) as usize;
+    let span = (x1 - x0) as usize;
+    let x0_u = x0 as usize;
+    let x1_u = x1 as usize;
+    let has_storage = canvas.has_pixel_storage();
+
     for py in y0..y1 {
         let sy = (py - ay) as usize;
         let from_row = (from_valid && sy < from.height)
             .then(|| &from.pixels[sy * from.width..(sy + 1) * from.width]);
         let to_row =
             (to_valid && sy < to.height).then(|| &to.pixels[sy * to.width..(sy + 1) * to.width]);
-        let canvas_row = py as usize * canvas.width;
-        for px in x0..x1 {
-            let sx = (px - ax) as usize;
-            let p_from = from_row
-                .and_then(|r| r.get(sx).copied())
-                .unwrap_or(COLOR_KEY_565);
-            let p_to = to_row
-                .and_then(|r| r.get(sx).copied())
-                .unwrap_or(COLOR_KEY_565);
-            let rgb = match (p_from == COLOR_KEY_565, p_to == COLOR_KEY_565) {
-                (true, true) => continue,
-                (false, false) => blend565(widen_565(p_to), widen_565(p_from), alpha),
-                // Overhanging roof pixel (present in `from`, keyed in `to`):
-                // substitute the backdrop pixel for `to` (`0x54ef8b..0x54f120`).
-                (false, true) => {
-                    let bg = canvas.color[canvas_row + px as usize];
-                    blend565(bg, widen_565(p_from), alpha)
+        if has_storage {
+            let (dst_color, dst_depth, dst_ids) = canvas.row_slices_mut(py as usize, x0_u, x1_u);
+            if let (Some(fr), Some(tr)) = (from_row, to_row)
+                && sx0 + span <= fr.len()
+                && sx0 + span <= tr.len()
+            {
+                let fr = &fr[sx0..sx0 + span];
+                let tr = &tr[sx0..sx0 + span];
+                if lot_id.is_some() {
+                    for i in 0..span {
+                        let p_from = fr[i];
+                        let p_to = tr[i];
+                        let rgb = match (p_from == COLOR_KEY_565, p_to == COLOR_KEY_565) {
+                            (true, true) => continue,
+                            (false, false) => blend_565_pair(table, row_a5, p_to, p_from),
+                            (false, true) => {
+                                blend_rgb_over_565(table, row_a5, dst_color[i], p_from)
+                            }
+                            (true, false) => blend_565_over_rgb(table, row_a5, p_to, dst_color[i]),
+                        };
+                        dst_color[i] = rgb;
+                        dst_depth[i] = 0;
+                        dst_ids[i] = lot_id;
+                    }
+                } else {
+                    for i in 0..span {
+                        let p_from = fr[i];
+                        let p_to = tr[i];
+                        let rgb = match (p_from == COLOR_KEY_565, p_to == COLOR_KEY_565) {
+                            (true, true) => continue,
+                            (false, false) => blend_565_pair(table, row_a5, p_to, p_from),
+                            (false, true) => {
+                                blend_rgb_over_565(table, row_a5, dst_color[i], p_from)
+                            }
+                            (true, false) => blend_565_over_rgb(table, row_a5, p_to, dst_color[i]),
+                        };
+                        dst_color[i] = rgb;
+                    }
                 }
-                // Newly exposed interior/badge pixel (keyed in `from`, present in `to`):
-                // fade in from the underlying backdrop pixel.
-                (true, false) => {
-                    let bg = canvas.color[canvas_row + px as usize];
-                    blend565(widen_565(p_to), bg, alpha)
+                continue;
+            }
+            for i in 0..span {
+                let sx = sx0 + i;
+                let p_from = from_row
+                    .and_then(|r| r.get(sx).copied())
+                    .unwrap_or(COLOR_KEY_565);
+                let p_to = to_row
+                    .and_then(|r| r.get(sx).copied())
+                    .unwrap_or(COLOR_KEY_565);
+                let rgb = match (p_from == COLOR_KEY_565, p_to == COLOR_KEY_565) {
+                    (true, true) => continue,
+                    (false, false) => blend_565_pair(table, row_a5, p_to, p_from),
+                    (false, true) => blend_rgb_over_565(table, row_a5, dst_color[i], p_from),
+                    (true, false) => blend_565_over_rgb(table, row_a5, p_to, dst_color[i]),
+                };
+                dst_color[i] = rgb;
+                if lot_id.is_some() {
+                    dst_depth[i] = 0;
+                    dst_ids[i] = lot_id;
                 }
-            };
-            if lot_id.is_some() {
-                canvas.plot(px as i32, py as i32, 0, rgb);
-            } else {
-                canvas.plot_color(px as i32, py as i32, rgb);
+            }
+        } else {
+            let canvas_row = py as usize * canvas.width;
+            for px in x0..x1 {
+                let sx = (px - ax) as usize;
+                let p_from = from_row
+                    .and_then(|r| r.get(sx).copied())
+                    .unwrap_or(COLOR_KEY_565);
+                let p_to = to_row
+                    .and_then(|r| r.get(sx).copied())
+                    .unwrap_or(COLOR_KEY_565);
+                let rgb = match (p_from == COLOR_KEY_565, p_to == COLOR_KEY_565) {
+                    (true, true) => continue,
+                    (false, false) => blend_565_pair(table, row_a5, p_to, p_from),
+                    (false, true) => {
+                        let bg = canvas.color[canvas_row + px as usize];
+                        blend_rgb_over_565(table, row_a5, bg, p_from)
+                    }
+                    (true, false) => {
+                        let bg = canvas.color[canvas_row + px as usize];
+                        blend_565_over_rgb(table, row_a5, p_to, bg)
+                    }
+                };
+                if lot_id.is_some() {
+                    canvas.plot(px as i32, py as i32, 0, rgb);
+                } else {
+                    canvas.plot_color(px as i32, py as i32, rgb);
+                }
             }
         }
     }
@@ -3945,17 +4484,39 @@ fn mark_surface_ids(
     let y1 = ay.saturating_add(surface.height as i64).clamp(y0, clip_y1);
 
     canvas.set_id(Some(lot_id));
-    for py in y0..y1 {
-        let sy = (py - ay) as usize;
-        let row = &surface.pixels[sy * surface.width..(sy + 1) * surface.width];
-        let canvas_row = py as usize * canvas.width;
-        for px in x0..x1 {
-            let sx = (px - ax) as usize;
-            if row[sx] == COLOR_KEY_565 {
-                continue;
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let sx0 = (x0 - ax) as usize;
+    let span = (x1 - x0) as usize;
+    if canvas.has_pixel_storage() {
+        let x0_u = x0 as usize;
+        let x1_u = x1 as usize;
+        for py in y0..y1 {
+            let sy = (py - ay) as usize;
+            let src_row =
+                &surface.pixels[sy * surface.width + sx0..sy * surface.width + sx0 + span];
+            let (_, dst_depth, dst_ids) = canvas.row_slices_mut(py as usize, x0_u, x1_u);
+            for (i, &pixel) in src_row.iter().enumerate() {
+                if pixel != COLOR_KEY_565 {
+                    dst_depth[i] = 0;
+                    dst_ids[i] = Some(lot_id);
+                }
             }
-            let existing = canvas.color[canvas_row + px as usize];
-            canvas.plot(px as i32, py as i32, 0, existing);
+        }
+    } else {
+        for py in y0..y1 {
+            let sy = (py - ay) as usize;
+            let row = &surface.pixels[sy * surface.width..(sy + 1) * surface.width];
+            let canvas_row = py as usize * canvas.width;
+            for px in x0..x1 {
+                let sx = (px - ax) as usize;
+                if row[sx] == COLOR_KEY_565 {
+                    continue;
+                }
+                let existing = canvas.color[canvas_row + px as usize];
+                canvas.plot(px as i32, py as i32, 0, existing);
+            }
         }
     }
 }
@@ -4032,16 +4593,41 @@ fn blit_surface_stretched_to_canvas(
     let src_x0 = sx0 as usize;
     let src_y0 = sy0 as usize;
 
-    for py in dy0..dy1 {
-        let sy = src_y0 + (((py - dy0) as usize) * sh / out_h).min(sh - 1);
-        let row = &surface.pixels[sy * surface.width..(sy + 1) * surface.width];
-        for px in dx0..dx1 {
-            let sx = src_x0 + (((px - dx0) as usize) * sw / out_w).min(sw - 1);
-            let pixel = row[sx];
-            if keyed && pixel == COLOR_KEY_565 {
-                continue;
+    if canvas.has_pixel_storage() {
+        let x0_u = dx0 as usize;
+        let x1_u = dx1 as usize;
+        for py in dy0..dy1 {
+            let sy = src_y0 + (((py - dy0) as usize) * sh / out_h).min(sh - 1);
+            let row = &surface.pixels[sy * surface.width..(sy + 1) * surface.width];
+            let dst_color = &mut canvas.color
+                [py as usize * canvas.width + x0_u..py as usize * canvas.width + x1_u];
+            if !keyed {
+                for (i, dst) in dst_color.iter_mut().enumerate() {
+                    let sx = src_x0 + (i * sw / out_w).min(sw - 1);
+                    *dst = widen_565(row[sx]);
+                }
+            } else {
+                for (i, dst) in dst_color.iter_mut().enumerate() {
+                    let sx = src_x0 + (i * sw / out_w).min(sw - 1);
+                    let pixel = row[sx];
+                    if pixel != COLOR_KEY_565 {
+                        *dst = widen_565(pixel);
+                    }
+                }
             }
-            canvas.plot_color(px as i32, py as i32, widen_565(pixel));
+        }
+    } else {
+        for py in dy0..dy1 {
+            let sy = src_y0 + (((py - dy0) as usize) * sh / out_h).min(sh - 1);
+            let row = &surface.pixels[sy * surface.width..(sy + 1) * surface.width];
+            for px in dx0..dx1 {
+                let sx = src_x0 + (((px - dx0) as usize) * sw / out_w).min(sw - 1);
+                let pixel = row[sx];
+                if keyed && pixel == COLOR_KEY_565 {
+                    continue;
+                }
+                canvas.plot_color(px as i32, py as i32, widen_565(pixel));
+            }
         }
     }
 }
@@ -4109,16 +4695,44 @@ fn blit_subrect_to_canvas_mode(
     let x1 = ax.saturating_add(rw as i64).clamp(x0, clip_x1);
     let y1 = ay.saturating_add(rh as i64).clamp(y0, clip_y1);
 
-    for py in y0..y1 {
-        let sy = ry + (py - ay) as usize;
-        let row = &surface.pixels[sy * surface.width..(sy + 1) * surface.width];
-        for px in x0..x1 {
-            let sx = rx + (px - ax) as usize;
-            let pixel = row[sx];
-            if keyed && pixel == COLOR_KEY_565 {
-                continue;
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let sx0 = rx + (x0 - ax) as usize;
+    let span = (x1 - x0) as usize;
+    if canvas.has_pixel_storage() {
+        let x0_u = x0 as usize;
+        let x1_u = x1 as usize;
+        for py in y0..y1 {
+            let sy = ry + (py - ay) as usize;
+            let src_row =
+                &surface.pixels[sy * surface.width + sx0..sy * surface.width + sx0 + span];
+            let dst_color = &mut canvas.color
+                [py as usize * canvas.width + x0_u..py as usize * canvas.width + x1_u];
+            if !keyed {
+                for (dst, &pixel) in dst_color.iter_mut().zip(src_row) {
+                    *dst = widen_565(pixel);
+                }
+            } else {
+                for (dst, &pixel) in dst_color.iter_mut().zip(src_row) {
+                    if pixel != COLOR_KEY_565 {
+                        *dst = widen_565(pixel);
+                    }
+                }
             }
-            canvas.plot_color(px as i32, py as i32, widen_565(pixel));
+        }
+    } else {
+        for py in y0..y1 {
+            let sy = ry + (py - ay) as usize;
+            let row = &surface.pixels[sy * surface.width..(sy + 1) * surface.width];
+            for px in x0..x1 {
+                let sx = rx + (px - ax) as usize;
+                let pixel = row[sx];
+                if keyed && pixel == COLOR_KEY_565 {
+                    continue;
+                }
+                canvas.plot_color(px as i32, py as i32, widen_565(pixel));
+            }
         }
     }
 }
@@ -4148,6 +4762,7 @@ fn draw_status_pip(canvas: &mut Canvas, center: [i32; 2], clip: [i32; 4], rgb: [
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::canvas::blend565;
     use sims_formats::strings::{Format, TextEntry};
 
     fn make_lot(id: u16, origin: [i32; 2], surface: Surface565) -> MapLot {
@@ -4193,6 +4808,7 @@ mod tests {
             vacation_no_vacancy: None,
             filter_badges: BTreeMap::new(),
             lots,
+            render_cache: RenderCacheSlot::default(),
         }
     }
 
@@ -5521,5 +6137,91 @@ mod tests {
         assert!((state.fade_for(6, 2420) - 0.0).abs() < 1e-6);
         state.prune(2420);
         assert!(!state.is_animating(2420));
+    }
+
+    #[test]
+    fn brighten_highlight_lut_matches_uncached_for_all_65536_pixels() {
+        let lut = brighten_highlight_lut();
+        for p in 0..=u16::MAX {
+            assert_eq!(
+                lut[usize::from(p)],
+                brighten_565_uncached(p, 1.0, HIGHLIGHT_Y_OFFSET),
+                "LUT mismatch at 5-6-5 pixel 0x{p:04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_cache_matches_uncached_across_overhanging_fades_overlaps_and_mutations() {
+        let mut lot_a = make_lot(
+            1,
+            [20, 20],
+            Surface565::filled(12, 12, pack_565([200, 40, 40])),
+        );
+        let mut cutaway_a = Surface565::filled(12, 12, COLOR_KEY_565);
+        for y in 4..10 {
+            for x in 4..10 {
+                cutaway_a.pixels[y * 12 + x] = pack_565([40, 180, 40]);
+            }
+        }
+        lot_a.roofs_off = Some(cutaway_a);
+
+        // Lot B overlaps Lot A in Z-order (drawn after Lot A).
+        let lot_b = make_lot(
+            2,
+            [26, 26],
+            Surface565::filled(10, 10, pack_565([40, 60, 220])),
+        );
+        // Lot C is disjoint from A and B (stays in static base layer).
+        let lot_c = make_lot(
+            3,
+            [100, 100],
+            Surface565::filled(10, 10, pack_565([220, 200, 40])),
+        );
+
+        let mut map = make_test_map(NeighborhoodKind::Unleashed, vec![lot_a, lot_b, lot_c]);
+        let mut cached_canvas = Canvas::new(800, 600, [0, 0, 0]);
+        let mut uncached_canvas = Canvas::new(800, 600, [0, 0, 0]);
+
+        for &(fade, highlight) in &[(0.0, false), (0.35, false), (0.65, true), (1.0, true)] {
+            let opts = RenderOptions {
+                hovered_lot: Some(1),
+                hover_roofs_off: true,
+                hover_roof_fade: fade,
+                highlight_hovered: highlight,
+                ..RenderOptions::default()
+            };
+            map.render_into(&mut cached_canvas, &opts);
+            map.render_into_uncached(&mut uncached_canvas, &opts);
+            assert_eq!(
+                cached_canvas.color, uncached_canvas.color,
+                "fade={fade} hl={highlight}"
+            );
+            assert_eq!(
+                cached_canvas.depth, uncached_canvas.depth,
+                "fade={fade} hl={highlight}"
+            );
+            assert_eq!(
+                cached_canvas.ids(),
+                uncached_canvas.ids(),
+                "fade={fade} hl={highlight}"
+            );
+        }
+
+        // Mutate both a static lot and the hovered lot in place: fingerprints must invalidate.
+        map.lots[2].normal.pixels[0] = pack_565([16, 240, 240]);
+        map.lots[0].normal.pixels[0] = pack_565([240, 16, 240]);
+        let opts = RenderOptions {
+            hovered_lot: Some(1),
+            hover_roofs_off: true,
+            hover_roof_fade: 0.5,
+            highlight_hovered: true,
+            ..RenderOptions::default()
+        };
+        map.render_into(&mut cached_canvas, &opts);
+        map.render_into_uncached(&mut uncached_canvas, &opts);
+        assert_eq!(cached_canvas.color, uncached_canvas.color);
+        assert_eq!(cached_canvas.depth, uncached_canvas.depth);
+        assert_eq!(cached_canvas.ids(), uncached_canvas.ids());
     }
 }

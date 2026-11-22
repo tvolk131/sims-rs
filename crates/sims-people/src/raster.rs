@@ -254,6 +254,42 @@ pub trait Target {
     /// drew it (the lot renderer's canvas, `sims_render::Canvas::id_at`)
     /// notes it; by default nothing does.
     fn set_id(&mut self, _id: Option<u16>) {}
+
+    /// Precomputes the linear row base index for scanline `y` (used by
+    /// [`Target::passes_at`], [`Target::write_passed_at`], and
+    /// [`Target::write_coloured_passed_at`]).
+    #[inline]
+    fn row_index(&self, _y: u32) -> usize {
+        0
+    }
+
+    /// Like [`Target::passes`], given `row = self.row_index(y)`.
+    #[inline]
+    fn passes_at(&self, _row: usize, x: u32, y: u32, z: f32) -> bool {
+        self.passes(x, y, z)
+    }
+
+    /// Like [`Target::write`], given `row = self.row_index(y)` after
+    /// [`Target::passes_at`] returned `true`.
+    #[inline]
+    fn write_passed_at(&mut self, _row: usize, x: u32, y: u32, z: f32, texel: [u8; 4], shade: f32) {
+        self.write(x, y, z, texel, shade);
+    }
+
+    /// Like [`Target::write_coloured`], given `row = self.row_index(y)` after
+    /// [`Target::passes_at`] returned `true`.
+    #[inline]
+    fn write_coloured_passed_at(
+        &mut self,
+        _row: usize,
+        x: u32,
+        y: u32,
+        z: f32,
+        texel: [u8; 4],
+        shade: [f32; 3],
+    ) {
+        self.write_coloured(x, y, z, texel, shade);
+    }
 }
 
 impl Target for Canvas {
@@ -266,7 +302,28 @@ impl Target for Canvas {
     }
 
     fn write(&mut self, x: u32, y: u32, z: f32, texel: [u8; 4], s: f32) {
-        let i = (y * self.width + x) as usize;
+        self.write_at((y * self.width + x) as usize, z, texel, s);
+    }
+
+    #[inline]
+    fn row_index(&self, y: u32) -> usize {
+        (y * self.width) as usize
+    }
+
+    #[inline]
+    fn passes_at(&self, row: usize, x: u32, _y: u32, z: f32) -> bool {
+        z < self.depth[row + x as usize]
+    }
+
+    #[inline]
+    fn write_passed_at(&mut self, row: usize, x: u32, _y: u32, z: f32, texel: [u8; 4], s: f32) {
+        self.write_at(row + x as usize, z, texel, s);
+    }
+}
+
+impl Canvas {
+    #[inline]
+    fn write_at(&mut self, i: usize, z: f32, texel: [u8; 4], s: f32) {
         let alpha = texel[3];
         let lit = |c: u8| (f32::from(c) * s).min(255.0);
         if alpha == 255 {
@@ -358,6 +415,19 @@ pub fn draw_shaded_culled<T: Target + ?Sized>(
     draw_shaded_with_cull(target, part, skinned, shade, project, true);
 }
 
+/// Like [`draw_shaded_culled`], reusing `screen` as scratch storage for
+/// projected vertices.
+pub(crate) fn draw_shaded_culled_scratch<T: Target + ?Sized>(
+    target: &mut T,
+    part: &Part,
+    skinned: &Skinned,
+    shade: &[Shade],
+    project: impl Fn(Vec3) -> Vec3,
+    screen: &mut Vec<Vec3>,
+) {
+    draw_shaded_with_cull_scratch(target, part, skinned, shade, project, true, screen);
+}
+
 fn draw_shaded_with_cull<T: Target + ?Sized>(
     target: &mut T,
     part: &Part,
@@ -366,7 +436,21 @@ fn draw_shaded_with_cull<T: Target + ?Sized>(
     project: impl Fn(Vec3) -> Vec3,
     cull_ccw: bool,
 ) {
-    let screen: Vec<Vec3> = skinned.positions.iter().map(|&p| project(p)).collect();
+    let mut screen = Vec::new();
+    draw_shaded_with_cull_scratch(target, part, skinned, shade, project, cull_ccw, &mut screen);
+}
+
+fn draw_shaded_with_cull_scratch<T: Target + ?Sized>(
+    target: &mut T,
+    part: &Part,
+    skinned: &Skinned,
+    shade: &[Shade],
+    project: impl Fn(Vec3) -> Vec3,
+    cull_ccw: bool,
+    screen: &mut Vec<Vec3>,
+) {
+    screen.clear();
+    screen.extend(skinned.positions.iter().map(|&p| project(p)));
     for t in &part.mesh.triangles {
         let [a, b, c] = t.map(|i| i as usize);
         // A mesh whose triangles name vertices it lacks draws nothing
@@ -391,6 +475,70 @@ fn draw_shaded_with_cull<T: Target + ?Sized>(
             cull_ccw,
         );
     }
+}
+
+#[inline(always)]
+fn outside(w: f32, owned: bool) -> bool {
+    w < 0.0 || (w == 0.0 && !owned)
+}
+
+/// Tightens `[x_start, x_end]` along a scanline for one directed edge `e`
+/// with precomputed `inv_dy = 1.0 / f64::from(e.dy)` (or `0.0` when `e.dy == 0.0`).
+/// Uses a conservative ±1 px bracket around the exact f64 root and verifies
+/// IEEE-754 monotonicity at the clipped boundary pixel so no inside pixel can
+/// ever be skipped. Returns `false` if the entire scanline is provably outside.
+#[inline(always)]
+fn clip_edge_span(
+    e: &Edge,
+    inv_dy: f64,
+    r: f32,
+    owned: bool,
+    x_start: &mut i64,
+    x_end: &mut i64,
+) -> bool {
+    if e.dy == 0.0 {
+        if e.ax.is_finite() {
+            let v = if e.negate { -r } else { r };
+            return !outside(v, owned);
+        }
+        return true;
+    }
+    if !inv_dy.is_finite() || !e.ax.is_finite() || !r.is_finite() {
+        return true;
+    }
+    let qx_root = f64::from(e.ax) + f64::from(r) * inv_dy;
+    if !qx_root.is_finite() {
+        return true;
+    }
+    // Slope of `e.eval(r, qx)` with respect to `qx`: positive when `e.eval`
+    // grows with `x`, negative when `e.eval` shrinks with `x`.
+    let slope_pos = if e.negate { e.dy > 0.0 } else { e.dy < 0.0 };
+    if slope_pos {
+        let cand = (qx_root - 0.5).floor() - 1.0;
+        if cand > *x_start as f64 {
+            let lo = if cand >= (*x_end as f64) + 1.0 {
+                *x_end + 1
+            } else {
+                cand as i64
+            };
+            if lo > *x_start && outside(e.eval(r, (lo - 1) as f32 + 0.5), owned) {
+                *x_start = lo;
+            }
+        }
+    } else {
+        let cand = (qx_root - 0.5).ceil() + 1.0;
+        if cand < *x_end as f64 {
+            let hi = if cand <= (*x_start as f64) - 1.0 {
+                *x_start - 1
+            } else {
+                cand as i64
+            };
+            if hi < *x_end && outside(e.eval(r, (hi + 1) as f32 + 0.5), owned) {
+                *x_end = hi;
+            }
+        }
+    }
+    *x_start <= *x_end
 }
 
 fn triangle<T: Target + ?Sized>(
@@ -459,14 +607,45 @@ fn triangle<T: Target + ?Sized>(
     let e0 = Edge::new(p[1], p[2]);
     let e1 = Edge::new(p[2], p[0]);
     let e2 = Edge::new(p[0], p[1]);
-    let outside = |w: f32, owned: bool| w < 0.0 || (w == 0.0 && !owned);
+    let wide = max_x - min_x > 12;
+    let (inv_dy0, inv_dy1, inv_dy2) = if wide {
+        (
+            if e0.dy != 0.0 {
+                1.0 / f64::from(e0.dy)
+            } else {
+                0.0
+            },
+            if e1.dy != 0.0 {
+                1.0 / f64::from(e1.dy)
+            } else {
+                0.0
+            },
+            if e2.dy != 0.0 {
+                1.0 / f64::from(e2.dy)
+            } else {
+                0.0
+            },
+        )
+    } else {
+        (0.0, 0.0, 0.0)
+    };
     for y in min_y..=max_y {
         let qy = y as f32 + 0.5;
         let r0 = e0.row(qy);
         let r1 = e1.row(qy);
         let r2 = e2.row(qy);
+        let mut x_start = min_x;
+        let mut x_end = max_x;
+        if wide
+            && (!clip_edge_span(&e0, inv_dy0, r0, owns[0], &mut x_start, &mut x_end)
+                || !clip_edge_span(&e1, inv_dy1, r1, owns[1], &mut x_start, &mut x_end)
+                || !clip_edge_span(&e2, inv_dy2, r2, owns[2], &mut x_start, &mut x_end))
+        {
+            continue;
+        }
         let yu = y as u32;
-        for x in min_x..=max_x {
+        let row = target.row_index(yu);
+        for x in x_start..=x_end {
             let qx = x as f32 + 0.5;
             let v0 = e0.eval(r0, qx);
             if outside(v0, owns[0]) {
@@ -480,12 +659,14 @@ fn triangle<T: Target + ?Sized>(
             if outside(v2, owns[2]) {
                 continue;
             }
+            // Preserve exact division by `area` (do NOT replace with `inv_area`
+            // multiplication) so boundary texels stay bit-for-bit identical.
             let w0 = v0 / area;
             let w1 = v1 / area;
             let w2 = v2 / area;
             let z = w0 * p[0].z + w1 * p[1].z + w2 * p[2].z;
             let xu = x as u32;
-            if !target.passes(xu, yu, z) {
+            if !target.passes_at(row, xu, yu, z) {
                 continue;
             }
             let u = w0 * uv[0][0] + w1 * uv[1][0] + w2 * uv[2][0];
@@ -498,11 +679,11 @@ fn triangle<T: Target + ?Sized>(
             }
             if grey {
                 let s0 = w0 * channels[0][0] + w1 * channels[1][0] + w2 * channels[2][0];
-                target.write(xu, yu, z, texel, s0);
+                target.write_passed_at(row, xu, yu, z, texel, s0);
             } else {
                 let s = [0, 1, 2]
                     .map(|k| w0 * channels[0][k] + w1 * channels[1][k] + w2 * channels[2][k]);
-                target.write_coloured(xu, yu, z, texel, s);
+                target.write_coloured_passed_at(row, xu, yu, z, texel, s);
             }
         }
     }
@@ -906,5 +1087,95 @@ mod tests {
         draw_shaded_culled(&mut culled, &front, &skinned(5.0), &shade, |p| p);
         draw_shaded_culled(&mut culled, &back, &skinned(1.0), &shade, |p| p);
         assert_eq!(pixel(&culled, 4, 3), [200, 50, 50, 255]);
+    }
+
+    #[test]
+    fn clip_edge_span_never_skips_any_inside_pixel() {
+        let cases = [
+            // Thin diagonal sliver across viewport
+            [
+                Vec3::new(0.25, 0.25, 1.0),
+                Vec3::new(63.75, 62.5, 2.0),
+                Vec3::new(63.5, 63.75, 3.0),
+            ],
+            // Horizontal top edge
+            [
+                Vec3::new(5.0, 10.5, 1.0),
+                Vec3::new(55.0, 10.5, 2.0),
+                Vec3::new(30.3, 40.7, 3.0),
+            ],
+            // Horizontal bottom edge
+            [
+                Vec3::new(30.3, 5.1, 1.0),
+                Vec3::new(55.0, 45.5, 2.0),
+                Vec3::new(5.0, 45.5, 3.0),
+            ],
+            // Huge off-screen vertices
+            [
+                Vec3::new(-5000.3, -200.7, 1.0),
+                Vec3::new(6000.9, 15.2, 2.0),
+                Vec3::new(31.5, 4000.1, 3.0),
+            ],
+            // Vertical edge
+            [
+                Vec3::new(12.5, 2.0, 1.0),
+                Vec3::new(40.0, 20.0, 2.0),
+                Vec3::new(12.5, 50.0, 3.0),
+            ],
+        ];
+        let (width, height) = (64i64, 64i64);
+        let top_left = |a: Vec3, b: Vec3| {
+            let (dx, dy) = (b.x - a.x, b.y - a.y);
+            dy < 0.0 || (dy == 0.0 && dx > 0.0)
+        };
+        for mut p in cases {
+            if edge(p[0], p[1], p[2]) < 0.0 {
+                p.swap(1, 2);
+            }
+            let owns = [
+                top_left(p[1], p[2]),
+                top_left(p[2], p[0]),
+                top_left(p[0], p[1]),
+            ];
+            let e0 = Edge::new(p[1], p[2]);
+            let e1 = Edge::new(p[2], p[0]);
+            let e2 = Edge::new(p[0], p[1]);
+            let inv_dy0 = if e0.dy != 0.0 {
+                1.0 / f64::from(e0.dy)
+            } else {
+                0.0
+            };
+            let inv_dy1 = if e1.dy != 0.0 {
+                1.0 / f64::from(e1.dy)
+            } else {
+                0.0
+            };
+            let inv_dy2 = if e2.dy != 0.0 {
+                1.0 / f64::from(e2.dy)
+            } else {
+                0.0
+            };
+            for y in 0..height {
+                let qy = y as f32 + 0.5;
+                let (r0, r1, r2) = (e0.row(qy), e1.row(qy), e2.row(qy));
+                let mut x_start = 0i64;
+                let mut x_end = width - 1;
+                let keep = clip_edge_span(&e0, inv_dy0, r0, owns[0], &mut x_start, &mut x_end)
+                    && clip_edge_span(&e1, inv_dy1, r1, owns[1], &mut x_start, &mut x_end)
+                    && clip_edge_span(&e2, inv_dy2, r2, owns[2], &mut x_start, &mut x_end);
+                for x in 0..width {
+                    let qx = x as f32 + 0.5;
+                    let inside = !outside(e0.eval(r0, qx), owns[0])
+                        && !outside(e1.eval(r1, qx), owns[1])
+                        && !outside(e2.eval(r2, qx), owns[2]);
+                    if inside {
+                        assert!(
+                            keep && x >= x_start && x <= x_end,
+                            "clipped away inside pixel ({x}, {y}) with span [{x_start}..={x_end}]"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
