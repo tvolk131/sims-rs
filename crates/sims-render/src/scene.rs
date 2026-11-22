@@ -935,7 +935,7 @@ impl<'a> Painter<'a> {
                 let p = self.corner_screen(top, level);
                 let (view, height) = (self.rotate_corner(top), self.corner_elevation(top) / 16);
                 if floor == 0 {
-                    self.shadow(level, [x, y], p, view, height);
+                    self.shadow(level, [x, y], view, height);
                     continue;
                 }
                 let wall = self.lot.levels[index].walls[cell];
@@ -1025,16 +1025,22 @@ impl<'a> Painter<'a> {
                     }
                     self.stats.floors += 1;
                 }
-                self.shadow(level, [x, y], p, view, height);
+                self.shadow(level, [x, y], view, height);
             }
         }
     }
 
-    /// Casts the floor shadow of tile (`x`, `y`) on `level`, whose top
-    /// corner is at screen point `p` and view corner `view` at terrain
-    /// height `height`: that of the first object on the tile that has one
-    /// (see [`crate::shadows`]).
-    fn shadow(&mut self, level: i32, [x, y]: [i32; 2], p: [i32; 2], view: [i32; 2], height: i32) {
+    /// Casts the floor shadow of tile (`x`, `y`) on `level`, whose view top
+    /// corner is `view` at terrain height `height`: that of the first object on
+    /// the tile that has one (see [`crate::shadows`]).
+    ///
+    /// Placement follows `0x4adac0` → `0x4b9613` → `0x4b97ea` and
+    /// `0x4ae8cc`–`0x4ae9d3`: project the tile centre `[x * 16 + 8, y * 16 + 8]`
+    /// at its rounded terrain altitude (`0x478dfe`), then subtract half the
+    /// tile's width (`[esi + 0x5c]`) and height (`[esi + 0x64]`). Depth still
+    /// anchors from the tile's top corner (`0x4c9e38`) and steps from the
+    /// shadow's top row (`0x4ae93e`–`0x4ae9ab`).
+    fn shadow(&mut self, level: i32, [x, y]: [i32; 2], view: [i32; 2], height: i32) {
         if !self.options.shadows {
             return;
         }
@@ -1044,7 +1050,8 @@ impl<'a> Painter<'a> {
             return;
         };
         let index = (level - 1) as usize;
-        let byte = self.lot.light_at(index, [x * 16 + 8, y * 16 + 8]);
+        let center = [x * 16 + 8, y * 16 + 8];
+        let byte = self.lot.light_at(index, center);
         let strength = i32::from(strength) + 255
             - Light::drawn_byte(byte, self.lot.brightest()).unwrap_or(255) as i32;
         let zoom = self.camera.zoom.index();
@@ -1054,7 +1061,13 @@ impl<'a> Painter<'a> {
         let Some(mask) = self.assets.shadow_mask(zoom, code) else {
             return;
         };
-        let at = [p[0] - tile.unwrap_or(mask.width) as i32 / 2, p[1]];
+        let at = shadow_origin(
+            self.camera,
+            self.lot,
+            [x, y],
+            level,
+            tile.unwrap_or(mask.width),
+        );
         let depth = &self.depth;
         let (base_d, first_row) = depth.floor_base(view, height, level, at[1]);
         self.canvas.shade_mask(mask, at, strength, |row| {
@@ -1214,59 +1227,112 @@ impl<'a> Painter<'a> {
     ) {
         let index = (level - 1) as usize;
         let zoom = self.camera.zoom.index();
+        // Sort individual wall segments back-to-front by their normalized
+        // rotated endpoints `(lo, hi)` in `(vx + vy, vx - vy)` order,
+        // approximating the original's view-sorted run traversal (`0x54045b` →
+        // `0x540809` → `0x54088d` → `0x44054c`) so that on depth ties
+        // (`d <= dst + 1` at `0x4c49f2`), front walls overwrite back walls on
+        // rotated views. (Whole-run completion across crossing runs and
+        // mid-run trim/cap interleaving at `0x53e335`/`0x53e3c0` remain
+        // separate passes.)
+        let mut ordered = Vec::new();
         for x in 0..self.lot.size as i32 {
             for y in 0..self.lot.size as i32 {
                 let wall = self.lot.levels[index].walls[Lot::cell(x as usize, y as usize)];
+                if wall.segments == 0 {
+                    continue;
+                }
                 for s in segments(x, y) {
                     if wall.segments & s.bit == 0 {
                         continue;
                     }
-                    let style = if s.bit == lot::WEST {
-                        wall.styles[0]
-                    } else {
-                        wall.styles[1]
-                    };
-                    let patterns = self.sides(index, x, y, s.bit);
-                    let n = self.rotate_direction(s.normal);
-                    let front = shown_side(n);
-                    let cut = cut.cuts(self.camera, [x, y], s.bit, style);
-                    // In live and buy modes (`0x416920 != 0`), a cut door-like
-                    // wall (styles 3, 5, 6, 15 and 23) zeroes its pass count
-                    // (`0x53e9ce` to `0x53ea2b`) and draws no wall stub across
-                    // the doorway.
-                    if cut && caps::door_like(style) {
-                        continue;
-                    }
-                    let key = edge(s.from, s.to);
-                    let opening = openings.get(&key).copied();
-                    let pattern = patterns[front];
-                    let ends = [s.from, s.to].map(|c| self.corner_screen(c, level));
-                    let heights = [s.from, s.to].map(|c| self.corner_elevation(c) / 16);
-                    let frame = wall_frame(ends);
-                    // A cut wall marked for a cap at one end stands full
-                    // height there: the original draws it in shape 7 or 8,
-                    // then lays a strip of trim-coloured pattern (252 or
-                    // 253, shape 9 or 10) down that end (0x53ea55 to
-                    // 0x53ebb5). Door-like walls are drawn as usual.
-                    let flags = corners.flags(([x, y], s.bit));
-                    let capped = (flags & 6 != 0 && !caps::door_like(style))
-                        .then_some(if flags & 2 != 0 { 8 } else { 7 });
-                    // The side that shows takes the light of the room on
-                    // that side: sampled just beside the wall's middle, so
-                    // a split tile gives the triangle touching the wall.
-                    // Without a room there the wall pass keeps the light it
-                    // last read, first 1 (0x53dbb4, 0x53dc78); ours takes 1.
-                    let fraction = self
-                        .lot
-                        .room_fraction_at(index, wall_side(&s, front))
-                        .unwrap_or(1.0);
-                    let seen = seen_tile(self.camera, s.from, s.to);
-                    // Fences have no cut shape and stay up.
-                    let drew = match capped {
-                        Some(shape) => self.place_wall_parts(
+                    let (lo, hi) = wall_draw_key(self.camera, s.from, s.to);
+                    ordered.push((lo, hi, x, y, wall, s));
+                }
+            }
+        }
+        ordered.sort_by_key(|&(lo, hi, x, y, _, ref s)| (lo, hi, x, y, s.bit));
+        for (_, _, x, y, wall, s) in ordered {
+            let style = if s.bit == lot::WEST {
+                wall.styles[0]
+            } else {
+                wall.styles[1]
+            };
+            let patterns = self.sides(index, x, y, s.bit);
+            let n = self.rotate_direction(s.normal);
+            let front = shown_side(n);
+            let cut = cut.cuts(self.camera, [x, y], s.bit, style);
+            // In live and buy modes (`0x416920 != 0`), a cut door-like
+            // wall (styles 3, 5, 6, 15 and 23) zeroes its pass count
+            // (`0x53e9ce` to `0x53ea2b`) and draws no wall stub across
+            // the doorway.
+            if cut && caps::door_like(style) {
+                continue;
+            }
+            let key = edge(s.from, s.to);
+            let opening = openings.get(&key).copied();
+            let pattern = patterns[front];
+            let ends = [s.from, s.to].map(|c| self.corner_screen(c, level));
+            let heights = [s.from, s.to].map(|c| self.corner_elevation(c) / 16);
+            let frame = wall_frame(ends);
+            // A cut wall marked for a cap at one end stands full
+            // height there: the original draws it in shape 7 or 8,
+            // then lays a strip of trim-coloured pattern (252 or
+            // 253, shape 9 or 10) down that end (0x53ea55 to
+            // 0x53ebb5). Door-like walls are drawn as usual.
+            let flags = corners.flags(([x, y], s.bit));
+            let capped = (flags & 6 != 0 && !caps::door_like(style)).then_some(if flags & 2 != 0 {
+                8
+            } else {
+                7
+            });
+            // The side that shows takes the light of the room on
+            // that side: sampled just beside the wall's middle, so
+            // a split tile gives the triangle touching the wall.
+            // Without a room there the wall pass keeps the light it
+            // last read, first 1 (0x53dbb4, 0x53dc78); ours takes 1.
+            let fraction = self
+                .lot
+                .room_fraction_at(index, wall_side(&s, front))
+                .unwrap_or(1.0);
+            let seen = seen_tile(self.camera, s.from, s.to);
+            // Fences have no cut shape and stay up.
+            let drew = match capped {
+                Some(shape) => self.place_wall_parts(
+                    pattern,
+                    shape,
+                    None,
+                    false,
+                    zoom,
+                    frame,
+                    ends,
+                    heights,
+                    level,
+                    Some(fraction),
+                    seen,
+                    None,
+                    0,
+                ),
+                None => {
+                    self.place_wall_parts(
+                        pattern,
+                        style,
+                        opening,
+                        cut,
+                        zoom,
+                        frame,
+                        ends,
+                        heights,
+                        level,
+                        Some(fraction),
+                        seen,
+                        None,
+                        0,
+                    ) || (cut
+                        && self.place_wall_parts(
                             pattern,
-                            shape,
-                            None,
+                            style,
+                            opening,
                             false,
                             zoom,
                             frame,
@@ -1277,76 +1343,43 @@ impl<'a> Painter<'a> {
                             seen,
                             None,
                             0,
-                        ),
-                        None => {
-                            self.place_wall_parts(
-                                pattern,
-                                style,
-                                opening,
-                                cut,
-                                zoom,
-                                frame,
-                                ends,
-                                heights,
-                                level,
-                                Some(fraction),
-                                seen,
-                                None,
-                                0,
-                            ) || (cut
-                                && self.place_wall_parts(
-                                    pattern,
-                                    style,
-                                    opening,
-                                    false,
-                                    zoom,
-                                    frame,
-                                    ends,
-                                    heights,
-                                    level,
-                                    Some(fraction),
-                                    seen,
-                                    None,
-                                    0,
-                                ))
-                        }
-                    };
-                    if !drew {
-                        self.stats.missing_walls += 1;
-                        continue;
-                    }
-                    if let Some(shape) = capped {
-                        // In room 0's light, or 1 without one, held by the time
-                        // of day's cap, and no pools (0x53eba8 to 0x53ebb5).
-                        let outdoor = self.lot.outdoor_light.unwrap_or(1.0);
-                        // On an edge-on diagonal the strip is always pattern 252
-                        // in shape 9, whichever end is marked (0x53eb6d to
-                        // 0x53ebf5), moved up before drawing.
-                        if frame == 3 {
-                            let lift = edge_on_strip_lift(self.camera.zoom);
-                            self.place_edge_on_strip(zoom, ends, heights, level, outdoor, lift);
-                        } else {
-                            let (trim, mask) = if shape == 7 { (252, 9) } else { (253, 10) };
-                            self.place_wall_parts(
-                                trim,
-                                mask,
-                                None,
-                                false,
-                                zoom,
-                                frame,
-                                ends,
-                                heights,
-                                level,
-                                Some(outdoor),
-                                None,
-                                None,
-                                0,
-                            );
-                        }
-                    }
-                    self.stats.walls += 1;
+                        ))
+                }
+            };
+            if !drew {
+                self.stats.missing_walls += 1;
+                continue;
+            }
+            if let Some(shape) = capped {
+                // In room 0's light, or 1 without one, held by the time
+                // of day's cap, and no pools (0x53eba8 to 0x53ebb5).
+                let outdoor = self.lot.outdoor_light.unwrap_or(1.0);
+                // On an edge-on diagonal the strip is always pattern 252
+                // in shape 9, whichever end is marked (0x53eb6d to
+                // 0x53ebf5), moved up before drawing.
+                if frame == 3 {
+                    let lift = edge_on_strip_lift(self.camera.zoom);
+                    self.place_edge_on_strip(zoom, ends, heights, level, outdoor, lift);
+                } else {
+                    let (trim, mask) = if shape == 7 { (252, 9) } else { (253, 10) };
+                    self.place_wall_parts(
+                        trim,
+                        mask,
+                        None,
+                        false,
+                        zoom,
+                        frame,
+                        ends,
+                        heights,
+                        level,
+                        Some(outdoor),
+                        None,
+                        None,
+                        0,
+                    );
                 }
             }
+            self.stats.walls += 1;
         }
     }
 
@@ -2439,6 +2472,44 @@ fn project_fine_terrain(
         (dx, dy)
     };
     [base[0].saturating_add(dx), base[1].saturating_add(dy)]
+}
+
+/// Screen top-left of a tile's floor shadow mask (`0x4adac0` → `0x4b9613` →
+/// `0x4b97ea`, `0x4ae8cc`–`0x4ae8e3`): project the tile centre at its rounded
+/// terrain altitude (`0x478dfe`), then subtract half `tile_width` (matching
+/// plain floor sprite alignment) and half the tile's screen height.
+fn shadow_origin(
+    camera: &Camera,
+    lot: &Lot,
+    [x, y]: [i32; 2],
+    level: i32,
+    tile_width: usize,
+) -> [i32; 2] {
+    let center = [x * 16 + 8, y * 16 + 8];
+    let altitude = lot.altitude_at(center);
+    let steps = (altitude + 0.5).trunc().clamp(0.0, 255.0) as u8;
+    let screen = project_fine_terrain(camera, lot, camera.rotate_fine(center), level, Some(steps));
+    [
+        screen[0] - tile_width as i32 / 2,
+        screen[1] - camera.zoom.tile_height() / 2,
+    ]
+}
+
+/// Back-to-front view sort key for a wall segment (`0x54045b` → `0x540809` →
+/// `0x54088d` → `0x44054c`), ordering its two rotated corners by
+/// `(vx + vy, vx - vy)` ascending.
+fn wall_draw_key(camera: &Camera, from: [i32; 2], to: [i32; 2]) -> ((i32, i32), (i32, i32)) {
+    let m = lot::FULL as i32;
+    let rot = |[x, y]: [i32; 2]| match camera.rotation & 3 {
+        1 => [m - y, x],
+        2 => [m - x, m - y],
+        3 => [y, m - x],
+        _ => [x, y],
+    };
+    let key = |[vx, vy]: [i32; 2]| (vx + vy, vx - vy);
+    let va = key(rot(from));
+    let vb = key(rot(to));
+    if va <= vb { (va, vb) } else { (vb, va) }
 }
 
 /// Base screen position and depth anchor for an unheld object at unrotated
@@ -3588,6 +3659,91 @@ mod tests {
                     assert_eq!(floor_for_rotation(other, 2, camera, stored), other);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn floor_shadows_project_tile_center_at_rounded_altitude() {
+        let mut lot = flat_lot(0);
+        // Sloped tile (10, 12) has corners (0,1)=0, (0,0)=0, (1,0)=0, (1,1)=1;
+        // center altitude is 0.5, which 0x4b97ea rounds up to 1 terrain step.
+        lot.heights[Lot::cell(10, 12)] = [0, 0, 0, 1];
+        let flat = flat_lot(0);
+        for zoom in Zoom::ALL {
+            let floor_w = (zoom.tile_width() - 1) as usize;
+            for rotation in 0..4 {
+                let cam = Camera {
+                    zoom,
+                    rotation,
+                    ..camera(rotation)
+                };
+                let depth = Depth::new(&cam);
+                let view = cam.rotate_tile([10, 12]);
+                for level in [1, 2] {
+                    let flat_at = shadow_origin(&cam, &flat, [10, 12], level, floor_w);
+                    let sloped_at = shadow_origin(&cam, &lot, [10, 12], level, floor_w);
+                    // On a flat tile, shadow_origin matches the top corner minus
+                    // half floor_w identically across all zooms, rotations, and levels.
+                    let top_p = cam.project(view, level, 0);
+                    assert_eq!(flat_at, [top_p[0] - floor_w as i32 / 2, top_p[1]]);
+                    // On the sloped tile, the shadow lifts by 1 terrain step
+                    // (2 << zoom pixels) with x unchanged.
+                    assert_eq!(sloped_at[0], flat_at[0]);
+                    assert_eq!(flat_at[1] - sloped_at[1], 2 << zoom.level());
+                    // Depth anchors from the top corner with level offset and
+                    // rebases from the mask's own first row (0x4ae93e..0x4ae9ab).
+                    let (base_d, first_row) = depth.floor_base(view, 0, level, sloped_at[1]);
+                    assert_eq!(
+                        depth
+                            .floor_row(base_d, first_row, sloped_at[1])
+                            .saturating_sub(65),
+                        depth.shadow(view, 0, level, sloped_at[1], sloped_at[1]),
+                    );
+                }
+                // Level 2 lifts by one storey height and shifts depth nearer by LEVEL_DEPTH.
+                let l1 = shadow_origin(&cam, &flat, [10, 12], 1, floor_w);
+                let l2 = shadow_origin(&cam, &flat, [10, 12], 2, floor_w);
+                assert_eq!(l2[0], l1[0]);
+                assert!(l2[1] < l1[1]);
+                let (b1, f1) = depth.floor_base(view, 0, 1, l1[1]);
+                let (b2, f2) = depth.floor_base(view, 0, 2, l2[1]);
+                assert_eq!(
+                    depth.floor_row(b2, f2, l2[1]) - depth.floor_row(b1, f1, l1[1]),
+                    -967
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wall_draw_key_orders_back_to_front_at_every_rotation() {
+        // At corner (26, 24), tile (26, 24)'s WEST wall runs (26,24)-(26,25)
+        // and tile (25, 24)'s NORTH wall runs (25,24)-(26,24).
+        let west = ([26, 24], [26, 25]);
+        let north = ([25, 24], [26, 24]);
+        // Rotation 0: north's start (49, 1) < west's start (50, 2).
+        let cam0 = camera(0);
+        assert!(wall_draw_key(&cam0, north.0, north.1) < wall_draw_key(&cam0, west.0, west.1));
+        // Rotation 1: west's start (65, 13) < north's start (65, 15).
+        let cam1 = camera(1);
+        assert!(wall_draw_key(&cam1, west.0, west.1) < wall_draw_key(&cam1, north.0, north.1));
+        // Rotation 2: west's start (77, -1) < north's start (78, -2).
+        let cam2 = camera(2);
+        assert!(wall_draw_key(&cam2, west.0, west.1) < wall_draw_key(&cam2, north.0, north.1));
+        // Rotation 3: both share start (62, -14); endpoint tie-break orders
+        // north's far end (63, -15) before west's far end (63, -13).
+        let cam3 = camera(3);
+        let k_north = wall_draw_key(&cam3, north.0, north.1);
+        let k_west = wall_draw_key(&cam3, west.0, west.1);
+        assert_eq!(k_north.0, k_west.0);
+        assert!(k_north < k_west);
+        // Regardless of endpoint order, the key is invariant at every rotation.
+        for rot in 0..4 {
+            let cam = camera(rot);
+            assert_eq!(
+                wall_draw_key(&cam, west.0, west.1),
+                wall_draw_key(&cam, west.1, west.0)
+            );
         }
     }
 }

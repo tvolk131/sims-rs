@@ -9,10 +9,12 @@ use sims_render::{Camera, Canvas, Focus, Lot, Walls, Zoom, draw, open_house};
 use std::path::PathBuf;
 
 /// The original's mean colour (16-bit, read as 8-bit) across the strip's
-/// four columns, 557 to 560, on rows 80 to 100: the strip's top row is
-/// 80, and the pattern's first row, hidden by shape 9's transparent first
-/// row, is not drawn.
-const ORIGINAL: [[i32; 3]; 21] = [
+/// four columns, 557 to 560, on rows 80 to 111: rows 80 to 100 show the
+/// lifted edge-on strip (pattern 252 in shape 9, whose transparent first row
+/// hides row 79), and rows 101 to 111 show corner `(27, 24)`'s mid-run
+/// standing diagonal trim (`0x50`, frame 29, `0x53df39`–`0x53df5c`) winning
+/// the depth test over the strip.
+const ORIGINAL: [[i32; 3]; 32] = [
     [153, 123, 86],
     [139, 109, 77],
     [143, 115, 84],
@@ -34,6 +36,17 @@ const ORIGINAL: [[i32; 3]; 21] = [
     [135, 101, 61],
     [137, 103, 63],
     [133, 99, 61],
+    [160, 121, 84],
+    [166, 130, 88],
+    [162, 132, 92],
+    [154, 117, 78],
+    [150, 111, 71],
+    [153, 119, 82],
+    [160, 129, 92],
+    [154, 123, 86],
+    [147, 113, 76],
+    [154, 115, 74],
+    [150, 111, 67],
 ];
 
 /// The same at medium zoom, across the strip's eight columns, 715 to
@@ -126,8 +139,10 @@ fn the_edge_on_strip_starts_on_the_originals_row_and_shows_its_colours() {
         return;
     };
     let mean = |y: usize| mean(&canvas, 557..561, y);
-    // The colours don't show where depth is read: on this tile the strip
-    // wins the depth test either way. So its depth is pinned: read at
+    // Through row 100 the colours don't show where depth is read: on rows
+    // 80 to 100 the strip wins the depth test either way (from row 101 to
+    // 111, corner (27, 24)'s standing trim drawn through 0x53e38f–0x53e3b4
+    // wins over it). So rows 80, 90, and 100 pin depth directly: read at
     // the row drawn (0x49a5d3), as the decision records. Read at the
     // unlifted row, 24 rows lower, each value would be 347 more.
     for (row, want) in [(80, 44471), (90, 44615), (100, 44760)] {
