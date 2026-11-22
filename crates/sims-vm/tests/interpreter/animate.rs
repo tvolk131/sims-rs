@@ -70,16 +70,10 @@ fn sim_animates(operands: [u8; 8]) -> Fixture {
     // The animator the load leaves is to read the person's appearance
     // again, which the first clip does. This profile changes only person
     // words 22 and 23.
-    fx.program.people.profiles.insert(
-        SIM_GUID,
-        Profile {
-            gender: None,
-            age: None,
-            skin: None,
-            tones: Vec::new(),
-            rig: Default::default(),
-        },
-    );
+    fx.program
+        .people
+        .profiles
+        .insert(SIM_GUID, Profile::default());
     fx.thread(SIM, 4096, &[-7]);
     fx.sim_mut().stack[0].locals = vec![0, 0];
     fx
@@ -1420,6 +1414,13 @@ fn dress_and_undress_events_put_accessories_on_and_take_them_off() {
         ]),
     ]);
     fx.program.people.suits = ["fun-fetch-ball01", "petbowl"].map(String::from).into();
+    fx.world.animators.insert(
+        SIM,
+        sims_sim::animator::Animator {
+            profile_stale: false,
+            ..LOADED
+        },
+    );
     fx.sim_mut().person.as_mut().unwrap().accessories = vec![Accessory {
         name: "petbowl".into(),
         binding: "R_HAND".into(),
@@ -2127,11 +2128,12 @@ fn what_a_draw_does_not_port_fails_loudly() {
     a.undrawn = false;
     a.position[0] = UNSET;
     assert!(failed(&mut fx).contains("+0xda"));
-    // A body that follows word 8.
+    // A body that follows word 8 (`0x58a1ed`) is ported via `outfits::dress_person`.
     let mut fx = turning();
     sim_definition(&mut fx)[102] |= 8;
     fx.sim_mut().person.as_mut().unwrap().data[8] = 1;
-    assert!(failed(&mut fx).contains("word 8"));
+    draw(&mut fx).unwrap();
+    assert_eq!(fx.sim().person.as_ref().unwrap().data[8], 1);
     // The type in the view's second list.
     let mut fx = turning();
     sim_definition(&mut fx)[101] |= 2;

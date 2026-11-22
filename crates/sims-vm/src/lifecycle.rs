@@ -79,6 +79,17 @@ const PAUSED: usize = 17;
 const BUILT: usize = 22;
 const GLOBAL_26: usize = 26;
 const DAYS_PLAYED: usize = 28;
+const BUDGET_MODE: usize = 32;
+
+/// MagiCoin inventory token (`TokensMagic.iff` `"Magic Token - Currency"`,
+/// `Sims.exe` `0x410282` / `0x556467`).
+pub const MAGIC_COIN_TOKEN_KIND: i32 = 7;
+pub const MAGIC_COIN_TOKEN_GUID: u32 = 0x99e8_1bec;
+/// Magic Town Creepy Hollow residential lots (`0x5500ee..0x5500f6`).
+pub const MAGIC_TOWN_RESIDENTIAL_LOTS: std::ops::RangeInclusive<u32> = 90..=92;
+const UITEXT_HOUSE_INFO_TABLE: u16 = 134;
+const DEFAULT_MAGIC_LOT_91_COST: i32 = 1500;
+const DEFAULT_MAGIC_LOT_OTHER_COST: i32 = 1000;
 
 /// Object data words.
 const DATA_FLAGS: usize = 43;
@@ -153,6 +164,12 @@ pub enum LifecycleError {
         available: i32,
         required: i32,
     },
+    InsufficientMagicCoins {
+        family: u16,
+        house: u32,
+        available: i32,
+        required: i32,
+    },
     NeighborhoodMismatch {
         expected: String,
         actual: String,
@@ -208,6 +225,15 @@ impl fmt::Display for LifecycleError {
                 f,
                 "family {family} has ${available} but house {house} costs ${required}"
             ),
+            Self::InsufficientMagicCoins {
+                family,
+                house,
+                available,
+                required,
+            } => write!(
+                f,
+                "family {family} has {available} MagiCoins but house {house} requires {required} MagiCoins"
+            ),
             Self::NeighborhoodMismatch { expected, actual } => write!(
                 f,
                 "lot was opened from neighborhood {expected:?}, cannot save into {actual:?}"
@@ -243,6 +269,8 @@ pub struct MoveInReport {
     pub budget_before: i32,
     pub budget_after: i32,
     pub architecture_value: i32,
+    pub committed_instance_id: u128,
+    pub committed_revision: u64,
 }
 
 /// Summary of [`evict`].
@@ -1366,9 +1394,144 @@ pub fn lot_price(
     ))
 }
 
+/// Counts a household's MagiCoins from its members' `NGBH` inventories,
+/// matching `Sims.exe` `0x410282`: for each member GUID in order, looks up the
+/// first neighbor record matching that GUID (`0x42571f`), finds its inventory
+/// (`0x42a8a1`), and sums the first `(kind = 7, guid = 0x99e81bec)` token count
+/// (`0x41f660`), sign-extended through 16 bits (`0x4102fc`).
+pub fn family_magic_coins(stored: &StoredNeighborhood, family_id: u16) -> i32 {
+    let Some(family) = stored.families.get(&family_id) else {
+        return 0;
+    };
+    let mut sum = 0i32;
+    for &guid in &family.members {
+        if guid == 0 {
+            continue;
+        }
+        let Some(record) = stored
+            .neighbors
+            .iter()
+            .flatten()
+            .find(|record| record.guid == guid)
+        else {
+            continue;
+        };
+        let Some(inventory) = stored
+            .inventories
+            .iter()
+            .flatten()
+            .find(|inv| inv.neighbor == record.id)
+        else {
+            continue;
+        };
+        if let Some(item) = inventory
+            .items
+            .iter()
+            .find(|item| item.kind == MAGIC_COIN_TOKEN_KIND && item.guid == MAGIC_COIN_TOKEN_GUID)
+        {
+            sum = sum.wrapping_add(i32::from(item.count as i16));
+        }
+    }
+    i32::from(sum as i16)
+}
+
+/// Returns the MagiCoin cost for moving into `house`, matching `Sims.exe`
+/// `0x5500c5..0x550124`:
+/// - `91` (`0x5b`, Alfred's B & B): `UIText.iff STR# 134[32]` (default `1500`)
+/// - `90` / `92` (EverAfter Oaks / Old Man Lum's): `STR# 134[33]` (default `1000`)
+/// - All other lots: `0`.
+pub fn magic_town_lot_cost(install_root: Option<&Path>, house: u32) -> i32 {
+    if !MAGIC_TOWN_RESIDENTIAL_LOTS.contains(&house) {
+        return 0;
+    }
+    let (idx, fallback) = if house == 91 {
+        (32usize, DEFAULT_MAGIC_LOT_91_COST)
+    } else {
+        (33usize, DEFAULT_MAGIC_LOT_OTHER_COST)
+    };
+    let Some(root) = install_root else {
+        return fallback;
+    };
+    let Ok(install) = Install::detect(root) else {
+        return fallback;
+    };
+    let Ok(path) = install.file("GameData/UIText.iff") else {
+        return fallback;
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return fallback;
+    };
+    let Ok(iff) = Iff::parse(bytes) else {
+        return fallback;
+    };
+    let Some(chunk) = iff.get(b"STR#", UITEXT_HOUSE_INFO_TABLE) else {
+        return fallback;
+    };
+    let Ok(table) = StringTable::parse(iff.data(chunk)) else {
+        return fallback;
+    };
+    table
+        .get(idx, US_ENGLISH)
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .unwrap_or(fallback)
+}
+
+/// Deducts `amount` MagiCoins across `family_id`'s members' inventories in
+/// member order, matching `Sims.exe` `0x556467` (`0x41f660` + `0x41f49b`).
+fn deduct_family_magic_coins(stored: &mut StoredNeighborhood, family_id: u16, mut remaining: i32) {
+    if remaining <= 0 {
+        return;
+    }
+    let Some(members) = stored.families.get(&family_id).map(|f| f.members.clone()) else {
+        return;
+    };
+    for guid in members {
+        if remaining <= 0 {
+            break;
+        }
+        if guid == 0 {
+            continue;
+        }
+        let Some(neighbor_id) = stored
+            .neighbors
+            .iter()
+            .flatten()
+            .find(|record| record.guid == guid)
+            .map(|record| record.id)
+        else {
+            continue;
+        };
+        let Some(inventory) = stored
+            .inventories
+            .iter_mut()
+            .flatten()
+            .find(|inv| inv.neighbor == neighbor_id)
+        else {
+            continue;
+        };
+        if let Some(pos) = inventory.items.iter().position(|item| {
+            item.kind == MAGIC_COIN_TOKEN_KIND && item.guid == MAGIC_COIN_TOKEN_GUID
+        }) {
+            let have = i32::from(inventory.items[pos].count as i16);
+            if have <= 0 {
+                continue;
+            }
+            let take = remaining.min(have);
+            let left = have - take;
+            if left <= 0 {
+                inventory.items.remove(pos);
+            } else {
+                inventory.items[pos].count = left as u16;
+            }
+            remaining -= take;
+        }
+    }
+}
+
 /// Moves a Family Bin household (`house == 0`) onto an unoccupied residential
 /// lot (`zoning == 1`), validating funds against `lot_price` using the
-/// install's `FCNS #4` `"architecture value multiplier"`.
+/// install's `FCNS #4` `"architecture value multiplier"` and (for Magic Town
+/// residential lots `90..=92`) validating and deducting MagiCoins.
 pub fn move_in(
     install_root: &Path,
     store: &NeighborhoodStore,
@@ -1377,12 +1540,14 @@ pub fn move_in(
     house: u32,
 ) -> Result<MoveInReport, LifecycleError> {
     let tuning = NeighborhoodTuning::from_install(install_root);
-    move_in_with_multiplier(
+    let magic_cost = magic_town_lot_cost(Some(install_root), house);
+    move_in_inner(
         store,
         neighborhood_id,
         family_id,
         house,
         tuning.arch_value_multiplier,
+        magic_cost,
     )
 }
 
@@ -1395,6 +1560,25 @@ pub fn move_in_with_multiplier(
     family_id: u16,
     house: u32,
     arch_multiplier: f32,
+) -> Result<MoveInReport, LifecycleError> {
+    let magic_cost = magic_town_lot_cost(None, house);
+    move_in_inner(
+        store,
+        neighborhood_id,
+        family_id,
+        house,
+        arch_multiplier,
+        magic_cost,
+    )
+}
+
+fn move_in_inner(
+    store: &NeighborhoodStore,
+    neighborhood_id: &str,
+    family_id: u16,
+    house: u32,
+    arch_multiplier: f32,
+    required_magic: i32,
 ) -> Result<MoveInReport, LifecycleError> {
     let mut stored = store
         .load_neighborhood(neighborhood_id)?
@@ -1446,6 +1630,17 @@ pub fn move_in_with_multiplier(
             required,
         });
     }
+    if required_magic > 0 {
+        let available_magic = family_magic_coins(&stored, family_id);
+        if available_magic < required_magic {
+            return Err(LifecycleError::InsufficientMagicCoins {
+                family: family_id,
+                house,
+                available: available_magic,
+                required: required_magic,
+            });
+        }
+    }
 
     let family = stored.families.get_mut(&family_id).expect("checked above");
     // 0x4282ff..0x428308 + 0x42735b..0x427376:
@@ -1456,15 +1651,18 @@ pub fn move_in_with_multiplier(
     family.house = i32::try_from(house).map_err(|e| LifecycleError::Lot(e.to_string()))?;
     family.flags = (family.flags & !FAMILY_FLAG_BIT_3) | FAMILY_FLAG_NEW_MOVE_IN;
     let budget_after = family.budget;
+    if required_magic > 0 {
+        deduct_family_magic_coins(&mut stored, family_id, required_magic);
+    }
     stored.revision = stored.revision.saturating_add(1);
 
-    match store.save_neighborhood_checked(
+    let (committed_instance_id, committed_revision) = match store.save_neighborhood_checked(
         neighborhood_id,
         origin_instance_id,
         origin_revision,
         &stored,
     )? {
-        Ok((_, _)) => {}
+        Ok(version) => version,
         Err(CheckedCommitError::InstanceMismatch { expected, current }) => {
             return Err(LifecycleError::NeighborhoodMismatch {
                 expected: format!("{neighborhood_id}#{expected:032x}"),
@@ -1478,7 +1676,7 @@ pub fn move_in_with_multiplier(
                 current_revision: current,
             });
         }
-    }
+    };
     Ok(MoveInReport {
         family: family_id,
         house,
@@ -1486,6 +1684,8 @@ pub fn move_in_with_multiplier(
         budget_before,
         budget_after,
         architecture_value: required,
+        committed_instance_id,
+        committed_revision,
     })
 }
 
@@ -1775,6 +1975,16 @@ fn boot_from_saved_lot(
         }
 
         let residents_before = world.residents();
+        // An occupied residential lot is in Live mode, never vacant edit mode
+        // (`global[32] == 1`). Clearing `global[32]` before `select_family`
+        // ensures `World::set_funds` writes the arriving household's funds
+        // instead of keeping a previously edited vacant lot's edit budget.
+        if family_id != 0
+            && stored.is_residential(house)
+            && let Some(edit_budget) = world.globals.get_mut(BUDGET_MODE)
+        {
+            *edit_budget = 0;
+        }
         world
             .select_family(
                 i16::try_from(family_id).map_err(|e| LifecycleError::Lot(e.to_string()))?,
@@ -1953,7 +2163,7 @@ fn boot_from_saved_lot(
     let play = Play { fresh: saved.fresh };
     Ok(Lot {
         program,
-        catalog,
+        catalog: std::sync::Arc::new(catalog),
         surfaces,
         world,
         tuning: None,
@@ -2214,6 +2424,16 @@ fn boot_from_base_house(
         load.family = family_id;
         load.house = house;
         let residents = world.residents();
+        // Base residential houses (notably Magic Town lots 90..=92) can store
+        // `global[32] == 1` from when they were authored vacant; clear it
+        // before `select_family` when an occupying household enters Live mode.
+        if enter_live
+            && family_id != 0
+            && stored.is_residential(house)
+            && let Some(edit_budget) = world.globals.get_mut(BUDGET_MODE)
+        {
+            *edit_budget = 0;
+        }
         world
             .select_family(
                 i16::try_from(family_id).map_err(|e| LifecycleError::Lot(e.to_string()))?,
@@ -2358,7 +2578,7 @@ fn boot_from_base_house(
     let loaded = world.hash();
     Ok(Lot {
         program,
-        catalog,
+        catalog: std::sync::Arc::new(catalog),
         surfaces,
         world,
         tuning: None,

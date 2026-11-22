@@ -98,16 +98,12 @@ use sims_core::F32;
 use sims_sim::World;
 use sims_sim::animator::{EPSILON, LOADED, UNSET};
 
-/// Person data words the draw reads or writes.
-const BODY: usize = 8;
+/// Person data words the draw reads.
 const UPPER_LEVEL: usize = 40;
-const KIND: usize = 65;
 /// Object data word 1: the direction.
 const DIRECTION: usize = 1;
-/// The definition word whose bit 3 makes the body follow person word 8
-/// (definition +0xcc), and the one whose bit 1 puts the type in the
-/// view's other list (definition +0xca, 0x4aad5a).
-const DEFINITION_FLAGS: usize = 102;
+/// The definition word whose bit 1 puts the type in the view's other list
+/// (definition +0xca, 0x4aad5a).
 const DEFINITION_LISTS: usize = 101;
 
 /// The control panel's mode (word +8 of the panel object, set by
@@ -193,27 +189,13 @@ impl Interpreter<'_> {
         let mut a = world.animators.get(&id).cloned().unwrap_or(LOADED);
 
         // 1. Byte +0xd8.
-        read_appearance_if_stale(world, self.program, id, &mut a.profile_stale)?;
+        read_appearance_if_stale(self.catalog, world, self.program, id, &mut a.profile_stale)?;
 
-        // 2. The body (0x58a178).
-        let data = &mut world
-            .objects
-            .get_mut(&id)
-            .and_then(|o| o.person.as_mut())
-            .ok_or_else(|| Trap::native(0x1c, "object is not a person"))?
-            .data;
-        if definition[DEFINITION_FLAGS] & 8 != 0 {
-            if word(data, BODY) > 0 {
-                return Err(Trap::Unsupported(
-                    "drawing a person whose body follows person word 8 (definition word 102 bit \
-                     3, 0x58a1ed) is not ported"
-                        .into(),
-                ));
-            }
-        } else if word(data, KIND) & 6 != 0 && word(data, BODY) != 0 {
-            data[BODY] = 0;
-            world.routing.unknown_words.remove(&(id, BODY));
-        }
+        // 2. The body (`0x590cb8` → `0x58a178(0)`): runs full dressing side
+        // effects (pet `data[8] = 0`, cached-guard early exit `0x58a333`,
+        // head invalidation `0x4eb0cc`/`0x4eb0eb`, lazy `.ndx` catalog loads &
+        // CRT RNG draws, and live slot updates).
+        crate::outfits::dress_person(self.catalog, self.program, world, id, false)?;
 
         // 3. Byte +0xdb: the first draw.
         let first = a.undrawn;

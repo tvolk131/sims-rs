@@ -17,6 +17,12 @@ impl Machine<'_, '_> {
             u8::try_from(word(operands, offset) as u16)
                 .map_err(|_| Trap::native(9, "invalid memory scope"))
         };
+        // 0x451e8d: binds `[esi + 0x128]` to `&[ebp + 0x0c]` before resolving
+        // the destination operand and never clears it.
+        self.world.scratch_ptr_set_to_next.remove(&self.me);
+        self.world.scratch_ptr_expression.remove(&self.me);
+        self.world.scratch_ptr_arg_slot.insert(self.me);
+        self.world.scratch_ptr_set.insert(self.me);
         let (destination, writable) = self.resolve(scope(2)?, word(operands, 0), true)?;
         // Resolution also reads the old value, so an unreadable destination
         // faults before the range is read or a number drawn. The value

@@ -141,6 +141,19 @@ impl Machine<'_, '_> {
         if let Cell::Data(id, LOCKOUT) = resolved.0 {
             self.wake(id)?;
         }
+        // 0x4538e3..0x453926 -> 0x4539c7 -> 0x45810c -> 0x4eb0eb -> 0x4e895e:
+        // resolving any person-data scope (18, 19, 30, 31) with write intent
+        // on word 68 (0x44), 74 (0x4a), or 84 (0x54) invalidates the running
+        // object's cached portrait slots and marks them dirty when the running
+        // object's GUID is in the portrait table (`0x4eb0eb` exits if `0x4e9753`
+        // misses).
+        if write && matches!(resolved.0, Cell::Person(_, 68 | 74 | 84)) {
+            let guid = self.world.objects[&self.me].guid;
+            if self.in_portrait_table(guid)? {
+                self.world.portraits.remove(&guid);
+                self.world.dirty_portraits.insert(guid);
+            }
+        }
         Ok(resolved)
     }
 

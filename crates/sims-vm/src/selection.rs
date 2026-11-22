@@ -635,6 +635,7 @@ mod tests {
             people: Default::default(),
             icon_frames: None,
             wardrobe: None,
+            ordered_wardrobe: None,
             character_files: Default::default(),
             expansions: 0,
             characters: Default::default(),

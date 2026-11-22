@@ -258,17 +258,22 @@ impl Interpreter<'_> {
             ));
         }
         let mut crt = world.crt_rng;
-        let mut draws = Draws {
-            stream: &mut crt,
-            count: 0,
+        let mut registry = SavedPersonRegistry {
+            draws: Draws {
+                stream: &mut crt,
+                count: 0,
+            },
+            files: world.skeleton_files.clone(),
+            loaded_skeletons: world.loaded_indexed_skeletons.clone(),
+            loaded_suits: world.loaded_indexed_suits.clone(),
+            loaded_suit_bones: world.loaded_indexed_suit_bones.clone(),
+            runtime_added_suits: world.runtime_added_suits.clone(),
         };
-        let mut files = world.skeleton_files.clone();
         let expansions = world.globals.get(20).copied().unwrap_or(0);
         let mut objects = BTreeMap::new();
         let mut order = Vec::new();
-        // First every object is constructed, then every object is read.
-        // Only construction draws, so one pass in the file's order gives
-        // the same stream.
+        // Pass 1: construct every object in saved file order (`0x45962b` ->
+        // `0x58838b` -> `0x5a0384` skeleton resolution + default traits).
         for &id in &saved.order {
             let Some(instance) = saved.instances.get(&id) else {
                 continue;
@@ -278,8 +283,7 @@ impl Interpreter<'_> {
                     instance,
                     people,
                     &world.neighbors,
-                    &mut draws,
-                    &mut files,
+                    &mut registry,
                     expansions,
                 )
                 .map_err(|trap| fail(id, trap))?;
@@ -287,6 +291,78 @@ impl Interpreter<'_> {
                 return Err(fail(id, Trap::Invalid("a saved ID is listed twice".into())));
             }
             order.push(id);
+        }
+        // Pass 2: bind every saved person's serialized appearance slots
+        // (`0x591ab4..0x591aff` -> `0x583541`), dirty portrait on non-empty
+        // saved head (`0x591b01..0x591b58` -> `0x4eb0eb`), and bind saved
+        // accessories (`0x591b66..0x591bf8` -> `0x583541`) in saved order.
+        let mut person_outfits = BTreeMap::new();
+        let mut dirtied_portraits = Vec::new();
+        for &id in &order {
+            let object = &objects[&id];
+            let Some(person) = object.person.as_ref() else {
+                continue;
+            };
+            let mut outfit = sims_sim::PersonOutfit::new();
+            // 0x591acc / 0x591ad7 deserialize the saved head strings into the
+            // live head slot BEFORE `0x591ae2` checks the `GROWN` flag, and
+            // `0x591b01..0x591b53` compares those deserialized strings against
+            // empty (`""`, `""`) regardless of whether `0x583541` was skipped
+            // or failed lookup.
+            if !person.appearance[8].is_empty() || !person.appearance[9].is_empty() {
+                dirtied_portraits.push(object.guid);
+            }
+            // 0x4400ef -> 0x45cf79 -> 0x591ae2 / 0x591bdc: for the special
+            // types in `GROWN`, native loading sets the flag passed into
+            // `cTSPerson::Read`, skipping saved appearance and accessory
+            // attachment (`0x583541`).
+            if grows(object.guid, expansions) {
+                person_outfits.insert(id, outfit);
+                continue;
+            }
+            let mut bind = |suit: &str, texture: &str| -> Option<sims_sim::BoundSlot> {
+                if suit.is_empty() {
+                    return None;
+                }
+                // 0x591af3 / 0x591bf3 pass serialized names directly to
+                // `0x5a044d` -> `0x5a27f2` (byte-exact, no case folding).
+                let mut reg = crate::people::RegistryMut {
+                    loaded_skeletons: &mut registry.loaded_skeletons,
+                    loaded_suits: &mut registry.loaded_suits,
+                    loaded_suit_bones: &mut registry.loaded_suit_bones,
+                    runtime_added_suits: &mut registry.runtime_added_suits,
+                    draws: &mut registry.draws,
+                    files: &mut registry.files,
+                };
+                match crate::people::resolve_suit_into(people, suit, &mut reg) {
+                    crate::people::ResolvedSuit::Found(has_head) => Some(sims_sim::BoundSlot {
+                        suit: suit.to_owned(),
+                        texture: texture.to_owned(),
+                        has_head: Some(has_head),
+                    }),
+                    crate::people::ResolvedSuit::Missing => None,
+                    crate::people::ResolvedSuit::Unknown => Some(sims_sim::BoundSlot {
+                        suit: suit.to_owned(),
+                        texture: texture.to_owned(),
+                        has_head: None,
+                    }),
+                }
+            };
+            // 0x591a52..0x591aff: 5 slot pairs in exact native order:
+            // body [0..2], body_alt [2..4], extra_left [4..6], extra_right [6..8], head [8..10].
+            outfit.body = bind(&person.appearance[0], &person.appearance[1]);
+            outfit.body_alt = bind(&person.appearance[2], &person.appearance[3]);
+            outfit.extra_left = bind(&person.appearance[4], &person.appearance[5]);
+            outfit.extra_right = bind(&person.appearance[6], &person.appearance[7]);
+            outfit.head = bind(&person.appearance[8], &person.appearance[9]);
+            // 0x591b66..0x591bf8: bind each serialized accessory via 0x583541
+            // (byte-exact); only successfully bound entries attach to `[ebx + 0x274]`.
+            for acc in &person.accessories {
+                if let Some(bound) = bind(&acc.name, &acc.binding) {
+                    outfit.accessories.push(bound);
+                }
+            }
+            person_outfits.insert(id, outfit);
         }
         for &(id, index) in frame_tree_bits {
             if index == 0 {
@@ -354,9 +430,26 @@ impl Interpreter<'_> {
                 contexts.insert(id, vec![crate::routing::slot::loaded_context(); frames]);
             }
         }
+        let SavedPersonRegistry {
+            draws,
+            files,
+            loaded_skeletons,
+            loaded_suits,
+            loaded_suit_bones,
+            runtime_added_suits,
+        } = registry;
         let count = draws.count;
         world.crt_rng = crt;
         world.skeleton_files = files;
+        world.loaded_indexed_skeletons = loaded_skeletons;
+        world.loaded_indexed_suits = loaded_suits;
+        world.loaded_indexed_suit_bones = loaded_suit_bones;
+        world.runtime_added_suits = runtime_added_suits;
+        world.person_outfits.extend(person_outfits);
+        for guid in dirtied_portraits {
+            world.portraits.remove(&guid);
+            world.dirty_portraits.insert(guid);
+        }
         for &id in &order {
             if let Some(instances) = world.instances.get_mut(&objects[&id].guid) {
                 instances.push(id);
@@ -404,8 +497,7 @@ impl Interpreter<'_> {
         saved: &Instance,
         people: &People,
         neighbors: &Neighbors,
-        draws: &mut Draws<'_>,
-        files: &mut BTreeSet<String>,
+        registry: &mut SavedPersonRegistry<'_>,
         expansions: i16,
     ) -> Result<Object, Trap> {
         let definition = self
@@ -447,7 +539,7 @@ impl Interpreter<'_> {
             .containers(definition.resource, definition.chunk);
         let slots = 1 + containers + if person { PERSON_SLOTS } else { 0 };
         if person {
-            construct_person(saved.guid, people, neighbors, draws, files)?;
+            construct_person(saved.guid, people, neighbors, registry)?;
         }
         // The read (the object's function at vtable offset 0x7c, 0x4342ae).
         // From version 0x18 the saved attribute count comes first; when it
@@ -514,22 +606,39 @@ impl Interpreter<'_> {
     }
 }
 
+/// Mutable avatar-registry and CRT-RNG state threaded through saved-object
+/// construction so saved-house loads fail transactionally on error.
+struct SavedPersonRegistry<'a> {
+    draws: Draws<'a>,
+    files: BTreeSet<String>,
+    loaded_skeletons: BTreeMap<String, Option<String>>,
+    loaded_suits: BTreeMap<String, Option<bool>>,
+    loaded_suit_bones: BTreeMap<String, Vec<Vec<String>>>,
+    runtime_added_suits: Vec<String>,
+}
+
 /// A person's constructor, as far as it draws random numbers (0x45962b).
 fn construct_person(
     guid: u32,
     people: &People,
     neighbors: &Neighbors,
-    draws: &mut Draws<'_>,
-    files: &mut BTreeSet<String>,
+    registry: &mut SavedPersonRegistry<'_>,
 ) -> Result<(), Trap> {
-    // The house's people are of the types the catalog registered, never
-    // of one made while the game ran.
-    let skeleton = people.skeletons.get(&guid).ok_or_else(|| {
-        Trap::Unsupported(format!(
-            "no skeleton was supplied for the person type 0x{guid:08X}"
-        ))
-    })?;
-    build_skeleton(skeleton, draws, files)?;
+    // 0x58838b -> 0x5a073b -> 0x5a0384: saved-house people resolve through the
+    // avatar registry in load order, populating sibling skeletons & appearances
+    // from any lazy `.ndx` `.bcf` catalog they open.
+    let skeleton = {
+        let mut reg = crate::people::RegistryMut {
+            loaded_skeletons: &mut registry.loaded_skeletons,
+            loaded_suits: &mut registry.loaded_suits,
+            loaded_suit_bones: &mut registry.loaded_suit_bones,
+            runtime_added_suits: &mut registry.runtime_added_suits,
+            draws: &mut registry.draws,
+            files: &mut registry.files,
+        };
+        crate::people::resolve_skeleton_for_saved(people, guid, &mut reg)?
+    };
+    build_skeleton(skeleton, &mut registry.draws, &mut registry.files)?;
     // The first record of the person's type, in slot order.
     let record = neighbors.first_of(guid).ok_or_else(|| {
         Trap::Unsupported(format!(
@@ -552,7 +661,7 @@ fn construct_person(
         }
     }
     if defaults {
-        draws.default_traits();
+        registry.draws.default_traits();
     }
     Ok(())
 }

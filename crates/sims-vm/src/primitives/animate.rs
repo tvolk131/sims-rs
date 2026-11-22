@@ -146,7 +146,13 @@ impl Machine<'_, '_> {
         if !a.playing {
             // 0x5893b3 first reads the person's appearance again if the
             // animator says so.
-            read_appearance_if_stale(self.world, self.program, self.me, &mut a.profile_stale)?;
+            read_appearance_if_stale(
+                self.catalog,
+                self.world,
+                self.program,
+                self.me,
+                &mut a.profile_stale,
+            )?;
             let (name, duration, frames, bound, tracks) = self.clip(operands, id)?;
             a.events.clear();
             a.clear_foreground();
@@ -338,7 +344,13 @@ impl Machine<'_, '_> {
             }
             a.carry_mode = 0;
         } else {
-            read_appearance_if_stale(self.world, self.program, self.me, &mut a.profile_stale)?;
+            read_appearance_if_stale(
+                self.catalog,
+                self.world,
+                self.program,
+                self.me,
+                &mut a.profile_stale,
+            )?;
             let (name, duration, frames, bound, tracks) = self.clip(operands, id)?;
             a.slow = flags & 0x80 != 0;
             if a.carry.take().is_some() {
@@ -405,7 +417,13 @@ impl Machine<'_, '_> {
             clear_base(self.world, self.me, a);
             return Ok(Flow::Branch(true));
         }
-        read_appearance_if_stale(self.world, self.program, self.me, &mut a.profile_stale)?;
+        read_appearance_if_stale(
+            self.catalog,
+            self.world,
+            self.program,
+            self.me,
+            &mut a.profile_stale,
+        )?;
         let (name, _, _, _, _) = self.clip(operands, id)?;
         a.slow = flags & 0x80 != 0;
         let reverse = flags & 0x02 != 0;
