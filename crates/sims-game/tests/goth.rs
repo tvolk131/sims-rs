@@ -7738,7 +7738,12 @@ fn buy_mode_hand_tool_guards_depreciation_undo_redo_and_followups() {
         assert_eq!(lot5.world().budget.funds, funds_after_stale_undo);
         lot5.buy_cancel(&stale_cur).unwrap();
         assert!(!lot5.world().objects.contains_key(&stale_cur.cursor));
-        assert!(!lot5.world().objects.contains_key(&stale_chair));
+        assert!(
+            lot5.world()
+                .objects
+                .get(&stale_chair)
+                .is_none_or(|o| o.position[0] < 0)
+        );
         assert_eq!(lot5.world().budget.funds, funds_after_stale_undo);
 
         // P2 #1: Buy Redo affordability check after a refused Sell Redo.
@@ -7875,6 +7880,74 @@ fn buy_mode_hand_tool_guards_depreciation_undo_redo_and_followups() {
             lot6.set_mode_releasing_buy_cursor(sims_vm::PanelMode::Live, Some(&old_pick))
                 .unwrap();
             assert!(lot6.world().objects.contains_key(&chair2));
+
+            // Sol Round 7 regression: Undo while retaining a pickup handle
+            // invalidates it permanently, so even after a later commit purges
+            // the detached object and an unpaid preview or paid chair reuses
+            // its ID, the old pickup handle CANNOT sell, mutate, or delete the
+            // new object via buy_sell, buy_cancel, save_without_buy_cursor, or
+            // set_mode_releasing_buy_cursor.
+            lot6.set_mode(sims_vm::PanelMode::Buy).unwrap();
+            let mut u1 = lot6.buy_start(chair_guid, 1, 2).unwrap().unwrap();
+            assert!(lot6.buy_move(&mut u1, [600, 440], 1).unwrap());
+            let undone_chair = lot6.buy_commit(&u1).unwrap();
+            let stale_after_undo = lot6.buy_pick_up(undone_chair).unwrap().unwrap();
+            assert!(lot6.buy_undo().unwrap()); // detaches undone_chair, invalidates stale_after_undo
+            // Commit another chair to purge buy_redo and free `undone_chair`'s ID.
+            let mut other = lot6.buy_start(chair_guid, 1, 2).unwrap().unwrap();
+            assert!(lot6.buy_move(&mut other, [632, 440], 1).unwrap());
+            let _other_id = lot6.buy_commit(&other).unwrap();
+            assert!(!lot6.world().objects.contains_key(&undone_chair));
+            // Start a new unpaid preview that reuses `undone_chair`'s ID.
+            let mut reused_prev = lot6.buy_start(chair_guid, 1, 2).unwrap().unwrap();
+            assert_eq!(
+                reused_prev.held, undone_chair,
+                "expected new preview to reuse purged undone chair ID"
+            );
+            assert!(lot6.buy_move(&mut reused_prev, [600, 440], 1).unwrap());
+            let funds_before_stale_sell = lot6.world().budget.funds;
+            assert!(
+                !lot6.buy_sell(&stale_after_undo).unwrap(),
+                "invalidated pickup handle must not sell reused unpaid preview"
+            );
+            assert_eq!(lot6.world().budget.funds, funds_before_stale_sell);
+            assert!(lot6.world().objects.contains_key(&reused_prev.held));
+            // `save_without_buy_cursor(&stale_after_undo)` strips only the
+            // invalidated Tile Cursor, never deleting `reused_prev.held`.
+            let saved = lot6.save_without_buy_cursor(&stale_after_undo).unwrap();
+            assert!(!saved.world().objects.contains_key(&stale_after_undo.cursor));
+            assert!(saved.world().objects.contains_key(&reused_prev.held));
+            // Commit `reused_prev` into a paid chair and verify mode switch
+            // with `stale_after_undo` discards only its Tile Cursor and keeps
+            // the paid chair intact.
+            let paid_reused = lot6.buy_commit(&reused_prev).unwrap();
+            lot6.set_mode_releasing_buy_cursor(sims_vm::PanelMode::Live, Some(&stale_after_undo))
+                .unwrap();
+            assert!(!lot6.world().objects.contains_key(&stale_after_undo.cursor));
+            assert!(lot6.world().objects.contains_key(&paid_reused));
+
+            // Undo of a `Move` while holding a pickup handle for the same chair
+            // also invalidates the pickup handle without corrupting redo.
+            lot6.set_mode(sims_vm::PanelMode::Buy).unwrap();
+            let mut m1 = lot6.buy_pick_up(paid_reused).unwrap().unwrap();
+            assert!(lot6.buy_move(&mut m1, [552, 472], 1).unwrap());
+            assert_eq!(lot6.buy_commit(&m1).unwrap(), paid_reused);
+            let stale_after_move_undo = lot6.buy_pick_up(paid_reused).unwrap().unwrap();
+            assert!(lot6.buy_undo().unwrap());
+            assert!(lot6.can_buy_redo());
+            assert!(!lot6.buy_sell(&stale_after_move_undo).unwrap());
+            lot6.buy_cancel(&stale_after_move_undo).unwrap();
+            assert!(
+                lot6.can_buy_redo(),
+                "cancelling an invalidated pickup handle must not clear unrelated redo history"
+            );
+            assert!(
+                !lot6
+                    .world()
+                    .objects
+                    .contains_key(&stale_after_move_undo.cursor)
+            );
+            assert!(lot6.world().objects.contains_key(&paid_reused));
         }
     }
 }

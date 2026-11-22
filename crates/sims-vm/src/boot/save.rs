@@ -170,11 +170,11 @@ impl Lot {
         if self.halted {
             return Err(SaveError::Halted);
         }
-        let cursor = cursor.filter(|c| self.is_active_buy_cursor(c));
+        let active_cursor = cursor.and_then(|c| self.active_cursor_entry(c).map(|e| (c, e)));
         let mut world = self.world.clone();
         let has_history =
             !self.buy_redo.is_empty() || !self.buy_undo.is_empty() || !self.buy_orphans.is_empty();
-        if cursor.is_some() || has_history {
+        if active_cursor.is_some() || has_history {
             let sounds = std::cell::RefCell::new(Vec::new());
             let interpreter = crate::interpreter::Interpreter {
                 sounds: Some(&sounds),
@@ -189,15 +189,17 @@ impl Lot {
             // Strip any unpaid Buy preview first so an item linked into an
             // undone surface container's slot is cleanly unlinked and deleted
             // before detached history objects are purged.
-            if let Some(cursor) = cursor {
-                if self.is_stale_existing_cursor(&interpreter, cursor) {
-                    interpreter
-                        .buy_discard_tile_cursor(&mut world, cursor)
-                        .map_err(|e| {
-                            SaveError::Format(format!(
-                                "clearing stale Buy Mode cursor for save: {e}"
-                            ))
-                        })?;
+            if let Some((cursor, entry)) = active_cursor {
+                if entry.invalidated {
+                    if !entry.cursor_dead {
+                        interpreter
+                            .buy_discard_tile_cursor(&mut world, cursor)
+                            .map_err(|e| {
+                                SaveError::Format(format!(
+                                    "clearing stale Buy Mode cursor for save: {e}"
+                                ))
+                            })?;
+                    }
                 } else {
                     let live = self.strip_detached_origin_children(cursor);
                     interpreter.buy_cancel(&mut world, &live).map_err(|e| {
