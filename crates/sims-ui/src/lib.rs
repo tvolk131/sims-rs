@@ -2,6 +2,8 @@
 //!
 //! - [`hud`]: the live-mode control panel.
 //! - [`neighborhood`]: the neighborhood top controls bar and lot hover popup card.
+//! - [`loading`]: the startup splash and neighborhood/lot/travel loading screen.
+//! - [`travel`]: travel destination top chrome, filters, and travel-confirm dialogs.
 //! - [`family_bin`]: the Select a Family / Family Bin picker screen.
 //! - [`dialog`]: the dialogs scripts show.
 //! - [`balloon`]: the help balloons the panels open over the lot.
@@ -30,11 +32,13 @@ pub mod frame;
 pub mod house;
 pub mod household;
 pub mod hud;
+pub mod loading;
 pub mod neighborhood;
 pub mod options;
 pub mod pie;
 pub mod queue;
 pub mod thumbnail;
+pub mod travel;
 
 /// Why art could not be loaded.
 #[derive(Debug)]
