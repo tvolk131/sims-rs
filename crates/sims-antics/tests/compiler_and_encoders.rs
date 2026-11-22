@@ -904,4 +904,70 @@ tree 4097 "RoomsChanged" { return true; }
         .is_err()
     );
     assert!(encode_pcm16_wav(u32::MAX, &[0, 1]).is_err());
+
+    // 11. Sol Round 2 P1 fixes: implicit param[0] in set_to_next(6) and animate(),
+    // plus rejecting raw `op` mixed with high-level `idle()`.
+    let stn6 = compile_antics(
+        r#"
+tree 4096 "Stn6Idle" {
+    idle(2);
+    set_to_next(6);
+    return true;
+}
+"#,
+    )
+    .unwrap();
+    assert!(
+        stn6.behaviors[&4096].args >= 1,
+        "set_to_next(6) must infer args >= 1"
+    );
+    assert!(
+        stn6.behaviors[&4096].locals >= 1,
+        "set_to_next(6) + idle() must allocate scratch local to preserve param[0]"
+    );
+
+    let anim_p0 = compile_antics(
+        r#"
+tree 4096 "AnimParam0Idle" {
+    idle(2);
+    animate(clip: 0, flags: 4);
+    return true;
+}
+"#,
+    )
+    .unwrap();
+    assert!(anim_p0.behaviors[&4096].args >= 1);
+    assert!(
+        anim_p0.behaviors[&4096].locals >= 1,
+        "animate(clip: 0, flags: 4) + idle() must preserve param[0]"
+    );
+
+    let anim_ev = compile_antics(
+        r#"
+tree 4096 "AnimEvents" {
+    animate(clip: 1, events: 2);
+    return true;
+}
+"#,
+    )
+    .unwrap();
+    assert!(
+        anim_ev.behaviors[&4096].args >= 1,
+        "foreground animate with events != 0 writes param[0], so args >= 1 must be inferred"
+    );
+
+    // Mixing raw `op` and high-level `idle()` is rejected so raw locals cannot be clobbered.
+    assert!(
+        compile_antics(
+            r#"
+tree 4096 "MixedRawIdle" (locals: 1) {
+    op 0x0002 (0, 0, 7, 0, 0, 5, 25, 7) -> true: 1, false: 1;
+    idle(2);
+    my.attr[0] := param[0];
+    return true;
+}
+"#
+        )
+        .is_err()
+    );
 }

@@ -138,9 +138,9 @@ pub fn synthesize_wav(spec: &SynthSpec) -> Result<Vec<u8>> {
                 "synthesized WAV sample count {sample_count_u64} outside 1..={MAX_WAV_SAMPLES}"
             ))
         })?;
-    let attack_samples = ((u64::from(spec.sample_rate) * u64::from(spec.attack_ms)) / 1000)
-        .max(1)
-        .min(sample_count as u64) as usize;
+    let attack_samples =
+        usize::try_from(((u64::from(spec.sample_rate) * u64::from(spec.attack_ms)) / 1000).max(1))
+            .unwrap_or(usize::MAX);
 
     let mut samples = Vec::with_capacity(sample_count);
     let mut phase = 0.0f64;

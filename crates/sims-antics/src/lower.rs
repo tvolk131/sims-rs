@@ -105,6 +105,7 @@ struct PendingNode {
 #[derive(Debug, Default)]
 struct TreeUsage {
     only_raw_ops: bool,
+    has_raw_ops: bool,
     uses_idle: bool,
     uses_param0: bool,
     max_user_local: Option<usize>,
@@ -151,12 +152,29 @@ fn scan_primitive(prim: &PrimitiveCall, usage: &mut TreeUsage) {
             scan_operand(*delta_per_hour, usage);
             scan_operand(*stop_at, usage);
         }
+        PrimitiveCall::SetToNext { mode, .. } if mode & 0x7F == 6 => {
+            // Mode 6 matches objects whose data word 59 equals param[0] (`set_to_next.rs:28`).
+            usage.uses_param0 = true;
+        }
         PrimitiveCall::Animate {
-            flags, local_index, ..
-        } if flags & 0x20 != 0 => {
-            // Flag bit 0x20 stores animation events in `local_index`.
-            let idx = usize::from(*local_index);
-            usage.max_user_local = Some(usage.max_user_local.map_or(idx, |m| m.max(idx)));
+            clip_id,
+            flags,
+            events,
+            local_index,
+            ..
+        } => {
+            // Flag bit 0x04 takes the clip number from param[clip_id].
+            if flags & 0x04 != 0 && *clip_id == 0 {
+                usage.uses_param0 = true;
+            }
+            // Flag bit 0x20 stores events in local[local_index]; otherwise foreground
+            // animation events write to param[0] (`animate.rs:13`).
+            if flags & 0x20 != 0 {
+                let idx = usize::from(*local_index);
+                usage.max_user_local = Some(usage.max_user_local.map_or(idx, |m| m.max(idx)));
+            } else if *events != 0 && matches!(flags & 0x11, 0x00 | 0x11) {
+                usage.uses_param0 = true;
+            }
         }
         _ => {}
     }
@@ -177,7 +195,10 @@ fn scan_condition(cond: &Condition, usage: &mut TreeUsage) {
 fn scan_stmts(stmts: &[Stmt], usage: &mut TreeUsage) {
     for stmt in stmts {
         match stmt {
-            Stmt::Label { .. } | Stmt::RawOp { .. } => {}
+            Stmt::Label { .. } => {}
+            Stmt::RawOp { .. } => {
+                usage.has_raw_ops = true;
+            }
             Stmt::Primitive { prim, .. } => {
                 usage.only_raw_ops = false;
                 scan_primitive(prim, usage);
@@ -433,6 +454,9 @@ impl<'a> TreeBuilder<'a> {
             }
             PrimitiveCall::ClearMotiveChanges => Ok((29, [0, 0, 0, 1, 0, 0, 0, 0])),
             PrimitiveCall::SetToNext { mode, guid } => {
+                if mode & 0x7F == 6 {
+                    self.note_operand(Operand::new(9, 0), span)?;
+                }
                 let [g0, g1, g2, g3] = guid.to_le_bytes();
                 Ok((31, [g0, g1, g2, g3, *mode & 0x7F, 0, 0, 0]))
             }
@@ -471,6 +495,8 @@ impl<'a> TreeBuilder<'a> {
             } => {
                 if flags & 0x20 != 0 {
                     self.note_operand(Operand::new(25, i16::from(*local_index)), span)?;
+                } else if *events != 0 && matches!(flags & 0x11, 0x00 | 0x11) {
+                    self.note_operand(Operand::new(9, 0), span)?;
                 }
                 if flags & 0x04 != 0 {
                     self.note_operand(Operand::new(9, *clip_id as i16), span)?;
@@ -993,6 +1019,16 @@ fn lower_tree(tree: &TreeDecl, tree_ids: &BTreeMap<String, u16>) -> Result<BhavC
         })?;
 
     let usage = scan_tree_usage(&tree.body);
+    if usage.has_raw_ops && usage.uses_idle {
+        return Err(Error::at(
+            tree.span,
+            format!(
+                "tree '{}' mixes raw 'op' instructions with high-level 'idle()'; \
+                 raw operands may alias locals/params — use explicit 'sleep(param[N])' instead",
+                tree.label
+            ),
+        ));
+    }
     let idle_scratch_local = if usage.uses_idle && usage.uses_param0 {
         let scratch = usage.max_user_local.map_or(0, |m| m + 1);
         if scratch >= max_allowed_locals {

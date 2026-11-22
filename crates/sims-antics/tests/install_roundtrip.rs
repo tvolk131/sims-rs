@@ -208,7 +208,15 @@ fn complete_collection_in_memory_chunk_roundtrip_parity() {
                     let s = stats.entry(tag_key).or_default();
                     s.attempted += 1;
                     if StringTable::parse(data).is_err() {
-                        s.reader_rejected += 1;
+                        if StringTable::parse_chunk(data, iff.resource_flags(chunk)).is_ok() {
+                            s.unexpected_skips += 1;
+                            unexpected_notes.push(format!(
+                                "{loc} {tag_key} #{}: flag-aware parse_chunk succeeded where StringTable::parse failed",
+                                chunk.id
+                            ));
+                        } else {
+                            s.reader_rejected += 1;
+                        }
                         continue;
                     }
                     let lifted = match lift_string_table(chunk.tag, chunk.id, &chunk.label, data) {
