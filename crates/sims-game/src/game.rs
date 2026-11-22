@@ -101,6 +101,8 @@ pub struct Outcome {
     pub quit: bool,
     /// The player accepted returning to the Neighborhood screen (`0x5170f0..0x51713c`).
     pub neighborhood: bool,
+    /// The player clicked the Options → Saves ("Load / Manage Saves") button.
+    pub open_save_manager: bool,
 }
 
 impl Outcome {
@@ -238,6 +240,18 @@ pub struct Game {
     drawn_camera: Camera,
     lot_depth: Vec<i32>,
     people_ids: sims_render::Ids,
+    /// Explicit override enabling 400 ms pie-menu animations even at `clock_us == 0`.
+    /// Also enabled automatically whenever `clock_us > 0` (live window / `advance`).
+    pie_animations: bool,
+    /// Classic cheat console toggles (`move_objects`, `map_edit`, `autonomy`, `sim_speed`).
+    cheat_move_objects: bool,
+    cheat_map_edit: bool,
+    cheat_autonomy: Option<u8>,
+    cheat_sim_speed: Option<i16>,
+    /// True once `Lot::restore` cleared `neighborhood_origin` (after loading a save
+    /// slot or applying a world-mutating cheat), signaling `NeighborhoodShell` to
+    /// write back via `StoredNeighborhood::write_back_world`.
+    world_mutated_via_restore: bool,
 }
 
 impl Game {
@@ -591,6 +605,12 @@ impl Game {
             drawn_camera,
             lot_depth: Vec::new(),
             people_ids: sims_render::Ids::default(),
+            pie_animations: false,
+            cheat_move_objects: false,
+            cheat_map_edit: false,
+            cheat_autonomy: None,
+            cheat_sim_speed: None,
+            world_mutated_via_restore: false,
         };
         game.sync_view();
         if edit_mode && game.stopped.is_none() {
@@ -831,6 +851,12 @@ impl Game {
             drawn_camera,
             lot_depth: Vec::new(),
             people_ids: sims_render::Ids::default(),
+            pie_animations: false,
+            cheat_move_objects: false,
+            cheat_map_edit: false,
+            cheat_autonomy: None,
+            cheat_sim_speed: None,
+            world_mutated_via_restore: false,
         };
         game.sync_view();
         if edit_mode && game.stopped.is_none() {
@@ -890,6 +916,299 @@ impl Game {
             || self.hud.dragging_slider()
             || self.hud.dragging_dialog_entry()
             || self.has_dialog()
+            || self.pie_animating()
+            || self.cheat_console_open()
+    }
+
+    /// Enables or disables 400 ms pie-menu pop-in / submenu glide / direction
+    /// ease-out animations explicitly (also enabled automatically once `clock_us > 0`).
+    pub fn set_pie_animations(&mut self, enabled: bool) {
+        self.pie_animations = enabled;
+    }
+
+    fn pie_animations_active(&self) -> bool {
+        self.pie_animations || self.clock_us > 0
+    }
+
+    /// Whether an open pie menu currently has an active 400 ms animation
+    /// (backdrop pop-in, submenu glide, or head direction ease-out).
+    pub fn pie_animating(&self) -> bool {
+        let now_ms = (self.clock_us / 1_000) as u32;
+        self.hud
+            .menu
+            .as_ref()
+            .is_some_and(|m| m.is_animating(now_ms))
+    }
+
+    /// Whether the lot's live `World` was replaced via `Lot::restore` (e.g.
+    /// Save Manager load or world-mutating cheat), clearing `neighborhood_origin`.
+    pub fn world_mutated_via_restore(&self) -> bool {
+        self.world_mutated_via_restore
+    }
+
+    /// Marks the lot clean after an external host/REDB save succeeds.
+    pub fn mark_saved_clean(&mut self, note: impl Into<String>) {
+        self.dirty = false;
+        self.note = Some(note.into());
+    }
+
+    /// Whether `move_objects on` is currently enabled via the cheat console.
+    pub fn cheat_move_objects(&self) -> bool {
+        self.cheat_move_objects
+    }
+
+    /// Whether `map_edit on` is currently enabled via the cheat console.
+    pub fn cheat_map_edit(&self) -> bool {
+        self.cheat_map_edit
+    }
+
+    /// Last `autonomy <0..=100>` level applied via the cheat console, if any.
+    pub fn cheat_autonomy(&self) -> Option<u8> {
+        self.cheat_autonomy
+    }
+
+    /// Last `sim_speed <-1000..=1000>` value applied via the cheat console, if any.
+    pub fn cheat_sim_speed(&self) -> Option<i16> {
+        self.cheat_sim_speed
+    }
+
+    /// Screen rectangle of the Options-strip "Saves" button when visible.
+    pub fn options_saves_button_rect(&self) -> Option<sims_ui::frame::Rect> {
+        self.hud.options_saves_button_rect()
+    }
+
+    /// Read-only access to the classic top-left cheat console (`Ctrl+Shift+C`).
+    pub fn cheat_console(&self) -> &sims_ui::cheat_console::CheatConsole {
+        &self.hud.cheat_console
+    }
+
+    /// Whether the classic cheat console overlay is currently open.
+    pub fn cheat_console_open(&self) -> bool {
+        self.hud.cheat_console.is_open()
+    }
+
+    /// Toggles the classic cheat console (`Ctrl+Shift+C` / `Cmd+Shift+C`).
+    pub fn toggle_cheat_console(&mut self) -> bool {
+        self.hud.cheat_console.toggle()
+    }
+
+    /// Closes the cheat console if open; returns `true` if it was open.
+    pub fn close_cheat_console(&mut self) -> bool {
+        if self.hud.cheat_console.is_open() {
+            self.hud.cheat_console.close();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn cheat_console_char(&mut self, ch: char) -> bool {
+        self.hud.cheat_console.insert_char(ch)
+    }
+
+    pub fn cheat_console_backspace(&mut self) -> bool {
+        self.hud.cheat_console.backspace()
+    }
+
+    pub fn cheat_console_delete(&mut self) -> bool {
+        self.hud.cheat_console.delete_forward()
+    }
+
+    pub fn cheat_console_left(&mut self) -> bool {
+        self.hud.cheat_console.move_left()
+    }
+
+    pub fn cheat_console_right(&mut self) -> bool {
+        self.hud.cheat_console.move_right()
+    }
+
+    pub fn cheat_console_home(&mut self) -> bool {
+        self.hud.cheat_console.move_home()
+    }
+
+    pub fn cheat_console_end(&mut self) -> bool {
+        self.hud.cheat_console.move_end()
+    }
+
+    pub fn cheat_console_history_up(&mut self) -> bool {
+        self.hud.cheat_console.history_up()
+    }
+
+    pub fn cheat_console_history_down(&mut self) -> bool {
+        self.hud.cheat_console.history_down()
+    }
+
+    /// Submits the current cheat console input line and executes every emitted
+    /// [`sims_ui::cheat_console::CheatCommand`] against the active lot.
+    pub fn cheat_console_submit(
+        &mut self,
+    ) -> Result<Vec<sims_ui::cheat_console::CheatCommand>, sims_ui::cheat_console::CheatParseError>
+    {
+        let commands = self.hud.cheat_console.submit()?;
+        self.execute_cheat_commands(&commands);
+        Ok(commands)
+    }
+
+    /// Executes a batch of parsed [`sims_ui::cheat_console::CheatCommand`]s
+    /// cleanly against `self` and updates console feedback.
+    pub fn execute_cheat_commands(&mut self, commands: &[sims_ui::cheat_console::CheatCommand]) {
+        use sims_ui::cheat_console::{CheatCommand, FeedbackKind};
+
+        let mut total_funds_delta: i32 = 0;
+        let mut target_hour: Option<u8> = None;
+        let mut messages: Vec<String> = Vec::new();
+        let mut saw_help = false;
+
+        for cmd in commands {
+            match *cmd {
+                CheatCommand::AddFunds(amount) => {
+                    total_funds_delta = total_funds_delta.saturating_add(amount);
+                }
+                CheatCommand::SetHour(hour) => {
+                    target_hour = Some(hour % 24);
+                }
+                CheatCommand::MoveObjects(on) => {
+                    self.cheat_move_objects = on;
+                    messages.push(format!("move_objects {}", if on { "on" } else { "off" }));
+                }
+                CheatCommand::MapEdit(on) => {
+                    self.cheat_map_edit = on;
+                    self.lot.set_edit_budget(on);
+                    messages.push(format!("map_edit {}", if on { "on" } else { "off" }));
+                }
+                CheatCommand::WaterTool => {
+                    self.set_mode(Mode::Build);
+                    self.select_build_tool(BuildTool::Water);
+                    messages.push("Water tool selected".into());
+                }
+                CheatCommand::Autonomy(level) => {
+                    self.cheat_autonomy = Some(level);
+                    let free_will = level > 0;
+                    let _ = self.lot.set_free_will(free_will);
+                    self.hud.controls.options.play.free_will = free_will;
+                    messages.push(format!("Autonomy set to {level}"));
+                }
+                CheatCommand::SimSpeed(val) => {
+                    self.cheat_sim_speed = Some(val);
+                    let speed = if val > 600 {
+                        Speed::Ultra
+                    } else if val > 200 {
+                        Speed::Fast
+                    } else {
+                        Speed::Normal
+                    };
+                    self.set_speed(speed);
+                    messages.push(format!("sim_speed {val}"));
+                }
+                CheatCommand::Interests => {
+                    self.set_mode(Mode::Live);
+                    self.hud.controls.expanded = true;
+                    self.hud.controls.panel = Some(sims_ui::command::Panel::Interests);
+                    messages.push("Interests panel opened".into());
+                }
+                CheatCommand::PrepareLot => {
+                    self.buy_cursor = None;
+                    self.buy_selected = None;
+                    self.wall_cursor = None;
+                    self.build_drag = None;
+                    self.build_preview_shape = None;
+                    self.refresh_world();
+                    self.lot_cache.clear();
+                    messages.push("Lot prepared".into());
+                }
+                CheatCommand::Help => {
+                    saw_help = true;
+                }
+            }
+        }
+
+        if total_funds_delta != 0 || target_hour.is_some() {
+            let res = self.mutate_world_via_saved(|world| {
+                if total_funds_delta != 0 {
+                    world.budget.funds = world.budget.funds.saturating_add(total_funds_delta);
+                }
+                if let Some(hour) = target_hour {
+                    if !world.globals.is_empty() {
+                        world.globals[0] = i16::from(hour);
+                    }
+                    if world.globals.len() > 5 {
+                        world.globals[5] = 0;
+                    }
+                    if world.globals.len() > 4 {
+                        // Matches `sims_render::light` (`0` day 6..=18, `1` dusk 19,
+                        // `2` night 20..=23|0..=4, `3` dawn 5).
+                        world.globals[4] = match hour {
+                            6..=18 => 0,
+                            19 => 1,
+                            5 => 3,
+                            _ => 2,
+                        };
+                    }
+                }
+            });
+            match res {
+                Ok(()) => {
+                    if total_funds_delta != 0 {
+                        messages.push(format!("Added ${total_funds_delta}"));
+                    }
+                    if let Some(hour) = target_hour {
+                        messages.push(format!("Hour set to {hour:02}:00"));
+                    }
+                }
+                Err(err) => {
+                    self.hud
+                        .cheat_console
+                        .set_feedback(FeedbackKind::Error, format!("Cheat failed: {err}"));
+                    return;
+                }
+            }
+        }
+
+        if !messages.is_empty() {
+            self.hud
+                .cheat_console
+                .set_feedback(FeedbackKind::Ok, messages.join("; "));
+        } else if !saw_help {
+            self.hud
+                .cheat_console
+                .set_feedback(FeedbackKind::Info, "Done.");
+        }
+    }
+
+    /// Applies an in-place mutation to the live `World` via lossless `Saved`
+    /// round-tripping while preserving UI mode, camera, and open cheat console.
+    fn mutate_world_via_saved(
+        &mut self,
+        mutator: impl FnOnce(&mut sims_sim::World),
+    ) -> Result<(), String> {
+        let saved = self.save()?;
+        let orig_world_body = saved.world().encode();
+        let encoded = saved.encode();
+        let saved_body = encoded
+            .get(8..)
+            .ok_or_else(|| "invalid Saved snapshot header".to_owned())?;
+        let tail = saved_body
+            .strip_prefix(orig_world_body.as_slice())
+            .ok_or_else(|| "Saved snapshot world prefix mismatch".to_owned())?;
+        let mut world = saved.world().clone();
+        mutator(&mut world);
+        let new_world_body = world.encode();
+        let mut rebuilt = Vec::with_capacity(8 + new_world_body.len() + tail.len());
+        rebuilt.extend_from_slice(&encoded[..8]);
+        rebuilt.extend_from_slice(&new_world_body);
+        rebuilt.extend_from_slice(tail);
+        let patched = Saved::decode(&rebuilt).map_err(|e| e.to_string())?;
+        self.lot.restore(patched).map_err(|e| e.to_string())?;
+        self.world_mutated_via_restore = true;
+        self.dirty = true;
+        self.lot_cache.clear();
+        let world = self.lot.world();
+        self.people.refresh(world);
+        if let Ok(shape) = sims_render::Lot::from_world(world) {
+            self.lot_shape = shape.with_floor_rotation(self.lot.floor_rotation());
+        }
+        self.hud.sync_clock_blink(self.lot.world(), self.clock_us);
+        Ok(())
     }
 
     /// Current lot geometry and render assets for capturing map thumbnails on save.
@@ -1233,6 +1552,7 @@ impl Game {
             || self.hud.has_ui_dialog()
             || self.lot.asking().is_some()
             || self.hud.menu.is_some()
+            || self.cheat_console_open()
         {
             self.edge_scroll_rem = [0, 0];
             return false;
@@ -1301,7 +1621,19 @@ impl Game {
         if dx == 0 && dy == 0 {
             return false;
         }
-        self.apply(Move::Scroll([dx, dy]))
+        let moved = self.apply(Move::Scroll([dx, dy]));
+        if moved && let Some(point) = self.pointer {
+            match self.hud.controls.mode {
+                Mode::Build => {
+                    let _ = self.hover_build(point);
+                }
+                Mode::Buy => {
+                    let _ = self.hover_buy(point);
+                }
+                _ => {}
+            }
+        }
+        moved
     }
 
     /// Why the lot stopped, if it has.
@@ -1801,27 +2133,46 @@ impl Game {
             self.hud.resize_menu(self.view.size);
             let pointer = self.hud.pointer();
             if let Some(menu) = &mut self.hud.menu {
-                if let Some(center) = menu.active_center() {
-                    crate::people::shade_pie_face(&mut self.canvas, center, viewport);
+                if let Some(backdrop) = menu.backdrop_at(milliseconds) {
+                    crate::people::shade_pie_face_with_radius(
+                        &mut self.canvas,
+                        backdrop.center,
+                        backdrop.radius,
+                        viewport,
+                    );
                 }
                 if let Some(center) = menu.main_center() {
-                    let look = menu.head_look(pointer);
-                    match self.people.head_in_viewport(
-                        world,
-                        menu.person,
-                        viewport,
-                        center,
-                        self.view.camera.zoom,
-                        look,
-                    ) {
+                    let rendered = if let Some(pose) = menu.head_pose_at(pointer, milliseconds) {
+                        self.people.head_in_viewport_pose(
+                            world,
+                            menu.person,
+                            viewport,
+                            center,
+                            self.view.camera.zoom,
+                            pose,
+                        )
+                    } else {
+                        let look = menu.head_look(pointer);
+                        self.people.head_in_viewport(
+                            world,
+                            menu.person,
+                            viewport,
+                            center,
+                            self.view.camera.zoom,
+                            look,
+                        )
+                    };
+                    match rendered {
                         Ok((origin, head, depth)) => {
-                            crate::people::composite_pie_head(
-                                &mut self.canvas,
-                                origin,
-                                &head,
-                                &depth,
-                                viewport,
-                            );
+                            if head.width > 0 && head.height > 0 {
+                                crate::people::composite_pie_head(
+                                    &mut self.canvas,
+                                    origin,
+                                    &head,
+                                    &depth,
+                                    viewport,
+                                );
+                            }
                             menu.head_origin = origin;
                             menu.head = Some(head);
                             menu.head_depth = depth;
@@ -2238,6 +2589,16 @@ impl Game {
     /// - Commits a Buy Mode drag or updates/chooses an open pie menu entry.
     pub fn release(&mut self, point: [i32; 2]) -> Outcome {
         let released_slider = self.hud.release_slider(Some(point));
+        let (released_saves, open_saves) = self.hud.release_saves_button(Some(point));
+        if open_saves {
+            let sounds = self.hud.take_sounds();
+            self.keep_sounds(sounds);
+            return Outcome {
+                redraw: true,
+                open_save_manager: true,
+                ..Outcome::default()
+            };
+        }
         let (released_action, action_cmd) = self.hud.release_options_action(Some(point));
         if let Some(command) = action_cmd {
             let outcome = self.command(command, None);
@@ -2260,7 +2621,7 @@ impl Game {
         }
         if !self.in_view(point) {
             let mut out = self.release_outside();
-            out.redraw |= released_slider || released_action || released_dialog;
+            out.redraw |= released_slider || released_saves || released_action || released_dialog;
             return out;
         }
         if matches!(self.hud.controls.mode, Mode::Buy | Mode::Build)
@@ -2298,7 +2659,7 @@ impl Game {
         }
         if self.has_dialog() || self.hud.menu.is_none() {
             return Outcome {
-                redraw: released_slider || released_action || released_dialog,
+                redraw: released_slider || released_saves || released_action || released_dialog,
                 ..Outcome::default()
             };
         }
@@ -2307,10 +2668,11 @@ impl Game {
         let sounds = self.hud.take_sounds();
         self.keep_sounds(sounds);
         redraw |= self.highlight(point);
+        let now_ms = (self.clock_us / 1_000) as u32;
         let will_choose = self.hud.menu.as_ref().is_some_and(|m| m.will_choose(point));
         if !will_choose {
             let was_held = self.hud.menu.as_ref().is_some_and(|m| m.held());
-            let (release, command) = self.hud.release_menu(point);
+            let (release, command) = self.hud.release_menu_at(point, now_ms);
             debug_assert_eq!((release, command), (menu::Release::Settled, None));
             return Outcome {
                 redraw: redraw || was_held,
@@ -2326,7 +2688,7 @@ impl Game {
         // A failed check's note stays in front of what the choice says.
         let failed = self.note.take();
         let menu = self.hud.menu.clone();
-        let (release, command) = self.hud.release_menu(point);
+        let (release, command) = self.hud.release_menu_at(point, now_ms);
         if release == menu::Release::Stays
             && let Some(warped) = self.hud.menu.as_ref().and_then(Menu::pending_pointer)
         {
@@ -2354,12 +2716,16 @@ impl Game {
     /// pie without checking or choosing any entry.
     pub fn release_outside(&mut self) -> Outcome {
         let released_slider = self.hud.release_slider(None);
+        let (released_saves, _) = self.hud.release_saves_button(None);
         let (released_action, _) = self.hud.release_options_action(None);
         let (released_dialog, _) = self.hud.release_dialog(None);
         if self.buy_dragging.take().is_some() {
             self.buy_commit_on_release = false;
-            let redraw =
-                self.hide_buy_cursor() || released_slider || released_action || released_dialog;
+            let redraw = self.hide_buy_cursor()
+                || released_slider
+                || released_saves
+                || released_action
+                || released_dialog;
             return Outcome {
                 redraw,
                 ..Outcome::default()
@@ -2372,7 +2738,7 @@ impl Game {
         }
         if self.has_dialog() || self.hud.menu.is_none() {
             return Outcome {
-                redraw: released_slider || released_action || released_dialog,
+                redraw: released_slider || released_saves || released_action || released_dialog,
                 ..Outcome::default()
             };
         }
@@ -2562,14 +2928,26 @@ impl Game {
                 } else {
                     self.note = why.map(|why| format!("Every entry is shown, as {why}"));
                     self.highlighted = None;
-                    let menu = Menu::new(
-                        person,
-                        object,
-                        listing.entries,
-                        point,
-                        &self.hud.art,
-                        self.view.size,
-                    );
+                    let menu = if self.pie_animations_active() {
+                        Menu::new_animated(
+                            person,
+                            object,
+                            listing.entries,
+                            point,
+                            &self.hud.art,
+                            self.view.size,
+                            (self.clock_us / 1_000) as u32,
+                        )
+                    } else {
+                        Menu::new(
+                            person,
+                            object,
+                            listing.entries,
+                            point,
+                            &self.hud.art,
+                            self.view.size,
+                        )
+                    };
                     // Native menu setup reads the current cursor (0x5ebd05)
                     // after any on-screen clamp warp (0x5ebab2) and updates
                     // hit state (0x5ebd29), so the opening frame aims the head
@@ -2978,6 +3356,8 @@ impl Game {
     /// its object is gone).
     pub fn restore(&mut self, saved: Saved) -> Result<(), String> {
         self.lot.restore(saved).map_err(|e| e.to_string())?;
+        self.world_mutated_via_restore = true;
+        self.lot_cache.clear();
         self.stopped = None;
         self.errors = Errors::default();
         self.sounds.clear();

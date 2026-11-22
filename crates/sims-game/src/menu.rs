@@ -426,6 +426,10 @@ pub struct Menu {
     /// `0x462290` reads highlighted/angle/distance from the parent menu while
     /// a submenu is active).
     submenu_look: Option<sims_people::pie_head::Look>,
+    /// Optional 400 ms pop-in, submenu glide, and direction ease-out animation
+    /// state (`0x462078`–`0x462822`). `None` preserves timeless instant steady
+    /// state for headless unit tests that do not advance `clock_us`.
+    anim: Option<sims_people::pie_head::PieAnimState>,
 }
 
 /// What a left release on an open [`Menu`] did (0x5eb433).
@@ -491,10 +495,30 @@ impl Menu {
             head_origin: [0, 0],
             head_depth: Vec::new(),
             submenu_look: None,
+            anim: None,
         };
         menu.layout(art, size);
         menu.moved = menu.layouts.first().is_some_and(|l| l.moved);
         menu.pointer = menu.moved.then(|| menu.layouts[0].center);
+        menu
+    }
+
+    /// Like [`Menu::new`], initializing [`sims_people::pie_head::PieAnimState`]
+    /// at `now_ms` for Complete Collection's 400 ms pop-in, submenu glide, and
+    /// head direction ease-out transitions.
+    pub fn new_animated(
+        person: u16,
+        object: u16,
+        entries: Vec<Entry>,
+        at: [i32; 2],
+        art: &Art,
+        size: [i32; 2],
+        now_ms: u32,
+    ) -> Self {
+        let mut menu = Self::new(person, object, entries, at, art, size);
+        menu.anim = menu
+            .main_center()
+            .map(|c| sims_people::pie_head::PieAnimState::open(c, now_ms));
         menu
     }
 
@@ -564,6 +588,12 @@ impl Menu {
     /// settled (`sticky`), with the pointer moved to a newly opened
     /// submenu's middle (0x48d9c0).
     pub fn release(&mut self, art: &Art, point: [i32; 2]) -> Release {
+        self.release_at(art, point, 0)
+    }
+
+    /// Like [`Menu::release`], driving submenu center/radius glide transitions
+    /// on [`sims_people::pie_head::PieAnimState`] at `now_ms`.
+    pub fn release_at(&mut self, art: &Art, point: [i32; 2], now_ms: u32) -> Release {
         self.held = false;
         let choose = self.will_choose(point);
         self.moved = false;
@@ -581,9 +611,17 @@ impl Menu {
                     Pressed::Opened { .. } => {
                         self.submenu_look = opening_look;
                         self.pointer = self.layouts.last().map(|l| l.center);
+                        if let (Some(anim), Some(sub_center)) =
+                            (&mut self.anim, self.layouts.last().map(|l| l.center))
+                        {
+                            anim.open_submenu(sub_center, now_ms);
+                        }
                     }
                     Pressed::Back => {
                         self.submenu_look = None;
+                        if let Some(anim) = &mut self.anim {
+                            anim.close_submenu(now_ms);
+                        }
                         // Backing out restores the parent at its requested
                         // position (0x48db38) and re-runs placement
                         // (0x5ebab2), which warps the pointer back to the
@@ -665,6 +703,36 @@ impl Menu {
     /// (`0x46216e` → `0x4ac8ff`).
     pub fn active_center(&self) -> Option<[i32; 2]> {
         self.layouts.last().map(|l| l.center)
+    }
+
+    /// Evaluates the circular dark backdrop's center and radius at `now_ms`.
+    pub fn backdrop_at(&mut self, now_ms: u32) -> Option<sims_people::pie_head::BackdropState> {
+        if let Some(anim) = &mut self.anim {
+            Some(anim.backdrop(now_ms))
+        } else {
+            self.active_center()
+                .map(|center| sims_people::pie_head::BackdropState {
+                    center,
+                    radius: sims_people::pie_head::BACKDROP_RADIUS,
+                })
+        }
+    }
+
+    /// Evaluates the animated [`sims_people::pie_head::HeadPose`] at `now_ms`
+    /// when `PieAnimState` is active, or `None` in steady-state mode.
+    pub fn head_pose_at(
+        &mut self,
+        pointer: Option<[i32; 2]>,
+        now_ms: u32,
+    ) -> Option<sims_people::pie_head::HeadPose> {
+        let look = self.head_look(pointer);
+        self.anim.as_mut().map(|anim| anim.head_pose(look, now_ms))
+    }
+
+    /// Whether any 400 ms pie-menu pop-in, submenu glide, or direction
+    /// ease-out transition is currently active at `now_ms`.
+    pub fn is_animating(&self, now_ms: u32) -> bool {
+        self.anim.as_ref().is_some_and(|a| a.is_animating(now_ms))
     }
 
     /// The pie head's [`sims_people::pie_head::Look`] for `pointer`

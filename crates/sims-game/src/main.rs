@@ -922,6 +922,14 @@ impl App {
         if outcome.photo {
             self.photo();
         }
+        if outcome.open_save_manager
+            && let Some(game) = self.session.game_mut()
+        {
+            game.set_note(
+                "Save Manager requires launching in Neighborhood / REDB mode (without a house file).",
+            );
+            self.changed(true, true);
+        }
         let saved_ok = if outcome.save { self.save(false) } else { true };
         if outcome.save
             && !saved_ok
@@ -953,6 +961,9 @@ impl App {
         }
         if outcome.quit {
             self.persist_options();
+            if let Session::Shell(shell) = &mut self.session {
+                shell.flush_background_saves();
+            }
             event_loop.exit();
         }
     }
@@ -1014,6 +1025,14 @@ impl App {
                         }
                         "z" | "Z" | "y" | "Y" => {
                             if game.redo_buy() {
+                                self.changed(true, true);
+                            }
+                            return;
+                        }
+                        "l" | "L" if !self.shift_held => {
+                            if let Session::Shell(shell) = &mut self.session
+                                && shell.open_save_manager(None)
+                            {
                                 self.changed(true, true);
                             }
                             return;
@@ -1087,7 +1106,8 @@ impl App {
         self.wake_clock.finish(now, Instant::now(), capped);
         let mut redraw = ran > 0 || (!waited && game.asking().is_some());
         let scrolled = self.drag.is_none() && game.edge_scroll(clock_us);
-        redraw |= scrolled || game.spin_due() || game.blink_due();
+        let pie_anim = game.pie_animating();
+        redraw |= scrolled || pie_anim || game.spin_due() || game.blink_due();
         self.sound_feed.update(game, |input| self.sound.send(input));
         for error in &game.errors()[self.printed..] {
             eprintln!("sims-game: error caught: {error}");
@@ -1100,9 +1120,12 @@ impl App {
             self.reported = true;
             redraw = true;
         }
-        // Edge-scrolling counts as active user interaction (display-refresh cadence),
+        if let Session::Shell(shell) = &mut self.session {
+            redraw |= shell.poll_background_saves();
+        }
+        // Edge-scrolling and active 400 ms pie animations use display-refresh cadence,
         // while pure simulation ticks / plumb-bob spin / pause blink are passive (60 FPS cap).
-        self.changed(redraw, scrolled);
+        self.changed(redraw, scrolled || pie_anim);
     }
 
     fn redraw(&mut self) {
@@ -1363,6 +1386,9 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => {
                 self.persist_options();
+                if let Session::Shell(shell) = &mut self.session {
+                    shell.flush_background_saves();
+                }
                 event_loop.exit();
             }
             WindowEvent::Focused(focused) => {
@@ -1414,6 +1440,116 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                let is_cheat_toggle = !event.repeat
+                    && self.ctrl_or_cmd_held
+                    && self.shift_held
+                    && matches!(&event.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("c"));
+                let save_manager_open = matches!(
+                    &self.session,
+                    Session::Shell(shell) if shell.save_manager_open()
+                );
+                if is_cheat_toggle
+                    && !save_manager_open
+                    && !self.session.has_dialog()
+                    && let Some(game) = self.session.game_mut()
+                {
+                    game.toggle_cheat_console();
+                    self.changed(true, true);
+                    return;
+                }
+                if save_manager_open && let Session::Shell(shell) = &mut self.session {
+                    let out = match &event.logical_key {
+                        Key::Named(NamedKey::ArrowUp) => shell.key_up(),
+                        Key::Named(NamedKey::ArrowDown) => shell.key_down(),
+                        Key::Named(NamedKey::Enter) if !event.repeat => shell.key_enter(),
+                        Key::Named(NamedKey::Escape) if !event.repeat => shell.escape(),
+                        _ => ShellOutcome::default(),
+                    };
+                    self.handle_shell_outcome(event_loop, out);
+                    return;
+                }
+                if self.session.game().is_some_and(Game::cheat_console_open)
+                    && let Some(game) = self.session.game_mut()
+                {
+                    let mut changed = false;
+                    match &event.logical_key {
+                        Key::Named(NamedKey::Escape) if !event.repeat => {
+                            changed = game.close_cheat_console();
+                        }
+                        Key::Named(NamedKey::Enter) if !event.repeat => {
+                            let _ = game.cheat_console_submit();
+                            changed = true;
+                        }
+                        Key::Named(NamedKey::Backspace) => {
+                            changed = game.cheat_console_backspace();
+                        }
+                        Key::Named(NamedKey::Delete) => {
+                            changed = game.cheat_console_delete();
+                        }
+                        Key::Named(NamedKey::ArrowLeft) => {
+                            changed = game.cheat_console_left();
+                        }
+                        Key::Named(NamedKey::ArrowRight) => {
+                            changed = game.cheat_console_right();
+                        }
+                        Key::Named(NamedKey::ArrowUp) => {
+                            changed = game.cheat_console_history_up();
+                        }
+                        Key::Named(NamedKey::ArrowDown) => {
+                            changed = game.cheat_console_history_down();
+                        }
+                        Key::Named(NamedKey::Home) => {
+                            changed = game.cheat_console_home();
+                        }
+                        Key::Named(NamedKey::End) => {
+                            changed = game.cheat_console_end();
+                        }
+                        Key::Named(NamedKey::Space) => {
+                            changed = game.cheat_console_char(' ');
+                        }
+                        _ => {
+                            if !self.ctrl_or_cmd_held
+                                && let Some(text) = &event.text
+                            {
+                                for ch in text.chars() {
+                                    changed |= game.cheat_console_char(ch);
+                                }
+                            }
+                        }
+                    }
+                    self.changed(changed, true);
+                    return;
+                }
+                if self.session.screen_kind() == ScreenKind::CreateFamily
+                    && let Session::Shell(shell) = &mut self.session
+                {
+                    let out = match &event.logical_key {
+                        Key::Named(NamedKey::Backspace) => shell.key_backspace(),
+                        Key::Named(NamedKey::Delete) => shell.key_delete(),
+                        Key::Named(NamedKey::ArrowLeft) => shell.key_left(),
+                        Key::Named(NamedKey::ArrowRight) => shell.key_right(),
+                        Key::Named(NamedKey::Home) => shell.key_home(),
+                        Key::Named(NamedKey::End) => shell.key_end(),
+                        Key::Named(NamedKey::Tab) => shell.key_tab(),
+                        Key::Named(NamedKey::Enter) if !event.repeat => shell.key_enter(),
+                        Key::Named(NamedKey::Escape) if !event.repeat => shell.escape(),
+                        Key::Named(NamedKey::Space) => shell.key_char(' '),
+                        _ => {
+                            let mut combined = ShellOutcome::default();
+                            if !self.ctrl_or_cmd_held
+                                && let Some(text) = &event.text
+                            {
+                                for ch in text.chars() {
+                                    let o = shell.key_char(ch);
+                                    combined.redraw |= o.redraw;
+                                }
+                            }
+                            combined
+                        }
+                    };
+                    self.handle_shell_outcome(event_loop, out);
+                    return;
+                }
                 if self.session.has_dialog() {
                     let has_entry = self.session.game().is_some_and(Game::has_dialog_entry);
                     if has_entry {
@@ -1566,6 +1702,7 @@ impl ApplicationHandler for App {
                                             game.buy_cursor().is_some(),
                                         )
                                     {
+                                        shell.flush_background_saves();
                                         self.persist_options();
                                         event_loop.exit();
                                     } else {
@@ -1583,13 +1720,20 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if self.session.has_dialog() {
-                    return;
-                }
                 let y = match delta {
                     MouseScrollDelta::LineDelta(_, y) => f64::from(y),
                     MouseScrollDelta::PixelDelta(p) => p.y,
                 };
+                if let Session::Shell(shell) = &mut self.session
+                    && shell.save_manager_open()
+                {
+                    let redraw = shell.wheel(y);
+                    self.changed(redraw, true);
+                    return;
+                }
+                if self.session.has_dialog() {
+                    return;
+                }
                 if let Some(game) = self.session.game_mut() {
                     let command = if y > 0.0 {
                         Move::ZoomIn

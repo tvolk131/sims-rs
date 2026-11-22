@@ -49,11 +49,13 @@
 //! shown.
 
 use sims_audio::SoundEvent;
+use sims_audio::ambience::{AmbienceCatalog, AmbienceMixer, AmbienceZone, ZoomLevel};
 use sims_audio::files::SoundFiles;
 use sims_audio::module::Module;
 use sims_audio::music::{ALL_EXPANSIONS, ModeCatalog, ModeMusicPlayer, MusicMode};
 use sims_audio::placement::Projection;
 use sims_audio::player::Player;
+use sims_audio::radio::{BuiltinStation, RadioCatalog, RadioPlayer, SpatialAttenuation, StationId};
 use sims_audio::sources::{FIELDS, NO_ROOM, Snapshot};
 use sims_audio::stations::StationLists;
 use sims_core::F32;
@@ -410,6 +412,10 @@ pub struct Feed {
     volumes: [u8; 3],
     /// The last streaming mode-music station sent to the mixer.
     music_mode: Option<MusicMode>,
+    /// The last lot environmental ambience zone sent to the mixer.
+    ambience_zone: Option<AmbienceZone>,
+    /// The last zoom level (`0..=2`) sent to the mixer's ambience attenuator.
+    zoom: Option<u32>,
 }
 
 impl Default for Feed {
@@ -426,7 +432,66 @@ impl Default for Feed {
             paused_for_blur: false,
             volumes: [sims_ui::options::VOLUME_MAX; 3],
             music_mode: None,
+            ambience_zone: None,
+            zoom: None,
         }
+    }
+}
+
+/// Maps a lot ID to its environmental [`AmbienceZone`].
+pub fn ambience_zone_for_lot(lot_id: i16) -> AmbienceZone {
+    match lot_id {
+        21..=30 => AmbienceZone::Downtown,
+        40..=42 => AmbienceZone::VacationBeach,
+        43..=45 => AmbienceZone::VacationForest,
+        46..=48 => AmbienceZone::VacationSnow,
+        81..=89 => AmbienceZone::StudioTown,
+        90..=98 => AmbienceZone::MagicTown,
+        _ => AmbienceZone::Residential,
+    }
+}
+
+/// Maps a camera zoom level (`0` = Far, `1` = Medium, `2` = Near) to [`ZoomLevel`].
+pub fn zoom_level_from_u32(zoom: u32) -> ZoomLevel {
+    match zoom {
+        0 => ZoomLevel::Far,
+        1 => ZoomLevel::Medium,
+        _ => ZoomLevel::Near,
+    }
+}
+
+/// Maps a SimAntics/HIT stereo or television play event name to its built-in
+/// streaming [`BuiltinStation`], if any.
+pub fn station_for_sound_event(name: &str) -> Option<BuiltinStation> {
+    let lower = name.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "radio_country" | "stereo_country" => Some(BuiltinStation::Country),
+        "radio_rock" | "stereo_rock" => Some(BuiltinStation::Rock),
+        "radio_latin" | "stereo_latin" => Some(BuiltinStation::Latin),
+        "radio_classical" | "radio_classica" | "stereo_classical" => {
+            Some(BuiltinStation::Classical)
+        }
+        "radio_countrydance" | "radio_countryd" | "stereo_countrydance" => {
+            Some(BuiltinStation::CountryDance)
+        }
+        "radio_rap" | "stereo_rap" => Some(BuiltinStation::Rap),
+        "radio_rave" | "stereo_rave" => Some(BuiltinStation::Rave),
+        "radio_disco" | "stereo_disco" => Some(BuiltinStation::Disco),
+        "radio_beach" | "stereo_beach" => Some(BuiltinStation::Beach),
+        "radio_ez" | "radio_easylistening" | "stereo_ez" => Some(BuiltinStation::EasyListening),
+        "radio_ezexp" | "stereo_ezexp" => Some(BuiltinStation::EasyListeningExp),
+        "radio_unlcheap" | "radio_oldtown" => Some(BuiltinStation::UnleashedCheap),
+        "radio_unlspeak" | "radio_zydeco" => Some(BuiltinStation::UnleashedSpeakeasy),
+        "radio_superstar" | "stereo_superstar" => Some(BuiltinStation::Superstar),
+        "tv_romance" | "tv_play_romance" => Some(BuiltinStation::TvRomance),
+        "tv_action" | "tv_play_action" => Some(BuiltinStation::TvAction),
+        "tv_comedy" | "tv_comedy_cartoon" | "tv_play_comedy" => Some(BuiltinStation::TvComedy),
+        "tv_mystery" | "tv_horror" | "tv_play_mystery" => Some(BuiltinStation::TvMystery),
+        "tv_animal" | "tv_play_animal" => Some(BuiltinStation::TvAnimal),
+        "tv_entertainment" | "tv_play_entertainment" => Some(BuiltinStation::TvEntertainment),
+        "tv_news" | "tv_play_news" => Some(BuiltinStation::TvNews),
+        "tv_sports" | "tv_play_sports" => Some(BuiltinStation::TvSports),
+        _ => None,
     }
 }
 
@@ -466,6 +531,8 @@ impl Feed {
         self.saved_paused = false;
         self.paused_for_blur = false;
         self.music_mode = None;
+        self.ambience_zone = None;
+        self.zoom = None;
     }
 
     /// Syncs `[fx, music, vox]` slider steps (`0..=10`) outside a running lot
@@ -673,6 +740,11 @@ impl Feed {
             send(Input::MusicMode(desired_music));
             self.music_mode = Some(desired_music);
         }
+        let desired_zone = ambience_zone_for_lot(game.lot().lot_id());
+        if self.ambience_zone != Some(desired_zone) {
+            send(Input::AmbienceZone(desired_zone));
+            self.ambience_zone = Some(desired_zone);
+        }
         // `0x4ce4c4..0x4ce4d1`: leaving Live mode (e.g. entering Options) pauses
         // live audio; returning to Live unpauses unless the lot is paused.
         let audio_paused = game.paused() || game.mode() != sims_ui::command::Mode::Live;
@@ -698,6 +770,10 @@ impl Feed {
         }
         // Kind 33, after the sources and the view the moved camera shows.
         let shot = game.shot();
+        if self.zoom != Some(shot.zoom) {
+            send(Input::Zoom(shot.zoom));
+            self.zoom = Some(shot.zoom);
+        }
         if self.shot != Some(shot) {
             send(Input::Camera);
             self.shot = Some(shot);
@@ -776,16 +852,46 @@ pub enum Input {
     VoxVolume(u8),
     /// Streaming mode music transition (`kSetMusicMode`, `0x575170`).
     MusicMode(MusicMode),
+    /// Environmental lot ambience zone (`Residential`, `Downtown`, `Vacation*`,
+    /// `StudioTown`, `MagicTown`).
+    AmbienceZone(AmbienceZone),
+    /// Camera zoom level (`0` = Far, `1` = Medium, `2` = Near) for environmental
+    /// ambience attenuation.
+    Zoom(u32),
+    /// Tunes an in-lot stereo or TV emitter (`object_id`) to `station`.
+    RadioTune {
+        emitter: u32,
+        station: StationId,
+    },
+    /// Skips to the next shuffled track on an active stereo/TV emitter.
+    RadioSkip {
+        emitter: u32,
+    },
+    /// Turns off one active stereo/TV emitter.
+    RadioStop {
+        emitter: u32,
+    },
+    /// Stops all active stereo/TV emitters.
+    RadioStopAll,
 }
 
 /// The sound player with every module, station and ambient score of an
-/// install, paired with streaming Neighborhood/Buy/Build/expansion mode music.
+/// install, paired with streaming Neighborhood/Buy/Build/expansion mode music,
+/// in-lot stereo/TV radio streaming, and environmental lot ambience beds.
 pub struct Mixer {
     player: Player<SoundFiles>,
     music: ModeMusicPlayer<SoundFiles>,
+    radio: RadioPlayer<SoundFiles>,
+    ambience: AmbienceMixer<SoundFiles>,
     hour: u32,
     view: i32,
     sources: Snapshot,
+    /// Whether the host window is focused (`Input::Active`).
+    active: bool,
+    /// Whether live gameplay audio is paused (`SoundEvent::Pause` / `Unpause`).
+    paused_by_game: bool,
+    /// Whether an active lot has enabled the streaming environmental ambience bed.
+    ambience_active: bool,
     /// Faults already reported, so each is reported once.
     reported: BTreeSet<String>,
 }
@@ -798,6 +904,10 @@ impl Mixer {
         let lists = StationLists::build(&files);
         let catalog = ModeCatalog::from_sound_files(&files, true, ALL_EXPANSIONS);
         let music = ModeMusicPlayer::new(catalog, files.clone(), SEED);
+        let radio_catalog = RadioCatalog::from_sound_files(&files);
+        let radio = RadioPlayer::new(radio_catalog, files.clone(), SEED ^ 0x5241_4449);
+        let ambience_catalog = AmbienceCatalog::from_sound_files(&files);
+        let ambience = AmbienceMixer::new(ambience_catalog, files.clone());
         let mut player = Player::new(modules, files.clone(), SEED);
         player.add_stations(&lists);
         player.add_scores(&files);
@@ -805,11 +915,50 @@ impl Mixer {
         Ok(Self {
             player,
             music,
+            radio,
+            ambience,
             hour: u32::MAX,
             view: 0,
             sources: Snapshot::default(),
+            active: true,
+            paused_by_game: false,
+            ambience_active: false,
             reported: BTreeSet::new(),
         })
+    }
+
+    fn sync_stream_pause(&mut self) {
+        let paused = !self.active || self.paused_by_game;
+        self.radio.set_paused(paused);
+        self.ambience.set_paused(paused);
+    }
+
+    fn spatial_for_emitter(&self, emitter_id: u32) -> SpatialAttenuation {
+        let key = emitter_id as i32;
+        if let Some(proj) = self.sources.screen.get(&key) {
+            let level = self.sources.positions.get(&key).map_or(1, |pos| pos[2]);
+            if let Ok(spatial) = SpatialAttenuation::from_projection(20, level, proj) {
+                return spatial;
+            }
+        }
+        SpatialAttenuation::FULL
+    }
+
+    fn refresh_radio_spatial(&mut self) {
+        if self.radio.active_emitters() == 0 {
+            return;
+        }
+        let ids: Vec<u32> = self
+            .sources
+            .screen
+            .keys()
+            .filter_map(|&id| u32::try_from(id).ok())
+            .filter(|&id| self.radio.emitter_station(id).is_some())
+            .collect();
+        for id in ids {
+            let spatial = self.spatial_for_emitter(id);
+            self.radio.set_emitter_spatial(id, spatial);
+        }
     }
 
     /// Takes one input.
@@ -819,8 +968,38 @@ impl Mixer {
                 // Placed where the last snapshot has their objects, which
                 // the game sends before a tick's events.
                 for event in &events {
-                    if matches!(event, SoundEvent::StopAll) {
-                        self.music.stop();
+                    match event {
+                        SoundEvent::StopAll => {
+                            self.music.stop();
+                            self.radio.stop_all();
+                            self.ambience.stop();
+                            self.ambience_active = false;
+                            self.paused_by_game = false;
+                            self.sync_stream_pause();
+                        }
+                        SoundEvent::Pause => {
+                            self.paused_by_game = true;
+                            self.sync_stream_pause();
+                        }
+                        SoundEvent::Unpause => {
+                            self.paused_by_game = false;
+                            self.sync_stream_pause();
+                        }
+                        SoundEvent::StopObject { object } => {
+                            self.radio.stop_emitter(*object);
+                        }
+                        SoundEvent::Play { object, name } => {
+                            if let Some(station) = station_for_sound_event(name) {
+                                let spatial = self.spatial_for_emitter(*object);
+                                if self.radio.tune(*object, station, spatial) {
+                                    continue;
+                                }
+                            } else if name.eq_ignore_ascii_case("radio_next_song")
+                                && self.radio.skip_track(*object)
+                            {
+                                continue;
+                            }
+                        }
                     }
                     self.player.handle(event, &self.sources);
                 }
@@ -828,32 +1007,75 @@ impl Mixer {
             Input::Hour(hour) => {
                 let changed = self.hour != u32::MAX && self.hour != hour;
                 self.hour = hour;
+                if self.ambience_active {
+                    self.ambience.set_hour((hour % 24) as u8);
+                }
                 if changed {
                     self.player
                         .camera_moved(self.view, self.hour, &self.sources);
                 }
             }
-            Input::View(view) => self.view = view,
-            Input::Sources(sources) => self.sources = sources,
-            Input::Camera => self
-                .player
-                .camera_moved(self.view, self.hour, &self.sources),
+            Input::View(view) => {
+                self.view = view;
+                self.ambience.set_outdoor_percent(view.clamp(0, 100) as u8);
+            }
+            Input::Sources(sources) => {
+                self.sources = sources;
+                self.refresh_radio_spatial();
+            }
+            Input::Camera => {
+                self.player
+                    .camera_moved(self.view, self.hour, &self.sources);
+                self.refresh_radio_spatial();
+            }
             Input::Active(active) => {
+                self.active = active;
                 self.player.set_active(active, &self.sources);
                 self.music.set_paused(!active);
+                self.sync_stream_pause();
             }
-            Input::FxVolume(step) => self
-                .player
-                .set_fx_volume_step(usize::from(step), &self.sources),
+            Input::FxVolume(step) => {
+                let idx = usize::from(step);
+                self.player.set_fx_volume_step(idx, &self.sources);
+                self.radio.set_fx_volume_step(idx);
+                self.ambience.set_volume_step(idx);
+            }
             Input::MusicVolume(step) => {
-                self.player.set_music_volume_step(usize::from(step));
-                self.music.set_volume_step(usize::from(step));
+                let idx = usize::from(step);
+                self.player.set_music_volume_step(idx);
+                self.music.set_volume_step(idx);
+                self.radio.set_music_volume_step(idx);
             }
             Input::VoxVolume(step) => self.player.set_vox_volume_step(usize::from(step)),
             Input::Speed(speed) => self
                 .player
                 .set_global(SPEED_REGISTER, speed_register(speed)),
             Input::MusicMode(mode) => self.music.set_mode(mode),
+            Input::AmbienceZone(zone) => {
+                self.ambience_active = true;
+                self.ambience.set_zone(zone);
+                if self.hour != u32::MAX {
+                    self.ambience.set_hour((self.hour % 24) as u8);
+                }
+                self.ambience
+                    .set_outdoor_percent(self.view.clamp(0, 100) as u8);
+            }
+            Input::Zoom(zoom) => {
+                self.ambience.set_zoom(zoom_level_from_u32(zoom));
+            }
+            Input::RadioTune { emitter, station } => {
+                let spatial = self.spatial_for_emitter(emitter);
+                self.radio.tune(emitter, station, spatial);
+            }
+            Input::RadioSkip { emitter } => {
+                self.radio.skip_track(emitter);
+            }
+            Input::RadioStop { emitter } => {
+                self.radio.stop_emitter(emitter);
+            }
+            Input::RadioStopAll => {
+                self.radio.stop_all();
+            }
         }
     }
 
@@ -876,13 +1098,26 @@ impl Mixer {
         self.music.is_playing()
     }
 
+    /// In-lot streaming stereo/TV radio player.
+    pub fn radio(&self) -> &RadioPlayer<SoundFiles> {
+        &self.radio
+    }
+
+    /// Streaming environmental lot ambience mixer.
+    pub fn ambience(&self) -> &AmbienceMixer<SoundFiles> {
+        &self.ambience
+    }
+
     /// Renders `frames` stereo frames at [`sims_audio::player::RATE`],
     /// moving the ambience's cursor to the latest hour and view first, then
-    /// mixing streaming mode music into the output buffer.
+    /// mixing streaming mode music, stereo/TV radio, and environmental ambience
+    /// into the output buffer.
     pub fn render(&mut self, frames: usize) -> Vec<i16> {
         self.player.set_ambience_view(self.view, self.hour);
         let mut out = self.player.render_stereo(frames, &self.sources);
         self.music.mix_into_stereo(&mut out);
+        self.radio.mix_into_stereo(&mut out);
+        self.ambience.mix_into_stereo(&mut out);
         out
     }
 
@@ -896,6 +1131,7 @@ impl Mixer {
             .faults
             .drain(..)
             .chain(self.music.faults.drain(..))
+            .chain(self.radio.faults.drain(..))
         {
             if self.reported.len() >= REPORTED {
                 continue;
