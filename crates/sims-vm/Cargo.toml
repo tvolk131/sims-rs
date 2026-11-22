@@ -12,11 +12,10 @@ publish = false
 sims-content.workspace = true
 sims-core.workspace = true
 sims-formats.workspace = true
+sims-net.workspace = true
 sims-sim.workspace = true
 postcard.workspace = true
 serde.workspace = true
-
-[dev-dependencies]
 sha2.workspace = true
 
 [lints]

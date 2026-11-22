@@ -53,6 +53,7 @@ pub(crate) struct Cells {
     deleting: Option<RefCell<BTreeSet<u16>>>,
     refreshing: Option<RefCell<Refreshing>>,
     taken_off: Option<RefCell<BTreeMap<u16, Pending>>>,
+    coop: Option<RefCell<crate::coop::CoopVmContext>>,
 }
 
 /// A copy of what one cell holds.
@@ -123,6 +124,7 @@ impl Cells {
             deleting: copy(interpreter.deleting),
             refreshing: copy(interpreter.refreshing),
             taken_off: copy(interpreter.taken_off),
+            coop: copy(interpreter.coop),
         }
     }
 
@@ -145,6 +147,7 @@ impl Cells {
             deleting: self.deleting.as_ref(),
             refreshing: self.refreshing.as_ref(),
             taken_off: self.taken_off.as_ref(),
+            coop: self.coop.as_ref(),
             ..*interpreter
         }
     }
@@ -163,6 +166,7 @@ impl Cells {
             deleting: copy(self.deleting.as_ref()),
             refreshing: copy(self.refreshing.as_ref()),
             taken_off: copy(self.taken_off.as_ref()),
+            coop: copy(self.coop.as_ref()),
         }
     }
 
@@ -180,6 +184,7 @@ impl Cells {
             && alike(&self.deleting, &other.deleting, PartialEq::eq)
             && self.same_refresh(other)
             && alike(&self.taken_off, &other.taken_off, PartialEq::eq)
+            && alike(&self.coop, &other.coop, PartialEq::eq)
     }
 
     /// Whether these cells hold the same refresh as `other`'s.
@@ -201,6 +206,7 @@ impl Cells {
         let letting_go = take(interpreter.letting_go);
         let deleting = take(interpreter.deleting);
         let taken_off = take(interpreter.taken_off);
+        let coop = take(interpreter.coop);
         *world = lot;
         put(asked, self.asked);
         put(deleted, self.deleted);
@@ -214,6 +220,7 @@ impl Cells {
         put(letting_go, self.letting_go);
         put(deleting, self.deleting);
         put(taken_off, self.taken_off);
+        put(coop, self.coop);
     }
 }
 
@@ -333,6 +340,7 @@ impl<'a> Machine<'a, '_> {
             character_names: self.character_names,
             default_character_name: self.default_character_name,
             active_family: self.active_family,
+            coop: interpreter.coop,
         }
     }
 
@@ -445,6 +453,7 @@ mod tests {
             deleting: None,
             refreshing: None,
             taken_off: None,
+            coop: None,
         };
         let (nan, other_nan) = (0x7fc0_0001, 0x7fc0_0002);
         assert!(!cells(0, 0).same(&cells(0x8000_0000, 0)), "0.0 and -0.0");
