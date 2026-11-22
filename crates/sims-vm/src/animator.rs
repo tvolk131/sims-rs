@@ -2161,78 +2161,90 @@ impl Interpreter<'_> {
         let name = self
             .posture_clip(world, id, WALK)?
             .ok_or_else(|| unsupported("0x58852c", &format!("has no name for its clip {WALK}")))?;
-        let clip = self.clip(&name)?;
+        let clip_name = self.clip(&name)?.name.as_str();
         let guid = world
             .objects
             .get(&id)
             .ok_or_else(|| Trap::native(10, "missing object"))?
             .guid;
         let skeleton = crate::people::skeleton(&self.program.people, world, guid)?;
-        let bits = self.program.animations.cached_strides(skeleton, clip, || {
-            let samples =
-                self.program.animations.samples(clip).map_err(|e| {
+        let bits = self.program.animations.cached_strides(
+            skeleton,
+            clip_name,
+            |e| {
+                unsupported(
+                    "0x5992b3",
+                    &format!("cannot read animation clip {name:?}: {e}"),
+                )
+            },
+            |clip| {
+                let samples = self.program.animations.samples(clip).map_err(|e| {
                     unsupported("0x5992b3", &format!("cannot read its samples: {e}"))
                 })?;
-            let floats3 = |v: &[f32; 3]| v.map(F32::from_f32);
-            let floats4 = |v: &[f32; 4]| v.map(F32::from_f32);
-            let translations: Vec<[F32; 3]> = samples.translations.iter().map(floats3).collect();
-            let rotations: Vec<[F32; 4]> = samples.rotations.iter().map(floats4).collect();
-            let place = |bone: &str| skeleton.bones.iter().position(|b| b.name == bone);
-            let anchor = |value: &str| {
-                let (bone, _) = anchor_event(clip, value).ok_or_else(|| {
-                    unsupported(
-                        "0x588df8",
-                        &format!("finds no event anchor = {value} in its walk clip {name:?}"),
-                    )
-                })?;
-                place(bone).ok_or_else(|| {
-                    unsupported(
-                        "0x5990e0",
-                        &format!("finds no bone {bone:?} in the person's skeleton"),
-                    )
-                })
-            };
-            let anchors = [anchor("1")?, anchor("2")?];
-            let parents: Vec<Option<usize>> = skeleton.bones.iter().map(|b| b.parent).collect();
-            let rest: Vec<pose::Bone> = skeleton
-                .bones
-                .iter()
-                .map(|b| pose::Bone {
-                    translation: b.translation.map(F32::from_bits),
-                    rotation: b.rotation.map(F32::from_bits),
-                })
-                .collect();
-            let bad = |e: pose::Error| unsupported("0x5992b3", &format!("cannot pose: {}", e.0));
-            let duration = F32::from_bits(clip.duration);
-            let k = (Ext::from_i32(16) / Ext::from_i32(3)).single();
-            let heights = |phase: F32| -> Result<[Ext; 2], Trap> {
-                let at = pose::Selection::at(phase, clip.frames, duration, F32::ZERO, true)
-                    .map_err(bad)?;
-                let mut locals = rest.clone();
-                for channel in &clip.channels {
-                    let Some(bone) = place(&channel.bone) else {
-                        continue;
-                    };
-                    let from = |start: Option<u32>, len: usize| {
-                        start.map(|s| s as usize).filter(|&s| s <= len)
-                    };
-                    let motion = pose::Motion {
-                        translations: from(channel.translation, translations.len())
-                            .map(|s| &translations[s..]),
-                        rotations: from(channel.rotation, rotations.len()).map(|s| &rotations[s..]),
-                    };
-                    pose::sample(&mut locals[bone], motion, at).map_err(bad)?;
-                }
-                let placed = pose::absolute(&parents, &locals).map_err(bad)?;
-                Ok(anchors.map(|b| (placed[b].translation[2].ext() * k).single()))
-            };
-            let footfalls = self.footfall_phases(world, id)?;
-            let [one, two] = heights(footfalls[1])?;
-            let first = (two - one).single().to_f32();
-            let [one, two] = heights(footfalls[0])?;
-            let second = (one - two).single().to_f32();
-            Ok([first.to_bits(), second.to_bits()])
-        })?;
+                let floats3 = |v: &[f32; 3]| v.map(F32::from_f32);
+                let floats4 = |v: &[f32; 4]| v.map(F32::from_f32);
+                let translations: Vec<[F32; 3]> =
+                    samples.translations.iter().map(floats3).collect();
+                let rotations: Vec<[F32; 4]> = samples.rotations.iter().map(floats4).collect();
+                let place = |bone: &str| skeleton.bones.iter().position(|b| b.name == bone);
+                let anchor = |value: &str| {
+                    let (bone, _) = anchor_event(clip, value).ok_or_else(|| {
+                        unsupported(
+                            "0x588df8",
+                            &format!("finds no event anchor = {value} in its walk clip {name:?}"),
+                        )
+                    })?;
+                    place(bone).ok_or_else(|| {
+                        unsupported(
+                            "0x5990e0",
+                            &format!("finds no bone {bone:?} in the person's skeleton"),
+                        )
+                    })
+                };
+                let anchors = [anchor("1")?, anchor("2")?];
+                let parents: Vec<Option<usize>> = skeleton.bones.iter().map(|b| b.parent).collect();
+                let rest: Vec<pose::Bone> = skeleton
+                    .bones
+                    .iter()
+                    .map(|b| pose::Bone {
+                        translation: b.translation.map(F32::from_bits),
+                        rotation: b.rotation.map(F32::from_bits),
+                    })
+                    .collect();
+                let bad =
+                    |e: pose::Error| unsupported("0x5992b3", &format!("cannot pose: {}", e.0));
+                let duration = F32::from_bits(clip.duration);
+                let k = (Ext::from_i32(16) / Ext::from_i32(3)).single();
+                let heights = |phase: F32| -> Result<[Ext; 2], Trap> {
+                    let at = pose::Selection::at(phase, clip.frames, duration, F32::ZERO, true)
+                        .map_err(bad)?;
+                    let mut locals = rest.clone();
+                    for channel in &clip.channels {
+                        let Some(bone) = place(&channel.bone) else {
+                            continue;
+                        };
+                        let from = |start: Option<u32>, len: usize| {
+                            start.map(|s| s as usize).filter(|&s| s <= len)
+                        };
+                        let motion = pose::Motion {
+                            translations: from(channel.translation, translations.len())
+                                .map(|s| &translations[s..]),
+                            rotations: from(channel.rotation, rotations.len())
+                                .map(|s| &rotations[s..]),
+                        };
+                        pose::sample(&mut locals[bone], motion, at).map_err(bad)?;
+                    }
+                    let placed = pose::absolute(&parents, &locals).map_err(bad)?;
+                    Ok(anchors.map(|b| (placed[b].translation[2].ext() * k).single()))
+                };
+                let footfalls = self.footfall_phases(world, id)?;
+                let [one, two] = heights(footfalls[1])?;
+                let first = (two - one).single().to_f32();
+                let [one, two] = heights(footfalls[0])?;
+                let second = (one - two).single().to_f32();
+                Ok([first.to_bits(), second.to_bits()])
+            },
+        )?;
         Ok(bits.map(F32::from_bits))
     }
 

@@ -1007,32 +1007,83 @@ fn lot_cache_two_tier_hits_environment_and_matches_uncached() {
         "tier2 steady hit",
     );
 
-    // Find visible level-1 non-wall object and visible level-1 wall-shaping object (door/window).
+    // Find visible level-1 objects whose mutations visibly change pixels:
+    // - `anim_id`: non-wall object with multiple graphics frames (or any visible
+    //   non-wall object whose `data[0] + 1` changes rendered pixels),
+    // - `door_id`: visible wall-shaping object (door/window) whose `data[0]`
+    //   changes pixels and whose wall cutout changes pixels when moved off-lot.
     let anim_id = world
         .objects
         .iter()
         .find(|&(&id, o)| {
-            o.person.is_none()
+            if o.person.is_none()
                 && o.position[2] == 1
                 && baseline.drawn(id).is_some()
-                && assets.definition(o.guid).is_none_or(|d| !d.shapes_wall())
+                && assets
+                    .definition(o.guid)
+                    .is_some_and(|d| !d.shapes_wall() && d.graphics > 1)
+            {
+                let mut probe_world = world.clone();
+                if let Some(obj) = probe_world.objects.get_mut(&id) {
+                    if obj.data.is_empty() {
+                        obj.data.push(0);
+                    }
+                    obj.data[0] = obj.data[0].wrapping_add(1);
+                }
+                let mut probe = Canvas::new(size[0], size[1], [0xaa, 0xbb, 0xcc]);
+                draw_lot_with_preview(
+                    &probe_world,
+                    &lot,
+                    assets,
+                    &camera,
+                    (400, 300),
+                    None,
+                    &mut probe,
+                );
+                probe.color != baseline.color
+            } else {
+                false
+            }
         })
         .map(|(&id, _)| id)
-        .expect("visible non-wall level-1 object");
+        .expect("visible non-wall level-1 object with visibly distinct graphic frame");
     let door_id = world
         .objects
         .iter()
         .find(|&(&id, o)| {
-            o.person.is_none()
+            if o.person.is_none()
                 && o.position[2] == 1
                 && baseline.drawn(id).is_some()
+                && matches!(o.data.get(13).copied().unwrap_or(0) as u16 & 5, 1 | 4)
                 && assets.definition(o.guid).is_some_and(|d| d.shapes_wall())
+            {
+                let mut probe_world = world.clone();
+                if let Some(door) = probe_world.objects.get_mut(&id) {
+                    if door.data.is_empty() {
+                        door.data.push(0);
+                    }
+                    door.data[0] = door.data[0].wrapping_add(1);
+                }
+                let mut probe = Canvas::new(size[0], size[1], [0xaa, 0xbb, 0xcc]);
+                draw_lot_with_preview(
+                    &probe_world,
+                    &lot,
+                    assets,
+                    &camera,
+                    (400, 300),
+                    None,
+                    &mut probe,
+                );
+                probe.color != baseline.color
+            } else {
+                false
+            }
         })
         .map(|(&id, _)| id)
-        .expect("visible wall-shaping level-1 object");
+        .expect("visible wall-shaping level-1 object with distinct graphic frame");
 
     // 2. Non-wall object graphic animation (`data[0]`) hits Tier 1 (`Environment`),
-    //    then next steady frame hits Tier 2 (`Full`).
+    //    genuinely changing rendered pixels, then next steady frame hits Tier 2 (`Full`).
     {
         let obj = world.objects.get_mut(&anim_id).unwrap();
         if obj.data.len() <= 51 {
@@ -1040,7 +1091,7 @@ fn lot_cache_two_tier_hits_environment_and_matches_uncached() {
         }
         obj.data[0] = obj.data[0].wrapping_add(1);
     }
-    assert_parity_with_hit(
+    let after_anim = assert_parity_with_hit(
         &mut cache,
         &world,
         &lot,
@@ -1051,6 +1102,10 @@ fn lot_cache_two_tier_hits_environment_and_matches_uncached() {
         size,
         CacheHit::Environment,
         "animated non-wall object graphic frame",
+    );
+    assert_ne!(
+        after_anim.color, baseline.color,
+        "non-wall graphic animation must visibly change pixels"
     );
     assert_parity_with_hit(
         &mut cache,
@@ -1074,7 +1129,7 @@ fn lot_cache_two_tier_hits_environment_and_matches_uncached() {
         }
         door.data[0] = door.data[0].wrapping_add(1);
     }
-    assert_parity_with_hit(
+    let after_door = assert_parity_with_hit(
         &mut cache,
         &world,
         &lot,
@@ -1086,12 +1141,35 @@ fn lot_cache_two_tier_hits_environment_and_matches_uncached() {
         CacheHit::Environment,
         "door graphic frame open/close",
     );
+    assert_ne!(
+        after_door.color, after_anim.color,
+        "door graphic animation must visibly change pixels"
+    );
 
-    // 4. Moving or rotating a wall-shaping object changes its wall aperture ->
-    //    Tier 1 MUST miss (`Miss`) so walls repaint with the updated cutout!
-    let saved_door_pos = world.objects.get(&door_id).unwrap().position;
-    world.objects.get_mut(&door_id).unwrap().position[0] += 16;
-    assert_parity_with_hit(
+    // 4. Moving all parts of a wall-shaping object off-lot removes its wall
+    //    aperture -> Tier 1 MUST miss (`Miss`) so walls repaint without the cutout!
+    let door_parent = world
+        .objects
+        .get(&door_id)
+        .and_then(|o| o.multipart.as_ref().map(|m| m.parent))
+        .filter(|&p| p > 0)
+        .unwrap_or(door_id as i16);
+    let door_group: Vec<(u16, [i32; 3])> = world
+        .objects
+        .iter()
+        .filter(|&(&id, o)| {
+            id == door_id
+                || id as i16 == door_parent
+                || o.multipart
+                    .as_ref()
+                    .is_some_and(|m| m.parent == door_parent)
+        })
+        .map(|(&id, o)| (id, o.position))
+        .collect();
+    for &(id, _) in &door_group {
+        world.objects.get_mut(&id).unwrap().position = [-16, -16, 1];
+    }
+    let after_door_removed = assert_parity_with_hit(
         &mut cache,
         &world,
         &lot,
@@ -1101,10 +1179,16 @@ fn lot_cache_two_tier_hits_environment_and_matches_uncached() {
         None,
         size,
         CacheHit::Miss,
-        "wall-shaper moved invalidates tier 1",
+        "wall-shaper removed off-lot invalidates tier 1",
     );
-    world.objects.get_mut(&door_id).unwrap().position = saved_door_pos;
-    assert_parity_with_hit(
+    assert_ne!(
+        after_door_removed.color, after_door.color,
+        "removing wall-shaper must visibly change pixels"
+    );
+    for &(id, pos) in &door_group {
+        world.objects.get_mut(&id).unwrap().position = pos;
+    }
+    let after_door_restored = assert_parity_with_hit(
         &mut cache,
         &world,
         &lot,
@@ -1116,14 +1200,80 @@ fn lot_cache_two_tier_hits_environment_and_matches_uncached() {
         CacheHit::Miss,
         "wall-shaper restored",
     );
+    assert_eq!(after_door_restored.color, after_door.color);
 
-    // 5. Lamp glow word (`data[51]`) toggle hits Tier 1 (`Environment`); changing
-    //    `lot.room_lights` / `lot.lamps` misses Tier 1 (`Miss`).
+    // 5. At night with dimmed room light, toggling object glow (`data[51]`)
+    //    visibly brightens a non-window object via Tier 1 (`Environment`),
+    //    while adding a `lot.lamps` pool visibly illuminates a floored tile
+    //    via Tier 1 miss (`Miss`).
+    if world.globals.len() < 20 {
+        world.globals.resize(20, 0);
+    }
+    world.globals[4] = 2;
+    let _ = world.rebuild_rooms();
+    lot = Lot::from_world(&world)
+        .expect("Lot::from_world after rebuild_rooms")
+        .with_floor_rotation(opened.rotation);
+    lot.time_of_day = 2;
+    for v in lot.room_lights.values_mut() {
+        *v = (*v).min(60);
+    }
+    for v in lot.room_fractions.values_mut() {
+        *v = (*v).min(0.25);
+    }
+    let night_base = assert_parity_with_hit(
+        &mut cache,
+        &world,
+        &lot,
+        assets,
+        &camera,
+        (400, 300),
+        None,
+        size,
+        CacheHit::Miss,
+        "nighttime dim room baseline",
+    );
+    let glow_id = world
+        .objects
+        .iter()
+        .find(|&(&id, o)| {
+            if o.person.is_none()
+                && o.position[2] == 1
+                && night_base.drawn(id).is_some()
+                && assets.definition(o.guid).is_none_or(|d| !d.shapes_wall())
+            {
+                let mut probe_world = world.clone();
+                if let Some(obj) = probe_world.objects.get_mut(&id) {
+                    if obj.data.len() <= 51 {
+                        obj.data.resize(52, 0);
+                    }
+                    obj.data[51] = if obj.data[51] == 0 { 100 } else { 0 };
+                }
+                let mut probe = Canvas::new(size[0], size[1], [0xaa, 0xbb, 0xcc]);
+                draw_lot_with_preview(
+                    &probe_world,
+                    &lot,
+                    assets,
+                    &camera,
+                    (400, 300),
+                    None,
+                    &mut probe,
+                );
+                probe.color != night_base.color
+            } else {
+                false
+            }
+        })
+        .map(|(&id, _)| id)
+        .expect("visible non-wall object whose glow word visibly changes night pixels");
     {
-        let obj = world.objects.get_mut(&anim_id).unwrap();
+        let obj = world.objects.get_mut(&glow_id).unwrap();
+        if obj.data.len() <= 51 {
+            obj.data.resize(52, 0);
+        }
         obj.data[51] = if obj.data[51] == 0 { 100 } else { 0 };
     }
-    assert_parity_with_hit(
+    let after_glow = assert_parity_with_hit(
         &mut cache,
         &world,
         &lot,
@@ -1133,11 +1283,22 @@ fn lot_cache_two_tier_hits_environment_and_matches_uncached() {
         None,
         size,
         CacheHit::Environment,
-        "lamp glow word toggle",
+        "lamp glow word toggle at night",
     );
-    let lamp_cell = Lot::cell(25, 25);
+    assert_ne!(
+        after_glow.color, night_base.color,
+        "glow word toggle at night must visibly change object pixels"
+    );
+    // Pick a floored tile under `glow_id` (known on-screen and dimmed at night)
+    // so the lamp pool visibly illuminates its floor tile.
+    let glow_tile = world.objects.get(&glow_id).unwrap().position;
+    let lamp_cell = Lot::cell(
+        (glow_tile[0] / 16).clamp(0, lot.size as i32 - 1) as usize,
+        (glow_tile[1] / 16).clamp(0, lot.size as i32 - 1) as usize,
+    );
+    lot.levels[0].floors[lamp_cell] = lot.levels[0].floors[lamp_cell].max(1);
     lot.lamps[0][lamp_cell] = Lamps([Some([0, 0]), None]);
-    assert_parity_with_hit(
+    let after_lamp_pool = assert_parity_with_hit(
         &mut cache,
         &world,
         &lot,
@@ -1149,24 +1310,92 @@ fn lot_cache_two_tier_hits_environment_and_matches_uncached() {
         CacheHit::Miss,
         "lot lamp pool change invalidates tier 1",
     );
-
-    // 6. TV / appliance dynamic sprite animation (`dynamic_sprites`) hits Tier 1.
-    world.objects.get_mut(&anim_id).unwrap().dynamic_sprites = vec![1, 2];
-    assert_parity_with_hit(
-        &mut cache,
-        &world,
-        &lot,
-        assets,
-        &camera,
-        (400, 300),
-        None,
-        size,
-        CacheHit::Environment,
-        "appliance dynamic_sprites toggle",
+    assert_ne!(
+        after_lamp_pool.color, after_glow.color,
+        "adding lamp pool on visible night floor must visibly change pixels"
     );
 
-    // 7. Buy Mode preview moving (cursor + off-lot held object, no shadow/wall
-    //    change) hits Tier 1 (`Environment`) with exact parity!
+    // 6. TV / appliance dynamic sprite animation (`dynamic_sprites`) hits Tier 1
+    //    and visibly changes pixels on an object with dynamic sprite parts.
+    let dyn_id = world
+        .objects
+        .iter()
+        .find(|&(&id, o)| {
+            if o.person.is_none()
+                && o.position[2] == 1
+                && night_base.drawn(id).is_some()
+                && assets
+                    .definition(o.guid)
+                    .is_some_and(|d| !d.shapes_wall() && d.dynamic_base > 0)
+            {
+                let mut probe_world = world.clone();
+                let target_dyn = if o.dynamic_sprites.is_empty() {
+                    vec![0; 16]
+                } else {
+                    Vec::new()
+                };
+                probe_world.objects.get_mut(&id).unwrap().dynamic_sprites = target_dyn;
+                let mut probe = Canvas::new(size[0], size[1], [0xaa, 0xbb, 0xcc]);
+                draw_lot_with_preview(
+                    &probe_world,
+                    &lot,
+                    assets,
+                    &camera,
+                    (400, 300),
+                    None,
+                    &mut probe,
+                );
+                probe.color != after_lamp_pool.color
+            } else {
+                false
+            }
+        })
+        .map(|(&id, _)| id);
+    let after_dyn = if let Some(dyn_id) = dyn_id {
+        let obj = world.objects.get_mut(&dyn_id).unwrap();
+        obj.dynamic_sprites = if obj.dynamic_sprites.is_empty() {
+            vec![0; 16]
+        } else {
+            Vec::new()
+        };
+        let canvas = assert_parity_with_hit(
+            &mut cache,
+            &world,
+            &lot,
+            assets,
+            &camera,
+            (400, 300),
+            None,
+            size,
+            CacheHit::Environment,
+            "appliance dynamic_sprites toggle",
+        );
+        assert_ne!(
+            canvas.color, after_lamp_pool.color,
+            "dynamic_sprites toggle must visibly change pixels"
+        );
+        canvas
+    } else {
+        // Fallback if House05 has no dynamic-sprite object on screen: toggle
+        // `dynamic_sprites` on `anim_id` to still exercise the Tier-1 key path.
+        world.objects.get_mut(&anim_id).unwrap().dynamic_sprites = vec![1, 2];
+        assert_parity_with_hit(
+            &mut cache,
+            &world,
+            &lot,
+            assets,
+            &camera,
+            (400, 300),
+            None,
+            size,
+            CacheHit::Environment,
+            "appliance dynamic_sprites toggle",
+        )
+    };
+
+    // 7. Buy Mode preview moving (cursor + visible off-lot held object, no
+    //    shadow/wall change) hits Tier 1 (`Environment`) and visibly moves the
+    //    rendered preview pixels!
     let preview_held_id = world
         .objects
         .iter()
@@ -1175,13 +1404,15 @@ fn lot_cache_two_tier_hits_environment_and_matches_uncached() {
                 && id != door_id
                 && o.person.is_none()
                 && o.position[2] == 1
+                && night_base.drawn(id).is_some()
                 && assets.definition(o.guid).is_none_or(|d| !d.shapes_wall())
         })
         .map(|(&id, _)| id)
-        .expect("second non-wall object for buy preview");
+        .expect("visible non-wall object for buy preview");
     let saved_held_pos = world.objects.get(&preview_held_id).unwrap().position;
+    let saved_anim_pos = world.objects.get(&anim_id).unwrap().position;
     world.objects.get_mut(&preview_held_id).unwrap().position = [-16, -16, 1];
-    assert_parity_with_hit(
+    let after_preview = assert_parity_with_hit(
         &mut cache,
         &world,
         &lot,
@@ -1193,8 +1424,13 @@ fn lot_cache_two_tier_hits_environment_and_matches_uncached() {
         CacheHit::Environment,
         "buy preview active",
     );
+    assert_ne!(
+        after_preview.color, after_dyn.color,
+        "activating buy preview must visibly change pixels"
+    );
+    world.objects.get_mut(&anim_id).unwrap().position[0] += 16;
     world.objects.get_mut(&anim_id).unwrap().position[1] += 16;
-    assert_parity_with_hit(
+    let after_preview_move = assert_parity_with_hit(
         &mut cache,
         &world,
         &lot,
@@ -1206,7 +1442,12 @@ fn lot_cache_two_tier_hits_environment_and_matches_uncached() {
         CacheHit::Environment,
         "buy preview moved",
     );
+    assert_ne!(
+        after_preview_move.color, after_preview.color,
+        "moving buy preview must visibly change pixels"
+    );
     world.objects.get_mut(&preview_held_id).unwrap().position = saved_held_pos;
+    world.objects.get_mut(&anim_id).unwrap().position = saved_anim_pos;
 
     // 8. Padded canvas on a Tier-1 hit must match uncached bit-for-bit including
     //    trailing padded elements.
@@ -1242,11 +1483,16 @@ fn lot_cache_two_tier_hits_environment_and_matches_uncached() {
         assert_eq!(padded_cached, padded_uncached);
     }
 
-    // 9. Level 2 (`camera.level == 2`): level-1 environment stands full height
-    //    regardless of `camera.walls`, so animating objects and even switching
-    //    `camera.walls` on level 2 hit Tier 1 (`Environment`) with exact parity!
+    // 9. Level 2 (`camera.level == 2`): place visible level-2 walls on the
+    //    centered tile so toggling `camera.walls` from `Down` to `Up` visibly
+    //    raises level-2 walls while still hitting Tier 1 (`Environment`) for
+    //    level 1 (which stands full height under both wall modes).
+    lot.levels[1].walls[lamp_cell].segments |= WEST | NORTH;
+    lot.levels[1].walls[lamp_cell].styles = [1, 1];
+    lot.levels[1].walls[lamp_cell].patterns = [2, 2, 2, 2];
     camera.level = 2;
-    assert_parity_with_hit(
+    camera.walls = Walls::Down;
+    let level2_cold = assert_parity_with_hit(
         &mut cache,
         &world,
         &lot,
@@ -1270,9 +1516,33 @@ fn lot_cache_two_tier_hits_environment_and_matches_uncached() {
         CacheHit::Full,
         "level 2 steady",
     );
-    world.objects.get_mut(&anim_id).unwrap().data[0] =
-        world.objects.get(&anim_id).unwrap().data[0].wrapping_add(1);
-    assert_parity_with_hit(
+    let mut level2_visible = std::collections::BTreeSet::new();
+    for y in 0..size[1] as i32 {
+        for x in 0..size[0] as i32 {
+            if let Some(id) = level2_cold.id_at(x, y) {
+                level2_visible.insert(id);
+            }
+        }
+    }
+    let level2_vis_id = world
+        .objects
+        .iter()
+        .find(|&(&id, o)| {
+            o.person.is_none()
+                && o.position[2] == 1
+                && level2_visible.contains(&id)
+                && assets.definition(o.guid).is_none_or(|d| !d.shapes_wall())
+        })
+        .map(|(&id, _)| id)
+        .expect("level-1 object with visible pixels in level-2 view");
+    {
+        let obj = world.objects.get_mut(&level2_vis_id).unwrap();
+        if obj.data.len() <= 34 {
+            obj.data.resize(35, 0);
+        }
+        obj.data[34] = 1;
+    }
+    let level2_anim = assert_parity_with_hit(
         &mut cache,
         &world,
         &lot,
@@ -1282,10 +1552,14 @@ fn lot_cache_two_tier_hits_environment_and_matches_uncached() {
         None,
         size,
         CacheHit::Environment,
-        "level 2 with level-1 object animation",
+        "level 2 with level-1 object hidden toggle",
+    );
+    assert_ne!(
+        level2_anim.color, level2_cold.color,
+        "level-1 object mutation on level 2 must visibly change pixels"
     );
     camera.walls = Walls::Up;
-    assert_parity_with_hit(
+    let level2_walls_up = assert_parity_with_hit(
         &mut cache,
         &world,
         &lot,
@@ -1296,5 +1570,9 @@ fn lot_cache_two_tier_hits_environment_and_matches_uncached() {
         size,
         CacheHit::Environment,
         "level 2 walls mode switch keeps level-1 tier 1",
+    );
+    assert_ne!(
+        level2_walls_up.color, level2_anim.color,
+        "raising level-2 walls must visibly change pixels while reusing level-1 tier 1"
     );
 }

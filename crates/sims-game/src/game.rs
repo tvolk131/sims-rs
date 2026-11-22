@@ -435,23 +435,26 @@ impl Game {
     /// (`0x46da1b`); here the next tick waits a period of the new speed
     /// (**unverified**, and the window's timing, not the simulation's).
     pub fn advance(&mut self, elapsed_us: u64) -> u32 {
-        self.advance_while(elapsed_us, |_| true).0
+        self.advance_while(elapsed_us, elapsed_us, |_| true).0
     }
 
-    /// Runs the ticks owed after `elapsed_us` more microseconds while
-    /// `keep_going(ran)` returns `true`. Returns `(ran, capped)`, where
-    /// `capped` is `true` if `keep_going` stopped the batch before all owed
-    /// ticks ran (in which case [`Pace::restart`] drops the leftover fraction).
+    /// Advances the presentation clock by `clock_elapsed_us` and runs the
+    /// ticks owed for `step_elapsed_us` while `keep_going(ran)` returns
+    /// `true`. Returns `(ran, capped)`, where `capped` is `true` if
+    /// `keep_going` stopped the batch before all owed ticks ran (in which case
+    /// [`Pace::restart`] drops the leftover fraction).
     ///
-    /// Used by the interactive window loop to cap simulation work per wake so
-    /// Ultra/Idle speeds never spiral into multi-frame stalls; headless callers
-    /// use [`Game::advance`].
+    /// Keeping `clock_elapsed_us` separate from `step_elapsed_us` lets the
+    /// interactive window loop drop capped simulation time from scheduler
+    /// pacing without slowing the plumb bob spin or pause-button blink;
+    /// headless callers use [`Game::advance`].
     pub fn advance_while(
         &mut self,
-        elapsed_us: u64,
+        clock_elapsed_us: u64,
+        step_elapsed_us: u64,
         mut keep_going: impl FnMut(u32) -> bool,
     ) -> (u32, bool) {
-        self.clock_us = self.clock_us.saturating_add(elapsed_us);
+        self.clock_us = self.clock_us.saturating_add(clock_elapsed_us);
         if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
             self.blink_dirty = true;
         }
@@ -462,7 +465,7 @@ impl Game {
         if self.idle_speed() {
             return (0, false);
         }
-        let due = self.pace.due(elapsed_us, self.lot.world().speed());
+        let due = self.pace.due(step_elapsed_us, self.lot.world().speed());
         let (ran, capped) = self.run_while(due, true, &mut keep_going);
         if capped {
             self.pace.restart();
@@ -524,11 +527,11 @@ impl Game {
         let mut ran = 0;
         let mut capped = false;
         while ran < ticks && self.stopped.is_none() {
-            if !keep_going(ran) {
-                capped = true;
+            if idle && self.idle_speed() {
                 break;
             }
-            if idle && self.idle_speed() {
+            if !keep_going(ran) {
+                capped = true;
                 break;
             }
             let speed_before = (self.lot.world().speed(), self.lot.world().return_speed());

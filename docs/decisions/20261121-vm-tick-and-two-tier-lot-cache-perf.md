@@ -13,8 +13,9 @@ Profiling `House05.iff` in `--release` uncovered three exact, correctness-neutra
      `neighbors`, `12.0 µs` in `frame_storage`, `4.0 µs` in `arrays` totaling 188 KB) just in case
      the tick paused on an unanswered dialog.
    - Inside `Lot::advance`, macOS `sample` profiling over 20,000 ticks showed:
-     - `Animations::clip` (~23% of VM CPU): O(N) linear scan with per-entry `to_ascii_lowercase()`
-       heap allocation on case-insensitive clip lookups.
+     - `Animations::clip` (~23% of VM CPU): O(N) linear `eq_ignore_ascii_case` scan across the
+       clip map on case-insensitive lookups (plus per-lookup `to_ascii_lowercase()` heap allocation
+       in `Animations::samples` sample-name normalization).
      - `Interpreter::strides` (~17% of VM CPU): repeatedly decompressing `.cfp` animations and
        posing skeletons to recompute walk/run stride distances for the same `(clip, skeleton)` pair.
      - `set_to_next::next_in_order` (~8% of VM CPU): rebuilding a full `Vec<(i16, &Object)>`
@@ -42,9 +43,10 @@ or any of the 8 SHA-256 hashes in `crates/sims-game/tests/ratchet.txt`):
 
 1. **Copy-on-write `World` storage + `sims-vm` hot-loop speedups:**
    - Added `sims_sim::{CowBox, CowMap}` (`crates/sims-sim/src/cow.rs`) backed by `Arc` with
-     `Arc::ptr_eq` fast equality, `Arc::strong_count` unshared fast paths, and wire-identical
-     `Serialize`/`Deserialize` matching plain `T` / `BTreeMap<K, V>`. Wrapped `World::objects`,
-     `World::arrays`, `World::frame_storage` in `CowMap` and `World::neighbors` in `CowBox`.
+     `Arc::strong_count` unshared fast paths, exact `PartialEq` (matching `NaN` inequality of the
+     wrapped types), and wire-identical `Serialize`/`Deserialize` (using `collect_map`) matching
+     plain `T` / `BTreeMap<K, V>`. Wrapped `World::objects`, `World::arrays`, `World::frame_storage`
+     in `CowMap` and `World::neighbors` in `CowBox`.
    - Guarded read-before-write sites in `sims-vm` (`tick::pass`, `Machine::wrote_local`,
      `Machine::end_turn`) so non-mutating objects and untouched `frame_storage` entries avoid
      triggering `Arc::make_mut` during `asks = true` ticks.
@@ -74,12 +76,14 @@ or any of the 8 SHA-256 hashes in `crates/sims-game/tests/ratchet.txt`):
      transitions and bit-for-bit parity against uncached `draw_lot_with_preview` across all of
      those cases.
 3. **Interactive pacing budget and title throttling (`crates/sims-game/src/{game.rs, main.rs}`):**
-   - Added `Game::advance_while(elapsed_us, keep_going)` (`Game::advance` delegates to it with
-     `|_| true`, leaving headless `Game::advance` and `Pace` semantics 100% unchanged).
+   - Added `Game::advance_while(clock_elapsed_us, step_elapsed_us, keep_going)` (`Game::advance`
+     delegates to it with `(elapsed_us, elapsed_us, |_| true)`, leaving headless `Game::advance`
+     and `Pace` semantics 100% unchanged).
    - Wired `SIM_BUDGET = 8 ms` (`within_step_budget`: always allows at least 1 owed tick, then
-     yields to render once spent time reaches 8 ms) into `App::tick`, keeping zero-drift
-     `self.last = now` when within budget and re-anchoring `self.last = Instant::now()` + calling
-     `pace.restart()` when capped to prevent catch-up spirals.
+     yields to render once spent time reaches 8 ms) and `WakeClock` into `App::tick`, keeping
+     continuous wall-clock presentation time (`clock_us`) independent of capped scheduler pacing so
+     plumb-bob rotation and pause-button blinking never slow down when Ultra/Idle speed hits the
+     budget cap.
    - Added `TitleThrottle` (`TITLE_INTERVAL = 250 ms`) in `App::redraw` so steady running updates
      the window title at most 4×/sec while immediately flushing first draw and paused/stopped state
      transitions, with unit tests for both helpers in `crates/sims-game/src/main.rs`.

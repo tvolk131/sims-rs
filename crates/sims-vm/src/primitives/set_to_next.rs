@@ -287,6 +287,19 @@ impl Machine<'_, '_> {
             }
             &self.world.people
         } else {
+            // Validate every entry in registration order upfront (matching
+            // `registration_order`: object lookup before script-word
+            // conversion) without allocating a temporary `Vec`.
+            for &raw_id in &self.world.order {
+                if !self.world.objects.contains_key(&raw_id) {
+                    return Err(Trap::Invalid(format!(
+                        "registered object {raw_id} does not exist"
+                    )));
+                }
+                i16::try_from(raw_id).map_err(|_| {
+                    Trap::Invalid(format!("object ID {raw_id} does not fit a script word"))
+                })?;
+            }
             &self.world.order
         };
         let remaining = match current {

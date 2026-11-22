@@ -299,15 +299,18 @@ impl Animations {
     }
 
     /// Returns memoized walk-stride bit patterns `[first, second]` for
-    /// `(skeleton, clip)`, computing and caching them on a miss. Validated
-    /// against `self.revision` and `skeleton.bones` so mutations never observe
-    /// stale entries. Errors are never cached.
+    /// `(skeleton, clip_name)`, resolving the canonical clip from `self` so
+    /// arbitrary caller-supplied `Clip` values can never collide in the cache.
+    /// Validated against `self.revision` and `skeleton.bones` so mutations
+    /// never observe stale entries. Errors are never cached.
     pub fn cached_strides<E>(
         &self,
         skeleton: &Skeleton,
-        clip: &Clip,
-        compute: impl FnOnce() -> std::result::Result<[u32; 2], E>,
+        clip_name: &str,
+        on_lookup_err: impl FnOnce(Error) -> E,
+        compute: impl FnOnce(&Clip) -> std::result::Result<[u32; 2], E>,
     ) -> std::result::Result<[u32; 2], E> {
+        let clip = self.clip(clip_name).map_err(on_lookup_err)?;
         let key = (
             skeleton.file.clone(),
             skeleton.name.clone(),
@@ -321,7 +324,7 @@ impl Animations {
         {
             return Ok(*bits);
         }
-        let bits = compute()?;
+        let bits = compute(clip)?;
         if let Ok(mut cache) = self.strides_cache.lock() {
             cache.insert(key, (self.revision, skeleton.bones.clone(), bits));
         }

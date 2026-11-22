@@ -82,7 +82,7 @@ impl<T> From<T> for CowBox<T> {
 impl<T: PartialEq> PartialEq for CowBox<T> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0) || *self.0 == *other.0
+        *self.0 == *other.0
     }
 }
 
@@ -443,15 +443,7 @@ impl<K: Ord + Clone, V: Clone> Extend<(K, V)> for CowMap<K, V> {
 
 impl<K: PartialEq, V: PartialEq> PartialEq for CowMap<K, V> {
     fn eq(&self, other: &Self) -> bool {
-        if Arc::ptr_eq(&self.0, &other.0) {
-            return true;
-        }
-        self.0.len() == other.0.len()
-            && self
-                .0
-                .iter()
-                .zip(other.0.iter())
-                .all(|((k1, v1), (k2, v2))| k1 == k2 && (Arc::ptr_eq(v1, v2) || **v1 == **v2))
+        self.0.len() == other.0.len() && self.iter().eq(other.iter())
     }
 }
 
@@ -465,12 +457,7 @@ impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for CowMap<K, V> {
 
 impl<K: Serialize, V: Serialize> Serialize for CowMap<K, V> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
-        let mut map = serializer.serialize_map(Some(self.0.len()))?;
-        for (k, v) in self.0.iter() {
-            map.serialize_entry(k, v.as_ref())?;
-        }
-        map.end()
+        serializer.collect_map(self.iter())
     }
 }
 
@@ -540,5 +527,16 @@ mod tests {
         let decoded: CowMap<u16, Vec<i16>> =
             postcard::from_bytes(&encoded_plain).expect("decode CowMap");
         assert_eq!(decoded, map);
+    }
+
+    #[test]
+    fn cow_wrappers_match_plain_nan_inequality() {
+        let box_nan = CowBox::new(f32::NAN);
+        let box_clone = box_nan.clone();
+        assert_ne!(box_nan, box_clone);
+
+        let map_nan: CowMap<u16, f32> = CowMap::from([(1, f32::NAN)]);
+        let map_clone = map_nan.clone();
+        assert_ne!(map_nan, map_clone);
     }
 }

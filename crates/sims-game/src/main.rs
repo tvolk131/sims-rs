@@ -92,6 +92,47 @@ fn within_step_budget(ran: u32, spent: Duration, budget: Duration) -> bool {
     ran == 0 || spent < budget
 }
 
+/// Tracks wall-clock time for the interactive wake loop with separate anchors
+/// for presentation (`clock_us`: plumb bob spin, pause-button blink) and
+/// simulation pacing (`Pace::due`).
+///
+/// When all owed ticks fit inside [`SIM_BUDGET`], both anchors advance to the
+/// wake start (`wake_start`) for zero-drift pacing. When a batch hits the
+/// wall-clock cap, `last_step` re-anchors to `wake_end` so the next wake does
+/// not inherit this wake's simulation time as a catch-up spiral, while
+/// `last_clock` stays at `wake_start` so presentation time never slows down.
+struct WakeClock {
+    last_clock: Instant,
+    last_step: Instant,
+}
+
+impl WakeClock {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_clock: now,
+            last_step: now,
+        }
+    }
+
+    fn reset(&mut self, now: Instant) {
+        self.last_clock = now;
+        self.last_step = now;
+    }
+
+    fn elapsed_us(&self, now: Instant) -> (u64, u64) {
+        let to_us = |d: Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
+        (
+            to_us(now.saturating_duration_since(self.last_clock)),
+            to_us(now.saturating_duration_since(self.last_step)),
+        )
+    }
+
+    fn finish(&mut self, wake_start: Instant, wake_end: Instant, capped: bool) {
+        self.last_clock = wake_start;
+        self.last_step = if capped { wake_end } else { wake_start };
+    }
+}
+
 /// High-level run state reflected in the window title suffix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TitleState {
@@ -286,7 +327,7 @@ struct App {
     scale: u32,
     cursor: Option<PhysicalPosition<f64>>,
     drag: Option<PhysicalPosition<f64>>,
-    last: Instant,
+    wake_clock: WakeClock,
     dirty: bool,
     photos: usize,
     /// The stop already printed, so it is printed once.
@@ -451,7 +492,7 @@ impl App {
             // The errors and the stop are the restored lot's.
             self.printed = 0;
             self.reported = false;
-            self.last = Instant::now();
+            self.wake_clock.reset(Instant::now());
         }
         self.changed(true);
     }
@@ -552,16 +593,12 @@ impl App {
     /// Steps the lot for the time since the last call.
     fn tick(&mut self) {
         let now = Instant::now();
-        let elapsed = now.duration_since(self.last);
-        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        let (clock_us, step_us) = self.wake_clock.elapsed_us(now);
         let waited = self.game.asking().is_some();
-        let (ran, capped) = self.game.advance_while(micros, |ran| {
+        let (ran, capped) = self.game.advance_while(clock_us, step_us, |ran| {
             within_step_budget(ran, now.elapsed(), SIM_BUDGET)
         });
-        // Keep zero-drift pacing (`self.last = now`) when all owed ticks fit in
-        // `SIM_BUDGET`. When Ultra/Idle speed hits the cap, re-anchor `self.last`
-        // after the batch so simulation time does not feed a catch-up spiral.
-        self.last = if capped { Instant::now() } else { now };
+        self.wake_clock.finish(now, Instant::now(), capped);
         // A dialog shown at the first tick due is drawn though none ran.
         let mut redraw = ran > 0 || (!waited && self.game.asking().is_some());
         // The plumb bob spins and the Live-mode pause button blinks by the
@@ -777,7 +814,7 @@ impl ApplicationHandler for App {
         }
         self.scale = window.scale_factor().round().max(1.0) as u32;
         self.window = Some(window.clone());
-        self.last = Instant::now();
+        self.wake_clock.reset(Instant::now());
         self.dirty = true;
         window.request_redraw();
     }
@@ -798,7 +835,7 @@ impl ApplicationHandler for App {
                 {
                     // Drop any wall-clock time spent paused or stalled while
                     // unfocused so the first tick after resume does not catch up.
-                    self.last = Instant::now();
+                    self.wake_clock.reset(Instant::now());
                     self.changed(true);
                 }
             }
@@ -976,7 +1013,7 @@ fn run() -> Result<(), String> {
         scale: 1,
         cursor: None,
         drag: None,
-        last: Instant::now(),
+        wake_clock: WakeClock::new(Instant::now()),
         dirty: true,
         photos: 0,
         reported: false,
@@ -1133,6 +1170,29 @@ mod tests {
         assert!(within_step_budget(3, Duration::from_micros(7_999), budget));
         assert!(!within_step_budget(1, Duration::from_millis(8), budget));
         assert!(!within_step_budget(4, Duration::from_millis(12), budget));
+    }
+
+    #[test]
+    fn wake_clock_preserves_presentation_time_across_capped_batches() {
+        let t0 = Instant::now();
+        let mut clock = WakeClock::new(t0);
+
+        // Uncapped wake: both presentation and scheduler anchor to wake_start.
+        let w1_start = t0 + Duration::from_millis(16);
+        let w1_end = w1_start + Duration::from_millis(2);
+        assert_eq!(clock.elapsed_us(w1_start), (16_000, 16_000));
+        clock.finish(w1_start, w1_end, false);
+
+        // Capped wake: takes 9 ms; next wake arrives 5 ms after it ends.
+        let w2_start = w1_start + Duration::from_millis(16);
+        let w2_end = w2_start + Duration::from_millis(9);
+        assert_eq!(clock.elapsed_us(w2_start), (16_000, 16_000));
+        clock.finish(w2_start, w2_end, true);
+
+        // Presentation clock must advance by the full 9 + 5 = 14 ms while
+        // scheduler pacing advances only by the 5 ms since w2_end.
+        let w3_start = w2_end + Duration::from_millis(5);
+        assert_eq!(clock.elapsed_us(w3_start), (14_000, 5_000));
     }
 
     #[test]
