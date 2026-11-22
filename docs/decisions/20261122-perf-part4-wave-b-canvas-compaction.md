@@ -73,23 +73,32 @@ Rust (`unsafe_code = "forbid"`)**.
   - `scale >= 3` indexes `u32` pixels directly without shift/OR packing.
 - Added `blit_canvas_rect` (handling arbitrary scales `1..=4`, odd window sizes,
   and trailing edge-clamped columns/rows bit-for-bit identically to `blit_canvas`)
-  and safe `softbuffer::Buffer::present_with_damage` presentation in `App::redraw`:
-  - Partial damage is used **only** when `buffer.age() == 1` (backbuffer retains
-    the exact previous frame — e.g. Win32, X11, Web, KMS; macOS CoreGraphics
-    returns `age() == 0` and safely falls back to full `blit_canvas` +
+  and safe partial-update presentation in `App::redraw`:
+  - Partial rectangular CPU blitting (`blit_canvas_rect`) is used **only** when
+    `buffer.age() == 1` (backbuffer retains the exact previous frame; macOS
+    CoreGraphics returns `age() == 0` and falls back to full `blit_canvas` +
     `buffer.present()`), the `(bw, bh, scale, cw, ch, screen_kind)` signature
     matches the last successfully presented frame (invalidated on resize, error,
     or loading-screen direct presents), and the active screen proves a complete,
-    bounded list of canvas-space damage rects:
+    bounded list of canvas-space damage rects.
+  - `buffer.present_with_damage(&damage)` is invoked **only** on composited
+    exposure-safe display backends (`RawDisplayHandle::Wayland` / `Web`); on
+    X11 and Win32, where winit coalesces OS exposure events into
+    `RedrawRequested`, `blit_canvas_rect` still skips rewriting unchanged
+    backbuffer pixels and then calls full `buffer.present()` so any exposed
+    window region outside `damage` is always repainted.
+  - Proven steady-state damage invariants:
     - **Lot screen (`Game::SteadyFrameKey`):** `LotCache::last_hit() == CacheHit::Full`,
-      Live mode with no dialogs/menus/highlights/overlays/animations/blink change,
-      unchanged HUD/world inputs (`prev_dynamic_rects ∪ cur_dynamic_rects`
-      covering all 3D Sims, plumb bob, and `draw_held` objects across every
-      unpresented `draw()`).
+      Live mode with no dialogs/menus/highlights/overlays/animations/blink change
+      or active/starting co-op overlay, unchanged HUD items (`hud_items`) and
+      world inputs (`prev_dynamic_rects ∪ cur_dynamic_rects` covering all 3D
+      Sims, plumb bob, and `draw_held` objects across every unpresented `draw()`),
+      invalidated whenever a pie-menu check tree runs (`Game::list`) or a shell
+      modal overlay (`save_manager` / `album` / `travel_dialog`) is composited.
     - **Neighborhood screen (`NeighborhoodSteadyKey` + `NeighborhoodMap::render_into_with_damage`):**
-      cached static base-layer hit, unchanged chrome/water/pointer/state with no
-      dialogs or filters (`prev_nb_dynamic_rects ∪ cur_nb_dynamic_rects` covering
-      all fading/hovered and transitively overlapping dynamic lots).
+      cached static base-layer hit, unchanged chrome hover/press/water/pointer/state
+      with no dialogs or filters (`prev_nb_dynamic_rects ∪ cur_nb_dynamic_rects`
+      covering all fading/hovered and transitively overlapping dynamic lots).
   - `on_presented()` is called **only after** `buffer.present()` /
     `buffer.present_with_damage()` returns `Ok(())`; any intermediate non-steady
     frame or presentation error forces a full blit on the next present.

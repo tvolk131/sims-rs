@@ -536,6 +536,7 @@ impl Saved {
                 },
             )
         };
+        validate_world_object_ids(&saved.world)?;
         saved.hydrate_world_aux();
         Ok((saved, report))
     }
@@ -558,9 +559,26 @@ impl Saved {
         }
         let mut saved: Self =
             decode_postcard_exact("saved-lot", FORMAT, body).map_err(|e| format(e.to_string()))?;
+        validate_world_object_ids(&saved.world)?;
         saved.hydrate_world_aux();
         Ok(saved)
     }
+}
+
+/// Rejects saves whose world contains the reserved sentinel object ID
+/// (`u16::MAX` / `65535`), which native signed-`i16` object registries never
+/// emit and `sims_render::Canvas` reserves as `ID_NONE`.
+fn validate_world_object_ids(world: &World) -> Result<(), SaveError> {
+    if world.objects.contains_key(&u16::MAX)
+        || world.objects.values().any(|o| o.id == u16::MAX)
+        || world.people.contains(&u16::MAX)
+        || world.selected() == Some(u16::MAX)
+    {
+        return Err(SaveError::Format(
+            "saved world contains reserved object ID 65535".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl Lot {
@@ -730,6 +748,7 @@ impl Lot {
         if saved.loaded != self.loaded || saved.floor_rotation != self.floor_rotation {
             return Err(SaveError::OtherLoad);
         }
+        validate_world_object_ids(&saved.world)?;
         self.world = saved.world;
         self.ticks = saved.ticks;
         self.start = saved.start;
@@ -1407,5 +1426,79 @@ mod tests {
             dec9.special_panel_responses,
             VecDeque::from([SpecialPanelResponse::Lot(Some(93))])
         );
+    }
+
+    #[test]
+    fn decode_rejects_reserved_u16_max_object_id() {
+        let mut world = World::empty();
+        world.objects.insert(
+            u16::MAX,
+            sims_sim::Object {
+                id: u16::MAX,
+                guid: 0x1234_5678,
+                footprint: [0; 4],
+                position: [0; 3],
+                unknown_short: 0,
+                attributes: Vec::new(),
+                temps: Vec::new(),
+                data: Vec::new(),
+                obsolete_word: 0,
+                stack_capacity_bytes: 0,
+                stack: Vec::new(),
+                relationship_flag: 0,
+                relationships: Vec::new(),
+                slots: Vec::new(),
+                dynamic_sprites: Vec::new(),
+                multipart: None,
+                portal: None,
+                person: None,
+                registry_word: None,
+                last_result: false,
+                removal_skips_resets: false,
+                selected: false,
+            },
+        );
+        let bad = Saved {
+            generated_portrait_2002: BTreeSet::new(),
+            made_portrait_head: BTreeMap::new(),
+            ambiguous_portraits: BTreeSet::new(),
+            loaded_indexed_skeletons: BTreeMap::new(),
+            loaded_indexed_suits: BTreeMap::new(),
+            loaded_indexed_suit_bones: BTreeMap::new(),
+            made_outfits: BTreeMap::new(),
+            person_outfits: BTreeMap::new(),
+            scratch_ptr_set: BTreeSet::new(),
+            scratch_ptr_set_to_next: BTreeSet::new(),
+            scratch_ptr_expression: BTreeSet::new(),
+            scratch_ptr_arg_slot: BTreeSet::new(),
+            runtime_added_suits: Vec::new(),
+            suit_scan_cache: None,
+            world,
+            ticks: 0,
+            start: 0,
+            answers: Answers::default(),
+            fresh: BTreeSet::new(),
+            view_rotation: 0,
+            answered: false,
+            house: 5,
+            family: 1,
+            loaded: [0; 32],
+            view_centre: None,
+            floor_rotation: 0,
+            replay_view: None,
+            last_dialog_text: String::new(),
+            character_names: BTreeMap::new(),
+            lot_name: String::new(),
+            lot_description: String::new(),
+            special_panels: SpecialPanels::default(),
+            special_panel_responses: VecDeque::new(),
+            deletion_epoch: 0,
+        };
+        let bytes = bad.encode();
+        assert!(matches!(Saved::decode(&bytes), Err(SaveError::Format(_))));
+        assert!(matches!(
+            Saved::decode_strict(&bytes),
+            Err(SaveError::Format(_))
+        ));
     }
 }

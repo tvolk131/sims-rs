@@ -47,6 +47,7 @@ use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
+use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
 use winit::window::{Window, WindowId};
 
 /// Splash animation and worker-completion poll interval while `StartupLoading`
@@ -1802,8 +1803,15 @@ impl App {
             if damage.is_empty() {
                 blit_canvas(canvas, &mut buffer, bw, bh, scale);
                 buffer.present()
-            } else {
+            } else if window_supports_exposure_safe_partial_present(&window) {
                 buffer.present_with_damage(&damage)
+            } else {
+                // On X11/Win32, winit coalesces OS exposure events into
+                // `RedrawRequested`; `blit_canvas_rect` already avoided
+                // rewriting unchanged pixels in the retained backbuffer
+                // (`age() == 1`), and full `present()` guarantees any exposed
+                // window region outside `damage` is repainted.
+                buffer.present()
             }
         } else {
             blit_canvas(canvas, &mut buffer, bw, bh, scale);
@@ -1857,6 +1865,20 @@ impl App {
             (None, None) => None,
         }
     }
+}
+
+/// Whether `softbuffer::Buffer::present_with_damage` can safely copy only the
+/// dirty rectangles without leaving OS-exposed window regions unpainted.
+/// Composited surfaces (Wayland, Web) retain their window backing store across
+/// exposures, whereas X11/Win32 coalesce OS exposure events into winit's
+/// `RedrawRequested` and need a full `present()` after the partial CPU blit.
+fn window_supports_exposure_safe_partial_present(window: &Window) -> bool {
+    window.display_handle().is_ok_and(|handle| {
+        matches!(
+            handle.as_raw(),
+            RawDisplayHandle::Wayland(_) | RawDisplayHandle::Web(_)
+        )
+    })
 }
 
 #[inline]

@@ -218,7 +218,7 @@ struct ActiveSpecialPanel {
 /// Conservative invariant key for steady-state Tier-2 lot frames where all
 /// non-people pixels (lot surface, HUD, overlays) are guaranteed unchanged and
 /// pixel differences are strictly bounded by `prev_dynamic_rects ∪ cur_dynamic_rects`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct SteadyFrameKey {
     width: usize,
     height: usize,
@@ -235,7 +235,7 @@ struct SteadyFrameKey {
     return_speed: i16,
     clock_nonzero: bool,
     queue: sims_ui::queue::Queue,
-    hud_items_len: usize,
+    hud_items: Vec<sims_ui::hud::Item>,
 }
 
 pub struct Game {
@@ -3800,7 +3800,7 @@ impl Game {
             && self.build_preview_shape.is_none()
             && self.buy_cursor.is_none()
             && self.buy_selected.is_none()
-            && !self.coop.is_active()
+            && !self.coop.is_active_or_starting()
             && !self.coop_lobby.is_open()
             && self.hud.menu.is_none()
             && self.hud.dialog().is_none()
@@ -3832,7 +3832,7 @@ impl Game {
                 return_speed: world.return_speed(),
                 clock_nonzero: self.clock_us > 0,
                 queue: self.hud.queue().clone(),
-                hud_items_len: self.hud.items().len(),
+                hud_items: self.hud.items().to_vec(),
             })
         } else {
             None
@@ -4737,6 +4737,10 @@ impl Game {
         };
         let listing = menu::entries(&mut self.lot, &self.assets, person, object);
         let changed = listing.as_ref().is_ok_and(|l| l.unchecked.is_none());
+        if changed {
+            self.prev_steady_key = None;
+            self.present_damage = None;
+        }
         if let Ok(listing) = &listing {
             self.keep_sounds(listing.sounds.clone());
         }

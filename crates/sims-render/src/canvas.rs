@@ -348,46 +348,74 @@ impl Ids {
     }
 
     /// Takes `canvas`'s full-screen IDs as they are now, reusing this one's storage.
+    /// Bounds capture by `canvas.ids.len()` so undersized canvases preserve all
+    /// backed picks matching [`Canvas::id_at`].
     pub fn take(&mut self, canvas: &Canvas) {
         self.rects.clear();
         self.pool.clear();
-        if canvas.width == 0 || canvas.height == 0 || !canvas.has_pixel_storage() {
+        if canvas.width == 0 || canvas.height == 0 || canvas.ids.is_empty() {
             return;
         }
-        let Ok(w) = i32::try_from(canvas.width) else {
-            return;
-        };
-        let Ok(h) = i32::try_from(canvas.height) else {
-            return;
-        };
-        let pixels = canvas.width * canvas.height;
-        self.pool.extend_from_slice(&canvas.ids[..pixels]);
-        self.rects.push(IdRect {
-            x0: 0,
-            y0: 0,
-            x1: w,
-            y1: h,
-            offset: 0,
-        });
+        let max_i32 = i32::MAX as usize;
+        let backed = canvas.ids.len();
+        let full_rows = (backed / canvas.width).min(canvas.height).min(max_i32);
+        if full_rows > 0 {
+            let row_w = canvas.width.min(max_i32);
+            if row_w == canvas.width {
+                let pixels = full_rows * canvas.width;
+                self.pool.extend_from_slice(&canvas.ids[..pixels]);
+            } else {
+                self.pool.reserve(full_rows * row_w);
+                for y in 0..full_rows {
+                    let start = y * canvas.width;
+                    self.pool
+                        .extend_from_slice(&canvas.ids[start..start + row_w]);
+                }
+            }
+            self.rects.push(IdRect {
+                x0: 0,
+                y0: 0,
+                x1: row_w as i32,
+                y1: full_rows as i32,
+                offset: 0,
+            });
+        }
+        if full_rows < canvas.height && full_rows < max_i32 {
+            let tail_start = full_rows.saturating_mul(canvas.width);
+            let partial_cols = backed
+                .saturating_sub(tail_start)
+                .min(canvas.width)
+                .min(max_i32);
+            if partial_cols > 0 {
+                let offset = self.pool.len();
+                self.pool
+                    .extend_from_slice(&canvas.ids[tail_start..tail_start + partial_cols]);
+                self.rects.push(IdRect {
+                    x0: 0,
+                    y0: full_rows as i32,
+                    x1: partial_cols as i32,
+                    y1: (full_rows + 1) as i32,
+                    offset,
+                });
+            }
+        }
     }
 
     /// Takes `canvas`'s IDs only inside `rects` (clipped to the canvas),
     /// reusing this one's backing allocations. For overlapping rects captured
     /// from the same `canvas` snapshot, every rect stores identical pixel IDs
     /// at their intersection so [`Ids::id_at`] agrees bit-for-bit with
-    /// [`Ids::take`] on every pixel inside the union of `rects`.
+    /// [`Ids::take`] on every pixel inside the union of `rects`. Bounds capture
+    /// by `canvas.ids.len()` so undersized canvases preserve backed picks.
     pub fn take_rects(&mut self, canvas: &Canvas, rects: &[Rect]) {
         self.rects.clear();
         self.pool.clear();
-        if rects.is_empty()
-            || canvas.width == 0
-            || canvas.height == 0
-            || !canvas.has_pixel_storage()
-        {
+        if rects.is_empty() || canvas.width == 0 || canvas.height == 0 || canvas.ids.is_empty() {
             return;
         }
         let cw = i64::try_from(canvas.width).unwrap_or(i64::MAX);
         let ch = i64::try_from(canvas.height).unwrap_or(i64::MAX);
+        let backed = canvas.ids.len();
         for &[rx0, ry0, rx1, ry1] in rects {
             let x0 = i64::from(rx0).clamp(0, cw);
             let y0 = i64::from(ry0).clamp(0, ch);
@@ -406,12 +434,26 @@ impl Ids {
             };
             let (x0_u, x1_u) = (x0 as usize, x1 as usize);
             let (y0_u, y1_u) = (y0 as usize, y1 as usize);
+            let rect_w = x1_u - x0_u;
+            let Some(rect_pixels) = rect_w.checked_mul(y1_u - y0_u) else {
+                continue;
+            };
             let offset = self.pool.len();
-            self.pool.reserve((x1_u - x0_u) * (y1_u - y0_u));
+            self.pool.reserve(rect_pixels);
             for y in y0_u..y1_u {
-                let row = y * canvas.width;
-                self.pool
-                    .extend_from_slice(&canvas.ids[row + x0_u..row + x1_u]);
+                let row_start = y.checked_mul(canvas.width);
+                let src_start = row_start.and_then(|r| r.checked_add(x0_u));
+                let avail = src_start
+                    .filter(|&s| s < backed)
+                    .map_or(0, |s| (backed - s).min(rect_w));
+                if avail > 0 {
+                    let s = src_start.unwrap();
+                    self.pool.extend_from_slice(&canvas.ids[s..s + avail]);
+                }
+                if avail < rect_w {
+                    self.pool
+                        .resize(self.pool.len() + (rect_w - avail), ID_NONE);
+                }
             }
             self.rects.push(IdRect {
                 x0: x0_i,
@@ -665,7 +707,7 @@ impl Canvas {
     /// last, if any did and the pixel is on the canvas: what a click there
     /// hit.
     pub fn id_at(&self, x: i32, y: i32) -> Option<u16> {
-        decode_id(self.ids[self.index(x, y)?])
+        self.ids.get(self.index(x, y)?).copied().and_then(decode_id)
     }
 
     /// The IDs of every pixel as they are now ([`Ids`]).
@@ -3016,6 +3058,14 @@ mod tests {
         assert_eq!(unpack_rgb(c.color[0]), [200, 100, 50]);
         assert_eq!(c.depth[0], 5);
         assert_eq!(c.id_at(0, 0), Some(3));
+        assert_eq!(c.id_at(1, 0), None);
+        let full_ids = c.ids();
+        assert_eq!(full_ids.id_at(0, 0), Some(3));
+        assert_eq!(full_ids.id_at(1, 0), None);
+        let mut rect_ids = Ids::default();
+        rect_ids.take_rects(&c, &[[0, 0, 4, 1]]);
+        assert_eq!(rect_ids.id_at(0, 0), Some(3));
+        assert_eq!(rect_ids.id_at(1, 0), None);
         // 2x1 sprite whose second pixel is transparent must also avoid
         // touching index 1 (matching origin/main's per-pixel alpha skip).
         let two = Image {
