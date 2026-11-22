@@ -142,6 +142,7 @@ fn parse_rsmp_raw(data: &[u8]) -> Result<Option<RawRsmp>> {
     let count = r.u32()? as usize;
     r.count(count, 8)?;
     let mut types: Vec<([u8; 4], Range<usize>)> = Vec::with_capacity(count);
+    let mut seen_tags: BTreeSet<[u8; 4]> = BTreeSet::new();
     let mut entries: Vec<RawRsmpEntry> = Vec::new();
     for _ in 0..count {
         let tag = r.u32()?.to_be_bytes();
@@ -159,7 +160,7 @@ fn parse_rsmp_raw(data: &[u8]) -> Result<Option<RawRsmp>> {
             }
             entries.push(RawRsmpEntry { offset, id, flags });
         }
-        if types.iter().any(|(seen, _)| *seen == tag) {
+        if !seen_tags.insert(tag) {
             return r.fail("duplicate resource-map type");
         }
         types.push((tag, start..entries.len()));
@@ -434,6 +435,34 @@ impl Iff {
         } else {
             Cow::Owned(western(raw))
         }
+    }
+    /// Walks chunk headers identically to [`Iff::parse`] (validating the
+    /// complete file framing without allocating chunk labels or parsing `rsmp`)
+    /// and returns the payload of the first physical chunk matching `tag`.
+    /// Matches `Iff::parse(bytes)?.chunks.iter().find(|c| &c.tag == tag)`.
+    pub fn find_first_physical(bytes: &[u8], target: &[u8; 4]) -> Result<Option<Vec<u8>>> {
+        let mut r = Reader::new(bytes);
+        let header = r.take(FILE_HEADER_SIZE)?;
+        if !header.starts_with(b"IFF FILE 2.5:") && !header.starts_with(b"IFF FILE 2.0:") {
+            return r.fail("invalid Maxis IFF signature");
+        }
+        let mut found: Option<Range<usize>> = None;
+        while r.remaining() > 0 {
+            let tag: [u8; 4] = r.take(4)?.try_into().unwrap();
+            let length = r.be32()? as usize;
+            if length < CHUNK_HEADER_SIZE {
+                return r.fail("IFF chunk shorter than its 76-byte header");
+            }
+            let _id = r.be16()?;
+            let _flags = r.be16()?;
+            let _label = r.take(64)?;
+            let start = r.pos;
+            r.skip(length - CHUNK_HEADER_SIZE)?;
+            if found.is_none() && &tag == target {
+                found = Some(start..r.pos);
+            }
+        }
+        Ok(found.map(|range| bytes[range].to_vec()))
     }
     /// Scans only the requested chunk `tags` from an in-memory IFF buffer,
     /// reading headers and `rsmp` zero-copy directly from `bytes` (zero chunk

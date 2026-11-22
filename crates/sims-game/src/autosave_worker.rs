@@ -7,6 +7,7 @@
 //! Serialization (`World::encode` / `Saved::encode`), payload validation,
 //! SHA-256 checksumming, and atomic REDB commits all run off-thread.
 
+use sims_net::manifest::sha256_bytes;
 use sims_sim::World;
 use sims_sim::autosave::{
     AutosaveStore, SaveError, SaveJob, SaveMetadata, SavePayload, SavePayloadKind, SaveSlot,
@@ -14,11 +15,72 @@ use sims_sim::autosave::{
 };
 use sims_ui::saves::{SaveHealth, SaveManagerSnapshot, SaveSlotKind, SaveSlotSummary};
 use sims_vm::boot::save::Saved;
-use std::sync::Arc;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const VALIDATION_CACHE_MAX: usize = 64;
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum ValidationKind {
+    SavedLot,
+    WorldSnapshot,
+    Custom(String),
+}
+
+impl From<&SavePayloadKind> for ValidationKind {
+    fn from(kind: &SavePayloadKind) -> Self {
+        match kind {
+            SavePayloadKind::SavedLot => Self::SavedLot,
+            SavePayloadKind::WorldSnapshot => Self::WorldSnapshot,
+            SavePayloadKind::Custom(tag) => Self::Custom(tag.clone()),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ValidationCache {
+    order: VecDeque<(ValidationKind, [u8; 32])>,
+    results: BTreeMap<(ValidationKind, [u8; 32]), Result<(), String>>,
+}
+
+impl ValidationCache {
+    fn get(&self, key: &(ValidationKind, [u8; 32])) -> Option<Result<(), String>> {
+        self.results.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: (ValidationKind, [u8; 32]), value: Result<(), String>) {
+        if let Some(existing) = self.results.get_mut(&key) {
+            *existing = value;
+            return;
+        }
+        while self.order.len() >= VALIDATION_CACHE_MAX {
+            if let Some(oldest) = self.order.pop_front() {
+                self.results.remove(&oldest);
+            }
+        }
+        self.order.push_back(key.clone());
+        self.results.insert(key, value);
+    }
+}
+
+fn validation_cache() -> &'static Mutex<ValidationCache> {
+    static CACHE: OnceLock<Mutex<ValidationCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(ValidationCache::default()))
+}
+
+/// Records that `bytes` were just produced by `Saved::encode()` inside the
+/// worker thread so `commit_job_validated` skips a redundant round-trip
+/// `Saved::decode` for that exact digest while still running full validation
+/// for existing slots and any caller-supplied bytes.
+fn note_validated_saved_lot(bytes: &[u8]) {
+    let key = (ValidationKind::SavedLot, sha256_bytes(bytes));
+    let mut guard = validation_cache().lock().unwrap_or_else(|e| e.into_inner());
+    guard.insert(key, Ok(()));
+}
 
 /// Result of one background save or autosave job executed by [`AutosaveWorker`].
 #[derive(Debug, Clone)]
@@ -31,14 +93,7 @@ pub struct SaveCompletion {
 }
 
 enum WorkerMessage {
-    Job {
-        job: SaveJob,
-        /// True for caller-supplied external jobs that need full payload decode;
-        /// false for self-encoded `World` / `Saved::encode` payloads where
-        /// header + envelope SHA-256 verification avoids a redundant round-trip
-        /// `Saved::decode`.
-        full_validate: bool,
-    },
+    Job(SaveJob),
     SavedLot {
         neighborhood_id: String,
         expected_instance_id: u128,
@@ -67,14 +122,30 @@ pub fn validate_save_payload(kind: &SavePayloadKind, bytes: &[u8]) -> Result<(),
     }
 }
 
-/// Fast header-only payload validator for Save Manager listing and self-encoded
-/// background commits.
-///
-/// `AutosaveStore` already verifies the full REDB envelope (magic, schema
-/// version, 32-byte record SHA-256 checksum, key binding, and payload SHA-256).
-/// This check verifies the `Saved` 8-byte format/world-snapshot header without
-/// synchronously deserializing every slot's entire `World`; full `Saved::decode`
-/// still runs whenever a slot is actually loaded or imported.
+/// Full payload validator backed by a bounded `(SavePayloadKind, SHA-256)`
+/// cache so Save Manager listings, overwrite/pruning safeguards, and
+/// self-encoded commits agree 100% with [`validate_save_payload`] without
+/// repeatedly re-decoding identical immutable payloads.
+pub fn validate_save_payload_cached(kind: &SavePayloadKind, bytes: &[u8]) -> Result<(), String> {
+    let key = (ValidationKind::from(kind), sha256_bytes(bytes));
+    {
+        let guard = validation_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cached) = guard.get(&key) {
+            return cached;
+        }
+    }
+    let result = validate_save_payload(kind, bytes);
+    {
+        let mut guard = validation_cache().lock().unwrap_or_else(|e| e.into_inner());
+        guard.insert(key, result.clone());
+    }
+    result
+}
+
+/// Fast header-only check verifying the 8-byte `Saved` format and
+/// `SNAPSHOT_FORMAT` header. Callers requiring full body integrity (such as
+/// Save Manager listing, commit safeguards, and loads) should use
+/// [`validate_save_payload_cached`] or [`validate_save_payload`].
 pub fn validate_save_payload_header(kind: &SavePayloadKind, bytes: &[u8]) -> Result<(), String> {
     match kind {
         SavePayloadKind::SavedLot => {
@@ -201,7 +272,7 @@ pub fn build_save_manager_snapshot(
     let lot_u16 = u16::try_from(lot_id).unwrap_or(u16::MAX);
     let lot_label = lot_label.into();
     let entries =
-        match store.list_saves_validated(neighborhood_id, lot_id, validate_save_payload_header) {
+        match store.list_saves_validated(neighborhood_id, lot_id, validate_save_payload_cached) {
             Ok(entries) => entries,
             Err(err) => {
                 let merged_err = match active_error {
@@ -299,6 +370,7 @@ pub struct AutosaveWorker {
     tx: Option<Sender<WorkerMessage>>,
     rx: Receiver<SaveCompletion>,
     pending: Arc<AtomicUsize>,
+    unread: Arc<AtomicUsize>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -308,12 +380,14 @@ impl AutosaveWorker {
         let (job_tx, job_rx) = mpsc::channel::<WorkerMessage>();
         let (done_tx, done_rx) = mpsc::channel::<SaveCompletion>();
         let pending = Arc::new(AtomicUsize::new(0));
+        let unread = Arc::new(AtomicUsize::new(0));
         let pending_worker = Arc::clone(&pending);
+        let unread_worker = Arc::clone(&unread);
 
         let builder = thread::Builder::new().name("sims-autosave-worker".into());
         let handle = builder
             .spawn(move || {
-                worker_loop(store, job_rx, done_tx, pending_worker);
+                worker_loop(store, job_rx, done_tx, pending_worker, unread_worker);
             })
             .expect("failed to spawn sims-autosave-worker thread");
 
@@ -321,27 +395,24 @@ impl AutosaveWorker {
             tx: Some(job_tx),
             rx: done_rx,
             pending,
+            unread,
             handle: Some(handle),
         }
-    }
-
-    fn enqueue_job_inner(&self, job: SaveJob, full_validate: bool) -> Result<(), String> {
-        let Some(tx) = &self.tx else {
-            return Err("autosave worker is shut down".into());
-        };
-        self.pending.fetch_add(1, Ordering::AcqRel);
-        if tx.send(WorkerMessage::Job { job, full_validate }).is_err() {
-            self.pending.fetch_sub(1, Ordering::AcqRel);
-            return Err("autosave worker channel closed".into());
-        }
-        Ok(())
     }
 
     /// Enqueues an already-constructed [`SaveJob`] (such as a CoW
     /// `SavePayload::World(Box<World>)` snapshot with `expected_instance_id`
     /// fencing) for asynchronous REDB commit.
     pub fn enqueue_job(&self, job: SaveJob) -> Result<(), String> {
-        self.enqueue_job_inner(job, true)
+        let Some(tx) = &self.tx else {
+            return Err("autosave worker is shut down".into());
+        };
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        if tx.send(WorkerMessage::Job(job)).is_err() {
+            self.pending.fetch_sub(1, Ordering::AcqRel);
+            return Err("autosave worker channel closed".into());
+        }
+        Ok(())
     }
 
     /// Enqueues a cheap CoW [`World`] snapshot (`SavePayload::World`) fenced to
@@ -385,7 +456,7 @@ impl AutosaveWorker {
         if let Some(ts) = unix_timestamp_secs() {
             job = job.with_saved_at_unix_secs(ts);
         }
-        self.enqueue_job_inner(job, false)
+        self.enqueue_job(job)
     }
 
     /// Enqueues a cheap CoW [`Saved`] lot snapshot whose `Saved::encode()` runs
@@ -464,13 +535,14 @@ impl AutosaveWorker {
         if let Some(ts) = unix_timestamp_secs() {
             job = job.with_saved_at_unix_secs(ts);
         }
-        self.enqueue_job_inner(job, false)
+        self.enqueue_job(job)
     }
 
     /// Non-blocking drain of all completed background save jobs.
     pub fn poll_completions(&self) -> Vec<SaveCompletion> {
         let mut out = Vec::new();
         while let Ok(item) = self.rx.try_recv() {
+            self.unread.fetch_sub(1, Ordering::AcqRel);
             out.push(item);
         }
         out
@@ -480,6 +552,13 @@ impl AutosaveWorker {
     /// worker thread.
     pub fn pending_count(&self) -> usize {
         self.pending.load(Ordering::Acquire)
+    }
+
+    /// Whether any background save job is either still in flight on the worker
+    /// thread OR has published a completion not yet drained by
+    /// [`AutosaveWorker::poll_completions`].
+    pub fn has_pending_or_unread(&self) -> bool {
+        self.pending.load(Ordering::Acquire) > 0 || self.unread.load(Ordering::Acquire) > 0
     }
 
     /// Blocks until every previously enqueued save job has finished committing
@@ -511,21 +590,27 @@ fn worker_loop(
     rx: Receiver<WorkerMessage>,
     done_tx: Sender<SaveCompletion>,
     pending: Arc<AtomicUsize>,
+    unread: Arc<AtomicUsize>,
 ) {
+    let publish = |completion: SaveCompletion| {
+        // Increment `unread` BEFORE sending and BEFORE decrementing `pending`
+        // so `has_pending_or_unread()` can never transiently observe both as 0
+        // while a completion is waiting for the UI thread to drain it.
+        unread.fetch_add(1, Ordering::AcqRel);
+        if done_tx.send(completion).is_err() {
+            unread.fetch_sub(1, Ordering::AcqRel);
+        }
+        pending.fetch_sub(1, Ordering::AcqRel);
+    };
     while let Ok(msg) = rx.recv() {
         match msg {
-            WorkerMessage::Job { job, full_validate } => {
+            WorkerMessage::Job(job) => {
                 let neighborhood_id = job.neighborhood_id.clone();
                 let lot_id = job.lot_id;
                 let target = job.target;
                 let sim_tick = job.sim_tick;
-                let result = if full_validate {
-                    store.commit_job_validated(job, validate_save_payload)
-                } else {
-                    store.commit_job_validated(job, validate_save_payload_header)
-                };
-                pending.fetch_sub(1, Ordering::AcqRel);
-                let _ = done_tx.send(SaveCompletion {
+                let result = store.commit_job_validated(job, validate_save_payload_cached);
+                publish(SaveCompletion {
                     neighborhood_id,
                     lot_id,
                     target,
@@ -544,7 +629,9 @@ fn worker_loop(
                 saved,
             } => {
                 // Encode off the UI/render thread so manual & periodic saves never hitch.
-                let payload = SavePayload::saved_lot(saved.encode());
+                let encoded = saved.encode();
+                note_validated_saved_lot(&encoded);
+                let payload = SavePayload::saved_lot(encoded);
                 let mut job = match target {
                     SaveTarget::Manual => SaveJob::manual_for_instance(
                         neighborhood_id.clone(),
@@ -572,11 +659,11 @@ fn worker_loop(
                 if let Some(ts) = saved_at_unix_secs {
                     job = job.with_saved_at_unix_secs(ts);
                 }
-                // `saved.encode()` just serialized this payload; verify envelope
-                // SHA-256 + header metadata without a redundant round-trip `Saved::decode`.
-                let result = store.commit_job_validated(job, validate_save_payload_header);
-                pending.fetch_sub(1, Ordering::AcqRel);
-                let _ = done_tx.send(SaveCompletion {
+                // Incoming payload hits the SHA-256 validation cache in O(1);
+                // existing manual/ring records still run full `Saved::decode`
+                // on first sight so corrupt slots are never overwritten/pruned.
+                let result = store.commit_job_validated(job, validate_save_payload_cached);
+                publish(SaveCompletion {
                     neighborhood_id,
                     lot_id,
                     target,

@@ -544,6 +544,70 @@ impl InstallAssets {
             base_preloaded_cast,
         })
     }
+
+    /// Returns a [`PreloadedCast`] matching `(index, catalog)`. When
+    /// neighborhood character files are mounted, reuses cached base entries
+    /// only when both the winning `OBJD` definition and its resolved
+    /// semi-global file are unchanged, re-resolving all inline or affected
+    /// person types against the cached [`AvatarRegistry`].
+    pub(crate) fn preloaded_cast_for(
+        &self,
+        index: &Index,
+        catalog: &Catalog,
+        has_character_files: bool,
+    ) -> Option<PreloadedCast> {
+        let mut preloaded = self.base_preloaded_cast.clone()?;
+        if !has_character_files {
+            return Some(preloaded);
+        }
+        let registry = self.avatar_registry.as_ref()?;
+        let semi_global_loc = |idx: &Index, cat: &Catalog, resource: usize| {
+            cat.semi_globals
+                .get(&resource)
+                .map(|opt| opt.map(|target| idx.resources[target].location(&idx.root)))
+        };
+        let mut to_resolve = Vec::new();
+        for (&guid, &obj_idx) in &catalog.by_guid {
+            let obj = &catalog.objects[obj_idx];
+            if obj.kind != 2 {
+                preloaded.skeleton_names.remove(&guid);
+                preloaded.unresolved.remove(&guid);
+                continue;
+            }
+            let unchanged = !index.resources[obj.resource].is_inline()
+                && self.base_catalog.object(guid).is_some_and(|base_obj| {
+                    base_obj.kind == 2
+                        && base_obj.chunk == obj.chunk
+                        && index.resources[obj.resource].location(&index.root)
+                            == self.base_index.resources[base_obj.resource]
+                                .location(&self.base_index.root)
+                        && semi_global_loc(index, catalog, obj.resource)
+                            == semi_global_loc(
+                                &self.base_index,
+                                &self.base_catalog,
+                                base_obj.resource,
+                            )
+                });
+            if !unchanged {
+                to_resolve.push(guid);
+            }
+        }
+        if !to_resolve.is_empty() {
+            let (extra, unresolved) = ContentPeople::load_each_with_registry(
+                index, catalog, to_resolve, registry, &self.pool,
+            )
+            .ok()?;
+            for (guid, skel) in extra.skeletons {
+                preloaded.unresolved.remove(&guid);
+                preloaded.skeleton_names.insert(guid, skel.name);
+            }
+            for (guid, reason) in unresolved {
+                preloaded.skeleton_names.remove(&guid);
+                preloaded.unresolved.insert(guid, reason);
+            }
+        }
+        Some(preloaded)
+    }
 }
 
 impl Game {
@@ -1143,35 +1207,7 @@ impl Game {
             let people_handle = scope.spawn(|| -> Result<People, String> {
                 let (content_assets, people_library) = people_assets_res?;
                 let preloaded_cast = cached.and_then(|shared| {
-                    let mut preloaded = shared.base_preloaded_cast.clone()?;
-                    if !character_files.is_empty() {
-                        let registry = shared.avatar_registry.as_ref()?;
-                        let inline_people: Vec<u32> = catalog
-                            .objects
-                            .iter()
-                            .filter(|o| o.kind == 2 && index.resources[o.resource].is_inline())
-                            .map(|o| o.guid)
-                            .collect();
-                        if !inline_people.is_empty() {
-                            let (extra, unresolved) = ContentPeople::load_each_with_registry(
-                                &index,
-                                &catalog,
-                                inline_people,
-                                registry,
-                                &pool,
-                            )
-                            .ok()?;
-                            for (guid, skel) in extra.skeletons {
-                                preloaded.unresolved.remove(&guid);
-                                preloaded.skeleton_names.insert(guid, skel.name);
-                            }
-                            for (guid, reason) in unresolved {
-                                preloaded.skeleton_names.remove(&guid);
-                                preloaded.unresolved.insert(guid, reason);
-                            }
-                        }
-                    }
-                    Some(preloaded)
+                    shared.preloaded_cast_for(&index, &catalog, !character_files.is_empty())
                 });
                 let cast = Cast::from_shared(
                     install.clone(),
@@ -1501,35 +1537,7 @@ impl Game {
             let people_handle = scope.spawn(|| -> Result<People, String> {
                 let (content_assets, people_library) = people_assets_res?;
                 let preloaded_cast = cached.and_then(|shared| {
-                    let mut preloaded = shared.base_preloaded_cast.clone()?;
-                    if !character_files.is_empty() {
-                        let registry = shared.avatar_registry.as_ref()?;
-                        let inline_people: Vec<u32> = catalog
-                            .objects
-                            .iter()
-                            .filter(|o| o.kind == 2 && index.resources[o.resource].is_inline())
-                            .map(|o| o.guid)
-                            .collect();
-                        if !inline_people.is_empty() {
-                            let (extra, unresolved) = ContentPeople::load_each_with_registry(
-                                &index,
-                                &catalog,
-                                inline_people,
-                                registry,
-                                &pool,
-                            )
-                            .ok()?;
-                            for (guid, skel) in extra.skeletons {
-                                preloaded.unresolved.remove(&guid);
-                                preloaded.skeleton_names.insert(guid, skel.name);
-                            }
-                            for (guid, reason) in unresolved {
-                                preloaded.skeleton_names.remove(&guid);
-                                preloaded.unresolved.insert(guid, reason);
-                            }
-                        }
-                    }
-                    Some(preloaded)
+                    shared.preloaded_cast_for(&index, &catalog, !character_files.is_empty())
                 });
                 let cast = Cast::from_shared(
                     install.clone(),
@@ -2123,6 +2131,7 @@ impl Game {
         self.buy_commit_on_release = false;
         if let Some(cursor) = self.wall_cursor.take() {
             let _ = self.lot.build_cursor_close(&cursor);
+            self.world_sound_rev = self.world_sound_rev.wrapping_add(1);
         }
         self.build_drag = None;
         self.build_preview_shape = None;
@@ -2988,20 +2997,26 @@ impl Game {
     /// Exact microseconds until the lot next needs an event-loop wakeup, or
     /// `None` when completely idle (allowing `ControlFlow::Wait`).
     pub fn next_wake_us(&self, dragging: bool, anim_interval_us: u64) -> Option<u64> {
+        self.next_wake_us_with_window(dragging, anim_interval_us, true, false)
+    }
+
+    /// Like [`Game::next_wake_us`], gating pure presentation wakeups on
+    /// `can_draw` and yielding to the redraw pacer when `frame_dirty` is
+    /// already set so a zero-sized window or deferred redraw never spins.
+    pub fn next_wake_us_with_window(
+        &self,
+        dragging: bool,
+        anim_interval_us: u64,
+        can_draw: bool,
+        frame_dirty: bool,
+    ) -> Option<u64> {
+        const CARET_POLL_US: u64 = 100_000;
         let mut best: Option<u64> = None;
         let mut consider = |us: u64| {
             best = Some(best.map_or(us, |prev| prev.min(us)));
         };
         if self.coop.is_active_or_starting() || self.pending_coop_restage().is_some() {
             consider(5_000);
-        }
-        if self.is_edge_scrolling(dragging)
-            || self.pie_animating()
-            || self.ui_animating()
-            || self.ui_animating_prev
-            || self.camera_panning()
-        {
-            consider(anim_interval_us.max(1_000));
         }
         let ticks_active = self.hud.controls.mode == Mode::Live
             && !self.hud.has_ui_dialog()
@@ -3011,22 +3026,38 @@ impl Game {
         if ticks_active {
             consider(self.pace.remaining_us(self.lot.world().speed()));
         }
-        if self
-            .lot
-            .world()
-            .objects
-            .values()
-            .any(|o| o.guid == sims_people::bob::STANDARD)
-        {
-            let elapsed = self.clock_us.saturating_sub(self.drawn_us);
-            consider(SPIN_FRAME_US.saturating_sub(elapsed));
-        }
-        if let Some(us) = self.hud.next_blink_us(self.clock_us) {
-            consider(us);
-        }
-        if self.coop_lobby.is_open() {
-            let rem = sims_ui::hud::PAUSE_BLINK_US - (self.clock_us % sims_ui::hud::PAUSE_BLINK_US);
-            consider(rem.max(1));
+        if can_draw {
+            if self.is_edge_scrolling(dragging)
+                || self.pie_animating()
+                || self.ui_animating()
+                || self.ui_animating_prev
+                || self.camera_panning()
+            {
+                consider(anim_interval_us.max(1_000));
+            }
+            if self
+                .lot
+                .world()
+                .objects
+                .values()
+                .any(|o| o.guid == sims_people::bob::STANDARD)
+            {
+                let elapsed = self.clock_us.saturating_sub(self.drawn_us);
+                let rem = SPIN_FRAME_US.saturating_sub(elapsed);
+                if rem > 0 {
+                    consider(rem);
+                } else if !frame_dirty {
+                    // Once `frame_dirty` is true, `redraw_pacer` owns the next
+                    // presentation deadline; never return 0 us and busy-spin.
+                    consider(anim_interval_us.max(1_000));
+                }
+            }
+            if let Some(us) = self.hud.next_blink_us(self.clock_us) {
+                consider(us);
+            }
+            if self.coop_lobby.is_open() {
+                consider(CARET_POLL_US);
+            }
         }
         best
     }
@@ -4864,6 +4895,7 @@ impl Game {
         match self.lot.select(sim) {
             Ok(sounds) => {
                 self.dirty = true;
+                self.world_sound_rev = self.world_sound_rev.wrapping_add(1);
                 self.keep_sounds(sounds);
                 self.hud.play(crate::hud::CLICK);
             }
@@ -6735,12 +6767,16 @@ impl Game {
             if cur.mode != mode {
                 let pos = cur.position;
                 let _ = self.lot.build_cursor_move(&mut cur, pos, None, Some(mode));
+                self.world_sound_rev = self.world_sound_rev.wrapping_add(1);
             }
             self.wall_cursor = Some(cur);
             return;
         }
         match self.lot.build_cursor_open(mode) {
-            Ok(cursor) => self.wall_cursor = Some(cursor),
+            Ok(cursor) => {
+                self.wall_cursor = Some(cursor);
+                self.world_sound_rev = self.world_sound_rev.wrapping_add(1);
+            }
             Err(e) => self.note = Some(format!("Could not open Wall Cursor: {e}")),
         }
     }
@@ -6754,8 +6790,10 @@ impl Game {
             if let Err(e) = self.lot.build_cursor_close(&cursor) {
                 self.note = Some(format!("Could not close Wall Cursor: {e}"));
             }
+            self.world_sound_rev = self.world_sound_rev.wrapping_add(1);
         } else {
             let _ = self.lot.build_cursor_close_active();
+            self.world_sound_rev = self.world_sound_rev.wrapping_add(1);
         }
     }
 
@@ -7057,6 +7095,7 @@ impl Game {
                             Some(0),
                             Some(mode.cursor_mode()),
                         );
+                        self.world_sound_rev = self.world_sound_rev.wrapping_add(1);
                         self.wall_cursor = Some(cur);
                     }
                     let computed = sims_vm::plan_wall_drag(
@@ -7132,6 +7171,7 @@ impl Game {
                             let facing =
                                 sims_vm::wallpaper_cursor_facing(face, self.view.camera.rotation);
                             let _ = self.lot.build_cursor_move(&mut cur, cfine, facing, Some(2));
+                            self.world_sound_rev = self.world_sound_rev.wrapping_add(1);
                             self.wall_cursor = Some(cur);
                         }
                         if !faces.contains(&face) {
@@ -7262,6 +7302,7 @@ impl Game {
                     let _ = self
                         .lot
                         .build_cursor_move(&mut cur, cfine, Some(0), Some(mode));
+                    self.world_sound_rev = self.world_sound_rev.wrapping_add(1);
                     self.wall_cursor = Some(cur);
                 }
                 true
@@ -7275,6 +7316,7 @@ impl Game {
                         let facing =
                             sims_vm::wallpaper_cursor_facing(face, self.view.camera.rotation);
                         let _ = self.lot.build_cursor_move(&mut cur, cfine, facing, Some(2));
+                        self.world_sound_rev = self.world_sound_rev.wrapping_add(1);
                         self.wall_cursor = Some(cur);
                     }
                     if self.shift_held {
@@ -7383,6 +7425,7 @@ impl Game {
         let was_on_lot = cur.position[0] >= 0;
         if was_on_lot {
             let _ = self.lot.build_cursor_hide(&mut cur);
+            self.world_sound_rev = self.world_sound_rev.wrapping_add(1);
         }
         self.wall_cursor = Some(cur);
         was_on_lot || had_overlay
@@ -7411,6 +7454,7 @@ impl Game {
                         Some(0),
                         Some(mode.cursor_mode()),
                     );
+                    self.world_sound_rev = self.world_sound_rev.wrapping_add(1);
                     self.wall_cursor = Some(cur);
                 }
                 self.build_drag = Some(BuildDrag::Wall {
@@ -7480,6 +7524,7 @@ impl Game {
                     let cfine = sims_vm::wallpaper_cursor_fine(face, level);
                     let facing = sims_vm::wallpaper_cursor_facing(face, self.view.camera.rotation);
                     let _ = self.lot.build_cursor_move(&mut cur, cfine, facing, Some(2));
+                    self.world_sound_rev = self.world_sound_rev.wrapping_add(1);
                     self.wall_cursor = Some(cur);
                 }
                 let pattern_id = self
@@ -9858,6 +9903,7 @@ impl Game {
             }
         }
         if visual_changed {
+            self.world_sound_rev = self.world_sound_rev.wrapping_add(1);
             if self.lot.asking_special_panel().is_none() {
                 self.submitted_coop_special_panel = None;
                 self.close_special_panel_ui();
@@ -9879,6 +9925,7 @@ impl Game {
     }
 
     fn sync_after_coop_snapshot_restore(&mut self) {
+        self.world_sound_rev = self.world_sound_rev.wrapping_add(1);
         if self.coop.is_peer() {
             self.coop_remote_world = true;
         }

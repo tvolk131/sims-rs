@@ -14,7 +14,7 @@
 
 use crate::autosave_worker::{
     AutosaveWorker, SaveCompletion, build_save_manager_snapshot, format_save_label, parse_slot_id,
-    validate_save_payload, validate_save_payload_header,
+    validate_save_payload, validate_save_payload_cached,
 };
 use crate::caf_screen::{CafOutcome, CafSession};
 use crate::coop::default_player_name;
@@ -1622,31 +1622,44 @@ impl NeighborhoodShell {
     /// Exact microseconds until this shell next needs an event-loop wakeup, or
     /// `None` when completely idle (allowing `ControlFlow::Wait`).
     pub fn next_wake_us(&self, dragging: bool, anim_interval_us: u64) -> Option<u64> {
+        self.next_wake_us_with_window(dragging, anim_interval_us, true, false)
+    }
+
+    /// Like [`NeighborhoodShell::next_wake_us`], gating pure presentation
+    /// wakeups on `can_draw` and letting the redraw pacer own already-dirty
+    /// frame deadlines so a zero-sized window or deferred redraw never spins.
+    pub fn next_wake_us_with_window(
+        &self,
+        dragging: bool,
+        anim_interval_us: u64,
+        can_draw: bool,
+        frame_dirty: bool,
+    ) -> Option<u64> {
+        const CARET_POLL_US: u64 = 100_000;
         let mut best: Option<u64> = None;
         let mut consider = |us: u64| {
             best = Some(best.map_or(us, |prev| prev.min(us)));
         };
-        if self.autosave_worker.pending_count() > 0 {
+        if self.autosave_worker.has_pending_or_unread() {
             consider(25_000);
         }
-        if self.album_dialog.is_open() {
-            let blink = sims_ui::hud::PAUSE_BLINK_US;
-            consider((blink - (self.clock_us % blink)).max(1));
-        }
-        if self.coop_lobby.is_open() {
-            let blink = sims_ui::hud::PAUSE_BLINK_US;
-            consider((blink - (self.clock_us % blink)).max(1));
-        }
-        if let Some(dialog) = &self.dialog {
-            let now_ms = self.now_ms() as u32;
-            if (self.clock_us > 0 && self.dialog_fade.is_animating(now_ms))
-                || self.dialog_fade_was_animating
-            {
-                consider(anim_interval_us.max(1_000));
+        if can_draw {
+            if self.album_dialog.is_open() {
+                consider(CARET_POLL_US);
             }
-            if dialog.message.entry.is_some() {
-                let blink = sims_ui::hud::PAUSE_BLINK_US;
-                consider((blink - (self.clock_us % blink)).max(1));
+            if self.coop_lobby.is_open() {
+                consider(CARET_POLL_US);
+            }
+            if let Some(dialog) = &self.dialog {
+                let now_ms = self.now_ms() as u32;
+                if (self.clock_us > 0 && self.dialog_fade.is_animating(now_ms))
+                    || self.dialog_fade_was_animating
+                {
+                    consider(anim_interval_us.max(1_000));
+                }
+                if dialog.message.entry.is_some() {
+                    consider(CARET_POLL_US);
+                }
             }
         }
         let modal_open = self.dialog.is_some()
@@ -1656,32 +1669,43 @@ impl NeighborhoodShell {
             || self.coop_lobby.is_open();
         match &self.screen {
             ActiveScreen::Loading(_) => {
-                consider(anim_interval_us.max(1_000));
-            }
-            ActiveScreen::Neighborhood => {
-                let now_ms = self.clock_us / 1_000;
-                if self.hover_fade.is_animating(now_ms) || self.hover_fade_was_animating {
+                if can_draw {
                     consider(anim_interval_us.max(1_000));
                 }
-                let has_waves = self.map.waves.iter().any(Option::is_some);
-                let has_filter_anim = destination_for_kind(self.kind).is_some()
-                    && self.travel_state.active_filter.is_some();
-                if has_waves || has_filter_anim {
-                    let rem = WATER_STEP_US - (self.clock_us % WATER_STEP_US);
-                    consider(rem.max(1));
-                }
-                if !modal_open
-                    && let (Some(lot_id), Some(since_us)) =
-                        (self.hovered_lot_id, self.hovered_lot_since_us)
-                    && self.hover_card_shown_for != Some(lot_id)
-                {
-                    let elapsed = self.clock_us.saturating_sub(since_us);
-                    consider(HOVER_CARD_DELAY_US.saturating_sub(elapsed));
+            }
+            ActiveScreen::Neighborhood => {
+                if can_draw {
+                    let now_ms = self.clock_us / 1_000;
+                    if self.hover_fade.is_animating(now_ms) || self.hover_fade_was_animating {
+                        consider(anim_interval_us.max(1_000));
+                    }
+                    let has_waves = self.map.waves.iter().any(Option::is_some);
+                    let has_filter_anim = destination_for_kind(self.kind).is_some()
+                        && self.travel_state.active_filter.is_some();
+                    if has_waves || has_filter_anim {
+                        let rem = WATER_STEP_US - (self.clock_us % WATER_STEP_US);
+                        consider(rem.max(1_000));
+                    }
+                    if !modal_open
+                        && let (Some(lot_id), Some(since_us)) =
+                            (self.hovered_lot_id, self.hovered_lot_since_us)
+                        && self.hover_card_shown_for != Some(lot_id)
+                    {
+                        let elapsed = self.clock_us.saturating_sub(since_us);
+                        let rem = HOVER_CARD_DELAY_US.saturating_sub(elapsed);
+                        if rem > 0 {
+                            consider(rem);
+                        } else if !frame_dirty {
+                            consider(anim_interval_us.max(1_000));
+                        }
+                    }
                 }
             }
             ActiveScreen::FamilyBin => {}
             ActiveScreen::CreateFamily(caf) => {
-                consider(caf.next_wake_us());
+                if can_draw {
+                    consider(caf.next_wake_us());
+                }
             }
             ActiveScreen::Lot(session) => {
                 let shell_modal_open = self.save_manager.is_open()
@@ -1691,7 +1715,12 @@ impl NeighborhoodShell {
                     if session.game.coop_active() || session.game.pending_coop_restage().is_some() {
                         consider(5_000);
                     }
-                } else if let Some(us) = session.game.next_wake_us(dragging, anim_interval_us) {
+                } else if let Some(us) = session.game.next_wake_us_with_window(
+                    dragging,
+                    anim_interval_us,
+                    can_draw,
+                    frame_dirty,
+                ) {
                     consider(us);
                 }
             }
@@ -4674,7 +4703,7 @@ impl NeighborhoodShell {
                         .list_saves_validated(
                             &self.neighborhood_id,
                             house,
-                            validate_save_payload_header,
+                            validate_save_payload_cached,
                         )
                         .is_ok_and(|slots| !slots.is_empty())
                     {
@@ -7581,9 +7610,8 @@ fn build_lot_meta(
         let mut house_cost = 0;
         let mut has_house = false;
         if let Ok(Some(base_bytes)) = store.load_base_house(neighborhood_id, house)
-            && let Ok(scanned) = Iff::scan_types(&base_bytes, &[*b"SIMI"])
-            && let Some(chunk) = scanned.all(b"SIMI").next()
-            && let Ok(sim) = sims_formats::lot::Simulator::parse(&chunk.data)
+            && let Ok(Some(simi_bytes)) = Iff::find_first_physical(&base_bytes, b"SIMI")
+            && let Ok(sim) = sims_formats::lot::Simulator::parse(&simi_bytes)
         {
             house_cost = lot_total_value(
                 sim.lot_value,

@@ -1778,17 +1778,18 @@ impl App {
         )
         .unwrap_or(16_667)
         .max(1_000);
+        let can_draw = self.window_drawable();
         let dragging = self.drag.is_some();
         let session_deadline = match &self.session {
             Session::Starting(_) => Some(now + STARTUP_POLL),
             Session::Standalone { game, .. } => game
-                .next_wake_us(dragging, anim_interval_us)
+                .next_wake_us_with_window(dragging, anim_interval_us, can_draw, self.dirty)
                 .map(|us| now + Duration::from_micros(us)),
             Session::Shell(shell) => shell
-                .next_wake_us(dragging, anim_interval_us)
+                .next_wake_us_with_window(dragging, anim_interval_us, can_draw, self.dirty)
                 .map(|us| now + Duration::from_micros(us)),
         };
-        let redraw_deadline = if self.window_drawable() {
+        let redraw_deadline = if can_draw {
             self.redraw_pacer
                 .next_redraw_deadline(now, self.dirty, continuous)
         } else {
@@ -1961,6 +1962,22 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+        // Account for any time spent idle under the previous screen/modal state
+        // before dispatching interactive input so closing a modal never dumps
+        // modal idle time into live simulation ticks and newly hovered map lots
+        // start their debounce timer at the current event time.
+        if !matches!(self.session, Session::Starting(_))
+            && matches!(
+                event,
+                WindowEvent::KeyboardInput { .. }
+                    | WindowEvent::CursorMoved { .. }
+                    | WindowEvent::CursorLeft { .. }
+                    | WindowEvent::MouseInput { .. }
+                    | WindowEvent::MouseWheel { .. }
+            )
+        {
+            self.tick(event_loop);
+        }
         match event {
             WindowEvent::CloseRequested => {
                 self.shutdown_session();

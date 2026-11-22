@@ -67,14 +67,14 @@ Every change in this lane is strictly **100% correctness-neutral**:
 
 ### 7. Item 3.4 — Parallel `NeighborhoodShell::open` & Cross-Lot `InstallAssets` Cache (`crates/sims-game/src/{neighborhood,game}.rs`)
 
-- Cached all `*Desc.iff` `STR#` tables once in `NeighborhoodDescriptions::load` using `Iff::scan_types(&bytes, &[*b"STR#"])` and switched `build_lot_meta`'s `HouseXX.iff` `SIMI` extraction to `Iff::scan_types(&base_bytes, &[*b"SIMI"])`, eliminating 40+ redundant disk reads.
+- Cached all `*Desc.iff` `STR#` tables once in `NeighborhoodDescriptions::load` using `Iff::scan_types(&bytes, &[*b"STR#"])` and switched `build_lot_meta`'s `HouseXX.iff` `SIMI` extraction to `Iff::find_first_physical(&base_bytes, b"SIMI")` (matching exact first-physical selection without allocating chunk labels or parsing `rsmp`), eliminating 40+ redundant disk reads.
 - Parallelized `NeighborhoodShell::open` via `std::thread::scope` sharing a single `Arc<ArchivePool>` across UI art packs, strings/tuning, neighborhood map load, street/description tables, and `base_index`/faces.
-- Introduced `InstallAssets` (caching `Install`, `Arc<ArchivePool>`, `Arc<Index>`, `Arc<Catalog>`, surface plug-ins, `HudStatic`, `HudShared`, `ContentAssets`, `PeopleLibrary`, `Arc<AvatarRegistry>`, and `PreloadedCast`) on `NeighborhoodShell`, wired into `Game::open_from_store_cached` and `Game::from_loaded_lot_cached` across all lot-entry, Save Manager, travel, and co-op restage paths, and removed a duplicate `people.refresh(lot.world())` call during lot assembly.
+- Introduced `InstallAssets` (caching `Install`, `Arc<ArchivePool>`, `Arc<Index>`, `Arc<Catalog>`, surface plug-ins, `HudStatic`, `HudShared`, `ContentAssets`, `PeopleLibrary`, `Arc<AvatarRegistry>`, and `PreloadedCast` with winning-definition + semi-global cache validation when character files are mounted) on `NeighborhoodShell`, wired into `Game::open_from_store_cached` and `Game::from_loaded_lot_cached` across all lot-entry, Save Manager, travel, and co-op restage paths, and removed a duplicate `people.refresh(lot.world())` call during lot assembly.
 
-### 8. Item 4.4 — Header-Only Save Validation for Listing & Self-Encoded Commits (`crates/sims-game/src/{autosave_worker,neighborhood}.rs`)
+### 8. Item 4.4 — Digest-Cached Full Save Validation (`crates/sims-game/src/{autosave_worker,neighborhood}.rs`)
 
-- Added `validate_save_payload_header` verifying the 8-byte `Saved` format (`MIN_FORMAT..=FORMAT`) and `SNAPSHOT_FORMAT` header while `AutosaveStore` continues verifying full record and payload SHA-256 checksums.
-- Used `validate_save_payload_header` in `build_save_manager_snapshot`, `neighborhood.rs`'s corrupt-save presence check, and self-encoded `AutosaveWorker` commits (`SavedLot`, `enqueue_world`, `enqueue_saved_lot_bytes`), while keeping full `validate_save_payload` (`Saved::decode`) on actual slot loads (`load_save_validated`) and arbitrary external `enqueue_job` payloads.
+- Added a bounded `(SavePayloadKind, SHA-256)` full-validation cache (`validate_save_payload_cached`, backed by `sims_net::manifest::sha256_bytes`) so `AutosaveWorker` skips redundant round-trip `Saved::decode` on payloads it just produced via `Saved::encode()` while still running full `Saved::decode` on caller-supplied bytes (`enqueue_saved_lot_bytes`), existing manual/ring records during overwrite/pruning checks, and Save Manager listings (`build_save_manager_snapshot`), guaranteeing 100% agreement between listing, commit safeguards, and `load_save_validated`.
+- Added atomic `unread` completion tracking (`AutosaveWorker::has_pending_or_unread`) so `NeighborhoodShell::next_wake_us_with_window` never enters `ControlFlow::Wait` with an unconsumed `SaveCompletion`.
 
 ## Measured Results (`--release`, Apple Silicon, Complete Collection)
 

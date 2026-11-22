@@ -58,6 +58,19 @@ impl OpenArchive {
         })
     }
 
+    fn live_len(&self, path: &Path) -> Result<u64> {
+        let io = |e| Error::io(path, e);
+        #[cfg(unix)]
+        {
+            Ok(self.file.metadata().map_err(io)?.len())
+        }
+        #[cfg(not(unix))]
+        {
+            let guard = self.file.lock().unwrap_or_else(|e| e.into_inner());
+            Ok(guard.metadata().map_err(io)?.len())
+        }
+    }
+
     fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
         #[cfg(unix)]
         {
@@ -229,7 +242,7 @@ impl ArchivePool {
             return sims_formats::iff::Iff::scan_types(scratch, tags)
                 .map_err(|e| Error::format(location, e));
         }
-        sims_formats::iff::Iff::scan_types_from_reader(
+        let scanned = sims_formats::iff::Iff::scan_types_from_reader(
             member_size,
             |rel_offset, buf| {
                 archive
@@ -247,7 +260,20 @@ impl ArchivePool {
         .map_err(|err| match err {
             sims_formats::iff::ScanError::Io(e) => e,
             sims_formats::iff::ScanError::Format(e) => Error::format(location, e),
-        })
+        })?;
+        // Streaming scans skip non-target payloads (such as a trailing SPR2);
+        // probe the member's final byte so post-open file truncation inside a
+        // skipped tail is still caught identically to a full read.
+        if member.size > 0 {
+            let mut tail = [0u8; 1];
+            if let Err(err) = archive.read_exact_at(base + member.size - 1, &mut tail) {
+                if err.kind() == std::io::ErrorKind::UnexpectedEof {
+                    return Err(invalid(format!("{name} ends early")));
+                }
+                return Err(Error::io(path, err));
+            }
+        }
+        Ok(scanned)
     }
 
     fn read_slice(
@@ -259,7 +285,15 @@ impl ArchivePool {
         to_read: u64,
     ) -> Result<Vec<u8>> {
         let archive = self.get_or_open(path)?;
-        let len = archive.file_len;
+        // Full reads validate the member's entire extent via `read_exact_at`
+        // (avoiding a per-`pread` `fstat` syscall); partial peeks (`to_read <
+        // full_size`) check the live file length so truncation past `to_read`
+        // is never silently accepted.
+        let len = if to_read < full_size {
+            archive.live_len(path)?
+        } else {
+            archive.file_len
+        };
         let invalid = |message: String| {
             Error::io(
                 path,
@@ -362,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn read_member_rejects_member_truncated_after_handle_cached() {
+    fn head_peek_rejects_member_truncated_after_handle_cached() {
         let path = temp_file(&[0u8; 32]);
         let pool = ArchivePool::new();
         let member = Member {
@@ -382,12 +416,20 @@ mod tests {
         file.set_len(12).expect("truncate archive");
         drop(file);
 
-        let err = pool
+        let peek_err = pool
+            .read_member_head(&path, &member, 8)
+            .expect_err("post-open truncation must be rejected even on 8-byte peek");
+        assert!(
+            peek_err.to_string().contains("outside file"),
+            "unexpected peek error: {peek_err}"
+        );
+
+        let read_err = pool
             .read_member(&path, &member)
             .expect_err("post-open truncation must be rejected via read_exact_at EOF");
         assert!(
-            err.to_string().contains("ends early"),
-            "unexpected error: {err}"
+            read_err.to_string().contains("ends early"),
+            "unexpected read error: {read_err}"
         );
         let _ = std::fs::remove_dir_all(path.parent().expect("temp parent"));
     }

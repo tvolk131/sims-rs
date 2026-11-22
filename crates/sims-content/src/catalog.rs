@@ -98,7 +98,7 @@ fn scan_loose_iff(
         }
         return Iff::scan_types(scratch, &CATALOG_TAGS).map_err(|e| Error::format(location, e));
     }
-    Iff::scan_types_from_reader(
+    let scanned = Iff::scan_types_from_reader(
         len as usize,
         |offset, buf| {
             #[cfg(unix)]
@@ -120,7 +120,23 @@ fn scan_loose_iff(
     .map_err(|err| match err {
         ScanError::Io(e) => e,
         ScanError::Format(e) => Error::format(location, e),
-    })
+    })?;
+    if len > 0 {
+        let mut tail = [0u8; 1];
+        #[cfg(unix)]
+        let res = file.read_exact_at(&mut tail, len - 1);
+        #[cfg(not(unix))]
+        let res = file
+            .seek(SeekFrom::Start(len - 1))
+            .and_then(|_| file.read_exact(&mut tail));
+        if let Err(err) = res {
+            if err.kind() == std::io::ErrorKind::UnexpectedEof {
+                return Err(invalid(format!("{name} ends early")));
+            }
+            return Err(Error::io(&resource.path, err));
+        }
+    }
+    Ok(scanned)
 }
 
 fn scan_iff_resource(

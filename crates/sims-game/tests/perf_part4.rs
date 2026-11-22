@@ -62,6 +62,55 @@ fn validate_save_payload_header_rejects_short_and_bad_versions() {
     ok.extend_from_slice(&sims_sim::SNAPSHOT_FORMAT.to_le_bytes());
     ok.push(0);
     assert!(validate_save_payload_header(&SavePayloadKind::SavedLot, &ok).is_ok());
+    // Full cached validation MUST reject valid-header / corrupt-body payloads
+    // so Save Manager listings and overwrite/pruning safeguards always agree
+    // with `load_save_validated`.
+    assert!(
+        sims_game::autosave_worker::validate_save_payload_cached(&SavePayloadKind::SavedLot, &ok)
+            .is_err(),
+        "valid-header corrupt-body SavedLot must be rejected by cached full validator"
+    );
+}
+
+#[test]
+fn autosave_worker_rejects_corrupt_body_bytes_and_tracks_unread_completions() {
+    let tmp = TempTestDir::new("sol-r1-autosave");
+    let store =
+        sims_sim::NeighborhoodStore::open(&tmp.path().join("saves.redb")).expect("open redb store");
+    let autosaves = store.autosaves();
+    let worker = AutosaveWorker::spawn(autosaves.clone());
+
+    let mut bogus_saved = Vec::new();
+    bogus_saved.extend_from_slice(&sims_vm::boot::save::FORMAT.to_le_bytes());
+    bogus_saved.extend_from_slice(&sims_sim::SNAPSHOT_FORMAT.to_le_bytes());
+    bogus_saved.extend_from_slice(b"corrupt-body-bytes");
+
+    worker
+        .enqueue_saved_lot_bytes(
+            "UserData",
+            0,
+            5,
+            SaveTarget::Manual,
+            1,
+            format_save_label(Some("Goth"), 1, 8, 0),
+            bogus_saved,
+        )
+        .expect("enqueue");
+    worker.flush();
+    assert!(
+        worker.has_pending_or_unread(),
+        "unread completion must keep wakeup active until drained"
+    );
+    let done = worker.poll_completions();
+    assert_eq!(done.len(), 1);
+    assert!(
+        done[0].result.is_err(),
+        "caller-supplied valid-header corrupt-body bytes must be rejected"
+    );
+    assert!(
+        !worker.has_pending_or_unread(),
+        "after draining completions with no pending jobs, worker must be idle"
+    );
 }
 
 #[test]
@@ -151,6 +200,23 @@ fn perf_part4_track1_measurements_and_parity() {
         let wake_ultra = game.next_wake_us(false, 16_667).expect("ultra wake");
         assert_eq!(wake_ultra, 2_000, "Ultra speed wake must be 2ms");
         game.set_speed(Speed::Normal);
+
+        // Sol Round 1 P1: plumb-bob deadline must never busy-spin at 0 us when
+        // the window cannot draw or when a frame is already dirty.
+        game.set_mode(Mode::Options);
+        assert_eq!(
+            game.next_wake_us_with_window(false, 16_667, false, false),
+            None,
+            "zero-sized/undrawable window in Options mode must not schedule presentation wakes"
+        );
+        let _ = game.advance(200_000); // push clock_us past SPIN_FRAME_US without drawing
+        if let Some(us) = game.next_wake_us_with_window(false, 16_667, true, true) {
+            assert!(
+                us > 0,
+                "dirty frame with overdue plumb bob must not emit a 0 us busy-spin deadline"
+            );
+        }
+        game.set_mode(Mode::Live);
 
         // Item 3.2: Feed::update dirty-gating skips duplicate Snapshot rebuilds
         // on idle wakeups and updates screen on pure camera pan.
