@@ -1045,11 +1045,88 @@ fn a_new_person_with_person_word_68_74_or_84_set_is_placed_as_any_other() {
 }
 
 #[test]
+fn famous_unselected_person_takes_a_pooled_star_marker_when_superstar_is_installed() {
+    const STAR_MARKER: u32 = 0xE933_7020;
+    let register_star = |fx: &mut Fixture| {
+        let file = fx.add_type(STAR_MARKER, 4, 0, 4096);
+        fx.add(
+            file,
+            4096,
+            tree(vec![assign(
+                scope::TEMPS,
+                0,
+                scope::LITERAL,
+                0,
+                RETURN_TRUE,
+            )]),
+        );
+    };
+    // Without Superstar (expansions & 0x40 == 0), person word 81 >= 10 does not
+    // create or attach a star marker (0x447a36).
+    let mut fx = recorded(81, 10);
+    register_star(&mut fx);
+    let before: Vec<u16> = fx.world.objects.keys().copied().collect();
+    assert_eq!(create(&mut fx, 0, 0, SIM as i16), Ok(true));
+    let id = *fx
+        .world
+        .objects
+        .keys()
+        .find(|id| !before.contains(id))
+        .unwrap();
+    assert_eq!(fx.world.objects[&id].slots[2].object, 0);
+    assert_eq!(
+        fx.world
+            .objects
+            .values()
+            .filter(|o| o.guid == STAR_MARKER)
+            .count(),
+        0
+    );
+
+    // With Superstar (expansions = 0x40), placing the first non-selected famous
+    // person creates 4 hidden star markers (0x446356) and puts the back one
+    // into the person's head slot (0x447a82..0x447d27).
+    let mut fx = recorded(81, 10);
+    fx.program.expansions = 0x40;
+    register_star(&mut fx);
+    let mut people = Vec::new();
+    for step in 0..5 {
+        // Clear previous person's solid flag so multiple Sims can be placed on
+        // the same tile in the fixture.
+        if let Some(&prev) = people.last() {
+            fx.world.objects.get_mut(&prev).unwrap().data[8] |= 0x10;
+        }
+        let before: Vec<u16> = fx.world.objects.keys().copied().collect();
+        assert_eq!(create(&mut fx, 0, 0, SIM as i16), Ok(true), "step {step}");
+        let person_id = *fx
+            .world
+            .objects
+            .iter()
+            .find(|(id, obj)| !before.contains(id) && obj.person.is_some())
+            .unwrap()
+            .0;
+        people.push(person_id);
+        let star_id = fx.world.objects[&person_id].slots[2].object as u16;
+        assert_ne!(star_id, 0, "step {step} famous person must receive a star");
+        let star = &fx.world.objects[&star_id];
+        assert_eq!(star.guid, STAR_MARKER);
+        assert_ne!(star.data[8] & 0x4000, 0, "star markers are created hidden");
+        assert_eq!((star.data[2], star.data[3]), (person_id as i16, 1));
+        assert_eq!(star.position, fx.world.objects[&person_id].position);
+        let total_stars = fx
+            .world
+            .objects
+            .values()
+            .filter(|o| o.guid == STAR_MARKER)
+            .count();
+        // First allocation creates 4; 5th famous Sim refills by 2 (0x44642a).
+        let expected_total = if step < 4 { 4 } else { 6 };
+        assert_eq!(total_stars, expected_total, "step {step}");
+    }
+}
+
+#[test]
 fn what_placing_a_new_person_does_not_port_fails_loudly() {
-    // Person word 81 of 10 or more, once the person is on the lot, has
-    // the interface move a pooled object to it (0x447a82).
-    let result = create(&mut recorded(81, 10), 0, 0, SIM as i16);
-    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x447a82")));
     // Bit 0 of person word 84 changes the place test's collision test
     // (0x43383f).
     let mut fx = recorded(84, 1);
@@ -1156,16 +1233,19 @@ fn the_selected_sim_coming_onto_the_lot_takes_the_first_indicator_into_its_head_
 }
 
 #[test]
-fn the_selected_sim_lets_an_indicator_in_its_head_slot_go_first() {
-    // 0x4481eb: an object of an indicator's type in the head slot leaves
-    // the lot unannounced; the marker takes its place. An object of any
-    // other type is left as it is.
-    let (mut fx, id) = selected_off_the_lot();
-    held_in_the_head(&mut fx, id, INDICATOR_GUID);
-    assert_eq!(find(&mut fx, 0, id, 0), Ok(true));
-    assert_eq!(fx.world.objects[&id].slots[2].object, MARKER as i16);
-    let held = &fx.world.objects[&61];
-    assert_eq!((held.data[2], held.data[3]), (0, -1));
+fn the_selected_sim_lets_an_indicator_or_star_marker_in_its_head_slot_go_first() {
+    // 0x4481eb: an object of an indicator's type or a pooled star marker
+    // (0xE9337020) in the head slot leaves the lot unannounced; the marker
+    // takes its place. An object of any other type is left as it is.
+    for guid in [INDICATOR_GUID, 0xE933_7020] {
+        let (mut fx, id) = selected_off_the_lot();
+        held_in_the_head(&mut fx, id, guid);
+        assert_eq!(find(&mut fx, 0, id, 0), Ok(true));
+        assert_eq!(fx.world.objects[&id].slots[2].object, MARKER as i16);
+        let held = &fx.world.objects[&61];
+        assert_eq!((held.data[2], held.data[3]), (0, -1));
+        assert_eq!(held.position, [-16, -16, 1]);
+    }
     let (mut fx, id) = selected_off_the_lot();
     held_in_the_head(&mut fx, id, 0x1234_5678);
     assert_eq!(find(&mut fx, 0, id, 0), Ok(true));
@@ -1176,12 +1256,6 @@ fn the_selected_sim_lets_an_indicator_in_its_head_slot_go_first() {
 
 #[test]
 fn what_the_selected_sim_coming_onto_the_lot_does_not_port_fails_loudly() {
-    // A pooled object (type 0xE9337020) in the head slot leaves the
-    // interface's pooled list first (0x4483e7).
-    let (mut fx, id) = selected_off_the_lot();
-    held_in_the_head(&mut fx, id, 0xE933_7020);
-    let result = find(&mut fx, 0, id, 0);
-    assert!(matches!(trap(result), Trap::Unsupported(ref m) if m.contains("0x4483e7")));
     // A person whose definition has container slots of its own: its slot
     // 1 (0x4476a2) is then one of them.
     let (mut fx, id) = selected_off_the_lot();

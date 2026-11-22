@@ -204,13 +204,120 @@ fn selecting_another_sim_deselects_the_first() {
 }
 
 #[test]
-fn a_sim_deselected_with_fame_fails() {
-    // Person word 81 at 10 or more takes a star marker (0x446c15).
+fn a_famous_sim_deselected_takes_and_releases_a_star_marker() {
+    const STAR_MARKER: u32 = 0xE933_7020;
+    let register_star = |fx: &mut Fixture| {
+        let file = fx.add_type(STAR_MARKER, 4, 0, 4096);
+        fx.add(
+            file,
+            4096,
+            tree(vec![assign(
+                scope::TEMPS,
+                0,
+                scope::LITERAL,
+                0,
+                RETURN_TRUE,
+            )]),
+        );
+    };
+    // Without Superstar (expansions & 0x40 == 0), deselecting a Sim with word
+    // 81 >= 10 leaves no star marker in the head slot (0x446bf4).
     let mut fx = two_residents();
-    let sim = fx.world.objects.get_mut(&PERSON).unwrap();
-    sim.person.as_mut().unwrap().data[81] = 10;
+    register_star(&mut fx);
+    fx.world
+        .objects
+        .get_mut(&PERSON)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap()
+        .data[81] = 10;
     let (result, _) = asking(&mut fx, |i, world| i.select(world, Some(PERSON + 1)));
-    assert!(unsupported(result).contains("word 81"));
+    assert!(result.is_ok());
+    assert_eq!(fx.world.objects[&PERSON].slots[2].object, 0);
+
+    // With Superstar (expansions = 0x40), deselecting PERSON places a pooled
+    // star marker in its head slot (0x446c15), and re-selecting PERSON releases
+    // that star marker back off the lot (0x4467d7 -> 0x4481eb) and reuses the
+    // pool on the next deselect without allocating more stars.
+    let mut fx = two_residents();
+    fx.program.expansions = 0x40;
+    register_star(&mut fx);
+    fx.world
+        .objects
+        .get_mut(&PERSON)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap()
+        .data[81] = 10;
+    let (result, _) = asking(&mut fx, |i, world| i.select(world, Some(PERSON + 1)));
+    assert!(result.is_ok());
+    let star_id = fx.world.objects[&PERSON].slots[2].object as u16;
+    assert_ne!(star_id, 0);
+    assert_eq!(fx.world.objects[&star_id].guid, STAR_MARKER);
+    assert_eq!(
+        fx.world
+            .objects
+            .values()
+            .filter(|o| o.guid == STAR_MARKER)
+            .count(),
+        4
+    );
+
+    // Re-selecting PERSON releases the star marker off-lot and puts indicator 0
+    // in PERSON's head slot.
+    let first = fx.world.indicators[0];
+    let (result, _) = asking(&mut fx, |i, world| i.select(world, Some(PERSON)));
+    assert!(result.is_ok());
+    assert_eq!(fx.world.objects[&PERSON].slots[2].object, first as i16);
+    assert_eq!(fx.world.objects[&star_id].data[2], 0);
+    assert_eq!(fx.world.objects[&star_id].position, [-16, -16, 1]);
+
+    // Deselecting PERSON again reuses the existing pool (still 4 total stars).
+    let (result, _) = asking(&mut fx, |i, world| i.select(world, Some(PERSON + 1)));
+    assert!(result.is_ok());
+    let star_id_2 = fx.world.objects[&PERSON].slots[2].object as u16;
+    assert_ne!(star_id_2, 0);
+    assert_eq!(fx.world.objects[&star_id_2].guid, STAR_MARKER);
+    assert_eq!(
+        fx.world
+            .objects
+            .values()
+            .filter(|o| o.guid == STAR_MARKER)
+            .count(),
+        4
+    );
+
+    // Selecting a Sim on a lot smaller than 64 tiles whose position is on the
+    // outer border tile (0x446727 -> 0x422632) leaves its head slot untouched
+    // and does not attach indicator 0.
+    let mut fx = two_residents();
+    fx.program.expansions = 0x40;
+    register_star(&mut fx);
+    fx.world
+        .objects
+        .get_mut(&PERSON)
+        .unwrap()
+        .person
+        .as_mut()
+        .unwrap()
+        .data[81] = 10;
+    asking(&mut fx, |i, world| {
+        i.select(world, Some(PERSON + 1)).unwrap()
+    });
+    let border_star = fx.world.objects[&PERSON].slots[2].object as u16;
+    assert_ne!(border_star, 0);
+    fx.world.size = 32;
+    fx.world.objects.get_mut(&PERSON).unwrap().position = [31 * 16 + 8, 3 * 16 + 8, 1];
+    let first = fx.world.indicators[0];
+    asking(&mut fx, |i, world| i.select(world, Some(PERSON)).unwrap());
+    assert_eq!(
+        fx.world.objects[&PERSON].slots[2].object, border_star as i16,
+        "border-tile Sim on smaller lot must keep its star marker untouched"
+    );
+    assert_eq!(fx.world.objects[&first].data[2], 0);
+
     // A Sim that is not a person still cannot be selected, after the
     // deselection.
     let mut fx = lot_with_person();
@@ -263,13 +370,20 @@ fn what_the_selection_does_not_port_fails() {
     sim.person.as_mut().unwrap().data[77] = -3;
     let (result, _) = asking(&mut fx, |i, world| i.select(world, Some(PERSON)));
     assert!(unsupported(result).contains("date"));
-    // A Sim whose slot 1 already holds something.
+}
+
+#[test]
+fn selecting_a_sim_whose_head_slot_holds_a_non_indicator_puts_the_indicator_there() {
+    // 0x4467d7 -> 0x4481eb: a non-indicator object in slot 1 is left untouched
+    // by release_from_head and the first indicator takes slot 1.
     let mut fx = lot_with_person();
     asking(&mut fx, |i, world| i.announce_house(world).unwrap());
+    let first = fx.world.indicators[0];
     let widget = stand(&mut fx, [4, 4]);
     fx.world.objects.get_mut(&PERSON).unwrap().slots[2].object = widget as i16;
     let (result, _) = asking(&mut fx, |i, world| i.select(world, Some(PERSON)));
-    assert!(unsupported(result).contains("slot 1"));
+    assert!(result.is_ok());
+    assert_eq!(fx.world.objects[&PERSON].slots[2].object, first as i16);
 }
 
 #[test]

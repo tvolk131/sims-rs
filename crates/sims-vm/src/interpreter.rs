@@ -814,6 +814,42 @@ impl<'a> Machine<'a, '_> {
         )
     }
 
+    /// Like [`Machine::enter_on`], returning `Ok(false)` on the three
+    /// non-throwing push rejections of `0x47484a` (`0x4748b0` missing tree,
+    /// `0x474917` negative indexed entry on kind-4 BHAV, `0x474921` empty
+    /// BHAV with `node >= instruction count`). Used by `Idle For Input`
+    /// (`0x45dcaf`) so declined pushes fall through to action cancellation.
+    pub(crate) fn try_enter_on(
+        &mut self,
+        target: u16,
+        tree: u16,
+        args: &[i16],
+    ) -> Result<bool, Trap> {
+        let guid = self
+            .world
+            .objects
+            .get(&target)
+            .ok_or(Trap::native(0x15, "missing object"))?
+            .guid;
+        let owner = self.definition(guid)?.resource;
+        let behavior = match self.program.tree(owner, tree) {
+            Tree::Behavior(_, behavior) => behavior,
+            Tree::Missing => return Ok(false),
+            Tree::Primitive(_) => {
+                return Err(Trap::Invalid(format!(
+                    "tree ID {tree} names a primitive, not a BHAV"
+                )));
+            }
+        };
+        if behavior.instructions.is_empty()
+            || (behavior.kind == 4 && args.first().copied().unwrap_or(0) < 0)
+        {
+            return Ok(false);
+        }
+        self.enter_on(target, tree, args)?;
+        Ok(true)
+    }
+
     /// Pushes a frame that runs a tree of another object's type, with
     /// that object as its stack object (Run Tree By Name, 0x44e9d2).
     pub(crate) fn enter_on(&mut self, target: u16, tree: u16, args: &[i16]) -> Result<(), Trap> {

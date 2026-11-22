@@ -950,6 +950,239 @@ fn core_interactive_objects_on_goth_and_newbies_avoid_unsupported() {
 }
 
 #[test]
+fn studio_town_house81_celebrity_pooled_stars_and_downtown_house21_bar_avoid_unsupported() {
+    let Some(root) = sims_install() else {
+        return;
+    };
+
+    // 1. Studio Town (House81): [res#30379] (0xFD4FB8E4) interactions summon
+    //    famous Sims (person word 81 >= 10), exercising the Superstar star-
+    //    marker pool (0x446356 / 0x447a82 / 0x4481eb, GUID 0xE933_7020).
+    const STUDIO_TARGET_GUID: u32 = 0xFD4F_B8E4;
+    const STAR_MARKER_GUID: u32 = 0xE933_7020;
+    {
+        let house = root.join("UserData/Houses/House81.iff");
+        let mut lot = Lot::load(&root, &house, &[3; 32], Frames::default())
+            .expect("Studio Town House81 must boot");
+        for _ in 0..20 {
+            if find_actor(lot.world()).is_some() && lot.ticks() >= 5 {
+                break;
+            }
+            let _ = lot.step_play();
+        }
+        let actor = find_actor(lot.world()).expect("House81 must have an actor");
+        let target_id = lot
+            .world()
+            .objects
+            .iter()
+            .find_map(|(&id, obj)| (obj.guid == STUDIO_TARGET_GUID).then_some(id))
+            .expect("House81 must contain 0xFD4FB8E4");
+        let tuning = lot.program().motive_tuning().expect("motive tuning");
+        let family_zero: Vec<u32> = lot
+            .world()
+            .families
+            .iter()
+            .find(|f| f.id == 0)
+            .map(|f| f.members.clone())
+            .unwrap_or_default();
+        let active_family = (lot.world().globals.get(10).copied().unwrap_or(0) != 0
+            && lot.world().globals.get(9).copied().unwrap_or(0) == 0)
+            .then_some(family_zero.as_slice());
+        let mut menu_world = lot.world().clone();
+        let sounds = RefCell::new(Vec::new());
+        let mut menu_interp = Interpreter::new(lot.program(), lot.catalog(), Stream::Global);
+        menu_interp.sounds = Some(&sounds);
+        menu_interp.view_rotation = lot.view_rotation();
+        menu_interp.view_centre = lot.view_centre();
+        menu_interp.active_family = active_family;
+        let entries = menu_interp
+            .pie_menu(&mut menu_world, actor, target_id)
+            .expect("House81 target pie_menu must succeed");
+        let entry = entries
+            .iter()
+            .find(|e| e.action.action == 0x101D)
+            .or_else(|| entries.first())
+            .cloned()
+            .expect("House81 0xFD4FB8E4 must offer at least one interaction");
+
+        let mut world = menu_world;
+        let special_panels = RefCell::new(SpecialPanels::default());
+        let dialog_text = RefCell::new(String::new());
+        let character_names = RefCell::new(BTreeMap::new());
+        let mut interp = Interpreter::new(lot.program(), lot.catalog(), Stream::Global);
+        interp.view_rotation = lot.view_rotation();
+        interp.view_centre = lot.view_centre();
+        interp.active_family = active_family;
+        interp.special_panels = Some(&special_panels);
+        interp.dialog_text = Some(&dialog_text);
+        interp.character_names = Some(&character_names);
+        interp
+            .pick(&mut world, actor, entry.action)
+            .expect("picking House81 interaction must succeed");
+
+        let mut player = SweepPlayer::new(&world);
+        let mut play = Play::default();
+        let mut saw_star_attached = false;
+        for tick in 1..=200 {
+            let (u, res) =
+                interp.lot_update_kept(&mut world, &tuning, &mut player, Some(&mut play));
+            for err in &u.errors {
+                assert!(
+                    !matches!(err.fault.trap, Trap::Unsupported(_)),
+                    "House81 0xFD4FB8E4 hit Trap::Unsupported at tick {tick}: {}",
+                    err.fault
+                );
+            }
+            if let Err(err) = res {
+                panic!("House81 0xFD4FB8E4 failed at tick {tick}: {err}");
+            }
+            if world
+                .objects
+                .values()
+                .any(|o| o.guid == STAR_MARKER_GUID && o.data.get(2).copied().unwrap_or(0) > 0)
+            {
+                saw_star_attached = true;
+            }
+        }
+        assert!(
+            saw_star_attached,
+            "House81 celebrity arrival must allocate and attach a pooled star marker (0xE9337020)"
+        );
+    }
+
+    // 2. Downtown (House21): DTS Bar System (0x26DD83D3) / Bartender Leonardo
+    //    (0x3F5CFBEA) -> Order Drink, exercising Animate Sim clip source 2
+    //    (0x58944b -> 0x59deb4 -> Global.iff STR# 130).
+    const DTS_BAR_GUID: u32 = 0x26DD_83D3;
+    const BARTENDER_GUID: u32 = 0x3F5C_FBEA;
+    {
+        let house = root.join("UserData/Houses/House21.iff");
+        let mut lot = Lot::load(&root, &house, &[3; 32], Frames::default())
+            .expect("Downtown House21 must boot");
+        for _ in 0..20 {
+            if find_actor(lot.world()).is_some() && lot.ticks() >= 5 {
+                break;
+            }
+            let _ = lot.step_play();
+        }
+        let actor = find_actor(lot.world()).expect("House21 must have an actor");
+        let tuning = lot.program().motive_tuning().expect("motive tuning");
+        let family_zero: Vec<u32> = lot
+            .world()
+            .families
+            .iter()
+            .find(|f| f.id == 0)
+            .map(|f| f.members.clone())
+            .unwrap_or_default();
+        let active_family = (lot.world().globals.get(10).copied().unwrap_or(0) != 0
+            && lot.world().globals.get(9).copied().unwrap_or(0) == 0)
+            .then_some(family_zero.as_slice());
+        let str130_clips: BTreeSet<String> = lot
+            .program()
+            .libraries
+            .get(&lot.program().global)
+            .and_then(|lib| lib.strings.get(&130))
+            .map(|list| {
+                list.iter()
+                    .filter(|name| !name.is_empty())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            !str130_clips.is_empty(),
+            "Global.iff STR# 130 (PersonAnimations) must be loaded"
+        );
+        let mut tested_bar_orders = 0usize;
+        let mut saw_source2_clip = false;
+        for guid in [DTS_BAR_GUID, BARTENDER_GUID] {
+            let Some(target_id) = lot
+                .world()
+                .objects
+                .iter()
+                .find_map(|(&id, obj)| (obj.guid == guid).then_some(id))
+            else {
+                continue;
+            };
+            let mut menu_world = lot.world().clone();
+            let sounds = RefCell::new(Vec::new());
+            let mut menu_interp = Interpreter::new(lot.program(), lot.catalog(), Stream::Global);
+            menu_interp.sounds = Some(&sounds);
+            menu_interp.view_rotation = lot.view_rotation();
+            menu_interp.view_centre = lot.view_centre();
+            menu_interp.active_family = active_family;
+            let entries = menu_interp
+                .pie_menu(&mut menu_world, actor, target_id)
+                .expect("House21 bar pie_menu must succeed");
+            let order = entries
+                .into_iter()
+                .find(|e| {
+                    e.name
+                        .as_deref()
+                        .is_some_and(|n| n.contains("Order Drink") || n.contains("Soda"))
+                })
+                .expect("House21 bar/bartender must offer Order Drink");
+
+            let mut world = menu_world;
+            let special_panels = RefCell::new(SpecialPanels::default());
+            let dialog_text = RefCell::new(String::new());
+            let character_names = RefCell::new(BTreeMap::new());
+            let mut interp = Interpreter::new(lot.program(), lot.catalog(), Stream::Global);
+            interp.view_rotation = lot.view_rotation();
+            interp.view_centre = lot.view_centre();
+            interp.active_family = active_family;
+            interp.special_panels = Some(&special_panels);
+            interp.dialog_text = Some(&dialog_text);
+            interp.character_names = Some(&character_names);
+            interp
+                .pick(&mut world, actor, order.action)
+                .expect("picking Order Drink must succeed");
+
+            let mut player = SweepPlayer::new(&world);
+            let mut play = Play::default();
+            for tick in 1..=200 {
+                let (u, res) =
+                    interp.lot_update_kept(&mut world, &tuning, &mut player, Some(&mut play));
+                for err in &u.errors {
+                    assert!(
+                        !matches!(err.fault.trap, Trap::Unsupported(_)),
+                        "House21 bar 0x{guid:08X} hit Trap::Unsupported at tick {tick}: {}",
+                        err.fault
+                    );
+                }
+                if let Err(err) = res {
+                    panic!("House21 bar 0x{guid:08X} failed at tick {tick}: {err}");
+                }
+                if world.animators.values().any(|a| {
+                    a.foreground
+                        .as_ref()
+                        .is_some_and(|l| str130_clips.contains(&l.clip))
+                        || a.carry
+                            .as_ref()
+                            .is_some_and(|l| str130_clips.contains(&l.clip))
+                        || matches!(
+                            &a.base,
+                            sims_sim::animator::Base::Script { clip, .. }
+                                if str130_clips.contains(clip)
+                        )
+                }) {
+                    saw_source2_clip = true;
+                }
+            }
+            tested_bar_orders += 1;
+        }
+        assert!(
+            tested_bar_orders >= 1,
+            "House21 must exercise at least one bar Order Drink interaction"
+        );
+        assert!(
+            saw_source2_clip,
+            "House21 Order Drink must start at least one Global.iff STR# 130 (source 2) animation clip"
+        );
+    }
+}
+
+#[test]
 #[ignore = "full 9-lot Complete Collection sweep; run explicitly with --ignored --nocapture"]
 fn complete_collection_interactive_object_sweep() {
     let Some(root) = sims_install() else {
@@ -1118,5 +1351,32 @@ fn complete_collection_interactive_object_sweep() {
     eprintln!(
         "\nTOTAL: objects={tot_obj} entries={tot_ent} clean={tot_clean} unsupported={tot_unsup} pie_unsup={tot_pie} distinct_unsupported={}",
         ranked.len()
+    );
+    for s in &all_stats {
+        if !s.lot_name.contains("House90") {
+            assert!(
+                s.skipped_reason.is_none() && s.entries_tested > 0,
+                "expected active lot {} to contribute swept interactions (skipped={:?}, entries={})",
+                s.lot_name,
+                s.skipped_reason,
+                s.entries_tested
+            );
+        }
+    }
+    assert!(
+        tot_ent >= 1800,
+        "expected >= 1800 swept interactions across Complete Collection lots (baseline 1833), got {tot_ent}"
+    );
+    assert_eq!(
+        tot_unsup, 0,
+        "expected 0 Trap::Unsupported hits across all swept Complete Collection lots; see report"
+    );
+    assert_eq!(
+        tot_pie, 0,
+        "expected 0 pie_menu Trap::Unsupported hits across all swept Complete Collection lots"
+    );
+    assert!(
+        ranked.is_empty(),
+        "expected 0 distinct Trap::Unsupported buckets across all swept Complete Collection lots"
     );
 }
