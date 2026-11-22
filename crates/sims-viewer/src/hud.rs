@@ -238,11 +238,11 @@ impl Hud {
             u32::try_from(canvas.width).unwrap_or(u32::MAX),
             u32::try_from(canvas.height).unwrap_or(u32::MAX),
         );
-        let mut frame = match Frame::from_rgb(width, height, std::mem::take(&mut canvas.color)) {
+        let mut frame = match Frame::from_packed(width, height, std::mem::take(&mut canvas.color)) {
             Ok(frame) => frame,
             // A canvas the frame cannot take: leave it as drawn.
-            Err(rgb) => {
-                canvas.color = rgb;
+            Err(pixels) => {
+                canvas.color = pixels;
                 return;
             }
         };
@@ -267,7 +267,7 @@ impl Hud {
                 self.controls.pointer,
             );
         }
-        canvas.color = frame.into_rgb();
+        canvas.color = frame.into_packed();
     }
 
     /// Whether the panel covers `point` (canvas pixels), or a dialog is

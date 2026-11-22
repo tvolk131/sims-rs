@@ -484,7 +484,9 @@ fn build_mode_dug_pool_and_painted_pond_render_and_invalidate_cache() {
     );
     // Above the viewport boundary, pool & pond water were drawn.
     assert!(
-        clipped.depth[..150 * 640].iter().any(|&d| d < EMPTY),
+        clipped.depth[..150 * 640]
+            .iter()
+            .any(|&d| i32::from(d) < EMPTY),
         "pool/pond should draw above clip_bottom"
     );
     // Below the viewport boundary, color/depth/ids must remain strictly untouched
@@ -499,7 +501,8 @@ fn build_mode_dug_pool_and_painted_pond_render_and_invalidate_cache() {
                 "pool/pond leaked color below clip_bottom at ({col}, {row})"
             );
             assert_eq!(
-                clipped.depth[idx], EMPTY,
+                i32::from(clipped.depth[idx]),
+                EMPTY,
                 "pool/pond leaked depth below clip_bottom at ({col}, {row})"
             );
             assert_eq!(

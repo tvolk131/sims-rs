@@ -127,7 +127,7 @@ fn neighborhood_top_bar_matches_191_clean_and_mode_oracles() {
     };
     chrome.draw(&mut frame, &clean_state, &art, &strings);
     let q = frame.quantized();
-    let (exact, total) = match_rate_565(q.rgb(), &oracle_clean, 800, 0..52, |_, _| false);
+    let (exact, total) = match_rate_565(&q.rgb(), &oracle_clean, 800, 0..52, |_, _| false);
     assert_eq!(
         exact, total,
         "Neighborhood 1 top bar (800x52) must match 1.91 01-nb-clean.png bit-exact ({exact}/{total})"
@@ -150,7 +150,7 @@ fn neighborhood_top_bar_matches_191_clean_and_mode_oracles() {
         };
         chrome.draw(&mut frame, &movein_state, &art, &strings);
         let q = frame.quantized();
-        let (exact, total) = match_rate_565(q.rgb(), &oracle_movein, 800, 0..52, |_, _| false);
+        let (exact, total) = match_rate_565(&q.rgb(), &oracle_movein, 800, 0..52, |_, _| false);
         let pct = 100.0 * exact as f64 / total as f64;
         assert!(
             pct >= 99.5,
@@ -173,7 +173,7 @@ fn neighborhood_top_bar_matches_191_clean_and_mode_oracles() {
         };
         chrome.draw(&mut frame, &doze_state, &art, &strings);
         let q = frame.quantized();
-        let (exact, total) = match_rate_565(q.rgb(), &oracle_doze, 800, 0..52, |x, _| {
+        let (exact, total) = match_rate_565(&q.rgb(), &oracle_doze, 800, 0..52, |x, _| {
             (520..710).contains(&x)
         });
         let pct = 100.0 * exact as f64 / total as f64;
@@ -228,7 +228,7 @@ fn family_bin_chrome_matches_191_oracle() {
     let q = frame.quantized();
 
     // Exclude dynamic household portrait cells (x=145..520, y=90..290).
-    let (exact, total) = match_rate_565(q.rgb(), &oracle_fb, 800, 0..600, |x, y| {
+    let (exact, total) = match_rate_565(&q.rgb(), &oracle_fb, 800, 0..600, |x, y| {
         (145..520).contains(&x) && (90..290).contains(&y)
     });
     let pct = 100.0 * exact as f64 / total as f64;
@@ -255,7 +255,8 @@ fn caf_family_and_sim_screens_match_191_oracles() {
     let mut fam_frame = Frame::new(800, 600, [0, 0, 0]);
     ctrl.draw(&mut fam_frame, &caf_art, None);
     let qfam = fam_frame.quantized();
-    let (fam_exact, fam_total) = match_rate_565(qfam.rgb(), &oracle_fam, 800, 0..600, |_, _| false);
+    let (fam_exact, fam_total) =
+        match_rate_565(&qfam.rgb(), &oracle_fam, 800, 0..600, |_, _| false);
     let fam_pct = 100.0 * fam_exact as f64 / fam_total as f64;
     assert!(
         fam_pct >= 95.5,
@@ -269,7 +270,7 @@ fn caf_family_and_sim_screens_match_191_oracles() {
     let mut sim_frame = Frame::new(800, 600, [0, 0, 0]);
     ctrl.draw(&mut sim_frame, &caf_art, None);
     let qsim = sim_frame.quantized();
-    let (sim_exact, sim_total) = match_rate_565(qsim.rgb(), &oracle_sim, 800, 0..600, |x, y| {
+    let (sim_exact, sim_total) = match_rate_565(&qsim.rgb(), &oracle_sim, 800, 0..600, |x, y| {
         (570..760).contains(&x) && (115..385).contains(&y)
     });
     let sim_pct = 100.0 * sim_exact as f64 / sim_total as f64;

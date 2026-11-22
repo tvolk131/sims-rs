@@ -30,7 +30,7 @@ pub mod shadows;
 pub use assets::{Assets, BaseAssets};
 pub use cache::{CacheHit, LotCache};
 pub use camera::{Camera, Walls, Zoom};
-pub use canvas::{Canvas, Ids, Image};
+pub use canvas::{Canvas, EMPTY_DEPTH, ID_NONE, Ids, Image, clamp_depth, pack_rgb, unpack_rgb};
 pub use cutaway::{Focus, Selected, screen_centre_pick, unproject_terrain};
 pub use light::Light;
 pub use lot::Lot;

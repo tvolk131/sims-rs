@@ -55,9 +55,10 @@ fn has_maroon_top_bar(game: &Game) -> bool {
         return false;
     }
     let mut maroon = 0usize;
+    let maroon_px = sims_render::pack_rgb([96, 24, 24]);
     for y in 0..12 {
         for x in 0..canvas.width {
-            if canvas.color[y * canvas.width + x] == [96, 24, 24] {
+            if canvas.color[y * canvas.width + x] == maroon_px {
                 maroon += 1;
             }
         }

@@ -29,7 +29,7 @@
 //! and color-key silhouette hit-testing (`0x5e4071` -> `0x5dd79a`) operate on
 //! CPU surfaces and write directly into [`Canvas`].
 
-use crate::canvas::{Canvas, blend_table, quantize565};
+use crate::canvas::{Canvas, Rect, blend_table, encode_id, pack_rgb, quantize565, unpack_rgb};
 use crate::{Error, Result};
 use sims_content::Install;
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
@@ -874,9 +874,8 @@ fn effective_vacation_fade(lot_id: u16, options: &RenderOptions) -> f32 {
 
 const MAX_HIGHLIGHT_CACHE_ENTRIES: usize = 128;
 const MAX_RENDER_CACHE_BYTES: usize = 32 * 1024 * 1024;
-const CANVAS_BYTES_PER_PIXEL: usize = std::mem::size_of::<[u8; 3]>()
-    + std::mem::size_of::<i32>()
-    + std::mem::size_of::<Option<u16>>();
+const CANVAS_BYTES_PER_PIXEL: usize =
+    std::mem::size_of::<u32>() + std::mem::size_of::<u16>() + std::mem::size_of::<u16>();
 
 fn surface_bytes(surface: &Surface565) -> usize {
     surface
@@ -1434,13 +1433,27 @@ impl NeighborhoodMap {
     /// [`Canvas::id_at`] agrees with [`Self::hit_test_with_options`] inside
     /// the clipped `800×600` lot rectangle from the centered backdrop origin.
     pub fn render_into(&self, canvas: &mut Canvas, options: &RenderOptions) {
+        let _ = self.render_into_with_damage(canvas, options);
+    }
+
+    /// Like [`Self::render_into`], additionally returning the clipped screen
+    /// rectangles of all dynamically composited lots when the static base layer
+    /// cache hit (`Some(dynamic_rects)`), or `None` when the full base layer
+    /// was rebuilt (or uncached). Callers can union `prev_dynamic_rects ∪
+    /// cur_dynamic_rects` for safe partial damage presentation when static
+    /// overlays (water wave frame, chrome, dialogs) did not change.
+    pub fn render_into_with_damage(
+        &self,
+        canvas: &mut Canvas,
+        options: &RenderOptions,
+    ) -> Option<Vec<Rect>> {
         if canvas.width == 0
             || canvas.height == 0
             || !canvas.has_pixel_storage()
             || canvas.width.saturating_mul(canvas.height) > MAX_SURFACE_PIXELS
         {
             self.render_into_uncached(canvas, options);
-            return;
+            return None;
         }
 
         let viewport = [canvas.width as u32, canvas.height as u32];
@@ -1644,6 +1657,16 @@ impl NeighborhoodMap {
 
         self.render_post_lot_overlays(canvas, options, origin, full_clip, map_clip, overlay_keyed);
         canvas.set_id(None);
+        if hit && options.active_filter.is_none() && !options.show_occupancy_markers {
+            Some(
+                excluded_rects
+                    .into_iter()
+                    .map(|[x0, y0, x1, y1]| [x0 as i32, y0 as i32, x1 as i32, y1 as i32])
+                    .collect(),
+            )
+        } else {
+            None
+        }
     }
 
     fn render_into_uncached(&self, canvas: &mut Canvas, options: &RenderOptions) {
@@ -4284,6 +4307,11 @@ fn jpeg_idct_8x8(block: &[i32; 64]) -> [u8; 64] {
 }
 
 #[inline(always)]
+fn widen_565_packed(p: u16) -> u32 {
+    pack_rgb(widen_565(p))
+}
+
+#[inline(always)]
 fn widen_blend5(r5: u8, g5: u8, b5: u8) -> [u8; 3] {
     let g6 = g5 << 1;
     [
@@ -4309,10 +4337,10 @@ fn blend_565_pair(table: &[u8; 32768], row_a5: usize, fg: u16, bg: u16) -> [u8; 
 }
 
 #[inline(always)]
-fn blend_rgb_over_565(table: &[u8; 32768], row_a5: usize, fg: [u8; 3], bg: u16) -> [u8; 3] {
-    let sr = usize::from(fg[0] >> 3);
-    let sg = usize::from(fg[1] >> 3);
-    let sb = usize::from(fg[2] >> 3);
+fn blend_packed_over_565(table: &[u8; 32768], row_a5: usize, fg: u32, bg: u16) -> [u8; 3] {
+    let sr = ((fg >> 19) & 0x1f) as usize;
+    let sg = ((fg >> 11) & 0x1f) as usize;
+    let sb = ((fg >> 3) & 0x1f) as usize;
     let dr = usize::from((bg >> 11) & 0x1f);
     let dg = usize::from((bg >> 6) & 0x1f);
     let db = usize::from(bg & 0x1f);
@@ -4324,13 +4352,13 @@ fn blend_rgb_over_565(table: &[u8; 32768], row_a5: usize, fg: [u8; 3], bg: u16) 
 }
 
 #[inline(always)]
-fn blend_565_over_rgb(table: &[u8; 32768], row_a5: usize, fg: u16, bg: [u8; 3]) -> [u8; 3] {
+fn blend_565_over_packed(table: &[u8; 32768], row_a5: usize, fg: u16, bg: u32) -> [u8; 3] {
     let sr = usize::from((fg >> 11) & 0x1f);
     let sg = usize::from((fg >> 6) & 0x1f);
     let sb = usize::from(fg & 0x1f);
-    let dr = usize::from(bg[0] >> 3);
-    let dg = usize::from(bg[1] >> 3);
-    let db = usize::from(bg[2] >> 3);
+    let dr = ((bg >> 19) & 0x1f) as usize;
+    let dg = ((bg >> 11) & 0x1f) as usize;
+    let db = ((bg >> 3) & 0x1f) as usize;
     widen_blend5(
         table[row_a5 | (sr << 5) | dr],
         table[row_a5 | (sg << 5) | dg],
@@ -4369,6 +4397,7 @@ fn blit_surface_to_canvas(
     }
     let sx0 = (x0 - ax) as usize;
     let span = (x1 - x0) as usize;
+    let raw_id = encode_id(lot_id);
     if canvas.has_pixel_storage() {
         let x0_u = x0 as usize;
         let x1_u = x1 as usize;
@@ -4379,16 +4408,16 @@ fn blit_surface_to_canvas(
             let (dst_color, dst_depth, dst_ids) = canvas.row_slices_mut(py as usize, x0_u, x1_u);
             if !keyed {
                 for (dst, &pixel) in dst_color.iter_mut().zip(src_row) {
-                    *dst = widen_565(pixel);
+                    *dst = widen_565_packed(pixel);
                 }
                 dst_depth.fill(0);
-                dst_ids.fill(lot_id);
+                dst_ids.fill(raw_id);
             } else {
                 for (i, &pixel) in src_row.iter().enumerate() {
                     if pixel != COLOR_KEY_565 {
-                        dst_color[i] = widen_565(pixel);
+                        dst_color[i] = widen_565_packed(pixel);
                         dst_depth[i] = 0;
-                        dst_ids[i] = lot_id;
+                        dst_ids[i] = raw_id;
                     }
                 }
             }
@@ -4489,6 +4518,7 @@ fn blit_crossfade_to_canvas(
             (to_valid && sy < to.height).then(|| &to.pixels[sy * to.width..(sy + 1) * to.width]);
         if has_storage {
             let (dst_color, dst_depth, dst_ids) = canvas.row_slices_mut(py as usize, x0_u, x1_u);
+            let raw_id = encode_id(lot_id);
             if let (Some(fr), Some(tr)) = (from_row, to_row)
                 && sx0 + span <= fr.len()
                 && sx0 + span <= tr.len()
@@ -4503,13 +4533,15 @@ fn blit_crossfade_to_canvas(
                             (true, true) => continue,
                             (false, false) => blend_565_pair(table, row_a5, p_to, p_from),
                             (false, true) => {
-                                blend_rgb_over_565(table, row_a5, dst_color[i], p_from)
+                                blend_packed_over_565(table, row_a5, dst_color[i], p_from)
                             }
-                            (true, false) => blend_565_over_rgb(table, row_a5, p_to, dst_color[i]),
+                            (true, false) => {
+                                blend_565_over_packed(table, row_a5, p_to, dst_color[i])
+                            }
                         };
-                        dst_color[i] = rgb;
+                        dst_color[i] = pack_rgb(rgb);
                         dst_depth[i] = 0;
-                        dst_ids[i] = lot_id;
+                        dst_ids[i] = raw_id;
                     }
                 } else {
                     for i in 0..span {
@@ -4519,11 +4551,13 @@ fn blit_crossfade_to_canvas(
                             (true, true) => continue,
                             (false, false) => blend_565_pair(table, row_a5, p_to, p_from),
                             (false, true) => {
-                                blend_rgb_over_565(table, row_a5, dst_color[i], p_from)
+                                blend_packed_over_565(table, row_a5, dst_color[i], p_from)
                             }
-                            (true, false) => blend_565_over_rgb(table, row_a5, p_to, dst_color[i]),
+                            (true, false) => {
+                                blend_565_over_packed(table, row_a5, p_to, dst_color[i])
+                            }
                         };
-                        dst_color[i] = rgb;
+                        dst_color[i] = pack_rgb(rgb);
                     }
                 }
                 continue;
@@ -4539,13 +4573,13 @@ fn blit_crossfade_to_canvas(
                 let rgb = match (p_from == COLOR_KEY_565, p_to == COLOR_KEY_565) {
                     (true, true) => continue,
                     (false, false) => blend_565_pair(table, row_a5, p_to, p_from),
-                    (false, true) => blend_rgb_over_565(table, row_a5, dst_color[i], p_from),
-                    (true, false) => blend_565_over_rgb(table, row_a5, p_to, dst_color[i]),
+                    (false, true) => blend_packed_over_565(table, row_a5, dst_color[i], p_from),
+                    (true, false) => blend_565_over_packed(table, row_a5, p_to, dst_color[i]),
                 };
-                dst_color[i] = rgb;
+                dst_color[i] = pack_rgb(rgb);
                 if lot_id.is_some() {
                     dst_depth[i] = 0;
-                    dst_ids[i] = lot_id;
+                    dst_ids[i] = raw_id;
                 }
             }
         } else {
@@ -4563,11 +4597,11 @@ fn blit_crossfade_to_canvas(
                     (false, false) => blend_565_pair(table, row_a5, p_to, p_from),
                     (false, true) => {
                         let bg = canvas.color[canvas_row + px as usize];
-                        blend_rgb_over_565(table, row_a5, bg, p_from)
+                        blend_packed_over_565(table, row_a5, bg, p_from)
                     }
                     (true, false) => {
                         let bg = canvas.color[canvas_row + px as usize];
-                        blend_565_over_rgb(table, row_a5, p_to, bg)
+                        blend_565_over_packed(table, row_a5, p_to, bg)
                     }
                 };
                 if lot_id.is_some() {
@@ -4610,6 +4644,7 @@ fn mark_surface_ids(
     }
     let sx0 = (x0 - ax) as usize;
     let span = (x1 - x0) as usize;
+    let raw_id = encode_id(Some(lot_id));
     if canvas.has_pixel_storage() {
         let x0_u = x0 as usize;
         let x1_u = x1 as usize;
@@ -4621,7 +4656,7 @@ fn mark_surface_ids(
             for (i, &pixel) in src_row.iter().enumerate() {
                 if pixel != COLOR_KEY_565 {
                     dst_depth[i] = 0;
-                    dst_ids[i] = Some(lot_id);
+                    dst_ids[i] = raw_id;
                 }
             }
         }
@@ -4635,7 +4670,7 @@ fn mark_surface_ids(
                 if row[sx] == COLOR_KEY_565 {
                     continue;
                 }
-                let existing = canvas.color[canvas_row + px as usize];
+                let existing = unpack_rgb(canvas.color[canvas_row + px as usize]);
                 canvas.plot(px as i32, py as i32, 0, existing);
             }
         }
@@ -4725,14 +4760,14 @@ fn blit_surface_stretched_to_canvas(
             if !keyed {
                 for (i, dst) in dst_color.iter_mut().enumerate() {
                     let sx = src_x0 + (i * sw / out_w).min(sw - 1);
-                    *dst = widen_565(row[sx]);
+                    *dst = widen_565_packed(row[sx]);
                 }
             } else {
                 for (i, dst) in dst_color.iter_mut().enumerate() {
                     let sx = src_x0 + (i * sw / out_w).min(sw - 1);
                     let pixel = row[sx];
                     if pixel != COLOR_KEY_565 {
-                        *dst = widen_565(pixel);
+                        *dst = widen_565_packed(pixel);
                     }
                 }
             }
@@ -4832,12 +4867,12 @@ fn blit_subrect_to_canvas_mode(
                 [py as usize * canvas.width + x0_u..py as usize * canvas.width + x1_u];
             if !keyed {
                 for (dst, &pixel) in dst_color.iter_mut().zip(src_row) {
-                    *dst = widen_565(pixel);
+                    *dst = widen_565_packed(pixel);
                 }
             } else {
                 for (dst, &pixel) in dst_color.iter_mut().zip(src_row) {
                     if pixel != COLOR_KEY_565 {
-                        *dst = widen_565(pixel);
+                        *dst = widen_565_packed(pixel);
                     }
                 }
             }
@@ -5625,10 +5660,13 @@ mod tests {
             ..RenderOptions::default()
         });
         // Outer frame requires viewport width > 800 (0x569025), so (0, 0) stays black.
-        assert_eq!(vac_frame1.color[0], [0, 0, 0]);
+        assert_eq!(unpack_rgb(vac_frame1.color[0]), [0, 0, 0]);
         // Frame 1 is None (not shifted to frame 2) and port alone is suppressed,
         // so (110, 110) stays backdrop color rather than wave2_c or port_c.
-        assert_eq!(vac_frame1.color[110 * 800 + 110], widen_565(bg_c));
+        assert_eq!(
+            unpack_rgb(vac_frame1.color[110 * 800 + 110]),
+            widen_565(bg_c)
+        );
         // Local JPEG overlays keep color-keying disabled (0x4b8285), so solid
         // magenta (0xf81f) in frame 0 draws opaquely rather than transparent.
         let vac_frame0 = custom_vac.render(&RenderOptions {
@@ -5637,14 +5675,20 @@ mod tests {
             show_vacation_overlays: true,
             ..RenderOptions::default()
         });
-        assert_eq!(vac_frame0.color[110 * 800 + 110], widen_565(COLOR_KEY_565));
+        assert_eq!(
+            unpack_rgb(vac_frame0.color[110 * 800 + 110]),
+            widen_565(COLOR_KEY_565)
+        );
         let vac_frame2 = custom_vac.render(&RenderOptions {
             viewport: [800, 600],
             water_frame: Some(2),
             show_vacation_overlays: true,
             ..RenderOptions::default()
         });
-        assert_eq!(vac_frame2.color[110 * 800 + 110], widen_565(wave2_c));
+        assert_eq!(
+            unpack_rgb(vac_frame2.color[110 * 800 + 110]),
+            widen_565(wave2_c)
+        );
 
         // Filter badges use a null/full-viewport clip (0x56bec5) so edge-lot
         // badges extend into the 1024×768 outer frame; Classic waves clip to
@@ -5673,7 +5717,10 @@ mod tests {
             active_filter: Some(CommunityFilter::Lodging),
             ..RenderOptions::default()
         });
-        assert_eq!(badge_1024.color[84 * 1024 + 98], widen_565(badge_px));
+        assert_eq!(
+            unpack_rgb(badge_1024.color[84 * 1024 + 98]),
+            widen_565(badge_px)
+        );
 
         let mut classic_small = make_test_map(NeighborhoodKind::Classic, Vec::new());
         let frame_c = pack_565([40, 40, 40]);
@@ -5698,15 +5745,27 @@ mod tests {
             water_frame: Some(0),
             ..RenderOptions::default()
         });
-        assert_eq!(classic_step0.color[200 * 1024 + 300], widen_565(bg_c));
+        assert_eq!(
+            unpack_rgb(classic_step0.color[200 * 1024 + 300]),
+            widen_565(bg_c)
+        );
         let classic_1024 = classic_small.render(&RenderOptions {
             viewport: [1024, 768],
             water_frame: Some(1),
             ..RenderOptions::default()
         });
-        assert_eq!(classic_1024.color[200 * 1024 + 850], widen_565(frame_c));
-        assert_eq!(classic_1024.color[200 * 1024 + 300], widen_565(left_c));
-        assert_eq!(classic_1024.color[200 * 1024 + 700], widen_565(right_c));
+        assert_eq!(
+            unpack_rgb(classic_1024.color[200 * 1024 + 850]),
+            widen_565(frame_c)
+        );
+        assert_eq!(
+            unpack_rgb(classic_1024.color[200 * 1024 + 300]),
+            widen_565(left_c)
+        );
+        assert_eq!(
+            unpack_rgb(classic_1024.color[200 * 1024 + 700]),
+            widen_565(right_c)
+        );
 
         // When Classic's backdrop exceeds the viewport (900px backdrop, 800px
         // wave, 800px viewport), `cRZGraphic::Blt` (`0x5def65..0x5def81`)
@@ -5730,7 +5789,10 @@ mod tests {
             ..RenderOptions::default()
         });
         assert!(
-            classic_800.color.iter().all(|&c| c == widen_565(green_c)),
+            classic_800
+                .color
+                .iter()
+                .all(|&c| c == widen_565_packed(green_c)),
             "rightmost 100 wave columns must be cropped out by 0x5def65"
         );
 
@@ -5758,13 +5820,19 @@ mod tests {
             water_frame: Some(0),
             ..RenderOptions::default()
         });
-        assert_eq!(dt_1024.color[200 * 1024 + 850], widen_565(wave2_c));
+        assert_eq!(
+            unpack_rgb(dt_1024.color[200 * 1024 + 850]),
+            widen_565(wave2_c)
+        );
         let dt_step5 = dt_small.render(&RenderOptions {
             viewport: [1024, 768],
             water_frame: Some(5),
             ..RenderOptions::default()
         });
-        assert_eq!(dt_step5.color[200 * 1024 + 850], widen_565(slot4_c));
+        assert_eq!(
+            unpack_rgb(dt_step5.color[200 * 1024 + 850]),
+            widen_565(slot4_c)
+        );
         let mut vac_cycle = make_test_map(NeighborhoodKind::Vacation, Vec::new());
         vac_cycle.waves = vec![
             Some(Surface565::filled(10, 10, wave2_c)),
@@ -5779,7 +5847,7 @@ mod tests {
             water_frame: Some(5),
             ..RenderOptions::default()
         });
-        assert_eq!(vac_step5.color[0], widen_565(slot4_c));
+        assert_eq!(unpack_rgb(vac_step5.color[0]), widen_565(slot4_c));
 
         // Unleashed skips widget updates when a custom wave slot is absent
         // (`0x557e87..0x557e90`), keeping the previous wave visible on slot 1.
@@ -5797,7 +5865,7 @@ mod tests {
             water_frame: Some(1),
             ..RenderOptions::default()
         });
-        assert_eq!(ul_step1.color[0], widen_565(wave2_c));
+        assert_eq!(unpack_rgb(ul_step1.color[0]), widen_565(wave2_c));
 
         // 4-component CMYK baseline JPEG decodes through the same YCbCr->RGB
         // path as shipped `gimex.dll` + `ijl10.dll` (`JPGColor = IJL_YCBCR`,
@@ -5852,7 +5920,10 @@ mod tests {
             viewport: [900, 600],
             ..RenderOptions::default()
         });
-        assert_eq!(wide_canvas.color[15 * 900 + 855], widen_565(bg_c));
+        assert_eq!(
+            unpack_rgb(wide_canvas.color[15 * 900 + 855]),
+            widen_565(bg_c)
+        );
 
         // Version-0 FAMI retains default number = -1 (0x410083, 0x4104f9), so a
         // version-1 family #9 with number 0 beats version-0 family #10 on lot 5.
@@ -5911,7 +5982,7 @@ mod tests {
         };
         let canvas = magic_map.render(&hover_opts);
         // Badge pixel at (10+8, 10+4) renders at its exact unhighlighted color.
-        assert_eq!(canvas.color[14 * 800 + 18], widen_565(badge_c));
+        assert_eq!(unpack_rgb(canvas.color[14 * 800 + 18]), widen_565(badge_c));
         // Picking tests the regular cutaway thumbnail: (10+0, 10+0) hits,
         // while (10+8, 10+4) (transparent in cutaway) misses on BOTH hit_test & Canvas::id_at.
         assert_eq!(
@@ -6174,8 +6245,14 @@ mod tests {
             hover_roof_fade: 0.0,
             ..RenderOptions::default()
         });
-        assert_eq!(c0.color[10 * 800 + 10], widen_565(pack_565(roof_rgb)));
-        assert_eq!(c0.color[10 * 800 + 11], widen_565(pack_565(wall_rgb)));
+        assert_eq!(
+            unpack_rgb(c0.color[10 * 800 + 10]),
+            widen_565(pack_565(roof_rgb))
+        );
+        assert_eq!(
+            unpack_rgb(c0.color[10 * 800 + 11]),
+            widen_565(pack_565(wall_rgb))
+        );
 
         // fade = 1.0 matches `roofs_off` with zero yellow outline pixels.
         let c1 = map.render(&RenderOptions {
@@ -6183,10 +6260,16 @@ mod tests {
             hover_roof_fade: 1.0,
             ..RenderOptions::default()
         });
-        assert_eq!(c1.color[10 * 800 + 10], widen_565(pack_565(bg_rgb)));
-        assert_eq!(c1.color[10 * 800 + 11], widen_565(pack_565(interior_rgb)));
+        assert_eq!(
+            unpack_rgb(c1.color[10 * 800 + 10]),
+            widen_565(pack_565(bg_rgb))
+        );
+        assert_eq!(
+            unpack_rgb(c1.color[10 * 800 + 11]),
+            widen_565(pack_565(interior_rgb))
+        );
         assert_ne!(
-            c1.color[10 * 800 + 11],
+            unpack_rgb(c1.color[10 * 800 + 11]),
             quantize565(DEFAULT_HIGHLIGHT_RGB),
             "default hover must not draw a yellow outline"
         );
@@ -6200,7 +6283,7 @@ mod tests {
         let cmid = map.render(&mid_opts);
         let alpha = fade_to_alpha(0.5);
         assert_eq!(
-            cmid.color[10 * 800 + 10],
+            unpack_rgb(cmid.color[10 * 800 + 10]),
             blend565(
                 widen_565(pack_565(bg_rgb)),
                 widen_565(pack_565(roof_rgb)),
@@ -6208,7 +6291,7 @@ mod tests {
             )
         );
         assert_eq!(
-            cmid.color[10 * 800 + 11],
+            unpack_rgb(cmid.color[10 * 800 + 11]),
             blend565(
                 widen_565(pack_565(interior_rgb)),
                 widen_565(pack_565(wall_rgb)),

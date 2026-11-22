@@ -106,7 +106,7 @@ fn end_to_end_neighborhood_lot_save_move_in_evict_bulldoze_loop() {
     // Render Neighborhood map and verify non-blank output.
     shell.resize([800, 600]);
     shell.render();
-    assert!(shell.canvas().color.iter().any(|&px| px != [0, 0, 0]));
+    assert!(shell.canvas().color.iter().any(|&px| px != 0));
 
     // 2. Hover Goth lot (House 5) and verify debounced StreetNames.iff address & popup metadata.
     let goth_pt = find_lot_hit_point(&shell, 5).expect("Goth lot 5 is hit-testable on map");

@@ -35,6 +35,54 @@ use std::sync::OnceLock;
 /// and depth untouched.
 pub const FAINT: u8 = 65;
 
+/// Empty 16-bit depth stored in [`Canvas::depth`] (`65535`, matching [`EMPTY`]).
+pub const EMPTY_DEPTH: u16 = u16::MAX;
+
+/// Sentinel stored in [`Canvas::ids`] when no object or person drew a pixel.
+/// Object IDs (`0`..`< 65535`) and neighborhood lot IDs (`< 100`) never equal
+/// `u16::MAX`.
+pub const ID_NONE: u16 = u16::MAX;
+
+/// Packs 8-bit `[r, g, b]` into `0x00RRGGBB` (matching `softbuffer` directly).
+#[inline(always)]
+pub const fn pack_rgb([r, g, b]: [u8; 3]) -> u32 {
+    ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+}
+
+/// Unpacks `0x00RRGGBB` back into 8-bit `[r, g, b]`.
+#[inline(always)]
+pub const fn unpack_rgb(pixel: u32) -> [u8; 3] {
+    [(pixel >> 16) as u8, (pixel >> 8) as u8, pixel as u8]
+}
+
+/// Clamps an `i32` depth into the canvas's 16-bit `0..=65535` range.
+#[inline(always)]
+pub const fn clamp_depth(d: i32) -> u16 {
+    if d <= 0 {
+        0
+    } else if d >= EMPTY {
+        EMPTY_DEPTH
+    } else {
+        d as u16
+    }
+}
+
+#[inline(always)]
+pub(crate) fn encode_id(id: Option<u16>) -> u16 {
+    match id {
+        Some(v) => {
+            assert_ne!(v, ID_NONE, "Canvas pick ID u16::MAX is reserved as ID_NONE");
+            v
+        }
+        None => ID_NONE,
+    }
+}
+
+#[inline(always)]
+pub(crate) const fn decode_id(raw: u16) -> Option<u16> {
+    if raw == ID_NONE { None } else { Some(raw) }
+}
+
 /// A contiguous horizontal span of active (non-transparent) columns in one
 /// sprite row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,9 +194,9 @@ pub(crate) struct CanvasBand<'a> {
     pub height: usize,
     pub y0: usize,
     pub y1: usize,
-    pub color: &'a mut [[u8; 3]],
-    pub depth: &'a mut [i32],
-    pub ids: &'a mut [Option<u16>],
+    pub color: &'a mut [u32],
+    pub depth: &'a mut [u16],
+    pub ids: &'a mut [u16],
 }
 
 /// A decoded sprite frame: straight-alpha RGBA and, if it has one, a depth
@@ -252,43 +300,204 @@ impl From<sims_formats::sprite::Frame> for Image {
 pub struct Canvas {
     pub width: usize,
     pub height: usize,
-    pub color: Vec<[u8; 3]>,
-    pub depth: Vec<i32>,
-    /// For each pixel, the ID of what drew it last ([`Canvas::id_at`]).
-    ids: Vec<Option<u16>>,
-    /// The ID the pixels drawn now take ([`Canvas::set_id`]).
-    pen: Option<u16>,
+    /// Packed `0x00RRGGBB` pixels (matching `softbuffer` directly, 4-byte aligned).
+    pub color: Vec<u32>,
+    /// 16-bit depth per pixel (`0..=65535`, [`EMPTY_DEPTH`] = empty).
+    pub depth: Vec<u16>,
+    /// For each pixel, the ID of what drew it last ([`Canvas::id_at`]), with
+    /// [`ID_NONE`] (`u16::MAX`) denoting none.
+    ids: Vec<u16>,
+    /// The ID the pixels drawn now take ([`Canvas::set_id`]), or [`ID_NONE`].
+    pen: u16,
     /// For each ID, the screen rectangle its images were drawn into since
     /// the canvas was cleared ([`Canvas::drawn`]).
     rects: std::collections::BTreeMap<u16, Rect>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IdRect {
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    offset: usize,
+}
+
 /// Which object or person drew each pixel of a canvas, kept apart from
 /// it: what [`Canvas::id_at`] read when it was taken ([`Canvas::ids`],
-/// [`Ids::take`]). A frame drawn in passes keeps the IDs of a pass this
-/// way before the next draws over them.
+/// [`Ids::take`], [`Ids::take_rects`]). A frame drawn in passes keeps the IDs
+/// of a pass this way before the next draws over them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Ids {
-    width: usize,
-    height: usize,
-    ids: Vec<Option<u16>>,
+    rects: Vec<IdRect>,
+    pool: Vec<u16>,
 }
 
 impl Ids {
     /// The ID that had drawn the pixel at (`x`, `y`) last when these were
-    /// taken, if any had and the pixel is on the canvas.
+    /// taken, if any had and the pixel is within a captured rectangle.
     pub fn id_at(&self, x: i32, y: i32) -> Option<u16> {
-        let (x, y) = (usize::try_from(x).ok()?, usize::try_from(y).ok()?);
-        (x < self.width && y < self.height)
-            .then(|| self.ids[y * self.width + x])
-            .flatten()
+        for r in &self.rects {
+            if x >= r.x0 && x < r.x1 && y >= r.y0 && y < r.y1 {
+                let w = (r.x1 - r.x0) as usize;
+                let idx = r.offset + (y - r.y0) as usize * w + (x - r.x0) as usize;
+                return decode_id(self.pool[idx]);
+            }
+        }
+        None
     }
 
-    /// Takes `canvas`'s IDs as they are now, reusing this one's storage.
+    /// Takes `canvas`'s full-screen IDs as they are now, reusing this one's storage.
+    /// Bounds capture by `canvas.ids.len()` so undersized canvases preserve all
+    /// backed picks matching [`Canvas::id_at`].
     pub fn take(&mut self, canvas: &Canvas) {
-        self.width = canvas.width;
-        self.height = canvas.height;
-        self.ids.clone_from(&canvas.ids);
+        self.rects.clear();
+        self.pool.clear();
+        if canvas.width == 0 || canvas.height == 0 || canvas.ids.is_empty() {
+            return;
+        }
+        let max_i32 = i32::MAX as usize;
+        let backed = canvas.ids.len();
+        let full_rows = (backed / canvas.width).min(canvas.height).min(max_i32);
+        if full_rows > 0 {
+            let row_w = canvas.width.min(max_i32);
+            if row_w == canvas.width {
+                let pixels = full_rows * canvas.width;
+                self.pool.extend_from_slice(&canvas.ids[..pixels]);
+            } else {
+                self.pool.reserve(full_rows * row_w);
+                for y in 0..full_rows {
+                    let start = y * canvas.width;
+                    self.pool
+                        .extend_from_slice(&canvas.ids[start..start + row_w]);
+                }
+            }
+            self.rects.push(IdRect {
+                x0: 0,
+                y0: 0,
+                x1: row_w as i32,
+                y1: full_rows as i32,
+                offset: 0,
+            });
+        }
+        if full_rows < canvas.height && full_rows < max_i32 {
+            let tail_start = full_rows.saturating_mul(canvas.width);
+            let partial_cols = backed
+                .saturating_sub(tail_start)
+                .min(canvas.width)
+                .min(max_i32);
+            if partial_cols > 0 {
+                let offset = self.pool.len();
+                self.pool
+                    .extend_from_slice(&canvas.ids[tail_start..tail_start + partial_cols]);
+                self.rects.push(IdRect {
+                    x0: 0,
+                    y0: full_rows as i32,
+                    x1: partial_cols as i32,
+                    y1: (full_rows + 1) as i32,
+                    offset,
+                });
+            }
+        }
+    }
+
+    /// Takes `canvas`'s IDs only inside `rects` (clipped to the canvas's backed
+    /// ID storage), reusing this one's backing allocations. For overlapping rects
+    /// captured from the same `canvas` snapshot, every rect stores identical
+    /// pixel IDs at their intersection so [`Ids::id_at`] agrees bit-for-bit
+    /// with [`Ids::take`] on every pixel inside the union of `rects`. Clips to
+    /// backed full rows and any partial tail row before reserving so undersized
+    /// canvases with huge declared dimensions never over-allocate.
+    pub fn take_rects(&mut self, canvas: &Canvas, rects: &[Rect]) {
+        self.rects.clear();
+        self.pool.clear();
+        if rects.is_empty() || canvas.width == 0 || canvas.height == 0 || canvas.ids.is_empty() {
+            return;
+        }
+        let backed = canvas.ids.len();
+        let full_rows = (backed / canvas.width).min(canvas.height);
+        let partial_cols = if full_rows < canvas.height {
+            backed % canvas.width
+        } else {
+            0
+        };
+        let cw = i64::try_from(canvas.width).unwrap_or(i64::MAX);
+        let full_rows_i = i64::try_from(full_rows).unwrap_or(i64::MAX);
+        let partial_cols_i = i64::try_from(partial_cols).unwrap_or(i64::MAX);
+        for &[rx0, ry0, rx1, ry1] in rects {
+            let rx0 = i64::from(rx0);
+            let ry0 = i64::from(ry0);
+            let rx1 = i64::from(rx1);
+            let ry1 = i64::from(ry1);
+            if rx0 >= rx1 || ry0 >= ry1 {
+                continue;
+            }
+            // 1. Fully backed rows `[0, full_rows)`.
+            if full_rows > 0 {
+                let x0 = rx0.clamp(0, cw);
+                let y0 = ry0.clamp(0, full_rows_i);
+                let x1 = rx1.clamp(x0, cw);
+                let y1 = ry1.clamp(y0, full_rows_i);
+                if x0 < x1
+                    && y0 < y1
+                    && let (Ok(x0_i), Ok(y0_i), Ok(x1_i), Ok(y1_i)) = (
+                        i32::try_from(x0),
+                        i32::try_from(y0),
+                        i32::try_from(x1),
+                        i32::try_from(y1),
+                    )
+                {
+                    let (x0_u, x1_u) = (x0 as usize, x1 as usize);
+                    let (y0_u, y1_u) = (y0 as usize, y1 as usize);
+                    let rect_w = x1_u - x0_u;
+                    let offset = self.pool.len();
+                    self.pool.reserve(rect_w * (y1_u - y0_u));
+                    for y in y0_u..y1_u {
+                        let start = y * canvas.width + x0_u;
+                        self.pool
+                            .extend_from_slice(&canvas.ids[start..start + rect_w]);
+                    }
+                    self.rects.push(IdRect {
+                        x0: x0_i,
+                        y0: y0_i,
+                        x1: x1_i,
+                        y1: y1_i,
+                        offset,
+                    });
+                }
+            }
+            // 2. Optional partially backed tail row `y == full_rows`.
+            if partial_cols > 0
+                && ry0 <= full_rows_i
+                && ry1 > full_rows_i
+                && let (Ok(row_i), Ok(row_end_i)) =
+                    (i32::try_from(full_rows_i), i32::try_from(full_rows_i + 1))
+            {
+                let px0 = rx0.clamp(0, partial_cols_i);
+                let px1 = rx1.clamp(px0, partial_cols_i);
+                if px0 < px1
+                    && let (Ok(px0_i), Ok(px1_i)) = (i32::try_from(px0), i32::try_from(px1))
+                {
+                    let tail_start = full_rows * canvas.width + px0 as usize;
+                    let len = (px1 - px0) as usize;
+                    let offset = self.pool.len();
+                    self.pool
+                        .extend_from_slice(&canvas.ids[tail_start..tail_start + len]);
+                    self.rects.push(IdRect {
+                        x0: px0_i,
+                        y0: row_i,
+                        x1: px1_i,
+                        y1: row_end_i,
+                        offset,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Number of `u16` pixel ID entries currently stored (for diagnostics & tests).
+    pub fn stored_pixels(&self) -> usize {
+        self.pool.len()
     }
 }
 
@@ -301,21 +510,38 @@ impl Canvas {
         Self {
             width,
             height,
-            color: vec![background; width * height],
-            depth: vec![EMPTY; width * height],
-            ids: vec![None; width * height],
-            pen: None,
+            color: vec![pack_rgb(background); width * height],
+            depth: vec![EMPTY_DEPTH; width * height],
+            ids: vec![ID_NONE; width * height],
+            pen: ID_NONE,
             rects: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// Unpacks the RGB color of pixel `(x, y)`.
+    #[inline]
+    pub fn pixel_rgb(&self, x: usize, y: usize) -> [u8; 3] {
+        unpack_rgb(self.color[y * self.width + x])
+    }
+
+    /// Packs and writes the RGB color of pixel `(x, y)`.
+    #[inline]
+    pub fn set_pixel_rgb(&mut self, x: usize, y: usize, rgb: [u8; 3]) {
+        self.color[y * self.width + x] = pack_rgb(rgb);
+    }
+
+    /// Unpacks all pixels into `[r, g, b]` triples.
+    pub fn color_rgb(&self) -> Vec<[u8; 3]> {
+        self.color.iter().map(|&c| unpack_rgb(c)).collect()
     }
 
     /// Clears to `background`, empty depth and no IDs, keeping the size,
     /// and puts the pen down (no ID).
     pub fn clear(&mut self, background: [u8; 3]) {
-        self.color.fill(background);
-        self.depth.fill(EMPTY);
-        self.ids.fill(None);
-        self.pen = None;
+        self.color.fill(pack_rgb(background));
+        self.depth.fill(EMPTY_DEPTH);
+        self.ids.fill(ID_NONE);
+        self.pen = ID_NONE;
         self.rects.clear();
     }
 
@@ -358,15 +584,15 @@ impl Canvas {
         debug_assert_eq!(other.ids.len(), pixels);
         self.color[..pixels].copy_from_slice(&other.color);
         if self.color.len() > pixels {
-            self.color[pixels..].fill(background);
+            self.color[pixels..].fill(pack_rgb(background));
         }
         self.depth[..pixels].copy_from_slice(&other.depth);
         if self.depth.len() > pixels {
-            self.depth[pixels..].fill(EMPTY);
+            self.depth[pixels..].fill(EMPTY_DEPTH);
         }
         self.ids[..pixels].copy_from_slice(&other.ids);
         if self.ids.len() > pixels {
-            self.ids[pixels..].fill(None);
+            self.ids[pixels..].fill(ID_NONE);
         }
         self.pen = other.pen;
         self.rects.clone_from(&other.rects);
@@ -374,7 +600,7 @@ impl Canvas {
 
     #[inline]
     fn record_rect(&mut self, x: i32, y: i32, width: usize, height: usize) {
-        if let Some(id) = self.pen {
+        if let Some(id) = decode_id(self.pen) {
             self.record_rect_for(id, x, y, width, height);
         }
     }
@@ -459,9 +685,9 @@ impl Canvas {
             return;
         }
         let row_start = partial_y * self.width;
-        let mut color = vec![[0, 0, 0]; self.width];
-        let mut depth = vec![i32::MAX; self.width];
-        let mut ids = vec![None; self.width];
+        let mut color = vec![0u32; self.width];
+        let mut depth = vec![EMPTY_DEPTH; self.width];
+        let mut ids = vec![ID_NONE; self.width];
         color[..partial_cols].copy_from_slice(&self.color[row_start..min_len]);
         depth[..partial_cols].copy_from_slice(&self.depth[row_start..min_len]);
         ids[..partial_cols].copy_from_slice(&self.ids[row_start..min_len]);
@@ -489,7 +715,7 @@ impl Canvas {
         y: usize,
         x0: usize,
         x1: usize,
-    ) -> (&mut [[u8; 3]], &mut [i32], &mut [Option<u16>]) {
+    ) -> (&mut [u32], &mut [u16], &mut [u16]) {
         let start = y * self.width + x0;
         let end = y * self.width + x1;
         (
@@ -504,14 +730,14 @@ impl Canvas {
     /// nobody's (terrain, floors, walls). See [the module
     /// docs](self#which-object-drew-a-pixel).
     pub fn set_id(&mut self, id: Option<u16>) {
-        self.pen = id;
+        self.pen = encode_id(id);
     }
 
     /// The ID of the object or person that drew the pixel at (`x`, `y`)
     /// last, if any did and the pixel is on the canvas: what a click there
     /// hit.
     pub fn id_at(&self, x: i32, y: i32) -> Option<u16> {
-        self.ids[self.index(x, y)?]
+        self.ids.get(self.index(x, y)?).copied().and_then(decode_id)
     }
 
     /// The IDs of every pixel as they are now ([`Ids`]).
@@ -766,7 +992,7 @@ impl Canvas {
         let img_w = image.width;
         let rgba = &image.rgba;
         for py in y0..y1 {
-            let d = row_depth(py as i32).clamp(0, EMPTY);
+            let d = clamp_depth(row_depth(py as i32));
             let iy = (py as i64 - ay) as usize;
             let src_row = iy * img_w;
             let dst_row = py * width;
@@ -783,9 +1009,9 @@ impl Canvas {
                 self.ids[target] = pen;
                 let rgb = light.apply_with(light_tables, [rgba[pi], rgba[pi + 1], rgba[pi + 2]]);
                 if a5 >= 31 {
-                    self.color[target] = rgb;
+                    self.color[target] = pack_rgb(rgb);
                 } else {
-                    self.color[target] = blend565_with(table, rgb, self.color[target], a);
+                    self.color[target] = blend565_packed(table, rgb, self.color[target], a);
                 }
             }
         }
@@ -873,16 +1099,16 @@ impl Canvas {
                     let Some(d) = depth(px as i32, sy, byte) else {
                         continue;
                     };
-                    if d > dst_depth[offset].saturating_add(slack) {
+                    if d > i32::from(dst_depth[offset]).saturating_add(slack) {
                         continue;
                     }
                     let rgb = color(ix, iy, [rgba[si], rgba[si + 1], rgba[si + 2]]);
-                    dst_depth[offset] = d.clamp(0, EMPTY);
+                    dst_depth[offset] = clamp_depth(d);
                     dst_ids[offset] = pen;
                     if a == 255 {
-                        dst_color[offset] = rgb;
+                        dst_color[offset] = pack_rgb(rgb);
                     } else {
-                        dst_color[offset] = blend565_with(table, rgb, dst_color[offset], a);
+                        dst_color[offset] = blend565_packed(table, rgb, dst_color[offset], a);
                     }
                 }
             } else {
@@ -903,17 +1129,17 @@ impl Canvas {
                         continue;
                     };
                     let target = py * width + px;
-                    if d > self.depth[target].saturating_add(slack) {
+                    if d > i32::from(self.depth[target]).saturating_add(slack) {
                         continue;
                     }
                     let rgb = color(ix, iy, [rgba[si], rgba[si + 1], rgba[si + 2]]);
                     let pixel = &mut self.color[target];
-                    self.depth[target] = d.clamp(0, EMPTY);
+                    self.depth[target] = clamp_depth(d);
                     self.ids[target] = pen;
                     if a == 255 {
-                        *pixel = rgb;
+                        *pixel = pack_rgb(rgb);
                     } else {
-                        *pixel = blend565_with(table, rgb, *pixel, a);
+                        *pixel = blend565_packed(table, rgb, *pixel, a);
                     }
                 }
             }
@@ -994,7 +1220,7 @@ impl Canvas {
         for py in y0..y1 {
             let sy = py as i32;
             let d = row_depth(sy);
-            let d_clamped = d.clamp(0, EMPTY);
+            let d_clamped = clamp_depth(d);
             let iy = (py as i64 - ay) as usize;
             let src_row = iy * img_w;
             let ix_base = (x0 as i64 - ax) as usize + left_skip;
@@ -1010,7 +1236,7 @@ impl Canvas {
                     if a < FAINT {
                         continue;
                     }
-                    if d > dst_depth[offset] {
+                    if d > i32::from(dst_depth[offset]) {
                         continue;
                     }
                     let rgb = light(ix, iy)
@@ -1018,9 +1244,9 @@ impl Canvas {
                     dst_depth[offset] = d_clamped;
                     dst_ids[offset] = pen;
                     if a == 255 {
-                        dst_color[offset] = rgb;
+                        dst_color[offset] = pack_rgb(rgb);
                     } else {
-                        dst_color[offset] = blend565_with(table, rgb, dst_color[offset], a);
+                        dst_color[offset] = blend565_packed(table, rgb, dst_color[offset], a);
                     }
                 }
             } else {
@@ -1032,7 +1258,7 @@ impl Canvas {
                         continue;
                     }
                     let target = py * width + px;
-                    if d > self.depth[target] {
+                    if d > i32::from(self.depth[target]) {
                         continue;
                     }
                     let rgb = light(ix, iy)
@@ -1041,9 +1267,9 @@ impl Canvas {
                     self.depth[target] = d_clamped;
                     self.ids[target] = pen;
                     if a == 255 {
-                        *pixel = rgb;
+                        *pixel = pack_rgb(rgb);
                     } else {
-                        *pixel = blend565_with(table, rgb, *pixel, a);
+                        *pixel = blend565_packed(table, rgb, *pixel, a);
                     }
                 }
             }
@@ -1059,7 +1285,7 @@ impl Canvas {
         x: i32,
         y: i32,
         depth: i32,
-        depth_clamped: i32,
+        depth_clamped: u16,
         pixels: [[u8; 3]; 4],
     ) {
         let Ok(py) = usize::try_from(y) else {
@@ -1083,9 +1309,9 @@ impl Canvas {
             let dst_color = &mut self.color[start..end];
             let dst_ids = &mut self.ids[start..end];
             for i in 0..4 {
-                if depth <= dst_depth[i] {
+                if depth <= i32::from(dst_depth[i]) {
                     dst_depth[i] = depth_clamped;
-                    dst_color[i] = pixels[i];
+                    dst_color[i] = pack_rgb(pixels[i]);
                     dst_ids[i] = pen;
                 }
             }
@@ -1100,11 +1326,11 @@ impl Canvas {
             };
             if px < self.width {
                 let target = py * self.width + px;
-                if depth <= self.depth[target] {
+                if depth <= i32::from(self.depth[target]) {
                     let pixel = &mut self.color[target];
                     self.depth[target] = depth_clamped;
                     self.ids[target] = pen;
-                    *pixel = rgb;
+                    *pixel = pack_rgb(rgb);
                 }
             }
         }
@@ -1120,7 +1346,7 @@ impl Canvas {
         top: i32,
         bottom: i32,
         depth: i32,
-        depth_clamped: i32,
+        depth_clamped: u16,
         color: [u8; 3],
     ) {
         if top > bottom || self.height == 0 {
@@ -1142,13 +1368,14 @@ impl Canvas {
         }
         let width = self.width;
         let pen = self.pen;
+        let packed = pack_rgb(color);
         for py in y0..=y1 {
             let idx = py * width + px;
-            if depth <= self.depth[idx] {
+            if depth <= i32::from(self.depth[idx]) {
                 let pixel = &mut self.color[idx];
                 self.depth[idx] = depth_clamped;
                 self.ids[idx] = pen;
-                *pixel = color;
+                *pixel = packed;
             }
         }
     }
@@ -1159,15 +1386,18 @@ impl Canvas {
     /// 5-5-5 lookup table.
     fn write(&mut self, target: usize, rgb: [u8; 3], a: u8, d: i32) {
         let pixel = &mut self.color[target];
-        self.depth[target] = d.clamp(0, EMPTY);
+        self.depth[target] = clamp_depth(d);
         self.ids[target] = self.pen;
         if a == 255 {
-            *pixel = rgb;
+            *pixel = pack_rgb(rgb);
         } else {
             let a = u32::from(a);
-            for (c, &s) in pixel.iter_mut().zip(&rgb) {
-                *c = ((u32::from(s) * a + u32::from(*c) * (255 - a) + 127) / 255) as u8;
-            }
+            let inv = 255 - a;
+            let [dr, dg, db] = unpack_rgb(*pixel);
+            let r = ((u32::from(rgb[0]) * a + u32::from(dr) * inv + 127) / 255) as u8;
+            let g = ((u32::from(rgb[1]) * a + u32::from(dg) * inv + 127) / 255) as u8;
+            let b = ((u32::from(rgb[2]) * a + u32::from(db) * inv + 127) / 255) as u8;
+            *pixel = pack_rgb([r, g, b]);
         }
     }
 
@@ -1180,7 +1410,8 @@ impl Canvas {
     /// Whether a sprite pixel at depth `d` on (`x`, `y`) would be drawn:
     /// it is on the canvas and no farther than what is there.
     pub fn passes(&self, x: i32, y: i32, d: i32) -> bool {
-        self.index(x, y).is_some_and(|i| d <= self.depth[i])
+        self.index(x, y)
+            .is_some_and(|i| d <= i32::from(self.depth[i]))
     }
 
     /// Row-indexed depth check for an in-bounds pixel at `row_start + x`,
@@ -1192,7 +1423,7 @@ impl Canvas {
             && self
                 .depth
                 .get(row_start.saturating_add(x))
-                .is_some_and(|&cur| d <= cur)
+                .is_some_and(|&cur| d <= i32::from(cur))
     }
 
     /// Writes a straight-alpha pixel at precomputed index `idx = y * width + x`
@@ -1223,7 +1454,7 @@ impl Canvas {
         let Some(target) = self.index(x, y) else {
             return false;
         };
-        if d > self.depth[target] {
+        if d > i32::from(self.depth[target]) {
             return false;
         }
         self.write(target, [r, g, b], a, d);
@@ -1233,7 +1464,7 @@ impl Canvas {
     /// Fills one pixel if `d` passes the depth test.
     pub fn plot(&mut self, x: i32, y: i32, d: i32, rgb: [u8; 3]) {
         if let Some(target) = self.index(x, y)
-            && d <= self.depth[target]
+            && d <= i32::from(self.depth[target])
         {
             self.write(target, rgb, 255, d);
         }
@@ -1244,7 +1475,7 @@ impl Canvas {
     /// write directly to the color surface.
     pub fn plot_color(&mut self, x: i32, y: i32, rgb: [u8; 3]) {
         if let Some(target) = self.index(x, y) {
-            self.color[target] = rgb;
+            self.color[target] = pack_rgb(rgb);
         }
     }
 
@@ -1253,9 +1484,9 @@ impl Canvas {
     /// what is drawn there (0x4b10c4).
     pub fn shade(&mut self, x: i32, y: i32, at_least: i32, light: Light) {
         if let Some(i) = self.index(x, y)
-            && self.depth[i] >= at_least
+            && i32::from(self.depth[i]) >= at_least
         {
-            self.color[i] = light.apply(self.color[i]);
+            self.color[i] = pack_rgb(light.apply(unpack_rgb(self.color[i])));
         }
     }
 
@@ -1264,14 +1495,20 @@ impl Canvas {
     /// high bits. The original runs its display in that mode, so a fair
     /// comparison quantizes both sides this way.
     pub fn rgb565(&self) -> Vec<[u8; 3]> {
-        self.color.iter().map(|&c| quantize565(c)).collect()
+        self.color
+            .iter()
+            .map(|&c| quantize565(unpack_rgb(c)))
+            .collect()
     }
 
     /// RGBA bytes, row by row, for a window or an image file.
     pub fn rgba(&self) -> Vec<u8> {
         self.color
             .iter()
-            .flat_map(|c| [c[0], c[1], c[2], 255])
+            .flat_map(|&c| {
+                let [r, g, b] = unpack_rgb(c);
+                [r, g, b, 255]
+            })
             .collect()
     }
 }
@@ -1395,6 +1632,23 @@ fn blend565_with(table: &[u8; 32 * 32 * 32], src: [u8; 3], dst: [u8; 3], a: u8) 
     ]
 }
 
+#[inline(always)]
+fn blend565_packed(table: &[u8; 32 * 32 * 32], src: [u8; 3], dst_packed: u32, a: u8) -> u32 {
+    let row = usize::from(a >> 3) << 10;
+    let dr = ((dst_packed >> 19) & 31) as usize;
+    let dg = ((dst_packed >> 11) & 31) as usize;
+    let db = ((dst_packed >> 3) & 31) as usize;
+    let r5 = table[row | (usize::from(src[0] >> 3) << 5) | dr];
+    let g5 = table[row | (usize::from(src[1] >> 3) << 5) | dg];
+    let b5 = table[row | (usize::from(src[2] >> 3) << 5) | db];
+    let g6 = g5 << 1;
+    pack_rgb([
+        (r5 << 3) | (r5 >> 2),
+        (g6 << 2) | (g6 >> 4),
+        (b5 << 3) | (b5 >> 2),
+    ])
+}
+
 /// Blends `src` over `dst` at 8-bit alpha `a` as the original's 16-bit
 /// 5-6-5 blitters do (`0x4bbab8` at `0x4bbc04..0x4bbc7d`, `0x4bc2eb`,
 /// `0x49a60b`): each channel takes its top 5 bits (green drops its lowest
@@ -1415,7 +1669,7 @@ impl CanvasBand<'_> {
             return;
         };
         if px < self.width && py >= self.y0 && py < self.y1 {
-            self.color[(py - self.y0) * self.width + px] = rgb;
+            self.color[(py - self.y0) * self.width + px] = pack_rgb(rgb);
         }
     }
 
@@ -1425,7 +1679,7 @@ impl CanvasBand<'_> {
         x: i32,
         y: i32,
         depth: i32,
-        depth_clamped: i32,
+        depth_clamped: u16,
         pixels: [[u8; 3]; 4],
     ) {
         let Ok(py) = usize::try_from(y) else {
@@ -1442,10 +1696,10 @@ impl CanvasBand<'_> {
             let dst_color = &mut self.color[start..end];
             let dst_ids = &mut self.ids[start..end];
             for i in 0..4 {
-                if depth <= dst_depth[i] {
+                if depth <= i32::from(dst_depth[i]) {
                     dst_depth[i] = depth_clamped;
-                    dst_color[i] = pixels[i];
-                    dst_ids[i] = None;
+                    dst_color[i] = pack_rgb(pixels[i]);
+                    dst_ids[i] = ID_NONE;
                 }
             }
             return;
@@ -1459,10 +1713,10 @@ impl CanvasBand<'_> {
             };
             if px < self.width {
                 let target = local_row + px;
-                if depth <= self.depth[target] {
+                if depth <= i32::from(self.depth[target]) {
                     self.depth[target] = depth_clamped;
-                    self.ids[target] = None;
-                    self.color[target] = rgb;
+                    self.ids[target] = ID_NONE;
+                    self.color[target] = pack_rgb(rgb);
                 }
             }
         }
@@ -1475,7 +1729,7 @@ impl CanvasBand<'_> {
         top: i32,
         bottom: i32,
         depth: i32,
-        depth_clamped: i32,
+        depth_clamped: u16,
         color: [u8; 3],
     ) {
         if top > bottom || self.y0 >= self.y1 {
@@ -1496,12 +1750,13 @@ impl CanvasBand<'_> {
             return;
         }
         let width = self.width;
+        let packed = pack_rgb(color);
         for py in y0..=y1 {
             let idx = (py - self.y0) * width + px;
-            if depth <= self.depth[idx] {
+            if depth <= i32::from(self.depth[idx]) {
                 self.depth[idx] = depth_clamped;
-                self.ids[idx] = None;
-                self.color[idx] = color;
+                self.ids[idx] = ID_NONE;
+                self.color[idx] = packed;
             }
         }
     }
@@ -1551,6 +1806,7 @@ impl CanvasBand<'_> {
         let img_w = image.width;
         let rgba = image.rgba.as_chunks::<4>().0;
         let table = blend_table();
+        let pen = encode_id(pen);
         let ix_min = (x0 as i64 - ax) as usize + left_skip;
         let ix_max = ix_min + (x1 - x0);
         match light.level() {
@@ -1562,7 +1818,7 @@ impl CanvasBand<'_> {
                         continue;
                     }
                     let d = row_depth(py as i32);
-                    let d_clamped = d.clamp(0, EMPTY);
+                    let d_clamped = clamp_depth(d);
                     let src_row = iy * img_w;
                     let dst_base = (py - self.y0) * width + x0;
                     for span in row_spans {
@@ -1579,27 +1835,27 @@ impl CanvasBand<'_> {
                         let di = &mut self.ids[dst_off..dst_off + len];
                         if span.all_opaque {
                             for i in 0..len {
-                                if d <= dd[i] {
+                                if d <= i32::from(dd[i]) {
                                     let px = src_px[i];
                                     dd[i] = d_clamped;
                                     di[i] = pen;
-                                    dc[i] = [px[0], px[1], px[2]];
+                                    dc[i] = pack_rgb([px[0], px[1], px[2]]);
                                 }
                             }
                         } else {
                             for i in 0..len {
                                 let px = src_px[i];
                                 let a = px[3];
-                                if a < FAINT || d > dd[i] {
+                                if a < FAINT || d > i32::from(dd[i]) {
                                     continue;
                                 }
                                 dd[i] = d_clamped;
                                 di[i] = pen;
                                 let rgb = [px[0], px[1], px[2]];
                                 if a == 255 {
-                                    dc[i] = rgb;
+                                    dc[i] = pack_rgb(rgb);
                                 } else {
-                                    dc[i] = blend565_with(table, rgb, dc[i], a);
+                                    dc[i] = blend565_packed(table, rgb, dc[i], a);
                                 }
                             }
                         }
@@ -1616,7 +1872,7 @@ impl CanvasBand<'_> {
                         continue;
                     }
                     let d = row_depth(py as i32);
-                    let d_clamped = d.clamp(0, EMPTY);
+                    let d_clamped = clamp_depth(d);
                     let src_row = iy * img_w;
                     let dst_base = (py - self.y0) * width + x0;
                     for span in row_spans {
@@ -1633,22 +1889,22 @@ impl CanvasBand<'_> {
                         let di = &mut self.ids[dst_off..dst_off + len];
                         if span.all_opaque {
                             for i in 0..len {
-                                if d <= dd[i] {
+                                if d <= i32::from(dd[i]) {
                                     let px = src_px[i];
                                     dd[i] = d_clamped;
                                     di[i] = pen;
-                                    dc[i] = [
+                                    dc[i] = pack_rgb([
                                         tr[usize::from(px[0] >> 3)],
                                         tg[usize::from(px[1] >> 2)],
                                         tb[usize::from(px[2] >> 3)],
-                                    ];
+                                    ]);
                                 }
                             }
                         } else {
                             for i in 0..len {
                                 let px = src_px[i];
                                 let a = px[3];
-                                if a < FAINT || d > dd[i] {
+                                if a < FAINT || d > i32::from(dd[i]) {
                                     continue;
                                 }
                                 dd[i] = d_clamped;
@@ -1659,9 +1915,9 @@ impl CanvasBand<'_> {
                                     tb[usize::from(px[2] >> 3)],
                                 ];
                                 if a == 255 {
-                                    dc[i] = rgb;
+                                    dc[i] = pack_rgb(rgb);
                                 } else {
-                                    dc[i] = blend565_with(table, rgb, dc[i], a);
+                                    dc[i] = blend565_packed(table, rgb, dc[i], a);
                                 }
                             }
                         }
@@ -1717,6 +1973,7 @@ impl CanvasBand<'_> {
         let rgba = image.rgba.as_chunks::<4>().0;
         let table = blend_table();
         let lt = light::tables();
+        let pen = encode_id(pen);
         let ix_min = (x0 as i64 - ax) as usize + left_skip;
         let ix_max = ix_min + (x1 - x0);
         for py in y0..y1 {
@@ -1726,7 +1983,7 @@ impl CanvasBand<'_> {
                 continue;
             }
             let d = row_depth(py as i32);
-            let d_clamped = d.clamp(0, EMPTY);
+            let d_clamped = clamp_depth(d);
             let src_row = iy * img_w;
             let dst_base = (py - self.y0) * width + x0;
             for span in row_spans {
@@ -1743,27 +2000,28 @@ impl CanvasBand<'_> {
                 let di = &mut self.ids[dst_off..dst_off + len];
                 if span.all_opaque {
                     for i in 0..len {
-                        if d <= dd[i] {
+                        if d <= i32::from(dd[i]) {
                             let px = src_px[i];
                             dd[i] = d_clamped;
                             di[i] = pen;
-                            dc[i] = light(s + i, iy).apply_with(lt, [px[0], px[1], px[2]]);
+                            dc[i] =
+                                pack_rgb(light(s + i, iy).apply_with(lt, [px[0], px[1], px[2]]));
                         }
                     }
                 } else {
                     for i in 0..len {
                         let px = src_px[i];
                         let a = px[3];
-                        if a < FAINT || d > dd[i] {
+                        if a < FAINT || d > i32::from(dd[i]) {
                             continue;
                         }
                         dd[i] = d_clamped;
                         di[i] = pen;
                         let rgb = light(s + i, iy).apply_with(lt, [px[0], px[1], px[2]]);
                         if a == 255 {
-                            dc[i] = rgb;
+                            dc[i] = pack_rgb(rgb);
                         } else {
-                            dc[i] = blend565_with(table, rgb, dc[i], a);
+                            dc[i] = blend565_packed(table, rgb, dc[i], a);
                         }
                     }
                 }
@@ -1792,6 +2050,7 @@ impl CanvasBand<'_> {
         }
         let table = blend_table();
         let lt = light::tables();
+        let pen = encode_id(pen);
         let width = self.width;
         let img_w = image.width;
         let rgba = image.rgba.as_chunks::<4>().0;
@@ -1804,7 +2063,7 @@ impl CanvasBand<'_> {
             if row_spans.is_empty() {
                 continue;
             }
-            let d = row_depth(py as i32).clamp(0, EMPTY);
+            let d = clamp_depth(row_depth(py as i32));
             let src_row = iy * img_w;
             let dst_base = (py - self.y0) * width + x0;
             for span in row_spans {
@@ -1837,9 +2096,9 @@ impl CanvasBand<'_> {
                         ],
                     };
                     if a5 >= 31 {
-                        dc[i] = rgb;
+                        dc[i] = pack_rgb(rgb);
                     } else {
-                        dc[i] = blend565_with(table, rgb, dc[i], a);
+                        dc[i] = blend565_packed(table, rgb, dc[i], a);
                     }
                 }
             }
@@ -1876,6 +2135,7 @@ impl CanvasBand<'_> {
         let mask_px = mask.rgba.as_chunks::<4>().0;
         let table = blend_table();
         let lt = light::tables();
+        let pen = encode_id(pen);
         let light_rows = light.level().map(|l| (&lt.r[l], &lt.g[l], &lt.b[l]));
         let ix_min = (x0 as i64 - ax) as usize + left_skip;
         let ix_max = ix_min + (x1 - x0);
@@ -1915,7 +2175,7 @@ impl CanvasBand<'_> {
                             continue;
                         }
                         let d = depth(px_start + i as i32, sy);
-                        if d > dd[i].saturating_add(1) {
+                        if d > i32::from(dd[i]) + 1 {
                             continue;
                         }
                         let rgb = match light_rows {
@@ -1926,12 +2186,12 @@ impl CanvasBand<'_> {
                                 tb[usize::from(p[2] >> 3)],
                             ],
                         };
-                        dd[i] = d.clamp(0, EMPTY);
+                        dd[i] = clamp_depth(d);
                         di[i] = pen;
                         if a == 255 {
-                            dc[i] = rgb;
+                            dc[i] = pack_rgb(rgb);
                         } else {
-                            dc[i] = blend565_with(table, rgb, dc[i], a);
+                            dc[i] = blend565_packed(table, rgb, dc[i], a);
                         }
                     }
                 } else {
@@ -1948,7 +2208,7 @@ impl CanvasBand<'_> {
                             continue;
                         }
                         let d = depth(px_start + i as i32, sy);
-                        if d > dd[i].saturating_add(1) {
+                        if d > i32::from(dd[i]) + 1 {
                             continue;
                         }
                         let rgb = match light_rows {
@@ -1959,12 +2219,12 @@ impl CanvasBand<'_> {
                                 tb[usize::from(p[2] >> 3)],
                             ],
                         };
-                        dd[i] = d.clamp(0, EMPTY);
+                        dd[i] = clamp_depth(d);
                         di[i] = pen;
                         if a == 255 {
-                            dc[i] = rgb;
+                            dc[i] = pack_rgb(rgb);
                         } else {
-                            dc[i] = blend565_with(table, rgb, dc[i], a);
+                            dc[i] = blend565_packed(table, rgb, dc[i], a);
                         }
                     }
                 }
@@ -2002,6 +2262,7 @@ impl CanvasBand<'_> {
         let mask_px = mask.rgba.as_chunks::<4>().0;
         let table = blend_table();
         let lt = light::tables();
+        let pen = encode_id(pen);
         let ix_min = (x0 as i64 - ax) as usize + left_skip;
         let ix_max = ix_min + (x1 - x0);
         for py in y0..y1 {
@@ -2047,16 +2308,16 @@ impl CanvasBand<'_> {
                         continue;
                     }
                     let d = depth(px_start + i as i32, sy);
-                    if d > dd[i].saturating_add(1) {
+                    if d > i32::from(dd[i]) + 1 {
                         continue;
                     }
                     let rgb = light(s + i, iy).apply_with(lt, [p[0], p[1], p[2]]);
-                    dd[i] = d.clamp(0, EMPTY);
+                    dd[i] = clamp_depth(d);
                     di[i] = pen;
                     if a == 255 {
-                        dc[i] = rgb;
+                        dc[i] = pack_rgb(rgb);
                     } else {
-                        dc[i] = blend565_with(table, rgb, dc[i], a);
+                        dc[i] = blend565_packed(table, rgb, dc[i], a);
                     }
                 }
             }
@@ -2092,6 +2353,7 @@ impl CanvasBand<'_> {
         let depth_bytes = image.depth.as_deref();
         let table = blend_table();
         let lt = light::tables();
+        let pen = encode_id(pen);
         let light_rows = light.level().map(|l| (&lt.r[l], &lt.g[l], &lt.b[l]));
         let ix_base = (x0 as i64 - ax) as usize + left_skip;
         let ix_end = ix_base + (x1 - x0);
@@ -2128,13 +2390,13 @@ impl CanvasBand<'_> {
                                     let Some(d) = depth(px_start + i as i32, sy, byte) else {
                                         continue;
                                     };
-                                    if d > dd[i].saturating_add(slack) {
+                                    if d > i32::from(dd[i]).saturating_add(slack) {
                                         continue;
                                     }
                                     let px = src_px[i];
-                                    dd[i] = d.clamp(0, EMPTY);
+                                    dd[i] = clamp_depth(d);
                                     di[i] = pen;
-                                    dc[i] = [px[0], px[1], px[2]];
+                                    dc[i] = pack_rgb([px[0], px[1], px[2]]);
                                 }
                             }
                             Some((tr, tg, tb)) => {
@@ -2145,17 +2407,17 @@ impl CanvasBand<'_> {
                                     let Some(d) = depth(px_start + i as i32, sy, byte) else {
                                         continue;
                                     };
-                                    if d > dd[i].saturating_add(slack) {
+                                    if d > i32::from(dd[i]).saturating_add(slack) {
                                         continue;
                                     }
                                     let px = src_px[i];
-                                    dd[i] = d.clamp(0, EMPTY);
+                                    dd[i] = clamp_depth(d);
                                     di[i] = pen;
-                                    dc[i] = [
+                                    dc[i] = pack_rgb([
                                         tr[usize::from(px[0] >> 3)],
                                         tg[usize::from(px[1] >> 2)],
                                         tb[usize::from(px[2] >> 3)],
-                                    ];
+                                    ]);
                                 }
                             }
                         }
@@ -2171,7 +2433,7 @@ impl CanvasBand<'_> {
                             let Some(d) = depth(px_start + i as i32, sy, byte) else {
                                 continue;
                             };
-                            if d > dd[i].saturating_add(slack) {
+                            if d > i32::from(dd[i]).saturating_add(slack) {
                                 continue;
                             }
                             let rgb = match light_rows {
@@ -2182,12 +2444,12 @@ impl CanvasBand<'_> {
                                     tb[usize::from(px[2] >> 3)],
                                 ],
                             };
-                            dd[i] = d.clamp(0, EMPTY);
+                            dd[i] = clamp_depth(d);
                             di[i] = pen;
                             if a == 255 {
-                                dc[i] = rgb;
+                                dc[i] = pack_rgb(rgb);
                             } else {
-                                dc[i] = blend565_with(table, rgb, dc[i], a);
+                                dc[i] = blend565_packed(table, rgb, dc[i], a);
                             }
                         }
                     }
@@ -2218,7 +2480,7 @@ impl CanvasBand<'_> {
                         let Some(d) = depth(px_start + i as i32, sy, byte) else {
                             continue;
                         };
-                        if d > dd[i].saturating_add(slack) {
+                        if d > i32::from(dd[i]).saturating_add(slack) {
                             continue;
                         }
                         let rgb = match light_rows {
@@ -2229,12 +2491,12 @@ impl CanvasBand<'_> {
                                 tb[usize::from(px[2] >> 3)],
                             ],
                         };
-                        dd[i] = d.clamp(0, EMPTY);
+                        dd[i] = clamp_depth(d);
                         di[i] = pen;
                         if span.all_opaque || a == 255 {
-                            dc[i] = rgb;
+                            dc[i] = pack_rgb(rgb);
                         } else {
-                            dc[i] = blend565_with(table, rgb, dc[i], a);
+                            dc[i] = blend565_packed(table, rgb, dc[i], a);
                         }
                     }
                 }
@@ -2269,6 +2531,7 @@ impl CanvasBand<'_> {
         let rgba = image.rgba.as_chunks::<4>().0;
         let depth_bytes = image.depth.as_deref();
         let table = blend_table();
+        let pen = encode_id(pen);
         let ix_base = (x0 as i64 - ax) as usize + left_skip;
         let ix_end = ix_base + (x1 - x0);
         for py in y0..y1 {
@@ -2313,16 +2576,16 @@ impl CanvasBand<'_> {
                     let Some(d) = depth(px_start + i as i32, sy, byte) else {
                         continue;
                     };
-                    if d > dd[i].saturating_add(slack) {
+                    if d > i32::from(dd[i]).saturating_add(slack) {
                         continue;
                     }
                     let rgb = tint_blocked([px[0], px[1], px[2]]);
-                    dd[i] = d.clamp(0, EMPTY);
+                    dd[i] = clamp_depth(d);
                     di[i] = pen;
                     if span.all_opaque || a == 255 {
-                        dc[i] = rgb;
+                        dc[i] = pack_rgb(rgb);
                     } else {
-                        dc[i] = blend565_with(table, rgb, dc[i], a);
+                        dc[i] = blend565_packed(table, rgb, dc[i], a);
                     }
                 }
             }
@@ -2358,9 +2621,10 @@ impl CanvasBand<'_> {
             let dst_color = &mut self.color[dst_off..dst_off + len];
             for i in 0..len {
                 if let Some(s) = mask.shade(mx_base + i, my, strength)
-                    && dst_depth[i] >= at_least
+                    && i32::from(dst_depth[i]) >= at_least
                 {
-                    dst_color[i] = Light::from_sum(s).apply_with(lt, dst_color[i]);
+                    dst_color[i] =
+                        pack_rgb(Light::from_sum(s).apply_with(lt, unpack_rgb(dst_color[i])));
                 }
             }
         }
@@ -2445,15 +2709,15 @@ mod tests {
             false,
             |_, _, _| 20,
         );
-        assert_eq!(c.color[5], [255, 0, 0]);
-        assert_eq!(c.color[10], [0, 255, 0]);
+        assert_eq!(unpack_rgb(c.color[5]), [255, 0, 0]);
+        assert_eq!(unpack_rgb(c.color[10]), [0, 255, 0]);
         c.draw(
             &image(1, 1, [0, 0, 255, 255], None),
             [1, 1],
             false,
             |_, _, _| 10,
         );
-        assert_eq!(c.color[5], [0, 0, 255]);
+        assert_eq!(unpack_rgb(c.color[5]), [0, 0, 255]);
         assert_eq!(c.depth[5], 10);
     }
 
@@ -2466,8 +2730,11 @@ mod tests {
             false,
             |_, _, _| 5,
         );
-        assert_eq!(c.color[0], blend565([255, 255, 255], [0, 0, 0], 128));
-        assert_eq!(c.color[0], [132, 130, 132]);
+        assert_eq!(
+            unpack_rgb(c.color[0]),
+            blend565([255, 255, 255], [0, 0, 0], 128)
+        );
+        assert_eq!(unpack_rgb(c.color[0]), [132, 130, 132]);
         assert_eq!(c.depth[0], 5);
         // Farther and opaque, drawn later: hidden by the soft edge.
         c.draw(
@@ -2476,7 +2743,7 @@ mod tests {
             false,
             |_, _, _| 10,
         );
-        assert_eq!(c.color[0], [132, 130, 132]);
+        assert_eq!(unpack_rgb(c.color[0]), [132, 130, 132]);
         // Nearer: drawn over it.
         c.draw(
             &image(1, 1, [0, 255, 0, 255], None),
@@ -2484,7 +2751,7 @@ mod tests {
             false,
             |_, _, _| 1,
         );
-        assert_eq!(c.color[0], [0, 255, 0]);
+        assert_eq!(unpack_rgb(c.color[0]), [0, 255, 0]);
     }
 
     #[test]
@@ -2530,14 +2797,17 @@ mod tests {
             false,
             |_, _, _| 5,
         );
-        assert_eq!((c.color[0], c.depth[0]), ([0, 0, 0], EMPTY));
+        assert_eq!(
+            (unpack_rgb(c.color[0]), c.depth[0]),
+            ([0, 0, 0], EMPTY_DEPTH)
+        );
         c.draw(
             &image(1, 1, [255, 255, 255, FAINT], None),
             [0, 0],
             false,
             |_, _, _| 5,
         );
-        assert_ne!(c.color[0], [0, 0, 0]);
+        assert_ne!(unpack_rgb(c.color[0]), [0, 0, 0]);
         assert_eq!(c.depth[0], 5);
         // File alpha 8 of 31 (8 * 255 / 31 = 65) is the faintest drawn.
         assert_eq!(FAINT, (8 * 255 / 31) as u8);
@@ -2556,11 +2826,15 @@ mod tests {
             );
             c.draw_wall(&wall, [0, 0], Light::FULL, |_, _| d);
             let expected = if wins {
-                ([0, 255, 0], d)
+                ([0, 255, 0], d as u16)
             } else {
-                ([255, 0, 0], 10)
+                ([255, 0, 0], 10u16)
             };
-            assert_eq!((c.color[0], c.depth[0]), expected, "wall at {d}");
+            assert_eq!(
+                (unpack_rgb(c.color[0]), c.depth[0]),
+                expected,
+                "wall at {d}"
+            );
         }
         for (d, wins) in [(9, true), (10, true), (11, false)] {
             let mut c = Canvas::new(1, 1, [0, 0, 0]);
@@ -2572,11 +2846,15 @@ mod tests {
             );
             c.draw(&wall, [0, 0], false, |_, _, _| d);
             let expected = if wins {
-                ([0, 255, 0], d)
+                ([0, 255, 0], d as u16)
             } else {
-                ([255, 0, 0], 10)
+                ([255, 0, 0], 10u16)
             };
-            assert_eq!((c.color[0], c.depth[0]), expected, "sprite at {d}");
+            assert_eq!(
+                (unpack_rgb(c.color[0]), c.depth[0]),
+                expected,
+                "sprite at {d}"
+            );
         }
         // A pixel whose depth function gives None is not drawn.
         let mut c = Canvas::new(1, 1, [0, 0, 0]);
@@ -2599,7 +2877,7 @@ mod tests {
             false,
             |_, _, _| Some(5),
         );
-        assert_eq!(c.color[0], quantize565([156, 108, 108]));
+        assert_eq!(unpack_rgb(c.color[0]), quantize565([156, 108, 108]));
         assert_eq!(c.depth[0], 5);
     }
 
@@ -2614,20 +2892,23 @@ mod tests {
             assert!(!c.passes(x, y, 0));
             assert!(!c.put(x, y, [255, 255, 255, 255], 0));
         }
-        assert_eq!(c.color, vec![[0, 0, 0], [10, 20, 30], [0, 0, 0], [0, 0, 0]]);
-        assert_eq!(c.depth, vec![EMPTY, 100, EMPTY, EMPTY]);
+        assert_eq!(
+            c.color_rgb(),
+            vec![[0, 0, 0], [10, 20, 30], [0, 0, 0], [0, 0, 0]]
+        );
+        assert_eq!(c.depth, vec![EMPTY_DEPTH, 100, EMPTY_DEPTH, EMPTY_DEPTH]);
         // A tie wins; a soft pixel straight-alpha blends and writes its depth
         // without passing through the SPR2 5-5-5 lookup table.
         assert!(c.passes(1, 0, 100) && !c.passes(1, 0, 101));
         assert!(c.put(1, 0, [255, 255, 255, 255], 100));
         assert!(c.put(0, 1, [255, 255, 255, 128], -7));
-        assert_eq!(c.color[1], [255, 255, 255]);
-        assert_eq!((c.color[2], c.depth[2]), ([128, 128, 128], 0));
+        assert_eq!(unpack_rgb(c.color[1]), [255, 255, 255]);
+        assert_eq!((unpack_rgb(c.color[2]), c.depth[2]), ([128, 128, 128], 0));
         // Odd 6-bit green is preserved on mesh pixels (whereas sprite blits
         // drop green's low bit through `blend565`).
         let mut g = Canvas::new(1, 1, [0, 4, 0]);
         assert!(g.put(0, 0, [0, 4, 0, 128], 10));
-        assert_eq!(g.color[0], [0, 4, 0]);
+        assert_eq!(unpack_rgb(g.color[0]), [0, 4, 0]);
     }
 
     #[test]
@@ -2637,7 +2918,7 @@ mod tests {
         img.rgba[0] = 200;
         img.depth.as_mut().unwrap()[0] = 7;
         c.draw(&img, [0, 0], true, |x, _, b| x * 100 + i32::from(b));
-        assert_eq!(c.color[2], [200, 9, 9]);
+        assert_eq!(unpack_rgb(c.color[2]), [200, 9, 9]);
         assert_eq!(c.depth, vec![0, 100, 207]);
     }
 
@@ -2650,7 +2931,10 @@ mod tests {
             false,
             |_, _, _| 0,
         );
-        assert_eq!(c.color, vec![[1, 2, 3], [1, 2, 3], [0, 0, 0], [0, 0, 0]]);
+        assert_eq!(
+            c.color_rgb(),
+            vec![[1, 2, 3], [1, 2, 3], [0, 0, 0], [0, 0, 0]]
+        );
     }
 
     /// Each pixel's light comes from its place in the image, also where
@@ -2665,8 +2949,8 @@ mod tests {
             |x, y| if (x, y) == (2, 0) { Light::FULL } else { dark },
             |_, _, _| Some(0),
         );
-        assert_eq!(c.color[0], dark.apply([200; 3]));
-        assert_eq!(c.color[1], [200; 3]);
+        assert_eq!(unpack_rgb(c.color[0]), dark.apply([200; 3]));
+        assert_eq!(unpack_rgb(c.color[1]), [200; 3]);
         assert_ne!(c.color[0], c.color[1]);
     }
 
@@ -2770,8 +3054,8 @@ mod tests {
             false,
             |_, _, _| 5,
         );
-        assert_eq!(c.color[0][1] >> 2, 1);
-        assert_eq!(c.color[1][1] >> 2, 0);
+        assert_eq!(unpack_rgb(c.color[0])[1] >> 2, 1);
+        assert_eq!(unpack_rgb(c.color[1])[1] >> 2, 0);
     }
 
     #[test]
@@ -2801,9 +3085,34 @@ mod tests {
         // 1x1 opaque sprite at (0, 0) fits inside the 1-pixel backing store.
         let one = image(1, 1, [200, 100, 50, 255], None);
         c.draw(&one, [0, 0], false, |_, _, _| 5);
-        assert_eq!(c.color[0], [200, 100, 50]);
+        assert_eq!(unpack_rgb(c.color[0]), [200, 100, 50]);
         assert_eq!(c.depth[0], 5);
         assert_eq!(c.id_at(0, 0), Some(3));
+        assert_eq!(c.id_at(1, 0), None);
+        let full_ids = c.ids();
+        assert_eq!(full_ids.id_at(0, 0), Some(3));
+        assert_eq!(full_ids.id_at(1, 0), None);
+        let mut rect_ids = Ids::default();
+        rect_ids.take_rects(&c, &[[0, 0, 4, 1]]);
+        assert_eq!(rect_ids.id_at(0, 0), Some(3));
+        assert_eq!(rect_ids.id_at(1, 0), None);
+        assert_eq!(rect_ids.stored_pixels(), 1);
+
+        // Huge declared dimensions with 1 backed pixel must never allocate for unbacked space.
+        let mut giant = Canvas::new(1, 1, [0, 0, 0]);
+        giant.set_id(Some(9));
+        giant.draw(&one, [0, 0], false, |_, _, _| 5);
+        giant.width = 100_000;
+        giant.height = 100_000;
+        let giant_full = giant.ids();
+        assert_eq!(giant_full.stored_pixels(), 1);
+        assert_eq!(giant_full.id_at(0, 0), Some(9));
+        assert_eq!(giant_full.id_at(1, 0), None);
+        let mut giant_sparse = Ids::default();
+        giant_sparse.take_rects(&giant, &[[0, 0, 100_000, 100_000]]);
+        assert_eq!(giant_sparse.stored_pixels(), 1);
+        assert_eq!(giant_sparse.id_at(0, 0), Some(9));
+        assert_eq!(giant_sparse.id_at(1, 0), None);
         // 2x1 sprite whose second pixel is transparent must also avoid
         // touching index 1 (matching origin/main's per-pixel alpha skip).
         let two = Image {
@@ -2813,7 +3122,7 @@ mod tests {
             depth: None,
         };
         c.draw(&two, [0, 0], false, |_, _, _| 4);
-        assert_eq!(c.color[0], [10, 20, 30]);
+        assert_eq!(unpack_rgb(c.color[0]), [10, 20, 30]);
         assert_eq!(c.depth[0], 4);
 
         // Wrapping `width = usize::MAX, height = 2` must skip transparent and
@@ -2835,7 +3144,7 @@ mod tests {
         }))
         .is_err();
         assert!(panicked);
-        assert_eq!(short_color.depth[1], EMPTY);
+        assert_eq!(short_color.depth[1], EMPTY_DEPTH);
         assert_eq!(short_color.id_at(1, 0), None);
 
         // `width = usize::MAX, height = 2` with 2 backing pixels must draw
@@ -2845,16 +3154,16 @@ mod tests {
         huge.width = usize::MAX;
         huge.height = 2;
         huge.draw_floor_shaded(&one, [0, 0], Some([0, 0, 1, 1]), |_, _| Light::FULL, |_| 10);
-        assert_eq!(huge.color[0], [200, 100, 50]);
+        assert_eq!(unpack_rgb(huge.color[0]), [200, 100, 50]);
         assert_eq!(huge.depth[0], 10);
         huge.plot_grass_span(-3, 0, 8, 8, [[1, 1, 1], [2, 2, 2], [3, 3, 3], [40, 50, 60]]);
-        assert_eq!(huge.color[0], [40, 50, 60]);
+        assert_eq!(unpack_rgb(huge.color[0]), [40, 50, 60]);
         assert_eq!(huge.depth[0], 8);
         huge.plot_grass_blade(1, 0, 0, 7, 7, [70, 80, 90]);
-        assert_eq!(huge.color[1], [70, 80, 90]);
+        assert_eq!(unpack_rgb(huge.color[1]), [70, 80, 90]);
         assert_eq!(huge.depth[1], 7);
         huge.plot_grass_blade(0, -3, -1, 1, 1, [9, 9, 9]);
-        assert_eq!(huge.color[0], [40, 50, 60]);
+        assert_eq!(unpack_rgb(huge.color[0]), [40, 50, 60]);
     }
 
     #[test]
@@ -2872,10 +3181,10 @@ mod tests {
             |_| 5,
         );
         assert_eq!(c.drawn(9), Some([1, 1, 9, 3]));
-        assert_eq!(c.color[12], [0, 0, 0]);
-        assert_eq!(c.color[13], [200, 100, 50]);
-        assert_eq!(c.color[14], [200, 100, 50]);
-        assert_eq!(c.color[15], [0, 0, 0]);
+        assert_eq!(unpack_rgb(c.color[12]), [0, 0, 0]);
+        assert_eq!(unpack_rgb(c.color[13]), [200, 100, 50]);
+        assert_eq!(unpack_rgb(c.color[14]), [200, 100, 50]);
+        assert_eq!(unpack_rgb(c.color[15]), [0, 0, 0]);
 
         // Combined `columns` [3, 5) and source `sub_rect` [1, 3) at x = 0 have
         // empty intersection and must draw no pixels.
@@ -2889,7 +3198,7 @@ mod tests {
             None,
             |_| 5,
         );
-        assert!(c2.color.iter().all(|&p| p == [0, 0, 0]));
+        assert!(c2.color.iter().all(|&p| p == 0));
     }
 
     #[test]
@@ -2913,11 +3222,11 @@ mod tests {
         // writes depth 500 on every drawn pixel without a Z-test.
         c.depth.fill(100);
         c.draw_water_overlay(&water, [0, 0], 1, Light::FULL, |_| 500);
-        assert_eq!(c.color[0], bg);
+        assert_eq!(unpack_rgb(c.color[0]), bg);
         assert_eq!(c.depth[0], 100);
-        assert_eq!(c.color[1], blend565([40, 80, 160], bg, 128));
+        assert_eq!(unpack_rgb(c.color[1]), blend565([40, 80, 160], bg, 128));
         assert_eq!(c.depth[1], 500);
-        assert_eq!(c.color[2], [33, 57, 82]);
+        assert_eq!(unpack_rgb(c.color[2]), [33, 57, 82]);
         assert_eq!(c.depth[2], 500);
 
         // Both draw_water_overlay (0x4c1a4a) and draw_floor_shaded_clipped (0x4c81b1)
@@ -2929,22 +3238,22 @@ mod tests {
             depth: None,
         };
         let mut clipped = Canvas::new(2, 4, bg);
-        clipped.pen = Some(42);
+        clipped.set_id(Some(42));
         clipped.draw_water_overlay(&tall_water, [0, 0], 2, Light::FULL, |_| 500);
         for row in 0..2 {
             for col in 0..2 {
                 let idx = row * 2 + col;
-                assert_eq!(clipped.color[idx], [33, 57, 82]);
+                assert_eq!(unpack_rgb(clipped.color[idx]), [33, 57, 82]);
                 assert_eq!(clipped.depth[idx], 500);
-                assert_eq!(clipped.ids[idx], Some(42));
+                assert_eq!(clipped.ids[idx], 42);
             }
         }
         for row in 2..4 {
             for col in 0..2 {
                 let idx = row * 2 + col;
-                assert_eq!(clipped.color[idx], bg);
-                assert_eq!(clipped.depth[idx], EMPTY);
-                assert_eq!(clipped.ids[idx], None);
+                assert_eq!(unpack_rgb(clipped.color[idx]), bg);
+                assert_eq!(clipped.depth[idx], EMPTY_DEPTH);
+                assert_eq!(clipped.ids[idx], ID_NONE);
             }
         }
 
@@ -2955,7 +3264,7 @@ mod tests {
             depth: None,
         };
         let mut clipped_pool = Canvas::new(2, 4, bg);
-        clipped_pool.pen = Some(77);
+        clipped_pool.set_id(Some(77));
         clipped_pool.draw_floor_shaded_clipped(
             &tall_pool,
             [0, 0],
@@ -2967,17 +3276,95 @@ mod tests {
         for row in 0..2 {
             for col in 0..2 {
                 let idx = row * 2 + col;
-                assert_eq!(clipped_pool.color[idx], [90, 174, 189]);
+                assert_eq!(unpack_rgb(clipped_pool.color[idx]), [90, 174, 189]);
                 assert_eq!(clipped_pool.depth[idx], 400);
-                assert_eq!(clipped_pool.ids[idx], Some(77));
+                assert_eq!(clipped_pool.ids[idx], 77);
             }
         }
         for row in 2..4 {
             for col in 0..2 {
                 let idx = row * 2 + col;
-                assert_eq!(clipped_pool.color[idx], bg);
-                assert_eq!(clipped_pool.depth[idx], EMPTY);
-                assert_eq!(clipped_pool.ids[idx], None);
+                assert_eq!(unpack_rgb(clipped_pool.color[idx]), bg);
+                assert_eq!(clipped_pool.depth[idx], EMPTY_DEPTH);
+                assert_eq!(clipped_pool.ids[idx], ID_NONE);
+            }
+        }
+    }
+
+    #[test]
+    fn compact_canvas_helpers_depth_clamping_and_sparse_ids_parity() {
+        // Pack / unpack roundtrip across extremes and arbitrary RGB values.
+        for rgb in [
+            [0, 0, 0],
+            [255, 255, 255],
+            [0x12, 0x34, 0x56],
+            [255, 0, 128],
+        ] {
+            assert_eq!(unpack_rgb(pack_rgb(rgb)), rgb);
+        }
+        // Depth clamping covers negative, in-range, and >65535 identically.
+        assert_eq!(clamp_depth(i32::MIN), 0);
+        assert_eq!(clamp_depth(-1), 0);
+        assert_eq!(clamp_depth(0), 0);
+        assert_eq!(clamp_depth(12345), 12345);
+        assert_eq!(clamp_depth(65535), 65535);
+        assert_eq!(clamp_depth(65536), 65535);
+        assert_eq!(clamp_depth(i32::MAX), 65535);
+
+        // Object ID 0 is valid (distinct from ID_NONE = u16::MAX).
+        let mut c = Canvas::new(8, 6, [0, 0, 0]);
+        c.set_id(Some(0));
+        c.plot(1, 1, -50, [10, 20, 30]);
+        assert_eq!(c.id_at(1, 1), Some(0));
+        assert_eq!(c.depth[8 + 1], 0);
+        // Depth > 65535 fails standard depth test against EMPTY_DEPTH (65535).
+        c.set_id(Some(5));
+        c.plot(2, 1, 65536, [40, 50, 60]);
+        assert_eq!(c.id_at(2, 1), None);
+        assert_eq!(c.depth[8 + 2], EMPTY_DEPTH);
+        // Wall with slack=1 wins at 65536 against EMPTY_DEPTH and clamps to 65535.
+        let one = image(1, 1, [40, 50, 60, 255], None);
+        c.draw_wall(&one, [2, 1], Light::FULL, |_, _| 65536);
+        assert_eq!(c.id_at(2, 1), Some(5));
+        assert_eq!(c.depth[8 + 2], EMPTY_DEPTH);
+
+        // Passing ID_NONE (u16::MAX) to set_id panics rather than silently aliasing None.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut bad = Canvas::new(1, 1, [0, 0, 0]);
+            bad.set_id(Some(ID_NONE));
+        }))
+        .is_err();
+        assert!(panicked);
+
+        // Sparse Ids::take_rects matches full Ids::take on every pixel inside the
+        // captured rects (including overlapping rects) and returns None outside.
+        c.set_id(Some(10));
+        for y in 1..4 {
+            for x in 2..5 {
+                c.plot(x, y, 100, [1, 2, 3]);
+            }
+        }
+        c.set_id(Some(20));
+        for y in 2..5 {
+            for x in 3..6 {
+                c.plot(x, y, 50, [4, 5, 6]);
+            }
+        }
+        let mut full = Ids::default();
+        full.take(&c);
+        let mut sparse = Ids::default();
+        sparse.take_rects(&c, &[[2, 1, 5, 4], [3, 2, 6, 5]]);
+        assert_eq!(sparse.stored_pixels(), 9 + 9);
+        assert_eq!(full.stored_pixels(), 8 * 6);
+        for y in -1..7 {
+            for x in -1..9 {
+                let in_rect = (2..5).contains(&x) && (1..4).contains(&y)
+                    || (3..6).contains(&x) && (2..5).contains(&y);
+                if in_rect {
+                    assert_eq!(sparse.id_at(x, y), full.id_at(x, y), "({x}, {y})");
+                } else {
+                    assert_eq!(sparse.id_at(x, y), None, "outside ({x}, {y})");
+                }
             }
         }
     }

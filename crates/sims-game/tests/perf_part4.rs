@@ -512,3 +512,228 @@ fn perf_part4_track1_measurements_and_parity() {
         "BENCH Audio: Mixer::open={mixer_open_ms:?} ms, 500x dual render+compare={render_500_ms:.2} ms (0 output buffer reallocs)"
     );
 }
+
+#[test]
+#[ignore]
+#[allow(clippy::disallowed_methods)]
+fn bench_wave_b_game_draw() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+        eprintln!("SIMS_INSTALL is not set; skipping bench_wave_b_game_draw");
+        return;
+    };
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut game = Game::open(&sims_game::Options {
+        install: root,
+        house,
+        answers: vec![3],
+        play: false,
+        frames: Frames::default(),
+    })
+    .expect("open House05");
+    game.resize([1024, 768]);
+    game.set_mode(Mode::Live);
+    // Warm up Tier-2 LotCache, People poses, HUD layout, and canvases.
+    for _ in 0..3 {
+        let _ = game.advance(50_000);
+        let _ = game.render();
+    }
+
+    // 1. Steady-state Tier-2 Game::render (plumb-bob spin while paused, LotCache Tier-2 hit).
+    let _ = game.render();
+    let steady_iters = 60usize;
+    let t0 = Instant::now();
+    for _ in 0..steady_iters {
+        let _ = game.advance(50_000);
+        let c = game.render();
+        std::hint::black_box(&c.color);
+    }
+    let steady_ms = t0.elapsed().as_secs_f64() * 1000.0 / steady_iters as f64;
+
+    // 2. Uncached pan Game::render (camera shifts each frame -> LotCache Miss + People + HUD).
+    let pan_iters = 20usize;
+    let t1 = Instant::now();
+    for i in 0..pan_iters {
+        let dx = if i % 2 == 0 { 16 } else { -16 };
+        let _ = game.apply(Move::Scroll([dx, 0]));
+        let c = game.render();
+        std::hint::black_box(&c.color);
+    }
+    let pan_ms = t1.elapsed().as_secs_f64() * 1000.0 / pan_iters as f64;
+
+    println!(
+        "BENCH_GAME_DRAW 1024x768 steady(Tier-2): {steady_ms:.3} ms/frame ({steady_iters} frames), uncached_pan: {pan_ms:.3} ms/frame ({pan_iters} frames)"
+    );
+}
+
+#[test]
+fn wave_b_picking_parity_and_steady_present_damage_completeness() {
+    let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+        return;
+    };
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut game = Game::open(&sims_game::Options {
+        install: root.clone(),
+        house: house.clone(),
+        answers: vec![3],
+        play: false,
+        frames: Frames::default(),
+    })
+    .expect("open House05");
+    game.resize([1024, 768]);
+    game.set_mode(Mode::Live);
+    let _ = game.run(100);
+    // First render populates LotCache (Miss -> Tier-2 stored); second render hits Tier-2.
+    let _ = game.render();
+    let _ = game.render();
+
+    assert!(
+        game.lot_depth_from_cache(),
+        "cached draw must borrow lot depth directly from LotCache without cloning"
+    );
+    let sparse_bytes = game.people_ids_stored_pixels() * std::mem::size_of::<u16>();
+    assert!(
+        sparse_bytes < 40_000,
+        "sparse people_ids should be <40 KB at 1024x768 (was 3.15 MB), got {sparse_bytes} bytes"
+    );
+
+    // Build an independent full-screen reference (cloned lot_depth + full-screen Ids::take).
+    let (cw, ch) = (game.canvas().width, game.canvas().height);
+    let viewport = game.house_viewport_size();
+    let install = Install::detect(&root).expect("detect install");
+    let mut index = Index::build(&install).expect("build index");
+    let nbhd_dir = house.parent().and_then(|p| p.parent()).expect("nbhd dir");
+    let nbhd = sims_content::Neighborhood::open(nbhd_dir).expect("open neighborhood");
+    if let Some(chars) = nbhd.characters().expect("characters") {
+        index.add_characters(&chars).expect("add characters");
+    }
+    let catalog = Catalog::build(&index).expect("build catalog");
+    let mut ref_assets = sims_render::Assets::new(&install, index, catalog).expect("render assets");
+    let mut ref_people = sims_game::people::People::open(&root, &house).expect("open people");
+    let world = game.lot().world();
+    ref_people.refresh(world);
+    let lot_shape = sims_render::Lot::from_world(world)
+        .expect("lot shape")
+        .with_floor_rotation(game.lot().floor_rotation());
+    let cam = game.view.camera;
+    let render_options = sims_render::RenderOptions {
+        shadows: game.options().graphics.shadows,
+        lighting: game.options().graphics.lighting,
+    };
+    let mut ref_canvas = sims_render::Canvas::new(cw, ch, [0, 0, 0]);
+    sims_render::draw_lot_with_preview_and_options(
+        world,
+        &lot_shape,
+        &mut ref_assets,
+        &cam,
+        viewport,
+        None,
+        render_options,
+        &mut ref_canvas,
+    );
+    let ref_lot_depth = ref_canvas.depth.clone();
+    assert_eq!(
+        game.lot_depth_slice(),
+        ref_lot_depth.as_slice(),
+        "borrowed LotCache depth must be bit-for-bit identical to full-screen lot_depth clone"
+    );
+    ref_people.set_clock(0);
+    ref_people.draw_in_viewport(world, &cam, viewport, &mut ref_canvas);
+    let ref_people_ids = ref_canvas.ids();
+    sims_render::draw_held_with_options(
+        world,
+        &lot_shape,
+        &mut ref_assets,
+        &cam,
+        render_options,
+        &mut ref_canvas,
+    );
+
+    // Verify 100% identical `Game::under` results across:
+    // 1. Every single pixel where a Sim or plumb bob is drawn (plus neighbors),
+    // 2. Every 4th pixel across the full 1024×768 frame.
+    let mut checked_people_pixels = 0usize;
+    let mut checked_grid_pixels = 0usize;
+    for y in 0..ch as i32 {
+        for x in 0..cw as i32 {
+            let is_noted = sims_game::pick::noted(world, &cam, &ref_people_ids, [x, y]).is_some();
+            if is_noted || (x % 4 == 0 && y % 4 == 0) {
+                let got = game.under([x, y]);
+                let want = sims_game::pick::at(
+                    game.lot(),
+                    &cam,
+                    &ref_canvas,
+                    &ref_lot_depth,
+                    &ref_people_ids,
+                    [x, y],
+                );
+                assert_eq!(
+                    got, want,
+                    "Game::under mismatch at ({x}, {y}) (is_noted={is_noted})"
+                );
+                if is_noted {
+                    checked_people_pixels += 1;
+                } else {
+                    checked_grid_pixels += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        checked_people_pixels > 500,
+        "expected >500 Sim/bob pixels checked, got {checked_people_pixels}"
+    );
+    assert!(checked_grid_pixels > 40_000);
+
+    // Verify steady-state present_damage completeness:
+    // Pause and settle non-zero clock animations, then advance 34 ms (between
+    // 42 ms normal-speed ticks, spinning the 30 FPS plumb bob without running a
+    // tick), and assert EVERY differing pixel across all 786,432 pixels lies
+    // inside the reported `present_damage` rects.
+    if !game.paused() {
+        game.toggle_pause();
+    }
+    let _ = game.advance(1_000);
+    let _ = game.render();
+    let _ = game.advance(1_000);
+    let _ = game.render();
+    // Restart pace so the next 34 ms step runs 0 simulation ticks while rotating the plumb bob.
+    game.pace.restart();
+    let before_color = game.canvas().color.clone();
+    game.on_presented();
+    let (ran, _) = game.advance_while(34_000, 34_000, |_| true);
+    assert_eq!(ran, 0, "34 ms step must run 0 ticks at 42 ms/tick");
+    let after_color = game.render().color.clone();
+    let damage = game
+        .peek_present_damage()
+        .expect("steady plumb-bob spin frame should produce bounded present_damage");
+    assert!(!damage.is_empty(), "damage list must cover dynamic rects");
+    let mut diff_pixels = 0usize;
+    for y in 0..ch {
+        for x in 0..cw {
+            let idx = y * cw + x;
+            if before_color[idx] != after_color[idx] {
+                diff_pixels += 1;
+                let (xi, yi) = (x as i32, y as i32);
+                let covered = damage
+                    .iter()
+                    .any(|&[x0, y0, x1, y1]| xi >= x0 && xi < x1 && yi >= y0 && yi < y1);
+                assert!(
+                    covered,
+                    "changed pixel ({x}, {y}) not covered by present_damage {damage:?}"
+                );
+            }
+        }
+    }
+    assert!(
+        diff_pixels > 0,
+        "expected spinning plumb bob to change pixels between frames"
+    );
+    let damage_area: i64 = damage
+        .iter()
+        .map(|&[x0, y0, x1, y1]| i64::from((x1 - x0).max(0)) * i64::from((y1 - y0).max(0)))
+        .sum();
+    assert!(
+        damage_area < (cw * ch) as i64 / 4,
+        "steady-state partial damage area ({damage_area} px) should be a small fraction of full screen"
+    );
+}

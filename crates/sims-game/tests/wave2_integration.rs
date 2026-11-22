@@ -936,7 +936,7 @@ fn wave2_loading_screen_transitions_and_simlish_voices() {
     let cap0 = shell.loading_screen().caption_index();
     shell.render();
     let frame0 = shell.canvas().color.clone();
-    assert!(frame0.iter().any(|&rgb| rgb != [0, 0, 0]));
+    assert!(frame0.iter().any(|&rgb| rgb != 0));
     assert!(
         shell
             .take_audio_inputs()
@@ -960,7 +960,7 @@ fn wave2_loading_screen_transitions_and_simlish_voices() {
         [800, 600],
     );
     assert_eq!((standalone.width, standalone.height), (800, 600));
-    assert!(standalone.color.iter().any(|&rgb| rgb != [0, 0, 0]));
+    assert!(standalone.color.iter().any(|&rgb| rgb != 0));
 
     shell.finish_loading();
     assert_eq!(shell.screen(), ScreenKind::Neighborhood);

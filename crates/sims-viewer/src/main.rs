@@ -261,15 +261,10 @@ impl Viewer {
         let scale = scale as usize;
         for y in 0..bh {
             let cy = (y / scale).min(self.canvas.height.saturating_sub(1));
+            let row = cy * self.canvas.width;
             for x in 0..bw {
                 let cx = (x / scale).min(self.canvas.width.saturating_sub(1));
-                let [r, g, b] = self
-                    .canvas
-                    .color
-                    .get(cy * self.canvas.width + cx)
-                    .copied()
-                    .unwrap_or([0, 0, 0]);
-                buffer[y * bw + x] = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+                buffer[y * bw + x] = self.canvas.color.get(row + cx).copied().unwrap_or(0);
             }
         }
         let _ = buffer.present();

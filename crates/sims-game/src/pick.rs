@@ -42,7 +42,7 @@ use sims_vm::boot::Lot;
 
 /// The person or object the pointer at `point` (canvas pixels) is on in
 /// `canvas`, the frame last drawn of `lot` through `camera`. Its lot left
-/// `lot_depth` (a depth per pixel, in rows of the canvas's width) before
+/// `lot_depth` (a 16-bit depth per pixel, in rows of the canvas's width) before
 /// anything else was drawn, and `people` are its IDs once the people were
 /// drawn. The answer is the person or bob drawn at the pixel ([`noted`]),
 /// else the sprite pick's object.
@@ -50,7 +50,7 @@ pub fn at(
     lot: &Lot,
     camera: &Camera,
     canvas: &Canvas,
-    lot_depth: &[i32],
+    lot_depth: &[u16],
     people: &Ids,
     point: [i32; 2],
 ) -> Option<u16> {
@@ -82,13 +82,13 @@ fn sprite(
     lot: &Lot,
     camera: &Camera,
     canvas: &Canvas,
-    lot_depth: &[i32],
+    lot_depth: &[u16],
     point: [i32; 2],
 ) -> Option<u16> {
     let [x, y] = point;
     let column = usize::try_from(x).ok().filter(|&x| x < canvas.width)?;
     let row = usize::try_from(y).ok().filter(|&y| y < canvas.height)?;
-    let depth = *lot_depth.get(row * canvas.width + column)?;
+    let depth = i32::from(*lot_depth.get(row * canvas.width + column)?);
     let world = lot.world();
     let origin_x = camera.origin[0].saturating_add(ORIGIN_COLUMN);
     let projected = [x.saturating_sub(ORIGIN_COLUMN), y];

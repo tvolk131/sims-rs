@@ -58,6 +58,10 @@ pub struct LotCache {
     env: Option<EnvEntry>,
     grass: Option<GrassEntry>,
     last_hit: CacheHit,
+    /// True iff `self.entry` holds the exact `Pass::Lot` surface of the most
+    /// recent `draw_lot_with_preview_and_options` call (false after `clear()`
+    /// or when the most recent draw bypassed caching via `!can_cache`).
+    entry_is_current: bool,
 }
 
 struct Entry {
@@ -359,6 +363,7 @@ impl LotCache {
         self.env = None;
         self.grass = None;
         self.last_hit = CacheHit::Miss;
+        self.entry_is_current = false;
     }
 
     /// Which cache tier satisfied the most recent [`LotCache::draw_lot_with_preview`] call.
@@ -367,8 +372,19 @@ impl LotCache {
     }
 
     /// Read-only view of the Tier-2 cached lot depth buffer, if populated.
-    pub fn cached_depth(&self) -> Option<&[i32]> {
+    pub fn cached_depth(&self) -> Option<&[u16]> {
         self.entry.as_ref().map(|e| e.canvas.depth.as_slice())
+    }
+
+    /// Read-only view of the lot depth buffer for the most recent
+    /// [`LotCache::draw_lot_with_preview`] call when it was cached in Tier 2.
+    /// Returns `None` if the cache was cleared or the most recent draw
+    /// bypassed caching (e.g. zero-area or undersized canvas).
+    pub fn last_lot_depth(&self) -> Option<&[u16]> {
+        self.entry
+            .as_ref()
+            .filter(|_| self.entry_is_current)
+            .map(|e| e.canvas.depth.as_slice())
     }
 
     /// Draws `Pass::Lot` into `canvas`, returning the exact [`Stats`] of
@@ -493,6 +509,7 @@ impl LotCache {
                         entry.key.camera.focus = camera.focus;
                         canvas.restore_pixels_from(&entry.canvas, background(time_of_day, house));
                         self.last_hit = CacheHit::Full;
+                        self.entry_is_current = true;
                         return entry.stats;
                     }
                 }
@@ -602,6 +619,7 @@ impl LotCache {
                     };
                     store_entry(&mut self.entry, key, canvas, stats);
                     self.last_hit = CacheHit::Environment;
+                    self.entry_is_current = true;
                     return stats;
                 }
             }
@@ -654,6 +672,7 @@ impl LotCache {
         self.last_hit = CacheHit::Miss;
 
         if !can_cache {
+            self.entry_is_current = false;
             return stats;
         }
 
@@ -726,6 +745,7 @@ impl LotCache {
             objects: collect_objects(world, assets, preview),
         };
         store_entry(&mut self.entry, key, canvas, stats);
+        self.entry_is_current = true;
         stats
     }
 }

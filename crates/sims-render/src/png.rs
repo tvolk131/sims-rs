@@ -2,14 +2,15 @@
 //! can save renders without an image library.
 
 use crate::Canvas;
+use crate::canvas::unpack_rgb;
 
 /// The canvas as a PNG file.
 pub fn encode(canvas: &Canvas) -> Vec<u8> {
     let mut raw = Vec::with_capacity((canvas.width * 3 + 1) * canvas.height);
     for row in canvas.color.chunks(canvas.width.max(1)) {
         raw.push(0);
-        for c in row {
-            raw.extend_from_slice(c);
+        for &c in row {
+            raw.extend_from_slice(&unpack_rgb(c));
         }
     }
     let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
