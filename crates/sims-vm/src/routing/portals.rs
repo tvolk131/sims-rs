@@ -258,10 +258,12 @@ impl Interpreter<'_> {
                     }
                 }
                 let from = pending.remove(best);
+                // 0x463adf..0x463b16: a null partner (`None`) skips the
+                // cross-room edge while still exploring same-room portals.
                 let partner = self.partner(world, from)?;
                 let room = word(world, from, ROOM)?;
                 for &next in &portals {
-                    if word(world, next, ROOM)? != room && next != partner {
+                    if word(world, next, ROOM)? != room && Some(next) != partner {
                         continue;
                     }
                     let own = column(world, from, ordinal)?;
@@ -338,7 +340,7 @@ impl Interpreter<'_> {
                     if through == value(NO_WAY) {
                         continue;
                     }
-                    let partner = self.partner(world, portal)?;
+                    let partner = self.require_partner(world, portal)?;
                     if self.portal_distance(world, partner, exit)? > through {
                         continue;
                     }
@@ -400,7 +402,7 @@ impl Interpreter<'_> {
             next
         };
         set_column(world, portal, ordinal, mark)?;
-        let partner = self.partner(world, portal)?;
+        let partner = self.require_partner(world, portal)?;
         set_column(world, partner, ordinal, mark)
     }
 
@@ -414,7 +416,7 @@ impl Interpreter<'_> {
     ) -> Result<(), Trap> {
         let ordinal = word(world, person, ORDINAL)?;
         set_column(world, portal, ordinal, value(FAILED))?;
-        let partner = self.partner(world, portal)?;
+        let partner = self.require_partner(world, portal)?;
         set_column(world, partner, ordinal, value(FAILED))
     }
 }
@@ -720,5 +722,36 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn portal_graph_keeps_exploring_same_room_portals_when_graphic_partner_is_missing() {
+        // 0x463adf..0x463b16: if partner(from) returns null (Ok(None)),
+        // portal_distance still explores same-room portals rather than aborting.
+        let mut prog = program();
+        // Switch the door definition (resource 2, chunk 128) to graphic pairing
+        // so solo portal 10 has partner(10) == Ok(None) while doors 12/13 and
+        // 14/15 still pair by matching word 8 (graphic 999).
+        let def = prog
+            .libraries
+            .get_mut(&2)
+            .unwrap()
+            .definitions
+            .get_mut(&128)
+            .unwrap();
+        def[69] = 1; // PAIRING = graphic
+        def[8] = 999; // shared graphic for paired tiles
+        let cat = catalog();
+        let interpreter = Interpreter::new(&prog, &cat, Stream::Lot);
+        let mut w = world();
+        // Disconnect 10 and 11 so both are solo graphic-paired portals with no partner.
+        w.next_parts.remove(&10);
+        w.objects.get_mut(&10).unwrap().multipart = None;
+        w.objects.get_mut(&11).unwrap().multipart = None;
+        assert_eq!(interpreter.partner(&w, 10), Ok(None));
+        // From 10 (room 1, no partner), same-room portal 12 (room 1) is still
+        // reachable, and through 12 <-> 13 -> 14 <-> 15 it reaches room 2!
+        let d_same_room = interpreter.portal_distance(&mut w, 10, 12).unwrap();
+        assert!(d_same_room < value(NO_WAY), "d_same_room={d_same_room:?}");
     }
 }

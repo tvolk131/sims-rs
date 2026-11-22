@@ -733,12 +733,12 @@ fn mode_2_reads_reference_level_again_after_fits_and_preserves_callback_error_ki
     for (label, node) in [
         ("unimplemented", ins(38, RETURN_TRUE, RETURN_FALSE, [0; 8])),
         (
-            "unsupported scope",
+            "unsupported job data",
             ins(
                 2,
                 RETURN_TRUE,
                 RETURN_FALSE,
-                expr(38, 0, op::EQUAL, scope::LITERAL, 0),
+                expr(33, 0, op::EQUAL, scope::LITERAL, 0),
             ),
         ),
     ] {

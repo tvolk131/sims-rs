@@ -1544,6 +1544,16 @@ impl Lot {
             self.replay_view
                 .unwrap_or((self.view_rotation, self.view_centre))
         };
+        let family_zero_members: Vec<u32> = if self.load.house != 0 && self.load.family == 0 {
+            self.world
+                .families
+                .iter()
+                .find(|f| f.id == 0)
+                .map(|f| f.members.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let interpreter = Interpreter {
             sounds: Some(&sounds),
             ui_effects: Some(&ui_effects),
@@ -1553,7 +1563,8 @@ impl Lot {
             dialog_text: Some(&dialog_text),
             character_names: Some(&character_names),
             default_character_name: Some(&self.default_character_name),
-            active_family: (self.load.house != 0 && self.load.family == 0).then_some(&[][..]),
+            active_family: (self.load.house != 0 && self.load.family == 0)
+                .then_some(family_zero_members.as_slice()),
             coop,
             ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
         };

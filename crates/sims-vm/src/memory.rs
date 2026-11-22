@@ -64,7 +64,7 @@ const SCOPE_NAMES: [&str; 39] = [
     "stack object's callback",
     "my type attribute",
     "stack object's type attribute",
-    "scope 38",
+    "neighbor's definition",
 ];
 
 /// A scope's name, for messages.
@@ -105,10 +105,6 @@ fn bounded(index: i16, count: usize, code: u16) -> Result<usize, Trap> {
         .ok()
         .filter(|&i| i < count)
         .ok_or(Trap::native(code, "memory index out of bounds"))
-}
-
-fn unsupported(scope: u8) -> Trap {
-    Trap::UnsupportedScope { scope }
 }
 
 impl Machine<'_, '_> {
@@ -641,9 +637,33 @@ impl Machine<'_, '_> {
                     .ok_or(Trap::native(0x3c, "neighborhood data index out of bounds"))?;
                 Cell::Literal(self.world.neighborhood_data[i])
             }
-            // Scope 38 needs state the simulation doesn't hold yet.
+            // Neighbor's object definition as words (0x454304): the neighbor
+            // record the stack object names (native error 0x37 if missing),
+            // then word `index` of its linked definition's 108 words (native
+            // error 0x23 if out of bounds), as a read-only value with no word
+            // pointer.
             38 => {
-                return Err(unsupported(scope));
+                let record = self
+                    .world
+                    .neighbors
+                    .get(stack_object)
+                    .ok_or(Trap::native(0x37, "missing neighbor"))?;
+                let index = bounded(index, DEFINITION_WORDS, 0x23)?;
+                if self
+                    .catalog
+                    .objects
+                    .iter()
+                    .filter(|o| o.guid == record.guid)
+                    .count()
+                    > 1
+                {
+                    return Err(Trap::Unsupported(format!(
+                        "scope 38 (0x454304) for neighbor GUID 0x{:08X}, which more than one \
+                         definition names: the neighbor's linked definition pointer is not kept",
+                        record.guid
+                    )));
+                }
+                Cell::Literal(self.definition_word(record.guid, index)?)
             }
             2 | 5 | 39..=255 => return Err(Trap::native(9, "invalid memory scope")),
         };
@@ -810,6 +830,66 @@ impl Machine<'_, '_> {
                 *slot = host_selected.map_or(0, |id| id as i16);
             }
             return Ok(true);
+        }
+        if let Cell::Data(id, 1) = cell {
+            let old = self
+                .world
+                .objects
+                .get(&id)
+                .and_then(|o| o.data.get(1).copied());
+            if let Some(prev) = old
+                && self.interpreter().facing_change_shifts_held_person_offset(
+                    self.world,
+                    id,
+                    i32::from(prev),
+                    i32::from(value),
+                )
+            {
+                return Err(Trap::Unsupported(
+                    "writing facing of a container holding a person in a slot with horizontal \
+                     offset (0x454ceb / 0x5921f0), whose stored animator offset is not kept"
+                        .into(),
+                ));
+            }
+        } else if let Cell::Data(id, index @ (2 | 3)) = cell
+            && let Some(object) = self.world.objects.get(&id)
+            && object.person.is_some()
+        {
+            let interpreter = self.interpreter();
+            let old_offset = interpreter.container_animator_offset(self.world, object);
+            let new_container_word = if index == 2 {
+                value
+            } else {
+                object.data.get(2).copied().unwrap_or(0)
+            };
+            let new_slot_word = if index == 3 {
+                value
+            } else {
+                object.data.get(3).copied().unwrap_or(-1)
+            };
+            let new_offset = u16::try_from(new_container_word)
+                .ok()
+                .filter(|&c| c > 0)
+                .and_then(|container_id| {
+                    let slot_index = usize::try_from(new_slot_word).ok()?;
+                    let facing = i32::from(
+                        self.world
+                            .objects
+                            .get(&container_id)?
+                            .data
+                            .get(1)
+                            .copied()
+                            .unwrap_or(0),
+                    );
+                    interpreter.slot_animator_offset(self.world, container_id, slot_index, facing)
+                });
+            if old_offset != new_offset {
+                return Err(Trap::Unsupported(
+                    "writing container/slot data directly on a person in a horizontal-offset slot \
+                     (0x454ceb / 0x5921f0), whose stored animator offset is not kept"
+                        .into(),
+                ));
+            }
         }
         let world = &mut *self.world;
         let target = match cell {

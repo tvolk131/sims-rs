@@ -164,6 +164,29 @@ impl Clip {
         repeat: bool,
         weight: f32,
     ) {
+        self.apply_with_interpolation(skeleton, pose, phase, repeat, true, None, weight);
+    }
+
+    /// Like [`Clip::apply`], honoring `cAnimLayer::Update`'s per-layer
+    /// `interpolate` flag (`0x597f1b`–`0x597f38`, `0x59844d`–`0x5985f8`):
+    /// when `interpolate` is `false`, each motion snaps directly to the
+    /// layer-wide frame index `floor(phase * layer_frames)` (`0x597ebb`–`0x597f18`,
+    /// reused across translation and rotation at `0x59846e` / `0x59852c`,
+    /// falling back to `motion.frames` when `layer_frames` is `None` and
+    /// clamped to `motion.frames - 1`) without blending toward the next
+    /// keyframe (still blending by `weight` over the existing pose when
+    /// `weight < 1`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_with_interpolation(
+        &self,
+        skeleton: &Skeleton,
+        pose: &mut Pose,
+        phase: f32,
+        repeat: bool,
+        interpolate: bool,
+        layer_frames: Option<u32>,
+        weight: f32,
+    ) {
         let weight = if weight.is_finite() {
             weight.clamp(0.0, 1.0)
         } else {
@@ -172,6 +195,19 @@ impl Clip {
         if weight == 0.0 {
             return;
         }
+        let shared_snapped = (!interpolate)
+            .then(|| {
+                layer_frames.filter(|&f| f > 0).map(|lf| {
+                    let lf_usize = lf as usize;
+                    let pos = if phase.is_finite() {
+                        phase.clamp(0.0, 1.0) * lf as f32
+                    } else {
+                        0.0
+                    };
+                    (pos.floor() as usize).min(lf_usize - 1)
+                })
+            })
+            .flatten();
         for motion in &self.animation.motions {
             let Some(bone) = rig::bone(skeleton, &motion.bone) else {
                 continue;
@@ -185,20 +221,32 @@ impl Clip {
             } else {
                 0.0
             };
-            let first = (position.floor() as usize).min(frames - 1);
-            let second = if first + 1 < frames {
-                first + 1
-            } else if repeat {
-                0
-            } else {
-                first
+            let first = match shared_snapped {
+                Some(idx) => idx.min(frames - 1),
+                None => (position.floor() as usize).min(frames - 1),
             };
-            let blend = (position - first as f32).clamp(0.0, 1.0);
+            let (second, blend) = if interpolate {
+                let second = if first + 1 < frames {
+                    first + 1
+                } else if repeat {
+                    0
+                } else {
+                    first
+                };
+                let blend = (position - first as f32).clamp(0.0, 1.0);
+                (second, blend)
+            } else {
+                (first, 0.0)
+            };
             let local = &mut pose.local[bone];
             if let Some(start) = motion.translation {
                 let at = |f: usize| self.samples.translations.get(start as usize + f).copied();
                 if let (Some(a), Some(b)) = (at(first), at(second)) {
-                    let t = rig::position(a).lerp(rig::position(b), blend);
+                    let t = if interpolate {
+                        rig::position(a).lerp(rig::position(b), blend)
+                    } else {
+                        rig::position(a)
+                    };
                     local.translation = if weight < 1.0 {
                         local.translation.lerp(t, weight)
                     } else {
@@ -209,7 +257,11 @@ impl Clip {
             if let Some(start) = motion.rotation {
                 let at = |f: usize| self.samples.rotations.get(start as usize + f).copied();
                 if let (Some(a), Some(b)) = (at(first), at(second)) {
-                    let r = rig::rotation(a).nlerp(rig::rotation(b), blend);
+                    let r = if interpolate {
+                        rig::rotation(a).nlerp(rig::rotation(b), blend)
+                    } else {
+                        rig::rotation(a)
+                    };
                     local.rotation = if weight < 1.0 {
                         local.rotation.nlerp(r, weight)
                     } else {
@@ -303,5 +355,90 @@ mod tests {
         assert_eq!(at(2.0), Vec3::new(0.0, 3.0, 0.0));
         assert_eq!(at(-1.0), below);
         assert_eq!(at(f32::NAN), Vec3::new(0.0, 3.0, 0.0));
+    }
+
+    #[test]
+    fn apply_with_interpolation_false_snaps_to_floor_and_keeps_weight_blend() {
+        let skeleton = rig::tests::skeleton();
+        let mut clip = clip();
+        clip.animation.rotation_count = 2;
+        clip.animation.motions[0].rotation = Some(0);
+        let q0 = [0.0, 0.0, 0.0, 1.0];
+        let half = std::f32::consts::FRAC_1_SQRT_2;
+        let q1 = [0.0, half, 0.0, half];
+        clip.samples.rotations = vec![q0, q1];
+
+        // Phase 0.25 -> position 0.5 (halfway between frame 0 and frame 1).
+        let mut snapped = Pose::rest(&skeleton);
+        clip.apply_with_interpolation(&skeleton, &mut snapped, 0.25, false, false, Some(2), 1.0);
+        assert_eq!(snapped.local[1].translation, Vec3::new(0.0, 1.0, 0.0));
+        assert_eq!(snapped.local[1].rotation, rig::rotation(q0));
+
+        // Phase 0.75 on a repeating clip -> position 1.5; without interpolation
+        // it snaps to frame 1 instead of wrapping back toward frame 0.
+        let mut snapped_repeat = Pose::rest(&skeleton);
+        clip.apply_with_interpolation(
+            &skeleton,
+            &mut snapped_repeat,
+            0.75,
+            true,
+            false,
+            Some(2),
+            1.0,
+        );
+        assert_eq!(
+            snapped_repeat.local[1].translation,
+            Vec3::new(0.0, 3.0, 0.0)
+        );
+        assert_eq!(snapped_repeat.local[1].rotation, rig::rotation(q1));
+
+        // Weight < 1 still blends the snapped keyframe over the pose below.
+        let mut weighted = Pose::rest(&skeleton);
+        clip.apply_with_interpolation(&skeleton, &mut weighted, 0.75, true, false, Some(2), 0.5);
+        assert_eq!(weighted.local[1].translation, Vec3::new(0.0, 2.0, 0.0));
+        assert_ne!(weighted.local[1].rotation, rig::rotation(q0));
+        assert_ne!(weighted.local[1].rotation, rig::rotation(q1));
+
+        // Mixed-length clip (`0x597ebb`–`0x597f18` -> `0x59846e`/`0x59852c`):
+        // a 2-frame layer with a 4-frame motion at phase 0.75 selects frame 1
+        // (floor(0.75 * 2) = 1), not frame 3 (floor(0.75 * 4) = 3).
+        let mut mixed = clip.clone();
+        mixed.animation.frames = 2;
+        mixed.animation.motions[0].frames = 4;
+        mixed.animation.translation_count = 4;
+        mixed.animation.rotation_count = 4;
+        mixed.samples.translations = vec![
+            [0.0, 10.0, 0.0],
+            [0.0, 20.0, 0.0],
+            [0.0, 30.0, 0.0],
+            [0.0, 40.0, 0.0],
+        ];
+        mixed.samples.rotations = vec![q0, q1, q0, q1];
+        let mut mixed_pose = Pose::rest(&skeleton);
+        mixed.apply_with_interpolation(
+            &skeleton,
+            &mut mixed_pose,
+            0.75,
+            false,
+            false,
+            Some(2),
+            1.0,
+        );
+        assert_eq!(mixed_pose.local[1].translation, Vec3::new(0.0, 20.0, 0.0));
+        assert_eq!(mixed_pose.local[1].rotation, rig::rotation(q1));
+
+        // Clamping safety: if layer_frames > motion.frames, snapping clamps to
+        // the motion's final frame rather than reading out of bounds.
+        let mut clamped_pose = Pose::rest(&skeleton);
+        clip.apply_with_interpolation(
+            &skeleton,
+            &mut clamped_pose,
+            0.9,
+            false,
+            false,
+            Some(10),
+            1.0,
+        );
+        assert_eq!(clamped_pose.local[1].translation, Vec3::new(0.0, 3.0, 0.0));
     }
 }
