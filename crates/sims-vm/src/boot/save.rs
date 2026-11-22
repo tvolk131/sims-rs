@@ -38,8 +38,10 @@ use std::collections::BTreeSet;
 /// pre-resolved house view centre; layout 4 keeps the house file's saved
 /// floor rotation baseline (`HOUS 0` `camera_direction & 3`); layout 5
 /// keeps the view-rotated screen-centre tile pick (`0x4a7b58` cut via
-/// `0x433067`) and any frozen dialog-replay view.
-pub const FORMAT: u32 = 5;
+/// `0x433067`) and any frozen dialog-replay view; layout 6 keeps choice-only
+/// follow-up answers (`Answers::choices_after`) separately from explicit
+/// dialog replay queues.
+pub const FORMAT: u32 = 6;
 
 /// A lot as it stood between two steps ([`Lot::save`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]

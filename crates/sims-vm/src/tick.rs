@@ -200,6 +200,10 @@ pub struct Shown {
 pub struct Answers {
     pub(crate) queue: VecDeque<Answer>,
     include_single_button: bool,
+    /// Choice-only answers (`include_single_button = false`) that take over
+    /// once `queue` is drained (for example when reopening a saved
+    /// [`Answers::replay`] lot with caller-supplied choices).
+    pub(crate) choices_after: Option<VecDeque<Answer>>,
 }
 
 impl Answers {
@@ -209,6 +213,7 @@ impl Answers {
         Self {
             queue: list.iter().copied().map(Answer::from).collect(),
             include_single_button: false,
+            choices_after: None,
         }
     }
 
@@ -217,12 +222,30 @@ impl Answers {
         Self {
             queue: list.iter().copied().collect(),
             include_single_button: true,
+            choices_after: None,
         }
+    }
+
+    /// Appends choice-only answers to take over once any existing queued
+    /// answers have been consumed, switching `include_single_button` to `false`
+    /// at the boundary so later one-button notices never consume a choice.
+    pub(crate) fn extend_choices_after(&mut self, list: &[u8]) {
+        if list.is_empty() {
+            return;
+        }
+        let extra = self.choices_after.get_or_insert_with(VecDeque::new);
+        extra.extend(list.iter().copied().map(Answer::from));
     }
 }
 
 impl Player for Answers {
     fn answer(&mut self, shown: &Shown) -> Option<Answer> {
+        if self.queue.is_empty()
+            && let Some(next) = self.choices_after.take()
+        {
+            self.queue = next;
+            self.include_single_button = false;
+        }
         match shown.answers {
             [only] if !self.include_single_button => Some((*only).into()),
             _ => self.queue.pop_front(),

@@ -1778,14 +1778,13 @@ fn boot_from_saved_lot(
 
     let player = if answers.is_empty() {
         saved.answers
-    } else if saved.answered {
-        // Preserve the player's already-committed dialog answer at the front
-        // of the saved queue so replay applies the chosen answer, and queue
-        // any caller-provided answers behind it for later dialogs.
+    } else if saved.answered || saved.replay_view.is_some() {
+        // Preserve any already-committed dialog answer(s) for an in-flight
+        // dialog tick (including multi-dialog ticks paused on a second dialog
+        // where `answered` was cleared while `replay_view` stays set), and
+        // stage caller-supplied future answers in choice-only mode behind them.
         let mut player = saved.answers;
-        player
-            .queue
-            .extend(answers.iter().copied().map(crate::Answer::from));
+        player.extend_choices_after(answers);
         player
     } else {
         Answers::choices(answers)
@@ -1930,9 +1929,25 @@ fn boot_from_base_house(
 
         let types = &file.types.entries;
         for entry in types {
-            let object = catalog.object(entry.guid).ok_or_else(|| {
-                LifecycleError::Lot(format!("type {} has no definition", entry.id))
-            })?;
+            let Some(object) = catalog.object(entry.guid) else {
+                // If a character file was permanently deleted when another lot
+                // was bulldozed (`0x426fcd`), an unused `objt` entry for that
+                // GUID in another imported house file is harmless (`read_types`
+                // already skips entries missing from the catalog).
+                if stored.deleted_characters.contains(&entry.guid)
+                    && !file
+                        .objects
+                        .instances
+                        .values()
+                        .any(|o| o.guid == entry.guid)
+                {
+                    continue;
+                }
+                return Err(LifecycleError::Lot(format!(
+                    "type {} has no definition",
+                    entry.id
+                )));
+            };
             if interpreter.type_changed(entry) == Some(true) {
                 let current = [Callback::Init, Callback::Main]
                     .map(|c| program.signature(object.resource, program.callback(object, c)));
@@ -2479,20 +2494,36 @@ fn evict_or_bulldoze(
     let _ = broadcast_tree(&interpreter, &mut lot.world, "evict lot", 0)
         .map_err(|e| LifecycleError::Lot(format!("broadcasting \"evict lot\": {e}")))?;
 
-    // 0x42749a..0x427536: remove people first (so no lingering routes/uses
-    // block furniture removal), then removable objects.
+    // 0x42749a..0x427536: remove all removable people first — including seated
+    // residents and seated visitors whose chairs will be removed — so no
+    // lingering seated person or route/use blocks furniture removal.
     let mut removed_objects = 0usize;
     let people_ids: Vec<u16> = lot.world.people.clone();
     for id in people_ids {
         if !lot.world.objects.contains_key(&id) || lot.world.indicators.contains(&id) {
             continue;
         }
-        let in_container = crate::placement::capture(&mut lot.world, id)
-            .map(|c| c.container.is_some())
-            .unwrap_or(false);
-        if !in_container
-            && should_remove_on_evict_or_bulldoze(&interpreter, &mut lot.world, id, bulldoze)
+        let mut removable =
+            should_remove_on_evict_or_bulldoze(&interpreter, &mut lot.world, id, bulldoze);
+        if !removable
+            && let Ok(place) = crate::placement::capture(&mut lot.world, id)
+            && let Some(mut container) = place.container
         {
+            while let Ok(parent) = crate::placement::capture(&mut lot.world, container) {
+                if let Some(next) = parent.container {
+                    container = next;
+                } else {
+                    break;
+                }
+            }
+            removable = should_remove_on_evict_or_bulldoze(
+                &interpreter,
+                &mut lot.world,
+                container,
+                bulldoze,
+            );
+        }
+        if removable {
             remove_person_cleanly(&interpreter, &mut lot.world, id)?;
             removed_objects += 1;
         }
@@ -3638,12 +3669,19 @@ mod tests {
 
         // 3. Answered 3, saved before stepping, reopened with `answers = &[2]`:
         //    replay must apply the saved answer 3 (matching `hash_three`), NOT
-        //    overwrite it with 2, and keep 2 queued behind it for later dialogs.
+        //    overwrite it with 2, and keep 2 staged in `choices_after` behind it.
         let mut reopened = enter_lot(&root, &store_three, "UserData", 5, &[2], no_frames).unwrap();
         assert!(reopened.answered);
-        assert_eq!(reopened.player.queue.len(), 2);
+        assert_eq!(reopened.player.queue.len(), 1);
         assert_eq!(reopened.player.queue[0].status, 3);
-        assert_eq!(reopened.player.queue[1].status, 2);
+        assert_eq!(
+            reopened
+                .player
+                .choices_after
+                .as_ref()
+                .map(|q| q.iter().map(|a| a.status).collect::<Vec<_>>()),
+            Some(vec![2])
+        );
         for _ in 0..4 {
             reopened.step().unwrap();
         }
@@ -3652,7 +3690,241 @@ mod tests {
             hash_three,
             "reopening an already-answered lot with different future answers must replay the saved answer (3), not replace it with 2"
         );
-        assert_eq!(reopened.player.queue.len(), 1);
-        assert_eq!(reopened.player.queue[0].status, 2);
+        assert_eq!(
+            reopened
+                .player
+                .choices_after
+                .as_ref()
+                .map(|q| q.iter().map(|a| a.status).collect::<Vec<_>>()),
+            Some(vec![2])
+        );
+    }
+
+    #[test]
+    fn evict_and_bulldoze_succeed_with_seated_visitor() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let no_frames = Frames::parse("none").unwrap();
+        for do_bulldoze in [false, true] {
+            let db = TempDb::new(if do_bulldoze {
+                "seated-visitor-bulldoze"
+            } else {
+                "seated-visitor-evict"
+            });
+            let store = NeighborhoodStore::open(&db.0).unwrap();
+            store
+                .import_directory("UserData", &root.join("UserData"), 0xff)
+                .unwrap();
+
+            let mut house7 =
+                enter_lot(&root, &store, "UserData", 7, &[3], no_frames.clone()).unwrap();
+            let goth_guid = store
+                .load_neighborhood("UserData")
+                .unwrap()
+                .unwrap()
+                .family_in(5)
+                .unwrap()
+                .1
+                .members[0];
+            let goth_nbr = house7.world.neighbors.first_of(goth_guid).unwrap().id;
+            let template_id = house7.world.people[0];
+            let visitor_id = house7.world.objects.keys().copied().max().unwrap_or(100) + 1;
+            let next_type = house7.world.types.keys().copied().max().unwrap_or(0) + 1;
+            house7.world.types.insert(next_type, goth_guid);
+
+            let chair_id = house7
+                .world
+                .order
+                .iter()
+                .copied()
+                .find(|&oid| {
+                    !house7.world.indicators.contains(&oid)
+                        && house7.world.objects[&oid].person.is_none()
+                        && house7.world.objects[&oid].slots.len() > 1
+                })
+                .expect("House 7 has a furniture chair with a container slot");
+            let chair_pos = house7.world.objects[&chair_id].position;
+
+            let mut visitor = house7.world.objects[&template_id].clone();
+            visitor.id = visitor_id;
+            visitor.guid = goth_guid;
+            visitor.selected = false;
+            visitor.position = chair_pos;
+            visitor.data[2] = chair_id as i16;
+            visitor.data[3] = 0;
+            visitor.data[14] = 1;
+            visitor.data[26] = chair_id as i16;
+            if let Some(person) = visitor.person.as_mut() {
+                person.data[31] = goth_nbr;
+                person.data[PERSON_HOME] = 5;
+                person.data[61] = 5;
+            }
+            house7.world.objects.get_mut(&chair_id).unwrap().slots[1].object = visitor_id as i16;
+            house7.world.objects.insert(visitor_id, visitor);
+            house7.world.order.push(visitor_id);
+            house7.world.people.push(visitor_id);
+            save_and_leave_lot(&root, &store, "UserData", &mut house7).unwrap();
+
+            if do_bulldoze {
+                let report = bulldoze(&root, &store, "UserData", 7).unwrap();
+                assert_eq!(report.evicted_family, Some(1));
+            } else {
+                let report = evict(&root, &store, "UserData", 7).unwrap();
+                assert_eq!(report.family, 1);
+            }
+            assert!(
+                store
+                    .load_neighborhood("UserData")
+                    .unwrap()
+                    .unwrap()
+                    .family_in(7)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn bulldozing_lot_allows_another_imported_lot_with_unused_deleted_objt_to_open() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let db = TempDb::new("unused-deleted-objt");
+        let store = NeighborhoodStore::open(&db.0).unwrap();
+        store
+            .import_directory("UserData", &root.join("UserData"), 0xff)
+            .unwrap();
+
+        // Append an unused `objt` entry for Goth House 5 tombstone `0x7757D9EE`
+        // to House 7's imported base `House07.iff`.
+        let orig_bytes = store.load_base_house("UserData", 7).unwrap().unwrap();
+        let iff = sims_formats::iff::Iff::parse(orig_bytes).unwrap();
+        let mut rebuilt = Vec::new();
+        rebuilt.extend_from_slice(b"IFF FILE 2.5:TYPE FOLLOWED BY SIZE\0 JAMIE DOORNBOS & MAXIS 1");
+        rebuilt.extend_from_slice(&0u32.to_be_bytes()); // no rsmp offset
+        for chunk in &iff.chunks {
+            if &chunk.tag == b"rsmp" {
+                continue;
+            }
+            let mut payload = iff.data(chunk).to_vec();
+            if &chunk.tag == b"objt" {
+                let parsed = sims_formats::lot::ObjectTypes::parse(&payload).unwrap();
+                let new_id = parsed
+                    .entries
+                    .iter()
+                    .map(|e| e.id)
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                payload.extend_from_slice(&0x7757_D9EEu32.to_le_bytes());
+                payload.extend_from_slice(&0u32.to_le_bytes());
+                payload.extend_from_slice(&0u32.to_le_bytes());
+                payload.extend_from_slice(&new_id.to_le_bytes());
+                payload.extend_from_slice(&2u16.to_le_bytes());
+                payload.extend_from_slice(b"tomb\0\0");
+                if parsed.version == 3 {
+                    payload.extend_from_slice(&0u32.to_le_bytes());
+                }
+            }
+            let total_size = (76 + payload.len()) as u32;
+            rebuilt.extend_from_slice(&chunk.tag);
+            rebuilt.extend_from_slice(&total_size.to_be_bytes());
+            rebuilt.extend_from_slice(&chunk.id.to_be_bytes());
+            rebuilt.extend_from_slice(&chunk.flags.to_be_bytes());
+            let mut label = [0u8; 64];
+            let raw_label = chunk.label.as_bytes();
+            let n = raw_label.len().min(63);
+            label[..n].copy_from_slice(&raw_label[..n]);
+            rebuilt.extend_from_slice(&label);
+            rebuilt.extend_from_slice(&payload);
+        }
+        store.save_base_house("UserData", 7, &rebuilt).unwrap();
+
+        let no_frames = Frames::parse("none").unwrap();
+        // Opens cleanly before Bulldozing House 5.
+        let _before = enter_lot(&root, &store, "UserData", 7, &[3], no_frames.clone()).unwrap();
+        // Bulldoze House 5: deletes `0x7757D9EE` character file from REDB.
+        let report = bulldoze(&root, &store, "UserData", 5).unwrap();
+        assert!(report.deleted_tombstones >= 1);
+        // Must STILL open cleanly after Bulldozing House 5!
+        let mut after = enter_lot(&root, &store, "UserData", 7, &[3], no_frames).unwrap();
+        after.step().unwrap();
+    }
+
+    #[test]
+    fn multi_dialog_and_replay_mode_answers_preserve_queue_and_auto_answer_notices() {
+        use crate::Player;
+        use crate::tick::Shown;
+
+        // 1. Explicit `Answers::replay` queue with appended choices must consume
+        //    the saved replay answer first, then switch to choice-only mode so a
+        //    later one-button notice auto-answers WITHOUT consuming the choice!
+        let mut player = Answers::replay(&[crate::Answer::from(2)]);
+        player.extend_choices_after(&[3]);
+        let choice_dialog = Shown {
+            tick: 1,
+            object: 1,
+            answers: &[2, 3],
+        };
+        let one_button_notice = Shown {
+            tick: 2,
+            object: 1,
+            answers: &[2],
+        };
+        assert_eq!(player.answer(&choice_dialog).map(|a| a.status), Some(2));
+        assert_eq!(
+            player.answer(&one_button_notice).map(|a| a.status),
+            Some(2),
+            "one-button notice after drained replay queue must auto-answer without consuming choice 3"
+        );
+        assert_eq!(
+            player.answer(&choice_dialog).map(|a| a.status),
+            Some(3),
+            "appended choice 3 must still be available for the next multi-button dialog"
+        );
+        assert_eq!(
+            player.answer(&one_button_notice).map(|a| a.status),
+            Some(2),
+            "subsequent one-button notice must continue to auto-answer in choice mode"
+        );
+
+        // 2. Saving a lot while paused on a second dialog (`answered == false`,
+        //    `replay_view.is_some()`, first answer `2` already in `saved.answers`)
+        //    and reopening with `[3, 3]` must keep `2` at the front and stage
+        //    `[3, 3]` behind it (`[2, 3]` instead of `[3, 3]`).
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let db = TempDb::new("multi-dialog-replay-view");
+        let store = NeighborhoodStore::open(&db.0).unwrap();
+        store
+            .import_directory("UserData", &root.join("UserData"), 0xff)
+            .unwrap();
+        let no_frames = Frames::parse("none").unwrap();
+        let mut lot = enter_lot(&root, &store, "UserData", 5, &[], no_frames.clone()).unwrap();
+        // Simulate a tick paused on a second dialog after answering the first
+        // dialog with `2` (`answered = false`, `replay_view = Some(...)`,
+        // `player = Answers::replay([2])`).
+        lot.player = Answers::replay(&[crate::Answer::from(2)]);
+        lot.answered = false;
+        lot.replay_view = Some((lot.view_rotation, lot.view_centre));
+        save_and_leave_lot(&root, &store, "UserData", &mut lot).unwrap();
+
+        let mut reopened = enter_lot(&root, &store, "UserData", 5, &[3, 3], no_frames).unwrap();
+        assert_eq!(
+            reopened.player.answer(&choice_dialog).map(|a| a.status),
+            Some(2),
+            "first already-chosen answer must be preserved when replay_view is active"
+        );
+        assert_eq!(
+            reopened.player.answer(&one_button_notice).map(|a| a.status),
+            Some(2),
+            "one-button notice after saved replay answer must auto-answer"
+        );
+        assert_eq!(
+            reopened.player.answer(&choice_dialog).map(|a| a.status),
+            Some(3),
+            "second dialog must receive caller-supplied choice 3"
+        );
     }
 }
