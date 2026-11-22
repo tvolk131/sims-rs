@@ -58,8 +58,9 @@ pub const DEFAULT_ROOF_PATTERN: &str = "r1_";
 const POOL_ARRAY_ID: u16 = 9;
 const WATER_ARRAY_ID: u16 = 10;
 
-/// Maximum terrain corner height step (`u8::MAX`, matching `Depth::CURVE`).
-const MAX_TERRAIN_HEIGHT: u8 = 255;
+/// Native maximum terrain corner height step (`cSimpleAltTool` -> `0x490f54`:
+/// caps candidate vertex elevation at `0x40` = 64).
+pub const MAX_TERRAIN_HEIGHT: u8 = 64;
 
 /// Maximum slope delta across adjacent corners of a tile before terrain
 /// lighting/clamping saturates (`grass.rs`: `-5..=5` slope table).
@@ -181,7 +182,11 @@ pub fn validate_terrain_overlay(
 
     let candidate_tiles: Vec<[i32; 2]> = match overlay.target {
         TerrainTarget::Vertex([vx, vy]) => {
-            vec![[vx - 1, vy - 1], [vx, vy - 1], [vx - 1, vy], [vx, vy]]
+            if vx < 0 || vy < 0 || vx > size || vy > size {
+                vec![[vx, vy]]
+            } else {
+                vec![[vx - 1, vy - 1], [vx, vy - 1], [vx - 1, vy], [vx, vy]]
+            }
         }
         TerrainTarget::Rect { start, end } => {
             let (x0, x1) = ordered_pair(start[0], end[0]);
@@ -215,9 +220,10 @@ pub fn validate_terrain_overlay(
     let vertex_limit_status = match (overlay.tool, overlay.target) {
         (TerrainTool::Raise, TerrainTarget::Vertex(v)) => {
             let h = corner_height(lot, v);
-            if h == MAX_TERRAIN_HEIGHT {
+            let candidate = h.saturating_add(1).min(MAX_TERRAIN_HEIGHT);
+            if candidate == h {
                 Some(TerrainTileStatus::HeightLimit)
-            } else if vertex_exceeds_slope(lot, v, i32::from(h) + 1) {
+            } else if vertex_exceeds_slope(lot, v, i32::from(candidate)) {
                 Some(TerrainTileStatus::SlopeLimit)
             } else {
                 None
@@ -552,38 +558,47 @@ pub fn validate_water_overlay(
         }
     }
 
+    let rect_within_clamp = x0 == x0c && x1 == x1c && y0 == y0c && y1 == y1c;
     let mut coping_tiles = Vec::new();
-    if overlay.tool == WaterTool::Pool && overlay.action == WaterAction::Dig {
+    if overlay.tool == WaterTool::Pool && overlay.action == WaterAction::Dig && rect_within_clamp {
         for x in (x0c - 1)..=(x1c + 1) {
             for y in (y0c - 1)..=(y1c + 1) {
-                if x >= x0 && x <= x1 && y >= y0 && y <= y1 {
+                if x >= x0c && x <= x1c && y >= y0c && y <= y1c {
                     continue;
                 }
                 let mut mask = 0u8;
-                if x == x0 - 1 {
+                if x == x0c - 1 {
                     mask |= COPING_EAST;
                 }
-                if x == x1 + 1 {
+                if x == x1c + 1 {
                     mask |= COPING_WEST;
                 }
-                if y == y0 - 1 {
+                if y == y0c - 1 {
                     mask |= COPING_SOUTH;
                 }
-                if y == y1 + 1 {
+                if y == y1c + 1 {
                     mask |= COPING_NORTH;
                 }
                 if mask.count_ones() >= 2 {
                     mask |= COPING_CORNER;
                 }
-                let status = validate_water_tile(
-                    lot,
-                    world,
-                    [x, y],
-                    WaterTool::Pool,
-                    WaterAction::Dig,
-                    target_height,
-                    true,
-                );
+                // Visual coping border surrounds the excavation rectangle; native
+                // `cPoolTool::Validate` (`0x48fa7b`) validates the excavation
+                // rectangle itself, so outer-lot-edge coping (`0` or `size-1`)
+                // renders cleanly without invalidating a pool starting at `x=1`.
+                let status = if lot.contains(x, y) {
+                    let (tx, ty) = (x as usize, y as usize);
+                    let floor = lot.levels[0].floors[Lot::cell(tx, ty)];
+                    if is_road_floor(floor) {
+                        WaterTileStatus::BlockedByRoad
+                    } else if world.is_some_and(|w| has_water_mask(w, WATER_ARRAY_ID, tx, ty)) {
+                        WaterTileStatus::BlockedByWater
+                    } else {
+                        WaterTileStatus::Valid
+                    }
+                } else {
+                    WaterTileStatus::OutOfBounds
+                };
                 coping_tiles.push(CopingTile {
                     tile: [x, y],
                     edge_mask: mask,
@@ -593,13 +608,27 @@ pub fn validate_water_overlay(
         }
     }
 
-    let rect_within_clamp = x0 == x0c && x1 == x1c && y0 == y0c && y1 == y1c;
     let interior_valid = !tiles.is_empty() && tiles.iter().all(|t| t.status.is_valid());
-    let coping_valid = coping_tiles.iter().all(|c| c.status.is_valid());
-    let valid = rect_within_clamp && interior_valid && coping_valid;
+    let valid = rect_within_clamp && interior_valid;
 
+    // `0x48fa06`..`0x48fa0c`: charge only for newly excavated tiles, not tiles
+    // that already hold the same pool/water surface.
+    let new_tiles = tiles
+        .iter()
+        .filter(|t| {
+            t.status.is_valid()
+                && lot.contains(t.tile[0], t.tile[1])
+                && !world.is_some_and(|w| {
+                    let arr_id = match overlay.tool {
+                        WaterTool::Pool => POOL_ARRAY_ID,
+                        WaterTool::Pond => WATER_ARRAY_ID,
+                    };
+                    has_water_mask(w, arr_id, t.tile[0] as usize, t.tile[1] as usize)
+                })
+        })
+        .count() as i32;
     let cost = match overlay.action {
-        WaterAction::Dig if valid => tiles.len() as i32 * overlay.tool.tile_cost(),
+        WaterAction::Dig if valid => new_tiles * overlay.tool.tile_cost(),
         _ => 0,
     };
 
@@ -645,18 +674,15 @@ fn validate_water_tile(
         return WaterTileStatus::BlockedByRoad;
     }
 
-    // Flatness check for pools (`0x48faf9`..`0x48fb11`): every interior tile
-    // and coping rim tile must have all four corners flat at `target_height`.
+    // Native flatness check for both Pool (`0x48faf9`..`0x48fb11`) and Water/Pond
+    // (`0x49838e`..`0x4983a6`, `0x4984aa`..`0x4984cf`): all four corners of every
+    // selected tile must match the anchor's flat elevation `target_height`.
     let h = lot.heights[cell];
-    if tool == WaterTool::Pool {
-        if h[0] != target_height
-            || h[1] != target_height
-            || h[2] != target_height
-            || h[3] != target_height
-        {
-            return WaterTileStatus::InvalidSlope;
-        }
-    } else if !is_tile_flat_enough_for_pond(h) {
+    if h[0] != target_height
+        || h[1] != target_height
+        || h[2] != target_height
+        || h[3] != target_height
+    {
         return WaterTileStatus::InvalidSlope;
     }
 
@@ -682,14 +708,6 @@ fn validate_water_tile(
     }
 
     WaterTileStatus::Valid
-}
-
-/// Ponds allow gentle slopes up to 2 terrain steps across a tile, matching
-/// natural pond excavation while rejecting cliffs.
-fn is_tile_flat_enough_for_pond(h: [u8; 4]) -> bool {
-    let min = h.into_iter().min().unwrap_or(0);
-    let max = h.into_iter().max().unwrap_or(0);
-    max - min <= 2
 }
 
 /// Composites a validated [`WaterPreviewPlan`] depth-correctly over `canvas`.
@@ -942,9 +960,15 @@ impl RoofPattern {
         let v_wrap = v - v.floor();
         let tx = ((u_wrap * self.width as f32) as usize).min(self.width as usize - 1);
         let ty = ((v_wrap * self.height as f32) as usize).min(self.height as usize - 1);
-        let idx = (ty * self.width as usize + tx) * 4;
-        if idx + 3 <= self.rgba.len() {
-            [self.rgba[idx], self.rgba[idx + 1], self.rgba[idx + 2]]
+        let Some(idx) = ty
+            .checked_mul(self.width as usize)
+            .and_then(|row| row.checked_add(tx))
+            .and_then(|pixel| pixel.checked_mul(4))
+        else {
+            return [128, 128, 128];
+        };
+        if let Some(slice) = self.rgba.get(idx..idx + 3) {
+            [slice[0], slice[1], slice[2]]
         } else {
             [128, 128, 128]
         }
@@ -1141,7 +1165,8 @@ pub struct RoofStats {
     pub pixels_written: usize,
 }
 
-/// Detects enclosed indoor tiles eligible for roofing on level 1 and level 2.
+/// Detects enclosed indoor tiles eligible for roofing on level 1 and level 2,
+/// including diagonally split tiles (`Lot::halves`) that hold an indoor half.
 ///
 /// Level-1 tiles covered by a level-2 enclosed tile (or level-2 floor) are
 /// excluded from the level-1 roof footprint so multi-storey houses do not draw
@@ -1157,7 +1182,19 @@ pub fn detect_roof_footprints(lot: &Lot) -> [Vec<[i32; 2]>; 2] {
                 let cell = Lot::cell(x, y);
                 let is_indoor = if let Some(rooms) = &level.rooms {
                     let room = rooms[cell];
-                    room >= 0 && !lot.outdoor_rooms.contains(&room)
+                    if room >= 0 {
+                        !lot.outdoor_rooms.contains(&room)
+                    } else if room == sims_sim::rooms::NO_ROOM {
+                        lot.halves
+                            .get(&[level_idx as u8 + 1, x as u8, y as u8])
+                            .is_some_and(|halves| {
+                                halves
+                                    .iter()
+                                    .any(|&(_, r)| r >= 0 && !lot.outdoor_rooms.contains(&r))
+                            })
+                    } else {
+                        false
+                    }
                 } else {
                     false
                 };
@@ -1291,23 +1328,42 @@ fn draw_roof_layer(
     let vw = w_sub + 1;
     let vh = h_sub + 1;
 
-    // Determine whether each half-tile cell is inside the footprint.
+    // Determine whether each half-tile cell is inside the footprint. For
+    // diagonally split tiles (`NO_ROOM` + `Lot::halves`), include only the
+    // half-tile sub-cells whose center lies in an indoor triangle when room
+    // data is available (explicit caller footprints without room data cover
+    // all four sub-cells).
+    let level_idx = (base_level - 1).clamp(0, 1) as usize;
     let mut inside = vec![false; w_sub * h_sub];
     for &[tx, ty] in tile_set {
         let sx0 = ((tx - min_tx) * 2) as usize;
         let sy0 = ((ty - min_ty) * 2) as usize;
+        let cell = Lot::cell(tx as usize, ty as usize);
+        let is_split = lot.levels[level_idx]
+            .rooms
+            .as_ref()
+            .is_some_and(|r| r[cell] == sims_sim::rooms::NO_ROOM)
+            && lot
+                .halves
+                .contains_key(&[base_level as u8, tx as u8, ty as u8]);
         for dx in 0..2 {
             for dy in 0..2 {
-                inside[(sx0 + dx) * h_sub + (sy0 + dy)] = true;
+                let sub_ok = if is_split {
+                    let fine = [tx * 16 + dx as i32 * 8 + 4, ty * 16 + dy as i32 * 8 + 4];
+                    lot.room_at(level_idx, fine)
+                        .is_some_and(|r| !lot.outdoor_rooms.contains(&r))
+                } else {
+                    true
+                };
+                if sub_ok {
+                    inside[(sx0 + dx) * h_sub + (sy0 + dy)] = true;
+                }
             }
         }
     }
 
-    // Determine the roof eave base elevation (terrain height under the
-    // footprint; roof rests on top of `base_level`'s walls = `roof_level`).
+    // Roof rests on top of `base_level`'s walls (`roof_level = base_level + 1`).
     let roof_level = base_level + 1;
-    let base_terrain_steps = average_footprint_height(lot, tile_set);
-    let base_elev_near = base_terrain_steps * 16.0;
 
     // Compute per-vertex roof height in world units above the eaves.
     let gable_along_x = (max_tx - min_tx) >= (max_ty - min_ty);
@@ -1433,12 +1489,17 @@ fn draw_roof_layer(
         }
     }
 
-    // Project a half-tile vertex `(vx, vy)` into `(ScreenVertex, world_pos_view, uv)`.
+    // Project a half-tile vertex `(vx, vy)` anchored to its supporting terrain
+    // height (`0x56ed12`–`0x56ed41`), then add the pitch increment
+    // (`0x56ee4b`–`0x56ee73`), so rooms on separate terraces get accurate eaves.
     let make_vertex = |vx: usize, vy: usize, world_h: f32| -> RoofVertex {
-        let fine_x = (min_tx * 16 + vx as i32 * 8) as f32;
-        let fine_y = (min_ty * 16 + vy as i32 * 8) as f32;
-        let view = rotate_fine_f32(camera.rotation, [fine_x, fine_y]);
-        let elev_near = base_elev_near + world_h * NEAR_PX_PER_WORLD_UNIT;
+        let fine_ix = min_tx * 16 + vx as i32 * 8;
+        let fine_iy = min_ty * 16 + vy as i32 * 8;
+        let max_fine = (lot.size as i32 * 16).saturating_sub(1).max(0);
+        let terrain_steps =
+            lot.altitude_at([fine_ix.clamp(0, max_fine), fine_iy.clamp(0, max_fine)]);
+        let view = rotate_fine_f32(camera.rotation, [fine_ix as f32, fine_iy as f32]);
+        let elev_near = terrain_steps * 16.0 + world_h * NEAR_PX_PER_WORLD_UNIT;
         let [sx, sy] = camera.project_fine_f32(view, roof_level, elev_near);
         let z = depth.point(view, elev_near, roof_level);
         RoofVertex {
@@ -1448,7 +1509,7 @@ fn draw_roof_layer(
             // World position in view space for directional sun lighting.
             wx: view[0] * (TILE_WORLD_UNITS / 16.0),
             wy: view[1] * (TILE_WORLD_UNITS / 16.0),
-            wz: world_h,
+            wz: terrain_steps * (16.0 / NEAR_PX_PER_WORLD_UNIT) + world_h,
             u: (vx as f32) * 0.5,
             v: (vy as f32) * 0.5,
         }
@@ -1566,22 +1627,6 @@ fn triangle_roof_shade(tri: [RoofVertex; 3], sun: [f32; 3], brightest: f32) -> f
     (diffuse * brightest).clamp(0.2, 1.0)
 }
 
-fn average_footprint_height(lot: &Lot, tile_set: &BTreeSet<[i32; 2]>) -> f32 {
-    if tile_set.is_empty() {
-        return 0.0;
-    }
-    let mut sum = 0u64;
-    let mut count = 0u64;
-    for &[tx, ty] in tile_set {
-        let h = lot.heights[Lot::cell(tx as usize, ty as usize)];
-        for c in h {
-            sum += u64::from(c);
-            count += 1;
-        }
-    }
-    (sum as f64 / count.max(1) as f64) as f32
-}
-
 // ============================================================================
 // Shared Geometry, Validation & Rasterization Helpers
 // ============================================================================
@@ -1638,6 +1683,9 @@ fn tile_reference_height(lot: &Lot, [x, y]: [i32; 2]) -> u8 {
 
 fn vertex_exceeds_slope(lot: &Lot, [vx, vy]: [i32; 2], candidate_h: i32) -> bool {
     let size = lot.size as i32;
+    if vx < 0 || vy < 0 || vx > size || vy > size {
+        return false;
+    }
     for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
         let nx = vx + dx;
         let ny = vy + dy;
@@ -1739,6 +1787,11 @@ fn project_corner_vertex(
 
 /// Returns the 4 projected vertices of lot tile `[tx, ty]` in order
 /// `[(tx, ty), (tx + 1, ty), (tx + 1, ty + 1), (tx, ty + 1)]`.
+///
+/// Clamps each vertex's depth to sit just in front of the tile's constant
+/// grass depth (`depth.grass(view_top, top_h) - 1`, `scene.rs:2246`) so steep
+/// 5-step slopes never self-occlude their own overlay while preserving
+/// foreground occlusion by standing walls and objects.
 fn sloped_tile_vertices(
     lot: &Lot,
     camera: &Camera,
@@ -1749,40 +1802,27 @@ fn sloped_tile_vertices(
     let h = lot.heights[Lot::cell(tx as usize, ty as usize)];
     // Native height corner order (`scene.rs:798`):
     // h[0]=(0,1), h[1]=(0,0), h[2]=(1,0), h[3]=(1,1)
-    [
-        project_corner_vertex(
-            camera,
-            depth,
-            [tx, ty],
-            f32::from(h[1]) * 16.0,
-            1,
-            depth_bias,
-        ),
-        project_corner_vertex(
-            camera,
-            depth,
-            [tx + 1, ty],
-            f32::from(h[2]) * 16.0,
-            1,
-            depth_bias,
-        ),
-        project_corner_vertex(
-            camera,
-            depth,
-            [tx + 1, ty + 1],
-            f32::from(h[3]) * 16.0,
-            1,
-            depth_bias,
-        ),
-        project_corner_vertex(
-            camera,
-            depth,
-            [tx, ty + 1],
-            f32::from(h[0]) * 16.0,
-            1,
-            depth_bias,
-        ),
-    ]
+    let corner_pairs = [
+        ([tx, ty], h[1]),
+        ([tx + 1, ty], h[2]),
+        ([tx + 1, ty + 1], h[3]),
+        ([tx, ty + 1], h[0]),
+    ];
+    let (top_corner, top_h) = corner_pairs
+        .into_iter()
+        .min_by_key(|&(c, _)| {
+            let v = rotate_corner(camera.rotation, c);
+            v[0] + v[1]
+        })
+        .unwrap_or(([tx, ty], h[1]));
+    let max_surface_z =
+        (depth.grass(rotate_corner(camera.rotation, top_corner), i32::from(top_h)) - 1) as f32;
+    corner_pairs.map(|(corner, ch)| {
+        let mut v =
+            project_corner_vertex(camera, depth, corner, f32::from(ch) * 16.0, 1, depth_bias);
+        v.z = v.z.min(max_surface_z);
+        v
+    })
 }
 
 fn edge_fn(ax: f32, ay: f32, bx: f32, by: f32, px: f32, py: f32) -> f32 {
@@ -2411,5 +2451,189 @@ mod tests {
         assert_eq!(p.sample_rgb(f32::NAN, 0.5), [128, 128, 128]);
         assert_eq!(p.sample_rgb(0.5, f32::INFINITY), [128, 128, 128]);
         assert_eq!(p.sample_rgb(-0.25, 1.75), [100, 120, 140]);
+
+        // Oversized manual pattern must never overflow byte indexing.
+        let huge = RoofPattern {
+            name: "huge".into(),
+            file_name: "huge.bmp".into(),
+            width: u32::MAX,
+            height: u32::MAX,
+            rgba: vec![255; 16],
+        };
+        assert_eq!(huge.sample_rgb(0.99, 0.99), [128, 128, 128]);
+    }
+
+    #[test]
+    fn sol_r1_parity_pond_flatness_pool_edge_billing_height_cap_sloped_grass_and_roofs() {
+        // 1. Pond rejects sloped tiles `[0, 0, 0, 1]` matching `0x49838e`..`0x4984cf`.
+        let world = test_world(16);
+        let mut lot = Lot::from_world(&world).unwrap();
+        lot.heights[Lot::cell(5, 5)] = [0, 0, 0, 1];
+        let pond_sloped = validate_water_overlay(
+            &lot,
+            Some(&world),
+            &WaterOverlay {
+                tool: WaterTool::Pond,
+                action: WaterAction::Dig,
+                start: [5, 5],
+                end: [5, 5],
+            },
+        );
+        assert!(!pond_sloped.valid);
+        assert_eq!(pond_sloped.tiles[0].status, WaterTileStatus::InvalidSlope);
+
+        // 2. Pool starting at interior edge `x = 1` is valid even though visual
+        //    coping reaches `x = 0`, and billing skips already-wet pool tiles.
+        let mut pool_world = test_world(16);
+        let mut pool_arr = vec![0xFFu8; lot::FULL * lot::FULL];
+        pool_arr[Lot::cell(1, 2)] = 0; // already excavated pool tile
+        pool_world.arrays.insert(
+            POOL_ARRAY_ID,
+            Array {
+                width: lot::FULL,
+                height: lot::FULL,
+                stride: 1,
+                encoding: 0,
+                data: pool_arr,
+            },
+        );
+        let flat_lot = Lot::from_world(&pool_world).unwrap();
+        let edge_pool = validate_water_overlay(
+            &flat_lot,
+            Some(&pool_world),
+            &WaterOverlay {
+                tool: WaterTool::Pool,
+                action: WaterAction::Dig,
+                start: [1, 2],
+                end: [2, 2],
+            },
+        );
+        assert!(
+            edge_pool.valid,
+            "pool at x=1 must not fail on coping at x=0"
+        );
+        assert_eq!(edge_pool.cost, 75, "only 1 newly excavated tile is billed");
+
+        // 3. Raise Terrain rejects vertex already at native ceiling 64 (`0x40`).
+        let mut high_lot = flat_lot.clone();
+        high_lot.heights.fill([MAX_TERRAIN_HEIGHT; 4]);
+        let capped = validate_terrain_overlay(
+            &high_lot,
+            None,
+            &TerrainOverlay {
+                tool: TerrainTool::Raise,
+                target: TerrainTarget::Vertex([6, 6]),
+            },
+        );
+        assert!(!capped.valid);
+        assert_eq!(capped.cost, 0);
+        assert!(
+            capped
+                .tiles
+                .iter()
+                .all(|t| t.status == TerrainTileStatus::HeightLimit)
+        );
+
+        // 4. Extreme coordinates never overflow.
+        let extreme_v = validate_terrain_overlay(
+            &flat_lot,
+            None,
+            &TerrainOverlay {
+                tool: TerrainTool::Raise,
+                target: TerrainTarget::Vertex([i32::MIN, i32::MAX]),
+            },
+        );
+        assert!(!extreme_v.valid);
+        let extreme_pool = validate_water_overlay(
+            &flat_lot,
+            None,
+            &WaterOverlay {
+                tool: WaterTool::Pool,
+                action: WaterAction::Dig,
+                start: [i32::MIN, i32::MIN],
+                end: [i32::MAX, i32::MAX],
+            },
+        );
+        assert!(!extreme_pool.valid);
+
+        // 5. Sloped 5-step grass tile must not self-occlude its own preview overlay.
+        let mut sloped_lot = flat_lot.clone();
+        // Corner (0,0) = 5 (view-top at rot 0), side corners = 0 -> 5-step drop.
+        sloped_lot.heights[Lot::cell(6, 6)] = [0, 5, 0, 0];
+        let mut cam = camera_for(&sloped_lot, Zoom::Near, 0);
+        cam.center_on([6 * 16 + 8, 6 * 16 + 8], [160, 140]);
+        let d = Depth::new(&cam);
+        let grass_z = d.grass(rotate_corner(cam.rotation, [6, 6]), 5);
+        let mut grass_canvas = Canvas::new(320, 280, [40, 90, 40]);
+        grass_canvas.depth.fill(grass_z);
+        let mut empty_canvas = Canvas::new(320, 280, [40, 90, 40]);
+        let plan = validate_terrain_overlay(
+            &sloped_lot,
+            None,
+            &TerrainOverlay {
+                tool: TerrainTool::Grass,
+                target: TerrainTarget::Brush {
+                    center: [6, 6],
+                    radius: 0,
+                },
+            },
+        );
+        let s_grass = draw_terrain_overlay(&sloped_lot, &cam, &plan, &mut grass_canvas);
+        let s_empty = draw_terrain_overlay(&sloped_lot, &cam, &plan, &mut empty_canvas);
+        assert_eq!(
+            s_grass.pixels_written, s_empty.pixels_written,
+            "sloped grass depth must not clip any pixels of its own overlay"
+        );
+
+        // 6. Roofs on separate terraces sit at their own terrain heights, and
+        //    split-diagonal indoor halves are included in detect_roof_footprints.
+        let mut terrace_lot = flat_lot.clone();
+        for x in 2..=4 {
+            for y in 9..=11 {
+                terrace_lot.heights[Lot::cell(x, y)] = [0; 4];
+            }
+        }
+        for x in 9..=11 {
+            for y in 2..=4 {
+                terrace_lot.heights[Lot::cell(x, y)] = [8; 4];
+            }
+        }
+        let mut rooms = vec![0i16; lot::FULL * lot::FULL];
+        rooms[Lot::cell(3, 10)] = 1;
+        rooms[Lot::cell(10, 3)] = 2;
+        rooms[Lot::cell(6, 6)] = sims_sim::rooms::NO_ROOM;
+        terrace_lot.outdoor_rooms.insert(0);
+        terrace_lot.levels[0].rooms = Some(rooms);
+        terrace_lot.halves.insert([1, 6, 6], [(4, 1), (2, 0)]);
+        let [l1, _] = detect_roof_footprints(&terrace_lot);
+        assert!(
+            l1.contains(&[6, 6]),
+            "split tile with indoor half must be included in automatic roof footprint"
+        );
+        let pattern = RoofPattern::solid("terrace", [150, 120, 100]);
+        let mut c_low = Canvas::new(320, 320, [115, 113, 115]);
+        let mut c_high = Canvas::new(320, 320, [115, 113, 115]);
+        let mut cam_low = camera_for(&terrace_lot, Zoom::Far, 0);
+        cam_low.center_on([3 * 16 + 8, 10 * 16 + 8], [160, 220]);
+        let mut cam_high = camera_for(&terrace_lot, Zoom::Far, 0);
+        cam_high.center_on([10 * 16 + 8, 3 * 16 + 8], [160, 220]);
+        let cfg_flat = RoofPreviewConfig {
+            style: RoofStyle::Flat,
+            pitch: RoofPitch::Flat,
+            ..RoofPreviewConfig::default()
+        };
+        draw_roof_preview(&terrace_lot, &cam_low, &pattern, &cfg_flat, &mut c_low);
+        draw_roof_preview(&terrace_lot, &cam_high, &pattern, &cfg_flat, &mut c_high);
+        let top_at_center = |c: &Canvas| {
+            (0..c.height)
+                .find(|&y| c.depth[y * c.width + 160] < EMPTY)
+                .unwrap()
+        };
+        // 8 terrain steps at Far zoom = 8 * 4 = 32 px higher on screen.
+        let diff = top_at_center(&c_low) as i32 - top_at_center(&c_high) as i32;
+        assert!(
+            (diff - 32).abs() <= 2,
+            "8-step higher terrace roof should sit ~32 px higher at Far zoom (got {diff})"
+        );
     }
 }

@@ -23,16 +23,18 @@ ease-out).
 - **`Build.iff STR# 128` (`Terrain`):** defines the four tools at `$1` each:
   `Raise Terrain`, `Lower Terrain`, `Level Terrain` (rectangular drag flatten
   to anchor elevation), and `Grass` (click/drag to restore grass, Ctrl-click to
-  remove grass to soil). `cSimpleAltTool`, `cLevelDirtTool`, and `cGrassTool`
-  operate on interior lot tiles (`1..size-1`) away from roads (`floors 9..=13`),
-  walls, floors, objects, and water/pool arrays (`9`/`10`).
+  remove grass to soil). `cSimpleAltTool` caps candidate terrain elevation at
+  `64` (`0x40`, `0x490f54`). `cSimpleAltTool`, `cLevelDirtTool`, and
+  `cGrassTool` operate on interior lot tiles (`1..size-1`) away from roads
+  (`floors 9..=13`), walls, floors, objects, and water/pool arrays (`9`/`10`).
 - **`Build.iff STR# 133` (`Pool`):** defines `Pool Tool` (`$75`/tile,
   `cPoolTool` vtable `0x667fa4`) and `Water Tool` (`$15`/tile, `cWaterTool`
   vtable `0x66822c`).
-- **`cPoolTool::Validate` (`0x48fa7b`–`0x48fb90`):** enforces interior bounds
-  `1..size-1` (`0x48fa95`–`0x48faee`) so the 1-tile coping rim stays on the lot
-  and requires all four corners of every pool tile and its border to share the
-  same flat elevation (`0x48faf9`–`0x48fb11`).
+- **`cPoolTool::Validate` (`0x48fa7b`–`0x48fb90`) & `cWaterTool` (`0x49838e`–`0x4984cf`):**
+  both enforce interior bounds `1..size-1` (`0x48fa95`–`0x48faee`) and require
+  all four corners of every excavated tile to match the anchor's flat elevation
+  (`0x48faf9`–`0x48fb11`, `0x49838e`–`0x4984cf`). Pool billing counts only
+  newly excavated tiles (`0x48fa06`–`0x48fa0c`).
 
 ### 2. Roof catalog, pitch presets & projection (`0x4153c4`, `cWinRoofPanel`, `cRoofMeshFactory`)
 - **Pattern catalog (`0x4153c4`):** `GameData/Roofs/` holds 18 `32×32` 8-bit
@@ -49,10 +51,13 @@ ease-out).
     `[0.0, 2.0]` (`[0x66657c] = 0.0`, `[0x66740c] = 2.0`).
 - **World geometry scale (`cRoofMeshFactory` `0x56f7fa`–`0x56f81a`):** uses
   `TILE_WORLD_UNITS = 3.0` (`[0x6714e8]`) and half-tile sub-cells (`0.5`,
-  `[0x666578]`). Combined with `Sims.exe`'s house camera terrain-step ratio
-  (`16` near-zoom pixels per `3 / (2√6)` world units), vertical roof elevation
-  projects at `32√6 / 3 ≈ 26.12789` near-zoom pixels per world unit through
-  `Camera::project_fine_f32` and `Depth::point`.
+  `[0x666578]`). Each roof piece anchors to its supporting terrain height
+  (`0x56ed12`–`0x56ed41`) before adding the pitch increment
+  (`0x56ee4b`–`0x56ee73`), and automatic footprints include indoor halves of
+  diagonally split tiles (`Lot::halves`). Combined with `Sims.exe`'s house
+  camera terrain-step ratio (`16` near-zoom pixels per `3 / (2√6)` world
+  units), vertical roof elevation projects at `32√6 / 3 ≈ 26.12789` near-zoom
+  pixels per world unit through `Camera::project_fine_f32` and `Depth::point`.
 
 ### 3. Pie-menu 400 ms transitions (`0x462078`–`0x462822`)
 - **Constants in unpacked `Sims.exe` image:**

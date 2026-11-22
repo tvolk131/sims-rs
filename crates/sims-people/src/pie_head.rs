@@ -201,6 +201,20 @@ impl PieTransition {
         let tf = f64::from(t);
         ((1.0 - tf) * f64::from(from) + tf * f64::from(to)).trunc() as i32
     }
+
+    /// Exact elapsed-millisecond linear interpolation matching `0x4621fb`–`0x462267`
+    /// (evaluates `t = elapsed_ms / duration_ms` in `f64` without rounding `t`
+    /// through `f32`, preserving exact steps such as `4 ms / 400 ms * 100 = 1`).
+    pub fn lerp_i32_ms(from: i32, to: i32, elapsed_ms: u32, duration_ms: u32) -> i32 {
+        if duration_ms == 0 || elapsed_ms >= duration_ms {
+            return to;
+        }
+        if elapsed_ms == 0 {
+            return from;
+        }
+        let tf = f64::from(elapsed_ms) / f64::from(duration_ms);
+        ((1.0 - tf) * f64::from(from) + tf * f64::from(to)).trunc() as i32
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -312,24 +326,26 @@ impl PieAnimState {
             self.is_pop_in = false;
             self.backdrop_cur = self.backdrop_to;
         } else {
-            let t = PieTransition::pop_in_progress(elapsed);
             self.backdrop_cur = BackdropState {
                 center: [
-                    PieTransition::lerp_i32(
+                    PieTransition::lerp_i32_ms(
                         self.backdrop_from.center[0],
                         self.backdrop_to.center[0],
-                        t,
+                        elapsed,
+                        POP_IN_MS,
                     ),
-                    PieTransition::lerp_i32(
+                    PieTransition::lerp_i32_ms(
                         self.backdrop_from.center[1],
                         self.backdrop_to.center[1],
-                        t,
+                        elapsed,
+                        POP_IN_MS,
                     ),
                 ],
-                radius: PieTransition::lerp_i32(
+                radius: PieTransition::lerp_i32_ms(
                     self.backdrop_from.radius,
                     self.backdrop_to.radius,
-                    t,
+                    elapsed,
+                    POP_IN_MS,
                 ),
             };
         }
@@ -359,17 +375,12 @@ impl PieAnimState {
         let next_dir = LastDirection::from_opt(look.direction);
         if next_dir != self.last_direction {
             self.last_direction = next_dir;
-            if look.direction.is_some() {
-                self.dir_start_ms = Some(now_ms);
-                // 0x4626cf..0x4626d8: snapshot pointer-tracked angles without
-                // the new compass turn as the ease-out start state.
-                self.dir_from_angles = raw;
-            } else {
-                // With no highlighted direction, target == raw so the ease
-                // curve is an exact identity; avoid spurious redraw ticks.
-                self.dir_start_ms = None;
-                self.dir_from_angles = raw;
-            }
+            // 0x4626c2..0x4626d8: start the 400 ms ease timer and snapshot the
+            // raw pointer-tracked angles on every direction change, including
+            // clearing a highlight (`None` / `-1`), so subsequent pointer
+            // motion during the 400 ms window eases smoothly.
+            self.dir_start_ms = Some(now_ms);
+            self.dir_from_angles = raw;
         }
 
         let [pitch, yaw] = if let Some(start_ms) = self.dir_start_ms {
@@ -1158,6 +1169,14 @@ mod tests {
                 radius: 0,
             }
         );
+        // Exact millisecond step: 4 ms / 400 ms * 100 = 1 (`0x4621fb`..`0x462267`).
+        assert_eq!(
+            anim.backdrop(1004),
+            BackdropState {
+                center: [300, 200],
+                radius: 1,
+            }
+        );
         // Halfway through 400 ms pop-in: radius = 50, head scale = 0.5, y_offset = 7.
         assert_eq!(
             anim.backdrop(1200),
@@ -1217,10 +1236,11 @@ mod tests {
     #[test]
     fn pie_transition_400ms_direction_ease_out_matches_sqrt_curve() {
         let mut anim = PieAnimState::open([300, 200], 0);
-        // Settle initial pop-in at 500 ms with neutral look.
+        // Settle initial pop-in at 500 ms with neutral look, then wait 400 ms
+        // for the initial direction timer (`Unset -> None`) to settle.
         let _ = anim.backdrop(500);
         let _ = anim.head_pose(Look::neutral(), 500);
-        assert!(!anim.is_animating(500));
+        assert!(!anim.is_animating(900));
 
         // Hover north option (direction 0 -> pitch += 0.6) at t = 1000 ms.
         let north = Look {
@@ -1244,6 +1264,28 @@ mod tests {
         let p_done = anim.head_pose(north, 1400);
         assert_eq!([p_done.pitch, p_done.yaw], north.angles());
         assert!(!anim.is_animating(1400));
+
+        // Clearing a highlight (`Some(0) -> None`) starts a 400 ms timer and
+        // snapshots raw pointer angles (`0x4626c2`..`0x4626d8`); if the pointer
+        // moves during the next 400 ms, the pose eases toward the new pointer.
+        let clear = Look {
+            distance: 0.0,
+            angle: 0.0,
+            direction: None,
+        };
+        let _ = anim.head_pose(clear, 2000);
+        assert!(anim.is_animating(2000));
+        let moved = Look {
+            distance: 200.0,
+            angle: 0.0,
+            direction: None,
+        };
+        let p_clear_mid = anim.head_pose(moved, 2200);
+        let [moved_pitch, _] = moved.angles();
+        let expected = (1.0 - u_mid) * IDLE_BIAS + u_mid * moved_pitch;
+        assert!((p_clear_mid.pitch - expected).abs() < 1e-5);
+        let p_clear_done = anim.head_pose(moved, 2400);
+        assert_eq!([p_clear_done.pitch, p_clear_done.yaw], moved.angles());
     }
 
     #[test]
