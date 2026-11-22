@@ -193,6 +193,18 @@ pub struct Interpreter<'a> {
     /// Optional co-op multiplayer VM context (`docs/vision.md`, "Multiplayer
     /// (v1)"). `None` in single-player, preserving 100% identical behavior.
     pub coop: Option<&'a RefCell<crate::coop::CoopVmContext>>,
+    /// Registry special-panel slots (`cObjectRegistry +0xe8..=+0x10c`) used by
+    /// `Dialog` kinds `5..=11, 13, 14` (`0x451552`, `0x4413e1..0x442320`) and
+    /// `Generic Sims Call` routine 35 (`0x451142`).
+    pub special_panels: Option<&'a RefCell<crate::primitives::dialog::SpecialPanels>>,
+    /// Transient inline coordination sink for synchronous reference book modals
+    /// (`Dialog` kinds 12 & 15, `0x4518e2`, `0x451946`) during `lot_update`.
+    pub(crate) inline_special_panel:
+        Option<&'a (dyn crate::primitives::dialog::InlinePanelSink + 'a)>,
+    /// True inside speculative `both_ways` probes (`crate::both_ways::Cells::on`)
+    /// where `inline_special_panel` is cleared so side-effectful inline books
+    /// refuse loudly instead of silently skipping `Player::special_panel`.
+    pub(crate) in_both_ways: bool,
 }
 
 /// One call of the original's "run this object's function" (0x422d46):
@@ -232,6 +244,9 @@ impl<'a> Interpreter<'a> {
             default_character_name: None,
             active_family: None,
             coop: None,
+            special_panels: None,
+            inline_special_panel: None,
+            in_both_ways: false,
         }
     }
 
@@ -396,6 +411,9 @@ impl<'a> Interpreter<'a> {
             default_character_name: self.default_character_name,
             active_family: self.active_family,
             coop: self.coop,
+            special_panels: self.special_panels,
+            inline_special_panel: self.inline_special_panel,
+            in_both_ways: self.in_both_ways,
         }
     }
 }
@@ -437,6 +455,12 @@ fn run(
             Ok(Status::Running) => {}
             Ok(Status::Returned(value)) => return Ok(value),
             Ok(Status::Yielded) => {
+                if machine
+                    .inline_special_panel
+                    .is_some_and(|inline| inline.has_unanswered())
+                {
+                    return Ok(false);
+                }
                 let trap = Trap::native(0x44f, "a synchronous tree yielded");
                 return Err(machine.fault(trap));
             }
@@ -517,6 +541,13 @@ pub(crate) struct Machine<'a, 'w> {
     pub(crate) active_family: Option<&'a [u32]>,
     /// See [`Interpreter::coop`].
     pub(crate) coop: Option<&'a RefCell<crate::coop::CoopVmContext>>,
+    /// See [`Interpreter::special_panels`].
+    pub(crate) special_panels: Option<&'a RefCell<crate::primitives::dialog::SpecialPanels>>,
+    /// See [`Interpreter::inline_special_panel`].
+    pub(crate) inline_special_panel:
+        Option<&'a (dyn crate::primitives::dialog::InlinePanelSink + 'a)>,
+    /// See [`Interpreter::in_both_ways`].
+    pub(crate) in_both_ways: bool,
 }
 
 impl<'a> Machine<'a, '_> {
@@ -548,6 +579,9 @@ impl<'a> Machine<'a, '_> {
             default_character_name: self.default_character_name,
             active_family: self.active_family,
             coop: self.coop,
+            special_panels: self.special_panels,
+            inline_special_panel: self.inline_special_panel,
+            in_both_ways: self.in_both_ways,
         }
     }
 
@@ -1147,7 +1181,25 @@ impl<'a> Machine<'a, '_> {
             )));
         }
         let place = self.thread_place();
-        let result = match self.primitive(instruction)? {
+        let flow = match self.primitive(instruction) {
+            Ok(flow) => flow,
+            Err(trap) => {
+                if self
+                    .inline_special_panel
+                    .is_some_and(|inline| inline.has_unanswered())
+                {
+                    return Ok(Status::Yielded);
+                }
+                return Err(trap);
+            }
+        };
+        if self
+            .inline_special_panel
+            .is_some_and(|inline| inline.has_unanswered())
+        {
+            return Ok(Status::Yielded);
+        }
+        let result = match flow {
             Flow::Branch(result) => result,
             Flow::Yield => return Ok(Status::Yielded),
             Flow::Pushed => return Ok(Status::Running),
