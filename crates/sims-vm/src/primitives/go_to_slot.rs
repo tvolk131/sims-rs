@@ -921,12 +921,17 @@ impl Machine<'_, '_> {
                         self.store_route(&ctx, &path);
                         let stack = &mut self.me_mut()?.stack;
                         let below = stack.len().checked_sub(2);
-                        below
-                            .and_then(|at| stack.get_mut(at))
+                        let below_depth = below.ok_or_else(|| {
+                            Trap::Invalid("no routing frame below the feedback tree".into())
+                        })?;
+                        stack
+                            .get_mut(below_depth)
                             .ok_or_else(|| {
                                 Trap::Invalid("no routing frame below the feedback tree".into())
                             })?
                             .primitive_state = FEEDBACK;
+                        let me = self.me;
+                        crate::interpreter::mark_frame_dirty(self.world, me, below_depth);
                         return Ok(Flow::Pushed);
                     }
                 }

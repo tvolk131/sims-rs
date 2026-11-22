@@ -288,12 +288,10 @@ fn world() -> World {
         loaded_indexed_suit_bones: BTreeMap::new(),
         made_outfits: BTreeMap::new(),
         person_outfits: BTreeMap::new(),
-        scratch_ptr_set: BTreeSet::new(),
-        scratch_ptr_set_to_next: BTreeSet::new(),
-        scratch_ptr_expression: BTreeSet::new(),
-        scratch_ptr_arg_slot: BTreeSet::new(),
+        scratch_ptrs: sims_sim::ScratchPtrs::new(),
         runtime_added_suits: Vec::new(),
         suit_scan_cache: None,
+        ..World::empty()
     }
 }
 

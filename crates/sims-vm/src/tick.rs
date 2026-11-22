@@ -680,12 +680,22 @@ impl Interpreter<'_> {
             inline_special_panel: inline_sink,
             ..*self
         };
-        for id in start..=end {
+        let mut cursor = start;
+        while cursor <= end {
+            let Some(id) = world.objects.next_key_from(cursor) else {
+                break;
+            };
+            if id > end {
+                break;
+            }
+            cursor = id.saturating_add(1);
             world.scheduler_cursor = id as i16;
             let Some(object) = world.objects.get(&id) else {
                 continue;
             };
             let mut flags = object.flags();
+            let mut countdown = object.countdown().unwrap_or(0);
+            let mut is_person = object.person.is_some();
             if flags & CHECK_ERROR != 0 {
                 if flags & READY != 0 && object.stack.is_empty() {
                     // 0x46d5da -> 0x46d68c -> 0x439a6f: a deferred thread
@@ -719,24 +729,27 @@ impl Interpreter<'_> {
                 if let Some(object) = world.objects.get_mut(&id) {
                     object.set_flags(CHECK_ERROR, false);
                     flags = object.flags();
+                    countdown = object.countdown().unwrap_or(0);
+                    is_person = object.person.is_some();
                 }
             }
             if flags & READY == 0 || (partial && flags & IN_PARTIAL == 0) {
+                if id == u16::MAX {
+                    break;
+                }
                 continue;
             }
-            let Some(object) = world.objects.get(&id) else {
-                continue;
-            };
-            let countdown = object.countdown().unwrap_or(0);
             if countdown > 0 {
                 if let Some(object) = world.objects.get_mut(&id) {
                     object.set_countdown(countdown - 1);
                 }
                 update.counted.push(id);
+                if id == u16::MAX {
+                    break;
+                }
                 continue;
             }
             let tick = world.ticks as i32;
-            let is_person = object.person.is_some();
             update.ticked.push(id);
             let mut caught = None;
             let catch = play.is_some().then_some(&mut caught);
@@ -782,6 +795,9 @@ impl Interpreter<'_> {
                     "object {id}'s tick returned false, which stops the scheduler's pass with \
                      the cursor kept; carrying on in the next update is not ported"
                 )));
+            }
+            if id == u16::MAX {
+                break;
             }
         }
         world.scheduler_cursor = 0;

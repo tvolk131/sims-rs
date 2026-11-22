@@ -9,6 +9,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+flate2.workspace = true
 postcard.workspace = true
 redb.workspace = true
 serde.workspace = true

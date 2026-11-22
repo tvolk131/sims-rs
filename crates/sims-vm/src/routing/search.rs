@@ -10,9 +10,11 @@
 //! addition, product, quotient and square root rounds to single
 //! precision.
 
-use super::regions::{HARD, Region, Space};
+use super::regions::{HARD, Region, Space, SpatialGrid};
 use crate::fault::Trap;
 use sims_core::{Ext, F32};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap};
 
 /// A point: the first coordinate (object +0xf8) and the second (+0xf4).
 pub(crate) type Point = [i32; 2];
@@ -27,6 +29,8 @@ struct Node {
     parent: Option<usize>,
     f: F32,
     g: F32,
+    is_goal: bool,
+    is_start: bool,
 }
 
 impl Node {
@@ -40,8 +44,28 @@ impl Node {
             parent: None,
             f: F32::ZERO,
             g: F32::ZERO,
+            is_goal: false,
+            is_start: false,
         }
     }
+}
+
+/// Total-order key for non-NaN IEEE-754 single-precision floats, normalizing
+/// `-0.0` to `+0.0` so ordering matches `F32::ext() < F32::ext()` exactly.
+/// Returns `None` for NaN.
+#[inline]
+fn float_sort_key(value: F32) -> Option<u32> {
+    if value.is_nan() {
+        return None;
+    }
+    let bits = value.to_bits();
+    let normalized = if bits == 0x8000_0000 { 0 } else { bits };
+    let mask = if normalized & 0x8000_0000 != 0 {
+        u32::MAX
+    } else {
+        0x8000_0000
+    };
+    Some(normalized ^ mask)
 }
 
 /// What a search is asked.
@@ -72,7 +96,12 @@ pub(crate) struct Found {
 struct Graph<'a> {
     query: Query<'a>,
     regions: Vec<Region>,
+    obstacle_grid: SpatialGrid,
+    region_grid: SpatialGrid,
     nodes: Vec<Node>,
+    /// First node index registered for `(goal, region)` — preserves exact
+    /// `nodes.iter().position(...)` first-match semantics via `.or_insert`.
+    node_by_goal_region: BTreeMap<(Option<usize>, usize), usize>,
     goal_nodes: Vec<usize>,
     start_nodes: Vec<usize>,
 }
@@ -115,6 +144,8 @@ impl Graph<'_> {
             fixed: self.query.fixed,
             regions: &self.regions,
             maximum: self.query.maximum,
+            obstacle_grid: Some(&self.obstacle_grid),
+            region_grid: Some(&self.region_grid),
         }
     }
 
@@ -124,7 +155,25 @@ impl Graph<'_> {
     }
 
     fn region_at(&self, rect: Region) -> Option<usize> {
-        self.regions.iter().position(|r| r.overlaps(rect))
+        self.region_grid.first_overlap(rect, &self.regions)
+    }
+
+    fn push_region(&mut self, rect: Region) -> usize {
+        let id = self.regions.len();
+        self.regions.push(rect);
+        self.region_grid.insert(id, rect);
+        id
+    }
+
+    fn push_node(&mut self, node: Node) -> usize {
+        let id = self.nodes.len();
+        if let Some(region) = node.region {
+            self.node_by_goal_region
+                .entry((node.goal, region))
+                .or_insert(id);
+        }
+        self.nodes.push(node);
+        id
     }
 
     /// The start's rectangle and node 0, the end node 1, and for each goal
@@ -134,10 +183,10 @@ impl Graph<'_> {
         let start = self.query.start;
         let mut region = Region([start[0], start[1], start[0] + 1, start[1] + 1, 0]);
         self.space().expand(&mut region);
-        self.regions.push(region);
-        self.nodes.push(Node::new(None, Some(0), 0));
+        self.push_region(region);
+        self.push_node(Node::new(None, Some(0), 0));
         self.nodes[0].point = start;
-        self.nodes.push(Node::new(None, None, 0));
+        self.push_node(Node::new(None, None, 0));
         for (i, &goal) in self.query.goals.iter().enumerate() {
             let obstacle = self.obstacle(goal);
             if obstacle.is_some_and(|r| r.0[4] == HARD) {
@@ -151,23 +200,26 @@ impl Graph<'_> {
                 if !self.space().expand(&mut r) {
                     continue;
                 }
-                self.regions.push(r);
-                self.regions.len() - 1
+                self.push_region(r)
             };
-            self.goal_nodes.push(self.nodes.len());
-            self.nodes
-                .push(Node::new(Some(i), Some(region), self.regions[region].0[4]));
-            self.start_nodes.push(self.nodes.len());
-            self.nodes.push(Node::new(Some(i), Some(0), goal.0[4]));
+            let mut goal_node = Node::new(Some(i), Some(region), self.regions[region].0[4]);
+            goal_node.is_goal = true;
+            let goal_node_id = self.push_node(goal_node);
+            self.goal_nodes.push(goal_node_id);
+
+            let mut start_node = Node::new(Some(i), Some(0), goal.0[4]);
+            start_node.is_start = true;
+            let start_node_id = self.push_node(start_node);
+            self.start_nodes.push(start_node_id);
         }
     }
 
-    /// A node's neighbours, found once: the rectangles along each side of
-    /// its rectangle, walked clockwise from the top-left corner, each
-    /// grown when first seen.
-    fn neighbors(&mut self, id: usize) -> Result<Vec<usize>, Trap> {
-        if let Some(n) = &self.nodes[id].neighbors {
-            return Ok(n.clone());
+    /// Computes a node's neighbours once and stores them on `self.nodes[id]`:
+    /// the rectangles along each side of its rectangle, walked clockwise from
+    /// the top-left corner, each grown when first seen.
+    fn ensure_neighbors(&mut self, id: usize) -> Result<(), Trap> {
+        if self.nodes[id].neighbors.is_some() {
+            return Ok(());
         }
         let mut neighbors = vec![];
         if id == 0 {
@@ -199,22 +251,15 @@ impl Graph<'_> {
                             ));
                         }
                         r.0[4] = obstacle.map_or(self.query.free_cost, |r| r.0[4]);
-                        self.regions.push(r);
-                        self.regions.len() - 1
+                        self.push_region(r)
                     };
                     let goal = self.nodes[id].goal;
-                    let node = self
-                        .nodes
-                        .iter()
-                        .position(|n| n.goal == goal && n.region == Some(region))
-                        .unwrap_or_else(|| {
-                            self.nodes.push(Node::new(
-                                goal,
-                                Some(region),
-                                self.regions[region].0[4],
-                            ));
-                            self.nodes.len() - 1
-                        });
+                    let node = match self.node_by_goal_region.get(&(goal, region)).copied() {
+                        Some(existing) => existing,
+                        None => {
+                            self.push_node(Node::new(goal, Some(region), self.regions[region].0[4]))
+                        }
+                    };
                     neighbors.push(node);
                     self.regions[region]
                 };
@@ -235,18 +280,22 @@ impl Graph<'_> {
                 seed.0[3] += dy;
                 side += usize::from(turn);
             }
-            if self.goal_nodes.contains(&id) {
+            if self.nodes[id].is_goal {
                 neighbors.push(1);
             }
-            if self.start_nodes.contains(&id) {
-                neighbors.extend(self.goal_nodes.iter().copied().filter(|&n| {
-                    self.nodes[n].goal == self.nodes[id].goal
-                        && self.nodes[n].region == self.nodes[id].region
-                }));
+            if self.nodes[id].is_start {
+                let goal = self.nodes[id].goal;
+                let region = self.nodes[id].region;
+                neighbors.extend(
+                    self.goal_nodes
+                        .iter()
+                        .copied()
+                        .filter(|&n| self.nodes[n].goal == goal && self.nodes[n].region == region),
+                );
             }
         }
-        self.nodes[id].neighbors = Some(neighbors.clone());
-        Ok(neighbors)
+        self.nodes[id].neighbors = Some(neighbors);
+        Ok(())
     }
 
     /// The cost of a step from one node to another and the point it
@@ -280,17 +329,37 @@ impl Graph<'_> {
 
 /// Runs a search to its end or its step limit.
 pub(crate) fn search(query: Query<'_>) -> Result<Found, Trap> {
+    let obstacle_grid = SpatialGrid::from_obstacles(query.dynamic, query.fixed);
     let mut graph = Graph {
         query,
         regions: vec![],
+        obstacle_grid,
+        region_grid: SpatialGrid::new(),
         nodes: vec![],
+        node_by_goal_region: BTreeMap::new(),
         goal_nodes: vec![],
         start_nodes: vec![],
     };
     graph.init();
     let steps = graph.query.steps;
-    let mut open = vec![0];
-    let mut closed: Vec<usize> = vec![];
+    let initial_len = graph.nodes.len();
+    let mut in_open = vec![false; initial_len];
+    let mut in_closed = vec![false; initial_len];
+    let mut open_seq = vec![0u64; initial_len];
+    let mut f_key: Vec<Option<u32>> = vec![None; initial_len];
+    let mut open_heap: BinaryHeap<Reverse<(u32, u64, usize)>> = BinaryHeap::new();
+    let mut open_count = 1usize;
+    let mut nan_in_open = 0usize;
+    let mut next_seq = 0u64;
+    in_open[0] = true;
+    open_seq[0] = 0;
+    f_key[0] = float_sort_key(graph.nodes[0].f);
+    if let Some(key) = f_key[0] {
+        open_heap.push(Reverse((key, 0, 0)));
+    } else {
+        nan_in_open = 1;
+    }
+
     let mut current = 0;
     let mut iterations = 0;
     let mut goal = None;
@@ -328,21 +397,41 @@ pub(crate) fn search(query: Query<'_>) -> Result<Found, Trap> {
             }
             break;
         }
-        for next in graph.neighbors(current)? {
+        graph.ensure_neighbors(current)?;
+        if graph.nodes.len() > in_open.len() {
+            let new_len = graph.nodes.len();
+            in_open.resize(new_len, false);
+            in_closed.resize(new_len, false);
+            open_seq.resize(new_len, 0);
+            f_key.resize(new_len, None);
+        }
+        let neighbor_count = graph.nodes[current].neighbors.as_ref().map_or(0, Vec::len);
+        for ni in 0..neighbor_count {
+            let next = graph.nodes[current]
+                .neighbors
+                .as_ref()
+                .expect("neighbors populated")[ni];
             let (cost, point) = graph.transition(current, next)?;
             let cost = (cost + graph.nodes[current].g.ext()).single();
-            if let Some(i) = closed.iter().position(|&id| id == next) {
+            if in_closed[next] {
                 if graph.nodes[next].g.ext() <= cost {
                     continue;
                 }
-                closed.remove(i);
+                in_closed[next] = false;
             }
-            if open.contains(&next) {
+            let already_open = in_open[next];
+            if already_open {
                 if cost >= graph.nodes[next].g.ext() {
                     continue;
                 }
+                if f_key[next].is_none() {
+                    nan_in_open -= 1;
+                }
             } else {
-                open.push(next);
+                in_open[next] = true;
+                open_count += 1;
+                next_seq += 1;
+                open_seq[next] = next_seq;
             }
             let h = if next == 1 {
                 Ext::ZERO
@@ -355,22 +444,49 @@ pub(crate) fn search(query: Query<'_>) -> Result<Found, Trap> {
             n.f = (cost + h).single().to_f32();
             n.point = point;
             n.parent = Some(current);
-        }
-        if let Some(at) = open.iter().position(|&id| id == current) {
-            open.remove(at);
-        }
-        closed.push(current);
-        if open.is_empty() {
-            break;
-        }
-        // The first node with the least estimate.
-        let mut best = open[0];
-        for &id in &open[1..] {
-            if graph.nodes[id].f.ext() < graph.nodes[best].f.ext() {
-                best = id;
+            let key = float_sort_key(n.f);
+            f_key[next] = key;
+            if let Some(k) = key {
+                open_heap.push(Reverse((k, open_seq[next], next)));
+            } else {
+                nan_in_open += 1;
             }
         }
-        current = best;
+        if in_open[current] {
+            in_open[current] = false;
+            open_count -= 1;
+            if f_key[current].is_none() {
+                nan_in_open -= 1;
+            }
+        }
+        in_closed[current] = true;
+        if open_count == 0 {
+            break;
+        }
+        // The first node (lowest open_seq) with the least estimate.
+        current = if nan_in_open == 0 {
+            loop {
+                let Reverse((key, seq, id)) =
+                    open_heap.pop().expect("open_count > 0 implies heap entry");
+                if in_open[id] && open_seq[id] == seq && f_key[id] == Some(key) {
+                    break id;
+                }
+            }
+        } else {
+            let mut active: Vec<(u64, usize)> = in_open
+                .iter()
+                .enumerate()
+                .filter_map(|(id, &open)| open.then_some((open_seq[id], id)))
+                .collect();
+            active.sort_unstable_by_key(|&(seq, _)| seq);
+            let mut best = active[0].1;
+            for &(_, id) in &active[1..] {
+                if graph.nodes[id].f.ext() < graph.nodes[best].f.ext() {
+                    best = id;
+                }
+            }
+            best
+        };
     }
     let mut pass = 0;
     loop {
@@ -495,5 +611,50 @@ mod tests {
         let found = search(query(&goals, &fixed)).unwrap();
         assert_eq!(found.goal, None);
         assert!(found.points.is_empty());
+    }
+
+    #[test]
+    fn float_sort_key_orders_ieee_floats_and_rejects_nan() {
+        let vals = [
+            f32::NEG_INFINITY,
+            -1000.0,
+            -1.0,
+            -0.0,
+            0.0,
+            1.0,
+            1000.0,
+            f32::INFINITY,
+        ];
+        let keys: Vec<u32> = vals
+            .iter()
+            .map(|&v| float_sort_key(F32::from_f32(v)).unwrap())
+            .collect();
+        // -0.0 and +0.0 normalize to the same key; all other neighbors strictly increase.
+        assert_eq!(keys[3], keys[4]);
+        for pair in keys.windows(2) {
+            assert!(pair[0] <= pair[1]);
+        }
+        assert!(keys[2] < keys[3] && keys[4] < keys[5]);
+        assert!(float_sort_key(F32::from_f32(f32::NAN)).is_none());
+    }
+
+    #[test]
+    fn multi_goal_same_region_and_tie_break_are_deterministic() {
+        // Two equidistant goals in the same start region; goal 0 must win tie-break.
+        let border = [
+            Region([-7, -7, 7, 300, HARD]),
+            Region([-7, -7, 300, 7, HARD]),
+            Region([200, -7, 300, 300, HARD]),
+            Region([-7, 200, 300, 300, HARD]),
+        ];
+        let goals = [
+            Region([24, 20, 25, 21, 0]),
+            Region([20, 24, 21, 25, 0]),
+            Region([100, 100, 101, 101, 0]),
+        ];
+        let found = search(query(&goals, &border)).unwrap();
+        assert_eq!(found.goal, Some(0));
+        assert_eq!(found.points.first(), Some(&[20, 20]));
+        assert_eq!(found.points.last(), Some(&[24, 20]));
     }
 }

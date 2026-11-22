@@ -846,10 +846,10 @@ struct CoopWorldFingerprintTail<'a> {
     loaded_indexed_suit_bones: &'a BTreeMap<String, Vec<Vec<String>>>,
     made_outfits: &'a BTreeMap<u32, BTreeMap<usize, String>>,
     person_outfits: &'a BTreeMap<u16, sims_sim::PersonOutfit>,
-    scratch_ptr_set: &'a BTreeSet<u16>,
-    scratch_ptr_set_to_next: &'a BTreeSet<u16>,
-    scratch_ptr_expression: &'a BTreeSet<u16>,
-    scratch_ptr_arg_slot: &'a BTreeSet<u16>,
+    scratch_ptr_set: sims_sim::ScratchPtrBitSerialize<'a>,
+    scratch_ptr_set_to_next: sims_sim::ScratchPtrBitSerialize<'a>,
+    scratch_ptr_expression: sims_sim::ScratchPtrBitSerialize<'a>,
+    scratch_ptr_arg_slot: sims_sim::ScratchPtrBitSerialize<'a>,
     runtime_added_suits: &'a Vec<String>,
     suit_scan_cache: &'a Option<Vec<String>>,
     activity_owners: Option<&'a BTreeMap<u16, PlayerId>>,
@@ -2918,10 +2918,14 @@ impl Lot {
             loaded_indexed_suit_bones: &w.loaded_indexed_suit_bones,
             made_outfits: &w.made_outfits,
             person_outfits: &w.person_outfits,
-            scratch_ptr_set: &w.scratch_ptr_set,
-            scratch_ptr_set_to_next: &w.scratch_ptr_set_to_next,
-            scratch_ptr_expression: &w.scratch_ptr_expression,
-            scratch_ptr_arg_slot: &w.scratch_ptr_arg_slot,
+            scratch_ptr_set: w.scratch_ptrs.serialize_bit(sims_sim::SCRATCH_PTR_SET),
+            scratch_ptr_set_to_next: w
+                .scratch_ptrs
+                .serialize_bit(sims_sim::SCRATCH_PTR_SET_TO_NEXT),
+            scratch_ptr_expression: w
+                .scratch_ptrs
+                .serialize_bit(sims_sim::SCRATCH_PTR_EXPRESSION),
+            scratch_ptr_arg_slot: w.scratch_ptrs.serialize_bit(sims_sim::SCRATCH_PTR_ARG_SLOT),
             runtime_added_suits: &w.runtime_added_suits,
             suit_scan_cache: &w.suit_scan_cache,
             activity_owners: self.coop.as_ref().map(|c| &c.activity_owners),
@@ -2934,11 +2938,9 @@ impl Lot {
             frozen_dialog_digest,
             pending_speed_sync: self.coop.as_ref().is_some_and(|c| c.pending_speed_sync),
         };
-        let encoded = postcard::to_allocvec(&tail)
-            .expect("CoopWorldFingerprintTail postcard serialization is infallible");
         let mut hasher = Sha256::new();
         hasher.update(COOP_WORLD_HASH_DOMAIN);
-        hasher.update(&encoded);
+        sims_sim::hash_postcard(&tail, &mut hasher);
         hasher.finalize().into()
     }
 
@@ -3827,9 +3829,12 @@ mod tests {
             adult_mood: vec![curve(7)],
             child_mood: vec![curve(7)],
         };
+        let catalog: std::sync::Arc<Catalog> = catalog.into();
+        let fast = crate::program::ProgramFast::build(&program, &catalog);
         Lot {
             program,
-            catalog: catalog.into(),
+            fast,
+            catalog,
             surfaces: sims_content::Surfaces::default(),
             world,
             tuning: Some(tuning),

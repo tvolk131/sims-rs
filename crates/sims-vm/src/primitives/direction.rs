@@ -46,10 +46,10 @@ impl Machine<'_, '_> {
             .map_err(|_| Trap::native(9, "invalid memory scope"))?;
         // 0x45202b: binds `[esi + 0x128]` to `&[ebp + 0x0c]` before resolving
         // the destination operand and never clears it.
-        self.world.scratch_ptr_set_to_next.remove(&self.me);
-        self.world.scratch_ptr_expression.remove(&self.me);
-        self.world.scratch_ptr_arg_slot.insert(self.me);
-        self.world.scratch_ptr_set.insert(self.me);
+        self.world.scratch_ptrs.set(
+            self.me,
+            sims_sim::SCRATCH_PTR_SET | sims_sim::SCRATCH_PTR_ARG_SLOT,
+        );
         let (destination, writable) = self.resolve(scope, word(operands, 0), true)?;
         self.probe(destination)?;
         let (scope, index) = if operands[4] & 1 != 0 {

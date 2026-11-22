@@ -6,8 +6,60 @@ use sims_formats::execution::{self, ObjectFunction, ObjectFunctions, Slots};
 use sims_formats::iff::Iff;
 use sims_sim::TypeAttributes;
 use sims_sim::rooms::Tuning;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+
+/// Precomputed immutable tuning constants and parsed score curves attached to
+/// a linked [`Library`] during [`Program::link_with_pool`].
+#[derive(Debug, Clone, Default)]
+pub struct LibraryTuningCache {
+    room_tuning: Option<Tuning>,
+    autonomy_constants: Option<crate::autonomy::Constants>,
+    score_curves: BTreeMap<u16, Vec<sims_sim::motives::Curve>>,
+}
+
+/// Fast-path lookup tables derived once from a linked [`Program`] and
+/// [`Catalog`] (stored on [`crate::boot::Lot`] and borrowed into
+/// [`crate::Interpreter`]).
+#[derive(Debug, Clone)]
+pub(crate) struct ProgramFast {
+    /// Dense semi-global resource index (`semi_globals[owner] == program.semi_globals[&owner]`).
+    pub semi_globals: Vec<Option<usize>>,
+    /// GUIDs that appear more than once in `catalog.objects`.
+    pub duplicate_guids: BTreeSet<u32>,
+}
+
+impl ProgramFast {
+    pub(crate) fn build(program: &Program, catalog: &Catalog) -> Self {
+        let max_res = program
+            .semi_globals
+            .keys()
+            .next_back()
+            .copied()
+            .map_or(0, |k| k + 1);
+        let mut semi_globals = vec![None; max_res];
+        for (&owner, &semi) in &program.semi_globals {
+            semi_globals[owner] = semi;
+        }
+        let mut seen = BTreeSet::new();
+        let mut duplicate_guids = BTreeSet::new();
+        for object in &catalog.objects {
+            if !seen.insert(object.guid) {
+                duplicate_guids.insert(object.guid);
+            }
+        }
+        Self {
+            semi_globals,
+            duplicate_guids,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn semi_global(&self, owner: usize) -> Option<usize> {
+        self.semi_globals.get(owner).copied().flatten()
+    }
+}
 
 /// The SLOT entry kind that makes a routing slot (0x46e3a0).
 const ROUTING_SLOT: u16 = 3;
@@ -102,6 +154,11 @@ pub struct Library {
     /// `0x413083`). FAR archive members (`ResolveResFile`, `0x5cfb38`) and
     /// files from other mounts (`0x43aa03`) are read-only.
     pub writable: bool,
+    /// Precomputed tuning constants and parsed score curves populated by
+    /// [`Program::link_with_pool`]. Left `None` by [`Library::default`] so
+    /// synthetic test fixtures that mutate `tuning`/`strings` always read live.
+    #[doc(hidden)]
+    pub cached_tuning: Option<LibraryTuningCache>,
 }
 
 /// The `BMP_` chunk ID of a person file's portrait faces (`0x4e9260`).
@@ -302,10 +359,16 @@ impl Program {
                 let careers_handle = scope.spawn(|| careers_with_pool(index, pool));
                 let texts_handle = scope.spawn(|| career_texts_end_with_pool(index, pool));
                 let labels_handle = scope.spawn(|| labels_hold_no_token(&index.root));
+                let global_res = catalog.global;
                 let libs: Vec<(usize, Result<Library>)> = if workers <= 1 {
                     resources_to_load
                         .iter()
-                        .map(|&res| (res, load_library_with_pool(index, res, pool)))
+                        .map(|&res| {
+                            (
+                                res,
+                                load_library_with_pool(index, res, res == global_res, pool),
+                            )
+                        })
                         .collect()
                 } else {
                     let chunk_size = resources_to_load.len().div_ceil(workers);
@@ -315,7 +378,17 @@ impl Program {
                             scope.spawn(move || {
                                 chunk
                                     .iter()
-                                    .map(|&res| (res, load_library_with_pool(index, res, pool)))
+                                    .map(|&res| {
+                                        (
+                                            res,
+                                            load_library_with_pool(
+                                                index,
+                                                res,
+                                                res == global_res,
+                                                pool,
+                                            ),
+                                        )
+                                    })
                                     .collect::<Vec<_>>()
                             })
                         })
@@ -368,7 +441,12 @@ impl Program {
     }
 }
 
-fn load_library_with_pool(index: &Index, resource: usize, pool: &ArchivePool) -> Result<Library> {
+fn load_library_with_pool(
+    index: &Index,
+    resource: usize,
+    is_global: bool,
+    pool: &ArchivePool,
+) -> Result<Library> {
     let file = &index.resources[resource];
     let location = file.location(&index.root);
     let format =
@@ -552,7 +630,93 @@ fn load_library_with_pool(index: &Index, resource: usize, pool: &ArchivePool) ->
         };
         library.callbacks.insert(chunk.id, callbacks);
     }
+    library.cached_tuning = Some(build_library_tuning_cache(&library, is_global));
     Ok(library)
+}
+
+fn compute_room_tuning(library: Option<&Library>) -> Tuning {
+    let table = library.and_then(|library| library.tuning.get(&ROOM_TUNING));
+    Tuning::from_lookup(|name| table.and_then(|table| table.get(name)))
+}
+
+fn compute_autonomy_constants(library: Option<&Library>) -> crate::autonomy::Constants {
+    use crate::autonomy::Constants;
+    use sims_core::{Ext, F32};
+    let table = library.and_then(|library| library.tuning.get(&AUTONOMY_TUNING));
+    let value = |name: &str, default: u32| {
+        table
+            .and_then(|table| {
+                table
+                    .entries
+                    .iter()
+                    .find(|entry| entry.name.eq_ignore_ascii_case(name))
+            })
+            .map_or(F32::from_bits(default), |entry| F32::from_f32(entry.value))
+    };
+    Constants {
+        family_threshold: value("min autonomy score for family", 0x3e4c_cccd),
+        visitor_threshold: value("min autonomy score for visitors", 0x3d4c_cccd),
+        attenuation: [
+            value("low attenuation", 0x3b03_126f),
+            value("moderate attenuation", 0x3ca3_d70a),
+            value("high attenuation", 0x3dcc_cccd),
+        ],
+        visitor_attenuation: [
+            value("visitor low attenuation", 0x3b03_126f),
+            value("visitor moderate attenuation", 0x3ca3_d70a),
+            value("visitor high attenuation", 0x3dcc_cccd),
+        ],
+        sitting_threshold: value("min autonomy score for sitting", 0x3e4c_cccd),
+        random_count: Ext::from_f32(value("random selection count", 0x4120_0000)).to_i32_truncate(),
+        distance_attenuation: value("functional distance attenuation", 0x4040_0000),
+        friendship_threshold: Ext::from_f32(value("friendship threshold", 0x41c8_0000))
+            .to_i32_truncate(),
+    }
+}
+
+fn parse_score_curves(
+    strings: &[String],
+    table: u16,
+) -> std::result::Result<Vec<sims_sim::motives::Curve>, String> {
+    use crate::autonomy::{SCORE_MOTIVES, SCORE_POINTS};
+    SCORE_MOTIVES
+        .iter()
+        .enumerate()
+        .map(|(i, &motive)| {
+            let text = strings
+                .get(i)
+                .ok_or_else(|| format!("string table {table} has no entry {i}"))?;
+            Ok(sims_sim::motives::Curve::parse(motive, text, SCORE_POINTS))
+        })
+        .collect()
+}
+
+fn build_library_tuning_cache(library: &Library, is_global: bool) -> LibraryTuningCache {
+    let mut score_curves = BTreeMap::new();
+    if is_global {
+        for table in [501u16, 503u16] {
+            if let Some(strings) = library.strings.get(&table)
+                && let Ok(parsed) = parse_score_curves(strings, table)
+            {
+                score_curves.insert(table, parsed);
+            }
+        }
+    }
+    for words in library.definitions.values() {
+        let custom = words[51] as u16;
+        if custom != 0
+            && !score_curves.contains_key(&custom)
+            && let Some(strings) = library.strings.get(&custom)
+            && let Ok(parsed) = parse_score_curves(strings, custom)
+        {
+            score_curves.insert(custom, parsed);
+        }
+    }
+    LibraryTuningCache {
+        room_tuning: is_global.then(|| compute_room_tuning(Some(library))),
+        autonomy_constants: is_global.then(|| compute_autonomy_constants(Some(library))),
+        score_curves,
+    }
 }
 
 impl Program {
@@ -563,11 +727,14 @@ impl Program {
     /// Ported from the old prototype's `Tuning::from_program`
     /// (legacy/crates/sims-sim/src/lot_environment.rs).
     pub fn room_tuning(&self) -> Tuning {
-        let table = self
-            .libraries
-            .get(&self.global)
-            .and_then(|library| library.tuning.get(&ROOM_TUNING));
-        Tuning::from_lookup(|name| table.and_then(|table| table.get(name)))
+        let global = self.libraries.get(&self.global);
+        if let Some(cached) = global
+            .and_then(|l| l.cached_tuning.as_ref())
+            .and_then(|c| c.room_tuning)
+        {
+            return cached;
+        }
+        compute_room_tuning(global)
     }
 
     /// The constants a person's motives are updated with
@@ -639,42 +806,14 @@ impl Program {
     /// values read here were compared with the stored ones in a memory
     /// image of the original (`docs/decisions/`).
     pub fn autonomy_constants(&self) -> crate::autonomy::Constants {
-        use crate::autonomy::Constants;
-        use sims_core::{Ext, F32};
-        let table = self
-            .libraries
-            .get(&self.global)
-            .and_then(|library| library.tuning.get(&AUTONOMY_TUNING));
-        let value = |name: &str, default: u32| {
-            table
-                .and_then(|table| {
-                    table
-                        .entries
-                        .iter()
-                        .find(|entry| entry.name.eq_ignore_ascii_case(name))
-                })
-                .map_or(F32::from_bits(default), |entry| F32::from_f32(entry.value))
-        };
-        Constants {
-            family_threshold: value("min autonomy score for family", 0x3e4c_cccd),
-            visitor_threshold: value("min autonomy score for visitors", 0x3d4c_cccd),
-            attenuation: [
-                value("low attenuation", 0x3b03_126f),
-                value("moderate attenuation", 0x3ca3_d70a),
-                value("high attenuation", 0x3dcc_cccd),
-            ],
-            visitor_attenuation: [
-                value("visitor low attenuation", 0x3b03_126f),
-                value("visitor moderate attenuation", 0x3ca3_d70a),
-                value("visitor high attenuation", 0x3dcc_cccd),
-            ],
-            sitting_threshold: value("min autonomy score for sitting", 0x3e4c_cccd),
-            random_count: Ext::from_f32(value("random selection count", 0x4120_0000))
-                .to_i32_truncate(),
-            distance_attenuation: value("functional distance attenuation", 0x4040_0000),
-            friendship_threshold: Ext::from_f32(value("friendship threshold", 0x41c8_0000))
-                .to_i32_truncate(),
+        let global = self.libraries.get(&self.global);
+        if let Some(cached) = global
+            .and_then(|l| l.cached_tuning.as_ref())
+            .and_then(|c| c.autonomy_constants)
+        {
+            return cached;
         }
+        compute_autonomy_constants(global)
     }
 
     /// A person's score curves: the curves Find Best Interaction weighs
@@ -694,23 +833,35 @@ impl Program {
         resource: usize,
         table: u16,
     ) -> std::result::Result<Vec<sims_sim::motives::Curve>, String> {
-        use crate::autonomy::{SCORE_MOTIVES, SCORE_POINTS};
+        self.score_curves_ref(global, resource, table)
+            .map(Cow::into_owned)
+    }
+
+    /// Borrowing variant of [`Self::score_curves`] returning precomputed
+    /// curves by reference when linked via [`Self::link_with_pool`].
+    pub fn score_curves_ref(
+        &self,
+        global: bool,
+        resource: usize,
+        table: u16,
+    ) -> std::result::Result<Cow<'_, [sims_sim::motives::Curve]>, String> {
         let file = if global { self.global } else { resource };
-        let strings = self
+        let library = self
             .libraries
             .get(&file)
-            .and_then(|library| library.strings.get(&table))
             .ok_or_else(|| format!("resource {file} has no string table {table}"))?;
-        SCORE_MOTIVES
-            .iter()
-            .enumerate()
-            .map(|(i, &motive)| {
-                let text = strings
-                    .get(i)
-                    .ok_or_else(|| format!("string table {table} has no entry {i}"))?;
-                Ok(sims_sim::motives::Curve::parse(motive, text, SCORE_POINTS))
-            })
-            .collect()
+        if let Some(cached) = library
+            .cached_tuning
+            .as_ref()
+            .and_then(|c| c.score_curves.get(&table))
+        {
+            return Ok(Cow::Borrowed(cached.as_slice()));
+        }
+        let strings = library
+            .strings
+            .get(&table)
+            .ok_or_else(|| format!("resource {file} has no string table {table}"))?;
+        parse_score_curves(strings, table).map(Cow::Owned)
     }
 
     /// Resolves a tree ID for code running on behalf of the object whose

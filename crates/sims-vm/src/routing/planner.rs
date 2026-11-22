@@ -115,46 +115,64 @@ fn obstacle(rect: Region, cost: i32, kind: i16, actor: [i32; 4]) -> Option<Regio
     })
 }
 
+/// Pre-check for [`Interpreter::ignored`]: handles all fast checks (never
+/// mutates `world.order`) and tells [`Interpreter::plan`] when an
+/// `ALLOW_OVERLAP` callback is needed.
+enum IgnoreCheck {
+    Ignored,
+    Obstacle,
+    CheckOverlap,
+}
+
 impl Interpreter<'_> {
-    /// Whether the planner leaves an object out of its obstacles
-    /// (0x4817e9): one in a container; one a person may pass by its data
-    /// word 8 (with bit 2, when bit 1 is clear; else when bit 4 is set)
-    /// and whose data word 10 is 0; another person farther than 3 tiles
-    /// (one nearer is an obstacle),
-    /// or the one the context names; and any other object that answers
-    /// its function 5 true with the person as the stack object.
-    pub(crate) fn ignored(&self, world: &mut World, ctx: &Context, id: u16) -> Result<bool, Fault> {
+    fn check_ignored_fast(
+        &self,
+        world: &mut World,
+        ctx: &Context,
+        id: u16,
+    ) -> Result<IgnoreCheck, Fault> {
         let fail = |trap| Fault {
             object: ctx.person,
             at: None,
             trap,
         };
         if capture(world, id).map_err(fail)?.container.is_some() {
-            return Ok(true);
-        }
-        let flags = datum(world, id, FLAGS).map_err(fail)? as u16;
-        let passable = if flags & 4 != 0 {
-            flags & 2 == 0
-        } else {
-            flags & 0x10 != 0
-        };
-        if passable && datum(world, id, COST).map_err(fail)? == 0 {
-            return Ok(true);
-        }
-        if self.kind(world, id).map_err(fail)? != PERSON {
-            return self.callback(world, id, ALLOW_OVERLAP, ctx.person as i16);
+            return Ok(IgnoreCheck::Ignored);
         }
         let object = world
             .objects
             .get(&id)
             .ok_or_else(|| fail(Trap::native(10, "missing object")))?;
+        let flags = object
+            .data
+            .get(FLAGS)
+            .copied()
+            .ok_or_else(|| fail(Trap::Invalid(format!("object data has no word {FLAGS}"))))?
+            as u16;
+        let passable = if flags & 4 != 0 {
+            flags & 2 == 0
+        } else {
+            flags & 0x10 != 0
+        };
+        if passable {
+            let cost =
+                object.data.get(COST).copied().ok_or_else(|| {
+                    fail(Trap::Invalid(format!("object data has no word {COST}")))
+                })?;
+            if cost == 0 {
+                return Ok(IgnoreCheck::Ignored);
+            }
+        }
+        if self.kind(world, id).map_err(fail)? != PERSON {
+            return Ok(IgnoreCheck::CheckOverlap);
+        }
         if object.person.is_none() {
             return Err(fail(unsupported(
                 "an object of the person type that is not a person",
             )));
         }
         if ctx.objects[0] == id {
-            return Ok(true);
+            return Ok(IgnoreCheck::Ignored);
         }
         let from = world
             .objects
@@ -164,7 +182,26 @@ impl Interpreter<'_> {
         let distance = crate::primitives::distance(from, object.position, false);
         // 0x48188a: a person within 3 tiles (or at a distance that is not
         // a number) is in the way.
-        Ok(distance > Ext::from_i32(NEAR))
+        Ok(if distance > Ext::from_i32(NEAR) {
+            IgnoreCheck::Ignored
+        } else {
+            IgnoreCheck::Obstacle
+        })
+    }
+
+    /// Whether the planner leaves an object out of its obstacles
+    /// (0x4817e9): one in a container; one a person may pass by its data
+    /// word 8 (with bit 2, when bit 1 is clear; else when bit 4 is set)
+    /// and whose data word 10 is 0; another person farther than 3 tiles
+    /// (one nearer is an obstacle),
+    /// or the one the context names; and any other object that answers
+    /// its function 5 true with the person as the stack object.
+    pub(crate) fn ignored(&self, world: &mut World, ctx: &Context, id: u16) -> Result<bool, Fault> {
+        match self.check_ignored_fast(world, ctx, id)? {
+            IgnoreCheck::Ignored => Ok(true),
+            IgnoreCheck::Obstacle => Ok(false),
+            IgnoreCheck::CheckOverlap => self.callback(world, id, ALLOW_OVERLAP, ctx.person as i16),
+        }
     }
 
     /// Plans the route of a context: fills `path` and the context's
@@ -195,8 +232,18 @@ impl Interpreter<'_> {
             .ok_or_else(|| fail(unsupported("a route for an object that is not a person")))?;
         let through = through(&words.data);
         // 0x482458: data word 17 set, the ground is not costed.
-        let ground = datum(world, person, PACE).map_err(fail)? == 0;
-        let room = datum(world, person, ROOM).map_err(fail)?;
+        let ground = me
+            .data
+            .get(PACE)
+            .copied()
+            .ok_or_else(|| fail(Trap::Invalid(format!("object data has no word {PACE}"))))?
+            == 0;
+        let room = me
+            .data
+            .get(ROOM)
+            .copied()
+            .ok_or_else(|| fail(Trap::Invalid(format!("object data has no word {ROOM}"))))?;
+        let actor = me.footprint;
         if !through && datum(world, ctx.target, ROOM).map_err(fail)? != room {
             return Err(fail(unsupported("a slot in another room than the person")));
         }
@@ -205,74 +252,114 @@ impl Interpreter<'_> {
             None => return Err(fail(unsupported("a person in no room"))),
         };
         let free_cost = free_cost(room, outdoors, ground);
-        let actor = me.footprint;
 
         // The objects' obstacles; none for a person going through
-        // everything (0x48258f).
+        // everything (0x48258f). Borrow `&world.order` until the first object
+        // actually requires an `ALLOW_OVERLAP` callback, then snapshot only
+        // the remaining suffix so semantics remain identical to an upfront
+        // clone even if a callback mutates `world.order`.
         let mut dynamic = Vec::new();
-        let order = if through {
-            Vec::new()
-        } else {
-            world.order.clone()
-        };
-        for id in order {
-            if id == person || !world.objects.contains_key(&id) {
-                continue;
-            }
-            if datum(world, id, ROOM).map_err(fail)? != room {
-                continue;
-            }
-            if self.ignored(world, ctx, id)? {
-                continue;
-            }
-            let object = world
-                .objects
-                .get(&id)
-                .ok_or_else(|| fail(Trap::native(10, "missing object")))?;
-            let fp = object.footprint;
-            let mut cost = if datum(world, id, COST).map_err(fail)? != 0 {
-                10
-            } else {
-                HARD
-            };
-            let mut rect = Region([fp[0], fp[1], fp[2], fp[3], cost]);
-            let kind = self.kind(world, id).map_err(fail)?;
-            if kind == DOOR {
-                // 0x4359ce: the door's walls, turned by its direction.
-                // 0x482620..0x482758: each matching wall edge bit replaces
-                // the obstacle rectangle (`[ebp - 0x58]`) with a 1-unit strip
-                // along that footprint edge at cost 10000 and inflates it by
-                // `PADDING` (3); `0x48276f` and `0x48279f` then run on the
-                // resulting rectangle and cost.
-                let mask = i32::from(datum(world, id, WALL_MASK).map_err(fail)?);
-                if mask != 0 {
-                    let dir = (datum(world, id, DIRECTION).map_err(fail)? as u8 & 31) as u32;
-                    let turned = (mask as u32).wrapping_shl(dir);
-                    let bits = (turned & 0xff) | ((turned >> 8) & 0xff);
-                    const DOOR_EDGE_COST: i32 = 10_000;
-                    if bits & 0x01 != 0 {
-                        cost = DOOR_EDGE_COST;
-                        rect = Region([fp[0], fp[1], fp[2], fp[1].wrapping_add(1), cost])
-                            .inflate(PADDING);
+        if !through {
+            let mut idx = 0usize;
+            let mut suffix: Option<Vec<u16>> = None;
+            loop {
+                let id = if let Some(rest) = suffix.as_ref() {
+                    if idx >= rest.len() {
+                        break;
                     }
-                    if bits & 0x04 != 0 {
-                        cost = DOOR_EDGE_COST;
-                        rect = Region([fp[2].wrapping_sub(1), fp[1], fp[2], fp[3], cost])
-                            .inflate(PADDING);
+                    let id = rest[idx];
+                    idx += 1;
+                    id
+                } else {
+                    if idx >= world.order.len() {
+                        break;
                     }
-                    if bits & 0x10 != 0 {
-                        cost = DOOR_EDGE_COST;
-                        rect = Region([fp[0], fp[3].wrapping_sub(1), fp[2], fp[3], cost])
-                            .inflate(PADDING);
-                    }
-                    if bits & 0x40 != 0 {
-                        cost = DOOR_EDGE_COST;
-                        rect = Region([fp[0], fp[1], fp[0].wrapping_add(1), fp[3], cost])
-                            .inflate(PADDING);
+                    let id = world.order[idx];
+                    idx += 1;
+                    id
+                };
+                if id == person {
+                    continue;
+                }
+                let Some(object) = world.objects.get(&id) else {
+                    continue;
+                };
+                let obj_room = object.data.get(ROOM).copied().ok_or_else(|| {
+                    fail(Trap::Invalid(format!("object data has no word {ROOM}")))
+                })?;
+                if obj_room != room {
+                    continue;
+                }
+                match self.check_ignored_fast(world, ctx, id)? {
+                    IgnoreCheck::Ignored => continue,
+                    IgnoreCheck::Obstacle => {}
+                    IgnoreCheck::CheckOverlap => {
+                        if suffix.is_none() {
+                            suffix = Some(world.order[idx..].to_vec());
+                            idx = 0;
+                        }
+                        if self.callback(world, id, ALLOW_OVERLAP, ctx.person as i16)? {
+                            continue;
+                        }
                     }
                 }
+                let object = world
+                    .objects
+                    .get(&id)
+                    .ok_or_else(|| fail(Trap::native(10, "missing object")))?;
+                let fp = object.footprint;
+                let cost_word = object.data.get(COST).copied().ok_or_else(|| {
+                    fail(Trap::Invalid(format!("object data has no word {COST}")))
+                })?;
+                let mut cost = if cost_word != 0 { 10 } else { HARD };
+                let mut rect = Region([fp[0], fp[1], fp[2], fp[3], cost]);
+                let kind = self.kind(world, id).map_err(fail)?;
+                if kind == DOOR {
+                    // 0x4359ce: the door's walls, turned by its direction.
+                    // 0x482620..0x482758: each matching wall edge bit replaces
+                    // the obstacle rectangle (`[ebp - 0x58]`) with a 1-unit strip
+                    // along that footprint edge at cost 10000 and inflates it by
+                    // `PADDING` (3); `0x48276f` and `0x48279f` then run on the
+                    // resulting rectangle and cost.
+                    let mask = i32::from(object.data.get(WALL_MASK).copied().ok_or_else(|| {
+                        fail(Trap::Invalid(format!(
+                            "object data has no word {WALL_MASK}"
+                        )))
+                    })?);
+                    if mask != 0 {
+                        let dir = (object.data.get(DIRECTION).copied().ok_or_else(|| {
+                            fail(Trap::Invalid(format!(
+                                "object data has no word {DIRECTION}"
+                            )))
+                        })? as u8
+                            & 31) as u32;
+                        let turned = (mask as u32).wrapping_shl(dir);
+                        let bits = (turned & 0xff) | ((turned >> 8) & 0xff);
+                        const DOOR_EDGE_COST: i32 = 10_000;
+                        if bits & 0x01 != 0 {
+                            cost = DOOR_EDGE_COST;
+                            rect = Region([fp[0], fp[1], fp[2], fp[1].wrapping_add(1), cost])
+                                .inflate(PADDING);
+                        }
+                        if bits & 0x04 != 0 {
+                            cost = DOOR_EDGE_COST;
+                            rect = Region([fp[2].wrapping_sub(1), fp[1], fp[2], fp[3], cost])
+                                .inflate(PADDING);
+                        }
+                        if bits & 0x10 != 0 {
+                            cost = DOOR_EDGE_COST;
+                            rect = Region([fp[0], fp[3].wrapping_sub(1), fp[2], fp[3], cost])
+                                .inflate(PADDING);
+                        }
+                        if bits & 0x40 != 0 {
+                            cost = DOOR_EDGE_COST;
+                            rect = Region([fp[0], fp[1], fp[0].wrapping_add(1), fp[3], cost])
+                                .inflate(PADDING);
+                        }
+                    }
+                }
+                dynamic.extend(obstacle(rect, cost, kind, actor));
             }
-            dynamic.extend(obstacle(rect, cost, kind, actor));
         }
 
         // 0x4827f6: the room's own rectangles (0x46795a, with terrain), or,

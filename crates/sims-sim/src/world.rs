@@ -5,13 +5,265 @@ use crate::neighbors::{Family, Neighbors};
 use crate::rooms::Rooms;
 use crate::route::Routing;
 use crate::{Error, Result};
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeSeq;
+use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use sims_content::{Catalog, House as HouseFile};
 use sims_core::{CrtRng, GameRng};
 use sims_formats::lot::{Array, House, Simulator};
 use sims_formats::saved_objects::{Frame, Instance, Multipart, Person, Relationship, Slot};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+/// Bit 0 of [`ScratchPtrs`]: `[object + 0x128]` has been populated by a safe
+/// writer (`Expression`, `Random Number`, `Get Direction To`, `Relationship`).
+pub const SCRATCH_PTR_SET: u8 = 1 << 0;
+/// Bit 1 of [`ScratchPtrs`]: last `[object + 0x128]` writer was `Set To Next`.
+pub const SCRATCH_PTR_SET_TO_NEXT: u8 = 1 << 1;
+/// Bit 2 of [`ScratchPtrs`]: last `[object + 0x128]` writer was `Expression`.
+pub const SCRATCH_PTR_EXPRESSION: u8 = 1 << 2;
+/// Bit 3 of [`ScratchPtrs`]: last `[object + 0x128]` writer was `Random Number`
+/// or `Get Direction To`.
+pub const SCRATCH_PTR_ARG_SLOT: u8 = 1 << 3;
+
+const SCRATCH_DENSE_LIMIT: usize = 4096;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ScratchPtrsInner {
+    dense: Vec<u8>,
+    overflow: BTreeMap<u16, u8>,
+    counts: [usize; 4],
+}
+
+impl ScratchPtrsInner {
+    #[inline]
+    fn get(&self, id: u16) -> u8 {
+        let idx = usize::from(id);
+        if idx < SCRATCH_DENSE_LIMIT {
+            self.dense.get(idx).copied().unwrap_or(0)
+        } else {
+            self.overflow.get(&id).copied().unwrap_or(0)
+        }
+    }
+
+    fn set(&mut self, id: u16, mask: u8) {
+        let mask = mask & 0x0f;
+        let prev = self.get(id);
+        if prev == mask {
+            return;
+        }
+        let changed = prev ^ mask;
+        for bit in 0..4u8 {
+            let flag = 1u8 << bit;
+            if changed & flag != 0 {
+                if mask & flag != 0 {
+                    self.counts[usize::from(bit)] += 1;
+                } else {
+                    self.counts[usize::from(bit)] -= 1;
+                }
+            }
+        }
+        let idx = usize::from(id);
+        if idx < SCRATCH_DENSE_LIMIT {
+            if mask == 0 {
+                if idx < self.dense.len() {
+                    self.dense[idx] = 0;
+                    while self.dense.last() == Some(&0) {
+                        self.dense.pop();
+                    }
+                }
+            } else {
+                if idx >= self.dense.len() {
+                    self.dense.resize(idx + 1, 0);
+                }
+                self.dense[idx] = mask;
+            }
+        } else if mask == 0 {
+            self.overflow.remove(&id);
+        } else {
+            self.overflow.insert(id, mask);
+        }
+    }
+}
+
+/// Compact copy-on-write per-object bitmask consolidating the four
+/// `[object + 0x128]` scratch-pointer state flags (`SCRATCH_PTR_*`).
+///
+/// Cloning is `O(1)` via [`CowBox`]; unmodified flags skip CoW detachment.
+#[derive(Debug, Clone, Default, Eq)]
+pub struct ScratchPtrs(CowBox<ScratchPtrsInner>);
+
+impl PartialEq for ScratchPtrs {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.0.ptr_eq(&other.0) || *self.0 == *other.0
+    }
+}
+
+impl ScratchPtrs {
+    #[inline]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    pub fn get(&self, id: u16) -> u8 {
+        self.0.get(id)
+    }
+
+    #[inline]
+    pub fn has(&self, id: u16, bit: u8) -> bool {
+        self.0.get(id) & bit != 0
+    }
+
+    #[inline]
+    pub fn set(&mut self, id: u16, mask: u8) {
+        let mask = mask & 0x0f;
+        if self.0.get(id) == mask {
+            return;
+        }
+        self.0.set(id, mask);
+    }
+
+    #[inline]
+    pub fn insert_bit(&mut self, id: u16, bit: u8) {
+        let prev = self.0.get(id);
+        let next = (prev | bit) & 0x0f;
+        if prev != next {
+            self.0.set(id, next);
+        }
+    }
+
+    #[inline]
+    pub fn remove_bit(&mut self, id: u16, bit: u8) {
+        let prev = self.0.get(id);
+        let next = prev & !bit;
+        if prev != next {
+            self.0.set(id, next);
+        }
+    }
+
+    #[inline]
+    pub fn clear_id(&mut self, id: u16) {
+        if self.0.get(id) != 0 {
+            self.0.set(id, 0);
+        }
+    }
+
+    /// Reconstructs a `BTreeSet<u16>` of all object IDs having `bit` set.
+    pub fn to_btreeset(&self, bit: u8) -> BTreeSet<u16> {
+        self.iter_bit(bit).collect()
+    }
+
+    /// Builds [`ScratchPtrs`] from the four legacy `BTreeSet<u16>` sets
+    /// (used when hydrating saved lots).
+    pub fn from_btreesets(
+        set: &BTreeSet<u16>,
+        set_to_next: &BTreeSet<u16>,
+        expression: &BTreeSet<u16>,
+        arg_slot: &BTreeSet<u16>,
+    ) -> Self {
+        let mut inner = ScratchPtrsInner::default();
+        for &id in set {
+            inner.set(id, inner.get(id) | SCRATCH_PTR_SET);
+        }
+        for &id in set_to_next {
+            inner.set(id, inner.get(id) | SCRATCH_PTR_SET_TO_NEXT);
+        }
+        for &id in expression {
+            inner.set(id, inner.get(id) | SCRATCH_PTR_EXPRESSION);
+        }
+        for &id in arg_slot {
+            inner.set(id, inner.get(id) | SCRATCH_PTR_ARG_SLOT);
+        }
+        Self(CowBox::new(inner))
+    }
+
+    /// Iterates all object IDs with `bit` set in strictly ascending order.
+    pub fn iter_bit(&self, bit: u8) -> impl Iterator<Item = u16> + '_ {
+        let dense = self
+            .0
+            .dense
+            .iter()
+            .enumerate()
+            .filter(move |&(_, &m)| m & bit != 0)
+            .map(|(i, _)| i as u16);
+        let overflow = self
+            .0
+            .overflow
+            .iter()
+            .filter(move |&(_, &m)| m & bit != 0)
+            .map(|(&id, _)| id);
+        dense.chain(overflow)
+    }
+
+    /// Number of object IDs having `bit` (a single `SCRATCH_PTR_*` flag) set.
+    #[inline]
+    pub fn count_bit(&self, bit: u8) -> usize {
+        debug_assert!(bit.is_power_of_two() && bit <= 0x08);
+        self.0.counts[bit.trailing_zeros() as usize]
+    }
+
+    /// Zero-allocation [`Serialize`] adapter that emits the exact `postcard`
+    /// wire representation of `BTreeSet<u16>` for `bit`.
+    #[inline]
+    pub fn serialize_bit(&self, bit: u8) -> ScratchPtrBitSerialize<'_> {
+        ScratchPtrBitSerialize { ptrs: self, bit }
+    }
+}
+
+/// Zero-allocation `Serialize` adapter emitting a single bit plane of
+/// [`ScratchPtrs`] identically to `BTreeSet<u16>`.
+pub struct ScratchPtrBitSerialize<'a> {
+    ptrs: &'a ScratchPtrs,
+    bit: u8,
+}
+
+impl Serialize for ScratchPtrBitSerialize<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let len = self.ptrs.count_bit(self.bit);
+        let mut seq = serializer.serialize_seq(Some(len))?;
+        for id in self.ptrs.iter_bit(self.bit) {
+            seq.serialize_element(&id)?;
+        }
+        seq.end()
+    }
+}
+
+/// Opaque cached reverse index from GUID to lowest type ID in [`World::types`].
+#[derive(Debug, Clone, Default)]
+pub struct TypesByGuidCache(Option<Arc<TypesByGuid>>);
+
+/// Cached reverse index from GUID to lowest type ID in [`World::types`].
+#[derive(Debug, Clone)]
+struct TypesByGuid {
+    len: usize,
+    first: Option<(u16, u32)>,
+    last: Option<(u16, u32)>,
+    map: BTreeMap<u32, u16>,
+}
+
+impl TypesByGuid {
+    fn build(types: &BTreeMap<u16, u32>) -> Self {
+        let mut map = BTreeMap::new();
+        for (&id, &guid) in types {
+            map.entry(guid).or_insert(id);
+        }
+        Self {
+            len: types.len(),
+            first: types.first_key_value().map(|(&k, &v)| (k, v)),
+            last: types.last_key_value().map(|(&k, &v)| (k, v)),
+            map,
+        }
+    }
+
+    #[inline]
+    fn matches(&self, types: &BTreeMap<u16, u32>) -> bool {
+        self.len == types.len()
+            && self.first == types.first_key_value().map(|(&k, &v)| (k, v))
+            && self.last == types.last_key_value().map(|(&k, &v)| (k, v))
+    }
+}
 
 /// One lot's simulation state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -288,46 +540,13 @@ pub struct World {
     /// `sims_vm::boot::save::Saved` preserves it across save/restore.
     #[serde(skip)]
     pub person_outfits: BTreeMap<u16, PersonOutfit>,
-    /// Objects whose scratch destination pointer (`[object + 0x128]`, zeroed
-    /// at `0x431a77`) has been populated by `Expression` (`0x452c85`),
-    /// `Random Number` (`0x451e8d`), `Get Direction To` (`0x45202b`),
-    /// `Relationship`/`Old Relationship` (`0x44d513`), or `Set To Next`
-    /// (`0x44eb9d`). Once set, `UI Effect` reading global 34 (`0x4541d5`)
-    /// writes through that pointer and succeeds instead of dereferencing null.
-    /// Kept out of [`World::encode`] to preserve snapshot format 32;
-    /// `sims_vm::boot::save::Saved` preserves it across save/restore.
+    /// Compact bitmask consolidating the four `[object + 0x128]` scratch
+    /// destination pointer states (`SCRATCH_PTR_SET`, `SCRATCH_PTR_SET_TO_NEXT`,
+    /// `SCRATCH_PTR_EXPRESSION`, `SCRATCH_PTR_ARG_SLOT`). Kept out of
+    /// [`World::encode`] to preserve snapshot format 32; `sims_vm::boot::save::Saved`
+    /// preserves it across save/restore.
     #[serde(skip)]
-    pub scratch_ptr_set: BTreeSet<u16>,
-    /// Live objects whose last `[object + 0x128]` write was `Set To Next`
-    /// (`0x44eb9d`). That pointer addresses an allocated local inside a
-    /// subsequent `Expression`'s right-hand Global 34 read (`0x452c76` →
-    /// `0x4541db`, which therefore succeeds), while still overlapping
-    /// `UI Effect`'s return address (`0x44ad70`, which traps). Kept out of
-    /// [`World::encode`] to preserve snapshot format 32;
-    /// `sims_vm::boot::save::Saved` preserves it across save/restore.
-    #[serde(skip)]
-    pub scratch_ptr_set_to_next: BTreeSet<u16>,
-    /// Live objects whose last `[object + 0x128]` write was `Expression`
-    /// (`0x452c85` → `&[ebp - 0x04]`). In a subsequent `Expression` at the
-    /// same dispatch depth, reading Global 34 on the right-hand side
-    /// (`0x452c76` → `0x4541db`) writes `&globals[34]` into `[ebp - 0x04]`,
-    /// which takes priority over `[ebp - 0x08]` (motives) and read-only LHS
-    /// destinations at `0x452e84..0x4530c5`. Kept out of [`World::encode`] to
-    /// preserve snapshot format 32; `sims_vm::boot::save::Saved` preserves it.
-    #[serde(skip)]
-    pub scratch_ptr_expression: BTreeSet<u16>,
-    /// Live objects whose last `[object + 0x128]` write was `Random Number`
-    /// (`0x451e8d`) or `Get Direction To` (`0x45202b`), both 2-argument
-    /// primitives storing `&[ebp + 0x0c]`. In a subsequent 1-argument
-    /// `Expression` at the same dispatch depth, that address aliases
-    /// `[ebp + 0x08]` (the LHS `write` flag), so reading Global 34 on the RHS
-    /// (`0x452c76` → `0x4541db`) overwrites `[ebp + 0x08]` with `&globals[34]`
-    /// (nonzero low byte) before `0x452c7b` passes it to `0x453141` (`resolve`)
-    /// and before `0x452d01` checks it for the motive clamp. Kept out of
-    /// [`World::encode`] to preserve snapshot format 32;
-    /// `sims_vm::boot::save::Saved` preserves it across save/restore.
-    #[serde(skip)]
-    pub scratch_ptr_arg_slot: BTreeSet<u16>,
+    pub scratch_ptrs: ScratchPtrs,
     /// Appearance names newly inserted into `AvatarRegistry`'s hash table by
     /// runtime `.bcf` catalog loads (`0x59f320` → `0x5a1fb1`) that were not
     /// already present in startup eager or `.ndx` registrations, in exact
@@ -342,6 +561,18 @@ pub struct World {
     /// `sims_vm::boot::save::Saved` preserves it across save/restore.
     #[serde(skip)]
     pub suit_scan_cache: Option<Vec<String>>,
+    /// Lazily maintained reverse index from GUID to lowest type ID in
+    /// [`World::types`], stored behind [`Arc`] so [`World::clone`] is `O(1)`.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub types_by_guid: TypesByGuidCache,
+    /// Per-object bitmask of lower stack frame depths modified outside
+    /// top-frame execution (`idle`, `go_to_slot`, `notify`, `wake`, `create`)
+    /// so `sync_top_frame` flushes them at the exact same point full
+    /// `sync_frames` would have.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub dirty_frames: CowBox<BTreeMap<u16, u64>>,
 }
 
 /// One appearance attachment slot on `cTSPerson` (`0x583559`: suit name at
@@ -791,13 +1022,66 @@ impl World {
             loaded_indexed_suit_bones: BTreeMap::new(),
             made_outfits: BTreeMap::new(),
             person_outfits: BTreeMap::new(),
-            scratch_ptr_set: BTreeSet::new(),
-            scratch_ptr_set_to_next: BTreeSet::new(),
-            scratch_ptr_expression: BTreeSet::new(),
-            scratch_ptr_arg_slot: BTreeSet::new(),
+            scratch_ptrs: ScratchPtrs::new(),
             runtime_added_suits: Vec::new(),
             suit_scan_cache: None,
+            types_by_guid: TypesByGuidCache(None),
+            dirty_frames: CowBox::default(),
         }
+    }
+
+    /// Inserts `(id, guid)` into [`World::types`] and updates the cached
+    /// reverse GUID index incrementally when present.
+    pub fn insert_type(&mut self, id: u16, guid: u32) {
+        let prev = self.types.insert(id, guid);
+        if prev.is_some() {
+            // Overwriting an existing type ID invalidates the reverse map.
+            self.types_by_guid.0 = None;
+            return;
+        }
+        if let Some(cache) = self.types_by_guid.0.as_mut() {
+            if cache.len + 1 == self.types.len() {
+                let inner = Arc::make_mut(cache);
+                inner.len = self.types.len();
+                inner.first = self.types.first_key_value().map(|(&k, &v)| (k, v));
+                inner.last = self.types.last_key_value().map(|(&k, &v)| (k, v));
+                inner
+                    .map
+                    .entry(guid)
+                    .and_modify(|existing| {
+                        if id < *existing {
+                            *existing = id;
+                        }
+                    })
+                    .or_insert(id);
+            } else {
+                self.types_by_guid.0 = None;
+            }
+        }
+    }
+
+    /// Returns the smallest type ID in [`World::types`] whose GUID equals
+    /// `guid` (matching `self.types.iter().find(|&(_, &g)| g == guid)`),
+    /// using the lazily-built reverse index.
+    pub fn type_id_for_guid(&mut self, guid: u32) -> Option<u16> {
+        let valid = self
+            .types_by_guid
+            .0
+            .as_ref()
+            .is_some_and(|c| c.matches(&self.types));
+        if !valid {
+            self.types_by_guid.0 = Some(Arc::new(TypesByGuid::build(&self.types)));
+        }
+        let cache = self.types_by_guid.0.as_ref().expect("just initialized");
+        let id = cache.map.get(&guid).copied()?;
+        if self.types.get(&id) == Some(&guid) {
+            return Some(id);
+        }
+        // Fallback rebuild if `world.types` was overwritten in place externally.
+        let rebuilt = Arc::new(TypesByGuid::build(&self.types));
+        let ans = rebuilt.map.get(&guid).copied();
+        self.types_by_guid.0 = Some(rebuilt);
+        ans
     }
 
     /// Reads a house's usage counts from its house model (HOUS 1;
@@ -935,9 +1219,12 @@ impl World {
         postcard::from_bytes(bytes).map_err(|e| Error::Snapshot(e.to_string()))
     }
 
-    /// SHA-256 of the canonical encoding.
+    /// SHA-256 of the canonical encoding, computed via zero-allocation
+    /// streaming serialization.
     pub fn hash(&self) -> [u8; 32] {
-        Sha256::digest(self.encode()).into()
+        let mut hasher = Sha256::new();
+        crate::hash_flavor::hash_postcard(self, &mut hasher);
+        hasher.finalize().into()
     }
 
     /// [`World::hash`] as lowercase hex.
@@ -1001,5 +1288,80 @@ impl Object {
             removal_skips_resets: false,
             selected: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scratch_ptrs_serialize_bit_matches_btreeset_postcard_bytes() {
+        let mut ptrs = ScratchPtrs::new();
+        let mut s_set = BTreeSet::new();
+        let mut s_stn = BTreeSet::new();
+        let mut s_expr = BTreeSet::new();
+        let mut s_arg = BTreeSet::new();
+
+        for (id, mask) in [
+            (0u16, SCRATCH_PTR_SET | SCRATCH_PTR_EXPRESSION),
+            (1, SCRATCH_PTR_SET_TO_NEXT),
+            (42, SCRATCH_PTR_SET | SCRATCH_PTR_ARG_SLOT),
+            (4095, SCRATCH_PTR_SET),
+            (4096, SCRATCH_PTR_SET | SCRATCH_PTR_EXPRESSION),
+            (60000, SCRATCH_PTR_SET_TO_NEXT),
+        ] {
+            ptrs.set(id, mask);
+            if mask & SCRATCH_PTR_SET != 0 {
+                s_set.insert(id);
+            }
+            if mask & SCRATCH_PTR_SET_TO_NEXT != 0 {
+                s_stn.insert(id);
+            }
+            if mask & SCRATCH_PTR_EXPRESSION != 0 {
+                s_expr.insert(id);
+            }
+            if mask & SCRATCH_PTR_ARG_SLOT != 0 {
+                s_arg.insert(id);
+            }
+        }
+
+        // Clearing an ID keeps counts & canonical representation intact.
+        ptrs.clear_id(42);
+        s_set.remove(&42);
+        s_arg.remove(&42);
+
+        for (bit, expected) in [
+            (SCRATCH_PTR_SET, &s_set),
+            (SCRATCH_PTR_SET_TO_NEXT, &s_stn),
+            (SCRATCH_PTR_EXPRESSION, &s_expr),
+            (SCRATCH_PTR_ARG_SLOT, &s_arg),
+        ] {
+            assert_eq!(ptrs.to_btreeset(bit), *expected);
+            assert_eq!(ptrs.count_bit(bit), expected.len());
+            let actual_bytes = postcard::to_allocvec(&ptrs.serialize_bit(bit)).unwrap();
+            let expected_bytes = postcard::to_allocvec(expected).unwrap();
+            assert_eq!(actual_bytes, expected_bytes, "bit {bit:#x}");
+        }
+
+        let roundtrip = ScratchPtrs::from_btreesets(&s_set, &s_stn, &s_expr, &s_arg);
+        assert_eq!(roundtrip, ptrs);
+    }
+
+    #[test]
+    fn world_streaming_hash_matches_encode_sha256() {
+        let mut world = World::empty();
+        world.ticks = 12345;
+        world.globals[0] = 9;
+        world.order = vec![1, 5, 5000];
+        world.insert_type(1, 0x1111_2222);
+        world.insert_type(5, 0x1111_2222);
+        world.insert_type(2, 0x3333_4444);
+        assert_eq!(world.type_id_for_guid(0x1111_2222), Some(1));
+        assert_eq!(world.type_id_for_guid(0x3333_4444), Some(2));
+        assert_eq!(world.type_id_for_guid(0x9999_9999), None);
+
+        let expected: [u8; 32] = Sha256::digest(world.encode()).into();
+        assert_eq!(world.hash(), expected);
     }
 }

@@ -4407,7 +4407,7 @@ fn round_19_global34_stale_refresh_mummy_hashtable_textures_clothing_workwear_np
         fx.world.rooms.rooms.get_mut(&1).unwrap().occupied = true;
         fx.program.people.portrait_head.insert(WIDGET, true);
         assert_eq!(fx.run_with(LAMP, 4099, 0, &[], 100), Ok(true));
-        assert!(fx.world.scratch_ptr_set.contains(&LAMP));
+        assert!(fx.world.scratch_ptrs.has(LAMP, sims_sim::SCRATCH_PTR_SET));
         assert!(fx.world.portraits.contains(&WIDGET));
     }
 
@@ -5084,7 +5084,7 @@ fn round_20_global34_grown_saved_shared_scan_empty_retry_mnc_init_leading_g_work
             fx.run_with(LAMP, 4099, 0, &[], 100).is_err(),
             "Set To Next must make subsequent UI Effect Global 34 trap"
         );
-        assert!(!fx.world.scratch_ptr_set.contains(&LAMP));
+        assert!(!fx.world.scratch_ptrs.has(LAMP, sims_sim::SCRATCH_PTR_SET));
 
         fx.add(
             LAMP_FILE,
@@ -5570,7 +5570,7 @@ fn round_21_old_rel_mnc_commit_empty_suit_freeze_pet_0x1f_and_p3_limits() {
             fx.run_with(LAMP, 4099, 0, &[0], 100).is_err(),
             "Old Relationship (opcode 24) must leave scratch_ptr_set unset so Global 34 traps"
         );
-        assert!(!fx.world.scratch_ptr_set.contains(&LAMP));
+        assert!(!fx.world.scratch_ptrs.has(LAMP, sims_sim::SCRATCH_PTR_SET));
     }
 
     // 2. P2 #4: Make New Character final commit (`0x44b185` -> `0x40a588` ->
@@ -6799,8 +6799,12 @@ fn round_23_dialog_placed_large_lot_strcmp_and_set_to_next_expression() {
         assert_eq!(fx.run_with(LAMP, 4096, 0, &[], 1000), Ok(true));
         assert_eq!(fx.world.objects[&LAMP].temps[0], record);
         assert!(fx.world.portraits.contains(&WIDGET));
-        assert!(fx.world.scratch_ptr_set.contains(&LAMP));
-        assert!(!fx.world.scratch_ptr_set_to_next.contains(&LAMP));
+        assert!(fx.world.scratch_ptrs.has(LAMP, sims_sim::SCRATCH_PTR_SET));
+        assert!(
+            !fx.world
+                .scratch_ptrs
+                .has(LAMP, sims_sim::SCRATCH_PTR_SET_TO_NEXT)
+        );
     }
 }
 

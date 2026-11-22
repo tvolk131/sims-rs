@@ -30,11 +30,16 @@
 use crate::migration::decode_postcard_exact;
 use crate::neighborhood_store::{NEIGHBORHOODS as NEIGHBORHOODS_TABLE, StoredNeighborhood};
 use crate::{Error, World};
+use flate2::Compression;
+use flate2::read::DeflateDecoder;
+use flate2::write::DeflateEncoder;
+use postcard::ser_flavors::ExtendFlavor;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fmt;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -48,11 +53,16 @@ const RECORD_HASH_DOMAIN: &[u8] = b"sims-sim:autosave-record:v1";
 /// 32-byte record SHA-256.
 const RECORD_HEADER_LEN: usize = 4 + 4 + 32;
 
+/// Upper bound on decompressed V2 autosave payload size (128 MiB) to guard
+/// against malformed compressed payloads.
+const MAX_AUTOSAVE_PAYLOAD_BYTES: usize = 128 * 1024 * 1024;
+
 /// Earliest supported autosave record format version.
 pub const AUTOSAVE_MIN_FORMAT: u32 = 1;
 
-/// Current autosave record format version.
-pub const AUTOSAVE_FORMAT: u32 = 1;
+/// Current autosave record format version (V2: deflate-compressed payload with
+/// split metadata header for fast metadata-only listing).
+pub const AUTOSAVE_FORMAT: u32 = 2;
 
 /// Default maximum number of rotating autosave slots kept per
 /// `(neighborhood_id, lot_id)`.
@@ -561,6 +571,24 @@ struct AutosaveBodyV1 {
     payload: Vec<u8>,
 }
 
+/// Metadata prefix of a V2 autosave record, followed immediately in the
+/// checksummed body by raw deflate (`flate2::Compression::fast()`) bytes of
+/// `payload`. Splitting the header from the compressed payload allows
+/// [`AutosaveStore::list_saves_metadata`] to verify the record checksum and
+/// read metadata without decompressing or decoding the lot payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct AutosaveHeaderV2 {
+    slot: SaveSlot,
+    neighborhood_id: String,
+    lot_id: u32,
+    sim_tick: u64,
+    saved_at_unix_secs: Option<u64>,
+    label: String,
+    payload_kind: SavePayloadKind,
+    payload_len: u64,
+    payload_sha256: [u8; 32],
+}
+
 fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
     let digest = Sha256::digest(bytes);
     let mut out = [0u8; 32];
@@ -579,66 +607,46 @@ fn record_checksum(version: u32, body: &[u8]) -> [u8; 32] {
     out
 }
 
-fn encode_record(body: &AutosaveBodyV1) -> std::result::Result<Vec<u8>, SaveError> {
-    let body_bytes = postcard::to_allocvec(body).map_err(|error| SaveError::DecodeFailed {
-        neighborhood_id: body.neighborhood_id.clone(),
-        lot_id: body.lot_id,
-        slot: body.slot,
-        detail: format!("failed to encode save record: {error}"),
-    })?;
-    let checksum = record_checksum(AUTOSAVE_FORMAT, &body_bytes);
-    let mut out = Vec::with_capacity(RECORD_HEADER_LEN + body_bytes.len());
+fn encode_record_v2(
+    header: &AutosaveHeaderV2,
+    payload: &[u8],
+) -> std::result::Result<Vec<u8>, SaveError> {
+    let mut out = Vec::with_capacity(RECORD_HEADER_LEN + 256 + payload.len() / 4);
     out.extend_from_slice(&AUTOSAVE_MAGIC);
     out.extend_from_slice(&AUTOSAVE_FORMAT.to_le_bytes());
-    out.extend_from_slice(&checksum);
-    out.extend_from_slice(&body_bytes);
+    out.extend_from_slice(&[0u8; 32]);
+    let mut out =
+        postcard::serialize_with_flavor(header, ExtendFlavor::new(out)).map_err(|error| {
+            SaveError::DecodeFailed {
+                neighborhood_id: header.neighborhood_id.clone(),
+                lot_id: header.lot_id,
+                slot: header.slot,
+                detail: format!("failed to encode save record header: {error}"),
+            }
+        })?;
+    {
+        let mut encoder = DeflateEncoder::new(&mut out, Compression::fast());
+        encoder
+            .write_all(payload)
+            .and_then(|()| encoder.finish().map(|_| ()))
+            .map_err(|error| SaveError::DecodeFailed {
+                neighborhood_id: header.neighborhood_id.clone(),
+                lot_id: header.lot_id,
+                slot: header.slot,
+                detail: format!("failed to compress save record payload: {error}"),
+            })?;
+    }
+    let checksum = record_checksum(AUTOSAVE_FORMAT, &out[RECORD_HEADER_LEN..]);
+    out[8..40].copy_from_slice(&checksum);
     Ok(out)
 }
 
-fn noop_payload_validator(
-    _kind: &SavePayloadKind,
-    _bytes: &[u8],
-) -> std::result::Result<(), String> {
-    Ok(())
-}
-
-fn validate_payload_bytes<F>(
+fn verify_envelope<'a>(
     neighborhood_id: &str,
     lot_id: u32,
     slot: SaveSlot,
-    kind: &SavePayloadKind,
-    payload: &[u8],
-    validator: &F,
-) -> std::result::Result<(), SaveError>
-where
-    F: Fn(&SavePayloadKind, &[u8]) -> std::result::Result<(), String>,
-{
-    if *kind == SavePayloadKind::WorldSnapshot {
-        World::decode(payload).map_err(|error| SaveError::DecodeFailed {
-            neighborhood_id: neighborhood_id.to_owned(),
-            lot_id,
-            slot,
-            detail: format!("invalid world snapshot payload: {error}"),
-        })?;
-    }
-    validator(kind, payload).map_err(|detail| SaveError::DecodeFailed {
-        neighborhood_id: neighborhood_id.to_owned(),
-        lot_id,
-        slot,
-        detail,
-    })
-}
-
-fn decode_record_validated<F>(
-    neighborhood_id: &str,
-    lot_id: u32,
-    slot: SaveSlot,
-    bytes: &[u8],
-    validator: &F,
-) -> std::result::Result<LoadedSave, SaveError>
-where
-    F: Fn(&SavePayloadKind, &[u8]) -> std::result::Result<(), String>,
-{
+    bytes: &'a [u8],
+) -> std::result::Result<(u32, &'a [u8]), SaveError> {
     if bytes.len() < 8 {
         return Err(SaveError::DecodeFailed {
             neighborhood_id: neighborhood_id.to_owned(),
@@ -689,66 +697,343 @@ where
             actual: actual_record_sha,
         });
     }
+    Ok((version, body_bytes))
+}
 
-    let record_name = format!("{neighborhood_id}:lot{lot_id}:{slot}");
-    let body: AutosaveBodyV1 =
-        decode_postcard_exact(&record_name, version, body_bytes).map_err(|error| {
-            SaveError::DecodeFailed {
-                neighborhood_id: neighborhood_id.to_owned(),
-                lot_id,
-                slot,
-                detail: error.to_string(),
-            }
-        })?;
-
-    let actual_payload_sha = sha256_bytes(&body.payload);
-    if actual_payload_sha != body.payload_sha256 {
-        return Err(SaveError::CorruptChecksum {
-            neighborhood_id: neighborhood_id.to_owned(),
-            lot_id,
-            slot,
-            expected: body.payload_sha256,
-            actual: actual_payload_sha,
-        });
-    }
-
-    if body.neighborhood_id != neighborhood_id || body.lot_id != lot_id || body.slot != slot {
+fn check_key_binding(
+    stored_neighborhood: &str,
+    stored_lot: u32,
+    stored_slot: SaveSlot,
+    neighborhood_id: &str,
+    lot_id: u32,
+    slot: SaveSlot,
+) -> std::result::Result<(), SaveError> {
+    if stored_neighborhood != neighborhood_id || stored_lot != lot_id || stored_slot != slot {
         return Err(SaveError::DecodeFailed {
             neighborhood_id: neighborhood_id.to_owned(),
             lot_id,
             slot,
             detail: format!(
-                "record key binding mismatch: stored ({:?}, lot {}, {}), expected ({:?}, lot {}, {})",
-                body.neighborhood_id, body.lot_id, body.slot, neighborhood_id, lot_id, slot
+                "record key binding mismatch: stored ({stored_neighborhood:?}, lot {stored_lot}, {stored_slot}), expected ({neighborhood_id:?}, lot {lot_id}, {slot})"
             ),
         });
     }
+    Ok(())
+}
 
-    validate_payload_bytes(
-        neighborhood_id,
+fn decompress_v2_payload(
+    neighborhood_id: &str,
+    lot_id: u32,
+    slot: SaveSlot,
+    compressed: &[u8],
+    expected_len: usize,
+) -> std::result::Result<Vec<u8>, SaveError> {
+    if expected_len > MAX_AUTOSAVE_PAYLOAD_BYTES {
+        return Err(SaveError::DecodeFailed {
+            neighborhood_id: neighborhood_id.to_owned(),
+            lot_id,
+            slot,
+            detail: format!(
+                "declared payload length {expected_len} exceeds maximum {MAX_AUTOSAVE_PAYLOAD_BYTES}"
+            ),
+        });
+    }
+    let mut decoder = DeflateDecoder::new(compressed).take((expected_len as u64).saturating_add(1));
+    let mut payload = Vec::with_capacity(expected_len.min(1024 * 1024));
+    decoder
+        .read_to_end(&mut payload)
+        .map_err(|error| SaveError::DecodeFailed {
+            neighborhood_id: neighborhood_id.to_owned(),
+            lot_id,
+            slot,
+            detail: format!("failed to decompress V2 save payload: {error}"),
+        })?;
+    if payload.len() != expected_len {
+        return Err(SaveError::DecodeFailed {
+            neighborhood_id: neighborhood_id.to_owned(),
+            lot_id,
+            slot,
+            detail: format!(
+                "decompressed V2 payload length {} does not match header length {expected_len}",
+                payload.len()
+            ),
+        });
+    }
+    Ok(payload)
+}
+
+fn noop_payload_validator(
+    _kind: &SavePayloadKind,
+    _bytes: &[u8],
+) -> std::result::Result<(), String> {
+    Ok(())
+}
+
+fn validate_payload_bytes<F>(
+    neighborhood_id: &str,
+    lot_id: u32,
+    slot: SaveSlot,
+    kind: &SavePayloadKind,
+    payload: &[u8],
+    validator: &F,
+) -> std::result::Result<(), SaveError>
+where
+    F: Fn(&SavePayloadKind, &[u8]) -> std::result::Result<(), String>,
+{
+    if *kind == SavePayloadKind::WorldSnapshot {
+        World::decode(payload).map_err(|error| SaveError::DecodeFailed {
+            neighborhood_id: neighborhood_id.to_owned(),
+            lot_id,
+            slot,
+            detail: format!("invalid world snapshot payload: {error}"),
+        })?;
+    }
+    validator(kind, payload).map_err(|detail| SaveError::DecodeFailed {
+        neighborhood_id: neighborhood_id.to_owned(),
         lot_id,
         slot,
-        &body.payload_kind,
-        &body.payload,
-        validator,
-    )?;
-
-    let metadata = SaveMetadata {
-        slot: body.slot,
-        neighborhood_id: body.neighborhood_id,
-        lot_id: body.lot_id,
-        sim_tick: body.sim_tick,
-        saved_at_unix_secs: body.saved_at_unix_secs,
-        label: body.label,
-        payload_kind: body.payload_kind,
-        payload_len: body.payload.len(),
-        payload_sha256: body.payload_sha256,
-        format_version: version,
-    };
-    Ok(LoadedSave {
-        metadata,
-        payload: body.payload,
+        detail,
     })
+}
+
+fn decode_record_metadata(
+    neighborhood_id: &str,
+    lot_id: u32,
+    slot: SaveSlot,
+    bytes: &[u8],
+) -> std::result::Result<SaveMetadata, SaveError> {
+    let (version, body_bytes) = verify_envelope(neighborhood_id, lot_id, slot, bytes)?;
+    match version {
+        1 => {
+            let record_name = format!("{neighborhood_id}:lot{lot_id}:{slot}");
+            let body: AutosaveBodyV1 = decode_postcard_exact(&record_name, version, body_bytes)
+                .map_err(|error| SaveError::DecodeFailed {
+                    neighborhood_id: neighborhood_id.to_owned(),
+                    lot_id,
+                    slot,
+                    detail: error.to_string(),
+                })?;
+            let actual_payload_sha = sha256_bytes(&body.payload);
+            if actual_payload_sha != body.payload_sha256 {
+                return Err(SaveError::CorruptChecksum {
+                    neighborhood_id: neighborhood_id.to_owned(),
+                    lot_id,
+                    slot,
+                    expected: body.payload_sha256,
+                    actual: actual_payload_sha,
+                });
+            }
+            check_key_binding(
+                &body.neighborhood_id,
+                body.lot_id,
+                body.slot,
+                neighborhood_id,
+                lot_id,
+                slot,
+            )?;
+            Ok(SaveMetadata {
+                slot: body.slot,
+                neighborhood_id: body.neighborhood_id,
+                lot_id: body.lot_id,
+                sim_tick: body.sim_tick,
+                saved_at_unix_secs: body.saved_at_unix_secs,
+                label: body.label,
+                payload_kind: body.payload_kind,
+                payload_len: body.payload.len(),
+                payload_sha256: body.payload_sha256,
+                format_version: version,
+            })
+        }
+        2 => {
+            let mut de = postcard::Deserializer::from_bytes(body_bytes);
+            let header = AutosaveHeaderV2::deserialize(&mut de).map_err(|error| {
+                SaveError::DecodeFailed {
+                    neighborhood_id: neighborhood_id.to_owned(),
+                    lot_id,
+                    slot,
+                    detail: format!("failed to decode V2 save header: {error}"),
+                }
+            })?;
+            check_key_binding(
+                &header.neighborhood_id,
+                header.lot_id,
+                header.slot,
+                neighborhood_id,
+                lot_id,
+                slot,
+            )?;
+            let payload_len =
+                usize::try_from(header.payload_len).map_err(|_| SaveError::DecodeFailed {
+                    neighborhood_id: neighborhood_id.to_owned(),
+                    lot_id,
+                    slot,
+                    detail: format!("V2 payload length {} overflows usize", header.payload_len),
+                })?;
+            if payload_len > MAX_AUTOSAVE_PAYLOAD_BYTES {
+                return Err(SaveError::DecodeFailed {
+                    neighborhood_id: neighborhood_id.to_owned(),
+                    lot_id,
+                    slot,
+                    detail: format!(
+                        "declared payload length {payload_len} exceeds maximum {MAX_AUTOSAVE_PAYLOAD_BYTES}"
+                    ),
+                });
+            }
+            Ok(SaveMetadata {
+                slot: header.slot,
+                neighborhood_id: header.neighborhood_id,
+                lot_id: header.lot_id,
+                sim_tick: header.sim_tick,
+                saved_at_unix_secs: header.saved_at_unix_secs,
+                label: header.label,
+                payload_kind: header.payload_kind,
+                payload_len,
+                payload_sha256: header.payload_sha256,
+                format_version: version,
+            })
+        }
+        _ => Err(SaveError::UnsupportedVersion {
+            neighborhood_id: neighborhood_id.to_owned(),
+            lot_id,
+            slot,
+            found: version,
+            min_supported: AUTOSAVE_MIN_FORMAT,
+            max_supported: AUTOSAVE_FORMAT,
+        }),
+    }
+}
+
+fn decode_record_validated<F>(
+    neighborhood_id: &str,
+    lot_id: u32,
+    slot: SaveSlot,
+    bytes: &[u8],
+    validator: &F,
+) -> std::result::Result<LoadedSave, SaveError>
+where
+    F: Fn(&SavePayloadKind, &[u8]) -> std::result::Result<(), String>,
+{
+    let (version, body_bytes) = verify_envelope(neighborhood_id, lot_id, slot, bytes)?;
+    match version {
+        1 => {
+            let record_name = format!("{neighborhood_id}:lot{lot_id}:{slot}");
+            let body: AutosaveBodyV1 = decode_postcard_exact(&record_name, version, body_bytes)
+                .map_err(|error| SaveError::DecodeFailed {
+                    neighborhood_id: neighborhood_id.to_owned(),
+                    lot_id,
+                    slot,
+                    detail: error.to_string(),
+                })?;
+            let actual_payload_sha = sha256_bytes(&body.payload);
+            if actual_payload_sha != body.payload_sha256 {
+                return Err(SaveError::CorruptChecksum {
+                    neighborhood_id: neighborhood_id.to_owned(),
+                    lot_id,
+                    slot,
+                    expected: body.payload_sha256,
+                    actual: actual_payload_sha,
+                });
+            }
+            check_key_binding(
+                &body.neighborhood_id,
+                body.lot_id,
+                body.slot,
+                neighborhood_id,
+                lot_id,
+                slot,
+            )?;
+            validate_payload_bytes(
+                neighborhood_id,
+                lot_id,
+                slot,
+                &body.payload_kind,
+                &body.payload,
+                validator,
+            )?;
+            let metadata = SaveMetadata {
+                slot: body.slot,
+                neighborhood_id: body.neighborhood_id,
+                lot_id: body.lot_id,
+                sim_tick: body.sim_tick,
+                saved_at_unix_secs: body.saved_at_unix_secs,
+                label: body.label,
+                payload_kind: body.payload_kind,
+                payload_len: body.payload.len(),
+                payload_sha256: body.payload_sha256,
+                format_version: version,
+            };
+            Ok(LoadedSave {
+                metadata,
+                payload: body.payload,
+            })
+        }
+        2 => {
+            let mut de = postcard::Deserializer::from_bytes(body_bytes);
+            let header = AutosaveHeaderV2::deserialize(&mut de).map_err(|error| {
+                SaveError::DecodeFailed {
+                    neighborhood_id: neighborhood_id.to_owned(),
+                    lot_id,
+                    slot,
+                    detail: format!("failed to decode V2 save header: {error}"),
+                }
+            })?;
+            let compressed = de.finalize().map_err(|error| SaveError::DecodeFailed {
+                neighborhood_id: neighborhood_id.to_owned(),
+                lot_id,
+                slot,
+                detail: format!("failed to read V2 compressed payload: {error}"),
+            })?;
+            check_key_binding(
+                &header.neighborhood_id,
+                header.lot_id,
+                header.slot,
+                neighborhood_id,
+                lot_id,
+                slot,
+            )?;
+            let expected_len =
+                usize::try_from(header.payload_len).map_err(|_| SaveError::DecodeFailed {
+                    neighborhood_id: neighborhood_id.to_owned(),
+                    lot_id,
+                    slot,
+                    detail: format!("V2 payload length {} overflows usize", header.payload_len),
+                })?;
+            // Outer record_checksum already authenticates both header and
+            // compressed payload, avoiding a redundant second SHA-256 pass over
+            // the uncompressed bytes.
+            let payload =
+                decompress_v2_payload(neighborhood_id, lot_id, slot, compressed, expected_len)?;
+            validate_payload_bytes(
+                neighborhood_id,
+                lot_id,
+                slot,
+                &header.payload_kind,
+                &payload,
+                validator,
+            )?;
+            let metadata = SaveMetadata {
+                slot: header.slot,
+                neighborhood_id: header.neighborhood_id,
+                lot_id: header.lot_id,
+                sim_tick: header.sim_tick,
+                saved_at_unix_secs: header.saved_at_unix_secs,
+                label: header.label,
+                payload_kind: header.payload_kind,
+                payload_len: payload.len(),
+                payload_sha256: header.payload_sha256,
+                format_version: version,
+            };
+            Ok(LoadedSave { metadata, payload })
+        }
+        _ => Err(SaveError::UnsupportedVersion {
+            neighborhood_id: neighborhood_id.to_owned(),
+            lot_id,
+            slot,
+            found: version,
+            min_supported: AUTOSAVE_MIN_FORMAT,
+            max_supported: AUTOSAVE_FORMAT,
+        }),
+    }
 }
 
 fn verify_neighborhood_instance_in_txn(
@@ -1055,7 +1340,7 @@ impl AutosaveStore {
     where
         F: Fn(&SavePayloadKind, &[u8]) -> std::result::Result<(), String>,
     {
-        let body = AutosaveBodyV1 {
+        let header = AutosaveHeaderV2 {
             slot: SaveSlot::Manual,
             neighborhood_id: neighborhood_id.clone(),
             lot_id,
@@ -1063,10 +1348,10 @@ impl AutosaveStore {
             saved_at_unix_secs,
             label: label.clone(),
             payload_kind: payload_kind.clone(),
+            payload_len: payload_len as u64,
             payload_sha256,
-            payload,
         };
-        let encoded = encode_record(&body)?;
+        let encoded = encode_record_v2(&header, &payload)?;
 
         let txn = self.db.begin_write().map_err(store_err)?;
         {
@@ -1181,7 +1466,7 @@ impl AutosaveStore {
                 })?;
             assigned_seq = next_seq;
 
-            let body = AutosaveBodyV1 {
+            let header = AutosaveHeaderV2 {
                 slot: SaveSlot::Autosave(next_seq),
                 neighborhood_id: neighborhood_id.clone(),
                 lot_id,
@@ -1189,10 +1474,10 @@ impl AutosaveStore {
                 saved_at_unix_secs,
                 label: label.clone(),
                 payload_kind: payload_kind.clone(),
+                payload_len: payload_len as u64,
                 payload_sha256,
-                payload,
             };
-            let encoded = encode_record(&body)?;
+            let encoded = encode_record_v2(&header, &payload)?;
 
             // 1. Insert the new slot and advance the monotonic counter first.
             ring_table
@@ -1232,6 +1517,66 @@ impl AutosaveStore {
             payload_sha256,
             format_version: AUTOSAVE_FORMAT,
         })
+    }
+
+    /// Lists all save slots for `(neighborhood_id, lot_id)` by verifying each
+    /// record's outer SHA-256 envelope, version, and key-bound metadata header
+    /// without decompressing V2 payloads or running full `World`/`Saved`
+    /// deserialization.
+    ///
+    /// Corrupt or unsupported-version slots are reported inline as
+    /// [`SaveSlotEntry::Corrupt`] without modifying or deleting any record.
+    pub fn list_saves_metadata(
+        &self,
+        neighborhood_id: &str,
+        lot_id: u32,
+    ) -> std::result::Result<Vec<SaveSlotEntry>, SaveError> {
+        validate_neighborhood_id(neighborhood_id)?;
+        let txn = self.db.begin_read().map_err(store_err)?;
+        let mut entries = Vec::new();
+
+        match txn.open_table(AUTOSAVE_MANUAL) {
+            Ok(table) => {
+                if let Some(value) = table.get((neighborhood_id, lot_id)).map_err(store_err)? {
+                    match decode_record_metadata(
+                        neighborhood_id,
+                        lot_id,
+                        SaveSlot::Manual,
+                        value.value(),
+                    ) {
+                        Ok(metadata) => entries.push(SaveSlotEntry::Intact(metadata)),
+                        Err(error) => entries.push(SaveSlotEntry::Corrupt {
+                            slot: SaveSlot::Manual,
+                            error,
+                        }),
+                    }
+                }
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(error) => return Err(store_err(error)),
+        }
+
+        match txn.open_table(AUTOSAVE_RING) {
+            Ok(table) => {
+                for item in table
+                    .range((neighborhood_id, lot_id, 0u64)..=(neighborhood_id, lot_id, u64::MAX))
+                    .map_err(store_err)?
+                    .rev()
+                {
+                    let (key, value) = item.map_err(store_err)?;
+                    let seq = key.value().2;
+                    let slot = SaveSlot::Autosave(seq);
+                    match decode_record_metadata(neighborhood_id, lot_id, slot, value.value()) {
+                        Ok(metadata) => entries.push(SaveSlotEntry::Intact(metadata)),
+                        Err(error) => entries.push(SaveSlotEntry::Corrupt { slot, error }),
+                    }
+                }
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(error) => return Err(store_err(error)),
+        }
+
+        Ok(entries)
     }
 
     /// Lists all save slots for `(neighborhood_id, lot_id)`: the manual save

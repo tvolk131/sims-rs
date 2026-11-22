@@ -549,6 +549,7 @@ impl Machine<'_, '_> {
                 *word = me_id;
                 bottom.stack_object = caller_stack;
             }
+            crate::interpreter::mark_frame_dirty(self.world, created, 0);
         } else if flags & TEMP_0_TO_NEW != 0 {
             let value = *self
                 .me()?
@@ -575,6 +576,7 @@ impl Machine<'_, '_> {
                 };
                 *word = value;
             }
+            crate::interpreter::mark_frame_dirty(self.world, created, 0);
         }
         self.frame_mut()?.stack_object = created as i16;
         Ok(true)

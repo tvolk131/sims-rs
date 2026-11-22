@@ -477,10 +477,10 @@ impl Interpreter<'_> {
             deleted.borrow_mut().push(id);
         }
         world.frame_storage.remove(&id);
-        world.scratch_ptr_set.remove(&id);
-        world.scratch_ptr_set_to_next.remove(&id);
-        world.scratch_ptr_expression.remove(&id);
-        world.scratch_ptr_arg_slot.remove(&id);
+        if world.dirty_frames.contains_key(&id) {
+            world.dirty_frames.as_mut().remove(&id);
+        }
+        world.scratch_ptrs.clear_id(id);
         // So does its headline list (0x4323ce).
         world.headlines.remove(&id);
         // The object's slot table goes with it.
