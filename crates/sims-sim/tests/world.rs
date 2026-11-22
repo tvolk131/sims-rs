@@ -280,6 +280,20 @@ fn world() -> World {
         portraits: BTreeSet::from([0x1234_0042, 0x7fd9_6b54]),
         dirty_portraits: BTreeSet::from([0xdead_beef]),
         saved_portraits: BTreeSet::from([0xfeed_face]),
+        generated_portrait_2002: BTreeSet::new(),
+        made_portrait_head: BTreeMap::new(),
+        ambiguous_portraits: BTreeSet::new(),
+        loaded_indexed_skeletons: BTreeMap::new(),
+        loaded_indexed_suits: BTreeMap::new(),
+        loaded_indexed_suit_bones: BTreeMap::new(),
+        made_outfits: BTreeMap::new(),
+        person_outfits: BTreeMap::new(),
+        scratch_ptr_set: BTreeSet::new(),
+        scratch_ptr_set_to_next: BTreeSet::new(),
+        scratch_ptr_expression: BTreeSet::new(),
+        scratch_ptr_arg_slot: BTreeSet::new(),
+        runtime_added_suits: Vec::new(),
+        suit_scan_cache: None,
     }
 }
 

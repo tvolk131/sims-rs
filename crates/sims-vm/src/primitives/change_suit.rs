@@ -54,16 +54,11 @@ impl Machine<'_, '_> {
             0 | 2 => {
                 let name = self.accessory_name(scope, index)?;
                 let program = self.program;
-                let accessories = &mut self
-                    .me_mut()?
-                    .person
-                    .as_mut()
-                    .ok_or(Trap::native(0x1c, "object is not a person"))?
-                    .accessories;
+                let me = self.me;
                 if off {
-                    undress(accessories, &name);
+                    undress_person(self.world, me, &name)?;
                 } else {
-                    put_on(&program.people, accessories, name)?;
+                    put_on(&program.people, self.world, me, name)?;
                 }
             }
             _ => return Err(Trap::native(0x2f, "invalid accessory string table")),
@@ -158,30 +153,72 @@ impl Machine<'_, '_> {
     }
 }
 
-/// Puts on accessory `name` (0x58d88f), looking it up in `people`'s
-/// suits. The lookup compares bytes exactly (0x5a25dc, 0x5a27f2). A miss
-/// fails if any avatar files stopped decoding, since they might name it.
-/// An empty name is not looked up (0x583569): it gets an unnamed entry.
+/// Puts on accessory `name` (`0x58d88f` → `0x58d903` → `0x583559` → `0x5a044d`),
+/// looking it up in `people`'s avatar registry in runtime `.ndx` load order.
+/// The lookup compares bytes exactly (`0x5a25dc`, `0x5a27f2`). A miss fails if
+/// any avatar files stopped decoding, since they might name it. An empty name
+/// is not looked up (`0x583569`): it gets an unnamed entry.
 pub(crate) fn put_on(
     people: &People,
-    accessories: &mut Vec<Accessory>,
+    world: &mut sims_sim::World,
+    id: u16,
     name: String,
 ) -> Result<(), Trap> {
-    let found = !name.is_empty() && people.suits.contains(&name);
-    let errors = &people.suit_errors;
-    if !found && !name.is_empty() && !errors.is_empty() {
-        return Err(Trap::Unsupported(format!(
-            "accessory {name:?} is put on, but no decoded avatar file names it. {} avatar \
-             files stopped decoding ({})",
-            errors.len(),
-            errors
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(", ")
-        )));
+    let resolved = if name.is_empty() {
+        None
+    } else {
+        match crate::people::resolve_suit(people, world, &name) {
+            crate::people::ResolvedSuit::Found(has_head) => Some(has_head),
+            crate::people::ResolvedSuit::Missing => None,
+            crate::people::ResolvedSuit::Unknown => {
+                let errors = &people.suit_errors;
+                return Err(Trap::Unsupported(format!(
+                    "accessory {name:?} is put on, but no decoded avatar file names it. {} avatar \
+                     files stopped decoding ({})",
+                    errors.len(),
+                    errors
+                        .keys()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+        }
+    };
+    let found = resolved.is_some();
+    let accessories = &mut world
+        .objects
+        .get_mut(&id)
+        .and_then(|o| o.person.as_mut())
+        .ok_or(Trap::native(0x1c, "object is not a person"))?
+        .accessories;
+    dress(accessories, name.clone(), found);
+    if let Some(outfit) = world.person_outfits.get_mut(&id) {
+        outfit.accessories.retain(|slot| slot.suit != name);
+        if let Some(has_head) = resolved {
+            outfit.accessories.push(sims_sim::BoundSlot {
+                suit: name,
+                texture: String::new(),
+                has_head: Some(has_head),
+            });
+        }
     }
-    dress(accessories, name, found);
+    Ok(())
+}
+
+/// Takes off every accessory named exactly `name` on person `id` (`0x58d919`),
+/// updating both `person.accessories` and `world.person_outfits[&id].accessories`.
+pub(crate) fn undress_person(world: &mut sims_sim::World, id: u16, name: &str) -> Result<(), Trap> {
+    let accessories = &mut world
+        .objects
+        .get_mut(&id)
+        .and_then(|o| o.person.as_mut())
+        .ok_or(Trap::native(0x1c, "object is not a person"))?
+        .accessories;
+    undress(accessories, name);
+    if let Some(outfit) = world.person_outfits.get_mut(&id) {
+        outfit.accessories.retain(|slot| slot.suit != name);
+    }
     Ok(())
 }
 

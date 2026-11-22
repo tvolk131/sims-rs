@@ -299,6 +299,7 @@ fn program() -> Program {
         people: Default::default(),
         icon_frames: None,
         wardrobe: None,
+        ordered_wardrobe: None,
         character_files: Default::default(),
         expansions: 0,
         characters: Default::default(),
@@ -308,6 +309,7 @@ fn program() -> Program {
         library.definitions.insert(128, definition(guid, kind));
         library.definition_order.push(128);
     }
+    program.people.portrait_head.insert(SIM_GUID, true);
     program
 }
 
@@ -364,6 +366,7 @@ impl Fixture {
             callbacks: BTreeMap::from([(128, callbacks.to_vec())]),
             definitions: BTreeMap::from([(128, words)]),
             definition_order: vec![128],
+            writable: kind == 2,
             ..Library::default()
         };
         self.program.libraries.insert(resource, library);

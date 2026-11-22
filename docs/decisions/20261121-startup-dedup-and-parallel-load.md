@@ -42,8 +42,9 @@ Profiling `House05.iff` in `--release` uncovered three exact, correctness-neutra
 ## What was decided
 
 All changes are **100% bit-for-bit correctness-neutral** (zero changes to simulation determinism,
-43,200-tick Goth state hash `48440355df84c6963b8e634c29c6a379e85e33d86a14d08a9aebb1d51bf85586`,
-save wire layout, rendered `Canvas` pixels/depth/IDs, or any of the 8 SHA-256 hashes in
+43,200-tick Goth state hash `df6eb544be87b93233011f355999ac9abb0c36dc5e914f2f7c0fe2f49967b19a` on
+`origin/main` after `#340` — `48440355df84c6963b8e634c29c6a379e85e33d86a14d08a9aebb1d51bf85586`
+pre-`#340`, save wire layout, rendered `Canvas` pixels/depth/IDs, or any of the 8 SHA-256 hashes in
 `crates/sims-game/tests/ratchet.txt`), use only Rust `std` (`std::thread::scope`, `Arc`,
 `RwLock`/`Mutex`, `BTreeMap`/`BTreeSet`) with **no new dependencies** and **zero `unsafe`**, and
 keep every existing public API signature backward-compatible:
@@ -71,30 +72,29 @@ keep every existing public API signature backward-compatible:
        `Index::first_by_file_name` `GLOB` lookup), `Assets::scan` (per `SOURCES` mount),
        `Animations::load_with_pool` (parallel `.cfp`/`.bcf` reads + 8-byte header peek),
        `Wardrobe::load_with_pool` (parallel `.cmx`/`.bcf` reads + 8-byte `[0; 8]` skip),
-       `AvatarRegistry::load_with_pool` (parallel `.cmx`, `.bcf` with 8-byte `[0; 8]` skip, and
-       indexed `.bcf` verification applied in exact startup precedence order),
-       `People::load_each_with_registry` / `load_each_with_registry_result` (caches semi-global
-       `STR# 8192` skin tones per semi-global while preserving exact `body_strings` -> `skin_tones`
-       -> skeleton name -> `AvatarRegistry` error order), `Surfaces::build_with_pool` (scans
-       shared `WallsAndFloors` directories once in bounded batches and parses `.flr`/`.wll` in
-       parallel while checking directory and parse errors in exact original traversal order), and
-       `UiGraphics::open_with_pool` (caches visited directory listings on demand for exact
-       component-by-component case resolution without walking unreferenced subdirectories, and
-       reuses `ArchivePool` for `UIGraphics.far`).
+       `ImportWardrobe::load_lenient_with_pool` (pooled parallel `.cmx`/`.bcf` scan + 8-byte
+       `[0; 8]` skip), `AvatarRegistry::load_with_pool` (parallel `.cmx`, `.bcf` with 8-byte
+       `[0; 8]` skip, indexed `.bcf`, and HEAD mesh validation applied in exact startup precedence
+       order), `People::load_each_with_registry` / `load_each_with_registry_result` (caches
+       semi-global `STR# 8192` skin tones per semi-global while preserving exact `body_strings` ->
+       `skin_tones` -> `AvatarRegistry` error order and immutable `export_skeletons` resolution),
+       `Surfaces::build_with_pool` (scans shared `WallsAndFloors` directories once in bounded
+       batches and parses `.flr`/`.wll` in parallel while checking directory and parse errors in
+       exact original traversal order), and `UiGraphics::open_with_pool` (caches visited directory
+       listings on demand for exact component-by-component case resolution without walking
+       unreferenced subdirectories, and reuses `ArchivePool` for `UIGraphics.far`).
      - `sims-vm`: `Program::link_with_pool` (parallel library reads/parses + parallel career/label
        checks with exact sequential error priority: `careers` -> `career_texts_end` ->
        `labels_hold_no_token` -> libraries -> `MissingDefinition`) and `Lot::boot` /
        `Lot::load_preloaded` (two-stage parallel DAG deferring stage errors to their exact original
-       points, plus reuse of already-resolved catalog person types at step 6e whenever
-       `registry.is_order_independent()` is true — no skeleton decode error and no lazy `.ndx`
-       skeleton mutation — falling back to `People::load_each_with_pool` otherwise).
+       points, forwarding boot-time `view_centre`, and reusing immutable `program.people` directly
+       at step 6e after checking `unresolved_people` over `saved_guids`).
      - `sims-render`: `BaseAssets::load` + `Assets::from_base` / `Assets::new_shared` sharing
        `Arc<Index>`, `Arc<Catalog>`, `Arc<ArchivePool>`, and pre-scanned `floor_plugins` /
        `wall_plugins` from `Surfaces::build_with_plugins_and_pool` / `Surfaces::plugins_with_pool`
        (and reading plug-in floor/wall sprites through `ArchivePool`).
      - `sims-people`: `Library::scan_with_pool` (8-byte `[0; 8]` peek + parallel `.bcf` parse) and
-       `Cast::from_shared` with optional `PreloadedCast`, order-independent cached `AvatarRegistry`
-       (never retaining a registry across refreshes after a skeleton error or lazy `.ndx` mutation),
+       `Cast::from_shared` with optional `PreloadedCast`, cached immutable `AvatarRegistry`,
        and cached `body_strings`.
      - `sims-ui`: `Art::load_with_optional` (bounded `<= 8` workers decoding required/optional
        bitmaps + fonts in parallel while preserving exact `missing` order), `Careers::load_with_pool`,

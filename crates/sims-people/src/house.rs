@@ -157,26 +157,24 @@ impl Cast {
             let mut guard = self.registry.lock().unwrap_or_else(|e| e.into_inner());
             let cached = guard.take();
             let result = match cached {
-                Some(mut registry) => {
+                Some(registry) => {
                     let loaded = People::load_each_with_registry(
                         &self.index,
                         &self.catalog,
                         people.iter().map(|&(_, guid, _)| guid),
-                        &mut registry,
+                        &registry,
                         &self.pool,
                     )
                     .map_err(|e| e.to_string());
-                    // Retain the cached registry across refreshes only while it
-                    // remains order-independent (no skeleton decode error and no
-                    // lazy `.ndx` skeleton load mutating its table).
-                    if registry.is_order_independent() {
-                        *guard = Some(registry);
-                    }
+                    // `People::load_each_with_registry` reads `registry`
+                    // immutably via `export_skeletons`, so retaining it across
+                    // refreshes is always order-independent.
+                    *guard = Some(registry);
                     loaded?
                 }
                 None => {
                     let registry_res = AvatarRegistry::load_with_pool(&self.install, &self.pool);
-                    let (loaded, registry) = People::load_each_with_registry_result(
+                    let (loaded, registry) = People::load_each_with_registry_cached(
                         &self.index,
                         &self.catalog,
                         people.iter().map(|&(_, guid, _)| guid),
@@ -184,9 +182,7 @@ impl Cast {
                         &self.pool,
                     )
                     .map_err(|e| e.to_string())?;
-                    if registry.is_order_independent() {
-                        *guard = Some(registry);
-                    }
+                    *guard = Some(registry);
                     loaded
                 }
             };

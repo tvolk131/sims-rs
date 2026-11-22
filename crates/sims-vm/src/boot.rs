@@ -255,21 +255,38 @@ pub struct Finished {
 /// ([`Lot::load_after_pools`]).
 #[derive(Debug, Clone, Default)]
 pub struct Handoff {
-    /// The skeletons, by name, whose files the game has already read.
-    /// They are added to the files our load counts as read before the
-    /// first lot.
-    pub skeletons_read: BTreeSet<String>,
+    /// The skeletons, by name, whose files the game has already read, in exact
+    /// open order so duplicate entries across already-opened catalogs preserve
+    /// native first-registration order (`0x59f18c`, `0x59f34c`).
+    pub skeletons_read: Vec<String>,
     /// Whether the two indicators' graphics roots already exist.
     pub indicators_made: bool,
 }
 
-/// Preloaded catalog person types: `((resolved, unresolved_by_guid), registry_order_independent)`.
-pub type PreloadedPeople = ((People, BTreeMap<u32, String>), bool);
+/// Preloaded catalog person types: `(resolved, unresolved_by_guid)`.
+pub type PreloadedPeople = (People, BTreeMap<u32, String>);
+
+/// Loads the native-ordered wardrobe for Make New Character (`0x44b151`) using
+/// `pool`, converting lenient archive/catalog errors into the `Result` stored
+/// in `Program::ordered_wardrobe`.
+pub fn load_ordered_wardrobe(
+    install: &Install,
+    pool: &ArchivePool,
+) -> Result<sims_content::ImportWardrobe, String> {
+    match sims_content::ImportWardrobe::load_lenient_with_pool(install, pool) {
+        Ok((ordered, errors)) if errors.is_empty() => Ok(ordered),
+        Ok((_, errors)) => {
+            let (file, error) = errors.into_iter().next().unwrap();
+            Err(format!("{file} ({error})"))
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
 
 /// Pre-loaded content shared by a host (such as `sims-game`) so [`Lot::load_preloaded`]
 /// reuses the same [`Install`], [`Neighborhood`], [`Index`], [`Catalog`],
-/// [`Program`], [`Animations`], [`People`], [`Surfaces`], and [`sims_content::Wardrobe`]
-/// without scanning or parsing game archives twice.
+/// [`Program`], [`Animations`], [`People`], [`Surfaces`], [`sims_content::Wardrobe`],
+/// and [`sims_content::ImportWardrobe`] without scanning or parsing game archives twice.
 ///
 /// Parallel stage results are passed as `Result`s so [`Lot::load_preloaded`]
 /// checks every error at the exact original sequential point (`House::load` ->
@@ -288,8 +305,10 @@ pub struct PreloadedBoot<'a> {
     pub people: sims_content::Result<PreloadedPeople>,
     pub icon_frames: crate::Result<Option<BTreeMap<u16, i32>>>,
     pub wardrobe: sims_content::Wardrobe,
+    pub ordered_wardrobe: Result<sims_content::ImportWardrobe, String>,
     pub surfaces: sims_content::Result<Surfaces>,
     pub default_character_name: String,
+    pub view_centre: Option<[i8; 2]>,
 }
 
 /// A booted house: its linked code, its catalog and its lot.
@@ -821,6 +840,7 @@ impl Lot {
         frames: Frames,
         preloaded: PreloadedBoot<'_>,
     ) -> Result<Self, BootError> {
+        let view_centre = preloaded.view_centre;
         Self::boot_preloaded(
             house,
             answers,
@@ -828,7 +848,7 @@ impl Lot {
             CrtRng::from_state(1),
             &BTreeSet::new(),
             None,
-            None,
+            view_centre,
             preloaded,
         )
     }
@@ -857,6 +877,7 @@ impl Lot {
             registry_res,
             surfaces_res,
             wardrobe,
+            ordered_wardrobe,
             icon_frames_res,
             default_name,
         ) = std::thread::scope(|scope| {
@@ -877,6 +898,7 @@ impl Lot {
                 Ok(assets) => sims_content::Wardrobe::load_with_pool(&assets, &pool),
                 Err(error) => sims_content::Wardrobe::unread(error),
             });
+            let ordered_ward_handle = scope.spawn(|| load_ordered_wardrobe(&install, &pool));
             let icon_handle = scope.spawn(|| crate::program::icon_frames(&install));
             let name = read_default_character_name(&install);
             (
@@ -886,6 +908,9 @@ impl Lot {
                 reg_handle.join().expect("boot registry worker panicked"),
                 surf_handle.join().expect("boot surfaces worker panicked"),
                 ward_handle.join().expect("boot wardrobe worker panicked"),
+                ordered_ward_handle
+                    .join()
+                    .expect("boot ordered_wardrobe worker panicked"),
                 icon_handle
                     .join()
                     .expect("boot icon_frames worker panicked"),
@@ -927,8 +952,7 @@ impl Lot {
                 person_types,
                 registry_res,
                 &pool,
-            )
-            .map(|(loaded, registry)| (loaded, registry.is_order_independent()));
+            );
             (
                 prog_handle.join().expect("boot program worker panicked"),
                 anim_handle.join().expect("boot animations worker panicked"),
@@ -957,8 +981,10 @@ impl Lot {
                 people: people_res,
                 icon_frames: icon_frames_res,
                 wardrobe,
+                ordered_wardrobe,
                 surfaces: surfaces_res,
                 default_character_name: default_name,
+                view_centre,
             },
         )
     }
@@ -975,20 +1001,22 @@ impl Lot {
         preloaded: PreloadedBoot<'_>,
     ) -> Result<Self, BootError> {
         let PreloadedBoot {
-            install,
+            install: _,
             neighborhood,
             characters,
             index,
             catalog,
-            pool,
+            pool: _,
             file,
             program,
             animations,
             people,
             icon_frames,
             wardrobe,
+            ordered_wardrobe,
             surfaces: surfaces_res,
             default_character_name,
+            view_centre: _,
         } = preloaded;
 
         let file = match file {
@@ -1013,10 +1041,11 @@ impl Lot {
             })
             .collect();
         program.animations = animations?;
-        let ((catalog_people, unresolved_people), registry_order_independent) = people?;
+        let (catalog_people, unresolved_people) = people?;
         program.people = catalog_people;
         program.icon_frames = icon_frames?;
         program.wardrobe = Some(wardrobe);
+        program.ordered_wardrobe = Some(ordered_wardrobe);
         if let Some(characters) = characters {
             program.character_files = crate::program::character_files(index, characters);
         }
@@ -1055,6 +1084,43 @@ impl Lot {
                     .into());
                 };
                 world.skeleton_files.insert(file.clone());
+                // The handoff's catalog was already opened through `0x59f087`
+                // before the lot load, so its indexed skeletons and appearances
+                // are already registered in the avatar registry (preventing a
+                // duplicate lazy load and CRT RNG draw during house load).
+                if let Some((items, _)) = program.people.indexed_catalogs.get(file) {
+                    for item in items {
+                        if !program.people.skeletons_by_name.contains_key(&item.name)
+                            && !world.loaded_indexed_skeletons.contains_key(&item.name)
+                        {
+                            world
+                                .loaded_indexed_skeletons
+                                .insert(item.name.clone(), Some(file.clone()));
+                        }
+                    }
+                }
+                if let Some((suits, _)) = program.people.indexed_suit_catalogs.get(file) {
+                    let catalog_bones = program.people.indexed_suit_head_bones.get(file);
+                    for (app_name, has_head) in suits {
+                        if !program.people.eager_suits.contains(app_name)
+                            && !world.loaded_indexed_suits.contains_key(app_name)
+                        {
+                            world
+                                .loaded_indexed_suits
+                                .insert(app_name.clone(), Some(*has_head));
+                            if let Some(bones) = catalog_bones.and_then(|m| m.get(app_name)) {
+                                world
+                                    .loaded_indexed_suit_bones
+                                    .insert(app_name.clone(), bones.clone());
+                            }
+                            if !program.people.indexed_suits.contains_key(app_name)
+                                && !world.runtime_added_suits.contains(app_name)
+                            {
+                                world.runtime_added_suits.push(app_name.clone());
+                            }
+                        }
+                    }
+                }
             }
             world.read_neighbors(
                 neighborhood,
@@ -1172,61 +1238,22 @@ impl Lot {
             }
             // 6d: the second clear, then 6e: the saved objects.
             load.cleared_again = interpreter.clear(&mut world)?.len();
-            // Reuse the already-resolved catalog person types instead of
-            // rebuilding AvatarRegistry a second time whenever lookups are
-            // order-independent (no skeleton decode error and no lazy `.ndx`
-            // skeleton mutation).
-            let people = if registry_order_independent {
-                let saved_guids: BTreeSet<u32> =
-                    file.objects.instances.values().map(|o| o.guid).collect();
-                for &guid in &saved_guids {
-                    if let Some(reason) = unresolved_people.get(&guid) {
-                        return Err(sims_content::Error::Unsupported(reason.clone()).into());
-                    }
+            // Reuse `program.people` directly instead of rebuilding
+            // AvatarRegistry a second time: `People::load_each` resolves
+            // skeletons immutably via `AvatarRegistry::export_skeletons`, so
+            // checking `unresolved_people` over `saved_guids` matches
+            // `People::load` over the saved objects' GUIDs identically.
+            let saved_guids: BTreeSet<u32> =
+                file.objects.instances.values().map(|o| o.guid).collect();
+            for &guid in &saved_guids {
+                if let Some(reason) = unresolved_people.get(&guid) {
+                    return Err(sims_content::Error::Unsupported(reason.clone()).into());
                 }
-                let skeletons = saved_guids
-                    .iter()
-                    .filter_map(|guid| {
-                        program
-                            .people
-                            .skeletons
-                            .get(guid)
-                            .map(|s| (*guid, s.clone()))
-                    })
-                    .collect();
-                let profiles = saved_guids
-                    .iter()
-                    .filter_map(|guid| {
-                        program
-                            .people
-                            .profiles
-                            .get(guid)
-                            .map(|p| (*guid, p.clone()))
-                    })
-                    .collect();
-                People {
-                    skeletons,
-                    profiles,
-                    suits: program.people.suits.clone(),
-                    suit_errors: program.people.suit_errors.clone(),
-                }
-            } else {
-                let (loaded, mut unresolved) = People::load_each_with_pool(
-                    install,
-                    index,
-                    &catalog,
-                    file.objects.instances.values().map(|o| o.guid),
-                    pool,
-                )?;
-                if let Some((_, reason)) = unresolved.pop_first() {
-                    return Err(sims_content::Error::Unsupported(reason).into());
-                }
-                loaded
-            };
+            }
             let read = interpreter.read_objects_with_frame_tree_bits(
                 &mut world,
                 &file.objects,
-                &people,
+                &program.people,
                 frame_tree_bits,
             )?;
             load.read = read.objects.len();
@@ -1288,7 +1315,7 @@ impl Lot {
             // stops at the first visit that is not ported, with the lot as
             // the visit before it left it.
             load.to_visit = world.order.len();
-            let visited = interpreter.visit_objects(&mut world, &people);
+            let visited = interpreter.visit_objects(&mut world, &program.people);
             load.visited = visited.objects.len();
             load.reset = visited.reset.len();
             load.stopped = visited.stopped.map(|fault| fault.to_string());
@@ -1482,6 +1509,7 @@ impl Lot {
         let tuning = self.tuning.as_ref().ok_or(StepError::Incomplete)?;
         let asks = self.asks;
         let sounds = RefCell::new(Vec::new());
+        let ui_effects = RefCell::new(Vec::new());
         let masks_rebuilt = Cell::new(0);
         let dialog_text = RefCell::new(self.last_dialog_text.clone());
         let character_names = RefCell::new(self.character_names.clone());
@@ -1490,6 +1518,7 @@ impl Lot {
             .unwrap_or((self.view_rotation, self.view_centre));
         let interpreter = Interpreter {
             sounds: Some(&sounds),
+            ui_effects: Some(&ui_effects),
             masks_rebuilt: Some(&masks_rebuilt),
             view_rotation,
             view_centre,
@@ -1557,6 +1586,7 @@ impl Lot {
                     // it: the errors caught, a skipped first frame, and
                     // the sounds.
                     update.sounds = sounds.take();
+                    update.ui_effects = ui_effects.take();
                     update.masks_rebuilt = masks_rebuilt.get();
                     StepError::Tick {
                         tick,
@@ -1597,6 +1627,7 @@ impl Lot {
         // The step's sounds go with its update whether or not the frame
         // failed.
         update.sounds = sounds.into_inner();
+        update.ui_effects = ui_effects.into_inner();
         update.masks_rebuilt = masks_rebuilt.get();
         self.last_dialog_text = dialog_text.into_inner();
         self.character_names = character_names.into_inner();
@@ -3541,6 +3572,7 @@ mod tests {
                 people: Default::default(),
                 icon_frames: None,
                 wardrobe: None,
+                ordered_wardrobe: None,
                 character_files: Default::default(),
                 expansions: 0,
                 characters: Default::default(),
@@ -4338,6 +4370,9 @@ mod tests {
                         skin: None,
                         tones: Vec::new(),
                         rig: Default::default(),
+                        body: None,
+                        head: None,
+                        suit_rows: Default::default(),
                     },
                 );
             }
@@ -4371,11 +4406,12 @@ mod tests {
         assert!(restored.world().saved_portraits.contains(&PERSON_A));
 
         // Tick 2 runs after replay_view is cleared, so PERSON_B's portrait search
-        // MUST use the moved live [2, 2] and hit the no-tile trap (0x4e9706 / 0x4e938c).
-        let err = restored.step().unwrap_err().to_string();
-        assert!(
-            err.contains("0x4e9706") && err.contains("0x4e938c"),
-            "{err}"
-        );
+        // MUST use the moved live [2, 2], find no tile, remove unput (`0x4e9706`)
+        // without caching or saving PERSON_B, and pause on tick 2's dialog.
+        assert_eq!(restored.step().unwrap_err(), StepError::Asking { tick: 2 });
+        restored.answer(2).unwrap();
+        restored.step().unwrap();
+        assert!(!restored.world().portraits.contains(&PERSON_B));
+        assert!(!restored.world().saved_portraits.contains(&PERSON_B));
     }
 }
