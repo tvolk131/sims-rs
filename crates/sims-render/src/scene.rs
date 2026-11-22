@@ -13,7 +13,7 @@ use crate::light::Light;
 use crate::lot::{self, Lot, WallCell};
 use crate::pools::{self, Pools};
 use crate::shadows;
-use sims_sim::{Object, World};
+use sims_sim::{CowMap, Object, World};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Rows between a tile's left corner and the top of its first grass
@@ -318,12 +318,25 @@ fn paint(
         holds_person(world)
     };
     paint_with_precomputed(
-        world, lot, assets, camera, viewport, preview, options, canvas, pass, &grass, held, None,
+        world,
+        lot,
+        assets,
+        camera,
+        viewport,
+        preview,
+        options,
+        canvas,
+        pass,
+        &grass,
+        held,
+        None,
+        None,
+        |_, _| {},
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn paint_lot_precomputed(
+pub(crate) fn paint_lot_with_env_hook(
     world: &World,
     lot: &Lot,
     assets: &mut Assets,
@@ -335,6 +348,8 @@ pub(crate) fn paint_lot_precomputed(
     grass: &Grass,
     held: BTreeSet<u16>,
     cut_mask: Option<&Mask>,
+    level1_openings: Option<&BTreeMap<Edge, (usize, u16)>>,
+    after_level1_env: impl FnMut(&Canvas, Stats),
 ) -> Stats {
     paint_with_precomputed(
         world,
@@ -349,7 +364,55 @@ pub(crate) fn paint_lot_precomputed(
         grass,
         held,
         cut_mask,
+        level1_openings,
+        after_level1_env,
     )
+}
+
+/// Completes `Pass::Lot` starting from a canvas already populated with level-1's
+/// static environment (`clear` + `floors(1)` + `walls(1)` + `trims(1)`) and its
+/// accumulated [`Stats`]. Draws level-1 non-held objects, plus all of level 2
+/// when `camera.level == 2`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn paint_lot_from_env(
+    world: &World,
+    lot: &Lot,
+    assets: &mut Assets,
+    camera: &Camera,
+    viewport: (u32, u32),
+    preview: Option<(u16, u16)>,
+    options: RenderOptions,
+    canvas: &mut Canvas,
+    held: BTreeSet<u16>,
+    cut_mask: Option<&Mask>,
+    env_stats: Stats,
+) -> Stats {
+    let mut painter = Painter::new(
+        world,
+        lot,
+        assets,
+        camera,
+        viewport,
+        preview,
+        options,
+        canvas,
+        Pass::Lot,
+        None,
+        held,
+    );
+    painter.stats = env_stats;
+    let top = camera.level.clamp(1, 2);
+    let cut1 = cut(lot, camera, 1, top, cut_mask);
+    painter.objects(1, &cut1);
+    if top == 2 {
+        painter.floors(2);
+        let cut2 = cut(lot, camera, 2, top, cut_mask);
+        let corners2 = painter.corners(2, &cut2);
+        painter.walls(2, &cut2, &corners2);
+        painter.trims(2, &corners2);
+        painter.objects(2, &cut2);
+    }
+    painter.stats
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -366,6 +429,8 @@ fn paint_with_precomputed(
     grass: &Grass,
     held: BTreeSet<u16>,
     cut_mask: Option<&Mask>,
+    level1_openings: Option<&BTreeMap<Edge, (usize, u16)>>,
+    mut after_level1_env: impl FnMut(&Canvas, Stats),
 ) -> Stats {
     let time_of_day = world.globals.get(4).copied().unwrap_or(lot.time_of_day);
     let house = world.globals.get(10).copied().unwrap_or(0);
@@ -388,8 +453,17 @@ fn paint_with_precomputed(
         painter.floors(level);
         let cut = cut(lot, camera, level, top, cut_mask);
         let corners = painter.corners(level, &cut);
-        painter.walls(level, &cut, &corners);
+        if level == 1
+            && let Some(openings) = level1_openings
+        {
+            painter.walls_with_openings(level, &cut, &corners, openings);
+        } else {
+            painter.walls(level, &cut, &corners);
+        }
         painter.trims(level, &corners);
+        if level == 1 {
+            after_level1_env(painter.canvas, painter.stats);
+        }
         painter.objects(level, &cut);
     }
     painter.stats
@@ -440,7 +514,7 @@ pub fn holds_person(world: &World) -> BTreeSet<u16> {
 }
 
 /// [`holds_person`] for `objects`, of which `people` are the people.
-fn held_trees(objects: &BTreeMap<u16, Object>, people: &BTreeSet<u16>) -> BTreeSet<u16> {
+fn held_trees(objects: &CowMap<u16, Object>, people: &BTreeSet<u16>) -> BTreeSet<u16> {
     let word = |id: u16, i: usize| objects.get(&id).and_then(|o| o.data.get(i).copied());
     let registered = |w: i16| {
         u16::try_from(w)
@@ -587,7 +661,32 @@ impl Level {
 }
 
 /// A wall segment by its two lot corners, the lower first.
-type Edge = [[i32; 2]; 2];
+pub(crate) type Edge = [[i32; 2]; 2];
+
+/// The objects that cut their own shape into a wall on a level, by the wall
+/// they stand in, stored as `(resource, wall_shape)`.
+pub(crate) fn wall_objects_on_level(
+    world: &World,
+    assets: &mut Assets,
+    level: i32,
+) -> BTreeMap<Edge, (usize, u16)> {
+    let mut found = BTreeMap::new();
+    for o in world.objects.values() {
+        if o.position[2] != level || o.position[0] < 0 || o.position[1] < 0 {
+            continue;
+        }
+        let Some(definition) = assets.definition_ref(o.guid) else {
+            continue;
+        };
+        if definition.shapes_wall() {
+            let info = (Assets::resource_of(definition), definition.wall_shape);
+            if let Some(e) = object_edge(o.position, &o.data) {
+                found.insert(e, info);
+            }
+        }
+    }
+    found
+}
 
 fn edge(a: [i32; 2], b: [i32; 2]) -> Edge {
     if a <= b { [a, b] } else { [b, a] }
@@ -1096,29 +1195,25 @@ impl<'a> Painter<'a> {
     /// wall they stand in (the old prototype's `object_apertures` in
     /// `legacy/crates/sims-render/src/walls.rs`), stored as `(resource, wall_shape)`.
     fn wall_objects(&mut self, level: i32) -> BTreeMap<Edge, (usize, u16)> {
-        let mut found = BTreeMap::new();
-        for o in self.world.objects.values() {
-            if o.position[2] != level || o.position[0] < 0 || o.position[1] < 0 {
-                continue;
-            }
-            let Some(definition) = self.assets.definition_ref(o.guid) else {
-                continue;
-            };
-            if definition.shapes_wall() {
-                let info = (Assets::resource_of(definition), definition.wall_shape);
-                if let Some(e) = object_edge(o.position, &o.data) {
-                    found.insert(e, info);
-                }
-            }
-        }
-        found
+        wall_objects_on_level(self.world, self.assets, level)
     }
 
     /// Draws a level's walls.
     fn walls(&mut self, level: i32, cut: &Cut, corners: &Level) {
+        let openings = self.wall_objects(level);
+        self.walls_with_openings(level, cut, corners, &openings);
+    }
+
+    /// Draws a level's walls using precomputed wall-shaping object apertures.
+    fn walls_with_openings(
+        &mut self,
+        level: i32,
+        cut: &Cut,
+        corners: &Level,
+        openings: &BTreeMap<Edge, (usize, u16)>,
+    ) {
         let index = (level - 1) as usize;
         let zoom = self.camera.zoom.index();
-        let openings = self.wall_objects(level);
         for x in 0..self.lot.size as i32 {
             for y in 0..self.lot.size as i32 {
                 let wall = self.lot.levels[index].walls[Lot::cell(x as usize, y as usize)];
@@ -2021,7 +2116,7 @@ const BEFORE: usize = 26;
 /// cycle returns `(false, base)`. Each accumulated coordinate stays within a
 /// lot's width of `base` so malformed slot data cannot overflow.
 fn held(
-    objects: &BTreeMap<u16, Object>,
+    objects: &CowMap<u16, Object>,
     mut slot: impl FnMut(u32, usize) -> Option<[f32; 3]>,
     id: u16,
     base: [f32; 3],
@@ -2891,7 +2986,7 @@ mod tests {
             (TRAY, 0) => Some([-9.6, 0.0, 0.0]),
             _ => None,
         };
-        let mut objects = BTreeMap::new();
+        let mut objects = CowMap::new();
         // A table facing 2 (one quarter turn) holds a lamp in its slot 1.
         objects.insert(1, object(1, TABLE, [100, 200, 1], &[(1, 2)]));
         objects.insert(
@@ -2948,11 +3043,11 @@ mod tests {
     #[test]
     fn a_persons_holders_and_all_they_hold_draw_after_the_people() {
         use sims_formats::saved_objects::Slot;
-        let mut objects = BTreeMap::new();
+        let mut objects = CowMap::new();
         // Sets entry `index` of `at`'s saved slot list to `id`. Entry 0
         // links to the next object on the tile; slot `n` (from 0) is entry
         // `n + 1`.
-        let entry = |objects: &mut BTreeMap<u16, Object>, at: u16, index: usize, id: u16| {
+        let entry = |objects: &mut CowMap<u16, Object>, at: u16, index: usize, id: u16| {
             let slots = &mut objects.get_mut(&at).unwrap().slots;
             if slots.len() <= index {
                 let empty = Slot {
@@ -2965,14 +3060,14 @@ mod tests {
         };
         // `at` holds `id` in its slot `slot` (from 0), by the link words
         // and in the holder's slot list.
-        let put = |objects: &mut BTreeMap<u16, Object>, id: u16, at: u16, slot: usize| {
+        let put = |objects: &mut CowMap<u16, Object>, id: u16, at: u16, slot: usize| {
             let o = objects.get_mut(&id).unwrap();
             o.data[LINK_SLOT] = slot as i16 + 1;
             o.data[BEFORE] = at as i16;
             entry(objects, at, slot + 1, id);
         };
         // `id` follows `before` on its tile.
-        let follow = |objects: &mut BTreeMap<u16, Object>, id: u16, before: u16| {
+        let follow = |objects: &mut CowMap<u16, Object>, id: u16, before: u16| {
             let o = objects.get_mut(&id).unwrap();
             o.data[LINK_SLOT] = 0;
             o.data[BEFORE] = before as i16;
@@ -3028,7 +3123,7 @@ mod tests {
     #[test]
     fn a_long_chain_of_huge_slots_stays_within_a_lot() {
         let huge = |_: u32, _: usize| Some([f32::MAX, -1e30, f32::INFINITY]);
-        let mut objects = BTreeMap::new();
+        let mut objects = CowMap::new();
         objects.insert(1, object(1, 1, [0, 0, 1], &[]));
         for id in 2..200u16 {
             let below = (id - 1) as i16;

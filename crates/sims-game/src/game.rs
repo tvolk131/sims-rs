@@ -844,7 +844,26 @@ impl Game {
     /// (`0x46da1b`); here the next tick waits a period of the new speed
     /// (**unverified**, and the window's timing, not the simulation's).
     pub fn advance(&mut self, elapsed_us: u64) -> u32 {
-        self.clock_us = self.clock_us.saturating_add(elapsed_us);
+        self.advance_while(elapsed_us, elapsed_us, |_| true).0
+    }
+
+    /// Advances the presentation clock by `clock_elapsed_us` and runs the
+    /// ticks owed for `step_elapsed_us` while `keep_going(ran)` returns
+    /// `true`. Returns `(ran, capped)`, where `capped` is `true` if
+    /// `keep_going` stopped the batch before all owed ticks ran (in which case
+    /// [`Pace::restart`] drops the leftover fraction).
+    ///
+    /// Keeping `clock_elapsed_us` separate from `step_elapsed_us` lets the
+    /// interactive window loop drop capped simulation time from scheduler
+    /// pacing without slowing the plumb bob spin or pause-button blink;
+    /// headless callers use [`Game::advance`].
+    pub fn advance_while(
+        &mut self,
+        clock_elapsed_us: u64,
+        step_elapsed_us: u64,
+        mut keep_going: impl FnMut(u32) -> bool,
+    ) -> (u32, bool) {
+        self.clock_us = self.clock_us.saturating_add(clock_elapsed_us);
         if self.hud.sync_clock_blink(self.lot.world(), self.clock_us)
             || self.hud.sync_dialog_blink(self.clock_us)
         {
@@ -855,20 +874,23 @@ impl Game {
             || self.lot.asking().is_some()
         {
             self.pace.restart();
-            return 0;
+            return (0, false);
         }
         if self.idle_speed() {
-            return 0;
+            return (0, false);
         }
-        let due = self.pace.due(elapsed_us, self.lot.world().speed());
-        let ran = self.run_while(due, true);
+        let due = self.pace.due(step_elapsed_us, self.lot.world().speed());
+        let (ran, capped) = self.run_while(due, true, &mut keep_going);
+        if capped {
+            self.pace.restart();
+        }
         if ran > 0 {
             self.dirty = true;
         }
         if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
             self.blink_dirty = true;
         }
-        ran
+        (ran, capped)
     }
 
     /// Sets the idle loop's own speed between ticks ([`Lot::idle_speed`]).
@@ -903,23 +925,36 @@ impl Game {
     /// Runs up to `ticks` ticks, stopping at the first that fails or that
     /// shows a dialog the player has to answer.
     pub fn run(&mut self, ticks: u32) -> u32 {
-        let ran = self.run_while(ticks, false);
+        let ran = self.run_while(ticks, false, |_| true).0;
         if ran > 0 {
             self.dirty = true;
         }
         ran
     }
 
-    /// Runs up to `ticks` ticks, stopping at the first that fails, and,
-    /// if `idle`, before a tick the idle loop's speed sets the speed for
-    /// ([`Game::idle_speed`]) or after a tick that changes the
-    /// simulation's speed or return speed (such as Special Effect resetting
-    /// to normal, `0x4f684c` → `0x46d697`). Any mid-tick speed or return-speed
-    /// change updates the panel's speed and restarts the time owed, whether
-    /// `idle` is set or not.
-    fn run_while(&mut self, ticks: u32, idle: bool) -> u32 {
+    /// Runs up to `ticks` ticks, stopping at the first that fails, before
+    /// `keep_going(ran)` returns `false`, and, if `idle`, before a tick the
+    /// idle loop's speed sets the speed for ([`Game::idle_speed`]) or after a
+    /// tick that changes the simulation's speed or return speed (such as
+    /// Special Effect resetting to normal, `0x4f684c` → `0x46d697`). Any
+    /// mid-tick speed or return-speed change updates the panel's speed and
+    /// restarts the time owed, whether `idle` is set or not.
+    fn run_while(
+        &mut self,
+        ticks: u32,
+        idle: bool,
+        mut keep_going: impl FnMut(u32) -> bool,
+    ) -> (u32, bool) {
         let mut ran = 0;
-        while ran < ticks && self.stopped.is_none() && !(idle && self.idle_speed()) {
+        let mut capped = false;
+        while ran < ticks && self.stopped.is_none() {
+            if idle && self.idle_speed() {
+                break;
+            }
+            if !keep_going(ran) {
+                capped = true;
+                break;
+            }
             let speed_before = (self.lot.world().speed(), self.lot.world().return_speed());
             let step = if self.play {
                 self.lot.step_play()
@@ -1003,7 +1038,7 @@ impl Game {
                 }
             }
         }
-        ran
+        (ran, capped)
     }
 
     /// Keeps a step's sound requests for the host, at most

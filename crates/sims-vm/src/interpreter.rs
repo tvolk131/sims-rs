@@ -975,8 +975,15 @@ impl<'a> Machine<'a, '_> {
             .objects
             .get(&self.me)
             .map_or(0, |o| o.stack.len().saturating_sub(1)) as u32;
-        if let Some(storage) = self.world.frame_storage.get_mut(&self.me) {
-            storage.unknown.remove(&(depth, local as u32));
+        let key = (depth, local as u32);
+        if self
+            .world
+            .frame_storage
+            .get(&self.me)
+            .is_some_and(|s| s.unknown.contains(&key))
+            && let Some(storage) = self.world.frame_storage.get_mut(&self.me)
+        {
+            storage.unknown.remove(&key);
         }
     }
 
