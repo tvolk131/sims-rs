@@ -45,7 +45,7 @@
 //!     pattern and purging all detached history before committing.
 
 use crate::boot::save::{SaveError, Saved};
-use crate::boot::{AnswerError, Frames, Lot, Menu, OrderError, StepError};
+use crate::boot::{AnswerError, Frames, Lot, Menu, OrderError, SpecialPanelAnswerError, StepError};
 use crate::build::{
     BuildPrices, FloorDragMode, SPLIT_FLOOR_ID, WALL_EAST, WALL_NORTH, WALL_SOUTH, WALL_WEST,
     WallDragMode, WallFace, WallStyle, WallpaperDragMode, is_buildable_tile, plan_floor_edit,
@@ -54,7 +54,10 @@ use crate::build::{
 use crate::buy::{BuyPurchase, snap_to_tile_centre};
 use crate::interpreter::{Interpreter, Stream};
 use crate::orders::MenuEntry;
-use crate::{Answer, Answers, PanelMode, Shown, Update};
+use crate::{
+    Answer, Answers, PanelMode, Shown, ShownSpecialPanel, SpecialPanelRequest,
+    SpecialPanelResponse, Update,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sims_content::ui_graphics::US_ENGLISH;
@@ -63,8 +66,8 @@ use sims_formats::iff::Iff;
 use sims_formats::strings::StringTable;
 use sims_net::{
     AppliedBatch, BuyBuildEdit, CameraRotation, Command, CommandIgnoreReason, CommandRejectReason,
-    DialogId, InviteTicket, PlayerId, PlayerMode, PlayerRole, SessionError, SessionState, SimSpeed,
-    StampedCommand, StateFingerprint, Tick, TickBatch,
+    DialogAnswer, DialogId, InviteTicket, PlayerId, PlayerMode, PlayerRole, SessionError,
+    SessionState, SimSpeed, StampedCommand, StateFingerprint, Tick, TickBatch,
 };
 use sims_sim::World;
 use sims_sim::load::{ExpandedWall, WALLS};
@@ -101,7 +104,113 @@ const COOP_WORLD_HASH_DOMAIN: &[u8] = b"sims-vm/coop-world/v1\0";
 /// Magic prefix distinguishing [`CoopSnapshotEnvelope`] from raw [`Saved`] bytes.
 const COOP_SNAPSHOT_MAGIC: &[u8; 4] = b"SCOP";
 /// Wire version of [`CoopSnapshotEnvelope`].
-const COOP_SNAPSHOT_VERSION: u32 = 2;
+const COOP_SNAPSHOT_VERSION: u32 = 3;
+
+/// Tagged `DialogAnswer::status` values carrying [`SpecialPanelResponse`] over
+/// [`Command::AnswerBlockingDialog`] (disjoint from ordinary statuses `2..=4`).
+const SPECIAL_PANEL_STATUS_LOT_CANCEL: u8 = 0x81;
+const SPECIAL_PANEL_STATUS_LOT_PICK: u8 = 0x82;
+const SPECIAL_PANEL_STATUS_NEIGHBOR_CANCEL: u8 = 0x83;
+const SPECIAL_PANEL_STATUS_NEIGHBOR_PICK: u8 = 0x84;
+const SPECIAL_PANEL_STATUS_SELECTION_CANCEL: u8 = 0x85;
+const SPECIAL_PANEL_STATUS_SELECTION_ACCEPT: u8 = 0x86;
+const SPECIAL_PANEL_STATUS_DISMISSED: u8 = 0x87;
+
+/// Encodes a [`SpecialPanelResponse`] into a [`DialogAnswer`] suitable for
+/// lockstep [`Command::AnswerBlockingDialog`].
+#[must_use]
+pub fn special_panel_response_to_dialog_answer(response: &SpecialPanelResponse) -> DialogAnswer {
+    match *response {
+        SpecialPanelResponse::Lot(None) => DialogAnswer {
+            status: SPECIAL_PANEL_STATUS_LOT_CANCEL,
+            bitmap_id: None,
+            text: None,
+        },
+        SpecialPanelResponse::Lot(Some(lot)) => DialogAnswer {
+            status: SPECIAL_PANEL_STATUS_LOT_PICK,
+            bitmap_id: Some(lot),
+            text: None,
+        },
+        SpecialPanelResponse::Neighbor(None) => DialogAnswer {
+            status: SPECIAL_PANEL_STATUS_NEIGHBOR_CANCEL,
+            bitmap_id: None,
+            text: None,
+        },
+        SpecialPanelResponse::Neighbor(Some(neighbor)) => DialogAnswer {
+            status: SPECIAL_PANEL_STATUS_NEIGHBOR_PICK,
+            bitmap_id: Some(neighbor),
+            text: None,
+        },
+        SpecialPanelResponse::Selection {
+            accepted: false,
+            index,
+        } => DialogAnswer {
+            status: SPECIAL_PANEL_STATUS_SELECTION_CANCEL,
+            bitmap_id: Some(index),
+            text: None,
+        },
+        SpecialPanelResponse::Selection {
+            accepted: true,
+            index,
+        } => DialogAnswer {
+            status: SPECIAL_PANEL_STATUS_SELECTION_ACCEPT,
+            bitmap_id: Some(index),
+            text: None,
+        },
+        SpecialPanelResponse::Dismissed => DialogAnswer {
+            status: SPECIAL_PANEL_STATUS_DISMISSED,
+            bitmap_id: None,
+            text: None,
+        },
+    }
+}
+
+/// Decodes a [`DialogAnswer`] produced by [`special_panel_response_to_dialog_answer`]
+/// back into a typed [`SpecialPanelResponse`].
+pub fn dialog_answer_to_special_panel_response(
+    answer: &DialogAnswer,
+) -> Result<SpecialPanelResponse, String> {
+    if answer.text.is_some() {
+        return Err("special panel response must not carry text payload".into());
+    }
+    match (answer.status, answer.bitmap_id) {
+        (SPECIAL_PANEL_STATUS_LOT_CANCEL, None) => Ok(SpecialPanelResponse::Lot(None)),
+        (SPECIAL_PANEL_STATUS_LOT_PICK, Some(lot)) => Ok(SpecialPanelResponse::Lot(Some(lot))),
+        (SPECIAL_PANEL_STATUS_NEIGHBOR_CANCEL, None) => Ok(SpecialPanelResponse::Neighbor(None)),
+        (SPECIAL_PANEL_STATUS_NEIGHBOR_PICK, Some(neighbor)) => {
+            Ok(SpecialPanelResponse::Neighbor(Some(neighbor)))
+        }
+        (SPECIAL_PANEL_STATUS_SELECTION_CANCEL, Some(index)) => {
+            Ok(SpecialPanelResponse::Selection {
+                accepted: false,
+                index,
+            })
+        }
+        (SPECIAL_PANEL_STATUS_SELECTION_ACCEPT, Some(index)) => {
+            Ok(SpecialPanelResponse::Selection {
+                accepted: true,
+                index,
+            })
+        }
+        (SPECIAL_PANEL_STATUS_DISMISSED, None) => Ok(SpecialPanelResponse::Dismissed),
+        (status, bitmap_id) => Err(format!(
+            "invalid special panel dialog answer (status={status:#x}, bitmap_id={bitmap_id:?})"
+        )),
+    }
+}
+
+/// Builds a lockstep [`Command::AnswerBlockingDialog`] answering an active
+/// co-op special panel (`CoopBatchReport::opened_special_panel`).
+#[must_use]
+pub fn special_panel_answer_command(
+    dialog_id: DialogId,
+    response: &SpecialPanelResponse,
+) -> Command {
+    Command::AnswerBlockingDialog {
+        dialog_id,
+        answer: special_panel_response_to_dialog_answer(response),
+    }
+}
 
 /// `GameData/Build.iff` `STR#` chunk IDs (`0x4cd453`, `0x4cd696`, `0x4cd71b`).
 const STR_WALLS: u16 = 129;
@@ -312,6 +421,9 @@ pub struct CoopVmContext {
     pub next_dialog_id: u64,
     /// Currently open blocking modal dialog awaiting first-answer-wins, if any.
     pub active_dialog: Option<DialogId>,
+    /// Currently open blocking special panel (`Dialog` kinds `5..=15`) awaiting
+    /// first-answer-wins, if any.
+    pub active_special_panel: Option<(DialogId, ShownSpecialPanel)>,
     /// Frozen pre-tick inputs for an interrupted dialog tick (preserved across
     /// every dialog in the tick and through answered-but-paused states until
     /// replay completes).
@@ -346,6 +458,7 @@ impl CoopVmContext {
             activity_owners: BTreeMap::new(),
             next_dialog_id: 1,
             active_dialog: None,
+            active_special_panel: None,
             frozen_dialog: None,
             pending_speed_sync: false,
             frames: Frames::default(),
@@ -620,6 +733,9 @@ pub struct CoopBatchReport {
     pub update: Option<Update>,
     /// Newly opened blocking modal dialog if stepping hit an unanswered dialog.
     pub opened_dialog: Option<(DialogId, Shown)>,
+    /// Newly opened blocking special panel (`Dialog` kinds `5..=15`) if stepping
+    /// hit an unanswered special panel.
+    pub opened_special_panel: Option<(DialogId, ShownSpecialPanel)>,
     /// Per-command deterministic outcomes in exact batch sequence order.
     pub command_results: Vec<(StampedCommand, CoopCommandStatus)>,
     /// Any player selections altered by scripts (including immediate at-once /
@@ -684,6 +800,7 @@ struct CoopSnapshotMeta {
     activity_owners: BTreeMap<u16, PlayerId>,
     next_dialog_id: u64,
     active_dialog: Option<DialogId>,
+    active_special_panel: Option<(DialogId, ShownSpecialPanel)>,
     frozen_dialog: Option<FrozenDialogTick>,
     pending_speed_sync: bool,
     frames: Frames,
@@ -709,7 +826,7 @@ struct CoopWorldFingerprintTail<'a> {
     view_rotation: u8,
     answered: bool,
     asking: Option<(u32, u16)>,
-    asking_special_panel: Option<(u32, u8)>,
+    asking_special_panel: Option<(u32, &'a SpecialPanelRequest)>,
     special_panels: &'a crate::SpecialPanels,
     special_panel_responses: &'a std::collections::VecDeque<crate::SpecialPanelResponse>,
     answers: &'a Answers,
@@ -738,6 +855,7 @@ struct CoopWorldFingerprintTail<'a> {
     activity_owners: Option<&'a BTreeMap<u16, PlayerId>>,
     next_dialog_id: Option<u64>,
     active_dialog: Option<DialogId>,
+    active_special_panel: Option<(DialogId, &'a ShownSpecialPanel)>,
     frozen_dialog_digest: Option<[u8; 32]>,
     pending_speed_sync: bool,
 }
@@ -1297,6 +1415,12 @@ impl Lot {
         result
     }
 
+    /// Whether the lot is currently waiting on either an ordinary modal dialog
+    /// or a special panel (`Dialog` kinds `5..=15`).
+    fn has_pending_dialog(&self) -> bool {
+        self.asking.is_some() || self.asking_special_panel.is_some()
+    }
+
     fn execute_coop_batch(
         &mut self,
         batch: &AppliedBatch,
@@ -1336,7 +1460,7 @@ impl Lot {
         // Sync globals, mode, pause, host camera, and host plumbob when not
         // frozen on a dialog tick (best-effort so callback errors never strand
         // VM tick continuity behind lockstep).
-        if ctx.frozen_dialog.is_none() && self.asking.is_none() && !self.answered {
+        if ctx.frozen_dialog.is_none() && !self.has_pending_dialog() && !self.answered {
             let apply_speed = ctx.pending_speed_sync;
             let before_sync = snapshot_selections(&ctx.session);
             self.sync_world_from_session_best_effort(ctx, apply_speed);
@@ -1348,8 +1472,9 @@ impl Lot {
         let mut stepped = false;
         let mut update = None;
         let mut opened_dialog = None;
+        let mut opened_special_panel = None;
 
-        if !running_session.is_paused() && self.asking.is_none() {
+        if !running_session.is_paused() && !self.has_pending_dialog() {
             let play_mode = ctx.play_mode;
             let was_frozen = ctx.frozen_dialog.is_some();
             let frozen = ctx
@@ -1456,8 +1581,9 @@ impl Lot {
                         let dialog_id = DialogId(ctx.next_dialog_id);
                         ctx.next_dialog_id = ctx.next_dialog_id.saturating_add(1);
                         ctx.active_dialog = Some(dialog_id);
+                        ctx.active_special_panel = None;
                         // Preserve the ORIGINAL frozen pre-tick context across
-                        // every dialog in this interrupted tick.
+                        // every dialog or special panel in this interrupted tick.
                         if ctx.frozen_dialog.is_none() {
                             ctx.frozen_dialog = Some(frozen);
                         }
@@ -1465,6 +1591,22 @@ impl Lot {
                         running_session.open_blocking_dialog(dialog_id, shown.object, batch.tick);
                         ctx.session = running_session.clone();
                         opened_dialog = Some((dialog_id, shown));
+                    } else if let Some(asking_sp) = self.asking_special_panel.as_ref() {
+                        let dialog_id = DialogId(ctx.next_dialog_id);
+                        ctx.next_dialog_id = ctx.next_dialog_id.saturating_add(1);
+                        let shown = asking_sp.shown.clone();
+                        ctx.active_dialog = None;
+                        ctx.active_special_panel = Some((dialog_id, shown.clone()));
+                        if ctx.frozen_dialog.is_none() {
+                            ctx.frozen_dialog = Some(frozen);
+                        }
+                        running_session.open_blocking_dialog(
+                            dialog_id,
+                            shown.request.caller_object().unwrap_or(0),
+                            batch.tick,
+                        );
+                        ctx.session = running_session.clone();
+                        opened_special_panel = Some((dialog_id, shown));
                     }
                 }
                 Err(err) => {
@@ -1493,6 +1635,7 @@ impl Lot {
             stepped,
             update,
             opened_dialog,
+            opened_special_panel,
             command_results,
             script_selection_changes,
             world_hash,
@@ -1535,7 +1678,7 @@ impl Lot {
                 }
                 ctx.session = session.clone();
                 if ctx.frozen_dialog.is_none()
-                    && self.asking.is_none()
+                    && !self.has_pending_dialog()
                     && !self.answered
                     && issuer == session.host_id
                 {
@@ -1567,6 +1710,42 @@ impl Lot {
                     return CoopCommandStatus::IgnoredBySession(
                         CommandIgnoreReason::DialogAlreadyAnswered,
                     );
+                }
+                if ctx
+                    .active_special_panel
+                    .as_ref()
+                    .is_some_and(|(id, _)| id == dialog_id)
+                {
+                    if self.asking_special_panel.is_none() {
+                        ctx.active_special_panel = None;
+                        session.open_dialogs.remove(dialog_id);
+                        ctx.session = session.clone();
+                        return CoopCommandStatus::Refused(
+                            "lot is not waiting on a special panel".to_string(),
+                        );
+                    }
+                    let response = match dialog_answer_to_special_panel_response(answer) {
+                        Ok(response) => response,
+                        Err(msg) => return CoopCommandStatus::Refused(msg),
+                    };
+                    return match self.answer_special_panel(response) {
+                        Ok(()) => {
+                            session.open_dialogs.remove(dialog_id);
+                            ctx.active_special_panel = None;
+                            ctx.session = session.clone();
+                            CoopCommandStatus::DialogAnswered {
+                                dialog_id: *dialog_id,
+                                winner: issuer,
+                            }
+                        }
+                        Err(SpecialPanelAnswerError::WrongResponse {
+                            expected_kind,
+                            given,
+                        }) => CoopCommandStatus::Refused(format!(
+                            "special panel {dialog_id} (kind {expected_kind}) does not accept {given:?}"
+                        )),
+                        Err(err) => CoopCommandStatus::Refused(err.to_string()),
+                    };
                 }
                 if ctx.active_dialog != Some(*dialog_id) {
                     return CoopCommandStatus::Refused(format!(
@@ -1619,7 +1798,7 @@ impl Lot {
                 ctx.session = session.clone();
                 if issuer == session.host_id
                     && ctx.frozen_dialog.is_none()
-                    && self.asking.is_none()
+                    && !self.has_pending_dialog()
                     && !self.answered
                 {
                     self.set_view_rotation(rotation.quarter_turns());
@@ -1632,7 +1811,7 @@ impl Lot {
                     return status;
                 }
                 ctx.session = session.clone();
-                if ctx.frozen_dialog.is_none() && self.asking.is_none() && !self.answered {
+                if ctx.frozen_dialog.is_none() && !self.has_pending_dialog() && !self.answered {
                     let target_mode = player_mode_to_panel_mode(session.effective_mode());
                     if self.mode() != target_mode {
                         let before = snapshot_selections(&ctx.session);
@@ -1657,7 +1836,7 @@ impl Lot {
                     return status;
                 }
                 ctx.session = session.clone();
-                if ctx.frozen_dialog.is_none() && self.asking.is_none() && !self.answered {
+                if ctx.frozen_dialog.is_none() && !self.has_pending_dialog() && !self.answered {
                     sync_pause_global(&mut self.world, session.is_paused());
                 }
                 CoopCommandStatus::Applied
@@ -1667,7 +1846,7 @@ impl Lot {
                     return status;
                 }
                 ctx.session = session.clone();
-                if ctx.frozen_dialog.is_none() && self.asking.is_none() && !self.answered {
+                if ctx.frozen_dialog.is_none() && !self.has_pending_dialog() && !self.answered {
                     self.world.set_speed(i32::from(session.time.speed.value()));
                     ctx.pending_speed_sync = false;
                 } else {
@@ -1685,7 +1864,7 @@ impl Lot {
                 // run the exact tick that asked; post-replay sync writes the
                 // updated `session.config.free_will`.
                 if ctx.frozen_dialog.is_none()
-                    && self.asking.is_none()
+                    && !self.has_pending_dialog()
                     && !self.answered
                     && let Err(err) = self.set_free_will(session.config.free_will)
                 {
@@ -1723,7 +1902,7 @@ impl Lot {
                 }
                 ctx.activity_owners.retain(|_, owner| owner != player_id);
                 ctx.session = session.clone();
-                if ctx.frozen_dialog.is_none() && self.asking.is_none() && !self.answered {
+                if ctx.frozen_dialog.is_none() && !self.has_pending_dialog() && !self.answered {
                     let target_mode = player_mode_to_panel_mode(session.effective_mode());
                     if self.mode() != target_mode {
                         let before = snapshot_selections(&ctx.session);
@@ -1741,7 +1920,7 @@ impl Lot {
                     return status;
                 }
                 ctx.session = session.clone();
-                if ctx.frozen_dialog.is_none() && self.asking.is_none() && !self.answered {
+                if ctx.frozen_dialog.is_none() && !self.has_pending_dialog() && !self.answered {
                     self.set_view_rotation(ctx.host_camera_rotation());
                     let before = snapshot_selections(&ctx.session);
                     if self.sync_host_plumbob_with_coop(ctx).is_ok() {
@@ -1768,7 +1947,7 @@ impl Lot {
                 if let Err(status) = apply_session_command(session, stamped) {
                     return status;
                 }
-                if ctx.frozen_dialog.is_some() || self.asking.is_some() || self.answered {
+                if ctx.frozen_dialog.is_some() || self.has_pending_dialog() || self.answered {
                     return CoopCommandStatus::IgnoredWhileDialogPending;
                 }
                 if self.mode() != PanelMode::Live {
@@ -1794,7 +1973,7 @@ impl Lot {
                 if let Err(status) = apply_session_command(session, stamped) {
                     return status;
                 }
-                if ctx.frozen_dialog.is_some() || self.asking.is_some() || self.answered {
+                if ctx.frozen_dialog.is_some() || self.has_pending_dialog() || self.answered {
                     return CoopCommandStatus::IgnoredWhileDialogPending;
                 }
                 if self.mode() != PanelMode::Live {
@@ -1824,7 +2003,7 @@ impl Lot {
                 if let Err(status) = apply_session_command(session, stamped) {
                     return status;
                 }
-                if ctx.frozen_dialog.is_some() || self.asking.is_some() || self.answered {
+                if ctx.frozen_dialog.is_some() || self.has_pending_dialog() || self.answered {
                     return CoopCommandStatus::IgnoredWhileDialogPending;
                 }
                 let issuer_mode = session
@@ -2719,7 +2898,7 @@ impl Lot {
             asking_special_panel: self
                 .asking_special_panel
                 .as_ref()
-                .map(|a| (a.shown.tick, a.shown.request.kind())),
+                .map(|a| (a.shown.tick, &a.shown.request)),
             special_panels: &self.special_panels,
             special_panel_responses: &self.special_panel_responses,
             answers: &self.player,
@@ -2748,6 +2927,10 @@ impl Lot {
             activity_owners: self.coop.as_ref().map(|c| &c.activity_owners),
             next_dialog_id: self.coop.as_ref().map(|c| c.next_dialog_id),
             active_dialog: self.coop.as_ref().and_then(|c| c.active_dialog),
+            active_special_panel: self
+                .coop
+                .as_ref()
+                .and_then(|c| c.active_special_panel.as_ref().map(|(id, s)| (*id, s))),
             frozen_dialog_digest,
             pending_speed_sync: self.coop.as_ref().is_some_and(|c| c.pending_speed_sync),
         };
@@ -2775,6 +2958,7 @@ impl Lot {
                 activity_owners: ctx.activity_owners.clone(),
                 next_dialog_id: ctx.next_dialog_id,
                 active_dialog: ctx.active_dialog,
+                active_special_panel: ctx.active_special_panel.clone(),
                 frozen_dialog: ctx.frozen_dialog.clone(),
                 pending_speed_sync: ctx.pending_speed_sync,
                 frames: ctx.frames.clone(),
@@ -2786,6 +2970,7 @@ impl Lot {
                 activity_owners: BTreeMap::new(),
                 next_dialog_id: 1,
                 active_dialog: None,
+                active_special_panel: None,
                 frozen_dialog: None,
                 pending_speed_sync: false,
                 frames: self.frames.clone(),
@@ -2872,6 +3057,7 @@ impl Lot {
                     activity_owners: BTreeMap::new(),
                     next_dialog_id: 1,
                     active_dialog: None,
+                    active_special_panel: None,
                     frozen_dialog: None,
                     pending_speed_sync: false,
                     frames: Frames::default(),
@@ -2882,20 +3068,30 @@ impl Lot {
             )
         };
 
+        if meta.active_dialog.is_some() && meta.active_special_panel.is_some() {
+            return Err(SaveError::Format(
+                "co-op snapshot cannot have both active_dialog and active_special_panel".into(),
+            ));
+        }
+        let meta_active_id = meta
+            .active_dialog
+            .or_else(|| meta.active_special_panel.as_ref().map(|(id, _)| *id));
         if !session.open_dialogs.is_empty() {
-            let Some(active_id) = meta.active_dialog else {
+            let Some(active_id) = meta_active_id else {
                 return Err(SaveError::Format(
-                    "co-op snapshot has open session dialogs without active_dialog metadata".into(),
+                    "co-op snapshot has open session dialogs without active dialog/panel metadata"
+                        .into(),
                 ));
             };
             if !session.open_dialogs.contains_key(&active_id) {
                 return Err(SaveError::Format(format!(
-                    "co-op snapshot active_dialog {active_id} missing from session.open_dialogs"
+                    "co-op snapshot active dialog {active_id} missing from session.open_dialogs"
                 )));
             }
-        } else if meta.active_dialog.is_some() {
+        } else if meta_active_id.is_some() {
             return Err(SaveError::Format(
-                "co-op snapshot has active_dialog metadata while session.open_dialogs is empty"
+                "co-op snapshot has active dialog/panel metadata while session.open_dialogs is \
+                 empty"
                     .into(),
             ));
         }
@@ -2970,6 +3166,7 @@ impl Lot {
             ctx.activity_owners = probe_owners;
             ctx.next_dialog_id = meta.next_dialog_id.max(1);
             ctx.active_dialog = meta.active_dialog;
+            ctx.active_special_panel = meta.active_special_panel.clone();
             ctx.frozen_dialog = meta.frozen_dialog;
             ctx.pending_speed_sync = meta.pending_speed_sync;
             ctx.frames = meta.frames;
@@ -2978,29 +3175,52 @@ impl Lot {
             ctx.play_mode = meta.play_mode;
             self.coop = Some(ctx);
 
-            // If the snapshot was captured while a blocking dialog was awaiting
-            // an answer (`Saved` intentionally stores the pre-tick world
-            // without `Lot::asking`), re-run the tick probe using the exact
-            // frozen `(session, activity_owners, free_will)` so `self.asking`
-            // and `self.replay_view` match the host identically.
-            if meta.active_dialog.is_some() && self.asking.is_none() && !self.answered {
+            // If the snapshot was captured while a blocking dialog or special
+            // panel was awaiting an answer (`Saved` intentionally stores the
+            // pre-tick world without `Lot::asking` / `Lot::asking_special_panel`),
+            // re-run the tick probe using the exact frozen
+            // `(session, activity_owners, free_will)` so `self.asking` /
+            // `self.asking_special_panel` and `self.replay_view` match the host
+            // identically.
+            if (meta.active_dialog.is_some() || meta.active_special_panel.is_some())
+                && !self.has_pending_dialog()
+                && !self.answered
+            {
                 if let Some(frozen) = probe_frozen.as_ref()
                     && let Some(slot) = self.world.globals.get_mut(GLOBAL_FREE_WILL)
                 {
                     *slot = i16::from(frozen.free_will);
                 }
                 match self.step_in(meta.play_mode) {
-                    Err(StepError::Asking { .. }) => {}
+                    Err(StepError::Asking { .. }) => {
+                        if meta.active_dialog.is_some() && self.asking.is_none() {
+                            return Err(SaveError::Format(
+                                "co-op snapshot expected an ordinary blocking dialog on restore, \
+                                 but tick asked for a different prompt"
+                                    .into(),
+                            ));
+                        }
+                        if let Some((_, expected_shown)) = meta.active_special_panel.as_ref()
+                            && self.asking_special_panel.as_ref().map(|a| &a.shown)
+                                != Some(expected_shown)
+                        {
+                            return Err(SaveError::Format(format!(
+                                "co-op snapshot expected special panel {expected_shown:?} on \
+                                 restore, but tick asked {:?}",
+                                self.asking_special_panel.as_ref().map(|a| &a.shown)
+                            )));
+                        }
+                    }
                     Ok(_) => {
                         return Err(SaveError::Format(
-                            "co-op snapshot expected an open blocking dialog on restore, but tick \
-                             completed without asking"
+                            "co-op snapshot expected an open blocking dialog/panel on restore, \
+                             but tick completed without asking"
                                 .into(),
                         ));
                     }
                     Err(err) => {
                         return Err(SaveError::Format(format!(
-                            "replaying open co-op blocking dialog failed: {err}"
+                            "replaying open co-op blocking dialog/panel failed: {err}"
                         )));
                     }
                 }
@@ -4481,10 +4701,17 @@ mod tests {
             "raw Saved restore must deterministically park Help System controllers"
         );
 
-        // 3. Old "SCOP" v1 snapshot bytes must be rejected by v2 parser.
-        let mut v1_snap = target.coop_snapshot_bytes().unwrap();
-        v1_snap[4..8].copy_from_slice(&1u32.to_le_bytes());
-        assert!(target.restore_coop_snapshot(&v1_snap, session).is_err());
+        // 3. Old "SCOP" v1/v2 snapshot bytes must be rejected by v3 parser.
+        for old_version in [1u32, 2u32] {
+            let mut old_snap = target.coop_snapshot_bytes().unwrap();
+            old_snap[4..8].copy_from_slice(&old_version.to_le_bytes());
+            assert!(
+                target
+                    .restore_coop_snapshot(&old_snap, session.clone())
+                    .is_err(),
+                "SCOP v{old_version} must be rejected by v{COOP_SNAPSHOT_VERSION} parser"
+            );
+        }
     }
 
     #[test]
@@ -4595,5 +4822,534 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn coop_special_panel_freezes_resyncs_and_answers_in_lockstep() {
+        let (mut program, catalog, mut world) = run_expr_world();
+        // Object 40 executes Dialog kind 13 (MagicTownLotPicker) and records the
+        // picked lot into MyData[0] when it returns True.
+        program.libraries.get_mut(&0).unwrap().behaviors.insert(
+            4100,
+            Behavior {
+                format: 0x8002,
+                kind: 0,
+                args: 1,
+                locals: 0,
+                revision: 0,
+                instructions: vec![
+                    // 0: Dialog kind 13 -> 1 on True, 2 on False
+                    Instruction {
+                        opcode: 36,
+                        on_true: 1,
+                        on_false: 2,
+                        operands: [0, 0, 0, 0, 0, 13, 0, 0],
+                    },
+                    // 1: MyData[0] := Temp[0] -> 2
+                    Instruction {
+                        opcode: 2,
+                        on_true: 2,
+                        on_false: 2,
+                        operands: [0, 0, 0, 0, 0, 5, 3, 8],
+                    },
+                    // 2: Sleep param[0] (yield)
+                    Instruction {
+                        opcode: 0,
+                        on_true: 2,
+                        on_false: 2,
+                        operands: [0; 8],
+                    },
+                ],
+            },
+        );
+        for obj in world.objects.values_mut() {
+            obj.set_flags(SCHEDULER_READY, false);
+        }
+        {
+            let obj40 = world.objects.get_mut(&40).unwrap();
+            obj40.registry_word = Some(0);
+            obj40.set_countdown(-1);
+            obj40.set_flags(SCHEDULER_READY, true);
+            obj40.stack.push(Frame {
+                tree: 4100,
+                node: 0,
+                stack_object: 0,
+                parameters: vec![1],
+                locals: Vec::new(),
+                primitive_state: 0,
+                code_owner_type: 4,
+            });
+        }
+
+        let make_peer = || {
+            let mut lot = synthetic_coop_lot(
+                program.clone(),
+                catalog.clone(),
+                world.clone(),
+                Frames::parse("none").unwrap(),
+            );
+            let session = two_player_session(Some(10), Some(20));
+            lot.attach_coop_context(
+                CoopVmContext::new(session.clone()).with_frames(Frames::parse("none").unwrap()),
+            )
+            .expect("attach");
+            (lot, session)
+        };
+
+        let (mut host, mut host_session) = make_peer();
+        let (mut peer, mut peer_session) = make_peer();
+
+        // Batch 1: triggers Dialog kind 13 special panel -> opens & freezes tick!
+        let b1 = TickBatch {
+            epoch: host_session.epoch,
+            tick: Tick(1),
+            pacing_hint_ms: 0,
+            host_fingerprint: None,
+            commands: Vec::new(),
+        };
+        let a1_h = host_session.apply_batch(&b1).unwrap();
+        let r1_h = host.apply_coop_batch(&a1_h, &mut host_session).unwrap();
+        let a1_p = peer_session.apply_batch(&b1).unwrap();
+        let r1_p = peer.apply_coop_batch(&a1_p, &mut peer_session).unwrap();
+
+        assert!(!r1_h.stepped);
+        assert!(r1_h.opened_dialog.is_none());
+        let (dialog_id, opened_shown) = r1_h
+            .opened_special_panel
+            .clone()
+            .expect("tick 1 must open MagicTownLotPicker special panel");
+        assert_eq!(
+            opened_shown.request,
+            SpecialPanelRequest::MagicTownLotPicker { via_blimp: false }
+        );
+        assert_eq!(r1_h.state_fingerprint, r1_p.state_fingerprint);
+        assert!(host_session.open_dialogs.contains_key(&dialog_id));
+        assert!(host.coop().unwrap().frozen_dialog.is_some());
+
+        // Batch 2 (while special panel is open): gameplay commands are ignored and
+        // SetFreeWill does NOT mutate pre-tick world.globals[30] before replay!
+        let b2 = TickBatch {
+            epoch: host_session.epoch,
+            tick: Tick(2),
+            pacing_hint_ms: 0,
+            host_fingerprint: None,
+            commands: vec![
+                StampedCommand {
+                    tick: Tick(2),
+                    sequence: 0,
+                    issuer: PlayerId(1),
+                    command: Command::SetFreeWill { enabled: false },
+                },
+                StampedCommand {
+                    tick: Tick(2),
+                    sequence: 1,
+                    issuer: PlayerId(2),
+                    command: Command::SimActionPick {
+                        sim_id: 20,
+                        target_id: 40,
+                        menu_index: 0,
+                        joining: false,
+                        args: [0; 4],
+                    },
+                },
+            ],
+        };
+        let a2_h = host_session.apply_batch(&b2).unwrap();
+        let r2_h = host.apply_coop_batch(&a2_h, &mut host_session).unwrap();
+        let a2_p = peer_session.apply_batch(&b2).unwrap();
+        let r2_p = peer.apply_coop_batch(&a2_p, &mut peer_session).unwrap();
+        assert!(!r2_h.stepped);
+        assert_eq!(r2_h.command_results[0].1, CoopCommandStatus::Applied);
+        assert_eq!(
+            r2_h.command_results[1].1,
+            CoopCommandStatus::IgnoredWhileDialogPending
+        );
+        assert_eq!(
+            host.world().globals[GLOBAL_FREE_WILL],
+            1,
+            "pre-tick Free Will must remain frozen while special panel waits"
+        );
+        assert_eq!(r2_h.state_fingerprint, r2_p.state_fingerprint);
+
+        // Mid-wait snapshot + verified restore onto a joining peer!
+        let snap = host
+            .coop_snapshot_bytes()
+            .expect("encode mid-panel snapshot");
+        let host_fp = host.coop_state_fingerprint(&host_session);
+        let mut joiner = synthetic_coop_lot(
+            program.clone(),
+            catalog.clone(),
+            world.clone(),
+            Frames::parse("none").unwrap(),
+        );
+        let mut joiner_session = host_session.clone();
+        joiner
+            .restore_coop_snapshot_verified(&snap, joiner_session.clone(), host_fp)
+            .expect("joiner must verify mid-special-panel snapshot bit-for-bit");
+        assert_eq!(
+            joiner.asking_special_panel().map(|a| &a.shown),
+            Some(&opened_shown)
+        );
+        assert_eq!(
+            joiner.coop().unwrap().active_special_panel,
+            Some((dialog_id, opened_shown))
+        );
+
+        // Batch 3: wrong-variant answer is Refused (leaving panel open), then valid
+        // special_panel_answer_command wins and replays tick 1 across all three peers!
+        let b3 = TickBatch {
+            epoch: host_session.epoch,
+            tick: Tick(3),
+            pacing_hint_ms: 0,
+            host_fingerprint: None,
+            commands: vec![
+                StampedCommand {
+                    tick: Tick(3),
+                    sequence: 0,
+                    issuer: PlayerId(1),
+                    command: special_panel_answer_command(
+                        dialog_id,
+                        &SpecialPanelResponse::Dismissed,
+                    ),
+                },
+                StampedCommand {
+                    tick: Tick(3),
+                    sequence: 1,
+                    issuer: PlayerId(2),
+                    command: special_panel_answer_command(
+                        dialog_id,
+                        &SpecialPanelResponse::Lot(Some(93)),
+                    ),
+                },
+            ],
+        };
+        let a3_h = host_session.apply_batch(&b3).unwrap();
+        let r3_h = host.apply_coop_batch(&a3_h, &mut host_session).unwrap();
+        let a3_p = peer_session.apply_batch(&b3).unwrap();
+        let r3_p = peer.apply_coop_batch(&a3_p, &mut peer_session).unwrap();
+        let a3_j = joiner_session.apply_batch(&b3).unwrap();
+        let r3_j = joiner.apply_coop_batch(&a3_j, &mut joiner_session).unwrap();
+
+        assert!(matches!(
+            r3_h.command_results[0].1,
+            CoopCommandStatus::Refused(_)
+        ));
+        assert_eq!(
+            r3_h.command_results[1].1,
+            CoopCommandStatus::DialogAnswered {
+                dialog_id,
+                winner: PlayerId(2),
+            }
+        );
+        assert!(r3_h.stepped);
+        assert_eq!(host.special_panels().magic_lot, 93);
+        assert_eq!(
+            host.world().globals[GLOBAL_FREE_WILL],
+            0,
+            "intervening SetFreeWill must apply after replay completes"
+        );
+        assert_eq!(r3_h.state_fingerprint, r3_p.state_fingerprint);
+        assert_eq!(r3_h.state_fingerprint, r3_j.state_fingerprint);
+
+        // Batch 4: object 40 reads magic_lot = 93 into MyData[0] and clears slot!
+        let b4 = TickBatch {
+            epoch: host_session.epoch,
+            tick: Tick(4),
+            pacing_hint_ms: 0,
+            host_fingerprint: None,
+            commands: Vec::new(),
+        };
+        let a4_h = host_session.apply_batch(&b4).unwrap();
+        let r4_h = host.apply_coop_batch(&a4_h, &mut host_session).unwrap();
+        let a4_j = joiner_session.apply_batch(&b4).unwrap();
+        let r4_j = joiner.apply_coop_batch(&a4_j, &mut joiner_session).unwrap();
+        assert_eq!(host.world().objects[&40].data[0], 93);
+        assert_eq!(joiner.world().objects[&40].data[0], 93);
+        assert_eq!(r4_h.state_fingerprint, r4_j.state_fingerprint);
+    }
+
+    #[test]
+    fn lot_mixed_dialog_and_special_panel_double_wait_guards_and_headless_book() {
+        let (mut program, catalog, mut world) = run_expr_world();
+        program.labels_hold_no_token = true;
+        {
+            let lib = program.libraries.get_mut(&0).unwrap();
+            lib.definitions.insert(1, [0; 108]);
+            lib.definitions.insert(4, [0; 108]);
+        }
+        // Object 10 (person): inline Spellbook (kind 12) then ordinary Dialog (kind 0).
+        program.libraries.get_mut(&0).unwrap().behaviors.insert(
+            4101,
+            Behavior {
+                format: 0x8002,
+                kind: 0,
+                args: 1,
+                locals: 0,
+                revision: 0,
+                instructions: vec![
+                    Instruction {
+                        opcode: 36,
+                        on_true: 1,
+                        on_false: 1,
+                        operands: [0, 0, 0, 0, 0, 12, 0, 0],
+                    },
+                    Instruction {
+                        opcode: 36,
+                        on_true: 2,
+                        on_false: 2,
+                        operands: [0, 0, 0, 0, 0, 1, 0, 0],
+                    },
+                    Instruction {
+                        opcode: 0,
+                        on_true: 2,
+                        on_false: 2,
+                        operands: [0; 8],
+                    },
+                ],
+            },
+        );
+        // Object 40: Dialog kind 13 (MagicTownLotPicker).
+        program.libraries.get_mut(&0).unwrap().behaviors.insert(
+            4102,
+            Behavior {
+                format: 0x8002,
+                kind: 0,
+                args: 1,
+                locals: 0,
+                revision: 0,
+                instructions: vec![
+                    Instruction {
+                        opcode: 36,
+                        on_true: 1,
+                        on_false: 1,
+                        operands: [0, 0, 0, 0, 0, 13, 0, 0],
+                    },
+                    Instruction {
+                        opcode: 0,
+                        on_true: 1,
+                        on_false: 1,
+                        operands: [0; 8],
+                    },
+                ],
+            },
+        );
+        world
+            .objects
+            .insert(41, test_object(41, 0x2001, [160, 320, 1]));
+        world.order.push(41);
+        for obj in world.objects.values_mut() {
+            obj.set_flags(SCHEDULER_READY, false);
+        }
+        {
+            let obj40 = world.objects.get_mut(&40).unwrap();
+            obj40.registry_word = Some(0);
+            obj40.set_countdown(-1);
+            obj40.set_flags(SCHEDULER_READY, true);
+            obj40.stack.push(Frame {
+                tree: 4101,
+                node: 0,
+                stack_object: 0,
+                parameters: vec![1],
+                locals: Vec::new(),
+                primitive_state: 0,
+                code_owner_type: 4,
+            });
+        }
+        {
+            let obj41 = world.objects.get_mut(&41).unwrap();
+            obj41.registry_word = Some(0);
+            obj41.set_countdown(-1);
+            obj41.set_flags(SCHEDULER_READY, true);
+            obj41.stack.push(Frame {
+                tree: 4102,
+                node: 0,
+                stack_object: 0,
+                parameters: vec![1],
+                locals: Vec::new(),
+                primitive_state: 0,
+                code_owner_type: 4,
+            });
+        }
+
+        // 1. Headless mode (`asks = false`): queued `Lot(Some(93))` MUST NOT be consumed
+        //    by the preceding Spellbook (kind 12); the book auto-dismisses and kind 13
+        //    receives `Lot(Some(93))` on the same tick!
+        let mut headless = synthetic_coop_lot(
+            program.clone(),
+            catalog.clone(),
+            world.clone(),
+            Frames::parse("none").unwrap(),
+        );
+        headless.player = Answers::choices(&[2]);
+        headless
+            .queue_special_panel_responses(&[SpecialPanelResponse::Lot(Some(93))])
+            .unwrap();
+        let u_headless = headless
+            .step()
+            .expect("headless step must complete cleanly");
+        assert_eq!(
+            u_headless.special_panels_answered,
+            vec![
+                (
+                    SpecialPanelRequest::SpellBook { caller: None },
+                    SpecialPanelResponse::Dismissed
+                ),
+                (
+                    SpecialPanelRequest::MagicTownLotPicker { via_blimp: false },
+                    SpecialPanelResponse::Lot(Some(93))
+                ),
+            ]
+        );
+        assert_eq!(headless.special_panels().magic_lot, 93);
+
+        // 2. Interactive mode (`wait_for_answers`): tick 1 waits THREE times
+        //    (wait #1: inline Spellbook from object 40, wait #2: ordinary dialog
+        //    from object 40, wait #3: special panel kind 13 from object 41) across
+        //    rollback, v9 save/restore, and build/travel pending-input guards!
+        let mut interactive = synthetic_coop_lot(
+            program.clone(),
+            catalog.clone(),
+            world.clone(),
+            Frames::parse("none").unwrap(),
+        );
+        interactive.wait_for_answers();
+
+        // Wait #1: inline Spellbook (kind 12).
+        assert_eq!(
+            interactive.step().unwrap_err(),
+            StepError::Asking { tick: 1 }
+        );
+        assert!(interactive.asking().is_none());
+        assert_eq!(
+            interactive
+                .asking_special_panel()
+                .expect("first wait must be inline Spellbook")
+                .shown
+                .request,
+            SpecialPanelRequest::SpellBook { caller: None }
+        );
+        interactive
+            .answer_special_panel(SpecialPanelResponse::Dismissed)
+            .unwrap();
+
+        // Wait #2: ordinary dialog (kind 0).
+        assert_eq!(
+            interactive.step().unwrap_err(),
+            StepError::Asking { tick: 1 }
+        );
+        assert!(interactive.asking().is_some());
+        assert!(interactive.asking_special_panel().is_none());
+
+        // Answer ordinary dialog #2 -> replaying tick 1 now pauses at Wait #3 (special panel kind 13)!
+        interactive.answer(2).unwrap();
+        assert_eq!(
+            interactive.step().unwrap_err(),
+            StepError::Asking { tick: 1 }
+        );
+        assert!(interactive.asking().is_none());
+        let sp = interactive
+            .asking_special_panel()
+            .expect("third wait in same tick must be MagicTownLotPicker");
+        assert_eq!(
+            sp.shown.request,
+            SpecialPanelRequest::MagicTownLotPicker { via_blimp: false }
+        );
+
+        // Verify Build commit and Travel depart/return are blocked while special panel waits!
+        assert!(matches!(
+            interactive.build_commit_roof(&crate::build::RoofPlan {
+                before_raw: None,
+                before: crate::build::RoofState::default(),
+                after: crate::build::RoofState::default(),
+                valid: true,
+            }),
+            Err(OrderError::Asking)
+        ));
+        let db_path = std::env::temp_dir().join(format!(
+            "sims-vm-special-panel-guard-{}.redb",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db_path);
+        struct TempDbGuard(std::path::PathBuf);
+        impl Drop for TempDbGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _db_guard = TempDbGuard(db_path.clone());
+        let dummy_store = sims_sim::neighborhood_store::NeighborhoodStore::open(&db_path).unwrap();
+        assert!(matches!(
+            crate::travel::depart_to_destination(
+                std::path::Path::new("."),
+                &dummy_store,
+                "UserData",
+                &mut interactive,
+                &crate::travel::TravelRequest::downtown(21, 0x1001),
+            ),
+            Err(crate::travel::TravelError::Lot(msg)) if msg.contains("special panel")
+        ));
+        let dummy_session = crate::travel::TravelSession {
+            store_id: dummy_store.store_id(),
+            neighborhood_id: "UserData".to_owned(),
+            instance_id: 1,
+            trip_id: 1,
+            home_house: 5,
+            home_family: 1,
+            destination_house: 21,
+            destination: crate::travel::TravelDestination::Downtown,
+            transport: crate::travel::TravelTransport::DowntownCab,
+            accommodation: crate::travel::VacationAccommodation::None,
+            fare_paid: 50,
+            departure_ticks: 0,
+            departure_world_ticks: 0,
+            departure_clock: (8, 0, 0),
+            funds_before_fare: 1000,
+            funds_at_arrival: 950,
+            magic_coins_at_arrival: 0,
+            leader_guid: 0x1001,
+            travelers: Vec::new(),
+        };
+        assert!(matches!(
+            crate::travel::return_from_destination(
+                std::path::Path::new("."),
+                &dummy_store,
+                &dummy_session,
+                &mut interactive,
+                &[],
+                Frames::parse("none").unwrap(),
+            ),
+            Err(crate::travel::TravelError::Lot(msg)) if msg.contains("special panel")
+        ));
+
+        // Save/restore v9 mid-second-wait and verify replay reproduces wait #2 & converges!
+        let saved_bytes = interactive
+            .save()
+            .expect("v9 save mid-second-wait")
+            .encode();
+        let decoded = Saved::decode(&saved_bytes).expect("decode v9 save");
+        let mut restored =
+            synthetic_coop_lot(program, catalog, world, Frames::parse("none").unwrap());
+        restored.wait_for_answers();
+        restored.restore(decoded).unwrap();
+        assert_eq!(restored.step().unwrap_err(), StepError::Asking { tick: 1 });
+        assert_eq!(
+            restored.asking_special_panel().unwrap().shown.request,
+            SpecialPanelRequest::MagicTownLotPicker { via_blimp: false }
+        );
+
+        interactive
+            .answer_special_panel(SpecialPanelResponse::Lot(Some(93)))
+            .unwrap();
+        restored
+            .answer_special_panel(SpecialPanelResponse::Lot(Some(93)))
+            .unwrap();
+        let u_live = interactive.step().unwrap();
+        let u_restored = restored.step().unwrap();
+        assert_eq!(
+            u_live.special_panels_answered,
+            u_restored.special_panels_answered
+        );
+        assert_eq!(interactive.world().hash(), restored.world().hash());
+        assert_eq!(interactive.world().hash(), headless.world().hash());
     }
 }

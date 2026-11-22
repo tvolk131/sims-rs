@@ -197,10 +197,10 @@ pub struct Interpreter<'a> {
     /// `Dialog` kinds `5..=11, 13, 14` (`0x451552`, `0x4413e1..0x442320`) and
     /// `Generic Sims Call` routine 35 (`0x451142`).
     pub special_panels: Option<&'a RefCell<crate::primitives::dialog::SpecialPanels>>,
-    /// Transient inline coordination slot for synchronous reference book modals
+    /// Transient inline coordination sink for synchronous reference book modals
     /// (`Dialog` kinds 12 & 15, `0x4518e2`, `0x451946`) during `lot_update`.
     pub(crate) inline_special_panel:
-        Option<&'a RefCell<crate::primitives::dialog::InlineSpecialPanel>>,
+        Option<&'a (dyn crate::primitives::dialog::InlinePanelSink + 'a)>,
 }
 
 /// One call of the original's "run this object's function" (0x422d46):
@@ -278,22 +278,11 @@ impl<'a> Interpreter<'a> {
     /// The budget is a guard against scripts that never yield; the
     /// original's own limit is not modeled.
     pub fn turn(&self, world: &mut World, object: u16, budget: usize) -> Result<Status, Fault> {
-        self.turn_counted(world, object, budget)
-            .map(|(status, _)| status)
-    }
-
-    /// Like [`Interpreter::turn`], also returning how many instructions ran.
-    pub(crate) fn turn_counted(
-        &self,
-        world: &mut World,
-        object: u16,
-        budget: usize,
-    ) -> Result<(Status, usize), Fault> {
         let mut machine = self.machine(world, object, 0, false);
-        for executed in 0..budget {
+        for _ in 0..budget {
             match machine.step() {
                 Ok(Status::Running) => {}
-                Ok(status) => return Ok((status, executed + 1)),
+                Ok(status) => return Ok(status),
                 Err(trap) => return Err(machine.fault(trap)),
             }
         }
@@ -460,6 +449,12 @@ fn run(
             Ok(Status::Running) => {}
             Ok(Status::Returned(value)) => return Ok(value),
             Ok(Status::Yielded) => {
+                if machine
+                    .inline_special_panel
+                    .is_some_and(|inline| inline.has_unanswered())
+                {
+                    return Ok(false);
+                }
                 let trap = Trap::native(0x44f, "a synchronous tree yielded");
                 return Err(machine.fault(trap));
             }
@@ -544,7 +539,7 @@ pub(crate) struct Machine<'a, 'w> {
     pub(crate) special_panels: Option<&'a RefCell<crate::primitives::dialog::SpecialPanels>>,
     /// See [`Interpreter::inline_special_panel`].
     pub(crate) inline_special_panel:
-        Option<&'a RefCell<crate::primitives::dialog::InlineSpecialPanel>>,
+        Option<&'a (dyn crate::primitives::dialog::InlinePanelSink + 'a)>,
 }
 
 impl<'a> Machine<'a, '_> {
@@ -1177,7 +1172,25 @@ impl<'a> Machine<'a, '_> {
             )));
         }
         let place = self.thread_place();
-        let result = match self.primitive(instruction)? {
+        let flow = match self.primitive(instruction) {
+            Ok(flow) => flow,
+            Err(trap) => {
+                if self
+                    .inline_special_panel
+                    .is_some_and(|inline| inline.has_unanswered())
+                {
+                    return Ok(Status::Yielded);
+                }
+                return Err(trap);
+            }
+        };
+        if self
+            .inline_special_panel
+            .is_some_and(|inline| inline.has_unanswered())
+        {
+            return Ok(Status::Yielded);
+        }
+        let result = match flow {
             Flow::Branch(result) => result,
             Flow::Yield => return Ok(Status::Yielded),
             Flow::Pushed => return Ok(Status::Running),

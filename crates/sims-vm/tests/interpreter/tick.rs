@@ -1647,8 +1647,8 @@ fn special_dialog_call_neighbor_kind10_and_pet_picker_kind9() {
 #[test]
 fn special_dialog_reference_books_kind12_and_kind15_run_inline_on_same_tick() {
     for (kind, expected_req) in [
-        (12, SpecialPanelRequest::SpellBook { caller: SIM }),
-        (15, SpecialPanelRequest::CookBook { caller: SIM }),
+        (12, SpecialPanelRequest::SpellBook { caller: Some(SIM) }),
+        (15, SpecialPanelRequest::CookBook { caller: Some(SIM) }),
     ] {
         // Headless auto-dismiss completes on tick 1 without yielding!
         let mut fx = person_lot(asking(kind, 0));
@@ -1689,6 +1689,388 @@ fn special_dialog_reference_books_kind12_and_kind15_run_inline_on_same_tick() {
             })
         );
     }
+
+    // Non-person callers pass `NULL` to `0x5107dc` (`caller: None`) with NO `0x1c` fault
+    // (`0x4518e6..0x45197c`).
+    for (kind, expected_req) in [
+        (12, SpecialPanelRequest::SpellBook { caller: None }),
+        (15, SpecialPanelRequest::CookBook { caller: None }),
+    ] {
+        let mut fx = lot(asking(kind, 0));
+        let panels = RefCell::new(SpecialPanels::default());
+        let mut player = ScriptedPlayer::new(answers(&[]), &[]);
+        let u1 = update_with_panels(&mut fx, &panels, &mut player).unwrap();
+        assert_eq!(
+            fx.lamp().data[0],
+            1,
+            "non-person kind {kind} must succeed and take True"
+        );
+        assert_eq!(
+            u1.special_panels_answered,
+            vec![(expected_req, SpecialPanelResponse::Dismissed)]
+        );
+    }
+}
+
+#[test]
+fn special_dialog_reference_book_in_run_tree_by_name_callbacks_and_budget_boundary() {
+    // 1. Spellbook opened inside Run Tree By Name mode 0 (me's thread) and mode 1
+    //    (stack object's thread) must NOT trigger native 0x44f: headless auto-dismiss
+    //    completes on tick 1, and interactive wait unwinds cleanly before play-mode recovery.
+    for mode in [0u8, 1u8] {
+        let mut fx = person_lot(tree(vec![
+            // Stack object = LAMP so mode 1 targets LAMP's thread while mode 0 uses SIM's.
+            assign(scope::STACK_OBJECT, 0, scope::LITERAL, LAMP as i16, 1),
+            // Run Tree By Name (opcode 28): STR# 303 ([47, 1]), entry 1 ("book_cb"), mode 0 or 1.
+            ins(28, 2, 3, [47, 1, 0, 0, 1, mode, 0, 0]),
+            assign(scope::MY_DATA, 0, scope::LITERAL, 1, 4),
+            assign(scope::MY_DATA, 0, scope::LITERAL, 2, 4),
+            ins(0, 4, 4, [0; 8]),
+        ]));
+        fx.program
+            .libraries
+            .get_mut(&SIM_FILE)
+            .unwrap()
+            .tree_names
+            .push("book_cb".to_owned());
+        fx.program
+            .libraries
+            .get_mut(&LAMP_FILE)
+            .unwrap()
+            .tree_names
+            .push("book_cb".to_owned());
+        fx.program
+            .libraries
+            .get_mut(&LAMP_FILE)
+            .unwrap()
+            .names
+            .insert(4097, "book_cb".to_owned());
+        fx.add(
+            LAMP_FILE,
+            4097,
+            tree(vec![ins(36, 0xfe, 0xff, dialog(12, 0))]),
+        );
+        let expected_caller = if mode == 0 { Some(SIM) } else { None };
+
+        // Interactive wait pauses cleanly without 0x44f or play-mode recovery.
+        let mut interactive_world = fx.world.clone();
+        let panels = RefCell::new(SpecialPanels::default());
+        let mut waiting_player = ScriptedPlayer {
+            answers: answers(&[]),
+            special_panels: std::collections::VecDeque::new(),
+            wait_for_books: true,
+        };
+        let mut play = Play::default();
+        let tuning = tuning();
+        let mut interp = Interpreter::new(&fx.program, &fx.catalog, fx.stream);
+        interp.special_panels = Some(&panels);
+        let (u, res) = interp.lot_update_kept(
+            &mut interactive_world,
+            &tuning,
+            &mut waiting_player,
+            Some(&mut play),
+        );
+        assert!(
+            u.errors.is_empty(),
+            "mode {mode} nested book pause must not trip play-mode recovery: {:?}",
+            u.errors
+        );
+        assert_eq!(
+            res,
+            Err(TickError::UnansweredSpecialPanel {
+                shown: ShownSpecialPanel {
+                    tick: 2,
+                    request: SpecialPanelRequest::SpellBook {
+                        caller: expected_caller,
+                    },
+                },
+                given: None,
+            })
+        );
+
+        // Replaying with Dismissed completes cleanly on the exact same tick!
+        let mut dismiss_player =
+            ScriptedPlayer::new(answers(&[]), &[SpecialPanelResponse::Dismissed]);
+        let u_done = update_with_panels(&mut fx, &panels, &mut dismiss_player).unwrap();
+        assert_eq!(
+            fx.sim().data[0],
+            1,
+            "mode {mode} nested book must return True"
+        );
+        assert_eq!(
+            u_done.special_panels_answered,
+            vec![(
+                SpecialPanelRequest::SpellBook {
+                    caller: expected_caller,
+                },
+                SpecialPanelResponse::Dismissed
+            )]
+        );
+    }
+
+    // 2. Instruction-budget boundary: a Spellbook consumes 1 instruction of TICK_BUDGET
+    //    (458_605). Run 458_602 instructions before Dialog(12), then 1 instruction + Sleep(1)
+    //    (total = 458_605 -> succeeds) vs 2 instructions + Sleep(1) (total = 458_606 ->
+    //    Trap::BudgetExhausted { budget: TICK_BUDGET }).
+    let outer_iters: i16 = 228; // 228 * (1000 * 2 + 3) = 456_684 instructions
+    let rem_iters: i16 = 959; // 959 * 2 = 1_918 instructions -> 458_602 before Dialog(12)
+    assert_eq!(
+        usize::try_from(outer_iters).unwrap() * 2003 + usize::try_from(rem_iters).unwrap() * 2 + 3,
+        sims_vm::TICK_BUDGET
+    );
+    let build_budget_tree = |one_over: bool| {
+        let thousand = 1000i16.to_le_bytes();
+        let outer = outer_iters.to_le_bytes();
+        let rem = rem_iters.to_le_bytes();
+        tree(vec![
+            // 0: temp[0] += 1 -> 1
+            ins(
+                2,
+                1,
+                1,
+                [0, 0, 1, 0, 0, op::ADD, scope::TEMPS, scope::LITERAL],
+            ),
+            // 1: temp[0] < 1000 ? 0 : 2
+            ins(
+                2,
+                0,
+                2,
+                [
+                    0,
+                    0,
+                    thousand[0],
+                    thousand[1],
+                    0,
+                    1,
+                    scope::TEMPS,
+                    scope::LITERAL,
+                ],
+            ),
+            // 2: temp[0] := 0 -> 3
+            assign(scope::TEMPS, 0, scope::LITERAL, 0, 3),
+            // 3: temp[1] += 1 -> 4
+            ins(
+                2,
+                4,
+                4,
+                [1, 0, 1, 0, 0, op::ADD, scope::TEMPS, scope::LITERAL],
+            ),
+            // 4: temp[1] < outer_iters ? 0 : 5
+            ins(
+                2,
+                0,
+                5,
+                [1, 0, outer[0], outer[1], 0, 1, scope::TEMPS, scope::LITERAL],
+            ),
+            // 5: temp[2] += 1 -> 6
+            ins(
+                2,
+                6,
+                6,
+                [2, 0, 1, 0, 0, op::ADD, scope::TEMPS, scope::LITERAL],
+            ),
+            // 6: temp[2] < rem_iters ? 5 : 7
+            ins(
+                2,
+                5,
+                7,
+                [2, 0, rem[0], rem[1], 0, 1, scope::TEMPS, scope::LITERAL],
+            ),
+            // 7: Dialog kind 12 (instruction 458_603) -> 8
+            ins(36, 8, 8, dialog(12, 0)),
+            // 8: temp[3] := 1 (instruction 458_604) -> 10 if one_over else 9
+            assign(
+                scope::TEMPS,
+                3,
+                scope::LITERAL,
+                1,
+                if one_over { 10 } else { 9 },
+            ),
+            // 9: Sleep (instruction 458_605 if !one_over, 458_606 if one_over)
+            ins(0, 9, 9, [0; 8]),
+            // 10: extra instruction (458_605) before Sleep (458_606 -> BudgetExhausted)
+            assign(scope::TEMPS, 3, scope::LITERAL, 2, 9),
+        ])
+    };
+    let mut fx_ok = person_lot(build_budget_tree(false));
+    let panels_ok = RefCell::new(SpecialPanels::default());
+    let mut player_ok = ScriptedPlayer::new(answers(&[]), &[]);
+    let u_ok = update_with_panels(&mut fx_ok, &panels_ok, &mut player_ok)
+        .expect("book at exact TICK_BUDGET boundary must succeed");
+    assert_eq!(u_ok.special_panels_answered.len(), 1);
+    assert_eq!(fx_ok.sim().temps[3], 1);
+
+    let mut fx_over = person_lot(build_budget_tree(true));
+    let panels_over = RefCell::new(SpecialPanels::default());
+    let mut player_over = ScriptedPlayer::new(answers(&[]), &[]);
+    let err_over = update_with_panels(&mut fx_over, &panels_over, &mut player_over).unwrap_err();
+    assert!(
+        matches!(err_over, TickError::Fault(ref f) if matches!(f.trap, Trap::BudgetExhausted { .. })),
+        "exceeding TICK_BUDGET by 1 instruction past book must trap BudgetExhausted, got {err_over:?}"
+    );
+}
+
+#[test]
+fn special_dialog_informs_precheck_kind13_gate_and_pet_picker_speed_hold() {
+    // 1. `0x451562..0x4515a9` + `0x4443ab`: `informs` (operand 7 bit 0) runs AFTER
+    //    the record pre-check (closing SHOWN -> DONE) and handles kinds 5, 7, 8, 11, 13
+    //    through `end_of_update` without portrait formatting.
+    for (kind, expected_req, response) in [
+        (
+            5,
+            SpecialPanelRequest::DowntownLotPicker,
+            SpecialPanelResponse::Lot(Some(22)),
+        ),
+        (
+            7,
+            SpecialPanelRequest::VacationLotPicker {
+                on_residential: true,
+            },
+            SpecialPanelResponse::Lot(Some(41)),
+        ),
+        (
+            8,
+            SpecialPanelRequest::OldTownLotPicker { unleashed: false },
+            SpecialPanelResponse::Lot(Some(58)),
+        ),
+        (
+            11,
+            SpecialPanelRequest::StudioTownLotPicker { star_limo: false },
+            SpecialPanelResponse::Lot(Some(81)),
+        ),
+        (
+            13,
+            SpecialPanelRequest::MagicTownLotPicker { via_blimp: false },
+            SpecialPanelResponse::Lot(Some(93)),
+        ),
+    ] {
+        let mut fx = lot(tree(vec![
+            ins(36, 1, 2, [0, 0, 0, 0, 0, kind, 0, 1]), // operand 7 bit 0 = informs!
+            assign(scope::MY_DATA, 0, scope::LITERAL, 1, 3),
+            assign(scope::MY_DATA, 0, scope::LITERAL, 2, 3),
+            ins(0, 3, 3, [0; 8]),
+        ]));
+        fx.world.dialogs.records.push(sims_sim::Dialog {
+            caller: LAMP,
+            operands: dialog(0, 0),
+            status: 1, // SHOWN
+        });
+        let panels = RefCell::new(SpecialPanels::default());
+        let mut player = ScriptedPlayer::new(answers(&[]), std::slice::from_ref(&response));
+        let u = update_with_panels(&mut fx, &panels, &mut player).unwrap();
+        assert_eq!(fx.lamp().data[0], 1, "informs kind {kind} must take True");
+        assert_eq!(u.special_panels_answered, vec![(expected_req, response)]);
+        assert!(
+            fx.world.dialogs.records.is_empty(),
+            "old SHOWN record and informs record must both be closed & drained"
+        );
+    }
+
+    // Unsupported informs kind (e.g. kind 6) must STILL run the SHOWN -> DONE pre-check first.
+    let mut fx = lot(tree(vec![
+        ins(36, 1, 2, [0, 0, 0, 0, 0, 6, 0, 1]),
+        assign(scope::MY_DATA, 0, scope::LITERAL, 1, 3),
+        assign(scope::MY_DATA, 0, scope::LITERAL, 2, 3),
+        ins(0, 3, 3, [0; 8]),
+    ]));
+    fx.world.dialogs.records.push(sims_sim::Dialog {
+        caller: LAMP,
+        operands: dialog(0, 0),
+        status: 1, // SHOWN
+    });
+    let panels = RefCell::new(SpecialPanels::default());
+    let err = update_with_panels(&mut fx, &panels, &mut answers(&[])).unwrap_err();
+    assert!(matches!(
+        err,
+        TickError::Fault(f) if matches!(f.trap, Trap::Unsupported(_))
+    ));
+    assert_eq!(
+        fx.world.dialogs.records[0].status,
+        5, // DONE
+        "0x451562..0x45158d pre-check must close SHOWN record before informs trap"
+    );
+
+    // 2. Kind 13 `[0x6f2a58]+0xf8` gate (`magic_picker_blocked`): yields without arming -1
+    //    while blocked, then arms -1 and opens MagicTownLotPicker once cleared.
+    let mut fx = lot(asking(13, 0));
+    let panels = RefCell::new(SpecialPanels {
+        magic_picker_blocked: true,
+        ..SpecialPanels::default()
+    });
+    let mut player = ScriptedPlayer::new(answers(&[]), &[SpecialPanelResponse::Lot(Some(93))]);
+    let u_blocked = update_with_panels(&mut fx, &panels, &mut player).unwrap();
+    assert!(u_blocked.special_panels_answered.is_empty());
+    assert_eq!(
+        panels.borrow().magic_lot,
+        0,
+        "kind 13 must NOT arm magic_lot = -1 while magic_picker_blocked is true"
+    );
+    panels.borrow_mut().magic_picker_blocked = false;
+    let u_open = update_with_panels(&mut fx, &panels, &mut player).unwrap();
+    assert_eq!(
+        u_open.special_panels_answered,
+        vec![(
+            SpecialPanelRequest::MagicTownLotPicker { via_blimp: false },
+            SpecialPanelResponse::Lot(Some(93))
+        )]
+    );
+    assert_eq!(panels.borrow().magic_lot, 93);
+
+    // 3. Kind 9 Pet Picker saves speed, sets 760, and restores via `World::set_speed`
+    //    (`0x441bb2..0x441de8`), which updates `return_speed` when idle speed hold is active!
+    let mut fx = lot(asking(9, 0));
+    fx.lamp_mut().stack[0].stack_object = SIM as i16;
+    fx.sim_mut().person.as_mut().unwrap().motives[11] = -10.0;
+    fx.world.globals[18] = -1;
+    fx.world.set_speed(25);
+    assert!(fx.world.idle_speed(true));
+    assert_eq!(fx.world.speed(), 1000);
+    assert_eq!(fx.world.return_speed(), 25);
+    let panels = RefCell::new(SpecialPanels::default());
+    let mut player = ScriptedPlayer::new(
+        answers(&[]),
+        &[SpecialPanelResponse::Selection {
+            accepted: true,
+            index: 2,
+        }],
+    );
+    update_with_panels(&mut fx, &panels, &mut player).unwrap();
+    assert_eq!(
+        fx.world.speed(),
+        1000,
+        "active idle-speed hold must stay at 1000"
+    );
+    assert_eq!(
+        fx.world.return_speed(),
+        1000,
+        "restoring saved speed (1000) through World::set_speed during idle hold updates return_speed"
+    );
+
+    // 4. Headless `ScriptedPlayer` with a queued `Lot(Some(93))` preceded by a Spellbook
+    //    must auto-dismiss the book WITHOUT consuming the queued picker response!
+    let mut fx = person_lot(tree(vec![
+        ins(36, 1, 1, dialog(12, 0)), // inline Spellbook
+        ins(36, 2, 2, dialog(13, 0)), // Magic Town lot picker
+        assign(scope::MY_DATA, 0, scope::LITERAL, 1, 3),
+        ins(0, 3, 3, [0; 8]),
+    ]));
+    let panels = RefCell::new(SpecialPanels::default());
+    let mut player = ScriptedPlayer::new(answers(&[]), &[SpecialPanelResponse::Lot(Some(93))]);
+    let u1 = update_with_panels(&mut fx, &panels, &mut player).unwrap();
+    assert_eq!(
+        u1.special_panels_answered,
+        vec![
+            (
+                SpecialPanelRequest::SpellBook { caller: Some(SIM) },
+                SpecialPanelResponse::Dismissed
+            ),
+            (
+                SpecialPanelRequest::MagicTownLotPicker { via_blimp: false },
+                SpecialPanelResponse::Lot(Some(93))
+            ),
+        ]
+    );
+    assert_eq!(panels.borrow().magic_lot, 93);
 }
 
 #[test]

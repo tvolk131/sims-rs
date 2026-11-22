@@ -555,13 +555,16 @@ impl Player for LotPlayer<'_> {
     }
 
     fn special_panel(&mut self, shown: &ShownSpecialPanel) -> Option<SpecialPanelResponse> {
-        if let Some(resp) = self.special_panels.pop_front() {
-            return Some(resp);
-        }
         if shown.request.is_dismiss_only() && !self.wait_for_books {
+            if matches!(
+                self.special_panels.front(),
+                Some(SpecialPanelResponse::Dismissed)
+            ) {
+                return self.special_panels.pop_front();
+            }
             return Some(SpecialPanelResponse::Dismissed);
         }
-        None
+        self.special_panels.pop_front()
     }
 }
 

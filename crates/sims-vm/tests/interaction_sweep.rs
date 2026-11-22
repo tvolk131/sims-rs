@@ -201,6 +201,8 @@ struct LotSweepStats {
     invalid_faults: usize,
     unsupported_hits: usize,
     special_panels_triggered: BTreeMap<u8, usize>,
+    warmup_errors: Vec<String>,
+    skipped_reason: Option<String>,
 }
 
 /// Normalizes dynamic object IDs in `Trap::Unsupported` messages so identical
@@ -233,6 +235,7 @@ fn sweep_one_lot(
     root: &std::path::Path,
     label: &str,
     rel_house: &str,
+    select_actor: bool,
     ticks_per_interaction: u32,
     buckets: &mut BTreeMap<String, UnsupportedBucket>,
 ) -> LotSweepStats {
@@ -245,16 +248,77 @@ fn sweep_one_lot(
         .unwrap_or_else(|e| panic!("failed to load {rel_house}: {e}"));
 
     // Warm up a few ticks so destination lots spawn arriving NPCs / controllers.
-    for _ in 0..20 {
+    for tick in 1..=20 {
         if find_actor(lot.world()).is_some() && lot.ticks() >= 5 {
             break;
         }
-        let _ = lot.step_play();
+        match lot.step_play() {
+            Ok(_) => {}
+            Err(StepError::Asking { .. }) => {
+                if let Some(asking) = lot.asking() {
+                    let ans = asking.shown.answers[0];
+                    let _ = lot.answer(ans);
+                } else if let Some(sp) = lot.asking_special_panel() {
+                    let resp = match sp.shown.request {
+                        SpecialPanelRequest::DowntownLotPicker => {
+                            SpecialPanelResponse::Lot(Some(21))
+                        }
+                        SpecialPanelRequest::VacationLotPicker { .. } => {
+                            SpecialPanelResponse::Lot(Some(40))
+                        }
+                        SpecialPanelRequest::OldTownLotPicker { .. } => {
+                            SpecialPanelResponse::Lot(Some(58))
+                        }
+                        SpecialPanelRequest::StudioTownLotPicker { .. } => {
+                            SpecialPanelResponse::Lot(Some(81))
+                        }
+                        SpecialPanelRequest::MagicTownLotPicker { .. } => {
+                            SpecialPanelResponse::Lot(Some(93))
+                        }
+                        SpecialPanelRequest::CallNeighbor { .. } => {
+                            SpecialPanelResponse::Neighbor(Some(1))
+                        }
+                        SpecialPanelRequest::WardrobeShop { .. }
+                        | SpecialPanelRequest::PetPicker { .. }
+                        | SpecialPanelRequest::CharmTransform { .. } => {
+                            SpecialPanelResponse::Selection {
+                                accepted: true,
+                                index: 0,
+                            }
+                        }
+                        SpecialPanelRequest::SpellBook { .. }
+                        | SpecialPanelRequest::CookBook { .. } => SpecialPanelResponse::Dismissed,
+                    };
+                    let _ = lot.answer_special_panel(resp);
+                }
+            }
+            Err(err) => {
+                stats.warmup_errors.push(format!("tick {tick}: {err}"));
+                break;
+            }
+        }
     }
     let Some(actor) = find_actor(lot.world()) else {
-        eprintln!("{}: no actor found after warm-up; skipping", stats.lot_name);
+        let reason = if stats.warmup_errors.is_empty() {
+            "no actor found after warm-up".to_owned()
+        } else {
+            format!(
+                "no actor found after warm-up ({})",
+                stats.warmup_errors.join("; ")
+            )
+        };
+        eprintln!("{}: {reason}; skipping", stats.lot_name);
+        stats.skipped_reason = Some(reason);
         return stats;
     };
+    if select_actor
+        && selected(lot.world()).is_none()
+        && let Err(err) = lot.select(actor)
+    {
+        stats
+            .warmup_errors
+            .push(format!("select actor {actor} failed: {err}"));
+    }
     let tuning = lot
         .program()
         .motive_tuning()
@@ -302,7 +366,14 @@ fn sweep_one_lot(
         }
     };
 
+    // Deduplicate identical `(object GUID, menu table_index, action tree, join)`
+    // entries per lot while still probing every lead object's `pie_menu` so
+    // state-dependent menus are never missed and duplicate chairs/shrubs/lamps
+    // don't multiply runtime 10x.
+    let mut seen_interactions = BTreeSet::new();
+    let mut worklist: Vec<(String, World, sims_vm::orders::MenuEntry)> = Vec::new();
     for obj_id in object_ids {
+        let obj_guid = base_world.objects.get(&obj_id).map_or(0, |o| o.guid);
         let obj_name = object_label(&lot, obj_id);
         let mut menu_world = base_world.clone();
         let sounds = RefCell::new(Vec::new());
@@ -325,120 +396,177 @@ fn sweep_one_lot(
                 continue;
             }
         };
-
         for entry in entries {
-            stats.entries_tested += 1;
-            let entry_label = menu_entry_label(&entry);
-            let mut world = menu_world.clone();
-            let special_panels = RefCell::new(SpecialPanels::default());
-            let dialog_text = RefCell::new(String::new());
-            let character_names = RefCell::new(BTreeMap::new());
-            let mut interp = Interpreter::new(lot.program(), lot.catalog(), Stream::Global);
-            interp.view_rotation = base_rotation;
-            interp.view_centre = base_centre;
-            interp.active_family = active_family;
-            interp.special_panels = Some(&special_panels);
-            interp.dialog_text = Some(&dialog_text);
-            interp.character_names = Some(&character_names);
-
-            if let Err(fault) = interp.pick(&mut world, actor, entry.action) {
-                match &fault.trap {
-                    Trap::Unsupported(msg) => {
-                        stats.unsupported_hits += 1;
-                        record_unsupported(
-                            format!("[pick] {}", normalize_unsupported(msg)),
-                            format!("{label} | {obj_name} | {entry_label} | {fault}"),
-                            label,
-                        );
-                    }
-                    Trap::Native { .. } => stats.native_faults += 1,
-                    _ => stats.invalid_faults += 1,
-                }
-                continue;
+            let key = (
+                obj_guid,
+                entry.action.table_index,
+                entry.action.action,
+                entry.action.join,
+            );
+            if seen_interactions.insert(key) {
+                worklist.push((obj_name.clone(), menu_world.clone(), entry));
             }
+        }
+    }
 
-            let mut player = SweepPlayer::new(&world);
-            let mut play = Play::default();
-            let mut hit_unsupported = false;
-            let mut hit_native = false;
-            let mut hit_invalid = false;
-            for tick in 1..=ticks_per_interaction {
-                let (update, res) =
-                    interp.lot_update_kept(&mut world, &tuning, &mut player, Some(&mut play));
-                for err in &update.errors {
-                    match &err.fault.trap {
-                        Trap::Unsupported(msg) => {
-                            hit_unsupported = true;
-                            stats.unsupported_hits += 1;
-                            record_unsupported(
-                                normalize_unsupported(msg),
-                                format!(
-                                    "{label} | {obj_name} | {entry_label} | tick {tick} | {}",
-                                    err.fault
-                                ),
-                                label,
-                            );
-                            break;
-                        }
-                        Trap::Native { .. } => hit_native = true,
-                        _ => hit_invalid = true,
-                    }
-                }
-                if hit_unsupported {
-                    break;
-                }
-                match res {
-                    Ok(_) => {}
-                    Err(TickError::Fault(fault)) => {
+    stats.entries_tested = worklist.len();
+    let workers = std::thread::available_parallelism()
+        .map_or(4, |n| n.get().min(8))
+        .max(1);
+    let chunk_size = worklist.len().div_ceil(workers).max(1);
+
+    #[derive(Default)]
+    struct ChunkResult {
+        clean: usize,
+        native_faults: usize,
+        invalid_faults: usize,
+        unsupported_hits: usize,
+        special_panels_triggered: BTreeMap<u8, usize>,
+        unsupported_events: Vec<(String, String)>,
+    }
+
+    let program = lot.program();
+    let catalog = lot.catalog();
+    let tuning_ref = &tuning;
+    let chunk_results: Vec<ChunkResult> = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for chunk in worklist.chunks(chunk_size) {
+            handles.push(scope.spawn(move || {
+                let mut res = ChunkResult::default();
+                for (obj_name, menu_world, entry) in chunk {
+                    let entry_label = menu_entry_label(entry);
+                    let mut world = menu_world.clone();
+                    let special_panels = RefCell::new(SpecialPanels::default());
+                    let dialog_text = RefCell::new(String::new());
+                    let character_names = RefCell::new(BTreeMap::new());
+                    let mut interp = Interpreter::new(program, catalog, Stream::Global);
+                    interp.view_rotation = base_rotation;
+                    interp.view_centre = base_centre;
+                    interp.active_family = active_family;
+                    interp.special_panels = Some(&special_panels);
+                    interp.dialog_text = Some(&dialog_text);
+                    interp.character_names = Some(&character_names);
+
+                    if let Err(fault) = interp.pick(&mut world, actor, entry.action.clone()) {
                         match &fault.trap {
                             Trap::Unsupported(msg) => {
-                                hit_unsupported = true;
-                                stats.unsupported_hits += 1;
-                                record_unsupported(
-                                    normalize_unsupported(msg),
-                                    format!(
-                                        "{label} | {obj_name} | {entry_label} | tick {tick} | {fault}"
-                                    ),
-                                    label,
-                                );
+                                res.unsupported_hits += 1;
+                                res.unsupported_events.push((
+                                    format!("[pick] {}", normalize_unsupported(msg)),
+                                    format!("{label} | {obj_name} | {entry_label} | {fault}"),
+                                ));
                             }
-                            Trap::Native { .. } => hit_native = true,
-                            _ => hit_invalid = true,
+                            Trap::Native { .. } => res.native_faults += 1,
+                            _ => res.invalid_faults += 1,
                         }
-                        break;
+                        continue;
                     }
-                    Err(TickError::Unsupported(msg)) => {
-                        hit_unsupported = true;
-                        stats.unsupported_hits += 1;
-                        record_unsupported(
-                            format!("[tick] {}", normalize_unsupported(&msg)),
-                            format!("{label} | {obj_name} | {entry_label} | tick {tick} | {msg}"),
-                            label,
+
+                    let mut player = SweepPlayer::new(&world);
+                    let mut play = Play::default();
+                    let mut hit_unsupported = false;
+                    let mut hit_native = false;
+                    let mut hit_invalid = false;
+                    for tick in 1..=ticks_per_interaction {
+                        let (update, tick_res) = interp.lot_update_kept(
+                            &mut world,
+                            tuning_ref,
+                            &mut player,
+                            Some(&mut play),
                         );
-                        break;
+                        for err in &update.errors {
+                            match &err.fault.trap {
+                                Trap::Unsupported(msg) => {
+                                    hit_unsupported = true;
+                                    res.unsupported_hits += 1;
+                                    res.unsupported_events.push((
+                                        normalize_unsupported(msg),
+                                        format!(
+                                            "{label} | {obj_name} | {entry_label} | tick {tick} | {}",
+                                            err.fault
+                                        ),
+                                    ));
+                                    break;
+                                }
+                                Trap::Native { .. } => hit_native = true,
+                                _ => hit_invalid = true,
+                            }
+                        }
+                        if hit_unsupported {
+                            break;
+                        }
+                        match tick_res {
+                            Ok(_) => {}
+                            Err(TickError::Fault(fault)) => {
+                                match &fault.trap {
+                                    Trap::Unsupported(msg) => {
+                                        hit_unsupported = true;
+                                        res.unsupported_hits += 1;
+                                        res.unsupported_events.push((
+                                            normalize_unsupported(msg),
+                                            format!(
+                                                "{label} | {obj_name} | {entry_label} | tick {tick} | {fault}"
+                                            ),
+                                        ));
+                                    }
+                                    Trap::Native { .. } => hit_native = true,
+                                    _ => hit_invalid = true,
+                                }
+                                break;
+                            }
+                            Err(TickError::Unsupported(msg)) => {
+                                hit_unsupported = true;
+                                res.unsupported_hits += 1;
+                                res.unsupported_events.push((
+                                    format!("[tick] {}", normalize_unsupported(&msg)),
+                                    format!(
+                                        "{label} | {obj_name} | {entry_label} | tick {tick} | {msg}"
+                                    ),
+                                ));
+                                break;
+                            }
+                            Err(
+                                TickError::Unanswered { .. }
+                                | TickError::UnansweredSpecialPanel { .. },
+                            ) => {
+                                hit_invalid = true;
+                                break;
+                            }
+                        }
                     }
-                    Err(
-                        TickError::Unanswered { .. } | TickError::UnansweredSpecialPanel { .. },
-                    ) => {
-                        hit_invalid = true;
-                        break;
+                    for panel in &player.panels_seen {
+                        *res.special_panels_triggered
+                            .entry(panel.kind())
+                            .or_default() += 1;
+                    }
+                    if !hit_unsupported && !hit_invalid {
+                        res.clean += 1;
+                        if hit_native {
+                            res.native_faults += 1;
+                        }
+                    } else if hit_invalid && !hit_unsupported {
+                        res.invalid_faults += 1;
                     }
                 }
-            }
-            for panel in &player.panels_seen {
-                *stats
-                    .special_panels_triggered
-                    .entry(panel.kind())
-                    .or_default() += 1;
-            }
-            if !hit_unsupported && !hit_invalid {
-                stats.clean += 1;
-                if hit_native {
-                    stats.native_faults += 1;
-                }
-            } else if hit_invalid && !hit_unsupported {
-                stats.invalid_faults += 1;
-            }
+                res
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("sweep worker thread panicked"))
+            .collect()
+    });
+
+    for chunk in chunk_results {
+        stats.clean += chunk.clean;
+        stats.native_faults += chunk.native_faults;
+        stats.invalid_faults += chunk.invalid_faults;
+        stats.unsupported_hits += chunk.unsupported_hits;
+        for (kind, count) in chunk.special_panels_triggered {
+            *stats.special_panels_triggered.entry(kind).or_default() += count;
+        }
+        for (key, sample) in chunk.unsupported_events {
+            record_unsupported(key, sample, label);
         }
     }
 
@@ -823,24 +951,39 @@ fn complete_collection_interactive_object_sweep() {
         return;
     };
 
+    // Mirror `tests/destination_lots.rs`: Vacation (`House40`) requires `global[3] != 0`
+    // to avoid the Maxis uninitialized `local 6` bug in `NPC_Vacation_Controller.iff`,
+    // whereas other destination lots run without selecting an NPC/visitor.
     let lots = [
-        ("Goth (House05)", "UserData/Houses/House05.iff"),
-        ("Newbies (House07)", "UserData/Houses/House07.iff"),
-        ("Charming (House69)", "UserData/Houses/House69.iff"),
-        ("Downtown (House21)", "UserData/Houses/House21.iff"),
-        ("Vacation (House40)", "UserData/Houses/House40.iff"),
-        ("Old Town (House58)", "UserData/Houses/House58.iff"),
-        ("Studio Town (House81)", "UserData/Houses/House81.iff"),
-        ("Magic Town Res (House90)", "UserData/Houses/House90.iff"),
-        ("Magic Town Comm (House93)", "UserData/Houses/House93.iff"),
+        ("Goth (House05)", "UserData/Houses/House05.iff", false),
+        ("Newbies (House07)", "UserData/Houses/House07.iff", false),
+        ("Charming (House69)", "UserData/Houses/House69.iff", false),
+        ("Downtown (House21)", "UserData/Houses/House21.iff", false),
+        ("Vacation (House40)", "UserData/Houses/House40.iff", true),
+        ("Old Town (House58)", "UserData/Houses/House58.iff", false),
+        (
+            "Studio Town (House81)",
+            "UserData/Houses/House81.iff",
+            false,
+        ),
+        (
+            "Magic Town Res (House90)",
+            "UserData/Houses/House90.iff",
+            false,
+        ),
+        (
+            "Magic Town Comm (House93)",
+            "UserData/Houses/House93.iff",
+            false,
+        ),
     ];
 
     let mut buckets: BTreeMap<String, UnsupportedBucket> = BTreeMap::new();
     let mut all_stats = Vec::new();
-    for (label, rel) in lots {
-        let stats = sweep_one_lot(&root, label, rel, 200, &mut buckets);
+    for (label, rel, select_actor) in lots {
+        let stats = sweep_one_lot(&root, label, rel, select_actor, 200, &mut buckets);
         eprintln!(
-            "{}: objects={} entries={} clean={} native={} invalid={} unsupported={} pie_unsup={} panels={:?}",
+            "{}: objects={} entries={} clean={} native={} invalid={} unsupported={} pie_unsup={} warmup_errs={} skipped={:?} panels={:?}",
             stats.lot_name,
             stats.objects_scanned,
             stats.entries_tested,
@@ -849,6 +992,8 @@ fn complete_collection_interactive_object_sweep() {
             stats.invalid_faults,
             stats.unsupported_hits,
             stats.pie_menu_unsupported,
+            stats.warmup_errors.len(),
+            stats.skipped_reason,
             stats.special_panels_triggered,
         );
         all_stats.push(stats);
@@ -869,9 +1014,9 @@ fn complete_collection_interactive_object_sweep() {
     let _ = writeln!(report, "## Per-Lot Summary\n");
     let _ = writeln!(
         report,
-        "| Lot | Objects | Entries | Clean | Native Fault | Invalid/Other | Unsupported | Pie-Menu Unsup | Special Panels |"
+        "| Lot | Status | Objects | Entries | Clean | Native Fault | Invalid/Other | Unsupported | Pie-Menu Unsup | Special Panels |"
     );
-    let _ = writeln!(report, "|---|---:|---:|---:|---:|---:|---:|---:|---|");
+    let _ = writeln!(report, "|---|---|---:|---:|---:|---:|---:|---:|---:|---|");
     let (
         mut tot_obj,
         mut tot_ent,
@@ -889,6 +1034,13 @@ fn complete_collection_interactive_object_sweep() {
         tot_inv += s.invalid_faults;
         tot_unsup += s.unsupported_hits;
         tot_pie += s.pie_menu_unsupported;
+        let status = if let Some(reason) = &s.skipped_reason {
+            format!("SKIPPED ({reason})")
+        } else if !s.warmup_errors.is_empty() {
+            format!("warmup warn ({})", s.warmup_errors.join("; "))
+        } else {
+            "ok".to_owned()
+        };
         let panels = if s.special_panels_triggered.is_empty() {
             "-".to_owned()
         } else {
@@ -900,8 +1052,9 @@ fn complete_collection_interactive_object_sweep() {
         };
         let _ = writeln!(
             report,
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             s.lot_name,
+            status,
             s.objects_scanned,
             s.entries_tested,
             s.clean,
@@ -914,8 +1067,22 @@ fn complete_collection_interactive_object_sweep() {
     }
     let _ = writeln!(
         report,
-        "| **TOTAL** | **{tot_obj}** | **{tot_ent}** | **{tot_clean}** | **{tot_nat}** | **{tot_inv}** | **{tot_unsup}** | **{tot_pie}** | |"
+        "| **TOTAL** | | **{tot_obj}** | **{tot_ent}** | **{tot_clean}** | **{tot_nat}** | **{tot_inv}** | **{tot_unsup}** | **{tot_pie}** | |"
     );
+    let skipped: Vec<&LotSweepStats> = all_stats
+        .iter()
+        .filter(|s| s.skipped_reason.is_some() || !s.warmup_errors.is_empty())
+        .collect();
+    if !skipped.is_empty() {
+        let _ = writeln!(report, "\n## Warm-Up Warnings & Skipped Lots\n");
+        for s in skipped {
+            let _ = writeln!(
+                report,
+                "- **{}**: skipped={:?}, warmup_errors={:?}",
+                s.lot_name, s.skipped_reason, s.warmup_errors
+            );
+        }
+    }
 
     let _ = writeln!(
         report,

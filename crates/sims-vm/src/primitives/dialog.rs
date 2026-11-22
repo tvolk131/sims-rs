@@ -311,6 +311,10 @@ pub struct SpecialPanels {
     /// `+0x10c`: kind 11 Studio Town star-limo subject person ID (set by
     /// Generic Sims Call routine 35 at `0x451197`, cleared on valid pick at `0x442152`).
     pub studio_caller: Option<u16>,
+    /// UI transition/panel busy flag `[0x6f2a58] + 0xf8` checked by Dialog kind 13
+    /// (`0x451628..0x451634`). While `true`, kind 13 yields without arming
+    /// `magic_lot = -1` when `magic_lot == 0`.
+    pub magic_picker_blocked: bool,
 }
 
 /// Typed special panel request surfaced by `Dialog` kinds `5..=15` (`0x451552`
@@ -342,7 +346,9 @@ pub enum SpecialPanelRequest {
     StudioTownLotPicker { star_limo: bool },
     /// Kind 12 (`0x4518e2` -> `0x5107dc(person, 0)`): Makin' Magic Spellbook reference
     /// modal, opened synchronously inside `Dialog` and always taking the True branch.
-    SpellBook { caller: u16 },
+    /// `caller` is `Some(me)` when `me` casts to `cXPerson` (`0x635abe`), or `None`
+    /// (passing `NULL` to `0x5107dc`) for a non-person caller.
+    SpellBook { caller: Option<u16> },
     /// Kind 13 (`reg+0xf0`, `0x44216e` -> `0x551285`): Makin' Magic Town lot picker
     /// (`90..=98`). `via_blimp` reflects `world.globals[34] != 0` (`0x4421e3..0x442219`,
     /// written to `[dialog + 0xec]` and read at `0x5545ee`: `false` for the Magic Hole
@@ -354,7 +360,9 @@ pub enum SpecialPanelRequest {
     CharmTransform { person: u16 },
     /// Kind 15 (`0x451946` -> `0x5107dc(person, 1)`): Makin' Magic Cookbook reference
     /// modal, opened synchronously inside `Dialog` and always taking the True branch.
-    CookBook { caller: u16 },
+    /// `caller` is `Some(me)` when `me` casts to `cXPerson` (`0x635abe`), or `None`
+    /// (passing `NULL` to `0x5107dc`) for a non-person caller.
+    CookBook { caller: Option<u16> },
 }
 
 impl SpecialPanelRequest {
@@ -373,6 +381,22 @@ impl SpecialPanelRequest {
             Self::MagicTownLotPicker { .. } => 13,
             Self::CharmTransform { .. } => 14,
             Self::CookBook { .. } => 15,
+        }
+    }
+
+    /// Subject/caller object ID associated with this panel request, if any.
+    #[must_use]
+    pub const fn caller_object(&self) -> Option<u16> {
+        match *self {
+            Self::WardrobeShop { person, .. } | Self::CharmTransform { person } => Some(person),
+            Self::PetPicker { pet } => Some(pet),
+            Self::SpellBook { caller } | Self::CookBook { caller } => caller,
+            Self::DowntownLotPicker
+            | Self::VacationLotPicker { .. }
+            | Self::OldTownLotPicker { .. }
+            | Self::CallNeighbor { .. }
+            | Self::StudioTownLotPicker { .. }
+            | Self::MagicTownLotPicker { .. } => None,
         }
     }
 
@@ -419,13 +443,96 @@ pub enum SpecialPanelResponse {
     Dismissed,
 }
 
-/// Transient per-turn coordination slot allowing inline reference modals
-/// (kinds 12 & 15) inside `Machine::dialog` to pause for `Player::special_panel`
-/// without tripping `play`-mode script error recovery or consuming an extra tick.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct InlineSpecialPanel {
-    pub(crate) waiting: Option<SpecialPanelRequest>,
-    pub(crate) pre_approved: bool,
+/// Covariant sink interface allowing inline reference modals (kinds 12 & 15,
+/// `0x4518e2`, `0x451946`) inside `Machine::dialog` to invoke
+/// `Player::special_panel` synchronously at any call depth (top-level threads
+/// and synchronous `Run Tree By Name` callbacks) while keeping `Interpreter<'a>`
+/// covariant in `'a`.
+pub(crate) trait InlinePanelSink: std::fmt::Debug {
+    /// Invokes the player synchronously for an inline book request. Returns
+    /// `true` when accepted (`Dismissed`) and `false` when unanswered/rejected
+    /// (recording the [`crate::tick::TickError`] to unwind the tick).
+    fn ask_inline(&self, request: SpecialPanelRequest) -> bool;
+
+    /// Whether an inline book modal suspended this pass awaiting player input.
+    fn has_unanswered(&self) -> bool;
+
+    /// Takes any recorded unanswered inline modal error.
+    fn take_unanswered(&self) -> Option<crate::tick::TickError>;
+}
+
+struct InlineSpecialPanelState<'p> {
+    tick: u32,
+    player: &'p mut dyn crate::tick::Player,
+    answered: Vec<(SpecialPanelRequest, SpecialPanelResponse)>,
+    unanswered: Option<crate::tick::TickError>,
+}
+
+/// Concrete per-pass [`InlinePanelSink`] wrapping a [`crate::tick::Player`].
+pub(crate) struct InlineSpecialPanel<'p> {
+    state: std::cell::RefCell<InlineSpecialPanelState<'p>>,
+}
+
+impl std::fmt::Debug for InlineSpecialPanel<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self.state.borrow();
+        f.debug_struct("InlineSpecialPanel")
+            .field("tick", &state.tick)
+            .field("answered", &state.answered.len())
+            .field("has_unanswered", &state.unanswered.is_some())
+            .finish()
+    }
+}
+
+impl<'p> InlineSpecialPanel<'p> {
+    pub(crate) fn new(tick: u32, player: &'p mut dyn crate::tick::Player) -> Self {
+        Self {
+            state: std::cell::RefCell::new(InlineSpecialPanelState {
+                tick,
+                player,
+                answered: Vec::new(),
+                unanswered: None,
+            }),
+        }
+    }
+
+    pub(crate) fn drain_answered(
+        &self,
+        out: &mut Vec<(SpecialPanelRequest, SpecialPanelResponse)>,
+    ) {
+        out.append(&mut self.state.borrow_mut().answered);
+    }
+}
+
+impl InlinePanelSink for InlineSpecialPanel<'_> {
+    fn ask_inline(&self, request: SpecialPanelRequest) -> bool {
+        let mut state = self.state.borrow_mut();
+        let shown = crate::tick::ShownSpecialPanel {
+            tick: state.tick,
+            request: request.clone(),
+        };
+        match state.player.special_panel(&shown) {
+            Some(resp) if request.accepts(&resp) => {
+                state.answered.push((request, resp));
+                true
+            }
+            other => {
+                state.unanswered = Some(crate::tick::TickError::UnansweredSpecialPanel {
+                    shown,
+                    given: other,
+                });
+                false
+            }
+        }
+    }
+
+    fn has_unanswered(&self) -> bool {
+        self.state.borrow().unanswered.is_some()
+    }
+
+    fn take_unanswered(&self) -> Option<crate::tick::TickError> {
+        self.state.borrow_mut().unanswered.take()
+    }
 }
 
 /// The answers an ordinary dialog of this kind (operand 5) offers, as statuses,
@@ -460,19 +567,9 @@ pub fn informs(operands: &[u8; 8]) -> bool {
 impl Machine<'_, '_> {
     pub(crate) fn dialog(&mut self, operands: &[u8; 8]) -> Result<Flow, Trap> {
         let kind = operands[5] & 0x7f;
-        if kind > 15 {
-            return Err(Trap::Unsupported(format!(
-                "Dialog kind {kind} (operand 5) is unknown, which is not ported (0x451552)"
-            )));
-        }
-        if informs(operands) && answers(kind).is_none() {
-            return Err(Trap::Unsupported(format!(
-                "Dialog kind {kind} (operand 5) with informs flag (operand 7 bit 0) is not ported \
-                 (0x451552)"
-            )));
-        }
         let me = self.me;
-        // 0x451562..0x45158d runs before the informs and kind dispatches.
+        // `0x451562..0x45158d` runs unconditionally before the `informs` check
+        // (`0x451593`) and the `kind` dispatch (`0x4515ae..0x4515b1`).
         let records = &mut self.world.dialogs.records;
         let mut found = records.iter().position(|record| record.caller == me);
         if let Some(index) = found {
@@ -485,28 +582,58 @@ impl Machine<'_, '_> {
                 _ => {}
             }
         }
+        // `0x451593..0x4515a9`: when `informs` (operand 7 bit 0) is set, call
+        // `0x4443ab` and take the true branch immediately. `0x4443ab` has
+        // dedicated neighborhood-picker constructors for kinds 5, 7, 8, 11, 13
+        // (skipping `0x43601c` / portrait formatting) and routes ordinary kinds
+        // `0..=4` through `0x435d8a` + `0x43601c`.
         if informs(operands) {
             let record = Dialog {
                 caller: me,
                 operands: *operands,
                 status: NEW,
             };
-            self.dialog_portrait(operands)?;
-            self.world.dialogs.records.push(record);
-            return Ok(Flow::Branch(true));
+            match kind {
+                0..=4 => {
+                    self.dialog_portrait(operands)?;
+                    self.world.dialogs.records.push(record);
+                    return Ok(Flow::Branch(true));
+                }
+                5 | 7 | 8 | 11 | 13 => {
+                    self.world.dialogs.records.push(record);
+                    return Ok(Flow::Branch(true));
+                }
+                _ => {
+                    return Err(Trap::Unsupported(format!(
+                        "Dialog kind {kind} (operand 5) with informs flag (operand 7 bit 0) is \
+                         not ported (0x4443ab)"
+                    )));
+                }
+            }
+        }
+        if kind > 15 {
+            return Err(Trap::Unsupported(format!(
+                "Dialog kind {kind} (operand 5) is unknown, which is not ported (0x451552)"
+            )));
         }
         match kind {
-            5 => return self.dialog_lot_picker(5, |sp| &mut sp.downtown_lot),
-            7 => return self.dialog_lot_picker(7, |sp| &mut sp.vacation_lot),
-            8 => return self.dialog_lot_picker(8, |sp| &mut sp.old_town_lot),
-            11 => return self.dialog_lot_picker(11, |sp| &mut sp.studio_lot),
-            13 => return self.dialog_lot_picker(13, |sp| &mut sp.magic_lot),
+            5 => return self.dialog_lot_picker(5, false, |sp| &mut sp.downtown_lot),
+            7 => return self.dialog_lot_picker(7, false, |sp| &mut sp.vacation_lot),
+            8 => return self.dialog_lot_picker(8, false, |sp| &mut sp.old_town_lot),
+            11 => return self.dialog_lot_picker(11, false, |sp| &mut sp.studio_lot),
+            13 => return self.dialog_lot_picker(13, true, |sp| &mut sp.magic_lot),
             6 => return self.dialog_wardrobe(),
             14 => return self.dialog_charm_transform(),
             10 => return self.dialog_call_neighbor(),
             9 => return self.dialog_pet_picker(),
-            12 => return self.dialog_reference_book(SpecialPanelRequest::SpellBook { caller: me }),
-            15 => return self.dialog_reference_book(SpecialPanelRequest::CookBook { caller: me }),
+            12 => {
+                let caller = self.me()?.person.is_some().then_some(me);
+                return self.dialog_reference_book(SpecialPanelRequest::SpellBook { caller });
+            }
+            15 => {
+                let caller = self.me()?.person.is_some().then_some(me);
+                return self.dialog_reference_book(SpecialPanelRequest::CookBook { caller });
+            }
             _ => {}
         }
         let record = Dialog {
@@ -547,11 +674,14 @@ impl Machine<'_, '_> {
 
     /// Kinds 5 (`reg+0xea`), 7 (`reg+0xec`), 8 (`reg+0xf2`), 11 (`reg+0xee`),
     /// and 13 (`reg+0xf0`) at `0x4515b3..0x451656`: if the slot is 0, arm it
-    /// to -1 and yield; otherwise copy the picked lot into `temp 0`, clear the
-    /// slot to 0, and take the true branch.
+    /// to -1 and yield (except kind 13 when `magic_picker_blocked` / `[0x6f2a58]+0xf8`
+    /// is set at `0x451628..0x451634`, which yields without arming `-1`);
+    /// otherwise copy the picked lot into `temp 0`, clear the slot to 0, and
+    /// take the true branch.
     fn dialog_lot_picker(
         &mut self,
         kind: u8,
+        check_magic_blocked: bool,
         slot: impl FnOnce(&mut SpecialPanels) -> &mut i16,
     ) -> Result<Flow, Trap> {
         let Some(panels) = self.special_panels else {
@@ -561,10 +691,13 @@ impl Machine<'_, '_> {
         };
         let value = {
             let mut panels = panels.borrow_mut();
+            let blocked = check_magic_blocked && panels.magic_picker_blocked;
             let field = slot(&mut panels);
             let value = *field;
             if value == 0 {
-                *field = -1;
+                if !blocked {
+                    *field = -1;
+                }
                 return Ok(Flow::Yield);
             }
             *field = 0;
@@ -761,12 +894,10 @@ impl Machine<'_, '_> {
     /// take the true branch on the same tick.
     fn dialog_reference_book(&mut self, request: SpecialPanelRequest) -> Result<Flow, Trap> {
         if let Some(inline) = self.inline_special_panel {
-            let mut state = inline.borrow_mut();
-            if state.pre_approved {
-                state.pre_approved = false;
+            self.interpreter().refresh_family_panel(self.world);
+            if inline.ask_inline(request) {
                 return Ok(Flow::Branch(true));
             }
-            state.waiting = Some(request);
             return Ok(Flow::Yield);
         }
         Ok(Flow::Branch(true))

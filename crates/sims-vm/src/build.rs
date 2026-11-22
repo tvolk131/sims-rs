@@ -4511,16 +4511,7 @@ impl Interpreter<'_> {
 }
 
 fn lot_ready(lot: &Lot) -> Result<(), OrderError> {
-    if lot.halted {
-        return Err(OrderError::Halted);
-    }
-    if lot.asking.is_some() || lot.answered {
-        return Err(OrderError::Asking);
-    }
-    if lot.load.finished.is_none() {
-        return Err(OrderError::Incomplete);
-    }
-    Ok(())
+    lot.ready()
 }
 
 fn commit_build_history_on_lot<F>(lot: &mut Lot, commit: F) -> Result<bool, OrderError>

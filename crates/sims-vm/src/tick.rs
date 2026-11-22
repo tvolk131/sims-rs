@@ -215,6 +215,12 @@ impl Player for ScriptedPlayer {
 
     fn special_panel(&mut self, shown: &ShownSpecialPanel) -> Option<SpecialPanelResponse> {
         if shown.request.is_dismiss_only() && !self.wait_for_books {
+            if matches!(
+                self.special_panels.front(),
+                Some(SpecialPanelResponse::Dismissed)
+            ) {
+                return self.special_panels.pop_front();
+            }
             return Some(SpecialPanelResponse::Dismissed);
         }
         self.special_panels.pop_front()
@@ -651,7 +657,7 @@ impl Interpreter<'_> {
         tuning: &Tuning,
         update: &mut Update,
         mut play: Option<&mut Play>,
-        mut player: Option<&mut dyn Player>,
+        player: Option<&mut dyn Player>,
     ) -> Result<bool, TickError> {
         let partial =
             global(world, PAUSED)? != 0 || (global(world, MODE)? != 0 && global(world, LOT)? != 0);
@@ -663,11 +669,15 @@ impl Interpreter<'_> {
             TickError::Unsupported(format!("a scheduler cursor of {}", world.scheduler_cursor))
         })?;
         let taken_off = RefCell::new(BTreeMap::new());
-        let inline_panel = RefCell::new(InlineSpecialPanel::default());
         let inline_tick = world.ticks.wrapping_add(u32::from(!partial));
+        let inline_panel = player.map(|p| InlineSpecialPanel::new(inline_tick, p));
+        let inline_sink: Option<&(dyn crate::primitives::dialog::InlinePanelSink + '_)> =
+            inline_panel
+                .as_ref()
+                .map(|p| p as &dyn crate::primitives::dialog::InlinePanelSink);
         let this = Interpreter {
             taken_off: Some(&taken_off),
-            inline_special_panel: player.is_some().then_some(&inline_panel),
+            inline_special_panel: inline_sink,
             ..*self
         };
         for id in start..=end {
@@ -699,6 +709,9 @@ impl Interpreter<'_> {
                             then: None,
                             recovery,
                         });
+                        if let Some(panel) = &inline_panel {
+                            panel.drain_answered(&mut update.special_panels_answered);
+                        }
                         return Ok(false);
                     }
                     return Err(fault.into());
@@ -728,33 +741,14 @@ impl Interpreter<'_> {
             let mut caught = None;
             let catch = play.is_some().then_some(&mut caught);
             let mut inline_err = None;
-            let player_ref: Option<&mut dyn Player> = match &mut player {
-                Some(p) => Some(&mut **p),
-                None => None,
-            };
             let result = if is_person {
-                this.person_tick_with_player(
-                    world,
-                    id,
-                    tick,
-                    tuning,
-                    catch,
-                    player_ref,
-                    Some(update),
-                    inline_tick,
-                    &mut inline_err,
-                )
+                this.person_tick_with_player(world, id, tick, tuning, catch, &mut inline_err)
             } else {
-                this.object_tick_with_player(
-                    world,
-                    id,
-                    catch,
-                    player_ref,
-                    Some(update),
-                    inline_tick,
-                    &mut inline_err,
-                )
+                this.object_tick_with_player(world, id, catch, &mut inline_err)
             };
+            if let Some(panel) = &inline_panel {
+                panel.drain_answered(&mut update.special_panels_answered);
+            }
             if let Some(err) = inline_err {
                 return Err(err);
             }
@@ -807,21 +801,17 @@ impl Interpreter<'_> {
     /// returns the codes that make a thread return false.
     pub fn tick_object(&self, world: &mut World, id: u16) -> Result<bool, Fault> {
         let mut inline_err = None;
-        self.object_tick_with_player(world, id, None, None, None, 0, &mut inline_err)
+        self.object_tick_with_player(world, id, None, &mut inline_err)
     }
 
     /// An object's tick. With `catch`, a fault in the thread's run is put
     /// there and the rest of the tick runs, as the original's catch
     /// (0x474ec1) lets it ([`crate::play`]); without, it is returned.
-    #[allow(clippy::too_many_arguments)]
     fn object_tick_with_player(
         &self,
         world: &mut World,
         id: u16,
         catch: Option<&mut Option<Fault>>,
-        mut player: Option<&mut dyn Player>,
-        mut update: Option<&mut Update>,
-        inline_tick: u32,
         inline_err: &mut Option<TickError>,
     ) -> Result<bool, Fault> {
         let fail = |code, message| Fault {
@@ -829,66 +819,27 @@ impl Interpreter<'_> {
             at: None,
             trap: Trap::native(code, message),
         };
-        let mut remaining = TICK_BUDGET;
-        let error = loop {
-            match self.turn_counted(world, id, remaining) {
-                Ok((Status::Yielded, used)) => {
-                    let waiting = self
-                        .inline_special_panel
-                        .and_then(|cell| cell.borrow_mut().waiting.take());
-                    if let Some(request) = waiting {
-                        let shown = ShownSpecialPanel {
-                            tick: inline_tick,
-                            request: request.clone(),
-                        };
-                        self.refresh_family_panel(world);
-                        let given = player.as_deref_mut().and_then(|p| p.special_panel(&shown));
-                        match given {
-                            Some(resp) if request.accepts(&resp) => {
-                                if let Some(u) = update.as_deref_mut() {
-                                    u.special_panels_answered.push((request, resp));
-                                }
-                                if let Some(cell) = self.inline_special_panel {
-                                    cell.borrow_mut().pre_approved = true;
-                                }
-                                remaining = remaining.saturating_sub(used.saturating_sub(1));
-                                if remaining == 0 {
-                                    break Some(fail(
-                                        0x44d,
-                                        "the thread ran past the instruction limit of one tick; \
-                                         the original's error handling (the object's virtual \
-                                         function 4) is not ported",
-                                    ));
-                                }
-                                continue;
-                            }
-                            other => {
-                                *inline_err = Some(TickError::UnansweredSpecialPanel {
-                                    shown,
-                                    given: other,
-                                });
-                                return Ok(true);
-                            }
-                        }
-                    }
-                    break None;
-                }
-                Ok((Status::Returned(_), _)) => {
-                    break Some(fail(
-                        0x3e9,
-                        "the thread returned from its outermost frame; the original's error \
-                         handling (the object's virtual function 4) is not ported",
-                    ));
-                }
-                Ok((Status::Running, _)) => {
-                    break Some(fail(
-                        0x44d,
-                        "the thread ran past the instruction limit of one tick; the original's \
-                         error handling (the object's virtual function 4) is not ported",
-                    ));
-                }
-                Err(fault) => break Some(fault),
-            }
+        let turn_result = self.turn(world, id, TICK_BUDGET);
+        if let Some(err) = self
+            .inline_special_panel
+            .and_then(|inline| inline.take_unanswered())
+        {
+            *inline_err = Some(err);
+            return Ok(true);
+        }
+        let error = match turn_result {
+            Ok(Status::Yielded) => None,
+            Ok(Status::Returned(_)) => Some(fail(
+                0x3e9,
+                "the thread returned from its outermost frame; the original's error handling \
+                 (the object's virtual function 4) is not ported",
+            )),
+            Ok(Status::Running) => Some(fail(
+                0x44d,
+                "the thread ran past the instruction limit of one tick; the original's error \
+                 handling (the object's virtual function 4) is not ported",
+            )),
+            Err(fault) => Some(fault),
         };
         if let Some(fault) = error {
             let Some(slot) = catch else {
@@ -956,17 +907,7 @@ impl Interpreter<'_> {
     ) -> Result<bool, Fault> {
         let mut inline_err = None;
         if self.taken_off.is_some() {
-            return self.person_tick_with_player(
-                world,
-                id,
-                tick,
-                tuning,
-                None,
-                None,
-                None,
-                0,
-                &mut inline_err,
-            );
+            return self.person_tick_with_player(world, id, tick, tuning, None, &mut inline_err);
         }
         // Outside the scheduler's pass, the tick has a pass of its own for
         // the refreshes of anyone it queues for removal (thread or
@@ -978,17 +919,7 @@ impl Interpreter<'_> {
             taken_off: Some(&taken_off),
             ..*self
         }
-        .person_tick_with_player(
-            world,
-            id,
-            tick,
-            tuning,
-            None,
-            None,
-            None,
-            0,
-            &mut inline_err,
-        )?;
+        .person_tick_with_player(world, id, tick, tuning, None, &mut inline_err)?;
         if let Some(other) = taken_off.into_inner().into_keys().next() {
             return Err(Fault {
                 object: id,
@@ -1005,7 +936,6 @@ impl Interpreter<'_> {
 
     /// A person's tick, catching a fault in its thread's run as
     /// [`Interpreter::object_tick_with_player`] does.
-    #[allow(clippy::too_many_arguments)]
     fn person_tick_with_player(
         &self,
         world: &mut World,
@@ -1013,9 +943,6 @@ impl Interpreter<'_> {
         tick: i32,
         tuning: &Tuning,
         catch: Option<&mut Option<Fault>>,
-        player: Option<&mut dyn Player>,
-        update: Option<&mut Update>,
-        inline_tick: u32,
         inline_err: &mut Option<TickError>,
     ) -> Result<bool, Fault> {
         let fail = |trap| Fault {
@@ -1052,15 +979,7 @@ impl Interpreter<'_> {
             refreshing: Some(&refreshing),
             ..*self
         }
-        .object_tick_with_player(
-            world,
-            id,
-            catch,
-            player,
-            update,
-            inline_tick,
-            inline_err,
-        )?;
+        .object_tick_with_player(world, id, catch, inline_err)?;
         if inline_err.is_some() {
             return Ok(true);
         }
@@ -1338,6 +1257,54 @@ impl Interpreter<'_> {
             }
             let record = &mut records[index];
             record.status = SHOWN;
+            let kind = record.operands[5] & 0x7f;
+            if dialog::informs(&record.operands) && matches!(kind, 5 | 7 | 8 | 11 | 13) {
+                // `0x4443ab` constructed a dedicated neighborhood-picker dialog
+                // for an `informs` Dialog call. Show it through `special_panel`
+                // and mark it `DONE` immediately (no registry result slot).
+                if !dialog::modal(&record.operands) {
+                    return Err(TickError::Unsupported(format!(
+                        "object {} shows a dialog that does not stop the game; answering one \
+                         while the game runs is not ported (0x436da0)",
+                        record.caller
+                    )));
+                }
+                let req = match kind {
+                    5 => SpecialPanelRequest::DowntownLotPicker,
+                    7 => {
+                        let current_lot = world.globals.get(LOT).copied().unwrap_or(0);
+                        let on_residential =
+                            current_lot == 0 || self.program.zoning.get(&current_lot) == Some(&1);
+                        SpecialPanelRequest::VacationLotPicker { on_residential }
+                    }
+                    8 => SpecialPanelRequest::OldTownLotPicker {
+                        unleashed: self.program.expansions & 0x20 != 0,
+                    },
+                    11 => SpecialPanelRequest::StudioTownLotPicker { star_limo: false },
+                    13 => SpecialPanelRequest::MagicTownLotPicker {
+                        via_blimp: world.globals.get(34).copied().unwrap_or(0) != 0,
+                    },
+                    _ => unreachable!(),
+                };
+                let shown = ShownSpecialPanel {
+                    tick: world.ticks,
+                    request: req.clone(),
+                };
+                self.refresh_family_panel(world);
+                match player.special_panel(&shown) {
+                    Some(resp) if req.accepts(&resp) => {
+                        world.dialogs.records[index].status = DONE;
+                        update.special_panels_answered.push((req, resp));
+                        continue;
+                    }
+                    other => {
+                        return Err(TickError::UnansweredSpecialPanel {
+                            shown,
+                            given: other,
+                        });
+                    }
+                }
+            }
             let answers = dialog::answers(record.operands[5]).ok_or_else(|| {
                 TickError::Unsupported(format!(
                     "object {}'s dialog is of a kind that is not ported (0x436da0)",
@@ -1601,6 +1568,12 @@ impl Interpreter<'_> {
             }
         } else if let Some(pet) = snapshot.pet_target {
             // Kind 9: Pet Adoption / Buy Pet picker (`0x441b8b..0x441df2`).
+            // `0x441bb2..0x441bd7`: saves current speed (`0x46d78b`), sets speed
+            // to `760` (`0x4425a2` -> `0x46d697`), then `0x441de8` restores the
+            // saved speed through `0x46d697` (updating `return_speed` if idle
+            // speed was active).
+            let saved_speed = i32::from(world.speed());
+            world.set_speed(760);
             let req = SpecialPanelRequest::PetPicker { pet };
             // `0x441d52`: clears reg+0xf6 before opening the modal.
             panels.borrow_mut().wardrobe_index = 0;
@@ -1613,6 +1586,7 @@ impl Interpreter<'_> {
                     SPECIAL_PANEL_CANCELLED
                 };
             }
+            world.set_speed(saved_speed);
         } else if snapshot.vacation_lot < 0 {
             // Kind 7: Vacation Island lot picker (`0x441df2..0x441f6d`).
             let current_lot = world.globals.get(LOT).copied().unwrap_or(0);

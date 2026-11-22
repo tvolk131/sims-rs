@@ -1582,9 +1582,9 @@ pub fn depart_to_destination(
     if home_lot.halted {
         return Err(TravelError::Lot("home lot is halted".into()));
     }
-    if home_lot.asking.is_some() {
+    if home_lot.asking.is_some() || home_lot.asking_special_panel.is_some() || home_lot.answered {
         return Err(TravelError::Lot(
-            "home lot is waiting on an unanswered modal dialog".into(),
+            "home lot is waiting on an unanswered modal dialog or special panel".into(),
         ));
     }
     let Some(origin) = home_lot.neighborhood_origin.clone() else {
@@ -2722,9 +2722,12 @@ pub fn return_from_destination(
     if destination_lot.halted {
         return Err(TravelError::Lot("destination lot is halted".into()));
     }
-    if destination_lot.asking.is_some() {
+    if destination_lot.asking.is_some()
+        || destination_lot.asking_special_panel.is_some()
+        || destination_lot.answered
+    {
         return Err(TravelError::Lot(
-            "destination lot is waiting on an unanswered modal dialog".into(),
+            "destination lot is waiting on an unanswered modal dialog or special panel".into(),
         ));
     }
     if session.store_id != store.store_id() {
