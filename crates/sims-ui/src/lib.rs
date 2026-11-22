@@ -20,6 +20,7 @@
 
 pub mod art;
 pub mod balloon;
+pub mod build;
 pub mod buy;
 pub mod command;
 pub mod dialog;

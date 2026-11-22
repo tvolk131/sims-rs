@@ -335,12 +335,27 @@ pub struct Lot {
     /// native single-cursor ownership and preventing retired/cross-lot
     /// [`BuyCursor`] handles from touching objects owned by this lot.
     pub(crate) active_buy_cursor: Option<ActiveBuyCursor>,
+    /// Committed Build Mode operations available for Undo.
+    pub(crate) build_undo: Vec<crate::BuildHistory>,
+    /// Undone Build Mode operations available for Redo.
+    pub(crate) build_redo: Vec<crate::BuildHistory>,
+    /// Chronological order of Buy vs Build entries on the Undo/Redo stacks.
+    pub(crate) undo_order: Vec<HistoryKind>,
+    pub(crate) redo_order: Vec<HistoryKind>,
+    /// The single live Build Mode `"Wall Cursor"` (`0x00000439`) owned by this lot.
+    pub(crate) active_wall_cursor: Option<crate::WallCursor>,
     /// When opened via [`crate::lifecycle::enter_lot`], records the store,
     /// neighborhood ID, neighborhood instance identity, and revision this lot
     /// was loaded from so Save & Leave rejects cross-store saves,
     /// cross-neighborhood saves, re-imported same-ID overwrites, and
     /// stale-revision overwrites. Cleared by [`Lot::restore`].
     pub(crate) neighborhood_origin: Option<NeighborhoodOrigin>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HistoryKind {
+    Buy,
+    Build,
 }
 
 /// Store-backed origin of a live [`Lot`] opened via [`crate::lifecycle::enter_lot`].
@@ -1171,6 +1186,11 @@ impl Lot {
             buy_redo: Vec::new(),
             buy_orphans: Vec::new(),
             active_buy_cursor: None,
+            build_undo: Vec::new(),
+            build_redo: Vec::new(),
+            undo_order: Vec::new(),
+            redo_order: Vec::new(),
+            active_wall_cursor: None,
             neighborhood_origin: None,
         })
     }
@@ -1743,6 +1763,13 @@ impl Lot {
             interpreter
                 .buy_purge_detached(&mut world, &self.buy_orphans, &keep)
                 .map_err(OrderError::Refused)?;
+            let mut build_detached = Vec::new();
+            for entry in self.build_undo.iter().chain(self.build_redo.iter()) {
+                build_detached.extend_from_slice(entry.detached_objects());
+            }
+            interpreter
+                .buy_purge_detached(&mut world, &build_detached, &keep)
+                .map_err(OrderError::Refused)?;
         }
         if let Some(cur) = release_cursor.as_ref() {
             let live = self.strip_detached_origin_children(cur);
@@ -1760,6 +1787,13 @@ impl Lot {
                 interpreter
                     .buy_purge_detached(&mut world, &self.buy_orphans, &empty)
                     .map_err(OrderError::Refused)?;
+                let mut build_detached = Vec::new();
+                for entry in self.build_undo.iter().chain(self.build_redo.iter()) {
+                    build_detached.extend_from_slice(entry.detached_objects());
+                }
+                interpreter
+                    .buy_purge_detached(&mut world, &build_detached, &empty)
+                    .map_err(OrderError::Refused)?;
             }
             self.active_buy_cursor = None;
         } else {
@@ -1768,11 +1802,21 @@ impl Lot {
                 self.active_buy_cursor = None;
             }
         }
+        if clearing && let Some(wall_cur) = self.active_wall_cursor.as_ref() {
+            interpreter
+                .build_cursor_close(&mut world, wall_cur)
+                .map_err(OrderError::Refused)?;
+        }
         self.world = world;
         if clearing {
             self.buy_undo.clear();
             self.buy_redo.clear();
             self.buy_orphans.clear();
+            self.build_undo.clear();
+            self.build_redo.clear();
+            self.undo_order.clear();
+            self.redo_order.clear();
+            self.active_wall_cursor = None;
         }
         Ok(())
     }
@@ -2049,9 +2093,19 @@ impl Lot {
             interpreter
                 .buy_purge_detached(&mut world, &self.buy_redo, &keep)
                 .map_err(OrderError::Refused)?;
+            let mut build_redo_detached = Vec::new();
+            for entry in &self.build_redo {
+                build_redo_detached.extend_from_slice(entry.detached_objects());
+            }
+            interpreter
+                .buy_purge_detached(&mut world, &build_redo_detached, &keep)
+                .map_err(OrderError::Refused)?;
             self.world = world;
             self.buy_undo.push(sell_record);
             self.buy_redo.clear();
+            self.build_redo.clear();
+            self.undo_order.push(HistoryKind::Buy);
+            self.redo_order.clear();
         } else {
             self.world = world;
         }
@@ -2268,10 +2322,20 @@ impl Lot {
         interpreter
             .buy_purge_detached(&mut world, &self.buy_redo, &keep)
             .map_err(OrderError::Refused)?;
+        let mut build_redo_detached = Vec::new();
+        for entry in &self.build_redo {
+            build_redo_detached.extend_from_slice(entry.detached_objects());
+        }
+        interpreter
+            .buy_purge_detached(&mut world, &build_redo_detached, &keep)
+            .map_err(OrderError::Refused)?;
         let id = purchase.object;
         self.world = world;
         self.buy_undo.push(purchase);
         self.buy_redo.clear();
+        self.build_redo.clear();
+        self.undo_order.push(HistoryKind::Buy);
+        self.redo_order.clear();
         self.active_buy_cursor = None;
         Ok(id)
     }
@@ -2356,6 +2420,10 @@ impl Lot {
                 let clear = snapped_existing
                     || self.reconcile_active_buy_cursor(&interpreter, &mut world, Some(&affected));
                 self.buy_redo.push(purchase);
+                if let Some(pos) = self.undo_order.iter().rposition(|&k| k == HistoryKind::Buy) {
+                    self.undo_order.remove(pos);
+                }
+                self.redo_order.push(HistoryKind::Buy);
                 if clear {
                     self.active_buy_cursor = None;
                 }
@@ -2369,8 +2437,12 @@ impl Lot {
                 }
                 let mut dropped = std::mem::take(&mut self.buy_undo);
                 dropped.push(purchase);
+                self.undo_order.retain(|&k| k != HistoryKind::Buy);
                 let mut keep = BTreeSet::new();
                 crate::buy::collect_buy_ids(&self.buy_redo, &mut keep);
+                for entry in self.build_undo.iter().chain(self.build_redo.iter()) {
+                    crate::buy::collect_buy_ids(entry.detached_objects(), &mut keep);
+                }
                 self.purge_buy_history(&dropped, &keep);
                 self.sync_active_buy_cursor();
                 Ok(false)
@@ -2382,8 +2454,12 @@ impl Lot {
                 }
                 let mut dropped = std::mem::take(&mut self.buy_undo);
                 dropped.push(purchase);
+                self.undo_order.retain(|&k| k != HistoryKind::Buy);
                 let mut keep = BTreeSet::new();
                 crate::buy::collect_buy_ids(&self.buy_redo, &mut keep);
+                for entry in self.build_undo.iter().chain(self.build_redo.iter()) {
+                    crate::buy::collect_buy_ids(entry.detached_objects(), &mut keep);
+                }
                 self.purge_buy_history(&dropped, &keep);
                 self.sync_active_buy_cursor();
                 Err(OrderError::Refused(fault))
@@ -2431,6 +2507,10 @@ impl Lot {
                 let clear = snapped_existing
                     || self.reconcile_active_buy_cursor(&interpreter, &mut world, Some(&affected));
                 self.buy_undo.push(purchase);
+                if let Some(pos) = self.redo_order.iter().rposition(|&k| k == HistoryKind::Buy) {
+                    self.redo_order.remove(pos);
+                }
+                self.undo_order.push(HistoryKind::Buy);
                 if clear {
                     self.active_buy_cursor = None;
                 }
@@ -2462,6 +2542,10 @@ impl Lot {
                     self.buy_undo.push(purchase);
                     self.sync_active_buy_cursor();
                 }
+                if let Some(pos) = self.redo_order.iter().rposition(|&k| k == HistoryKind::Buy) {
+                    self.redo_order.remove(pos);
+                }
+                self.undo_order.push(HistoryKind::Buy);
                 Ok(false)
             }
             Err(fault) => {
@@ -2471,8 +2555,12 @@ impl Lot {
                 }
                 let mut dropped = std::mem::take(&mut self.buy_redo);
                 dropped.push(purchase);
+                self.redo_order.retain(|&k| k != HistoryKind::Buy);
                 let mut keep = BTreeSet::new();
                 crate::buy::collect_buy_ids(&self.buy_undo, &mut keep);
+                for entry in self.build_undo.iter().chain(self.build_redo.iter()) {
+                    crate::buy::collect_buy_ids(entry.detached_objects(), &mut keep);
+                }
                 self.purge_buy_history(&dropped, &keep);
                 self.sync_active_buy_cursor();
                 Err(OrderError::Refused(fault))
@@ -2509,10 +2597,19 @@ impl Lot {
             interpreter
                 .buy_purge_detached(&mut world, &self.buy_redo, &keep)
                 .map_err(OrderError::Refused)?;
+            let mut build_redo_detached = Vec::new();
+            for entry in &self.build_redo {
+                build_redo_detached.extend_from_slice(entry.detached_objects());
+            }
+            interpreter
+                .buy_purge_detached(&mut world, &build_redo_detached, &keep)
+                .map_err(OrderError::Refused)?;
         }
         self.world = world;
         if cursor.is_existing() {
             self.buy_redo.clear();
+            self.build_redo.clear();
+            self.redo_order.clear();
         }
         self.active_buy_cursor = None;
         Ok(())
@@ -2542,6 +2639,452 @@ impl Lot {
         self.world = world;
         self.active_buy_cursor = None;
         Ok(())
+    }
+
+    /// Whether the Build Mode `"Wall Cursor"` handle `cursor` is currently live
+    /// on this lot (matching both its monotonic token and its registered object ID).
+    fn is_active_wall_cursor(&self, cursor: &crate::WallCursor) -> bool {
+        cursor.token != 0
+            && self
+                .active_wall_cursor
+                .as_ref()
+                .is_some_and(|a| a.token == cursor.token && a.id == cursor.id)
+    }
+
+    /// Opens the Build Mode `"Wall Cursor"` (`0x00000439`, off-lot) with
+    /// `data[0] = mode` (`0` = wall build, `1` = wall demolish, `2` = wallpaper,
+    /// `3` = wall room-box), closing any previously active wall cursor first
+    /// (`0x48b68b`, `0x48a66a`).
+    pub fn build_cursor_open(&mut self, mode: i16) -> Result<crate::WallCursor, OrderError> {
+        self.ready()?;
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        if let Some(old) = self.active_wall_cursor.as_ref() {
+            interpreter
+                .build_cursor_close(&mut world, old)
+                .map_err(OrderError::Refused)?;
+        }
+        let mut cursor = interpreter
+            .build_cursor_open(&mut world, mode)
+            .map_err(OrderError::Refused)?;
+        cursor.token = alloc_buy_cursor_token();
+        self.world = world;
+        self.active_wall_cursor = Some(cursor.clone());
+        Ok(cursor)
+    }
+
+    /// Moves/updates the active Build Mode `"Wall Cursor"` on the lot
+    /// (`0x48b797`, `0x48a7e9`).
+    pub fn build_cursor_move(
+        &mut self,
+        cursor: &mut crate::WallCursor,
+        fine: [i32; 3],
+        facing: Option<i16>,
+        mode: Option<i16>,
+    ) -> Result<(), OrderError> {
+        self.ready()?;
+        if !self.is_active_wall_cursor(cursor) {
+            return Ok(());
+        }
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let mut next = cursor.clone();
+        interpreter
+            .build_cursor_move(&mut world, &mut next, fine, facing, mode)
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        self.active_wall_cursor = Some(next.clone());
+        *cursor = next;
+        Ok(())
+    }
+
+    /// Hides the active Build Mode `"Wall Cursor"` off-lot (`0x48b781`,
+    /// `0x48a8ae`).
+    pub fn build_cursor_hide(&mut self, cursor: &mut crate::WallCursor) -> Result<(), OrderError> {
+        self.ready()?;
+        if !self.is_active_wall_cursor(cursor) {
+            return Ok(());
+        }
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let mut next = cursor.clone();
+        interpreter
+            .build_cursor_hide(&mut world, &mut next)
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        self.active_wall_cursor = Some(next.clone());
+        *cursor = next;
+        Ok(())
+    }
+
+    /// Closes and deletes the active Build Mode `"Wall Cursor"` (`0x48a6e5`).
+    pub fn build_cursor_close(&mut self, cursor: &crate::WallCursor) -> Result<(), OrderError> {
+        self.ready()?;
+        if !self.is_active_wall_cursor(cursor) {
+            return Ok(());
+        }
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        interpreter
+            .build_cursor_close(&mut world, cursor)
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        self.active_wall_cursor = None;
+        Ok(())
+    }
+
+    /// Closes any active Build Mode `"Wall Cursor"` owned by this lot.
+    pub fn build_cursor_close_active(&mut self) -> Result<(), OrderError> {
+        if let Some(cur) = self.active_wall_cursor.clone() {
+            self.build_cursor_close(&cur)?;
+        }
+        Ok(())
+    }
+
+    /// Commits a planned wall build or demolition to `self.world`, updating
+    /// rooms, Architecture funds, and the unified Undo/Redo stack. Refuses
+    /// while any Buy Mode cursor is active so a held/hidden existing object
+    /// cannot lose its snapback wall and an unpaid preview cannot be sold.
+    pub fn build_commit_wall(&mut self, plan: &crate::WallPlan) -> Result<bool, OrderError> {
+        self.ready()?;
+        if self.active_buy_cursor.is_some() {
+            return Ok(false);
+        }
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let Some(entry) = interpreter
+            .build_commit_wall(&mut world, plan)
+            .map_err(OrderError::Refused)?
+        else {
+            return Ok(false);
+        };
+        let mut keep = BTreeSet::new();
+        crate::buy::collect_buy_ids(&self.buy_undo, &mut keep);
+        for e in &self.build_undo {
+            crate::buy::collect_buy_ids(e.detached_objects(), &mut keep);
+        }
+        crate::buy::collect_buy_ids(entry.detached_objects(), &mut keep);
+        let mut build_redo_detached = Vec::new();
+        for e in &self.build_redo {
+            build_redo_detached.extend_from_slice(e.detached_objects());
+        }
+        interpreter
+            .buy_purge_detached(&mut world, &self.buy_redo, &keep)
+            .map_err(OrderError::Refused)?;
+        interpreter
+            .buy_purge_detached(&mut world, &build_redo_detached, &keep)
+            .map_err(OrderError::Refused)?;
+        let mut affected = BTreeSet::new();
+        crate::buy::collect_buy_ids(entry.detached_objects(), &mut affected);
+        let clear = self.reconcile_active_buy_cursor(&interpreter, &mut world, Some(&affected));
+        if clear {
+            self.active_buy_cursor = None;
+        }
+        self.world = world;
+        self.build_undo.push(entry);
+        self.build_redo.clear();
+        self.buy_redo.clear();
+        self.undo_order.push(HistoryKind::Build);
+        self.redo_order.clear();
+        Ok(true)
+    }
+
+    /// Commits a planned floor edit to `self.world`, updating Architecture
+    /// funds and the unified Undo/Redo stack.
+    pub fn build_commit_floor(&mut self, plan: &crate::FloorPlan) -> Result<bool, OrderError> {
+        self.ready()?;
+        if self.active_buy_cursor.is_some() {
+            return Ok(false);
+        }
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let Some(entry) = interpreter
+            .build_commit_floor(&mut world, plan)
+            .map_err(OrderError::Refused)?
+        else {
+            return Ok(false);
+        };
+        let mut keep = BTreeSet::new();
+        crate::buy::collect_buy_ids(&self.buy_undo, &mut keep);
+        for e in &self.build_undo {
+            crate::buy::collect_buy_ids(e.detached_objects(), &mut keep);
+        }
+        let mut build_redo_detached = Vec::new();
+        for e in &self.build_redo {
+            build_redo_detached.extend_from_slice(e.detached_objects());
+        }
+        interpreter
+            .buy_purge_detached(&mut world, &self.buy_redo, &keep)
+            .map_err(OrderError::Refused)?;
+        interpreter
+            .buy_purge_detached(&mut world, &build_redo_detached, &keep)
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        self.build_undo.push(entry);
+        self.build_redo.clear();
+        self.buy_redo.clear();
+        self.undo_order.push(HistoryKind::Build);
+        self.redo_order.clear();
+        Ok(true)
+    }
+
+    /// Commits a planned wallpaper edit to `self.world`, updating Architecture
+    /// funds and the unified Undo/Redo stack.
+    pub fn build_commit_wallpaper(
+        &mut self,
+        plan: &crate::WallpaperPlan,
+    ) -> Result<bool, OrderError> {
+        self.ready()?;
+        if self.active_buy_cursor.is_some() {
+            return Ok(false);
+        }
+        let sounds = RefCell::new(Vec::new());
+        let interpreter = Interpreter {
+            sounds: Some(&sounds),
+            view_rotation: self.view_rotation,
+            view_centre: self.view_centre,
+            ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+        };
+        let mut world = self.world.clone();
+        let Some(entry) = interpreter
+            .build_commit_wallpaper(&mut world, plan)
+            .map_err(OrderError::Refused)?
+        else {
+            return Ok(false);
+        };
+        let mut keep = BTreeSet::new();
+        crate::buy::collect_buy_ids(&self.buy_undo, &mut keep);
+        for e in &self.build_undo {
+            crate::buy::collect_buy_ids(e.detached_objects(), &mut keep);
+        }
+        let mut build_redo_detached = Vec::new();
+        for e in &self.build_redo {
+            build_redo_detached.extend_from_slice(e.detached_objects());
+        }
+        interpreter
+            .buy_purge_detached(&mut world, &self.buy_redo, &keep)
+            .map_err(OrderError::Refused)?;
+        interpreter
+            .buy_purge_detached(&mut world, &build_redo_detached, &keep)
+            .map_err(OrderError::Refused)?;
+        self.world = world;
+        self.build_undo.push(entry);
+        self.build_redo.clear();
+        self.buy_redo.clear();
+        self.undo_order.push(HistoryKind::Build);
+        self.redo_order.clear();
+        Ok(true)
+    }
+
+    /// Whether there is any committed Buy or Build Mode action available to undo.
+    pub fn can_undo(&self) -> bool {
+        !self.undo_order.is_empty() || !self.buy_undo.is_empty() || !self.build_undo.is_empty()
+    }
+
+    /// Whether there is any undone Buy or Build Mode action available to redo.
+    pub fn can_redo(&self) -> bool {
+        !self.redo_order.is_empty() || !self.buy_redo.is_empty() || !self.build_redo.is_empty()
+    }
+
+    /// Undoes the most recent Buy or Build Mode action in chronological order.
+    pub fn undo(&mut self) -> Result<bool, OrderError> {
+        self.ready()?;
+        let kind = match self.undo_order.last().copied() {
+            Some(k) => k,
+            None if !self.buy_undo.is_empty() => HistoryKind::Buy,
+            None if !self.build_undo.is_empty() => HistoryKind::Build,
+            None => return Ok(false),
+        };
+        match kind {
+            HistoryKind::Buy => self.buy_undo(),
+            HistoryKind::Build => {
+                if self.build_undo.is_empty() {
+                    self.undo_order.pop();
+                    return Ok(false);
+                }
+                let sounds = RefCell::new(Vec::new());
+                let interpreter = Interpreter {
+                    sounds: Some(&sounds),
+                    view_rotation: self.view_rotation,
+                    view_centre: self.view_centre,
+                    ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+                };
+                let mut world = self.world.clone();
+                let after_snap =
+                    if let Some(active) = self.active_buy_cursor.as_ref().filter(|a| a.existing) {
+                        let live = self.strip_detached_origin_children(&active.cursor);
+                        interpreter
+                            .buy_cancel(&mut world, &live)
+                            .map_err(OrderError::Refused)?;
+                        Some(world.clone())
+                    } else {
+                        None
+                    };
+                let snapped_existing = after_snap.is_some();
+                let mut entry = self.build_undo.pop().expect("checked non-empty");
+                match interpreter.build_undo_entry(&mut world, &mut entry) {
+                    Ok(true) => {
+                        let mut affected = BTreeSet::new();
+                        crate::buy::collect_buy_ids(entry.detached_objects(), &mut affected);
+                        let clear = snapped_existing
+                            || self.reconcile_active_buy_cursor(
+                                &interpreter,
+                                &mut world,
+                                Some(&affected),
+                            );
+                        if clear {
+                            self.active_buy_cursor = None;
+                        }
+                        self.world = world;
+                        self.build_redo.push(entry);
+                        if let Some(pos) = self
+                            .undo_order
+                            .iter()
+                            .rposition(|&k| k == HistoryKind::Build)
+                        {
+                            self.undo_order.remove(pos);
+                        }
+                        self.redo_order.push(HistoryKind::Build);
+                        Ok(true)
+                    }
+                    Ok(false) => {
+                        if let Some(snapped) = after_snap {
+                            self.world = snapped;
+                            self.active_buy_cursor = None;
+                        }
+                        self.build_undo.push(entry);
+                        Ok(false)
+                    }
+                    Err(fault) => {
+                        if let Some(snapped) = after_snap {
+                            self.world = snapped;
+                            self.active_buy_cursor = None;
+                        }
+                        self.build_undo.push(entry);
+                        Err(OrderError::Refused(fault))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Redoes the most recently undone Buy or Build Mode action in chronological
+    /// order.
+    pub fn redo(&mut self) -> Result<bool, OrderError> {
+        self.ready()?;
+        let kind = match self.redo_order.last().copied() {
+            Some(k) => k,
+            None if !self.buy_redo.is_empty() => HistoryKind::Buy,
+            None if !self.build_redo.is_empty() => HistoryKind::Build,
+            None => return Ok(false),
+        };
+        match kind {
+            HistoryKind::Buy => self.buy_redo(),
+            HistoryKind::Build => {
+                if self.build_redo.is_empty() {
+                    self.redo_order.pop();
+                    return Ok(false);
+                }
+                let sounds = RefCell::new(Vec::new());
+                let interpreter = Interpreter {
+                    sounds: Some(&sounds),
+                    view_rotation: self.view_rotation,
+                    view_centre: self.view_centre,
+                    ..Interpreter::new(&self.program, &self.catalog, Stream::Global)
+                };
+                let mut world = self.world.clone();
+                let after_snap =
+                    if let Some(active) = self.active_buy_cursor.as_ref().filter(|a| a.existing) {
+                        let live = self.strip_detached_origin_children(&active.cursor);
+                        interpreter
+                            .buy_cancel(&mut world, &live)
+                            .map_err(OrderError::Refused)?;
+                        Some(world.clone())
+                    } else {
+                        None
+                    };
+                let snapped_existing = after_snap.is_some();
+                let mut entry = self.build_redo.pop().expect("checked non-empty");
+                match interpreter.build_redo_entry(&mut world, &mut entry) {
+                    Ok(true) => {
+                        let mut affected = BTreeSet::new();
+                        crate::buy::collect_buy_ids(entry.detached_objects(), &mut affected);
+                        let clear = snapped_existing
+                            || self.reconcile_active_buy_cursor(
+                                &interpreter,
+                                &mut world,
+                                Some(&affected),
+                            );
+                        if clear {
+                            self.active_buy_cursor = None;
+                        }
+                        self.world = world;
+                        self.build_undo.push(entry);
+                        if let Some(pos) = self
+                            .redo_order
+                            .iter()
+                            .rposition(|&k| k == HistoryKind::Build)
+                        {
+                            self.redo_order.remove(pos);
+                        }
+                        self.undo_order.push(HistoryKind::Build);
+                        Ok(true)
+                    }
+                    Ok(false) => {
+                        if let Some(snapped) = after_snap {
+                            self.world = snapped;
+                            self.active_buy_cursor = None;
+                        }
+                        self.build_redo.push(entry);
+                        Ok(false)
+                    }
+                    Err(fault) => {
+                        if let Some(snapped) = after_snap {
+                            self.world = snapped;
+                            self.active_buy_cursor = None;
+                        }
+                        self.build_redo.push(entry);
+                        Err(OrderError::Refused(fault))
+                    }
+                }
+            }
+        }
     }
 
     /// Replace the pending answers with an explicit replay, one entry
@@ -2860,6 +3403,11 @@ mod tests {
             buy_redo: Vec::new(),
             buy_orphans: Vec::new(),
             active_buy_cursor: None,
+            build_undo: Vec::new(),
+            build_redo: Vec::new(),
+            undo_order: Vec::new(),
+            redo_order: Vec::new(),
+            active_wall_cursor: None,
             neighborhood_origin: None,
         }
     }

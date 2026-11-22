@@ -34,7 +34,7 @@ pub use index::{Index, Member, Resource, far_members};
 pub use install::{Expansions, Install, Layout, Mount};
 pub use neighborhood::{House, Neighborhood, PENDING_IMPORT};
 pub use people::{AvatarRegistry, Bone, People, Profile, Skeleton, skeleton_name, skeleton_scales};
-pub use surfaces::{SurfaceCatalog, SurfaceFile, SurfaceKind, Surfaces, atoi};
+pub use surfaces::{SurfaceCatalog, SurfaceFile, SurfaceKind, SurfacePlugin, Surfaces, atoi};
 pub use wardrobe::Wardrobe;
 
 pub type Result<T> = std::result::Result<T, Error>;
