@@ -732,9 +732,9 @@ impl StarterHouseManifest {
                     )));
                 }
                 let direction = opt_i16(t, "direction")?.unwrap_or(0);
-                if !(0..8).contains(&direction) {
+                if !matches!(direction, 0 | 2 | 4 | 6) {
                     return Err(Error::new(format!(
-                        "[[placement]] for '{object_slug}' direction {direction} must be in 0..=7"
+                        "[[placement]] for '{object_slug}' direction {direction} must be an even cardinal facing (0, 2, 4, or 6)"
                     )));
                 }
                 placements.push(StarterPlacementSpec {
@@ -1011,7 +1011,7 @@ pub fn build_starter_house_iff(
                 2 => (dy.wrapping_neg(), dx),
                 4 => (dx.wrapping_neg(), dy.wrapping_neg()),
                 6 => (dy, dx.wrapping_neg()),
-                _ => (dx, dy),
+                _ => (0, 0),
             };
             let tile_x = pl.x + rx;
             let tile_y = pl.y + ry;
@@ -1102,8 +1102,10 @@ pub fn build_starter_house_iff(
     objt.extend_from_slice(b"tjbo");
     for (guid, type_id, kind, name) in &type_entries {
         objt.extend_from_slice(&guid.to_le_bytes());
-        objt.extend_from_slice(&0u32.to_le_bytes()); // init_signature
-        objt.extend_from_slice(&0u32.to_le_bytes()); // main_signature
+        // Sentinel non-zero signatures (clean-room BHAVs default to revision 0 -> signature 0)
+        // so initial lot load triggers `visit_objects` reset/Init and boots saved Sims onto Main.
+        objt.extend_from_slice(&1u32.to_le_bytes()); // init_signature
+        objt.extend_from_slice(&1u32.to_le_bytes()); // main_signature
         objt.extend_from_slice(&type_id.to_le_bytes());
         objt.extend_from_slice(&kind.to_le_bytes());
         write_padded_cstr(&mut objt, name)?;

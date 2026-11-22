@@ -14,7 +14,7 @@ use sims_antics::{
     EquivOptions, EquivResult, StructuredLiftOutcome, check_bhav_equivalent_with_arities,
     compile_antics, lift::lift_bhav, lift_bhav_structured,
 };
-use sims_content::{ArchivePool, Index, Install};
+use sims_content::{ArchivePool, Catalog, Index, Install};
 use sims_formats::behavior::Behavior;
 use sims_formats::iff::{DELETED, Iff};
 use std::collections::BTreeMap;
@@ -26,6 +26,19 @@ fn bhav_arity(b: &Behavior) -> usize {
         0x8001 => usize::from(b.args).min(4),
         _ => usize::from(b.args),
     }
+}
+
+fn collect_iff_arities_in_range(iff: &Iff, lo: u16, hi: u16) -> BTreeMap<u16, usize> {
+    let mut out = BTreeMap::new();
+    for chunk in &iff.chunks {
+        if chunk.flags & DELETED != 0 || &chunk.tag != b"BHAV" || chunk.id < lo || chunk.id > hi {
+            continue;
+        }
+        if let Ok(bhav) = Behavior::parse(iff.data(chunk)) {
+            out.insert(chunk.id, bhav_arity(&bhav));
+        }
+    }
+    out
 }
 
 #[test]
@@ -43,34 +56,16 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
         .expect("SIMS_INSTALL did not resolve to a valid Sims installation");
     let index = Index::build(&install).expect("failed to index SIMS_INSTALL");
     let pool = ArchivePool::new();
+    let catalog = Catalog::build_with_pool(&index, &pool).expect("failed to build catalog");
 
-    // Pre-pass (strictly in memory): collect global (256..4096) BHAV arities across the
-    // install so inline subroutine calls (`opcode >= 256`) are verified against real arities.
-    let mut shared_arities: BTreeMap<u16, usize> = BTreeMap::new();
-    for resource in &index.resources {
-        let name = resource.name();
-        if name.len() < 4 || !name[name.len() - 4..].eq_ignore_ascii_case(".iff") {
-            continue;
-        }
-        let Ok(bytes) = resource.read_with(&pool) else {
-            continue;
-        };
-        let Ok(iff) = Iff::parse(bytes) else {
-            continue;
-        };
-        for chunk in &iff.chunks {
-            if chunk.flags & DELETED != 0 || &chunk.tag != b"BHAV" || chunk.id >= 4096 {
-                continue;
-            }
-            if let Ok(bhav) = Behavior::parse(iff.data(chunk)) {
-                let arity = bhav_arity(&bhav);
-                shared_arities
-                    .entry(chunk.id)
-                    .and_modify(|prev| *prev = (*prev).max(arity))
-                    .or_insert(arity);
-            }
-        }
-    }
+    // Pre-pass (strictly in memory): load global BHAV arities (256..=4095) exclusively from
+    // `Global.iff`, matching `sims_vm::Interpreter::behavior_from_owner`.
+    let global_bytes = index.resources[catalog.global]
+        .read_with(&pool)
+        .expect("failed to read Global.iff");
+    let global_iff = Iff::parse(global_bytes).expect("failed to parse Global.iff");
+    let global_arities = collect_iff_arities_in_range(&global_iff, 256, 4095);
+    let mut semi_global_cache: BTreeMap<usize, BTreeMap<u16, usize>> = BTreeMap::new();
 
     let mut total_bhavs = 0usize;
     let mut lifted_high_level = 0usize;
@@ -86,7 +81,7 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
 
     let opts = EquivOptions::default();
 
-    for resource in &index.resources {
+    for (resource_index, resource) in index.resources.iter().enumerate() {
         let name = resource.name();
         if name.len() < 4 || !name[name.len() - 4..].eq_ignore_ascii_case(".iff") {
             continue;
@@ -98,14 +93,22 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
             continue;
         };
 
-        let mut iff_arities = shared_arities.clone();
-        for chunk in &iff.chunks {
-            if chunk.flags & DELETED != 0 || &chunk.tag != b"BHAV" {
-                continue;
-            }
-            if let Ok(bhav) = Behavior::parse(iff.data(chunk)) {
-                iff_arities.insert(chunk.id, bhav_arity(&bhav));
-            }
+        // Match `sims-vm` tree dispatch: 256..=4095 from `Global.iff`, 4096..=8191 from
+        // this IFF, and 8192..=65535 from this IFF's linked semi-global (or self if semi-global).
+        let mut iff_arities = global_arities.clone();
+        iff_arities.extend(collect_iff_arities_in_range(&iff, 4096, 8191));
+        if let Some(Some(semi_res)) = catalog.semi_globals.get(&resource_index).copied() {
+            let semi_map = semi_global_cache.entry(semi_res).or_insert_with(|| {
+                index.resources[semi_res]
+                    .read_with(&pool)
+                    .ok()
+                    .and_then(|b| Iff::parse(b).ok())
+                    .map(|semi_iff| collect_iff_arities_in_range(&semi_iff, 8192, u16::MAX))
+                    .unwrap_or_default()
+            });
+            iff_arities.extend(semi_map.iter().map(|(&id, &arity)| (id, arity)));
+        } else {
+            iff_arities.extend(collect_iff_arities_in_range(&iff, 8192, u16::MAX));
         }
 
         for chunk in &iff.chunks {
@@ -136,7 +139,7 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
                 StructuredLiftOutcome::Lifted(source_text) => {
                     assert!(
                         !source_text.contains("op 0x"),
-                        "structured lifter emitted raw op on resource_index={total_bhavs} BHAV #{}",
+                        "structured lifter emitted raw op on resource_index={resource_index} BHAV #{}",
                         chunk.id
                     );
                     lifted_high_level += 1;
@@ -146,8 +149,8 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
                             compile_failures += 1;
                             if first_compile_failure_meta.is_none() {
                                 first_compile_failure_meta = Some(format!(
-                                    "resource_index={} BHAV #{} (compile_failure)",
-                                    total_bhavs, chunk.id
+                                    "resource_index={resource_index} BHAV #{} (compile_failure)",
+                                    chunk.id
                                 ));
                             }
                             continue;
@@ -172,8 +175,7 @@ fn complete_collection_in_memory_structured_lift_and_equiv_proof() {
                                 let last_pcs =
                                     path.last().map(|s| (s.pc_a, s.pc_b)).unwrap_or((0, 0));
                                 first_counterexample_meta = Some(format!(
-                                    "resource_index={} BHAV #{} (steps={}, last_pc_a={}, last_pc_b={})",
-                                    total_bhavs,
+                                    "resource_index={resource_index} BHAV #{} (steps={}, last_pc_a={}, last_pc_b={})",
                                     chunk.id,
                                     path.len(),
                                     last_pcs.0,

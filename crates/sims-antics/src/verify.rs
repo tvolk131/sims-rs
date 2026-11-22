@@ -605,13 +605,55 @@ fn is_known_primitive(opcode: u16) -> bool {
 
 /// Returns true iff `scope` is a valid SimAntics memory scope implemented in `sims-vm/src/memory.rs`.
 fn is_valid_memory_scope(scope: u8) -> bool {
-    matches!(scope, 0..=4 | 6..=38)
+    matches!(scope, 0 | 1 | 3 | 4 | 6..=38)
 }
 
 /// Returns true iff `scope` is read-only in `sims-vm/src/memory.rs` (writes trap with 0x13).
 fn is_read_only_scope(scope: u8) -> bool {
     matches!(scope, 7 | 21 | 23 | 24 | 26 | 32 | 33 | 34 | 35 | 38)
 }
+
+/// Returns true iff `routine` is implemented in `sims-vm/src/primitives/generic.rs`.
+fn is_known_generic_call(routine: i16) -> bool {
+    matches!(
+        routine,
+        2 | 6 | 10 | 11 | 12 | 14 | 15 | 18 | 26 | 28 | 35 | 43
+    )
+}
+
+/// Legacy OBJD callback word indices matching `sims-vm/src/program.rs:213` (`DEFINITION_CALLBACKS`).
+const OBJD_CALLBACK_WORDS: [usize; 30] = [
+    0x56 / 2,
+    0x0a / 2,
+    0x5e / 2,
+    0x68 / 2,
+    0x78 / 2,
+    0x2a / 2,
+    0x7c / 2,
+    0x64 / 2,
+    0x9c / 2,
+    0x58 / 2,
+    0x94 / 2,
+    0x60 / 2,
+    0x5a / 2,
+    0x6a / 2,
+    0x6e / 2,
+    0x22 / 2,
+    0x0c / 2,
+    0x18 / 2,
+    0x30 / 2,
+    0x32 / 2,
+    0x34 / 2,
+    0x36 / 2,
+    0x38 / 2,
+    0x3a / 2,
+    0x3c / 2,
+    0x3e / 2,
+    0x40 / 2,
+    0x42 / 2,
+    0x76 / 2,
+    0xa0 / 2,
+];
 
 /// For private helper BHAVs that are NOT external entry points (OBJD/OBJf/TTAB) and are
 /// invoked exclusively via inline constant calls (`operands != [0xFF; 8]`), computes the
@@ -621,7 +663,7 @@ fn compute_private_helper_param_consts(
 ) -> BTreeMap<u16, [Option<BTreeSet<i16>>; 4]> {
     let mut entry_points = BTreeSet::new();
     for objd in model.objds.values() {
-        for idx in [5usize, 43] {
+        for &idx in &OBJD_CALLBACK_WORDS {
             let id = objd.words.get(idx).copied().unwrap_or(0);
             if id >= 4096 {
                 entry_points.insert(id);
@@ -652,6 +694,7 @@ fn compute_private_helper_param_consts(
     let mut result: BTreeMap<u16, [Option<BTreeSet<i16>>; 4]> = BTreeMap::new();
     let mut poisoned: BTreeSet<u16> = entry_points;
     let mut called: BTreeSet<u16> = BTreeSet::new();
+    let mut has_dynamic_tree_dispatch = false;
 
     for (_, bhav) in model.behaviors.values() {
         let reach = if bhav.kind == 4 {
@@ -660,7 +703,15 @@ fn compute_private_helper_param_consts(
             reachable_nodes(&bhav.instructions)
         };
         for (i, ins) in bhav.instructions.iter().enumerate() {
-            if !reach[i] || !(4096..=8191).contains(&ins.opcode) {
+            if !reach[i] {
+                continue;
+            }
+            // `RunFunctionalTree` (20) or `RunTreeByName` (28) can invoke private trees dynamically
+            // with caller temps (`named_tree.rs:100`), so no private helper has a closed inline caller set.
+            if matches!(ins.opcode, 20 | 28) {
+                has_dynamic_tree_dispatch = true;
+            }
+            if !(4096..=8191).contains(&ins.opcode) {
                 continue;
             }
             called.insert(ins.opcode);
@@ -682,6 +733,9 @@ fn compute_private_helper_param_consts(
         }
     }
 
+    if has_dynamic_tree_dispatch {
+        return BTreeMap::new();
+    }
     result.retain(|id, _| called.contains(id) && !poisoned.contains(id));
     result
 }
@@ -944,6 +998,17 @@ fn verify_bhav_static(
                 );
                 return;
             }
+            // In `sims-vm/src/memory.rs:669`, globals are read-only except global 34 and global 36
+            // (and global 3 in coop mode). Writing e.g. `global[0]` traps with 0x13.
+            if scope == 6 && is_write && !matches!(index, 34 | 36) {
+                add_err(
+                    violations,
+                    SafetyCategory::PotentialTrap,
+                    idx,
+                    format!("cannot write to read-only global[{index}]"),
+                );
+                return;
+            }
             match scope {
                 7 => {}
                 9 | 22 => {
@@ -1017,6 +1082,17 @@ fn verify_bhav_static(
                 0 => {
                     let p = word_i16(ops, 0);
                     check_operand(9, p, false, violations);
+                }
+                1 => {
+                    let routine = word_i16(ops, 0);
+                    if !is_known_generic_call(routine) {
+                        add_err(
+                            violations,
+                            SafetyCategory::PotentialTrap,
+                            idx,
+                            format!("unimplemented Generic Sims Call routine {routine}"),
+                        );
+                    }
                 }
                 2 => {
                     let lhs_idx = word_i16(ops, 0);
@@ -1134,25 +1210,28 @@ fn verify_bhav_static(
                         );
                     } else {
                         check_operand(rng_scope as u8, rng_idx, false, violations);
-                        let static_rng = match rng_scope as u8 {
-                            7 => Some(rng_idx),
-                            26 => lookup_bcon(model, rng_idx),
+                        let (ref cur_p, ref cur_l) = node_consts[idx];
+                        let static_rng_vals: Option<BTreeSet<i16>> = match rng_scope as u8 {
+                            7 => Some(BTreeSet::from([rng_idx])),
+                            9 => cur_p.get(&rng_idx).and_then(|v| v.clone()),
+                            25 => cur_l.get(&rng_idx).and_then(|v| v.clone()),
+                            26 => lookup_bcon(model, rng_idx).map(|v| BTreeSet::from([v])),
                             _ => None,
                         };
-                        match static_rng {
-                            Some(0) => add_err(
+                        match static_rng_vals.as_ref() {
+                            Some(vals) if !vals.is_empty() && vals.iter().all(|&v| v != 0) => {}
+                            Some(vals) if vals.contains(&0) => add_err(
                                 violations,
                                 SafetyCategory::PotentialTrap,
                                 idx,
                                 "Random range is constant 0".to_owned(),
                             ),
-                            None => add_err(
+                            _ => add_err(
                                 violations,
                                 SafetyCategory::PotentialTrap,
                                 idx,
                                 "Random range is unproved non-constant (could be 0)".to_owned(),
                             ),
-                            Some(_) => {}
                         }
                     }
                 }
@@ -1478,6 +1557,17 @@ fn collect_guard_mutexes(bhav: &Behavior) -> BTreeSet<LockKey> {
     out
 }
 
+/// Summary of lock operations discovered across reachable paths of an interaction.
+#[derive(Default)]
+struct TreeLockOps {
+    acquires: BTreeSet<LockKey>,
+    releases: BTreeSet<LockKey>,
+    /// True if a reachable scope-22 write has an unknown index (can alias any tracked mutex).
+    wildcard_attr_write: bool,
+    /// True if call-depth recursion cap was hit before completing discovery.
+    truncated: bool,
+}
+
 /// Collects scalar/bitmask lock acquires and releases reachable from `root_tree`
 /// (inlining private BHAV callees with constant param propagation).
 fn collect_tree_lock_ops(
@@ -1485,10 +1575,10 @@ fn collect_tree_lock_ops(
     root_tree: u16,
     initial_params: &[SymWord],
     depth: usize,
-    acquires: &mut BTreeSet<LockKey>,
-    releases: &mut BTreeSet<LockKey>,
+    out: &mut TreeLockOps,
 ) {
     if depth > 6 {
+        out.truncated = true;
         return;
     }
     let Some((_, bhav)) = model.behaviors.get(&root_tree) else {
@@ -1526,33 +1616,33 @@ fn collect_tree_lock_ops(
                     5 => {
                         if let Some(v) = resolve_val(rhs_scope, rhs_idx) {
                             if v == 0 {
-                                releases.insert(LockKey::Scalar(lhs_idx));
+                                out.releases.insert(LockKey::Scalar(lhs_idx));
                             } else {
-                                acquires.insert(LockKey::Scalar(lhs_idx));
+                                out.acquires.insert(LockKey::Scalar(lhs_idx));
                             }
                         } else {
                             // Unknown/symbolic write to stack.attr[lhs_idx] can acquire it.
-                            acquires.insert(LockKey::Scalar(lhs_idx));
+                            out.acquires.insert(LockKey::Scalar(lhs_idx));
                         }
                     }
                     9 => {
                         if let Some(b) = resolve_val(rhs_scope, rhs_idx)
                             && (1..=16).contains(&b)
                         {
-                            acquires.insert(LockKey::Bit(lhs_idx, b as u8));
+                            out.acquires.insert(LockKey::Bit(lhs_idx, b as u8));
                         } else {
-                            acquires.insert(LockKey::Scalar(lhs_idx));
+                            out.acquires.insert(LockKey::Scalar(lhs_idx));
                         }
                     }
                     10 => {
                         if let Some(b) = resolve_val(rhs_scope, rhs_idx)
                             && (1..=16).contains(&b)
                         {
-                            releases.insert(LockKey::Bit(lhs_idx, b as u8));
+                            out.releases.insert(LockKey::Bit(lhs_idx, b as u8));
                         }
                     }
                     3 | 4 | 6 | 7 | 12 | 13 | 18 | 19 | 20 => {
-                        acquires.insert(LockKey::Scalar(lhs_idx));
+                        out.acquires.insert(LockKey::Scalar(lhs_idx));
                     }
                     _ => {}
                 }
@@ -1560,10 +1650,12 @@ fn collect_tree_lock_ops(
                 // Scope 22 writes `stack.attr[param[lhs_idx]]`.
                 if let Some(attr_idx) = resolve_val(9, lhs_idx) {
                     if op == 5 && resolve_val(rhs_scope, rhs_idx) == Some(0) {
-                        releases.insert(LockKey::Scalar(attr_idx));
+                        out.releases.insert(LockKey::Scalar(attr_idx));
                     } else {
-                        acquires.insert(LockKey::Scalar(attr_idx));
+                        out.acquires.insert(LockKey::Scalar(attr_idx));
                     }
+                } else {
+                    out.wildcard_attr_write = true;
                 }
             }
         } else if (4096..=8191).contains(&ins.opcode) {
@@ -1574,14 +1666,7 @@ fn collect_tree_lock_ops(
                     .map(|i| SymWord::Const(word_i16(&ins.operands, i * 2)))
                     .collect()
             };
-            collect_tree_lock_ops(
-                model,
-                ins.opcode,
-                &call_params,
-                depth + 1,
-                acquires,
-                releases,
-            );
+            collect_tree_lock_ops(model, ins.opcode, &call_params, depth + 1, out);
         }
     }
 }
@@ -1622,27 +1707,28 @@ fn verify_object_locks(model: &ObjectModel, violations: &mut Vec<SafetyViolation
         }
     }
 
-    let mut per_inter_ops: Vec<(BTreeSet<LockKey>, BTreeSet<LockKey>, BTreeSet<LockKey>)> =
+    let mut per_inter_ops: Vec<(TreeLockOps, BTreeSet<LockKey>)> =
         Vec::with_capacity(interactions.len());
     for &(action, test) in &interactions {
-        let mut acq = BTreeSet::new();
-        let mut rel = BTreeSet::new();
-        collect_tree_lock_ops(model, action, &[], 0, &mut acq, &mut rel);
+        let mut ops = TreeLockOps::default();
+        collect_tree_lock_ops(model, action, &[], 0, &mut ops);
         let guard_mutexes = model
             .behaviors
             .get(&test)
             .map(|(_, b)| collect_guard_mutexes(b))
             .unwrap_or_default();
-        per_inter_ops.push((acq, rel, guard_mutexes));
+        per_inter_ops.push((ops, guard_mutexes));
     }
 
     // Identify attributes that act as scoped mutexes anywhere on this object (acquired AND released
     // within at least one interaction). A persistent multi-interaction toggle (like TV power or
     // lamp on/off) has separate TurnOn (only sets) and TurnOff (only clears) interactions.
     let mut scoped_mutexes: BTreeSet<LockKey> = BTreeSet::new();
-    for (acq, rel, _) in &per_inter_ops {
-        for &lock in acq {
-            if rel.contains(&lock) {
+    let mut all_guarded_mutexes: BTreeSet<LockKey> = BTreeSet::new();
+    for (ops, guards) in &per_inter_ops {
+        all_guarded_mutexes.extend(guards.iter().copied());
+        for &lock in &ops.acquires {
+            if ops.releases.contains(&lock) {
                 scoped_mutexes.insert(lock);
             }
         }
@@ -1655,33 +1741,51 @@ fn verify_object_locks(model: &ObjectModel, violations: &mut Vec<SafetyViolation
         if !checked_actions.insert(action) {
             continue;
         }
-        let (acq, rel, guard_mutexes) = &per_inter_ops[idx];
+        let (ops, guard_mutexes) = &per_inter_ops[idx];
+        let (tree_name, _) = &model.behaviors[&action];
+        if ops.truncated {
+            violations.push(SafetyViolation {
+                object: model.name.clone(),
+                tree_id: Some(action),
+                tree_name: tree_name.clone(),
+                category: SafetyCategory::InconclusiveProof,
+                node: None,
+                message: "lock discovery exceeded private call-depth limit (6)".to_owned(),
+                path: Vec::new(),
+            });
+            continue;
+        }
+
         let mut tracked_locks = BTreeSet::new();
-        for &lock in acq {
-            if rel.contains(&lock) || scoped_mutexes.contains(&lock) {
+        for &lock in &ops.acquires {
+            if ops.releases.contains(&lock) || scoped_mutexes.contains(&lock) {
                 // Acquired and released in this interaction (or a known scoped mutex on this object).
                 tracked_locks.insert(lock);
             } else if guard_mutexes.contains(&lock) {
                 // Guarded as mutex and acquired here; only exempt if another interaction
                 // acts strictly as a dedicated release toggle (releases without acquiring).
                 let is_persistent_toggle =
-                    per_inter_ops
-                        .iter()
-                        .enumerate()
-                        .any(|(j, (other_acq, other_rel, _))| {
-                            j != idx && other_rel.contains(&lock) && !other_acq.contains(&lock)
-                        });
+                    per_inter_ops.iter().enumerate().any(|(j, (other_ops, _))| {
+                        j != idx
+                            && other_ops.releases.contains(&lock)
+                            && !other_ops.acquires.contains(&lock)
+                    });
                 if !is_persistent_toggle {
                     tracked_locks.insert(lock);
                 }
             }
+        }
+        // If this interaction writes through scope 22 with an unknown index, it can alias any
+        // known scoped or guarded mutex on this object — include all of them in the proof!
+        if ops.wildcard_attr_write {
+            tracked_locks.extend(scoped_mutexes.iter().copied());
+            tracked_locks.extend(all_guarded_mutexes.iter().copied());
         }
 
         if tracked_locks.is_empty() {
             continue;
         }
 
-        let (tree_name, _) = &model.behaviors[&action];
         match prove_interaction_lock_safety(model, action, &tracked_locks) {
             Ok(verified_count) => {
                 locks_verified += verified_count;
@@ -2144,10 +2248,9 @@ fn prove_interaction_lock_safety(
                             &mut queue,
                         )?;
                     } else {
-                        let mut next = state.clone();
-                        let caller_stack_obj = next.frames.last().expect("frame").stack_obj;
+                        let caller_stack_obj = state.frames.last().expect("frame").stack_obj;
                         let mut params = if *ops == [0xFF; 8] {
-                            next.temps.to_vec()
+                            state.temps.to_vec()
                         } else {
                             (0..4)
                                 .map(|i| SymWord::Const(word_i16(ops, i * 2)))
@@ -2157,37 +2260,51 @@ fn prove_interaction_lock_safety(
                         if params.len() < needed {
                             params.resize(needed, SymWord::Const(0));
                         }
-                        next.frames.push(SymFrame {
-                            tree_id: opcode,
-                            pc: 0,
-                            stack_obj: caller_stack_obj,
-                            params,
-                            // Frame locals can inherit nonzero values from prior frames.
-                            locals: vec![SymWord::Unknown; bhav_local_limit(callee)],
-                        });
-                        if visited.insert(next.clone()) {
-                            let mut next_trace = trace.clone();
-                            next_trace.push(format!("tree#{cur_tree}@n{cur_pc}:enter#{opcode}"));
-                            queue.push_back((next, next_trace));
+                        // Kind-4 indexed trees can enter at any instruction index selected by
+                        // param[0] (`interpreter.rs:1609`), so explore every valid entry PC.
+                        let entry_pcs: Vec<u8> = if callee.kind == 4 {
+                            (0..callee.instructions.len())
+                                .filter_map(|p| u8::try_from(p).ok())
+                                .collect()
+                        } else {
+                            vec![0]
+                        };
+                        for entry_pc in entry_pcs {
+                            let mut next = state.clone();
+                            next.frames.push(SymFrame {
+                                tree_id: opcode,
+                                pc: entry_pc,
+                                stack_obj: caller_stack_obj,
+                                params: params.clone(),
+                                // Frame locals can inherit nonzero values from prior frames.
+                                locals: vec![SymWord::Unknown; bhav_local_limit(callee)],
+                            });
+                            if visited.insert(next.clone()) {
+                                let mut next_trace = trace.clone();
+                                next_trace.push(format!(
+                                    "tree#{cur_tree}@n{cur_pc}:enter#{opcode}@{entry_pc}"
+                                ));
+                                queue.push_back((next, next_trace));
+                            }
                         }
                     }
                 }
             }
             _ => {
                 // World-interacting primitive: apply conservative mutation to stack_obj/dest/temps.
-                let mut next = state.clone();
+                let mut next_true = state.clone();
                 match ins.opcode {
                     0 => {
                         // Sleep zeroes its param slot.
                         let p = word_i16(ops, 0);
-                        write_sym_operand(&mut next, 9, p, SymWord::Const(0));
+                        write_sym_operand(&mut next_true, 9, p, SymWord::Const(0));
                     }
                     8 => {
                         let dst_idx = word_i16(ops, 0);
                         let dst_scope = u16::from_le_bytes([ops[2], ops[3]]);
                         if dst_scope <= 255 {
                             write_sym_operand(
-                                &mut next,
+                                &mut next_true,
                                 dst_scope as u8,
                                 dst_idx,
                                 SymWord::Unknown,
@@ -2196,33 +2313,49 @@ fn prove_interaction_lock_safety(
                     }
                     14 | 42 => {
                         // FindBestObject / CreateObject overwrites stack_obj with another object.
-                        write_sym_operand(&mut next, 10, 0, SymWord::Unknown);
+                        write_sym_operand(&mut next_true, 10, 0, SymWord::Unknown);
+                    }
+                    17 => {
+                        // IdleForInput decrements/zeroes its param slot.
+                        let p = word_i16(ops, 0);
+                        write_sym_operand(&mut next_true, 9, p, SymWord::Unknown);
                     }
                     31 => {
                         // SetToNext writes dest (or stack_obj if bit 7 clear).
                         let mode = ops[4];
                         if mode & 0x80 != 0 {
                             write_sym_operand(
-                                &mut next,
+                                &mut next_true,
                                 ops[5],
                                 i16::from(ops[7]),
                                 SymWord::Unknown,
                             );
                         } else {
-                            write_sym_operand(&mut next, 10, 0, SymWord::Unknown);
+                            write_sym_operand(&mut next_true, 10, 0, SymWord::Unknown);
                         }
                     }
                     36 => {
                         // Dialog writes result into selected temp slot.
                         let t = usize::from((ops[7] >> 4) & 7);
-                        next.temps[t] = SymWord::Unknown;
+                        next_true.temps[t] = SymWord::Unknown;
                     }
                     _ => {}
                 }
 
+                let mut next_false = next_true.clone();
+                if ins.opcode == 44 {
+                    // Animate (`animate.rs:197`): firing an animation event takes `on_false`
+                    // and writes the event ID into local[ops[2]] (when bit 0x20 set) or param[0].
+                    if ops[5] & 0x20 != 0 {
+                        write_sym_operand(&mut next_false, 25, i16::from(ops[2]), SymWord::Unknown);
+                    } else {
+                        write_sym_operand(&mut next_false, 9, 0, SymWord::Unknown);
+                    }
+                }
+
                 if is_always_true_instruction(ins) {
                     advance(
-                        next,
+                        next_true,
                         ins.on_true,
                         format!("tree#{cur_tree}@n{cur_pc}:prim({})->true", ins.opcode),
                         &mut visited,
@@ -2230,14 +2363,14 @@ fn prove_interaction_lock_safety(
                     )?;
                 } else {
                     advance(
-                        next.clone(),
+                        next_true,
                         ins.on_true,
                         format!("tree#{cur_tree}@n{cur_pc}:prim({})->true", ins.opcode),
                         &mut visited,
                         &mut queue,
                     )?;
                     advance(
-                        next,
+                        next_false,
                         ins.on_false,
                         format!("tree#{cur_tree}@n{cur_pc}:prim({})->false", ins.opcode),
                         &mut visited,
@@ -2382,6 +2515,16 @@ impl CanonPred {
             }
         }
     }
+
+    fn touches_scope_22(self) -> bool {
+        let is_22 = |op: CanonOperand| matches!(op, CanonOperand::Mem(22, _));
+        match self {
+            Self::Const(_) => false,
+            Self::Eq(a, b) | Self::Lt(a, b) | Self::Gt(a, b) | Self::FlagTest(a, b) => {
+                is_22(a) || is_22(b)
+            }
+        }
+    }
 }
 
 fn is_global_34(scope: u8, idx: i16) -> bool {
@@ -2400,6 +2543,8 @@ fn bhav_uses_global_34(bhav: &BhavChunk) -> bool {
                 || (u16::from_le_bytes([ins.operands[6], ins.operands[7]]) == 6
                     && word_i16(&ins.operands, 4) == 34)
         }
+        // `UI Effect` (opcode 34) reads Global 34 / scratch pointers (`ui_effect.rs:371`).
+        34 => true,
         _ => false,
     })
 }
@@ -2721,12 +2866,17 @@ fn try_silent_step(
     let rhs_scope = ins.operands[7];
 
     // 1. Constant-folded pure comparison (e.g., `0 == 0` jump node emitted by `lower.rs`).
+    //    Never fold a read of an uninitialized `InitLocal` (the VM may trap on unreadable
+    //    pointer fragments inherited from prior frames, `interpreter.rs:1271`).
     if matches!(op, 0 | 1 | 2 | 8 | 14 | 15 | 16)
         && (lhs_scope == 7 || env.is_frame_private(lhs_scope, lhs_idx))
         && (rhs_scope == 7 || env.is_frame_private(rhs_scope, rhs_idx))
     {
         let lhs = env.read(lhs_scope, lhs_idx);
         let rhs = env.read(rhs_scope, rhs_idx);
+        if matches!(lhs, CanonOperand::InitLocal(_)) || matches!(rhs, CanonOperand::InitLocal(_)) {
+            return None;
+        }
         if let Some((CanonPred::Const(b), t, f)) =
             canonicalize_compare(op, lhs, rhs, ins.on_true, ins.on_false, true)
         {
@@ -2748,6 +2898,12 @@ fn try_silent_step(
     {
         let lhs = env.read(lhs_scope, lhs_idx);
         let rhs = env.read(rhs_scope, rhs_idx);
+        // Plain overwrite (`=`, `sqrt`) only reads RHS; read-modify-write ops also read LHS.
+        let reads_uninit_local = matches!(rhs, CanonOperand::InitLocal(_))
+            || (!matches!(op, 5 | 20) && matches!(lhs, CanonOperand::InitLocal(_)));
+        if reads_uninit_local {
+            return None;
+        }
         // Only step silently if guaranteed not to trap (no div/mod by 0, valid flag/sqrt).
         let safe = match op {
             7 | 12 => matches!(rhs, CanonOperand::Const(r) if r != 0),
@@ -3050,8 +3206,11 @@ pub fn check_bhav_equivalent_with_arities(
                 (Some((pred_a, ta, fa)), Some((pred_b, tb, fb))) if pred_a == pred_b => {
                     let mut enqueue = |na: u8, nb: u8, branch: bool, record_pred: Option<bool>| {
                         let mut next_constraints = state.constraints.clone();
+                        // Never cache scope-22 indirect predicates (`stack.attr[param[i]]`) because
+                        // a later change to `param[i]` changes the addressed attribute.
                         if let Some(outcome) = record_pred
                             && !matches!(pred_a, CanonPred::Const(_))
+                            && !pred_a.touches_scope_22()
                             && next_constraints.len() < 16
                         {
                             next_constraints.insert(pred_a, outcome);
@@ -3248,12 +3407,19 @@ pub fn check_bhav_equivalent_with_arities(
                     }
                 }
                 None => {
-                    // Callee arity unknown: sound only if following instruction bytes match identically.
+                    // Callee arity unknown: a callee with >4 inline args can read across multiple
+                    // following instructions (`interpreter.rs:1542-1580`), so require the entire
+                    // trailing instruction suffix after the call to match byte-for-byte.
                     let key =
                         |ins: &Instruction| (ins.opcode, ins.on_true, ins.on_false, ins.operands);
-                    let next_a = a.instructions.get(usize::from(pc_a) + 1).map(key);
-                    let next_b = b.instructions.get(usize::from(pc_b) + 1).map(key);
-                    if next_a != next_b {
+                    let tail_a = a.instructions.get(usize::from(pc_a) + 1..).unwrap_or(&[]);
+                    let tail_b = b.instructions.get(usize::from(pc_b) + 1..).unwrap_or(&[]);
+                    let suffix_matches = tail_a.len() == tail_b.len()
+                        && tail_a
+                            .iter()
+                            .zip(tail_b.iter())
+                            .all(|(x, y)| key(x) == key(y));
+                    if !suffix_matches {
                         return EquivResult::Inconclusive {
                             reason: format!(
                                 "subroutine call #{} at A@n{pc_a}/B@n{pc_b} has unknown callee arity and differing following instruction layout",
@@ -4014,6 +4180,207 @@ mod tests {
                 EquivResult::Counterexample { .. }
             ),
             "kind-4 indexed entry divergence at node 1 must be caught"
+        );
+    }
+
+    #[test]
+    fn sol_round2_verifier_soundness_regressions() {
+        // 1. Scope 2, write to read-only global[0], and unsupported Generic Sims Call routine 99
+        //    must all be flagged by the no-trap checker.
+        let trap_manifest = r#"
+            [object]
+            name = "Round2TrapObj"
+            guid = 0x7F00_9994
+            init = "Init"
+            main = "Main"
+            scripts = ["behavior.antics"]
+        "#;
+        let trap_script = r#"
+            tree 4096 "Init" { return true; }
+            tree 4097 "Main" {
+                op 0x0002 (0, 0, 0, 0, 0, 2, 2, 7) -> true: 1, false: 1;
+                op 0x0002 (0, 0, 1, 0, 0, 5, 6, 7) -> true: 2, false: 2;
+                op 0x0001 (99, 0, 0, 0, 0, 0, 0, 0) -> true: true, false: false;
+            }
+        "#;
+        let trap_obj =
+            compile_object_from_sources(trap_manifest, &[("behavior.antics", trap_script)])
+                .unwrap();
+        let trap_report = verify_object_safety(&trap_obj).unwrap();
+        let trap_violations: Vec<_> = trap_report
+            .violations
+            .iter()
+            .filter(|v| v.category == SafetyCategory::PotentialTrap)
+            .collect();
+        assert!(
+            trap_violations.len() >= 3,
+            "expected >=3 PotentialTrap violations (scope 2, write global[0], generic call 99), got {:?}",
+            trap_report.violations
+        );
+
+        // 2. Animate on_false event overwriting a cleanup-controlling local must be caught as LockLeak.
+        let anim_lock_manifest = r#"
+            [object]
+            name = "AnimLeakObj"
+            guid = 0x7F00_9995
+            init = "Init"
+            main = "Main"
+            scripts = ["behavior.antics"]
+
+            [[interaction]]
+            name = "Use"
+            action = "Use"
+            guard = "CanUse"
+        "#;
+        let anim_lock_script = r#"
+            tree 4096 "Init" { my.attr[0] := 0; return true; }
+            tree 4097 "Main" { return true; }
+            tree 4098 "CanUse" {
+                if stack.attr[0] != 0 { return false; }
+                return true;
+            }
+            interaction 4099 "Use" (locals: 1) {
+                op 0x0002 (0, 0, 1, 0, 0, 5, 1, 7) -> true: 1, false: 1;
+                op 0x0002 (0, 0, 0, 0, 0, 5, 25, 7) -> true: 2, false: 2;
+                op 0x002c (0, 0, 0, 0, 0, 32, 0, 0) -> true: 3, false: 3;
+                op 0x0002 (0, 0, 0, 0, 0, 2, 25, 7) -> true: 4, false: false;
+                op 0x0002 (0, 0, 0, 0, 0, 5, 1, 7) -> true: true, false: true;
+            }
+        "#;
+        let anim_obj = compile_object_from_sources(
+            anim_lock_manifest,
+            &[("behavior.antics", anim_lock_script)],
+        )
+        .unwrap();
+        let anim_report = verify_object_safety(&anim_obj).unwrap();
+        assert!(
+            anim_report
+                .violations
+                .iter()
+                .any(|v| v.category == SafetyCategory::LockLeak),
+            "Animate on_false mutating cleanup-controlling local[0] must trigger LockLeak: {:?}",
+            anim_report.violations
+        );
+
+        // 3. Run Tree By Name (opcode 28) disables closed-caller param inference so helper div is rejected.
+        let named_manifest = r#"
+            [object]
+            name = "NamedDivObj"
+            guid = 0x7F00_9996
+            init = "Init"
+            main = "Main"
+            scripts = ["behavior.antics"]
+        "#;
+        let named_script = r#"
+            tree 4096 "Init" { return true; }
+            tree 4097 "Main" {
+                op 0x1002 (1, 0, 0, 0, 0, 0, 0, 0) -> true: 1, false: 1;
+                op 0x001c (0, 0, 0, 0, 0, 0, 0, 0) -> true: true, false: false;
+            }
+            tree 4098 "Helper" (args: 1) {
+                op 0x0002 (0, 0, 0, 0, 0, 7, 8, 9) -> true: true, false: false;
+            }
+        "#;
+        let named_obj =
+            compile_object_from_sources(named_manifest, &[("behavior.antics", named_script)])
+                .unwrap();
+        let named_report = verify_object_safety(&named_obj).unwrap();
+        assert!(
+            named_report
+                .violations
+                .iter()
+                .any(|v| v.category == SafetyCategory::PotentialTrap && v.tree_id == Some(4098)),
+            "RunTreeByName must disable closed-caller divisor inference on Helper #4098: {:?}",
+            named_report.violations
+        );
+
+        // 4. `0 == 0` before UI Effect (opcode 34) must NOT be silently folded away!
+        let ui_a = &compile_antics(
+            r#"
+            tree 4096 "WithUiInit" {
+                op 0x0002 (0, 0, 0, 0, 0, 2, 7, 7) -> true: 1, false: 1;
+                op 0x0022 (0, 0, 0, 0, 0, 0, 0, 0) -> true: true, false: false;
+            }
+        "#,
+        )
+        .unwrap()
+        .behaviors[&4096];
+        let ui_b = &compile_antics(
+            r#"
+            tree 4096 "WithoutUiInit" {
+                op 0x0022 (0, 0, 0, 0, 0, 0, 0, 0) -> true: true, false: false;
+            }
+        "#,
+        )
+        .unwrap()
+        .behaviors[&4096];
+        assert!(
+            matches!(
+                check_bhav_equivalent(ui_a, ui_b, &EquivOptions::default()),
+                EquivResult::Counterexample { .. }
+            ),
+            "0 == 0 before UI Effect (opcode 34) must not be silently folded"
+        );
+
+        // 5. Scope-22 indirect predicate must NOT be falsely pruned after param[0] mutates.
+        let s22_pred_a = &compile_antics(
+            r#"
+            tree 4096 "S22PredA" (args: 1) {
+                op 0x0002 (0, 0, 0, 0, 0, 2, 22, 7) -> true: 1, false: false;
+                op 0x0002 (0, 0, 1, 0, 0, 5, 9, 7) -> true: 2, false: 2;
+                op 0x0002 (0, 0, 0, 0, 0, 2, 22, 7) -> true: true, false: false;
+            }
+        "#,
+        )
+        .unwrap()
+        .behaviors[&4096];
+        let s22_pred_b = &compile_antics(
+            r#"
+            tree 4096 "S22PredB" (args: 1) {
+                op 0x0002 (0, 0, 0, 0, 0, 2, 22, 7) -> true: 1, false: false;
+                op 0x0002 (0, 0, 1, 0, 0, 5, 9, 7) -> true: true, false: true;
+            }
+        "#,
+        )
+        .unwrap()
+        .behaviors[&4096];
+        assert!(
+            matches!(
+                check_bhav_equivalent(s22_pred_a, s22_pred_b, &EquivOptions::default()),
+                EquivResult::Counterexample { .. }
+            ),
+            "scope-22 predicate after param[0] write must not be cached as redundant"
+        );
+
+        // 6. Unknown-arity inline call with divergent pc+2 suffix must return Inconclusive.
+        let wide_a = &compile_antics(
+            r#"
+            tree 4096 "WideA" {
+                op 0x0100 (1, 0, 2, 0, 3, 0, 4, 0) -> true: true, false: false;
+                op 0x0002 (0, 0, 0, 0, 0, 2, 7, 7) -> true: true, false: false;
+                op 0x0002 (1, 0, 0, 0, 0, 2, 7, 7) -> true: true, false: false;
+            }
+        "#,
+        )
+        .unwrap()
+        .behaviors[&4096];
+        let wide_b = &compile_antics(
+            r#"
+            tree 4096 "WideB" {
+                op 0x0100 (1, 0, 2, 0, 3, 0, 4, 0) -> true: true, false: false;
+                op 0x0002 (0, 0, 0, 0, 0, 2, 7, 7) -> true: true, false: false;
+                op 0x0002 (9, 0, 0, 0, 0, 2, 7, 7) -> true: true, false: false;
+            }
+        "#,
+        )
+        .unwrap()
+        .behaviors[&4096];
+        assert!(
+            matches!(
+                check_bhav_equivalent(wide_a, wide_b, &EquivOptions::default()),
+                EquivResult::Inconclusive { .. }
+            ),
+            "unknown-arity inline call with divergent pc+2 suffix must return Inconclusive"
         );
     }
 }

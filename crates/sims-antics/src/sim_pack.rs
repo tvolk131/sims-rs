@@ -122,7 +122,7 @@ pub fn compile_standalone_pack_dir(dir: &Path) -> Result<StandalonePack> {
                     let sub_index = w(11) as i16;
                     let guid = u32::from(w(14)) | (u32::from(w(15)) << 16);
                     let obj_price = w(18);
-                    let level_word = w(41) as i16;
+                    let level_word = w(56) as i16;
                     let num_attributes = w(58);
                     let lead_tile = w(63);
                     if sub_index == -1 {

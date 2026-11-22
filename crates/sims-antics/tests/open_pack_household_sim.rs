@@ -600,6 +600,185 @@ fn standalone_open_pack_builds_verifies_safety_and_validates_all_formats() {
     let fami = Family::parse(nbhd_iff.data(nbhd_iff.get(b"FAMI", 1).unwrap())).unwrap();
     assert_eq!(fami.budget, 20_000);
     assert_eq!(fami.members, vec![0x7F00_0101, 0x7F00_0102]);
+
+    // 8. Exercise REAL saved-House + saved-Sim startup from `parsed_house` + `Neighborhood.iff`
+    //    + `standalone.pack.objects` + `standalone.characters` via `World::from_house` ->
+    //    `read_neighbors` -> `read_types` -> `assign_rooms` -> `visit_objects`, proving both
+    //    saved Sims boot organically onto `Main` (#4097) from `open_sim_01.iff`/`open_sim_02.iff`
+    //    and interact cleanly with a saved object in `House01.iff` with 0 traps!
+    let mut boot_catalog = Catalog {
+        global: 0,
+        objects: Vec::new(),
+        by_guid: BTreeMap::new(),
+        semi_globals: BTreeMap::new(),
+        diagnostics: Vec::new(),
+    };
+    let mut boot_libs = BTreeMap::new();
+    let mut boot_semi = BTreeMap::new();
+    let mut boot_ttas: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+    boot_libs.insert(0usize, Library::default());
+    let mut boot_res = 1usize;
+    for entry in &standalone.pack.objects {
+        let iff = Iff::parse(entry.object.iff_bytes.clone()).unwrap();
+        if let Some(ttas_chunk) = iff.get(b"TTAs", 128) {
+            let st = StringTable::parse(iff.data(ttas_chunk)).unwrap();
+            let labels: Vec<String> = st.entries.into_iter().map(|e| e.text).collect();
+            boot_ttas.insert(entry.object.guid, labels.clone());
+            for &tg in &entry.object.tile_guids {
+                boot_ttas.insert(tg, labels.clone());
+            }
+        }
+        let lib = load_iff_into_vm(&iff, boot_res, &mut boot_catalog);
+        boot_libs.insert(boot_res, lib);
+        boot_semi.insert(boot_res, None);
+        boot_res += 1;
+    }
+    for char_bytes in standalone.characters.values() {
+        let iff = Iff::parse(char_bytes.clone()).unwrap();
+        let lib = load_iff_into_vm(&iff, boot_res, &mut boot_catalog);
+        boot_libs.insert(boot_res, lib);
+        boot_semi.insert(boot_res, None);
+        boot_res += 1;
+    }
+    let boot_program = Program {
+        global: 0,
+        libraries: boot_libs,
+        semi_globals: boot_semi,
+        careers: None,
+        career_texts_end: true,
+        labels_hold_no_token: true,
+        zoning: BTreeMap::new(),
+        animations: Default::default(),
+        people: Default::default(),
+        icon_frames: None,
+        wardrobe: None,
+        ordered_wardrobe: None,
+        character_files: Default::default(),
+        expansions: 0,
+        characters: Default::default(),
+    };
+
+    let mut booted_world = World::empty();
+    booted_world.size = 64;
+    booted_world.indicators = [u16::MAX, u16::MAX];
+    booted_world.read_simulator(&parsed_house.simulator);
+    if let Some(model) = &parsed_house.model {
+        booted_world.read_house_model(model);
+    }
+    booted_world
+        .read_arrays(&parsed_house.arrays, house_ver)
+        .expect("read_arrays failed");
+    booted_world.rebuild_rooms().expect("rebuild_rooms failed");
+    let mut families_map = BTreeMap::new();
+    families_map.insert(1u16, fami);
+    let content_nbhd = sims_content::Neighborhood {
+        directory: PathBuf::from("."),
+        families: families_map,
+        type_attributes: None,
+        neighbors: nbrs.entries,
+        inventories: ngbh.inventories,
+        data: ngbh.data,
+        options: Some(ngbh.options),
+    };
+    let registered: Vec<sims_sim::neighbors::Registered> = boot_catalog
+        .objects
+        .iter()
+        .map(|o| sims_sim::neighbors::Registered {
+            guid: o.guid,
+            kind: o.kind,
+            resolves: boot_catalog.object(o.guid).is_some_and(|resolved| {
+                resolved.resource == o.resource && resolved.chunk == o.chunk
+            }),
+        })
+        .collect();
+    booted_world
+        .read_neighbors(&content_nbhd, &registered)
+        .expect("read_neighbors failed");
+    let mut people_profiles = sims_content::People::default();
+    let open_skeleton = sims_content::Skeleton {
+        name: "open-adult".to_owned(),
+        file: "open-pack/skeleton".to_owned(),
+        place: 0,
+        scales: vec![vec![1]],
+        bones: vec![sims_content::Bone {
+            name: "ROOT".to_owned(),
+            parent: None,
+            translation: [0; 3],
+            rotation: [0, 0, 0, 1.0f32.to_bits()],
+            blends: true,
+        }],
+    };
+    for sim_guid in [SIM_GUID, SIM2_GUID] {
+        people_profiles
+            .skeletons
+            .insert(sim_guid, open_skeleton.clone());
+        people_profiles
+            .profiles
+            .insert(sim_guid, sims_content::Profile::default());
+    }
+
+    let mut boot_vm = Interpreter::new(&boot_program, &boot_catalog, Stream::Lot);
+    let _ = boot_vm
+        .read_types(&mut booted_world, &parsed_house.types)
+        .expect("read_types failed");
+    let _ = boot_vm
+        .read_objects(&mut booted_world, &parsed_house.objects, &people_profiles)
+        .expect("read_objects failed");
+    let _ = boot_vm
+        .assign_rooms(&mut booted_world)
+        .expect("assign_rooms failed");
+    let visited = boot_vm.visit_objects(&mut booted_world, &people_profiles);
+    assert!(
+        visited.stopped.is_none(),
+        "visit_objects failed on saved House01.iff: {:?}",
+        visited.stopped
+    );
+    assert_eq!(booted_world.people.len(), 2);
+    for &saved_sim_id in &booted_world.people.clone() {
+        let sim_obj = &booted_world.objects[&saved_sim_id];
+        assert_eq!(
+            sim_obj.stack.len(),
+            1,
+            "saved Sim {saved_sim_id} must boot organically onto its Main stack frame"
+        );
+        assert_eq!(sim_obj.stack[0].tree, 4097);
+        let status = boot_vm
+            .turn(&mut booted_world, saved_sim_id, 4_000)
+            .expect("saved Sim Main turn trapped");
+        assert!(matches!(status, Status::Yielded));
+    }
+
+    // Run a pie-menu interaction from a booted saved Sim onto the saved Open Bookshelf in House01.iff!
+    let saved_sim_id = booted_world.people[0];
+    let saved_bookshelf_id = booted_world
+        .objects
+        .values()
+        .find(|o| o.guid == BOOKSHELF_GUID)
+        .expect("House01.iff missing saved Open Bookshelf")
+        .id;
+    let before_fun = booted_world.objects[&saved_sim_id]
+        .person
+        .as_ref()
+        .unwrap()
+        .motives[MOTIVE_FUN];
+    run_pie_interaction_by_name(
+        &mut boot_vm,
+        &mut booted_world,
+        &boot_ttas,
+        saved_sim_id,
+        saved_bookshelf_id,
+        "Read Novel",
+        80,
+    );
+    assert!(
+        booted_world.objects[&saved_sim_id]
+            .person
+            .as_ref()
+            .unwrap()
+            .motives[MOTIVE_FUN]
+            > before_fun,
+        "saved Sim interacting with saved Open Bookshelf in House01.iff must gain Fun"
+    );
 }
 
 #[test]
