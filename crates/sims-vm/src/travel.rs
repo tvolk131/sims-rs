@@ -1271,6 +1271,39 @@ struct LiveTravelerSnapshot {
     had_hotel_key_before_trip: bool,
 }
 
+/// Departure neighborhood snapshot used as the 3-way merge base when
+/// `return_from_destination` reconciles destination changes against a
+/// `StoredNeighborhood` that advanced due to unrelated concurrent writes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DepartureBaseline {
+    revision: u64,
+    neighbors: Vec<Option<sims_formats::neighborhood::Neighbor>>,
+    inventories: Vec<Option<sims_formats::neighborhood::Inventory>>,
+    type_attributes: Option<sims_formats::tatt::Tatt>,
+    made_characters: sims_sim::characters::Characters,
+    home_family_members: Vec<u32>,
+    home_family_budget: i32,
+}
+
+impl DepartureBaseline {
+    fn from_stored(stored: &StoredNeighborhood, committed_revision: u64, home_family: u16) -> Self {
+        let (members, budget) = stored
+            .families
+            .get(&home_family)
+            .map(|f| (f.members.clone(), f.budget))
+            .unwrap_or_default();
+        Self {
+            revision: committed_revision,
+            neighbors: stored.neighbors.clone(),
+            inventories: stored.inventories.clone(),
+            type_attributes: stored.type_attributes.clone(),
+            made_characters: stored.made_characters.clone(),
+            home_family_members: members,
+            home_family_budget: budget,
+        }
+    }
+}
+
 /// Active-trip envelope persisted atomically in
 /// `NEIGHBORHOOD_LOTS[(neighborhood_id, home_house)]` while away.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1279,6 +1312,7 @@ struct PersistedTravelRecord {
     is_date: bool,
     view_centre: Option<[i8; 2]>,
     session: TravelSession,
+    baseline: DepartureBaseline,
     departure_snapshots: Vec<LiveTravelerSnapshot>,
     frozen_home_bytes: Vec<u8>,
 }
@@ -1781,11 +1815,13 @@ pub fn depart_to_destination(
     // prevents ordinary `lifecycle::enter_lot` from opening or overwriting the
     // frozen home lot while the household is away.
     let frozen_home_bytes = frozen_home.encode();
+    let baseline = DepartureBaseline::from_stored(&staged_stored, origin.revision + 1, home_family);
     let envelope_bytes = encode_travel_envelope(&PersistedTravelRecord {
         trip_id,
         is_date,
         view_centre: request.view_centre,
         session: session.clone(),
+        baseline,
         departure_snapshots: snapshots,
         frozen_home_bytes,
     })?;
@@ -1864,6 +1900,7 @@ pub fn inspect_active_trip(
         home_house,
         &snapshot.neighborhood,
         &persisted,
+        true,
     )?;
     Ok(Some(persisted.session))
 }
@@ -1898,6 +1935,7 @@ pub fn resume_active_trip(
         home_house,
         &home_snapshot.neighborhood,
         &persisted,
+        false,
     )?;
 
     let required_bit = persisted.session.destination.expansion_bit();
@@ -1982,6 +2020,11 @@ pub fn resume_active_trip(
     persisted.session.trip_id = new_trip_id;
     persisted.session.instance_id = home_snapshot.neighborhood.instance_id;
     persisted.session.travelers = traveler_records;
+    persisted.baseline = DepartureBaseline::from_stored(
+        &home_snapshot.neighborhood,
+        home_snapshot.neighborhood.revision + 1,
+        persisted.session.home_family,
+    );
     let envelope_bytes = encode_travel_envelope(&persisted)?;
 
     let (committed_instance, committed_revision) = match store.save_lot_and_neighborhood_checked(
@@ -2053,6 +2096,7 @@ pub fn abort_active_trip(
         home_house,
         &home_snapshot.neighborhood,
         &persisted,
+        true,
     )?;
 
     let auth_session = &persisted.session;
@@ -2199,6 +2243,7 @@ fn verify_persisted_trip_against_snapshot(
     home_house: u32,
     stored: &StoredNeighborhood,
     persisted: &PersistedTravelRecord,
+    allow_cleared_secondary: bool,
 ) -> Result<(), TravelError> {
     if persisted.session.store_id != store_id {
         return Err(TravelError::NeighborhoodMismatch {
@@ -2238,9 +2283,9 @@ fn verify_persisted_trip_against_snapshot(
         i32::try_from(home_house).map_err(|e| TravelError::Lot(e.to_string()))?;
     let expected_dest_i32 = i32::try_from(persisted.session.destination_house)
         .map_err(|e| TravelError::Lot(e.to_string()))?;
-    if stored_family.house != expected_home_i32
-        || stored_family.secondary_house() != expected_dest_i32
-    {
+    let secondary_ok = stored_family.secondary_house() == expected_dest_i32
+        || (allow_cleared_secondary && stored_family.secondary_house() == 0);
+    if stored_family.house != expected_home_i32 || !secondary_ok {
         return Err(TravelError::SessionMismatch(format!(
             "family {} is at home={}, secondary_house={}, expected home={}, secondary_house={}",
             persisted.session.home_family,
@@ -2266,10 +2311,90 @@ fn clear_stored_inventory_token(
     }
 }
 
-/// Merges destination-visit updates from `dest_saved_world` onto the latest
-/// `StoredNeighborhood` snapshot without clobbering concurrent writes to
-/// unrelated lots, households, or off-lot neighbors.
+fn relationship_map(rels: &[sims_formats::neighborhood::Relationship]) -> BTreeMap<i32, Vec<i32>> {
+    rels.iter().map(|r| (r.target, r.values.clone())).collect()
+}
+
+fn inventory_map(
+    invs: &[Option<sims_formats::neighborhood::Inventory>],
+) -> BTreeMap<i16, Vec<sims_formats::neighborhood::InventoryItem>> {
+    let mut map = BTreeMap::new();
+    for inv in invs.iter().flatten() {
+        map.insert(inv.neighbor, inv.items.clone());
+    }
+    map
+}
+
+fn tatt_map(tatt: &Option<sims_formats::tatt::Tatt>) -> BTreeMap<u32, Vec<i16>> {
+    let mut map = BTreeMap::new();
+    if let Some(t) = tatt {
+        for e in &t.entries {
+            map.insert(e.guid, e.values.clone());
+        }
+    }
+    map
+}
+
+fn count_stored_family_friends(stored: &StoredNeighborhood, family_id: u16, threshold: i32) -> i32 {
+    let Some(family) = stored.families.get(&family_id) else {
+        return 0;
+    };
+    let mutual = |a: &sims_formats::neighborhood::Neighbor,
+                  b: &sims_formats::neighborhood::Neighbor| {
+        let ab = a
+            .relationships
+            .iter()
+            .find(|r| r.target == i32::from(b.id))
+            .and_then(|r| r.values.first().copied())
+            .unwrap_or(0);
+        let ba = b
+            .relationships
+            .iter()
+            .find(|r| r.target == i32::from(a.id))
+            .and_then(|r| r.values.first().copied())
+            .unwrap_or(0);
+        ab >= threshold && ba >= threshold
+    };
+    let mut count = 0i32;
+    for candidate in stored.neighbors.iter().flatten() {
+        if family.members.contains(&candidate.guid)
+            || candidate.person_data.get(61).copied().unwrap_or(0) == 0
+            || candidate.person_data.get(PERSON_KIND).copied().unwrap_or(0) > 1
+        {
+            continue;
+        }
+        for &guid in &family.members {
+            if guid == 0 {
+                continue;
+            }
+            let Some(member) = stored.neighbors.iter().flatten().find(|n| n.guid == guid) else {
+                continue;
+            };
+            if mutual(candidate, member) {
+                count = count.wrapping_add(1);
+                break;
+            }
+        }
+    }
+    count
+}
+
+/// Three-way reconciles destination-visit changes (`dest_world`) against the
+/// departure `baseline` and the `latest` `StoredNeighborhood`:
+///
+/// - When `latest.revision == baseline.revision` (no concurrent writes while
+///   away), applies the destination write-back directly.
+/// - When `latest.revision != baseline.revision` (another writer committed
+///   while away), applies ONLY fields that actually changed during the visit:
+///   unchanged neighbors, inventories, relationships, and `TATT` entries keep
+///   `latest`'s values untouched; disjoint updates merge cleanly; and any true
+///   conflict (concurrent edits to the same Sim's `person_data`, same
+///   relationship row, same inventory, same `TATT` entry, same `home_family`
+///   roster/budget, or same newly allocated neighbor/character slot) returns
+///   `Err(TravelError::StaleNeighborhood { .. })` instead of silently
+///   clobbering either side.
 fn merge_destination_into_latest_neighborhood(
+    baseline: &DepartureBaseline,
     latest: &StoredNeighborhood,
     dest_world: &World,
     session: &TravelSession,
@@ -2279,9 +2404,14 @@ fn merge_destination_into_latest_neighborhood(
     let expected_home_i32 =
         i32::try_from(session.home_house).map_err(|e| TravelError::Lot(e.to_string()))?;
 
-    // Run native `write_back_world` onto a scratch copy to produce exact
-    // serialized `Neighbor`, `Inventory`, `Family`, `TATT`, and `made_characters`.
+    // Build a clean baseline-seeded scratch copy before running
+    // `write_back_world` so `dest_written` reflects PURELY `baseline +
+    // destination_visit_deltas` with zero contamination from `latest`.
     let mut dest_written = latest.clone();
+    dest_written.neighbors = baseline.neighbors.clone();
+    dest_written.inventories = baseline.inventories.clone();
+    dest_written.type_attributes = baseline.type_attributes.clone();
+    dest_written.made_characters = baseline.made_characters.clone();
     dest_written.write_back_world(
         dest_world,
         session.destination_house,
@@ -2291,114 +2421,268 @@ fn merge_destination_into_latest_neighborhood(
         friendship_threshold,
     );
 
-    // Collect every neighbor touched during the destination visit:
-    // - all travelers (household + date companion)
-    // - every live person spawned on `destination_lot` (townies, NPCs, etc.)
-    // - any character newly created on `destination_lot`
-    let mut touched_neighbors: BTreeSet<i16> =
-        session.travelers.iter().map(|t| t.neighbor_id).collect();
-    for &pid in &dest_world.people {
-        if let Some(person) = dest_world.objects.get(&pid).and_then(|o| o.person.as_ref())
-            && let Some(&nid) = person.data.get(PERSON_NEIGHBOR)
-            && nid > 0
-        {
-            touched_neighbors.insert(nid);
-        }
-    }
-    for &guid in dest_world.characters.made.keys() {
-        if !latest.made_characters.made.contains_key(&guid)
-            && let Some(rec) = dest_world.neighbors.first_of(guid)
-        {
-            touched_neighbors.insert(rec.id);
-        }
-    }
+    let conflict = || TravelError::StaleNeighborhood {
+        neighborhood: session.neighborhood_id.clone(),
+        expected_revision: baseline.revision,
+        current_revision: latest.revision,
+    };
 
     let mut merged = latest.clone();
-    // Keep `NGBH.data[2]` (last active residential lot) pointing at home.
     let prev_last_lot = merged.data[2];
     merged.data[2] = i16::try_from(session.home_house).unwrap_or(prev_last_lot);
 
-    // Merge NBRS: overwrite slots for touched/new neighbors, and for untouched
-    // neighbors merge ONLY relationship rows targeting a touched neighbor so
-    // concurrent edits to unrelated households are preserved intact.
-    if merged.neighbors.len() < dest_written.neighbors.len() {
-        merged.neighbors.resize(dest_written.neighbors.len(), None);
-    }
-    for (idx, d_slot) in dest_written.neighbors.iter().enumerate() {
-        let Some(d_nbr) = d_slot else {
-            continue;
-        };
-        if merged.deleted_characters.contains(&d_nbr.guid) {
-            continue;
-        }
-        if touched_neighbors.contains(&d_nbr.id) {
-            merged.neighbors[idx] = Some(d_nbr.clone());
-        } else if let Some(u_nbr) = merged.neighbors[idx].as_mut()
-            && u_nbr.id == d_nbr.id
-            && u_nbr.guid == d_nbr.guid
-        {
-            for d_row in &d_nbr.relationships {
-                let target_i16 = i16::try_from(d_row.target).ok();
-                if target_i16.is_some_and(|t| touched_neighbors.contains(&t)) {
-                    if let Some(existing) = u_nbr
-                        .relationships
-                        .iter_mut()
-                        .find(|r| r.target == d_row.target)
-                    {
-                        existing.values = d_row.values.clone();
-                    } else {
-                        u_nbr.relationships.push(d_row.clone());
-                    }
+    if latest.revision == baseline.revision {
+        merged.neighbors = dest_written.neighbors;
+        merged.inventories = dest_written.inventories;
+        merged.type_attributes = dest_written.type_attributes;
+        merged.made_characters = dest_written.made_characters;
+        if let Some(fam) = merged.families.get_mut(&session.home_family) {
+            fam.upgrade_to_v9();
+            fam.budget = funds_at_return;
+            fam.house = expected_home_i32;
+            fam.set_secondary_house(0);
+            if let Some(dest_fam) = dest_written.families.get(&session.home_family) {
+                fam.friends = dest_fam.friends;
+                if let Ok(Some(magic)) = dest_fam.magic_history() {
+                    let _ = fam.set_magic_history(magic);
                 }
             }
         }
+        return Ok(merged);
     }
 
-    // Merge inventories: keep untouched neighbors' inventories from `latest`,
-    // and replace/insert inventories for all touched neighbors from `dest_written`.
-    merged.inventories.retain(|entry| {
-        entry
-            .as_ref()
-            .is_none_or(|inv| !touched_neighbors.contains(&inv.neighbor))
-    });
-    for d_inv in dest_written.inventories.iter().flatten() {
-        if touched_neighbors.contains(&d_inv.neighbor) {
-            merged.inventories.push(Some(d_inv.clone()));
-        }
+    // Concurrent-write path (`latest.revision != baseline.revision`):
+    // 1. Verify the away household itself was not concurrently altered.
+    let Some(latest_fam) = latest.families.get(&session.home_family) else {
+        return Err(TravelError::FamilyNotFound {
+            neighborhood: session.neighborhood_id.clone(),
+            family: session.home_family,
+        });
+    };
+    if latest_fam.members != baseline.home_family_members
+        || latest_fam.budget != baseline.home_family_budget
+    {
+        return Err(conflict());
     }
 
-    // Merge FAMI: update ONLY `session.home_family`, preserving all other
-    // families in `latest` untouched.
-    if let Some(fam) = merged.families.get_mut(&session.home_family) {
-        fam.upgrade_to_v9();
-        fam.budget = funds_at_return;
-        fam.house = expected_home_i32;
-        fam.set_secondary_house(0);
-        if let Some(dest_fam) = dest_written.families.get(&session.home_family) {
-            fam.friends = dest_fam.friends;
-            if let Ok(Some(magic)) = dest_fam.magic_history() {
-                let _ = fam.set_magic_history(magic);
-            }
-        }
-    }
-
-    // Union newly made characters without losing characters made concurrently.
+    // 2. Three-way merge `made_characters` (reject file/GUID collisions).
     for (&guid, ch) in &dest_written.made_characters.made {
-        if !merged.deleted_characters.contains(&guid) {
-            merged
+        if baseline.made_characters.made.contains_key(&guid) {
+            continue;
+        }
+        if merged.deleted_characters.contains(&guid)
+            || merged.made_characters.made.contains_key(&guid)
+            || merged
                 .made_characters
                 .made
-                .entry(guid)
-                .or_insert_with(|| ch.clone());
+                .values()
+                .any(|other| other.file == ch.file)
+        {
+            return Err(conflict());
         }
+        merged.made_characters.made.insert(guid, ch.clone());
     }
     if dest_written.made_characters.next_file > merged.made_characters.next_file {
         merged.made_characters.next_file = dest_written.made_characters.next_file;
     }
 
-    // Merge TATT entries produced on the destination lot.
-    if let Some(dest_tatt) = dest_written.type_attributes {
-        merged.type_attributes = Some(dest_tatt);
+    // 3. Three-way merge `NBRS` slots.
+    let max_slots = baseline
+        .neighbors
+        .len()
+        .max(dest_written.neighbors.len())
+        .max(merged.neighbors.len());
+    for idx in 0..max_slots {
+        let b_slot = baseline.neighbors.get(idx).and_then(|s| s.as_ref());
+        let d_slot = dest_written.neighbors.get(idx).and_then(|s| s.as_ref());
+        let l_slot = merged.neighbors.get(idx).and_then(|s| s.as_ref());
+
+        // Unchanged during destination visit -> preserve `latest` verbatim.
+        if d_slot == b_slot {
+            continue;
+        }
+
+        match (b_slot, d_slot, l_slot) {
+            (None, Some(d_nbr), None) => {
+                if merged.deleted_characters.contains(&d_nbr.guid) {
+                    return Err(conflict());
+                }
+                if merged.neighbors.len() <= idx {
+                    merged.neighbors.resize(idx + 1, None);
+                }
+                merged.neighbors[idx] = Some(d_nbr.clone());
+            }
+            (None, Some(_), Some(_)) => {
+                // Both sides allocated the same free neighbor slot concurrently.
+                return Err(conflict());
+            }
+            (Some(b_nbr), Some(d_nbr), Some(l_nbr)) => {
+                if d_nbr.guid != b_nbr.guid
+                    || l_nbr.guid != b_nbr.guid
+                    || l_nbr.id != b_nbr.id
+                    || d_nbr.id != b_nbr.id
+                {
+                    return Err(conflict());
+                }
+                if l_nbr == b_nbr {
+                    merged.neighbors[idx] = Some(d_nbr.clone());
+                    continue;
+                }
+                // Both sides modified this neighbor: allow only disjoint
+                // core/relationship updates, rejecting overlapping edits.
+                let dest_core_changed = d_nbr.person_mode != b_nbr.person_mode
+                    || d_nbr.person_data != b_nbr.person_data
+                    || d_nbr.name != b_nbr.name;
+                let latest_core_changed = l_nbr.person_mode != b_nbr.person_mode
+                    || l_nbr.person_data != b_nbr.person_data
+                    || l_nbr.name != b_nbr.name;
+                if dest_core_changed && latest_core_changed {
+                    return Err(conflict());
+                }
+
+                let b_rels = relationship_map(&b_nbr.relationships);
+                let d_rels = relationship_map(&d_nbr.relationships);
+                let l_rels = relationship_map(&l_nbr.relationships);
+                let targets: BTreeSet<i32> = b_rels
+                    .keys()
+                    .chain(d_rels.keys())
+                    .chain(l_rels.keys())
+                    .copied()
+                    .collect();
+                let mut merged_rels = Vec::new();
+                for target in targets {
+                    let bv = b_rels.get(&target);
+                    let dv = d_rels.get(&target);
+                    let lv = l_rels.get(&target);
+                    let d_changed = dv != bv;
+                    let l_changed = lv != bv;
+                    let chosen = match (d_changed, l_changed) {
+                        (false, _) => lv,
+                        (true, false) => dv,
+                        (true, true) if dv == lv => dv,
+                        (true, true) => return Err(conflict()),
+                    };
+                    if let Some(values) = chosen {
+                        merged_rels.push(sims_formats::neighborhood::Relationship {
+                            target,
+                            values: values.clone(),
+                        });
+                    }
+                }
+                let mut combined = if dest_core_changed {
+                    d_nbr.clone()
+                } else {
+                    l_nbr.clone()
+                };
+                combined.relationships = merged_rels;
+                merged.neighbors[idx] = Some(combined);
+            }
+            (Some(_), Some(_), None) => {
+                // Neighbor modified on destination was concurrently deleted in `latest`.
+                return Err(conflict());
+            }
+            (Some(b_nbr), None, Some(l_nbr)) => {
+                if l_nbr != b_nbr {
+                    return Err(conflict());
+                }
+                merged.neighbors[idx] = None;
+            }
+            (Some(_), None, None) | (None, None, _) => {}
+        }
+    }
+
+    // 4. Three-way merge `inventories` (`NGBH`).
+    let base_invs = inventory_map(&baseline.inventories);
+    let dest_invs = inventory_map(&dest_written.inventories);
+    let latest_invs = inventory_map(&merged.inventories);
+    let all_nids: BTreeSet<i16> = base_invs.keys().chain(dest_invs.keys()).copied().collect();
+    for nid in all_nids {
+        let bv = base_invs.get(&nid);
+        let dv = dest_invs.get(&nid);
+        let lv = latest_invs.get(&nid);
+        if dv == bv {
+            continue;
+        }
+        if lv != bv && lv != dv {
+            return Err(conflict());
+        }
+        merged
+            .inventories
+            .retain(|entry| entry.as_ref().is_none_or(|inv| inv.neighbor != nid));
+        if let Some(items) = dv {
+            merged
+                .inventories
+                .push(Some(sims_formats::neighborhood::Inventory {
+                    neighbor: nid,
+                    items: items.clone(),
+                }));
+        }
+    }
+
+    // 5. Three-way merge `type_attributes` (`TATT`).
+    let base_tatt = tatt_map(&baseline.type_attributes);
+    let dest_tatt = tatt_map(&dest_written.type_attributes);
+    let latest_tatt = tatt_map(&merged.type_attributes);
+    let all_guids: BTreeSet<u32> = base_tatt.keys().chain(dest_tatt.keys()).copied().collect();
+    for guid in all_guids {
+        let bv = base_tatt.get(&guid);
+        let dv = dest_tatt.get(&guid);
+        let lv = latest_tatt.get(&guid);
+        if dv == bv {
+            continue;
+        }
+        if lv != bv && lv != dv {
+            return Err(conflict());
+        }
+        let target_tatt = merged
+            .type_attributes
+            .get_or_insert_with(|| sims_formats::tatt::Tatt {
+                version: dest_written
+                    .type_attributes
+                    .as_ref()
+                    .map_or(0, |t| t.version),
+                packed: dest_written
+                    .type_attributes
+                    .as_ref()
+                    .is_none_or(|t| t.packed),
+                entries: Vec::new(),
+                count_end: 0,
+                consumed: 0,
+            });
+        match dv {
+            Some(values) => {
+                if let Some(existing) = target_tatt.entries.iter_mut().find(|e| e.guid == guid) {
+                    existing.values = values.clone();
+                } else {
+                    target_tatt.entries.push(sims_formats::tatt::Entry {
+                        guid,
+                        values: values.clone(),
+                        count_end: 0,
+                        end: 0,
+                    });
+                }
+            }
+            None => {
+                target_tatt.entries.retain(|e| e.guid != guid);
+            }
+        }
+    }
+
+    // 6. Update ONLY `session.home_family`, preserving all other families and
+    //    recomputing `friends` against the 3-way merged neighborhood.
+    let merged_friends =
+        count_stored_family_friends(&merged, session.home_family, friendship_threshold);
+    if let Some(fam) = merged.families.get_mut(&session.home_family) {
+        fam.upgrade_to_v9();
+        fam.budget = funds_at_return;
+        fam.house = expected_home_i32;
+        fam.set_secondary_house(0);
+        fam.friends = merged_friends;
+        if let Some(dest_fam) = dest_written.families.get(&session.home_family)
+            && let Ok(Some(magic)) = dest_fam.magic_history()
+        {
+            let _ = fam.set_magic_history(magic);
+        }
     }
 
     Ok(merged)
@@ -2511,6 +2795,7 @@ pub fn return_from_destination(
         session.home_house,
         &home_snapshot.neighborhood,
         &persisted,
+        false,
     )?;
     if persisted.trip_id != session.trip_id
         || persisted.session.home_family != session.home_family
@@ -2536,19 +2821,62 @@ pub fn return_from_destination(
         .save()
         .map_err(|e| TravelError::Lot(format!("snapshotting destination lot: {e}")))?;
 
-    // 1. Flush EVERY live person on the destination lot into `NBRS` so both
-    //    travelers and interacted townies/vacationers/celebrities/NPCs persist.
-    for person_id in dest_saved.world.people.clone() {
-        if dest_saved
+    // Resolve each traveler's authoritative live object ID FIRST (preferring
+    // the recorded `destination_object_id`) so any duplicate instance sharing
+    // the same GUID or neighbor ID cannot overwrite the authoritative traveler
+    // when flushing live persons to `NBRS`.
+    let mut preferred_traveler_ids: Vec<(usize, u16)> =
+        Vec::with_capacity(auth_session.travelers.len());
+    let mut preferred_id_set: BTreeSet<u16> = BTreeSet::new();
+    let mut preferred_guids: BTreeSet<u32> = BTreeSet::new();
+    let mut preferred_nids: BTreeSet<i16> = BTreeSet::new();
+    for (idx, traveler) in auth_session.travelers.iter().enumerate() {
+        let live_id = dest_saved
             .world
             .objects
-            .get(&person_id)
-            .is_some_and(|o| o.person.is_some())
-        {
-            people::save_to_record(&mut dest_saved.world, person_id).map_err(|e| {
-                TravelError::Lot(format!("saving destination person {person_id}: {e}"))
-            })?;
+            .get(&traveler.destination_object_id)
+            .is_some_and(|o| o.guid == traveler.guid && o.person.is_some())
+            .then_some(traveler.destination_object_id)
+            .or_else(|| {
+                dest_saved.world.people.iter().copied().find(|&id| {
+                    dest_saved
+                        .world
+                        .objects
+                        .get(&id)
+                        .is_some_and(|o| o.guid == traveler.guid && o.person.is_some())
+                })
+            });
+        if let Some(id) = live_id {
+            preferred_traveler_ids.push((idx, id));
+            preferred_id_set.insert(id);
+            preferred_guids.insert(traveler.guid);
+            preferred_nids.insert(traveler.neighbor_id);
         }
+    }
+
+    // 1. Flush non-duplicate live persons first, then authoritative travelers
+    //    so preferred `destination_object_id`s always win in `NBRS`.
+    for person_id in dest_saved.world.people.clone() {
+        if preferred_id_set.contains(&person_id) {
+            continue;
+        }
+        let Some(obj) = dest_saved.world.objects.get(&person_id) else {
+            continue;
+        };
+        let Some(person) = obj.person.as_ref() else {
+            continue;
+        };
+        let nid = person.data.get(PERSON_NEIGHBOR).copied().unwrap_or(0);
+        if preferred_guids.contains(&obj.guid) || (nid > 0 && preferred_nids.contains(&nid)) {
+            continue;
+        }
+        people::save_to_record(&mut dest_saved.world, person_id)
+            .map_err(|e| TravelError::Lot(format!("saving destination person {person_id}: {e}")))?;
+    }
+    for &(_, person_id) in &preferred_traveler_ids {
+        people::save_to_record(&mut dest_saved.world, person_id).map_err(|e| {
+            TravelError::Lot(format!("saving destination traveler {person_id}: {e}"))
+        })?;
     }
 
     // 2. Revoke temporary Vacation check-in hotel keys granted on arrival
@@ -2572,26 +2900,13 @@ pub fn return_from_destination(
         }
     }
 
-    // 3. Capture returning state for every traveler on the destination lot,
-    //    preferring the recorded `destination_object_id` first.
+    // 3. Capture returning state for every traveler on the destination lot
+    //    using the exact same resolved live IDs as step 1.
+    let resolved_by_index: BTreeMap<usize, u16> = preferred_traveler_ids.into_iter().collect();
     let mut returning_states: Vec<LiveTravelerSnapshot> =
         Vec::with_capacity(auth_session.travelers.len());
-    for traveler in &auth_session.travelers {
-        let live_id = dest_saved
-            .world
-            .objects
-            .get(&traveler.destination_object_id)
-            .is_some_and(|o| o.guid == traveler.guid && o.person.is_some())
-            .then_some(traveler.destination_object_id)
-            .or_else(|| {
-                dest_saved.world.people.iter().copied().find(|&id| {
-                    dest_saved
-                        .world
-                        .objects
-                        .get(&id)
-                        .is_some_and(|o| o.guid == traveler.guid && o.person.is_some())
-                })
-            });
+    for (idx, traveler) in auth_session.travelers.iter().enumerate() {
+        let live_id = resolved_by_index.get(&idx).copied();
         let made_outfits = dest_saved.world.made_outfits.get(&traveler.guid).cloned();
         if let Some(id) = live_id
             && let Some(obj) = dest_saved.world.objects.get(&id)
@@ -2639,9 +2954,9 @@ pub fn return_from_destination(
         })?;
     let magic_coins_at_return = family_magic_coins(&dest_saved.world, &family_members);
 
-    // 4. Reconcile destination neighborhood-wide updates onto the LATEST
-    //    `StoredNeighborhood` (`home_snapshot.neighborhood`) without clobbering
-    //    unrelated edits made while away, clearing `secondary_house = 0`.
+    // 4. Three-way reconcile destination neighborhood-wide updates against
+    //    `persisted.baseline` onto `home_snapshot.neighborhood`, preserving
+    //    unrelated edits made while away and rejecting true conflicts.
     let tuning = NeighborhoodTuning::from_program(&destination_lot.program);
 
     // Mark the returning household's friend count stale so `write_back_world`
@@ -2654,6 +2969,7 @@ pub fn return_from_destination(
     }
 
     let updated_stored = merge_destination_into_latest_neighborhood(
+        &persisted.baseline,
         &home_snapshot.neighborhood,
         &dest_saved.world,
         auth_session,
@@ -3069,8 +3385,13 @@ fn load_destination_world(
                 })
             })
             .collect();
+        let mut people_to_reset = BTreeSet::new();
+        let mut objects_to_reset = BTreeSet::new();
         for pid in orphaned {
-            strip_person_for_travel(&interpreter, &mut world, pid)?;
+            let (p_reset, o_reset) =
+                strip_person_for_travel_deferred(&interpreter, &mut world, pid)?;
+            people_to_reset.extend(p_reset);
+            objects_to_reset.extend(o_reset);
         }
         for pid in world.people.clone() {
             if world.objects.get(&pid).is_some_and(|o| o.person.is_some()) {
@@ -3079,6 +3400,7 @@ fn load_destination_world(
                     .map_err(|e| TravelError::Lot(format!("attaching person {pid}: {e}")))?;
             }
         }
+        apply_post_purge_resets(&interpreter, &mut world, people_to_reset, objects_to_reset)?;
         let _ = interpreter
             .ensure_indicators(&mut world)
             .map_err(|e| TravelError::Lot(e.to_string()))?;
@@ -3811,12 +4133,41 @@ fn reconcile_frozen_home_lot(
             .ensure_indicators(&mut world)
             .map_err(|e| TravelError::Lot(e.to_string()))?;
 
-        // Re-attach all non-traveling Sims on the home lot from latest NBRS.
+        // Purge any orphaned/deleted non-traveling visitors (e.g. a neighbor
+        // whose home lot was bulldozed while this household was away) BEFORE
+        // re-attaching surviving persons, matching `lifecycle::boot_from_saved_lot`.
         let returning_household_guids: BTreeSet<u32> = returning_states
             .iter()
             .filter(|s| s.is_household_member)
             .map(|s| s.guid)
             .collect();
+        let lot_epoch = saved.deletion_epoch;
+        let orphaned_home: Vec<u16> = world
+            .people
+            .iter()
+            .copied()
+            .filter(|&pid| {
+                world.objects.get(&pid).is_some_and(|o| {
+                    o.person.is_some()
+                        && (stored.deleted_characters.contains(&o.guid)
+                            || world.neighbors.first_of(o.guid).is_none()
+                            || stored
+                                .deleted_at_epoch
+                                .get(&o.guid)
+                                .is_some_and(|&del| lot_epoch < del))
+                })
+            })
+            .collect();
+        let mut home_people_to_reset = BTreeSet::new();
+        let mut home_objects_to_reset = BTreeSet::new();
+        for pid in orphaned_home {
+            let (p_reset, o_reset) =
+                strip_person_for_travel_deferred(&interpreter, &mut world, pid)?;
+            home_people_to_reset.extend(p_reset);
+            home_objects_to_reset.extend(o_reset);
+        }
+
+        // Re-attach all surviving non-traveling Sims on the home lot from latest NBRS.
         for pid in world.people.clone() {
             if let Some(obj) = world.objects.get(&pid)
                 && obj.person.is_some()
@@ -3827,6 +4178,12 @@ fn reconcile_frozen_home_lot(
                     .map_err(|e| TravelError::Lot(format!("attaching home person {pid}: {e}")))?;
             }
         }
+        apply_post_purge_resets(
+            &interpreter,
+            &mut world,
+            home_people_to_reset,
+            home_objects_to_reset,
+        )?;
 
         // Deselect cleanly before repositioning returning travelers so we don't
         // move an active indicator prematurely or hit 0x446c15 on famous Sims.
@@ -4410,15 +4767,67 @@ fn strip_deleted_base_objects(
 }
 
 /// Removes a person cleanly from `world` without leaving dangling slots, routes,
-/// object uses, or grid links (used when stripping visiting travelers from a
-/// saved destination lot or deduplicating a returning traveler on a home lot).
+/// object uses, grid links, or live BHAV execution frames referencing the
+/// removed object or its code owner, immediately resetting affected surviving
+/// threads.
 fn strip_person_for_travel(
     interpreter: &Interpreter<'_>,
     world: &mut World,
     id: u16,
 ) -> Result<(), TravelError> {
+    let (people_to_reset, objects_to_reset) =
+        strip_person_for_travel_deferred(interpreter, world, id)?;
+    apply_post_purge_resets(
+        interpreter,
+        world,
+        people_to_reset.into_iter().collect(),
+        objects_to_reset.into_iter().collect(),
+    )
+}
+
+/// Applies post-purge thread resets collected across one or more
+/// [`strip_person_for_travel_deferred`] calls after all orphans have been
+/// stripped and surviving persons re-attached.
+fn apply_post_purge_resets(
+    interpreter: &Interpreter<'_>,
+    world: &mut World,
+    people_to_reset: BTreeSet<u16>,
+    objects_to_reset: BTreeSet<u16>,
+) -> Result<(), TravelError> {
+    for other in people_to_reset {
+        if world
+            .objects
+            .get(&other)
+            .is_some_and(|o| o.person.is_some())
+        {
+            interpreter
+                .reset_person_after_purge(world, other)
+                .map_err(|e| {
+                    TravelError::Lot(format!("resetting person {other} after orphan purge: {e}"))
+                })?;
+        }
+    }
+    for other in objects_to_reset {
+        if world.objects.contains_key(&other) {
+            interpreter.reset(world, other, false).map_err(|e| {
+                TravelError::Lot(format!("resetting object {other} after orphan purge: {e}"))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Removes a person cleanly from `world` and returns `(people_to_reset,
+/// objects_to_reset)` so callers purging multiple orphans can finish all
+/// removals and re-attach survivors before running post-purge resets
+/// (matching `lifecycle.rs::purge_orphaned_person`).
+fn strip_person_for_travel_deferred(
+    interpreter: &Interpreter<'_>,
+    world: &mut World,
+    id: u16,
+) -> Result<(Vec<u16>, Vec<u16>), TravelError> {
     let Some(deleted_guid) = world.objects.get(&id).map(|o| o.guid) else {
-        return Ok(());
+        return Ok((Vec::new(), Vec::new()));
     };
     people::clear_person_uses_and_counts(world, id);
     let _ = crate::placement::unlink_off_lot(world, id);
@@ -4568,31 +4977,7 @@ fn strip_person_for_travel(
     world.repair_grid().map_err(|e| {
         TravelError::Lot(format!("repairing grid after stripping person {id}: {e}"))
     })?;
-    for other in people_to_reset {
-        if world
-            .objects
-            .get(&other)
-            .is_some_and(|o| o.person.is_some())
-        {
-            interpreter
-                .reset_person_after_purge(world, other)
-                .map_err(|e| {
-                    TravelError::Lot(format!(
-                        "resetting person {other} after stripping person {id}: {e}"
-                    ))
-                })?;
-        }
-    }
-    for other in objects_to_reset {
-        if world.objects.contains_key(&other) {
-            interpreter.reset(world, other, false).map_err(|e| {
-                TravelError::Lot(format!(
-                    "resetting object {other} after stripping person {id}: {e}"
-                ))
-            })?;
-        }
-    }
-    Ok(())
+    Ok((people_to_reset, objects_to_reset))
 }
 
 /// Reads `(lot_name, lot_description)` for `lot_id` from the install's
@@ -5921,6 +6306,360 @@ mod tests {
         let mut home_final = ret_st.home_lot;
         for _ in 0..20 {
             home_final.step().unwrap();
+        }
+    }
+
+    #[test]
+    fn three_way_merge_preserves_unrelated_writes_and_rejects_conflicts() {
+        let (mut dest_world, mut base_stored) = fixture_world_and_nh();
+        // Seed StoredNeighborhood with matching NBRS, inventories, and TATT.
+        base_stored.neighbors = vec![
+            Some(sims_formats::neighborhood::Neighbor {
+                version: 10,
+                version_extra: Some(1),
+                name: "Sim1".into(),
+                unknown_zero: 0,
+                person_mode: 9,
+                person_data: dest_world.neighbors.get(1).unwrap().data.clone(),
+                id: 1,
+                guid: 0x1001,
+                unknown_negative: -1,
+                relationships: Vec::new(),
+            }),
+            Some(sims_formats::neighborhood::Neighbor {
+                version: 10,
+                version_extra: Some(1),
+                name: "Sim2".into(),
+                unknown_zero: 0,
+                person_mode: 9,
+                person_data: dest_world.neighbors.get(2).unwrap().data.clone(),
+                id: 2,
+                guid: 0x1002,
+                unknown_negative: -1,
+                relationships: Vec::new(),
+            }),
+            Some(sims_formats::neighborhood::Neighbor {
+                version: 10,
+                version_extra: Some(1),
+                name: "Pet3".into(),
+                unknown_zero: 0,
+                person_mode: 9,
+                person_data: dest_world.neighbors.get(3).unwrap().data.clone(),
+                id: 3,
+                guid: 0x1003,
+                unknown_negative: -1,
+                relationships: Vec::new(),
+            }),
+            Some(sims_formats::neighborhood::Neighbor {
+                version: 10,
+                version_extra: Some(1),
+                name: "Townie4".into(),
+                unknown_zero: 0,
+                person_mode: 9,
+                person_data: dest_world.neighbors.get(4).unwrap().data.clone(),
+                id: 4,
+                guid: 0x2001,
+                unknown_negative: -1,
+                relationships: Vec::new(),
+            }),
+        ];
+        base_stored.inventories = vec![
+            Some(sims_formats::neighborhood::Inventory {
+                neighbor: 1,
+                items: vec![sims_formats::neighborhood::InventoryItem {
+                    kind: MAGICOIN_TOKEN_KIND,
+                    guid: MAGICOIN_TOKEN_GUID,
+                    count: 125,
+                }],
+            }),
+            Some(sims_formats::neighborhood::Inventory {
+                neighbor: 2,
+                items: vec![sims_formats::neighborhood::InventoryItem {
+                    kind: MAGICOIN_TOKEN_KIND,
+                    guid: MAGICOIN_TOKEN_GUID,
+                    count: 25,
+                }],
+            }),
+        ];
+        base_stored.type_attributes = Some(sims_formats::tatt::Tatt {
+            version: 0,
+            packed: true,
+            entries: vec![sims_formats::tatt::Entry {
+                guid: 0xaaaa_0001,
+                values: vec![1, 2],
+                count_end: 0,
+                end: 0,
+            }],
+            count_end: 0,
+            consumed: 0,
+        });
+        base_stored
+            .families
+            .get_mut(&5)
+            .unwrap()
+            .set_secondary_house(21);
+        base_stored.revision = 10;
+
+        let baseline = DepartureBaseline::from_stored(&base_stored, 10, 5);
+        let session = TravelSession {
+            store_id: 1,
+            instance_id: 1,
+            trip_id: 42,
+            neighborhood_id: "UserData".into(),
+            home_house: 5,
+            home_family: 5,
+            destination_house: 21,
+            destination: TravelDestination::Downtown,
+            transport: TravelTransport::DowntownCab,
+            accommodation: VacationAccommodation::None,
+            fare_paid: 50,
+            departure_ticks: 0,
+            departure_world_ticks: 0,
+            departure_clock: (8, 0, 0),
+            funds_before_fare: 2_050,
+            funds_at_arrival: 2_000,
+            magic_coins_at_arrival: 150,
+            leader_guid: 0x1001,
+            travelers: vec![TravelerRecord {
+                guid: 0x1001,
+                neighbor_id: 1,
+                is_household_member: true,
+                home_object_id: Some(1),
+                destination_object_id: 1,
+                had_hotel_key_before_trip: false,
+            }],
+        };
+
+        // Destination mutates Sim 1's cooking skill, relationship with 4, and inventory.
+        dest_world.neighbors.get_mut(1).unwrap().data[9] = 700;
+        dest_world
+            .neighbors
+            .get_mut(1)
+            .unwrap()
+            .relationships
+            .push(sims_sim::neighbors::Row {
+                target: 4,
+                values: vec![80, 80],
+            });
+        set_neighbor_token_count(&mut dest_world, 1, 0, 0xfeed_0001, 1);
+
+        // Concurrent writer advances revision to 11 and edits Townie 4's skill,
+        // Sim 2's inventory, Sim 1's relationship with Sim 2 (disjoint target!),
+        // and a TATT entry that destination did not change.
+        let mut latest = base_stored.clone();
+        latest.revision = 11;
+        latest.neighbors[3].as_mut().unwrap().person_data[9] = 450;
+        latest.neighbors[0].as_mut().unwrap().relationships.push(
+            sims_formats::neighborhood::Relationship {
+                target: 2,
+                values: vec![95, 95],
+            },
+        );
+        latest.inventories[1].as_mut().unwrap().items[0].count = 99;
+        latest.type_attributes.as_mut().unwrap().entries[0].values = vec![9, 9];
+
+        // 1. Disjoint concurrent edits merge cleanly with ZERO overwrites!
+        let merged = merge_destination_into_latest_neighborhood(
+            &baseline,
+            &latest,
+            &dest_world,
+            &session,
+            1_850,
+            50,
+        )
+        .unwrap();
+        assert_eq!(merged.neighbors[0].as_ref().unwrap().person_data[9], 700);
+        assert_eq!(
+            merged.neighbors[3].as_ref().unwrap().person_data[9],
+            450,
+            "concurrent Townie 4 edit preserved"
+        );
+        let sim1_rels = relationship_map(&merged.neighbors[0].as_ref().unwrap().relationships);
+        assert_eq!(sim1_rels.get(&4), Some(&vec![80, 80]));
+        assert_eq!(
+            sim1_rels.get(&2),
+            Some(&vec![95, 95]),
+            "disjoint concurrent relationship row preserved"
+        );
+        let invs = inventory_map(&merged.inventories);
+        assert_eq!(
+            invs[&2][0].count, 99,
+            "concurrent Sim 2 inventory preserved"
+        );
+        assert!(invs[&1].iter().any(|it| it.guid == 0xfeed_0001));
+        assert_eq!(
+            merged.type_attributes.as_ref().unwrap().entries[0].values,
+            vec![9, 9],
+            "concurrent TATT edit preserved"
+        );
+        assert_eq!(merged.families[&5].secondary_house(), 0);
+        assert_eq!(merged.families[&5].budget, 1_850);
+
+        // 2. Same-Sim core `person_data` conflict is rejected (never silently lost).
+        let mut core_conflict = latest.clone();
+        core_conflict.neighbors[0].as_mut().unwrap().person_data[9] = 333;
+        assert!(matches!(
+            merge_destination_into_latest_neighborhood(
+                &baseline,
+                &core_conflict,
+                &dest_world,
+                &session,
+                1_850,
+                50,
+            ),
+            Err(TravelError::StaleNeighborhood { .. })
+        ));
+
+        // 3. Same-inventory conflict is rejected.
+        let mut inv_conflict = latest.clone();
+        inv_conflict.inventories[0].as_mut().unwrap().items[0].count = 500;
+        assert!(matches!(
+            merge_destination_into_latest_neighborhood(
+                &baseline,
+                &inv_conflict,
+                &dest_world,
+                &session,
+                1_850,
+                50,
+            ),
+            Err(TravelError::StaleNeighborhood { .. })
+        ));
+
+        // 4. Newly created character neighbor-slot collision is rejected.
+        let mut slot_dest_world = dest_world.clone();
+        slot_dest_world
+            .neighbors
+            .slots
+            .push(Some(make_neighbor(5, 0x9001, 27, 0, 0)));
+        let mut slot_conflict = latest.clone();
+        slot_conflict
+            .neighbors
+            .push(Some(sims_formats::neighborhood::Neighbor {
+                version: 10,
+                version_extra: Some(1),
+                name: "ConcurrentNewSim".into(),
+                unknown_zero: 0,
+                person_mode: 9,
+                person_data: vec![0; PERSON_WORDS],
+                id: 5,
+                guid: 0x9002,
+                unknown_negative: -1,
+                relationships: Vec::new(),
+            }));
+        assert!(matches!(
+            merge_destination_into_latest_neighborhood(
+                &baseline,
+                &slot_conflict,
+                &slot_dest_world,
+                &session,
+                1_850,
+                50,
+            ),
+            Err(TravelError::StaleNeighborhood { .. })
+        ));
+    }
+
+    #[test]
+    fn deleted_frozen_home_visitor_is_purged_on_return_and_abort() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let db_path = std::env::temp_dir().join(format!(
+            "sims-vm-travel-deleted-visitor-{}.redb",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db_path);
+        struct Guard(PathBuf);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _guard = Guard(db_path.clone());
+
+        let store = NeighborhoodStore::open(&db_path).unwrap();
+        store
+            .import_directory("UserData", &root.join("UserData"), 0xff)
+            .unwrap();
+        let nh = store.load_neighborhood("UserData").unwrap().unwrap();
+        let goth_members = nh.family_in(5).unwrap().1.members.clone();
+        let mortimer_guid = goth_members[0];
+        let newbie_guid = nh.family_in(7).unwrap().1.members[0];
+
+        // Enter Goth House 5 and inject a visiting Newbie Sim onto the home lot
+        // before departure so the frozen home snapshot contains that visitor.
+        let mut goth =
+            crate::lifecycle::enter_lot(&root, &store, "UserData", 5, &[3], Frames::default())
+                .unwrap();
+        {
+            let interp = Interpreter::new(&goth.program, &goth.catalog, Stream::Global);
+            let visitor_id = interp.create_person(&mut goth.world, newbie_guid).unwrap();
+            let anchor = find_arrival_anchor(&goth.world, None);
+            let pos = find_free_arrival_position(
+                &interp,
+                &mut goth.world,
+                visitor_id,
+                anchor,
+                &BTreeSet::new(),
+            )
+            .unwrap();
+            place_person_on_tile(&interp, &mut goth.world, visitor_id, pos).unwrap();
+        }
+        assert!(
+            goth.world
+                .people
+                .iter()
+                .any(|id| goth.world.objects[id].guid == newbie_guid)
+        );
+
+        // Depart Mortimer to Downtown House 21 (freezing House 5 WITH the visitor).
+        let dep = depart_to_destination(
+            &root,
+            &store,
+            "UserData",
+            &mut goth,
+            &TravelRequest::downtown(21, mortimer_guid),
+        )
+        .unwrap();
+        let mut dt = dep.destination_lot;
+
+        // While Goth is away, delete the visitor's neighbor record in REDB
+        // (simulating bulldozing a lot that owned a tombstone visitor).
+        let mut nh_now = store.load_neighborhood("UserData").unwrap().unwrap();
+        nh_now.deleted_characters.insert(newbie_guid);
+        nh_now.deletion_epoch += 1;
+        nh_now
+            .deleted_at_epoch
+            .insert(newbie_guid, nh_now.deletion_epoch);
+        for slot in &mut nh_now.neighbors {
+            if slot.as_ref().is_some_and(|n| n.guid == newbie_guid) {
+                *slot = None;
+            }
+        }
+        store.save_neighborhood("UserData", &nh_now).unwrap();
+
+        // Return home MUST purge the deleted visitor cleanly instead of failing
+        // in `attach_neighbor`!
+        let ret = return_from_destination(
+            &root,
+            &store,
+            &dep.session,
+            &mut dt,
+            &[3],
+            Frames::default(),
+        )
+        .unwrap();
+        let mut home_after = ret.home_lot;
+        assert!(
+            !home_after
+                .world
+                .people
+                .iter()
+                .any(|id| home_after.world.objects[id].guid == newbie_guid),
+            "deleted visitor was purged during return reconciliation"
+        );
+        for _ in 0..20 {
+            home_after.step().unwrap();
         }
     }
 }

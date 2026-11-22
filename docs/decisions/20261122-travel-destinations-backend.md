@@ -99,7 +99,8 @@ home lot and boots the destination lot in memory **before** committing to REDB:
    - Live destination handles receive `neighborhood_origin = None` (blocking
      ordinary `lifecycle::save_and_leave_lot` from overwriting the Build/Buy
      destination snapshot) and `loaded = trip_binding_tag(store_id, trip_id)`
-     (cryptographically binding the handle to its unique departure `trip_id`).
+     (a 256-bit trip identity tag binding the handle to its unique departure
+     `trip_id`).
 
 ### 3. Return Home, Concurrent-Write Reconciliation & Crash Recovery (`return_from_destination`, `inspect_active_trip`, `resume_active_trip`, `abort_active_trip`)
 
@@ -112,36 +113,47 @@ home lot and boots the destination lot in memory **before** committing to REDB:
    freezing `departure_revision`, unrelated neighborhood writes made while away
    (such as editing and saving another unoccupied destination lot) do **not**
    strand the active trip.
-2. **Flush, Extract & Selective Neighborhood Merge:** Flushes every live Sim on
-   `destination_lot` into `NBRS`, revokes temporary Vacation check-in hotel
-   keys, captures returning traveler states (preferring each traveler's recorded
-   `destination_object_id` and copying `accessories` + outfits + motives +
-   `person.data`), and merges destination updates onto the **latest**
-   `StoredNeighborhood` (updating touched/new neighbors, their bidirectional
-   relationships and inventories, `TATT`, `made_characters`, and
-   `session.home_family`'s budget/friends/`secondary_house = 0` while preserving
-   unrelated families and untouched off-lot neighbors).
+2. **Flush, Extract & 3-Way Neighborhood Merge:** Resolves each traveler's
+   preferred `destination_object_id` before flushing live Sims into `NBRS` (so
+   a duplicate instance sharing a traveler's GUID or neighbor ID cannot
+   overwrite the authoritative traveler), revokes temporary Vacation check-in
+   hotel keys, captures returning traveler states (including `accessories`,
+   outfits, motives, and `person.data`), and performs a strict 3-way merge of
+   destination deltas against the persisted `DepartureBaseline` onto the
+   **latest** `StoredNeighborhood`:
+   - Unchanged neighbors, inventories, relationships, and `TATT` entries keep
+     `latest`'s values untouched (never overwritten by stale visit state).
+   - Disjoint concurrent edits merge cleanly.
+   - True conflicts (concurrent edits to the same Sim's `person_data`, same
+     relationship row, same inventory, same `TATT` entry, same away family's
+     roster/budget, or same newly allocated neighbor/character slot) fail
+     explicitly with `TravelError::StaleNeighborhood` instead of silently
+     dropping either side.
 3. **Home Reconciliation & Single-Transaction Commit:** Restores the frozen home
    lot directly from the authoritative `persisted.frozen_home_bytes` (taking
    exact `ticks`, `world.ticks`, and `globals[0/5/6]` clock from the decoded
-   `Saved` snapshot rather than caller-supplied session fields), keeps
-   non-traveling Sims/pets untouched, deduplicates and resets returning
-   household travelers cleanly at the home curb/portal, selects the returning
-   leader via `select_sim`, and commits the unwrapped `Saved` home lot + merged
+   `Saved` snapshot rather than caller-supplied session fields), purges any
+   orphaned/deleted frozen-home visitors (e.g. from another lot's bulldoze
+   while away) in two phases before re-attaching surviving non-traveling Sims
+   and running post-purge resets, deduplicates and resets returning household
+   travelers cleanly at the home curb/portal, selects the returning leader via
+   `select_sim`, and commits the unwrapped `Saved` home lot + merged
    `StoredNeighborhood` in a single atomic checked REDB transaction fenced on
    the latest `(instance_id, revision)`. Clears `destination_lot.loaded` so the
    handle cannot be returned twice.
-4. **Crash / Restart / Halted-Destination Recovery:**
+4. **Crash / Restart / Halted-Destination / Destination-Eviction Recovery:**
    - `inspect_active_trip`: reads and validates any active `TRVL` envelope for
-     `home_house`.
+     `home_house` (including when ordinary destination eviction/bulldoze cleared
+     `secondary_house = 0`).
    - `resume_active_trip`: reboots the destination lot from the persisted
      departure snapshots after a crash/restart or halted lot, atomically
-     rotating `trip_id` in the `TRVL` envelope so any stale pre-crash handle is
-     invalidated.
-   - `abort_active_trip`: settles an active or halted trip directly from the
-     persisted frozen home snapshot without needing a live destination handle,
-     revoking temporary hotel keys, clearing `secondary_house = 0`, and
-     unwrapping `TRVL` back into a normal `Saved` lot under a checked commit.
+     rotating `trip_id` and refreshing `DepartureBaseline` in the `TRVL`
+     envelope so any stale pre-crash handle is invalidated.
+   - `abort_active_trip`: settles an active, halted, or destination-evicted
+     trip directly from the persisted frozen home snapshot without needing a
+     live destination handle, revoking temporary hotel keys, clearing
+     `secondary_house = 0`, purging any deleted frozen visitors, and unwrapping
+     `TRVL` back into a normal `Saved` lot under a checked commit.
 
 ## Known VM Follow-Ups (Outside Disjoint Scope)
 

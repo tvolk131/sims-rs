@@ -3,7 +3,7 @@
 
 use sims_sim::NeighborhoodStore;
 use sims_vm::boot::Frames;
-use sims_vm::lifecycle::{enter_lot, save_and_leave_lot};
+use sims_vm::lifecycle::{enter_lot, evict, save_and_leave_lot};
 use sims_vm::travel::{
     DOWNTOWN_FARE, HOTEL_KEY_TOKEN_GUID, HOTEL_KEY_TOKEN_KIND, MAGIC_BLIMP_FARE, MAGIC_HOLE_FARE,
     OLD_TOWN_FARE, STUDIO_TOWN_FARE, TravelDestination, TravelError, TravelParty, TravelRequest,
@@ -749,8 +749,9 @@ fn active_trip_crash_resume_and_abort_recovery() {
         goth.world().globals[6],
     );
 
-    // 1. Depart to Vacation House 40 with hotel check-in, then simulate a
-    //    crash/restart by dropping the live destination handle.
+    // 1. Depart to Vacation House 40 with hotel check-in, then simulate a full
+    //    process crash/restart by dropping BOTH the live destination handle AND
+    //    the `NeighborhoodStore`, then reopening REDB from disk!
     let req = TravelRequest::vacation(
         40,
         mortimer_guid,
@@ -761,15 +762,18 @@ fn active_trip_crash_resume_and_abort_recovery() {
     let dep = depart_to_destination(&root, &store, "UserData", &mut goth, &req).unwrap();
     let old_trip_id = dep.session.trip_id;
     let mut stale_vac = dep.destination_lot;
+    drop(store);
 
+    let store = NeighborhoodStore::open(&db.0).unwrap();
     let inspected = inspect_active_trip(&store, "UserData", 5)
         .unwrap()
-        .expect("active trip visible after crash/restart");
+        .expect("active trip visible after REDB close and reopen");
     assert_eq!(inspected.trip_id, old_trip_id);
     assert_eq!(inspected.destination_house, 40);
 
-    // Resume the active trip: rotates `trip_id`, invalidates the old handle,
-    // boots Vacation House 40 with all travelers & hotel keys, and returns home!
+    // Resume the active trip against the reopened store: rotates `trip_id`,
+    // invalidates the old handle, boots Vacation House 40 with all travelers &
+    // hotel keys, and returns home!
     let resumed =
         resume_active_trip(&root, &store, "UserData", 5, &[3], Frames::default()).unwrap();
     assert_ne!(resumed.session.trip_id, old_trip_id);
@@ -811,7 +815,8 @@ fn active_trip_crash_resume_and_abort_recovery() {
     step_strict(&mut home_after_resume, 20, "goth home post-resume");
 
     // 2. Depart again to Vacation House 40, simulate a halted destination /
-    //    crash by dropping the handle, and settle via `abort_active_trip`.
+    //    crash by dropping the handle + reopening REDB, and settle via
+    //    `abort_active_trip`.
     let ticks_before_abort = home_after_resume.ticks();
     let clock_before_abort = (
         home_after_resume.world().globals[0],
@@ -822,7 +827,9 @@ fn active_trip_crash_resume_and_abort_recovery() {
         depart_to_destination(&root, &store, "UserData", &mut home_after_resume, &req).unwrap();
     let aborted_travelers = dep2.session.travelers.clone();
     drop(dep2.destination_lot);
+    drop(store);
 
+    let store = NeighborhoodStore::open(&db.0).unwrap();
     let aborted = abort_active_trip(&root, &store, "UserData", 5, &[3], Frames::default()).unwrap();
     let mut home_after_abort = aborted.home_lot;
     assert_eq!(home_after_abort.ticks(), ticks_before_abort);
@@ -847,7 +854,69 @@ fn active_trip_crash_resume_and_abort_recovery() {
         );
     }
     step_strict(&mut home_after_abort, 30, "goth home post-abort");
-    save_and_leave_lot(&root, &store, "UserData", &mut home_after_abort).unwrap();
+
+    // 3. Depart to Magic Town residential House 90, then run ordinary
+    //    `lifecycle::evict` on destination House 90 (which clears
+    //    `secondary_house = 0` while leaving the `TRVL` envelope on House 5).
+    //    Verify `inspect_active_trip` still sees it, `resume_active_trip`/
+    //    `return` reject it, and `abort_active_trip` cleanly settles Goth home!
+    let req90 = TravelRequest::magic_town(
+        90,
+        TravelParty::Single {
+            sim_guid: mortimer_guid,
+        },
+        TravelTransport::MagicHole,
+    );
+    let dep3 =
+        depart_to_destination(&root, &store, "UserData", &mut home_after_abort, &req90).unwrap();
+    let mut evicted_mt = dep3.destination_lot;
+    evict(&root, &store, "UserData", 90).unwrap();
+    assert_eq!(
+        store
+            .load_neighborhood("UserData")
+            .unwrap()
+            .unwrap()
+            .families[&5]
+            .secondary_house(),
+        0
+    );
+    assert_eq!(
+        inspect_active_trip(&store, "UserData", 5)
+            .unwrap()
+            .expect("evicted-destination trip still visible to inspect_active_trip")
+            .trip_id,
+        dep3.session.trip_id
+    );
+    assert!(matches!(
+        resume_active_trip(&root, &store, "UserData", 5, &[3], Frames::default()),
+        Err(TravelError::SessionMismatch(_))
+    ));
+    assert!(matches!(
+        return_from_destination(
+            &root,
+            &store,
+            &dep3.session,
+            &mut evicted_mt,
+            &[3],
+            Frames::default()
+        ),
+        Err(TravelError::SessionMismatch(_))
+    ));
+    drop(evicted_mt);
+
+    let settled = abort_active_trip(&root, &store, "UserData", 5, &[3], Frames::default()).unwrap();
+    let mut home_after_evict_abort = settled.home_lot;
+    assert!(
+        inspect_active_trip(&store, "UserData", 5)
+            .unwrap()
+            .is_none()
+    );
+    step_strict(
+        &mut home_after_evict_abort,
+        20,
+        "goth home post-destination-evict-abort",
+    );
+    save_and_leave_lot(&root, &store, "UserData", &mut home_after_evict_abort).unwrap();
     // Normal `enter_lot` works again once the `TRVL` envelope is unwrapped.
     let mut reopened = enter_lot(&root, &store, "UserData", 5, &[3], Frames::default()).unwrap();
     step_strict(&mut reopened, 10, "goth home normal enter_lot post-abort");
