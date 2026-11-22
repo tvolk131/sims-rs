@@ -16,7 +16,7 @@ use crate::coop::{
     CoopController, CoopPollOutput, CoopPumpStats, CoopStartOptions, CoopTransport, clipboard_copy,
     clipboard_paste, default_player_name, player_badge_color,
 };
-use crate::hud::{DialogKey, Hud, HudShared, HudStatic, OptionsDialog};
+use crate::hud::{CameraStripAction, DialogKey, Hud, HudShared, HudStatic, OptionsDialog};
 use crate::menu::{self, Listing, Menu};
 use crate::pace::{self, Pace};
 use crate::people::People;
@@ -147,6 +147,43 @@ impl Outcome {
 /// changes: 20 frames a second, this crate's choice (the original's frame
 /// rate is not ported).
 pub const SPIN_FRAME_US: u64 = 50_000;
+
+/// Duration of the smooth camera pan glide when double-clicking / re-clicking a
+/// Sim's portrait to centre the view (`0x4c9a27`), in microseconds (350 ms).
+pub const CAMERA_PAN_DURATION_US: u64 = 350_000;
+
+/// Active smooth camera pan interpolation from `start_origin` to `target_origin`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CameraPan {
+    start_origin: [i32; 2],
+    target_origin: [i32; 2],
+    start_us: u64,
+    duration_us: u64,
+}
+
+impl CameraPan {
+    fn sample(&self, now_us: u64) -> ([i32; 2], bool) {
+        let elapsed = now_us.saturating_sub(self.start_us);
+        if self.duration_us == 0 || elapsed >= self.duration_us {
+            return (self.target_origin, true);
+        }
+        let t = (elapsed as f64) / (self.duration_us as f64);
+        let inv = 1.0 - t;
+        // Cubic ease-out: fast responsive departure, gentle deceleration onto the Sim.
+        let eased = 1.0 - inv * inv * inv;
+        let lerp = |a: i32, b: i32| -> i32 {
+            let delta = f64::from(b) - f64::from(a);
+            (f64::from(a) + delta * eased).round() as i32
+        };
+        (
+            [
+                lerp(self.start_origin[0], self.target_origin[0]),
+                lerp(self.start_origin[1], self.target_origin[1]),
+            ],
+            false,
+        )
+    }
+}
 
 pub struct Game {
     lot: Lot,
@@ -290,6 +327,19 @@ pub struct Game {
     /// Explicit override enabling 400 ms pie-menu animations even at `clock_us == 0`.
     /// Also enabled automatically whenever `clock_us > 0` (live window / `advance`).
     pie_animations: bool,
+    /// When `true` (`--debug`), draws the maroon top diagnostic/status banner
+    /// and logs diagnostic notes to stderr. Defaults to `false`.
+    debug: bool,
+    /// Last diagnostic note logged to stderr while `debug` is enabled.
+    last_debug_logged_note: Option<String>,
+    /// Explicit override enabling smooth camera pan interpolation on portrait
+    /// centring even at `clock_us == 0`. Enabled automatically when `clock_us > 0`.
+    smooth_camera_pan: bool,
+    /// Active smooth camera pan toward a Sim's centred origin, if any.
+    camera_pan: Option<CameraPan>,
+    /// Set whenever `step_camera_pan` advances the camera origin, consumed by
+    /// the desktop host loop so the final landing frame always redraws.
+    camera_pan_moved: bool,
     /// Classic cheat console toggles (`move_objects`, `map_edit`, `autonomy`, `sim_speed`).
     cheat_move_objects: bool,
     cheat_map_edit: bool,
@@ -695,6 +745,11 @@ impl Game {
             lot_depth: Vec::new(),
             people_ids: sims_render::Ids::default(),
             pie_animations: false,
+            debug: false,
+            last_debug_logged_note: None,
+            smooth_camera_pan: false,
+            camera_pan: None,
+            camera_pan_moved: false,
             cheat_move_objects: false,
             cheat_map_edit: false,
             cheat_autonomy: None,
@@ -968,6 +1023,11 @@ impl Game {
             lot_depth: Vec::new(),
             people_ids: sims_render::Ids::default(),
             pie_animations: false,
+            debug: false,
+            last_debug_logged_note: None,
+            smooth_camera_pan: false,
+            camera_pan: None,
+            camera_pan_moved: false,
             cheat_move_objects: false,
             cheat_map_edit: false,
             cheat_autonomy: None,
@@ -1209,6 +1269,11 @@ impl Game {
             lot_depth: Vec::new(),
             people_ids: sims_render::Ids::default(),
             pie_animations: false,
+            debug: false,
+            last_debug_logged_note: None,
+            smooth_camera_pan: false,
+            camera_pan: None,
+            camera_pan_moved: false,
             cheat_move_objects: false,
             cheat_map_edit: false,
             cheat_autonomy: None,
@@ -1293,7 +1358,48 @@ impl Game {
             || self.hud.dragging_dialog_entry()
             || self.has_dialog()
             || self.pie_animating()
+            || self.camera_panning()
             || self.cheat_console_open()
+    }
+
+    /// Enables or disables smooth camera pan interpolation on portrait
+    /// double-click / re-click (also enabled automatically once `clock_us > 0`).
+    pub fn set_smooth_camera_pan(&mut self, enabled: bool) {
+        self.smooth_camera_pan = enabled;
+        if !enabled {
+            self.camera_pan = None;
+        }
+    }
+
+    fn smooth_pan_active(&self) -> bool {
+        self.smooth_camera_pan || self.clock_us > 0
+    }
+
+    /// Whether a smooth camera pan interpolation is currently in flight.
+    pub fn camera_panning(&self) -> bool {
+        self.camera_pan.is_some()
+    }
+
+    /// Returns and clears whether the camera origin moved during the last
+    /// smooth camera pan step.
+    pub fn take_camera_pan_moved(&mut self) -> bool {
+        std::mem::take(&mut self.camera_pan_moved)
+    }
+
+    fn step_camera_pan(&mut self) -> bool {
+        let Some(pan) = self.camera_pan else {
+            return false;
+        };
+        let (origin, finished) = pan.sample(self.clock_us);
+        let moved = self.view.set_origin(origin);
+        if finished {
+            self.camera_pan = None;
+            self.sync_view();
+        }
+        if moved {
+            self.camera_pan_moved = true;
+        }
+        moved || finished
     }
 
     /// Enables or disables 400 ms pie-menu pop-in / submenu glide / direction
@@ -1672,14 +1778,71 @@ impl Game {
         &mut self.lot
     }
 
-    /// Enables or disables the Camera-panel Photo Album button (`CamViewAlbum`, `1105`).
+    /// Enables or disables the Camera sub-strip's Photo Album action (`CamViewAlbum`, `1105`).
     pub fn set_album_button_enabled(&mut self, enabled: bool) {
         self.hud.set_album_button_enabled(enabled);
     }
 
-    /// Screen rectangle of the Camera-panel Photo Album button, if visible.
+    /// Whether the bottom Camera sub-strip is currently toggled open.
+    pub fn camera_strip_open(&self) -> bool {
+        self.hud.camera_strip_open()
+    }
+
+    /// Closes the bottom Camera sub-strip if open. Returns `true` if it was open.
+    pub fn close_camera_strip(&mut self) -> bool {
+        self.hud.close_camera_strip()
+    }
+
+    /// Bounding rectangle of the bottom Camera sub-strip when open.
+    pub fn camera_strip_rect(&self) -> Option<sims_ui::frame::Rect> {
+        self.hud.camera_strip_rect()
+    }
+
+    /// Screen rectangle of the Camera sub-strip's "Take Snapshot" button when open.
+    pub fn camera_snapshot_button_rect(&self) -> Option<sims_ui::frame::Rect> {
+        self.hud.camera_snapshot_button_rect()
+    }
+
+    /// Screen rectangle of the Camera sub-strip's "Photo Album" button, if open and enabled.
     pub fn album_button_rect(&self) -> Option<sims_ui::frame::Rect> {
         self.hud.album_button_rect()
+    }
+
+    /// Enables or disables `--debug` mode (which shows the maroon top
+    /// diagnostic/status banner and logs diagnostic notes to stderr).
+    pub fn set_debug(&mut self, debug: bool) {
+        self.debug = debug;
+        if !debug {
+            self.last_debug_logged_note = None;
+        }
+    }
+
+    /// Whether `--debug` diagnostic banner & stderr logging mode is active.
+    pub fn debug(&self) -> bool {
+        self.debug
+    }
+
+    /// Surfaces a genuine user-facing error or confirmation via a native Sims 1
+    /// modal message dialog (`cTSWinMsgBox`, OK button), while also recording
+    /// `body` in the programmatic [`Game::note`] getter (and logging to stderr
+    /// when `--debug` is enabled).
+    pub fn show_notice(&mut self, title: impl Into<String>, body: impl Into<String>) {
+        let body = body.into();
+        self.set_note(body.clone());
+        self.hud.open_notice_dialog(title, body, self.view.size);
+    }
+
+    fn log_debug_note_if_new(&mut self) {
+        if !self.debug {
+            return;
+        }
+        let current = self.note.as_deref();
+        if current != self.last_debug_logged_note.as_deref() {
+            if let Some(msg) = current {
+                eprintln!("sims-game [debug]: {msg}");
+            }
+            self.last_debug_logged_note = current.map(str::to_owned);
+        }
     }
 
     /// House baseline roof state read from `HOUS 0`.
@@ -1886,7 +2049,7 @@ impl Game {
     /// still set, upgrades it to `ConfirmSaveBeforeQuit` (`0x516821 ->
     /// 0x516866 -> 0x4f290d` with `dirty == true`).
     pub fn after_save_failed(&mut self) {
-        if self.dirty && self.hud.has_ui_dialog() {
+        if self.dirty && self.hud.ui_dialog_kind() == Some(OptionsDialog::ConfirmQuit) {
             let name = self.lot.lot_name().to_owned();
             let desc = self.lot.lot_description().to_owned();
             self.hud.open_options_dialog(
@@ -1928,6 +2091,7 @@ impl Game {
     pub fn set_note(&mut self, note: impl Into<String>) {
         self.pending_after_save_note = None;
         self.note = Some(note.into());
+        self.log_debug_note_if_new();
     }
 
     /// The status note currently displayed across the top of the frame, if any.
@@ -2366,6 +2530,9 @@ impl Game {
         mut keep_going: impl FnMut(u32) -> bool,
     ) -> (u32, bool) {
         self.clock_us = self.clock_us.saturating_add(clock_elapsed_us);
+        if self.step_camera_pan() {
+            self.blink_dirty = true;
+        }
         if self.hud.sync_clock_blink(self.lot.world(), self.clock_us)
             || self.hud.sync_dialog_blink(self.clock_us)
             || self.coop_lobby.sync_blink(self.clock_us)
@@ -2736,10 +2903,11 @@ impl Game {
         } else {
             None
         };
+        self.log_debug_note_if_new();
+        let status = self.debug.then(|| self.status()).flatten();
         let world = hud_world_override
             .as_ref()
             .unwrap_or_else(|| self.lot.world());
-        let status = self.status();
         // A dialog the lot waits on is in the lot as the tick left it when
         // it was shown. Read it before the pie menu so a newly opened dialog
         // suppresses the pie's dark backdrop and head on the frame it closes
@@ -2889,10 +3057,12 @@ impl Game {
         if size == self.view.size {
             return false;
         }
+        self.camera_pan = None;
         self.view.resize(size);
         self.sync_view_centre();
         self.hud.resize_menu(size);
         self.hud.relayout_dialog(size);
+        self.hud.layout_camera_strip(size);
         if matches!(
             self.hud.controls.mode,
             Mode::Buy | Mode::Build | Mode::Options
@@ -2918,6 +3088,7 @@ impl Game {
     /// synced only when the picker's camera geometry actually changes so
     /// no-op or wall-mode commands preserve a restored pick.
     pub fn apply(&mut self, command: Move) -> bool {
+        self.camera_pan = None;
         let before = self.view.camera;
         let (w, h) = self.house_viewport_size();
         let viewport = [w as i32, h as i32];
@@ -3084,6 +3255,7 @@ impl Game {
             // it; clicking empty strip background while holding an unpaid
             // preview cancels it.
             if !self.has_dialog()
+                && !self.hud.camera_strip_open()
                 && self.hud.controls.mode == Mode::Buy
                 && self.hud.over_buy_catalog(self.view.size, point)
                 && self.buy_cursor.is_some()
@@ -3094,6 +3266,7 @@ impl Game {
                 return Outcome::redraw();
             }
             if !self.has_dialog()
+                && !self.hud.camera_strip_open()
                 && self.hud.controls.mode == Mode::Build
                 && let Some(action) = self.hud.press_build_subtool(point)
             {
@@ -3348,14 +3521,21 @@ impl Game {
                 ..Outcome::default()
             };
         }
-        let (released_album, open_album) = self.hud.release_album_button(Some(point));
-        if open_album {
+        let (released_camera, camera_action) = self.hud.release_camera_strip(Some(point));
+        if let Some(action) = camera_action {
             let sounds = self.hud.take_sounds();
             self.keep_sounds(sounds);
-            return Outcome {
-                redraw: true,
-                open_photo_album: true,
-                ..Outcome::default()
+            return match action {
+                CameraStripAction::TakeSnapshot => Outcome {
+                    redraw: true,
+                    photo: true,
+                    ..Outcome::default()
+                },
+                CameraStripAction::PhotoAlbum => Outcome {
+                    redraw: true,
+                    open_photo_album: true,
+                    ..Outcome::default()
+                },
             };
         }
         let (released_action, action_cmd) = self.hud.release_options_action(Some(point));
@@ -3383,7 +3563,7 @@ impl Game {
             out.redraw |= released_slider
                 || released_saves
                 || released_coop
-                || released_album
+                || released_camera
                 || released_action
                 || released_dialog;
             return out;
@@ -3394,6 +3574,7 @@ impl Game {
             // Dropping a held object onto the Buy catalog strip sells it
             // (`0x50d04d` → `0x4cf97a` → `0x487e18`).
             if self.hud.controls.mode == Mode::Buy
+                && !self.hud.camera_strip_open()
                 && self.hud.over_buy_catalog(self.view.size, point)
                 && (self.buy_cursor.is_some() || self.coop_buy_preview.is_some())
             {
@@ -3426,7 +3607,7 @@ impl Game {
                 redraw: released_slider
                     || released_saves
                     || released_coop
-                    || released_album
+                    || released_camera
                     || released_action
                     || released_dialog,
                 ..Outcome::default()
@@ -3488,7 +3669,7 @@ impl Game {
         let released_slider = self.hud.release_slider(None);
         let (released_saves, _) = self.hud.release_saves_button(None);
         let (released_coop, _) = self.hud.release_coop_button(None);
-        let (released_album, _) = self.hud.release_album_button(None);
+        let (released_camera, _) = self.hud.release_camera_strip(None);
         let (released_action, _) = self.hud.release_options_action(None);
         let (released_dialog, _) = self.hud.release_dialog(None);
         if self.buy_dragging.take().is_some() {
@@ -3497,7 +3678,7 @@ impl Game {
                 || released_slider
                 || released_saves
                 || released_coop
-                || released_album
+                || released_camera
                 || released_action
                 || released_dialog;
             return Outcome {
@@ -3515,7 +3696,7 @@ impl Game {
                 redraw: released_slider
                     || released_saves
                     || released_coop
-                    || released_album
+                    || released_camera
                     || released_action
                     || released_dialog,
                 ..Outcome::default()
@@ -4029,7 +4210,8 @@ impl Game {
                 .get(&sim)
                 .and_then(|o| sims_ui::household::first_person_for_guid(world, o.guid))
                 .map_or(sim, |o| o.id);
-            self.centre_on(target);
+            let smooth = self.smooth_pan_active();
+            self.centre_on_with_pan(target, smooth);
             self.hud.play(crate::hud::CLICK);
             return;
         }
@@ -4087,6 +4269,10 @@ impl Game {
     /// origin to the scroll limits (0x4a9fa9) and align its x coordinate
     /// with `(x + 1) & !3` (0x4a81cc).
     pub fn centre_on(&mut self, id: u16) {
+        self.centre_on_with_pan(id, false);
+    }
+
+    fn centre_on_with_pan(&mut self, id: u16, smooth: bool) {
         let world = self.lot.world();
         let Some(object) = world.objects.get(&id) else {
             return;
@@ -4105,7 +4291,7 @@ impl Game {
         if is_person && level == self.view.camera.level {
             let mut at = lot_point(&self.view.camera, &self.lot_shape, position);
             at[1] -= person_rise(self.view.camera.zoom.level());
-            self.centre_screen_point(at, view_size);
+            self.centre_screen_point_with_pan(at, view_size, smooth);
             return;
         }
         if self.view.apply(Move::Floor(level)) {
@@ -4115,7 +4301,7 @@ impl Game {
             return;
         }
         let at = lot_point(&self.view.camera, &self.lot_shape, position);
-        self.centre_screen_point(at, view_size);
+        self.centre_screen_point_with_pan(at, view_size, smooth);
     }
 
     /// The active 3D house viewport size (`0x49ae5e`, `0x4f4b43`, `0x4d363b`,
@@ -4153,7 +4339,7 @@ impl Game {
     /// and `0x4a81cc` compute the original's `origin_x`, and we store
     /// `origin_x - pick::ORIGIN_COLUMN` so both walls and objects land on
     /// the original's exact screen columns.
-    fn centre_screen_point(&mut self, at: [i32; 2], view_size: [i32; 2]) {
+    fn centre_screen_point_with_pan(&mut self, at: [i32; 2], view_size: [i32; 2], smooth: bool) {
         let middle = [view_size[0] / 2, view_size[1] / 2];
         let origin = self.view.camera.origin;
         let target = [
@@ -4165,7 +4351,22 @@ impl Game {
         let native_x = target[0].max(min_x).min(max_x).wrapping_add(1) & !3;
         let clamped_x = native_x.saturating_sub(pick::ORIGIN_COLUMN);
         let clamped_y = target[1].max(min_y).min(max_y);
-        if self.view.set_origin([clamped_x, clamped_y]) {
+        let goal = [clamped_x, clamped_y];
+        if smooth && origin != goal {
+            if self.camera_pan.is_some_and(|pan| pan.target_origin == goal) {
+                return;
+            }
+            self.camera_pan = Some(CameraPan {
+                start_origin: origin,
+                target_origin: goal,
+                start_us: self.clock_us,
+                duration_us: CAMERA_PAN_DURATION_US,
+            });
+            self.camera_pan_moved = true;
+            return;
+        }
+        self.camera_pan = None;
+        if self.view.set_origin(goal) {
             self.sync_view();
         }
     }
@@ -4276,6 +4477,8 @@ impl Game {
         self.restore_dirty_on_quit_cancel = false;
         self.pending_after_save_note = None;
         self.edge_scroll_rem = [0, 0];
+        self.camera_pan = None;
+        self.camera_pan_moved = false;
         // `0x517c21`, `0x46d8c9`: edit mode and the §999,999 edit budget both
         // read `[lot + 0x50]` (`global[32]`), so keep `edit_mode` synced with
         // the restored snapshot's global 32.
@@ -4382,10 +4585,11 @@ impl Game {
                     }));
                     Outcome::redraw()
                 }
-                UiCamera::Photo => Outcome {
-                    photo: true,
-                    ..Outcome::default()
-                },
+                UiCamera::Photo => {
+                    self.hud.toggle_camera_strip(self.view.size);
+                    self.hud.play(crate::hud::CLICK);
+                    Outcome::redraw()
+                }
                 UiCamera::Roof => {
                     self.roof_view = !self.roof_view;
                     self.hud.set_roof_view(self.roof_view);
@@ -4744,6 +4948,7 @@ impl Game {
                 Outcome::redraw()
             }
             Command::TogglePanel => {
+                self.hud.close_camera_strip();
                 if self.hud.controls.mode == Mode::Live {
                     self.live_panel_expanded = self.hud.controls.expanded;
                 }
@@ -5114,6 +5319,7 @@ impl Game {
     /// updates `global[19]` (calling `go_live` `0x416534` when returning to
     /// Live mode), and refreshes the control panel and Buy catalog strip.
     pub fn set_mode(&mut self, mode: Mode) {
+        self.hud.close_camera_strip();
         // `0x4f2482..0x4f248b` -> `0x53b233..0x53b254`: edit-mode lots lock
         // out Live mode while `[lot + 0x50] == 1`.
         if mode == Mode::Live && self.edit_mode {

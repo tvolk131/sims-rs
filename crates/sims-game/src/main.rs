@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! sims-game [<install>] [<house file>] [--neighborhood] [--answers A,B,...] [--mute]
-//!           [--play] [--saves <file>] [--png <file> [--ticks N] [--size WxH]]
+//!           [--play | --strict] [--debug] [--saves <file>] [--png <file> [--ticks N] [--size WxH]]
 //! ```
 //!
 //! The install defaults to `SIMS_INSTALL`. Without a house file (or with
@@ -405,6 +405,7 @@ struct LaunchConfig {
     house: Option<PathBuf>,
     answers: Vec<u8>,
     play: bool,
+    debug: bool,
     still: Option<Still>,
     mute: bool,
     saves: PathBuf,
@@ -416,15 +417,17 @@ where
     I: IntoIterator<Item = std::ffi::OsString>,
 {
     let usage = "usage: sims-game [<install>] [<house file>] [--neighborhood] [--answers A,B,...] \
-                 [--mute] [--play] [--saves <file>] [--host | --join <ticket>] [--player-name <name>] \
-                 [--coop-loopback] [--png <file> [--ticks N] [--size WxH]]";
+                 [--mute] [--play | --strict] [--debug] [--saves <file>] [--host | --join <ticket>] \
+                 [--player-name <name>] [--coop-loopback] [--png <file> [--ticks N] [--size WxH]]";
     let mut paths = Vec::new();
     let mut answers = None;
     let mut png = None;
     let mut ticks = 0;
     let mut size = [800, 600];
     let mut mute = false;
-    let mut play = false;
+    let mut play_flag = false;
+    let mut strict_flag = false;
+    let mut debug = false;
     let mut neighborhood_flag = false;
     let mut saves = PathBuf::from("sims-game-saves.redb");
     let mut coop = CoopCliConfig::default();
@@ -438,7 +441,11 @@ where
         if arg == "--mute" {
             mute = true;
         } else if arg == "--play" {
-            play = true;
+            play_flag = true;
+        } else if arg == "--strict" {
+            strict_flag = true;
+        } else if arg == "--debug" {
+            debug = true;
         } else if arg == "--neighborhood" {
             neighborhood_flag = true;
         } else if arg == "--host" {
@@ -488,12 +495,25 @@ where
             paths.push(PathBuf::from(arg));
         }
     }
+    if play_flag && strict_flag {
+        return Err("--play and --strict cannot be combined".into());
+    }
     if coop.host && coop.join.is_some() {
         return Err("--host and --join cannot be combined".into());
     }
     if png.is_some() && (coop.host || coop.join.is_some()) {
         return Err("--png cannot be combined with --host or --join".into());
     }
+    // Interactive desktop play defaults to graceful play mode (`play: true`)
+    // unless `--strict` is explicitly requested; headless `--png` captures keep
+    // strict mode by default unless `--play` is explicitly given.
+    let play = if strict_flag {
+        false
+    } else if play_flag {
+        true
+    } else {
+        png.is_none()
+    };
     let mut paths = paths.into_iter();
     let install = match paths.next() {
         Some(path) => path,
@@ -528,6 +548,7 @@ where
         house,
         answers,
         play,
+        debug,
         still,
         mute,
         saves,
@@ -1137,6 +1158,7 @@ impl App {
     }
 
     fn photo(&mut self) {
+        self.session.render();
         let path = PathBuf::from(format!("sims-game-{}.png", self.photos));
         self.photos += 1;
         match std::fs::write(&path, png::encode(self.session.canvas())) {
@@ -1155,37 +1177,68 @@ impl App {
                     Ok(store) => store,
                     Err(e) => {
                         eprintln!("sims-game: {}: {e}", self.saves.display());
-                        let msg = if restore {
-                            format!("The save was not restored: {e}")
+                        let (title, msg) = if restore {
+                            ("Restore Failed", format!("The save was not restored: {e}"))
                         } else {
-                            format!("The lot was not saved: {e}")
+                            ("Save Failed", format!("The lot was not saved: {e}"))
                         };
-                        game.set_note(msg);
+                        if game.has_ui_dialog() {
+                            game.set_note(msg);
+                        } else {
+                            game.show_notice(title, msg);
+                        }
                         self.changed(true, true);
                         return false;
                     }
                 };
                 if !restore {
-                    game.save_to(&store, slot)
+                    let saved = game.save_to(&store, slot);
+                    if !saved
+                        && !game.has_ui_dialog()
+                        && let Some(msg) = game.note().map(str::to_owned)
+                    {
+                        game.show_notice("Save Failed", msg);
+                    }
+                    saved
                 } else if game.restore_from(&store, slot) {
                     self.printed = 0;
                     self.reported = false;
                     self.wake_clock.reset(Instant::now());
                     true
                 } else {
+                    if !game.has_ui_dialog()
+                        && let Some(msg) = game.note().map(str::to_owned)
+                    {
+                        game.show_notice("Restore Failed", msg);
+                    }
                     false
                 }
             }
             Session::Shell(shell) => {
                 if !restore {
-                    shell.save_current_lot().is_ok()
-                } else if shell.restore_current_lot().is_ok() {
-                    self.printed = 0;
-                    self.reported = false;
-                    self.wake_clock.reset(Instant::now());
-                    true
+                    match shell.save_current_lot() {
+                        Ok(_) => true,
+                        Err(e) => {
+                            shell.show_notice("Save Failed", format!("The lot was not saved: {e}"));
+                            false
+                        }
+                    }
                 } else {
-                    false
+                    match shell.restore_current_lot() {
+                        Ok(_) => {
+                            self.printed = 0;
+                            self.reported = false;
+                            self.wake_clock.reset(Instant::now());
+                            true
+                        }
+                        Err(e) => {
+                            shell.show_notice(
+                                "Restore Failed",
+                                format!("The save was not restored: {e}"),
+                            );
+                            false
+                        }
+                    }
                 }
             }
         };
@@ -1214,7 +1267,8 @@ impl App {
         if outcome.open_save_manager
             && let Some(game) = self.session.game_mut()
         {
-            game.set_note(
+            game.show_notice(
+                "Save Manager",
                 "Save Manager requires launching in Neighborhood / REDB mode (without a house file).",
             );
             self.changed(true, true);
@@ -1231,7 +1285,8 @@ impl App {
             && saved_ok
             && let Some(game) = self.session.game_mut()
         {
-            game.set_note(
+            game.show_notice(
+                "Neighborhood",
                 "Neighborhood view requires launching without a house file (or with --neighborhood).",
             );
             self.changed(true, true);
@@ -1294,7 +1349,7 @@ impl App {
             Key::Named(NamedKey::F7) => {
                 if let Session::Shell(shell) = &mut self.session {
                     if let Err(err) = shell.open_default_travel_dialog() {
-                        shell.set_note(format!("Travel unavailable: {err}"));
+                        shell.show_notice("Travel", format!("Travel unavailable: {err}"));
                     }
                     self.changed(true, true);
                 }
@@ -1315,7 +1370,7 @@ impl App {
             Key::Named(NamedKey::F10) => {
                 if let Session::Shell(shell) = &mut self.session {
                     if let Err(err) = shell.open_photo_album() {
-                        shell.set_note(format!("Photo Album unavailable: {err}"));
+                        shell.show_notice("Photo Album", format!("Photo Album unavailable: {err}"));
                     }
                     self.changed(true, true);
                 }
@@ -1353,7 +1408,10 @@ impl App {
                         "t" | "T" if !self.shift_held => {
                             if let Session::Shell(shell) = &mut self.session {
                                 if let Err(err) = shell.open_default_travel_dialog() {
-                                    shell.set_note(format!("Travel unavailable: {err}"));
+                                    shell.show_notice(
+                                        "Travel",
+                                        format!("Travel unavailable: {err}"),
+                                    );
                                 }
                                 self.changed(true, true);
                             }
@@ -1366,7 +1424,10 @@ impl App {
                                 if let Err(err) = shell.return_from_destination()
                                     && (shell.screen() == ScreenKind::Lot || shell.note().is_none())
                                 {
-                                    shell.set_note(format!("Could not return home: {err}"));
+                                    shell.show_notice(
+                                        "Travel",
+                                        format!("Could not return home: {err}"),
+                                    );
                                 }
                                 self.drain_shell_audio();
                                 self.changed(true, true);
@@ -1458,13 +1519,13 @@ impl App {
                     if pending_coop.host {
                         if let Err(err) = shell.coop_host_current_or_default() {
                             eprintln!("sims-game: co-op host failed: {err}");
-                            shell.set_note(format!("Co-op host failed: {err}"));
+                            shell.show_notice("Co-op", format!("Co-op host failed: {err}"));
                         }
                     } else if let Some(ticket) = pending_coop.join
                         && let Err(err) = shell.coop_join_from_shell(ticket)
                     {
                         eprintln!("sims-game: co-op join failed: {err}");
-                        shell.set_note(format!("Co-op join failed: {err}"));
+                        shell.show_notice("Co-op", format!("Co-op join failed: {err}"));
                     }
                     self.session = Session::Shell(Box::new(shell));
                     self.attach_loading_presenter();
@@ -1540,7 +1601,8 @@ impl App {
         let mut redraw = ran > 0 || (!waited && game.asking().is_some());
         let scrolled = self.drag.is_none() && game.edge_scroll(clock_us);
         let pie_anim = game.pie_animating();
-        redraw |= scrolled || pie_anim || game.spin_due() || game.blink_due();
+        let panning = game.take_camera_pan_moved() || game.camera_panning();
+        redraw |= scrolled || pie_anim || panning || game.spin_due() || game.blink_due();
         let sound_rc = Rc::clone(&self.sound);
         self.sound_feed
             .update(game, |input| sound_rc.borrow().send(input));
@@ -1550,9 +1612,12 @@ impl App {
         }
         self.printed = game.errors().len();
         if !self.reported
-            && let Some(stop) = game.stopped()
+            && let Some(stop) = game.stopped().map(str::to_owned)
         {
             eprintln!("sims-game: {stop}");
+            if !game.debug() {
+                game.show_notice("Lot Stopped", stop);
+            }
             self.reported = true;
             redraw = true;
         }
@@ -1562,16 +1627,19 @@ impl App {
         } else if let Session::Standalone { game, .. } = &mut self.session
             && let Some((host_house, host_family)) = game.pending_coop_restage()
         {
-            game.fail_pending_coop_restage(format!(
+            let msg = format!(
                 "Host is playing Lot {host_house} (family {host_family}), which does not match \
                  this standalone house file. Relaunch with House{host_house:02}.iff or in \
                  Neighborhood mode and rejoin."
-            ));
+            );
+            game.fail_pending_coop_restage(msg.clone());
+            game.show_notice("Co-op", msg);
             redraw = true;
         }
-        // Edge-scrolling and active 400 ms pie animations use display-refresh cadence,
-        // while pure simulation ticks / plumb-bob spin / pause blink are passive (60 FPS cap).
-        self.changed(redraw, scrolled || pie_anim);
+        // Edge-scrolling, smooth camera pan, and active 400 ms pie animations use
+        // display-refresh cadence, while pure simulation ticks / plumb-bob spin /
+        // pause blink are passive (60 FPS cap).
+        self.changed(redraw, scrolled || pie_anim || panning);
     }
 
     fn redraw(&mut self) {
@@ -2349,7 +2417,7 @@ impl ApplicationHandler for App {
                         match &mut self.session {
                             Session::Starting(_) => {}
                             Session::Standalone { game, .. } => {
-                                let closed = game.close_menu();
+                                let closed = game.close_menu() || game.close_camera_strip();
                                 let cancelled = !closed && game.cancel_buy();
                                 let escaped_options =
                                     !closed && !cancelled && game.escape_options();
@@ -2364,7 +2432,7 @@ impl ApplicationHandler for App {
                             }
                             Session::Shell(shell) => {
                                 if let Some(game) = shell.game_mut() {
-                                    let closed = game.close_menu();
+                                    let closed = game.close_menu() || game.close_camera_strip();
                                     let cancelled = !closed && game.cancel_buy();
                                     let escaped_options =
                                         !closed && !cancelled && game.escape_options();
@@ -2628,6 +2696,7 @@ fn run() -> Result<(), String> {
         };
         #[cfg(not(any(target_os = "macos", feature = "sound")))]
         let mut game = Game::open(&game_options)?;
+        game.set_debug(config.debug);
         eprintln!(
             "sims-game: booted in {:.1} s",
             started.elapsed().as_secs_f32()
@@ -2679,13 +2748,13 @@ fn run() -> Result<(), String> {
             game.open_coop_lobby(Some(sims_ui::coop::LobbyTab::Host));
             if let Err(err) = game.coop_start_host_async(None) {
                 eprintln!("sims-game: co-op host failed: {err}");
-                game.set_note(format!("Co-op host failed: {err}"));
+                game.show_notice("Co-op", format!("Co-op host failed: {err}"));
             }
         } else if let Some(ticket) = config.coop.join.clone() {
             game.open_coop_lobby(Some(sims_ui::coop::LobbyTab::Join));
             if let Err(err) = game.coop_start_join_async(ticket, None) {
                 eprintln!("sims-game: co-op join failed: {err}");
-                game.set_note(format!("Co-op join failed: {err}"));
+                game.show_notice("Co-op", format!("Co-op join failed: {err}"));
             }
         }
         #[cfg(any(target_os = "macos", feature = "sound"))]
@@ -2740,6 +2809,7 @@ fn run() -> Result<(), String> {
     let install_bg = config.install.clone();
     let saves_bg = config.saves.clone();
     let play_bg = config.play;
+    let debug_bg = config.debug;
     let answers_bg = config.answers;
     let mute_bg = config.mute;
     std::thread::spawn(move || {
@@ -2756,7 +2826,11 @@ fn run() -> Result<(), String> {
                     play_bg,
                     answers_bg,
                     sims_game::Frames::default(),
-                );
+                )
+                .map(|mut shell| {
+                    shell.set_debug(debug_bg);
+                    shell
+                });
                 (
                     shell_res,
                     mixer_handle
@@ -2774,7 +2848,10 @@ fn run() -> Result<(), String> {
                 answers_bg,
                 sims_game::Frames::default(),
             )
-            .map(|shell| (shell, None))
+            .map(|mut shell| {
+                shell.set_debug(debug_bg);
+                (shell, None)
+            })
         };
         #[cfg(not(any(target_os = "macos", feature = "sound")))]
         let result: StartupResult = {
@@ -2787,7 +2864,10 @@ fn run() -> Result<(), String> {
                 answers_bg,
                 sims_game::Frames::default(),
             )
-            .map(|shell| (shell, None))
+            .map(|mut shell| {
+                shell.set_debug(debug_bg);
+                (shell, None)
+            })
         };
         let _ = tx.send(result);
     });
@@ -3234,17 +3314,51 @@ mod tests {
     fn cli_defaults_to_neighborhood_while_keeping_house_and_png_backwards_compatible() {
         let env = Some(PathBuf::from("/sims"));
 
-        // Default with no house arg -> Neighborhood shell.
+        // Default with no house arg -> Neighborhood shell in graceful play mode, debug off.
         let cfg = parse_launch_args(Vec::<OsString>::new(), env.clone()).unwrap();
         assert_eq!(cfg.install, PathBuf::from("/sims"));
         assert!(cfg.house.is_none());
         assert!(cfg.still.is_none());
+        assert!(
+            cfg.play,
+            "interactive Neighborhood mode defaults to play mode"
+        );
+        assert!(!cfg.debug, "--debug defaults to false");
 
-        // Explicit --neighborhood -> Neighborhood shell.
-        let cfg = parse_launch_args([OsString::from("--neighborhood")], env.clone()).unwrap();
+        // Explicit --neighborhood --strict --debug -> strict halt mode + debug banners.
+        let cfg = parse_launch_args(
+            [
+                OsString::from("--neighborhood"),
+                OsString::from("--strict"),
+                OsString::from("--debug"),
+            ],
+            env.clone(),
+        )
+        .unwrap();
         assert!(cfg.house.is_none());
+        assert!(!cfg.play, "--strict disables play mode");
+        assert!(cfg.debug, "--debug enables diagnostic banner mode");
 
-        // Explicit <install> <house> -> direct house launch.
+        // Explicit <install> <house> -> direct interactive house launch defaults to play mode.
+        let cfg = parse_launch_args(
+            [
+                OsString::from("/sims"),
+                OsString::from("/sims/UserData/Houses/House05.iff"),
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.house,
+            Some(PathBuf::from("/sims/UserData/Houses/House05.iff"))
+        );
+        assert!(
+            cfg.play,
+            "interactive direct house launch defaults to play mode"
+        );
+        assert!(!cfg.debug);
+
+        // Explicit --play remains accepted for backwards compatibility.
         let cfg = parse_launch_args(
             [
                 OsString::from("/sims"),
@@ -3254,13 +3368,18 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(
-            cfg.house,
-            Some(PathBuf::from("/sims/UserData/Houses/House05.iff"))
-        );
         assert!(cfg.play);
 
-        // --png without house -> defaults to Goth house with answers = [3].
+        // --play and --strict together are rejected.
+        assert!(
+            parse_launch_args(
+                [OsString::from("--play"), OsString::from("--strict")],
+                env.clone(),
+            )
+            .is_err()
+        );
+
+        // --png without house -> defaults to Goth house with answers = [3] and strict mode.
         let cfg = parse_launch_args(
             [OsString::from("--png"), OsString::from("out.png")],
             env.clone(),
@@ -3269,6 +3388,20 @@ mod tests {
         assert_eq!(cfg.house, Some(goth_house(std::path::Path::new("/sims"))));
         assert_eq!(cfg.answers, vec![3]);
         assert!(cfg.still.is_some());
+        assert!(!cfg.play, "headless --png defaults to strict mode");
+        assert!(!cfg.debug);
+
+        // --png --play explicitly opts into play mode for still capture.
+        let cfg = parse_launch_args(
+            [
+                OsString::from("--png"),
+                OsString::from("out.png"),
+                OsString::from("--play"),
+            ],
+            env.clone(),
+        )
+        .unwrap();
+        assert!(cfg.play);
     }
 
     #[test]

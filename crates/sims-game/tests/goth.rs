@@ -802,9 +802,10 @@ fn a_press_on_an_actions_icon_cancels_it() {
     assert!(!icon.yellow && !icon.cancelled);
     assert_eq!(icon.rect, Rect::new(32, 32, 45, 45));
     let centre = [icon.rect.x + 22, icon.rect.y + 22];
-    // In a narrow window the note the order left across the top wraps
-    // down over the icon; a press there is the band's, and cancels
+    // In a narrow window with `--debug` enabled, the note the order left across
+    // the top wraps down over the icon; a press there is the band's, and cancels
     // nothing. The press clears the note.
+    game.set_debug(true);
     game.resize([80, 600]);
     game.render();
     game.take_sounds();
@@ -813,6 +814,7 @@ fn a_press_on_an_actions_icon_cancels_it() {
     game.press(under_band);
     assert_eq!(mortimer(&game).queue.len(), 1);
     assert!(game.take_sounds().is_empty());
+    game.set_debug(false);
     game.resize([800, 600]);
     game.render();
     // A press on it takes it off the queue, with the interface's sound.

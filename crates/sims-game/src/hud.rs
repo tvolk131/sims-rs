@@ -112,6 +112,18 @@ pub enum OptionsDialog {
     /// Dirty savable Reset Tutorial confirmation (`0x4f25ea -> 0x4f1a11`):
     /// `STR# 153[3..4]` (`confirm_save`) + Yes/No/Cancel.
     ConfirmSaveBeforeResetTutorial,
+    /// Genuine user-facing error or confirmation notice (`cTSWinMsgBox` + OK).
+    Notice,
+}
+
+/// Interactive button inside the bottom Camera sub-strip (toggled by the
+/// cluster's Camera button, `Command::Camera(Photo)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CameraStripAction {
+    /// Captures a PNG snapshot of the current lot view.
+    TakeSnapshot,
+    /// Opens the household Photo Album modal (`F10`).
+    PhotoAlbum,
 }
 
 pub struct Hud {
@@ -177,14 +189,21 @@ pub struct Hud {
     /// Last laid-out screen rect of the Options-strip "Co-op" button (present only
     /// while `Mode::Options` is expanded).
     coop_button_rect: Option<Rect>,
-    /// Whether the Camera-panel Photo Album button (`CamViewAlbum`, resource `1105`)
-    /// is shown beside the snapshot button (enabled in `NeighborhoodShell` lots,
-    /// disabled for standalone/ratchet renders so static Live frames stay bit-exact).
+    /// Whether the Camera sub-strip's Photo Album action (`CamViewAlbum`, `1105`)
+    /// is enabled (true in `NeighborhoodShell` lots, false in standalone launches).
     album_button_enabled: bool,
-    /// Whether the Camera-panel Photo Album button is currently pressed.
-    pressed_album_button: bool,
-    /// Last laid-out screen rect of the Camera-panel Photo Album button.
-    album_button_rect: Option<Rect>,
+    /// Whether the Camera sub-strip is currently toggled open inside the bottom
+    /// panel strip area (`x >= hud::CLUSTER[0]`).
+    camera_strip_open: bool,
+    /// Camera sub-strip button currently held down for mouse-up dispatch.
+    pressed_camera_action: Option<CameraStripAction>,
+    /// Last laid-out bounding rect of the Camera sub-strip when open.
+    camera_strip_rect: Option<Rect>,
+    /// Last laid-out screen rect of the Camera sub-strip's "Take Snapshot" button.
+    camera_snapshot_rect: Option<Rect>,
+    /// Last laid-out screen rect of the Camera sub-strip's "Photo Album" button
+    /// (populated only while the Camera sub-strip is open and Photo Album is enabled).
+    camera_album_rect: Option<Rect>,
     /// Whether the Roof camera toggle (`Camera::Roof`) is active.
     roof_view: bool,
     /// Classic Sims 1 top-left cheat console (`Ctrl+Shift+C` / `Cmd+Shift+C`).
@@ -541,8 +560,11 @@ impl Hud {
             pressed_coop_button: false,
             coop_button_rect: None,
             album_button_enabled: false,
-            pressed_album_button: false,
-            album_button_rect: None,
+            camera_strip_open: false,
+            pressed_camera_action: None,
+            camera_strip_rect: None,
+            camera_snapshot_rect: None,
+            camera_album_rect: None,
             roof_view: false,
             cheat_console: CheatConsole::new(),
             menu: None,
@@ -584,8 +606,11 @@ impl Hud {
         self.saves_button_rect = None;
         self.pressed_coop_button = false;
         self.coop_button_rect = None;
-        self.pressed_album_button = false;
-        self.album_button_rect = None;
+        self.camera_strip_open = false;
+        self.pressed_camera_action = None;
+        self.camera_strip_rect = None;
+        self.camera_snapshot_rect = None;
+        self.camera_album_rect = None;
         self.roof_view = false;
         self.controls.pressed_options_action = None;
         self.controls.help = None;
@@ -733,34 +758,88 @@ impl Hud {
         self.build_layout.press_subtool(point)
     }
 
-    /// Enables or disables the Camera-panel Photo Album button (`CamViewAlbum`, `1105`).
+    /// Enables or disables the Camera sub-strip's Photo Album action (`CamViewAlbum`, `1105`).
     pub fn set_album_button_enabled(&mut self, enabled: bool) {
         self.album_button_enabled = enabled;
         if !enabled {
-            self.album_button_rect = None;
-            self.pressed_album_button = false;
+            self.camera_album_rect = None;
+            if self.pressed_camera_action == Some(CameraStripAction::PhotoAlbum) {
+                self.pressed_camera_action = None;
+            }
         }
     }
 
-    /// Screen rectangle of the Camera-panel Photo Album button, when shown.
+    /// Whether the bottom Camera sub-strip is currently toggled open.
+    pub fn camera_strip_open(&self) -> bool {
+        self.camera_strip_open
+    }
+
+    /// Toggles the bottom Camera sub-strip open or closed, returning the new state.
+    pub fn toggle_camera_strip(&mut self, size: [i32; 2]) -> bool {
+        self.camera_strip_open = !self.camera_strip_open;
+        if self.camera_strip_open {
+            self.dismiss_help();
+            self.layout_camera_strip(size);
+        } else {
+            self.clear_camera_strip_layout();
+        }
+        self.camera_strip_open
+    }
+
+    /// Closes the bottom Camera sub-strip if open. Returns `true` if it was open.
+    pub fn close_camera_strip(&mut self) -> bool {
+        if !self.camera_strip_open {
+            return false;
+        }
+        self.camera_strip_open = false;
+        self.clear_camera_strip_layout();
+        true
+    }
+
+    fn clear_camera_strip_layout(&mut self) {
+        self.pressed_camera_action = None;
+        self.camera_strip_rect = None;
+        self.camera_snapshot_rect = None;
+        self.camera_album_rect = None;
+    }
+
+    /// Bounding rectangle of the Camera sub-strip inside the bottom panel strip
+    /// area, when open.
+    pub fn camera_strip_rect(&self) -> Option<Rect> {
+        self.camera_strip_rect
+    }
+
+    /// Screen rectangle of the Camera sub-strip's "Take Snapshot" button, when open.
+    pub fn camera_snapshot_button_rect(&self) -> Option<Rect> {
+        self.camera_snapshot_rect
+    }
+
+    /// Screen rectangle of the Camera sub-strip's "Photo Album" button, when
+    /// the Camera sub-strip is open and Photo Album is enabled.
     pub fn album_button_rect(&self) -> Option<Rect> {
-        self.album_button_rect
+        self.camera_album_rect
     }
 
-    /// Releases a held Camera-panel Photo Album button, returning `(changed, activated)`.
-    pub fn release_album_button(&mut self, point: Option<[i32; 2]>) -> (bool, bool) {
-        if !self.pressed_album_button {
-            return (false, false);
-        }
-        self.pressed_album_button = false;
-        let activated = point.is_some_and(|[x, y]| {
-            self.album_button_rect
-                .is_some_and(|rect| rect.contains(x, y))
-        });
+    /// Releases a held Camera sub-strip button, returning `(changed, activated_action)`.
+    pub fn release_camera_strip(
+        &mut self,
+        point: Option<[i32; 2]>,
+    ) -> (bool, Option<CameraStripAction>) {
+        let Some(action) = self.pressed_camera_action.take() else {
+            return (false, None);
+        };
+        let target_rect = match action {
+            CameraStripAction::TakeSnapshot => self.camera_snapshot_rect,
+            CameraStripAction::PhotoAlbum => self.camera_album_rect,
+        };
+        let activated = point.is_some_and(|[x, y]| target_rect.is_some_and(|r| r.contains(x, y)));
         if activated {
             self.play(CLICK);
+            self.close_camera_strip();
+            (true, Some(action))
+        } else {
+            (true, None)
         }
-        (true, activated)
     }
 
     /// Updates the highlighted state of the Roof camera toggle (`Camera::Roof`).
@@ -903,6 +982,7 @@ impl Hud {
         hud::fit(&mut self.items, &self.art, &self.texts);
         self.layout_buy(size, world, assets, sell);
         self.layout_build(size, world, assets, false, false);
+        self.layout_camera_strip(size);
     }
 
     /// Opens a UI-owned Options confirmation dialog using the install's
@@ -974,11 +1054,33 @@ impl Hud {
                 vec![yes, no],
             )
             .with_frame(dialog::FrameStyle::Generic),
+            OptionsDialog::Notice => {
+                Message::notice("", "", ok).with_frame(dialog::FrameStyle::Generic)
+            }
         };
         self.dialog_state = DialogState::for_message(&message);
         self.dialog = dialog::layout(view_size, &message, &self.art);
         self.ui_dialog = Some((kind, message));
         self.menu = None;
+        self.close_camera_strip();
+    }
+
+    /// Opens a native Sims 1 modal notice dialog (`cTSWinMsgBox`, OK button)
+    /// for genuine user-facing errors or confirmations (e.g., save error,
+    /// travel unavailable, co-op error, or strict lot halt).
+    pub fn open_notice_dialog(
+        &mut self,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        view_size: [i32; 2],
+    ) {
+        let ok = self.labels.get(1).to_owned();
+        let message = Message::notice(title, body, ok).with_frame(dialog::FrameStyle::Generic);
+        self.dialog_state = DialogState::for_message(&message);
+        self.dialog = dialog::layout(view_size, &message, &self.art);
+        self.ui_dialog = Some((OptionsDialog::Notice, message));
+        self.menu = None;
+        self.close_camera_strip();
     }
 
     /// The current text inside the active modal dialog's primary text entry
@@ -1380,6 +1482,11 @@ impl Hud {
         self.ui_dialog.is_some()
     }
 
+    /// Which UI-owned dialog (`OptionsDialog`) is currently open, if any.
+    pub fn ui_dialog_kind(&self) -> Option<OptionsDialog> {
+        self.ui_dialog.as_ref().map(|(kind, _)| *kind)
+    }
+
     /// Whether any modal dialog (UI confirmation, loaded VM dialog, or drawn
     /// layout) is currently active, even before the next [`Hud::draw`].
     pub fn has_dialog(&self) -> bool {
@@ -1672,10 +1779,6 @@ impl Hud {
         if let Some(rect) = self.coop_button_rect {
             self.draw_options_strip_button(&mut frame, rect, "Co-op", self.pressed_coop_button);
         }
-        self.album_button_rect = self.compute_camera_album_button_rect();
-        if let Some(rect) = self.album_button_rect {
-            self.draw_camera_album_button(&mut frame, rect);
-        }
         if self.controls.mode == Mode::Buy && self.controls.expanded {
             self.layout_buy(view.size, world, assets, sell);
             let mut guids: Vec<u32> = self
@@ -1741,6 +1844,10 @@ impl Hud {
             );
         } else {
             self.build_layout = BuildLayout::default();
+        }
+        self.layout_camera_strip(view.size);
+        if self.camera_strip_open {
+            self.draw_camera_strip(&mut frame);
         }
         if self.controls.mode == Mode::Live {
             self.queue
@@ -1869,51 +1976,143 @@ impl Hud {
         }
     }
 
-    fn compute_camera_album_button_rect(&self) -> Option<Rect> {
-        if !self.album_button_enabled || !self.controls.expanded {
-            return None;
-        }
-        let photo = self
-            .items
-            .iter()
-            .find(|i| i.command == Some(Command::Camera(sims_ui::command::Camera::Photo)))?;
-        Some(Rect::new(
-            (photo.rect.x - 33).max(0),
-            photo.rect.y,
-            photo.rect.width,
-            photo.rect.height,
-        ))
-    }
-
-    fn draw_camera_album_button(&self, frame: &mut Frame, rect: Rect) {
-        let hovered = self
-            .controls
-            .pointer
-            .is_some_and(|[px, py]| rect.contains(px, py));
-        if let Some(strip) = self.art.image(sims_ui::album::CAM_VIEW_ALBUM)
-            && strip.width >= 4
-            && strip.height > 0
-        {
-            let cell_w = strip.width / 4;
-            let state = if self.pressed_album_button && hovered {
-                2
-            } else if hovered {
-                3
-            } else {
-                1
-            };
-            let src = Rect::new(
-                (cell_w * state) as i32,
-                0,
-                cell_w as i32,
-                strip.height as i32,
-            );
-            let dx = rect.x + (rect.width - cell_w as i32) / 2;
-            let dy = rect.y + (rect.height - strip.height as i32) / 2;
-            frame.draw(strip, src, [dx, dy]);
+    /// Computes the Camera sub-strip layout strictly inside the bottom panel
+    /// strip area (`x >= hud::CLUSTER[0]`), guaranteeing zero overlap with the
+    /// Live Mode cluster, clock readout, speed buttons, or Camera icon.
+    pub fn layout_camera_strip(&mut self, size: [i32; 2]) {
+        if !self.camera_strip_open {
+            self.clear_camera_strip_layout();
             return;
         }
-        let (bg, border, fg) = if self.pressed_album_button && hovered {
+        let x = hud::CLUSTER[0];
+        let avail_w = (size[0] - x).max(0);
+        if avail_w < 120 || size[1] < hud::STRIP {
+            self.camera_strip_rect = None;
+            self.camera_snapshot_rect = None;
+            self.camera_album_rect = None;
+            return;
+        }
+        let strip_h = if self.controls.expanded && self.controls.mode == Mode::Buy {
+            hud::TALL_STRIP
+        } else {
+            hud::STRIP
+        }
+        .min(size[1]);
+        let y = (size[1] - strip_h).max(0);
+        self.camera_strip_rect = Some(Rect::new(x, y, avail_w, strip_h));
+
+        let band_y = (size[1] - hud::STRIP).max(0);
+        let pad_x = 16;
+        let gap = 14;
+        let btn_w = ((avail_w - pad_x * 2 - gap) / 2).clamp(52, 184);
+        let btn_h = 46;
+        let btn_y = band_y + 36;
+        self.camera_snapshot_rect = Some(Rect::new(x + pad_x, btn_y, btn_w, btn_h));
+        let album_rect = Rect::new(x + pad_x + btn_w + gap, btn_y, btn_w, btn_h);
+        self.camera_album_rect = self.album_button_enabled.then_some(album_rect);
+    }
+
+    fn draw_camera_strip(&self, frame: &mut Frame) {
+        let Some(strip) = self.camera_strip_rect else {
+            return;
+        };
+        let bg_id = if strip.height > hud::STRIP {
+            4918
+        } else {
+            hud::id::STRIP
+        };
+        if let Some(bg) = self.art.image(bg_id)
+            && bg.width > 0
+            && bg.height > 0
+        {
+            let bw = bg.width as i32;
+            let bh = bg.height as i32;
+            let draw_w = strip.width.min(bw);
+            let draw_h = strip.height.min(bh);
+            frame.draw(bg, Rect::new(0, 0, draw_w, draw_h), [strip.x, strip.y]);
+            if strip.width > bw {
+                // Stretch the rightmost column to the window edge just like `sims_ui::hud`.
+                let last_col = Rect::new(bw - 1, 0, 1, draw_h);
+                for col in bw..strip.width {
+                    frame.draw(bg, last_col, [strip.x + col, strip.y]);
+                }
+            }
+        } else {
+            frame.fill(strip, [16, 32, 92]);
+        }
+        // Subtle top separator accent line inside the strip.
+        frame.fill(Rect::new(strip.x, strip.y, strip.width, 1), [88, 120, 204]);
+
+        let band_y = (strip.y + strip.height - hud::STRIP).max(strip.y);
+        if let Some(font) = self.art.font(12).or_else(|| self.art.font(10)) {
+            font.draw(
+                frame,
+                "Camera",
+                [strip.x + 16, band_y + 10],
+                [235, 242, 255],
+            );
+        }
+        if let Some(snap_rect) = self.camera_snapshot_rect {
+            self.draw_camera_strip_button(
+                frame,
+                snap_rect,
+                hud::id::PHOTO,
+                if snap_rect.width >= 132 {
+                    "Take Snapshot"
+                } else {
+                    "Snapshot"
+                },
+                None,
+                true,
+                self.pressed_camera_action == Some(CameraStripAction::TakeSnapshot),
+            );
+            let album_rect = self.camera_album_rect.unwrap_or_else(|| {
+                Rect::new(
+                    snap_rect.x + snap_rect.width + 14,
+                    snap_rect.y,
+                    snap_rect.width,
+                    snap_rect.height,
+                )
+            });
+            self.draw_camera_strip_button(
+                frame,
+                album_rect,
+                sims_ui::album::CAM_VIEW_ALBUM,
+                if album_rect.width >= 132 {
+                    "Photo Album"
+                } else {
+                    "Album"
+                },
+                if album_rect.width >= 132 {
+                    Some("F10")
+                } else {
+                    None
+                },
+                self.album_button_enabled,
+                self.pressed_camera_action == Some(CameraStripAction::PhotoAlbum),
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_camera_strip_button(
+        &self,
+        frame: &mut Frame,
+        rect: Rect,
+        icon_id: i32,
+        label: &str,
+        shortcut: Option<&str>,
+        enabled: bool,
+        pressed: bool,
+    ) {
+        let hovered = enabled
+            && self
+                .controls
+                .pointer
+                .is_some_and(|[px, py]| rect.contains(px, py));
+        let (bg, border, fg) = if !enabled {
+            ([14, 24, 68], [52, 72, 128], [0x40, 0x5d, 0x5f])
+        } else if pressed && hovered {
             ([30, 88, 176], [0, 255, 255], [0, 255, 255])
         } else if hovered {
             ([26, 62, 146], [136, 178, 232], [255, 255, 255])
@@ -1931,11 +2130,51 @@ impl Hud {
             Rect::new(rect.x + rect.width - 1, rect.y, 1, rect.height),
             border,
         );
-        if let Some(font) = self.art.font(10) {
-            let label = "A";
-            let tx = rect.x + (rect.width - font.width(label)) / 2;
-            let ty = rect.y + (rect.height - font.line_height) / 2;
-            font.draw(frame, label, [tx, ty], fg);
+        let mut text_left = rect.x + 10;
+        if let Some(strip) = self.art.image(icon_id)
+            && strip.width >= 4
+            && strip.height > 0
+            && rect.width >= 84
+        {
+            let cell_w = strip.width / 4;
+            let state = if !enabled {
+                0
+            } else if pressed && hovered {
+                2
+            } else if hovered {
+                3
+            } else {
+                1
+            };
+            let src = Rect::new(
+                (cell_w * state) as i32,
+                0,
+                cell_w as i32,
+                strip.height as i32,
+            );
+            let dx = rect.x + 8;
+            let dy = rect.y + (rect.height - strip.height as i32) / 2;
+            frame.draw(strip, src, [dx, dy]);
+            text_left = dx + cell_w as i32 + 8;
+        }
+        if let Some(font) = self.art.font(10).or_else(|| self.art.font(12)) {
+            if let Some(hint) = shortcut {
+                let ty = rect.y + (rect.height - font.line_height * 2 - 2) / 2;
+                font.draw(frame, label, [text_left, ty], fg);
+                font.draw(
+                    frame,
+                    hint,
+                    [text_left, ty + font.line_height + 2],
+                    if enabled {
+                        [132, 152, 186]
+                    } else {
+                        [0x40, 0x5d, 0x5f]
+                    },
+                );
+            } else {
+                let ty = rect.y + (rect.height - font.line_height) / 2;
+                font.draw(frame, label, [text_left, ty], fg);
+            }
         }
     }
 
@@ -1977,13 +2216,13 @@ impl Hud {
             || self.menu.is_some()
             || self.band.is_some_and(|b| b.contains(point[0], point[1]))
             || self
+                .camera_strip_rect
+                .is_some_and(|r| r.contains(point[0], point[1]))
+            || self
                 .saves_button_rect
                 .is_some_and(|r| r.contains(point[0], point[1]))
             || self
                 .coop_button_rect
-                .is_some_and(|r| r.contains(point[0], point[1]))
-            || self
-                .album_button_rect
                 .is_some_and(|r| r.contains(point[0], point[1]))
             || hud::covers(&self.items, point)
             || (self.controls.mode == Mode::Buy
@@ -2124,9 +2363,11 @@ impl Hud {
                 .is_some_and(|[x, y]| self.saves_button_rect.is_some_and(|r| r.contains(x, y)));
             let c = pointer
                 .is_some_and(|[x, y]| self.coop_button_rect.is_some_and(|r| r.contains(x, y)));
-            let a = pointer
-                .is_some_and(|[x, y]| self.album_button_rect.is_some_and(|r| r.contains(x, y)));
-            (s, c, a)
+            let snap = pointer
+                .is_some_and(|[x, y]| self.camera_snapshot_rect.is_some_and(|r| r.contains(x, y)));
+            let album = pointer
+                .is_some_and(|[x, y]| self.camera_album_rect.is_some_and(|r| r.contains(x, y)));
+            (s, c, snap, album)
         };
         let before = (
             hud::hovered(&self.items, self.controls.pointer),
@@ -2263,6 +2504,27 @@ impl Hud {
             return None;
         }
         if self
+            .camera_snapshot_rect
+            .is_some_and(|r| r.contains(point[0], point[1]))
+        {
+            self.pressed_camera_action = Some(CameraStripAction::TakeSnapshot);
+            return None;
+        }
+        if self
+            .camera_album_rect
+            .is_some_and(|r| r.contains(point[0], point[1]))
+        {
+            self.pressed_camera_action = Some(CameraStripAction::PhotoAlbum);
+            return None;
+        }
+        if self
+            .camera_strip_rect
+            .is_some_and(|r| r.contains(point[0], point[1]))
+        {
+            self.dismiss_help();
+            return None;
+        }
+        if self
             .saves_button_rect
             .is_some_and(|r| r.contains(point[0], point[1]))
         {
@@ -2274,13 +2536,6 @@ impl Hud {
             .is_some_and(|r| r.contains(point[0], point[1]))
         {
             self.pressed_coop_button = true;
-            return None;
-        }
-        if self
-            .album_button_rect
-            .is_some_and(|r| r.contains(point[0], point[1]))
-        {
-            self.pressed_album_button = true;
             return None;
         }
         if self.controls.mode == Mode::Live
