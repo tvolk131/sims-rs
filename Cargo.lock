@@ -3534,6 +3534,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "sims-antics"
+version = "0.1.0"
+dependencies = [
+ "encoding_rs",
+ "libm",
+ "sims-content",
+ "sims-core",
+ "sims-formats",
+ "sims-sim",
+ "sims-vm",
+]
+
+[[package]]
 name = "sims-audio"
 version = "0.1.0"
 dependencies = [

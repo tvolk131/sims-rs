@@ -3,6 +3,7 @@
 # not part of this workspace and is never built. See docs/vision.md and
 # docs/salvage-audit.md.
 members = [
+    "crates/sims-antics",
     "crates/sims-audio",
     "crates/sims-cli",
     "crates/sims-content",
@@ -36,6 +37,7 @@ redb = "4.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+sims-antics = { path = "crates/sims-antics" }
 sims-content = { path = "crates/sims-content" }
 sims-core = { path = "crates/sims-core" }
 sims-formats = { path = "crates/sims-formats" }
