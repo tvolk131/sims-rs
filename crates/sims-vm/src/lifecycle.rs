@@ -882,17 +882,110 @@ fn remove_person_cleanly(
             }
         }
     }
+    // If another person on the lot is seated/off-lot/wide and currently
+    // referencing `id`, recover that person first via `reset_person_after_purge`
+    // so `remove_now`'s `drop_references` (`0x444306` -> `0x45e8dd`) does not
+    // trap on an unported seated/off-lot person reset.
+    let id_i16 = id as i16;
+    let mut blocked_others = Vec::new();
+    for other in world.people.clone() {
+        if other == id {
+            continue;
+        }
+        let (references_id, wide) = {
+            let Some(person) = world.objects.get(&other).and_then(|o| o.person.as_ref()) else {
+                continue;
+            };
+            let references = person.object_uses.iter().any(|u| u.target == id_i16)
+                || person.active.target == id_i16
+                || person.active.icon == id_i16
+                || person.active.caller == id_i16;
+            let wide = person.data.get(73).copied().unwrap_or(0) != 0;
+            (references, wide)
+        };
+        if !references_id {
+            continue;
+        }
+        let in_container =
+            crate::placement::capture(world, other).is_ok_and(|place| place.container.is_some());
+        let off_lot = !crate::placement::stands_on_lot(world, other).unwrap_or(true);
+        if in_container || off_lot || wide {
+            blocked_others.push(other);
+        }
+    }
+    for other in blocked_others {
+        if let Some(person) = world
+            .objects
+            .get_mut(&other)
+            .and_then(|o| o.person.as_mut())
+        {
+            person.queue.retain(|action| {
+                action.target != id_i16 && action.icon != id_i16 && action.caller != id_i16
+            });
+            if person.last.target == id_i16 || person.last.caller == id_i16 {
+                person.last = crate::object_uses::no_action();
+            } else if person.last.icon == id_i16 {
+                person.last.icon = 0;
+            }
+        }
+        interpreter
+            .reset_person_after_purge(world, other)
+            .map_err(|e| {
+                LifecycleError::Lot(format!(
+                    "releasing seated/off-lot person {other} from {id}: {e}"
+                ))
+            })?;
+    }
+    // Release `id`'s own object uses (decrementing target `data[62]` counts)
+    // and clear its queue; if `id` itself is seated inside a container, unlink
+    // it off-lot first so `reset_person_to_delete` does not trap at `0x45e8dd`.
+    people::clear_person_uses_and_counts(world, id);
     if let Some(person) = world
         .objects
         .get_mut(&id)
         .and_then(|obj| obj.person.as_mut())
     {
-        person.object_uses.clear();
         person.queue.clear();
     }
-    interpreter
-        .remove_now(world, id)
-        .map_err(|e| LifecycleError::Lot(format!("removing person {id}: {e}")))
+    if crate::placement::capture(world, id).is_ok_and(|place| place.container.is_some()) {
+        let _ = crate::placement::unlink_off_lot(world, id);
+    }
+    match interpreter.remove_now(world, id) {
+        Ok(()) => Ok(()),
+        Err(crate::fault::Fault {
+            trap: crate::fault::Trap::Unsupported(_),
+            ..
+        }) => {
+            let (people_to_reset, objects_to_reset) =
+                purge_orphaned_person(interpreter, world, id)?;
+            for other in people_to_reset {
+                if world
+                    .objects
+                    .get(&other)
+                    .is_some_and(|o| o.person.is_some())
+                {
+                    interpreter
+                        .reset_person_after_purge(world, other)
+                        .map_err(|e| {
+                            LifecycleError::Lot(format!(
+                                "resetting person {other} after fallback removal of {id}: {e}"
+                            ))
+                        })?;
+                }
+            }
+            for other in objects_to_reset {
+                if world.objects.contains_key(&other) {
+                    interpreter.reset(world, other, false).map_err(|e| {
+                        LifecycleError::Lot(format!(
+                            "resetting object {other} after fallback removal of {id}: {e}"
+                        ))
+                    })?;
+                }
+            }
+            Ok(())
+        }
+        Err(e) => Err(LifecycleError::Lot(format!("removing person {id}: {e}"))),
+    }
 }
 
 /// Removes an orphaned live person whose neighborhood record (and possibly its
@@ -910,6 +1003,9 @@ fn purge_orphaned_person(
     let Some(deleted_guid) = world.objects.get(&id).map(|o| o.guid) else {
         return Ok((Vec::new(), Vec::new()));
     };
+    // Release any surviving objects currently marked in use by `id` (decrement
+    // their data word 62 use count) before tearing down `id`.
+    people::clear_person_uses_and_counts(world, id);
     // Unlink cleanly from the object's tile (ground or upper floor) or
     // container FIRST so any surviving object behind `id` in `slot 0` is
     // promoted into `id`'s tile/container head (`placement::relink` / 0x4329c1).
@@ -1682,6 +1778,15 @@ fn boot_from_saved_lot(
 
     let player = if answers.is_empty() {
         saved.answers
+    } else if saved.answered {
+        // Preserve the player's already-committed dialog answer at the front
+        // of the saved queue so replay applies the chosen answer, and queue
+        // any caller-provided answers behind it for later dialogs.
+        let mut player = saved.answers;
+        player
+            .queue
+            .extend(answers.iter().copied().map(crate::Answer::from));
+        player
     } else {
         Answers::choices(answers)
     };
@@ -3248,11 +3353,49 @@ mod tests {
                     && house7.world.objects[&oid].slots.len() > 1
             })
             .expect("House 7 has a furniture object with a container slot");
+        let visitor_used_obj_id = house7
+            .world
+            .order
+            .iter()
+            .copied()
+            .find(|&oid| {
+                oid != survivor_id
+                    && oid != container_id
+                    && !house7.world.indicators.contains(&oid)
+                    && house7.world.objects[&oid].person.is_none()
+                    && house7.world.objects[&oid].data.get(62).copied() == Some(0)
+            })
+            .expect("House 7 has an unused surviving object for the visitor to use");
+        let container_users_before = house7.world.objects[&container_id].data[62];
+        {
+            // Mark `visitor_used_obj_id` in use by `visitor_ground_id` (`data[62] += 1`).
+            house7
+                .world
+                .objects
+                .get_mut(&visitor_used_obj_id)
+                .unwrap()
+                .data[62] += 1;
+            if let Some(person) = house7
+                .world
+                .objects
+                .get_mut(&visitor_ground_id)
+                .and_then(|o| o.person.as_mut())
+            {
+                person
+                    .object_uses
+                    .push(sims_formats::saved_objects::ObjectUse {
+                        target: visitor_used_obj_id as i16,
+                        stack_depth: 1,
+                        unknown: 0,
+                    });
+            }
+        }
         {
             let _ = crate::placement::unlink_off_lot(&mut house7.world, seated_resident_id);
-            house7.world.objects.get_mut(&container_id).unwrap().slots[1].object =
-                seated_resident_id as i16;
-            let container_pos = house7.world.objects[&container_id].position;
+            let container_obj = house7.world.objects.get_mut(&container_id).unwrap();
+            container_obj.slots[1].object = seated_resident_id as i16;
+            container_obj.data[62] += 1;
+            let container_pos = container_obj.position;
             let seated = house7.world.objects.get_mut(&seated_resident_id).unwrap();
             seated.position = container_pos;
             seated.data[2] = container_id as i16; // CONTAINER
@@ -3269,6 +3412,13 @@ mod tests {
                 code_owner_type: next_type as i16,
             });
             if let Some(person) = seated.person.as_mut() {
+                person
+                    .object_uses
+                    .push(sims_formats::saved_objects::ObjectUse {
+                        target: container_id as i16,
+                        stack_depth: 1,
+                        unknown: 0,
+                    });
                 person.active.target = visitor_ground_id as i16;
                 person.active.icon = visitor_ground_id as i16;
                 person.active.action = 4096;
@@ -3297,8 +3447,9 @@ mod tests {
 
         // Reopening House 7 must purge both deleted visitors cleanly, promote
         // `survivor_id` back to the ground-floor tile head, clear the upstairs
-        // grid cell, preserve both residents' unrelated queued orders, recover
-        // the seated resident cleanly, and step cleanly!
+        // grid cell, decrement data[62] use counts on surviving objects used by
+        // the deleted visitor or seated resident, preserve both residents'
+        // unrelated queued orders, recover the seated resident cleanly, and step!
         let mut house7_after = enter_lot(&root, &store, "UserData", 7, &[3], no_frames).unwrap();
         assert!(!house7_after.world.objects.contains_key(&visitor_ground_id));
         assert!(!house7_after.world.people.contains(&visitor_ground_id));
@@ -3321,6 +3472,14 @@ mod tests {
             crate::placement::head(&house7_after.world, upstairs_tile),
             None,
             "upper-floor grid must not retain purged visitor ID"
+        );
+        assert_eq!(
+            house7_after.world.objects[&container_id].data[62], container_users_before,
+            "seated resident's chair must have its data[62] use count decremented"
+        );
+        assert_eq!(
+            house7_after.world.objects[&visitor_used_obj_id].data[62], 0,
+            "object used by purged visitor must have its data[62] use count decremented"
         );
         assert!(
             house7_after.world.objects[&template_id]
@@ -3346,5 +3505,154 @@ mod tests {
             house7_after.step().unwrap();
         }
         save_and_leave_lot(&root, &store, "UserData", &mut house7_after).unwrap();
+    }
+
+    #[test]
+    fn evict_and_bulldoze_succeed_when_seated_resident_interacts_with_another_resident() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let no_frames = Frames::parse("none").unwrap();
+        for do_bulldoze in [false, true] {
+            let db = TempDb::new(if do_bulldoze {
+                "seated-interact-bulldoze"
+            } else {
+                "seated-interact-evict"
+            });
+            let store = NeighborhoodStore::open(&db.0).unwrap();
+            store
+                .import_directory("UserData", &root.join("UserData"), 0xff)
+                .unwrap();
+
+            let mut house7 =
+                enter_lot(&root, &store, "UserData", 7, &[3], no_frames.clone()).unwrap();
+            let seated_id = house7.world.people[0];
+            let target_id = house7.world.people[1];
+            let chair_id = house7
+                .world
+                .order
+                .iter()
+                .copied()
+                .find(|&oid| {
+                    !house7.world.indicators.contains(&oid)
+                        && house7.world.objects[&oid].person.is_none()
+                        && house7.world.objects[&oid].slots.len() > 1
+                })
+                .expect("House 7 has a container furniture object");
+
+            let _ = crate::placement::unlink_off_lot(&mut house7.world, seated_id);
+            house7.world.objects.get_mut(&chair_id).unwrap().slots[1].object = seated_id as i16;
+            house7.world.objects.get_mut(&chair_id).unwrap().data[62] += 1;
+            house7.world.objects.get_mut(&target_id).unwrap().data[62] += 1;
+            let chair_pos = house7.world.objects[&chair_id].position;
+            let seated = house7.world.objects.get_mut(&seated_id).unwrap();
+            seated.position = chair_pos;
+            seated.data[2] = chair_id as i16;
+            seated.data[3] = 0;
+            seated.data[14] = 1;
+            seated.data[26] = chair_id as i16;
+            if let Some(person) = seated.person.as_mut() {
+                person
+                    .object_uses
+                    .push(sims_formats::saved_objects::ObjectUse {
+                        target: chair_id as i16,
+                        stack_depth: 1,
+                        unknown: 0,
+                    });
+                person
+                    .object_uses
+                    .push(sims_formats::saved_objects::ObjectUse {
+                        target: target_id as i16,
+                        stack_depth: 1,
+                        unknown: 1,
+                    });
+                person.active.target = target_id as i16;
+                person.active.icon = target_id as i16;
+            }
+            save_and_leave_lot(&root, &store, "UserData", &mut house7).unwrap();
+
+            if do_bulldoze {
+                let report = bulldoze(&root, &store, "UserData", 7).unwrap();
+                assert_eq!(report.evicted_family, Some(1));
+            } else {
+                let report = evict(&root, &store, "UserData", 7).unwrap();
+                assert_eq!(report.family, 1);
+            }
+            assert!(
+                store
+                    .load_neighborhood("UserData")
+                    .unwrap()
+                    .unwrap()
+                    .family_in(7)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn reopening_answered_dialog_lot_preserves_chosen_answer() {
+        let Some(root) = std::env::var_os("SIMS_INSTALL").map(PathBuf::from) else {
+            return;
+        };
+        let no_frames = Frames::parse("none").unwrap();
+
+        let save_answered = |label: &str, chosen: u8| -> (TempDb, NeighborhoodStore) {
+            let db = TempDb::new(label);
+            let store = NeighborhoodStore::open(&db.0).unwrap();
+            store
+                .import_directory("UserData", &root.join("UserData"), 0xff)
+                .unwrap();
+            let mut lot = enter_lot(&root, &store, "UserData", 5, &[], no_frames.clone()).unwrap();
+            lot.wait_for_answers();
+            lot.step().unwrap();
+            assert_eq!(
+                lot.step().unwrap_err(),
+                crate::boot::StepError::Asking { tick: 2 }
+            );
+            lot.answer(chosen).unwrap();
+            save_and_leave_lot(&root, &store, "UserData", &mut lot).unwrap();
+            (db, store)
+        };
+
+        // 1. Answered 3, saved before stepping, reopened with `&[]` (baseline).
+        let (_db_three, store_three) = save_answered("dialog-answer-three", 3);
+        let mut baseline_three =
+            enter_lot(&root, &store_three, "UserData", 5, &[], no_frames.clone()).unwrap();
+        for _ in 0..4 {
+            baseline_three.step().unwrap();
+        }
+        let hash_three = baseline_three.world.hash();
+
+        // 2. Answered 2, saved before stepping, reopened with `&[]` (contrast).
+        let (_db_two, store_two) = save_answered("dialog-answer-two", 2);
+        let mut baseline_two =
+            enter_lot(&root, &store_two, "UserData", 5, &[], no_frames.clone()).unwrap();
+        for _ in 0..4 {
+            baseline_two.step().unwrap();
+        }
+        let hash_two = baseline_two.world.hash();
+        assert_ne!(
+            hash_three, hash_two,
+            "tick-2 Help System answers 3 and 2 must diverge in world state"
+        );
+
+        // 3. Answered 3, saved before stepping, reopened with `answers = &[2]`:
+        //    replay must apply the saved answer 3 (matching `hash_three`), NOT
+        //    overwrite it with 2, and keep 2 queued behind it for later dialogs.
+        let mut reopened = enter_lot(&root, &store_three, "UserData", 5, &[2], no_frames).unwrap();
+        assert!(reopened.answered);
+        assert_eq!(reopened.player.queue.len(), 2);
+        assert_eq!(reopened.player.queue[0].status, 3);
+        assert_eq!(reopened.player.queue[1].status, 2);
+        for _ in 0..4 {
+            reopened.step().unwrap();
+        }
+        assert_eq!(
+            reopened.world.hash(),
+            hash_three,
+            "reopening an already-answered lot with different future answers must replay the saved answer (3), not replace it with 2"
+        );
+        assert_eq!(reopened.player.queue.len(), 1);
+        assert_eq!(reopened.player.queue[0].status, 2);
     }
 }

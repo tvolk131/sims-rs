@@ -300,6 +300,26 @@ pub fn curve_table(age: i16, custom: u16) -> (bool, u16) {
     }
 }
 
+/// Decrements data word 62 (`USERS`) on every target object currently listed in
+/// `person_id`'s `object_uses` and clears `person_id`'s `object_uses`.
+pub(crate) fn clear_person_uses_and_counts(world: &mut World, person_id: u16) {
+    let targets: Vec<i16> = world
+        .objects
+        .get_mut(&person_id)
+        .and_then(|o| o.person.as_mut())
+        .map(|p| p.object_uses.drain(..).map(|u| u.target).collect())
+        .unwrap_or_default();
+    for target in targets {
+        if let Ok(target_id) = u16::try_from(target)
+            && let Some(obj) = world.objects.get_mut(&target_id)
+            && let Some(users) = obj.data.get_mut(62)
+            && *users > 0
+        {
+            *users -= 1;
+        }
+    }
+}
+
 impl Interpreter<'_> {
     /// Gives a person the fields its neighborhood record keeps for it
     /// (0x4258a3): the record's ID goes into person data word 31; then, if
@@ -537,6 +557,7 @@ impl Interpreter<'_> {
             route.contexts.clear();
         }
         world.headlines.remove(&id);
+        clear_person_uses_and_counts(world, id);
         {
             let obj = world
                 .objects
@@ -548,7 +569,6 @@ impl Interpreter<'_> {
                 .person
                 .as_mut()
                 .ok_or_else(|| fail(Trap::native(0x1c, "object is not a person")))?;
-            person.object_uses.clear();
             person.active = no_action();
             person.motive_deltas.clear();
             for word in [0, 30, 33, 40, 59, 71, 72] {
