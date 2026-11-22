@@ -655,7 +655,8 @@ pub struct NeighborhoodMap {
     pub non_us: bool,
     pub backdrop: Surface565,
     pub large_frame: Option<Surface565>,
-    pub waves: Vec<Surface565>,
+    /// Numbered water wave animation slots (`None` when a slot is absent, `0x56bb7a..0x56bb8d`).
+    pub waves: Vec<Option<Surface565>>,
     pub vacation_port: Option<Surface565>,
     pub vacation_trees: Option<Surface565>,
     pub vacation_logo: Option<Surface565>,
@@ -719,11 +720,9 @@ impl NeighborhoodMap {
                     kind.backdrop_id(non_us)
                 ))
             })?;
-            let mut waves = Vec::new();
+            let mut waves = Vec::with_capacity(kind.wave_ids(non_us).len());
             for &wave_id in kind.wave_ids(non_us) {
-                if let Some(surf) = load_ui(wave_id)? {
-                    waves.push(surf);
-                }
+                waves.push(load_ui(wave_id)?);
             }
             let (port, trees) = if kind == NeighborhoodKind::Vacation {
                 (load_ui(res::VACATION_PORT)?, load_ui(res::VACATION_TREES)?)
@@ -896,21 +895,54 @@ impl NeighborhoodMap {
         Ok(canvas)
     }
 
+    /// Top-left map origin in `viewport` using this map's decoded backdrop
+    /// dimensions (`0x568fa7..0x568fe6`). Matches [`map_origin`] for standard
+    /// `800×600` backdrops.
+    pub fn map_origin_for(&self, viewport: [u32; 2]) -> [i32; 2] {
+        let bw = self.backdrop.width as u32;
+        let bh = self.backdrop.height as u32;
+        let ox = if viewport[0] > bw {
+            ((viewport[0] - bw) / 2) as i32
+        } else {
+            0
+        };
+        let oy = if viewport[1] > bh {
+            ((viewport[1] - bh) / 2) as i32
+        } else {
+            0
+        };
+        [ox, oy]
+    }
+
+    fn map_clip_for(&self, viewport: [u32; 2]) -> [i32; 4] {
+        let [ox, oy] = self.map_origin_for(viewport);
+        let bw = self.backdrop.width.min(i32::MAX as usize) as i32;
+        let bh = self.backdrop.height.min(i32::MAX as usize) as i32;
+        let vw = viewport[0].min(i32::MAX as u32) as i32;
+        let vh = viewport[1].min(i32::MAX as u32) as i32;
+        [
+            ox,
+            oy,
+            ox.saturating_add(bw).min(vw),
+            oy.saturating_add(bh).min(vh),
+        ]
+    }
+
     /// Renders the neighborhood map screen into an existing [`Canvas`].
     ///
     /// Sets `canvas.set_id(Some(lot.id))` for each lot's opaque pixels so
     /// [`Canvas::id_at`] agrees with [`Self::hit_test_with_options`] inside
-    /// the clipped `800×600` map rectangle.
+    /// the clipped backdrop rectangle.
     pub fn render_into(&self, canvas: &mut Canvas, options: &RenderOptions) {
         let viewport = [canvas.width as u32, canvas.height as u32];
-        let origin = map_origin(viewport);
-        let map_clip = map_clip_rect(viewport);
+        let origin = self.map_origin_for(viewport);
+        let map_clip = self.map_clip_for(viewport);
 
         canvas.clear([0, 0, 0]);
         canvas.set_id(None);
 
-        // 1. 1024×768 outer frame when viewport exceeds 800×600 (0x556d8c..0x557031).
-        if (viewport[0] > MAP_WIDTH || viewport[1] > MAP_HEIGHT)
+        // 1. 1024×768 outer frame when viewport exceeds backdrop size (0x556d8c..0x557031).
+        if (viewport[0] > self.backdrop.width as u32 || viewport[1] > self.backdrop.height as u32)
             && let Some(frame) = &self.large_frame
         {
             blit_surface_to_canvas(
@@ -923,21 +955,21 @@ impl NeighborhoodMap {
             );
         }
 
-        // 2. 800×600 map backdrop at centered origin (0x556db7..0x556ddc).
+        // 2. Map backdrop at centered origin (0x556db7..0x556ddc, 0x568fa7..0x568fe6).
         blit_surface_to_canvas(canvas, &self.backdrop, origin, map_clip, false, None);
 
         // 3. Pre-lot water wave overlay for Unleashed (0x5570c1) and Classic.
         if !self.kind.waves_draw_after_lots()
             && let Some(frame_idx) = options.water_frame
             && !self.waves.is_empty()
+            && let Some(wave) = &self.waves[frame_idx % self.waves.len()]
         {
-            let wave = &self.waves[frame_idx % self.waves.len()];
             let [wx, wy] = self.kind.wave_offset();
             let at = [origin[0].saturating_add(wx), origin[1].saturating_add(wy)];
             blit_surface_to_canvas(canvas, wave, at, map_clip, true, None);
         }
 
-        // 4. Lots in back-to-front Z-order, clipped strictly to the 800×600 map rect
+        // 4. Lots in back-to-front Z-order, clipped strictly to the map rect
         //    (cWinLot + 0x230..0x240, 0x5571e4..0x557201).
         for lot in &self.lots {
             let draw_at = [
@@ -959,23 +991,22 @@ impl NeighborhoodMap {
         }
 
         // 5. Vacation Island foreground port & trees overlays (5442, 5443)
-        //    at 0x56baeb..0x56bb5d (drawn after lots, before Vacation waves).
-        if options.show_vacation_overlays && self.kind == NeighborhoodKind::Vacation {
-            if let Some(port) = &self.vacation_port {
-                blit_color_only(canvas, port, origin, map_clip);
-            }
-            if let Some(trees) = &self.vacation_trees {
-                blit_color_only(canvas, trees, origin, map_clip);
-            }
+        //    at 0x56bac8..0x56bb5d: drawn only when BOTH port and trees are present.
+        if options.show_vacation_overlays
+            && self.kind == NeighborhoodKind::Vacation
+            && let (Some(port), Some(trees)) = (&self.vacation_port, &self.vacation_trees)
+        {
+            blit_color_only(canvas, port, origin, map_clip);
+            blit_color_only(canvas, trees, origin, map_clip);
         }
 
         // 6. Post-lot water wave overlay for Downtown (0x54cb21), Vacation
-        //    (0x56bb7a, after port & trees), and Magic Town (0x554ff6 at (0, 62)).
+        //    (0x56bb7a..0x56bb8d, skipping missing slots), and Magic Town (0x554ff6 at (0, 62)).
         if self.kind.waves_draw_after_lots()
             && let Some(frame_idx) = options.water_frame
             && !self.waves.is_empty()
+            && let Some(wave) = &self.waves[frame_idx % self.waves.len()]
         {
-            let wave = &self.waves[frame_idx % self.waves.len()];
             let [wx, wy] = self.kind.wave_offset();
             let at = [origin[0].saturating_add(wx), origin[1].saturating_add(wy)];
             blit_color_only(canvas, wave, at, map_clip);
@@ -1078,7 +1109,7 @@ impl NeighborhoodMap {
     /// highlight evaluation, and only the single sampled scanline is
     /// highlighted on hit candidates.
     pub fn hit_test_with_options(&self, options: &RenderOptions, point: [i32; 2]) -> Option<u16> {
-        let origin = map_origin(options.viewport);
+        let origin = self.map_origin_for(options.viewport);
         for lot in self.lots.iter().rev() {
             let is_hovered = options.hovered_lot == Some(lot.id);
             let show_cutaway = is_hovered && options.hover_roofs_off;
@@ -1111,22 +1142,10 @@ impl NeighborhoodMap {
     /// `0x54eb52..0x54eb64` (`0x54f24f`: Vacation Island lot occupied by a
     /// family's primary or secondary house).
     fn has_vacation_badge(&self, lot: &MapLot) -> bool {
+        // 0x54eb49..0x54eb64: primary home with vacation stay (0x54f20e) on any
+        // map, or secondary/primary occupancy (0x54f24f) only on Vacation Island.
         lot.has_primary_vacation_stay
-            || matches!(
-                lot.status,
-                LotStatus::Occupied {
-                    vacation_lot: Some(_),
-                    ..
-                }
-            )
-            || (self.kind == NeighborhoodKind::Vacation
-                && (lot.has_vacation_occupancy
-                    || matches!(
-                        lot.status,
-                        LotStatus::Community {
-                            occupied_by_family: Some(_),
-                        } | LotStatus::Occupied { .. }
-                    )))
+            || (self.kind == NeighborhoodKind::Vacation && lot.has_vacation_occupancy)
     }
 
     /// Returns the unhighlighted `[esi + 0x264]` vacation-badged surface when
@@ -1810,24 +1829,47 @@ fn read_lot_filter_mask(iff: &NativeIff) -> Option<u16> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FamilyRecord {
     id: i32,
+    number: i32,
     house: i32,
     secondary_house: i32,
 }
 
 #[derive(Default)]
 struct FamilyOccupancy {
-    /// Variant-0 `FAMI` records sorted in ascending family ID order, matching
-    /// native `0x424b75..0x424c65` (`IFFResFile3` tree order) and `0x425d95`.
+    /// Variant-0 `FAMI` records plus default family `0` when absent (`0x424c65..0x424cb5`),
+    /// sorted descending by `(number, id)` matching `0x425209` and scanned by `0x425d95`.
     families: Vec<FamilyRecord>,
 }
 
 impl FamilyOccupancy {
-    fn record_family_houses(&mut self, family_id: i32, house: i32, secondary_house: i32) {
+    fn record_family_houses(
+        &mut self,
+        family_id: i32,
+        number: i32,
+        house: i32,
+        secondary_house: i32,
+    ) {
         self.families.push(FamilyRecord {
             id: family_id,
+            number,
             house,
             secondary_house,
         });
+    }
+
+    /// Synthesizes default family `0` when absent (`0x424c65..0x424cb5`) and
+    /// sorts the list descending by `(number, id)` (`0x425209`).
+    fn finalize_native(&mut self) {
+        if !self.families.iter().any(|f| f.id == 0) {
+            self.families.push(FamilyRecord {
+                id: 0,
+                number: 0,
+                house: 0,
+                secondary_house: 0,
+            });
+        }
+        self.families
+            .sort_by(|a, b| b.number.cmp(&a.number).then_with(|| b.id.cmp(&a.id)));
     }
 
     /// Native `GetFamilyByLot` (`0x425d95..0x425de0`):
@@ -1871,12 +1913,14 @@ impl FamilyOccupancy {
         };
         let house = s.i32().unwrap_or(0);
         if version < 5 && s.skip_cstr_padded().is_none() {
-            self.record_family_houses(family_id, house, 0);
+            self.record_family_houses(family_id, 0, house, 0);
             return;
         }
-        if version >= 1 {
-            let _ = s.i32(); // number (+0x114)
-        }
+        let number = if version >= 1 {
+            s.i32().unwrap_or(0)
+        } else {
+            0
+        };
         if version >= 2 {
             let _ = s.i32(); // budget (+0x118)
             let _ = s.i32(); // architecture_value (+0x11c)
@@ -1898,13 +1942,13 @@ impl FamilyOccupancy {
         // 0x4105e7..0x4105ff: member list is serialized when family_id != 0.
         if family_id != 0 {
             let Some(member_count) = s.i32() else {
-                self.record_family_houses(family_id, house, 0);
+                self.record_family_houses(family_id, number, house, 0);
                 return;
             };
             if member_count > 0 {
                 let skip = (member_count as usize).saturating_mul(4);
                 if skip > s.remaining() {
-                    self.record_family_houses(family_id, house, 0);
+                    self.record_family_houses(family_id, number, house, 0);
                     return;
                 }
                 s.pos += skip;
@@ -1916,21 +1960,24 @@ impl FamilyOccupancy {
         } else {
             0
         };
-        self.record_family_houses(family_id, house, secondary_raw);
+        self.record_family_houses(family_id, number, house, secondary_raw);
     }
 }
 
 fn load_family_occupancy(install: &Install, user_dir: &Path) -> FamilyOccupancy {
     let mut occ = FamilyOccupancy::default();
-    let Some(iff) = resolve_child(install, user_dir, "Neighborhood.iff").and_then(|p| open_iff(&p))
-    else {
-        return occ;
-    };
-    // 0x424b75..0x424c0b + 0x41031b + 0x41bad8: native family loading resolves
-    // each non-negative signed 16-bit FAMI ID through variant 0 in ascending ID order.
-    for (id, data, flags) in iff.all_variant_zero_sorted(b"FAMI") {
-        occ.record_fami_chunk(i32::from(id), data, flags);
+    if let Some(iff) =
+        resolve_child(install, user_dir, "Neighborhood.iff").and_then(|p| open_iff(&p))
+    {
+        // 0x424b75..0x424c0b + 0x41031b + 0x41bad8: native family loading resolves
+        // each non-negative signed 16-bit FAMI ID through variant 0.
+        for (id, data, flags) in iff.all_variant_zero_sorted(b"FAMI") {
+            occ.record_fami_chunk(i32::from(id), data, flags);
+        }
     }
+    // 0x424c65..0x424d38 + 0x425209: add default family 0 if absent, then sort
+    // descending by (number, id).
+    occ.finalize_native();
     occ
 }
 
@@ -2441,7 +2488,7 @@ fn resolve_child(install: &Install, dir: &Path, name: &str) -> Option<PathBuf> {
 
 struct LocalMapArtwork {
     backdrop: Surface565,
-    waves: Vec<Surface565>,
+    waves: Vec<Option<Surface565>>,
     vacation_port: Option<Surface565>,
     vacation_trees: Option<Surface565>,
 }
@@ -2519,12 +2566,9 @@ fn load_local_map_artwork(
     };
 
     let backdrop = load_jpg(backdrop_name)?;
-    let mut waves = Vec::new();
-    for &name in wave_names {
-        if let Some(surf) = load_jpg(name) {
-            waves.push(surf);
-        }
-    }
+    // Preserve numbered wave slots so missing slots are skipped rather than
+    // shifting subsequent frames down (0x56bb7a..0x56bb8d).
+    let waves = wave_names.iter().map(|&name| load_jpg(name)).collect();
     let vacation_port = port_name.and_then(load_jpg);
     let vacation_trees = trees_name.and_then(load_jpg);
     Some(LocalMapArtwork {
@@ -3007,7 +3051,9 @@ fn decode_jpeg_to_surface565(data: &[u8]) -> Option<Surface565> {
                                     };
                                     while k <= se {
                                         if block[k] != 0 {
-                                            if br.read_bit()? == 1 && (block[k] & p1) == 0 {
+                                            if br.read_bit()? == 1
+                                                && (block[k].unsigned_abs() & (p1 as u32)) == 0
+                                            {
                                                 block[k] += if block[k] > 0 { p1 } else { m1 };
                                             }
                                         } else {
@@ -3024,12 +3070,17 @@ fn decode_jpeg_to_surface565(data: &[u8]) -> Option<Surface565> {
                                         }
                                         block[k] = new_val;
                                         k += 1;
+                                    } else if k <= se {
+                                        // ZRL (s == 0, r == 15): advance past the 16th zero.
+                                        k += 1;
                                     }
                                 }
                             }
                             if *eobrun > 0 {
                                 while k <= se {
-                                    if block[k] != 0 && br.read_bit()? == 1 && (block[k] & p1) == 0
+                                    if block[k] != 0
+                                        && br.read_bit()? == 1
+                                        && (block[k].unsigned_abs() & (p1 as u32)) == 0
                                     {
                                         block[k] += if block[k] > 0 { p1 } else { m1 };
                                     }
@@ -4134,14 +4185,15 @@ mod tests {
         assert_eq!(badged.get(11, 5), Some(badge_c));
         assert_ne!(badged.get(7, 4), Some(badge_c));
 
-        // Occupancy: native GetFamilyByLot (0x425d95) selects the first family
-        // in ascending ID order matching primary or secondary house, and looks
-        // up family ID 0 specifically for lot 0.
+        // Occupancy: native GetFamilyByLot (0x425d95) adds default family 0 when
+        // absent (0x424c65..0x424cb5), sorts descending by (number, id) (0x425209),
+        // looks up family ID 0 for lot 0, and picks the first matching family.
         let mut occ = FamilyOccupancy::default();
-        occ.record_family_houses(0, 0, 0);
-        occ.record_family_houses(5, 5, 41);
-        occ.record_family_houses(9, 40, 0);
-        occ.record_family_houses(12, 5, 0); // later family on lot 5 loses to family 5
+        occ.record_family_houses(1, 10, 5, 0);
+        occ.record_family_houses(9, 10, 5, 41); // same number, higher ID wins over 1
+        occ.record_family_houses(4, 20, 40, 0); // higher number
+        occ.finalize_native();
+        // Default family 0 was synthesized even though no FAMI #0 was recorded.
         assert_eq!(
             resolve_lot_status(0, NeighborhoodKind::Unleashed, LotZoning::Residential, &occ),
             LotStatus::Occupied {
@@ -4152,22 +4204,81 @@ mod tests {
         assert_eq!(
             resolve_lot_status(40, NeighborhoodKind::Vacation, LotZoning::Community, &occ),
             LotStatus::Community {
-                occupied_by_family: Some(9)
+                occupied_by_family: Some(4)
             }
         );
         assert_eq!(
             resolve_lot_status(41, NeighborhoodKind::Vacation, LotZoning::Community, &occ),
             LotStatus::Community {
-                occupied_by_family: Some(5)
+                occupied_by_family: Some(9)
             }
         );
         assert_eq!(
             resolve_lot_status(5, NeighborhoodKind::Unleashed, LotZoning::Residential, &occ),
             LotStatus::Occupied {
-                family_id: 5,
+                family_id: 9,
                 vacation_lot: Some(41),
             }
         );
+
+        // On Unleashed, a residential lot 41 that is ONLY a family's secondary
+        // house must NOT trigger the vacation badge (0x54eb49..0x54eb64).
+        let mut sec_only_lot = make_lot(41, [10, 10], on.clone());
+        sec_only_lot.vacation_badged = Some(badged.clone());
+        sec_only_lot.status = resolve_lot_status(
+            41,
+            NeighborhoodKind::Unleashed,
+            LotZoning::Residential,
+            &occ,
+        );
+        sec_only_lot.has_primary_vacation_stay = occ.has_primary_vacation_stay(41);
+        sec_only_lot.has_vacation_occupancy = occ.has_vacation_occupancy(41);
+        assert!(!sec_only_lot.has_primary_vacation_stay);
+        assert!(sec_only_lot.has_vacation_occupancy);
+        let unleashed_sec_map = make_test_map(NeighborhoodKind::Unleashed, vec![sec_only_lot]);
+        assert!(!unleashed_sec_map.has_vacation_badge(&unleashed_sec_map.lots[0]));
+
+        // Custom 600×400 backdrop centers at (100, 100) in an 800×600 viewport
+        // (0x568fa7..0x568fe6), numbered wave slots skip missing slot 1
+        // (0x56bb7a..0x56bb8d), and Vacation port without trees is not drawn (0x56bac8).
+        let mut custom_vac = make_test_map(
+            NeighborhoodKind::Vacation,
+            vec![make_lot(
+                40,
+                [0, 0],
+                Surface565::filled(4, 4, pack_565([10, 200, 10])),
+            )],
+        );
+        let bg_c = pack_565([20, 40, 80]);
+        let wave2_c = pack_565([200, 200, 20]);
+        let port_c = pack_565([240, 40, 240]);
+        custom_vac.backdrop = Surface565::filled(600, 400, bg_c);
+        custom_vac.waves = vec![
+            Some(Surface565::filled(600, 400, pack_565([10, 10, 240]))),
+            None,
+            Some(Surface565::filled(600, 400, wave2_c)),
+        ];
+        custom_vac.vacation_port = Some(Surface565::filled(600, 400, port_c));
+        custom_vac.vacation_trees = None;
+        assert_eq!(custom_vac.map_origin_for([800, 600]), [100, 100]);
+        assert_eq!(custom_vac.hit_test([800, 600], [100, 100]), Some(40));
+        assert_eq!(custom_vac.hit_test([800, 600], [0, 0]), None);
+        let vac_frame1 = custom_vac.render(&RenderOptions {
+            viewport: [800, 600],
+            water_frame: Some(1),
+            show_vacation_overlays: true,
+            ..RenderOptions::default()
+        });
+        // Frame 1 is None (not shifted to frame 2) and port alone is suppressed,
+        // so (110, 110) stays backdrop color rather than wave2_c or port_c.
+        assert_eq!(vac_frame1.color[110 * 800 + 110], widen_565(bg_c));
+        let vac_frame2 = custom_vac.render(&RenderOptions {
+            viewport: [800, 600],
+            water_frame: Some(2),
+            show_vacation_overlays: true,
+            ..RenderOptions::default()
+        });
+        assert_eq!(vac_frame2.color[110 * 800 + 110], widen_565(wave2_c));
 
         // Verify vacation badge draws unhighlighted (0x54ec5a) while picking
         // tests the regular thumbnail (0x5e40b4), and works on Magic Town homes (0x54eb49).
