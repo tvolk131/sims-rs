@@ -127,17 +127,18 @@ impl BalloonFadeState {
     }
 
     /// Begins fading the balloon out at `now_ms` (`0x50fb7f..0x50fbdc`).
+    ///
+    /// Native `0x50fb91..0x50fbb1` unconditionally starts a fresh `1.0 -> 0.0`
+    /// ramp lasting [`FADE_DURATION_MS`] (250 ms), even if dismissed mid-open.
     pub fn close(&mut self, now_ms: u32) {
         if !self.open {
             return;
         }
-        let cur = self.progress(now_ms);
         self.open = false;
-        let rem_ms = ((cur * FADE_DURATION_MS as f32) + 0.5).clamp(0.0, 250.0) as u32;
-        self.start_value = cur;
+        self.start_value = 1.0;
         self.target_value = 0.0;
         self.start_ms = now_ms;
-        self.end_ms = now_ms.saturating_add(rem_ms);
+        self.end_ms = now_ms.saturating_add(FADE_DURATION_MS);
     }
 
     /// Evaluates the normalized linear ramp in `0.0..=1.0` at `now_ms` (`0x473390`).
@@ -1258,6 +1259,16 @@ mod tests {
         fade.open(2125);
         assert_eq!(fade.alpha(2125), 128);
         assert_eq!(fade.alpha(2250), 255);
+
+        // Dismissing mid-open (`0x50fb91..0x50fbb1`) starts a full 250 ms
+        // `1.0 -> 0.0` ramp.
+        let mut mid = BalloonFadeState::default();
+        mid.open(1000);
+        mid.close(1125);
+        assert_eq!(mid.alpha(1125), 255);
+        assert_eq!(mid.alpha(1250), 128);
+        assert_eq!(mid.alpha(1375), 0);
+        assert!(!mid.is_visible(1375));
     }
 
     #[test]

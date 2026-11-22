@@ -93,10 +93,31 @@ fn neighborhood_top_bar_matches_191_clean_and_mode_oracles() {
     let strings = NeighborhoodStrings::load(&install, US_ENGLISH).expect("load NB strings");
     let chrome = NeighborhoodChrome::new();
 
+    // Seed opaque top-bar pixels with a sentinel color `[255, 0, 255]` while
+    // preserving the underlying map only where `BAR_BKG` is keyed transparent,
+    // so an omitted or skipped `chrome.draw()` call fails the ratchet immediately.
+    let bar_bkg = art
+        .image(neighborhood::art_id::BAR_BKG)
+        .expect("BAR_BKG loaded");
+    let seed_top_bar = |oracle: &[[u8; 3]]| -> Frame {
+        let mut buf = oracle.to_vec();
+        for y in 0..52usize {
+            for x in 0..800usize {
+                if bar_bkg
+                    .pixel(x as u32, y as u32)
+                    .is_some_and(|[_, _, _, a]| a > 0)
+                {
+                    buf[y * 800 + x] = [255, 0, 255];
+                }
+            }
+        }
+        Frame::from_rgb(800, 600, buf).unwrap()
+    };
+
     // 1. Clean Neighborhood 1 top bar (`01-nb-clean.png`), including page number `1`
     //    centered over `banner_neighborhood.bmp` with zero `Current.bmp` plate overhang.
     let (_, _, oracle_clean) = load_png(&nb_dir, "01-nb-clean.png");
-    let mut frame = Frame::from_rgb(800, 600, oracle_clean.clone()).unwrap();
+    let mut frame = seed_top_bar(&oracle_clean);
     let clean_state = NeighborhoodState {
         neighborhood_number: 1,
         mode: NeighborhoodMode::Normal,
@@ -115,7 +136,7 @@ fn neighborhood_top_bar_matches_191_clean_and_mode_oracles() {
     // 2. Move-In mode (`11-nb-movein-mode.png`): SelectFamily button toggled on.
     if nb_dir.join("11-nb-movein-mode.png").is_file() {
         let (_, _, oracle_movein) = load_png(&nb_dir, "11-nb-movein-mode.png");
-        let mut frame = Frame::from_rgb(800, 600, oracle_movein.clone()).unwrap();
+        let mut frame = seed_top_bar(&oracle_movein);
         let movein_state = NeighborhoodState {
             neighborhood_number: 1,
             mode: NeighborhoodMode::MoveIn {
@@ -142,7 +163,7 @@ fn neighborhood_top_bar_matches_191_clean_and_mode_oracles() {
     //    popup card overlaps the top bar.
     if nb_dir.join("17b-bulldoze-hover-lot4.png").is_file() {
         let (_, _, oracle_doze) = load_png(&nb_dir, "17b-bulldoze-hover-lot4.png");
-        let mut frame = Frame::from_rgb(800, 600, oracle_doze.clone()).unwrap();
+        let mut frame = seed_top_bar(&oracle_doze);
         let doze_state = NeighborhoodState {
             neighborhood_number: 1,
             mode: NeighborhoodMode::Bulldoze,
@@ -286,20 +307,27 @@ fn camera_panel_loads_all_191_assets_strings_and_renders_native_strip() {
     let mut panel = CameraPanel::new();
     let mut state = CameraState::default();
     let strip = CameraPanel::strip_rect([800, 600]);
+
+    // Render background-only `PanelBack.BMP` first so we prove `CamViewAlbum`
+    // (`1105`) actually paints over the strip rather than matching strip pixels.
+    let mut bg_only = Frame::new(800, 600, [0, 0, 0]);
+    if let Some(bg) = art.image(camera::id::STRIP) {
+        bg_only.draw_all(bg, [strip.x, strip.y]);
+    }
     let mut frame = Frame::new(800, 600, [0, 0, 0]);
     let layout = panel.draw(&mut frame, strip, &state, &strings, &art, true);
     CameraPanel::draw_cluster_patch(&mut frame, [0, 417], &art);
 
-    // Verify CamViewAlbum (`1105`) rendered non-black pixels inside its native slot
+    // Verify CamViewAlbum (`1105`) painted distinct pixels over `PanelBack.BMP`
     // and that clicking it emits `CameraCommand::OpenPhotoAlbum`.
     let album_rect = layout.button(CameraButton::ViewAlbum).unwrap().rect;
-    let non_black = (album_rect.y..album_rect.y + album_rect.height)
+    let painted_over_bg = (album_rect.y..album_rect.y + album_rect.height)
         .flat_map(|y| (album_rect.x..album_rect.x + album_rect.width).map(move |x| (x, y)))
-        .filter(|&(x, y)| frame.pixel(x, y) != Some([0, 0, 0]))
+        .filter(|&(x, y)| frame.pixel(x, y) != bg_only.pixel(x, y))
         .count();
     assert!(
-        non_black > 500,
-        "CamViewAlbum (1105) should render visible pixels inside strip (got {non_black})"
+        painted_over_bg > 500,
+        "CamViewAlbum (1105) must draw visible pixels over PanelBack.BMP (got {painted_over_bg})"
     );
     let cx = album_rect.x + album_rect.width / 2;
     let cy = album_rect.y + album_rect.height / 2;

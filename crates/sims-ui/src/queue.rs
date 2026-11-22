@@ -287,9 +287,10 @@ impl QueueSlideState {
 
     /// Synchronizes slide ramps with the latest `queue` snapshot at `now_ms`.
     ///
-    /// When `origin_for_new` is `Some(pos)` (e.g. the pie-menu click position)
-    /// and the selected Sim has not changed, newly added icons slide from `pos`
-    /// to their target slot over [`SLIDE_DURATION_MS`]; otherwise they snap.
+    /// When `origin_for_new` is `Some(click_pos)` (the pie-menu click position)
+    /// and the selected Sim has not changed, newly added icons slide from
+    /// `[click_pos[0] - 16, click_pos[1] - 16]` (`0x4d2adb..0x4d2af5`) to their
+    /// target slot over [`SLIDE_DURATION_MS`]; otherwise they snap.
     pub fn sync(&mut self, queue: &Queue, origin_for_new: Option<[i32; 2]>, now_ms: u32) {
         let same_person = self.person == queue.person && queue.person.is_some();
         self.person = queue.person;
@@ -311,7 +312,8 @@ impl QueueSlideState {
                     let cur = existing.pos(now_ms);
                     self.slide_to(icon.uid, cur, target, now_ms, SLIDE_DURATION_MS);
                 }
-            } else if let Some(from) = origin_for_new {
+            } else if let Some([cx, cy]) = origin_for_new {
+                let from = [cx.saturating_sub(16), cy.saturating_sub(16)];
                 self.slide_to(icon.uid, from, target, now_ms, SLIDE_DURATION_MS);
             } else {
                 self.snap(icon.uid, target);
@@ -574,5 +576,14 @@ mod tests {
             settled.at_clickable([40, 40], &slide, 2500).map(|i| i.uid),
             Some(2)
         );
+
+        // Newly queued icon slides from `[click_x - 16, click_y - 16]` (`0x4d2adb..0x4d2af5`).
+        let mut added = icon(82, false, false);
+        added.uid = 3;
+        q1.icons.push(added);
+        slide.sync(&q1, Some([200, 150]), 3000);
+        assert_eq!(slide.position(3, 3000), Some([184, 134]));
+        assert_eq!(slide.position(3, 3250), Some([133, 83]));
+        assert_eq!(slide.position(3, 3500), Some([82, 32]));
     }
 }

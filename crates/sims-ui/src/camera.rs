@@ -333,19 +333,10 @@ impl Default for CameraStrings {
     fn default() -> Self {
         Self {
             origins: CameraButton::ALL.map(CameraButton::default_origin),
-            tooltips: [
-                "Small".into(),
-                "Medium".into(),
-                "Large".into(),
-                "Custom".into(),
-                "Album".into(),
-                "Low".into(),
-                "Medium".into(),
-                "High".into(),
-            ],
-            size_help_title: "Size".into(),
+            tooltips: std::array::from_fn(|_| String::new()),
+            size_help_title: String::new(),
             size_help_body: String::new(),
-            quality_help_title: "Quality".into(),
+            quality_help_title: String::new(),
             quality_help_body: String::new(),
         }
     }
@@ -410,7 +401,13 @@ impl CameraStrings {
 fn parse_point(s: &str) -> Option<[i32; 2]> {
     let inner = s.trim().strip_prefix('(')?.strip_suffix(')')?;
     let (xs, ys) = inner.split_once(';')?;
-    Some([xs.trim().parse().ok()?, ys.trim().parse().ok()?])
+    let x: i32 = xs.trim().parse().ok()?;
+    let y: i32 = ys.trim().parse().ok()?;
+    // Reject hostile or absurdly large coordinates from malformed string tables.
+    if !(-4096..=4096).contains(&x) || !(-4096..=4096).contains(&y) {
+        return None;
+    }
+    Some([x, y])
 }
 
 fn normalize_crlf(s: &str) -> String {
@@ -444,7 +441,7 @@ impl CameraLayout {
     /// control matches `cWinCamera`'s exact pixel coordinates from `STR# 140`
     /// and `0x503c67..0x503cc4`. Narrower strips pack visible buttons cleanly
     /// without overlapping hit boxes.
-    pub fn compute(strip: Rect, state: &CameraState, strings: &CameraStrings, art: &Art) -> Self {
+    pub fn compute(strip: Rect, _state: &CameraState, strings: &CameraStrings, art: &Art) -> Self {
         if strip.width <= 0 || strip.height <= 0 {
             return Self {
                 strip,
@@ -456,29 +453,42 @@ impl CameraLayout {
         }
 
         let compact = strip.width < Self::MIN_NATIVE_WIDTH || strip.height < hud::STRIP;
-        let show_custom = matches!(state.size, SnapshotSize::Custom);
         let mut buttons = Vec::with_capacity(8);
 
         if !compact {
+            let strip_right = strip.x.saturating_add(strip.width);
+            let strip_bottom = strip.y.saturating_add(strip.height);
             let tp_rect = |pos: [i32; 2], art_id: i32| {
                 let (w, h) = art
                     .image(art_id)
                     .map_or((2, 89), |img| (img.width as i32, img.height as i32));
-                Rect::new(strip.x + pos[0], strip.y + pos[1], w, h.min(strip.height))
+                Rect::new(
+                    strip.x.saturating_add(pos[0]),
+                    strip.y.saturating_add(pos[1]),
+                    w,
+                    h.min(strip.height),
+                )
             };
             let toothpick_left = Some(tp_rect(TOOTHPICK_LEFT_POS, id::TOOTHPICK_LEFT));
             let toothpick_right = Some(tp_rect(TOOTHPICK_RIGHT_POS, id::TOOTHPICK_RIGHT));
 
+            // 0x5041a8..0x5041da: native `cWinCamera` creates all 8 buttons and
+            // toggles Custom (`1104`) between enabled (cell 1) and disabled (cell 3).
             for btn in CameraButton::ALL {
-                if btn == CameraButton::Custom && !show_custom {
-                    continue;
-                }
                 let [ox, oy] = strings.origins[btn.index()];
                 let [cw, ch] = button_cell_size(art, btn);
-                buttons.push(CameraButtonPlacement {
-                    button: btn,
-                    rect: Rect::new(strip.x + ox, strip.y + oy, cw, ch),
-                });
+                let x = strip.x.saturating_add(ox);
+                let y = strip.y.saturating_add(oy);
+                let x0 = x.clamp(strip.x, strip_right);
+                let y0 = y.clamp(strip.y, strip_bottom);
+                let x1 = x.saturating_add(cw).clamp(x0, strip_right);
+                let y1 = y.saturating_add(ch).clamp(y0, strip_bottom);
+                if x1 > x0 && y1 > y0 {
+                    buttons.push(CameraButtonPlacement {
+                        button: btn,
+                        rect: Rect::new(x0, y0, x1 - x0, y1 - y0),
+                    });
+                }
             }
 
             Self {
@@ -625,6 +635,33 @@ impl CameraPanel {
         strip.contains(x, y)
     }
 
+    /// Returns `Some(CameraCommand::Help(topic))` when Quick Tips are active
+    /// and the pointer is hovering a size or quality button (`0x503d43..0x5040ff`).
+    pub fn quick_tip_command(&self, state: &CameraState) -> Option<CameraCommand> {
+        if !state.quick_tips {
+            return None;
+        }
+        self.hovered?.help_topic().map(CameraCommand::Help)
+    }
+
+    /// Lays out the active Camera Mode Quick Tips help balloon above `strip`
+    /// when `state.quick_tips` is enabled and the pointer hovers a size or
+    /// quality control (`0x504008..0x504116`).
+    pub fn help_balloon(
+        &self,
+        strip: Rect,
+        state: &CameraState,
+        strings: &CameraStrings,
+        art: &Art,
+    ) -> Option<balloon::Balloon> {
+        if !state.quick_tips {
+            return None;
+        }
+        let topic = self.hovered?.help_topic()?;
+        let text = topic.balloon_text(strings);
+        Some(balloon::lay_out(art, &text, strip))
+    }
+
     /// Completes a mouse release at `(x, y)`, emitting a [`CameraCommand`] when
     /// released over the same enabled button that was pressed.
     pub fn release(
@@ -642,6 +679,11 @@ impl CameraPanel {
         let hit = layout.hit(x, y);
         self.hovered = hit;
         let btn = pressed.filter(|&b| Some(b) == hit && is_enabled(b, state))?;
+        if state.quick_tips
+            && let Some(topic) = btn.help_topic()
+        {
+            return Some(CameraCommand::Help(topic));
+        }
         Some(match btn {
             CameraButton::Small => CameraCommand::SetSize(SnapshotSize::Small),
             CameraButton::Medium => CameraCommand::SetSize(SnapshotSize::Medium),
@@ -704,8 +746,10 @@ impl CameraPanel {
             draw_four_cell_button(frame, art, btn.art_id(), cell, placement.rect);
 
             // 0x503688..0x5036f5 & 0x5041e0..0x504277: custom size button
-            // draws "<w> x <h>" centered along its bottom edge in 9 pt font.
+            // draws "<w> x <h>" centered along its bottom edge in 9 pt font
+            // only while Custom size is active.
             if btn == CameraButton::Custom
+                && matches!(state.size, SnapshotSize::Custom)
                 && let Some(font) = art.font(9).or_else(|| art.font(8))
             {
                 let label = format!(
@@ -719,7 +763,9 @@ impl CameraPanel {
             }
         }
 
-        if let Some(hovered) = self.hovered
+        if let Some(help) = self.help_balloon(strip, state, strings, art) {
+            balloon::draw(frame, art, &help);
+        } else if let Some(hovered) = self.hovered
             && let Some(placement) = layout.button(hovered)
         {
             let tip = strings.tooltip(hovered);
@@ -757,6 +803,7 @@ impl CameraPanel {
 const fn is_enabled(button: CameraButton, state: &CameraState) -> bool {
     match button {
         CameraButton::ViewAlbum => state.album_enabled,
+        CameraButton::Custom => matches!(state.size, SnapshotSize::Custom),
         _ => true,
     }
 }
@@ -849,17 +896,23 @@ mod tests {
     }
 
     #[test]
-    fn native_layout_matches_191_coords_and_hides_custom_until_active() {
+    fn native_layout_matches_191_coords_and_keeps_custom_button_in_strip() {
         let art = Art::default();
         let strings = CameraStrings::default();
         let strip = CameraPanel::strip_rect([800, 600]);
         assert_eq!(strip, Rect::new(220, 500, 580, 100));
 
+        // All 8 native buttons are placed (Custom sits at (11, 11) in disabled cell 3
+        // until Custom size is active, matching `0x5041a8..0x5041da`).
         let mut state = CameraState::default();
         let layout = CameraLayout::compute(strip, &state, &strings, &art);
         assert!(!layout.compact);
-        assert_eq!(layout.buttons.len(), 7);
-        assert!(layout.button(CameraButton::Custom).is_none());
+        assert_eq!(layout.buttons.len(), 8);
+        assert_eq!(
+            layout.button(CameraButton::Custom).unwrap().rect,
+            Rect::new(220 + 11, 500 + 11, 60, 58)
+        );
+        assert!(!is_enabled(CameraButton::Custom, &state));
         assert_eq!(
             layout.button(CameraButton::ViewAlbum).unwrap().rect,
             Rect::new(220 + 226, 500 + 35, 61, 35)
@@ -873,14 +926,10 @@ mod tests {
             Rect::new(220 + 206, 500 + 6, 2, 89)
         );
 
-        // Activating Custom reveals the 8th button at (11, 11).
         state.size = SnapshotSize::Custom;
+        assert!(is_enabled(CameraButton::Custom, &state));
         let with_custom = CameraLayout::compute(strip, &state, &strings, &art);
         assert_eq!(with_custom.buttons.len(), 8);
-        assert_eq!(
-            with_custom.button(CameraButton::Custom).unwrap().rect,
-            Rect::new(220 + 11, 500 + 11, 60, 58)
-        );
         for i in 0..with_custom.buttons.len() {
             for j in (i + 1)..with_custom.buttons.len() {
                 assert!(
@@ -891,10 +940,18 @@ mod tests {
                 );
             }
         }
+
+        // Out-of-range coordinates in malformed STR# 140 are rejected safely.
+        assert_eq!(parse_point("(2147483647;0)"), None);
+        assert_eq!(parse_point("(-5000;10)"), None);
+        let mut bad_strings = CameraStrings::default();
+        bad_strings.origins[CameraButton::Small.index()] = [10_000, 10_000];
+        let clamped = CameraLayout::compute(strip, &state, &bad_strings, &art);
+        assert!(clamped.button(CameraButton::Small).is_none());
     }
 
     #[test]
-    fn click_interactions_emit_size_quality_and_album_commands() {
+    fn click_interactions_emit_size_quality_album_and_quick_tip_help_commands() {
         let art = Art::default();
         let strings = CameraStrings::default();
         let strip = CameraPanel::strip_rect([800, 600]);
@@ -917,6 +974,27 @@ mod tests {
             click(&mut panel, &state, CameraButton::QualityLow),
             Some(CameraCommand::SetQuality(SnapshotQuality::Low))
         );
+        assert_eq!(
+            click(&mut panel, &state, CameraButton::ViewAlbum),
+            Some(CameraCommand::OpenPhotoAlbum)
+        );
+        // Custom is disabled while Medium is active.
+        assert_eq!(click(&mut panel, &state, CameraButton::Custom), None);
+
+        // Quick Tips mode routes size/quality controls to `CameraCommand::Help`.
+        state.quick_tips = true;
+        let qr = layout.button(CameraButton::QualityHigh).unwrap().rect;
+        panel.hover(qr.x + 4, qr.y + 4, strip, &state, &strings, &art);
+        assert_eq!(
+            panel.quick_tip_command(&state),
+            Some(CameraCommand::Help(CameraHelp::QualitySettings))
+        );
+        assert!(panel.help_balloon(strip, &state, &strings, &art).is_some());
+        assert_eq!(
+            click(&mut panel, &state, CameraButton::Large),
+            Some(CameraCommand::Help(CameraHelp::SnapshotSizes))
+        );
+        // ViewAlbum still opens the album directly in Quick Tips mode.
         assert_eq!(
             click(&mut panel, &state, CameraButton::ViewAlbum),
             Some(CameraCommand::OpenPhotoAlbum)
