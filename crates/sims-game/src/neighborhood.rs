@@ -24,20 +24,25 @@ use sims_audio::SoundEvent;
 use sims_audio::music::MusicMode;
 use sims_content::ui_graphics::UiGraphics;
 use sims_content::{Catalog, Index, Install};
+use sims_formats::bitmap::Image;
 use sims_formats::iff::Iff;
 use sims_formats::strings::StringTable;
 use sims_render::camera::{Camera, Walls, Zoom};
 use sims_render::neighborhood::{
-    COLOR_KEY_565, LotStatus, LotZoning, MapLot, NeighborhoodKind, NeighborhoodMap, RenderOptions,
-    Surface565, pack_565,
+    COLOR_KEY_565, CommunityFilter, LotStatus, LotZoning, MapLot, NeighborhoodKind,
+    NeighborhoodMap, RenderOptions, Surface565, pack_565,
 };
 use sims_render::{Canvas, Focus};
+use sims_sim::album_store::{AlbumFamilyToken, AlbumImage, NewAlbumPhoto};
 use sims_sim::autosave::{SavePayloadKind, SaveSlot, SaveTarget};
 use sims_sim::load::Context;
 use sims_sim::migration::StoreMigrationReport;
 use sims_sim::neighborhood_store::{
-    DEFAULT_ARCH_VALUE_MULTIPLIER, NeighborhoodStore, StoredNeighborhood, family_net_worth,
-    lot_total_value,
+    DEFAULT_ARCH_VALUE_MULTIPLIER, NeighborhoodStore, StoredLotThumbnail, StoredNeighborhood,
+    ThumbnailSurface565, family_net_worth, lot_total_value,
+};
+use sims_ui::album::{
+    AlbumCommand, AlbumEntry, AlbumKey, AlbumSnapshot, AlbumStrings, PhotoAlbumDialog, PhotoId,
 };
 use sims_ui::art::Art;
 use sims_ui::command::Command;
@@ -48,6 +53,7 @@ use sims_ui::family_bin::{
 };
 use sims_ui::frame::{Frame, Rect};
 use sims_ui::household::Faces;
+use sims_ui::loading::{LoadingAudioCue, LoadingKind, LoadingScreen, LoadingState, LoadingStrings};
 use sims_ui::neighborhood::{
     LotInfo, LotKind, LotOccupant, MAX_NEIGHBORHOOD, MIN_NEIGHBORHOOD, NeighborhoodChrome,
     NeighborhoodCommand, NeighborhoodMode, NeighborhoodState, NeighborhoodStrings,
@@ -55,10 +61,19 @@ use sims_ui::neighborhood::{
 };
 use sims_ui::options::{OptionsState, OptionsTexts};
 use sims_ui::saves::{SaveManagerCommand, SaveManagerDialog, SaveManagerSnapshot};
+use sims_ui::travel::{
+    Destination, LotFilter, TravelBarMode, TravelChrome, TravelCommand, TravelDialog,
+    TravelDialogCommand, TravelDialogLayout, TravelDialogState, TravelLayout, TravelState,
+    TravelStrings, TravelTransport as UiTravelTransport,
+};
 use sims_vm::boot::Frames;
 use sims_vm::boot::save::Saved;
 use sims_vm::lifecycle::{self, BulldozeReport, EvictReport, MoveInReport, SaveReport};
-use std::collections::BTreeMap;
+use sims_vm::travel::{
+    self as vm_travel, ReturnReport, TravelDestination, TravelRequest, TravelSession,
+    TravelTransport as VmTravelTransport, ValidatedTravelPlan,
+};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 const US_ENGLISH: u8 = 1;
@@ -75,6 +90,7 @@ const NEIGHBORHOOD_TUNING_CHUNK: u16 = 4;
 /// High-level screen currently shown by [`NeighborhoodShell`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScreenKind {
+    Loading,
     Neighborhood,
     FamilyBin,
     CreateFamily,
@@ -124,12 +140,34 @@ pub fn music_mode_for_kind(kind: NeighborhoodKind) -> MusicMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ShellDialogKind {
     ConfirmQuit,
-    ConfirmMoveIn { family_id: u16, lot_id: u16 },
-    ConfirmEvict { lot_id: u16 },
-    ConfirmBulldoze { lot_id: u16 },
-    ConfirmDeleteFamily { family_id: u16 },
+    ConfirmMoveIn {
+        family_id: u16,
+        lot_id: u16,
+    },
+    ConfirmEvict {
+        lot_id: u16,
+    },
+    ConfirmBulldoze {
+        lot_id: u16,
+    },
+    ConfirmDeleteFamily {
+        family_id: u16,
+    },
+    ConfirmResumeOrAbortTrip {
+        home_house: u32,
+        destination_house: u32,
+    },
     Notice,
 }
+
+/// Optional desktop host hook called immediately before blocking lot/travel
+/// transitions with the rendered native [`LoadingScreen`] RGB buffer, canvas
+/// size, and drained audio queue (starting [`MusicMode::Load`]).
+pub type LoadingPresenter = Box<dyn FnMut(&[[u8; 3]], [i32; 2], Vec<Input>) + Send>;
+
+/// Maximum number of full-resolution album images kept hydrated around the
+/// currently selected page (well under `PhotoAlbumStore`'s 32 MiB bulk limit).
+const ALBUM_IMAGE_WINDOW: usize = 12;
 
 struct ShellDialog {
     kind: ShellDialogKind,
@@ -391,13 +429,28 @@ struct LotSession {
     /// Last observed VM `days_played` (`world.globals[28]`) for exact midnight
     /// rotating autosave detection (`daily::turn_day`).
     last_days_played: i16,
+    /// Present when the household is actively visiting a travel destination
+    /// (`depart_to_destination` / `resume_active_trip`), so leaving returns
+    /// home cleanly via `return_from_destination` without overwriting the
+    /// destination community lot.
+    active_trip: Option<TravelSession>,
+    /// True when the lot was opened as an unoccupied destination community lot
+    /// in Build/Buy edit mode (`open_destination_for_edit`).
+    is_destination_edit: bool,
 }
 
 enum ActiveScreen {
+    Loading(LoadingState),
     Neighborhood,
     FamilyBin,
     CreateFamily(Box<CafSession>),
     Lot(Box<LotSession>),
+}
+
+/// Pending travel departure plan awaiting confirmation in [`TravelDialog`].
+struct PendingTravel {
+    request: TravelRequest,
+    plan: ValidatedTravelPlan,
 }
 
 /// Full playable Neighborhood ↔ Family Bin ↔ Lot application shell.
@@ -435,7 +488,16 @@ pub struct NeighborhoodShell {
     family_bin_art: Art,
     dialog_art: Art,
     save_manager_art: Art,
+    loading_art: Art,
+    loading_strings: LoadingStrings,
+    album_art: Art,
+    travel_art: Art,
+    travel_strings: TravelStrings,
     dialogs: DialogStrings,
+
+    // Native Loading Screen state (`sims_ui::loading::LoadingScreen`).
+    loading_screen: LoadingScreen,
+    loading_caption_seq: usize,
 
     // Active neighborhood state.
     slot: u8,
@@ -457,12 +519,30 @@ pub struct NeighborhoodShell {
     pressed_lot_id: Option<u16>,
     move_in_family_id: Option<u16>,
 
+    // Travel destination sub-neighborhood chrome & confirmation dialog.
+    travel_chrome: TravelChrome,
+    travel_state: TravelState,
+    travel_dialog: TravelDialog,
+    travel_dialog_state: Option<TravelDialogState>,
+    pending_travel: Option<PendingTravel>,
+    magic_family_bin_hovered: bool,
+    magic_family_bin_pressed: bool,
+    loading_presenter: Option<LoadingPresenter>,
+
     // Family Bin screen interactive state.
     family_bin: FamilyBin,
     family_bin_entries: Vec<FamilyEntry>,
 
     // Modal confirmation / notice dialog over Neighborhood or Family Bin.
     dialog: Option<ShellDialog>,
+    // Household Photo Album / Storybook modal (overlay over Lot or Neighborhood).
+    album_dialog: PhotoAlbumDialog,
+    album_snapshot: Option<AlbumSnapshot>,
+    album_token: Option<AlbumFamilyToken>,
+    album_neighborhood_id: Option<String>,
+    album_has_image: BTreeSet<PhotoId>,
+    album_strip_scroll: usize,
+    album_strip_pressed: Option<i32>,
     // Crash-safe Save & Rotating Autosave Manager dialog (overlay over Lot/Neighborhood).
     save_manager: SaveManagerDialog,
     save_manager_snapshot: Option<SaveManagerSnapshot>,
@@ -524,6 +604,28 @@ impl NeighborhoodShell {
             &[sims_ui::neighborhood::art_id::POPUP_TILER],
         )
         .map_err(|e| e.to_string())?;
+        let loading_art = sims_ui::loading::load_art(&ui, US_ENGLISH)
+            .or_else(|_| {
+                Art::load_with_optional(&ui, US_ENGLISH, &[], &sims_ui::loading::RESOURCES)
+            })
+            .map_err(|e| e.to_string())?;
+        let loading_strings = LoadingStrings::load(&install, US_ENGLISH).unwrap_or_default();
+        let album_art = sims_ui::album::load_art(&ui, US_ENGLISH)
+            .or_else(|_| {
+                Art::load_with_optional(
+                    &ui,
+                    US_ENGLISH,
+                    &dialog::RESOURCES,
+                    &sims_ui::album::RESOURCES,
+                )
+            })
+            .map_err(|e| e.to_string())?;
+        let album_strings =
+            AlbumStrings::load_from_install(&install, US_ENGLISH).unwrap_or_default();
+        let travel_art = sims_ui::travel::load_art(&ui, US_ENGLISH)
+            .or_else(|_| Art::load_with_optional(&ui, US_ENGLISH, &[], &sims_ui::travel::RESOURCES))
+            .map_err(|e| e.to_string())?;
+        let travel_strings = TravelStrings::load(&install, US_ENGLISH).unwrap_or_default();
         let dialogs = DialogStrings::load(&install);
         let arch_multiplier = load_arch_multiplier(&install);
         let magic_lot_91_cost = lifecycle::magic_town_lot_cost(Some(&install_root), 91);
@@ -554,7 +656,7 @@ impl NeighborhoodShell {
             &descriptions,
             arch_multiplier,
         );
-        let custom_thumbs = BTreeMap::new();
+        let custom_thumbs = load_persisted_custom_thumbs(&store, &neighborhood_id);
         sync_map_with_store(
             &mut map,
             &stored,
@@ -572,20 +674,29 @@ impl NeighborhoodShell {
             show_credits_button: false,
             hovered_lot: None,
         };
+        let travel_state = TravelState::default();
 
         let vols = [
             options_state.sound.fx,
             options_state.sound.music,
             options_state.sound.vox,
         ];
-        let audio_queue = vec![
+        let mut loading_screen = LoadingScreen::new();
+        let mut audio_queue = vec![
             Input::FxVolume(vols[0]),
             Input::MusicVolume(vols[1]),
             Input::VoxVolume(vols[2]),
-            Input::MusicMode(music_mode_for_kind(kind)),
         ];
+        if let Some(LoadingAudioCue::StartLoadLoop { .. }) = loading_screen.begin(0) {
+            audio_queue.push(Input::MusicMode(MusicMode::Load));
+        }
+        if let Some(LoadingAudioCue::StopLoadLoop) = loading_screen.finish() {
+            audio_queue.push(Input::MusicMode(music_mode_for_kind(kind)));
+        } else {
+            audio_queue.push(Input::MusicMode(music_mode_for_kind(kind)));
+        }
 
-        Ok(Self {
+        let mut shell = Self {
             install_root,
             install,
             saves_path,
@@ -614,7 +725,14 @@ impl NeighborhoodShell {
             family_bin_art,
             dialog_art,
             save_manager_art,
+            loading_art,
+            loading_strings,
+            album_art,
+            travel_art,
+            travel_strings,
             dialogs,
+            loading_screen,
+            loading_caption_seq: 1,
             slot,
             neighborhood_id,
             kind,
@@ -631,20 +749,45 @@ impl NeighborhoodShell {
             hovered_lot_id: None,
             pressed_lot_id: None,
             move_in_family_id: None,
+            travel_chrome: TravelChrome::new(),
+            travel_state,
+            travel_dialog: TravelDialog::new(),
+            travel_dialog_state: None,
+            pending_travel: None,
+            magic_family_bin_hovered: false,
+            magic_family_bin_pressed: false,
+            loading_presenter: None,
             family_bin: FamilyBin::new(),
             family_bin_entries,
             dialog: None,
+            album_dialog: PhotoAlbumDialog::new(album_strings),
+            album_snapshot: None,
+            album_token: None,
+            album_neighborhood_id: None,
+            album_has_image: BTreeSet::new(),
+            album_strip_scroll: 0,
+            album_strip_pressed: None,
             save_manager: SaveManagerDialog::new(),
             save_manager_snapshot: None,
             save_manager_target_lot: None,
             last_save_completions: Vec::new(),
             note: startup_note,
             audio_queue,
-        })
+        };
+        let active_trips = shell.inspect_any_active_trips();
+        if !active_trips.is_empty() && shell.note.is_none() {
+            let (home_house, trip) = &active_trips[0];
+            shell.note = Some(format!(
+                "Lot {home_house} has an interrupted trip to lot {}. Click it to Resume or Abort.",
+                trip.destination_house
+            ));
+        }
+        Ok(shell)
     }
 
     pub fn screen(&self) -> ScreenKind {
         match self.screen {
+            ActiveScreen::Loading(_) => ScreenKind::Loading,
             ActiveScreen::Neighborhood => ScreenKind::Neighborhood,
             ActiveScreen::FamilyBin => ScreenKind::FamilyBin,
             ActiveScreen::CreateFamily(_) => ScreenKind::CreateFamily,
@@ -684,6 +827,187 @@ impl NeighborhoodShell {
 
     pub fn save_manager_snapshot(&self) -> Option<&SaveManagerSnapshot> {
         self.save_manager_snapshot.as_ref()
+    }
+
+    pub fn loading_screen(&self) -> &LoadingScreen {
+        &self.loading_screen
+    }
+
+    pub fn loading_strings(&self) -> &LoadingStrings {
+        &self.loading_strings
+    }
+
+    pub fn loading_state(&self) -> Option<&LoadingState> {
+        match &self.screen {
+            ActiveScreen::Loading(state) => Some(state),
+            _ => None,
+        }
+    }
+
+    /// Enters the interactive native [`LoadingScreen`] (`ScreenKind::Loading`),
+    /// emitting [`Input::MusicMode`]`(`[`MusicMode::Load`]`)` when
+    /// [`LoadingAudioCue::StartLoadLoop`] fires.
+    pub fn begin_loading(
+        &mut self,
+        kind: LoadingKind,
+        destination_label: Option<String>,
+        progress: f32,
+    ) {
+        self.start_load_audio();
+        self.screen = ActiveScreen::Loading(LoadingState {
+            kind,
+            progress,
+            destination_label,
+            caption_override: None,
+        });
+    }
+
+    /// Updates the progress ratio and optional caption override while on
+    /// [`ScreenKind::Loading`].
+    pub fn update_loading(&mut self, progress: f32, caption_override: Option<String>) -> bool {
+        if let ActiveScreen::Loading(state) = &mut self.screen {
+            state.progress = progress;
+            state.caption_override = caption_override;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Advances the active loading screen's rotating caption timer by `delta_ms`.
+    pub fn tick_loading(&mut self, delta_ms: u64) {
+        self.loading_screen.tick(delta_ms);
+    }
+
+    /// Finishes the active [`LoadingScreen`], emitting
+    /// [`LoadingAudioCue::StopLoadLoop`] -> destination music mode and returning
+    /// to the Neighborhood screen if still on [`ScreenKind::Loading`].
+    pub fn finish_loading(&mut self) {
+        if matches!(self.screen, ActiveScreen::Loading(_)) {
+            self.screen = ActiveScreen::Neighborhood;
+        }
+        let target_music = self.desired_music_mode();
+        self.stop_load_audio(target_music);
+    }
+
+    /// Renders a standalone [`LoadingScreen`] frame at `size` using the shell's
+    /// loaded splash artwork and `UIText.iff` caption strings.
+    pub fn render_loading_frame(&self, state: &LoadingState, size: [u32; 2]) -> Canvas {
+        let w = size[0].max(1);
+        let h = size[1].max(1);
+        let mut frame = Frame::new(w, h, [0, 0, 0]);
+        self.loading_screen
+            .draw(&mut frame, state, &self.loading_art, &self.loading_strings);
+        let mut canvas = Canvas::new(w as usize, h as usize, [0, 0, 0]);
+        canvas.color = frame.into_rgb();
+        canvas
+    }
+
+    /// Installs a desktop host presenter invoked immediately before blocking
+    /// lot/travel transitions so the native [`LoadingScreen`] splash, progress
+    /// bar, rotating caption, and [`MusicMode::Load`] are presented live while
+    /// work executes.
+    pub fn set_loading_presenter(&mut self, presenter: Option<LoadingPresenter>) {
+        self.loading_presenter = presenter;
+    }
+
+    /// Sets a user-visible status note on the active Lot or Neighborhood screen.
+    pub fn set_note(&mut self, note: impl Into<String>) {
+        let text = note.into();
+        if let ActiveScreen::Lot(session) = &mut self.screen {
+            session.game.set_note(text);
+        } else {
+            self.note = Some(text);
+        }
+    }
+
+    /// Returns the active status note on the current Lot or Neighborhood screen, if any.
+    pub fn note(&self) -> Option<&str> {
+        if let ActiveScreen::Lot(session) = &self.screen {
+            session.game.note()
+        } else {
+            self.note.as_deref()
+        }
+    }
+
+    fn present_loading_step(
+        &mut self,
+        kind: LoadingKind,
+        destination_label: Option<String>,
+        progress: f32,
+    ) {
+        if self.loading_presenter.is_none() {
+            return;
+        }
+        let state = LoadingState {
+            kind,
+            progress: progress.clamp(0.0, 1.0),
+            destination_label,
+            caption_override: None,
+        };
+        let frame_size = self.frame_size_u32();
+        let canvas = self.render_loading_frame(&state, frame_size);
+        let audio = std::mem::take(&mut self.audio_queue);
+        if let Some(mut presenter) = self.loading_presenter.take() {
+            presenter(&canvas.color, self.size, audio);
+            self.loading_presenter = Some(presenter);
+        }
+    }
+
+    fn start_load_audio(&mut self) {
+        let seq = self.loading_caption_seq;
+        self.loading_caption_seq = self.loading_caption_seq.wrapping_add(1);
+        if let Some(LoadingAudioCue::StartLoadLoop { .. }) = self.loading_screen.begin(seq) {
+            self.audio_queue.push(Input::MusicMode(MusicMode::Load));
+        }
+    }
+
+    fn stop_load_audio(&mut self, next_music: MusicMode) {
+        if let Some(LoadingAudioCue::StopLoadLoop) = self.loading_screen.finish() {
+            self.audio_queue.push(Input::MusicMode(next_music));
+        }
+    }
+
+    pub fn album_open(&self) -> bool {
+        self.album_dialog.is_open()
+    }
+
+    pub fn album_dialog(&self) -> &PhotoAlbumDialog {
+        &self.album_dialog
+    }
+
+    pub fn album_snapshot(&self) -> Option<&AlbumSnapshot> {
+        self.album_snapshot.as_ref()
+    }
+
+    pub fn travel_state(&self) -> &TravelState {
+        &self.travel_state
+    }
+
+    pub fn travel_dialog_open(&self) -> bool {
+        self.travel_dialog_state.is_some()
+    }
+
+    pub fn travel_dialog_state(&self) -> Option<&TravelDialogState> {
+        self.travel_dialog_state.as_ref()
+    }
+
+    /// Active travel session when the household is currently visiting a
+    /// destination lot (`depart_to_destination` / `resume_active_trip`).
+    pub fn active_trip(&self) -> Option<&TravelSession> {
+        match &self.screen {
+            ActiveScreen::Lot(session) => session.active_trip.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Whether the active lot is an unoccupied destination lot opened for
+    /// Build/Buy editing (`open_destination_for_edit`).
+    pub fn is_destination_edit(&self) -> bool {
+        match &self.screen {
+            ActiveScreen::Lot(session) => session.is_destination_edit,
+            _ => false,
+        }
     }
 
     pub fn caf_session(&self) -> Option<&CafSession> {
@@ -762,11 +1086,14 @@ impl NeighborhoodShell {
     }
 
     pub fn has_dialog(&self) -> bool {
-        if self.save_manager.is_open() {
+        if self.save_manager.is_open()
+            || self.album_dialog.is_open()
+            || self.travel_dialog_state.is_some()
+        {
             return true;
         }
         match &self.screen {
-            ActiveScreen::Lot(session) => session.game.has_dialog(),
+            ActiveScreen::Lot(session) => session.game.has_dialog() || session.game.shop_open(),
             ActiveScreen::CreateFamily(caf) => caf.controller().confirm().is_some(),
             _ => self.dialog.is_some(),
         }
@@ -801,6 +1128,7 @@ impl NeighborhoodShell {
 
     pub fn desired_music_mode(&self) -> MusicMode {
         match &self.screen {
+            ActiveScreen::Loading(_) => MusicMode::Load,
             ActiveScreen::Neighborhood => music_mode_for_kind(self.kind),
             ActiveScreen::FamilyBin | ActiveScreen::CreateFamily(_) => MusicMode::FamilyBin,
             ActiveScreen::Lot(session) => {
@@ -817,10 +1145,14 @@ impl NeighborhoodShell {
     /// Whether the active screen has an interactive tool, drag, or dialog open
     /// that benefits from full monitor refresh rate.
     pub fn is_actively_interacting(&self) -> bool {
-        if self.save_manager.is_open() {
+        if self.save_manager.is_open()
+            || self.album_dialog.is_open()
+            || self.travel_dialog_state.is_some()
+        {
             return true;
         }
         match &self.screen {
+            ActiveScreen::Loading(_) => true,
             ActiveScreen::Lot(session) => session.game.is_actively_interacting(),
             ActiveScreen::Neighborhood => {
                 self.dialog.is_some()
@@ -835,8 +1167,20 @@ impl NeighborhoodShell {
     /// Window title string appropriate for the current screen.
     pub fn window_title(&self) -> String {
         match &self.screen {
+            ActiveScreen::Loading(state) => match &state.destination_label {
+                Some(label) => format!("sims-game: Loading {label}..."),
+                None => "sims-game: Loading...".to_owned(),
+            },
             ActiveScreen::Neighborhood => {
-                format!("sims-game: Neighborhood {}", self.slot)
+                if let Some(dest) = destination_for_kind(self.kind) {
+                    format!(
+                        "sims-game: Neighborhood {} — {}",
+                        self.slot,
+                        dest.short_label()
+                    )
+                } else {
+                    format!("sims-game: Neighborhood {}", self.slot)
+                }
             }
             ActiveScreen::FamilyBin => {
                 format!("sims-game: Neighborhood {} — Select a Family", self.slot)
@@ -884,13 +1228,23 @@ impl NeighborhoodShell {
         changed
     }
 
-    /// Advances shell-level animation timers (e.g. neighborhood water waves,
-    /// CAF turntable & caret blink) and polls background save completions.
-    /// Returns `true` when the active screen should be redrawn.
+    /// Advances shell-level animation timers (e.g. loading captions, neighborhood
+    /// water waves, Photo Album caret blink, CAF turntable & caret blink) and
+    /// polls background save completions. Returns `true` when the active screen
+    /// should be redrawn.
     pub fn tick_shell(&mut self, delta_us: u64) -> bool {
         self.clock_us = self.clock_us.saturating_add(delta_us);
         let mut redraw = self.poll_background_saves();
+        if self.album_dialog.is_open() {
+            self.album_dialog.advance_time(delta_us);
+            redraw = true;
+        }
         match &mut self.screen {
+            ActiveScreen::Loading(_) => {
+                let ms = (delta_us / 1_000).max(u64::from(delta_us > 0));
+                self.loading_screen.tick(ms);
+                redraw = true;
+            }
             ActiveScreen::Neighborhood => {
                 let next_wave = (self.clock_us / WATER_STEP_US) as usize;
                 if next_wave != self.water_frame {
@@ -900,6 +1254,7 @@ impl NeighborhoodShell {
             }
             ActiveScreen::CreateFamily(caf) => {
                 redraw |= caf.tick(delta_us);
+                self.drain_caf_voice_previews();
             }
             _ => {}
         }
@@ -907,7 +1262,10 @@ impl NeighborhoodShell {
     }
 
     pub fn canvas(&self) -> &Canvas {
-        if self.save_manager.is_open() {
+        if self.save_manager.is_open()
+            || self.album_dialog.is_open()
+            || self.travel_dialog_state.is_some()
+        {
             return &self.canvas;
         }
         match &self.screen {
@@ -919,16 +1277,35 @@ impl NeighborhoodShell {
     pub fn render(&mut self) {
         if let ActiveScreen::Lot(session) = &mut self.screen {
             session.game.render();
-            if self.save_manager.is_open()
-                && let Some(snapshot) = &self.save_manager_snapshot
-            {
+            let has_overlay = self.save_manager.is_open()
+                || self.album_dialog.is_open()
+                || self.travel_dialog_state.is_some();
+            if has_overlay {
                 let lot_canvas = session.game.canvas();
                 let w = lot_canvas.width;
                 let h = lot_canvas.height;
                 if let Ok(mut frame) = Frame::from_rgb(w as u32, h as u32, lot_canvas.color.clone())
                 {
-                    self.save_manager
-                        .draw(&mut frame, snapshot, &self.save_manager_art);
+                    if self.album_dialog.is_open()
+                        && let Some(snapshot) = &self.album_snapshot
+                    {
+                        self.album_dialog
+                            .draw(&mut frame, snapshot, &self.album_art);
+                    }
+                    if let Some(td_state) = &self.travel_dialog_state {
+                        self.travel_dialog.draw(
+                            &mut frame,
+                            td_state,
+                            &self.travel_art,
+                            &self.travel_strings,
+                        );
+                    }
+                    if self.save_manager.is_open()
+                        && let Some(snapshot) = &self.save_manager_snapshot
+                    {
+                        self.save_manager
+                            .draw(&mut frame, snapshot, &self.save_manager_art);
+                    }
                     let mut composed = Canvas::new(w, h, [0, 0, 0]);
                     composed.color = frame.into_rgb();
                     self.canvas = composed;
@@ -943,12 +1320,33 @@ impl NeighborhoodShell {
         }
 
         match &mut self.screen {
+            ActiveScreen::Loading(state) => {
+                let rgb = std::mem::take(&mut self.canvas.color);
+                if let Ok(mut frame) = Frame::from_rgb(w as u32, h as u32, rgb) {
+                    self.loading_screen.draw(
+                        &mut frame,
+                        state,
+                        &self.loading_art,
+                        &self.loading_strings,
+                    );
+                    self.canvas.color = frame.into_rgb();
+                } else {
+                    self.canvas.color = vec![[0, 0, 0]; w * h];
+                }
+            }
             ActiveScreen::Neighborhood => {
+                let is_travel_map = destination_for_kind(self.kind).is_some();
+                let highlighted_lots = if is_travel_map {
+                    self.travel_filtered_lot_ids()
+                } else {
+                    BTreeSet::new()
+                };
                 let opts = RenderOptions {
                     viewport: [w as u32, h as u32],
                     hovered_lot: self.hovered_lot_id,
                     hover_roofs_off: true,
                     highlight_hovered: true,
+                    highlighted_lots,
                     water_frame: Some(self.water_frame),
                     show_occupancy_markers: matches!(
                         self.nbhd_state.mode,
@@ -959,13 +1357,39 @@ impl NeighborhoodShell {
                 self.map.render_into(&mut self.canvas, &opts);
                 let rgb = std::mem::take(&mut self.canvas.color);
                 if let Ok(mut frame) = Frame::from_rgb(w as u32, h as u32, rgb) {
-                    self.chrome.draw(
-                        &mut frame,
-                        &self.nbhd_state,
-                        &self.chrome_art,
-                        &self.chrome_strings,
-                    );
+                    if is_travel_map {
+                        self.travel_chrome.draw(
+                            &mut frame,
+                            &self.travel_state,
+                            &self.travel_art,
+                            &self.travel_strings,
+                        );
+                        if self.kind == NeighborhoodKind::MagicTown {
+                            self.draw_magic_family_bin_button(&mut frame);
+                        }
+                    } else {
+                        self.chrome.draw(
+                            &mut frame,
+                            &self.nbhd_state,
+                            &self.chrome_art,
+                            &self.chrome_strings,
+                        );
+                    }
                     self.draw_overlay_note_and_dialog(&mut frame);
+                    if self.album_dialog.is_open()
+                        && let Some(snapshot) = &self.album_snapshot
+                    {
+                        self.album_dialog
+                            .draw(&mut frame, snapshot, &self.album_art);
+                    }
+                    if let Some(td_state) = &self.travel_dialog_state {
+                        self.travel_dialog.draw(
+                            &mut frame,
+                            td_state,
+                            &self.travel_art,
+                            &self.travel_strings,
+                        );
+                    }
                     if self.save_manager.is_open()
                         && let Some(snapshot) = &self.save_manager_snapshot
                     {
@@ -1072,6 +1496,16 @@ impl NeighborhoodShell {
             }
             return true;
         }
+        if self.travel_dialog_state.is_some() {
+            return true;
+        }
+        if self.album_dialog.is_open() {
+            if let Some(snapshot) = &self.album_snapshot {
+                self.album_dialog
+                    .handle_pointer_move(point, self.size, snapshot);
+            }
+            return true;
+        }
         if let ActiveScreen::Lot(session) = &mut self.screen {
             return session.game.hover(point);
         }
@@ -1079,17 +1513,39 @@ impl NeighborhoodShell {
             return true;
         }
         match &mut self.screen {
+            ActiveScreen::Loading(_) => false,
             ActiveScreen::Neighborhood => {
-                let prev_btn = self.chrome.hovered();
                 let prev_lot = self.hovered_lot_id;
-                let btn = self.chrome.hover(
-                    point[0],
-                    point[1],
-                    frame_size,
-                    &self.nbhd_state,
-                    &self.chrome_art,
-                );
-                let over_bar = btn.is_some() || point[1] < sims_ui::neighborhood::BAR_HEIGHT;
+                let (chrome_changed, over_bar) = if destination_for_kind(self.kind).is_some() {
+                    let prev_btn = self.travel_chrome.hovered();
+                    let prev_fb = self.magic_family_bin_hovered;
+                    let layout =
+                        TravelLayout::compute(frame_size[0], frame_size[1], &self.travel_state);
+                    let over_magic_fb = self
+                        .magic_family_bin_rect(&layout)
+                        .is_some_and(|r| r.contains(point[0], point[1]));
+                    self.magic_family_bin_hovered = over_magic_fb;
+                    self.travel_chrome.pointer_move(point[0], point[1], &layout);
+                    let cur_btn = self.travel_chrome.hovered();
+                    let over_chrome = cur_btn.is_some()
+                        || over_magic_fb
+                        || layout.bar_rect.contains(point[0], point[1])
+                        || layout.filter_strip_rect.contains(point[0], point[1]);
+                    (cur_btn != prev_btn || over_magic_fb != prev_fb, over_chrome)
+                } else {
+                    let prev_btn = self.chrome.hovered();
+                    let btn = self.chrome.hover(
+                        point[0],
+                        point[1],
+                        frame_size,
+                        &self.nbhd_state,
+                        &self.chrome_art,
+                    );
+                    (
+                        btn != prev_btn,
+                        btn.is_some() || point[1] < sims_ui::neighborhood::BAR_HEIGHT,
+                    )
+                };
                 let next_lot = if over_bar {
                     None
                 } else {
@@ -1100,7 +1556,7 @@ impl NeighborhoodShell {
                 if next_lot != prev_lot {
                     self.nbhd_state.hovered_lot = next_lot.and_then(|id| self.build_lot_info(id));
                 }
-                btn != prev_btn || next_lot != prev_lot
+                chrome_changed || next_lot != prev_lot
             }
             ActiveScreen::FamilyBin => {
                 let view = FamilyBinView {
@@ -1116,6 +1572,7 @@ impl NeighborhoodShell {
             }
             ActiveScreen::CreateFamily(caf) => {
                 let _ = caf.pointer_move(point, frame_size);
+                self.drain_caf_voice_previews();
                 true
             }
             ActiveScreen::Lot(_) => unreachable!(),
@@ -1124,19 +1581,26 @@ impl NeighborhoodShell {
 
     pub fn leave(&mut self) -> bool {
         self.pointer = None;
-        if self.save_manager.is_open() {
+        if self.save_manager.is_open()
+            || self.album_dialog.is_open()
+            || self.travel_dialog_state.is_some()
+        {
             return true;
         }
         if let ActiveScreen::Lot(session) = &mut self.screen {
             return session.game.leave();
         }
         match self.screen {
+            ActiveScreen::Loading(_) => false,
             ActiveScreen::Neighborhood => {
                 let had_state = self.chrome.hovered().is_some()
                     || self.chrome.pressed().is_some()
+                    || self.travel_chrome.hovered().is_some()
                     || self.hovered_lot_id.is_some()
                     || self.pressed_lot_id.is_some();
                 self.chrome.clear_pointer();
+                self.magic_family_bin_hovered = false;
+                self.magic_family_bin_pressed = false;
                 self.hovered_lot_id = None;
                 self.pressed_lot_id = None;
                 self.nbhd_state.hovered_lot = None;
@@ -1166,10 +1630,47 @@ impl NeighborhoodShell {
             }
             return false;
         }
-        if self.dialog.is_some() {
+        if self.album_dialog.is_open() {
+            let delta = if delta_y > 0.0 {
+                -1
+            } else if delta_y < 0.0 {
+                1
+            } else {
+                return false;
+            };
+            if let Some(snapshot) = &self.album_snapshot {
+                let layout = self.album_dialog.layout(self.size[0], self.size[1]);
+                let in_caption = self
+                    .pointer
+                    .is_some_and(|p| layout.caption_box.contains(p[0], p[1]));
+                self.album_dialog
+                    .handle_scroll(delta, self.size, snapshot, &self.album_art);
+                if !in_caption {
+                    let max_scroll = snapshot
+                        .entries
+                        .len()
+                        .saturating_sub(layout.thumb_slots.len());
+                    if delta > 0 {
+                        self.album_strip_scroll =
+                            (self.album_strip_scroll + delta as usize).min(max_scroll);
+                    } else {
+                        self.album_strip_scroll = self
+                            .album_strip_scroll
+                            .saturating_sub(delta.unsigned_abs() as usize);
+                    }
+                }
+                self.hydrate_album_images();
+                return true;
+            }
+            return false;
+        }
+        if self.travel_dialog_state.is_some() || self.dialog.is_some() {
             return false;
         }
         match &mut self.screen {
+            ActiveScreen::Lot(session) if session.game.shop_open() => {
+                session.game.shop_wheel(delta_y)
+            }
             ActiveScreen::FamilyBin => {
                 let delta = if delta_y > 0.0 {
                     -1
@@ -1205,6 +1706,36 @@ impl NeighborhoodShell {
             }
             return ShellOutcome::default();
         }
+        if let Some(td_state) = &self.travel_dialog_state {
+            let layout = TravelDialogLayout::compute(frame_size[0], frame_size[1]);
+            let changed = self
+                .travel_dialog
+                .pointer_down(point[0], point[1], &layout, td_state);
+            return ShellOutcome {
+                redraw: changed,
+                ..ShellOutcome::default()
+            };
+        }
+        if self.album_dialog.is_open() {
+            if let Some(snapshot) = &self.album_snapshot {
+                let layout = self.album_dialog.layout(self.size[0], self.size[1]);
+                self.album_strip_pressed = if layout.strip_prev.contains(point[0], point[1]) {
+                    Some(-1)
+                } else if layout.strip_next.contains(point[0], point[1]) {
+                    Some(1)
+                } else {
+                    None
+                };
+                let changed = self
+                    .album_dialog
+                    .handle_pointer_down(point, self.size, snapshot);
+                return ShellOutcome {
+                    redraw: changed,
+                    ..ShellOutcome::default()
+                };
+            }
+            return ShellOutcome::default();
+        }
         if let ActiveScreen::Lot(session) = &mut self.screen {
             let out = session.game.press(point);
             return self.handle_lot_outcome(out);
@@ -1221,7 +1752,42 @@ impl NeighborhoodShell {
         }
         self.note = None;
         match &mut self.screen {
+            ActiveScreen::Loading(_) => ShellOutcome::default(),
             ActiveScreen::Neighborhood => {
+                if destination_for_kind(self.kind).is_some() {
+                    let layout =
+                        TravelLayout::compute(frame_size[0], frame_size[1], &self.travel_state);
+                    if self
+                        .magic_family_bin_rect(&layout)
+                        .is_some_and(|r| r.contains(point[0], point[1]))
+                    {
+                        self.magic_family_bin_pressed = true;
+                        self.pressed_lot_id = None;
+                        return ShellOutcome::redraw();
+                    }
+                    self.magic_family_bin_pressed = false;
+                    if self.travel_chrome.pointer_down(point[0], point[1], &layout) {
+                        self.pressed_lot_id = None;
+                        return ShellOutcome::redraw();
+                    }
+                    let over_chrome = layout.bar_rect.contains(point[0], point[1])
+                        || layout.filter_strip_rect.contains(point[0], point[1]);
+                    let hit = if over_chrome {
+                        None
+                    } else {
+                        self.map
+                            .hit_test_with_state(frame_size, point, self.hovered_lot_id, true)
+                    };
+                    self.pressed_lot_id = hit;
+                    if hit != self.hovered_lot_id {
+                        self.hovered_lot_id = hit;
+                        self.nbhd_state.hovered_lot = hit.and_then(|id| self.build_lot_info(id));
+                    }
+                    return ShellOutcome {
+                        redraw: hit.is_some(),
+                        ..ShellOutcome::default()
+                    };
+                }
                 if self.chrome.press(
                     point[0],
                     point[1],
@@ -1263,6 +1829,7 @@ impl NeighborhoodShell {
             }
             ActiveScreen::CreateFamily(caf) => {
                 let outcome = caf.pointer_down(point, frame_size);
+                self.drain_caf_voice_previews();
                 self.handle_caf_outcome(outcome)
             }
             ActiveScreen::Lot(_) => unreachable!(),
@@ -1310,6 +1877,37 @@ impl NeighborhoodShell {
                 None => ShellOutcome::redraw(),
             };
         }
+        if let Some(td_state) = self.travel_dialog_state.clone() {
+            let layout = TravelDialogLayout::compute(frame_size[0], frame_size[1]);
+            let cmd = self
+                .travel_dialog
+                .pointer_up(point[0], point[1], &layout, &td_state);
+            return match cmd {
+                Some(cmd) => self.handle_travel_dialog_command(cmd),
+                None => ShellOutcome::redraw(),
+            };
+        }
+        if self.album_dialog.is_open() {
+            let strip_pressed = self.album_strip_pressed.take();
+            let layout = self.album_dialog.layout(self.size[0], self.size[1]);
+            let cmds = self
+                .album_snapshot
+                .clone()
+                .map(|snap| self.album_dialog.handle_pointer_up(point, self.size, &snap))
+                .unwrap_or_default();
+            if let Some(snap) = &self.album_snapshot {
+                let max_scroll = snap.entries.len().saturating_sub(layout.thumb_slots.len());
+                if strip_pressed == Some(-1) && layout.strip_prev.contains(point[0], point[1]) {
+                    self.album_strip_scroll = self.album_strip_scroll.saturating_sub(1);
+                } else if strip_pressed == Some(1) && layout.strip_next.contains(point[0], point[1])
+                {
+                    self.album_strip_scroll = (self.album_strip_scroll + 1).min(max_scroll);
+                }
+            }
+            let out = self.execute_album_commands(cmds);
+            self.hydrate_album_images();
+            return out;
+        }
         if let ActiveScreen::Lot(session) = &mut self.screen {
             let out = session.game.release(point);
             return self.handle_lot_outcome(out);
@@ -1329,7 +1927,46 @@ impl NeighborhoodShell {
             };
         }
         match &mut self.screen {
+            ActiveScreen::Loading(_) => ShellOutcome::default(),
             ActiveScreen::Neighborhood => {
+                if destination_for_kind(self.kind).is_some() {
+                    let layout =
+                        TravelLayout::compute(frame_size[0], frame_size[1], &self.travel_state);
+                    let was_magic_fb = std::mem::take(&mut self.magic_family_bin_pressed);
+                    if was_magic_fb
+                        && self
+                            .magic_family_bin_rect(&layout)
+                            .is_some_and(|r| r.contains(point[0], point[1]))
+                    {
+                        self.pressed_lot_id = None;
+                        self.open_family_bin();
+                        return ShellOutcome::redraw();
+                    }
+                    if let Some(cmd) = self.travel_chrome.pointer_up(
+                        point[0],
+                        point[1],
+                        &layout,
+                        &self.travel_state,
+                    ) {
+                        self.pressed_lot_id = None;
+                        return self.handle_travel_command(cmd);
+                    }
+                    let pressed_lot = self.pressed_lot_id.take();
+                    let over_chrome = layout.bar_rect.contains(point[0], point[1])
+                        || layout.filter_strip_rect.contains(point[0], point[1]);
+                    let hit = if over_chrome {
+                        None
+                    } else {
+                        self.map
+                            .hit_test_with_state(frame_size, point, self.hovered_lot_id, true)
+                    };
+                    if let Some(lot_id) = pressed_lot
+                        && Some(lot_id) == hit
+                    {
+                        return self.activate_lot(lot_id);
+                    }
+                    return ShellOutcome::redraw();
+                }
                 if let Some(cmd) = self.chrome.release(
                     point[0],
                     point[1],
@@ -1374,6 +2011,7 @@ impl NeighborhoodShell {
             }
             ActiveScreen::CreateFamily(caf) => {
                 let outcome = caf.pointer_up();
+                self.drain_caf_voice_previews();
                 self.handle_caf_outcome(outcome)
             }
             ActiveScreen::Lot(_) => unreachable!(),
@@ -1381,7 +2019,10 @@ impl NeighborhoodShell {
     }
 
     pub fn release_outside(&mut self) -> ShellOutcome {
-        if self.save_manager.is_open() {
+        if self.save_manager.is_open()
+            || self.album_dialog.is_open()
+            || self.travel_dialog_state.is_some()
+        {
             return ShellOutcome::redraw();
         }
         if let ActiveScreen::Lot(session) = &mut self.screen {
@@ -1397,6 +2038,7 @@ impl NeighborhoodShell {
         }
         if let ActiveScreen::CreateFamily(caf) = &mut self.screen {
             let outcome = caf.pointer_up();
+            self.drain_caf_voice_previews();
             return self.handle_caf_outcome(outcome);
         }
         self.pressed_lot_id = None;
@@ -1447,15 +2089,34 @@ impl NeighborhoodShell {
             }
             return ShellOutcome::redraw();
         }
+        if let Some(td_state) = self.travel_dialog_state.clone() {
+            if let Some(cmd) = self.travel_dialog.key_press("Escape", &td_state) {
+                return self.handle_travel_dialog_command(cmd);
+            }
+            self.close_travel_dialog();
+            return ShellOutcome::redraw();
+        }
+        if self.album_dialog.is_open() {
+            return self.send_album_key(AlbumKey::Escape);
+        }
         if self.dialog.is_some() {
             return self.key_dialog(DialogKey::Escape);
         }
         match &mut self.screen {
+            ActiveScreen::Loading(_) => ShellOutcome::default(),
             ActiveScreen::Neighborhood => {
-                if !matches!(self.nbhd_state.mode, NeighborhoodMode::Normal) {
+                if !matches!(self.nbhd_state.mode, NeighborhoodMode::Normal)
+                    || self.travel_state.mode != TravelBarMode::Browse
+                {
                     self.nbhd_state.mode = NeighborhoodMode::Normal;
+                    self.travel_state.mode = TravelBarMode::Browse;
                     self.move_in_family_id = None;
                     self.refresh_hovered_lot();
+                    return ShellOutcome::redraw();
+                }
+                if destination_for_kind(self.kind).is_some() {
+                    let home_kind = default_map_kind(&self.install, self.slot);
+                    let _ = self.switch_kind(home_kind);
                     return ShellOutcome::redraw();
                 }
                 self.open_quit_dialog();
@@ -1467,21 +2128,33 @@ impl NeighborhoodShell {
             }
             ActiveScreen::CreateFamily(caf) => {
                 let outcome = caf.key_escape();
+                self.drain_caf_voice_previews();
                 self.handle_caf_outcome(outcome)
+            }
+            ActiveScreen::Lot(session) if session.game.shop_open() => {
+                let out = session.game.shop_escape();
+                self.handle_lot_outcome(out)
             }
             ActiveScreen::Lot(_) => ShellOutcome::default(),
         }
     }
 
     pub fn key_char(&mut self, ch: char) -> ShellOutcome {
+        if self.album_dialog.is_open() {
+            return self.send_album_key(AlbumKey::Char(ch));
+        }
         if let ActiveScreen::CreateFamily(caf) = &mut self.screen {
             let outcome = caf.key_char(ch);
+            self.drain_caf_voice_previews();
             return self.handle_caf_outcome(outcome);
         }
         ShellOutcome::default()
     }
 
     pub fn key_backspace(&mut self) -> ShellOutcome {
+        if self.album_dialog.is_open() {
+            return self.send_album_key(AlbumKey::Backspace);
+        }
         if let ActiveScreen::CreateFamily(caf) = &mut self.screen {
             let outcome = caf.key_backspace();
             return self.handle_caf_outcome(outcome);
@@ -1490,6 +2163,9 @@ impl NeighborhoodShell {
     }
 
     pub fn key_delete(&mut self) -> ShellOutcome {
+        if self.album_dialog.is_open() {
+            return self.send_album_key(AlbumKey::Delete);
+        }
         if let ActiveScreen::CreateFamily(caf) = &mut self.screen {
             let outcome = caf.key_delete();
             return self.handle_caf_outcome(outcome);
@@ -1498,6 +2174,15 @@ impl NeighborhoodShell {
     }
 
     pub fn key_left(&mut self) -> ShellOutcome {
+        if self.travel_dialog_state.is_some() {
+            return ShellOutcome {
+                redraw: self.cycle_travel_destination(-1),
+                ..ShellOutcome::default()
+            };
+        }
+        if self.album_dialog.is_open() {
+            return self.send_album_key(AlbumKey::Left);
+        }
         if let ActiveScreen::CreateFamily(caf) = &mut self.screen {
             let outcome = caf.key_left();
             return self.handle_caf_outcome(outcome);
@@ -1506,6 +2191,15 @@ impl NeighborhoodShell {
     }
 
     pub fn key_right(&mut self) -> ShellOutcome {
+        if self.travel_dialog_state.is_some() {
+            return ShellOutcome {
+                redraw: self.cycle_travel_destination(1),
+                ..ShellOutcome::default()
+            };
+        }
+        if self.album_dialog.is_open() {
+            return self.send_album_key(AlbumKey::Right);
+        }
         if let ActiveScreen::CreateFamily(caf) = &mut self.screen {
             let outcome = caf.key_right();
             return self.handle_caf_outcome(outcome);
@@ -1522,6 +2216,17 @@ impl NeighborhoodShell {
                 ..ShellOutcome::default()
             };
         }
+        if self.album_dialog.is_open() {
+            return self.send_album_key(AlbumKey::Up);
+        }
+        if let ActiveScreen::Lot(session) = &mut self.screen
+            && session.game.shop_open()
+        {
+            return ShellOutcome {
+                redraw: session.game.shop_select_prev(),
+                ..ShellOutcome::default()
+            };
+        }
         ShellOutcome::default()
     }
 
@@ -1534,10 +2239,24 @@ impl NeighborhoodShell {
                 ..ShellOutcome::default()
             };
         }
+        if self.album_dialog.is_open() {
+            return self.send_album_key(AlbumKey::Down);
+        }
+        if let ActiveScreen::Lot(session) = &mut self.screen
+            && session.game.shop_open()
+        {
+            return ShellOutcome {
+                redraw: session.game.shop_select_next(),
+                ..ShellOutcome::default()
+            };
+        }
         ShellOutcome::default()
     }
 
     pub fn key_home(&mut self) -> ShellOutcome {
+        if self.album_dialog.is_open() {
+            return self.send_album_key(AlbumKey::Home);
+        }
         if let ActiveScreen::CreateFamily(caf) = &mut self.screen {
             let outcome = caf.key_home();
             return self.handle_caf_outcome(outcome);
@@ -1546,6 +2265,9 @@ impl NeighborhoodShell {
     }
 
     pub fn key_end(&mut self) -> ShellOutcome {
+        if self.album_dialog.is_open() {
+            return self.send_album_key(AlbumKey::End);
+        }
         if let ActiveScreen::CreateFamily(caf) = &mut self.screen {
             let outcome = caf.key_end();
             return self.handle_caf_outcome(outcome);
@@ -1554,9 +2276,39 @@ impl NeighborhoodShell {
     }
 
     pub fn key_tab(&mut self) -> ShellOutcome {
+        if self.travel_dialog_state.is_some() {
+            return ShellOutcome {
+                redraw: self.cycle_travel_destination(1),
+                ..ShellOutcome::default()
+            };
+        }
+        if self.album_dialog.is_open() {
+            return self.send_album_key(AlbumKey::Tab);
+        }
         if let ActiveScreen::CreateFamily(caf) = &mut self.screen {
             let outcome = caf.key_tab();
             return self.handle_caf_outcome(outcome);
+        }
+        ShellOutcome::default()
+    }
+
+    pub fn key_page_up(&mut self) -> ShellOutcome {
+        if self.album_dialog.is_open() {
+            return self.send_album_key(AlbumKey::PageUp);
+        }
+        ShellOutcome::default()
+    }
+
+    pub fn key_page_down(&mut self) -> ShellOutcome {
+        if self.album_dialog.is_open() {
+            return self.send_album_key(AlbumKey::PageDown);
+        }
+        ShellOutcome::default()
+    }
+
+    pub fn key_save_shortcut(&mut self) -> ShellOutcome {
+        if self.album_dialog.is_open() {
+            return self.send_album_key(AlbumKey::SaveShortcut);
         }
         ShellOutcome::default()
     }
@@ -1572,15 +2324,32 @@ impl NeighborhoodShell {
                 None => ShellOutcome::default(),
             };
         }
+        if let Some(td_state) = self.travel_dialog_state.clone() {
+            if let Some(cmd) = self.travel_dialog.key_press("Enter", &td_state) {
+                return self.handle_travel_dialog_command(cmd);
+            }
+            return ShellOutcome::default();
+        }
+        if self.album_dialog.is_open() {
+            return self.send_album_key(AlbumKey::Enter);
+        }
+        if let ActiveScreen::Lot(session) = &mut self.screen
+            && session.game.shop_open()
+        {
+            let out = session.game.shop_submit();
+            return self.handle_lot_outcome(out);
+        }
         if let ActiveScreen::CreateFamily(caf) = &mut self.screen {
             let outcome = caf.key_enter();
+            self.drain_caf_voice_previews();
             return self.handle_caf_outcome(outcome);
         }
         ShellOutcome::default()
     }
 
     /// Handles a [`crate::game::Outcome`] produced by an input to the active lot
-    /// (including Save, Save Manager, Save & Leave to Neighborhood, Quit, and Photo).
+    /// (including Save, Save Manager, Photo Album, Save & Leave to Neighborhood,
+    /// Quit, and Photo).
     pub fn handle_lot_outcome(&mut self, outcome: crate::game::Outcome) -> ShellOutcome {
         self.persist_options();
         let mut out = ShellOutcome {
@@ -1590,6 +2359,17 @@ impl NeighborhoodShell {
         };
         if outcome.open_save_manager {
             self.open_save_manager(None);
+            out.redraw = true;
+            return out;
+        }
+        if outcome.open_photo_album {
+            if let Err(err) = self.open_photo_album()
+                && let ActiveScreen::Lot(session) = &mut self.screen
+            {
+                session
+                    .game
+                    .set_note(format!("Photo Album unavailable: {err}"));
+            }
             out.redraw = true;
             return out;
         }
@@ -1635,6 +2415,12 @@ impl NeighborhoodShell {
         let ActiveScreen::Lot(session) = &self.screen else {
             return Err("no lot is currently open".into());
         };
+        if session.active_trip.is_some() {
+            return Err(
+                "cannot save directly while visiting a travel destination; return home first"
+                    .into(),
+            );
+        }
         let world = session.game.lot().world().clone();
         let label = self.active_lot_save_label(session);
         self.autosave_worker.enqueue_world(
@@ -1654,6 +2440,12 @@ impl NeighborhoodShell {
         let ActiveScreen::Lot(session) = &self.screen else {
             return Err("no lot is currently open".into());
         };
+        if session.active_trip.is_some() {
+            return Err(
+                "cannot save directly while visiting a travel destination; return home first"
+                    .into(),
+            );
+        }
         let saved = session.game.save()?;
         let label = self.active_lot_save_label(session);
         self.autosave_worker.enqueue_saved_lot(
@@ -1743,7 +2535,8 @@ impl NeighborhoodShell {
         }
 
         // Periodic midnight rotating autosave (triggered strictly when VM
-        // `daily::turn_day` increments `world.globals[28]`).
+        // `daily::turn_day` increments `world.globals[28]`). Skip during active
+        // travel visits so destination community templates are never overwritten.
         let trigger_midnight = if let ActiveScreen::Lot(session) = &mut self.screen {
             let days_played = session
                 .game
@@ -1753,7 +2546,7 @@ impl NeighborhoodShell {
                 .get(28)
                 .copied()
                 .unwrap_or(0);
-            let turned = days_played > session.last_days_played;
+            let turned = session.active_trip.is_none() && days_played > session.last_days_played;
             session.last_days_played = days_played;
             turned
         } else {
@@ -1786,7 +2579,13 @@ impl NeighborhoodShell {
     pub fn open_save_manager(&mut self, active_error: Option<String>) -> bool {
         self.flush_background_saves();
         let lot_id = match &self.screen {
-            ActiveScreen::Lot(session) => Some(session.house),
+            ActiveScreen::Lot(session) => {
+                if let Some(trip) = &session.active_trip {
+                    Some(trip.home_house)
+                } else {
+                    Some(session.house)
+                }
+            }
             _ => self
                 .save_manager_target_lot
                 .or_else(|| self.hovered_lot_id.map(u32::from)),
@@ -1831,7 +2630,12 @@ impl NeighborhoodShell {
     /// Executes a [`SaveManagerCommand`] emitted by [`SaveManagerDialog`]
     /// (`LoadSlot`, `FallbackToNewestIntact`, `DeleteSlot`, or `Cancel`).
     pub fn handle_save_manager_command(&mut self, cmd: SaveManagerCommand) -> ShellOutcome {
-        let Some(lot_id) = self.active_lot_house().or(self.save_manager_target_lot) else {
+        // Always target the lot displayed in Save Manager (e.g. the home house
+        // during a live travel visit), never overriding it with a destination lot.
+        let Some(lot_id) = self
+            .save_manager_target_lot
+            .or_else(|| self.active_lot_house())
+        else {
             self.close_save_manager();
             return ShellOutcome::redraw();
         };
@@ -1862,9 +2666,16 @@ impl NeighborhoodShell {
                 ShellOutcome::redraw()
             }
             SaveManagerCommand::LoadSlot { slot_id } => {
-                let result = parse_slot_id(&slot_id)
-                    .ok_or_else(|| format!("unknown save slot {slot_id:?}"))
-                    .and_then(|slot| self.load_autosave_slot_into_lot(lot_id, slot));
+                let result = if self.active_trip().is_some() {
+                    Err(
+                        "Cannot load a save slot while visiting a travel destination; return home first."
+                            .to_owned(),
+                    )
+                } else {
+                    parse_slot_id(&slot_id)
+                        .ok_or_else(|| format!("unknown save slot {slot_id:?}"))
+                        .and_then(|slot| self.load_autosave_slot_into_lot(lot_id, slot))
+                };
                 match result {
                     Ok(tick) => {
                         self.close_save_manager();
@@ -1890,22 +2701,29 @@ impl NeighborhoodShell {
                 ShellOutcome::redraw()
             }
             SaveManagerCommand::FallbackToNewestIntact { slot_id } => {
-                let result = parse_slot_id(&slot_id)
-                    .ok_or_else(|| format!("unknown fallback slot {slot_id:?}"))
-                    .and_then(|slot| self.load_autosave_slot_into_lot(lot_id, slot))
-                    .or_else(|_| {
-                        let recovered = self
-                            .store
-                            .autosaves()
-                            .load_with_fallback_validated(
-                                &self.neighborhood_id,
-                                lot_id,
-                                SaveSlot::Manual,
-                                validate_save_payload,
-                            )
-                            .map_err(|e| e.to_string())?;
-                        self.apply_loaded_save_into_lot(lot_id, &recovered.loaded)
-                    });
+                let result = if self.active_trip().is_some() {
+                    Err(
+                        "Cannot load a save slot while visiting a travel destination; return home first."
+                            .to_owned(),
+                    )
+                } else {
+                    parse_slot_id(&slot_id)
+                        .ok_or_else(|| format!("unknown fallback slot {slot_id:?}"))
+                        .and_then(|slot| self.load_autosave_slot_into_lot(lot_id, slot))
+                        .or_else(|_| {
+                            let recovered = self
+                                .store
+                                .autosaves()
+                                .load_with_fallback_validated(
+                                    &self.neighborhood_id,
+                                    lot_id,
+                                    SaveSlot::Manual,
+                                    validate_save_payload,
+                                )
+                                .map_err(|e| e.to_string())?;
+                            self.apply_loaded_save_into_lot(lot_id, &recovered.loaded)
+                        })
+                };
                 match result {
                     Ok(tick) => {
                         self.close_save_manager();
@@ -1950,11 +2768,35 @@ impl NeighborhoodShell {
         lot_id: u32,
         loaded: &sims_sim::autosave::LoadedSave,
     ) -> Result<u64, String> {
+        if self.active_trip().is_some() {
+            return Err(
+                "cannot restore a save slot while visiting a travel destination; return home first"
+                    .into(),
+            );
+        }
         let snapshot = self
             .store
             .load_lot_snapshot(&self.neighborhood_id, lot_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("neighborhood {:?} not found", self.neighborhood_id))?;
+        let has_trvl_envelope = snapshot
+            .saved_lot
+            .as_deref()
+            .is_some_and(|bytes| bytes.len() >= 4 && &bytes[0..4] == b"TRVL");
+        let secondary_dest = snapshot
+            .neighborhood
+            .family_in(lot_id)
+            .map(|(_, f)| f.secondary_house())
+            .filter(|&d| d != 0);
+        if has_trvl_envelope || secondary_dest.is_some() {
+            let dest_detail = match secondary_dest {
+                Some(dest) => format!(" to lot {dest}"),
+                None => String::new(),
+            };
+            return Err(format!(
+                "lot {lot_id} has an active travel trip{dest_detail}; resume or abort the trip before restoring a save slot"
+            ));
+        }
         let real_instance_id = snapshot.neighborhood.instance_id;
         let real_revision = snapshot.neighborhood.revision;
 
@@ -2038,6 +2880,7 @@ impl NeighborhoodShell {
         if self.options_file.is_file() {
             let _ = game.load_options(&self.options_file);
         }
+        game.set_album_button_enabled(true);
         game.resize(self.size);
         let initial_days_played = game.lot().world().globals.get(28).copied().unwrap_or(0);
         let ticks = restored_tick.unwrap_or_else(|| u64::from(game.lot().ticks()));
@@ -2056,6 +2899,8 @@ impl NeighborhoodShell {
             }),
             house: lot_id,
             last_days_played: initial_days_played,
+            active_trip: None,
+            is_destination_edit: false,
         }));
         self.lot_generation = self.lot_generation.wrapping_add(1);
         self.dialog = None;
@@ -2080,6 +2925,12 @@ impl NeighborhoodShell {
             let ActiveScreen::Lot(session) = &mut self.screen else {
                 return Err("no lot is currently open".into());
             };
+            if session.active_trip.is_some() {
+                let msg =
+                    "Cannot save directly while visiting a travel destination; return home first.";
+                session.game.set_note(msg);
+                return Err(msg.into());
+            }
             let (report, lot_bytes) = if session.game.world_mutated_via_restore() {
                 save_cheat_mutated_lot_to_store(
                     &self.install_root,
@@ -2163,15 +3014,52 @@ impl NeighborhoodShell {
 
     fn capture_active_lot_thumbnail(&mut self) {
         if let ActiveScreen::Lot(session) = &mut self.screen
+            && session.active_trip.is_none()
             && let Ok(lot_id) = u16::try_from(session.house)
-            && let Some(map_lot) = self.map.lot(lot_id)
         {
-            let normal_size = [map_lot.normal.width, map_lot.normal.height];
-            let has_cutaway = map_lot.roofs_off.is_some();
-            let (world, lot_shape, assets) = session.game.render_parts_mut();
-            let thumb = capture_lot_thumbnail(world, lot_shape, assets, normal_size, has_cutaway);
-            self.custom_thumbs
-                .insert((session.neighborhood_id.clone(), lot_id), thumb);
+            let target_size_and_cutaway = self
+                .map
+                .lot(lot_id)
+                .map(|m| ([m.normal.width, m.normal.height], m.roofs_off.is_some()))
+                .or_else(|| {
+                    let kind = map_kind_for_house(&self.install, self.slot, session.house);
+                    load_map_for_slot(&self.install, self.slot, kind)
+                        .ok()
+                        .and_then(|m| {
+                            m.lot(lot_id)
+                                .map(|l| ([l.normal.width, l.normal.height], l.roofs_off.is_some()))
+                        })
+                });
+            if let Some((normal_size, has_cutaway)) = target_size_and_cutaway {
+                let (world, lot_shape, assets) = session.game.render_parts_mut();
+                let thumb =
+                    capture_lot_thumbnail(world, lot_shape, assets, normal_size, has_cutaway);
+                let stored_thumb = StoredLotThumbnail {
+                    normal: to_stored_thumb_surface(&thumb.normal),
+                    roofs_off: thumb.roofs_off.as_ref().map(to_stored_thumb_surface),
+                };
+                match self.store.save_lot_thumbnail_checked(
+                    &session.neighborhood_id,
+                    session.neighborhood_instance_id,
+                    session.house,
+                    &stored_thumb,
+                ) {
+                    Ok(Ok(())) => {
+                        self.custom_thumbs
+                            .insert((session.neighborhood_id.clone(), lot_id), thumb);
+                    }
+                    Ok(Err(commit_err)) => {
+                        session.game.set_note(format!(
+                            "Saved lot; map thumbnail was not updated ({commit_err:?})."
+                        ));
+                    }
+                    Err(err) => {
+                        session
+                            .game
+                            .set_note(format!("Saved lot; map thumbnail update warning: {err}"));
+                    }
+                }
+            }
         }
     }
 
@@ -2182,8 +3070,15 @@ impl NeighborhoodShell {
     /// the manual slot or `SAVED_LOTS` is corrupt.
     pub fn restore_current_lot(&mut self) -> Result<(), String> {
         self.flush_background_saves();
-        let (neighborhood_id, house) = match &self.screen {
-            ActiveScreen::Lot(session) => (session.neighborhood_id.clone(), session.house),
+        let (neighborhood_id, house) = match &mut self.screen {
+            ActiveScreen::Lot(session) => {
+                if session.active_trip.is_some() {
+                    let msg = "Cannot restore directly while visiting a travel destination; return home first.";
+                    session.game.set_note(msg);
+                    return Err(msg.into());
+                }
+                (session.neighborhood_id.clone(), session.house)
+            }
             _ => return Err("no lot is currently open".into()),
         };
         let manual_slot = self.store.autosaves().load_save_validated(
@@ -2298,7 +3193,8 @@ impl NeighborhoodShell {
         let descriptions = NeighborhoodDescriptions::load(&self.install, &user_dir);
         let faces = load_neighborhood_faces(&self.install, &self.store, &id, &stored);
         let lot_meta = build_lot_meta(&self.store, &id, &map, &descriptions, self.arch_multiplier);
-        sync_map_with_store(&mut map, &stored, &lot_meta, &id, &self.custom_thumbs);
+        let custom_thumbs = load_persisted_custom_thumbs(&self.store, &id);
+        sync_map_with_store(&mut map, &stored, &lot_meta, &id, &custom_thumbs);
         let family_bin_entries = build_family_bin_entries(&stored, &family_names, &faces);
 
         self.slot = slot;
@@ -2311,6 +3207,7 @@ impl NeighborhoodShell {
         self.descriptions = descriptions;
         self.faces = faces;
         self.lot_meta = lot_meta;
+        self.custom_thumbs = custom_thumbs;
         self.family_bin_entries = family_bin_entries;
         self.family_bin
             .sync(&self.family_bin_entries, sims_ui::family_bin::VISIBLE_ROWS);
@@ -2321,11 +3218,14 @@ impl NeighborhoodShell {
         self.pressed_lot_id = None;
         self.move_in_family_id = None;
         self.dialog = None;
+        self.close_photo_album();
+        self.close_travel_dialog();
         self.save_manager.close();
         self.save_manager_snapshot = None;
         self.save_manager_target_lot = None;
         self.note = None;
         self.screen = ActiveScreen::Neighborhood;
+        self.sync_travel_state();
         self.audio_queue
             .push(Input::MusicMode(music_mode_for_kind(kind)));
         Ok(())
@@ -2342,6 +3242,7 @@ impl NeighborhoodShell {
             &self.descriptions,
             self.arch_multiplier,
         );
+        self.custom_thumbs = load_persisted_custom_thumbs(&self.store, &self.neighborhood_id);
         sync_map_with_store(
             &mut map,
             &self.stored,
@@ -2357,6 +3258,10 @@ impl NeighborhoodShell {
         self.hovered_lot_id = None;
         self.pressed_lot_id = None;
         self.move_in_family_id = None;
+        self.travel_state.active_filter = None;
+        self.travel_state.vacation_lodging_filter = None;
+        self.travel_state.mode = TravelBarMode::Browse;
+        self.sync_travel_state();
         self.audio_queue
             .push(Input::MusicMode(music_mode_for_kind(kind)));
         Ok(())
@@ -2491,17 +3396,40 @@ impl NeighborhoodShell {
         }
     }
 
-    /// Enters `house` in the active neighborhood via [`lifecycle::enter_lot`].
+    /// Enters `house` in the active neighborhood via [`lifecycle::enter_lot`],
+    /// automatically resuming an active travel trip if crash-recovery detects a
+    /// persisted `TRVL` envelope on `house`, and driving [`LoadingScreen`] audio
+    /// cues across the transition.
     pub fn enter_lot(&mut self, house: u32) -> Result<(), String> {
+        // Crash recovery: if `house` has an active persisted travel trip,
+        // resume it into the destination lot instead of treating the `TRVL`
+        // envelope as a raw `Saved` lot.
+        if let Ok(Some(_)) =
+            vm_travel::inspect_active_trip(&self.store, &self.neighborhood_id, house)
+        {
+            self.resume_active_trip(house)?;
+            return Ok(());
+        }
+        self.start_load_audio();
+        self.present_loading_step(LoadingKind::Lot, Some(format!("Lot {house}")), 0.2);
         // Capture the neighborhood version BEFORE booting the VM and confirm it
         // did not advance concurrently so `LotSession` never records a newer
         // `(instance_id, revision)` than the snapshot that actually booted.
-        let before_nh = self
+        let before_nh = match self
             .store
             .load_neighborhood(&self.neighborhood_id)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("neighborhood {:?} not found", self.neighborhood_id))?;
-        let mut game = Game::open_from_store(
+            .map_err(|e| e.to_string())
+            .and_then(|opt| {
+                opt.ok_or_else(|| format!("neighborhood {:?} not found", self.neighborhood_id))
+            }) {
+            Ok(nh) => nh,
+            Err(err) => {
+                let fallback = self.desired_music_mode();
+                self.stop_load_audio(fallback);
+                return Err(err);
+            }
+        };
+        let mut game = match Game::open_from_store(
             &self.install_root,
             &self.store,
             &self.neighborhood_id,
@@ -2509,14 +3437,32 @@ impl NeighborhoodShell {
             &self.answers,
             self.play,
             self.frames.clone(),
-        )?;
-        let after_nh = self
+        ) {
+            Ok(game) => game,
+            Err(err) => {
+                let fallback = self.desired_music_mode();
+                self.stop_load_audio(fallback);
+                return Err(err);
+            }
+        };
+        let after_nh = match self
             .store
             .load_neighborhood(&self.neighborhood_id)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("neighborhood {:?} not found", self.neighborhood_id))?;
+            .map_err(|e| e.to_string())
+            .and_then(|opt| {
+                opt.ok_or_else(|| format!("neighborhood {:?} not found", self.neighborhood_id))
+            }) {
+            Ok(nh) => nh,
+            Err(err) => {
+                let fallback = self.desired_music_mode();
+                self.stop_load_audio(fallback);
+                return Err(err);
+            }
+        };
         if after_nh.instance_id != before_nh.instance_id || after_nh.revision != before_nh.revision
         {
+            let fallback = self.desired_music_mode();
+            self.stop_load_audio(fallback);
             return Err(format!(
                 "neighborhood {:?} changed while opening lot {house}; please try again",
                 self.neighborhood_id
@@ -2526,6 +3472,7 @@ impl NeighborhoodShell {
         if self.options_file.is_file() {
             let _ = game.load_options(&self.options_file);
         }
+        game.set_album_button_enabled(true);
         game.resize(self.size);
         let initial_days_played = game.lot().world().globals.get(28).copied().unwrap_or(0);
         let next_music = sound::lot_music_mode(game.mode(), game.lot().lot_id());
@@ -2537,9 +3484,13 @@ impl NeighborhoodShell {
             staging: None,
             house,
             last_days_played: initial_days_played,
+            active_trip: None,
+            is_destination_edit: false,
         }));
         self.lot_generation = self.lot_generation.wrapping_add(1);
         self.dialog = None;
+        self.close_photo_album();
+        self.close_travel_dialog();
         self.save_manager.close();
         self.save_manager_snapshot = None;
         self.save_manager_target_lot = Some(house);
@@ -2547,7 +3498,7 @@ impl NeighborhoodShell {
         self.hovered_lot_id = None;
         self.pressed_lot_id = None;
         self.nbhd_state.hovered_lot = None;
-        self.audio_queue.push(Input::MusicMode(next_music));
+        self.stop_load_audio(next_music);
         Ok(())
     }
 
@@ -2555,10 +3506,24 @@ impl NeighborhoodShell {
     /// saving through [`lifecycle::save_and_leave_lot`] + rotating background
     /// autosave first, cleanly draining the background worker, and refreshing
     /// map thumbnails, funds, occupancy, and the Family Bin.
+    ///
+    /// If the household is currently on an active travel destination visit,
+    /// returns them cleanly via [`Self::return_from_destination`] first so
+    /// community lot templates are never overwritten and the home lot is
+    /// reconciled before returning to the neighborhood map.
     pub fn leave_lot(&mut self, save_first: bool) -> Result<(), String> {
+        if self.active_trip().is_some() {
+            self.return_from_destination()?;
+        }
+        self.start_load_audio();
+        self.present_loading_step(LoadingKind::Neighborhood, None, 0.2);
         let mut autosave_warning: Option<String> = None;
         if save_first {
-            let _ = self.save_current_lot()?;
+            if let Err(err) = self.save_current_lot() {
+                let fallback = self.desired_music_mode();
+                self.stop_load_audio(fallback);
+                return Err(err);
+            }
             if let Err(err) = self.enqueue_background_lot_save(SaveTarget::Autosave) {
                 autosave_warning = Some(format!(
                     "Rotating autosave could not be queued (existing saves preserved): {err}"
@@ -2584,14 +3549,16 @@ impl NeighborhoodShell {
         self.pressed_lot_id = None;
         self.move_in_family_id = None;
         self.dialog = None;
+        self.close_photo_album();
+        self.close_travel_dialog();
         self.save_manager.close();
         self.save_manager_snapshot = None;
         self.note = autosave_warning;
-        self.refresh_from_store()?;
+        let refresh_res = self.refresh_from_store();
         self.audio_queue
             .push(Input::Events(vec![SoundEvent::StopAll]));
-        self.audio_queue
-            .push(Input::MusicMode(music_mode_for_kind(self.kind)));
+        self.stop_load_audio(music_mode_for_kind(self.kind));
+        refresh_res?;
         Ok(())
     }
 
@@ -2666,8 +3633,9 @@ impl NeighborhoodShell {
         Ok(report)
     }
 
-    /// Executes Bulldoze on `house`, refreshing map occupancy, vacant lot
-    /// thumbnail, and Family Bin immediately.
+    /// Executes Bulldoze on `house`, deleting any persisted custom REDB map
+    /// thumbnail and refreshing map occupancy, vacant lot thumbnail, and Family
+    /// Bin immediately.
     pub fn execute_bulldoze(&mut self, house: u32) -> Result<BulldozeReport, String> {
         let report = lifecycle::bulldoze(
             &self.install_root,
@@ -2676,19 +3644,22 @@ impl NeighborhoodShell {
             house,
         )
         .map_err(|e| e.to_string())?;
-        if let Ok(lot_id) = u16::try_from(house)
-            && let Some(map_lot) = self.map.lot(lot_id)
-        {
-            let grass = vacant_lot_thumbnail(map_lot.normal.width, map_lot.normal.height);
-            self.custom_thumbs.insert(
-                (self.neighborhood_id.clone(), lot_id),
-                CustomThumb {
-                    normal: grass,
-                    roofs_off: None,
-                },
-            );
+        let thumb_warning = match self.store.delete_lot_thumbnail_checked(
+            &self.neighborhood_id,
+            self.stored.instance_id,
+            house,
+        ) {
+            Ok(_) => None,
+            Err(err) => Some(format!("Lot bulldozed; thumbnail cleanup warning: {err}")),
+        };
+        if let Ok(lot_id) = u16::try_from(house) {
+            self.custom_thumbs
+                .remove(&(self.neighborhood_id.clone(), lot_id));
         }
         self.refresh_from_store()?;
+        if let Some(warn) = thumb_warning {
+            self.note = Some(warn);
+        }
         Ok(report)
     }
 
@@ -2732,6 +3703,7 @@ impl NeighborhoodShell {
             &self.descriptions,
             self.arch_multiplier,
         );
+        self.custom_thumbs = load_persisted_custom_thumbs(&self.store, &self.neighborhood_id);
         sync_map_with_store(
             &mut self.map,
             &self.stored,
@@ -2743,6 +3715,7 @@ impl NeighborhoodShell {
             build_family_bin_entries(&self.stored, &self.family_names, &self.faces);
         self.family_bin
             .sync(&self.family_bin_entries, sims_ui::family_bin::VISIBLE_ROWS);
+        self.sync_travel_state();
         self.refresh_hovered_lot();
         Ok(())
     }
@@ -2951,10 +3924,40 @@ impl NeighborhoodShell {
     fn activate_lot(&mut self, lot_id: u16) -> ShellOutcome {
         match self.nbhd_state.mode.clone() {
             NeighborhoodMode::Normal | NeighborhoodMode::Visit | NeighborhoodMode::Rezone => {
-                if let Err(e) = self.enter_lot(u32::from(lot_id)) {
+                let house = u32::from(lot_id);
+                if let Ok(Some(trip)) =
+                    vm_travel::inspect_active_trip(&self.store, &self.neighborhood_id, house)
+                {
+                    let title = format!("Active Travel Trip (Lot {house})");
+                    let body = format!(
+                        "This household has an interrupted trip at destination lot {}. Resume the trip or abort and restore the frozen home lot?",
+                        trip.destination_house
+                    );
+                    self.open_dialog(
+                        ShellDialogKind::ConfirmResumeOrAbortTrip {
+                            home_house: house,
+                            destination_house: trip.destination_house,
+                        },
+                        Message::confirm(
+                            title,
+                            body,
+                            vec!["Resume Trip".into(), "Abort Trip".into(), "Cancel".into()],
+                        )
+                        .with_frame(FrameStyle::Generic),
+                    );
+                    return ShellOutcome::redraw();
+                }
+                let is_unoccupied_destination = destination_for_kind(self.kind).is_some()
+                    && TravelDestination::classify(house, &self.stored.zoning).is_some()
+                    && self.stored.family_in(house).is_none();
+                let res = if is_unoccupied_destination {
+                    self.open_destination_for_edit(house)
+                } else {
+                    self.enter_lot(house)
+                };
+                if let Err(e) = res {
                     // Non-destructive corrupt-save fallback: if intact autosaves
                     // exist for this lot, open the Save Manager with the error banner.
-                    let house = u32::from(lot_id);
                     if self
                         .store
                         .autosaves()
@@ -3091,6 +4094,33 @@ impl NeighborhoodShell {
         let Some(dlg) = self.dialog.take() else {
             return ShellOutcome::default();
         };
+        if let ShellDialogKind::ConfirmResumeOrAbortTrip {
+            home_house,
+            destination_house,
+        } = dlg.kind
+        {
+            match button {
+                0 => {
+                    if let Err(e) = self.resume_active_trip(home_house) {
+                        self.note = Some(format!(
+                            "Could not resume trip to lot {destination_house}: {e}"
+                        ));
+                    }
+                }
+                1 => match self.abort_active_trip(home_house) {
+                    Ok(restored) => {
+                        self.note = Some(format!(
+                            "Aborted interrupted trip and restored home lot {restored}."
+                        ));
+                    }
+                    Err(e) => {
+                        self.note = Some(format!("Could not abort interrupted trip: {e}"));
+                    }
+                },
+                _ => {}
+            }
+            return ShellOutcome::redraw();
+        }
         if button != 0 {
             return ShellOutcome::redraw();
         }
@@ -3124,9 +4154,1575 @@ impl NeighborhoodShell {
                 }
                 ShellOutcome::redraw()
             }
+            ShellDialogKind::ConfirmResumeOrAbortTrip { .. } => unreachable!(),
             ShellDialogKind::Notice => ShellOutcome::redraw(),
         }
     }
+
+    // =========================================================================
+    // CAF Simlish Voice Preview draining
+    // =========================================================================
+
+    fn drain_caf_voice_previews(&mut self) {
+        let previews = match &mut self.screen {
+            ActiveScreen::CreateFamily(caf) => caf.take_voice_previews(),
+            _ => Vec::new(),
+        };
+        for preview in previews {
+            self.audio_queue.push(Input::PlayVoice {
+                voice: preview.voice,
+                category: preview.category,
+                pitch: preview.pitch,
+                seed: preview.seed,
+                object: None,
+            });
+        }
+    }
+
+    // =========================================================================
+    // Photo Album / Family Storybook Modal (`sims_ui::album` + `PhotoAlbumStore`)
+    // =========================================================================
+
+    /// Opens the Photo Album modal for the active lot's household (or hovered /
+    /// first neighborhood household when on the Neighborhood map).
+    pub fn open_photo_album(&mut self) -> Result<(), String> {
+        let family_id = match &self.screen {
+            ActiveScreen::Lot(session) => {
+                if let Some(trip) = &session.active_trip {
+                    Some(trip.home_family)
+                } else {
+                    self.stored
+                        .family_in(session.house)
+                        .map(|(id, _)| id)
+                        .or_else(|| {
+                            u16::try_from(
+                                session
+                                    .game
+                                    .lot()
+                                    .world()
+                                    .globals
+                                    .get(9)
+                                    .copied()
+                                    .unwrap_or(0),
+                            )
+                            .ok()
+                            .filter(|&id| id != 0)
+                        })
+                }
+            }
+            _ => self
+                .hovered_lot_id
+                .and_then(|lot| self.stored.family_in(u32::from(lot)).map(|(id, _)| id))
+                .or_else(|| self.stored.families.keys().next().copied()),
+        }
+        .ok_or_else(|| "no household available for Photo Album".to_owned())?;
+        self.open_photo_album_for_family(family_id)
+    }
+
+    /// Opens the Photo Album modal for a specific `family_id` in the active
+    /// neighborhood, acquiring a fenced [`AlbumFamilyToken`] from REDB.
+    pub fn open_photo_album_for_family(&mut self, family_id: u16) -> Result<(), String> {
+        let nh_id = match &self.screen {
+            ActiveScreen::Lot(session) => session.neighborhood_id.clone(),
+            _ => self.neighborhood_id.clone(),
+        };
+        let token = self
+            .store
+            .albums()
+            .family_token(&nh_id, family_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("family {family_id} not found in neighborhood {nh_id:?}"))?;
+        let (snapshot, has_image) = self.build_album_snapshot(&nh_id, family_id, None)?;
+        self.album_token = Some(token);
+        self.album_neighborhood_id = Some(nh_id);
+        self.album_has_image = has_image;
+        self.album_strip_scroll = 0;
+        self.album_strip_pressed = None;
+        self.album_dialog.open(&snapshot);
+        self.album_snapshot = Some(snapshot);
+        Ok(())
+    }
+
+    /// Closes the Photo Album modal cleanly.
+    pub fn close_photo_album(&mut self) {
+        self.album_dialog.close();
+        self.album_snapshot = None;
+        self.album_token = None;
+        self.album_neighborhood_id = None;
+        self.album_has_image.clear();
+        self.album_strip_scroll = 0;
+        self.album_strip_pressed = None;
+    }
+
+    fn build_album_snapshot(
+        &self,
+        nh_id: &str,
+        family_id: u16,
+        selected_hint: Option<PhotoId>,
+    ) -> Result<(AlbumSnapshot, BTreeSet<PhotoId>), String> {
+        let summaries = self
+            .store
+            .albums()
+            .list_summaries(nh_id, family_id)
+            .map_err(|e| e.to_string())?;
+        let family_name = self
+            .family_names
+            .get(&family_id)
+            .cloned()
+            .unwrap_or_else(|| format!("Family {family_id}"));
+        let focus_idx = selected_hint
+            .or_else(|| self.album_dialog.selected_id())
+            .and_then(|sel| summaries.iter().position(|s| s.id == sel.0))
+            .unwrap_or(0);
+        let (win_start, win_end) = album_hydration_window(summaries.len(), focus_idx);
+        let visible_slots = self
+            .album_dialog
+            .layout(self.size[0], self.size[1])
+            .thumb_slots
+            .len();
+        let strip_start = self
+            .album_strip_scroll
+            .min(summaries.len().saturating_sub(visible_slots));
+        let strip_end = (strip_start + visible_slots + 2).min(summaries.len());
+        let mut entries = Vec::with_capacity(summaries.len());
+        let mut has_image = BTreeSet::new();
+        for (idx, s) in summaries.into_iter().enumerate() {
+            let pid = PhotoId(s.id);
+            let entry_has_img = s.image_dimensions.is_some();
+            if entry_has_img {
+                has_image.insert(pid);
+            }
+            let in_sel = idx >= win_start && idx < win_end;
+            let in_strip = idx >= strip_start && idx < strip_end;
+            let (image, thumbnail) = if entry_has_img && (in_sel || in_strip) {
+                let loaded = self
+                    .store
+                    .albums()
+                    .get(nh_id, family_id, s.id)
+                    .map_err(|e| e.to_string())?
+                    .and_then(|p| p.image)
+                    .map(|img| Image {
+                        width: img.width,
+                        height: img.height,
+                        rgba: img.to_rgba(),
+                    });
+                let thumb = loaded
+                    .as_ref()
+                    .map(|img| downscale_album_thumbnail(img, 78, 60));
+                if in_sel {
+                    (loaded, thumb)
+                } else {
+                    (None, thumb)
+                }
+            } else {
+                (None, None)
+            };
+            entries.push(AlbumEntry {
+                id: pid,
+                title: s.title,
+                caption: s.caption,
+                image,
+                thumbnail,
+                sim_day: s.sim_day,
+            });
+        }
+        Ok((
+            AlbumSnapshot {
+                family_name,
+                entries,
+                can_capture_snapshot: matches!(self.screen, ActiveScreen::Lot(_)),
+            },
+            has_image,
+        ))
+    }
+
+    fn sync_album_strip_scroll_to_selection(&mut self) {
+        let Some(selected) = self.album_dialog.selected_id() else {
+            return;
+        };
+        let Some(snapshot) = &self.album_snapshot else {
+            return;
+        };
+        let total = snapshot.entries.len();
+        let visible_slots = self
+            .album_dialog
+            .layout(self.size[0], self.size[1])
+            .thumb_slots
+            .len();
+        if visible_slots == 0 || total == 0 {
+            self.album_strip_scroll = 0;
+            return;
+        }
+        let max_scroll = total.saturating_sub(visible_slots);
+        if let Some(idx) = snapshot.entries.iter().position(|e| e.id == selected) {
+            if idx < self.album_strip_scroll {
+                self.album_strip_scroll = idx;
+            } else if idx >= self.album_strip_scroll + visible_slots {
+                self.album_strip_scroll = idx + 1 - visible_slots;
+            }
+        }
+        self.album_strip_scroll = self.album_strip_scroll.min(max_scroll);
+    }
+
+    fn hydrate_album_images(&mut self) {
+        let (Some(nh_id), Some(token)) = (self.album_neighborhood_id.clone(), self.album_token)
+        else {
+            return;
+        };
+        let visible_slots = self
+            .album_dialog
+            .layout(self.size[0], self.size[1])
+            .thumb_slots
+            .len();
+        let selected = self.album_dialog.selected_id();
+        let Some(snapshot) = self.album_snapshot.as_mut() else {
+            return;
+        };
+        let total = snapshot.entries.len();
+        if total == 0 {
+            self.album_strip_scroll = 0;
+            return;
+        }
+        let focus_idx = selected
+            .and_then(|sel| snapshot.entries.iter().position(|e| e.id == sel))
+            .unwrap_or(0);
+        let (win_start, win_end) = album_hydration_window(total, focus_idx);
+        let max_scroll = total.saturating_sub(visible_slots);
+        self.album_strip_scroll = self.album_strip_scroll.min(max_scroll);
+        let strip_start = self.album_strip_scroll.saturating_sub(1);
+        let strip_end = (self.album_strip_scroll + visible_slots + 2).min(total);
+        for (idx, entry) in snapshot.entries.iter_mut().enumerate() {
+            let in_sel = idx >= win_start && idx < win_end;
+            let in_strip = idx >= strip_start && idx < strip_end;
+            let has_img = self.album_has_image.contains(&entry.id);
+            if in_sel {
+                if has_img
+                    && entry.image.is_none()
+                    && let Ok(Some(photo)) =
+                        self.store.albums().get(&nh_id, token.family_id, entry.id.0)
+                    && let Some(img) = photo.image
+                {
+                    let full = Image {
+                        width: img.width,
+                        height: img.height,
+                        rgba: img.to_rgba(),
+                    };
+                    if entry.thumbnail.is_none() {
+                        entry.thumbnail = Some(downscale_album_thumbnail(&full, 78, 60));
+                    }
+                    entry.image = Some(full);
+                }
+            } else {
+                // Keep full-resolution memory bounded even for large albums.
+                entry.image = None;
+                if in_strip
+                    && has_img
+                    && entry.thumbnail.is_none()
+                    && let Ok(Some(photo)) =
+                        self.store.albums().get(&nh_id, token.family_id, entry.id.0)
+                    && let Some(img) = photo.image
+                {
+                    let full = Image {
+                        width: img.width,
+                        height: img.height,
+                        rgba: img.to_rgba(),
+                    };
+                    entry.thumbnail = Some(downscale_album_thumbnail(&full, 78, 60));
+                }
+            }
+        }
+    }
+
+    fn reload_album_snapshot(&mut self, select_id: Option<PhotoId>) -> Result<(), String> {
+        let (Some(nh_id), Some(token)) = (self.album_neighborhood_id.clone(), self.album_token)
+        else {
+            return Err("Photo Album is not open".into());
+        };
+        let (snapshot, has_image) =
+            self.build_album_snapshot(&nh_id, token.family_id, select_id)?;
+        self.album_has_image = has_image;
+        self.album_dialog.sync_snapshot(&snapshot);
+        if let Some(id) = select_id {
+            self.album_dialog.select_entry(&snapshot, id);
+        }
+        self.album_snapshot = Some(snapshot);
+        self.sync_album_strip_scroll_to_selection();
+        self.hydrate_album_images();
+        Ok(())
+    }
+
+    fn send_album_key(&mut self, key: AlbumKey) -> ShellOutcome {
+        let cmds = self
+            .album_snapshot
+            .clone()
+            .map(|snap| {
+                self.album_dialog
+                    .handle_key(key, self.size, &snap, &self.album_art)
+            })
+            .unwrap_or_default();
+        let out = self.execute_album_commands(cmds);
+        self.sync_album_strip_scroll_to_selection();
+        self.hydrate_album_images();
+        out
+    }
+
+    fn execute_album_commands(&mut self, cmds: Vec<AlbumCommand>) -> ShellOutcome {
+        let mut out = ShellOutcome::redraw();
+        for cmd in cmds {
+            let step = self.execute_album_command(cmd);
+            out.redraw |= step.redraw;
+            out.quit |= step.quit;
+            out.photo |= step.photo;
+        }
+        out
+    }
+
+    /// Executes a single [`AlbumCommand`] emitted by [`PhotoAlbumDialog`] against
+    /// REDB's fenced [`sims_sim::album_store::PhotoAlbumStore`].
+    pub fn execute_album_command(&mut self, cmd: AlbumCommand) -> ShellOutcome {
+        match cmd {
+            AlbumCommand::Close => {
+                self.close_photo_album();
+                ShellOutcome::redraw()
+            }
+            AlbumCommand::SelectEntry(id) => {
+                if let Some(snap) = &self.album_snapshot {
+                    self.album_dialog.select_entry(snap, id);
+                }
+                self.sync_album_strip_scroll_to_selection();
+                self.hydrate_album_images();
+                ShellOutcome::redraw()
+            }
+            AlbumCommand::CaptureSnapshot => {
+                let (Some(nh_id), Some(token)) =
+                    (self.album_neighborhood_id.clone(), self.album_token)
+                else {
+                    return ShellOutcome::redraw();
+                };
+                let capture = if let ActiveScreen::Lot(session) = &mut self.screen {
+                    session.game.render();
+                    let canvas = session.game.canvas();
+                    let sim_day = u32::try_from(
+                        session
+                            .game
+                            .lot()
+                            .world()
+                            .globals
+                            .get(28)
+                            .copied()
+                            .unwrap_or(0)
+                            .max(0),
+                    )
+                    .ok()
+                    .map(|d| d + 1);
+                    let lot_title = {
+                        let name = session.game.lot().lot_name().trim();
+                        if !name.is_empty() {
+                            name.to_owned()
+                        } else {
+                            format!("Lot {}", session.house)
+                        }
+                    };
+                    capture_canvas_to_album_image(canvas).map(|img| (lot_title, img, sim_day))
+                } else {
+                    Err("snapshot capture requires an open lot".to_owned())
+                };
+                match capture {
+                    Ok((title, img, sim_day)) => {
+                        let mut entry = NewAlbumPhoto::with_image(title, "", img);
+                        if let Some(day) = sim_day {
+                            entry = entry.with_sim_day(day);
+                        }
+                        match self.store.albums().add(&nh_id, token, entry) {
+                            Ok(photo) => {
+                                if let Err(err) =
+                                    self.reload_album_snapshot(Some(PhotoId(photo.id)))
+                                {
+                                    self.set_note(format!(
+                                        "Saved snapshot; album reload error: {err}"
+                                    ));
+                                }
+                            }
+                            Err(err) => {
+                                self.set_note(format!("Could not save snapshot: {err}"));
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        self.set_note(format!("Snapshot capture failed: {err}"));
+                    }
+                }
+                ShellOutcome::redraw()
+            }
+            AlbumCommand::AddBlankPage => {
+                if let (Some(nh_id), Some(token)) =
+                    (self.album_neighborhood_id.clone(), self.album_token)
+                {
+                    let page = NewAlbumPhoto::blank("", "");
+                    match self.store.albums().add(&nh_id, token, page) {
+                        Ok(photo) => {
+                            if let Err(err) = self.reload_album_snapshot(Some(PhotoId(photo.id))) {
+                                self.set_note(format!("Added page; album reload error: {err}"));
+                            }
+                        }
+                        Err(err) => {
+                            self.set_note(format!("Could not add album page: {err}"));
+                        }
+                    }
+                }
+                ShellOutcome::redraw()
+            }
+            AlbumCommand::UpdateEntryText { id, title, caption } => {
+                if let (Some(nh_id), Some(token)) =
+                    (self.album_neighborhood_id.clone(), self.album_token)
+                {
+                    match self
+                        .store
+                        .albums()
+                        .update_text(&nh_id, token, id.0, &title, &caption)
+                    {
+                        Ok(_) => {
+                            if let Err(err) = self.reload_album_snapshot(Some(id)) {
+                                self.set_note(format!("Updated entry; album reload error: {err}"));
+                            }
+                        }
+                        Err(err) => {
+                            self.set_note(format!("Could not update album text: {err}"));
+                        }
+                    }
+                }
+                ShellOutcome::redraw()
+            }
+            AlbumCommand::MoveEntry { id, new_index } => {
+                if let (Some(nh_id), Some(token)) =
+                    (self.album_neighborhood_id.clone(), self.album_token)
+                {
+                    match self
+                        .store
+                        .albums()
+                        .move_entry(&nh_id, token, id.0, new_index)
+                    {
+                        Ok(_) => {
+                            if let Err(err) = self.reload_album_snapshot(Some(id)) {
+                                self.set_note(format!(
+                                    "Reordered entry; album reload error: {err}"
+                                ));
+                            }
+                        }
+                        Err(err) => {
+                            self.set_note(format!("Could not reorder album entry: {err}"));
+                        }
+                    }
+                }
+                ShellOutcome::redraw()
+            }
+            AlbumCommand::DeleteEntry(id) => {
+                if let (Some(nh_id), Some(token)) =
+                    (self.album_neighborhood_id.clone(), self.album_token)
+                {
+                    match self.store.albums().delete(&nh_id, token, id.0) {
+                        Ok(_) => {
+                            if let Err(err) = self.reload_album_snapshot(None) {
+                                self.set_note(format!("Deleted entry; album reload error: {err}"));
+                            }
+                        }
+                        Err(err) => {
+                            self.set_note(format!("Could not delete album entry: {err}"));
+                        }
+                    }
+                }
+                ShellOutcome::redraw()
+            }
+        }
+    }
+
+    // =========================================================================
+    // Travel Destinations Shell (`TravelChrome`, `TravelDialog`, `sims_vm::travel`)
+    // =========================================================================
+
+    fn sync_travel_state(&mut self) {
+        if let Some(dest) = destination_for_kind(self.kind) {
+            self.travel_state.destination = dest;
+        }
+        self.travel_state.mode = match self.nbhd_state.mode {
+            NeighborhoodMode::Bulldoze => TravelBarMode::Bulldoze,
+            NeighborhoodMode::Visit => TravelBarMode::Visit,
+            _ => TravelBarMode::Browse,
+        };
+        self.travel_state.expansions = self.nbhd_state.expansions;
+        self.travel_state.vacation_has_no_vacancy = self
+            .map
+            .lots
+            .iter()
+            .any(|l| (40..=48).contains(&l.id) && l.has_vacation_occupancy);
+        // Show the first occupied household's funds & MagiCoins as a quick status badge.
+        if let Some((&fam_id, fam)) = self.stored.families.iter().find(|(_, f)| f.house != 0) {
+            self.travel_state.simoleons = fam.budget;
+            self.travel_state.magic_coins = lifecycle::family_magic_coins(&self.stored, fam_id);
+        }
+    }
+
+    fn magic_family_bin_rect(&self, layout: &TravelLayout) -> Option<Rect> {
+        if self.kind != NeighborhoodKind::MagicTown {
+            return None;
+        }
+        // On native viewports (>= 800px), place the Family Bin button in the open
+        // 78px left margin of `TravelChrome`'s top bar. On compact viewports
+        // (< 800px), top bar controls start at x=4, so dock the compact button on
+        // the open right side of `filter_strip_rect` (Magic Town only has 2 filter
+        // chips on the left) so Family Bin stays reachable at every viewport width.
+        let rect = if layout.compact {
+            let btn_w = 54.min((layout.filter_strip_rect.width - 8).max(0));
+            let btn_h = (layout.filter_strip_rect.height - 4).clamp(0, 26);
+            let x = layout.filter_strip_rect.x + layout.filter_strip_rect.width - btn_w - 4;
+            let y = layout.filter_strip_rect.y + (layout.filter_strip_rect.height - btn_h) / 2;
+            if btn_w <= 0 || btn_h <= 0 {
+                return None;
+            }
+            Rect::new(x, y, btn_w, btn_h)
+        } else {
+            let btn_w = 53;
+            let btn_h = (layout.bar_rect.height - 6).clamp(0, 56);
+            let x = layout.bar_rect.x + 12;
+            let y = (layout.bar_rect.height - btn_h) / 2;
+            if btn_w <= 0 || btn_h <= 0 {
+                return None;
+            }
+            Rect::new(x, y, btn_w, btn_h)
+        };
+        // Never overlap any TravelChrome control.
+        if layout.controls.iter().any(|c| {
+            rect.x < c.rect.x + c.rect.width
+                && rect.x + rect.width > c.rect.x
+                && rect.y < c.rect.y + c.rect.height
+                && rect.y + rect.height > c.rect.y
+        }) {
+            return None;
+        }
+        Some(rect)
+    }
+
+    fn draw_magic_family_bin_button(&self, frame: &mut Frame) {
+        let layout = TravelLayout::compute(frame.width(), frame.height(), &self.travel_state);
+        let Some(rect) = self.magic_family_bin_rect(&layout) else {
+            return;
+        };
+        let state = if self.magic_family_bin_pressed {
+            2
+        } else if self.magic_family_bin_hovered {
+            1
+        } else {
+            0
+        };
+        if !layout.compact
+            && let Some(img) = self
+                .chrome_art
+                .image(sims_ui::neighborhood::art_id::SELECT_FAMILY)
+            && img.width >= 4
+            && img.height > 0
+            && rect.height >= img.height as i32
+        {
+            let sw = (img.width / 4) as i32;
+            let sh = img.height as i32;
+            let src = Rect::new(state * sw, 0, sw, sh);
+            let dx = rect.x + (rect.width - sw) / 2;
+            let dy = rect.y + (rect.height - sh) / 2;
+            frame.draw(img, src, [dx, dy]);
+        } else {
+            let fill = if self.magic_family_bin_pressed {
+                [56, 74, 114]
+            } else if self.magic_family_bin_hovered {
+                [84, 108, 158]
+            } else {
+                [66, 86, 130]
+            };
+            frame.fill(rect, fill);
+            if let Some(font) = self.chrome_art.font(10) {
+                let text_y = rect.y + ((rect.height - 10) / 2).max(2);
+                font.draw(frame, "Fam", [rect.x + 12, text_y], [245, 245, 255]);
+            }
+        }
+    }
+
+    fn travel_filtered_lot_ids(&self) -> BTreeSet<u16> {
+        let filter_mask = self
+            .travel_state
+            .active_filter
+            .map(|f| community_filter_for_lot_filter(f) as u16);
+        let lodging = if self.kind == NeighborhoodKind::Vacation {
+            self.travel_state.vacation_lodging_filter
+        } else {
+            None
+        };
+        if filter_mask.is_none() && lodging.is_none() {
+            return BTreeSet::new();
+        }
+        self.map
+            .lots
+            .iter()
+            .filter(|lot| {
+                let matches_filter = filter_mask.is_none_or(|mask| (lot.filter_mask & mask) != 0);
+                let matches_lodging = lodging.is_none_or(|l| vacation_lot_matches_lodging(lot, l));
+                matches_filter && matches_lodging
+            })
+            .map(|lot| lot.id)
+            .collect()
+    }
+
+    /// Handles a [`TravelCommand`] emitted by [`TravelChrome`] on expansion
+    /// sub-neighborhood maps.
+    pub fn handle_travel_command(&mut self, cmd: TravelCommand) -> ShellOutcome {
+        match cmd {
+            TravelCommand::ReturnToNeighborhood => {
+                let home = default_map_kind(&self.install, self.slot);
+                if let Err(e) = self.switch_kind(home) {
+                    self.note = Some(format!("Could not return to neighborhood map: {e}"));
+                }
+                ShellOutcome::redraw()
+            }
+            TravelCommand::ToggleBulldoze => {
+                if self.travel_state.mode == TravelBarMode::Bulldoze {
+                    self.travel_state.mode = TravelBarMode::Browse;
+                    self.nbhd_state.mode = NeighborhoodMode::Normal;
+                } else {
+                    self.travel_state.mode = TravelBarMode::Bulldoze;
+                    self.nbhd_state.mode = NeighborhoodMode::Bulldoze;
+                }
+                self.refresh_hovered_lot();
+                ShellOutcome::redraw()
+            }
+            TravelCommand::ImportLot => {
+                self.note = Some("Community lot import is not ported yet.".into());
+                ShellOutcome::redraw()
+            }
+            TravelCommand::SwitchDestination(dest) => {
+                if let Err(e) = self.switch_kind(kind_for_destination(dest)) {
+                    self.note = Some(format!("Could not switch destination map: {e}"));
+                }
+                ShellOutcome::redraw()
+            }
+            TravelCommand::SetFilter(filter) => {
+                self.travel_state.active_filter = filter;
+                ShellOutcome::redraw()
+            }
+            TravelCommand::SetVacationLodging(lodging) => {
+                self.travel_state.vacation_lodging_filter = lodging;
+                ShellOutcome::redraw()
+            }
+        }
+    }
+
+    /// Opens an unoccupied travel destination community lot in Build/Buy edit
+    /// mode via [`vm_travel::open_destination_for_edit`]. Edits persist via
+    /// [`Self::save_current_lot`] / [`Self::leave_lot`].
+    pub fn open_destination_for_edit(&mut self, destination_house: u32) -> Result<(), String> {
+        self.start_load_audio();
+        self.present_loading_step(
+            loading_kind_for_house(destination_house),
+            Some(format!("Destination Lot {destination_house}")),
+            0.2,
+        );
+        let snapshot = match self
+            .store
+            .load_lot_snapshot(&self.neighborhood_id, destination_house)
+            .map_err(|e| e.to_string())
+            .and_then(|opt| {
+                opt.ok_or_else(|| format!("neighborhood {:?} not found", self.neighborhood_id))
+            }) {
+            Ok(s) => s,
+            Err(err) => {
+                let fallback = self.desired_music_mode();
+                self.stop_load_audio(fallback);
+                return Err(err);
+            }
+        };
+        let lot = match vm_travel::open_destination_for_edit(
+            &self.install_root,
+            &self.store,
+            &self.neighborhood_id,
+            destination_house,
+            &self.answers,
+            self.frames.clone(),
+        ) {
+            Ok(lot) => lot,
+            Err(err) => {
+                let fallback = self.desired_music_mode();
+                self.stop_load_audio(fallback);
+                return Err(err.to_string());
+            }
+        };
+        let mut game = match Game::from_loaded_lot(
+            &self.install_root,
+            lot,
+            Vec::new(),
+            &snapshot.character_files,
+            snapshot.base_house.as_deref(),
+            self.play,
+        ) {
+            Ok(game) => game,
+            Err(err) => {
+                let fallback = self.desired_music_mode();
+                self.stop_load_audio(fallback);
+                return Err(err);
+            }
+        };
+        if self.options_file.is_file() {
+            let _ = game.load_options(&self.options_file);
+        }
+        game.set_album_button_enabled(true);
+        game.resize(self.size);
+        let initial_days_played = game.lot().world().globals.get(28).copied().unwrap_or(0);
+        let next_music = sound::lot_music_mode(game.mode(), game.lot().lot_id());
+        self.stored = snapshot.neighborhood;
+        self.screen = ActiveScreen::Lot(Box::new(LotSession {
+            game,
+            neighborhood_id: self.neighborhood_id.clone(),
+            neighborhood_instance_id: self.stored.instance_id,
+            neighborhood_revision: self.stored.revision,
+            staging: None,
+            house: destination_house,
+            last_days_played: initial_days_played,
+            active_trip: None,
+            is_destination_edit: true,
+        }));
+        self.lot_generation = self.lot_generation.wrapping_add(1);
+        self.dialog = None;
+        self.close_photo_album();
+        self.close_travel_dialog();
+        self.save_manager.close();
+        self.save_manager_snapshot = None;
+        self.save_manager_target_lot = Some(destination_house);
+        self.note = None;
+        self.hovered_lot_id = None;
+        self.pressed_lot_id = None;
+        self.nbhd_state.hovered_lot = None;
+        self.stop_load_audio(next_music);
+        Ok(())
+    }
+
+    /// Opens [`TravelDialog`] from the currently open home lot using the first
+    /// eligible Complete Collection travel destination (defaulting to Downtown,
+    /// falling back across Vacation Island, Old Town Community, Studio Town,
+    /// and Magic Town). Desktop users can press `Left`/`Right`/`Tab` inside the
+    /// open dialog to cycle destinations before confirming.
+    pub fn open_default_travel_dialog(&mut self) -> Result<ValidatedTravelPlan, String> {
+        let mut last_err = "no travel destinations available".to_owned();
+        for dest in [
+            TravelDestination::Downtown,
+            TravelDestination::VacationIsland,
+            TravelDestination::OldTown,
+            TravelDestination::StudioTown,
+            TravelDestination::MagicTown,
+        ] {
+            match self.open_travel_dialog_for_destination(dest) {
+                Ok(plan) => return Ok(plan),
+                Err(err) => last_err = err,
+            }
+        }
+        Err(last_err)
+    }
+
+    /// Opens [`TravelDialog`] for `destination` from the currently open home lot,
+    /// selecting the first available community lot for `destination` and the
+    /// appropriate traveling party (selected Sim or whole household).
+    pub fn open_travel_dialog_for_destination(
+        &mut self,
+        destination: TravelDestination,
+    ) -> Result<ValidatedTravelPlan, String> {
+        let dest_house = self
+            .default_house_for_destination(destination)
+            .ok_or_else(|| format!("no community lot found for {destination:?}"))?;
+        let leader_guid = {
+            let ActiveScreen::Lot(session) = &self.screen else {
+                return Err("enter a home lot before traveling".into());
+            };
+            let world = session.game.lot().world();
+            let home_family_id = self
+                .stored
+                .family_in(session.house)
+                .map(|(id, _)| id)
+                .or_else(|| {
+                    u16::try_from(world.globals.get(9).copied().unwrap_or(0))
+                        .ok()
+                        .filter(|&id| id != 0)
+                })
+                .ok_or_else(|| format!("lot {} has no resident household", session.house))?;
+            let fam_members: Vec<u32> = self
+                .stored
+                .families
+                .get(&home_family_id)
+                .map(|f| f.members.clone())
+                .unwrap_or_default();
+            let selected_guid = world
+                .selected()
+                .and_then(|sel| world.objects.get(&sel))
+                .map(|o| o.guid)
+                .filter(|g| fam_members.contains(g));
+            selected_guid
+                .or_else(|| fam_members.first().copied())
+                .ok_or_else(|| format!("household {home_family_id} has no living members"))?
+        };
+        let party = match destination {
+            TravelDestination::VacationIsland
+            | TravelDestination::OldTown
+            | TravelDestination::MagicTown => vm_travel::TravelParty::WholeFamily { leader_guid },
+            TravelDestination::Downtown | TravelDestination::StudioTown => {
+                vm_travel::TravelParty::Single {
+                    sim_guid: leader_guid,
+                }
+            }
+        };
+        let request = TravelRequest {
+            destination_house: dest_house,
+            party,
+            transport: None,
+            accommodation: vm_travel::VacationAccommodation::None,
+            fare_override: None,
+            answers: self.answers.clone(),
+            frames: self.frames.clone(),
+            view_centre: None,
+        };
+        self.open_travel_dialog(request)
+    }
+
+    /// Cycles the open [`TravelDialog`] to the next (`delta > 0`) or previous
+    /// (`delta < 0`) eligible destination without leaving the dialog.
+    pub fn cycle_travel_destination(&mut self, delta: i32) -> bool {
+        let Some(current) = self.pending_travel.as_ref().map(|p| p.plan.destination) else {
+            return false;
+        };
+        const ORDER: [TravelDestination; 5] = [
+            TravelDestination::Downtown,
+            TravelDestination::VacationIsland,
+            TravelDestination::OldTown,
+            TravelDestination::StudioTown,
+            TravelDestination::MagicTown,
+        ];
+        let start = ORDER.iter().position(|&d| d == current).unwrap_or(0);
+        let step: isize = if delta >= 0 { 1 } else { -1 };
+        for offset in 1..ORDER.len() {
+            let idx =
+                (start as isize + step * offset as isize).rem_euclid(ORDER.len() as isize) as usize;
+            if self.open_travel_dialog_for_destination(ORDER[idx]).is_ok() {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn default_house_for_destination(&self, dest: TravelDestination) -> Option<u32> {
+        let candidates: &[u32] = match dest {
+            TravelDestination::Downtown => &[21, 22, 23, 24, 25, 26, 27, 28, 29, 30],
+            TravelDestination::VacationIsland => &[40, 41, 42, 43, 44, 45, 46, 47, 48],
+            TravelDestination::OldTown => &[58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68],
+            TravelDestination::StudioTown => &[81, 82, 83, 84, 85, 86, 87, 88, 89],
+            TravelDestination::MagicTown => &[93, 94, 95, 96, 97, 98],
+        };
+        candidates.iter().copied().find(|&house| {
+            TravelDestination::classify(house, &self.stored.zoning) == Some(dest)
+                && self
+                    .store
+                    .load_lot_snapshot(&self.neighborhood_id, house)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|s| s.base_house.is_some() || s.saved_lot.is_some())
+        })
+    }
+
+    /// Validates `request` against the currently open home lot via
+    /// [`vm_travel::validate_travel_plan`] and opens [`TravelDialog`] for
+    /// player confirmation.
+    pub fn open_travel_dialog(
+        &mut self,
+        request: TravelRequest,
+    ) -> Result<ValidatedTravelPlan, String> {
+        let (plan, travelers, simoleons, magic_coins) = {
+            let ActiveScreen::Lot(session) = &self.screen else {
+                return Err("enter a home lot before traveling".into());
+            };
+            if session.active_trip.is_some() {
+                return Err("household is already visiting a travel destination".into());
+            }
+            let world = session.game.lot().world();
+            let home_family_id = self
+                .stored
+                .family_in(session.house)
+                .map(|(id, _)| id)
+                .or_else(|| {
+                    u16::try_from(world.globals.get(9).copied().unwrap_or(0))
+                        .ok()
+                        .filter(|&id| id != 0)
+                })
+                .ok_or_else(|| format!("lot {} has no resident household", session.house))?;
+            let plan = vm_travel::validate_travel_plan(
+                world,
+                session.house,
+                home_family_id,
+                u16::from(self.install.expansions.0),
+                &self.stored,
+                &request,
+            )
+            .map_err(|e| e.to_string())?;
+            let travelers: Vec<String> = plan
+                .members
+                .iter()
+                .map(|t| {
+                    self.faces
+                        .name(t.guid)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("Sim 0x{:08X}", t.guid))
+                })
+                .collect();
+            let simoleons = sims_vm::available_funds(world).max(0);
+            let members: Vec<u32> = self
+                .stored
+                .families
+                .get(&home_family_id)
+                .map(|f| f.members.clone())
+                .unwrap_or_default();
+            let magic_coins = vm_travel::family_magic_coins(world, &members).max(0);
+            (plan, travelers, simoleons, magic_coins)
+        };
+        let ui_dest = ui_destination_for_vm(plan.destination);
+        let mut td_state = TravelDialogState::for_destination(ui_dest, travelers);
+        td_state.transport = ui_transport_for_vm(plan.transport);
+        td_state.fare_simoleons = plan.fare;
+        td_state.household_simoleons = simoleons;
+        td_state.household_magic_coins = magic_coins;
+        self.travel_dialog = TravelDialog::new();
+        self.travel_dialog_state = Some(td_state);
+        self.pending_travel = Some(PendingTravel {
+            request,
+            plan: plan.clone(),
+        });
+        Ok(plan)
+    }
+
+    /// Closes [`TravelDialog`] without departing.
+    pub fn close_travel_dialog(&mut self) {
+        self.travel_dialog_state = None;
+        self.pending_travel = None;
+    }
+
+    fn handle_travel_dialog_command(&mut self, cmd: TravelDialogCommand) -> ShellOutcome {
+        match cmd {
+            TravelDialogCommand::Cancel => {
+                self.close_travel_dialog();
+                ShellOutcome::redraw()
+            }
+            TravelDialogCommand::Confirm { .. } => {
+                let pending = self.pending_travel.take();
+                self.travel_dialog_state = None;
+                if let Some(pending) = pending {
+                    let _ = &pending.plan;
+                    if let Err(err) = self.depart_to_destination(pending.request) {
+                        if let ActiveScreen::Lot(session) = &mut self.screen {
+                            session.game.set_note(format!("Travel failed: {err}"));
+                        } else if self.note.is_none() {
+                            self.note = Some(format!("Travel failed: {err}"));
+                        }
+                    }
+                }
+                ShellOutcome::redraw()
+            }
+        }
+    }
+
+    /// Departs from the currently open home lot to a travel destination via
+    /// [`vm_travel::depart_to_destination`], driving [`LoadingScreen`] audio
+    /// cues and wrapping the booted destination lot into the active session.
+    pub fn depart_to_destination(
+        &mut self,
+        request: TravelRequest,
+    ) -> Result<TravelSession, String> {
+        self.note = None;
+        self.flush_background_saves();
+        let nh_id = match &self.screen {
+            ActiveScreen::Lot(session) => {
+                if session.active_trip.is_some() {
+                    return Err("already on an active travel trip".into());
+                }
+                session.neighborhood_id.clone()
+            }
+            _ => return Err("no home lot is open for travel departure".into()),
+        };
+        // Pre-validate snapshot availability BEFORE committing `TRVL` to REDB.
+        let _ = self
+            .store
+            .load_lot_snapshot(&nh_id, request.destination_house)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("neighborhood {nh_id:?} not found before departure"))?;
+
+        self.start_load_audio();
+        self.present_loading_step(
+            loading_kind_for_house(request.destination_house),
+            Some(format!("Destination Lot {}", request.destination_house)),
+            0.2,
+        );
+        let departure = {
+            let ActiveScreen::Lot(session) = &mut self.screen else {
+                let fallback = self.desired_music_mode();
+                self.stop_load_audio(fallback);
+                return Err("no home lot is open for travel departure".into());
+            };
+            match vm_travel::depart_to_destination(
+                &self.install_root,
+                &self.store,
+                &nh_id,
+                session.game.lot_mut(),
+                &request,
+            ) {
+                Ok(dep) => dep,
+                Err(err) => {
+                    let fallback = self.desired_music_mode();
+                    self.stop_load_audio(fallback);
+                    return Err(err.to_string());
+                }
+            }
+        };
+        self.present_loading_step(
+            loading_kind_for_house(departure.session.destination_house),
+            Some(format!(
+                "Destination Lot {}",
+                departure.session.destination_house
+            )),
+            0.75,
+        );
+        let trip = departure.session;
+        let dest_house = trip.destination_house;
+        let post_commit_res: Result<(Game, StoredNeighborhood), String> = (|| {
+            let snapshot = self
+                .store
+                .load_lot_snapshot(&nh_id, dest_house)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("neighborhood {nh_id:?} not found after departure"))?;
+            let members = snapshot
+                .neighborhood
+                .families
+                .get(&trip.home_family)
+                .map(|f| f.members.clone())
+                .unwrap_or_default();
+            let game = Game::from_loaded_lot(
+                &self.install_root,
+                departure.destination_lot,
+                members,
+                &snapshot.character_files,
+                snapshot.base_house.as_deref(),
+                self.play,
+            )?;
+            Ok((game, snapshot.neighborhood))
+        })();
+        let (mut game, next_stored) = match post_commit_res {
+            Ok(ok) => ok,
+            Err(err) => {
+                // Departure already committed `TRVL` to REDB: never leave the
+                // frozen home lot on screen with `active_trip == None`. Return
+                // cleanly to the Neighborhood map so clicking `trip.home_house`
+                // offers Resume or Abort.
+                self.screen = ActiveScreen::Neighborhood;
+                self.lot_generation = self.lot_generation.wrapping_add(1);
+                self.close_photo_album();
+                self.close_travel_dialog();
+                self.save_manager.close();
+                self.save_manager_snapshot = None;
+                self.save_manager_target_lot = None;
+                let _ = self.refresh_from_store();
+                self.note = Some(format!(
+                    "Trip departed (saved in REDB), but destination lot {dest_house} could not open: {err}. Click lot {} to Resume or Abort.",
+                    trip.home_house
+                ));
+                self.audio_queue
+                    .push(Input::Events(vec![SoundEvent::StopAll]));
+                self.stop_load_audio(music_mode_for_kind(self.kind));
+                return Err(err);
+            }
+        };
+        if self.options_file.is_file() {
+            let _ = game.load_options(&self.options_file);
+        }
+        game.set_album_button_enabled(true);
+        game.resize(self.size);
+        let initial_days_played = game.lot().world().globals.get(28).copied().unwrap_or(0);
+        let next_music = sound::lot_music_mode(game.mode(), game.lot().lot_id());
+        self.stored = next_stored;
+        self.screen = ActiveScreen::Lot(Box::new(LotSession {
+            game,
+            neighborhood_id: nh_id,
+            neighborhood_instance_id: self.stored.instance_id,
+            neighborhood_revision: self.stored.revision,
+            staging: None,
+            house: dest_house,
+            last_days_played: initial_days_played,
+            active_trip: Some(trip.clone()),
+            is_destination_edit: false,
+        }));
+        self.lot_generation = self.lot_generation.wrapping_add(1);
+        self.close_photo_album();
+        self.close_travel_dialog();
+        self.save_manager.close();
+        self.save_manager_snapshot = None;
+        self.save_manager_target_lot = None;
+        self.note = None;
+        self.audio_queue
+            .push(Input::Events(vec![SoundEvent::StopAll]));
+        self.stop_load_audio(next_music);
+        Ok(trip)
+    }
+
+    /// Returns the traveling household from the active destination lot back to
+    /// their reconciled home lot via [`vm_travel::return_from_destination`].
+    pub fn return_from_destination(&mut self) -> Result<ReturnReport, String> {
+        self.note = None;
+        let (nh_id, trip) = match &self.screen {
+            ActiveScreen::Lot(session) => {
+                let Some(trip) = session.active_trip.clone() else {
+                    return Err("current lot is not an active travel trip".into());
+                };
+                (session.neighborhood_id.clone(), trip)
+            }
+            _ => return Err("no active travel destination lot is open".into()),
+        };
+        // Pre-validate home snapshot availability BEFORE committing return.
+        let _ = self
+            .store
+            .load_lot_snapshot(&nh_id, trip.home_house)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("neighborhood {nh_id:?} not found before return"))?;
+
+        self.start_load_audio();
+        self.present_loading_step(
+            LoadingKind::Lot,
+            Some(format!("Home Lot {}", trip.home_house)),
+            0.2,
+        );
+        let ret = {
+            let ActiveScreen::Lot(session) = &mut self.screen else {
+                let fallback = self.desired_music_mode();
+                self.stop_load_audio(fallback);
+                return Err("no active travel destination lot is open".into());
+            };
+            match vm_travel::return_from_destination(
+                &self.install_root,
+                &self.store,
+                &trip,
+                session.game.lot_mut(),
+                &self.answers,
+                self.frames.clone(),
+            ) {
+                Ok(ret) => ret,
+                Err(err) => {
+                    let fallback = self.desired_music_mode();
+                    self.stop_load_audio(fallback);
+                    return Err(err.to_string());
+                }
+            }
+        };
+        let home_house = ret.report.home_house;
+        self.present_loading_step(
+            LoadingKind::Lot,
+            Some(format!("Home Lot {home_house}")),
+            0.75,
+        );
+        let post_commit_res: Result<(Game, StoredNeighborhood), String> = (|| {
+            let snapshot = self
+                .store
+                .load_lot_snapshot(&nh_id, home_house)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("neighborhood {nh_id:?} not found after return"))?;
+            let members = snapshot
+                .neighborhood
+                .family_in(home_house)
+                .map(|(_, f)| f.members.clone())
+                .unwrap_or_default();
+            let game = Game::from_loaded_lot(
+                &self.install_root,
+                ret.home_lot,
+                members,
+                &snapshot.character_files,
+                snapshot.base_house.as_deref(),
+                self.play,
+            )?;
+            Ok((game, snapshot.neighborhood))
+        })();
+        let (mut game, next_stored) = match post_commit_res {
+            Ok(ok) => ok,
+            Err(err) => {
+                // Return already reconciled the home lot and consumed `TRVL` in
+                // REDB: never leave the consumed destination lot on screen with
+                // a stale `active_trip`. Transition cleanly to Neighborhood so
+                // the player can immediately enter their saved home lot.
+                self.screen = ActiveScreen::Neighborhood;
+                self.lot_generation = self.lot_generation.wrapping_add(1);
+                self.close_photo_album();
+                self.close_travel_dialog();
+                self.save_manager.close();
+                self.save_manager_snapshot = None;
+                self.save_manager_target_lot = Some(home_house);
+                let _ = self.refresh_from_store();
+                self.note = Some(format!(
+                    "Returned home to lot {home_house} (saved in REDB), but failed to reopen home lot: {err}. Click lot {home_house} to enter."
+                ));
+                self.audio_queue
+                    .push(Input::Events(vec![SoundEvent::StopAll]));
+                self.stop_load_audio(music_mode_for_kind(self.kind));
+                return Err(err);
+            }
+        };
+        if self.options_file.is_file() {
+            let _ = game.load_options(&self.options_file);
+        }
+        game.set_album_button_enabled(true);
+        game.resize(self.size);
+        let initial_days_played = game.lot().world().globals.get(28).copied().unwrap_or(0);
+        let next_music = sound::lot_music_mode(game.mode(), game.lot().lot_id());
+        self.stored = next_stored;
+        self.screen = ActiveScreen::Lot(Box::new(LotSession {
+            game,
+            neighborhood_id: nh_id,
+            neighborhood_instance_id: self.stored.instance_id,
+            neighborhood_revision: self.stored.revision,
+            staging: None,
+            house: home_house,
+            last_days_played: initial_days_played,
+            active_trip: None,
+            is_destination_edit: false,
+        }));
+        self.lot_generation = self.lot_generation.wrapping_add(1);
+        self.close_photo_album();
+        self.close_travel_dialog();
+        self.save_manager.close();
+        self.save_manager_snapshot = None;
+        self.save_manager_target_lot = Some(home_house);
+        self.note = None;
+        self.audio_queue
+            .push(Input::Events(vec![SoundEvent::StopAll]));
+        self.stop_load_audio(next_music);
+        Ok(ret.report)
+    }
+
+    /// Inspects whether `home_house` in the active neighborhood has an active
+    /// crash-persisted travel trip envelope (`TRVL`) in REDB.
+    pub fn inspect_active_trip(&self, home_house: u32) -> Result<Option<TravelSession>, String> {
+        vm_travel::inspect_active_trip(&self.store, &self.neighborhood_id, home_house)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Scans occupied residential lots in the active neighborhood for any
+    /// crash-interrupted travel trips persisted in REDB.
+    pub fn inspect_any_active_trips(&self) -> Vec<(u32, TravelSession)> {
+        let mut out = Vec::new();
+        for fam in self.stored.families.values() {
+            if fam.house > 0
+                && let Ok(house) = u32::try_from(fam.house)
+                && let Ok(Some(session)) =
+                    vm_travel::inspect_active_trip(&self.store, &self.neighborhood_id, house)
+            {
+                out.push((house, session));
+            }
+        }
+        out
+    }
+
+    /// Resumes an interrupted active travel trip for `home_house` directly into
+    /// its destination lot via [`vm_travel::resume_active_trip`].
+    pub fn resume_active_trip(&mut self, home_house: u32) -> Result<TravelSession, String> {
+        self.start_load_audio();
+        self.present_loading_step(
+            LoadingKind::Lot,
+            Some(format!("Resuming Trip (Lot {home_house})")),
+            0.2,
+        );
+        let resumed = match vm_travel::resume_active_trip(
+            &self.install_root,
+            &self.store,
+            &self.neighborhood_id,
+            home_house,
+            &self.answers,
+            self.frames.clone(),
+        ) {
+            Ok(dep) => dep,
+            Err(err) => {
+                let fallback = self.desired_music_mode();
+                self.stop_load_audio(fallback);
+                return Err(err.to_string());
+            }
+        };
+        let trip = resumed.session;
+        let dest_house = trip.destination_house;
+        let snapshot = match self
+            .store
+            .load_lot_snapshot(&self.neighborhood_id, dest_house)
+            .map_err(|e| e.to_string())
+            .and_then(|opt| {
+                opt.ok_or_else(|| format!("neighborhood {:?} not found", self.neighborhood_id))
+            }) {
+            Ok(s) => s,
+            Err(err) => {
+                let fallback = self.desired_music_mode();
+                self.stop_load_audio(fallback);
+                return Err(err);
+            }
+        };
+        let members = snapshot
+            .neighborhood
+            .families
+            .get(&trip.home_family)
+            .map(|f| f.members.clone())
+            .unwrap_or_default();
+        let mut game = match Game::from_loaded_lot(
+            &self.install_root,
+            resumed.destination_lot,
+            members,
+            &snapshot.character_files,
+            snapshot.base_house.as_deref(),
+            self.play,
+        ) {
+            Ok(game) => game,
+            Err(err) => {
+                let fallback = self.desired_music_mode();
+                self.stop_load_audio(fallback);
+                return Err(err);
+            }
+        };
+        if self.options_file.is_file() {
+            let _ = game.load_options(&self.options_file);
+        }
+        game.set_album_button_enabled(true);
+        game.resize(self.size);
+        let initial_days_played = game.lot().world().globals.get(28).copied().unwrap_or(0);
+        let next_music = sound::lot_music_mode(game.mode(), game.lot().lot_id());
+        self.stored = snapshot.neighborhood;
+        self.screen = ActiveScreen::Lot(Box::new(LotSession {
+            game,
+            neighborhood_id: self.neighborhood_id.clone(),
+            neighborhood_instance_id: self.stored.instance_id,
+            neighborhood_revision: self.stored.revision,
+            staging: None,
+            house: dest_house,
+            last_days_played: initial_days_played,
+            active_trip: Some(trip.clone()),
+            is_destination_edit: false,
+        }));
+        self.lot_generation = self.lot_generation.wrapping_add(1);
+        self.dialog = None;
+        self.close_photo_album();
+        self.close_travel_dialog();
+        self.save_manager.close();
+        self.save_manager_snapshot = None;
+        self.save_manager_target_lot = None;
+        self.note = None;
+        self.stop_load_audio(next_music);
+        Ok(trip)
+    }
+
+    /// Aborts a crash-interrupted travel trip for `home_house` via
+    /// [`vm_travel::abort_active_trip`], restoring the frozen home lot bytes in
+    /// REDB and refreshing the neighborhood view.
+    pub fn abort_active_trip(&mut self, home_house: u32) -> Result<u32, String> {
+        let restored = vm_travel::abort_active_trip(
+            &self.install_root,
+            &self.store,
+            &self.neighborhood_id,
+            home_house,
+            &self.answers,
+            self.frames.clone(),
+        )
+        .map_err(|e| e.to_string())?;
+        self.refresh_from_store()?;
+        Ok(restored.report.home_house)
+    }
+}
+
+fn loading_kind_for_house(house: u32) -> LoadingKind {
+    match house {
+        21..=30 => LoadingKind::Downtown,
+        40..=48 => LoadingKind::Vacation { alternate: false },
+        81..=89 => LoadingKind::StudioTown { fan_bus: false },
+        90..=98 => LoadingKind::MagicTown { via_hole: false },
+        _ => LoadingKind::Lot,
+    }
+}
+
+fn album_hydration_window(total: usize, focus_idx: usize) -> (usize, usize) {
+    if total <= ALBUM_IMAGE_WINDOW {
+        return (0, total);
+    }
+    let half = ALBUM_IMAGE_WINDOW / 2;
+    let start = focus_idx
+        .saturating_sub(half)
+        .min(total - ALBUM_IMAGE_WINDOW);
+    (start, start + ALBUM_IMAGE_WINDOW)
+}
+
+fn downscale_album_thumbnail(src: &Image, max_w: u32, max_h: u32) -> Image {
+    if src.width == 0 || src.height == 0 || (src.width <= max_w && src.height <= max_h) {
+        return src.clone();
+    }
+    let scale = (max_w as f32 / src.width as f32).min(max_h as f32 / src.height as f32);
+    let dst_w = ((src.width as f32 * scale).round() as u32).clamp(1, max_w);
+    let dst_h = ((src.height as f32 * scale).round() as u32).clamp(1, max_h);
+    let mut rgba = vec![0u8; (dst_w as usize) * (dst_h as usize) * 4];
+    for dy in 0..dst_h {
+        let sy = ((u64::from(dy) * u64::from(src.height)) / u64::from(dst_h))
+            .min(u64::from(src.height.saturating_sub(1))) as usize;
+        for dx in 0..dst_w {
+            let sx = ((u64::from(dx) * u64::from(src.width)) / u64::from(dst_w))
+                .min(u64::from(src.width.saturating_sub(1))) as usize;
+            let s = (sy * src.width as usize + sx) * 4;
+            let d = (dy as usize * dst_w as usize + dx as usize) * 4;
+            rgba[d..d + 4].copy_from_slice(&src.rgba[s..s + 4]);
+        }
+    }
+    Image {
+        width: dst_w,
+        height: dst_h,
+        rgba,
+    }
+}
+
+fn vacation_lot_matches_lodging(lot: &MapLot, lodging: sims_ui::travel::VacationLodging) -> bool {
+    let has_lodging_bit = (lot.filter_mask & (CommunityFilter::Lodging as u16)) != 0;
+    let by_zone = match lodging {
+        sims_ui::travel::VacationLodging::Hotel => matches!(lot.id, 40 | 42 | 46),
+        sims_ui::travel::VacationLodging::CabinRental => matches!(lot.id, 44 | 48),
+        sims_ui::travel::VacationLodging::Campground => matches!(lot.id, 41 | 43 | 45 | 47),
+    };
+    by_zone && (has_lodging_bit || (40..=48).contains(&lot.id))
+}
+
+fn load_persisted_custom_thumbs(
+    store: &NeighborhoodStore,
+    neighborhood_id: &str,
+) -> BTreeMap<(String, u16), CustomThumb> {
+    let mut out = BTreeMap::new();
+    if let Ok(stored) = store.load_lot_thumbnails(neighborhood_id) {
+        for (house, thumb) in stored {
+            if let Ok(lot_id) = u16::try_from(house) {
+                let normal = from_stored_thumb_surface(&thumb.normal);
+                if normal.is_valid() {
+                    out.insert(
+                        (neighborhood_id.to_owned(), lot_id),
+                        CustomThumb {
+                            normal,
+                            roofs_off: thumb.roofs_off.as_ref().map(from_stored_thumb_surface),
+                        },
+                    );
+                }
+            }
+        }
+    }
+    out
+}
+
+fn to_stored_thumb_surface(s: &Surface565) -> ThumbnailSurface565 {
+    ThumbnailSurface565 {
+        width: s.width as u32,
+        height: s.height as u32,
+        pixels: s.pixels.clone(),
+    }
+}
+
+fn from_stored_thumb_surface(s: &ThumbnailSurface565) -> Surface565 {
+    Surface565 {
+        width: s.width as usize,
+        height: s.height as usize,
+        pixels: s.pixels.clone(),
+    }
+}
+
+fn destination_for_kind(kind: NeighborhoodKind) -> Option<Destination> {
+    match kind {
+        NeighborhoodKind::Downtown => Some(Destination::Downtown),
+        NeighborhoodKind::Vacation => Some(Destination::VacationIsland),
+        NeighborhoodKind::StudioTown => Some(Destination::StudioTown),
+        NeighborhoodKind::MagicTown => Some(Destination::MagicTown),
+        NeighborhoodKind::Unleashed | NeighborhoodKind::Classic => None,
+    }
+}
+
+fn kind_for_destination(dest: Destination) -> NeighborhoodKind {
+    match dest {
+        Destination::Downtown => NeighborhoodKind::Downtown,
+        Destination::VacationIsland => NeighborhoodKind::Vacation,
+        Destination::StudioTown => NeighborhoodKind::StudioTown,
+        Destination::MagicTown => NeighborhoodKind::MagicTown,
+    }
+}
+
+fn map_kind_for_house(install: &Install, slot: u8, house: u32) -> NeighborhoodKind {
+    match house {
+        21..=30 => NeighborhoodKind::Downtown,
+        40..=48 => NeighborhoodKind::Vacation,
+        81..=89 => NeighborhoodKind::StudioTown,
+        90..=98 => NeighborhoodKind::MagicTown,
+        _ => default_map_kind(install, slot),
+    }
+}
+
+fn ui_destination_for_vm(dest: TravelDestination) -> Destination {
+    match dest {
+        TravelDestination::Downtown => Destination::Downtown,
+        TravelDestination::VacationIsland => Destination::VacationIsland,
+        TravelDestination::StudioTown => Destination::StudioTown,
+        TravelDestination::MagicTown => Destination::MagicTown,
+        TravelDestination::OldTown => Destination::Downtown,
+    }
+}
+
+fn ui_transport_for_vm(transport: VmTravelTransport) -> UiTravelTransport {
+    match transport {
+        VmTravelTransport::DowntownCab => UiTravelTransport::Taxi,
+        VmTravelTransport::VacationWagon
+        | VmTravelTransport::OldTownTrolley
+        | VmTravelTransport::StudioShuttle
+        | VmTravelTransport::StudioLimo => UiTravelTransport::Shuttle,
+        VmTravelTransport::MagicHole | VmTravelTransport::MagicBlimp => {
+            UiTravelTransport::MagicHole
+        }
+    }
+}
+
+fn community_filter_for_lot_filter(filter: LotFilter) -> CommunityFilter {
+    match filter {
+        LotFilter::Lodging => CommunityFilter::Lodging,
+        LotFilter::Food => CommunityFilter::Food,
+        LotFilter::Gardening => CommunityFilter::Gardening,
+        LotFilter::Shopping => CommunityFilter::Shopping,
+        LotFilter::DogCat => CommunityFilter::Pets,
+        LotFilter::SmallAnimal => CommunityFilter::SmallAnimals,
+        LotFilter::Recreation => CommunityFilter::Park,
+        LotFilter::Spa => CommunityFilter::Spa,
+        LotFilter::Movie => CommunityFilter::Movie,
+        LotFilter::Model => CommunityFilter::Model,
+        LotFilter::Music => CommunityFilter::Music,
+        LotFilter::Magic => CommunityFilter::Magic,
+        LotFilter::Rides => CommunityFilter::Rides,
+    }
+}
+
+/// Converts a live lot [`Canvas`] into a bounded [`AlbumImage`] (clamped to
+/// `<= 640×480` so snapshots stay crisp and compact inside REDB).
+fn capture_canvas_to_album_image(canvas: &Canvas) -> Result<AlbumImage, String> {
+    if canvas.width == 0 || canvas.height == 0 {
+        return Err("lot framebuffer is empty".into());
+    }
+    let max_w = 640usize;
+    let max_h = 480usize;
+    let scale = (max_w as f32 / canvas.width as f32)
+        .min(max_h as f32 / canvas.height as f32)
+        .min(1.0);
+    let tw = ((canvas.width as f32 * scale).round() as usize).clamp(1, max_w);
+    let th = ((canvas.height as f32 * scale).round() as usize).clamp(1, max_h);
+    let mut rgba = Vec::with_capacity(tw * th * 4);
+    for y in 0..th {
+        let sy = (y * canvas.height / th).min(canvas.height - 1);
+        for x in 0..tw {
+            let sx = (x * canvas.width / tw).min(canvas.width - 1);
+            let [r, g, b] = canvas.color[sy * canvas.width + sx];
+            rgba.extend_from_slice(&[r, g, b, 255]);
+        }
+    }
+    AlbumImage::from_rgba(tw as u32, th as u32, &rgba).map_err(|e| e.to_string())
 }
 
 /// Saves a lot booted from an ephemeral reconciled staging store through the
@@ -3754,14 +6350,14 @@ fn sync_map_with_store(
         {
             lot.filter_mask = mask;
         }
-        if let Some(thumb) = custom_thumbs.get(&(neighborhood_id.to_owned(), lot.id)) {
-            apply_custom_thumb(lot, thumb);
-        } else if let Some(meta) = lot_meta.get(&lot.id)
+        if let Some(meta) = lot_meta.get(&lot.id)
             && meta.from_saved_lot
             && !meta.has_house
         {
             lot.normal = vacant_lot_thumbnail(lot.normal.width, lot.normal.height);
             lot.roofs_off = None;
+        } else if let Some(thumb) = custom_thumbs.get(&(neighborhood_id.to_owned(), lot.id)) {
+            apply_custom_thumb(lot, thumb);
         }
     }
 }

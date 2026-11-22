@@ -51,13 +51,15 @@
 use sims_audio::SoundEvent;
 use sims_audio::ambience::{AmbienceCatalog, AmbienceMixer, AmbienceZone, ZoomLevel};
 use sims_audio::files::SoundFiles;
+use sims_audio::levels;
 use sims_audio::module::Module;
 use sims_audio::music::{ALL_EXPANSIONS, ModeCatalog, ModeMusicPlayer, MusicMode};
 use sims_audio::placement::Projection;
-use sims_audio::player::Player;
+use sims_audio::player::{Player, RATE, VOLUME_STEPS};
 use sims_audio::radio::{BuiltinStation, RadioCatalog, RadioPlayer, SpatialAttenuation, StationId};
 use sims_audio::sources::{FIELDS, NO_ROOM, Snapshot};
 use sims_audio::stations::StationLists;
+use sims_audio::voices::{VoiceAgeGender, VoiceCatalog, VoicePitch, VoiceStream};
 use sims_core::F32;
 use sims_render::camera::Camera;
 use sims_sim::World;
@@ -708,6 +710,9 @@ impl Feed {
         if !sounds.is_empty() {
             send(Input::Events(sounds.into_iter().map(event).collect()));
         }
+        for voice_input in game.take_voice_inputs() {
+            send(voice_input);
+        }
         let now = (game.hour(), game.pace.speed, game.ambience_view());
         if self.heard != Some(now) {
             send(Input::View(now.2));
@@ -782,6 +787,9 @@ impl Feed {
         if !sounds.is_empty() {
             send(Input::Events(sounds.into_iter().map(event).collect()));
         }
+        for voice_input in game.take_voice_inputs() {
+            send(voice_input);
+        }
         let now = (game.hour(), game.pace.speed, game.ambience_view());
         if self.heard != Some(now) {
             send(Input::View(now.2));
@@ -845,6 +853,24 @@ impl Shot {
     }
 }
 
+/// Maps a Sim's person data words (`AGE` word 58, `GENDER` word 65, `FLAGS`
+/// word 74) to its [`VoiceAgeGender`] bucket (`0x570e61` voice classification).
+pub fn voice_for_person(age: i16, gender: i16, flags: i16) -> VoiceAgeGender {
+    if flags & 0b0100 != 0 {
+        VoiceAgeGender::Dog
+    } else if flags & 0b1000 != 0 {
+        VoiceAgeGender::Cat
+    } else if age < 3 {
+        VoiceAgeGender::Baby
+    } else if age < 12 {
+        VoiceAgeGender::Child
+    } else if gender != 0 {
+        VoiceAgeGender::AdultFemale
+    } else {
+        VoiceAgeGender::AdultMale
+    }
+}
+
 /// What the mixer is told between blocks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Input {
@@ -894,16 +920,40 @@ pub enum Input {
     },
     /// Stops all active stereo/TV emitters.
     RadioStopAll,
+    /// Plays a Simlish voice clip from [`VoiceCatalog`] (for Sim speech/reactions
+    /// or Create-a-Sim voice previews).
+    PlayVoice {
+        voice: VoiceAgeGender,
+        category: Option<String>,
+        pitch: VoicePitch,
+        seed: u64,
+        /// Optional lot object ID for spatial placement & pause gating (`None`
+        /// for UI / Create-a-Family previews).
+        object: Option<u32>,
+    },
+    /// Stops all active Simlish voice streams immediately.
+    StopVoices,
+}
+
+/// Maximum concurrent [`VoiceStream`] instances mixed simultaneously.
+const MAX_ACTIVE_VOICES: usize = 16;
+
+struct ActiveVoice {
+    stream: VoiceStream,
+    object: Option<u32>,
 }
 
 /// The sound player with every module, station and ambient score of an
 /// install, paired with streaming Neighborhood/Buy/Build/expansion mode music,
-/// in-lot stereo/TV radio streaming, and environmental lot ambience beds.
+/// in-lot stereo/TV radio streaming, environmental lot ambience beds, and
+/// Simlish voice bank playback.
 pub struct Mixer {
     player: Player<SoundFiles>,
     music: ModeMusicPlayer<SoundFiles>,
     radio: RadioPlayer<SoundFiles>,
     ambience: AmbienceMixer<SoundFiles>,
+    voices: VoiceCatalog,
+    active_voices: Vec<ActiveVoice>,
     hour: u32,
     view: i32,
     sources: Snapshot,
@@ -929,6 +979,7 @@ impl Mixer {
         let radio = RadioPlayer::new(radio_catalog, files.clone(), SEED ^ 0x5241_4449);
         let ambience_catalog = AmbienceCatalog::from_sound_files(&files);
         let ambience = AmbienceMixer::new(ambience_catalog, files.clone());
+        let voices = VoiceCatalog::from_sound_files(files.clone());
         let mut player = Player::new(modules, files.clone(), SEED);
         player.add_stations(&lists);
         player.add_scores(&files);
@@ -938,6 +989,8 @@ impl Mixer {
             music,
             radio,
             ambience,
+            voices,
+            active_voices: Vec::new(),
             hour: u32::MAX,
             view: 0,
             sources: Snapshot::default(),
@@ -946,6 +999,80 @@ impl Mixer {
             ambience_active: false,
             reported: BTreeSet::new(),
         })
+    }
+
+    fn start_voice_stream(&mut self, stream: VoiceStream, object: Option<u32>) {
+        if let Some(obj) = object {
+            self.active_voices.retain(|v| v.object != Some(obj));
+        } else {
+            // Keep only one UI / CAF preview voice active at once so rapid
+            // appearance clicks stay crisp rather than overlapping.
+            self.active_voices.retain(|v| v.object.is_some());
+        }
+        if self.active_voices.len() >= MAX_ACTIVE_VOICES {
+            self.active_voices.remove(0);
+        }
+        self.active_voices.push(ActiveVoice { stream, object });
+    }
+
+    fn mix_active_voices(&mut self, out: &mut [i16]) {
+        if !self.active || self.active_voices.is_empty() || out.is_empty() {
+            return;
+        }
+        let vox_step = self.player.vox_volume_step();
+        let frames = out.len() / 2;
+        if frames == 0 {
+            return;
+        }
+        let mut scratch = Vec::new();
+        for voice in &mut self.active_voices {
+            if voice.object.is_some() && self.paused_by_game {
+                continue;
+            }
+            let ch = usize::from(voice.stream.channels());
+            if ch == 0 {
+                continue;
+            }
+            scratch.resize(frames * ch, 0i16);
+            let read = voice.stream.read_frames(&mut scratch);
+            if read == 0 || vox_step == 0 {
+                continue;
+            }
+            let spatial = voice.object.map(|obj| {
+                let key = obj as i32;
+                self.sources
+                    .screen
+                    .get(&key)
+                    .and_then(|proj| {
+                        let level = self.sources.positions.get(&key).map_or(1, |pos| pos[2]);
+                        SpatialAttenuation::from_projection(20, level, proj).ok()
+                    })
+                    .unwrap_or(SpatialAttenuation::FULL)
+            });
+            let [left_gain, right_gain] = voice_stereo_gains(vox_step, spatial);
+            if left_gain <= 0.0 && right_gain <= 0.0 {
+                continue;
+            }
+            for i in 0..read {
+                let (sl, sr) = if ch == 1 {
+                    let s = f32::from(scratch[i]);
+                    (s, s)
+                } else {
+                    (f32::from(scratch[i * ch]), f32::from(scratch[i * ch + 1]))
+                };
+                let dl = (f32::from(out[i * 2]) + sl * left_gain)
+                    .round()
+                    .clamp(f32::from(i16::MIN), f32::from(i16::MAX))
+                    as i16;
+                let dr = (f32::from(out[i * 2 + 1]) + sr * right_gain)
+                    .round()
+                    .clamp(f32::from(i16::MIN), f32::from(i16::MAX))
+                    as i16;
+                out[i * 2] = dl;
+                out[i * 2 + 1] = dr;
+            }
+        }
+        self.active_voices.retain(|v| !v.stream.is_finished());
     }
 
     fn sync_stream_pause(&mut self) {
@@ -994,6 +1121,7 @@ impl Mixer {
                             self.music.stop();
                             self.radio.stop_all();
                             self.ambience.stop();
+                            self.active_voices.clear();
                             self.ambience_active = false;
                             self.paused_by_game = false;
                             self.sync_stream_pause();
@@ -1008,6 +1136,7 @@ impl Mixer {
                         }
                         SoundEvent::StopObject { object } => {
                             self.radio.stop_emitter(*object);
+                            self.active_voices.retain(|v| v.object != Some(*object));
                         }
                         SoundEvent::Play { object, name } => {
                             if is_radio_stop_event(name) {
@@ -1020,6 +1149,13 @@ impl Mixer {
                             } else if name.eq_ignore_ascii_case("radio_next_song")
                                 && self.radio.skip_track(*object)
                             {
+                                continue;
+                            } else if let Some(clip) = self.voices.resolve_path(name)
+                                && let Ok(stream) =
+                                    self.voices.open_stream(clip, VoicePitch::NATIVE, RATE)
+                            {
+                                let obj = (*object != 0).then_some(*object);
+                                self.start_voice_stream(stream, obj);
                                 continue;
                             }
                         }
@@ -1099,6 +1235,26 @@ impl Mixer {
             Input::RadioStopAll => {
                 self.radio.stop_all();
             }
+            Input::PlayVoice {
+                voice,
+                category,
+                pitch,
+                seed,
+                object,
+            } => {
+                let clip = self
+                    .voices
+                    .pick(voice, category.as_deref(), seed)
+                    .or_else(|| self.voices.pick(voice, None, seed));
+                if let Some(clip) = clip
+                    && let Ok(stream) = self.voices.open_stream(clip, pitch, RATE)
+                {
+                    self.start_voice_stream(stream, object);
+                }
+            }
+            Input::StopVoices => {
+                self.active_voices.clear();
+            }
         }
     }
 
@@ -1131,16 +1287,27 @@ impl Mixer {
         &self.ambience
     }
 
+    /// Indexed Simlish voice bank catalog.
+    pub fn voices(&self) -> &VoiceCatalog {
+        &self.voices
+    }
+
+    /// Number of currently playing Simlish [`VoiceStream`] instances.
+    pub fn active_voice_count(&self) -> usize {
+        self.active_voices.len()
+    }
+
     /// Renders `frames` stereo frames at [`sims_audio::player::RATE`],
     /// moving the ambience's cursor to the latest hour and view first, then
-    /// mixing streaming mode music, stereo/TV radio, and environmental ambience
-    /// into the output buffer.
+    /// mixing streaming mode music, stereo/TV radio, environmental ambience,
+    /// and Simlish voice playback into the output buffer.
     pub fn render(&mut self, frames: usize) -> Vec<i16> {
         self.player.set_ambience_view(self.view, self.hour);
         let mut out = self.player.render_stereo(frames, &self.sources);
         self.music.mix_into_stereo(&mut out);
         self.radio.mix_into_stereo(&mut out);
         self.ambience.mix_into_stereo(&mut out);
+        self.mix_active_voices(&mut out);
         out
     }
 
@@ -1168,6 +1335,27 @@ impl Mixer {
         }
         out
     }
+}
+
+/// Converts a 1.91 `vox_volume_step` (`0..=10`) and optional [`SpatialAttenuation`]
+/// (`volume: 0..=1024`, `pan: 0..=1024` with `512` at center) into linear `[left, right]`
+/// stereo gains using the exact same [`sims_audio::levels`] conversion as [`RadioPlayer`].
+pub fn voice_stereo_gains(vox_step: u8, spatial: Option<SpatialAttenuation>) -> [f32; 2] {
+    let vox_vol = VOLUME_STEPS[usize::from(vox_step.min(10))];
+    if vox_vol <= 0 {
+        return [0.0, 0.0];
+    }
+    let spatial = spatial.unwrap_or(SpatialAttenuation::FULL);
+    if spatial.volume <= 0 {
+        return [0.0, 0.0];
+    }
+    let eff_vol = (i64::from(spatial.volume) * i64::from(vox_vol)) / 1024;
+    if eff_vol <= 0 {
+        return [0.0, 0.0];
+    }
+    let att = levels::attenuation(eff_vol, 1024);
+    let [gl, gr] = levels::gains(att, levels::pan(spatial.pan));
+    [gl as f32 / 65536.0, gr as f32 / 65536.0]
 }
 
 #[cfg(test)]
@@ -1328,5 +1516,56 @@ mod tests {
     #[test]
     fn feed_starts_focused_like_app_constructor() {
         assert!(Feed::default().focused());
+    }
+
+    #[test]
+    fn voice_stereo_gains_pan_left_center_and_right() {
+        assert_eq!(
+            voice_stereo_gains(0, Some(SpatialAttenuation::FULL)),
+            [0.0, 0.0]
+        );
+
+        let [cl, cr] = voice_stereo_gains(
+            10,
+            Some(SpatialAttenuation {
+                volume: 1024,
+                pan: 512,
+            }),
+        );
+        assert!(
+            cl > 0.9 && (cl - cr).abs() < 1e-4,
+            "center pan must be balanced: [{cl}, {cr}]"
+        );
+
+        let [ll, lr] = voice_stereo_gains(
+            10,
+            Some(SpatialAttenuation {
+                volume: 1024,
+                pan: 0,
+            }),
+        );
+        assert!(
+            ll > 0.9 && lr < ll * 0.1,
+            "left pan must favor left: [{ll}, {lr}]"
+        );
+
+        let [rl, rr] = voice_stereo_gains(
+            10,
+            Some(SpatialAttenuation {
+                volume: 1024,
+                pan: 1024,
+            }),
+        );
+        assert!(
+            rr > 0.9 && rl < rr * 0.1,
+            "right pan must favor right: [{rl}, {rr}]"
+        );
+
+        let [ul, ur] = voice_stereo_gains(10, None);
+        assert_eq!(
+            [ul, ur],
+            [cl, cr],
+            "UI/CAF preview must be centered at full volume"
+        );
     }
 }

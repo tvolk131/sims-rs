@@ -29,7 +29,21 @@ fn find_lot_hit_point(shell: &NeighborhoodShell, lot_id: u16) -> Option<[i32; 2]
     let viewport = [800u32, 600u32];
     let lot = shell.map().lot(lot_id)?;
     let [left, top, right, bottom] = shell.map().lot_screen_rect(lot, viewport);
-    let y_start = top.max(sims_ui::neighborhood::BAR_HEIGHT);
+    let chrome_bottom = match shell.neighborhood_kind() {
+        sims_render::neighborhood::NeighborhoodKind::Downtown
+        | sims_render::neighborhood::NeighborhoodKind::Vacation
+        | sims_render::neighborhood::NeighborhoodKind::StudioTown
+        | sims_render::neighborhood::NeighborhoodKind::MagicTown => {
+            let layout = sims_ui::travel::TravelLayout::compute(
+                viewport[0],
+                viewport[1],
+                shell.travel_state(),
+            );
+            layout.bar_rect.height + layout.filter_strip_rect.height
+        }
+        _ => sims_ui::neighborhood::BAR_HEIGHT,
+    };
+    let y_start = top.max(chrome_bottom);
     for y in (y_start..bottom.min(600)).step_by(2) {
         for x in (left.max(0)..right.min(800)).step_by(2) {
             if shell.map().hit_test(viewport, [x, y]) == Some(lot_id) {

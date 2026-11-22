@@ -3,6 +3,7 @@
 //! turntable preview + 6-portrait BMP rasterizer), and [`sims_vm::caf`]
 //! (atomic REDB household commit into the Family Bin).
 
+use sims_audio::voices::{VoiceAgeGender, VoicePitch};
 use sims_content::Install;
 use sims_content::ui_graphics::{US_ENGLISH, UiGraphics};
 use sims_core::CrtRng;
@@ -25,6 +26,15 @@ use sims_vm::caf::{
     PortraitBitmaps, SimSpec,
 };
 use std::path::{Path, PathBuf};
+
+/// Simlish voice preview request emitted when creating or editing a Sim in CAF.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CafVoicePreview {
+    pub voice: VoiceAgeGender,
+    pub category: Option<String>,
+    pub pitch: VoicePitch,
+    pub seed: u64,
+}
 
 /// Outcome returned by [`CafSession`] input methods to [`crate::neighborhood::NeighborhoodShell`].
 #[derive(Debug, Clone)]
@@ -66,6 +76,8 @@ pub struct CafSession {
     manual_yaw: bool,
     preview_dirty: bool,
     vm_ctx: Option<CafContext>,
+    pending_voice_previews: Vec<CafVoicePreview>,
+    voice_seed: u64,
     note: Option<String>,
 }
 
@@ -92,8 +104,56 @@ impl CafSession {
             manual_yaw: false,
             preview_dirty: true,
             vm_ctx: None,
+            pending_voice_previews: Vec::new(),
+            voice_seed: 1,
             note: None,
         })
+    }
+
+    /// Drains queued Simlish voice previews triggered by Sim creation/editing.
+    pub fn take_voice_previews(&mut self) -> Vec<CafVoicePreview> {
+        std::mem::take(&mut self.pending_voice_previews)
+    }
+
+    /// Explicitly triggers a Simlish voice preview for the currently edited
+    /// (or first roster) Sim.
+    pub fn preview_voice(&mut self) -> Option<CafVoicePreview> {
+        let appearance = self
+            .controller
+            .editing_sim()
+            .map(|s| s.appearance.clone())
+            .or_else(|| {
+                self.controller
+                    .family()
+                    .members
+                    .first()
+                    .map(|m| m.appearance.clone())
+            })?;
+        let preview = self.make_voice_preview(&appearance, Some("converse"));
+        self.pending_voice_previews.push(preview.clone());
+        Some(preview)
+    }
+
+    fn make_voice_preview(
+        &mut self,
+        appearance: &SimAppearance,
+        category: Option<&str>,
+    ) -> CafVoicePreview {
+        let voice = match (appearance.age, appearance.gender) {
+            (ui_caf::Age::Child, _) => VoiceAgeGender::Child,
+            (ui_caf::Age::Adult, ui_caf::Gender::Female) => VoiceAgeGender::AdultFemale,
+            (ui_caf::Age::Adult, ui_caf::Gender::Male) => VoiceAgeGender::AdultMale,
+        };
+        let semitones = ((appearance.head_index % 5) as f32 - 2.0) * 0.5;
+        let pitch = VoicePitch::from_semitones(semitones);
+        let seed = self.voice_seed;
+        self.voice_seed = self.voice_seed.wrapping_add(1).max(1);
+        CafVoicePreview {
+            voice,
+            category: category.map(str::to_owned),
+            pitch,
+            seed,
+        }
     }
 
     pub fn controller(&self) -> &CafController {
@@ -256,11 +316,19 @@ impl CafSession {
                 self.manual_yaw = false;
                 self.preview_dirty = true;
                 self.sync_active_sim_preview();
+                if let Some(appearance) =
+                    self.controller.editing_sim().map(|s| s.appearance.clone())
+                {
+                    let preview = self.make_voice_preview(&appearance, Some("converse"));
+                    self.pending_voice_previews.push(preview);
+                }
                 CafOutcome::redraw()
             }
-            Some(CafCommand::AppearanceChanged(_)) => {
+            Some(CafCommand::AppearanceChanged(appearance)) => {
                 self.preview_dirty = true;
                 self.sync_active_sim_preview();
+                let preview = self.make_voice_preview(&appearance, Some("converse"));
+                self.pending_voice_previews.push(preview);
                 CafOutcome::redraw()
             }
             Some(CafCommand::RotatePreview(_)) => {
@@ -270,10 +338,12 @@ impl CafSession {
                 CafOutcome::redraw()
             }
             Some(CafCommand::SimSaved { index, .. }) => {
-                if let Some(member) = self.controller.family().members.get(index).cloned()
-                    && let Some(portrait) = self.render_roster_portrait(&member.appearance)
-                {
-                    self.controller.set_member_portrait(index, Some(portrait));
+                if let Some(member) = self.controller.family().members.get(index).cloned() {
+                    if let Some(portrait) = self.render_roster_portrait(&member.appearance) {
+                        self.controller.set_member_portrait(index, Some(portrait));
+                    }
+                    let preview = self.make_voice_preview(&member.appearance, Some("laugh"));
+                    self.pending_voice_previews.push(preview);
                 }
                 self.active_body = None;
                 self.body_key = None;
