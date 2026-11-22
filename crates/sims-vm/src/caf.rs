@@ -29,13 +29,14 @@
 //!   `"money for new family"` (default `$20,000`), `flags = 0x18`
 //!   ([`CAF_INITIAL_FAMILY_FLAGS`]), 1..=8 member GUIDs with at least one adult
 //!   human Sim, and 16-byte zeroed v9 tail (`secondary_house` + 6 magic words).
-//!   Persisted into REDB [`NeighborhoodStore`] via a serialized three-phase
-//!   tombstone-shielded commit so concurrent CAF commits never overwrite each
-//!   other's character files, mid-flight lot loads never register staged
-//!   characters as stray neighbors, and the household publishes atomically so
-//!   it immediately appears in `StoredNeighborhood::family_bin()`, passes
-//!   [`crate::lifecycle::move_in`], and boots cleanly into any vacant
-//!   residential lot.
+//!   Persisted into REDB [`NeighborhoodStore`] via a single-transaction atomic
+//!   checked commit (`NeighborhoodStore::save_characters_and_neighborhood_checked`)
+//!   that verifies `(instance_id, revision)` before writing all `User%05d.iff`
+//!   character blobs and the updated `StoredNeighborhood` together — leaving
+//!   zero partial writes on concurrent revision conflicts or `import_directory`
+//!   replaces — so the household immediately appears in
+//!   `StoredNeighborhood::family_bin()`, passes [`crate::lifecycle::move_in`],
+//!   and boots cleanly into any vacant residential lot.
 //! - **Delete Family (`delete_bin_family`)**: removes an un-housed playable
 //!   Family Bin household, vacates its members' `NBRS` slots, scrubs reciprocal
 //!   relationships and inventories, bumps `deletion_epoch`, and records
@@ -1720,80 +1721,48 @@ fn checked_save_neighborhood(
     }
 }
 
-/// Persists synthesized character IFFs and publishes `final_stored` using a
-/// three-phase tombstone-shielded protocol (held under [`CAF_COMMIT_LOCK`]):
+/// Persists synthesized character IFFs and `final_stored` atomically inside a
+/// single REDB write transaction via
+/// [`NeighborhoodStore::save_characters_and_neighborhood_checked`].
 ///
-/// 1. **Phase 1 (Checked tombstone reservation):** Atomically checks
-///    `(origin_instance_id, origin_revision)` and inserts every new member's
-///    GUID into `deleted_characters` BEFORE writing any character file. If the
-///    neighborhood changed concurrently, returns `StaleNeighborhood` /
-///    `NeighborhoodMismatch` with zero files written. If `expected_revision`
-///    would roll over `u64::MAX` during Phase 2, advances the checked
-///    reservation across the rollover first so Phase 2 never crosses `u64::MAX`
-///    without an authoritative `instance_id`.
-/// 2. **Phase 2 (Staged character IFF writes):** Writes each `User%05d.iff`
-///    into REDB. Because every staged GUID is already suppressed in
-///    `deleted_characters`, any concurrent `load_lot_snapshot` / `enter_lot`
-///    (or recovery after a mid-write crash) ignores every staged/orphaned file
-///    and never registers it in `NBRS` (`World::read_neighbors`).
-/// 3. **Phase 3 (Atomic publication):** Atomically checks the post-Phase-2
-///    `(expected_instance, expected_revision)` and writes `final_stored`
-///    (un-tombstoning the new GUIDs and publishing `FAMI` + `NBRS` together).
-///
-/// Note: Because `NeighborhoodStore::save_character_file` is currently an
-/// unchecked single-file write in `sims-sim`, callers must not race
-/// `NeighborhoodStore::import_directory` (replacing the same neighborhood ID)
-/// against an in-flight CAF commit until a follow-up `sims-sim` API commits
-/// character files and neighborhood metadata inside one checked write
-/// transaction.
-fn persist_household_staged(
+/// Checking `(origin_neighborhood.instance_id, origin_neighborhood.revision)`
+/// inside the same write transaction that writes all `User%05d.iff` blobs and
+/// the updated `StoredNeighborhood` record eliminates any partial-write window
+/// against concurrent `import_directory`, `delete_neighborhood`, lot saves, or
+/// crashes: on conflict, zero character files and zero neighborhood rows are
+/// written.
+fn persist_household_atomic(
     store: &NeighborhoodStore,
     neighborhood_id: &str,
     origin_neighborhood: &StoredNeighborhood,
     final_stored: &StoredNeighborhood,
     created_members: &[CreatedSim],
 ) -> Result<u64, CafError> {
-    let mut reservation = origin_neighborhood.clone();
-    for member in created_members {
-        reservation.deleted_characters.insert(member.guid);
-    }
-    let (mut expected_instance, mut expected_revision) = checked_save_neighborhood(
-        store,
+    let files = created_members
+        .iter()
+        .map(|member| (member.file_name.as_str(), member.iff_bytes.as_slice()));
+    match store.save_characters_and_neighborhood_checked(
         neighborhood_id,
         origin_neighborhood.instance_id,
         origin_neighborhood.revision,
-        &reservation,
-    )?;
-    // Guarantee `expected_revision + created_members.len()` cannot cross
-    // `u64::MAX` during Phase 2's per-file writes without checked rotation.
-    while expected_revision
-        .checked_add(created_members.len() as u64)
-        .is_none()
-    {
-        (expected_instance, expected_revision) = checked_save_neighborhood(
-            store,
-            neighborhood_id,
-            expected_instance,
-            expected_revision,
-            &reservation,
-        )?;
-    }
-
-    for member in created_members {
-        store.save_character_file(neighborhood_id, &member.file_name, &member.iff_bytes)?;
-        expected_revision = expected_revision
-            .checked_add(1)
-            .expect("rollover cleared before Phase 2");
-    }
-
-    let (_, committed_revision) = checked_save_neighborhood(
-        store,
-        neighborhood_id,
-        expected_instance,
-        expected_revision,
+        files,
         final_stored,
-    )?;
-    Ok(committed_revision)
+    )? {
+        Ok((_, committed_revision)) => Ok(committed_revision),
+        Err(CheckedCommitError::InstanceMismatch { expected, current }) => {
+            Err(CafError::NeighborhoodMismatch {
+                expected: format!("{neighborhood_id}#{expected:032x}"),
+                actual: format!("{neighborhood_id}#{current:032x}"),
+            })
+        }
+        Err(CheckedCommitError::RevisionMismatch { expected, current }) => {
+            Err(CafError::StaleNeighborhood {
+                neighborhood: neighborhood_id.to_owned(),
+                expected_revision: expected,
+                current_revision: current,
+            })
+        }
+    }
 }
 
 /// Like [`commit_family`], reusing a pre-loaded [`CafContext`] (suitable for
@@ -1805,6 +1774,17 @@ pub fn commit_family_with_context(
     spec: &FamilySpec,
     rng: &mut CrtRng,
 ) -> Result<CreatedHousehold, CafError> {
+    commit_family_with_context_hook(ctx, store, neighborhood_id, spec, rng, || {})
+}
+
+fn commit_family_with_context_hook(
+    ctx: &CafContext,
+    store: &NeighborhoodStore,
+    neighborhood_id: &str,
+    spec: &FamilySpec,
+    rng: &mut CrtRng,
+    on_after_snapshot: impl FnOnce(),
+) -> Result<CreatedHousehold, CafError> {
     spec.validate()?;
 
     let _guard = CAF_COMMIT_LOCK
@@ -1814,6 +1794,7 @@ pub fn commit_family_with_context(
     let snapshot = store
         .load_lot_snapshot(neighborhood_id, 0)?
         .ok_or_else(|| CafError::NeighborhoodNotFound(neighborhood_id.to_owned()))?;
+    on_after_snapshot();
     let origin_neighborhood = snapshot.neighborhood.clone();
     let mut stored = snapshot.neighborhood;
     let origin_revision = stored.revision;
@@ -1887,7 +1868,7 @@ pub fn commit_family_with_context(
     };
     stored.families.insert(family_id, family.clone());
 
-    let committed_revision = persist_household_staged(
+    let committed_revision = persist_household_atomic(
         store,
         neighborhood_id,
         &origin_neighborhood,
@@ -2009,6 +1990,9 @@ pub fn delete_bin_family(
         }
     }
 
+    // `save_neighborhood_checked` atomically purges the removed family's photo
+    // album and advances its household lifetime epoch inside the same REDB
+    // write transaction.
     let (_, committed_revision) = checked_save_neighborhood(
         store,
         neighborhood_id,
@@ -2856,7 +2840,7 @@ pub fn import_family_fam(
     };
     stored.families.insert(family_id, family.clone());
 
-    let committed_revision = persist_household_staged(
+    let committed_revision = persist_household_atomic(
         store,
         neighborhood_id,
         &origin_neighborhood,
@@ -3486,5 +3470,193 @@ mod tests {
         let ctss =
             StringTable::parse(parsed.members.get(&1).unwrap().ctss.as_deref().unwrap()).unwrap();
         assert_eq!(ctss.get(0, 1), Some("FreshLoose"));
+    }
+
+    #[test]
+    fn paused_caf_commit_returns_mismatch_and_preserves_replacement_byte_for_byte() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::mpsc;
+
+        static NEXT_PAUSE_DB: AtomicU64 = AtomicU64::new(0);
+        let db_path = std::env::temp_dir().join(format!(
+            "sims-vm-caf-paused-{}-{}.redb",
+            std::process::id(),
+            NEXT_PAUSE_DB.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&db_path);
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(db_path.clone());
+
+        let store = NeighborhoodStore::open(&db_path).unwrap();
+        let make_nh = |marker: i16| StoredNeighborhood {
+            name: "PauseNH".into(),
+            families: BTreeMap::from([(
+                0,
+                Family {
+                    version: 9,
+                    house: 0,
+                    number: -1,
+                    budget: 0,
+                    architecture_value: 0,
+                    friends: 0,
+                    flags: 0,
+                    members: Vec::new(),
+                    tail: vec![0; 16],
+                },
+            )]),
+            neighbors: Vec::new(),
+            inventories: Vec::new(),
+            data: [marker; 16],
+            options: None,
+            type_attributes: None,
+            zoning: BTreeMap::from([(4, 1)]),
+            lot_rows: vec![4],
+            made_characters: sims_sim::characters::Characters::default(),
+            deleted_characters: BTreeSet::new(),
+            deletion_epoch: 0,
+            deleted_at_epoch: BTreeMap::new(),
+            instance_id: 1,
+            revision: 0,
+        };
+        store.save_neighborhood("PauseNH", &make_nh(1)).unwrap();
+
+        let ctx = CafContext::synthetic(
+            synthetic_template_iff(),
+            BTreeSet::from([TEMPLATE_PERSON_GUID]),
+            DEFAULT_STARTING_FUNDS,
+        );
+        let spec = FamilySpec::new(
+            "Stale",
+            "",
+            vec![SimSpec {
+                first_name: "Alice".into(),
+                bio: String::new(),
+                age: Age::Adult,
+                gender: Gender::Female,
+                skin_tone: SkinTone::Light,
+                body_appearance: "b002fafit_01".into(),
+                body_texture: "b002fafitlgt_mom02".into(),
+                head_appearance: "c809fa_beth".into(),
+                head_texture: "c809falgt_beth3".into(),
+                personality: Personality::new(5, 5, 5, 5, 5).unwrap(),
+                portraits: None,
+            }],
+        );
+
+        // Case 1: Pause CAF right after snapshot capture, replace the
+        // neighborhood (simulating concurrent `import_directory`), resume CAF,
+        // and assert deterministic `NeighborhoodMismatch` + byte-for-byte
+        // preservation of the replacement neighborhood and zero leaked files.
+        let ctx_ref = &ctx;
+        let store_ref = &store;
+        let spec_ref = &spec;
+        let mut replacement_encoded = Vec::new();
+        let mut replacement_chars = BTreeMap::new();
+        let err = std::thread::scope(|scope| {
+            let (snap_tx, snap_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let h = scope.spawn(move || {
+                let mut rng = CrtRng::from_state(0x1122_3344);
+                commit_family_with_context_hook(
+                    ctx_ref,
+                    store_ref,
+                    "PauseNH",
+                    spec_ref,
+                    &mut rng,
+                    || {
+                        let _ = snap_tx.send(());
+                        let _ = resume_rx.recv();
+                    },
+                )
+            });
+            snap_rx.recv().unwrap();
+            assert!(store.delete_neighborhood("PauseNH").unwrap());
+            store.save_neighborhood("PauseNH", &make_nh(77)).unwrap();
+            store
+                .save_character_file("PauseNH", "User00099.iff", b"replacement-char")
+                .unwrap();
+            replacement_encoded = store
+                .load_neighborhood("PauseNH")
+                .unwrap()
+                .unwrap()
+                .encode();
+            replacement_chars = store.load_character_files("PauseNH").unwrap();
+            resume_tx.send(()).unwrap();
+            h.join().unwrap().unwrap_err()
+        });
+        assert!(
+            matches!(err, CafError::NeighborhoodMismatch { .. }),
+            "expected NeighborhoodMismatch, got {err}"
+        );
+        assert_eq!(
+            store
+                .load_neighborhood("PauseNH")
+                .unwrap()
+                .unwrap()
+                .encode(),
+            replacement_encoded
+        );
+        assert_eq!(
+            store.load_character_files("PauseNH").unwrap(),
+            replacement_chars
+        );
+
+        // Case 2: Pause CAF right after snapshot capture, bump same-instance
+        // revision via `save_neighborhood_checked`, resume CAF, and assert
+        // deterministic `StaleNeighborhood` + byte-for-byte preservation.
+        let mut bumped_encoded = Vec::new();
+        let err2 = std::thread::scope(|scope| {
+            let (snap_tx2, snap_rx2) = mpsc::channel();
+            let (resume_tx2, resume_rx2) = mpsc::channel();
+            let h = scope.spawn(move || {
+                let mut rng = CrtRng::from_state(0x5566_7788);
+                commit_family_with_context_hook(
+                    ctx_ref,
+                    store_ref,
+                    "PauseNH",
+                    spec_ref,
+                    &mut rng,
+                    || {
+                        let _ = snap_tx2.send(());
+                        let _ = resume_rx2.recv();
+                    },
+                )
+            });
+            snap_rx2.recv().unwrap();
+            let mut cur = store.load_neighborhood("PauseNH").unwrap().unwrap();
+            cur.data[1] = 88;
+            store
+                .save_neighborhood_checked("PauseNH", cur.instance_id, cur.revision, &cur)
+                .unwrap()
+                .unwrap();
+            bumped_encoded = store
+                .load_neighborhood("PauseNH")
+                .unwrap()
+                .unwrap()
+                .encode();
+            resume_tx2.send(()).unwrap();
+            h.join().unwrap().unwrap_err()
+        });
+        assert!(
+            matches!(err2, CafError::StaleNeighborhood { .. }),
+            "expected StaleNeighborhood, got {err2}"
+        );
+        assert_eq!(
+            store
+                .load_neighborhood("PauseNH")
+                .unwrap()
+                .unwrap()
+                .encode(),
+            bumped_encoded
+        );
+        assert_eq!(
+            store.load_character_files("PauseNH").unwrap(),
+            replacement_chars
+        );
     }
 }
