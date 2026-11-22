@@ -22,6 +22,8 @@
 // table).
 #![allow(clippy::disallowed_methods)]
 
+pub mod autosave_worker;
+pub mod caf_screen;
 pub mod game;
 pub mod hud;
 pub mod menu;

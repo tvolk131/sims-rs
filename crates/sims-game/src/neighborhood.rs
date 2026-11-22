@@ -12,6 +12,11 @@
 //!   Bulldoze, and
 //! - [`sims_audio::music::MusicMode`] transitions for streaming mode music.
 
+use crate::autosave_worker::{
+    AutosaveWorker, SaveCompletion, build_save_manager_snapshot, format_save_label, parse_slot_id,
+    validate_save_payload,
+};
+use crate::caf_screen::{CafOutcome, CafSession};
 use crate::game::Game;
 use crate::hud::DialogKey;
 use crate::sound::{self, Input};
@@ -27,7 +32,9 @@ use sims_render::neighborhood::{
     Surface565, pack_565,
 };
 use sims_render::{Canvas, Focus};
+use sims_sim::autosave::{SavePayloadKind, SaveSlot, SaveTarget};
 use sims_sim::load::Context;
+use sims_sim::migration::StoreMigrationReport;
 use sims_sim::neighborhood_store::{
     DEFAULT_ARCH_VALUE_MULTIPLIER, NeighborhoodStore, StoredNeighborhood, family_net_worth,
     lot_total_value,
@@ -47,6 +54,7 @@ use sims_ui::neighborhood::{
     format_simoleons,
 };
 use sims_ui::options::{OptionsState, OptionsTexts};
+use sims_ui::saves::{SaveManagerCommand, SaveManagerDialog, SaveManagerSnapshot};
 use sims_vm::boot::Frames;
 use sims_vm::boot::save::Saved;
 use sims_vm::lifecycle::{self, BulldozeReport, EvictReport, MoveInReport, SaveReport};
@@ -69,6 +77,7 @@ const NEIGHBORHOOD_TUNING_CHUNK: u16 = 4;
 pub enum ScreenKind {
     Neighborhood,
     FamilyBin,
+    CreateFamily,
     Lot,
 }
 
@@ -359,16 +368,35 @@ impl DialogStrings {
     }
 }
 
+/// Ephemeral REDB staging store kept alive for a lot booted from a Save Manager
+/// slot so subsequent saves run the full `sims_vm::lifecycle::save_and_leave_lot`
+/// pipeline (`people::save_to_record`, `update_lot_values`, `deletion_epoch`)
+/// before committing atomically to the real store with strict fencing.
+struct StagingStoreHandle {
+    _dir: TempStagingDir,
+    store: NeighborhoodStore,
+}
+
 /// Active live lot session launched from the Neighborhood map.
 struct LotSession {
     game: Game,
     neighborhood_id: String,
+    neighborhood_instance_id: u128,
+    /// Expected REDB neighborhood revision for optimistic write fencing.
+    neighborhood_revision: u64,
+    /// Present when the lot was booted from an ephemeral reconciled staging store
+    /// (e.g. Save Manager slot load or corrupt-save recovery).
+    staging: Option<StagingStoreHandle>,
     house: u32,
+    /// Last observed VM `days_played` (`world.globals[28]`) for exact midnight
+    /// rotating autosave detection (`daily::turn_day`).
+    last_days_played: i16,
 }
 
 enum ActiveScreen {
     Neighborhood,
     FamilyBin,
+    CreateFamily(Box<CafSession>),
     Lot(Box<LotSession>),
 }
 
@@ -376,7 +404,11 @@ enum ActiveScreen {
 pub struct NeighborhoodShell {
     install_root: PathBuf,
     install: Install,
+    saves_path: PathBuf,
     store: NeighborhoodStore,
+    autosave_worker: AutosaveWorker,
+    migration_report: Option<StoreMigrationReport>,
+    migration_error: Option<String>,
     options_file: PathBuf,
     options_state: OptionsState,
     saved_optn: Vec<u8>,
@@ -388,6 +420,9 @@ pub struct NeighborhoodShell {
     magic_lot_other_cost: i32,
 
     screen: ActiveScreen,
+    /// Monotonic generation bumped whenever a lot is entered or restored in
+    /// place so the host app resets error counters and lot-scoped audio.
+    lot_generation: u64,
     size: [i32; 2],
     canvas: Canvas,
     pointer: Option<[i32; 2]>,
@@ -399,6 +434,7 @@ pub struct NeighborhoodShell {
     chrome_strings: NeighborhoodStrings,
     family_bin_art: Art,
     dialog_art: Art,
+    save_manager_art: Art,
     dialogs: DialogStrings,
 
     // Active neighborhood state.
@@ -427,6 +463,11 @@ pub struct NeighborhoodShell {
 
     // Modal confirmation / notice dialog over Neighborhood or Family Bin.
     dialog: Option<ShellDialog>,
+    // Crash-safe Save & Rotating Autosave Manager dialog (overlay over Lot/Neighborhood).
+    save_manager: SaveManagerDialog,
+    save_manager_snapshot: Option<SaveManagerSnapshot>,
+    save_manager_target_lot: Option<u32>,
+    last_save_completions: Vec<SaveCompletion>,
     note: Option<String>,
 
     // Pending sound inputs to be drained by the host.
@@ -447,6 +488,17 @@ impl NeighborhoodShell {
     ) -> Result<Self, String> {
         let install = Install::detect(&install_root).map_err(|e| e.to_string())?;
         let store = NeighborhoodStore::open(&saves_path).map_err(|e| e.to_string())?;
+        // Non-destructive startup migration: surface any schema/corruption error
+        // clearly without crashing or overwriting existing saves.
+        let (migration_report, migration_error, startup_note) = match store.migrate_all() {
+            Ok(report) => (Some(report), None, None),
+            Err(err) => {
+                let msg =
+                    format!("Save migration warning (existing saves preserved untouched): {err}");
+                (None, Some(err.to_string()), Some(msg))
+            }
+        };
+        let autosave_worker = AutosaveWorker::spawn(store.autosaves());
         let options_file = saves_path.with_extension("options.iff");
         let options_state = if options_file.is_file() {
             OptionsState::load_iff(&options_file)
@@ -465,6 +517,13 @@ impl NeighborhoodShell {
             sims_ui::family_bin::load_art(&ui, US_ENGLISH).map_err(|e| e.to_string())?;
         let dialog_art =
             Art::load(&ui, US_ENGLISH, &dialog::RESOURCES).map_err(|e| e.to_string())?;
+        let save_manager_art = Art::load_with_optional(
+            &ui,
+            US_ENGLISH,
+            &dialog::RESOURCES,
+            &[sims_ui::neighborhood::art_id::POPUP_TILER],
+        )
+        .map_err(|e| e.to_string())?;
         let dialogs = DialogStrings::load(&install);
         let arch_multiplier = load_arch_multiplier(&install);
         let magic_lot_91_cost = lifecycle::magic_town_lot_cost(Some(&install_root), 91);
@@ -478,7 +537,13 @@ impl NeighborhoodShell {
         let mut map = load_map_for_slot(&install, slot, kind)?;
 
         let user_dir = resolve_user_dir(&install, slot)?;
-        let family_names = load_family_names(&user_dir);
+        let family_names = load_family_names_with_caf(
+            &user_dir,
+            &saves_path,
+            &neighborhood_id,
+            stored.instance_id,
+            &stored,
+        );
         let street_names = StreetNames::load(&install, &user_dir);
         let descriptions = NeighborhoodDescriptions::load(&install, &user_dir);
         let faces = load_neighborhood_faces(&install, &store, &neighborhood_id, &stored);
@@ -523,7 +588,11 @@ impl NeighborhoodShell {
         Ok(Self {
             install_root,
             install,
+            saves_path,
             store,
+            autosave_worker,
+            migration_report,
+            migration_error,
             options_file,
             options_state,
             saved_optn,
@@ -534,6 +603,7 @@ impl NeighborhoodShell {
             magic_lot_91_cost,
             magic_lot_other_cost,
             screen: ActiveScreen::Neighborhood,
+            lot_generation: 0,
             size: [800, 600],
             canvas: Canvas::new(800, 600, [0, 0, 0]),
             pointer: None,
@@ -543,6 +613,7 @@ impl NeighborhoodShell {
             chrome_strings,
             family_bin_art,
             dialog_art,
+            save_manager_art,
             dialogs,
             slot,
             neighborhood_id,
@@ -563,7 +634,11 @@ impl NeighborhoodShell {
             family_bin: FamilyBin::new(),
             family_bin_entries,
             dialog: None,
-            note: None,
+            save_manager: SaveManagerDialog::new(),
+            save_manager_snapshot: None,
+            save_manager_target_lot: None,
+            last_save_completions: Vec::new(),
+            note: startup_note,
             audio_queue,
         })
     }
@@ -572,7 +647,56 @@ impl NeighborhoodShell {
         match self.screen {
             ActiveScreen::Neighborhood => ScreenKind::Neighborhood,
             ActiveScreen::FamilyBin => ScreenKind::FamilyBin,
+            ActiveScreen::CreateFamily(_) => ScreenKind::CreateFamily,
             ActiveScreen::Lot(_) => ScreenKind::Lot,
+        }
+    }
+
+    /// Monotonic counter incremented on every lot entry or Save Manager / F9
+    /// restore so the window host resets error indices and lot-scoped audio.
+    pub fn lot_generation(&self) -> u64 {
+        self.lot_generation
+    }
+
+    pub fn migration_report(&self) -> Option<&StoreMigrationReport> {
+        self.migration_report.as_ref()
+    }
+
+    pub fn migration_error(&self) -> Option<&str> {
+        self.migration_error.as_deref()
+    }
+
+    pub fn autosave_worker(&self) -> &AutosaveWorker {
+        &self.autosave_worker
+    }
+
+    pub fn pending_background_saves(&self) -> usize {
+        self.autosave_worker.pending_count()
+    }
+
+    pub fn save_manager_open(&self) -> bool {
+        self.save_manager.is_open()
+    }
+
+    pub fn save_manager(&self) -> &SaveManagerDialog {
+        &self.save_manager
+    }
+
+    pub fn save_manager_snapshot(&self) -> Option<&SaveManagerSnapshot> {
+        self.save_manager_snapshot.as_ref()
+    }
+
+    pub fn caf_session(&self) -> Option<&CafSession> {
+        match &self.screen {
+            ActiveScreen::CreateFamily(caf) => Some(caf),
+            _ => None,
+        }
+    }
+
+    pub fn caf_session_mut(&mut self) -> Option<&mut CafSession> {
+        match &mut self.screen {
+            ActiveScreen::CreateFamily(caf) => Some(caf),
+            _ => None,
         }
     }
 
@@ -638,8 +762,12 @@ impl NeighborhoodShell {
     }
 
     pub fn has_dialog(&self) -> bool {
+        if self.save_manager.is_open() {
+            return true;
+        }
         match &self.screen {
             ActiveScreen::Lot(session) => session.game.has_dialog(),
+            ActiveScreen::CreateFamily(caf) => caf.controller().confirm().is_some(),
             _ => self.dialog.is_some(),
         }
     }
@@ -653,7 +781,8 @@ impl NeighborhoodShell {
 
     pub fn status_note(&self) -> Option<&str> {
         match &self.screen {
-            ActiveScreen::Lot(session) => session.game.note(),
+            ActiveScreen::Lot(session) => session.game.note().or(self.note.as_deref()),
+            ActiveScreen::CreateFamily(caf) => caf.note().or(self.note.as_deref()),
             _ => self.note.as_deref(),
         }
     }
@@ -673,7 +802,7 @@ impl NeighborhoodShell {
     pub fn desired_music_mode(&self) -> MusicMode {
         match &self.screen {
             ActiveScreen::Neighborhood => music_mode_for_kind(self.kind),
-            ActiveScreen::FamilyBin => MusicMode::FamilyBin,
+            ActiveScreen::FamilyBin | ActiveScreen::CreateFamily(_) => MusicMode::FamilyBin,
             ActiveScreen::Lot(session) => {
                 sound::lot_music_mode(session.game.mode(), session.game.lot().lot_id())
             }
@@ -688,6 +817,9 @@ impl NeighborhoodShell {
     /// Whether the active screen has an interactive tool, drag, or dialog open
     /// that benefits from full monitor refresh rate.
     pub fn is_actively_interacting(&self) -> bool {
+        if self.save_manager.is_open() {
+            return true;
+        }
         match &self.screen {
             ActiveScreen::Lot(session) => session.game.is_actively_interacting(),
             ActiveScreen::Neighborhood => {
@@ -696,6 +828,7 @@ impl NeighborhoodShell {
                     || self.pressed_lot_id.is_some()
             }
             ActiveScreen::FamilyBin => self.dialog.is_some(),
+            ActiveScreen::CreateFamily(_) => true,
         }
     }
 
@@ -707,6 +840,9 @@ impl NeighborhoodShell {
             }
             ActiveScreen::FamilyBin => {
                 format!("sims-game: Neighborhood {} — Select a Family", self.slot)
+            }
+            ActiveScreen::CreateFamily(_) => {
+                format!("sims-game: Neighborhood {} — Create a Family", self.slot)
             }
             ActiveScreen::Lot(session) => {
                 let suffix = if session.game.stopped().is_some() {
@@ -748,22 +884,32 @@ impl NeighborhoodShell {
         changed
     }
 
-    /// Advances shell-level animation timers (e.g. neighborhood water waves).
-    /// Returns `true` when the Neighborhood map should be redrawn.
+    /// Advances shell-level animation timers (e.g. neighborhood water waves,
+    /// CAF turntable & caret blink) and polls background save completions.
+    /// Returns `true` when the active screen should be redrawn.
     pub fn tick_shell(&mut self, delta_us: u64) -> bool {
         self.clock_us = self.clock_us.saturating_add(delta_us);
-        if !matches!(self.screen, ActiveScreen::Neighborhood) {
-            return false;
+        let mut redraw = self.poll_background_saves();
+        match &mut self.screen {
+            ActiveScreen::Neighborhood => {
+                let next_wave = (self.clock_us / WATER_STEP_US) as usize;
+                if next_wave != self.water_frame {
+                    self.water_frame = next_wave;
+                    redraw |= !self.map.waves.is_empty();
+                }
+            }
+            ActiveScreen::CreateFamily(caf) => {
+                redraw |= caf.tick(delta_us);
+            }
+            _ => {}
         }
-        let next_wave = (self.clock_us / WATER_STEP_US) as usize;
-        if next_wave != self.water_frame {
-            self.water_frame = next_wave;
-            return !self.map.waves.is_empty();
-        }
-        false
+        redraw
     }
 
     pub fn canvas(&self) -> &Canvas {
+        if self.save_manager.is_open() {
+            return &self.canvas;
+        }
         match &self.screen {
             ActiveScreen::Lot(session) => session.game.canvas(),
             _ => &self.canvas,
@@ -773,6 +919,21 @@ impl NeighborhoodShell {
     pub fn render(&mut self) {
         if let ActiveScreen::Lot(session) = &mut self.screen {
             session.game.render();
+            if self.save_manager.is_open()
+                && let Some(snapshot) = &self.save_manager_snapshot
+            {
+                let lot_canvas = session.game.canvas();
+                let w = lot_canvas.width;
+                let h = lot_canvas.height;
+                if let Ok(mut frame) = Frame::from_rgb(w as u32, h as u32, lot_canvas.color.clone())
+                {
+                    self.save_manager
+                        .draw(&mut frame, snapshot, &self.save_manager_art);
+                    let mut composed = Canvas::new(w, h, [0, 0, 0]);
+                    composed.color = frame.into_rgb();
+                    self.canvas = composed;
+                }
+            }
             return;
         }
         let w = self.size[0].max(1) as usize;
@@ -781,7 +942,7 @@ impl NeighborhoodShell {
             self.canvas = Canvas::new(w, h, [0, 0, 0]);
         }
 
-        match self.screen {
+        match &mut self.screen {
             ActiveScreen::Neighborhood => {
                 let opts = RenderOptions {
                     viewport: [w as u32, h as u32],
@@ -805,6 +966,12 @@ impl NeighborhoodShell {
                         &self.chrome_strings,
                     );
                     self.draw_overlay_note_and_dialog(&mut frame);
+                    if self.save_manager.is_open()
+                        && let Some(snapshot) = &self.save_manager_snapshot
+                    {
+                        self.save_manager
+                            .draw(&mut frame, snapshot, &self.save_manager_art);
+                    }
                     self.canvas.color = frame.into_rgb();
                 } else {
                     self.canvas.color = vec![[0, 0, 0]; w * h];
@@ -821,6 +988,25 @@ impl NeighborhoodShell {
                         &self.dialogs.family_bin,
                     );
                     self.draw_overlay_note_and_dialog(&mut frame);
+                    self.canvas.color = frame.into_rgb();
+                } else {
+                    self.canvas.color = vec![[0, 0, 0]; w * h];
+                }
+            }
+            ActiveScreen::CreateFamily(caf) => {
+                let rgb = std::mem::take(&mut self.canvas.color);
+                if let Ok(mut frame) = Frame::from_rgb(w as u32, h as u32, rgb) {
+                    caf.draw(&mut frame);
+                    if let Some(note) = caf.note().or(self.note.as_deref())
+                        && let Some(font) = self
+                            .chrome_art
+                            .font(12)
+                            .or_else(|| self.chrome_art.font(10))
+                    {
+                        let bar_h = font.line_height + 6;
+                        frame.fill(Rect::new(0, 0, frame.width() as i32, bar_h), [96, 24, 24]);
+                        font.draw(&mut frame, note, [8, 3], [255, 255, 255]);
+                    }
                     self.canvas.color = frame.into_rgb();
                 } else {
                     self.canvas.color = vec![[0, 0, 0]; w * h];
@@ -878,14 +1064,21 @@ impl NeighborhoodShell {
 
     pub fn hover(&mut self, point: [i32; 2]) -> bool {
         self.pointer = Some(point);
+        let frame_size = self.frame_size_u32();
+        if self.save_manager.is_open() {
+            if let Some(snapshot) = &self.save_manager_snapshot {
+                self.save_manager
+                    .pointer_move(frame_size, snapshot, point[0], point[1]);
+            }
+            return true;
+        }
         if let ActiveScreen::Lot(session) = &mut self.screen {
             return session.game.hover(point);
         }
         if self.dialog.is_some() {
             return true;
         }
-        let frame_size = self.frame_size_u32();
-        match self.screen {
+        match &mut self.screen {
             ActiveScreen::Neighborhood => {
                 let prev_btn = self.chrome.hovered();
                 let prev_lot = self.hovered_lot_id;
@@ -921,12 +1114,19 @@ impl NeighborhoodShell {
                 self.family_bin.hover(point[0], point[1], frame_size, &view);
                 true
             }
+            ActiveScreen::CreateFamily(caf) => {
+                let _ = caf.pointer_move(point, frame_size);
+                true
+            }
             ActiveScreen::Lot(_) => unreachable!(),
         }
     }
 
     pub fn leave(&mut self) -> bool {
         self.pointer = None;
+        if self.save_manager.is_open() {
+            return true;
+        }
         if let ActiveScreen::Lot(session) = &mut self.screen {
             return session.game.leave();
         }
@@ -946,11 +1146,26 @@ impl NeighborhoodShell {
                 self.family_bin.clear_pointer();
                 true
             }
+            ActiveScreen::CreateFamily(_) => false,
             ActiveScreen::Lot(_) => unreachable!(),
         }
     }
 
     pub fn wheel(&mut self, delta_y: f64) -> bool {
+        if self.save_manager.is_open() {
+            let delta = if delta_y > 0.0 {
+                -1
+            } else if delta_y < 0.0 {
+                1
+            } else {
+                return false;
+            };
+            let frame_size = self.frame_size_u32();
+            if let Some(snapshot) = &self.save_manager_snapshot {
+                return self.save_manager.scroll(delta, frame_size, snapshot);
+            }
+            return false;
+        }
         if self.dialog.is_some() {
             return false;
         }
@@ -977,6 +1192,19 @@ impl NeighborhoodShell {
 
     pub fn press(&mut self, point: [i32; 2]) -> ShellOutcome {
         self.pointer = Some(point);
+        let frame_size = self.frame_size_u32();
+        if self.save_manager.is_open() {
+            if let Some(snapshot) = &self.save_manager_snapshot {
+                let changed = self
+                    .save_manager
+                    .pointer_down(frame_size, snapshot, point[0], point[1]);
+                return ShellOutcome {
+                    redraw: changed,
+                    ..ShellOutcome::default()
+                };
+            }
+            return ShellOutcome::default();
+        }
         if let ActiveScreen::Lot(session) = &mut self.screen {
             let out = session.game.press(point);
             return self.handle_lot_outcome(out);
@@ -992,8 +1220,7 @@ impl NeighborhoodShell {
             return ShellOutcome::default();
         }
         self.note = None;
-        let frame_size = self.frame_size_u32();
-        match self.screen {
+        match &mut self.screen {
             ActiveScreen::Neighborhood => {
                 if self.chrome.press(
                     point[0],
@@ -1034,13 +1261,20 @@ impl NeighborhoodShell {
                     ShellOutcome::redraw()
                 }
             }
+            ActiveScreen::CreateFamily(caf) => {
+                let outcome = caf.pointer_down(point, frame_size);
+                self.handle_caf_outcome(outcome)
+            }
             ActiveScreen::Lot(_) => unreachable!(),
         }
     }
 
     pub fn double_click(&mut self, point: [i32; 2]) -> ShellOutcome {
         self.pointer = Some(point);
-        if self.dialog.is_some() || !matches!(self.screen, ActiveScreen::FamilyBin) {
+        if self.save_manager.is_open()
+            || self.dialog.is_some()
+            || !matches!(self.screen, ActiveScreen::FamilyBin)
+        {
             return self.press(point);
         }
         let frame_size = self.frame_size_u32();
@@ -1065,6 +1299,17 @@ impl NeighborhoodShell {
 
     pub fn release(&mut self, point: [i32; 2]) -> ShellOutcome {
         self.pointer = Some(point);
+        let frame_size = self.frame_size_u32();
+        if self.save_manager.is_open() {
+            let cmd = self.save_manager_snapshot.as_ref().and_then(|snap| {
+                self.save_manager
+                    .pointer_up(frame_size, snap, point[0], point[1])
+            });
+            return match cmd {
+                Some(cmd) => self.handle_save_manager_command(cmd),
+                None => ShellOutcome::redraw(),
+            };
+        }
         if let ActiveScreen::Lot(session) = &mut self.screen {
             let out = session.game.release(point);
             return self.handle_lot_outcome(out);
@@ -1083,8 +1328,7 @@ impl NeighborhoodShell {
                 ..ShellOutcome::default()
             };
         }
-        let frame_size = self.frame_size_u32();
-        match self.screen {
+        match &mut self.screen {
             ActiveScreen::Neighborhood => {
                 if let Some(cmd) = self.chrome.release(
                     point[0],
@@ -1128,11 +1372,18 @@ impl NeighborhoodShell {
                     ShellOutcome::redraw()
                 }
             }
+            ActiveScreen::CreateFamily(caf) => {
+                let outcome = caf.pointer_up();
+                self.handle_caf_outcome(outcome)
+            }
             ActiveScreen::Lot(_) => unreachable!(),
         }
     }
 
     pub fn release_outside(&mut self) -> ShellOutcome {
+        if self.save_manager.is_open() {
+            return ShellOutcome::redraw();
+        }
         if let ActiveScreen::Lot(session) = &mut self.screen {
             let out = session.game.release_outside();
             return self.handle_lot_outcome(out);
@@ -1143,6 +1394,10 @@ impl NeighborhoodShell {
                 redraw: had,
                 ..ShellOutcome::default()
             };
+        }
+        if let ActiveScreen::CreateFamily(caf) = &mut self.screen {
+            let outcome = caf.pointer_up();
+            return self.handle_caf_outcome(outcome);
         }
         self.pressed_lot_id = None;
         self.chrome.clear_pointer();
@@ -1186,10 +1441,16 @@ impl NeighborhoodShell {
     }
 
     pub fn escape(&mut self) -> ShellOutcome {
+        if self.save_manager.is_open() {
+            if let Some(cmd) = self.save_manager.escape() {
+                return self.handle_save_manager_command(cmd);
+            }
+            return ShellOutcome::redraw();
+        }
         if self.dialog.is_some() {
             return self.key_dialog(DialogKey::Escape);
         }
-        match self.screen {
+        match &mut self.screen {
             ActiveScreen::Neighborhood => {
                 if !matches!(self.nbhd_state.mode, NeighborhoodMode::Normal) {
                     self.nbhd_state.mode = NeighborhoodMode::Normal;
@@ -1204,12 +1465,122 @@ impl NeighborhoodShell {
                 let cmd = self.family_bin.cancel();
                 self.handle_family_bin_command(cmd)
             }
+            ActiveScreen::CreateFamily(caf) => {
+                let outcome = caf.key_escape();
+                self.handle_caf_outcome(outcome)
+            }
             ActiveScreen::Lot(_) => ShellOutcome::default(),
         }
     }
 
+    pub fn key_char(&mut self, ch: char) -> ShellOutcome {
+        if let ActiveScreen::CreateFamily(caf) = &mut self.screen {
+            let outcome = caf.key_char(ch);
+            return self.handle_caf_outcome(outcome);
+        }
+        ShellOutcome::default()
+    }
+
+    pub fn key_backspace(&mut self) -> ShellOutcome {
+        if let ActiveScreen::CreateFamily(caf) = &mut self.screen {
+            let outcome = caf.key_backspace();
+            return self.handle_caf_outcome(outcome);
+        }
+        ShellOutcome::default()
+    }
+
+    pub fn key_delete(&mut self) -> ShellOutcome {
+        if let ActiveScreen::CreateFamily(caf) = &mut self.screen {
+            let outcome = caf.key_delete();
+            return self.handle_caf_outcome(outcome);
+        }
+        ShellOutcome::default()
+    }
+
+    pub fn key_left(&mut self) -> ShellOutcome {
+        if let ActiveScreen::CreateFamily(caf) = &mut self.screen {
+            let outcome = caf.key_left();
+            return self.handle_caf_outcome(outcome);
+        }
+        ShellOutcome::default()
+    }
+
+    pub fn key_right(&mut self) -> ShellOutcome {
+        if let ActiveScreen::CreateFamily(caf) = &mut self.screen {
+            let outcome = caf.key_right();
+            return self.handle_caf_outcome(outcome);
+        }
+        ShellOutcome::default()
+    }
+
+    pub fn key_up(&mut self) -> ShellOutcome {
+        if self.save_manager.is_open()
+            && let Some(snapshot) = &self.save_manager_snapshot
+        {
+            return ShellOutcome {
+                redraw: self.save_manager.select_prev(snapshot),
+                ..ShellOutcome::default()
+            };
+        }
+        ShellOutcome::default()
+    }
+
+    pub fn key_down(&mut self) -> ShellOutcome {
+        if self.save_manager.is_open()
+            && let Some(snapshot) = &self.save_manager_snapshot
+        {
+            return ShellOutcome {
+                redraw: self.save_manager.select_next(snapshot),
+                ..ShellOutcome::default()
+            };
+        }
+        ShellOutcome::default()
+    }
+
+    pub fn key_home(&mut self) -> ShellOutcome {
+        if let ActiveScreen::CreateFamily(caf) = &mut self.screen {
+            let outcome = caf.key_home();
+            return self.handle_caf_outcome(outcome);
+        }
+        ShellOutcome::default()
+    }
+
+    pub fn key_end(&mut self) -> ShellOutcome {
+        if let ActiveScreen::CreateFamily(caf) = &mut self.screen {
+            let outcome = caf.key_end();
+            return self.handle_caf_outcome(outcome);
+        }
+        ShellOutcome::default()
+    }
+
+    pub fn key_tab(&mut self) -> ShellOutcome {
+        if let ActiveScreen::CreateFamily(caf) = &mut self.screen {
+            let outcome = caf.key_tab();
+            return self.handle_caf_outcome(outcome);
+        }
+        ShellOutcome::default()
+    }
+
+    pub fn key_enter(&mut self) -> ShellOutcome {
+        if self.save_manager.is_open() {
+            let cmd = self
+                .save_manager_snapshot
+                .as_ref()
+                .and_then(|snap| self.save_manager.submit(snap));
+            return match cmd {
+                Some(cmd) => self.handle_save_manager_command(cmd),
+                None => ShellOutcome::default(),
+            };
+        }
+        if let ActiveScreen::CreateFamily(caf) = &mut self.screen {
+            let outcome = caf.key_enter();
+            return self.handle_caf_outcome(outcome);
+        }
+        ShellOutcome::default()
+    }
+
     /// Handles a [`crate::game::Outcome`] produced by an input to the active lot
-    /// (including Save, Save & Leave to Neighborhood, Quit, and Photo).
+    /// (including Save, Save Manager, Save & Leave to Neighborhood, Quit, and Photo).
     pub fn handle_lot_outcome(&mut self, outcome: crate::game::Outcome) -> ShellOutcome {
         self.persist_options();
         let mut out = ShellOutcome {
@@ -1217,6 +1588,11 @@ impl NeighborhoodShell {
             quit: false,
             photo: outcome.photo,
         };
+        if outcome.open_save_manager {
+            self.open_save_manager(None);
+            out.redraw = true;
+            return out;
+        }
         if outcome.neighborhood {
             match self.leave_lot(outcome.save) {
                 Ok(()) => {
@@ -1247,24 +1623,540 @@ impl NeighborhoodShell {
             out.redraw = true;
         }
         if outcome.quit && saved_ok {
+            self.flush_background_saves();
             out.quit = true;
         }
         out
     }
 
-    /// Saves the currently open lot to REDB (F5 or Options → Save) and updates
-    /// its cached neighborhood map thumbnail immediately.
+    /// Enqueues a non-blocking CoW [`sims_sim::World`] snapshot onto the
+    /// background [`AutosaveWorker`] with `expected_instance_id` fencing.
+    pub fn enqueue_background_world_save(&mut self, target: SaveTarget) -> Result<(), String> {
+        let ActiveScreen::Lot(session) = &self.screen else {
+            return Err("no lot is currently open".into());
+        };
+        let world = session.game.lot().world().clone();
+        let label = self.active_lot_save_label(session);
+        self.autosave_worker.enqueue_world(
+            session.neighborhood_id.clone(),
+            session.neighborhood_instance_id,
+            session.house,
+            target,
+            u64::from(session.game.lot().ticks()),
+            label,
+            world,
+        )
+    }
+
+    /// Enqueues a non-blocking CoW [`Saved`] lot snapshot onto the background
+    /// [`AutosaveWorker`] (encoding runs off-thread).
+    pub fn enqueue_background_lot_save(&mut self, target: SaveTarget) -> Result<(), String> {
+        let ActiveScreen::Lot(session) = &self.screen else {
+            return Err("no lot is currently open".into());
+        };
+        let saved = session.game.save()?;
+        let label = self.active_lot_save_label(session);
+        self.autosave_worker.enqueue_saved_lot(
+            session.neighborhood_id.clone(),
+            session.neighborhood_instance_id,
+            session.house,
+            target,
+            u64::from(session.game.lot().ticks()),
+            label,
+            saved,
+        )
+    }
+
+    fn active_lot_save_label(&self, session: &LotSession) -> String {
+        let world = session.game.lot().world();
+        let hour = session.game.hour().min(23) as u8;
+        let minute = world.globals.get(5).copied().unwrap_or(0).clamp(0, 59) as u8;
+        let sim_day = (world.globals.get(28).copied().unwrap_or(0).max(0) as u32) + 1;
+        let fam_name = self
+            .stored
+            .family_in(session.house)
+            .and_then(|(id, _)| self.family_names.get(&id))
+            .map(String::as_str);
+        format_save_label(fam_name, sim_day, hour, minute)
+    }
+
+    /// Polls background save completions and triggers a periodic rotating
+    /// autosave whenever the active lot's VM `days_played` (`world.globals[28]`)
+    /// advances across midnight.
+    /// Returns `true` if status feedback changed and the screen should redraw.
+    pub fn poll_background_saves(&mut self) -> bool {
+        let mut redraw = false;
+        let mut refresh_manager = false;
+        let completions = self.autosave_worker.poll_completions();
+        for completion in completions {
+            if self.save_manager.is_open()
+                && self.save_manager_target_lot == Some(completion.lot_id)
+                && completion.neighborhood_id == self.neighborhood_id
+            {
+                refresh_manager = true;
+            }
+            match &completion.result {
+                Ok(meta) => {
+                    if completion.target == SaveTarget::Autosave
+                        && let ActiveScreen::Lot(session) = &mut self.screen
+                        && session.house == completion.lot_id
+                        && session.game.note().is_none()
+                    {
+                        session.game.set_note(format!(
+                            "Autosaved ({}) at tick {}.",
+                            meta.slot, meta.sim_tick
+                        ));
+                        redraw = true;
+                    }
+                }
+                Err(err) => {
+                    let msg = format!("Background save warning (existing saves preserved): {err}");
+                    if let ActiveScreen::Lot(session) = &mut self.screen {
+                        session.game.set_note(msg);
+                    } else {
+                        self.note = Some(msg);
+                    }
+                    redraw = true;
+                }
+            }
+            if self.last_save_completions.len() >= 64 {
+                self.last_save_completions.remove(0);
+            }
+            self.last_save_completions.push(completion);
+        }
+
+        if refresh_manager && let Some(lot_id) = self.save_manager_target_lot {
+            let active_err = self
+                .save_manager_snapshot
+                .as_ref()
+                .and_then(|s| s.active_error.clone());
+            let label = self.format_lot_label_for_saves(lot_id);
+            self.save_manager_snapshot = Some(build_save_manager_snapshot(
+                &self.store.autosaves(),
+                &self.neighborhood_id,
+                self.slot,
+                lot_id,
+                label,
+                active_err,
+            ));
+            redraw = true;
+        }
+
+        // Periodic midnight rotating autosave (triggered strictly when VM
+        // `daily::turn_day` increments `world.globals[28]`).
+        let trigger_midnight = if let ActiveScreen::Lot(session) = &mut self.screen {
+            let days_played = session
+                .game
+                .lot()
+                .world()
+                .globals
+                .get(28)
+                .copied()
+                .unwrap_or(0);
+            let turned = days_played > session.last_days_played;
+            session.last_days_played = days_played;
+            turned
+        } else {
+            false
+        };
+        if trigger_midnight && let Err(err) = self.enqueue_background_lot_save(SaveTarget::Autosave)
+        {
+            if let ActiveScreen::Lot(session) = &mut self.screen {
+                session.game.set_note(format!("Autosave skipped: {err}"));
+            }
+            redraw = true;
+        }
+        redraw
+    }
+
+    /// Flushes all pending background save/autosave jobs and drains completions.
+    pub fn flush_background_saves(&mut self) {
+        self.autosave_worker.flush();
+        let _ = self.poll_background_saves();
+    }
+
+    /// Returns completed background save results observed since the last drain.
+    pub fn take_save_completions(&mut self) -> Vec<SaveCompletion> {
+        std::mem::take(&mut self.last_save_completions)
+    }
+
+    /// Opens the crash-safe [`SaveManagerDialog`] for the currently active lot
+    /// (or hovered/last lot), flushing pending background saves first so every
+    /// manual and rotating autosave slot is shown.
+    pub fn open_save_manager(&mut self, active_error: Option<String>) -> bool {
+        self.flush_background_saves();
+        let lot_id = match &self.screen {
+            ActiveScreen::Lot(session) => Some(session.house),
+            _ => self
+                .save_manager_target_lot
+                .or_else(|| self.hovered_lot_id.map(u32::from)),
+        };
+        let Some(lot_id) = lot_id else {
+            self.note = Some("Enter a lot to manage its saves.".into());
+            return false;
+        };
+        self.save_manager_target_lot = Some(lot_id);
+        let lot_label = self.format_lot_label_for_saves(lot_id);
+        let snapshot = build_save_manager_snapshot(
+            &self.store.autosaves(),
+            &self.neighborhood_id,
+            self.slot,
+            lot_id,
+            lot_label,
+            active_error,
+        );
+        self.save_manager_snapshot = Some(snapshot);
+        self.save_manager.open();
+        true
+    }
+
+    /// Closes the [`SaveManagerDialog`] without modifying any save slot.
+    pub fn close_save_manager(&mut self) {
+        self.save_manager.close();
+        self.save_manager_snapshot = None;
+    }
+
+    fn format_lot_label_for_saves(&self, lot_id: u32) -> String {
+        let fam = self
+            .stored
+            .family_in(lot_id)
+            .and_then(|(id, _)| self.family_names.get(&id))
+            .cloned();
+        match fam {
+            Some(name) => format!("Neighborhood {} · Lot {lot_id} ({name})", self.slot),
+            None => format!("Neighborhood {} · Lot {lot_id}", self.slot),
+        }
+    }
+
+    /// Executes a [`SaveManagerCommand`] emitted by [`SaveManagerDialog`]
+    /// (`LoadSlot`, `FallbackToNewestIntact`, `DeleteSlot`, or `Cancel`).
+    pub fn handle_save_manager_command(&mut self, cmd: SaveManagerCommand) -> ShellOutcome {
+        let Some(lot_id) = self.active_lot_house().or(self.save_manager_target_lot) else {
+            self.close_save_manager();
+            return ShellOutcome::redraw();
+        };
+        match cmd {
+            SaveManagerCommand::Cancel => {
+                self.close_save_manager();
+                ShellOutcome::redraw()
+            }
+            SaveManagerCommand::DeleteSlot { slot_id } => {
+                let err = match parse_slot_id(&slot_id) {
+                    Some(slot) => self
+                        .store
+                        .autosaves()
+                        .delete_slot(&self.neighborhood_id, lot_id, slot)
+                        .err()
+                        .map(|e| format!("Could not delete save slot: {e}")),
+                    None => Some(format!("Unknown save slot identifier: {slot_id}")),
+                };
+                let label = self.format_lot_label_for_saves(lot_id);
+                self.save_manager_snapshot = Some(build_save_manager_snapshot(
+                    &self.store.autosaves(),
+                    &self.neighborhood_id,
+                    self.slot,
+                    lot_id,
+                    label,
+                    err,
+                ));
+                ShellOutcome::redraw()
+            }
+            SaveManagerCommand::LoadSlot { slot_id } => {
+                let result = parse_slot_id(&slot_id)
+                    .ok_or_else(|| format!("unknown save slot {slot_id:?}"))
+                    .and_then(|slot| self.load_autosave_slot_into_lot(lot_id, slot));
+                match result {
+                    Ok(tick) => {
+                        self.close_save_manager();
+                        if let ActiveScreen::Lot(session) = &mut self.screen {
+                            session
+                                .game
+                                .set_note(format!("Loaded save slot {slot_id} (tick {tick})."));
+                        }
+                    }
+                    Err(err) => {
+                        // Non-destructive: keep dialog open with warning banner & fallback.
+                        let label = self.format_lot_label_for_saves(lot_id);
+                        self.save_manager_snapshot = Some(build_save_manager_snapshot(
+                            &self.store.autosaves(),
+                            &self.neighborhood_id,
+                            self.slot,
+                            lot_id,
+                            label,
+                            Some(err),
+                        ));
+                    }
+                }
+                ShellOutcome::redraw()
+            }
+            SaveManagerCommand::FallbackToNewestIntact { slot_id } => {
+                let result = parse_slot_id(&slot_id)
+                    .ok_or_else(|| format!("unknown fallback slot {slot_id:?}"))
+                    .and_then(|slot| self.load_autosave_slot_into_lot(lot_id, slot))
+                    .or_else(|_| {
+                        let recovered = self
+                            .store
+                            .autosaves()
+                            .load_with_fallback_validated(
+                                &self.neighborhood_id,
+                                lot_id,
+                                SaveSlot::Manual,
+                                validate_save_payload,
+                            )
+                            .map_err(|e| e.to_string())?;
+                        self.apply_loaded_save_into_lot(lot_id, &recovered.loaded)
+                    });
+                match result {
+                    Ok(tick) => {
+                        self.close_save_manager();
+                        if let ActiveScreen::Lot(session) = &mut self.screen {
+                            session.game.set_note(format!(
+                                "Recovered newest intact save (tick {tick}); corrupt saves preserved."
+                            ));
+                        }
+                    }
+                    Err(err) => {
+                        let label = self.format_lot_label_for_saves(lot_id);
+                        self.save_manager_snapshot = Some(build_save_manager_snapshot(
+                            &self.store.autosaves(),
+                            &self.neighborhood_id,
+                            self.slot,
+                            lot_id,
+                            label,
+                            Some(format!("Recovery failed: {err}")),
+                        ));
+                    }
+                }
+                ShellOutcome::redraw()
+            }
+        }
+    }
+
+    fn load_autosave_slot_into_lot(
+        &mut self,
+        lot_id: u32,
+        slot: sims_sim::autosave::SaveSlot,
+    ) -> Result<u64, String> {
+        let loaded = self
+            .store
+            .autosaves()
+            .load_save_validated(&self.neighborhood_id, lot_id, slot, validate_save_payload)
+            .map_err(|e| e.to_string())?;
+        self.apply_loaded_save_into_lot(lot_id, &loaded)
+    }
+
+    fn apply_loaded_save_into_lot(
+        &mut self,
+        lot_id: u32,
+        loaded: &sims_sim::autosave::LoadedSave,
+    ) -> Result<u64, String> {
+        let snapshot = self
+            .store
+            .load_lot_snapshot(&self.neighborhood_id, lot_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("neighborhood {:?} not found", self.neighborhood_id))?;
+        let real_instance_id = snapshot.neighborhood.instance_id;
+        let real_revision = snapshot.neighborhood.revision;
+
+        // Boot through an ephemeral staging NeighborhoodStore populated with the
+        // CURRENT StoredNeighborhood (all newer CAF families, NBRS, NGBH, TATT,
+        // made_characters, and deletion_epoch tombstones) + the selected validated
+        // save slot. This avoids retrying a corrupt SAVED_LOTS record and runs
+        // `sims_vm::lifecycle::enter_lot`'s full neighborhood reconciliation
+        // before replacing the live session.
+        let staging_dir = TempStagingDir::new("slot-boot")?;
+        let staging_store = NeighborhoodStore::open(&staging_dir.path().join("stage.redb"))
+            .map_err(|e| e.to_string())?;
+        for (file_name, bytes) in &snapshot.character_files {
+            staging_store
+                .save_character_file(&self.neighborhood_id, file_name, bytes)
+                .map_err(|e| e.to_string())?;
+        }
+        if let Some(base_house) = &snapshot.base_house {
+            staging_store
+                .save_base_house(&self.neighborhood_id, lot_id, base_house)
+                .map_err(|e| e.to_string())?;
+        }
+
+        let (staged_saved_bytes, restored_tick) = match &loaded.metadata.payload_kind {
+            SavePayloadKind::SavedLot => {
+                let _ = Saved::decode(&loaded.payload).map_err(|e| e.to_string())?;
+                (loaded.payload.clone(), None)
+            }
+            SavePayloadKind::WorldSnapshot => {
+                let world = sims_sim::World::decode(&loaded.payload).map_err(|e| e.to_string())?;
+                // Obtain a compatible base `Saved` envelope without touching a
+                // potentially corrupt SAVED_LOTS entry: reuse the open lot if it
+                // matches `lot_id`, otherwise boot the clean base house in staging.
+                let base_saved = match &self.screen {
+                    ActiveScreen::Lot(session) if session.house == lot_id => session.game.save()?,
+                    _ => {
+                        staging_store
+                            .save_neighborhood(&self.neighborhood_id, &snapshot.neighborhood)
+                            .map_err(|e| e.to_string())?;
+                        let base_game = Game::open_from_store(
+                            &self.install_root,
+                            &staging_store,
+                            &self.neighborhood_id,
+                            lot_id,
+                            &self.answers,
+                            self.play,
+                            self.frames.clone(),
+                        )?;
+                        base_game.save()?
+                    }
+                };
+                let spliced = splice_world_into_saved_bytes(&base_saved, &world)?;
+                (spliced, Some(loaded.metadata.sim_tick))
+            }
+            SavePayloadKind::Custom(tag) => {
+                return Err(format!("unsupported custom payload kind {tag:?}"));
+            }
+        };
+
+        // Keep `snapshot.neighborhood` unmodified so restoring an older slot
+        // reconciles against the live neighborhood's current FAMI budgets, NBRS,
+        // made_characters, and deletion_epoch without rolling any of them back.
+        staging_store
+            .save_lot_and_neighborhood(
+                &self.neighborhood_id,
+                lot_id,
+                &staged_saved_bytes,
+                &snapshot.neighborhood,
+            )
+            .map_err(|e| e.to_string())?;
+
+        let mut game = Game::open_from_store(
+            &self.install_root,
+            &staging_store,
+            &self.neighborhood_id,
+            lot_id,
+            &self.answers,
+            self.play,
+            self.frames.clone(),
+        )?;
+        if self.options_file.is_file() {
+            let _ = game.load_options(&self.options_file);
+        }
+        game.resize(self.size);
+        let initial_days_played = game.lot().world().globals.get(28).copied().unwrap_or(0);
+        let ticks = restored_tick.unwrap_or_else(|| u64::from(game.lot().ticks()));
+        let next_music = sound::lot_music_mode(game.mode(), game.lot().lot_id());
+
+        // Replace live session only after the reconciled boot succeeded.
+        self.stored = snapshot.neighborhood;
+        self.screen = ActiveScreen::Lot(Box::new(LotSession {
+            game,
+            neighborhood_id: self.neighborhood_id.clone(),
+            neighborhood_instance_id: real_instance_id,
+            neighborhood_revision: real_revision,
+            staging: Some(StagingStoreHandle {
+                _dir: staging_dir,
+                store: staging_store,
+            }),
+            house: lot_id,
+            last_days_played: initial_days_played,
+        }));
+        self.lot_generation = self.lot_generation.wrapping_add(1);
+        self.dialog = None;
+        self.save_manager_target_lot = Some(lot_id);
+        self.note = None;
+        self.hovered_lot_id = None;
+        self.pressed_lot_id = None;
+        self.nbhd_state.hovered_lot = None;
+        self.audio_queue
+            .push(Input::Events(vec![SoundEvent::StopAll]));
+        self.audio_queue.push(Input::MusicMode(next_music));
+        Ok(ticks)
+    }
+
+    /// Saves the currently open lot to REDB (F5 or Options → Save): performs the
+    /// strictly fenced `SAVED_LOTS` + neighborhood writeback commit first, then
+    /// mirrors the exact committed `Saved` bytes to the background
+    /// [`AutosaveWorker`] manual slot and updates the cached neighborhood map
+    /// thumbnail immediately.
     pub fn save_current_lot(&mut self) -> Result<SaveReport, String> {
-        let report = {
+        let (report, committed_bytes, nh_id, expected_instance_id, house, ticks, label) = {
             let ActiveScreen::Lot(session) = &mut self.screen else {
                 return Err("no lot is currently open".into());
             };
-            session.game.save_to_neighborhood(
-                &self.install_root,
-                &self.store,
-                &session.neighborhood_id,
-            )?
+            let (report, lot_bytes) = if session.game.world_mutated_via_restore() {
+                save_cheat_mutated_lot_to_store(
+                    &self.install_root,
+                    &self.store,
+                    &session.neighborhood_id,
+                    session.neighborhood_instance_id,
+                    session.neighborhood_revision,
+                    session.house,
+                    self.arch_multiplier,
+                    &self.answers,
+                    self.frames.clone(),
+                    &mut session.game,
+                )?
+            } else if let Some(staging) = &session.staging {
+                save_staged_lot_to_store(
+                    &self.install_root,
+                    &self.store,
+                    &staging.store,
+                    &session.neighborhood_id,
+                    session.neighborhood_instance_id,
+                    session.neighborhood_revision,
+                    session.house,
+                    &mut session.game,
+                )?
+            } else {
+                // Propagate fencing / stale-revision / replacement errors directly
+                // instead of bypassing them with an unfenced fallback.
+                let report = session.game.save_to_neighborhood(
+                    &self.install_root,
+                    &self.store,
+                    &session.neighborhood_id,
+                )?;
+                let bytes = self
+                    .store
+                    .load_saved_lot(&session.neighborhood_id, session.house)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "committed saved lot missing after save".to_owned())?;
+                (report, bytes)
+            };
+            session.neighborhood_revision = report.revision;
+            let nh_id = session.neighborhood_id.clone();
+            let inst = session.neighborhood_instance_id;
+            let house = session.house;
+            let ticks = u64::from(session.game.lot().ticks());
+            let world = session.game.lot().world();
+            let hour = session.game.hour().min(23) as u8;
+            let minute = world.globals.get(5).copied().unwrap_or(0).clamp(0, 59) as u8;
+            let sim_day = (world.globals.get(28).copied().unwrap_or(0).max(0) as u32) + 1;
+            let fam_name = self
+                .stored
+                .family_in(house)
+                .and_then(|(id, _)| self.family_names.get(&id))
+                .map(String::as_str);
+            let label = format_save_label(fam_name, sim_day, hour, minute);
+            (report, lot_bytes, nh_id, inst, house, ticks, label)
         };
+        if let Ok(Some(reloaded)) = self.store.load_neighborhood(&nh_id) {
+            self.stored = reloaded;
+        } else {
+            self.stored.revision = report.revision;
+        }
+        // Mirror the exact committed `Saved` bytes into the crash-safe manual slot
+        // on the background worker so F9 and Save Manager share one source of truth.
+        if let Err(err) = self.autosave_worker.enqueue_saved_lot_bytes(
+            nh_id,
+            expected_instance_id,
+            house,
+            SaveTarget::Manual,
+            ticks,
+            label,
+            committed_bytes,
+        ) && let ActiveScreen::Lot(session) = &mut self.screen
+        {
+            session
+                .game
+                .set_note(format!("Saved lot; manual slot mirror warning: {err}"));
+        }
         self.capture_active_lot_thumbnail();
         Ok(report)
     }
@@ -1283,33 +2175,107 @@ impl NeighborhoodShell {
         }
     }
 
-    /// Reloads the currently open lot from its latest REDB save (F9).
+    /// Reloads the currently open lot from its latest REDB manual save (F9),
+    /// preferring the primary committed `SAVED_LOTS` record whenever it is
+    /// intact (so a newer F5 commit is never shadowed by a stale manual mirror)
+    /// and falling back non-destructively to [`SaveManagerDialog`] if either
+    /// the manual slot or `SAVED_LOTS` is corrupt.
     pub fn restore_current_lot(&mut self) -> Result<(), String> {
+        self.flush_background_saves();
         let (neighborhood_id, house) = match &self.screen {
             ActiveScreen::Lot(session) => (session.neighborhood_id.clone(), session.house),
             _ => return Err("no lot is currently open".into()),
         };
-        if self
+        let manual_slot = self.store.autosaves().load_save_validated(
+            &neighborhood_id,
+            house,
+            sims_sim::autosave::SaveSlot::Manual,
+            validate_save_payload,
+        );
+        let manual_loaded = match manual_slot {
+            Ok(loaded) => Some(loaded),
+            Err(sims_sim::autosave::SaveError::Missing { .. }) => None,
+            Err(corrupt_err) => {
+                let msg = format!(
+                    "Manual save could not be loaded ({corrupt_err}). Choose an intact autosave below."
+                );
+                self.open_save_manager(Some(msg.clone()));
+                return Err(msg);
+            }
+        };
+        let saved_lot_bytes = self
             .store
             .load_saved_lot(&neighborhood_id, house)
-            .map_err(|e| e.to_string())?
-            .is_none()
-        {
-            if let ActiveScreen::Lot(session) = &mut self.screen {
-                session
-                    .game
-                    .set_note("The save was not restored: nothing is saved for this house");
+            .map_err(|e| e.to_string())?;
+        if let Some(bytes) = saved_lot_bytes {
+            if Saved::decode(&bytes).is_ok() {
+                match self.enter_lot(house) {
+                    Ok(()) => {
+                        if let ActiveScreen::Lot(session) = &mut self.screen {
+                            let ticks = session.game.lot().ticks();
+                            session
+                                .game
+                                .set_note(format!("Back to the save after tick {ticks}."));
+                        }
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        self.open_save_manager(Some(format!(
+                            "Saved lot could not be restored ({err}). Choose an intact autosave below."
+                        )));
+                        return Err(err);
+                    }
+                }
+            } else if let Some(loaded) = manual_loaded {
+                // Primary SAVED_LOTS is unreadable, but the validated Manual slot is intact.
+                return match self.apply_loaded_save_into_lot(house, &loaded) {
+                    Ok(ticks) => {
+                        if let ActiveScreen::Lot(session) = &mut self.screen {
+                            session
+                                .game
+                                .set_note(format!("Back to the save after tick {ticks}."));
+                        }
+                        Ok(())
+                    }
+                    Err(err) => {
+                        self.open_save_manager(Some(format!(
+                            "Manual save could not be restored ({err}). Choose an intact autosave below."
+                        )));
+                        Err(err)
+                    }
+                };
+            } else {
+                let msg =
+                    "Saved lot is corrupt and no intact manual slot is available. Choose an intact autosave below."
+                        .to_owned();
+                self.open_save_manager(Some(msg.clone()));
+                return Err(msg);
             }
-            return Err("nothing is saved for this house".into());
         }
-        self.enter_lot(house)?;
+        if let Some(loaded) = manual_loaded {
+            return match self.apply_loaded_save_into_lot(house, &loaded) {
+                Ok(ticks) => {
+                    if let ActiveScreen::Lot(session) = &mut self.screen {
+                        session
+                            .game
+                            .set_note(format!("Back to the save after tick {ticks}."));
+                    }
+                    Ok(())
+                }
+                Err(err) => {
+                    self.open_save_manager(Some(format!(
+                        "Manual save could not be restored ({err}). Choose an intact autosave below."
+                    )));
+                    Err(err)
+                }
+            };
+        }
         if let ActiveScreen::Lot(session) = &mut self.screen {
-            let ticks = session.game.lot().ticks();
             session
                 .game
-                .set_note(format!("Back to the save after tick {ticks}."));
+                .set_note("The save was not restored: nothing is saved for this house");
         }
-        Ok(())
+        Err("nothing is saved for this house".into())
     }
 
     /// Switches to neighborhood slot `1..=8`, importing it into REDB on first visit.
@@ -1321,7 +2287,13 @@ impl NeighborhoodShell {
         let _ = self.store.set_active_neighborhood(&id);
         let mut map = load_map_for_slot(&self.install, slot, kind)?;
         let user_dir = resolve_user_dir(&self.install, slot)?;
-        let family_names = load_family_names(&user_dir);
+        let family_names = load_family_names_with_caf(
+            &user_dir,
+            &self.saves_path,
+            &id,
+            stored.instance_id,
+            &stored,
+        );
         let street_names = StreetNames::load(&self.install, &user_dir);
         let descriptions = NeighborhoodDescriptions::load(&self.install, &user_dir);
         let faces = load_neighborhood_faces(&self.install, &self.store, &id, &stored);
@@ -1349,6 +2321,9 @@ impl NeighborhoodShell {
         self.pressed_lot_id = None;
         self.move_in_family_id = None;
         self.dialog = None;
+        self.save_manager.close();
+        self.save_manager_snapshot = None;
+        self.save_manager_target_lot = None;
         self.note = None;
         self.screen = ActiveScreen::Neighborhood;
         self.audio_queue
@@ -1439,8 +2414,93 @@ impl NeighborhoodShell {
         Ok(())
     }
 
+    /// Opens the interactive Create-a-Family (`CAF`) screen.
+    pub fn open_create_family(&mut self) -> Result<(), String> {
+        let ui = UiGraphics::open(&self.install).map_err(|e| e.to_string())?;
+        let caf = CafSession::open(&self.install_root, &self.install, &ui)?;
+        self.dialog = None;
+        self.note = None;
+        self.screen = ActiveScreen::CreateFamily(Box::new(caf));
+        self.audio_queue
+            .push(Input::MusicMode(MusicMode::FamilyBin));
+        Ok(())
+    }
+
+    fn handle_caf_outcome(&mut self, outcome: CafOutcome) -> ShellOutcome {
+        match outcome {
+            CafOutcome::Stay { redraw } => ShellOutcome {
+                redraw,
+                ..ShellOutcome::default()
+            },
+            CafOutcome::Cancelled => {
+                self.open_family_bin();
+                ShellOutcome::redraw()
+            }
+            CafOutcome::Commit(draft) => {
+                let commit_res = match &mut self.screen {
+                    ActiveScreen::CreateFamily(caf) => {
+                        caf.commit_family_draft(&self.store, &self.neighborhood_id, &draft)
+                    }
+                    _ => Err("Create-a-Family screen is not active".into()),
+                };
+                match commit_res {
+                    Ok(created) => {
+                        self.family_names
+                            .insert(created.family_id, created.family_name.clone());
+                        save_persisted_caf_name(
+                            &self.saves_path,
+                            &self.neighborhood_id,
+                            self.stored.instance_id,
+                            created.family_id,
+                            Some(&created.family_name),
+                        );
+                        if let Err(err) = self.refresh_from_store() {
+                            self.note = Some(format!(
+                                "Created family {} but refresh failed: {err}",
+                                created.family_name
+                            ));
+                        }
+                        self.open_family_bin();
+                        // Pre-select the newly created household so the player can
+                        // immediately click Move In.
+                        if let Some(idx) = self
+                            .family_bin_entries
+                            .iter()
+                            .position(|e| e.id == u32::from(created.family_id))
+                        {
+                            self.family_bin.select(Some(idx), &self.family_bin_entries);
+                        }
+                        self.note = Some(format!(
+                            "Created family {} ({} Sim{}). Ready to Move In!",
+                            created.family_name,
+                            created.members.len(),
+                            if created.members.len() == 1 { "" } else { "s" }
+                        ));
+                        ShellOutcome::redraw()
+                    }
+                    Err(err) => {
+                        if let ActiveScreen::CreateFamily(caf) = &mut self.screen {
+                            caf.set_note(format!("Could not create family: {err}"));
+                        } else {
+                            self.note = Some(format!("Could not create family: {err}"));
+                        }
+                        ShellOutcome::redraw()
+                    }
+                }
+            }
+        }
+    }
+
     /// Enters `house` in the active neighborhood via [`lifecycle::enter_lot`].
     pub fn enter_lot(&mut self, house: u32) -> Result<(), String> {
+        // Capture the neighborhood version BEFORE booting the VM and confirm it
+        // did not advance concurrently so `LotSession` never records a newer
+        // `(instance_id, revision)` than the snapshot that actually booted.
+        let before_nh = self
+            .store
+            .load_neighborhood(&self.neighborhood_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("neighborhood {:?} not found", self.neighborhood_id))?;
         let mut game = Game::open_from_store(
             &self.install_root,
             &self.store,
@@ -1450,17 +2510,39 @@ impl NeighborhoodShell {
             self.play,
             self.frames.clone(),
         )?;
+        let after_nh = self
+            .store
+            .load_neighborhood(&self.neighborhood_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("neighborhood {:?} not found", self.neighborhood_id))?;
+        if after_nh.instance_id != before_nh.instance_id || after_nh.revision != before_nh.revision
+        {
+            return Err(format!(
+                "neighborhood {:?} changed while opening lot {house}; please try again",
+                self.neighborhood_id
+            ));
+        }
+        self.stored = before_nh;
         if self.options_file.is_file() {
             let _ = game.load_options(&self.options_file);
         }
         game.resize(self.size);
+        let initial_days_played = game.lot().world().globals.get(28).copied().unwrap_or(0);
         let next_music = sound::lot_music_mode(game.mode(), game.lot().lot_id());
         self.screen = ActiveScreen::Lot(Box::new(LotSession {
             game,
             neighborhood_id: self.neighborhood_id.clone(),
+            neighborhood_instance_id: self.stored.instance_id,
+            neighborhood_revision: self.stored.revision,
+            staging: None,
             house,
+            last_days_played: initial_days_played,
         }));
+        self.lot_generation = self.lot_generation.wrapping_add(1);
         self.dialog = None;
+        self.save_manager.close();
+        self.save_manager_snapshot = None;
+        self.save_manager_target_lot = Some(house);
         self.note = None;
         self.hovered_lot_id = None;
         self.pressed_lot_id = None;
@@ -1470,11 +2552,29 @@ impl NeighborhoodShell {
     }
 
     /// Leaves the currently open lot back to the Neighborhood map, optionally
-    /// saving through [`lifecycle::save_and_leave_lot`] first and refreshing
+    /// saving through [`lifecycle::save_and_leave_lot`] + rotating background
+    /// autosave first, cleanly draining the background worker, and refreshing
     /// map thumbnails, funds, occupancy, and the Family Bin.
     pub fn leave_lot(&mut self, save_first: bool) -> Result<(), String> {
+        let mut autosave_warning: Option<String> = None;
         if save_first {
             let _ = self.save_current_lot()?;
+            if let Err(err) = self.enqueue_background_lot_save(SaveTarget::Autosave) {
+                autosave_warning = Some(format!(
+                    "Rotating autosave could not be queued (existing saves preserved): {err}"
+                ));
+            }
+        }
+        // Drain any prior completion noise before flushing this leave's jobs so
+        // we accurately report failures from leaving the lot.
+        let _ = self.take_save_completions();
+        self.flush_background_saves();
+        for completion in self.take_save_completions() {
+            if let Err(err) = completion.result {
+                autosave_warning = Some(format!(
+                    "Background save warning (existing saves preserved): {err}"
+                ));
+            }
         }
         self.persist_options();
         self.screen = ActiveScreen::Neighborhood;
@@ -1484,7 +2584,9 @@ impl NeighborhoodShell {
         self.pressed_lot_id = None;
         self.move_in_family_id = None;
         self.dialog = None;
-        self.note = None;
+        self.save_manager.close();
+        self.save_manager_snapshot = None;
+        self.note = autosave_warning;
         self.refresh_from_store()?;
         self.audio_queue
             .push(Input::Events(vec![SoundEvent::StopAll]));
@@ -1591,29 +2693,20 @@ impl NeighborhoodShell {
     }
 
     /// Permanently removes a Family Bin household from the active neighborhood
-    /// in REDB and refreshes the Family Bin list.
+    /// in REDB via [`sims_vm::caf::delete_bin_family`] (vacating `NBRS` slots,
+    /// scrubbing reciprocal relationships, and recording deletion tombstones)
+    /// and refreshes the Family Bin list.
     pub fn execute_delete_family(&mut self, family_id: u16) -> Result<(), String> {
-        let mut stored = self
-            .store
-            .load_neighborhood(&self.neighborhood_id)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("neighborhood {:?} not found", self.neighborhood_id))?;
-        let origin = (stored.instance_id, stored.revision);
-        let Some(fam) = stored.families.get(&family_id) else {
-            return Err(format!("family {family_id} not found"));
-        };
-        if fam.house != 0 || fam.secondary_house() != 0 {
-            return Err(format!("family {family_id} is not in the Family Bin"));
-        }
-        stored.families.remove(&family_id);
-        match self
-            .store
-            .save_neighborhood_checked(&self.neighborhood_id, origin.0, origin.1, &stored)
-            .map_err(|e| e.to_string())?
-        {
-            Ok(_) => {}
-            Err(e) => return Err(format!("could not delete family: {e:?}")),
-        }
+        sims_vm::caf::delete_bin_family(&self.store, &self.neighborhood_id, family_id)
+            .map_err(|e| e.to_string())?;
+        self.family_names.remove(&family_id);
+        save_persisted_caf_name(
+            &self.saves_path,
+            &self.neighborhood_id,
+            self.stored.instance_id,
+            family_id,
+            None,
+        );
         self.refresh_from_store()?;
         Ok(())
     }
@@ -1847,7 +2940,9 @@ impl NeighborhoodShell {
                 ShellOutcome::redraw()
             }
             FamilyBinCommand::CreateNewFamily => {
-                self.note = Some("Create-a-Family is not wired into this screen yet.".into());
+                if let Err(err) = self.open_create_family() {
+                    self.note = Some(format!("Could not open Create-a-Family: {err}"));
+                }
                 ShellOutcome::redraw()
             }
         }
@@ -1857,7 +2952,20 @@ impl NeighborhoodShell {
         match self.nbhd_state.mode.clone() {
             NeighborhoodMode::Normal | NeighborhoodMode::Visit | NeighborhoodMode::Rezone => {
                 if let Err(e) = self.enter_lot(u32::from(lot_id)) {
-                    self.note = Some(format!("Could not enter lot {lot_id}: {e}"));
+                    // Non-destructive corrupt-save fallback: if intact autosaves
+                    // exist for this lot, open the Save Manager with the error banner.
+                    let house = u32::from(lot_id);
+                    if self
+                        .store
+                        .autosaves()
+                        .list_saves_validated(&self.neighborhood_id, house, validate_save_payload)
+                        .is_ok_and(|slots| !slots.is_empty())
+                    {
+                        self.save_manager_target_lot = Some(house);
+                        self.open_save_manager(Some(format!("Could not open lot {lot_id}: {e}")));
+                    } else {
+                        self.note = Some(format!("Could not enter lot {lot_id}: {e}"));
+                    }
                 }
                 ShellOutcome::redraw()
             }
@@ -2019,6 +3127,342 @@ impl NeighborhoodShell {
             ShellDialogKind::Notice => ShellOutcome::redraw(),
         }
     }
+}
+
+/// Saves a lot booted from an ephemeral reconciled staging store through the
+/// full `sims_vm::lifecycle::save_and_leave_lot` pipeline (flushing live person
+/// fields via `people::save_to_record`, recomputing lot values/family flags,
+/// and stamping `saved.deletion_epoch = stored.deletion_epoch`), then commits
+/// the exact produced `(lot_bytes, stored)` atomically to the real store under
+/// strict `(expected_instance_id, expected_revision)` fencing.
+#[allow(clippy::too_many_arguments)]
+fn save_staged_lot_to_store(
+    install_root: &Path,
+    real_store: &NeighborhoodStore,
+    staging_store: &NeighborhoodStore,
+    neighborhood_id: &str,
+    expected_instance_id: u128,
+    expected_revision: u64,
+    house: u32,
+    game: &mut Game,
+) -> Result<(SaveReport, Vec<u8>), String> {
+    let real_nh = real_store
+        .load_neighborhood(neighborhood_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("neighborhood {neighborhood_id:?} not found"))?;
+    if real_nh.instance_id != expected_instance_id {
+        return Err(format!(
+            "neighborhood {neighborhood_id:?} was replaced (expected instance {expected_instance_id:032x}, found {:032x})",
+            real_nh.instance_id
+        ));
+    }
+    if real_nh.revision != expected_revision {
+        return Err(format!(
+            "stale neighborhood {neighborhood_id:?} revision (expected {expected_revision}, found {})",
+            real_nh.revision
+        ));
+    }
+    let mut report = game.save_to_neighborhood(install_root, staging_store, neighborhood_id)?;
+    let lot_bytes = staging_store
+        .load_saved_lot(neighborhood_id, house)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "staged saved lot missing after save".to_owned())?;
+    let staged_nh = staging_store
+        .load_neighborhood(neighborhood_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "staged neighborhood missing after save".to_owned())?;
+    let committed = real_store
+        .save_lot_and_neighborhood_checked(
+            neighborhood_id,
+            house,
+            Some((expected_instance_id, expected_revision)),
+            &lot_bytes,
+            &staged_nh,
+            &[],
+        )
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("checked neighborhood commit failed: {e:?}"))?;
+    report.revision = committed.1;
+    Ok((report, lot_bytes))
+}
+
+/// Flushes every live person's persistent `data` words (`0x423827`, revision 9)
+/// into its `NBRS` slot on `world`, mirroring `sims_vm::people::save_to_record`
+/// (`0x425a69`).
+fn flush_live_people_to_neighbors(world: &mut sims_sim::World) -> Result<(), String> {
+    const NEIGHBOR_WORD: usize = 31;
+    const SAVED_REVISION: i32 = 9;
+    // Exact `0x423827` table through revision 9 (`sims_vm::people::persistent_fields(9)`).
+    const PERSISTENT_FIELDS_REV9: &[usize] = &[
+        2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 16, 20, 15, 26, 17, 18, 46, 47, 48, 49, 50, 51, 52, 53,
+        13, 14, 58, 60, 61, 56, 57, 63, 65, 67, 68, 69, 74, 54, 55, 75, 76, 80, 81, 82,
+    ];
+    for person_id in world.people.clone() {
+        let Some(person) = world
+            .objects
+            .get(&person_id)
+            .and_then(|o| o.person.as_ref())
+        else {
+            continue;
+        };
+        let mut values = Vec::with_capacity(PERSISTENT_FIELDS_REV9.len());
+        for &word in PERSISTENT_FIELDS_REV9 {
+            values.push(
+                *person
+                    .data
+                    .get(word)
+                    .ok_or_else(|| format!("person {person_id} missing data word {word}"))?,
+            );
+        }
+        let neighbor_id = person.data.get(NEIGHBOR_WORD).copied().unwrap_or(0);
+        let Some(record) = world.neighbors.get_mut(neighbor_id) else {
+            continue;
+        };
+        record.revision = SAVED_REVISION;
+        for (&word, value) in PERSISTENT_FIELDS_REV9.iter().zip(values) {
+            if let Some(slot) = record.data.get_mut(word) {
+                *slot = value;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Persists a lot whose `neighborhood_origin` was cleared by a world-mutating
+/// cheat (`Lot::restore`) by flushing live person fields and running the full
+/// `sims_vm::lifecycle::save_and_leave_lot` pipeline inside an ephemeral
+/// staging store (so `people::save_to_record`, `update_lot_values`,
+/// `family_flags`, and `saved.deletion_epoch` match normal saves exactly), then
+/// committing atomically to `store` under strict `(expected_instance_id,
+/// expected_revision)` fencing.
+#[allow(clippy::too_many_arguments)]
+fn save_cheat_mutated_lot_to_store(
+    install_root: &Path,
+    store: &NeighborhoodStore,
+    neighborhood_id: &str,
+    expected_instance_id: u128,
+    expected_revision: u64,
+    house: u32,
+    arch_multiplier: f32,
+    answers: &[u8],
+    frames: Frames,
+    game: &mut Game,
+) -> Result<(SaveReport, Vec<u8>), String> {
+    let snapshot = store
+        .load_lot_snapshot(neighborhood_id, house)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("neighborhood {neighborhood_id:?} not found"))?;
+    if snapshot.neighborhood.instance_id != expected_instance_id {
+        return Err(format!(
+            "neighborhood {neighborhood_id:?} was replaced (expected instance {expected_instance_id:032x}, found {:032x})",
+            snapshot.neighborhood.instance_id
+        ));
+    }
+    if snapshot.neighborhood.revision != expected_revision {
+        return Err(format!(
+            "stale neighborhood {neighborhood_id:?} revision (expected {expected_revision}, found {})",
+            snapshot.neighborhood.revision
+        ));
+    }
+    let raw_saved = game.save()?;
+    let mut flushed_world = raw_saved.world().clone();
+    flush_live_people_to_neighbors(&mut flushed_world)?;
+    let flushed_saved_bytes = splice_world_into_saved_bytes(&raw_saved, &flushed_world)?;
+
+    let mut staging_nh = snapshot.neighborhood.clone();
+    let fam_id = staging_nh.family_in(house).map_or(0, |(id, _)| id);
+    let b = &flushed_world.budget;
+    let total_val = lot_total_value(
+        b.lot_value,
+        b.objects_value,
+        b.architecture_value,
+        arch_multiplier,
+    );
+    staging_nh.write_back_world(&flushed_world, house, fam_id, total_val, None, 50);
+
+    let staging_dir = TempStagingDir::new("cheat-save")?;
+    let staging_store = NeighborhoodStore::open(&staging_dir.path().join("stage.redb"))
+        .map_err(|e| e.to_string())?;
+    for (file_name, bytes) in &snapshot.character_files {
+        staging_store
+            .save_character_file(neighborhood_id, file_name, bytes)
+            .map_err(|e| e.to_string())?;
+    }
+    if let Some(base_house) = &snapshot.base_house {
+        staging_store
+            .save_base_house(neighborhood_id, house, base_house)
+            .map_err(|e| e.to_string())?;
+    }
+    staging_store
+        .save_lot_and_neighborhood(neighborhood_id, house, &flushed_saved_bytes, &staging_nh)
+        .map_err(|e| e.to_string())?;
+
+    let mut staged_lot = lifecycle::enter_lot(
+        install_root,
+        &staging_store,
+        neighborhood_id,
+        house,
+        answers,
+        frames,
+    )
+    .map_err(|e| format!("staging cheat save boot failed: {e}"))?;
+    let mut report = lifecycle::save_and_leave_lot(
+        install_root,
+        &staging_store,
+        neighborhood_id,
+        &mut staged_lot,
+    )
+    .map_err(|e| format!("staging cheat save writeback failed: {e}"))?;
+    let lot_bytes = staging_store
+        .load_saved_lot(neighborhood_id, house)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "staged cheat save bytes missing".to_owned())?;
+    let final_nh = staging_store
+        .load_neighborhood(neighborhood_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "staged cheat save neighborhood missing".to_owned())?;
+
+    let committed = store
+        .save_lot_and_neighborhood_checked(
+            neighborhood_id,
+            house,
+            Some((expected_instance_id, expected_revision)),
+            &lot_bytes,
+            &final_nh,
+            &[],
+        )
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("checked neighborhood commit failed: {e:?}"))?;
+    let ticks = game.lot().ticks();
+    game.mark_saved_clean(format!("Saved after tick {ticks}."));
+    report.revision = committed.1;
+    Ok((report, lot_bytes))
+}
+
+struct TempStagingDir(PathBuf);
+
+impl TempStagingDir {
+    fn new(tag: &str) -> Result<Self, String> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let id = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("sims-game-stage-{tag}-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create staging dir: {e}"))?;
+        Ok(Self(dir))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempStagingDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn splice_world_into_saved_bytes(
+    base_saved: &Saved,
+    world: &sims_sim::World,
+) -> Result<Vec<u8>, String> {
+    let orig_world_body = base_saved.world().encode();
+    let encoded = base_saved.encode();
+    let saved_body = encoded
+        .get(8..)
+        .ok_or_else(|| "invalid base Saved header".to_owned())?;
+    let tail = saved_body
+        .strip_prefix(orig_world_body.as_slice())
+        .ok_or_else(|| "base Saved world prefix mismatch".to_owned())?;
+    let new_world_body = world.encode();
+    let mut rebuilt = Vec::with_capacity(8 + new_world_body.len() + tail.len());
+    rebuilt.extend_from_slice(&encoded[..8]);
+    rebuilt.extend_from_slice(&new_world_body);
+    rebuilt.extend_from_slice(tail);
+    let _ = Saved::decode(&rebuilt).map_err(|e| e.to_string())?;
+    Ok(rebuilt)
+}
+
+fn caf_names_sidecar_path(saves_path: &Path) -> PathBuf {
+    saves_path.with_extension("caf-names.tsv")
+}
+
+fn load_family_names_with_caf(
+    user_dir: &Path,
+    saves_path: &Path,
+    neighborhood_id: &str,
+    instance_id: u128,
+    stored: &StoredNeighborhood,
+) -> BTreeMap<u16, String> {
+    let mut names = load_family_names(user_dir);
+    let sidecar = caf_names_sidecar_path(saves_path);
+    let Ok(text) = std::fs::read_to_string(&sidecar) else {
+        return names;
+    };
+    let inst_hex = format!("{instance_id:032x}");
+    for line in text.lines() {
+        let mut parts = line.splitn(4, '\t');
+        let (Some(nh), Some(inst), Some(fam_str), Some(surname)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if nh == neighborhood_id
+            && inst == inst_hex
+            && let Ok(fam_id) = fam_str.parse::<u16>()
+            && stored.families.contains_key(&fam_id)
+            && !surname.trim().is_empty()
+        {
+            names.insert(fam_id, surname.to_owned());
+        }
+    }
+    names
+}
+
+fn save_persisted_caf_name(
+    saves_path: &Path,
+    neighborhood_id: &str,
+    instance_id: u128,
+    family_id: u16,
+    surname: Option<&str>,
+) {
+    let sidecar = caf_names_sidecar_path(saves_path);
+    let inst_hex = format!("{instance_id:032x}");
+    let mut entries: BTreeMap<(String, String, u16), String> = BTreeMap::new();
+    if let Ok(text) = std::fs::read_to_string(&sidecar) {
+        for line in text.lines() {
+            let mut parts = line.splitn(4, '\t');
+            if let (Some(nh), Some(inst), Some(fam_str), Some(name)) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+                && let Ok(fid) = fam_str.parse::<u16>()
+                && !name.is_empty()
+            {
+                entries.insert((nh.to_owned(), inst.to_owned(), fid), name.to_owned());
+            }
+        }
+    }
+    let key = (neighborhood_id.to_owned(), inst_hex, family_id);
+    match surname.map(|s| s.replace(['\t', '\r', '\n'], " ")) {
+        Some(clean) if !clean.trim().is_empty() => {
+            entries.insert(key, clean.trim().to_owned());
+        }
+        _ => {
+            entries.remove(&key);
+        }
+    }
+    let mut out = String::new();
+    for ((nh, inst, fid), name) in entries {
+        out.push_str(&nh);
+        out.push('\t');
+        out.push_str(&inst);
+        out.push('\t');
+        out.push_str(&fid.to_string());
+        out.push('\t');
+        out.push_str(&name);
+        out.push('\n');
+    }
+    let _ = std::fs::write(&sidecar, out);
 }
 
 fn resolve_dir_case_insensitive(dir: &Path, name: &str) -> Option<PathBuf> {

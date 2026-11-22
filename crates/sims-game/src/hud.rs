@@ -18,6 +18,7 @@ use sims_ui::build::{self, BuildCatalog, BuildLayout, BuildState, BuildSwatches,
 use sims_ui::buy::{
     self, BuyCatalog, BuyLayout, BuyState, BuyWidgetKind, RatingLabels, SellInfo, SellLabels,
 };
+use sims_ui::cheat_console::CheatConsole;
 use sims_ui::command::{
     BuildItemId, Command, Mode, OptionsAction, Panel as UiPanel, VolumeChannel, Walls as UiWalls,
 };
@@ -163,6 +164,13 @@ pub struct Hud {
     /// `0x5e45d2..0x5e45f3`). Hit-tested against its live layout rectangle on
     /// release so a mid-press resize cannot fire an unhovered button.
     pressed_options_action: Option<OptionsAction>,
+    /// Whether the Options-strip "Saves" (Load / Manage Saves) button is currently pressed.
+    pressed_saves_button: bool,
+    /// Last laid-out screen rect of the Options-strip "Saves" button (present only
+    /// while `Mode::Options` is expanded).
+    saves_button_rect: Option<Rect>,
+    /// Classic Sims 1 top-left cheat console (`Ctrl+Shift+C` / `Cmd+Shift+C`).
+    pub cheat_console: CheatConsole,
     /// The pie menu, while one is open.
     pub menu: Option<Menu>,
     /// The status band across the top, as last drawn.
@@ -256,7 +264,10 @@ impl HudStatic {
                 let optional: Vec<i32> = hud::OPTIONAL_RESOURCES
                     .iter()
                     .chain(&options::HELP_RESOURCES)
-                    .chain(&[options::id::SAVE_CARD])
+                    .chain(&[
+                        options::id::SAVE_CARD,
+                        sims_ui::neighborhood::art_id::POPUP_TILER,
+                    ])
                     .copied()
                     .chain(buy::resource_ids())
                     .chain(build::resource_ids())
@@ -506,6 +517,9 @@ impl Hud {
             dialog: None,
             dragging_slider: None,
             pressed_options_action: None,
+            pressed_saves_button: false,
+            saves_button_rect: None,
+            cheat_console: CheatConsole::new(),
             menu: None,
             band: None,
             queue: Queue::default(),
@@ -541,6 +555,8 @@ impl Hud {
         self.dialog = None;
         self.dragging_slider = None;
         self.pressed_options_action = None;
+        self.pressed_saves_button = false;
+        self.saves_button_rect = None;
         self.controls.pressed_options_action = None;
         self.controls.help = None;
         self.controls.options.tab = None;
@@ -914,13 +930,38 @@ impl Hud {
         }
     }
 
-    /// Advances the active dialog's `cTSWinTextEdit2` 500 ms caret blink timer.
+    /// Advances the active dialog's `cTSWinTextEdit2` 500 ms caret blink timer
+    /// (and the open cheat console's caret blink timer).
     pub fn sync_dialog_blink(&mut self, clock_us: u64) -> bool {
-        if self.active_message().is_some_and(|m| m.entry.is_some()) {
+        let dialog_changed = if self.active_message().is_some_and(|m| m.entry.is_some()) {
             self.dialog_state.sync_blink(clock_us)
         } else {
             false
+        };
+        let cheat_changed = self.cheat_console.sync_blink(clock_us);
+        dialog_changed || cheat_changed
+    }
+
+    /// Screen rectangle of the Options-strip "Saves" button (present only while
+    /// Options mode is expanded).
+    pub fn options_saves_button_rect(&self) -> Option<Rect> {
+        self.saves_button_rect
+    }
+
+    /// Releases a held Options-strip "Saves" button, returning `(changed, activated)`.
+    pub fn release_saves_button(&mut self, point: Option<[i32; 2]>) -> (bool, bool) {
+        if !self.pressed_saves_button {
+            return (false, false);
         }
+        self.pressed_saves_button = false;
+        let activated = point.is_some_and(|[x, y]| {
+            self.saves_button_rect
+                .is_some_and(|rect| rect.contains(x, y))
+        });
+        if activated {
+            self.play(CLICK);
+        }
+        (true, activated)
     }
 
     /// Types `ch` into the active dialog's text entry field.
@@ -1503,6 +1544,10 @@ impl Hud {
             &self.items,
             &self.controls,
         );
+        self.saves_button_rect = self.compute_options_saves_button_rect(view.size);
+        if let Some(rect) = self.saves_button_rect {
+            self.draw_options_saves_button(&mut frame, rect);
+        }
         if self.controls.mode == Mode::Buy && self.controls.expanded {
             self.layout_buy(view.size, world, assets, sell);
             let mut guids: Vec<u32> = self
@@ -1595,7 +1640,72 @@ impl Hud {
             menu.draw_labels(&mut frame, &self.art, self.controls.pointer);
         }
         self.band = status.and_then(|status| self.status(&mut frame, status));
+        if self.cheat_console.is_open() {
+            self.cheat_console.draw(&mut frame, &self.art);
+        }
         canvas.color = frame.into_rgb();
+    }
+
+    fn compute_options_saves_button_rect(&self, size: [i32; 2]) -> Option<Rect> {
+        if self.controls.mode != Mode::Options || !self.controls.expanded {
+            return None;
+        }
+        let quit = self
+            .items
+            .iter()
+            .find(|i| i.command == Some(Command::OptionsAction(OptionsAction::Quit)))?;
+        let divider_x = self
+            .items
+            .iter()
+            .find(|i| {
+                matches!(
+                    i.kind,
+                    hud::Kind::Image(id) if id == options::id::TOOTHPICK_VERT
+                )
+            })
+            .map(|i| i.rect.x)?;
+        let left = quit.rect.x + quit.rect.width + 4;
+        let avail = divider_x - left - 3;
+        if avail >= 42 {
+            Some(Rect::new(left, quit.rect.y + 6, avail.min(48), 28))
+        } else {
+            // Compact window fallback: sit neatly in the bottom-right corner of the strip.
+            let x = (size[0] - 54).max(divider_x + 4);
+            let y = (size[1] - 26).max(0);
+            Some(Rect::new(x, y, 48, 22))
+        }
+    }
+
+    fn draw_options_saves_button(&self, frame: &mut Frame, rect: Rect) {
+        let hovered = self
+            .controls
+            .pointer
+            .is_some_and(|[px, py]| rect.contains(px, py));
+        let (bg, border, text_rgb) = if self.pressed_saves_button && hovered {
+            ([30, 88, 176], [0, 255, 255], [0, 255, 255])
+        } else if hovered {
+            ([26, 62, 146], [136, 178, 232], [255, 255, 255])
+        } else {
+            ([16, 36, 108], [88, 120, 204], [195, 205, 205])
+        };
+        frame.fill(rect, bg);
+        frame.fill(Rect::new(rect.x, rect.y, rect.width, 1), border);
+        frame.fill(
+            Rect::new(rect.x, rect.y + rect.height - 1, rect.width, 1),
+            border,
+        );
+        frame.fill(Rect::new(rect.x, rect.y, 1, rect.height), border);
+        frame.fill(
+            Rect::new(rect.x + rect.width - 1, rect.y, 1, rect.height),
+            border,
+        );
+        if let Some(font) = self.art.font(10).or_else(|| self.art.font(12)) {
+            let label = "Saves";
+            let tw = font.width(label);
+            let tx = rect.x + (rect.width - tw) / 2;
+            let ty = rect.y + (rect.height - font.line_height) / 2;
+            font.draw(frame, label, [tx, ty], text_rgb);
+        }
     }
 
     /// A line of text on a band across the top of the frame; the band.
@@ -1762,6 +1872,9 @@ impl Hud {
                 .iter()
                 .rposition(|w| w.rect.contains(x, y))
         };
+        let over_saves = |pointer: Option<[i32; 2]>| {
+            pointer.is_some_and(|[x, y]| self.saves_button_rect.is_some_and(|r| r.contains(x, y)))
+        };
         let before = (
             hud::hovered(&self.items, self.controls.pointer),
             hud::lit_relation(&self.items, self.controls.pointer),
@@ -1769,6 +1882,7 @@ impl Hud {
             entry(self.controls.pointer),
             buy_widget(self.controls.pointer),
             build_widget(self.controls.pointer),
+            over_saves(self.controls.pointer),
         );
         self.controls.pointer = Some(point);
         let hovered_changed = (
@@ -1778,6 +1892,7 @@ impl Hud {
             entry(self.controls.pointer),
             buy_widget(self.controls.pointer),
             build_widget(self.controls.pointer),
+            over_saves(self.controls.pointer),
         ) != before;
         let dismissed_live = self.controls.help.is_some()
             && !hud::in_subpanel(&self.items, point)
@@ -1894,6 +2009,13 @@ impl Hud {
             self.dismiss_help();
             return None;
         }
+        if self
+            .saves_button_rect
+            .is_some_and(|r| r.contains(point[0], point[1]))
+        {
+            self.pressed_saves_button = true;
+            return None;
+        }
         if self.controls.mode == Mode::Live
             && let Some(command) = self.press_queue(point)
         {
@@ -1987,10 +2109,16 @@ impl Hud {
     /// the opening press, opens or leaves a submenu, chooses an entry, or
     /// closes the menu.
     pub fn release_menu(&mut self, point: [i32; 2]) -> (Release, Option<Command>) {
+        self.release_menu_at(point, 0)
+    }
+
+    /// Like [`Hud::release_menu`], driving submenu transitions on
+    /// [`sims_people::pie_head::PieAnimState`] at `now_ms`.
+    pub fn release_menu_at(&mut self, point: [i32; 2], now_ms: u32) -> (Release, Option<Command>) {
         let Some(mut menu) = self.menu.take() else {
             return (Release::Closed, None);
         };
-        let release = menu.release(&self.art, point);
+        let release = menu.release_at(&self.art, point, now_ms);
         match release {
             Release::Chose(choice) => {
                 let command =
