@@ -38,8 +38,13 @@ and `Export/Alice_7.FAM`).
   (2) write each `User%05d.iff` (invisible to concurrent `load_lot_snapshot` /
   `enter_lot` and safe across mid-write crashes because its GUID is suppressed
   by `deleted_characters`), and (3) atomically publish `FAMI`, `NBRS`, and
-  un-tombstoned GUIDs via `save_neighborhood_checked`. A follow-up `sims-sim`
-  helper can later collapse these phases into a single REDB write transaction.
+  un-tombstoned GUIDs via `save_neighborhood_checked`. Because
+  `NeighborhoodStore::save_character_file` is currently an unchecked single-file
+  write in `sims-sim`, callers must not race `NeighborhoodStore::import_directory`
+  (replacing the same neighborhood ID) against an in-flight CAF commit; a
+  follow-up `sims-sim` helper (`save_characters_and_neighborhood_checked`)
+  should collapse these phases into a single checked REDB write transaction once
+  `crates/sims-sim` is free to modify.
 
 ## Complete Collection 1.91 Parity Verified Against `caf-create-family-20261121`
 

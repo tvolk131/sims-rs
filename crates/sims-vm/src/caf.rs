@@ -1739,6 +1739,13 @@ fn checked_save_neighborhood(
 /// 3. **Phase 3 (Atomic publication):** Atomically checks the post-Phase-2
 ///    `(expected_instance, expected_revision)` and writes `final_stored`
 ///    (un-tombstoning the new GUIDs and publishing `FAMI` + `NBRS` together).
+///
+/// Note: Because `NeighborhoodStore::save_character_file` is currently an
+/// unchecked single-file write in `sims-sim`, callers must not race
+/// `NeighborhoodStore::import_directory` (replacing the same neighborhood ID)
+/// against an in-flight CAF commit until a follow-up `sims-sim` API commits
+/// character files and neighborhood metadata inside one checked write
+/// transaction.
 fn persist_household_staged(
     store: &NeighborhoodStore,
     neighborhood_id: &str,
@@ -2139,6 +2146,7 @@ fn parse_finv(bytes: &[u8]) -> Result<Vec<Option<Inventory>>, CafError> {
         ));
     }
     let mut inventories = Vec::with_capacity(count);
+    let mut seen_neighbors = BTreeSet::new();
     for _ in 0..count {
         match read_i32(&mut pos)? {
             0 => inventories.push(None),
@@ -2149,6 +2157,11 @@ fn parse_finv(bytes: &[u8]) -> Result<Vec<Option<Inventory>>, CafError> {
                     return Err(CafError::TemplateInvalid(
                         "FINV #2 item count exceeds chunk length".into(),
                     ));
+                }
+                if !seen_neighbors.insert(neighbor) {
+                    return Err(CafError::TemplateInvalid(format!(
+                        "FINV #2 contains duplicate inventory row for neighbor {neighbor}"
+                    )));
                 }
                 let mut items = Vec::with_capacity(item_count);
                 for _ in 0..item_count {
@@ -2305,9 +2318,11 @@ pub fn export_family_fam(
     }
     let fams = encode_fams(family_name, language)?;
 
-    // Index character IFFs by OBJD GUID across both loose `.iff` and `.far` archives.
+    // Index character IFFs by OBJD GUID, scanning `.far` archives before loose
+    // `.iff` files so loose character files take precedence over shadowed FAR
+    // archive members (matching `Index::add_character_files`).
     let mut char_iffs_by_guid: BTreeMap<u32, Iff> = BTreeMap::new();
-    visit_character_blobs(character_files, |_, bytes| {
+    let mut index_iff = |bytes: &[u8]| {
         if let Ok(iff) = Iff::parse(bytes.to_vec()) {
             for chunk in iff.all(b"OBJD") {
                 if let Some(raw) = iff.data(chunk).get(0x1c..0x20) {
@@ -2316,7 +2331,32 @@ pub fn export_family_fam(
                 }
             }
         }
-    });
+    };
+    for (key, bytes) in character_files {
+        if key.to_ascii_lowercase().ends_with(".far") {
+            let file_len = bytes.len() as u64;
+            if let Ok(offset) = manifest_offset(bytes, file_len)
+                && directory_len(offset, file_len).is_ok()
+                && let Ok(entries) = far_directory(&bytes[offset as usize..], file_len)
+            {
+                for entry in entries {
+                    if !entry.within_payload(offset) {
+                        continue;
+                    }
+                    let start = entry.offset as usize;
+                    let end = start.saturating_add(entry.stored_size as usize);
+                    if let Some(slice) = bytes.get(start..end) {
+                        index_iff(slice);
+                    }
+                }
+            }
+        }
+    }
+    for (key, bytes) in character_files {
+        if !key.to_ascii_lowercase().ends_with(".far") {
+            index_iff(bytes);
+        }
+    }
 
     let mut used_ctss_ids = BTreeSet::from([1000u16]);
     let mut member_ids = Vec::with_capacity(family.members.len());
@@ -3344,5 +3384,107 @@ mod tests {
             export_family_fam(&stored, &chars, 1, "Collide", 1, true),
             Err(CafError::TemplateInvalid(_))
         ));
+    }
+
+    #[test]
+    fn parse_finv_rejects_duplicate_owner_rows() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        raw.extend_from_slice(&STREAM_VERSION_COMPLETE_COLLECTION.to_le_bytes());
+        raw.extend_from_slice(b"VNIF");
+        raw.extend_from_slice(&2u32.to_le_bytes());
+        for item_guid in [0x1111_1111u32, 0x2222_2222u32] {
+            raw.extend_from_slice(&1i32.to_le_bytes());
+            raw.extend_from_slice(&5i16.to_le_bytes()); // duplicate neighbor 5
+            raw.extend_from_slice(&1u32.to_le_bytes());
+            raw.extend_from_slice(&1i32.to_le_bytes());
+            raw.extend_from_slice(&item_guid.to_le_bytes());
+            raw.extend_from_slice(&1u16.to_le_bytes());
+        }
+        assert!(matches!(
+            parse_finv(&raw),
+            Err(CafError::TemplateInvalid(_))
+        ));
+    }
+
+    #[test]
+    fn export_family_fam_prefers_loose_iff_over_shadowed_far_member() {
+        let tpl = synthetic_template_iff();
+        let make_spec = |name: &str| SimSpec {
+            first_name: name.into(),
+            bio: String::new(),
+            age: Age::Adult,
+            gender: Gender::Female,
+            skin_tone: SkinTone::Light,
+            body_appearance: "b002fafit_01".into(),
+            body_texture: "b002fafitlgt_mom02".into(),
+            head_appearance: "c809fa_beth".into(),
+            head_texture: "c809falgt_beth3".into(),
+            personality: Personality::new(5, 5, 5, 5, 5).unwrap(),
+            portraits: None,
+        };
+        let guid = 0x7777_0042u32;
+        let stale_iff =
+            synthesize_character_iff(&tpl, &make_spec("StaleFar"), guid, 1, 1, None).unwrap();
+        let loose_iff =
+            synthesize_character_iff(&tpl, &make_spec("FreshLoose"), guid, 1, 1, None).unwrap();
+
+        // Put `stale_iff` inside `zzz_archive.far` (sorts lexicographically AFTER `User00001.iff`).
+        let member_name = b"User00001.iff";
+        let payload_offset = 16u32;
+        let manifest_off = payload_offset + stale_iff.len() as u32;
+        let mut far = Vec::new();
+        far.extend_from_slice(b"FAR!byAZ");
+        far.extend_from_slice(&1u32.to_le_bytes());
+        far.extend_from_slice(&manifest_off.to_le_bytes());
+        far.extend_from_slice(&stale_iff);
+        far.extend_from_slice(&1u32.to_le_bytes());
+        far.extend_from_slice(&(stale_iff.len() as u32).to_le_bytes());
+        far.extend_from_slice(&(stale_iff.len() as u32).to_le_bytes());
+        far.extend_from_slice(&payload_offset.to_le_bytes());
+        far.extend_from_slice(&(member_name.len() as u32).to_le_bytes());
+        far.extend_from_slice(member_name);
+
+        let mut rng = CrtRng::from_state(7);
+        let neighbor = synthesize_neighbor(&make_spec("FreshLoose"), 1, guid, 1, 1, &mut rng);
+        let stored = StoredNeighborhood {
+            name: "Precedence".into(),
+            families: BTreeMap::from([(
+                1,
+                Family {
+                    version: 9,
+                    house: 0,
+                    number: 1,
+                    budget: 20_000,
+                    architecture_value: 0,
+                    friends: 0,
+                    flags: CAF_INITIAL_FAMILY_FLAGS,
+                    members: vec![guid],
+                    tail: vec![0; 16],
+                },
+            )]),
+            neighbors: vec![Some(neighbor)],
+            inventories: Vec::new(),
+            data: [0; 16],
+            options: None,
+            type_attributes: None,
+            zoning: BTreeMap::new(),
+            lot_rows: Vec::new(),
+            made_characters: sims_sim::characters::Characters::default(),
+            deleted_characters: BTreeSet::new(),
+            deletion_epoch: 0,
+            deleted_at_epoch: BTreeMap::new(),
+            instance_id: 1,
+            revision: 0,
+        };
+        let chars = BTreeMap::from([
+            ("User00001.iff".to_owned(), loose_iff),
+            ("zzz_archive.far".to_owned(), far),
+        ]);
+        let fam_bytes = export_family_fam(&stored, &chars, 1, "Precedence", 1, false).unwrap();
+        let parsed = FamilyFile::parse(&fam_bytes).unwrap();
+        let ctss =
+            StringTable::parse(parsed.members.get(&1).unwrap().ctss.as_deref().unwrap()).unwrap();
+        assert_eq!(ctss.get(0, 1), Some("FreshLoose"));
     }
 }
