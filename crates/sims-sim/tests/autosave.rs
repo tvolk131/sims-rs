@@ -554,11 +554,43 @@ fn shared_neighborhood_store_and_background_worker_cow_world_commits() {
     nh_store
         .save_neighborhood("UserData2", &sample_neighborhood("UserData2"))
         .unwrap();
+    let ud1_instance = nh_store
+        .load_neighborhood("UserData")
+        .unwrap()
+        .unwrap()
+        .instance_id;
+    let ud2_instance = nh_store
+        .load_neighborhood("UserData2")
+        .unwrap()
+        .unwrap()
+        .instance_id;
 
     // Share the exact same REDB database handle with a background worker thread.
     let worker_autosaves = nh_store
         .autosaves_with_policy(AutosavePolicy::new(3).unwrap())
         .unwrap();
+
+    // Shared handles reject jobs that omit `expected_instance_id` or pass `0`.
+    assert!(matches!(
+        worker_autosaves.commit_job(SaveJob::autosave(
+            "UserData",
+            5,
+            1,
+            SavePayload::saved_lot(b"unfenced".to_vec()),
+        )),
+        Err(SaveError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        worker_autosaves.commit_job(SaveJob::autosave_for_instance(
+            "UserData",
+            0,
+            5,
+            1,
+            SavePayload::saved_lot(b"zero-id".to_vec()),
+        )),
+        Err(SaveError::InvalidInput(_))
+    ));
+
     let (tx, rx) = mpsc::channel::<SaveJob>();
     let worker = std::thread::spawn(move || {
         let mut results = Vec::new();
@@ -580,8 +612,9 @@ fn shared_neighborhood_store_and_background_worker_cow_world_commits() {
 
         let snapshot = world.clone();
         tx.send(
-            SaveJob::autosave(
+            SaveJob::autosave_for_instance(
                 "UserData",
+                ud1_instance,
                 5,
                 u64::from(world.ticks),
                 SavePayload::from_world(snapshot),
@@ -601,8 +634,9 @@ fn shared_neighborhood_store_and_background_worker_cow_world_commits() {
     world.budget.funds = 25_000;
     let nh2_hash = world.hash();
     tx.send(
-        SaveJob::manual(
+        SaveJob::manual_for_instance(
             "UserData2",
+            ud2_instance,
             5,
             u64::from(world.ticks),
             SavePayload::from_world(world.clone()),
@@ -635,8 +669,160 @@ fn shared_neighborhood_store_and_background_worker_cow_world_commits() {
     assert_eq!(nh2_loaded.decode_world().unwrap().hash(), nh2_hash);
 
     // Deleting neighborhood "UserData" atomically cleans up its autosaves
-    // without touching "UserData2"'s saves.
+    // without touching "UserData2"'s saves, AND a late queued job carrying
+    // `ud1_instance` fails cleanly without recreating orphaned saves.
     assert!(nh_store.delete_neighborhood("UserData").unwrap());
     assert!(autosaves.list_saves("UserData", 5).unwrap().is_empty());
     assert_eq!(autosaves.list_saves("UserData2", 5).unwrap().len(), 1);
+
+    let late_after_delete = autosaves.commit_job(SaveJob::autosave_for_instance(
+        "UserData",
+        ud1_instance,
+        5,
+        999,
+        SavePayload::from_world(world.clone()),
+    ));
+    assert!(matches!(
+        late_after_delete,
+        Err(SaveError::StaleNeighborhoodInstance {
+            expected_instance_id,
+            current_instance_id: None,
+            ..
+        }) if expected_instance_id == ud1_instance
+    ));
+    assert!(autosaves.list_saves("UserData", 5).unwrap().is_empty());
+
+    // Recreating "UserData" mints a new instance_id; a late manual or autosave
+    // job from the old instance cannot overwrite the replacement's manual save!
+    nh_store
+        .save_neighborhood("UserData", &sample_neighborhood("UserData"))
+        .unwrap();
+    let replacement_instance = nh_store
+        .load_neighborhood("UserData")
+        .unwrap()
+        .unwrap()
+        .instance_id;
+    assert_ne!(replacement_instance, ud1_instance);
+    autosaves
+        .commit_job(SaveJob::manual_for_instance(
+            "UserData",
+            replacement_instance,
+            5,
+            10,
+            SavePayload::saved_lot(b"replacement-manual".to_vec()),
+        ))
+        .unwrap();
+
+    let late_after_replace = autosaves.commit_job(SaveJob::manual_force_replace_for_instance(
+        "UserData",
+        ud1_instance,
+        5,
+        999,
+        SavePayload::saved_lot(b"stale-overwrite".to_vec()),
+    ));
+    assert!(matches!(
+        late_after_replace,
+        Err(SaveError::StaleNeighborhoodInstance {
+            expected_instance_id,
+            current_instance_id: Some(current),
+            ..
+        }) if expected_instance_id == ud1_instance && current == replacement_instance
+    ));
+    assert_eq!(
+        autosaves.load_manual("UserData", 5).unwrap().payload,
+        b"replacement-manual"
+    );
+}
+
+#[test]
+fn validated_commits_pruning_and_fallback_reject_malformed_payloads() {
+    let db = TempDb::new("validated-payloads");
+    let store = AutosaveStore::open_with_policy(&db.0, AutosavePolicy::new(1).unwrap()).unwrap();
+
+    let lot_validator = |kind: &SavePayloadKind, bytes: &[u8]| -> Result<(), String> {
+        if *kind == SavePayloadKind::SavedLot && !bytes.starts_with(b"LOT!") {
+            return Err("missing LOT! payload magic".into());
+        }
+        Ok(())
+    };
+
+    // 1. Write one valid SavedLot slot with max_autosaves = 1.
+    let s1 = store
+        .commit_job_validated(
+            SaveJob::autosave(
+                "UserData",
+                5,
+                10,
+                SavePayload::saved_lot(b"LOT!good-1".to_vec()),
+            ),
+            lot_validator,
+        )
+        .unwrap();
+    assert_eq!(s1.slot, SaveSlot::Autosave(1));
+
+    // 2. Attempting to write a malformed SavedLot via `commit_job_validated`
+    //    is rejected BEFORE touching REDB, so slot 1 is never evicted!
+    assert!(matches!(
+        store.commit_job_validated(
+            SaveJob::autosave(
+                "UserData",
+                5,
+                20,
+                SavePayload::saved_lot(b"BAD-LOT".to_vec())
+            ),
+            lot_validator,
+        ),
+        Err(SaveError::DecodeFailed { .. })
+    ));
+    assert_eq!(
+        store
+            .load_latest_intact_autosave_validated("UserData", 5, lot_validator)
+            .unwrap()
+            .loaded
+            .payload,
+        b"LOT!good-1"
+    );
+
+    // 3. Even if an unusable SavedLot was written into a newer slot (say by a
+    //    store opened without a validator), validated fallback skips it without
+    //    deleting it and returns the usable predecessor!
+    let store_keep_2 = store.with_policy(AutosavePolicy::new(2).unwrap()).unwrap();
+    let s2 = store_keep_2
+        .save_autosave(
+            "UserData",
+            5,
+            30,
+            None,
+            "Unusable",
+            SavePayload::saved_lot(b"NOT-A-LOT".to_vec()),
+        )
+        .unwrap();
+    assert_eq!(s2.slot, SaveSlot::Autosave(2));
+
+    let recovered = store
+        .load_latest_intact_autosave_validated("UserData", 5, lot_validator)
+        .unwrap();
+    assert_eq!(recovered.loaded.metadata.slot, SaveSlot::Autosave(1));
+    assert_eq!(recovered.loaded.payload, b"LOT!good-1");
+    assert_eq!(recovered.skipped_corrupt.len(), 1);
+    assert_eq!(recovered.skipped_corrupt[0].0, SaveSlot::Autosave(2));
+
+    // 4. `load_with_fallback_validated` also prefers direct lookup of a healthy
+    //    manual slot without tripping on unusable ring slots.
+    store
+        .commit_job_validated(
+            SaveJob::manual(
+                "UserData",
+                5,
+                40,
+                SavePayload::saved_lot(b"LOT!manual".to_vec()),
+            ),
+            lot_validator,
+        )
+        .unwrap();
+    let direct = store
+        .load_with_fallback_validated("UserData", 5, SaveSlot::Manual, lot_validator)
+        .unwrap();
+    assert_eq!(direct.loaded.metadata.slot, SaveSlot::Manual);
+    assert!(direct.skipped_corrupt.is_empty());
 }

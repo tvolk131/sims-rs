@@ -162,14 +162,22 @@ fn stored_neighborhood_decode_rejects_short_corrupt_and_unsupported_versions() {
         ));
     }
 
-    // Tampering a v3 body's header down to v1 or v2 fails strict payload decoding
+    // Tampering a v3 body's header down to v1 fails strict payload decoding
     // (schema mismatch / trailing bytes) instead of silently misreading fields.
-    for old in [1u32, 2u32] {
-        let mut mismatched = sample_neighborhood("UserData").encode();
-        mismatched[0..4].copy_from_slice(&old.to_le_bytes());
+    let mut v3_as_v1 = sample_neighborhood("UserData").encode();
+    v3_as_v1[0..4].copy_from_slice(&1u32.to_le_bytes());
+    assert!(matches!(
+        StoredNeighborhood::decode_with_report("UserData", &v3_as_v1),
+        Err(MigrationError::CorruptPayload { version: 1, .. })
+    ));
+
+    // Truncated payloads fail cleanly at their declared version.
+    for ver in [1u32, 2u32, 3u32] {
+        let mut truncated = ver.to_le_bytes().to_vec();
+        truncated.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
         assert!(matches!(
-            StoredNeighborhood::decode_with_report("UserData", &mismatched),
-            Err(MigrationError::CorruptPayload { version, .. }) if version == old
+            StoredNeighborhood::decode_with_report("UserData", &truncated),
+            Err(MigrationError::CorruptPayload { version, .. }) if version == ver
         ));
     }
 
@@ -180,6 +188,97 @@ fn stored_neighborhood_decode_rejects_short_corrupt_and_unsupported_versions() {
         StoredNeighborhood::decode_with_report("UserData", &with_trailing),
         Err(MigrationError::CorruptPayload { version: 3, .. })
     ));
+}
+
+#[test]
+fn historical_0c25ad21_and_1719402e_layouts_migrate_losslessly() {
+    let base = sample_neighborhood("UserData");
+
+    // 1. Historical commit `0c25ad21` wrote header `1` with the extended v2
+    //    body (`deleted_characters` + `instance_id` + `revision`).
+    let legacy_v1_ext = StoredNeighborhoodV2 {
+        name: "HistV1".to_owned(),
+        families: base.families.clone(),
+        neighbors: base.neighbors.clone(),
+        inventories: base.inventories.clone(),
+        data: base.data,
+        options: base.options,
+        type_attributes: base.type_attributes.clone(),
+        zoning: base.zoning.clone(),
+        lot_rows: base.lot_rows.clone(),
+        made_characters: base.made_characters.clone(),
+        deleted_characters: BTreeSet::from([0xAAAA_0001, 0xBBBB_0002]),
+        instance_id: 0xCAFE_BABE_1234_5678,
+        revision: 5,
+    };
+    let mut hist_0c25ad21 = 1u32.to_le_bytes().to_vec();
+    hist_0c25ad21.extend(postcard::to_allocvec(&legacy_v1_ext).unwrap());
+
+    let (decoded_0c, rep_0c) =
+        StoredNeighborhood::decode_with_report("HistV1", &hist_0c25ad21).unwrap();
+    assert_eq!(rep_0c.original_version, 1);
+    assert_eq!(rep_0c.final_version, 3);
+    assert_eq!(rep_0c.steps_applied, 2);
+    assert_eq!(decoded_0c.instance_id, 0xCAFE_BABE_1234_5678);
+    assert_eq!(decoded_0c.revision, 5);
+    assert_eq!(
+        decoded_0c.deleted_characters,
+        BTreeSet::from([0xAAAA_0001, 0xBBBB_0002])
+    );
+    assert_eq!(decoded_0c.deletion_epoch, 1);
+    assert_eq!(
+        decoded_0c.deleted_at_epoch,
+        BTreeMap::from([(0xAAAA_0001, 1), (0xBBBB_0002, 1)])
+    );
+
+    // 2. Historical commit `1719402e` wrote header `2` with the full v3 body
+    //    (`deletion_epoch` + `deleted_at_epoch` already populated).
+    let legacy_v2_epochs = StoredNeighborhood {
+        name: "HistV2".to_owned(),
+        deleted_characters: BTreeSet::from([0xCCCC_0003]),
+        deletion_epoch: 4,
+        deleted_at_epoch: BTreeMap::from([(0xCCCC_0003, 4), (0xDDDD_0004, 2)]),
+        instance_id: 0xFEED_FACE_8765_4321,
+        revision: 9,
+        ..base.clone()
+    };
+    let mut hist_1719402e = 2u32.to_le_bytes().to_vec();
+    hist_1719402e.extend(postcard::to_allocvec(&legacy_v2_epochs).unwrap());
+
+    let (decoded_17, rep_17) =
+        StoredNeighborhood::decode_with_report("HistV2", &hist_1719402e).unwrap();
+    assert_eq!(rep_17.original_version, 2);
+    assert_eq!(rep_17.final_version, 3);
+    assert_eq!(rep_17.steps_applied, 1);
+    assert_eq!(decoded_17, legacy_v2_epochs);
+
+    // 3. Both historical layouts migrate cleanly inside `migrate_all`.
+    let db = TempDb::new("hist-layouts");
+    {
+        let raw_db = redb::Database::create(&db.0).unwrap();
+        let w = raw_db.begin_write().unwrap();
+        {
+            const NH_TABLE: redb::TableDefinition<&str, &[u8]> =
+                redb::TableDefinition::new("neighborhoods");
+            let mut t = w.open_table(NH_TABLE).unwrap();
+            t.insert("HistV1", hist_0c25ad21.as_slice()).unwrap();
+            t.insert("HistV2", hist_1719402e.as_slice()).unwrap();
+        }
+        w.commit().unwrap();
+    }
+
+    let store = NeighborhoodStore::open(&db.0).unwrap();
+    let report = store.migrate_all().unwrap();
+    assert_eq!(report.inspected, 2);
+    assert_eq!(report.migrated.len(), 2);
+    assert_eq!(
+        store.load_neighborhood("HistV1").unwrap().unwrap(),
+        decoded_0c
+    );
+    assert_eq!(
+        store.load_neighborhood("HistV2").unwrap().unwrap(),
+        legacy_v2_epochs
+    );
 }
 
 #[test]

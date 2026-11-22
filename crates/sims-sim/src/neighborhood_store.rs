@@ -82,7 +82,8 @@ pub enum CheckedCommitError {
 }
 
 /// Versioned `StoredNeighborhood` metadata keyed by neighborhood ID.
-const NEIGHBORHOODS: TableDefinition<&str, &[u8]> = TableDefinition::new("neighborhoods");
+pub(crate) const NEIGHBORHOODS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("neighborhoods");
 
 /// Raw immutable `Characters/*.iff` bytes keyed by `(neighborhood_id, filename)`.
 const NEIGHBORHOOD_CHARACTERS: TableDefinition<(&str, &str), &[u8]> =

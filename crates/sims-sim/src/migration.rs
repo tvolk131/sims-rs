@@ -385,21 +385,34 @@ pub fn derive_legacy_instance_id(record: &str, body: &[u8]) -> u128 {
 }
 
 fn migrate_v1_to_v2(record: &str, body: &[u8]) -> std::result::Result<Vec<u8>, MigrationError> {
-    let v1: StoredNeighborhoodV1 = decode_postcard_exact(record, 1, body)?;
-    let v2 = StoredNeighborhoodV2 {
-        name: v1.name,
-        families: v1.families,
-        neighbors: v1.neighbors,
-        inventories: v1.inventories,
-        data: v1.data,
-        options: v1.options,
-        type_attributes: v1.type_attributes,
-        zoning: v1.zoning,
-        lot_rows: v1.lot_rows,
-        made_characters: v1.made_characters,
-        deleted_characters: BTreeSet::new(),
-        instance_id: derive_legacy_instance_id(record, body),
-        revision: v1.revision,
+    let v2 = match decode_postcard_exact::<StoredNeighborhoodV1>(record, 1, body) {
+        Ok(v1) => StoredNeighborhoodV2 {
+            name: v1.name,
+            families: v1.families,
+            neighbors: v1.neighbors,
+            inventories: v1.inventories,
+            data: v1.data,
+            options: v1.options,
+            type_attributes: v1.type_attributes,
+            zoning: v1.zoning,
+            lot_rows: v1.lot_rows,
+            made_characters: v1.made_characters,
+            deleted_characters: BTreeSet::new(),
+            instance_id: derive_legacy_instance_id(record, body),
+            revision: v1.revision,
+        },
+        Err(v1_err) => {
+            // Historical commit `0c25ad21` wrote header `1` with the extended
+            // v2 field layout (`deleted_characters` + `instance_id`). Under
+            // exact postcard decoding the two layouts are strictly disjoint, so
+            // accept it losslessly and preserve any fields already present.
+            let mut legacy = decode_postcard_exact::<StoredNeighborhoodV2>(record, 1, body)
+                .map_err(|_| v1_err)?;
+            if legacy.instance_id == 0 {
+                legacy.instance_id = derive_legacy_instance_id(record, body);
+            }
+            legacy
+        }
     };
     postcard::to_allocvec(&v2).map_err(|error| MigrationError::StepFailed {
         record: record.to_owned(),
@@ -410,38 +423,65 @@ fn migrate_v1_to_v2(record: &str, body: &[u8]) -> std::result::Result<Vec<u8>, M
 }
 
 fn migrate_v2_to_v3(record: &str, body: &[u8]) -> std::result::Result<Vec<u8>, MigrationError> {
-    let v2: StoredNeighborhoodV2 = decode_postcard_exact(record, 2, body)?;
-    let (deletion_epoch, deleted_at_epoch) = if v2.deleted_characters.is_empty() {
-        (0u64, BTreeMap::new())
-    } else {
-        let map = v2
-            .deleted_characters
-            .iter()
-            .map(|&guid| (guid, 1u64))
-            .collect();
-        (1u64, map)
-    };
-    let instance_id = if v2.instance_id == 0 {
-        derive_legacy_instance_id(record, body)
-    } else {
-        v2.instance_id
-    };
-    let v3 = StoredNeighborhood {
-        name: v2.name,
-        families: v2.families,
-        neighbors: v2.neighbors,
-        inventories: v2.inventories,
-        data: v2.data,
-        options: v2.options,
-        type_attributes: v2.type_attributes,
-        zoning: v2.zoning,
-        lot_rows: v2.lot_rows,
-        made_characters: v2.made_characters,
-        deleted_characters: v2.deleted_characters,
-        deletion_epoch,
-        deleted_at_epoch,
-        instance_id,
-        revision: v2.revision,
+    let v3 = match decode_postcard_exact::<StoredNeighborhoodV2>(record, 2, body) {
+        Ok(v2) => {
+            let (deletion_epoch, deleted_at_epoch) = if v2.deleted_characters.is_empty() {
+                (0u64, BTreeMap::new())
+            } else {
+                let map = v2
+                    .deleted_characters
+                    .iter()
+                    .map(|&guid| (guid, 1u64))
+                    .collect();
+                (1u64, map)
+            };
+            let instance_id = if v2.instance_id == 0 {
+                derive_legacy_instance_id(record, body)
+            } else {
+                v2.instance_id
+            };
+            StoredNeighborhood {
+                name: v2.name,
+                families: v2.families,
+                neighbors: v2.neighbors,
+                inventories: v2.inventories,
+                data: v2.data,
+                options: v2.options,
+                type_attributes: v2.type_attributes,
+                zoning: v2.zoning,
+                lot_rows: v2.lot_rows,
+                made_characters: v2.made_characters,
+                deleted_characters: v2.deleted_characters,
+                deletion_epoch,
+                deleted_at_epoch,
+                instance_id,
+                revision: v2.revision,
+            }
+        }
+        Err(v2_err) => {
+            // Historical commit `1719402e` wrote header `2` with the full v3
+            // field layout (`deletion_epoch` + `deleted_at_epoch`). Under exact
+            // postcard decoding the two layouts are strictly disjoint, so
+            // preserve existing epoch fields verbatim (backfilling epoch 1 only
+            // if deleted_characters was non-empty with zeroed epoch metadata).
+            let mut legacy =
+                decode_postcard_exact::<StoredNeighborhood>(record, 2, body).map_err(|_| v2_err)?;
+            if !legacy.deleted_characters.is_empty()
+                && legacy.deletion_epoch == 0
+                && legacy.deleted_at_epoch.is_empty()
+            {
+                legacy.deletion_epoch = 1;
+                legacy.deleted_at_epoch = legacy
+                    .deleted_characters
+                    .iter()
+                    .map(|&guid| (guid, 1u64))
+                    .collect();
+            }
+            if legacy.instance_id == 0 {
+                legacy.instance_id = derive_legacy_instance_id(record, body);
+            }
+            legacy
+        }
     };
     postcard::to_allocvec(&v3).map_err(|error| MigrationError::StepFailed {
         record: record.to_owned(),

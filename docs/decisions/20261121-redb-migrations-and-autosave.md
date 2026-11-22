@@ -17,16 +17,28 @@ followed by a `postcard` body. Instead of rejecting older versions outright,
 - **`v1 -> v2`**: decodes `StoredNeighborhoodV1` strictly via
   `decode_postcard_exact` (rejecting truncated or trailing bytes), initializes
   `deleted_characters` to empty, and derives a deterministic non-zero 128-bit
-  `instance_id` via `SHA-256("sims-sim:neighborhood-legacy-instance-id:v1" || record || v1_body)`.
+  `instance_id` via
+  `SHA-256("sims-sim:neighborhood-legacy-instance-id:v1" || (record.len() as u64).to_le_bytes() || record || (body.len() as u64).to_le_bytes() || body)`.
+  Also accepts the historical commit `0c25ad21` layout (version `1` header
+  carrying `deleted_characters` and `instance_id`), which is strictly disjoint
+  from pure `v1` under exact postcard decoding, preserving fields already
+  present and normalizing a zero `instance_id` deterministically.
 - **`v2 -> v3`**: decodes `StoredNeighborhoodV2` strictly, preserves non-zero
   `instance_id` (normalizing `0` deterministically), and backfills
   `deletion_epoch = 1` and `deleted_at_epoch[guid] = 1` whenever a `v2` record
   carries non-empty `deleted_characters` so pre-migration saved lots
   (`deletion_epoch == 0`) continue stripping stale character instances if a
-  deleted GUID is later reused.
+  deleted GUID is later reused. Also accepts the historical commit `1719402e`
+  layout (version `2` header carrying `deletion_epoch` and `deleted_at_epoch`),
+  strictly disjoint from pure `v2` under exact postcard decoding, preserving
+  existing epoch fields verbatim.
 - **Current-version validation**: every record passing through `migrate_bytes`
   (including `v3` records) is strictly validated with `decode_postcard_exact`
   so truncated payloads, corrupt bytes, or trailing bytes fail cleanly.
+  Unframed `v1..=v3` neighborhood rows carry no outer checksum and therefore
+  receive structural and exact-length validation only (a future
+  `NEIGHBORHOOD_FORMAT = 4` can add an outer key+version+body SHA-256 envelope
+  for bit-flip detection on structurally valid mutations).
 
 ### Determinism & Atomicity
 
@@ -87,11 +99,27 @@ Decode also verifies `payload_sha256` and record-to-key binding
   manual record first and refuses to silently overwrite a corrupt or
   unsupported-version manual save unless the caller explicitly commits
   `SaveTarget::ManualForceReplace`.
-- **Listing & fallback:** `list_saves` returns `[Manual?, Autosave(newest)..Autosave(oldest)]`
-  with corrupt slots reported inline as `SaveSlotEntry::Corrupt`.
-  `load_latest_intact_autosave` and `load_with_fallback` execute in a single
-  MVCC REDB read transaction, returning the newest intact candidate plus all
-  skipped corrupt slots untouched on disk.
+- **Listing & streaming fallback:** `list_saves` returns
+  `[Manual?, Autosave(newest)..Autosave(oldest)]` with corrupt slots reported
+  inline as `SaveSlotEntry::Corrupt`. `load_latest_intact_autosave` and
+  `load_with_fallback` execute in a single MVCC REDB read transaction, looking
+  up `preferred` directly by key first and streaming fallback candidates lazily
+  without copying the full ring up front, returning the newest intact candidate
+  plus all skipped corrupt slots untouched on disk.
+- **Payload validation:** Built-in validation decodes `WorldSnapshot` payloads
+  with `World::decode` on write, load, list, prune, and fallback; callers
+  storing external formats (`SavedLot`, `Custom`) can pass a validator via
+  `commit_job_validated`, `load_save_validated`, `list_saves_validated`,
+  `load_latest_intact_autosave_validated`, and `load_with_fallback_validated`
+  so malformed external payloads are rejected before writing and never evict or
+  mask usable predecessors.
+- **Neighborhood lifetime fencing:** Shared handles obtained from
+  `NeighborhoodStore::autosaves` / `autosaves_with_policy` require every
+  `SaveJob` to specify `expected_instance_id` (`SaveJob::autosave_for_instance`,
+  `manual_for_instance`, or `.with_expected_instance_id`), verified inside the
+  REDB write transaction against `NEIGHBORHOODS[neighborhood_id]` before any
+  slot mutation. Queued background jobs that outlive a neighborhood deletion or
+  re-import abort cleanly with `SaveError::StaleNeighborhoodInstance`.
 - **Background worker ergonomics:** `AutosaveStore` is `Clone + Send + Sync`
   and `SaveJob` / `SavePayload` (`World(Box<World>)`, `SavedLot(Vec<u8>)`,
   `Custom`) are fully owned (`Send + 'static`), allowing the main thread to

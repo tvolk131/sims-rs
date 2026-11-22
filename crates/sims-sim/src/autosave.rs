@@ -28,6 +28,7 @@
 //!   commits to a background worker thread with zero borrows.
 
 use crate::migration::decode_postcard_exact;
+use crate::neighborhood_store::{NEIGHBORHOODS as NEIGHBORHOODS_TABLE, StoredNeighborhood};
 use crate::{Error, World};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -188,6 +189,11 @@ pub enum SaveTarget {
 pub struct SaveJob {
     pub neighborhood_id: String,
     pub lot_id: u32,
+    /// Expected `StoredNeighborhood::instance_id` for lifetime fencing inside
+    /// the REDB write transaction. Required on shared [`crate::NeighborhoodStore`]
+    /// handles so a queued background job cannot commit after its neighborhood
+    /// was deleted or re-imported.
+    pub expected_instance_id: Option<u128>,
     pub target: SaveTarget,
     /// Logical simulation tick at which the snapshot was captured.
     pub sim_tick: u64,
@@ -200,7 +206,9 @@ pub struct SaveJob {
 }
 
 impl SaveJob {
-    /// Creates an autosave job for `(neighborhood_id, lot_id)`.
+    /// Creates an autosave job for `(neighborhood_id, lot_id)` (standalone
+    /// store usage, or chain [`Self::with_expected_instance_id`] for a shared
+    /// [`crate::NeighborhoodStore`]).
     #[must_use]
     pub fn autosave(
         neighborhood_id: impl Into<String>,
@@ -211,12 +219,27 @@ impl SaveJob {
         Self {
             neighborhood_id: neighborhood_id.into(),
             lot_id,
+            expected_instance_id: None,
             target: SaveTarget::Autosave,
             sim_tick,
             saved_at_unix_secs: None,
             label: String::new(),
             payload,
         }
+    }
+
+    /// Creates an autosave job fenced to `expected_instance_id` for a shared
+    /// [`crate::NeighborhoodStore`].
+    #[must_use]
+    pub fn autosave_for_instance(
+        neighborhood_id: impl Into<String>,
+        expected_instance_id: u128,
+        lot_id: u32,
+        sim_tick: u64,
+        payload: SavePayload,
+    ) -> Self {
+        Self::autosave(neighborhood_id, lot_id, sim_tick, payload)
+            .with_expected_instance_id(expected_instance_id)
     }
 
     /// Creates a manual save job for `(neighborhood_id, lot_id)`.
@@ -230,12 +253,27 @@ impl SaveJob {
         Self {
             neighborhood_id: neighborhood_id.into(),
             lot_id,
+            expected_instance_id: None,
             target: SaveTarget::Manual,
             sim_tick,
             saved_at_unix_secs: None,
             label: String::new(),
             payload,
         }
+    }
+
+    /// Creates a manual save job fenced to `expected_instance_id` for a shared
+    /// [`crate::NeighborhoodStore`].
+    #[must_use]
+    pub fn manual_for_instance(
+        neighborhood_id: impl Into<String>,
+        expected_instance_id: u128,
+        lot_id: u32,
+        sim_tick: u64,
+        payload: SavePayload,
+    ) -> Self {
+        Self::manual(neighborhood_id, lot_id, sim_tick, payload)
+            .with_expected_instance_id(expected_instance_id)
     }
 
     /// Creates a user-confirmed manual save job that may replace a corrupt or
@@ -250,12 +288,36 @@ impl SaveJob {
         Self {
             neighborhood_id: neighborhood_id.into(),
             lot_id,
+            expected_instance_id: None,
             target: SaveTarget::ManualForceReplace,
             sim_tick,
             saved_at_unix_secs: None,
             label: String::new(),
             payload,
         }
+    }
+
+    /// Creates a user-confirmed manual force-replace job fenced to
+    /// `expected_instance_id` for a shared [`crate::NeighborhoodStore`].
+    #[must_use]
+    pub fn manual_force_replace_for_instance(
+        neighborhood_id: impl Into<String>,
+        expected_instance_id: u128,
+        lot_id: u32,
+        sim_tick: u64,
+        payload: SavePayload,
+    ) -> Self {
+        Self::manual_force_replace(neighborhood_id, lot_id, sim_tick, payload)
+            .with_expected_instance_id(expected_instance_id)
+    }
+
+    /// Binds this job to a specific [`crate::StoredNeighborhood::instance_id`]
+    /// verified atomically inside the REDB write transaction before mutating
+    /// any slot.
+    #[must_use]
+    pub const fn with_expected_instance_id(mut self, instance_id: u128) -> Self {
+        self.expected_instance_id = Some(instance_id);
+        self
     }
 
     /// Attaches a human-readable label to this save job.
@@ -392,6 +454,13 @@ pub enum SaveError {
         slot: SaveSlot,
         detail: String,
     },
+    /// Neighborhood was deleted or replaced by a different instance before a
+    /// queued save job committed.
+    StaleNeighborhoodInstance {
+        neighborhood_id: String,
+        expected_instance_id: u128,
+        current_instance_id: Option<u128>,
+    },
     /// Caller supplied invalid input (e.g. empty neighborhood ID or zero cap).
     InvalidInput(String),
     /// Underlying REDB storage or transaction error.
@@ -445,6 +514,22 @@ impl fmt::Display for SaveError {
             } => write!(
                 f,
                 "failed to decode {slot} for neighborhood {neighborhood_id:?} lot {lot_id}: {detail}"
+            ),
+            Self::StaleNeighborhoodInstance {
+                neighborhood_id,
+                expected_instance_id,
+                current_instance_id: Some(current),
+            } => write!(
+                f,
+                "stale neighborhood instance for {neighborhood_id:?}: expected {expected_instance_id:#034x}, current {current:#034x}"
+            ),
+            Self::StaleNeighborhoodInstance {
+                neighborhood_id,
+                expected_instance_id,
+                current_instance_id: None,
+            } => write!(
+                f,
+                "stale neighborhood instance for {neighborhood_id:?}: expected {expected_instance_id:#034x}, neighborhood no longer exists"
             ),
             Self::InvalidInput(message) => write!(f, "invalid save input: {message}"),
             Self::Store(message) => write!(f, "autosave store error: {message}"),
@@ -510,12 +595,50 @@ fn encode_record(body: &AutosaveBodyV1) -> std::result::Result<Vec<u8>, SaveErro
     Ok(out)
 }
 
-fn decode_record(
+fn noop_payload_validator(
+    _kind: &SavePayloadKind,
+    _bytes: &[u8],
+) -> std::result::Result<(), String> {
+    Ok(())
+}
+
+fn validate_payload_bytes<F>(
+    neighborhood_id: &str,
+    lot_id: u32,
+    slot: SaveSlot,
+    kind: &SavePayloadKind,
+    payload: &[u8],
+    validator: &F,
+) -> std::result::Result<(), SaveError>
+where
+    F: Fn(&SavePayloadKind, &[u8]) -> std::result::Result<(), String>,
+{
+    if *kind == SavePayloadKind::WorldSnapshot {
+        World::decode(payload).map_err(|error| SaveError::DecodeFailed {
+            neighborhood_id: neighborhood_id.to_owned(),
+            lot_id,
+            slot,
+            detail: format!("invalid world snapshot payload: {error}"),
+        })?;
+    }
+    validator(kind, payload).map_err(|detail| SaveError::DecodeFailed {
+        neighborhood_id: neighborhood_id.to_owned(),
+        lot_id,
+        slot,
+        detail,
+    })
+}
+
+fn decode_record_validated<F>(
     neighborhood_id: &str,
     lot_id: u32,
     slot: SaveSlot,
     bytes: &[u8],
-) -> std::result::Result<LoadedSave, SaveError> {
+    validator: &F,
+) -> std::result::Result<LoadedSave, SaveError>
+where
+    F: Fn(&SavePayloadKind, &[u8]) -> std::result::Result<(), String>,
+{
     if bytes.len() < 8 {
         return Err(SaveError::DecodeFailed {
             neighborhood_id: neighborhood_id.to_owned(),
@@ -601,6 +724,15 @@ fn decode_record(
         });
     }
 
+    validate_payload_bytes(
+        neighborhood_id,
+        lot_id,
+        slot,
+        &body.payload_kind,
+        &body.payload,
+        validator,
+    )?;
+
     let metadata = SaveMetadata {
         slot: body.slot,
         neighborhood_id: body.neighborhood_id,
@@ -617,6 +749,34 @@ fn decode_record(
         metadata,
         payload: body.payload,
     })
+}
+
+fn verify_neighborhood_instance_in_txn(
+    txn: &redb::WriteTransaction,
+    neighborhood_id: &str,
+    expected_instance_id: u128,
+) -> std::result::Result<(), SaveError> {
+    let nh_table = txn.open_table(NEIGHBORHOODS_TABLE).map_err(store_err)?;
+    let Some(raw) = nh_table.get(neighborhood_id).map_err(store_err)? else {
+        return Err(SaveError::StaleNeighborhoodInstance {
+            neighborhood_id: neighborhood_id.to_owned(),
+            expected_instance_id,
+            current_instance_id: None,
+        });
+    };
+    let nh = StoredNeighborhood::decode(neighborhood_id, raw.value()).map_err(|error| {
+        SaveError::Store(format!(
+            "cannot verify neighborhood {neighborhood_id:?} instance: {error}"
+        ))
+    })?;
+    if nh.instance_id != expected_instance_id {
+        return Err(SaveError::StaleNeighborhoodInstance {
+            neighborhood_id: neighborhood_id.to_owned(),
+            expected_instance_id,
+            current_instance_id: Some(nh.instance_id),
+        });
+    }
+    Ok(())
 }
 
 fn validate_neighborhood_id(neighborhood_id: &str) -> std::result::Result<(), SaveError> {
@@ -642,12 +802,17 @@ fn store_err(error: impl fmt::Display) -> SaveError {
 pub struct AutosaveStore {
     db: Arc<Database>,
     policy: AutosavePolicy,
+    require_neighborhood_instance: bool,
 }
 
 impl fmt::Debug for AutosaveStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AutosaveStore")
             .field("policy", &self.policy)
+            .field(
+                "require_neighborhood_instance",
+                &self.require_neighborhood_instance,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -674,16 +839,22 @@ impl AutosaveStore {
         Ok(Self {
             db: Arc::new(db),
             policy,
+            require_neighborhood_instance: false,
         })
     }
 
     /// Constructs an [`AutosaveStore`] sharing an existing `Arc<Database>`
     /// (used by [`crate::NeighborhoodStore::autosaves`]).
+    ///
+    /// Shared handles require every committed [`SaveJob`] to carry
+    /// `expected_instance_id` so queued background writes cannot cross a
+    /// neighborhood delete or re-import boundary.
     pub(crate) fn from_shared_db(db: Arc<Database>, policy: AutosavePolicy) -> Self {
         let max_autosaves = policy.max_autosaves.max(1);
         Self {
             db,
             policy: AutosavePolicy { max_autosaves },
+            require_neighborhood_instance: true,
         }
     }
 
@@ -704,23 +875,66 @@ impl AutosaveStore {
         Ok(Self {
             db: Arc::clone(&self.db),
             policy,
+            require_neighborhood_instance: self.require_neighborhood_instance,
         })
     }
 
-    /// Executes an owned [`SaveJob`] atomically.
+    /// Executes an owned [`SaveJob`] atomically with built-in payload
+    /// validation (`World::decode` for [`SavePayloadKind::WorldSnapshot`]).
     ///
-    /// Payload encoding (`World::encode`) and payload SHA-256 hashing happen
-    /// *before* acquiring the REDB write transaction so background workers hold
-    /// the write lock for minimal duration.
+    /// Payload encoding (`World::encode`), validation, and payload SHA-256
+    /// hashing happen *before* acquiring the REDB write transaction so
+    /// background workers hold the write lock for minimal duration.
     pub fn commit_job(&self, job: SaveJob) -> std::result::Result<SaveMetadata, SaveError> {
+        self.commit_job_validated(job, noop_payload_validator)
+    }
+
+    /// Executes an owned [`SaveJob`] atomically, validating both the incoming
+    /// payload before writing and existing slots during pruning with
+    /// `payload_validator` (in addition to built-in `World::decode` checks for
+    /// [`SavePayloadKind::WorldSnapshot`]).
+    ///
+    /// Use this when storing formats defined outside `sims-sim` (such as
+    /// `sims_vm::boot::save::Saved`) so malformed payloads are rejected before
+    /// writing and never evict usable slots.
+    pub fn commit_job_validated<F>(
+        &self,
+        job: SaveJob,
+        payload_validator: F,
+    ) -> std::result::Result<SaveMetadata, SaveError>
+    where
+        F: Fn(&SavePayloadKind, &[u8]) -> std::result::Result<(), String>,
+    {
         validate_neighborhood_id(&job.neighborhood_id)?;
         if self.policy.max_autosaves == 0 {
             return Err(SaveError::InvalidInput(
                 "max_autosaves must be at least 1".into(),
             ));
         }
+        if self.require_neighborhood_instance && job.expected_instance_id.is_none() {
+            return Err(SaveError::InvalidInput(
+                "shared NeighborhoodStore autosave jobs must specify expected_instance_id".into(),
+            ));
+        }
+        if job.expected_instance_id == Some(0) {
+            return Err(SaveError::InvalidInput(
+                "expected_instance_id must be non-zero".into(),
+            ));
+        }
 
         let (payload_kind, payload_bytes) = job.payload.into_encoded();
+        let validation_slot = match job.target {
+            SaveTarget::Manual | SaveTarget::ManualForceReplace => SaveSlot::Manual,
+            SaveTarget::Autosave => SaveSlot::Autosave(0),
+        };
+        validate_payload_bytes(
+            &job.neighborhood_id,
+            job.lot_id,
+            validation_slot,
+            &payload_kind,
+            &payload_bytes,
+            &payload_validator,
+        )?;
         let payload_sha256 = sha256_bytes(&payload_bytes);
         let payload_len = payload_bytes.len();
 
@@ -728,6 +942,7 @@ impl AutosaveStore {
             SaveTarget::Manual => self.commit_manual_encoded(
                 job.neighborhood_id,
                 job.lot_id,
+                job.expected_instance_id,
                 job.sim_tick,
                 job.saved_at_unix_secs,
                 job.label,
@@ -736,10 +951,12 @@ impl AutosaveStore {
                 payload_len,
                 payload_bytes,
                 false,
+                &payload_validator,
             ),
             SaveTarget::ManualForceReplace => self.commit_manual_encoded(
                 job.neighborhood_id,
                 job.lot_id,
+                job.expected_instance_id,
                 job.sim_tick,
                 job.saved_at_unix_secs,
                 job.label,
@@ -748,10 +965,12 @@ impl AutosaveStore {
                 payload_len,
                 payload_bytes,
                 true,
+                &payload_validator,
             ),
             SaveTarget::Autosave => self.commit_autosave_encoded(
                 job.neighborhood_id,
                 job.lot_id,
+                job.expected_instance_id,
                 job.sim_tick,
                 job.saved_at_unix_secs,
                 job.label,
@@ -759,6 +978,7 @@ impl AutosaveStore {
                 payload_sha256,
                 payload_len,
                 payload_bytes,
+                &payload_validator,
             ),
         }
     }
@@ -817,10 +1037,11 @@ impl AutosaveStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn commit_manual_encoded(
+    fn commit_manual_encoded<F>(
         &self,
         neighborhood_id: String,
         lot_id: u32,
+        expected_instance_id: Option<u128>,
         sim_tick: u64,
         saved_at_unix_secs: Option<u64>,
         label: String,
@@ -829,7 +1050,11 @@ impl AutosaveStore {
         payload_len: usize,
         payload: Vec<u8>,
         force_replace: bool,
-    ) -> std::result::Result<SaveMetadata, SaveError> {
+        payload_validator: &F,
+    ) -> std::result::Result<SaveMetadata, SaveError>
+    where
+        F: Fn(&SavePayloadKind, &[u8]) -> std::result::Result<(), String>,
+    {
         let body = AutosaveBodyV1 {
             slot: SaveSlot::Manual,
             neighborhood_id: neighborhood_id.clone(),
@@ -845,6 +1070,9 @@ impl AutosaveStore {
 
         let txn = self.db.begin_write().map_err(store_err)?;
         {
+            if let Some(expected) = expected_instance_id {
+                verify_neighborhood_instance_in_txn(&txn, &neighborhood_id, expected)?;
+            }
             let mut table = txn.open_table(AUTOSAVE_MANUAL).map_err(store_err)?;
             if !force_replace
                 && let Some(existing) = table
@@ -852,8 +1080,13 @@ impl AutosaveStore {
                     .map_err(store_err)?
             {
                 // Refuse to silently replace a corrupt or future-version manual save.
-                let _ =
-                    decode_record(&neighborhood_id, lot_id, SaveSlot::Manual, existing.value())?;
+                let _ = decode_record_validated(
+                    &neighborhood_id,
+                    lot_id,
+                    SaveSlot::Manual,
+                    existing.value(),
+                    payload_validator,
+                )?;
             }
             table
                 .insert((neighborhood_id.as_str(), lot_id), encoded.as_slice())
@@ -876,10 +1109,11 @@ impl AutosaveStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn commit_autosave_encoded(
+    fn commit_autosave_encoded<F>(
         &self,
         neighborhood_id: String,
         lot_id: u32,
+        expected_instance_id: Option<u128>,
         sim_tick: u64,
         saved_at_unix_secs: Option<u64>,
         label: String,
@@ -887,10 +1121,17 @@ impl AutosaveStore {
         payload_sha256: [u8; 32],
         payload_len: usize,
         payload: Vec<u8>,
-    ) -> std::result::Result<SaveMetadata, SaveError> {
+        payload_validator: &F,
+    ) -> std::result::Result<SaveMetadata, SaveError>
+    where
+        F: Fn(&SavePayloadKind, &[u8]) -> std::result::Result<(), String>,
+    {
         let txn = self.db.begin_write().map_err(store_err)?;
         let assigned_seq;
         {
+            if let Some(expected) = expected_instance_id {
+                verify_neighborhood_instance_in_txn(&txn, &neighborhood_id, expected)?;
+            }
             let mut ring_table = txn.open_table(AUTOSAVE_RING).map_err(store_err)?;
             let mut seq_table = txn.open_table(AUTOSAVE_SEQ).map_err(store_err)?;
 
@@ -917,11 +1158,12 @@ impl AutosaveStore {
                 if seq > max_existing_seq {
                     max_existing_seq = seq;
                 }
-                if decode_record(
+                if decode_record_validated(
                     &neighborhood_id,
                     lot_id,
                     SaveSlot::Autosave(seq),
                     value.value(),
+                    payload_validator,
                 )
                 .is_ok()
                 {
@@ -1003,6 +1245,20 @@ impl AutosaveStore {
         neighborhood_id: &str,
         lot_id: u32,
     ) -> std::result::Result<Vec<SaveSlotEntry>, SaveError> {
+        self.list_saves_validated(neighborhood_id, lot_id, noop_payload_validator)
+    }
+
+    /// Lists all save slots using `payload_validator` in addition to built-in
+    /// integrity and `WorldSnapshot` checks.
+    pub fn list_saves_validated<F>(
+        &self,
+        neighborhood_id: &str,
+        lot_id: u32,
+        payload_validator: F,
+    ) -> std::result::Result<Vec<SaveSlotEntry>, SaveError>
+    where
+        F: Fn(&SavePayloadKind, &[u8]) -> std::result::Result<(), String>,
+    {
         validate_neighborhood_id(neighborhood_id)?;
         let txn = self.db.begin_read().map_err(store_err)?;
         let mut entries = Vec::new();
@@ -1010,7 +1266,13 @@ impl AutosaveStore {
         match txn.open_table(AUTOSAVE_MANUAL) {
             Ok(table) => {
                 if let Some(value) = table.get((neighborhood_id, lot_id)).map_err(store_err)? {
-                    match decode_record(neighborhood_id, lot_id, SaveSlot::Manual, value.value()) {
+                    match decode_record_validated(
+                        neighborhood_id,
+                        lot_id,
+                        SaveSlot::Manual,
+                        value.value(),
+                        &payload_validator,
+                    ) {
                         Ok(loaded) => entries.push(SaveSlotEntry::Intact(loaded.metadata)),
                         Err(error) => entries.push(SaveSlotEntry::Corrupt {
                             slot: SaveSlot::Manual,
@@ -1025,21 +1287,25 @@ impl AutosaveStore {
 
         match txn.open_table(AUTOSAVE_RING) {
             Ok(table) => {
-                let mut ring_entries = Vec::new();
                 for item in table
                     .range((neighborhood_id, lot_id, 0u64)..=(neighborhood_id, lot_id, u64::MAX))
                     .map_err(store_err)?
+                    .rev()
                 {
                     let (key, value) = item.map_err(store_err)?;
                     let seq = key.value().2;
                     let slot = SaveSlot::Autosave(seq);
-                    match decode_record(neighborhood_id, lot_id, slot, value.value()) {
-                        Ok(loaded) => ring_entries.push(SaveSlotEntry::Intact(loaded.metadata)),
-                        Err(error) => ring_entries.push(SaveSlotEntry::Corrupt { slot, error }),
+                    match decode_record_validated(
+                        neighborhood_id,
+                        lot_id,
+                        slot,
+                        value.value(),
+                        &payload_validator,
+                    ) {
+                        Ok(loaded) => entries.push(SaveSlotEntry::Intact(loaded.metadata)),
+                        Err(error) => entries.push(SaveSlotEntry::Corrupt { slot, error }),
                     }
                 }
-                ring_entries.reverse();
-                entries.extend(ring_entries);
             }
             Err(redb::TableError::TableDoesNotExist(_)) => {}
             Err(error) => return Err(store_err(error)),
@@ -1089,14 +1355,29 @@ impl AutosaveStore {
         Ok(lots.into_iter().collect())
     }
 
-    /// Loads one specific save slot with full checksum and schema verification.
-    /// Never modifies or deletes any record on failure.
+    /// Loads one specific save slot with full checksum, schema, and built-in
+    /// payload verification. Never modifies or deletes any record on failure.
     pub fn load_save(
         &self,
         neighborhood_id: &str,
         lot_id: u32,
         slot: SaveSlot,
     ) -> std::result::Result<LoadedSave, SaveError> {
+        self.load_save_validated(neighborhood_id, lot_id, slot, noop_payload_validator)
+    }
+
+    /// Loads one specific save slot using `payload_validator` in addition to
+    /// built-in checks. Never modifies or deletes any record on failure.
+    pub fn load_save_validated<F>(
+        &self,
+        neighborhood_id: &str,
+        lot_id: u32,
+        slot: SaveSlot,
+        payload_validator: F,
+    ) -> std::result::Result<LoadedSave, SaveError>
+    where
+        F: Fn(&SavePayloadKind, &[u8]) -> std::result::Result<(), String>,
+    {
         validate_neighborhood_id(neighborhood_id)?;
         let txn = self.db.begin_read().map_err(store_err)?;
         match slot {
@@ -1119,7 +1400,13 @@ impl AutosaveStore {
                         slot: Some(slot),
                     });
                 };
-                decode_record(neighborhood_id, lot_id, slot, value.value())
+                decode_record_validated(
+                    neighborhood_id,
+                    lot_id,
+                    slot,
+                    value.value(),
+                    &payload_validator,
+                )
             }
             SaveSlot::Autosave(seq) => {
                 let table = match txn.open_table(AUTOSAVE_RING) {
@@ -1143,7 +1430,13 @@ impl AutosaveStore {
                         slot: Some(slot),
                     });
                 };
-                decode_record(neighborhood_id, lot_id, slot, value.value())
+                decode_record_validated(
+                    neighborhood_id,
+                    lot_id,
+                    slot,
+                    value.value(),
+                    &payload_validator,
+                )
             }
         }
     }
@@ -1165,6 +1458,21 @@ impl AutosaveStore {
         neighborhood_id: &str,
         lot_id: u32,
     ) -> std::result::Result<RecoveryLoad, SaveError> {
+        self.load_latest_intact_autosave_validated(neighborhood_id, lot_id, noop_payload_validator)
+    }
+
+    /// Streams rotating autosaves newest-first in a single REDB read
+    /// transaction and returns the first candidate passing both built-in
+    /// integrity checks and `payload_validator`.
+    pub fn load_latest_intact_autosave_validated<F>(
+        &self,
+        neighborhood_id: &str,
+        lot_id: u32,
+        payload_validator: F,
+    ) -> std::result::Result<RecoveryLoad, SaveError>
+    where
+        F: Fn(&SavePayloadKind, &[u8]) -> std::result::Result<(), String>,
+    {
         validate_neighborhood_id(neighborhood_id)?;
         let txn = self.db.begin_read().map_err(store_err)?;
         let table = match txn.open_table(AUTOSAVE_RING) {
@@ -1189,7 +1497,13 @@ impl AutosaveStore {
         {
             let (key, value) = item.map_err(store_err)?;
             let slot = SaveSlot::Autosave(key.value().2);
-            match decode_record(neighborhood_id, lot_id, slot, value.value()) {
+            match decode_record_validated(
+                neighborhood_id,
+                lot_id,
+                slot,
+                value.value(),
+                &payload_validator,
+            ) {
                 Ok(loaded) => {
                     return Ok(RecoveryLoad {
                         loaded,
@@ -1218,46 +1532,44 @@ impl AutosaveStore {
     /// Attempts to load `preferred`, falling back in a single consistent REDB
     /// read transaction to the newest intact autosave (and finally to the manual
     /// slot if `preferred` was an autosave) if `preferred` is missing or
-    /// corrupt. Never deletes or modifies any record.
+    /// corrupt. Never copies the ring up front and never deletes or modifies
+    /// any record.
     pub fn load_with_fallback(
         &self,
         neighborhood_id: &str,
         lot_id: u32,
         preferred: SaveSlot,
     ) -> std::result::Result<RecoveryLoad, SaveError> {
+        self.load_with_fallback_validated(
+            neighborhood_id,
+            lot_id,
+            preferred,
+            noop_payload_validator,
+        )
+    }
+
+    /// Streams `preferred` first by direct key lookup and falls back lazily in
+    /// the same REDB read transaction, validating every candidate with both
+    /// built-in checks and `payload_validator`.
+    pub fn load_with_fallback_validated<F>(
+        &self,
+        neighborhood_id: &str,
+        lot_id: u32,
+        preferred: SaveSlot,
+        payload_validator: F,
+    ) -> std::result::Result<RecoveryLoad, SaveError>
+    where
+        F: Fn(&SavePayloadKind, &[u8]) -> std::result::Result<(), String>,
+    {
         validate_neighborhood_id(neighborhood_id)?;
         let txn = self.db.begin_read().map_err(store_err)?;
-
-        let manual_bytes = match txn.open_table(AUTOSAVE_MANUAL) {
-            Ok(table) => table
-                .get((neighborhood_id, lot_id))
-                .map_err(store_err)?
-                .map(|v| v.value().to_vec()),
-            Err(redb::TableError::TableDoesNotExist(_)) => None,
-            Err(error) => return Err(store_err(error)),
-        };
-
-        let mut ring_newest_first: Vec<(u64, Vec<u8>)> = Vec::new();
-        match txn.open_table(AUTOSAVE_RING) {
-            Ok(table) => {
-                for item in table
-                    .range((neighborhood_id, lot_id, 0u64)..=(neighborhood_id, lot_id, u64::MAX))
-                    .map_err(store_err)?
-                    .rev()
-                {
-                    let (key, value) = item.map_err(store_err)?;
-                    ring_newest_first.push((key.value().2, value.value().to_vec()));
-                }
-            }
-            Err(redb::TableError::TableDoesNotExist(_)) => {}
-            Err(error) => return Err(store_err(error)),
-        }
 
         let mut skipped_corrupt = Vec::new();
         let mut first_error: Option<SaveError> = None;
 
         let mut try_candidate = |slot: SaveSlot, bytes: &[u8]| -> Option<LoadedSave> {
-            match decode_record(neighborhood_id, lot_id, slot, bytes) {
+            match decode_record_validated(neighborhood_id, lot_id, slot, bytes, &payload_validator)
+            {
                 Ok(loaded) => Some(loaded),
                 Err(error) => {
                     if first_error.is_none() {
@@ -1271,50 +1583,106 @@ impl AutosaveStore {
 
         match preferred {
             SaveSlot::Manual => {
-                if let Some(ref bytes) = manual_bytes
-                    && let Some(loaded) = try_candidate(SaveSlot::Manual, bytes)
-                {
-                    return Ok(RecoveryLoad {
-                        loaded,
-                        skipped_corrupt,
-                    });
-                }
-                for (seq, bytes) in &ring_newest_first {
-                    if let Some(loaded) = try_candidate(SaveSlot::Autosave(*seq), bytes) {
-                        return Ok(RecoveryLoad {
-                            loaded,
-                            skipped_corrupt,
-                        });
+                // 1. Direct lookup of the preferred manual slot first (zero ring reads).
+                match txn.open_table(AUTOSAVE_MANUAL) {
+                    Ok(table) => {
+                        if let Some(value) =
+                            table.get((neighborhood_id, lot_id)).map_err(store_err)?
+                            && let Some(loaded) = try_candidate(SaveSlot::Manual, value.value())
+                        {
+                            return Ok(RecoveryLoad {
+                                loaded,
+                                skipped_corrupt,
+                            });
+                        }
                     }
+                    Err(redb::TableError::TableDoesNotExist(_)) => {}
+                    Err(error) => return Err(store_err(error)),
+                }
+
+                // 2. Stream rotating autosaves newest-first directly from REDB.
+                match txn.open_table(AUTOSAVE_RING) {
+                    Ok(table) => {
+                        for item in table
+                            .range(
+                                (neighborhood_id, lot_id, 0u64)
+                                    ..=(neighborhood_id, lot_id, u64::MAX),
+                            )
+                            .map_err(store_err)?
+                            .rev()
+                        {
+                            let (key, value) = item.map_err(store_err)?;
+                            let slot = SaveSlot::Autosave(key.value().2);
+                            if let Some(loaded) = try_candidate(slot, value.value()) {
+                                return Ok(RecoveryLoad {
+                                    loaded,
+                                    skipped_corrupt,
+                                });
+                            }
+                        }
+                    }
+                    Err(redb::TableError::TableDoesNotExist(_)) => {}
+                    Err(error) => return Err(store_err(error)),
                 }
             }
             SaveSlot::Autosave(target_seq) => {
-                if let Some((_, bytes)) = ring_newest_first.iter().find(|(s, _)| *s == target_seq)
-                    && let Some(loaded) = try_candidate(SaveSlot::Autosave(target_seq), bytes)
-                {
-                    return Ok(RecoveryLoad {
-                        loaded,
-                        skipped_corrupt,
-                    });
-                }
-                for (seq, bytes) in &ring_newest_first {
-                    if *seq == target_seq {
-                        continue;
+                // 1. Direct lookup of the preferred autosave slot first, then
+                //    stream remaining autosaves newest-first.
+                match txn.open_table(AUTOSAVE_RING) {
+                    Ok(table) => {
+                        if let Some(value) = table
+                            .get((neighborhood_id, lot_id, target_seq))
+                            .map_err(store_err)?
+                            && let Some(loaded) =
+                                try_candidate(SaveSlot::Autosave(target_seq), value.value())
+                        {
+                            return Ok(RecoveryLoad {
+                                loaded,
+                                skipped_corrupt,
+                            });
+                        }
+                        for item in table
+                            .range(
+                                (neighborhood_id, lot_id, 0u64)
+                                    ..=(neighborhood_id, lot_id, u64::MAX),
+                            )
+                            .map_err(store_err)?
+                            .rev()
+                        {
+                            let (key, value) = item.map_err(store_err)?;
+                            let seq = key.value().2;
+                            if seq == target_seq {
+                                continue;
+                            }
+                            if let Some(loaded) =
+                                try_candidate(SaveSlot::Autosave(seq), value.value())
+                            {
+                                return Ok(RecoveryLoad {
+                                    loaded,
+                                    skipped_corrupt,
+                                });
+                            }
+                        }
                     }
-                    if let Some(loaded) = try_candidate(SaveSlot::Autosave(*seq), bytes) {
-                        return Ok(RecoveryLoad {
-                            loaded,
-                            skipped_corrupt,
-                        });
-                    }
+                    Err(redb::TableError::TableDoesNotExist(_)) => {}
+                    Err(error) => return Err(store_err(error)),
                 }
-                if let Some(ref bytes) = manual_bytes
-                    && let Some(loaded) = try_candidate(SaveSlot::Manual, bytes)
-                {
-                    return Ok(RecoveryLoad {
-                        loaded,
-                        skipped_corrupt,
-                    });
+
+                // 2. Fall back to the manual slot only if no autosave was intact.
+                match txn.open_table(AUTOSAVE_MANUAL) {
+                    Ok(table) => {
+                        if let Some(value) =
+                            table.get((neighborhood_id, lot_id)).map_err(store_err)?
+                            && let Some(loaded) = try_candidate(SaveSlot::Manual, value.value())
+                        {
+                            return Ok(RecoveryLoad {
+                                loaded,
+                                skipped_corrupt,
+                            });
+                        }
+                    }
+                    Err(redb::TableError::TableDoesNotExist(_)) => {}
+                    Err(error) => return Err(store_err(error)),
                 }
             }
         }
