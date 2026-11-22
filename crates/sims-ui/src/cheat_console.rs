@@ -613,6 +613,21 @@ impl CheatConsole {
         false
     }
 
+    /// Exact microseconds until the cheat console caret next flips visibility,
+    /// or `None` when the console is closed.
+    pub fn next_blink_us(&self, clock_us: u64) -> Option<u64> {
+        if !self.open {
+            return None;
+        }
+        match self.blink_since {
+            None => Some(CARET_BLINK_US),
+            Some(since) => {
+                let elapsed = clock_us.saturating_sub(since);
+                Some(CARET_BLINK_US.saturating_sub(elapsed).max(1_000))
+            }
+        }
+    }
+
     /// Parses and submits the current input line (`Enter`), updating command
     /// history and the feedback line. Returns the parsed [`CheatCommand`] list
     /// on success, or [`CheatParseError::Closed`] when the console is closed.

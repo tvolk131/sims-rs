@@ -261,6 +261,12 @@ pub fn parse_slot_id(slot_id: &str) -> Option<SaveSlot> {
 /// Projects all REDB manual and rotating autosave slots for
 /// `(neighborhood_id, lot_id)` into a read-only [`SaveManagerSnapshot`] for
 /// [`sims_ui::saves::SaveManagerDialog`].
+///
+/// Uses [`AutosaveStore::list_saves_metadata`] so listing verifies each slot's
+/// outer SHA-256 envelope, format version, and key-bound metadata header
+/// without decompressing V2 payloads or deserializing every slot's full
+/// `World`/`Saved` on the UI thread. Full [`Saved::decode`] / [`World::decode`]
+/// validation still runs whenever a slot is actually loaded or committed.
 pub fn build_save_manager_snapshot(
     store: &AutosaveStore,
     neighborhood_id: &str,
@@ -271,23 +277,22 @@ pub fn build_save_manager_snapshot(
 ) -> SaveManagerSnapshot {
     let lot_u16 = u16::try_from(lot_id).unwrap_or(u16::MAX);
     let lot_label = lot_label.into();
-    let entries =
-        match store.list_saves_validated(neighborhood_id, lot_id, validate_save_payload_cached) {
-            Ok(entries) => entries,
-            Err(err) => {
-                let merged_err = match active_error {
-                    Some(prev) if !prev.trim().is_empty() => format!("{prev} ({err})"),
-                    _ => err.to_string(),
-                };
-                return SaveManagerSnapshot {
-                    neighborhood: neighborhood_slot,
-                    lot: lot_u16,
-                    lot_label,
-                    slots: Vec::new(),
-                    active_error: Some(merged_err),
-                };
-            }
-        };
+    let entries = match store.list_saves_metadata(neighborhood_id, lot_id) {
+        Ok(entries) => entries,
+        Err(err) => {
+            let merged_err = match active_error {
+                Some(prev) if !prev.trim().is_empty() => format!("{prev} ({err})"),
+                _ => err.to_string(),
+            };
+            return SaveManagerSnapshot {
+                neighborhood: neighborhood_slot,
+                lot: lot_u16,
+                lot_label,
+                slots: Vec::new(),
+                active_error: Some(merged_err),
+            };
+        }
+    };
 
     let mut slots = Vec::with_capacity(entries.len());
     for entry in entries {

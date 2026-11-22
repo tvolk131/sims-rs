@@ -467,6 +467,28 @@ impl PhotoAlbumDialog {
         self.blink_us = self.blink_us.wrapping_add(dt_us);
     }
 
+    /// Advances the 500 ms caret blink timer and returns `true` only when a text
+    /// field is focused and the caret visibility phase toggled.
+    pub fn sync_blink(&mut self, dt_us: u64) -> bool {
+        if !self.open || self.focus.is_none() {
+            return false;
+        }
+        let prev_phase = (self.blink_us / CARET_BLINK_US) & 1;
+        self.blink_us = self.blink_us.wrapping_add(dt_us);
+        let next_phase = (self.blink_us / CARET_BLINK_US) & 1;
+        prev_phase != next_phase
+    }
+
+    /// Exact microseconds until the Photo Album text-entry caret next flips
+    /// visibility, or `None` when closed or no text field is focused.
+    pub fn next_blink_us(&self) -> Option<u64> {
+        if !self.open || self.focus.is_none() {
+            return None;
+        }
+        let rem = CARET_BLINK_US - (self.blink_us % CARET_BLINK_US);
+        Some(rem.max(1_000))
+    }
+
     /// Synchronizes internal selection and draft state against a new `snapshot`
     /// (e.g., after the host adds, deletes, or reorders entries).
     pub fn sync_snapshot(&mut self, snapshot: &AlbumSnapshot) {

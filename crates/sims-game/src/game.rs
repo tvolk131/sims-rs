@@ -43,6 +43,10 @@ use sims_render::build_preview::{
 use sims_render::{BaseAssets, Camera, Canvas, Selected, Walls};
 use sims_ui::art::Art;
 use sims_ui::balloon::BalloonFadeState;
+use sims_ui::book::{
+    BookBadge, BookCommand, BookEntry, BookPage, BookStrings, ReferenceBookDialog,
+    ReferenceBookSnapshot,
+};
 use sims_ui::build::{BuildSubtoolAction, RoofPitchPreset, TerrainSubtool, WaterSubtool};
 use sims_ui::camera::{
     CameraButton, CameraCommand, CameraLayout, CameraPanel, CameraState, CameraStrings,
@@ -206,6 +210,14 @@ pub struct SpecialLotEntry {
     pub zoning: i16,
 }
 
+/// Outfit / skin target resolved for live 3D Sim "Try On" preview rendering.
+#[derive(Debug, Clone)]
+struct ShopPreviewTarget {
+    person: u16,
+    suit: String,
+    row: Option<String>,
+}
+
 /// Active VM special panel (`Dialog` kinds `5..=15`) currently presented in UI.
 #[derive(Debug, Clone)]
 struct ActiveSpecialPanel {
@@ -213,6 +225,7 @@ struct ActiveSpecialPanel {
     request: SpecialPanelRequest,
     coop_dialog_id: Option<NetDialogId>,
     responses: BTreeMap<String, SpecialPanelResponse>,
+    preview_targets: BTreeMap<String, ShopPreviewTarget>,
 }
 
 /// Conservative invariant key for steady-state Tier-2 lot frames where all
@@ -332,7 +345,16 @@ pub struct Game {
     shop_art: Option<Art>,
     shop_strings: Option<ShopStrings>,
     shop_snapshot: Option<ShopSnapshot>,
+    shop_preview_assets: Option<sims_people::Assets>,
+    shop_preview_yaw_deg: i16,
+    shop_preview_body: Option<(String, sims_people::appearance::Body)>,
+    shop_preview_targets: BTreeMap<String, ShopPreviewTarget>,
     purchased_shop_items: BTreeSet<String>,
+    /// Native paginated Spellbook (kind 12) & Cookbook (kind 15) reference modal.
+    book_dialog: ReferenceBookDialog,
+    book_art: Option<Art>,
+    book_strings: Option<BookStrings>,
+    book_snapshot: Option<ReferenceBookSnapshot>,
     /// Currently presented VM special panel (`Dialog` kinds `5..=15`), if any.
     active_special_panel: Option<ActiveSpecialPanel>,
     /// Co-op special-panel dialog ID already answered locally plus pump count
@@ -377,6 +399,10 @@ pub struct Game {
     /// Neighborhood and Reset Tutorial save-before-action flows so `save_to`
     /// does not overwrite the unported-action note).
     pending_after_save_note: Option<&'static str>,
+    /// Optional follow-up Options dialog opened automatically once an active
+    /// `OptionsDialog::Notice` is dismissed (used to chain a Save & Quit write
+    /// failure notice into `OptionsDialog::ConfirmSaveBeforeQuit`).
+    pending_after_notice: Option<OptionsDialog>,
     /// Whether the lot is open in neighborhood edit mode (`[lot + 0x50] == 1`,
     /// `0x4f1b5f..0x4f1be5`, `0x4f24b5`, `0x4f24d9`, `0x517c21`). Enabled when
     /// opening any vacant zoned lot or a lot with `global[32] == 1`.
@@ -1001,7 +1027,15 @@ impl Game {
             shop_art: None,
             shop_strings: None,
             shop_snapshot: None,
+            shop_preview_assets: None,
+            shop_preview_yaw_deg: 0,
+            shop_preview_body: None,
+            shop_preview_targets: BTreeMap::new(),
             purchased_shop_items: BTreeSet::new(),
+            book_dialog: ReferenceBookDialog::new(),
+            book_art: None,
+            book_strings: None,
+            book_snapshot: None,
             active_special_panel: None,
             submitted_coop_special_panel: None,
             ordered_wardrobe: None,
@@ -1018,6 +1052,7 @@ impl Game {
             dirty: false,
             restore_dirty_on_quit_cancel: false,
             pending_after_save_note: None,
+            pending_after_notice: None,
             edit_mode,
             edge_scroll_rem: [0, 0],
             canvas: Canvas::new(1, 1, [0, 0, 0]),
@@ -1362,7 +1397,15 @@ impl Game {
             shop_art: None,
             shop_strings: None,
             shop_snapshot: None,
+            shop_preview_assets: None,
+            shop_preview_yaw_deg: 0,
+            shop_preview_body: None,
+            shop_preview_targets: BTreeMap::new(),
             purchased_shop_items: BTreeSet::new(),
+            book_dialog: ReferenceBookDialog::new(),
+            book_art: None,
+            book_strings: None,
+            book_snapshot: None,
             active_special_panel: None,
             submitted_coop_special_panel: None,
             ordered_wardrobe: None,
@@ -1379,6 +1422,7 @@ impl Game {
             dirty: false,
             restore_dirty_on_quit_cancel: false,
             pending_after_save_note: None,
+            pending_after_notice: None,
             edit_mode,
             edge_scroll_rem: [0, 0],
             canvas: Canvas::new(1, 1, [0, 0, 0]),
@@ -1689,7 +1733,15 @@ impl Game {
             shop_art: None,
             shop_strings: None,
             shop_snapshot: None,
+            shop_preview_assets: None,
+            shop_preview_yaw_deg: 0,
+            shop_preview_body: None,
+            shop_preview_targets: BTreeMap::new(),
             purchased_shop_items: BTreeSet::new(),
+            book_dialog: ReferenceBookDialog::new(),
+            book_art: None,
+            book_strings: None,
+            book_snapshot: None,
             active_special_panel: None,
             submitted_coop_special_panel: None,
             ordered_wardrobe: None,
@@ -1706,6 +1758,7 @@ impl Game {
             dirty: false,
             restore_dirty_on_quit_cancel: false,
             pending_after_save_note: None,
+            pending_after_notice: None,
             edit_mode,
             edge_scroll_rem: [0, 0],
             canvas: Canvas::new(1, 1, [0, 0, 0]),
@@ -2344,6 +2397,7 @@ impl Game {
     /// `body` in the programmatic [`Game::note`] getter (and logging to stderr
     /// when `--debug` is enabled).
     pub fn show_notice(&mut self, title: impl Into<String>, body: impl Into<String>) {
+        self.pending_after_notice = None;
         let body = body.into();
         self.set_note(body.clone());
         self.hud.open_notice_dialog(title, body, self.view.size);
@@ -2507,6 +2561,7 @@ impl Game {
     /// panel `Dialog` kinds `5..=15`) is open.
     pub fn has_dialog(&self) -> bool {
         self.hud.has_dialog()
+            || self.book_dialog.is_open()
             || self.lot.asking().is_some()
             || self.lot.asking_special_panel().is_some()
             || self.active_special_panel.is_some()
@@ -2570,6 +2625,12 @@ impl Game {
     /// Handles a native modal confirmation key (`Enter`, `Escape`, or localized
     /// Yes/No from `STR# 161`, `0x5e5b3b..0x5e5bfd`, `0x6d7530`).
     pub fn dialog_confirm_key(&mut self, key: DialogKey) -> Outcome {
+        if self.book_dialog.is_open() {
+            return match key {
+                DialogKey::Enter | DialogKey::Escape => self.book_close(),
+                _ => Outcome::default(),
+            };
+        }
         if key == DialogKey::Tab {
             return Outcome {
                 redraw: self.hud.switch_dialog_field(),
@@ -2608,6 +2669,25 @@ impl Game {
                 &name,
                 &desc,
             );
+        }
+    }
+
+    /// Called by the window host when a save failed and a user-facing notice
+    /// should explain the write failure first. When `ConfirmQuit` was queued
+    /// after edit-mode `SaveCardQuit` while `dirty` is still set, chains
+    /// `OptionsDialog::Notice` -> `OptionsDialog::ConfirmSaveBeforeQuit` on
+    /// dismissal so the player sees the exact error before retrying or quitting
+    /// without saving.
+    pub fn after_save_failed_with_notice(
+        &mut self,
+        title: impl Into<String>,
+        body: impl Into<String>,
+    ) {
+        if self.dirty && self.hud.ui_dialog_kind() == Some(OptionsDialog::ConfirmQuit) {
+            self.show_notice(title, body);
+            self.pending_after_notice = Some(OptionsDialog::ConfirmSaveBeforeQuit);
+        } else if !self.hud.has_ui_dialog() {
+            self.show_notice(title, body);
         }
     }
 
@@ -2774,6 +2854,7 @@ impl Game {
             || self.lot.asking().is_some()
             || self.lot.asking_special_panel().is_some()
             || self.shop_dialog.is_open()
+            || self.book_dialog.is_open()
             || self.hud.menu.is_some()
             || self.cheat_console_open()
         {
@@ -3034,6 +3115,7 @@ impl Game {
             || self.lot.asking().is_some()
             || self.lot.asking_special_panel().is_some()
             || self.shop_dialog.is_open()
+            || self.book_dialog.is_open()
             || self.hud.menu.is_some()
             || self.cheat_console_open()
         {
@@ -3067,7 +3149,6 @@ impl Game {
         can_draw: bool,
         frame_dirty: bool,
     ) -> Option<u64> {
-        const CARET_POLL_US: u64 = 100_000;
         let mut best: Option<u64> = None;
         let mut consider = |us: u64| {
             best = Some(best.map_or(us, |prev| prev.min(us)));
@@ -3077,6 +3158,7 @@ impl Game {
         }
         let ticks_active = self.hud.controls.mode == Mode::Live
             && !self.hud.has_ui_dialog()
+            && !self.book_dialog.is_open()
             && self.lot.asking().is_none()
             && self.lot.asking_special_panel().is_none()
             && self.stopped.is_none();
@@ -3112,8 +3194,8 @@ impl Game {
             if let Some(us) = self.hud.next_blink_us(self.clock_us) {
                 consider(us);
             }
-            if self.coop_lobby.is_open() {
-                consider(CARET_POLL_US);
+            if let Some(us) = self.coop_lobby.next_blink_us(self.clock_us) {
+                consider(us);
             }
         }
         best
@@ -3780,6 +3862,7 @@ impl Game {
         );
         self.draw_build_cost_label();
         self.draw_shop_dialog();
+        self.draw_book_dialog();
         self.draw_coop_hud_and_lobby();
         // The help balloon closed by the selection's going.
         let sounds = self.hud.take_sounds();
@@ -3810,6 +3893,7 @@ impl Game {
             && !self.hud.camera_strip_open()
             && !self.cheat_console_open()
             && !self.shop_dialog.is_open()
+            && !self.book_dialog.is_open()
             && self.highlighted_buttons.is_empty()
             && self.highlighted_portraits.is_empty()
             && self.highlighted_relationships.is_empty()
@@ -4003,6 +4087,17 @@ impl Game {
             }
             return true;
         }
+        if self.book_dialog.is_open() {
+            if let Some(snapshot) = &self.book_snapshot {
+                let size = [
+                    self.view.size[0].max(1) as u32,
+                    self.view.size[1].max(1) as u32,
+                ];
+                self.book_dialog
+                    .pointer_move(size, snapshot, point[0], point[1]);
+            }
+            return true;
+        }
         let mut redraw = self.hud.hover(point);
         let sounds = self.hud.take_sounds();
         self.keep_sounds(sounds);
@@ -4056,6 +4151,23 @@ impl Game {
                 ];
                 let changed = self
                     .shop_dialog
+                    .pointer_down(size, snapshot, point[0], point[1]);
+                return Outcome {
+                    redraw: changed,
+                    ..Outcome::default()
+                };
+            }
+            return Outcome::default();
+        }
+        if self.book_dialog.is_open() {
+            self.pointer = Some(point);
+            if let Some(snapshot) = &self.book_snapshot {
+                let size = [
+                    self.view.size[0].max(1) as u32,
+                    self.view.size[1].max(1) as u32,
+                ];
+                let changed = self
+                    .book_dialog
                     .pointer_down(size, snapshot, point[0], point[1]);
                 return Outcome {
                     redraw: changed,
@@ -4346,6 +4458,34 @@ impl Game {
             });
             return match cmd {
                 Some(cmd) => self.execute_shop_command(cmd),
+                None => Outcome::redraw(),
+            };
+        }
+        if self.book_dialog.is_open() {
+            self.pointer = Some(point);
+            let cmd = self.book_snapshot.as_ref().and_then(|snap| {
+                let size = [
+                    self.view.size[0].max(1) as u32,
+                    self.view.size[1].max(1) as u32,
+                ];
+                self.book_dialog.pointer_up(size, snap, point[0], point[1])
+            });
+            return match cmd {
+                Some(BookCommand::PageChanged(_)) => {
+                    self.hud.play(crate::hud::CLICK);
+                    let sounds = self.hud.take_sounds();
+                    self.keep_sounds(sounds);
+                    Outcome::redraw()
+                }
+                Some(BookCommand::ScrollLines(delta)) => {
+                    if self.book_scroll_lines(delta) {
+                        self.hud.play(crate::hud::CLICK);
+                        let sounds = self.hud.take_sounds();
+                        self.keep_sounds(sounds);
+                    }
+                    Outcome::redraw()
+                }
+                Some(BookCommand::Close) => self.book_close(),
                 None => Outcome::redraw(),
             };
         }
@@ -5676,6 +5816,19 @@ impl Game {
                                     // the blocking panel never becomes invisible.
                                     self.active_special_panel = None;
                                     self.sync_special_panel();
+                                }
+                            }
+                            (OptionsDialog::Notice, _) => {
+                                self.note = None;
+                                if let Some(next) = self.pending_after_notice.take() {
+                                    let name = self.lot.lot_name().to_owned();
+                                    let desc = self.lot.lot_description().to_owned();
+                                    self.hud.open_options_dialog(
+                                        next,
+                                        self.view.size,
+                                        &name,
+                                        &desc,
+                                    );
                                 }
                             }
                             _ => {
@@ -8200,14 +8353,21 @@ impl Game {
                 .and_then(|o| self.hud.name(o.guid))
                 .map(str::to_owned)
         });
+        let preview_targets = self.build_boutique_preview_targets(kind, &items);
         self.shop_snapshot = Some(ShopSnapshot {
             kind,
             title_override: None,
+            buy_label_override: None,
             shopper_name,
             wallet,
             items,
             tried_on_item_id: None,
+            preview_image: None,
+            preview_label: None,
         });
+        self.shop_preview_yaw_deg = 0;
+        self.shop_preview_body = None;
+        self.shop_preview_targets = preview_targets;
         self.shop_dialog.open();
         self.close_menu();
         true
@@ -8217,6 +8377,40 @@ impl Game {
     pub fn close_shop(&mut self) {
         self.shop_dialog.close();
         self.shop_snapshot = None;
+        self.shop_preview_yaw_deg = 0;
+        self.shop_preview_body = None;
+        self.shop_preview_targets.clear();
+    }
+
+    /// Current horizontal rotation angle (in degrees) of the live 3D Shop Try-On preview.
+    pub fn shop_preview_yaw_deg(&self) -> i16 {
+        self.shop_preview_yaw_deg
+    }
+
+    /// Triggers Try-On for the currently selected item in [`ShopPickerDialog`].
+    pub fn shop_try_on_selected(&mut self) -> Outcome {
+        let Some(item_id) = self.shop_snapshot.as_ref().and_then(|snap| {
+            self.shop_dialog
+                .can_try_on_selected(snap)
+                .then(|| self.shop_dialog.selected_item(snap).map(|i| i.id.clone()))
+                .flatten()
+        }) else {
+            return Outcome::default();
+        };
+        self.execute_shop_command(ShopCommand::TryOn { item_id })
+    }
+
+    /// Rotates the live 3D Shop Try-On preview by `delta_deg` degrees.
+    pub fn shop_rotate_preview(&mut self, delta_deg: i16) -> Outcome {
+        if !self.shop_dialog.is_open()
+            || self
+                .shop_snapshot
+                .as_ref()
+                .is_none_or(|s| s.preview_image.is_none())
+        {
+            return Outcome::default();
+        }
+        self.execute_shop_command(ShopCommand::RotatePreview(delta_deg))
     }
 
     pub fn shop_select_prev(&mut self) -> bool {
@@ -8282,14 +8476,15 @@ impl Game {
                 Outcome::redraw()
             }
             ShopCommand::TryOn { item_id } => {
-                let mut tried_name = item_id.clone();
-                if let Some(snap) = &mut self.shop_snapshot {
-                    snap.tried_on_item_id = Some(item_id.clone());
-                    if let Some(item) = snap.items.iter().find(|i| i.id == item_id) {
-                        tried_name = item.name.clone();
-                    }
-                }
-                self.note = Some(format!("Trying on {tried_name}."));
+                let target = self.shop_preview_targets.get(&item_id).cloned();
+                self.apply_shop_try_on(&item_id, target.as_ref());
+                self.hud.play(crate::hud::CLICK);
+                let sounds = self.hud.take_sounds();
+                self.keep_sounds(sounds);
+                Outcome::redraw()
+            }
+            ShopCommand::RotatePreview(delta_deg) => {
+                self.apply_shop_rotate_preview(delta_deg);
                 self.hud.play(crate::hud::CLICK);
                 let sounds = self.hud.take_sounds();
                 self.keep_sounds(sounds);
@@ -8459,6 +8654,509 @@ impl Game {
     }
 
     // -------------------------------------------------------------------------
+    // Paginated Spellbook & Cookbook Reference Modal (`sims_ui::book`)
+    // -------------------------------------------------------------------------
+
+    /// Whether the paginated Spellbook / Cookbook [`ReferenceBookDialog`] is open.
+    pub fn book_open(&self) -> bool {
+        self.book_dialog.is_open()
+    }
+
+    /// Active [`ReferenceBookDialog`] controller.
+    pub fn book_dialog(&self) -> &ReferenceBookDialog {
+        &self.book_dialog
+    }
+
+    /// Active [`ReferenceBookSnapshot`], when the reference book modal is open.
+    pub fn book_snapshot(&self) -> Option<&ReferenceBookSnapshot> {
+        self.book_snapshot.as_ref()
+    }
+
+    /// Navigates to the previous page of the open reference book.
+    pub fn book_prev_page(&mut self) -> bool {
+        let changed = self
+            .book_snapshot
+            .as_ref()
+            .and_then(|snap| self.book_dialog.prev_page(snap))
+            .is_some();
+        if changed {
+            self.hud.play(crate::hud::CLICK);
+            let sounds = self.hud.take_sounds();
+            self.keep_sounds(sounds);
+        }
+        changed
+    }
+
+    /// Navigates to the next page of the open reference book.
+    pub fn book_next_page(&mut self) -> bool {
+        let changed = self
+            .book_snapshot
+            .as_ref()
+            .and_then(|snap| self.book_dialog.next_page(snap))
+            .is_some();
+        if changed {
+            self.hud.play(crate::hud::CLICK);
+            let sounds = self.hud.take_sounds();
+            self.keep_sounds(sounds);
+        }
+        changed
+    }
+
+    /// Scrolls vertically within the active page of the open reference book
+    /// (clamped to the measured wrapped line overflow for the current viewport).
+    pub fn book_scroll_lines(&mut self, delta_lines: i32) -> bool {
+        if !self.book_dialog.is_open() {
+            return false;
+        }
+        self.ensure_book_assets();
+        let size = [
+            self.view.size[0].max(1) as u32,
+            self.view.size[1].max(1) as u32,
+        ];
+        let art = self.book_art.as_ref().unwrap_or(&self.hud.art);
+        self.book_snapshot.as_ref().is_some_and(|snap| {
+            self.book_dialog
+                .scroll_vertical(delta_lines, size, snap, art)
+        })
+    }
+
+    /// Scrolls within a tall reference book page via mouse wheel, turning pages
+    /// once at the top/bottom of the current page.
+    pub fn book_wheel(&mut self, delta_y: f64) -> bool {
+        let dir = if delta_y > 0.0 {
+            -1
+        } else if delta_y < 0.0 {
+            1
+        } else {
+            return false;
+        };
+        if self.book_scroll_lines(dir * 3) {
+            return true;
+        }
+        let changed = self
+            .book_snapshot
+            .as_ref()
+            .and_then(|snap| self.book_dialog.scroll(dir, snap))
+            .is_some();
+        if changed {
+            self.hud.play(crate::hud::CLICK);
+            let sounds = self.hud.take_sounds();
+            self.keep_sounds(sounds);
+        }
+        changed
+    }
+
+    /// Opens the paginated Spellbook (`is_cookbook == false`) or Cookbook
+    /// (`is_cookbook == true`) reference modal directly for `caller`.
+    pub fn open_reference_book(&mut self, caller: Option<u16>, is_cookbook: bool) {
+        self.ensure_book_assets();
+        let snapshot = self.build_reference_book_snapshot(self.lot.world(), caller, is_cookbook);
+        self.book_snapshot = Some(snapshot);
+        self.book_dialog.open();
+        self.close_menu();
+        self.hud.close_camera_strip();
+    }
+
+    /// Closes the open reference book modal and delivers
+    /// [`SpecialPanelResponse::Dismissed`] to the VM when backing a special panel.
+    pub fn book_close(&mut self) -> Outcome {
+        let is_book_panel = self.active_special_panel.as_ref().is_some_and(|p| {
+            matches!(
+                p.request,
+                SpecialPanelRequest::SpellBook { .. } | SpecialPanelRequest::CookBook { .. }
+            )
+        });
+        if !self.book_dialog.is_open() && !is_book_panel {
+            return Outcome::default();
+        }
+        self.book_dialog.close();
+        if is_book_panel {
+            if self.answer_special_panel(SpecialPanelResponse::Dismissed) {
+                self.hud.play(crate::hud::CLICK);
+            } else {
+                self.hud.play(crate::hud::ERROR);
+                if self.book_snapshot.is_some() {
+                    self.book_dialog.open();
+                } else {
+                    self.active_special_panel = None;
+                    self.sync_special_panel();
+                }
+            }
+        } else {
+            self.book_snapshot = None;
+            self.hud.play(crate::hud::CLICK);
+        }
+        let sounds = self.hud.take_sounds();
+        self.keep_sounds(sounds);
+        Outcome::redraw()
+    }
+
+    fn ensure_book_assets(&mut self) {
+        if self.book_strings.is_none() {
+            let strings = BookStrings::load(self.hud.install(), US_ENGLISH).unwrap_or_default();
+            self.book_strings = Some(strings);
+        }
+        if self.book_art.is_none()
+            && let Ok(ui) = UiGraphics::open(self.hud.install())
+            && let Ok(art) = sims_ui::book::load_art(&ui, US_ENGLISH)
+        {
+            self.book_art = Some(art);
+        }
+    }
+
+    fn draw_book_dialog(&mut self) {
+        if !self.book_dialog.is_open() {
+            return;
+        }
+        self.ensure_book_assets();
+        let Some(snapshot) = self.book_snapshot.as_ref() else {
+            return;
+        };
+        let strings = self.book_strings.clone().unwrap_or_default();
+        let art = self.book_art.as_ref().unwrap_or(&self.hud.art);
+        let (w, h) = (
+            u32::try_from(self.canvas.width).unwrap_or(0),
+            u32::try_from(self.canvas.height).unwrap_or(0),
+        );
+        let Ok(mut frame) =
+            sims_ui::frame::Frame::from_packed(w, h, std::mem::take(&mut self.canvas.color))
+        else {
+            return;
+        };
+        self.book_dialog.draw(&mut frame, snapshot, &strings, art);
+        self.canvas.color = frame.into_packed();
+    }
+
+    // -------------------------------------------------------------------------
+    // Live 3D Sim Preview for Wardrobe / Charm Try-On (`sims_people::caf_preview`)
+    // -------------------------------------------------------------------------
+
+    fn ensure_shop_preview_assets(&mut self) -> Option<&sims_people::Assets> {
+        if self.shop_preview_assets.is_none() {
+            self.shop_preview_assets = sims_people::Assets::scan(&self.hud.install().root).ok();
+        }
+        self.shop_preview_assets.as_ref()
+    }
+
+    fn build_boutique_preview_targets(
+        &mut self,
+        kind: ShopKind,
+        items: &[ShopItem],
+    ) -> BTreeMap<String, ShopPreviewTarget> {
+        let mut targets = BTreeMap::new();
+        let category_prefix: Option<&str> = match kind {
+            ShopKind::DowntownBoutique(WardrobeCategory::Everyday) => Some("b"),
+            ShopKind::DowntownBoutique(WardrobeCategory::Swimwear) => Some("s"),
+            ShopKind::DowntownBoutique(WardrobeCategory::Formal) => Some("f"),
+            ShopKind::DowntownBoutique(WardrobeCategory::Pajamas) => Some("l"),
+            ShopKind::DowntownBoutique(WardrobeCategory::Winterwear) => Some("w"),
+            ShopKind::StudioWardrobe => Some("h"),
+            _ => None,
+        };
+        let Some(prefix) = category_prefix else {
+            return targets;
+        };
+        let try_on_items: Vec<&ShopItem> = items.iter().filter(|i| i.supports_try_on).collect();
+        if try_on_items.is_empty() {
+            return targets;
+        }
+        let world = self.lot.world();
+        let Some(person) = world.selected().or_else(|| {
+            world
+                .objects
+                .iter()
+                .find(|(_, o)| o.person.is_some())
+                .map(|(&id, _)| id)
+        }) else {
+            return targets;
+        };
+        let (female, child) = world
+            .objects
+            .get(&person)
+            .and_then(|o| o.person.as_ref())
+            .map(|p| {
+                let kind_word = p.data.get(sims_sim::neighbors::KIND).copied().unwrap_or(0);
+                let age = p.data.get(58).copied().unwrap_or(27);
+                ((kind_word & 1) == 1, age < 18)
+            })
+            .unwrap_or((false, false));
+        let skin = self.person_skin_tone(world, person);
+
+        if prefix == "b" {
+            let mut everyday_rows: Vec<(String, String)> = Vec::new();
+            if let Some(wardrobe) = self.ensure_ordered_wardrobe() {
+                let count = wardrobe.count(false, female, child, &skin).min(32);
+                for idx in 0..count {
+                    if let Some((suit, row)) = wardrobe.pick(false, female, child, &skin, idx) {
+                        everyday_rows.push((suit, row));
+                    }
+                }
+            }
+            for (idx, item) in try_on_items.iter().enumerate() {
+                if let Some((suit, row)) = everyday_rows.get(idx) {
+                    targets.insert(
+                        item.id.clone(),
+                        ShopPreviewTarget {
+                            person,
+                            suit: suit.clone(),
+                            row: Some(row.clone()),
+                        },
+                    );
+                }
+            }
+            return targets;
+        }
+
+        let gender_age = match (female, child) {
+            (true, false) => "fa",
+            (false, false) => "ma",
+            (true, true) => "fc",
+            (false, true) => "mc",
+        };
+        let mut category_suits: Vec<String> = Vec::new();
+        if let Some(assets) = self.ensure_shop_preview_assets() {
+            let mut matched: Vec<String> = sims_people::appearance::appearance_names(assets)
+                .filter(|name| {
+                    let lower = name.to_ascii_lowercase();
+                    lower.starts_with(prefix)
+                        && lower.len() >= 6
+                        && lower.as_bytes()[1..4].iter().all(u8::is_ascii_digit)
+                        && lower.as_bytes().get(4..6) == Some(gender_age.as_bytes())
+                })
+                .map(str::to_owned)
+                .collect();
+            matched.sort();
+            matched.dedup();
+            category_suits = matched;
+        }
+        for (idx, item) in try_on_items.iter().enumerate() {
+            if let Some(suit) = category_suits.get(idx) {
+                targets.insert(
+                    item.id.clone(),
+                    ShopPreviewTarget {
+                        person,
+                        suit: suit.clone(),
+                        row: None,
+                    },
+                );
+            }
+        }
+        targets
+    }
+
+    fn apply_shop_try_on(&mut self, item_id: &str, target: Option<&ShopPreviewTarget>) {
+        let mut tried_name = item_id.to_owned();
+        let is_new_item = self
+            .shop_snapshot
+            .as_ref()
+            .and_then(|s| s.tried_on_item_id.as_deref())
+            != Some(item_id);
+        if is_new_item {
+            self.shop_preview_yaw_deg = 0;
+            self.shop_preview_body = None;
+        }
+        if let Some(snap) = &self.shop_snapshot
+            && let Some(item) = snap.items.iter().find(|i| i.id == item_id)
+        {
+            tried_name = item.name.clone();
+        }
+        let image = self.render_shop_try_on_image(item_id, target);
+        if let Some(snap) = &mut self.shop_snapshot {
+            snap.tried_on_item_id = Some(item_id.to_owned());
+            if image.is_some() {
+                snap.preview_image = image;
+                snap.preview_label = Some(tried_name.clone());
+            } else {
+                snap.preview_image = None;
+                snap.preview_label = Some("Preview unavailable".into());
+            }
+        }
+        self.note = Some(format!("Previewing {tried_name}."));
+    }
+
+    fn apply_shop_rotate_preview(&mut self, delta_deg: i16) {
+        self.shop_preview_yaw_deg =
+            (i32::from(self.shop_preview_yaw_deg) + i32::from(delta_deg)).rem_euclid(360) as i16;
+        let yaw = sims_people::caf_preview::TURNTABLE_BASE_YAW
+            + f32::from(self.shop_preview_yaw_deg).to_radians();
+        let params = sims_people::caf_preview::TurntableParams {
+            yaw,
+            ..sims_people::caf_preview::TurntableParams::default()
+        };
+        let rendered = self
+            .shop_preview_body
+            .as_ref()
+            .and_then(|(_, body)| {
+                sims_people::caf_preview::render_turntable(body, None, &params).ok()
+            })
+            .map(|canvas| sims_formats::bitmap::Image {
+                width: canvas.width,
+                height: canvas.height,
+                rgba: canvas.rgba,
+            });
+        if let (Some(img), Some(snap)) = (rendered, &mut self.shop_snapshot) {
+            snap.preview_image = Some(img);
+        }
+    }
+
+    fn person_head_binding(
+        &self,
+        world: &sims_sim::World,
+        person: u16,
+    ) -> Option<(String, String)> {
+        let obj = world.objects.get(&person)?;
+        if let Some(outfits) = world.made_outfits.get(&obj.guid)
+            && let Some(raw) = outfits.get(&2)
+        {
+            let (app, tex) = sims_people::appearance::body_string(raw);
+            if !app.is_empty() {
+                return Some((app, tex));
+            }
+        }
+        let catalog = self.assets.catalog();
+        if let Some(entry) = catalog
+            .by_guid
+            .get(&obj.guid)
+            .and_then(|&idx| catalog.objects.get(idx))
+            && let Some(res) = self.assets.index().resources.get(entry.resource)
+            && let Ok(bytes) = res.read()
+            && let Ok(iff) = sims_formats::iff::Iff::parse(bytes)
+            && let Some(chunk) = iff.get(b"STR#", 200)
+            && let Ok(table) = sims_formats::strings::StringTable::parse(iff.data(chunk))
+            && let Some(raw) = table.get(2, US_ENGLISH).or_else(|| table.get(2, 1))
+        {
+            let (app, tex) = sims_people::appearance::body_string(raw);
+            if !app.is_empty() {
+                return Some((app, tex));
+            }
+        }
+        None
+    }
+
+    fn render_shop_try_on_image(
+        &mut self,
+        item_id: &str,
+        target: Option<&ShopPreviewTarget>,
+    ) -> Option<sims_formats::bitmap::Image> {
+        let target = target?;
+        let world = self
+            .lot
+            .asking_special_panel()
+            .map(|a| &a.world)
+            .unwrap_or_else(|| self.lot.world());
+        let person = target.person;
+        let (female, child) = world
+            .objects
+            .get(&person)
+            .and_then(|o| o.person.as_ref())
+            .map(|p| {
+                let kind = p.data.get(sims_sim::neighbors::KIND).copied().unwrap_or(0);
+                let age = p.data.get(58).copied().unwrap_or(27);
+                ((kind & 1) == 1, age < 18)
+            })
+            .unwrap_or((false, false));
+        let skin_code = self.person_skin_tone(world, person);
+        let head_override = self.person_head_binding(world, person);
+        let p_age = if child {
+            sims_people::caf_preview::Age::Child
+        } else {
+            sims_people::caf_preview::Age::Adult
+        };
+        let p_gender = if female {
+            sims_people::caf_preview::Gender::Female
+        } else {
+            sims_people::caf_preview::Gender::Male
+        };
+        let p_skin = match skin_code.as_str() {
+            "med" => sims_people::caf_preview::SkinTone::Medium,
+            "drk" => sims_people::caf_preview::SkinTone::Dark,
+            _ => sims_people::caf_preview::SkinTone::Light,
+        };
+
+        if self
+            .shop_preview_body
+            .as_ref()
+            .is_none_or(|(id, _)| id != item_id)
+        {
+            let assets = self.ensure_shop_preview_assets()?;
+            let wardrobe = sims_people::suit::Wardrobe::of(assets);
+            let catalog = sims_people::caf_preview::enumerate_catalog_from_wardrobe(
+                &wardrobe, p_age, p_gender, p_skin,
+            );
+            let head = head_override
+                .filter(|(app, _)| sims_people::appearance::load_appearance(assets, app).is_ok())
+                .or_else(|| {
+                    catalog
+                        .heads
+                        .first()
+                        .map(|h| (h.appearance.clone(), h.texture_binding.clone()))
+                })?;
+
+            let mut candidate_bodies: Vec<(String, String)> = Vec::new();
+            if let Some(row) = &target.row {
+                let (app, tex) = sims_people::appearance::body_string(row);
+                if !app.is_empty() {
+                    candidate_bodies.push((app, tex));
+                }
+            }
+            if !target.suit.is_empty() {
+                if sims_people::appearance::load_appearance(assets, &target.suit).is_ok() {
+                    candidate_bodies.push((target.suit.clone(), String::new()));
+                } else {
+                    // `scan_install_skin_names` may return a `.bmp` texture stem
+                    // such as `s001fafitlgt_bikini`; match its appearance prefix.
+                    let lower_suit = target.suit.to_ascii_lowercase();
+                    let prefix_len = lower_suit.len().min(9);
+                    let matched_app = sims_people::appearance::appearance_names(assets)
+                        .find(|name| {
+                            let ln = name.to_ascii_lowercase();
+                            ln == lower_suit
+                                || (prefix_len >= 6
+                                    && ln.as_bytes().get(..prefix_len)
+                                        == lower_suit.as_bytes().get(..prefix_len))
+                        })
+                        .map(str::to_owned);
+                    if let Some(app) = matched_app {
+                        candidate_bodies.push((app, format!("BODY={}", target.suit)));
+                    }
+                }
+            }
+
+            let mut loaded_body = None;
+            for (body_app, body_tex) in candidate_bodies {
+                let cfg = sims_people::caf_preview::SimConfig {
+                    age: p_age,
+                    gender: p_gender,
+                    skin_tone: p_skin,
+                    head: head.clone(),
+                    body: (body_app, body_tex),
+                    hands: None,
+                };
+                if let Ok(body) = cfg.load_body(assets) {
+                    loaded_body = Some(body);
+                    break;
+                }
+            }
+            let body = loaded_body?;
+            self.shop_preview_body = Some((item_id.to_owned(), body));
+        }
+
+        let (_, body) = self.shop_preview_body.as_ref()?;
+        let yaw = sims_people::caf_preview::TURNTABLE_BASE_YAW
+            + f32::from(self.shop_preview_yaw_deg).to_radians();
+        let params = sims_people::caf_preview::TurntableParams {
+            yaw,
+            ..sims_people::caf_preview::TurntableParams::default()
+        };
+        let canvas = sims_people::caf_preview::render_turntable(body, None, &params).ok()?;
+        Some(sims_formats::bitmap::Image {
+            width: canvas.width,
+            height: canvas.height,
+            rgba: canvas.rgba,
+        })
+    }
+
+    // -------------------------------------------------------------------------
     // Special Dialog Panels (`Dialog` kinds `5..=15`, single-player & co-op)
     // -------------------------------------------------------------------------
 
@@ -8469,6 +9167,11 @@ impl Game {
         if self.active_special_panel.take().is_some() {
             self.shop_dialog.close();
             self.shop_snapshot = None;
+            self.shop_preview_yaw_deg = 0;
+            self.shop_preview_body = None;
+            self.shop_preview_targets.clear();
+            self.book_dialog.close();
+            self.book_snapshot = None;
             self.hud.close_special_book_dialog();
         }
     }
@@ -8513,22 +9216,28 @@ impl Game {
         self.close_menu();
         self.hud.close_camera_strip();
         self.hud.close_special_book_dialog();
+        self.book_dialog.close();
+        self.book_snapshot = None;
         self.shop_dialog.close();
         self.shop_snapshot = None;
+        self.shop_preview_yaw_deg = 0;
+        self.shop_preview_body = None;
 
         match &request {
             SpecialPanelRequest::SpellBook { caller }
             | SpecialPanelRequest::CookBook { caller } => {
                 let is_cookbook = matches!(request, SpecialPanelRequest::CookBook { .. });
-                let (title, body) =
-                    self.build_reference_book_content(&asking.world, *caller, is_cookbook);
-                self.hud
-                    .open_special_book_dialog(title, body, self.view.size);
+                self.ensure_book_assets();
+                let snapshot =
+                    self.build_reference_book_snapshot(&asking.world, *caller, is_cookbook);
+                self.book_snapshot = Some(snapshot);
+                self.book_dialog.open();
                 self.active_special_panel = Some(ActiveSpecialPanel {
                     tick,
                     request,
                     coop_dialog_id,
                     responses: BTreeMap::new(),
+                    preview_targets: BTreeMap::new(),
                 });
             }
             SpecialPanelRequest::DowntownLotPicker
@@ -8547,6 +9256,7 @@ impl Game {
                     None,
                     items,
                     responses,
+                    BTreeMap::new(),
                 );
             }
             SpecialPanelRequest::WardrobeShop { person, mode } => {
@@ -8564,7 +9274,7 @@ impl Game {
                     ShopKind::DowntownBoutique(category)
                 };
                 let shopper = self.person_display_name(&asking.world, *person);
-                let (items, responses) =
+                let (items, responses, preview_targets) =
                     self.build_wardrobe_picker_items(&asking.world, *person, *mode);
                 self.open_special_picker(
                     tick,
@@ -8575,6 +9285,7 @@ impl Game {
                     shopper,
                     items,
                     responses,
+                    preview_targets,
                 );
             }
             SpecialPanelRequest::PetPicker { pet } => {
@@ -8589,6 +9300,7 @@ impl Game {
                     shopper,
                     items,
                     responses,
+                    BTreeMap::new(),
                 );
             }
             SpecialPanelRequest::CallNeighbor { caller_neighbor } => {
@@ -8617,11 +9329,13 @@ impl Game {
                     None,
                     items,
                     responses,
+                    BTreeMap::new(),
                 );
             }
             SpecialPanelRequest::CharmTransform { person } => {
                 let shopper = self.person_display_name(&asking.world, *person);
-                let (items, responses) = self.build_charm_transform_items(&asking.world, *person);
+                let (items, responses, preview_targets) =
+                    self.build_charm_transform_items(&asking.world, *person);
                 self.open_special_picker(
                     tick,
                     request,
@@ -8631,6 +9345,7 @@ impl Game {
                     shopper,
                     items,
                     responses,
+                    preview_targets,
                 );
             }
         }
@@ -8647,23 +9362,30 @@ impl Game {
         shopper_name: Option<String>,
         items: Vec<ShopItem>,
         responses: BTreeMap<String, SpecialPanelResponse>,
+        preview_targets: BTreeMap<String, ShopPreviewTarget>,
     ) {
         self.ensure_shop_assets();
         let wallet = self.current_shop_wallet();
         self.shop_snapshot = Some(ShopSnapshot {
             kind,
             title_override,
+            buy_label_override: None,
             shopper_name,
             wallet,
             items,
             tried_on_item_id: None,
+            preview_image: None,
+            preview_label: None,
         });
+        self.shop_preview_yaw_deg = 0;
+        self.shop_preview_body = None;
         self.shop_dialog.open();
         self.active_special_panel = Some(ActiveSpecialPanel {
             tick,
             request,
             coop_dialog_id,
             responses,
+            preview_targets,
         });
     }
 
@@ -8752,14 +9474,15 @@ impl Game {
                 Outcome::redraw()
             }
             ShopCommand::TryOn { item_id } => {
-                let mut tried_name = item_id.clone();
-                if let Some(snap) = &mut self.shop_snapshot {
-                    snap.tried_on_item_id = Some(item_id.clone());
-                    if let Some(item) = snap.items.iter().find(|i| i.id == item_id) {
-                        tried_name = item.name.clone();
-                    }
-                }
-                self.note = Some(format!("Previewing {tried_name}."));
+                let target = active.preview_targets.get(&item_id);
+                self.apply_shop_try_on(&item_id, target);
+                self.hud.play(crate::hud::CLICK);
+                let sounds = self.hud.take_sounds();
+                self.keep_sounds(sounds);
+                Outcome::redraw()
+            }
+            ShopCommand::RotatePreview(delta_deg) => {
+                self.apply_shop_rotate_preview(delta_deg);
                 self.hud.play(crate::hud::CLICK);
                 let sounds = self.hud.take_sounds();
                 self.keep_sounds(sounds);
@@ -8797,24 +9520,22 @@ impl Game {
             .or_else(|| self.hud.name(obj.guid).map(str::to_owned))
     }
 
-    fn build_reference_book_content(
+    fn build_reference_book_snapshot(
         &self,
         world: &sims_sim::World,
         caller: Option<u16>,
         is_cookbook: bool,
-    ) -> (String, String) {
-        let base_title = if is_cookbook { "Cookbook" } else { "Spellbook" };
+    ) -> ReferenceBookSnapshot {
+        let strings = self.book_strings.clone().unwrap_or_default();
         let caller_name = caller.and_then(|id| self.person_display_name(world, id));
-        let title = match &caller_name {
-            Some(name) => format!("{base_title} — {name}"),
-            None => base_title.to_owned(),
-        };
+        let title = strings.format_title(is_cookbook, caller_name.as_deref());
+
         let neighbor_id = caller
             .and_then(|id| world.objects.get(&id))
             .and_then(|o| o.person.as_ref())
             .and_then(|p| p.data.get(31).copied())
             .filter(|&nid| nid > 0);
-        let mut entries: Vec<String> = Vec::new();
+        let mut held_tokens: Vec<(String, u16)> = Vec::new();
         if let Some(nid) = neighbor_id
             && let Some(inv) = world
                 .neighbors
@@ -8838,42 +9559,88 @@ impl Game {
                 let label = self
                     .catalog_object_name(item.guid)
                     .unwrap_or_else(|| format!("0x{:08X}", item.guid));
-                if item.count > 1 {
-                    entries.push(format!("{label} (x{})", item.count));
-                } else {
-                    entries.push(label);
-                }
+                held_tokens.push((label, item.count));
             }
         }
-        const MAX_BOOK_LINES: usize = 6;
-        const MAX_LINE_CHARS: usize = 36;
-        let clamp_line = |s: &str| -> String {
-            let mut chars = s.chars();
-            let head: String = chars.by_ref().take(MAX_LINE_CHARS).collect();
-            if chars.next().is_some() {
-                format!("{head}...")
-            } else {
-                head
+
+        let held_summary: Vec<BookBadge> = held_tokens
+            .iter()
+            .map(|(name, count)| BookBadge {
+                label: if *count > 1 {
+                    format!("{name} (x{count})")
+                } else {
+                    name.clone()
+                },
+                owned: true,
+            })
+            .collect();
+
+        let catalog =
+            sims_ui::book::load_magic_book_entries(self.hud.install(), is_cookbook, US_ENGLISH)
+                .unwrap_or_default();
+
+        let mut pages: Vec<BookPage> = Vec::new();
+        for entry in catalog {
+            let haystack = format!(
+                "{} {}",
+                entry.title.to_ascii_lowercase(),
+                entry.description.to_ascii_lowercase()
+            );
+            let mut matched_badges = Vec::new();
+            for (token_name, count) in &held_tokens {
+                let needle = token_name.to_ascii_lowercase();
+                if needle.len() >= 3 && haystack.contains(&needle) {
+                    matched_badges.push(BookBadge {
+                        label: if *count > 1 {
+                            format!("{token_name} (x{count})")
+                        } else {
+                            token_name.clone()
+                        },
+                        owned: true,
+                    });
+                }
             }
-        };
-        let body = if entries.is_empty() {
-            "—".to_owned()
-        } else if entries.len() > MAX_BOOK_LINES {
-            let remaining = entries.len() - (MAX_BOOK_LINES - 1);
-            let mut shown: Vec<String> = entries[..(MAX_BOOK_LINES - 1)]
-                .iter()
-                .map(|e| clamp_line(e))
-                .collect();
-            shown.push(format!("+{remaining}"));
-            shown.join("\n")
-        } else {
-            entries
-                .iter()
-                .map(|e| clamp_line(e))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        (title, body)
+            let highlight = !matched_badges.is_empty();
+            pages.push(BookPage {
+                heading: None,
+                entries: vec![BookEntry {
+                    title: entry.title,
+                    subtitle: None,
+                    body: entry.description,
+                    badges: matched_badges,
+                    highlight,
+                }],
+            });
+        }
+
+        if pages.is_empty() {
+            let body = if held_summary.is_empty() {
+                "—".to_owned()
+            } else {
+                held_summary
+                    .iter()
+                    .map(|b| b.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            pages.push(BookPage {
+                heading: None,
+                entries: vec![BookEntry {
+                    title: title.clone(),
+                    subtitle: None,
+                    body,
+                    badges: Vec::new(),
+                    highlight: !held_summary.is_empty(),
+                }],
+            });
+        }
+
+        ReferenceBookSnapshot {
+            title,
+            subtitle: None,
+            held_summary,
+            pages,
+        }
     }
 
     fn catalog_object_name(&self, guid: u32) -> Option<String> {
@@ -9145,8 +9912,12 @@ impl Game {
         world: &sims_sim::World,
         person: u16,
         mode: i16,
-    ) -> (Vec<ShopItem>, BTreeMap<String, SpecialPanelResponse>) {
-        let mut entries: Vec<(usize, String)> = Vec::new();
+    ) -> (
+        Vec<ShopItem>,
+        BTreeMap<String, SpecialPanelResponse>,
+        BTreeMap<String, ShopPreviewTarget>,
+    ) {
+        let mut entries: Vec<(usize, String, String, Option<String>)> = Vec::new();
         if mode == 0 {
             let (female, child) = world
                 .objects
@@ -9163,7 +9934,8 @@ impl Game {
                 let count = wardrobe.count(false, female, child, &skin).min(32);
                 for idx in 0..count {
                     if let Some((suit, row)) = wardrobe.pick(false, female, child, &skin, idx) {
-                        entries.push((idx, Self::format_wardrobe_row_label(&suit, &row)));
+                        let label = Self::format_wardrobe_row_label(&suit, &row);
+                        entries.push((idx, label, suit, Some(row)));
                     }
                 }
             }
@@ -9182,11 +9954,16 @@ impl Game {
                 Some(prefix),
                 32,
             );
-            entries = names.into_iter().enumerate().collect();
+            entries = names
+                .into_iter()
+                .enumerate()
+                .map(|(idx, suit)| (idx, suit.clone(), suit, None))
+                .collect();
         }
         let mut items = Vec::with_capacity(entries.len());
         let mut responses = BTreeMap::new();
-        for (idx, name) in entries {
+        let mut preview_targets = BTreeMap::new();
+        for (idx, name, suit, row) in entries {
             let id = format!("special_wardrobe:{idx}");
             items.push(ShopItem {
                 id: id.clone(),
@@ -9200,14 +9977,15 @@ impl Game {
                 available: true,
             });
             responses.insert(
-                id,
+                id.clone(),
                 SpecialPanelResponse::Selection {
                     accepted: true,
                     index: idx as i16,
                 },
             );
+            preview_targets.insert(id, ShopPreviewTarget { person, suit, row });
         }
-        (items, responses)
+        (items, responses, preview_targets)
     }
 
     fn build_pet_picker_items(
@@ -9265,8 +10043,12 @@ impl Game {
         &mut self,
         world: &sims_sim::World,
         person: u16,
-    ) -> (Vec<ShopItem>, BTreeMap<String, SpecialPanelResponse>) {
-        let _ = (world, person);
+    ) -> (
+        Vec<ShopItem>,
+        BTreeMap<String, SpecialPanelResponse>,
+        BTreeMap<String, ShopPreviewTarget>,
+    ) {
+        let _ = world;
         let names = self.scan_install_skin_names(
             &[
                 "ExpansionPack7/Skins",
@@ -9278,8 +10060,10 @@ impl Game {
         );
         let mut items = Vec::with_capacity(names.len());
         let mut responses = BTreeMap::new();
+        let mut preview_targets = BTreeMap::new();
         for (idx, name) in names.into_iter().enumerate() {
             let id = format!("special_charm:{idx}");
+            let suit = name.clone();
             items.push(ShopItem {
                 id: id.clone(),
                 name,
@@ -9292,14 +10076,22 @@ impl Game {
                 available: true,
             });
             responses.insert(
-                id,
+                id.clone(),
                 SpecialPanelResponse::Selection {
                     accepted: true,
                     index: idx as i16,
                 },
             );
+            preview_targets.insert(
+                id,
+                ShopPreviewTarget {
+                    person,
+                    suit,
+                    row: None,
+                },
+            );
         }
-        (items, responses)
+        (items, responses, preview_targets)
     }
 
     fn build_call_neighbor_items(
