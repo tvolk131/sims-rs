@@ -873,6 +873,17 @@ fn effective_vacation_fade(lot_id: u16, options: &RenderOptions) -> f32 {
 }
 
 const MAX_HIGHLIGHT_CACHE_ENTRIES: usize = 128;
+const MAX_RENDER_CACHE_BYTES: usize = 32 * 1024 * 1024;
+const CANVAS_BYTES_PER_PIXEL: usize = std::mem::size_of::<[u8; 3]>()
+    + std::mem::size_of::<i32>()
+    + std::mem::size_of::<Option<u16>>();
+
+fn surface_bytes(surface: &Surface565) -> usize {
+    surface
+        .pixels
+        .len()
+        .saturating_mul(std::mem::size_of::<u16>())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct SurfaceFingerprint {
@@ -941,6 +952,7 @@ struct CachedBaseLayer {
     pre_lot_wave: Option<Surface565>,
     static_lots: Vec<CachedStaticLot>,
     canvas: Canvas,
+    bytes: usize,
 }
 
 impl CachedBaseLayer {
@@ -1006,12 +1018,25 @@ struct CachedHighlight {
     normal: Surface565,
     cutaway: Option<Surface565>,
     surface: Arc<Surface565>,
+    bytes: usize,
 }
 
 #[derive(Default)]
 struct NeighborhoodRenderCache {
     base: Option<CachedBaseLayer>,
     highlights: BTreeMap<HighlightCacheKey, CachedHighlight>,
+    highlight_bytes: usize,
+}
+
+impl NeighborhoodRenderCache {
+    fn base_bytes(&self) -> usize {
+        self.base.as_ref().map_or(0, |b| b.bytes)
+    }
+
+    fn clear_highlights(&mut self) {
+        self.highlights.clear();
+        self.highlight_bytes = 0;
+    }
 }
 
 static NEIGHBORHOOD_RENDER_CACHE: OnceLock<Mutex<NeighborhoodRenderCache>> = OnceLock::new();
@@ -1549,18 +1574,27 @@ impl NeighborhoodMap {
 
             canvas.set_id(None);
 
-            let can_cache_sources = self.backdrop.pixels.len() <= MAX_SURFACE_PIXELS
-                && active_large_frame.is_none_or(|s| s.pixels.len() <= MAX_SURFACE_PIXELS)
-                && pre_lot_wave.is_none_or(|s| s.pixels.len() <= MAX_SURFACE_PIXELS)
-                && self.lots.iter().enumerate().all(|(i, lot)| {
-                    excluded[i]
-                        || (lot.normal.pixels.len() <= MAX_SURFACE_PIXELS
-                            && lot
-                                .roofs_off
-                                .as_ref()
-                                .is_none_or(|c| c.pixels.len() <= MAX_SURFACE_PIXELS))
-                });
-            if can_cache_sources {
+            let mut base_bytes = canvas
+                .width
+                .saturating_mul(canvas.height)
+                .saturating_mul(CANVAS_BYTES_PER_PIXEL)
+                .saturating_add(surface_bytes(&self.backdrop))
+                .saturating_add(active_large_frame.map_or(0, surface_bytes))
+                .saturating_add(pre_lot_wave.map_or(0, surface_bytes));
+            for (index, lot) in self.lots.iter().enumerate() {
+                if excluded[index] {
+                    continue;
+                }
+                base_bytes = base_bytes.saturating_add(surface_bytes(&lot.normal));
+                if self.highlight_rgb_for(lot, options).is_some() {
+                    base_bytes =
+                        base_bytes.saturating_add(lot.roofs_off.as_ref().map_or(0, surface_bytes));
+                }
+                if base_bytes > MAX_RENDER_CACHE_BYTES {
+                    break;
+                }
+            }
+            if base_bytes <= MAX_RENDER_CACHE_BYTES {
                 let mut static_lots = Vec::with_capacity(static_count);
                 for (index, lot) in self.lots.iter().enumerate() {
                     if excluded[index] {
@@ -1577,6 +1611,9 @@ impl NeighborhoodMap {
                     });
                 }
                 let mut guard = render_cache().lock().unwrap_or_else(|e| e.into_inner());
+                if base_bytes.saturating_add(guard.highlight_bytes) > MAX_RENDER_CACHE_BYTES {
+                    guard.clear_highlights();
+                }
                 let mut snap = guard
                     .base
                     .take()
@@ -1592,6 +1629,7 @@ impl NeighborhoodMap {
                     pre_lot_wave: pre_lot_wave.cloned(),
                     static_lots,
                     canvas: snap,
+                    bytes: base_bytes,
                 });
             }
         }
@@ -1984,18 +2022,36 @@ impl NeighborhoodMap {
                     }
                 }
                 let built = Arc::new(highlight_lot_cell(lot, show_cutaway, rgb));
-                let mut guard = render_cache().lock().unwrap_or_else(|e| e.into_inner());
-                if guard.highlights.len() >= MAX_HIGHLIGHT_CACHE_ENTRIES {
-                    guard.highlights.clear();
+                let entry_bytes = surface_bytes(&lot.normal)
+                    .saturating_add(lot.roofs_off.as_ref().map_or(0, surface_bytes))
+                    .saturating_add(surface_bytes(&built));
+                if entry_bytes <= MAX_RENDER_CACHE_BYTES {
+                    let mut guard = render_cache().lock().unwrap_or_else(|e| e.into_inner());
+                    if guard.highlights.len() >= MAX_HIGHLIGHT_CACHE_ENTRIES
+                        || guard
+                            .base_bytes()
+                            .saturating_add(guard.highlight_bytes)
+                            .saturating_add(entry_bytes)
+                            > MAX_RENDER_CACHE_BYTES
+                    {
+                        guard.clear_highlights();
+                    }
+                    if guard.base_bytes().saturating_add(entry_bytes) > MAX_RENDER_CACHE_BYTES {
+                        guard.base = None;
+                    }
+                    if let Some(old) = guard.highlights.insert(
+                        key,
+                        CachedHighlight {
+                            normal: lot.normal.clone(),
+                            cutaway: lot.roofs_off.clone(),
+                            surface: Arc::clone(&built),
+                            bytes: entry_bytes,
+                        },
+                    ) {
+                        guard.highlight_bytes = guard.highlight_bytes.saturating_sub(old.bytes);
+                    }
+                    guard.highlight_bytes = guard.highlight_bytes.saturating_add(entry_bytes);
                 }
-                guard.highlights.insert(
-                    key,
-                    CachedHighlight {
-                        normal: lot.normal.clone(),
-                        cutaway: lot.roofs_off.clone(),
-                        surface: Arc::clone(&built),
-                    },
-                );
                 ResolvedSurface::Cached(built)
             }
             None => ResolvedSurface::Borrowed(lot.active_surface(show_cutaway)),

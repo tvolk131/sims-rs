@@ -1139,29 +1139,29 @@ fn rasterize_band(
                 let by0_i32 = by0 as i32;
                 let by1_i32 = (by1 as i32).min(*clip_bottom);
                 if (*mask & 1) != 0 {
-                    let dy = ((*y_top - *y_left) << 16) / *half_w;
-                    let mut y_fp = *y_left << 16;
+                    let dy = y_top.wrapping_sub(*y_left).wrapping_shl(16) / *half_w;
+                    let mut y_fp = y_left.wrapping_shl(16);
                     let mut px = *left;
                     while px < *left + *half_w {
                         let py = y_fp >> 16;
                         if py >= by0_i32 && py < by1_i32 {
                             band.plot_color(px, py, [0, 0, 0]);
                         }
-                        px += *step;
-                        y_fp += dy * *step;
+                        px = px.wrapping_add(*step);
+                        y_fp = y_fp.wrapping_add(dy.wrapping_mul(*step));
                     }
                 }
                 if (*mask & 2) != 0 {
-                    let dy = ((*y_right - *y_top) << 16) / *half_w;
-                    let mut y_fp = *y_top << 16;
+                    let dy = y_right.wrapping_sub(*y_top).wrapping_shl(16) / *half_w;
+                    let mut y_fp = y_top.wrapping_shl(16);
                     let mut px = *left + *half_w;
                     while px < *left + *half_w * 2 {
                         let py = y_fp >> 16;
                         if py >= by0_i32 && py < by1_i32 {
                             band.plot_color(px, py, [0, 0, 0]);
                         }
-                        px += *step;
-                        y_fp += dy * *step;
+                        px = px.wrapping_add(*step);
+                        y_fp = y_fp.wrapping_add(dy.wrapping_mul(*step));
                     }
                 }
             }
@@ -1657,6 +1657,9 @@ impl<'a> Painter<'a> {
                 }
             });
         }
+        self.canvas.rasterize_partial_tail_row(|band| {
+            rasterize_band(band, &resolved, depth_table, pools, grass);
+        });
     }
 
     /// The elevation of a lot corner in near-zoom pixels: 16 per terrain

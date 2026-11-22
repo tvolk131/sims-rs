@@ -444,6 +444,42 @@ impl Canvas {
             .collect()
     }
 
+    /// If a manually truncated canvas ends with a partial backed row
+    /// (`0 < min_len % width < width`), stages that row into a 1-row
+    /// [`CanvasBand`], invokes `f`, and copies the backed prefix back.
+    /// No-op for normally allocated canvases (`self.has_pixel_storage()`).
+    pub(crate) fn rasterize_partial_tail_row(&mut self, f: impl FnOnce(&mut CanvasBand<'_>)) {
+        if self.width == 0 || self.height == 0 || self.has_pixel_storage() {
+            return;
+        }
+        let min_len = self.color.len().min(self.depth.len()).min(self.ids.len());
+        let partial_y = min_len / self.width;
+        let partial_cols = min_len % self.width;
+        if partial_cols == 0 || partial_y >= self.height {
+            return;
+        }
+        let row_start = partial_y * self.width;
+        let mut color = vec![[0, 0, 0]; self.width];
+        let mut depth = vec![i32::MAX; self.width];
+        let mut ids = vec![None; self.width];
+        color[..partial_cols].copy_from_slice(&self.color[row_start..min_len]);
+        depth[..partial_cols].copy_from_slice(&self.depth[row_start..min_len]);
+        ids[..partial_cols].copy_from_slice(&self.ids[row_start..min_len]);
+        let mut band = CanvasBand {
+            width: self.width,
+            height: self.height,
+            y0: partial_y,
+            y1: partial_y + 1,
+            color: &mut color,
+            depth: &mut depth,
+            ids: &mut ids,
+        };
+        f(&mut band);
+        self.color[row_start..min_len].copy_from_slice(&color[..partial_cols]);
+        self.depth[row_start..min_len].copy_from_slice(&depth[..partial_cols]);
+        self.ids[row_start..min_len].copy_from_slice(&ids[..partial_cols]);
+    }
+
     /// Mutable row slices for `(color, depth, ids)` on row `y`, columns `x0..x1`.
     /// Caller must ensure `y < self.height`, `x0 <= x1 <= self.width`, and
     /// `self.has_pixel_storage()`.
