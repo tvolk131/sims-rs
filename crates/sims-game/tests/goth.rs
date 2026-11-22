@@ -7851,30 +7851,37 @@ fn buy_mode_hand_tool_guards_depreciation_undo_redo_and_followups() {
             let saved = lot6.save_without_buy_cursor(&old_pick).unwrap();
             assert!(saved.world().objects.contains_key(&chair2));
 
-            // Single-cursor surface ownership + Undo invalidation:
+            // Single-cursor surface ownership + Sol Round 8b P2 #3:
             // picking up a desk prevents picking up its lamp at the same time;
-            // undoing the lamp's Buy while holding the desk immediately retires
-            // the desk cursor and removes its Tile Cursor so stale handles can
-            // never resurrect the refunded lamp.
+            // moving the desk (uncommitted) and then undoing the lamp's Buy
+            // snaps the desk back to its pre-pickup tile BEFORE undoing the
+            // lamp so the uncommitted surface move is never made permanent.
             let mut dk = lot6.buy_start(desk.guid, 1, 2).unwrap().unwrap();
             assert!(lot6.buy_move(&mut dk, [584, 472], 1).unwrap());
             let desk_id = lot6.buy_commit(&dk).unwrap();
             let mut lp = lot6.buy_start(lamp.guid, 1, 2).unwrap().unwrap();
             assert!(lot6.buy_move(&mut lp, [584, 472], 1).unwrap());
             let lamp_id = lot6.buy_commit(&lp).unwrap();
-            let desk_pick = lot6.buy_pick_up(desk_id).unwrap().unwrap();
+            let mut desk_pick = lot6.buy_pick_up(desk_id).unwrap().unwrap();
+            assert!(lot6.buy_move(&mut desk_pick, [600, 440], 1).unwrap());
+            assert_eq!(lot6.world().objects[&desk_id].position, [600, 440, 1]);
             assert!(
                 lot6.buy_pick_up(lamp_id).unwrap().is_none(),
                 "cannot pick up lamp while desk cursor is active"
             );
-            assert!(lot6.buy_undo().unwrap()); // undoes lamp_id, retires desk_pick + removes Tile Cursor
+            assert!(lot6.buy_undo().unwrap()); // snaps desk back to [584, 472], undoes lamp_id
             assert!(!lot6.world().objects.contains_key(&desk_pick.cursor));
+            assert_eq!(
+                lot6.world().objects[&desk_id].position,
+                [584, 472, 1],
+                "undoing child purchase must snap uncommitted desk move back to origin"
+            );
             assert!(lot6.world().objects[&lamp_id].position[0] < 0);
             let funds_after_lamp_undo = lot6.world().budget.funds;
             assert!(!lot6.buy_sell(&desk_pick).unwrap());
             lot6.buy_cancel(&desk_pick).unwrap();
             assert_eq!(lot6.world().budget.funds, funds_after_lamp_undo);
-            assert!(lot6.world().objects[&desk_id].position[0] >= 0);
+            assert_eq!(lot6.world().objects[&desk_id].position, [584, 472, 1]);
             assert!(
                 lot6.world().objects[&lamp_id].position[0] < 0,
                 "cancelling retired desk handle must not restore already-refunded lamp"
@@ -7887,10 +7894,10 @@ fn buy_mode_hand_tool_guards_depreciation_undo_redo_and_followups() {
             assert!(lot6.world().objects.contains_key(&chair2));
 
             // Sol Round 7 regression: Undo while retaining a pickup handle
-            // invalidates it permanently, so even after a later commit purges
-            // the detached object and an unpaid preview or paid chair reuses
-            // its ID, the old pickup handle CANNOT sell, mutate, or delete the
-            // new object via buy_sell, buy_cancel, save_without_buy_cursor, or
+            // retires it immediately, so even after a later commit purges the
+            // detached object and an unpaid preview or paid chair reuses its
+            // ID, the old pickup handle CANNOT sell, mutate, or delete the new
+            // object via buy_sell, buy_cancel, save_without_buy_cursor, or
             // set_mode_releasing_buy_cursor.
             lot6.set_mode(sims_vm::PanelMode::Buy).unwrap();
             let mut u1 = lot6.buy_start(chair_guid, 1, 2).unwrap().unwrap();
@@ -7919,21 +7926,31 @@ fn buy_mode_hand_tool_guards_depreciation_undo_redo_and_followups() {
             assert_eq!(lot6.world().budget.funds, funds_before_stale_sell);
             assert!(lot6.world().objects.contains_key(&reused_prev.held));
             assert!(lot6.world().objects.contains_key(&other_id));
-            // `save_without_buy_cursor(&stale_after_undo)` ignores the retired
-            // handle and touches neither `reused_prev.held` nor `other_id`.
-            let saved = lot6.save_without_buy_cursor(&stale_after_undo).unwrap();
-            assert!(saved.world().objects.contains_key(&other_id));
-            assert!(saved.world().objects.contains_key(&reused_prev.held));
-            // Commit `reused_prev` into a paid chair and verify mode switch
-            // with `stale_after_undo` keeps both `other_id` and `paid_reused`.
+            // `save()` / `save_without_buy_cursor` always strips the active
+            // unpaid preview (`reused_prev`) from the saved world while keeping
+            // committed furniture (`other_id`) intact.
+            let saved_unpaid = lot6.save_without_buy_cursor(&stale_after_undo).unwrap();
+            assert!(saved_unpaid.world().objects.contains_key(&other_id));
+            assert!(!saved_unpaid.world().objects.contains_key(&reused_prev.held));
+            assert!(
+                !saved_unpaid
+                    .world()
+                    .objects
+                    .contains_key(&reused_prev.cursor)
+            );
+            // Commit `reused_prev` into a paid chair and verify save + mode
+            // switch with `stale_after_undo` keep both `other_id` and `paid_reused`.
             let paid_reused = lot6.buy_commit(&reused_prev).unwrap();
+            let saved_paid = lot6.save_without_buy_cursor(&stale_after_undo).unwrap();
+            assert!(saved_paid.world().objects.contains_key(&other_id));
+            assert!(saved_paid.world().objects.contains_key(&paid_reused));
             lot6.set_mode_releasing_buy_cursor(sims_vm::PanelMode::Live, Some(&stale_after_undo))
                 .unwrap();
             assert!(lot6.world().objects.contains_key(&other_id));
             assert!(lot6.world().objects.contains_key(&paid_reused));
 
             // Undo of a `Move` while holding a pickup handle for the same chair
-            // also invalidates the pickup handle without corrupting redo.
+            // snaps it back and applies Undo without corrupting redo.
             lot6.set_mode(sims_vm::PanelMode::Buy).unwrap();
             let mut m1 = lot6.buy_pick_up(paid_reused).unwrap().unwrap();
             assert!(lot6.buy_move(&mut m1, [552, 472], 1).unwrap());
@@ -7945,7 +7962,7 @@ fn buy_mode_hand_tool_guards_depreciation_undo_redo_and_followups() {
             lot6.buy_cancel(&stale_after_move_undo).unwrap();
             assert!(
                 lot6.can_buy_redo(),
-                "cancelling an invalidated pickup handle must not clear unrelated redo history"
+                "cancelling a retired pickup handle must not clear unrelated redo history"
             );
             assert!(
                 !lot6
@@ -7953,7 +7970,49 @@ fn buy_mode_hand_tool_guards_depreciation_undo_redo_and_followups() {
                     .objects
                     .contains_key(&stale_after_move_undo.cursor)
             );
+            assert_eq!(lot6.world().objects[&paid_reused].position, [600, 440, 1]);
+
+            // Sol Round 8b P2 #1: cross-lot cursor tokens are globally unique,
+            // so a cursor handle from `lot5` cannot affect `lot6`.
+            let lot5_prev = lot5.buy_start(chair_guid, 1, 2).unwrap().unwrap();
+            let mut lot6_pick = lot6.buy_pick_up(paid_reused).unwrap().unwrap();
+            assert!(!lot6.buy_sell(&lot5_prev).unwrap());
+            lot6.buy_cancel(&lot5_prev).unwrap();
             assert!(lot6.world().objects.contains_key(&paid_reused));
+            assert!(lot6.world().objects.contains_key(&lot6_pick.cursor));
+            lot5.buy_cancel(&lot5_prev).unwrap();
+
+            // Sol Round 8b P2 #2: `Lot::save()` while a paid chair is held and
+            // hidden off-lot snaps it back on the saved copy so `restore()`
+            // never strands paid furniture off-lot or leaves a Tile Cursor.
+            lot6.buy_hide(&mut lot6_pick).unwrap();
+            assert!(lot6.world().objects[&paid_reused].position[0] < 0);
+            let saved_hidden = lot6.save().unwrap();
+            assert_eq!(
+                saved_hidden.world().objects[&paid_reused].position,
+                [600, 440, 1],
+                "Lot::save() must snap back a held/hidden paid chair"
+            );
+            assert!(!saved_hidden.world().objects.contains_key(&lot6_pick.cursor));
+            lot6.restore(saved_hidden).unwrap();
+            assert_eq!(lot6.world().objects[&paid_reused].position, [600, 440, 1]);
+            assert!(!lot6.world().objects.contains_key(&lot6_pick.cursor));
+            // Restored chair is pickable again immediately.
+            let repick = lot6.buy_pick_up(paid_reused).unwrap().unwrap();
+            lot6.buy_cancel(&repick).unwrap();
+
+            // Sol Round 8b P2 #4: plain `Lot::set_mode` Buy -> Live -> Buy
+            // releases any active cursor instead of blocking Buy Mode forever.
+            let abandoned = lot6.buy_start(chair_guid, 1, 2).unwrap().unwrap();
+            lot6.set_mode(sims_vm::PanelMode::Live).unwrap();
+            assert!(!lot6.world().objects.contains_key(&abandoned.held));
+            assert!(!lot6.world().objects.contains_key(&abandoned.cursor));
+            lot6.set_mode(sims_vm::PanelMode::Buy).unwrap();
+            let fresh = lot6
+                .buy_start(chair_guid, 1, 2)
+                .unwrap()
+                .expect("Buy Mode must not stay blocked after plain set_mode Live -> Buy");
+            lot6.buy_cancel(&fresh).unwrap();
         }
     }
 }

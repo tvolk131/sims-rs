@@ -170,7 +170,9 @@ impl Lot {
         if self.halted {
             return Err(SaveError::Halted);
         }
-        let cursor = cursor.filter(|c| self.is_active_buy_cursor(c));
+        let cursor = cursor
+            .filter(|c| self.is_active_buy_cursor(c))
+            .or_else(|| self.active_buy_cursor.as_ref().map(|a| &a.cursor));
         let mut world = self.world.clone();
         let has_history =
             !self.buy_redo.is_empty() || !self.buy_undo.is_empty() || !self.buy_orphans.is_empty();
@@ -186,9 +188,10 @@ impl Lot {
                     crate::interpreter::Stream::Global,
                 )
             };
-            // Strip any active Buy preview first so an item linked into an
-            // undone surface container's slot is cleanly unlinked and deleted
-            // before detached history objects are purged.
+            // Strip any active Buy preview (or snap back any held existing
+            // furniture) first so a saved lot never serializes an unpaid item,
+            // a `"Tile Cursor"`, or a held/hidden paid object stranded off-lot,
+            // and never double-deletes a preview linked in a detached surface.
             if let Some(cursor) = cursor {
                 let live = self.strip_detached_origin_children(cursor);
                 interpreter.buy_cancel(&mut world, &live).map_err(|e| {
@@ -208,15 +211,6 @@ impl Lot {
                     .map_err(|e| {
                         SaveError::Format(format!("clearing detached Buy Mode redo objects: {e}"))
                     })?;
-            }
-            // If `save()` (without a cursor) purged a detached surface whose
-            // slot held an unpassed preview, discard its orphaned Tile Cursor
-            // on the saved copy too.
-            if cursor.is_none()
-                && let Some(active) = &self.active_buy_cursor
-                && !world.objects.contains_key(&active.held_lead)
-            {
-                let _ = interpreter.buy_discard_tile_cursor_id(&mut world, active.cursor_lead);
             }
         }
         Ok(Saved {
