@@ -7,7 +7,7 @@ use sims_vm::{Fault, Trap};
 
 /// A neighborhood whose record vector holds `guids` in order; None is an
 /// empty slot. Each record's ID is its place plus one.
-fn neighborhood(guids: &[Option<u32>]) -> Neighbors {
+fn neighborhood(guids: &[Option<u32>]) -> sims_sim::CowBox<Neighbors> {
     Neighbors {
         slots: guids
             .iter()
@@ -26,6 +26,7 @@ fn neighborhood(guids: &[Option<u32>]) -> Neighbors {
             .collect(),
         ..Neighbors::default()
     }
+    .into()
 }
 
 /// Mode 5 (0x425b15): the next occupied slot after the cursor, by place

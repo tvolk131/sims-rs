@@ -150,7 +150,7 @@ fn format_7_bytes(world: &World) -> Vec<u8> {
         order: &'a Vec<u16>,
         types: &'a BTreeMap<u16, u32>,
         objects: BTreeMap<u16, Object7<'a>>,
-        arrays: &'a BTreeMap<u16, sims_formats::lot::Array>,
+        arrays: &'a sims_sim::CowMap<u16, sims_formats::lot::Array>,
         removals: &'a Vec<u16>,
         type_attributes: &'a Vec<sims_sim::TypeAttributes>,
         instances: &'a BTreeMap<u32, Vec<u16>>,
@@ -162,7 +162,7 @@ fn format_7_bytes(world: &World) -> Vec<u8> {
         skeleton_files: &'a BTreeSet<String>,
         rooms: Rooms7<'a>,
         fires: &'a Vec<u16>,
-        frame_storage: &'a BTreeMap<u16, sims_sim::FrameStorage>,
+        frame_storage: &'a sims_sim::CowMap<u16, sims_sim::FrameStorage>,
     }
     let objects = world
         .objects
@@ -266,7 +266,7 @@ fn format_8_bytes(world: &World) -> Vec<u8> {
 /// records. The records are compared with the original apart from this.
 fn format_9_bytes(world: &World) -> Vec<u8> {
     let mut old = world.clone();
-    old.neighbors = sims_sim::neighbors::Neighbors::default();
+    *old.neighbors = sims_sim::neighbors::Neighbors::default();
     let mut encoded = format_10_bytes(&old);
     assert_eq!(encoded.split_off(encoded.len() - 3), [0; 3]);
     encoded

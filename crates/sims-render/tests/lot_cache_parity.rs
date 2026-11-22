@@ -4,7 +4,8 @@
 use sims_formats::lot::Array;
 use sims_render::lot::{FULL, Lamps, NORTH, WEST};
 use sims_render::{
-    Camera, Canvas, Focus, Lot, LotCache, Selected, Walls, Zoom, draw_lot_with_preview, open_house,
+    CacheHit, Camera, Canvas, Focus, Lot, LotCache, Selected, Walls, Zoom, draw_lot_with_preview,
+    open_house,
 };
 use sims_sim::World;
 use std::path::PathBuf;
@@ -912,4 +913,388 @@ fn lot_cache_matches_uncached_across_house05_states_and_mutations() {
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assert_parity_with_hit(
+    cache: &mut LotCache,
+    world: &World,
+    lot: &Lot,
+    assets: &mut sims_render::Assets,
+    camera: &Camera,
+    viewport: (u32, u32),
+    preview: Option<(u16, u16)>,
+    size: [usize; 2],
+    expected_hit: CacheHit,
+    label: &str,
+) -> Canvas {
+    let mut cached = Canvas::new(size[0], size[1], [0xaa, 0xbb, 0xcc]);
+    let mut uncached = Canvas::new(size[0], size[1], [0xaa, 0xbb, 0xcc]);
+    let stats_cached =
+        cache.draw_lot_with_preview(world, lot, assets, camera, viewport, preview, &mut cached);
+    let actual_hit = cache.last_hit();
+    let stats_uncached =
+        draw_lot_with_preview(world, lot, assets, camera, viewport, preview, &mut uncached);
+    assert_eq!(
+        actual_hit, expected_hit,
+        "cache hit tier mismatch at {label}"
+    );
+    assert_eq!(stats_cached, stats_uncached, "stats mismatch at {label}");
+    assert_eq!(cached, uncached, "canvas mismatch at {label}");
+    cached
+}
+
+#[test]
+fn lot_cache_two_tier_hits_environment_and_matches_uncached() {
+    let Some(root) = install() else {
+        return;
+    };
+    let house = root.join("UserData/Houses/House05.iff");
+    let mut opened = open_house(&root, &house).expect("open House05");
+    let mut world = opened.world;
+    let mut lot = Lot::from_world(&world)
+        .expect("Lot::from_world")
+        .with_floor_rotation(opened.rotation);
+    let assets = &mut opened.assets;
+    let mut cache = LotCache::new();
+
+    let size = [400, 300];
+    let origin = {
+        let c = lot.built_center();
+        let cam = Camera {
+            zoom: Zoom::Medium,
+            rotation: 0,
+            level: 1,
+            origin: [0, 0],
+            walls: Walls::Cutaway,
+            focus: Focus::default(),
+        };
+        let p = cam.project_fine(cam.rotate_fine(c), 1, 0);
+        [200 - p[0], 150 - p[1]]
+    };
+    let mut camera = Camera {
+        zoom: Zoom::Medium,
+        rotation: 0,
+        level: 1,
+        origin,
+        walls: Walls::Cutaway,
+        focus: Focus::default(),
+    };
+
+    // 1. Cold draw populates both Tier 1 (environment) and Tier 2 (full lot).
+    let baseline = assert_parity_with_hit(
+        &mut cache,
+        &world,
+        &lot,
+        assets,
+        &camera,
+        (400, 300),
+        None,
+        size,
+        CacheHit::Miss,
+        "tier2 cold draw",
+    );
+    assert_parity_with_hit(
+        &mut cache,
+        &world,
+        &lot,
+        assets,
+        &camera,
+        (400, 300),
+        None,
+        size,
+        CacheHit::Full,
+        "tier2 steady hit",
+    );
+
+    // Find visible level-1 non-wall object and visible level-1 wall-shaping object (door/window).
+    let anim_id = world
+        .objects
+        .iter()
+        .find(|&(&id, o)| {
+            o.person.is_none()
+                && o.position[2] == 1
+                && baseline.drawn(id).is_some()
+                && assets.definition(o.guid).is_none_or(|d| !d.shapes_wall())
+        })
+        .map(|(&id, _)| id)
+        .expect("visible non-wall level-1 object");
+    let door_id = world
+        .objects
+        .iter()
+        .find(|&(&id, o)| {
+            o.person.is_none()
+                && o.position[2] == 1
+                && baseline.drawn(id).is_some()
+                && assets.definition(o.guid).is_some_and(|d| d.shapes_wall())
+        })
+        .map(|(&id, _)| id)
+        .expect("visible wall-shaping level-1 object");
+
+    // 2. Non-wall object graphic animation (`data[0]`) hits Tier 1 (`Environment`),
+    //    then next steady frame hits Tier 2 (`Full`).
+    {
+        let obj = world.objects.get_mut(&anim_id).unwrap();
+        if obj.data.len() <= 51 {
+            obj.data.resize(52, 0);
+        }
+        obj.data[0] = obj.data[0].wrapping_add(1);
+    }
+    assert_parity_with_hit(
+        &mut cache,
+        &world,
+        &lot,
+        assets,
+        &camera,
+        (400, 300),
+        None,
+        size,
+        CacheHit::Environment,
+        "animated non-wall object graphic frame",
+    );
+    assert_parity_with_hit(
+        &mut cache,
+        &world,
+        &lot,
+        assets,
+        &camera,
+        (400, 300),
+        None,
+        size,
+        CacheHit::Full,
+        "steady after animated object",
+    );
+
+    // 3. Door opening/closing (`data[0]` on a wall-shaping object) leaves its
+    //    wall aperture untouched -> Tier 1 hit (`Environment`) + exact parity!
+    {
+        let door = world.objects.get_mut(&door_id).unwrap();
+        if door.data.is_empty() {
+            door.data.resize(2, 0);
+        }
+        door.data[0] = door.data[0].wrapping_add(1);
+    }
+    assert_parity_with_hit(
+        &mut cache,
+        &world,
+        &lot,
+        assets,
+        &camera,
+        (400, 300),
+        None,
+        size,
+        CacheHit::Environment,
+        "door graphic frame open/close",
+    );
+
+    // 4. Moving or rotating a wall-shaping object changes its wall aperture ->
+    //    Tier 1 MUST miss (`Miss`) so walls repaint with the updated cutout!
+    let saved_door_pos = world.objects.get(&door_id).unwrap().position;
+    world.objects.get_mut(&door_id).unwrap().position[0] += 16;
+    assert_parity_with_hit(
+        &mut cache,
+        &world,
+        &lot,
+        assets,
+        &camera,
+        (400, 300),
+        None,
+        size,
+        CacheHit::Miss,
+        "wall-shaper moved invalidates tier 1",
+    );
+    world.objects.get_mut(&door_id).unwrap().position = saved_door_pos;
+    assert_parity_with_hit(
+        &mut cache,
+        &world,
+        &lot,
+        assets,
+        &camera,
+        (400, 300),
+        None,
+        size,
+        CacheHit::Miss,
+        "wall-shaper restored",
+    );
+
+    // 5. Lamp glow word (`data[51]`) toggle hits Tier 1 (`Environment`); changing
+    //    `lot.room_lights` / `lot.lamps` misses Tier 1 (`Miss`).
+    {
+        let obj = world.objects.get_mut(&anim_id).unwrap();
+        obj.data[51] = if obj.data[51] == 0 { 100 } else { 0 };
+    }
+    assert_parity_with_hit(
+        &mut cache,
+        &world,
+        &lot,
+        assets,
+        &camera,
+        (400, 300),
+        None,
+        size,
+        CacheHit::Environment,
+        "lamp glow word toggle",
+    );
+    let lamp_cell = Lot::cell(25, 25);
+    lot.lamps[0][lamp_cell] = Lamps([Some([0, 0]), None]);
+    assert_parity_with_hit(
+        &mut cache,
+        &world,
+        &lot,
+        assets,
+        &camera,
+        (400, 300),
+        None,
+        size,
+        CacheHit::Miss,
+        "lot lamp pool change invalidates tier 1",
+    );
+
+    // 6. TV / appliance dynamic sprite animation (`dynamic_sprites`) hits Tier 1.
+    world.objects.get_mut(&anim_id).unwrap().dynamic_sprites = vec![1, 2];
+    assert_parity_with_hit(
+        &mut cache,
+        &world,
+        &lot,
+        assets,
+        &camera,
+        (400, 300),
+        None,
+        size,
+        CacheHit::Environment,
+        "appliance dynamic_sprites toggle",
+    );
+
+    // 7. Buy Mode preview moving (cursor + off-lot held object, no shadow/wall
+    //    change) hits Tier 1 (`Environment`) with exact parity!
+    let preview_held_id = world
+        .objects
+        .iter()
+        .find(|&(&id, o)| {
+            id != anim_id
+                && id != door_id
+                && o.person.is_none()
+                && o.position[2] == 1
+                && assets.definition(o.guid).is_none_or(|d| !d.shapes_wall())
+        })
+        .map(|(&id, _)| id)
+        .expect("second non-wall object for buy preview");
+    let saved_held_pos = world.objects.get(&preview_held_id).unwrap().position;
+    world.objects.get_mut(&preview_held_id).unwrap().position = [-16, -16, 1];
+    assert_parity_with_hit(
+        &mut cache,
+        &world,
+        &lot,
+        assets,
+        &camera,
+        (400, 300),
+        Some((anim_id, preview_held_id)),
+        size,
+        CacheHit::Environment,
+        "buy preview active",
+    );
+    world.objects.get_mut(&anim_id).unwrap().position[1] += 16;
+    assert_parity_with_hit(
+        &mut cache,
+        &world,
+        &lot,
+        assets,
+        &camera,
+        (400, 300),
+        Some((anim_id, preview_held_id)),
+        size,
+        CacheHit::Environment,
+        "buy preview moved",
+    );
+    world.objects.get_mut(&preview_held_id).unwrap().position = saved_held_pos;
+
+    // 8. Padded canvas on a Tier-1 hit must match uncached bit-for-bit including
+    //    trailing padded elements.
+    world.objects.get_mut(&anim_id).unwrap().data[0] =
+        world.objects.get(&anim_id).unwrap().data[0].wrapping_add(1);
+    {
+        let mut padded_cached = Canvas::new(size[0], size[1], [0xaa, 0xbb, 0xcc]);
+        padded_cached.color.push([0x11, 0x22, 0x33]);
+        padded_cached.depth.push(42);
+        let mut padded_uncached = Canvas::new(size[0], size[1], [0xaa, 0xbb, 0xcc]);
+        padded_uncached.color.push([0x11, 0x22, 0x33]);
+        padded_uncached.depth.push(42);
+        let sc = cache.draw_lot_with_preview(
+            &world,
+            &lot,
+            assets,
+            &camera,
+            (400, 300),
+            None,
+            &mut padded_cached,
+        );
+        assert_eq!(cache.last_hit(), CacheHit::Environment);
+        let su = draw_lot_with_preview(
+            &world,
+            &lot,
+            assets,
+            &camera,
+            (400, 300),
+            None,
+            &mut padded_uncached,
+        );
+        assert_eq!(sc, su);
+        assert_eq!(padded_cached, padded_uncached);
+    }
+
+    // 9. Level 2 (`camera.level == 2`): level-1 environment stands full height
+    //    regardless of `camera.walls`, so animating objects and even switching
+    //    `camera.walls` on level 2 hit Tier 1 (`Environment`) with exact parity!
+    camera.level = 2;
+    assert_parity_with_hit(
+        &mut cache,
+        &world,
+        &lot,
+        assets,
+        &camera,
+        (400, 300),
+        None,
+        size,
+        CacheHit::Miss,
+        "level 2 cold",
+    );
+    assert_parity_with_hit(
+        &mut cache,
+        &world,
+        &lot,
+        assets,
+        &camera,
+        (400, 300),
+        None,
+        size,
+        CacheHit::Full,
+        "level 2 steady",
+    );
+    world.objects.get_mut(&anim_id).unwrap().data[0] =
+        world.objects.get(&anim_id).unwrap().data[0].wrapping_add(1);
+    assert_parity_with_hit(
+        &mut cache,
+        &world,
+        &lot,
+        assets,
+        &camera,
+        (400, 300),
+        None,
+        size,
+        CacheHit::Environment,
+        "level 2 with level-1 object animation",
+    );
+    camera.walls = Walls::Up;
+    assert_parity_with_hit(
+        &mut cache,
+        &world,
+        &lot,
+        assets,
+        &camera,
+        (400, 300),
+        None,
+        size,
+        CacheHit::Environment,
+        "level 2 walls mode switch keeps level-1 tier 1",
+    );
 }

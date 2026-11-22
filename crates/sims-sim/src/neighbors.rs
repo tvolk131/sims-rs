@@ -429,7 +429,7 @@ impl World {
                 }
             }
         }
-        self.neighbors = neighbors;
+        self.neighbors = neighbors.into();
         self.families = ordered.into_iter().map(|(_, family)| family).collect();
         Ok(())
     }

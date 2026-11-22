@@ -435,23 +435,42 @@ impl Game {
     /// (`0x46da1b`); here the next tick waits a period of the new speed
     /// (**unverified**, and the window's timing, not the simulation's).
     pub fn advance(&mut self, elapsed_us: u64) -> u32 {
+        self.advance_while(elapsed_us, |_| true).0
+    }
+
+    /// Runs the ticks owed after `elapsed_us` more microseconds while
+    /// `keep_going(ran)` returns `true`. Returns `(ran, capped)`, where
+    /// `capped` is `true` if `keep_going` stopped the batch before all owed
+    /// ticks ran (in which case [`Pace::restart`] drops the leftover fraction).
+    ///
+    /// Used by the interactive window loop to cap simulation work per wake so
+    /// Ultra/Idle speeds never spiral into multi-frame stalls; headless callers
+    /// use [`Game::advance`].
+    pub fn advance_while(
+        &mut self,
+        elapsed_us: u64,
+        mut keep_going: impl FnMut(u32) -> bool,
+    ) -> (u32, bool) {
         self.clock_us = self.clock_us.saturating_add(elapsed_us);
         if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
             self.blink_dirty = true;
         }
         if self.lot.asking().is_some() {
             self.pace.restart();
-            return 0;
+            return (0, false);
         }
         if self.idle_speed() {
-            return 0;
+            return (0, false);
         }
         let due = self.pace.due(elapsed_us, self.lot.world().speed());
-        let ran = self.run_while(due, true);
+        let (ran, capped) = self.run_while(due, true, &mut keep_going);
+        if capped {
+            self.pace.restart();
+        }
         if self.hud.sync_clock_blink(self.lot.world(), self.clock_us) {
             self.blink_dirty = true;
         }
-        ran
+        (ran, capped)
     }
 
     /// Sets the idle loop's own speed between ticks ([`Lot::idle_speed`]).
@@ -486,19 +505,32 @@ impl Game {
     /// Runs up to `ticks` ticks, stopping at the first that fails or that
     /// shows a dialog the player has to answer.
     pub fn run(&mut self, ticks: u32) -> u32 {
-        self.run_while(ticks, false)
+        self.run_while(ticks, false, |_| true).0
     }
 
-    /// Runs up to `ticks` ticks, stopping at the first that fails, and,
-    /// if `idle`, before a tick the idle loop's speed sets the speed for
-    /// ([`Game::idle_speed`]) or after a tick that changes the
-    /// simulation's speed or return speed (such as Special Effect resetting
-    /// to normal, `0x4f684c` → `0x46d697`). Any mid-tick speed or return-speed
-    /// change updates the panel's speed and restarts the time owed, whether
-    /// `idle` is set or not.
-    fn run_while(&mut self, ticks: u32, idle: bool) -> u32 {
+    /// Runs up to `ticks` ticks, stopping at the first that fails, before
+    /// `keep_going(ran)` returns `false`, and, if `idle`, before a tick the
+    /// idle loop's speed sets the speed for ([`Game::idle_speed`]) or after a
+    /// tick that changes the simulation's speed or return speed (such as
+    /// Special Effect resetting to normal, `0x4f684c` → `0x46d697`). Any
+    /// mid-tick speed or return-speed change updates the panel's speed and
+    /// restarts the time owed, whether `idle` is set or not.
+    fn run_while(
+        &mut self,
+        ticks: u32,
+        idle: bool,
+        mut keep_going: impl FnMut(u32) -> bool,
+    ) -> (u32, bool) {
         let mut ran = 0;
-        while ran < ticks && self.stopped.is_none() && !(idle && self.idle_speed()) {
+        let mut capped = false;
+        while ran < ticks && self.stopped.is_none() {
+            if !keep_going(ran) {
+                capped = true;
+                break;
+            }
+            if idle && self.idle_speed() {
+                break;
+            }
             let speed_before = (self.lot.world().speed(), self.lot.world().return_speed());
             let step = if self.play {
                 self.lot.step_play()
@@ -581,7 +613,7 @@ impl Game {
                 }
             }
         }
-        ran
+        (ran, capped)
     }
 
     /// Keeps a step's sound requests for the host, at most

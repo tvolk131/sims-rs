@@ -531,11 +531,12 @@ impl Interpreter<'_> {
         };
         for id in start..=end {
             world.scheduler_cursor = id as i16;
-            let Some(object) = world.objects.get_mut(&id) else {
+            let Some(object) = world.objects.get(&id) else {
                 continue;
             };
-            if object.flags() & CHECK_ERROR != 0 {
-                if object.flags() & READY != 0 && object.stack.is_empty() {
+            let mut flags = object.flags();
+            if flags & CHECK_ERROR != 0 {
+                if flags & READY != 0 && object.stack.is_empty() {
                     // 0x46d5da -> 0x46d68c -> 0x439a6f: a deferred thread
                     // error recorded by 0x474aae (such as a faulted "init
                     // visitor") stops the pass and resets the object instead
@@ -561,15 +562,22 @@ impl Interpreter<'_> {
                     }
                     return Err(fault.into());
                 }
-                object.set_flags(CHECK_ERROR, false);
+                if let Some(object) = world.objects.get_mut(&id) {
+                    object.set_flags(CHECK_ERROR, false);
+                    flags = object.flags();
+                }
             }
-            let flags = object.flags();
             if flags & READY == 0 || (partial && flags & IN_PARTIAL == 0) {
                 continue;
             }
+            let Some(object) = world.objects.get(&id) else {
+                continue;
+            };
             let countdown = object.countdown().unwrap_or(0);
             if countdown > 0 {
-                object.set_countdown(countdown - 1);
+                if let Some(object) = world.objects.get_mut(&id) {
+                    object.set_countdown(countdown - 1);
+                }
                 update.counted.push(id);
                 continue;
             }

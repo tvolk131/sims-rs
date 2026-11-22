@@ -253,16 +253,63 @@ impl Interpreter<'_> {
         if (a.base.is_filled() || a.foreground.is_some() || a.carry.is_some())
             && let Some(held) = world.held_poses.remove(&id)
         {
-            let moved = self.translated_by(id, held.layers.iter())?;
-            Self::note_moved(world, id, moved);
+            self.note_translated_by(world, id, held.layers.iter())?;
         }
-        let base = world.base_layers.get(&id);
-        let moved = self.translated_by(
-            id,
-            [base, a.foreground.as_ref(), a.carry.as_ref()]
+        // Check active layers without cloning bone names already present in
+        // `world.translated_bones[&id]`.
+        let mut new_bones: Vec<String> = Vec::new();
+        {
+            let base = world.base_layers.get(&id);
+            let existing = world.translated_bones.get(&id);
+            for layer in [base, a.foreground.as_ref(), a.carry.as_ref()]
                 .into_iter()
-                .flatten(),
-        )?;
+                .flatten()
+            {
+                if !layer.bound || layer.frames == 0 || layer.weight.ext() <= Ext::ZERO {
+                    continue;
+                }
+                let clip = self.program.animations.clip(&layer.clip).map_err(|e| {
+                    Trap::Unsupported(format!(
+                        "person {id}'s skin samples a clip {:?} that cannot be found (0x59dc32): {e}",
+                        layer.clip
+                    ))
+                })?;
+                for c in &clip.channels {
+                    if c.translation.is_some() && existing.is_none_or(|set| !set.contains(&c.bone))
+                    {
+                        new_bones.push(c.bone.clone());
+                    }
+                }
+            }
+        }
+        Self::note_moved(world, id, new_bones);
+        Ok(())
+    }
+
+    fn note_translated_by<'l>(
+        &self,
+        world: &mut World,
+        id: u16,
+        layers: impl Iterator<Item = &'l Layer>,
+    ) -> Result<(), Trap> {
+        let mut moved = Vec::new();
+        let existing = world.translated_bones.get(&id);
+        for layer in layers {
+            if !layer.bound || layer.frames == 0 || layer.weight.ext() <= Ext::ZERO {
+                continue;
+            }
+            let clip = self.program.animations.clip(&layer.clip).map_err(|e| {
+                Trap::Unsupported(format!(
+                    "person {id}'s skin samples a clip {:?} that cannot be found (0x59dc32): {e}",
+                    layer.clip
+                ))
+            })?;
+            for c in &clip.channels {
+                if c.translation.is_some() && existing.is_none_or(|set| !set.contains(&c.bone)) {
+                    moved.push(c.bone.clone());
+                }
+            }
+        }
         Self::note_moved(world, id, moved);
         Ok(())
     }
@@ -2121,70 +2168,72 @@ impl Interpreter<'_> {
             .ok_or_else(|| Trap::native(10, "missing object"))?
             .guid;
         let skeleton = crate::people::skeleton(&self.program.people, world, guid)?;
-        let samples = self
-            .program
-            .animations
-            .samples(clip)
-            .map_err(|e| unsupported("0x5992b3", &format!("cannot read its samples: {e}")))?;
-        let floats3 = |v: &[f32; 3]| v.map(F32::from_f32);
-        let floats4 = |v: &[f32; 4]| v.map(F32::from_f32);
-        let translations: Vec<[F32; 3]> = samples.translations.iter().map(floats3).collect();
-        let rotations: Vec<[F32; 4]> = samples.rotations.iter().map(floats4).collect();
-        let place = |bone: &str| skeleton.bones.iter().position(|b| b.name == bone);
-        let anchor = |value: &str| {
-            let (bone, _) = anchor_event(clip, value).ok_or_else(|| {
-                unsupported(
-                    "0x588df8",
-                    &format!("finds no event anchor = {value} in its walk clip {name:?}"),
-                )
-            })?;
-            place(bone).ok_or_else(|| {
-                unsupported(
-                    "0x5990e0",
-                    &format!("finds no bone {bone:?} in the person's skeleton"),
-                )
-            })
-        };
-        let anchors = [anchor("1")?, anchor("2")?];
-        let parents: Vec<Option<usize>> = skeleton.bones.iter().map(|b| b.parent).collect();
-        let rest: Vec<pose::Bone> = skeleton
-            .bones
-            .iter()
-            .map(|b| pose::Bone {
-                translation: b.translation.map(F32::from_bits),
-                rotation: b.rotation.map(F32::from_bits),
-            })
-            .collect();
-        let bad = |e: pose::Error| unsupported("0x5992b3", &format!("cannot pose: {}", e.0));
-        let duration = F32::from_bits(clip.duration);
-        let k = (Ext::from_i32(16) / Ext::from_i32(3)).single();
-        let heights = |phase: F32| -> Result<[Ext; 2], Trap> {
-            let at =
-                pose::Selection::at(phase, clip.frames, duration, F32::ZERO, true).map_err(bad)?;
-            let mut locals = rest.clone();
-            for channel in &clip.channels {
-                let Some(bone) = place(&channel.bone) else {
-                    continue;
-                };
-                let from = |start: Option<u32>, len: usize| {
-                    start.map(|s| s as usize).filter(|&s| s <= len)
-                };
-                let motion = pose::Motion {
-                    translations: from(channel.translation, translations.len())
-                        .map(|s| &translations[s..]),
-                    rotations: from(channel.rotation, rotations.len()).map(|s| &rotations[s..]),
-                };
-                pose::sample(&mut locals[bone], motion, at).map_err(bad)?;
-            }
-            let placed = pose::absolute(&parents, &locals).map_err(bad)?;
-            Ok(anchors.map(|b| (placed[b].translation[2].ext() * k).single()))
-        };
-        let footfalls = self.footfall_phases(world, id)?;
-        let [one, two] = heights(footfalls[1])?;
-        let first = (two - one).single().to_f32();
-        let [one, two] = heights(footfalls[0])?;
-        let second = (one - two).single().to_f32();
-        Ok([first, second])
+        let bits = self.program.animations.cached_strides(skeleton, clip, || {
+            let samples =
+                self.program.animations.samples(clip).map_err(|e| {
+                    unsupported("0x5992b3", &format!("cannot read its samples: {e}"))
+                })?;
+            let floats3 = |v: &[f32; 3]| v.map(F32::from_f32);
+            let floats4 = |v: &[f32; 4]| v.map(F32::from_f32);
+            let translations: Vec<[F32; 3]> = samples.translations.iter().map(floats3).collect();
+            let rotations: Vec<[F32; 4]> = samples.rotations.iter().map(floats4).collect();
+            let place = |bone: &str| skeleton.bones.iter().position(|b| b.name == bone);
+            let anchor = |value: &str| {
+                let (bone, _) = anchor_event(clip, value).ok_or_else(|| {
+                    unsupported(
+                        "0x588df8",
+                        &format!("finds no event anchor = {value} in its walk clip {name:?}"),
+                    )
+                })?;
+                place(bone).ok_or_else(|| {
+                    unsupported(
+                        "0x5990e0",
+                        &format!("finds no bone {bone:?} in the person's skeleton"),
+                    )
+                })
+            };
+            let anchors = [anchor("1")?, anchor("2")?];
+            let parents: Vec<Option<usize>> = skeleton.bones.iter().map(|b| b.parent).collect();
+            let rest: Vec<pose::Bone> = skeleton
+                .bones
+                .iter()
+                .map(|b| pose::Bone {
+                    translation: b.translation.map(F32::from_bits),
+                    rotation: b.rotation.map(F32::from_bits),
+                })
+                .collect();
+            let bad = |e: pose::Error| unsupported("0x5992b3", &format!("cannot pose: {}", e.0));
+            let duration = F32::from_bits(clip.duration);
+            let k = (Ext::from_i32(16) / Ext::from_i32(3)).single();
+            let heights = |phase: F32| -> Result<[Ext; 2], Trap> {
+                let at = pose::Selection::at(phase, clip.frames, duration, F32::ZERO, true)
+                    .map_err(bad)?;
+                let mut locals = rest.clone();
+                for channel in &clip.channels {
+                    let Some(bone) = place(&channel.bone) else {
+                        continue;
+                    };
+                    let from = |start: Option<u32>, len: usize| {
+                        start.map(|s| s as usize).filter(|&s| s <= len)
+                    };
+                    let motion = pose::Motion {
+                        translations: from(channel.translation, translations.len())
+                            .map(|s| &translations[s..]),
+                        rotations: from(channel.rotation, rotations.len()).map(|s| &rotations[s..]),
+                    };
+                    pose::sample(&mut locals[bone], motion, at).map_err(bad)?;
+                }
+                let placed = pose::absolute(&parents, &locals).map_err(bad)?;
+                Ok(anchors.map(|b| (placed[b].translation[2].ext() * k).single()))
+            };
+            let footfalls = self.footfall_phases(world, id)?;
+            let [one, two] = heights(footfalls[1])?;
+            let first = (two - one).single().to_f32();
+            let [one, two] = heights(footfalls[0])?;
+            let second = (one - two).single().to_f32();
+            Ok([first.to_bits(), second.to_bits()])
+        })?;
+        Ok(bits.map(F32::from_bits))
     }
 
     /// A clip by name, as the animator looks it up (0x59dc32).
