@@ -368,6 +368,15 @@ impl DialogStrings {
     }
 }
 
+/// Ephemeral REDB staging store kept alive for a lot booted from a Save Manager
+/// slot so subsequent saves run the full `sims_vm::lifecycle::save_and_leave_lot`
+/// pipeline (`people::save_to_record`, `update_lot_values`, `deletion_epoch`)
+/// before committing atomically to the real store with strict fencing.
+struct StagingStoreHandle {
+    _dir: TempStagingDir,
+    store: NeighborhoodStore,
+}
+
 /// Active live lot session launched from the Neighborhood map.
 struct LotSession {
     game: Game,
@@ -375,10 +384,9 @@ struct LotSession {
     neighborhood_instance_id: u128,
     /// Expected REDB neighborhood revision for optimistic write fencing.
     neighborhood_revision: u64,
-    /// True when the lot was booted from an ephemeral reconciled staging store
-    /// (e.g. Save Manager slot load or corrupt-save recovery), so saves commit
-    /// via the fenced restored-lot writeback path.
-    booted_from_staging: bool,
+    /// Present when the lot was booted from an ephemeral reconciled staging store
+    /// (e.g. Save Manager slot load or corrupt-save recovery).
+    staging: Option<StagingStoreHandle>,
     house: u32,
     /// Last observed VM `days_played` (`world.globals[28]`) for exact midnight
     /// rotating autosave detection (`daily::turn_day`).
@@ -1970,31 +1978,13 @@ impl NeighborhoodShell {
                 .map_err(|e| e.to_string())?;
         }
 
-        let (staged_saved_bytes, saved_family_id, saved_budget, restored_tick) = match &loaded
-            .metadata
-            .payload_kind
-        {
+        let (staged_saved_bytes, restored_tick) = match &loaded.metadata.payload_kind {
             SavePayloadKind::SavedLot => {
-                let saved = Saved::decode(&loaded.payload).map_err(|e| e.to_string())?;
-                let fam = saved
-                    .world()
-                    .globals
-                    .get(9)
-                    .copied()
-                    .and_then(|v| u16::try_from(v).ok())
-                    .unwrap_or(0);
-                let budget = saved.world().budget.funds;
-                (loaded.payload.clone(), fam, budget, None)
+                let _ = Saved::decode(&loaded.payload).map_err(|e| e.to_string())?;
+                (loaded.payload.clone(), None)
             }
             SavePayloadKind::WorldSnapshot => {
                 let world = sims_sim::World::decode(&loaded.payload).map_err(|e| e.to_string())?;
-                let fam = world
-                    .globals
-                    .get(9)
-                    .copied()
-                    .and_then(|v| u16::try_from(v).ok())
-                    .unwrap_or(0);
-                let budget = world.budget.funds;
                 // Obtain a compatible base `Saved` envelope without touching a
                 // potentially corrupt SAVED_LOTS entry: reuse the open lot if it
                 // matches `lot_id`, otherwise boot the clean base house in staging.
@@ -2017,26 +2007,22 @@ impl NeighborhoodShell {
                     }
                 };
                 let spliced = splice_world_into_saved_bytes(&base_saved, &world)?;
-                (spliced, fam, budget, Some(loaded.metadata.sim_tick))
+                (spliced, Some(loaded.metadata.sim_tick))
             }
             SavePayloadKind::Custom(tag) => {
                 return Err(format!("unsupported custom payload kind {tag:?}"));
             }
         };
 
-        let mut staging_nh = snapshot.neighborhood.clone();
-        if saved_family_id != 0
-            && let Some((current_fam_id, fam)) = staging_nh.family_in_mut(lot_id)
-            && current_fam_id == saved_family_id
-        {
-            fam.budget = saved_budget;
-        }
+        // Keep `snapshot.neighborhood` unmodified so restoring an older slot
+        // reconciles against the live neighborhood's current FAMI budgets, NBRS,
+        // made_characters, and deletion_epoch without rolling any of them back.
         staging_store
             .save_lot_and_neighborhood(
                 &self.neighborhood_id,
                 lot_id,
                 &staged_saved_bytes,
-                &staging_nh,
+                &snapshot.neighborhood,
             )
             .map_err(|e| e.to_string())?;
 
@@ -2064,7 +2050,10 @@ impl NeighborhoodShell {
             neighborhood_id: self.neighborhood_id.clone(),
             neighborhood_instance_id: real_instance_id,
             neighborhood_revision: real_revision,
-            booted_from_staging: true,
+            staging: Some(StagingStoreHandle {
+                _dir: staging_dir,
+                store: staging_store,
+            }),
             house: lot_id,
             last_days_played: initial_days_played,
         }));
@@ -2091,32 +2080,45 @@ impl NeighborhoodShell {
             let ActiveScreen::Lot(session) = &mut self.screen else {
                 return Err("no lot is currently open".into());
             };
-            let (report, lot_bytes) =
-                if session.booted_from_staging || session.game.world_mutated_via_restore() {
-                    save_restored_lot_to_store(
-                        &self.store,
-                        &session.neighborhood_id,
-                        session.neighborhood_instance_id,
-                        session.neighborhood_revision,
-                        session.house,
-                        self.arch_multiplier,
-                        &mut session.game,
-                    )?
-                } else {
-                    // Propagate fencing / stale-revision / replacement errors directly
-                    // instead of bypassing them with an unfenced fallback.
-                    let report = session.game.save_to_neighborhood(
-                        &self.install_root,
-                        &self.store,
-                        &session.neighborhood_id,
-                    )?;
-                    let bytes = self
-                        .store
-                        .load_saved_lot(&session.neighborhood_id, session.house)
-                        .map_err(|e| e.to_string())?
-                        .ok_or_else(|| "committed saved lot missing after save".to_owned())?;
-                    (report, bytes)
-                };
+            let (report, lot_bytes) = if session.game.world_mutated_via_restore() {
+                save_cheat_mutated_lot_to_store(
+                    &self.install_root,
+                    &self.store,
+                    &session.neighborhood_id,
+                    session.neighborhood_instance_id,
+                    session.neighborhood_revision,
+                    session.house,
+                    self.arch_multiplier,
+                    &self.answers,
+                    self.frames.clone(),
+                    &mut session.game,
+                )?
+            } else if let Some(staging) = &session.staging {
+                save_staged_lot_to_store(
+                    &self.install_root,
+                    &self.store,
+                    &staging.store,
+                    &session.neighborhood_id,
+                    session.neighborhood_instance_id,
+                    session.neighborhood_revision,
+                    session.house,
+                    &mut session.game,
+                )?
+            } else {
+                // Propagate fencing / stale-revision / replacement errors directly
+                // instead of bypassing them with an unfenced fallback.
+                let report = session.game.save_to_neighborhood(
+                    &self.install_root,
+                    &self.store,
+                    &session.neighborhood_id,
+                )?;
+                let bytes = self
+                    .store
+                    .load_saved_lot(&session.neighborhood_id, session.house)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "committed saved lot missing after save".to_owned())?;
+                (report, bytes)
+            };
             session.neighborhood_revision = report.revision;
             let nh_id = session.neighborhood_id.clone();
             let inst = session.neighborhood_instance_id;
@@ -2174,38 +2176,25 @@ impl NeighborhoodShell {
     }
 
     /// Reloads the currently open lot from its latest REDB manual save (F9),
-    /// using the exact same validated manual save record shown in
-    /// [`SaveManagerDialog`] and falling back non-destructively to the Save
-    /// Manager if the manual save slot is corrupt.
+    /// preferring the primary committed `SAVED_LOTS` record whenever it is
+    /// intact (so a newer F5 commit is never shadowed by a stale manual mirror)
+    /// and falling back non-destructively to [`SaveManagerDialog`] if either
+    /// the manual slot or `SAVED_LOTS` is corrupt.
     pub fn restore_current_lot(&mut self) -> Result<(), String> {
         self.flush_background_saves();
         let (neighborhood_id, house) = match &self.screen {
             ActiveScreen::Lot(session) => (session.neighborhood_id.clone(), session.house),
             _ => return Err("no lot is currently open".into()),
         };
-        match self.store.autosaves().load_save_validated(
+        let manual_slot = self.store.autosaves().load_save_validated(
             &neighborhood_id,
             house,
             sims_sim::autosave::SaveSlot::Manual,
             validate_save_payload,
-        ) {
-            Ok(loaded) => match self.apply_loaded_save_into_lot(house, &loaded) {
-                Ok(ticks) => {
-                    if let ActiveScreen::Lot(session) = &mut self.screen {
-                        session
-                            .game
-                            .set_note(format!("Back to the save after tick {ticks}."));
-                    }
-                    return Ok(());
-                }
-                Err(err) => {
-                    self.open_save_manager(Some(format!(
-                        "Manual save could not be restored ({err}). Choose an intact autosave below."
-                    )));
-                    return Err(err);
-                }
-            },
-            Err(sims_sim::autosave::SaveError::Missing { .. }) => {}
+        );
+        let manual_loaded = match manual_slot {
+            Ok(loaded) => Some(loaded),
+            Err(sims_sim::autosave::SaveError::Missing { .. }) => None,
             Err(corrupt_err) => {
                 let msg = format!(
                     "Manual save could not be loaded ({corrupt_err}). Choose an intact autosave below."
@@ -2213,37 +2202,80 @@ impl NeighborhoodShell {
                 self.open_save_manager(Some(msg.clone()));
                 return Err(msg);
             }
-        }
-        if self
+        };
+        let saved_lot_bytes = self
             .store
             .load_saved_lot(&neighborhood_id, house)
-            .map_err(|e| e.to_string())?
-            .is_none()
-        {
-            if let ActiveScreen::Lot(session) = &mut self.screen {
-                session
-                    .game
-                    .set_note("The save was not restored: nothing is saved for this house");
-            }
-            return Err("nothing is saved for this house".into());
-        }
-        match self.enter_lot(house) {
-            Ok(()) => {
-                if let ActiveScreen::Lot(session) = &mut self.screen {
-                    let ticks = session.game.lot().ticks();
-                    session
-                        .game
-                        .set_note(format!("Back to the save after tick {ticks}."));
+            .map_err(|e| e.to_string())?;
+        if let Some(bytes) = saved_lot_bytes {
+            if Saved::decode(&bytes).is_ok() {
+                match self.enter_lot(house) {
+                    Ok(()) => {
+                        if let ActiveScreen::Lot(session) = &mut self.screen {
+                            let ticks = session.game.lot().ticks();
+                            session
+                                .game
+                                .set_note(format!("Back to the save after tick {ticks}."));
+                        }
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        self.open_save_manager(Some(format!(
+                            "Saved lot could not be restored ({err}). Choose an intact autosave below."
+                        )));
+                        return Err(err);
+                    }
                 }
-                Ok(())
-            }
-            Err(err) => {
-                self.open_save_manager(Some(format!(
-                    "Saved lot could not be restored ({err}). Choose an intact autosave below."
-                )));
-                Err(err)
+            } else if let Some(loaded) = manual_loaded {
+                // Primary SAVED_LOTS is unreadable, but the validated Manual slot is intact.
+                return match self.apply_loaded_save_into_lot(house, &loaded) {
+                    Ok(ticks) => {
+                        if let ActiveScreen::Lot(session) = &mut self.screen {
+                            session
+                                .game
+                                .set_note(format!("Back to the save after tick {ticks}."));
+                        }
+                        Ok(())
+                    }
+                    Err(err) => {
+                        self.open_save_manager(Some(format!(
+                            "Manual save could not be restored ({err}). Choose an intact autosave below."
+                        )));
+                        Err(err)
+                    }
+                };
+            } else {
+                let msg =
+                    "Saved lot is corrupt and no intact manual slot is available. Choose an intact autosave below."
+                        .to_owned();
+                self.open_save_manager(Some(msg.clone()));
+                return Err(msg);
             }
         }
+        if let Some(loaded) = manual_loaded {
+            return match self.apply_loaded_save_into_lot(house, &loaded) {
+                Ok(ticks) => {
+                    if let ActiveScreen::Lot(session) = &mut self.screen {
+                        session
+                            .game
+                            .set_note(format!("Back to the save after tick {ticks}."));
+                    }
+                    Ok(())
+                }
+                Err(err) => {
+                    self.open_save_manager(Some(format!(
+                        "Manual save could not be restored ({err}). Choose an intact autosave below."
+                    )));
+                    Err(err)
+                }
+            };
+        }
+        if let ActiveScreen::Lot(session) = &mut self.screen {
+            session
+                .game
+                .set_note("The save was not restored: nothing is saved for this house");
+        }
+        Err("nothing is saved for this house".into())
     }
 
     /// Switches to neighborhood slot `1..=8`, importing it into REDB on first visit.
@@ -2461,6 +2493,14 @@ impl NeighborhoodShell {
 
     /// Enters `house` in the active neighborhood via [`lifecycle::enter_lot`].
     pub fn enter_lot(&mut self, house: u32) -> Result<(), String> {
+        // Capture the neighborhood version BEFORE booting the VM and confirm it
+        // did not advance concurrently so `LotSession` never records a newer
+        // `(instance_id, revision)` than the snapshot that actually booted.
+        let before_nh = self
+            .store
+            .load_neighborhood(&self.neighborhood_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("neighborhood {:?} not found", self.neighborhood_id))?;
         let mut game = Game::open_from_store(
             &self.install_root,
             &self.store,
@@ -2470,9 +2510,19 @@ impl NeighborhoodShell {
             self.play,
             self.frames.clone(),
         )?;
-        if let Ok(Some(fresh)) = self.store.load_neighborhood(&self.neighborhood_id) {
-            self.stored = fresh;
+        let after_nh = self
+            .store
+            .load_neighborhood(&self.neighborhood_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("neighborhood {:?} not found", self.neighborhood_id))?;
+        if after_nh.instance_id != before_nh.instance_id || after_nh.revision != before_nh.revision
+        {
+            return Err(format!(
+                "neighborhood {:?} changed while opening lot {house}; please try again",
+                self.neighborhood_id
+            ));
         }
+        self.stored = before_nh;
         if self.options_file.is_file() {
             let _ = game.load_options(&self.options_file);
         }
@@ -2484,7 +2534,7 @@ impl NeighborhoodShell {
             neighborhood_id: self.neighborhood_id.clone(),
             neighborhood_instance_id: self.stored.instance_id,
             neighborhood_revision: self.stored.revision,
-            booted_from_staging: false,
+            staging: None,
             house,
             last_days_played: initial_days_played,
         }));
@@ -3079,81 +3129,213 @@ impl NeighborhoodShell {
     }
 }
 
-/// Persists a lot whose `neighborhood_origin` was cleared by `Lot::restore`
-/// or booted from a reconciled staging store cleanly back into
-/// `NeighborhoodStore` (`saved_lots` + `write_back_world`) while strictly
-/// enforcing `(expected_instance_id, expected_revision)` fencing.
+/// Saves a lot booted from an ephemeral reconciled staging store through the
+/// full `sims_vm::lifecycle::save_and_leave_lot` pipeline (flushing live person
+/// fields via `people::save_to_record`, recomputing lot values/family flags,
+/// and stamping `saved.deletion_epoch = stored.deletion_epoch`), then commits
+/// the exact produced `(lot_bytes, stored)` atomically to the real store under
+/// strict `(expected_instance_id, expected_revision)` fencing.
 #[allow(clippy::too_many_arguments)]
-fn save_restored_lot_to_store(
+fn save_staged_lot_to_store(
+    install_root: &Path,
+    real_store: &NeighborhoodStore,
+    staging_store: &NeighborhoodStore,
+    neighborhood_id: &str,
+    expected_instance_id: u128,
+    expected_revision: u64,
+    house: u32,
+    game: &mut Game,
+) -> Result<(SaveReport, Vec<u8>), String> {
+    let real_nh = real_store
+        .load_neighborhood(neighborhood_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("neighborhood {neighborhood_id:?} not found"))?;
+    if real_nh.instance_id != expected_instance_id {
+        return Err(format!(
+            "neighborhood {neighborhood_id:?} was replaced (expected instance {expected_instance_id:032x}, found {:032x})",
+            real_nh.instance_id
+        ));
+    }
+    if real_nh.revision != expected_revision {
+        return Err(format!(
+            "stale neighborhood {neighborhood_id:?} revision (expected {expected_revision}, found {})",
+            real_nh.revision
+        ));
+    }
+    let mut report = game.save_to_neighborhood(install_root, staging_store, neighborhood_id)?;
+    let lot_bytes = staging_store
+        .load_saved_lot(neighborhood_id, house)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "staged saved lot missing after save".to_owned())?;
+    let staged_nh = staging_store
+        .load_neighborhood(neighborhood_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "staged neighborhood missing after save".to_owned())?;
+    let committed = real_store
+        .save_lot_and_neighborhood_checked(
+            neighborhood_id,
+            house,
+            Some((expected_instance_id, expected_revision)),
+            &lot_bytes,
+            &staged_nh,
+            &[],
+        )
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("checked neighborhood commit failed: {e:?}"))?;
+    report.revision = committed.1;
+    Ok((report, lot_bytes))
+}
+
+/// Flushes every live person's persistent `data` words (`0x423827`, revision 9)
+/// into its `NBRS` slot on `world`, mirroring `sims_vm::people::save_to_record`
+/// (`0x425a69`).
+fn flush_live_people_to_neighbors(world: &mut sims_sim::World) -> Result<(), String> {
+    const NEIGHBOR_WORD: usize = 31;
+    const SAVED_REVISION: i32 = 9;
+    // Exact `0x423827` table through revision 9 (`sims_vm::people::persistent_fields(9)`).
+    const PERSISTENT_FIELDS_REV9: &[usize] = &[
+        2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 16, 20, 15, 26, 17, 18, 46, 47, 48, 49, 50, 51, 52, 53,
+        13, 14, 58, 60, 61, 56, 57, 63, 65, 67, 68, 69, 74, 54, 55, 75, 76, 80, 81, 82,
+    ];
+    for person_id in world.people.clone() {
+        let Some(person) = world
+            .objects
+            .get(&person_id)
+            .and_then(|o| o.person.as_ref())
+        else {
+            continue;
+        };
+        let mut values = Vec::with_capacity(PERSISTENT_FIELDS_REV9.len());
+        for &word in PERSISTENT_FIELDS_REV9 {
+            values.push(
+                *person
+                    .data
+                    .get(word)
+                    .ok_or_else(|| format!("person {person_id} missing data word {word}"))?,
+            );
+        }
+        let neighbor_id = person.data.get(NEIGHBOR_WORD).copied().unwrap_or(0);
+        let Some(record) = world.neighbors.get_mut(neighbor_id) else {
+            continue;
+        };
+        record.revision = SAVED_REVISION;
+        for (&word, value) in PERSISTENT_FIELDS_REV9.iter().zip(values) {
+            if let Some(slot) = record.data.get_mut(word) {
+                *slot = value;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Persists a lot whose `neighborhood_origin` was cleared by a world-mutating
+/// cheat (`Lot::restore`) by flushing live person fields and running the full
+/// `sims_vm::lifecycle::save_and_leave_lot` pipeline inside an ephemeral
+/// staging store (so `people::save_to_record`, `update_lot_values`,
+/// `family_flags`, and `saved.deletion_epoch` match normal saves exactly), then
+/// committing atomically to `store` under strict `(expected_instance_id,
+/// expected_revision)` fencing.
+#[allow(clippy::too_many_arguments)]
+fn save_cheat_mutated_lot_to_store(
+    install_root: &Path,
     store: &NeighborhoodStore,
     neighborhood_id: &str,
     expected_instance_id: u128,
     expected_revision: u64,
     house: u32,
     arch_multiplier: f32,
+    answers: &[u8],
+    frames: Frames,
     game: &mut Game,
 ) -> Result<(SaveReport, Vec<u8>), String> {
-    let saved = game.save()?;
-    let lot_bytes = saved.encode();
-    let mut stored = store
-        .load_neighborhood(neighborhood_id)
+    let snapshot = store
+        .load_lot_snapshot(neighborhood_id, house)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("neighborhood {neighborhood_id:?} not found"))?;
-    if stored.instance_id != expected_instance_id {
+    if snapshot.neighborhood.instance_id != expected_instance_id {
         return Err(format!(
             "neighborhood {neighborhood_id:?} was replaced (expected instance {expected_instance_id:032x}, found {:032x})",
-            stored.instance_id
+            snapshot.neighborhood.instance_id
         ));
     }
-    if stored.revision != expected_revision {
+    if snapshot.neighborhood.revision != expected_revision {
         return Err(format!(
             "stale neighborhood {neighborhood_id:?} revision (expected {expected_revision}, found {})",
-            stored.revision
+            snapshot.neighborhood.revision
         ));
     }
-    let expected = (expected_instance_id, expected_revision);
-    let world = saved.world();
-    let fam_id = stored.family_in(house).map_or(0, |(id, _)| id);
-    let b = &world.budget;
+    let raw_saved = game.save()?;
+    let mut flushed_world = raw_saved.world().clone();
+    flush_live_people_to_neighbors(&mut flushed_world)?;
+    let flushed_saved_bytes = splice_world_into_saved_bytes(&raw_saved, &flushed_world)?;
+
+    let mut staging_nh = snapshot.neighborhood.clone();
+    let fam_id = staging_nh.family_in(house).map_or(0, |(id, _)| id);
+    let b = &flushed_world.budget;
     let total_val = lot_total_value(
         b.lot_value,
         b.objects_value,
         b.architecture_value,
         arch_multiplier,
     );
-    let friend_threshold = 50;
-    stored.write_back_world(world, house, fam_id, total_val, None, friend_threshold);
+    staging_nh.write_back_world(&flushed_world, house, fam_id, total_val, None, 50);
+
+    let staging_dir = TempStagingDir::new("cheat-save")?;
+    let staging_store = NeighborhoodStore::open(&staging_dir.path().join("stage.redb"))
+        .map_err(|e| e.to_string())?;
+    for (file_name, bytes) in &snapshot.character_files {
+        staging_store
+            .save_character_file(neighborhood_id, file_name, bytes)
+            .map_err(|e| e.to_string())?;
+    }
+    if let Some(base_house) = &snapshot.base_house {
+        staging_store
+            .save_base_house(neighborhood_id, house, base_house)
+            .map_err(|e| e.to_string())?;
+    }
+    staging_store
+        .save_lot_and_neighborhood(neighborhood_id, house, &flushed_saved_bytes, &staging_nh)
+        .map_err(|e| e.to_string())?;
+
+    let mut staged_lot = lifecycle::enter_lot(
+        install_root,
+        &staging_store,
+        neighborhood_id,
+        house,
+        answers,
+        frames,
+    )
+    .map_err(|e| format!("staging cheat save boot failed: {e}"))?;
+    let mut report = lifecycle::save_and_leave_lot(
+        install_root,
+        &staging_store,
+        neighborhood_id,
+        &mut staged_lot,
+    )
+    .map_err(|e| format!("staging cheat save writeback failed: {e}"))?;
+    let lot_bytes = staging_store
+        .load_saved_lot(neighborhood_id, house)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "staged cheat save bytes missing".to_owned())?;
+    let final_nh = staging_store
+        .load_neighborhood(neighborhood_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "staged cheat save neighborhood missing".to_owned())?;
+
     let committed = store
         .save_lot_and_neighborhood_checked(
             neighborhood_id,
             house,
-            Some(expected),
+            Some((expected_instance_id, expected_revision)),
             &lot_bytes,
-            &stored,
+            &final_nh,
             &[],
         )
         .map_err(|e| e.to_string())?
         .map_err(|e| format!("checked neighborhood commit failed: {e:?}"))?;
     let ticks = game.lot().ticks();
-    let saved_people = stored.families.get(&fam_id).map_or(0, |f| f.members.len());
     game.mark_saved_clean(format!("Saved after tick {ticks}."));
-    let report = SaveReport {
-        neighborhood: neighborhood_id.to_owned(),
-        house,
-        family: fam_id,
-        saved_people,
-        budget: stored
-            .families
-            .get(&fam_id)
-            .map_or(world.budget.funds, |f| f.budget),
-        lot_total_value: total_val,
-        objects_value: b.objects_value,
-        architecture_value: stored
-            .families
-            .get(&fam_id)
-            .map_or(b.architecture_value, |f| f.architecture_value),
-        revision: committed.1,
-    };
+    report.revision = committed.1;
     Ok((report, lot_bytes))
 }
 

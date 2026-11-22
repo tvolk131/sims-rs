@@ -354,19 +354,45 @@ fn restoring_pre_caf_lot_slot_preserves_newer_caf_family_and_neighbors() {
     let caf_guid = created.members[0].guid;
     shell.refresh_from_store().expect("refresh after CAF");
 
-    // 3. Re-enter Lot 5, load the OLDER pre-CAF manual slot via Save Manager,
-    //    then Save & Leave!
+    // 3. Also mutate the Goth family's current funds in REDB (simulating an
+    //    updated household balance), then re-enter Lot 5, load the OLDER
+    //    pre-CAF manual slot via Save Manager, run a few ticks, and Save & Leave!
+    let mut updated_nh = shell
+        .store()
+        .load_neighborhood("UserData")
+        .unwrap()
+        .expect("UserData present");
+    let expected_funds = {
+        let (_, fam) = updated_nh.family_in_mut(5).expect("Goth family on lot 5");
+        fam.budget = fam.budget.saturating_add(777);
+        fam.budget
+    };
+    shell
+        .store()
+        .save_neighborhood("UserData", &updated_nh)
+        .expect("persist updated Goth budget");
+    shell
+        .refresh_from_store()
+        .expect("refresh after budget edit");
+
     shell.enter_lot(5).expect("re-enter lot 5");
     assert!(shell.open_save_manager(None));
     let _ = shell.handle_save_manager_command(SaveManagerCommand::LoadSlot {
         slot_id: "manual".into(),
     });
     assert!(!shell.save_manager_open());
+    assert_eq!(
+        shell.game().unwrap().lot().world().budget.funds,
+        expected_funds,
+        "restoring an older lot slot must preserve the live neighborhood's current household budget"
+    );
+    shell.game_mut().unwrap().run(3);
     shell
         .leave_lot(true)
         .expect("Save & Leave after loading pre-CAF slot");
 
-    // 4. Verify BOTH the newer CAF family AND its NBRS neighbor record survived!
+    // 4. Verify BOTH the newer CAF family, its NBRS record, AND the updated
+    //    household budget survived!
     let final_nh = shell
         .store()
         .load_neighborhood("UserData")
@@ -383,6 +409,38 @@ fn restoring_pre_caf_lot_slot_preserves_newer_caf_family_and_neighbors() {
             .flatten()
             .any(|n| n.guid == caf_guid),
         "newer CAF Sim NBRS record must survive restoring and saving an older lot slot"
+    );
+    assert_eq!(
+        final_nh.family_in(5).map(|(_, f)| f.budget),
+        Some(expected_funds),
+        "current household budget must not roll back when saving a restored older slot"
+    );
+
+    // 5. Verify a cheat-mutated lot save (`rosebud`) persists cleanly via the
+    //    full lifecycle save pipeline and reloads with the cheated funds intact.
+    shell
+        .enter_lot(5)
+        .expect("enter lot 5 for cheat save check");
+    {
+        let game = shell.game_mut().unwrap();
+        game.toggle_cheat_console();
+        for ch in "rosebud".chars() {
+            game.cheat_console_char(ch);
+        }
+        game.cheat_console_submit().expect("rosebud executes");
+    }
+    shell
+        .leave_lot(true)
+        .expect("Save & Leave after rosebud cheat");
+    let after_cheat_nh = shell
+        .store()
+        .load_neighborhood("UserData")
+        .unwrap()
+        .expect("UserData present");
+    assert_eq!(
+        after_cheat_nh.family_in(5).map(|(_, f)| f.budget),
+        Some(expected_funds + 1_000),
+        "rosebud cheat funds must persist through Save & Leave"
     );
 }
 

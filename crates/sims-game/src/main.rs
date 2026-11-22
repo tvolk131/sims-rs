@@ -586,7 +586,7 @@ impl Session {
 struct App {
     session: Session,
     last_screen: ScreenKind,
-    last_lot_generation: u64,
+    last_lot_generation: (u64, u64),
     window: Option<Rc<Window>>,
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
     surface_size: Option<(NonZeroU32, NonZeroU32)>,
@@ -755,12 +755,13 @@ impl App {
         }
     }
 
-    fn current_lot_generation(&self) -> u64 {
+    fn current_lot_generation(&self) -> (u64, u64) {
         match &self.session {
-            Session::Standalone { game, .. } => game.restore_generation(),
-            Session::Shell(shell) => shell
-                .lot_generation()
-                .wrapping_add(shell.game().map_or(0, Game::restore_generation)),
+            Session::Standalone { game, .. } => (0, game.restore_generation()),
+            Session::Shell(shell) => (
+                shell.lot_generation(),
+                shell.game().map_or(0, Game::restore_generation),
+            ),
         }
     }
 
@@ -2024,7 +2025,7 @@ fn run() -> Result<(), String> {
                 saved_optn,
             },
             last_screen: ScreenKind::Lot,
-            last_lot_generation: 0,
+            last_lot_generation: (0, 0),
             window: None,
             surface: None,
             surface_size: None,
@@ -2112,7 +2113,7 @@ fn run() -> Result<(), String> {
     let mut app = App {
         session: Session::Shell(Box::new(shell)),
         last_screen: ScreenKind::Neighborhood,
-        last_lot_generation: 0,
+        last_lot_generation: (0, 0),
         window: None,
         surface: None,
         surface_size: None,
