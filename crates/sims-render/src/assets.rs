@@ -22,11 +22,12 @@ use crate::canvas::Image;
 use crate::pools::Pools;
 use crate::shadows::{self, Mask};
 use crate::{Error, Result};
-use sims_content::{Catalog, Index, Install, SurfaceCatalog, SurfaceKind, SurfacePlugin};
+use sims_content::{ArchivePool, Catalog, Index, Install, SurfacePlugin, Surfaces};
 use sims_formats::execution::Slots;
 use sims_formats::iff::Iff;
 use sims_formats::sprite::{DrawGroup, LegacySpriteSet, Palette, SpriteSet};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_ASSETS_ID: AtomicU64 = AtomicU64::new(1);
@@ -101,10 +102,36 @@ impl Definition {
     }
 }
 
+/// Install-level static lot art (`floors.iff`, `walls.iff`, `lightMap.dat`)
+/// that depends only on [`Install`] and can be loaded in parallel with
+/// [`Index`]/[`Catalog`] construction before assembling [`Assets`].
+pub struct BaseAssets {
+    floors: Iff,
+    walls: Iff,
+    pools: Option<Pools>,
+}
+
+impl BaseAssets {
+    pub fn load(install: &Install) -> Result<Self> {
+        let read = |path: &str| -> Result<Iff> {
+            let path = install.file(path)?;
+            let bytes =
+                std::fs::read(&path).map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+            Ok(Iff::parse(bytes)?)
+        };
+        Ok(Self {
+            floors: read("GameData/floors.iff")?,
+            walls: read("GameData/walls.iff")?,
+            pools: read_pools(install),
+        })
+    }
+}
+
 pub struct Assets {
     id: u64,
-    index: Index,
-    catalog: Catalog,
+    index: Arc<Index>,
+    catalog: Arc<Catalog>,
+    pool: Arc<ArchivePool>,
     floors: Iff,
     walls: Iff,
     floor_plugins: BTreeMap<u16, SurfacePlugin>,
@@ -123,23 +150,61 @@ pub struct Assets {
 
 impl Assets {
     pub fn new(install: &Install, index: Index, catalog: Catalog) -> Result<Self> {
-        let read = |path: &str| -> Result<Iff> {
-            let path = install.file(path)?;
-            let bytes =
-                std::fs::read(&path).map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
-            Ok(Iff::parse(bytes)?)
-        };
-        let floor_plugins =
-            SurfaceCatalog::plugins(install, SurfaceKind::Floor).unwrap_or_default();
-        let wall_plugins = SurfaceCatalog::plugins(install, SurfaceKind::Wall).unwrap_or_default();
-        Ok(Self {
-            id: NEXT_ASSETS_ID.fetch_add(1, Ordering::Relaxed),
-            floors: read("GameData/floors.iff")?,
-            walls: read("GameData/walls.iff")?,
+        Self::new_shared(
+            install,
+            Arc::new(index),
+            Arc::new(catalog),
+            Arc::new(ArchivePool::new()),
+        )
+    }
+
+    /// Creates [`Assets`] sharing an existing `Arc<Index>`, `Arc<Catalog>`,
+    /// and `Arc<ArchivePool>` without duplicating index/catalog storage.
+    pub fn new_shared(
+        install: &Install,
+        index: Arc<Index>,
+        catalog: Arc<Catalog>,
+        pool: Arc<ArchivePool>,
+    ) -> Result<Self> {
+        let (base_res, (floor_plugins, wall_plugins)) = std::thread::scope(|scope| {
+            let plugins_handle = scope.spawn(|| Surfaces::plugins_with_pool(install, &pool));
+            let base_res = BaseAssets::load(install);
+            (
+                base_res,
+                plugins_handle
+                    .join()
+                    .expect("surface plugins worker panicked"),
+            )
+        });
+        Ok(Self::from_base(
+            base_res?,
             floor_plugins,
             wall_plugins,
             index,
             catalog,
+            pool,
+        ))
+    }
+
+    /// Assembles [`Assets`] from pre-loaded [`BaseAssets`], pre-scanned surface
+    /// plug-ins, and shared `Arc<Index>`, `Arc<Catalog>`, and `Arc<ArchivePool>`.
+    pub fn from_base(
+        base: BaseAssets,
+        floor_plugins: BTreeMap<u16, SurfacePlugin>,
+        wall_plugins: BTreeMap<u16, SurfacePlugin>,
+        index: Arc<Index>,
+        catalog: Arc<Catalog>,
+        pool: Arc<ArchivePool>,
+    ) -> Self {
+        Self {
+            id: NEXT_ASSETS_ID.fetch_add(1, Ordering::Relaxed),
+            floors: base.floors,
+            walls: base.walls,
+            floor_plugins,
+            wall_plugins,
+            index,
+            catalog,
+            pool,
             files: BTreeMap::new(),
             definitions: BTreeMap::new(),
             floor_images: BTreeMap::new(),
@@ -148,9 +213,9 @@ impl Assets {
             groups: BTreeMap::new(),
             object_shapes: BTreeMap::new(),
             trims: BTreeMap::new(),
-            pools: read_pools(install),
+            pools: base.pools,
             shadow_masks: BTreeMap::new(),
-        })
+        }
     }
 
     /// Unique identity of this immutable `Assets` instance (install + index +
@@ -215,13 +280,14 @@ impl Assets {
     ) -> Option<(&Image, Option<&Pools>)> {
         let floors = &self.floors;
         let floor_plugins = &self.floor_plugins;
+        let pool = &self.pool;
         let pools = self.pools.as_ref();
         let img = self
             .floor_images
             .entry((id, zoom))
             .or_insert_with(|| {
                 if let Some(plugin) = floor_plugins.get(&id) {
-                    let bytes = plugin.resource.read().ok()?;
+                    let bytes = plugin.resource.read_with(pool).ok()?;
                     let iff = Iff::parse(bytes).ok()?;
                     let sprite = plugin.local.checked_add([0, 256, 512][zoom])?;
                     let chunk = iff.get(b"SPR2", sprite)?;
@@ -262,11 +328,12 @@ impl Assets {
     pub fn pattern(&mut self, id: u16, zoom: usize) -> Option<&[Image; 4]> {
         let walls = &self.walls;
         let wall_plugins = &self.wall_plugins;
+        let pool = &self.pool;
         self.patterns
             .entry((id, zoom))
             .or_insert_with(|| {
                 if let Some(plugin) = wall_plugins.get(&id) {
-                    let bytes = plugin.resource.read().ok()?;
+                    let bytes = plugin.resource.read_with(pool).ok()?;
                     let iff = Iff::parse(bytes).ok()?;
                     let candidates = [
                         plugin.local.checked_add([1536, 1792, 2048][zoom]),
@@ -511,7 +578,12 @@ impl Assets {
 
     fn file(&mut self, resource: usize) -> Option<&Iff> {
         if !self.files.contains_key(&resource) {
-            let bytes = self.index.resources.get(resource)?.read().ok()?;
+            let bytes = self
+                .index
+                .resources
+                .get(resource)?
+                .read_with(&self.pool)
+                .ok()?;
             self.files.insert(resource, Iff::parse(bytes).ok()?);
         }
         self.files.get(&resource)

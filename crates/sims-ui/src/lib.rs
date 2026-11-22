@@ -4,6 +4,7 @@
 //! - [`caf`]: the Create-a-Family and Create-a-Sim screens.
 //! - [`neighborhood`]: the neighborhood top controls bar and lot hover popup card.
 //! - [`family_bin`]: the Select a Family / Family Bin picker screen.
+//! - [`coop`]: the co-op multiplayer Host/Join lobby dialog and in-lot HUD overlay.
 //! - [`dialog`]: the dialogs scripts show.
 //! - [`balloon`]: the help balloons the panels open over the lot.
 //! - [`pie`]: the pie menu of what a Sim can do with an object.
@@ -25,6 +26,7 @@ pub mod build;
 pub mod buy;
 pub mod caf;
 pub mod command;
+pub mod coop;
 pub mod dialog;
 pub mod family_bin;
 pub mod font;

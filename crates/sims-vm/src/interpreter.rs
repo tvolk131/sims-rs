@@ -8,6 +8,7 @@
 //! native-suspension and retained-frame machinery.
 
 use crate::fault::{Fault, Location, Trap};
+use crate::primitives::ui_effect::UiEffectEvent;
 use crate::program::{DEFINITION_WORDS, Program, Tree};
 use crate::sounds::SoundEvent;
 use sims_content::Catalog;
@@ -104,6 +105,9 @@ pub struct Interpreter<'a> {
     /// Where to note each request to the sound system, or None to note
     /// nothing. See [`crate::sounds`].
     pub sounds: Option<&'a RefCell<Vec<SoundEvent>>>,
+    /// Where to note each UI highlight change requested by UI Effect
+    /// (opcode 34, `0x44acff`), or None to note nothing. See [`UiEffectEvent`].
+    pub ui_effects: Option<&'a RefCell<Vec<UiEffectEvent>>>,
     /// Where to note the levels whose rooms a room update counted, as
     /// bits (1 for level 1, 2 for level 2), or None to note nothing. The
     /// original builds the cutaway mask of every room on such a level at
@@ -207,6 +211,7 @@ impl<'a> Interpreter<'a> {
             asked: None,
             deleted: None,
             sounds: None,
+            ui_effects: None,
             masks_rebuilt: None,
             making_person: None,
             menu: None,
@@ -356,6 +361,7 @@ impl<'a> Interpreter<'a> {
             asked: self.asked,
             deleted: self.deleted,
             sounds: self.sounds,
+            ui_effects: self.ui_effects,
             masks_rebuilt: self.masks_rebuilt,
             base,
             synchronous,
@@ -447,6 +453,9 @@ pub(crate) struct Machine<'a, 'w> {
     /// See [`Interpreter::deleted`].
     pub deleted: Option<&'a RefCell<Vec<u16>>>,
     pub sounds: Option<&'a RefCell<Vec<SoundEvent>>>,
+    /// Where to note each UI highlight change requested by UI Effect
+    /// (opcode 34, `0x44acff`), or None to note nothing. See [`UiEffectEvent`].
+    pub ui_effects: Option<&'a RefCell<Vec<UiEffectEvent>>>,
     /// See [`Interpreter::masks_rebuilt`].
     pub masks_rebuilt: Option<&'a Cell<u8>>,
     /// The stack depth below the frames this run owns. When a return pops
@@ -502,6 +511,7 @@ impl<'a> Machine<'a, '_> {
             asked: self.asked,
             deleted: self.deleted,
             sounds: self.sounds,
+            ui_effects: self.ui_effects,
             masks_rebuilt: self.masks_rebuilt,
             making_person: self.making_person,
             menu: self.menu,
@@ -525,6 +535,13 @@ impl<'a> Machine<'a, '_> {
     pub(crate) fn sound(&self, event: SoundEvent) {
         if let Some(sounds) = self.sounds {
             sounds.borrow_mut().push(event);
+        }
+    }
+
+    /// Notes a HUD highlight request from UI Effect (opcode 34, `0x44acff`).
+    pub(crate) fn emit_ui_effect(&self, event: UiEffectEvent) {
+        if let Some(ui_effects) = self.ui_effects {
+            ui_effects.borrow_mut().push(event);
         }
     }
 

@@ -453,6 +453,10 @@ impl Interpreter<'_> {
             deleted.borrow_mut().push(id);
         }
         world.frame_storage.remove(&id);
+        world.scratch_ptr_set.remove(&id);
+        world.scratch_ptr_set_to_next.remove(&id);
+        world.scratch_ptr_expression.remove(&id);
+        world.scratch_ptr_arg_slot.remove(&id);
         // So does its headline list (0x4323ce).
         world.headlines.remove(&id);
         // The object's slot table goes with it.
@@ -471,6 +475,7 @@ impl Interpreter<'_> {
         if person {
             // The person's destructor (0x459511).
             world.animators.remove(&id);
+            world.person_outfits.remove(&id);
             world.base_layers.remove(&id);
             world.translated_bones.remove(&id);
             world.held_poses.remove(&id);

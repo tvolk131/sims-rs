@@ -22,16 +22,18 @@
 //! - scales output by the exact 1.91 Music volume slider table
 //!   ([`VOLUME_STEPS`], `0x67156c`, `kind 38` / `kGroupMusic` group 2).
 
+use crate::decode::Kind;
 use crate::files::{SoundFiles, Source, key};
 use crate::player::{RATE, VOLUME_STEPS};
-use crate::{Error, Pcm, Result, wav};
+use crate::{Error, Pcm, Result, wav, xa};
 use std::collections::BTreeMap;
+use std::io::{Read, Seek, SeekFrom};
 use symphonia_bundle_mp3::{MpaDecoder, MpaReader};
 use symphonia_core::audio::SampleBuffer;
 use symphonia_core::codecs::{Decoder, DecoderOptions};
 use symphonia_core::errors::Error as SymphoniaError;
 use symphonia_core::formats::{FormatOptions, FormatReader};
-use symphonia_core::io::{MediaSourceStream, MediaSourceStreamOptions};
+use symphonia_core::io::{MediaSource, MediaSourceStream, MediaSourceStreamOptions};
 
 /// HIT timer tick rate (50 Hz = 20 ms per tick).
 pub const HIT_TICK_HZ: u32 = 50;
@@ -332,15 +334,38 @@ impl ModeCatalog {
     }
 }
 
-/// Provider of raw audio file bytes (MP3 or WAV) for [`ModeMusicPlayer`].
+/// Open track media returned by [`TrackSource::open_track`].
+pub enum TrackData {
+    /// Loose file on disk, streamed incrementally without buffering multi-MB MP3s.
+    File(std::fs::File),
+    /// In-memory file bytes (for FAR archive members or synthetic test sources).
+    Bytes(Vec<u8>),
+}
+
+/// Provider of audio track data (MP3, WAV, or XA) for [`ModeMusicPlayer`] and
+/// [`crate::radio::RadioPlayer`].
 pub trait TrackSource {
     /// Reads the raw bytes of the file at `path`.
     fn read_bytes(&mut self, path: &str) -> Option<Vec<u8>>;
+
+    /// Opens `path` for streaming. Defaults to [`Self::read_bytes`], while
+    /// [`SoundFiles`] opens loose files directly via [`std::fs::File`].
+    fn open_track(&mut self, path: &str) -> Option<TrackData> {
+        self.read_bytes(path).map(TrackData::Bytes)
+    }
 }
 
 impl TrackSource for SoundFiles {
     fn read_bytes(&mut self, path: &str) -> Option<Vec<u8>> {
         self.get(path)?.read().ok()
+    }
+
+    fn open_track(&mut self, path: &str) -> Option<TrackData> {
+        let entry = self.get(path)?;
+        match &entry.source {
+            Source::Loose(file_path) => std::fs::File::open(file_path).ok().map(TrackData::File),
+            Source::Member { .. } => entry.read().ok().map(TrackData::Bytes),
+        }
     }
 }
 
@@ -350,11 +375,10 @@ impl TrackSource for BTreeMap<String, Vec<u8>> {
     }
 }
 
-/// An active streaming audio track (incremental MP3 packet decoder or looping
-/// PCM buffer for WAV files such as `loadloop.wav`), resampled on the fly to
-/// `output_rate` stereo.
-struct StreamDeck {
-    path: String,
+/// An active streaming audio track (incremental MP3 packet decoder or PCM
+/// buffer for WAV/XA files), resampled on the fly to `output_rate` stereo.
+pub(crate) struct StreamDeck {
+    pub(crate) path: String,
     inner: StreamInner,
     /// Decoded stereo interleaved source frames (`[L, R, L, R, ...]`).
     buffer: Vec<i16>,
@@ -368,13 +392,13 @@ struct StreamDeck {
     eof: bool,
     /// Current per-deck fade volume (`0..=1024`, scaled in 16.16 fixed point
     /// for smooth per-frame ramps).
-    gain_fp: i64,
+    pub(crate) gain_fp: i64,
     /// Target per-deck fade volume in 16.16 fixed point.
     target_fp: i64,
     /// Signed per-frame ramp delta in 16.16 fixed point.
     ramp_per_frame: i64,
     /// Drop this deck once its fade reaches 0.
-    stop_at_zero: bool,
+    pub(crate) stop_at_zero: bool,
 }
 
 enum StreamInner {
@@ -389,36 +413,67 @@ enum StreamInner {
 }
 
 impl StreamDeck {
-    fn open(path: String, bytes: Vec<u8>, output_rate: u32) -> Result<Self> {
+    pub(crate) fn open_media(path: String, media: TrackData, output_rate: u32) -> Result<Self> {
         let output_rate = output_rate.max(1);
-        if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
-            let pcm = wav::decode(&bytes)?;
-            if pcm.rate == 0 || pcm.channels == 0 || pcm.frames() == 0 {
-                return Err(Error::format("WAV", 0, "empty music track"));
+        match media {
+            TrackData::File(mut file) => {
+                let io = |e| Error::io(std::path::Path::new(&path), e);
+                let mut head = [0u8; 12];
+                let n = file.read(&mut head).map_err(io)?;
+                file.seek(SeekFrom::Start(0)).map_err(io)?;
+                match Kind::sniff(&head[..n]) {
+                    Some(Kind::Wav) => {
+                        let mut bytes = Vec::new();
+                        file.read_to_end(&mut bytes).map_err(io)?;
+                        Self::open_pcm(path, wav::decode(&bytes)?, "WAV", output_rate)
+                    }
+                    Some(Kind::Xa) => {
+                        let mut bytes = Vec::new();
+                        file.read_to_end(&mut bytes).map_err(io)?;
+                        Self::open_pcm(path, xa::decode(&bytes)?, "XA", output_rate)
+                    }
+                    _ => Self::open_mp3_source(path, Box::new(file), output_rate),
+                }
             }
-            let source_rate = pcm.rate;
-            let step = ((u64::from(source_rate) << 32) / u64::from(output_rate)).max(1);
-            let mut deck = Self {
-                path,
-                inner: StreamInner::Pcm { pcm, cursor: 0 },
-                buffer: Vec::new(),
-                source_rate,
-                phase: 0,
-                step,
-                eof: false,
-                gain_fp: i64::from(MAX_VOLUME) << 16,
-                target_fp: i64::from(MAX_VOLUME) << 16,
-                ramp_per_frame: 0,
-                stop_at_zero: false,
-            };
-            deck.refill();
-            return Ok(deck);
+            TrackData::Bytes(bytes) => match Kind::sniff(&bytes) {
+                Some(Kind::Wav) => Self::open_pcm(path, wav::decode(&bytes)?, "WAV", output_rate),
+                Some(Kind::Xa) => Self::open_pcm(path, xa::decode(&bytes)?, "XA", output_rate),
+                _ => {
+                    Self::open_mp3_source(path, Box::new(std::io::Cursor::new(bytes)), output_rate)
+                }
+            },
         }
+    }
 
-        let source = MediaSourceStream::new(
-            Box::new(std::io::Cursor::new(bytes)),
-            MediaSourceStreamOptions::default(),
-        );
+    fn open_pcm(path: String, pcm: Pcm, label: &'static str, output_rate: u32) -> Result<Self> {
+        if pcm.rate == 0 || pcm.channels == 0 || pcm.frames() == 0 {
+            return Err(Error::format(label, 0, "empty audio track"));
+        }
+        let source_rate = pcm.rate;
+        let step = ((u64::from(source_rate) << 32) / u64::from(output_rate)).max(1);
+        let mut deck = Self {
+            path,
+            inner: StreamInner::Pcm { pcm, cursor: 0 },
+            buffer: Vec::new(),
+            source_rate,
+            phase: 0,
+            step,
+            eof: false,
+            gain_fp: i64::from(MAX_VOLUME) << 16,
+            target_fp: i64::from(MAX_VOLUME) << 16,
+            ramp_per_frame: 0,
+            stop_at_zero: false,
+        };
+        deck.refill();
+        Ok(deck)
+    }
+
+    fn open_mp3_source(
+        path: String,
+        media: Box<dyn MediaSource>,
+        output_rate: u32,
+    ) -> Result<Self> {
+        let source = MediaSourceStream::new(media, MediaSourceStreamOptions::default());
         let reader = MpaReader::try_new(source, &FormatOptions::default())
             .map_err(|e| Error::format("MP3", 0, e.to_string()))?;
         let params = reader
@@ -451,7 +506,7 @@ impl StreamDeck {
         Ok(deck)
     }
 
-    fn start_fade(&mut self, target_vol: i32, duration_frames: u32, stop_at_zero: bool) {
+    pub(crate) fn start_fade(&mut self, target_vol: i32, duration_frames: u32, stop_at_zero: bool) {
         let target_fp = i64::from(target_vol.clamp(0, MAX_VOLUME)) << 16;
         self.target_fp = target_fp;
         self.stop_at_zero = stop_at_zero;
@@ -465,7 +520,7 @@ impl StreamDeck {
         }
     }
 
-    fn is_finished(&self) -> bool {
+    pub(crate) fn is_finished(&self) -> bool {
         if self.stop_at_zero && self.gain_fp <= 0 {
             return true;
         }
@@ -545,7 +600,7 @@ impl StreamDeck {
     }
 
     /// Reads one resampled stereo sample pair and advances the deck's fade ramp.
-    fn next_frame(&mut self) -> Option<[i32; 2]> {
+    pub(crate) fn next_frame(&mut self) -> Option<[i32; 2]> {
         if self.stop_at_zero && self.gain_fp <= 0 {
             return None;
         }
@@ -955,11 +1010,11 @@ impl<S: TrackSource> ModeMusicPlayer<S> {
 
     fn try_open_track(&mut self, mode: MusicMode, idx: usize, fade_in: bool) -> bool {
         let path = self.catalog.tracks(mode)[idx].clone();
-        let Some(bytes) = self.source.read_bytes(&path) else {
+        let Some(media) = self.source.open_track(&path) else {
             self.faults.push(format!("missing music track: {path}"));
             return false;
         };
-        match StreamDeck::open(path.clone(), bytes, self.output_rate) {
+        match StreamDeck::open_media(path.clone(), media, self.output_rate) {
             Ok(mut deck) => {
                 if fade_in {
                     let cf = self.crossfade_frames();
@@ -1008,14 +1063,14 @@ impl<S: TrackSource> ModeMusicPlayer<S> {
     }
 }
 
-fn splitmix64(seed: u64) -> u64 {
+pub(crate) fn splitmix64(seed: u64) -> u64 {
     let mut z = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     (z ^ (z >> 31)).max(1)
 }
 
-fn xorshift(state: &mut u64, below: u32) -> u32 {
+pub(crate) fn xorshift(state: &mut u64, below: u32) -> u32 {
     *state ^= *state >> 12;
     *state ^= *state << 25;
     *state ^= *state >> 27;

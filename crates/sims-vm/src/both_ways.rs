@@ -27,6 +27,7 @@ use crate::Trap;
 use crate::interpreter::{Asked, AtOnce, Interpreter, Machine, Status};
 use crate::orders::Checking;
 use crate::placement::{Kept, Pending, Refreshing};
+use crate::primitives::ui_effect::UiEffectEvent;
 use crate::sounds::SoundEvent;
 use sims_formats::saved_objects::Interaction;
 use sims_sim::World;
@@ -43,6 +44,7 @@ pub(crate) struct Cells {
     asked: Option<RefCell<Vec<Asked>>>,
     deleted: Option<RefCell<Vec<u16>>>,
     sounds: Option<RefCell<Vec<SoundEvent>>>,
+    ui_effects: Option<RefCell<Vec<UiEffectEvent>>>,
     masks_rebuilt: Option<Cell<u8>>,
     menu: Option<RefCell<Checking>>,
     /// The action of `running_at_once`.
@@ -113,6 +115,7 @@ impl Cells {
             asked: copy(interpreter.asked),
             deleted: copy(interpreter.deleted),
             sounds: copy(interpreter.sounds),
+            ui_effects: copy(interpreter.ui_effects),
             masks_rebuilt: interpreter.masks_rebuilt.map(|c| Cell::new(c.get())),
             menu: copy(interpreter.menu),
             action: copy(interpreter.running_at_once.map(|a| a.action)),
@@ -129,6 +132,7 @@ impl Cells {
             asked: self.asked.as_ref(),
             deleted: self.deleted.as_ref(),
             sounds: self.sounds.as_ref(),
+            ui_effects: self.ui_effects.as_ref(),
             masks_rebuilt: self.masks_rebuilt.as_ref(),
             menu: self.menu.as_ref(),
             running_at_once: interpreter.running_at_once.zip(self.action.as_ref()).map(
@@ -151,6 +155,7 @@ impl Cells {
             asked: copy(self.asked.as_ref()),
             deleted: copy(self.deleted.as_ref()),
             sounds: copy(self.sounds.as_ref()),
+            ui_effects: copy(self.ui_effects.as_ref()),
             masks_rebuilt: self.masks_rebuilt.as_ref().map(|c| Cell::new(c.get())),
             menu: copy(self.menu.as_ref()),
             action: copy(self.action.as_ref()),
@@ -166,6 +171,7 @@ impl Cells {
         alike(&self.asked, &other.asked, PartialEq::eq)
             && alike(&self.deleted, &other.deleted, PartialEq::eq)
             && alike(&self.sounds, &other.sounds, PartialEq::eq)
+            && alike(&self.ui_effects, &other.ui_effects, PartialEq::eq)
             && self.masks_rebuilt.as_ref().map(Cell::get)
                 == other.masks_rebuilt.as_ref().map(Cell::get)
             && alike(&self.menu, &other.menu, same_checking)
@@ -189,6 +195,7 @@ impl Cells {
         let asked = take(interpreter.asked);
         let deleted = take(interpreter.deleted);
         let sounds = take(interpreter.sounds);
+        let ui_effects = take(interpreter.ui_effects);
         let menu = take(interpreter.menu);
         let action = take(interpreter.running_at_once.map(|a| a.action));
         let letting_go = take(interpreter.letting_go);
@@ -198,6 +205,7 @@ impl Cells {
         put(asked, self.asked);
         put(deleted, self.deleted);
         put(sounds, self.sounds);
+        put(ui_effects, self.ui_effects);
         if let (Some(held), Some(copy)) = (interpreter.masks_rebuilt, self.masks_rebuilt) {
             held.set(copy.get());
         }
@@ -209,9 +217,62 @@ impl Cells {
     }
 }
 
-/// Whether two lots are the same: their encodings, and each object's
-/// count of its thread's restarts (`FrameStorage::restarts`), which the
-/// encoding leaves out and the interpreter reads.
+/// Pre-encoded snapshot of a [`World`] for repeated [`same_lot`] comparisons
+/// without re-encoding the reference world on every candidate.
+#[derive(PartialEq, Eq)]
+pub(crate) struct LotSnapshot {
+    encoded: Vec<u8>,
+    restarts: Vec<(u16, u32)>,
+    dirty_portraits: BTreeSet<u32>,
+    generated_portrait_2002: BTreeSet<sims_sim::PortraitFile>,
+    made_portrait_head: BTreeMap<u32, Option<bool>>,
+    ambiguous_portraits: BTreeSet<u32>,
+    loaded_indexed_skeletons: BTreeMap<String, Option<String>>,
+    loaded_indexed_suits: BTreeMap<String, Option<bool>>,
+    loaded_indexed_suit_bones: BTreeMap<String, Vec<Vec<String>>>,
+    made_outfits: BTreeMap<u32, BTreeMap<usize, String>>,
+    person_outfits: BTreeMap<u16, sims_sim::PersonOutfit>,
+    scratch_ptr_set: BTreeSet<u16>,
+    scratch_ptr_set_to_next: BTreeSet<u16>,
+    scratch_ptr_expression: BTreeSet<u16>,
+    scratch_ptr_arg_slot: BTreeSet<u16>,
+    runtime_added_suits: Vec<String>,
+    suit_scan_cache: Option<Vec<String>>,
+}
+
+impl LotSnapshot {
+    pub(crate) fn of(w: &World) -> Self {
+        Self {
+            encoded: w.encode(),
+            restarts: w
+                .frame_storage
+                .iter()
+                .map(|(id, s)| (*id, s.restarts))
+                .collect(),
+            dirty_portraits: w.dirty_portraits.clone(),
+            generated_portrait_2002: w.generated_portrait_2002.clone(),
+            made_portrait_head: w.made_portrait_head.clone(),
+            ambiguous_portraits: w.ambiguous_portraits.clone(),
+            loaded_indexed_skeletons: w.loaded_indexed_skeletons.clone(),
+            loaded_indexed_suits: w.loaded_indexed_suits.clone(),
+            loaded_indexed_suit_bones: w.loaded_indexed_suit_bones.clone(),
+            made_outfits: w.made_outfits.clone(),
+            person_outfits: w.person_outfits.clone(),
+            scratch_ptr_set: w.scratch_ptr_set.clone(),
+            scratch_ptr_set_to_next: w.scratch_ptr_set_to_next.clone(),
+            scratch_ptr_expression: w.scratch_ptr_expression.clone(),
+            scratch_ptr_arg_slot: w.scratch_ptr_arg_slot.clone(),
+            runtime_added_suits: w.runtime_added_suits.clone(),
+            suit_scan_cache: w.suit_scan_cache.clone(),
+        }
+    }
+}
+
+/// Whether two lots are the same: their encodings, each object's count of
+/// its thread's restarts (`FrameStorage::restarts`), and the unencoded
+/// portrait dirty/writeback sets (`World::dirty_portraits`,
+/// `World::generated_portrait_2002`), which the encoding leaves out and
+/// the interpreter reads.
 pub(crate) fn same_lot(a: &World, b: &World) -> bool {
     let restarts = |w: &World| {
         w.frame_storage
@@ -219,7 +280,23 @@ pub(crate) fn same_lot(a: &World, b: &World) -> bool {
             .map(|(id, s)| (*id, s.restarts))
             .collect::<Vec<_>>()
     };
-    a.encode() == b.encode() && restarts(a) == restarts(b)
+    a.encode() == b.encode()
+        && restarts(a) == restarts(b)
+        && a.dirty_portraits == b.dirty_portraits
+        && a.generated_portrait_2002 == b.generated_portrait_2002
+        && a.made_portrait_head == b.made_portrait_head
+        && a.ambiguous_portraits == b.ambiguous_portraits
+        && a.loaded_indexed_skeletons == b.loaded_indexed_skeletons
+        && a.loaded_indexed_suits == b.loaded_indexed_suits
+        && a.loaded_indexed_suit_bones == b.loaded_indexed_suit_bones
+        && a.made_outfits == b.made_outfits
+        && a.person_outfits == b.person_outfits
+        && a.scratch_ptr_set == b.scratch_ptr_set
+        && a.scratch_ptr_set_to_next == b.scratch_ptr_set_to_next
+        && a.scratch_ptr_expression == b.scratch_ptr_expression
+        && a.scratch_ptr_arg_slot == b.scratch_ptr_arg_slot
+        && a.runtime_added_suits == b.runtime_added_suits
+        && a.suit_scan_cache == b.suit_scan_cache
 }
 
 impl<'a> Machine<'a, '_> {
@@ -238,6 +315,7 @@ impl<'a> Machine<'a, '_> {
             asked: interpreter.asked,
             deleted: interpreter.deleted,
             sounds: interpreter.sounds,
+            ui_effects: interpreter.ui_effects,
             masks_rebuilt: interpreter.masks_rebuilt,
             base: self.base,
             synchronous: self.synchronous,
@@ -356,6 +434,7 @@ mod tests {
             asked: None,
             deleted: None,
             sounds: None,
+            ui_effects: None,
             masks_rebuilt: None,
             menu: Some(RefCell::new(Checking {
                 action: action(menu_bits),
@@ -391,6 +470,7 @@ mod tests {
             people: Default::default(),
             icon_frames: None,
             wardrobe: None,
+            ordered_wardrobe: None,
             character_files: Default::default(),
             expansions: 0,
             characters: Default::default(),
@@ -446,6 +526,7 @@ mod tests {
             people: Default::default(),
             icon_frames: None,
             wardrobe: None,
+            ordered_wardrobe: None,
             character_files: Default::default(),
             expansions: 0,
             characters: Default::default(),
@@ -492,5 +573,34 @@ mod tests {
         assert!(!same_lot(&a, &b));
         a.frame_storage.get_mut(&7).unwrap().restarts = 1;
         assert!(same_lot(&a, &b));
+    }
+
+    #[test]
+    fn lots_that_differ_only_in_portrait_flags_are_not_the_same() {
+        let a = World::empty();
+        let mut b = a.clone();
+        b.dirty_portraits.insert(0x1234_5678);
+        assert_ne!(a.encode(), b.encode(), "dirty_portraits is encoded");
+        assert!(!same_lot(&a, &b));
+
+        let mut c = a.clone();
+        c.generated_portrait_2002
+            .insert(sims_sim::PortraitFile::Resource(7));
+        assert_eq!(
+            a.encode(),
+            c.encode(),
+            "generated_portrait_2002 is not encoded"
+        );
+        assert!(!same_lot(&a, &c));
+
+        let mut d = a.clone();
+        d.made_portrait_head.insert(0x1234_5678, Some(true));
+        assert_eq!(a.encode(), d.encode(), "made_portrait_head is not encoded");
+        assert!(!same_lot(&a, &d));
+
+        let mut e = a.clone();
+        e.ambiguous_portraits.insert(0x1234_5678);
+        assert_eq!(a.encode(), e.encode(), "ambiguous_portraits is not encoded");
+        assert!(!same_lot(&a, &e));
     }
 }
