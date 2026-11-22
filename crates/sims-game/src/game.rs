@@ -4737,7 +4737,9 @@ impl Game {
         };
         let listing = menu::entries(&mut self.lot, &self.assets, person, object);
         let changed = listing.as_ref().is_ok_and(|l| l.unchecked.is_none());
-        if changed {
+        if !listing.as_ref().is_ok_and(|l| l.unchecked.is_some()) {
+            // `Lot::pie_menu` commits check-tree side effects before `menu::named`
+            // runs, so invalidate steady-state damage even if naming returns `Err`.
             self.prev_steady_key = None;
             self.present_damage = None;
         }
