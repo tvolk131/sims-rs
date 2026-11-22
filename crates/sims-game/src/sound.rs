@@ -451,41 +451,62 @@ pub fn ambience_zone_for_lot(lot_id: i16) -> AmbienceZone {
     }
 }
 
-/// Maps a camera zoom level (`0` = Far, `1` = Medium, `2` = Near) to [`ZoomLevel`].
+/// Maps a camera zoom level (`1` = Far, `2` = Medium, `3` = Near) to [`ZoomLevel`].
 pub fn zoom_level_from_u32(zoom: u32) -> ZoomLevel {
-    match zoom {
-        0 => ZoomLevel::Far,
-        1 => ZoomLevel::Medium,
-        _ => ZoomLevel::Near,
-    }
+    ZoomLevel::from_zoom(zoom)
+}
+
+/// Returns whether `name` is a native stereo/TV turn-off HIT event.
+pub fn is_radio_stop_event(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    lower == "tv_turn_off" || lower == "stereo_turnoff" || lower.starts_with("stereo_turnoff_")
 }
 
 /// Maps a SimAntics/HIT stereo or television play event name to its built-in
 /// streaming [`BuiltinStation`], if any.
+///
+/// Covers both direct station names (`radio_rock`, `tv_comedy`) and Complete
+/// Collection 1.91's native HIT event aliases (`tv_action_cheap`, `tv_cartoon_mod`,
+/// `stereo_rock_exp`, `stereo_jazz_cheap`, etc.).
 pub fn station_for_sound_event(name: &str) -> Option<BuiltinStation> {
     let lower = name.trim().to_ascii_lowercase();
-    match lower.as_str() {
+    let base = lower
+        .strip_suffix("_cheap")
+        .or_else(|| lower.strip_suffix("_mod"))
+        .or_else(|| lower.strip_suffix("_exp"))
+        .unwrap_or(lower.as_str());
+    match base {
         "radio_country" | "stereo_country" => Some(BuiltinStation::Country),
         "radio_rock" | "stereo_rock" => Some(BuiltinStation::Rock),
-        "radio_latin" | "stereo_latin" => Some(BuiltinStation::Latin),
+        "radio_latin" | "stereo_latin" | "radio_jazz" | "stereo_jazz" => {
+            Some(BuiltinStation::Latin)
+        }
         "radio_classical" | "radio_classica" | "stereo_classical" => {
             Some(BuiltinStation::Classical)
         }
-        "radio_countrydance" | "radio_countryd" | "stereo_countrydance" => {
+        "radio_countrydance" | "radio_countryd" | "stereo_countrydance" | "stereo_countryd" => {
             Some(BuiltinStation::CountryDance)
         }
         "radio_rap" | "stereo_rap" => Some(BuiltinStation::Rap),
         "radio_rave" | "stereo_rave" => Some(BuiltinStation::Rave),
         "radio_disco" | "stereo_disco" => Some(BuiltinStation::Disco),
         "radio_beach" | "stereo_beach" => Some(BuiltinStation::Beach),
-        "radio_ez" | "radio_easylistening" | "stereo_ez" => Some(BuiltinStation::EasyListening),
+        "radio_ez" | "radio_easylistening" | "stereo_ez" | "stereo_easylistening" => {
+            Some(BuiltinStation::EasyListening)
+        }
         "radio_ezexp" | "stereo_ezexp" => Some(BuiltinStation::EasyListeningExp),
-        "radio_unlcheap" | "radio_oldtown" => Some(BuiltinStation::UnleashedCheap),
-        "radio_unlspeak" | "radio_zydeco" => Some(BuiltinStation::UnleashedSpeakeasy),
+        "radio_unlcheap" | "radio_oldtown" | "stereo_unlcheap" | "stereo_oldtown" => {
+            Some(BuiltinStation::UnleashedCheap)
+        }
+        "radio_unlspeak" | "radio_zydeco" | "stereo_unlspeak" | "stereo_zydeco" => {
+            Some(BuiltinStation::UnleashedSpeakeasy)
+        }
         "radio_superstar" | "stereo_superstar" => Some(BuiltinStation::Superstar),
         "tv_romance" | "tv_play_romance" => Some(BuiltinStation::TvRomance),
         "tv_action" | "tv_play_action" => Some(BuiltinStation::TvAction),
-        "tv_comedy" | "tv_comedy_cartoon" | "tv_play_comedy" => Some(BuiltinStation::TvComedy),
+        "tv_comedy" | "tv_comedy_cartoon" | "tv_cartoon" | "tv_play_comedy" => {
+            Some(BuiltinStation::TvComedy)
+        }
         "tv_mystery" | "tv_horror" | "tv_play_mystery" => Some(BuiltinStation::TvMystery),
         "tv_animal" | "tv_play_animal" => Some(BuiltinStation::TvAnimal),
         "tv_entertainment" | "tv_play_entertainment" => Some(BuiltinStation::TvEntertainment),
@@ -989,7 +1010,9 @@ impl Mixer {
                             self.radio.stop_emitter(*object);
                         }
                         SoundEvent::Play { object, name } => {
-                            if let Some(station) = station_for_sound_event(name) {
+                            if is_radio_stop_event(name) {
+                                self.radio.stop_emitter(*object);
+                            } else if let Some(station) = station_for_sound_event(name) {
                                 let spatial = self.spatial_for_emitter(*object);
                                 if self.radio.tune(*object, station, spatial) {
                                     continue;

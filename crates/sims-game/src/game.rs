@@ -250,8 +250,11 @@ pub struct Game {
     cheat_sim_speed: Option<i16>,
     /// True once `Lot::restore` cleared `neighborhood_origin` (after loading a save
     /// slot or applying a world-mutating cheat), signaling `NeighborhoodShell` to
-    /// write back via `StoredNeighborhood::write_back_world`.
+    /// write back via fenced `StoredNeighborhood::write_back_world`.
     world_mutated_via_restore: bool,
+    /// Monotonic counter bumped whenever `Game::restore` resets `self.errors`
+    /// and live lot state, so `App` resets its error-log index and audio feed.
+    restore_generation: u64,
 }
 
 impl Game {
@@ -611,6 +614,7 @@ impl Game {
             cheat_autonomy: None,
             cheat_sim_speed: None,
             world_mutated_via_restore: false,
+            restore_generation: 0,
         };
         game.sync_view();
         if edit_mode && game.stopped.is_none() {
@@ -857,6 +861,7 @@ impl Game {
             cheat_autonomy: None,
             cheat_sim_speed: None,
             world_mutated_via_restore: false,
+            restore_generation: 0,
         };
         game.sync_view();
         if edit_mode && game.stopped.is_none() {
@@ -944,6 +949,11 @@ impl Game {
     /// Save Manager load or world-mutating cheat), clearing `neighborhood_origin`.
     pub fn world_mutated_via_restore(&self) -> bool {
         self.world_mutated_via_restore
+    }
+
+    /// Monotonic counter bumped on each `Game::restore` that resets `errors()`.
+    pub fn restore_generation(&self) -> u64 {
+        self.restore_generation
     }
 
     /// Marks the lot clean after an external host/REDB save succeeds.
@@ -1069,7 +1079,10 @@ impl Game {
                 }
                 CheatCommand::MoveObjects(on) => {
                     self.cheat_move_objects = on;
-                    messages.push(format!("move_objects {}", if on { "on" } else { "off" }));
+                    messages.push(format!(
+                        "move_objects {} (VM placement override pending)",
+                        if on { "on" } else { "off" }
+                    ));
                 }
                 CheatCommand::MapEdit(on) => {
                     self.cheat_map_edit = on;
@@ -1123,9 +1136,15 @@ impl Game {
         }
 
         if total_funds_delta != 0 || target_hour.is_some() {
+            let mut funds_blocked_by_edit_budget = false;
             let res = self.mutate_world_via_saved(|world| {
                 if total_funds_delta != 0 {
-                    world.budget.funds = world.budget.funds.saturating_add(total_funds_delta);
+                    if world.globals.get(32).copied().unwrap_or(0) != 0 {
+                        funds_blocked_by_edit_budget = true;
+                    } else {
+                        let next_funds = world.budget.funds.saturating_add(total_funds_delta);
+                        let _ = world.set_funds(next_funds);
+                    }
                 }
                 if let Some(hour) = target_hour {
                     if !world.globals.is_empty() {
@@ -1134,22 +1153,35 @@ impl Game {
                     if world.globals.len() > 5 {
                         world.globals[5] = 0;
                     }
+                    if world.globals.len() > 6 {
+                        world.globals[6] = 0;
+                    }
                     if world.globals.len() > 4 {
-                        // Matches `sims_render::light` (`0` day 6..=18, `1` dusk 19,
-                        // `2` night 20..=23|0..=4, `3` dawn 5).
-                        world.globals[4] = match hour {
-                            6..=18 => 0,
-                            19 => 1,
-                            5 => 3,
+                        // Matches `sims_vm::tick::time_of_day` (`0x46d525`):
+                        // `0..=5` night (2), `6` dawn (3), `7..=17` day (0),
+                        // `18` dusk (1), `19..=23` night (2).
+                        let period = match hour {
+                            0..=5 => 2,
+                            6 => 3,
+                            7..=17 => 0,
+                            18 => 1,
                             _ => 2,
                         };
+                        if world.globals[4] != period {
+                            world.globals[4] = period;
+                            world.mark_all_rooms();
+                        }
                     }
                 }
             });
             match res {
                 Ok(()) => {
                     if total_funds_delta != 0 {
-                        messages.push(format!("Added ${total_funds_delta}"));
+                        if funds_blocked_by_edit_budget {
+                            messages.push("Funds unchanged in edit-budget mode".into());
+                        } else {
+                            messages.push(format!("Added ${total_funds_delta}"));
+                        }
                     }
                     if let Some(hour) = target_hour {
                         messages.push(format!("Hour set to {hour:02}:00"));
@@ -1175,12 +1207,34 @@ impl Game {
         }
     }
 
+    /// Releases any active Buy/Build preview cursors or drags so a subsequent
+    /// `Lot::restore` never leaves stale handles in `Game`.
+    fn cancel_active_buy_build_tools(&mut self) {
+        if let Some(cursor) = self.buy_cursor.take() {
+            if cursor.is_existing() {
+                let _ = self.lot.buy_snap_back(&cursor);
+            } else {
+                let _ = self.lot.buy_cancel(&cursor);
+            }
+        }
+        self.buy_selected = None;
+        self.buy_in_house = false;
+        self.buy_dragging = None;
+        self.buy_commit_on_release = false;
+        if let Some(cursor) = self.wall_cursor.take() {
+            let _ = self.lot.build_cursor_close(&cursor);
+        }
+        self.build_drag = None;
+        self.build_preview_shape = None;
+    }
+
     /// Applies an in-place mutation to the live `World` via lossless `Saved`
     /// round-tripping while preserving UI mode, camera, and open cheat console.
     fn mutate_world_via_saved(
         &mut self,
         mutator: impl FnOnce(&mut sims_sim::World),
     ) -> Result<(), String> {
+        self.cancel_active_buy_build_tools();
         let saved = self.save()?;
         let orig_world_body = saved.world().encode();
         let encoded = saved.encode();
@@ -1623,17 +1677,37 @@ impl Game {
         }
         let moved = self.apply(Move::Scroll([dx, dy]));
         if moved && let Some(point) = self.pointer {
-            match self.hud.controls.mode {
-                Mode::Build => {
-                    let _ = self.hover_build(point);
-                }
-                Mode::Buy => {
-                    let _ = self.hover_buy(point);
-                }
-                _ => {}
-            }
+            let _ = self.refresh_mode_hover(point);
         }
         moved
+    }
+
+    /// Refreshes Buy/Build hover previews (including held furniture in Build
+    /// mode) or Live pointer following after pointer movement or edge scrolling.
+    fn refresh_mode_hover(&mut self, point: [i32; 2]) -> bool {
+        if self.hud.controls.mode == Mode::Buy {
+            if !self.hud.covers(point) || self.buy_dragging.is_some() {
+                self.hover_buy(point)
+            } else {
+                self.hide_buy_cursor()
+            }
+        } else if self.hud.controls.mode == Mode::Build {
+            if self.buy_selected.is_some() || self.buy_cursor.is_some() {
+                if !self.hud.covers(point) || self.buy_dragging.is_some() {
+                    self.hover_buy(point)
+                } else {
+                    self.hide_buy_cursor()
+                }
+            } else if !self.hud.covers(point) {
+                self.hover_build(point)
+            } else if self.build_drag.is_none() {
+                self.hide_build_cursor()
+            } else {
+                false
+            }
+        } else {
+            self.follow()
+        }
     }
 
     /// Why the lot stopped, if it has.
@@ -2343,27 +2417,7 @@ impl Game {
         let sounds = self.hud.take_sounds();
         self.keep_sounds(sounds);
         redraw |= self.highlight(point);
-        if self.hud.controls.mode == Mode::Buy {
-            if !self.hud.covers(point) || self.buy_dragging.is_some() {
-                redraw |= self.hover_buy(point);
-            } else {
-                redraw |= self.hide_buy_cursor();
-            }
-        } else if self.hud.controls.mode == Mode::Build {
-            if self.buy_selected.is_some() || self.buy_cursor.is_some() {
-                if !self.hud.covers(point) || self.buy_dragging.is_some() {
-                    redraw |= self.hover_buy(point);
-                } else {
-                    redraw |= self.hide_buy_cursor();
-                }
-            } else if !self.hud.covers(point) {
-                redraw |= self.hover_build(point);
-            } else if self.build_drag.is_none() {
-                redraw |= self.hide_build_cursor();
-            }
-        } else {
-            redraw |= self.follow();
-        }
+        redraw |= self.refresh_mode_hover(point);
         // The cutaway follows the rooms the pointer passes over, while
         // the cutaway is on and the pointer is over the lot.
         if !self.hud.covers(point) && self.view.camera.walls == Walls::Cutaway {
@@ -3357,6 +3411,7 @@ impl Game {
     pub fn restore(&mut self, saved: Saved) -> Result<(), String> {
         self.lot.restore(saved).map_err(|e| e.to_string())?;
         self.world_mutated_via_restore = true;
+        self.restore_generation = self.restore_generation.wrapping_add(1);
         self.lot_cache.clear();
         self.stopped = None;
         self.errors = Errors::default();

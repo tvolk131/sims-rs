@@ -370,6 +370,51 @@ impl AutosaveWorker {
         Ok(())
     }
 
+    /// Enqueues already-encoded [`Saved`] lot bytes onto the background worker
+    /// so the Save Manager manual slot records the exact same payload committed
+    /// to `SAVED_LOTS`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_saved_lot_bytes(
+        &self,
+        neighborhood_id: impl Into<String>,
+        expected_instance_id: u128,
+        lot_id: u32,
+        target: SaveTarget,
+        sim_tick: u64,
+        label: impl Into<String>,
+        bytes: Vec<u8>,
+    ) -> Result<(), String> {
+        let payload = SavePayload::saved_lot(bytes);
+        let mut job = match target {
+            SaveTarget::Manual => SaveJob::manual_for_instance(
+                neighborhood_id,
+                expected_instance_id,
+                lot_id,
+                sim_tick,
+                payload,
+            ),
+            SaveTarget::ManualForceReplace => SaveJob::manual_force_replace_for_instance(
+                neighborhood_id,
+                expected_instance_id,
+                lot_id,
+                sim_tick,
+                payload,
+            ),
+            SaveTarget::Autosave => SaveJob::autosave_for_instance(
+                neighborhood_id,
+                expected_instance_id,
+                lot_id,
+                sim_tick,
+                payload,
+            ),
+        }
+        .with_label(label);
+        if let Some(ts) = unix_timestamp_secs() {
+            job = job.with_saved_at_unix_secs(ts);
+        }
+        self.enqueue_job(job)
+    }
+
     /// Non-blocking drain of all completed background save jobs.
     pub fn poll_completions(&self) -> Vec<SaveCompletion> {
         let mut out = Vec::new();

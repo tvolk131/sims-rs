@@ -101,7 +101,9 @@ fn background_cow_autosave_worker_and_save_manager_end_to_end() {
     };
     assert!(tick_a >= 5);
 
-    // 1. Trigger manual save (F5 / Options -> Save) -> background worker + store.
+    // 1. Trigger manual save (F5 / Options -> Save) -> strictly fenced commit +
+    //    mirrored manual slot on background worker.
+    let gen_before_load = shell.lot_generation();
     shell.save_current_lot().expect("manual save succeeds");
     shell.flush_background_saves();
     assert_eq!(shell.pending_background_saves(), 0);
@@ -192,6 +194,10 @@ fn background_cow_autosave_worker_and_save_manager_end_to_end() {
         slot_id: "manual".into(),
     });
     assert!(!shell.save_manager_open());
+    assert!(
+        shell.lot_generation() > gen_before_load,
+        "in-place Save Manager slot load must bump lot_generation so host resets error indices & audio"
+    );
     assert_eq!(
         shell.game().expect("lot game").lot().ticks(),
         tick_a,
@@ -233,6 +239,151 @@ fn background_cow_autosave_worker_and_save_manager_end_to_end() {
         .list_saves_validated("UserData", 5, validate_save_payload)
         .expect("list final saves");
     assert!(final_slots.iter().any(|s| s.slot() == SaveSlot::Manual));
+
+    // 8. P1 #3 regression: corrupt the main SAVED_LOTS record so `enter_lot(5)` fails,
+    //    then verify Save Manager recovers directly from an intact autosave without
+    //    retrying the corrupt SAVED_LOTS record.
+    let nh_now = shell
+        .store()
+        .load_neighborhood("UserData")
+        .unwrap()
+        .expect("UserData present");
+    shell
+        .store()
+        .save_lot_and_neighborhood("UserData", 5, b"corrupt-saved-lot-bytes", &nh_now)
+        .expect("inject corrupt SAVED_LOTS record");
+    assert!(
+        shell.enter_lot(5).is_err(),
+        "entering a lot with corrupt SAVED_LOTS must fail"
+    );
+    let intact_autosave_id = final_slots
+        .iter()
+        .find_map(|s| match s.slot() {
+            SaveSlot::Autosave(seq) => Some(format!("autosave:{seq}")),
+            SaveSlot::Manual => None,
+        })
+        .expect("intact autosave exists");
+    assert!(shell.open_save_manager(Some("Corrupt SAVED_LOTS test".into())));
+    let _ = shell.handle_save_manager_command(SaveManagerCommand::FallbackToNewestIntact {
+        slot_id: intact_autosave_id,
+    });
+    assert!(
+        !shell.save_manager_open(),
+        "corrupt SAVED_LOTS recovery via Save Manager must succeed cleanly"
+    );
+    assert_eq!(shell.screen(), ScreenKind::Lot);
+
+    // 9. P1 #1 regression: advancing the neighborhood revision externally must
+    //    cause `save_current_lot()` to fail with a fencing error instead of
+    //    overwriting the newer neighborhood state.
+    let bumped_nh = shell
+        .store()
+        .load_neighborhood("UserData")
+        .unwrap()
+        .expect("UserData present");
+    shell
+        .store()
+        .save_neighborhood("UserData", &bumped_nh)
+        .expect("externally bump neighborhood revision");
+    assert!(
+        shell.save_current_lot().is_err(),
+        "stale-revision lot save must fail fencing rather than overwriting"
+    );
+    shell
+        .leave_lot(false)
+        .expect("leave lot without saving after fencing rejection");
+}
+
+#[test]
+fn restoring_pre_caf_lot_slot_preserves_newer_caf_family_and_neighbors() {
+    let Some(install) = install_dir() else {
+        eprintln!("SIMS_INSTALL is not set; skipping wave1 pre-CAF reconciliation test");
+        return;
+    };
+    let tmp = TempTestDir::new("pre-caf-reconcile");
+    let saves = tmp.path().join("saves.redb");
+
+    let mut shell = NeighborhoodShell::open(
+        install.clone(),
+        saves.clone(),
+        1,
+        false,
+        vec![3],
+        Frames::default(),
+    )
+    .expect("NeighborhoodShell opens");
+
+    // 1. Enter Lot 5, run a few ticks, save manual slot (pre-CAF!), and leave.
+    shell.enter_lot(5).expect("enter lot 5");
+    shell.game_mut().unwrap().run(4);
+    shell.save_current_lot().expect("pre-CAF manual save");
+    shell.flush_background_saves();
+    shell.leave_lot(false).expect("leave lot 5");
+
+    // 2. Create a brand-new CAF household in REDB (advancing neighborhood + NBRS).
+    let ui = sims_content::ui_graphics::UiGraphics::open(
+        &sims_content::Install::detect(&install).unwrap(),
+    )
+    .unwrap();
+    let mut caf = sims_game::caf_screen::CafSession::open(
+        &install,
+        &sims_content::Install::detect(&install).unwrap(),
+        &ui,
+    )
+    .unwrap();
+    let draft = sims_ui::caf::FamilyDraft {
+        last_name: "Persisted".into(),
+        bio: "Created after lot 5 save.".into(),
+        members: vec![SimDraft {
+            first_name: "Nova".into(),
+            bio: "Test Sim".into(),
+            kind: sims_ui::caf::MemberKind::Sim,
+            appearance: SimAppearance {
+                age: Age::Adult,
+                gender: Gender::Female,
+                skin_tone: SkinTone::Light,
+                ..SimAppearance::default()
+            },
+            personality: Personality::from_raw([5, 5, 5, 5, 5]),
+            portrait: None,
+        }],
+    };
+    let created = caf
+        .commit_family_draft(shell.store(), shell.neighborhood_id(), &draft)
+        .expect("commit CAF household");
+    let caf_guid = created.members[0].guid;
+    shell.refresh_from_store().expect("refresh after CAF");
+
+    // 3. Re-enter Lot 5, load the OLDER pre-CAF manual slot via Save Manager,
+    //    then Save & Leave!
+    shell.enter_lot(5).expect("re-enter lot 5");
+    assert!(shell.open_save_manager(None));
+    let _ = shell.handle_save_manager_command(SaveManagerCommand::LoadSlot {
+        slot_id: "manual".into(),
+    });
+    assert!(!shell.save_manager_open());
+    shell
+        .leave_lot(true)
+        .expect("Save & Leave after loading pre-CAF slot");
+
+    // 4. Verify BOTH the newer CAF family AND its NBRS neighbor record survived!
+    let final_nh = shell
+        .store()
+        .load_neighborhood("UserData")
+        .unwrap()
+        .expect("UserData present");
+    assert!(
+        final_nh.families.contains_key(&created.family_id),
+        "newer CAF family must survive restoring and saving an older lot slot"
+    );
+    assert!(
+        final_nh
+            .neighbors
+            .iter()
+            .flatten()
+            .any(|n| n.guid == caf_guid),
+        "newer CAF Sim NBRS record must survive restoring and saving an older lot slot"
+    );
 }
 
 #[test]
@@ -440,19 +591,47 @@ fn cheat_console_rosebud_chain_set_hour_and_toggles() {
     }
     let cmds = game.cheat_console_submit().expect("rosebud;!;! parses");
     assert_eq!(cmds.len(), 3);
+    let expected_funds = before_funds + 3_000;
     assert_eq!(
         game.lot().world().budget.funds,
-        before_funds + 3_000,
+        expected_funds,
         "rosebud;!;! must add $3,000"
     );
+    assert_eq!(
+        game.lot().world().globals.get(14).copied(),
+        Some((expected_funds / 10_000) as i16),
+        "split funds high global[14] must match World::set_funds"
+    );
+    assert_eq!(
+        game.lot().world().globals.get(13).copied(),
+        Some((expected_funds % 10_000) as i16),
+        "split funds low global[13] must match World::set_funds"
+    );
 
-    // Test set_hour, move_objects, map_edit, autonomy, sim_speed, water_tool, prepare_lot, help.
+    // Test set_hour (including exact VM period boundaries & zeroed seconds),
+    // move_objects, map_edit, autonomy, sim_speed, water_tool, prepare_lot, help.
+    for ch in "set_hour 6".chars() {
+        assert!(game.cheat_console_char(ch));
+    }
+    let _ = game.cheat_console_submit().expect("set_hour 6 parses");
+    assert_eq!(game.hour(), 6);
+    assert_eq!(game.lot().world().globals.get(4).copied(), Some(3)); // dawn
+    assert_eq!(game.lot().world().globals.get(6).copied(), Some(0)); // seconds cleared
+
+    for ch in "set_hour 18".chars() {
+        assert!(game.cheat_console_char(ch));
+    }
+    let _ = game.cheat_console_submit().expect("set_hour 18 parses");
+    assert_eq!(game.hour(), 18);
+    assert_eq!(game.lot().world().globals.get(4).copied(), Some(1)); // dusk
+
     for ch in "set_hour 22; move_objects on; map_edit on; autonomy 0; sim_speed 800".chars() {
         assert!(game.cheat_console_char(ch));
     }
     let _ = game.cheat_console_submit().expect("chained cheats parse");
     assert_eq!(game.hour(), 22);
     assert_eq!(game.lot().world().globals.get(4).copied(), Some(2));
+    assert_eq!(game.lot().world().globals.get(6).copied(), Some(0));
     assert!(game.cheat_move_objects());
     assert!(game.cheat_map_edit());
     assert_eq!(game.cheat_autonomy(), Some(0));
@@ -565,17 +744,32 @@ fn sound_mixer_radio_streaming_and_ambience_integration() {
         "tuned Rock stereo station should render non-zero PCM audio (track={track:?}, faults={faults:?})"
     );
 
-    // 2. SimAntics Play / StopObject routing for TV channel.
+    // 2. Native SimAntics HIT TV play & turn-off routing (`tv_action_cheap`, `tv_turn_off`).
     mixer.input(Input::Events(vec![SoundEvent::Play {
         object: 77,
-        name: "tv_comedy".into(),
+        name: "tv_action_cheap".into(),
     }]));
     assert_eq!(mixer.radio().active_emitters(), 2);
-    mixer.input(Input::Events(vec![SoundEvent::StopObject { object: 77 }]));
+    mixer.input(Input::Events(vec![SoundEvent::Play {
+        object: 77,
+        name: "tv_turn_off".into(),
+    }]));
     assert_eq!(mixer.radio().active_emitters(), 1);
 
-    // 3. Activate environmental lot ambience bed and verify zone/zoom/hour/pause wiring.
-    mixer.input(Input::Zoom(2));
+    // 3. Activate environmental lot ambience bed and verify 1..=3 zoom mapping, zone, hour, pause.
+    assert_eq!(
+        sims_game::sound::zoom_level_from_u32(1),
+        sims_audio::ambience::ZoomLevel::Far
+    );
+    assert_eq!(
+        sims_game::sound::zoom_level_from_u32(2),
+        sims_audio::ambience::ZoomLevel::Medium
+    );
+    assert_eq!(
+        sims_game::sound::zoom_level_from_u32(3),
+        sims_audio::ambience::ZoomLevel::Near
+    );
+    mixer.input(Input::Zoom(3));
     mixer.input(Input::View(100));
     mixer.input(Input::Hour(12));
     mixer.input(Input::AmbienceZone(AmbienceZone::Residential));

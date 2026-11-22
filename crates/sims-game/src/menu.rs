@@ -524,14 +524,36 @@ impl Menu {
 
     /// Lays the menus out again on a screen of `size`.
     pub fn layout(&mut self, art: &Art, size: [i32; 2]) {
-        let before = self.layouts.last().map(|l| l.center);
+        self.layout_inner(art, size, true);
+    }
+
+    fn layout_inner(&mut self, art: &Art, size: [i32; 2], rebase_anim: bool) {
+        let before_main = self.layouts.first().map(|l| l.center);
+        let before_active = self.layouts.last().map(|l| l.center);
         self.size = size;
         self.layouts = self.pie.layout(size, art).unwrap_or_default();
+        let after_main = self.layouts.first().map(|l| l.center);
+        let after_active = self.layouts.last().map(|l| l.center);
         // If a resize shifts the menu's middle during the opening gesture,
         // the opening release settles the menu instead of choosing under
         // the unmoved cursor (0x5eb45d).
-        if !self.sticky && before.is_some() && self.layouts.last().map(|l| l.center) != before {
+        if !self.sticky && before_active.is_some() && after_active != before_active {
             self.moved = true;
+        }
+        // Keep animated backdrop anchors synchronized when a resize repositions
+        // the main menu or open submenu so the dark disk never lags at the old center.
+        if rebase_anim
+            && self.anim.is_some()
+            && (after_main != before_main || after_active != before_active)
+            && let Some(main_center) = after_main
+        {
+            let mut rebased = sims_people::pie_head::PieAnimState::open(main_center, 0);
+            if self.layouts.len() > 1
+                && let Some(sub_center) = after_active
+            {
+                rebased.open_submenu(sub_center, 0);
+            }
+            self.anim = Some(rebased);
         }
     }
 
@@ -606,7 +628,7 @@ impl Menu {
             Pressed::Chose(choice) => Release::Chose(choice),
             pressed @ (Pressed::Opened { .. } | Pressed::Back) => {
                 self.sticky = true;
-                self.layout(art, self.size);
+                self.layout_inner(art, self.size, false);
                 match pressed {
                     Pressed::Opened { .. } => {
                         self.submenu_look = opening_look;

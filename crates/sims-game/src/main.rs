@@ -586,6 +586,7 @@ impl Session {
 struct App {
     session: Session,
     last_screen: ScreenKind,
+    last_lot_generation: u64,
     window: Option<Rc<Window>>,
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
     surface_size: Option<(NonZeroU32, NonZeroU32)>,
@@ -754,10 +755,26 @@ impl App {
         }
     }
 
+    fn current_lot_generation(&self) -> u64 {
+        match &self.session {
+            Session::Standalone { game, .. } => game.restore_generation(),
+            Session::Shell(shell) => shell
+                .lot_generation()
+                .wrapping_add(shell.game().map_or(0, Game::restore_generation)),
+        }
+    }
+
     fn drain_shell_audio(&mut self) {
         let screen_now = self.session.screen_kind();
-        if screen_now != self.last_screen {
+        let lot_gen = self.current_lot_generation();
+        if screen_now != self.last_screen || lot_gen != self.last_lot_generation {
+            let was_lot = self.last_screen == ScreenKind::Lot;
             self.last_screen = screen_now;
+            self.last_lot_generation = lot_gen;
+            if was_lot && screen_now == ScreenKind::Lot {
+                self.sound
+                    .send(sound::Input::Events(vec![sims_audio::SoundEvent::StopAll]));
+            }
             self.sound_feed.reset_for_lot();
             self.drag = None;
             self.printed = 0;
@@ -1089,6 +1106,19 @@ impl App {
         let now = Instant::now();
         let (clock_us, step_us) = self.wake_clock.elapsed_us(now);
         self.drain_shell_audio();
+        let save_manager_open = matches!(
+            &self.session,
+            Session::Shell(shell) if shell.save_manager_open()
+        );
+        if save_manager_open {
+            self.wake_clock.finish(now, Instant::now(), false);
+            let redraw = match &mut self.session {
+                Session::Shell(shell) => shell.poll_background_saves(),
+                Session::Standalone { .. } => false,
+            };
+            self.changed(redraw, false);
+            return;
+        }
         let Some(game) = self.session.game_mut() else {
             self.wake_clock.finish(now, Instant::now(), false);
             let redraw = match &mut self.session {
@@ -1109,7 +1139,8 @@ impl App {
         let pie_anim = game.pie_animating();
         redraw |= scrolled || pie_anim || game.spin_due() || game.blink_due();
         self.sound_feed.update(game, |input| self.sound.send(input));
-        for error in &game.errors()[self.printed..] {
+        let start = self.printed.min(game.errors().len());
+        for error in &game.errors()[start..] {
             eprintln!("sims-game: error caught: {error}");
         }
         self.printed = game.errors().len();
@@ -1468,7 +1499,38 @@ impl ApplicationHandler for App {
                     self.handle_shell_outcome(event_loop, out);
                     return;
                 }
-                if self.session.game().is_some_and(Game::cheat_console_open)
+                if self.session.screen_kind() == ScreenKind::CreateFamily
+                    && let Session::Shell(shell) = &mut self.session
+                {
+                    let out = match &event.logical_key {
+                        Key::Named(NamedKey::Backspace) => shell.key_backspace(),
+                        Key::Named(NamedKey::Delete) => shell.key_delete(),
+                        Key::Named(NamedKey::ArrowLeft) => shell.key_left(),
+                        Key::Named(NamedKey::ArrowRight) => shell.key_right(),
+                        Key::Named(NamedKey::Home) => shell.key_home(),
+                        Key::Named(NamedKey::End) => shell.key_end(),
+                        Key::Named(NamedKey::Tab) => shell.key_tab(),
+                        Key::Named(NamedKey::Enter) if !event.repeat => shell.key_enter(),
+                        Key::Named(NamedKey::Escape) if !event.repeat => shell.escape(),
+                        Key::Named(NamedKey::Space) => shell.key_char(' '),
+                        _ => {
+                            let mut combined = ShellOutcome::default();
+                            if !self.ctrl_or_cmd_held
+                                && let Some(text) = &event.text
+                            {
+                                for ch in text.chars() {
+                                    let o = shell.key_char(ch);
+                                    combined.redraw |= o.redraw;
+                                }
+                            }
+                            combined
+                        }
+                    };
+                    self.handle_shell_outcome(event_loop, out);
+                    return;
+                }
+                if !self.session.has_dialog()
+                    && self.session.game().is_some_and(Game::cheat_console_open)
                     && let Some(game) = self.session.game_mut()
                 {
                     let mut changed = false;
@@ -1518,36 +1580,6 @@ impl ApplicationHandler for App {
                         }
                     }
                     self.changed(changed, true);
-                    return;
-                }
-                if self.session.screen_kind() == ScreenKind::CreateFamily
-                    && let Session::Shell(shell) = &mut self.session
-                {
-                    let out = match &event.logical_key {
-                        Key::Named(NamedKey::Backspace) => shell.key_backspace(),
-                        Key::Named(NamedKey::Delete) => shell.key_delete(),
-                        Key::Named(NamedKey::ArrowLeft) => shell.key_left(),
-                        Key::Named(NamedKey::ArrowRight) => shell.key_right(),
-                        Key::Named(NamedKey::Home) => shell.key_home(),
-                        Key::Named(NamedKey::End) => shell.key_end(),
-                        Key::Named(NamedKey::Tab) => shell.key_tab(),
-                        Key::Named(NamedKey::Enter) if !event.repeat => shell.key_enter(),
-                        Key::Named(NamedKey::Escape) if !event.repeat => shell.escape(),
-                        Key::Named(NamedKey::Space) => shell.key_char(' '),
-                        _ => {
-                            let mut combined = ShellOutcome::default();
-                            if !self.ctrl_or_cmd_held
-                                && let Some(text) = &event.text
-                            {
-                                for ch in text.chars() {
-                                    let o = shell.key_char(ch);
-                                    combined.redraw |= o.redraw;
-                                }
-                            }
-                            combined
-                        }
-                    };
-                    self.handle_shell_outcome(event_loop, out);
                     return;
                 }
                 if self.session.has_dialog() {
@@ -1992,6 +2024,7 @@ fn run() -> Result<(), String> {
                 saved_optn,
             },
             last_screen: ScreenKind::Lot,
+            last_lot_generation: 0,
             window: None,
             surface: None,
             surface_size: None,
@@ -2079,6 +2112,7 @@ fn run() -> Result<(), String> {
     let mut app = App {
         session: Session::Shell(Box::new(shell)),
         last_screen: ScreenKind::Neighborhood,
+        last_lot_generation: 0,
         window: None,
         surface: None,
         surface_size: None,
