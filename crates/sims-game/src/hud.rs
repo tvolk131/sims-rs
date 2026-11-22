@@ -328,46 +328,57 @@ impl Hud {
         world: &World,
         friendship: i32,
     ) -> Result<Self, String> {
-        let install = Install::detect(install).map_err(|e| e.to_string())?;
-        let pool = Arc::new(ArchivePool::new());
-        let static_part = HudStatic::load(&install, Arc::clone(&pool))?;
         let neighborhood = house
             .parent()
             .and_then(Path::parent)
             .ok_or("the house file is not in a Houses folder")?;
         let neighborhood = Neighborhood::open(neighborhood).map_err(|e| e.to_string())?;
+        let number = neighborhood
+            .houses()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|(_, path)| path.file_name() == house.file_name())
+            .map(|(n, _)| n);
+        let members = number
+            .and_then(|n| neighborhood.family_in(n))
+            .map(|(_, f)| f.members.clone())
+            .unwrap_or_default();
+        Self::open_with_members(install, members, assets, world, friendship)
+    }
+
+    /// Reads the art and faces for a lot whose occupying household members
+    /// come from a `NeighborhoodStore` rather than a `Houses/HouseXX.iff` path.
+    pub fn open_with_members(
+        install: &Path,
+        members: Vec<u32>,
+        assets: &Assets,
+        world: &World,
+        friendship: i32,
+    ) -> Result<Self, String> {
+        let install = Install::detect(install).map_err(|e| e.to_string())?;
+        let pool = Arc::new(ArchivePool::new());
+        let static_part = HudStatic::load(&install, Arc::clone(&pool))?;
         // Load Careers + Tuning in parallel with Faces while deferring their
-        // error checks until after `neighborhood.houses()` and `Faces::load`.
-        let (shared_res, faces_and_members) = std::thread::scope(|scope| {
+        // error checks until after `Faces::load`.
+        let (shared_res, faces_res) = std::thread::scope(|scope| {
             let shared_handle =
                 scope.spawn(|| HudShared::load(assets.index(), assets.catalog(), &pool));
-            let faces_and_members = (|| -> Result<_, String> {
-                let number = neighborhood
-                    .houses()
-                    .map_err(|e| e.to_string())?
-                    .into_iter()
-                    .find(|(_, path)| path.file_name() == house.file_name())
-                    .map(|(n, _)| n);
-                let members = number
-                    .and_then(|n| neighborhood.family_in(n))
-                    .map(|(_, f)| f.members.clone())
-                    .unwrap_or_default();
+            let faces_res = {
                 let mut people = members.clone();
                 for record in world.neighbors.slots.iter().flatten() {
                     if !people.contains(&record.guid) {
                         people.push(record.guid);
                     }
                 }
-                let faces = Faces::load_with_pool(assets.index(), assets.catalog(), &people, &pool)
-                    .map_err(|e| e.to_string())?;
-                Ok((members, faces))
-            })();
+                Faces::load_with_pool(assets.index(), assets.catalog(), &people, &pool)
+                    .map_err(|e| e.to_string())
+            };
             (
                 shared_handle.join().expect("hud shared worker panicked"),
-                faces_and_members,
+                faces_res,
             )
         });
-        let (members, faces) = faces_and_members?;
+        let faces = faces_res?;
         let shared_part = shared_res?;
         Ok(Self::assemble(
             &install,
@@ -405,6 +416,32 @@ impl Hud {
             .and_then(|n| neighborhood.family_in(n))
             .map(|(_, f)| f.members.clone())
             .unwrap_or_default();
+        Self::from_preloaded_with_members(
+            install,
+            members,
+            assets,
+            world,
+            friendship,
+            static_part,
+            shared_part,
+            pool,
+        )
+    }
+
+    /// Builds a [`Hud`] from preloaded [`HudStatic`] and [`HudShared`] tables
+    /// for a lot whose occupying household members are already known (e.g. from
+    /// a REDB `NeighborhoodStore` snapshot).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_preloaded_with_members(
+        install: &Install,
+        members: Vec<u32>,
+        assets: &Assets,
+        world: &World,
+        friendship: i32,
+        static_part: HudStatic,
+        shared_part: Result<HudShared, String>,
+        pool: &ArchivePool,
+    ) -> Result<Self, String> {
         let mut people = members.clone();
         for record in world.neighbors.slots.iter().flatten() {
             if !people.contains(&record.guid) {

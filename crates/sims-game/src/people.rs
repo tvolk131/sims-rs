@@ -18,7 +18,9 @@ use sims_formats::bitmap::Image;
 use sims_people::pie_head::Look;
 use sims_render::{Camera, Canvas};
 use sims_sim::World;
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Radius of the dark radial shading circle behind the pie menu (`[0x6c4708]`,
 /// `0x4ac8ff`).
@@ -174,9 +176,71 @@ pub fn composite_pie_head(
 /// How many different problems are kept; later ones are dropped.
 const KEPT: usize = 256;
 
+/// Temporary directory holding REDB-materialized `Characters/` files for the
+/// lifetime of a [`People`] cast, removed automatically on drop.
+struct TempCastDir(PathBuf);
+
+impl TempCastDir {
+    fn create() -> Result<Self, String> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let pid = std::process::id();
+        let base = std::env::temp_dir();
+        for _ in 0..1024 {
+            let seq = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let path = base.join(format!("sims-rs-cast-{pid}-{seq}"));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(format!(
+                        "creating temporary cast directory {}: {e}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        Err("could not allocate a unique temporary cast directory".into())
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempCastDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Joins a relative REDB character key under `base`, splitting on both `/` and
+/// `\` (matching `sims_content::Index::add_character_files` on Unix and
+/// Windows) and rejecting absolute paths, parent traversal (`..`), or drive
+/// prefixes.
+fn safe_relative_path(base: &Path, rel: &str) -> Option<PathBuf> {
+    if rel.starts_with('/') || rel.starts_with('\\') {
+        return None;
+    }
+    let mut out = base.to_path_buf();
+    let mut has_component = false;
+    for part in rel.split(['/', '\\']) {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." || part.contains(':') || part.contains('\0') {
+            return None;
+        }
+        out.push(part);
+        has_component = true;
+    }
+    has_component.then_some(out)
+}
+
 /// The people of a lot, and what went wrong drawing them.
 pub struct People {
     people: sims_people::People,
+    /// Keeps any REDB-staged character cast directory alive for `sims_people::Cast`.
+    _temp_cast_dir: Option<TempCastDir>,
     /// What went wrong, one line each, each said once, for the host to
     /// show.
     pub problems: Vec<String>,
@@ -194,8 +258,69 @@ impl People {
     pub(crate) fn from_inner(people: sims_people::People) -> Self {
         Self {
             people,
+            _temp_cast_dir: None,
             problems: Vec::new(),
         }
+    }
+
+    /// Reads the people's files from the install at `root`, and the cast
+    /// of `neighborhood_dir` (`UserData`, `UserData2`..`UserData8`), without
+    /// requiring a house file on disk.
+    pub fn open_neighborhood(root: &Path, neighborhood_dir: &Path) -> Result<Self, String> {
+        let assets = sims_people::Assets::scan(root)?;
+        let library = sims_people::Library::scan(&assets)?;
+        let cast = sims_people::Cast::open(root, neighborhood_dir)?;
+        Ok(Self::from_inner(sims_people::People::new(
+            assets, library, cast,
+        )))
+    }
+
+    /// Reads the people's files from the install at `root` and builds the
+    /// neighborhood character cast directly from REDB's `character_files`
+    /// snapshot, matching the VM and HUD even for REDB-only or
+    /// `TemplateUserData`-imported characters without reading loose `UserData`
+    /// files on disk.
+    pub fn open_from_character_files(
+        root: &Path,
+        character_files: &BTreeMap<String, Vec<u8>>,
+    ) -> Result<Self, String> {
+        let staging = TempCastDir::create()?;
+        let empty_iff = sims_formats::iff::write(&[])
+            .map_err(|e| format!("writing staged Neighborhood.iff: {e}"))?;
+        std::fs::write(staging.path().join("Neighborhood.iff"), empty_iff)
+            .map_err(|e| format!("staging Neighborhood.iff: {e}"))?;
+        if !character_files.is_empty() {
+            let chars_dir = staging.path().join("Characters");
+            std::fs::create_dir_all(&chars_dir)
+                .map_err(|e| format!("creating staged Characters dir: {e}"))?;
+            for (rel, bytes) in character_files {
+                let is_dir = rel.ends_with('/') || rel.ends_with('\\');
+                let trimmed = rel.trim_end_matches(['/', '\\']);
+                let Some(dest) = safe_relative_path(&chars_dir, trimmed) else {
+                    continue;
+                };
+                if is_dir {
+                    std::fs::create_dir_all(&dest)
+                        .map_err(|e| format!("creating staged dir {}: {e}", dest.display()))?;
+                } else {
+                    if let Some(parent) = dest.parent() {
+                        std::fs::create_dir_all(parent).map_err(|e| {
+                            format!("creating staged parent {}: {e}", parent.display())
+                        })?;
+                    }
+                    std::fs::write(&dest, bytes)
+                        .map_err(|e| format!("staging character {}: {e}", dest.display()))?;
+                }
+            }
+        }
+        let assets = sims_people::Assets::scan(root)?;
+        let library = sims_people::Library::scan(&assets)?;
+        let cast = sims_people::Cast::open(root, staging.path())?;
+        Ok(Self {
+            people: sims_people::People::new(assets, library, cast),
+            _temp_cast_dir: Some(staging),
+            problems: Vec::new(),
+        })
     }
 
     /// Follows `world`: loads the people who appeared or changed clothes
@@ -392,5 +517,22 @@ mod tests {
         assert_eq!(edge.color[0], [5, 110, 15]);
         assert_eq!(edge.color[3 * 10 + 3], [200, 40, 20]);
         assert_eq!(edge.color[4 * 10 + 4], [10, 20, 30]);
+    }
+
+    #[test]
+    fn safe_relative_path_normalizes_both_separators_and_rejects_traversal() {
+        let base = Path::new("/tmp/cast/Characters");
+        assert_eq!(
+            safe_relative_path(base, r"ignored.dir\Sim.iff"),
+            Some(base.join("ignored.dir").join("Sim.iff"))
+        );
+        assert_eq!(
+            safe_relative_path(base, "sub/User00001.iff"),
+            Some(base.join("sub").join("User00001.iff"))
+        );
+        assert_eq!(safe_relative_path(base, r"..\escape.iff"), None);
+        assert_eq!(safe_relative_path(base, "/abs.iff"), None);
+        assert_eq!(safe_relative_path(base, r"\abs.iff"), None);
+        assert_eq!(safe_relative_path(base, r"C:\drive.iff"), None);
     }
 }
