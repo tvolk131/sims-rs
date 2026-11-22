@@ -220,11 +220,22 @@ impl Game {
     pub fn open(options: &Options) -> Result<Self, String> {
         let house = &options.house;
         let opened = open_house(&options.install, house).map_err(|e| e.to_string())?;
-        let mut lot = Lot::load(
+        let initial_centre = sims_render::Lot::from_world(&opened.world)
+            .ok()
+            .and_then(|shape| {
+                let shape = shape.with_floor_rotation(opened.rotation);
+                let view = View::new([800, 600], shape.built_center(), opened.rotation);
+                let mut camera = view.camera;
+                camera.origin[0] = camera.origin[0].saturating_add(pick::ORIGIN_COLUMN);
+                sims_render::screen_centre_pick(&shape, &camera, [800, 600])
+                    .map(|[x, y]| [(x >> 4) as i8, (y >> 4) as i8])
+            });
+        let mut lot = Lot::load_viewed(
             &options.install,
             house,
             &options.answers,
             options.frames.clone(),
+            initial_centre,
         )
         .map_err(|e| format!("{}: {e}", house.display()))?;
         // The player answers a dialog when it is shown.
@@ -1102,10 +1113,12 @@ impl Game {
                     }
                 }
                 UiEffectEvent::Relationship { guid, highlight } => {
+                    // `0x4769ca` resolves the first `cWinRelationship` control
+                    // without comparing neighbor identity, so a clear for any
+                    // valid neighbor clears the single active highlight.
+                    self.highlighted_relationships.clear();
                     if highlight {
                         self.highlighted_relationships.insert(guid);
-                    } else {
-                        self.highlighted_relationships.remove(&guid);
                     }
                 }
             }
@@ -1266,6 +1279,13 @@ impl Game {
             &self.pace,
             status.as_deref(),
             sell.as_ref(),
+            &mut self.canvas,
+        );
+        draw_ui_effect_highlights(
+            self.hud.items(),
+            &self.highlighted_buttons,
+            &self.highlighted_portraits,
+            !self.highlighted_relationships.is_empty(),
             &mut self.canvas,
         );
         // The help balloon closed by the selection's going.
@@ -3504,6 +3524,87 @@ impl Errors {
     }
 }
 
+/// Highlight colour drawn around HUD controls targeted by UI Effect (opcode 34,
+/// `0x476485` / `0x47690d` / `0x4769c3` → `0x5de13f`).
+const UI_EFFECT_HIGHLIGHT_RGB: [u8; 3] = [255, 224, 64];
+
+/// Outlines any laid-out HUD items currently highlighted by UI Effect
+/// (opcode 34, `0x44acff`). Returns immediately when no highlight is active so
+/// ordinary frames and ratchet captures are untouched.
+fn draw_ui_effect_highlights(
+    items: &[sims_ui::hud::Item],
+    highlighted_buttons: &BTreeSet<i16>,
+    highlighted_portraits: &BTreeSet<u32>,
+    highlight_relationship: bool,
+    canvas: &mut Canvas,
+) {
+    if highlighted_buttons.is_empty() && highlighted_portraits.is_empty() && !highlight_relationship
+    {
+        return;
+    }
+    let mut relationship_drawn = false;
+    for item in items {
+        let matched = match &item.kind {
+            sims_ui::hud::Kind::Button { id, .. }
+            | sims_ui::hud::Kind::Toggle { id, .. }
+            | sims_ui::hud::Kind::Cell { id, .. } => {
+                i16::try_from(*id).is_ok_and(|k| highlighted_buttons.contains(&k))
+            }
+            sims_ui::hud::Kind::Pause { .. } => i16::try_from(sims_ui::hud::id::PAUSE)
+                .is_ok_and(|k| highlighted_buttons.contains(&k)),
+            sims_ui::hud::Kind::Portrait { guid, .. } => highlighted_portraits.contains(guid),
+            sims_ui::hud::Kind::Relation { .. }
+                if highlight_relationship && !relationship_drawn =>
+            {
+                relationship_drawn = true;
+                true
+            }
+            _ => false,
+        };
+        if matched {
+            draw_highlight_rect(canvas, item.rect, UI_EFFECT_HIGHLIGHT_RGB);
+        }
+    }
+}
+
+/// Draws a 2-pixel rectangular outline around `rect` clipped to `canvas`.
+fn draw_highlight_rect(canvas: &mut Canvas, rect: sims_ui::frame::Rect, rgb: [u8; 3]) {
+    if rect.width <= 0 || rect.height <= 0 || canvas.width == 0 || canvas.height == 0 {
+        return;
+    }
+    let cw = canvas.width as i32;
+    let ch = canvas.height as i32;
+    let x0 = rect.x;
+    let y0 = rect.y;
+    let x1 = rect.x.saturating_add(rect.width).saturating_sub(1);
+    let y1 = rect.y.saturating_add(rect.height).saturating_sub(1);
+    let mut put = |x: i32, y: i32| {
+        if x >= 0 && x < cw && y >= 0 && y < ch {
+            let idx = y as usize * canvas.width + x as usize;
+            if let Some(px) = canvas.color.get_mut(idx) {
+                *px = rgb;
+            }
+        }
+    };
+    for inset in 0..2 {
+        let lx = x0.saturating_add(inset);
+        let rx = x1.saturating_sub(inset);
+        let ty = y0.saturating_add(inset);
+        let by = y1.saturating_sub(inset);
+        if lx > rx || ty > by {
+            break;
+        }
+        for x in lx.max(0)..=rx.min(cw - 1) {
+            put(x, ty);
+            put(x, by);
+        }
+        for y in ty.max(0)..=by.min(ch - 1) {
+            put(lx, y);
+            put(rx, y);
+        }
+    }
+}
+
 /// Adds `items` to the requests the host has yet to take, keeping at
 /// most `kept`: the oldest go first.
 fn keep<T>(queue: &mut VecDeque<T>, items: Vec<T>, kept: usize) {
@@ -4414,5 +4515,79 @@ mod tests {
             lot_point(&near, &lot, [424, 392, 1]),
             lot_point(&near, &lot, [4520, 392, 1])
         );
+    }
+
+    #[test]
+    fn ui_effect_highlights_outline_buttons_portraits_and_first_relationship_control() {
+        let relation = |guid: u32, id: i16| sims_ui::household::Relation {
+            guid,
+            id,
+            daily: 10,
+            lifetime: 5,
+            friends: false,
+            pink_heart: false,
+            red_heart: false,
+            star: false,
+            family: false,
+        };
+        let items = vec![
+            sims_ui::hud::Item {
+                rect: sims_ui::frame::Rect::new(2, 2, 10, 10),
+                kind: sims_ui::hud::Kind::Button {
+                    id: sims_ui::hud::id::LIVE,
+                    cells: 4,
+                    selected: false,
+                },
+                command: None,
+            },
+            sims_ui::hud::Item {
+                rect: sims_ui::frame::Rect::new(16, 2, 10, 10),
+                kind: sims_ui::hud::Kind::Portrait {
+                    guid: 0x1111_2222,
+                    selected: false,
+                },
+                command: None,
+            },
+            sims_ui::hud::Item {
+                rect: sims_ui::frame::Rect::new(30, 2, 10, 10),
+                kind: sims_ui::hud::Kind::Relation {
+                    relation: relation(0xAAAA_0001, 1),
+                    lit: false,
+                },
+                command: None,
+            },
+            sims_ui::hud::Item {
+                rect: sims_ui::frame::Rect::new(44, 2, 10, 10),
+                kind: sims_ui::hud::Kind::Relation {
+                    relation: relation(0xAAAA_0002, 2),
+                    lit: false,
+                },
+                command: None,
+            },
+        ];
+
+        // Empty highlight sets leave the canvas untouched.
+        let mut canvas = Canvas::new(64, 20, [0, 0, 0]);
+        draw_ui_effect_highlights(
+            &items,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            false,
+            &mut canvas,
+        );
+        assert!(canvas.color.iter().all(|&px| px == [0, 0, 0]));
+
+        // Active highlights draw the outline on the matching button, portrait,
+        // and only the first relationship control (matching 0x4769ca).
+        let buttons = BTreeSet::from([sims_ui::hud::id::LIVE as i16]);
+        let portraits = BTreeSet::from([0x1111_2222u32]);
+        draw_ui_effect_highlights(&items, &buttons, &portraits, true, &mut canvas);
+        let pixel = |c: &Canvas, x: usize, y: usize| c.color[y * c.width + x];
+        assert_eq!(pixel(&canvas, 2, 2), UI_EFFECT_HIGHLIGHT_RGB);
+        assert_eq!(pixel(&canvas, 16, 2), UI_EFFECT_HIGHLIGHT_RGB);
+        assert_eq!(pixel(&canvas, 30, 2), UI_EFFECT_HIGHLIGHT_RGB);
+        assert_eq!(pixel(&canvas, 44, 2), [0, 0, 0]);
+        // Interior pixels stay untouched.
+        assert_eq!(pixel(&canvas, 6, 6), [0, 0, 0]);
     }
 }
