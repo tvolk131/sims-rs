@@ -226,6 +226,7 @@ impl<'a> Player<'a> {
                     layer.phase.to_f32(),
                     layer.mode == 1,
                     interpolate,
+                    Some(layer.frames),
                     layer.weight.to_f32(),
                 );
             }
@@ -266,6 +267,7 @@ impl<'a> Player<'a> {
                 layer.phase.to_f32(),
                 layer.mode == 1,
                 interpolate,
+                Some(layer.frames),
                 layer.weight.to_f32(),
             );
         }

@@ -23,7 +23,8 @@ diagonal triangles.
   shadows (`0x4ae844`). For `rot_val < 0x10`, `Sims.exe` draws `GameData/floors.iff`
   `SPR2 0x400 + zoom * 16 + rot_val` (frame 0; far `31×16`, medium `63×32`, near `127×64`); for
   `rot_val == 0x10`, it draws built-in floor `12` (`12 + [0, 256, 512][zoom]`). Position uses
-  `shadow_origin`, Z-tested via `0x4c811f` (`d <= dst_d`, room light + lamp pools).
+  `shadow_origin`, Z-tested via `0x4c811f` (`d <= dst_d`, room light + lamp pools), clipped to the
+  active house viewport bottom (`0x4c81b1`–`0x4c81c0`).
 - **Inner-corner coping patches (`0x4ae710`–`0x4ae83e` → `0x461e39`, table `[0x6e52a0..0x6e52c8]`
   at `0x461d2f`–`0x461e38`):** Four rules inspect `self_val` and two orthogonal neighbors to detect
   L-shaped inner corners, rotate the 4-bit mask right by `rotation & 3`, and draw
@@ -53,7 +54,8 @@ diagonal triangles.
     smooth shoreline transitions, unconditionally writing row depth `ground + 0x50` (`floor_base + 15`,
     stepping along `R[y - origin_y]` anchored at `at[1]`, `0x4c1f9d`–`0x4c1fb1`).
   - `a5 == 31` (`byte0 >= 248`, including the `254` water interior): opaque copy with the same
-    unconditional row depth write.
+    unconditional row depth write, clipped to the active house viewport bottom
+    (`0x4c1a4a`–`0x4c1a8c`).
 - **Verification:** Visually verified on `House08.iff` (river/pond) and `House28.iff` (beach pond
   + pool deck `0x10`), and integration-tested across all 4 rotations × 3 zooms on House02, House08,
   House28, and Build Mode Part 2 dug pools & painted ponds (including `LotCache` invalidation via
@@ -61,11 +63,13 @@ diagonal triangles.
 
 ### 3. `cAnimLayer::Update` (`0x597f1b`–`0x597f38`) Per-Layer `interpolate` Flag
 
-- **Formula (`0x597f1b`–`0x597f38`, `0x59844d`–`0x5985f8`):** Under x87 24-bit significand
-  precision, `cAnimLayer::Update` computes `frame_ms = duration / frames`, `threshold = 2 * frame_ms`,
-  and `elapsed = float(current - previous)`. It sets `interpolate = true` iff `elapsed < threshold`
-  (or unordered), and clears `interpolate = false` when `elapsed >= threshold`, snapping directly to
-  keyframe `floor(phase * frames)` while preserving `weight < 1.0` pose blending.
+- **Formula (`0x597f1b`–`0x597f38`, `0x597ebb`–`0x597f18`, `0x59844d`–`0x5985f8`):** Under x87 24-bit
+  significand precision, `cAnimLayer::Update` computes `frame_ms = duration / frames`,
+  `threshold = 2 * frame_ms`, and `elapsed = float(current - previous)`. It sets
+  `interpolate = true` iff `elapsed < threshold` (or unordered), and clears `interpolate = false`
+  when `elapsed >= threshold`, snapping directly to the layer-wide keyframe index
+  `floor(phase * layer_frames)` (`0x597ebb`–`0x597f18`, reused across translation and rotation at
+  `0x59846e`/`0x59852c`) while preserving `weight < 1.0` pose blending.
 - **Hash- & serialization-preserving design:** Implemented as `Layer::interpolate(&self) -> bool` in
   `crates/sims-sim/src/animator.rs` (zero new struct fields, keeping `World` serialization and the
   43,200-tick Goth day hash `df6eb544be87b93233011f355999ac9abb0c36dc5e914f2f7c0fe2f49967b19a`
@@ -94,8 +98,9 @@ diagonal triangles.
 
 - Replaced the `0.5`-tile sub-cell boolean approximation in `draw_roof_layer` with exact per-triangle
   `SubCell::{Empty, Full, Split0011(u8), Split1001(u8)}` clipping against `Lot::halves` /
-  `Lot::room_at` centroids, setting eave distance `0` on non-full sub-cells and eliminating roof
-  overhang onto the outdoor triangle of split-diagonal tiles.
+  `Lot::room_at` centroids, deriving gable eaves and exposed gable-end walls strictly from
+  triangle-owned cardinal edges (`SubCell::owns_edge`) so split-diagonal roofs never overhang or
+  emit walls onto the outdoor triangle.
 
 ## Changes
 

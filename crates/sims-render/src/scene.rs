@@ -1069,6 +1069,7 @@ impl<'a> Painter<'a> {
         } else {
             self.assets.floor_with_pools(12, zoom)
         };
+        let clip_bottom = self.clip_bottom;
         if let Some((image, pools)) = main {
             let row_depth = |sy| depth.floor_row(base_d, first_row, sy);
             match (Light::drawn_byte(byte, brightest), pools) {
@@ -1081,13 +1082,25 @@ impl<'a> Painter<'a> {
                         }
                         Light::from_sum(sum)
                     };
-                    self.canvas
-                        .draw_floor_shaded(image, at, None, light, row_depth);
+                    self.canvas.draw_floor_shaded_clipped(
+                        image,
+                        at,
+                        None,
+                        clip_bottom,
+                        light,
+                        row_depth,
+                    );
                 }
                 _ => {
                     let flat_light = Light::from_byte(byte, brightest);
-                    self.canvas
-                        .draw_floor_shaded(image, at, None, |_, _| flat_light, row_depth);
+                    self.canvas.draw_floor_shaded_clipped(
+                        image,
+                        at,
+                        None,
+                        clip_bottom,
+                        |_, _| flat_light,
+                        row_depth,
+                    );
                 }
             }
         }
@@ -1126,13 +1139,25 @@ impl<'a> Painter<'a> {
                         }
                         Light::from_sum(sum)
                     };
-                    self.canvas
-                        .draw_floor_shaded(image, cat, None, light, row_depth);
+                    self.canvas.draw_floor_shaded_clipped(
+                        image,
+                        cat,
+                        None,
+                        clip_bottom,
+                        light,
+                        row_depth,
+                    );
                 }
                 _ => {
                     let flat_light = Light::from_byte(byte, brightest);
-                    self.canvas
-                        .draw_floor_shaded(image, cat, None, |_, _| flat_light, row_depth);
+                    self.canvas.draw_floor_shaded_clipped(
+                        image,
+                        cat,
+                        None,
+                        clip_bottom,
+                        |_, _| flat_light,
+                        row_depth,
+                    );
                 }
             }
         }
@@ -1174,9 +1199,11 @@ impl<'a> Painter<'a> {
         let depth = &self.depth;
         let (floor_base, first_row) = depth.floor_base(view, height, 1, at[1]);
         let water_base = floor_base.saturating_add(15);
-        self.canvas.draw_water_overlay(image, at, light, |sy| {
-            depth.floor_row(water_base, first_row, sy)
-        });
+        let clip_bottom = self.clip_bottom;
+        self.canvas
+            .draw_water_overlay(image, at, clip_bottom, light, |sy| {
+                depth.floor_row(water_base, first_row, sy)
+            });
     }
 
     /// Casts the floor shadow of tile (`x`, `y`) on `level`, whose view top

@@ -177,11 +177,25 @@ impl Lot {
             _ => vec![0; FULL * FULL],
         };
         let pool = match world.arrays.get(&9) {
-            Some(a) if a.stride == 1 && a.data.len() == FULL * FULL => a.data.clone(),
+            Some(a)
+                if a.width == FULL
+                    && a.height == FULL
+                    && a.stride == 1
+                    && a.data.len() == FULL * FULL =>
+            {
+                a.data.clone()
+            }
             _ => vec![0xff; FULL * FULL],
         };
         let water = match world.arrays.get(&10) {
-            Some(a) if a.stride == 1 && a.data.len() == FULL * FULL => a.data.clone(),
+            Some(a)
+                if a.width == FULL
+                    && a.height == FULL
+                    && a.stride == 1
+                    && a.data.len() == FULL * FULL =>
+            {
+                a.data.clone()
+            }
             _ => vec![0xff; FULL * FULL],
         };
         let level = |index: usize| -> Result<Level> {

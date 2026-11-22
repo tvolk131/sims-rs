@@ -456,7 +456,7 @@ impl Canvas {
         columns: Option<[i32; 2]>,
         row_depth: impl Fn(i32) -> i32,
     ) {
-        self.blit_row_depth(image, at, |_, _| light, columns, None, row_depth);
+        self.blit_row_depth(image, at, |_, _| light, columns, None, None, row_depth);
     }
 
     /// Draws a floor tile (whole or split-tile sub-rectangle `sub_rect =
@@ -470,7 +470,30 @@ impl Canvas {
         light: impl Fn(usize, usize) -> Light,
         row_depth: impl Fn(i32) -> i32,
     ) {
-        self.blit_row_depth(image, at, light, None, sub_rect, row_depth);
+        self.blit_row_depth(image, at, light, None, sub_rect, None, row_depth);
+    }
+
+    /// Like [`Canvas::draw_floor_shaded`], additionally clipping output rows to
+    /// `[0, clip_bottom)` (matching `Sims.exe`'s active house viewport clip at
+    /// `0x4c81b1`–`0x4c81c0`).
+    pub(crate) fn draw_floor_shaded_clipped(
+        &mut self,
+        image: &Image,
+        at: [i32; 2],
+        sub_rect: Option<[usize; 4]>,
+        clip_bottom: i32,
+        light: impl Fn(usize, usize) -> Light,
+        row_depth: impl Fn(i32) -> i32,
+    ) {
+        self.blit_row_depth(
+            image,
+            at,
+            light,
+            None,
+            sub_rect,
+            Some(clip_bottom),
+            row_depth,
+        );
     }
 
     /// Draws a pond/natural water overlay tile (`Arry 10`, `0x4c1eea`–`0x4c2059`
@@ -481,10 +504,13 @@ impl Canvas {
     ///   table (`blend565_with`) and unconditionally writes row depth `row_depth(y)`;
     /// - `a >> 3 >= 31` (`a >= 248`): opaque copy and unconditionally writes
     ///   row depth `row_depth(y)`.
+    ///
+    /// Output rows are clipped to `[0, clip_bottom)` (`0x4c1a4a`–`0x4c1a8c`).
     pub(crate) fn draw_water_overlay(
         &mut self,
         image: &Image,
         at: [i32; 2],
+        clip_bottom: i32,
         light: Light,
         row_depth: impl Fn(i32) -> i32,
     ) {
@@ -497,12 +523,13 @@ impl Canvas {
         {
             return;
         }
-        self.record_rect(at[0], at[1], image.width, image.height);
+        let max_h = self.height.min(clip_bottom.max(0) as usize);
         let (x0, x1, ax) = clip_span(at[0], image.width, self.width);
-        let (y0, y1, ay) = clip_span(at[1], image.height, self.height);
+        let (y0, y1, ay) = clip_span(at[1], image.height, max_h);
         if x0 >= x1 || y0 >= y1 {
             return;
         }
+        self.record_rect(x0 as i32, y0 as i32, x1 - x0, y1 - y0);
         let table = blend_table();
         let pen = self.pen;
         let width = self.width;
@@ -800,6 +827,7 @@ impl Canvas {
         light: impl Fn(usize, usize) -> Light,
         columns: Option<[i32; 2]>,
         sub_rect: Option<[usize; 4]>,
+        clip_bottom: Option<i32>,
         row_depth: impl Fn(i32) -> i32,
     ) {
         let pixels = image.width.checked_mul(image.height);
@@ -814,8 +842,11 @@ impl Canvas {
         else {
             return;
         };
-        self.record_rect(rect_x, at[1], rect_w, image.height);
-        let (mut y0, mut y1, ay) = clip_span(at[1], image.height, self.height);
+        let max_h = match clip_bottom {
+            Some(cb) => self.height.min(cb.max(0) as usize),
+            None => self.height,
+        };
+        let (mut y0, mut y1, ay) = clip_span(at[1], image.height, max_h);
         if let Some([ix0, iy0, ix1, iy1]) = sub_rect {
             if ix0 >= ix1 || iy0 >= iy1 {
                 return;
@@ -823,7 +854,7 @@ impl Canvas {
             let wide = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
             let base_x = i64::from(at[0]);
             let lim_x = wide(self.width);
-            let lim_y = wide(self.height);
+            let lim_y = wide(max_h);
             let sub_x0 = base_x.saturating_add(wide(ix0)).clamp(0, lim_x) as usize;
             let sub_x1 = base_x.saturating_add(wide(ix1)).clamp(0, lim_x) as usize;
             let sub_y0 = ay.saturating_add(wide(iy0)).clamp(0, lim_y) as usize;
@@ -833,8 +864,16 @@ impl Canvas {
             y0 = y0.max(sub_y0);
             y1 = y1.min(sub_y1);
         }
-        if x0 >= x1 || y0 >= y1 {
-            return;
+        if clip_bottom.is_some() {
+            if x0 >= x1 || y0 >= y1 {
+                return;
+            }
+            self.record_rect(x0 as i32, y0 as i32, x1 - x0, y1 - y0);
+        } else {
+            self.record_rect(rect_x, at[1], rect_w, image.height);
+            if x0 >= x1 || y0 >= y1 {
+                return;
+            }
         }
         let pen = self.pen;
         let width = self.width;
@@ -1807,6 +1846,7 @@ mod tests {
             |_, _| Light::FULL,
             Some([3, 5]),
             Some([1, 0, 3, 2]),
+            None,
             |_| 5,
         );
         assert!(c2.color.iter().all(|&p| p == [0, 0, 0]));
@@ -1832,12 +1872,73 @@ mod tests {
         // Existing depth is nearer (100) than water depth (500): 0x4c6650 still
         // writes depth 500 on every drawn pixel without a Z-test.
         c.depth.fill(100);
-        c.draw_water_overlay(&water, [0, 0], Light::FULL, |_| 500);
+        c.draw_water_overlay(&water, [0, 0], 1, Light::FULL, |_| 500);
         assert_eq!(c.color[0], bg);
         assert_eq!(c.depth[0], 100);
         assert_eq!(c.color[1], blend565([40, 80, 160], bg, 128));
         assert_eq!(c.depth[1], 500);
         assert_eq!(c.color[2], [33, 57, 82]);
         assert_eq!(c.depth[2], 500);
+
+        // Both draw_water_overlay (0x4c1a4a) and draw_floor_shaded_clipped (0x4c81b1)
+        // must leave color, depth, and ids untouched at rows >= clip_bottom.
+        let tall_water = Image {
+            width: 2,
+            height: 4,
+            rgba: [33, 57, 82, 254].repeat(8),
+            depth: None,
+        };
+        let mut clipped = Canvas::new(2, 4, bg);
+        clipped.pen = Some(42);
+        clipped.draw_water_overlay(&tall_water, [0, 0], 2, Light::FULL, |_| 500);
+        for row in 0..2 {
+            for col in 0..2 {
+                let idx = row * 2 + col;
+                assert_eq!(clipped.color[idx], [33, 57, 82]);
+                assert_eq!(clipped.depth[idx], 500);
+                assert_eq!(clipped.ids[idx], Some(42));
+            }
+        }
+        for row in 2..4 {
+            for col in 0..2 {
+                let idx = row * 2 + col;
+                assert_eq!(clipped.color[idx], bg);
+                assert_eq!(clipped.depth[idx], EMPTY);
+                assert_eq!(clipped.ids[idx], None);
+            }
+        }
+
+        let tall_pool = Image {
+            width: 2,
+            height: 4,
+            rgba: [90, 174, 189, 255].repeat(8),
+            depth: None,
+        };
+        let mut clipped_pool = Canvas::new(2, 4, bg);
+        clipped_pool.pen = Some(77);
+        clipped_pool.draw_floor_shaded_clipped(
+            &tall_pool,
+            [0, 0],
+            None,
+            2,
+            |_, _| Light::FULL,
+            |_| 400,
+        );
+        for row in 0..2 {
+            for col in 0..2 {
+                let idx = row * 2 + col;
+                assert_eq!(clipped_pool.color[idx], [90, 174, 189]);
+                assert_eq!(clipped_pool.depth[idx], 400);
+                assert_eq!(clipped_pool.ids[idx], Some(77));
+            }
+        }
+        for row in 2..4 {
+            for col in 0..2 {
+                let idx = row * 2 + col;
+                assert_eq!(clipped_pool.color[idx], bg);
+                assert_eq!(clipped_pool.depth[idx], EMPTY);
+                assert_eq!(clipped_pool.ids[idx], None);
+            }
+        }
     }
 }

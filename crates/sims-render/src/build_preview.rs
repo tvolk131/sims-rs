@@ -1351,6 +1351,29 @@ fn draw_roof_layer(
         fn is_empty(self) -> bool {
             matches!(self, Self::Empty) || matches!(self, Self::Split0011(0) | Self::Split1001(0))
         }
+        /// Whether any retained triangle in this half-tile sub-cell owns the
+        /// cardinal boundary edge facing `(dx, dy)` (`(-1,0)`, `(1,0)`,
+        /// `(0,-1)`, or `(0,1)`).
+        fn owns_edge(self, dx: isize, dy: isize) -> bool {
+            match self {
+                Self::Empty => false,
+                Self::Full => true,
+                // bit 0 = (v00,v10,v11) owns -y (0,-1) and +x (1,0);
+                // bit 1 = (v00,v11,v01) owns -x (-1,0) and +y (0,1).
+                Self::Split0011(mask) => match (dx, dy) {
+                    (0, -1) | (1, 0) => (mask & 1) != 0,
+                    (-1, 0) | (0, 1) => (mask & 2) != 0,
+                    _ => false,
+                },
+                // bit 0 = (v00,v10,v01) owns -y (0,-1) and -x (-1,0);
+                // bit 1 = (v10,v11,v01) owns +x (1,0) and +y (0,1).
+                Self::Split1001(mask) => match (dx, dy) {
+                    (0, -1) | (-1, 0) => (mask & 1) != 0,
+                    (1, 0) | (0, 1) => (mask & 2) != 0,
+                    _ => false,
+                },
+            }
+        }
     }
     let level_idx = (base_level - 1).clamp(0, 1) as usize;
     let mut sub_cells = vec![SubCell::Empty; w_sub * h_sub];
@@ -1439,12 +1462,12 @@ fn draw_roof_layer(
             && (cy as usize) < h_sub
             && sub_cells[cx as usize * h_sub + cy as usize].is_full()
     };
-    let cell_in = |cx: isize, cy: isize| -> bool {
+    let cell_owns_edge = |cx: isize, cy: isize, dx: isize, dy: isize| -> bool {
         cx >= 0
             && cy >= 0
             && (cx as usize) < w_sub
             && (cy as usize) < h_sub
-            && !sub_cells[cx as usize * h_sub + cy as usize].is_empty()
+            && sub_cells[cx as usize * h_sub + cy as usize].owns_edge(dx, dy)
     };
     let mut queue = std::collections::VecDeque::new();
     for vx in 0..vw {
@@ -1493,12 +1516,20 @@ fn draw_roof_layer(
                 let iy = vy as isize;
                 let on_eave = if gable_along_x {
                     // Ridge runs along X -> eaves are along Y boundaries.
-                    !(cell_in(ix.min(w_sub as isize - 1).max(0), iy - 1)
-                        && cell_in(ix.min(w_sub as isize - 1).max(0), iy))
+                    // A vertex is off the eave only when at least one side along X
+                    // has both Y-adjacent sub-cells meeting cleanly across the Y edge.
+                    let left_closed =
+                        cell_owns_edge(ix - 1, iy - 1, 0, 1) && cell_owns_edge(ix - 1, iy, 0, -1);
+                    let right_closed =
+                        cell_owns_edge(ix, iy - 1, 0, 1) && cell_owns_edge(ix, iy, 0, -1);
+                    !(left_closed || right_closed)
                 } else {
                     // Ridge runs along Y -> eaves are along X boundaries.
-                    !(cell_in(ix - 1, iy.min(h_sub as isize - 1).max(0))
-                        && cell_in(ix, iy.min(h_sub as isize - 1).max(0)))
+                    let top_closed =
+                        cell_owns_edge(ix - 1, iy - 1, 1, 0) && cell_owns_edge(ix, iy - 1, -1, 0);
+                    let bot_closed =
+                        cell_owns_edge(ix - 1, iy, 1, 0) && cell_owns_edge(ix, iy, -1, 0);
+                    !(top_closed || bot_closed)
                 };
                 if on_eave {
                     gable_dist[v_idx(vx, vy)] = 0;
@@ -1632,7 +1663,10 @@ fn draw_roof_layer(
                     ((0, 1), (sx, sy + 1, h01), (sx + 1, sy + 1, h11)),
                 ];
                 for ((dx, dy), (ax, ay, ha), (bx, by, hb)) in neighbors {
-                    if !cell_in(sx as isize + dx, sy as isize + dy) && (ha > 0.01 || hb > 0.01) {
+                    if cell_kind.owns_edge(dx, dy)
+                        && !cell_owns_edge(sx as isize + dx, sy as isize + dy, -dx, -dy)
+                        && (ha > 0.01 || hb > 0.01)
+                    {
                         let top_a = make_vertex(ax, ay, ha);
                         let top_b = make_vertex(bx, by, hb);
                         let bot_a = make_vertex(ax, ay, 0.0);
@@ -2714,18 +2748,37 @@ mod tests {
         );
 
         // 7. Split-diagonal roof tiles clip to the exact indoor triangle (for
-        //    both ascending (0,0)-(1,1) and descending (1,0)-(0,1) diagonals)
-        //    with zero roof overhang onto the outdoor triangle.
+        //    both ascending (0,0)-(1,1) and descending (1,0)-(0,1) diagonals),
+        //    including probes inside the diagonal-crossed half-cells and a
+        //    nonzero-pitch Gable roof where Sol's `fx > fy` ascending case must
+        //    not emit a gable-end wall across the outdoor half.
         let cfg_zero_elev = RoofPreviewConfig {
             style: RoofStyle::Hip,
             pitch: RoofPitch::Flat,
             ..RoofPreviewConfig::default()
         };
-        for (halves, indoor_off, outdoor_off) in [
+        for (halves, indoor_offs, outdoor_offs) in [
             // Ascending diagonal: triangle 1 (fy > fx) indoor, triangle 3 (fx > fy) outdoor.
-            ([(1u8, 1i16), (3u8, 0i16)], [3, 13], [13, 3]),
+            // Probes include (2, 6) vs (6, 2) inside the diagonal-crossed (0,0) half-cell
+            // and (10, 14) vs (14, 10) inside the (1,1) half-cell.
+            (
+                [(1u8, 1i16), (3u8, 0i16)],
+                [[3, 13], [2, 6], [10, 14]],
+                [[13, 3], [6, 2], [14, 10]],
+            ),
+            // Ascending diagonal flipped: triangle 3 (fx > fy) indoor, triangle 1 (fy > fx) outdoor.
+            (
+                [(3u8, 1i16), (1u8, 0i16)],
+                [[13, 3], [6, 2], [14, 10]],
+                [[3, 13], [2, 6], [10, 14]],
+            ),
             // Descending diagonal: triangle 4 (fx + fy < 16) indoor, triangle 2 (fx + fy > 16) outdoor.
-            ([(4u8, 1i16), (2u8, 0i16)], [3, 3], [13, 13]),
+            // Probes include (10, 2) vs (14, 6) inside the (1,0) half-cell and (2, 10) vs (6, 14) inside (0,1).
+            (
+                [(4u8, 1i16), (2u8, 0i16)],
+                [[3, 3], [10, 2], [2, 10]],
+                [[13, 13], [14, 6], [6, 14]],
+            ),
         ] {
             let mut diag_lot = flat_lot.clone();
             let mut diag_rooms = vec![0i16; lot::FULL * lot::FULL];
@@ -2749,21 +2802,60 @@ mod tests {
                 diag_stats.pixels_written > 0,
                 "indoor triangle {halves:?} should draw roof pixels"
             );
-            let indoor_pt =
-                diag_cam.project_fine([6 * 16 + indoor_off[0], 6 * 16 + indoor_off[1]], 2, 0);
+            for indoor_off in indoor_offs {
+                let indoor_pt =
+                    diag_cam.project_fine([6 * 16 + indoor_off[0], 6 * 16 + indoor_off[1]], 2, 0);
+                assert!(
+                    diag_canvas.depth
+                        [indoor_pt[1] as usize * diag_canvas.width + indoor_pt[0] as usize]
+                        < EMPTY,
+                    "indoor diagonal probe {indoor_off:?} for {halves:?} must be covered"
+                );
+            }
+            for outdoor_off in outdoor_offs {
+                let outdoor_pt =
+                    diag_cam.project_fine([6 * 16 + outdoor_off[0], 6 * 16 + outdoor_off[1]], 2, 0);
+                assert_eq!(
+                    diag_canvas.depth
+                        [outdoor_pt[1] as usize * diag_canvas.width + outdoor_pt[0] as usize],
+                    EMPTY,
+                    "outdoor diagonal probe {outdoor_off:?} for {halves:?} must have zero overhang"
+                );
+            }
+        }
+
+        // Nonzero-pitch Gable roof on a single ascending split tile (`fx > fy`
+        // indoors) must not emit a gable-end wall across the outdoor `(fy > fx)` half.
+        let mut gable_diag_lot = flat_lot.clone();
+        let mut gable_rooms = vec![0i16; lot::FULL * lot::FULL];
+        gable_rooms[Lot::cell(6, 6)] = sims_sim::rooms::NO_ROOM;
+        gable_diag_lot.outdoor_rooms.insert(0);
+        gable_diag_lot.levels[0].rooms = Some(gable_rooms);
+        gable_diag_lot.halves.insert([1, 6, 6], [(3, 1), (1, 0)]);
+        let mut gable_cam = camera_for(&gable_diag_lot, Zoom::Near, 0);
+        gable_cam.center_on([6 * 16 + 8, 6 * 16 + 8], [160, 290]);
+        let cfg_gable = RoofPreviewConfig {
+            style: RoofStyle::Gable,
+            pitch: RoofPitch::Medium,
+            ..RoofPreviewConfig::default()
+        };
+        let mut gable_canvas = Canvas::new(320, 320, [115, 113, 115]);
+        let gable_stats = draw_roof_preview(
+            &gable_diag_lot,
+            &gable_cam,
+            &pattern,
+            &cfg_gable,
+            &mut gable_canvas,
+        );
+        assert!(gable_stats.pixels_written > 0);
+        for outdoor_off in [[3, 13], [2, 6], [4, 10]] {
             let outdoor_pt =
-                diag_cam.project_fine([6 * 16 + outdoor_off[0], 6 * 16 + outdoor_off[1]], 2, 0);
-            assert!(
-                diag_canvas.depth
-                    [indoor_pt[1] as usize * diag_canvas.width + indoor_pt[0] as usize]
-                    < EMPTY,
-                "indoor diagonal half {halves:?} must be covered by the roof triangle"
-            );
+                gable_cam.project_fine([6 * 16 + outdoor_off[0], 6 * 16 + outdoor_off[1]], 2, 0);
             assert_eq!(
-                diag_canvas.depth
-                    [outdoor_pt[1] as usize * diag_canvas.width + outdoor_pt[0] as usize],
+                gable_canvas.depth
+                    [outdoor_pt[1] as usize * gable_canvas.width + outdoor_pt[0] as usize],
                 EMPTY,
-                "outdoor diagonal half {halves:?} must have zero roof overhang"
+                "nonzero-pitch split Gable roof must not leak wall/roof pixels onto outdoor probe {outdoor_off:?}"
             );
         }
     }
