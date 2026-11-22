@@ -114,6 +114,30 @@ pub fn entries(
     }
 }
 
+/// Throwaway co-op pie-menu listing (`Lot::coop_pie_menu`, `&Lot`): runs all
+/// check trees for `player`'s selected Sim on a throwaway CoW clone of the
+/// world so RNG draws and scratch mutations never touch the shared lot.
+pub fn coop_entries(
+    lot: &Lot,
+    assets: &Assets,
+    player: sims_net::PlayerId,
+    object: u16,
+) -> Result<Listing, String> {
+    match lot.coop_pie_menu(player, object) {
+        Ok(menu) => Ok(Listing {
+            entries: named(lot, assets, menu.entries)?,
+            sounds: menu.sounds,
+            unchecked: None,
+        }),
+        Err(OrderError::Refused(fault)) if unported(&fault.trap) => Ok(Listing {
+            entries: every_entry(lot, assets, object)?,
+            sounds: Vec::new(),
+            unchecked: Some(fault.to_string()),
+        }),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// Whether `trap` is something the simulation has not ported, rather
 /// than a failure of the script or a wrong caller. A check tree's fault
 /// keeps its trap ([`Trap::CheckTree`]), and is what that trap is: a

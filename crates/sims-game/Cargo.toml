@@ -13,12 +13,14 @@ sims-audio = { path = "../sims-audio" }
 sims-content.workspace = true
 sims-core.workspace = true
 sims-formats.workspace = true
+sims-net.workspace = true
 sims-people = { path = "../sims-people" }
 sims-render = { path = "../sims-render" }
 sims-sim.workspace = true
 sims-ui = { path = "../sims-ui" }
 sims-vm.workspace = true
 softbuffer = "0.4.8"
+tokio.workspace = true
 winit = "0.30.13"
 # Sound output. On macOS it needs no system library, so it is always on;
 # elsewhere it is the `sound` feature, so the workspace build and CI need
