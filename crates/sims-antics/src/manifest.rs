@@ -573,8 +573,124 @@ pub struct CallbackSpec {
     pub condition: Option<TreeRef>,
 }
 
+/// Multi-tile sub-object definition in `[[tile]]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TileSpec {
+    pub guid: u32,
+    pub name: Option<String>,
+    pub objd_id: Option<u16>,
+    /// Encoded multi-tile offset `(dx << 8) | (dy & 0xff)`.
+    pub sub_index: i16,
+    pub level: i16,
+    pub lead: bool,
+    pub interaction_group: Option<i16>,
+    pub dgrp_id: Option<u16>,
+    pub slot_id: Option<u16>,
+    pub ttab_id: Option<u16>,
+    pub init: Option<TreeRef>,
+    pub main: Option<TreeRef>,
+    pub attributes: Option<u16>,
+}
+
+/// Explicit `STR#` string table in `[[string_table]]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StringTableSpec {
+    pub id: u16,
+    pub label: String,
+    pub entries: Vec<String>,
+}
+
+/// Typed `pack.toml` manifest describing an on-disk clean-room asset pack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackManifest {
+    pub name: String,
+    pub version: String,
+    pub author: String,
+    pub license: String,
+    pub archive: String,
+    pub objects: Vec<String>,
+}
+
+impl PackManifest {
+    /// Parses a `pack.toml` document, strictly validating section names and object slugs.
+    pub fn parse(source: &str) -> Result<Self> {
+        let root = parse_toml(source)?;
+        for (key, value) in &root {
+            match (key.as_str(), value) {
+                ("pack", TomlValue::Table(_)) => {}
+                ("pack", _) => {
+                    return Err(Error::new(
+                        "section '[pack]' must be a table, not an array of tables",
+                    ));
+                }
+                (other, _) => {
+                    return Err(Error::new(format!(
+                        "unknown top-level key or section '{other}' in pack.toml"
+                    )));
+                }
+            }
+        }
+        let pack = get_table(&root, "pack")
+            .ok_or_else(|| Error::new("pack.toml requires a [pack] section"))?;
+        let name = req_str(pack, "name")?;
+        let version = opt_str(pack, "version").unwrap_or_else(|| "0.1.0".to_owned());
+        let author = opt_str(pack, "author").unwrap_or_default();
+        let license = opt_str(pack, "license").unwrap_or_else(|| "MIT".to_owned());
+        let archive = opt_str(pack, "archive").unwrap_or_else(|| "open-pack.far".to_owned());
+        validate_relative_filename(&archive, "[pack].archive")?;
+        let objects = opt_str_array(pack, "objects")?;
+        if objects.is_empty() {
+            return Err(Error::new("[pack].objects must list at least one object"));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for slug in &objects {
+            validate_slug(slug)?;
+            if !seen.insert(slug.clone()) {
+                return Err(Error::new(format!(
+                    "duplicate object slug '{slug}' in pack.toml"
+                )));
+            }
+        }
+        Ok(Self {
+            name,
+            version,
+            author,
+            license,
+            archive,
+            objects,
+        })
+    }
+}
+
+fn validate_slug(slug: &str) -> Result<()> {
+    if slug.is_empty()
+        || !slug
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(Error::new(format!(
+            "invalid object slug '{slug}' (allowed: ASCII letters, digits, '-', '_')"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_relative_filename(name: &str, field: &str) -> Result<()> {
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+        || name.starts_with('.')
+    {
+        return Err(Error::new(format!(
+            "invalid filename '{name}' in {field} (must be a plain relative filename)"
+        )));
+    }
+    Ok(())
+}
+
 /// Typed `object.toml` manifest bundling metadata, scripts, interactions, slots,
-/// constants, callbacks, procedural sprites, and synthesized audio.
+/// constants, callbacks, tiles, string tables, procedural sprites, and synthesized audio.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObjectManifest {
     pub name: String,
@@ -589,6 +705,10 @@ pub struct ObjectManifest {
     pub dgrp_id: u16,
     pub spr2_id: u16,
     pub palt_id: u16,
+    pub master_id: Option<u16>,
+    pub attributes: u16,
+    pub interaction_group: i16,
+    pub data_58: i16,
     pub init: Option<TreeRef>,
     pub main: Option<TreeRef>,
     pub scripts: Vec<String>,
@@ -598,6 +718,8 @@ pub struct ObjectManifest {
     pub sounds: Vec<SoundSpec>,
     pub constants: Vec<ConstantSpec>,
     pub callbacks: Vec<CallbackSpec>,
+    pub tiles: Vec<TileSpec>,
+    pub string_tables: Vec<StringTableSpec>,
 }
 
 impl ObjectManifest {
@@ -608,7 +730,8 @@ impl ObjectManifest {
             match (key.as_str(), value) {
                 ("object" | "sprite", TomlValue::Table(_)) => {}
                 (
-                    "interaction" | "slot" | "sound" | "constant" | "callback",
+                    "interaction" | "slot" | "sound" | "constant" | "callback" | "tile"
+                    | "string_table",
                     TomlValue::Array(_),
                 ) => {}
                 ("object" | "sprite", _) => {
@@ -616,7 +739,11 @@ impl ObjectManifest {
                         "section '[{key}]' must be a table, not an array of tables"
                     )));
                 }
-                ("interaction" | "slot" | "sound" | "constant" | "callback", _) => {
+                (
+                    "interaction" | "slot" | "sound" | "constant" | "callback" | "tile"
+                    | "string_table",
+                    _,
+                ) => {
                     return Err(Error::new(format!(
                         "section '{key}' must be declared as an array of tables '[[{key}]]'"
                     )));
@@ -644,9 +771,16 @@ impl ObjectManifest {
         let dgrp_id = opt_u16(obj, "dgrp_id")?.unwrap_or(100);
         let spr2_id = opt_u16(obj, "spr2_id")?.unwrap_or(100);
         let palt_id = opt_u16(obj, "palt_id")?.unwrap_or(100);
+        let master_id = opt_u16(obj, "master_id")?;
+        let attributes = opt_u16(obj, "attributes")?.unwrap_or(0);
+        let interaction_group = opt_i16(obj, "interaction_group")?.unwrap_or(0);
+        let data_58 = opt_i16(obj, "data_58")?.unwrap_or(0);
         let init = opt_tree_ref(obj, "init")?;
         let main = opt_tree_ref(obj, "main")?;
         let scripts = opt_str_array(obj, "scripts")?;
+        for script in &scripts {
+            validate_relative_filename(script, "[object].scripts")?;
+        }
 
         let sprite = match get_table(&root, "sprite") {
             Some(t) => SpriteSpec {
@@ -656,6 +790,13 @@ impl ObjectManifest {
                     Some("basin") | Some("toilet") => FurnitureShape::Basin,
                     Some("table") => FurnitureShape::Table,
                     Some("chair") => FurnitureShape::Chair,
+                    Some("double_bed") => FurnitureShape::DoubleBed,
+                    Some("fridge") => FurnitureShape::Fridge,
+                    Some("counter") => FurnitureShape::Counter,
+                    Some("stove") => FurnitureShape::Stove,
+                    Some("meal_plate") | Some("plate") => FurnitureShape::MealPlate,
+                    Some("wall_phone") | Some("phone") => FurnitureShape::WallPhone,
+                    Some("shower") => FurnitureShape::Shower,
                     Some("box") | None => FurnitureShape::Box,
                     Some(other) => {
                         return Err(Error::new(format!("unknown [sprite].shape '{other}'")));
@@ -677,7 +818,14 @@ impl ObjectManifest {
                 let name = req_str(t, "name")?;
                 let action = opt_tree_ref(t, "action")?
                     .ok_or_else(|| Error::new("[[interaction]] requires 'action'"))?;
-                let test = opt_tree_ref(t, "test")?;
+                let test_ref = opt_tree_ref(t, "test")?;
+                let guard_ref = opt_tree_ref(t, "guard")?;
+                if test_ref.is_some() && guard_ref.is_some() {
+                    return Err(Error::new(format!(
+                        "[[interaction]] '{name}' cannot specify both 'test' and 'guard'"
+                    )));
+                }
+                let test = test_ref.or(guard_ref);
                 let flags = opt_u32(t, "flags")?.unwrap_or(0);
                 let flags2 = opt_u32(t, "flags2")?.unwrap_or(0);
                 let autonomy = opt_u32(t, "autonomy")?.unwrap_or(50);
@@ -752,12 +900,18 @@ impl ObjectManifest {
                 };
                 let id = req_u16(t, "id")?;
                 let name = req_str(t, "name")?;
+                validate_relative_filename(&name, "[[sound]].name")?;
                 let preset = match opt_str(t, "preset").as_deref() {
                     Some("ui_click") | None => SoundPreset::UiClick,
                     Some("chime") => SoundPreset::Chime,
                     Some("wood_creak") => SoundPreset::WoodCreak,
                     Some("water_flush") => SoundPreset::WaterFlush,
                     Some("soft_thud") => SoundPreset::SoftThud,
+                    Some("phone_ring") => SoundPreset::PhoneRing,
+                    Some("phone_dial") => SoundPreset::PhoneDial,
+                    Some("sizzle") => SoundPreset::Sizzle,
+                    Some("shower_spray") => SoundPreset::ShowerSpray,
+                    Some("wrench_clank") => SoundPreset::WrenchClank,
                     Some(other) => {
                         return Err(Error::new(format!("unknown [[sound]].preset '{other}'")));
                     }
@@ -812,6 +966,58 @@ impl ObjectManifest {
             }
         }
 
+        let mut tiles = Vec::new();
+        if let Some(TomlValue::Array(arr)) = root.get("tile") {
+            for item in arr {
+                let TomlValue::Table(t) = item else {
+                    return Err(Error::new("[[tile]] entries must be tables"));
+                };
+                let tile_guid = req_u32(t, "guid")?;
+                let tile_name = opt_str(t, "name");
+                let tile_objd_id = opt_u16(t, "objd_id")?;
+                let sub_index = parse_sub_index(t)?;
+                let level = opt_i16(t, "level")?.unwrap_or(0);
+                let lead = opt_bool(t, "lead")?.unwrap_or(false);
+                let tile_interaction_group = opt_i16(t, "interaction_group")?;
+                let tile_dgrp_id = opt_u16(t, "dgrp_id")?;
+                let tile_slot_id = opt_u16(t, "slot_id")?;
+                let tile_ttab_id = opt_u16(t, "ttab_id")?;
+                let tile_init = opt_tree_ref(t, "init")?;
+                let tile_main = opt_tree_ref(t, "main")?;
+                let tile_attributes = opt_u16(t, "attributes")?;
+                tiles.push(TileSpec {
+                    guid: tile_guid,
+                    name: tile_name,
+                    objd_id: tile_objd_id,
+                    sub_index,
+                    level,
+                    lead,
+                    interaction_group: tile_interaction_group,
+                    dgrp_id: tile_dgrp_id,
+                    slot_id: tile_slot_id,
+                    ttab_id: tile_ttab_id,
+                    init: tile_init,
+                    main: tile_main,
+                    attributes: tile_attributes,
+                });
+            }
+        }
+
+        let mut string_tables = Vec::new();
+        if let Some(TomlValue::Array(arr)) = root.get("string_table") {
+            for item in arr {
+                let TomlValue::Table(t) = item else {
+                    return Err(Error::new("[[string_table]] entries must be tables"));
+                };
+                let id = req_u16(t, "id")?;
+                let label = opt_str(t, "label")
+                    .or_else(|| opt_str(t, "name"))
+                    .unwrap_or_else(|| format!("STR_{id}"));
+                let entries = opt_str_array(t, "entries")?;
+                string_tables.push(StringTableSpec { id, label, entries });
+            }
+        }
+
         Ok(Self {
             name,
             description,
@@ -825,6 +1031,10 @@ impl ObjectManifest {
             dgrp_id,
             spr2_id,
             palt_id,
+            master_id,
+            attributes,
+            interaction_group,
+            data_58,
             init,
             main,
             scripts,
@@ -834,7 +1044,54 @@ impl ObjectManifest {
             sounds,
             constants,
             callbacks,
+            tiles,
+            string_tables,
         })
+    }
+}
+
+fn opt_bool(t: &BTreeMap<String, TomlValue>, key: &str) -> Result<Option<bool>> {
+    match t.get(key) {
+        None => Ok(None),
+        Some(TomlValue::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(Error::new(format!("key '{key}' must be a boolean"))),
+    }
+}
+
+fn parse_sub_index(t: &BTreeMap<String, TomlValue>) -> Result<i16> {
+    match t.get("sub_index") {
+        None => Ok(0),
+        Some(TomlValue::Int(v)) => {
+            let val = i16::try_from(*v)
+                .map_err(|_| Error::new(format!("[[tile]].sub_index {v} out of i16 range")))?;
+            if val == -1 {
+                return Err(Error::new(
+                    "[[tile]].sub_index cannot be -1 (reserved for the catalog master OBJD)",
+                ));
+            }
+            Ok(val)
+        }
+        Some(TomlValue::Array(items)) if items.len() == 2 => {
+            let (TomlValue::Int(dx), TomlValue::Int(dy)) = (&items[0], &items[1]) else {
+                return Err(Error::new(
+                    "[[tile]].sub_index [dx, dy] entries must be integers",
+                ));
+            };
+            let dx = i8::try_from(*dx)
+                .map_err(|_| Error::new(format!("[[tile]].sub_index dx {dx} out of i8 range")))?;
+            let dy = u8::try_from(*dy)
+                .map_err(|_| Error::new(format!("[[tile]].sub_index dy {dy} out of u8 range")))?;
+            let encoded = (i16::from(dx) << 8) | i16::from(dy);
+            if encoded == -1 {
+                return Err(Error::new(
+                    "[[tile]].sub_index [-1, 255] collides with master sentinel -1",
+                ));
+            }
+            Ok(encoded)
+        }
+        Some(_) => Err(Error::new(
+            "[[tile]].sub_index must be an i16 or a 2-element [dx, dy] integer array",
+        )),
     }
 }
 

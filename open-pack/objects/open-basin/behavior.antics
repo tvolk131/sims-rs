@@ -1,0 +1,35 @@
+// Open Ceramic Basin (0x7F00_0003) — clean-room porcelain fixture.
+
+bcon 4096 "BasinTuning" {
+    max_bladder = 90,
+    hygiene_gain = 25,
+}
+
+tree 4096 "Init" {
+    my.attr[0] := 0;
+    return true;
+}
+
+tree 4097 "Main" {
+    return true;
+}
+
+tree 4098 "CanUse" {
+    if stack.motive.bladder >= bcon.max_bladder {
+        return false;
+    }
+    return true;
+}
+
+tree 4100 "WashHands" {
+    stack.motive.hygiene += bcon.hygiene_gain;
+    play_sound(1);
+    return true;
+}
+
+interaction 4099 "UseBasin" {
+    my.attr[0] += 1;
+    stack.motive.bladder := 100;
+    call WashHands();
+    return true;
+}

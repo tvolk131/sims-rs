@@ -1,0 +1,62 @@
+// Open Meal Plate (0x7F00_0023) — cooked meal plate spawned by Open Hearth Stove.
+//
+// Attributes:
+//   attr[0] = hunger nutrition value (set by stove based on Cooking skill)
+//   attr[1] = full flag (1 = ready to eat, 0 = empty plate)
+
+bcon 4096 "PlateTuning" {
+    default_nutrition = 40,
+    bite_ticks = 1,
+    bites = 2,
+}
+
+tree 4096 "Init" {
+    my.attr[0] := bcon.default_nutrition;
+    my.attr[1] := 1;
+    return true;
+}
+
+tree 4097 "Main" {
+    return true;
+}
+
+tree 4098 "CanEat" {
+    if my.attr[1] == 1 {
+        return true;
+    }
+    return false;
+}
+
+tree 4099 "CanClean" {
+    if my.attr[1] == 0 {
+        return true;
+    }
+    return false;
+}
+
+interaction 4100 "DisposePlate" {
+    play_sound(2);
+    remove_object(me, no_yield: true);
+    return true;
+}
+
+interaction 4101 "EatMeal" {
+    let per_bite = my.attr[0];
+    per_bite /= bcon.bites;
+    let remainder = my.attr[0];
+    remainder %= bcon.bites;
+
+    let eaten = 0;
+    while eaten < bcon.bites {
+        idle(bcon.bite_ticks);
+        stack.motive.hunger += per_bite;
+        eaten += 1;
+    }
+    stack.motive.hunger += remainder;
+    play_sound(1);
+
+    // Mark plate empty and dispose cleanly.
+    my.attr[1] := 0;
+    call DisposePlate();
+    return true;
+}

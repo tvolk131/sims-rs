@@ -1,0 +1,40 @@
+// Open Camp Cot (0x7F00_0002) — clean-room single folding cot.
+
+bcon 4096 "CotTuning" {
+    nap_cycles = 3,
+    nap_ticks = 2,
+    energy_step = 20,
+    comfort_step = 5,
+    max_energy = 80,
+}
+
+tree 4096 "Init" {
+    my.attr[0] := 0;
+    return true;
+}
+
+tree 4097 "Main" {
+    return true;
+}
+
+tree 4098 "CanSleep" {
+    if stack.motive.energy < bcon.max_energy {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+interaction 4099 "TakeNap" {
+    my.attr[0] := 1;
+    play_sound(1);
+    let cycles = 0;
+    while cycles < bcon.nap_cycles {
+        idle(bcon.nap_ticks);
+        stack.motive.energy += bcon.energy_step;
+        stack.motive.comfort += bcon.comfort_step;
+        cycles += 1;
+    }
+    my.attr[0] := 0;
+    return true;
+}

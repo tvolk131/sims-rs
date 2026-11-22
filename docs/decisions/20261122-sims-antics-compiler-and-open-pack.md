@@ -58,10 +58,23 @@ We enforce a strict separation between **interoperable binary wire formats** and
 - **Sprites (`art.rs`):** Deterministic geometric isometric furniture rasterizer producing all **4 rotations** (`1, 4, 16, 64` matching `sims-render` DGRP direction masks) × **3 zooms** (`1` far, `2` mid, `3` near) with 5-6-5 quantized shading, 5-bit edge alpha, and z-buffer depth values, encoded directly into `PALT` + `SPR2` + `DGRP` chunks.
 - **Audio (`audio.rs`):** Deterministic 22050 Hz 16-bit mono PCM RIFF/WAVE synthesizer using `libm` oscillators, envelopes, and xorshift32 noise bursts for clean-room UI clicks, chimes, wood creaks, water/flush effects, and thuds.
 
-## 4. Phase 2 Roadmap: Dual-Mode `sims-game`
+## 4. Phase 2 Progress: On-Disk `open-pack/`, Multi-Tile OBJD & High-Level `.antics` Stress Suite
 
-This PR establishes the compiler, binary writers, in-memory completeness verifier, and VM-verified starter objects (`Open Pine Bench`, `Open Camp Cot`, `Open Ceramic Basin`). In Phase 2:
-1. An `open-pack/` source directory (plain-text `object.toml` + `.antics` files only — zero committed binaries) will define a minimal playable starter neighborhood, global behaviors, basic furniture, and open characters.
-2. `sims-game` will support **Dual Mode**:
-   - **Standalone Open Mode (default when `--install` is omitted):** Compiles the Open Starter Pack in memory via `sims-antics` and mounts it into `sims-content`/`sims-vm`/`sims-render` with zero external files required.
-   - **BYO Original Mode (`--install <path>`):** Preserves 100% existing Complete Collection fidelity and screenshot/simulation parity unchanged.
+Implemented on `antics/open-pack-complex-objects`:
+1. **On-Disk `open-pack/` Source Tree & Pack Pipeline:**
+   - `open-pack/pack.toml` declares pack metadata, archive name (`open-pack.far`), and deterministic object list; each object lives in `open-pack/objects/<slug>/{object.toml, behavior.antics}` (100% plain UTF-8 text, zero committed binaries).
+   - `compile_object_dir(dir)` and `compile_pack_dir(dir)` compile the full pack into `.iff` members, packaged `open-pack.far`, and a deterministic synthesized PCM WAV sound bank, rejecting cross-object GUID collisions or conflicting audio definitions.
+   - `sims-antics` CLI (`crates/sims-antics/src/bin/sims-antics.rs`) provides `check <pack_dir>` and `build <pack_dir> --out <dir>` with zero third-party CLI crates.
+2. **Multi-Tile `OBJD` Linking & `object.toml` Ergonomics:**
+   - `[[tile]]` sections emit a catalog master `OBJD` (`sub_index = -1`, non-zero `master_id`) plus per-tile `OBJD` + `OBJf` chunks with `[dx, dy]` `sub_index` encoding, `lead` tile flag (word 63), `level` (word 56), and `interaction_group` redirection (`-1` lead / `+1` slave), matching `sims-vm`'s native multi-tile group factory.
+   - `[[interaction]]` accepts `guard = "..."` (or `test = "..."`) for guard trees, and `[[string_table]]` / `.antics` `str` declarations emit `STR#` chunks (such as `STR# 301` for dialogs).
+3. **High-Level `.antics` DSL Upgrades & Procedural Asset Expansion:**
+   - Added named local variables (`let name = expr;` / `local name;`), `break;` / `continue;` inside `while` loops, named `bcon` constant blocks (`bcon.name`), named `str` table blocks (`str.name`), skill/data member aliases (`my.id`, `stack.person.cooking`, `stack.person.mechanical`, `my.prep_score`, `my.cook_score`), and first-class high-level primitives `create_object`, `remove_object`, `run_functional_tree`, `alter_budget`, and destination-capable `set_to_next`.
+   - Expanded procedural isometric silhouettes (`art.rs`: `DoubleBed`, `Fridge`, `Counter`, `Stove`, `MealPlate`, `WallPhone`, `Shower` across 4 rotations × 3 zooms) and synthesized WAV presets (`audio.rs`: `PhoneRing`, `PhoneDial`, `Sizzle`, `ShowerSpray`, `WrenchClank`).
+   - Battle-tested in `crates/sims-antics/tests/open_pack_behavioral.rs` against 10 clean-room objects (`0x7F00_0001..=0x7F00_0040`), including multi-tile double bed occupancy/cancel, 4-object Fridge→Counter→Stove→Meal Plate cooking chain, 2-way/3-way Wall Phone dialogs, and wear/broken/Mechanic-scaled Repair Shower.
+
+## 5. Next Phase: Dual-Mode `sims-game`
+
+In the next phase, `sims-game` will support **Dual Mode**:
+- **Standalone Open Mode (default when `--install` is omitted):** Compiles `open-pack/` in memory via `sims-antics` and mounts it into `sims-content`/`sims-vm`/`sims-render` with zero external files required.
+- **BYO Original Mode (`--install <path>`):** Preserves 100% existing Complete Collection fidelity and screenshot/simulation parity unchanged.

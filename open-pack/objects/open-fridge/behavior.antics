@@ -1,0 +1,86 @@
+// Open Frost Fridge (0x7F00_0020) — initiates the multi-object cooking chain:
+// Fridge (funds + stock) -> Counter (prep) -> Stove (cook + skill scaling) -> Meal Plate.
+//
+// Attributes:
+//   attr[0] = pantry stock count (starts at 5; restocked by Open Wall Phone)
+//   attr[1] = total meals prepared
+//   attr[2] = object ID of the most recently created Open Meal Plate
+
+bcon 4096 "FridgeTuning" {
+    initial_stock = 5,
+    meal_cost = 15,
+    max_entry_hunger = 90,
+    cooking_xp = 20,
+}
+
+tree 4096 "Init" {
+    my.attr[0] := bcon.initial_stock;
+    my.attr[1] := 0;
+    my.attr[2] := 0;
+    return true;
+}
+
+tree 4097 "Main" {
+    return true;
+}
+
+tree 4098 "CanCookMeal" {
+    if my.attr[0] <= 0 {
+        return false;
+    }
+    if stack.motive.hunger >= bcon.max_entry_hunger {
+        return false;
+    }
+    if !alter_budget(bcon.meal_cost, category: 0, test_only: true) {
+        return false;
+    }
+    return true;
+}
+
+interaction 4099 "CookMeal" {
+    let sim_id = stack_obj;
+
+    if my.attr[0] <= 0 {
+        return false;
+    }
+    if !alter_budget(bcon.meal_cost, category: 0) {
+        return false;
+    }
+
+    my.attr[0] -= 1;
+    play_sound(1);
+
+    // Pass Sim's cooking skill (temp[0]), Sim ID (temp[1]), plate output slot (temp[2]),
+    // and counter prep bonus (temp[3]) into downstream functional trees.
+    temp[0] := stack.person.cooking;
+    temp[1] := sim_id;
+    temp[2] := 0;
+    temp[3] := 0;
+
+    // Step 1: Locate best Counter (function 0 / prep) and run its PrepIngredients callback.
+    if !find_best_object(prep) {
+        stack_obj := sim_id;
+        return false;
+    }
+    if !run_functional_tree(prep) {
+        stack_obj := sim_id;
+        return false;
+    }
+
+    // Step 2: Locate best Stove (function 1 / cook) and run its CookOnStove callback.
+    if !find_best_object(cook) {
+        stack_obj := sim_id;
+        return false;
+    }
+    if !run_functional_tree(cook) {
+        stack_obj := sim_id;
+        return false;
+    }
+
+    // Step 3: Record newly created Meal Plate ID and award Cooking skill experience.
+    my.attr[2] := temp[2];
+    my.attr[1] += 1;
+    stack_obj := sim_id;
+    stack.person.cooking += bcon.cooking_xp;
+    return true;
+}

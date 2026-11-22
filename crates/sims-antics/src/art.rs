@@ -23,6 +23,13 @@ pub enum FurnitureShape {
     Table,
     Chair,
     Box,
+    DoubleBed,
+    Fridge,
+    Counter,
+    Stove,
+    MealPlate,
+    WallPhone,
+    Shower,
 }
 
 /// An axis-aligned 3D box in normalized tile space (`x, y in [-0.5, 0.5]`, `z >= 0`).
@@ -272,6 +279,297 @@ fn shape_geometry(
             max: [0.35, 0.35, 0.60],
             base_rgb: primary,
         }],
+        FurnitureShape::DoubleBed => vec![
+            // Corner posts
+            IsoBox {
+                min: [-0.46, -0.46, 0.0],
+                max: [-0.38, -0.38, 0.50],
+                base_rgb: trim,
+            },
+            IsoBox {
+                min: [0.38, -0.46, 0.0],
+                max: [0.46, -0.38, 0.50],
+                base_rgb: trim,
+            },
+            IsoBox {
+                min: [-0.46, 0.38, 0.0],
+                max: [-0.38, 0.46, 0.86],
+                base_rgb: trim,
+            },
+            IsoBox {
+                min: [0.38, 0.38, 0.0],
+                max: [0.46, 0.46, 0.86],
+                base_rgb: trim,
+            },
+            // Wooden base plinth & headboard
+            IsoBox {
+                min: [-0.46, -0.46, 0.14],
+                max: [0.46, 0.46, 0.28],
+                base_rgb: trim,
+            },
+            IsoBox {
+                min: [-0.44, 0.38, 0.28],
+                max: [0.44, 0.46, 0.80],
+                base_rgb: trim,
+            },
+            // Low footboard rail
+            IsoBox {
+                min: [-0.44, -0.46, 0.28],
+                max: [0.44, -0.40, 0.44],
+                base_rgb: trim,
+            },
+            // Mattress & quilted comforter
+            IsoBox {
+                min: [-0.42, -0.40, 0.28],
+                max: [0.42, 0.38, 0.46],
+                base_rgb: primary,
+            },
+            // Twin pillows
+            IsoBox {
+                min: [-0.36, 0.16, 0.46],
+                max: [-0.04, 0.34, 0.56],
+                base_rgb: accent,
+            },
+            IsoBox {
+                min: [0.04, 0.16, 0.46],
+                max: [0.36, 0.34, 0.56],
+                base_rgb: accent,
+            },
+            // Folded runner blanket
+            IsoBox {
+                min: [-0.41, -0.38, 0.46],
+                max: [0.41, -0.10, 0.51],
+                base_rgb: accent,
+            },
+        ],
+        FurnitureShape::Fridge => vec![
+            // Base toe kick
+            IsoBox {
+                min: [-0.36, -0.34, 0.0],
+                max: [0.36, 0.34, 0.08],
+                base_rgb: trim,
+            },
+            // Main lower refrigerator compartment
+            IsoBox {
+                min: [-0.38, -0.36, 0.08],
+                max: [0.38, 0.36, 0.78],
+                base_rgb: primary,
+            },
+            // Recessed door divider gasket
+            IsoBox {
+                min: [-0.36, -0.35, 0.78],
+                max: [0.36, 0.35, 0.82],
+                base_rgb: trim,
+            },
+            // Upper freezer compartment
+            IsoBox {
+                min: [-0.38, -0.36, 0.82],
+                max: [0.38, 0.36, 1.16],
+                base_rgb: primary,
+            },
+            // Top trim cap
+            IsoBox {
+                min: [-0.36, -0.34, 1.16],
+                max: [0.36, 0.34, 1.20],
+                base_rgb: accent,
+            },
+            // Vertical handles on front (-y) face
+            IsoBox {
+                min: [-0.30, -0.41, 0.34],
+                max: [-0.24, -0.36, 0.72],
+                base_rgb: accent,
+            },
+            IsoBox {
+                min: [-0.30, -0.41, 0.88],
+                max: [-0.24, -0.36, 1.08],
+                base_rgb: accent,
+            },
+        ],
+        FurnitureShape::Counter => vec![
+            // Recessed toe kick
+            IsoBox {
+                min: [-0.44, -0.38, 0.0],
+                max: [0.44, 0.44, 0.08],
+                base_rgb: trim,
+            },
+            // Cabinet carcass
+            IsoBox {
+                min: [-0.46, -0.42, 0.08],
+                max: [0.46, 0.46, 0.56],
+                base_rgb: primary,
+            },
+            // Front drawer handle bar
+            IsoBox {
+                min: [-0.18, -0.46, 0.44],
+                max: [0.18, -0.42, 0.48],
+                base_rgb: trim,
+            },
+            // Overhanging countertop slab
+            IsoBox {
+                min: [-0.48, -0.46, 0.56],
+                max: [0.48, 0.48, 0.64],
+                base_rgb: accent,
+            },
+            // Rear backsplash lip
+            IsoBox {
+                min: [-0.48, 0.40, 0.64],
+                max: [0.48, 0.48, 0.74],
+                base_rgb: accent,
+            },
+        ],
+        FurnitureShape::Stove => vec![
+            // Oven body
+            IsoBox {
+                min: [-0.44, -0.42, 0.0],
+                max: [0.44, 0.44, 0.58],
+                base_rgb: primary,
+            },
+            // Oven door glass window
+            IsoBox {
+                min: [-0.28, -0.45, 0.16],
+                max: [0.28, -0.42, 0.42],
+                base_rgb: trim,
+            },
+            // Oven handle bar
+            IsoBox {
+                min: [-0.30, -0.47, 0.46],
+                max: [0.30, -0.43, 0.50],
+                base_rgb: accent,
+            },
+            // Cooktop deck
+            IsoBox {
+                min: [-0.46, -0.44, 0.58],
+                max: [0.46, 0.46, 0.64],
+                base_rgb: accent,
+            },
+            // Four burner grates
+            IsoBox {
+                min: [-0.34, -0.30, 0.64],
+                max: [-0.10, -0.06, 0.67],
+                base_rgb: trim,
+            },
+            IsoBox {
+                min: [0.10, -0.30, 0.64],
+                max: [0.34, -0.06, 0.67],
+                base_rgb: trim,
+            },
+            IsoBox {
+                min: [-0.34, 0.06, 0.64],
+                max: [-0.10, 0.30, 0.67],
+                base_rgb: trim,
+            },
+            IsoBox {
+                min: [0.10, 0.06, 0.64],
+                max: [0.34, 0.30, 0.67],
+                base_rgb: trim,
+            },
+            // Rear control console riser
+            IsoBox {
+                min: [-0.44, 0.34, 0.64],
+                max: [0.44, 0.46, 0.84],
+                base_rgb: primary,
+            },
+        ],
+        FurnitureShape::MealPlate => vec![
+            // Foot ring
+            IsoBox {
+                min: [-0.18, -0.18, 0.0],
+                max: [0.18, 0.18, 0.04],
+                base_rgb: trim,
+            },
+            // Ceramic plate platter
+            IsoBox {
+                min: [-0.28, -0.28, 0.04],
+                max: [0.28, 0.28, 0.09],
+                base_rgb: primary,
+            },
+            // Plated entree mound
+            IsoBox {
+                min: [-0.16, -0.14, 0.09],
+                max: [0.12, 0.14, 0.17],
+                base_rgb: accent,
+            },
+            // Side garnish
+            IsoBox {
+                min: [0.06, -0.16, 0.09],
+                max: [0.20, 0.02, 0.15],
+                base_rgb: trim,
+            },
+        ],
+        FurnitureShape::WallPhone => vec![
+            // Wall-mounted backplate
+            IsoBox {
+                min: [-0.16, 0.28, 0.56],
+                max: [0.16, 0.44, 0.94],
+                base_rgb: primary,
+            },
+            // Keypad faceplate
+            IsoBox {
+                min: [-0.10, 0.24, 0.62],
+                max: [0.10, 0.28, 0.82],
+                base_rgb: accent,
+            },
+            // Handset body on left cradle
+            IsoBox {
+                min: [-0.24, 0.22, 0.60],
+                max: [-0.14, 0.34, 0.96],
+                base_rgb: trim,
+            },
+            // Handset ear/mouth caps
+            IsoBox {
+                min: [-0.26, 0.18, 0.86],
+                max: [-0.14, 0.34, 0.98],
+                base_rgb: trim,
+            },
+            IsoBox {
+                min: [-0.26, 0.18, 0.58],
+                max: [-0.14, 0.34, 0.68],
+                base_rgb: trim,
+            },
+        ],
+        FurnitureShape::Shower => vec![
+            // Porcelain shower base pan
+            IsoBox {
+                min: [-0.46, -0.46, 0.0],
+                max: [0.46, 0.46, 0.10],
+                base_rgb: primary,
+            },
+            // Rear tiled wall
+            IsoBox {
+                min: [-0.46, 0.38, 0.10],
+                max: [0.46, 0.46, 1.18],
+                base_rgb: primary,
+            },
+            // Right privacy side wall
+            IsoBox {
+                min: [0.38, -0.44, 0.10],
+                max: [0.46, 0.46, 1.18],
+                base_rgb: primary,
+            },
+            // Frosted glass left panel
+            IsoBox {
+                min: [-0.46, -0.44, 0.10],
+                max: [-0.40, 0.40, 1.14],
+                base_rgb: accent,
+            },
+            // Chrome mixing valve
+            IsoBox {
+                min: [-0.08, 0.32, 0.56],
+                max: [0.08, 0.38, 0.68],
+                base_rgb: trim,
+            },
+            // Overhead shower riser & head
+            IsoBox {
+                min: [-0.04, 0.22, 1.04],
+                max: [0.04, 0.38, 1.10],
+                base_rgb: trim,
+            },
+            IsoBox {
+                min: [-0.10, 0.14, 0.98],
+                max: [0.10, 0.26, 1.04],
+                base_rgb: trim,
+            },
+        ],
     }
 }
 
