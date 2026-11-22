@@ -1166,6 +1166,21 @@ impl DialogState {
         false
     }
 
+    /// Exact microseconds until the focused `cTSWinTextEdit2` caret next flips
+    /// visibility, or `None` when no text field is focused.
+    pub fn next_blink_us(&self, clock_us: u64) -> Option<u64> {
+        if !self.focused {
+            return None;
+        }
+        match self.blink_since {
+            None => Some(CARET_BLINK_US),
+            Some(since) => {
+                let elapsed = clock_us.saturating_sub(since);
+                Some(CARET_BLINK_US.saturating_sub(elapsed).max(1_000))
+            }
+        }
+    }
+
     /// Resets the caret to visible on user typing or cursor movement.
     fn reset_blink(&mut self) {
         self.caret_visible = true;

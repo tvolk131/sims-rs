@@ -1763,7 +1763,6 @@ impl Hud {
     /// text-entry caret, or cheat-console caret) needs a wakeup, or `None`
     /// when no blink is active.
     pub fn next_blink_us(&self, clock_us: u64) -> Option<u64> {
-        const CARET_POLL_US: u64 = 100_000;
         let mut best: Option<u64> = None;
         let mut consider = |us: u64| {
             best = Some(best.map_or(us, |prev| prev.min(us)));
@@ -1771,12 +1770,13 @@ impl Hud {
         if let Some(us) = self.clock_blink.next_blink_us(clock_us) {
             consider(us);
         }
-        if self.active_message().is_some_and(|m| m.entry.is_some()) || self.cheat_console.is_open()
+        if self.active_message().is_some_and(|m| m.entry.is_some())
+            && let Some(us) = self.dialog_state.next_blink_us(clock_us)
         {
-            // Text-entry carets restart their 500 ms blink timer on focus/edit
-            // inside `sims-ui`; poll at 100 ms (10 Hz) only while open so the
-            // caret toggles promptly regardless of edit phase.
-            consider(CARET_POLL_US);
+            consider(us);
+        }
+        if let Some(us) = self.cheat_console.next_blink_us(clock_us) {
+            consider(us);
         }
         best
     }
