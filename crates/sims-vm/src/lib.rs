@@ -39,6 +39,7 @@ pub mod boot;
 mod both_ways;
 mod build;
 mod buy;
+pub mod caf;
 mod cancel;
 mod clip_events;
 pub mod coop;

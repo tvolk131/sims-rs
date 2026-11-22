@@ -3178,7 +3178,12 @@ mod tests {
         assert!(resolve_cancel_uid(&world, 10, cancel_uid_to_wire(40_000)).is_err());
     }
 
-    fn synthetic_coop_lot(program: Program, catalog: Catalog, world: World, frames: Frames) -> Lot {
+    fn synthetic_coop_lot(
+        program: Program,
+        catalog: impl Into<std::sync::Arc<Catalog>>,
+        world: World,
+        frames: Frames,
+    ) -> Lot {
         use crate::boot::{Finished, LoadReport};
         use crate::play::Play;
         use sims_sim::motives::{Curve, Rates, Tuning};
@@ -3191,7 +3196,7 @@ mod tests {
         };
         Lot {
             program,
-            catalog,
+            catalog: catalog.into(),
             surfaces: sims_content::Surfaces::default(),
             world,
             tuning: Some(tuning),

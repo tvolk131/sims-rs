@@ -34,7 +34,7 @@ pub mod texture;
 pub use animation::{Clip, Library};
 pub use appearance::{Body, Outfit, Part};
 pub use assets::Assets;
-pub use house::{Cast, Resident, residents, residents_of};
+pub use house::{Cast, PreloadedCast, Resident, residents, residents_of};
 pub use lot::{People, View};
 pub use person::{Player, base_clip, heading, placement, walk_clip};
 pub use skin::skin;
