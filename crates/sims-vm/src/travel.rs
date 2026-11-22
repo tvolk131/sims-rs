@@ -3275,6 +3275,7 @@ fn boot_destination_for_edit(
             instance_id: origin_instance_id,
             revision: origin_revision,
         }),
+        coop: None,
     })
 }
 
@@ -4012,6 +4013,7 @@ fn boot_destination_lot(
         redo_order: Vec::new(),
         active_wall_cursor: None,
         neighborhood_origin: None,
+        coop: None,
     };
     Ok((lot, traveler_records))
 }
@@ -4395,6 +4397,7 @@ fn reconcile_frozen_home_lot(
             instance_id: origin_instance_id,
             revision: origin_revision,
         }),
+        coop: None,
     };
 
     Ok((lot, returning_travelers))
