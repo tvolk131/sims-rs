@@ -218,6 +218,33 @@ impl Hud {
         world: &World,
         friendship: i32,
     ) -> Result<Self, String> {
+        let neighborhood = house
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("the house file is not in a Houses folder")?;
+        let neighborhood = Neighborhood::open(neighborhood).map_err(|e| e.to_string())?;
+        let number = neighborhood
+            .houses()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|(_, path)| path.file_name() == house.file_name())
+            .map(|(n, _)| n);
+        let members = number
+            .and_then(|n| neighborhood.family_in(n))
+            .map(|(_, f)| f.members.clone())
+            .unwrap_or_default();
+        Self::open_with_members(install, members, assets, world, friendship)
+    }
+
+    /// Reads the art and faces for a lot whose occupying household members
+    /// come from a `NeighborhoodStore` rather than a `Houses/HouseXX.iff` path.
+    pub fn open_with_members(
+        install: &Path,
+        members: Vec<u32>,
+        assets: &Assets,
+        world: &World,
+        friendship: i32,
+    ) -> Result<Self, String> {
         let install = Install::detect(install).map_err(|e| e.to_string())?;
         let ui = UiGraphics::open(&install).map_err(|e| e.to_string())?;
         let resources: Vec<i32> = hud::RESOURCES
@@ -252,21 +279,6 @@ impl Hud {
         let fame = Fame::load(&install).unwrap_or_default();
         let options_texts = OptionsTexts::load(&install).unwrap_or_default();
         let options_state = options::OptionsState::load_install(&install).unwrap_or_default();
-        let neighborhood = house
-            .parent()
-            .and_then(Path::parent)
-            .ok_or("the house file is not in a Houses folder")?;
-        let neighborhood = Neighborhood::open(neighborhood).map_err(|e| e.to_string())?;
-        let number = neighborhood
-            .houses()
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .find(|(_, path)| path.file_name() == house.file_name())
-            .map(|(n, _)| n);
-        let members = number
-            .and_then(|n| neighborhood.family_in(n))
-            .map(|(_, f)| f.members.clone())
-            .unwrap_or_default();
         let mut people = members.clone();
         for record in world.neighbors.slots.iter().flatten() {
             if !people.contains(&record.guid) {

@@ -89,15 +89,15 @@ pub struct Outcome {
     pub save: bool,
     /// The player accepted Quit from the Options panel (`0x516866..0x51686c`).
     pub quit: bool,
+    /// The player accepted returning to the Neighborhood screen (`0x5170f0..0x51713c`).
+    pub neighborhood: bool,
 }
 
 impl Outcome {
     fn redraw() -> Self {
         Self {
             redraw: true,
-            photo: false,
-            save: false,
-            quit: false,
+            ..Self::default()
         }
     }
 }
@@ -351,6 +351,210 @@ impl Game {
             game.set_mode(Mode::Buy);
         }
         Ok(game)
+    }
+
+    /// Boots `house` from a REDB [`sims_sim::neighborhood_store::NeighborhoodStore`]
+    /// via [`sims_vm::lifecycle::enter_lot`], without reading or mutating any
+    /// `UserData` house files on disk.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_from_store(
+        install_root: &Path,
+        store: &sims_sim::neighborhood_store::NeighborhoodStore,
+        neighborhood_id: &str,
+        house: u32,
+        answers: &[u8],
+        play: bool,
+        frames: Frames,
+    ) -> Result<Self, String> {
+        let snapshot = store
+            .load_lot_snapshot(neighborhood_id, house)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("neighborhood {neighborhood_id:?} not found in store"))?;
+        let members = snapshot
+            .neighborhood
+            .family_in(house)
+            .map(|(_, f)| f.members.clone())
+            .unwrap_or_default();
+        let mut lot = sims_vm::lifecycle::enter_lot(
+            install_root,
+            store,
+            neighborhood_id,
+            house,
+            answers,
+            frames,
+        )
+        .map_err(|e| format!("{neighborhood_id} House{house:02}: {e}"))?;
+        lot.wait_for_answers();
+        let stopped = lot
+            .load_report()
+            .stopped
+            .as_ref()
+            .map(|s| format!("The load stopped, so the lot cannot run: {s}"));
+        let install = sims_content::Install::detect(install_root).map_err(|e| e.to_string())?;
+        let mut index = sims_content::Index::build(&install).map_err(|e| e.to_string())?;
+        if !snapshot.character_files.is_empty() {
+            index
+                .add_character_files(&snapshot.character_files)
+                .map_err(|e| e.to_string())?;
+        }
+        let catalog = sims_content::Catalog::build(&index).map_err(|e| e.to_string())?;
+        let assets =
+            sims_render::Assets::new(&install, index, catalog).map_err(|e| e.to_string())?;
+        let lot_shape = sims_render::Lot::from_world(lot.world())
+            .map_err(|e| e.to_string())?
+            .with_floor_rotation(lot.floor_rotation());
+        let mut hud = Hud::open_with_members(
+            install_root,
+            members,
+            &assets,
+            lot.world(),
+            lot.program().autonomy_constants().friendship_threshold,
+        )?;
+        hud.sync_clock_blink(lot.world(), 0);
+        let free_will = hud.controls.options.play.free_will;
+        if lot.world().globals.get(30).copied().unwrap_or(1) != i16::from(free_will) {
+            let _ = lot.set_free_will(free_will);
+        }
+        let mut people =
+            People::open_from_character_files(install_root, &snapshot.character_files)?;
+        people.refresh(lot.world());
+        let view = View::new([800, 600], lot_shape.built_center(), lot.view_rotation());
+        let drawn_camera = view.camera;
+        let has_family = lot.world().globals.get(9).copied().unwrap_or(0) != 0;
+        let is_residential = lot.lot_zoning().unwrap_or(1) == 1
+            && !matches!(lot.lot_id(), 21..=30 | 40..=48 | 81..=89 | 93..=98);
+        let edit_mode = if has_family && is_residential {
+            false
+        } else {
+            lot.world().globals.get(32).copied().unwrap_or(0) == 1
+                || (!has_family
+                    && (lot.lot_zoning().unwrap_or(0) != 0
+                        || matches!(lot.lot_id(), 21..=30 | 40..=48 | 81..=99)))
+        };
+        let mut pace = Pace::default();
+        if let Some(speed) = pace::shown(lot.world()) {
+            pace.speed = speed;
+        }
+        let mut game = Self {
+            lot,
+            lot_shape,
+            assets,
+            view,
+            people,
+            hud,
+            pace,
+            play,
+            stopped,
+            errors: Errors::default(),
+            sounds: VecDeque::new(),
+            ui_effects: VecDeque::new(),
+            highlighted_buttons: BTreeSet::new(),
+            highlighted_portraits: BTreeSet::new(),
+            highlighted_relationships: BTreeSet::new(),
+            pointer: None,
+            reached: None,
+            listed: None,
+            highlighted: None,
+            buy_selected: None,
+            buy_cursor: None,
+            buy_in_house: false,
+            buy_last_guid: None,
+            buy_facing: None,
+            buy_dragging: None,
+            buy_grab_offset: [0, 0],
+            buy_commit_on_release: false,
+            live_panel_expanded: true,
+            shift_held: false,
+            ctrl_held: false,
+            wall_cursor: None,
+            build_drag: None,
+            build_preview_shape: None,
+            buy_moneyback_us: None,
+            buy_delete_us: None,
+            note: None,
+            clock_us: 0,
+            drawn_us: 0,
+            blink_dirty: false,
+            dirty: false,
+            restore_dirty_on_quit_cancel: false,
+            pending_after_save_note: None,
+            edit_mode,
+            edge_scroll_rem: [0, 0],
+            canvas: Canvas::new(1, 1, [0, 0, 0]),
+            lot_cache: sims_render::LotCache::new(),
+            drawn_camera,
+            lot_depth: Vec::new(),
+            people_ids: sims_render::Ids::default(),
+        };
+        game.sync_view();
+        if edit_mode && game.stopped.is_none() {
+            game.lot.set_edit_budget(true);
+            game.set_mode(Mode::Buy);
+        }
+        Ok(game)
+    }
+
+    /// Saves the active lot back to its REDB [`sims_sim::neighborhood_store::NeighborhoodStore`]
+    /// via [`sims_vm::lifecycle::save_and_leave_lot`] (stripping any unpaid
+    /// Buy Mode placement cursor first).
+    pub fn save_to_neighborhood(
+        &mut self,
+        install_root: &Path,
+        store: &sims_sim::neighborhood_store::NeighborhoodStore,
+        neighborhood_id: &str,
+    ) -> Result<sims_vm::lifecycle::SaveReport, String> {
+        let result = match self.buy_cursor.as_ref() {
+            Some(cursor) => sims_vm::lifecycle::save_and_leave_lot_without_buy_cursor(
+                install_root,
+                store,
+                neighborhood_id,
+                &mut self.lot,
+                cursor,
+            ),
+            None => sims_vm::lifecycle::save_and_leave_lot(
+                install_root,
+                store,
+                neighborhood_id,
+                &mut self.lot,
+            ),
+        }
+        .map_err(|e| e.to_string());
+        let followup = self.pending_after_save_note.take();
+        match &result {
+            Ok(_) => {
+                self.dirty = false;
+                self.note = Some(match followup {
+                    Some(extra) => format!("Saved after tick {}. {extra}", self.lot.ticks()),
+                    None => format!("Saved after tick {}.", self.lot.ticks()),
+                });
+            }
+            Err(e) => {
+                self.note = Some(format!("The lot was not saved: {e}"));
+            }
+        }
+        result
+    }
+
+    /// Whether the player is currently holding an interactive tool, drag,
+    /// slider, or modal dialog that benefits from display-refresh redraws.
+    pub fn is_actively_interacting(&self) -> bool {
+        self.buy_cursor.is_some()
+            || self.build_drag.is_some()
+            || self.wall_cursor.is_some()
+            || self.hud.dragging_slider()
+            || self.hud.dragging_dialog_entry()
+            || self.has_dialog()
+    }
+
+    /// Current lot geometry and render assets for capturing map thumbnails on save.
+    pub fn render_parts_mut(
+        &mut self,
+    ) -> (
+        &sims_sim::World,
+        &sims_render::Lot,
+        &mut sims_render::Assets,
+    ) {
+        (self.lot.world(), &self.lot_shape, &mut self.assets)
     }
 
     /// The lot, for reading.
@@ -2564,10 +2768,8 @@ impl Game {
                     Outcome::redraw()
                 }
                 UiCamera::Photo => Outcome {
-                    redraw: false,
                     photo: true,
-                    save: false,
-                    quit: false,
+                    ..Outcome::default()
                 },
                 UiCamera::Roof => {
                     self.note = Some("Roofs are not drawn yet.".into());
@@ -2649,8 +2851,7 @@ impl Game {
                                 return Outcome {
                                     redraw: true,
                                     save: true,
-                                    quit: false,
-                                    photo: false,
+                                    ..Outcome::default()
                                 };
                             }
                             (OptionsDialog::SaveCardQuit, 1) => {
@@ -2668,7 +2869,7 @@ impl Game {
                                     redraw: true,
                                     save: true,
                                     quit: true,
-                                    photo: false,
+                                    ..Outcome::default()
                                 };
                             }
                             (OptionsDialog::ConfirmSaveBeforeQuit, 1) => {
@@ -2680,22 +2881,24 @@ impl Game {
                             }
                             (OptionsDialog::SaveCardNeighborhood, 0) => {
                                 apply_save_card(&mut self.lot, &mut self.dirty);
-                                let note = "Neighborhood view is not ported yet.";
+                                let note = "Returning to Neighborhood.";
                                 self.pending_after_save_note = Some(note);
                                 self.note = Some(note.into());
                                 return Outcome {
                                     redraw: true,
                                     save: true,
+                                    neighborhood: true,
                                     ..Outcome::default()
                                 };
                             }
                             (OptionsDialog::ConfirmSaveBeforeNeighborhood, 0) => {
-                                let note = "Neighborhood view is not ported yet.";
+                                let note = "Returning to Neighborhood.";
                                 self.pending_after_save_note = Some(note);
                                 self.note = Some(note.into());
                                 return Outcome {
                                     redraw: true,
                                     save: true,
+                                    neighborhood: true,
                                     ..Outcome::default()
                                 };
                             }
@@ -2705,7 +2908,12 @@ impl Game {
                                 1,
                             ) => {
                                 self.pending_after_save_note = None;
-                                self.note = Some("Neighborhood view is not ported yet.".into());
+                                self.note = None;
+                                return Outcome {
+                                    redraw: true,
+                                    neighborhood: true,
+                                    ..Outcome::default()
+                                };
                             }
                             (OptionsDialog::ConfirmResetTutorial, 0) => {
                                 // `0x4f25ea -> 0x4f1a11..0x4f1ac6`: confirming
@@ -2814,10 +3022,11 @@ impl Game {
                     // `0x5170f0..0x51713c`: prompts only when `dirty && can_save`;
                     // edit mode uses the save card (`0x517c03(1)`), ordinary lots
                     // fall back to `0x4f1a11` (`STR# 153[3..4]`).
-                    OptionsAction::Neighborhood if !self.dirty || !can_save => {
-                        self.note = Some("Neighborhood view is not ported yet.".into());
-                        Outcome::redraw()
-                    }
+                    OptionsAction::Neighborhood if !self.dirty || !can_save => Outcome {
+                        redraw: true,
+                        neighborhood: true,
+                        ..Outcome::default()
+                    },
                     OptionsAction::Neighborhood => {
                         let dialog = if self.edit_mode {
                             OptionsDialog::SaveCardNeighborhood
