@@ -5,16 +5,23 @@
 //! and Ctrl removal (`cNewFloorTool` / `FloorUndoable` `0x4881e6`..`0x4899d5`),
 //! wallpaper face application, drag, Shift room-fill, and Ctrl stripping
 //! (`cNewWallpaperTool` / `WallpaperUndoable` `0x48a08d`..`0x4939c0`),
-//! Architecture budget accounting (`0x46d91c` category 7), and Build Mode
-//! Undo/Redo (`0x4932fa`, `0x493338`).
+//! terrain elevation, leveling, and grass restoration (`cNewTerrainTool`,
+//! `GameData/Build.iff STR# 128`), pond water painting/removal and swimming
+//! pool digging/demolition (`Arry 9` / `Arry 10`, `STR# 133`), roof pattern and
+//! pitch switching (`HOUS 0` / `GameData/Roofs/*.bmp`), Architecture budget
+//! accounting (`0x46d91c` category 7), and Build Mode Undo/Redo (`0x4932fa`,
+//! `0x493338`).
 
+use crate::boot::{HistoryKind, Lot, OrderError};
 use crate::buy::{BuyActionKind, BuyPurchase, available_funds};
 use crate::fault::{Fault, Trap};
-use crate::interpreter::Interpreter;
+use crate::interpreter::{Interpreter, Stream};
 use crate::placement::{Place, on_lot};
 use crate::primitives::budget::spend;
+use sims_formats::lot::{Array, HouseView};
 use sims_sim::World;
 use sims_sim::load::{ExpandedWall, FLOORS, WALLS};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The `"Wall Cursor"` object GUID looked up by name (`0x43ab8f`) in
@@ -32,10 +39,41 @@ pub const SPLIT_FLOOR_ID: u16 = 255;
 const FULL_SIZE: usize = 64;
 const WALL_CELL: usize = 14;
 const HEIGHTS_ARRAY: u16 = 0;
+/// Lot grass array (`Arry 6`, signed `i8` per tile, `sims-sim/src/grass.rs`).
+pub const GRASS_ARRAY: u16 = 6;
+/// Lot target grass array (`Arry 7`, signed `i8` per tile, `sims-sim/src/grass.rs`).
+pub const TARGET_GRASS_ARRAY: u16 = 7;
 const FLAGS_ARRAY: [u16; 2] = [8, 108];
 const FLAG_BUILDABLE: u8 = 1;
+/// Tile flag `0x20` (`Arry 8`): locked terrain/river/road border that Build
+/// Mode tools must not alter (`0x42737e`, `House08`/`House10` river tiles).
+pub const FLAG_LOCKED: u8 = 0x20;
 const POOL_ARRAY: u16 = 9;
 const WATER_ARRAY: u16 = 10;
+/// Sentinel array ID (`"rf"`) persisted inside [`World::arrays`] to carry
+/// edited roof pitch (`f32` LE) and roof pattern stem across `World::clone`
+/// and `Lot::save()`/`Lot::restore()` without altering load hashes when unread.
+pub const ROOF_META_ARRAY: u16 = 0x7266;
+
+/// Maximum orthogonal height difference between adjacent terrain vertices
+/// enforced by Terrain and Pond editing tools (matching `sims-render/src/grass.rs`
+/// `[-5, 5]` sun-shading slope table at `0x4c47f7`).
+pub const MAX_TERRAIN_SLOPE: u8 = 5;
+/// Bare dirt grass value written to `Arry 6` when terrain elevation changes
+/// or grass is removed with Ctrl (`< SPARSE = -73` in `sims-render/src/grass.rs`).
+pub const TERRAIN_DIRT_GRASS: i8 = -100;
+/// Lush restored grass value written to `Arry 6` by the Grass tool
+/// (`> DENSE = 85` in `sims-render/src/grass.rs`).
+pub const GRASS_RESTORED_VALUE: i8 = 100;
+
+/// Default Complete Collection 1.91 Terrain/Grass/Pool/Water tool prices
+/// (`GameData/Build.iff STR# 128` and `STR# 133`).
+pub const DEFAULT_TERRAIN_PRICE: i32 = 1;
+pub const DEFAULT_GRASS_PRICE: i32 = 1;
+pub const DEFAULT_POOL_PRICE: i32 = 75;
+pub const DEFAULT_WATER_PRICE: i32 = 15;
+/// Default base-game roof texture stem (`GameData/Roofs/r1_.bmp`).
+pub const DEFAULT_ROOF_PATTERN: &str = "r1_";
 
 /// Wall segment bitmasks (`ExpandedWall::segments`).
 pub const WALL_WEST: u8 = 1;
@@ -337,6 +375,27 @@ pub enum BuildHistory {
         wall_changes: Vec<(usize, [u8; WALL_CELL], [u8; WALL_CELL])>,
         net_cost: i32,
     },
+    Terrain {
+        height_changes: Vec<(usize, [u8; 4], [u8; 4])>,
+        grass_changes: Vec<(usize, i8, i8)>,
+        net_cost: i32,
+    },
+    Water {
+        water_changes: Vec<(usize, u8, u8)>,
+        height_changes: Vec<(usize, [u8; 4], [u8; 4])>,
+        grass_changes: Vec<(usize, i8, i8)>,
+        created_water_array: bool,
+        net_cost: i32,
+    },
+    Pool {
+        pool_changes: Vec<(usize, u8, u8)>,
+        created_pool_array: bool,
+        net_cost: i32,
+    },
+    Roof {
+        before_raw: Option<Vec<u8>>,
+        after_raw: Vec<u8>,
+    },
 }
 
 impl BuildHistory {
@@ -346,7 +405,11 @@ impl BuildHistory {
         match self {
             Self::Wall { net_cost, .. }
             | Self::Floor { net_cost, .. }
-            | Self::Wallpaper { net_cost, .. } => *net_cost,
+            | Self::Wallpaper { net_cost, .. }
+            | Self::Terrain { net_cost, .. }
+            | Self::Water { net_cost, .. }
+            | Self::Pool { net_cost, .. } => *net_cost,
+            Self::Roof { .. } => 0,
         }
     }
 
@@ -356,7 +419,12 @@ impl BuildHistory {
             Self::Wall {
                 removed_objects, ..
             } => removed_objects,
-            Self::Floor { .. } | Self::Wallpaper { .. } => &[],
+            Self::Floor { .. }
+            | Self::Wallpaper { .. }
+            | Self::Terrain { .. }
+            | Self::Water { .. }
+            | Self::Pool { .. }
+            | Self::Roof { .. } => &[],
         }
     }
 }
@@ -2034,6 +2102,94 @@ impl Interpreter<'_> {
                 }
                 Ok(true)
             }
+            BuildHistory::Terrain {
+                height_changes,
+                grass_changes,
+                net_cost,
+            } => {
+                if !terrain_diffs_match(world, height_changes, grass_changes, false) {
+                    return Ok(false);
+                }
+                apply_terrain_diffs(world, height_changes, grass_changes, false)?;
+                if !height_changes.is_empty() {
+                    self.rebuild_architecture_rooms(world)?;
+                }
+                if *net_cost != 0 {
+                    spend(world, ARCHITECTURE_BUDGET, -*net_cost).map_err(|trap| Fault {
+                        object: 0,
+                        at: None,
+                        trap,
+                    })?;
+                }
+                Ok(true)
+            }
+            BuildHistory::Water {
+                water_changes,
+                height_changes,
+                grass_changes,
+                created_water_array,
+                net_cost,
+            } => {
+                if !byte_array_diffs_match(world, WATER_ARRAY, water_changes, false, false)
+                    || !terrain_diffs_match(world, height_changes, grass_changes, false)
+                {
+                    return Ok(false);
+                }
+                apply_byte_array_diffs(
+                    world,
+                    WATER_ARRAY,
+                    water_changes,
+                    *created_water_array,
+                    false,
+                )?;
+                apply_terrain_diffs(world, height_changes, grass_changes, false)?;
+                if !height_changes.is_empty() {
+                    self.rebuild_architecture_rooms(world)?;
+                }
+                if *net_cost != 0 {
+                    spend(world, ARCHITECTURE_BUDGET, -*net_cost).map_err(|trap| Fault {
+                        object: 0,
+                        at: None,
+                        trap,
+                    })?;
+                }
+                Ok(true)
+            }
+            BuildHistory::Pool {
+                pool_changes,
+                created_pool_array,
+                net_cost,
+            } => {
+                if !byte_array_diffs_match(world, POOL_ARRAY, pool_changes, false, false) {
+                    return Ok(false);
+                }
+                apply_byte_array_diffs(
+                    world,
+                    POOL_ARRAY,
+                    pool_changes,
+                    *created_pool_array,
+                    false,
+                )?;
+                self.rebuild_architecture_rooms(world)?;
+                if *net_cost != 0 {
+                    spend(world, ARCHITECTURE_BUDGET, -*net_cost).map_err(|trap| Fault {
+                        object: 0,
+                        at: None,
+                        trap,
+                    })?;
+                }
+                Ok(true)
+            }
+            BuildHistory::Roof {
+                before_raw,
+                after_raw,
+            } => {
+                if !roof_meta_matches(world, Some(after_raw.as_slice())) {
+                    return Ok(false);
+                }
+                apply_roof_meta_raw(world, before_raw.as_deref());
+                Ok(true)
+            }
         }
     }
 
@@ -2118,6 +2274,99 @@ impl Interpreter<'_> {
                 }
                 Ok(true)
             }
+            BuildHistory::Terrain {
+                height_changes,
+                grass_changes,
+                net_cost,
+            } => {
+                if !terrain_diffs_match(world, height_changes, grass_changes, true) {
+                    return Ok(false);
+                }
+                apply_terrain_diffs(world, height_changes, grass_changes, true)?;
+                if !height_changes.is_empty() {
+                    self.rebuild_architecture_rooms(world)?;
+                }
+                if *net_cost != 0 {
+                    spend(world, ARCHITECTURE_BUDGET, *net_cost).map_err(|trap| Fault {
+                        object: 0,
+                        at: None,
+                        trap,
+                    })?;
+                }
+                Ok(true)
+            }
+            BuildHistory::Water {
+                water_changes,
+                height_changes,
+                grass_changes,
+                created_water_array,
+                net_cost,
+            } => {
+                if !byte_array_diffs_match(
+                    world,
+                    WATER_ARRAY,
+                    water_changes,
+                    *created_water_array,
+                    true,
+                ) || !terrain_diffs_match(world, height_changes, grass_changes, true)
+                {
+                    return Ok(false);
+                }
+                apply_byte_array_diffs(
+                    world,
+                    WATER_ARRAY,
+                    water_changes,
+                    *created_water_array,
+                    true,
+                )?;
+                apply_terrain_diffs(world, height_changes, grass_changes, true)?;
+                if !height_changes.is_empty() {
+                    self.rebuild_architecture_rooms(world)?;
+                }
+                if *net_cost != 0 {
+                    spend(world, ARCHITECTURE_BUDGET, *net_cost).map_err(|trap| Fault {
+                        object: 0,
+                        at: None,
+                        trap,
+                    })?;
+                }
+                Ok(true)
+            }
+            BuildHistory::Pool {
+                pool_changes,
+                created_pool_array,
+                net_cost,
+            } => {
+                if !byte_array_diffs_match(
+                    world,
+                    POOL_ARRAY,
+                    pool_changes,
+                    *created_pool_array,
+                    true,
+                ) {
+                    return Ok(false);
+                }
+                apply_byte_array_diffs(world, POOL_ARRAY, pool_changes, *created_pool_array, true)?;
+                self.rebuild_architecture_rooms(world)?;
+                if *net_cost != 0 {
+                    spend(world, ARCHITECTURE_BUDGET, *net_cost).map_err(|trap| Fault {
+                        object: 0,
+                        at: None,
+                        trap,
+                    })?;
+                }
+                Ok(true)
+            }
+            BuildHistory::Roof {
+                before_raw,
+                after_raw,
+            } => {
+                if !roof_meta_matches(world, before_raw.as_deref()) {
+                    return Ok(false);
+                }
+                apply_roof_meta_raw(world, Some(after_raw.as_slice()));
+                Ok(true)
+            }
         }
     }
 }
@@ -2146,4 +2395,1719 @@ pub fn preview_floor_on_world(world: &mut World, plan: &FloorPlan) {
 
 pub fn preview_wallpaper_on_world(world: &mut World, plan: &WallpaperPlan) {
     let _ = apply_cell_diffs(world, plan.level, &plan.wall_changes, &[], true);
+}
+
+// ============================================================================
+// Build Mode Part 2: Terrain, Water/Pond, Swimming Pool & Roof Style/Pitch
+// ============================================================================
+
+/// Pricing table for Build Mode Part 2 tools (`GameData/Build.iff STR# 128`
+/// and `STR# 133`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolPrices {
+    pub terrain_raise: i32,
+    pub terrain_lower: i32,
+    pub terrain_level: i32,
+    pub grass: i32,
+    pub pool: i32,
+    pub water: i32,
+}
+
+impl Default for ToolPrices {
+    fn default() -> Self {
+        Self {
+            terrain_raise: DEFAULT_TERRAIN_PRICE,
+            terrain_lower: DEFAULT_TERRAIN_PRICE,
+            terrain_level: DEFAULT_TERRAIN_PRICE,
+            grass: DEFAULT_GRASS_PRICE,
+            pool: DEFAULT_POOL_PRICE,
+            water: DEFAULT_WATER_PRICE,
+        }
+    }
+}
+
+/// Terrain editing mode (`BuildTool::Terrain`, `GameData/Build.iff STR# 128`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TerrainMode {
+    /// Raise terrain vertex/vertices (`+$1` per modified vertex).
+    Raise,
+    /// Lower terrain vertex/vertices (`+$1` per modified vertex).
+    Lower,
+    /// Flatten rectangle to the anchor (`start`) vertex height (`+$1` per modified vertex).
+    Level,
+    /// Flatten rectangle to the rounded average height of its editable vertices (`+$1` per modified vertex).
+    LevelAverage,
+    /// Paint healthy green grass back over dirt/sloped tiles (`+$1` per tile).
+    RestoreGrass,
+    /// Ctrl-paint to remove grass back to bare soil (`$0`).
+    RemoveGrass,
+}
+
+/// Computed preview / planned mutation for a Terrain or Grass tool edit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerrainPlan {
+    pub mode: TerrainMode,
+    pub height_changes: Vec<(usize, [u8; 4], [u8; 4])>,
+    pub grass_changes: Vec<(usize, i8, i8)>,
+    pub net_cost: i32,
+    pub valid: bool,
+    pub affordable: bool,
+}
+
+/// Pond/Water editing mode (`BuildTool::Water` — Water Tool, `STR# 133[2]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WaterMode {
+    /// Paint pond water tiles (`+$15` per tile) with basin terrain depression.
+    Paint,
+    /// Ctrl-remove pond water tiles (`-$12`, 80% refund per tile).
+    Remove,
+}
+
+/// Computed preview / planned mutation for a Pond/Water edit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaterPlan {
+    pub mode: WaterMode,
+    pub water_changes: Vec<(usize, u8, u8)>,
+    pub height_changes: Vec<(usize, [u8; 4], [u8; 4])>,
+    pub grass_changes: Vec<(usize, i8, i8)>,
+    pub created_water_array: bool,
+    pub net_cost: i32,
+    pub valid: bool,
+    pub affordable: bool,
+}
+
+/// Swimming Pool editing mode (`BuildTool::Water` — Pool Tool, `STR# 133[1]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PoolMode {
+    /// Drag-dig swimming pool tiles (`+$75` per tile).
+    Dig,
+    /// Ctrl-demolish swimming pool tiles (`-$60`, 80% refund per tile).
+    Demolish,
+}
+
+/// Computed preview / planned mutation for a Swimming Pool edit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolPlan {
+    pub mode: PoolMode,
+    pub pool_changes: Vec<(usize, u8, u8)>,
+    pub created_pool_array: bool,
+    pub net_cost: i32,
+    pub valid: bool,
+    pub affordable: bool,
+}
+
+/// Complete Collection 1.91 roof pitch presets (`HOUS 0` float pitch &
+/// `Res_CPanel.h` `3900..=3904`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RoofPitch {
+    /// Flat roof (`0.0f`, `kBldSbTlRoofFlat = 3904`).
+    Flat,
+    /// Shallow roof (`0.4f`, `kBldSbTlRoofShallow = 3900`).
+    Shallow,
+    /// Medium roof (`0.6f`, `kBldSbTlRoofMedium = 3901`).
+    #[default]
+    Medium,
+    /// Steep roof (`1.0f`, `kBldSbTlRoofSteep = 3902`).
+    Steep,
+}
+
+impl RoofPitch {
+    /// All four native roof pitch presets in shallowest-to-steepest order.
+    pub const ALL: [Self; 4] = [Self::Flat, Self::Shallow, Self::Medium, Self::Steep];
+
+    /// Native `HOUS 0` IEEE-754 `f32` roof slope value.
+    pub const fn as_f32(self) -> f32 {
+        match self {
+            Self::Flat => 0.0,
+            Self::Shallow => 0.4,
+            Self::Medium => 0.6,
+            Self::Steep => 1.0,
+        }
+    }
+
+    /// Maps an arbitrary `HOUS 0` `f32` pitch value to the closest preset.
+    pub fn from_f32(value: f32) -> Self {
+        if !value.is_finite() {
+            return Self::Medium;
+        }
+        let mut best = Self::Medium;
+        let mut best_dist = f32::INFINITY;
+        for preset in Self::ALL {
+            let d = (value - preset.as_f32()).abs();
+            if d < best_dist {
+                best_dist = d;
+                best = preset;
+            }
+        }
+        best
+    }
+}
+
+/// Active lot roof texture stem and pitch preset (`HOUS 0`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoofState {
+    /// Texture stem inside `GameData/Roofs/` without `.bmp` (e.g. `"r1_"`).
+    pub pattern: String,
+    /// Roof slope preset (`Flat`, `Shallow`, `Medium`, `Steep`).
+    pub pitch: RoofPitch,
+}
+
+impl Default for RoofState {
+    fn default() -> Self {
+        Self {
+            pattern: DEFAULT_ROOF_PATTERN.to_owned(),
+            pitch: RoofPitch::Medium,
+        }
+    }
+}
+
+impl RoofState {
+    /// Decodes the native roof pitch (`f32` bits in `HouseView::unknown_word`)
+    /// and texture stem (`HouseView::roof`) from a parsed `HOUS 0` chunk.
+    pub fn from_house_view(view: &HouseView) -> Self {
+        let pitch_f32 = f32::from_bits(view.unknown_word);
+        let stem = normalize_roof_stem(&view.roof);
+        Self {
+            pattern: if stem.is_empty() {
+                DEFAULT_ROOF_PATTERN.to_owned()
+            } else {
+                stem
+            },
+            pitch: RoofPitch::from_f32(pitch_f32),
+        }
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + self.pattern.len());
+        out.extend_from_slice(&self.pitch.as_f32().to_le_bytes());
+        out.extend_from_slice(self.pattern.as_bytes());
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 4 {
+            return None;
+        }
+        let pitch_f32 = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let stem = std::str::from_utf8(&bytes[4..]).ok()?;
+        let pattern = normalize_roof_stem(stem);
+        if pattern.is_empty() {
+            return None;
+        }
+        Some(Self {
+            pattern,
+            pitch: RoofPitch::from_f32(pitch_f32),
+        })
+    }
+}
+
+/// Computed planned mutation for changing roof pattern and/or pitch (`$0`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoofPlan {
+    pub before_raw: Option<Vec<u8>>,
+    pub before: RoofState,
+    pub after: RoofState,
+    pub valid: bool,
+}
+
+fn normalize_roof_stem(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let bytes = trimmed.as_bytes();
+    if bytes.len() >= 4 && bytes[bytes.len() - 4..].eq_ignore_ascii_case(b".bmp") {
+        trimmed[..trimmed.len() - 4].to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+fn is_locked_tile(world: &World, x: usize, y: usize) -> bool {
+    let idx = cell_index(x, y);
+    world
+        .arrays
+        .get(&FLAGS_ARRAY[0])
+        .filter(|a| a.stride == 1)
+        .and_then(|a| a.data.get(idx).copied())
+        .is_some_and(|bits| (bits & FLAG_LOCKED) != 0)
+}
+
+/// Whether tile `(x, y)` is currently a swimming pool tile (`Arry 9 < 16`).
+pub fn is_pool_tile(world: &World, x: usize, y: usize) -> bool {
+    if x >= FULL_SIZE || y >= FULL_SIZE {
+        return false;
+    }
+    let idx = cell_index(x, y);
+    world
+        .arrays
+        .get(&POOL_ARRAY)
+        .filter(|a| a.stride == 1)
+        .and_then(|a| a.data.get(idx).copied())
+        .is_some_and(|v| v < 16)
+}
+
+/// Whether tile `(x, y)` is currently a pond/river water tile (`Arry 10 < 16`).
+pub fn is_water_tile(world: &World, x: usize, y: usize) -> bool {
+    if x >= FULL_SIZE || y >= FULL_SIZE {
+        return false;
+    }
+    let idx = cell_index(x, y);
+    world
+        .arrays
+        .get(&WATER_ARRAY)
+        .filter(|a| a.stride == 1)
+        .and_then(|a| a.data.get(idx).copied())
+        .is_some_and(|v| v < 16)
+}
+
+fn tile_has_any_wall(world: &World, x: usize, y: usize, level_idx: usize) -> bool {
+    let active = usize::try_from(world.size).unwrap_or(0);
+    let Some(walls) = world.arrays.get(&WALLS[level_idx]) else {
+        return false;
+    };
+    if walls.stride != WALL_CELL || x >= active || y >= active {
+        return false;
+    }
+    ExpandedWall::get(&walls.data, active, x, y).segments != 0
+}
+
+fn tile_has_any_floor(world: &World, x: usize, y: usize, level_idx: usize) -> bool {
+    let Some(floors) = world.arrays.get(&FLOORS[level_idx]) else {
+        return false;
+    };
+    if floors.stride != 2 {
+        return false;
+    }
+    read_floor(&floors.data, x, y) != 0
+}
+
+fn tile_has_non_cursor_object(world: &World, x: usize, y: usize, level: Option<u8>) -> bool {
+    let tx = x as i32;
+    let ty = y as i32;
+    for obj in world.objects.values() {
+        if obj.guid == WALL_CURSOR_GUID || obj.guid == crate::buy::TILE_CURSOR_GUID {
+            continue;
+        }
+        if !on_lot([obj.position[0], obj.position[1]]) {
+            continue;
+        }
+        if let Some(lvl) = level
+            && obj.position[2] != i32::from(lvl)
+        {
+            continue;
+        }
+        if (obj.position[0] >> 4) == tx && (obj.position[1] >> 4) == ty {
+            return true;
+        }
+    }
+    false
+}
+
+/// Checks whether a single ground tile `(x, y)` allows terrain elevation
+/// changes (bounds, off-road, unlocked, no walls/floors/pool/water/objects).
+fn tile_allows_terrain_elevation(world: &World, x: usize, y: usize, allow_water: bool) -> bool {
+    if !is_buildable_tile(world, x, y, 1) || is_locked_tile(world, x, y) {
+        return false;
+    }
+    if is_pool_tile(world, x, y) || (!allow_water && is_water_tile(world, x, y)) {
+        return false;
+    }
+    if tile_has_any_wall(world, x, y, 0)
+        || tile_has_any_wall(world, x, y, 1)
+        || tile_has_any_floor(world, x, y, 0)
+        || tile_has_any_floor(world, x, y, 1)
+    {
+        return false;
+    }
+    !tile_has_non_cursor_object(world, x, y, None)
+}
+
+/// Reads the elevation (`u8` terrain steps) of grid vertex `(vx, vy)` from
+/// `Arry 0` (`heights`), where tile `(tx, ty)` stores corners
+/// `[SW(0,1), NW(0,0), NE(1,0), SE(1,1)]`.
+pub fn terrain_vertex_height(world: &World, vx: usize, vy: usize) -> Option<u8> {
+    let heights = world.arrays.get(&HEIGHTS_ARRAY)?;
+    if heights.stride != 4 {
+        return None;
+    }
+    read_vertex_height(&heights.data, vx, vy)
+}
+
+fn read_vertex_height(heights: &[u8], vx: usize, vy: usize) -> Option<u8> {
+    if vx < FULL_SIZE && vy < FULL_SIZE {
+        return heights.get(cell_index(vx, vy) * 4 + 1).copied();
+    }
+    if vx == FULL_SIZE && vy < FULL_SIZE {
+        return heights.get(cell_index(vx - 1, vy) * 4 + 2).copied();
+    }
+    if vx < FULL_SIZE && vy == FULL_SIZE {
+        return heights.get(cell_index(vx, vy - 1) * 4).copied();
+    }
+    if vx == FULL_SIZE && vy == FULL_SIZE {
+        return heights.get(cell_index(vx - 1, vy - 1) * 4 + 3).copied();
+    }
+    None
+}
+
+/// Writes `value` into every tile corner sharing vertex `(vx, vy)` in `heights`.
+fn write_vertex_height(heights: &mut [u8], vx: usize, vy: usize, value: u8) {
+    if vx > 0 && vy > 0 && vx <= FULL_SIZE && vy <= FULL_SIZE {
+        heights[cell_index(vx - 1, vy - 1) * 4 + 3] = value;
+    }
+    if vx < FULL_SIZE && vy > 0 && vy <= FULL_SIZE {
+        heights[cell_index(vx, vy - 1) * 4] = value;
+    }
+    if vx > 0 && vy < FULL_SIZE && vx <= FULL_SIZE {
+        heights[cell_index(vx - 1, vy) * 4 + 2] = value;
+    }
+    if vx < FULL_SIZE && vy < FULL_SIZE {
+        heights[cell_index(vx, vy) * 4 + 1] = value;
+    }
+}
+
+/// Whether grid vertex `(vx, vy)` can be raised, lowered, or leveled (all four
+/// incident tiles are editable buildable land without roads, locks, walls,
+/// floors, pools, water, or objects).
+pub fn is_terrain_vertex_editable(world: &World, vx: usize, vy: usize) -> bool {
+    is_terrain_vertex_editable_inner(world, vx, vy, false)
+}
+
+fn is_terrain_vertex_editable_inner(
+    world: &World,
+    vx: usize,
+    vy: usize,
+    allow_water: bool,
+) -> bool {
+    let active = usize::try_from(world.size).unwrap_or(0);
+    if active < 4 || vx < 2 || vy < 2 || vx + 1 >= active || vy + 1 >= active {
+        return false;
+    }
+    for (tx, ty) in [(vx - 1, vy - 1), (vx, vy - 1), (vx - 1, vy), (vx, vy)] {
+        if !tile_allows_terrain_elevation(world, tx, ty, allow_water) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether tile `(x, y)` can be painted with Grass or stripped to soil.
+pub fn is_grass_tile_editable(world: &World, x: usize, y: usize) -> bool {
+    is_buildable_tile(world, x, y, 1)
+        && !is_locked_tile(world, x, y)
+        && !is_pool_or_water_tile(world, x, y)
+        && !tile_has_any_floor(world, x, y, 0)
+}
+
+fn vertex_slope_ok(heights: &[u8], active: usize, vx: usize, vy: usize, new_h: u8) -> bool {
+    let Some(cur_h) = read_vertex_height(heights, vx, vy) else {
+        return false;
+    };
+    let neighbors = [
+        (vx.checked_sub(1), Some(vy)),
+        ((vx < active).then_some(vx + 1), Some(vy)),
+        (Some(vx), vy.checked_sub(1)),
+        (Some(vx), (vy < active).then_some(vy + 1)),
+    ];
+    for (nx, ny) in neighbors {
+        let (Some(nx), Some(ny)) = (nx, ny) else {
+            continue;
+        };
+        let Some(nh) = read_vertex_height(heights, nx, ny) else {
+            continue;
+        };
+        let new_diff = new_h.abs_diff(nh);
+        let old_diff = cur_h.abs_diff(nh);
+        if new_diff > MAX_TERRAIN_SLOPE && new_diff > old_diff {
+            return false;
+        }
+    }
+    true
+}
+
+/// Plans a Terrain raise/lower/level or Grass restore/remove edit without
+/// mutating `world`.
+pub fn plan_terrain_edit(
+    world: &World,
+    start: [i32; 2],
+    end: [i32; 2],
+    mode: TerrainMode,
+    prices: &ToolPrices,
+) -> TerrainPlan {
+    let active = usize::try_from(world.size).unwrap_or(0);
+    let empty = TerrainPlan {
+        mode,
+        height_changes: Vec::new(),
+        grass_changes: Vec::new(),
+        net_cost: 0,
+        valid: false,
+        affordable: true,
+    };
+    if active < 4 {
+        return empty;
+    }
+
+    match mode {
+        TerrainMode::RestoreGrass | TerrainMode::RemoveGrass => {
+            let Some(orig_grass) = world.arrays.get(&GRASS_ARRAY).filter(|a| a.stride == 1) else {
+                return empty;
+            };
+            let target_grass = world
+                .arrays
+                .get(&TARGET_GRASS_ARRAY)
+                .filter(|a| a.stride == 1);
+            let min_x = start[0].min(end[0]).max(1);
+            let max_x = start[0].max(end[0]).min(active as i32 - 2);
+            let min_y = start[1].min(end[1]).max(1);
+            let max_y = start[1].max(end[1]).min(active as i32 - 2);
+            if min_x > max_x || min_y > max_y {
+                return empty;
+            }
+            let funds = available_funds(world);
+            let mut grass_changes = Vec::new();
+            let mut net_cost = 0i32;
+            let mut affordable = true;
+            for x in min_x..=max_x {
+                for y in min_y..=max_y {
+                    let ux = x as usize;
+                    let uy = y as usize;
+                    if !is_grass_tile_editable(world, ux, uy) {
+                        continue;
+                    }
+                    let idx = cell_index(ux, uy);
+                    let cur = orig_grass.data[idx] as i8;
+                    let next = match mode {
+                        TerrainMode::RestoreGrass => {
+                            let target = target_grass
+                                .and_then(|t| t.data.get(idx).copied())
+                                .map(|b| b as i8)
+                                .unwrap_or(GRASS_RESTORED_VALUE);
+                            let desired = GRASS_RESTORED_VALUE.max(target);
+                            if cur >= desired {
+                                continue;
+                            }
+                            desired
+                        }
+                        TerrainMode::RemoveGrass => {
+                            if cur <= TERRAIN_DIRT_GRASS {
+                                continue;
+                            }
+                            TERRAIN_DIRT_GRASS
+                        }
+                        _ => unreachable!(),
+                    };
+                    let step_cost = if mode == TerrainMode::RestoreGrass {
+                        prices.grass.max(0)
+                    } else {
+                        0
+                    };
+                    if net_cost.saturating_add(step_cost) > funds {
+                        affordable = false;
+                        break;
+                    }
+                    net_cost = net_cost.saturating_add(step_cost);
+                    grass_changes.push((idx, cur, next));
+                }
+                if !affordable {
+                    break;
+                }
+            }
+            let valid = !grass_changes.is_empty();
+            TerrainPlan {
+                mode,
+                height_changes: Vec::new(),
+                grass_changes,
+                net_cost,
+                valid,
+                affordable: affordable && (net_cost <= 0 || net_cost <= funds),
+            }
+        }
+        TerrainMode::Raise
+        | TerrainMode::Lower
+        | TerrainMode::Level
+        | TerrainMode::LevelAverage => {
+            let Some(orig_heights) = world.arrays.get(&HEIGHTS_ARRAY).filter(|a| a.stride == 4)
+            else {
+                return empty;
+            };
+            let min_x = start[0].min(end[0]).max(2);
+            let max_x = start[0].max(end[0]).min(active as i32 - 2);
+            let min_y = start[1].min(end[1]).max(2);
+            let max_y = start[1].max(end[1]).min(active as i32 - 2);
+            if min_x > max_x || min_y > max_y {
+                return empty;
+            }
+
+            let mut heights_buf = orig_heights.data.clone();
+            let mut editable = Vec::new();
+            for vx in min_x..=max_x {
+                for vy in min_y..=max_y {
+                    let uvx = vx as usize;
+                    let uvy = vy as usize;
+                    if is_terrain_vertex_editable(world, uvx, uvy) {
+                        editable.push((uvx, uvy));
+                    }
+                }
+            }
+            if editable.is_empty() {
+                return empty;
+            }
+
+            let mut changed_vertices = 0i32;
+            match mode {
+                TerrainMode::Raise | TerrainMode::Lower => {
+                    for &(vx, vy) in &editable {
+                        let Some(cur) = read_vertex_height(&heights_buf, vx, vy) else {
+                            continue;
+                        };
+                        let next = if mode == TerrainMode::Raise {
+                            cur.saturating_add(1)
+                        } else {
+                            cur.saturating_sub(1)
+                        };
+                        if next == cur || !vertex_slope_ok(&heights_buf, active, vx, vy, next) {
+                            continue;
+                        }
+                        write_vertex_height(&mut heights_buf, vx, vy, next);
+                        changed_vertices += 1;
+                    }
+                }
+                TerrainMode::Level | TerrainMode::LevelAverage => {
+                    let target_h = if mode == TerrainMode::Level {
+                        let ax = start[0].clamp(0, active as i32) as usize;
+                        let ay = start[1].clamp(0, active as i32) as usize;
+                        let Some(h) = read_vertex_height(&orig_heights.data, ax, ay) else {
+                            return empty;
+                        };
+                        h
+                    } else {
+                        let sum: u64 = editable
+                            .iter()
+                            .filter_map(|&(vx, vy)| {
+                                read_vertex_height(&orig_heights.data, vx, vy).map(u64::from)
+                            })
+                            .sum();
+                        let count = editable.len() as u64;
+                        ((sum + count / 2) / count) as u8
+                    };
+                    let editable_set: BTreeSet<(usize, usize)> = editable.iter().copied().collect();
+                    let mut lo: BTreeMap<(usize, usize), i32> = BTreeMap::new();
+                    let mut hi: BTreeMap<(usize, usize), i32> = BTreeMap::new();
+                    for &v in &editable {
+                        lo.insert(v, 0);
+                        hi.insert(v, i32::from(u8::MAX));
+                    }
+                    // Seed bounds from fixed (non-editable) neighbors outside the drag rectangle.
+                    let slope = i32::from(MAX_TERRAIN_SLOPE);
+                    for &(vx, vy) in &editable {
+                        let cur = i32::from(
+                            read_vertex_height(&orig_heights.data, vx, vy).unwrap_or(target_h),
+                        );
+                        for (nx, ny) in [
+                            (vx.checked_sub(1), Some(vy)),
+                            ((vx < active).then_some(vx + 1), Some(vy)),
+                            (Some(vx), vy.checked_sub(1)),
+                            (Some(vx), (vy < active).then_some(vy + 1)),
+                        ] {
+                            let (Some(nx), Some(ny)) = (nx, ny) else {
+                                continue;
+                            };
+                            if editable_set.contains(&(nx, ny)) {
+                                continue;
+                            }
+                            if let Some(nh) = read_vertex_height(&orig_heights.data, nx, ny) {
+                                let nh = i32::from(nh);
+                                let allowed = slope.max((cur - nh).abs());
+                                *lo.get_mut(&(vx, vy)).unwrap() = lo[&(vx, vy)].max(nh - allowed);
+                                *hi.get_mut(&(vx, vy)).unwrap() = hi[&(vx, vy)].min(nh + allowed);
+                            }
+                        }
+                    }
+                    // Relax feasible intervals across internal edges of the editable set.
+                    let mut changed = true;
+                    let mut guard = editable.len().saturating_add(1);
+                    while changed && guard > 0 {
+                        changed = false;
+                        guard -= 1;
+                        for &(vx, vy) in &editable {
+                            let mut cur_lo = lo[&(vx, vy)];
+                            let mut cur_hi = hi[&(vx, vy)];
+                            for (nx, ny) in [
+                                (vx.checked_sub(1), Some(vy)),
+                                ((vx < active).then_some(vx + 1), Some(vy)),
+                                (Some(vx), vy.checked_sub(1)),
+                                (Some(vx), (vy < active).then_some(vy + 1)),
+                            ] {
+                                let (Some(nx), Some(ny)) = (nx, ny) else {
+                                    continue;
+                                };
+                                if !editable_set.contains(&(nx, ny)) {
+                                    continue;
+                                }
+                                let nlo = lo[&(nx, ny)] - slope;
+                                let nhi = hi[&(nx, ny)] + slope;
+                                if nlo > cur_lo {
+                                    cur_lo = nlo;
+                                    lo.insert((vx, vy), nlo);
+                                    changed = true;
+                                }
+                                if nhi < cur_hi {
+                                    cur_hi = nhi;
+                                    hi.insert((vx, vy), nhi);
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                    for &(vx, vy) in &editable {
+                        let Some(cur) = read_vertex_height(&orig_heights.data, vx, vy) else {
+                            continue;
+                        };
+                        let v_lo = lo[&(vx, vy)];
+                        let v_hi = hi[&(vx, vy)];
+                        let next = if v_lo <= v_hi {
+                            i32::from(target_h).clamp(v_lo, v_hi).clamp(0, 255) as u8
+                        } else {
+                            cur
+                        };
+                        if next != cur {
+                            write_vertex_height(&mut heights_buf, vx, vy, next);
+                            changed_vertices += 1;
+                        }
+                    }
+                }
+                TerrainMode::RestoreGrass | TerrainMode::RemoveGrass => unreachable!(),
+            }
+
+            let mut height_changes = Vec::new();
+            let mut disturbed_tiles = Vec::new();
+            for idx in 0..(FULL_SIZE * FULL_SIZE) {
+                let off = idx * 4;
+                let before = [
+                    orig_heights.data[off],
+                    orig_heights.data[off + 1],
+                    orig_heights.data[off + 2],
+                    orig_heights.data[off + 3],
+                ];
+                let after = [
+                    heights_buf[off],
+                    heights_buf[off + 1],
+                    heights_buf[off + 2],
+                    heights_buf[off + 3],
+                ];
+                if before != after {
+                    height_changes.push((idx, before, after));
+                    disturbed_tiles.push(idx);
+                }
+            }
+            let mut grass_changes = Vec::new();
+            if let Some(orig_grass) = world.arrays.get(&GRASS_ARRAY).filter(|a| a.stride == 1) {
+                for idx in disturbed_tiles {
+                    let cur = orig_grass.data[idx] as i8;
+                    if cur > TERRAIN_DIRT_GRASS {
+                        grass_changes.push((idx, cur, TERRAIN_DIRT_GRASS));
+                    }
+                }
+            }
+
+            let unit_price = match mode {
+                TerrainMode::Raise => prices.terrain_raise.max(0),
+                TerrainMode::Lower => prices.terrain_lower.max(0),
+                TerrainMode::Level | TerrainMode::LevelAverage => prices.terrain_level.max(0),
+                TerrainMode::RestoreGrass | TerrainMode::RemoveGrass => 0,
+            };
+            let net_cost = changed_vertices.saturating_mul(unit_price);
+            let affordable = net_cost <= 0 || net_cost <= available_funds(world);
+            TerrainPlan {
+                mode,
+                valid: !height_changes.is_empty(),
+                height_changes,
+                grass_changes,
+                net_cost,
+                affordable,
+            }
+        }
+    }
+}
+
+/// Recomputes the native 4-bit cardinal connectivity bitmask (`0x00..=0x0f`:
+/// `N=1, W=2, S=4, E=8`) for every present (`< 16`) cell in `buf`.
+fn recompute_water_pool_masks(buf: &mut [u8], active: usize) {
+    let snapshot: Vec<bool> = buf.iter().map(|&v| v < 16).collect();
+    for x in 0..active.min(FULL_SIZE) {
+        for y in 0..active.min(FULL_SIZE) {
+            let idx = cell_index(x, y);
+            if !snapshot[idx] {
+                continue;
+            }
+            let mut mask = 0u8;
+            if y > 0 && snapshot[cell_index(x, y - 1)] {
+                mask |= 0x01; // North
+            }
+            if x > 0 && snapshot[cell_index(x - 1, y)] {
+                mask |= 0x02; // West
+            }
+            if y + 1 < active && snapshot[cell_index(x, y + 1)] {
+                mask |= 0x04; // South
+            }
+            if x + 1 < active && snapshot[cell_index(x + 1, y)] {
+                mask |= 0x08; // East
+            }
+            buf[idx] = mask;
+        }
+    }
+}
+
+fn tile_supports_water_paint(world: &World, x: usize, y: usize) -> bool {
+    is_buildable_tile(world, x, y, 1)
+        && !is_locked_tile(world, x, y)
+        && !is_pool_tile(world, x, y)
+        && !tile_has_any_wall(world, x, y, 0)
+        && !tile_has_any_wall(world, x, y, 1)
+        && !tile_has_any_floor(world, x, y, 0)
+        && !tile_has_non_cursor_object(world, x, y, Some(1))
+}
+
+fn tile_supports_water_remove(world: &World, x: usize, y: usize) -> bool {
+    is_buildable_tile(world, x, y, 1)
+        && !is_locked_tile(world, x, y)
+        && !tile_has_non_cursor_object(world, x, y, Some(1))
+}
+
+/// Plans painting or Ctrl-removing pond water tiles (`Arry 10`) with native
+/// Complete Collection 1.91 connectivity masks and basin terrain depression.
+pub fn plan_water_edit(
+    world: &World,
+    start_tile: [i32; 2],
+    end_tile: [i32; 2],
+    mode: WaterMode,
+    prices: &ToolPrices,
+) -> WaterPlan {
+    let active = usize::try_from(world.size).unwrap_or(0);
+    let empty = WaterPlan {
+        mode,
+        water_changes: Vec::new(),
+        height_changes: Vec::new(),
+        grass_changes: Vec::new(),
+        created_water_array: false,
+        net_cost: 0,
+        valid: false,
+        affordable: true,
+    };
+    if active < 4 {
+        return empty;
+    }
+    let min_x = start_tile[0].min(end_tile[0]);
+    let max_x = start_tile[0].max(end_tile[0]);
+    let min_y = start_tile[1].min(end_tile[1]);
+    let max_y = start_tile[1].max(end_tile[1]);
+    if min_x < 1
+        || min_y < 1
+        || max_x + 1 >= active as i32
+        || max_y + 1 >= active as i32
+        || min_x > max_x
+        || min_y > max_y
+    {
+        return empty;
+    }
+
+    let created_water_array = !world.arrays.contains_key(&WATER_ARRAY);
+    let orig_water: Vec<u8> = match world.arrays.get(&WATER_ARRAY) {
+        Some(a) if a.stride == 1 && a.data.len() == FULL_SIZE * FULL_SIZE => a.data.clone(),
+        Some(_) => return empty,
+        None => vec![0xff; FULL_SIZE * FULL_SIZE],
+    };
+    let mut water_buf = orig_water.clone();
+    let mut changed_tiles = Vec::new();
+
+    for x in min_x..=max_x {
+        for y in min_y..=max_y {
+            let ux = x as usize;
+            let uy = y as usize;
+            let idx = cell_index(ux, uy);
+            let is_wet = orig_water[idx] < 16;
+            match mode {
+                WaterMode::Paint => {
+                    if is_wet {
+                        continue;
+                    }
+                    if !tile_supports_water_paint(world, ux, uy) {
+                        return empty;
+                    }
+                    water_buf[idx] = 0;
+                    changed_tiles.push((ux, uy));
+                }
+                WaterMode::Remove => {
+                    if !is_wet {
+                        continue;
+                    }
+                    if !tile_supports_water_remove(world, ux, uy) {
+                        return empty;
+                    }
+                    water_buf[idx] = 0xff;
+                    changed_tiles.push((ux, uy));
+                }
+            }
+        }
+    }
+
+    if changed_tiles.is_empty() {
+        return empty;
+    }
+
+    recompute_water_pool_masks(&mut water_buf, active);
+
+    let mut water_changes = Vec::new();
+    for idx in 0..(FULL_SIZE * FULL_SIZE) {
+        if orig_water[idx] != water_buf[idx] {
+            water_changes.push((idx, orig_water[idx], water_buf[idx]));
+        }
+    }
+
+    // Depress mutable basin vertices on Paint, or restore depressed vertices on Remove.
+    let mut height_changes = Vec::new();
+    let mut grass_changes = Vec::new();
+    if let Some(orig_heights) = world.arrays.get(&HEIGHTS_ARRAY).filter(|a| a.stride == 4) {
+        let mut heights_buf = orig_heights.data.clone();
+        let mut candidate_vertices = BTreeSet::new();
+        for &(tx, ty) in &changed_tiles {
+            for (vx, vy) in [(tx, ty), (tx + 1, ty), (tx, ty + 1), (tx + 1, ty + 1)] {
+                candidate_vertices.insert((vx, vy));
+            }
+        }
+        for (vx, vy) in candidate_vertices {
+            if !is_terrain_vertex_editable_inner(world, vx, vy, true) {
+                continue;
+            }
+            let Some(cur) = read_vertex_height(&heights_buf, vx, vy) else {
+                continue;
+            };
+            match mode {
+                WaterMode::Paint => {
+                    let next = cur.saturating_sub(1);
+                    if next != cur && vertex_slope_ok(&heights_buf, active, vx, vy, next) {
+                        write_vertex_height(&mut heights_buf, vx, vy, next);
+                    }
+                }
+                WaterMode::Remove => {
+                    // Only raise vertices that no longer border any surviving water tile.
+                    let still_wet = [(vx - 1, vy - 1), (vx, vy - 1), (vx - 1, vy), (vx, vy)]
+                        .into_iter()
+                        .any(|(tx, ty)| water_buf[cell_index(tx, ty)] < 16);
+                    if still_wet {
+                        continue;
+                    }
+                    let mut bank_sum = 0u32;
+                    let mut bank_count = 0u32;
+                    for (nx, ny) in [
+                        (vx.checked_sub(1), Some(vy)),
+                        ((vx < active).then_some(vx + 1), Some(vy)),
+                        (Some(vx), vy.checked_sub(1)),
+                        (Some(vx), (vy < active).then_some(vy + 1)),
+                    ] {
+                        let (Some(nx), Some(ny)) = (nx, ny) else {
+                            continue;
+                        };
+                        if let Some(nh) = read_vertex_height(&orig_heights.data, nx, ny)
+                            && nh > cur
+                        {
+                            bank_sum += u32::from(nh);
+                            bank_count += 1;
+                        }
+                    }
+                    if let Some(target) = (bank_sum + bank_count / 2).checked_div(bank_count) {
+                        let next = cur.saturating_add(1).min(target as u8);
+                        if next != cur && vertex_slope_ok(&heights_buf, active, vx, vy, next) {
+                            write_vertex_height(&mut heights_buf, vx, vy, next);
+                        }
+                    }
+                }
+            }
+        }
+        let mut disturbed = Vec::new();
+        for idx in 0..(FULL_SIZE * FULL_SIZE) {
+            let off = idx * 4;
+            let b = [
+                orig_heights.data[off],
+                orig_heights.data[off + 1],
+                orig_heights.data[off + 2],
+                orig_heights.data[off + 3],
+            ];
+            let a = [
+                heights_buf[off],
+                heights_buf[off + 1],
+                heights_buf[off + 2],
+                heights_buf[off + 3],
+            ];
+            if b != a {
+                height_changes.push((idx, b, a));
+                disturbed.push(idx);
+            }
+        }
+        if let Some(orig_grass) = world.arrays.get(&GRASS_ARRAY).filter(|a| a.stride == 1) {
+            for idx in disturbed {
+                let cur = orig_grass.data[idx] as i8;
+                if cur > TERRAIN_DIRT_GRASS {
+                    grass_changes.push((idx, cur, TERRAIN_DIRT_GRASS));
+                }
+            }
+        }
+    }
+
+    let count = changed_tiles.len() as i32;
+    let net_cost = match mode {
+        WaterMode::Paint => count.saturating_mul(prices.water.max(0)),
+        WaterMode::Remove => -count.saturating_mul(build_refund(prices.water)),
+    };
+    let affordable = net_cost <= 0 || net_cost <= available_funds(world);
+    WaterPlan {
+        mode,
+        water_changes,
+        height_changes,
+        grass_changes,
+        created_water_array,
+        net_cost,
+        valid: true,
+        affordable,
+    }
+}
+
+fn tile_flat_elevation(world: &World, x: usize, y: usize) -> Option<u8> {
+    let heights = world.arrays.get(&HEIGHTS_ARRAY)?;
+    if heights.stride != 4 {
+        return None;
+    }
+    let off = cell_index(x, y) * 4;
+    let c = heights.data.get(off..off + 4)?;
+    (c[0] == c[1] && c[1] == c[2] && c[2] == c[3]).then_some(c[0])
+}
+
+fn tile_supports_pool_dig(world: &World, x: usize, y: usize) -> bool {
+    is_buildable_tile(world, x, y, 1)
+        && !is_locked_tile(world, x, y)
+        && is_flat_tile(world, x, y)
+        && !is_water_tile(world, x, y)
+        && !tile_has_any_wall(world, x, y, 0)
+        && !tile_has_any_wall(world, x, y, 1)
+        && !tile_has_any_floor(world, x, y, 0)
+        && !tile_has_any_floor(world, x, y, 1)
+        && !tile_has_non_cursor_object(world, x, y, Some(1))
+}
+
+fn tile_supports_pool_demolish(world: &World, x: usize, y: usize) -> bool {
+    is_buildable_tile(world, x, y, 1)
+        && !is_locked_tile(world, x, y)
+        && !tile_has_non_cursor_object(world, x, y, Some(1))
+}
+
+/// Plans swimming pool drag digging or Ctrl demolition (`Arry 9`, flat-ground
+/// & no-wall/no-floor/no-object guards, exact `$75` pricing and 80% `$60` refund).
+pub fn plan_pool_edit(
+    world: &World,
+    start_tile: [i32; 2],
+    end_tile: [i32; 2],
+    mode: PoolMode,
+    prices: &ToolPrices,
+) -> PoolPlan {
+    let active = usize::try_from(world.size).unwrap_or(0);
+    let empty = PoolPlan {
+        mode,
+        pool_changes: Vec::new(),
+        created_pool_array: false,
+        net_cost: 0,
+        valid: false,
+        affordable: true,
+    };
+    if active < 4 {
+        return empty;
+    }
+    let min_x = start_tile[0].min(end_tile[0]);
+    let max_x = start_tile[0].max(end_tile[0]);
+    let min_y = start_tile[1].min(end_tile[1]);
+    let max_y = start_tile[1].max(end_tile[1]);
+    if min_x < 1
+        || min_y < 1
+        || max_x + 1 >= active as i32
+        || max_y + 1 >= active as i32
+        || min_x > max_x
+        || min_y > max_y
+    {
+        return empty;
+    }
+
+    let created_pool_array = !world.arrays.contains_key(&POOL_ARRAY);
+    let orig_pool: Vec<u8> = match world.arrays.get(&POOL_ARRAY) {
+        Some(a) if a.stride == 1 && a.data.len() == FULL_SIZE * FULL_SIZE => a.data.clone(),
+        Some(_) => return empty,
+        None => vec![0xff; FULL_SIZE * FULL_SIZE],
+    };
+    let mut pool_buf = orig_pool.clone();
+    let mut changed_count = 0i32;
+    let mut pool_elev: Option<u8> = None;
+
+    for x in min_x..=max_x {
+        for y in min_y..=max_y {
+            let ux = x as usize;
+            let uy = y as usize;
+            let idx = cell_index(ux, uy);
+            let is_pool = orig_pool[idx] < 16;
+            match mode {
+                PoolMode::Dig => {
+                    let Some(elev) = tile_flat_elevation(world, ux, uy) else {
+                        return empty;
+                    };
+                    if let Some(expected) = pool_elev {
+                        if elev != expected {
+                            return empty;
+                        }
+                    } else {
+                        pool_elev = Some(elev);
+                    }
+                    if is_pool {
+                        continue;
+                    }
+                    if !tile_supports_pool_dig(world, ux, uy) {
+                        return empty;
+                    }
+                    // Adjacent existing pool tiles must share the same flat elevation.
+                    for (nx, ny) in [
+                        (ux.checked_sub(1), Some(uy)),
+                        ((ux + 1 < active).then_some(ux + 1), Some(uy)),
+                        (Some(ux), uy.checked_sub(1)),
+                        (Some(ux), (uy + 1 < active).then_some(uy + 1)),
+                    ] {
+                        let (Some(nx), Some(ny)) = (nx, ny) else {
+                            continue;
+                        };
+                        if orig_pool[cell_index(nx, ny)] < 16
+                            && tile_flat_elevation(world, nx, ny) != Some(elev)
+                        {
+                            return empty;
+                        }
+                    }
+                    pool_buf[idx] = 0;
+                    changed_count += 1;
+                }
+                PoolMode::Demolish => {
+                    if !is_pool {
+                        continue;
+                    }
+                    if !tile_supports_pool_demolish(world, ux, uy) {
+                        return empty;
+                    }
+                    pool_buf[idx] = 0xff;
+                    changed_count += 1;
+                }
+            }
+        }
+    }
+
+    if changed_count == 0 {
+        return empty;
+    }
+
+    recompute_water_pool_masks(&mut pool_buf, active);
+
+    let mut pool_changes = Vec::new();
+    for idx in 0..(FULL_SIZE * FULL_SIZE) {
+        if orig_pool[idx] != pool_buf[idx] {
+            pool_changes.push((idx, orig_pool[idx], pool_buf[idx]));
+        }
+    }
+
+    let net_cost = match mode {
+        PoolMode::Dig => changed_count.saturating_mul(prices.pool.max(0)),
+        PoolMode::Demolish => -changed_count.saturating_mul(build_refund(prices.pool)),
+    };
+    let affordable = net_cost <= 0 || net_cost <= available_funds(world);
+    PoolPlan {
+        mode,
+        pool_changes,
+        created_pool_array,
+        net_cost,
+        valid: true,
+        affordable,
+    }
+}
+
+/// Reads the lot's active [`RoofState`] from `world`, falling back to
+/// [`RoofState::default`] (`r1_`, `Medium`) when never edited.
+pub fn roof_state(world: &World) -> RoofState {
+    world
+        .arrays
+        .get(&ROOF_META_ARRAY)
+        .and_then(|arr| RoofState::decode(&arr.data))
+        .unwrap_or_default()
+}
+
+/// Plans changing the lot's roof texture pattern and/or pitch (`$0`).
+pub fn plan_roof_edit(world: &World, pattern: Option<&str>, pitch: Option<RoofPitch>) -> RoofPlan {
+    let before_raw = world
+        .arrays
+        .get(&ROOF_META_ARRAY)
+        .map(|arr| arr.data.clone());
+    let before = roof_state(world);
+    let next_pattern = match pattern {
+        Some(raw) => {
+            let norm = normalize_roof_stem(raw);
+            if norm.is_empty() {
+                return RoofPlan {
+                    before_raw,
+                    after: before.clone(),
+                    before,
+                    valid: false,
+                };
+            }
+            norm
+        }
+        None => before.pattern.clone(),
+    };
+    let next_pitch = pitch.unwrap_or(before.pitch);
+    let after = RoofState {
+        pattern: next_pattern,
+        pitch: next_pitch,
+    };
+    let valid = after != before;
+    RoofPlan {
+        before_raw,
+        before,
+        after,
+        valid,
+    }
+}
+
+/// Plans switching the lot's roof pattern stem (e.g. `"r2_"` or `"r2_.bmp"`).
+pub fn plan_roof_pattern(world: &World, pattern: &str) -> RoofPlan {
+    plan_roof_edit(world, Some(pattern), None)
+}
+
+/// Plans switching the lot's roof pitch preset.
+pub fn plan_roof_pitch(world: &World, pitch: RoofPitch) -> RoofPlan {
+    plan_roof_edit(world, None, Some(pitch))
+}
+
+fn terrain_diffs_match(
+    world: &World,
+    height_changes: &[(usize, [u8; 4], [u8; 4])],
+    grass_changes: &[(usize, i8, i8)],
+    forward: bool,
+) -> bool {
+    if !height_changes.is_empty() {
+        let Some(heights) = world.arrays.get(&HEIGHTS_ARRAY).filter(|a| a.stride == 4) else {
+            return false;
+        };
+        for &(idx, before, after) in height_changes {
+            let off = idx.saturating_mul(4);
+            let expected = if forward { &before } else { &after };
+            if heights.data.get(off..off + 4) != Some(expected.as_slice()) {
+                return false;
+            }
+        }
+    }
+    if !grass_changes.is_empty() {
+        let Some(grass) = world.arrays.get(&GRASS_ARRAY).filter(|a| a.stride == 1) else {
+            return false;
+        };
+        for &(idx, before, after) in grass_changes {
+            let expected = if forward { before as u8 } else { after as u8 };
+            if grass.data.get(idx).copied() != Some(expected) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn apply_terrain_diffs(
+    world: &mut World,
+    height_changes: &[(usize, [u8; 4], [u8; 4])],
+    grass_changes: &[(usize, i8, i8)],
+    forward: bool,
+) -> Result<(), Fault> {
+    if !height_changes.is_empty() {
+        let heights = world.arrays.get_mut(&HEIGHTS_ARRAY).ok_or(Fault {
+            object: 0,
+            at: None,
+            trap: Trap::Invalid("missing terrain heights array".into()),
+        })?;
+        for &(idx, before, after) in height_changes {
+            let off = idx * 4;
+            let bytes = if forward { &after } else { &before };
+            if let Some(dst) = heights.data.get_mut(off..off + 4) {
+                dst.copy_from_slice(bytes);
+            }
+        }
+    }
+    if !grass_changes.is_empty() {
+        let grass = world.arrays.get_mut(&GRASS_ARRAY).ok_or(Fault {
+            object: 0,
+            at: None,
+            trap: Trap::Invalid("missing grass array".into()),
+        })?;
+        for &(idx, before, after) in grass_changes {
+            let val = if forward { after as u8 } else { before as u8 };
+            if let Some(dst) = grass.data.get_mut(idx) {
+                *dst = val;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn byte_array_diffs_match(
+    world: &World,
+    array_id: u16,
+    changes: &[(usize, u8, u8)],
+    created_array: bool,
+    forward: bool,
+) -> bool {
+    if changes.is_empty() {
+        return true;
+    }
+    if forward && created_array {
+        if world.arrays.contains_key(&array_id) {
+            return false;
+        }
+        return changes.iter().all(|&(_, before, _)| before == 0xff);
+    }
+    let Some(arr) = world.arrays.get(&array_id).filter(|a| a.stride == 1) else {
+        return false;
+    };
+    for &(idx, before, after) in changes {
+        let expected = if forward { before } else { after };
+        if arr.data.get(idx).copied() != Some(expected) {
+            return false;
+        }
+    }
+    true
+}
+
+fn apply_byte_array_diffs(
+    world: &mut World,
+    array_id: u16,
+    changes: &[(usize, u8, u8)],
+    created_array: bool,
+    forward: bool,
+) -> Result<(), Fault> {
+    if changes.is_empty() {
+        return Ok(());
+    }
+    if forward && created_array && !world.arrays.contains_key(&array_id) {
+        world.arrays.insert(
+            array_id,
+            Array {
+                width: FULL_SIZE,
+                height: FULL_SIZE,
+                stride: 1,
+                encoding: 0,
+                data: vec![0xff; FULL_SIZE * FULL_SIZE],
+            },
+        );
+    }
+    if !forward && created_array {
+        world.arrays.remove(&array_id);
+        return Ok(());
+    }
+    let arr = world.arrays.get_mut(&array_id).ok_or(Fault {
+        object: 0,
+        at: None,
+        trap: Trap::Invalid(format!("missing lot array {array_id}")),
+    })?;
+    for &(idx, before, after) in changes {
+        let val = if forward { after } else { before };
+        if let Some(dst) = arr.data.get_mut(idx) {
+            *dst = val;
+        }
+    }
+    Ok(())
+}
+
+fn roof_meta_matches(world: &World, expected: Option<&[u8]>) -> bool {
+    let current = world
+        .arrays
+        .get(&ROOF_META_ARRAY)
+        .map(|a| a.data.as_slice());
+    current == expected
+}
+
+fn apply_roof_meta_raw(world: &mut World, bytes: Option<&[u8]>) {
+    match bytes {
+        Some(raw) => {
+            world.arrays.insert(
+                ROOF_META_ARRAY,
+                Array {
+                    width: 1,
+                    height: 1,
+                    stride: raw.len(),
+                    encoding: 0,
+                    data: raw.to_vec(),
+                },
+            );
+        }
+        None => {
+            world.arrays.remove(&ROOF_META_ARRAY);
+        }
+    }
+}
+
+/// Applies a [`TerrainPlan`] to a cloned [`World`] for live preview rendering.
+pub fn preview_terrain_on_world(world: &mut World, plan: &TerrainPlan) {
+    let _ = apply_terrain_diffs(world, &plan.height_changes, &plan.grass_changes, true);
+}
+
+/// Applies a [`WaterPlan`] to a cloned [`World`] for live preview rendering.
+pub fn preview_water_on_world(world: &mut World, plan: &WaterPlan) {
+    let _ = apply_byte_array_diffs(
+        world,
+        WATER_ARRAY,
+        &plan.water_changes,
+        plan.created_water_array,
+        true,
+    );
+    let _ = apply_terrain_diffs(world, &plan.height_changes, &plan.grass_changes, true);
+}
+
+/// Applies a [`PoolPlan`] to a cloned [`World`] for live preview rendering.
+pub fn preview_pool_on_world(world: &mut World, plan: &PoolPlan) {
+    let _ = apply_byte_array_diffs(
+        world,
+        POOL_ARRAY,
+        &plan.pool_changes,
+        plan.created_pool_array,
+        true,
+    );
+}
+
+/// Applies a [`RoofPlan`] to a cloned [`World`] for live preview rendering.
+pub fn preview_roof_on_world(world: &mut World, plan: &RoofPlan) {
+    if plan.valid {
+        let raw = plan.after.encode();
+        apply_roof_meta_raw(world, Some(&raw));
+    }
+}
+
+impl Interpreter<'_> {
+    /// Commits a planned Terrain or Grass edit to `world`, rebuilding tile
+    /// flags when terrain heights changed and charging Architecture category `7`.
+    pub fn build_commit_terrain(
+        &self,
+        world: &mut World,
+        plan: &TerrainPlan,
+    ) -> Result<Option<BuildHistory>, Fault> {
+        if !plan.valid
+            || !plan.affordable
+            || (plan.net_cost > 0 && plan.net_cost > available_funds(world))
+            || !terrain_diffs_match(world, &plan.height_changes, &plan.grass_changes, true)
+        {
+            return Ok(None);
+        }
+        // Re-validate live buildability guards so stale plans cannot mutate
+        // tiles that gained walls, floors, pools, water, or objects.
+        if !plan.height_changes.is_empty() {
+            let mut touched_vertices = BTreeSet::new();
+            for &(idx, before, after) in &plan.height_changes {
+                let tx = idx / FULL_SIZE;
+                let ty = idx % FULL_SIZE;
+                // Corners: 0=(tx, ty+1), 1=(tx, ty), 2=(tx+1, ty), 3=(tx+1, ty+1)
+                let corners = [(tx, ty + 1), (tx, ty), (tx + 1, ty), (tx + 1, ty + 1)];
+                for (ci, v) in corners.into_iter().enumerate() {
+                    if before[ci] != after[ci] {
+                        touched_vertices.insert(v);
+                    }
+                }
+            }
+            for (vx, vy) in touched_vertices {
+                if !is_terrain_vertex_editable(world, vx, vy) {
+                    return Ok(None);
+                }
+            }
+        } else {
+            for &(idx, _, _) in &plan.grass_changes {
+                let tx = idx / FULL_SIZE;
+                let ty = idx % FULL_SIZE;
+                if !is_grass_tile_editable(world, tx, ty) {
+                    return Ok(None);
+                }
+            }
+        }
+        apply_terrain_diffs(world, &plan.height_changes, &plan.grass_changes, true)?;
+        if !plan.height_changes.is_empty() {
+            self.rebuild_architecture_rooms(world)?;
+        }
+        if plan.net_cost != 0 {
+            spend(world, ARCHITECTURE_BUDGET, plan.net_cost).map_err(|trap| Fault {
+                object: 0,
+                at: None,
+                trap,
+            })?;
+        }
+        Ok(Some(BuildHistory::Terrain {
+            height_changes: plan.height_changes.clone(),
+            grass_changes: plan.grass_changes.clone(),
+            net_cost: plan.net_cost,
+        }))
+    }
+
+    /// Commits a planned Pond/Water edit to `world`, updating `Arry 10`,
+    /// terrain depression/grass diffs, tile flags, and Architecture category `7`.
+    pub fn build_commit_water(
+        &self,
+        world: &mut World,
+        plan: &WaterPlan,
+    ) -> Result<Option<BuildHistory>, Fault> {
+        if !plan.valid
+            || !plan.affordable
+            || (plan.net_cost > 0 && plan.net_cost > available_funds(world))
+            || !byte_array_diffs_match(
+                world,
+                WATER_ARRAY,
+                &plan.water_changes,
+                plan.created_water_array,
+                true,
+            )
+            || !terrain_diffs_match(world, &plan.height_changes, &plan.grass_changes, true)
+        {
+            return Ok(None);
+        }
+        for &(idx, before, after) in &plan.water_changes {
+            let tx = idx / FULL_SIZE;
+            let ty = idx % FULL_SIZE;
+            if before >= 16 && after < 16 && !tile_supports_water_paint(world, tx, ty) {
+                return Ok(None);
+            }
+            if before < 16 && after >= 16 && !tile_supports_water_remove(world, tx, ty) {
+                return Ok(None);
+            }
+        }
+        if !plan.height_changes.is_empty() {
+            let mut touched_vertices = BTreeSet::new();
+            for &(idx, before, after) in &plan.height_changes {
+                let tx = idx / FULL_SIZE;
+                let ty = idx % FULL_SIZE;
+                let corners = [(tx, ty + 1), (tx, ty), (tx + 1, ty), (tx + 1, ty + 1)];
+                for (ci, v) in corners.into_iter().enumerate() {
+                    if before[ci] != after[ci] {
+                        touched_vertices.insert(v);
+                    }
+                }
+            }
+            for (vx, vy) in touched_vertices {
+                if !is_terrain_vertex_editable_inner(world, vx, vy, true) {
+                    return Ok(None);
+                }
+            }
+        }
+        apply_byte_array_diffs(
+            world,
+            WATER_ARRAY,
+            &plan.water_changes,
+            plan.created_water_array,
+            true,
+        )?;
+        apply_terrain_diffs(world, &plan.height_changes, &plan.grass_changes, true)?;
+        if !plan.height_changes.is_empty() {
+            self.rebuild_architecture_rooms(world)?;
+        }
+        if plan.net_cost != 0 {
+            spend(world, ARCHITECTURE_BUDGET, plan.net_cost).map_err(|trap| Fault {
+                object: 0,
+                at: None,
+                trap,
+            })?;
+        }
+        Ok(Some(BuildHistory::Water {
+            water_changes: plan.water_changes.clone(),
+            height_changes: plan.height_changes.clone(),
+            grass_changes: plan.grass_changes.clone(),
+            created_water_array: plan.created_water_array,
+            net_cost: plan.net_cost,
+        }))
+    }
+
+    /// Commits a planned Swimming Pool dig/demolish edit to `world`, updating
+    /// `Arry 9`, rebuilding rooms & tile flags, and charging/refunding
+    /// Architecture category `7`.
+    pub fn build_commit_pool(
+        &self,
+        world: &mut World,
+        plan: &PoolPlan,
+    ) -> Result<Option<BuildHistory>, Fault> {
+        if !plan.valid
+            || !plan.affordable
+            || (plan.net_cost > 0 && plan.net_cost > available_funds(world))
+            || !byte_array_diffs_match(
+                world,
+                POOL_ARRAY,
+                &plan.pool_changes,
+                plan.created_pool_array,
+                true,
+            )
+        {
+            return Ok(None);
+        }
+        let active = usize::try_from(world.size).unwrap_or(0);
+        let mut dig_elev: Option<u8> = None;
+        for &(idx, before, after) in &plan.pool_changes {
+            let tx = idx / FULL_SIZE;
+            let ty = idx % FULL_SIZE;
+            if before >= 16 && after < 16 {
+                if !tile_supports_pool_dig(world, tx, ty) {
+                    return Ok(None);
+                }
+                let Some(elev) = tile_flat_elevation(world, tx, ty) else {
+                    return Ok(None);
+                };
+                if let Some(expected) = dig_elev {
+                    if elev != expected {
+                        return Ok(None);
+                    }
+                } else {
+                    dig_elev = Some(elev);
+                }
+                for (nx, ny) in [
+                    (tx.checked_sub(1), Some(ty)),
+                    ((tx + 1 < active).then_some(tx + 1), Some(ty)),
+                    (Some(tx), ty.checked_sub(1)),
+                    (Some(tx), (ty + 1 < active).then_some(ty + 1)),
+                ] {
+                    let (Some(nx), Some(ny)) = (nx, ny) else {
+                        continue;
+                    };
+                    if is_pool_tile(world, nx, ny)
+                        && tile_flat_elevation(world, nx, ny) != Some(elev)
+                    {
+                        return Ok(None);
+                    }
+                }
+            }
+            if before < 16 && after >= 16 && !tile_supports_pool_demolish(world, tx, ty) {
+                return Ok(None);
+            }
+        }
+        apply_byte_array_diffs(
+            world,
+            POOL_ARRAY,
+            &plan.pool_changes,
+            plan.created_pool_array,
+            true,
+        )?;
+        self.rebuild_architecture_rooms(world)?;
+        if plan.net_cost != 0 {
+            spend(world, ARCHITECTURE_BUDGET, plan.net_cost).map_err(|trap| Fault {
+                object: 0,
+                at: None,
+                trap,
+            })?;
+        }
+        Ok(Some(BuildHistory::Pool {
+            pool_changes: plan.pool_changes.clone(),
+            created_pool_array: plan.created_pool_array,
+            net_cost: plan.net_cost,
+        }))
+    }
+
+    /// Commits a planned Roof pattern/pitch change (`$0`) to `world`.
+    pub fn build_commit_roof(
+        &self,
+        world: &mut World,
+        plan: &RoofPlan,
+    ) -> Result<Option<BuildHistory>, Fault> {
+        if !plan.valid || !roof_meta_matches(world, plan.before_raw.as_deref()) {
+            return Ok(None);
+        }
+        let after_raw = plan.after.encode();
+        apply_roof_meta_raw(world, Some(&after_raw));
+        Ok(Some(BuildHistory::Roof {
+            before_raw: plan.before_raw.clone(),
+            after_raw,
+        }))
+    }
+}
+
+fn lot_ready(lot: &Lot) -> Result<(), OrderError> {
+    if lot.halted {
+        return Err(OrderError::Halted);
+    }
+    if lot.asking.is_some() || lot.answered {
+        return Err(OrderError::Asking);
+    }
+    if lot.load.finished.is_none() {
+        return Err(OrderError::Incomplete);
+    }
+    Ok(())
+}
+
+fn commit_build_history_on_lot<F>(lot: &mut Lot, commit: F) -> Result<bool, OrderError>
+where
+    F: FnOnce(&Interpreter<'_>, &mut World) -> Result<Option<BuildHistory>, Fault>,
+{
+    lot_ready(lot)?;
+    if lot.active_buy_cursor.is_some() {
+        return Ok(false);
+    }
+    let sounds = RefCell::new(Vec::new());
+    let interpreter = Interpreter {
+        sounds: Some(&sounds),
+        view_rotation: lot.view_rotation,
+        view_centre: lot.view_centre,
+        ..Interpreter::new(&lot.program, &lot.catalog, Stream::Global)
+    };
+    let mut world = lot.world.clone();
+    let Some(entry) = commit(&interpreter, &mut world).map_err(OrderError::Refused)? else {
+        return Ok(false);
+    };
+    let mut keep = BTreeSet::new();
+    crate::buy::collect_buy_ids(&lot.buy_undo, &mut keep);
+    for e in &lot.build_undo {
+        crate::buy::collect_buy_ids(e.detached_objects(), &mut keep);
+    }
+    let mut build_redo_detached = Vec::new();
+    for e in &lot.build_redo {
+        build_redo_detached.extend_from_slice(e.detached_objects());
+    }
+    interpreter
+        .buy_purge_detached(&mut world, &lot.buy_redo, &keep)
+        .map_err(OrderError::Refused)?;
+    interpreter
+        .buy_purge_detached(&mut world, &build_redo_detached, &keep)
+        .map_err(OrderError::Refused)?;
+    lot.world = world;
+    lot.build_undo.push(entry);
+    lot.build_redo.clear();
+    lot.buy_redo.clear();
+    lot.undo_order.push(HistoryKind::Build);
+    lot.redo_order.clear();
+    Ok(true)
+}
+
+impl Lot {
+    /// Commits a planned Terrain raise/lower/level or Grass edit to
+    /// `self.world`, updating Architecture funds and the unified Undo/Redo stack.
+    pub fn build_commit_terrain(&mut self, plan: &TerrainPlan) -> Result<bool, OrderError> {
+        commit_build_history_on_lot(self, |interp, world| {
+            interp.build_commit_terrain(world, plan)
+        })
+    }
+
+    /// Commits a planned Pond/Water edit to `self.world`, updating Architecture
+    /// funds and the unified Undo/Redo stack.
+    pub fn build_commit_water(&mut self, plan: &WaterPlan) -> Result<bool, OrderError> {
+        commit_build_history_on_lot(self, |interp, world| interp.build_commit_water(world, plan))
+    }
+
+    /// Commits a planned Swimming Pool dig or demolish edit to `self.world`,
+    /// rebuilding rooms/flags, updating Architecture funds, and pushing to the
+    /// unified Undo/Redo stack.
+    pub fn build_commit_pool(&mut self, plan: &PoolPlan) -> Result<bool, OrderError> {
+        commit_build_history_on_lot(self, |interp, world| interp.build_commit_pool(world, plan))
+    }
+
+    /// Returns the lot's current [`RoofState`] (pattern stem and pitch preset).
+    pub fn roof_state(&self) -> RoofState {
+        roof_state(&self.world)
+    }
+
+    /// Commits a planned Roof pattern/pitch change (`$0`) to `self.world`,
+    /// recording it on the unified Undo/Redo stack and persisting across
+    /// `Lot::save()`/`Lot::restore()`.
+    pub fn build_commit_roof(&mut self, plan: &RoofPlan) -> Result<bool, OrderError> {
+        commit_build_history_on_lot(self, |interp, world| interp.build_commit_roof(world, plan))
+    }
 }
